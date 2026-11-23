@@ -48,6 +48,7 @@ import {
   parseSessionKey,
   readCapped,
   relayhistoryExportProvenance,
+  type ChunkEntry,
   type ManifestReader,
   type ManifestV1,
   type ObjectStore,
@@ -69,6 +70,17 @@ import {
   canonicalManifestIdentity,
   manifestUserId as admittedManifestUserId,
 } from "../shared/manifest-identity.ts";
+import {
+  STREAM_DEADLINE,
+  STREAM_PASSES,
+  StreamStop,
+  chunkBytes,
+  streamDeadlinePassed,
+  streamKey,
+  streamScope,
+  type StreamDeadline,
+  type StreamReadLimits,
+} from "./search-index-stream.ts";
 
 export type Transact = <T>(work: (tx: SqlExecutor) => Promise<T>) => Promise<T>;
 
@@ -85,7 +97,36 @@ export interface SearchIndexDeps {
   limits?: Partial<SearchIndexLimits>;
   /** Test seam; production writes the catalog in the same Supabase transaction. */
   writeCatalog?: typeof writeDirectoryCatalog;
+  /**
+   * SEARCH_INDEX_STREAMING_CH=1 only (lambda.ts): a scope refused by the whole read with
+   * `scope_too_large` alone, whose STREAM_PASSES reads fit these budgets, is reconciled by
+   * the streamed reader (search-index-stream.ts) instead of being marked partial. Absent:
+   * such a scope is marked partial exactly as before, and nothing else changes.
+   */
+  stream?: StreamReadLimits;
+  /**
+   * Only with `stream`: checked before every chunk of every pass, before the ClickHouse
+   * scan, before the regenerate pass and before any delete. Once crossed, the scope stops
+   * there, deletes nothing, keeps what it already inserted, and is recorded owing a full
+   * pass (needs_full=1, reasons scope_too_large + stream_deadline). Absent: no deadline.
+   */
+  streamDeadline?: StreamDeadline;
+  /**
+   * Only with `stream`: the invocation's one streamed scope. The first scope that streams
+   * takes it; a later one returns `deferred` before any write and the consumer requeues it.
+   */
+  streamSlot?: { used: boolean };
+  /** Tests only: how often the streamed reconcile keeps its transaction busy (default 20 s). */
+  streamKeepaliveMs?: number;
 }
+
+/** The Lambda's streaming budgets: four passes over at most 256 MiB / 250,000 records. */
+export const SEARCH_INDEX_STREAM_CH_BUDGET: Readonly<StreamReadLimits> = Object.freeze({
+  maxReadBytes: 1024 * 1024 * 1024,
+  maxReadEvents: 1_000_000,
+});
+/** Time kept back from the invocation's remaining time for the rest of the batch. */
+export const SEARCH_INDEX_STREAM_DEADLINE_MARGIN_MS = 60_000;
 
 export interface SearchIndexLimits {
   /** Largest scope read into memory, summed over its manifests' raw bytes. */
@@ -121,6 +162,8 @@ export interface SearchIndexResult {
   busy?: boolean;
   /** Too large to index whole: no rows written, its index state marked partial. */
   partial?: boolean;
+  /** Would stream, but this invocation already streamed a scope (`streamSlot`): nothing was written, re-enqueue the event. */
+  deferred?: boolean;
 }
 
 interface ScopeIdentity {
@@ -167,36 +210,47 @@ export async function readManifestRecords(
   if (manifest.raw.format !== "ndjson")
     throw new PipelineError("raw_format_unsupported", "only ndjson raw is indexed", false);
   const records: RelayhistoryStreamRecord[] = [];
-  for (const { entry, key } of chunkKeys(manifest, { prefix })) {
-    if (entry.stored_bytes > MAX_CHUNK_BYTES || (entry.stored_raw_bytes ?? entry.bytes) > MAX_CHUNK_BYTES)
-      throw new PipelineError("chunk_too_large", "a raw chunk exceeds the index limit", false);
-    let stored: Uint8Array | null;
-    try {
-      stored = await readCapped(await store.get(key), entry.stored_bytes);
-    } catch (error) {
-      if ((error as { code?: unknown } | null)?.code === "not_found")
-        throw new PipelineError("chunk_missing", "a listed raw chunk is missing", true);
-      throw new PipelineError("chunk_unavailable", "a raw chunk read failed", true);
-    }
-    if (!stored || stored.byteLength !== entry.stored_bytes || sha256(stored) !== entry.stored_sha256)
-      throw new PipelineError("chunk_digest_mismatch", "a raw chunk has the wrong stored digest", false);
-    let raw: Uint8Array;
-    try {
-      raw = decompress(stored, entry.stored_raw_bytes ?? MAX_CHUNK_BYTES);
-    } catch (error) {
-      if (error instanceof PipelineError) throw error;
-      throw new PipelineError("chunk_decompress_failed", "a raw chunk is not valid zstd", false);
-    }
-    if (entry.raw_sha256 && sha256(raw) !== entry.raw_sha256)
-      throw new PipelineError("chunk_digest_mismatch", "a raw chunk has the wrong raw digest", false);
-    let text: string;
-    try {
-      text = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true }).decode(raw);
-    } catch {
-      throw new PipelineError("chunk_not_utf8", "a raw chunk is not UTF-8", false);
-    }
-    for (const line of text.split("\n")) if (line) records.push(parseRelayhistoryRecord(line));
+  for (const { entry, key } of chunkKeys(manifest, { prefix }))
+    for (const record of await readChunkRecords(entry, key, store, decompress)) records.push(record);
+  return records;
+}
+
+/** One listed raw chunk's canonical records, digests verified. Throws a PipelineError with a code. */
+export async function readChunkRecords(
+  entry: ChunkEntry,
+  key: Parameters<ObjectStore["get"]>[0],
+  store: ObjectStore,
+  decompress: (stored: Uint8Array, maxOutputLength: number) => Uint8Array,
+): Promise<RelayhistoryStreamRecord[]> {
+  const records: RelayhistoryStreamRecord[] = [];
+  if (entry.stored_bytes > MAX_CHUNK_BYTES || (entry.stored_raw_bytes ?? entry.bytes) > MAX_CHUNK_BYTES)
+    throw new PipelineError("chunk_too_large", "a raw chunk exceeds the index limit", false);
+  let stored: Uint8Array | null;
+  try {
+    stored = await readCapped(await store.get(key), entry.stored_bytes);
+  } catch (error) {
+    if ((error as { code?: unknown } | null)?.code === "not_found")
+      throw new PipelineError("chunk_missing", "a listed raw chunk is missing", true);
+    throw new PipelineError("chunk_unavailable", "a raw chunk read failed", true);
   }
+  if (!stored || stored.byteLength !== entry.stored_bytes || sha256(stored) !== entry.stored_sha256)
+    throw new PipelineError("chunk_digest_mismatch", "a raw chunk has the wrong stored digest", false);
+  let raw: Uint8Array;
+  try {
+    raw = decompress(stored, entry.stored_raw_bytes ?? MAX_CHUNK_BYTES);
+  } catch (error) {
+    if (error instanceof PipelineError) throw error;
+    throw new PipelineError("chunk_decompress_failed", "a raw chunk is not valid zstd", false);
+  }
+  if (entry.raw_sha256 && sha256(raw) !== entry.raw_sha256)
+    throw new PipelineError("chunk_digest_mismatch", "a raw chunk has the wrong raw digest", false);
+  let text: string;
+  try {
+    text = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true }).decode(raw);
+  } catch {
+    throw new PipelineError("chunk_not_utf8", "a raw chunk is not UTF-8", false);
+  }
+  for (const line of text.split("\n")) if (line) records.push(parseRelayhistoryRecord(line));
   return records;
 }
 
@@ -251,6 +305,9 @@ interface ScopeRead {
   reasons: string[];
   catalog: DirectoryCatalog;
   directorySessionId: string | null;
+  /** Partial only: the admitted manifests and the scope's size, for the streamed reconcile. */
+  admitted?: ManifestV1[];
+  size?: { bytes: number; events: number };
 }
 
 async function readScope(
@@ -307,6 +364,7 @@ async function readScope(
       rows: [], manifests: readable.length, complete: false, partial: true,
       revision, reasons: [...new Set([...reasons, "scope_too_large"])],
       catalog: directoryCatalogFromProjection([]), directorySessionId: null,
+      admitted: readable, size: { bytes, events },
     };
 
   for (const manifest of readable) {
@@ -494,6 +552,17 @@ export async function indexSearchScope(scope: SessionScope, deps: SearchIndexDep
     }
     const fromMs = Date.parse(await windowStart(deps.ch, at));
     const s3 = await readScope(scope, keys, deps, limits, version);
+    // SEARCH_INDEX_STREAMING_CH=1 only: a scope refused for its size alone, small enough for
+    // STREAM_PASSES reads within the budgets, is reconciled streamed instead.
+    if (
+      deps.stream && s3.partial && s3.admitted && s3.size && s3.reasons.length === 1 && s3.reasons[0] === "scope_too_large" &&
+      s3.size.bytes * STREAM_PASSES <= deps.stream.maxReadBytes && s3.size.events * STREAM_PASSES <= deps.stream.maxReadEvents
+    ) {
+      if (deps.streamSlot?.used)
+        return { manifests: s3.manifests, rows: 0, inserted: 0, deleted: 0, complete: false, deferred: true, reasons: ["stream_deferred"] };
+      if (deps.streamSlot) deps.streamSlot.used = true;
+      return streamedReconcile(tx, scope, deps, deps.stream, limits, s3.admitted, s3.revision, version, fromMs, at);
+    }
     if (s3.partial) {
       // Not indexed from S3 and never treated as current: the state row says the
       // session owes a full pass (needs_full = 1), and nothing else is written.
@@ -559,3 +628,129 @@ export async function indexSearchScope(scope: SessionScope, deps: SearchIndexDep
     };
   });
 }
+
+const STREAM_KEEPALIVE_MS = 20_000;
+
+/**
+ * SEARCH_INDEX_STREAMING_CH=1 only: indexSearchScope's reconcile for a scope too large to
+ * read whole, over the streamed read (search-index-stream.ts), inside the same advisory-lock
+ * transaction. The ClickHouse scan, inserts, deletes (regenerable kinds only), catalog write
+ * and state row are the whole read's own statements; a stopped read inserts nothing more,
+ * deletes nothing and leaves the session owing a full pass (needs_full = 1).
+ */
+async function streamedReconcile(
+  tx: SqlExecutor,
+  scope: SessionScope,
+  deps: SearchIndexDeps,
+  budget: StreamReadLimits,
+  limits: SearchIndexLimits,
+  admitted: ManifestV1[],
+  revision: number,
+  version: number,
+  fromMs: number,
+  at: Date,
+): Promise<SearchIndexResult> {
+  const decompress = deps.decompress ?? defaultDecompress;
+  const prefix = deps.prefixFor(scope.orgId);
+  const deadline = deps.streamDeadline;
+  const everyMs = deps.streamKeepaliveMs ?? STREAM_KEEPALIVE_MS;
+  let pinged = Date.now();
+  // The transaction is idle while S3 is read: re-take the lock it already holds (the same
+  // statement, re-entrant within the transaction) so it never sits idle for long.
+  const keepalive = async () => {
+    if (Date.now() - pinged < everyMs) return;
+    pinged = Date.now();
+    await tx.query("SELECT pg_try_advisory_xact_lock(hashtextextended($1, 0)) AS ok", [scopeLockKey(scope, "search")]);
+  };
+  const checkDeadline = () => {
+    if (streamDeadlinePassed(deadline)) throw new StreamStop(STREAM_DEADLINE, true);
+  };
+  let inserted = 0;
+  const owing = async (stop: StreamStop): Promise<SearchIndexResult> => {
+    await recordState(deps.ch, scope, revision, 0, false, at);
+    return {
+      manifests: admitted.length, rows: 0, inserted, deleted: 0, complete: false,
+      ...(stop.partial ? { partial: true, reasons: ["scope_too_large", stop.code] } : { reasons: [stop.code] }),
+    };
+  };
+  try {
+    // The whole read refuses any other raw format per manifest; the streamed read refuses the scope.
+    if (admitted.some((manifest) => manifest.raw.format !== "ndjson")) throw new StreamStop("raw_format_unsupported", false);
+    const read = await streamScope(
+      {
+        scope, manifests: admitted, userIds: admitted.map(manifestUserId),
+        chunks: (manifest) => chunkKeys(manifest, { prefix }),
+        readChunk: (entry, key) => readChunkRecords(entry, key as Parameters<ObjectStore["get"]>[0], deps.store, decompress),
+        beforeChunk: async () => {
+          checkDeadline();
+          await keepalive();
+        },
+        budget, version, fromMs,
+      },
+      projectedToNeonRow,
+    );
+    checkDeadline();
+    const chRows = await clickhouseScope(deps.ch, scope, fromMs, limits.maxRows + 1);
+    await keepalive();
+    const truncated = chRows.length > limits.maxRows;
+    const existing = new Map<string, ScopeIdentity[]>();
+    for (const r of chRows) {
+      const key = streamKey(r);
+      existing.set(key, [...(existing.get(key) ?? []), r]);
+    }
+    const toInsert = new Set<string>();
+    for (const [key, w] of read.identities) {
+      if (!w.inWindow) continue;
+      const same = existing.get(key) ?? [];
+      if (!same.some((c) => c.workspaceId === w.workspaceId && c.tsMs === w.tsMs && c.fingerprint === w.fingerprint)) toInsert.add(key);
+    }
+    // Before pass 4: past the deadline nothing is written or deleted.
+    checkDeadline();
+    if (toInsert.size)
+      await read.regenerate(toInsert, limits.insertBatch, async (rows) => {
+        await deps.ch.insert(EVENTS_TABLE, rows, { timeoutMs: 60_000 });
+        inserted += rows.length;
+        await keepalive();
+      });
+    const directoryIds = new Set(admitted.map((manifest) => canonicalManifestIdentity(manifest).sessionId));
+    const reasons: string[] = [];
+    if (directoryIds.size > 1) reasons.push("canonical_session_mismatch");
+    if (truncated) reasons.push("clickhouse_truncated");
+    if (inserted !== toInsert.size) reasons.push(STREAM_SOURCE_CHANGED_WRITE);
+    const complete = reasons.length === 0;
+    const deletes: PendingDelete[] = [];
+    if (complete) {
+      // Before any delete: what was inserted stays, nothing is deleted, the scope still owes a pass.
+      checkDeadline();
+      // As the whole read: only kinds this pass can regenerate from S3 are diffed.
+      const regenerable = new Set<string>([...S3_ACTIVITY_KINDS, ...read.kinds]);
+      for (const [key, list] of existing) {
+        const current = read.identities.get(key);
+        for (const c of list) {
+          if (!regenerable.has(c.kind)) continue;
+          if (!current || !current.inWindow || current.workspaceId !== c.workspaceId || current.tsMs !== c.tsMs)
+            deletes.push({ orgId: scope.orgId, sessionId: scope.sessionId, identity: c } as PendingDelete);
+        }
+      }
+      await deleteRows(deps.ch, deletes);
+      if (directoryIds.size === 1)
+        await (deps.writeCatalog ?? writeDirectoryCatalog)(
+          tx,
+          { orgId: scope.orgId, workspaceId: scope.workspaceId, harness: scope.harness, sessionId: [...directoryIds][0]! },
+          read.catalog,
+        );
+    }
+    await recordState(deps.ch, scope, revision, read.rows, complete, at);
+    return { manifests: admitted.length, rows: read.rows, inserted, deleted: deletes.length, complete, reasons };
+  } catch (error) {
+    if (error instanceof StreamStop) return owing(error);
+    // Anything else (a retryable read, the keepalive, ClickHouse) fails the message for
+    // redelivery; what was inserted stays, nothing was deleted, and the session is left
+    // owing a full pass. Best effort: the original error is what the consumer sees.
+    await recordState(deps.ch, scope, revision, 0, false, at).catch(() => {});
+    throw error;
+  }
+}
+
+/** Pass 4 wrote fewer rows than the index lacked: not complete, nothing deleted. */
+const STREAM_SOURCE_CHANGED_WRITE = "stream_short_write";

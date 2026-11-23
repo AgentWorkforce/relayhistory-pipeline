@@ -101,6 +101,13 @@ export async function processBatch(records: readonly QueueRecord[], deps: Consum
           log.info("search index busy, requeued", { stage: "search-index", org_id: scope.orgId, session_id: scope.sessionId, reason: "scope_busy" });
           continue;
         }
+        if (result.deferred) {
+          // SEARCH_INDEX_STREAMING_CH=1 only: this invocation already streamed a scope; stream this one later.
+          if (!deps.requeue) throw new Error("stream deferred and no requeue");
+          await deps.requeue(manifestKey);
+          log.info("search index stream deferred, requeued", { stage: "search-index", org_id: scope.orgId, session_id: scope.sessionId, reason: "stream_deferred" });
+          continue;
+        }
         if (result.partial)
           log.warn("search index partial", { stage: "search-index", org_id: scope.orgId, session_id: scope.sessionId, manifests: result.manifests, reason: "scope_too_large" });
         log.info("search index reconciled", {
