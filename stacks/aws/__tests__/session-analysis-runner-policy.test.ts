@@ -139,6 +139,15 @@ function withResultDeletePrincipals(policy: unknown[], principals: string[]) {
   statement.Condition.ArnNotEquals["aws:PrincipalArn"] = principals;
   return changed;
 }
+function withStatementFrom(policy: unknown[], source: unknown[], sid: string) {
+  const changed = structuredClone(policy) as Array<{ Sid?: string }>;
+  const clonedSource = structuredClone(source) as Array<{ Sid?: string }>;
+  const replacement = clonedSource.find((item) => item.Sid === sid);
+  const index = changed.findIndex((item) => item.Sid === sid);
+  if (index < 0 || replacement === undefined) throw new Error(`${sid} missing from test fixture`);
+  changed[index] = replacement;
+  return changed;
+}
 function check(blocks: Record<string, string[]>, actions: Record<string, string>, input?: unknown) {
   const counts = new Map<string, number>();
   for (const action of Object.values(actions)) counts.set(action, (counts.get(action) ?? 0) + 1);
@@ -188,6 +197,41 @@ describe("session-analysis runner plan contract", () => {
       transcripts: bucketBlock(plannedBucket, liveBucket),
       "transcripts-key": keyBlock(plannedKey, liveKey),
     }, { transcripts: "update", "transcripts-key": "update" }, SESSION_ANALYSIS_RUNNER_ROLE_ARN)).toThrow(/cannot remove/);
+  });
+
+  it("refuses a runner revocation that leaves the result prefix outside every delete deny", () => {
+    const gc = `arn:aws:iam::${TRANSCRIPT_ACCOUNT_ID}:role/test-buffered-gc`;
+    const rearm = `arn:aws:iam::${TRANSCRIPT_ACCOUNT_ID}:role/test-rearm-sweeper`;
+    const upload = {
+      uploadRoleArn: `arn:aws:iam::${TRANSCRIPT_ACCOUNT_ID}:role/test-upload`,
+      consumerRoleArn: `arn:aws:iam::${TRANSCRIPT_ACCOUNT_ID}:role/test-consumer`,
+    };
+    const shapes = [
+      { bucket: {}, key: {}, rearm: false },
+      { bucket: { bufferedGcRoleArn: gc }, key: { bufferedGcRoleArn: gc }, rearm: false },
+      {
+        bucket: { bufferedGcRoleArn: gc, rearmSweeperRoleArn: rearm, uploadInbox: upload },
+        key: { bufferedGcRoleArn: gc, rearmSweeperRoleArn: rearm, uploadInbox: upload },
+        rearm: true,
+      },
+    ];
+    for (const shape of shapes) {
+      const commonBucket = { accountId: TRANSCRIPT_ACCOUNT_ID, bucketArn: names.bucketArn, keyArn: "key", eraserArn, ...shape.bucket };
+      const commonKey = { ...keyArgs, ...shape.key };
+      const rearmStatements = shape.rearm ? rearmSweeperBucketStatements({ bucketArn: names.bucketArn, roleArn: rearm }) : [];
+      const withoutRunnerBucket = [...transcriptBucketPolicy(commonBucket), ...rearmStatements];
+      const withRunnerBucket = [
+        ...transcriptBucketPolicy({ ...commonBucket, sessionAnalysisRunnerRoleArn: SESSION_ANALYSIS_RUNNER_ROLE_ARN }),
+        ...rearmStatements,
+      ];
+      const unsafeRevokeBucket = withStatementFrom(withoutRunnerBucket, withRunnerBucket, "OnlyTheEraserDeletes");
+      const withoutRunnerKey = transcriptKeyPolicy(commonKey);
+      const withRunnerKey = transcriptKeyPolicy({ ...commonKey, sessionAnalysisRunnerRoleArn: SESSION_ANALYSIS_RUNNER_ROLE_ARN });
+      expect(() => check({
+        transcripts: bucketBlock(withRunnerBucket, unsafeRevokeBucket),
+        "transcripts-key": keyBlock(withRunnerKey, withoutRunnerKey),
+      }, { transcripts: "update", "transcripts-key": "update" })).toThrow(/cannot retain the analysis-result carve-out/);
+    }
   });
 
   it("ports cleanly over the live multi-principal and upload-inbox deny shape", () => {

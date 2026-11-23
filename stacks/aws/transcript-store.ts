@@ -1272,13 +1272,15 @@ function assertSessionAnalysisRunnerGrantDiff(
   if (JSON.stringify(oldEraserShape.principals) !== JSON.stringify(newEraserShape.principals))
     refuse(`${ERASER_DENY_SID} principals may not change`);
   const resultArn = `${names.bucketArn}/${ANALYSIS_RESULT_OBJECT_GLOB}`;
+  const oldResult = before.bySid.get(ANALYSIS_RESULT_DENY_SID);
+  if (!oldResult && oldEraserShape.not && oldEraserShape.resources.includes(resultArn))
+    refuse(`${ERASER_DENY_SID} cannot retain the analysis-result carve-out without ${ANALYSIS_RESULT_DENY_SID}`);
   const expectedResources = oldEraserShape.not
     ? oldEraserShape.resources.includes(resultArn) ? oldEraserShape.resources : [resultArn, ...oldEraserShape.resources]
     : [resultArn];
   if (!newEraserShape.not || JSON.stringify(newEraserShape.resources) !== JSON.stringify(expectedResources))
     refuse(`${ERASER_DENY_SID} must carve out exactly the analysis-result prefix`);
 
-  const oldResult = before.bySid.get(ANALYSIS_RESULT_DENY_SID);
   const newResult = after.bySid.get(ANALYSIS_RESULT_DENY_SID);
   if (!newResult) refuse(`${ANALYSIS_RESULT_DENY_SID} must exist with the runner enabled`);
   const nextPrincipals = exactResultDeleteDeny(newResult, after.itemIndent, refuse);
