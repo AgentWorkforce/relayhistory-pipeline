@@ -315,8 +315,12 @@ Checks, in order: token shape and size, strict claims parse, kid (current or
 previous), signature, `iss`/`alg`/`v`, `aud` (`session-read-api` or
 `ingest-edge`), lifetime (`exp - iat` 5 to 60 s, `iat` at most 5 s ahead,
 not expired), method, `path` equal to the raw request target, the credential
-hash, then the route rule (access kind and, where the scope comes from the
-target, the session scope). After the bounded body read: the body hash, then,
+hash, then the route (a request on no table route is refused with reason
+`route`), then the route rule (access kind and, where the scope comes from the
+target, the session scope). A bad token is refused for its own reason whatever
+the route: `route` is logged only for an otherwise valid assertion, and the
+answer is the same generic 401 either way. After the bounded body read: the
+body hash, then,
 for routes whose scope is in the body (delivery batches and session selection),
 the scope derived from the parsed body. Targets with dot segments, `//`, `%2F`,
 `%5C` or a raw backslash in the path are refused; the query is not. The
@@ -328,26 +332,45 @@ is at most 2048 bytes. Unknown extra claims are ignored. The payload size limit
 is not reached in practice: node's header size limit answers 431 first.
 
 Routes. Each service has a table of its routes with the access kind and scope
-source they require (`UPSTREAM_ASSERTION_ROUTES`). A route not in the table
-still needs a fully valid assertion, with access kind `passthrough` (else
-`access`) and an empty session scope (else `scope`). This includes `HEAD` on a
-path the table lists for `GET`, a `GET /v1/events` with more than one
-`session=` value or with neither `session=` nor `q=`, and `POST
-/v1/turns/batches`. An empty `session=` value on `GET /v1/events` counts as
-absent, as in the app: with `q=` it is the `filter` route.
+source they require (`UPSTREAM_ASSERTION_ROUTES`). A request that matches no
+table route is refused under `enforce` with reason `route`, even with an
+otherwise valid assertion of access kind `passthrough` and an empty session
+scope (`log` logs `would_refuse` and continues). A missing assertion there is
+still `missing`. No route: `HEAD` on a path the table lists for `GET` (no
+aliasing), a `GET /v1/events` with a repeated `session=` or `q=` (the app
+answers 400) or with neither a non-empty `session=` nor a non-empty `q=`,
+`POST /v1/cli/login` on the read API and `POST /v1/turns/batches` on the
+ingest edge. So under `enforce` the CLI login and the turns upload are refused
+until they get table routes. An empty `session=` or `q=` value on
+`GET /v1/events` counts as absent, as in the app (`src/session-read-api/app.ts`,
+`GET /v1/events`): a non-empty `session=` is the `read` route, else a
+non-empty `q=` with no `session=` value is the `filter` route.
 
 - Bypass (no assertion read): `/healthz`, `/readyz` and `/health` (any method)
   and every `OPTIONS` request.
 - Exempt: `POST /v1/auth/token/revoke` on the read API and
   `POST /v1/auth/token/refresh` on the ingest edge may come without an
-  assertion; one that is presented is validated.
+  assertion; one that is presented is validated, with access kind
+  `passthrough` and an empty session scope. Any other method or path next to
+  them (a trailing slash, `GET`) is no route.
 - Internal routes have no prefix exemption. The read API's internal token
   routes (exact paths, served only with `READ_API_AUTH_MODE=self_issued`) and
   the ingest edge's session erase routes keep their own internal-secret check as
   the deciding auth, and the assertion is not read there. Any other path,
-  `/internal/` ones included, needs the assertion like a route not in the table.
+  `/internal/` ones included, needs an assertion and, as it is on no table
+  route, is refused (`route` with one, `missing` without).
 - Known limit: private custody routes are not exempt, so a custody client that
-  does not pass through the gateway is refused under `enforce`.
+  does not pass through the gateway is refused under `enforce`. In this repo the
+  custody routes are the ingest app's `POST /v1/custody/legacy-receipt`,
+  `/v1/custody/pending`, `/v1/custody/control/begin`,
+  `/v1/custody/control/complete`, `/v1/custody/authority/begin` and
+  `/v1/custody/authority/complete` (`src/session-ingest/app.ts`); their only
+  named caller is relayhistory's Worker, over a Cloudflare service binding
+  (the hosted ingest Worker, which never runs the check). The self-host ingest
+  edge does not serve them (501 `unsupported_by_backend`, and
+  `INGEST_CUSTODY_SOURCE` other than `relayhistory` fails startup), and the
+  edge never routes `/v1/custody/*` (rule 6 above). An install that has such a
+  custody client calling the ingest edge directly stays on `log`.
 - Unread bodies: a POST the read API answers without reading its body (for
   example a route whose flag is off) has its body checked as zero bytes, so under
   `enforce` a correctly signed POST with a body there is refused 401 (log reason
@@ -361,10 +384,18 @@ absent, 401 `invalid_upstream_assertion` for every other failure, both with a
 generic message. Logs (`upstream assertion check failed`) carry only a closed reason
 (`missing`, `bad_format`, `unknown_kid`, `bad_signature`, `claims`, `aud`,
 `lifetime`, `not_yet_valid`, `expired`, `method`, `path`, `credential`,
-`access`, `scope`, `body`), the outcome (`refused`, or `would_refuse` in `log`
+`route`, `access`, `scope`, `body`), the outcome (`refused`, or `would_refuse` in `log`
 mode), the mode and, on the ingest edge, the correlation id. The token, its
 segments, the `Authorization` value, hashes of either, `jti`, the principal and
 session ids are never logged.
+
+Before `enforce`: run each service on `log` for a period with the gateway in
+front and all real clients going through it, and count the
+`upstream assertion check failed` lines by reason and by route. The request
+path is not in the line (its `route` field is always `upstream_assertion`):
+join it with the gateway's own request log by time or, on the ingest edge, by
+the correlation id. Switch to
+`enforce` only when every remaining refusal is one you intend.
 
 Rotation: put the new key in as current and the old key as previous on every
 replica of both services, restart them, and only then switch the signer to the

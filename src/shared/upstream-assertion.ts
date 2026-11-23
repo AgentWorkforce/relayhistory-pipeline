@@ -9,8 +9,9 @@
  * Phase 1 (before the body is read): token shape, strict claim parse, key by kid (current, previous), signature,
  * iss / alg / v, aud (fixed per service), time, method, the exact request target (pathname + query as received),
  * credential (sha256 of the exact Authorization value), and the route table: access class plus every scope that is
- * known before the body. Phase 2 (after the service's own bounded read, before any side effect): body_sha256 over
- * the exact wire bytes, and the body-derived scope for the body-scoped ingest routes.
+ * known before the body. A request on no table route is refused (`route`), except the audience's exempt route.
+ * Phase 2 (after the service's own bounded read, before any side effect): body_sha256 over the exact wire bytes, and
+ * the body-derived scope for the body-scoped ingest routes.
  *
  * No I/O and no logging here: every check returns a closed reason, and the services log that reason only. The
  * claims grant nothing: `principal` is shape-checked and never used for a decision.
@@ -29,7 +30,7 @@ const ACCESS: readonly string[] = ["read", "write", "filter", "aggregate", "pass
 /** The closed set of refusal reasons; the only assertion detail a service ever logs. */
 export type UpstreamAssertionReason =
   | "missing" | "bad_format" | "unknown_kid" | "bad_signature" | "claims" | "aud" | "lifetime" | "not_yet_valid" | "expired"
-  | "method" | "path" | "credential" | "access" | "scope" | "body";
+  | "method" | "path" | "credential" | "route" | "access" | "scope" | "body";
 
 export interface UpstreamAssertionConfig {
   mode: "log" | "enforce";
@@ -207,10 +208,13 @@ export const ingestRecordsScope = (value: unknown) => idsAt(value, [], "records"
 export const deliveryBatchScope = (value: unknown) => idsAt(value, ["batch"], "records", "session_id");
 export const sessionSelectionScope = (value: unknown) => idsAt(value, [], "sessions", "session_id");
 
-/** The one session= value of a query, or null when there is not exactly one (empty string when it is given empty). */
-function singleSessionValue(query: URLSearchParams): string | null {
-  const values = query.getAll("session");
-  return values.length === 1 ? values[0]! : null;
+/**
+ * A query parameter as the read app reads it (app.ts GET /v1/events: `single(c, name) || undefined`): "" when it is
+ * absent or given once empty, the value when given once, null when repeated (the app answers 400 and serves nothing).
+ */
+function appQueryValue(query: URLSearchParams, name: string): string | null {
+  const values = query.getAll(name);
+  return values.length > 1 ? null : (values[0] ?? "");
 }
 
 const SESSION_READS = ["events", "turns", "metadata", "thread", "catalog", "timing", "analysis", "brief", "summary"];
@@ -220,9 +224,16 @@ export const UPSTREAM_ASSERTION_ROUTES: Readonly<Record<UpstreamAssertionAudienc
     ...["users", "activity", "output", "titles"].map((p) => rule("GET", `/v1/sessions/${p}`, "aggregate")),
     rule("GET", "/v1/sessions/summaries/activity", "aggregate"),
     ...SESSION_READS.map((p) => rule("GET", `/v1/sessions/:/${p}`, "read", { kind: "path", segment: 2 })),
-    rule("GET", "/v1/events", "read", { kind: "query_session" }, (q) => (singleSessionValue(q) ?? "") !== ""),
-    // The app treats an empty session= as absent: with q= it is the workspace search.
-    rule("GET", "/v1/events", "filter", NONE, (q) => q.has("q") && (!q.has("session") || singleSessionValue(q) === "")),
+    // The app treats an empty session= or q= as absent and answers 400 for a repeated one: a non-empty session= is the
+    // single-session read, else a non-empty q= is the workspace search, else no route (the app serves nothing).
+    rule("GET", "/v1/events", "read", { kind: "query_session" }, (q) => {
+      const session = appQueryValue(q, "session");
+      return session !== null && session !== "" && appQueryValue(q, "q") !== null;
+    }),
+    rule("GET", "/v1/events", "filter", NONE, (q) => {
+      const search = appQueryValue(q, "q");
+      return search !== null && search !== "" && appQueryValue(q, "session") === "";
+    }),
     rule("GET", "/v1/sessions", "filter"),
     rule("GET", "/v1/delivery/records", "aggregate"),
     rule("GET", "/v1/digest/**", "aggregate"),
@@ -245,11 +256,22 @@ export const UPSTREAM_ASSERTION_ROUTES: Readonly<Record<UpstreamAssertionAudienc
   ]),
 });
 
-/** Routes where a MISSING assertion is allowed in enforce (a presented one is still validated). Exact method + raw pathname. */
+/**
+ * Routes where a MISSING assertion is allowed in enforce (a presented one is still validated). Exact method + raw
+ * pathname. One that is not also a table route is checked as passthrough with an empty scope (EXEMPT_RULES).
+ */
 const EXEMPT: Readonly<Record<UpstreamAssertionAudience, { method: string; path: string }>> = Object.freeze({
   "session-read-api": { method: "POST", path: "/v1/auth/token/revoke" },
   "ingest-edge": { method: "POST", path: "/v1/auth/token/refresh" },
 });
+
+const EXEMPT_RULES: Readonly<Record<UpstreamAssertionAudience, RouteRule>> = Object.freeze({
+  "session-read-api": rule("POST", EXEMPT["session-read-api"].path, "passthrough"),
+  "ingest-edge": rule("POST", EXEMPT["ingest-edge"].path, "passthrough"),
+});
+
+const isExempt = (audience: UpstreamAssertionAudience, method: string, pathname: string) =>
+  method === EXEMPT[audience].method && pathname === EXEMPT[audience].path;
 
 const BYPASS_PATHS: ReadonlySet<string> = new Set(["/healthz", "/readyz", "/health"]);
 
@@ -258,16 +280,6 @@ const rawPathname = (target: string) => target.split("?", 1)[0]!;
 /** Probes and CORS preflight never see assertion logic. */
 export function upstreamAssertionBypass(method: string | undefined, target: string): boolean {
   return method === "OPTIONS" || BYPASS_PATHS.has(rawPathname(target));
-}
-
-/**
- * The single rule for a request that matches no table route but carries an assertion: every binding is verified
- * (signature, time, aud, method, path, credential, body), the access must be "passthrough" (else `access`) and the
- * claimed scope must be empty (else `scope`); the service's own auth decides as before.
- */
-function unknownRouteRefusal(claims: UpstreamAssertionClaims): UpstreamAssertionReason | null {
-  if (claims.access !== "passthrough") return "access";
-  return scopeMatches(claims, []) ? null : "scope";
 }
 
 // ---------------------------------------------------------------------------------------------------------------
@@ -373,8 +385,7 @@ export function verifyUpstreamAssertionPhase1(
   const pathname = rawPathname(request.target);
   const token = request.assertion;
   if (token === undefined || token === "") {
-    const exempt = EXEMPT[audience];
-    return request.method === exempt.method && pathname === exempt.path ? { ok: true, pending: null, exempt: true } : { ok: false, reason: "missing" };
+    return isExempt(audience, request.method, pathname) ? { ok: true, pending: null, exempt: true } : { ok: false, reason: "missing" };
   }
   if (typeof token !== "string") return { ok: false, reason: "bad_format" };
   // 1. shape
@@ -410,13 +421,12 @@ export function verifyUpstreamAssertionPhase1(
   if (!segments) return { ok: false, reason: "path" };
   // 10. credential
   if (request.authorization === undefined || claims.credential_sha256 !== sha256Hex(request.authorization)) return { ok: false, reason: "credential" };
-  // 11. route table: access and the scope known before the body
+  // 11. route table: a request on no table route is refused, whatever the claims say; the exempt route keeps its
+  // passthrough rule. Only a token that passed 1-10 reaches this, so a bad token's reason never depends on the route.
   const query = new URLSearchParams(request.target.slice(pathname.length + 1));
-  const route = matchRoute(audience, request.method, segments, query);
-  if (!route) {
-    const refusal = unknownRouteRefusal(claims);
-    return refusal === null ? { ok: true, pending: { claims, bodyScope: null } } : { ok: false, reason: refusal };
-  }
+  const route = matchRoute(audience, request.method, segments, query) ?? (isExempt(audience, request.method, pathname) ? EXEMPT_RULES[audience] : undefined);
+  if (!route) return { ok: false, reason: "route" };
+  // 12. access and the scope known before the body
   if (claims.access !== route.access) return { ok: false, reason: "access" };
   const scope = route.scope;
   if (scope.kind === "body") return { ok: true, pending: { claims, bodyScope: scope.extract } };

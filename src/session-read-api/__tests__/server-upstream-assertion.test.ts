@@ -138,6 +138,20 @@ describe("log", () => {
       expect(line).not.toContain("agent-test");
     }
   });
+  test("a valid assertion on a route not in the table continues and logs would_refuse route", async () => {
+    const seen: Seen[] = [];
+    const url = await start(keyed("log"), recording(seen));
+    const login = "/v1/cli/login";
+    const body = JSON.stringify({ agentRelayToken: "t" });
+    const { result, lines } = await capture(async () => [
+      await get(url("/v1/unknown/thing"), sign("/v1/unknown/thing", { access: "passthrough", sessions: [] })),
+      await fetch(url(login), { method: "POST", body, headers: { authorization: AUTH, "content-type": "application/json", "x-relaygate-assertion": sign(login, { method: "POST", access: "passthrough", sessions: [], body }) } }),
+    ]);
+    expect(result.map((r) => r.status)).toEqual([200, 200]);
+    expect(seen.map((s) => [s.method, s.path])).toEqual([["GET", "/v1/unknown/thing"], ["POST", login]]);
+    expect(Buffer.from(seen[1]!.body).toString("utf8")).toBe(body);
+    expect(lines.map((l) => (JSON.parse(l) as { outcome: string; reason: string })).map((l) => [l.outcome, l.reason])).toEqual([["would_refuse", "route"], ["would_refuse", "route"]]);
+  });
 });
 
 describe("enforce", () => {
@@ -154,21 +168,58 @@ describe("enforce", () => {
     expect(result.map((r) => r.status)).toEqual([401, 401, 401, 401, 401]);
     expect(await Promise.all(result.map(code))).toEqual(["missing_upstream_assertion", "invalid_upstream_assertion", "missing_upstream_assertion", "invalid_upstream_assertion", "invalid_upstream_assertion"]);
     expect(seen).toEqual([]);
-    expect(lines.map((l) => (JSON.parse(l) as { outcome: string; reason: string }).reason)).toEqual(["missing", "scope", "missing", "scope", "credential"]);
+    expect(lines.map((l) => (JSON.parse(l) as { outcome: string; reason: string }).reason)).toEqual(["missing", "scope", "missing", "route", "credential"]);
     expect(lines.every((l) => (JSON.parse(l) as { outcome: string }).outcome === "refused")).toBe(true);
     for (const line of lines) expect(line).not.toContain(SESSION);
   });
-  test("an unknown route refuses any access but passthrough", async () => {
+  test("a route not in the table is refused (route) for any access, passthrough with an empty scope included; HEAD is not GET", async () => {
     const seen: Seen[] = [];
     const url = await start(keyed("enforce"), recording(seen));
     const { result, lines } = await capture(async () => [
       await get(url("/v1/unknown/thing"), sign("/v1/unknown/thing", { access: "aggregate", sessions: [] })),
-      await fetch(url(EVENTS), { method: "HEAD", headers: { authorization: AUTH, "x-relaygate-assertion": sign(EVENTS, { method: "HEAD", access: "read", sessions: [] }) } }),
+      await get(url("/v1/unknown/thing"), sign("/v1/unknown/thing", { access: "passthrough", sessions: [] })),
+      await fetch(url(EVENTS), { method: "HEAD", headers: { authorization: AUTH, "x-relaygate-assertion": sign(EVENTS, { method: "HEAD", access: "read", sessions: [SESSION] }) } }),
+      await fetch(url(EVENTS), { method: "HEAD", headers: { authorization: AUTH, "x-relaygate-assertion": sign(EVENTS, { method: "HEAD", access: "passthrough", sessions: [] }) } }),
     ]);
-    expect(result.map((r) => r.status)).toEqual([401, 401]);
+    expect(result.map((r) => r.status)).toEqual([401, 401, 401, 401]);
     expect(await code(result[0]!)).toBe("invalid_upstream_assertion");
+    expect(await code(result[1]!)).toBe("invalid_upstream_assertion");
     expect(seen).toEqual([]);
-    expect(lines.map((l) => (JSON.parse(l) as { reason: string }).reason)).toEqual(["access", "access"]);
+    expect(lines.map((l) => (JSON.parse(l) as { reason: string }).reason)).toEqual(["route", "route", "route", "route"]);
+  });
+  test("POST /v1/cli/login is not in the table: route with a valid passthrough assertion, missing without one", async () => {
+    const seen: Seen[] = [];
+    const url = await start(keyed("enforce"), recording(seen));
+    const login = "/v1/cli/login";
+    const body = JSON.stringify({ agentRelayToken: "t" });
+    const post = (headers: Record<string, string>) => fetch(url(login), { method: "POST", body, headers: { "content-type": "application/json", ...headers } });
+    const { result, lines } = await capture(async () => [
+      await post({ authorization: AUTH, "x-relaygate-assertion": sign(login, { method: "POST", access: "passthrough", sessions: [], body }) }),
+      await post({ authorization: AUTH }),
+      await post({}),
+    ]);
+    expect(result.map((r) => r.status)).toEqual([401, 401, 401]);
+    expect(await Promise.all(result.map(code))).toEqual(["invalid_upstream_assertion", "missing_upstream_assertion", "missing_upstream_assertion"]);
+    expect(seen).toEqual([]);
+    expect(lines.map((l) => (JSON.parse(l) as { reason: string }).reason)).toEqual(["route", "missing", "missing"]);
+  });
+  test("GET /v1/events: an empty q= counts as absent; a repeated q= is no route", async () => {
+    const seen: Seen[] = [];
+    const url = await start(keyed("enforce"), recording(seen));
+    const cases: [string, Partial<SignInput>, string][] = [
+      ["/v1/events?q=", { access: "filter", sessions: [] }, "route"],
+      ["/v1/events?session=&q=", { access: "filter", sessions: [] }, "route"],
+      [`/v1/events?session=${SESSION}&q=`, { access: "read", sessions: [SESSION] }, "ok"],
+      [`/v1/events?session=${SESSION}&q=`, { access: "filter", sessions: [] }, "access"],
+      ["/v1/events?q=abc", { access: "filter", sessions: [] }, "ok"],
+      [`/v1/events?session=${SESSION}&q=abc`, { access: "read", sessions: [SESSION] }, "ok"],
+      ["/v1/events?q=abc&q=def", { access: "filter", sessions: [] }, "route"],
+      [`/v1/events?session=${SESSION}&q=abc&q=def`, { access: "read", sessions: [SESSION] }, "route"],
+    ];
+    const { result, lines } = await capture(async () => Promise.all(cases.map(([target, over]) => get(url(target), sign(target, over)))));
+    expect(result.map((r) => r.status)).toEqual(cases.map(([, , want]) => (want === "ok" ? 200 : 401)));
+    expect(seen).toHaveLength(cases.filter(([, , want]) => want === "ok").length);
+    expect(lines.map((l) => (JSON.parse(l) as { reason: string }).reason).sort()).toEqual(cases.map(([, , want]) => want).filter((w) => w !== "ok").sort());
   });
   test("HEAD and GET on a table route without an assertion are the 401 missing_upstream_assertion; the app is not called", async () => {
     const seen: Seen[] = [];
@@ -184,16 +235,18 @@ describe("enforce", () => {
     expect(seen).toEqual([]);
     expect(lines.map((l) => (JSON.parse(l) as { outcome: string; reason: string })).map((l) => [l.outcome, l.reason])).toEqual([["refused", "missing"], ["refused", "missing"], ["refused", "missing"]]);
   });
-  test("a valid assertion passes on a table route and on an unknown route (passthrough, empty scope); a previous key works", async () => {
+  test("a valid assertion passes on a table route, not on an unknown route; a previous key works", async () => {
     const seen: Seen[] = [];
     const previous = testKey("read-k0");
     const url = await start({ ...keyed("enforce"), READ_API_UPSTREAM_ASSERTION_PUBLIC_KEY_PREVIOUS: previous.publicB64, READ_API_UPSTREAM_ASSERTION_KID_PREVIOUS: previous.kid }, recording(seen));
     const listing = "/v1/sessions?limit=5&workspace=ws-a";
     expect((await get(url(EVENTS), sign(EVENTS))).status).toBe(200);
     expect((await get(url(listing), sign(listing, { access: "filter", sessions: [] }))).status).toBe(200);
-    expect((await get(url("/v1/unknown/thing"), sign("/v1/unknown/thing", { access: "passthrough", sessions: [] }))).status).toBe(200);
+    const unknown = await get(url("/v1/unknown/thing"), sign("/v1/unknown/thing", { access: "passthrough", sessions: [] }));
+    expect(unknown.status).toBe(401);
+    expect(await code(unknown)).toBe("invalid_upstream_assertion");
     expect((await get(url(EVENTS), sign(EVENTS, { key: previous }))).status).toBe(200);
-    expect(seen.map((s) => s.path)).toEqual([EVENTS, "/v1/sessions", "/v1/unknown/thing", EVENTS]);
+    expect(seen.map((s) => s.path)).toEqual([EVENTS, "/v1/sessions", EVENTS]);
   });
   test("bypass: /healthz and OPTIONS need no assertion", async () => {
     const seen: Seen[] = [];
@@ -204,11 +257,12 @@ describe("enforce", () => {
   });
   test("phase 2: a POST body that does not match body_sha256 is refused before the app sees it", async () => {
     const seen: Seen[] = [];
-    const url = await start(keyed("enforce"), recording(seen));
-    const login = "/v1/cli/login";
-    const body = JSON.stringify({ agentRelayToken: "t" });
-    const assertion = sign(login, { method: "POST", access: "passthrough", sessions: [], body });
-    const post = (b: string) => fetch(url(login), { method: "POST", body: b, headers: { authorization: AUTH, "content-type": "application/json", "x-relaygate-assertion": assertion } });
+    // The advisory ack is a table POST route whose body the service reads (only with its flag on).
+    const url = await start({ ...keyed("enforce"), READ_API_COORDINATION_ADVISORIES_ENABLED: "true" }, recording(seen));
+    const ack = "/v1/coordination/advisories/a-1/ack";
+    const body = JSON.stringify({ note: "t" });
+    const assertion = sign(ack, { method: "POST", access: "passthrough", sessions: [], body });
+    const post = (b: string) => fetch(url(ack), { method: "POST", body: b, headers: { authorization: AUTH, "content-type": "application/json", "x-relaygate-assertion": assertion } });
     const refused = await capture(() => post(`${body} `));
     expect(refused.result.status).toBe(401);
     expect(await code(refused.result)).toBe("invalid_upstream_assertion");
@@ -219,7 +273,7 @@ describe("enforce", () => {
     // A GET's body is drained unread: its hash binds zero bytes.
     expect((await get(url(EVENTS), sign(EVENTS, { body: "x" }))).status).toBe(401);
   });
-  test("exempt POST /v1/auth/token/revoke: passes without an assertion, a presented bad one is refused", async () => {
+  test("exempt POST /v1/auth/token/revoke: passes without an assertion, a presented one is validated", async () => {
     const seen: Seen[] = [];
     const url = await start({ ...keyed("enforce"), READ_API_AUTH_MODE: "self_issued" }, recording(seen));
     const revoke = (headers: Record<string, string>) => fetch(url("/v1/auth/token/revoke"), { method: "POST", body: "{}", headers: { "content-type": "application/json", ...headers } });
@@ -227,7 +281,20 @@ describe("enforce", () => {
     expect(seen.map((s) => s.path)).toEqual(["/v1/auth/token/revoke"]);
     const bad = await capture(() => revoke({ authorization: AUTH, "x-relaygate-assertion": sign("/v1/auth/token/revoke", { method: "POST", access: "passthrough", sessions: [], body: "{ }" }) }));
     expect(bad.result.status).toBe(401);
+    expect(bad.lines.map((l) => (JSON.parse(l) as { reason: string }).reason)).toEqual(["body"]);
     expect(seen).toHaveLength(1);
+    // A presented valid one passes; one with a non-passthrough access or a scope is refused.
+    const good = await capture(() => revoke({ authorization: AUTH, "x-relaygate-assertion": sign("/v1/auth/token/revoke", { method: "POST", access: "passthrough", sessions: [], body: "{}" }) }));
+    expect(good.result.status).toBe(200);
+    expect(good.lines).toEqual([]);
+    expect(seen).toHaveLength(2);
+    const wrong = await capture(async () => [
+      await revoke({ authorization: AUTH, "x-relaygate-assertion": sign("/v1/auth/token/revoke", { method: "POST", access: "read", sessions: [], body: "{}" }) }),
+      await revoke({ authorization: AUTH, "x-relaygate-assertion": sign("/v1/auth/token/revoke", { method: "POST", access: "passthrough", sessions: [SESSION], body: "{}" }) }),
+    ]);
+    expect(wrong.result.map((r) => r.status)).toEqual([401, 401]);
+    expect(wrong.lines.map((l) => (JSON.parse(l) as { reason: string }).reason)).toEqual(["access", "scope"]);
+    expect(seen).toHaveLength(2);
     // Only the exact method + path is exempt.
     expect(await code(await fetch(url("/v1/auth/token/revoke")))).toBe("missing_upstream_assertion");
     expect(await code(await fetch(url("/v1/auth/token/revoke/"), { method: "POST", body: "{}" }))).toBe("missing_upstream_assertion");
@@ -258,6 +325,12 @@ describe("log line", () => {
     for (const mode of ["log", "enforce"] as const) {
       const line = JSON.parse(logLine("warn", UPSTREAM_ASSERTION_LOG_MESSAGE, upstreamAssertionLogFields(mode, "bad_signature", "corr-1"))) as Record<string, unknown>;
       expect(line).toMatchObject({ level: "warn", message: UPSTREAM_ASSERTION_LOG_MESSAGE, route: "upstream_assertion", outcome: mode === "enforce" ? "refused" : "would_refuse", reason: "bad_signature", state: mode, correlation_id: "corr-1" });
+    }
+  });
+  test("the reason route survives the real logLine", () => {
+    for (const mode of ["log", "enforce"] as const) {
+      const line = JSON.parse(logLine("warn", UPSTREAM_ASSERTION_LOG_MESSAGE, upstreamAssertionLogFields(mode, "route"))) as Record<string, unknown>;
+      expect(line).toMatchObject({ outcome: mode === "enforce" ? "refused" : "would_refuse", reason: "route", state: mode });
     }
   });
 });

@@ -189,19 +189,19 @@ describe("phase 1: route table", () => {
     expect(ok("/v1/sessions", "filter", ["s-1"])).toBe("scope");
     expect(ok("/v1/sessions/users", "aggregate", ["s-1"])).toBe("scope");
   });
-  test("GET /v1/events with two session= values or neither q nor session is an unknown route: passthrough, empty scope", () => {
-    expect(ok("/v1/events?session=a&session=b", "read", ["a", "b"])).toBe("access");
-    expect(ok("/v1/events?session=a&session=b", "passthrough", ["a", "b"])).toBe("scope");
-    expect(ok("/v1/events?session=a&session=b", "filter")).toBe("access");
-    expect(ok("/v1/events?session=a&session=b", "passthrough")).toBe("ok");
-    expect(ok("/v1/events?limit=3", "aggregate")).toBe("access");
-    expect(ok("/v1/events?limit=3", "passthrough")).toBe("ok");
+  test("GET /v1/events with two session= values or neither q nor session is no route: refused (route) whatever the claims", () => {
+    for (const [access, sessions] of [["read", ["a", "b"]], ["passthrough", ["a", "b"]], ["filter", []], ["passthrough", []]] as const) {
+      expect(ok("/v1/events?session=a&session=b", access, [...sessions])).toBe("route");
+    }
+    expect(ok("/v1/events?limit=3", "aggregate")).toBe("route");
+    expect(ok("/v1/events?limit=3", "passthrough")).toBe("route");
+    expect(ok("/v1/events", "passthrough")).toBe("route");
   });
-  test("GET /v1/events with an empty session= value is not a single-session read: with q= it is filter, without q= an unknown route", () => {
-    expect(ok("/v1/events?session=", "read", [""])).toBe("access");
-    expect(ok("/v1/events?session=", "read")).toBe("access");
-    expect(ok("/v1/events?session=", "passthrough", [""])).toBe("scope");
-    expect(ok("/v1/events?session=", "passthrough")).toBe("ok");
+  test("GET /v1/events with an empty session= value is not a single-session read: with a non-empty q= it is filter, else no route", () => {
+    expect(ok("/v1/events?session=", "read", [""])).toBe("route");
+    expect(ok("/v1/events?session=", "read")).toBe("route");
+    expect(ok("/v1/events?session=", "passthrough", [""])).toBe("route");
+    expect(ok("/v1/events?session=", "passthrough")).toBe("route");
     expect(ok("/v1/events?session=&q=hello", "read", [""])).toBe("access");
     expect(ok("/v1/events?session=&q=hello", "filter", [""])).toBe("scope");
     expect(ok("/v1/events?session=&q=hello", "filter")).toBe("ok");
@@ -210,20 +210,61 @@ describe("phase 1: route table", () => {
     expect(ok("/v1/events?session=s-9&q=hello", "read", ["s-9"])).toBe("ok");
     expect(ok("/v1/events?session=s-9&q=hello", "filter")).toBe("access");
   });
-  test("unknown route: only passthrough with an empty scope is accepted; other access values are refused; a non-empty claimed scope is refused", () => {
-    for (const access of ["read", "write", "filter", "aggregate"]) {
-      expect(ok("/v1/sessions/s-1/sources", access)).toBe("access");
-      // HEAD on a session-scoped read path (the table serves GET only).
-      expect(ok("/v1/sessions/s-1/events", access, [], "HEAD")).toBe("access");
-      expect(ok("/v1/turns/batches", access, [], "POST", "ingest-edge")).toBe("access");
+  test("GET /v1/events: an empty q= counts as absent, a repeated q= is no route (the app answers 400), as app.ts reads them", () => {
+    // ?q= alone and ?session=&q= : neither parameter is present, no route, whatever the claims.
+    for (const target of ["/v1/events?q=", "/v1/events?session=&q=", "/v1/events?q=&session="]) {
+      for (const access of ["filter", "passthrough", "read"]) expect(ok(target, access)).toBe("route");
+      expect(ok(target, "read", [""])).toBe("route");
     }
-    expect(ok("/v1/sessions/s-1/sources", "passthrough")).toBe("ok");
-    expect(ok("/v1/sessions/s-1/events", "passthrough", [], "HEAD")).toBe("ok");
-    expect(ok("/v1/turns/batches", "passthrough", [], "POST", "ingest-edge")).toBe("ok");
-    expect(ok("/v1/sessions/s-1/sources", "passthrough", ["s-1"])).toBe("scope");
-    expect(ok("/v1/sessions/s-1/events", "passthrough", ["s-1"], "HEAD")).toBe("scope");
-    expect(ok("/v1/turns/batches", "passthrough", ["s-1"], "POST", "ingest-edge")).toBe("scope");
-    expect(ok("/v1/sessions/s-1/sources", "read", ["s-1"])).toBe("access");
+    // ?session=X&q= : the single-session read of X (the empty q= is no filter).
+    expect(ok("/v1/events?session=s-9&q=", "read", ["s-9"])).toBe("ok");
+    expect(ok("/v1/events?session=s-9&q=", "filter")).toBe("access");
+    expect(ok("/v1/events?session=s-9&q=", "read", ["s-8"])).toBe("scope");
+    // ?q=abc : the workspace search; ?session=X&q=abc : the single-session read.
+    expect(ok("/v1/events?q=abc", "filter")).toBe("ok");
+    expect(ok("/v1/events?q=abc", "read")).toBe("access");
+    expect(ok("/v1/events?session=s-9&q=abc", "read", ["s-9"])).toBe("ok");
+    expect(ok("/v1/events?session=s-9&q=abc", "filter")).toBe("access");
+    // A repeated q= is never served by the app (400): no route, with or without session=, empty or not.
+    for (const target of ["/v1/events?q=a&q=b", "/v1/events?q=abc&q=", "/v1/events?q=&q=", "/v1/events?session=s-9&q=a&q=b", "/v1/events?session=s-9&q=&q=", "/v1/events?session=&q=a&q=b"]) {
+      expect(ok(target, "filter")).toBe("route");
+      expect(ok(target, "read", ["s-9"])).toBe("route");
+      expect(ok(target, "passthrough")).toBe("route");
+    }
+  });
+  test("a route not in the table is refused (route) even with a valid passthrough assertion and an empty scope", () => {
+    for (const access of ["read", "write", "filter", "aggregate", "passthrough"]) {
+      for (const sessions of [[], ["s-1"]]) {
+        expect(ok("/v1/sessions/s-1/sources", access, sessions)).toBe("route");
+        expect(ok("/v1/turns/batches", access, sessions, "POST", "ingest-edge")).toBe("route");
+        expect(ok("/v1/cli/login", access, sessions, "POST")).toBe("route");
+        expect(ok("/v1/custody/pending", access, sessions, "POST", "ingest-edge")).toBe("route");
+      }
+    }
+  });
+  test("HEAD is not aliased to GET: HEAD on a GET table path is no route", () => {
+    for (const [target, access, sessions] of [["/v1/sessions/s-1/events", "read", ["s-1"]], ["/v1/sessions", "filter", []], ["/v1/events?q=abc", "filter", []], ["/v1/relayfacts", "passthrough", []]] as const) {
+      expect(ok(target, access, [...sessions], "HEAD")).toBe("route");
+      expect(ok(target, "passthrough", [], "HEAD")).toBe("route");
+      expect(ok(target, access, [...sessions], "GET")).toBe("ok");
+    }
+    for (const p of ["/v1/delivery/limits", "/v1/delivery/admission"]) expect(ok(p, "passthrough", [], "HEAD", "ingest-edge")).toBe("route");
+  });
+  test("check order on a route not in the table: a missing or bad token reports its own reason, `route` only for a token that passed every binding", () => {
+    const target = "/v1/sessions/s-1/sources";
+    const t = (over: Partial<SignInput> = {}) => signAssertion({ key: current, aud: "session-read-api", method: "GET", path: target, authorization: AUTH, access: "passthrough", sessions: [], nowS: NOW_S, ...over });
+    expect(reason(phase1(undefined, { target }))).toBe("missing");
+    expect(reason(phase1("v1.x.y", { target }))).toBe("bad_format");
+    expect(reason(phase1(t({ key: testKey("k-other") }), { target }))).toBe("unknown_kid");
+    expect(reason(phase1(`v1.${t().split(".")[1]}.${t({ sessions: ["s-2"] }).split(".")[2]}`, { target }))).toBe("bad_signature");
+    expect(reason(phase1(t({ aud: "ingest-edge" }), { target }))).toBe("aud");
+    expect(reason(phase1(t({ nowS: NOW_S - 30, ttl: 30 }), { target }))).toBe("expired");
+    expect(reason(phase1(t({ method: "POST" }), { target }))).toBe("method");
+    expect(reason(phase1(t({ path: "/v1/sessions/s-2/sources" }), { target }))).toBe("path");
+    expect(reason(phase1(t(), { target, authorization: "Bearer other" }))).toBe("credential");
+    expect(reason(phase1(t(), { target }))).toBe("route");
+    // The answer body is the same generic one for every reason but `missing`.
+    expect(upstreamAssertionRefusal("route")).toEqual(upstreamAssertionRefusal("bad_signature"));
   });
   test("ingest classes: write by path, passthrough, body-scoped routes defer the scope to phase 2", () => {
     expect(ok("/v1/sessions/s-1/turns", "write", ["s-1"], "POST", "ingest-edge")).toBe("ok");
@@ -247,6 +288,16 @@ describe("phase 1: route table", () => {
     expect(phase1(undefined, { method: "POST", target: "/v1/auth/token/refresh" }, "ingest-edge")).toEqual({ ok: true, pending: null, exempt: true });
     expect(reason(phase1("v1.x.y", { method: "POST", target: "/v1/auth/token/revoke" }))).toBe("bad_format");
     expect(reason(phase1(readToken({ access: "read" }, { method: "POST", target: "/v1/auth/token/refresh" }), { method: "POST", target: "/v1/auth/token/refresh" }, "ingest-edge"))).toBe("aud");
+    // The read API's exempt route is not a table route: a presented assertion is checked as passthrough, empty scope.
+    const revoke = { method: "POST", target: "/v1/auth/token/revoke" };
+    expect(reason(phase1(readToken({ access: "passthrough", sessions: [], method: "POST" }, revoke), revoke))).toBe("ok");
+    expect(reason(phase1(readToken({ access: "read", sessions: [], method: "POST" }, revoke), revoke))).toBe("access");
+    expect(reason(phase1(readToken({ access: "passthrough", sessions: ["s-1"], method: "POST" }, revoke), revoke))).toBe("scope");
+    expect(reason(phase1(readToken({ access: "passthrough", sessions: [], method: "POST", nowS: NOW_S - 60 }, revoke), revoke))).toBe("expired");
+    // Only the exact method + raw pathname: a trailing slash, another method or the other audience's path is no route.
+    for (const [method, target] of [["POST", "/v1/auth/token/revoke/"], ["GET", "/v1/auth/token/revoke"], ["POST", "/v1/auth/token/refresh"]]) {
+      expect(reason(phase1(readToken({ access: "passthrough", sessions: [], method }, { method, target }), { method, target }))).toBe("route");
+    }
   });
   test("bypass: probes and OPTIONS", () => {
     expect(upstreamAssertionBypass("GET", "/healthz")).toBe(true);
@@ -441,6 +492,6 @@ describe("configuration", () => {
   });
   test("refusal answers are generic", () => {
     expect(upstreamAssertionRefusal("missing").code).toBe("missing_upstream_assertion");
-    for (const r of ["bad_signature", "scope", "body", "expired"] as const) expect(upstreamAssertionRefusal(r)).toEqual({ code: "invalid_upstream_assertion", message: "invalid upstream assertion" });
+    for (const r of ["bad_signature", "scope", "body", "expired", "route"] as const) expect(upstreamAssertionRefusal(r)).toEqual({ code: "invalid_upstream_assertion", message: "invalid upstream assertion" });
   });
 });

@@ -186,6 +186,22 @@ describe("log", () => {
     expect(parsed[0]!.correlation_id).toBe("corr-log-1");
     assertNoSecrets(lines, [bad]);
   });
+  test("a valid assertion on a route not in the table continues to its answer and logs would_refuse route", async () => {
+    const seen: Seen[] = [];
+    const counts = { verify: 0 };
+    const url = await start(keyed("log"), recording(seen, counts));
+    const turnsBatches = "/v1/turns/batches";
+    const body = JSON.stringify({ sessions: [SESSION] });
+    const { result, lines } = await capture(async () => [
+      await send(url(turnsBatches), { body, assertion: sign(turnsBatches, { access: "passthrough", sessions: [], body }) }),
+      await send(url("/v1/unknown"), { method: "GET", assertion: sign("/v1/unknown", { method: "GET", access: "passthrough", sessions: [], body: "" }) }),
+    ]);
+    expect(result.map((r) => r.status)).toEqual([200, 501]);
+    expect(seen.map((s) => [s.method, s.path])).toEqual([["POST", turnsBatches]]);
+    expect(Buffer.from(seen[0]!.body).toString("utf8")).toBe(body);
+    expect(counts.verify).toBe(1);
+    expect(lines.map((l) => (JSON.parse(l) as { outcome: string; reason: string })).map((l) => [l.outcome, l.reason])).toEqual([["would_refuse", "route"], ["would_refuse", "route"]]);
+  });
 });
 
 describe("enforce (wrapper, phase 1)", () => {
@@ -216,12 +232,12 @@ describe("enforce (wrapper, phase 1)", () => {
     const parsed = lines.map((l) => JSON.parse(l) as Record<string, unknown>);
     expect(parsed.map((l) => [l.outcome, l.reason, l.state])).toEqual([
       ["refused", "missing", "enforce"], ["refused", "aud", "enforce"], ["refused", "credential", "enforce"],
-      ["refused", "missing", "enforce"], ["refused", "scope", "enforce"], ["refused", "missing", "enforce"],
+      ["refused", "missing", "enforce"], ["refused", "route", "enforce"], ["refused", "missing", "enforce"],
     ]);
     assertNoSecrets(lines, tokens);
   });
 
-  test("a valid assertion (current or previous key) passes; an unknown route with an empty scope keeps its 501", async () => {
+  test("a valid assertion (current or previous key) passes; on an unknown route it is refused (route), not the 501", async () => {
     const seen: Seen[] = [];
     const counts = { verify: 0 };
     const url = await start(keyed("enforce"), recording(seen, counts));
@@ -229,12 +245,13 @@ describe("enforce (wrapper, phase 1)", () => {
     const a = await send(url(BATCHES), { body: batchBody([SESSION]), assertion: sign(BATCHES) });
     const b = await send(url(LIMITS), { method: "GET", assertion: limits(OLD) });
     const c = await send(url("/v1/unknown?x=1"), { method: "GET", assertion: sign("/v1/unknown?x=1", { method: "GET", access: "passthrough", sessions: [], body: "" }) });
-    expect([a.status, b.status, c.status]).toEqual([200, 200, 501]);
+    expect([a.status, b.status, c.status]).toEqual([200, 200, 401]);
+    expect(await code(c)).toBe("invalid_upstream_assertion");
     expect(seen.map((s) => s.path)).toEqual([BATCHES, LIMITS]);
     expect(counts.verify).toBe(2);
   });
 
-  test("an unknown route refuses any access but passthrough, before introspection and the app", async () => {
+  test("POST /v1/turns/batches is not in the table: route for any access, passthrough with an empty scope included; missing without one", async () => {
     const seen: Seen[] = [];
     const counts = { verify: 0 };
     const url = await start(keyed("enforce"), recording(seen, counts));
@@ -243,11 +260,29 @@ describe("enforce (wrapper, phase 1)", () => {
     const { result, lines } = await capture(async () => [
       await send(url(turnsBatches), { body, assertion: sign(turnsBatches, { access: "write", sessions: [], body }) }),
       await send(url(turnsBatches), { body, assertion: sign(turnsBatches, { access: "aggregate", sessions: [], body }) }),
+      await send(url(turnsBatches), { body, assertion: sign(turnsBatches, { access: "passthrough", sessions: [], body }) }),
+      await send(url(turnsBatches), { body }),
     ]);
-    expect(await Promise.all(result.map(async (r) => [r.status, await code(r)]))).toEqual([[401, "invalid_upstream_assertion"], [401, "invalid_upstream_assertion"]]);
+    expect(await Promise.all(result.map(async (r) => [r.status, await code(r)]))).toEqual([
+      [401, "invalid_upstream_assertion"], [401, "invalid_upstream_assertion"], [401, "invalid_upstream_assertion"], [401, "missing_upstream_assertion"],
+    ]);
     expect(seen).toEqual([]);
     expect(counts.verify).toBe(0);
-    expect(lines.map((l) => (JSON.parse(l) as { reason: string }).reason)).toEqual(["access", "access"]);
+    expect(lines.map((l) => (JSON.parse(l) as { reason: string }).reason)).toEqual(["route", "route", "route", "missing"]);
+  });
+
+  test("HEAD is not aliased to GET: a valid assertion for HEAD on a GET table path is refused (route)", async () => {
+    const seen: Seen[] = [];
+    const counts = { verify: 0 };
+    const url = await start(keyed("enforce"), recording(seen, counts));
+    const { result, lines } = await capture(async () => [
+      await send(url(LIMITS), { method: "HEAD", assertion: sign(LIMITS, { method: "HEAD", access: "passthrough", sessions: [], body: "" }) }),
+      await send(url(LIMITS), { method: "GET", assertion: sign(LIMITS, { method: "GET", access: "passthrough", sessions: [], body: "" }) }),
+    ]);
+    expect(result.map((r) => r.status)).toEqual([401, 200]);
+    expect(seen.map((s) => [s.method, s.path])).toEqual([["GET", LIMITS]]);
+    expect(counts.verify).toBe(1);
+    expect(lines.map((l) => (JSON.parse(l) as { reason: string }).reason)).toEqual(["route"]);
   });
 
   test("HEAD and GET on a table route without an assertion are the 401 missing_upstream_assertion, before introspection and the app", async () => {
@@ -289,6 +324,11 @@ describe("enforce (wrapper, phase 1)", () => {
     expect([good.status, await code(good)]).toEqual([401, "refresh_not_supported"]);
     const get = await send(url(refresh), { method: "GET" });
     expect([get.status, await code(get)]).toEqual([401, "missing_upstream_assertion"]);
+    // A valid assertion for a method or path next to the exempt one is no route.
+    const getSigned = await send(url(refresh), { method: "GET", assertion: sign(refresh, { method: "GET", access: "passthrough", sessions: [], body: "" }) });
+    expect([getSigned.status, await code(getSigned)]).toEqual([401, "invalid_upstream_assertion"]);
+    const slash = await send(url(`${refresh}/`), { body: "{}", assertion: sign(`${refresh}/`, { access: "passthrough", sessions: [], body: "{}" }) });
+    expect([slash.status, await code(slash)]).toEqual([401, "invalid_upstream_assertion"]);
   });
 
   test("the operator erase route: its own bearer decides, no assertion needed; a wrong secret is still refused", async () => {
