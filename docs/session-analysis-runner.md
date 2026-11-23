@@ -79,9 +79,9 @@ request made before any refusal. The store, the eraser and the check are built f
 | `SESSION_ANALYSIS_S3_ACCESS_KEY_ID_FILE` or `SESSION_ANALYSIS_S3_ACCESS_KEY_ID` | with `static`, exactly one | Static access key id, read like the model key (absolute path, 1..65536 bytes, one trailing newline dropped). Read with the secrets, never logged. Refusals: `s3_access_key_id_missing`, `_ambiguous`, `_unreadable`, `_invalid` |
 | `SESSION_ANALYSIS_S3_SECRET_ACCESS_KEY_FILE` or `SESSION_ANALYSIS_S3_SECRET_ACCESS_KEY` | with `static`, exactly one | Static secret key (8..256 characters, no whitespace), as above (`s3_secret_access_key_*`). A rotation needs a rollout |
 | `SESSION_ANALYSIS_S3_SESSION_TOKEN_FILE` or `SESSION_ANALYSIS_S3_SESSION_TOKEN` | no | Optional session token for temporary static keys; at most one source (`s3_session_token_*`) |
-| `SESSION_ANALYSIS_S3_ENDPOINT` | no | Bare origin of an S3-compatible store (the bundled MinIO). Unset is AWS S3 in `SESSION_ANALYSIS_S3_REGION` (the hosted default, unchanged). When set, the store and the sweeper's eraser both use it, path-style, signed for `SESSION_ANALYSIS_S3_REGION` (MinIO's default is `us-east-1`). Allowed: https; http to loopback; http to a Kubernetes Service name `<svc>.<ns>.svc[.cluster.local]` only with `ALLOW_IN_CLUSTER_HTTP=true` (`src/shared/destination-url.ts`, the rule the publisher and the erase job use). No credentials, path, query or fragment. Refusals: `endpoint_invalid`, `allow_in_cluster_http_invalid`, and `provider_unsupported` for the GCS API host |
+| `SESSION_ANALYSIS_S3_ENDPOINT` | no | Bare origin of an S3-compatible store (the bundled MinIO). Unset is AWS S3 in `SESSION_ANALYSIS_S3_REGION` (the hosted default, unchanged). When set, the store and the sweeper's eraser both use it, path-style, signed for `SESSION_ANALYSIS_S3_REGION` (MinIO's default is `us-east-1`). Allowed: https; http to loopback; http to a Kubernetes Service name `<svc>.<ns>.svc[.cluster.local]` only with `ALLOW_IN_CLUSTER_HTTP=true` (`src/shared/destination-url.ts`, the rule the publisher and the erase job use). No credentials, path, query or fragment. Refusals: `endpoint_invalid` (one code for several causes: plain http outside the allowed cases, in-cluster http without `ALLOW_IN_CLUSTER_HTTP=true`, a path, a query or fragment, userinfo, not a URL), `allow_in_cluster_http_invalid`, and `provider_unsupported` for the GCS API host (any case, with or without a trailing dot) |
 | `SESSION_ANALYSIS_S3_VERSIONING_CHECK` | no | Unset: the startup versioning check runs when `SESSION_ANALYSIS_S3_ENDPOINT` is set or the credentials are `static`, and not on the hosted default (whose role has no `s3:GetBucketVersioning` today). `true` forces it. Any other value refuses (`versioning_check_invalid`). See "Versioning" below |
-| `LOCKER_PROVIDER` | no | Read only to refuse: unset or `s3` is this S3 path; `gcs`, `azure` and `fs` refuse startup (`provider_unsupported`) until their versioned erasers exist (slices S2/S3); anything else is `provider_invalid` |
+| `LOCKER_PROVIDER` | no | Read only to refuse. Unset or `s3`: this S3 path, and the hosted path is unchanged. Any other value refuses startup: `gcs`, `azure` and `fs` as `provider_unsupported` (until their versioned erasers exist, slices S2/S3), anything else as `provider_invalid` |
 | `ALLOW_IN_CLUSTER_HTTP` | no | Read only when `SESSION_ANALYSIS_S3_ENDPOINT` is set; `true`/`false`/unset, as everywhere |
 | `PIPELINE_KEY_PREFIX` | yes | The bare key root, as the Lambda reads it |
 | `PIPELINE_ORG_FROM_PREFIX` | yes, `true` | The org-prefix layout, as the Lambda requires |
@@ -118,8 +118,16 @@ When the check runs (see `SESSION_ANALYSIS_S3_VERSIONING_CHECK`), the runner sen
 | --- | --- |
 | `Status` `Enabled` | starts |
 | `Status` `Suspended`, or no `Status` (never enabled) | refusal `bucket_not_versioned` (exit 2) |
-| 4xx, 501, or not a readable `VersioningConfiguration` document | refusal `bucket_versioning_unverified` (exit 2) |
-| other 5xx, network failure | error `bucket_versioning_unavailable` (exit 1; the pod restarts and retries) |
+| MinIO exclusions in effect (`ExcludeFolders` `true`, or any non-empty `Prefix` under `ExcludedPrefixes`): the excluded keys are unversioned | refusal `bucket_versioning_unverified` (exit 2) |
+| 4xx, 501, a body over 64 KiB, or a document outside the known shape (one `VersioningConfiguration` root holding only `Status`, `MfaDelete`, `ExcludeFolders`, `ExcludedPrefixes`/`Prefix`; any other element, a repeated one or an unknown value; XML comments are ignored, so a commented-out `Status` never counts) | refusal `bucket_versioning_unverified` (exit 2) |
+| 3xx (the endpoint or region is wrong; the signed GET is never redirected) | refusal `bucket_versioning_redirect` (exit 2) |
+| other 5xx, network failure, timeout (10 s, including a stalled body) | error `bucket_versioning_unavailable` (exit 1; the pod restarts and retries) |
+| the credentials cannot be fetched (e.g. the Pod Identity agent is not ready) | error `bucket_versioning_credentials_unavailable` (exit 1; the pod restarts and retries) |
+
+Limits: the check runs only at startup, so a bucket suspended later is not noticed until the next start.
+`MfaDelete` is accepted and not checked; with MFA delete on, the sweeper's version deletes fail loudly
+(an S3 error code), never silently. Redirect refusal applies to this GET only; the store and the eraser
+are unchanged by S1.
 
 `GetBucketVersioning` rather than a write/list-versions probe: it is read-only (a probe would write an
 object and need a version delete to clean it up, leaving residue if the pod dies), it tells `Enabled` from
@@ -206,8 +214,8 @@ the values the sessions umbrella would need to expose, with nothing enabled by d
 | `sessionAnalysis.replicas` | `1` (see "Concurrency") |
 | `sessionAnalysis.tickMs`, `sessionAnalysis.batch` | `SESSION_ANALYSIS_TICK_MS`, `SESSION_ANALYSIS_BATCH` |
 | `sessionAnalysis.bucket`, `sessionAnalysis.bucketRegion` | `SESSION_ANALYSIS_S3_BUCKET`, `SESSION_ANALYSIS_S3_REGION` (set from private values, never committed in this repository) |
-| `sessionAnalysis.s3Endpoint` (self-host only; unset on hosted) | `SESSION_ANALYSIS_S3_ENDPOINT`, plus `ALLOW_IN_CLUSTER_HTTP=true` for an in-cluster MinIO Service |
-| `sessionAnalysis.s3KeysSecret` (self-host only; unset on hosted) | `SESSION_ANALYSIS_S3_CREDENTIALS=static` and a Secret volume with `SESSION_ANALYSIS_S3_ACCESS_KEY_ID_FILE` and `SESSION_ANALYSIS_S3_SECRET_ACCESS_KEY_FILE` |
+| `sessionAnalysis.s3Endpoint` (proposed, name owned by the chart; self-host only, unset on hosted) | `SESSION_ANALYSIS_S3_ENDPOINT`, plus `ALLOW_IN_CLUSTER_HTTP=true` for an in-cluster MinIO Service |
+| `sessionAnalysis.s3KeysSecret` (proposed, name owned by the chart; self-host only, unset on hosted) | `SESSION_ANALYSIS_S3_CREDENTIALS=static` and a Secret volume with `SESSION_ANALYSIS_S3_ACCESS_KEY_ID_FILE` and `SESSION_ANALYSIS_S3_SECRET_ACCESS_KEY_FILE` |
 | `sessionAnalysis.keyPrefix` | `PIPELINE_KEY_PREFIX`, plus a fixed `PIPELINE_ORG_FROM_PREFIX=true` |
 | `sessionAnalysis.readerMaxRuleset` | `READER_MAX_RULESET` (omit to match the Lambda today) |
 | `sessionAnalysis.modelKeySecret` (`name`, `key`) | A Secret volume mounted read-only, with `SESSION_ANALYSIS_OPENAI_API_KEY_FILE` set to its path |

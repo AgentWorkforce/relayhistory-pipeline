@@ -15,10 +15,13 @@
  * A store without the API answers an error status, which refuses as unverified (the operator learns the
  * store cannot prove the property the sweeper needs, rather than the sweeper failing later).
  *
- * Verdicts: "Enabled" passes. A readable document whose Status is absent or not Enabled is the refusal
- * `bucket_not_versioned`. A 4xx, a 501 or an unreadable document is the refusal `bucket_versioning_unverified`.
- * Any other 5xx or a network failure throws a plain coded error (exit 1: transient, the pod restarts and retries).
- * Errors carry codes only, never the bucket, endpoint or a credential.
+ * Verdicts: "Enabled" passes. A strictly parsed document whose Status is absent or Suspended is the refusal
+ * `bucket_not_versioned`. A 4xx, a 501, a body over 64 KiB, or a document that is not exactly the known
+ * shape (see versioningStatus) is the refusal `bucket_versioning_unverified`. A 3xx is the refusal
+ * `bucket_versioning_redirect` (the endpoint or region is wrong; redirects are never followed). Any other
+ * 5xx, a network failure, or a timeout while reading the body throws a plain coded error
+ * `bucket_versioning_unavailable` (exit 1: transient, the pod restarts and retries). Errors carry codes only,
+ * never the bucket, endpoint or a credential.
  */
 import { sha256Hex } from "../../packages/object-store/src/crypto.ts";
 import { signRequest, type AwsCredentials } from "../../packages/object-store/src/sigv4.ts";
@@ -33,7 +36,7 @@ export interface BucketVersioningCheck {
   timeoutMs?: number;
 }
 
-export type BucketVersioningVerdict = "Enabled" | "not_versioned" | "unverified";
+export type BucketVersioningVerdict = "Enabled" | "not_versioned" | "unverified" | "redirect";
 
 const MAX_BYTES = 64 * 1024;
 
@@ -45,14 +48,47 @@ export function bucketVersioningUrl(cfg: Pick<BucketVersioningCheck, "bucket" | 
   return url;
 }
 
-/** The Status of a GetBucketVersioning document, "" when absent (never enabled), or undefined when unreadable. */
+/**
+ * The Status of a GetBucketVersioning document, parsed strictly: "Enabled" or "Suspended", "" when absent
+ * (never enabled), or undefined when the document cannot prove the bucket's versioning, namely:
+ *   - anything but one VersioningConfiguration root (optional XML declaration and xmlns), comments ignored;
+ *   - an element other than Status, MfaDelete, ExcludeFolders, ExcludedPrefixes and its Prefix (any other
+ *     element, attribute, CDATA or processing instruction);
+ *   - a repeated Status, MfaDelete or ExcludeFolders, or a value outside Enabled/Suspended, Enabled/Disabled,
+ *     true/false;
+ *   - MinIO's exclusions in effect: ExcludeFolders true, or any non-empty Prefix under ExcludedPrefixes (the
+ *     excluded keys are written unversioned, so the sweeper's exact-version erase would not hold for them).
+ * MfaDelete is accepted and not evaluated: with MFA delete on, the eraser's version deletes fail loudly.
+ */
 export function versioningStatus(xml: string): string | undefined {
-  const doc = /^\s*(?:<\?xml[^?]*\?>\s*)?<VersioningConfiguration(?:\s+xmlns=(?:"[^"]*"|'[^']*'))?\s*(?:\/>\s*$|>([\s\S]*)<\/VersioningConfiguration>\s*$)/.exec(xml);
+  if (/<!--(?![\s\S]*?-->)/.test(xml)) return undefined;
+  const text = xml.replace(/<!--[\s\S]*?-->/g, "");
+  const doc = /^\s*(?:<\?xml\s[^?<>]*\?>\s*)?<VersioningConfiguration(?:\s+xmlns=(?:"[^"<>]*"|'[^'<>]*'))?\s*(?:\/>\s*$|>([\s\S]*)<\/VersioningConfiguration\s*>\s*$)/.exec(text);
   if (!doc) return undefined;
   const body = doc[1] ?? "";
-  const statuses = [...body.matchAll(/<Status\s*>\s*([^<]*?)\s*<\/Status\s*>/g)].map((m) => m[1]!);
-  if (statuses.length > 1) return undefined;
-  return statuses[0] ?? "";
+  const seen = new Map<string, string>();
+  const child = /\s*(?:<(Status|MfaDelete|ExcludeFolders)>([^<]*)<\/\1>|<ExcludedPrefixes\s*\/>|<ExcludedPrefixes>((?:\s*<Prefix>[^<]*<\/Prefix>|\s*<Prefix\s*\/>)*)\s*<\/ExcludedPrefixes>)/y;
+  let at = 0;
+  while (at < body.length) {
+    if (/^\s*$/.test(body.slice(at))) break;
+    child.lastIndex = at;
+    const m = child.exec(body);
+    if (!m) return undefined;
+    at = child.lastIndex;
+    if (m[1]) {
+      if (seen.has(m[1])) return undefined;
+      seen.set(m[1], m[2]!.trim());
+    } else if (m[3] !== undefined) {
+      for (const p of m[3].matchAll(/<Prefix>([^<]*)<\/Prefix>/g)) if (p[1]!.trim() !== "") return undefined;
+    }
+  }
+  const status = seen.get("Status") ?? "";
+  if (status !== "" && status !== "Enabled" && status !== "Suspended") return undefined;
+  const mfa = seen.get("MfaDelete");
+  if (mfa !== undefined && mfa !== "Enabled" && mfa !== "Disabled") return undefined;
+  const folders = seen.get("ExcludeFolders");
+  if (folders !== undefined && folders !== "false") return undefined;
+  return status;
 }
 
 const coded = (code: string) => Object.assign(new Error(code), { code });
@@ -64,14 +100,19 @@ export async function readBucketVersioning(cfg: BucketVersioningCheck): Promise<
   await signRequest({ method: "GET", url, headers, payloadSha256: await sha256Hex(new Uint8Array()), region: cfg.region, credentials: cfg.credentials });
   let res: Response;
   try {
-    res = await doFetch(url, { method: "GET", headers, redirect: "error", signal: AbortSignal.timeout(cfg.timeoutMs ?? 10_000) });
+    // Never followed: a redirect means the endpoint or region is wrong, and the signed request must not move.
+    res = await doFetch(url, { method: "GET", headers, redirect: "manual", signal: AbortSignal.timeout(cfg.timeoutMs ?? 10_000) });
   } catch {
     throw coded("bucket_versioning_unavailable");
   }
+  const discard = async () => { await res.body?.cancel().catch(() => {}); };
+  if (res.type === "opaqueredirect" || res.redirected || (res.status >= 300 && res.status < 400)) { await discard(); return "redirect"; }
   // 501 is the store saying it has no such API: unverified (a refusal), not a transient failure.
-  if (res.status >= 500 && res.status !== 501) throw coded("bucket_versioning_unavailable");
-  if (!res.ok) return "unverified";
-  const text = await boundedText(res);
+  if (res.status >= 500 && res.status !== 501) { await discard(); throw coded("bucket_versioning_unavailable"); }
+  if (!res.ok) { await discard(); return "unverified"; }
+  let text: string | undefined;
+  // A stall past the deadline while reading the body (the signal's TimeoutError) is transient, by code.
+  try { text = await boundedText(res); } catch { throw coded("bucket_versioning_unavailable"); }
   const status = text === undefined ? undefined : versioningStatus(text);
   if (status === undefined) return "unverified";
   return status === "Enabled" ? "Enabled" : "not_versioned";
