@@ -13,6 +13,7 @@ import {
   analysisRunnerService,
   assertRunnerBucketVersioned,
   runnerAnalysisDeps,
+  runnerExitCode,
   runnerFailureFields,
   runnerS3Target,
   runnerSecrets,
@@ -398,4 +399,143 @@ test("every refusal fails at startup before any object or database request; the 
     expect([name, queries]).toEqual([name, []]);
     expect([name, requests]).toEqual([name, versioningDoc === null ? [] : [`GET /${BUCKET}?versioning=`]]);
   }
+});
+
+// ---- strict versioning document, redirects, bounds, timeouts --------------------------------------
+
+test("the versioning document is parsed strictly: comments ignored, known elements only, MinIO exclusions unverified", () => {
+  const ns = 'xmlns="http://s3.amazonaws.com/doc/2006-03-01/"';
+  const doc = (inner: string) => `<?xml version="1.0" encoding="UTF-8"?><VersioningConfiguration ${ns}>${inner}</VersioningConfiguration>`;
+  const cases: [string, string | undefined][] = [
+    [doc("<Status>Enabled</Status>"), "Enabled"],
+    [doc("<Status>Suspended</Status>"), "Suspended"],
+    [doc(""), ""],
+    [`<VersioningConfiguration ${ns}/>`, ""],
+    [doc("<Status>Enabled</Status><MfaDelete>Disabled</MfaDelete>"), "Enabled"],
+    [doc("<Status>Enabled</Status><MfaDelete>Enabled</MfaDelete>"), "Enabled"],
+    [doc("<Status>Enabled</Status><ExcludeFolders>false</ExcludeFolders>"), "Enabled"],
+    [doc("<Status>Enabled</Status><ExcludedPrefixes></ExcludedPrefixes>"), "Enabled"],
+    [doc("<Status>Enabled</Status><ExcludedPrefixes/>"), "Enabled"],
+    [doc("<Status>Enabled</Status><ExcludedPrefixes><Prefix></Prefix></ExcludedPrefixes>"), "Enabled"],
+    [doc("<!-- note --><Status>Enabled</Status>"), "Enabled"],
+    // A comment never supplies a Status.
+    [doc("<!-- <Status>Enabled</Status> -->"), ""],
+    [doc("<Status>Suspended</Status><!--<Status>Enabled</Status>-->"), "Suspended"],
+    [`<!-- <VersioningConfiguration><Status>Enabled</Status></VersioningConfiguration> --><VersioningConfiguration/>`, ""],
+    // MinIO exclusions in effect: the excluded keys are unversioned.
+    [doc("<Status>Enabled</Status><ExcludeFolders>true</ExcludeFolders>"), undefined],
+    [doc("<Status>Enabled</Status><ExcludedPrefixes><Prefix>tmp/</Prefix></ExcludedPrefixes>"), undefined],
+    [doc("<Status>Enabled</Status><ExcludedPrefixes><Prefix></Prefix></ExcludedPrefixes><ExcludedPrefixes><Prefix>a/</Prefix></ExcludedPrefixes>"), undefined],
+    // Unknown elements, values, repeats, malformed shapes.
+    [doc("<Status>Enabled</Status><Other>x</Other>"), undefined],
+    [doc("<Status>Enabled</Status><ExcludedPrefixes><Other/></ExcludedPrefixes>"), undefined],
+    [doc("<Status>Enabled</Status><Status>Enabled</Status>"), undefined],
+    [doc("<Status>Enabled</Status><MfaDelete>maybe</MfaDelete>"), undefined],
+    [doc("<Status>Enabled</Status><ExcludeFolders>yes</ExcludeFolders>"), undefined],
+    [doc("<Status>enabled</Status>"), undefined],
+    [doc("<Status a=\"1\">Enabled</Status>"), undefined],
+    [doc("<s3:Status>Enabled</s3:Status>"), undefined],
+    [doc("<Status><![CDATA[Enabled]]></Status>"), undefined],
+    [doc("<Status>Enabled</Status><!-- unterminated"), undefined],
+    [doc("text<Status>Enabled</Status>"), undefined],
+    [`<VersioningConfiguration ${ns} extra="1"><Status>Enabled</Status></VersioningConfiguration>`, undefined],
+    [`<Other><Status>Enabled</Status></Other>`, undefined],
+    [`${doc("<Status>Enabled</Status>")}<VersioningConfiguration/>`, undefined],
+  ];
+  for (const [xml, want] of cases) expect([xml, versioningStatus(xml)]).toEqual([xml, want]);
+});
+
+/** A fetch that honours `redirect` as a real one does: follow (default), error, or manual (the 307 itself). */
+const redirecting = (followed: string): typeof fetch => (async (_u: string | URL, init?: RequestInit) => {
+  if (init?.redirect === "error") throw new TypeError("redirect");
+  if (init?.redirect === "manual") return new Response(null, { status: 307, headers: { location: "https://elsewhere.example.test/" } });
+  return new Response(followed);
+}) as typeof fetch;
+
+test("a 3xx on the versioning GET is never followed: it refuses as bucket_versioning_redirect (exit 2)", async () => {
+  const enabled = "<VersioningConfiguration><Status>Enabled</Status></VersioningConfiguration>";
+  expect(await readBucketVersioning({ bucket: BUCKET, region: "us-east-1", endpoint: ENDPOINT, credentials: creds, fetch: redirecting(enabled) })).toBe("redirect");
+  // A real fetch against a loopback server that answers 307 to a location that would say Enabled.
+  const server = Bun.serve({ port: 0, hostname: "127.0.0.1", fetch: (req) => new URL(req.url).pathname === "/other"
+    ? new Response(enabled) : new Response(null, { status: 307, headers: { location: "/other" } }) });
+  try {
+    expect(await readBucketVersioning({ bucket: BUCKET, region: "us-east-1", endpoint: `http://127.0.0.1:${server.port}`, credentials: creds })).toBe("redirect");
+  } finally { server.stop(true); }
+  let code = "";
+  try { await assertRunnerBucketVersioned({ versioningCheck: true }, runnerS3Target(selfhost(), analysisRunnerConfig(selfhost()), { s3: creds }), { versioning: async () => "redirect" }); }
+  catch (e) { code = e instanceof AnalysisRunnerRefused ? e.code : String(e); }
+  expect(code).toBe("bucket_versioning_redirect");
+});
+
+test("a body over 64 KiB is unverified, even when it is a valid Enabled document; at the bound it is read", async () => {
+  const enabled = "<VersioningConfiguration><Status>Enabled</Status></VersioningConfiguration>";
+  const read = (body: string) => readBucketVersioning({ bucket: BUCKET, region: "us-east-1", endpoint: ENDPOINT, credentials: creds, fetch: respond(200, body) });
+  expect(await read(enabled + " ".repeat(64 * 1024 - enabled.length))).toBe("Enabled");
+  expect(await read(enabled + " ".repeat(64 * 1024 - enabled.length + 1))).toBe("unverified");
+});
+
+test("a body that stalls past the deadline is bucket_versioning_unavailable (exit 1), not a raw TimeoutError", async () => {
+  const stalled = (async (_u: string | URL, init?: RequestInit) => {
+    const signal = init!.signal!;
+    const body = new ReadableStream<Uint8Array>({
+      start(c) { c.enqueue(new TextEncoder().encode("<VersioningConfiguration>")); },
+      pull(c) { return new Promise<void>((_, reject) => signal.addEventListener("abort", () => { reject(signal.reason); c.error(signal.reason); }, { once: true })); },
+    });
+    return new Response(body, { status: 200 });
+  }) as typeof fetch;
+  const err = await readBucketVersioning({ bucket: BUCKET, region: "us-east-1", endpoint: ENDPOINT, credentials: creds, fetch: stalled, timeoutMs: 50 }).then(() => undefined, (e) => e);
+  expect(err).toMatchObject({ code: "bucket_versioning_unavailable" });
+  expect(JSON.parse(logLine("error", "session analysis runner refused", runnerFailureFields(err)))).toMatchObject({ error_code: "bucket_versioning_unavailable" });
+});
+
+test("error responses have their body cancelled", async () => {
+  for (const status of [403, 307, 503]) {
+    let cancelled = false;
+    const body = new ReadableStream({ cancel() { cancelled = true; } });
+    const f = (async () => new Response(body, { status })) as unknown as typeof fetch;
+    await readBucketVersioning({ bucket: BUCKET, region: "us-east-1", endpoint: ENDPOINT, credentials: creds, fetch: f }).catch(() => {});
+    expect([status, cancelled]).toEqual([status, true]);
+  }
+});
+
+test("a credentials failure before the versioning GET is bucket_versioning_credentials_unavailable (exit 1)", async () => {
+  const env = baseEnv({ AWS_CONTAINER_CREDENTIALS_FULL_URI: POD_URI, SESSION_ANALYSIS_S3_VERSIONING_CHECK: "true", SESSION_ANALYSIS_DATABASE_URL: DB_URL, SESSION_ANALYSIS_OPENAI_API_KEY: MODEL_KEY });
+  const checks: string[] = [];
+  let pools = 0;
+  const err = await analysisRunnerService(env, {
+    host: "127.0.0.1", port: 0, scrubInit: async () => {},
+    ports: {
+      fetcher: (async () => new Response("", { status: 500 })) as unknown as typeof fetch,
+      pool: () => { pools += 1; return fakeDb(); },
+      versioning: async () => { checks.push("called"); return "Enabled"; },
+    },
+  }).then(() => undefined, (e) => e);
+  expect(err).not.toBeInstanceOf(AnalysisRunnerRefused);
+  expect(err).toMatchObject({ code: "bucket_versioning_credentials_unavailable" });
+  expect(runnerExitCode(err)).toBe(1);
+  expect(checks).toEqual([]);
+  expect(pools).toBe(0);
+  expect(JSON.parse(logLine("error", "session analysis runner refused", runnerFailureFields(err)))).toMatchObject({ error_code: "bucket_versioning_credentials_unavailable" });
+});
+
+test("a refused versioning check builds no pool and no store", async () => {
+  for (const verdict of ["not_versioned", "unverified", "redirect"] as const) {
+    let pools = 0, stores = 0, erasers = 0;
+    const result = await analysisRunnerService({ ...selfhost(), SESSION_ANALYSIS_DATABASE_URL: DB_URL, SESSION_ANALYSIS_OPENAI_API_KEY: MODEL_KEY }, {
+      host: "127.0.0.1", port: 0, scrubInit: async () => {},
+      ports: {
+        pool: () => { pools += 1; return fakeDb(); },
+        store: () => { stores += 1; return {} as ObjectStore; },
+        eraserFactory: () => { erasers += 1; return { eraseStep: async () => ({}) as never, verifyErased: async () => ({}) as never }; },
+        versioning: async () => verdict,
+      },
+    }).then(() => "no_refusal", (e) => (e instanceof AnalysisRunnerRefused ? e.code : String(e)));
+    expect(result).toMatch(/^bucket_/);
+    expect([verdict, pools, stores, erasers]).toEqual([verdict, 0, 0, 0]);
+  }
+});
+
+test("the GCS API host is refused in any case and with a trailing dot", async () => {
+  for (const host of ["https://STORAGE.googleapis.com.", "https://storage.googleapis.com.", "https://Storage.GoogleApis.Com", "https://bucket.storage.googleapis.com.", "https://storage.google.com."])
+    expect([host, await code(() => analysisRunnerConfig(baseEnv({ SESSION_ANALYSIS_S3_ENDPOINT: host })))]).toEqual([host, "provider_unsupported"]);
 });

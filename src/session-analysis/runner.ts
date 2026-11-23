@@ -68,7 +68,7 @@ import { lambdaCredentials } from "../session-pipeline/aws-json.ts";
 import { supabasePool, transaction } from "../session-pipeline/lambda.ts";
 import { modelKey } from "../session-brief/config.ts";
 import { assertDestinationUrl, destinationPolicy } from "../shared/destination-url.ts";
-import { readBucketVersioning, type BucketVersioningCheck } from "./bucket-versioning.ts";
+import { readBucketVersioning, type BucketVersioningCheck, type BucketVersioningVerdict } from "./bucket-versioning.ts";
 import { podIdentityCredentials, trustedCredentialsUri } from "../shared/locker.ts";
 import { postgresConnectionString, postgresTlsOptions } from "../shared/postgres-tls.ts";
 import { sessionIntelControls } from "../shared/session-intel-controls.ts";
@@ -160,7 +160,8 @@ function runnerEndpoint(env: NodeJS.ProcessEnv): string | undefined {
   try { policy = destinationPolicy(env); } catch { return refuse("allow_in_cluster_http_invalid"); }
   let url: URL;
   try { url = assertDestinationUrl("SESSION_ANALYSIS_S3_ENDPOINT", raw, policy, { allowPath: false }); } catch { return refuse("endpoint_invalid"); }
-  if (GCS_API_HOST.test(url.hostname)) refuse("provider_unsupported");
+  // Any case, and one trailing dot (an equally valid spelling of the same host).
+  if (GCS_API_HOST.test(url.hostname.toLowerCase().replace(/\.$/, ""))) refuse("provider_unsupported");
   return url.origin;
 }
 
@@ -285,7 +286,7 @@ export interface RunnerPorts {
   pool?: (url: string, max: number) => HoopDb;
   fetcher?: typeof fetch;
   /** The startup versioning check's reader (bucket-versioning.ts readBucketVersioning). */
-  versioning?: (check: BucketVersioningCheck) => Promise<"Enabled" | "not_versioned" | "unverified">;
+  versioning?: (check: BucketVersioningCheck) => Promise<BucketVersioningVerdict>;
 }
 
 /**
@@ -311,17 +312,22 @@ export function runnerS3Target(env: NodeJS.ProcessEnv, cfg: AnalysisRunnerConfig
 }
 
 /**
- * Refuses a bucket the sweeper cannot erase by version id: `bucket_not_versioned` (Status not Enabled) or
- * `bucket_versioning_unverified` (the store answered 4xx/501 or no readable document). Transient failures
- * throw a plain coded error (exit 1). Runs only when cfg.versioningCheck (never on the hosted default), and
+ * Refuses a bucket the sweeper cannot erase by version id: `bucket_not_versioned` (Status not Enabled),
+ * `bucket_versioning_unverified` (4xx/501, an oversized body or a document outside the known shape) or
+ * `bucket_versioning_redirect` (a 3xx). Transient failures throw a plain coded error (exit 1):
+ * `bucket_versioning_credentials_unavailable`, `bucket_versioning_unavailable`. Runs only when cfg.versioningCheck (never on the hosted default), and
  * before the pool, the store or the eraser exists: its GET is the only store request before a refusal.
  */
 export async function assertRunnerBucketVersioned(cfg: Pick<AnalysisRunnerConfig, "versioningCheck">, target: RunnerS3Target, ports: RunnerPorts = {}): Promise<void> {
   if (!cfg.versioningCheck) return;
+  let credentials: AwsCredentials;
+  // A credentials failure here (the Pod Identity agent not ready yet) is transient: exit 1, by code.
+  try { credentials = await target.credentials(); } catch { throw Object.assign(new Error("bucket_versioning_credentials_unavailable"), { code: "bucket_versioning_credentials_unavailable" }); }
   const verdict = await (ports.versioning ?? readBucketVersioning)({
-    bucket: target.bucket, region: target.region, ...(target.endpoint ? { endpoint: target.endpoint } : {}), credentials: await target.credentials(),
+    bucket: target.bucket, region: target.region, ...(target.endpoint ? { endpoint: target.endpoint } : {}), credentials,
   });
   if (verdict === "not_versioned") refuse("bucket_not_versioned");
+  if (verdict === "redirect") refuse("bucket_versioning_redirect");
   if (verdict !== "Enabled") refuse("bucket_versioning_unverified");
 }
 
