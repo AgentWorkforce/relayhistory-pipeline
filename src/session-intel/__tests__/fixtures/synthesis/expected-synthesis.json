@@ -1,0 +1,703 @@
+{
+  "contract": "workspace-synthesis/1",
+  "workspace": "fx-ws-synthesis",
+  "window": {
+    "since": "2026-11-01T00:00:00.000Z",
+    "until": "2026-11-08T00:00:00.000Z"
+  },
+  "generatedAt": "2026-11-08T00:00:00.000Z",
+  "inputs": {
+    "eligible": 60,
+    "considered": 53,
+    "analyzed": 40,
+    "skipped": {
+      "not_analyzed": 2,
+      "failed": 1,
+      "unsupported": 2,
+      "invalid": 3,
+      "too_large": 1,
+      "stale_version": 2,
+      "out_of_window": 2
+    },
+    "truncated": false,
+    "caps": {
+      "sessions": {
+        "limit": 500,
+        "offered": 53,
+        "truncated": false
+      },
+      "drilldown": {
+        "limit": 50,
+        "truncated": false
+      },
+      "issues": {
+        "limit": 10,
+        "truncated": false
+      },
+      "evidencePerIssue": {
+        "limit": 5,
+        "truncated": false
+      },
+      "textChars": {
+        "limit": 280,
+        "truncated": false
+      },
+      "artifactBytes": {
+        "limit": 262144,
+        "truncated": false
+      }
+    },
+    "notes": [
+      "Aggregates cover analyzed sessions only; skipped sessions are counted in inputs.skipped and nowhere else.",
+      "Usage is observed only: an unobserved session or a null costUSD is counted as such, never as zero, and nothing is imputed.",
+      "Issues are recurrence candidates by exact key, not findings.",
+      "7 eligible sessions are not in the cohort.",
+      "3 results failed validation and were not trusted."
+    ]
+  },
+  "freshness": {
+    "staleAfterMs": 86400000,
+    "analyzedAtMin": "2026-11-01T06:00:00.000Z",
+    "analyzedAtMax": "2026-11-07T18:00:00.000Z",
+    "indexedThroughMs": 1793511000000,
+    "indexedThroughMissing": 0,
+    "staleCount": 35,
+    "analyzedAfterNow": 0,
+    "bySource": {
+      "fx-claude": {
+        "analyzed": 16,
+        "analyzedAtMin": "2026-11-01T06:00:00.000Z",
+        "analyzedAtMax": "2026-11-07T10:00:00.000Z",
+        "staleCount": 14
+      },
+      "fx-codex": {
+        "analyzed": 24,
+        "analyzedAtMin": "2026-11-01T10:00:00.000Z",
+        "analyzedAtMax": "2026-11-07T18:00:00.000Z",
+        "staleCount": 21
+      }
+    }
+  },
+  "usageCoverage": {
+    "fx-claude": {
+      "considered": 26,
+      "analyzed": 16,
+      "observed": 12,
+      "unobserved": 4,
+      "knownCost": 8,
+      "nullCost": 8,
+      "observedRate": 0.75,
+      "nullCostRate": 0.5
+    },
+    "fx-codex": {
+      "considered": 27,
+      "analyzed": 24,
+      "observed": 18,
+      "unobserved": 6,
+      "knownCost": 12,
+      "nullCost": 12,
+      "observedRate": 0.75,
+      "nullCostRate": 0.5
+    }
+  },
+  "categories": [
+    {
+      "sessionType": "planning",
+      "outcomeStatus": "in-progress",
+      "count": 1,
+      "truncated": false,
+      "sessions": [
+        {
+          "source": "fx-codex",
+          "sessionId": "fx-s10"
+        }
+      ]
+    },
+    {
+      "sessionType": "planning",
+      "outcomeStatus": "implemented",
+      "count": 1,
+      "truncated": false,
+      "sessions": [
+        {
+          "source": "fx-codex",
+          "sessionId": "fx-s19"
+        }
+      ]
+    },
+    {
+      "sessionType": "planning",
+      "outcomeStatus": "reported-complete",
+      "count": 1,
+      "truncated": false,
+      "sessions": [
+        {
+          "source": "fx-claude",
+          "sessionId": "fx-s28"
+        }
+      ]
+    },
+    {
+      "sessionType": "planning",
+      "outcomeStatus": "blocked",
+      "count": 1,
+      "truncated": false,
+      "sessions": [
+        {
+          "source": "fx-claude",
+          "sessionId": "fx-s01"
+        }
+      ]
+    },
+    {
+      "sessionType": "planning",
+      "outcomeStatus": "mixed",
+      "count": 1,
+      "truncated": false,
+      "sessions": [
+        {
+          "source": "fx-codex",
+          "sessionId": "fx-s37"
+        }
+      ]
+    },
+    {
+      "sessionType": "implementation",
+      "outcomeStatus": "implemented",
+      "count": 1,
+      "truncated": false,
+      "sessions": [
+        {
+          "source": "fx-claude",
+          "sessionId": "fx-s11"
+        }
+      ]
+    },
+    {
+      "sessionType": "implementation",
+      "outcomeStatus": "reported-complete",
+      "count": 1,
+      "truncated": false,
+      "sessions": [
+        {
+          "source": "fx-codex",
+          "sessionId": "fx-s20"
+        }
+      ]
+    },
+    {
+      "sessionType": "implementation",
+      "outcomeStatus": "verified",
+      "count": 1,
+      "truncated": false,
+      "sessions": [
+        {
+          "source": "fx-codex",
+          "sessionId": "fx-s29"
+        }
+      ]
+    },
+    {
+      "sessionType": "implementation",
+      "outcomeStatus": "blocked",
+      "count": 2,
+      "truncated": false,
+      "sessions": [
+        {
+          "source": "fx-claude",
+          "sessionId": "fx-s38"
+        },
+        {
+          "source": "fx-codex",
+          "sessionId": "fx-s02"
+        }
+      ]
+    },
+    {
+      "sessionType": "debugging",
+      "outcomeStatus": "blocked",
+      "count": 3,
+      "truncated": false,
+      "sessions": [
+        {
+          "source": "fx-claude",
+          "sessionId": "fx-s03"
+        },
+        {
+          "source": "fx-codex",
+          "sessionId": "fx-s12"
+        },
+        {
+          "source": "fx-codex",
+          "sessionId": "fx-s30"
+        }
+      ]
+    },
+    {
+      "sessionType": "debugging",
+      "outcomeStatus": "superseded",
+      "count": 1,
+      "truncated": false,
+      "sessions": [
+        {
+          "source": "fx-codex",
+          "sessionId": "fx-s39"
+        }
+      ]
+    },
+    {
+      "sessionType": "debugging",
+      "outcomeStatus": "none",
+      "count": 1,
+      "truncated": false,
+      "sessions": [
+        {
+          "source": "fx-claude",
+          "sessionId": "fx-s21"
+        }
+      ]
+    },
+    {
+      "sessionType": "review",
+      "outcomeStatus": "verified",
+      "count": 1,
+      "truncated": false,
+      "sessions": [
+        {
+          "source": "fx-claude",
+          "sessionId": "fx-s13"
+        }
+      ]
+    },
+    {
+      "sessionType": "review",
+      "outcomeStatus": "blocked",
+      "count": 2,
+      "truncated": false,
+      "sessions": [
+        {
+          "source": "fx-codex",
+          "sessionId": "fx-s04"
+        },
+        {
+          "source": "fx-codex",
+          "sessionId": "fx-s22"
+        }
+      ]
+    },
+    {
+      "sessionType": "review",
+      "outcomeStatus": "superseded",
+      "count": 1,
+      "truncated": false,
+      "sessions": [
+        {
+          "source": "fx-claude",
+          "sessionId": "fx-s31"
+        }
+      ]
+    },
+    {
+      "sessionType": "review",
+      "outcomeStatus": "unknown",
+      "count": 1,
+      "truncated": false,
+      "sessions": [
+        {
+          "source": "fx-codex",
+          "sessionId": "fx-s40"
+        }
+      ]
+    },
+    {
+      "sessionType": "testing",
+      "outcomeStatus": "verified",
+      "count": 1,
+      "truncated": false,
+      "sessions": [
+        {
+          "source": "fx-codex",
+          "sessionId": "fx-s05"
+        }
+      ]
+    },
+    {
+      "sessionType": "testing",
+      "outcomeStatus": "blocked",
+      "count": 2,
+      "truncated": false,
+      "sessions": [
+        {
+          "source": "fx-claude",
+          "sessionId": "fx-s23"
+        },
+        {
+          "source": "fx-codex",
+          "sessionId": "fx-s14"
+        }
+      ]
+    },
+    {
+      "sessionType": "testing",
+      "outcomeStatus": "unknown",
+      "count": 1,
+      "truncated": false,
+      "sessions": [
+        {
+          "source": "fx-codex",
+          "sessionId": "fx-s32"
+        }
+      ]
+    },
+    {
+      "sessionType": "research",
+      "outcomeStatus": "not-started",
+      "count": 1,
+      "truncated": false,
+      "sessions": [
+        {
+          "source": "fx-claude",
+          "sessionId": "fx-s33"
+        }
+      ]
+    },
+    {
+      "sessionType": "research",
+      "outcomeStatus": "blocked",
+      "count": 2,
+      "truncated": false,
+      "sessions": [
+        {
+          "source": "fx-claude",
+          "sessionId": "fx-s06"
+        },
+        {
+          "source": "fx-codex",
+          "sessionId": "fx-s24"
+        }
+      ]
+    },
+    {
+      "sessionType": "research",
+      "outcomeStatus": "mixed",
+      "count": 1,
+      "truncated": false,
+      "sessions": [
+        {
+          "source": "fx-codex",
+          "sessionId": "fx-s15"
+        }
+      ]
+    },
+    {
+      "sessionType": "conversation",
+      "outcomeStatus": "not-started",
+      "count": 1,
+      "truncated": false,
+      "sessions": [
+        {
+          "source": "fx-codex",
+          "sessionId": "fx-s25"
+        }
+      ]
+    },
+    {
+      "sessionType": "conversation",
+      "outcomeStatus": "blocked",
+      "count": 1,
+      "truncated": false,
+      "sessions": [
+        {
+          "source": "fx-codex",
+          "sessionId": "fx-s07"
+        }
+      ]
+    },
+    {
+      "sessionType": "conversation",
+      "outcomeStatus": "unknown",
+      "count": 1,
+      "truncated": false,
+      "sessions": [
+        {
+          "source": "fx-claude",
+          "sessionId": "fx-s16"
+        }
+      ]
+    },
+    {
+      "sessionType": "conversation",
+      "outcomeStatus": "none",
+      "count": 1,
+      "truncated": false,
+      "sessions": [
+        {
+          "source": "fx-codex",
+          "sessionId": "fx-s34"
+        }
+      ]
+    },
+    {
+      "sessionType": "mixed",
+      "outcomeStatus": "not-started",
+      "count": 1,
+      "truncated": false,
+      "sessions": [
+        {
+          "source": "fx-codex",
+          "sessionId": "fx-s17"
+        }
+      ]
+    },
+    {
+      "sessionType": "mixed",
+      "outcomeStatus": "implemented",
+      "count": 1,
+      "truncated": false,
+      "sessions": [
+        {
+          "source": "fx-codex",
+          "sessionId": "fx-s35"
+        }
+      ]
+    },
+    {
+      "sessionType": "mixed",
+      "outcomeStatus": "blocked",
+      "count": 1,
+      "truncated": false,
+      "sessions": [
+        {
+          "source": "fx-claude",
+          "sessionId": "fx-s08"
+        }
+      ]
+    },
+    {
+      "sessionType": "mixed",
+      "outcomeStatus": "mixed",
+      "count": 1,
+      "truncated": false,
+      "sessions": [
+        {
+          "source": "fx-claude",
+          "sessionId": "fx-s26"
+        }
+      ]
+    },
+    {
+      "sessionType": "unknown",
+      "outcomeStatus": "not-started",
+      "count": 1,
+      "truncated": false,
+      "sessions": [
+        {
+          "source": "fx-codex",
+          "sessionId": "fx-s09"
+        }
+      ]
+    },
+    {
+      "sessionType": "unknown",
+      "outcomeStatus": "in-progress",
+      "count": 1,
+      "truncated": false,
+      "sessions": [
+        {
+          "source": "fx-claude",
+          "sessionId": "fx-s18"
+        }
+      ]
+    },
+    {
+      "sessionType": "unknown",
+      "outcomeStatus": "implemented",
+      "count": 1,
+      "truncated": false,
+      "sessions": [
+        {
+          "source": "fx-codex",
+          "sessionId": "fx-s27"
+        }
+      ]
+    },
+    {
+      "sessionType": "unknown",
+      "outcomeStatus": "reported-complete",
+      "count": 1,
+      "truncated": false,
+      "sessions": [
+        {
+          "source": "fx-claude",
+          "sessionId": "fx-s36"
+        }
+      ]
+    }
+  ],
+  "issues": [
+    {
+      "id": "failed-command:97423b8a7828e7bd",
+      "label": "candidate",
+      "kind": "failed-command",
+      "key": "Bash: bun test src/fx",
+      "keyTruncated": false,
+      "text": "Tests failed with exit code 1 in run fx-run-0001.",
+      "textTruncated": false,
+      "roots": 4,
+      "sessionCount": 4,
+      "sessionsTruncated": false,
+      "sessions": [
+        {
+          "source": "fx-claude",
+          "sessionId": "fx-s01"
+        },
+        {
+          "source": "fx-claude",
+          "sessionId": "fx-s03"
+        },
+        {
+          "source": "fx-codex",
+          "sessionId": "fx-s02"
+        },
+        {
+          "source": "fx-codex",
+          "sessionId": "fx-s04"
+        }
+      ],
+      "evidenceTruncated": false,
+      "evidence": [
+        {
+          "source": "fx-claude",
+          "sessionId": "fx-s01",
+          "eventId": "tool:fx-claude:fx-s01:1",
+          "ts": "2026-11-01T05:00:00.000Z",
+          "kind": "tool-call"
+        },
+        {
+          "source": "fx-claude",
+          "sessionId": "fx-s03",
+          "eventId": "tool:fx-claude:fx-s03:1",
+          "ts": "2026-11-01T13:00:00.000Z",
+          "kind": "tool-call"
+        },
+        {
+          "source": "fx-codex",
+          "sessionId": "fx-s02",
+          "eventId": "result:fx-codex:fx-s02:1",
+          "ts": "2026-11-01T09:00:00.000Z",
+          "kind": "tool-result"
+        },
+        {
+          "source": "fx-codex",
+          "sessionId": "fx-s04",
+          "eventId": "tool:fx-codex:fx-s04:1",
+          "ts": "2026-11-01T17:00:00.000Z",
+          "kind": "tool-call"
+        }
+      ],
+      "basis": "deterministic"
+    },
+    {
+      "id": "artifact:20af1b8e7d55c1e2",
+      "label": "candidate",
+      "kind": "artifact",
+      "key": "migrations/0042_fx_widgets.sql",
+      "keyTruncated": false,
+      "text": "Migration blocked: a lock is held on the widgets table (fx-s10).",
+      "textTruncated": false,
+      "roots": 2,
+      "sessionCount": 3,
+      "sessionsTruncated": false,
+      "sessions": [
+        {
+          "source": "fx-codex",
+          "sessionId": "fx-s10"
+        },
+        {
+          "source": "fx-codex",
+          "sessionId": "fx-s14"
+        },
+        {
+          "source": "fx-codex",
+          "sessionId": "fx-s15"
+        }
+      ],
+      "evidenceTruncated": false,
+      "evidence": [
+        {
+          "source": "fx-codex",
+          "sessionId": "fx-s10",
+          "eventId": "edit:fx-codex:fx-s10:1",
+          "ts": "2026-11-02T17:00:00.000Z",
+          "kind": "file-edit"
+        },
+        {
+          "source": "fx-codex",
+          "sessionId": "fx-s14",
+          "eventId": "edit:fx-codex:fx-s14:1",
+          "ts": "2026-11-03T09:00:00.000Z",
+          "kind": "file-edit"
+        },
+        {
+          "source": "fx-codex",
+          "sessionId": "fx-s15",
+          "eventId": "edit:fx-codex:fx-s15:1",
+          "ts": "2026-11-03T13:00:00.000Z",
+          "kind": "file-edit"
+        }
+      ],
+      "basis": "deterministic"
+    },
+    {
+      "id": "failed-command:ca916865f628eec1",
+      "label": "candidate",
+      "kind": "failed-command",
+      "key": "Bash: cargo test --workspace",
+      "keyTruncated": false,
+      "text": "Tests failed with exit code 1 in run fx-run-0002.",
+      "textTruncated": false,
+      "roots": 2,
+      "sessionCount": 3,
+      "sessionsTruncated": false,
+      "sessions": [
+        {
+          "source": "fx-claude",
+          "sessionId": "fx-s08"
+        },
+        {
+          "source": "fx-codex",
+          "sessionId": "fx-s07"
+        },
+        {
+          "source": "fx-codex",
+          "sessionId": "fx-s12"
+        }
+      ],
+      "evidenceTruncated": false,
+      "evidence": [
+        {
+          "source": "fx-claude",
+          "sessionId": "fx-s08",
+          "eventId": "tool:fx-claude:fx-s08:1",
+          "ts": "2026-11-02T09:00:00.000Z",
+          "kind": "tool-call"
+        },
+        {
+          "source": "fx-codex",
+          "sessionId": "fx-s07",
+          "eventId": "tool:fx-codex:fx-s07:1",
+          "ts": "2026-11-02T05:00:00.000Z",
+          "kind": "tool-call"
+        },
+        {
+          "source": "fx-codex",
+          "sessionId": "fx-s12",
+          "eventId": "tool:fx-codex:fx-s12:1",
+          "ts": "2026-11-03T01:00:00.000Z",
+          "kind": "tool-call"
+        }
+      ],
+      "basis": "deterministic"
+    }
+  ]
+}
