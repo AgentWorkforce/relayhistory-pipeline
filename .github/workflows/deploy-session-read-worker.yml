@@ -113,8 +113,11 @@ name: deploy session-read-worker
 # without a flag of their own: when an on dispatch introduces the raw store, the resolve step
 # (resolve-deploy-profile.ts rawStoreOtherReads, from the live Worker, fail-closed) renders
 # READ_API_RAW_STORE_OTHER_READS=off beside the vars; a raw store already live without that switch
-# gets none, and a live switch is kept. Turning those reads on is a separate decision with its own
-# step (removing the switch), never part of this dispatch.
+# gets none, and a live switch is kept. An on dispatch is refused, in every mode, while any of those
+# raw-store vars is live as a secret, or while another live PIPELINE_RAW_* binding (a provider,
+# endpoint or SSE mode set up by hand) exists without PIPELINE_RAW_S3_BUCKET; the two credential
+# secrets alone are the expected fresh-add state. Turning those reads on is a separate decision
+# with its own step (removing the switch), never part of this dispatch.
 # Same not-preserved rule; dispatch, and putting that secret on the Worker, are Khaliq's call.
 # summary_search=on adds --var READ_API_SUMMARY_SEARCH_ENABLED:true: GET /v1/sessions/summaries/search
 # over ClickHouse session_brief_documents (docs/ch-brief-search-design.md; needs no other input and
@@ -151,7 +154,9 @@ name: deploy session-read-worker
 # profile/preserve dispatch refuses to drop or change live raw-store vars; analysis=disable without
 # summary_fallback=on drops them with the switch, and is refused while they are live without
 # READ_API_RAW_STORE_OTHER_READS (timing, turns and metadata read through them) or the bucket is a
-# secret. Break-glass (below) refuses summary_fallback=on.
+# secret. An explicit owner_buffered=on/off dispatch with summary_fallback and analysis both off
+# would drop them the same way, so the same two refusals apply there; with no raw-store var and no
+# switch live (the ordinary redeploy) nothing changes. Break-glass (below) refuses summary_fallback=on.
 # The ANALYSIS_ADMIT binding is rendered whenever SESSION_READ_ANALYSIS_HYPERDRIVE_ID is set, whatever
 # `analysis` says (a flag-off Worker ignores it); the render is byte-identical to before only with
 # that variable unset. Not preserved from live: in EVERY mode (profile, preserve, and explicit

@@ -432,12 +432,19 @@ store). The summary fallback and analysis are not gated by it. `resolve-deploy-p
 (`rawStoreOtherReads`) decides it from the live Worker, fail-closed: when an on dispatch introduces
 the raw store (no live `PIPELINE_RAW_S3_BUCKET`), the render adds `READ_API_RAW_STORE_OTHER_READS=off`;
 when the raw store is already live as plain vars without the switch, it adds none (those reads stay
-on as they were); a live switch is kept (only plain `off` is accepted). A bucket held as a secret,
-a partial live raw store, an invalid live switch, or (with no live switch) any raw-store value
-other than the live one is refused, explicit `owner_buffered=on/off` included. The removal (`analysis=disable`
-without `summary_fallback=on`) drops the vars together with the switch, and is refused when the
-raw store is live without the switch (those reads were served through it and would silently go
-off) or when the bucket stays a secret (dropping the switch would turn them on). Break-glass reads
+on as they were); a live switch is kept (only plain `off` is accepted). Any raw-store var stored as
+a secret (checked before a live switch is accepted), a partial live raw store, an invalid live
+switch, or (with no live switch) any raw-store value other than the live one is refused, explicit
+`owner_buffered=on/off` included. So is any other live `PIPELINE_RAW_*` binding while no
+`PIPELINE_RAW_S3_BUCKET` is live (a provider, endpoint or SSE mode set up by hand that the render
+would combine with its own values); the two credential secrets `PIPELINE_RAW_S3_ACCESS_KEY_ID` /
+`_SECRET_ACCESS_KEY` without a bucket are the expected state and still count as a fresh add. The
+removal (`analysis=disable` without `summary_fallback=on`) drops the vars together with the switch,
+and is refused when the raw store is live without the switch (those reads were served through it
+and would silently go off) or when the bucket stays a secret (dropping the switch would turn them
+on). An explicit `owner_buffered=on/off` dispatch with both inputs off would drop them the same
+way, so the same two refusals apply there (profile and preserve mode already refuse dropping any
+live setting); with no raw-store var and no switch live, the ordinary redeploy, nothing changes. Break-glass reads
 no live state, so it refuses `summary_fallback=on`. Turning timing, turns or metadata on is a
 separate decision with its own step (removing the switch from the Worker), never part of a
 `summary_fallback` or `analysis` dispatch.

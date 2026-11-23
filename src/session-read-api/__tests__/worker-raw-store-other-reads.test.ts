@@ -6,7 +6,7 @@
  * raw store; any other value refuses every request that reaches the configuration step (503, logged
  * by field name) and withholds the store from /v1/canonical/*.
  */
-import { afterEach, describe, expect, spyOn, test } from "bun:test";
+import { afterAll, afterEach, beforeAll, describe, expect, spyOn, test } from "bun:test";
 import { analysisDeps, babysitterEvidenceDeps, canonicalEventsDeps, handle, rawStoreOtherReadsEnabled, timingDeps, turnsDeps, type Env } from "../../../packages/session-read-worker/src/index.ts";
 import { rawStoreForCanonical } from "../../../packages/session-read-worker/src/canonical.ts";
 import type { TenantRunner } from "../liveness.ts";
@@ -99,6 +99,84 @@ describe("handle(): the switch value", () => {
       expect(errors.mock.calls.some((c) => String(c[0]).includes(`missing_${SWITCH}`))).toBe(true);
       expect(errors.mock.calls.some((c) => String(c[0]).includes(JSON.stringify(value)))).toBe(false);
       errors.mockRestore();
+    }
+  });
+});
+
+describe("handle(), authenticated: the switch reaches timing, turns and metadata through the real entry", () => {
+  const ORIGIN = "https://read.test.example";
+  const ISSUER = "https://relayauth.test.example";
+  // A JWKS URL of this file's own: the verifier caches keys per URL.
+  const JWKS = "https://relayauth.test.example/raw-store-other-reads/jwks.json";
+  const KID = "raw-store-other-reads";
+  const realFetch = globalThis.fetch;
+  let privateKey: CryptoKey;
+  beforeAll(async () => {
+    const pair = (await crypto.subtle.generateKey(
+      { name: "RSASSA-PKCS1-v1_5", modulusLength: 2048, publicExponent: new Uint8Array([1, 0, 1]), hash: "SHA-256" },
+      true,
+      ["sign", "verify"],
+    )) as CryptoKeyPair;
+    privateKey = pair.privateKey;
+    const jwk = { ...(await crypto.subtle.exportKey("jwk", pair.publicKey)), kid: KID, alg: "RS256", use: "sig" };
+    globalThis.fetch = (async (url: RequestInfo | URL) => {
+      if (String(url) !== JWKS) throw new Error("no network in this test");
+      return Response.json({ keys: [jwk] });
+    }) as typeof fetch;
+  });
+  afterAll(() => { globalThis.fetch = realFetch; });
+  afterEach(() => { (console.error as { mockRestore?: () => void }).mockRestore?.(); });
+  const token = async () => {
+    const enc = (v: unknown) => Buffer.from(JSON.stringify(v)).toString("base64url");
+    const now = Math.floor(Date.now() / 1000);
+    const head = enc({ alg: "RS256", kid: KID, typ: "JWT" });
+    const payload = enc({
+      iss: ISSUER, iat: now, exp: now + 60,
+      sub: "agent_relayhistory_assertion", meta: { tokenClass: "relayhistory_assertion" }, aud: [ORIGIN],
+      org: "org-a", wks: "ws-a", sponsorId: "u-1", scopes: ["rth:read"],
+    });
+    const sig = Buffer.from(await crypto.subtle.sign("RSASSA-PKCS1-v1_5", privateKey, new TextEncoder().encode(`${head}.${payload}`))).toString("base64url");
+    return `${head}.${payload}.${sig}`;
+  };
+  const base = {
+    CLICKHOUSE_URL: "https://ch.test.example", CLICKHOUSE_USER: "u", CLICKHOUSE_PASSWORD: "p", CLICKHOUSE_DATABASE: "d",
+    READ_API_ORIGIN: ORIGIN, READ_API_COMPLETE_SINCE: "epoch", READ_API_DIRECTORY_WORKSPACES: "ws-a",
+    RELAYAUTH_JWKS_URL: JWKS, RELAYAUTH_ISSUER: ISSUER,
+  };
+  const ctx = { waitUntil: () => {}, passThroughOnException: () => {} } as never;
+  const overrides = { connect: async () => { throw new Error("no database in this test"); }, fetcher: noFetch };
+  const ROUTES = [
+    ["/v1/sessions/s-1/timing?workspace=ws-a&source=claude", "timing_not_configured"],
+    ["/v1/sessions/s-1/turns?workspace=ws-a", "turns_not_configured"],
+    ["/v1/sessions/s-1/metadata?workspace=ws-a", "turns_not_configured"],
+  ] as const;
+  const get = async (env: Record<string, string | undefined>, path: string) => {
+    const response = await handle(
+      new Request(`${ORIGIN}${path}`, { headers: { authorization: `Bearer ${await token()}` } }),
+      env as unknown as Env,
+      ctx,
+      overrides as never,
+    );
+    return { status: response.status, body: await response.text() };
+  };
+
+  test("off with the raw store present: 501 timing_not_configured / turns_not_configured", async () => {
+    for (const [path, reason] of ROUTES) {
+      const { status, body } = await get({ ...base, ...rawStore, [SWITCH]: "off" }, path);
+      expect([path, status]).toEqual([path, 501]);
+      expect(body).toContain(reason);
+    }
+  });
+
+  test("unset or empty with the raw store present: past auth and the gate to the database (503), never those 501s", async () => {
+    spyOn(console, "error").mockImplementation(() => {});
+    for (const value of [undefined, ""]) {
+      for (const [path, reason] of ROUTES) {
+        const { status, body } = await get({ ...base, ...rawStore, [SWITCH]: value }, path);
+        // Past auth and the gate, the read reaches the (absent) database: 503, not a 401 or a 501.
+        expect([value, path, status]).toEqual([value, path, 503]);
+        expect([value, path, body.includes(reason)]).toEqual([value, path, false]);
+      }
     }
   });
 });

@@ -250,3 +250,82 @@ it.each(scenarios)(
     });
   },
 );
+
+it("raw-mode read: READ_API_RAW_STORE_OTHER_READS=off withholds the env-configured raw store; unset reaches it", async () => {
+  const location = {
+    prefix: "example/org_1",
+    workspaceId: "ws_1",
+    machineId: "machine_1",
+    harness: "claude",
+    sessionId: "sess_1",
+    startDate: "2026-11-01",
+  };
+  const pointer: CanonicalPointer = {
+    org_id: "org_1",
+    workspace_id: "ws_1",
+    harness: "claude",
+    session_id: "sess:1",
+    machine_id: "machine_1",
+    user_id: "user_1",
+    storage_provider: "s3",
+    bucket: "example-raw-bucket",
+    manifest_key: manifestKey(location),
+    content_sha256: "a".repeat(64),
+    raw_format: "ndjson",
+    revision: 1,
+    deleted_at: null,
+  };
+  const token = [
+    btoa("{}"),
+    btoa(
+      JSON.stringify({
+        role: "session_directory_search_worker",
+        app_metadata: { org_id: "org_1", workspace_ids: ["ws_1"] },
+      }),
+    ),
+    "fixture",
+  ].join(".");
+  const env = {
+    CANONICAL_READ_ENABLED: "true",
+    CANONICAL_SUPABASE_URL: "https://metadata.example.invalid",
+    CANONICAL_SUPABASE_API_KEY: "example-api-key",
+    PIPELINE_RAW_S3_BUCKET: "example-raw-bucket",
+    PIPELINE_RAW_S3_REGION: "us-east-1",
+    PIPELINE_RAW_S3_ENDPOINT: "https://store.example.invalid",
+    PIPELINE_RAW_S3_ACCESS_KEY_ID: "EXAMPLEACCESSKEY",
+    PIPELINE_RAW_S3_SECRET_ACCESS_KEY: "example-secret-key",
+    PIPELINE_KEY_PREFIX: "example",
+    PIPELINE_ORG_FROM_PREFIX: "true",
+  };
+  const run = async (sw: string | undefined) => {
+    const metadata: string[] = [],
+      store: string[] = [];
+    const fetcher = (async (input: RequestInfo | URL) => {
+      const url = new URL(input instanceof Request ? input.url : String(input));
+      if (url.hostname === "metadata.example.invalid") {
+        metadata.push(url.pathname);
+        return Response.json([pointer]);
+      }
+      store.push(url.hostname);
+      return new Response("", { status: 404 });
+    }) as typeof fetch;
+    const response = await canonicalHandle(
+      new Request(
+        "https://reader.invalid/v1/canonical/sessions/sess%3A1?workspace=ws_1&source=claude&limit=1",
+        { headers: { authorization: "Bearer " + token } },
+      ),
+      sw === undefined ? env : { ...env, READ_API_RAW_STORE_OTHER_READS: sw },
+      fetcher,
+    );
+    return { response, metadata, store };
+  };
+  const off = await run("off");
+  expect(off.response.status).toBe(503);
+  expect(off.response.headers.get("X-Session-Read-Reason")).toBe("not_configured");
+  expect(off.store).toEqual([]);
+  expect(off.metadata).toEqual([]);
+  const unset = await run(undefined);
+  expect(unset.response.headers.get("X-Session-Read-Reason")).not.toBe("not_configured");
+  expect(unset.metadata).toEqual(["/rest/v1/rpc/session_directory_pointers"]);
+  expect(unset.store.length).toBeGreaterThan(0);
+});

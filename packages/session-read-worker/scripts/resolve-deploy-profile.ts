@@ -86,6 +86,12 @@ function rendersRawStore(env: Environment): boolean {
   return env.SUMMARY_FALLBACK === "on" || env.ANALYSIS === "on";
 }
 
+/** The owner_buffered inputs that select explicit mode (resolveProfile), where the live-settings guard does not run. */
+const EXPLICIT_MODES = ["on", "off"];
+
+/** The raw store's credential secrets: expected live without a bucket (the render never writes them). */
+const RAW_STORE_CREDENTIALS = ["PIPELINE_RAW_S3_ACCESS_KEY_ID", "PIPELINE_RAW_S3_SECRET_ACCESS_KEY"];
+
 /** The raw-store removal: analysis=disable without summary_fallback=on lets the dispatch drop the live raw-store vars. */
 function removesRawStore(env: Environment): boolean {
   return env.ANALYSIS === "disable" && env.SUMMARY_FALLBACK !== "on";
@@ -96,6 +102,9 @@ function removesRawStore(env: Environment): boolean {
  * rawStoreOtherReadsEnabled), decided from the live version so that rendering or removing the
  * raw store for the summary fallback or analysis never changes what timing, turns, metadata,
  * owner-buffered turns, hosted canonical events, babysitter evidence or /v1/canonical/* answer:
+ *   - the dispatch renders the raw store: first, in every mode, refused while any of RAW_STORE_VARS
+ *     is live as a secret, and refused while no PIPELINE_RAW_S3_BUCKET is live but another live
+ *     PIPELINE_RAW_* binding is (other than the two credential secrets and RAW_STORE_VARS);
  *   - the dispatch renders the raw store and the live Worker has the switch: keep it (only "off"
  *     is accepted; any other live value or a secret is refused);
  *   - it renders the raw store, the live Worker has PIPELINE_RAW_S3_BUCKET and no switch: add no
@@ -108,7 +117,9 @@ function removesRawStore(env: Environment): boolean {
  *     dropping it would silently turn them off), and refused while a live switch sits beside a
  *     secret bucket (dropping the switch would turn them on); otherwise "" (the switch is dropped
  *     with the vars);
- *   - otherwise "": nothing rendered, and a live switch is compared like any other live setting.
+ *   - otherwise "": nothing rendered. In profile and preserve mode a live switch and live plain
+ *     raw-store vars are compared like any other live setting; in explicit owner_buffered=on/off
+ *     mode (no such comparison) the two removal refusals above apply instead.
  * Returns "" or "off". Never turns those reads on; turning them on is a separate decision.
  * resolveProfile carries a non-empty value as RAW_STORE_OTHER_READS and ignores the key in its input.
  */
@@ -117,13 +128,37 @@ export function rawStoreOtherReads(version: Version, env: Environment): string {
   const sw = bindings.find((b) => b.name === RAW_STORE_OTHER_READS_VAR);
   const bucket = bindings.find((b) => b.name === RAW_STORE_VARS[0]);
   if (sw) need(sw.type === "plain_text" && sw.text === "off", `Live ${RAW_STORE_OTHER_READS_VAR} is not plain text "off"; explicit deployment review required`);
+  const livePlain = bindings.some((b) => (RAW_STORE_VARS as readonly unknown[]).includes(b.name) && b.type === "plain_text");
   if (removesRawStore(env)) {
-    const livePlain = bindings.some((b) => (RAW_STORE_VARS as readonly unknown[]).includes(b.name) && b.type === "plain_text");
     need(!livePlain || sw, `analysis=disable would drop the live raw-store vars that timing, turns and metadata read through (no live ${RAW_STORE_OTHER_READS_VAR}); keep summary_fallback=on or analysis=on, or remove them in a separate reviewed change`);
     need(!sw || !bucket || bucket.type === "plain_text", `analysis=disable would drop live ${RAW_STORE_OTHER_READS_VAR} while ${RAW_STORE_VARS[0]} stays a secret, turning timing, turns and metadata on; explicit deployment review required`);
     return "";
   }
-  if (!rendersRawStore(env)) return "";
+  if (!rendersRawStore(env)) {
+    // Explicit owner_buffered=on/off skips the live-settings guard (unchangedOtherSettings), which
+    // in profile and preserve mode already refuses dropping any of these live plain vars. Here the
+    // dispatch would drop them silently, so the two removal refusals apply. With none of them live
+    // (today's redeploy) nothing is refused and nothing changes.
+    if (EXPLICIT_MODES.includes(env.OWNER_BUFFERED?.trim() ?? "")) {
+      need(!livePlain || sw, `This dispatch (summary_fallback and analysis both off) would drop the live raw-store vars that timing, turns and metadata read through (no live ${RAW_STORE_OTHER_READS_VAR}); keep summary_fallback=on or analysis=on, or remove them in a separate reviewed change`);
+      need(!sw || !bucket || bucket.type === "plain_text", `This dispatch (summary_fallback and analysis both off) would drop live ${RAW_STORE_OTHER_READS_VAR} while ${RAW_STORE_VARS[0]} stays a secret, turning timing, turns and metadata on; keep summary_fallback=on or analysis=on, or remove them in a separate reviewed change`);
+    }
+    return "";
+  }
+  // From here the dispatch renders the raw store. In every mode, and before a live switch is
+  // accepted: never shadow a secret with a rendered plain var (explicit mode skips the
+  // live-settings guard that otherwise refuses it).
+  for (const name of RAW_STORE_VARS) {
+    need(bindings.find((b) => b.name === name)?.type !== "secret_text", `The render refuses replacing secret binding ${name} with a plain variable`);
+  }
+  // Fresh-add detection keys on PIPELINE_RAW_S3_BUCKET. Without it, any other live PIPELINE_RAW_*
+  // setting (a provider, endpoint, SSE mode or a store set up by hand) would be combined with the
+  // rendered values; only the two credential secrets are expected there.
+  if (!bucket) {
+    const other = bindings.find((b) => typeof b.name === "string" && b.name.startsWith("PIPELINE_RAW_") && !RAW_STORE_CREDENTIALS.includes(b.name) && !(RAW_STORE_VARS as readonly string[]).includes(b.name));
+    const shown = /^[A-Z0-9_]{1,64}$/.test(String(other?.name)) ? String(other?.name) : "another PIPELINE_RAW_* binding";
+    need(!other, `The live Worker has ${shown} without ${RAW_STORE_VARS[0]}; rendering the raw store would combine it with the rendered values; explicit deployment review required`);
+  }
   if (sw) return "off";
   if (!bucket) return "off";
   // The values this dispatch renders (render-deploy-config.ts rawStoreVars); compared here in every
@@ -131,7 +166,6 @@ export function rawStoreOtherReads(version: Version, env: Environment): string {
   const rendered = [(env.RAW_S3_BUCKET ?? "").trim(), (env.RAW_S3_REGION ?? "").trim(), TENANT_KEY_BASE, "true"];
   RAW_STORE_VARS.forEach((name, i) => {
     const live = bindings.find((b) => b.name === name);
-    need(live?.type !== "secret_text", `The render refuses replacing secret binding ${name} with a plain variable`);
     need(live?.type === "plain_text", `The live Worker has ${RAW_STORE_VARS[0]} without ${RAW_STORE_OTHER_READS_VAR} and without plain ${name}; rendering the raw store would change what timing, turns and metadata read; explicit deployment review required`);
     // An empty bucket or region is left to the render's own refusal, which names the variables.
     need(!rendered[i] || live.text === rendered[i], `This dispatch would change or drop live setting ${name}, which timing, turns and metadata read (no live ${RAW_STORE_OTHER_READS_VAR}); explicit deployment review required`);

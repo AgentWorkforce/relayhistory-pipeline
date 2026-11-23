@@ -269,3 +269,48 @@ it("old title-less index is explicit unavailable and unknown views never reach m
   expect(bad.reads()).toBe(0);
   expect(bad.claims()).toBe(0);
 });
+it("READ_API_RAW_STORE_OTHER_READS=off withholds the env-configured raw store from the analysis cache; unset reaches it", async () => {
+  const rawEnv = {
+    ...env,
+    CANONICAL_SUPABASE_URL: "https://metadata.example.invalid",
+    CANONICAL_SUPABASE_API_KEY: "example-api-key",
+    PIPELINE_RAW_S3_BUCKET: "example-raw-bucket",
+    PIPELINE_RAW_S3_REGION: "us-east-1",
+    PIPELINE_RAW_S3_ENDPOINT: "https://store.example.invalid",
+    PIPELINE_RAW_S3_ACCESS_KEY_ID: "EXAMPLEACCESSKEY",
+    PIPELINE_RAW_S3_SECRET_ACCESS_KEY: "example-secret-key",
+  };
+  const run = async (sw: string | undefined) => {
+    const f = await titleFixture("Example title");
+    const metadata: string[] = [],
+      store: string[] = [];
+    const fetcher = (async (input: RequestInfo | URL) => {
+      const url = new URL(input instanceof Request ? input.url : String(input));
+      if (url.hostname === "metadata.example.invalid") {
+        metadata.push(url.pathname);
+        return Response.json(
+          url.pathname.endsWith("/request_session_analysis_cache")
+            ? await f.deps.wake(identity, new AbortController().signal)
+            : await f.deps.publication(identity, new AbortController().signal),
+        );
+      }
+      store.push(url.hostname);
+      return new Response("", { status: 404 });
+    }) as typeof fetch;
+    const response = await canonicalAnalysisHandle(
+      request("workspace=ws-a&source=codex&view=title"),
+      sw === undefined ? rawEnv : { ...rawEnv, READ_API_RAW_STORE_OTHER_READS: sw },
+      fetcher,
+    );
+    return { response, metadata, store };
+  };
+  const off = await run("off");
+  expect(off.response.status).toBe(503);
+  expect(off.response.headers.get("X-Session-Read-Reason")).toBe("not_configured");
+  expect(off.store).toEqual([]);
+  expect(off.metadata).toEqual([]);
+  const unset = await run(undefined);
+  expect(unset.response.headers.get("X-Session-Read-Reason")).not.toBe("not_configured");
+  expect(unset.metadata).toContain("/rest/v1/rpc/request_session_analysis_cache");
+  expect(unset.store.length).toBeGreaterThan(0);
+});
