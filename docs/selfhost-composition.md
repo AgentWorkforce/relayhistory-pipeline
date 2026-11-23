@@ -304,7 +304,7 @@ auth, its order and every body bound are unchanged.
 
 | Env | Service | Meaning |
 | --- | --- | --- |
-| `READ_API_UPSTREAM_ASSERTION_MODE` / `INGEST_UPSTREAM_ASSERTION_MODE` | read API / ingest edge (self-host SERVICE only) | Unset, `""` or `off` (default): no key variable is read and behaviour is unchanged. `log`: every check runs and a failure is logged, the request continues. `enforce`: a failure is answered 401. Any other value fails startup, naming the variable only. A dormant service (its enable flag off) ignores it. |
+| `READ_API_UPSTREAM_ASSERTION_MODE` / `INGEST_UPSTREAM_ASSERTION_MODE` | read API / ingest edge (self-host SERVICE only) | Unset, `""` or `off` (default): no key variable is read and behaviour is unchanged. `log`: the same checks run in the same order and each failure is logged, the request continues; the checks before the body stop at the first failure, and when one of them fails the checks after the body read (body hash, body scope) are skipped for that request. `enforce`: a failure is answered 401. Any other value fails startup, naming the variable only. A dormant service (its enable flag off) ignores it. |
 | `..._PUBLIC_KEY` / `..._KID` | same | Required when the mode is `log` or `enforce`: the current verifying key as the canonical standard base64 of an Ed25519 SPKI DER public key, and its kid (`^[A-Za-z0-9._-]{1,64}$`). |
 | `..._PUBLIC_KEY_PREVIOUS` / `..._KID_PREVIOUS` | same | Optional, both or neither, with a kid different from the current one: a second accepted key for rotation. |
 
@@ -323,7 +323,8 @@ answer is the same generic 401 either way. After the bounded body read: the
 body hash, then,
 for routes whose scope is in the body (delivery batches and session selection),
 the scope derived from the parsed body. Targets with dot segments, `//`, `%2F`,
-`%5C` or a raw backslash in the path are refused; the query is not. The
+`%5C` or a raw backslash in the path are refused; the query is not. A target
+that contains `#` anywhere, path or query, is refused with reason `path`. The
 assertion relies on the router rule above ("Do not rewrite paths"): any prefix
 strip, slash merging or other path normalisation at the proxy makes it fail
 with a `path` refusal. The session scope is deduplicated, sorted, written as
@@ -341,7 +342,12 @@ aliasing), a `GET /v1/events` with a repeated `session=` or `q=` (the app
 answers 400) or with neither a non-empty `session=` nor a non-empty `q=`,
 `POST /v1/cli/login` on the read API and `POST /v1/turns/batches` on the
 ingest edge. So under `enforce` the CLI login and the turns upload are refused
-until they get table routes. An empty `session=` or `q=` value on
+until they get table routes. `GET /v1/sessions/summaries/search` and
+`GET /v1/sessions/:id/sources` on the read API have no rule, and none is
+predeclared. The gateway does not proxy either route, so behind an install
+where every request comes through the gateway both are unreachable whatever
+their flags say; under `enforce` a direct request to them is refused (`route`
+with an assertion, `missing` without). An empty `session=` or `q=` value on
 `GET /v1/events` counts as absent, as in the app (`src/session-read-api/app.ts`,
 `GET /v1/events`): a non-empty `session=` is the `read` route, else a
 non-empty `q=` with no `session=` value is the `filter` route.
@@ -350,27 +356,31 @@ non-empty `q=` with no `session=` value is the `filter` route.
   and every `OPTIONS` request.
 - Exempt: `POST /v1/auth/token/revoke` on the read API and
   `POST /v1/auth/token/refresh` on the ingest edge may come without an
-  assertion; one that is presented is validated, with access kind
-  `passthrough` and an empty session scope. Any other method or path next to
-  them (a trailing slash, `GET`) is no route.
+  assertion. One that is presented is validated in full: a valid one passes, an
+  invalid one is refused for its own reason. On the read API the revoke route
+  is not a table route; a presented assertion there is checked against a
+  fallback rule of access kind `passthrough` with an empty session scope, so it
+  is not refused as `route`. On the ingest edge the refresh route has its own
+  table rule, also `passthrough` with an empty session scope. Any other method
+  or path next to them (a trailing slash, `GET`) is no route.
 - Internal routes have no prefix exemption. The read API's internal token
   routes (exact paths, served only with `READ_API_AUTH_MODE=self_issued`) and
   the ingest edge's session erase routes keep their own internal-secret check as
   the deciding auth, and the assertion is not read there. Any other path,
   `/internal/` ones included, needs an assertion and, as it is on no table
   route, is refused (`route` with one, `missing` without).
-- Known limit: private custody routes are not exempt, so a custody client that
-  does not pass through the gateway is refused under `enforce`. In this repo the
-  custody routes are the ingest app's `POST /v1/custody/legacy-receipt`,
-  `/v1/custody/pending`, `/v1/custody/control/begin`,
-  `/v1/custody/control/complete`, `/v1/custody/authority/begin` and
-  `/v1/custody/authority/complete` (`src/session-ingest/app.ts`); their only
-  named caller is relayhistory's Worker, over a Cloudflare service binding
-  (the hosted ingest Worker, which never runs the check). The self-host ingest
-  edge does not serve them (501 `unsupported_by_backend`, and
-  `INGEST_CUSTODY_SOURCE` other than `relayhistory` fails startup), and the
-  edge never routes `/v1/custody/*` (rule 6 above). An install that has such a
-  custody client calling the ingest edge directly stays on `log`.
+- Custody routes have no exemption and no table rule: under `enforce` a
+  request to them without a valid assertion is refused (`missing` without one,
+  `route` with an otherwise valid one). In this repo the custody routes are the
+  ingest app's `POST /v1/custody/legacy-receipt`, `/v1/custody/pending`,
+  `/v1/custody/control/begin`, `/v1/custody/control/complete`,
+  `/v1/custody/authority/begin` and `/v1/custody/authority/complete`
+  (`src/session-ingest/app.ts`); their only named caller is relayhistory's
+  Worker, over a Cloudflare service binding (the hosted ingest Worker, which
+  never runs the check). The self-host ingest edge does not serve them in any
+  mode (501 `unsupported_by_backend`, and `INGEST_CUSTODY_SOURCE` other than
+  `relayhistory` fails startup), and the public router never forwards
+  `/v1/custody/*` (rule 6 above).
 - Unread bodies: a POST the read API answers without reading its body (for
   example a route whose flag is off) has its body checked as zero bytes, so under
   `enforce` a correctly signed POST with a body there is refused 401 (log reason

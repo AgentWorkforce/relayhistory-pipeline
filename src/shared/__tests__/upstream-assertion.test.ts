@@ -1,7 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import { gzipSync } from "node:zlib";
 import {
-  INGEST_UPSTREAM_ASSERTION_PREFIX, READ_API_UPSTREAM_ASSERTION_PREFIX, assertUpstreamAssertionOff, deliveryBatchScope, ingestRecordsScope,
+  INGEST_UPSTREAM_ASSERTION_PREFIX, READ_API_UPSTREAM_ASSERTION_PREFIX, assertUpstreamAssertionOff, checkUpstreamAssertion, deliveryBatchScope, ingestRecordsScope,
   sessionScope, sessionSelectionScope, sha256Hex, upstreamAssertionBypass, upstreamAssertionConfig, upstreamAssertionMode, upstreamAssertionRefusal,
   verifyUpstreamAssertionBody, verifyUpstreamAssertionPhase1, verifyUpstreamAssertionScope, type UpstreamAssertionConfig, type UpstreamAssertionPhase1,
 } from "../upstream-assertion.ts";
@@ -144,6 +144,38 @@ describe("phase 1: claims, time and bindings", () => {
     const target = "/v1/events?q=a%2Fb%5Cc";
     expect(reason(phase1(readToken({ access: "filter", sessions: [] }, { target }), { target }))).toBe("ok");
   });
+  test("a '#' in the target (path or query) is refused (path) even when signed exactly; enforce refuses, log reports and continues", () => {
+    const cases: [string, Partial<SignInput>][] = [
+      ["/v1/sessions/users#x/events", { access: "aggregate", sessions: [] }],
+      ["/v1/sessions/s-1/events#x", {}],
+      ["/v1/events?session=s-1#x", {}],
+      ["/v1/events?q=a#b", { access: "filter", sessions: [] }],
+    ];
+    for (const [target, over] of cases) {
+      const token = readToken(over, { target });
+      expect(reason(phase1(token, { target }))).toBe("path");
+      for (const mode of ["enforce", "log"] as const) {
+        const reported: string[] = [];
+        const result = checkUpstreamAssertion({ ...config, mode }, "session-read-api", { method: "GET", target, authorization: AUTH, assertion: token }, (r) => reported.push(r), NOW_MS);
+        expect(reported).toEqual(["path"]);
+        expect("refuse" in result ? result.refuse : "continue").toBe(mode === "enforce" ? "path" : "continue");
+      }
+    }
+    // The same targets without the '#' part pass (the refusal is the '#', not the route).
+    expect(reason(phase1(readToken({}, { target: "/v1/events?session=s-1" }), { target: "/v1/events?session=s-1" }))).toBe("ok");
+    expect(reason(phase1(readToken({ access: "filter", sessions: [] }, { target: "/v1/events?q=a" }), { target: "/v1/events?q=a" }))).toBe("ok");
+    // Order: the token checks before step 9 keep their own reasons; `path` comes before `credential`.
+    const target = "/v1/sessions/s-1/events#x";
+    expect(reason(phase1(undefined, { target }))).toBe("missing");
+    expect(reason(phase1("v1.x.y", { target }))).toBe("bad_format");
+    expect(reason(phase1(readToken({ key: testKey("k-other") }, { target }), { target }))).toBe("unknown_kid");
+    expect(reason(phase1(`v1.${readToken({}, { target }).split(".")[1]}.${readToken({ sessions: ["s-2"] }, { target }).split(".")[2]}`, { target }))).toBe("bad_signature");
+    expect(reason(phase1(readToken({ aud: "ingest-edge" }, { target }), { target }))).toBe("aud");
+    expect(reason(phase1(readToken({ nowS: NOW_S - 30, ttl: 30 }, { target }), { target }))).toBe("expired");
+    expect(reason(phase1(readToken({ method: "POST" }, { target }), { target }))).toBe("method");
+    expect(reason(phase1(readToken({}, { target }), { target, authorization: "Bearer other" }))).toBe("path");
+    expect(reason(phase1(readToken({}, { target }), { target, authorization: undefined }))).toBe("path");
+  });
   test("credential is sha256 of the exact Authorization value; spacing differences and a missing header fail", () => {
     const token = readToken();
     expect(reason(phase1(token, { authorization: "Bearer  sh_at_reader-token" }))).toBe("credential");
@@ -230,6 +262,13 @@ describe("phase 1: route table", () => {
       expect(ok(target, "filter")).toBe("route");
       expect(ok(target, "read", ["s-9"])).toBe("route");
       expect(ok(target, "passthrough")).toBe("route");
+    }
+  });
+  test("GET /v1/events with a non-empty session= and a non-empty q= is the read route: filter claims are refused (access), in either parameter order", () => {
+    for (const target of ["/v1/events?session=s&q=x", "/v1/events?q=x&session=s"]) {
+      expect(ok(target, "filter")).toBe("access");
+      expect(ok(target, "filter", ["s"])).toBe("access");
+      expect(ok(target, "read", ["s"])).toBe("ok");
     }
   });
   test("a route not in the table is refused (route) even with a valid passthrough assertion and an empty scope", () => {

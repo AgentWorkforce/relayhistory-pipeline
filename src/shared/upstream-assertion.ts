@@ -417,6 +417,8 @@ export function verifyUpstreamAssertionPhase1(
   if (claims.method !== request.method) return { ok: false, reason: "method" };
   // 9. the exact target, plus pathname hygiene
   if (claims.path !== request.target) return { ok: false, reason: "path" };
+  // A "#" has no place in a request target: the framework and this matcher could split it differently.
+  if (request.target.includes("#")) return { ok: false, reason: "path" };
   const segments = pathSegments(pathname);
   if (!segments) return { ok: false, reason: "path" };
   // 10. credential
