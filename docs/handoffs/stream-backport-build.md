@@ -86,12 +86,20 @@ same batch, or one with less than `STREAM_MIN_START_MS` (120 s) left before the
 deadline, is requeued with the existing 60 s delayed SQS message (log reason
 `stream_deferred`). Once the invocation's stream deadline has passed, no further scope of the batch is
 started, whether a whole read or a stream; the rest are requeued the same way
-(reason `stream_batch_deadline`). A scope that is already running when the
-deadline passes is not interrupted. A whole read runs to its end inside the 60 s
-margin. A streamed pass stops at its next check, and it does not start its tail
-(a batch of deletes, then the catalog write, the state row and COMMIT) with less
-than `STREAM_TAIL_RESERVE_MS` (30 s) left before the deadline, which is about 90 s
-before the function timeout.
+(reason `stream_batch_deadline`). A requeued scope comes back as a new SQS
+message: its receive count starts again, so a scope requeued this way never
+reaches the DLQ.
+
+A scope that is already running when the deadline passes is not interrupted. A
+whole read normally ends inside the 60 s margin, but nothing guarantees it: each
+ClickHouse statement may take up to 60 s and the state-row insert up to 300 s. A
+streamed pass stops at its next check. It does not start its tail (a batch of
+deletes, then the catalog write, the state row and COMMIT) with less than
+`STREAM_TAIL_RESERVE_MS` (30 s) left before the deadline, which is about 90 s
+before the function timeout. The tail check runs even when there is nothing to
+delete. So a streamed pass has about 210 s (the deadline less the 30 s reserve)
+for its reads, scan and inserts, not about 240 s. A pass that finishes those inside
+the reserve is cut with `scope_too_large,stream_deadline` and stays partial.
 
 A stopped streamed pass (deadline, a read budget) returns success: the message is
 deleted from the queue and the scope stays `needs_full = 1` until its next upload
@@ -146,22 +154,27 @@ message fails and is redelivered. With the flag off there is no listener, exactl
 as before; there the transaction stays open only briefly.
 
 Before arming the flag, an operator should confirm that the role's
-`idle_in_transaction_session_timeout` is either 0 or above about 60 s. The idle
-gaps between the pass's statements can last as long as one ClickHouse statement,
-whose timeout is 60 s. The same applies to a connection pooler's own idle limit,
-if one sits in between.
+`idle_in_transaction_session_timeout` is either 0 or at least 300 s, on the server
+and on any connection pooler in between. The pass inserts its state rows (the
+pre-mark, a stop and the final row) with the ClickHouse client's default insert
+timeout of 300 s, and the Postgres transaction is idle while each insert runs.
 
 ## Known behaviour while a scope streams
 
 - From the start of a streamed pass until its end, the session's state row reads
   `needs_full = 1` (the pre-mark, 1 ms before the pass's own state row). Main has
   the same in its pending row. A complete pass then records `needs_full = 0`.
-- A scope that needs more time than one invocation's deadline allows (about 240 s
-  for all four passes, the scan and the writes) is cut on every attempt. Nothing is
+- A scope that needs more time than one invocation allows (about 210 s for all four
+  passes, the scan and the inserts, see the tail reserve above) is cut on every attempt. Nothing is
   lost, but it stays `needs_full = 1`. The pass emits no new signal for this; the
   existing warn line is enough to find it. Search the pipeline's logs for
   `"message":"search index partial"` with `"reason":"scope_too_large,stream_deadline"`.
   The same `org_id` and `session_id` turning up on each attempt is such a scope.
   `"reason":"scope_too_large,stream_read_events_budget"` is a scope whose index holds
-  more identities than the events budget. A plain `"reason":"scope_too_large"` is a
-  scope above the streamed limit, refused as before.
+  more identities than the events budget. A plain `"reason":"scope_too_large"` only
+  says the scope was partial and did not stream: the consumer writes that literal for
+  every partial result of the whole read, whatever its reasons (above the streamed
+  limit, a missing manifest, the flag off).
+- Known limit: after the reserve check the tail is not bounded in time. One delete
+  batch may take up to 60 s and the state-row insert up to 300 s. A timeout for the
+  stream's own statements is a possible follow-up; it is not built here.
