@@ -237,7 +237,7 @@ export { ACCEPTANCE_MISSING };
  * (packages/pipeline relayhistory-transform and the projection), which live outside this file;
  * otherwise purge the stamps (docs/handoffs/acceptance-skip.md).
  */
-export const ACCEPTANCE_SKIP_VERSION = "acceptance-skip-v1";
+export const ACCEPTANCE_SKIP_VERSION = "acceptance-skip-v2";
 /** `search_ingest_state` names of acceptance stamps; no other state name starts with it. */
 export const ACCEPTANCE_STAMP_PREFIX = "acceptance_skip/";
 

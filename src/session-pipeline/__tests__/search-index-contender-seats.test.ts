@@ -187,6 +187,10 @@ describe("record id groups", () => {
     // group has a seated member even though one copy has none.
     const d = await writeSession("srv_dd", [[say("m", 1), ...unseatedPair("u", 2)], [say("m", 1, { accepted_seq: "7" }), say("m", 1, other)]]);
     for (const r of await both([d])) expect([r.reasons[0], r.contenderSeats]).toEqual([ACCEPTANCE_MISSING, "both"]);
+    // The same, seated copy first: a later unseated copy of the same revision does not replace
+    // the merged seat, so the group still has a seated member.
+    const g = await writeSession("srv_gg", [[say("m", 1, { accepted_seq: "7" }), ...unseatedPair("u", 2)], [say("m", 1), say("m", 1, other)]]);
+    for (const r of await both([g])) expect([r.reasons[0], r.contenderSeats]).toEqual([ACCEPTANCE_MISSING, "both"]);
     // A newer revision replaces the older seat: the old seated revision does not count.
     const e = await writeSession("srv_ee", [[say("n", 1, { accepted_seq: "1" }), rec("session_event", "n", "2", { ts_ms: t(1), text: "edited", role: "assistant" }), say("n", 1, other)]]);
     for (const r of await both([e])) expect([r.reasons[0], r.contenderSeats]).toEqual([ACCEPTANCE_MISSING, "all_unseated"]);

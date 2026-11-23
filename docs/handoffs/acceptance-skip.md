@@ -90,9 +90,12 @@ normal acceptance-missing pass. No new log key is added.
 
 The digest is sha256 over JSON of these inputs:
 
-- the salt `ACCEPTANCE_SKIP_VERSION` (`acceptance-skip-v1`). Bump it with any change to how a
+- the salt `ACCEPTANCE_SKIP_VERSION` (`acceptance-skip-v2`). Bump it with any change to how a
   pass reads, folds or decides this outcome, including the acceptance fold and the transform
-  outside this file (see "Before turning it on");
+  outside this file (see "Before turning it on"). The salt went from `acceptance-skip-v1` to
+  `acceptance-skip-v2` with the change that keeps legacy kinds out of the cross-origin fold.
+  A build with that change does not honour a stamp written by a build without it, and the
+  other way round. So deploying or rolling back that change needs no stamp purge;
 - the scope (org, workspace, harness, session);
 - the window marker: `default:14d`, or `stored:<window_start>`;
 - `limits.maxScopeBytes` and `limits.maxScopeEvents`;

@@ -539,6 +539,27 @@ describe("flag on: stamps that never skip", () => {
       expect(JSON.parse(stampsOf(ch.ingest).at(-1)!.value)).toEqual({ v: 1, reason: ACCEPTANCE_MISSING, digest: await currentDigest() });
     }, 60_000);
 
+  test("a stamp written under another salt (the previous acceptance-skip-v1) never skips; the same digest under the current salt does", async () => {
+    await acceptanceScope();
+    const facts = await live();
+    const limits = { maxScopeBytes: 64 * 1024 * 1024, maxScopeEvents: 100_000 };
+    const rows = facts.map((p) => JSON.stringify([p.manifest_key, p.machine_id, p.revision, p.content_sha256, p.manifest_etag, p.scrubbed])).sort();
+    const digestUnder = (salt: string) =>
+      createHash("sha256")
+        .update(JSON.stringify([salt, [scope.orgId, scope.workspaceId, scope.harness, scope.sessionId], "default:14d", [limits.maxScopeBytes, limits.maxScopeEvents], null, rows]))
+        .digest("hex");
+    expect(ACCEPTANCE_SKIP_VERSION).not.toBe("acceptance-skip-v1");
+    const old = fakeClickHouse();
+    old.ingest.push(stampRow({ v: 1, reason: ACCEPTANCE_MISSING, digest: digestUnder("acceptance-skip-v1") }, NOW.getTime() - 1_000));
+    const s = searchDeps(old.ch, ON);
+    const result = await indexSearchScope(scope, s.deps);
+    expect(result.skippedBeforeRead).toBeUndefined();
+    expect(s.reads).toHaveLength(2);
+    const cur = fakeClickHouse();
+    cur.ingest.push(stampRow({ v: 1, reason: ACCEPTANCE_MISSING, digest: digestUnder(ACCEPTANCE_SKIP_VERSION) }, NOW.getTime() - 1_000));
+    expect(await indexSearchScope(scope, searchDeps(cur.ch, ON).deps)).toEqual(SKIPPED);
+  }, 60_000);
+
   test("just under the age bound skips; a non-numeric or missing time does not", async () => {
     await acceptanceScope();
     const fresh = fakeClickHouse();
@@ -586,7 +607,7 @@ describe("flag on: stamps that never skip", () => {
     const expected = createHash("sha256")
       .update(JSON.stringify([ACCEPTANCE_SKIP_VERSION, [scope.orgId, scope.workspaceId, scope.harness, scope.sessionId], "default:14d", [limits.maxScopeBytes, limits.maxScopeEvents], null, rows]))
       .digest("hex");
-    expect(ACCEPTANCE_SKIP_VERSION).toBe("acceptance-skip-v1");
+    expect(ACCEPTANCE_SKIP_VERSION).toBe("acceptance-skip-v2");
     expect(acceptanceDigest(scope, facts, "default:14d", limits, undefined)).toBe(expected);
     expect(acceptanceDigest(scope, [...facts].reverse(), "default:14d", limits, undefined)).toBe(expected);
     expect(acceptanceDigest(scope, facts, "default:14d", limits, { maxReadBytes: 1, maxReadEvents: 1 })).not.toBe(expected);

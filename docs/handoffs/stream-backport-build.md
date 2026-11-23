@@ -313,7 +313,31 @@ This is a behaviour change with no flag. It brings the lineage to main's rule: a
 whose only unseated cross-origin contenders are legacy kinds stops being refused with
 `relayhistory_acceptance_missing`. Legacy records still project no rows (the catalog-key
 fold gives them no key), so a scope that now passes indexes only its delivery records.
-Groups of delivery records are refused exactly as before.
+
+Legacy records also no longer hide or win over delivery records. So the outcome for some
+groups of delivery records changes too:
+
+- Some groups that used to pass now refuse with `relayhistory_acceptance_missing`. Example:
+  an unseated delivery record and a newer, seated legacy record under one (origin, record
+  id), and a seated delivery record with that record id from another origin. The legacy
+  record used to take the first origin's seat and hide the unseated record. Now the two
+  delivery records contend, and the group refuses.
+- Some rows that were suppressed now appear. Example: the same shape with both delivery
+  records seated. The legacy record used to win the group, and it projects nothing. Now the
+  delivery record with the higher accepted_seq wins and projects its row.
+
+This is main's behaviour. There is no backfill: such rows appear, or such a refusal
+happens, only on the next reconcile of that scope.
+
+The transform change also reaches the two other readers of `normalizeRelayhistoryRecords`:
+`readRelayhistoryExport` (used by the session brief input, `src/session-brief/input.ts`)
+and `RelayhistoryExportTransform.normalize`. On this lineage legacy records project no
+rows on either path: `projectRelayhistorySession` counts them as unprojected. The two
+effects above apply there as well, within one manifest: such a manifest's brief input now
+refuses, or now carries the event that was suppressed. In this repository only tests
+create a `RelayhistoryExportTransform`. Its output object is create-only under an
+unchanged `RELAYHISTORY_NORMALIZED_VERSION`, so an object written before the change is
+reused, not rewritten.
 
 The streamed read's payload-free seat fold (`search-index-stream.ts`) and the
 `contender_seats` mirror (`contender-seats.ts`) follow the same rule, so the streamed read

@@ -32,7 +32,7 @@ import type { SqlExecutor } from "@rhc/lib/pipeline/queue.ts";
 import type { ClickHouseClient } from "../vendor/search-index/clickhouse.ts";
 import type { IndexRow } from "../vendor/search-index/rows.ts";
 import { EVENTS_TABLE, SESSION_STATE_TABLE } from "../vendor/search-index/schema.ts";
-import { SEARCH_INDEX_STREAM_CH_BUDGET, STREAM_TAIL_RESERVE_MS, indexSearchScope, projectedToNeonRow, readChunkRecords, type SearchIndexDeps } from "../search-index.ts";
+import { ACCEPTANCE_MISSING, SEARCH_INDEX_STREAM_CH_BUDGET, STREAM_TAIL_RESERVE_MS, indexSearchScope, projectedToNeonRow, readChunkRecords, type SearchIndexDeps } from "../search-index.ts";
 import { STREAM_PASSES, streamScope } from "../search-index-stream.ts";
 import { transaction } from "../lambda.ts";
 import { chunkKeys } from "../../shared/vendor.ts";
@@ -318,6 +318,61 @@ describe("streamed reconcile", () => {
     const second = await run([b, a]);
     expect(second.wr).toMatchObject({ complete: false, deleted: 0, reasons: ["relayhistory_event_identity"] });
     expect(second.sr).toMatchObject({ complete: false, deleted: 0, inserted: 0, streamed: true, reasons: ["relayhistory_event_identity"] });
+  });
+
+  test("a direct line's owner is the FIRST manifest with a legacy record of its identity, with the line in between", async () => {
+    // Legacy records for the line's (origin, record id) in manifests 0 and 2, the line in 1:
+    // the whole read's owner is manifest 0 (srv_aa, the machine the line names); keeping the
+    // last legacy manifest would make the stream's owner manifest 1 and refuse the line.
+    const line = rec("convergence_event", "d9", "1", {
+      source: "claude", session_id: scope.sessionId, machine_id: "srv_aa", user_id: "user_1", event_id: "d9", kind: "assistant", type: "assistant",
+      ts: new Date(t(9)).toISOString(), content: "direct nine", tags: [], files_touched: [], task_ref: {},
+    }, { origin_id: "machine:srv_aa" });
+    const lg = rec("legacy_scope", "d9", "1", { note: "n" }, { origin_id: "machine:srv_aa" });
+    const a = await writeSession("srv_aa", [[say("r1", "1", 1, "one"), lg]]);
+    const b = await writeSession("srv_bb", [[say("r2", "1", 2, "two"), line]]);
+    const c = await writeSession("srv_cc", [[say("r3", "1", 3, "three"), lg]]);
+    const keys = [a, b, c];
+    const whole = fakeClickHouse();
+    const w = deps(whole.ch, () => keys);
+    const wr = await indexSearchScope(scope, w.d);
+    expect(wr).toMatchObject({ complete: true, reasons: [] });
+    const streamed = fakeClickHouse();
+    const s = deps(streamed.ch, () => keys, armed);
+    expect(await indexSearchScope(scope, s.d)).toEqual({ ...wr, streamed: true });
+    expect(streamed.final()).toEqual(whole.final());
+    expect(s.catalogs).toEqual(w.catalogs);
+    expect(whole.final().some((r) => r.event_id === "d9" && r.machine_id === "srv_aa")).toBe(true);
+  });
+
+  test("legacy records no longer hide or win over delivery records: a group that passed now refuses, a suppressed row now appears", async () => {
+    // A newer, seated legacy record under the desktop origin's "x". Before the backport it took
+    // that origin's seat; now the delivery records contend on their own.
+    const legacyX = rec("legacy_scope", "x", "2", { note: "n" }, { accepted_seq: "9" });
+    const fromOther = (seq: string) => say("x", "1", 1, "x from other", { origin_id: "other-origin", accepted_seq: seq });
+    const run = async (keys: string[]) => {
+      const whole = fakeClickHouse();
+      const w = deps(whole.ch, () => keys);
+      const wr = await indexSearchScope(scope, w.d);
+      const streamed = fakeClickHouse();
+      const s = deps(streamed.ch, () => keys, armed);
+      return { whole, w, wr, streamed, s, sr: await indexSearchScope(scope, s.d) };
+    };
+    // a. The desktop "x" has no accepted_seq: no longer hidden, its group refuses on both reads.
+    const a = await run([await writeSession("srv_aa", [[say("x", "1", 1, "x from desktop"), legacyX, fromOther("3"), say("r2", "1", 2, "two")]])]);
+    expect(a.wr).toMatchObject({ complete: false, inserted: 0, deleted: 0, contenderSeats: "seated_unseated" });
+    expect(a.wr.reasons[0]).toBe(ACCEPTANCE_MISSING);
+    expect(a.sr).toMatchObject({ complete: false, inserted: 0, deleted: 0, streamed: true, reasons: [ACCEPTANCE_MISSING], contenderSeats: "seated_unseated" });
+    expect(a.whole.final()).toEqual([]);
+    expect(a.streamed.final()).toEqual([]);
+    // b. The desktop "x" is seated (2), the other origin's (3) wins: the legacy record (9) no
+    // longer wins the group, so a row for "x" now appears, on both reads alike.
+    const b = await run([await writeSession("srv_bb", [[say("x", "1", 1, "x from desktop", { accepted_seq: "2" }), legacyX, fromOther("3"), say("r3", "1", 3, "three")]])]);
+    expect(b.wr).toMatchObject({ complete: true, reasons: [] });
+    expect(b.sr).toEqual({ ...b.wr, streamed: true });
+    expect(b.streamed.final()).toEqual(b.whole.final());
+    expect(b.s.catalogs).toEqual(b.w.catalogs);
+    expect(b.whole.final().map((r) => [r.delivery_record_id, r.content]).sort()).toEqual([["r3", "three"], ["x", "x from other"]]);
   });
 
   test("redelivery is idempotent: nothing inserted or deleted, rows unchanged", async () => {
