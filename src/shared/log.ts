@@ -18,7 +18,23 @@ export const ALLOWED_LOG_FIELDS = new Set([
   "state", "rule", "kind", "port", "ok", "reason", "key_sha256", "manifest_key_sha256",
   "migration", "ledger_sha", "accepted_as_alias_of",
   "route", "correlation_id",
+  // Queue and upload latency of the session pipeline's lines (session-pipeline/consumer.ts); value rules below.
+  "event_age_ms", "s3_event_age_ms", "queue_origin",
 ]);
+
+/** Allowlisted keys that survive only as a non-negative safe integer; any other value is dropped. */
+export const NON_NEGATIVE_INTEGER_FIELDS: ReadonlySet<string> = new Set(["event_age_ms", "s3_event_age_ms"]);
+
+/** Allowlisted keys that survive only as one of a fixed set of strings; any other value is dropped. */
+export const EXACT_VALUE_FIELDS: ReadonlyMap<string, ReadonlySet<string>> = new Map([["queue_origin", new Set(["s3", "requeue", "sweep"])]]);
+
+/** Whether an allowlisted key's value passes its value rule (keys without a rule: always). */
+function valueAllowed(k: string, v: unknown): boolean {
+  if (NON_NEGATIVE_INTEGER_FIELDS.has(k)) return typeof v === "number" && Number.isSafeInteger(v) && v >= 0;
+  const exact = EXACT_VALUE_FIELDS.get(k);
+  if (exact) return typeof v === "string" && exact.has(v);
+  return true;
+}
 
 export type Level = "debug" | "info" | "warn" | "error";
 const service = process.env.OTEL_SERVICE_NAME ?? "96bulls";
@@ -30,6 +46,7 @@ function filter(fields: Record<string, unknown>): Record<string, unknown> {
   for (const [k, v] of Object.entries(fields)) {
     if (!ALLOWED_LOG_FIELDS.has(k)) continue;
     if (v === undefined) continue;
+    if (!valueAllowed(k, v)) continue;
     // Strings are scrubbed again before emit as a backstop; ids never match a rule.
     out[k] = typeof v === "string" ? scrubText(v).slice(0, 256) : v;
   }

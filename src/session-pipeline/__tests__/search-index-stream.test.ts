@@ -39,6 +39,7 @@ import { chunkKeys } from "../../shared/vendor.ts";
 import { EventEmitter } from "node:events";
 import { zstdDecompressSync } from "node:zlib";
 import { processBatch, type ConsumerDeps } from "../consumer.ts";
+import { requeueBody } from "../s3-events.ts";
 import { droppedFanout, type SessionScope } from "../pointer.ts";
 import { memoryLock } from "./support.ts";
 
@@ -675,19 +676,25 @@ describe("streamed reconcile", () => {
     const db = { ...sb.tx, pool: undefined, end: async () => {} } as unknown as HoopDb;
     const bindings = { PIPELINE_ORG_FROM_PREFIX: "true", PIPELINE_KEY_PREFIX: "96bulls" };
     const requeued: string[] = [];
+    // Each requeue's key with the oldest upload time it carries.
+    const carried: [string, string | undefined][] = [];
     const transact: SearchIndexDeps["transact"] = async (work) => work({ query: async (text: string, params?: unknown[]) => {
       if (text.includes("FROM sessions.session_index") && text.includes("deleted_at IS NULL"))
         return { rows: all.filter((k) => k.includes(`/s=${String(params?.[3])}/`)).map((manifest_key) => ({ manifest_key })) } as never;
       return sb.tx.query(text, params);
     } });
-    const consumer = (search: Partial<SearchIndexDeps>): ConsumerDeps => ({
+    const consumer = (search: Partial<SearchIndexDeps>, now?: () => number): ConsumerDeps => ({
       pointer: { db, lock: memoryLock(), reader, exists: async (k) => (await store.head(objectKey(k))) !== undefined, orgs: prefixOrgResolver, allowPrefix: (prefix, org) => prefixAllowed(bindings, prefix, org), fanout: droppedFanout },
       // Whole-read bound 3 events: the small sessions read whole, the rich one streams.
       search: { ...deps(ch.ch, () => [], { limits: { maxScopeEvents: 3 }, stream: { ...SEARCH_INDEX_STREAM_CH_BUDGET }, ...search }).d, transact },
-      requeue: async (k) => void requeued.push(k),
+      requeue: async (k, time) => {
+        requeued.push(k);
+        carried.push([k, time]);
+      },
+      ...(now ? { now } : {}),
     });
     const put = (key: string, seq: string) => ({ messageId: `m${seq}`, body: JSON.stringify({ Records: [{ eventSource: "aws:s3", eventName: "ObjectCreated:Put", eventTime: AT, s3: { bucket: { name: "bucket" }, object: { key, eTag: "e", sequencer: seq } } }] }) });
-    return { rich, small, ch, requeued, consumer, put };
+    return { rich, small, ch, requeued, carried, consumer, put };
   }
 
   test("a batch whose streamed scope spends its deadline requeues the rest: inside the deadline, nothing failed", async () => {
@@ -725,6 +732,60 @@ describe("streamed reconcile", () => {
     expect(out.batchItemFailures).toEqual([]);
     expect(requeued).toEqual([rich[1]]);
     expect(ch.state.map((r) => [r.session_id, r.needs_full])).toEqual([["sess_2", 0], ["sess_3", 0]]);
+  });
+
+  /** The real logger's "search index reconciled" lines while `work` runs. */
+  async function reconciledLines(work: () => Promise<unknown>): Promise<Record<string, unknown>[]> {
+    const lines: Record<string, unknown>[] = [];
+    const out = process.stdout.write.bind(process.stdout);
+    const err = process.stderr.write.bind(process.stderr);
+    const grab = ((chunk: unknown) => {
+      for (const l of String(chunk).split("\n")) if (l.startsWith("{")) lines.push(JSON.parse(l) as Record<string, unknown>);
+      return true;
+    }) as typeof process.stdout.write;
+    process.stdout.write = grab;
+    process.stderr.write = grab;
+    try {
+      await work();
+    } finally {
+      process.stdout.write = out;
+      process.stderr.write = err;
+    }
+    return lines.filter((l) => l.message === "search index reconciled");
+  }
+  const lag = (l: Record<string, unknown> | undefined) => ({ s3_event_age_ms: l?.s3_event_age_ms, event_age_ms: l?.event_age_ms, queue_origin: l?.queue_origin });
+
+  test("a stream deferred for time carries its oldest upload time: the later pass reports the age since upload, origin requeue", async () => {
+    const { rich, small, carried, consumer, put } = await batchFixture();
+    await processBatch([put(small[0]!, "01"), put(small[1]!, "02"), put(rich[1]!, "03")], consumer({ streamSlot: { used: false }, streamDeadline: { at: 100_000, now: () => 0 } }));
+    expect(carried).toEqual([[rich[1], AT]]);
+    const T0 = Date.parse(AT);
+    const lines = await reconciledLines(() =>
+      processBatch(
+        [{ messageId: "r1", body: requeueBody(rich[1]!, carried[0]![1]), sentTimestamp: String(T0 + 60_000) }],
+        consumer({ streamSlot: { used: false }, streamDeadline: { at: 10_000_000, now: () => 0 } }, () => T0 + 90_000),
+      ),
+    );
+    expect(lines.map((l) => [l.session_id, l.ok])).toEqual([["sess_1", true]]);
+    expect(lag(lines[0])).toEqual({ s3_event_age_ms: 90_000, event_age_ms: 30_000, queue_origin: "requeue" });
+  });
+
+  test("whole reads requeued at the batch deadline carry their oldest upload time: the later pass reports it, origin requeue", async () => {
+    const { small, carried, consumer, put } = await batchFixture();
+    await processBatch([put(small[0]!, "01"), put(small[1]!, "02")], consumer({ streamSlot: { used: false }, streamDeadline: { at: 100, now: () => 200 } }));
+    expect(carried).toEqual([[small[0], AT], [small[1], AT]]);
+    const T0 = Date.parse(AT);
+    const lines = await reconciledLines(() =>
+      processBatch(
+        carried.map(([key, time], i) => ({ messageId: `r${i}`, body: requeueBody(key, time), sentTimestamp: String(T0 + 40_000 + i * 1_000) })),
+        consumer({}, () => T0 + 45_000),
+      ),
+    );
+    expect(lines.map((l) => l.session_id).sort()).toEqual(["sess_2", "sess_3"]);
+    expect(lines.map(lag)).toEqual([
+      { s3_event_age_ms: 45_000, event_age_ms: 5_000, queue_origin: "requeue" },
+      { s3_event_age_ms: 45_000, event_age_ms: 4_000, queue_origin: "requeue" },
+    ]);
   });
 
   test("a connection error emitted on the checked-out client mid-pass fails the message, never an uncaught exception", async () => {

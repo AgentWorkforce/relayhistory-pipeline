@@ -2,10 +2,11 @@ import { describe, expect, test } from "bun:test";
 import { createHash } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
-import { signV4 } from "../aws-json.ts";
-import { decodeS3Key, parseQueueBody, sequencerAfter } from "../s3-events.ts";
+import { signV4, type awsJsonCall } from "../aws-json.ts";
+import { decodeS3Key, parseQueueBody, requeueBody, sequencerAfter } from "../s3-events.ts";
 import { SUPABASE_PROD_CA_2021 } from "../supabase-ca.ts";
-import { handler, lambdaEnv, parseSecret } from "../lambda.ts";
+import { BUSY_REQUEUE_DELAY_SECONDS, handler, lambdaEnv, parseSecret, queueRecords, sqsRequeue } from "../lambda.ts";
+import { sentTimestampMs } from "../consumer.ts";
 
 const here = (p: string) => fileURLToPath(new URL(p, import.meta.url));
 
@@ -82,6 +83,7 @@ describe("S3 event notifications", () => {
           sequencer: "0055AED6DCD90281E5",
         },
       ],
+      origin: "s3",
     });
   });
 
@@ -91,15 +93,17 @@ describe("S3 event notifications", () => {
       expect(parsed).toEqual({
         kind: "events",
         events: [{ provider: "s3", key: "a", bucket: "bucket", eventTime: "2026-11-01T18:00:00.000Z", sequencer: "01", deleted: true }],
+        origin: "s3",
       });
     }
   });
 
   test("restores, replication and other sources are ignored; the test event is recognized", () => {
-    expect(parseQueueBody(s3Body("ObjectRestore:Completed", { key: "a" }))).toEqual({ kind: "events", events: [] });
+    expect(parseQueueBody(s3Body("ObjectRestore:Completed", { key: "a" }))).toEqual({ kind: "events", events: [], origin: "s3" });
     expect(parseQueueBody(JSON.stringify({ Records: [{ eventSource: "aws:sqs", eventName: "ObjectCreated:Put", s3: { object: { key: "a" } } }] }))).toEqual({
       kind: "events",
       events: [],
+      origin: "s3",
     });
     expect(parseQueueBody(JSON.stringify({ Service: "Amazon S3", Event: "s3:TestEvent", Bucket: "b" }))).toEqual({ kind: "test" });
     expect(parseQueueBody("not json")).toEqual({ kind: "invalid" });
@@ -110,6 +114,95 @@ describe("S3 event notifications", () => {
     expect(parseQueueBody(JSON.stringify({ reconcile: { key: KEY, etag: "e" } }))).toEqual({
       kind: "events",
       events: [{ provider: "s3", key: KEY, etag: "e" }],
+      origin: "sweep",
+    });
+  });
+
+  test("a requeue body: key, the requeued marker, and the oldest upload event time only when known", () => {
+    for (const none of [undefined, ""]) expect(requeueBody(KEY, none)).toBe(JSON.stringify({ reconcile: { key: KEY, requeued: true } }));
+    expect(requeueBody(KEY)).toBe(JSON.stringify({ reconcile: { key: KEY, requeued: true } }));
+    const carried = requeueBody(KEY, "2026-11-01T18:00:00.000Z");
+    expect(carried).toBe(JSON.stringify({ reconcile: { key: KEY, requeued: true, oldest_event_time: "2026-11-01T18:00:00.000Z" } }));
+    expect(parseQueueBody(carried)).toEqual({ kind: "events", events: [{ provider: "s3", key: KEY, oldestEventTime: "2026-11-01T18:00:00.000Z" }], origin: "requeue" });
+    expect(parseQueueBody(requeueBody(KEY))).toEqual({ kind: "events", events: [{ provider: "s3", key: KEY }], origin: "requeue" });
+  });
+
+  test("old-shaped reconcile bodies still parse: sweep unless they carry a time; only a literal true marks a requeue", () => {
+    // The body every build before the marker requeued, and the sweep's two shapes: origin sweep.
+    expect(parseQueueBody(JSON.stringify({ reconcile: { key: KEY } }))).toEqual({ kind: "events", events: [{ provider: "s3", key: KEY }], origin: "sweep" });
+    expect(parseQueueBody(JSON.stringify({ reconcile: { key: KEY, etag: "e", version: "v1" } }))).toEqual({
+      kind: "events",
+      events: [{ provider: "s3", key: KEY, etag: "e", version: "v1" }],
+      origin: "sweep",
+    });
+    // A requeue written with a time but before the marker: requeue.
+    expect(parseQueueBody(JSON.stringify({ reconcile: { key: KEY, oldest_event_time: "2026-11-01T18:00:00.000Z" } }))).toEqual({
+      kind: "events",
+      events: [{ provider: "s3", key: KEY, oldestEventTime: "2026-11-01T18:00:00.000Z" }],
+      origin: "requeue",
+    });
+    for (const bad of [123, null, "", { at: 1 }]) {
+      expect(parseQueueBody(JSON.stringify({ reconcile: { key: KEY, oldest_event_time: bad } }))).toEqual({ kind: "events", events: [{ provider: "s3", key: KEY }], origin: "sweep" });
+    }
+    for (const marker of ["true", 1, false, null, {}]) {
+      expect(parseQueueBody(JSON.stringify({ reconcile: { key: KEY, requeued: marker } }))).toEqual({ kind: "events", events: [{ provider: "s3", key: KEY }], origin: "sweep" });
+    }
+    // The marker never reaches the event a stage reads.
+    expect(parseQueueBody(requeueBody(KEY, "2026-11-01T18:00:00.000Z"))).not.toMatchObject({ events: [{ requeued: true }] });
+  });
+
+  test("the Lambda's SQS records reach the consumer with SentTimestamp only; it is used only as a positive integer", () => {
+    // SQS writes epoch ms as a decimal string.
+    const SENT_MS = Date.parse("2026-11-01T10:00:00.000Z");
+    const SENT = String(SENT_MS);
+    const records = queueRecords([
+      { messageId: "m1", body: "b1", eventSource: "aws:sqs", attributes: { SentTimestamp: SENT, SenderId: "AIDAEXAMPLE", ApproximateReceiveCount: "1" } as { SentTimestamp?: unknown } },
+      { messageId: "m2", body: "b2" },
+      { messageId: "m3", body: "b3", attributes: null },
+    ]);
+    expect(records).toEqual([
+      { messageId: "m1", body: "b1", sentTimestamp: SENT },
+      { messageId: "m2", body: "b2", sentTimestamp: undefined },
+      { messageId: "m3", body: "b3", sentTimestamp: undefined },
+    ]);
+    expect(JSON.stringify(records)).not.toContain("AIDA");
+    expect(sentTimestampMs(SENT)).toBe(SENT_MS);
+    expect(sentTimestampMs(SENT_MS)).toBe(SENT_MS);
+    for (const bad of [undefined, null, "", "0", 0, -5, "-5", "1.5", 1.5, "1e12", " 1", "9".repeat(17), Number.NaN, Number.POSITIVE_INFINITY, Number.MAX_SAFE_INTEGER + 1, "abc", true, {}]) {
+      expect(sentTimestampMs(bad)).toBeUndefined();
+    }
+  });
+
+  test("the Lambda's requeue dep sends one SendMessage: the requeue body with the carried time when known, the fixed delay", async () => {
+    type Call = Parameters<typeof awsJsonCall>[0];
+    const calls: Call[] = [];
+    const creds = { accessKeyId: "AKIDEXAMPLE", secretAccessKey: "secret-example" };
+    const requeue = sqsRequeue(
+      { region: "us-east-1", queueUrl: "https://sqs.example.invalid/queue" },
+      (async (args: Call) => void calls.push(args)) as typeof awsJsonCall,
+      () => creds,
+    );
+    await requeue(KEY, "2026-11-01T18:00:00.000Z");
+    await requeue(KEY);
+    await requeue(KEY, undefined);
+    expect(BUSY_REQUEUE_DELAY_SECONDS).toBe(60);
+    const sent = (body: string) => ({
+      service: "sqs",
+      target: "AmazonSQS.SendMessage",
+      region: "us-east-1",
+      body: { QueueUrl: "https://sqs.example.invalid/queue", MessageBody: body, DelaySeconds: 60 },
+      credentials: creds,
+    });
+    expect(calls).toEqual([
+      sent(JSON.stringify({ reconcile: { key: KEY, requeued: true, oldest_event_time: "2026-11-01T18:00:00.000Z" } })),
+      sent(JSON.stringify({ reconcile: { key: KEY, requeued: true } })),
+      sent(JSON.stringify({ reconcile: { key: KEY, requeued: true } })),
+    ]);
+    // The exact bytes the consumer reads back on the next pass.
+    expect(parseQueueBody(calls[0]!.body.MessageBody as string)).toEqual({
+      kind: "events",
+      events: [{ provider: "s3", key: KEY, oldestEventTime: "2026-11-01T18:00:00.000Z" }],
+      origin: "requeue",
     });
   });
 

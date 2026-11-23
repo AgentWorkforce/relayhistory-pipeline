@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { ALLOWED_LOG_FIELDS, errorFields } from "../log.ts";
+import { ALLOWED_LOG_FIELDS, EXACT_VALUE_FIELDS, NON_NEGATIVE_INTEGER_FIELDS, errorFields, logLine } from "../log.ts";
 import { spanAttrs } from "../telemetry.ts";
 
 describe("telemetry allowlist", () => {
@@ -21,5 +21,43 @@ describe("telemetry allowlist", () => {
     const f = errorFields(Object.assign(new Error("Authorization: Bearer sk-live-123"), { code: "chunk_empty", retryable: false }));
     expect(f).toEqual({ error_code: "chunk_empty", retryable: false });
     expect(JSON.stringify(f)).not.toContain("sk-live");
+  });
+  test("event_age_ms and s3_event_age_ms survive the real logLine only as non-negative safe integers", () => {
+    for (const field of ["event_age_ms", "s3_event_age_ms"]) {
+      expect(ALLOWED_LOG_FIELDS.has(field)).toBe(true);
+      expect(NON_NEGATIVE_INTEGER_FIELDS.has(field)).toBe(true);
+      const line = (v: unknown) => JSON.parse(logLine("info", "search index reconciled", { stage: "search-index", [field]: v })) as Record<string, unknown>;
+      for (const v of [0, 1, 7_200_000, Number.MAX_SAFE_INTEGER]) expect(line(v)[field]).toBe(v);
+      for (const v of [-1, 1.5, Number.NaN, Number.POSITIVE_INFINITY, Number.NEGATIVE_INFINITY, Number.MAX_SAFE_INTEGER + 1, "5", "AKIAABCDEFGHIJKLMNOP", true, null, { ms: 1 }, [1]]) {
+        const out = line(v);
+        expect([field, v, field in out]).toEqual([field, v, false]);
+        expect(out.stage).toBe("search-index");
+      }
+    }
+    expect(ALLOWED_LOG_FIELDS.has("oldest_event_age_ms")).toBe(false);
+  });
+  test("queue_origin survives the real logLine only as one of s3, requeue, sweep", () => {
+    expect(ALLOWED_LOG_FIELDS.has("queue_origin")).toBe(true);
+    expect([...EXACT_VALUE_FIELDS.get("queue_origin")!].sort()).toEqual(["requeue", "s3", "sweep"]);
+    const line = (v: unknown) => JSON.parse(logLine("info", "search index reconciled", { stage: "search-index", queue_origin: v })) as Record<string, unknown>;
+    for (const v of ["s3", "requeue", "sweep"]) expect(line(v).queue_origin).toBe(v);
+    for (const v of ["S3", "s3 ", "", "other", "sqs", "AKIAABCDEFGHIJKLMNOP", "059f36b3-02ba-4e7d-a2c1-8f1e1c0d9a77", 0, 1, true, null, ["s3"], { s3: 1 }]) {
+      const out = line(v);
+      expect([v, "queue_origin" in out]).toEqual([v, false]);
+      expect(out.stage).toBe("search-index");
+    }
+  });
+  test("the value rules apply at every level, not only info", () => {
+    for (const level of ["debug", "info", "warn", "error"] as const) {
+      const out = JSON.parse(logLine(level, "search index partial", { stage: "search-index", event_age_ms: -1, s3_event_age_ms: "5", queue_origin: "other" })) as Record<string, unknown>;
+      expect([level, "event_age_ms" in out, "s3_event_age_ms" in out, "queue_origin" in out]).toEqual([level, false, false, false]);
+      expect(out).toMatchObject({ level, stage: "search-index" });
+      const kept = JSON.parse(logLine(level, "search index partial", { stage: "search-index", event_age_ms: 3, s3_event_age_ms: 4, queue_origin: "sweep" })) as Record<string, unknown>;
+      expect(kept).toMatchObject({ level, event_age_ms: 3, s3_event_age_ms: 4, queue_origin: "sweep" });
+    }
+  });
+  test("the value rule leaves other allowlisted fields as they were", () => {
+    const out = JSON.parse(logLine("info", "m", { count: -1, duration_ms: 1.5, ok: true, reason: "x" })) as Record<string, unknown>;
+    expect(out).toMatchObject({ count: -1, duration_ms: 1.5, ok: true, reason: "x" });
   });
 });

@@ -38,12 +38,12 @@ import {
 import type { SqlExecutor } from "@rhc/lib/pipeline/queue.ts";
 import type { HoopDb } from "../shared/db.ts";
 import { errorFields, log } from "../shared/log.ts";
-import { awsJsonCall, invokeAsync, lambdaCredentials } from "./aws-json.ts";
+import { awsJsonCall, invokeAsync, lambdaCredentials, type AwsSessionCredentials } from "./aws-json.ts";
 import { createClickHouseClient } from "./vendor/search-index/clickhouse.ts";
 import { processBatch, type BatchResponse, type ConsumerDeps, type QueueRecord } from "./consumer.ts";
 import { droppedFanout, scopeLockKey, type ScopeLock } from "./pointer.ts";
 import { SEARCH_INDEX_STREAM_CH_BUDGET, SEARCH_INDEX_STREAM_DEADLINE_MARGIN_MS, type SearchIndexDeps } from "./search-index.ts";
-import { RECONCILE_BODY_KEY } from "./s3-events.ts";
+import { RECONCILE_BODY_KEY, requeueBody } from "./s3-events.ts";
 import { SUPABASE_PROD_CA_2021 } from "./supabase-ca.ts";
 import { briefConfig, modelKey } from "../session-brief/config.ts";
 import { createAnalysisTransport } from "../session-brief/engine/transport.ts";
@@ -212,6 +212,26 @@ export function searchTransaction(db: HoopDb, env: Pick<LambdaEnv, "searchStream
 /** A search pass that found its session busy runs again this much later. */
 export const BUSY_REQUEUE_DELAY_SECONDS = 60;
 
+/**
+ * The consumer's `requeue` dep: one SQS SendMessage of the requeue body (the key, and the oldest
+ * upload event time when known) with the fixed delay. `call` and `credentials` are injectable for tests.
+ */
+export function sqsRequeue(
+  env: Pick<LambdaEnv, "region" | "queueUrl">,
+  call: typeof awsJsonCall = awsJsonCall,
+  credentials: () => AwsSessionCredentials = () => lambdaCredentials(),
+): NonNullable<ConsumerDeps["requeue"]> {
+  return async (manifestKey, oldestEventTime) => {
+    await call({
+      service: "sqs",
+      target: "AmazonSQS.SendMessage",
+      region: env.region,
+      body: { QueueUrl: env.queueUrl, MessageBody: requeueBody(manifestKey, oldestEventTime), DelaySeconds: BUSY_REQUEUE_DELAY_SECONDS },
+      credentials: credentials(),
+    });
+  };
+}
+
 interface Runtime {
   env: LambdaEnv;
   deps: ConsumerDeps;
@@ -252,15 +272,7 @@ async function init(): Promise<Runtime> {
       allowPrefix: (prefix, orgId) => prefixAllowed(bindings, prefix, orgId),
       fanout,
     },
-    requeue: async (manifestKey) => {
-      await awsJsonCall({
-        service: "sqs",
-        target: "AmazonSQS.SendMessage",
-        region: env.region,
-        body: { QueueUrl: env.queueUrl, MessageBody: JSON.stringify({ [RECONCILE_BODY_KEY]: { key: manifestKey } }), DelaySeconds: BUSY_REQUEUE_DELAY_SECONDS },
-        credentials: lambdaCredentials(),
-      });
-    },
+    requeue: sqsRequeue(env),
   };
   if (env.searchEnabled) {
     if (!secret.clickhouse) throw new Error("SEARCH_INDEX_ENABLED=1 but the secret has no clickhouse block");
@@ -475,7 +487,17 @@ export function invocationDeps(deps: ConsumerDeps, context?: LambdaInvocationCon
   };
 }
 
-type LambdaEvent = { Records?: { messageId: string; body: string; eventSource?: string }[]; reconcile?: unknown; brief?: unknown; cursor?: string; since?: string; link?: number };
+type SqsRecord = { messageId: string; body: string; eventSource?: string; attributes?: { SentTimestamp?: unknown } | null };
+
+/**
+ * The consumer's view of the Lambda's SQS records. Of the message attributes only
+ * SentTimestamp is passed on (for the event_age_ms log field); SenderId and the rest stay here.
+ */
+export function queueRecords(records: readonly SqsRecord[]): QueueRecord[] {
+  return records.map((r) => ({ messageId: r.messageId, body: r.body, sentTimestamp: r.attributes?.SentTimestamp }));
+}
+
+type LambdaEvent = { Records?: SqsRecord[]; reconcile?: unknown; brief?: unknown; cursor?: string; since?: string; link?: number };
 
 export async function handler(event: LambdaEvent, context?: LambdaInvocationContext): Promise<BatchResponse | { ok: boolean }> {
   if (Array.isArray(event?.Records)) {
@@ -487,8 +509,7 @@ export async function handler(event: LambdaEvent, context?: LambdaInvocationCont
       // Nothing was processed: every message goes back to the queue.
       return { batchItemFailures: event.Records.map((r) => ({ itemIdentifier: r.messageId })) };
     }
-    const records: QueueRecord[] = event.Records.map((r) => ({ messageId: r.messageId, body: r.body }));
-    return processBatch(records, invocationDeps(rt.deps, context));
+    return processBatch(queueRecords(event.Records), invocationDeps(rt.deps, context));
   }
   if (event?.reconcile === true) {
     const started = Date.now();

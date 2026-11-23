@@ -178,3 +178,93 @@ timeout of 300 s, and the Postgres transaction is idle while each insert runs.
 - Known limit: after the reserve check the tail is not bounded in time. One delete
   batch may take up to 60 s and the state-row insert up to 300 s. A timeout for the
   stream's own statements is a possible follow-up; it is not built here.
+
+## Upload-to-searchable latency: `s3_event_age_ms`, `event_age_ms`, `queue_origin`
+
+Three log fields measure latency. They appear on the `pointer indexed` line (one line
+per key, covering the messages for that key) and on the `search index reconciled`
+line and the `search index partial` warn line (one pass per session scope, covering
+the messages for that scope). No flag gates them. They change nothing that is
+indexed, deleted or acknowledged. The requeue decision, key, delay and count are
+unchanged; the requeue body gains two telemetry fields (below). The log allowlist
+keeps each field only if its value passes its rule.
+
+- `s3_event_age_ms` is `floor(log time - oldest upload event time covered)`. It is
+  a non-negative integer. A negative age, from clock skew, is logged as 0.
+  - **Upload time.** The upload time is the S3 notification record's `eventTime`
+    for an `ObjectCreated:*` event. When several messages cover the line, the oldest
+    time wins. This includes repeated puts of one key, where the later sequencer
+    still wins the key. Deletes carry no upload and are not counted.
+  - **Requeued passes.** A pass can be requeued because the scope is busy, the
+    stream is deferred, or the batch deadline has passed. A requeued pass carries
+    the time forward in its requeue body. The later pass then reports the age since
+    the original upload, not since the requeue.
+  - **Redelivered messages.** A message redelivered after a failure or a visibility
+    timeout is the original body, so it keeps its `eventTime`.
+  - **When the field is omitted.** It is omitted, not guessed, when any covered
+    message that is not a delete has no usable time. That covers:
+    - a scheduled reconcile sweep body;
+    - a requeue body without a time;
+    - a missing or unparseable `eventTime`.
+- `event_age_ms` is `floor(log time - oldest SQS SentTimestamp)` over the messages
+  covered by the line. It is a non-negative integer, clamped at 0.
+  - **What it measures.** `SentTimestamp` is the time the message was put on the
+    queue. A requeue and a sweep message are new messages, so for them the field is
+    the wait since that enqueue, not since the upload.
+  - **Redelivered messages.** An `s3` message that SQS redelivers after a failure
+    or a visibility timeout keeps its original `SentTimestamp` and is still tagged
+    `s3`. Its `event_age_ms` therefore includes the failed attempt and the timeout,
+    and redeliveries inflate the tail. They cannot be told apart on these lines:
+    `ApproximateReceiveCount` is not logged. The `search index failed` and
+    `pointer index failed` error lines are a rough indicator of how many there are.
+  - **When the field is omitted.** It is omitted when any covered message lacks a
+    `SentTimestamp` attribute that is a positive integer.
+- `queue_origin` is one of `s3`, `requeue` or `sweep`. It is always present on these
+  lines.
+  - `s3` means every covered message is an S3 notification.
+  - Otherwise it is `requeue` if any covered message is a search pass that this
+    consumer requeued.
+  - Otherwise it is `sweep`: a reconcile body from the scheduled sweep, or from any
+    producer that marks neither.
+
+Requeue body shapes:
+
+- **Before this change:** `{"reconcile":{"key":...}}`.
+- **Now:** `{"reconcile":{"key":...,"requeued":true,"oldest_event_time":"<ISO 8601>"}}`.
+  `oldest_event_time` is present only when every covered upload time is known.
+- **Sweep:** `{"reconcile":{"key":...,"etag":...,"version":...}}`, unchanged.
+
+A build without this change reads only `key`, `etag` and `version`. It ignores the
+two extra fields. A body without `requeued` still parses:
+
+- it counts as `requeue` if it carries `oldest_event_time`;
+- otherwise it counts as `sweep`.
+
+No field holds an id, key or time string. Only the integers and the three origin
+words are logged.
+
+### Computing p50/p90 of upload-to-searchable latency
+
+1. Take `s3_event_age_ms` on `search index reconciled` lines with `"ok":true` that
+   carry the field, and compute p50 and p90 over the window. Use a percentile
+   aggregation over the parsed JSON field in the log store.
+   - These lines are end to end across requeues, so keep every `queue_origin`.
+   - Count the `"ok":true` lines without the field alongside, so you can see the
+     share the percentiles leave out (passes driven by a sweep, requeues without a
+     time).
+   - Exclude lines with `"ok":false`, which are partial or incomplete passes and not
+     fully searchable. Such a scope completes only in a later pass, triggered by a
+     new upload or a sweep. That pass reports the age of the events it covers, not
+     of the earlier ones.
+2. For queue wait, take `event_age_ms` on the same lines, and on `pointer indexed`
+   lines for the pointer stage, restricted to `"queue_origin":"s3"`. A requeue or
+   sweep message has its own `SentTimestamp`, so exclude every other origin.
+   - An `s3` message redelivered after a failure or a visibility timeout keeps its
+     `SentTimestamp`, so redeliveries inflate the tail (p90) and cannot be filtered
+     out; `ApproximateReceiveCount` is not logged. Read the tail next to the count
+     of `search index failed` and `pointer index failed` lines in the same window,
+     a rough indicator of redeliveries.
+3. For the delay from S3 to the queue, compare the
+   two fields on the same `s3` lines. `s3_event_age_ms - event_age_ms` is roughly
+   the time from the S3 event to the SQS enqueue. The two fields use different
+   clocks, so treat small differences as noise.

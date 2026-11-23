@@ -2,8 +2,9 @@
  * Golden transcript of the S3 -> ClickHouse search stage with SEARCH_INDEX_STREAMING_CH
  * unset (the deployed behaviour). Fixed inputs run through the SQS consumer and
  * indexSearchScope; every ClickHouse statement (text, params, settings, rows), every
- * Postgres statement (text, params), every log line (minus its clock fields) and every
- * result is recorded, and the whole transcript must equal the committed snapshot
+ * Postgres statement (text, params), every log line (minus its clock fields and the
+ * additive latency telemetry, see captureLogs) and every result is recorded, and the
+ * whole transcript must equal the committed snapshot
  * (__snapshots__/search-index-golden.test.ts.snap).
  *
  * The snapshot was written before the streamed reconcile was ported and must not
@@ -181,7 +182,10 @@ async function captureLogs(log: Entry[], work: () => Promise<unknown>) {
     for (const line of String(chunk).split("\n")) {
       if (!line.startsWith("{")) continue;
       // Clock fields, and the packages/pipeline work_key's per-run suffix, are not behaviour.
-      const { ts: _ts, duration_ms: _d, ...rest } = JSON.parse(line) as Entry;
+      // The latency telemetry (event_age_ms, s3_event_age_ms: clock-derived; queue_origin)
+      // is additive and pinned by pipeline.test.ts; it is left out so this transcript stays
+      // the search stage's behaviour, byte for byte as before it existed.
+      const { ts: _ts, duration_ms: _d, event_age_ms: _q, s3_event_age_ms: _s3, queue_origin: _o, ...rest } = JSON.parse(line) as Entry;
       if (typeof rest.work_key === "string") rest.work_key = rest.work_key.replace(/@[^@]*$/, "@<run>");
       log.push({ log: rest });
     }

@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, spyOn, test } from "bun:test";
 import { createHash } from "node:crypto";
 import { zstdCompressSync } from "node:zlib";
 import { mkdir, mkdtemp, rm } from "node:fs/promises";
@@ -28,9 +28,11 @@ import type { IndexRow } from "../vendor/search-index/rows.ts";
 import { EVENTS_TABLE, SESSION_STATE_TABLE } from "../vendor/search-index/schema.ts";
 import { indexSearchScope, type SearchIndexDeps } from "../search-index.ts";
 import { processBatch, type ConsumerDeps } from "../consumer.ts";
+import * as pointerModule from "../pointer.ts";
 import { droppedFanout, type SessionScope } from "../pointer.ts";
 import { memoryLock } from "./support.ts";
 import { RECONCILE_DEADLINE_MS, reconcileRecent } from "../lambda.ts";
+import { requeueBody } from "../s3-events.ts";
 
 const TRACE = "019a1f3c-8e2b-7c41-9d3a-5b6f0e2a7c18";
 const NOW = new Date("2026-11-01T12:00:00.000Z");
@@ -616,5 +618,260 @@ describe("reconcile", () => {
     const second = await reconcileRecent({ store: paged, db, keyPrefix: "96bulls", since: new Date(0), cursor: first.nextCursor, send: async () => {}, now: () => clock });
     expect(pages).toEqual([undefined, "1", "2", "3", "4", "5"].slice(0, pages.length));
     expect(second.pages).toBeGreaterThan(0);
+  });
+});
+
+describe("latency fields (s3_event_age_ms, event_age_ms, queue_origin) on the pointer and search pass lines", () => {
+  type Line = Record<string, unknown>;
+  const T0 = Date.parse(AT);
+  const LAG = ["event_age_ms", "queue_origin", "s3_event_age_ms"];
+  // Each line's keys before the fields existed (reason is absent on a complete pass).
+  const RECONCILED_KEYS = ["count", "deleted", "deployment", "deployment_id", "duration_ms", "harness", "inserted", "level", "manifests", "message", "ok", "org_id", "service", "session_id", "stage", "ts", "workspace_id"];
+  const POINTER_KEYS = ["deployment", "deployment_id", "duration_ms", "harness", "level", "message", "org_id", "outcome", "revision", "service", "session_id", "stage", "ts", "workspace_id"];
+  const keysOf = (l: Line | undefined) => Object.keys(l!).sort();
+  const lagOf = (l: Line | undefined) => Object.fromEntries(LAG.filter((k) => k in l!).map((k) => [k, l![k]]));
+
+  /** The real logger's JSON lines (log.info / log.warn through logLine and its allowlist) while `work` runs. */
+  async function captured(work: () => Promise<unknown>): Promise<Line[]> {
+    const lines: Line[] = [];
+    const out = process.stdout.write.bind(process.stdout);
+    const err = process.stderr.write.bind(process.stderr);
+    const grab = (chunk: unknown) => {
+      for (const l of String(chunk).split("\n")) if (l.startsWith("{")) lines.push(JSON.parse(l) as Line);
+      return true;
+    };
+    process.stdout.write = grab as typeof process.stdout.write;
+    process.stderr.write = grab as typeof process.stderr.write;
+    try {
+      await work();
+    } finally {
+      process.stdout.write = out;
+      process.stderr.write = err;
+    }
+    return lines;
+  }
+  const reconciled = (lines: Line[]) => lines.filter((l) => l.message === "search index reconciled");
+  const pointers = (lines: Line[]) => lines.filter((l) => l.message === "pointer indexed");
+
+  // eventTime null: the record has none.
+  const put = (key: string, sequencer: string, eventTime: string | null = AT, eventName = "ObjectCreated:Put") =>
+    JSON.stringify({ Records: [{ eventSource: "aws:s3", eventName, ...(eventTime === null ? {} : { eventTime }), s3: { bucket: { name: "bucket" }, object: { key, eTag: "e", sequencer } } }] });
+  const sweep = (key: string) => JSON.stringify({ reconcile: { key, etag: "e", version: "v1" } });
+  /** An SQS record as the Lambda hands it on: SentTimestamp an epoch-ms decimal string. */
+  const msg = (messageId: string, body: string, sentMs?: number | string) =>
+    sentMs === undefined ? { messageId, body } : { messageId, body, sentTimestamp: typeof sentMs === "number" ? String(sentMs) : sentMs };
+
+  function consumer(live: () => string[], now: () => number, busy: () => boolean = () => false, limits?: SearchIndexDeps["limits"]) {
+    const ch = fakeClickHouse();
+    const sb = fakeSupabase(live, busy);
+    const db = { ...sb.tx, pool: undefined, end: async () => {} } as unknown as HoopDb;
+    const bindings = { PIPELINE_ORG_FROM_PREFIX: "true", PIPELINE_KEY_PREFIX: "96bulls" };
+    const requeued: { key: string; time?: string }[] = [];
+    const deps: ConsumerDeps = {
+      pointer: { db, lock: memoryLock(), reader, exists: async (k) => (await store.head(objectKey(k))) !== undefined, orgs: prefixOrgResolver, allowPrefix: (prefix, org) => prefixAllowed(bindings, prefix, org), fanout: droppedFanout },
+      search: searchDeps(ch.ch, sb.transact, limits),
+      requeue: async (key, time) => void requeued.push(time === undefined ? { key } : { key, time }),
+      now,
+    };
+    return { deps, requeued, ch };
+  }
+  const one = () => writeSession("srv_bb", [event("r1", "1", Date.parse("2026-11-01T10:00:01Z"), "hello")]);
+
+  test("one S3 put: both ages at the injected clock and queue_origin s3, on the pointer and the reconciled line; otherwise the same field sets", async () => {
+    const key = await one();
+    const { deps } = consumer(() => [key], () => T0 + 5_000);
+    const lines = await captured(() => processBatch([msg("m1", put(key, "01"), T0 + 2_000)], deps));
+    const [line, ...rest] = reconciled(lines);
+    expect(rest).toEqual([]);
+    expect(line).toMatchObject({ ok: true, s3_event_age_ms: 5_000, event_age_ms: 3_000, queue_origin: "s3" });
+    expect(keysOf(line)).toEqual([...RECONCILED_KEYS, ...LAG].sort());
+    const [pointer, ...more] = pointers(lines);
+    expect(more).toEqual([]);
+    expect(lagOf(pointer)).toEqual({ s3_event_age_ms: 5_000, event_age_ms: 3_000, queue_origin: "s3" });
+    expect(keysOf(pointer)).toEqual([...POINTER_KEYS, ...LAG].sort());
+  });
+
+  test("several messages: each age is the oldest of its own clock, per key on the pointer line and per scope on the reconciled line", async () => {
+    const a = await one();
+    const b = await writeSession("delivery_aa", [event("r2", "1", Date.parse("2026-11-01T10:00:02Z"), "two")]);
+    const { deps } = consumer(() => [a, b], () => T0 + 60_000);
+    const lines = await captured(() =>
+      processBatch(
+        [
+          // The oldest upload is m3 (key b); the oldest enqueue is m1 (key a): the two ages need not come from one message.
+          msg("m1", put(a, "01", "2026-11-01T10:00:30.000Z"), T0 + 30_000),
+          // The later sequencer wins the key, but the earlier message is still covered.
+          msg("m2", put(a, "02", "2026-11-01T10:00:50.000Z"), T0 + 55_000),
+          msg("m3", put(b, "03", "2026-11-01T09:59:58.000Z"), T0 + 45_000),
+        ],
+        deps,
+      ),
+    );
+    const [line, ...rest] = reconciled(lines);
+    expect(rest).toEqual([]);
+    expect(line).toMatchObject({ ok: true, manifests: 2 });
+    expect(lagOf(line)).toEqual({ s3_event_age_ms: 62_000, event_age_ms: 30_000, queue_origin: "s3" });
+    expect(pointers(lines).map(lagOf)).toEqual([
+      { s3_event_age_ms: 30_000, event_age_ms: 30_000, queue_origin: "s3" },
+      { s3_event_age_ms: 62_000, event_age_ms: 15_000, queue_origin: "s3" },
+    ]);
+  });
+
+  test("s3_event_age_ms is omitted when an upload time is unknown: a sweep body, a requeue body without a time, a put without or with a bad eventTime, or any of them in the scope", async () => {
+    const key = await one();
+    const { deps } = consumer(() => [key], () => T0 + 5_000);
+    const batches: string[][] = [
+      [sweep(key)],
+      [requeueBody(key)],
+      [JSON.stringify({ reconcile: { key } })],
+      [put(key, "01", null)],
+      [put(key, "02", "not a time")],
+      [put(key, "03"), JSON.stringify({ reconcile: { key } })],
+    ];
+    for (const bodies of batches) {
+      const lines = await captured(() => processBatch(bodies.map((body, i) => msg(`m${i}`, body, T0 + 1_000)), deps));
+      const [line, ...rest] = reconciled(lines);
+      expect(rest).toEqual([]);
+      expect(keysOf(line)).toEqual([...RECONCILED_KEYS, "event_age_ms", "queue_origin"].sort());
+      expect(line!.event_age_ms).toBe(4_000);
+      expect("s3_event_age_ms" in pointers(lines)[0]!).toBe(false);
+    }
+  });
+
+  test("event_age_ms is omitted when a covered message has no SentTimestamp that is a positive integer; s3_event_age_ms is unaffected", async () => {
+    const key = await one();
+    const { deps } = consumer(() => [key], () => T0 + 5_000);
+    for (const bad of [undefined, "", "abc", "0", "-1000", "1.5", "1e12", " 1000", "9".repeat(17)]) {
+      const lines = await captured(() => processBatch([msg("m1", put(key, "01"), bad)], deps));
+      for (const l of [...reconciled(lines), ...pointers(lines)]) expect(lagOf(l)).toEqual({ s3_event_age_ms: 5_000, queue_origin: "s3" });
+    }
+    // Garbage that is not a string (a hand-built record): omitted too.
+    for (const bad of [Number.NaN, -1, 1.5, null, { at: 1 }]) {
+      const [line] = reconciled(await captured(() => processBatch([{ messageId: "m1", body: put(key, "02"), sentTimestamp: bad }], deps)));
+      expect("event_age_ms" in line!).toBe(false);
+    }
+    // One good and one missing in a scope: omitted, never the good one alone.
+    const lines = await captured(() => processBatch([msg("m1", put(key, "03"), T0 + 1_000), msg("m2", put(key, "04"))], deps));
+    expect("event_age_ms" in reconciled(lines)[0]!).toBe(false);
+    expect("event_age_ms" in pointers(lines)[0]!).toBe(false);
+  });
+
+  test("queue_origin: s3, requeue and sweep, and the mixed rule (s3 only when every message is s3, else requeue if any is, else sweep)", async () => {
+    const key = await one();
+    const { deps } = consumer(() => [key], () => T0 + 5_000);
+    const cases: [string[], string][] = [
+      [[put(key, "01")], "s3"],
+      [[requeueBody(key)], "requeue"],
+      [[requeueBody(key, AT)], "requeue"],
+      // A requeue written with a time before the marker existed.
+      [[JSON.stringify({ reconcile: { key, oldest_event_time: AT } })], "requeue"],
+      [[sweep(key)], "sweep"],
+      // The body every build before the marker requeued: indistinguishable from the sweep's.
+      [[JSON.stringify({ reconcile: { key } })], "sweep"],
+      [[put(key, "02"), put(key, "03")], "s3"],
+      [[put(key, "04"), sweep(key)], "sweep"],
+      [[put(key, "05"), requeueBody(key, AT)], "requeue"],
+      [[sweep(key), requeueBody(key)], "requeue"],
+      [[put(key, "06"), sweep(key), requeueBody(key)], "requeue"],
+    ];
+    for (const [bodies, origin] of cases) {
+      const lines = await captured(() => processBatch(bodies.map((body, i) => msg(`m${i}`, body, T0)), deps));
+      expect([origin, reconciled(lines).map((l) => l.queue_origin)]).toEqual([origin, [origin]]);
+      expect([origin, pointers(lines).map((l) => l.queue_origin)]).toEqual([origin, [origin]]);
+    }
+  });
+
+  test("the partial warn carries the same fields as its reconciled line", async () => {
+    const key = await one();
+    const { deps } = consumer(() => [key], () => T0 + 7_000, undefined, { maxScopeEvents: 0 });
+    const lines = await captured(() => processBatch([msg("m1", put(key, "01"), T0 + 1_000)], deps));
+    const partial = lines.filter((l) => l.message === "search index partial");
+    expect(partial).toHaveLength(1);
+    expect(partial[0]).toMatchObject({ level: "warn", reason: "scope_too_large" });
+    expect(lagOf(partial[0])).toEqual({ s3_event_age_ms: 7_000, event_age_ms: 6_000, queue_origin: "s3" });
+    expect(lagOf(reconciled(lines)[0])).toEqual(lagOf(partial[0]));
+  });
+
+  test("a delete carries no upload: a delete-only scope logs no s3 age, and a delete beside a put does not change the put's", async () => {
+    const key = await one();
+    const { deps } = consumer(() => [key], () => T0 + 9_000);
+    const only = reconciled(await captured(() => processBatch([msg("d", put(key, "05", "2026-11-01T09:00:00.000Z", "ObjectRemoved:Delete"), T0)], deps)))[0]!;
+    expect(lagOf(only)).toEqual({ event_age_ms: 9_000, queue_origin: "s3" });
+    const both = reconciled(
+      await captured(() =>
+        processBatch([msg("p", put(key, "06", "2026-11-01T10:00:01.000Z"), T0 + 2_000), msg("d", put(key, "07", "2026-11-01T09:00:00.000Z", "ObjectRemoved:DeleteMarkerCreated"), T0 + 4_000)], deps),
+      ),
+    )[0]!;
+    expect(lagOf(both)).toEqual({ s3_event_age_ms: 8_000, event_age_ms: 7_000, queue_origin: "s3" });
+  });
+
+  test("carried across a busy requeue: the body holds the oldest time; the later pass reports the full s3 age, its own queue wait, origin requeue", async () => {
+    const key = await one();
+    let busy = true;
+    let clock = T0 + 1_000;
+    const { deps, requeued } = consumer(() => [key], () => clock, () => busy);
+    const first = await captured(() => processBatch([msg("m1", put(key, "01"), T0 + 500)], deps));
+    expect(reconciled(first)).toEqual([]);
+    expect(requeued).toEqual([{ key, time: AT }]);
+    // The requeued line itself is unchanged.
+    const busyLine = first.find((l) => l.reason === "scope_busy")!;
+    for (const k of LAG) expect(k in busyLine).toBe(false);
+    busy = false;
+    clock = T0 + 31_000;
+    const [line] = reconciled(await captured(() => processBatch([msg("m2", requeueBody(key, requeued[0]!.time), T0 + 21_000)], deps)));
+    expect(lagOf(line)).toEqual({ s3_event_age_ms: 31_000, event_age_ms: 10_000, queue_origin: "requeue" });
+    // A newer put beside the carried body does not hide the older carried time.
+    const [both] = reconciled(await captured(() => processBatch([msg("m3", requeueBody(key, AT), T0 + 29_000), msg("m4", put(key, "02", "2026-11-01T10:00:20.000Z"), T0 + 25_000)], deps)));
+    expect(lagOf(both)).toEqual({ s3_event_age_ms: 31_000, event_age_ms: 6_000, queue_origin: "requeue" });
+  });
+
+  test("the carried upload time never reaches the pointer stage: indexPointer gets the event without it", async () => {
+    const key = await one();
+    const { deps } = consumer(() => [key], () => T0 + 5_000);
+    const spy = spyOn(pointerModule, "indexPointer");
+    try {
+      const [line] = reconciled(await captured(() => processBatch([msg("m1", requeueBody(key, AT), T0 + 1_000)], deps)));
+      expect(lagOf(line)).toEqual({ s3_event_age_ms: 5_000, event_age_ms: 4_000, queue_origin: "requeue" });
+      expect(spy).toHaveBeenCalledTimes(1);
+      expect(spy.mock.calls[0]![0]).toEqual({ provider: "s3", key });
+      expect("oldestEventTime" in spy.mock.calls[0]![0]).toBe(false);
+    } finally {
+      spy.mockRestore();
+    }
+  });
+
+  test("a scope with an unknown upload time requeues the key and the marker only", async () => {
+    const key = await one();
+    const { deps, requeued } = consumer(() => [key], () => T0, () => true);
+    await captured(() => processBatch([msg("m1", put(key, "01")), msg("m2", JSON.stringify({ reconcile: { key } }))], deps));
+    expect(requeued).toEqual([{ key }]);
+    expect(requeueBody(requeued[0]!.key, requeued[0]!.time)).toBe(JSON.stringify({ reconcile: { key, requeued: true } }));
+  });
+
+  test("clamped at 0 when an event or enqueue time is ahead of the clock (skew); a non-finite clock omits both ages", async () => {
+    const key = await one();
+    const ahead = consumer(() => [key], () => T0 - 2_500);
+    const [line] = reconciled(await captured(() => processBatch([msg("m1", put(key, "01"), T0 + 1_000)], ahead.deps)));
+    expect(lagOf(line)).toEqual({ s3_event_age_ms: 0, event_age_ms: 0, queue_origin: "s3" });
+    const broken = consumer(() => [key], () => Number.NaN);
+    const [none] = reconciled(await captured(() => processBatch([msg("m2", put(key, "02"), T0)], broken.deps)));
+    expect(keysOf(none)).toEqual([...RECONCILED_KEYS, "queue_origin"].sort());
+  });
+
+  test("the fields carry no ids, keys or times: only integers and the three origin words, and nothing else of the message is logged", async () => {
+    const key = await one();
+    const { deps } = consumer(() => [key], () => T0 + 5_000);
+    const messageId = "059f36b3-02ba-4e7d-a2c1-8f1e1c0d9a77";
+    const lines = await captured(() =>
+      processBatch([{ messageId, body: put(key, "01"), sentTimestamp: String(T0 + 1_000) }, msg("m2", requeueBody(key, AT), T0 + 2_000), msg("m3", sweep(key), T0 + 3_000)], deps),
+    );
+    const tagged = lines.filter((l) => LAG.some((k) => k in l));
+    expect(tagged.map((l) => l.message).sort()).toEqual(["pointer indexed", "search index reconciled"]);
+    for (const l of tagged) {
+      for (const k of ["event_age_ms", "s3_event_age_ms"]) if (k in l) expect(Number.isSafeInteger(l[k]) && (l[k] as number) >= 0).toBe(true);
+      expect(["s3", "requeue", "sweep"]).toContain(l.queue_origin as string);
+    }
+    const text = JSON.stringify(lines);
+    for (const secret of [messageId, key, AT, String(T0 + 1_000), "oldest_event_time", "requeued"]) expect(text).not.toContain(secret);
   });
 });
