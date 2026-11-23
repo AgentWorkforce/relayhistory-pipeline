@@ -226,6 +226,9 @@ export const ACCEPTANCE_MISSING = "relayhistory_acceptance_missing";
  * Salt of the acceptance stamp's digest. Bump it with any change to how a pass reads, folds or
  * projects a scope (readScope, the streamed read, normalizeRelayhistoryRecords and friends): a
  * stamp written under another salt then never matches, and the next pass reads in full.
+ * It must also be bumped with any change to the acceptance fold or the transform it runs in
+ * (packages/pipeline relayhistory-transform and the projection), which live outside this file;
+ * otherwise purge the stamps (docs/handoffs/acceptance-skip.md).
  */
 export const ACCEPTANCE_SKIP_VERSION = "acceptance-skip-v1";
 /** `search_ingest_state` names of acceptance stamps; no other state name starts with it. */
@@ -789,8 +792,12 @@ async function settleAcceptanceStamp(
         [{ name, value: JSON.stringify({ v: 1, reason: ACCEPTANCE_MISSING, digest: stampDigest }), updated_at: chNow(at) }],
         { timeoutMs: 5_000 },
       );
-    else if (stamp.state !== "none")
-      await deps.ch.insert(INGEST_STATE_TABLE, [{ name, value: "", updated_at: chNow(at) }], { timeoutMs: 5_000 });
+    else if (stamp.state !== "none") {
+      // The read takes the newest updated_at, so the tombstone must sort above the stamp it
+      // clears even when the clock that wrote the stamp ran ahead of this one.
+      const clearAt = stamp.state === "live" && Number.isFinite(stamp.atMs) ? new Date(Math.max(at.getTime(), stamp.atMs + 1)) : at;
+      await deps.ch.insert(INGEST_STATE_TABLE, [{ name, value: "", updated_at: chNow(clearAt) }], { timeoutMs: 5_000 });
+    }
   } catch (error) {
     log.warn("search index acceptance stamp not written", {
       stage: "search-index",
@@ -936,9 +943,10 @@ export async function indexSearchScope(scope: SessionScope, deps: SearchIndexDep
       acceptance = { stamp, digest, observed: new Map() };
     } else fromMs = Date.parse(await windowStart(deps.ch, at));
     const s3 = await readScope(scope, keys, deps, limits, version, acceptance?.observed);
-    // Flag on: stamp or clear once the pass has its outcome (busy and deferred passes do neither).
+    // Flag on: stamp or clear once the pass has its outcome. Busy and deferred passes return
+    // before this is called (the lock refusal above, the stream deferral below), so they do neither.
     const settle = async (result: SearchIndexResult): Promise<SearchIndexResult> => {
-      if (acceptance && pointers && !result.busy && !result.deferred)
+      if (acceptance && pointers)
         await settleAcceptanceStamp(
           deps, scope, stampName, acceptance.stamp,
           acceptanceOnly(result) && readAsListed(pointers, acceptance.observed) ? acceptance.digest : null,

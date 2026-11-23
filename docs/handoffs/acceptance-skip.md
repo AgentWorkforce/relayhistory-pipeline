@@ -61,6 +61,9 @@ three ways.
        sha256, same etag as the manifest read returned.
    - **Clear.** Any other outcome writes a tombstone (empty value), but only when a stamp
      was seen or the stamp read failed. Erase also clears.
+   - **Tombstone time.** When a stamp was seen, the tombstone is written at the later of the
+     pass's time and the stamp's time plus one millisecond. So it sorts above the stamp it
+     clears even when the clock that wrote the stamp ran ahead.
 
 ### The early return
 
@@ -85,7 +88,8 @@ normal acceptance-missing pass. No new log key is added.
 The digest is sha256 over JSON of these inputs:
 
 - the salt `ACCEPTANCE_SKIP_VERSION` (`acceptance-skip-v1`). Bump it with any change to how a
-  pass reads, folds or decides this outcome;
+  pass reads, folds or decides this outcome, including the acceptance fold and the transform
+  outside this file (see "Before turning it on");
 - the scope (org, workspace, harness, session);
 - the window marker: `default:14d`, or `stored:<window_start>`;
 - `limits.maxScopeBytes` and `limits.maxScopeEvents`;
@@ -137,9 +141,14 @@ Readers outside this repository that list the whole table, if any, are not cover
   added or removed, a revision raised, an etag or content hash changed, or a scrubbed flip.
   A stored `window_start` set or changed, or a change to the limits or stream budgets, also
   changes it.
-- **Stale stamps are harmless.** A stamp predicts the outcome for its exact digest. Two
-  passes over the same digest fold the same manifest bytes under the same window and limits.
-  A concurrent pass that wrote a stamp for an older pointer set never matches the current
+- **Stale stamps are harmless, under two conditions.** A stamp predicts the outcome for its
+  exact digest. Two passes over the same digest fold the same manifest bytes under the same
+  window and limits only while both of these are true:
+  - every manifest writer raises the revision whenever a manifest's content changes;
+  - the fold code is unchanged since the stamp was written.
+
+  If either fails, a skip can repeat an outcome that a full read would no longer reach, for
+  up to six hours (see "Before turning it on"). A concurrent pass that wrote a stamp for an older pointer set never matches the current
   digest. The latest row by `updated_at` decides.
 - **Erase and delete flows.** An acceptance-only pass never deletes, so a skip never keeps a
   row that the normal pass would remove. Erase (no live pointer) runs before the decision and
@@ -149,12 +158,78 @@ Readers outside this repository that list the whole table, if any, are not cover
 
 ## Before turning it on
 
-- The ClickHouse user the pipeline uses must be allowed to INSERT into
-  `search_ingest_state`. Before this flag, the search stage only read that table (for
-  `window_start`). Check the grant before turning the flag on.
-- Confirm that nothing outside this repository lists `search_ingest_state` by prefix or
-  without a name filter. If something does, it must ignore `acceptance_skip/` names.
-- Accept the whole-read caveat below.
+Each item below must be true before the flag goes on.
+
+1. **Fold or transform changes.** Any deploy that changes the acceptance fold or the
+   transform (packages/pipeline `relayhistory-transform` and the projection) must either bump
+   `ACCEPTANCE_SKIP_VERSION` in `src/session-pipeline/search-index.ts`, or purge the stamps.
+   The digest does not see code changes. Without one of the two, a stamped scope can keep
+   skipping for up to six hours after such a deploy.
+   - Purge statement, run as a ClickHouse admin:
+     `DELETE FROM <database>.search_ingest_state WHERE startsWith(name, 'acceptance_skip/')`.
+   - The table is a plain `ReplacingMergeTree(updated_at)` ordered by `name`
+     (`src/session-pipeline/vendor/search-index/schema.ts`). So this is a lightweight
+     `DELETE`, the same form the stage already uses to erase rows from the events table.
+     The mutation form `ALTER TABLE <database>.search_ingest_state DELETE WHERE
+     startsWith(name, 'acceptance_skip/')` also works.
+   - Both forms need the `ALTER DELETE` privilege on the table. The pipeline user does not
+     need that privilege; the purge is an admin step.
+2. **Manifest writers raise the revision.** Every writer of manifests must raise the revision
+   whenever content changes. A manifest rewritten in place at the same revision leaves the
+   pointer row as it was, so the digest still matches and a skip hides the change.
+   - The pointer upsert keeps the existing pointer row unless the new revision is higher
+     (`supabase/migrations/20261025000300_upsert_keep_on_null.sql`). So a rewrite at the same
+     revision never reaches the pointer row.
+   - The sync exporter in this repository writes the prior revision plus one
+     (`src/migration/neon-s3-sync/export-session.ts`). It meets the condition.
+   - Any other writer must be checked before the flag goes on.
+3. **INSERT grant.** See "Grant" below.
+4. **Readers.** See "Readers" below.
+5. **The whole-read caveat.** Someone must accept it (see "Limits").
+
+### Grant
+
+On this code line no code path of the function writes `search_ingest_state`. The only INSERT
+into it in this repository is `writeState` in
+`src/session-pipeline/vendor/search-index/reconcile.ts`. Only the vendored tail reconcile
+(`runTail` and its `tailPass`) calls it, and nothing in the function imports `runTail`. On the
+base, `search-index.ts` imports only `chNow`, `deleteRows` and `windowStart` from that file.
+This change adds `readState` and two constants, none of which write.
+
+So the INSERT grant cannot be assumed. It is a prerequisite to the flag.
+
+1. **Check first (read only).** An admin runs:
+   - `SHOW GRANTS FOR <pipeline user>`
+   - `SELECT * FROM system.grants WHERE user_name = '<pipeline user>' AND (table = 'search_ingest_state' OR table IS NULL)`
+
+   A row with `access_type = 'INSERT'` on `<database>.search_ingest_state`, or on the whole
+   database, means the grant is already there. Grants through a role show under the role's
+   name; check `system.role_grants` for the user's roles.
+2. **Grant, if missing:**
+   `GRANT INSERT ON <database>.search_ingest_state TO <pipeline user>`
+3. **SELECT is already needed.** The stage reads `window_start` from this table on every
+   pass. With the flag on it also reads the stamp. Both are SELECTs on the same table.
+4. **Who does it.** The grant is a ClickHouse admin step. It needs the owner's own approval.
+   It is not part of any deploy of this code.
+5. **Flag on without the grant.** Each stamp or tombstone INSERT is refused. The refusal is
+   caught. The pass returns exactly what it would return with the flag off, nothing is
+   thrown, and one warning line is logged per pass (`acceptance_stamp_write_failed` or
+   `acceptance_stamp_clear_failed`). No stamp is ever stored, so every pass reads in full and
+   no skip ever happens. The test "ClickHouse refuses every insert into the state table"
+   covers this.
+
+### Readers
+
+- Every reader of `search_ingest_state` in this repository asks for one exact name:
+  `readState` (`reconcile.ts:91`), called by `windowStart` (:117), the tail lease (:656,
+  :680), the watermark (:708), the revision floor (:713) and the cursor (:721), and by the
+  stage itself for `window_start`. The new `readAcceptanceStamp` also asks for one exact
+  name. None of the fixed names starts with `acceptance_skip/` (tested).
+- The read API's partial check reads `search_ingest_session_state`, not this table
+  (`src/session-read-api/queries.ts:30`, used at :105 and :124).
+- Readers outside this repository must be confirmed absent before the flag goes on. If one
+  lists the table by prefix or without a name filter, it must ignore `acceptance_skip/`
+  names.
 
 ## Counting affected scopes from logs
 
@@ -169,10 +244,9 @@ Readers outside this repository that list the whole table, if any, are not cover
 
 - **Turn it off.** Unset the flag, or set it to `false`. Nothing reads stamps with the flag
   off, so leftover rows are inert.
-- **Clean up (optional).** To remove leftover rows:
-  `DELETE FROM search_ingest_state WHERE startsWith(name, 'acceptance_skip/')`. Turning the
-  flag back on later is safe either way, because old stamps older than six hours never
-  match.
+- **Clean up (optional).** To remove leftover rows, run the purge statement under "Before
+  turning it on". Turning the flag back on later is safe either way, because stamps older
+  than six hours never match.
 
 ## Limits
 
@@ -181,9 +255,10 @@ Readers outside this repository that list the whole table, if any, are not cover
 - **It helps only when repeats arrive with an unchanged pointer set.** Any pointer event that
   changes a pointer fact runs a full pass.
 - **Whole-read caveat.** A skip does not re-insert rows that ClickHouse lost since the
-  stamped pass, and does not refresh the session state row. A skip never refreshes the stamp,
-  so a normal pass runs at least once per six hours for a scope that keeps getting events.
-  That bounds this caveat.
+  stamped pass, and does not refresh the session state row, so `synced_at` in
+  `search_ingest_session_state` does not move. A skip never refreshes the stamp. So a normal
+  pass runs at least once per six hours only while the scope keeps receiving events. A scope
+  that receives no more events gets no more passes, skipped or not. That bounds this caveat.
 - **Rolling default window.** With no stored `window_start`, the rolling default window moves
   forward without changing the digest. That only shrinks what a normal pass would insert.
   The outcome and reasons do not depend on it.
@@ -205,7 +280,10 @@ store, and a ClickHouse fake that models `search_ingest_state`. They cover:
 - each digest input;
 - stale, future, malformed, other-reason and other-version stamps;
 - read and write failures, with the write failure checked through the real logger;
-- clear on other outcomes and on erase;
+- every insert into the state table refused: flag-off results, one warning per pass, every
+  pass reads in full;
+- clear on other outcomes and on erase, and no tombstone on erase with no stamp;
+- a tombstone written on a slower clock than its stamp;
 - the consumer's acknowledgement and log line;
 - the env parse and wiring.
 
