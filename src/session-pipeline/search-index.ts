@@ -128,6 +128,10 @@ export const SEARCH_INDEX_STREAM_CH_BUDGET: Readonly<StreamReadLimits> = Object.
 });
 /** Time kept back from the invocation's remaining time for the rest of the batch. */
 export const SEARCH_INDEX_STREAM_DEADLINE_MARGIN_MS = 60_000;
+/** A scope is not started streaming with less than this left before its deadline (half a fresh invocation's). */
+export const STREAM_MIN_START_MS = 120_000;
+/** Deletes per batch between the streamed pass's deadline and lock checks (deleteRows' own key batch). */
+const STREAM_DELETE_BATCH = 500;
 
 export interface SearchIndexLimits {
   /** Largest scope read into memory, summed over its manifests' raw bytes. */
@@ -163,8 +167,10 @@ export interface SearchIndexResult {
   busy?: boolean;
   /** Too large to index whole: no rows written, its index state marked partial. */
   partial?: boolean;
-  /** Would stream, but this invocation already streamed a scope (`streamSlot`): nothing was written, re-enqueue the event. */
+  /** Would stream, but this invocation already streamed a scope (`streamSlot`), or too little of its time is left: nothing was written, re-enqueue the event. */
   deferred?: boolean;
+  /** The streamed reconcile produced this result (SEARCH_INDEX_STREAMING_CH=1 only). */
+  streamed?: true;
 }
 
 interface ScopeIdentity {
@@ -614,7 +620,9 @@ export async function indexSearchScope(scope: SessionScope, deps: SearchIndexDep
       deps.stream && s3.partial && s3.admitted && s3.size && s3.reasons.length === 1 && s3.reasons[0] === "scope_too_large" &&
       s3.size.bytes * STREAM_PASSES <= deps.stream.maxReadBytes && s3.size.events * STREAM_PASSES <= deps.stream.maxReadEvents
     ) {
-      if (deps.streamSlot?.used)
+      // One streamed scope per invocation, and none started with less than STREAM_MIN_START_MS left
+      // before the deadline: it would only be cut. Both are retried later through the queue.
+      if (deps.streamSlot?.used || (deps.streamDeadline && deps.streamDeadline.at - (deps.streamDeadline.now ?? Date.now)() < STREAM_MIN_START_MS))
         return { manifests: s3.manifests, rows: 0, inserted: 0, deleted: 0, complete: false, deferred: true, reasons: ["stream_deferred"] };
       if (deps.streamSlot) deps.streamSlot.used = true;
       return streamedReconcile(tx, scope, deps, deps.stream, limits, s3.admitted, s3.revision, version, fromMs, at);
@@ -712,9 +720,10 @@ async function streamedReconcile(
   const everyMs = deps.streamKeepaliveMs ?? STREAM_KEEPALIVE_MS;
   let pinged = Date.now();
   // The transaction is idle while S3 is read: re-take the lock it already holds (the same
-  // statement, re-entrant within the transaction) so it never sits idle for long.
-  const keepalive = async () => {
-    if (Date.now() - pinged < everyMs) return;
+  // statement, re-entrant within the transaction) so it never sits idle for long. `force`
+  // skips the 20 s throttle: before and after the scan, and before every delete batch.
+  const keepalive = async (force = false) => {
+    if (!force && Date.now() - pinged < everyMs) return;
     pinged = Date.now();
     const { rows } = await tx.query<{ ok: boolean }>("SELECT pg_try_advisory_xact_lock(hashtextextended($1, 0)) AS ok", [scopeLockKey(scope, "search")]);
     // The transaction holds this lock, so anything but true means it is not the transaction we
@@ -725,14 +734,19 @@ async function streamedReconcile(
     if (streamDeadlinePassed(deadline)) throw new StreamStop(STREAM_DEADLINE, true);
   };
   let inserted = 0;
+  let deleted = 0;
   const owing = async (stop: StreamStop): Promise<SearchIndexResult> => {
     await recordState(deps.ch, scope, revision, 0, false, at);
     return {
-      manifests: admitted.length, rows: 0, inserted, deleted: 0, complete: false,
+      manifests: admitted.length, rows: 0, inserted, deleted, complete: false, streamed: true,
       ...(stop.partial ? { partial: true, reasons: ["scope_too_large", stop.code] } : { reasons: [stop.code] }),
     };
   };
   try {
+    // Before anything is read or written: the session owes a full pass until this one ends
+    // complete, also if the invocation dies on the way. One millisecond earlier than the
+    // final state row, so that row replaces it (ReplacingMergeTree(synced_at)).
+    await recordState(deps.ch, scope, revision, 0, false, new Date(at.getTime() - 1));
     // The whole read refuses any other raw format per manifest; the streamed read refuses the scope.
     if (admitted.some((manifest) => manifest.raw.format !== "ndjson")) throw new StreamStop("raw_format_unsupported", false);
     const read = await streamScope(
@@ -749,30 +763,34 @@ async function streamedReconcile(
       projectedToNeonRow,
     );
     checkDeadline();
+    await keepalive(true);
     // Keyset pages of one insert batch each (origin/main legacyProjectionIo.scanPages), never the
     // whole read's single LIMIT maxRows+1 read: up to the events budget of identities, so a
     // streamed scope larger than the whole read's cap can still complete. Past the budget the
-    // scope is partial, never a delete.
-    const chRows: ScopeIdentity[] = [];
+    // scope is partial, never a delete. Each page must be within its limit, in strictly
+    // increasing key order and after the last one, or the scan is not trusted.
+    const existing = new Map<string, ScopeIdentity[]>();
+    let scanned = 0;
     let after: ScopeIdentity | undefined;
     for (;;) {
       if (after) {
         checkDeadline();
         await keepalive();
       }
-      const want = Math.min(limits.insertBatch, budget.maxReadEvents + 1 - chRows.length);
+      const want = Math.min(limits.insertBatch, budget.maxReadEvents + 1 - scanned);
       const page = await clickhouseScopePage(deps.ch, scope, fromMs, want, after);
-      for (const r of page) chRows.push(r);
-      if (chRows.length > budget.maxReadEvents) throw new StreamStop(STREAM_READ_EVENTS_BUDGET, true);
+      if (page.length > want) throw new StreamStop(STREAM_SCAN_INVALID, false);
+      for (const r of page) {
+        if (after && compareScopePageKey(after, r) >= 0) throw new StreamStop(STREAM_SCAN_INVALID, false);
+        after = r;
+        const key = streamKey(r);
+        existing.set(key, [...(existing.get(key) ?? []), r]);
+      }
+      scanned += page.length;
+      if (scanned > budget.maxReadEvents) throw new StreamStop(STREAM_READ_EVENTS_BUDGET, true);
       if (page.length < want) break;
-      after = page[page.length - 1];
     }
-    await keepalive();
-    const existing = new Map<string, ScopeIdentity[]>();
-    for (const r of chRows) {
-      const key = streamKey(r);
-      existing.set(key, [...(existing.get(key) ?? []), r]);
-    }
+    await keepalive(true);
     const toInsert = new Set<string>();
     for (const [key, w] of read.identities) {
       if (!w.inWindow) continue;
@@ -792,12 +810,10 @@ async function streamedReconcile(
     if (directoryIds.size > 1) reasons.push("canonical_session_mismatch");
     if (inserted !== toInsert.size) reasons.push(STREAM_SOURCE_CHANGED_WRITE);
     const complete = reasons.length === 0;
-    const deletes: PendingDelete[] = [];
     if (complete) {
-      // Before any delete: what was inserted stays, nothing is deleted, the scope still owes a pass.
-      checkDeadline();
       // As the whole read: only kinds this pass can regenerate from S3 are diffed.
       const regenerable = new Set<string>([...S3_ACTIVITY_KINDS, ...read.kinds]);
+      const deletes: PendingDelete[] = [];
       for (const [key, list] of existing) {
         const current = read.identities.get(key);
         for (const c of list) {
@@ -806,7 +822,15 @@ async function streamedReconcile(
             deletes.push({ orgId: scope.orgId, sessionId: scope.sessionId, identity: c } as PendingDelete);
         }
       }
-      await deleteRows(deps.ch, deletes);
+      // Before every delete batch: the deadline, and the lock (unthrottled). A stop between
+      // batches keeps what was deleted (rows S3 no longer has) and owes a pass for the rest.
+      for (let i = 0; i < deletes.length; i += STREAM_DELETE_BATCH) {
+        checkDeadline();
+        await keepalive(true);
+        const batch = deletes.slice(i, i + STREAM_DELETE_BATCH);
+        await deleteRows(deps.ch, batch);
+        deleted += batch.length;
+      }
       if (directoryIds.size === 1)
         await (deps.writeCatalog ?? writeDirectoryCatalog)(
           tx,
@@ -815,16 +839,29 @@ async function streamedReconcile(
         );
     }
     await recordState(deps.ch, scope, revision, read.rows, complete, at);
-    return { manifests: admitted.length, rows: read.rows, inserted, deleted: deletes.length, complete, reasons };
+    return { manifests: admitted.length, rows: read.rows, inserted, deleted, complete, reasons, streamed: true };
   } catch (error) {
     if (error instanceof StreamStop) return owing(error);
     // Anything else (a retryable read, the keepalive, ClickHouse) fails the message for
-    // redelivery; what was inserted stays, nothing was deleted, and the session is left
-    // owing a full pass. Best effort: the original error is what the consumer sees.
+    // redelivery; what was inserted stays, and the session is left owing a full pass. Best
+    // effort: the original error is what the consumer sees.
     await recordState(deps.ch, scope, revision, 0, false, at).catch(() => {});
     throw error;
   }
 }
+
+/** Keyset order of two scope page rows: (ts, machine_id, kind, event_id), strings by UTF-8 bytes as ClickHouse compares them. */
+function compareScopePageKey(a: ScopeIdentity, b: ScopeIdentity): number {
+  if (a.tsMs !== b.tsMs) return a.tsMs < b.tsMs ? -1 : 1;
+  for (const [x, y] of [[a.machineId, b.machineId], [a.kind, b.kind], [a.eventId, b.eventId]] as const) {
+    const c = Buffer.compare(Buffer.from(x, "utf8"), Buffer.from(y, "utf8"));
+    if (c !== 0) return c;
+  }
+  return 0;
+}
+
+/** A keyset page broke its contract (over its limit, out of order, repeating): nothing is deleted. */
+const STREAM_SCAN_INVALID = "clickhouse_page_invalid";
 
 /** Pass 4 wrote fewer rows than the index lacked: not complete, nothing deleted. */
 const STREAM_SOURCE_CHANGED_WRITE = "stream_short_write";

@@ -149,24 +149,45 @@ export function supabasePool(url: string, max: number): HoopDb {
   };
 }
 
-async function transaction<T>(db: HoopDb, work: (tx: SqlExecutor) => Promise<T>): Promise<T> {
+/**
+ * One transaction on one checked-out client. `guarded` (SEARCH_INDEX_STREAMING_CH=1, the search
+ * stage only): pg-pool drops its idle 'error' listener at checkout, and pg's client emits
+ * 'error' when its connection ends, also between statements, so a streamed pass holding the
+ * client for minutes would crash the invocation with an uncaught exception. Guarded, a
+ * per-checkout listener keeps the error: the next statement (the pass's keepalive, its forced
+ * lock check before any delete, COMMIT) rejects with it, the transaction fails as a normal
+ * rejected promise, and the broken client is destroyed (`release(err)`), not returned to the
+ * pool. Unguarded: exactly as before.
+ */
+export async function transaction<T>(db: HoopDb, work: (tx: SqlExecutor) => Promise<T>, guarded = false): Promise<T> {
   const client = await db.pool.connect();
+  let broken: Error | undefined;
+  const onError = (error: Error) => {
+    broken ??= error;
+  };
+  if (guarded) client.on("error", onError);
+  const query = async (text: string, params?: unknown[]) => {
+    if (broken) throw broken;
+    return client.query(text, params as unknown[]);
+  };
   try {
-    await client.query("BEGIN");
-    await client.query("SET LOCAL statement_timeout = '60s'");
+    await query("BEGIN");
+    await query("SET LOCAL statement_timeout = '60s'");
     const result = await work({
       async query<R = Record<string, unknown>>(text: string, params?: unknown[]) {
-        const r = await client.query(text, params as unknown[]);
+        const r = await query(text, params);
         return { rows: r.rows as R[] };
       },
     });
-    await client.query("COMMIT");
+    await query("COMMIT");
     return result;
   } catch (error) {
-    await client.query("ROLLBACK").catch(() => {});
+    await query("ROLLBACK").catch(() => {});
     throw error;
   } finally {
-    client.release();
+    if (guarded) client.removeListener("error", onError);
+    if (broken) client.release(broken);
+    else client.release();
   }
 }
 
@@ -226,7 +247,8 @@ async function init(): Promise<Runtime> {
   if (env.searchEnabled) {
     if (!secret.clickhouse) throw new Error("SEARCH_INDEX_ENABLED=1 but the secret has no clickhouse block");
     deps.search = {
-      transact: (work) => transaction(db, work),
+      // Guarded only when streaming is armed: unarmed, the search transaction is exactly as before.
+      transact: (work) => transaction(db, work, env.searchStreamCh === true),
       reader,
       store,
       ch: createClickHouseClient(secret.clickhouse),

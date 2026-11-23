@@ -32,8 +32,12 @@ import type { SqlExecutor } from "@rhc/lib/pipeline/queue.ts";
 import type { ClickHouseClient } from "../vendor/search-index/clickhouse.ts";
 import type { IndexRow } from "../vendor/search-index/rows.ts";
 import { EVENTS_TABLE, SESSION_STATE_TABLE } from "../vendor/search-index/schema.ts";
-import { SEARCH_INDEX_STREAM_CH_BUDGET, indexSearchScope, type SearchIndexDeps } from "../search-index.ts";
-import { STREAM_PASSES } from "../search-index-stream.ts";
+import { SEARCH_INDEX_STREAM_CH_BUDGET, indexSearchScope, projectedToNeonRow, readChunkRecords, type SearchIndexDeps } from "../search-index.ts";
+import { STREAM_PASSES, streamScope } from "../search-index-stream.ts";
+import { transaction } from "../lambda.ts";
+import { chunkKeys } from "../../shared/vendor.ts";
+import { EventEmitter } from "node:events";
+import { zstdDecompressSync } from "node:zlib";
 import { processBatch, type ConsumerDeps } from "../consumer.ts";
 import { droppedFanout, type SessionScope } from "../pointer.ts";
 import { memoryLock } from "./support.ts";
@@ -62,7 +66,13 @@ beforeEach(async () => {
 });
 afterEach(async () => { await rm(root, { recursive: true, force: true }); });
 
-async function writeSession(machine: string, chunks: RelayhistoryStreamRecord[][], revision = 1, sessionId = scope.sessionId) {
+async function writeSession(
+  machine: string,
+  chunks: RelayhistoryStreamRecord[][],
+  revision = 1,
+  sessionId = scope.sessionId,
+  opts: { canonical?: string; noRawDigest?: boolean } = {},
+) {
   const location = loc(machine, sessionId);
   const entries: ChunkEntry[] = [];
   let offset = 0;
@@ -72,7 +82,7 @@ async function writeSession(machine: string, chunks: RelayhistoryStreamRecord[][
     const sha = await sha256Hex(source);
     const chunk: ChunkEntry = {
       seq, epoch: 0, start_offset: offset, bytes: source.byteLength, stored_bytes: stored.byteLength, sha256: sha, sha256_8: sha.slice(0, 8),
-      stored_sha256: await sha256Hex(stored), stored_raw_bytes: source.byteLength, raw_sha256: sha, compression: "zstd", records: records.length,
+      stored_sha256: await sha256Hex(stored), stored_raw_bytes: source.byteLength, ...(opts.noRawDigest ? {} : { raw_sha256: sha }), compression: "zstd", records: records.length,
     };
     offset += source.byteLength;
     entries.push(chunk);
@@ -88,7 +98,7 @@ async function writeSession(machine: string, chunks: RelayhistoryStreamRecord[][
       epochs: [{ epoch: 0, opened_at: AT, reason: "initial", first_seq: 0, opened_by: machine }], next_offset: offset, chunks: entries,
       scrub: { ruleset: "relayhistory-scrub", version: 1 },
     },
-    extensions: { "96bulls": { user_id: "user_1" } },
+    extensions: { "96bulls": { user_id: "user_1", ...(opts.canonical ? { canonical_session_id: opts.canonical } : {}) } },
   } as unknown as ManifestV1;
   const key = manifestKey(location);
   await store.put(objectKey(key), new TextEncoder().encode(JSON.stringify(manifest)), { contentType: "application/json" });
@@ -229,12 +239,14 @@ describe("streamed reconcile", () => {
     expect(refused).toMatchObject({ partial: true, reasons: ["scope_too_large"] });
 
     const sr = await indexSearchScope(scope, s.d);
-    expect(sr).toEqual({ ...wr });
+    expect(sr).toEqual({ ...wr, streamed: true });
     expect(streamed.final()).toEqual(whole.final());
     expect(streamed.final().length).toBeGreaterThan(5);
     expect(s.catalogs).toEqual(w.catalogs);
-    expect(streamed.state.map((r) => r.needs_full)).toEqual([0]);
-    expect(streamed.state).toEqual(whole.state);
+    // A pre-mark owing a pass (1 ms earlier), then the whole read's own state row.
+    expect(streamed.state.map((r) => r.needs_full)).toEqual([1, 0]);
+    expect(streamed.state.slice(1)).toEqual(whole.state);
+    expect((streamed.state[0] as unknown as { synced_at: string }).synced_at < (streamed.state[1] as unknown as { synced_at: string }).synced_at).toBe(true);
     // Tool times settled across chunks and manifests: c1 and e1 take p0's earlier time.
     const byEvent = new Map(streamed.final().map((r) => [r.delivery_record_id, r.ts]));
     expect(byEvent.get("c1")).toBe(byEvent.get("p0"));
@@ -249,7 +261,7 @@ describe("streamed reconcile", () => {
     const before = ch.final();
     expect(await indexSearchScope(scope, s.d)).toMatchObject({ complete: true, inserted: 0, deleted: 0 });
     expect(ch.final()).toEqual(before);
-    expect(ch.state.map((r) => r.needs_full)).toEqual([0, 0]);
+    expect(ch.state.map((r) => r.needs_full)).toEqual([1, 0, 1, 0]);
   });
 
   test("never diff-deletes kinds S3 cannot regenerate; a stale activity row is deleted", async () => {
@@ -304,11 +316,15 @@ describe("streamed reconcile", () => {
     expect(await indexSearchScope(scope, deps(probe.ch, () => keys, { ...armed, streamDeadline: { at: Number.POSITIVE_INFINITY, now: () => calls++ } }).d)).toMatchObject({ complete: true, deleted: 1 });
     expect(calls).toBeGreaterThan(20);
     const repaired = probe.final();
-    for (let cut = 0; cut < calls; cut++) {
+    // `calls` counts the start check too: the cut points are the calls - 1 checks after it.
+    for (let cut = 0; cut < calls - 1; cut++) {
       const ch = fakeClickHouse();
       ch.rows.push(...damaged());
+      // The first reading is the start check (STREAM_MIN_START_MS must be left); the k-th check
+      // after it reads START + k - 1, so the cut lands on check number `cut`.
       let n = 0;
-      const result = await indexSearchScope(scope, deps(ch.ch, () => keys, { ...armed, streamDeadline: { at: cut, now: () => n++ } }).d);
+      const START = 120_000;
+      const result = await indexSearchScope(scope, deps(ch.ch, () => keys, { ...armed, streamDeadline: { at: START + cut, now: () => (n++ === 0 ? 0 : START + n - 2) } }).d);
       expect(result).toMatchObject({ complete: false, partial: true, deleted: 0, reasons: ["scope_too_large", "stream_deadline"] });
       expect(ch.statements.some((q) => q.startsWith("command DELETE"))).toBe(false);
       expect(ch.final().some((r) => r.event_id === "tail:stale")).toBe(true);
@@ -376,7 +392,7 @@ describe("streamed reconcile", () => {
     await expect(indexSearchScope(scope, { ...s.d, store: missing })).rejects.toMatchObject({ code: "chunk_missing", retryable: true });
     // Nothing written but the state row: the session owes a full pass.
     expect(ch.rows).toEqual([]);
-    expect(ch.state.map((r) => r.needs_full)).toEqual([1]);
+    expect(ch.state.map((r) => r.needs_full)).toEqual([1, 1]);
   });
 
   test("keeps the transaction busy with the statement it already sends; no new Postgres statement, the keyset page the only new ClickHouse one", async () => {
@@ -427,7 +443,7 @@ describe("streamed reconcile", () => {
     expect(first.batchItemFailures).toEqual([]);
     expect(requeued).toEqual([two]);
     expect(ch.final().some((r) => r.session_id === "sess_2")).toBe(false);
-    expect(ch.state.map((r) => [r.session_id, r.needs_full])).toEqual([["sess_1", 0]]);
+    expect(ch.state.map((r) => [r.session_id, r.needs_full])).toEqual([["sess_1", 1], ["sess_1", 0]]);
     const second = await processBatch([{ messageId: "03", body: JSON.stringify({ reconcile: { key: two } }) }], consumer({ used: false }));
     expect(second.batchItemFailures).toEqual([]);
     expect(requeued).toEqual([two]);
@@ -490,5 +506,254 @@ describe("streamed reconcile", () => {
     expect(out).toMatchObject({ complete: false, partial: true, deleted: 0, reasons: ["scope_too_large", "stream_read_events_budget"] });
     expect(ch.statements.some((q) => q.startsWith("command DELETE"))).toBe(false);
     expect(ch.state.at(-1)!.needs_full).toBe(1);
+  });
+
+  /** A pass whose stale rows and whose result say whether it deleted. */
+  const staleSeeded = async (keys: string[], stale = 1) => {
+    const truth = fakeClickHouse();
+    await indexSearchScope(scope, deps(truth.ch, () => keys).d);
+    const ch = fakeClickHouse();
+    const base = truth.final()[0]!;
+    ch.rows.push(...truth.final(), ...Array.from({ length: stale }, (_, i) => ({ ...base, event_id: `tail:stale${i}`, fingerprint: "neon-y" })));
+    return { ch, truth };
+  };
+  const noDelete = (ch: ReturnType<typeof fakeClickHouse>) => {
+    expect(ch.statements.some((q) => q.startsWith("command DELETE"))).toBe(false);
+    expect(ch.final().some((r) => r.event_id.startsWith("tail:stale"))).toBe(true);
+    expect(ch.state.at(-1)!.needs_full).toBe(1);
+  };
+
+  test("an incomplete pass deletes nothing: two manifests naming different canonical sessions", async () => {
+    const a = await writeSession("srv_aa", [[say("r1", "1", 1, "one")]], 1, scope.sessionId, { canonical: "sess:1" });
+    const b = await writeSession("srv_bb", [[say("r2", "1", 2, "two")]], 1, scope.sessionId, { canonical: "sess/1" });
+    const { ch } = await staleSeeded([a, b]);
+    const s = deps(ch.ch, () => [a, b], armed);
+    expect(await indexSearchScope(scope, s.d)).toMatchObject({ complete: false, deleted: 0, reasons: ["canonical_session_mismatch"], streamed: true });
+    noDelete(ch);
+    expect(s.catalogs).toEqual([]);
+  });
+
+  test("an equal revision with different content stops the pass: nothing inserted or deleted", async () => {
+    const a = await writeSession("srv_aa", [[say("r1", "1", 1, "one")]]);
+    const b = await writeSession("srv_bb", [[say("r1", "1", 1, "not one"), say("r2", "1", 2, "two")]]);
+    const ch = fakeClickHouse();
+    ch.rows.push({ ...(await (async () => { const t = fakeClickHouse(); await indexSearchScope(scope, deps(t.ch, () => [b]).d); return t.final()[0]!; })()), event_id: "tail:stale0", fingerprint: "neon-y" });
+    const out = await indexSearchScope(scope, deps(ch.ch, () => [a, b], armed).d);
+    expect(out).toMatchObject({ complete: false, inserted: 0, deleted: 0, reasons: ["relayhistory_revision_conflict"] });
+    expect(ch.statements.filter((q) => q === `insert ${EVENTS_TABLE}`)).toEqual([]);
+    noDelete(ch);
+  });
+
+  /**
+   * Pass 4 must regenerate exactly what pass 3 recorded. Through indexSearchScope every chunk is
+   * digest-verified (stored and raw sha256, required for scrubbed raw), so a source that changes
+   * between passes cannot be produced there; these drive the reader with a readChunk that
+   * answers differently on pass 4, the case the guards exist for.
+   */
+  async function readerOn(change: (records: RelayhistoryStreamRecord[]) => RelayhistoryStreamRecord[]) {
+    const keys = await richScope();
+    const manifests = await Promise.all(keys.map(async (k) => (await reader.read(k))!.manifest));
+    const decompress = (stored: Uint8Array, max: number) => new Uint8Array(zstdDecompressSync(stored, { maxOutputLength: max }));
+    const chunks = manifests.reduce((n, m) => n + m.raw.chunks.length, 0);
+    let reads = 0;
+    const read = await streamScope(
+      {
+        scope, manifests, userIds: manifests.map(() => "user_1"),
+        chunks: (m) => chunkKeys(m, { prefix: "96bulls/org_1" }),
+        readChunk: async (entry, key) => {
+          const records = await readChunkRecords(entry, key as never, store, decompress);
+          return ++reads > 3 * chunks ? change(records) : records;
+        },
+        beforeChunk: async () => {}, budget: { ...SEARCH_INDEX_STREAM_CH_BUDGET }, version: 1, fromMs: 0,
+      },
+      projectedToNeonRow,
+    );
+    return read;
+  }
+
+  test("pass 4 finding a row missing writes fewer rows than asked (the reconcile then records stream_short_write)", async () => {
+    const read = await readerOn((records) => records.filter((r) => r.record_id !== "r3"));
+    const all = new Set(read.identities.keys());
+    const written: IndexRow[] = [];
+    expect(await read.regenerate(all, 100, async (rows) => void written.push(...rows))).toBe(all.size - 1);
+    expect(written.some((r) => r.delivery_record_id === "r3")).toBe(false);
+  });
+
+  test("pass 4 regenerating a row unlike pass 3's stops the read (stream_source_changed)", async () => {
+    const read = await readerOn((records) => records.map((r) => (r.record_id === "r1" && r.payload ? { ...r, payload: { ...r.payload, text: "changed" } } : r)));
+    const all = new Set(read.identities.keys());
+    await expect(read.regenerate(all, 100, async () => {})).rejects.toMatchObject({ code: "stream_source_changed", partial: false });
+  });
+
+  test("two surviving events with one index key stop the streamed read (stream_duplicate_event)", async () => {
+    const keys = await richScope();
+    const manifests = await Promise.all(keys.map(async (k) => (await reader.read(k))!.manifest));
+    const decompress = (stored: Uint8Array, max: number) => new Uint8Array(zstdDecompressSync(stored, { maxOutputLength: max }));
+    const read = streamScope(
+      {
+        scope, manifests, userIds: manifests.map(() => "user_1"),
+        chunks: (m) => chunkKeys(m, { prefix: "96bulls/org_1" }),
+        readChunk: (entry, key) => readChunkRecords(entry, key as never, store, decompress),
+        beforeChunk: async () => {}, budget: { ...SEARCH_INDEX_STREAM_CH_BUDGET }, version: 1, fromMs: 0,
+      },
+      // Every activity row gets one event id: two rows of one key.
+      (row, sc, uid) => ({ ...projectedToNeonRow(row, sc, uid), event_id: "same" }),
+    );
+    await expect(read).rejects.toMatchObject({ code: "stream_duplicate_event", partial: false });
+  });
+
+  test("malformed keyset pages (over the limit, out of order, repeating) are not trusted: nothing deleted", async () => {
+    const keys = await richScope();
+    for (const breakPage of [
+      (rows: unknown[]) => [...rows, ...rows], // more rows than asked for
+      (rows: unknown[]) => [...rows].reverse(), // out of order
+      (rows: unknown[], after: boolean) => (after ? [...rows.slice(0, 1), ...rows] : rows), // the first row again
+    ]) {
+      const { ch } = await staleSeeded(keys, 3);
+      let pages = 0;
+      const odd = { ...ch.ch, select: async <T,>(q: string, o?: { params?: Record<string, unknown> }) => {
+        const rows = await ch.ch.select<T>(q, o as never);
+        if (!q.includes("ORDER BY ts, machine_id")) return rows;
+        pages++;
+        return (pages === 2 ? breakPage(rows as unknown[], true) : rows) as T[];
+      } } as ClickHouseClient;
+      const out = await indexSearchScope(scope, deps(odd, () => keys, { ...armed, limits: { ...tiny, insertBatch: 3 } }).d);
+      expect(out).toMatchObject({ complete: false, deleted: 0, reasons: ["clickhouse_page_invalid"] });
+      noDelete(ch);
+    }
+  });
+
+  test("deletes run in batches, each after a deadline check and an unthrottled lock check; a cut between batches owes the rest", async () => {
+    const keys = await richScope();
+    const { ch, truth } = await staleSeeded(keys, 1_200);
+    let clock = 0;
+    let deleteBatches = 0;
+    const counting = { ...ch.ch, command: async (q: string, o?: unknown) => {
+      await ch.ch.command(q, o as never);
+      if (q.startsWith("DELETE") && ++deleteBatches === 1) clock = 10_000_000; // past the deadline after the first batch
+    } } as ClickHouseClient;
+    const s = deps(counting, () => keys, { ...armed, streamDeadline: { at: 1_000_000, now: () => clock } });
+    const out = await indexSearchScope(scope, s.d);
+    expect(out).toMatchObject({ complete: false, partial: true, deleted: 500, reasons: ["scope_too_large", "stream_deadline"] });
+    expect(ch.state.at(-1)!.needs_full).toBe(1);
+    // Every delete batch was preceded by a lock check (one batch ran).
+    const locks = s.sb.calls.filter((c) => c.startsWith("SELECT pg_try_advisory_xact_lock")).length;
+    expect(locks).toBeGreaterThanOrEqual(4); // the pass's lock, before and after the scan, before the batch
+    // The retry deletes the rest and makes the session current.
+    expect(await indexSearchScope(scope, deps(ch.ch, () => keys, armed).d)).toMatchObject({ complete: true, deleted: 700 });
+    expect(ch.final()).toEqual(truth.final());
+    expect(ch.state.at(-1)!.needs_full).toBe(0);
+  });
+
+  test("a scope is not started streaming with less than STREAM_MIN_START_MS left: deferred, nothing written", async () => {
+    const keys = await richScope();
+    const ch = fakeClickHouse();
+    const out = await indexSearchScope(scope, deps(ch.ch, () => keys, { ...armed, streamSlot: { used: false }, streamDeadline: { at: 119_999, now: () => 0 } }).d);
+    expect(out).toMatchObject({ deferred: true, reasons: ["stream_deferred"], inserted: 0 });
+    expect(ch.rows).toEqual([]);
+    expect(ch.state).toEqual([]);
+  });
+
+  /** One batch through the consumer: sessions sess_1 (streams) and the small sess_2, sess_3 (whole reads). */
+  async function batchFixture() {
+    const rich = await richScope();
+    const small = [
+      await writeSession("srv_cc", [[say("x1", "1", 1, "x")]], 1, "sess_2"),
+      await writeSession("srv_dd", [[say("y1", "1", 1, "y")]], 1, "sess_3"),
+    ];
+    const all = [...rich, ...small];
+    const ch = fakeClickHouse();
+    const sb = fakeSupabase(() => []);
+    const db = { ...sb.tx, pool: undefined, end: async () => {} } as unknown as HoopDb;
+    const bindings = { PIPELINE_ORG_FROM_PREFIX: "true", PIPELINE_KEY_PREFIX: "96bulls" };
+    const requeued: string[] = [];
+    const transact: SearchIndexDeps["transact"] = async (work) => work({ query: async (text: string, params?: unknown[]) => {
+      if (text.includes("FROM sessions.session_index") && text.includes("deleted_at IS NULL"))
+        return { rows: all.filter((k) => k.includes(`/s=${String(params?.[3])}/`)).map((manifest_key) => ({ manifest_key })) } as never;
+      return sb.tx.query(text, params);
+    } });
+    const consumer = (search: Partial<SearchIndexDeps>): ConsumerDeps => ({
+      pointer: { db, lock: memoryLock(), reader, exists: async (k) => (await store.head(objectKey(k))) !== undefined, orgs: prefixOrgResolver, allowPrefix: (prefix, org) => prefixAllowed(bindings, prefix, org), fanout: droppedFanout },
+      // Whole-read bound 3 events: the small sessions read whole, the rich one streams.
+      search: { ...deps(ch.ch, () => [], { limits: { maxScopeEvents: 3 }, stream: { ...SEARCH_INDEX_STREAM_CH_BUDGET }, ...search }).d, transact },
+      requeue: async (k) => void requeued.push(k),
+    });
+    const put = (key: string, seq: string) => ({ messageId: `m${seq}`, body: JSON.stringify({ Records: [{ eventSource: "aws:s3", eventName: "ObjectCreated:Put", eventTime: AT, s3: { bucket: { name: "bucket" }, object: { key, eTag: "e", sequencer: seq } } }] }) });
+    return { rich, small, ch, requeued, consumer, put };
+  }
+
+  test("a batch whose streamed scope spends its deadline requeues the rest: inside the deadline, nothing failed", async () => {
+    const { rich, small, ch, requeued, consumer, put } = await batchFixture();
+    let clock = 0;
+    const cutting = { ...store, get: async (key: Parameters<ObjectStore["get"]>[0]) => {
+      if (String(key).includes("/s=sess_1/")) clock = 200_000; // the stream spends its time
+      return store.get(key);
+    } } as ObjectStore;
+    const logs: string[] = [];
+    const out1 = process.stdout.write.bind(process.stdout);
+    const err1 = process.stderr.write.bind(process.stderr);
+    const grab = ((chunk: unknown) => { logs.push(String(chunk)); return true; }) as typeof process.stdout.write;
+    process.stdout.write = grab;
+    process.stderr.write = grab;
+    let out;
+    try {
+      out = await processBatch([put(rich[1]!, "01"), put(small[0]!, "02"), put(small[1]!, "03")], consumer({ store: cutting, streamSlot: { used: false }, streamDeadline: { at: 200_000, now: () => clock } }));
+    } finally {
+      process.stdout.write = out1;
+      process.stderr.write = err1;
+    }
+    expect(out.batchItemFailures).toEqual([]);
+    expect(requeued).toEqual(small);
+    expect(ch.final().some((r) => r.session_id !== "sess_1")).toBe(false);
+    expect(ch.state.map((r) => [r.session_id, r.needs_full])).toEqual([["sess_1", 1], ["sess_1", 1]]);
+    expect(logs.filter((l) => l.includes('"reason":"stream_batch_deadline"'))).toHaveLength(2);
+    // The partial line names the stream's own reasons, not only scope_too_large.
+    expect(logs.some((l) => l.includes('"search index partial"') && l.includes('"reason":"scope_too_large,stream_deadline"'))).toBe(true);
+  });
+
+  test("whole reads before the stream run; a stream with too little time left is deferred, not started", async () => {
+    const { rich, small, ch, requeued, consumer, put } = await batchFixture();
+    const out = await processBatch([put(small[0]!, "01"), put(small[1]!, "02"), put(rich[1]!, "03")], consumer({ streamSlot: { used: false }, streamDeadline: { at: 100_000, now: () => 0 } }));
+    expect(out.batchItemFailures).toEqual([]);
+    expect(requeued).toEqual([rich[1]]);
+    expect(ch.state.map((r) => [r.session_id, r.needs_full])).toEqual([["sess_2", 0], ["sess_3", 0]]);
+  });
+
+  test("a connection error emitted on the checked-out client mid-pass fails the message, never an uncaught exception", async () => {
+    const keys = await richScope();
+    const ch = fakeClickHouse();
+    ch.rows.push({ ...(await staleSeeded(keys)).truth.final()[0]!, event_id: "tail:stale0", fingerprint: "neon-y" });
+    const sb = fakeSupabase(() => keys);
+    const client = Object.assign(new EventEmitter(), {
+      released: [] as unknown[],
+      async query(text: string, params?: unknown[]) {
+        return sb.tx.query(text, params);
+      },
+      release(error?: unknown) {
+        this.released.push(error);
+      },
+    });
+    const db = { pool: { connect: async () => client } } as unknown as HoopDb;
+    let emitted = false;
+    const cutting = { ...store, get: async (key: Parameters<ObjectStore["get"]>[0]) => {
+      if (!emitted) {
+        emitted = true;
+        // What pg does when the server ends the session between statements.
+        client.emit("error", Object.assign(new Error("Connection terminated unexpectedly"), { code: "ECONNRESET" }));
+      }
+      return store.get(key);
+    } } as ObjectStore;
+    const s = deps(ch.ch, () => keys, { ...armed, store: cutting, streamKeepaliveMs: 60_000 });
+    await expect(transaction(db, (tx) => indexSearchScope(scope, { ...s.d, transact: async (w) => w(tx) }), true)).rejects.toMatchObject({ code: "ECONNRESET" });
+    // The broken client is destroyed (released with its error), not returned to the pool.
+    expect(client.released).toHaveLength(1);
+    expect(client.released[0]).toMatchObject({ code: "ECONNRESET" });
+    expect(client.listenerCount("error")).toBe(0);
+    noDelete(ch);
+    // Unguarded (as the flag-off path always was), the same emit has no listener and throws.
+    const bare = Object.assign(new EventEmitter(), { query: client.query, release() {} });
+    await transaction({ pool: { connect: async () => bare } } as unknown as HoopDb, async () => {
+      expect(() => bare.emit("error", new Error("x"))).toThrow("x");
+    });
   });
 });

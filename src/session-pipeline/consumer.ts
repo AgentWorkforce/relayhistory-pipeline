@@ -14,6 +14,7 @@ import { errorFields, log } from "../shared/log.ts";
 import { parseQueueBody, sequencerAfter, type LandedEvent } from "./s3-events.ts";
 import { indexPointer, type PointerDeps, type SessionScope } from "./pointer.ts";
 import { indexSearchScope, type SearchIndexDeps } from "./search-index.ts";
+import { streamDeadlinePassed } from "./search-index-stream.ts";
 
 export interface QueueRecord {
   messageId: string;
@@ -93,6 +94,14 @@ export async function processBatch(records: readonly QueueRecord[], deps: Consum
       if (messageIds.every((id) => failed.has(id))) continue;
       const started = Date.now();
       try {
+        // SEARCH_INDEX_STREAMING_CH=1 only: once this invocation streamed a scope and its deadline
+        // passed, the batch's remaining scopes are requeued instead of run in the margin.
+        if (deps.search.streamSlot?.used && streamDeadlinePassed(deps.search.streamDeadline)) {
+          if (!deps.requeue) throw new Error("batch past its stream deadline and no requeue");
+          await deps.requeue(manifestKey);
+          log.info("search index past the batch deadline, requeued", { stage: "search-index", org_id: scope.orgId, session_id: scope.sessionId, reason: "stream_batch_deadline" });
+          continue;
+        }
         const result = await indexSearchScope(scope, deps.search);
         if (result.busy) {
           // The running pass may have read S3 before this event's write: run again later.
@@ -109,7 +118,7 @@ export async function processBatch(records: readonly QueueRecord[], deps: Consum
           continue;
         }
         if (result.partial)
-          log.warn("search index partial", { stage: "search-index", org_id: scope.orgId, session_id: scope.sessionId, manifests: result.manifests, reason: "scope_too_large" });
+          log.warn("search index partial", { stage: "search-index", org_id: scope.orgId, session_id: scope.sessionId, manifests: result.manifests, reason: result.streamed ? result.reasons.join(",") : "scope_too_large" });
         log.info("search index reconciled", {
           stage: "search-index",
           org_id: scope.orgId,
