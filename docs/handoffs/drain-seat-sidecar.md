@@ -29,6 +29,7 @@ It runs the same queries and never reads the seat query.
 The drain refuses a v3 sidecar exactly as it refuses an unknown version.
 That outcome is `accepted_mismatch`, and nothing is written.
 A v2 sidecar drains to the same unseated lines whether the drain opt-in is on or off.
+An export with the opt-in off still reads an existing v3 sidecar, so it can replace it with v2.
 
 ## How the export proves a seat
 
@@ -38,14 +39,18 @@ It is a read-only copy of `sessions.ingest_lazy_stage_seats`, its guard `session
 Those functions take locks and raise, so the export cannot call them.
 Each case where they raise becomes a failed flag or a short count.
 
+The export opt-in needs the lazy custody policy (a row in `sessions.ingest_lazy_policy`).
+Without one, every live stage is refused with `seat_not_lazy` and gets no sidecar.
+
 A seat is given only under the rules of `acceptedReceiptSeat` in `publication-seats.ts`.
-A line whose body was not accepted is not kept and never gets a seat.
+Under the lazy policy, a line whose body was not accepted is not kept and never gets a seat.
 The seat's first digest must equal the line's digest.
 The reset epoch and fence epoch must equal the publication head's.
 
 Any doubt means refuse.
 A refused live stage gets no sidecar.
 Its code is counted in `failed_codes`, and its org stays incomplete.
+In the summary, such a stage counts in both `live` and `failed`, as a `no_head_parity_unlisted` refusal does.
 A sidecar an earlier export wrote for that stage is left as it is.
 So an earlier v2 sidecar can still drain, unseated.
 The codes are `seat_row`, `seat_not_lazy`, `seat_precondition`, `seat_missing`, `seat_scope`, `seat_duplicate`, and the `publication_seats_*` codes.
@@ -83,18 +88,35 @@ Two copies with different seats are refused by the reader (`relayhistory_accepta
 
 ## Before turning it on
 
-1. Turn on the drain opt-in first, everywhere the drain runs.
+1. Confirm the lazy custody policy is in place where the export runs.
+   Without it, the export opt-in refuses every live stage (`seat_not_lazy`).
+2. Turn on the drain opt-in first, everywhere the drain runs.
+   This applies to every drain build and every host that runs a drain.
    A drain without it refuses every v3 sidecar.
-2. Then turn on the export opt-in.
-3. Watch `failed_codes` for the `seat_*` codes after the first export.
+3. Then turn on the export opt-in.
+4. Watch `failed_codes` for the `seat_*` codes after the first export.
    Any of them leaves the org incomplete until the cause is fixed.
-4. Each step needs the owner's explicit OK.
+5. Each step needs the owner's explicit OK.
 
-Turning the export opt-in off again is safe.
-The next export replaces each v3 sidecar with v2, and the drain reads both.
+The export and the drain run from this repository's ingest tooling.
+So a build that carries these options also carries every other change on the branch it is built from that the running ingest build does not have yet.
+Compare the running build with the build to be shipped before enabling.
+
+## Turning it off
+
+To roll back, turn the export option off first, let one export rewrite v2, then turn the drain option off.
+That export replaces the v3 sidecar of each stage it still exports with v2, and the drain reads both.
+
+Do not turn the drain option off while v3 sidecars exist.
+A drain without the opt-in, or an older drain build, meets a v3 sidecar as an unknown version.
+Each such stage is `accepted_mismatch`, and nothing is written.
+That outcome is final for that export generation: a checkpoint may pass it, so a run resumed from that checkpoint does not retry it.
+The user's hold entry for that stage is released first, so later batches of that user can drain ahead of it.
 
 ## What was not tested
 
 - Real PostgreSQL. The SQL ran only in PGlite, with the migrations through `20261105047020`.
 - Real S3. The object store was the local file store.
 - The command-line scripts, since they do not pass the opt-ins.
+- A deployment without the lazy custody policy, beyond the unit check that gives `seat_not_lazy`.
+- The rollback order, and an older drain build meeting a v3 sidecar. These follow from reading the drain code; no test runs them.
