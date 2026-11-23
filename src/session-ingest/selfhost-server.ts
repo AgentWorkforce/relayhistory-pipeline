@@ -108,6 +108,10 @@ function withoutSlots(d: DeliverDeps): DeliverDeps {
 }
 import { randomUUID } from "node:crypto";
 import { isSessionErasePath } from "./session-erase.ts";
+import {
+  bindUpstreamAssertionGate, checkUpstreamAssertion, upstreamAssertionBypass, upstreamAssertionLogFields, upstreamAssertionRefusal,
+  UPSTREAM_ASSERTION_HEADER, UPSTREAM_ASSERTION_LOG_MESSAGE, type UpstreamAssertionConfig, type UpstreamAssertionGate,
+} from "../shared/upstream-assertion.ts";
 import type { SessionEraseService } from "./session-erase.ts";
 import { buildSelfhostEraseRuntime } from "../session-erase/selfhost-runtime.ts";
 import { composeSessionWriteGuards, s3EraseFenceGuard, withS3EraseTombstones } from "./s3-erase-fence.ts";
@@ -702,8 +706,13 @@ function probeFields(runtime: SelfhostIngestRuntime | null): Record<string, unkn
 
 const envelope = (code: string, message: string, correlationId: string, extra: Record<string, unknown> = {}) => ({ error: { code, message, ...extra }, correlationId });
 
-/** node:http in front of the runtime (null: dormant). */
-export function selfhostIngestHttpServer(runtime: SelfhostIngestRuntime | null): Server {
+/**
+ * node:http in front of the runtime (null: dormant). `upstreamAssertion` (INGEST_UPSTREAM_ASSERTION_MODE=log|enforce,
+ * docs/selfhost-composition.md): the relaygate v1 upstream assertion, phase 1 here before any body byte is read,
+ * phase 2 in the app's bounded read (the gate is bound to the Request handed to the app). Absent: unchanged.
+ */
+export function selfhostIngestHttpServer(runtime: SelfhostIngestRuntime | null, options: { upstreamAssertion?: UpstreamAssertionConfig } = {}): Server {
+  const assertion = options.upstreamAssertion;
   const server = createServer((req, res) => {
     void (async () => {
       const correlationId = correlationOf(req);
@@ -718,6 +727,22 @@ export function selfhostIngestHttpServer(runtime: SelfhostIngestRuntime | null):
         }
         if (!runtime)
           return sendJson(req, res, 503, envelope("not_configured", "the session ingest is not enabled", correlationId), { "retry-after": "60", "x-correlation-id": correlationId });
+        // Upstream assertion phase 1, before any body byte is read. Bypass: OPTIONS (the probes answered above). The
+        // operator erase route is not checked here: its own bearer check in the app decides, as today.
+        let gate: UpstreamAssertionGate | undefined;
+        if (assertion && !upstreamAssertionBypass(req.method, req.url ?? "") && !isSessionErasePath(path)) {
+          const checked = checkUpstreamAssertion(
+            assertion,
+            "ingest-edge",
+            { method: req.method ?? "", target: req.url ?? "", authorization: req.headers.authorization, assertion: req.headers[UPSTREAM_ASSERTION_HEADER] },
+            (reason) => log.warn(UPSTREAM_ASSERTION_LOG_MESSAGE, upstreamAssertionLogFields(assertion.mode, reason, correlationId)),
+          );
+          if ("refuse" in checked) {
+            const { code, message } = upstreamAssertionRefusal(checked.refuse);
+            return sendJson(req, res, 401, envelope(code, message, correlationId), { "x-correlation-id": correlationId });
+          }
+          gate = checked.gate;
+        }
         if (path === SELFHOST_REFRESH_PATH) {
           if (req.method !== "POST")
             return sendJson(req, res, 405, envelope("method_not_allowed", "POST only", correlationId), { allow: "POST", "x-correlation-id": correlationId });
@@ -788,6 +813,7 @@ export function selfhostIngestHttpServer(runtime: SelfhostIngestRuntime | null):
           ...(post ? { body: Readable.toWeb(req) as unknown as ReadableStream<Uint8Array>, duplex: "half" } : {}),
         } as RequestInit);
         if (identity) runtime.bind(request, identity);
+        if (gate) bindUpstreamAssertionGate(request, gate);
         const response = await runtime.app.fetch(request);
         const out: Record<string, string> = {};
         response.headers.forEach((v, k) => (out[k] = v));
@@ -826,7 +852,7 @@ export async function startSelfhostIngestService(
 ): Promise<SelfhostIngestService> {
   const config = selfhostIngestConfig(env);
   const runtime = config.enabled ? await (options.build ?? productionRuntime)(config, env) : null;
-  const server = selfhostIngestHttpServer(runtime);
+  const server = selfhostIngestHttpServer(runtime, config.enabled && config.upstreamAssertion ? { upstreamAssertion: config.upstreamAssertion } : {});
   try {
     await new Promise<void>((resolve, reject) => {
       server.once("error", reject);

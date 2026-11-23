@@ -166,7 +166,12 @@
  *                                    SELFHOST_INGEST_ADMISSION=async|drain: 1..SELFHOST_ADMISSION_CONCURRENCY,
  *                                    default max(1, floor(concurrency / 2)), so one org never holds more than half
  *                                    the consumer. Set without the flag (or without async admission): refused.
+ *   INGEST_UPSTREAM_ASSERTION_MODE   unset | "" | "off" (default: nothing mounted, no key variable read) | "log" | "enforce":
+ *                                    the relaygate v1 upstream assertion check with INGEST_UPSTREAM_ASSERTION_{PUBLIC_KEY,
+ *                                    KID,PUBLIC_KEY_PREVIOUS,KID_PREVIOUS} (src/shared/upstream-assertion.ts,
+ *                                    docs/selfhost-composition.md); anything else refuses startup.
  */
+import { INGEST_UPSTREAM_ASSERTION_PREFIX, upstreamAssertionConfig, type UpstreamAssertionConfig } from "../shared/upstream-assertion.ts";
 import { UPLOAD_CONSENT_VAR, uploadConsentEnforcement, type UploadConsentEnforcement } from "./upload-consent.ts";
 import { INGEST_LEDGER_VAR, ingestLedgerMode } from "./ledger-s3.ts";
 import { LEDGER_HOME_GUARD_VAR, ledgerHomeGuard } from "./ledger-store.ts";
@@ -265,6 +270,8 @@ export interface SelfhostIngestSettings {
   ledgerHomeGuard?: true;
   /** INGEST_S3_ERASE_FENCE=on (INGEST_LEDGER=s3 only, s3-erase-fence.ts). Absent (the default): no tombstone guard or write. */
   s3EraseFence?: true;
+  /** INGEST_UPSTREAM_ASSERTION_MODE=log|enforce (src/shared/upstream-assertion.ts). Absent (the default): off. */
+  upstreamAssertion?: UpstreamAssertionConfig;
 }
 
 /** The S3 ledger's own bucket (ledger-store.ts). `region`: INGEST_LEDGER_REGION, else LOCKER_REGION, else us-east-1. */
@@ -632,6 +639,7 @@ export function selfhostIngestConfig(env: NodeJS.ProcessEnv = process.env): Self
   const s3TenantLimit = selfhostS3TenantLimit(env, ledger, admission);
   const ledgerStore = selfhostLedgerStore(env, ledger);
   const homeGuard = selfhostLedgerHomeGuard(env, ledger);
+  const upstreamAssertion = upstreamAssertionConfig(env, INGEST_UPSTREAM_ASSERTION_PREFIX);
   return {
     enabled: true,
     port: port(env),
@@ -659,5 +667,6 @@ export function selfhostIngestConfig(env: NodeJS.ProcessEnv = process.env): Self
     ...(s3TenantLimit ? { s3TenantLimit } : {}),
     ...(ledgerStore ? { ledgerStore } : {}),
     ...(homeGuard ? { ledgerHomeGuard: true as const } : {}),
+    ...(upstreamAssertion ? { upstreamAssertion } : {}),
   };
 }

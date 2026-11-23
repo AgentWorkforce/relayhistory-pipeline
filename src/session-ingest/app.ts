@@ -43,6 +43,7 @@ import { zstdDecompressSync } from "node:zlib";
 import { createHash, createHmac, timingSafeEqual } from "node:crypto";
 import { Hono, type Context } from "hono";
 import { log } from "../shared/log.ts";
+import { upstreamAssertionGate, upstreamAssertionRefusal } from "../shared/upstream-assertion.ts";
 import { captureSafely, ingestOutcome, type AnalyticsPort } from "../shared/analytics.ts";
 import { AuthError, type VerifiedIdentity } from "../session-read-api/app.ts";
 import { batchIdConflict, BufferLockBusy, ClaimLockBusy, deliverBatch, deliverPrepared, IngestUnavailable, type DeliverDeps } from "./deliver.ts";
@@ -355,6 +356,12 @@ export async function boundedJson(request: Request, read: BodyRead): Promise<unk
 
 function errorBody(c: Context<Env>, code: string, message: string, extra: Record<string, unknown> = {}) {
   return { error: { code, message, ...extra }, correlationId: c.get("correlationId") ?? "" };
+}
+
+/** The generic 401 for an upstream assertion that failed phase 2 in enforce (never says which check). */
+function upstreamAssertionRefused(c: Context<Env>) {
+  const { code, message } = upstreamAssertionRefusal("body");
+  return c.json(errorBody(c, code, message), 401);
 }
 
 /** The 503 diagnosis on the route's log line: stage, cause code and, for a database cause,
@@ -698,6 +705,9 @@ export function createIngestApp(deps: IngestAppDeps) {
     } catch (error) {
       return failure(c, error);
     }
+    // Relaygate v1 upstream assertion, phase 2 (self-host only: selfhost-server.ts binds the gate): body_sha256 over
+    // these exact wire bytes, before identity or any side effect. No gate bound (hosted, off): nothing changes.
+    if (upstreamAssertionGate(c.req.raw)?.body(body)) return upstreamAssertionRefused(c);
     c.set("body", body);
     try {
       c.set("identity", await identify(c.req.raw, body));
@@ -846,7 +856,10 @@ export function createIngestApp(deps: IngestAppDeps) {
     let lease: InflightGrant | undefined;
     try {
       assertHttpAdmissionOpen(identity.orgId);
-      const batch = parse(await jsonOf(c, read), identity);
+      const value = await jsonOf(c, read);
+      // Upstream assertion phase 2: the body-derived scope (batch.records[].session_id, decoded), before any write.
+      if (upstreamAssertionGate(c.req.raw)?.scope(value)) return upstreamAssertionRefused(c);
+      const batch = parse(value, identity);
       // Capture policy (capture-policy.ts): self-host identities carry the org's policy. Report logs, enforce refuses.
       const violation = uploadPolicyViolation(identity, c.req.header(CAPTURE_POLICY_REVISION_HEADER), batch);
       if (violation) {
@@ -1018,7 +1031,10 @@ export function createIngestApp(deps: IngestAppDeps) {
   app.post("/v1/delivery/sessions/selection", async (c) => {
     const identity = c.get("identity");
     try {
-      const input = parseSelection(await jsonOf(c));
+      const value = await jsonOf(c);
+      // Upstream assertion phase 2: the body-derived scope (sessions[].session_id), before any write.
+      if (upstreamAssertionGate(c.req.raw)?.scope(value)) return upstreamAssertionRefused(c);
+      const input = parseSelection(value);
       await requireDeliveryAccount(identity, input.account_id);
       if (input.expected_user_id !== undefined && input.expected_user_id !== identity.userId)
         throw new DeliveryError("delivery_user_mismatch", 403, "Upload selection does not match authenticated user");
