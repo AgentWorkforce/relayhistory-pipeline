@@ -41,6 +41,57 @@ describe("session analysis job schedule", () => {
   });
 });
 
+describe("analysisJobs.cutoverProof renders SESSION_ANALYSIS_CUTOVER_PROOF only when armed", () => {
+  const env = (p: Parameters<typeof sessionPipelineEnv>[0]["p"]) => sessionPipelineEnv({ stage: "s", bucket: "b", names, p });
+  // The pre-change rendering, written out in full: a flag-off stage must render exactly this.
+  const before = (analysis: "true" | "false") => ({
+    DEPLOYMENT: "s", DEPLOYMENT_ID: "s", OTEL_SERVICE_NAME: "96bulls-session-pipeline", PIPELINE_RAW_S3_BUCKET: "b",
+    PIPELINE_KEY_PREFIX: "96bulls", PIPELINE_ORG_FROM_PREFIX: "true", SESSION_PIPELINE_SECRET_ARN: "96bulls/aws-sessions-prod/session-pipeline",
+    SESSION_PIPELINE_QUEUE_URL: "https://sqs.us-east-1.amazonaws.com/941433935742/96bulls-aws-sessions-prod-session-events",
+    SEARCH_INDEX_ENABLED: "0", SESSION_REPLAY_PAGES_ENABLED: "0", SESSION_ANALYSIS_CACHE_ENABLED: "0", SESSION_DESKTOP_CATALOG_ENABLED: "0",
+    SESSION_SEMANTIC_COPY_ENABLED: "0", SESSION_SEARCH_FEATURE_SOURCE_ID: "", SESSION_ANALYSIS_ENABLED: analysis, PIPELINE_FANOUT: "off",
+    PIPELINE_RECONCILE_LOOKBACK_MINUTES: "60", HOOPDB_POOL_MAX: "4", NODE_OPTIONS: "--enable-source-maps", SESSION_BRIEF_ENABLED: "false",
+  });
+  test("flag off: the rendered env is identical to before, with no SESSION_ANALYSIS_CUTOVER_PROOF key", () => {
+    for (const [p, analysis] of [
+      [{}, "false"],
+      [{ analysisJobs: { enabled: false } }, "false"],
+      [{ analysisJobs: { enabled: true } }, "true"],
+      [{ analysisJobs: { enabled: true, cutoverProof: false } }, "true"],
+      [{ analysisJobs: { enabled: false, cutoverProof: false } }, "false"],
+    ] as const) {
+      const e = env(p);
+      expect(e).not.toHaveProperty("SESSION_ANALYSIS_CUTOVER_PROOF");
+      expect(JSON.stringify(e)).toBe(JSON.stringify(before(analysis)));
+    }
+    // cutoverProof: false is the same as absent, key order included.
+    expect(JSON.stringify(env({ analysisJobs: { enabled: true, cutoverProof: false } }))).toBe(JSON.stringify(env({ analysisJobs: { enabled: true } })));
+  });
+  test("on with the jobs on: exactly one added key, \"on\"", () => {
+    const e = env({ analysisJobs: { enabled: true, cutoverProof: true } });
+    expect(e.SESSION_ANALYSIS_CUTOVER_PROOF).toBe("on");
+    const { SESSION_ANALYSIS_CUTOVER_PROOF: _, ...rest } = e;
+    expect(rest).toEqual(before("true"));
+    // The schedule is the analysisJobs.enabled one; the switch does not change it.
+    const sched = (p: Parameters<typeof sessionPipelineEnv>[0]["p"]) => analysisJobScheduleProps({ names, functionArn: FN, p, tags: {} });
+    expect(sched({ analysisJobs: { enabled: true, cutoverProof: true } })).toEqual(sched({ analysisJobs: { enabled: true } }));
+    // Never rendered without the jobs, even if validation were bypassed.
+    expect(env({ analysisJobs: { enabled: false, cutoverProof: true } })).not.toHaveProperty("SESSION_ANALYSIS_CUTOVER_PROOF");
+  });
+  test("validation: boolean only, needs enabled, unknown keys still refused", () => {
+    const ok = { schedules: { analysisJob: true } } as const;
+    expect(() => assertSessionPipelineInputs({ analysisJobs: { enabled: true, cutoverProof: true }, ...ok }, refuse)).not.toThrow();
+    expect(() => assertSessionPipelineInputs({ analysisJobs: { enabled: true, cutoverProof: false }, ...ok }, refuse)).not.toThrow();
+    expect(() => assertSessionPipelineInputs({ analysisJobs: { enabled: false, cutoverProof: false } }, refuse)).not.toThrow();
+    expect(() => assertSessionPipelineInputs({ analysisJobs: { enabled: false, cutoverProof: true } }, refuse)).toThrow(/analysisJobs.cutoverProof requires analysisJobs.enabled/);
+    for (const v of ["on", "true", 1, null, {}])
+      expect(() => assertSessionPipelineInputs({ analysisJobs: { enabled: true, cutoverProof: v }, ...ok }, refuse)).toThrow(/analysisJobs requires exactly/);
+    expect(() => assertSessionPipelineInputs({ analysisJobs: { cutoverProof: true }, ...ok }, refuse)).toThrow(/analysisJobs requires exactly/);
+    expect(() => assertSessionPipelineInputs({ analysisJobs: { enabled: true, cutoverProof: true, model: "x" }, ...ok }, refuse)).toThrow(/analysisJobs requires exactly/);
+    expect(() => assertSessionPipelineInputs({ analysisJobs: { enabled: true, cutoverproof: true }, ...ok }, refuse)).toThrow(/analysisJobs requires exactly/);
+  });
+});
+
 import { pipelineBucketStatements, pipelineAnalysisKeyStatement } from "../session-pipeline.ts";
 import { transcriptKeyPolicy } from "../transcript-store.ts";
 

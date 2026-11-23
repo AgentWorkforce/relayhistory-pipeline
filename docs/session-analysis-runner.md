@@ -167,7 +167,7 @@ the values the sessions umbrella would need to expose, with nothing enabled by d
 | `sessionAnalysis.postgresTls` | `SESSION_POSTGRES_TLS_PROFILE` and, for `custom-ca`, a CA ConfigMap plus its SHA-256 |
 | `sessionAnalysis.serviceAccount` | A dedicated ServiceAccount bound by an EKS Pod Identity association to the role in the S3 and KMS section. Not shared with ingest-edge, which must not gain result-write or version-delete rights |
 | `sessionAnalysis.decisionRecords` | `SUMMARY_DECISION_RECORDS_ENABLED` (default unset, as on the Lambda today) |
-| `sessionAnalysis.cutoverProof` | `SESSION_ANALYSIS_CUTOVER_PROOF`, passed through |
+| `sessionAnalysis.cutoverProof` | `SESSION_ANALYSIS_CUTOVER_PROOF`, passed through (the Lambda's counterpart is the stack input `transcriptStore.sessionPipeline.analysisJobs.cutoverProof`, default off) |
 | probes | `livenessProbe` and `readinessProbe` as HTTP GET `/healthz` and `/readyz` on 8081, with liveness `periodSeconds` 30 and `failureThreshold` 3 |
 | `terminationGracePeriodSeconds` | `660` (one 600 s lease plus margin), so a draining job can finish instead of waiting out its lease |
 | resources | A starting point of requests 250m / 512Mi and limit 1Gi. Canonical evidence and the model request are held in memory per job, and jobs run one at a time |

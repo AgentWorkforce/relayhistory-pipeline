@@ -41,6 +41,7 @@ import { bufferedErasureConfig } from "../../../src/session-pipeline/buffered-er
 import { searchIndexLimits, searchIndexStreamChFromEnv, searchIndexStreamFloor, SEARCH_INDEX_STREAM_CH_CEILING } from "../../../src/session-pipeline/search-index.ts";
 import { lambdaEnv, pointerPreReadFromEnv, pointerSkipOriginBucketFromEnv, searchIndexPreReadFromEnv, searchIndexSkipCurrentFromEnv } from "../../../src/session-pipeline/lambda.ts";
 import { NeonExitRefusal } from "../../../src/shared/neon-exit.ts";
+import { analysisConfig } from "../../../src/session-analysis/worker.ts";
 
 const STAGE = "aws-sessions-prod";
 const ACCOUNT = "941433935742";
@@ -944,6 +945,47 @@ describe("session pipeline: SUMMARY_DECISION_RECORDS_ENABLED (relayfacts, defaul
   it("refuses a non-boolean", () => {
     for (const bad of ["true", 1, null, {}, "on"])
       expect(() => validate(withPipeline({ relayfacts: bad }))).toThrow("transcriptStore.sessionPipeline.relayfacts must be a boolean");
+  });
+});
+
+describe("session pipeline: analysisJobs.cutoverProof (SESSION_ANALYSIS_CUTOVER_PROOF, default off)", () => {
+  const withPipeline = (sessionPipeline: unknown) =>
+    ({ ...example, transcriptStore: { ...example.transcriptStore, sessionPipeline } }) as unknown as AwsInputs & Record<string, unknown>;
+  const validate = (i: AwsInputs & Record<string, unknown>) => assertTranscriptStoreInputs(STAGE, i);
+  const props = (sp: SessionPipelineInputs) => sessionPipelineFunctionProps({ stage: STAGE, accountId: ACCOUNT, region: REGION, p: sp, tags: () => ({}), bucket: t.bucket });
+  const on = { analysisJobs: { enabled: true }, schedules: { analysisJob: true } } as SessionPipelineInputs;
+
+  it("absent or false: the function props are byte-identical and carry no SESSION_ANALYSIS_CUTOVER_PROOF", () => {
+    for (const sp of [{}, { searchIndex: true }, on] as SessionPipelineInputs[]) {
+      expect(Object.hasOwn(props(sp).env, "SESSION_ANALYSIS_CUTOVER_PROOF")).toBe(false);
+      if (!sp.analysisJobs) continue;
+      const off = { ...sp, analysisJobs: { ...sp.analysisJobs, cutoverProof: false } };
+      expect(() => validate(withPipeline(off))).not.toThrow(/sessionPipeline/);
+      expect(JSON.stringify(props(off))).toBe(JSON.stringify(props(sp)));
+    }
+    expect(analysisConfig(props(on).env).cutoverProof).toBe(false);
+  });
+
+  it("true with the jobs on: exactly one more var, \"on\", which the worker parses as on", () => {
+    const armed = { ...on, analysisJobs: { enabled: true, cutoverProof: true } };
+    expect(() => validate(withPipeline(armed))).not.toThrow(/sessionPipeline/);
+    expect(props(armed).env).toEqual({ ...props(on).env, SESSION_ANALYSIS_CUTOVER_PROOF: "on" });
+    const { env: _a, ...restArmed } = props(armed);
+    const { env: _b, ...restOn } = props(on);
+    // JSON, as a capture sees it: the build plugin is a fresh object per call.
+    expect(JSON.stringify(restArmed)).toBe(JSON.stringify(restOn));
+    expect(analysisConfig(props(armed).env).cutoverProof).toBe(true);
+  });
+
+  it("refuses it without the jobs, a non-boolean, and unknown keys", () => {
+    expect(() => validate(withPipeline({ analysisJobs: { enabled: false, cutoverProof: true } }))).toThrow(
+      "transcriptStore.sessionPipeline.analysisJobs.cutoverProof requires analysisJobs.enabled",
+    );
+    for (const bad of ["on", "true", 1, null, {}])
+      expect(() => validate(withPipeline({ ...on, analysisJobs: { enabled: true, cutoverProof: bad } }))).toThrow(
+        "transcriptStore.sessionPipeline.analysisJobs requires exactly { enabled: boolean, cutoverProof?: boolean }",
+      );
+    expect(() => validate(withPipeline({ ...on, analysisJobs: { enabled: true, cutoverProof: true, extra: true } }))).toThrow(/analysisJobs requires exactly/);
   });
 });
 
