@@ -78,6 +78,13 @@ export interface LambdaEnv {
    * before any manifest read (search-index.ts overBoundBeforeRead). Absent: as before.
    */
   searchSkipOverBound?: true;
+  /**
+   * SEARCH_INDEX_SKIP_ACCEPTANCE_MISSING_ENABLED=true (default off): a scope whose last pass
+   * ended incomplete for relayhistory_acceptance_missing alone, over the same pointer set,
+   * returns that outcome again before any manifest read (search-index.ts acceptance stamp).
+   * Absent: as before.
+   */
+  searchSkipAcceptanceMissing?: true;
 }
 
 export function lambdaEnv(env: NodeJS.ProcessEnv = process.env): LambdaEnv {
@@ -101,6 +108,12 @@ export function lambdaEnv(env: NodeJS.ProcessEnv = process.env): LambdaEnv {
     throw new Error("session pipeline: SEARCH_INDEX_SKIP_OVER_BOUND_ENABLED must be true or false");
   if (searchSkipOverBound && env.SEARCH_INDEX_ENABLED !== "1")
     throw new Error("session pipeline: SEARCH_INDEX_SKIP_OVER_BOUND_ENABLED=true needs SEARCH_INDEX_ENABLED=1");
+  const skipAcceptance = env.SEARCH_INDEX_SKIP_ACCEPTANCE_MISSING_ENABLED;
+  const searchSkipAcceptanceMissing = skipAcceptance === "true";
+  if (!searchSkipAcceptanceMissing && skipAcceptance !== undefined && skipAcceptance !== "" && skipAcceptance !== "false")
+    throw new Error("session pipeline: SEARCH_INDEX_SKIP_ACCEPTANCE_MISSING_ENABLED must be true or false");
+  if (searchSkipAcceptanceMissing && env.SEARCH_INDEX_ENABLED !== "1")
+    throw new Error("session pipeline: SEARCH_INDEX_SKIP_ACCEPTANCE_MISSING_ENABLED=true needs SEARCH_INDEX_ENABLED=1");
   return {
     region: need("AWS_REGION"),
     bucket: need("PIPELINE_RAW_S3_BUCKET"),
@@ -113,6 +126,7 @@ export function lambdaEnv(env: NodeJS.ProcessEnv = process.env): LambdaEnv {
     dbPoolMax: Number(env.HOOPDB_POOL_MAX ?? "4") || 4,
     ...(searchStreamCh ? { searchStreamCh: true as const } : {}),
     ...(searchSkipOverBound ? { searchSkipOverBound: true as const } : {}),
+    ...(searchSkipAcceptanceMissing ? { searchSkipAcceptanceMissing: true as const } : {}),
   };
 }
 
@@ -287,6 +301,8 @@ async function init(): Promise<Runtime> {
       ...(env.searchStreamCh ? { stream: { ...SEARCH_INDEX_STREAM_CH_BUDGET } } : {}),
       // Default off (SEARCH_INDEX_SKIP_OVER_BOUND_ENABLED=true).
       ...(env.searchSkipOverBound ? { skipOverBound: true as const } : {}),
+      // Default off (SEARCH_INDEX_SKIP_ACCEPTANCE_MISSING_ENABLED=true).
+      ...(env.searchSkipAcceptanceMissing ? { skipAcceptanceMissing: true as const } : {}),
     };
   }
   // The key comes from the secret only; "-disabled" or blank means no model, as in config.ts.
