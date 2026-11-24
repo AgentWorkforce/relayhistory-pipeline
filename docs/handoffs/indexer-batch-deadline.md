@@ -229,15 +229,24 @@ the work exactly as before. The pointer stage threads it, per call (never stored
 index object), into `upsertRawPointer` (`UpsertOptions.ensureLive` in `src/hoopdb/index.ts`). With
 it, a check runs:
 
-- before every statement the pointer work sends on the main pool, reads included (the stored-row
-  read, the upsert and its reads, the tombstone, the rekey);
-- before every statement in the publication transaction, before its BEGIN and before its COMMIT;
-- before every statement of the move transaction, before its BEGIN and before its COMMIT;
+- before each main-pool statement the pointer work sends: the pre-read stamp re-read and the
+  stored-row read (the pointer stage's own, through `checkedDb` in `src/hoopdb/index.ts`), and
+  the upsert's own reads and writes, the tombstone and the rekey (each `upsertRawPointer` call
+  wraps its executor, its transactions and its queue for that call only);
+- before the publication transaction starts, before each statement the upsert sends in it and
+  before its COMMIT (its own BEGIN and `SET LOCAL` lines: see below);
+- before the move transaction's BEGIN, each of its statements and its COMMIT;
 - before each fan-out queue send and before the brief wakeup is armed.
 
+Nothing else on the pointer path is checked; the list below says what is not.
+
 The search pass (`indexSearchScopeBase` in `src/session-pipeline/search-index.ts`) wraps its index
-calls and its ClickHouse facts calls with `checkedCalls`: the check runs before each call. Its
-statements on the transaction itself are checked by `transaction()`.
+calls (`io`: scope reads and scan pages, upserts, removes, erase, record) and its ClickHouse facts
+calls (`chFacts`) with `checkedCalls`: the check runs before each call. Its statements on the
+transaction itself are checked by `transaction()`. On main the in-transaction streamed reconcile
+(`streamedReconcile`) receives the same checked `io`, so its scans, insert batches, removes and
+its `owing()` record go through a check per call; its `owing()` directory invalidation runs on the
+transaction. It writes no facts state (it never runs with output facts).
 
 ### Not covered
 
@@ -245,13 +254,22 @@ statements on the transaction itself are checked by `transaction()`.
 - A drop pg has not reported (no `error` emitted yet): the check passes.
 - Work inside one checked call: the pages of one index scan call, and the delete batches inside
   the vendored `deleteRows` (one `remove` call), run without a check between them.
-- The manifest read of the pointer stage is not interrupted; with
-  `SESSION_PIPELINE_OBJECT_READ_TIMEOUT_MS` unset it has no deadline at all.
-- The pre-read capture's index scan (`captureSearchPreRead`, outside the guarded transaction), the
-  skip check's ClickHouse read (`alreadyCurrent`), and the staged run (outside the transaction, in
-  its own batches).
+- Object-store reads on the pointer path are not checked or interrupted: the manifest read, the
+  message enrichment reads, the moved-sibling HEAD probe and, on a move, the read of the other
+  key. With `SESSION_PIPELINE_OBJECT_READ_TIMEOUT_MS` unset they have no deadline at all.
+- Unchecked ClickHouse reads in the transaction: the skip check's output-facts completeness read
+  (`alreadyCurrent` with output facts, `outputFactsComplete` on the raw client).
+- The streamed reconcile's own source reads (raw chunks from the object store, between its
+  checked calls) and its keepalive between them (a transaction statement, so `transaction()`
+  checks it). An insert batch already sent runs to its end; a drop that pg has not reported yet
+  is noticed at the next keepalive or checked call.
+- The pre-read capture's index scan (`captureSearchPreRead`, outside the guarded transaction) and
+  the staged run (outside the transaction, in its own batches).
 - The move transaction's own ROLLBACK after a failed check is still sent (cleanup on its own
   connection).
+- Inside the publication transaction, its own BEGIN and its two `SET LOCAL` timeouts run right
+  after the check that precedes the transaction, without a check of their own.
+- The manifest reads and the moved-sibling HEAD requests are object-store calls, not statements.
 - Timeouts: the checks neither shorten nor extend any timeout (the lock's 30 s `lock_timeout`,
   the 60 s statement timeout, the publication transaction's 5 s / 1 s). A pass still running when
   the function times out is cut by the timeout, not by a check. A batch-deadline margin near the

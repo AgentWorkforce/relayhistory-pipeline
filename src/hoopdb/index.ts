@@ -61,9 +61,11 @@ export interface UpsertOptions {
   /**
    * The pointer stage's scope lock is held on another connection (pointer.ts ScopeLock): a
    * synchronous check that throws once that connection has dropped. Given, this call runs
-   * `ensureLive()` before every statement it sends (the main pool, the publication transaction,
-   * the move transaction), before each fan-out send and before the brief wakeup. The check is
-   * this call's only: nothing is stored on the index object. Absent: as before.
+   * `ensureLive()` before each main-pool statement, before the publication transaction and before
+   * each statement in it and its COMMIT (not between its own BEGIN and SET LOCAL lines), before the
+   * move transaction's BEGIN, each statement and COMMIT, before each fan-out send and before the
+   * brief wakeup. The check is this call's only: nothing is stored on the index object. Absent:
+   * as before.
    */
   ensureLive?: () => void;
 }
@@ -114,6 +116,15 @@ function checkedQuery(query: HoopDb["query"], ensureLive: () => void): HoopDb["q
 }
 
 /**
+ * `db` with `ensureLive()` run before each `query` (same arguments, same round trips); the pool
+ * and other fields are the same objects. For the pointer stage's own statements under its scope
+ * lock (pointer.ts indexLocked), and for this module's per-call deps.
+ */
+export function checkedDb(db: HoopDb, ensureLive: () => void): HoopDb {
+  return { ...db, query: checkedQuery(db.query.bind(db), ensureLive) } as HoopDb;
+}
+
+/**
  * `deps` for one upsertRawPointer call whose scope lock is held elsewhere (UpsertOptions.ensureLive):
  * the main pool's queries, the fan-out sends and the publication transaction (before it starts,
  * before each of its statements and before its COMMIT) run `ensureLive()` first. Same objects underneath, same statements.
@@ -122,7 +133,7 @@ function checkedIndexDeps(deps: IndexDeps, ensureLive: () => void): IndexDeps {
   const queue = deps.queue;
   return {
     ...deps,
-    db: { ...deps.db, query: checkedQuery(deps.db.query.bind(deps.db), ensureLive) } as HoopDb,
+    db: checkedDb(deps.db, ensureLive),
     queue: {
       backend: queue.backend,
       send: (message, options) => {

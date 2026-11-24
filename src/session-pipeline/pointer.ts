@@ -37,7 +37,7 @@ import {
 import { RETENTION_BUCKET_HARNESS, type ObjectLanded } from "@rhc/lib/pipeline/adapter.ts";
 import type { HoopDb,Transact } from "../shared/db.ts";
 import { enrichMessage } from "../shared/enrich.ts";
-import { hoopDbSessionIndex } from "../hoopdb/index.ts";
+import { checkedDb, hoopDbSessionIndex } from "../hoopdb/index.ts";
 import { NO_SESSION_HARNESS, NO_SESSION_ID } from "../session-ingest/writer.ts";
 
 export interface SessionScope {
@@ -64,8 +64,9 @@ export function scopeLockKey(scope: SessionScope, stage: "pointer" | "search" = 
 /**
  * Run `work` while holding the session's lock (lambda.ts: pg_advisory_xact_lock in Supabase).
  * The Lambda's lock (lambda.ts scopeLock) passes `ensureLive`: a synchronous check that throws once
- * the lock's connection has dropped (and the lock with it). The pointer work calls it before every
- * statement it sends on other connections, before each fan-out send and before the brief wakeup.
+ * the lock's connection has dropped (and the lock with it). The pointer work calls it before each
+ * of its own main-pool statements (checkedDb), inside upsertRawPointer (see UpsertOptions), before
+ * each fan-out send and before the brief wakeup. Object-store reads are not checked.
  * A lock that passes none (the self-host consumer, test doubles) runs the work as before.
  */
 export type ScopeLock = <T>(scope: SessionScope, work: (ensureLive?: () => void) => Promise<T>) => Promise<T>;
@@ -234,8 +235,7 @@ async function indexPreRead(landed: ObjectLanded, orgId: string, scope: SessionS
     const stamp = await scopeStamp(deps.db, scope);
     const cache = await preReadEvent(landed, orgId, scope, deps);
     const out = await deps.lock(scope, async (ensureLive) => {
-      ensureLive?.();
-      if ((await scopeStamp(deps.db, scope)) !== stamp) return SCOPE_CHANGED;
+      if ((await scopeStamp(ensureLive ? checkedDb(deps.db, ensureLive) : deps.db, scope)) !== stamp) return SCOPE_CHANGED;
       return indexLocked(landed, orgId, scope, replayDeps(deps, cache), ensureLive);
     });
     if (out !== SCOPE_CHANGED) return out;
@@ -320,6 +320,9 @@ async function indexLocked(
   const message = await enrichMessage(indexed, deps.reader);
 
   const index = hoopDbSessionIndex({ db: deps.db, reader: deps.reader, queue: deps.fanout, current: () => message,publication:deps.publication });
+  // Under the Lambda's lock this function's own statements go through `db` (a check before each);
+  // each upsert wraps its executor, transactions and queue for that call (see UpsertOptions).
+  const db = ensureLive ? checkedDb(deps.db, ensureLive) : deps.db;
   const upsert = () =>
     index.upsertRawPointer(message.payload as Parameters<typeof index.upsertRawPointer>[0], message.ctx, ensureLive ? { ensureLive } : undefined);
   const result = await upsert();
@@ -332,9 +335,8 @@ async function indexLocked(
   // because a new key restarts its revision count. The key that is live in S3
   // wins; while both are live the move is in progress and the event retries.
   const pk = [orgId, scope.workspaceId, scope.harness, scope.sessionId, read.manifest.session.machine_id];
-  ensureLive?.();
   const stored = (
-    await deps.db.query<{ manifest_key: string; deleted: boolean }>(
+    await db.query<{ manifest_key: string; deleted: boolean }>(
       `SELECT manifest_key, deleted_at IS NOT NULL AS deleted FROM sessions.session_index
         WHERE org_id = $1 AND workspace_id = $2 AND harness = $3 AND session_id = $4 AND machine_id = $5`,
       pk,

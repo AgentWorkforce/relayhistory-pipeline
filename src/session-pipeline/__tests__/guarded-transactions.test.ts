@@ -3,10 +3,9 @@
  * emitted on the checked-out client between statements, as pg does when the connection ends while
  * no query is in flight, fails that key or scope through the consumer instead of escaping as an
  * uncaught exception, and the listener is gone once the client is released. The transaction hands
- * its work `ensureLive`; the pointer work runs it before every statement it sends on other
- * connections (the main pool, the publication transaction, the move transaction), before each
- * fan-out send and before the brief wakeup; the search pass runs it before each index and facts
- * call. Without a check, or with a check that never throws, the same statements are sent.
+ * its work `ensureLive`; the pointer work runs it before each statement these fakes record on the
+ * main pool, the publication transaction and the move transaction, before each fan-out send and
+ * before the brief wakeup; the search pass runs it before each index and facts call. Without a check, or with a check that never throws, the same statements are sent.
  *
  * The client and the pool are fakes (an EventEmitter with query/release, handed out by a connect()
  * that reuses one client); what pg does on a dropped connection is reproduced by emitting 'error'
@@ -39,6 +38,7 @@ import { scopeLock, searchTransaction, transaction } from "../lambda.ts";
 import * as pointerModule from "../pointer.ts";
 import { droppedFanout, indexPointer, type PointerDeps, type ScopeLock, type SessionScope } from "../pointer.ts";
 import { checkedCalls } from "../search-index.ts";
+import { checkedDb } from "../../hoopdb/index.ts";
 import type { ClickHouseClient } from "../vendor/search-index/clickhouse.ts";
 import { dropConnection, dropped, fakePool as fakePoolWith, memoryLock } from "./support.ts";
 
@@ -530,5 +530,32 @@ describe("checkedCalls", () => {
     });
     expect(() => failing.bump(1)).toThrow(error);
     expect(target.n).toBe(2);
+  });
+});
+
+describe("checkedDb", () => {
+  test("a check before each query with the same text and parameters; the pool is the same object; a throwing check sends nothing", async () => {
+    const sentTexts: Array<[string, unknown[] | undefined]> = [];
+    const pool = { connect: async () => ({}) };
+    const db = {
+      async query<R>(text: string, params?: unknown[]) {
+        sentTexts.push([text, params]);
+        return { rows: [] as R[] };
+      },
+      pool,
+      end: async () => {},
+    } as unknown as HoopDb;
+    const log: string[] = [];
+    const checked = checkedDb(db, () => void log.push("check"));
+    expect(checked.pool).toBe(db.pool);
+    await checked.query("SELECT 1", [1]);
+    expect(log).toEqual(["check"]);
+    expect(sentTexts).toEqual([["SELECT 1", [1]]]);
+    const error = dropped();
+    const failing = checkedDb(db, () => {
+      throw error;
+    });
+    expect(await failing.query("SELECT 2").catch((e: unknown) => e)).toBe(error);
+    expect(sentTexts).toEqual([["SELECT 1", [1]]]);
   });
 });
