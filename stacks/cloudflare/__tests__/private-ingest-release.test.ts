@@ -36,6 +36,9 @@ test("tracked production config is H-only baseline drain; only the rollout phase
     { ...tracked, sessionIngest: { ...tracked.sessionIngest, claimLockWaitMs: 10 } },
     { ...tracked, sessionIngest: { ...tracked.sessionIngest, bufferCommitLockWaitMs: 2000 } },
     { ...tracked, sessionIngest: { ...tracked.sessionIngest, bufferCommitLockWaitMs: 4001 } },
+    { ...tracked, sessionIngest: { ...tracked.sessionIngest, bufferCommitBudgetMs: 5000 } },
+    { ...tracked, sessionIngest: { ...tracked.sessionIngest, bufferCommitBudgetMs: 7001 } },
+    { ...tracked, sessionIngest: { ...tracked.sessionIngest, bufferTimeoutBusy: "off" } },
     { ...tracked, sessionIngest: { ...tracked.sessionIngest, advertisedMaxRecords: 0 } },
     { ...tracked, sessionIngest: { ...tracked.sessionIngest, expectedGeneration: "f".repeat(64) } },
   ]) expect(() => privateIngestReleasePhase(bad)).toThrow();

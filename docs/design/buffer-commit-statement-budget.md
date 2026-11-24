@@ -56,6 +56,7 @@ for the previous answer: three round trips instead of one.
 - **Lock wait**: the commit's lock wait (`INGEST_BUFFER_COMMIT_LOCK_WAIT_MS`, or the role's 2 s) must
   end at least 1 s before the budget. Validation refuses the combination otherwise. Within the two
   ranges it always holds (4000 ≤ 5001 − 1000).
+- **Unset or empty**: means unset at every layer, the same rule as the lock wait.
 - **Refused values**: anything else, at deploy-plan time (`private_ingest_profile_buffer_commit_budget`)
   and at Worker start, where every request is answered 503 `not_configured`.
 - **Worker request time limit**: none is configured in this repository.

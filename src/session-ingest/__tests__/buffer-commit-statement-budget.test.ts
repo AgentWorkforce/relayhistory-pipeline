@@ -97,7 +97,8 @@ describe("Part 1: statement budget", () => {
     expect(Object.hasOwn(off, "bufferCommitBudgetMs")).toBe(false);
     expect(await ingestSettings({ ...buffered, INGEST_BUFFER_COMMIT_STATEMENT_BUDGET_MS: "6000" })).toEqual({ ...off, bufferCommitBudgetMs: 6000 });
     const msg = "INGEST_BUFFER_COMMIT_STATEMENT_BUDGET_MS must be an integer from 5001 to 7000 (buffered acceptance only)";
-    for (const bad of ["", " ", "5000", "7001", "6000 ", " 6000", "+6000", "6000ms", "6s", "6e3", "6000.0", "06000", "60000"]) {
+    expect(await ingestSettings({ ...buffered, INGEST_BUFFER_COMMIT_STATEMENT_BUDGET_MS: "" })).toEqual(off); // empty = unset
+    for (const bad of [" ", "5000", "7001", "6000 ", " 6000", "+6000", "6000ms", "6s", "6e3", "6000.0", "06000", "60000"]) {
       expect(() => bufferCommitBudgetMs(bad)).toThrow(msg);
       await expect(ingestSettings({ ...buffered, INGEST_BUFFER_COMMIT_STATEMENT_BUDGET_MS: bad })).rejects.toThrow(msg);
     }

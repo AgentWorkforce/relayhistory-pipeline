@@ -78,8 +78,8 @@
  *                              statement_timeout is unchanged and still caps the whole statement: a wait that reaches
  *                              it ends 57014 (ledger_timeout), not 55P03. docs/design/buffer-commit-lock-wait.md.
  *                              Rendered only from sessionIngest.bufferCommitLockWaitMs
- *   INGEST_BUFFER_COMMIT_STATEMENT_BUDGET_MS  unset (default) | 5001..7000 (buffered only; exactly four digits; an
- *                              empty or any other value refuses the settings): the buffer_receipt commit, and only it,
+ *   INGEST_BUFFER_COMMIT_STATEMENT_BUDGET_MS  unset or empty (default) | 5001..7000 (buffered only; exactly four
+ *                              digits; any other value refuses the settings): the buffer_receipt commit, and only it,
  *                              runs in its own explicit transaction (BEGIN + SET LOCAL statement_timeout, lock_timeout
  *                              when INGEST_BUFFER_COMMIT_LOCK_WAIT_MS is set, idle_in_transaction 1 s; the call; COMMIT:
  *                              3 round trips instead of 1) so its statement budget is this many ms instead of the role's
@@ -429,7 +429,7 @@ export async function ingestSettings(env: IngestWorkerEnv): Promise<IngestSettin
   // malformed value refuses the settings.
   const commitLockWait = env.INGEST_BUFFER_COMMIT_LOCK_WAIT_MS ? bufferCommitLockWaitMs(env.INGEST_BUFFER_COMMIT_LOCK_WAIT_MS) : undefined;
   if (commitLockWait !== undefined && acceptanceMode !== "buffered") throw new Error("session ingest: INGEST_BUFFER_COMMIT_LOCK_WAIT_MS needs buffered acceptance");
-  const commitBudget = env.INGEST_BUFFER_COMMIT_STATEMENT_BUDGET_MS === undefined ? undefined : bufferCommitBudgetMs(env.INGEST_BUFFER_COMMIT_STATEMENT_BUDGET_MS);
+  const commitBudget = env.INGEST_BUFFER_COMMIT_STATEMENT_BUDGET_MS ? bufferCommitBudgetMs(env.INGEST_BUFFER_COMMIT_STATEMENT_BUDGET_MS) : undefined; // empty = unset
   if (commitBudget !== undefined && acceptanceMode !== "buffered") throw new Error("session ingest: INGEST_BUFFER_COMMIT_STATEMENT_BUDGET_MS needs buffered acceptance");
   // The lock wait must end before the budget does (with headroom), or a long wait ends 57014 instead of 55P03.
   if (commitBudget !== undefined && (commitLockWait ?? ROLE_LOCK_TIMEOUT_MS) > commitBudget - BUFFER_COMMIT_BUDGET_HEADROOM_MS)
