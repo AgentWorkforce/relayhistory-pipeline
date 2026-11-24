@@ -40,10 +40,10 @@ import {validatedCustodyAck} from "./custody-ack.ts";
  * `DeliverDeps.claimTimeoutBusy`): a claim whose statement hit statement_timeout or was
  * cancelled (`ledger_timeout` with SQLSTATE 57014 by code only; name-only client timeouts
  * stay 503) is the same 429 `ClaimLockBusy`. It is the same rolled back single statement.
- * Mechanism, confirmed with pg_locks on 2026-11-24 (runbooks/history-620-operations.md, "Claim 57014
- * convoy"): staged ACKs queue on the singleton seat clock (FOR NO KEY UPDATE) while holding their
- * per-origin advisory lock (origin claim fence on). A same-origin claim waits on that lock, then on the
- * next ones, each wait under the claim lock wait, and together they reach the 5 s statement_timeout.
+ * The earlier fence-row hypothesis was not reproduced. A candidate mechanism, not proven causal
+ * (runbooks/history-620-operations.md, "Claim 57014 convoy"): with the origin fence on, a claim can wait
+ * on its origin advisory lock behind a same-origin staged ACK that is queued on the seat clock, and
+ * several such waits plus execution can reach the 5 s statement_timeout.
  * Buffered acceptance, two more exceptions, each default off and independent:
  * INGEST_BUFFER_LOCK_RETRY=on (`DeliverDeps.bufferLockRetry`) re-issues a `buffer_intent` /
  * `buffer_receipt` ledger call that failed with `ledger_lock_timeout` (55P03/40P01) once, after a

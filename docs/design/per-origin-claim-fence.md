@@ -164,11 +164,11 @@ Rollback:
 
 - **The global seat clock still serializes staged ACKs** (`NO KEY UPDATE`, every user). Two machines' commits that both
   allocate seats still queue on it, briefly (the ACK's seat loop), as two different users' commits do today. Claims
-  never wait on the clock row itself (`KEY SHARE`), and test O3 proves a held commit does not block another origin's
-  claim. A claim of the SAME origin is affected: the ACK takes the origin advisory lock before it queues on the clock and
-  holds it while it waits, so the claim waits as long as the ACK queue. In production that was about 7% of claims
-  timing out at 5 s (57014); see the runbook section "Claim 57014 convoy" (`runbooks/history-620-operations.md`). The
-  fix is to shorten the clock hold (062210 T2).
+  never wait on the clock row itself (`KEY SHARE` is compatible with the ACK's `NO KEY UPDATE`, though not with a
+  control's `FOR UPDATE`), and test O3 proves a held commit does not block another origin's claim. A claim with the
+  SAME origin key can wait indirectly: the commit wrapper takes the origin advisory lock before the ACK queues on the
+  clock. How much of the production claim 57014 share that explains has not been established; see the runbook section
+  "Claim 57014 convoy" (`runbooks/history-620-operations.md`) for the dated observations.
 - **Per-user slots** (`ingest_acquire_slot`, `maxPerUser` = 4 in production) still cap a user's concurrent
   deliveries. A user with more than 4 active machines queues there (429, no DB lock), not on the fence.
 - **Canonical mode** and the self-host server are unchanged (per-user `FOR UPDATE`).
