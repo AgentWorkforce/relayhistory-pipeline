@@ -53,6 +53,14 @@ export interface SessionPipelineInputs {
    * function also refuses to start unless the pipeline secret has its clickhouse block.
    */
   streamReconcile?: { enabled: boolean };
+  /**
+   * The search stage's batch deadline (src/session-pipeline/consumer.ts). Absent: no variable is
+   * rendered and every scope of a batch is started as before. `marginMs` (an integer from
+   * BATCH_DEADLINE_MARGIN_MIN_MS to BATCH_DEADLINE_MARGIN_MAX_MS, below the function timeout)
+   * needs `searchIndex: true` and renders SEARCH_INDEX_BATCH_DEADLINE_MARGIN_MS: once the
+   * invocation's remaining time is under it, no further scope's pass starts and the rest are requeued.
+   */
+  searchBatchDeadline?: { marginMs: number };
 }
 
 /**
@@ -99,6 +107,9 @@ export const VISIBILITY_TIMEOUT_SECONDS = 6 * FUNCTION_TIMEOUT_SECONDS;
 export const MAX_RECEIVE_COUNT = 8;
 /** S3 events wait this long before the first delivery, so a burst of manifest writes coalesces. */
 export const DELIVERY_DELAY_SECONDS = 30;
+/** searchBatchDeadline.marginMs bounds: the same as the function's own check (src/session-pipeline/lambda.ts). */
+export const BATCH_DEADLINE_MARGIN_MIN_MS = 1_000;
+export const BATCH_DEADLINE_MARGIN_MAX_MS = FUNCTION_TIMEOUT_SECONDS * 1000 - 1_000;
 
 export interface SessionPipelineNames {
   function: string;
@@ -132,7 +143,7 @@ export function assertSessionPipelineInputs(p: unknown, refuse: (why: string) =>
     refuse("transcriptStore.sessionPipeline must be a plain object");
   const v = p as Record<string, unknown>;
   for (const k of Object.keys(v))
-    if (k !== "searchIndex" && k !== "maxConcurrency" && k !== "reconcileMinutes" && k !== "briefs" && k !== "streamReconcile") refuse(`transcriptStore.sessionPipeline.${k} is not a known setting`);
+    if (k !== "searchIndex" && k !== "maxConcurrency" && k !== "reconcileMinutes" && k !== "briefs" && k !== "streamReconcile" && k !== "searchBatchDeadline") refuse(`transcriptStore.sessionPipeline.${k} is not a known setting`);
   if (v.searchIndex !== undefined && typeof v.searchIndex !== "boolean") refuse("transcriptStore.sessionPipeline.searchIndex must be a boolean");
   if (v.maxConcurrency !== undefined && !(Number.isInteger(v.maxConcurrency) && (v.maxConcurrency as number) >= 2 && (v.maxConcurrency as number) <= 10))
     refuse("transcriptStore.sessionPipeline.maxConcurrency must be an integer from 2 to 10");
@@ -158,6 +169,15 @@ export function assertSessionPipelineInputs(p: unknown, refuse: (why: string) =>
     for (const k of Object.keys(r)) if (k !== "enabled") refuse(`transcriptStore.sessionPipeline.streamReconcile.${k} is not a known setting`);
     if (typeof r.enabled !== "boolean") refuse("transcriptStore.sessionPipeline.streamReconcile.enabled must be a boolean");
     if (r.enabled === true && v.searchIndex !== true) refuse("transcriptStore.sessionPipeline.streamReconcile.enabled requires searchIndex: true");
+  }
+  if (v.searchBatchDeadline !== undefined) {
+    const d = v.searchBatchDeadline as Record<string, unknown> | null;
+    if (d === null || typeof d !== "object" || Array.isArray(d) || Object.getPrototypeOf(d) !== Object.prototype)
+      refuse("transcriptStore.sessionPipeline.searchBatchDeadline must be a plain object");
+    for (const k of Object.keys(d)) if (k !== "marginMs") refuse(`transcriptStore.sessionPipeline.searchBatchDeadline.${k} is not a known setting`);
+    if (!(Number.isInteger(d.marginMs) && (d.marginMs as number) >= BATCH_DEADLINE_MARGIN_MIN_MS && (d.marginMs as number) <= BATCH_DEADLINE_MARGIN_MAX_MS))
+      refuse(`transcriptStore.sessionPipeline.searchBatchDeadline.marginMs must be an integer from ${BATCH_DEADLINE_MARGIN_MIN_MS} to ${BATCH_DEADLINE_MARGIN_MAX_MS}`);
+    if (v.searchIndex !== true) refuse("transcriptStore.sessionPipeline.searchBatchDeadline requires searchIndex: true");
   }
 }
 
@@ -287,6 +307,8 @@ export function sessionPipelineEnv(i: { stage: string; bucket: string; names: Se
     SEARCH_INDEX_ENABLED: i.p.searchIndex ? "1" : "0",
     // Only when armed: a stage without streamReconcile.enabled renders nothing new and never streams.
     ...(i.p.streamReconcile?.enabled === true ? { SEARCH_INDEX_STREAMING_CH: "1" } : {}),
+    // Only when set: a stage without searchBatchDeadline renders nothing new.
+    ...(i.p.searchBatchDeadline !== undefined ? { SEARCH_INDEX_BATCH_DEADLINE_MARGIN_MS: String(i.p.searchBatchDeadline.marginMs) } : {}),
     PIPELINE_FANOUT: "off",
     PIPELINE_RECONCILE_LOOKBACK_MINUTES: String(2 * (i.p.reconcileMinutes ?? 30)),
     HOOPDB_POOL_MAX: "4",

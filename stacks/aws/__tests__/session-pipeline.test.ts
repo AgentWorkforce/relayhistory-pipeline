@@ -5,6 +5,8 @@ import * as AWS from "@alchemy.run/aws";
 import { fileURLToPath } from "node:url";
 import type { AwsInputs } from "../inputs.ts";
 import {
+  BATCH_DEADLINE_MARGIN_MAX_MS,
+  BATCH_DEADLINE_MARGIN_MIN_MS,
   DELIVERY_DELAY_SECONDS,
   FUNCTION_TIMEOUT_SECONDS,
   SESSION_BRIEF_RESOURCES,
@@ -22,6 +24,7 @@ import {
   sessionQueuePolicy,
   sessionSecretPolicy,
 } from "../session-pipeline.ts";
+import { SEARCH_INDEX_BATCH_DEADLINE_MARGIN_MAX_MS, SEARCH_INDEX_BATCH_DEADLINE_MARGIN_MIN_MS } from "../../../src/session-pipeline/lambda.ts";
 import { assertTranscriptStoreInputs, assertTranscriptStorePlanContract, transcriptBucketPolicy, transcriptKeyPolicy, transcriptNames } from "../transcript-store.ts";
 
 const STAGE = "aws-sessions-prod";
@@ -595,5 +598,46 @@ describe("session pipeline: streamed reconcile switch", () => {
     const on = sessionPipelineFunctionProps({ ...i, p: { searchIndex: true, streamReconcile: { enabled: true } } });
     expect({ ...on, env: undefined }).toEqual({ ...off, env: undefined });
     expect(on.env).toEqual({ ...off.env, SEARCH_INDEX_STREAMING_CH: "1" });
+  });
+});
+
+describe("session pipeline: search batch deadline", () => {
+  const refuse = (why: string): never => {
+    throw new Error(why);
+  };
+  it("absent renders nothing new; set renders SEARCH_INDEX_BATCH_DEADLINE_MARGIN_MS only", () => {
+    const off = sessionPipelineEnv({ stage: STAGE, bucket: t.bucket, names: p, p: { searchIndex: true } });
+    expect(Object.keys(off)).not.toContain("SEARCH_INDEX_BATCH_DEADLINE_MARGIN_MS");
+    const on = sessionPipelineEnv({ stage: STAGE, bucket: t.bucket, names: p, p: { searchIndex: true, searchBatchDeadline: { marginMs: 90_000 } } });
+    expect(on).toEqual({ ...off, SEARCH_INDEX_BATCH_DEADLINE_MARGIN_MS: "90000" });
+    const both = sessionPipelineEnv({ stage: STAGE, bucket: t.bucket, names: p, p: { searchIndex: true, streamReconcile: { enabled: true }, searchBatchDeadline: { marginMs: 90_000 } } });
+    expect(both).toEqual({ ...off, SEARCH_INDEX_STREAMING_CH: "1", SEARCH_INDEX_BATCH_DEADLINE_MARGIN_MS: "90000" });
+  });
+
+  it("the bounds are the function's own and stay below the function timeout", () => {
+    expect(BATCH_DEADLINE_MARGIN_MIN_MS).toBe(SEARCH_INDEX_BATCH_DEADLINE_MARGIN_MIN_MS);
+    expect(BATCH_DEADLINE_MARGIN_MAX_MS).toBe(SEARCH_INDEX_BATCH_DEADLINE_MARGIN_MAX_MS);
+    expect(BATCH_DEADLINE_MARGIN_MAX_MS).toBeLessThan(FUNCTION_TIMEOUT_SECONDS * 1000);
+  });
+
+  it("validates the shape and the value strictly and needs searchIndex: true", () => {
+    const ok = (v: unknown) => assertSessionPipelineInputs(v, refuse);
+    for (const marginMs of [BATCH_DEADLINE_MARGIN_MIN_MS, 90_000, BATCH_DEADLINE_MARGIN_MAX_MS])
+      expect(() => ok({ searchIndex: true, searchBatchDeadline: { marginMs } })).not.toThrow();
+    for (const marginMs of [-1, 0, 999, BATCH_DEADLINE_MARGIN_MAX_MS + 1, FUNCTION_TIMEOUT_SECONDS * 1000, 1.5, Number.NaN, Number.POSITIVE_INFINITY, "90000", null, undefined])
+      expect(() => ok({ searchIndex: true, searchBatchDeadline: { marginMs } })).toThrow(/marginMs must be an integer from 1000 to 299000/);
+    expect(() => ok({ searchBatchDeadline: { marginMs: 90_000 } })).toThrow(/searchBatchDeadline requires searchIndex: true/);
+    expect(() => ok({ searchIndex: false, searchBatchDeadline: { marginMs: 90_000 } })).toThrow(/searchBatchDeadline requires searchIndex: true/);
+    expect(() => ok({ searchIndex: true, searchBatchDeadline: { marginMs: 90_000, maxDeferrals: 3 } })).toThrow(/maxDeferrals is not a known setting/);
+    for (const bad of [90_000, true, null, [], "90000"])
+      expect(() => ok({ searchIndex: true, searchBatchDeadline: bad })).toThrow(/searchBatchDeadline must be a plain object/);
+  });
+
+  it("the function's resources and props are the same with it set, but the env", () => {
+    const i = { stage: STAGE, accountId: ACCOUNT, region: REGION, bucket: t.bucket, tags: () => ({}) };
+    const off = sessionPipelineFunctionProps({ ...i, p: { searchIndex: true } });
+    const on = sessionPipelineFunctionProps({ ...i, p: { searchIndex: true, searchBatchDeadline: { marginMs: 90_000 } } });
+    expect({ ...on, env: undefined }).toEqual({ ...off, env: undefined });
+    expect(on.env).toEqual({ ...off.env, SEARCH_INDEX_BATCH_DEADLINE_MARGIN_MS: "90000" });
   });
 });

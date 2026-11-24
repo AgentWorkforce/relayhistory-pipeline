@@ -22,10 +22,12 @@ export const ALLOWED_LOG_FIELDS = new Set([
   "event_age_ms", "s3_event_age_ms", "queue_origin",
   // How a search pass's acceptance refusal looked (session-pipeline/contender-seats.ts); value rule below.
   "contender_seats",
+  // How often a scope was requeued for the opt-in batch deadline (session-pipeline/consumer.ts); value rule below.
+  "batch_deadline_deferrals",
 ]);
 
 /** Allowlisted keys that survive only as a non-negative safe integer; any other value is dropped. */
-export const NON_NEGATIVE_INTEGER_FIELDS: ReadonlySet<string> = new Set(["event_age_ms", "s3_event_age_ms"]);
+export const NON_NEGATIVE_INTEGER_FIELDS: ReadonlySet<string> = new Set(["event_age_ms", "s3_event_age_ms", "batch_deadline_deferrals"]);
 
 /** Allowlisted keys that survive only as one of a fixed set of strings; any other value is dropped. */
 export const EXACT_VALUE_FIELDS: ReadonlyMap<string, ReadonlySet<string>> = new Map([

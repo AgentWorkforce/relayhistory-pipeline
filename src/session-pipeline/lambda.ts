@@ -91,6 +91,32 @@ export interface LambdaEnv {
    * need SEARCH_INDEX_ENABLED. Absent: as before.
    */
   pointerSkipOriginBucketEnabled?: true;
+  /**
+   * SEARCH_INDEX_BATCH_DEADLINE_MARGIN_MS (default off): with a Lambda context, no scope's search
+   * pass starts once the invocation's remaining time is under this margin; the rest of the batch
+   * is requeued (consumer.ts batch deadline). Absent: as before.
+   */
+  searchBatchDeadlineMarginMs?: number;
+}
+
+/** SEARCH_INDEX_BATCH_DEADLINE_MARGIN_MS bounds (ms): at least one second, below the function's 300 s timeout. */
+export const SEARCH_INDEX_BATCH_DEADLINE_MARGIN_MIN_MS = 1_000;
+export const SEARCH_INDEX_BATCH_DEADLINE_MARGIN_MAX_MS = 299_000;
+
+/**
+ * SEARCH_INDEX_BATCH_DEADLINE_MARGIN_MS: unset or "" is off; otherwise a decimal integer of
+ * milliseconds within the bounds above, else init fails naming the variable, never the value.
+ */
+export function batchDeadlineMarginFromEnv(env: Record<string, string | undefined>): number | undefined {
+  const value = env.SEARCH_INDEX_BATCH_DEADLINE_MARGIN_MS;
+  if (value === undefined || value === "") return undefined;
+  const ms = /^[1-9][0-9]{0,8}$/.test(value) ? Number(value) : NaN;
+  if (!(ms >= SEARCH_INDEX_BATCH_DEADLINE_MARGIN_MIN_MS && ms <= SEARCH_INDEX_BATCH_DEADLINE_MARGIN_MAX_MS))
+    throw new Error(
+      `session pipeline: SEARCH_INDEX_BATCH_DEADLINE_MARGIN_MS must be an integer from ${SEARCH_INDEX_BATCH_DEADLINE_MARGIN_MIN_MS} to ${SEARCH_INDEX_BATCH_DEADLINE_MARGIN_MAX_MS}`,
+    );
+  if (env.SEARCH_INDEX_ENABLED !== "1") throw new Error("session pipeline: SEARCH_INDEX_BATCH_DEADLINE_MARGIN_MS needs SEARCH_INDEX_ENABLED=1");
+  return ms;
 }
 
 export function lambdaEnv(env: NodeJS.ProcessEnv = process.env): LambdaEnv {
@@ -122,6 +148,7 @@ export function lambdaEnv(env: NodeJS.ProcessEnv = process.env): LambdaEnv {
     throw new Error("session pipeline: SEARCH_INDEX_SKIP_ACCEPTANCE_MISSING_ENABLED=true needs SEARCH_INDEX_ENABLED=1");
   // SESSION_POINTER_SKIP_ORIGIN_BUCKET_ENABLED: strict grammar, default off, no SEARCH_INDEX_ENABLED coupling.
   const pointerSkipOriginBucket = pointerSkipOriginBucketFromEnv(env);
+  const searchBatchDeadlineMarginMs = batchDeadlineMarginFromEnv(env);
   return {
     region: need("AWS_REGION"),
     bucket: need("PIPELINE_RAW_S3_BUCKET"),
@@ -136,6 +163,7 @@ export function lambdaEnv(env: NodeJS.ProcessEnv = process.env): LambdaEnv {
     ...(searchSkipOverBound ? { searchSkipOverBound: true as const } : {}),
     ...(searchSkipAcceptanceMissing ? { searchSkipAcceptanceMissing: true as const } : {}),
     ...(pointerSkipOriginBucket ? { pointerSkipOriginBucketEnabled: true as const } : {}),
+    ...(searchBatchDeadlineMarginMs !== undefined ? { searchBatchDeadlineMarginMs } : {}),
   };
 }
 
@@ -253,20 +281,21 @@ export function searchTransaction(db: HoopDb, env: Pick<LambdaEnv, "searchStream
 export const BUSY_REQUEUE_DELAY_SECONDS = 60;
 
 /**
- * The consumer's `requeue` dep: one SQS SendMessage of the requeue body (the key, and the oldest
- * upload event time when known) with the fixed delay. `call` and `credentials` are injectable for tests.
+ * The consumer's `requeue` dep: one SQS SendMessage of the requeue body (the key, the oldest
+ * upload event time when known, and the batch-deadline deferral count when the consumer passes
+ * one) with the fixed delay. Wired whether or not streaming is armed. `call` and `credentials` are injectable for tests.
  */
 export function sqsRequeue(
   env: Pick<LambdaEnv, "region" | "queueUrl">,
   call: typeof awsJsonCall = awsJsonCall,
   credentials: () => AwsSessionCredentials = () => lambdaCredentials(),
 ): NonNullable<ConsumerDeps["requeue"]> {
-  return async (manifestKey, oldestEventTime) => {
+  return async (manifestKey, oldestEventTime, batchDeadlineDeferrals) => {
     await call({
       service: "sqs",
       target: "AmazonSQS.SendMessage",
       region: env.region,
-      body: { QueueUrl: env.queueUrl, MessageBody: requeueBody(manifestKey, oldestEventTime), DelaySeconds: BUSY_REQUEUE_DELAY_SECONDS },
+      body: { QueueUrl: env.queueUrl, MessageBody: requeueBody(manifestKey, oldestEventTime, batchDeadlineDeferrals), DelaySeconds: BUSY_REQUEUE_DELAY_SECONDS },
       credentials: credentials(),
     });
   };
@@ -276,6 +305,8 @@ interface Runtime {
   env: LambdaEnv;
   deps: ConsumerDeps;
   brief: ReturnType<typeof briefTick>;
+  /** SEARCH_INDEX_BATCH_DEADLINE_MARGIN_MS when set and the search stage is on. */
+  batchDeadlineMarginMs?: number;
 }
 
 let runtime: Promise<Runtime> | undefined;
@@ -341,8 +372,10 @@ async function init(): Promise<Runtime> {
     transport: key ? createAnalysisTransport({ apiKey: () => key }) : null,
     config: briefConfig(),
   });
+  // Default off (SEARCH_INDEX_BATCH_DEADLINE_MARGIN_MS); the deadline itself is set per invocation.
+  const batchDeadlineMarginMs = deps.search ? env.searchBatchDeadlineMarginMs : undefined;
   log.info("session pipeline ready", { stage: "init", ok: true, state: env.searchEnabled ? "search_on" : "search_off" });
-  return { env, deps, brief };
+  return { env, deps, brief, ...(batchDeadlineMarginMs !== undefined ? { batchDeadlineMarginMs } : {}) };
 }
 
 function ready(): Promise<Runtime> {
@@ -513,22 +546,32 @@ export interface LambdaInvocationContext {
 }
 
 /**
- * The consumer deps for one SQS batch: `deps` itself unless streaming is armed; then the
- * search stage streams at most one scope of the batch (a second is requeued) and, with a
- * Lambda context, stops streaming at the remaining time less the margin.
+ * The consumer deps for one SQS batch: `deps` itself unless streaming is armed or a batch
+ * deadline margin is set (with the search stage on). Streaming armed: the search stage streams
+ * at most one scope of the batch (a second is requeued) and, with a Lambda context, stops
+ * streaming at the remaining time less SEARCH_INDEX_STREAM_DEADLINE_MARGIN_MS. Margin set, with
+ * a Lambda context: the batch deadline (no further pass starts) at the remaining time less the
+ * margin. Both set: each applies; whichever instant comes first is crossed first.
  */
-export function invocationDeps(deps: ConsumerDeps, context?: LambdaInvocationContext, now: () => number = Date.now): ConsumerDeps {
+export function invocationDeps(
+  deps: ConsumerDeps,
+  context?: LambdaInvocationContext,
+  now: () => number = Date.now,
+  batchDeadlineMarginMs?: number,
+): ConsumerDeps {
   const search = deps.search;
-  if (!search?.stream) return deps;
+  const margin = search ? batchDeadlineMarginMs : undefined;
+  if (!search?.stream && margin === undefined) return deps;
   const remaining = typeof context?.getRemainingTimeInMillis === "function" ? context.getRemainingTimeInMillis() : NaN;
-  return {
-    ...deps,
-    search: {
+  const out: ConsumerDeps = { ...deps };
+  if (search?.stream)
+    out.search = {
       ...search,
       streamSlot: { used: false },
       ...(Number.isFinite(remaining) ? { streamDeadline: { at: now() + remaining - SEARCH_INDEX_STREAM_DEADLINE_MARGIN_MS } } : {}),
-    },
-  };
+    };
+  if (margin !== undefined && Number.isFinite(remaining)) out.batchDeadline = { at: now() + remaining - margin };
+  return out;
 }
 
 type SqsRecord = { messageId: string; body: string; eventSource?: string; attributes?: { SentTimestamp?: unknown } | null };
@@ -553,7 +596,7 @@ export async function handler(event: LambdaEvent, context?: LambdaInvocationCont
       // Nothing was processed: every message goes back to the queue.
       return { batchItemFailures: event.Records.map((r) => ({ itemIdentifier: r.messageId })) };
     }
-    return processBatch(queueRecords(event.Records), invocationDeps(rt.deps, context));
+    return processBatch(queueRecords(event.Records), invocationDeps(rt.deps, context, Date.now, rt.batchDeadlineMarginMs));
   }
   if (event?.reconcile === true) {
     const started = Date.now();

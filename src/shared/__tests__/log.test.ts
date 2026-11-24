@@ -73,6 +73,21 @@ describe("telemetry allowlist", () => {
       }
     }
   });
+  test("batch_deadline_deferrals and the batch-deadline reasons survive the real logLine; the count only as a non-negative safe integer, at every level", () => {
+    expect(ALLOWED_LOG_FIELDS.has("batch_deadline_deferrals")).toBe(true);
+    expect(NON_NEGATIVE_INTEGER_FIELDS.has("batch_deadline_deferrals")).toBe(true);
+    for (const level of ["info", "error"] as const) {
+      for (const reason of ["batch_deadline", "batch_deadline_deferrals_exhausted"]) {
+        const line = (v: unknown) => JSON.parse(logLine(level, "search index past the batch deadline, requeued", { stage: "search-index", reason, batch_deadline_deferrals: v })) as Record<string, unknown>;
+        for (const v of [0, 1, 3, 4]) expect(line(v)).toMatchObject({ level, stage: "search-index", reason, batch_deadline_deferrals: v });
+        for (const v of [-1, 1.5, Number.NaN, Number.POSITIVE_INFINITY, Number.MAX_SAFE_INTEGER + 1, "3", true, null, [3], { n: 3 }]) {
+          const out = line(v);
+          expect([level, v, "batch_deadline_deferrals" in out]).toEqual([level, v, false]);
+          expect(out).toMatchObject({ level, stage: "search-index", reason });
+        }
+      }
+    }
+  });
   test("the value rule leaves other allowlisted fields as they were", () => {
     const out = JSON.parse(logLine("info", "m", { count: -1, duration_ms: 1.5, ok: true, reason: "x" })) as Record<string, unknown>;
     expect(out).toMatchObject({ count: -1, duration_ms: 1.5, ok: true, reason: "x" });
