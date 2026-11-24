@@ -125,6 +125,36 @@ describe("transaction()", () => {
     expect(guarded.seen.every((n) => n === 1)).toBe(true);
     expect(guarded.after).toBe(0);
   });
+
+  test("guarded, a client whose on() throws: released exactly once, the error reaches the caller, no statement and no work run", async () => {
+    const { client, db } = fakePool();
+    const error = new TypeError("no listener support");
+    client.on = () => {
+      throw error;
+    };
+    let ran = false;
+    const out = await transaction(db, async () => {
+      ran = true;
+    }, true).catch((caught: unknown) => caught);
+    expect(out).toBe(error);
+    expect(ran).toBe(false);
+    expect(client.statements).toEqual([]);
+    expect(client.released).toEqual(["release()"]);
+  });
+
+  test("guarded, a client whose removeListener() throws: still released exactly once, the error reaches the caller", async () => {
+    const { client, db } = fakePool();
+    const error = new TypeError("cannot remove listener");
+    client.removeListener = () => {
+      throw error;
+    };
+    const out = await transaction(db, async (tx) => {
+      await tx.query("SELECT 1");
+    }, true).catch((caught: unknown) => caught);
+    expect(out).toBe(error);
+    expect(client.statements).toEqual(["BEGIN", "SET LOCAL statement_timeout = '60s'", "SELECT 1", "COMMIT"]);
+    expect(client.released).toEqual(["release()"]);
+  });
 });
 
 // ---------------------------------------------------------------------------------------------

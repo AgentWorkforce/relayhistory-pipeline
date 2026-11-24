@@ -18,6 +18,9 @@ class BoundedPool {
   peakWaiting = 0;
   failErase = false;
   synchronizeBegins = false;
+  // 'error' listeners a transaction put on a checked-out client and has not removed yet. The fake
+  // pool adds none of its own, so every entry belongs to a transaction.
+  readonly errorListeners = new Set<(error: Error) => void>();
   private nextClient = 0;
   private begun = 0;
   private start!: () => void;
@@ -30,7 +33,15 @@ class BoundedPool {
     this.active++;
     const id = ++this.nextClient;
     let released = false;
+    const own = new Set<(error: Error) => void>();
     return {
+      on: (event: string, fn: (error: Error) => void) => {
+        expect(released).toBe(false);
+        if (event === "error") { own.add(fn); this.errorListeners.add(fn); }
+      },
+      removeListener: (event: string, fn: (error: Error) => void) => {
+        if (event === "error") { own.delete(fn); this.errorListeners.delete(fn); }
+      },
       query: async (text: string, params?: unknown[]) => {
         this.queries.push({ client: id, text, params });
         if (text === "BEGIN" && this.synchronizeBegins) {
@@ -50,7 +61,9 @@ class BoundedPool {
         return { rows };
       },
       release: () => {
-        expect(released).toBe(false); released = true; this.active--;
+        expect(released).toBe(false);
+        expect(own.size).toBe(0); // No transaction 'error' listener survives the release.
+        released = true; this.active--;
         const waiting = this.waiting.shift();
         if (waiting) { clearTimeout(waiting.timer); waiting.resolve(this.client()); }
       },
@@ -72,7 +85,7 @@ class BoundedPool {
     const client = await this.connect();
     try { return await client.query(text, params); } finally { client.release(); }
   }
-  async end() { expect(this.active).toBe(0); expect(this.waiting).toHaveLength(0); }
+  async end() { expect(this.active).toBe(0); expect(this.waiting).toHaveLength(0); expect(this.errorListeners.size).toBe(0); }
 }
 
 const RealPool = pg.Pool;

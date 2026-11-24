@@ -510,7 +510,9 @@ export async function transaction<T>(
   const onError = (error: Error) => {
     broken ??= error;
   };
-  if (guarded) client.on("error", onError);
+  // Set once the listener is on (guarded) or at once (unguarded). A listener that cannot be added
+  // sends no ROLLBACK and is not removed; the client is still released below.
+  let started = false;
   const ensureLive = () => {
     if (broken) throw broken;
   };
@@ -519,6 +521,8 @@ export async function transaction<T>(
     return client.query(text, params as unknown[]);
   };
   try {
+    if (guarded) client.on("error", onError);
+    started = true;
     await query("BEGIN");
     await query("SET LOCAL statement_timeout = '60s'");
     const result = await work(
@@ -533,12 +537,15 @@ export async function transaction<T>(
     await query("COMMIT");
     return result;
   } catch (error) {
-    await query("ROLLBACK").catch(() => {});
+    if (started) await query("ROLLBACK").catch(() => {});
     throw error;
   } finally {
-    if (guarded) client.removeListener("error", onError);
-    if (broken) client.release(broken);
-    else client.release();
+    try {
+      if (guarded && started) client.removeListener("error", onError);
+    } finally {
+      if (broken) client.release(broken);
+      else client.release();
+    }
   }
 }
 

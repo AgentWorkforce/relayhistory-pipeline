@@ -353,7 +353,6 @@ export function sessionPipelineNames(stage: string, accountId: string, region: s
 export const MS_INPUT_MIN = 1_000;
 export const MS_INPUT_MAX = FUNCTION_TIMEOUT_SECONDS * 1000 - 1_000;
 
-/** A plain object of millisecond integers within MS_INPUT_MIN..MS_INPUT_MAX: unknown keys refused, `required` keys present. */
 /** dbTimeouts key to the variable it renders (read by src/session-pipeline/lambda.ts dbTimeoutsFromEnv). */
 const DB_TIMEOUT_ENV = {
   statementTimeoutMs: "HOOPDB_STATEMENT_TIMEOUT_MS",
@@ -361,6 +360,7 @@ const DB_TIMEOUT_ENV = {
   acquireTimeoutMs: "HOOPDB_ACQUIRE_TIMEOUT_MS",
 } as const;
 
+/** A plain object of millisecond integers within MS_INPUT_MIN..MS_INPUT_MAX: unknown keys refused, `required` keys present. */
 function assertMsInputs(value: unknown, path: string, keys: readonly string[], required: readonly string[], refuse: (why: string) => never): void {
   if (value === null || typeof value !== "object" || Array.isArray(value) || Object.getPrototypeOf(value) !== Object.prototype)
     refuse(`transcriptStore.sessionPipeline.${path} must be a plain object`);
