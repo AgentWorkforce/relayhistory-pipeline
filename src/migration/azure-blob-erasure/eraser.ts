@@ -235,7 +235,10 @@ export function createAzureBlobEraser(cfg: AzureBlobEraserConfig): PagedEraser {
     const res = await request("DELETE", url, extra);
     await res.body?.cancel().catch(() => {});
     if (res.ok || res.status === 404) return;
-    if (onRefused && (res.status === 400 || res.status === 403 || res.status === 409)) throw coded(onRefused, "Azure refused a permanent delete");
+    // A permanent delete refused: 403 is a permission the key or account lacks; 400/409 is the account's retention
+    // (soft delete without permanent delete enabled). Both keep the copy, so both block erasure.
+    if (onRefused && res.status === 403) throw coded("azure_permanent_delete_forbidden", "Azure forbade a permanent delete");
+    if (onRefused && (res.status === 400 || res.status === 409)) throw coded(onRefused, "Azure refused a permanent delete");
     if (res.status === 412) throw coded("azure_current_changed", "the current version changed");
     throw coded(`azure_${res.status}`, "Azure DELETE failed");
   }

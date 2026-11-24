@@ -54,6 +54,12 @@ export interface AzureBlobConfig {
   auth: AzureAuth;
   pageSize?: number;
   fetch?: typeof fetch;
+  /**
+   * Report a versioning account's `x-ms-version-id` as `version` on put, head and get (off by default, so every
+   * existing store keeps its exact version objects and comparisons). The session-analysis runner turns it on: its
+   * sweeper keeps exactly the version a result put created.
+   */
+  versionIds?: boolean;
 }
 
 const BACKEND = "azure";
@@ -76,6 +82,10 @@ class AzureTransport implements Transport {
       this.#sas = cachedProvider(config.auth.token);
     if (config.auth.kind === "bearer")
       this.#bearer = cachedProvider(config.auth.token);
+  }
+
+  #version(headers: Headers): ObjectVersion {
+    return this.#config.versionIds ? versionOf(headers) : eTagOf(headers.get("etag"));
   }
 
   #blobUrl(key: string): URL {
@@ -167,7 +177,7 @@ class AzureTransport implements Transport {
       signal,
     );
     // A versioning account names the version this put created (x-ms-version-id), as S3 does.
-    if (res.ok) return versionOf(res.headers);
+    if (res.ok) return this.#version(res.headers);
     const text = await errorBody(res);
     if (mode.kind === "create" && (res.status === 409 || res.status === 412)) {
       throw new ObjectStoreError("already_exists", BACKEND, `${key} exists`, {
@@ -201,7 +211,7 @@ class AzureTransport implements Transport {
       key,
       size: Number(res.headers.get("content-length") ?? 0),
       lastModified: new Date(res.headers.get("last-modified") ?? 0),
-      version: versionOf(res.headers),
+      version: this.#version(res.headers),
       metadata: metadataFromHeaders(res.headers, "x-ms-meta-", "_"),
     };
   }
@@ -218,7 +228,7 @@ class AzureTransport implements Transport {
         key,
         size: objectSizeFromHeaders(res.headers),
         lastModified: new Date(res.headers.get("last-modified") ?? 0),
-        version: versionOf(res.headers),
+        version: this.#version(res.headers),
         metadata: metadataFromHeaders(res.headers, "x-ms-meta-", "_"),
       },
       body: res.body,

@@ -23,6 +23,8 @@ export interface FakeRecord {
   etag: string;
   bytes: Uint8Array;
   seq: number;
+  /** Last-Modified (epoch ms, real clock by default). */
+  modified: number;
 }
 
 export interface FakeAzureOptions {
@@ -40,6 +42,8 @@ export interface FakeAzureOptions {
    * last returned entry and that item is never listed by a continuation from that marker.
    */
   markerMode?: "after-last" | "next-item";
+  /** Status of a refused permanent delete: 409 (retention, default) or 403 (permission). */
+  permanentDeleteRefusal?: 403 | 409;
 }
 
 export const FAKE_ENDPOINT = "http://127.0.0.1:1/fxacct";
@@ -84,11 +88,11 @@ export class FakeAzureBlob {
     if (this.versioning) {
       for (const r of this.records) if (r.key === key && r.kind === "version") r.current = false;
       const id = this.#stamp();
-      this.records.push({ key, kind: "version", id, current: true, deleted: false, etag: this.#etag(), bytes, seq: ++this.#seq });
+      this.records.push({ key, kind: "version", id, current: true, deleted: false, etag: this.#etag(), bytes, seq: ++this.#seq, modified: Date.now() });
       return id;
     }
     this.records = this.records.filter((r) => !(r.key === key && r.kind === "base" && !r.deleted));
-    this.records.push({ key, kind: "base", id: "", current: true, deleted: false, etag: this.#etag(), bytes, seq: ++this.#seq });
+    this.records.push({ key, kind: "base", id: "", current: true, deleted: false, etag: this.#etag(), bytes, seq: ++this.#seq, modified: Date.now() });
     return "";
   }
 
@@ -96,7 +100,7 @@ export class FakeAzureBlob {
     const src = this.records.find((r) => r.key === key && r.current && !r.deleted);
     if (!src) throw new Error("no current blob");
     const id = this.#stamp();
-    this.records.push({ ...src, kind: "snapshot", id, current: false, seq: ++this.#seq });
+    this.records.push({ ...src, kind: "snapshot", id, current: false, seq: ++this.#seq, modified: Date.now() });
     return id;
   }
 
@@ -157,7 +161,7 @@ export class FakeAzureBlob {
       const r = this.records.find((x) => x.key === key && x.kind === (snap !== null ? "snapshot" : "version") && x.id === (snap ?? versionId));
       if (!r) return new Response(null, { status: 404 });
       if (permanent) {
-        if (!r.deleted || !this.permanentDelete) return new Response("<Error><Code>PermanentDeleteNotAllowed</Code></Error>", { status: 409 });
+        if (!r.deleted || !this.permanentDelete) return new Response("<Error><Code>PermanentDeleteNotAllowed</Code></Error>", { status: this.#opts.permanentDeleteRefusal ?? 409 });
         drop(r);
         return ok();
       }
@@ -206,7 +210,7 @@ export class FakeAzureBlob {
       + (r.kind === "version" ? `<VersionId>${r.id}</VersionId>` : "")
       + (r.kind === "version" && r.current ? "<IsCurrentVersion>true</IsCurrentVersion>" : "")
       + (r.deleted ? "<Deleted>true</Deleted>" : "")
-      + `<Properties><Last-Modified>${new Date(this.#clock).toUTCString()}</Last-Modified><Etag>${r.etag}</Etag><Content-Length>${r.bytes.length}</Content-Length></Properties></Blob>`;
+      + `<Properties><Last-Modified>${new Date(r.modified).toUTCString()}</Last-Modified><Etag>${r.etag}</Etag><Content-Length>${r.bytes.length}</Content-Length></Properties></Blob>`;
     const last = nextItem ? all[max] : page[page.length - 1];
     const next = truncated && last ? Buffer.from(JSON.stringify({ key: last.key, seq: last.seq, kind: last.kind })).toString("base64") : "";
     const xml = `﻿<?xml version="1.0" encoding="utf-8"?><EnumerationResults ServiceEndpoint="${FAKE_ENDPOINT}" ContainerName="${this.container}">`

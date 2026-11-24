@@ -4,7 +4,7 @@
  * without permanent delete refuses, a 3xx is never followed, and transient failures throw by code.
  */
 import { describe, expect, test } from "bun:test";
-import { probeBlobVersioning, runnerProbePrefix } from "../blob-versioning.ts";
+import { PROBE_LEFTOVER_AGE_MS, probeBlobVersioning, runnerProbePrefix } from "../blob-versioning.ts";
 import { FAKE_ENDPOINT, FakeAzureBlob, type FakeAzureOptions } from "../../migration/__tests__/fake-azure-blob.ts";
 
 const PREFIX = runnerProbePrefix("fxroot");
@@ -60,11 +60,48 @@ describe("blob versioning probe", () => {
     expect(await run()).toBe("soft_delete_retained");
   });
 
-  test("leftovers of an interrupted probe are erased first", async () => {
+  test("stale leftovers of an interrupted probe are erased first; a fresh probe in flight (another runner) is never touched", async () => {
     const { fake, run } = probe();
     fake.put(`${PREFIX}fx-earlier/probe`); fake.put(`${PREFIX}fx-earlier/probe`);
+    for (const r of fake.records) r.modified = Date.now() - PROBE_LEFTOVER_AGE_MS - 60_000;
+    fake.put(`${PREFIX}fx-other-runner/probe`);
     expect(await run()).toBe("Enabled");
+    expect(fake.records.map((r) => r.key)).toEqual([`${PREFIX}fx-other-runner/probe`]);
+  });
+
+  test("two runners probing at once: both pass and neither deletes the other's probe version", async () => {
+    const fake = new FakeAzureBlob();
+    let n = 0;
+    const deletedOther: string[] = [];
+    fake.hook = (req) => {
+      if (req.method === "DELETE") {
+        const mine = req.url.pathname.includes("/fx-probe-a/") ? "a" : req.url.pathname.includes("/fx-probe-b/") ? "b" : "?";
+        deletedOther.push(mine);
+      }
+      return undefined;
+    };
+    const one = (id: string) => probeBlobVersioning({ account: fake.account, container: fake.container, endpoint: FAKE_ENDPOINT,
+      accountKey: () => fake.accountKey, prefix: PREFIX, fetch: fake.fetch, id: () => { n++; return id; } });
+    expect(await Promise.all([one("fx-probe-a"), one("fx-probe-b")])).toEqual(["Enabled", "Enabled"]);
+    expect(n).toBe(2);
     expect(fake.records).toEqual([]);
+    // Each probe's deletes stay inside its own directory (a's and b's counts are its own put's base + version).
+    expect(deletedOther.filter((d) => d === "a")).toHaveLength(2);
+    expect(deletedOther.filter((d) => d === "b")).toHaveLength(2);
+    expect(deletedOther.filter((d) => d === "?")).toHaveLength(0);
+  });
+
+  test("a 404 (container missing) on the put or the listing: container_missing", async () => {
+    for (const on of ["PUT", "GET"]) {
+      const { fake, run } = probe();
+      fake.hook = (req) => (req.method === on ? new Response("<Error><Code>ContainerNotFound</Code></Error>", { status: 404 }) : undefined);
+      expect([on, await run()]).toEqual([on, "container_missing"]);
+    }
+  });
+
+  test("soft delete with permanent delete forbidden (403): permanent_delete_forbidden, distinct from retention", async () => {
+    const { run } = probe({ softDelete: true, permanentDelete: false, permanentDeleteRefusal: 403 });
+    expect(await run()).toBe("permanent_delete_forbidden");
   });
 
   test("a 3xx on the put or the listing: redirect, and the Location is never requested", async () => {

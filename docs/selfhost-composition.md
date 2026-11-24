@@ -126,8 +126,9 @@ the orphan-result sweeper's eraser use the same endpoint and keys. Versioning is
 or static keys the runner checks `GetBucketVersioning` at startup and refuses `bucket_not_versioned`
 otherwise (checked at startup only). `LOCKER_PROVIDER` unset or `s3` is this path. `azure` is the Azure Blob
 path (slice S2): `SESSION_ANALYSIS_AZURE_ACCOUNT`, `_CONTAINER`, optional `_ENDPOINT` and the key from a mounted
-file, `SESSION_ANALYSIS_AZURE_ACCOUNT_KEY_FILE`, with a data-plane versioning probe at startup. On Azure, nothing
-creates analysis jobs and the read API serves no analysis until S2b. `gcs` or `fs` is refused
+file, `SESSION_ANALYSIS_AZURE_ACCOUNT_KEY_FILE`, with a data-plane versioning probe at startup. On Azure, S2 alone runs
+no analysis job (the read API serves no analysis until S2b, and decision records, which the claims scheduler
+needs, are refused there). `gcs` or `fs` is refused
 (`provider_unsupported`) until their versioned erasers land (S3), and any other value is refused
 (`provider_invalid`). Full contract: [session-analysis-runner.md](session-analysis-runner.md#azure-blob-slice-s2).
 

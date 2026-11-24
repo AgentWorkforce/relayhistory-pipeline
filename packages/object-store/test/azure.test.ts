@@ -54,10 +54,20 @@ describe("azure adapter version ids", () => {
     return { fetcher, seen };
   };
 
-  it("put, head and getObject surface x-ms-version-id as the version (a versioning account)", async () => {
+  it("by default the version stays the ETag alone even when x-ms-version-id is sent (existing stores unchanged)", async () => {
+    const { fetcher } = fakeFetch("2026-11-23T10:00:00.1234567Z");
+    const store = createAzureBlobStore({ account: ACCOUNT, container: "fx-container", endpoint: "http://127.0.0.1:1/fxacct", auth: { kind: "sharedKey", accountKey: KEY }, fetch: fetcher });
+    expect((await store.put(objectKey("a/b.json"), new TextEncoder().encode("ok"))).version).toEqual({ eTag: '"0x1D"' });
+    expect((await store.head(objectKey("a/b.json")))?.version).toEqual({ eTag: '"0x1D"' });
+    const got = await store.getObject(objectKey("a/b.json"));
+    await got.body.cancel();
+    expect(got.meta.version).toEqual({ eTag: '"0x1D"' });
+  });
+
+  it("versionIds: put, head and getObject surface x-ms-version-id as the version (a versioning account)", async () => {
     const v = "2026-11-23T10:00:00.1234567Z";
     const { fetcher, seen } = fakeFetch(v);
-    const store = createAzureBlobStore({ account: ACCOUNT, container: "fx-container", endpoint: "http://127.0.0.1:1/fxacct", auth: { kind: "sharedKey", accountKey: KEY }, fetch: fetcher });
+    const store = createAzureBlobStore({ account: ACCOUNT, container: "fx-container", endpoint: "http://127.0.0.1:1/fxacct", auth: { kind: "sharedKey", accountKey: KEY }, fetch: fetcher, versionIds: true });
     const signal = new AbortController().signal;
     const ack = await store.put(objectKey("a/b.json"), new TextEncoder().encode("ok"), { signal });
     expect(ack.version).toEqual({ eTag: '"0x1D"', version: v });
@@ -68,9 +78,9 @@ describe("azure adapter version ids", () => {
     expect(got.meta.version).toEqual({ eTag: '"0x1D"', version: v });
   });
 
-  it("without the header (versioning off) the version is the ETag alone, as before", async () => {
+  it("versionIds without the header (versioning off): the version is the ETag alone", async () => {
     const { fetcher } = fakeFetch(null);
-    const store = createAzureBlobStore({ account: ACCOUNT, container: "fx-container", endpoint: "http://127.0.0.1:1/fxacct", auth: { kind: "sharedKey", accountKey: KEY }, fetch: fetcher });
+    const store = createAzureBlobStore({ account: ACCOUNT, container: "fx-container", endpoint: "http://127.0.0.1:1/fxacct", auth: { kind: "sharedKey", accountKey: KEY }, fetch: fetcher, versionIds: true });
     expect((await store.put(objectKey("a/b.json"), new TextEncoder().encode("ok"))).version).toEqual({ eTag: '"0x1D"' });
     expect((await store.head(objectKey("a/b.json")))?.version).toEqual({ eTag: '"0x1D"' });
   });

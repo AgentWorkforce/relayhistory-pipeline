@@ -105,7 +105,7 @@ describe("owned versions survive (the sweeper's select, F1)", () => {
     const { fake, eraser } = setup();
     const stray = fake.put(KEY, "stray-earlier-attempt");
     const store = createAzureBlobStore({ account: fake.account, container: fake.container, endpoint: FAKE_ENDPOINT,
-      auth: { kind: "sharedKey", accountKey: fake.accountKey }, fetch: fake.fetch });
+      auth: { kind: "sharedKey", accountKey: fake.accountKey }, fetch: fake.fetch, versionIds: true });
     const ack = await store.put(KEY as never, new TextEncoder().encode('{"published":true}'), { contentType: "application/json" });
     const owned = ack.version.version!;
     expect(owned).toMatch(/^\d{4}-\d{2}-\d{2}T/);
@@ -149,6 +149,14 @@ describe("soft delete", () => {
     await drain(eraser(), DIR);
     await expect(drain(eraser(), DIR)).rejects.toMatchObject({ code: "azure_soft_delete_retained" });
     expect(fake.copies(KEY)).toHaveLength(1);
+    expect(await eraser().verifyErased(DIR, { authorize })).toMatchObject({ status: "pending", remaining: 1 });
+  });
+
+  test("a 403 on the permanent delete is azure_permanent_delete_forbidden (permission), not retention", async () => {
+    const { fake, eraser } = setup({ softDelete: true, permanentDelete: false, permanentDeleteRefusal: 403 });
+    fake.put(KEY);
+    await drain(eraser(), DIR);
+    await expect(drain(eraser(), DIR)).rejects.toMatchObject({ code: "azure_permanent_delete_forbidden" });
     expect(await eraser().verifyErased(DIR, { authorize })).toMatchObject({ status: "pending", remaining: 1 });
   });
 
@@ -244,6 +252,26 @@ describe("fresh traversals (Azure markers name the next item as of issue time)",
     expect(fake.copies(C2!)).toEqual([]);
     expect(await e.verifyErased(DIR, { authorize })).toMatchObject({ status: "pending", reason: "remaining" });
     expect(fake.records.map((r) => r.key).sort()).toEqual([A, C, D].sort());
+  });
+
+  test("two prefixes on one instance, interleaved, and a second verifyErased after more objects arrive: each sees everything", async () => {
+    const { fake, eraser } = setup({ pageSize: 2, markerMode: "next-item" });
+    const P1 = `${DIR}fx-p1/`, P2 = `${DIR}fx-p2/`;
+    for (const k of ["a", "c", "e"]) { fake.put(`${P1}${k}`); fake.put(`${P2}${k}`); }
+    const e = eraser();
+    const none = () => false;
+    expect(await e.eraseStep(P1, { scope: "fx", authorize, select: none })).toMatchObject({ status: "traversed" });
+    expect(await e.eraseStep(P2, { scope: "fx", authorize, select: none })).toMatchObject({ status: "traversed" });
+    for (const k of ["b", "d"]) { fake.put(`${P1}${k}`); fake.put(`${P2}${k}`); }
+    for (const p of [P1, P2]) {
+      const want = new Set([`${p}b`, `${p}d`]);
+      const proof = await e.verifyErased(p, { authorize, select: (v) => want.has(v.key) });
+      expect([p, proof.status]).toEqual([p, "pending"]);
+      await drain(e, p, { select: (v) => want.has(v.key) });
+      expect([p, fake.records.filter((r) => want.has(r.key))]).toEqual([p, []]);
+      expect([p, (await e.verifyErased(p, { authorize, select: (v) => want.has(v.key) })).status]).toEqual([p, "erased"]);
+    }
+    expect(fake.records.map((r) => r.key).sort()).toEqual([`${P1}a`, `${P1}c`, `${P1}e`, `${P2}a`, `${P2}c`, `${P2}e`].sort());
   });
 
   test("one instance across a directory traversal and an exact-key traversal (the probe's pattern) erases everything", async () => {

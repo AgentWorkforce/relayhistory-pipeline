@@ -115,6 +115,7 @@ describe("azure config", () => {
       [{ PIPELINE_ORG_FROM_PREFIX: undefined }, "org_from_prefix_required"],
       [{ PIPELINE_KEY_PREFIX: "" }, "key_prefix_invalid"],
       [{ SESSION_ANALYSIS_BATCH: "0" }, "batch_invalid"],
+      [{ SUMMARY_DECISION_RECORDS_ENABLED: "true" }, "azure_decision_records_unsupported"],
     ];
     for (const [extra, want] of cases) expect([extra, await code(() => analysisRunnerConfig(azureEnv(extra)))]).toEqual([extra, want]);
   });
@@ -197,7 +198,7 @@ describe("azure deps", () => {
     expect(target).toMatchObject({ provider: "azure", account: "fxacct", container: "fx-container", endpoint: "http://127.0.0.1:10000/fxacct" });
     expect(Object.isFrozen(target)).toBe(true);
     expect(stores).toHaveLength(1);
-    expect(stores[0]).toMatchObject({ account: "fxacct", container: "fx-container", endpoint: "http://127.0.0.1:10000/fxacct", auth: { kind: "sharedKey", accountKey: KEY } });
+    expect(stores[0]).toMatchObject({ account: "fxacct", container: "fx-container", endpoint: "http://127.0.0.1:10000/fxacct", auth: { kind: "sharedKey", accountKey: KEY }, versionIds: true });
     expect(deps.canonical).toMatchObject({ provider: "azure", bucket: "fx-container", prefix: { PIPELINE_ORG_FROM_PREFIX: "true", PIPELINE_KEY_PREFIX: "fxroot" } });
     expect(erasers).toHaveLength(0);
     await deps.eraser!.eraseStep("fxroot/fx-org/", {} as never);
@@ -240,7 +241,8 @@ describe("azure startup", () => {
   test("every probe verdict but Enabled refuses before the pool, the store or a listener; transient exits 1", async () => {
     const cases = [
       ["not_versioned", "blob_not_versioned"], ["unverified", "blob_versioning_unverified"], ["redirect", "blob_versioning_redirect"],
-      ["soft_delete_retained", "blob_soft_delete_retained"], ["auth_refused", "blob_auth_refused"],
+      ["soft_delete_retained", "blob_soft_delete_retained"], ["permanent_delete_forbidden", "blob_permanent_delete_forbidden"],
+      ["auth_refused", "blob_auth_refused"], ["container_missing", "blob_container_missing"],
     ] as const;
     for (const [verdict, want] of cases) {
       let listened = false, pools = 0, stores = 0;
@@ -255,6 +257,18 @@ describe("azure startup", () => {
     }
     const transient = await run(azureEnv(), { pool: fakeDb, blobVersioning: async () => { throw Object.assign(new Error("x"), { code: "blob_versioning_unavailable" }); } }).catch((e) => e);
     expect([transient.code, runnerExitCode(transient)]).toEqual(["blob_versioning_unavailable", 1]);
+    // Any other throw is not something a restart fixes: a refusal, not a retry.
+    const other = await run(azureEnv(), { pool: fakeDb, blobVersioning: async () => { throw new TypeError("unexpected"); } }).catch((e) => e);
+    expect([other.code, runnerExitCode(other)]).toEqual(["blob_versioning_unverified", 2]);
+  });
+
+  test("against the fake Azure container: a wrong key refuses blob_auth_refused and a missing container blob_container_missing (exit 2, no retry)", async () => {
+    const wrongKey = new FakeAzureBlob({ accountKey: randomKey() });
+    const missing = new FakeAzureBlob({ accountKey: KEY, container: "fx-other-container" });
+    for (const [fake, want] of [[wrongKey, "blob_auth_refused"], [missing, "blob_container_missing"]] as const) {
+      const result = await run(azureEnv({ SESSION_ANALYSIS_AZURE_ENDPOINT: FAKE_ENDPOINT }), { fetcher: fake.fetch, pool: fakeDb }).catch((e) => e);
+      expect([want, result instanceof AnalysisRunnerRefused ? result.code : String(result), runnerExitCode(result)]).toEqual([want, want, 2]);
+    }
   });
 
   test("against the fake Azure container: versioning on starts (real probe, real eraser); versioning off refuses blob_not_versioned", async () => {

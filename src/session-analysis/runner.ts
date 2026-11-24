@@ -256,6 +256,9 @@ export function analysisRunnerConfig(env: NodeJS.ProcessEnv): AnalysisRunnerConf
 /** The azure branch: its store settings (runnerAzureConfig), then the same provider-independent checks as S3. */
 function analysisRunnerConfigAzure(env: NodeJS.ProcessEnv): AnalysisRunnerConfig {
   const azure = runnerAzureConfig(env);
+  // Decision records (and the claims they feed) stay off on Azure until the self-host operator erase can erase
+  // them there (it adopts the Azure eraser in its own slice): a rule only in a doc would fail open.
+  if (env.SUMMARY_DECISION_RECORDS_ENABLED === "true") refuse("azure_decision_records_unsupported");
   const keyPrefix = runnerKeyPrefix(env);
   const run = runnerProcessSettings(env);
   return {
@@ -478,7 +481,8 @@ const transient = (code: string) => Object.assign(new Error(code), { code });
  * LOCKER_PROVIDER=azure, before the pool, the store or anything listens: the data-plane versioning probe
  * (blob-versioning.ts) under <PIPELINE_KEY_PREFIX>/.runner-probe/session-analysis/. Refusals (exit 2):
  * blob_not_versioned, blob_versioning_unverified, blob_versioning_redirect, blob_soft_delete_retained,
- * blob_auth_refused. A transient failure throws blob_versioning_unavailable (exit 1).
+ * blob_permanent_delete_forbidden, blob_auth_refused, blob_container_missing. Only a transient failure
+ * (5xx, network, timeout) throws blob_versioning_unavailable (exit 1).
  */
 export async function assertRunnerBlobVersioned(cfg: Pick<AnalysisRunnerConfig, "keyPrefix">, target: RunnerAzureTarget, ports: RunnerPorts = {}): Promise<void> {
   let verdict: BlobVersioningVerdict;
@@ -489,14 +493,18 @@ export async function assertRunnerBlobVersioned(cfg: Pick<AnalysisRunnerConfig, 
       ...(ports.fetcher ? { fetch: ports.fetcher } : {}),
       ...(ports.azureEraserFactory ? { eraserFactory: ports.azureEraserFactory } : {}),
     });
-  } catch {
-    throw transient("blob_versioning_unavailable");
+  } catch (error) {
+    // Only the probe's own transient code retries (exit 1); any other failure cannot be fixed by a restart.
+    if ((error as { code?: string })?.code === "blob_versioning_unavailable") throw transient("blob_versioning_unavailable");
+    return refuse("blob_versioning_unverified");
   }
   if (verdict === "Enabled") return;
   if (verdict === "not_versioned") refuse("blob_not_versioned");
   if (verdict === "redirect") refuse("blob_versioning_redirect");
   if (verdict === "soft_delete_retained") refuse("blob_soft_delete_retained");
+  if (verdict === "permanent_delete_forbidden") refuse("blob_permanent_delete_forbidden");
   if (verdict === "auth_refused") refuse("blob_auth_refused");
+  if (verdict === "container_missing") refuse("blob_container_missing");
   refuse("blob_versioning_unverified");
 }
 
@@ -510,6 +518,9 @@ export function runnerAzureAnalysisDeps(env: NodeJS.ProcessEnv, cfg: AnalysisRun
     account, container, ...endpoint, auth: { kind: "sharedKey", accountKey: target.accountKey() },
     // Shared Key signed requests never follow a redirect (the eraser and the probe enforce the same).
     fetch: azureNoRedirectFetch(ports.fetcher),
+    // The exact version a result put created (x-ms-version-id): the sweeper keeps exactly that one. Only this
+    // store turns it on; every other Azure store keeps its ETag-only versions.
+    versionIds: true,
   });
   const makeEraser = ports.azureEraserFactory ?? createAzureBlobEraser;
   const deps = analysisTickDeps({

@@ -19,9 +19,11 @@
 import { azureSharedKeyAuthorization, AZURE_API_VERSION } from "../../packages/object-store/src/azure.ts";
 import { encodeKeyPath, rfc3986 } from "../../packages/object-store/src/crypto.ts";
 import { createAzureBlobEraser, type AzureBlobEraserConfig } from "../migration/azure-blob-erasure/eraser.ts";
-import type { EraseCheckpoint, PagedEraser } from "../migration/neon-s3-erasure/eraser.ts";
+import type { EraseCheckpoint, ListedVersion, PagedEraser } from "../migration/neon-s3-erasure/eraser.ts";
 
-export type BlobVersioningVerdict = "Enabled" | "not_versioned" | "unverified" | "redirect" | "soft_delete_retained" | "auth_refused";
+export type BlobVersioningVerdict =
+  | "Enabled" | "not_versioned" | "unverified" | "redirect" | "soft_delete_retained" | "permanent_delete_forbidden"
+  | "auth_refused" | "container_missing";
 
 export interface BlobVersioningCheck {
   account: string;
@@ -36,7 +38,16 @@ export interface BlobVersioningCheck {
   eraserFactory?: (config: AzureBlobEraserConfig) => PagedEraser;
   /** Test port for the probe's unique segment. */
   id?: () => string;
+  /** Test port for the clock that ages leftovers. */
+  now?: () => number;
 }
+
+/**
+ * Leftovers older than this are erased before the probe (a pod killed mid-probe). A younger probe blob is another
+ * runner's probe in flight (each probe writes its own <uuid>/ directory) and is never touched, so runners that
+ * start together cannot delete each other's probe.
+ */
+export const PROBE_LEFTOVER_AGE_MS = 15 * 60_000;
 
 /** The reserved probe directory under the runner's key root (never an org: a dot segment). */
 export function runnerProbePrefix(keyPrefix: string): string {
@@ -60,6 +71,8 @@ class Verdict extends Error {
 function fromEraser(error: unknown): never {
   const code = (error as { code?: string })?.code ?? "";
   if (code === "azure_soft_delete_retained") throw new Verdict("soft_delete_retained");
+  if (code === "azure_permanent_delete_forbidden") throw new Verdict("permanent_delete_forbidden");
+  if (code === "azure_404") throw new Verdict("container_missing");
   if (code === "azure_redirect") throw new Verdict("redirect");
   if (code === "azure_403") throw new Verdict("auth_refused");
   if (code === "azure_unavailable" || /^azure_5\d\d$/.test(code)) throw transient();
@@ -67,9 +80,9 @@ function fromEraser(error: unknown): never {
 }
 
 /** eraseStep to traversal and verifyErased, up to MAX_PASSES (a soft-deleted version needs a second pass). */
-async function eraseAndVerify(eraser: PagedEraser, prefix: string, exactKey?: string): Promise<void> {
+async function eraseAndVerify(eraser: PagedEraser, prefix: string, exactKey?: string, select?: (v: ListedVersion) => boolean): Promise<void> {
   const authorize = async () => {};
-  const exact = exactKey ? { exactKey } : {};
+  const exact = { ...(exactKey ? { exactKey } : {}), ...(select ? { select } : {}) };
   try {
     for (let pass = 0; pass < MAX_PASSES; pass++) {
       let checkpoint: EraseCheckpoint | null = null;
@@ -115,14 +128,17 @@ export async function probeBlobVersioning(cfg: BlobVersioningCheck): Promise<Blo
     return res;
   };
   try {
-    // 1. Leftovers of an earlier, interrupted probe.
-    await eraseAndVerify(eraser, cfg.prefix);
+    // 1. Leftovers of an earlier, interrupted probe: only copies older than PROBE_LEFTOVER_AGE_MS (an unknown age is
+    //    kept), never another runner's probe in flight.
+    const cutoff = (cfg.now ?? Date.now)() - PROBE_LEFTOVER_AGE_MS;
+    await eraseAndVerify(eraser, cfg.prefix, undefined, (v) => v.lastModified !== undefined && v.lastModified < cutoff);
     // 2. The probe write.
     const dir = `${cfg.prefix}${(cfg.id ?? (() => crypto.randomUUID()))()}/`;
     const key = `${dir}probe`;
     const res = await signed("PUT", key, { "x-ms-blob-type": "BlockBlob", "content-type": "application/octet-stream", "if-none-match": "*" }, PROBE_BODY);
     if (res.type === "opaqueredirect" || res.redirected || (res.status >= 300 && res.status < 400)) return "redirect";
     if (res.status === 403) return "auth_refused";
+    if (res.status === 404) return "container_missing";
     if (res.status >= 500) throw transient();
     if (!res.ok) return "unverified";
     const version = res.headers.get("x-ms-version-id");

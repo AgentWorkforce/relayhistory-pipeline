@@ -147,17 +147,39 @@ reads none of the settings below.
 | `SESSION_ANALYSIS_AZURE_ACCOUNT` | yes | The storage account: 3-24 lowercase letters or digits (`azure_account_invalid`) |
 | `SESSION_ANALYSIS_AZURE_CONTAINER` | yes | The container, an Azure container name (`azure_container_invalid`). It is the canonical pointers' bucket (`session_index.bucket`), as the Azure Locker writes it |
 | `SESSION_ANALYSIS_AZURE_ENDPOINT` | no | Blob endpoint. Unset: `https://<account>.blob.core.windows.net`. The shared destination policy, as for `SESSION_ANALYSIS_S3_ENDPOINT` (https; loopback http; in-cluster http only with `ALLOW_IN_CLUSTER_HTTP=true`); no credentials, query or fragment; the path is empty or exactly `/<account>` (Azurite's path style). Refusals `azure_endpoint_invalid`, `allow_in_cluster_http_invalid` |
-| `SESSION_ANALYSIS_AZURE_ACCOUNT_KEY_FILE` | yes | Absolute path to a mounted Secret file holding the account key (one trailing newline dropped): strict padded base64 of at least 32 bytes. The only source: a plaintext `SESSION_ANALYSIS_AZURE_ACCOUNT_KEY` refuses (`azure_account_key_plaintext`). Refusals `azure_account_key_missing`, `_unreadable`, `_invalid`. The key is held behind a closure and never appears in a config object, an error or a log line |
+| `SESSION_ANALYSIS_AZURE_ACCOUNT_KEY_FILE` | yes | Absolute path to a mounted Secret file holding the account key (one trailing newline dropped): strict padded base64 of at least 32 bytes. The only source: a plaintext `SESSION_ANALYSIS_AZURE_ACCOUNT_KEY` refuses (`azure_account_key_plaintext`). Refusals `azure_account_key_missing`, `_unreadable`, `_invalid`. The key is kept behind a closure and never appears in a config object, an error or a log line |
 
-With `LOCKER_PROVIDER=azure`, every `SESSION_ANALYSIS_S3_*` setting must be unset (`azure_s3_settings_conflict`).
-Shared Key is the only auth: SAS is out of scope, and Entra workload identity is a later slice.
+With `LOCKER_PROVIDER=azure`, every `SESSION_ANALYSIS_S3_*` setting must be unset (`azure_s3_settings_conflict`), and
+`SUMMARY_DECISION_RECORDS_ENABLED=true` refuses startup (`azure_decision_records_unsupported`) until the self-host
+operator erase can erase decision records on Azure. Shared Key is the only auth: SAS is out of scope, and Entra
+workload identity is a later slice.
+
+**What S2 delivers, and what it does not.** S2 delivers the Azure store, the startup proof, the sweeper and the strict
+erase. **On its own it runs no analysis job on Azure:** the read API's POST is not wired to Azure until S2b, and the
+claims scheduler needs `SUMMARY_DECISION_RECORDS_ENABLED=true`, which this path refuses. The first job on Azure needs
+S2b (the read API on the Azure store) or the operator-erase slice (which lifts the decision-records refusal).
+
+**Account prerequisites.**
+
+- **Blob versioning** enabled on the storage account (an account setting; the startup probe proves it, `blob_not_versioned`).
+- **The container** exists (`blob_container_missing`), and the account key is the account's (`blob_auth_refused`).
+- **Blob soft delete:** either off, or on with **permanent delete for soft-deleted blobs enabled** on the account
+  (the blob service's soft-delete policy, "allow permanent delete"). Otherwise a deleted version stays recoverable and
+  erasure cannot complete: the probe refuses `blob_soft_delete_retained` (the account keeps the copy), or
+  `blob_permanent_delete_forbidden` (a 403 on `deletetype=permanent`: the permanent-delete permission is not granted,
+  which for an Entra identity is the data action
+  `Microsoft.Storage/storageAccounts/blobServices/containers/blobs/permanentDelete/action`; the Shared Key carries
+  every data permission, so with S2's Shared Key a 403 there points at the account policy).
+- The key needs read, write, list and delete on the container; the probe exercises all four.
 
 **Startup proof.** Blob versioning is an account (ARM) setting the data plane cannot read, so the runner proves it
 on the data plane before the pool, the store or a listener exists (`src/session-analysis/blob-versioning.ts`),
 under the reserved prefix `<PIPELINE_KEY_PREFIX>/.runner-probe/session-analysis/` (never a session key; the
 consumer ignores it as `not_a_session_key`):
 
-1. erase any probe leftovers there (a pod killed mid-probe);
+1. erase probe leftovers there older than 15 minutes (a pod killed mid-probe). Each probe writes its own
+   `<uuid>/` directory and a younger copy is another runner's probe in flight, so runners that start together
+   never delete each other's probe;
 2. put one small create-only probe blob: the answer must carry `x-ms-version-id`;
 3. see it in a List Blobs inventory, erase it through the strict eraser and verify that no copy remains.
 
@@ -165,14 +187,16 @@ consumer ignores it as `not_a_session_key`):
 | --- | --- |
 | version id, erased and verified | starts |
 | no `x-ms-version-id` (versioning off) | refusal `blob_not_versioned` (exit 2) |
-| soft delete keeps the deleted version and the account refuses permanent delete | refusal `blob_soft_delete_retained` (exit 2) |
-| 403 | refusal `blob_auth_refused` (exit 2) |
+| soft delete keeps the deleted version and the account refuses permanent delete (400/409: retention) | refusal `blob_soft_delete_retained` (exit 2) |
+| soft delete keeps the deleted version and the permanent delete answers 403 (permission) | refusal `blob_permanent_delete_forbidden` (exit 2) |
+| 403 (wrong key or account) | refusal `blob_auth_refused` (exit 2) |
+| 404 (the container does not exist) | refusal `blob_container_missing` (exit 2) |
 | a 3xx anywhere (never followed with credentials) | refusal `blob_versioning_redirect` (exit 2) |
 | other 4xx, a malformed version id, a probe the inventory does not show, or an erase that does not verify | refusal `blob_versioning_unverified` (exit 2) |
 | 5xx, network failure, timeout | error `blob_versioning_unavailable` (exit 1; the pod restarts and retries) |
+| any other failure of the probe itself | refusal `blob_versioning_unverified` (exit 2; a restart would not fix it) |
 
-The key needs read, write, list and delete on the container; the probe proves all four. Like the S3 check it
-runs only at startup.
+Like the S3 check it runs only at startup.
 
 **Strict erasure.** The sweeper's eraser lists every copy under a prefix with `include=versions,deleted,snapshots`
 and deletes each one by exact identity: snapshots by time, the current version through a base-blob delete
@@ -187,21 +211,21 @@ traversal's (`createPagedEraser`). Azure's continuation marker is opaque, so a c
 eraser relists from the start of the prefix and skips at most 100 provider pages (`azure_resume_unbounded`).
 The sweeper erases one key at a time, so in practice this is one or two pages.
 
-**Version ids.** The Azure adapter (`packages/object-store/src/azure.ts`) reports `x-ms-version-id` as the object
-version from put, head and get, so a published result records the version it created. The sweeper keeps exactly
-that version.
+**Version ids.** The runner's store turns on the Azure adapter's `versionIds` option
+(`packages/object-store/src/azure.ts`): put, head and get then report `x-ms-version-id` as the object version, so a
+published result records the version it created, and the sweeper keeps exactly that version. The option is off by
+default, so every other Azure store (the Locker, the consumer, the publisher) keeps its ETag-only versions and its
+comparisons unchanged. The runner's store never follows a redirect: a 3xx is `azure_redirect`, and a job that
+meets one fails as `analysis_store_redirect`, non-retryable, rather than burning attempts.
 
 **Not covered yet on Azure.**
 
-- **Nothing creates analysis jobs on Azure until S2b.** The read API's `POST /v1/sessions/:id/analysis` and its
-  result reads use an S3 client (`READ_API_ANALYSIS_BUCKET`). On `LOCKER_PROVIDER=azure` the read API ignores that
-  variable with one startup warning (`read_api_analysis_bucket_ignored_on_azure`), builds neither the S3 client
-  nor the admission pool, and answers 501 `analysis_not_configured`. The claims scheduler needs
-  `SUMMARY_DECISION_RECORDS_ENABLED=true`, which stays off on Azure (below). So with S2 alone an Azure runner
-  starts, passes its versioning proof and runs empty ticks: it claims and sweeps nothing until a job source exists.
-  Until S2b, results on Azure are also not readable through the read API.
-- **`SUMMARY_DECISION_RECORDS_ENABLED` stays off on Azure** until the self-host operator erase adopts the
-  Azure eraser (its own slice). Today that erase refuses anything but S3.
+- **The read API on Azure.** Its `POST /v1/sessions/:id/analysis` and its result reads use an S3 client
+  (`READ_API_ANALYSIS_BUCKET`). On `LOCKER_PROVIDER=azure` the read API ignores that variable with one startup warning
+  (`read_api_analysis_bucket_ignored_on_azure`), builds neither the S3 client nor the admission pool, and answers 501
+  `analysis_not_configured`. Until S2b, results on Azure are not readable through the read API either.
+- **`SUMMARY_DECISION_RECORDS_ENABLED` is refused on Azure** (`azure_decision_records_unsupported`) until the
+  self-host operator erase adopts the Azure eraser (its own slice). Today that erase refuses anything but S3.
 - **Proof.** CI (`pg-proof.yml`) runs `runner-store.azurite.test.ts` against Azurite 3.38.0 pinned by digest.
   With versioning on, it covers the probe, the owned-version sweep and the full erase; with versioning off, the
   `blob_not_versioned` refusal. Azurite has no soft delete or permanent delete, so those paths are proven only
