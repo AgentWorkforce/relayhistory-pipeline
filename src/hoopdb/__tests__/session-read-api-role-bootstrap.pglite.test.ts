@@ -1,6 +1,7 @@
 /**
  * supabase/bootstrap/session_read_api_role.sql on PGlite with the full migration plan:
- * - three transactions, each with lock_timeout 3s right after BEGIN; no transaction names both
+ * - three transactions, each with lock_timeout right after BEGIN (3s for transaction 0, 1s for the
+ *   two table transactions, below the ingest role's 2s); no transaction names both
  *   sessions.session_index and sessions.session_directory; DROP POLICY only in a policy step's
  *   mismatch branch (after its early RETURN);
  * - a fresh database: the file runs, session_read_api_role_verify.sql passes, both policies have the
@@ -78,13 +79,26 @@ async function locksOf(db: PGlite, block: string): Promise<string[]> {
 
 describe("session_read_api_role.sql: static shape", () => {
   const blocks = transactions(ROLE);
-  test("three transactions, each sets lock_timeout 3s right after BEGIN, and nothing runs outside them", () => {
+  test("three transactions, lock_timeout right after BEGIN (3s, then 1s, 1s), and nothing runs outside them", () => {
     expect(blocks.length).toBe(3);
-    for (const b of blocks) expect(b.split("\n")[1]).toBe("SET LOCAL lock_timeout = '3s';");
+    expect(blocks[0]!.split("\n")[1]).toBe("SET LOCAL lock_timeout = '3s';");
+    expect(blocks[1]!.split("\n")[1]).toBe("SET LOCAL lock_timeout = '1s';");
+    expect(blocks[2]!.split("\n")[1]).toBe("SET LOCAL lock_timeout = '1s';");
     let rest = ROLE;
     for (const b of blocks) rest = rest.replace(b, "");
     expect(rest.split("\n").filter((l) => l.trim() !== "" && !l.trim().startsWith("--"))).toEqual([]);
     expect(RAW.split("\n").filter((l) => l.startsWith("\\"))).toEqual(["\\set ON_ERROR_STOP 1"]);
+  });
+  test("the table transactions wait strictly less than the ingest role's lock_timeout", () => {
+    const ingest = [...read("supabase/bootstrap/session_ingest_role.sql").matchAll(/^ALTER ROLE bulls96_session_ingest SET lock_timeout = '(\d+)s';$/gm)];
+    expect(ingest.length).toBe(1);
+    const limit = Number(ingest[0]![1]);
+    for (const b of [blocks[1]!, blocks[2]!]) {
+      const m = /^SET LOCAL lock_timeout = '(\d+)s';$/m.exec(b.split("\n")[1]!);
+      expect(m).not.toBeNull();
+      expect(Number(m![1])).toBeGreaterThan(0);
+      expect(Number(m![1])).toBeLessThan(limit);
+    }
   });
   test("no transaction names both tables; transaction 0 names neither", () => {
     for (const b of blocks) expect(b.includes(INDEX) && b.includes(DIRECTORY)).toBe(false);

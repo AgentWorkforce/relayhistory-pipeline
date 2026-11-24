@@ -43,11 +43,19 @@
 -- wanted definition (PERMISSIVE, FOR SELECT, TO bulls96_read_api only, the same
 -- USING expression, no WITH CHECK) is left alone, so that transaction takes no
 -- ACCESS EXCLUSIVE lock (ACCESS SHARE at most, which does not block readers or
--- writers); any other difference, or no policy, drops and recreates it. Each transaction
--- sets lock_timeout 3s, so a busy table fails that transaction instead of queueing
--- behind (and blocking) its readers and writers. The file is safe to re-run after
--- such a timeout: transactions that committed are no-ops the second time, and the
--- rest are applied.
+-- writers); any other difference, or no policy, drops and recreates it. Transaction 0
+-- uses lock_timeout 3s (it takes no table lock). The two table transactions use 1s,
+-- strictly below the 2s lock_timeout the bootstrap files set for the runtime roles that
+-- write these tables (session_ingest_role.sql sets it for bulls96_session_ingest): while
+-- this file's ACCESS EXCLUSIVE request waits, a writer arriving on that table queues
+-- behind it, and with a wait of 2s or more that writer would hit its own lock timeout
+-- first; with 1s this file gives up first and the writer proceeds. A statement that runs
+-- with a shorter lock wait of its own (the code sets some below 1s) is not covered: if it
+-- reaches the table while this file's request is pending, it can still lose its wait;
+-- that window is at most 1s per table transaction. A busy table thus fails that
+-- transaction instead of queueing behind (and blocking) its readers and writers. The
+-- file is safe to re-run after such a timeout: transactions that committed are no-ops
+-- the second time, and the rest are applied.
 --
 -- No statement here reads hoopdb.db_mode, so this file needs no PGOPTIONS; only
 -- session_read_api_role_verify.sql reads it (on Supabase PG16+ run the verifier with
@@ -90,9 +98,9 @@ COMMIT;
 -- recreated (and the verifier, which compares the same literal, would refuse it); a different policy is
 -- never kept.
 
--- Transaction 1: sessions.session_index only.
+-- Transaction 1: sessions.session_index only. lock_timeout 1s: see the header.
 BEGIN;
-SET LOCAL lock_timeout = '3s';
+SET LOCAL lock_timeout = '1s';
 GRANT SELECT (org_id, workspace_id, harness, session_id, created_at, deleted_at,
               canonical_session_id, machine_id, canonical_machine_id, user_id,
               storage_provider, bucket, manifest_key, content_sha256, raw_format, revision)
@@ -120,9 +128,9 @@ END
 $session_index_read_api_policy$;
 COMMIT;
 
--- Transaction 2: sessions.session_directory only.
+-- Transaction 2: sessions.session_directory only. lock_timeout 1s: see the header.
 BEGIN;
-SET LOCAL lock_timeout = '3s';
+SET LOCAL lock_timeout = '1s';
 -- The Postgres search backend's completeness check (postgres-search-state.ts partials) compares the
 -- search projection's epoch with the directory's. Ids and epoch columns only, tenant-bound below; no
 -- title, summary, metadata or other content column. Everything else about the directory stays behind
