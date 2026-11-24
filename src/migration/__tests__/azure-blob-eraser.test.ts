@@ -254,6 +254,21 @@ describe("fresh traversals (Azure markers name the next item as of issue time)",
     expect(fake.records.map((r) => r.key).sort()).toEqual([A, C, D].sort());
   });
 
+  test("an eraseStep from the start never resumes from an earlier traversal's marker (the key-only resume after the last complete key)", async () => {
+    const { fake, eraser } = setup({ pageSize: 2, markerMode: "next-item" });
+    const e = eraser();
+    const [A, B, C, D, E] = ["fx-a", "fx-b", "fx-c", "fx-d", "fx-e"].map((k) => `${DIR}${k}.json`);
+    for (const k of [A, B, D, E]) fake.put(k!);
+    // Traversal 1 deletes nothing; its page ending at B records a marker naming D (the next item then).
+    expect(await e.eraseStep(DIR, { scope: "fx", authorize, select: () => false })).toMatchObject({ status: "traversed" });
+    fake.records = fake.records.filter((r) => r.key !== A);
+    fake.put(C!, "one"); fake.put(C!, "two");   // two versions of C between B and D
+    // Traversal 2: page 1 is [B, C v1]; the key-only relist after B must not resume on traversal 1's marker (D).
+    await drain(e, DIR, { select: (v) => v.key === C });
+    expect(fake.copies(C!)).toEqual([]);
+    expect(await e.verifyErased(DIR, { authorize, select: (v) => v.key === C })).toMatchObject({ status: "erased" });
+  });
+
   test("two prefixes on one instance, interleaved, and a second verifyErased after more objects arrive: each sees everything", async () => {
     const { fake, eraser } = setup({ pageSize: 2, markerMode: "next-item" });
     const P1 = `${DIR}fx-p1/`, P2 = `${DIR}fx-p2/`;
