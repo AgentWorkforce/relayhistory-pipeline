@@ -179,7 +179,10 @@ consumer ignores it as `not_a_session_key`):
 
 1. erase probe leftovers there older than 15 minutes (a pod killed mid-probe). Each probe writes its own
    `<uuid>/` directory and a younger copy is another runner's probe in flight, so runners that start together
-   never delete each other's probe;
+   never delete each other's probe. Two limits: a pod clock more than 15 minutes ahead of the storage
+   service's clock could treat another runner's in-flight probe as a leftover and erase it (that runner then refuses
+   `blob_versioning_unverified`: fail closed, and its next start passes); and a crash loop faster than 15 minutes
+   leaves one probe directory per start until a later start finds them old enough to erase;
 2. put one small create-only probe blob: the answer must carry `x-ms-version-id`;
 3. see it in a List Blobs inventory, erase it through the strict eraser and verify that no copy remains.
 

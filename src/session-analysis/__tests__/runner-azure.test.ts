@@ -218,11 +218,16 @@ describe("the Azure store never follows a redirect (Shared Key requests are not 
     const { deps } = runnerAzureAnalysisDeps(env, analysisRunnerConfig(env), runnerSecrets(env), { pool: fakeDb, fetcher: fake.fetch });
     const key = "fxroot/fx-org/v1/normalized/session-analysis-v2/fx-job.json";
     expect((await deps.store.put(key as never, new TextEncoder().encode("{}"), { ifNoneMatch: true })).created).toBe(true);
-    for (const method of ["PUT", "GET"]) {
-      fake.hook = (req) => (req.method === method ? new Response(null, { status: 307, headers: { location: "https://fx-elsewhere.invalid/x" } }) : undefined);
-      const op = method === "PUT"
-        ? deps.store.put(`${key}.2` as never, new TextEncoder().encode("{}"), { ifNoneMatch: true })
-        : deps.store.getObject(key as never);
+    const ops: Record<string, () => Promise<unknown>> = {
+      put: () => deps.store.put(`${key}.2` as never, new TextEncoder().encode("{}"), { ifNoneMatch: true }),
+      get: () => deps.store.getObject(key as never),
+      head: () => deps.store.head(key as never),
+      list: () => deps.store.list("fxroot/fx-org" as never),
+    };
+    const methodOf: Record<string, string> = { put: "PUT", get: "GET", head: "HEAD", list: "GET" };
+    for (const [method, run] of Object.entries(ops)) {
+      fake.hook = (req) => (req.method === methodOf[method] ? new Response(null, { status: 307, headers: { location: "https://fx-elsewhere.invalid/x" } }) : undefined);
+      const op = run();
       const error = await op.then(() => null, (e) => e);
       expect([method, (error?.cause as { code?: string })?.code]).toEqual([method, "azure_redirect"]);
       // A misconfigured endpoint is not transient: the job fails without burning retries.

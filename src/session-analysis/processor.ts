@@ -193,7 +193,6 @@ export interface AnalysisJobStore {
 /** relayhistory repository.ts: the analysis lease. */
 export const ANALYSIS_LEASE_SECONDS = 600;
 
-/** A controlled failure code and whether it is retried (relayhistory runSessionJob). */
 /** True when `code` is the error's own code or that of any cause in its chain (bounded). */
 function causedBy(error: unknown, code: string): boolean {
   let e: unknown = error;
@@ -204,6 +203,7 @@ function causedBy(error: unknown, code: string): boolean {
   return false;
 }
 
+/** A controlled failure code and whether it is retried (relayhistory runSessionJob). */
 export function classifyAnalysisFailure(error: unknown): { code: string; retryable: boolean } {
   // A store that answered a redirect (the Azure store never follows one: azure-blob-erasure/eraser.ts
   // azureNoRedirectFetch) is misconfigured, not transient: retrying would only burn attempts.
