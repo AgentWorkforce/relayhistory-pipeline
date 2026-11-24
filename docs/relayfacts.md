@@ -190,6 +190,49 @@ Out of scope, as follow-ups:
 - A Desktop or Cloud view (relayhistory-cloud).
 - A workspace-level delete of records and evidence (this repository).
 
+## Self-host read side
+
+The read side can be on without any writer. Until something writes rows, every enabled workspace answers 200 with an empty list.
+
+To turn it on (each step that touches a real database or a deployment still needs Khaliq's own OK, see Activation):
+
+1. Migration `20261105062080` is applied. It grants EXECUTE on `relayfacts_topics_v1` and `relayfacts_list_v1` to `bulls96_read_api`, the read API's existing login. No new role is needed for reads.
+2. The edge routes `GET /v1/relayfacts` (exact) and `/v1/relayfacts/*` (prefix) to session-read-api (`docs/selfhost-composition.md` section 2, rule 3; `deploy/selfhost-local/nginx.conf`). Without them the edge answers its own 404.
+3. Set `READ_API_RELAYFACTS_ENABLED=true` on session-read-api and restart it. Only exactly `true` turns it on. Any other value (`TRUE`, `1`, `true ` with a space) leaves it off and does not fail startup, so check the answer below after a restart.
+4. Make sure the workspace is in `READ_API_DIRECTORY_WORKSPACES`. This is the shared canary allowlist (see Surfacing), so listing a workspace also opens the other canary routes for it.
+
+What each answer means (`src/session-read-api/relayfacts.ts`, `server.ts`, `app.ts`; tested through the self-host service in `src/session-read-api/__tests__/server-selfhost-reads.pglite.test.ts`):
+
+| Answer | Meaning | Operator action |
+|---|---|---|
+| 404 from the edge, not JSON from the read API | the router has no rule for the path | add the two rules above |
+| 503 `not_configured`, `Retry-After: 60` | the read API service is dormant (`RELAYHISTORY_SELFHOST_READ_API` is not on), so every route answers this | configure the read API first |
+| 405 `method_not_allowed` | not a GET | none; the routes are GET only |
+| 401 | no bearer, an invalid one, or a token for a different workspace than `?workspace=` | client side; nothing reads the database |
+| 501 `{"error":"relayfacts_disabled"}` | `READ_API_RELAYFACTS_ENABLED` is not exactly `true`. This is the normal answer while the feature is off, not a fault | set the flag if the read side should be on |
+| 501 `unsupported_by_backend`, reason `relayfacts_workspace_not_enabled` | the workspace is not in `READ_API_DIRECTORY_WORKSPACES` | add it only if it is cleared for every canary route |
+| 501 `unsupported_by_backend`, reason `org_scope` or `param_<name>` | no `workspace` parameter, or a parameter the route does not serve | client side |
+| 501 `unsupported_by_backend`, reason `relayfacts_not_migrated` | the read functions of `20261105062080` are not in this database | apply the migration (Khaliq's OK) |
+| 400 `bad_request` | a topic that is not lowercase letters, digits and dashes (at most 64), a `limit` outside 1..200, or a cursor this route did not issue | client side |
+| 200 `{"topics":[]}`, or a topic page with `records: 0` and "No decisions recorded." | everything is on and no rows exist for this workspace | none. Rows appear only once a writer runs (below) |
+| 200 with topics or records | rows written for this org and workspace only | none |
+| 503 `backend_unavailable` | a real backend fault: the database is unreachable, `bulls96_read_api` lacks EXECUTE on the read functions, the read-scope check refused the call, or a stored row did not parse | not a feature switch. Check the read API's log line (`reason: "unavailable"`), the grants of `20261105062080` and the database |
+
+What must run for rows to appear:
+
+- The session-analysis runner (`SERVICE=session-analysis`, `src/session-analysis/runner.ts`, `docs/session-analysis-runner.md`) with `SESSION_ANALYSIS_ENABLED=true`, `SUMMARY_DECISION_RECORDS_ENABLED=true`, a model key (`SESSION_ANALYSIS_OPENAI_API_KEY[_FILE]`; a key ending `-disabled` means no model, so no job is claimed), its database URL and its `SESSION_ANALYSIS_S3_*` store settings. It writes through `relayfacts_insert_v1` after each completed analysis job (`src/session-analysis/runtime-deps.ts`). Jobs come from analysis requests or from the claims scheduler, which needs its own gates and the `claims` control on (`docs/session-analysis-runner.md`).
+- The runner refuses `LOCKER_PROVIDER` `gcs`, `azure` and `fs`. On those stores no writer runs, so the read side stays at 200 with an empty list.
+- The runner needs a database login as `service_role` or the configured HoopDb runtime role (`docs/session-analysis-runner.md`, "Database role"). `relayfacts_insert_v1` is granted to `service_role`. The self-host role scripts (`deploy/selfhost-local/roles.sh`, `e2e/selfhost/roles.sh`) set passwords only for `bulls96_session_ingest`, `bulls96_read_api` and `search_consumer_runtime`. They create no login for the runner.
+
+Erase prerequisite: do not turn on the writer until an erase reaches these tables (see Retention). On self-host that is the operator per-session erase, and it calls `relayfacts_evidence_erase_session_v1` only when all of these hold on session-ingest:
+
+- `SESSION_ERASE_FENCE_ENFORCED=1` and `SESSION_ERASE_BYTES_ENABLED=1`. The relayfacts step is part of the bytes worker, which is not built otherwise (`src/session-erase/selfhost-runtime.ts`, `buildSelfhostEraseRuntime`).
+- `SUMMARY_DECISION_RECORDS_ENABLED=true` on session-ingest (`decisionRecordsErasePort`). Startup then also requires the erase function.
+- A versioned S3 Locker: `LOCKER_PROVIDER` unset or `s3`. Any other provider, gcs included, refuses the operator erase (`eraseStoreIdentity`).
+- Synchronous admission, direct desktop uploads off (`src/session-erase/flags.ts`), and not `INGEST_LEDGER=s3`, which refuses the bytes worker (`src/session-ingest/selfhost-config.ts`).
+
+The operator per-user erase job (`SERVICE=user-erase`) also reaches these tables. It does so only where `20261105062100` is applied and the job runs with `SUMMARY_DECISION_RECORDS_ENABLED=true`, its sessions-schema owner login and its S3 eraser settings (`docs/operator-user-erase.md`). No workspace-level delete reaches these tables. On a store where neither erase can run, keep the writer off. The read side alone stores nothing.
+
 ## Threat model
 
 | Threat | Mitigation |
@@ -205,7 +248,7 @@ Out of scope, as follow-ups:
 Each step needs Khaliq's own explicit OK; a relayed quote is not that OK, except as "Relayed approvals" in AGENTS.md describes.
 
 1. Apply migrations `20261105062080` and `20261105062090` (and, for hosted, `20261105062100`) with `.github/workflows/apply-session-schema.yml`: run it with mode `plan`, then with mode `apply` (environment `session-schema-production`), then confirm the sentinels.
-2. Set `SUMMARY_DECISION_RECORDS_ENABLED=true` on the ingest process that runs the operator erase, confirm it starts (startup requires the erase function), and only then turn on the extractor. On hosted, the extractor is the session-pipeline Lambda, and its switch is the sessions stack input `relayfacts` (`stacks/aws/session-pipeline.ts`). Turn it on only where an erase reaches these tables (see Retention): on hosted, only after `20261105062100` is applied and `SUMMARY_DECISION_RECORDS_ENABLED=true` is set on the operator user-erase job.
+2. Set `SUMMARY_DECISION_RECORDS_ENABLED=true` on the ingest process that runs the operator erase, confirm it starts (with `SESSION_ERASE_FENCE_ENFORCED=1`, startup requires the erase function), and only then turn on the extractor. On hosted, the extractor is the session-pipeline Lambda, and its switch is the sessions stack input `relayfacts` (`stacks/aws/session-pipeline.ts`). Turn the extractor on only where an erase actually reaches these tables. On hosted, that means after `20261105062100` is applied and `SUMMARY_DECISION_RECORDS_ENABLED=true` is set on the operator user-erase job. On self-host, it means the operator per-session erase runs its relayfacts step, which needs fence enforcement, the bytes worker and a versioned S3 Locker (see "Self-host read side", Erase prerequisite). On gcs, azure or fs that erase refuses to run, so keep the extractor off there.
 3. Set `READ_API_RELAYFACTS_ENABLED=true` on the read API, either through the read-API stack input `relayfacts` (`stacks/aws/session-read-api.ts`) or through the `relayfacts=on` input of `.github/workflows/deploy-session-read-worker.yml`. That input is not preserved from live, so repeat it on later dispatches. Then add the workspace to `READ_API_DIRECTORY_WORKSPACES`, the shared canary allowlist that `requireCanary(identity, "relayfacts")` checks (see Surfacing). That also enables the other directory routes for that workspace, so add only a workspace that is cleared for them too.
 
 Rollback: unset the flags, then run the rollback files if the tables must go, `20261105062100` first, then `20261105062090` (each rollback refuses while a later migration is applied). The `20261105062100` rollback also refuses while erasure fences exist, unless `relayfacts.rollback_drop_fences` is set to `true` in the same session (see Retention).
@@ -220,6 +263,7 @@ Rollback: unset the flags, then run the rollback files if the tables must go, `2
 4. Read API routes, behind `READ_API_RELAYFACTS_ENABLED`.
    Implemented: `src/session-read-api/relayfacts.ts`, registered once in `app.ts` and wired by the Lambda and self-host entries (`lambda.ts`) and the Cloudflare worker; tests in `src/session-read-api/__tests__/relayfacts.test.ts`, `facts-backends-wiring.test.ts` and the worker suite.
 5. Self-host composition rows and the runbook.
+   Implemented (read side only): the `/v1/relayfacts` and `/v1/relayfacts/*` edge rules in `deploy/selfhost-local/nginx.conf` and `docs/selfhost-composition.md` (routing rule 3 and the read API env row), the "Self-host read side" section above, and tests in `src/shared/__tests__/selfhost-local-compose.test.ts` and `src/session-read-api/__tests__/server-selfhost-reads.pglite.test.ts`. Not implemented: a self-host login for the session-analysis runner, and a writer or erase on gcs, azure or fs.
 6. Operator per-session erase (`20261105062090`), behind `SUMMARY_DECISION_RECORDS_ENABLED`.
    Implemented: the migration and rollback, the `relayfacts-erase` lane, `decisionRecords` in `src/session-erase/runtime.ts` and `selfhost-runtime.ts`; tests in `relayfacts.pglite.test.ts`, `runtime.test.ts` and `selfhost-runtime.test.ts`.
 7. Hosted operator per-user erase (`20261105062100`), behind `SUMMARY_DECISION_RECORDS_ENABLED` on the user-erase job.
