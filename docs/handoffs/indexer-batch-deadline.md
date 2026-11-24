@@ -78,3 +78,33 @@ missing), so the key or scope fails and its messages are redelivered. A timed-ou
 read becomes the retryable `chunk_unavailable` (`readChunkRecords` in
 `src/session-pipeline/search-index.ts`), which the search pass rethrows, so the scope fails
 the same way rather than being recorded as incomplete.
+
+## Pool timeouts
+
+Three variables, read once at Lambda init (`dbTimeoutsFromEnv` in
+`src/session-pipeline/lambda.ts`), each independent:
+
+| variable | pool option | effect when set |
+| --- | --- | --- |
+| `HOOPDB_STATEMENT_TIMEOUT_MS` | `statement_timeout` | connection default for every statement |
+| `HOOPDB_LOCK_TIMEOUT_MS` | `lock_timeout` | connection default for every lock wait |
+| `HOOPDB_ACQUIRE_TIMEOUT_MS` | `connectionTimeoutMillis` | how long a checkout waits for a client (queued on a full pool, or connecting) |
+
+Each takes the same grammar: unset or `""` is off (the default; the pool options are exactly
+as before), a decimal integer from `1000` to `299000` (milliseconds) is on, anything else fails
+init naming the variable, never the value. The stack renders them only from
+`transcriptStore.sessionPipeline.dbTimeouts: { statementTimeoutMs?, lockTimeoutMs?,
+acquireTimeoutMs? }` (at least one key, same bounds, unknown keys refused).
+
+The two server settings go in the pool options (`supabasePoolOptions`), which pg sends as
+startup parameters on every new connection. There is no extra statement per checkout, it
+covers `pool.query` as well as `transaction()`, and both settings are ones any role may set,
+so nothing needs a new privilege. Inside a transaction the existing `SET LOCAL` still wins:
+`transaction()` keeps its own 60 s `statement_timeout`, and the scope lock keeps its 30 s
+`lock_timeout`. A transaction without its own `SET LOCAL lock_timeout` (the search
+transaction) gets the connection default. A transaction-mode connection pooler in front of
+the database may refuse unknown startup parameters; check the connection path before turning
+these on.
+
+An acquire timeout rejects the checkout with pg-pool's "timeout exceeded when trying to
+connect"; the key or scope fails and its messages are redelivered.

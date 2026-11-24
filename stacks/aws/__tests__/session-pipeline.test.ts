@@ -7,6 +7,8 @@ import type { AwsInputs } from "../inputs.ts";
 import {
   BATCH_DEADLINE_MARGIN_MAX_MS,
   BATCH_DEADLINE_MARGIN_MIN_MS,
+  DB_TIMEOUT_MAX_MS,
+  DB_TIMEOUT_MIN_MS,
   DELIVERY_DELAY_SECONDS,
   FUNCTION_TIMEOUT_SECONDS,
   OBJECT_READ_TIMEOUT_MAX_MS,
@@ -27,6 +29,8 @@ import {
   sessionSecretPolicy,
 } from "../session-pipeline.ts";
 import {
+  DB_TIMEOUT_MAX_MS as FN_DB_TIMEOUT_MAX_MS,
+  DB_TIMEOUT_MIN_MS as FN_DB_TIMEOUT_MIN_MS,
   OBJECT_READ_TIMEOUT_MAX_MS as FN_OBJECT_READ_TIMEOUT_MAX_MS,
   OBJECT_READ_TIMEOUT_MIN_MS as FN_OBJECT_READ_TIMEOUT_MIN_MS,
   SEARCH_INDEX_BATCH_DEADLINE_MARGIN_MAX_MS,
@@ -683,5 +687,49 @@ describe("session pipeline: object read timeout", () => {
     const on = sessionPipelineFunctionProps({ ...i, p: { searchIndex: true, objectReadTimeout: { ms: 20_000 } } });
     expect({ ...on, env: undefined }).toEqual({ ...off, env: undefined });
     expect(on.env).toEqual({ ...off.env, SESSION_PIPELINE_OBJECT_READ_TIMEOUT_MS: "20000" });
+  });
+});
+
+describe("session pipeline: db timeouts", () => {
+  const refuse = (why: string): never => {
+    throw new Error(why);
+  };
+  const all = { statementTimeoutMs: 20_000, lockTimeoutMs: 5_000, acquireTimeoutMs: 10_000 };
+  it("absent renders nothing new; each key set renders only its own variable", () => {
+    const off = sessionPipelineEnv({ stage: STAGE, bucket: t.bucket, names: p, p: { searchIndex: true } });
+    for (const name of ["HOOPDB_STATEMENT_TIMEOUT_MS", "HOOPDB_LOCK_TIMEOUT_MS", "HOOPDB_ACQUIRE_TIMEOUT_MS"]) expect(Object.keys(off)).not.toContain(name);
+    const env = (dbTimeouts: object) => sessionPipelineEnv({ stage: STAGE, bucket: t.bucket, names: p, p: { searchIndex: true, dbTimeouts } });
+    expect(env({ statementTimeoutMs: 20_000 })).toEqual({ ...off, HOOPDB_STATEMENT_TIMEOUT_MS: "20000" });
+    expect(env({ lockTimeoutMs: 5_000 })).toEqual({ ...off, HOOPDB_LOCK_TIMEOUT_MS: "5000" });
+    expect(env({ acquireTimeoutMs: 10_000 })).toEqual({ ...off, HOOPDB_ACQUIRE_TIMEOUT_MS: "10000" });
+    expect(env(all)).toEqual({ ...off, HOOPDB_STATEMENT_TIMEOUT_MS: "20000", HOOPDB_LOCK_TIMEOUT_MS: "5000", HOOPDB_ACQUIRE_TIMEOUT_MS: "10000" });
+  });
+
+  it("the bounds are the function's own and stay below the function timeout", () => {
+    expect(DB_TIMEOUT_MIN_MS).toBe(FN_DB_TIMEOUT_MIN_MS);
+    expect(DB_TIMEOUT_MAX_MS).toBe(FN_DB_TIMEOUT_MAX_MS);
+    expect(DB_TIMEOUT_MAX_MS).toBeLessThan(FUNCTION_TIMEOUT_SECONDS * 1000);
+  });
+
+  it("validates the shape and the values strictly", () => {
+    const ok = (v: unknown) => assertSessionPipelineInputs(v, refuse);
+    expect(() => ok({ dbTimeouts: all })).not.toThrow();
+    for (const k of Object.keys(all)) {
+      for (const ms of [DB_TIMEOUT_MIN_MS, DB_TIMEOUT_MAX_MS]) expect(() => ok({ dbTimeouts: { [k]: ms } })).not.toThrow();
+      for (const ms of [-1, 0, 999, DB_TIMEOUT_MAX_MS + 1, 1.5, Number.NaN, Number.POSITIVE_INFINITY, "20000", null, undefined])
+        expect(() => ok({ dbTimeouts: { [k]: ms } })).toThrow(new RegExp(`dbTimeouts.${k} must be an integer from 1000 to 299000`));
+    }
+    expect(() => ok({ dbTimeouts: {} })).toThrow(/dbTimeouts must set at least one timeout/);
+    expect(() => ok({ dbTimeouts: { idleTimeoutMs: 1_000 } })).toThrow(/dbTimeouts.idleTimeoutMs is not a known setting/);
+    expect(() => ok({ dbTimeouts: { toString: 1_000 } })).toThrow(/dbTimeouts.toString is not a known setting/);
+    for (const bad of [20_000, true, null, [], "20000"]) expect(() => ok({ dbTimeouts: bad })).toThrow(/dbTimeouts must be a plain object/);
+  });
+
+  it("the function's resources and props are the same with them set, but the env", () => {
+    const i = { stage: STAGE, accountId: ACCOUNT, region: REGION, bucket: t.bucket, tags: () => ({}) };
+    const off = sessionPipelineFunctionProps({ ...i, p: { searchIndex: true } });
+    const on = sessionPipelineFunctionProps({ ...i, p: { searchIndex: true, dbTimeouts: all } });
+    expect({ ...on, env: undefined }).toEqual({ ...off, env: undefined });
+    expect(on.env).toEqual({ ...off.env, HOOPDB_STATEMENT_TIMEOUT_MS: "20000", HOOPDB_LOCK_TIMEOUT_MS: "5000", HOOPDB_ACQUIRE_TIMEOUT_MS: "10000" });
   });
 });

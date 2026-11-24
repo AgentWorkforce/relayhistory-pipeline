@@ -68,6 +68,15 @@ export interface SessionPipelineInputs {
    * SESSION_PIPELINE_OBJECT_READ_TIMEOUT_MS; a read past it fails as a transient error.
    */
   objectReadTimeout?: { ms: number };
+  /**
+   * Pool timeouts (src/session-pipeline/lambda.ts supabasePoolOptions). Absent: nothing is rendered
+   * and the pool is as before. Each key is optional (at least one), an integer from
+   * DB_TIMEOUT_MIN_MS to DB_TIMEOUT_MAX_MS, and renders one variable: statementTimeoutMs
+   * HOOPDB_STATEMENT_TIMEOUT_MS, lockTimeoutMs HOOPDB_LOCK_TIMEOUT_MS (connection defaults; a
+   * transaction's own SET LOCAL still wins), acquireTimeoutMs HOOPDB_ACQUIRE_TIMEOUT_MS (how long a
+   * checkout waits for a client).
+   */
+  dbTimeouts?: { statementTimeoutMs?: number; lockTimeoutMs?: number; acquireTimeoutMs?: number };
 }
 
 /**
@@ -120,6 +129,14 @@ export const BATCH_DEADLINE_MARGIN_MAX_MS = FUNCTION_TIMEOUT_SECONDS * 1000 - 1_
 /** objectReadTimeout.ms bounds: the same as the function's own check (src/session-pipeline/lambda.ts). */
 export const OBJECT_READ_TIMEOUT_MIN_MS = 1_000;
 export const OBJECT_READ_TIMEOUT_MAX_MS = FUNCTION_TIMEOUT_SECONDS * 1000 - 1_000;
+/** dbTimeouts bounds: the same as the function's own check (src/session-pipeline/lambda.ts). */
+export const DB_TIMEOUT_MIN_MS = 1_000;
+export const DB_TIMEOUT_MAX_MS = FUNCTION_TIMEOUT_SECONDS * 1000 - 1_000;
+const DB_TIMEOUT_ENV = {
+  statementTimeoutMs: "HOOPDB_STATEMENT_TIMEOUT_MS",
+  lockTimeoutMs: "HOOPDB_LOCK_TIMEOUT_MS",
+  acquireTimeoutMs: "HOOPDB_ACQUIRE_TIMEOUT_MS",
+} as const;
 
 export interface SessionPipelineNames {
   function: string;
@@ -153,7 +170,7 @@ export function assertSessionPipelineInputs(p: unknown, refuse: (why: string) =>
     refuse("transcriptStore.sessionPipeline must be a plain object");
   const v = p as Record<string, unknown>;
   for (const k of Object.keys(v))
-    if (k !== "searchIndex" && k !== "maxConcurrency" && k !== "reconcileMinutes" && k !== "briefs" && k !== "streamReconcile" && k !== "searchBatchDeadline" && k !== "objectReadTimeout") refuse(`transcriptStore.sessionPipeline.${k} is not a known setting`);
+    if (k !== "searchIndex" && k !== "maxConcurrency" && k !== "reconcileMinutes" && k !== "briefs" && k !== "streamReconcile" && k !== "searchBatchDeadline" && k !== "objectReadTimeout" && k !== "dbTimeouts") refuse(`transcriptStore.sessionPipeline.${k} is not a known setting`);
   if (v.searchIndex !== undefined && typeof v.searchIndex !== "boolean") refuse("transcriptStore.sessionPipeline.searchIndex must be a boolean");
   if (v.maxConcurrency !== undefined && !(Number.isInteger(v.maxConcurrency) && (v.maxConcurrency as number) >= 2 && (v.maxConcurrency as number) <= 10))
     refuse("transcriptStore.sessionPipeline.maxConcurrency must be an integer from 2 to 10");
@@ -196,6 +213,18 @@ export function assertSessionPipelineInputs(p: unknown, refuse: (why: string) =>
     for (const k of Object.keys(o)) if (k !== "ms") refuse(`transcriptStore.sessionPipeline.objectReadTimeout.${k} is not a known setting`);
     if (!(Number.isInteger(o.ms) && (o.ms as number) >= OBJECT_READ_TIMEOUT_MIN_MS && (o.ms as number) <= OBJECT_READ_TIMEOUT_MAX_MS))
       refuse(`transcriptStore.sessionPipeline.objectReadTimeout.ms must be an integer from ${OBJECT_READ_TIMEOUT_MIN_MS} to ${OBJECT_READ_TIMEOUT_MAX_MS}`);
+  }
+  if (v.dbTimeouts !== undefined) {
+    const d = v.dbTimeouts as Record<string, unknown> | null;
+    if (d === null || typeof d !== "object" || Array.isArray(d) || Object.getPrototypeOf(d) !== Object.prototype)
+      refuse("transcriptStore.sessionPipeline.dbTimeouts must be a plain object");
+    const keys = Object.keys(d);
+    if (keys.length === 0) refuse("transcriptStore.sessionPipeline.dbTimeouts must set at least one timeout");
+    for (const k of keys) {
+      if (!Object.hasOwn(DB_TIMEOUT_ENV, k)) refuse(`transcriptStore.sessionPipeline.dbTimeouts.${k} is not a known setting`);
+      if (!(Number.isInteger(d[k]) && (d[k] as number) >= DB_TIMEOUT_MIN_MS && (d[k] as number) <= DB_TIMEOUT_MAX_MS))
+        refuse(`transcriptStore.sessionPipeline.dbTimeouts.${k} must be an integer from ${DB_TIMEOUT_MIN_MS} to ${DB_TIMEOUT_MAX_MS}`);
+    }
   }
 }
 
@@ -329,6 +358,12 @@ export function sessionPipelineEnv(i: { stage: string; bucket: string; names: Se
     ...(i.p.searchBatchDeadline !== undefined ? { SEARCH_INDEX_BATCH_DEADLINE_MARGIN_MS: String(i.p.searchBatchDeadline.marginMs) } : {}),
     // Only when set: a stage without objectReadTimeout renders nothing new.
     ...(i.p.objectReadTimeout !== undefined ? { SESSION_PIPELINE_OBJECT_READ_TIMEOUT_MS: String(i.p.objectReadTimeout.ms) } : {}),
+    // Only the keys set: a stage without dbTimeouts renders nothing new.
+    ...Object.fromEntries(
+      (Object.keys(DB_TIMEOUT_ENV) as (keyof typeof DB_TIMEOUT_ENV)[])
+        .filter((k) => i.p.dbTimeouts?.[k] !== undefined)
+        .map((k) => [DB_TIMEOUT_ENV[k], String(i.p.dbTimeouts![k])]),
+    ),
     PIPELINE_FANOUT: "off",
     PIPELINE_RECONCILE_LOOKBACK_MINUTES: String(2 * (i.p.reconcileMinutes ?? 30)),
     HOOPDB_POOL_MAX: "4",

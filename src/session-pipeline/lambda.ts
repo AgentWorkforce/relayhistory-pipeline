@@ -103,6 +103,47 @@ export interface LambdaEnv {
    * transient object-store error (packages/object-store core.ts send). Absent: no deadline.
    */
   objectReadTimeoutMs?: number;
+  /**
+   * HOOPDB_STATEMENT_TIMEOUT_MS, HOOPDB_LOCK_TIMEOUT_MS, HOOPDB_ACQUIRE_TIMEOUT_MS (each default
+   * off): the pool's connection defaults for statement_timeout and lock_timeout, and how long a
+   * checkout may wait for a client (supabasePoolOptions). Absent: the pool is exactly as before.
+   */
+  dbTimeouts?: DbTimeouts;
+}
+
+/** Optional pool timeouts in ms; a missing key adds nothing to the pool options. */
+export interface DbTimeouts {
+  statementTimeoutMs?: number;
+  lockTimeoutMs?: number;
+  acquireTimeoutMs?: number;
+}
+
+/** HOOPDB_*_TIMEOUT_MS bounds (ms): at least one second, below the function's 300 s timeout. */
+export const DB_TIMEOUT_MIN_MS = 1_000;
+export const DB_TIMEOUT_MAX_MS = 299_000;
+
+const DB_TIMEOUT_VARS = {
+  statementTimeoutMs: "HOOPDB_STATEMENT_TIMEOUT_MS",
+  lockTimeoutMs: "HOOPDB_LOCK_TIMEOUT_MS",
+  acquireTimeoutMs: "HOOPDB_ACQUIRE_TIMEOUT_MS",
+} as const;
+
+/**
+ * The three HOOPDB_*_TIMEOUT_MS variables: each unset or "" is off; otherwise a decimal integer of
+ * milliseconds within the bounds above, else init fails naming the variable, never the value.
+ * Undefined when all three are off.
+ */
+export function dbTimeoutsFromEnv(env: Record<string, string | undefined>): DbTimeouts | undefined {
+  const out: DbTimeouts = {};
+  for (const [field, name] of Object.entries(DB_TIMEOUT_VARS) as [keyof DbTimeouts, string][]) {
+    const value = env[name];
+    if (value === undefined || value === "") continue;
+    const ms = /^[1-9][0-9]{0,8}$/.test(value) ? Number(value) : NaN;
+    if (!(ms >= DB_TIMEOUT_MIN_MS && ms <= DB_TIMEOUT_MAX_MS))
+      throw new Error(`session pipeline: ${name} must be an integer from ${DB_TIMEOUT_MIN_MS} to ${DB_TIMEOUT_MAX_MS}`);
+    out[field] = ms;
+  }
+  return Object.keys(out).length ? out : undefined;
 }
 
 /** SEARCH_INDEX_BATCH_DEADLINE_MARGIN_MS bounds (ms): at least one second, below the function's 300 s timeout. */
@@ -176,6 +217,7 @@ export function lambdaEnv(env: NodeJS.ProcessEnv = process.env): LambdaEnv {
   const pointerSkipOriginBucket = pointerSkipOriginBucketFromEnv(env);
   const searchBatchDeadlineMarginMs = batchDeadlineMarginFromEnv(env);
   const objectReadTimeoutMs = objectReadTimeoutFromEnv(env);
+  const dbTimeouts = dbTimeoutsFromEnv(env);
   return {
     region: need("AWS_REGION"),
     bucket: need("PIPELINE_RAW_S3_BUCKET"),
@@ -192,6 +234,7 @@ export function lambdaEnv(env: NodeJS.ProcessEnv = process.env): LambdaEnv {
     ...(pointerSkipOriginBucket ? { pointerSkipOriginBucketEnabled: true as const } : {}),
     ...(searchBatchDeadlineMarginMs !== undefined ? { searchBatchDeadlineMarginMs } : {}),
     ...(objectReadTimeoutMs !== undefined ? { objectReadTimeoutMs } : {}),
+    ...(dbTimeouts !== undefined ? { dbTimeouts } : {}),
   };
 }
 
@@ -234,19 +277,35 @@ export function parseSecret(text: string): PipelineSecret {
 }
 
 /**
- * A pg pool that verifies Supabase's certificate against the pinned root. The
- * URL's own ssl parameters are dropped so they cannot weaken that.
+ * The pool's options. The URL's own ssl parameters are dropped so they cannot weaken the pinned
+ * root. Optional timeouts (all off by default; off adds no key):
+ * - statementTimeoutMs, lockTimeoutMs: pg's `statement_timeout` / `lock_timeout` client options,
+ *   which pg sends as startup parameters when each connection opens, so every connection
+ *   (pool.query and checked-out clients alike) starts with them as its session defaults, with no
+ *   extra statement and no privilege beyond setting one's own session parameters. A SET LOCAL
+ *   inside a transaction (transaction() below, the scope lock) overrides them for that
+ *   transaction only.
+ * - acquireTimeoutMs: pg-pool's `connectionTimeoutMillis`: a checkout waiting for a free client,
+ *   or for a new connection to open, fails after it ("timeout exceeded when trying to connect").
  */
-export function supabasePool(url: string, max: number): HoopDb {
+export function supabasePoolOptions(url: string, max: number, timeouts: DbTimeouts = {}): pg.PoolConfig {
   const parsed = new URL(url);
   for (const k of ["sslmode", "sslrootcert", "sslcert", "sslkey", "ssl"]) parsed.searchParams.delete(k);
-  const pool = new pg.Pool({
+  return {
     connectionString: parsed.toString(),
     max,
     application_name: "96bulls-session-pipeline",
     ssl: { ca: SUPABASE_PROD_CA_2021, rejectUnauthorized: true },
     idleTimeoutMillis: 60_000,
-  });
+    ...(timeouts.statementTimeoutMs !== undefined ? { statement_timeout: timeouts.statementTimeoutMs } : {}),
+    ...(timeouts.lockTimeoutMs !== undefined ? { lock_timeout: timeouts.lockTimeoutMs } : {}),
+    ...(timeouts.acquireTimeoutMs !== undefined ? { connectionTimeoutMillis: timeouts.acquireTimeoutMs } : {}),
+  };
+}
+
+/** A pg pool that verifies Supabase's certificate against the pinned root (supabasePoolOptions). */
+export function supabasePool(url: string, max: number, timeouts: DbTimeouts = {}): HoopDb {
+  const pool = new pg.Pool(supabasePoolOptions(url, max, timeouts));
   pool.on("error", (err) => log.error("hoopdb pool error", { error_code: (err as { code?: string }).code ?? "pool_error" }));
   return {
     pool,
@@ -350,7 +409,8 @@ async function init(): Promise<Runtime> {
   });
   if (!SecretString) throw new Error("session pipeline secret has no value yet");
   const secret = parseSecret(SecretString);
-  const db = supabasePool(secret.hoopdb_url, env.dbPoolMax);
+  // Default off (HOOPDB_*_TIMEOUT_MS): no timeouts, the pool exactly as before.
+  const db = supabasePool(secret.hoopdb_url, env.dbPoolMax, env.dbTimeouts);
   const store = pipelineStore(env);
   const reader = objectStoreManifestReader(store, { provider: "s3", bucket: env.bucket });
   const bindings = { PIPELINE_ORG_FROM_PREFIX: "true", PIPELINE_KEY_PREFIX: env.keyPrefix };
