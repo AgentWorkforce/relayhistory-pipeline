@@ -140,3 +140,43 @@ chunk read (`readManifestRecords` / `streamManifestRecords` in
 which the search pass rethrows; the message then goes back to SQS like any other retryable
 failure. The deadline bounds one request; it does not bound a pass that makes many reads, which
 is what the batch deadline is for.
+
+## Main-pool timeouts
+
+`HOOPDB_STATEMENT_TIMEOUT_MS`, `HOOPDB_LOCK_TIMEOUT_MS`, `HOOPDB_ACQUIRE_TIMEOUT_MS`, each
+independent. The stack renders only the keys set in
+`transcriptStore.sessionPipeline.dbTimeouts: { statementTimeoutMs?, lockTimeoutMs?, acquireTimeoutMs? }`
+(at least one key; unknown keys refused).
+
+They apply to the function's main pool only (`runtimeFromSecret` passes them to `supabasePool`,
+whose options come from `supabasePoolOptions` in `lambda.ts`). TLS, the connection string, the
+other options and the other callers of `supabasePool` are unchanged, and `refuseEnvOptions` still
+runs first: the pool never sets node-pg's `options`, so a set `PGOPTIONS` is still refused.
+
+- `statementTimeoutMs`, `lockTimeoutMs` become node-pg's `statement_timeout` and `lock_timeout`
+  client options, which it sends as startup parameters when each connection opens. They are the
+  connection's defaults; a `SET LOCAL` inside a transaction wins for that transaction:
+
+  | where | statement_timeout | lock_timeout |
+  | --- | --- | --- |
+  | `pool.query` outside a transaction (pointer reads and writes, fan-out, reconcile) | the default | the default |
+  | `transaction()` (search transaction, every other caller) | 60 s (its own `SET LOCAL`) | the default |
+  | scope lock (`lock` in `runtimeFromSecret`) | 60 s | 30 s (its own) |
+  | publication transaction (`publication.transact`) | 5 s (its own) | 1 s (its own) |
+
+  So inside a transaction the statement default never applies (every `transaction()` sets 60 s),
+  and the lock default applies only where no `SET LOCAL lock_timeout` is sent.
+- `acquireTimeoutMs` is pg-pool's `connectionTimeoutMillis`, enforced in this process: a
+  checkout waiting for a free client, or for a new connection to open, fails after it with
+  `timeout exceeded when trying to connect`.
+
+**Poolers that drop startup parameters.** The code elsewhere notes that Supavisor drops startup
+options (`refuseEnvOptions`, `analysis-snapshot.ts`). If the main pool's URL goes through such a
+pooler, the statement and lock defaults are silently not applied; only `acquireTimeoutMs` (local
+to the process) still works. Before relying on them, read `SHOW statement_timeout` and
+`SHOW lock_timeout` on a connection from the real pool, through the real endpoint.
+
+Not covered (their own pools or clients, unchanged): the buffered-feed pool (its own login
+timeout profile), the analysis-cache read-only pool (`analysis-snapshot.ts`, its own `SET LOCAL`),
+the self-host consumer and its bootstrap, the output-facts bootstrap, the large-read main, the
+repair and restamp jobs, and the analysis runner.

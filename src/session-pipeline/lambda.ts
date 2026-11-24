@@ -184,7 +184,26 @@ export interface LambdaEnv {
    * call fails as a transient object-store error (packages/object-store core.ts send). Absent: no deadline.
    */
   objectReadTimeoutMs?: number;
+  /**
+   * HOOPDB_STATEMENT_TIMEOUT_MS, HOOPDB_LOCK_TIMEOUT_MS, HOOPDB_ACQUIRE_TIMEOUT_MS (each default
+   * off): the main pool's connection defaults for statement_timeout and lock_timeout, and how long
+   * a checkout may wait for a client (supabasePoolOptions). Absent: the pool is exactly as before.
+   */
+  dbTimeouts?: DbTimeouts;
 }
+
+/** Optional main-pool timeouts in ms; a missing key adds nothing to the pool options. */
+export interface DbTimeouts {
+  statementTimeoutMs?: number;
+  lockTimeoutMs?: number;
+  acquireTimeoutMs?: number;
+}
+
+const DB_TIMEOUT_VARS = {
+  statementTimeoutMs: "HOOPDB_STATEMENT_TIMEOUT_MS",
+  lockTimeoutMs: "HOOPDB_LOCK_TIMEOUT_MS",
+  acquireTimeoutMs: "HOOPDB_ACQUIRE_TIMEOUT_MS",
+} as const;
 
 /** Bounds (ms) shared by the opt-in millisecond knobs: at least one second, below the function's 300 s timeout. */
 export const MS_KNOB_MIN = 1_000;
@@ -207,6 +226,16 @@ export function batchDeadlineMarginFromEnv(env: Record<string, string | undefine
   const ms = msKnobFromEnv(env, "SEARCH_INDEX_BATCH_DEADLINE_MARGIN_MS");
   if (ms !== undefined && env.SEARCH_INDEX_ENABLED !== "1") throw new Error("session pipeline: SEARCH_INDEX_BATCH_DEADLINE_MARGIN_MS needs SEARCH_INDEX_ENABLED=1");
   return ms;
+}
+
+/** HOOPDB_*_TIMEOUT_MS: each the knob grammar above, independent of the others; undefined when all three are off. */
+export function dbTimeoutsFromEnv(env: Record<string, string | undefined>): DbTimeouts | undefined {
+  const out: DbTimeouts = {};
+  for (const [field, name] of Object.entries(DB_TIMEOUT_VARS) as [keyof DbTimeouts, string][]) {
+    const ms = msKnobFromEnv(env, name);
+    if (ms !== undefined) out[field] = ms;
+  }
+  return Object.keys(out).length ? out : undefined;
 }
 
 /** SESSION_PIPELINE_OBJECT_READ_TIMEOUT_MS: the knob grammar above; not tied to SEARCH_INDEX_ENABLED (the pointer stage and reconcile read objects too). */
@@ -287,6 +316,8 @@ export function lambdaEnv(env: NodeJS.ProcessEnv = process.env, composition?: Se
   const searchBatchDeadlineMarginMs = batchDeadlineMarginFromEnv(env);
   // SESSION_PIPELINE_OBJECT_READ_TIMEOUT_MS: strict grammar, default off.
   const objectReadTimeoutMs = objectReadTimeoutFromEnv(env);
+  // HOOPDB_*_TIMEOUT_MS: strict grammar, default off; only the main pool (runtimeFromSecret) reads them.
+  const dbTimeouts = dbTimeoutsFromEnv(env);
   return {
     searchBackend: selected.search,
     adapterEnv: Object.freeze(Object.fromEntries(Object.entries(env).filter(([key]) => key.startsWith("SEARCH_INDEX_") || ["PIPELINE_RUNTIME", "AWS_REGION", "READ_API_COMPLETE_SINCE"].includes(key)))),
@@ -320,6 +351,7 @@ export function lambdaEnv(env: NodeJS.ProcessEnv = process.env, composition?: Se
     ...(maximum === undefined ? {} : { readerMaxRuleset: maximum }),
     ...(searchBatchDeadlineMarginMs === undefined ? {} : { searchBatchDeadlineMarginMs }),
     ...(objectReadTimeoutMs === undefined ? {} : { objectReadTimeoutMs }),
+    ...(dbTimeouts === undefined ? {} : { dbTimeouts }),
   };
 }
 
@@ -414,15 +446,32 @@ export function refuseEnvOptions(env: NodeJS.ProcessEnv = process.env): void {
     throw new Error("pipeline consumer: refusing PGOPTIONS environment fallback (pool options are pinned)");
 }
 
-export function supabasePool(url: string, max: number, tls = postgresTlsOptions()): HoopDb {
-  refuseEnvOptions();
-  const pool = new pg.Pool({
+/**
+ * The pool's options. Optional timeouts (all off by default; off adds no key):
+ * - statementTimeoutMs, lockTimeoutMs: node-pg's `statement_timeout` / `lock_timeout` client
+ *   options, which it sends in the startup packet of each new connection (not through `options`,
+ *   which stays unset, so refuseEnvOptions still applies). A SET LOCAL inside a transaction
+ *   (transaction() below, the scope lock, the publication transaction) overrides them for that
+ *   transaction. A pooler that drops startup parameters drops these too (see the handoff doc).
+ * - acquireTimeoutMs: pg-pool's `connectionTimeoutMillis`, enforced in this process: a checkout
+ *   waiting for a free client, or for a new connection to open, fails after it.
+ */
+export function supabasePoolOptions(url: string, max: number, tls: ReturnType<typeof postgresTlsOptions>, timeouts: DbTimeouts = {}): pg.PoolConfig {
+  return {
     connectionString: postgresConnectionString(url),
     max,
     application_name: "96bulls-session-pipeline",
     ssl: tls,
     idleTimeoutMillis: 60_000,
-  });
+    ...(timeouts.statementTimeoutMs === undefined ? {} : { statement_timeout: timeouts.statementTimeoutMs }),
+    ...(timeouts.lockTimeoutMs === undefined ? {} : { lock_timeout: timeouts.lockTimeoutMs }),
+    ...(timeouts.acquireTimeoutMs === undefined ? {} : { connectionTimeoutMillis: timeouts.acquireTimeoutMs }),
+  };
+}
+
+export function supabasePool(url: string, max: number, tls = postgresTlsOptions(), timeouts: DbTimeouts = {}): HoopDb {
+  refuseEnvOptions();
+  const pool = new pg.Pool(supabasePoolOptions(url, max, tls, timeouts));
   pool.on("error", (err) => log.error("hoopdb pool error", { error_code: (err as { code?: string }).code ?? "pool_error" }));
   return {
     pool,
@@ -542,7 +591,8 @@ export function lambdaAnalysisDeps(env: Pick<LambdaEnv, "bucket" | "region" | "k
  */
 export function runtimeFromSecret(env: LambdaEnv, secretText: string, schemaGeneration: string, composition?: SearchComposition): Runtime {
   const secret = parseSecret(secretText);
-  const db = supabasePool(secret.hoopdb_url, env.dbPoolMax, env.postgresTls ?? postgresTlsOptions());
+  // Default off (HOOPDB_*_TIMEOUT_MS): no timeouts, the pool exactly as before. Main pool only.
+  const db = supabasePool(secret.hoopdb_url, env.dbPoolMax, env.postgresTls ?? postgresTlsOptions(), env.dbTimeouts ?? {});
   const store = pipelineStore(env);
   const reader = objectStoreManifestReader(store, { provider: "s3", bucket: env.bucket });
   const bindings = { PIPELINE_ORG_FROM_PREFIX: "true", PIPELINE_KEY_PREFIX: env.keyPrefix };

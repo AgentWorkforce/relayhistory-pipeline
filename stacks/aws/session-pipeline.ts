@@ -133,6 +133,15 @@ export interface SessionPipelineInputs {
    * it fails as a transient error. Not tied to `searchIndex`.
    */
   objectReadTimeout?: { ms: number };
+  /**
+   * Main-pool timeouts (src/session-pipeline/lambda.ts supabasePoolOptions). Absent: nothing is
+   * rendered and the pool is as before. Each key is optional (at least one), an integer from
+   * MS_INPUT_MIN to MS_INPUT_MAX, and renders one variable: statementTimeoutMs
+   * HOOPDB_STATEMENT_TIMEOUT_MS, lockTimeoutMs HOOPDB_LOCK_TIMEOUT_MS (connection defaults; a
+   * transaction's own SET LOCAL still wins), acquireTimeoutMs HOOPDB_ACQUIRE_TIMEOUT_MS (how long a
+   * checkout waits for a client).
+   */
+  dbTimeouts?: { statementTimeoutMs?: number; lockTimeoutMs?: number; acquireTimeoutMs?: number };
   /** Default off. `true` is refused until the reviewed normalized-prefix PutObject/KMS grant and publication migration exist. */
   replayPages?: boolean;
   /** Dormant full v1 analysis-cache worker; separate readonly source secret required. */
@@ -345,6 +354,13 @@ export const MS_INPUT_MIN = 1_000;
 export const MS_INPUT_MAX = FUNCTION_TIMEOUT_SECONDS * 1000 - 1_000;
 
 /** A plain object of millisecond integers within MS_INPUT_MIN..MS_INPUT_MAX: unknown keys refused, `required` keys present. */
+/** dbTimeouts key to the variable it renders (read by src/session-pipeline/lambda.ts dbTimeoutsFromEnv). */
+const DB_TIMEOUT_ENV = {
+  statementTimeoutMs: "HOOPDB_STATEMENT_TIMEOUT_MS",
+  lockTimeoutMs: "HOOPDB_LOCK_TIMEOUT_MS",
+  acquireTimeoutMs: "HOOPDB_ACQUIRE_TIMEOUT_MS",
+} as const;
+
 function assertMsInputs(value: unknown, path: string, keys: readonly string[], required: readonly string[], refuse: (why: string) => never): void {
   if (value === null || typeof value !== "object" || Array.isArray(value) || Object.getPrototypeOf(value) !== Object.prototype)
     refuse(`transcriptStore.sessionPipeline.${path} must be a plain object`);
@@ -362,7 +378,7 @@ export function assertSessionPipelineInputs(p: unknown, refuse: (why: string) =>
     refuse("transcriptStore.sessionPipeline must be a plain object");
   const v = p as Record<string, unknown>;
   for (const k of Object.keys(v))
-    if (k !== "searchIndex" && k !== "replayPages" && k!=="analysisCache" && k !== "legacyReadSource" && k !== "desktopCatalog" && k !== "maxConcurrency" && k !== "reconcileMinutes" && k !== "briefs" && k !== "semanticCopy" && k !== "analysisJobs" && k !== "bufferedSearchFeed" && k !== "bufferedErasureDelete" && k !== "neonExit" && k !== "relayfacts" && k !== "schedules" && k !== "streamReconcile" && k !== "summaryRegen" && k !== "skipCurrent" && k !== "searchPreRead" && k !== "pointerPreRead" && k !== "pointerSkipOriginBucket" && k !== "searchBatchDeadline" && k !== "objectReadTimeout") refuse(`transcriptStore.sessionPipeline.${k} is not a known setting`);
+    if (k !== "searchIndex" && k !== "replayPages" && k!=="analysisCache" && k !== "legacyReadSource" && k !== "desktopCatalog" && k !== "maxConcurrency" && k !== "reconcileMinutes" && k !== "briefs" && k !== "semanticCopy" && k !== "analysisJobs" && k !== "bufferedSearchFeed" && k !== "bufferedErasureDelete" && k !== "neonExit" && k !== "relayfacts" && k !== "schedules" && k !== "streamReconcile" && k !== "summaryRegen" && k !== "skipCurrent" && k !== "searchPreRead" && k !== "pointerPreRead" && k !== "pointerSkipOriginBucket" && k !== "searchBatchDeadline" && k !== "objectReadTimeout" && k !== "dbTimeouts") refuse(`transcriptStore.sessionPipeline.${k} is not a known setting`);
   if (v.searchIndex !== undefined && typeof v.searchIndex !== "boolean") refuse("transcriptStore.sessionPipeline.searchIndex must be a boolean");
   if (v.replayPages !== undefined && typeof v.replayPages !== "boolean") refuse("transcriptStore.sessionPipeline.replayPages must be a boolean");
   if(v.analysisCache!==undefined&&typeof v.analysisCache!=="boolean")refuse("transcriptStore.sessionPipeline.analysisCache must be a boolean");
@@ -464,6 +480,10 @@ export function assertSessionPipelineInputs(p: unknown, refuse: (why: string) =>
     if (v.searchIndex !== true) refuse("transcriptStore.sessionPipeline.searchBatchDeadline requires searchIndex: true");
   }
   if (v.objectReadTimeout !== undefined) assertMsInputs(v.objectReadTimeout, "objectReadTimeout", ["ms"], ["ms"], refuse);
+  if (v.dbTimeouts !== undefined) {
+    assertMsInputs(v.dbTimeouts, "dbTimeouts", Object.keys(DB_TIMEOUT_ENV), [], refuse);
+    if (Object.keys(v.dbTimeouts as object).length === 0) refuse("transcriptStore.sessionPipeline.dbTimeouts must set at least one timeout");
+  }
   if (v.briefs !== undefined) {
     const b = v.briefs as Record<string, unknown> | null;
     if (b === null || typeof b !== "object" || Array.isArray(b) || Object.getPrototypeOf(b) !== Object.prototype)
@@ -761,6 +781,12 @@ export function sessionPipelineEnv(i: { stage: string; bucket: string; names: Se
     ...(i.p.searchBatchDeadline !== undefined ? { SEARCH_INDEX_BATCH_DEADLINE_MARGIN_MS: String(i.p.searchBatchDeadline.marginMs) } : {}),
     // Only when set: a stage without objectReadTimeout renders nothing new.
     ...(i.p.objectReadTimeout !== undefined ? { SESSION_PIPELINE_OBJECT_READ_TIMEOUT_MS: String(i.p.objectReadTimeout.ms) } : {}),
+    // Only the keys set: a stage without dbTimeouts renders nothing new.
+    ...Object.fromEntries(
+      (Object.keys(DB_TIMEOUT_ENV) as (keyof typeof DB_TIMEOUT_ENV)[])
+        .filter((k) => i.p.dbTimeouts?.[k] !== undefined)
+        .map((k) => [DB_TIMEOUT_ENV[k], String(i.p.dbTimeouts![k])]),
+    ),
     PIPELINE_FANOUT: "off",
     PIPELINE_RECONCILE_LOOKBACK_MINUTES: String(2 * (i.p.reconcileMinutes ?? 30)),
     HOOPDB_POOL_MAX: "4",

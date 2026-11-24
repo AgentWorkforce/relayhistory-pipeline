@@ -1335,3 +1335,47 @@ describe("session pipeline: object read timeout", () => {
     expect(on.env).toEqual({ ...off.env, SESSION_PIPELINE_OBJECT_READ_TIMEOUT_MS: "20000" });
   });
 });
+
+describe("session pipeline: db timeouts", () => {
+  const refuse = (why: string): never => {
+    throw new Error(why);
+  };
+  const envOf = (cfg: SessionPipelineInputs) => sessionPipelineEnv({ stage: STAGE, bucket: t.bucket, names: p, p: cfg });
+  const VARS = { statementTimeoutMs: "HOOPDB_STATEMENT_TIMEOUT_MS", lockTimeoutMs: "HOOPDB_LOCK_TIMEOUT_MS", acquireTimeoutMs: "HOOPDB_ACQUIRE_TIMEOUT_MS" } as const;
+
+  it("absent renders nothing new; each key renders exactly its own variable, which the function reads back", () => {
+    for (const searchIndex of [false, true]) {
+      const off = envOf({ searchIndex });
+      for (const name of Object.values(VARS)) expect(Object.keys(off)).not.toContain(name);
+      for (const [k, name] of Object.entries(VARS)) {
+        const on = envOf({ searchIndex, dbTimeouts: { [k]: 20_000 } });
+        expect(on).toEqual({ ...off, [name]: "20000" });
+        expect(lambdaEnv({ AWS_REGION: REGION, ...on }).dbTimeouts).toEqual({ [k]: 20_000 });
+      }
+      const all = envOf({ searchIndex, dbTimeouts: { statementTimeoutMs: 20_000, lockTimeoutMs: 5_000, acquireTimeoutMs: 10_000 } });
+      expect(all).toEqual({ ...off, HOOPDB_STATEMENT_TIMEOUT_MS: "20000", HOOPDB_LOCK_TIMEOUT_MS: "5000", HOOPDB_ACQUIRE_TIMEOUT_MS: "10000" });
+      expect(lambdaEnv({ AWS_REGION: REGION, ...all }).dbTimeouts).toEqual({ statementTimeoutMs: 20_000, lockTimeoutMs: 5_000, acquireTimeoutMs: 10_000 });
+    }
+  });
+
+  it("validates the shape and every value strictly; at least one key; needs no searchIndex", () => {
+    const ok = (v: unknown) => assertSessionPipelineInputs(v, refuse);
+    for (const k of Object.keys(VARS)) {
+      for (const ms of [MS_INPUT_MIN, 20_000, MS_INPUT_MAX]) expect(() => ok({ dbTimeouts: { [k]: ms } })).not.toThrow();
+      for (const ms of [-1, 0, 999, MS_INPUT_MAX + 1, 1.5, Number.NaN, "20000", null])
+        expect(() => ok({ dbTimeouts: { [k]: ms } })).toThrow(new RegExp(`dbTimeouts\\.${k} must be an integer from 1000 to 299000`));
+    }
+    expect(() => ok({ dbTimeouts: {} })).toThrow(/dbTimeouts must set at least one timeout/);
+    expect(() => ok({ dbTimeouts: { statementTimeoutMs: 20_000, idleTimeoutMs: 1_000 } })).toThrow(/dbTimeouts\.idleTimeoutMs is not a known setting/);
+    for (const bad of [20_000, true, null, [], "20000"]) expect(() => ok({ dbTimeouts: bad })).toThrow(/dbTimeouts must be a plain object/);
+  });
+
+  it("the function's resources and props are the same with it set, but the env", () => {
+    const i = { stage: STAGE, accountId: ACCOUNT, region: REGION, bucket: t.bucket, tags: () => ({}) };
+    const off = sessionPipelineFunctionProps({ ...i, p: { searchIndex: true } });
+    const on = sessionPipelineFunctionProps({ ...i, p: { searchIndex: true, dbTimeouts: { lockTimeoutMs: 5_000 } } });
+    const plain = (x: typeof on) => ({ ...x, env: undefined, build: { ...x.build, plugins: x.build.plugins.map((pl) => pl.name) } });
+    expect(plain(on)).toEqual(plain(off));
+    expect(on.env).toEqual({ ...off.env, HOOPDB_LOCK_TIMEOUT_MS: "5000" });
+  });
+});
