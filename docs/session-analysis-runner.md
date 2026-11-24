@@ -236,7 +236,8 @@ meets one fails as `analysis_store_redirect`, non-retryable, rather than burning
 
 On `LOCKER_PROVIDER=azure` the read API builds its analysis store with **the runner's own settings parser**
 (`src/shared/azure-blob-settings.ts`: `SESSION_ANALYSIS_AZURE_ACCOUNT`, `_CONTAINER`, optional `_ENDPOINT`, and
-`_ACCOUNT_KEY_FILE`). It uses Shared Key and never follows a redirect. `READ_API_ANALYSIS_BUCKET` switches analysis on,
+`_ACCOUNT_KEY_FILE`), so the account, container, endpoint and key rules are the runner's. The read API never reads
+`SESSION_ANALYSIS_S3_*`, so unlike the runner it does not refuse them. It uses Shared Key and never follows a redirect. `READ_API_ANALYSIS_BUCKET` switches analysis on,
 exactly as on S3, and must name that same container. Admission (`POST`) uses the existing admission pool. Default
 off: with `READ_API_ANALYSIS_BUCKET` unset, the routes answer 501 `analysis_not_configured` as before.
 
@@ -250,6 +251,8 @@ because result keys are written create-only, one per job and digest. A later ver
 a re-put of identical bytes, which is served and is correct, or a write from outside the runner, which fails the
 digest check. A version with different bytes makes the result unavailable (503 `backend_unavailable`); its bytes
 are never served. What this does not give is a fallback to the owned version when someone else overwrites the key.
+A result read buffers the whole object before its digest check, without a size bound, as on S3; an oversized
+foreign object at a result key is read in full before it is refused (a bound belongs with S2c).
 **Version-pinned reads are slice S2c** (a migration exposing `result_version_id` in the read RPC, plus a versioned
 get on both stores). S2c needs a migration author and is listed as an unassigned follow-up.
 
