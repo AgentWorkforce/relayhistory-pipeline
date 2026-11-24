@@ -432,6 +432,25 @@ describe("CLI options", () => {
     expect(staleprefixOptions(["--execute", "--once", "--loop", "--dry-run", "extra"], env())).toBeUndefined();
   });
 
+  test("wider near misses: misspellings that do not start with --stale or --max are refused, alone and with --execute", () => {
+    const dash = String.fromCharCode(0x2013);
+    const misses = [
+      "--stal-prefixes-only", "-stale-prefixes-only", "--Stale-prefixes-only", "--STALE-PREFIXES-ONLY", "--prefixes-only",
+      "stale-prefixes-only", "--stale-prefixes-only ", `${dash}stale-prefixes-only`, "-max", "--Max", "max=3",
+    ];
+    for (const m of misses) {
+      expect(code(() => staleprefixOptions([m], env()))).toBe("stale_prefix_mode_flag_refused");
+      expect(code(() => staleprefixOptions(["--execute", m], env()))).toBe("stale_prefix_mode_flag_refused");
+      expect(code(() => staleprefixOptions([m, "--execute"], env()))).toBe("stale_prefix_mode_flag_refused");
+    }
+    // Exact --max / --max= keep their own code (checked first).
+    expect(code(() => staleprefixOptions(["--execute", "--max", "3"], env()))).toBe("stale_prefix_max_without_mode");
+    expect(code(() => staleprefixOptions(["--max=3", "--Max"], env()))).toBe("stale_prefix_max_without_mode");
+    // Not a strict allowlist: unrelated arguments stay the default job's business.
+    for (const args of [[], ["--execute"], ["--once"], ["--execute", "--once", "--loop", "--dry-run", "extra"]])
+      expect(staleprefixOptions(args, env())).toBeUndefined();
+  });
+
   test("accepted forms", () => {
     expect(staleprefixOptions(["--stale-prefixes-only"], env())).toEqual({ execute: false });
     expect(staleprefixOptions(["--stale-prefixes-only", "--execute", "--once", "--max", "25"], env({ BABYSITTER_RETENTION_SWEEP: " OFF " }))).toEqual({ execute: true, max: 25 });
@@ -482,6 +501,8 @@ describe("CLI options", () => {
       [["--stale-prefixes-only=1"], {}, "stale_prefix_mode_flag_refused"],
       [["--maximum", "3"], {}, "stale_prefix_mode_flag_refused"],
       [["--max-count=3"], {}, "stale_prefix_mode_flag_refused"],
+      [["--execute", "--stal-prefixes-only"], {}, "stale_prefix_mode_flag_refused"],
+      [["--execute", "--prefixes-only"], {}, "stale_prefix_mode_flag_refused"],
     ] as [string[], Record<string, string>, string][]) {
       const r = await run(args, extra);
       expect(r.code).toBe(1);

@@ -37,7 +37,7 @@
  * current, date-moved copy of the same session has a live manifest. No sweep, no babysitter phase, nothing else in the
  * queue touched. Without --execute it reads only and reports. Refused with BABYSITTER_RETENTION_SWEEP set to anything
  * but off, with S3X_OBLIGATIONS on, with any flag other than --execute, --once (implied) and --max <n>; outside the mode
- * --max and any other --stale* / --max* argument (a misspelled switch) are refused. --execute refuses to start while
+ * --max and any argument resembling the switch or --max (a misspelled switch) are refused. --execute refuses to start while
  * another eraser process holds an unexpired lease; the mode never releases leases.
  */
 import type { Queryable } from "../relayhistory-export.ts";
@@ -69,18 +69,26 @@ export function legacyExportErasureEnabled(raw: string | undefined): boolean {
 
 const optionRefusal = (code: string, message: string) => Object.assign(new Error(message), { code });
 
+/** Default path only: an argument that could be a mistyped `--stale-prefixes-only` or `--max`. */
+function nearMissArgument(a: string): boolean {
+  const lower = a.toLowerCase();
+  return lower.includes("stale") || lower.includes("prefix") || lower.replace(/^-+/, "").startsWith("max");
+}
+
 /**
  * The stale-prefixes-only switch and its options, refused before any credential is read. `args` is argv after the
  * script. Undefined when the switch is absent (the default job, whose other flags are not changed by this parser).
  * The default job ignores unknown flags, so a misspelled switch next to --execute would run the FULL job (sweeps
- * included): without the exact switch, any argument starting with --stale or --max is refused here.
+ * included): without the exact switch, any argument that looks like the switch or like --max is refused here (its
+ * lower-cased text contains "stale" or "prefix", or after its leading dashes it starts with "max" in any case). Every
+ * other argument is left to the default job, which keeps ignoring what it does not use.
  */
 export function staleprefixOptions(args: readonly string[], e: (k: string) => string | undefined = (k) => process.env[k]): { execute: boolean; max?: number } | undefined {
   if (!args.includes("--stale-prefixes-only")) {
     if (args.some((a) => a === "--max" || a.startsWith("--max=")))
       throw optionRefusal("stale_prefix_max_without_mode", "--max applies only with --stale-prefixes-only");
-    if (args.some((a) => a.startsWith("--stale") || a.startsWith("--max")))
-      throw optionRefusal("stale_prefix_mode_flag_refused", "unrecognised --stale* / --max* argument: the only mode switch is exactly --stale-prefixes-only");
+    if (args.some(nearMissArgument))
+      throw optionRefusal("stale_prefix_mode_flag_refused", "an argument resembles the stale-prefix switch or --max but is not exactly --stale-prefixes-only: refused before the full job could run");
     return undefined;
   }
   let execute = false, max: number | undefined, seen = 0;

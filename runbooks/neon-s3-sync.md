@@ -166,6 +166,10 @@ kind `prefix` with reason `stale_prefix`.
 <credentials JSON> | bun run migration:neon-s3-erasure --stale-prefixes-only --execute [--max <n>]
 ```
 
+**Procedure.** Run the dry run first with the exact command. Confirm that its
+`start` log line carries `mode: "stale_prefixes_only"`; the full job's `start`
+line does not. Only then re-run the SAME command with `--execute` appended.
+
 **What it does**
 
 - Reads only the queued entries with kind `prefix` AND reason `stale_prefix`
@@ -236,11 +240,15 @@ The mode refuses to start in any of these cases:
 Without the switch:
 
 - `--max` is refused (`stale_prefix_max_without_mode`).
-- Any other argument starting with `--stale` or `--max` is refused
-  (`stale_prefix_mode_flag_refused`). This catches a misspelled switch such as
-  `--stale-prefix-only` or `--stale-prefixes-only=1`: the full job ignores
-  unknown flags, so with `--execute` it would otherwise run the full job,
-  sweeps included.
+- Any argument that resembles the switch or `--max` is refused
+  (`stale_prefix_mode_flag_refused`): its lower-cased text contains `stale` or
+  `prefix`, or, after its leading dashes, it starts with `max` in any case.
+  This catches a misspelled switch such as `--stal-prefixes-only`,
+  `--prefixes-only`, `-stale-prefixes-only`, `--STALE-PREFIXES-ONLY`, a
+  trailing space, a typographic dash in front, or `--stale-prefixes-only=1`:
+  the full job ignores unknown flags, so with `--execute` it would otherwise
+  run the full job, sweeps included. Other arguments are still ignored by the
+  full job as before.
 
 All of these refusals exit non-zero before stdin is read and before the state
 file is opened, except the lease refusal, which needs the state file and is
