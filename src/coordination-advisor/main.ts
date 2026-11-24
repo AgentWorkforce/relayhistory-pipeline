@@ -25,6 +25,18 @@ import { advisorTick, sqlAdvisorStore } from "./scan.ts";
 
 export const ADVISOR_SERVICE = "coordination-advisor";
 
+/**
+ * The advisor's runWorker shape. It claims no stage and never reads the Locker: its tick reads the
+ * session directory and the advisory tables in HoopDb and facts from ClickHouse or HoopDb, never
+ * raw objects. `ownLocker` therefore admits LOCKER_PROVIDER=fs|azure on self-host (worker.ts
+ * workerBindings); for s3, gcs and an unset provider the bindings are unchanged. Exported for tests.
+ */
+export const ADVISOR_WORKER: Pick<WorkerOptions, "service" | "stages" | "ownLocker"> = {
+  service: ADVISOR_SERVICE,
+  stages: [],
+  ownLocker: true,
+};
+
 export interface AdvisorIo {
   runWorker(opts: WorkerOptions): Promise<unknown>;
   /** Keeps a disabled process alive until SIGTERM/SIGINT. */
@@ -50,8 +62,7 @@ export async function advisorMain(env: Record<string, string | undefined>, io: A
   log.info(`coordination advisor enabled; workspaces=${cfg.workspaces === "*" ? "all" : cfg.workspaces.size}${cfg.incarnation ? "; writer=upsert_v2" : ""}`,
     { service: ADVISOR_SERVICE, state: cfg.relayDm.enabled ? "dm_on" : "dm_off", kind: cfg.factsBackend });
   await io.runWorker({
-    service: ADVISOR_SERVICE,
-    stages: [],
+    ...ADVISOR_WORKER,
     handlers: () => ({}),
     tick: advisorTick((db) => ({ store: sqlAdvisorStore(db, cfg.incarnation ? { incarnation: true } : {}), backend: backendFor(db), limits, sender, workspaces: cfg.workspaces,
       ...(cfg.conflicts ? { conflicts: true } : {}) }), { intervalMs: cfg.intervalMs }),
