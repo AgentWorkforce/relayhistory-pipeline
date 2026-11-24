@@ -8,6 +8,11 @@ import {
 } from "../burn-cost/session-cost.ts";
 
 const FX_SHA = "f".repeat(64);
+const FX_PRICING = {
+  sdkVersion: "5.0.0",
+  builtinPricingSha256: FX_SHA,
+  overrideSha256: null,
+};
 
 /** Fixed per-million tariffs; anything else is unpriced, like burn. */
 const FX_TARIFFS: Record<string, { input: number; output: number; cacheRead: number; cacheWrite: number }> = {
@@ -20,17 +25,21 @@ function fakePricer(seen: BurnUsagePriceRequest[][] = []): UsagePricer {
     seen.push(requests);
     return {
       schema: "burn.usage-prices.v1",
-      pricing: { builtinSnapshotSha256: FX_SHA, overrideApplied: false },
+      pricing: FX_PRICING,
       prices: requests.map(({ model, usage }) => {
         const tariff = FX_TARIFFS[model];
-        if (!tariff) return { model, priced: false, costUsdMicros: null };
+        if (!tariff) return { costKnown: false, costUsdMicros: null, breakdown: null };
         const usd =
           (usage.input * tariff.input +
             usage.output * tariff.output +
             usage.cacheRead * tariff.cacheRead +
             usage.cacheCreate5m * tariff.cacheWrite) /
           1_000_000;
-        return { model, priced: true, costUsdMicros: Math.round(usd * 1_000_000) };
+        return {
+          costKnown: true,
+          costUsdMicros: Math.round(usd * 1_000_000),
+          breakdown: { model, total: usd },
+        };
       }),
     };
   };
@@ -141,7 +150,8 @@ describe("priceSessionUsage", () => {
       },
       {
         model: "fx-model-a",
-        // grok is not a burn harness: no source, priced by model id.
+        // grok is not a burn harness: null source, priced by model id.
+        source: null,
         usage: { input: 1, output: 0, reasoning: 0, cacheRead: 0, cacheCreate5m: 8, cacheCreate1h: 0 },
         measured: true,
       },
@@ -157,8 +167,12 @@ describe("priceSessionUsage", () => {
   it("accepts bigint micros from the napi binding", async () => {
     const pricer: UsagePricer = async ({ requests }) => ({
       schema: "burn.usage-prices.v1",
-      pricing: { builtinSnapshotSha256: FX_SHA, overrideApplied: false },
-      prices: requests.map(({ model }) => ({ model, priced: true, costUsdMicros: 7n })),
+      pricing: FX_PRICING,
+      prices: requests.map(({ model }) => ({
+        costKnown: true,
+        costUsdMicros: 7n,
+        breakdown: { model, total: 0.000007 },
+      })),
     });
     const result = await priceSessionUsage([row()], pricer);
     expect(result.costUsdMicros).toBe(7);
@@ -167,7 +181,7 @@ describe("priceSessionUsage", () => {
   it("fails loudly when burn answers a different number of rows", async () => {
     const pricer: UsagePricer = async () => ({
       schema: "burn.usage-prices.v1",
-      pricing: { builtinSnapshotSha256: FX_SHA, overrideApplied: false },
+      pricing: FX_PRICING,
       prices: [],
     });
     await expect(priceSessionUsage([row()], pricer)).rejects.toThrow("burn priced 0 of 1");

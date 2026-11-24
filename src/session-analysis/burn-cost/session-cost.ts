@@ -32,22 +32,27 @@ export interface BurnUsageTokens {
 
 export interface BurnUsagePriceRequest {
   model: string;
-  source?: BurnSource;
+  /** Required by burn; null for a harness burn does not model. */
+  source: BurnSource | null;
   usage: BurnUsageTokens;
   aggregate?: boolean;
   measured?: boolean;
 }
 
 export interface BurnUsagePrice {
-  model: string;
-  priced: boolean;
+  costKnown: boolean;
   costUsdMicros: number | bigint | null;
+  breakdown: { model: string; total: number } | null;
 }
 
 /** `burn.usage-prices.v1` (relayburn-sdk price_usage.rs). */
 export interface BurnUsagePrices {
   schema: "burn.usage-prices.v1";
-  pricing: { builtinSnapshotSha256: string; overrideApplied: boolean };
+  pricing: {
+    sdkVersion: string;
+    builtinPricingSha256: string;
+    overrideSha256: string | null;
+  };
   prices: BurnUsagePrice[];
 }
 
@@ -87,8 +92,12 @@ export interface UsageEventRow {
 export interface SessionCostProvenance {
   engine: "burn";
   schema: "burn.usage-prices.v1";
+  /** relayburn-sdk version (code-level pricing rules). */
+  sdkVersion: string;
+  /** SHA-256 of burn's bundled pricing data. */
   pricingSnapshotSha256: string;
-  overrideApplied: boolean;
+  /** SHA-256 of an applied pricing override; null when none. */
+  overrideSha256: string | null;
   pricedRows: number;
   unpricedRows: number;
   unpricedModels: string[];
@@ -226,7 +235,7 @@ export async function priceSessionUsage(
     priced.push({ model: row.model, tokens });
     requests.push({
       model: row.model,
-      ...(source ? { source } : {}),
+      source: source ?? null,
       usage: tokens,
       measured: true,
     });
@@ -245,7 +254,7 @@ export async function priceSessionUsage(
   let pricedRows = 0;
   answer.prices.forEach((price, index) => {
     const model = priced[index]!.model;
-    const cost = price.priced ? micros(price.costUsdMicros) : null;
+    const cost = price.costKnown ? micros(price.costUsdMicros) : null;
     const group = byModel.get(model) ?? { rows: 0, costUsdMicros: 0 };
     group.rows += 1;
     if (cost === null) {
@@ -282,8 +291,9 @@ export async function priceSessionUsage(
     provenance: {
       engine: "burn",
       schema: answer.schema,
-      pricingSnapshotSha256: answer.pricing.builtinSnapshotSha256,
-      overrideApplied: answer.pricing.overrideApplied,
+      sdkVersion: answer.pricing.sdkVersion,
+      pricingSnapshotSha256: answer.pricing.builtinPricingSha256,
+      overrideSha256: answer.pricing.overrideSha256,
       pricedRows,
       unpricedRows: requests.length - pricedRows,
       unpricedModels: [...unpricedModels].sort(),

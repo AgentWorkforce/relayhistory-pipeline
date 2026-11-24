@@ -35,17 +35,17 @@ sessions-intel-lead (F1 contract consumers, workspace synthesis, spend attributi
 ```jsonc
 {
   "schema": "burn.usage-prices.v1",
-  "pricing": { "builtinSnapshotSha256": "<64 hex>", "overrideApplied": false },
+  "pricing": { "sdkVersion": "5.0.0", "builtinPricingSha256": "<64 hex>", "overrideSha256": null },
   "prices": [
-    { "model": "claude-sonnet-4-5", "priced": true, "costUsdMicros": 60000,
-      "breakdown": { "model": "...", "total": 0.06, "input": 0.03, "output": 0.03,
+    { "costKnown": true, "costUsdMicros": 60000,
+      "breakdown": { "model": "claude-sonnet-4-5", "total": 0.06, "input": 0.03, "output": 0.03,
                      "reasoning": 0, "cacheRead": 0, "cacheCreate": 0 } },
-    { "model": "fx-unknown", "priced": false, "costUsdMicros": null, "breakdown": null }
+    { "costKnown": false, "costUsdMicros": null, "breakdown": null }
   ]
 }
 ```
 
-Request: `{ model, source?: burn SourceKind, usage: { input, output, reasoning, cacheRead, cacheCreate5m, cacheCreate1h },
+Request (unknown fields are rejected): `{ model, source: burn SourceKind | null (required), usage: { input, output, reasoning, cacheRead, cacheCreate5m, cacheCreate1h },
 aggregate?: bool (base rates, no context tier), measured?: bool (all-zero usage is then $0 even for an unpriced model) }`.
 
 How the crate gets in (layered-sessions-pipeline's condition: this is its own step, not part of the POC):
@@ -63,7 +63,7 @@ How the crate gets in (layered-sessions-pipeline's condition: this is its own st
     exec per job.
 - The pricing snapshot is compiled into burn (`data/models.dev.json`, `include_str!`). That means **no models.dev
   network egress from the runner**. The table is refreshed by burn's weekly `update-pricing` workflow, and reaches the
-  pipeline only through a deliberate dependency bump. `builtinSnapshotSha256` records which table priced each session.
+  pipeline only through a deliberate dependency bump. `sdkVersion` + `builtinPricingSha256` (every bundled pricing data file) + `overrideSha256` record which table priced each session.
 - Unknown model → `costUsdMicros: null` → F1 `costUSD: null`.
 
 ## 2. Data mapping (pipeline row → burn request)
@@ -131,8 +131,9 @@ not added in the POC:
 metrics.cost?: {
   engine: "burn";
   schema: "burn.usage-prices.v1";
-  pricingSnapshotSha256: string;
-  overrideApplied: boolean;
+  sdkVersion: string;
+  pricingSnapshotSha256: string;           // burn builtinPricingSha256
+  overrideSha256: string | null;
   costUsdMicros: number | null;            // integer, mirrors costUSD
   reasoningTokens: number;
   cacheCreateTokens: number;
@@ -156,7 +157,7 @@ Review by sessions-intel-lead (2026-11-23):
   3. Whether this is an optional field or a schema bump is the F1 owner's call (layered-sessions-pipeline), not
      session-intel's.
 - Stage 1's spend block carries `engine` and `pricingSnapshotSha256` per sum, and counts sessions where
-  `overrideApplied` is set or `unpricedRows > 0`.
+  `overrideSha256` is non-null or `unpricedRows > 0`.
 - Session-intel's own `costUsdMicros` readers stay on History's column until after Phase A lands.
 
 ## 6. Overlap with existing cost fields
