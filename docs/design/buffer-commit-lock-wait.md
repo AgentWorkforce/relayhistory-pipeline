@@ -127,7 +127,12 @@ version's bindings and in the readback.
 
 - **Enable condition**: a refusal this option moves from 55P03 to 57014 stays a 503, and that 503
   carries no `Retry-After` (`src/session-ingest/app.ts` `failure`). The client then sees a timeout to
-  back off from as a transient failure, where it used to see a lock refusal with a `Retry-After`.
+  back off from as a transient failure. With `INGEST_BUFFER_LOCK_BUSY` on, it used to see a 429 lock
+  refusal with a `Retry-After`; without that flag the 55P03 was a 503 with no `Retry-After` too
+  (`app.ts` sets `Retry-After` only for the busy errors).
+- **Order**: turn on the buffer-stage timeout class (`INGEST_BUFFER_TIMEOUT_BUSY`,
+  `docs/design/buffer-commit-statement-budget.md`) before this option. This order is advice; nothing
+  enforces it.
 - **Turn on**: set the variable to a value in range, then plan and deploy. The plan adds one
   plain-text binding.
 - **Change**: set another value in range, then plan and deploy. The plan updates the binding, and the
