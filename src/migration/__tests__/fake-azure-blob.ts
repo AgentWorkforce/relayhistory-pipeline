@@ -137,6 +137,7 @@ export class FakeAzureBlob {
     if (method === "GET" && q.get("comp") === "list") return this.#list(q);
     if (method === "PUT") return this.#put(key, headers, init?.body as Uint8Array | undefined);
     if (method === "DELETE") return this.#delete(key, q, headers);
+    if (method === "GET" || method === "HEAD") return this.#read(key, method);
     return new Response(null, { status: 405 });
   }) as typeof fetch;
 
@@ -149,6 +150,16 @@ export class FakeAzureBlob {
     const header = this.#opts.versionHeader ? this.#opts.versionHeader(id) : id || null;
     if (header) h.set("x-ms-version-id", header);
     return new Response(null, { status: 201, headers: h });
+  }
+
+  /** Get Blob / Get Blob Properties of the current copy. */
+  #read(key: string, method: string): Response {
+    const r = this.records.find((x) => x.key === key && x.current && !x.deleted);
+    if (!r) return new Response(null, { status: 404 });
+    const h = new Headers({ etag: `"${r.etag}"`, "content-length": String(r.bytes.length), "last-modified": new Date(r.modified).toUTCString(),
+      "content-type": "application/json" });
+    if (r.kind === "version") h.set("x-ms-version-id", r.id);
+    return new Response(method === "HEAD" ? null : (r.bytes as Uint8Array<ArrayBuffer>), { status: 200, headers: h });
   }
 
   #delete(key: string, q: URLSearchParams, headers: Headers): Response {
