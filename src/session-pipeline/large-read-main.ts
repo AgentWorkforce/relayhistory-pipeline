@@ -20,7 +20,7 @@ export function largeReadRuntime(env:NodeJS.ProcessEnv):LargeReadRuntime{
  if(env.PIPELINE_RAW_S3_KMS_KEY_ID&&encryption!=="aws:kms")throw new Error("large worker invalid encryption key mode");
  const maximum=readerMaxRuleset(env); // Unset: legacy reads. Checked before a pool opens.
  const db=supabasePool(secret.hoopdb_url,4),store=createS3Store({bucket,region,credentials:async()=>lambdaCredentials(env),serverSideEncryption:encryption,sseKmsKeyId:env.PIPELINE_RAW_S3_KMS_KEY_ID});
- const deps:LargeReadDeps={db,search:{transact:work=>transaction(db,work),reader:objectStoreManifestReader(store,{provider:"s3",bucket}),store,ch:createClickHouseClient(secret.clickhouse),prefixFor:org=>`${prefix}/${org}`,readerMaxRuleset:maximum,
+ const deps:LargeReadDeps={db,search:{transact:work=>transaction(db,tx=>work(tx)),reader:objectStoreManifestReader(store,{provider:"s3",bucket}),store,ch:createClickHouseClient(secret.clickhouse),prefixFor:org=>`${prefix}/${org}`,readerMaxRuleset:maximum,
   // The same labels as the Lambda that hands it large scopes: a scope moving between them keeps one fingerprint.
   ...(messageOriginLabelsEnabled(env[MESSAGE_ORIGIN_LABELS_VAR])?{originLabels:true as const}:{})},replay:{db,store,provider:"s3",bucket,prefix:{PIPELINE_KEY_PREFIX:prefix,PIPELINE_ORG_FROM_PREFIX:"true"},readerMaxRuleset:maximum}};
  return {deps,close:()=>db.end()};

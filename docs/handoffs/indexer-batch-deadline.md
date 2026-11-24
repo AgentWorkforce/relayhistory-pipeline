@@ -180,3 +180,81 @@ Not covered (their own pools or clients, unchanged): the buffered-feed pool (its
 timeout profile), the analysis-cache read-only pool (`analysis-snapshot.ts`, its own `SET LOCAL`),
 the self-host consumer and its bootstrap, the output-facts bootstrap, the large-read main, the
 repair and restamp jobs, and the analysis runner.
+
+## Guarded transactions
+
+No knob: this one is always on for two transactions of the Lambda, and changes behaviour only
+when a connection drops.
+
+pg-pool removes a client's idle `error` listener when the client is checked out. If the
+connection then ends between two statements (no query in flight), pg emits `error` on the
+client with no listener, which crashes the process: every message of the batch is redelivered,
+not only the one whose connection dropped. The connection's advisory transaction locks go with
+it, so work that continues after the drop no longer holds the lock it was started under.
+
+`transaction()` (`src/session-pipeline/lambda.ts`) takes a third argument, `guarded`. Guarded,
+it adds an `error` listener to the checked-out client for that checkout only, and records the
+error. `ensureLive()`, which it hands to its work, throws the recorded error; so does every later
+statement on the transaction (no COMMIT or ROLLBACK is sent on a broken client). The client is
+then destroyed (`release(err)`), not returned to the pool, and the listener is removed before
+release, so the next checkout of a reused client starts with one listener, not two. The error
+fails that key or scope through the consumer like any other failure. With no `error` emitted,
+a guarded transaction sends the same statements and releases the client the same way
+(`release()`). Unguarded (the default), no listener is added and `ensureLive` never throws.
+
+### What is guarded
+
+Every `transaction()` caller and every holder of a pooled client, on main:
+
+| caller | guarded |
+| --- | --- |
+| scope lock (`scopeLock` in `lambda.ts`, the pointer stage's `lock`) | yes |
+| search transaction (`searchTransaction` in `lambda.ts`, the search stage's `transact`) | yes |
+| publication transaction (`publication.transact` in `runtimeFromSecret`) | no (runs inside the scope lock; its own `SET LOCAL` 5 s statement / 1 s lock timeouts, unchanged) |
+| analysis deps `transact` (`runtimeFromSecret`) | no |
+| self-host consumer (`consumer-service.ts`, its lock and search `transact`) | no |
+| large-read main (`large-read-main.ts`) | no |
+| analysis runner (`src/session-analysis/runner.ts`) | no |
+| move transaction (`moveTransaction` in `src/hoopdb/index.ts`) | no own listener; checked (below). Unreachable from the Lambda, which always sets `publication` |
+| other `pool.connect()` holders (buffered-feed login, analysis snapshot, brief claim, bootstraps, repair and restamp jobs, read API, migrate, eraser, smoke) | no |
+
+The unguarded callers that pass a work function now wrap it (`(tx) => work(tx)`), so their work
+receives exactly the argument it received before.
+
+### Checks under the lock
+
+`ScopeLock` (`src/session-pipeline/pointer.ts`) passes `ensureLive` to its work as an optional
+argument; a lock that passes none (the in-memory test lock, the self-host consumer's lock) runs
+the work exactly as before. The pointer stage threads it, per call (never stored on the shared
+index object), into `upsertRawPointer` (`UpsertOptions.ensureLive` in `src/hoopdb/index.ts`). With
+it, a check runs:
+
+- before every statement the pointer work sends on the main pool, reads included (the stored-row
+  read, the upsert and its reads, the tombstone, the rekey);
+- before every statement in the publication transaction, before its BEGIN and before its COMMIT;
+- before every statement of the move transaction, before its BEGIN and before its COMMIT;
+- before each fan-out queue send and before the brief wakeup is armed.
+
+The search pass (`indexSearchScopeBase` in `src/session-pipeline/search-index.ts`) wraps its index
+calls and its ClickHouse facts calls with `checkedCalls`: the check runs before each call. Its
+statements on the transaction itself are checked by `transaction()`.
+
+### Not covered
+
+- A statement already in flight when the connection drops: it completes or fails on its own.
+- A drop pg has not reported (no `error` emitted yet): the check passes.
+- Work inside one checked call: the pages of one index scan call, and the delete batches inside
+  the vendored `deleteRows` (one `remove` call), run without a check between them.
+- The manifest read of the pointer stage is not interrupted; with
+  `SESSION_PIPELINE_OBJECT_READ_TIMEOUT_MS` unset it has no deadline at all.
+- The pre-read capture's index scan (`captureSearchPreRead`, outside the guarded transaction), the
+  skip check's ClickHouse read (`alreadyCurrent`), and the staged run (outside the transaction, in
+  its own batches).
+- The move transaction's own ROLLBACK after a failed check is still sent (cleanup on its own
+  connection).
+- Timeouts: the checks neither shorten nor extend any timeout (the lock's 30 s `lock_timeout`,
+  the 60 s statement timeout, the publication transaction's 5 s / 1 s). A pass still running when
+  the function times out is cut by the timeout, not by a check. A batch-deadline margin near the
+  upper bound (`299000`) still leaves no start window (above); a margin that is too small still
+  lets a pass run into the function timeout.
+- Every unguarded caller in the table above.

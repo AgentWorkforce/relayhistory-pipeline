@@ -75,7 +75,7 @@ import { awsJsonCall, invokeAsync, lambdaCredentials } from "./aws-json.ts";
 import { createClickHouseClient } from "./vendor/search-index/clickhouse.ts";
 import { processBatch, type BatchResponse, type ConsumerDeps, type QueueRecord } from "./consumer.ts";
 import { droppedFanout, scopeLockKey, type ScopeLock } from "./pointer.ts";
-import { searchIndexLimits, searchIndexStreamChFromEnv, type SearchIndexStreamCh } from "./search-index.ts";
+import { searchIndexLimits, searchIndexStreamChFromEnv, type SearchIndexStreamCh, type Transact as SearchTransact } from "./search-index.ts";
 import { BufferedFeedError, bufferedFeedConfig, bufferedFeedGateRefusal, bufferedFeedVersionRefusal, clickhouseTieLedger, runBufferedFeed, sqlBufferedFeedSource, type BufferedFeedConfig } from "./buffered-search-feed.ts";
 import { bufferedErasureConfig, runBufferedErasureDelete, type BufferedErasureConfig, type BufferedErasureDeps } from "./buffered-erasure-delete.ts";
 import { RECONCILE_BODY_KEY, requeueBody } from "./s3-events.ts";
@@ -483,25 +483,90 @@ export function supabasePool(url: string, max: number, tls = postgresTlsOptions(
   };
 }
 
-export async function transaction<T>(db: HoopDb, work: (tx: SqlExecutor) => Promise<T>): Promise<T> {
+/**
+ * One transaction on one checked-out client. `guarded` (the scope lock and the search
+ * transaction only): pg-pool drops its idle 'error' listener at checkout, and pg's client emits
+ * 'error' when its connection ends between statements (no query in flight), so a transaction
+ * holding its client idle (the scope lock while the pointer work runs on other pool clients, a
+ * search pass while it reads the bucket or writes the index) would crash the invocation with an
+ * uncaught exception. Guarded, a per-checkout listener keeps the first error, and from then on
+ * the transaction fails as a normal rejected promise: the next statement on this client rejects
+ * with it, and so does `ensureLive`, the synchronous check handed to `work` as its second
+ * argument. A dropped connection frees the advisory locks it held, so `work` calls `ensureLive()`
+ * before each statement or write it makes elsewhere (other pool clients, the search index). The
+ * check sends no statement. It cannot stop a statement already in flight when the error is
+ * emitted, and it sees only a drop that pg reported. The broken client is destroyed
+ * (`release(err)`), not returned to the pool, and the listener is removed before release.
+ * Unguarded, no listener is added and `ensureLive` is a no-op. With no 'error' emitted, guarded
+ * and unguarded send the same statements and release the client the same way (`release()`).
+ */
+export async function transaction<T>(
+  db: HoopDb,
+  work: (tx: SqlExecutor, ensureLive: () => void) => Promise<T>,
+  guarded = false,
+): Promise<T> {
   const client = await db.pool.connect();
+  let broken: Error | undefined;
+  const onError = (error: Error) => {
+    broken ??= error;
+  };
+  if (guarded) client.on("error", onError);
+  const ensureLive = () => {
+    if (broken) throw broken;
+  };
+  const query = async (text: string, params?: unknown[]) => {
+    ensureLive();
+    return client.query(text, params as unknown[]);
+  };
   try {
-    await client.query("BEGIN");
-    await client.query("SET LOCAL statement_timeout = '60s'");
-    const result = await work({
-      async query<R = Record<string, unknown>>(text: string, params?: unknown[]) {
-        const r = await client.query(text, params as unknown[]);
-        return { rows: r.rows as R[] };
+    await query("BEGIN");
+    await query("SET LOCAL statement_timeout = '60s'");
+    const result = await work(
+      {
+        async query<R = Record<string, unknown>>(text: string, params?: unknown[]) {
+          const r = await query(text, params);
+          return { rows: r.rows as R[] };
+        },
       },
-    });
-    await client.query("COMMIT");
+      ensureLive,
+    );
+    await query("COMMIT");
     return result;
   } catch (error) {
-    await client.query("ROLLBACK").catch(() => {});
+    await query("ROLLBACK").catch(() => {});
     throw error;
   } finally {
-    client.release();
+    if (guarded) client.removeListener("error", onError);
+    if (broken) client.release(broken);
+    else client.release();
   }
+}
+
+/**
+ * The search stage's transaction: guarded (transaction() above), streamed or not. A portable
+ * binding's writer SQL joins it (`writerSql.run`), as before; `work` also gets `ensureLive`.
+ */
+export function searchTransaction(db: HoopDb, writerSql?: Pick<ReturnType<typeof writerTransactionSql>, "run">): SearchTransact {
+  return (work) =>
+    transaction(db, (tx, ensureLive) => (writerSql ? writerSql.run(tx, () => work(tx, ensureLive)) : work(tx, ensureLive)), true);
+}
+
+/**
+ * The pointer stage's scope lock: a guarded transaction (transaction() above) holding the scope's
+ * advisory lock, waiting at most 30 s for it, while `work` runs. `work` gets the transaction's
+ * `ensureLive` (pointer.ts ScopeLock).
+ */
+export function scopeLock(db: HoopDb): ScopeLock {
+  return (scope, work) =>
+    transaction(
+      db,
+      async (tx, ensureLive) => {
+        await tx.query("SET LOCAL lock_timeout = '30s'");
+        await tx.query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))", [scopeLockKey(scope)]);
+        return work(ensureLive);
+      },
+      true,
+    );
 }
 
 /** A search pass that found its session busy runs again this much later. */
@@ -573,7 +638,7 @@ export function lambdaAnalysisDeps(env: Pick<LambdaEnv, "bucket" | "region" | "k
   ports: Pick<AnalysisRuntimeInputs, "eraserFactory"> = {}): AnalysisTickDeps {
   return analysisTickDeps({
     db,
-    transact: (work) => transaction(db, work),
+    transact: (work) => transaction(db, (tx) => work(tx)),
     store,
     bucket: env.bucket,
     region: env.region,
@@ -597,12 +662,7 @@ export function runtimeFromSecret(env: LambdaEnv, secretText: string, schemaGene
   const reader = objectStoreManifestReader(store, { provider: "s3", bucket: env.bucket });
   const bindings = { PIPELINE_ORG_FROM_PREFIX: "true", PIPELINE_KEY_PREFIX: env.keyPrefix };
   const fanout: PipelineQueue = env.fanout === "postgres" ? postgresPipelineQueue(db) : droppedFanout;
-  const lock: ScopeLock = (scope, work) =>
-    transaction(db, async (tx) => {
-      await tx.query("SET LOCAL lock_timeout = '30s'");
-      await tx.query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))", [scopeLockKey(scope)]);
-      return work();
-    });
+  const lock = scopeLock(db);
   const deps: ConsumerDeps = {
     pointer: {
       db,
@@ -631,7 +691,7 @@ export function runtimeFromSecret(env: LambdaEnv, secretText: string, schemaGene
     const writerSql = portable ? writerTransactionSql(db) : undefined;
     const binding = portable ? composeSearchService(composition!, { env: { ...env.adapterEnv, SEARCH_INDEX_BACKEND: env.searchBackend }, sql: writerSql!.sql, secrets: searchSecret(secret.search) }, "writer") : undefined;
     deps.search = {
-      transact: (work) => transaction(db, tx => writerSql ? writerSql.run(tx, () => work(tx)) : work(tx)),
+      transact: searchTransaction(db, writerSql),
       reader,
       store,
       ...(binding ? { adapter: binding } : { ch: createClickHouseClient(secret.clickhouse!) }),

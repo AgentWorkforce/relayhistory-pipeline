@@ -56,22 +56,38 @@ export interface IndexDeps {
  * the same identity. The upsert deletes that row and inserts the new one in ONE transaction, keeping
  * least(old, new) created_at, so a failure in between leaves the old row and its first-seen intact.
  */
-export interface UpsertOptions { rekeyFrom?: string }
+export interface UpsertOptions {
+  rekeyFrom?: string;
+  /**
+   * The pointer stage's scope lock is held on another connection (pointer.ts ScopeLock): a
+   * synchronous check that throws once that connection has dropped. Given, this call runs
+   * `ensureLive()` before every statement it sends (the main pool, the publication transaction,
+   * the move transaction), before each fan-out send and before the brief wakeup. The check is
+   * this call's only: nothing is stored on the index object. Absent: as before.
+   */
+  ensureLive?: () => void;
+}
 export type HoopDbSessionPointerIndex = SessionPointerIndex & {
   upsertRawPointer(pointer: RawPointer, ctx: TraceContext, opts?: UpsertOptions): ReturnType<SessionPointerIndex["upsertRawPointer"]>;
 };
 
 /**
  * One transaction on one pooled connection (shared/db.ts inTransaction, inlined: importing db.ts
- * as a value pulls its schema-asset reads into the large-read worker bundle).
+ * as a value pulls its schema-asset reads into the large-read worker bundle). `ensureLive`
+ * (UpsertOptions) runs before BEGIN, each statement and COMMIT; absent, nothing changes.
  */
-async function moveTransaction<T>(db: HoopDb, work: (tx: { query: HoopDb["query"] }) => Promise<T>): Promise<T> {
+async function moveTransaction<T>(db: HoopDb, work: (tx: { query: HoopDb["query"] }) => Promise<T>, ensureLive?: () => void): Promise<T> {
   const client = await db.pool.connect();
   try {
+    ensureLive?.();
     await client.query("BEGIN");
     const result = await work({
-      query: (async (text: string, params?: unknown[]) => ({ rows: (await client.query(text, params as unknown[])).rows })) as HoopDb["query"],
+      query: (async (text: string, params?: unknown[]) => {
+        ensureLive?.();
+        return { rows: (await client.query(text, params as unknown[])).rows };
+      }) as HoopDb["query"],
     });
+    ensureLive?.();
     await client.query("COMMIT");
     return result;
   } catch (error) {
@@ -88,13 +104,65 @@ const movedFenced = (reason: "operator_erased" | "move_guarded") =>
 
 const ROW_IDENTITY=(p:{org_id:string;workspace_id:string;harness:string;session_id:string;machine_id:string})=>JSON.stringify([p.org_id,p.workspace_id,p.harness,p.session_id,p.machine_id]);
 export function hoopDbSessionIndex(deps: IndexDeps): HoopDbSessionPointerIndex {return sessionIndex(deps,false);}
-function sessionIndex(deps:IndexDeps,authorized:boolean):HoopDbSessionPointerIndex{
+
+/** A query function that runs `ensureLive()` before each statement. */
+function checkedQuery(query: HoopDb["query"], ensureLive: () => void): HoopDb["query"] {
+  return (async (text: string, params?: unknown[]) => {
+    ensureLive();
+    return query(text, params);
+  }) as HoopDb["query"];
+}
+
+/**
+ * `deps` for one upsertRawPointer call whose scope lock is held elsewhere (UpsertOptions.ensureLive):
+ * the main pool's queries, the fan-out sends and the publication transaction (before it starts,
+ * before each of its statements and before its COMMIT) run `ensureLive()` first. Same objects underneath, same statements.
+ */
+function checkedIndexDeps(deps: IndexDeps, ensureLive: () => void): IndexDeps {
+  const queue = deps.queue;
+  return {
+    ...deps,
+    db: { ...deps.db, query: checkedQuery(deps.db.query.bind(deps.db), ensureLive) } as HoopDb,
+    queue: {
+      backend: queue.backend,
+      send: (message, options) => {
+        ensureLive();
+        return queue.send(message, options);
+      },
+      sendBatch: (messages, options) => {
+        ensureLive();
+        return queue.sendBatch(messages, options);
+      },
+    },
+    ...(deps.publication
+      ? {
+          publication: {
+            schemaGeneration: deps.publication.schemaGeneration,
+            transact: (work) => {
+              ensureLive();
+              // The check after `work` runs before the transaction's COMMIT: a lost scope lock rolls it back.
+              return deps.publication!.transact(async (tx) => {
+                const result = await work({ ...tx, query: checkedQuery(tx.query.bind(tx), ensureLive) });
+                ensureLive();
+                return result;
+              });
+            },
+          } satisfies NonNullable<IndexDeps["publication"]>,
+        }
+      : {}),
+  };
+}
+
+function sessionIndex(given:IndexDeps,authorized:boolean):HoopDbSessionPointerIndex{
   const operatorErase = eraseRuntimeFlag(process.env, ERASE_FENCE_FLAG);
   const fromEnv = briefConfig();
   const brief =
-    deps.brief !== undefined ? deps.brief : fromEnv.enabled ? fromEnv : null;
+    given.brief !== undefined ? given.brief : fromEnv.enabled ? fromEnv : null;
   return {
     async upsertRawPointer(pointer: RawPointer, ctx: TraceContext, opts: UpsertOptions = {}) {
+      // The outer call wraps its deps once; the inner authorized calls run on the transaction it
+      // opened, whose statements are checked already.
+      const deps = !authorized && opts.ensureLive ? checkedIndexDeps(given, opts.ensureLive) : given;
       const pk = {
         org_id: ctx.orgId,
         workspace_id: pointer.workspaceId,
@@ -162,7 +230,7 @@ function sessionIndex(deps:IndexDeps,authorized:boolean):HoopDbSessionPointerInd
       // A move without the publication transaction (no publication config): the delete and the
       // re-insert still commit together. (A test double without a pool runs them in sequence.)
       if(!authorized&&opts.rekeyFrom&&deps.db.pool)
-        return moveTransaction(deps.db,tx=>sessionIndex({...deps,db:{...deps.db,query:tx.query}as HoopDb},true).upsertRawPointer(pointer,ctx,opts));
+        return moveTransaction(deps.db,tx=>sessionIndex({...deps,db:{...deps.db,query:tx.query}as HoopDb},true).upsertRawPointer(pointer,ctx,opts),opts.ensureLive);
       const f = pointerFields(m);
       const ext = sessionExt(m);
       const canonical = canonicalManifestIdentity(m);

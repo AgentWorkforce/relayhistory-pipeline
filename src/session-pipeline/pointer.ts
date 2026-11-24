@@ -61,8 +61,14 @@ export function scopeLockKey(scope: SessionScope, stage: "pointer" | "search" = 
   return [`96bulls:${stage}`, scope.orgId, scope.workspaceId, scope.harness, scope.sessionId].join("\u001f");
 }
 
-/** Run `work` while holding the session's lock (lambda.ts: pg_advisory_xact_lock in Supabase). */
-export type ScopeLock = <T>(scope: SessionScope, work: () => Promise<T>) => Promise<T>;
+/**
+ * Run `work` while holding the session's lock (lambda.ts: pg_advisory_xact_lock in Supabase).
+ * The Lambda's lock (lambda.ts scopeLock) passes `ensureLive`: a synchronous check that throws once
+ * the lock's connection has dropped (and the lock with it). The pointer work calls it before every
+ * statement it sends on other connections, before each fan-out send and before the brief wakeup.
+ * A lock that passes none (the self-host consumer, test doubles) runs the work as before.
+ */
+export type ScopeLock = <T>(scope: SessionScope, work: (ensureLive?: () => void) => Promise<T>) => Promise<T>;
 
 export interface PointerDeps {
   db: HoopDb;
@@ -131,7 +137,7 @@ export async function indexPointer(landed: ObjectLanded, deps: PointerDeps): Pro
   };
 
   if (deps.preRead) return indexPreRead(landed, orgId, scope, deps);
-  return deps.lock(scope, () => indexLocked(landed, orgId, scope, deps));
+  return deps.lock(scope, (ensureLive) => indexLocked(landed, orgId, scope, deps, ensureLive));
 }
 
 /**
@@ -227,15 +233,16 @@ async function indexPreRead(landed: ObjectLanded, orgId: string, scope: SessionS
   for (let attempt = 0; attempt < 2; attempt++) {
     const stamp = await scopeStamp(deps.db, scope);
     const cache = await preReadEvent(landed, orgId, scope, deps);
-    const out = await deps.lock(scope, async () => {
+    const out = await deps.lock(scope, async (ensureLive) => {
+      ensureLive?.();
       if ((await scopeStamp(deps.db, scope)) !== stamp) return SCOPE_CHANGED;
-      return indexLocked(landed, orgId, scope, replayDeps(deps, cache));
+      return indexLocked(landed, orgId, scope, replayDeps(deps, cache), ensureLive);
     });
     if (out !== SCOPE_CHANGED) return out;
   }
   // The flag is an optimization. Under sustained churn, preserve the base path's liveness instead of
   // inventing a new retry/DLQ route. This rare fallback deliberately reads under the original lock.
-  return deps.lock(scope, () => indexLocked(landed, orgId, scope, deps));
+  return deps.lock(scope, (ensureLive) => indexLocked(landed, orgId, scope, deps, ensureLive));
 }
 
 /** How far either side of a deleted key's date the same session is looked for (an exporter date move). */
@@ -263,7 +270,14 @@ export async function findMovedSibling(key: string, exists: (key: string) => Pro
   return undefined;
 }
 
-async function indexLocked(landed: ObjectLanded, orgId: string, scope: SessionScope, deps: PointerDeps, followed = false): Promise<PointerOutcome> {
+async function indexLocked(
+  landed: ObjectLanded,
+  orgId: string,
+  scope: SessionScope,
+  deps: PointerDeps,
+  ensureLive?: () => void,
+  followed = false,
+): Promise<PointerOutcome> {
   // Canonical state, not the event: re-read the manifest, under the lock.
   const read = await deps.reader.read(landed.key);
   if (!read && !followed) {
@@ -271,7 +285,7 @@ async function indexLocked(landed: ObjectLanded, orgId: string, scope: SessionSc
     const sibling = await findMovedSibling(landed.key, deps.exists);
     if (sibling) {
       const { etag: _e, version: _v, size: _s, deleted: _d, ...rest } = landed;
-      return indexLocked({ ...rest, key: sibling }, orgId, scope, deps, true);
+      return indexLocked({ ...rest, key: sibling }, orgId, scope, deps, ensureLive, true);
     }
   }
   const built = read
@@ -306,7 +320,8 @@ async function indexLocked(landed: ObjectLanded, orgId: string, scope: SessionSc
   const message = await enrichMessage(indexed, deps.reader);
 
   const index = hoopDbSessionIndex({ db: deps.db, reader: deps.reader, queue: deps.fanout, current: () => message,publication:deps.publication });
-  const upsert = () => index.upsertRawPointer(message.payload as Parameters<typeof index.upsertRawPointer>[0], message.ctx);
+  const upsert = () =>
+    index.upsertRawPointer(message.payload as Parameters<typeof index.upsertRawPointer>[0], message.ctx, ensureLive ? { ensureLive } : undefined);
   const result = await upsert();
   if(result?.status==="skipped"&&result.reason==="publication_retired")return{status:"ignored",reason:"managed_publication_hint"};
   const revision = message.revision;
@@ -317,6 +332,7 @@ async function indexLocked(landed: ObjectLanded, orgId: string, scope: SessionSc
   // because a new key restarts its revision count. The key that is live in S3
   // wins; while both are live the move is in progress and the event retries.
   const pk = [orgId, scope.workspaceId, scope.harness, scope.sessionId, read.manifest.session.machine_id];
+  ensureLive?.();
   const stored = (
     await deps.db.query<{ manifest_key: string; deleted: boolean }>(
       `SELECT manifest_key, deleted_at IS NOT NULL AS deleted FROM sessions.session_index
@@ -338,7 +354,10 @@ async function indexLocked(landed: ObjectLanded, orgId: string, scope: SessionSc
     // delete rolls back and the old row stays.
     let moved: Awaited<ReturnType<typeof index.upsertRawPointer>>;
     try {
-      moved = await index.upsertRawPointer(message.payload as Parameters<typeof index.upsertRawPointer>[0], message.ctx, { rekeyFrom: stored.manifest_key });
+      moved = await index.upsertRawPointer(message.payload as Parameters<typeof index.upsertRawPointer>[0], message.ctx, {
+        rekeyFrom: stored.manifest_key,
+        ...(ensureLive ? { ensureLive } : {}),
+      });
     } catch (error) {
       // An erased (fenced) or guarded session: terminal. The old row (its tombstone) stays; retrying
       // would only repeat the refusal until the dead-letter queue.

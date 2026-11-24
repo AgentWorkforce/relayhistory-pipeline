@@ -340,7 +340,7 @@ export function runnerAnalysisDeps(env: NodeJS.ProcessEnv, cfg: AnalysisRunnerCo
   const store = (ports.store ?? createS3Store)({ bucket, region, ...endpoint, credentials }) as unknown as ObjectStore;
   const deps = analysisTickDeps({
     db,
-    transact: (work) => transaction(db, work),
+    transact: (work) => transaction(db, (tx) => work(tx)),
     store,
     bucket,
     region,

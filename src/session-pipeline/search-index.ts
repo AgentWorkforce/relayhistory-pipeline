@@ -99,7 +99,13 @@ import { MAX_SCAN_PAGE, type SearchPosition } from "@rhc/search-index/contracts.
 /** Kept in sync with buffered-search-feed.ts (not imported: that module pulls in the ingest stage reader). */
 const BUFFERED_FINGERPRINT_PREFIX = "bf";
 
-export type Transact = <T>(work: (tx: SqlExecutor) => Promise<T>) => Promise<T>;
+/**
+ * The search stage's transaction. A guarded implementation (lambda.ts searchTransaction) passes
+ * `ensureLive` as the second argument: a synchronous check that throws once the transaction's
+ * connection has dropped. Implementations that pass none (the self-host consumer, tests) behave
+ * as before.
+ */
+export type Transact = <T>(work: (tx: SqlExecutor, ensureLive?: () => void) => Promise<T>) => Promise<T>;
 
 export interface SearchIndexDeps {
   readerMaxRuleset?: number;
@@ -256,6 +262,25 @@ function observedProjectionIo(io: SearchProjectionIo, metrics: SearchIndexPhaseM
     erase: (scope, canonicalId) => write(1, () => io.erase(scope, canonicalId)),
     record: (scope, revision, rows, complete, at, canonicalId) => write(1, () => io.record(scope, revision, rows, complete, at, canonicalId)),
   };
+}
+
+/**
+ * `target` with `ensureLive()` called before each of its methods, or `target` itself when there
+ * is no check. The check runs when a method is called; it does not interrupt a call already
+ * running (for example the pages of one scanPages call or the batches of one upsert).
+ */
+export function checkedCalls<T extends object>(target: T, ensureLive: (() => void) | undefined): T {
+  if (!ensureLive) return target;
+  const checked: Record<string, unknown> = {};
+  for (const [name, value] of Object.entries(target))
+    checked[name] =
+      typeof value === "function"
+        ? (...args: unknown[]) => {
+            ensureLive();
+            return (value as (...a: unknown[]) => unknown).apply(target, args);
+          }
+        : value;
+  return checked as T;
 }
 
 /** SearchIndexDeps.staged: the staged reconcile's interim bound. */
@@ -621,14 +646,17 @@ async function indexSearchScopeBase(scope: SessionScope, deps: SearchIndexDeps, 
   const scanBefore = deps.metrics?.indexScanMs ?? 0;
   let first: SearchIndexResult | typeof SEARCH_SCOPE_CHANGED;
   try {
-    first = await deps.transact(async (tx): Promise<SearchIndexResult | typeof SEARCH_SCOPE_CHANGED> => {
+    first = await deps.transact(async (tx, ensureLive): Promise<SearchIndexResult | typeof SEARCH_SCOPE_CHANGED> => {
     const rawIo = deps.adapter
       ? deps.staged
         ? adapterProjectionIo(deps.adapter, tx, { pagedScan: true })
         : adapterProjectionIo(deps.adapter, tx)
       : legacyProjectionIo(deps.ch!);
-    const io = observedProjectionIo(rawIo, deps.metrics);
-    const chFacts = deps.ch ? clickhouseOutputFactsStore(deps.ch, { maxRows: limits.maxRows, insertBatch: limits.insertBatch }) : undefined;
+    // Guarded transaction (lambda.ts searchTransaction): every index and facts call checks the
+    // transaction's connection first, so a pass whose locks went with a dropped connection makes
+    // no further index write. No check passed: the same objects as before.
+    const io = checkedCalls(observedProjectionIo(rawIo, deps.metrics), ensureLive);
+    const chFacts = deps.ch ? checkedCalls(clickhouseOutputFactsStore(deps.ch, { maxRows: limits.maxRows, insertBatch: limits.insertBatch }), ensureLive) : undefined;
     const pgFacts = deps.outputFactsStore?.(tx);
     // Non-blocking: a pass already running for this session is busy for as long
     // as its ClickHouse work takes. The caller re-enqueues this event with a
