@@ -107,3 +107,36 @@ stream deadline is checked inside a streamed pass. So:
 
 New log field: `batch_deadline_deferrals`, a non-negative integer bounded at 1000
 (`BOUNDED_COUNT_FIELDS` in `src/shared/log.ts`). Any other value is dropped.
+
+## Object read deadline
+
+`SESSION_PIPELINE_OBJECT_READ_TIMEOUT_MS`. It does not need the search stage. The stack renders
+it only from `transcriptStore.sessionPipeline.objectReadTimeout: { ms }`.
+
+When set, the function's bucket clients (`pipelineStore` in `lambda.ts`, which passes
+`readTimeoutMs` to `createS3Store`) give every HEAD and GET one deadline that covers the headers
+and the whole body (`send` in `packages/object-store/src/core.ts`). A read that crosses it fails
+as a transient `ObjectStoreError` with `transportCause: "timeout"`. A caller's own abort signal
+still works (both are combined). Responses without a body (204, 205, 304) are returned as they
+are. PUT, list and delete get no deadline. Unset, the client sends no signal and returns the
+fetch's own body stream, as before.
+
+Which clients carry it (all built by `pipelineStore`):
+
+- the runtime store (`runtimeFromSecret`). On main this one client is shared by the pointer
+  stage (manifest reader and `exists` head), the search pass, the buffered feed, replay, the
+  brief tick, the analysis tick and the analysis cache, so the deadline applies to the reads of
+  every one of those stages, not only the search pass;
+- the scheduled reconcile's store (`runReconcile`; list and head).
+
+Not covered: the S3 eraser of the analysis deps (deletes only), the SQS / Secrets Manager /
+invoke calls, and the bucket clients of the other functions (read API, ingest, analysis runner,
+self-host Locker).
+
+How a timed-out read reaches the stages: the manifest reader (`objectStoreManifestReader`)
+returns null only for not found, so a timeout is rethrown, not read as a missing manifest. A raw
+chunk read (`readManifestRecords` / `streamManifestRecords` in
+`src/session-read-api/canonical-projection.ts`) turns it into the retryable `chunk_unavailable`,
+which the search pass rethrows; the message then goes back to SQS like any other retryable
+failure. The deadline bounds one request; it does not bound a pass that makes many reads, which
+is what the batch deadline is for.

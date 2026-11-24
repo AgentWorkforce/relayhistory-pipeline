@@ -126,6 +126,13 @@ export interface SessionPipelineInputs {
    * further scope's pass starts and the rest are requeued.
    */
   searchBatchDeadline?: { marginMs: number };
+  /**
+   * A deadline on the function's object GETs (body included) and HEADs (packages/object-store
+   * core.ts send). Absent: no variable is rendered and reads have no deadline. `ms` (an integer
+   * from MS_INPUT_MIN to MS_INPUT_MAX) renders SESSION_PIPELINE_OBJECT_READ_TIMEOUT_MS; a read past
+   * it fails as a transient error. Not tied to `searchIndex`.
+   */
+  objectReadTimeout?: { ms: number };
   /** Default off. `true` is refused until the reviewed normalized-prefix PutObject/KMS grant and publication migration exist. */
   replayPages?: boolean;
   /** Dormant full v1 analysis-cache worker; separate readonly source secret required. */
@@ -355,7 +362,7 @@ export function assertSessionPipelineInputs(p: unknown, refuse: (why: string) =>
     refuse("transcriptStore.sessionPipeline must be a plain object");
   const v = p as Record<string, unknown>;
   for (const k of Object.keys(v))
-    if (k !== "searchIndex" && k !== "replayPages" && k!=="analysisCache" && k !== "legacyReadSource" && k !== "desktopCatalog" && k !== "maxConcurrency" && k !== "reconcileMinutes" && k !== "briefs" && k !== "semanticCopy" && k !== "analysisJobs" && k !== "bufferedSearchFeed" && k !== "bufferedErasureDelete" && k !== "neonExit" && k !== "relayfacts" && k !== "schedules" && k !== "streamReconcile" && k !== "summaryRegen" && k !== "skipCurrent" && k !== "searchPreRead" && k !== "pointerPreRead" && k !== "pointerSkipOriginBucket" && k !== "searchBatchDeadline") refuse(`transcriptStore.sessionPipeline.${k} is not a known setting`);
+    if (k !== "searchIndex" && k !== "replayPages" && k!=="analysisCache" && k !== "legacyReadSource" && k !== "desktopCatalog" && k !== "maxConcurrency" && k !== "reconcileMinutes" && k !== "briefs" && k !== "semanticCopy" && k !== "analysisJobs" && k !== "bufferedSearchFeed" && k !== "bufferedErasureDelete" && k !== "neonExit" && k !== "relayfacts" && k !== "schedules" && k !== "streamReconcile" && k !== "summaryRegen" && k !== "skipCurrent" && k !== "searchPreRead" && k !== "pointerPreRead" && k !== "pointerSkipOriginBucket" && k !== "searchBatchDeadline" && k !== "objectReadTimeout") refuse(`transcriptStore.sessionPipeline.${k} is not a known setting`);
   if (v.searchIndex !== undefined && typeof v.searchIndex !== "boolean") refuse("transcriptStore.sessionPipeline.searchIndex must be a boolean");
   if (v.replayPages !== undefined && typeof v.replayPages !== "boolean") refuse("transcriptStore.sessionPipeline.replayPages must be a boolean");
   if(v.analysisCache!==undefined&&typeof v.analysisCache!=="boolean")refuse("transcriptStore.sessionPipeline.analysisCache must be a boolean");
@@ -456,6 +463,7 @@ export function assertSessionPipelineInputs(p: unknown, refuse: (why: string) =>
     assertMsInputs(v.searchBatchDeadline, "searchBatchDeadline", ["marginMs"], ["marginMs"], refuse);
     if (v.searchIndex !== true) refuse("transcriptStore.sessionPipeline.searchBatchDeadline requires searchIndex: true");
   }
+  if (v.objectReadTimeout !== undefined) assertMsInputs(v.objectReadTimeout, "objectReadTimeout", ["ms"], ["ms"], refuse);
   if (v.briefs !== undefined) {
     const b = v.briefs as Record<string, unknown> | null;
     if (b === null || typeof b !== "object" || Array.isArray(b) || Object.getPrototypeOf(b) !== Object.prototype)
@@ -751,6 +759,8 @@ export function sessionPipelineEnv(i: { stage: string; bucket: string; names: Se
     ...(i.p.streamReconcile?.enabled === true && i.p.streamReconcile.deadlineMarginMs !== undefined ? { SEARCH_INDEX_STREAM_DEADLINE_MARGIN_MS: String(i.p.streamReconcile.deadlineMarginMs) } : {}),
     // Only when set: a stage without searchBatchDeadline renders nothing new.
     ...(i.p.searchBatchDeadline !== undefined ? { SEARCH_INDEX_BATCH_DEADLINE_MARGIN_MS: String(i.p.searchBatchDeadline.marginMs) } : {}),
+    // Only when set: a stage without objectReadTimeout renders nothing new.
+    ...(i.p.objectReadTimeout !== undefined ? { SESSION_PIPELINE_OBJECT_READ_TIMEOUT_MS: String(i.p.objectReadTimeout.ms) } : {}),
     PIPELINE_FANOUT: "off",
     PIPELINE_RECONCILE_LOOKBACK_MINUTES: String(2 * (i.p.reconcileMinutes ?? 30)),
     HOOPDB_POOL_MAX: "4",

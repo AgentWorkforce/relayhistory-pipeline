@@ -1300,3 +1300,38 @@ describe("session pipeline: search batch deadline", () => {
     expect(on.env).toEqual({ ...off.env, SEARCH_INDEX_BATCH_DEADLINE_MARGIN_MS: "90000" });
   });
 });
+
+describe("session pipeline: object read timeout", () => {
+  const refuse = (why: string): never => {
+    throw new Error(why);
+  };
+  const envOf = (cfg: SessionPipelineInputs) => sessionPipelineEnv({ stage: STAGE, bucket: t.bucket, names: p, p: cfg });
+
+  it("absent renders nothing new; set renders SESSION_PIPELINE_OBJECT_READ_TIMEOUT_MS only, with or without search", () => {
+    for (const searchIndex of [false, true]) {
+      const off = envOf({ searchIndex });
+      expect(Object.keys(off)).not.toContain("SESSION_PIPELINE_OBJECT_READ_TIMEOUT_MS");
+      const on = envOf({ searchIndex, objectReadTimeout: { ms: 20_000 } });
+      expect(on).toEqual({ ...off, SESSION_PIPELINE_OBJECT_READ_TIMEOUT_MS: "20000" });
+      expect(lambdaEnv({ AWS_REGION: REGION, ...on }).objectReadTimeoutMs).toBe(20_000);
+    }
+  });
+
+  it("validates the shape and the value strictly; needs no searchIndex", () => {
+    const ok = (v: unknown) => assertSessionPipelineInputs(v, refuse);
+    for (const ms of [MS_INPUT_MIN, 20_000, MS_INPUT_MAX]) expect(() => ok({ objectReadTimeout: { ms } })).not.toThrow();
+    for (const ms of [-1, 0, 999, MS_INPUT_MAX + 1, FUNCTION_TIMEOUT_SECONDS * 1000, 1.5, Number.NaN, Number.POSITIVE_INFINITY, "20000", null, undefined])
+      expect(() => ok({ objectReadTimeout: { ms } })).toThrow(/objectReadTimeout\.ms must be an integer from 1000 to 299000/);
+    expect(() => ok({ objectReadTimeout: { ms: 20_000, put: true } })).toThrow(/objectReadTimeout\.put is not a known setting/);
+    for (const bad of [20_000, true, null, [], "20000"]) expect(() => ok({ objectReadTimeout: bad })).toThrow(/objectReadTimeout must be a plain object/);
+  });
+
+  it("the function's resources and props are the same with it set, but the env", () => {
+    const i = { stage: STAGE, accountId: ACCOUNT, region: REGION, bucket: t.bucket, tags: () => ({}) };
+    const off = sessionPipelineFunctionProps({ ...i, p: { searchIndex: true } });
+    const on = sessionPipelineFunctionProps({ ...i, p: { searchIndex: true, objectReadTimeout: { ms: 20_000 } } });
+    const plain = (x: typeof on) => ({ ...x, env: undefined, build: { ...x.build, plugins: x.build.plugins.map((pl) => pl.name) } });
+    expect(plain(on)).toEqual(plain(off));
+    expect(on.env).toEqual({ ...off.env, SESSION_PIPELINE_OBJECT_READ_TIMEOUT_MS: "20000" });
+  });
+});

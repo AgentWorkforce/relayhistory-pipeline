@@ -55,6 +55,13 @@ export interface S3Config {
    * refuses `aws:kms` without naming the bucket's own key.
    */
   sseKmsKeyId?: string;
+  /**
+   * Optional deadline in milliseconds (a positive safe integer) on object GET
+   * (`getObject`, including its body read) and HEAD; a timed-out call fails
+   * with a `transient` error (see `send` in core.ts). Put, delete, list and
+   * presign are unchanged. Absent: no deadline and no extra abort signal.
+   */
+  readTimeoutMs?: number;
 }
 
 const BACKEND = "s3";
@@ -76,6 +83,13 @@ class S3Transport implements Transport {
     this.#config = config;
     this.#credentials = cachedProvider(config.credentials);
     this.#fetch = config.fetch ?? ((...a) => fetch(...a));
+    const t = config.readTimeoutMs;
+    if (t !== undefined && !(Number.isSafeInteger(t) && t > 0))
+      throw new ObjectStoreError(
+        "invalid_argument",
+        BACKEND,
+        "readTimeoutMs must be a positive integer",
+      );
   }
 
   #url(key = ""): URL {
@@ -101,6 +115,7 @@ class S3Transport implements Transport {
     headers: Headers,
     body?: Uint8Array,
     signal?: AbortSignal,
+    timeoutMs?: number,
   ): Promise<Response> {
     await signRequest({
       method,
@@ -121,6 +136,7 @@ class S3Transport implements Transport {
         ...(signal ? { signal } : {}),
       },
       this.#fetch,
+      timeoutMs,
     );
   }
 
@@ -202,7 +218,15 @@ class S3Transport implements Transport {
   }
 
   async head(key: ObjectKey): Promise<ObjectMeta | undefined> {
-    const res = await this.#request(key, "HEAD", this.#url(key), new Headers());
+    const res = await this.#request(
+      key,
+      "HEAD",
+      this.#url(key),
+      new Headers(),
+      undefined,
+      undefined,
+      this.#config.readTimeoutMs,
+    );
     if (res.status === 404) return undefined;
     if (!res.ok) throw errorForStatus(BACKEND, key, res.status, "");
     return {
@@ -228,7 +252,15 @@ class S3Transport implements Transport {
     // `response-content-encoding=identity` override makes S3 (and MinIO) answer `identity`.
     const url = this.#url(key);
     url.searchParams.set("response-content-encoding", "identity");
-    const res = await this.#request(key, "GET", url, headers);
+    const res = await this.#request(
+      key,
+      "GET",
+      url,
+      headers,
+      undefined,
+      undefined,
+      this.#config.readTimeoutMs,
+    );
     if (!res.ok || !res.body)
       throw errorForStatus(BACKEND, key, res.status, await errorBody(res));
     return {

@@ -365,14 +365,30 @@ export async function errorBody(response: Response): Promise<string> {
   }
 }
 
-/** Wrap `fetch` so network failures are `transient`. */
+/**
+ * Wrap `fetch` so network failures are `transient`.
+ *
+ * `timeoutMs` (optional): one deadline from the call to the end of the response
+ * body. Before the response arrives, crossing it aborts the request and
+ * rejects with a `transient` error (transportCause `timeout`); afterwards, a
+ * body read still pending when it passes errors the body stream with the same
+ * error. The timer stops when the body ends, errors or is cancelled, or at
+ * once when the response has no body or a null-body status (204, 205, 304),
+ * which is returned unwrapped. A caller's own `init.signal` still aborts the
+ * request (as a `request failed` error). Signing and other work before the
+ * call are not covered. Undefined: no extra abort signal and no wrapping,
+ * exactly as without it.
+ */
 export async function send(
   backend: string,
   key: string,
   url: URL | string,
   init: RequestInit,
   fetchImpl: typeof fetch,
+  timeoutMs?: number,
 ): Promise<Response> {
+  if (timeoutMs !== undefined)
+    return sendWithTimeout(backend, key, url, init, fetchImpl, timeoutMs);
   try {
     return await fetchImpl(url, init);
   } catch (cause) {
@@ -381,6 +397,91 @@ export async function send(
       transportCause: storeTransportCause(cause),
     });
   }
+}
+
+const NULL_BODY_STATUSES = new Set([204, 205, 304]);
+
+async function sendWithTimeout(
+  backend: string,
+  key: string,
+  url: URL | string,
+  init: RequestInit,
+  fetchImpl: typeof fetch,
+  timeoutMs: number,
+): Promise<Response> {
+  const timedOut = (cause?: unknown) =>
+    new ObjectStoreError(
+      "transient",
+      backend,
+      `${key}: request timed out after ${timeoutMs} ms`,
+      { ...(cause === undefined ? {} : { cause }), transportCause: "timeout" },
+    );
+  const controller = new AbortController();
+  // Settles only on the deadline; raced against the fetch and every body read,
+  // so a fetch implementation that ignores the signal is still cut off.
+  const deadline = new Promise<never>((_, reject) => {
+    controller.signal.addEventListener("abort", () => reject(timedOut()), {
+      once: true,
+    });
+  });
+  deadline.catch(() => {});
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  const signal = init.signal
+    ? AbortSignal.any([init.signal, controller.signal])
+    : controller.signal;
+  let res: Response;
+  try {
+    res = await Promise.race([fetchImpl(url, { ...init, signal }), deadline]);
+  } catch (cause) {
+    clearTimeout(timer);
+    if (controller.signal.aborted)
+      throw isObjectStoreError(cause) ? cause : timedOut(cause);
+    throw new ObjectStoreError("transient", backend, `${key}: request failed`, {
+      cause,
+      transportCause: storeTransportCause(cause),
+    });
+  }
+  // A null-body status cannot be rebuilt around a stream (the Response
+  // constructor throws), so such a response is returned as it came.
+  if (!res.body || NULL_BODY_STATUSES.has(res.status)) {
+    clearTimeout(timer);
+    return res;
+  }
+  const reader = res.body.getReader();
+  const body = new ReadableStream<Uint8Array>({
+    async pull(stream) {
+      let chunk: Awaited<ReturnType<typeof reader.read>>;
+      try {
+        chunk = await Promise.race([reader.read(), deadline]);
+      } catch (cause) {
+        clearTimeout(timer);
+        reader.cancel().catch(() => {});
+        stream.error(
+          controller.signal.aborted
+            ? isObjectStoreError(cause)
+              ? cause
+              : timedOut(cause)
+            : cause,
+        );
+        return;
+      }
+      if (chunk.done) {
+        clearTimeout(timer);
+        stream.close();
+        return;
+      }
+      stream.enqueue(chunk.value);
+    },
+    cancel(reason) {
+      clearTimeout(timer);
+      return reader.cancel(reason);
+    },
+  });
+  return new Response(body, {
+    status: res.status,
+    statusText: res.statusText,
+    headers: res.headers,
+  });
 }
 
 /** Whole-object size from a GET response (range responses carry it in Content-Range). */
