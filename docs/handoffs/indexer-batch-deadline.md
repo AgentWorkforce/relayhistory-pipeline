@@ -19,6 +19,15 @@ the whole function, every stage, as the neighbouring knobs do; the error names t
 variable, never the value. The upper bound is one second under the function timeout
 (`FUNCTION_TIMEOUT_SECONDS` in `stacks/aws/session-pipeline.ts`).
 
+The upper bound only keeps the deadline inside the invocation; it is not a usable setting.
+Passes can start only while the remaining time is above the margin, so the window for starting
+them is the function timeout less the margin less what the invocation spent before the search
+loop (init, the pointer stage). A margin close to the function timeout leaves no such window:
+every scope is deferred on every delivery, reaches the deferral cap and is then failed, without
+a pass ever running. Choose a margin above the longest single search pass, and small enough
+that the function timeout less the margin still exceeds the time the pointer stage takes plus
+at least one such pass.
+
 The stack renders it only from the optional input
 `transcriptStore.sessionPipeline.searchBatchDeadline: { marginMs }` (same bounds, unknown
 keys refused, needs `searchIndex: true`). Absent, nothing new is rendered.
@@ -152,24 +161,46 @@ the header of `src/session-pipeline/pointer.ts`). An advisory lock lives on its 
 when that connection drops the lock is freed, and another invocation can take it while this one
 still runs. The pointer work writes on other connections and the unstreamed search pass writes
 to ClickHouse, so without a check the drop would be noticed only at the next statement on the
-lock's own client, after those writes. `transaction()` therefore hands its work a synchronous check (`ensureLive`)
-that throws the recorded error once one was emitted and sends no statement. The pointer work
-calls it immediately before each write it makes under the lock (each pointer upsert and the
-re-key delete of a moved session), and the unstreamed pass calls it before each ClickHouse
-insert batch, before `deleteRows` and before writing its state row (complete or owing a pass).
-Once an error was emitted, that write is not made and the key or scope fails with the error.
-The streamed pass is unchanged: its keepalive and forced lock check are statements on the lock's
-client.
+lock's own client, after those writes. `transaction()` therefore hands its work a synchronous
+check (`ensureLive`) that throws the recorded error once one was emitted and sends no statement.
+
+The rule: while the lock is held, the check runs immediately before every statement sent on a
+connection other than the lock's own client, and before every fan-out queue send. Each call site:
+
+- Pointer stage (`indexLocked` in `src/session-pipeline/pointer.ts`): its own statements (the
+  stored-row read and the re-key delete of a moved session) go through `checkedExecutor`, and
+  every `upsertRawPointer` call gets the check as its third argument. `upsertRawPointer`
+  (`src/hoopdb/index.ts`) then wraps its executor and its fan-out queue for that call, so every
+  statement it sends runs the check first: on a live pointer the existing-row read,
+  `upsert_session_index`, the extension-row write, the identity repair, the directory
+  projection's statements (`projectSessionDirectory`), each fan-out send, the brief wakeup
+  (`armWakeup`, when enabled) and the fan-out revision write; on a tombstone the tombstone
+  update, the propagation (`propagatePointerTombstone`) and the projection. Reads are checked
+  like writes. The check is per call and never stored on the index object; a call without it
+  sends exactly what it sent before.
+- Unstreamed search pass (`indexSearchScope` in `src/session-pipeline/search-index.ts`): before
+  each ClickHouse write, which are the erased-scope delete, each insert batch, `deleteRows`, the
+  state row (complete or owing a pass), and each acceptance-stamp write (the erased scope's stamp
+  clear, and the stamp or clear after a pass). The stamp writer logs its own errors instead of
+  throwing, so its check sits outside it, at both call sites. The erased-scope branch runs
+  after this transaction took the scope's search lock (`pg_try_advisory_xact_lock` on the
+  `search` key), so its writes are under that lock and checked the same way.
+- The streamed pass checks with statements on the lock's client instead (its keepalive and
+  forced lock check); its acceptance-stamp write is checked as above.
+
+Once an error was emitted, the next checked statement or send is not made and the key or scope
+fails with the error.
 
 What the check does not cover:
 
-- a write already in flight when the error is emitted, and the statements inside one pointer
-  upsert (`upsertRawPointer` sends several; the check runs once before the first);
+- a statement already in flight when the error is emitted;
 - a drop that pg has not reported yet: the client emits nothing until it next uses the
   connection. The streamed pass forces a round trip with its keepalive; the unstreamed pass has
   no such statement between its ClickHouse writes, so such a drop is seen only at its next
   statement on the lock's client (the catalog write of a complete pass, or `COMMIT`);
-- the delete batches inside one `deleteRows` call, which are not checked one by one.
+- the delete batches of one `deleteRows` call: the check runs once, before the first batch;
+- the object-store manifest read itself: it is not interrupted, only the statements after it
+  are stopped, and with `SESSION_PIPELINE_OBJECT_READ_TIMEOUT_MS` unset it has no deadline.
 
 In these cases the key or scope still fails (at the latest at `COMMIT`) and its messages are
 redelivered, and the next delivery re-reads S3 under a fresh lock and writes from that state.

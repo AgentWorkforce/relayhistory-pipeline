@@ -910,8 +910,10 @@ export async function indexSearchScope(scope: SessionScope, deps: SearchIndexDep
   const limits = { ...DEFAULT_LIMITS, ...deps.limits };
   const now = deps.now ?? (() => new Date());
   // The unstreamed pass makes its ClickHouse writes with no statement on `tx` in between, so it
-  // calls ensureLive() before each (a dropped lock connection has freed the search lock). The
-  // streamed pass checks with its keepalive statement instead (streamedReconcile).
+  // calls ensureLive() before each (a dropped lock connection has freed the search lock): the
+  // erased-scope delete, each insert batch, deleteRows, each state row and each acceptance-stamp
+  // write. The streamed pass checks with its keepalive statement instead (streamedReconcile);
+  // its acceptance-stamp write (settle) is checked too.
   return deps.transact(async (tx, ensureLive = () => {}) => {
     // Non-blocking: a pass already running for this session is busy for as long
     // as its ClickHouse work takes. The caller re-enqueues this event with a
@@ -930,6 +932,7 @@ export async function indexSearchScope(scope: SessionScope, deps: SearchIndexDep
       // Erased: no live manifest is left, so every row of the scope goes, in or
       // out of the window. One predicate delete, no listing, so no size can
       // truncate it. It throws on failure and the message retries.
+      ensureLive();
       await deps.ch.command(
         `DELETE FROM ${EVENTS_TABLE}
          WHERE org_id = {org:String} AND workspace_id = {workspace:String}
@@ -940,8 +943,13 @@ export async function indexSearchScope(scope: SessionScope, deps: SearchIndexDep
           timeoutMs: 120_000,
         },
       );
-      // Flag on: an erased scope keeps no stamp.
-      if (pointers) await settleAcceptanceStamp(deps, scope, stampName, await readAcceptanceStamp(deps, stampName), null, at);
+      // Flag on: an erased scope keeps no stamp. The check sits outside settleAcceptanceStamp,
+      // which logs its own write errors instead of throwing.
+      if (pointers) {
+        const stamp = await readAcceptanceStamp(deps, stampName);
+        ensureLive();
+        await settleAcceptanceStamp(deps, scope, stampName, stamp, null, at);
+      }
       return { manifests: 0, rows: 0, inserted: 0, deleted: 0, complete: true, reasons: ["erased"] };
     }
     // SEARCH_INDEX_SKIP_OVER_BOUND_ENABLED=true only: the same refusal as below, without a
@@ -973,12 +981,14 @@ export async function indexSearchScope(scope: SessionScope, deps: SearchIndexDep
     // Flag on: stamp or clear once the pass has its outcome. Busy and deferred passes return
     // before this is called (the lock refusal above, the stream deferral below), so they do neither.
     const settle = async (result: SearchIndexResult): Promise<SearchIndexResult> => {
-      if (acceptance && pointers)
+      if (acceptance && pointers) {
+        ensureLive();
         await settleAcceptanceStamp(
           deps, scope, stampName, acceptance.stamp,
           acceptanceOnly(result) && readAsListed(pointers, acceptance.observed) ? acceptance.digest : null,
           at,
         );
+      }
       return result;
     };
     // SEARCH_INDEX_STREAMING_CH=1 only: a scope refused for its size alone, small enough for

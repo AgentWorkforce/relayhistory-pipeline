@@ -185,3 +185,117 @@ describe("HoopDb session index", () => {
     ]);
   });
 });
+
+describe("HoopDb session index: the per-call liveness check", () => {
+  type Event = { kind: "sql"; text: string; params?: unknown[]; arity: number } | { kind: "send"; stage: string };
+  const label = (e: Event) => (e.kind === "sql" ? e.text.trim().split(/\s+/).slice(0, 2).join(" ") : `send ${e.stage}`);
+  const pointer: RawPointer = {
+    traceId,
+    workspaceId: "ws-test",
+    machineId: "machine-test",
+    harness: "codex",
+    sessionId: "session-test",
+    manifestKey,
+    provider: "s3",
+    bucket: "locker",
+  };
+  const ctx: TraceContext = {
+    traceId,
+    orgId: "org-test",
+    workspaceId: "ws-test",
+    machineId: "machine-test",
+    harness: "codex",
+    sessionId: "session-test",
+  };
+  /**
+   * One index over a recording executor and queue (statements and sends in one log). A new
+   * session, so the live path runs every statement and fans out; with `brief` the wakeup is armed.
+   * `after` runs after each statement and each send.
+   */
+  function rig(after: () => void = () => {}) {
+    const events: Event[] = [];
+    const db = {
+      async query<R>(...args: [string, unknown[]?]) {
+        const [text, params] = args;
+        events.push({ kind: "sql", text, ...(params ? { params } : {}), arity: args.length });
+        after();
+        if (text.includes("upsert_session_index")) return { rows: [{ applied: true, revision: "1" }] as R[] };
+        if (text.includes("RETURNING 1")) return { rows: [{ "?column?": 1 }] as R[] };
+        return { rows: [] as R[] };
+      },
+    } as unknown as HoopDb;
+    const manifest = scrubbedManifest();
+    const reader: ManifestReader = { provider: "s3", bucket: "locker", async read() { return { manifest, etag: "etag-1" }; } };
+    const queue: PipelineQueue = {
+      backend: "memory",
+      async send(message) { events.push({ kind: "send", stage: message.stage }); after(); },
+      async sendBatch() { throw new Error("not used"); },
+    };
+    const index = hoopDbSessionIndex({ db, reader, queue, current: () => undefined, brief: { idleSeconds: 60, maxWaitSeconds: 600 } });
+    return { events, index };
+  }
+  const tombstone: RawPointer = { ...pointer, deleted: true } as RawPointer;
+
+  test("without a check (and with a check that never throws) the statements, their parameters, arity and order, and the sends are the same", async () => {
+    for (const p of [pointer, tombstone]) {
+      const plain = rig();
+      await plain.index.upsertRawPointer(p, ctx);
+      const checked = rig();
+      await checked.index.upsertRawPointer(p, ctx, () => {});
+      expect(checked.events).toEqual(plain.events);
+    }
+    // The statement list as it was before the check existed.
+    const live = rig();
+    await live.index.upsertRawPointer(pointer, ctx);
+    expect(live.events.map(label)).toEqual([
+      "SELECT session_uuid::text,",
+      "SELECT applied,",
+      "INSERT INTO",
+      "UPDATE sessions.session_index",
+      "WITH live",
+      "WITH identity_stats",
+      "send summary-short",
+      "send summary-long",
+      "send status-classify",
+      "INSERT INTO",
+      "UPDATE sessions.session_index_ext",
+    ]);
+    const gone = rig();
+    await gone.index.upsertRawPointer(tombstone, ctx);
+    expect(gone.events.map(label)).toEqual([
+      "UPDATE sessions.session_index",
+      "WITH identity_stats", // propagatePointerTombstone
+      "WITH live", // projectSessionDirectory
+      "WITH identity_stats",
+    ]);
+  });
+
+  test("an error reported after any statement or send stops the next one, reads included, and the call fails with it", async () => {
+    for (const p of [pointer, tombstone]) {
+      const full = rig();
+      await full.index.upsertRawPointer(p, ctx);
+      for (let i = 0; i < full.events.length; i++) {
+        const error = new Error(`lock connection gone after event ${i}`);
+        let broken = false;
+        const r = rig(() => {
+          if (r.events.length === i + 1) broken = true;
+        });
+        const run = r.index.upsertRawPointer(p, ctx, () => {
+          if (broken) throw error;
+        });
+        if (i === full.events.length - 1) await run;
+        else await expect(run).rejects.toBe(error);
+        expect(r.events.map(label)).toEqual(full.events.slice(0, i + 1).map(label));
+      }
+    }
+  });
+
+  test("the check is per call: a call without one on the same index after a checked call is not checked", async () => {
+    const error = new Error("gone");
+    const r = rig();
+    await expect(r.index.upsertRawPointer(pointer, ctx, () => { throw error; })).rejects.toBe(error);
+    expect(r.events).toEqual([]);
+    await r.index.upsertRawPointer(pointer, ctx);
+    expect(r.events.length).toBe(11);
+  });
+});

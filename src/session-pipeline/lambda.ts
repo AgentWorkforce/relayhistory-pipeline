@@ -327,9 +327,10 @@ export function supabasePool(url: string, max: number, timeouts: DbTimeouts = {}
  * promise: the next statement on this client (the pass's keepalive, its forced lock check before
  * any delete, COMMIT) rejects with it, and so does `ensureLive`, the synchronous check handed to
  * `work` as its second argument. A dropped connection frees its advisory lock, so `work`
- * calls `ensureLive()` immediately before each write it makes elsewhere (other pool clients,
- * ClickHouse): once an error was emitted, the write is not made and the work fails with that
- * error. The check sends no statement. It cannot stop a write already in flight when the error
+ * calls `ensureLive()` immediately before what it sends elsewhere under the lock (the pointer
+ * stage: every statement on other pool clients and every fan-out send; the unstreamed search
+ * pass: every ClickHouse write): once an error was emitted, that is not sent and the work fails
+ * with that error. The check sends no statement. It cannot stop a write already in flight when the error
  * is emitted, and it sees only a drop that pg reported; a drop pg has not noticed yet surfaces at
  * the next statement on this client. The broken client is destroyed (`release(err)`), not
  * returned to the pool, and the listener is removed before release. Unguarded, `ensureLive` is
@@ -383,7 +384,7 @@ export function searchTransaction(db: HoopDb): SearchIndexDeps["transact"] {
 /**
  * The pointer stage's scope lock: a guarded transaction (transaction() above) holding the scope's
  * advisory lock, waiting at most 30 s for it, while `work` runs. `work` gets the transaction's
- * `ensureLive` check and calls it before each write it makes under the lock.
+ * `ensureLive` check and calls it before every statement and fan-out send it makes under the lock.
  */
 export function scopeLock(db: HoopDb): ScopeLock {
   return (scope, work) =>

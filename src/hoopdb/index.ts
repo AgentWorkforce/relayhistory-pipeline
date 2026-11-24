@@ -11,10 +11,10 @@ import {
   type PipelineQueue,
   type RawPointer,
   type SessionPointerIndex,
+  type SqlExecutor,
   type StageMessage,
   type TraceContext,
 } from "../shared/vendor.ts";
-import type { HoopDb } from "../shared/db.ts";
 import { ctxOf, enrichMessage, sessionExt } from "../shared/enrich.ts";
 import { log } from "../shared/log.ts";
 import { uuidv7 } from "../shared/ids.ts";
@@ -34,7 +34,7 @@ export const FAN_OUT_STAGES = [
 ] as const;
 
 export interface IndexDeps {
-  db: HoopDb;
+  db: SqlExecutor;
   reader: ManifestReader;
   queue: PipelineQueue;
   /** The message being handled, so fan-out continues its trace and ids. */
@@ -46,12 +46,81 @@ export interface IndexDeps {
   brief?: { idleSeconds: number; maxWaitSeconds: number } | null;
 }
 
-export function hoopDbSessionIndex(deps: IndexDeps): SessionPointerIndex {
+/**
+ * The pointer index, with an optional per-call check on `upsertRawPointer`.
+ *
+ * `ensureLive` (given by the session pipeline's pointer stage, which runs under a
+ * scope lock): called synchronously before every statement this call sends and
+ * before every fan-out queue send, so once the lock's connection has reported an
+ * error nothing further is written. It wraps the executor and queue this one call
+ * uses (the shared index object is never changed), so a statement added later in
+ * this method is covered without a new call site. Absent: the shared executor and
+ * queue are used as they are, exactly as without it.
+ */
+export interface CheckedSessionPointerIndex extends SessionPointerIndex {
+  upsertRawPointer(
+    pointer: RawPointer,
+    ctx: TraceContext,
+    ensureLive?: () => void,
+  ): ReturnType<SessionPointerIndex["upsertRawPointer"]>;
+}
+
+/** `db` with `ensureLive()` run before each statement; same arguments, same round trips. */
+export function checkedExecutor(
+  db: SqlExecutor,
+  ensureLive: () => void,
+): SqlExecutor {
+  return {
+    query<R = Record<string, unknown>>(
+      ...args: Parameters<SqlExecutor["query"]>
+    ) {
+      ensureLive();
+      return db.query<R>(...args);
+    },
+  };
+}
+
+function checkedQueue(
+  queue: PipelineQueue,
+  ensureLive: () => void,
+): PipelineQueue {
+  return {
+    backend: queue.backend,
+    send(...args) {
+      ensureLive();
+      return queue.send(...args);
+    },
+    sendBatch(...args) {
+      ensureLive();
+      return queue.sendBatch(...args);
+    },
+  };
+}
+
+export function hoopDbSessionIndex(
+  shared: IndexDeps,
+): CheckedSessionPointerIndex {
   const fromEnv = briefConfig();
   const brief =
-    deps.brief !== undefined ? deps.brief : fromEnv.enabled ? fromEnv : null;
+    shared.brief !== undefined
+      ? shared.brief
+      : fromEnv.enabled
+        ? fromEnv
+        : null;
   return {
-    async upsertRawPointer(pointer: RawPointer, ctx: TraceContext) {
+    async upsertRawPointer(
+      pointer: RawPointer,
+      ctx: TraceContext,
+      ensureLive?: () => void,
+    ) {
+      // Every statement and queue send below goes through `deps`.
+      const deps: IndexDeps = ensureLive
+        ? {
+            ...shared,
+            db: checkedExecutor(shared.db, ensureLive),
+            queue: checkedQueue(shared.queue, ensureLive),
+          }
+        : shared;
       const pk = {
         org_id: ctx.orgId,
         workspace_id: pointer.workspaceId,

@@ -268,6 +268,23 @@ describe("the pointer stage checks the scope lock before each write (real SQL)",
     expect(d.pool.client.released).toEqual([error]);
   }, 60_000);
 
+  test("a move, with an 'error' during the fenced upsert's last statement: the stored row is not read", async () => {
+    const { a, b } = await moved();
+    const error = dropped();
+    let pool!: ReturnType<typeof fakePool>;
+    // The fenced upsert at the new key: the existing-row read, upsert_session_index, the extension
+    // row, the identity repair and the directory projection (nine statements); emit during the last.
+    let n = 0;
+    const drop = dropOnce(() => pool.client, error, () => ++n === 9);
+    const d = lockedDeps(drop.during);
+    pool = d.pool;
+    await expect(indexPointer(landed(b), d.pointer)).rejects.toBe(error);
+    expect(drop.emitted()).toBe(true);
+    expect(d.sent).toEqual(["SELECT session_uuid::text,", "SELECT applied,", "INSERT INTO", "UPDATE sessions.session_index", "WITH live", "WITH target", "WITH target", "WITH target", "WITH target"]);
+    expect(await row()).toMatchObject({ deleted_at: null, manifest_key: a, revision: "3" });
+    expect(d.pool.client.released).toEqual([error]);
+  }, 60_000);
+
   test("a move, with an 'error' during the re-key delete: the upsert after it is not made", async () => {
     const { b } = await moved();
     const error = dropped();
@@ -282,6 +299,106 @@ describe("the pointer stage checks the scope lock before each write (real SQL)",
     expect(d.sent.slice(at + 1)).toEqual([]);
     // Left without a row (a redelivery under a fresh lock re-runs the move from the S3 truth).
     expect(await row()).toBeUndefined();
+    expect(d.pool.client.released).toEqual([error]);
+  }, 60_000);
+
+  test("an 'error' during the upsert's own manifest read: no statement after it is sent, and the message fails retryably", async () => {
+    const key = await writeManifest(1);
+    const error = dropped();
+    let pool!: ReturnType<typeof fakePool>;
+    const d = lockedDeps(async () => {});
+    pool = d.pool;
+    // Emit only during the read upsertRawPointer makes (after the stage's own reads).
+    let emitted = false;
+    const inner = d.pointer.reader;
+    const reader: ManifestReader = { ...inner, read: async (k) => {
+      const fromUpsert = (new Error().stack ?? "").includes("upsertRawPointer");
+      const r = await inner.read(k);
+      if (fromUpsert && !emitted) { emitted = true; await dropConnection(pool.client, error); }
+      return r;
+    } };
+    const out = await processBatch([{ messageId: "m", body: body(key, "ObjectCreated:Put", "01") }], { pointer: { ...d.pointer, reader } });
+    expect(emitted).toBe(true);
+    expect(out.batchItemFailures.map((f) => f.itemIdentifier)).toEqual(["m"]);
+    expect(d.sent).toEqual([]); // not the existing-row read, not upsert_session_index
+    expect(await row()).toBeUndefined();
+    expect(d.pool.client.released).toEqual([error]);
+  }, 60_000);
+
+  test("an 'error' between two statements of the upsert: the next one is not sent", async () => {
+    const key = await writeManifest(1);
+    const error = dropped();
+    let pool!: ReturnType<typeof fakePool>;
+    const drop = dropOnce(() => pool.client, error, (text) => text.includes("upsert_session_index"));
+    const d = lockedDeps(drop.during);
+    pool = d.pool;
+    await expect(indexPointer(landed(key), d.pointer)).rejects.toBe(error);
+    expect(drop.emitted()).toBe(true);
+    expect(d.sent).toEqual(["SELECT session_uuid::text,", "SELECT applied,"]);
+    expect(d.pool.client.released).toEqual([error]);
+  }, 60_000);
+
+  /** A live session whose manifest is then erased (the tombstone path). */
+  async function erased() {
+    const key = await writeManifest(1);
+    expect(await failures("1", body(key, "ObjectCreated:Put", "01"))).toEqual([]);
+    await store.delete(objectKey(key));
+    return key;
+  }
+
+  test("no error: the tombstone path sends the tombstone, the propagation and the projection", async () => {
+    const key = await erased();
+    const d = lockedDeps(async () => {});
+    expect(await indexPointer(landed(key, true), d.pointer)).toMatchObject({ status: "deleted" });
+    // Tombstone; propagatePointerTombstone; projectSessionDirectory (no machine left: it tombstones
+    // the directory row and deletes its memberships).
+    expect(d.sent).toEqual(["UPDATE sessions.session_index", "WITH identity_stats", "WITH live", "WITH identity_stats", "DELETE FROM", "DELETE FROM"]);
+    expect((await row())!.deleted_at).not.toBeNull();
+    expect(d.pool.client.statements).toEqual([...lockStatements, "COMMIT"]);
+  }, 60_000);
+
+  test("tombstone path, an 'error' during the tombstone: the propagation is not sent", async () => {
+    const key = await erased();
+    const error = dropped();
+    let pool!: ReturnType<typeof fakePool>;
+    const drop = dropOnce(() => pool.client, error, (text) => text.includes("RETURNING 1"));
+    const d = lockedDeps(drop.during);
+    pool = d.pool;
+    await expect(indexPointer(landed(key, true), d.pointer)).rejects.toBe(error);
+    expect(drop.emitted()).toBe(true);
+    expect(d.sent).toEqual(["UPDATE sessions.session_index"]);
+    expect(d.pool.client.released).toEqual([error]);
+  }, 60_000);
+
+  test("tombstone path, an 'error' during the propagation: the directory projection is not sent", async () => {
+    const key = await erased();
+    const error = dropped();
+    let pool!: ReturnType<typeof fakePool>;
+    const drop = dropOnce(() => pool.client, error, (text) => text.trim().startsWith("WITH identity_stats"));
+    const d = lockedDeps(drop.during);
+    pool = d.pool;
+    await expect(indexPointer(landed(key, true), d.pointer)).rejects.toBe(error);
+    expect(drop.emitted()).toBe(true);
+    expect(d.sent).toEqual(["UPDATE sessions.session_index", "WITH identity_stats"]);
+    expect(d.pool.client.released).toEqual([error]);
+  }, 60_000);
+
+  test("an 'error' during the first fan-out send: no further send and no statement after it", async () => {
+    const key = await writeManifest(1);
+    const error = dropped();
+    let pool!: ReturnType<typeof fakePool>;
+    const d = lockedDeps(async () => {});
+    pool = d.pool;
+    const sends: string[] = [];
+    const fanout = { ...droppedFanout, async send(message: { stage: string }) {
+      sends.push(message.stage);
+      d.sent.push(`send ${message.stage}`);
+      if (sends.length === 1) await dropConnection(pool.client, error);
+    } } as typeof droppedFanout;
+    await expect(indexPointer(landed(key), { ...d.pointer, fanout })).rejects.toBe(error);
+    expect(sends.length).toBe(1);
+    expect(d.sent.at(-1)).toBe(`send ${sends[0]}`);
+    expect(d.sent).not.toContain("UPDATE sessions.session_index_ext");
     expect(d.pool.client.released).toEqual([error]);
   }, 60_000);
 });

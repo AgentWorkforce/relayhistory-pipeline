@@ -31,7 +31,7 @@ import type { HoopDb } from "../../shared/db.ts";
 import type { SqlExecutor } from "@rhc/lib/pipeline/queue.ts";
 import type { ClickHouseClient } from "../vendor/search-index/clickhouse.ts";
 import type { IndexRow } from "../vendor/search-index/rows.ts";
-import { EVENTS_TABLE, SESSION_STATE_TABLE } from "../vendor/search-index/schema.ts";
+import { EVENTS_TABLE, INGEST_STATE_TABLE, SESSION_STATE_TABLE } from "../vendor/search-index/schema.ts";
 import { SEARCH_INDEX_STREAM_CH_BUDGET, STREAM_TAIL_RESERVE_MS, indexSearchScope, projectedToNeonRow, readChunkRecords, type SearchIndexDeps } from "../search-index.ts";
 import { STREAM_PASSES, streamScope } from "../search-index-stream.ts";
 import { searchTransaction, transaction } from "../lambda.ts";
@@ -1113,5 +1113,78 @@ describe("unstreamed pass on a guarded transaction: checked before each ClickHou
     const g = fakeClickHouse();
     expect(await indexSearchScope(scope, deps(g.ch, () => keys, { limits: tiny }).d)).toMatchObject({ partial: true });
     expect(g.state.map((r) => r.needs_full)).toEqual([1]);
+  });
+
+  /**
+   * Flag on (skipAcceptanceMissing). The acceptance-stamp read fails, so the pass owes a stamp
+   * clear (a write to INGEST_STATE_TABLE); `onStampRead` runs as that read fails.
+   */
+  function stampReadFails(ch: ClickHouseClient, onStampRead: () => Promise<void> = async () => {}): ClickHouseClient {
+    return {
+      ...ch,
+      async select<T>(q: string, o?: unknown) {
+        if (q.includes(INGEST_STATE_TABLE) && q.includes("AS at_ms")) {
+          await onStampRead();
+          throw new Error("stamp read failed");
+        }
+        return ch.select<T>(q, o as never);
+      },
+    };
+  }
+  const stampWrites = (statements: string[]) => statements.filter((s) => s === `insert ${INGEST_STATE_TABLE}`);
+
+  test("erased scope: an 'error' reported while the live keys are listed: the delete is not sent", async () => {
+    const f = fakeClickHouse();
+    const error = dropped();
+    let emitted = false;
+    const pool: ReturnType<typeof fakePool> = fakePool((text) => {
+      if (text.includes("pg_try_advisory_xact_lock")) return [{ ok: true }];
+      if (text.includes("FROM sessions.session_index") && text.includes("deleted_at IS NULL")) {
+        emitted = true;
+        pool.client.emit("error", error);
+      }
+      return [];
+    });
+    await expect(indexSearchScope(scope, deps(f.ch, () => [], { transact: searchTransaction(pool.db) }).d)).rejects.toBe(error);
+    expect(emitted).toBe(true);
+    expect(writes(f.statements)).toEqual([]);
+    expect(pool.client.released).toEqual([error]);
+  });
+
+  test("erased scope, flag on: an 'error' before the stamp clear: the clear is not written and the scope fails", async () => {
+    // Without an error the erased pass clears the stamp it could not read.
+    const plain = fakeClickHouse();
+    const p = livePool([]);
+    expect(await indexSearchScope(scope, deps(stampReadFails(plain.ch), () => [], { transact: searchTransaction(p.db), skipAcceptanceMissing: true }).d)).toMatchObject({ complete: true, reasons: ["erased"] });
+    expect(stampWrites(plain.statements)).toHaveLength(1);
+    const f = fakeClickHouse();
+    const { client, db } = livePool([]);
+    const error = dropped();
+    let emitted = false;
+    const ch = stampReadFails(f.ch, async () => { emitted = true; await dropConnection(client, error); });
+    await expect(indexSearchScope(scope, deps(ch, () => [], { transact: searchTransaction(db), skipAcceptanceMissing: true }).d)).rejects.toBe(error);
+    expect(emitted).toBe(true);
+    expect(f.statements.some((s) => s.startsWith(`command DELETE FROM ${EVENTS_TABLE}`))).toBe(true);
+    expect(stampWrites(f.statements)).toEqual([]);
+    expect(client.statements).not.toContain("COMMIT");
+    expect(client.released).toEqual([error]);
+  });
+
+  test("flag on: an 'error' during the pass's last write before settle: the stamp write is not made and the scope fails", async () => {
+    const keys = [await small()];
+    const plain = fakeClickHouse();
+    const p = livePool(keys);
+    expect(await indexSearchScope(scope, deps(stampReadFails(plain.ch), () => keys, { transact: searchTransaction(p.db), skipAcceptanceMissing: true }).d)).toMatchObject({ complete: true });
+    // The state row, then the stamp clear.
+    expect(writes(plain.statements).slice(-2)).toEqual([`insert ${SESSION_STATE_TABLE}`, `insert ${INGEST_STATE_TABLE}`]);
+    const f = fakeClickHouse();
+    const { client, db } = livePool(keys);
+    const error = dropped();
+    const d = dropDuring(stampReadFails(f.ch), client, error, (c) => c.kind === "insert" && c.text === SESSION_STATE_TABLE);
+    await expect(indexSearchScope(scope, deps(d.ch, () => keys, { transact: searchTransaction(db), skipAcceptanceMissing: true }).d)).rejects.toBe(error);
+    expect(d.emitted()).toBe(true);
+    expect(f.state).toHaveLength(1);
+    expect(stampWrites(f.statements)).toEqual([]);
+    expect(client.released).toEqual([error]);
   });
 });

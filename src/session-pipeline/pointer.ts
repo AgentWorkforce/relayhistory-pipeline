@@ -37,7 +37,7 @@ import {
 import type { ObjectLanded } from "@rhc/lib/pipeline/adapter.ts";
 import type { HoopDb } from "../shared/db.ts";
 import { enrichMessage } from "../shared/enrich.ts";
-import { hoopDbSessionIndex } from "../hoopdb/index.ts";
+import { checkedExecutor, hoopDbSessionIndex } from "../hoopdb/index.ts";
 
 /**
  * The ingest writer's spelling of the sessionless per-origin bucket: records without a session id
@@ -71,7 +71,8 @@ export function scopeLockKey(scope: SessionScope, stage: "pointer" | "search" = 
 /**
  * Run `work` while holding the session's lock (lambda.ts: pg_advisory_xact_lock in Supabase).
  * `ensureLive` throws once the lock's connection reported an error (the lock is then gone) and is
- * a no-op otherwise; `work` calls it immediately before each write it makes under the lock.
+ * a no-op otherwise; `work` calls it immediately before every statement it sends and every
+ * fan-out queue send it makes under the lock.
  */
 export type ScopeLock = <T>(scope: SessionScope, work: (ensureLive: () => void) => Promise<T>) => Promise<T>;
 
@@ -203,11 +204,12 @@ async function indexLocked(
   const message = await enrichMessage(indexed, deps.reader);
 
   const index = hoopDbSessionIndex({ db: deps.db, reader: deps.reader, queue: deps.fanout, current: () => message });
-  // Every write below first checks that the lock is still ours (ScopeLock).
-  const upsert = () => {
-    ensureLive();
-    return index.upsertRawPointer(message.payload as Parameters<typeof index.upsertRawPointer>[0], message.ctx);
-  };
+  // Every statement below, and every one the upsert sends (reads, writes, fan-out sends), first
+  // checks that the lock is still ours (ScopeLock): the upsert wraps its executor and queue with
+  // the check for this call, and this function's own statements go through `db`.
+  const db = checkedExecutor(deps.db, ensureLive);
+  const upsert = () =>
+    index.upsertRawPointer(message.payload as Parameters<typeof index.upsertRawPointer>[0], message.ctx, ensureLive);
   const result = await upsert();
   const revision = message.revision;
   if (!read) return { status: "deleted", scope, manifestKey: landed.key };
@@ -218,7 +220,7 @@ async function indexLocked(
   // wins; while both are live the move is in progress and the event retries.
   const pk = [orgId, scope.workspaceId, scope.harness, scope.sessionId, read.manifest.session.machine_id];
   const stored = (
-    await deps.db.query<{ manifest_key: string; deleted: boolean }>(
+    await db.query<{ manifest_key: string; deleted: boolean }>(
       `SELECT manifest_key, deleted_at IS NOT NULL AS deleted FROM sessions.session_index
         WHERE org_id = $1 AND workspace_id = $2 AND harness = $3 AND session_id = $4 AND machine_id = $5`,
       pk,
@@ -230,8 +232,7 @@ async function indexLocked(
       throw new PipelineError("pointer_move_pending", "the session's other key is still live; retry after its erasure", true);
     // The stored key is gone (or tombstoned): re-key the row to this one. The
     // row is derived, and the upsert rebuilds it from this manifest.
-    ensureLive();
-    await deps.db.query(
+    await db.query(
       `DELETE FROM sessions.session_index
         WHERE org_id = $1 AND workspace_id = $2 AND harness = $3 AND session_id = $4 AND machine_id = $5
           AND manifest_key = $6`,
