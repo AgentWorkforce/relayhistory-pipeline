@@ -1,0 +1,8547 @@
+{
+ "meta": {
+  "runId": "phase1-pg16-repeat",
+  "serverVersion": "PostgreSQL 16.16 (Debian 16.16-1.pgdg13+1) on x86_64-pc-linux-gnu, compiled by gcc (Debian 14.2.0-19) 14.2.0, 64-bit",
+  "settings": [
+   {
+    "name": "default_transaction_isolation",
+    "setting": "read committed",
+    "unit": null
+   },
+   {
+    "name": "fsync",
+    "setting": "on",
+    "unit": null
+   },
+   {
+    "name": "max_connections",
+    "setting": "300",
+    "unit": null
+   },
+   {
+    "name": "shared_buffers",
+    "setting": "131072",
+    "unit": "8kB"
+   },
+   {
+    "name": "synchronous_commit",
+    "setting": "on",
+    "unit": null
+   },
+   {
+    "name": "track_functions",
+    "setting": "all",
+    "unit": null
+   },
+   {
+    "name": "wal_level",
+    "setting": "replica",
+    "unit": null
+   }
+  ],
+  "templates": [
+   {
+    "historyLive": true
+   },
+   {
+    "body": "main",
+    "gate": "off",
+    "mode": "main"
+   },
+   {
+    "body": "t2",
+    "gate": "fenced",
+    "mode": "t2"
+   }
+  ],
+  "plan": {
+   "runId": "phase1-pg16-repeat",
+   "totalRecords": 32000,
+   "maxSeconds": 300,
+   "cells": [
+    {
+     "workload": "W1",
+     "n": 250,
+     "c": 2,
+     "body": "main"
+    },
+    {
+     "workload": "W1",
+     "n": 250,
+     "c": 4,
+     "body": "main"
+    },
+    {
+     "workload": "W1",
+     "n": 250,
+     "c": 16,
+     "body": "main"
+    },
+    {
+     "workload": "W1",
+     "n": 250,
+     "c": 64,
+     "body": "main"
+    },
+    {
+     "workload": "W2",
+     "n": 250,
+     "c": 4,
+     "body": "main"
+    },
+    {
+     "workload": "W2",
+     "n": 250,
+     "c": 16,
+     "body": "main"
+    },
+    {
+     "workload": "W1",
+     "n": 500,
+     "c": 2,
+     "body": "main"
+    },
+    {
+     "workload": "W1",
+     "n": 500,
+     "c": 4,
+     "body": "main"
+    },
+    {
+     "workload": "W1",
+     "n": 500,
+     "c": 16,
+     "body": "main"
+    },
+    {
+     "workload": "W1",
+     "n": 500,
+     "c": 64,
+     "body": "main"
+    },
+    {
+     "workload": "W2",
+     "n": 500,
+     "c": 4,
+     "body": "main"
+    },
+    {
+     "workload": "W2",
+     "n": 500,
+     "c": 16,
+     "body": "main"
+    },
+    {
+     "workload": "W1",
+     "n": 250,
+     "c": 2,
+     "body": "t2"
+    },
+    {
+     "workload": "W1",
+     "n": 250,
+     "c": 4,
+     "body": "t2"
+    },
+    {
+     "workload": "W1",
+     "n": 250,
+     "c": 16,
+     "body": "t2"
+    },
+    {
+     "workload": "W1",
+     "n": 250,
+     "c": 64,
+     "body": "t2"
+    },
+    {
+     "workload": "W2",
+     "n": 250,
+     "c": 4,
+     "body": "t2"
+    },
+    {
+     "workload": "W2",
+     "n": 250,
+     "c": 16,
+     "body": "t2"
+    },
+    {
+     "workload": "W1",
+     "n": 500,
+     "c": 2,
+     "body": "t2"
+    },
+    {
+     "workload": "W1",
+     "n": 500,
+     "c": 4,
+     "body": "t2"
+    },
+    {
+     "workload": "W1",
+     "n": 500,
+     "c": 16,
+     "body": "t2"
+    },
+    {
+     "workload": "W1",
+     "n": 500,
+     "c": 64,
+     "body": "t2"
+    },
+    {
+     "workload": "W2",
+     "n": 500,
+     "c": 4,
+     "body": "t2"
+    },
+    {
+     "workload": "W2",
+     "n": 500,
+     "c": 16,
+     "body": "t2"
+    }
+   ]
+  },
+  "client": {
+   "bun": "1.4.2",
+   "cpus": 24
+  },
+  "steps": [
+   "guard",
+   "lock_fences",
+   "seal",
+   "gate_read",
+   "clock_lock",
+   "origin_lock",
+   "stage_row",
+   "attempt_check1",
+   "attempt_row",
+   "loop_fetch",
+   "loop_key",
+   "loop_slot_lock",
+   "loop_checks",
+   "loop_seat",
+   "loop_slot_update",
+   "loop_decision_insert",
+   "loop_decision_check",
+   "last_seat_update",
+   "final_check",
+   "t2_A_candidates",
+   "t2_B_slot_locks",
+   "t2_C1_plan",
+   "t2_upgrade",
+   "t2_C2_number",
+   "t2_D_seats",
+   "t2_D_slots",
+   "t2_D_decisions",
+   "t2_E_count",
+   "verify_proxy"
+  ]
+ },
+ "rows": [
+  {
+   "cell": {
+    "workload": "W1",
+    "n": 250,
+    "c": 2,
+    "body": "main"
+   },
+   "threads": 2,
+   "drained": true,
+   "drainSeconds": 72.21,
+   "durableRecords": 32000,
+   "durableRecordsPerSec": 443,
+   "retriesPerBatch": 0,
+   "stageFailures": {},
+   "controls": {
+    "kind": "none",
+    "everyMs": 1000,
+    "scheduledSlots": 0,
+    "missedSlots": 0,
+    "started": 0,
+    "completedDuringLoad": 0,
+    "completedAfterLoadEnd": 0,
+    "failed": {},
+    "latencyMs": {
+     "n": 0,
+     "p50": null,
+     "p95": null,
+     "max": null,
+     "mean": null
+    }
+   },
+   "commitsOk": 128,
+   "traced": 128,
+   "untraced": 0,
+   "holdMs": {
+    "n": 128,
+    "p50": 144.87,
+    "p95": 1463.82,
+    "max": 3369.05,
+    "mean": 275.52
+   },
+   "clockWaitMs": {
+    "n": 128,
+    "p50": 0.04,
+    "p95": 98.79,
+    "max": 1756.85,
+    "mean": 34.94
+   },
+   "inAckAfterLockMs": {
+    "n": 128,
+    "p50": 133.58,
+    "p95": 229.63,
+    "max": 1168.7,
+    "mean": 146.19
+   },
+   "postAckMs": {
+    "n": 128,
+    "p50": 1.04,
+    "p95": 1.84,
+    "max": 2.38,
+    "mean": 1.06
+   },
+   "commitRttMs": {
+    "n": 128,
+    "p50": 3.48,
+    "p95": 852.45,
+    "max": 3298.95,
+    "mean": 128.26
+   },
+   "preLockMs": {
+    "n": 128,
+    "p50": 0.35,
+    "p95": 0.74,
+    "max": 2.52,
+    "mean": 0.41
+   },
+   "commitStatementMs": {
+    "n": 128,
+    "p50": 144.48,
+    "p95": 300.53,
+    "max": 1862.64,
+    "mean": 187.24
+   },
+   "commitStatementAllMs": {
+    "n": 128,
+    "p50": 144.48,
+    "p95": 300.53,
+    "max": 1862.64,
+    "mean": 187.24
+   },
+   "commitWholeAllMs": {
+    "n": 128,
+    "p50": 161.65,
+    "p95": 1826.47,
+    "max": 3375.31,
+    "mean": 316.19
+   },
+   "offsetProbeRttMs": {
+    "n": 128,
+    "p50": 0.62,
+    "p95": 1.69,
+    "max": 6.54,
+    "mean": 0.82
+   },
+   "split": {
+    "toWrapper": {
+     "n": 128,
+     "p50": 0.32,
+     "p95": 0.99,
+     "max": 16.21,
+     "mean": 0.53
+    },
+    "originClaimEnter": {
+     "n": 128,
+     "p50": 0.37,
+     "p95": 0.66,
+     "max": 1.11,
+     "mean": 0.4
+    },
+    "commitBeforeAck": {
+     "n": 128,
+     "p50": 3.39,
+     "p95": 5.74,
+     "max": 18.41,
+     "mean": 3.69
+    },
+    "ackBeforeLock": {
+     "n": 128,
+     "p50": 0.35,
+     "p95": 0.74,
+     "max": 2.52,
+     "mean": 0.41
+    },
+    "wait": {
+     "n": 128,
+     "p50": 0.04,
+     "p95": 98.79,
+     "max": 1756.85,
+     "mean": 34.94
+    },
+    "inAck": {
+     "n": 128,
+     "p50": 133.58,
+     "p95": 229.63,
+     "max": 1168.7,
+     "mean": 146.19
+    },
+    "afterAck": {
+     "n": 128,
+     "p50": 0.54,
+     "p95": 1.03,
+     "max": 1.91,
+     "mean": 0.6
+    },
+    "toClientReturn": {
+     "n": 128,
+     "p50": 0.47,
+     "p95": 0.79,
+     "max": 1.45,
+     "mean": 0.46
+    },
+    "commitRtt": {
+     "n": 128,
+     "p50": 3.48,
+     "p95": 852.45,
+     "max": 3298.95,
+     "mean": 128.26
+    },
+    "nativeOriginLock": {
+     "n": 128,
+     "p50": 0.03,
+     "p95": 0.08,
+     "max": 0.31,
+     "mean": 0.04
+    }
+   },
+   "commitAttempts": {
+    "n": 128,
+    "over2s": 0,
+    "over5s": 0,
+    "failed": 0,
+    "statementMsOkAndFailed": {
+     "n": 128,
+     "p50": 144.48,
+     "p95": 300.53,
+     "max": 1862.64,
+     "mean": 187.24
+    }
+   },
+   "afterLockSteps": [
+    "origin_lock",
+    "stage_row",
+    "attempt_check1",
+    "attempt_row",
+    "loop_fetch",
+    "loop_key",
+    "loop_slot_lock",
+    "loop_checks",
+    "loop_seat",
+    "loop_slot_update",
+    "loop_decision_insert",
+    "loop_decision_check",
+    "last_seat_update",
+    "final_check"
+   ],
+   "stepMs": {
+    "guard": {
+     "n": 128,
+     "p50": 0.12,
+     "p95": 0.25,
+     "max": 0.75,
+     "mean": 0.13
+    },
+    "lock_fences": {
+     "n": 128,
+     "p50": 0.14,
+     "p95": 0.28,
+     "max": 0.84,
+     "mean": 0.16
+    },
+    "seal": {
+     "n": 128,
+     "p50": 0.05,
+     "p95": 0.18,
+     "max": 0.67,
+     "mean": 0.07
+    },
+    "gate_read": {
+     "n": 128,
+     "p50": 0.04,
+     "p95": 0.08,
+     "max": 0.68,
+     "mean": 0.05
+    },
+    "clock_lock": {
+     "n": 128,
+     "p50": 0.04,
+     "p95": 98.79,
+     "max": 1756.85,
+     "mean": 34.94
+    },
+    "origin_lock": {
+     "n": 128,
+     "p50": 0.03,
+     "p95": 0.08,
+     "max": 0.31,
+     "mean": 0.04
+    },
+    "stage_row": {
+     "n": 128,
+     "p50": 0.09,
+     "p95": 0.48,
+     "max": 1.12,
+     "mean": 0.13
+    },
+    "attempt_check1": {
+     "n": 128,
+     "p50": 0.36,
+     "p95": 0.67,
+     "max": 1.69,
+     "mean": 0.37
+    },
+    "attempt_row": {
+     "n": 128,
+     "p50": 0.12,
+     "p95": 0.25,
+     "max": 0.53,
+     "mean": 0.13
+    },
+    "loop_fetch": {
+     "n": 128,
+     "p50": 8.02,
+     "p95": 11.06,
+     "max": 14.53,
+     "mean": 7.97
+    },
+    "loop_key": {
+     "n": 128,
+     "p50": 4.21,
+     "p95": 9.36,
+     "max": 11.49,
+     "mean": 4.58
+    },
+    "loop_slot_lock": {
+     "n": 128,
+     "p50": 5.4,
+     "p95": 8.72,
+     "max": 9.96,
+     "mean": 5.5
+    },
+    "loop_checks": {
+     "n": 128,
+     "p50": 1.04,
+     "p95": 2.25,
+     "max": 2.69,
+     "mean": 1.17
+    },
+    "loop_seat": {
+     "n": 128,
+     "p50": 18.51,
+     "p95": 29.6,
+     "max": 221.74,
+     "mean": 20.84
+    },
+    "loop_slot_update": {
+     "n": 128,
+     "p50": 53.82,
+     "p95": 99.27,
+     "max": 1127.41,
+     "mean": 65.5
+    },
+    "loop_decision_insert": {
+     "n": 128,
+     "p50": 34.72,
+     "p95": 55.28,
+     "max": 119.16,
+     "mean": 35.97
+    },
+    "loop_decision_check": {
+     "n": 128,
+     "p50": 3.35,
+     "p95": 6.14,
+     "max": 7.6,
+     "mean": 3.48
+    },
+    "last_seat_update": {
+     "n": 128,
+     "p50": 0.11,
+     "p95": 0.24,
+     "max": 0.46,
+     "mean": 0.13
+    },
+    "final_check": {
+     "n": 128,
+     "p50": 0.35,
+     "p95": 0.69,
+     "max": 0.93,
+     "mean": 0.39
+    }
+   },
+   "lastSeat": "9007199254772993",
+   "seats": 32000,
+   "decisions": 32000
+  },
+  {
+   "cell": {
+    "workload": "W1",
+    "n": 250,
+    "c": 4,
+    "body": "main"
+   },
+   "threads": 4,
+   "drained": true,
+   "drainSeconds": 27.2,
+   "durableRecords": 32000,
+   "durableRecordsPerSec": 1177,
+   "retriesPerBatch": 0.03,
+   "stageFailures": {
+    "commit:55P03": 4
+   },
+   "controls": {
+    "kind": "none",
+    "everyMs": 1000,
+    "scheduledSlots": 0,
+    "missedSlots": 0,
+    "started": 0,
+    "completedDuringLoad": 0,
+    "completedAfterLoadEnd": 0,
+    "failed": {},
+    "latencyMs": {
+     "n": 0,
+     "p50": null,
+     "p95": null,
+     "max": null,
+     "mean": null
+    }
+   },
+   "commitsOk": 128,
+   "traced": 128,
+   "untraced": 0,
+   "holdMs": {
+    "n": 128,
+    "p50": 119.34,
+    "p95": 418.01,
+    "max": 3478.2,
+    "mean": 206.46
+   },
+   "clockWaitMs": {
+    "n": 128,
+    "p50": 120.67,
+    "p95": 489.03,
+    "max": 3467.19,
+    "mean": 203.81
+   },
+   "inAckAfterLockMs": {
+    "n": 128,
+    "p50": 111.25,
+    "p95": 195.78,
+    "max": 266.6,
+    "mean": 116.17
+   },
+   "postAckMs": {
+    "n": 128,
+    "p50": 1.05,
+    "p95": 2.16,
+    "max": 4.76,
+    "mean": 1.16
+   },
+   "commitRttMs": {
+    "n": 128,
+    "p50": 2.97,
+    "p95": 257.57,
+    "max": 3372.96,
+    "mean": 89.14
+   },
+   "preLockMs": {
+    "n": 128,
+    "p50": 0.35,
+    "p95": 0.83,
+    "max": 1.22,
+    "mean": 0.4
+   },
+   "commitStatementMs": {
+    "n": 128,
+    "p50": 249.71,
+    "p95": 615.41,
+    "max": 3561.9,
+    "mean": 325.56
+   },
+   "commitStatementAllMs": {
+    "n": 128,
+    "p50": 249.71,
+    "p95": 615.41,
+    "max": 3561.9,
+    "mean": 325.56
+   },
+   "commitWholeAllMs": {
+    "n": 128,
+    "p50": 254.12,
+    "p95": 1993.7,
+    "max": 3606.95,
+    "mean": 415.25
+   },
+   "offsetProbeRttMs": {
+    "n": 128,
+    "p50": 0.6,
+    "p95": 1.33,
+    "max": 5.18,
+    "mean": 0.68
+   },
+   "split": {
+    "toWrapper": {
+     "n": 128,
+     "p50": 0.3,
+     "p95": 0.63,
+     "max": 1.32,
+     "mean": 0.33
+    },
+    "originClaimEnter": {
+     "n": 128,
+     "p50": 0.36,
+     "p95": 0.49,
+     "max": 0.98,
+     "mean": 0.36
+    },
+    "commitBeforeAck": {
+     "n": 128,
+     "p50": 3.19,
+     "p95": 5.42,
+     "max": 6.94,
+     "mean": 3.33
+    },
+    "ackBeforeLock": {
+     "n": 128,
+     "p50": 0.35,
+     "p95": 0.83,
+     "max": 1.22,
+     "mean": 0.4
+    },
+    "wait": {
+     "n": 128,
+     "p50": 120.67,
+     "p95": 489.03,
+     "max": 3467.19,
+     "mean": 203.81
+    },
+    "inAck": {
+     "n": 128,
+     "p50": 111.25,
+     "p95": 195.78,
+     "max": 266.6,
+     "mean": 116.17
+    },
+    "afterAck": {
+     "n": 128,
+     "p50": 0.51,
+     "p95": 1.36,
+     "max": 2.12,
+     "mean": 0.6
+    },
+    "toClientReturn": {
+     "n": 128,
+     "p50": 0.5,
+     "p95": 1,
+     "max": 2.73,
+     "mean": 0.56
+    },
+    "commitRtt": {
+     "n": 128,
+     "p50": 2.97,
+     "p95": 257.57,
+     "max": 3372.96,
+     "mean": 89.14
+    },
+    "nativeOriginLock": {
+     "n": 128,
+     "p50": 0.07,
+     "p95": 0.15,
+     "max": 0.44,
+     "mean": 0.08
+    }
+   },
+   "commitAttempts": {
+    "n": 132,
+    "over2s": 6,
+    "over5s": 0,
+    "failed": 4,
+    "statementMsOkAndFailed": {
+     "n": 132,
+     "p50": 250.81,
+     "p95": 1780.79,
+     "max": 3561.9,
+     "mean": 378.05
+    }
+   },
+   "afterLockSteps": [
+    "origin_lock",
+    "stage_row",
+    "attempt_check1",
+    "attempt_row",
+    "loop_fetch",
+    "loop_key",
+    "loop_slot_lock",
+    "loop_checks",
+    "loop_seat",
+    "loop_slot_update",
+    "loop_decision_insert",
+    "loop_decision_check",
+    "last_seat_update",
+    "final_check"
+   ],
+   "stepMs": {
+    "guard": {
+     "n": 128,
+     "p50": 0.12,
+     "p95": 0.23,
+     "max": 0.38,
+     "mean": 0.12
+    },
+    "lock_fences": {
+     "n": 128,
+     "p50": 0.14,
+     "p95": 0.28,
+     "max": 0.52,
+     "mean": 0.15
+    },
+    "seal": {
+     "n": 128,
+     "p50": 0.05,
+     "p95": 0.23,
+     "max": 0.48,
+     "mean": 0.08
+    },
+    "gate_read": {
+     "n": 128,
+     "p50": 0.04,
+     "p95": 0.1,
+     "max": 0.34,
+     "mean": 0.05
+    },
+    "clock_lock": {
+     "n": 128,
+     "p50": 120.67,
+     "p95": 489.03,
+     "max": 3467.19,
+     "mean": 203.81
+    },
+    "origin_lock": {
+     "n": 128,
+     "p50": 0.07,
+     "p95": 0.15,
+     "max": 0.44,
+     "mean": 0.08
+    },
+    "stage_row": {
+     "n": 128,
+     "p50": 0.14,
+     "p95": 0.74,
+     "max": 1.16,
+     "mean": 0.23
+    },
+    "attempt_check1": {
+     "n": 128,
+     "p50": 0.49,
+     "p95": 1.11,
+     "max": 1.94,
+     "mean": 0.54
+    },
+    "attempt_row": {
+     "n": 128,
+     "p50": 0.14,
+     "p95": 0.31,
+     "max": 0.75,
+     "mean": 0.17
+    },
+    "loop_fetch": {
+     "n": 128,
+     "p50": 7.55,
+     "p95": 10.87,
+     "max": 12.34,
+     "mean": 7.65
+    },
+    "loop_key": {
+     "n": 128,
+     "p50": 3.08,
+     "p95": 6.3,
+     "max": 9.15,
+     "mean": 3.38
+    },
+    "loop_slot_lock": {
+     "n": 128,
+     "p50": 4.65,
+     "p95": 7.15,
+     "max": 9.16,
+     "mean": 4.77
+    },
+    "loop_checks": {
+     "n": 128,
+     "p50": 0.83,
+     "p95": 1.72,
+     "max": 2.46,
+     "mean": 0.91
+    },
+    "loop_seat": {
+     "n": 128,
+     "p50": 15.59,
+     "p95": 25.56,
+     "max": 113.01,
+     "mean": 17.48
+    },
+    "loop_slot_update": {
+     "n": 128,
+     "p50": 43.15,
+     "p95": 79.86,
+     "max": 123.08,
+     "mean": 46.32
+    },
+    "loop_decision_insert": {
+     "n": 128,
+     "p50": 30.07,
+     "p95": 46.61,
+     "max": 134.04,
+     "mean": 31.36
+    },
+    "loop_decision_check": {
+     "n": 128,
+     "p50": 2.57,
+     "p95": 4.65,
+     "max": 6.78,
+     "mean": 2.74
+    },
+    "last_seat_update": {
+     "n": 128,
+     "p50": 0.11,
+     "p95": 0.3,
+     "max": 0.81,
+     "mean": 0.14
+    },
+    "final_check": {
+     "n": 128,
+     "p50": 0.34,
+     "p95": 0.77,
+     "max": 1.22,
+     "mean": 0.39
+    }
+   },
+   "lastSeat": "9007199254772993",
+   "seats": 32000,
+   "decisions": 32000
+  },
+  {
+   "cell": {
+    "workload": "W1",
+    "n": 250,
+    "c": 16,
+    "body": "main"
+   },
+   "threads": 8,
+   "drained": true,
+   "drainSeconds": 20.56,
+   "durableRecords": 32000,
+   "durableRecordsPerSec": 1556,
+   "retriesPerBatch": 0.06,
+   "stageFailures": {
+    "commit:55P03": 8
+   },
+   "controls": {
+    "kind": "none",
+    "everyMs": 1000,
+    "scheduledSlots": 0,
+    "missedSlots": 0,
+    "started": 0,
+    "completedDuringLoad": 0,
+    "completedAfterLoadEnd": 0,
+    "failed": {},
+    "latencyMs": {
+     "n": 0,
+     "p50": null,
+     "p95": null,
+     "max": null,
+     "mean": null
+    }
+   },
+   "commitsOk": 128,
+   "traced": 128,
+   "untraced": 0,
+   "holdMs": {
+    "n": 128,
+    "p50": 104.62,
+    "p95": 222.49,
+    "max": 5348.11,
+    "mean": 157.14
+   },
+   "clockWaitMs": {
+    "n": 128,
+    "p50": 1131.65,
+    "p95": 2453.12,
+    "max": 2660.12,
+    "mean": 1173.37
+   },
+   "inAckAfterLockMs": {
+    "n": 128,
+    "p50": 97.39,
+    "p95": 156.43,
+    "max": 214.75,
+    "mean": 101.54
+   },
+   "postAckMs": {
+    "n": 128,
+    "p50": 1.14,
+    "p95": 4.79,
+    "max": 62.07,
+    "mean": 2.38
+   },
+   "commitRttMs": {
+    "n": 128,
+    "p50": 2.97,
+    "p95": 61.22,
+    "max": 5246.41,
+    "mean": 53.23
+   },
+   "preLockMs": {
+    "n": 128,
+    "p50": 0.44,
+    "p95": 1.43,
+    "max": 2.25,
+    "mean": 0.53
+   },
+   "commitStatementMs": {
+    "n": 128,
+    "p50": 1274.13,
+    "p95": 2576.61,
+    "max": 2744.65,
+    "mean": 1282.87
+   },
+   "commitStatementAllMs": {
+    "n": 128,
+    "p50": 1274.13,
+    "p95": 2576.61,
+    "max": 2744.65,
+    "mean": 1282.87
+   },
+   "commitWholeAllMs": {
+    "n": 128,
+    "p50": 1275.94,
+    "p95": 2598.18,
+    "max": 7733.96,
+    "mean": 1336.67
+   },
+   "offsetProbeRttMs": {
+    "n": 128,
+    "p50": 0.59,
+    "p95": 1.13,
+    "max": 1.79,
+    "mean": 0.62
+   },
+   "split": {
+    "toWrapper": {
+     "n": 128,
+     "p50": 0.32,
+     "p95": 0.76,
+     "max": 0.99,
+     "mean": 0.36
+    },
+    "originClaimEnter": {
+     "n": 128,
+     "p50": 0.34,
+     "p95": 0.54,
+     "max": 0.73,
+     "mean": 0.35
+    },
+    "commitBeforeAck": {
+     "n": 128,
+     "p50": 3.84,
+     "p95": 8.89,
+     "max": 15.06,
+     "mean": 4.34
+    },
+    "ackBeforeLock": {
+     "n": 128,
+     "p50": 0.44,
+     "p95": 1.43,
+     "max": 2.25,
+     "mean": 0.53
+    },
+    "wait": {
+     "n": 128,
+     "p50": 1131.65,
+     "p95": 2453.12,
+     "max": 2660.12,
+     "mean": 1173.37
+    },
+    "inAck": {
+     "n": 128,
+     "p50": 97.39,
+     "p95": 156.43,
+     "max": 214.75,
+     "mean": 101.54
+    },
+    "afterAck": {
+     "n": 128,
+     "p50": 0.59,
+     "p95": 1.52,
+     "max": 3.39,
+     "mean": 0.72
+    },
+    "toClientReturn": {
+     "n": 128,
+     "p50": 0.51,
+     "p95": 4.1,
+     "max": 60.7,
+     "mean": 1.66
+    },
+    "commitRtt": {
+     "n": 128,
+     "p50": 2.97,
+     "p95": 61.22,
+     "max": 5246.41,
+     "mean": 53.23
+    },
+    "nativeOriginLock": {
+     "n": 128,
+     "p50": 0.09,
+     "p95": 0.24,
+     "max": 0.41,
+     "mean": 0.11
+    }
+   },
+   "commitAttempts": {
+    "n": 136,
+    "over2s": 55,
+    "over5s": 0,
+    "failed": 8,
+    "statementMsOkAndFailed": {
+     "n": 136,
+     "p50": 1535.77,
+     "p95": 2772.27,
+     "max": 3937.03,
+     "mean": 1395.58
+    }
+   },
+   "afterLockSteps": [
+    "origin_lock",
+    "stage_row",
+    "attempt_check1",
+    "attempt_row",
+    "loop_fetch",
+    "loop_key",
+    "loop_slot_lock",
+    "loop_checks",
+    "loop_seat",
+    "loop_slot_update",
+    "loop_decision_insert",
+    "loop_decision_check",
+    "last_seat_update",
+    "final_check"
+   ],
+   "stepMs": {
+    "guard": {
+     "n": 128,
+     "p50": 0.14,
+     "p95": 0.24,
+     "max": 0.47,
+     "mean": 0.14
+    },
+    "lock_fences": {
+     "n": 128,
+     "p50": 0.14,
+     "p95": 0.34,
+     "max": 0.67,
+     "mean": 0.16
+    },
+    "seal": {
+     "n": 128,
+     "p50": 0.13,
+     "p95": 0.36,
+     "max": 0.7,
+     "mean": 0.15
+    },
+    "gate_read": {
+     "n": 128,
+     "p50": 0.03,
+     "p95": 0.51,
+     "max": 0.64,
+     "mean": 0.09
+    },
+    "clock_lock": {
+     "n": 128,
+     "p50": 1131.65,
+     "p95": 2453.12,
+     "max": 2660.12,
+     "mean": 1173.37
+    },
+    "origin_lock": {
+     "n": 128,
+     "p50": 0.09,
+     "p95": 0.24,
+     "max": 0.41,
+     "mean": 0.11
+    },
+    "stage_row": {
+     "n": 128,
+     "p50": 0.41,
+     "p95": 1.22,
+     "max": 3.37,
+     "mean": 0.49
+    },
+    "attempt_check1": {
+     "n": 128,
+     "p50": 0.53,
+     "p95": 1.7,
+     "max": 2.2,
+     "mean": 0.7
+    },
+    "attempt_row": {
+     "n": 128,
+     "p50": 0.2,
+     "p95": 0.57,
+     "max": 1.14,
+     "mean": 0.25
+    },
+    "loop_fetch": {
+     "n": 128,
+     "p50": 6.71,
+     "p95": 10.02,
+     "max": 11.51,
+     "mean": 6.88
+    },
+    "loop_key": {
+     "n": 128,
+     "p50": 2.6,
+     "p95": 5.58,
+     "max": 7.58,
+     "mean": 2.87
+    },
+    "loop_slot_lock": {
+     "n": 128,
+     "p50": 4.34,
+     "p95": 6.75,
+     "max": 8.73,
+     "mean": 4.42
+    },
+    "loop_checks": {
+     "n": 128,
+     "p50": 0.7,
+     "p95": 1.57,
+     "max": 2.16,
+     "mean": 0.8
+    },
+    "loop_seat": {
+     "n": 128,
+     "p50": 14.4,
+     "p95": 21.57,
+     "max": 53.31,
+     "mean": 14.61
+    },
+    "loop_slot_update": {
+     "n": 128,
+     "p50": 37.62,
+     "p95": 64.97,
+     "max": 89.15,
+     "mean": 39.55
+    },
+    "loop_decision_insert": {
+     "n": 128,
+     "p50": 26.86,
+     "p95": 40.27,
+     "max": 79.45,
+     "mean": 27.32
+    },
+    "loop_decision_check": {
+     "n": 128,
+     "p50": 2.18,
+     "p95": 4.29,
+     "max": 6.03,
+     "mean": 2.39
+    },
+    "last_seat_update": {
+     "n": 128,
+     "p50": 0.14,
+     "p95": 0.35,
+     "max": 77.98,
+     "mean": 0.77
+    },
+    "final_check": {
+     "n": 128,
+     "p50": 0.32,
+     "p95": 0.71,
+     "max": 1.14,
+     "mean": 0.39
+    }
+   },
+   "lastSeat": "9007199254772993",
+   "seats": 32000,
+   "decisions": 32000
+  },
+  {
+   "cell": {
+    "workload": "W1",
+    "n": 250,
+    "c": 64,
+    "body": "main"
+   },
+   "threads": 8,
+   "drained": true,
+   "drainSeconds": 16.23,
+   "durableRecords": 32000,
+   "durableRecordsPerSec": 1971,
+   "retriesPerBatch": 0.31,
+   "stageFailures": {
+    "commit:57014": 40
+   },
+   "controls": {
+    "kind": "none",
+    "everyMs": 1000,
+    "scheduledSlots": 0,
+    "missedSlots": 0,
+    "started": 0,
+    "completedDuringLoad": 0,
+    "completedAfterLoadEnd": 0,
+    "failed": {},
+    "latencyMs": {
+     "n": 0,
+     "p50": null,
+     "p95": null,
+     "max": null,
+     "mean": null
+    }
+   },
+   "commitsOk": 128,
+   "traced": 128,
+   "untraced": 0,
+   "holdMs": {
+    "n": 128,
+    "p50": 95.44,
+    "p95": 231.82,
+    "max": 655.38,
+    "mean": 117.43
+   },
+   "clockWaitMs": {
+    "n": 128,
+    "p50": 2982.05,
+    "p95": 4549.34,
+    "max": 4821.27,
+    "mean": 2466.43
+   },
+   "inAckAfterLockMs": {
+    "n": 128,
+    "p50": 91.36,
+    "p95": 185.75,
+    "max": 616.41,
+    "mean": 105.69
+   },
+   "postAckMs": {
+    "n": 128,
+    "p50": 1.32,
+    "p95": 25.8,
+    "max": 185.32,
+    "mean": 5.98
+   },
+   "commitRttMs": {
+    "n": 128,
+    "p50": 2.66,
+    "p95": 4.98,
+    "max": 354.96,
+    "mean": 5.76
+   },
+   "preLockMs": {
+    "n": 128,
+    "p50": 0.52,
+    "p95": 3.84,
+    "max": 80.49,
+    "mean": 1.91
+   },
+   "commitStatementMs": {
+    "n": 128,
+    "p50": 3063.21,
+    "p95": 4670.21,
+    "max": 5007.98,
+    "mean": 2590.29
+   },
+   "commitStatementAllMs": {
+    "n": 128,
+    "p50": 3063.21,
+    "p95": 4670.21,
+    "max": 5007.98,
+    "mean": 2590.29
+   },
+   "commitWholeAllMs": {
+    "n": 128,
+    "p50": 3110.66,
+    "p95": 4672.44,
+    "max": 5012.26,
+    "mean": 2600.89
+   },
+   "offsetProbeRttMs": {
+    "n": 128,
+    "p50": 0.51,
+    "p95": 0.79,
+    "max": 3.47,
+    "mean": 0.54
+   },
+   "split": {
+    "toWrapper": {
+     "n": 128,
+     "p50": 0.36,
+     "p95": 2.9,
+     "max": 32.35,
+     "mean": 0.92
+    },
+    "originClaimEnter": {
+     "n": 128,
+     "p50": 0.36,
+     "p95": 0.69,
+     "max": 13.19,
+     "mean": 0.53
+    },
+    "commitBeforeAck": {
+     "n": 128,
+     "p50": 5.12,
+     "p95": 26.91,
+     "max": 79.39,
+     "mean": 8.82
+    },
+    "ackBeforeLock": {
+     "n": 128,
+     "p50": 0.52,
+     "p95": 3.84,
+     "max": 80.49,
+     "mean": 1.91
+    },
+    "wait": {
+     "n": 128,
+     "p50": 2982.05,
+     "p95": 4549.34,
+     "max": 4821.27,
+     "mean": 2466.43
+    },
+    "inAck": {
+     "n": 128,
+     "p50": 91.36,
+     "p95": 185.75,
+     "max": 616.41,
+     "mean": 105.69
+    },
+    "afterAck": {
+     "n": 128,
+     "p50": 0.84,
+     "p95": 1.69,
+     "max": 2.44,
+     "mean": 0.93
+    },
+    "toClientReturn": {
+     "n": 128,
+     "p50": 0.45,
+     "p95": 25.13,
+     "max": 184.08,
+     "mean": 5.05
+    },
+    "commitRtt": {
+     "n": 128,
+     "p50": 2.66,
+     "p95": 4.98,
+     "max": 354.96,
+     "mean": 5.76
+    },
+    "nativeOriginLock": {
+     "n": 128,
+     "p50": 0.15,
+     "p95": 0.31,
+     "max": 0.65,
+     "mean": 0.17
+    }
+   },
+   "commitAttempts": {
+    "n": 168,
+    "over2s": 122,
+    "over5s": 41,
+    "failed": 40,
+    "statementMsOkAndFailed": {
+     "n": 168,
+     "p50": 3713.3,
+     "p95": 5004.14,
+     "max": 5039.36,
+     "mean": 3165.18
+    }
+   },
+   "afterLockSteps": [
+    "origin_lock",
+    "stage_row",
+    "attempt_check1",
+    "attempt_row",
+    "loop_fetch",
+    "loop_key",
+    "loop_slot_lock",
+    "loop_checks",
+    "loop_seat",
+    "loop_slot_update",
+    "loop_decision_insert",
+    "loop_decision_check",
+    "last_seat_update",
+    "final_check"
+   ],
+   "stepMs": {
+    "guard": {
+     "n": 128,
+     "p50": 0.15,
+     "p95": 0.27,
+     "max": 3.93,
+     "mean": 0.19
+    },
+    "lock_fences": {
+     "n": 128,
+     "p50": 0.16,
+     "p95": 0.5,
+     "max": 3.49,
+     "mean": 0.26
+    },
+    "seal": {
+     "n": 128,
+     "p50": 0.16,
+     "p95": 0.51,
+     "max": 5.51,
+     "mean": 0.28
+    },
+    "gate_read": {
+     "n": 128,
+     "p50": 0.04,
+     "p95": 0.66,
+     "max": 74.5,
+     "mean": 1.18
+    },
+    "clock_lock": {
+     "n": 128,
+     "p50": 2982.05,
+     "p95": 4549.34,
+     "max": 4821.27,
+     "mean": 2466.43
+    },
+    "origin_lock": {
+     "n": 128,
+     "p50": 0.15,
+     "p95": 0.31,
+     "max": 0.65,
+     "mean": 0.17
+    },
+    "stage_row": {
+     "n": 128,
+     "p50": 0.57,
+     "p95": 1.35,
+     "max": 1.69,
+     "mean": 0.7
+    },
+    "attempt_check1": {
+     "n": 128,
+     "p50": 0.59,
+     "p95": 1.06,
+     "max": 1.27,
+     "mean": 0.63
+    },
+    "attempt_row": {
+     "n": 128,
+     "p50": 0.2,
+     "p95": 0.4,
+     "max": 0.5,
+     "mean": 0.22
+    },
+    "loop_fetch": {
+     "n": 128,
+     "p50": 5.99,
+     "p95": 10.98,
+     "max": 25.8,
+     "mean": 6.57
+    },
+    "loop_key": {
+     "n": 128,
+     "p50": 2.29,
+     "p95": 5.11,
+     "max": 34.55,
+     "mean": 2.9
+    },
+    "loop_slot_lock": {
+     "n": 128,
+     "p50": 4.08,
+     "p95": 6.47,
+     "max": 13.31,
+     "mean": 4.39
+    },
+    "loop_checks": {
+     "n": 128,
+     "p50": 0.68,
+     "p95": 1.37,
+     "max": 3.12,
+     "mean": 0.78
+    },
+    "loop_seat": {
+     "n": 128,
+     "p50": 13.34,
+     "p95": 25.29,
+     "max": 112.28,
+     "mean": 16.04
+    },
+    "loop_slot_update": {
+     "n": 128,
+     "p50": 34.6,
+     "p95": 59.73,
+     "max": 306.06,
+     "mean": 41.47
+    },
+    "loop_decision_insert": {
+     "n": 128,
+     "p50": 24.65,
+     "p95": 45.5,
+     "max": 264.18,
+     "mean": 28.69
+    },
+    "loop_decision_check": {
+     "n": 128,
+     "p50": 2.02,
+     "p95": 3.68,
+     "max": 12.49,
+     "mean": 2.47
+    },
+    "last_seat_update": {
+     "n": 128,
+     "p50": 0.2,
+     "p95": 0.37,
+     "max": 0.51,
+     "mean": 0.2
+    },
+    "final_check": {
+     "n": 128,
+     "p50": 0.47,
+     "p95": 0.77,
+     "max": 1.05,
+     "mean": 0.46
+    }
+   },
+   "lastSeat": "9007199254772993",
+   "seats": 32000,
+   "decisions": 32000
+  },
+  {
+   "cell": {
+    "workload": "W2",
+    "n": 250,
+    "c": 4,
+    "body": "main"
+   },
+   "threads": 4,
+   "drained": true,
+   "drainSeconds": 17.91,
+   "durableRecords": 32000,
+   "durableRecordsPerSec": 1787,
+   "retriesPerBatch": 0,
+   "stageFailures": {},
+   "controls": {
+    "kind": "none",
+    "everyMs": 1000,
+    "scheduledSlots": 0,
+    "missedSlots": 0,
+    "started": 0,
+    "completedDuringLoad": 0,
+    "completedAfterLoadEnd": 0,
+    "failed": {},
+    "latencyMs": {
+     "n": 0,
+     "p50": null,
+     "p95": null,
+     "max": null,
+     "mean": null
+    }
+   },
+   "commitsOk": 128,
+   "traced": 128,
+   "untraced": 0,
+   "holdMs": {
+    "n": 128,
+    "p50": 93.79,
+    "p95": 152.43,
+    "max": 928.84,
+    "mean": 108
+   },
+   "clockWaitMs": {
+    "n": 128,
+    "p50": 20.44,
+    "p95": 152.54,
+    "max": 655.5,
+    "mean": 48.81
+   },
+   "inAckAfterLockMs": {
+    "n": 128,
+    "p50": 88.02,
+    "p95": 138.08,
+    "max": 216.7,
+    "mean": 93.47
+   },
+   "postAckMs": {
+    "n": 128,
+    "p50": 0.88,
+    "p95": 1.67,
+    "max": 2.84,
+    "mean": 0.96
+   },
+   "commitRttMs": {
+    "n": 128,
+    "p50": 2.66,
+    "p95": 12.39,
+    "max": 792.73,
+    "mean": 13.57
+   },
+   "preLockMs": {
+    "n": 128,
+    "p50": 0.28,
+    "p95": 0.55,
+    "max": 1.29,
+    "mean": 0.32
+   },
+   "commitStatementMs": {
+    "n": 128,
+    "p50": 138.34,
+    "p95": 252.14,
+    "max": 743.61,
+    "mean": 154.85
+   },
+   "commitStatementAllMs": {
+    "n": 128,
+    "p50": 138.34,
+    "p95": 252.14,
+    "max": 743.61,
+    "mean": 154.85
+   },
+   "commitWholeAllMs": {
+    "n": 128,
+    "p50": 142.67,
+    "p95": 260.65,
+    "max": 1104.53,
+    "mean": 168.95
+   },
+   "offsetProbeRttMs": {
+    "n": 128,
+    "p50": 0.51,
+    "p95": 0.86,
+    "max": 3.04,
+    "mean": 0.54
+   },
+   "split": {
+    "toWrapper": {
+     "n": 128,
+     "p50": 0.27,
+     "p95": 0.48,
+     "max": 0.6,
+     "mean": 0.27
+    },
+    "originClaimEnter": {
+     "n": 128,
+     "p50": 0.33,
+     "p95": 83.78,
+     "max": 123.02,
+     "mean": 8.11
+    },
+    "commitBeforeAck": {
+     "n": 128,
+     "p50": 2.66,
+     "p95": 4.54,
+     "max": 7.51,
+     "mean": 2.9
+    },
+    "ackBeforeLock": {
+     "n": 128,
+     "p50": 0.28,
+     "p95": 0.55,
+     "max": 1.29,
+     "mean": 0.32
+    },
+    "wait": {
+     "n": 128,
+     "p50": 20.44,
+     "p95": 152.54,
+     "max": 655.5,
+     "mean": 48.81
+    },
+    "inAck": {
+     "n": 128,
+     "p50": 88.02,
+     "p95": 138.08,
+     "max": 216.7,
+     "mean": 93.47
+    },
+    "afterAck": {
+     "n": 128,
+     "p50": 0.41,
+     "p95": 0.89,
+     "max": 1.44,
+     "mean": 0.47
+    },
+    "toClientReturn": {
+     "n": 128,
+     "p50": 0.46,
+     "p95": 0.71,
+     "max": 1.7,
+     "mean": 0.49
+    },
+    "commitRtt": {
+     "n": 128,
+     "p50": 2.66,
+     "p95": 12.39,
+     "max": 792.73,
+     "mean": 13.57
+    },
+    "nativeOriginLock": {
+     "n": 128,
+     "p50": 0.05,
+     "p95": 0.13,
+     "max": 0.22,
+     "mean": 0.05
+    }
+   },
+   "commitAttempts": {
+    "n": 128,
+    "over2s": 0,
+    "over5s": 0,
+    "failed": 0,
+    "statementMsOkAndFailed": {
+     "n": 128,
+     "p50": 138.34,
+     "p95": 252.14,
+     "max": 743.61,
+     "mean": 154.85
+    }
+   },
+   "afterLockSteps": [
+    "origin_lock",
+    "stage_row",
+    "attempt_check1",
+    "attempt_row",
+    "loop_fetch",
+    "loop_key",
+    "loop_slot_lock",
+    "loop_checks",
+    "loop_seat",
+    "loop_slot_update",
+    "loop_decision_insert",
+    "loop_decision_check",
+    "last_seat_update",
+    "final_check"
+   ],
+   "stepMs": {
+    "guard": {
+     "n": 128,
+     "p50": 0.1,
+     "p95": 0.15,
+     "max": 0.24,
+     "mean": 0.1
+    },
+    "lock_fences": {
+     "n": 128,
+     "p50": 0.11,
+     "p95": 0.19,
+     "max": 0.3,
+     "mean": 0.12
+    },
+    "seal": {
+     "n": 128,
+     "p50": 0.04,
+     "p95": 0.19,
+     "max": 0.28,
+     "mean": 0.06
+    },
+    "gate_read": {
+     "n": 128,
+     "p50": 0.03,
+     "p95": 0.05,
+     "max": 0.46,
+     "mean": 0.04
+    },
+    "clock_lock": {
+     "n": 128,
+     "p50": 20.44,
+     "p95": 152.54,
+     "max": 655.5,
+     "mean": 48.81
+    },
+    "origin_lock": {
+     "n": 128,
+     "p50": 0.05,
+     "p95": 0.13,
+     "max": 0.22,
+     "mean": 0.05
+    },
+    "stage_row": {
+     "n": 128,
+     "p50": 0.1,
+     "p95": 0.49,
+     "max": 0.77,
+     "mean": 0.16
+    },
+    "attempt_check1": {
+     "n": 128,
+     "p50": 0.36,
+     "p95": 0.63,
+     "max": 0.94,
+     "mean": 0.37
+    },
+    "attempt_row": {
+     "n": 128,
+     "p50": 0.11,
+     "p95": 0.22,
+     "max": 0.27,
+     "mean": 0.12
+    },
+    "loop_fetch": {
+     "n": 128,
+     "p50": 6.24,
+     "p95": 9.59,
+     "max": 10.67,
+     "mean": 6.4
+    },
+    "loop_key": {
+     "n": 128,
+     "p50": 2.26,
+     "p95": 4.77,
+     "max": 6.65,
+     "mean": 2.58
+    },
+    "loop_slot_lock": {
+     "n": 128,
+     "p50": 3.73,
+     "p95": 5.57,
+     "max": 6.59,
+     "mean": 3.94
+    },
+    "loop_checks": {
+     "n": 128,
+     "p50": 0.65,
+     "p95": 1.42,
+     "max": 1.85,
+     "mean": 0.73
+    },
+    "loop_seat": {
+     "n": 128,
+     "p50": 13.18,
+     "p95": 19.49,
+     "max": 29.56,
+     "mean": 13.62
+    },
+    "loop_slot_update": {
+     "n": 128,
+     "p50": 34.56,
+     "p95": 59.48,
+     "max": 129.67,
+     "mean": 37.58
+    },
+    "loop_decision_insert": {
+     "n": 128,
+     "p50": 24.53,
+     "p95": 35.88,
+     "max": 46.72,
+     "mean": 25.34
+    },
+    "loop_decision_check": {
+     "n": 128,
+     "p50": 1.96,
+     "p95": 3.63,
+     "max": 4.74,
+     "mean": 2.16
+    },
+    "last_seat_update": {
+     "n": 128,
+     "p50": 0.1,
+     "p95": 0.21,
+     "max": 0.34,
+     "mean": 0.11
+    },
+    "final_check": {
+     "n": 128,
+     "p50": 0.29,
+     "p95": 0.51,
+     "max": 0.93,
+     "mean": 0.32
+    }
+   },
+   "lastSeat": "9007199254772993",
+   "seats": 32000,
+   "decisions": 32000
+  },
+  {
+   "cell": {
+    "workload": "W2",
+    "n": 250,
+    "c": 16,
+    "body": "main"
+   },
+   "threads": 8,
+   "drained": true,
+   "drainSeconds": 35.18,
+   "durableRecords": 32000,
+   "durableRecordsPerSec": 910,
+   "retriesPerBatch": 0.13,
+   "stageFailures": {
+    "commit:55P03": 9,
+    "prepare:55P03": 6,
+    "claim:55P03": 2
+   },
+   "controls": {
+    "kind": "none",
+    "everyMs": 1000,
+    "scheduledSlots": 0,
+    "missedSlots": 0,
+    "started": 0,
+    "completedDuringLoad": 0,
+    "completedAfterLoadEnd": 0,
+    "failed": {},
+    "latencyMs": {
+     "n": 0,
+     "p50": null,
+     "p95": null,
+     "max": null,
+     "mean": null
+    }
+   },
+   "commitsOk": 128,
+   "traced": 128,
+   "untraced": 0,
+   "holdMs": {
+    "n": 128,
+    "p50": 127.06,
+    "p95": 374.32,
+    "max": 1081.92,
+    "mean": 170.22
+   },
+   "clockWaitMs": {
+    "n": 128,
+    "p50": 161.67,
+    "p95": 1224.68,
+    "max": 1787.58,
+    "mean": 375.41
+   },
+   "inAckAfterLockMs": {
+    "n": 128,
+    "p50": 120.87,
+    "p95": 361.64,
+    "max": 682.41,
+    "mean": 158.09
+   },
+   "postAckMs": {
+    "n": 128,
+    "p50": 1.31,
+    "p95": 2.6,
+    "max": 17.61,
+    "mean": 1.52
+   },
+   "commitRttMs": {
+    "n": 128,
+    "p50": 3.16,
+    "p95": 14.65,
+    "max": 397.09,
+    "mean": 10.61
+   },
+   "preLockMs": {
+    "n": 128,
+    "p50": 0.51,
+    "p95": 1.55,
+    "max": 1.9,
+    "mean": 0.62
+   },
+   "commitStatementMs": {
+    "n": 128,
+    "p50": 855.08,
+    "p95": 2129.61,
+    "max": 2929.88,
+    "mean": 967.1
+   },
+   "commitStatementAllMs": {
+    "n": 128,
+    "p50": 855.08,
+    "p95": 2129.61,
+    "max": 2929.88,
+    "mean": 967.1
+   },
+   "commitWholeAllMs": {
+    "n": 128,
+    "p50": 864.12,
+    "p95": 2135.28,
+    "max": 2933.15,
+    "mean": 978.53
+   },
+   "offsetProbeRttMs": {
+    "n": 128,
+    "p50": 0.76,
+    "p95": 3.12,
+    "max": 7.16,
+    "mean": 1.03
+   },
+   "split": {
+    "toWrapper": {
+     "n": 128,
+     "p50": 0.41,
+     "p95": 1.46,
+     "max": 2.48,
+     "mean": 0.53
+    },
+    "originClaimEnter": {
+     "n": 128,
+     "p50": 1.34,
+     "p95": 1663.29,
+     "max": 1999.8,
+     "mean": 425.95
+    },
+    "commitBeforeAck": {
+     "n": 128,
+     "p50": 4.55,
+     "p95": 9.24,
+     "max": 12.5,
+     "mean": 4.98
+    },
+    "ackBeforeLock": {
+     "n": 128,
+     "p50": 0.51,
+     "p95": 1.55,
+     "max": 1.9,
+     "mean": 0.62
+    },
+    "wait": {
+     "n": 128,
+     "p50": 161.67,
+     "p95": 1224.68,
+     "max": 1787.58,
+     "mean": 375.41
+    },
+    "inAck": {
+     "n": 128,
+     "p50": 120.87,
+     "p95": 361.64,
+     "max": 682.41,
+     "mean": 158.09
+    },
+    "afterAck": {
+     "n": 128,
+     "p50": 0.76,
+     "p95": 1.6,
+     "max": 2.24,
+     "mean": 0.81
+    },
+    "toClientReturn": {
+     "n": 128,
+     "p50": 0.56,
+     "p95": 1.27,
+     "max": 16.47,
+     "mean": 0.7
+    },
+    "commitRtt": {
+     "n": 128,
+     "p50": 3.16,
+     "p95": 14.65,
+     "max": 397.09,
+     "mean": 10.61
+    },
+    "nativeOriginLock": {
+     "n": 128,
+     "p50": 0.07,
+     "p95": 0.26,
+     "max": 0.37,
+     "mean": 0.09
+    }
+   },
+   "commitAttempts": {
+    "n": 137,
+    "over2s": 17,
+    "over5s": 0,
+    "failed": 9,
+    "statementMsOkAndFailed": {
+     "n": 137,
+     "p50": 878.64,
+     "p95": 2129.61,
+     "max": 2929.88,
+     "mean": 1035.46
+    }
+   },
+   "afterLockSteps": [
+    "origin_lock",
+    "stage_row",
+    "attempt_check1",
+    "attempt_row",
+    "loop_fetch",
+    "loop_key",
+    "loop_slot_lock",
+    "loop_checks",
+    "loop_seat",
+    "loop_slot_update",
+    "loop_decision_insert",
+    "loop_decision_check",
+    "last_seat_update",
+    "final_check"
+   ],
+   "stepMs": {
+    "guard": {
+     "n": 128,
+     "p50": 0.15,
+     "p95": 0.31,
+     "max": 0.74,
+     "mean": 0.17
+    },
+    "lock_fences": {
+     "n": 128,
+     "p50": 0.17,
+     "p95": 0.42,
+     "max": 0.47,
+     "mean": 0.19
+    },
+    "seal": {
+     "n": 128,
+     "p50": 0.15,
+     "p95": 0.38,
+     "max": 1.02,
+     "mean": 0.17
+    },
+    "gate_read": {
+     "n": 128,
+     "p50": 0.04,
+     "p95": 0.53,
+     "max": 0.72,
+     "mean": 0.1
+    },
+    "clock_lock": {
+     "n": 128,
+     "p50": 161.67,
+     "p95": 1224.68,
+     "max": 1787.58,
+     "mean": 375.41
+    },
+    "origin_lock": {
+     "n": 128,
+     "p50": 0.07,
+     "p95": 0.26,
+     "max": 0.37,
+     "mean": 0.09
+    },
+    "stage_row": {
+     "n": 128,
+     "p50": 0.36,
+     "p95": 1.03,
+     "max": 1.4,
+     "mean": 0.4
+    },
+    "attempt_check1": {
+     "n": 128,
+     "p50": 0.51,
+     "p95": 1.21,
+     "max": 2.1,
+     "mean": 0.6
+    },
+    "attempt_row": {
+     "n": 128,
+     "p50": 0.18,
+     "p95": 0.42,
+     "max": 0.76,
+     "mean": 0.2
+    },
+    "loop_fetch": {
+     "n": 128,
+     "p50": 8.33,
+     "p95": 13.08,
+     "max": 16.75,
+     "mean": 8.47
+    },
+    "loop_key": {
+     "n": 128,
+     "p50": 3.57,
+     "p95": 17.34,
+     "max": 19.5,
+     "mean": 5.77
+    },
+    "loop_slot_lock": {
+     "n": 128,
+     "p50": 5.18,
+     "p95": 13.58,
+     "max": 16.3,
+     "mean": 6.27
+    },
+    "loop_checks": {
+     "n": 128,
+     "p50": 0.95,
+     "p95": 3.53,
+     "max": 4.46,
+     "mean": 1.38
+    },
+    "loop_seat": {
+     "n": 128,
+     "p50": 17.21,
+     "p95": 46.91,
+     "max": 51.36,
+     "mean": 21.18
+    },
+    "loop_slot_update": {
+     "n": 128,
+     "p50": 46.8,
+     "p95": 149.9,
+     "max": 456.66,
+     "mean": 65.4
+    },
+    "loop_decision_insert": {
+     "n": 128,
+     "p50": 31.51,
+     "p95": 80.74,
+     "max": 167.73,
+     "mean": 39.37
+    },
+    "loop_decision_check": {
+     "n": 128,
+     "p50": 3.7,
+     "p95": 35.09,
+     "max": 39.51,
+     "mean": 8.36
+    },
+    "last_seat_update": {
+     "n": 128,
+     "p50": 0.16,
+     "p95": 0.27,
+     "max": 0.47,
+     "mean": 0.17
+    },
+    "final_check": {
+     "n": 128,
+     "p50": 0.38,
+     "p95": 0.71,
+     "max": 1.05,
+     "mean": 0.42
+    }
+   },
+   "lastSeat": "9007199254772993",
+   "seats": 32000,
+   "decisions": 32000
+  },
+  {
+   "cell": {
+    "workload": "W1",
+    "n": 500,
+    "c": 2,
+    "body": "main"
+   },
+   "threads": 2,
+   "drained": true,
+   "drainSeconds": 53.95,
+   "durableRecords": 32000,
+   "durableRecordsPerSec": 593,
+   "retriesPerBatch": 0,
+   "stageFailures": {},
+   "controls": {
+    "kind": "none",
+    "everyMs": 1000,
+    "scheduledSlots": 0,
+    "missedSlots": 0,
+    "started": 0,
+    "completedDuringLoad": 0,
+    "completedAfterLoadEnd": 0,
+    "failed": {},
+    "latencyMs": {
+     "n": 0,
+     "p50": null,
+     "p95": null,
+     "max": null,
+     "mean": null
+    }
+   },
+   "commitsOk": 64,
+   "traced": 64,
+   "untraced": 0,
+   "holdMs": {
+    "n": 64,
+    "p50": 494.13,
+    "p95": 1277.81,
+    "max": 4093.93,
+    "mean": 636.48
+   },
+   "clockWaitMs": {
+    "n": 64,
+    "p50": 0.08,
+    "p95": 484.28,
+    "max": 760.27,
+    "mean": 52.72
+   },
+   "inAckAfterLockMs": {
+    "n": 64,
+    "p50": 482.43,
+    "p95": 768.28,
+    "max": 888.91,
+    "mean": 459.52
+   },
+   "postAckMs": {
+    "n": 64,
+    "p50": 1.71,
+    "p95": 4.5,
+    "max": 5.81,
+    "mean": 2.06
+   },
+   "commitRttMs": {
+    "n": 64,
+    "p50": 6.4,
+    "p95": 419.53,
+    "max": 3562.04,
+    "mean": 174.91
+   },
+   "preLockMs": {
+    "n": 64,
+    "p50": 0.54,
+    "p95": 1.73,
+    "max": 2.16,
+    "mean": 0.64
+   },
+   "commitStatementMs": {
+    "n": 64,
+    "p50": 505.05,
+    "p95": 968.11,
+    "max": 1024.07,
+    "mean": 522.19
+   },
+   "commitStatementAllMs": {
+    "n": 64,
+    "p50": 505.05,
+    "p95": 968.11,
+    "max": 1024.07,
+    "mean": 522.19
+   },
+   "commitWholeAllMs": {
+    "n": 64,
+    "p50": 512.19,
+    "p95": 1286.57,
+    "max": 4531.15,
+    "mean": 698.22
+   },
+   "offsetProbeRttMs": {
+    "n": 64,
+    "p50": 1.09,
+    "p95": 3.55,
+    "max": 3.9,
+    "mean": 1.35
+   },
+   "split": {
+    "toWrapper": {
+     "n": 64,
+     "p50": 0.62,
+     "p95": 1.71,
+     "max": 3.66,
+     "mean": 0.76
+    },
+    "originClaimEnter": {
+     "n": 64,
+     "p50": 0.49,
+     "p95": 1.07,
+     "max": 2.29,
+     "mean": 0.58
+    },
+    "commitBeforeAck": {
+     "n": 64,
+     "p50": 5.92,
+     "p95": 9.48,
+     "max": 13.09,
+     "mean": 5.9
+    },
+    "ackBeforeLock": {
+     "n": 64,
+     "p50": 0.54,
+     "p95": 1.73,
+     "max": 2.16,
+     "mean": 0.64
+    },
+    "wait": {
+     "n": 64,
+     "p50": 0.08,
+     "p95": 484.28,
+     "max": 760.27,
+     "mean": 52.72
+    },
+    "inAck": {
+     "n": 64,
+     "p50": 482.43,
+     "p95": 768.28,
+     "max": 888.91,
+     "mean": 459.52
+    },
+    "afterAck": {
+     "n": 64,
+     "p50": 0.81,
+     "p95": 2.21,
+     "max": 2.97,
+     "mean": 0.98
+    },
+    "toClientReturn": {
+     "n": 64,
+     "p50": 0.81,
+     "p95": 2.16,
+     "max": 4.3,
+     "mean": 1.08
+    },
+    "commitRtt": {
+     "n": 64,
+     "p50": 6.4,
+     "p95": 419.53,
+     "max": 3562.04,
+     "mean": 174.91
+    },
+    "nativeOriginLock": {
+     "n": 64,
+     "p50": 0.05,
+     "p95": 0.21,
+     "max": 0.58,
+     "mean": 0.07
+    }
+   },
+   "commitAttempts": {
+    "n": 64,
+    "over2s": 0,
+    "over5s": 0,
+    "failed": 0,
+    "statementMsOkAndFailed": {
+     "n": 64,
+     "p50": 505.05,
+     "p95": 968.11,
+     "max": 1024.07,
+     "mean": 522.19
+    }
+   },
+   "afterLockSteps": [
+    "origin_lock",
+    "stage_row",
+    "attempt_check1",
+    "attempt_row",
+    "loop_fetch",
+    "loop_key",
+    "loop_slot_lock",
+    "loop_checks",
+    "loop_seat",
+    "loop_slot_update",
+    "loop_decision_insert",
+    "loop_decision_check",
+    "last_seat_update",
+    "final_check"
+   ],
+   "stepMs": {
+    "guard": {
+     "n": 64,
+     "p50": 0.18,
+     "p95": 0.33,
+     "max": 0.57,
+     "mean": 0.19
+    },
+    "lock_fences": {
+     "n": 64,
+     "p50": 0.2,
+     "p95": 0.46,
+     "max": 0.74,
+     "mean": 0.24
+    },
+    "seal": {
+     "n": 64,
+     "p50": 0.07,
+     "p95": 0.28,
+     "max": 0.48,
+     "mean": 0.11
+    },
+    "gate_read": {
+     "n": 64,
+     "p50": 0.05,
+     "p95": 0.34,
+     "max": 1.32,
+     "mean": 0.1
+    },
+    "clock_lock": {
+     "n": 64,
+     "p50": 0.08,
+     "p95": 484.28,
+     "max": 760.27,
+     "mean": 52.72
+    },
+    "origin_lock": {
+     "n": 64,
+     "p50": 0.05,
+     "p95": 0.21,
+     "max": 0.58,
+     "mean": 0.07
+    },
+    "stage_row": {
+     "n": 64,
+     "p50": 0.14,
+     "p95": 1.04,
+     "max": 1.38,
+     "mean": 0.26
+    },
+    "attempt_check1": {
+     "n": 64,
+     "p50": 0.62,
+     "p95": 1.17,
+     "max": 1.43,
+     "mean": 0.63
+    },
+    "attempt_row": {
+     "n": 64,
+     "p50": 0.27,
+     "p95": 0.62,
+     "max": 0.75,
+     "mean": 0.3
+    },
+    "loop_fetch": {
+     "n": 64,
+     "p50": 24.27,
+     "p95": 30.81,
+     "max": 35.74,
+     "mean": 23.97
+    },
+    "loop_key": {
+     "n": 64,
+     "p50": 28.75,
+     "p95": 49.05,
+     "max": 54.47,
+     "mean": 25.83
+    },
+    "loop_slot_lock": {
+     "n": 64,
+     "p50": 18.66,
+     "p95": 29.06,
+     "max": 31.95,
+     "mean": 18.38
+    },
+    "loop_checks": {
+     "n": 64,
+     "p50": 5.33,
+     "p95": 8.53,
+     "max": 9.29,
+     "mean": 4.93
+    },
+    "loop_seat": {
+     "n": 64,
+     "p50": 62.24,
+     "p95": 106.73,
+     "max": 390.75,
+     "mean": 64.93
+    },
+    "loop_slot_update": {
+     "n": 64,
+     "p50": 212.42,
+     "p95": 344.92,
+     "max": 412.2,
+     "mean": 199.18
+    },
+    "loop_decision_insert": {
+     "n": 64,
+     "p50": 110.41,
+     "p95": 166.53,
+     "max": 190.32,
+     "mean": 107.28
+    },
+    "loop_decision_check": {
+     "n": 64,
+     "p50": 13.42,
+     "p95": 24.88,
+     "max": 26.53,
+     "mean": 12.96
+    },
+    "last_seat_update": {
+     "n": 64,
+     "p50": 0.18,
+     "p95": 0.46,
+     "max": 0.72,
+     "mean": 0.21
+    },
+    "final_check": {
+     "n": 64,
+     "p50": 0.53,
+     "p95": 1.15,
+     "max": 1.47,
+     "mean": 0.58
+    }
+   },
+   "lastSeat": "9007199254772993",
+   "seats": 32000,
+   "decisions": 32000
+  },
+  {
+   "cell": {
+    "workload": "W1",
+    "n": 500,
+    "c": 4,
+    "body": "main"
+   },
+   "threads": 4,
+   "drained": true,
+   "drainSeconds": 33.95,
+   "durableRecords": 32000,
+   "durableRecordsPerSec": 943,
+   "retriesPerBatch": 0.03,
+   "stageFailures": {
+    "commit:55P03": 2
+   },
+   "controls": {
+    "kind": "none",
+    "everyMs": 1000,
+    "scheduledSlots": 0,
+    "missedSlots": 0,
+    "started": 0,
+    "completedDuringLoad": 0,
+    "completedAfterLoadEnd": 0,
+    "failed": {},
+    "latencyMs": {
+     "n": 0,
+     "p50": null,
+     "p95": null,
+     "max": null,
+     "mean": null
+    }
+   },
+   "commitsOk": 64,
+   "traced": 64,
+   "untraced": 0,
+   "holdMs": {
+    "n": 64,
+    "p50": 396.39,
+    "p95": 786.82,
+    "max": 5976.12,
+    "mean": 518.47
+   },
+   "clockWaitMs": {
+    "n": 64,
+    "p50": 479.59,
+    "p95": 1477.5,
+    "max": 2128.51,
+    "mean": 573.82
+   },
+   "inAckAfterLockMs": {
+    "n": 64,
+    "p50": 366.33,
+    "p95": 707.7,
+    "max": 782.45,
+    "mean": 399.02
+   },
+   "postAckMs": {
+    "n": 64,
+    "p50": 1.73,
+    "p95": 3.32,
+    "max": 4.04,
+    "mean": 1.73
+   },
+   "commitRttMs": {
+    "n": 64,
+    "p50": 5.88,
+    "p95": 39.73,
+    "max": 5412.27,
+    "mean": 117.72
+   },
+   "preLockMs": {
+    "n": 64,
+    "p50": 0.56,
+    "p95": 1.39,
+    "max": 2.78,
+    "mean": 0.73
+   },
+   "commitStatementMs": {
+    "n": 64,
+    "p50": 885.38,
+    "p95": 1741.35,
+    "max": 2865.2,
+    "mean": 982.89
+   },
+   "commitStatementAllMs": {
+    "n": 64,
+    "p50": 885.38,
+    "p95": 1741.35,
+    "max": 2865.2,
+    "mean": 982.89
+   },
+   "commitWholeAllMs": {
+    "n": 64,
+    "p50": 890.1,
+    "p95": 2334.92,
+    "max": 6569.97,
+    "mean": 1101.73
+   },
+   "offsetProbeRttMs": {
+    "n": 64,
+    "p50": 1.01,
+    "p95": 2.81,
+    "max": 15.95,
+    "mean": 1.45
+   },
+   "split": {
+    "toWrapper": {
+     "n": 64,
+     "p50": 0.66,
+     "p95": 2.3,
+     "max": 7.88,
+     "mean": 0.93
+    },
+    "originClaimEnter": {
+     "n": 64,
+     "p50": 0.46,
+     "p95": 0.93,
+     "max": 1.57,
+     "mean": 0.53
+    },
+    "commitBeforeAck": {
+     "n": 64,
+     "p50": 5.8,
+     "p95": 9.34,
+     "max": 16.18,
+     "mean": 6.14
+    },
+    "ackBeforeLock": {
+     "n": 64,
+     "p50": 0.56,
+     "p95": 1.39,
+     "max": 2.78,
+     "mean": 0.73
+    },
+    "wait": {
+     "n": 64,
+     "p50": 479.59,
+     "p95": 1477.5,
+     "max": 2128.51,
+     "mean": 573.82
+    },
+    "inAck": {
+     "n": 64,
+     "p50": 366.33,
+     "p95": 707.7,
+     "max": 782.45,
+     "mean": 399.02
+    },
+    "afterAck": {
+     "n": 64,
+     "p50": 0.72,
+     "p95": 2.01,
+     "max": 2.5,
+     "mean": 0.9
+    },
+    "toClientReturn": {
+     "n": 64,
+     "p50": 0.85,
+     "p95": 1.55,
+     "max": 2.69,
+     "mean": 0.83
+    },
+    "commitRtt": {
+     "n": 64,
+     "p50": 5.88,
+     "p95": 39.73,
+     "max": 5412.27,
+     "mean": 117.72
+    },
+    "nativeOriginLock": {
+     "n": 64,
+     "p50": 0.13,
+     "p95": 0.33,
+     "max": 0.8,
+     "mean": 0.17
+    }
+   },
+   "commitAttempts": {
+    "n": 66,
+    "over2s": 5,
+    "over5s": 0,
+    "failed": 2,
+    "statementMsOkAndFailed": {
+     "n": 66,
+     "p50": 887.11,
+     "p95": 2301.13,
+     "max": 3545.24,
+     "mean": 1038.8
+    }
+   },
+   "afterLockSteps": [
+    "origin_lock",
+    "stage_row",
+    "attempt_check1",
+    "attempt_row",
+    "loop_fetch",
+    "loop_key",
+    "loop_slot_lock",
+    "loop_checks",
+    "loop_seat",
+    "loop_slot_update",
+    "loop_decision_insert",
+    "loop_decision_check",
+    "last_seat_update",
+    "final_check"
+   ],
+   "stepMs": {
+    "guard": {
+     "n": 64,
+     "p50": 0.19,
+     "p95": 0.47,
+     "max": 0.97,
+     "mean": 0.23
+    },
+    "lock_fences": {
+     "n": 64,
+     "p50": 0.21,
+     "p95": 0.48,
+     "max": 0.91,
+     "mean": 0.25
+    },
+    "seal": {
+     "n": 64,
+     "p50": 0.11,
+     "p95": 0.37,
+     "max": 0.58,
+     "mean": 0.15
+    },
+    "gate_read": {
+     "n": 64,
+     "p50": 0.05,
+     "p95": 0.49,
+     "max": 0.59,
+     "mean": 0.09
+    },
+    "clock_lock": {
+     "n": 64,
+     "p50": 479.59,
+     "p95": 1477.5,
+     "max": 2128.51,
+     "mean": 573.82
+    },
+    "origin_lock": {
+     "n": 64,
+     "p50": 0.13,
+     "p95": 0.33,
+     "max": 0.8,
+     "mean": 0.17
+    },
+    "stage_row": {
+     "n": 64,
+     "p50": 0.39,
+     "p95": 1.12,
+     "max": 2.1,
+     "mean": 0.46
+    },
+    "attempt_check1": {
+     "n": 64,
+     "p50": 0.73,
+     "p95": 2.94,
+     "max": 9.43,
+     "mean": 1.1
+    },
+    "attempt_row": {
+     "n": 64,
+     "p50": 0.3,
+     "p95": 0.67,
+     "max": 2.56,
+     "mean": 0.36
+    },
+    "loop_fetch": {
+     "n": 64,
+     "p50": 23.11,
+     "p95": 34.89,
+     "max": 36.22,
+     "mean": 23.16
+    },
+    "loop_key": {
+     "n": 64,
+     "p50": 17.86,
+     "p95": 46.42,
+     "max": 51.02,
+     "mean": 21.27
+    },
+    "loop_slot_lock": {
+     "n": 64,
+     "p50": 15.52,
+     "p95": 29.45,
+     "max": 33.85,
+     "mean": 17.04
+    },
+    "loop_checks": {
+     "n": 64,
+     "p50": 3.83,
+     "p95": 8.6,
+     "max": 9.85,
+     "mean": 4.29
+    },
+    "loop_seat": {
+     "n": 64,
+     "p50": 48.17,
+     "p95": 91.21,
+     "max": 100.67,
+     "mean": 52.56
+    },
+    "loop_slot_update": {
+     "n": 64,
+     "p50": 164.48,
+     "p95": 314.58,
+     "max": 353.84,
+     "mean": 170.8
+    },
+    "loop_decision_insert": {
+     "n": 64,
+     "p50": 88.2,
+     "p95": 158.96,
+     "max": 176.41,
+     "mean": 95.53
+    },
+    "loop_decision_check": {
+     "n": 64,
+     "p50": 10.35,
+     "p95": 23.13,
+     "max": 26.58,
+     "mean": 11.56
+    },
+    "last_seat_update": {
+     "n": 64,
+     "p50": 0.17,
+     "p95": 0.44,
+     "max": 0.48,
+     "mean": 0.2
+    },
+    "final_check": {
+     "n": 64,
+     "p50": 0.47,
+     "p95": 1.06,
+     "max": 1.31,
+     "mean": 0.52
+    }
+   },
+   "lastSeat": "9007199254772993",
+   "seats": 32000,
+   "decisions": 32000
+  },
+  {
+   "cell": {
+    "workload": "W1",
+    "n": 500,
+    "c": 16,
+    "body": "main"
+   },
+   "threads": 8,
+   "drained": true,
+   "drainSeconds": 83.02,
+   "durableRecords": 32000,
+   "durableRecordsPerSec": 385,
+   "retriesPerBatch": 1.44,
+   "stageFailures": {
+    "commit:55P03": 80,
+    "commit:57014": 12
+   },
+   "controls": {
+    "kind": "none",
+    "everyMs": 1000,
+    "scheduledSlots": 0,
+    "missedSlots": 0,
+    "started": 0,
+    "completedDuringLoad": 0,
+    "completedAfterLoadEnd": 0,
+    "failed": {},
+    "latencyMs": {
+     "n": 0,
+     "p50": null,
+     "p95": null,
+     "max": null,
+     "mean": null
+    }
+   },
+   "commitsOk": 64,
+   "traced": 64,
+   "untraced": 0,
+   "holdMs": {
+    "n": 64,
+    "p50": 415.57,
+    "p95": 6310.73,
+    "max": 11201.72,
+    "mean": 1241.44
+   },
+   "clockWaitMs": {
+    "n": 64,
+    "p50": 1074.7,
+    "p95": 4034.84,
+    "max": 4555.15,
+    "mean": 1512.18
+   },
+   "inAckAfterLockMs": {
+    "n": 64,
+    "p50": 374.41,
+    "p95": 728.63,
+    "max": 867.61,
+    "mean": 406.56
+   },
+   "postAckMs": {
+    "n": 64,
+    "p50": 1.93,
+    "p95": 79.66,
+    "max": 180.18,
+    "mean": 4.27
+   },
+   "commitRttMs": {
+    "n": 64,
+    "p50": 10.42,
+    "p95": 5976.28,
+    "max": 10685.68,
+    "mean": 830.61
+   },
+   "preLockMs": {
+    "n": 64,
+    "p50": 0.63,
+    "p95": 3.37,
+    "max": 13.52,
+    "mean": 1.17
+   },
+   "commitStatementMs": {
+    "n": 64,
+    "p50": 1493.32,
+    "p95": 4570.71,
+    "max": 4847.37,
+    "mean": 1942.16
+   },
+   "commitStatementAllMs": {
+    "n": 64,
+    "p50": 1493.32,
+    "p95": 4570.71,
+    "max": 4847.37,
+    "mean": 1942.16
+   },
+   "commitWholeAllMs": {
+    "n": 64,
+    "p50": 2038.6,
+    "p95": 7915.88,
+    "max": 12716.79,
+    "mean": 2775.72
+   },
+   "offsetProbeRttMs": {
+    "n": 64,
+    "p50": 1.31,
+    "p95": 13.12,
+    "max": 358.87,
+    "mean": 13.97
+   },
+   "split": {
+    "toWrapper": {
+     "n": 64,
+     "p50": 0.89,
+     "p95": 16.65,
+     "max": 189.89,
+     "mean": 7.74
+    },
+    "originClaimEnter": {
+     "n": 64,
+     "p50": 0.48,
+     "p95": 1.16,
+     "max": 2.13,
+     "mean": 0.57
+    },
+    "commitBeforeAck": {
+     "n": 64,
+     "p50": 7.43,
+     "p95": 21.52,
+     "max": 25.53,
+     "mean": 9.67
+    },
+    "ackBeforeLock": {
+     "n": 64,
+     "p50": 0.63,
+     "p95": 3.37,
+     "max": 13.52,
+     "mean": 1.17
+    },
+    "wait": {
+     "n": 64,
+     "p50": 1074.7,
+     "p95": 4034.84,
+     "max": 4555.15,
+     "mean": 1512.18
+    },
+    "inAck": {
+     "n": 64,
+     "p50": 374.41,
+     "p95": 728.63,
+     "max": 867.61,
+     "mean": 406.56
+    },
+    "afterAck": {
+     "n": 64,
+     "p50": 1.21,
+     "p95": 2.79,
+     "max": 3.86,
+     "mean": 1.36
+    },
+    "toClientReturn": {
+     "n": 64,
+     "p50": 0.66,
+     "p95": 78.36,
+     "max": 177.39,
+     "mean": 2.91
+    },
+    "commitRtt": {
+     "n": 64,
+     "p50": 10.42,
+     "p95": 5976.28,
+     "max": 10685.68,
+     "mean": 830.61
+    },
+    "nativeOriginLock": {
+     "n": 64,
+     "p50": 0.2,
+     "p95": 0.54,
+     "max": 0.72,
+     "mean": 0.25
+    }
+   },
+   "commitAttempts": {
+    "n": 156,
+    "over2s": 117,
+    "over5s": 12,
+    "failed": 92,
+    "statementMsOkAndFailed": {
+     "n": 156,
+     "p50": 2488.7,
+     "p95": 5002.69,
+     "max": 5023.43,
+     "mean": 2645.93
+    }
+   },
+   "afterLockSteps": [
+    "origin_lock",
+    "stage_row",
+    "attempt_check1",
+    "attempt_row",
+    "loop_fetch",
+    "loop_key",
+    "loop_slot_lock",
+    "loop_checks",
+    "loop_seat",
+    "loop_slot_update",
+    "loop_decision_insert",
+    "loop_decision_check",
+    "last_seat_update",
+    "final_check"
+   ],
+   "stepMs": {
+    "guard": {
+     "n": 64,
+     "p50": 0.18,
+     "p95": 0.57,
+     "max": 3.08,
+     "mean": 0.27
+    },
+    "lock_fences": {
+     "n": 64,
+     "p50": 0.21,
+     "p95": 0.64,
+     "max": 4.71,
+     "mean": 0.36
+    },
+    "seal": {
+     "n": 64,
+     "p50": 0.08,
+     "p95": 0.6,
+     "max": 7.33,
+     "mean": 0.32
+    },
+    "gate_read": {
+     "n": 64,
+     "p50": 0.05,
+     "p95": 1.11,
+     "max": 3.95,
+     "mean": 0.23
+    },
+    "clock_lock": {
+     "n": 64,
+     "p50": 1074.7,
+     "p95": 4034.84,
+     "max": 4555.15,
+     "mean": 1512.18
+    },
+    "origin_lock": {
+     "n": 64,
+     "p50": 0.2,
+     "p95": 0.54,
+     "max": 0.72,
+     "mean": 0.25
+    },
+    "stage_row": {
+     "n": 64,
+     "p50": 0.91,
+     "p95": 2.01,
+     "max": 2.82,
+     "mean": 1.04
+    },
+    "attempt_check1": {
+     "n": 64,
+     "p50": 0.86,
+     "p95": 2.94,
+     "max": 9.18,
+     "mean": 1.22
+    },
+    "attempt_row": {
+     "n": 64,
+     "p50": 0.39,
+     "p95": 0.94,
+     "max": 1.25,
+     "mean": 0.48
+    },
+    "loop_fetch": {
+     "n": 64,
+     "p50": 20.19,
+     "p95": 33.16,
+     "max": 44.09,
+     "mean": 21.34
+    },
+    "loop_key": {
+     "n": 64,
+     "p50": 16.78,
+     "p95": 45.23,
+     "max": 52.9,
+     "mean": 21.33
+    },
+    "loop_slot_lock": {
+     "n": 64,
+     "p50": 15.68,
+     "p95": 29.98,
+     "max": 34.34,
+     "mean": 16.88
+    },
+    "loop_checks": {
+     "n": 64,
+     "p50": 3.58,
+     "p95": 9.27,
+     "max": 13.63,
+     "mean": 4.17
+    },
+    "loop_seat": {
+     "n": 64,
+     "p50": 51.4,
+     "p95": 95.43,
+     "max": 328.35,
+     "mean": 58.78
+    },
+    "loop_slot_update": {
+     "n": 64,
+     "p50": 140.31,
+     "p95": 329.76,
+     "max": 385.37,
+     "mean": 167.9
+    },
+    "loop_decision_insert": {
+     "n": 64,
+     "p50": 92.76,
+     "p95": 178.94,
+     "max": 245.7,
+     "mean": 100.94
+    },
+    "loop_decision_check": {
+     "n": 64,
+     "p50": 9.89,
+     "p95": 23.81,
+     "max": 29.31,
+     "mean": 11.24
+    },
+    "last_seat_update": {
+     "n": 64,
+     "p50": 0.23,
+     "p95": 0.56,
+     "max": 1.08,
+     "mean": 0.29
+    },
+    "final_check": {
+     "n": 64,
+     "p50": 0.56,
+     "p95": 1.55,
+     "max": 3.38,
+     "mean": 0.69
+    }
+   },
+   "lastSeat": "9007199254772993",
+   "seats": 32000,
+   "decisions": 32000
+  },
+  {
+   "cell": {
+    "workload": "W1",
+    "n": 500,
+    "c": 64,
+    "body": "main"
+   },
+   "threads": 8,
+   "drained": true,
+   "drainSeconds": 88.21,
+   "durableRecords": 32000,
+   "durableRecordsPerSec": 363,
+   "retriesPerBatch": 5.58,
+   "stageFailures": {
+    "claim:57014": 92,
+    "commit:55P03": 189,
+    "commit:57014": 76
+   },
+   "controls": {
+    "kind": "none",
+    "everyMs": 1000,
+    "scheduledSlots": 0,
+    "missedSlots": 0,
+    "started": 0,
+    "completedDuringLoad": 0,
+    "completedAfterLoadEnd": 0,
+    "failed": {},
+    "latencyMs": {
+     "n": 0,
+     "p50": null,
+     "p95": null,
+     "max": null,
+     "mean": null
+    }
+   },
+   "commitsOk": 64,
+   "traced": 64,
+   "untraced": 0,
+   "holdMs": {
+    "n": 64,
+    "p50": 432.44,
+    "p95": 4568.12,
+    "max": 7623.11,
+    "mean": 1094.64
+   },
+   "clockWaitMs": {
+    "n": 64,
+    "p50": 1591.49,
+    "p95": 4012.22,
+    "max": 4598.2,
+    "mean": 1649.12
+   },
+   "inAckAfterLockMs": {
+    "n": 64,
+    "p50": 345,
+    "p95": 708.75,
+    "max": 3398.77,
+    "mean": 436.33
+   },
+   "postAckMs": {
+    "n": 64,
+    "p50": 1.88,
+    "p95": 14.05,
+    "max": 239.7,
+    "mean": 1.74
+   },
+   "commitRttMs": {
+    "n": 64,
+    "p50": 4.29,
+    "p95": 4180.97,
+    "max": 7437.78,
+    "mean": 656.57
+   },
+   "preLockMs": {
+    "n": 64,
+    "p50": 0.62,
+    "p95": 2.43,
+    "max": 5.15,
+    "mean": 0.88
+   },
+   "commitStatementMs": {
+    "n": 64,
+    "p50": 2090.28,
+    "p95": 4329.13,
+    "max": 4916.95,
+    "mean": 2129.31
+   },
+   "commitStatementAllMs": {
+    "n": 64,
+    "p50": 2090.28,
+    "p95": 4329.13,
+    "max": 4916.95,
+    "mean": 2129.31
+   },
+   "commitWholeAllMs": {
+    "n": 64,
+    "p50": 2356.92,
+    "p95": 7665.25,
+    "max": 11891.67,
+    "mean": 2787.46
+   },
+   "offsetProbeRttMs": {
+    "n": 64,
+    "p50": 0.76,
+    "p95": 167.32,
+    "max": 296.82,
+    "mean": 16.91
+   },
+   "split": {
+    "toWrapper": {
+     "n": 64,
+     "p50": 0.49,
+     "p95": 144.29,
+     "max": 761.21,
+     "mean": 32.27
+    },
+    "originClaimEnter": {
+     "n": 64,
+     "p50": 0.38,
+     "p95": 1.36,
+     "max": 4.45,
+     "mean": 0.55
+    },
+    "commitBeforeAck": {
+     "n": 64,
+     "p50": 5.93,
+     "p95": 18.63,
+     "max": 45.7,
+     "mean": 8.41
+    },
+    "ackBeforeLock": {
+     "n": 64,
+     "p50": 0.62,
+     "p95": 2.43,
+     "max": 5.15,
+     "mean": 0.88
+    },
+    "wait": {
+     "n": 64,
+     "p50": 1591.49,
+     "p95": 4012.22,
+     "max": 4598.2,
+     "mean": 1649.12
+    },
+    "inAck": {
+     "n": 64,
+     "p50": 345,
+     "p95": 708.75,
+     "max": 3398.77,
+     "mean": 436.33
+    },
+    "afterAck": {
+     "n": 64,
+     "p50": 1.38,
+     "p95": 2.48,
+     "max": 2.96,
+     "mean": 1.5
+    },
+    "toClientReturn": {
+     "n": 64,
+     "p50": 0.56,
+     "p95": 11.44,
+     "max": 237.01,
+     "mean": 0.24
+    },
+    "commitRtt": {
+     "n": 64,
+     "p50": 4.29,
+     "p95": 4180.97,
+     "max": 7437.78,
+     "mean": 656.57
+    },
+    "nativeOriginLock": {
+     "n": 64,
+     "p50": 0.25,
+     "p95": 0.57,
+     "max": 1.19,
+     "mean": 0.28
+    }
+   },
+   "commitAttempts": {
+    "n": 329,
+    "over2s": 297,
+    "over5s": 89,
+    "failed": 265,
+    "statementMsOkAndFailed": {
+     "n": 329,
+     "p50": 3850.92,
+     "p95": 5007.65,
+     "max": 10352.86,
+     "mean": 3621
+    }
+   },
+   "afterLockSteps": [
+    "origin_lock",
+    "stage_row",
+    "attempt_check1",
+    "attempt_row",
+    "loop_fetch",
+    "loop_key",
+    "loop_slot_lock",
+    "loop_checks",
+    "loop_seat",
+    "loop_slot_update",
+    "loop_decision_insert",
+    "loop_decision_check",
+    "last_seat_update",
+    "final_check"
+   ],
+   "stepMs": {
+    "guard": {
+     "n": 64,
+     "p50": 0.15,
+     "p95": 0.44,
+     "max": 2.33,
+     "mean": 0.23
+    },
+    "lock_fences": {
+     "n": 64,
+     "p50": 0.19,
+     "p95": 0.45,
+     "max": 1.71,
+     "mean": 0.24
+    },
+    "seal": {
+     "n": 64,
+     "p50": 0.2,
+     "p95": 0.56,
+     "max": 3.96,
+     "mean": 0.31
+    },
+    "gate_read": {
+     "n": 64,
+     "p50": 0.05,
+     "p95": 0.56,
+     "max": 0.75,
+     "mean": 0.11
+    },
+    "clock_lock": {
+     "n": 64,
+     "p50": 1591.49,
+     "p95": 4012.22,
+     "max": 4598.2,
+     "mean": 1649.12
+    },
+    "origin_lock": {
+     "n": 64,
+     "p50": 0.25,
+     "p95": 0.57,
+     "max": 1.19,
+     "mean": 0.28
+    },
+    "stage_row": {
+     "n": 64,
+     "p50": 1.16,
+     "p95": 1.66,
+     "max": 3.88,
+     "mean": 1.19
+    },
+    "attempt_check1": {
+     "n": 64,
+     "p50": 0.78,
+     "p95": 1.73,
+     "max": 2.48,
+     "mean": 0.93
+    },
+    "attempt_row": {
+     "n": 64,
+     "p50": 0.5,
+     "p95": 0.68,
+     "max": 0.77,
+     "mean": 0.49
+    },
+    "loop_fetch": {
+     "n": 64,
+     "p50": 18.57,
+     "p95": 32.78,
+     "max": 84.29,
+     "mean": 20.36
+    },
+    "loop_key": {
+     "n": 64,
+     "p50": 17.15,
+     "p95": 41.07,
+     "max": 79.95,
+     "mean": 20.4
+    },
+    "loop_slot_lock": {
+     "n": 64,
+     "p50": 13.32,
+     "p95": 23.84,
+     "max": 103.22,
+     "mean": 15.6
+    },
+    "loop_checks": {
+     "n": 64,
+     "p50": 3.45,
+     "p95": 6.26,
+     "max": 9.03,
+     "mean": 3.55
+    },
+    "loop_seat": {
+     "n": 64,
+     "p50": 46.77,
+     "p95": 104.3,
+     "max": 600.05,
+     "mean": 62.27
+    },
+    "loop_slot_update": {
+     "n": 64,
+     "p50": 146,
+     "p95": 315.19,
+     "max": 1336.82,
+     "mean": 185.52
+    },
+    "loop_decision_insert": {
+     "n": 64,
+     "p50": 85.97,
+     "p95": 200.02,
+     "max": 1162.75,
+     "mean": 114.28
+    },
+    "loop_decision_check": {
+     "n": 64,
+     "p50": 9.21,
+     "p95": 17.96,
+     "max": 60.1,
+     "mean": 10.59
+    },
+    "last_seat_update": {
+     "n": 64,
+     "p50": 0.3,
+     "p95": 0.51,
+     "max": 0.66,
+     "mean": 0.32
+    },
+    "final_check": {
+     "n": 64,
+     "p50": 0.54,
+     "p95": 0.92,
+     "max": 1.1,
+     "mean": 0.57
+    }
+   },
+   "lastSeat": "9007199254772993",
+   "seats": 32000,
+   "decisions": 32000
+  },
+  {
+   "cell": {
+    "workload": "W2",
+    "n": 500,
+    "c": 4,
+    "body": "main"
+   },
+   "threads": 4,
+   "drained": true,
+   "drainSeconds": 34.43,
+   "durableRecords": 32000,
+   "durableRecordsPerSec": 930,
+   "retriesPerBatch": 0.03,
+   "stageFailures": {
+    "commit:55P03": 2
+   },
+   "controls": {
+    "kind": "none",
+    "everyMs": 1000,
+    "scheduledSlots": 0,
+    "missedSlots": 0,
+    "started": 0,
+    "completedDuringLoad": 0,
+    "completedAfterLoadEnd": 0,
+    "failed": {},
+    "latencyMs": {
+     "n": 0,
+     "p50": null,
+     "p95": null,
+     "max": null,
+     "mean": null
+    }
+   },
+   "commitsOk": 64,
+   "traced": 64,
+   "untraced": 0,
+   "holdMs": {
+    "n": 64,
+    "p50": 226.16,
+    "p95": 468.03,
+    "max": 4378.95,
+    "mean": 344.93
+   },
+   "clockWaitMs": {
+    "n": 64,
+    "p50": 0.05,
+    "p95": 413.32,
+    "max": 584.62,
+    "mean": 98.62
+   },
+   "inAckAfterLockMs": {
+    "n": 64,
+    "p50": 207.08,
+    "p95": 403.31,
+    "max": 621.39,
+    "mean": 234.25
+   },
+   "postAckMs": {
+    "n": 64,
+    "p50": 1.1,
+    "p95": 2.46,
+    "max": 5.68,
+    "mean": 1.27
+   },
+   "commitRttMs": {
+    "n": 64,
+    "p50": 3.37,
+    "p95": 205.8,
+    "max": 3821.37,
+    "mean": 109.41
+   },
+   "preLockMs": {
+    "n": 64,
+    "p50": 0.39,
+    "p95": 1.82,
+    "max": 2.92,
+    "mean": 0.53
+   },
+   "commitStatementMs": {
+    "n": 64,
+    "p50": 326.1,
+    "p95": 788.19,
+    "max": 830.45,
+    "mean": 348.43
+   },
+   "commitStatementAllMs": {
+    "n": 64,
+    "p50": 326.1,
+    "p95": 788.19,
+    "max": 830.45,
+    "mean": 348.43
+   },
+   "commitWholeAllMs": {
+    "n": 64,
+    "p50": 350.58,
+    "p95": 839.2,
+    "max": 4391.05,
+    "mean": 458.56
+   },
+   "offsetProbeRttMs": {
+    "n": 64,
+    "p50": 0.69,
+    "p95": 1.93,
+    "max": 4.63,
+    "mean": 0.8
+   },
+   "split": {
+    "toWrapper": {
+     "n": 64,
+     "p50": 0.38,
+     "p95": 1.06,
+     "max": 2.53,
+     "mean": 0.46
+    },
+    "originClaimEnter": {
+     "n": 64,
+     "p50": 0.36,
+     "p95": 0.79,
+     "max": 512.44,
+     "mean": 8.48
+    },
+    "commitBeforeAck": {
+     "n": 64,
+     "p50": 4.11,
+     "p95": 15.07,
+     "max": 18.23,
+     "mean": 4.82
+    },
+    "ackBeforeLock": {
+     "n": 64,
+     "p50": 0.39,
+     "p95": 1.82,
+     "max": 2.92,
+     "mean": 0.53
+    },
+    "wait": {
+     "n": 64,
+     "p50": 0.05,
+     "p95": 413.32,
+     "max": 584.62,
+     "mean": 98.62
+    },
+    "inAck": {
+     "n": 64,
+     "p50": 207.08,
+     "p95": 403.31,
+     "max": 621.39,
+     "mean": 234.25
+    },
+    "afterAck": {
+     "n": 64,
+     "p50": 0.51,
+     "p95": 1.45,
+     "max": 4.28,
+     "mean": 0.65
+    },
+    "toClientReturn": {
+     "n": 64,
+     "p50": 0.57,
+     "p95": 1.05,
+     "max": 2.33,
+     "mean": 0.61
+    },
+    "commitRtt": {
+     "n": 64,
+     "p50": 3.37,
+     "p95": 205.8,
+     "max": 3821.37,
+     "mean": 109.41
+    },
+    "nativeOriginLock": {
+     "n": 64,
+     "p50": 0.04,
+     "p95": 0.21,
+     "max": 0.3,
+     "mean": 0.07
+    }
+   },
+   "commitAttempts": {
+    "n": 66,
+    "over2s": 2,
+    "over5s": 0,
+    "failed": 2,
+    "statementMsOkAndFailed": {
+     "n": 66,
+     "p50": 328.83,
+     "p95": 801.94,
+     "max": 2013.59,
+     "mean": 398.77
+    }
+   },
+   "afterLockSteps": [
+    "origin_lock",
+    "stage_row",
+    "attempt_check1",
+    "attempt_row",
+    "loop_fetch",
+    "loop_key",
+    "loop_slot_lock",
+    "loop_checks",
+    "loop_seat",
+    "loop_slot_update",
+    "loop_decision_insert",
+    "loop_decision_check",
+    "last_seat_update",
+    "final_check"
+   ],
+   "stepMs": {
+    "guard": {
+     "n": 64,
+     "p50": 0.13,
+     "p95": 0.33,
+     "max": 1.57,
+     "mean": 0.16
+    },
+    "lock_fences": {
+     "n": 64,
+     "p50": 0.15,
+     "p95": 0.43,
+     "max": 0.92,
+     "mean": 0.17
+    },
+    "seal": {
+     "n": 64,
+     "p50": 0.06,
+     "p95": 0.42,
+     "max": 0.99,
+     "mean": 0.12
+    },
+    "gate_read": {
+     "n": 64,
+     "p50": 0.04,
+     "p95": 0.57,
+     "max": 0.95,
+     "mean": 0.08
+    },
+    "clock_lock": {
+     "n": 64,
+     "p50": 0.05,
+     "p95": 413.32,
+     "max": 584.62,
+     "mean": 98.62
+    },
+    "origin_lock": {
+     "n": 64,
+     "p50": 0.04,
+     "p95": 0.21,
+     "max": 0.3,
+     "mean": 0.07
+    },
+    "stage_row": {
+     "n": 64,
+     "p50": 0.11,
+     "p95": 0.94,
+     "max": 1.25,
+     "mean": 0.26
+    },
+    "attempt_check1": {
+     "n": 64,
+     "p50": 0.39,
+     "p95": 1.15,
+     "max": 2.8,
+     "mean": 0.47
+    },
+    "attempt_row": {
+     "n": 64,
+     "p50": 0.2,
+     "p95": 0.59,
+     "max": 0.95,
+     "mean": 0.24
+    },
+    "loop_fetch": {
+     "n": 64,
+     "p50": 16.96,
+     "p95": 25.83,
+     "max": 33.72,
+     "mean": 17.32
+    },
+    "loop_key": {
+     "n": 64,
+     "p50": 8.21,
+     "p95": 21.12,
+     "max": 31.28,
+     "mean": 9.77
+    },
+    "loop_slot_lock": {
+     "n": 64,
+     "p50": 8.82,
+     "p95": 15.98,
+     "max": 29.53,
+     "mean": 9.55
+    },
+    "loop_checks": {
+     "n": 64,
+     "p50": 1.46,
+     "p95": 4.26,
+     "max": 5.62,
+     "mean": 1.8
+    },
+    "loop_seat": {
+     "n": 64,
+     "p50": 30.01,
+     "p95": 59.03,
+     "max": 82.55,
+     "mean": 33.48
+    },
+    "loop_slot_update": {
+     "n": 64,
+     "p50": 79.79,
+     "p95": 169.01,
+     "max": 370.61,
+     "mean": 94.41
+    },
+    "loop_decision_insert": {
+     "n": 64,
+     "p50": 56.39,
+     "p95": 100.74,
+     "max": 147.66,
+     "mean": 60.96
+    },
+    "loop_decision_check": {
+     "n": 64,
+     "p50": 4.57,
+     "p95": 13.04,
+     "max": 15.78,
+     "mean": 5.44
+    },
+    "last_seat_update": {
+     "n": 64,
+     "p50": 0.11,
+     "p95": 0.31,
+     "max": 0.58,
+     "mean": 0.14
+    },
+    "final_check": {
+     "n": 64,
+     "p50": 0.32,
+     "p95": 0.59,
+     "max": 1.05,
+     "mean": 0.36
+    }
+   },
+   "lastSeat": "9007199254772993",
+   "seats": 32000,
+   "decisions": 32000
+  },
+  {
+   "cell": {
+    "workload": "W2",
+    "n": 500,
+    "c": 16,
+    "body": "main"
+   },
+   "threads": 8,
+   "drained": true,
+   "drainSeconds": 47.97,
+   "durableRecords": 32000,
+   "durableRecordsPerSec": 667,
+   "retriesPerBatch": 0.98,
+   "stageFailures": {
+    "claim:55P03": 33,
+    "commit:55P03": 14,
+    "prepare:55P03": 13,
+    "commit:57014": 3
+   },
+   "controls": {
+    "kind": "none",
+    "everyMs": 1000,
+    "scheduledSlots": 0,
+    "missedSlots": 0,
+    "started": 0,
+    "completedDuringLoad": 0,
+    "completedAfterLoadEnd": 0,
+    "failed": {},
+    "latencyMs": {
+     "n": 0,
+     "p50": null,
+     "p95": null,
+     "max": null,
+     "mean": null
+    }
+   },
+   "commitsOk": 64,
+   "traced": 64,
+   "untraced": 0,
+   "holdMs": {
+    "n": 64,
+    "p50": 320.68,
+    "p95": 633.93,
+    "max": 4520.24,
+    "mean": 436.08
+   },
+   "clockWaitMs": {
+    "n": 64,
+    "p50": 175.74,
+    "p95": 3185.11,
+    "max": 3608.7,
+    "mean": 636.31
+   },
+   "inAckAfterLockMs": {
+    "n": 64,
+    "p50": 304.83,
+    "p95": 515.77,
+    "max": 604.53,
+    "mean": 308.75
+   },
+   "postAckMs": {
+    "n": 64,
+    "p50": 1.45,
+    "p95": 3.75,
+    "max": 92.99,
+    "mean": 4.73
+   },
+   "commitRttMs": {
+    "n": 64,
+    "p50": 4.44,
+    "p95": 279.78,
+    "max": 4128.55,
+    "mean": 122.61
+   },
+   "preLockMs": {
+    "n": 64,
+    "p50": 0.62,
+    "p95": 1.67,
+    "max": 2.09,
+    "mean": 0.7
+   },
+   "commitStatementMs": {
+    "n": 64,
+    "p50": 1473.5,
+    "p95": 3425.18,
+    "max": 4080.43,
+    "mean": 1514.55
+   },
+   "commitStatementAllMs": {
+    "n": 64,
+    "p50": 1473.5,
+    "p95": 3425.18,
+    "max": 4080.43,
+    "mean": 1514.55
+   },
+   "commitWholeAllMs": {
+    "n": 64,
+    "p50": 1567.69,
+    "p95": 3577.89,
+    "max": 5221.03,
+    "mean": 1638.05
+   },
+   "offsetProbeRttMs": {
+    "n": 64,
+    "p50": 0.83,
+    "p95": 3.18,
+    "max": 12.63,
+    "mean": 1.24
+   },
+   "split": {
+    "toWrapper": {
+     "n": 64,
+     "p50": 0.47,
+     "p95": 2.13,
+     "max": 5.88,
+     "mean": 0.71
+    },
+    "originClaimEnter": {
+     "n": 64,
+     "p50": 0.69,
+     "p95": 1726.29,
+     "max": 1868.79,
+     "mean": 556.5
+    },
+    "commitBeforeAck": {
+     "n": 64,
+     "p50": 6.5,
+     "p95": 11.67,
+     "max": 15.62,
+     "mean": 6.86
+    },
+    "ackBeforeLock": {
+     "n": 64,
+     "p50": 0.62,
+     "p95": 1.67,
+     "max": 2.09,
+     "mean": 0.7
+    },
+    "wait": {
+     "n": 64,
+     "p50": 175.74,
+     "p95": 3185.11,
+     "max": 3608.7,
+     "mean": 636.31
+    },
+    "inAck": {
+     "n": 64,
+     "p50": 304.83,
+     "p95": 515.77,
+     "max": 604.53,
+     "mean": 308.75
+    },
+    "afterAck": {
+     "n": 64,
+     "p50": 0.84,
+     "p95": 2.28,
+     "max": 2.99,
+     "mean": 1.02
+    },
+    "toClientReturn": {
+     "n": 64,
+     "p50": 0.65,
+     "p95": 2.66,
+     "max": 90.44,
+     "mean": 3.7
+    },
+    "commitRtt": {
+     "n": 64,
+     "p50": 4.44,
+     "p95": 279.78,
+     "max": 4128.55,
+     "mean": 122.61
+    },
+    "nativeOriginLock": {
+     "n": 64,
+     "p50": 0.12,
+     "p95": 0.29,
+     "max": 1.19,
+     "mean": 0.14
+    }
+   },
+   "commitAttempts": {
+    "n": 81,
+    "over2s": 27,
+    "over5s": 3,
+    "failed": 17,
+    "statementMsOkAndFailed": {
+     "n": 81,
+     "p50": 1696.92,
+     "p95": 3679.21,
+     "max": 5002.57,
+     "mean": 1731
+    }
+   },
+   "afterLockSteps": [
+    "origin_lock",
+    "stage_row",
+    "attempt_check1",
+    "attempt_row",
+    "loop_fetch",
+    "loop_key",
+    "loop_slot_lock",
+    "loop_checks",
+    "loop_seat",
+    "loop_slot_update",
+    "loop_decision_insert",
+    "loop_decision_check",
+    "last_seat_update",
+    "final_check"
+   ],
+   "stepMs": {
+    "guard": {
+     "n": 64,
+     "p50": 0.16,
+     "p95": 0.32,
+     "max": 0.38,
+     "mean": 0.16
+    },
+    "lock_fences": {
+     "n": 64,
+     "p50": 0.19,
+     "p95": 0.4,
+     "max": 0.96,
+     "mean": 0.21
+    },
+    "seal": {
+     "n": 64,
+     "p50": 0.21,
+     "p95": 0.39,
+     "max": 0.62,
+     "mean": 0.21
+    },
+    "gate_read": {
+     "n": 64,
+     "p50": 0.05,
+     "p95": 0.52,
+     "max": 0.7,
+     "mean": 0.12
+    },
+    "clock_lock": {
+     "n": 64,
+     "p50": 175.74,
+     "p95": 3185.11,
+     "max": 3608.7,
+     "mean": 636.31
+    },
+    "origin_lock": {
+     "n": 64,
+     "p50": 0.12,
+     "p95": 0.29,
+     "max": 1.19,
+     "mean": 0.14
+    },
+    "stage_row": {
+     "n": 64,
+     "p50": 0.45,
+     "p95": 1.27,
+     "max": 1.79,
+     "mean": 0.53
+    },
+    "attempt_check1": {
+     "n": 64,
+     "p50": 0.53,
+     "p95": 1.95,
+     "max": 5.45,
+     "mean": 0.72
+    },
+    "attempt_row": {
+     "n": 64,
+     "p50": 0.28,
+     "p95": 0.48,
+     "max": 2.3,
+     "mean": 0.33
+    },
+    "loop_fetch": {
+     "n": 64,
+     "p50": 17.78,
+     "p95": 30.21,
+     "max": 49.43,
+     "mean": 18.31
+    },
+    "loop_key": {
+     "n": 64,
+     "p50": 13.13,
+     "p95": 29.96,
+     "max": 40.07,
+     "mean": 15.12
+    },
+    "loop_slot_lock": {
+     "n": 64,
+     "p50": 11.52,
+     "p95": 19.89,
+     "max": 22.93,
+     "mean": 12.43
+    },
+    "loop_checks": {
+     "n": 64,
+     "p50": 2.31,
+     "p95": 5.4,
+     "max": 8.51,
+     "mean": 2.78
+    },
+    "loop_seat": {
+     "n": 64,
+     "p50": 41.68,
+     "p95": 70.67,
+     "max": 77.47,
+     "mean": 43.1
+    },
+    "loop_slot_update": {
+     "n": 64,
+     "p50": 118.23,
+     "p95": 221.94,
+     "max": 270.27,
+     "mean": 126.38
+    },
+    "loop_decision_insert": {
+     "n": 64,
+     "p50": 79.78,
+     "p95": 135.97,
+     "max": 166.4,
+     "mean": 80.29
+    },
+    "loop_decision_check": {
+     "n": 64,
+     "p50": 6.93,
+     "p95": 15.47,
+     "max": 17.99,
+     "mean": 7.88
+    },
+    "last_seat_update": {
+     "n": 64,
+     "p50": 0.18,
+     "p95": 0.45,
+     "max": 0.89,
+     "mean": 0.23
+    },
+    "final_check": {
+     "n": 64,
+     "p50": 0.42,
+     "p95": 1.1,
+     "max": 1.33,
+     "mean": 0.5
+    }
+   },
+   "lastSeat": "9007199254772993",
+   "seats": 32000,
+   "decisions": 32000
+  },
+  {
+   "cell": {
+    "workload": "W1",
+    "n": 250,
+    "c": 2,
+    "body": "t2"
+   },
+   "threads": 2,
+   "drained": true,
+   "drainSeconds": 34.05,
+   "durableRecords": 32000,
+   "durableRecordsPerSec": 940,
+   "retriesPerBatch": 0,
+   "stageFailures": {},
+   "controls": {
+    "kind": "none",
+    "everyMs": 1000,
+    "scheduledSlots": 0,
+    "missedSlots": 0,
+    "started": 0,
+    "completedDuringLoad": 0,
+    "completedAfterLoadEnd": 0,
+    "failed": {},
+    "latencyMs": {
+     "n": 0,
+     "p50": null,
+     "p95": null,
+     "max": null,
+     "mean": null
+    }
+   },
+   "commitsOk": 128,
+   "traced": 128,
+   "untraced": 0,
+   "holdMs": {
+    "n": 128,
+    "p50": 117,
+    "p95": 159.79,
+    "max": 359.22,
+    "mean": 114.04
+   },
+   "clockWaitMs": {
+    "n": 128,
+    "p50": 0.13,
+    "p95": 66.5,
+    "max": 209.49,
+    "mean": 10.47
+   },
+   "inAckAfterLockMs": {
+    "n": 128,
+    "p50": 104.94,
+    "p95": 152.36,
+    "max": 171.43,
+    "mean": 106.1
+   },
+   "postAckMs": {
+    "n": 128,
+    "p50": 1.13,
+    "p95": 2.39,
+    "max": 7.85,
+    "mean": 1.23
+   },
+   "commitRttMs": {
+    "n": 128,
+    "p50": 4.05,
+    "p95": 11.13,
+    "max": 217.54,
+    "mean": 6.71
+   },
+   "preLockMs": {
+    "n": 128,
+    "p50": 36.88,
+    "p95": 52.82,
+    "max": 79.24,
+    "mean": 36.66
+   },
+   "commitStatementMs": {
+    "n": 128,
+    "p50": 160.96,
+    "p95": 236.9,
+    "max": 393.73,
+    "mean": 159.27
+   },
+   "commitStatementAllMs": {
+    "n": 128,
+    "p50": 160.96,
+    "p95": 236.9,
+    "max": 393.73,
+    "mean": 159.27
+   },
+   "commitWholeAllMs": {
+    "n": 128,
+    "p50": 163,
+    "p95": 250.94,
+    "max": 418.48,
+    "mean": 166.77
+   },
+   "offsetProbeRttMs": {
+    "n": 128,
+    "p50": 0.68,
+    "p95": 3.25,
+    "max": 6.66,
+    "mean": 0.95
+   },
+   "split": {
+    "toWrapper": {
+     "n": 128,
+     "p50": 0.33,
+     "p95": 1.64,
+     "max": 12.29,
+     "mean": 0.54
+    },
+    "originClaimEnter": {
+     "n": 128,
+     "p50": 0.39,
+     "p95": 0.51,
+     "max": 1.33,
+     "mean": 0.39
+    },
+    "commitBeforeAck": {
+     "n": 128,
+     "p50": 3.72,
+     "p95": 6.44,
+     "max": 9.28,
+     "mean": 3.88
+    },
+    "ackBeforeLock": {
+     "n": 128,
+     "p50": 36.88,
+     "p95": 52.82,
+     "max": 79.24,
+     "mean": 36.66
+    },
+    "wait": {
+     "n": 128,
+     "p50": 0.13,
+     "p95": 66.5,
+     "max": 209.49,
+     "mean": 10.47
+    },
+    "inAck": {
+     "n": 128,
+     "p50": 104.94,
+     "p95": 152.36,
+     "max": 171.43,
+     "mean": 106.1
+    },
+    "afterAck": {
+     "n": 128,
+     "p50": 0.66,
+     "p95": 1.09,
+     "max": 2.01,
+     "mean": 0.68
+    },
+    "toClientReturn": {
+     "n": 128,
+     "p50": 0.49,
+     "p95": 1.54,
+     "max": 7.07,
+     "mean": 0.56
+    },
+    "commitRtt": {
+     "n": 128,
+     "p50": 4.05,
+     "p95": 11.13,
+     "max": 217.54,
+     "mean": 6.71
+    },
+    "nativeOriginLock": {
+     "n": 128,
+     "p50": 0.02,
+     "p95": 0.04,
+     "max": 0.17,
+     "mean": 0.03
+    }
+   },
+   "commitAttempts": {
+    "n": 128,
+    "over2s": 0,
+    "over5s": 0,
+    "failed": 0,
+    "statementMsOkAndFailed": {
+     "n": 128,
+     "p50": 160.96,
+     "p95": 236.9,
+     "max": 393.73,
+     "mean": 159.27
+    }
+   },
+   "afterLockSteps": [
+    "t2_C2_number",
+    "t2_D_seats",
+    "t2_D_slots",
+    "t2_D_decisions",
+    "t2_E_count",
+    "last_seat_update",
+    "final_check"
+   ],
+   "stepMs": {
+    "guard": {
+     "n": 128,
+     "p50": 0.14,
+     "p95": 0.2,
+     "max": 0.23,
+     "mean": 0.13
+    },
+    "lock_fences": {
+     "n": 128,
+     "p50": 0.16,
+     "p95": 0.24,
+     "max": 1.29,
+     "mean": 0.17
+    },
+    "seal": {
+     "n": 128,
+     "p50": 0.06,
+     "p95": 0.17,
+     "max": 0.44,
+     "mean": 0.07
+    },
+    "gate_read": {
+     "n": 128,
+     "p50": 0.04,
+     "p95": 0.05,
+     "max": 0.53,
+     "mean": 0.05
+    },
+    "clock_lock": {
+     "n": 128,
+     "p50": 0.04,
+     "p95": 0.06,
+     "max": 2.11,
+     "mean": 0.06
+    },
+    "origin_lock": {
+     "n": 128,
+     "p50": 0.02,
+     "p95": 0.04,
+     "max": 0.17,
+     "mean": 0.03
+    },
+    "stage_row": {
+     "n": 128,
+     "p50": 0.08,
+     "p95": 0.29,
+     "max": 0.97,
+     "mean": 0.11
+    },
+    "attempt_check1": {
+     "n": 128,
+     "p50": 0.36,
+     "p95": 0.56,
+     "max": 2.79,
+     "mean": 0.38
+    },
+    "attempt_row": {
+     "n": 128,
+     "p50": 0.14,
+     "p95": 0.2,
+     "max": 1.53,
+     "mean": 0.16
+    },
+    "last_seat_update": {
+     "n": 128,
+     "p50": 0.18,
+     "p95": 0.28,
+     "max": 0.53,
+     "mean": 0.18
+    },
+    "final_check": {
+     "n": 128,
+     "p50": 0.46,
+     "p95": 0.7,
+     "max": 1.27,
+     "mean": 0.47
+    },
+    "t2_A_candidates": {
+     "n": 128,
+     "p50": 15.93,
+     "p95": 24.11,
+     "max": 35.41,
+     "mean": 16.03
+    },
+    "t2_B_slot_locks": {
+     "n": 128,
+     "p50": 2.77,
+     "p95": 4.41,
+     "max": 6.18,
+     "mean": 2.76
+    },
+    "t2_C1_plan": {
+     "n": 128,
+     "p50": 17.11,
+     "p95": 24.6,
+     "max": 39.62,
+     "mean": 16.73
+    },
+    "t2_upgrade": {
+     "n": 128,
+     "p50": 0.13,
+     "p95": 66.5,
+     "max": 209.49,
+     "mean": 10.47
+    },
+    "t2_C2_number": {
+     "n": 128,
+     "p50": 10.05,
+     "p95": 14.07,
+     "max": 23.23,
+     "mean": 9.48
+    },
+    "t2_D_seats": {
+     "n": 128,
+     "p50": 10.84,
+     "p95": 14.48,
+     "max": 18.82,
+     "mean": 10.61
+    },
+    "t2_D_slots": {
+     "n": 128,
+     "p50": 59.93,
+     "p95": 94.21,
+     "max": 98.09,
+     "mean": 58.41
+    },
+    "t2_D_decisions": {
+     "n": 128,
+     "p50": 25.84,
+     "p95": 35.73,
+     "max": 39.72,
+     "mean": 26.7
+    },
+    "t2_E_count": {
+     "n": 128,
+     "p50": 0.25,
+     "p95": 0.35,
+     "max": 0.68,
+     "mean": 0.25
+    }
+   },
+   "lastSeat": "9007199254772993",
+   "seats": 32000,
+   "decisions": 32000
+  },
+  {
+   "cell": {
+    "workload": "W1",
+    "n": 250,
+    "c": 4,
+    "body": "t2"
+   },
+   "threads": 4,
+   "drained": true,
+   "drainSeconds": 15.22,
+   "durableRecords": 32000,
+   "durableRecordsPerSec": 2102,
+   "retriesPerBatch": 0,
+   "stageFailures": {},
+   "controls": {
+    "kind": "none",
+    "everyMs": 1000,
+    "scheduledSlots": 0,
+    "missedSlots": 0,
+    "started": 0,
+    "completedDuringLoad": 0,
+    "completedAfterLoadEnd": 0,
+    "failed": {},
+    "latencyMs": {
+     "n": 0,
+     "p50": null,
+     "p95": null,
+     "max": null,
+     "mean": null
+    }
+   },
+   "commitsOk": 128,
+   "traced": 128,
+   "untraced": 0,
+   "holdMs": {
+    "n": 128,
+    "p50": 98.88,
+    "p95": 140.81,
+    "max": 451.81,
+    "mean": 101.24
+   },
+   "clockWaitMs": {
+    "n": 128,
+    "p50": 14.55,
+    "p95": 131.51,
+    "max": 388.43,
+    "mean": 35.74
+   },
+   "inAckAfterLockMs": {
+    "n": 128,
+    "p50": 93.8,
+    "p95": 135.31,
+    "max": 159.09,
+    "mean": 93.27
+   },
+   "postAckMs": {
+    "n": 128,
+    "p50": 1.15,
+    "p95": 2.14,
+    "max": 3.69,
+    "mean": 1.24
+   },
+   "commitRttMs": {
+    "n": 128,
+    "p50": 3.18,
+    "p95": 8.43,
+    "max": 367.07,
+    "mean": 6.73
+   },
+   "preLockMs": {
+    "n": 128,
+    "p50": 31.81,
+    "p95": 43.74,
+    "max": 51.07,
+    "mean": 32.25
+   },
+   "commitStatementMs": {
+    "n": 128,
+    "p50": 156.61,
+    "p95": 280.24,
+    "max": 478.81,
+    "mean": 167.45
+   },
+   "commitStatementAllMs": {
+    "n": 128,
+    "p50": 156.61,
+    "p95": 280.24,
+    "max": 478.81,
+    "mean": 167.45
+   },
+   "commitWholeAllMs": {
+    "n": 128,
+    "p50": 160.84,
+    "p95": 294.24,
+    "max": 520.76,
+    "mean": 174.84
+   },
+   "offsetProbeRttMs": {
+    "n": 128,
+    "p50": 0.68,
+    "p95": 1.69,
+    "max": 3.35,
+    "mean": 0.78
+   },
+   "split": {
+    "toWrapper": {
+     "n": 128,
+     "p50": 0.37,
+     "p95": 1.18,
+     "max": 3.47,
+     "mean": 0.44
+    },
+    "originClaimEnter": {
+     "n": 128,
+     "p50": 0.37,
+     "p95": 0.54,
+     "max": 0.83,
+     "mean": 0.38
+    },
+    "commitBeforeAck": {
+     "n": 128,
+     "p50": 3.81,
+     "p95": 7.16,
+     "max": 13.94,
+     "mean": 4.14
+    },
+    "ackBeforeLock": {
+     "n": 128,
+     "p50": 31.81,
+     "p95": 43.74,
+     "max": 51.07,
+     "mean": 32.25
+    },
+    "wait": {
+     "n": 128,
+     "p50": 14.55,
+     "p95": 131.51,
+     "max": 388.43,
+     "mean": 35.74
+    },
+    "inAck": {
+     "n": 128,
+     "p50": 93.8,
+     "p95": 135.31,
+     "max": 159.09,
+     "mean": 93.27
+    },
+    "afterAck": {
+     "n": 128,
+     "p50": 0.64,
+     "p95": 1.32,
+     "max": 2.81,
+     "mean": 0.7
+    },
+    "toClientReturn": {
+     "n": 128,
+     "p50": 0.5,
+     "p95": 0.87,
+     "max": 1.75,
+     "mean": 0.54
+    },
+    "commitRtt": {
+     "n": 128,
+     "p50": 3.18,
+     "p95": 8.43,
+     "max": 367.07,
+     "mean": 6.73
+    },
+    "nativeOriginLock": {
+     "n": 128,
+     "p50": 0.02,
+     "p95": 0.06,
+     "max": 0.31,
+     "mean": 0.03
+    }
+   },
+   "commitAttempts": {
+    "n": 128,
+    "over2s": 0,
+    "over5s": 0,
+    "failed": 0,
+    "statementMsOkAndFailed": {
+     "n": 128,
+     "p50": 156.61,
+     "p95": 280.24,
+     "max": 478.81,
+     "mean": 167.45
+    }
+   },
+   "afterLockSteps": [
+    "t2_C2_number",
+    "t2_D_seats",
+    "t2_D_slots",
+    "t2_D_decisions",
+    "t2_E_count",
+    "last_seat_update",
+    "final_check"
+   ],
+   "stepMs": {
+    "guard": {
+     "n": 128,
+     "p50": 0.14,
+     "p95": 0.21,
+     "max": 0.82,
+     "mean": 0.14
+    },
+    "lock_fences": {
+     "n": 128,
+     "p50": 0.16,
+     "p95": 0.26,
+     "max": 0.56,
+     "mean": 0.16
+    },
+    "seal": {
+     "n": 128,
+     "p50": 0.06,
+     "p95": 0.24,
+     "max": 0.57,
+     "mean": 0.09
+    },
+    "gate_read": {
+     "n": 128,
+     "p50": 0.04,
+     "p95": 0.07,
+     "max": 0.9,
+     "mean": 0.06
+    },
+    "clock_lock": {
+     "n": 128,
+     "p50": 0.04,
+     "p95": 0.08,
+     "max": 0.33,
+     "mean": 0.05
+    },
+    "origin_lock": {
+     "n": 128,
+     "p50": 0.02,
+     "p95": 0.06,
+     "max": 0.31,
+     "mean": 0.03
+    },
+    "stage_row": {
+     "n": 128,
+     "p50": 0.08,
+     "p95": 0.43,
+     "max": 1.26,
+     "mean": 0.16
+    },
+    "attempt_check1": {
+     "n": 128,
+     "p50": 0.35,
+     "p95": 0.56,
+     "max": 1.2,
+     "mean": 0.36
+    },
+    "attempt_row": {
+     "n": 128,
+     "p50": 0.14,
+     "p95": 0.33,
+     "max": 0.47,
+     "mean": 0.16
+    },
+    "last_seat_update": {
+     "n": 128,
+     "p50": 0.16,
+     "p95": 0.33,
+     "max": 0.57,
+     "mean": 0.18
+    },
+    "final_check": {
+     "n": 128,
+     "p50": 0.43,
+     "p95": 0.71,
+     "max": 1.27,
+     "mean": 0.45
+    },
+    "t2_A_candidates": {
+     "n": 128,
+     "p50": 14.07,
+     "p95": 18.8,
+     "max": 23.03,
+     "mean": 13.81
+    },
+    "t2_B_slot_locks": {
+     "n": 128,
+     "p50": 2.34,
+     "p95": 3.16,
+     "max": 3.81,
+     "mean": 2.39
+    },
+    "t2_C1_plan": {
+     "n": 128,
+     "p50": 14.82,
+     "p95": 20.31,
+     "max": 22.45,
+     "mean": 14.84
+    },
+    "t2_upgrade": {
+     "n": 128,
+     "p50": 14.55,
+     "p95": 131.51,
+     "max": 388.43,
+     "mean": 35.74
+    },
+    "t2_C2_number": {
+     "n": 128,
+     "p50": 9.16,
+     "p95": 13.64,
+     "max": 20.12,
+     "mean": 9.29
+    },
+    "t2_D_seats": {
+     "n": 128,
+     "p50": 9.45,
+     "p95": 12.79,
+     "max": 15.82,
+     "mean": 9.56
+    },
+    "t2_D_slots": {
+     "n": 128,
+     "p50": 47.92,
+     "p95": 78.3,
+     "max": 94.25,
+     "mean": 49.63
+    },
+    "t2_D_decisions": {
+     "n": 128,
+     "p50": 23.53,
+     "p95": 32.53,
+     "max": 34.36,
+     "mean": 23.91
+    },
+    "t2_E_count": {
+     "n": 128,
+     "p50": 0.23,
+     "p95": 0.44,
+     "max": 0.82,
+     "mean": 0.25
+    }
+   },
+   "lastSeat": "9007199254772993",
+   "seats": 32000,
+   "decisions": 32000
+  },
+  {
+   "cell": {
+    "workload": "W1",
+    "n": 250,
+    "c": 16,
+    "body": "t2"
+   },
+   "threads": 8,
+   "drained": true,
+   "drainSeconds": 13.03,
+   "durableRecords": 32000,
+   "durableRecordsPerSec": 2456,
+   "retriesPerBatch": 0,
+   "stageFailures": {},
+   "controls": {
+    "kind": "none",
+    "everyMs": 1000,
+    "scheduledSlots": 0,
+    "missedSlots": 0,
+    "started": 0,
+    "completedDuringLoad": 0,
+    "completedAfterLoadEnd": 0,
+    "failed": {},
+    "latencyMs": {
+     "n": 0,
+     "p50": null,
+     "p95": null,
+     "max": null,
+     "mean": null
+    }
+   },
+   "commitsOk": 128,
+   "traced": 128,
+   "untraced": 0,
+   "holdMs": {
+    "n": 128,
+    "p50": 83.79,
+    "p95": 146.58,
+    "max": 601.42,
+    "mean": 95.55
+   },
+   "clockWaitMs": {
+    "n": 128,
+    "p50": 539.62,
+    "p95": 3278.36,
+    "max": 4386.74,
+    "mean": 928.9
+   },
+   "inAckAfterLockMs": {
+    "n": 128,
+    "p50": 73.98,
+    "p95": 118.74,
+    "max": 139.35,
+    "mean": 77.96
+   },
+   "postAckMs": {
+    "n": 128,
+    "p50": 1.28,
+    "p95": 4.2,
+    "max": 215.7,
+    "mean": 3.7
+   },
+   "commitRttMs": {
+    "n": 128,
+    "p50": 3.09,
+    "p95": 35.03,
+    "max": 549.11,
+    "mean": 13.89
+   },
+   "preLockMs": {
+    "n": 128,
+    "p50": 27.91,
+    "p95": 49.13,
+    "max": 65.4,
+    "mean": 29.82
+   },
+   "commitStatementMs": {
+    "n": 128,
+    "p50": 650.75,
+    "p95": 3371.95,
+    "max": 4579.11,
+    "mean": 1046.32
+   },
+   "commitStatementAllMs": {
+    "n": 128,
+    "p50": 650.75,
+    "p95": 3371.95,
+    "max": 4579.11,
+    "mean": 1046.32
+   },
+   "commitWholeAllMs": {
+    "n": 128,
+    "p50": 659.45,
+    "p95": 3376.07,
+    "max": 4597.07,
+    "mean": 1061.75
+   },
+   "offsetProbeRttMs": {
+    "n": 128,
+    "p50": 0.64,
+    "p95": 1.77,
+    "max": 4.64,
+    "mean": 0.8
+   },
+   "split": {
+    "toWrapper": {
+     "n": 128,
+     "p50": 0.38,
+     "p95": 1.14,
+     "max": 9.64,
+     "mean": 0.56
+    },
+    "originClaimEnter": {
+     "n": 128,
+     "p50": 0.37,
+     "p95": 0.67,
+     "max": 1.93,
+     "mean": 0.4
+    },
+    "commitBeforeAck": {
+     "n": 128,
+     "p50": 4.03,
+     "p95": 12.16,
+     "max": 19.22,
+     "mean": 4.97
+    },
+    "ackBeforeLock": {
+     "n": 128,
+     "p50": 27.91,
+     "p95": 49.13,
+     "max": 65.4,
+     "mean": 29.82
+    },
+    "wait": {
+     "n": 128,
+     "p50": 539.62,
+     "p95": 3278.36,
+     "max": 4386.74,
+     "mean": 928.9
+    },
+    "inAck": {
+     "n": 128,
+     "p50": 73.98,
+     "p95": 118.74,
+     "max": 139.35,
+     "mean": 77.96
+    },
+    "afterAck": {
+     "n": 128,
+     "p50": 0.7,
+     "p95": 2.15,
+     "max": 3.22,
+     "mean": 0.86
+    },
+    "toClientReturn": {
+     "n": 128,
+     "p50": 0.54,
+     "p95": 2.68,
+     "max": 213.74,
+     "mean": 2.84
+    },
+    "commitRtt": {
+     "n": 128,
+     "p50": 3.09,
+     "p95": 35.03,
+     "max": 549.11,
+     "mean": 13.89
+    },
+    "nativeOriginLock": {
+     "n": 128,
+     "p50": 0.03,
+     "p95": 0.18,
+     "max": 0.21,
+     "mean": 0.05
+    }
+   },
+   "commitAttempts": {
+    "n": 128,
+    "over2s": 20,
+    "over5s": 0,
+    "failed": 0,
+    "statementMsOkAndFailed": {
+     "n": 128,
+     "p50": 650.75,
+     "p95": 3371.95,
+     "max": 4579.11,
+     "mean": 1046.32
+    }
+   },
+   "afterLockSteps": [
+    "t2_C2_number",
+    "t2_D_seats",
+    "t2_D_slots",
+    "t2_D_decisions",
+    "t2_E_count",
+    "last_seat_update",
+    "final_check"
+   ],
+   "stepMs": {
+    "guard": {
+     "n": 128,
+     "p50": 0.15,
+     "p95": 0.3,
+     "max": 1.25,
+     "mean": 0.17
+    },
+    "lock_fences": {
+     "n": 128,
+     "p50": 0.14,
+     "p95": 0.45,
+     "max": 1.28,
+     "mean": 0.19
+    },
+    "seal": {
+     "n": 128,
+     "p50": 0.14,
+     "p95": 0.41,
+     "max": 0.58,
+     "mean": 0.16
+    },
+    "gate_read": {
+     "n": 128,
+     "p50": 0.04,
+     "p95": 0.59,
+     "max": 1.4,
+     "mean": 0.12
+    },
+    "clock_lock": {
+     "n": 128,
+     "p50": 0.07,
+     "p95": 0.25,
+     "max": 0.46,
+     "mean": 0.09
+    },
+    "origin_lock": {
+     "n": 128,
+     "p50": 0.03,
+     "p95": 0.18,
+     "max": 0.21,
+     "mean": 0.05
+    },
+    "stage_row": {
+     "n": 128,
+     "p50": 0.24,
+     "p95": 1.07,
+     "max": 2.42,
+     "mean": 0.34
+    },
+    "attempt_check1": {
+     "n": 128,
+     "p50": 0.37,
+     "p95": 1.05,
+     "max": 1.65,
+     "mean": 0.44
+    },
+    "attempt_row": {
+     "n": 128,
+     "p50": 0.14,
+     "p95": 0.41,
+     "max": 0.54,
+     "mean": 0.17
+    },
+    "last_seat_update": {
+     "n": 128,
+     "p50": 0.22,
+     "p95": 0.48,
+     "max": 0.96,
+     "mean": 0.25
+    },
+    "final_check": {
+     "n": 128,
+     "p50": 0.43,
+     "p95": 1.08,
+     "max": 1.43,
+     "mean": 0.5
+    },
+    "t2_A_candidates": {
+     "n": 128,
+     "p50": 11.02,
+     "p95": 18.85,
+     "max": 22.63,
+     "mean": 11.66
+    },
+    "t2_B_slot_locks": {
+     "n": 128,
+     "p50": 2.3,
+     "p95": 4.16,
+     "max": 6.71,
+     "mean": 2.5
+    },
+    "t2_C1_plan": {
+     "n": 128,
+     "p50": 13.13,
+     "p95": 21.95,
+     "max": 30.86,
+     "mean": 13.92
+    },
+    "t2_upgrade": {
+     "n": 128,
+     "p50": 539.62,
+     "p95": 3278.36,
+     "max": 4386.74,
+     "mean": 928.9
+    },
+    "t2_C2_number": {
+     "n": 128,
+     "p50": 8.4,
+     "p95": 13.22,
+     "max": 19.98,
+     "mean": 8.8
+    },
+    "t2_D_seats": {
+     "n": 128,
+     "p50": 8.2,
+     "p95": 13.48,
+     "max": 16.6,
+     "mean": 8.6
+    },
+    "t2_D_slots": {
+     "n": 128,
+     "p50": 37.44,
+     "p95": 64.25,
+     "max": 74.69,
+     "mean": 39.36
+    },
+    "t2_D_decisions": {
+     "n": 128,
+     "p50": 19.11,
+     "p95": 31.1,
+     "max": 32.86,
+     "mean": 20.18
+    },
+    "t2_E_count": {
+     "n": 128,
+     "p50": 0.22,
+     "p95": 0.61,
+     "max": 0.93,
+     "mean": 0.27
+    }
+   },
+   "lastSeat": "9007199254772993",
+   "seats": 32000,
+   "decisions": 32000
+  },
+  {
+   "cell": {
+    "workload": "W1",
+    "n": 250,
+    "c": 64,
+    "body": "t2"
+   },
+   "threads": 8,
+   "drained": true,
+   "drainSeconds": 30.65,
+   "durableRecords": 32000,
+   "durableRecordsPerSec": 1044,
+   "retriesPerBatch": 0.9,
+   "stageFailures": {
+    "commit:57014": 115
+   },
+   "controls": {
+    "kind": "none",
+    "everyMs": 1000,
+    "scheduledSlots": 0,
+    "missedSlots": 0,
+    "started": 0,
+    "completedDuringLoad": 0,
+    "completedAfterLoadEnd": 0,
+    "failed": {},
+    "latencyMs": {
+     "n": 0,
+     "p50": null,
+     "p95": null,
+     "max": null,
+     "mean": null
+    }
+   },
+   "commitsOk": 128,
+   "traced": 128,
+   "untraced": 0,
+   "holdMs": {
+    "n": 128,
+    "p50": 157.19,
+    "p95": 890.68,
+    "max": 1796.69,
+    "mean": 235.41
+   },
+   "clockWaitMs": {
+    "n": 128,
+    "p50": 1595.05,
+    "p95": 3944.59,
+    "max": 4720.72,
+    "mean": 1735.41
+   },
+   "inAckAfterLockMs": {
+    "n": 128,
+    "p50": 142.44,
+    "p95": 256.72,
+    "max": 759.62,
+    "mean": 158.36
+   },
+   "postAckMs": {
+    "n": 128,
+    "p50": 2.54,
+    "p95": 167.34,
+    "max": 740.54,
+    "mean": 26.02
+   },
+   "commitRttMs": {
+    "n": 128,
+    "p50": 8.46,
+    "p95": 166.28,
+    "max": 1541.66,
+    "mean": 51.02
+   },
+   "preLockMs": {
+    "n": 128,
+    "p50": 50.41,
+    "p95": 173.48,
+    "max": 305.84,
+    "mean": 69.18
+   },
+   "commitStatementMs": {
+    "n": 128,
+    "p50": 1857.66,
+    "p95": 4399.22,
+    "max": 5521.59,
+    "mean": 2010.6
+   },
+   "commitStatementAllMs": {
+    "n": 128,
+    "p50": 1857.66,
+    "p95": 4399.22,
+    "max": 5521.59,
+    "mean": 2010.6
+   },
+   "commitWholeAllMs": {
+    "n": 128,
+    "p50": 1883.3,
+    "p95": 4632.25,
+    "max": 5946.74,
+    "mean": 2063.79
+   },
+   "offsetProbeRttMs": {
+    "n": 128,
+    "p50": 1.22,
+    "p95": 15.23,
+    "max": 743.1,
+    "mean": 16.51
+   },
+   "split": {
+    "toWrapper": {
+     "n": 128,
+     "p50": 0.75,
+     "p95": 7.96,
+     "max": 368.18,
+     "mean": 8.32
+    },
+    "originClaimEnter": {
+     "n": 128,
+     "p50": 0.41,
+     "p95": 0.74,
+     "max": 18.25,
+     "mean": 0.66
+    },
+    "commitBeforeAck": {
+     "n": 128,
+     "p50": 8.87,
+     "p95": 32.71,
+     "max": 68.4,
+     "mean": 12.65
+    },
+    "ackBeforeLock": {
+     "n": 128,
+     "p50": 50.41,
+     "p95": 173.48,
+     "max": 305.84,
+     "mean": 69.18
+    },
+    "wait": {
+     "n": 128,
+     "p50": 1595.05,
+     "p95": 3944.59,
+     "max": 4720.72,
+     "mean": 1735.41
+    },
+    "inAck": {
+     "n": 128,
+     "p50": 142.44,
+     "p95": 256.72,
+     "max": 759.62,
+     "mean": 158.36
+    },
+    "afterAck": {
+     "n": 128,
+     "p50": 1.57,
+     "p95": 3.4,
+     "max": 18.59,
+     "mean": 2.13
+    },
+    "toClientReturn": {
+     "n": 128,
+     "p50": 0.62,
+     "p95": 157.38,
+     "max": 738.74,
+     "mean": 23.89
+    },
+    "commitRtt": {
+     "n": 128,
+     "p50": 8.46,
+     "p95": 166.28,
+     "max": 1541.66,
+     "mean": 51.02
+    },
+    "nativeOriginLock": {
+     "n": 128,
+     "p50": 0.05,
+     "p95": 0.21,
+     "max": 3.25,
+     "mean": 0.1
+    }
+   },
+   "commitAttempts": {
+    "n": 243,
+    "over2s": 173,
+    "over5s": 117,
+    "failed": 115,
+    "statementMsOkAndFailed": {
+     "n": 243,
+     "p50": 4399.22,
+     "p95": 5302.87,
+     "max": 6204.03,
+     "mean": 3458.39
+    }
+   },
+   "afterLockSteps": [
+    "t2_C2_number",
+    "t2_D_seats",
+    "t2_D_slots",
+    "t2_D_decisions",
+    "t2_E_count",
+    "last_seat_update",
+    "final_check"
+   ],
+   "stepMs": {
+    "guard": {
+     "n": 128,
+     "p50": 0.22,
+     "p95": 3.3,
+     "max": 5.49,
+     "mean": 0.49
+    },
+    "lock_fences": {
+     "n": 128,
+     "p50": 0.23,
+     "p95": 3.19,
+     "max": 6.43,
+     "mean": 0.53
+    },
+    "seal": {
+     "n": 128,
+     "p50": 0.28,
+     "p95": 1.26,
+     "max": 7.19,
+     "mean": 0.46
+    },
+    "gate_read": {
+     "n": 128,
+     "p50": 0.06,
+     "p95": 2.01,
+     "max": 5.28,
+     "mean": 0.36
+    },
+    "clock_lock": {
+     "n": 128,
+     "p50": 0.11,
+     "p95": 0.38,
+     "max": 5.87,
+     "mean": 0.24
+    },
+    "origin_lock": {
+     "n": 128,
+     "p50": 0.05,
+     "p95": 0.21,
+     "max": 3.25,
+     "mean": 0.1
+    },
+    "stage_row": {
+     "n": 128,
+     "p50": 0.41,
+     "p95": 5.95,
+     "max": 9.22,
+     "mean": 1.14
+    },
+    "attempt_check1": {
+     "n": 128,
+     "p50": 0.63,
+     "p95": 5.46,
+     "max": 15.57,
+     "mean": 1.36
+    },
+    "attempt_row": {
+     "n": 128,
+     "p50": 0.25,
+     "p95": 2.74,
+     "max": 15.52,
+     "mean": 0.7
+    },
+    "last_seat_update": {
+     "n": 128,
+     "p50": 0.43,
+     "p95": 1.26,
+     "max": 4.56,
+     "mean": 0.58
+    },
+    "final_check": {
+     "n": 128,
+     "p50": 0.74,
+     "p95": 2.43,
+     "max": 8.95,
+     "mean": 1.08
+    },
+    "t2_A_candidates": {
+     "n": 128,
+     "p50": 20.08,
+     "p95": 71.32,
+     "max": 152.16,
+     "mean": 27.91
+    },
+    "t2_B_slot_locks": {
+     "n": 128,
+     "p50": 3.64,
+     "p95": 13.68,
+     "max": 26.18,
+     "mean": 5.49
+    },
+    "t2_C1_plan": {
+     "n": 128,
+     "p50": 22.69,
+     "p95": 83.09,
+     "max": 136.04,
+     "mean": 30.4
+    },
+    "t2_upgrade": {
+     "n": 128,
+     "p50": 1595.05,
+     "p95": 3944.59,
+     "max": 4720.72,
+     "mean": 1735.41
+    },
+    "t2_C2_number": {
+     "n": 128,
+     "p50": 14.9,
+     "p95": 25.71,
+     "max": 99.88,
+     "mean": 16.82
+    },
+    "t2_D_seats": {
+     "n": 128,
+     "p50": 14.31,
+     "p95": 30.84,
+     "max": 169.77,
+     "mean": 18.02
+    },
+    "t2_D_slots": {
+     "n": 128,
+     "p50": 75.67,
+     "p95": 132.71,
+     "max": 473.44,
+     "mean": 85
+    },
+    "t2_D_decisions": {
+     "n": 128,
+     "p50": 33.79,
+     "p95": 53.58,
+     "max": 164.93,
+     "mean": 36.33
+    },
+    "t2_E_count": {
+     "n": 128,
+     "p50": 0.45,
+     "p95": 0.7,
+     "max": 7.2,
+     "mean": 0.53
+    }
+   },
+   "lastSeat": "9007199254772993",
+   "seats": 32000,
+   "decisions": 32000
+  },
+  {
+   "cell": {
+    "workload": "W2",
+    "n": 250,
+    "c": 4,
+    "body": "t2"
+   },
+   "threads": 4,
+   "drained": true,
+   "drainSeconds": 23.84,
+   "durableRecords": 32000,
+   "durableRecordsPerSec": 1342,
+   "retriesPerBatch": 0,
+   "stageFailures": {},
+   "controls": {
+    "kind": "none",
+    "everyMs": 1000,
+    "scheduledSlots": 0,
+    "missedSlots": 0,
+    "started": 0,
+    "completedDuringLoad": 0,
+    "completedAfterLoadEnd": 0,
+    "failed": {},
+    "latencyMs": {
+     "n": 0,
+     "p50": null,
+     "p95": null,
+     "max": null,
+     "mean": null
+    }
+   },
+   "commitsOk": 128,
+   "traced": 128,
+   "untraced": 0,
+   "holdMs": {
+    "n": 128,
+    "p50": 79.86,
+    "p95": 122.8,
+    "max": 771.25,
+    "mean": 91.77
+   },
+   "clockWaitMs": {
+    "n": 128,
+    "p50": 0.15,
+    "p95": 82.43,
+    "max": 147.77,
+    "mean": 19.63
+   },
+   "inAckAfterLockMs": {
+    "n": 128,
+    "p50": 74.96,
+    "p95": 115.53,
+    "max": 232.61,
+    "mean": 77.06
+   },
+   "postAckMs": {
+    "n": 128,
+    "p50": 1.05,
+    "p95": 2.83,
+    "max": 5.42,
+    "mean": 1.24
+   },
+   "commitRttMs": {
+    "n": 128,
+    "p50": 3.59,
+    "p95": 10.16,
+    "max": 537.71,
+    "mean": 13.47
+   },
+   "preLockMs": {
+    "n": 128,
+    "p50": 29.74,
+    "p95": 40.17,
+    "max": 52.33,
+    "mean": 29.36
+   },
+   "commitStatementMs": {
+    "n": 128,
+    "p50": 128.2,
+    "p95": 337.37,
+    "max": 1678.97,
+    "mean": 163.73
+   },
+   "commitStatementAllMs": {
+    "n": 128,
+    "p50": 128.2,
+    "p95": 337.37,
+    "max": 1678.97,
+    "mean": 163.73
+   },
+   "commitWholeAllMs": {
+    "n": 128,
+    "p50": 134.33,
+    "p95": 351.67,
+    "max": 1686.89,
+    "mean": 177.86
+   },
+   "offsetProbeRttMs": {
+    "n": 128,
+    "p50": 0.68,
+    "p95": 1.47,
+    "max": 3.66,
+    "mean": 0.8
+   },
+   "split": {
+    "toWrapper": {
+     "n": 128,
+     "p50": 0.33,
+     "p95": 1.02,
+     "max": 1.81,
+     "mean": 0.41
+    },
+    "originClaimEnter": {
+     "n": 128,
+     "p50": 0.39,
+     "p95": 179.51,
+     "max": 1563.11,
+     "mean": 32.47
+    },
+    "commitBeforeAck": {
+     "n": 128,
+     "p50": 3.41,
+     "p95": 6.09,
+     "max": 12.65,
+     "mean": 3.57
+    },
+    "ackBeforeLock": {
+     "n": 128,
+     "p50": 29.74,
+     "p95": 40.17,
+     "max": 52.33,
+     "mean": 29.36
+    },
+    "wait": {
+     "n": 128,
+     "p50": 0.15,
+     "p95": 82.43,
+     "max": 147.77,
+     "mean": 19.63
+    },
+    "inAck": {
+     "n": 128,
+     "p50": 74.96,
+     "p95": 115.53,
+     "max": 232.61,
+     "mean": 77.06
+    },
+    "afterAck": {
+     "n": 128,
+     "p50": 0.51,
+     "p95": 1.24,
+     "max": 3.07,
+     "mean": 0.62
+    },
+    "toClientReturn": {
+     "n": 128,
+     "p50": 0.53,
+     "p95": 1.27,
+     "max": 4.85,
+     "mean": 0.61
+    },
+    "commitRtt": {
+     "n": 128,
+     "p50": 3.59,
+     "p95": 10.16,
+     "max": 537.71,
+     "mean": 13.47
+    },
+    "nativeOriginLock": {
+     "n": 128,
+     "p50": 0.02,
+     "p95": 0.05,
+     "max": 0.26,
+     "mean": 0.03
+    }
+   },
+   "commitAttempts": {
+    "n": 128,
+    "over2s": 0,
+    "over5s": 0,
+    "failed": 0,
+    "statementMsOkAndFailed": {
+     "n": 128,
+     "p50": 128.2,
+     "p95": 337.37,
+     "max": 1678.97,
+     "mean": 163.73
+    }
+   },
+   "afterLockSteps": [
+    "t2_C2_number",
+    "t2_D_seats",
+    "t2_D_slots",
+    "t2_D_decisions",
+    "t2_E_count",
+    "last_seat_update",
+    "final_check"
+   ],
+   "stepMs": {
+    "guard": {
+     "n": 128,
+     "p50": 0.13,
+     "p95": 0.28,
+     "max": 0.36,
+     "mean": 0.13
+    },
+    "lock_fences": {
+     "n": 128,
+     "p50": 0.15,
+     "p95": 0.28,
+     "max": 0.87,
+     "mean": 0.16
+    },
+    "seal": {
+     "n": 128,
+     "p50": 0.05,
+     "p95": 0.24,
+     "max": 0.52,
+     "mean": 0.08
+    },
+    "gate_read": {
+     "n": 128,
+     "p50": 0.04,
+     "p95": 0.08,
+     "max": 0.62,
+     "mean": 0.06
+    },
+    "clock_lock": {
+     "n": 128,
+     "p50": 0.04,
+     "p95": 0.09,
+     "max": 0.39,
+     "mean": 0.05
+    },
+    "origin_lock": {
+     "n": 128,
+     "p50": 0.02,
+     "p95": 0.05,
+     "max": 0.26,
+     "mean": 0.03
+    },
+    "stage_row": {
+     "n": 128,
+     "p50": 0.08,
+     "p95": 0.47,
+     "max": 1.07,
+     "mean": 0.15
+    },
+    "attempt_check1": {
+     "n": 128,
+     "p50": 0.34,
+     "p95": 0.58,
+     "max": 1.2,
+     "mean": 0.35
+    },
+    "attempt_row": {
+     "n": 128,
+     "p50": 0.12,
+     "p95": 0.24,
+     "max": 0.47,
+     "mean": 0.13
+    },
+    "last_seat_update": {
+     "n": 128,
+     "p50": 0.14,
+     "p95": 0.32,
+     "max": 0.44,
+     "mean": 0.16
+    },
+    "final_check": {
+     "n": 128,
+     "p50": 0.39,
+     "p95": 0.74,
+     "max": 1.72,
+     "mean": 0.44
+    },
+    "t2_A_candidates": {
+     "n": 128,
+     "p50": 11.27,
+     "p95": 15.77,
+     "max": 17.11,
+     "mean": 11.39
+    },
+    "t2_B_slot_locks": {
+     "n": 128,
+     "p50": 2.27,
+     "p95": 6.42,
+     "max": 11,
+     "mean": 2.64
+    },
+    "t2_C1_plan": {
+     "n": 128,
+     "p50": 14.35,
+     "p95": 21.17,
+     "max": 27.1,
+     "mean": 14.2
+    },
+    "t2_upgrade": {
+     "n": 128,
+     "p50": 0.15,
+     "p95": 82.43,
+     "max": 147.77,
+     "mean": 19.63
+    },
+    "t2_C2_number": {
+     "n": 128,
+     "p50": 7.21,
+     "p95": 11.76,
+     "max": 15.24,
+     "mean": 7.39
+    },
+    "t2_D_seats": {
+     "n": 128,
+     "p50": 7.58,
+     "p95": 11.52,
+     "max": 13.23,
+     "mean": 7.94
+    },
+    "t2_D_slots": {
+     "n": 128,
+     "p50": 38.9,
+     "p95": 62.92,
+     "max": 121.22,
+     "mean": 40.17
+    },
+    "t2_D_decisions": {
+     "n": 128,
+     "p50": 19.92,
+     "p95": 29.92,
+     "max": 99.16,
+     "mean": 20.73
+    },
+    "t2_E_count": {
+     "n": 128,
+     "p50": 0.2,
+     "p95": 0.46,
+     "max": 0.62,
+     "mean": 0.23
+    }
+   },
+   "lastSeat": "9007199254772993",
+   "seats": 32000,
+   "decisions": 32000
+  },
+  {
+   "cell": {
+    "workload": "W2",
+    "n": 250,
+    "c": 16,
+    "body": "t2"
+   },
+   "threads": 8,
+   "drained": true,
+   "drainSeconds": 22.29,
+   "durableRecords": 32000,
+   "durableRecordsPerSec": 1436,
+   "retriesPerBatch": 0.1,
+   "stageFailures": {
+    "claim:55P03": 8,
+    "commit:55P03": 3,
+    "commit:57014": 1,
+    "prepare:55P03": 1
+   },
+   "controls": {
+    "kind": "none",
+    "everyMs": 1000,
+    "scheduledSlots": 0,
+    "missedSlots": 0,
+    "started": 0,
+    "completedDuringLoad": 0,
+    "completedAfterLoadEnd": 0,
+    "failed": {},
+    "latencyMs": {
+     "n": 0,
+     "p50": null,
+     "p95": null,
+     "max": null,
+     "mean": null
+    }
+   },
+   "commitsOk": 128,
+   "traced": 128,
+   "untraced": 0,
+   "holdMs": {
+    "n": 128,
+    "p50": 74.55,
+    "p95": 112.58,
+    "max": 1781.52,
+    "mean": 96.16
+   },
+   "clockWaitMs": {
+    "n": 128,
+    "p50": 45.04,
+    "p95": 902.04,
+    "max": 2718.87,
+    "mean": 256.83
+   },
+   "inAckAfterLockMs": {
+    "n": 128,
+    "p50": 69.56,
+    "p95": 94.45,
+    "max": 107.06,
+    "mean": 70.71
+   },
+   "postAckMs": {
+    "n": 128,
+    "p50": 1.21,
+    "p95": 2.63,
+    "max": 5.3,
+    "mean": 1.39
+   },
+   "commitRttMs": {
+    "n": 128,
+    "p50": 3.41,
+    "p95": 17.41,
+    "max": 1689.72,
+    "mean": 24.07
+   },
+   "preLockMs": {
+    "n": 128,
+    "p50": 24.71,
+    "p95": 38.46,
+    "max": 43.88,
+    "mean": 25.72
+   },
+   "commitStatementMs": {
+    "n": 128,
+    "p50": 586.84,
+    "p95": 1229.7,
+    "max": 2837.62,
+    "mean": 625.15
+   },
+   "commitStatementAllMs": {
+    "n": 128,
+    "p50": 586.84,
+    "p95": 1229.7,
+    "max": 2837.62,
+    "mean": 625.15
+   },
+   "commitWholeAllMs": {
+    "n": 128,
+    "p50": 617.07,
+    "p95": 1390.56,
+    "max": 2842.78,
+    "mean": 649.84
+   },
+   "offsetProbeRttMs": {
+    "n": 128,
+    "p50": 0.64,
+    "p95": 1.24,
+    "max": 1.37,
+    "mean": 0.69
+   },
+   "split": {
+    "toWrapper": {
+     "n": 128,
+     "p50": 0.36,
+     "p95": 0.91,
+     "max": 1.36,
+     "mean": 0.43
+    },
+    "originClaimEnter": {
+     "n": 128,
+     "p50": 3,
+     "p95": 771.31,
+     "max": 1216.1,
+     "mean": 265.46
+    },
+    "commitBeforeAck": {
+     "n": 128,
+     "p50": 3.89,
+     "p95": 10.18,
+     "max": 16.42,
+     "mean": 4.62
+    },
+    "ackBeforeLock": {
+     "n": 128,
+     "p50": 24.71,
+     "p95": 38.46,
+     "max": 43.88,
+     "mean": 25.72
+    },
+    "wait": {
+     "n": 128,
+     "p50": 45.04,
+     "p95": 902.04,
+     "max": 2718.87,
+     "mean": 256.83
+    },
+    "inAck": {
+     "n": 128,
+     "p50": 69.56,
+     "p95": 94.45,
+     "max": 107.06,
+     "mean": 70.71
+    },
+    "afterAck": {
+     "n": 128,
+     "p50": 0.65,
+     "p95": 2.05,
+     "max": 2.35,
+     "mean": 0.81
+    },
+    "toClientReturn": {
+     "n": 128,
+     "p50": 0.53,
+     "p95": 0.87,
+     "max": 3.72,
+     "mean": 0.58
+    },
+    "commitRtt": {
+     "n": 128,
+     "p50": 3.41,
+     "p95": 17.41,
+     "max": 1689.72,
+     "mean": 24.07
+    },
+    "nativeOriginLock": {
+     "n": 128,
+     "p50": 0.03,
+     "p95": 0.15,
+     "max": 0.64,
+     "mean": 0.05
+    }
+   },
+   "commitAttempts": {
+    "n": 132,
+    "over2s": 8,
+    "over5s": 1,
+    "failed": 4,
+    "statementMsOkAndFailed": {
+     "n": 132,
+     "p50": 613.67,
+     "p95": 2003.43,
+     "max": 5002.05,
+     "mean": 689.94
+    }
+   },
+   "afterLockSteps": [
+    "t2_C2_number",
+    "t2_D_seats",
+    "t2_D_slots",
+    "t2_D_decisions",
+    "t2_E_count",
+    "last_seat_update",
+    "final_check"
+   ],
+   "stepMs": {
+    "guard": {
+     "n": 128,
+     "p50": 0.13,
+     "p95": 0.24,
+     "max": 0.73,
+     "mean": 0.15
+    },
+    "lock_fences": {
+     "n": 128,
+     "p50": 0.15,
+     "p95": 0.36,
+     "max": 0.57,
+     "mean": 0.17
+    },
+    "seal": {
+     "n": 128,
+     "p50": 0.14,
+     "p95": 0.4,
+     "max": 1.1,
+     "mean": 0.16
+    },
+    "gate_read": {
+     "n": 128,
+     "p50": 0.04,
+     "p95": 0.48,
+     "max": 1.4,
+     "mean": 0.09
+    },
+    "clock_lock": {
+     "n": 128,
+     "p50": 0.05,
+     "p95": 0.2,
+     "max": 0.32,
+     "mean": 0.06
+    },
+    "origin_lock": {
+     "n": 128,
+     "p50": 0.03,
+     "p95": 0.15,
+     "max": 0.64,
+     "mean": 0.05
+    },
+    "stage_row": {
+     "n": 128,
+     "p50": 0.23,
+     "p95": 0.85,
+     "max": 1.24,
+     "mean": 0.28
+    },
+    "attempt_check1": {
+     "n": 128,
+     "p50": 0.32,
+     "p95": 0.8,
+     "max": 1.24,
+     "mean": 0.37
+    },
+    "attempt_row": {
+     "n": 128,
+     "p50": 0.14,
+     "p95": 0.3,
+     "max": 0.56,
+     "mean": 0.15
+    },
+    "last_seat_update": {
+     "n": 128,
+     "p50": 0.19,
+     "p95": 0.41,
+     "max": 0.61,
+     "mean": 0.21
+    },
+    "final_check": {
+     "n": 128,
+     "p50": 0.39,
+     "p95": 0.88,
+     "max": 1.08,
+     "mean": 0.46
+    },
+    "t2_A_candidates": {
+     "n": 128,
+     "p50": 9.63,
+     "p95": 16.24,
+     "max": 20.06,
+     "mean": 10.34
+    },
+    "t2_B_slot_locks": {
+     "n": 128,
+     "p50": 2,
+     "p95": 3,
+     "max": 3.67,
+     "mean": 2.09
+    },
+    "t2_C1_plan": {
+     "n": 128,
+     "p50": 11.24,
+     "p95": 17.98,
+     "max": 20.27,
+     "mean": 11.8
+    },
+    "t2_upgrade": {
+     "n": 128,
+     "p50": 45.04,
+     "p95": 902.04,
+     "max": 2718.87,
+     "mean": 256.83
+    },
+    "t2_C2_number": {
+     "n": 128,
+     "p50": 7.19,
+     "p95": 11.58,
+     "max": 12.93,
+     "mean": 7.49
+    },
+    "t2_D_seats": {
+     "n": 128,
+     "p50": 7.52,
+     "p95": 11.14,
+     "max": 16.8,
+     "mean": 7.78
+    },
+    "t2_D_slots": {
+     "n": 128,
+     "p50": 35.18,
+     "p95": 50.74,
+     "max": 57.61,
+     "mean": 36
+    },
+    "t2_D_decisions": {
+     "n": 128,
+     "p50": 18.2,
+     "p95": 24.01,
+     "max": 28.36,
+     "mean": 18.51
+    },
+    "t2_E_count": {
+     "n": 128,
+     "p50": 0.23,
+     "p95": 0.52,
+     "max": 0.96,
+     "mean": 0.27
+    }
+   },
+   "lastSeat": "9007199254772993",
+   "seats": 32000,
+   "decisions": 32000
+  },
+  {
+   "cell": {
+    "workload": "W1",
+    "n": 500,
+    "c": 2,
+    "body": "t2"
+   },
+   "threads": 2,
+   "drained": true,
+   "drainSeconds": 28.73,
+   "durableRecords": 32000,
+   "durableRecordsPerSec": 1114,
+   "retriesPerBatch": 0,
+   "stageFailures": {},
+   "controls": {
+    "kind": "none",
+    "everyMs": 1000,
+    "scheduledSlots": 0,
+    "missedSlots": 0,
+    "started": 0,
+    "completedDuringLoad": 0,
+    "completedAfterLoadEnd": 0,
+    "failed": {},
+    "latencyMs": {
+     "n": 0,
+     "p50": null,
+     "p95": null,
+     "max": null,
+     "mean": null
+    }
+   },
+   "commitsOk": 64,
+   "traced": 64,
+   "untraced": 0,
+   "holdMs": {
+    "n": 64,
+    "p50": 130.39,
+    "p95": 182.58,
+    "max": 4603.13,
+    "mean": 239.17
+   },
+   "clockWaitMs": {
+    "n": 64,
+    "p50": 0.11,
+    "p95": 69.76,
+    "max": 130.35,
+    "mean": 8.84
+   },
+   "inAckAfterLockMs": {
+    "n": 64,
+    "p50": 124.95,
+    "p95": 162.24,
+    "max": 261.93,
+    "mean": 126.08
+   },
+   "postAckMs": {
+    "n": 64,
+    "p50": 0.97,
+    "p95": 1.65,
+    "max": 2.14,
+    "mean": 0.99
+   },
+   "commitRttMs": {
+    "n": 64,
+    "p50": 4.52,
+    "p95": 22.13,
+    "max": 4401.29,
+    "mean": 112.09
+   },
+   "preLockMs": {
+    "n": 64,
+    "p50": 42.99,
+    "p95": 68.5,
+    "max": 96.84,
+    "mean": 44.23
+   },
+   "commitStatementMs": {
+    "n": 64,
+    "p50": 174.21,
+    "p95": 270.44,
+    "max": 370.96,
+    "mean": 184.23
+   },
+   "commitStatementAllMs": {
+    "n": 64,
+    "p50": 174.21,
+    "p95": 270.44,
+    "max": 370.96,
+    "mean": 184.23
+   },
+   "commitWholeAllMs": {
+    "n": 64,
+    "p50": 177.39,
+    "p95": 362.62,
+    "max": 4658.25,
+    "mean": 296.83
+   },
+   "offsetProbeRttMs": {
+    "n": 64,
+    "p50": 0.6,
+    "p95": 1.08,
+    "max": 3.02,
+    "mean": 0.69
+   },
+   "split": {
+    "toWrapper": {
+     "n": 64,
+     "p50": 0.27,
+     "p95": 0.82,
+     "max": 1.44,
+     "mean": 0.35
+    },
+    "originClaimEnter": {
+     "n": 64,
+     "p50": 0.32,
+     "p95": 0.45,
+     "max": 0.47,
+     "mean": 0.33
+    },
+    "commitBeforeAck": {
+     "n": 64,
+     "p50": 3.2,
+     "p95": 4.71,
+     "max": 9.55,
+     "mean": 3.42
+    },
+    "ackBeforeLock": {
+     "n": 64,
+     "p50": 42.99,
+     "p95": 68.5,
+     "max": 96.84,
+     "mean": 44.23
+    },
+    "wait": {
+     "n": 64,
+     "p50": 0.11,
+     "p95": 69.76,
+     "max": 130.35,
+     "mean": 8.84
+    },
+    "inAck": {
+     "n": 64,
+     "p50": 124.95,
+     "p95": 162.24,
+     "max": 261.93,
+     "mean": 126.08
+    },
+    "afterAck": {
+     "n": 64,
+     "p50": 0.46,
+     "p95": 1.02,
+     "max": 1.46,
+     "mean": 0.53
+    },
+    "toClientReturn": {
+     "n": 64,
+     "p50": 0.48,
+     "p95": 0.65,
+     "max": 0.86,
+     "mean": 0.46
+    },
+    "commitRtt": {
+     "n": 64,
+     "p50": 4.52,
+     "p95": 22.13,
+     "max": 4401.29,
+     "mean": 112.09
+    },
+    "nativeOriginLock": {
+     "n": 64,
+     "p50": 0.02,
+     "p95": 0.04,
+     "max": 0.11,
+     "mean": 0.02
+    }
+   },
+   "commitAttempts": {
+    "n": 64,
+    "over2s": 0,
+    "over5s": 0,
+    "failed": 0,
+    "statementMsOkAndFailed": {
+     "n": 64,
+     "p50": 174.21,
+     "p95": 270.44,
+     "max": 370.96,
+     "mean": 184.23
+    }
+   },
+   "afterLockSteps": [
+    "t2_C2_number",
+    "t2_D_seats",
+    "t2_D_slots",
+    "t2_D_decisions",
+    "t2_E_count",
+    "last_seat_update",
+    "final_check"
+   ],
+   "stepMs": {
+    "guard": {
+     "n": 64,
+     "p50": 0.1,
+     "p95": 0.16,
+     "max": 0.54,
+     "mean": 0.11
+    },
+    "lock_fences": {
+     "n": 64,
+     "p50": 0.12,
+     "p95": 0.2,
+     "max": 0.65,
+     "mean": 0.13
+    },
+    "seal": {
+     "n": 64,
+     "p50": 0.04,
+     "p95": 0.17,
+     "max": 0.29,
+     "mean": 0.06
+    },
+    "gate_read": {
+     "n": 64,
+     "p50": 0.03,
+     "p95": 0.05,
+     "max": 0.42,
+     "mean": 0.04
+    },
+    "clock_lock": {
+     "n": 64,
+     "p50": 0.03,
+     "p95": 0.05,
+     "max": 0.15,
+     "mean": 0.03
+    },
+    "origin_lock": {
+     "n": 64,
+     "p50": 0.02,
+     "p95": 0.04,
+     "max": 0.11,
+     "mean": 0.02
+    },
+    "stage_row": {
+     "n": 64,
+     "p50": 0.06,
+     "p95": 0.24,
+     "max": 0.65,
+     "mean": 0.1
+    },
+    "attempt_check1": {
+     "n": 64,
+     "p50": 0.24,
+     "p95": 0.42,
+     "max": 0.9,
+     "mean": 0.26
+    },
+    "attempt_row": {
+     "n": 64,
+     "p50": 0.13,
+     "p95": 0.22,
+     "max": 0.28,
+     "mean": 0.14
+    },
+    "last_seat_update": {
+     "n": 64,
+     "p50": 0.14,
+     "p95": 0.25,
+     "max": 0.53,
+     "mean": 0.15
+    },
+    "final_check": {
+     "n": 64,
+     "p50": 0.36,
+     "p95": 0.63,
+     "max": 1.01,
+     "mean": 0.4
+    },
+    "t2_A_candidates": {
+     "n": 64,
+     "p50": 20.06,
+     "p95": 33.8,
+     "max": 47.22,
+     "mean": 21.34
+    },
+    "t2_B_slot_locks": {
+     "n": 64,
+     "p50": 3.03,
+     "p95": 5.12,
+     "max": 7.44,
+     "mean": 3.14
+    },
+    "t2_C1_plan": {
+     "n": 64,
+     "p50": 18.75,
+     "p95": 24.8,
+     "max": 40.94,
+     "mean": 18.85
+    },
+    "t2_upgrade": {
+     "n": 64,
+     "p50": 0.11,
+     "p95": 69.76,
+     "max": 130.35,
+     "mean": 8.84
+    },
+    "t2_C2_number": {
+     "n": 64,
+     "p50": 12.01,
+     "p95": 17.4,
+     "max": 22.81,
+     "mean": 12.22
+    },
+    "t2_D_seats": {
+     "n": 64,
+     "p50": 12.22,
+     "p95": 18.72,
+     "max": 97.29,
+     "mean": 13.86
+    },
+    "t2_D_slots": {
+     "n": 64,
+     "p50": 62.34,
+     "p95": 87.52,
+     "max": 147.12,
+     "mean": 63.64
+    },
+    "t2_D_decisions": {
+     "n": 64,
+     "p50": 33.64,
+     "p95": 46.96,
+     "max": 81.16,
+     "mean": 35.51
+    },
+    "t2_E_count": {
+     "n": 64,
+     "p50": 0.27,
+     "p95": 0.44,
+     "max": 0.6,
+     "mean": 0.3
+    }
+   },
+   "lastSeat": "9007199254772993",
+   "seats": 32000,
+   "decisions": 32000
+  },
+  {
+   "cell": {
+    "workload": "W1",
+    "n": 500,
+    "c": 4,
+    "body": "t2"
+   },
+   "threads": 4,
+   "drained": true,
+   "drainSeconds": 12.59,
+   "durableRecords": 32000,
+   "durableRecordsPerSec": 2541,
+   "retriesPerBatch": 0,
+   "stageFailures": {},
+   "controls": {
+    "kind": "none",
+    "everyMs": 1000,
+    "scheduledSlots": 0,
+    "missedSlots": 0,
+    "started": 0,
+    "completedDuringLoad": 0,
+    "completedAfterLoadEnd": 0,
+    "failed": {},
+    "latencyMs": {
+     "n": 0,
+     "p50": null,
+     "p95": null,
+     "max": null,
+     "mean": null
+    }
+   },
+   "commitsOk": 64,
+   "traced": 64,
+   "untraced": 0,
+   "holdMs": {
+    "n": 64,
+    "p50": 147.23,
+    "p95": 198.11,
+    "max": 414.39,
+    "mean": 150.42
+   },
+   "clockWaitMs": {
+    "n": 64,
+    "p50": 0.22,
+    "p95": 176.3,
+    "max": 354.36,
+    "mean": 38.36
+   },
+   "inAckAfterLockMs": {
+    "n": 64,
+    "p50": 141.82,
+    "p95": 182.98,
+    "max": 207.44,
+    "mean": 140.24
+   },
+   "postAckMs": {
+    "n": 64,
+    "p50": 1.11,
+    "p95": 2.14,
+    "max": 2.27,
+    "mean": 1.22
+   },
+   "commitRttMs": {
+    "n": 64,
+    "p50": 4.17,
+    "p95": 9.94,
+    "max": 249.9,
+    "mean": 8.96
+   },
+   "preLockMs": {
+    "n": 64,
+    "p50": 49.44,
+    "p95": 65.19,
+    "max": 71.58,
+    "mean": 49.29
+   },
+   "commitStatementMs": {
+    "n": 64,
+    "p50": 218.41,
+    "p95": 364.11,
+    "max": 575.14,
+    "mean": 234.27
+   },
+   "commitStatementAllMs": {
+    "n": 64,
+    "p50": 218.41,
+    "p95": 364.11,
+    "max": 575.14,
+    "mean": 234.27
+   },
+   "commitWholeAllMs": {
+    "n": 64,
+    "p50": 221.73,
+    "p95": 390.65,
+    "max": 579.73,
+    "mean": 243.83
+   },
+   "offsetProbeRttMs": {
+    "n": 64,
+    "p50": 0.63,
+    "p95": 1.07,
+    "max": 6.64,
+    "mean": 0.76
+   },
+   "split": {
+    "toWrapper": {
+     "n": 64,
+     "p50": 0.35,
+     "p95": 0.92,
+     "max": 1.36,
+     "mean": 0.42
+    },
+    "originClaimEnter": {
+     "n": 64,
+     "p50": 0.36,
+     "p95": 0.54,
+     "max": 0.76,
+     "mean": 0.36
+    },
+    "commitBeforeAck": {
+     "n": 64,
+     "p50": 4.15,
+     "p95": 6.49,
+     "max": 11.71,
+     "mean": 4.37
+    },
+    "ackBeforeLock": {
+     "n": 64,
+     "p50": 49.44,
+     "p95": 65.19,
+     "max": 71.58,
+     "mean": 49.29
+    },
+    "wait": {
+     "n": 64,
+     "p50": 0.22,
+     "p95": 176.3,
+     "max": 354.36,
+     "mean": 38.36
+    },
+    "inAck": {
+     "n": 64,
+     "p50": 141.82,
+     "p95": 182.98,
+     "max": 207.44,
+     "mean": 140.24
+    },
+    "afterAck": {
+     "n": 64,
+     "p50": 0.56,
+     "p95": 1.53,
+     "max": 1.55,
+     "mean": 0.64
+    },
+    "toClientReturn": {
+     "n": 64,
+     "p50": 0.58,
+     "p95": 0.84,
+     "max": 1.11,
+     "mean": 0.58
+    },
+    "commitRtt": {
+     "n": 64,
+     "p50": 4.17,
+     "p95": 9.94,
+     "max": 249.9,
+     "mean": 8.96
+    },
+    "nativeOriginLock": {
+     "n": 64,
+     "p50": 0.02,
+     "p95": 0.08,
+     "max": 0.22,
+     "mean": 0.03
+    }
+   },
+   "commitAttempts": {
+    "n": 64,
+    "over2s": 0,
+    "over5s": 0,
+    "failed": 0,
+    "statementMsOkAndFailed": {
+     "n": 64,
+     "p50": 218.41,
+     "p95": 364.11,
+     "max": 575.14,
+     "mean": 234.27
+    }
+   },
+   "afterLockSteps": [
+    "t2_C2_number",
+    "t2_D_seats",
+    "t2_D_slots",
+    "t2_D_decisions",
+    "t2_E_count",
+    "last_seat_update",
+    "final_check"
+   ],
+   "stepMs": {
+    "guard": {
+     "n": 64,
+     "p50": 0.12,
+     "p95": 0.21,
+     "max": 0.27,
+     "mean": 0.12
+    },
+    "lock_fences": {
+     "n": 64,
+     "p50": 0.14,
+     "p95": 0.23,
+     "max": 0.39,
+     "mean": 0.14
+    },
+    "seal": {
+     "n": 64,
+     "p50": 0.06,
+     "p95": 0.23,
+     "max": 0.42,
+     "mean": 0.09
+    },
+    "gate_read": {
+     "n": 64,
+     "p50": 0.04,
+     "p95": 0.24,
+     "max": 0.54,
+     "mean": 0.06
+    },
+    "clock_lock": {
+     "n": 64,
+     "p50": 0.04,
+     "p95": 0.09,
+     "max": 0.19,
+     "mean": 0.04
+    },
+    "origin_lock": {
+     "n": 64,
+     "p50": 0.02,
+     "p95": 0.08,
+     "max": 0.22,
+     "mean": 0.03
+    },
+    "stage_row": {
+     "n": 64,
+     "p50": 0.08,
+     "p95": 0.5,
+     "max": 0.87,
+     "mean": 0.17
+    },
+    "attempt_check1": {
+     "n": 64,
+     "p50": 0.33,
+     "p95": 0.56,
+     "max": 0.92,
+     "mean": 0.33
+    },
+    "attempt_row": {
+     "n": 64,
+     "p50": 0.18,
+     "p95": 0.28,
+     "max": 0.43,
+     "mean": 0.18
+    },
+    "last_seat_update": {
+     "n": 64,
+     "p50": 0.15,
+     "p95": 0.3,
+     "max": 0.38,
+     "mean": 0.17
+    },
+    "final_check": {
+     "n": 64,
+     "p50": 0.39,
+     "p95": 0.7,
+     "max": 0.9,
+     "mean": 0.41
+    },
+    "t2_A_candidates": {
+     "n": 64,
+     "p50": 22.26,
+     "p95": 34.16,
+     "max": 43.1,
+     "mean": 23.39
+    },
+    "t2_B_slot_locks": {
+     "n": 64,
+     "p50": 3.44,
+     "p95": 5.26,
+     "max": 5.48,
+     "mean": 3.47
+    },
+    "t2_C1_plan": {
+     "n": 64,
+     "p50": 21.27,
+     "p95": 29.03,
+     "max": 29.66,
+     "mean": 21.26
+    },
+    "t2_upgrade": {
+     "n": 64,
+     "p50": 0.22,
+     "p95": 176.3,
+     "max": 354.36,
+     "mean": 38.36
+    },
+    "t2_C2_number": {
+     "n": 64,
+     "p50": 14.24,
+     "p95": 19.55,
+     "max": 23.71,
+     "mean": 14.29
+    },
+    "t2_D_seats": {
+     "n": 64,
+     "p50": 14.7,
+     "p95": 21.42,
+     "max": 23.2,
+     "mean": 14.66
+    },
+    "t2_D_slots": {
+     "n": 64,
+     "p50": 71.92,
+     "p95": 98.01,
+     "max": 119.26,
+     "mean": 72.49
+    },
+    "t2_D_decisions": {
+     "n": 64,
+     "p50": 38.36,
+     "p95": 51.49,
+     "max": 61.7,
+     "mean": 37.87
+    },
+    "t2_E_count": {
+     "n": 64,
+     "p50": 0.3,
+     "p95": 0.57,
+     "max": 0.81,
+     "mean": 0.34
+    }
+   },
+   "lastSeat": "9007199254772993",
+   "seats": 32000,
+   "decisions": 32000
+  },
+  {
+   "cell": {
+    "workload": "W1",
+    "n": 500,
+    "c": 16,
+    "body": "t2"
+   },
+   "threads": 8,
+   "drained": true,
+   "drainSeconds": 13.14,
+   "durableRecords": 32000,
+   "durableRecordsPerSec": 2434,
+   "retriesPerBatch": 0.05,
+   "stageFailures": {
+    "commit:57014": 3
+   },
+   "controls": {
+    "kind": "none",
+    "everyMs": 1000,
+    "scheduledSlots": 0,
+    "missedSlots": 0,
+    "started": 0,
+    "completedDuringLoad": 0,
+    "completedAfterLoadEnd": 0,
+    "failed": {},
+    "latencyMs": {
+     "n": 0,
+     "p50": null,
+     "p95": null,
+     "max": null,
+     "mean": null
+    }
+   },
+   "commitsOk": 64,
+   "traced": 64,
+   "untraced": 0,
+   "holdMs": {
+    "n": 64,
+    "p50": 153.75,
+    "p95": 251.75,
+    "max": 1642.42,
+    "mean": 184.15
+   },
+   "clockWaitMs": {
+    "n": 64,
+    "p50": 624.15,
+    "p95": 2868.53,
+    "max": 4261.98,
+    "mean": 1016.3
+   },
+   "inAckAfterLockMs": {
+    "n": 64,
+    "p50": 133.61,
+    "p95": 234.11,
+    "max": 245.5,
+    "mean": 141.71
+   },
+   "postAckMs": {
+    "n": 64,
+    "p50": 1.52,
+    "p95": 2.82,
+    "max": 84.94,
+    "mean": 4
+   },
+   "commitRttMs": {
+    "n": 64,
+    "p50": 5.72,
+    "p95": 65.49,
+    "max": 1459.66,
+    "mean": 38.44
+   },
+   "preLockMs": {
+    "n": 64,
+    "p50": 49.6,
+    "p95": 91.62,
+    "max": 130.64,
+    "mean": 54.57
+   },
+   "commitStatementMs": {
+    "n": 64,
+    "p50": 869.48,
+    "p95": 3061.74,
+    "max": 4470.54,
+    "mean": 1224.09
+   },
+   "commitStatementAllMs": {
+    "n": 64,
+    "p50": 869.48,
+    "p95": 3061.74,
+    "max": 4470.54,
+    "mean": 1224.09
+   },
+   "commitWholeAllMs": {
+    "n": 64,
+    "p50": 884.35,
+    "p95": 3076.78,
+    "max": 4479.33,
+    "mean": 1264.51
+   },
+   "offsetProbeRttMs": {
+    "n": 64,
+    "p50": 0.71,
+    "p95": 1.51,
+    "max": 5.91,
+    "mean": 0.83
+   },
+   "split": {
+    "toWrapper": {
+     "n": 64,
+     "p50": 0.44,
+     "p95": 1.91,
+     "max": 3.61,
+     "mean": 0.62
+    },
+    "originClaimEnter": {
+     "n": 64,
+     "p50": 0.37,
+     "p95": 0.65,
+     "max": 2.33,
+     "mean": 0.42
+    },
+    "commitBeforeAck": {
+     "n": 64,
+     "p50": 5.59,
+     "p95": 13.54,
+     "max": 14.57,
+     "mean": 6.46
+    },
+    "ackBeforeLock": {
+     "n": 64,
+     "p50": 49.6,
+     "p95": 91.62,
+     "max": 130.64,
+     "mean": 54.57
+    },
+    "wait": {
+     "n": 64,
+     "p50": 624.15,
+     "p95": 2868.53,
+     "max": 4261.98,
+     "mean": 1016.3
+    },
+    "inAck": {
+     "n": 64,
+     "p50": 133.61,
+     "p95": 234.11,
+     "max": 245.5,
+     "mean": 141.71
+    },
+    "afterAck": {
+     "n": 64,
+     "p50": 0.84,
+     "p95": 2.04,
+     "max": 2.2,
+     "mean": 0.94
+    },
+    "toClientReturn": {
+     "n": 64,
+     "p50": 0.6,
+     "p95": 1.86,
+     "max": 84.43,
+     "mean": 3.06
+    },
+    "commitRtt": {
+     "n": 64,
+     "p50": 5.72,
+     "p95": 65.49,
+     "max": 1459.66,
+     "mean": 38.44
+    },
+    "nativeOriginLock": {
+     "n": 64,
+     "p50": 0.05,
+     "p95": 0.18,
+     "max": 0.31,
+     "mean": 0.07
+    }
+   },
+   "commitAttempts": {
+    "n": 67,
+    "over2s": 19,
+    "over5s": 3,
+    "failed": 3,
+    "statementMsOkAndFailed": {
+     "n": 67,
+     "p50": 870.6,
+     "p95": 4470.54,
+     "max": 5003.23,
+     "mean": 1393.28
+    }
+   },
+   "afterLockSteps": [
+    "t2_C2_number",
+    "t2_D_seats",
+    "t2_D_slots",
+    "t2_D_decisions",
+    "t2_E_count",
+    "last_seat_update",
+    "final_check"
+   ],
+   "stepMs": {
+    "guard": {
+     "n": 64,
+     "p50": 0.17,
+     "p95": 0.26,
+     "max": 0.49,
+     "mean": 0.17
+    },
+    "lock_fences": {
+     "n": 64,
+     "p50": 0.17,
+     "p95": 0.39,
+     "max": 0.53,
+     "mean": 0.2
+    },
+    "seal": {
+     "n": 64,
+     "p50": 0.19,
+     "p95": 0.4,
+     "max": 1.14,
+     "mean": 0.22
+    },
+    "gate_read": {
+     "n": 64,
+     "p50": 0.05,
+     "p95": 0.57,
+     "max": 0.77,
+     "mean": 0.15
+    },
+    "clock_lock": {
+     "n": 64,
+     "p50": 0.07,
+     "p95": 0.23,
+     "max": 0.59,
+     "mean": 0.1
+    },
+    "origin_lock": {
+     "n": 64,
+     "p50": 0.05,
+     "p95": 0.18,
+     "max": 0.31,
+     "mean": 0.07
+    },
+    "stage_row": {
+     "n": 64,
+     "p50": 0.34,
+     "p95": 0.94,
+     "max": 1.5,
+     "mean": 0.43
+    },
+    "attempt_check1": {
+     "n": 64,
+     "p50": 0.43,
+     "p95": 0.99,
+     "max": 2.68,
+     "mean": 0.51
+    },
+    "attempt_row": {
+     "n": 64,
+     "p50": 0.26,
+     "p95": 0.49,
+     "max": 0.55,
+     "mean": 0.28
+    },
+    "last_seat_update": {
+     "n": 64,
+     "p50": 0.26,
+     "p95": 0.43,
+     "max": 0.53,
+     "mean": 0.26
+    },
+    "final_check": {
+     "n": 64,
+     "p50": 0.51,
+     "p95": 0.99,
+     "max": 1.02,
+     "mean": 0.53
+    },
+    "t2_A_candidates": {
+     "n": 64,
+     "p50": 22.41,
+     "p95": 38.35,
+     "max": 83.04,
+     "mean": 24.4
+    },
+    "t2_B_slot_locks": {
+     "n": 64,
+     "p50": 3.61,
+     "p95": 5.84,
+     "max": 35.55,
+     "mean": 4.48
+    },
+    "t2_C1_plan": {
+     "n": 64,
+     "p50": 21.99,
+     "p95": 37.22,
+     "max": 58.82,
+     "mean": 23.57
+    },
+    "t2_upgrade": {
+     "n": 64,
+     "p50": 624.15,
+     "p95": 2868.53,
+     "max": 4261.98,
+     "mean": 1016.3
+    },
+    "t2_C2_number": {
+     "n": 64,
+     "p50": 15.72,
+     "p95": 22.62,
+     "max": 28.08,
+     "mean": 15.96
+    },
+    "t2_D_seats": {
+     "n": 64,
+     "p50": 15.13,
+     "p95": 23.17,
+     "max": 25.28,
+     "mean": 15.91
+    },
+    "t2_D_slots": {
+     "n": 64,
+     "p50": 64.8,
+     "p95": 121.38,
+     "max": 149.41,
+     "mean": 70.99
+    },
+    "t2_D_decisions": {
+     "n": 64,
+     "p50": 36.46,
+     "p95": 59.14,
+     "max": 79.36,
+     "mean": 37.67
+    },
+    "t2_E_count": {
+     "n": 64,
+     "p50": 0.38,
+     "p95": 0.62,
+     "max": 0.78,
+     "mean": 0.4
+    }
+   },
+   "lastSeat": "9007199254772993",
+   "seats": 32000,
+   "decisions": 32000
+  },
+  {
+   "cell": {
+    "workload": "W1",
+    "n": 500,
+    "c": 64,
+    "body": "t2"
+   },
+   "threads": 8,
+   "drained": true,
+   "drainSeconds": 18.51,
+   "durableRecords": 32000,
+   "durableRecordsPerSec": 1729,
+   "retriesPerBatch": 0.78,
+   "stageFailures": {
+    "claim:55P03": 15,
+    "commit:57014": 29,
+    "claim:57014": 6
+   },
+   "controls": {
+    "kind": "none",
+    "everyMs": 1000,
+    "scheduledSlots": 0,
+    "missedSlots": 0,
+    "started": 0,
+    "completedDuringLoad": 0,
+    "completedAfterLoadEnd": 0,
+    "failed": {},
+    "latencyMs": {
+     "n": 0,
+     "p50": null,
+     "p95": null,
+     "max": null,
+     "mean": null
+    }
+   },
+   "commitsOk": 64,
+   "traced": 64,
+   "untraced": 0,
+   "holdMs": {
+    "n": 64,
+    "p50": 156.41,
+    "p95": 364.45,
+    "max": 1977.79,
+    "mean": 224.24
+   },
+   "clockWaitMs": {
+    "n": 64,
+    "p50": 2038.1,
+    "p95": 4268.14,
+    "max": 4618.41,
+    "mean": 2068.53
+   },
+   "inAckAfterLockMs": {
+    "n": 64,
+    "p50": 147.58,
+    "p95": 359.62,
+    "max": 1167.53,
+    "mean": 190.94
+   },
+   "postAckMs": {
+    "n": 64,
+    "p50": 1.97,
+    "p95": 3.05,
+    "max": 472.35,
+    "mean": 0.05
+   },
+   "commitRttMs": {
+    "n": 64,
+    "p50": 4.93,
+    "p95": 208.81,
+    "max": 685,
+    "mean": 33.25
+   },
+   "preLockMs": {
+    "n": 64,
+    "p50": 87.21,
+    "p95": 228.37,
+    "max": 350.21,
+    "mean": 108.35
+   },
+   "commitStatementMs": {
+    "n": 64,
+    "p50": 2350.97,
+    "p95": 4626.75,
+    "max": 4925.2,
+    "mean": 2401.89
+   },
+   "commitStatementAllMs": {
+    "n": 64,
+    "p50": 2350.97,
+    "p95": 4626.75,
+    "max": 4925.2,
+    "mean": 2401.89
+   },
+   "commitWholeAllMs": {
+    "n": 64,
+    "p50": 2355.39,
+    "p95": 4634.65,
+    "max": 4932.01,
+    "mean": 2441.09
+   },
+   "offsetProbeRttMs": {
+    "n": 64,
+    "p50": 0.7,
+    "p95": 179.66,
+    "max": 761.62,
+    "mean": 30.06
+   },
+   "split": {
+    "toWrapper": {
+     "n": 64,
+     "p50": 0.74,
+     "p95": 89.77,
+     "max": 382.14,
+     "mean": 15.98
+    },
+    "originClaimEnter": {
+     "n": 64,
+     "p50": 0.5,
+     "p95": 3.69,
+     "max": 16.63,
+     "mean": 1.06
+    },
+    "commitBeforeAck": {
+     "n": 64,
+     "p50": 11.9,
+     "p95": 51.9,
+     "max": 81.85,
+     "mean": 16.98
+    },
+    "ackBeforeLock": {
+     "n": 64,
+     "p50": 87.21,
+     "p95": 228.37,
+     "max": 350.21,
+     "mean": 108.35
+    },
+    "wait": {
+     "n": 64,
+     "p50": 2038.1,
+     "p95": 4268.14,
+     "max": 4618.41,
+     "mean": 2068.53
+    },
+    "inAck": {
+     "n": 64,
+     "p50": 147.58,
+     "p95": 359.62,
+     "max": 1167.53,
+     "mean": 190.94
+    },
+    "afterAck": {
+     "n": 64,
+     "p50": 1.55,
+     "p95": 2.38,
+     "max": 3.91,
+     "mean": 1.6
+    },
+    "toClientReturn": {
+     "n": 64,
+     "p50": 0.53,
+     "p95": 1.61,
+     "max": 470.86,
+     "mean": -1.55
+    },
+    "commitRtt": {
+     "n": 64,
+     "p50": 4.93,
+     "p95": 208.81,
+     "max": 685,
+     "mean": 33.25
+    },
+    "nativeOriginLock": {
+     "n": 64,
+     "p50": 0.14,
+     "p95": 0.26,
+     "max": 1.02,
+     "mean": 0.14
+    }
+   },
+   "commitAttempts": {
+    "n": 93,
+    "over2s": 64,
+    "over5s": 29,
+    "failed": 29,
+    "statementMsOkAndFailed": {
+     "n": 93,
+     "p50": 3352.79,
+     "p95": 5037.05,
+     "max": 5050.47,
+     "mean": 3215.96
+    }
+   },
+   "afterLockSteps": [
+    "t2_C2_number",
+    "t2_D_seats",
+    "t2_D_slots",
+    "t2_D_decisions",
+    "t2_E_count",
+    "last_seat_update",
+    "final_check"
+   ],
+   "stepMs": {
+    "guard": {
+     "n": 64,
+     "p50": 0.25,
+     "p95": 1.08,
+     "max": 4.36,
+     "mean": 0.37
+    },
+    "lock_fences": {
+     "n": 64,
+     "p50": 0.33,
+     "p95": 3.5,
+     "max": 6.73,
+     "mean": 0.66
+    },
+    "seal": {
+     "n": 64,
+     "p50": 0.3,
+     "p95": 0.89,
+     "max": 29.67,
+     "mean": 0.8
+    },
+    "gate_read": {
+     "n": 64,
+     "p50": 0.45,
+     "p95": 0.8,
+     "max": 3.42,
+     "mean": 0.41
+    },
+    "clock_lock": {
+     "n": 64,
+     "p50": 0.18,
+     "p95": 0.56,
+     "max": 5.43,
+     "mean": 0.28
+    },
+    "origin_lock": {
+     "n": 64,
+     "p50": 0.14,
+     "p95": 0.26,
+     "max": 1.02,
+     "mean": 0.14
+    },
+    "stage_row": {
+     "n": 64,
+     "p50": 0.74,
+     "p95": 4.34,
+     "max": 15.31,
+     "mean": 1.33
+    },
+    "attempt_check1": {
+     "n": 64,
+     "p50": 0.9,
+     "p95": 3.57,
+     "max": 11.29,
+     "mean": 1.24
+    },
+    "attempt_row": {
+     "n": 64,
+     "p50": 0.43,
+     "p95": 0.9,
+     "max": 3.43,
+     "mean": 0.49
+    },
+    "last_seat_update": {
+     "n": 64,
+     "p50": 0.36,
+     "p95": 0.53,
+     "max": 0.62,
+     "mean": 0.37
+    },
+    "final_check": {
+     "n": 64,
+     "p50": 0.81,
+     "p95": 1.53,
+     "max": 2.57,
+     "mean": 0.85
+    },
+    "t2_A_candidates": {
+     "n": 64,
+     "p50": 34.37,
+     "p95": 100.75,
+     "max": 144.62,
+     "mean": 45.77
+    },
+    "t2_B_slot_locks": {
+     "n": 64,
+     "p50": 6.18,
+     "p95": 31.13,
+     "max": 59.88,
+     "mean": 9.28
+    },
+    "t2_C1_plan": {
+     "n": 64,
+     "p50": 36.68,
+     "p95": 104.54,
+     "max": 134.15,
+     "mean": 47.58
+    },
+    "t2_upgrade": {
+     "n": 64,
+     "p50": 2038.1,
+     "p95": 4268.14,
+     "max": 4618.41,
+     "mean": 2068.53
+    },
+    "t2_C2_number": {
+     "n": 64,
+     "p50": 16.42,
+     "p95": 48.36,
+     "max": 314.36,
+     "mean": 23.24
+    },
+    "t2_D_seats": {
+     "n": 64,
+     "p50": 15.79,
+     "p95": 32.28,
+     "max": 167.89,
+     "mean": 20.83
+    },
+    "t2_D_slots": {
+     "n": 64,
+     "p50": 74.67,
+     "p95": 198.99,
+     "max": 775.32,
+     "mean": 96.06
+    },
+    "t2_D_decisions": {
+     "n": 64,
+     "p50": 38.74,
+     "p95": 93.34,
+     "max": 299.01,
+     "mean": 49.02
+    },
+    "t2_E_count": {
+     "n": 64,
+     "p50": 0.54,
+     "p95": 0.85,
+     "max": 1.15,
+     "mean": 0.58
+    }
+   },
+   "lastSeat": "9007199254772993",
+   "seats": 32000,
+   "decisions": 32000
+  },
+  {
+   "cell": {
+    "workload": "W2",
+    "n": 500,
+    "c": 4,
+    "body": "t2"
+   },
+   "threads": 4,
+   "drained": true,
+   "drainSeconds": 22.75,
+   "durableRecords": 32000,
+   "durableRecordsPerSec": 1406,
+   "retriesPerBatch": 0.02,
+   "stageFailures": {
+    "claim:55P03": 1
+   },
+   "controls": {
+    "kind": "none",
+    "everyMs": 1000,
+    "scheduledSlots": 0,
+    "missedSlots": 0,
+    "started": 0,
+    "completedDuringLoad": 0,
+    "completedAfterLoadEnd": 0,
+    "failed": {},
+    "latencyMs": {
+     "n": 0,
+     "p50": null,
+     "p95": null,
+     "max": null,
+     "mean": null
+    }
+   },
+   "commitsOk": 64,
+   "traced": 64,
+   "untraced": 0,
+   "holdMs": {
+    "n": 64,
+    "p50": 156.02,
+    "p95": 219.34,
+    "max": 252.05,
+    "mean": 154.47
+   },
+   "clockWaitMs": {
+    "n": 64,
+    "p50": 0.14,
+    "p95": 139.33,
+    "max": 185.12,
+    "mean": 31.64
+   },
+   "inAckAfterLockMs": {
+    "n": 64,
+    "p50": 147.41,
+    "p95": 211.5,
+    "max": 248.74,
+    "mean": 149.32
+   },
+   "postAckMs": {
+    "n": 64,
+    "p50": 1.18,
+    "p95": 1.93,
+    "max": 3.13,
+    "mean": 1.25
+   },
+   "commitRttMs": {
+    "n": 64,
+    "p50": 3.59,
+    "p95": 7.79,
+    "max": 12.95,
+    "mean": 3.9
+   },
+   "preLockMs": {
+    "n": 64,
+    "p50": 54.76,
+    "p95": 76.63,
+    "max": 79.53,
+    "mean": 54.86
+   },
+   "commitStatementMs": {
+    "n": 64,
+    "p50": 230.41,
+    "p95": 382.2,
+    "max": 521.54,
+    "mean": 247.58
+   },
+   "commitStatementAllMs": {
+    "n": 64,
+    "p50": 230.41,
+    "p95": 382.2,
+    "max": 521.54,
+    "mean": 247.58
+   },
+   "commitWholeAllMs": {
+    "n": 64,
+    "p50": 233.2,
+    "p95": 386.81,
+    "max": 527.24,
+    "mean": 252.19
+   },
+   "offsetProbeRttMs": {
+    "n": 64,
+    "p50": 0.71,
+    "p95": 1.13,
+    "max": 3.06,
+    "mean": 0.77
+   },
+   "split": {
+    "toWrapper": {
+     "n": 64,
+     "p50": 0.43,
+     "p95": 0.92,
+     "max": 1.43,
+     "mean": 0.48
+    },
+    "originClaimEnter": {
+     "n": 64,
+     "p50": 0.39,
+     "p95": 0.69,
+     "max": 323.03,
+     "mean": 5.44
+    },
+    "commitBeforeAck": {
+     "n": 64,
+     "p50": 4.37,
+     "p95": 6.64,
+     "max": 12.88,
+     "mean": 4.6
+    },
+    "ackBeforeLock": {
+     "n": 64,
+     "p50": 54.76,
+     "p95": 76.63,
+     "max": 79.53,
+     "mean": 54.86
+    },
+    "wait": {
+     "n": 64,
+     "p50": 0.14,
+     "p95": 139.33,
+     "max": 185.12,
+     "mean": 31.64
+    },
+    "inAck": {
+     "n": 64,
+     "p50": 147.41,
+     "p95": 211.5,
+     "max": 248.74,
+     "mean": 149.32
+    },
+    "afterAck": {
+     "n": 64,
+     "p50": 0.62,
+     "p95": 1.01,
+     "max": 1.81,
+     "mean": 0.65
+    },
+    "toClientReturn": {
+     "n": 64,
+     "p50": 0.56,
+     "p95": 0.84,
+     "max": 2.56,
+     "mean": 0.6
+    },
+    "commitRtt": {
+     "n": 64,
+     "p50": 3.59,
+     "p95": 7.79,
+     "max": 12.95,
+     "mean": 3.9
+    },
+    "nativeOriginLock": {
+     "n": 64,
+     "p50": 0.02,
+     "p95": 0.08,
+     "max": 0.2,
+     "mean": 0.03
+    }
+   },
+   "commitAttempts": {
+    "n": 64,
+    "over2s": 0,
+    "over5s": 0,
+    "failed": 0,
+    "statementMsOkAndFailed": {
+     "n": 64,
+     "p50": 230.41,
+     "p95": 382.2,
+     "max": 521.54,
+     "mean": 247.58
+    }
+   },
+   "afterLockSteps": [
+    "t2_C2_number",
+    "t2_D_seats",
+    "t2_D_slots",
+    "t2_D_decisions",
+    "t2_E_count",
+    "last_seat_update",
+    "final_check"
+   ],
+   "stepMs": {
+    "guard": {
+     "n": 64,
+     "p50": 0.13,
+     "p95": 0.18,
+     "max": 0.25,
+     "mean": 0.13
+    },
+    "lock_fences": {
+     "n": 64,
+     "p50": 0.15,
+     "p95": 0.22,
+     "max": 0.38,
+     "mean": 0.16
+    },
+    "seal": {
+     "n": 64,
+     "p50": 0.06,
+     "p95": 0.26,
+     "max": 0.42,
+     "mean": 0.11
+    },
+    "gate_read": {
+     "n": 64,
+     "p50": 0.04,
+     "p95": 0.23,
+     "max": 0.59,
+     "mean": 0.07
+    },
+    "clock_lock": {
+     "n": 64,
+     "p50": 0.04,
+     "p95": 0.09,
+     "max": 0.24,
+     "mean": 0.05
+    },
+    "origin_lock": {
+     "n": 64,
+     "p50": 0.02,
+     "p95": 0.08,
+     "max": 0.2,
+     "mean": 0.03
+    },
+    "stage_row": {
+     "n": 64,
+     "p50": 0.1,
+     "p95": 0.42,
+     "max": 0.86,
+     "mean": 0.18
+    },
+    "attempt_check1": {
+     "n": 64,
+     "p50": 0.35,
+     "p95": 0.66,
+     "max": 0.86,
+     "mean": 0.36
+    },
+    "attempt_row": {
+     "n": 64,
+     "p50": 0.19,
+     "p95": 0.3,
+     "max": 0.43,
+     "mean": 0.2
+    },
+    "last_seat_update": {
+     "n": 64,
+     "p50": 0.18,
+     "p95": 0.28,
+     "max": 0.45,
+     "mean": 0.18
+    },
+    "final_check": {
+     "n": 64,
+     "p50": 0.41,
+     "p95": 0.59,
+     "max": 0.75,
+     "mean": 0.43
+    },
+    "t2_A_candidates": {
+     "n": 64,
+     "p50": 26.63,
+     "p95": 37.66,
+     "max": 39.27,
+     "mean": 26.28
+    },
+    "t2_B_slot_locks": {
+     "n": 64,
+     "p50": 4.03,
+     "p95": 5.95,
+     "max": 7.01,
+     "mean": 4.02
+    },
+    "t2_C1_plan": {
+     "n": 64,
+     "p50": 23.01,
+     "p95": 33.3,
+     "max": 36.97,
+     "mean": 23.29
+    },
+    "t2_upgrade": {
+     "n": 64,
+     "p50": 0.14,
+     "p95": 139.33,
+     "max": 185.12,
+     "mean": 31.64
+    },
+    "t2_C2_number": {
+     "n": 64,
+     "p50": 14.71,
+     "p95": 21.18,
+     "max": 21.99,
+     "mean": 15.15
+    },
+    "t2_D_seats": {
+     "n": 64,
+     "p50": 14.54,
+     "p95": 23.67,
+     "max": 75.95,
+     "mean": 16.76
+    },
+    "t2_D_slots": {
+     "n": 64,
+     "p50": 74.78,
+     "p95": 119.65,
+     "max": 130.26,
+     "mean": 76.06
+    },
+    "t2_D_decisions": {
+     "n": 64,
+     "p50": 39.02,
+     "p95": 61.06,
+     "max": 136.07,
+     "mean": 40.39
+    },
+    "t2_E_count": {
+     "n": 64,
+     "p50": 0.34,
+     "p95": 0.55,
+     "max": 0.65,
+     "mean": 0.35
+    }
+   },
+   "lastSeat": "9007199254772993",
+   "seats": 32000,
+   "decisions": 32000
+  },
+  {
+   "cell": {
+    "workload": "W2",
+    "n": 500,
+    "c": 16,
+    "body": "t2"
+   },
+   "threads": 8,
+   "drained": true,
+   "drainSeconds": 25.81,
+   "durableRecords": 32000,
+   "durableRecordsPerSec": 1240,
+   "retriesPerBatch": 0.28,
+   "stageFailures": {
+    "commit:55P03": 6,
+    "prepare:55P03": 4,
+    "claim:55P03": 8
+   },
+   "controls": {
+    "kind": "none",
+    "everyMs": 1000,
+    "scheduledSlots": 0,
+    "missedSlots": 0,
+    "started": 0,
+    "completedDuringLoad": 0,
+    "completedAfterLoadEnd": 0,
+    "failed": {},
+    "latencyMs": {
+     "n": 0,
+     "p50": null,
+     "p95": null,
+     "max": null,
+     "mean": null
+    }
+   },
+   "commitsOk": 64,
+   "traced": 64,
+   "untraced": 0,
+   "holdMs": {
+    "n": 64,
+    "p50": 127.21,
+    "p95": 224.33,
+    "max": 515.39,
+    "mean": 143.64
+   },
+   "clockWaitMs": {
+    "n": 64,
+    "p50": 0.72,
+    "p95": 1028.05,
+    "max": 2005.47,
+    "mean": 252.96
+   },
+   "inAckAfterLockMs": {
+    "n": 64,
+    "p50": 119.68,
+    "p95": 219.41,
+    "max": 264.78,
+    "mean": 133.4
+   },
+   "postAckMs": {
+    "n": 64,
+    "p50": 1.35,
+    "p95": 2.38,
+    "max": 3.43,
+    "mean": 1.46
+   },
+   "commitRttMs": {
+    "n": 64,
+    "p50": 3.98,
+    "p95": 7.63,
+    "max": 280.4,
+    "mean": 8.78
+   },
+   "preLockMs": {
+    "n": 64,
+    "p50": 43.77,
+    "p95": 63.83,
+    "max": 91.43,
+    "mean": 43.55
+   },
+   "commitStatementMs": {
+    "n": 64,
+    "p50": 883.92,
+    "p95": 1928.3,
+    "max": 2369.61,
+    "mean": 915.15
+   },
+   "commitStatementAllMs": {
+    "n": 64,
+    "p50": 883.92,
+    "p95": 1928.3,
+    "max": 2369.61,
+    "mean": 915.15
+   },
+   "commitWholeAllMs": {
+    "n": 64,
+    "p50": 887.51,
+    "p95": 1932.61,
+    "max": 2374.35,
+    "mean": 924.58
+   },
+   "offsetProbeRttMs": {
+    "n": 64,
+    "p50": 0.66,
+    "p95": 1.06,
+    "max": 1.55,
+    "mean": 0.69
+   },
+   "split": {
+    "toWrapper": {
+     "n": 64,
+     "p50": 0.45,
+     "p95": 1.03,
+     "max": 2.98,
+     "mean": 0.52
+    },
+    "originClaimEnter": {
+     "n": 64,
+     "p50": 0.97,
+     "p95": 1541.77,
+     "max": 1930.41,
+     "mean": 477.34
+    },
+    "commitBeforeAck": {
+     "n": 64,
+     "p50": 5.06,
+     "p95": 13.24,
+     "max": 18.92,
+     "mean": 5.93
+    },
+    "ackBeforeLock": {
+     "n": 64,
+     "p50": 43.77,
+     "p95": 63.83,
+     "max": 91.43,
+     "mean": 43.55
+    },
+    "wait": {
+     "n": 64,
+     "p50": 0.72,
+     "p95": 1028.05,
+     "max": 2005.47,
+     "mean": 252.96
+    },
+    "inAck": {
+     "n": 64,
+     "p50": 119.68,
+     "p95": 219.41,
+     "max": 264.78,
+     "mean": 133.4
+    },
+    "afterAck": {
+     "n": 64,
+     "p50": 0.74,
+     "p95": 1.65,
+     "max": 2.6,
+     "mean": 0.86
+    },
+    "toClientReturn": {
+     "n": 64,
+     "p50": 0.56,
+     "p95": 0.91,
+     "max": 1.3,
+     "mean": 0.6
+    },
+    "commitRtt": {
+     "n": 64,
+     "p50": 3.98,
+     "p95": 7.63,
+     "max": 280.4,
+     "mean": 8.78
+    },
+    "nativeOriginLock": {
+     "n": 64,
+     "p50": 0.03,
+     "p95": 0.16,
+     "max": 0.46,
+     "mean": 0.06
+    }
+   },
+   "commitAttempts": {
+    "n": 70,
+    "over2s": 9,
+    "over5s": 0,
+    "failed": 6,
+    "statementMsOkAndFailed": {
+     "n": 70,
+     "p50": 948.1,
+     "p95": 2003.75,
+     "max": 2369.61,
+     "mean": 1008.38
+    }
+   },
+   "afterLockSteps": [
+    "t2_C2_number",
+    "t2_D_seats",
+    "t2_D_slots",
+    "t2_D_decisions",
+    "t2_E_count",
+    "last_seat_update",
+    "final_check"
+   ],
+   "stepMs": {
+    "guard": {
+     "n": 64,
+     "p50": 0.12,
+     "p95": 0.25,
+     "max": 0.58,
+     "mean": 0.14
+    },
+    "lock_fences": {
+     "n": 64,
+     "p50": 0.14,
+     "p95": 0.39,
+     "max": 0.82,
+     "mean": 0.17
+    },
+    "seal": {
+     "n": 64,
+     "p50": 0.15,
+     "p95": 0.36,
+     "max": 0.69,
+     "mean": 0.18
+    },
+    "gate_read": {
+     "n": 64,
+     "p50": 0.04,
+     "p95": 0.55,
+     "max": 0.98,
+     "mean": 0.14
+    },
+    "clock_lock": {
+     "n": 64,
+     "p50": 0.05,
+     "p95": 0.21,
+     "max": 0.36,
+     "mean": 0.07
+    },
+    "origin_lock": {
+     "n": 64,
+     "p50": 0.03,
+     "p95": 0.16,
+     "max": 0.46,
+     "mean": 0.06
+    },
+    "stage_row": {
+     "n": 64,
+     "p50": 0.25,
+     "p95": 0.87,
+     "max": 1.45,
+     "mean": 0.35
+    },
+    "attempt_check1": {
+     "n": 64,
+     "p50": 0.32,
+     "p95": 0.9,
+     "max": 1.18,
+     "mean": 0.4
+    },
+    "attempt_row": {
+     "n": 64,
+     "p50": 0.19,
+     "p95": 0.36,
+     "max": 0.92,
+     "mean": 0.23
+    },
+    "last_seat_update": {
+     "n": 64,
+     "p50": 0.22,
+     "p95": 0.38,
+     "max": 0.54,
+     "mean": 0.23
+    },
+    "final_check": {
+     "n": 64,
+     "p50": 0.46,
+     "p95": 0.82,
+     "max": 1.31,
+     "mean": 0.5
+    },
+    "t2_A_candidates": {
+     "n": 64,
+     "p50": 18.23,
+     "p95": 27.89,
+     "max": 39.09,
+     "mean": 18.56
+    },
+    "t2_B_slot_locks": {
+     "n": 64,
+     "p50": 3.17,
+     "p95": 5.07,
+     "max": 7.46,
+     "mean": 3.37
+    },
+    "t2_C1_plan": {
+     "n": 64,
+     "p50": 19.3,
+     "p95": 31.04,
+     "max": 41.92,
+     "mean": 19.88
+    },
+    "t2_upgrade": {
+     "n": 64,
+     "p50": 0.72,
+     "p95": 1028.05,
+     "max": 2005.47,
+     "mean": 252.96
+    },
+    "t2_C2_number": {
+     "n": 64,
+     "p50": 12.52,
+     "p95": 20.9,
+     "max": 23.75,
+     "mean": 13.77
+    },
+    "t2_D_seats": {
+     "n": 64,
+     "p50": 12.97,
+     "p95": 19.45,
+     "max": 20.94,
+     "mean": 13.51
+    },
+    "t2_D_slots": {
+     "n": 64,
+     "p50": 61.37,
+     "p95": 124.73,
+     "max": 189.66,
+     "mean": 69.9
+    },
+    "t2_D_decisions": {
+     "n": 64,
+     "p50": 33.91,
+     "p95": 47.88,
+     "max": 58.01,
+     "mean": 35.12
+    },
+    "t2_E_count": {
+     "n": 64,
+     "p50": 0.37,
+     "p95": 0.7,
+     "max": 0.9,
+     "mean": 0.38
+    }
+   },
+   "lastSeat": "9007199254772993",
+   "seats": 32000,
+   "decisions": 32000
+  }
+ ]
+}

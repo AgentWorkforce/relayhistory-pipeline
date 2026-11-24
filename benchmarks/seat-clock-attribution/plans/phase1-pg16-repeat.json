@@ -1,0 +1,151 @@
+{
+ "runId": "phase1-pg16-repeat",
+ "totalRecords": 32000,
+ "maxSeconds": 300,
+ "cells": [
+  {
+   "workload": "W1",
+   "n": 250,
+   "c": 2,
+   "body": "main"
+  },
+  {
+   "workload": "W1",
+   "n": 250,
+   "c": 4,
+   "body": "main"
+  },
+  {
+   "workload": "W1",
+   "n": 250,
+   "c": 16,
+   "body": "main"
+  },
+  {
+   "workload": "W1",
+   "n": 250,
+   "c": 64,
+   "body": "main"
+  },
+  {
+   "workload": "W2",
+   "n": 250,
+   "c": 4,
+   "body": "main"
+  },
+  {
+   "workload": "W2",
+   "n": 250,
+   "c": 16,
+   "body": "main"
+  },
+  {
+   "workload": "W1",
+   "n": 500,
+   "c": 2,
+   "body": "main"
+  },
+  {
+   "workload": "W1",
+   "n": 500,
+   "c": 4,
+   "body": "main"
+  },
+  {
+   "workload": "W1",
+   "n": 500,
+   "c": 16,
+   "body": "main"
+  },
+  {
+   "workload": "W1",
+   "n": 500,
+   "c": 64,
+   "body": "main"
+  },
+  {
+   "workload": "W2",
+   "n": 500,
+   "c": 4,
+   "body": "main"
+  },
+  {
+   "workload": "W2",
+   "n": 500,
+   "c": 16,
+   "body": "main"
+  },
+  {
+   "workload": "W1",
+   "n": 250,
+   "c": 2,
+   "body": "t2"
+  },
+  {
+   "workload": "W1",
+   "n": 250,
+   "c": 4,
+   "body": "t2"
+  },
+  {
+   "workload": "W1",
+   "n": 250,
+   "c": 16,
+   "body": "t2"
+  },
+  {
+   "workload": "W1",
+   "n": 250,
+   "c": 64,
+   "body": "t2"
+  },
+  {
+   "workload": "W2",
+   "n": 250,
+   "c": 4,
+   "body": "t2"
+  },
+  {
+   "workload": "W2",
+   "n": 250,
+   "c": 16,
+   "body": "t2"
+  },
+  {
+   "workload": "W1",
+   "n": 500,
+   "c": 2,
+   "body": "t2"
+  },
+  {
+   "workload": "W1",
+   "n": 500,
+   "c": 4,
+   "body": "t2"
+  },
+  {
+   "workload": "W1",
+   "n": 500,
+   "c": 16,
+   "body": "t2"
+  },
+  {
+   "workload": "W1",
+   "n": 500,
+   "c": 64,
+   "body": "t2"
+  },
+  {
+   "workload": "W2",
+   "n": 500,
+   "c": 4,
+   "body": "t2"
+  },
+  {
+   "workload": "W2",
+   "n": 500,
+   "c": 16,
+   "body": "t2"
+  }
+ ]
+}

@@ -14,8 +14,17 @@ upload path (`deliverBatch -> sqlLedger`, buffered, origin claim fence on), W1/W
   match exactly once) and installs the probed copies into the throwaway database. Nothing under `supabase/` or `src/`
   changes. A probe is three PL/pgSQL assignments; the trace goes out through a session-level `set_config`, read by the
   worker after COMMIT on the same connection (outside the hold). Failed transactions carry no trace.
-- `cell.body`: `main` (the base body, T2 gate off), `t2` (gate fenced, mode t2, set with the shipped owner setters on the
-  template), `main-plain` / `t2-plain` (unprobed, for the probe overhead check).
+- `cell.body`: `main` (the installed body, gate off), `t2` (gate fenced, mode t2, set with the shipped owner setters on the
+  template), `p` (gate fenced, mode p: 20261105062250's pre-planned ACK), `main-plain` / `t2-plain` / `p-plain` (unprobed,
+  for the probe overhead check), `t2-verify` (T2 plus a bench-only cost proxy of a re-check statement, never product SQL).
+  Which tree is measured is the checkout's: `phase1-pg16`, `phase1-pg16-history-off` and `phase1-pg16-c2` ran on the base
+  tree. The PG16-repeat, PG15 and PG17 phase 1 runs may have run on a working tree that already held a draft 062250 (it
+  was written while they ran; not recorded per run); their cells were gate off (main) or fenced/t2 only, which run
+  062210's statements in either tree. Phase 3 runs on the branch head.
+- Mode p trace fields: whether the pre-plan was valid and whether its candidate list was used (else recomputed under the
+  lock), and the pre-plan statement's own time (`preplan` in summary.json).
+- Barrier prober: every 100 ms one autocommit transaction TRY-locks (961996,50000) exclusive and rolls back, changing
+  nothing (`barrierProbe.freeShare`: how often a setter, down or erase would have found the barrier free).
 - Controls: none by default; `controls: "c2"` (plan or cell) runs the baseline's C2 ordered control loop unchanged.
 
 ## Measured span

@@ -1,0 +1,224 @@
+{
+ "runId": "phase3-pg16-a",
+ "totalRecords": 32000,
+ "maxSeconds": 300,
+ "controls": "c2",
+ "cells": [
+  {
+   "workload": "W1",
+   "n": 250,
+   "c": 2,
+   "body": "main"
+  },
+  {
+   "workload": "W1",
+   "n": 250,
+   "c": 2,
+   "body": "t2"
+  },
+  {
+   "workload": "W1",
+   "n": 250,
+   "c": 2,
+   "body": "p"
+  },
+  {
+   "workload": "W1",
+   "n": 250,
+   "c": 4,
+   "body": "main"
+  },
+  {
+   "workload": "W1",
+   "n": 250,
+   "c": 4,
+   "body": "t2"
+  },
+  {
+   "workload": "W1",
+   "n": 250,
+   "c": 4,
+   "body": "p"
+  },
+  {
+   "workload": "W1",
+   "n": 250,
+   "c": 16,
+   "body": "main"
+  },
+  {
+   "workload": "W1",
+   "n": 250,
+   "c": 16,
+   "body": "t2"
+  },
+  {
+   "workload": "W1",
+   "n": 250,
+   "c": 16,
+   "body": "p"
+  },
+  {
+   "workload": "W1",
+   "n": 250,
+   "c": 64,
+   "body": "main"
+  },
+  {
+   "workload": "W1",
+   "n": 250,
+   "c": 64,
+   "body": "t2"
+  },
+  {
+   "workload": "W1",
+   "n": 250,
+   "c": 64,
+   "body": "p"
+  },
+  {
+   "workload": "W2",
+   "n": 250,
+   "c": 4,
+   "body": "main"
+  },
+  {
+   "workload": "W2",
+   "n": 250,
+   "c": 4,
+   "body": "t2"
+  },
+  {
+   "workload": "W2",
+   "n": 250,
+   "c": 4,
+   "body": "p"
+  },
+  {
+   "workload": "W2",
+   "n": 250,
+   "c": 16,
+   "body": "main"
+  },
+  {
+   "workload": "W2",
+   "n": 250,
+   "c": 16,
+   "body": "t2"
+  },
+  {
+   "workload": "W2",
+   "n": 250,
+   "c": 16,
+   "body": "p"
+  },
+  {
+   "workload": "W1",
+   "n": 500,
+   "c": 2,
+   "body": "main"
+  },
+  {
+   "workload": "W1",
+   "n": 500,
+   "c": 2,
+   "body": "t2"
+  },
+  {
+   "workload": "W1",
+   "n": 500,
+   "c": 2,
+   "body": "p"
+  },
+  {
+   "workload": "W1",
+   "n": 500,
+   "c": 4,
+   "body": "main"
+  },
+  {
+   "workload": "W1",
+   "n": 500,
+   "c": 4,
+   "body": "t2"
+  },
+  {
+   "workload": "W1",
+   "n": 500,
+   "c": 4,
+   "body": "p"
+  },
+  {
+   "workload": "W1",
+   "n": 500,
+   "c": 16,
+   "body": "main"
+  },
+  {
+   "workload": "W1",
+   "n": 500,
+   "c": 16,
+   "body": "t2"
+  },
+  {
+   "workload": "W1",
+   "n": 500,
+   "c": 16,
+   "body": "p"
+  },
+  {
+   "workload": "W1",
+   "n": 500,
+   "c": 64,
+   "body": "main"
+  },
+  {
+   "workload": "W1",
+   "n": 500,
+   "c": 64,
+   "body": "t2"
+  },
+  {
+   "workload": "W1",
+   "n": 500,
+   "c": 64,
+   "body": "p"
+  },
+  {
+   "workload": "W2",
+   "n": 500,
+   "c": 4,
+   "body": "main"
+  },
+  {
+   "workload": "W2",
+   "n": 500,
+   "c": 4,
+   "body": "t2"
+  },
+  {
+   "workload": "W2",
+   "n": 500,
+   "c": 4,
+   "body": "p"
+  },
+  {
+   "workload": "W2",
+   "n": 500,
+   "c": 16,
+   "body": "main"
+  },
+  {
+   "workload": "W2",
+   "n": 500,
+   "c": 16,
+   "body": "t2"
+  },
+  {
+   "workload": "W2",
+   "n": 500,
+   "c": 16,
+   "body": "p"
+  }
+ ]
+}
