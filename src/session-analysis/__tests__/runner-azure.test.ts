@@ -26,6 +26,8 @@ import type { AzureBlobEraserConfig } from "../../migration/azure-blob-erasure/e
 import type { PagedEraser } from "../../migration/neon-s3-erasure/eraser.ts";
 import type { HoopDb } from "../../shared/db.ts";
 import { logLine } from "../../shared/log.ts";
+import { classifyAnalysisFailure } from "../processor.ts";
+import { ObjectStoreError } from "../../../packages/object-store/src/errors.ts";
 import { FAKE_ENDPOINT, FakeAzureBlob } from "../../migration/__tests__/fake-azure-blob.ts";
 
 const MODEL_KEY = "sk-test-RUNNERSECRETKEY0123456789";
@@ -205,6 +207,29 @@ describe("azure deps", () => {
     expect(erasers[0]).toMatchObject({ account: "fxacct", container: "fx-container", endpoint: "http://127.0.0.1:10000/fxacct" });
     expect(erasers[0]!.accountKey()).toBe(KEY);
     expect(JSON.stringify(erasers[0])).not.toContain(KEY.slice(0, 16));
+  });
+});
+
+describe("the Azure store never follows a redirect (Shared Key requests are not replayed)", () => {
+  test("a 3xx on a put or a read is refused as azure_redirect; the Location is never requested; every request is redirect manual", async () => {
+    const fake = new FakeAzureBlob({ accountKey: KEY });
+    const env = azureEnv({ SESSION_ANALYSIS_AZURE_ENDPOINT: FAKE_ENDPOINT });
+    const { deps } = runnerAzureAnalysisDeps(env, analysisRunnerConfig(env), runnerSecrets(env), { pool: fakeDb, fetcher: fake.fetch });
+    const key = "fxroot/fx-org/v1/normalized/session-analysis-v2/fx-job.json";
+    expect((await deps.store.put(key as never, new TextEncoder().encode("{}"), { ifNoneMatch: true })).created).toBe(true);
+    for (const method of ["PUT", "GET"]) {
+      fake.hook = (req) => (req.method === method ? new Response(null, { status: 307, headers: { location: "https://fx-elsewhere.invalid/x" } }) : undefined);
+      const op = method === "PUT"
+        ? deps.store.put(`${key}.2` as never, new TextEncoder().encode("{}"), { ifNoneMatch: true })
+        : deps.store.getObject(key as never);
+      const error = await op.then(() => null, (e) => e);
+      expect([method, (error?.cause as { code?: string })?.code]).toEqual([method, "azure_redirect"]);
+      // A misconfigured endpoint is not transient: the job fails without burning retries.
+      expect([method, classifyAnalysisFailure(error)]).toEqual([method, { code: "analysis_store_redirect", retryable: false }]);
+    }
+    // Any other transient store failure keeps its retry.
+    expect(classifyAnalysisFailure(new ObjectStoreError("transient", "azure", "request failed"))).toEqual({ code: "analysis_processing_failed", retryable: true });
+    expect(fake.requests.every((r) => r.url.hostname === "127.0.0.1" && r.redirect === "manual")).toBe(true);
   });
 });
 

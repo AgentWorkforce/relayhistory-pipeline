@@ -229,6 +229,48 @@ describe("pagination and resume", () => {
   });
 });
 
+describe("fresh traversals (Azure markers name the next item as of issue time)", () => {
+  test("verifyErased on the same instance never reuses an earlier traversal's marker: an entry created since is found", async () => {
+    const { fake, eraser } = setup({ pageSize: 2, markerMode: "next-item" });
+    const [A, C, C2, D] = ["fx-a.json", "fx-c.json", "fx-c2.json", "fx-d.json"].map((k) => `${DIR}${k}`);
+    fake.put(A!); fake.put(C!); fake.put(D!);
+    const e = eraser();
+    // Traversal 1 deletes nothing; its page ending at C gets a marker naming D (the next item then).
+    expect(await e.eraseStep(DIR, { scope: "fx", authorize, select: () => false })).toMatchObject({ status: "traversed" });
+    fake.put(C2!);   // sorts between C and D
+    // Traversal 2 must see C2 (the earlier marker would jump from C straight to D and report erased).
+    expect(await e.verifyErased(DIR, { authorize, select: (v) => v.key === C2 })).toMatchObject({ status: "pending", remaining: 1 });
+    await drain(e, DIR, { select: (v) => v.key === C2 });
+    expect(fake.copies(C2!)).toEqual([]);
+    expect(await e.verifyErased(DIR, { authorize })).toMatchObject({ status: "pending", reason: "remaining" });
+    expect(fake.records.map((r) => r.key).sort()).toEqual([A, C, D].sort());
+  });
+
+  test("one instance across a directory traversal and an exact-key traversal (the probe's pattern) erases everything", async () => {
+    const { fake, eraser } = setup({ pageSize: 1, markerMode: "next-item" });
+    for (const k of ["fx-1", "fx-2", "fx-3"]) fake.put(`${DIR}${k}/probe`);
+    const e = eraser();
+    await drain(e, DIR);
+    fake.put(`${DIR}fx-4/probe`); fake.put(`${DIR}fx-4/probe`);
+    await drain(e, `${DIR}fx-4/`, { exactKey: `${DIR}fx-4/probe` });
+    expect(await e.verifyErased(DIR, { authorize })).toEqual({ status: "erased", listed: 0 });
+    expect(fake.records).toEqual([]);
+  });
+
+  test("a full multi-page erase under next-item markers, resumed by fresh instances from checkpoints", async () => {
+    const { fake, eraser } = setup({ pageSize: 2, markerMode: "next-item" });
+    for (let k = 0; k < 5; k++) for (let v = 0; v < 3; v++) fake.put(`${DIR}fx-${k}.json`);
+    let checkpoint: EraseCheckpoint | null = null;
+    for (let i = 0; i < 100; i++) {
+      const r = await eraser().eraseStep(DIR, { scope: "fx", authorize, checkpoint, budget: { pages: 1 } });
+      if (r.status === "traversed") break;
+      checkpoint = r.checkpoint;
+    }
+    expect(fake.records).toEqual([]);
+    expect(await eraser().verifyErased(DIR, { authorize })).toMatchObject({ status: "erased" });
+  });
+});
+
 describe("strict inventory", () => {
   const listing = (xml: string) => (req: { method: string; url: URL }) =>
     (req.method === "GET" ? new Response(xml, { status: 200 }) : undefined);

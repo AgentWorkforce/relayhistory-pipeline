@@ -193,11 +193,13 @@ that version.
 
 **Not covered yet on Azure.**
 
-- **Jobs come only from the claims scheduler.** The read API's `POST /v1/sessions/:id/analysis` and its result
-  reads use an S3 client (`READ_API_ANALYSIS_BUCKET`). On `LOCKER_PROVIDER=azure` the read API ignores that
-  variable with one startup warning (`read_api_analysis_bucket_ignored_on_azure`), and analysis there stays
-  unconfigured (501 `analysis_not_configured`). Until the follow-up slice S2b, results on Azure are not readable
-  through the read API.
+- **Nothing creates analysis jobs on Azure until S2b.** The read API's `POST /v1/sessions/:id/analysis` and its
+  result reads use an S3 client (`READ_API_ANALYSIS_BUCKET`). On `LOCKER_PROVIDER=azure` the read API ignores that
+  variable with one startup warning (`read_api_analysis_bucket_ignored_on_azure`), builds neither the S3 client
+  nor the admission pool, and answers 501 `analysis_not_configured`. The claims scheduler needs
+  `SUMMARY_DECISION_RECORDS_ENABLED=true`, which stays off on Azure (below). So with S2 alone an Azure runner
+  starts, passes its versioning proof and runs empty ticks: it claims and sweeps nothing until a job source exists.
+  Until S2b, results on Azure are also not readable through the read API.
 - **`SUMMARY_DECISION_RECORDS_ENABLED` stays off on Azure** until the self-host operator erase adopts the
   Azure eraser (its own slice). Today that erase refuses anything but S3.
 - **Proof.** CI (`pg-proof.yml`) runs `runner-store.azurite.test.ts` against Azurite 3.38.0 pinned by digest.

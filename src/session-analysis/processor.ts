@@ -38,6 +38,7 @@ import {
   type AnalysisEvidenceDeps,
 } from "./evidence.ts";
 import { encodeAnalysisResult } from "./results.ts";
+import { log } from "../shared/log.ts";
 import {
   SESSION_ANALYSIS_ENVELOPE_VERSION,
   SESSION_ANALYSIS_RESULT_SCHEMA_VERSION,
@@ -193,7 +194,20 @@ export interface AnalysisJobStore {
 export const ANALYSIS_LEASE_SECONDS = 600;
 
 /** A controlled failure code and whether it is retried (relayhistory runSessionJob). */
+/** True when `code` is the error's own code or that of any cause in its chain (bounded). */
+function causedBy(error: unknown, code: string): boolean {
+  let e: unknown = error;
+  for (let depth = 0; depth < 6 && e && typeof e === "object"; depth++) {
+    if ((e as { code?: unknown }).code === code) return true;
+    e = (e as { cause?: unknown }).cause;
+  }
+  return false;
+}
+
 export function classifyAnalysisFailure(error: unknown): { code: string; retryable: boolean } {
+  // A store that answered a redirect (the Azure store never follows one: azure-blob-erasure/eraser.ts
+  // azureNoRedirectFetch) is misconfigured, not transient: retrying would only burn attempts.
+  if (causedBy(error, "azure_redirect")) return { code: "analysis_store_redirect", retryable: false };
   if (error instanceof UnsupportedAnalysisJobError) return { code: error.message, retryable: false };
   if (error instanceof SessionSourceNotFoundError) return { code: "session_not_found", retryable: false };
   if (error instanceof SessionSourceIncompleteError)
@@ -264,6 +278,7 @@ export async function runAnalysisJob(
   } catch (error) {
     // Persist only controlled codes, never model content, credentials or exception text.
     const { code, retryable } = classifyAnalysisFailure(error);
+    if (code === "analysis_store_redirect") log.error("session analysis store redirect", { stage: "session-analysis", reason: code });
     const saved = await store.fail({ jobId: job.id, leaseToken: job.leaseToken, error: code, retryable });
     return saved ? "failed" : "lease-lost";
   }

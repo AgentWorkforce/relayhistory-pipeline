@@ -34,6 +34,12 @@ export interface FakeAzureOptions {
   permanentDelete?: boolean;
   /** Omit x-ms-version-id even with versioning (a malformed / non-versioned answer). */
   versionHeader?: (id: string) => string | null;
+  /**
+   * "after-last" (default): NextMarker continues after the last entry returned. "next-item": NextMarker names the
+   * NEXT item as of the moment it is issued (real Azure's shape), so an entry created later that sorts between the
+   * last returned entry and that item is never listed by a continuation from that marker.
+   */
+  markerMode?: "after-last" | "next-item";
 }
 
 export const FAKE_ENDPOINT = "http://127.0.0.1:1/fxacct";
@@ -99,9 +105,13 @@ export class FakeAzureBlob {
     return this.records.filter((r) => r.key === key);
   }
 
+  static #rank(r: Pick<FakeRecord, "kind">) { return r.kind === "snapshot" ? 0 : r.kind === "version" ? 1 : 2; }
+  static #cmp(a: Pick<FakeRecord, "key" | "kind" | "seq">, b: Pick<FakeRecord, "key" | "kind" | "seq">) {
+    return a.key < b.key ? -1 : a.key > b.key ? 1 : FakeAzureBlob.#rank(a) - FakeAzureBlob.#rank(b) || a.seq - b.seq;
+  }
+
   #sorted(): FakeRecord[] {
-    const rank = (r: FakeRecord) => (r.kind === "snapshot" ? 0 : r.kind === "version" ? 1 : 2);
-    return [...this.records].sort((a, b) => (a.key < b.key ? -1 : a.key > b.key ? 1 : rank(a) - rank(b) || a.seq - b.seq));
+    return [...this.records].sort(FakeAzureBlob.#cmp);
   }
 
   readonly fetch = (async (input: RequestInfo | URL, init?: RequestInit): Promise<Response> => {
@@ -177,7 +187,11 @@ export class FakeAzureBlob {
       .filter((r) => (r.deleted ? include.has("deleted") : true))
       .filter((r) => (r.kind === "snapshot" ? include.has("snapshots") : true))
       .filter((r) => (r.kind === "version" && !r.current ? include.has("versions") : true));
-    if (marker) {
+    const nextItem = this.#opts.markerMode === "next-item";
+    if (marker && nextItem) {
+      const from = JSON.parse(Buffer.from(marker, "base64").toString()) as { key: string; seq: number; kind: FakeRecord["kind"] };
+      all = all.filter((r) => FakeAzureBlob.#cmp(r, from) >= 0);
+    } else if (marker) {
       const after = JSON.parse(Buffer.from(marker, "base64").toString()) as { key: string; seq: number; kind: string };
       const order = this.#sorted();
       const pos = order.findIndex((r) => r.seq === after.seq);
@@ -193,7 +207,7 @@ export class FakeAzureBlob {
       + (r.kind === "version" && r.current ? "<IsCurrentVersion>true</IsCurrentVersion>" : "")
       + (r.deleted ? "<Deleted>true</Deleted>" : "")
       + `<Properties><Last-Modified>${new Date(this.#clock).toUTCString()}</Last-Modified><Etag>${r.etag}</Etag><Content-Length>${r.bytes.length}</Content-Length></Properties></Blob>`;
-    const last = page[page.length - 1];
+    const last = nextItem ? all[max] : page[page.length - 1];
     const next = truncated && last ? Buffer.from(JSON.stringify({ key: last.key, seq: last.seq, kind: last.kind })).toString("base64") : "";
     const xml = `﻿<?xml version="1.0" encoding="utf-8"?><EnumerationResults ServiceEndpoint="${FAKE_ENDPOINT}" ContainerName="${this.container}">`
       + `<Prefix>${esc(prefix)}</Prefix>${marker ? `<Marker>${marker}</Marker>` : ""}<MaxResults>${max}</MaxResults><Blobs>${page.map(blob).join("")}</Blobs>`

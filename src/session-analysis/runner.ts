@@ -73,7 +73,7 @@ import { setTimeout as delay } from "node:timers/promises";
 import { createS3Store, type ObjectStore } from "../../packages/object-store/src/index.ts";
 import { createAzureBlobStore, type AzureBlobConfig } from "../../packages/object-store/src/azure.ts";
 import { fromBase64 } from "../../packages/object-store/src/crypto.ts";
-import { createAzureBlobEraser, type AzureBlobEraserConfig } from "../migration/azure-blob-erasure/eraser.ts";
+import { azureNoRedirectFetch, createAzureBlobEraser, type AzureBlobEraserConfig } from "../migration/azure-blob-erasure/eraser.ts";
 import { probeBlobVersioning, runnerProbePrefix, type BlobVersioningCheck, type BlobVersioningVerdict } from "./blob-versioning.ts";
 import { cachedProvider } from "../../packages/object-store/src/core.ts";
 import type { AwsCredentials } from "../../packages/object-store/src/sigv4.ts";
@@ -227,9 +227,7 @@ export function analysisRunnerConfig(env: NodeJS.ProcessEnv): AnalysisRunnerConf
   if (!/^[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]$/.test(bucket)) refuse("bucket_invalid");
   const region = env.SESSION_ANALYSIS_S3_REGION ?? "";
   if (!/^[a-z]{2}(-[a-z]+)+-\d{1,2}$/.test(region)) refuse("region_invalid");
-  if (env.PIPELINE_ORG_FROM_PREFIX !== "true") refuse("org_from_prefix_required");
-  const keyPrefix = (env.PIPELINE_KEY_PREFIX ?? "").replace(/^\/+|\/+$/g, "");
-  if (!/^[A-Za-z0-9][A-Za-z0-9._-]{0,62}$/.test(keyPrefix)) refuse("key_prefix_invalid");
+  const keyPrefix = runnerKeyPrefix(env);
   const credentials = env.SESSION_ANALYSIS_S3_CREDENTIALS || "podIdentity";
   if (credentials !== "podIdentity" && credentials !== "role" && credentials !== "static") refuse("credentials_mode_invalid");
   // Static keys are read only in "static" mode; set in any other mode they would be silently unused.
@@ -238,6 +236,55 @@ export function analysisRunnerConfig(env: NodeJS.ProcessEnv): AnalysisRunnerConf
   const check = env.SESSION_ANALYSIS_S3_VERSIONING_CHECK;
   if (check !== undefined && check !== "" && check !== "true") refuse("versioning_check_invalid");
   const versioningCheck = check === "true" || endpoint !== undefined || credentials === "static";
+  const run = runnerProcessSettings(env);
+  return {
+    tickMs: run.tickMs,
+    batch: run.batch,
+    poolMax: run.poolMax,
+    bucket,
+    region,
+    keyPrefix,
+    ...(run.readerMaxRuleset === undefined ? {} : { readerMaxRuleset: run.readerMaxRuleset }),
+    credentials: credentials as RunnerCredentialMode,
+    ...(endpoint === undefined ? {} : { endpoint }),
+    ...(versioningCheck ? { versioningCheck: true as const } : {}),
+    assumeNoLegacyTurns: run.assumeNoLegacyTurns,
+    cutoverProof: run.cutoverProof,
+  };
+}
+
+/** The azure branch: its store settings (runnerAzureConfig), then the same provider-independent checks as S3. */
+function analysisRunnerConfigAzure(env: NodeJS.ProcessEnv): AnalysisRunnerConfig {
+  const azure = runnerAzureConfig(env);
+  const keyPrefix = runnerKeyPrefix(env);
+  const run = runnerProcessSettings(env);
+  return {
+    tickMs: run.tickMs,
+    batch: run.batch,
+    poolMax: run.poolMax,
+    bucket: azure.container,
+    region: "",
+    keyPrefix,
+    ...(run.readerMaxRuleset === undefined ? {} : { readerMaxRuleset: run.readerMaxRuleset }),
+    credentials: "sharedKey",
+    // The data-plane probe always runs on azure (assertRunnerBlobVersioned).
+    versioningCheck: true,
+    azure,
+    assumeNoLegacyTurns: run.assumeNoLegacyTurns,
+    cutoverProof: run.cutoverProof,
+  };
+}
+
+/** The org-from-prefix layout and the bare key root, as the Lambda requires them (any provider). */
+function runnerKeyPrefix(env: NodeJS.ProcessEnv): string {
+  if (env.PIPELINE_ORG_FROM_PREFIX !== "true") refuse("org_from_prefix_required");
+  const keyPrefix = (env.PIPELINE_KEY_PREFIX ?? "").replace(/^\/+|\/+$/g, "");
+  if (!/^[A-Za-z0-9][A-Za-z0-9._-]{0,62}$/.test(keyPrefix)) refuse("key_prefix_invalid");
+  return keyPrefix;
+}
+
+/** The provider-independent process settings, checked in this order after the store settings (any provider). */
+function runnerProcessSettings(env: NodeJS.ProcessEnv) {
   const assume = env.SESSION_ANALYSIS_ASSUME_NO_LEGACY_TURNS;
   if (assume !== undefined && assume !== "" && assume !== "false" && assume !== "true") refuse("assume_no_legacy_turns_invalid");
   // Strict here, and it must be exactly what worker.ts analysisConfig runs (1-20, default 2): the
@@ -252,43 +299,7 @@ export function analysisRunnerConfig(env: NodeJS.ProcessEnv): AnalysisRunnerConf
     tickMs: int(env.SESSION_ANALYSIS_TICK_MS, 30_000, 1_000, 600_000, "tick_ms_invalid"),
     batch,
     poolMax: int(env.SESSION_ANALYSIS_PG_POOL_MAX, 4, 1, 16, "pool_max_invalid"),
-    bucket,
-    region,
-    keyPrefix,
-    ...(maximum === undefined ? {} : { readerMaxRuleset: maximum }),
-    credentials: credentials as RunnerCredentialMode,
-    ...(endpoint === undefined ? {} : { endpoint }),
-    ...(versioningCheck ? { versioningCheck: true as const } : {}),
-    assumeNoLegacyTurns: assume === "true",
-    cutoverProof: env.SESSION_ANALYSIS_CUTOVER_PROOF !== undefined && env.SESSION_ANALYSIS_CUTOVER_PROOF !== "",
-  };
-}
-
-/** The azure branch: the store settings above, then exactly the S3 path's provider-independent checks. */
-function analysisRunnerConfigAzure(env: NodeJS.ProcessEnv): AnalysisRunnerConfig {
-  const azure = runnerAzureConfig(env);
-  if (env.PIPELINE_ORG_FROM_PREFIX !== "true") refuse("org_from_prefix_required");
-  const keyPrefix = (env.PIPELINE_KEY_PREFIX ?? "").replace(/^\/+|\/+$/g, "");
-  if (!/^[A-Za-z0-9][A-Za-z0-9._-]{0,62}$/.test(keyPrefix)) refuse("key_prefix_invalid");
-  const assume = env.SESSION_ANALYSIS_ASSUME_NO_LEGACY_TURNS;
-  if (assume !== undefined && assume !== "" && assume !== "false" && assume !== "true") refuse("assume_no_legacy_turns_invalid");
-  const batch = int(env.SESSION_ANALYSIS_BATCH, 2, 1, 20, "batch_invalid");
-  if (analysisConfig(env).batch !== batch) refuse("batch_invalid");
-  let maximum: number | undefined;
-  try { maximum = readerMaxRuleset(env); } catch { refuse("reader_max_ruleset_invalid"); }
-  try { postgresTlsOptions(env); } catch { refuse("postgres_tls_invalid"); }
-  return {
-    tickMs: int(env.SESSION_ANALYSIS_TICK_MS, 30_000, 1_000, 600_000, "tick_ms_invalid"),
-    batch,
-    poolMax: int(env.SESSION_ANALYSIS_PG_POOL_MAX, 4, 1, 16, "pool_max_invalid"),
-    bucket: azure.container,
-    region: "",
-    keyPrefix,
-    ...(maximum === undefined ? {} : { readerMaxRuleset: maximum }),
-    credentials: "sharedKey",
-    // The data-plane probe always runs on azure (assertRunnerBlobVersioned).
-    versioningCheck: true,
-    azure,
+    readerMaxRuleset: maximum,
     assumeNoLegacyTurns: assume === "true",
     cutoverProof: env.SESSION_ANALYSIS_CUTOVER_PROOF !== undefined && env.SESSION_ANALYSIS_CUTOVER_PROOF !== "",
   };
@@ -497,7 +508,8 @@ export function runnerAzureAnalysisDeps(env: NodeJS.ProcessEnv, cfg: AnalysisRun
   const endpoint = target.endpoint ? { endpoint: target.endpoint } : {};
   const store = (ports.azureStore ?? ((c: AzureBlobConfig) => createAzureBlobStore(c) as unknown as ObjectStore))({
     account, container, ...endpoint, auth: { kind: "sharedKey", accountKey: target.accountKey() },
-    ...(ports.fetcher ? { fetch: ports.fetcher } : {}),
+    // Shared Key signed requests never follow a redirect (the eraser and the probe enforce the same).
+    fetch: azureNoRedirectFetch(ports.fetcher),
   });
   const makeEraser = ports.azureEraserFactory ?? createAzureBlobEraser;
   const deps = analysisTickDeps({
