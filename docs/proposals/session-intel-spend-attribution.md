@@ -47,9 +47,12 @@ Rules:
 - **Former members.** Membership rows are deleted when someone is removed, so an older session's user id can match no
   current member. Such sessions go to a `former member` bucket, keyed by user id, so per-person sums still add up to the
   workspace total.
-- **Once per session.** A session's usage counts once, never once per user. A session with one user is attributed to
-  that user. A session with several users goes to a `shared` bucket for its project, with the user count. It is never
-  split by guesswork.
+- **Once per session, keyed by user set.** A session's usage counts once, never once per user. Each session falls in
+  exactly one bucket, keyed by its sorted set of user ids: a one-person set is that person, a set of several users is a
+  `shared` bucket carrying the sorted ids, and an empty set is `unattributed`. Nothing is split by guesswork. At most
+  200 user-set buckets per scope (largest first by session count), with an `other` remainder so totals still add up.
+  The ids are Control user ids the reader already scopes by. A consumer such as Control can group these buckets into
+  teams itself.
 - **Parent and child.** A delegated child's usage counts under the child only. The parent's own usage excludes it,
   provided the producer reports them separately. If a harness reports a rolled-up parent total, the parent is marked
   `includesChildren` and its children are excluded from the sum. The producer must state which applies, per source.
@@ -73,7 +76,8 @@ Output: an optional `spend` block in a later contract version (not part of `/1` 
   pointer key adds the machine id. A resume from the same machine and user updates the same pointer.
 - **People.** `userIds` is server-written: the distinct users of the session's live upload pointers. It is NOT stable:
   every projection replaces it, a tombstone empties it, and a user erase removes that user. Attribution is therefore
-  computed at read time, and each stored sum records the `userIds` it used. Two users uploading the same session give
+  computed at read time in the read API, scoped by the caller's read token, and each stored sum records the `userIds`
+  it used. Two users uploading the same session give
   one row with both users: the `shared` bucket. A session with no users goes to an `unattributed` bucket.
 - **Projects.** `projectId` is client-declared, not a server identity. It matches across machines only when clients
   send the same key, and it is null until the catalog projection runs. Sums by project are labelled "as declared". A
