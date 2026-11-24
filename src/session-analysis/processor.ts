@@ -205,7 +205,7 @@ function causedBy(error: unknown, code: string): boolean {
 
 /** A controlled failure code and whether it is retried (relayhistory runSessionJob). */
 export function classifyAnalysisFailure(error: unknown): { code: string; retryable: boolean } {
-  // A store that answered a redirect (the Azure store never follows one: azure-blob-erasure/eraser.ts
+  // A store that answered a redirect (the Azure store never follows one: shared/azure-blob-settings.ts
   // azureNoRedirectFetch) is misconfigured, not transient: retrying would only burn attempts.
   if (causedBy(error, "azure_redirect")) return { code: "analysis_store_redirect", retryable: false };
   if (error instanceof UnsupportedAnalysisJobError) return { code: error.message, retryable: false };
