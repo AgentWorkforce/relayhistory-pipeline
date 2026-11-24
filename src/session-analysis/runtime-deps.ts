@@ -32,6 +32,11 @@ export interface AnalysisRuntimeInputs {
   transact: <T>(work: (tx: SqlExecutor) => Promise<T>) => Promise<T>;
   /** The pipeline bucket's store: canonical reads and normalized/session-analysis-v2/* puts. */
   store: ObjectStore;
+  /**
+   * The canonical pointers' storage_provider (canonical.ts refuses any other): "azure" only for the runner on
+   * LOCKER_PROVIDER=azure. Absent: "s3" (the Lambda and the S3 runner, unchanged).
+   */
+  provider?: "azure";
   /** The pipeline (canonical) bucket and ITS region (the signing region, not the caller's). */
   bucket: string;
   region: string;
@@ -50,7 +55,12 @@ export interface AnalysisRuntimeInputs {
    * Credentials for the sweeper's eraser, read on every erase call so each step signs with
    * current credentials (Lambda: the execution role's env; EKS: the Pod Identity cache).
    */
-  credentials: () => AwsCredentials | Promise<AwsCredentials>;
+  credentials?: () => AwsCredentials | Promise<AwsCredentials>;
+  /**
+   * The sweeper's strict paged eraser for a non-S3 store (the Azure Blob eraser), built per call like the S3
+   * one. When set, `credentials` and `eraserFactory` are unused. Absent: createS3Eraser over bucket/region.
+   */
+  pagedEraser?: () => PagedEraser | Promise<PagedEraser>;
   /** SESSION_ANALYSIS_* and SUMMARY_DECISION_RECORDS_ENABLED are read from here. */
   env?: NodeJS.ProcessEnv;
   /** Test-only port; production always uses createS3Eraser. */
@@ -61,11 +71,14 @@ export function analysisTickDeps(inputs: AnalysisRuntimeInputs): AnalysisTickDep
   const env = inputs.env ?? process.env;
   const makeEraser = inputs.eraserFactory ?? createS3Eraser;
   const key = inputs.modelKey;
-  const eraser = async () => makeEraser({
-    bucket: inputs.bucket,
-    region: inputs.region,
-    ...(inputs.endpoint ? { endpoint: inputs.endpoint } : {}),
-    credentials: await inputs.credentials(),
+  const eraser = inputs.pagedEraser ?? (async () => {
+    if (!inputs.credentials) throw Object.assign(new Error("analysis_eraser_credentials_missing"), { code: "analysis_eraser_credentials_missing" });
+    return makeEraser({
+      bucket: inputs.bucket,
+      region: inputs.region,
+      ...(inputs.endpoint ? { endpoint: inputs.endpoint } : {}),
+      credentials: await inputs.credentials(),
+    });
   });
   return {
     config: analysisConfig(env),
@@ -73,7 +86,7 @@ export function analysisTickDeps(inputs: AnalysisRuntimeInputs): AnalysisTickDep
     store: inputs.store,
     canonical: {
       store: inputs.store,
-      provider: "s3",
+      provider: inputs.provider ?? "s3",
       bucket: inputs.bucket,
       prefix: { PIPELINE_ORG_FROM_PREFIX: "true", PIPELINE_KEY_PREFIX: inputs.keyPrefix },
       readerMaxRuleset: inputs.readerMaxRuleset,

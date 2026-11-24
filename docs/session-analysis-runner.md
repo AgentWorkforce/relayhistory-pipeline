@@ -81,7 +81,7 @@ request made before any refusal. The store, the eraser and the check are built f
 | `SESSION_ANALYSIS_S3_SESSION_TOKEN_FILE` or `SESSION_ANALYSIS_S3_SESSION_TOKEN` | no | Optional session token for temporary static keys; at most one source (`s3_session_token_*`) |
 | `SESSION_ANALYSIS_S3_ENDPOINT` | no | Bare origin of an S3-compatible store (the bundled MinIO). Unset is AWS S3 in `SESSION_ANALYSIS_S3_REGION` (the hosted default, unchanged). When set, the store and the sweeper's eraser both use it, path-style, signed for `SESSION_ANALYSIS_S3_REGION` (MinIO's default is `us-east-1`). Allowed: https; http to loopback; http to a Kubernetes Service name `<svc>.<ns>.svc[.cluster.local]` only with `ALLOW_IN_CLUSTER_HTTP=true` (`src/shared/destination-url.ts`, the rule the publisher and the erase job use). No credentials, path, query or fragment. Refusals: `endpoint_invalid` (one code for several causes: plain http outside the allowed cases, in-cluster http without `ALLOW_IN_CLUSTER_HTTP=true`, a path, a query or fragment, userinfo, not a URL), `allow_in_cluster_http_invalid`, and `provider_unsupported` for the GCS API host (any case, with or without a trailing dot) |
 | `SESSION_ANALYSIS_S3_VERSIONING_CHECK` | no | Unset: the startup versioning check runs when `SESSION_ANALYSIS_S3_ENDPOINT` is set or the credentials are `static`, and not on the hosted default (whose role has no `s3:GetBucketVersioning` today). `true` forces it. Any other value refuses (`versioning_check_invalid`). See "Versioning" below |
-| `LOCKER_PROVIDER` | no | Read only to refuse. Unset or `s3`: this S3 path, and the hosted path is unchanged. Any other value refuses startup: `gcs`, `azure` and `fs` as `provider_unsupported` (until their versioned erasers exist, slices S2/S3), anything else as `provider_invalid` |
+| `LOCKER_PROVIDER` | no | Unset or `s3`: this S3 path, and the hosted path is unchanged. `azure`: the Azure Blob path ([below](#azure-blob-slice-s2)). `gcs` and `fs` refuse startup as `provider_unsupported` (until their versioned erasers exist, slice S3), anything else as `provider_invalid` |
 | `ALLOW_IN_CLUSTER_HTTP` | no | Read only when `SESSION_ANALYSIS_S3_ENDPOINT` is set; `true`/`false`/unset, as everywhere |
 | `PIPELINE_KEY_PREFIX` | yes | The bare key root, as the Lambda reads it |
 | `PIPELINE_ORG_FROM_PREFIX` | yes, `true` | The org-prefix layout, as the Lambda requires |
@@ -101,8 +101,8 @@ The runner works against AWS S3 and any S3-compatible store, including the bundl
   same credentials.
 - **Versioning is required.** The orphan-result sweeper erases every version of a ticketed result key by
   exact version id. A bucket that is not versioned cannot be swept correctly.
-- **GCS, Azure and fs are refused** at startup (`provider_unsupported`), pending their versioned erasers
-  (slices S2 and S3).
+- **GCS and fs are refused** at startup (`provider_unsupported`), pending their versioned erasers
+  (slice S3). Azure Blob is slice S2, below.
 
 With no endpoint and Pod Identity (or `role`) the requests are exactly the ones before S1: same URLs
 (virtual-hosted on `s3.<region>.amazonaws.com`), same signing region, same credentials, and no new
@@ -134,6 +134,78 @@ object and need a version delete to clean it up, leaving residue if the pod dies
 `Suspended` directly (a probe on a suspended bucket still sees version ids), and AWS S3 and MinIO both
 implement it. The credentials need `s3:GetBucketVersioning` on the bucket. On the bundled MinIO,
 `SERVICE=locker-init` already enables versioning on the bucket it creates (`src/locker/init.ts`).
+
+### Azure Blob (slice S2)
+
+`LOCKER_PROVIDER=azure` runs the same processor over Azure Blob Storage (`createAzureBlobStore`, Shared Key)
+with the strict Azure eraser (`src/migration/azure-blob-erasure/eraser.ts`) for the sweeper. It is default
+off like everything here: nothing changes unless `LOCKER_PROVIDER` is exactly `azure`, and unset or `s3`
+reads none of the settings below.
+
+| Variable | Required | Meaning |
+| --- | --- | --- |
+| `SESSION_ANALYSIS_AZURE_ACCOUNT` | yes | The storage account: 3-24 lowercase letters or digits (`azure_account_invalid`) |
+| `SESSION_ANALYSIS_AZURE_CONTAINER` | yes | The container, an Azure container name (`azure_container_invalid`). It is the canonical pointers' bucket (`session_index.bucket`), as the Azure Locker writes it |
+| `SESSION_ANALYSIS_AZURE_ENDPOINT` | no | Blob endpoint. Unset: `https://<account>.blob.core.windows.net`. The shared destination policy, as for `SESSION_ANALYSIS_S3_ENDPOINT` (https; loopback http; in-cluster http only with `ALLOW_IN_CLUSTER_HTTP=true`); no credentials, query or fragment; the path is empty or exactly `/<account>` (Azurite's path style). Refusals `azure_endpoint_invalid`, `allow_in_cluster_http_invalid` |
+| `SESSION_ANALYSIS_AZURE_ACCOUNT_KEY_FILE` | yes | Absolute path to a mounted Secret file holding the account key (one trailing newline dropped): strict padded base64 of at least 32 bytes. The only source: a plaintext `SESSION_ANALYSIS_AZURE_ACCOUNT_KEY` refuses (`azure_account_key_plaintext`). Refusals `azure_account_key_missing`, `_unreadable`, `_invalid`. The key is held behind a closure and never appears in a config object, an error or a log line |
+
+With `LOCKER_PROVIDER=azure`, every `SESSION_ANALYSIS_S3_*` setting must be unset (`azure_s3_settings_conflict`).
+Shared Key is the only auth: SAS is out of scope, and Entra workload identity is a later slice.
+
+**Startup proof.** Blob versioning is an account (ARM) setting the data plane cannot read, so the runner proves it
+on the data plane before the pool, the store or a listener exists (`src/session-analysis/blob-versioning.ts`),
+under the reserved prefix `<PIPELINE_KEY_PREFIX>/.runner-probe/session-analysis/` (never a session key; the
+consumer ignores it as `not_a_session_key`):
+
+1. erase any probe leftovers there (a pod killed mid-probe);
+2. put one small create-only probe blob: the answer must carry `x-ms-version-id`;
+3. see it in a List Blobs inventory, erase it through the strict eraser and verify that no copy remains.
+
+| Outcome | Result |
+| --- | --- |
+| version id, erased and verified | starts |
+| no `x-ms-version-id` (versioning off) | refusal `blob_not_versioned` (exit 2) |
+| soft delete keeps the deleted version and the account refuses permanent delete | refusal `blob_soft_delete_retained` (exit 2) |
+| 403 | refusal `blob_auth_refused` (exit 2) |
+| a 3xx anywhere (never followed with credentials) | refusal `blob_versioning_redirect` (exit 2) |
+| other 4xx, a malformed version id, a probe the inventory does not show, or an erase that does not verify | refusal `blob_versioning_unverified` (exit 2) |
+| 5xx, network failure, timeout | error `blob_versioning_unavailable` (exit 1; the pod restarts and retries) |
+
+The key needs read, write, list and delete on the container; the probe proves all four. Like the S3 check it
+runs only at startup.
+
+**Strict erasure.** The sweeper's eraser lists every copy under a prefix with `include=versions,deleted,snapshots`
+and deletes each one by exact identity: snapshots by time, the current version through a base-blob delete
+conditional on its listed ETag (a 412 means a successor became current: nothing is deleted, the step fails, the next
+sweep relists), then the version itself by id, then older versions by id. On an account with blob soft delete,
+a deleted version or snapshot stays listed as soft-deleted and recoverable, so `verifyErased` keeps reporting
+pending. The next pass deletes it with `deletetype=permanent`, which needs the account's permanent-delete
+setting; without that, the eraser fails with `azure_soft_delete_retained` and the ticket is never retired. A
+soft-deleted base blob without a version id can only be undeleted, so it also blocks erasure. Every request
+uses redirect `manual`: a 3xx is `azure_redirect`. Budgets, hard ceilings and checkpoints are the shared
+traversal's (`createPagedEraser`). Azure's continuation marker is opaque, so a checkpoint resumed by a fresh
+eraser relists from the start of the prefix and skips at most 100 provider pages (`azure_resume_unbounded`).
+The sweeper erases one key at a time, so in practice this is one or two pages.
+
+**Version ids.** The Azure adapter (`packages/object-store/src/azure.ts`) reports `x-ms-version-id` as the object
+version from put, head and get, so a published result records the version it created. The sweeper keeps exactly
+that version.
+
+**Not covered yet on Azure.**
+
+- **Jobs come only from the claims scheduler.** The read API's `POST /v1/sessions/:id/analysis` and its result
+  reads use an S3 client (`READ_API_ANALYSIS_BUCKET`). On `LOCKER_PROVIDER=azure` the read API ignores that
+  variable with one startup warning (`read_api_analysis_bucket_ignored_on_azure`), and analysis there stays
+  unconfigured (501 `analysis_not_configured`). Until the follow-up slice S2b, results on Azure are not readable
+  through the read API.
+- **`SUMMARY_DECISION_RECORDS_ENABLED` stays off on Azure** until the self-host operator erase adopts the
+  Azure eraser (its own slice). Today that erase refuses anything but S3.
+- **Proof.** CI (`pg-proof.yml`) runs `runner-store.azurite.test.ts` against Azurite 3.38.0 pinned by digest.
+  With versioning on, it covers the probe, the owned-version sweep and the full erase; with versioning off, the
+  `blob_not_versioned` refusal. Azurite has no soft delete or permanent delete, so those paths are proven only
+  against the in-memory fake server (`azure-blob-eraser.test.ts`, `blob-versioning.test.ts`). **A run against a
+  real Azure storage account (soft delete on and off, permanent delete on and off) is still owed** and is not
+  part of S2.
 
 The runner does not read `OPENAI_BASE_URL`, `AWS_REGION` or the Lambda's
 `SESSION_PIPELINE_SECRET_ARN`. This keeps the model endpoint and the bucket region exactly the

@@ -100,7 +100,8 @@ test("malformed store settings refuse with a named code", async () => {
     [{ SESSION_ANALYSIS_S3_ENDPOINT: ENDPOINT, ALLOW_IN_CLUSTER_HTTP: "yes" }, "allow_in_cluster_http_invalid"],
     [{ SESSION_ANALYSIS_S3_ENDPOINT: "https://storage.googleapis.com" }, "provider_unsupported"],
     [{ LOCKER_PROVIDER: "gcs" }, "provider_unsupported"],
-    [{ LOCKER_PROVIDER: "azure" }, "provider_unsupported"],
+    // azure is its own store contract (runner-azure.test.ts): with S3 settings beside it, it refuses.
+    [{ LOCKER_PROVIDER: "azure" }, "azure_s3_settings_conflict"],
     [{ LOCKER_PROVIDER: "fs" }, "provider_unsupported"],
     [{ LOCKER_PROVIDER: "minio" }, "provider_invalid"],
     [{ SESSION_ANALYSIS_S3_CREDENTIALS: "Static" }, "credentials_mode_invalid"],
@@ -274,8 +275,11 @@ test("the service refuses an unversioned bucket at startup, before anything list
   expect((await done).enabled).toBe(true);
 });
 
-test("LOCKER_PROVIDER gcs, azure and fs refuse the enabled service at startup (exit 2)", async () => {
-  for (const provider of ["gcs", "azure", "fs"]) {
+test("LOCKER_PROVIDER gcs and fs refuse the enabled service at startup (exit 2); azure with S3 settings conflicts", async () => {
+  const azure = await analysisRunnerService(baseEnv({ LOCKER_PROVIDER: "azure" }), { host: "127.0.0.1", port: 0, scrubInit: async () => {} })
+    .then(() => "no_refusal", (e) => (e instanceof AnalysisRunnerRefused ? e.code : String(e)));
+  expect(azure).toBe("azure_s3_settings_conflict");
+  for (const provider of ["gcs", "fs"]) {
     const result = await analysisRunnerService(baseEnv({ LOCKER_PROVIDER: provider }), { host: "127.0.0.1", port: 0, scrubInit: async () => {} })
       .then(() => "no_refusal", (e) => (e instanceof AnalysisRunnerRefused ? e.code : String(e)));
     expect(result).toBe("provider_unsupported");
@@ -369,7 +373,7 @@ test("every refusal fails at startup before any object or database request; the 
     ["suspended bucket", selfhost(secrets), "bucket_not_versioned", versioned("<Status>Suspended</Status>")],
     ["never-versioned bucket", selfhost(secrets), "bucket_not_versioned", versioned("")],
     ["unsupported provider", selfhost({ ...secrets, LOCKER_PROVIDER: "gcs" }), "provider_unsupported", null],
-    ["unsupported provider (azure)", selfhost({ ...secrets, LOCKER_PROVIDER: "azure" }), "provider_unsupported", null],
+    ["azure beside S3 settings", selfhost({ ...secrets, LOCKER_PROVIDER: "azure" }), "azure_s3_settings_conflict", null],
     ["unsupported provider (fs)", selfhost({ ...secrets, LOCKER_PROVIDER: "fs" }), "provider_unsupported", null],
     ["http outside the in-cluster rule", selfhost({ ...secrets, SESSION_ANALYSIS_S3_ENDPOINT: "http://minio.example.test:9000" }), "endpoint_invalid", null],
     ["in-cluster http without the flag", selfhost({ ...secrets, ALLOW_IN_CLUSTER_HTTP: undefined }), "endpoint_invalid", null],

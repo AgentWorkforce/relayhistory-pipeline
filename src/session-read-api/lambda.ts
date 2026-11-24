@@ -14,6 +14,10 @@ import { sqlRelayfacts } from "./relayfacts.ts";
  * Session analysis (lane F1), off unless configured:
  *   READ_API_ANALYSIS_BUCKET   the canonical bucket holding analysis result objects (the
  *                              read role's GET is served; unset = 501 analysis_not_configured).
+ *                              S3 only: with LOCKER_PROVIDER=azure it is ignored (analysis stays
+ *                              unconfigured, no S3 client is built) with one startup warning,
+ *                              read_api_analysis_bucket_ignored_on_azure, until the Locker-store
+ *                              read path (S2b) lands.
  *   "analysis_admit_url"       optional secret field: postgresql://bulls96_analysis_admit:…,
  *                              the separate admission principal; absent = POST 501.
  * POST is accepted for exactly /v1/sessions/:id/analysis; every other method/path is 405.
@@ -720,7 +724,7 @@ export async function readApiDepsFromSecret(secretText: string, env: NodeJS.Proc
       })
     : undefined;
   admitPool?.on("error", (err) => log.error("analysis admit pool error", { error_code: (err as { code?: string }).code ?? "pool_error" }));
-  const analysisBucket = env.READ_API_ANALYSIS_BUCKET?.trim();
+  const analysisBucket = readApiAnalysisBucket(env);
   const analysis = analysisBucket
     ? sqlAnalysisSource(
         poolTenantRunner(pool as never),
@@ -894,3 +898,16 @@ return async function readApiHandler(event: FunctionUrlEvent): Promise<FunctionU
 }
 
 export const handler = createReadApiLambdaHandler();
+
+/**
+ * READ_API_ANALYSIS_BUCKET as the analysis source's S3 bucket, or undefined (analysis unconfigured: 501). On
+ * LOCKER_PROVIDER=azure the S3 result reader does not apply, so the variable is ignored with one coded startup
+ * warning and no S3 client is built; the Azure store path is S2b.
+ */
+export function readApiAnalysisBucket(env: NodeJS.ProcessEnv): string | undefined {
+  const bucket = env.READ_API_ANALYSIS_BUCKET?.trim();
+  if (!bucket) return undefined;
+  if (env.LOCKER_PROVIDER?.trim() !== "azure") return bucket;
+  log.warn("read api analysis not configured", { reason: "read_api_analysis_bucket_ignored_on_azure" });
+  return undefined;
+}

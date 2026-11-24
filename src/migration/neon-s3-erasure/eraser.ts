@@ -133,8 +133,10 @@ export const ERASE_RUN_MAX_VERSIONS = 10_000;
 export const ERASE_RUN_MAX_PAGES = 100;
 const MAX_CURSOR_RESTARTS = 3;
 
-interface StrictPage { entries: ListedVersion[]; truncated: boolean; nextKey?: string; nextVersion?: string }
-type PageFetcher = (prefix: string, keyMarker?: string, versionMarker?: string) => Promise<StrictPage>;
+/** One strict inventory page; when truncated, nextKey/nextVersion name its last entry. */
+export interface StrictPage { entries: ListedVersion[]; truncated: boolean; nextKey?: string; nextVersion?: string }
+/** One bounded provider listing after (keyMarker[, versionMarker]) under `prefix`. */
+export type PageFetcher = (prefix: string, keyMarker?: string, versionMarker?: string) => Promise<StrictPage>;
 const cmpC = (a: string, b: string) => (a < b ? -1 : a > b ? 1 : 0);
 
 /**
@@ -198,8 +200,13 @@ function cutToKey(page: StrictPage, exact: string | null): StrictPage {
   return at < 0 ? page : { entries: page.entries.slice(0, at), truncated: false };
 }
 
-/** The one traversal both stores share (S3 versions, or an unversioned store's keys). */
-function pagedEraser(bucket: string, fetchPage: PageFetcher, removeExact: (list: ListedVersion[]) => Promise<number>): PagedEraser {
+/**
+ * The one traversal every store shares (S3 versions, Azure Blob versions, or an unversioned
+ * store's keys). Exported so another provider's eraser composes it instead of forking it:
+ * `bucket` is the checkpoint binding label, `fetchPage` one strict page, `removeExact` the
+ * exact-identity deletes of one page's selected entries.
+ */
+export function createPagedEraser(bucket: string, fetchPage: PageFetcher, removeExact: (list: ListedVersion[]) => Promise<number>): PagedEraser {
   return {
     async eraseStep(prefix, opts) {
       if (!prefix.endsWith("/")) throw coded("erasure_prefix_shape", "a prefix ends in /");
@@ -330,11 +337,11 @@ function cut<T extends { lastModified?: number }>(list: T[], before?: Date): { e
   return { erase, kept: list.length - erase.length };
 }
 
-const coded = (code: string, message: string) => Object.assign(new Error(message), { code });
+export const coded = (code: string, message: string) => Object.assign(new Error(message), { code });
 
 // S3 inventory is destructive authority. The lightweight value extractor alone
 // cannot distinguish a complete document from truncated/malformed XML.
-function assertInventoryXml(xml: string): void {
+export function assertInventoryXml(xml: string, root = "ListVersionsResult"): void {
   const stack: string[] = []; let at = 0, roots = 0;
   const tags = /<[^>]*>/g; let token: RegExpExecArray | null;
   while ((token = tags.exec(xml))) {
@@ -346,7 +353,7 @@ function assertInventoryXml(xml: string): void {
     if (close) { if (stack.pop() !== close[1]) throw coded("erasure_inventory", "unbalanced version inventory"); continue; }
     const open = /^<([A-Za-z_][\w:.-]*)(?:\s+[A-Za-z_][\w:.-]*=(?:"[^"<>]*"|'[^'<>]*'))*\s*(\/?)>$/.exec(tag);
     if (!open) throw coded("erasure_inventory", "malformed version inventory");
-    if (!stack.length && (++roots !== 1 || open[1] !== "ListVersionsResult")) throw coded("erasure_inventory", "unknown version inventory");
+    if (!stack.length && (++roots !== 1 || open[1] !== root)) throw coded("erasure_inventory", "unknown version inventory");
     if (!open[2]) stack.push(open[1]!);
   }
   if (stack.length || roots !== 1 || xml.slice(at).trim()) throw coded("erasure_inventory", "incomplete version inventory");
@@ -461,7 +468,7 @@ export function createS3Eraser(cfg: S3EraserConfig): Eraser & PreservedVersionEr
     return list.length;
   }
 
-  const paged = pagedEraser(cfg.bucket, (prefix, k, v) => fetchPage(prefix, k, v), (list) =>
+  const paged = createPagedEraser(cfg.bucket, (prefix, k, v) => fetchPage(prefix, k, v), (list) =>
     remove(list.map((v) => ({ key: v.key, versionId: v.versionId, latest: v.latest, deleteMarker: v.deleteMarker }))));
   return {
     eraseStep: paged.eraseStep,
@@ -541,7 +548,7 @@ export function storeEraser(store: ObjectStore): Eraser & PagedEraser {
     const truncated = after.length > 1000;
     return truncated ? { entries, truncated, nextKey: entries[entries.length - 1]!.key, nextVersion: "null" } : { entries, truncated };
   };
-  const paged = pagedEraser("store", fetchPage, async (list) => { for (const v of list) await store.delete(objectKey(v.key)); return list.length; });
+  const paged = createPagedEraser("store", fetchPage, async (list) => { for (const v of list) await store.delete(objectKey(v.key)); return list.length; });
   return {
     eraseStep: paged.eraseStep,
     verifyErased: paged.verifyErased,
