@@ -215,6 +215,18 @@ export interface SessionIngestInputs {
    */
   bufferCommitLockWaitMs?: number;
   /**
+   * INGEST_BUFFER_COMMIT_STATEMENT_BUDGET_MS: the buffered commit (buffer_receipt), and only it, runs in its own explicit
+   * transaction with this statement_timeout (5001..7000 ms) instead of the role's 5 s: 3 round trips instead of 1, all
+   * holding the commit's locks (docs/design/buffer-commit-statement-budget.md). The commit's lock wait (bufferCommitLockWaitMs,
+   * or the role's 2 s) must end at least 1 s before it. Buffered mode only. Omit for unchanged (no var rendered).
+   */
+  bufferCommitBudgetMs?: number;
+  /**
+   * INGEST_BUFFER_TIMEOUT_BUSY: at buffer_intent / buffer_receipt only, a statement timeout (57014) is handled like the lock
+   * wait (bufferLockRetry retries it once, bufferLockBusy answers 429). Buffered mode only. Omit for off (no var rendered).
+   */
+  bufferTimeoutBusy?: "on";
+  /**
    * INGEST_ADVERTISED_MAX_RECORDS: the records-per-batch limit the Worker ADVERTISES (GET /v1/delivery/limits and
    * receipts), an integer from 1 to 500. Acceptance stays 500, so already-persisted batches are never refused.
    * Omit for the default (500 advertised; nothing rendered).
@@ -295,7 +307,9 @@ const AUTHORITY_ENV_KEYS = [
 ] as const;
 /** INGEST_BUFFER_COMMIT_LOCK_WAIT_MS bounds; the same numbers as src/session-ingest/ledger-sql.ts (a test pins them equal). */
 export const STACK_BUFFER_COMMIT_LOCK_WAIT_MS = Object.freeze({ min: 2001, max: 4000 });
-const KEYS = ["custodySource", "privacyAuthority", "expectedGeneration", "overlapGeneration", "acceptanceMode", "accountId", "hyperdriveId", "secretsStoreId", "kmsKeyArn", "maxPerUser", "maxPerOrg", "inlineMaxSessions", "replicaMode", "neonReplicaQueue", "authority", "asyncAdmission", "syncAdmissionFrozenReceipt", "claimLockBusy", "claimTimeoutBusy", "bufferLockBusy", "bufferLockRetry", "inflightLease", "claimLockWaitMs", "bufferCommitLockWaitMs", "advertisedMaxRecords", "originClaimFence", "turnFenceRegister", "neonExit", "uploadConsent", "s3FenceMirror", "httpAdmissionStoppedOrgs"];
+/** INGEST_BUFFER_COMMIT_STATEMENT_BUDGET_MS bounds; the same numbers as src/session-ingest/ledger-sql.ts (a test pins them equal). */
+export const STACK_BUFFER_COMMIT_BUDGET_MS = Object.freeze({ min: 5001, max: 7000, roleLockTimeout: 2000, headroom: 1000 });
+const KEYS = ["custodySource", "privacyAuthority", "expectedGeneration", "overlapGeneration", "acceptanceMode", "accountId", "hyperdriveId", "secretsStoreId", "kmsKeyArn", "maxPerUser", "maxPerOrg", "inlineMaxSessions", "replicaMode", "neonReplicaQueue", "authority", "asyncAdmission", "syncAdmissionFrozenReceipt", "claimLockBusy", "claimTimeoutBusy", "bufferLockBusy", "bufferLockRetry", "inflightLease", "claimLockWaitMs", "bufferCommitLockWaitMs", "bufferCommitBudgetMs", "bufferTimeoutBusy", "advertisedMaxRecords", "originClaimFence", "turnFenceRegister", "neonExit", "uploadConsent", "s3FenceMirror", "httpAdmissionStoppedOrgs"];
 
 function validAuthorityKeyRoot(value: unknown): value is string {
   if (typeof value !== "string" || !/^96bulls\/[A-Za-z0-9][A-Za-z0-9_/-]{0,151}$/.test(value) || value.endsWith("/")) return false;
@@ -420,6 +434,13 @@ export function assertSessionIngestInputs(p: unknown, refuse: (why: string) => n
   if (v.bufferCommitLockWaitMs !== undefined && (typeof v.bufferCommitLockWaitMs !== "number" || !Number.isSafeInteger(v.bufferCommitLockWaitMs) ||
       v.bufferCommitLockWaitMs < STACK_BUFFER_COMMIT_LOCK_WAIT_MS.min || v.bufferCommitLockWaitMs > STACK_BUFFER_COMMIT_LOCK_WAIT_MS.max || v.acceptanceMode !== "buffered"))
     refuse(`sessionIngest.bufferCommitLockWaitMs must be an integer from ${STACK_BUFFER_COMMIT_LOCK_WAIT_MS.min} to ${STACK_BUFFER_COMMIT_LOCK_WAIT_MS.max}, in buffered mode only (omit for the role default)`);
+  if (v.bufferCommitBudgetMs !== undefined && (typeof v.bufferCommitBudgetMs !== "number" || !Number.isSafeInteger(v.bufferCommitBudgetMs) ||
+      v.bufferCommitBudgetMs < STACK_BUFFER_COMMIT_BUDGET_MS.min || v.bufferCommitBudgetMs > STACK_BUFFER_COMMIT_BUDGET_MS.max || v.acceptanceMode !== "buffered"))
+    refuse(`sessionIngest.bufferCommitBudgetMs must be an integer from ${STACK_BUFFER_COMMIT_BUDGET_MS.min} to ${STACK_BUFFER_COMMIT_BUDGET_MS.max}, in buffered mode only (omit for unchanged)`);
+  if (typeof v.bufferCommitBudgetMs === "number" && (typeof v.bufferCommitLockWaitMs === "number" ? v.bufferCommitLockWaitMs : STACK_BUFFER_COMMIT_BUDGET_MS.roleLockTimeout) > v.bufferCommitBudgetMs - STACK_BUFFER_COMMIT_BUDGET_MS.headroom)
+    refuse("sessionIngest.bufferCommitLockWaitMs must end at least 1000 ms before sessionIngest.bufferCommitBudgetMs");
+  if (v.bufferTimeoutBusy !== undefined && (v.bufferTimeoutBusy !== "on" || v.acceptanceMode !== "buffered"))
+    refuse('sessionIngest.bufferTimeoutBusy must be "on", in buffered mode only (omit for off)');
   if (v.advertisedMaxRecords !== undefined && (typeof v.advertisedMaxRecords !== "number" || !Number.isSafeInteger(v.advertisedMaxRecords) || v.advertisedMaxRecords < 1 || v.advertisedMaxRecords > 500))
     refuse("sessionIngest.advertisedMaxRecords must be an integer from 1 to 500 (omit for the default 500)");
   if (v.originClaimFence !== undefined && (v.originClaimFence !== "on" || v.acceptanceMode !== "buffered"))
@@ -475,6 +496,8 @@ export function sessionIngestVars(p: SessionIngestInputs) {
     ...(p.inflightLease === "observe" || p.inflightLease === "on" ? { INGEST_INFLIGHT_LEASE: p.inflightLease } : {}),
     ...(p.claimLockWaitMs !== undefined ? { INGEST_CLAIM_LOCK_WAIT_MS: String(p.claimLockWaitMs) } : {}),
     ...(p.bufferCommitLockWaitMs !== undefined ? { INGEST_BUFFER_COMMIT_LOCK_WAIT_MS: String(p.bufferCommitLockWaitMs) } : {}),
+    ...(p.bufferCommitBudgetMs !== undefined ? { INGEST_BUFFER_COMMIT_STATEMENT_BUDGET_MS: String(p.bufferCommitBudgetMs) } : {}),
+    ...(p.bufferTimeoutBusy === "on" ? { INGEST_BUFFER_TIMEOUT_BUSY: "on" } : {}),
     ...(p.advertisedMaxRecords !== undefined ? { INGEST_ADVERTISED_MAX_RECORDS: String(p.advertisedMaxRecords) } : {}),
     ...(p.originClaimFence === "on" ? { INGEST_ORIGIN_CLAIM_FENCE: "on" } : {}),
     ...(p.turnFenceRegister === "on" ? { INGEST_TURN_FENCE_REGISTER: "on" } : {}),

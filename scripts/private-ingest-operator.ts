@@ -912,6 +912,33 @@ export function bufferCommitLockWaitDeletionAllowed(
     proposedEnv?.INGEST_BUFFER_COMMIT_LOCK_WAIT_MS === undefined &&
     typeof live === "string" && /^[1-9][0-9]{3}$/u.test(live) && Number(live) >= 2001 && Number(live) <= 4000;
 }
+/**
+ * The only plan that may unbind INGEST_BUFFER_COMMIT_STATEMENT_BUDGET_MS (rollback to the single statement): the
+ * candidate omits bufferCommitBudgetMs, nothing is proposed, and the live value is exactly four digits in 5001..7000.
+ */
+export function bufferCommitBudgetDeletionAllowed(
+  sessionIngest: CloudflareStageInputs["sessionIngest"],
+  currentEnv: Record<string, unknown> | undefined,
+  proposedEnv: Record<string, unknown> | undefined,
+): boolean {
+  const live = currentEnv?.INGEST_BUFFER_COMMIT_STATEMENT_BUDGET_MS;
+  return sessionIngest.bufferCommitBudgetMs === undefined &&
+    proposedEnv?.INGEST_BUFFER_COMMIT_STATEMENT_BUDGET_MS === undefined &&
+    typeof live === "string" && /^[1-9][0-9]{3}$/u.test(live) && Number(live) >= 5001 && Number(live) <= 7000;
+}
+/**
+ * The only plan that may unbind INGEST_BUFFER_TIMEOUT_BUSY (rollback to off): the candidate omits bufferTimeoutBusy,
+ * nothing is proposed, and the live value is exactly "on" (no trim, no case folding).
+ */
+export function bufferTimeoutBusyDeletionAllowed(
+  sessionIngest: CloudflareStageInputs["sessionIngest"],
+  currentEnv: Record<string, unknown> | undefined,
+  proposedEnv: Record<string, unknown> | undefined,
+): boolean {
+  return sessionIngest.bufferTimeoutBusy === undefined &&
+    proposedEnv?.INGEST_BUFFER_TIMEOUT_BUSY === undefined &&
+    currentEnv?.INGEST_BUFFER_TIMEOUT_BUSY === "on";
+}
 export function assertOperatorSnapshot(
   snapshot: any,
   input: CloudflareStageInputs,
@@ -1082,6 +1109,16 @@ export function assertOperatorSnapshot(
             if (!bufferCommitLockWaitDeletionAllowed(input.sessionIngest, currentEnv, proposedEnv))
               refuse("native_binding_target");
             deletedValue = currentEnv.INGEST_BUFFER_COMMIT_LOCK_WAIT_MS;
+          } else if (b.sid === "INGEST_BUFFER_COMMIT_STATEMENT_BUDGET_MS") {
+            // Rolling the commit's own statement budget back to the single statement: only a strict, in-range live value.
+            if (!bufferCommitBudgetDeletionAllowed(input.sessionIngest, currentEnv, proposedEnv))
+              refuse("native_binding_target");
+            deletedValue = currentEnv.INGEST_BUFFER_COMMIT_STATEMENT_BUDGET_MS;
+          } else if (b.sid === "INGEST_BUFFER_TIMEOUT_BUSY") {
+            // Rolling the buffer-stage statement-timeout class back to off: only a strict live "on".
+            if (!bufferTimeoutBusyDeletionAllowed(input.sessionIngest, currentEnv, proposedEnv))
+              refuse("native_binding_target");
+            deletedValue = currentEnv.INGEST_BUFFER_TIMEOUT_BUSY;
           } else {
             refuse("native_binding_target");
           }

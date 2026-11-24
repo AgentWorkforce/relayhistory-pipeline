@@ -975,6 +975,28 @@ describe("session ingest: INGEST_BUFFER_COMMIT_LOCK_WAIT_MS (bufferCommitLockWai
   });
 });
 
+describe("session ingest: unit C (bufferCommitBudgetMs, bufferTimeoutBusy; default absent, buffered only)", () => {
+  const buffered: SessionIngestInputs = { ...inputs, acceptanceMode: "buffered", expectedGeneration: "a".repeat(64), inlineMaxSessions: 0, asyncAdmission: "off" };
+  it("omitted: no var, props byte-identical", () => {
+    for (const p of [inputs, buffered]) {
+      for (const n of ["INGEST_BUFFER_COMMIT_STATEMENT_BUDGET_MS", "INGEST_BUFFER_TIMEOUT_BUSY"]) expect(Object.hasOwn(sessionIngestVars(p), n)).toBe(false);
+      expect(JSON.stringify(props(p))).toBe(JSON.stringify(props({ ...p, bufferCommitBudgetMs: undefined, bufferTimeoutBusy: undefined })));
+    }
+  });
+  it("set in buffered acceptance: exactly one more var each", () => {
+    for (const ms of [5001, 6000, 7000]) expect(sessionIngestVars({ ...buffered, bufferCommitBudgetMs: ms })).toEqual({ ...sessionIngestVars(buffered), INGEST_BUFFER_COMMIT_STATEMENT_BUDGET_MS: String(ms) });
+    expect(sessionIngestVars({ ...buffered, bufferTimeoutBusy: "on" })).toEqual({ ...sessionIngestVars(buffered), INGEST_BUFFER_TIMEOUT_BUSY: "on" });
+    expect(() => assertSessionIngestInputs({ ...buffered, bufferCommitBudgetMs: 5001, bufferCommitLockWaitMs: 4000, bufferTimeoutBusy: "on", bufferLockBusy: "on", bufferLockRetry: "on" }, refuse)).not.toThrow();
+  });
+  it("is refused outside its range, outside buffered acceptance, for any other flag value", () => {
+    const why = "sessionIngest.bufferCommitBudgetMs must be an integer from 5001 to 7000, in buffered mode only (omit for unchanged)";
+    for (const v of [5000, 7001, 6000.5, "6000", null, true]) expect(() => assertSessionIngestInputs({ ...buffered, bufferCommitBudgetMs: v } as never, refuse)).toThrow(why);
+    expect(() => assertSessionIngestInputs({ ...inputs, acceptanceMode: "canonical", bufferCommitBudgetMs: 6000 }, refuse)).toThrow(why);
+    for (const v of ["off", "ON", true, ""]) expect(() => assertSessionIngestInputs({ ...buffered, bufferTimeoutBusy: v } as never, refuse)).toThrow('sessionIngest.bufferTimeoutBusy must be "on", in buffered mode only (omit for off)');
+    expect(() => assertSessionIngestInputs({ ...inputs, acceptanceMode: "canonical", bufferTimeoutBusy: "on" }, refuse)).toThrow("bufferTimeoutBusy");
+  });
+});
+
 describe("session ingest: INGEST_ADVERTISED_MAX_RECORDS (advertisedMaxRecords, default absent)", () => {
   it("omitted: no INGEST_ADVERTISED_MAX_RECORDS var, props byte-identical to a stack without the input", () => {
     expect(Object.hasOwn(sessionIngestVars(inputs), "INGEST_ADVERTISED_MAX_RECORDS")).toBe(false);

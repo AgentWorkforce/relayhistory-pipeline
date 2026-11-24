@@ -78,6 +78,17 @@
  *                              statement_timeout is unchanged and still caps the whole statement: a wait that reaches
  *                              it ends 57014 (ledger_timeout), not 55P03. docs/design/buffer-commit-lock-wait.md.
  *                              Rendered only from sessionIngest.bufferCommitLockWaitMs
+ *   INGEST_BUFFER_COMMIT_STATEMENT_BUDGET_MS  unset (default) | 5001..7000 (buffered only; exactly four digits; an
+ *                              empty or any other value refuses the settings): the buffer_receipt commit, and only it,
+ *                              runs in its own explicit transaction (BEGIN + SET LOCAL statement_timeout, lock_timeout
+ *                              when INGEST_BUFFER_COMMIT_LOCK_WAIT_MS is set, idle_in_transaction 1 s; the call; COMMIT:
+ *                              3 round trips instead of 1) so its statement budget is this many ms instead of the role's
+ *                              5 s (ledger-sql.ts inBufferCommitBudget; docs/design/buffer-commit-statement-budget.md).
+ *                              Rendered only from sessionIngest.bufferCommitBudgetMs
+ *   INGEST_BUFFER_TIMEOUT_BUSY unset/off (default) | on (any case; buffered acceptance only): at buffer_intent /
+ *                              buffer_receipt only, a statement timeout (ledger_timeout, SQLSTATE 57014 by code) is
+ *                              handled like the lock wait: retried once under INGEST_BUFFER_LOCK_RETRY, 429 with
+ *                              Retry-After 5-10 s under INGEST_BUFFER_LOCK_BUSY. Rendered only from sessionIngest.bufferTimeoutBusy: "on"
  *   INGEST_ORIGIN_CLAIM_FENCE  unset/off (default) | on (any case; buffered acceptance only): the buffered claim,
  *                              stage prepare and commit call the 20261105062010 origin-scoped entry points
  *                              (ledger-sql.ts originClaimFence, docs/design/per-origin-claim-fence.md), so one
@@ -129,7 +140,7 @@ import { dbClientErrorFields } from "./db-error-class.ts";
 import { assertNoNeonEdge, neonExitProfile, NeonExitRefusal } from "../shared/neon-exit.ts";
 import { createIngestApp } from "./app.ts";
 import { httpAdmissionStoppedOrgs } from "./http-admission-stop.ts";
-import { BUFFER_COMMIT_LOCK_WAIT_MS_MAX, BUFFER_COMMIT_LOCK_WAIT_MS_MIN, CLAIM_LOCK_WAIT_MS_MAX, CLAIM_LOCK_WAIT_MS_MIN, sqlLedger } from "./ledger-sql.ts";
+import { BUFFER_COMMIT_BUDGET_MS_MAX, BUFFER_COMMIT_BUDGET_MS_MIN, BUFFER_COMMIT_BUDGET_HEADROOM_MS, ROLE_LOCK_TIMEOUT_MS, BUFFER_COMMIT_LOCK_WAIT_MS_MAX, BUFFER_COMMIT_LOCK_WAIT_MS_MIN, CLAIM_LOCK_WAIT_MS_MAX, CLAIM_LOCK_WAIT_MS_MIN, sqlLedger } from "./ledger-sql.ts";
 import type { ReplicaMode, ReplicaSink, NeonReplicaMessage } from "./replica.ts";
 import { fanout, type FanoutMessage } from "./staging.ts";
 import type { StageLatencyFields } from "./deliver.ts";
@@ -222,6 +233,10 @@ export interface IngestWorkerEnv {
   INGEST_ORIGIN_CLAIM_FENCE?: string;
   /** 2001..4000 ms, four digits exactly, buffered only: the buffered commit's own lock wait (ledger-sql.ts). Unset (default): the role's lock_timeout. */
   INGEST_BUFFER_COMMIT_LOCK_WAIT_MS?: string;
+  /** 5001..7000 ms, four digits exactly, buffered only: the buffered commit's own statement budget (ledger-sql.ts inBufferCommitBudget). Unset (default): unchanged. */
+  INGEST_BUFFER_COMMIT_STATEMENT_BUDGET_MS?: string;
+  /** "on" (any case), buffered only: a buffer-stage 57014 joins the lock class for retry / busy (deliver.ts). Default off. */
+  INGEST_BUFFER_TIMEOUT_BUSY?: string;
   /** "on" (any case): register turn writers and serve the turn-fence capability receipt. Buffered only; default off. */
   INGEST_TURN_FENCE_REGISTER?: string;
   /** Operator per-session erase route (session-erase.ts): exactly "1" enables; unset, "" or "0" is off (default). */
@@ -273,6 +288,18 @@ export function bufferCommitLockWaitMs(raw: string): number {
   if (!/^[1-9][0-9]{3}$/u.test(raw)) refuse();
   const n = Number(raw);
   if (n < BUFFER_COMMIT_LOCK_WAIT_MS_MIN || n > BUFFER_COMMIT_LOCK_WAIT_MS_MAX) refuse();
+  return n;
+}
+
+/**
+ * INGEST_BUFFER_COMMIT_STATEMENT_BUDGET_MS: exactly four decimal digits (no trim), then 5001..7000. Never echoes
+ * the value; a refusal fails the settings (every request 503 not_configured).
+ */
+export function bufferCommitBudgetMs(raw: string): number {
+  const refuse = () => { throw new Error(`session ingest: INGEST_BUFFER_COMMIT_STATEMENT_BUDGET_MS must be an integer from ${BUFFER_COMMIT_BUDGET_MS_MIN} to ${BUFFER_COMMIT_BUDGET_MS_MAX} (buffered acceptance only)`); };
+  if (!/^[1-9][0-9]{3}$/u.test(raw)) refuse();
+  const n = Number(raw);
+  if (n < BUFFER_COMMIT_BUDGET_MS_MIN || n > BUFFER_COMMIT_BUDGET_MS_MAX) refuse();
   return n;
 }
 
@@ -335,6 +362,10 @@ export interface IngestSettings {
   originClaimFence?: true;
   /** INGEST_BUFFER_COMMIT_LOCK_WAIT_MS (2001..4000, buffered only): the buffered commit's own lock wait (ledger-sql.ts). Absent (the default): the role's lock_timeout. */
   bufferCommitLockWaitMs?: number;
+  /** INGEST_BUFFER_COMMIT_STATEMENT_BUDGET_MS (5001..7000, buffered only): the buffered commit's own statement budget. Absent (the default): unchanged. */
+  bufferCommitBudgetMs?: number;
+  /** INGEST_BUFFER_TIMEOUT_BUSY=on (buffered only): a buffer-stage 57014 joins the lock class (deliver.ts). Absent (the default): 503, unchanged. */
+  bufferTimeoutBusy?: true;
   /** INGEST_TURN_FENCE_REGISTER=on (buffered only): turn writer registration + receipt. Absent (the default): old route behavior. */
   turnFenceRegister?: true;
   /** INGEST_ASYNC_ADMISSION: absent = off (the default). */
@@ -397,6 +428,13 @@ export async function ingestSettings(env: IngestWorkerEnv): Promise<IngestSettin
   // Present means set: an empty value refuses like any other malformed one (the stack never renders it empty).
   const commitLockWait = env.INGEST_BUFFER_COMMIT_LOCK_WAIT_MS === undefined ? undefined : bufferCommitLockWaitMs(env.INGEST_BUFFER_COMMIT_LOCK_WAIT_MS);
   if (commitLockWait !== undefined && acceptanceMode !== "buffered") throw new Error("session ingest: INGEST_BUFFER_COMMIT_LOCK_WAIT_MS needs buffered acceptance");
+  const commitBudget = env.INGEST_BUFFER_COMMIT_STATEMENT_BUDGET_MS === undefined ? undefined : bufferCommitBudgetMs(env.INGEST_BUFFER_COMMIT_STATEMENT_BUDGET_MS);
+  if (commitBudget !== undefined && acceptanceMode !== "buffered") throw new Error("session ingest: INGEST_BUFFER_COMMIT_STATEMENT_BUDGET_MS needs buffered acceptance");
+  // The lock wait must end before the budget does (with headroom), or a long wait ends 57014 instead of 55P03.
+  if (commitBudget !== undefined && (commitLockWait ?? ROLE_LOCK_TIMEOUT_MS) > commitBudget - BUFFER_COMMIT_BUDGET_HEADROOM_MS)
+    throw new Error("session ingest: INGEST_BUFFER_COMMIT_LOCK_WAIT_MS must end at least 1000 ms before INGEST_BUFFER_COMMIT_STATEMENT_BUDGET_MS");
+  const timeoutBusy = routingFlag(env.INGEST_BUFFER_TIMEOUT_BUSY);
+  if (timeoutBusy && acceptanceMode !== "buffered") throw new Error("session ingest: INGEST_BUFFER_TIMEOUT_BUSY needs buffered acceptance");
   const turnFenceRegister = routingFlag(env.INGEST_TURN_FENCE_REGISTER);
   if (turnFenceRegister && acceptanceMode !== "buffered") throw new Error("session ingest: INGEST_TURN_FENCE_REGISTER needs buffered acceptance");
   // Async admission without its queue would refuse every opted-in batch: not configured.
@@ -462,6 +500,8 @@ export async function ingestSettings(env: IngestWorkerEnv): Promise<IngestSettin
     ...(env.INGEST_CLAIM_LOCK_WAIT_MS ? { claimLockWaitMs: claimLockWaitMs(env.INGEST_CLAIM_LOCK_WAIT_MS) } : {}),
     ...(originClaimFence ? { originClaimFence: true as const } : {}),
     ...(commitLockWait !== undefined ? { bufferCommitLockWaitMs: commitLockWait } : {}),
+    ...(commitBudget !== undefined ? { bufferCommitBudgetMs: commitBudget } : {}),
+    ...(timeoutBusy ? { bufferTimeoutBusy: true as const } : {}),
     ...(turnFenceRegister ? { turnFenceRegister: true as const } : {}),
     ...(asyncMode !== "off" ? { asyncAdmission: asyncMode } : {}),
     ...(syncFrozenReceipt === "on" ? { syncAdmissionFrozenReceipt: true as const } : {}),
@@ -524,7 +564,7 @@ function custodyConfig(env: IngestWorkerEnv) {
 /** The deliver deps for one invocation (request or admission consumer): the same ledger, slots and target. */
 export function deliverDepsFor(settings: IngestSettings, run: Run, target: WriteTarget, replica?: ReplicaSink): DeliverDeps {
   return {
-    ledger: sqlLedger(run, {acceptanceMode:settings.acceptanceMode,expectedGeneration:settings.expectedGeneration,...(settings.acceptGenerations?{acceptGenerations:settings.acceptGenerations}:{}),...(settings.claimLockWaitMs!==undefined?{claimLockWaitMs:settings.claimLockWaitMs}:{}),...(settings.originClaimFence?{originClaimFence:true}:{}),...(settings.bufferCommitLockWaitMs!==undefined?{bufferCommitLockWaitMs:settings.bufferCommitLockWaitMs}:{})}),
+    ledger: sqlLedger(run, {acceptanceMode:settings.acceptanceMode,expectedGeneration:settings.expectedGeneration,...(settings.acceptGenerations?{acceptGenerations:settings.acceptGenerations}:{}),...(settings.claimLockWaitMs!==undefined?{claimLockWaitMs:settings.claimLockWaitMs}:{}),...(settings.originClaimFence?{originClaimFence:true}:{}),...(settings.bufferCommitLockWaitMs!==undefined?{bufferCommitLockWaitMs:settings.bufferCommitLockWaitMs}:{}),...(settings.bufferCommitBudgetMs!==undefined?{bufferCommitBudgetMs:settings.bufferCommitBudgetMs}:{})}),
     acceptanceMode:settings.acceptanceMode,
     target,
     replica,
@@ -542,6 +582,7 @@ export function deliverDepsFor(settings: IngestSettings, run: Run, target: Write
     ...(settings.claimTimeoutBusy ? { claimTimeoutBusy: true as const } : {}),
     ...(settings.bufferLockBusy ? { bufferLockBusy: true as const } : {}),
     ...(settings.bufferLockRetry ? { bufferLockRetry: true as const } : {}),
+    ...(settings.bufferTimeoutBusy ? { bufferTimeoutBusy: true as const } : {}),
     ...(settings.advertisedMaxRecords !== undefined ? { advertisedMaxRecords: settings.advertisedMaxRecords } : {}),
   };
 }

@@ -382,6 +382,9 @@ underlying lock contention.
 read by the self-host server either: it lengthens the buffered commit's own lock
 wait, a stage self-host never runs
 (`docs/design/buffer-commit-lock-wait.md`).
+`INGEST_BUFFER_COMMIT_STATEMENT_BUDGET_MS` and `INGEST_BUFFER_TIMEOUT_BUSY`
+(hosted Worker only, default off) are not read by the self-host server for the
+same reason (`docs/design/buffer-commit-statement-budget.md`).
 
 `INGEST_ADVERTISED_MAX_RECORDS` (hosted Worker only, default off) is not read by
 the self-host server, which keeps publishing `maxRecords` 500. On the Worker it

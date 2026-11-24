@@ -247,6 +247,10 @@ jobs:
         env:
           SESSION_INGEST_TEST_PG_URL: postgres://postgres@127.0.0.1:5432/postgres
         run: bun test --timeout 300000 src/session-ingest/__tests__/buffer-commit-lock-wait.postgres.test.ts
+      - name: Prove the buffered commit's own statement budget (INGEST_BUFFER_COMMIT_STATEMENT_BUDGET_MS) in its own transaction, connection hygiene and outcome certainty
+        env:
+          SESSION_INGEST_TEST_PG_URL: postgres://postgres@127.0.0.1:5432/postgres
+        run: bun test --timeout 600000 src/session-ingest/__tests__/buffer-commit-statement-budget.postgres.test.ts
       - name: Prove the 062210 T2 staged ACK gate row under a non-superuser owner (fence, try-lock setters, RR/SERIALIZABLE races, seat upgrade, lifecycle and rollback quiescence; held candidate, gate off)
         env:
           # The fixture superuser only provisions the owner role and its database (owner-role-harness.ts); everything

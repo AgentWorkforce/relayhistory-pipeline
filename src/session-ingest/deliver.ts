@@ -60,7 +60,9 @@ import {validatedCustodyAck} from "./custody-ack.ts";
  * `buffer_receipt` commit's per-lock wait to 2001..4000 ms inside the same one statement. The 5 s
  * statement_timeout is unchanged and still bounds each attempt, so the bounds above hold; a failed attempt
  * holds its connection up to the configured wait instead of 2 s, and a wait that reaches the statement budget
- * ends 57014 (`ledger_timeout`), which this stage neither retries nor converts.
+ * ends 57014 (`ledger_timeout`), which this stage neither retries nor converts unless INGEST_BUFFER_TIMEOUT_BUSY is on.
+ * INGEST_BUFFER_COMMIT_STATEMENT_BUDGET_MS (default unset; ledger-sql.ts inBufferCommitBudget) gives the commit its own
+ * statement budget (5001..7000 ms) in its own transaction; each commit attempt is then bounded by that instead of 5 s.
  */
 import { log } from "../shared/log.ts";
 import type { Ledger, LedgerTenant, RevisionConflict, SlotRequest } from "./ledger.ts";
@@ -161,6 +163,14 @@ export interface DeliverDeps {
    * Every other cause and stage is never retried. Unset (the default): one call, unchanged.
    */
   bufferLockRetry?: true;
+  /**
+   * INGEST_BUFFER_TIMEOUT_BUSY=on (buffered acceptance): at `buffer_intent` / `buffer_receipt` only, a failure with
+   * cause `ledger_timeout` and SQLSTATE 57014 BY CODE (a name-only client timeout never qualifies) is handled like the
+   * lock wait above: retried once with `bufferLockRetry`, answered 429 BufferLockBusy with `bufferLockBusy`. The
+   * route line keeps `error_code: ledger_timeout` / `db_error_code: 57014`, so the classes stay separable. Without
+   * either of those flags it changes nothing. Unset (the default): a 57014 there stays the 503, unchanged.
+   */
+  bufferTimeoutBusy?: true;
   /**
    * INGEST_ADVERTISED_MAX_RECORDS (advertised-limits.ts): the maxRecords this Worker publishes in receipts and on
    * GET /v1/delivery/limits. Advertising only: acceptance stays MAX_DELIVERY_RECORDS. Unset (the default): 500.
@@ -443,8 +453,10 @@ function bufferLockRetryLine(deps: Pick<DeliverDeps, "bufferLockRetryLog">, fiel
   try { (deps.bufferLockRetryLog ?? ((f: BufferLockRetryFields) => log.warn("session ingest buffer lock retry", { ...f })))(fields); } catch { /* diagnostic only */ }
 }
 
-const isBufferLockWait = (error: unknown, stage: BufferLockStage): error is IngestUnavailable =>
-  error instanceof IngestUnavailable && error.stage === stage && error.cause_code === "ledger_lock_timeout";
+/** The failures a buffer stage retries / converts: its lock wait, and with `timeoutBusy` its statement timeout (57014 by code). */
+const isBufferLockWait = (error: unknown, stage: BufferLockStage, timeoutBusy?: true): error is IngestUnavailable =>
+  error instanceof IngestUnavailable && error.stage === stage &&
+  (error.cause_code === "ledger_lock_timeout" || (timeoutBusy === true && isClaimStatementTimeout(error)));
 
 /**
  * A buffered ledger stage (`buffer_intent` / `buffer_receipt`). Neither flag (the default): exactly the plain
@@ -454,7 +466,7 @@ const isBufferLockWait = (error: unknown, stage: BufferLockStage): error is Inge
  * failure still standing is a 429 BufferLockBusy. Every other error propagates unchanged.
  */
 async function bufferLedgerStage<T>(
-  deps: Pick<DeliverDeps, "stageLatency" | "bufferLockBusy" | "bufferLockRetry" | "random" | "sleep" | "bufferLockRetryLog">,
+  deps: Pick<DeliverDeps, "stageLatency" | "bufferLockBusy" | "bufferLockRetry" | "bufferTimeoutBusy" | "random" | "sleep" | "bufferLockRetryLog">,
   name: BufferLockStage,
   work: () => Promise<T>,
 ): Promise<T> {
@@ -466,7 +478,7 @@ async function bufferLedgerStage<T>(
   } catch (first) {
     error = first;
   }
-  if (deps.bufferLockRetry && isBufferLockWait(error, name)) {
+  if (deps.bufferLockRetry && isBufferLockWait(error, name, deps.bufferTimeoutBusy)) {
     const first = sqlstateOf(error);
     await (deps.sleep ?? ((ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms))))(bufferLockRetryPauseMs(random));
     try {
@@ -481,7 +493,7 @@ async function bufferLedgerStage<T>(
         ...(code ? { error_code: code } : {}), ...(sqlstate ? { sqlstate } : {}) });
     }
   }
-  if (deps.bufferLockBusy && isBufferLockWait(error, name))
+  if (deps.bufferLockBusy && isBufferLockWait(error, name, deps.bufferTimeoutBusy))
     throw new BufferLockBusy(name, error.cause_code, error.db, claimLockRetryAfter(random));
   throw error;
 }

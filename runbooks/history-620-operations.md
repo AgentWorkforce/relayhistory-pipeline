@@ -236,6 +236,20 @@ unbind refuses `native_binding_target`.
   the live value is exactly four digits in range and the deleted binding carries that exact text. It never
   shares a plan with another unbind (below).
 
+- `INGEST_BUFFER_COMMIT_STATEMENT_BUDGET_MS` (stack input `sessionIngest.bufferCommitBudgetMs`, 5001..7000,
+  buffered only; `PRIVATE_INGEST_BUFFER_COMMIT_STATEMENT_BUDGET_MS` four digits or unset/empty, anything else refuses
+  `private_ingest_profile_buffer_commit_budget`): the buffered commit runs in its own explicit transaction (3 round
+  trips instead of 1) with this statement budget. `INGEST_BUFFER_TIMEOUT_BUSY` (stack input
+  `sessionIngest.bufferTimeoutBusy: "on"`, `PRIVATE_INGEST_BUFFER_TIMEOUT_BUSY` `on` or unset/empty, else
+  `private_ingest_profile_buffer_timeout_busy`): a buffer-stage 57014 is retried and answered 429 like the lock wait.
+  With it on, a sustained commit timeout no longer feeds the DB-error alert and is seen only through the lock alert.
+  Turn it on before `INGEST_BUFFER_COMMIT_LOCK_WAIT_MS`. See `docs/design/buffer-commit-statement-budget.md`. Change:
+  set another value, plan, deploy, and the readback shows exactly that value. Rollback of either: unset (or empty), then
+  plan and deploy. Each plan shows one `unbind` admitted only by its own operator predicate
+  (`bufferCommitBudgetDeletionAllowed`: candidate omits the value, nothing proposed, live exactly four digits in range,
+  deleted binding carries that text; `bufferTimeoutBusyDeletionAllowed`: the same with live exactly `on`), and never
+  together with another unbind.
+
 The operator admits at most one unbind per plan (`native_binding_inventory`). Each supported unbind is its
 own plan, deploy and readback of the live Worker; a following unbind is planned only from the live state
 that deploy produced, never two in one plan.

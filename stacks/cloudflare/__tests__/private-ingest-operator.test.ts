@@ -9,7 +9,9 @@ import {
   assertOperatorSnapshot,
   advertisedMaxRecordsDeletionAllowed,
   inflightLeaseDeletionAllowed,
+  bufferCommitBudgetDeletionAllowed,
   bufferCommitLockWaitDeletionAllowed,
+  bufferTimeoutBusyDeletionAllowed,
   bufferLockBusyDeletionAllowed,
   retainedOperatorPlan,
   requireStateAuthority,
@@ -76,7 +78,7 @@ const tools = {
     nativeBindingsSha256: "f".repeat(64),
   };
 const digest = (v: string) => createHash("sha256").update(v).digest("hex");
-async function actualPlanProof(declared: "canonical" | "buffered" | "admission" | "admission-default" | "admission-drain" | "custody" | "custody-shadow" | "custody-shadow-drain" | "frozen-receipt" | "neon-exit" | "advertised" | "inflight" | "buffer-busy" | "buffer-commit-wait") {
+async function actualPlanProof(declared: "canonical" | "buffered" | "admission" | "admission-default" | "admission-drain" | "custody" | "custody-shadow" | "custody-shadow-drain" | "frozen-receipt" | "neon-exit" | "advertised" | "inflight" | "buffer-busy" | "buffer-commit-wait" | "buffer-commit-budget" | "buffer-timeout-busy") {
   // "admission": buffered + asyncAdmission "on" (the three admission resources and two more bindings).
   // "admission-default": buffered with asyncAdmission OMITTED, which resolves to "on" (same as "admission").
   // "admission-drain": buffered + asyncAdmission "drain" (same resources, the var says drain).
@@ -97,15 +99,16 @@ async function actualPlanProof(declared: "canonical" | "buffered" | "admission" 
   const inflight = declared === "inflight";
   const bufferBusy = declared === "buffer-busy";
   const commitWait = declared === "buffer-commit-wait";
+  const commitBudget = declared === "buffer-commit-budget", timeoutBusy = declared === "buffer-timeout-busy";
   const frozenReceipt = declared === "frozen-receipt", custody = declared === "custody" || shadow || frozenReceipt || neonExit;
-  const bindingCount = (admission ? 17 : mode === "buffered" ? 15 : 13) + (custody ? 1 : 0) + (frozenReceipt ? 1 : 0) + (neonExit ? 1 : 0) + (advertised ? 1 : 0) + (inflight ? 1 : 0) + (bufferBusy ? 1 : 0) + (commitWait ? 1 : 0);
+  const bindingCount = (admission ? 17 : mode === "buffered" ? 15 : 13) + (custody ? 1 : 0) + (frozenReceipt ? 1 : 0) + (neonExit ? 1 : 0) + (advertised ? 1 : 0) + (inflight ? 1 : 0) + (bufferBusy ? 1 : 0) + (commitWait ? 1 : 0) + (commitBudget ? 1 : 0) + (timeoutBusy ? 1 : 0);
   const input = {
     ...baseInput,
     sessionIngest: {
       ...baseInput.sessionIngest,
       ...(declared === "admission" ? { asyncAdmission: "on" as const } : {}),
       ...(declared === "admission-drain" ? { asyncAdmission: "drain" as const } : {}),
-      ...(declared === "buffered" || advertised || inflight || bufferBusy || commitWait || custody ? { asyncAdmission: shadowDrain ? "drain" as const : "off" as const } : {}),
+      ...(declared === "buffered" || advertised || inflight || bufferBusy || commitWait || commitBudget || timeoutBusy || custody ? { asyncAdmission: shadowDrain ? "drain" as const : "off" as const } : {}),
       ...(custody ? { custodySource: shadow ? "shadow" as const : "frozen-supabase" as const } : {}),
       ...(frozenReceipt ? { syncAdmissionFrozenReceipt: "on" as const } : {}),
       ...(neonExit ? { neonExit: "on" as const } : {}),
@@ -113,6 +116,8 @@ async function actualPlanProof(declared: "canonical" | "buffered" | "admission" 
       ...(inflight ? { inflightLease: "on" as const } : {}),
       ...(bufferBusy ? { bufferLockBusy: "on" as const } : {}),
       ...(commitWait ? { bufferCommitLockWaitMs: 3000 } : {}),
+      ...(commitBudget ? { bufferCommitBudgetMs: 6000 } : {}),
+      ...(timeoutBusy ? { bufferTimeoutBusy: "on" as const } : {}),
       ...(mode === "buffered"
         ? {
             acceptanceMode: "buffered" as const,
@@ -808,6 +813,114 @@ async function actualPlanProof(declared: "canonical" | "buffered" | "admission" 
         expect(() => assertOperatorSnapshot(at(swapped), omitted)).toThrow("native_binding_target");
       }
     }
+    if (timeoutBusy) {
+      const rowsOf = native.native.resources, worker = rowsOf["session-ingest"];
+      const tbBinding = worker.bindings.find((b: any) => b.sid === "INGEST_BUFFER_TIMEOUT_BUSY");
+      expect(tbBinding.data.bindings[0]).toEqual({ type: "plain_text", name: "INGEST_BUFFER_TIMEOUT_BUSY", text: "on" });
+      expect(worker.props.env.INGEST_BUFFER_TIMEOUT_BUSY).toBe("on");
+      const { INGEST_BUFFER_TIMEOUT_BUSY: _tb, ...unbindEnv } = worker.props.env;
+      const { bufferTimeoutBusy: _flag, ...withoutTb } = input.sessionIngest as any;
+      const omitted = { ...input, sessionIngest: withoutTb };
+      // Rollback to off: live (state) has "on", the candidate omits it, so the plan deletes the binding.
+      const unbindWorker = {
+        ...worker,
+        action: "update",
+        props: { ...worker.props, env: unbindEnv },
+        state: { status: "updated", props: worker.props },
+        bindings: worker.bindings.map((b: any) => b === tbBinding ? { ...b, action: "delete" } : b),
+      };
+      const at = (w: any) => ({ ...native, native: { ...native.native, resources: { ...rowsOf, "session-ingest": w } } });
+      const withLive = (w: any, live: unknown) => ({ ...w, state: { ...w.state, props: {
+        ...w.state.props, env: { ...w.state.props.env, INGEST_BUFFER_TIMEOUT_BUSY: live } } } });
+      const withDeleted = (w: any, value: unknown) => ({ ...w, bindings: w.bindings.map((b: any) =>
+        b.sid !== "INGEST_BUFFER_TIMEOUT_BUSY" ? b : { ...b, data: { bindings: [value] } }) });
+      // Admitted: one delete beyond the candidate's expected inventory, pinned to the live text "on".
+      const admitted = assertOperatorSnapshot(at(unbindWorker), omitted);
+      expect(admitted).toHaveLength(bindingCount);
+      expect(admitted.find((e) => e.sid === "INGEST_BUFFER_TIMEOUT_BUSY")).toEqual({
+        sid: "INGEST_BUFFER_TIMEOUT_BUSY", action: "delete",
+        target: { type: "plain_text", name: "INGEST_BUFFER_TIMEOUT_BUSY", text: "on" },
+      });
+      expect(admitted.filter((e) => e.action === "delete")).toHaveLength(1);
+      // The candidate profile still sets bufferTimeoutBusy: the inventory no longer matches, or (with a retained
+      // row for it as well) the delete names an expected binding.
+      const keeps = { ...input, sessionIngest: { ...withoutTb, bufferTimeoutBusy: "on" } };
+      expect(() => assertOperatorSnapshot(at(unbindWorker), keeps)).toThrow("native_binding_inventory");
+      expect(() => assertOperatorSnapshot(at({ ...unbindWorker, bindings: [...unbindWorker.bindings, {
+        sid: "INGEST_BUFFER_TIMEOUT_BUSY", action: "update",
+        data: { bindings: [{ type: "plain_text", name: "INGEST_BUFFER_TIMEOUT_BUSY", text: "on" }] },
+      }] }), keeps)).toThrow("native_binding_target");
+      // A candidate value that renders no binding ("off") keeps the inventory and wanted checks satisfied, so
+      // only the predicate's profile-omits clause can refuse.
+      expect(() => assertOperatorSnapshot(at(unbindWorker), {
+        ...input, sessionIngest: { ...withoutTb, bufferTimeoutBusy: "off" } } as any)).toThrow("native_binding_target");
+      // The proposed env still carries the variable (any value).
+      expect(() => assertOperatorSnapshot(at({ ...unbindWorker, props: worker.props }), omitted)).toThrow("native_binding_target");
+      for (const proposed of ["off", ""])
+        expect(() => assertOperatorSnapshot(at({ ...unbindWorker, props: { ...worker.props,
+          env: { ...unbindEnv, INGEST_BUFFER_TIMEOUT_BUSY: proposed } } }), omitted)).toThrow("native_binding_target");
+      // Live text other than exactly "on"; the deleted binding is forged to match so only the live-value
+      // check can refuse.
+      for (const live of ["ON", "On", " on", "on ", "off", "observe", "true", "1", "", 1, true, null, undefined]) {
+        expect(() => assertOperatorSnapshot(at(withDeleted(withLive(unbindWorker, live), {
+          type: "plain_text", name: "INGEST_BUFFER_TIMEOUT_BUSY", text: live })), omitted)).toThrow("native_binding_target");
+      }
+      // The native binding differs from the live "on": type mismatch, name mismatch, digest mismatch (other
+      // text, a non-string text, an extra key), or not a plain-text binding at all.
+      for (const value of [
+        { type: "secret_text", name: "INGEST_BUFFER_TIMEOUT_BUSY", text: "on" },
+        { type: "plain_text", name: "FOREIGN", text: "on" },
+        { type: "plain_text", name: "INGEST_BUFFER_LOCK_RETRY", text: "on" },
+        { type: "plain_text", name: "INGEST_BUFFER_TIMEOUT_BUSY", text: "off" },
+        { type: "plain_text", name: "INGEST_BUFFER_TIMEOUT_BUSY", text: "ON" },
+        { type: "plain_text", name: "INGEST_BUFFER_TIMEOUT_BUSY", text: true },
+        { type: "plain_text", name: "INGEST_BUFFER_TIMEOUT_BUSY", text: "on", extra: "x" },
+        { type: "queue", name: "INGEST_BUFFER_TIMEOUT_BUSY", queue_name: "foreign" },
+      ])
+        expect(() => assertOperatorSnapshot(at(withDeleted(unbindWorker, value)), omitted)).toThrow("native_binding_target");
+      // An extra data key on the delete row.
+      expect(() => assertOperatorSnapshot(at({ ...unbindWorker, bindings: unbindWorker.bindings.map((b: any) =>
+        b.sid !== "INGEST_BUFFER_TIMEOUT_BUSY" ? b : { ...b, data: { ...b.data, shim: "x" } }) }), omitted))
+        .toThrow("native_binding_target");
+      // The Worker resource row must be an update.
+      for (const action of ["create", "noop"])
+        expect(() => assertOperatorSnapshot(at({ ...unbindWorker, action }), omitted)).toThrow("native_binding_target");
+      // A second deletion in the same plan, each one admissible on its own, refuses on the single-delete limit.
+      for (const [sid, text] of [["INGEST_INFLIGHT_LEASE", "on"], ["INGEST_ADVERTISED_MAX_RECORDS", "120"]] as const) {
+        const second = {
+          ...unbindWorker,
+          state: { ...unbindWorker.state, props: { ...unbindWorker.state.props, env: {
+            ...unbindWorker.state.props.env, [sid]: text } } },
+          bindings: [...unbindWorker.bindings, { sid, action: "delete",
+            data: { bindings: [{ type: "plain_text", name: sid, text }] } }],
+        };
+        expect(() => assertOperatorSnapshot(at(second), omitted)).toThrow("native_binding_inventory");
+        // Alone, that other deletion is admitted (so only the limit refuses above).
+        const alone = { ...second, props: worker.props,
+          bindings: [...worker.bindings, { sid, action: "delete", data: { bindings: [{ type: "plain_text", name: sid, text }] } }] };
+        expect(assertOperatorSnapshot(at(alone), input).filter((e) => e.action === "delete")).toEqual([
+          { sid, action: "delete", target: { type: "plain_text", name: sid, text } }]);
+      }
+      // No arm for INGEST_CLAIM_LOCK_BUSY (pinned) or INGEST_BUFFER_LOCK_RETRY: a delete of either, with live
+      // "on", nothing proposed, the candidate omitting it, and matching native text, still refuses by name.
+      for (const sid of ["INGEST_CLAIM_LOCK_BUSY", "INGEST_BUFFER_LOCK_RETRY"]) {
+        const foreign = {
+          ...worker,
+          action: "update",
+          state: { status: "updated", props: { ...worker.props, env: { ...worker.props.env, [sid]: "on" } } },
+          bindings: [...worker.bindings, { sid, action: "delete",
+            data: { bindings: [{ type: "plain_text", name: sid, text: "on" }] } }],
+        };
+        expect(() => assertOperatorSnapshot(at(foreign), input)).toThrow("native_binding_target");
+        // The same delete row in place of an admissible buffer BUSY unbind (live BUSY "on" too).
+        const swapped = withLive({ ...unbindWorker,
+          state: { ...unbindWorker.state, props: { ...unbindWorker.state.props, env: {
+            ...unbindWorker.state.props.env, [sid]: "on" } } },
+          bindings: [...worker.bindings.filter((b: any) => b !== tbBinding), { sid, action: "delete",
+            data: { bindings: [{ type: "plain_text", name: sid, text: "on" }] } }] }, "on");
+        expect(() => assertOperatorSnapshot(at(swapped), omitted)).toThrow("native_binding_target");
+      }
+    }
     if (commitWait) {
       const NAME = "INGEST_BUFFER_COMMIT_LOCK_WAIT_MS";
       const rowsOf = native.native.resources, worker = rowsOf["session-ingest"];
@@ -895,6 +1008,97 @@ async function actualPlanProof(declared: "canonical" | "buffered" | "admission" 
           data: { bindings: [{ type: "plain_text", name: NAME, text: "3500" }] } }),
       };
       const updated = assertOperatorSnapshot(at(longer), { ...input, sessionIngest: { ...withoutWait, bufferCommitLockWaitMs: 3500 } });
+      expect(updated.some((e) => e.action === "delete")).toBe(false);
+      expect(updated.find((e) => e.sid === NAME)).toMatchObject({ action: "update" });
+      expect(() => assertOperatorSnapshot(at(longer), input)).toThrow("native_binding_target");
+    }
+    if (commitBudget) {
+      const NAME = "INGEST_BUFFER_COMMIT_STATEMENT_BUDGET_MS";
+      const rowsOf = native.native.resources, worker = rowsOf["session-ingest"];
+      const budgetBinding = worker.bindings.find((b: any) => b.sid === NAME);
+      // Create: the plan binds exactly the plain-text value.
+      expect(budgetBinding.data.bindings[0]).toEqual({ type: "plain_text", name: NAME, text: "6000" });
+      expect(worker.props.env[NAME]).toBe("6000");
+      const { [NAME]: _budget, ...unbindEnv } = worker.props.env;
+      const { bufferCommitBudgetMs: _ms, ...withoutBudget } = input.sessionIngest as any;
+      const omitted = { ...input, sessionIngest: withoutBudget };
+      const unbindWorker = {
+        ...worker,
+        action: "update",
+        props: { ...worker.props, env: unbindEnv },
+        state: { status: "updated", props: worker.props },
+        bindings: worker.bindings.map((b: any) => b === budgetBinding ? { ...b, action: "delete" } : b),
+      };
+      const at = (w: any) => ({ ...native, native: { ...native.native, resources: { ...rowsOf, "session-ingest": w } } });
+      const withLive = (w: any, live: unknown) => ({ ...w, state: { ...w.state, props: {
+        ...w.state.props, env: { ...w.state.props.env, [NAME]: live } } } });
+      const withDeleted = (w: any, value: unknown) => ({ ...w, bindings: w.bindings.map((b: any) =>
+        b.sid !== NAME ? b : { ...b, data: { bindings: [value] } }) });
+      // Delete (rollback to the role default): admitted, pinned to the live text, the only delete.
+      const admitted = assertOperatorSnapshot(at(unbindWorker), omitted);
+      expect(admitted).toHaveLength(bindingCount);
+      expect(admitted.filter((e) => e.action === "delete")).toEqual([
+        { sid: NAME, action: "delete", target: { type: "plain_text", name: NAME, text: "6000" } }]);
+      // Every in-range live value is admitted when the deleted binding carries that exact text.
+      for (const live of ["5001", "6500", "7000"]) {
+        const each = assertOperatorSnapshot(at(withDeleted(withLive(unbindWorker, live), { type: "plain_text", name: NAME, text: live })), omitted);
+        expect(each.find((e) => e.sid === NAME)).toEqual({ sid: NAME, action: "delete", target: { type: "plain_text", name: NAME, text: live } });
+      }
+      // The candidate still sets a value: the inventory no longer matches, or the delete names an expected binding.
+      const keeps = { ...input, sessionIngest: { ...withoutBudget, bufferCommitBudgetMs: 6000 } };
+      expect(() => assertOperatorSnapshot(at(unbindWorker), keeps)).toThrow("native_binding_inventory");
+      expect(() => assertOperatorSnapshot(at({ ...unbindWorker, bindings: [...unbindWorker.bindings, {
+        sid: NAME, action: "update", data: { bindings: [{ type: "plain_text", name: NAME, text: "6000" }] },
+      }] }), keeps)).toThrow("native_binding_target");
+      // The proposed env still carries the variable (any value).
+      expect(() => assertOperatorSnapshot(at({ ...unbindWorker, props: worker.props }), omitted)).toThrow("native_binding_target");
+      for (const proposed of ["6000", "", "9000"])
+        expect(() => assertOperatorSnapshot(at({ ...unbindWorker, props: { ...worker.props,
+          env: { ...unbindEnv, [NAME]: proposed } } }), omitted)).toThrow("native_binding_target");
+      // Malformed or unknown live values; the deleted binding is forged to match, so only the live-value check refuses.
+      for (const live of ["5000", "7001", "4000", "0", "06000", " 6000", "6000 ", "+6000", "6000ms", "6e3", "on", "", 6000, true, null, undefined])
+        expect(() => assertOperatorSnapshot(at(withDeleted(withLive(unbindWorker, live), {
+          type: "plain_text", name: NAME, text: live })), omitted)).toThrow("native_binding_target");
+      // The native binding differs from the live "6000": type, name, text, a non-string text, an extra key, not plain text.
+      for (const value of [
+        { type: "secret_text", name: NAME, text: "6000" },
+        { type: "plain_text", name: "FOREIGN", text: "6000" },
+        { type: "plain_text", name: "INGEST_CLAIM_LOCK_WAIT_MS", text: "6000" },
+        { type: "plain_text", name: NAME, text: "6500" },
+        { type: "plain_text", name: NAME, text: 6000 },
+        { type: "plain_text", name: NAME, text: "6000", extra: "x" },
+        { type: "queue", name: NAME, queue_name: "foreign" },
+      ])
+        expect(() => assertOperatorSnapshot(at(withDeleted(unbindWorker, value)), omitted)).toThrow("native_binding_target");
+      expect(() => assertOperatorSnapshot(at({ ...unbindWorker, bindings: unbindWorker.bindings.map((b: any) =>
+        b.sid !== NAME ? b : { ...b, data: { ...b.data, shim: "x" } }) }), omitted)).toThrow("native_binding_target");
+      for (const action of ["create", "noop"])
+        expect(() => assertOperatorSnapshot(at({ ...unbindWorker, action }), omitted)).toThrow("native_binding_target");
+      // A second deletion in the same plan, each admissible alone, refuses on the single-delete limit.
+      const second = {
+        ...unbindWorker,
+        state: { ...unbindWorker.state, props: { ...unbindWorker.state.props, env: { ...unbindWorker.state.props.env, INGEST_INFLIGHT_LEASE: "on" } } },
+        bindings: [...unbindWorker.bindings, { sid: "INGEST_INFLIGHT_LEASE", action: "delete",
+          data: { bindings: [{ type: "plain_text", name: "INGEST_INFLIGHT_LEASE", text: "on" }] } }],
+      };
+      expect(() => assertOperatorSnapshot(at(second), omitted)).toThrow("native_binding_inventory");
+      // No arm for INGEST_CLAIM_LOCK_WAIT_MS: the same delete row under that sid still refuses by name.
+      const claimWait = {
+        ...worker, action: "update",
+        state: { status: "updated", props: { ...worker.props, env: { ...worker.props.env, INGEST_CLAIM_LOCK_WAIT_MS: "250" } } },
+        bindings: [...worker.bindings, { sid: "INGEST_CLAIM_LOCK_WAIT_MS", action: "delete",
+          data: { bindings: [{ type: "plain_text", name: "INGEST_CLAIM_LOCK_WAIT_MS", text: "250" }] } }],
+      };
+      expect(() => assertOperatorSnapshot(at(claimWait), input)).toThrow("native_binding_target");
+      // Update (the live replacement path, 3000 -> 3500): an update row checked against the candidate alone, no delete.
+      const longer = {
+        ...worker, action: "update",
+        props: { ...worker.props, env: { ...worker.props.env, [NAME]: "6500" } },
+        state: { status: "updated", props: worker.props },
+        bindings: worker.bindings.map((b: any) => b !== budgetBinding ? b : { ...b, action: "update",
+          data: { bindings: [{ type: "plain_text", name: NAME, text: "6500" }] } }),
+      };
+      const updated = assertOperatorSnapshot(at(longer), { ...input, sessionIngest: { ...withoutBudget, bufferCommitBudgetMs: 6500 } });
       expect(updated.some((e) => e.action === "delete")).toBe(false);
       expect(updated.find((e) => e.sid === NAME)).toMatchObject({ action: "update" });
       expect(() => assertOperatorSnapshot(at(longer), input)).toThrow("native_binding_target");
@@ -1104,7 +1308,7 @@ async function actualPlanProof(declared: "canonical" | "buffered" | "admission" 
     await rm(dir, { recursive: true, force: true });
   }
 }
-test.each(["canonical", "buffered", "admission", "admission-default", "admission-drain", "custody", "custody-shadow", "custody-shadow-drain", "frozen-receipt", "neon-exit", "advertised", "inflight", "buffer-busy", "buffer-commit-wait"] as const)(
+test.each(["canonical", "buffered", "admission", "admission-default", "admission-drain", "custody", "custody-shadow", "custody-shadow-drain", "frozen-receipt", "neon-exit", "advertised", "inflight", "buffer-busy", "buffer-commit-wait", "buffer-commit-budget", "buffer-timeout-busy"] as const)(
   "actual original four-resource declaration %s uses authenticated HTTP state and retained plan",
   actualPlanProof,
 );
@@ -1510,6 +1714,52 @@ describe("operatorSafePlans: async admission follows the resolved mode; a deploy
       .toThrow("binding_render_summary");
   });
 
+  test("buffer commit statement budget removal renders one reviewed binding deletion", () => {
+    const unbind = {
+      sid: "INGEST_BUFFER_COMMIT_STATEMENT_BUDGET_MS",
+      action: "delete",
+      target: { type: "plain_text", name: "INGEST_BUFFER_COMMIT_STATEMENT_BUDGET_MS", text: "6000" },
+    };
+    const removal = [queue("noop"), flag("noop", "drain"), unbind];
+    expect(() => run(SEVEN, {}, removal)).not.toThrow();
+    const rendered = plans(SEVEN, {}, removal);
+    expect(rendered.planText).toContain("[session-ingest/INGEST_BUFFER_COMMIT_STATEMENT_BUDGET_MS] unbind");
+    expect(rendered.planText).toContain(", 1 binding changes");
+    const altered = (from: string, to: string) => ({
+      planText: rendered.planText.replace(from, to),
+      detailedText: rendered.detailedText.replace(from, to),
+    });
+    expect(() => operatorSafePlans(altered(
+      "[session-ingest/INGEST_BUFFER_COMMIT_STATEMENT_BUDGET_MS] unbind",
+      "[session-ingest/INGEST_BUFFER_COMMIT_STATEMENT_BUDGET_MS] delete",
+    ), secrets, removal)).toThrow("binding_render_inventory");
+    expect(() => operatorSafePlans(altered(", 1 binding changes", ", 2 binding changes"), secrets, removal))
+      .toThrow("binding_render_summary");
+  });
+
+  test("buffer timeout busy removal renders one reviewed binding deletion", () => {
+    const unbind = {
+      sid: "INGEST_BUFFER_TIMEOUT_BUSY",
+      action: "delete",
+      target: { type: "plain_text", name: "INGEST_BUFFER_TIMEOUT_BUSY", text: "on" },
+    };
+    const removal = [queue("noop"), flag("noop", "drain"), unbind];
+    expect(() => run(SEVEN, {}, removal)).not.toThrow();
+    const rendered = plans(SEVEN, {}, removal);
+    expect(rendered.planText).toContain("[session-ingest/INGEST_BUFFER_TIMEOUT_BUSY] unbind");
+    expect(rendered.planText).toContain(", 1 binding changes");
+    const altered = (from: string, to: string) => ({
+      planText: rendered.planText.replace(from, to),
+      detailedText: rendered.detailedText.replace(from, to),
+    });
+    expect(() => operatorSafePlans(altered(
+      "[session-ingest/INGEST_BUFFER_TIMEOUT_BUSY] unbind",
+      "[session-ingest/INGEST_BUFFER_TIMEOUT_BUSY] delete",
+    ), secrets, removal)).toThrow("binding_render_inventory");
+    expect(() => operatorSafePlans(altered(", 1 binding changes", ", 2 binding changes"), secrets, removal))
+      .toThrow("binding_render_summary");
+  });
+
   test("a refused contract exposes actions only, never binding values", () => {
     let refusal: unknown;
     try {
@@ -1615,6 +1865,43 @@ test("the retained plan unbinds INGEST_INFLIGHT_LEASE only for an omitted candid
   for (const value of ["On", "ON", "Observe", "OBSERVE", " on", "on ", "observe\t", "off", "true", "1", "", 0, 1, null, undefined])
     expect(inflightLeaseDeletionAllowed(profile(), live(value), {})).toBe(false);
   expect(inflightLeaseDeletionAllowed(profile(), undefined, {})).toBe(false);
+});
+test("the retained plan unbinds INGEST_BUFFER_COMMIT_STATEMENT_BUDGET_MS only for an omitted candidate value, nothing proposed and a strict in-range live value", () => {
+  const profile = (extra: Record<string, unknown> = {}) => ({ ...baseInput.sessionIngest, ...extra }) as any;
+  const live = (value: unknown) => ({ INGEST_BUFFER_COMMIT_STATEMENT_BUDGET_MS: value });
+  for (const v of ["5001", "6000", "7000"]) {
+    expect(bufferCommitBudgetDeletionAllowed(profile(), live(v), {})).toBe(true);
+    expect(bufferCommitBudgetDeletionAllowed(profile(), live(v), undefined)).toBe(true);
+  }
+  for (const ms of [6000, 5001, 7000, 9000, "6000"])
+    expect(bufferCommitBudgetDeletionAllowed(profile({ bufferCommitBudgetMs: ms }), live("6000"), {})).toBe(false);
+  for (const proposed of ["6000", "", "9000"])
+    expect(bufferCommitBudgetDeletionAllowed(profile(), live("6000"), live(proposed))).toBe(false);
+  for (const value of ["5000", "7001", "4000", "0", "06000", " 6000", "6000 ", "6000\n", "+6000", "-6000", "6000ms", "6s", "6e3", "6000.0", "on", "", 6000, true, null, undefined])
+    expect(bufferCommitBudgetDeletionAllowed(profile(), live(value), {})).toBe(false);
+  expect(bufferCommitBudgetDeletionAllowed(profile(), undefined, {})).toBe(false);
+  expect(bufferCommitBudgetDeletionAllowed(profile(), { INGEST_BUFFER_COMMIT_LOCK_WAIT_MS: "6000" }, {})).toBe(false);
+});
+test("the retained plan unbinds INGEST_BUFFER_TIMEOUT_BUSY only for an omitted candidate value, nothing proposed and a live exactly on", () => {
+  const profile = (extra: Record<string, unknown> = {}) =>
+    ({ ...baseInput.sessionIngest, ...extra }) as any;
+  const live = (value: unknown) => ({ INGEST_BUFFER_TIMEOUT_BUSY: value });
+  expect(bufferTimeoutBusyDeletionAllowed(profile(), live("on"), {})).toBe(true);
+  expect(bufferTimeoutBusyDeletionAllowed(profile(), live("on"), undefined)).toBe(true);
+  // The candidate profile still carries bufferTimeoutBusy (any value).
+  for (const mode of ["on", "off", ""])
+    expect(bufferTimeoutBusyDeletionAllowed(profile({ bufferTimeoutBusy: mode }), live("on"), {})).toBe(false);
+  // The binding is present in the proposed environment (any value).
+  for (const proposed of ["on", "off", ""])
+    expect(bufferTimeoutBusyDeletionAllowed(profile(), live("on"), live(proposed))).toBe(false);
+  // Live text other than exactly "on": no trim, no case folding, no other value; absent or non-string.
+  for (const value of ["ON", "On", "oN", " on", "on ", "on\n", "off", "observe", "true", "1", "", 1, true, null, undefined])
+    expect(bufferTimeoutBusyDeletionAllowed(profile(), live(value), {})).toBe(false);
+  expect(bufferTimeoutBusyDeletionAllowed(profile(), undefined, {})).toBe(false);
+  expect(bufferTimeoutBusyDeletionAllowed(profile(), {}, {})).toBe(false);
+  // Only its own variable counts: a live INGEST_BUFFER_LOCK_RETRY or INGEST_CLAIM_LOCK_BUSY "on" is not it.
+  expect(bufferTimeoutBusyDeletionAllowed(profile(), { INGEST_BUFFER_LOCK_RETRY: "on" }, {})).toBe(false);
+  expect(bufferTimeoutBusyDeletionAllowed(profile(), { INGEST_CLAIM_LOCK_BUSY: "on" }, {})).toBe(false);
 });
 test("the retained plan unbinds INGEST_BUFFER_COMMIT_LOCK_WAIT_MS only for an omitted candidate value, nothing proposed and a strict in-range live value", () => {
   const profile = (extra: Record<string, unknown> = {}) => ({ ...baseInput.sessionIngest, ...extra }) as any;

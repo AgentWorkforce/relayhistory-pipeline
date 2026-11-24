@@ -104,6 +104,50 @@ export const BUFFER_COMMIT_LOCK_WAIT_MS_MAX = 4000;
 export const bufferCommitLockWaitSql = (fn: string): string =>
   `SELECT sessions.${fn}(CASE WHEN set_config('lock_timeout', $2, true) IS NOT NULL THEN $1::jsonb END) AS result`;
 
+/**
+ * INGEST_BUFFER_COMMIT_STATEMENT_BUDGET_MS bounds (ms): the buffered commit's own statement_timeout, run in its own
+ * short explicit transaction. Above the role's 5 s (a shorter budget is not this option's purpose); at most 7 s so
+ * that the commit stage with its one INGEST_BUFFER_LOCK_RETRY retry (2 x 7 s + 250 ms) stays under 15 s.
+ * docs/design/buffer-commit-statement-budget.md.
+ */
+export const BUFFER_COMMIT_BUDGET_MS_MIN = 5001;
+export const BUFFER_COMMIT_BUDGET_MS_MAX = 7000;
+/** The role's lock_timeout (supabase/bootstrap/session_ingest_role.sql): the commit's lock wait when unit A's option is unset. */
+export const ROLE_LOCK_TIMEOUT_MS = 2000;
+/** A lock wait must end at least this long before the statement budget, so one early wait still ends 55P03, not 57014. */
+export const BUFFER_COMMIT_BUDGET_HEADROOM_MS = 1000;
+/** The commit transaction's own idle-in-transaction bound (the role's is 10 s): a Worker that dies between the
+ *  call and COMMIT strands the seat clock and fence locks for about this long, not 10 s. */
+export const BUFFER_COMMIT_IDLE_IN_TRANSACTION_MS = 1000;
+/** The opening flight: one simple-protocol message (no parameters, so the driver may send several statements in
+ *  it). Values are validated integers, never caller text. */
+export const bufferCommitBudgetOpen = (budgetMs: number, lockWaitMs?: number): string =>
+  `BEGIN; SET LOCAL statement_timeout = '${budgetMs}ms'; SET LOCAL idle_in_transaction_session_timeout = '${BUFFER_COMMIT_IDLE_IN_TRANSACTION_MS}ms'` +
+  (lockWaitMs === undefined ? "" : `; SET LOCAL lock_timeout = '${lockWaitMs}ms'`);
+
+/**
+ * One buffered commit in its own explicit transaction whose statement_timeout is `budgetMs` (and lock_timeout
+ * `lockWaitMs` when set): flight 1 BEGIN + SET LOCAL (one message), flight 2 the unchanged one-parameter call,
+ * flight 3 COMMIT. Every SET is LOCAL, so it ends with the transaction and never reaches the next use of the
+ * connection. Any failure before COMMIT is answered by ROLLBACK (its own failure ignored) and the first error is
+ * thrown: the transaction wrote nothing. A COMMIT that fails with a database SQLSTATE rolled back; a COMMIT whose
+ * answer is lost (connection error) is UNKNOWN: it maps to ledger_connection (503), and the client's retry repeats
+ * the same commit, which the function answers with the same receipt when the first one did commit.
+ * Requires a `run` bound to ONE connection used sequentially (the Worker's per-request / per-batch pg Client).
+ */
+export async function inBufferCommitBudget<T>(run: SqlRun, budgetMs: number, lockWaitMs: number | undefined, work: () => Promise<T>): Promise<T> {
+  const mapped = (error: unknown) => {
+    const s = dbErrorSnapshot(error);
+    return new LedgerUnavailableError(ledgerErrorCodeFrom(s), dbErrorDiagnosisFrom(s));
+  };
+  const rollback = () => run("ROLLBACK", []).then(() => undefined, () => undefined);
+  try { await run(bufferCommitBudgetOpen(budgetMs, lockWaitMs), []); } catch (error) { await rollback(); throw mapped(error); }
+  let value: T;
+  try { value = await work(); } catch (error) { await rollback(); throw error; }
+  try { await run("COMMIT", []); } catch (error) { await rollback(); throw mapped(error); }
+  return value;
+}
+
 /** `lockWaitMs` (buffered commit only, validated by sqlLedger): absent sends exactly the plain one-parameter statement. */
 async function call(run: SqlRun, fn: LedgerFunction | OriginScopedFunction, input: unknown, lockWaitMs?: number): Promise<unknown> {
   let rows: Record<string, unknown>[];
@@ -322,7 +366,13 @@ export function sqlLedger(run: SqlRun, options: { acceptanceMode?: IngestAccepta
   originClaimFence?: boolean;
   /** INGEST_BUFFER_COMMIT_LOCK_WAIT_MS (buffered only, 2001..4000 ms): the buffered commit (and only it) waits at most this long for each
    *  lock, inside its one statement (bufferCommitLockWaitSql). Absent: the role's lock_timeout, the statement byte-identical. */
-  bufferCommitLockWaitMs?: number } = {}): Ledger {
+  bufferCommitLockWaitMs?: number;
+  /** INGEST_BUFFER_COMMIT_STATEMENT_BUDGET_MS (buffered only, 5001..7000 ms): the buffered commit (and only it) runs in its own
+   *  explicit transaction with this statement_timeout (inBufferCommitBudget). Absent: unit A's or the base statement, unchanged. */
+  bufferCommitBudgetMs?: number } = {}): Ledger {
+  if(options.bufferCommitBudgetMs!==undefined&&(!Number.isSafeInteger(options.bufferCommitBudgetMs)||options.bufferCommitBudgetMs<BUFFER_COMMIT_BUDGET_MS_MIN||options.bufferCommitBudgetMs>BUFFER_COMMIT_BUDGET_MS_MAX||options.acceptanceMode!=="buffered"
+    ||(options.bufferCommitLockWaitMs??ROLE_LOCK_TIMEOUT_MS)>options.bufferCommitBudgetMs-BUFFER_COMMIT_BUDGET_HEADROOM_MS))throw new LedgerUnavailableError("ledger_buffer_commit_budget_invalid");
+  const bufferCommitBudgetMs=options.bufferCommitBudgetMs;
   if(options.bufferCommitLockWaitMs!==undefined&&(!Number.isSafeInteger(options.bufferCommitLockWaitMs)||options.bufferCommitLockWaitMs<BUFFER_COMMIT_LOCK_WAIT_MS_MIN||options.bufferCommitLockWaitMs>BUFFER_COMMIT_LOCK_WAIT_MS_MAX||options.acceptanceMode!=="buffered"))throw new LedgerUnavailableError("ledger_buffer_commit_lock_wait_invalid");
   const bufferCommitLockWaitMs=options.bufferCommitLockWaitMs;
   if(options.claimLockWaitMs!==undefined&&(!Number.isSafeInteger(options.claimLockWaitMs)||options.claimLockWaitMs<CLAIM_LOCK_WAIT_MS_MIN||options.claimLockWaitMs>CLAIM_LOCK_WAIT_MS_MAX))throw new LedgerUnavailableError("ledger_claim_lock_wait_invalid");
@@ -441,7 +491,12 @@ export function sqlLedger(run: SqlRun, options: { acceptanceMode?: IngestAccepta
     },
     async commitBuffered(input) {
       if (options.acceptanceMode !== "buffered") throw new LedgerUnavailableError("ledger_mode_refused");
-      const r = await originScoped(originFence,"ingest_commit_buffered_batch",(fn)=>call(run,fn,buffered(input,forClaim(input.claimToken)),bufferCommitLockWaitMs)) as Record<string,unknown>;
+      const send=(fn:LedgerFunction|OriginScopedFunction):Promise<unknown>=>{
+        const body=buffered(input,forClaim(input.claimToken));
+        return bufferCommitBudgetMs===undefined?call(run,fn,body,bufferCommitLockWaitMs)
+          :inBufferCommitBudget(run,bufferCommitBudgetMs,bufferCommitLockWaitMs,()=>call(run,fn,body));
+      };
+      const r = await originScoped(originFence,"ingest_commit_buffered_batch",send) as Record<string,unknown>;
       if (r.kind === "intent_invalid") throw new LedgerUnavailableError("ledger_stage_invalidated");
       if (r.kind !== "committed") throw new LedgerUnavailableError("ledger_bad_result");
       if(r.custodyAck!==undefined){try{return validatedCustodyAck(r.custodyAck)}catch{throw new LedgerUnavailableError("ledger_custody_ack_refused")}}

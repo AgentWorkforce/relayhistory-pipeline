@@ -412,3 +412,47 @@ test("buffer commit lock wait: env shapes, profile refusals, render, add / chang
   expect(workflow).toContain(`${envName}: \${{ vars.${envName} }}`);
   expect(workflow.split("\npermissions:")[0]).not.toContain(envName);
 });
+
+// Unit C controls: the buffered commit's own statement budget (numeric, 5001..7000) and the buffer-stage statement
+// timeout class ("on"). Cutover controls like the unit A lock wait: unset/empty off, exact shapes, add / change /
+// remove at a held phase, exact readback, malformed live values refused; the combination rule is checked too.
+test("buffer commit statement budget and buffer timeout busy: env shapes, refusals, render, transitions, readback", () => {
+  const budgetName = "INGEST_BUFFER_COMMIT_STATEMENT_BUDGET_MS", budgetEnv = "PRIVATE_INGEST_BUFFER_COMMIT_STATEMENT_BUDGET_MS";
+  const tbName = "INGEST_BUFFER_TIMEOUT_BUSY", tbEnv = "PRIVATE_INGEST_BUFFER_TIMEOUT_BUSY";
+  for (const k of ["bufferCommitBudgetMs", "bufferTimeoutBusy"]) expect(PRIVATE_INGEST_CUTOVER_KEYS).toContain(k as never);
+  expect(privateIngestCutoverFromEnv({ [budgetEnv]: "", [tbEnv]: "" })).toEqual({});
+  for (const [v, ms] of [["5001", 5001], ["6000", 6000], ["7000", 7000]] as const) expect(privateIngestCutoverFromEnv({ [budgetEnv]: v })).toEqual({ bufferCommitBudgetMs: ms });
+  expect(privateIngestCutoverFromEnv({ [tbEnv]: "on" })).toEqual({ bufferTimeoutBusy: "on" });
+  for (const v of [" ", "5000", "7001", "06000", " 6000", "6000 ", "+6000", "6000ms", "6e3", "6000.0", "60000", "on"])
+    expect(code(() => privateIngestCutoverFromEnv({ [budgetEnv]: v }))).toBe("private_ingest_profile_buffer_commit_budget");
+  for (const v of ["off", "ON", "true", "1", " on"]) expect(code(() => privateIngestCutoverFromEnv({ [tbEnv]: v }))).toBe("private_ingest_profile_buffer_timeout_busy");
+  for (const v of [5000, 7001, 6000.5, "6000", true, null]) expect(code(() => privateIngestReleasePhase(at("baseline-drain", { bufferCommitBudgetMs: v })))).toBe("private_ingest_profile_buffer_commit_budget");
+  for (const v of ["off", "ON", true, 1, ""]) expect(code(() => privateIngestReleasePhase(at("baseline-drain", { bufferTimeoutBusy: v })))).toBe("private_ingest_profile_buffer_timeout_busy");
+  // The lock wait must end 1 s before the budget: 4000 with 5001 passes (both ranges' extremes).
+  expect(privateIngestReleasePhase(at("baseline-drain", { bufferCommitBudgetMs: 5001, bufferCommitLockWaitMs: 4000 }))).toBe("baseline-drain");
+  for (const phase of ["baseline-drain", "step-4-async-on"] as const) {
+    const plainVars = sessionIngestVars(at(phase).sessionIngest);
+    for (const name of [budgetName, tbName]) expect(Object.hasOwn(plainVars, name)).toBe(false);
+    expect(sessionIngestVars(at(phase, { bufferCommitBudgetMs: 6000 }).sessionIngest)).toEqual({ ...plainVars, [budgetName]: "6000" });
+    expect(sessionIngestVars(at(phase, { bufferTimeoutBusy: "on" }).sessionIngest)).toEqual({ ...plainVars, [tbName]: "on" });
+  }
+  const plain = at("baseline-drain"), on = at("baseline-drain", { bufferCommitBudgetMs: 6000, bufferTimeoutBusy: "on" }), longer = at("baseline-drain", { bufferCommitBudgetMs: 6500, bufferTimeoutBusy: "on" });
+  const pass = { status: "PRIVATE_INGEST_LIVE_TRANSITION_PASS", from: "baseline-drain", to: "baseline-drain" };
+  const fromPlain = live(plain), fromOn = live(on), fromLonger = live(longer);
+  expect(privateIngestTransitionReadback(on, fromPlain.active, fromPlain.version)).toMatchObject(pass);
+  expect(privateIngestTransitionReadback(longer, fromOn.active, fromOn.version)).toMatchObject(pass);
+  expect(privateIngestTransitionReadback(plain, fromOn.active, fromOn.version)).toMatchObject(pass);
+  expect(privateIngestVersionReadback(on, fromOn.active, fromOn.version)).toMatchObject({ phase: "baseline-drain" });
+  expect(code(() => privateIngestVersionReadback(longer, fromOn.active, fromOn.version))).not.toBeNull();
+  expect(code(() => privateIngestVersionReadback(plain, fromOn.active, fromOn.version))).not.toBeNull();
+  for (const bad of [[{ name: budgetName, type: "plain_text", text: "9000" }], [{ name: budgetName, type: "plain_text", text: "5000" }], [{ name: budgetName, type: "plain_text", text: "" }],
+    [{ name: budgetName, type: "secret_text" }], [{ name: tbName, type: "plain_text", text: "off" }], [{ name: tbName, type: "secret_text" }]]) {
+    const fixture = live(plain, bad);
+    expect(code(() => privateIngestTransitionReadback(plain, fixture.active, fixture.version))).toBe("private_ingest_live_cutover");
+  }
+  const workflow = readFileSync(".github/workflows/deploy-private-ingest-worker.yml", "utf8");
+  for (const n of [budgetEnv, tbEnv]) { expect(workflow).toContain(`${n}: \${{ vars.${n} }}`); expect(workflow.split("\npermissions:")[0]).not.toContain(n); }
+  const tracked = JSON.parse(readFileSync("config/cloudflare/private-ingest-production.json", "utf8"));
+  const production = { ...tracked, sessionIngest: { ...tracked.sessionIngest, kmsKeyArn, ...privateIngestCutoverFromEnv({}) } };
+  for (const n of [budgetName, tbName]) expect(Object.hasOwn(sessionIngestVars(production.sessionIngest), n)).toBe(false);
+});
