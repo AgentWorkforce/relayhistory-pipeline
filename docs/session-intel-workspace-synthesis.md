@@ -367,7 +367,7 @@ the request):
 
 | Item | Fields | Cap |
 |---|---|---|
-| initiative | `title` (<= 80), `goal` (<= 280), `sessions` [alias], `evidence` [{alias, titleRef}] | 10 |
+| initiative | `title` (<= 80), `goal` (<= 280), `sessions` [2 to 20 aliases], `evidence` [2 to 20 {alias, titleRef}] | 10 |
 | theme | `title` (<= 80), `kind` (`recurring_issue` \| `workflow` \| `topic`), `sessions`, `evidence` | 10 |
 | hypothesis | `statement` (<= 280), `basis` [`initiative:N` \| `theme:N`], `impact: "unmeasured"` | 5 |
 
@@ -418,7 +418,8 @@ hypothesis is something to test, never a finding (`impact` is always `unmeasured
 
 | Cap | Value |
 |---|---|
-| model | `claude-sonnet-5-5` (Claude Sonnet 5.5) by default |
+| model | `claude-sonnet-5-5` (Claude Sonnet 5.5); the only model a run may request (`STAGE2_APPROVED_MODELS`) |
+| call deadline | 120 s, passed to the transport and enforced by a race (a hung call is `transport_failed`) |
 | input tokens per run | 100,000 |
 | output tokens per run | 10,000 (sent as the request's output limit) |
 | runs per workspace per UTC day | 1 scheduled plus 2 manual |
@@ -432,12 +433,15 @@ one atomic step; a refusal makes no call. After the call the reservation is sett
 uses the workspace's run for the day.
 
 The UTC day comes from an injected wall clock, never from the synthesis `now` (a caller chooses that, and could
-otherwise move a run to another day). The trigger (`scheduled` or `manual`) is the caller's; both are capped.
+otherwise move a run to another day). The trigger (`scheduled` or `manual`) is the caller's; both are capped. The
+estimate is a heuristic: JSON-heavy text can tokenize denser than 4 characters a token, so a run near the input cap can
+cost more than estimated; the post-call check then refuses to use it, and the ledger is settled to the actual usage.
 
 **Budget ledger.** `BudgetLedger` (`reserve`, `settle`) is an interface; only `memoryBudgetLedger` (one process,
 lost on exit) exists. A durable ledger (one row per reservation, a conditional insert per org, workspace, day and
-trigger, and a global day total, checked and written in one transaction) is required before any scheduled run. It is
-a later slice; there is no migration here.
+trigger, and a global day total, checked and written in one transaction) is required before any scheduled run. It
+should take the day from its own clock (the database's), enforce the approved ceilings itself rather than trust the
+`limits` it is passed, and never free an unsettled reservation. It is a later slice; there is no migration here.
 
 ### The job step and its flag
 
@@ -450,8 +454,10 @@ On, the job writes the v1 artifact unchanged first, then runs Stage 2. A complet
 `workspace-synthesis-artifact/2` (the v1 envelope's fields with the v2 document as `synthesis`) at
 `{v1 window prefix}stage2/{v1 key's file name}`: one per Stage 1 artifact, inside the analysis-result glob and the
 workspace's synthesis directory, so the per-user erase deletes it with the rest. The v1 lookup ignores the `stage2/`
-keys. A rerun of the same cohort and `now` finds the stored one and makes no second call. A null Stage 2 is returned
-and not stored, so a later run within the caps may try again.
+keys. A rerun of the same cohort and `now` finds the stored one and makes no second call. Two concurrent runs of the
+same cohort and `now` can both miss it and both call (each is reserved, so the caps still hold); the second write
+then fails loudly on the create-only put. A null Stage 2 is returned and not stored, so a later run within the caps
+may try again.
 
 **Serving.** The read route keeps serving `/1` only. Serving `/2` (a separate default-off flag, the same erase check
 over the v2 envelope's `considered` and `related`) is left for a later slice.

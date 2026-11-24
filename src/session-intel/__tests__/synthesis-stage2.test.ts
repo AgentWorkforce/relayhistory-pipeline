@@ -244,6 +244,19 @@ describe("usage", () => {
     // The run still counts: a failed scheduled run uses the day's scheduled run.
     expect((await run({ transport: fakeTransport().transport, ledger })).document.stage2Reason).toBe("budget_exhausted");
   });
+  test("a transport that never answers is cut at the deadline: transport_failed", async () => {
+    const hanging: Stage2ModelTransport = { complete: () => new Promise<never>(() => {}) };
+    const r = await run({ transport: hanging, timeoutMs: 20 });
+    expect([r.document.stage2Reason, r.called]).toEqual(["transport_failed", true]);
+    await expect(run({ transport: hanging, timeoutMs: 120_001 })).rejects.toThrow();
+  });
+
+  test("only the approved model may be requested", async () => {
+    const { transport, calls } = fakeTransport();
+    await expect(run({ transport, model: "claude-opus-5-5" })).rejects.toThrow();
+    expect(calls.length).toBe(0);
+    expect((await run({ transport, model: STAGE2_DEFAULT_MODEL })).document.stage2!.model).toBe("claude-sonnet-5-5");
+  });
 });
 
 describe("the validator", () => {

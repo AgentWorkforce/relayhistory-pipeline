@@ -25,6 +25,8 @@ export const SYNTHESIS_CONTRACT_V2 = "workspace-synthesis/2";
 export const STAGE2_PROMPT_VERSION = "workspace-synthesis-stage2/1";
 /** The approved default model (Claude Sonnet 5.5). */
 export const STAGE2_DEFAULT_MODEL = "claude-sonnet-5-5";
+/** The only models a run may request. Another model is a new approval, not an option. */
+export const STAGE2_APPROVED_MODELS: readonly string[] = [STAGE2_DEFAULT_MODEL];
 /** The job's flag: Stage 2 runs only when this is exactly `true`. */
 export const WORKSPACE_SYNTHESIS_STAGE2_ENABLED = "WORKSPACE_SYNTHESIS_STAGE2_ENABLED";
 export const stage2FlagOn = (value: unknown): boolean => value === "true";
@@ -50,7 +52,8 @@ export const STAGE2_BOUNDS = {
   titlesPerKind: 3,
   titleTextChars: SYNTHESIS_BOUNDS.maxTextChars,
   minSessionsPerItem: 2,
-  maxSessionsPerItem: 50,
+  /** Equal to maxEvidencePerItem: every named session needs its own citation. */
+  maxSessionsPerItem: 20,
   maxEvidencePerItem: 20,
   maxBasisPerHypothesis: 5,
   /** A reply longer than this many characters is invalid (10,000 tokens is far below it). */
@@ -397,7 +400,10 @@ export interface Stage2Deps {
   /** The wall clock for the ledger's UTC day. Injected; never the synthesis `now`, which a caller chooses. */
   clock?: (() => Date) | null;
   trigger: Stage2Trigger;
+  /** One of STAGE2_APPROVED_MODELS; default STAGE2_DEFAULT_MODEL. */
   model?: string;
+  /** The call's deadline, at most STAGE2_TIMEOUT_MS (tests lower it). Past it the run is transport_failed. */
+  timeoutMs?: number;
   /** Lower caps only (tests); each must be at most its STAGE2_CAPS value. */
   caps?: Partial<Stage2Caps>;
 }
@@ -451,7 +457,9 @@ export async function runStage2(input: {
   const { v1, deps } = input;
   const caps = resolveStage2Caps(deps.caps);
   const model = deps.model ?? STAGE2_DEFAULT_MODEL;
-  if (!MODEL_ID.test(model)) throw new Error("stage2: model must be a plain model id");
+  if (!STAGE2_APPROVED_MODELS.includes(model)) throw new Error("stage2: model is not an approved Stage 2 model");
+  const timeoutMs = deps.timeoutMs ?? STAGE2_TIMEOUT_MS;
+  if (!Number.isSafeInteger(timeoutMs) || timeoutMs < 1 || timeoutMs > STAGE2_TIMEOUT_MS) throw new Error(`stage2: timeoutMs must be an integer in [1, ${STAGE2_TIMEOUT_MS}]`);
   if (deps.trigger !== "scheduled" && deps.trigger !== "manual") throw new Error("stage2: trigger must be scheduled or manual");
   const none = (reason: Stage2Reason, extra: Partial<Stage2Run> = {}): Stage2Run => ({
     document: toV2(v1, null, reason), called: false, usage: null, estimatedInputTokens: null, refusal: null, ...extra,
@@ -487,10 +495,17 @@ export async function runStage2(input: {
 
   let response: ModelTransportResponse;
   try {
-    response = await deps.transport.complete({
-      model, instructions: prompt.instructions, input: prompt.input, schemaName: "workspace_synthesis_stage2",
-      schema: prompt.schema, timeoutMs: STAGE2_TIMEOUT_MS, maxOutputTokens: caps.maxOutputTokensPerRun,
-    });
+    // The transport is asked to honour timeoutMs; the race bounds a transport that does not.
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const deadline = new Promise<never>((_, reject) => { timer = setTimeout(() => reject(new Error("stage2: deadline")), timeoutMs); });
+    try {
+      response = await Promise.race([deps.transport.complete({
+        model, instructions: prompt.instructions, input: prompt.input, schemaName: "workspace_synthesis_stage2",
+        schema: prompt.schema, timeoutMs, maxOutputTokens: caps.maxOutputTokensPerRun,
+      }), deadline]);
+    } finally {
+      clearTimeout(timer);
+    }
   } catch {
     // The reservation stays charged in full: a failed call may still have cost.
     return none("transport_failed", { called: true, estimatedInputTokens: estimate });
@@ -517,8 +532,8 @@ export async function runStage2(input: {
 }
 
 /**
- * Structural check of a v2 document: the Stage 1 part through `validateV1` (pass validateWorkspaceSynthesis), the
- * stage2 part by shape and bounds, and every session it names among `listed` (the considered sessions).
+ * Structural check of the Stage 2 part of a v2 document: shape and bounds, and every session it names among `listed`
+ * (the considered sessions). The Stage 1 part is checked by comparing stage1Of with the v1 document.
  */
 export function stage2Errors(d: WorkspaceSynthesisV2, listed: ReadonlySet<string>): string[] {
   const e: string[] = [];
