@@ -89,6 +89,10 @@ describe.skipIf(!url)("062210 lifecycle and rollback under a non-superuser owner
     if (!opts.keepLater) {
       expect(await rollBackLaterSlots(db.ownerUrl, T2_SLOT)).toEqual(later);
       expect((await ledgerNames()).filter((n) => n > "upstream:" + T2_SLOT + ".sql")).toEqual([]);
+      // A later slot whose down changes an ingest body (20261105062250) leaves the readiness marker pending, as 062210's
+      // own down does. Test-only shortcut: the fixture marks it pass again so this suite starts from 062210 as newest with
+      // the marker in its normal state (the operator's real restoration is the rollback-target suite's subject).
+      await fx.query("UPDATE sessions.__96bulls_role_validation SET status='pass' WHERE name='session_directory_search_worker' AND status='pending'");
     }
     const generation = (await derivedSchemaAssets()).expected.generation;
     await pool.query("SELECT sessions.ingest_lazy_policy_set($1::jsonb)", [JSON.stringify({ baselineMode: "lazy-current", generation, sourceIdentitySha256: identity, controlEpoch: epoch,
