@@ -20,7 +20,7 @@ things are missing:
 |---|---|---|---|
 | Session to tokens and cost | F1 `metrics.usage` (`SessionUsageSummary`: `observed`, `inputTokens`, `outputTokens`, `cachedInputTokens`, `totalTokens`, `costUSD`) | pipeline (F1) | `costUSD` null means unknown, never 0. A price engine (relayburn) is being scoped to fill it, with optional price provenance. |
 | Session to person | the session's `userIds`, from the uploader's introspected token (`sub`) | pipeline | The join key is the user id. Host names are display text and are never joined on. |
-| Person to organization | Control `organization_memberships` | Control | Authoritative. No per-workspace member table. |
+| Person to organization | Control `organization_memberships` | Control | Authoritative. No per-workspace member table. Used only to resolve a person INSIDE the session's own organization, never to choose the organization. |
 | Session to project | `projectId`, `catalog.repoUrl`, `gitBranch` (free strings) | pipeline | Control attaches no meaning to them. |
 | Person to team | none | unowned | No team table, IdP groups claim or SCIM. |
 
@@ -42,6 +42,11 @@ Rules:
 - **Token semantics.** `inputTokens`, `outputTokens`, `cachedInputTokens` and `totalTokens` are summed as the source
   reports them, never recombined (a source's `totalTokens` may or may not include cached input). F1's list of models
   used is shown as which models were used; cost is never split per model.
+- **Scope comes from the session.** A session's organization and workspace are the ones on the session row itself. A
+  user can belong to several organizations, so a membership never moves a session to another organization.
+- **Former members.** Membership rows are deleted when someone is removed, so an older session's user id can match no
+  current member. Such sessions go to a `former member` bucket, keyed by user id, so per-person sums still add up to the
+  workspace total.
 - **Once per session.** A session's usage counts once, never once per user. A session with one user is attributed to
   that user. A session with several users goes to a `shared` bucket for its project, with the user count. It is never
   split by guesswork.
