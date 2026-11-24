@@ -174,6 +174,26 @@ describe("priceSessionUsage", () => {
   });
 });
 
+describe("costUSD and costUsdMicros agree", () => {
+  it("is null together and equal otherwise", async () => {
+    const cases: UsageEventRow[][] = [
+      [row()],
+      [row(), row({ model: "fx-unknown-model" })],
+      [row({ model: null })],
+      [row({ usage: null })],
+      [row({ model: "fx-model-b", usage: { input: 1, output: 1 } })],
+    ];
+    for (const rows of cases) {
+      const result = await priceSessionUsage(rows, fakePricer());
+      if (result.costUsdMicros === null) {
+        expect(result.usage.costUSD).toBeNull();
+      } else {
+        expect(result.usage.costUSD).toBe(result.costUsdMicros / 1_000_000);
+      }
+    }
+  });
+});
+
 describe("burnSourceFor", () => {
   it("maps only the harnesses burn models", () => {
     expect(burnSourceFor("claude")).toBe("claude-code");

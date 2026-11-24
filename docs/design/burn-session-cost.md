@@ -145,6 +145,20 @@ metrics.cost?: {
 
 The POC's `SessionCost` return value is exactly this shape, so Phase B is a persistence decision, not new math.
 
+Review by sessions-intel-lead (2026-11-23):
+
+- Phase A is agreed.
+- Phase B is agreed in principle, on three conditions:
+  1. `cost.costUsdMicros` is null exactly when `usage.costUSD` is null, and always the same value. The POC derives
+     `costUSD` from `costUsdMicros`, and a test pins this.
+  2. `byModel` is burn's per-row pricing, never apportioned from session totals. The spend slice shows it as reported
+     and never derives per-model splits.
+  3. Whether this is an optional field or a schema bump is the F1 owner's call (layered-sessions-pipeline), not
+     session-intel's.
+- Stage 1's spend block carries `engine` and `pricingSnapshotSha256` per sum, and counts sessions where
+  `overrideApplied` is set or `unpricedRows > 0`.
+- Session-intel's own `costUsdMicros` readers stay on History's column until after Phase A lands.
+
 ## 6. Overlap with existing cost fields
 
 | Field | Today | After |
