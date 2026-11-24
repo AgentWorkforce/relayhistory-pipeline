@@ -22,11 +22,11 @@ import { createHash } from "node:crypto";
 import { isObjectStoreError, objectKey, type ObjectStore } from "../../packages/object-store/src/index.ts";
 import { validateWorkspaceSynthesis } from "../session-intel/synthesis/schema.ts";
 import {
-  SESSION_ID, SOURCE_ID, synthesisJson, synthesisProvenance, synthesize,
+  analyzedSessions, SESSION_ID, SOURCE_ID, synthesisJson, synthesisProvenance, synthesize,
   type SessionRef, type SynthesisOptions, type WorkspaceSynthesis,
 } from "../session-intel/synthesis/synthesize.ts";
 import {
-  runStage2, stage1Of, stage2FlagOn, STAGE2_PROMPT_VERSION_SLUG, SYNTHESIS_CONTRACT_V2, synthesisV2Json, validateStoredStage2,
+  runStage2, stage1Of, stage2FlagOn, STAGE2_PROMPT_VERSION_SLUG, Stage2ValidationError, SYNTHESIS_CONTRACT_V2, synthesisV2Json, validateStoredStage2,
   type Stage2Deps, type WorkspaceSynthesisV2,
 } from "../session-intel/synthesis/stage2.ts";
 import { ORG_SEGMENT, SYNTHESIS_PREFIX_SEGMENT, workspaceSynthesisDirectory, workspaceSynthesisPrefix } from "./workspace-synthesis-layout.ts";
@@ -44,7 +44,11 @@ export const SYNTHESIS_LOOKUP_MAX_CANDIDATES = 5;
 export const SYNTHESIS_LOOKUP_MAX_KEYS = 1_000;
 
 export class SynthesisArtifactError extends Error {
-  constructor(readonly code: string) {
+  /**
+   * `detail` (optional, additive) names the rule that failed, e.g. `envelope.window` or the stored-v2 rule
+   * (`stage2: sessions: order`). Diagnostic only: it is never part of the message, and the read route serves `code`.
+   */
+  constructor(readonly code: string, readonly detail?: string) {
     super(code);
     this.name = "SynthesisArtifactError";
   }
@@ -126,17 +130,21 @@ export async function runWorkspaceSynthesisJob(input: {
 
 export const SYNTHESIS_ARTIFACT_FORMAT_V2 = "workspace-synthesis-artifact/2";
 /**
- * The v2 envelope: the v1 envelope's fields, `v1Sha256` (the Stage 1 artifact's digest, binding it to those bytes),
+ * The v2 envelope: the v1 envelope's fields, `analyzed` (the Stage 1 cohort's analyzed sessions, sorted: the set the
+ * kept sessions must come from; the v1 drilldowns can be cut, so they are not an exact list), `v1Sha256` (the Stage 1
+ * artifact's digest, binding it to those bytes),
  * `stage2Sha256` (sha256 of the v2 document's two-space JSON, verified on every read) and the
  * workspace-synthesis/2 document as `synthesis`. Served behind READ_API_WORKSPACE_SYNTHESIS_V2_ENABLED (latestWorkspaceSynthesisV2).
  */
 export interface SynthesisArtifactV2 extends Omit<SynthesisArtifact, "format" | "synthesis"> {
   format: typeof SYNTHESIS_ARTIFACT_FORMAT_V2;
+  /** The Stage 1 cohort's analyzed sessions, sorted by (source, sessionId); a subset of `considered`. */
+  analyzed: SessionRef[];
   v1Sha256: string;
   stage2Sha256: string;
   synthesis: WorkspaceSynthesisV2;
 }
-const V2_KEYS = "considered,format,generatedAt,orgId,related,stage2Sha256,synthesis,v1Sha256,window,workspace";
+const V2_KEYS = "analyzed,considered,format,generatedAt,orgId,related,stage2Sha256,synthesis,v1Sha256,window,workspace";
 
 export interface Stage2JobOptions extends Omit<Stage2Deps, "enabled"> {
   /** The raw WORKSPACE_SYNTHESIS_STAGE2_ENABLED value; the caller reads it, the job reads no environment. */
@@ -164,6 +172,7 @@ export function workspaceSynthesisStage2Key(keyRoot: string, orgId: string, work
   return `${workspaceSynthesisDirectory(keyRoot, orgId, workspace)}stage2/w=${Date.parse(window.since)}-${Date.parse(window.until)}/${name.slice(0, -".json".length)}.${STAGE2_PROMPT_VERSION_SLUG}.json`;
 }
 
+const refKey = (r: { source: unknown; sessionId: unknown }) => `${r.source}\u0000${r.sessionId}`;
 const v2Bytes = (a: SynthesisArtifactV2) => new TextEncoder().encode(`${JSON.stringify(a)}\n`);
 const errorCode = (e: unknown) => (e instanceof SynthesisArtifactError ? e.code : "synthesis_stage2_failed");
 
@@ -193,8 +202,10 @@ async function runStage2Step(
     // Only a complete Stage 2 is stored; a null one is returned, so a later run (within the caps) may still try.
     if (run.document.stage2 === null) return { ...base, outcome: "not_written" };
     const { format: _f, synthesis: _s, ...envelope } = v1Artifact;
+    const analyzed = analyzedSessions(input.cohort, input.options).map((a) => ({ source: a.source, sessionId: a.sessionId }))
+      .sort((x, y) => (refKey(x) < refKey(y) ? -1 : refKey(x) > refKey(y) ? 1 : 0));
     const artifact: SynthesisArtifactV2 = {
-      format: SYNTHESIS_ARTIFACT_FORMAT_V2, ...envelope, v1Sha256: v1Digest,
+      format: SYNTHESIS_ARTIFACT_FORMAT_V2, ...envelope, analyzed, v1Sha256: v1Digest,
       stage2Sha256: sha256(new TextEncoder().encode(synthesisV2Json(run.document))), synthesis: run.document,
     };
     const bytes = v2Bytes(artifact);
@@ -227,38 +238,74 @@ async function runStage2Step(
  * The STRICT reader of a stored v2 artifact, checked against the Stage 1 artifact it extends (and its digest). Any
  * failure is a typed SynthesisArtifactError: `synthesis_cross_tenant` (another org's envelope), `synthesis_stage2_digest`
  * (stage2Sha256 or v1Sha256 does not match), `synthesis_stage2_stage1_mismatch` (the Stage 1 part is not the v1
- * document byte for byte), `synthesis_stage2_invalid` (anything else: bytes, envelope keys, the stage2 rules).
+ * document byte for byte), `synthesis_stage2_invalid` (anything else: bytes, envelope keys, the `analyzed` list, the
+ * stage2 rules, the kept sessions checked against the ANALYZED set). `detail` names the rule that failed.
  */
 export function parseStage2Artifact(bytes: Uint8Array, v1: SynthesisArtifact, v1Digest: string): SynthesisArtifactV2 {
-  const invalid = () => new SynthesisArtifactError("synthesis_stage2_invalid");
+  const invalid = (detail: string) => new SynthesisArtifactError("synthesis_stage2_invalid", detail);
   let a: SynthesisArtifactV2;
   try {
     a = JSON.parse(new TextDecoder("utf-8", { fatal: true, ignoreBOM: false }).decode(bytes)) as SynthesisArtifactV2;
   } catch {
-    throw invalid();
+    throw invalid("bytes");
   }
-  if (!a || typeof a !== "object" || Array.isArray(a) || Object.keys(a).sort().join(",") !== V2_KEYS || a.format !== SYNTHESIS_ARTIFACT_FORMAT_V2) throw invalid();
-  if (a.orgId !== v1.orgId) throw new SynthesisArtifactError("synthesis_cross_tenant");
+  if (!a || typeof a !== "object" || Array.isArray(a)) throw invalid("envelope: not an object");
+  if (Object.keys(a).sort().join(",") !== V2_KEYS) throw invalid("envelope: keys");
+  if (a.format !== SYNTHESIS_ARTIFACT_FORMAT_V2) throw invalid("envelope.format");
+  if (a.orgId !== v1.orgId) throw new SynthesisArtifactError("synthesis_cross_tenant", "envelope.orgId");
   const same = (x: unknown, y: unknown) => JSON.stringify(x) === JSON.stringify(y);
-  if (a.workspace !== v1.workspace || !same(a.window, v1.window) || a.generatedAt !== v1.generatedAt || !same(a.considered, v1.considered) || !same(a.related, v1.related)) throw invalid();
-  if (a.v1Sha256 !== v1Digest) throw new SynthesisArtifactError("synthesis_stage2_digest");
+  if (a.workspace !== v1.workspace) throw invalid("envelope.workspace");
+  if (!same(a.window, v1.window)) throw invalid("envelope.window");
+  if (a.generatedAt !== v1.generatedAt) throw invalid("envelope.generatedAt");
+  if (!same(a.considered, v1.considered)) throw invalid("envelope.considered");
+  if (!same(a.related, v1.related)) throw invalid("envelope.related");
+  if (a.v1Sha256 !== v1Digest) throw new SynthesisArtifactError("synthesis_stage2_digest", "v1Sha256");
   const d = a.synthesis;
-  if (!d || typeof d !== "object" || Array.isArray(d) || d.contract !== SYNTHESIS_CONTRACT_V2 || d.stage2Reason !== null) throw invalid();
-  if (typeof a.stage2Sha256 !== "string" || a.stage2Sha256 !== sha256(new TextEncoder().encode(synthesisV2Json(d)))) throw new SynthesisArtifactError("synthesis_stage2_digest");
+  if (!d || typeof d !== "object" || Array.isArray(d)) throw invalid("synthesis: not an object");
+  if (d.contract !== SYNTHESIS_CONTRACT_V2) throw invalid("synthesis.contract");
+  if (d.stage2Reason !== null) throw invalid("synthesis.stage2Reason");
+  if (typeof a.stage2Sha256 !== "string" || a.stage2Sha256 !== sha256(new TextEncoder().encode(synthesisV2Json(d)))) throw new SynthesisArtifactError("synthesis_stage2_digest", "stage2Sha256");
   let stage1: string;
   try {
     stage1 = synthesisJson(stage1Of(d));
   } catch {
-    throw invalid();
+    throw invalid("synthesis: stage1");
   }
-  if (stage1 !== synthesisJson(v1.synthesis)) throw new SynthesisArtifactError("synthesis_stage2_stage1_mismatch");
-  const considered = new Set(v1.considered.map((r) => `${r.source}\u0000${r.sessionId}`));
+  if (stage1 !== synthesisJson(v1.synthesis)) throw new SynthesisArtifactError("synthesis_stage2_stage1_mismatch", "synthesis: stage1");
+  const analyzed = analyzedSet(a.analyzed, v1);
   try {
-    validateStoredStage2(d.stage2, considered, v1.synthesis.inputs.analyzed);
-  } catch {
-    throw invalid();
+    validateStoredStage2(d.stage2, analyzed, v1.synthesis.inputs.analyzed);
+  } catch (e) {
+    throw invalid(`stage2: ${e instanceof Stage2ValidationError ? e.where : "unknown"}`);
   }
   return a;
+}
+
+/**
+ * The envelope's `analyzed` list, checked against the v1 artifact: exact refs, strictly sorted, as many as
+ * inputs.analyzed, each among `considered`, and covering every session a category drilldown names; when no drilldown
+ * was cut it must equal the drilldowns' union exactly (every analyzed session sits in exactly one category).
+ */
+function analyzedSet(list: unknown, v1: SynthesisArtifact): Set<string> {
+  const invalid = (detail: string) => new SynthesisArtifactError("synthesis_stage2_invalid", `envelope.analyzed: ${detail}`);
+  if (!Array.isArray(list) || list.length !== v1.synthesis.inputs.analyzed) throw invalid("count");
+  const considered = new Set(v1.considered.map(refKey));
+  const out = new Set<string>();
+  let prev: string | null = null;
+  for (const r of list as unknown[]) {
+    if (!r || typeof r !== "object" || Array.isArray(r) || Object.keys(r).sort().join(",") !== "sessionId,source") throw invalid("ref");
+    const { source, sessionId } = r as Record<string, unknown>;
+    if (typeof source !== "string" || !SOURCE_ID.test(source) || typeof sessionId !== "string" || !SESSION_ID.test(sessionId)) throw invalid("ref");
+    const k = refKey({ source, sessionId });
+    if (prev !== null && !(prev < k)) throw invalid("order");
+    if (!considered.has(k)) throw invalid("not considered");
+    prev = k;
+    out.add(k);
+  }
+  const drilled = new Set(v1.synthesis.categories.flatMap((c) => c.sessions.map(refKey)));
+  for (const k of drilled) if (!out.has(k)) throw invalid("misses a drilldown session");
+  if (!v1.synthesis.inputs.caps.drilldown.truncated && drilled.size !== out.size) throw invalid("not the drilldowns");
+  return out;
 }
 
 /** Every session the synthesis names in a drilldown, an issue or its evidence. */

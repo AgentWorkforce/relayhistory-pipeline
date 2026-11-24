@@ -214,4 +214,31 @@ describe("the strict stored-v2 reader", () => {
     // Not JSON at all.
     expect(code(() => parseStage2Artifact(new Uint8Array([0xff, 0x00]), v1, digest))).toBe("synthesis_stage2_invalid");
   });
+
+  test("a kept session must be an ANALYZED one: a considered-but-skipped session is rejected, and the envelope's list is bound to v1", async () => {
+    const { v1, v2, digest } = await stored();
+    const detail = (a: unknown) => {
+      try { parseStage2Artifact(bytes(reseal(a)), v1, digest); } catch (e) { return [(e as SynthesisArtifactError).code, (e as SynthesisArtifactError).detail]; }
+      return ["accepted"];
+    };
+    const k = (r: { source: string; sessionId: string }) => `${r.source}\u0000${r.sessionId}`;
+    const skipped = { source: "fx-claude", sessionId: "fx-skip-not-analyzed" };
+    expect(v1.considered.some((r) => k(r) === k(skipped))).toBe(true);
+    expect(v2.analyzed.some((r) => k(r) === k(skipped))).toBe(false);
+    expect(v2.analyzed.length).toBe(v1.synthesis.inputs.analyzed);
+    // Swap a kept session no item names for the skipped one (sorted, counts unchanged): only the analyzed check sees it.
+    const named = new Set([...v2.synthesis.stage2!.initiatives, ...v2.synthesis.stage2!.themes].flatMap((x) => x.sessions.map(k)));
+    const a = JSON.parse(JSON.stringify(v2));
+    const sessions = a.synthesis.stage2.sessions.filter((r: any) => named.has(k(r)) || r !== a.synthesis.stage2.sessions.findLast((x: any) => !named.has(k(x))));
+    a.synthesis.stage2.sessions = [...sessions, skipped].sort((x: any, y: any) => (k(x) < k(y) ? -1 : 1));
+    const at = a.synthesis.stage2.sessions.findIndex((r: any) => k(r) === k(skipped));
+    expect(detail(a)).toEqual(["synthesis_stage2_invalid", `stage2: sessions[${at}]: not analyzed`]);
+    // The envelope's analyzed list cannot be widened to admit it: it must cover the drilldowns and match them exactly.
+    const b = JSON.parse(JSON.stringify(a));
+    b.analyzed = [...b.analyzed.filter((r: any) => k(r) !== k(b.analyzed.at(-1))), skipped].sort((x: any, y: any) => (k(x) < k(y) ? -1 : 1));
+    expect(detail(b)[1]).toMatch(/^envelope\.analyzed: (misses a drilldown session|not the drilldowns)$/u);
+    const c = JSON.parse(JSON.stringify(v2));
+    c.analyzed = [...c.analyzed, skipped].sort((x: any, y: any) => (k(x) < k(y) ? -1 : 1));
+    expect(detail(c)).toEqual(["synthesis_stage2_invalid", "envelope.analyzed: count"]);
+  });
 });

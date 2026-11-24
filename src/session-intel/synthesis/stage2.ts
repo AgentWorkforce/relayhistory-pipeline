@@ -615,11 +615,12 @@ export class Stage2ValidationError extends Error {
 /**
  * The STRICT check of a stored Stage 2 object, with the reply parser's closed rules: exact key sets, line() strings
  * (no control or format characters, no padding, within length), the title ref pattern, sessions among the kept
- * sessions and each cited by its own title ref, the item and usage bounds, ids and bases consistent. `considered`
- * is the Stage 1 artifact's considered sessions; `analyzed` its analyzed count. Throws Stage2ValidationError on the
- * first failure (never a TypeError: every access is type-checked first).
+ * sessions and each cited by its own title ref, the item and usage bounds, ids and bases consistent. `analyzed` is
+ * the Stage 1 cohort's ANALYZED sessions (`source\u0000sessionId` keys; a considered-but-skipped session is never a
+ * kept one); `analyzedCount` its count (inputs.analyzed), which the set must match. Throws Stage2ValidationError on
+ * the first failure, `where` naming the rule (never a TypeError: every access is type-checked first).
  */
-export function validateStoredStage2(value: unknown, considered: ReadonlySet<string>, analyzed: number): Stage2 {
+export function validateStoredStage2(value: unknown, analyzed: ReadonlySet<string>, analyzedCount: number): Stage2 {
   const fail = (where: string): never => { throw new Stage2ValidationError(where); };
   const exact = (o: unknown, keys: readonly string[], where: string): Raw => {
     if (!isObj(o)) return fail(`${where}: not an object`);
@@ -646,6 +647,7 @@ export function validateStoredStage2(value: unknown, considered: ReadonlySet<str
     return r;
   };
 
+  if (analyzed.size !== analyzedCount) fail("analyzed set != analyzed count");
   const s2 = exact(value, ["model", "promptVersion", "usage", "initiatives", "themes", "hypotheses", "dropped", "keptSessions", "truncatedSessions", "sessions", "basis"], "stage2");
   if (typeof s2.model !== "string" || !STAGE2_APPROVED_MODELS.includes(s2.model)) fail("model");
   if (s2.promptVersion !== STAGE2_PROMPT_VERSION) fail("promptVersion");
@@ -654,11 +656,12 @@ export function validateStoredStage2(value: unknown, considered: ReadonlySet<str
   count(usage.inputTokens, "usage.inputTokens", STAGE2_CAPS.maxInputTokensPerRun);
   count(usage.outputTokens, "usage.outputTokens", STAGE2_CAPS.maxOutputTokensPerRun);
   const keptCount = count(s2.keptSessions, "keptSessions"), truncated = count(s2.truncatedSessions, "truncatedSessions");
-  if (keptCount < STAGE2_BOUNDS.minSessionsPerItem || keptCount + truncated !== analyzed) fail("kept + truncated != analyzed");
+  if (keptCount < STAGE2_BOUNDS.minSessionsPerItem) fail("keptSessions below the minimum");
+  if (keptCount + truncated !== analyzedCount) fail("kept + truncated != analyzed");
   const sessions = list(s2.sessions, keptCount, keptCount, "sessions").map((r, i) => ref(r, `sessions[${i}]`));
   const kept = new Set<string>();
   sessions.forEach((r, i) => {
-    if (!considered.has(k(r))) fail(`sessions[${i}]: not considered`);
+    if (!analyzed.has(k(r))) fail(`sessions[${i}]: not analyzed`);
     if (i > 0 && !(k(sessions[i - 1]!) < k(r))) fail("sessions: order");
     kept.add(k(r));
   });

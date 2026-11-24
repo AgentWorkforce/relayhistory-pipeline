@@ -488,8 +488,9 @@ version, computed before the call:
 {workspace synthesis directory}stage2/w={sinceMs}-{untilMs}/{v1 file name without .json}.{prompt version, / as -}.json
 ```
 
-The envelope is the v1 envelope's fields plus `v1Sha256` (the Stage 1 artifact's digest) and `stage2Sha256` (the
-sha256 of the v2 document's two-space JSON). The digest is embedded rather than in the key, so the key stays
+The envelope is the v1 envelope's fields plus `analyzed` (the Stage 1 cohort's analyzed sessions, sorted: the set
+the kept sessions must come from; the v1 drilldowns can be cut, so they are not an exact list), `v1Sha256` (the
+Stage 1 artifact's digest) and `stage2Sha256` (the sha256 of the v2 document's two-space JSON). The digest is embedded rather than in the key, so the key stays
 deterministic; the strict reader verifies both digests on every read.
 
 - **Rerun.** The job computes the key, finds the object, verifies it, and makes no call (`exists`).
@@ -505,11 +506,14 @@ deterministic; the strict reader verifies both digests on every read.
 
 **The strict stored-v2 reader** (`parseStage2Artifact`) applies the reply parser's closed rules to stored bytes: the
 exact envelope, stage2 and item key sets, the plain-text rule for every string, the title ref pattern, every session
-among the kept sessions and the kept ones among the Stage 1 `considered`, each named session cited, the item, length
+among the kept sessions and the kept ones among the Stage 1 ANALYZED sessions (the envelope's `analyzed`, itself
+checked against the v1 artifact: as many as `inputs.analyzed`, sorted, each among `considered`, covering every
+drilldown session and equal to their union when no drilldown was cut; a considered-but-skipped session is never a
+kept one), each named session cited, the item, length
 and usage bounds (usage within the per-run caps), ids and bases consistent, and the Stage 1 part equal to the v1
 document byte for byte. Any failure is a typed `SynthesisArtifactError`: `synthesis_cross_tenant`,
 `synthesis_stage2_digest`, `synthesis_stage2_stage1_mismatch` or `synthesis_stage2_invalid` (never a raw
-`TypeError`). The reader cannot re-check that a title ref is that session's actual title (that needs the cohort); the
+`TypeError`), with an additive `detail` naming the rule that failed (diagnostic only; the read route serves `code`). The reader cannot re-check that a title ref is that session's actual title (that needs the cohort); the
 reply parser checked it before the write.
 
 ### Serving v2

@@ -428,9 +428,12 @@ describe("the v2 document", () => {
     expect(r.document.contract).toBe("workspace-synthesis/2");
     expect(synthesisV2Json(r.document)).toBe(readFileSync(new URL("expected-synthesis-v2.json", FIXTURE_DIR), "utf8"));
     expect(synthesisJson(stage1Of(r.document))).toBe(readFileSync(new URL("expected-synthesis.json", FIXTURE_DIR), "utf8"));
-    const listed = new Set(c.sessions.map((e) => `${e.source}\u0000${e.sessionId}`));
-    expect(() => validateStoredStage2(r.document.stage2, listed, 40)).not.toThrow();
-    expect(() => validateStoredStage2(r.document.stage2, new Set(), 40)).toThrow();
+    const analyzed = new Set(analyzedSessions(c, OPTS).map((a) => `${a.source}\u0000${a.sessionId}`));
+    expect(() => validateStoredStage2(r.document.stage2, analyzed, 40)).not.toThrow();
+    expect(() => validateStoredStage2(r.document.stage2, new Set(), 0)).toThrow();
+    // Every considered session is not enough: a skipped one is never a kept one.
+    const considered = new Set(c.sessions.map((e) => `${e.source}\u0000${e.sessionId}`));
+    expect(() => validateStoredStage2(r.document.stage2, considered, 40)).toThrow("analyzed set != analyzed count");
     // Keys: the Stage 1 keys in order, then stage2 and its reason.
     expect(Object.keys(r.document)).toEqual(["contract", "workspace", "window", "generatedAt", "inputs", "freshness", "usageCoverage", "categories", "issues", "stage2", "stage2Reason"]);
   });
