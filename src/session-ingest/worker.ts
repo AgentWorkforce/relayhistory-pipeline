@@ -70,8 +70,8 @@
  *                              with INGEST_CLAIM_LOCK_BUSY the 429) instead of waiting the role's 2 s.
  *                              Same function, input and lock order; a free lock is unchanged. The
  *                              Cloudflare stack renders it only from sessionIngest.claimLockWaitMs
- *   INGEST_BUFFER_COMMIT_LOCK_WAIT_MS  unset (default) | 2001..4000 (buffered acceptance only; exactly four digits,
- *                              no sign, space, unit or fraction; an empty or any other value refuses the settings, so
+ *   INGEST_BUFFER_COMMIT_LOCK_WAIT_MS  unset or empty (default) | 2001..4000 (buffered acceptance only; exactly four
+ *                              digits, no sign, space, unit or fraction; any other value refuses the settings, so
  *                              every request is 503 not_configured): the buffer_receipt commit, and only it, sends
  *                              its one autocommit statement with a transaction-local lock_timeout of this many ms
  *                              (ledger-sql.ts bufferCommitLockWaitSql) instead of the role's 2 s. The role's 5 s
@@ -220,7 +220,7 @@ export interface IngestWorkerEnv {
   INGEST_CLAIM_LOCK_WAIT_MS?: string;
   /** "on" (any case): buffered claim/stage/commit through the 062010 origin-scoped entry points. Default off. */
   INGEST_ORIGIN_CLAIM_FENCE?: string;
-  /** 2001..4000 ms, four digits exactly, buffered only: the buffered commit's own lock wait (ledger-sql.ts). Unset (default): the role's lock_timeout. */
+  /** 2001..4000 ms, four digits exactly, buffered only: the buffered commit's own lock wait (ledger-sql.ts). Unset or empty (default): the role's lock_timeout. */
   INGEST_BUFFER_COMMIT_LOCK_WAIT_MS?: string;
   /** "on" (any case): register turn writers and serve the turn-fence capability receipt. Buffered only; default off. */
   INGEST_TURN_FENCE_REGISTER?: string;
@@ -394,8 +394,9 @@ export async function ingestSettings(env: IngestWorkerEnv): Promise<IngestSettin
   if (asyncMode !== "off" && acceptanceMode !== "buffered") throw new Error("session ingest: INGEST_ASYNC_ADMISSION needs buffered acceptance");
   const originClaimFence = routingFlag(env.INGEST_ORIGIN_CLAIM_FENCE);
   if (originClaimFence && acceptanceMode !== "buffered") throw new Error("session ingest: INGEST_ORIGIN_CLAIM_FENCE needs buffered acceptance");
-  // Present means set: an empty value refuses like any other malformed one (the stack never renders it empty).
-  const commitLockWait = env.INGEST_BUFFER_COMMIT_LOCK_WAIT_MS === undefined ? undefined : bufferCommitLockWaitMs(env.INGEST_BUFFER_COMMIT_LOCK_WAIT_MS);
+  // Unset or empty is the role default (one rule with the claim lock wait and the release env reader); any other
+  // malformed value refuses the settings.
+  const commitLockWait = env.INGEST_BUFFER_COMMIT_LOCK_WAIT_MS ? bufferCommitLockWaitMs(env.INGEST_BUFFER_COMMIT_LOCK_WAIT_MS) : undefined;
   if (commitLockWait !== undefined && acceptanceMode !== "buffered") throw new Error("session ingest: INGEST_BUFFER_COMMIT_LOCK_WAIT_MS needs buffered acceptance");
   const turnFenceRegister = routingFlag(env.INGEST_TURN_FENCE_REGISTER);
   if (turnFenceRegister && acceptanceMode !== "buffered") throw new Error("session ingest: INGEST_TURN_FENCE_REGISTER needs buffered acceptance");

@@ -50,8 +50,9 @@ The claim (`buffer` claim) and the stage intent (`buffer_intent`) keep the role 
 - **Accepted forms**: an integer stack input (`sessionIngest.bufferCommitLockWaitMs`), a
   protected-environment variable `PRIVATE_INGEST_BUFFER_COMMIT_LOCK_WAIT_MS` of exactly four digits
   (empty means unset, because an unset GitHub variable renders empty), and a Worker variable
-  `INGEST_BUFFER_COMMIT_LOCK_WAIT_MS` of exactly four digits.
-- **Refused values**: anything else, including at the Worker an empty value, a space, a sign, a unit,
+  `INGEST_BUFFER_COMMIT_LOCK_WAIT_MS` of exactly four digits. At all three layers, unset or empty means
+  the role default; this is the same rule as `INGEST_CLAIM_LOCK_WAIT_MS`.
+- **Refused values**: anything else, including a space, a sign, a unit,
   an exponent, a fraction or a value outside the range. A refusal happens at deploy-plan time
   (`private_ingest_profile_buffer_commit_lock_wait`) and at Worker start. At Worker start the settings
   fail, so every request answers 503 `not_configured` and admission messages are retried. The Worker
@@ -124,6 +125,9 @@ never tracked in the public profile, is supplied from `PRIVATE_INGEST_BUFFER_COM
 `.github/workflows/deploy-private-ingest-worker.yml`, and is checked in the profile, in the live
 version's bindings and in the readback.
 
+- **Enable condition**: a refusal this option moves from 55P03 to 57014 stays a 503, and that 503
+  carries no `Retry-After` (`src/session-ingest/app.ts` `failure`). The client then sees a timeout to
+  back off from as a transient failure, where it used to see a lock refusal with a `Retry-After`.
 - **Turn on**: set the variable to a value in range, then plan and deploy. The plan adds one
   plain-text binding.
 - **Change**: set another value in range, then plan and deploy. The plan updates the binding, and the
@@ -142,7 +146,7 @@ approve any of them.
 
 ## What was proven, and what was not
 
-Proven on PostgreSQL 16 and 17 in disposable containers
+Proven on PostgreSQL 15, 16 and 17 in disposable containers
 (`src/session-ingest/__tests__/buffer-commit-lock-wait.postgres.test.ts`). The setup was a login role
 carrying the bootstrap file's role settings, a holder of the seat clock row, and the real
 `sqlLedger().commitBuffered` over the input the real `deliverBatch` builds, through both entry
@@ -158,6 +162,10 @@ points.
 
 Unit tests (`buffer-commit-lock-wait.test.ts`) pin the off-path text, the stage scope, validation, the
 Worker wiring and the class handling through the real deliver path.
+
+The pg-proof step runs the proof under the fixture superuser URL, like the origin-claim-fence proof,
+and the waiter is a disposable non-superuser login acting as the ingest role. `lock_timeout` is a
+user-settable parameter, so the owner harness would not change the result.
 
 Not proven:
 

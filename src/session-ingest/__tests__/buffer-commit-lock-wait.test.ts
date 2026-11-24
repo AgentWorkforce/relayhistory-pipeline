@@ -117,7 +117,7 @@ describe("validation (fail closed)", () => {
     for (const ms of [2001, 3000, 4000]) expect(() => sqlLedger(run, { acceptanceMode: "buffered", expectedGeneration: G, bufferCommitLockWaitMs: ms })).not.toThrow();
   });
 
-  test("Worker: unset is absent; 2001..4000 reaches the ledger; anything else, empty included, refuses the settings", async () => {
+  test("Worker: unset or empty is absent; 2001..4000 reaches the ledger; any other value refuses the settings", async () => {
     const { ingestSettings, deliverDepsFor, bufferCommitLockWaitMs } = await import("../worker.ts");
     const full = { HYPERDRIVE: { connectionString: "postgres://x" }, INGEST_FANOUT: {} as never, S3_ACCESS_KEY_ID: "k", S3_SECRET_ACCESS_KEY: "s", INGEST_SIGNING_KEY: "sign", INGEST_S3_BUCKET: "b", INGEST_KMS_KEY_ARN: "arn" };
     const buffered = { ...full, INGEST_ACCEPTANCE_MODE: "buffered", INGEST_EXPECT_GENERATION: G, INGEST_INLINE_MAX_SESSIONS: "0" };
@@ -136,7 +136,10 @@ describe("validation (fail closed)", () => {
     await deliverDepsFor(off, plain.run, target as never).ledger.commitBuffered!(COMMIT_INPUT as never);
     expect(plain.sent.map((s) => s.text)).toEqual(["SELECT sessions.ingest_commit_buffered_batch($1::jsonb) AS result"]);
     const message = "INGEST_BUFFER_COMMIT_LOCK_WAIT_MS must be an integer from 2001 to 4000 (buffered acceptance only)";
-    for (const bad of ["", " ", "2000", "4001", "5000", "0", "02500", "3000 ", " 3000", "+3000", "-3000", "3000ms", "3s", "3e3", "3000.0", "0xBB8", "3,000", "３０００", "30000", "9999"]) {
+    // Empty is unset (the role default), the same rule as INGEST_CLAIM_LOCK_WAIT_MS and the release env reader.
+    expect(await ingestSettings({ ...buffered, INGEST_BUFFER_COMMIT_LOCK_WAIT_MS: "" })).toEqual(off);
+    expect(() => bufferCommitLockWaitMs("")).toThrow(message); // the parser itself never accepts it
+    for (const bad of [" ", "2000", "4001", "5000", "0", "02500", "3000 ", " 3000", "+3000", "-3000", "3000ms", "3s", "3e3", "3000.0", "0xBB8", "3,000", "３０００", "30000", "9999"]) {
       expect(() => bufferCommitLockWaitMs(bad)).toThrow(message);
       await expect(ingestSettings({ ...buffered, INGEST_BUFFER_COMMIT_LOCK_WAIT_MS: bad })).rejects.toThrow(message);
     }
