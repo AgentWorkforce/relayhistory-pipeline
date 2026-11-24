@@ -162,23 +162,25 @@ test("claim lock controls: env shapes, and add / change / remove at a held phase
   }
 });
 
-// Buffer-stage lock controls (deliver.ts BufferLockBusy / bufferLedgerStage): cutover controls exactly like
+// Buffer-stage lock and statement-timeout controls (deliver.ts BufferLockBusy / bufferLedgerStage): cutover controls exactly like
 // claimTimeoutBusy. Absent renders nothing; "on" is accepted and rendered; anything else refuses.
 test("buffer lock controls: absent renders nothing, on renders, anything else refuses, add / remove at a held phase", () => {
-  const keys = { bufferLockBusy: "INGEST_BUFFER_LOCK_BUSY", bufferLockRetry: "INGEST_BUFFER_LOCK_RETRY" } as const;
-  const envName = { bufferLockBusy: "PRIVATE_INGEST_BUFFER_LOCK_BUSY", bufferLockRetry: "PRIVATE_INGEST_BUFFER_LOCK_RETRY" } as const;
-  const refusal = { bufferLockBusy: "private_ingest_profile_buffer_lock_busy", bufferLockRetry: "private_ingest_profile_buffer_lock_retry" } as const;
-  for (const key of ["bufferLockBusy", "bufferLockRetry"] as const) expect(PRIVATE_INGEST_CUTOVER_KEYS).toContain(key);
+  const keys = { bufferLockBusy: "INGEST_BUFFER_LOCK_BUSY", bufferLockRetry: "INGEST_BUFFER_LOCK_RETRY", bufferTimeoutBusy: "INGEST_BUFFER_TIMEOUT_BUSY" } as const;
+  const envName = { bufferLockBusy: "PRIVATE_INGEST_BUFFER_LOCK_BUSY", bufferLockRetry: "PRIVATE_INGEST_BUFFER_LOCK_RETRY", bufferTimeoutBusy: "PRIVATE_INGEST_BUFFER_TIMEOUT_BUSY" } as const;
+  const refusal = { bufferLockBusy: "private_ingest_profile_buffer_lock_busy", bufferLockRetry: "private_ingest_profile_buffer_lock_retry", bufferTimeoutBusy: "private_ingest_profile_buffer_timeout_busy" } as const;
+  const KEYS = ["bufferLockBusy", "bufferLockRetry", "bufferTimeoutBusy"] as const;
+  for (const key of KEYS) expect(PRIVATE_INGEST_CUTOVER_KEYS).toContain(key);
 
   // Absent: no var rendered and the profile check passes, at every phase.
-  expect(privateIngestCutoverFromEnv({ PRIVATE_INGEST_BUFFER_LOCK_BUSY: "", PRIVATE_INGEST_BUFFER_LOCK_RETRY: "" })).toEqual({});
+  expect(privateIngestCutoverFromEnv({ PRIVATE_INGEST_BUFFER_LOCK_BUSY: "", PRIVATE_INGEST_BUFFER_LOCK_RETRY: "", PRIVATE_INGEST_BUFFER_TIMEOUT_BUSY: "" })).toEqual({});
+  expect(Object.hasOwn(privateIngestCutoverFromEnv({}), "bufferTimeoutBusy")).toBe(false);
   for (const phase of ["baseline-drain", "step-0-shadow", "step-1-custody", "step-2-frozen-receipt", "step-4-async-on"] as const) {
     const absent = at(phase);
     expect(privateIngestReleasePhase(absent)).toBe(phase);
     for (const name of Object.values(keys)) expect(Object.hasOwn(sessionIngestVars(absent.sessionIngest), name)).toBe(false);
   }
 
-  for (const key of ["bufferLockBusy", "bufferLockRetry"] as const) {
+  for (const key of KEYS) {
     // "on": accepted and rendered.
     expect(privateIngestCutoverFromEnv({ [envName[key]]: "on" })).toEqual({ [key]: "on" });
     for (const phase of ["baseline-drain", "step-4-async-on"] as const) {
@@ -216,10 +218,13 @@ test("buffer lock controls: absent renders nothing, on renders, anything else re
     expect(workflow.split("\npermissions:")[0]).not.toContain(name);
   }
   // Independent: both together, alongside the claim controls.
-  const both = at("baseline-drain", { claimTimeoutBusy: "on", claimLockWaitMs: 250, bufferLockBusy: "on", bufferLockRetry: "on" });
+  const both = at("baseline-drain", { claimTimeoutBusy: "on", claimLockWaitMs: 250, bufferLockBusy: "on", bufferLockRetry: "on", bufferTimeoutBusy: "on" });
   expect(privateIngestReleasePhase(both)).toBe("baseline-drain");
-  expect(privateIngestCutoverFromEnv({ PRIVATE_INGEST_BUFFER_LOCK_BUSY: "on", PRIVATE_INGEST_BUFFER_LOCK_RETRY: "on" }))
-    .toEqual({ bufferLockBusy: "on", bufferLockRetry: "on" });
+  expect(privateIngestCutoverFromEnv({ PRIVATE_INGEST_BUFFER_LOCK_BUSY: "on", PRIVATE_INGEST_BUFFER_LOCK_RETRY: "on", PRIVATE_INGEST_BUFFER_TIMEOUT_BUSY: "on" }))
+    .toEqual({ bufferLockBusy: "on", bufferLockRetry: "on", bufferTimeoutBusy: "on" });
+  // Each alone: the timeout control does not imply the lock controls, nor they it.
+  expect(privateIngestCutoverFromEnv({ PRIVATE_INGEST_BUFFER_TIMEOUT_BUSY: "on" })).toEqual({ bufferTimeoutBusy: "on" });
+  expect(privateIngestCutoverFromEnv({ PRIVATE_INGEST_BUFFER_LOCK_BUSY: "on" })).toEqual({ bufferLockBusy: "on" });
   const fromBoth = live(both);
   expect(privateIngestVersionReadback(both, fromBoth.active, fromBoth.version)).toMatchObject({ phase: "baseline-drain" });
 });

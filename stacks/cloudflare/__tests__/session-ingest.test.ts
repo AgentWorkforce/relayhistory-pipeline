@@ -631,12 +631,12 @@ describe("session ingest: INGEST_CLAIM_TIMEOUT_BUSY (default off)", () => {
   });
 });
 
-describe("session ingest: INGEST_BUFFER_LOCK_BUSY / INGEST_BUFFER_LOCK_RETRY (default off, buffered only)", () => {
-  // Same shape as the claim flag blocks above; the two inputs are independent of each other and of the claim flags.
+describe("session ingest: INGEST_BUFFER_LOCK_BUSY / INGEST_BUFFER_LOCK_RETRY / INGEST_BUFFER_TIMEOUT_BUSY (default off, buffered only)", () => {
+  // Same shape as the claim flag blocks above; the three inputs are independent of each other and of the claim flags.
   const buffered: SessionIngestInputs = { ...inputs, acceptanceMode: "buffered", expectedGeneration: "a".repeat(64), inlineMaxSessions: 0, asyncAdmission: "off" };
   const canonical: SessionIngestInputs = { ...inputs, acceptanceMode: "canonical" };
   const admissionQueue = { Type: "Cloudflare.Queues.Queue", queueName: ADMISSION_QUEUE };
-  const FLAGS = [["bufferLockBusy", "INGEST_BUFFER_LOCK_BUSY"], ["bufferLockRetry", "INGEST_BUFFER_LOCK_RETRY"]] as const;
+  const FLAGS = [["bufferLockBusy", "INGEST_BUFFER_LOCK_BUSY"], ["bufferLockRetry", "INGEST_BUFFER_LOCK_RETRY"], ["bufferTimeoutBusy", "INGEST_BUFFER_TIMEOUT_BUSY"]] as const;
 
   it("omitted: neither var at all, vars and props byte-identical to a stack without the inputs", () => {
     for (const p of [inputs, canonical, buffered, { ...buffered, asyncAdmission: "on" as const }, { ...buffered, claimLockBusy: "on" as const, claimTimeoutBusy: "on" as const }]) {
@@ -646,7 +646,7 @@ describe("session ingest: INGEST_BUFFER_LOCK_BUSY / INGEST_BUFFER_LOCK_RETRY (de
         expect(Object.hasOwn(sessionIngestVars(p), envVar)).toBe(false);
         expect(Object.hasOwn(env, envVar)).toBe(false);
       }
-      expect(JSON.stringify(sessionIngestWorkerProps(p, b))).toBe(JSON.stringify(sessionIngestWorkerProps({ ...p, bufferLockBusy: undefined, bufferLockRetry: undefined }, b)));
+      expect(JSON.stringify(sessionIngestWorkerProps(p, b))).toBe(JSON.stringify(sessionIngestWorkerProps({ ...p, bufferLockBusy: undefined, bufferLockRetry: undefined, bufferTimeoutBusy: undefined }, b)));
     }
   });
 
@@ -665,6 +665,10 @@ describe("session ingest: INGEST_BUFFER_LOCK_BUSY / INGEST_BUFFER_LOCK_RETRY (de
     const both = { ...buffered, bufferLockBusy: "on" as const, bufferLockRetry: "on" as const, claimLockBusy: "on" as const };
     expect(() => assertSessionIngestInputs(both, refuse)).not.toThrow();
     expect(sessionIngestVars(both)).toEqual({ ...sessionIngestVars(buffered), INGEST_CLAIM_LOCK_BUSY: "on", INGEST_BUFFER_LOCK_BUSY: "on", INGEST_BUFFER_LOCK_RETRY: "on" });
+    expect(Object.hasOwn(sessionIngestVars(both), "INGEST_BUFFER_TIMEOUT_BUSY")).toBe(false);
+    const all = { ...both, bufferTimeoutBusy: "on" as const, claimTimeoutBusy: "on" as const };
+    expect(() => assertSessionIngestInputs(all, refuse)).not.toThrow();
+    expect(sessionIngestVars(all)).toEqual({ ...sessionIngestVars(both), INGEST_CLAIM_TIMEOUT_BUSY: "on", INGEST_BUFFER_TIMEOUT_BUSY: "on" });
     expect(sessionIngestResources()).toBe(SESSION_INGEST_RESOURCES);
   });
 
@@ -681,6 +685,7 @@ describe("session ingest: INGEST_BUFFER_LOCK_BUSY / INGEST_BUFFER_LOCK_RETRY (de
   it("an unknown key next to them is still refused", () => {
     expect(() => assertSessionIngestInputs({ ...buffered, bufferLockBusy: "on", bufferLockRetryCount: 2 }, refuse)).toThrow("sessionIngest.bufferLockRetryCount is not a known setting");
     expect(() => assertSessionIngestInputs({ ...buffered, INGEST_BUFFER_LOCK_RETRY: "on" }, refuse)).toThrow("sessionIngest.INGEST_BUFFER_LOCK_RETRY is not a known setting");
+    expect(() => assertSessionIngestInputs({ ...buffered, INGEST_BUFFER_TIMEOUT_BUSY: "on" }, refuse)).toThrow("sessionIngest.INGEST_BUFFER_TIMEOUT_BUSY is not a known setting");
   });
 });
 

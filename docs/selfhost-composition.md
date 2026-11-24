@@ -379,6 +379,11 @@ those stages the same 429 `delivery_busy` as the claim flag, and
 Both change only the error shape and the client's backoff; neither removes the
 underlying lock contention.
 
+`INGEST_BUFFER_TIMEOUT_BUSY` (hosted Worker only, default off and enabled
+nowhere) is not read by the self-host server either, for the same reason. On the
+Worker it makes a statement timeout (57014 by code) at those two stages the
+same 429 `delivery_busy`; it is never retried and needs neither sibling flag.
+
 `INGEST_ADVERTISED_MAX_RECORDS` (hosted Worker only, default off) is not read by
 the self-host server, which keeps publishing `maxRecords` 500. On the Worker it
 lowers only the advertised records-per-batch limit; the accepted limit stays 500.

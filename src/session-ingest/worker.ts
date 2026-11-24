@@ -51,6 +51,13 @@
  *                              re-issues the same ledger call once after a 50-250 ms jittered pause; a second
  *                              failure propagates as before (429 with INGEST_BUFFER_LOCK_BUSY, else 503).
  *                              Rendered only from sessionIngest.bufferLockRetry: "on"
+ *   INGEST_BUFFER_TIMEOUT_BUSY unset/off (default) | on (any case; buffered acceptance only): a buffer_intent /
+ *                              buffer_receipt ledger call that hit its statement timeout or was cancelled
+ *                              (ledger_timeout, SQLSTATE 57014 by code only; name-only client timeouts stay
+ *                              503) is the same 429 delivery_busy with Retry-After 5-10 s instead of a 503
+ *                              (deliver.ts BufferLockBusy; the route line keeps ledger_timeout / 57014).
+ *                              Independent of INGEST_BUFFER_LOCK_BUSY; never retried by INGEST_BUFFER_LOCK_RETRY.
+ *                              Rendered only from sessionIngest.bufferTimeoutBusy: "on"
  *   INGEST_INFLIGHT_LEASE      unset/empty/anything else = off (default) | observe | on (any case, trimmed): a
  *                              per-isolate in-flight lease per signed (org, workspace, user), taken on the HTTP
  *                              sync path before its first ledger call (inflight-lease.ts). observe: nothing is
@@ -204,6 +211,7 @@ export interface IngestWorkerEnv {
   INGEST_CLAIM_TIMEOUT_BUSY?: string;
   INGEST_BUFFER_LOCK_BUSY?: string;
   INGEST_BUFFER_LOCK_RETRY?: string;
+  INGEST_BUFFER_TIMEOUT_BUSY?: string;
   /** observe | on (any case): the per-isolate in-flight lease (inflight-lease.ts). Anything else: off. */
   INGEST_INFLIGHT_LEASE?: string;
   /** 1..500 (strict integer): the maxRecords this Worker ADVERTISES (advertised-limits.ts). Unset or invalid: 500. */
@@ -300,6 +308,8 @@ export interface IngestSettings {
   bufferLockBusy?: true;
   /** INGEST_BUFFER_LOCK_RETRY=on: that failure re-issues the same ledger call once after 50-250 ms. Absent (the default): one call. */
   bufferLockRetry?: true;
+  /** INGEST_BUFFER_TIMEOUT_BUSY=on: a buffer_intent / buffer_receipt statement timeout (SQLSTATE 57014 by code only) is a 429 with Retry-After. Absent (the default): 503. */
+  bufferTimeoutBusy?: true;
   /** INGEST_INFLIGHT_LEASE=observe|on: the per-isolate in-flight lease on the HTTP sync path. Absent (the default): off. */
   inflightLease?: InflightLeaseMode;
   /** INGEST_ADVERTISED_MAX_RECORDS (1..500): the advertised maxRecords; acceptance stays 500. Absent (the default): 500 published. */
@@ -429,6 +439,7 @@ export async function ingestSettings(env: IngestWorkerEnv): Promise<IngestSettin
     ...(routingFlag(env.INGEST_CLAIM_TIMEOUT_BUSY) ? { claimTimeoutBusy: true as const } : {}),
     ...(routingFlag(env.INGEST_BUFFER_LOCK_BUSY) ? { bufferLockBusy: true as const } : {}),
     ...(routingFlag(env.INGEST_BUFFER_LOCK_RETRY) ? { bufferLockRetry: true as const } : {}),
+    ...(routingFlag(env.INGEST_BUFFER_TIMEOUT_BUSY) ? { bufferTimeoutBusy: true as const } : {}),
     ...(inflightLeaseMode(env.INGEST_INFLIGHT_LEASE) ? { inflightLease: inflightLeaseMode(env.INGEST_INFLIGHT_LEASE)! } : {}),
     ...advertisedSetting(env.INGEST_ADVERTISED_MAX_RECORDS),
     ...(env.INGEST_CLAIM_LOCK_WAIT_MS ? { claimLockWaitMs: claimLockWaitMs(env.INGEST_CLAIM_LOCK_WAIT_MS) } : {}),
@@ -513,6 +524,7 @@ export function deliverDepsFor(settings: IngestSettings, run: Run, target: Write
     ...(settings.claimTimeoutBusy ? { claimTimeoutBusy: true as const } : {}),
     ...(settings.bufferLockBusy ? { bufferLockBusy: true as const } : {}),
     ...(settings.bufferLockRetry ? { bufferLockRetry: true as const } : {}),
+    ...(settings.bufferTimeoutBusy ? { bufferTimeoutBusy: true as const } : {}),
     ...(settings.advertisedMaxRecords !== undefined ? { advertisedMaxRecords: settings.advertisedMaxRecords } : {}),
   };
 }

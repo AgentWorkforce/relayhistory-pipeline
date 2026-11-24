@@ -225,6 +225,35 @@ unbind refuses `native_binding_target`.
   independent of `INGEST_BUFFER_LOCK_BUSY`: removing the BUSY var leaves a rendered RETRY var as it is, and a
   second failure then answers 503 again.
 
+Buffer-stage statement timeout (`INGEST_BUFFER_TIMEOUT_BUSY`, default off and enabled nowhere, buffered
+acceptance only; stack input `sessionIngest.bufferTimeoutBusy: "on"`, omit for off; any other value, or
+canonical mode, is refused). Independent of the two flags above: it does not need `INGEST_BUFFER_LOCK_BUSY`.
+With it on, a `buffer_intent` / `buffer_receipt` ledger call whose failure still stands at the end of the
+stage with `error_code` `ledger_timeout` and SQLSTATE 57014 by code (`db_error_basis` `code`; the role's 5 s
+`statement_timeout` or a cancel, which rolled the statement back whole) answers 429 `delivery_busy`
+(`Retry-After` 5-10 s) instead of the 503. `INGEST_BUFFER_LOCK_RETRY` never retries a 57014; when a retried
+lock wait fails again with a 57014, the retry line is written as before (`outcome` `failed`, `sqlstate`
+57014) and that standing 57014 is the 429. A name-only client/pool timeout (`ledger_timeout` without a 57014
+by code), a 57014 at any other stage and every other error are unchanged. Telling the classes apart on the
+route line: a converted statement timeout keeps `error_code: ledger_timeout` / `db_error_code: 57014`; a
+converted lock wait keeps `ledger_lock_timeout` / 55P03 or 40P01. With the flag on, the DB-error rate alert
+no longer counts these (it counts only 503s); the `ingest.lock_alert` line (`staged_intent` / `staged_ack`,
+`sqlstate` 57014) still fires for each, exactly as for the 503. No statement timeout, lock wait, pool
+setting, SQL or migration changes: the contention stays, only the error shape and the client's backoff
+change. On the private-ingest release it is a cutover control like the two above: the
+`private-ingest-production` environment variable `PRIVATE_INGEST_BUFFER_TIMEOUT_BUSY` accepts only `on`;
+unset or empty is off and renders no var; any other value refuses
+(`private_ingest_profile_buffer_timeout_busy`). Setting it and then planning and deploying is a production
+flag change that needs its own approval.
+- `INGEST_BUFFER_TIMEOUT_BUSY` rollback: unset (or empty) `PRIVATE_INGEST_BUFFER_TIMEOUT_BUSY`, then plan and
+  deploy, no code change. The plan shows one `unbind` of `INGEST_BUFFER_TIMEOUT_BUSY`, which the operator
+  (`bufferTimeoutBusyDeletionAllowed`) admits only when the candidate profile omits `bufferTimeoutBusy`, the
+  proposed Worker environment has no `INGEST_BUFFER_TIMEOUT_BUSY`, the live value is exactly `on` (no trim,
+  no case folding), the deleted native binding is the `plain_text` binding of that name with that exact
+  text, and the plan updates the Worker. A candidate that still sets `bufferTimeoutBusy: "on"`, or a second
+  delete in the same plan, refuses `native_binding_inventory`; any other mismatch refuses
+  `native_binding_target`.
+
 The operator admits at most one unbind per plan (`native_binding_inventory`). Each supported unbind is its
 own plan, deploy and readback of the live Worker; a following unbind is planned only from the live state
 that deploy produced, never two in one plan.

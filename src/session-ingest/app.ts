@@ -386,7 +386,9 @@ const BUFFER_BUSY_ALERT_SQLSTATES = new Set(["40P01"]);
  * (a 40P01 alerts in neither flag state); a claim statement timeout refused as 429
  * (INGEST_CLAIM_TIMEOUT_BUSY=on) still alerts for 57014. A buffer-stage lock wait refused as 429
  * (BufferLockBusy, INGEST_BUFFER_LOCK_BUSY=on) alerts for 55P03 and also for 40P01, which only that conversion
- * would otherwise remove from every alert; a buffer-stage 40P01 503 (flag off) stays as before (no lock alert). */
+ * would otherwise remove from every alert; a buffer-stage 40P01 503 (flag off) stays as before (no lock alert).
+ * A buffer-stage statement timeout refused as 429 (BufferLockBusy, INGEST_BUFFER_TIMEOUT_BUSY=on) still alerts
+ * for 57014 at staged_intent / staged_ack, exactly as its 503 does with the flag off. */
 export function lockAlertFields(error: unknown, acceptanceMode: string | undefined): { route: "ingest.lock_alert"; stage: LockAlertStage; sqlstate: string } | undefined {
   if (!(error instanceof IngestUnavailable || error instanceof ClaimLockBusy)) return undefined;
   const sqlstate = error.db?.db_error_code;

@@ -20,9 +20,10 @@
  *                cannot fire on one or two failures (below the floor the value is failures / MIN_DELIVERIES).
  * A claim converted to 429 `delivery_busy` (INGEST_CLAIM_LOCK_BUSY / INGEST_CLAIM_TIMEOUT_BUSY) is designed
  * back-pressure, not a failed delivery: it counts in the denominator only. So does a `buffer_intent` /
- * `buffer_receipt` lock wait converted to 429 by INGEST_BUFFER_LOCK_BUSY (55P03 or 40P01); this query does not
- * see it. Those stay visible through the `ingest.lock_alert` line (src/session-ingest/app.ts lockAlertFields,
- * `staged_intent` / `staged_ack`), which for that conversion also fires for 40P01. A lock wait absorbed by an
+ * `buffer_receipt` lock wait converted to 429 by INGEST_BUFFER_LOCK_BUSY (55P03 or 40P01), and a statement
+ * timeout there converted by INGEST_BUFFER_TIMEOUT_BUSY (57014 by code); this query does not see them. Those stay
+ * visible through the `ingest.lock_alert` line (src/session-ingest/app.ts lockAlertFields, `staged_intent` /
+ * `staged_ack`, with their sqlstate), which for the lock-wait conversion also fires for 40P01. A lock wait absorbed by an
  * INGEST_BUFFER_LOCK_RETRY retry shows only on its `ingest.buffer_lock_retry` warn line.
  *
  * The Worker profile (stacks/cloudflare/session-ingest.ts, config/cloudflare/private-ingest-production.json) and

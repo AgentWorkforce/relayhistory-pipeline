@@ -883,8 +883,9 @@ export function inflightLeaseDeletionAllowed(
 /**
  * The only plan that may unbind INGEST_BUFFER_LOCK_BUSY (rollback to off): the candidate profile omits
  * bufferLockBusy, no value is proposed, and the live value is exactly "on" (strict, no trim or case
- * folding, as the private-ingest release guard reads it in private-ingest-release.ts). No other buffer or
- * claim flag has an unbind: INGEST_BUFFER_LOCK_RETRY and INGEST_CLAIM_LOCK_BUSY stay refused.
+ * folding, as the private-ingest release guard reads it in private-ingest-release.ts). Of the other buffer and
+ * claim flags only INGEST_BUFFER_TIMEOUT_BUSY has an unbind (bufferTimeoutBusyDeletionAllowed):
+ * INGEST_BUFFER_LOCK_RETRY, INGEST_CLAIM_LOCK_BUSY and INGEST_CLAIM_TIMEOUT_BUSY stay refused.
  */
 export function bufferLockBusyDeletionAllowed(
   sessionIngest: CloudflareStageInputs["sessionIngest"],
@@ -894,6 +895,21 @@ export function bufferLockBusyDeletionAllowed(
   const live = currentEnv?.INGEST_BUFFER_LOCK_BUSY;
   return sessionIngest.bufferLockBusy === undefined &&
     proposedEnv?.INGEST_BUFFER_LOCK_BUSY === undefined &&
+    live === "on";
+}
+/**
+ * The only plan that may unbind INGEST_BUFFER_TIMEOUT_BUSY (rollback to off): the candidate profile omits
+ * bufferTimeoutBusy, no value is proposed, and the live value is exactly "on" (strict, no trim or case
+ * folding, as the private-ingest release guard reads it in private-ingest-release.ts).
+ */
+export function bufferTimeoutBusyDeletionAllowed(
+  sessionIngest: CloudflareStageInputs["sessionIngest"],
+  currentEnv: Record<string, unknown> | undefined,
+  proposedEnv: Record<string, unknown> | undefined,
+): boolean {
+  const live = currentEnv?.INGEST_BUFFER_TIMEOUT_BUSY;
+  return sessionIngest.bufferTimeoutBusy === undefined &&
+    proposedEnv?.INGEST_BUFFER_TIMEOUT_BUSY === undefined &&
     live === "on";
 }
 export function assertOperatorSnapshot(
@@ -1061,6 +1077,11 @@ export function assertOperatorSnapshot(
             if (!bufferLockBusyDeletionAllowed(input.sessionIngest, currentEnv, proposedEnv))
               refuse("native_binding_target");
             deletedValue = currentEnv.INGEST_BUFFER_LOCK_BUSY;
+          } else if (b.sid === "INGEST_BUFFER_TIMEOUT_BUSY") {
+            // Rolling the buffer-stage statement-timeout 429 back to off: only a strict live "on".
+            if (!bufferTimeoutBusyDeletionAllowed(input.sessionIngest, currentEnv, proposedEnv))
+              refuse("native_binding_target");
+            deletedValue = currentEnv.INGEST_BUFFER_TIMEOUT_BUSY;
           } else {
             refuse("native_binding_target");
           }
