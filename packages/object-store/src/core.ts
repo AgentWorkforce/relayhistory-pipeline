@@ -369,7 +369,8 @@ export async function errorBody(response: Response): Promise<string> {
  * rejects with a `transient` error; afterwards, a body read still pending when
  * it passes errors the body stream with the same `transient` error. The timer
  * stops when the body ends, errors or is cancelled, or at once when the
- * response has no body. Signing and other work before the call are not
+ * response has no body or a null-body status (204, 205, 304), which is
+ * returned unwrapped. Signing and other work before the call are not
  * covered. Undefined: no abort signal and no wrapping, exactly as without it.
  */
 export async function send(
@@ -396,6 +397,8 @@ export async function send(
   }
   return sendWithTimeout(backend, key, url, init, fetchImpl, timeoutMs);
 }
+
+const NULL_BODY_STATUSES = new Set([204, 205, 304]);
 
 async function sendWithTimeout(
   backend: string,
@@ -436,7 +439,9 @@ async function sendWithTimeout(
       cause,
     });
   }
-  if (!res.body) {
+  // A null-body status cannot be rebuilt around a stream (the Response
+  // constructor throws), so such a response is returned as it came.
+  if (!res.body || NULL_BODY_STATUSES.has(res.status)) {
     clearTimeout(timer);
     return res;
   }

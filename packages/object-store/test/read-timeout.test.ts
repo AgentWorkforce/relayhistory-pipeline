@@ -186,6 +186,46 @@ describe("object read deadline: set", () => {
     expect(error.message).toMatch(/request failed/);
   });
 
+  it("a network failure stops the timer at once", async () => {
+    vi.useFakeTimers();
+    const { fetchImpl } = recording(async () => {
+      throw new TypeError("connection reset");
+    });
+    const error = await send(
+      "s3",
+      "k",
+      "http://localhost:1/k",
+      { method: "GET" },
+      fetchImpl,
+      50,
+    ).catch((e) => e);
+    expect(isObjectStoreError(error, "transient")).toBe(true);
+    expect(error.message).toMatch(/request failed/);
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it.each([204, 205, 304])(
+    "a %i response is returned as it came and stops the timer",
+    async (status) => {
+      vi.useFakeTimers();
+      // A fetch could hand back a body with a null-body status; the Response
+      // constructor refuses to build one, so the status is set afterwards.
+      const response = new Response("x", { status: 200 });
+      Object.defineProperty(response, "status", { value: status });
+      const { fetchImpl } = recording(async () => response);
+      const got = await send(
+        "s3",
+        "k",
+        "http://localhost:1/k",
+        { method: "GET" },
+        fetchImpl,
+        50,
+      );
+      expect(got).toBe(response);
+      expect(vi.getTimerCount()).toBe(0);
+    },
+  );
+
   it("PUT, list and delete carry no signal and are not cut off", async () => {
     const { seen, fetchImpl } = recording(async (init) =>
       init?.method === "GET"
