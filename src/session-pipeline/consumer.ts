@@ -9,15 +9,32 @@
  * fails exactly the messages that fed the failed key or scope (SQS partial
  * batch response); SQS redelivers them after the visibility timeout and moves
  * them to the DLQ after `maxReceiveCount`.
+ *
+ * Batch deadline (SEARCH_INDEX_BATCH_DEADLINE_MARGIN_MS, default off; `batchDeadline` below):
+ * before each scope's search pass, once the invocation's remaining time is under the margin,
+ * the scope is not started but requeued with its deferral count plus one (reason
+ * `batch_deadline`); a pass already running is never interrupted. A scope whose count (the
+ * largest over its messages) has reached BATCH_DEADLINE_MAX_DEFERRALS runs before the others,
+ * and if it still cannot start it is failed rather than requeued (reason
+ * `batch_deadline_deferrals_exhausted`), so SQS redelivers it and the DLQ bounds it. Every
+ * other requeue (busy, stream deferred, buffered stage, pointer liveness) writes no count, so
+ * the count restarts from 0 after any of them.
  */
 import { errorFields, log, searchIndexErrorDetail } from "../shared/log.ts";
 import { parseQueueBody, sequencerAfter, type LandedEvent } from "./s3-events.ts";
 import { indexPointer, type PointerDeps, type SessionScope } from "./pointer.ts";
 import { indexSearchScope, searchIndexPhaseMetrics, type SearchIndexDeps } from "./search-index.ts";
+import { streamDeadlinePassed, type StreamDeadline } from "../session-read-api/canonical-stream-projection.ts";
 import { LEGACY_PROVENANCE_INVALID } from "../session-read-api/legacy-provenance.ts";
 import { captureRefusal, classifyReplayFailure, produceCanonicalReplay, type ReplayProducerDeps } from "./replay-publication.ts";
 import type { LargeJobState, LargeRoute } from "./large-read-worker.ts";
 import { feedBufferedStageByKey, isBufferedStageKey, type BufferedFeedDeps } from "./buffered-search-feed.ts";
+
+/**
+ * The batch-deadline deferral cap: a scope requeued for the batch deadline this many times
+ * runs first in its next batch and, if it still cannot start, is failed instead of requeued.
+ */
+export const BATCH_DEADLINE_MAX_DEFERRALS = 3;
 
 export interface QueueRecord {
   messageId: string;
@@ -43,20 +60,30 @@ export interface ConsumerDeps {
    * Put a manifest back on the queue after a delay (SQS DelaySeconds): used when
    * another pass holds the session, so the event is neither lost nor failed.
    */
-  requeue?: (manifestKey: string) => Promise<void>;
+  requeue?: (manifestKey: string, batchDeadlineDeferrals?: number) => Promise<void>;
   /**
    * Absent by default (INGEST_BUFFERED_SEARCH_FEED=on only): a buffered-stage object event
    * (`…/buffered-batches/v1/…`) feeds that stage into the search index instead of reaching the
    * pointer stage, which ignores such keys anyway. Absent: exactly the previous behavior.
    */
   bufferedFeed?: BufferedFeedDeps;
+  /**
+   * SEARCH_INDEX_BATCH_DEADLINE_MARGIN_MS only (lambda.ts invocationDeps): the instant after
+   * which no further scope's search pass is started (see the file comment). Absent: off.
+   */
+  batchDeadline?: StreamDeadline;
+}
+
+function withoutDeferrals(event: LandedEvent): LandedEvent {
+  const { batchDeadlineDeferrals: _deferrals, ...landed } = event;
+  return landed;
 }
 
 const scopeId = (s: SessionScope) => JSON.stringify([s.orgId, s.workspaceId, s.harness, s.sessionId]);
 
 export async function processBatch(records: readonly QueueRecord[], deps: ConsumerDeps): Promise<BatchResponse> {
   const failed = new Set<string>();
-  const byKey = new Map<string, { event: LandedEvent; messageIds: string[] }>();
+  const byKey = new Map<string, { event: LandedEvent; messageIds: string[]; deferrals: number }>();
   for (const record of records) {
     // Events carry the provider of the Locker the pointer stage reads from (s3 on the
     // Lambda, LOCKER_PROVIDER on self-host), which is what the row's storage_provider records.
@@ -70,16 +97,20 @@ export async function processBatch(records: readonly QueueRecord[], deps: Consum
     }
     for (const event of parsed.events) {
       const held = byKey.get(event.key);
-      if (!held) byKey.set(event.key, { event, messageIds: [record.messageId] });
+      if (!held) byKey.set(event.key, { event, messageIds: [record.messageId], deferrals: event.batchDeadlineDeferrals ?? 0 });
       else {
         held.messageIds.push(record.messageId);
+        held.deferrals = Math.max(held.deferrals, event.batchDeadlineDeferrals ?? 0);
         if (sequencerAfter(event.sequencer, held.event.sequencer)) held.event = event;
       }
     }
   }
 
-  const scopes = new Map<string, { scope: SessionScope; messageIds: string[]; manifestKey: string }>();
-  for (const { event, messageIds } of byKey.values()) {
+  const scopes = new Map<string, { scope: SessionScope; messageIds: string[]; manifestKey: string; deferrals: number }>();
+  for (const { event: carried, messageIds, deferrals } of byKey.values()) {
+    // The deferral count is the consumer's own: no stage sees it (stripped only when present,
+    // so an event without it reaches the stages as the same object as before).
+    const event = carried.batchDeadlineDeferrals === undefined ? carried : withoutDeferrals(carried);
     const started = Date.now();
     if (deps.bufferedFeed && isBufferedStageKey(event.key)) {
       // KEEP-UP. A delete event is a GC removal: index-row deletes are their own lane, so it is a no-op here.
@@ -130,8 +161,10 @@ export async function processBatch(records: readonly QueueRecord[], deps: Consum
       });
       const id = scopeId(outcome.scope);
       const held = scopes.get(id);
-      if (held) held.messageIds.push(...messageIds);
-      else scopes.set(id, { scope: outcome.scope, messageIds: [...messageIds], manifestKey: outcome.manifestKey });
+      if (held) {
+        held.messageIds.push(...messageIds);
+        held.deferrals = Math.max(held.deferrals, deferrals);
+      } else scopes.set(id, { scope: outcome.scope, messageIds: [...messageIds], manifestKey: outcome.manifestKey, deferrals });
     } catch (error) {
       log.error("pointer index failed", { stage: "session-indexed", ...errorFields(error), duration_ms: Date.now() - started });
       for (const id of messageIds) failed.add(id);
@@ -168,7 +201,12 @@ export async function processBatch(records: readonly QueueRecord[], deps: Consum
     }catch(error){log.warn("large scope job state unavailable",{stage:"large-read",...ids,...errorFields(error)})}
   }
   if (deps.search) {
-    for (const { scope, messageIds, manifestKey } of scopes.values()) {
+    const batchDeadline = deps.batchDeadline;
+    // Batch deadline armed only: scopes at the deferral cap first, otherwise in today's order (stable sort).
+    const ordered = batchDeadline
+      ? [...scopes.values()].sort((a, b) => Number(b.deferrals >= BATCH_DEADLINE_MAX_DEFERRALS) - Number(a.deferrals >= BATCH_DEADLINE_MAX_DEFERRALS))
+      : scopes.values();
+    for (const { scope, messageIds, manifestKey, deferrals } of ordered) {
       if (delegated.has(scopeId(scope)) || messageIds.every((id) => failed.has(id))) continue;
       const started = Date.now();
       const phase = searchIndexPhaseMetrics();
@@ -180,6 +218,30 @@ export async function processBatch(records: readonly QueueRecord[], deps: Consum
         write_batches: phase.writeBatches,
       });
       try {
+        // SEARCH_INDEX_BATCH_DEADLINE_MARGIN_MS only: past the batch deadline no further pass starts.
+        if (batchDeadline && streamDeadlinePassed(batchDeadline)) {
+          if (deferrals >= BATCH_DEADLINE_MAX_DEFERRALS) {
+            log.error("search index past the batch deadline, deferrals exhausted", {
+              stage: "search-index",
+              org_id: scope.orgId,
+              session_id: scope.sessionId,
+              reason: "batch_deadline_deferrals_exhausted",
+              batch_deadline_deferrals: deferrals,
+            });
+            for (const id of messageIds) failed.add(id);
+            continue;
+          }
+          if (!deps.requeue) throw new Error("batch past its deadline and no requeue");
+          await deps.requeue(manifestKey, deferrals + 1);
+          log.info("search index past the batch deadline, requeued", {
+            stage: "search-index",
+            org_id: scope.orgId,
+            session_id: scope.sessionId,
+            reason: "batch_deadline",
+            batch_deadline_deferrals: deferrals + 1,
+          });
+          continue;
+        }
         const result = await indexSearchScope(scope, { ...deps.search, metrics: phase });
         if (result.busy) {
           // The running pass may have read S3 before this event's write: run again later.

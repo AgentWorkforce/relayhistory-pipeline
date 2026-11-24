@@ -118,6 +118,14 @@ export interface SessionPipelineInputs {
     /** Time kept back from the invocation's remaining time (SEARCH_INDEX_STREAM_DEADLINE_MARGIN_MS, 10000-240000). Default 60000. */
     deadlineMarginMs?: number;
   };
+  /**
+   * The search stage's batch deadline (src/session-pipeline/consumer.ts). Absent: no variable is
+   * rendered and every scope of a batch is started as before. `marginMs` (an integer from
+   * MS_INPUT_MIN to MS_INPUT_MAX, below the function timeout) needs `searchIndex: true` and renders
+   * SEARCH_INDEX_BATCH_DEADLINE_MARGIN_MS: once the invocation's remaining time is under it, no
+   * further scope's pass starts and the rest are requeued.
+   */
+  searchBatchDeadline?: { marginMs: number };
   /** Default off. `true` is refused until the reviewed normalized-prefix PutObject/KMS grant and publication migration exist. */
   replayPages?: boolean;
   /** Dormant full v1 analysis-cache worker; separate readonly source secret required. */
@@ -325,12 +333,29 @@ export function sessionPipelineNames(stage: string, accountId: string, region: s
   };
 }
 
+/** Bounds of the opt-in millisecond inputs: the same as the function's own check (src/session-pipeline/lambda.ts msKnobFromEnv). */
+export const MS_INPUT_MIN = 1_000;
+export const MS_INPUT_MAX = FUNCTION_TIMEOUT_SECONDS * 1000 - 1_000;
+
+/** A plain object of millisecond integers within MS_INPUT_MIN..MS_INPUT_MAX: unknown keys refused, `required` keys present. */
+function assertMsInputs(value: unknown, path: string, keys: readonly string[], required: readonly string[], refuse: (why: string) => never): void {
+  if (value === null || typeof value !== "object" || Array.isArray(value) || Object.getPrototypeOf(value) !== Object.prototype)
+    refuse(`transcriptStore.sessionPipeline.${path} must be a plain object`);
+  const o = value as Record<string, unknown>;
+  for (const k of Object.keys(o)) if (!keys.includes(k)) refuse(`transcriptStore.sessionPipeline.${path}.${k} is not a known setting`);
+  for (const k of keys) {
+    if (o[k] === undefined && !required.includes(k)) continue;
+    if (!(Number.isInteger(o[k]) && (o[k] as number) >= MS_INPUT_MIN && (o[k] as number) <= MS_INPUT_MAX))
+      refuse(`transcriptStore.sessionPipeline.${path}.${k} must be an integer from ${MS_INPUT_MIN} to ${MS_INPUT_MAX}`);
+  }
+}
+
 export function assertSessionPipelineInputs(p: unknown, refuse: (why: string) => never): asserts p is SessionPipelineInputs {
   if (p === null || typeof p !== "object" || Array.isArray(p) || Object.getPrototypeOf(p) !== Object.prototype)
     refuse("transcriptStore.sessionPipeline must be a plain object");
   const v = p as Record<string, unknown>;
   for (const k of Object.keys(v))
-    if (k !== "searchIndex" && k !== "replayPages" && k!=="analysisCache" && k !== "legacyReadSource" && k !== "desktopCatalog" && k !== "maxConcurrency" && k !== "reconcileMinutes" && k !== "briefs" && k !== "semanticCopy" && k !== "analysisJobs" && k !== "bufferedSearchFeed" && k !== "bufferedErasureDelete" && k !== "neonExit" && k !== "relayfacts" && k !== "schedules" && k !== "streamReconcile" && k !== "summaryRegen" && k !== "skipCurrent" && k !== "searchPreRead" && k !== "pointerPreRead" && k !== "pointerSkipOriginBucket") refuse(`transcriptStore.sessionPipeline.${k} is not a known setting`);
+    if (k !== "searchIndex" && k !== "replayPages" && k!=="analysisCache" && k !== "legacyReadSource" && k !== "desktopCatalog" && k !== "maxConcurrency" && k !== "reconcileMinutes" && k !== "briefs" && k !== "semanticCopy" && k !== "analysisJobs" && k !== "bufferedSearchFeed" && k !== "bufferedErasureDelete" && k !== "neonExit" && k !== "relayfacts" && k !== "schedules" && k !== "streamReconcile" && k !== "summaryRegen" && k !== "skipCurrent" && k !== "searchPreRead" && k !== "pointerPreRead" && k !== "pointerSkipOriginBucket" && k !== "searchBatchDeadline") refuse(`transcriptStore.sessionPipeline.${k} is not a known setting`);
   if (v.searchIndex !== undefined && typeof v.searchIndex !== "boolean") refuse("transcriptStore.sessionPipeline.searchIndex must be a boolean");
   if (v.replayPages !== undefined && typeof v.replayPages !== "boolean") refuse("transcriptStore.sessionPipeline.replayPages must be a boolean");
   if(v.analysisCache!==undefined&&typeof v.analysisCache!=="boolean")refuse("transcriptStore.sessionPipeline.analysisCache must be a boolean");
@@ -426,6 +451,10 @@ export function assertSessionPipelineInputs(p: unknown, refuse: (why: string) =>
       refuse("transcriptStore.sessionPipeline.streamReconcile.maxReadEvents must be an integer from 400000 to 1000000");
     if (r.deadlineMarginMs !== undefined && !(Number.isInteger(r.deadlineMarginMs) && (r.deadlineMarginMs as number) >= 10_000 && (r.deadlineMarginMs as number) <= 240_000))
       refuse("transcriptStore.sessionPipeline.streamReconcile.deadlineMarginMs must be an integer from 10000 to 240000");
+  }
+  if (v.searchBatchDeadline !== undefined) {
+    assertMsInputs(v.searchBatchDeadline, "searchBatchDeadline", ["marginMs"], ["marginMs"], refuse);
+    if (v.searchIndex !== true) refuse("transcriptStore.sessionPipeline.searchBatchDeadline requires searchIndex: true");
   }
   if (v.briefs !== undefined) {
     const b = v.briefs as Record<string, unknown> | null;
@@ -720,6 +749,8 @@ export function sessionPipelineEnv(i: { stage: string; bucket: string; names: Se
     ...(i.p.streamReconcile?.enabled === true && i.p.streamReconcile.maxReadBytes !== undefined ? { SEARCH_INDEX_STREAM_CH_MAX_READ_BYTES: String(i.p.streamReconcile.maxReadBytes) } : {}),
     ...(i.p.streamReconcile?.enabled === true && i.p.streamReconcile.maxReadEvents !== undefined ? { SEARCH_INDEX_STREAM_CH_MAX_READ_EVENTS: String(i.p.streamReconcile.maxReadEvents) } : {}),
     ...(i.p.streamReconcile?.enabled === true && i.p.streamReconcile.deadlineMarginMs !== undefined ? { SEARCH_INDEX_STREAM_DEADLINE_MARGIN_MS: String(i.p.streamReconcile.deadlineMarginMs) } : {}),
+    // Only when set: a stage without searchBatchDeadline renders nothing new.
+    ...(i.p.searchBatchDeadline !== undefined ? { SEARCH_INDEX_BATCH_DEADLINE_MARGIN_MS: String(i.p.searchBatchDeadline.marginMs) } : {}),
     PIPELINE_FANOUT: "off",
     PIPELINE_RECONCILE_LOOKBACK_MINUTES: String(2 * (i.p.reconcileMinutes ?? 30)),
     HOOPDB_POOL_MAX: "4",

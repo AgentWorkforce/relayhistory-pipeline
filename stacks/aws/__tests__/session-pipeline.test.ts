@@ -7,6 +7,8 @@ import type { AwsInputs } from "../inputs.ts";
 import {
   DELIVERY_DELAY_SECONDS,
   FUNCTION_TIMEOUT_SECONDS,
+  MS_INPUT_MAX,
+  MS_INPUT_MIN,
   SESSION_BRIEF_RESOURCES,
   SESSION_ANALYSIS_CACHE_RESOURCES,
   SESSION_ANALYSIS_JOB_RESOURCES,
@@ -39,7 +41,7 @@ import { assertTranscriptStoreInputs, assertTranscriptStorePlanContract, transcr
 import { bufferedFeedConfig, bufferedFeedGateRefusal, BUFFERED_SEARCH_GATE_CONTRACT } from "../../../src/session-pipeline/buffered-search-feed.ts";
 import { bufferedErasureConfig } from "../../../src/session-pipeline/buffered-erasure-delete.ts";
 import { searchIndexLimits, searchIndexStreamChFromEnv, searchIndexStreamFloor, SEARCH_INDEX_STREAM_CH_CEILING } from "../../../src/session-pipeline/search-index.ts";
-import { lambdaEnv, pointerPreReadFromEnv, pointerSkipOriginBucketFromEnv, searchIndexPreReadFromEnv, searchIndexSkipCurrentFromEnv } from "../../../src/session-pipeline/lambda.ts";
+import { MS_KNOB_MAX, MS_KNOB_MIN, lambdaEnv, pointerPreReadFromEnv, pointerSkipOriginBucketFromEnv, searchIndexPreReadFromEnv, searchIndexSkipCurrentFromEnv } from "../../../src/session-pipeline/lambda.ts";
 import { NeonExitRefusal } from "../../../src/shared/neon-exit.ts";
 import { analysisConfig } from "../../../src/session-analysis/worker.ts";
 
@@ -1243,5 +1245,58 @@ describe("session pipeline: summaryRegen (summaries regeneration push A, default
     bad({ audit: { enabled: true, retentionDays: 0 } }, /audit.retentionDays must be an integer from 1 to 3650/);
     bad({ audit: { enabled: true, retentionDays: 3651 } }, /audit.retentionDays/);
     bad({ audit: { retentionDays: 90 } }, /audit.enabled must be a boolean/);
+  });
+});
+
+describe("session pipeline: search batch deadline", () => {
+  const refuse = (why: string): never => {
+    throw new Error(why);
+  };
+  const envOf = (cfg: SessionPipelineInputs) => sessionPipelineEnv({ stage: STAGE, bucket: t.bucket, names: p, p: cfg });
+  // The variable list base 48f61828 renders for these inputs, in order: the new inputs, absent, change nothing.
+  const BASE_KEYS = ["DEPLOYMENT", "DEPLOYMENT_ID", "OTEL_SERVICE_NAME", "PIPELINE_RAW_S3_BUCKET", "PIPELINE_KEY_PREFIX", "PIPELINE_ORG_FROM_PREFIX", "SESSION_PIPELINE_SECRET_ARN", "SESSION_PIPELINE_QUEUE_URL", "SEARCH_INDEX_ENABLED", "SESSION_REPLAY_PAGES_ENABLED", "SESSION_ANALYSIS_CACHE_ENABLED", "SESSION_DESKTOP_CATALOG_ENABLED", "SESSION_SEMANTIC_COPY_ENABLED", "SESSION_SEARCH_FEATURE_SOURCE_ID", "SESSION_ANALYSIS_ENABLED", "PIPELINE_FANOUT", "PIPELINE_RECONCILE_LOOKBACK_MINUTES", "HOOPDB_POOL_MAX", "NODE_OPTIONS", "SESSION_BRIEF_ENABLED"];
+
+  it("absent renders exactly the base variables, in the base order", () => {
+    expect(Object.keys(envOf({}))).toEqual(BASE_KEYS);
+    expect(Object.keys(envOf({ searchIndex: true }))).toEqual(BASE_KEYS);
+  });
+
+  it("absent renders nothing new; set renders SEARCH_INDEX_BATCH_DEADLINE_MARGIN_MS only", () => {
+    const off = envOf({ searchIndex: true });
+    expect(Object.keys(off)).not.toContain("SEARCH_INDEX_BATCH_DEADLINE_MARGIN_MS");
+    const on = envOf({ searchIndex: true, searchBatchDeadline: { marginMs: 90_000 } });
+    expect(on).toEqual({ ...off, SEARCH_INDEX_BATCH_DEADLINE_MARGIN_MS: "90000" });
+    const both = envOf({ searchIndex: true, streamReconcile: { enabled: true }, searchBatchDeadline: { marginMs: 90_000 } });
+    expect(both).toEqual({ ...off, SEARCH_INDEX_STREAMING_CH: "1", SEARCH_INDEX_BATCH_DEADLINE_MARGIN_MS: "90000" });
+    expect(lambdaEnv({ AWS_REGION: REGION, ...on }).searchBatchDeadlineMarginMs).toBe(90_000);
+  });
+
+  it("the bounds are the function's own and stay below the function timeout", () => {
+    expect(MS_INPUT_MIN).toBe(MS_KNOB_MIN);
+    expect(MS_INPUT_MAX).toBe(MS_KNOB_MAX);
+    expect(MS_INPUT_MAX).toBeLessThan(FUNCTION_TIMEOUT_SECONDS * 1000);
+  });
+
+  it("validates the shape and the value strictly and needs searchIndex: true", () => {
+    const ok = (v: unknown) => assertSessionPipelineInputs(v, refuse);
+    for (const marginMs of [MS_INPUT_MIN, 90_000, MS_INPUT_MAX])
+      expect(() => ok({ searchIndex: true, searchBatchDeadline: { marginMs } })).not.toThrow();
+    for (const marginMs of [-1, 0, 999, MS_INPUT_MAX + 1, FUNCTION_TIMEOUT_SECONDS * 1000, 1.5, Number.NaN, Number.POSITIVE_INFINITY, "90000", null, undefined])
+      expect(() => ok({ searchIndex: true, searchBatchDeadline: { marginMs } })).toThrow(/searchBatchDeadline\.marginMs must be an integer from 1000 to 299000/);
+    expect(() => ok({ searchBatchDeadline: { marginMs: 90_000 } })).toThrow(/searchBatchDeadline requires searchIndex: true/);
+    expect(() => ok({ searchIndex: false, searchBatchDeadline: { marginMs: 90_000 } })).toThrow(/searchBatchDeadline requires searchIndex: true/);
+    expect(() => ok({ searchIndex: true, searchBatchDeadline: { marginMs: 90_000, maxDeferrals: 3 } })).toThrow(/maxDeferrals is not a known setting/);
+    for (const bad of [90_000, true, null, [], "90000"])
+      expect(() => ok({ searchIndex: true, searchBatchDeadline: bad })).toThrow(/searchBatchDeadline must be a plain object/);
+  });
+
+  it("the function's resources and props are the same with it set, but the env", () => {
+    const i = { stage: STAGE, accountId: ACCOUNT, region: REGION, bucket: t.bucket, tags: () => ({}) };
+    const off = sessionPipelineFunctionProps({ ...i, p: { searchIndex: true } });
+    const on = sessionPipelineFunctionProps({ ...i, p: { searchIndex: true, searchBatchDeadline: { marginMs: 90_000 } } });
+    // The build plugin is a fresh object (with closures) per call: compare it by name.
+    const plain = (x: typeof on) => ({ ...x, env: undefined, build: { ...x.build, plugins: x.build.plugins.map((pl) => pl.name) } });
+    expect(plain(on)).toEqual(plain(off));
+    expect(on.env).toEqual({ ...off.env, SEARCH_INDEX_BATCH_DEADLINE_MARGIN_MS: "90000" });
   });
 });

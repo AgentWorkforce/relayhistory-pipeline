@@ -119,6 +119,9 @@ export const ALLOWED_LOG_FIELDS = new Set([
   // live holder the key already had; a bounded integer. `same_origin`: whether at least one of those live holders
   // was taken with this request's origin; a boolean only (BOOLEAN_FIELDS), never the origin id.
   "age_ms", "same_origin",
+  // How often a scope was requeued for the opt-in batch deadline (src/session-pipeline/consumer.ts): a bounded
+  // count only (BOUNDED_COUNT_FIELDS).
+  "batch_deadline_deferrals",
 ]);
 
 /**
@@ -143,6 +146,7 @@ export const BOUNDED_COUNT_FIELDS: ReadonlyMap<string, number> = new Map([
   ["skipped_budget", 100_000],
   ["skipped_control", 100_000],
   ["age_ms", 3_600_000],
+  ["batch_deadline_deferrals", 1_000],
   ...ADMISSION_PHASE_FIELDS_LIST.map((f): [string, number] => [f, 3_600_000]),
   ...ANALYTICS_COUNTER_FIELDS.map((f): [string, number] => [f, Number.MAX_SAFE_INTEGER]),
   ...SEAL_POOL_LOG_FIELDS.map((f): [string, number] => [f, Number.MAX_SAFE_INTEGER]),

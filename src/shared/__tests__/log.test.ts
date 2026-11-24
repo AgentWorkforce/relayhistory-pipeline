@@ -142,6 +142,19 @@ describe("telemetry allowlist", () => {
     }
     expect(Object.hasOwn(JSON.parse(logLine("info", "request", { same_origin: "origin-1" })), "same_origin")).toBe(false);
   });
+
+  test("batch_deadline_deferrals (the consumer's batch-deadline lines) is a bounded integer only", () => {
+    expect(ALLOWED_LOG_FIELDS.has("batch_deadline_deferrals")).toBe(true);
+    expect(BOUNDED_COUNT_FIELDS.get("batch_deadline_deferrals")).toBe(1_000);
+    for (const v of [0, 1, 3]) expect(sanitizeLogField("batch_deadline_deferrals", v)).toBe(v);
+    expect(sanitizeLogField("batch_deadline_deferrals", Number.MAX_SAFE_INTEGER)).toBe(1_000);
+    for (const bad of ["2", "org_123", -1, 1.5, Number.NaN, null, true, {}]) expect(sanitizeLogField("batch_deadline_deferrals", bad)).toBeUndefined();
+    // Through the real logLine filter, as the consumer emits it.
+    const line = JSON.parse(logLine("info", "search index past the batch deadline, requeued", { stage: "search-index", reason: "batch_deadline", batch_deadline_deferrals: 2 }));
+    expect(line).toMatchObject({ stage: "search-index", reason: "batch_deadline", batch_deadline_deferrals: 2 });
+    expect(Object.hasOwn(JSON.parse(logLine("info", "x", { batch_deadline_deferrals: "2" })), "batch_deadline_deferrals")).toBe(false);
+    expect(Object.hasOwn(JSON.parse(logLine("info", "x", { batch_deadline_deferrals: -1 })), "batch_deadline_deferrals")).toBe(false);
+  });
   test("error fields are code-only", () => {
     const f = errorFields(Object.assign(new Error("Authorization: Bearer sk-live-123"), { code: "chunk_empty", retryable: false }));
     expect(f).toEqual({ error_code: "chunk_empty", retryable: false });

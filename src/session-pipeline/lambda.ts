@@ -78,7 +78,7 @@ import { droppedFanout, scopeLockKey, type ScopeLock } from "./pointer.ts";
 import { searchIndexLimits, searchIndexStreamChFromEnv, type SearchIndexStreamCh } from "./search-index.ts";
 import { BufferedFeedError, bufferedFeedConfig, bufferedFeedGateRefusal, bufferedFeedVersionRefusal, clickhouseTieLedger, runBufferedFeed, sqlBufferedFeedSource, type BufferedFeedConfig } from "./buffered-search-feed.ts";
 import { bufferedErasureConfig, runBufferedErasureDelete, type BufferedErasureConfig, type BufferedErasureDeps } from "./buffered-erasure-delete.ts";
-import { RECONCILE_BODY_KEY } from "./s3-events.ts";
+import { RECONCILE_BODY_KEY, requeueBody } from "./s3-events.ts";
 import { BUFFERED_FEED_CA_FIELD, BUFFERED_FEED_URL_FIELD, bufferedFeedClientConfig, loginCheckedFeedExecutor } from "./buffered-feed-login.ts";
 import { postgresConnectionString, postgresTlsOptions } from "../shared/postgres-tls.ts";
 import { composeSearchService, searchSecret, type SearchComposition } from "../shared/search-composition.ts";
@@ -172,6 +172,35 @@ export interface LambdaEnv {
   bufferedErasureDelete?: BufferedErasureConfig;
   /** READER_MAX_RULESET: absent (default) keeps legacy sealed reads; set, every raw reader built here enforces it. */
   readerMaxRuleset?: number;
+  /**
+   * SEARCH_INDEX_BATCH_DEADLINE_MARGIN_MS (default off): with a Lambda context, no scope's search
+   * pass starts once the invocation's remaining time is under this margin; the rest of the batch
+   * is requeued (consumer.ts batch deadline). Absent: as before.
+   */
+  searchBatchDeadlineMarginMs?: number;
+}
+
+/** Bounds (ms) shared by the opt-in millisecond knobs: at least one second, below the function's 300 s timeout. */
+export const MS_KNOB_MIN = 1_000;
+export const MS_KNOB_MAX = 299_000;
+
+/**
+ * One opt-in millisecond knob: unset or "" is off (undefined); otherwise a decimal integer of
+ * milliseconds from MS_KNOB_MIN to MS_KNOB_MAX, else init fails naming the variable, never the value.
+ */
+export function msKnobFromEnv(env: Record<string, string | undefined>, name: string): number | undefined {
+  const value = env[name];
+  if (value === undefined || value === "") return undefined;
+  const ms = /^[1-9][0-9]{0,8}$/.test(value) ? Number(value) : NaN;
+  if (!(ms >= MS_KNOB_MIN && ms <= MS_KNOB_MAX)) throw new Error(`session pipeline: ${name} must be an integer from ${MS_KNOB_MIN} to ${MS_KNOB_MAX}`);
+  return ms;
+}
+
+/** SEARCH_INDEX_BATCH_DEADLINE_MARGIN_MS: the knob grammar above, and set needs SEARCH_INDEX_ENABLED=1. */
+export function batchDeadlineMarginFromEnv(env: Record<string, string | undefined>): number | undefined {
+  const ms = msKnobFromEnv(env, "SEARCH_INDEX_BATCH_DEADLINE_MARGIN_MS");
+  if (ms !== undefined && env.SEARCH_INDEX_ENABLED !== "1") throw new Error("session pipeline: SEARCH_INDEX_BATCH_DEADLINE_MARGIN_MS needs SEARCH_INDEX_ENABLED=1");
+  return ms;
 }
 
 /**
@@ -243,6 +272,8 @@ export function lambdaEnv(env: NodeJS.ProcessEnv = process.env, composition?: Se
   const pointerSkipOriginBucket = pointerSkipOriginBucketFromEnv(env);
   // Unset is undefined (legacy reads, no field); a malformed value refuses init, as briefConfig() already does.
   const maximum = readerMaxRuleset(env);
+  // SEARCH_INDEX_BATCH_DEADLINE_MARGIN_MS: strict grammar, default off; set needs the search stage.
+  const searchBatchDeadlineMarginMs = batchDeadlineMarginFromEnv(env);
   return {
     searchBackend: selected.search,
     adapterEnv: Object.freeze(Object.fromEntries(Object.entries(env).filter(([key]) => key.startsWith("SEARCH_INDEX_") || ["PIPELINE_RUNTIME", "AWS_REGION", "READ_API_COMPLETE_SINCE"].includes(key)))),
@@ -274,6 +305,7 @@ export function lambdaEnv(env: NodeJS.ProcessEnv = process.env, composition?: Se
     reconcileLookbackMinutes: Number(env.PIPELINE_RECONCILE_LOOKBACK_MINUTES ?? "30") || 30,
     dbPoolMax: Number(env.HOOPDB_POOL_MAX ?? "4") || 4,
     ...(maximum === undefined ? {} : { readerMaxRuleset: maximum }),
+    ...(searchBatchDeadlineMarginMs === undefined ? {} : { searchBatchDeadlineMarginMs }),
   };
 }
 
@@ -412,6 +444,28 @@ export async function transaction<T>(db: HoopDb, work: (tx: SqlExecutor) => Prom
 /** A search pass that found its session busy runs again this much later. */
 export const BUSY_REQUEUE_DELAY_SECONDS = 60;
 
+/**
+ * The consumer's `requeue` dep: one SQS SendMessage of `{"reconcile":{"key"}}` with the fixed
+ * delay, plus `batch_deadline_deferrals` only when the consumer's batch-deadline rule passes a
+ * count (s3-events.ts requeueBody). Credentials are read per send, as before. `call` and
+ * `credentials` are injectable for tests.
+ */
+export function sqsRequeue(
+  env: Pick<LambdaEnv, "region" | "queueUrl">,
+  call: typeof awsJsonCall = awsJsonCall,
+  credentials: () => ReturnType<typeof lambdaCredentials> = () => lambdaCredentials(),
+): NonNullable<ConsumerDeps["requeue"]> {
+  return async (manifestKey, batchDeadlineDeferrals) => {
+    await call({
+      service: "sqs",
+      target: "AmazonSQS.SendMessage",
+      region: env.region,
+      body: { QueueUrl: env.queueUrl, MessageBody: requeueBody(manifestKey, batchDeadlineDeferrals), DelaySeconds: BUSY_REQUEUE_DELAY_SECONDS },
+      credentials: credentials(),
+    });
+  };
+}
+
 export interface Runtime {
   env: LambdaEnv;
   deps: ConsumerDeps;
@@ -502,15 +556,7 @@ export function runtimeFromSecret(env: LambdaEnv, secretText: string, schemaGene
       // Default off; on, a sessionless per-origin bucket key (h=_none/s=_origin) is ignored before any lookup.
       ...(env.pointerSkipOriginBucketEnabled ? { skipOriginBucket: true as const } : {}),
     },
-    requeue: async (manifestKey) => {
-      await awsJsonCall({
-        service: "sqs",
-        target: "AmazonSQS.SendMessage",
-        region: env.region,
-        body: { QueueUrl: env.queueUrl, MessageBody: JSON.stringify({ [RECONCILE_BODY_KEY]: { key: manifestKey } }), DelaySeconds: BUSY_REQUEUE_DELAY_SECONDS },
-        credentials: lambdaCredentials(),
-      });
-    },
+    requeue: sqsRequeue(env),
   };
   if (env.searchEnabled) {
     const portable = env.searchBackend && env.searchBackend !== "clickhouse";
@@ -801,18 +847,30 @@ export interface LambdaInvocationContext {
 }
 
 /**
- * The consumer deps for one SQS batch: unchanged unless streaming is armed and the invocation has a
- * context, then the search stage stops streaming at the remaining time less the configured margin,
- * and streams at most one scope of the batch (`streamSlot`): a second scope that would stream is
- * requeued, so the margin only has to cover the batch's whole reads and replay, never another stream.
+ * The consumer deps for one SQS batch: unchanged (the same object) unless the invocation has a
+ * context with a finite remaining time and streaming is armed or a batch deadline margin is set
+ * (with the search stage on).
+ *
+ * Streaming armed: the search stage stops streaming at the remaining time less the configured
+ * stream margin, and streams at most one scope of the batch (`streamSlot`): a second scope that
+ * would stream is requeued, so the margin only has to cover the batch's whole reads and replay,
+ * never another stream. SEARCH_INDEX_BATCH_DEADLINE_MARGIN_MS set: `batchDeadline` at the
+ * remaining time less that margin; past it no further scope's pass starts (consumer.ts). Both
+ * set: each applies independently; whichever instant comes first is crossed first.
  */
 export function invocationDeps(rt: Pick<Runtime, "env" | "deps">, context?: LambdaInvocationContext, now: () => number = Date.now): ConsumerDeps {
   const search = rt.deps.search;
-  const margin = rt.env.searchStreamCh?.deadlineMarginMs;
-  if (!search?.stream || margin === undefined || typeof context?.getRemainingTimeInMillis !== "function") return rt.deps;
+  const streamMargin = search?.stream ? rt.env.searchStreamCh?.deadlineMarginMs : undefined;
+  const batchMargin = search ? rt.env.searchBatchDeadlineMarginMs : undefined;
+  if ((streamMargin === undefined && batchMargin === undefined) || typeof context?.getRemainingTimeInMillis !== "function") return rt.deps;
   const remaining = context.getRemainingTimeInMillis();
   if (!Number.isFinite(remaining)) return rt.deps;
-  return { ...rt.deps, search: { ...search, streamDeadline: { at: now() + remaining - margin }, streamSlot: { used: false } } };
+  const at = now() + remaining;
+  return {
+    ...rt.deps,
+    ...(search && streamMargin !== undefined ? { search: { ...search, streamDeadline: { at: at - streamMargin }, streamSlot: { used: false } } } : {}),
+    ...(batchMargin !== undefined ? { batchDeadline: { at: at - batchMargin } } : {}),
+  };
 }
 
 async function dispatchLambdaEvent(event: PipelineLambdaEvent, ready: () => Promise<Runtime>, context?: LambdaInvocationContext): Promise<BatchResponse | { ok: boolean }> {
