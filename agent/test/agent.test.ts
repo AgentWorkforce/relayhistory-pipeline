@@ -54,11 +54,12 @@ test("network: the existing agent-hosts VPC ids relaycast-cloud's agent-host sta
   });
 });
 
-test("secrets: the host reads exactly the kit's two shared parameters and its sessions MCP token, and writes none", () => {
+test("secrets: the host reads exactly the kit's two shared parameters, its sessions MCP token and its OpenAI key, and writes none", () => {
   assert.deepEqual(agent.secrets.map((s) => s.param), [
     "/relaycast-agent-host/dev/anthropic-api-key",
     "/relaycast-agent-host/dev/nango-secret-key",
     "/relaycast-agent-host/dev/relay-sessions-token-sessions-pipeline",
+    "/relaycast-agent-host/dev/openai-api-key-sessions-pipeline",
   ]);
   const policy = hostRolePolicy(agent, "500268966557");
   const ssm = policy.Statement.filter((s) => s.Action.some((a) => a.startsWith("ssm:")));
@@ -70,6 +71,7 @@ test("secrets: the host reads exactly the kit's two shared parameters and its se
       "arn:aws:ssm:us-west-2:500268966557:parameter/relaycast-agent-host/dev/anthropic-api-key",
       "arn:aws:ssm:us-west-2:500268966557:parameter/relaycast-agent-host/dev/nango-secret-key",
       "arn:aws:ssm:us-west-2:500268966557:parameter/relaycast-agent-host/dev/relay-sessions-token-sessions-pipeline",
+      "arn:aws:ssm:us-west-2:500268966557:parameter/relaycast-agent-host/dev/openai-api-key-sessions-pipeline",
     ],
   }]);
   // The token is read by name (load-secrets.sh -> kit/relay-sessions.sh -> ~/.claude.json), never exported to secrets.env.
@@ -154,30 +156,24 @@ test("repo stewardship: both repos, the kit's default sweep thresholds, generate
   for (const name of [STEWARDSHIP_FILE, ...STEWARDSHIP_KIT_FILES]) assert.ok(!script.includes(`cat > /opt/agent-host/${name}`), `${name} never rides in user data`);
 });
 
-test("the lead runs on Fable: the rendered lead unit starts the kit's lead-run.sh, which runs the kit's headless supervisor on Claude Code with claude-fable-5-2", () => {
-  // The model is the kit's default (lead-run.sh, which the lead unit starts):
-  // this agent sets no `lead`, so the env file has no LEAD_HARNESS or
-  // LEAD_MODEL (module 0.1.27) and lead-run.sh falls back to claude and
-  // claude-fable-5-2; implementation goes to sonnet or opus subagents per
-  // the routing block. Since kit 0.1.12 the unit runs lead-run.sh in the
-  // foreground (no tmux), and lead-run.sh execs the kit's headless.py
-  // supervisor, which the unit requires on disk (it arrives over SSM).
-  assert.equal(agent.input.lead, undefined);
-  assert.deepEqual(leadHarness(agent.input), { harness: "claude", model: "claude-fable-5-2" });
-  assert.equal(DEFAULT_LEAD_MODEL, "claude-fable-5-2");
-  assert.doesNotMatch(agent.envFile, /^LEAD_(HARNESS|MODEL)=/m);
+test("the lead runs on Codex (GPT-6.2 Astra) until the Anthropic credit is topped up, and so do its workers", () => {
+  // Khaliq, 2026-11-24: the Anthropic credit ran out, so the lead moves to
+  // Codex. The env file names the harness, model, Codex CLI and the OpenAI
+  // key parameter (a name, never a value); lead-run.sh execs headless.py
+  // with --harness codex. The relay workers run Codex too.
+  assert.deepEqual(agent.input.lead, { harness: "codex", model: "gpt-6.2-astra", openaiKeyParam: "/relaycast-agent-host/dev/openai-api-key-sessions-pipeline" });
+  assert.deepEqual(leadHarness(agent.input), { harness: "codex", model: "gpt-6.2-astra", openaiKeyParam: "/relaycast-agent-host/dev/openai-api-key-sessions-pipeline" });
+  assert.match(agent.envFile, /^LEAD_HARNESS=codex$/m);
+  assert.match(agent.envFile, /^LEAD_MODEL=gpt-6.2-astra$/m);
+  assert.match(agent.envFile, /^OPENAI_KEY_PARAM=\/relaycast-agent-host\/dev\/openai-api-key-sessions-pipeline$/m);
+  assert.equal(agent.input.workers?.harness, "codex");
+  assert.equal(agent.input.workers?.model, "gpt-6.2-astra");
   const script = gunzipSync(Buffer.from(userDataBase64(agent, read), "base64")).toString("utf8");
   const launch = script.split("\n").filter((l) => l.startsWith("ExecStart=/opt/agent-host/lead-run.sh "));
   assert.equal(launch.length, 1);
   assert.equal(launch[0], "ExecStart=/opt/agent-host/lead-run.sh /opt/agent-host/lead-prompt.md");
-  assert.doesNotMatch(script, /ExecStart=.*tmux|ExecStop=.*tmux/);
-  assert.match(script, /ConditionPathExists=\/opt\/agent-host\/headless.py/);
-  assert.match(script, /^harness=\$\{LEAD_HARNESS:-claude\} model=\$\{LEAD_MODEL:-claude-fable-5-2\}$/m);
   assert.match(script, /--harness "\$harness" --model "\$model" --prompt-file "\$state\/system\.md"/);
-  // Every hard-coded lead model id (a literal --model, or LEAD_MODEL's
-  // default or value) is Fable. The lead's own exec passes "$model", which is
-  // not a literal; the Sonnet subagent and worker defaults are not lead models.
-  assert.deepEqual([...new Set([...script.matchAll(/(?:--model |LEAD_MODEL(?::-|=))([a-z0-9][\w.-]*)/g)].map((m) => m[1]))], ["claude-fable-5-2"]);
+  assert.equal(DEFAULT_LEAD_MODEL, "claude-fable-5-2");
 });
 
 test("lead session rotation: on by default since module 0.1.35, left unset here, so no env line and the kit's thresholds", () => {
