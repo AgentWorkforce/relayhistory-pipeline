@@ -25,8 +25,8 @@ keys refused, needs `searchIndex: true`). Absent, nothing new is rendered.
 
 ## What it does
 
-Each SQS invocation with a Lambda context gets a batch deadline at the remaining time less
-the margin (`invocationDeps`). In the search loop (`processBatch` in
+Each SQS invocation with a Lambda context and a finite remaining time gets a batch deadline
+at the remaining time less the margin (`invocationDeps`). In the search loop (`processBatch` in
 `src/session-pipeline/consumer.ts`), before each scope's pass starts, a scope whose
 deadline has passed is not started: it is requeued with its carried upload time (log
 reason `batch_deadline`) and its message ids are not failures. A pass already running is
@@ -34,6 +34,12 @@ never interrupted, so **the margin must exceed the longest single search pass**,
 pass started just before the deadline can still run into the function timeout. Scopes
 finished before the deadline are reported as before. If the requeue is missing or
 throws, that scope's message ids go to the batch failures.
+
+The margin must also leave room after the pointer stage: the deadline is fixed when the
+invocation starts, and the pointer loop runs before the search loop. If the remaining time
+less the margin has already passed when the search loop starts, no pass runs in that
+invocation, and a scope at the deferral cap (below) is failed without a pass. A scope that
+meets this on every attempt reaches the dead-letter queue without ever being indexed.
 
 Deferral rule: each batch-deadline requeue carries `batch_deadline_deferrals` (the
 scope's count plus one, the count being the largest over the scope's messages) in the
@@ -48,6 +54,17 @@ their body. A build that predates the field reads only the named fields of a rec
 body and ignores it. The pointer loop is not changed. With
 `SEARCH_INDEX_STREAMING_CH=1` as well, each deadline applies, the earlier is crossed first,
 and the stream deadline's path and reason (`stream_batch_deadline`) are unchanged.
+
+What the cap bounds:
+
+- A requeue for any other reason (the scope busy, a stream deferred, the stream deadline)
+  carries no count, so the next delivery reads 0 and the count starts again. The cap
+  therefore bounds only consecutive batch-deadline deferrals, not how often a scope is
+  requeued in total.
+- With `SEARCH_INDEX_STREAMING_CH=1` and a margin of 60000 ms or less, the stream deadline
+  (remaining time less 60000 ms, checked first) is always crossed no later than the batch
+  deadline, so the batch deadline and its cap never act. Only a margin above 60000 ms gives
+  the batch deadline any effect while streaming is on.
 
 New log field: `batch_deadline_deferrals` (non-negative integer only).
 
