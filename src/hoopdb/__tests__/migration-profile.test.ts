@@ -2717,7 +2717,20 @@ describe("function boundary: ACL manifest, residual, activation gate", () => {
       const open = src.indexOf(tag, start) + tag.length;
       return src.slice(open, src.indexOf(tag, open));
     };
-    // 20261105062220 is newest: 062210's down refuses (55000) while it is applied; its checksum-pinned down restores
+    // 20261105062250 is newest: 062220's down refuses (55000) while it is applied; its checksum-pinned down (installed
+    // state: gate row off/main) restores 062210's exact ACK and set_mode and the mode CHECK IN('main','t2'), removes its
+    // ledger row, and refuses on a rerun.
+    const PRE = "upstream:20261105062250_lazy_ack_preplan.sql";
+    expect(await names()).toContain(PRE);
+    expect((await failure(rollback("20261105062220_coordination_advisories_incarnation.down.sql")))?.code).toBe("55000");
+    expect((await procSrc("sessions.ingest_lazy_ack_batch(jsonb)")).s).toBe(bodyOf("20261105062250_lazy_ack_preplan.sql", "ingest_lazy_ack_batch", "$lazy_ack_batch$"));
+    await rollback("20261105062250_lazy_ack_preplan.down.sql");
+    expect(await names()).not.toContain(PRE);
+    expect((await procSrc("sessions.ingest_lazy_ack_batch(jsonb)")).s).toBe(bodyOf("20261105062210_lazy_ack_t2.sql", "ingest_lazy_ack_batch", "$lazy_ack_batch$"));
+    expect((await procSrc("sessions.lazy_ack_t2_set_mode(text)")).s).toBe(bodyOf("20261105062210_lazy_ack_t2.sql", "lazy_ack_t2_set_mode", "$lazy_ack_tx_set_mode$"));
+    expect((await db.query<{ d: string }>("SELECT pg_get_constraintdef(oid) d FROM pg_constraint WHERE conname='lazy_ack_t2_mode_mode_check'")).rows[0]!.d).toBe("CHECK ((mode = ANY (ARRAY['main'::text, 't2'::text])))");
+    expect((await failure(rollback("20261105062250_lazy_ack_preplan.down.sql")))?.code).toBe("55000");
+    // 20261105062220 is then newest: 062210's down refuses (55000) while it is applied; its checksum-pinned down restores
     // 062000's exact upsert_v1, mark_delivered_v1 and ack_v1 bodies, drops upsert_v2, ack_v2, pending_for_v3 and the
     // incarnation column and its ledger row, and refuses on a rerun.
     expect(await names()).toContain(CAI);

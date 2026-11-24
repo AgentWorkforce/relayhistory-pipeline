@@ -217,8 +217,9 @@ describe("20261105062170 rollback", () => {
       // 20261105062180 (claims scheduler), 20261105062190 (the priority-first advisories reader), 20261105062200
       // (session list readiness), 20261105062210 (T2 staged ACK) and 20261105062220 (the advisory instance) are the
       // later steps: this down refuses under them; they come off first (062220, 062210, 062200, 062190, then 062180).
-      expect((await plan(LOCAL)).filter((s) => s.name.startsWith("upstream:") && s.name > STEP).map((s) => s.name)).toEqual(["upstream:20261105062180_claims_scheduler.sql", "upstream:20261105062190_coordination_advisories_pending_priority.sql", "upstream:20261105062200_session_directory_list_readiness.sql", "upstream:20261105062210_lazy_ack_t2.sql", "upstream:20261105062220_coordination_advisories_incarnation.sql"]);
+      expect((await plan(LOCAL)).filter((s) => s.name.startsWith("upstream:") && s.name > STEP).map((s) => s.name)).toEqual(["upstream:20261105062180_claims_scheduler.sql", "upstream:20261105062190_coordination_advisories_pending_priority.sql", "upstream:20261105062200_session_directory_list_readiness.sql", "upstream:20261105062210_lazy_ack_t2.sql", "upstream:20261105062220_coordination_advisories_incarnation.sql", "upstream:20261105062250_lazy_ack_preplan.sql"]);
       expect(await message(DOWN)).toContain("a later migration is applied");
+      await db.exec(read("supabase/rollbacks/20261105062250_lazy_ack_preplan.down.sql")); // 062250 (mode p) sits above 062220: first of all.
       await db.exec(read("supabase/rollbacks/20261105062220_coordination_advisories_incarnation.down.sql"));
       await db.exec(read("supabase/rollbacks/20261105062210_lazy_ack_t2.down.sql")); // 062210 (T2 staged ACK) sits above 062200: first.
       await db.exec(read("supabase/rollbacks/20261105062200_session_directory_list_readiness.down.sql"));

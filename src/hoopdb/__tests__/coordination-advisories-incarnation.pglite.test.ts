@@ -23,6 +23,9 @@ const FILE = "20261105062220_coordination_advisories_incarnation.sql";
 const STEP = `upstream:${FILE}`;
 const SQL = read(`supabase/migrations/${FILE}`);
 const DOWN = read("supabase/rollbacks/20261105062220_coordination_advisories_incarnation.down.sql");
+// 20261105062250 (mode p of the T2 gate row) sits above 062220: its down runs first.
+const PREPLAN_DOWN = read("supabase/rollbacks/20261105062250_lazy_ack_preplan.down.sql");
+const PREPLAN_STEP = "upstream:20261105062250_lazy_ack_preplan.sql";
 const V1_SQL = read("supabase/migrations/20261105062000_coordination_advisories.sql");
 const LOCAL: MigrationProfile = { mode: "local", shim: true, bootstrap: true, verify: false, runtimeRole: "postgres" };
 
@@ -138,6 +141,7 @@ describe("20261105062220 coordination advisories: the advisory instance", () => 
     expect(SQL).not.toMatch(/ADD COLUMN incarnation uuid[^;]*DEFAULT/i);
     // Before: roll 062220 back, write pending, delivered and acked rows through 062000's v1, then re-apply 062220.
     await reset();
+    await db.exec(PREPLAN_DOWN);
     await db.exec(DOWN);
     expect((await db.query<{ applied: boolean }>(MIGRATION_SENTINELS[STEP]!.sql)).rows[0]!.applied).toBe(false);
     expect(await upsert(1, [adv(1, "low"), adv(2, "high"), adv(3, "high")])).toEqual({ inserted: 3, upgraded: 0, skipped: 0 });
@@ -340,7 +344,9 @@ describe("20261105062220 rollback", () => {
     const h = harness(() => db);
     const message = async (sql: string) => { const m = await db.exec(sql).then(() => null, (e: Error) => e.message); await db.exec("ROLLBACK").catch(() => {}); return m; };
     try {
-      expect((await plan(LOCAL)).filter((s) => s.name.startsWith("upstream:") && s.name > STEP)).toEqual([]);
+      expect((await plan(LOCAL)).filter((s) => s.name.startsWith("upstream:") && s.name > STEP).map((s) => s.name)).toEqual([PREPLAN_STEP]);
+      expect(await message(DOWN)).toContain("a later migration is applied");
+      await db.exec(PREPLAN_DOWN);
       expect(await message(read("supabase/rollbacks/20261105062190_coordination_advisories_pending_priority.down.sql"))).toContain("a later migration is applied");
       await h.upsert(2, [h.adv(1, "high")]);
       await h.upsert(1, [h.adv(2, "high")]);

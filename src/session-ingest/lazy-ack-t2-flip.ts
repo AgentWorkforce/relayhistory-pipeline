@@ -22,6 +22,12 @@
  * Busy is recognised by SQLSTATE 55P03 AND the server's English message text (the function's own message, or the row
  * NOWAIT message); a server with translated messages (lc_messages other than English) makes every busy a thrown error,
  * never a retry or a false "switched".
+ * Mode 'p' (20261105062250, the pre-planned ACK) is NOT a mode this tool switches: before the first attempt it reads the
+ * row (MODE_PRECHECK, one autocommit statement, no lock) and stops with LazyAckT2FlipUnknownMode, before any write, unless
+ * the row says 'main' or 't2'. Leaving 'p' is the owner's own statement, through main only (the SQL setter refuses a
+ * direct p <-> t2 switch): SELECT sessions.lazy_ack_t2_set_mode('main'); as the owner, in a quiet window (same try-lock).
+ * The precheck is not a lock: a 'p' committed between it and the attempt is still refused by the setter for 't2', and
+ * is reported by the unexpected-previous-mode error after a switch to 'main' (which is then the intended exit from 'p').
  * Options must be finite and bounded: budgetMs > 0, maxAttempts an integer >= 1, backoffs >= 0 (TypeError otherwise).
  * The first attempt is always dispatched (a valid budget is > 0, so it starts before the deadline).
  *
@@ -69,6 +75,17 @@ export function isConnectionLoss(e: unknown): boolean {
   return code.startsWith("08") || code === "57P01" || code === "57P02" || code === "57P03";
 }
 export const MODE_READBACK = "SELECT mode FROM sessions.lazy_ack_t2_mode WHERE singleton";
+/** The pre-attempt read (autocommit, no lock): only 'main' or 't2' lets the tool attempt a switch. */
+export const MODE_PRECHECK = "SELECT mode FROM sessions.lazy_ack_t2_mode WHERE singleton -- flip precheck";
+
+/** The row holds a mode this tool does not switch (e.g. 'p'), or no row: nothing was attempted, nothing written. */
+export class LazyAckT2FlipUnknownMode extends Error {
+  readonly code = "lazy_ack_t2_flip_unknown_mode";
+  constructor(readonly observed: unknown) {
+    super(`lazy_ack_t2 flip: the mode row says ${JSON.stringify(observed ?? null)}, not main or t2; nothing attempted (leave mode p only through sessions.lazy_ack_t2_set_mode('main') as the owner)`);
+    this.name = "LazyAckT2FlipUnknownMode";
+  }
+}
 
 export type FlipSwitched = Extract<FlipResult, { result: "switched" }>;
 export type FlipNotSwitched = Exclude<FlipResult, { result: "switched" }>;
@@ -104,6 +121,8 @@ export async function lazyAckT2FlipOutcome(query: FlipQuery, to: FlipMode, opts:
   if (!Number.isFinite(base) || base < 0 || !Number.isFinite(cap) || cap < 0) throw new TypeError("lazy_ack_t2 flip: backoffMs and maxBackoffMs must be finite numbers >= 0");
   const sleep = opts.sleep ?? ((ms: number) => new Promise<void>((r) => setTimeout(r, ms)));
   const now = opts.now ?? (() => performance.now()), random = opts.random ?? Math.random;
+  const current = (await query(MODE_PRECHECK, [])).rows[0]?.mode;
+  if (current !== "main" && current !== "t2") throw new LazyAckT2FlipUnknownMode(current);
   const start = now();
   let attempts = 0, backoff = base;
   for (;;) {

@@ -452,6 +452,7 @@ names every step, and that each sentinel is false before its step and true after
 | `upstream:20261105062200_session_directory_list_readiness.sql` | functions sessions.list_session_directory_readiness_for and sessions.query_session_directory_readiness_for (the session list readiness reads beside 034000's list_session_directory_for and 046010's query_session_directory_for: the same rows plus events_ready / event_projected_at, and p_ready_only filters to search-projection-ready rows in SQL; EXECUTE to bulls96_read_api only; no table, index or existing function changes; applying it changes no response: the read API calls them only with READ_API_LIST_READINESS_ENABLED=true and includeReadiness=true or readyOnly=true) |
 | `upstream:20261105062210_lazy_ack_t2.sql` | table sessions.lazy_ack_t2_mode (owner-only singleton gate row: gate 'off'\|'fenced', mode 'main'\|'t2', installed off/main, CHECK mode='main' OR gate='fenced'; DELETE/TRUNCATE refused; an UPDATE needs (961996,50000) exclusive), functions sessions.lazy_ack_t2_set_mode, sessions.lazy_ack_t2_set_gate and sessions.lazy_ack_t2_mode_keep (owner-only) and the gated staged ACK (no function-level SET and no custom parameter: a non-superuser owner installs and changes it; the ACK reads the row once after its fence call, plain at READ COMMITTED, FOR SHARE otherwise, where a stale snapshot gives 40001 and fenced is refused 55000; suppressed receipts never read it; the gate change, the mode flip, the rollback and the apply are real-database operations and the owner's own decisions; the setters only try-lock (src/session-ingest/lazy-ack-t2-flip.ts): one bounded attempt sequence per operator action in a naturally quiet window, one autocommit statement per attempt; exhausted = no switch, mode unchanged; lost reply = indeterminate, reconcile first; no queued fallback or automatic repeat; it can starve under load in both directions, so rolling the mode back is not immediate; change the gate only with sessions.lazy_ack_t2_set_gate('fenced'\|'off') (owner-only, one autocommit statement; the same try-lock as the flip, mode must be main, busy is fail-fast and changes nothing); lazy_ack_t2_set_mode refuses t2 unless the gate is fenced; the down refuses unless the row says off/main; a busy down (any ingest or erase transaction open, the marker or the gate table in use) is fail-fast (try-locks and NOWAIT, never queued) and changes nothing, so it can starve too; a successful down blocks new ingest from its 50000 X until its COMMIT (through its DDL), so uploads arriving in that interval wait for it, and they are then refused (55000 'generation not ready', a 503) until the operator restores readiness, which client retries alone cannot do: run the rollback target tree's own migrator as the owner (nothing applied; PASS at that tree's generation), rebind the lazy policy and admission rows to that generation (src/hoopdb/ingest-generation-rebind.ts), and serve that tree's Worker; re-sent batches then commit once on the 043800 body; never flip during an operator erase) |
 | `upstream:20261105062220_coordination_advisories_incarnation.sql` | column sessions.coordination_advisories.incarnation and functions sessions.coordination_advisories_upsert_v2, _ack_v2 and _pending_for_v3 (the advisory instance: a nullable uuid, no default, no backfill; upsert_v2 EXECUTE to service_role and the runtime role, ack_v2 and pending_for_v3 to bulls96_read_api only, pinned to its read scope; replaces 062000's upsert_v1, mark_delivered_v1 and ack_v1 with bodies fenced to legacy rows, ACLs kept; used only with COORDINATION_ADVISOR_INCARNATION_ENABLED / READ_API_ADVISORY_INSTANCE_ENABLED; see [the advisories doc](../docs/coordination-live-advisories.md)) |
+| `upstream:20261105062250_lazy_ack_preplan.sql` | mode 'p' in sessions.lazy_ack_t2_mode's mode CHECK (`lazy_ack_t2_mode_mode_check`: 'main'\|'t2'\|'p'; 'p' needs the gate fenced through the existing CHECK) and the staged ACK sessions.ingest_lazy_ack_batch that selects it (`v_p:=v_gate='fenced' AND v_mode='p';`); sessions.lazy_ack_t2_set_mode also accepts 'p' (owner-only, same try-lock; no direct t2/p switch). No new function, table or grant. Installed off/main |
 | `upstream:20261105035000_semantic_copy_state.sql` | table sessions.search_feature_copy_state |
 | `upstream:20261105036000_canonical_consumer_lease.sql`        | table sessions.canonical_feature_consumer_lease |
 | `upstream:20261105037000_session_directory_document_pool.sql` | function sessions.canonical_feature_document_finish |
@@ -1025,12 +1026,26 @@ separate operator step, done as a superuser after every down that references it:
 `DROP OWNED BY session_directory_search_worker; DROP ROLE session_directory_search_worker;`
 in each database.
 
+### Rolling back 062250 (mode 'p' of the T2 gate row)
+
+The down (`supabase/rollbacks/20261105062250_lazy_ack_preplan.down.sql`) refuses unless the gate row says off/main
+(leave 'p' with `SELECT sessions.lazy_ack_t2_set_mode('main');` and then `SELECT sessions.lazy_ack_t2_set_gate('off');`,
+each as the owner in its own statement; both only try-lock the barrier). It fails fast (55P03) while any ingest or erase
+transaction is open, the validation marker is in use or the gate table is in use. A successful down restores 062210's
+staged ACK and `sessions.lazy_ack_t2_set_mode` byte-exact and the mode CHECK `IN('main','t2')`. It refuses while a later
+migration is applied. Afterwards readiness is pending as for 062210's down below, and restoring it takes the same three
+steps at the target tree's generation (that tree has 062210 and not 062250).
+
+The apply fails fast the same way: it try-locks (961996,50000) exclusively and takes the gate table ACCESS EXCLUSIVE
+NOWAIT before the CHECK swap, so under traffic it refuses (55P03, nothing applied) rather than queue; apply it in a
+quiet window.
+
 ### Rolling back 062210 (lazy ACK T2 gate row)
 
 The down (`supabase/rollbacks/20261105062210_lazy_ack_t2.down.sql`) refuses unless the gate row says off/main, and it
 fails fast (55P03) while any ingest or erase transaction is open, the validation marker is in use or the gate table is
 in use. A successful down restores 043800's staged ACK exactly and drops the gate table and its three functions.
-It also refuses while a later migration is applied: roll back 062220 first, with its own down.
+It also refuses while a later migration is applied: roll back 062250, then 062220 first, each with its own down.
 
 After the down commits, readiness is pending, and every staged commit is refused (55000 `generation not ready`, a 503
 to the client, which keeps the batch) until the owner restores readiness. Client retries alone do not clear a pending

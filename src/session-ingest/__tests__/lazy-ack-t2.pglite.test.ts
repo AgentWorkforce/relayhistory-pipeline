@@ -19,6 +19,7 @@ import { sqlLedger } from "../ledger-sql.ts";
 import { deliveryAccount, prepareDelivery } from "../vendor/delivery/prepare.ts";
 import { TENANT, batch, record } from "./support.ts";
 import { authorityFixture, epoch, generation, identity } from "./privacy-authority-support.ts";
+import { stripPreplan } from "./lazy-ack-preplan-support.ts";
 
 setDefaultTimeout(180_000);
 const open: Array<() => unknown> = [];
@@ -91,9 +92,9 @@ async function snapshot(f: Fixture) {
   return out;
 }
 type Outcome = { ok: true; result: unknown } | { ok: false; code: string; message: string };
-type Run = { out: Outcome; snap: Record<string, unknown>; triggerCalls: number; gate: string[] };
+type Run = { out: Outcome; snap: Record<string, unknown>; triggerCalls: number; gate: string[]; seatRecordCalls: number };
 
-type Mode = "off" | "fenced-main" | "t2";
+type Mode = "off" | "fenced-main" | "t2" | "p";
 /** The exact gate read 062210 inserts after the suppressed return (pinned by the byte-identity test). */
 const GATE_READ = ` -- 062210 gate row, read once: after ingest_lock_fences (which took (961996,50000) SHARED, held to transaction end, so
  -- no gate or mode change can commit from here on) and after the suppressed return, before the clock lock is chosen.
@@ -124,13 +125,13 @@ async function runMode(f: Fixture, mode: Mode, payload: string, setup: (f: Fixtu
     await f.db.exec("SET LOCAL track_functions='pl'");
     if (mode !== "off") {
       expect((await f.db.query<any>("SELECT sessions.lazy_ack_t2_set_gate('fenced') old")).rows[0].old).toBe("off");
-      expect((await f.db.query<any>("SELECT sessions.lazy_ack_t2_set_mode($1) old", [mode === "t2" ? "t2" : "main"])).rows[0].old).toBe("main");
+      expect((await f.db.query<any>("SELECT sessions.lazy_ack_t2_set_mode($1) old", [mode === "fenced-main" ? "main" : mode])).rows[0].old).toBe("main");
     }
     const g = (await gateRow(f))[0]!;
     const gate = [g.gate, g.mode];
     await setup(f);
-    const calls = async () => Number((await f.db.query<{ n: string }>("SELECT coalesce((SELECT calls FROM pg_stat_xact_user_functions WHERE schemaname='sessions' AND funcname='ingest_history_native_changed'),0)::text n")).rows[0]!.n);
-    const before = await calls();
+    const calls = async (fn = "ingest_history_native_changed") => Number((await f.db.query<{ n: string }>("SELECT coalesce((SELECT calls FROM pg_stat_xact_user_functions WHERE schemaname='sessions' AND funcname=$1),0)::text n", [fn])).rows[0]!.n);
+    const before = await calls(), seatBefore = await calls("ingest_receipt_seat_records");
     await f.db.exec("SAVEPOINT ack;SET LOCAL ROLE bulls96_session_ingest");
     let out: Outcome;
     try {
@@ -140,10 +141,10 @@ async function runMode(f: Fixture, mode: Mode, payload: string, setup: (f: Fixtu
       out = { ok: false, code: String(e.code), message: String(e.message) };
       await f.db.exec("ROLLBACK TO SAVEPOINT ack;RESET ROLE");
     }
-    const triggerCalls = (await calls()) - before;
+    const triggerCalls = (await calls()) - before, seatRecordCalls = (await calls("ingest_receipt_seat_records")) - seatBefore;
     const snap = await snapshot(f);
     delete snap["sessions.lazy_ack_t2_mode"]; // the one row that differs by construction; the gate tests check it
-    return { out, snap, triggerCalls, gate };
+    return { out, snap, triggerCalls, gate, seatRecordCalls };
   } finally {
     await f.db.exec("ROLLBACK");
   }
@@ -156,23 +157,30 @@ async function runMode(f: Fixture, mode: Mode, payload: string, setup: (f: Fixtu
 async function both(f: Fixture, payload: string, setup: (f: Fixture) => Promise<unknown> = async () => {}, sql = COMMIT, lives: boolean[] = [false, true]) {
   const seqs = (await f.db.query<{ s: string; v: string | null; start: string }>(
     "SELECT format('%I.%I',schemaname,sequencename) s,last_value::text v,start_value::text start FROM pg_sequences WHERE schemaname='sessions'")).rows;
-  const runs: Array<{ live: boolean; off: Run; fmain: Run; on: Run }> = [];
+  const runs: Array<{ live: boolean; off: Run; fmain: Run; on: Run; p: Run }> = [];
   for (const live of lives) {
     const withSwitch = async (g: Fixture) => { await g.db.query("UPDATE sessions.ingest_history_switch SET live=$1 WHERE singleton", [live]); await setup(g); };
     const off = await runMode(f, "off", payload, withSwitch, seqs, sql);
     const fmain = await runMode(f, "fenced-main", payload, withSwitch, seqs, sql);
     const on = await runMode(f, "t2", payload, withSwitch, seqs, sql);
+    // 20261105062250 mode 'p': the same commit, same state; must equal main too (outputs, first error, rows, sequences).
+    const p = await runMode(f, "p", payload, withSwitch, seqs, sql);
+    expect(p.gate).toEqual(["fenced", "p"]);
     expect(off.gate).toEqual(["off", "main"]);
     expect(fmain.gate).toEqual(["fenced", "main"]);
     expect(on.gate).toEqual(["fenced", "t2"]);
-    for (const [name, r] of [["fenced-main", fmain], ["t2", on]] as const) {
+    for (const [name, r] of [["fenced-main", fmain], ["t2", on], ["p", p]] as const) {
       expect({ live, name, out: r.out }).toEqual({ live, name, out: off.out });
       for (const t of Object.keys(off.snap)) expect({ live, name, t, rows: r.snap[t] }).toEqual({ live, name, t, rows: off.snap[t] });
       expect(Object.keys(r.snap)).toEqual(Object.keys(off.snap));
     }
     expect(fmain.triggerCalls).toBe(off.triggerCalls); // fenced + 'main' runs main's loop
     if (live) expect(on.triggerCalls).toBe(off.triggerCalls); // switch on: T2 also issues one UPDATE per accept
-    runs.push({ live, off, fmain, on });
+    expect(p.triggerCalls).toBe(on.triggerCalls); // p writes with T2's statements
+    // p never calls the real seat-records function when its pre-plan is used; it calls it once (as T2 and main do) when
+    // the pre-plan was invalid or a captured input changed. Recorded for the suites that pin which path ran.
+    expect(p.seatRecordCalls).toBeLessThanOrEqual(on.seatRecordCalls);
+    runs.push({ live, off, fmain, on, p });
   }
   return { ...runs[0]!, runs };
 }
@@ -210,7 +218,7 @@ describe("062210 installs the gate row off/main, and keeps the 043800 contract",
     // Logical key and cardinality: the boolean singleton PK with CHECK(singleton); the two-column CHECK; DELETE/TRUNCATE refused.
     const cons = (await f.db.query<any>("SELECT conname,contype,pg_get_constraintdef(oid) d FROM pg_constraint WHERE conrelid='sessions.lazy_ack_t2_mode'::regclass AND contype IN('p','c','u','f','x') ORDER BY conname")).rows;
     expect(cons.map((c: any) => [c.contype, c.d])).toEqual(expect.arrayContaining([["p", "PRIMARY KEY (singleton)"], ["c", "CHECK (singleton)"],
-      ["c", "CHECK ((mode = ANY (ARRAY['main'::text, 't2'::text])))"], ["c", "CHECK ((gate = ANY (ARRAY['off'::text, 'fenced'::text])))"],
+      ["c", "CHECK ((mode = ANY (ARRAY['main'::text, 't2'::text, 'p'::text])))"], ["c", "CHECK ((gate = ANY (ARRAY['off'::text, 'fenced'::text])))"],
       ["c", "CHECK (((mode = 'main'::text) OR (gate = 'fenced'::text)))"]]));
     expect(cons.length).toBe(5);
     expect((await f.db.query<any>("SELECT tgname,tgtype FROM pg_trigger WHERE tgrelid='sessions.lazy_ack_t2_mode'::regclass AND NOT tgisinternal ORDER BY 1")).rows.map((r: any) => r.tgname))
@@ -236,7 +244,8 @@ describe("062210 installs the gate row off/main, and keeps the 043800 contract",
     // the row) and the isolation checks. Outputs, first errors, rows and sequences are the differential suites' claim.
     const f = await fixture();
     const { readFileSync } = await import("node:fs");
-    const installed = (await f.db.query<any>("SELECT prosrc FROM pg_proc WHERE oid=$1::regprocedure", [ACK])).rows[0].prosrc as string;
+    // 062250 (mode 'p') is applied above 062210: its exact additions are removed first (lazy-ack-preplan-support.ts).
+    const installed = stripPreplan((await f.db.query<any>("SELECT prosrc FROM pg_proc WHERE oid=$1::regprocedure", [ACK])).rows[0].prosrc as string);
     expect(installed).toBe(ackBody(readFileSync(MIG, "utf8")));
     expect(installed.split(GATE_READ).length - 1).toBe(1);
     let x = installed.replace(/\n v_t2 boolean;[^\n]*/, "");

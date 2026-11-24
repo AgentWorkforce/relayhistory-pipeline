@@ -241,6 +241,9 @@ describe("G4-only schema: the post-G4 objects are absent", () => {
       // The advisory instance: a nullable column on the advisories table, three advisor/read-API functions and the
       // three fenced v1 bodies; no G4 function names them, no ingest path calls them.
       "20261105062220_coordination_advisories_incarnation.sql",
+      // Mode 'p' of the T2 gate row: the replaced ACK (gate off) and set_mode, and the widened mode CHECK; no new function
+      // or table; no G4 function names it.
+      "20261105062250_lazy_ack_preplan.sql",
     ]);
     expect(() => migrationFiles(REPO_ROOT, "20261105043800_typo.sql")).toThrow(/names no migration/);
     expect(OBJECTS.newFunctions.length).toBeGreaterThan(30);

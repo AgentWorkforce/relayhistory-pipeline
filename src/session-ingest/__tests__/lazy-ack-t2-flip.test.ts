@@ -1,12 +1,38 @@
 /** lazy-ack-t2-flip.ts: one autocommit statement per attempt, bounded backoff, "no_switch" as a clean result. */
 import { describe, expect, test } from "bun:test";
-import { FLIP_STATEMENT, LazyAckT2FlipNotSwitched, MODE_READBACK, flipLazyAckT2Mode as throwingFlip, isConnectionLoss, isFlipBusy, lazyAckT2FlipOutcome as flipLazyAckT2Mode, lazyAckT2FlipOutcome as lazyAckT2Outcome, type FlipQuery } from "../lazy-ack-t2-flip.ts";
+import { FLIP_STATEMENT, LazyAckT2FlipNotSwitched, LazyAckT2FlipUnknownMode, MODE_PRECHECK, MODE_READBACK, flipLazyAckT2Mode as rawThrowingFlip, isConnectionLoss, isFlipBusy, lazyAckT2FlipOutcome as rawOutcome, type FlipOptions, type FlipQuery } from "../lazy-ack-t2-flip.ts";
+
+// Every case below except the precheck ones sees a row in 'main' (or 't2' when switching to main): the precheck is
+// answered here and never reaches the case's own query function, so its recorded statement sequences are unchanged.
+const prechecked = (q: FlipQuery, to: string): FlipQuery => async (sql, p) => sql === MODE_PRECHECK ? { rows: [{ mode: to === "main" ? "t2" : "main" }] } : q(sql, p);
+const flipLazyAckT2Mode = (q: FlipQuery, to: "main" | "t2", o?: FlipOptions) => rawOutcome(prechecked(q, to), to, o);
+const lazyAckT2Outcome = flipLazyAckT2Mode;
+const throwingFlip = (q: FlipQuery, to: "main" | "t2", o?: FlipOptions) => rawThrowingFlip(prechecked(q, to), to, o);
 
 const busy = () => Object.assign(Error("T2 staged ACK: flip barrier busy (an ingest or erase transaction is open); mode unchanged, retry"), { code: "55P03" });
 const rowBusy = () => Object.assign(Error('could not obtain lock on row in relation "lazy_ack_t2_mode"'), { code: "55P03" });
 function clock() { let t = 0; return { now: () => t, sleep: async (ms: number) => { t += ms; }, random: () => 0.5 }; }
 
 describe("flipLazyAckT2Mode", () => {
+  test("mode p (062250), an unknown mode or no row: stops before any write, with its own error and code; main/t2 proceed", async () => {
+    for (const observed of ["p", "x", null, undefined]) {
+      for (const to of ["main", "t2"] as const) {
+        const seen: string[] = [];
+        const q: FlipQuery = async (sql) => { seen.push(sql); if (sql === MODE_PRECHECK) return { rows: observed === undefined ? [] : [{ mode: observed }] }; throw Error("must not be reached"); };
+        const e = await rawOutcome(q, to, clock()).then(() => null, (x) => x);
+        expect(e).toBeInstanceOf(LazyAckT2FlipUnknownMode);
+        expect(e.code).toBe("lazy_ack_t2_flip_unknown_mode");
+        expect(seen).toEqual([MODE_PRECHECK]); // never FLIP_STATEMENT
+        await expect(rawThrowingFlip(q, to, clock())).rejects.toBeInstanceOf(LazyAckT2FlipUnknownMode);
+      }
+    }
+    for (const current of ["main", "t2"]) {
+      const seen: string[] = [];
+      const q: FlipQuery = async (sql) => { seen.push(sql); return sql === MODE_PRECHECK ? { rows: [{ mode: current }] } : { rows: [{ old: current }] }; };
+      expect(await rawOutcome(q, current === "main" ? "t2" : "main", clock())).toMatchObject({ result: "switched", from: current });
+      expect(seen).toEqual([MODE_PRECHECK, FLIP_STATEMENT]);
+    }
+  });
   test("switched on the first free attempt; the statement is exactly FLIP_STATEMENT, never a BEGIN", async () => {
     const seen: string[] = [];
     const q: FlipQuery = async (sql, p) => { seen.push(sql); expect(p).toEqual(["t2"]); return { rows: [{ old: "main" }] }; };
