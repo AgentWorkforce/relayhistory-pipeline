@@ -3,11 +3,11 @@ import { describe, expect, test } from "bun:test";
 import { createHash } from "node:crypto";
 import { readFileSync } from "node:fs";
 import {
-  latestWorkspaceSynthesis, memoryArtifactStore, parseStage2Artifact, runWorkspaceSynthesisJob, SYNTHESIS_ARTIFACT_FORMAT_V2, SynthesisArtifactError,
+  latestWorkspaceSynthesis, latestWorkspaceSynthesisV2, memoryArtifactStore, parseStage2Artifact, runWorkspaceSynthesisJob, SYNTHESIS_ARTIFACT_FORMAT_V2, SynthesisArtifactError,
   workspaceSynthesisDirectory, workspaceSynthesisKey, workspaceSynthesisPrefix, workspaceSynthesisStage2Key,
   type Stage2JobOptions, type Stage2JobResult, type SynthesisArtifact, type SynthesisArtifactV2,
 } from "../workspace-synthesis.ts";
-import { memoryBudgetLedger, stage1Of, synthesisV2Json, type Stage2ModelTransport } from "../../session-intel/synthesis/stage2.ts";
+import { memoryBudgetLedger, stage1Of, synthesisV2Json, STAGE2_PROMPT_VERSION, type Stage2ModelTransport } from "../../session-intel/synthesis/stage2.ts";
 import { synthesisJson } from "../../session-intel/synthesis/synthesize.ts";
 import { userErasePrefixes } from "../../session-erase/user-erase.ts";
 import { ANALYSIS_RESULT_OBJECT_GLOB } from "../../../stacks/aws/session-pipeline.ts";
@@ -73,7 +73,7 @@ describe("flag on", () => {
     const s2 = ok(r.stage2);
     expect(s2.outcome).toBe("created");
     expect(s2.key).toBe(stage2KeyOf(r.key));
-    expect(s2.key.endsWith(`/${r.key.slice(r.key.lastIndexOf("/") + 1, -5)}.workspace-synthesis-stage2-1.json`)).toBe(true);
+    expect(s2.key.endsWith(`/${r.key.slice(r.key.lastIndexOf("/") + 1, -5)}.workspace-synthesis-stage2-2.json`)).toBe(true);
     expect(s2.usage).toEqual({ inputTokens: 4_000, outputTokens: 900 });
     expect(store.objects.size).toBe(2);
     const v2 = JSON.parse(new TextDecoder().decode(store.objects.get(s2.key)!)) as SynthesisArtifactV2;
@@ -106,8 +106,51 @@ describe("flag on", () => {
     const store = memoryArtifactStore();
     const r = await job(store, stage2("true"));
     const dir = ok(r.stage2).key.slice(0, ok(r.stage2).key.lastIndexOf("/") + 1);
-    for (let i = 0; i < 1_001; i++) store.objects.set(`${dir}g=${String(i).padStart(13, "0")}-${"b".repeat(64)}.workspace-synthesis-stage2-1.json`, new Uint8Array([1]));
+    for (let i = 0; i < 1_001; i++) store.objects.set(`${dir}g=${String(i).padStart(13, "0")}-${"b".repeat(64)}.workspace-synthesis-stage2-2.json`, new Uint8Array([1]));
     expect((await latestWorkspaceSynthesis(store, LOOKUP))!.synthesis.contract).toBe("workspace-synthesis/1");
+  });
+
+  test("a prior /1 object (no titlesWithheldByScrub) at the old key: the /2 job writes a distinct key, leaves it intact, and /2 is served", async () => {
+    expect(STAGE2_PROMPT_VERSION).toBe("workspace-synthesis-stage2/2");
+    // The parent generation's artifact: same Stage 1 artifact, promptVersion /1, no counter, its own digest.
+    const src = memoryArtifactStore();
+    const made = await job(src, stage2("true"));
+    const newKey = ok(made.stage2).key;
+    expect(newKey.endsWith(".workspace-synthesis-stage2-2.json")).toBe(true);
+    const oldKey = `${newKey.slice(0, -".workspace-synthesis-stage2-2.json".length)}.workspace-synthesis-stage2-1.json`;
+    const prior = JSON.parse(new TextDecoder().decode(src.objects.get(newKey)!)) as SynthesisArtifactV2;
+    const s1 = prior.synthesis.stage2 as unknown as Record<string, unknown>;
+    s1.promptVersion = "workspace-synthesis-stage2/1";
+    delete s1.titlesWithheldByScrub;
+    prior.stage2Sha256 = sha(synthesisV2Json(prior.synthesis));
+    const priorBytes = new TextEncoder().encode(`${JSON.stringify(prior)}\n`);
+
+    const store = memoryArtifactStore();
+    await job(store); // the same Stage 1 artifact (deterministic key and bytes)
+    store.objects.set(oldKey, priorBytes);
+    const v1Entry = (await latestWorkspaceSynthesis(store, LOOKUP))!;
+    expect(v1Entry.synthesis).toEqual(made.synthesis);
+    // Why the version had to move: the /2 reader refuses the /1 object, and a missing counter is not read as 0.
+    let refused: unknown;
+    try { parseStage2Artifact(priorBytes, v1Entry, made.sha256); } catch (e) { refused = e; }
+    expect(refused).toBeInstanceOf(SynthesisArtifactError);
+    expect([(refused as SynthesisArtifactError).code, (refused as SynthesisArtifactError).detail]).toEqual(["synthesis_stage2_invalid", "stage2: stage2: keys"]); // the counter is required, never defaulted to 0
+
+    const t = fake();
+    const r = await job(store, stage2("true", t));
+    const s2 = ok(r.stage2);
+    expect([s2.outcome, s2.key, t.calls]).toEqual(["created", newKey, 1]);
+    expect(s2.key).not.toBe(oldKey);
+    expect(Buffer.from(store.objects.get(oldKey)!).equals(Buffer.from(priorBytes))).toBe(true);
+    expect(store.objects.size).toBe(3);
+    const served = (await latestWorkspaceSynthesisV2(store, LOOKUP))!;
+    expect(served.v2!.synthesis.stage2!.promptVersion).toBe("workspace-synthesis-stage2/2");
+    expect(served.v2!.synthesis.stage2!.titlesWithheldByScrub).toBe(0);
+    expect(synthesisV2Json(served.v2!.synthesis)).toBe(readFileSync(new URL("expected-synthesis-v2.json", FIXTURE), "utf8"));
+    // A rerun finds the /2 object: no call, the /1 bytes still intact.
+    const again = await job(store, stage2("true", t));
+    expect([ok(again.stage2).outcome, t.calls, store.objects.size]).toEqual(["exists", 1, 3]);
+    expect(Buffer.from(store.objects.get(oldKey)!).equals(Buffer.from(priorBytes))).toBe(true);
   });
 
   test("transport failure: stage2 null with transport_failed, nothing extra written", async () => {

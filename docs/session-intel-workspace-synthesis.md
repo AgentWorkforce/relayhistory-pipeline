@@ -423,7 +423,7 @@ Surviving items keep their reply position as id (`initiative:3`, `theme:1`, `hyp
 The Stage 1 document with the same fields in the same order, `contract: "workspace-synthesis/2"`, then:
 
 ```
-stage2: { model, promptVersion: "workspace-synthesis-stage2/1", usage: {inputTokens, outputTokens},
+stage2: { model, promptVersion: "workspace-synthesis-stage2/2", usage: {inputTokens, outputTokens},
           initiatives, themes, hypotheses,
           dropped: {initiatives, themes, hypotheses, byReason: {over_limit, invalid_shape, unknown_key, over_length,
                     duplicate, foreign_alias, missing_citation, title_mismatch, bad_basis}},
@@ -510,6 +510,10 @@ deterministic; the strict reader verifies both digests on every read.
 - **Versions.** A prompt version bump is a new key, never a conflict. An older version's v2 stays stored next to the
   new one; a reader serves the current `promptVersion`'s key only. Both are under the workspace's synthesis
   directory, so the per-user erase deletes both.
+  `workspace-synthesis-stage2/2` is the scrubbed generation (titles withheld by the scrubber,
+  `titlesWithheldByScrub` required): it took a new version because the key is create-only, so a `/1` object (no
+  counter, which the `/2` reader refuses) at a shared key could never be replaced. A `/1` object stays at its own
+  `...workspace-synthesis-stage2-1.json` key, untouched and never served; a missing counter is never read as 0.
 - **Listing.** Stage 2 keys sit under `stage2/`, outside the window's v1 prefix (`.../w=.../`), so the v1 lookup
   never lists them and they do not count toward its 1,000-key bound (tested with 1,001 Stage 2 keys).
 - A null Stage 2 is returned and not stored, so a later run within the caps may try again.

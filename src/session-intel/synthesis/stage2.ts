@@ -24,7 +24,7 @@ import {
 } from "./synthesize.ts";
 
 export const SYNTHESIS_CONTRACT_V2 = "workspace-synthesis/2";
-export const STAGE2_PROMPT_VERSION = "workspace-synthesis-stage2/1";
+export const STAGE2_PROMPT_VERSION = "workspace-synthesis-stage2/2";
 /** The approved default model (Claude Sonnet 5.5). */
 export const STAGE2_DEFAULT_MODEL = "claude-sonnet-5-5";
 /** The only models a run may request. Another model is a new approval, not an option. */
@@ -83,7 +83,7 @@ const BASIS_REF = /^(initiative|theme):([1-9][0-9]?)$/u;
 const CONTROL = /[\u0000-\u001f\u007f-\u009f\u2028\u2029]/u;
 /** Unicode format characters (category Cf: zero-width, bidi controls, BOM, ...): never in a prompt title or a v2 string. */
 const FORMAT = /\p{Cf}/u;
-/** Key-safe form of the prompt version, for the Stage 2 key (`workspace-synthesis-stage2/1` -> `workspace-synthesis-stage2-1`). */
+/** Key-safe form of the prompt version, for the Stage 2 key (`workspace-synthesis-stage2/2` -> `workspace-synthesis-stage2-2`). */
 export const STAGE2_PROMPT_VERSION_SLUG = STAGE2_PROMPT_VERSION.replace(/\//gu, "-");
 
 export interface Stage2Evidence extends SessionRef { titleRef: string }

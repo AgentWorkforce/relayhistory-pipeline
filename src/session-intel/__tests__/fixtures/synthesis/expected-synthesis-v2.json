@@ -702,7 +702,7 @@
   ],
   "stage2": {
     "model": "claude-sonnet-5-5",
-    "promptVersion": "workspace-synthesis-stage2/1",
+    "promptVersion": "workspace-synthesis-stage2/2",
     "usage": {
       "inputTokens": 4000,
       "outputTokens": 900
