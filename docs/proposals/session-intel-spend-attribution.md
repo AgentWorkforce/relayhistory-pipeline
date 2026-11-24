@@ -67,9 +67,34 @@ Output: an optional `spend` block in a later contract version (not part of `/1` 
 - `shared` buckets;
 - the dedupe basis used per source.
 
+## Producer facts (answered 2026-11-24, code read of pipeline main 48f61828)
+
+- **Dedupe key.** Sum on the directory key `(org, workspace, harness, sessionId)`; each session then counts once. The
+  pointer key adds the machine id. A resume from the same machine and user updates the same pointer.
+- **People.** `userIds` is server-written: the distinct users of the session's live upload pointers. It is NOT stable:
+  every projection replaces it, a tombstone empties it, and a user erase removes that user. Attribution is therefore
+  computed at read time, and each stored sum records the `userIds` it used. Two users uploading the same session give
+  one row with both users: the `shared` bucket. A session with no users goes to an `unattributed` bucket.
+- **Projects.** `projectId` is client-declared, not a server identity. It matches across machines only when clients
+  send the same key, and it is null until the catalog projection runs. Sums by project are labelled "as declared". A
+  per-org `repo_id` exists (migration 20261025000100) but no read route exposes it yet; it is the better key if the
+  pipeline exposes it.
+- **Usage.** The directory carries `totalInputTokens`, `totalOutputTokens`, `totalCostUsdMicros` and `models`, summed
+  from canonical events. Reasoning and cache fields are currently fixed at 0 or null. A session whose event projection
+  has not run shows defaults, so 0 is not proof of no usage: such a session counts as not observed.
+- **Children.** Child sessions are their own rows, linked through `session_directory_relationships`. Usage is NOT rolled
+  up into the parent, so parent and child each count once, and a child's usage is never added to its parent. The
+  price engine (relayburn) also prices each session on its own rows, so this holds for its costs too.
+- **Cross-harness.** Harness is in every key, so the same work seen by two harnesses is two sessions. It is labelled as
+  a possible duplicate, not merged.
+- **Pricing.** The pipeline does not price tokens. Cost is what the events carry, or the price engine's figure once it
+  lands.
+- **Not determined.** Whether a harness keeps its session id on resume, how `canonical_session_id` is chosen for
+  exports, and whether `projectId` matches across machines in practice.
+
 ## Open questions
 
-1. **Producer accounting (pipeline / F1 owner).** How are `userIds` and `projectId` written? Which key identifies a
+1. **Producer accounting (pipeline / F1 owner).** ANSWERED above, except the 'not determined' items. How are `userIds` and `projectId` written? Which key identifies a
    session uniquely across uploads and harnesses? For each source, does the parent's usage include its children?
 2. **Price provenance (relayburn scope).** The engine, the pricing snapshot and the provider, recorded per session so a
    sum can say which price table it used.
