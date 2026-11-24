@@ -166,12 +166,14 @@ a claim whose statement hit the role `statement_timeout` or was cancelled (`erro
 stay 503) answers the same 429 `delivery_busy` with `Retry-After` 5-10 s instead of the 503.
 Proven: production claim-stage 503s are dominated by 57014 at about 5 s; the role runs
 `statement_timeout` 5 s and `lock_timeout` 2 s (`supabase/bootstrap/session_ingest_role.sql`); the
-claim is one autocommit statement (`src/session-ingest/ledger-sql.ts`, `call`). The earlier
+claim is one claim-function statement (`src/session-ingest/ledger-sql.ts`): autocommit (`call`) when the
+claim lock wait is unset, and with it set, wrapped in `BEGIN`, the local timeout setup and `COMMIT` or
+`ROLLBACK` (`inClaimLockWait`). The earlier
 hypothesis (several same-user claims queued on the per-user fence row) was not reproduced; a reviewer's
 PG15 probe gave 55P03s and no 57014. A candidate mechanism (not proven to cause these timeouts) is
 that a claim can wait indirectly, through the origin advisory lock, behind a same-origin staged ACK
 that is itself queued on the global seat clock. See "Claim 57014 convoy" below. The flag does not depend on the cause: a 57014 (timeout or `pg_cancel_backend`) rolls back
-the single autocommit claim statement just like 55P03, so nothing was written and the retry is the
+the claim statement (and its wrapping transaction, if any) just like 55P03, so nothing was written and the retry is the
 same idempotent claim;
 57P01/57P02 (terminate, shutdown) and 08xxx are other codes and stay 503. Only `stage=claim`
 converts: 57014 at `buffer_intent`, `buffer_receipt`, `slot`, `commit` and every other stage stays
@@ -431,8 +433,8 @@ Candidate mechanism. The lock facts are from the migrations; that they combine t
 not proven:
 
 1. A staged ACK (`ingest_lazy_ack_batch`, 043800) holds the singleton `ingest_receipt_seat_clock` row
-   `FOR NO KEY UPDATE` from its seat loop to the end of the transaction, so staged ACKs serialize
-   globally. Suppressed ACKs return early under `KEY SHARE`.
+   `FOR NO KEY UPDATE`, taken before its per-record seat loop and held to the end of the transaction, so
+   staged ACKs serialize globally. Suppressed ACKs return early under `KEY SHARE`.
 2. With the origin-scoped entry points on (`INGEST_ORIGIN_CLAIM_FENCE=on`, 062010), the commit wrapper
    takes the (org, workspace, user, origin) advisory lock before the ACK runs. A claim with the same key
    takes that lock first, so it can wait indirectly on an ACK that is queued on the clock.
@@ -459,10 +461,14 @@ select clock_timestamp() as sampled_at, w.pid as waiting_pid, w.locktype, w.mode
        w.relation::regclass, w.classid, w.objid, w.objsubid, w.transactionid, w.waitstart,
        pg_blocking_pids(w.pid) as blocking_pids
   from pg_locks w
+  join pg_stat_activity a on a.pid = w.pid
  where not w.granted
-   and (w.database = (select oid from pg_database where datname = current_database())
-        or w.database is null);
+   and a.datid = (select oid from pg_database where datname = current_database());
 ```
+
+The filter is on the waiting backend's database (`pg_stat_activity.datid`), not `pg_locks.database`:
+`pg_locks` is cluster-wide, and `transactionid` / `virtualxid` waits have a NULL lock database even
+for a backend in another database. `pg_blocking_pids` lists holders and also waiters queued ahead.
 
 Possible actions. Each one is a production change that needs Khaliq's explicit OK in his own words:
 

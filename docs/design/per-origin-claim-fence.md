@@ -164,8 +164,8 @@ Rollback:
 
 - **The global seat clock still serializes staged ACKs** (`NO KEY UPDATE`, every user). Two machines' commits that both
   allocate seats still queue on it, briefly (the ACK's seat loop), as two different users' commits do today. Claims
-  never wait on the clock row itself (`KEY SHARE` is compatible with the ACK's `NO KEY UPDATE`, though not with a
-  control's `FOR UPDATE`), and test O3 proves a held commit does not block another origin's claim. A claim with the
+  do not wait on a staged ACK's `NO KEY UPDATE` of the clock (their `KEY SHARE` is compatible with it); they can wait on
+  a control's `FOR UPDATE` of it, and test O3 proves a held commit does not block another origin's claim. A claim with the
   SAME origin key can wait indirectly: the commit wrapper takes the origin advisory lock before the ACK queues on the
   clock. How much of the production claim 57014 share that explains has not been established; see the runbook section
   "Claim 57014 convoy" (`runbooks/history-620-operations.md`) for the dated observations.
