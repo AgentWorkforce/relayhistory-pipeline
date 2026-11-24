@@ -40,7 +40,7 @@ export const STAGED_ERASE_AFTER_MS = 48 * 60 * 60 * 1000;
 const DOT_SEGMENT = /(^|\/)\.{1,2}(\/|$)/;
 import type { SyncState } from "../neon-s3-sync/state.ts";
 import { errorCode, type Log } from "../neon-s3-sync/sync.ts";
-import { inSessionAnyDate, type EraseCheckpoint, type Eraser, type ListedVersion, type PagedEraser } from "./eraser.ts";
+import { inSessionAnyDate, type EraseCheckpoint, type Eraser, type ListedVersion, type LiveObjectProbe, type PagedEraser } from "./eraser.ts";
 import { terminalInvocations } from "./write-obligation.ts";
 import { createHash } from "node:crypto";
 
@@ -93,6 +93,57 @@ export const DEFAULT_ERASURE_CONFIG: ErasureConfig = {
 
 const SESSION_PREFIX = /^[^/]+\/[^/]+\/v1\/ws=[^/]+\/m=[^/]+\/h=[^/]+\/d=\d{4}\/\d{2}\/\d{2}\/s=[^/]+\/$/;
 const LEASE_HOLDER = `eraser:${process.pid}`;
+const SESSION_PREFIX_PARTS = /^[^/]+\/[^/]+\/v1\/ws=([^/]+)\/m=([^/]+)\/h=([^/]+)\/d=(\d{4}\/\d{2}\/\d{2})\/s=([^/]+)\/$/;
+
+/** A session prefix of the org's own tenant prefix, split into its identity segments and date (else undefined). */
+export function sessionPrefixParts(keyRoot: string, orgId: string, prefix: string): { ws: string; m: string; h: string; d: string; s: string } | undefined {
+  let root: string;
+  try {
+    root = `${orgPrefix(keyRoot, orgId)}/v1/`;
+  } catch {
+    return undefined;
+  }
+  if (!prefix.startsWith(root) || DOT_SEGMENT.test(prefix) || !SESSION_PREFIX.test(prefix)) return undefined;
+  const m = SESSION_PREFIX_PARTS.exec(prefix);
+  return m ? { ws: m[1]!, m: m[2]!, h: m[3]!, d: m[4]!, s: m[5]! } : undefined;
+}
+
+/** Logs name a key only by its hash (public-repo / tenant hygiene). */
+const keyHash = (key: string) => createHash("sha256").update(key).digest("hex");
+
+type QueuedItem = { key: string; kind: "object" | "prefix"; org_id: string; reason: string; enqueued_at: number };
+type LeasedItemResult = {
+  outcome: "deferred" | "busy" | "cancelled" | "skipped" | "erased" | "unresolved" | "not_erased" | "done_refused" | "failed";
+  /** Added to `drain`'s return value (an erase was attempted, or a failure recorded). */
+  handled: number;
+  deleted: number;
+  skip?: string;
+  status?: PagedOutcome;
+  error?: string;
+};
+
+/** Why the stale-prefix-only mode leaves an entry queued (for the full job). */
+export type StalePrefixSkip =
+  | "shape_invalid" | "current_key" | "not_date_move" | "no_live_sibling" | "sibling_export_failed"
+  | "sibling_manifest_missing" | "sibling_check_failed" | "lease_busy" | "state_busy" | "cancelled";
+
+export interface StalePrefixResult {
+  ok: boolean;
+  execute: boolean;
+  /** Queued entries with kind 'prefix' and reason 'stale_prefix'; `due` of them are past their backoff. */
+  selected: number;
+  due: number;
+  backingOff: number;
+  /** Every other queued entry: never read further, never changed. */
+  otherEntries: number;
+  /** Execute: erased. Dry: would pass the guard (store check only when `siblingChecked`). */
+  eligible: number;
+  erased: number;
+  versionsDeleted: number;
+  skipped: Partial<Record<StalePrefixSkip, number>>;
+  siblingChecked: boolean;
+  stoppedBy?: string;
+}
 
 /** The session prefix a queued key belongs to, if the key has this layout under the org's prefix. */
 export function sessionPrefixOf(keyRoot: string, orgId: string, key: string): string | undefined {
@@ -805,85 +856,208 @@ export class ErasureJob {
           handled += 1;
           continue;
         }
-        if (!this.state.acquireLease(prefix, LEASE_HOLDER, undefined, this.now())) {
-          this.counters.deferred += 1;
-          continue;
-        }
       } catch (error) {
         this.log({ message: "erasure state busy", error_code: errorCode(error) });
         continue;
       }
-      try {
-        // The exporter may have cancelled it before we took the lease.
-        if (!this.state.erasureQueued(item.key, item.enqueued_at)) continue;
-        // The lease generation this eraser acquired: every retirement page and the done claim re-validate it.
-        const itemLease = { prefix, holder: LEASE_HOLDER, gen: this.state.leaseGen(prefix) ?? "" };
-        if (item.kind === "object") {
-          // One queued object, through the SAME gate as a prefix: reserve every version before its delete, done only
-          // after a strict empty inventory of the key and no unresolved PUT at exactly that key.
-          const objScope = eraseScope(["queued-object", this.authority.kind, item.org_id, item.key, item.reason, item.enqueued_at, "lease:" + prefix]);
-          const r = await this.#eraseKey(item.key, objScope, () => true, async () => {
-            if (!this.state.erasureQueued(item.key, item.enqueued_at)) throw refusal("erasure_item_cancelled");
-            if (!this.state.renewLease(prefix, LEASE_HOLDER, this.now())) throw refusal("erasure_lease_lost");
-            await this.authority.ready();
-          }, true, itemLease);
-          this.counters.versionsDeleted += r.deleted;
-          handled += 1;
-          if (r.status === "unresolved") {
-            this.state.erasureFailed(item.key, (this.cfg.obligationsSettled?.() ?? false) ? "erasure_write_unresolved" : "erasure_obligations_unattested", this.now());
-            continue;
-          }
-          if (r.status !== "erased") continue;
-          // The done claim re-validates the revision in the SAME transaction as the queue-row removal.
-          if (this.state.obligations ? !this.state.completeErasure(item.key, item.enqueued_at, item.key.slice(0, item.key.lastIndexOf("/") + 1), r.rev, itemLease) : (this.state.erasureDone(item.key, item.enqueued_at), false)) {
-            this.counters.doneRefused += 1;
-            this.state.erasureFailed(item.key, "erasure_done_refused", this.now());
-            this.log({ message: "erasure done refused", error_code: "erasure_done_refused", kind: item.kind });
-            continue;
-          }
-          this.counters.objectsErased += 1;
-          continue;
-        }
-        // A session prefix: the shared strict paged eraser, resumable across runs from a durable checkpoint bound to
-        // this queued item (key + enqueue time), the authority and the operation. Before every page's deletes the
-        // item must still be queued, this process must still hold its lease, and the authority must still be ready.
-        // Scope: operation, authority, tenant + queued item (its enqueue time is the item's generation) and the leased resource.
-        const scope = eraseScope(["queued-prefix", this.authority.kind, item.org_id, item.key, item.reason, item.enqueued_at, "lease:" + prefix]);
-        const authorize = async () => {
+      handled += (await this.#leasedItem(item, prefix)).handled;
+    }
+    return handled;
+  }
+
+  /**
+   * One queued item under its session-prefix lease: the per-item path shared by `drain` and the stale-prefix-only
+   * mode, so both keep every per-delete protection (still queued, lease renewed, authority ready, the OFF mode
+   * interlock, the strict paged eraser and its fresh proof, the done claim). `guard`, when given, runs inside the
+   * lease after the still-queued check and before any erase; a returned reason skips the item untouched.
+   */
+  async #leasedItem(item: QueuedItem, prefix: string, guard?: () => Promise<string | undefined>): Promise<LeasedItemResult> {
+    try {
+      if (!this.state.acquireLease(prefix, LEASE_HOLDER, undefined, this.now())) {
+        this.counters.deferred += 1;
+        return { outcome: "deferred", handled: 0, deleted: 0 };
+      }
+    } catch (error) {
+      this.log({ message: "erasure state busy", error_code: errorCode(error) });
+      return { outcome: "busy", handled: 0, deleted: 0 };
+    }
+    // `handled` and `deleted` advance at exactly the points drain counted them before this method existed.
+    let handled = 0, deleted = 0;
+    try {
+      // The exporter may have cancelled it before we took the lease.
+      if (!this.state.erasureQueued(item.key, item.enqueued_at)) return { outcome: "cancelled", handled, deleted };
+      if (guard) {
+        const skip = await guard();
+        if (skip !== undefined) return { outcome: "skipped", handled, deleted, skip };
+      }
+      // The lease generation this eraser acquired: every retirement page and the done claim re-validate it.
+      const itemLease = { prefix, holder: LEASE_HOLDER, gen: this.state.leaseGen(prefix) ?? "" };
+      if (item.kind === "object") {
+        // One queued object, through the SAME gate as a prefix: reserve every version before its delete, done only
+        // after a strict empty inventory of the key and no unresolved PUT at exactly that key.
+        const objScope = eraseScope(["queued-object", this.authority.kind, item.org_id, item.key, item.reason, item.enqueued_at, "lease:" + prefix]);
+        const r = await this.#eraseKey(item.key, objScope, () => true, async () => {
           if (!this.state.erasureQueued(item.key, item.enqueued_at)) throw refusal("erasure_item_cancelled");
           if (!this.state.renewLease(prefix, LEASE_HOLDER, this.now())) throw refusal("erasure_lease_lost");
           await this.authority.ready();
-        };
-        const r = await this.#erasePaged(item.key, scope, undefined, authorize, undefined, true, undefined, itemLease);
+        }, true, itemLease);
         this.counters.versionsDeleted += r.deleted;
+        deleted += r.deleted;
         handled += 1;
-        // Still queued unless proven: incomplete resumes from the checkpoint; unverified / refused retry on the next
-        // drain; an unresolved write (a PUT whose outcome is unknown) keeps it queued, re-swept on the bounded backoff.
         if (r.status === "unresolved") {
           this.state.erasureFailed(item.key, (this.cfg.obligationsSettled?.() ?? false) ? "erasure_write_unresolved" : "erasure_obligations_unattested", this.now());
-          continue;
+          return { outcome: "unresolved", handled, deleted };
         }
-        if (r.status !== "erased") continue;
+        if (r.status !== "erased") return { outcome: "not_erased", handled, deleted };
         // The done claim re-validates the revision in the SAME transaction as the queue-row removal.
-        if (this.state.obligations ? !this.state.completeErasure(item.key, item.enqueued_at, item.key, r.rev, itemLease) : (this.state.erasureDone(item.key, item.enqueued_at), false)) {
+        if (this.state.obligations ? !this.state.completeErasure(item.key, item.enqueued_at, item.key.slice(0, item.key.lastIndexOf("/") + 1), r.rev, itemLease) : (this.state.erasureDone(item.key, item.enqueued_at), false)) {
           this.counters.doneRefused += 1;
           this.state.erasureFailed(item.key, "erasure_done_refused", this.now());
           this.log({ message: "erasure done refused", error_code: "erasure_done_refused", kind: item.kind });
-          continue;
+          return { outcome: "done_refused", handled, deleted };
         }
-        this.counters.prefixesErased += 1;
-      } catch (error) {
-        this.counters.failed += 1;
-        this.state.erasureFailed(item.key, errorCode(error), this.now());
-        this.log({ message: "erasure failed", error_code: errorCode(error), kind: item.kind });
-        handled += 1;
-      } finally {
-        try {
-          this.state.releaseLeases(LEASE_HOLDER, [prefix]);
-        } catch {}
+        this.counters.objectsErased += 1;
+        return { outcome: "erased", handled, deleted };
       }
+      // A session prefix: the shared strict paged eraser, resumable across runs from a durable checkpoint bound to
+      // this queued item (key + enqueue time), the authority and the operation. Before every page's deletes the
+      // item must still be queued, this process must still hold its lease, and the authority must still be ready.
+      // Scope: operation, authority, tenant + queued item (its enqueue time is the item's generation) and the leased resource.
+      const scope = eraseScope(["queued-prefix", this.authority.kind, item.org_id, item.key, item.reason, item.enqueued_at, "lease:" + prefix]);
+      const authorize = async () => {
+        if (!this.state.erasureQueued(item.key, item.enqueued_at)) throw refusal("erasure_item_cancelled");
+        if (!this.state.renewLease(prefix, LEASE_HOLDER, this.now())) throw refusal("erasure_lease_lost");
+        await this.authority.ready();
+      };
+      const r = await this.#erasePaged(item.key, scope, undefined, authorize, undefined, true, undefined, itemLease);
+      this.counters.versionsDeleted += r.deleted;
+      deleted += r.deleted;
+      handled += 1;
+      // Still queued unless proven: incomplete resumes from the checkpoint; unverified / refused retry on the next
+      // drain; an unresolved write (a PUT whose outcome is unknown) keeps it queued, re-swept on the bounded backoff.
+      if (r.status === "unresolved") {
+        this.state.erasureFailed(item.key, (this.cfg.obligationsSettled?.() ?? false) ? "erasure_write_unresolved" : "erasure_obligations_unattested", this.now());
+        return { outcome: "unresolved", handled, deleted };
+      }
+      if (r.status !== "erased") return { outcome: "not_erased", handled, deleted, status: r.status };
+      // The done claim re-validates the revision in the SAME transaction as the queue-row removal.
+      if (this.state.obligations ? !this.state.completeErasure(item.key, item.enqueued_at, item.key, r.rev, itemLease) : (this.state.erasureDone(item.key, item.enqueued_at), false)) {
+        this.counters.doneRefused += 1;
+        this.state.erasureFailed(item.key, "erasure_done_refused", this.now());
+        this.log({ message: "erasure done refused", error_code: "erasure_done_refused", kind: item.kind });
+        return { outcome: "done_refused", handled, deleted };
+      }
+      this.counters.prefixesErased += 1;
+      return { outcome: "erased", handled, deleted };
+    } catch (error) {
+      this.counters.failed += 1;
+      this.state.erasureFailed(item.key, errorCode(error), this.now());
+      this.log({ message: "erasure failed", error_code: errorCode(error), kind: item.kind });
+      handled += 1;
+      return { outcome: "failed", handled, deleted, error: errorCode(error) };
+    } finally {
+      try {
+        this.state.releaseLeases(LEASE_HOLDER, [prefix]);
+      } catch {}
     }
-    return handled;
+  }
+
+  /**
+   * Stale-prefix guard, evaluated inside the item's lease right before its erase (or read-only in a dry pass):
+   *  (a) the queued prefix holds none of the org's current exported or pending keys (`current_key`);
+   *  (b) a current exported manifest of the same session identity (org, ws, m, h, s), differing ONLY in the date,
+   *      exists in a group whose last export succeeded, and that manifest is live in the object store right now.
+   * Without a probe (a dry run has no store credentials) (b)'s store check is not made; the caller reports it.
+   */
+  async #staleGuard(item: { key: string; org_id: string }, probe: LiveObjectProbe | undefined): Promise<StalePrefixSkip | undefined> {
+    const q = sessionPrefixParts(this.cfg.keyRoot, item.org_id, item.key);
+    if (!q) return "shape_invalid";
+    const rows = this.state.exportedKeysOf(item.org_id);
+    if (rows.some((r) => r.keys.some((k) => k.startsWith(item.key))) || this.state.pendingKeysOf(item.org_id).some((k) => k.startsWith(item.key)))
+      return "current_key";
+    const siblings: string[] = [];
+    let unsettled = false, otherMove = false;
+    for (const r of rows)
+      for (const k of r.keys) {
+        if (!k.endsWith("/manifest.json")) continue;
+        const p = sessionPrefixParts(this.cfg.keyRoot, item.org_id, k.slice(0, -"manifest.json".length));
+        if (!p || p.s !== q.s) continue;
+        if (p.ws !== q.ws || p.m !== q.m || p.h !== q.h) otherMove = true;
+        else if (p.d !== q.d) {
+          if (r.error === null) siblings.push(k);
+          else unsettled = true;
+        }
+      }
+    if (!siblings.length) return otherMove ? "not_date_move" : unsettled ? "sibling_export_failed" : "no_live_sibling";
+    if (!probe) return undefined;
+    try {
+      for (const k of siblings) if (await probe.objectLive(k)) return undefined;
+    } catch {
+      return "sibling_check_failed";
+    }
+    return "sibling_manifest_missing";
+  }
+
+  /**
+   * `--stale-prefixes-only`: ONE pass over the queued session prefixes the exporter retired (kind 'prefix' AND reason
+   * 'stale_prefix'), erasing an entry only when the stale-prefix guard proves a live date-moved sibling. No sweep of
+   * any kind and no babysitter phase; every other queued entry is left exactly as it is. With `execute` each selected
+   * entry goes through the SAME leased per-item path as `drain`; the pass stops after `max` erases and at the first
+   * failed erase (recorded as `drain` records it; `ok` false). Without `execute` it reads only: no lease, no queue
+   * write, no delete; it reports what is eligible and why the rest would be skipped.
+   */
+  async staleprefixPass(opts: { execute: boolean; max?: number; probe?: LiveObjectProbe }): Promise<StalePrefixResult> {
+    if (this.state.obligations) throw refusal("stale_prefix_mode_requires_obligations_off");
+    if (opts.max !== undefined && !(Number.isSafeInteger(opts.max) && opts.max > 0)) throw refusal("stale_prefix_mode_max_invalid");
+    if (opts.execute && !opts.probe) throw refusal("stale_prefix_mode_requires_existence_check");
+    const now = this.now();
+    const selected = this.state.staleprefixErasures();
+    const due = selected.filter((i) => i.next_try <= now);
+    const queued = this.state.erasureBacklog(now).queued;
+    const skipped: Partial<Record<StalePrefixSkip, number>> = {};
+    const res: StalePrefixResult = {
+      ok: true, execute: opts.execute, selected: selected.length, due: due.length, backingOff: selected.length - due.length,
+      otherEntries: queued - selected.length, eligible: 0, erased: 0, versionsDeleted: 0, skipped, siblingChecked: !!opts.probe,
+    };
+    const skip = (reason: StalePrefixSkip, key: string) => {
+      skipped[reason] = (skipped[reason] ?? 0) + 1;
+      this.log({ message: "stale prefix skipped", reason, key_sha256: keyHash(key), execute: opts.execute });
+    };
+    for (const item of due) {
+      if (this.stopped()) { res.stoppedBy = "signal"; break; }
+      if (opts.execute && opts.max !== undefined && res.erased >= opts.max) { res.stoppedBy = "max"; break; }
+      if (!sessionPrefixParts(this.cfg.keyRoot, item.org_id, item.key)) { skip("shape_invalid", item.key); continue; }
+      if (!opts.execute) {
+        const reason = await this.#staleGuard(item, opts.probe);
+        if (reason) skip(reason, item.key);
+        else res.eligible += 1;
+        continue;
+      }
+      const r = await this.#leasedItem(item, item.key, () => this.#staleGuard(item, opts.probe));
+      res.versionsDeleted += r.deleted;
+      if (r.outcome === "erased") {
+        res.eligible += 1;
+        res.erased += 1;
+        this.log({ message: "stale prefix erased", key_sha256: keyHash(item.key), versions_deleted: r.deleted });
+        continue;
+      }
+      if (r.outcome === "skipped") { skip(r.skip as StalePrefixSkip, item.key); continue; }
+      if (r.outcome === "deferred") { skip("lease_busy", item.key); continue; }
+      if (r.outcome === "busy") { skip("state_busy", item.key); continue; }
+      if (r.outcome === "cancelled") { skip("cancelled", item.key); continue; }
+      // failed, unresolved, done_refused or not erased (incomplete / unverified / refused): the entry is recorded as
+      // drain records it; the pass stops here and the remaining entries are not touched.
+      res.ok = false;
+      res.stoppedBy = r.outcome;
+      this.log({ message: "stale prefix pass stopped", outcome: r.outcome, ...(r.status ? { status: r.status } : {}), ...(r.error ? { error_code: r.error } : {}), key_sha256: keyHash(item.key) });
+      break;
+    }
+    this.log({
+      message: "stale prefix pass", execute: opts.execute, ok: res.ok, selected: res.selected, due: res.due, backing_off: res.backingOff,
+      other_entries: res.otherEntries, eligible: res.eligible, erased: res.erased, versions_deleted: res.versionsDeleted, skipped,
+      sibling_checked: res.siblingChecked, ...(opts.max !== undefined ? { max: opts.max } : {}), ...(res.stoppedBy ? { stopped_by: res.stoppedBy } : {}),
+    });
+    return res;
   }
 
   progress(force = false) {

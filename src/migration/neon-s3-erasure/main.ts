@@ -29,14 +29,24 @@
  * signal; its registry login (the least-privilege bulls96_babysitter_retention role, never
  * the ingest login) arrives as the optional "retentionDatabaseUrl" field of the same stdin
  * credential JSON, required only when the phase is not off.
+ *
+ *   <credentials JSON> | bun run migration:neon-s3-erasure --stale-prefixes-only [--execute] [--max <n>]
+ *
+ * Stale-prefixes-only mode (runbooks/neon-s3-sync.md): ONE pass over the queued session prefixes the exporter retired
+ * after a date move (kind prefix, reason stale_prefix), erasing one only when the old prefix holds no current key and a
+ * current, date-moved copy of the same session has a live manifest. No sweep, no babysitter phase, nothing else in the
+ * queue touched. Without --execute it reads only and reports. Refused with BABYSITTER_RETENTION_SWEEP set to anything
+ * but off, with S3X_OBLIGATIONS on, with any flag other than --execute, --once (implied) and --max <n>, and --max is
+ * refused outside the mode.
  */
 import type { Queryable } from "../relayhistory-export.ts";
+import { sweepMode } from "../../session-ingest/babysitter-retention.ts";
 import { sessionReadOnly } from "../neon-s3-sync/neon-reader.ts";
 import { SyncState, obligationsFlag } from "../neon-s3-sync/state.ts";
 import { errorCode } from "../neon-s3-sync/sync.ts";
 import { eraserDatabaseUrl, pinnedPgClient, readStdinCredentials, refuseCredentialEnv, s3Credentials, type S3Credentials } from "../stdin-credentials.ts";
 import { assertEraserIdentity, neonAuthority, supabaseAuthority, type ErasureAuthorityKind } from "./authority.ts";
-import { createS3Eraser, type Eraser, type PagedEraser } from "./eraser.ts";
+import { createS3Eraser, isLiveObjectProbe, type Eraser, type PagedEraser } from "./eraser.ts";
 import { DEFAULT_ERASURE_CONFIG, ErasureJob } from "./job.ts";
 import { phaseSettings, poolConfig, startBabysitterPhase, type BabysitterPhase } from "./babysitter-phase.ts";
 
@@ -54,6 +64,44 @@ export function legacyExportErasureEnabled(raw: string | undefined): boolean {
   throw Object.assign(new Error("S3X_LEGACY_EXPORT_ERASURE_ENABLED must be exactly true or unset"), {
     code: "config_flag_invalid",
   });
+}
+
+const optionRefusal = (code: string, message: string) => Object.assign(new Error(message), { code });
+
+/**
+ * The stale-prefixes-only switch and its options, refused before any credential is read. `args` is argv after the
+ * script. Undefined when the switch is absent (the default job, whose flags are not changed by this parser).
+ */
+export function staleprefixOptions(args: readonly string[], e: (k: string) => string | undefined = (k) => process.env[k]): { execute: boolean; max?: number } | undefined {
+  if (!args.includes("--stale-prefixes-only")) {
+    if (args.some((a) => a === "--max" || a.startsWith("--max=")))
+      throw optionRefusal("stale_prefix_max_without_mode", "--max applies only with --stale-prefixes-only");
+    return undefined;
+  }
+  let execute = false, max: number | undefined, seen = 0;
+  for (let i = 0; i < args.length; i++) {
+    const a = args[i]!;
+    if (a === "--stale-prefixes-only") seen += 1;
+    else if (a === "--execute") execute = true;
+    else if (a === "--once") continue; // implied: the mode is always one pass
+    else if (a === "--max") {
+      if (max !== undefined) throw optionRefusal("stale_prefix_max_invalid", "--max given more than once");
+      const v = args[++i];
+      if (v === undefined || !/^[1-9][0-9]*$/.test(v) || !Number.isSafeInteger(Number(v)))
+        throw optionRefusal("stale_prefix_max_invalid", "--max takes a positive decimal integer");
+      max = Number(v);
+    } else throw optionRefusal("stale_prefix_mode_flag_refused", "--stale-prefixes-only accepts only --execute, --once and --max <n>");
+  }
+  if (seen !== 1) throw optionRefusal("stale_prefix_mode_flag_refused", "--stale-prefixes-only given more than once");
+  let retention: string;
+  try {
+    retention = sweepMode(e("BABYSITTER_RETENTION_SWEEP"));
+  } catch {
+    retention = "invalid";
+  }
+  if (retention !== "off") throw optionRefusal("stale_prefix_mode_retention_refused", "--stale-prefixes-only runs no babysitter phase: BABYSITTER_RETENTION_SWEEP must be off or unset");
+  if (obligationsEnabled(e)) throw optionRefusal("stale_prefix_mode_requires_obligations_off", "--stale-prefixes-only runs only with S3X_OBLIGATIONS off");
+  return max === undefined ? { execute } : { execute, max };
 }
 
 const env = (k: string, d?: string) => process.env[k]?.trim() || d;
@@ -96,12 +144,14 @@ export function authorityUrl(kind: ErasureAuthorityKind, raw: unknown): string {
 
 export async function main() {
   const execute = flag("execute");
+  const stale = staleprefixOptions(process.argv.slice(2));
   refuseCredentialEnv();
   const kind = authorityKind(env("S3X_PRIVACY_AUTHORITY"));
   // Babysitter retention phase (additive): off without --execute; when on, its registry login is one
   // more field of the same stdin credential JSON (never a file, env or argv).
-  const retention = phaseSettings(env, execute, env("S3X_KEY_ROOT", "96bulls")!);
-  const required = [...(execute ? ["databaseUrl", "eraser"] : ["databaseUrl"]), ...(retention.mode !== "off" ? ["retentionDatabaseUrl"] : [])];
+  // The stale-prefixes-only mode never runs the phase (refused above unless BABYSITTER_RETENTION_SWEEP is off).
+  const retention = stale ? undefined : phaseSettings(env, execute, env("S3X_KEY_ROOT", "96bulls")!);
+  const required = [...(execute ? ["databaseUrl", "eraser"] : ["databaseUrl"]), ...(retention && retention.mode !== "off" ? ["retentionDatabaseUrl"] : [])];
   const creds = await readStdinCredentials(required, ["databaseUrl", "eraser", "retentionDatabaseUrl"]);
   const retentionUrl = creds.retentionDatabaseUrl;
   delete creds.retentionDatabaseUrl;
@@ -118,7 +168,7 @@ export async function main() {
   let stop = false;
   for (const sig of ["SIGINT", "SIGTERM"] as const) process.on(sig, () => void (stop = true));
   let phase: BabysitterPhase | undefined;
-  if (retention.mode !== "off") {
+  if (retention && retention.mode !== "off") {
     const pool = new pg.Pool(poolConfig(retentionUrl, env("BABYSITTER_RETENTION_ALLOW_LOOPBACK") === "true"));
     const stoppable = async (ms: number) => { for (let left = ms; left > 0 && !stop; left -= 1000) await new Promise((r) => setTimeout(r, Math.min(1000, left))); };
     phase = await startBabysitterPhase(retention, pool, eraser, log, stoppable);
@@ -135,6 +185,13 @@ export async function main() {
     if (kind === "supabase") await assertEraserIdentity(db);
     const authority = kind === "supabase" ? supabaseAuthority(db) : neonAuthority(db);
     const job = new ErasureJob(authority, state, eraser, log, cfg, Date.now, undefined, () => stop);
+    if (stale) {
+      // One pass, no sweep, no phase. A dry run's eraser has no existence check: it reports sibling_checked false.
+      log({ message: "start", mode: "stale_prefixes_only", execute, authority: kind, obligations, ...(stale.max !== undefined ? { max: stale.max } : {}) });
+      const r = await job.staleprefixPass({ execute, ...(stale.max !== undefined ? { max: stale.max } : {}), ...(isLiveObjectProbe(eraser) ? { probe: eraser } : {}) });
+      if (!r.ok) throw optionRefusal("stale_prefix_pass_stopped", "the stale-prefix pass stopped at a failed erase");
+      return;
+    }
     log({ message: "start", execute, authority: kind, recognize_legacy: cfg.recognizeLegacy, obligations });
     // A dry run deletes nothing and marks nothing done: it sweeps and reports what it would erase.
     if (!execute) {

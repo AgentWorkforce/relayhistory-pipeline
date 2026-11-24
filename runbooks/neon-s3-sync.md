@@ -150,6 +150,131 @@ holds only the eraser key ("sessions-prod transcript eraser").
 - Accepted gap (#105): record-level changes that do not bump
   `session_revisions` reach S3 only through the exporter's idle 14-day re-read.
 
+### Stale-prefixes-only mode (`--stale-prefixes-only`)
+
+**Approval first.** Running this mode, dry or with `--execute`, needs the
+owner's explicit approval in his own words for that run. A relayed approval is
+not enough.
+
+A narrow, single pass of the erasure job. It erases only the session prefixes
+the exporter queued after a session's date moved. When a session's export
+moves from one `d=YYYY/MM/DD` prefix to another, the old prefix is queued as
+kind `prefix` with reason `stale_prefix`.
+
+```sh
+<credentials JSON> | bun run migration:neon-s3-erasure --stale-prefixes-only [--max <n>]            # dry run
+<credentials JSON> | bun run migration:neon-s3-erasure --stale-prefixes-only --execute [--max <n>]
+```
+
+**What it does**
+
+- Reads only the queued entries with kind `prefix` AND reason `stale_prefix`
+  that are past their backoff. It takes them in enqueue order and makes one
+  pass, then exits. `--once` is implied.
+- Checks each entry inside its session-prefix lease, right before the erase:
+  - (a) The old prefix holds none of the org's current exported or pending
+    keys.
+  - (b) A current exported manifest of the same session exists. It must have
+    the same org, `ws`, `m`, `h` and `s`, and differ **only** in the date. Its
+    group's last export must have succeeded. It must also be live in the
+    bucket right now: its latest version exists and is not a delete marker.
+    The last copy of a session is therefore never erased.
+- An entry that passes goes through the job's normal per-item path, with
+  every protection the full job has:
+  - It must still be queued.
+  - The lease is renewed before each page.
+  - The privacy authority must be ready.
+  - The off-mode interlock applies.
+  - The strict paged eraser deletes every version by id and needs a fresh
+    zero proof before the entry is marked done.
+- With `--max <n>` (a positive decimal integer) it stops after `n` successful
+  erases.
+- It stops at the first failed erase: an error, an unresolved, unverified,
+  incomplete or refused result, or a refused done claim. It records that
+  entry exactly as the full job would (error code, backoff), touches nothing
+  after it, and exits non-zero (`stale_prefix_pass_stopped`).
+
+**What it does not do**
+
+- It runs no sweep of any kind: no presence, fenced, live-fenced or legacy
+  sweep.
+- It runs no babysitter retention phase.
+- It writes no `erasure_seen` rows and no sweep bookkeeping.
+- It never reads or changes any other queued entry (objects, or prefixes with
+  other reasons).
+- It does not release other erasers' leases. A prefix leased by the exporter
+  or another eraser is skipped untouched.
+- Without `--execute` it deletes nothing, takes no lease and writes nothing
+  to the queue.
+
+**Inputs.** The same stdin credentials and environment as the full job, with
+these differences:
+
+- The eraser key is needed only with `--execute`.
+- No `retentionDatabaseUrl` is needed.
+- The privacy authority database is still required. Its readiness is
+  re-checked before every page's deletes.
+
+The mode refuses to start in any of these cases:
+
+- `BABYSITTER_RETENTION_SWEEP` is set to anything other than `off` or unset
+  (`stale_prefix_mode_retention_refused`).
+- `S3X_OBLIGATIONS` is on (`stale_prefix_mode_requires_obligations_off`).
+- Any flag other than `--execute`, `--once` and `--max <n>` is given
+  (`stale_prefix_mode_flag_refused`).
+- `--max` is invalid or repeated (`stale_prefix_max_invalid`).
+
+`--max` without the switch is refused (`stale_prefix_max_without_mode`).
+
+Do not run it at the same time as another eraser on the same state file.
+
+**Reading the output.** The logs carry counts and key hashes (`key_sha256`)
+only.
+
+- `start` with `mode: "stale_prefixes_only"`.
+- One `stale prefix skipped` line per skipped entry, with `reason`.
+- One `stale prefix erased` line per erase.
+- On a stop, `stale prefix pass stopped` with `outcome` and `error_code`.
+- A final `stale prefix pass` line with:
+  - `selected`: queued stale prefixes.
+  - `due` and `backing_off`.
+  - `other_entries`: the rest of the queue, untouched.
+  - `eligible`: in a dry run, the entries that would pass the guard; with
+    `--execute`, the entries erased.
+  - `erased` and `versions_deleted`.
+  - `skipped`: counts by reason.
+  - `sibling_checked`.
+  - `stopped_by`: `max`, `signal` or the failing outcome.
+
+A dry run has no bucket credentials, so it does not make the bucket check in
+(b): `sibling_checked: false`. Its `eligible` count is therefore an upper bound
+for the execute run.
+
+Skip reasons:
+
+| reason | meaning |
+| --- | --- |
+| `shape_invalid` | not a session prefix of the entry's own org |
+| `current_key` | the old prefix still holds a current exported or pending key (guard a) |
+| `not_date_move` | the session's current copy differs in workspace, machine or host, not only the date |
+| `no_live_sibling` | no current exported copy of the session under another date |
+| `sibling_export_failed` | a date-moved copy exists only in a group whose last export failed |
+| `sibling_manifest_missing` | the date-moved copy's manifest is not live in the bucket now |
+| `sibling_check_failed` | the bucket existence check errored (nothing written; rerun later) |
+| `lease_busy` | another holder (exporter or eraser) holds the prefix lease |
+| `state_busy` | the state file was busy when taking the lease |
+| `cancelled` | the exporter cancelled the entry before the lease was taken |
+
+The queue's `stale_prefix` entries also include the former copies of sessions
+a deletion fence emptied (the exporter queues those through the same loop as a
+date move). Entries of fenced, emptied or machine-moved sessions are skipped
+and stay for the full job, and the `no_live_sibling` count is not a count of
+fences.
+
+**Skipped entries stay queued.** A skip writes nothing: no error, no backoff
+and no done claim. Skipped entries are left for the full erasure job, which
+handles them on its normal schedule.
+
 ## Run (linuyc, for now)
 
 State: `~/.agent-tmp/s3x/state.sqlite` (ids, revisions, keys; no content).

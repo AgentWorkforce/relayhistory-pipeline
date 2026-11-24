@@ -864,6 +864,30 @@ export class SyncState {
       .run(code, at, key));
   }
 
+  /**
+   * Stale-prefix-only mode (neon-s3-erasure --stale-prefixes-only), read-only: the queued session prefixes the
+   * exporter retired (kind 'prefix' AND reason 'stale_prefix'), with their backoff, oldest first.
+   */
+  staleprefixErasures(): { key: string; kind: "prefix"; org_id: string; reason: "stale_prefix"; enqueued_at: number; next_try: number }[] {
+    return this.db
+      .prepare(
+        `SELECT key, kind, org_id, reason, enqueued_at, next_try FROM erasures
+          WHERE kind = 'prefix' AND reason = 'stale_prefix' ORDER BY enqueued_at, key`,
+      )
+      .all() as unknown as { key: string; kind: "prefix"; org_id: string; reason: "stale_prefix"; enqueued_at: number; next_try: number }[];
+  }
+
+  /** Read-only: every exported group's current keys (and export error) for one org (the stale-prefix guard). */
+  exportedKeysOf(org: string): { session_id: string; keys: string[]; error: string | null }[] {
+    const rows = this.db.prepare("SELECT session_id, keys, error FROM exported WHERE org_id = ?").all(org) as { session_id: string; keys: string; error: string | null }[];
+    return rows.map((r) => ({ session_id: r.session_id, keys: JSON.parse(r.keys) as string[], error: r.error }));
+  }
+
+  /** Read-only: keys an exporter run recorded before writing (not yet folded into `exported`) for one org. */
+  pendingKeysOf(org: string): string[] {
+    return (this.db.prepare("SELECT key FROM pending_keys WHERE org_id = ?").all(org) as { key: string }[]).map((r) => r.key);
+  }
+
   erasureBacklog(now = Date.now()): { queued: number; oldestAgeH: number | null; failing: number } {
     const r = this.db.prepare("SELECT count(*) AS n, min(enqueued_at) AS o, count(error) AS f FROM erasures").get() as {
       n: number;
