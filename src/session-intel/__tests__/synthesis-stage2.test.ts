@@ -4,8 +4,8 @@ import { readFileSync } from "node:fs";
 import { analyzedSessions, synthesisJson, synthesize } from "../synthesis/synthesize.ts";
 import {
   buildStage2Prompt, DROP_REASONS, estimateInputTokens, memoryBudgetLedger, parseStage2Reply, resolveStage2Caps, runStage2,
-  stage1Of, stage2Errors, stage2FlagOn, STAGE2_CAPS, STAGE2_DEFAULT_MODEL, STAGE2_PROMPT_VERSION, synthesisV2Json,
-  type BudgetLedger, type Stage2Deps, type Stage2ModelRequest, type Stage2ModelTransport,
+  selectStage2Sessions, stage1Of, stage2FlagOn, validateStoredStage2, STAGE2_CAPS, STAGE2_DEFAULT_MODEL, STAGE2_PROMPT_VERSION, synthesisV2Json,
+  type BudgetLedger, type Stage2Deps, type Stage2ModelRequest, type Stage2ModelTransport, type Stage2Timer,
 } from "../synthesis/stage2.ts";
 import type { ModelTransportResponse } from "../../session-analysis/engine/model.ts";
 
@@ -69,7 +69,7 @@ describe("the prompt", () => {
     }));
     const ENUMS = new Set(["planning", "implementation", "debugging", "review", "testing", "research", "conversation", "mixed", "unknown",
       "not-started", "in-progress", "implemented", "reported-complete", "verified", "blocked", "superseded", "none", "artifact", "failed-command"]);
-    const KEYS = new Set(["promptVersion", "stage1", "analyzed", "categories", "sessionType", "outcomeStatus", "count", "sessions", "recurringFailures", "kind", "sessionCount", "scopeGroups", "alias", "titles"]);
+    const KEYS = new Set(["promptVersion", "truncatedSessions", "stage1", "analyzed", "categories", "sessionType", "outcomeStatus", "count", "sessions", "recurringFailures", "kind", "sessionCount", "scopeGroups", "alias", "titles"]);
     const leaks: string[] = [];
     for (const [path, v] of strings(data)) {
       if (path.endsWith("{key}")) { if (!KEYS.has(v) && !/^[idbo][1-9]$/u.test(v)) leaks.push(`${path}=${v}`); continue; }
@@ -116,6 +116,29 @@ describe("the prompt", () => {
       expect([...p.aliases]).toEqual([...base.aliases]);
     }
     expect(`${JSON.stringify(JSON.parse(base.input), null, 2)}\n`).toBe(readFileSync(new URL("expected-stage2-input.json", FIXTURE_DIR), "utf8"));
+    // The truncated case too: the same kept sessions, aliases and bytes in any cohort order.
+    const cap = estimateInputTokens(base) - 500;
+    const pick = (c: unknown) => selectStage2Sessions(synthesize(c, OPTS), analyzedSessions(c, OPTS), cap)!;
+    const t0 = pick(cohort());
+    expect(JSON.parse(t0.prompt.input).truncatedSessions).toBeGreaterThan(0);
+    for (const seed of [3, 9]) {
+      const c = cohort();
+      c.sessions = shuffled(c.sessions, seed);
+      const t = pick(c);
+      expect([t.prompt.input, [...t.prompt.aliases]]).toEqual([t0.prompt.input, [...t0.prompt.aliases]]);
+    }
+  });
+
+  test("a title with a Unicode format character (Cf) never enters the prompt; its ref is not reused", () => {
+    for (const cf of ["\u200b", "\u200e", "\u202e", "\ufeff", "\u2066", "\u00ad"]) {
+      const c = cohort();
+      const e = c.sessions.find((x) => x.sessionId === "fx-s01")!;
+      e.result.analysis.understanding.intents[0].text = `Hidden${cf}text`;
+      const p = prompt(c);
+      expect(JSON.parse(p.input).sessions[0].titles).toEqual({ o1: "Fixture assessment: the outcome is blocked." });
+      expect(p.input.includes(cf)).toBe(false);
+      expect(p.titleRefs.get("s1")).toEqual(new Set(["o1"]));
+    }
   });
 
   test("a title carrying instructions is quoted data, and a reply obeying it is dropped", () => {
@@ -127,28 +150,84 @@ describe("the prompt", () => {
     // Quoted as one JSON string inside the data object; it cannot close the object or add a key.
     const data = JSON.parse(p.input);
     expect(data.sessions[0].titles.i1).toBe(injected);
-    expect(Object.keys(data)).toEqual(["promptVersion", "stage1", "sessions"]);
+    expect(Object.keys(data)).toEqual(["promptVersion", "truncatedSessions", "stage1", "sessions"]);
     expect(p.instructions).toContain("untrusted");
     const parsed = parseStage2Reply(JSON.stringify({ initiatives: [{ title: "pwned", goal: "x", sessions: ["s1", "s999"], evidence: [{ alias: "s1", titleRef: "i1" }, { alias: "s999", titleRef: "i1" }] }], themes: [], hypotheses: [] }), p);
     expect(parsed.ok && parsed.initiatives).toEqual([]);
     expect(parsed.ok && parsed.dropped.byReason.foreign_alias).toBe(1);
   });
 
-  test("the estimate is ceil(ascii/4) + one per other code point + the overhead", () => {
-    expect(estimateInputTokens({ instructions: "abcd", input: "e", schema: {} })).toBe(Math.ceil(7 / 4) + 1_024);
+  test("the estimate is ceil(ascii/3) + one per other code point + the overhead", () => {
+    expect(estimateInputTokens({ instructions: "abcd", input: "e", schema: {} })).toBe(Math.ceil(7 / 3) + 1_024);
     expect(estimateInputTokens({ instructions: "", input: "一二", schema: {} })).toBe(1 + 2 + 1_024);
   });
 });
 
 describe("caps refuse before the call", () => {
-  test("per run: an input estimate over the cap makes no call and touches no budget", async () => {
-    const { transport, calls } = fakeTransport();
+  test("per run: the estimate binds the cap; over it the oldest sessions are left out, and under 2 kept there is no call", async () => {
+    const { transport, calls } = fakeTransport({ initiatives: [], themes: [], hypotheses: [] });
     const ledger = memoryBudgetLedger();
     const estimate = estimateInputTokens(prompt());
-    const r = await run({ transport, ledger, caps: { maxInputTokensPerRun: estimate - 1 } });
-    expect([r.document.stage2, r.document.stage2Reason, r.called, calls.length, ledger.reservations.size]).toEqual([null, "cap_exceeded", false, 0, 0]);
-    const ok = await run({ transport, ledger, caps: { maxInputTokensPerRun: estimate } });
-    expect(ok.document.stage2Reason).toBeNull();
+    const full = await run({ transport, ledger, trigger: "manual", caps: { maxInputTokensPerRun: estimate } });
+    expect([full.document.stage2!.keptSessions, full.document.stage2!.truncatedSessions]).toEqual([40, 0]);
+    const cut = await run({ transport, ledger, trigger: "manual", caps: { maxInputTokensPerRun: estimate - 1 } });
+    expect(cut.estimatedInputTokens!).toBeLessThanOrEqual(estimate - 1);
+    expect(cut.document.stage2!.truncatedSessions).toBeGreaterThan(0);
+    expect(cut.document.stage2!.keptSessions + cut.document.stage2!.truncatedSessions).toBe(40);
+    expect(JSON.parse(calls[1]!.input).truncatedSessions).toBe(cut.document.stage2!.truncatedSessions);
+    // Not even two sessions fit: insufficient_sessions, no call, no reservation.
+    const before = ledger.reservations.size;
+    const none = await run({ transport, ledger, trigger: "scheduled", caps: { maxInputTokensPerRun: 2_000 } });
+    expect([none.document.stage2, none.document.stage2Reason, none.called, calls.length, ledger.reservations.size]).toEqual([null, "insufficient_sessions", false, 2, before]);
+  });
+
+  test("fewer than 2 analyzed sessions: insufficient_sessions, no call and no reservation", async () => {
+    for (const keep of [0, 1]) {
+      const c = cohort();
+      c.sessions = c.sessions.filter((e) => e.status !== "analyzed" || String(e.sessionId).startsWith("fx-bad-")).concat(c.sessions.filter((e) => e.sessionId === "fx-s01").slice(0, keep));
+      const { transport, calls } = fakeTransport();
+      const ledger = memoryBudgetLedger();
+      const r = await run({ transport, ledger }, c);
+      expect([r.document.stage2Reason, calls.length, ledger.reservations.size, ledger.runs.size]).toEqual(["insufficient_sessions", 0, 0, 0]);
+    }
+  });
+
+  test("a big cohort at the real cap: the newest sessions that fit are kept, the dropped count is right, deterministic", async () => {
+    // 40 sessions with 9 titles each of 280 non-ASCII code points: about 100,800 tokens of titles alone.
+    const big = () => {
+      const c = cohort();
+      const long = (k: string) => `${k}${"\u4e00".repeat(280)}`.slice(0, 280);
+      for (const e of c.sessions) {
+        if (e.status !== "analyzed" || String(e.sessionId).startsWith("fx-bad-")) continue;
+        const u = e.result.analysis.understanding;
+        const cite = u.intents[0].evidenceIds;
+        const claim = (k: string) => ({ text: long(`${e.sessionId}${k}`), evidenceIds: cite, confidence: "high", basis: "observed" });
+        u.intents = ["i1", "i2", "i3"].map(claim);
+        u.decisions = ["d1", "d2", "d3"].map(claim);
+        u.blockers = ["b1", "b2", "b3"].map(claim);
+      }
+      return c;
+    };
+    const c = big();
+    const all = analyzedSessions(c, OPTS);
+    expect(estimateInputTokens(buildStage2Prompt(synthesize(c, OPTS), all, all))).toBeGreaterThan(100_000);
+    const { transport, calls } = fakeTransport({ initiatives: [], themes: [], hypotheses: [] });
+    const r = await run({ transport }, c);
+    const s2 = r.document.stage2!;
+    expect(r.estimatedInputTokens!).toBeLessThanOrEqual(100_000);
+    expect(s2.keptSessions + s2.truncatedSessions).toBe(40);
+    expect(s2.truncatedSessions).toBeGreaterThan(0);
+    expect(JSON.parse(calls[0]!.input).truncatedSessions).toBe(s2.truncatedSessions);
+    // The kept ones are exactly the newest by analyzedAt, and one more would not fit.
+    const newest = [...all].sort((x, y) => y.analyzedAtMs - x.analyzedAtMs);
+    const keptKeys = new Set(s2.sessions.map((x) => x.sessionId));
+    expect(new Set(newest.slice(0, s2.keptSessions).map((x) => x.sessionId))).toEqual(keptKeys);
+    expect(estimateInputTokens(buildStage2Prompt(synthesize(c, OPTS), newest.slice(0, s2.keptSessions + 1), all))).toBeGreaterThan(100_000);
+    const c2 = big();
+    c2.sessions = shuffled(c2.sessions, 5);
+    const again = await run({ transport }, c2);
+    expect(again.document.stage2!.sessions).toEqual(s2.sessions);
+    expect(calls[1]!.input).toBe(calls[0]!.input);
   });
 
   test("the caps can be lowered, never raised", () => {
@@ -244,11 +323,29 @@ describe("usage", () => {
     // The run still counts: a failed scheduled run uses the day's scheduled run.
     expect((await run({ transport: fakeTransport().transport, ledger })).document.stage2Reason).toBe("budget_exhausted");
   });
-  test("a transport that never answers is cut at the deadline: transport_failed", async () => {
-    const hanging: Stage2ModelTransport = { complete: () => new Promise<never>(() => {}) };
-    const r = await run({ transport: hanging, timeoutMs: 20 });
-    expect([r.document.stage2Reason, r.called]).toEqual(["transport_failed", true]);
+  test("a transport that never answers is cut at the deadline (injected timer): transport_failed, signal aborted", async () => {
+    const timers: Array<{ fire: () => void; ms: number; cleared: boolean }> = [];
+    const timer: Stage2Timer = { set: (fire, ms) => { const t = { fire, ms, cleared: false }; timers.push(t); return t; }, clear: (h) => { (h as { cleared: boolean }).cleared = true; } };
+    let seen: Stage2ModelRequest | undefined;
+    let started!: () => void;
+    const called = new Promise<void>((r) => { started = r; });
+    const hanging: Stage2ModelTransport = { complete: (req) => { seen = req; started(); return new Promise<never>(() => {}); } };
+    const pending = run({ transport: hanging, timeoutMs: 1_234, timer });
+    await called;
+    expect(timers.map((t) => t.ms)).toEqual([1_234]);
+    expect(seen!.timeoutMs).toBe(1_234);
+    expect(seen!.signal.aborted).toBe(false);
+    timers[0]!.fire();
+    const r = await pending;
+    expect([r.document.stage2Reason, r.called, seen!.signal.aborted, timers[0]!.cleared]).toEqual(["transport_failed", true, true, true]);
     await expect(run({ transport: hanging, timeoutMs: 120_001 })).rejects.toThrow();
+  });
+
+  test("an answer from a model outside the allowlist is a failure; the usage is still settled", async () => {
+    const ledger = memoryBudgetLedger();
+    const transport: Stage2ModelTransport = { async complete() { return { outputText: JSON.stringify({ initiatives: [], themes: [], hypotheses: [] }), inputTokens: 10, outputTokens: 5, providerRequestId: null, model: "claude-sonnet-5" }; } };
+    const r = await run({ transport, ledger });
+    expect([r.document.stage2Reason, r.modelMismatch, r.usage, ledger.tokensByDay.get("2026-11-24")]).toEqual(["transport_failed", true, { inputTokens: 10, outputTokens: 5 }, 15]);
   });
 
   test("only the approved model may be requested", async () => {
@@ -296,6 +393,21 @@ describe("the validator", () => {
     expect(pad.ok && pad.dropped.byReason.invalid_shape).toBe(1);
   });
 
+  test("an inner newline or a format character in a reply title is invalid_shape", () => {
+    const p = prompt();
+    for (const title of ["Two\nlines", "Tab\tinside", "Zero\u200bwidth", "Bidi\u202eoverride", "\ufeffBOM"]) {
+      const parsed = parseStage2Reply(JSON.stringify({ initiatives: [{ title, goal: "g", sessions: ["s1", "s2"], evidence: [{ alias: "s1", titleRef: "i1" }, { alias: "s2", titleRef: "i1" }] }], themes: [], hypotheses: [] }), p);
+      expect(parsed.ok && [parsed.initiatives.length, parsed.dropped.byReason.invalid_shape]).toEqual([0, 1]);
+    }
+  });
+
+  test("evidence citing a real alias and its own title, but a session the item does not name, is missing_citation", () => {
+    const p = prompt();
+    expect(p.titleRefs.get("s3")!.has("b1")).toBe(true);
+    const parsed = parseStage2Reply(JSON.stringify({ initiatives: [{ title: "t", goal: "g", sessions: ["s1", "s2"], evidence: [{ alias: "s1", titleRef: "i1" }, { alias: "s2", titleRef: "i1" }, { alias: "s3", titleRef: "b1" }] }], themes: [], hypotheses: [] }), p);
+    expect(parsed.ok && [parsed.initiatives.length, parsed.dropped.byReason.missing_citation]).toEqual([0, 1]);
+  });
+
   test("a reply that is not exactly the closed object is invalid_reply", async () => {
     const p = prompt();
     for (const bad of ["not json", "```json\n{}\n```", "[]", JSON.stringify({ initiatives: [], themes: [] }), JSON.stringify({ initiatives: [], themes: [], hypotheses: [], notes: "x" }),
@@ -317,8 +429,8 @@ describe("the v2 document", () => {
     expect(synthesisV2Json(r.document)).toBe(readFileSync(new URL("expected-synthesis-v2.json", FIXTURE_DIR), "utf8"));
     expect(synthesisJson(stage1Of(r.document))).toBe(readFileSync(new URL("expected-synthesis.json", FIXTURE_DIR), "utf8"));
     const listed = new Set(c.sessions.map((e) => `${e.source}\u0000${e.sessionId}`));
-    expect(stage2Errors(r.document, listed)).toEqual([]);
-    expect(stage2Errors(r.document, new Set())).not.toEqual([]);
+    expect(() => validateStoredStage2(r.document.stage2, listed, 40)).not.toThrow();
+    expect(() => validateStoredStage2(r.document.stage2, new Set(), 40)).toThrow();
     // Keys: the Stage 1 keys in order, then stage2 and its reason.
     expect(Object.keys(r.document)).toEqual(["contract", "workspace", "window", "generatedAt", "inputs", "freshness", "usageCoverage", "categories", "issues", "stage2", "stage2Reason"]);
   });
@@ -340,6 +452,15 @@ describe("the v2 document", () => {
     const other = cohort();
     other.sessions = other.sessions.slice(0, 5);
     await expect(runStage2({ v1: synthesize(other, OPTS), cohort: c, options: OPTS, orgId: ORG, deps: { enabled: true, trigger: "scheduled", clock: CLOCK, ledger: memoryBudgetLedger(), transport: fakeTransport().transport } })).rejects.toThrow();
+  });
+
+  test("an unmapped Stage 1 ref throws, never a silent drop", async () => {
+    const c = cohort();
+    const v1 = synthesize(c, OPTS);
+    v1.categories[0]!.sessions.push({ source: "fx-claude", sessionId: "fx-not-in-cohort" });
+    const { transport, calls } = fakeTransport();
+    await expect(runStage2({ v1, cohort: c, options: OPTS, orgId: ORG, deps: { enabled: true, trigger: "scheduled", clock: CLOCK, ledger: memoryBudgetLedger(), transport } })).rejects.toThrow(/not an analyzed session/u);
+    expect(calls.length).toBe(0);
   });
 
   test("the Stage 2 source reads no environment, clock or network", () => {

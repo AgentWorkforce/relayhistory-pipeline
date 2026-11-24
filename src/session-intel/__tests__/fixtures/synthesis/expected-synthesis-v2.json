@@ -801,6 +801,170 @@
         "bad_basis": 1
       }
     },
+    "keptSessions": 40,
+    "truncatedSessions": 0,
+    "sessions": [
+      {
+        "source": "fx-claude",
+        "sessionId": "fx-s01"
+      },
+      {
+        "source": "fx-claude",
+        "sessionId": "fx-s03"
+      },
+      {
+        "source": "fx-claude",
+        "sessionId": "fx-s06"
+      },
+      {
+        "source": "fx-claude",
+        "sessionId": "fx-s08"
+      },
+      {
+        "source": "fx-claude",
+        "sessionId": "fx-s11"
+      },
+      {
+        "source": "fx-claude",
+        "sessionId": "fx-s13"
+      },
+      {
+        "source": "fx-claude",
+        "sessionId": "fx-s16"
+      },
+      {
+        "source": "fx-claude",
+        "sessionId": "fx-s18"
+      },
+      {
+        "source": "fx-claude",
+        "sessionId": "fx-s21"
+      },
+      {
+        "source": "fx-claude",
+        "sessionId": "fx-s23"
+      },
+      {
+        "source": "fx-claude",
+        "sessionId": "fx-s26"
+      },
+      {
+        "source": "fx-claude",
+        "sessionId": "fx-s28"
+      },
+      {
+        "source": "fx-claude",
+        "sessionId": "fx-s31"
+      },
+      {
+        "source": "fx-claude",
+        "sessionId": "fx-s33"
+      },
+      {
+        "source": "fx-claude",
+        "sessionId": "fx-s36"
+      },
+      {
+        "source": "fx-claude",
+        "sessionId": "fx-s38"
+      },
+      {
+        "source": "fx-codex",
+        "sessionId": "fx-s02"
+      },
+      {
+        "source": "fx-codex",
+        "sessionId": "fx-s04"
+      },
+      {
+        "source": "fx-codex",
+        "sessionId": "fx-s05"
+      },
+      {
+        "source": "fx-codex",
+        "sessionId": "fx-s07"
+      },
+      {
+        "source": "fx-codex",
+        "sessionId": "fx-s09"
+      },
+      {
+        "source": "fx-codex",
+        "sessionId": "fx-s10"
+      },
+      {
+        "source": "fx-codex",
+        "sessionId": "fx-s12"
+      },
+      {
+        "source": "fx-codex",
+        "sessionId": "fx-s14"
+      },
+      {
+        "source": "fx-codex",
+        "sessionId": "fx-s15"
+      },
+      {
+        "source": "fx-codex",
+        "sessionId": "fx-s17"
+      },
+      {
+        "source": "fx-codex",
+        "sessionId": "fx-s19"
+      },
+      {
+        "source": "fx-codex",
+        "sessionId": "fx-s20"
+      },
+      {
+        "source": "fx-codex",
+        "sessionId": "fx-s22"
+      },
+      {
+        "source": "fx-codex",
+        "sessionId": "fx-s24"
+      },
+      {
+        "source": "fx-codex",
+        "sessionId": "fx-s25"
+      },
+      {
+        "source": "fx-codex",
+        "sessionId": "fx-s27"
+      },
+      {
+        "source": "fx-codex",
+        "sessionId": "fx-s29"
+      },
+      {
+        "source": "fx-codex",
+        "sessionId": "fx-s30"
+      },
+      {
+        "source": "fx-codex",
+        "sessionId": "fx-s32"
+      },
+      {
+        "source": "fx-codex",
+        "sessionId": "fx-s34"
+      },
+      {
+        "source": "fx-codex",
+        "sessionId": "fx-s35"
+      },
+      {
+        "source": "fx-codex",
+        "sessionId": "fx-s37"
+      },
+      {
+        "source": "fx-codex",
+        "sessionId": "fx-s39"
+      },
+      {
+        "source": "fx-codex",
+        "sessionId": "fx-s40"
+      }
+    ],
     "basis": "model"
   },
   "stage2Reason": null

@@ -1,5 +1,6 @@
 {
   "promptVersion": "workspace-synthesis-stage2/1",
+  "truncatedSessions": 0,
   "stage1": {
     "analyzed": 40,
     "categories": [
