@@ -5,7 +5,7 @@
 import { afterEach, describe, expect, test } from "bun:test";
 import { readFileSync } from "node:fs";
 import {
-  ANTHROPIC_VERSION, claudeRequestBody, ClaudeTransportError, createClaudeTransport, parseClaudeResponse, retryAfterSeconds,
+  ANTHROPIC_VERSION, CLAUDE_MAX_RESPONSE_BYTES, claudeRequestBody, ClaudeTransportError, createClaudeTransport, parseClaudeResponse, retryAfterSeconds,
   stripUnsupportedSchema, UNSUPPORTED_SCHEMA_KEYWORDS,
 } from "../synthesis/claude-transport.ts";
 import { memoryBudgetLedger, runStage2, STAGE2_CAPS, STAGE2_INSTRUCTIONS, STAGE2_REPLY_SCHEMA, type Stage2ModelRequest } from "../synthesis/stage2.ts";
@@ -182,6 +182,21 @@ describe("the response", () => {
     for (const [body, code] of cases) expect((await failure(transport(fakeFetch([json(200, body)])).complete(request()))).code).toBe(code as never);
     expect((await failure(transport(fakeFetch([new Response("not json", { status: 200 })])).complete(request()))).code).toBe("response_invalid");
     expect((await failure(transport(fakeFetch([new Response("x".repeat(1024 * 1024 + 1), { status: 200 })])).complete(request()))).code).toBe("response_invalid");
+  });
+
+  test("the response size cap: a VALID message body of exactly the cap is accepted, one byte over is refused", async () => {
+    // Padded with an unknown field the parser ignores, so only the size check can refuse it.
+    const sized = (total: number) => {
+      const base = JSON.stringify({ ...message(), padding: "" });
+      const text = JSON.stringify({ ...message(), padding: "x".repeat(total - base.length) });
+      expect(new TextEncoder().encode(text).length).toBe(total);
+      return new Response(text, { status: 200, headers: { "content-type": "application/json" } });
+    };
+    expect(CLAUDE_MAX_RESPONSE_BYTES).toBe(1024 * 1024);
+    const under = await transport(fakeFetch([sized(CLAUDE_MAX_RESPONSE_BYTES)])).complete(request());
+    expect([under.inputTokens, under.outputTokens]).toEqual([1_275, 300]);
+    const over = await failure(transport(fakeFetch([sized(CLAUDE_MAX_RESPONSE_BYTES + 1)])).complete(request()));
+    expect([over.code, over.status]).toEqual(["response_invalid", 200]);
   });
 });
 

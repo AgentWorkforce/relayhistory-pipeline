@@ -129,6 +129,48 @@ describe("envelope equality with the Stage 1 artifact", () => {
   });
 });
 
+describe("the envelope's analyzed list against a TRUNCATED drilldown", () => {
+  test("a ref outside considered is rejected even where no drilldown or kept-session check could see it", async () => {
+    // Drilldowns cut to 1 per category and the kept sessions cut by the input cap: some analyzed sessions are in
+    // neither, so swapping one of them for an outside ref leaves only the `considered` check to catch it.
+    const store = memoryArtifactStore();
+    const options = { now: NOW, bounds: { maxDrilldown: 1 } };
+    const r = await runWorkspaceSynthesisJob({
+      store, keyRoot: "fxroot", orgId: "fx-org", cohort: cohort(), options, stage2: { ...stage2(), caps: { maxInputTokensPerRun: 4_000 } },
+    });
+    if (!r.stage2 || r.stage2.outcome === "failed" || !r.stage2.document.stage2) throw new Error("fx: no v2");
+    const v1 = JSON.parse(new TextDecoder().decode(store.objects.get(r.key)!)) as SynthesisArtifact;
+    const v2 = JSON.parse(new TextDecoder().decode(store.objects.get(r.stage2.key)!)) as SynthesisArtifactV2;
+    expect(v1.synthesis.inputs.caps.drilldown.truncated).toBe(true);
+    expect(v2.synthesis.stage2!.truncatedSessions).toBeGreaterThan(0);
+    expect(outcome(() => parseStage2Artifact(bytes(v2), v1, r.sha256))).toEqual(["accepted"]);
+    const k = (x: { source: string; sessionId: string }) => `${x.source}\u0000${x.sessionId}`;
+    const drilled = new Set(v1.synthesis.categories.flatMap((c) => c.sessions.map(k)));
+    const kept = new Set(v2.synthesis.stage2!.sessions.map(k));
+    const free = v2.analyzed.find((x) => !drilled.has(k(x)) && !kept.has(k(x)))!;
+    expect(free).toBeDefined();
+    const outside = { source: "fx-claude", sessionId: "fx-zz-not-considered" };
+    expect(v1.considered.some((x) => k(x) === k(outside))).toBe(false);
+    const a = structuredClone(v2);
+    a.analyzed = [...a.analyzed.filter((x) => k(x) !== k(free)), outside].sort((x, y) => (k(x) < k(y) ? -1 : 1));
+    expect(outcome(() => parseStage2Artifact(bytes(a), v1, r.sha256))).toEqual(["synthesis_stage2_invalid", "envelope.analyzed: not considered"]);
+  });
+});
+
+describe("the detail stays out of the message", () => {
+  test("SynthesisArtifactError.message is the code alone, with or without a detail", async () => {
+    expect(new SynthesisArtifactError("synthesis_stage2_invalid", "envelope.window").message).toBe("synthesis_stage2_invalid");
+    const { v1, v2, digest } = await stored();
+    const a = structuredClone(v2) as any;
+    a.workspace = "fx-ws-other";
+    let error: SynthesisArtifactError | null = null;
+    try { parseStage2Artifact(bytes(reseal(a)), v1, digest); } catch (e) { error = e as SynthesisArtifactError; }
+    expect([error!.code, error!.detail, error!.message, String(error)]).toEqual([
+      "synthesis_stage2_invalid", "envelope.workspace", "synthesis_stage2_invalid", "SynthesisArtifactError: synthesis_stage2_invalid",
+    ]);
+  });
+});
+
 describe("the race loser's read-back", () => {
   /** The store as the loser sees it: the "winner" writes `planted` at the Stage 2 key just before the loser's put. */
   const racing = (planted: Uint8Array) => {

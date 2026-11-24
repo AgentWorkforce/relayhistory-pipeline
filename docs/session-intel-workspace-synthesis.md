@@ -541,6 +541,9 @@ GET /v1/session-intel/synthesis?workspace=<id>&since=<ISO>&until=<ISO>&stage=2
   `404 not_found`, reason `synthesis_invalidated`. The kept sessions are checked directly, not assumed covered by
   `considered`. A failing check is `503`.
 - **Body.** The `workspace-synthesis/2` document only (no org id, no provenance lists, no digests).
+- **Older envelopes.** A v2 envelope written before the `analyzed` field (by the Stage 2 code at 923778b5) is not
+  readable by this reader (`synthesis_stage2_invalid`, envelope keys); such a window needs a prompt-version bump or a
+  new window. None exist outside tests.
 - **Enable.** `READ_API_WORKSPACE_SYNTHESIS_V2_ENABLED` stays off until the v1 [Enable condition](#enable-condition)
   holds and a real run (below) has produced v2 objects; turning it on is a deploy step, gated by Khaliq.
 

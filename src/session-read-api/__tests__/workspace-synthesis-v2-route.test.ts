@@ -176,6 +176,29 @@ describe("flag on", () => {
     })();
   });
 
+  test("the reader's detail never reaches the response: the reason is the code only", async () => {
+    const s = await stored();
+    const a = JSON.parse(new TextDecoder().decode(s.store.objects.get(s.v2Key)!));
+    s.store.objects.set(s.v2Key, new TextEncoder().encode(`${JSON.stringify({ ...a, workspace: "fx-ws-other" })}\n`));
+    const r = await get(api({ stage2Enabled: true, source: s.source }).app);
+    expect([r.status, r.body.error]).toEqual([500, { code: "internal", message: "the stored Stage 2 workspace synthesis failed verification", reason: "synthesis_stage2_invalid" }]);
+    expect(r.text).not.toContain("envelope");
+    expect(r.text).not.toContain("fx-ws-other");
+  });
+
+  test("a v2 envelope of another org (or workspace) handed back for the right key is the 500 tenant refusal, never served", async () => {
+    const s = await stored();
+    const found = await s.source.latestStage2!("fx-org", "fx-ws-synthesis", WINDOW);
+    for (const forged of [{ ...found!.v2!, orgId: "fx-org-other" }, { ...found!.v2!, workspace: "fx-ws-other" }]) {
+      const source: WorkspaceSynthesisSource = { latest: s.source.latest, async latestStage2() { return { v1: found!.v1, v2: forged }; } };
+      const { app, live } = api({ stage2Enabled: true, source });
+      const r = await get(app);
+      expect([r.status, r.body.error.code, r.body.error.reason]).toEqual([500, "internal", undefined]);
+      expect(r.text).not.toContain("initiative:");
+      expect(live.calls.erased).toEqual([]);
+    }
+  });
+
   test("a failing erase check is a 503", async () => {
     const s = await stored();
     const app = createReadApi({
