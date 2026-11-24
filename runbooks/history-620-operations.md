@@ -166,13 +166,11 @@ a claim whose statement hit the role `statement_timeout` or was cancelled (`erro
 stay 503) answers the same 429 `delivery_busy` with `Retry-After` 5-10 s instead of the 503.
 Proven: production claim-stage 503s are dominated by 57014 at about 5 s; the role runs
 `statement_timeout` 5 s and `lock_timeout` 2 s (`supabase/bootstrap/session_ingest_role.sql`); the
-claim is one autocommit statement (`src/session-ingest/ledger-sql.ts`, `call`). Hypothesis, pending
-operator `pg_stat_activity` / lock / plan evidence: because `lock_timeout` applies to each lock
-acquisition separately, a claim queued behind several same-user claims on the per-user fence row
-waits several times (each under 2 s) and reaches the 5 s `statement_timeout` first. This is
-unproven: a reviewer's controlled PG15 probe (4-8 concurrent callers on one `FOR UPDATE` row,
-`statement_timeout` 5 s, `lock_timeout` 2 s) produced shallow successes plus deep 55P03s and no
-57014. The flag does not depend on the cause: a 57014 (timeout or `pg_cancel_backend`) rolls back
+claim is one autocommit statement (`src/session-ingest/ledger-sql.ts`, `call`). The earlier
+hypothesis (several same-user claims queued on the per-user fence row) was not reproduced; a reviewer's
+PG15 probe gave 55P03s and no 57014. The mechanism confirmed with `pg_locks` on 2026-11-24 is
+different: the claim waits behind a same-origin staged ACK that is itself queued on the global seat
+clock. See "Claim 57014 convoy" below. The flag does not depend on the cause: a 57014 (timeout or `pg_cancel_backend`) rolls back
 the single autocommit claim statement just like 55P03, so nothing was written and the retry is the
 same idempotent claim;
 57P01/57P02 (terminate, shutdown) and 08xxx are other codes and stay 503. Only `stage=claim`
@@ -316,7 +314,10 @@ nothing written), which with `INGEST_CLAIM_LOCK_BUSY=on` is the 429 `delivery_bu
 lock: the same claim, committed. `SET LOCAL` ends with the transaction, so it never reaches another
 use of a pooled connection. It needs a `run` bound to one connection used sequentially (the
 Worker's per-request and per-queue-batch pg Client); a pooled `run` must not set it. Production
-sets 250 ms with `claimTimeoutBusy` and `claimLockBusy` on (2026-11-16, customer upload retries).
+turned it on with `claimTimeoutBusy` and `claimLockBusy` on 2026-11-16 (customer upload retries); the
+value 250 ms was planned, but the live Worker read back 2000 ms on 2026-11-24, so each claim lock still
+waits up to 2 s. Read the live value from the Worker's settings before reasoning about it (see "Claim
+57014 convoy" below).
 `claimTimeoutBusy` and `claimLockWaitMs` are cutover controls of the private-ingest release contract
 (like the fence mirror and the stop list), never tracked in the public profile: set the
 `private-ingest-production` environment variables `PRIVATE_INGEST_CLAIM_TIMEOUT_BUSY=on` and
@@ -402,6 +403,56 @@ outcome line, and the capture-policy and upload-consent lines emitted from that 
 `linux`, `windows` or `other`, and `client_version` only when it is a release version such as
 `2026.11.12` or `2026.11.12-beta.1`. Any other User-Agent is `client_kind` `other` and nothing more;
 User-Agent text is never logged. Use it to split refusals and busy answers by Desktop release.
+
+## Claim 57014 convoy (diagnosed 2026-11-24)
+
+Signature: `delivery.batches` lines with `stage` `claim`, `error_code` `ledger_timeout`, `db_error_code`
+`57014`, `duration_ms` about 5-6.5 s (`outcome` `delivery_busy` with `INGEST_CLAIM_TIMEOUT_BUSY=on`). Three
+traits separate it from a slow or overloaded database:
+
+- they arrive one at a time across the fleet: the gap between consecutive claim 57014 lines (all orgs)
+  peaks at 4.5-5.5 s and gaps under 4 s are rare, whereas random slowness gives gaps densest near zero;
+- the share is flat per org (each org about 4-11% of its claims) and does not depend on `bytes_raw`,
+  client version or OS;
+- the `ingest.lock_alert` `lazy_claim` lines are mostly 57014 and only some 55P03.
+
+Measured 2026-11-21 to 2026-11-24: about 7% of buffered claims, 200-450 an hour, chronic back to the
+7-day Workers Observability retention edge. Desktops retry and are accepted later, so uploads are slow,
+not lost.
+
+Mechanism, confirmed with `pg_locks`:
+
+1. Every staged ACK (`ingest_lazy_ack_batch`, 043800) holds the singleton `ingest_receipt_seat_clock` row
+   `FOR NO KEY UPDATE` for its whole per-record seat loop, so staged ACKs of all orgs form one queue.
+   In `pg_locks` this shows as ungranted `tuple` `ExclusiveLock` rows on that relation and
+   `transactionid` `ShareLock` chains, with the blocking pid rotating.
+2. With `INGEST_ORIGIN_CLAIM_FENCE=on`, an ACK takes its per-origin advisory lock
+   (`ingest_origin_claim_enter`) before it queues on the clock, and holds it while it waits. A Desktop runs
+   up to `INGEST_MAX_PER_USER` deliveries at once, so its next claim waits on that advisory lock
+   (ungranted `advisory` `ExclusiveLock` rows whose blockers are the queued ACK pids). The claim
+   itself only takes `KEY SHARE` on the clock and never waits on the clock row directly.
+3. Each lock acquisition may wait up to the claim lock wait (`INGEST_CLAIM_LOCK_WAIT_MS`; 2000 ms
+   live on 2026-11-24). A claim that waits on the origin lock, then the lazy-native-origin lock, then
+   the fence row reaches the 5 s `statement_timeout` (57014) before any single wait reaches
+   `lock_timeout` (55P03).
+
+Read-only evidence query (any role can read `pg_locks`; sample every 0.5 s for about 30 s):
+
+```sql
+select now(), l.pid, l.locktype, l.mode, l.granted, l.relation::regclass, l.classid, l.objid,
+       l.objsubid, l.transactionid, pg_blocking_pids(l.pid)
+  from pg_locks l where not l.granted;
+```
+
+Actions. Each one is a production change that needs Khaliq's explicit OK:
+
+- Shorten the ACK's exclusive clock window: 062210 T2 staged ACK (`lazy_ack_t2_set_gate('fenced')`, then
+  `lazy_ack_t2_set_mode('t2')`, once 062210 is applied). It plans under `KEY SHARE` and holds
+  `NO KEY UPDATE` only for seat numbering and the writes. This is the fix.
+- Mitigation: lower `PRIVATE_INGEST_CLAIM_LOCK_WAIT_MS` (25..2000), for example to 250, then plan and
+  deploy the private-ingest Worker. A claim queued behind a same-origin ACK then fails 55P03 within that
+  wait as the 429 `ClaimLockBusy` (Retry-After 5-10 s), instead of holding a connection for 5 s. The ACK
+  queue itself does not get shorter.
 
 ## Ingest DB-error alert (DB-error deliveries above 20% for 2 minutes)
 
