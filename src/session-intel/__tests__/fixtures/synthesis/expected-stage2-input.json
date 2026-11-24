@@ -1,0 +1,652 @@
+{
+  "promptVersion": "workspace-synthesis-stage2/1",
+  "stage1": {
+    "analyzed": 40,
+    "categories": [
+      {
+        "sessionType": "planning",
+        "outcomeStatus": "in-progress",
+        "count": 1,
+        "sessions": [
+          "s22"
+        ]
+      },
+      {
+        "sessionType": "planning",
+        "outcomeStatus": "implemented",
+        "count": 1,
+        "sessions": [
+          "s27"
+        ]
+      },
+      {
+        "sessionType": "planning",
+        "outcomeStatus": "reported-complete",
+        "count": 1,
+        "sessions": [
+          "s12"
+        ]
+      },
+      {
+        "sessionType": "planning",
+        "outcomeStatus": "blocked",
+        "count": 1,
+        "sessions": [
+          "s1"
+        ]
+      },
+      {
+        "sessionType": "planning",
+        "outcomeStatus": "mixed",
+        "count": 1,
+        "sessions": [
+          "s38"
+        ]
+      },
+      {
+        "sessionType": "implementation",
+        "outcomeStatus": "implemented",
+        "count": 1,
+        "sessions": [
+          "s5"
+        ]
+      },
+      {
+        "sessionType": "implementation",
+        "outcomeStatus": "reported-complete",
+        "count": 1,
+        "sessions": [
+          "s28"
+        ]
+      },
+      {
+        "sessionType": "implementation",
+        "outcomeStatus": "verified",
+        "count": 1,
+        "sessions": [
+          "s33"
+        ]
+      },
+      {
+        "sessionType": "implementation",
+        "outcomeStatus": "blocked",
+        "count": 2,
+        "sessions": [
+          "s16",
+          "s17"
+        ]
+      },
+      {
+        "sessionType": "debugging",
+        "outcomeStatus": "blocked",
+        "count": 3,
+        "sessions": [
+          "s2",
+          "s23",
+          "s34"
+        ]
+      },
+      {
+        "sessionType": "debugging",
+        "outcomeStatus": "superseded",
+        "count": 1,
+        "sessions": [
+          "s39"
+        ]
+      },
+      {
+        "sessionType": "debugging",
+        "outcomeStatus": "none",
+        "count": 1,
+        "sessions": [
+          "s9"
+        ]
+      },
+      {
+        "sessionType": "review",
+        "outcomeStatus": "verified",
+        "count": 1,
+        "sessions": [
+          "s6"
+        ]
+      },
+      {
+        "sessionType": "review",
+        "outcomeStatus": "blocked",
+        "count": 2,
+        "sessions": [
+          "s18",
+          "s29"
+        ]
+      },
+      {
+        "sessionType": "review",
+        "outcomeStatus": "superseded",
+        "count": 1,
+        "sessions": [
+          "s13"
+        ]
+      },
+      {
+        "sessionType": "review",
+        "outcomeStatus": "unknown",
+        "count": 1,
+        "sessions": [
+          "s40"
+        ]
+      },
+      {
+        "sessionType": "testing",
+        "outcomeStatus": "verified",
+        "count": 1,
+        "sessions": [
+          "s19"
+        ]
+      },
+      {
+        "sessionType": "testing",
+        "outcomeStatus": "blocked",
+        "count": 2,
+        "sessions": [
+          "s10",
+          "s24"
+        ]
+      },
+      {
+        "sessionType": "testing",
+        "outcomeStatus": "unknown",
+        "count": 1,
+        "sessions": [
+          "s35"
+        ]
+      },
+      {
+        "sessionType": "research",
+        "outcomeStatus": "not-started",
+        "count": 1,
+        "sessions": [
+          "s14"
+        ]
+      },
+      {
+        "sessionType": "research",
+        "outcomeStatus": "blocked",
+        "count": 2,
+        "sessions": [
+          "s3",
+          "s30"
+        ]
+      },
+      {
+        "sessionType": "research",
+        "outcomeStatus": "mixed",
+        "count": 1,
+        "sessions": [
+          "s25"
+        ]
+      },
+      {
+        "sessionType": "conversation",
+        "outcomeStatus": "not-started",
+        "count": 1,
+        "sessions": [
+          "s31"
+        ]
+      },
+      {
+        "sessionType": "conversation",
+        "outcomeStatus": "blocked",
+        "count": 1,
+        "sessions": [
+          "s20"
+        ]
+      },
+      {
+        "sessionType": "conversation",
+        "outcomeStatus": "unknown",
+        "count": 1,
+        "sessions": [
+          "s7"
+        ]
+      },
+      {
+        "sessionType": "conversation",
+        "outcomeStatus": "none",
+        "count": 1,
+        "sessions": [
+          "s36"
+        ]
+      },
+      {
+        "sessionType": "mixed",
+        "outcomeStatus": "not-started",
+        "count": 1,
+        "sessions": [
+          "s26"
+        ]
+      },
+      {
+        "sessionType": "mixed",
+        "outcomeStatus": "implemented",
+        "count": 1,
+        "sessions": [
+          "s37"
+        ]
+      },
+      {
+        "sessionType": "mixed",
+        "outcomeStatus": "blocked",
+        "count": 1,
+        "sessions": [
+          "s4"
+        ]
+      },
+      {
+        "sessionType": "mixed",
+        "outcomeStatus": "mixed",
+        "count": 1,
+        "sessions": [
+          "s11"
+        ]
+      },
+      {
+        "sessionType": "unknown",
+        "outcomeStatus": "not-started",
+        "count": 1,
+        "sessions": [
+          "s21"
+        ]
+      },
+      {
+        "sessionType": "unknown",
+        "outcomeStatus": "in-progress",
+        "count": 1,
+        "sessions": [
+          "s8"
+        ]
+      },
+      {
+        "sessionType": "unknown",
+        "outcomeStatus": "implemented",
+        "count": 1,
+        "sessions": [
+          "s32"
+        ]
+      },
+      {
+        "sessionType": "unknown",
+        "outcomeStatus": "reported-complete",
+        "count": 1,
+        "sessions": [
+          "s15"
+        ]
+      }
+    ],
+    "recurringFailures": [
+      {
+        "kind": "failed-command",
+        "sessionCount": 4,
+        "scopeGroups": 4,
+        "sessions": [
+          "s1",
+          "s2",
+          "s17",
+          "s18"
+        ]
+      },
+      {
+        "kind": "artifact",
+        "sessionCount": 3,
+        "scopeGroups": 2,
+        "sessions": [
+          "s22",
+          "s24",
+          "s25"
+        ]
+      },
+      {
+        "kind": "failed-command",
+        "sessionCount": 3,
+        "scopeGroups": 2,
+        "sessions": [
+          "s4",
+          "s20",
+          "s23"
+        ]
+      }
+    ]
+  },
+  "sessions": [
+    {
+      "alias": "s1",
+      "sessionType": "planning",
+      "titles": {
+        "i1": "Fixture intent of the session.",
+        "o1": "Fixture assessment: the outcome is blocked."
+      }
+    },
+    {
+      "alias": "s2",
+      "sessionType": "debugging",
+      "titles": {
+        "i1": "Fixture intent of the session.",
+        "o1": "Fixture assessment: the outcome is blocked."
+      }
+    },
+    {
+      "alias": "s3",
+      "sessionType": "research",
+      "titles": {
+        "i1": "Fixture intent of the session.",
+        "b1": "Lint configuration rejects the fixture module.",
+        "o1": "Fixture assessment: the outcome is blocked."
+      }
+    },
+    {
+      "alias": "s4",
+      "sessionType": "mixed",
+      "titles": {
+        "i1": "Fixture intent of the session.",
+        "o1": "Fixture assessment: the outcome is blocked."
+      }
+    },
+    {
+      "alias": "s5",
+      "sessionType": "implementation",
+      "titles": {
+        "i1": "Fixture intent of the session.",
+        "b1": "Lint configuration rejects the fixture module.",
+        "o1": "Fixture assessment: the outcome is implemented."
+      }
+    },
+    {
+      "alias": "s6",
+      "sessionType": "review",
+      "titles": {
+        "i1": "Fixture intent of the session.",
+        "o1": "Fixture assessment: the outcome is verified."
+      }
+    },
+    {
+      "alias": "s7",
+      "sessionType": "conversation",
+      "titles": {
+        "i1": "Fixture intent of the session.",
+        "b1": "Lint configuration rejects the fixture module.",
+        "o1": "Fixture assessment: the outcome is unknown."
+      }
+    },
+    {
+      "alias": "s8",
+      "sessionType": "unknown",
+      "titles": {
+        "i1": "Fixture intent of the session.",
+        "b1": "Preview deploy is unavailable.",
+        "o1": "Fixture assessment: the outcome is in-progress."
+      }
+    },
+    {
+      "alias": "s9",
+      "sessionType": "debugging",
+      "titles": {
+        "i1": "Fixture intent of the session.",
+        "b1": "Lint configuration rejects the fixture module."
+      }
+    },
+    {
+      "alias": "s10",
+      "sessionType": "testing",
+      "titles": {
+        "i1": "Fixture intent of the session.",
+        "o1": "Fixture assessment: the outcome is blocked."
+      }
+    },
+    {
+      "alias": "s11",
+      "sessionType": "mixed",
+      "titles": {
+        "i1": "Fixture intent of the session.",
+        "o1": "Fixture assessment: the outcome is superseded.",
+        "o2": "Fixture assessment: the outcome is implemented."
+      }
+    },
+    {
+      "alias": "s12",
+      "sessionType": "planning",
+      "titles": {
+        "i1": "Fixture intent of the session.",
+        "o1": "Fixture assessment: the outcome is reported-complete."
+      }
+    },
+    {
+      "alias": "s13",
+      "sessionType": "review",
+      "titles": {
+        "i1": "Fixture intent of the session.",
+        "o1": "Fixture assessment: the outcome is superseded."
+      }
+    },
+    {
+      "alias": "s14",
+      "sessionType": "research",
+      "titles": {
+        "i1": "Fixture intent of the session.",
+        "o1": "Fixture assessment: the outcome is not-started."
+      }
+    },
+    {
+      "alias": "s15",
+      "sessionType": "unknown",
+      "titles": {
+        "i1": "Fixture intent of the session.",
+        "o1": "Fixture assessment: the outcome is reported-complete."
+      }
+    },
+    {
+      "alias": "s16",
+      "sessionType": "implementation",
+      "titles": {
+        "i1": "Fixture intent of the session.",
+        "o1": "Fixture assessment: the outcome is blocked."
+      }
+    },
+    {
+      "alias": "s17",
+      "sessionType": "implementation",
+      "titles": {
+        "i1": "Fixture intent of the session.",
+        "o1": "Fixture assessment: the outcome is blocked."
+      }
+    },
+    {
+      "alias": "s18",
+      "sessionType": "review",
+      "titles": {
+        "i1": "Fixture intent of the session.",
+        "o1": "Fixture assessment: the outcome is blocked."
+      }
+    },
+    {
+      "alias": "s19",
+      "sessionType": "testing",
+      "titles": {
+        "i1": "Fixture intent of the session.",
+        "o1": "Fixture assessment: the outcome is verified."
+      }
+    },
+    {
+      "alias": "s20",
+      "sessionType": "conversation",
+      "titles": {
+        "i1": "Fixture intent of the session.",
+        "o1": "Fixture assessment: the outcome is blocked."
+      }
+    },
+    {
+      "alias": "s21",
+      "sessionType": "unknown",
+      "titles": {
+        "i1": "Fixture intent of the session.",
+        "o1": "Fixture assessment: the outcome is not-started."
+      }
+    },
+    {
+      "alias": "s22",
+      "sessionType": "planning",
+      "titles": {
+        "i1": "Fixture intent of the session.",
+        "b1": "Migration blocked: a lock is held on the widgets table (fx-s10).",
+        "o1": "Fixture assessment: the outcome is in-progress."
+      }
+    },
+    {
+      "alias": "s23",
+      "sessionType": "debugging",
+      "titles": {
+        "i1": "Fixture intent of the session.",
+        "o1": "Fixture assessment: the outcome is blocked."
+      }
+    },
+    {
+      "alias": "s24",
+      "sessionType": "testing",
+      "titles": {
+        "i1": "Fixture intent of the session.",
+        "b1": "Migration blocked: a lock is held on the widgets table (fx-s14).",
+        "o1": "Fixture assessment: the outcome is blocked."
+      }
+    },
+    {
+      "alias": "s25",
+      "sessionType": "research",
+      "titles": {
+        "i1": "Fixture intent of the session.",
+        "b1": "Migration blocked: a lock is held on the widgets table (fx-s15).",
+        "o1": "Fixture assessment: the outcome is superseded.",
+        "o2": "Fixture assessment: the outcome is implemented."
+      }
+    },
+    {
+      "alias": "s26",
+      "sessionType": "mixed",
+      "titles": {
+        "i1": "Fixture intent of the session.",
+        "b1": "Preview deploy is unavailable.",
+        "o1": "Fixture assessment: the outcome is not-started."
+      }
+    },
+    {
+      "alias": "s27",
+      "sessionType": "planning",
+      "titles": {
+        "i1": "Fixture intent of the session.",
+        "b1": "Preview deploy is unavailable.",
+        "o1": "Fixture assessment: the outcome is implemented."
+      }
+    },
+    {
+      "alias": "s28",
+      "sessionType": "implementation",
+      "titles": {
+        "i1": "Fixture intent of the session.",
+        "o1": "Fixture assessment: the outcome is reported-complete."
+      }
+    },
+    {
+      "alias": "s29",
+      "sessionType": "review",
+      "titles": {
+        "i1": "Fixture intent of the session.",
+        "o1": "Fixture assessment: the outcome is blocked."
+      }
+    },
+    {
+      "alias": "s30",
+      "sessionType": "research",
+      "titles": {
+        "i1": "Fixture intent of the session.",
+        "o1": "Fixture assessment: the outcome is blocked."
+      }
+    },
+    {
+      "alias": "s31",
+      "sessionType": "conversation",
+      "titles": {
+        "i1": "Fixture intent of the session.",
+        "o1": "Fixture assessment: the outcome is not-started."
+      }
+    },
+    {
+      "alias": "s32",
+      "sessionType": "unknown",
+      "titles": {
+        "i1": "Fixture intent of the session.",
+        "o1": "Fixture assessment: the outcome is implemented."
+      }
+    },
+    {
+      "alias": "s33",
+      "sessionType": "implementation",
+      "titles": {
+        "i1": "Fixture intent of the session.",
+        "o1": "Fixture assessment: the outcome is verified."
+      }
+    },
+    {
+      "alias": "s34",
+      "sessionType": "debugging",
+      "titles": {
+        "i1": "Fixture intent of the session.",
+        "o1": "Fixture assessment: the outcome is blocked."
+      }
+    },
+    {
+      "alias": "s35",
+      "sessionType": "testing",
+      "titles": {
+        "i1": "Fixture intent of the session.",
+        "o1": "Fixture assessment: the outcome is unknown."
+      }
+    },
+    {
+      "alias": "s36",
+      "sessionType": "conversation",
+      "titles": {
+        "i1": "Fixture intent of the session."
+      }
+    },
+    {
+      "alias": "s37",
+      "sessionType": "mixed",
+      "titles": {
+        "i1": "Fixture intent of the session.",
+        "o1": "Fixture assessment: the outcome is implemented."
+      }
+    },
+    {
+      "alias": "s38",
+      "sessionType": "planning",
+      "titles": {
+        "i1": "Fixture intent of the session.",
+        "o1": "Fixture assessment: the outcome is superseded.",
+        "o2": "Fixture assessment: the outcome is implemented."
+      }
+    },
+    {
+      "alias": "s39",
+      "sessionType": "debugging",
+      "titles": {
+        "i1": "Fixture intent of the session.",
+        "o1": "Fixture assessment: the outcome is superseded."
+      }
+    },
+    {
+      "alias": "s40",
+      "sessionType": "review",
+      "titles": {
+        "i1": "Fixture intent of the session.",
+        "o1": "Fixture assessment: the outcome is unknown."
+      }
+    }
+  ]
+}

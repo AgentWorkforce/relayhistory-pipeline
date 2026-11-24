@@ -1,0 +1,20 @@
+{
+  "initiatives": [
+    { "title": "Unblock the lint configuration", "goal": "Make the fixture module pass the lint configuration so the blocked sessions can finish.", "sessions": ["s3", "s5", "s7"], "evidence": [{ "alias": "s3", "titleRef": "b1" }, { "alias": "s5", "titleRef": "b1" }, { "alias": "s7", "titleRef": "b1" }] },
+    { "title": "Foreign alias", "goal": "Cites a session the prompt never listed.", "sessions": ["s3", "s999"], "evidence": [{ "alias": "s3", "titleRef": "b1" }, { "alias": "s999", "titleRef": "i1" }] },
+    { "title": "Wrong title", "goal": "Cites a blocker the first session does not have.", "sessions": ["s1", "s3"], "evidence": [{ "alias": "s1", "titleRef": "b1" }, { "alias": "s3", "titleRef": "b1" }] },
+    { "title": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", "goal": "Title one character over the cap.", "sessions": ["s1", "s2"], "evidence": [{ "alias": "s1", "titleRef": "i1" }, { "alias": "s2", "titleRef": "i1" }] },
+    { "title": "Unknown key", "goal": "Carries an undeclared field.", "sessions": ["s1", "s2"], "evidence": [{ "alias": "s1", "titleRef": "i1" }, { "alias": "s2", "titleRef": "i1" }], "priority": "high" },
+    { "title": "One session", "goal": "Cites a single session only.", "sessions": ["s1"], "evidence": [{ "alias": "s1", "titleRef": "i1" }] },
+    { "title": "Uncited session", "goal": "Names s2 without citing a title of it.", "sessions": ["s1", "s2"], "evidence": [{ "alias": "s1", "titleRef": "i1" }] }
+  ],
+  "themes": [
+    { "title": "Blocked outcomes", "kind": "recurring_issue", "sessions": ["s1", "s2"], "evidence": [{ "alias": "s1", "titleRef": "o1" }, { "alias": "s2", "titleRef": "o1" }] },
+    { "title": "Bad kind", "kind": "finding", "sessions": ["s1", "s2"], "evidence": [{ "alias": "s1", "titleRef": "o1" }, { "alias": "s2", "titleRef": "o1" }] }
+  ],
+  "hypotheses": [
+    { "statement": "A shared lint baseline would cut the sessions that end blocked on configuration.", "basis": ["initiative:1", "theme:1"], "impact": "unmeasured" },
+    { "statement": "Rests on a dropped initiative.", "basis": ["initiative:2"], "impact": "unmeasured" },
+    { "statement": "Claims a measured impact.", "basis": ["theme:1"], "impact": "high" }
+  ]
+}

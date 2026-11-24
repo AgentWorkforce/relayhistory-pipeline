@@ -391,6 +391,14 @@ export function synthesisProvenance(rawCohort: unknown, opts: SynthesisOptions):
   return { considered, related: [...related.values()].sort(refCompare) };
 }
 
+/**
+ * The analyzed sessions of a cohort (validated F1 results, in window, accepted version), in (source, sessionId)
+ * order: exactly the sessions `synthesize` aggregates. Stage 2 (stage2.ts) reads their F1 titles from here.
+ */
+export function analyzedSessions(rawCohort: unknown, opts: SynthesisOptions): AnalyzedSession[] {
+  return considerCohort(rawCohort, opts).analyzed;
+}
+
 export function synthesize(rawCohort: unknown, opts: SynthesisOptions): WorkspaceSynthesis {
   if (!opts || opts.now === undefined) refuse("invalid_option", "opts.now is required (no clock is read)");
   const now = isoTime(opts.now instanceof Date ? opts.now.toISOString() : opts.now, "opts.now");
