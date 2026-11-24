@@ -5,7 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createFsStore } from "../../../packages/object-store/src/fs.ts";
 import {
-  artifactJson, latestWorkspaceSynthesis, SYNTHESIS_ARTIFACT_MAX_BYTES, memoryArtifactStore, namedSessions, objectStoreArtifacts, runWorkspaceSynthesisJob,
+  artifactJson, latestWorkspaceSynthesis, parseArtifact, readBounded, SYNTHESIS_ARTIFACT_MAX_BYTES, SYNTHESIS_MAX_RELATED, memoryArtifactStore, namedSessions, objectStoreArtifacts, runWorkspaceSynthesisJob,
   SYNTHESIS_ARTIFACT_FORMAT, SynthesisArtifactError, workspaceSynthesisDirectory, workspaceSynthesisKey, workspaceSynthesisPrefix, type SynthesisArtifact,
 } from "../workspace-synthesis.ts";
 import { SynthesisLayoutError } from "../workspace-synthesis-layout.ts";
@@ -15,7 +15,7 @@ import { storeEraser, type EraseCheckpoint } from "../../migration/neon-s3-erasu
 import { userErasePrefixes } from "../../session-erase/user-erase.ts";
 import { ANALYSIS_RESULT_OBJECT_GLOB } from "../../../stacks/aws/session-pipeline.ts";
 import { TENANT_KEY_BASE } from "../../../stacks/aws/tenants.ts";
-import { withChild } from "./workspace-synthesis-fixtures.ts";
+import { inWorkspace, withChild, withRelated } from "./workspace-synthesis-fixtures.ts";
 
 const FIXTURE = new URL("../../session-intel/__tests__/fixtures/synthesis/", import.meta.url);
 const cohort = () => JSON.parse(readFileSync(new URL("cohort.json", FIXTURE), "utf8"));
@@ -29,8 +29,9 @@ describe("key layout", () => {
     const prefix = workspaceSynthesisPrefix("fxroot", "fx-org", "fx-ws-synthesis", WINDOW);
     expect(prefix).toBe(`fxroot/fx-org/v1/ws=fx-ws-synthesis/normalized/session-analysis-v2/workspace-synthesis-v1/w=${Date.parse(WINDOW.since)}-${Date.parse(WINDOW.until)}/`);
     expect(prefix.startsWith(workspaceSynthesisDirectory("fxroot", "fx-org", "fx-ws-synthesis"))).toBe(true);
-    // A workspace id with a character the layout maps stays one path segment (layoutComponent).
-    expect(workspaceSynthesisDirectory("fxroot", "fx-org", "fx:ws")).toBe("fxroot/fx-org/v1/ws=fx_ws/normalized/session-analysis-v2/workspace-synthesis-v1/");
+    // The workspace component is an injective escape (`_` to `__`, `:` to `_c`), one path segment.
+    expect(workspaceSynthesisDirectory("fxroot", "fx-org", "fx:ws")).toBe("fxroot/fx-org/v1/ws=fx_cws/normalized/session-analysis-v2/workspace-synthesis-v1/");
+    expect(workspaceSynthesisDirectory("fxroot", "fx-org", "fx_ws")).toBe("fxroot/fx-org/v1/ws=fx__ws/normalized/session-analysis-v2/workspace-synthesis-v1/");
     const a = workspaceSynthesisKey(prefix, "2026-11-08T00:00:00.000Z", "a".repeat(64));
     const b = workspaceSynthesisKey(prefix, "2026-11-09T00:00:00.000Z", "0".repeat(64));
     expect(a < b).toBe(true);
@@ -185,5 +186,88 @@ describe("erasure", () => {
     expect(s.inputs.analyzed).toBe(40);
     const p = synthesisProvenance(c, { now: NOW });
     expect(p.related).toEqual([{ source: "fx-claude", sessionId: "fx-s01-child" }, { source: "fx-claude", sessionId: "fx-s01-spawned" }]);
+  });
+});
+
+describe("bounds", () => {
+  test("related sessions: exactly the cap is written; one more refuses the job and writes nothing", async () => {
+    const store = memoryArtifactStore();
+    const at = await job(store, NOW, withRelated(cohort(), SYNTHESIS_MAX_RELATED));
+    const a = JSON.parse(new TextDecoder().decode(store.objects.get(at.key)!)) as SynthesisArtifact;
+    expect(a.related.length).toBe(SYNTHESIS_MAX_RELATED);
+    expect(await latestWorkspaceSynthesis(store, LOOKUP)).not.toBeNull();
+    const over = memoryArtifactStore();
+    await expect(job(over, NOW, withRelated(cohort(), SYNTHESIS_MAX_RELATED + 1))).rejects.toThrow("synthesis_related_bound");
+    expect(over.objects.size).toBe(0);
+  }, 30_000);
+
+  test("the parse bound: a stored envelope with the cap of related sessions is read; one more is passed over", async () => {
+    const store = memoryArtifactStore();
+    const { key } = await job(store);
+    const base = JSON.parse(new TextDecoder().decode(store.objects.get(key)!)) as SynthesisArtifact;
+    const at = (n: number) => {
+      const bytes = new TextEncoder().encode(artifactJson({ ...base, related: Array.from({ length: n }, (_, i) => ({ source: "fx-claude", sessionId: `fx-zz-rel-${String(i).padStart(5, "0")}` })) }));
+      const sha256 = new Bun.CryptoHasher("sha256").update(bytes).digest("hex");
+      return parseArtifact(bytes, { orgId: "fx-org", workspace: base.workspace, window: base.window, generatedAtMs: Date.parse(base.generatedAt), sha256 });
+    };
+    expect(at(SYNTHESIS_MAX_RELATED)!.related.length).toBe(SYNTHESIS_MAX_RELATED);
+    expect(at(SYNTHESIS_MAX_RELATED + 1)).toBeNull();
+    // A non-string id is refused, not coerced.
+    const bytes = new TextEncoder().encode(artifactJson({ ...base, related: [{ source: ["fx-claude"], sessionId: "fx-a" }] as never }));
+    const sha256 = new Bun.CryptoHasher("sha256").update(bytes).digest("hex");
+    expect(parseArtifact(bytes, { orgId: "fx-org", workspace: base.workspace, window: base.window, generatedAtMs: Date.parse(base.generatedAt), sha256 })).toBeNull();
+  });
+
+  test("a body is refused as soon as it passes the limit while streaming", async () => {
+    let pulled = 0;
+    const stream = new ReadableStream<Uint8Array>({ pull(c) { pulled++; c.enqueue(new Uint8Array(1024)); } });
+    await expect(readBounded(stream, 4096)).rejects.toThrow("synthesis_artifact_bound");
+    expect(pulled).toBeLessThan(10);
+    const small = new ReadableStream<Uint8Array>({ start(c) { c.enqueue(new Uint8Array([1, 2])); c.enqueue(new Uint8Array([3])); c.close(); } });
+    expect([...await readBounded(small, 3)]).toEqual([1, 2, 3]);
+  });
+});
+
+describe("workspace ids that the raw layout would merge", () => {
+  test("`fx:ws` and `fx_ws` get separate directories; erasing one leaves the other; a foreign artifact is never read as its own", async () => {
+    const dirA = workspaceSynthesisDirectory("fxroot", "fx-org", "fx:ws"), dirB = workspaceSynthesisDirectory("fxroot", "fx-org", "fx_ws");
+    expect(dirA).not.toBe(dirB);
+    expect(dirA.startsWith(dirB) || dirB.startsWith(dirA)).toBe(false);
+    const ids = ["a:b", "a_b", "a__b", "a_cb", "a_:b", "a:_b", "a_c:b", "a::b"];
+    expect(new Set(ids.map((id) => workspaceSynthesisDirectory("fxroot", "fx-org", id))).size).toBe(ids.length);
+    const root = mkdtempSync(join(tmpdir(), "si-synthesis-collide-"));
+    try {
+      const fs = createFsStore({ root });
+      const store = objectStoreArtifacts(fs);
+      const a = await runWorkspaceSynthesisJob({ store, keyRoot: "fxroot", orgId: "fx-org", cohort: inWorkspace(cohort(), "fx:ws"), options: { now: NOW } });
+      const b = await runWorkspaceSynthesisJob({ store, keyRoot: "fxroot", orgId: "fx-org", cohort: inWorkspace(cohort(), "fx_ws"), options: { now: NOW } });
+      expect(a.key).not.toBe(b.key);
+      const lookA = { ...LOOKUP, workspace: "fx:ws" }, lookB = { ...LOOKUP, workspace: "fx_ws" };
+      expect((await latestWorkspaceSynthesis(store, lookA))!.workspace).toBe("fx:ws");
+      expect((await latestWorkspaceSynthesis(store, lookB))!.workspace).toBe("fx_ws");
+
+      // The tenant check: A's bytes under B's prefix (same generation and digest name) are not B's artifact.
+      const mem = memoryArtifactStore();
+      const own = await runWorkspaceSynthesisJob({ store: mem, keyRoot: "fxroot", orgId: "fx-org", cohort: inWorkspace(cohort(), "fx:ws"), options: { now: NOW } });
+      const prefixB = workspaceSynthesisPrefix("fxroot", "fx-org", "fx_ws", WINDOW);
+      mem.objects.set(`${prefixB}${own.key.slice(own.key.lastIndexOf("/") + 1)}`, mem.objects.get(own.key)!);
+      expect(await latestWorkspaceSynthesis(mem, lookB)).toBeNull();
+
+      // Erasing `fx:ws` removes its artifacts only.
+      const eraser = storeEraser(fs);
+      for (const prefix of userErasePrefixes("fxroot", { requestId: "fx-req", orgId: "fx-org", workspaceId: "fx:ws", userId: "fx-user" }, [])) {
+        let checkpoint: EraseCheckpoint | null = null;
+        for (;;) {
+          const r = await eraser.eraseStep(prefix, { scope: "fx-erase", checkpoint, authorize: async () => {} });
+          if (r.status === "traversed") break;
+          checkpoint = r.checkpoint;
+        }
+      }
+      expect(await store.get(a.key, SYNTHESIS_ARTIFACT_MAX_BYTES)).toBeUndefined();
+      expect(await store.get(b.key, SYNTHESIS_ARTIFACT_MAX_BYTES)).toBeDefined();
+      expect((await latestWorkspaceSynthesis(store, lookB))!.workspace).toBe("fx_ws");
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
   });
 });

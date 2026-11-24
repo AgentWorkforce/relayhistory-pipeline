@@ -10,7 +10,7 @@ import { memoryLiveness } from "./support.ts";
 import { storeWorkspaceSynthesis, synthesisKeyRoot, synthesisWindow, type WorkspaceSynthesisSource } from "../workspace-synthesis.ts";
 import { memoryArtifactStore, runWorkspaceSynthesisJob } from "../../session-analysis/workspace-synthesis.ts";
 import { workspaceSynthesisDeps } from "../../../packages/session-read-worker/src/index.ts";
-import { withChild } from "../../session-analysis/__tests__/workspace-synthesis-fixtures.ts";
+import { withChild, withRelated } from "../../session-analysis/__tests__/workspace-synthesis-fixtures.ts";
 import type { SessionKey } from "../page.ts";
 
 const FIXTURE = new URL("../../session-intel/__tests__/fixtures/synthesis/", import.meta.url);
@@ -129,6 +129,39 @@ describe("GET /v1/session-intel/synthesis: serving and invalidation", () => {
     // An erased session the artifact does not consider leaves it servable.
     const s = await storedSource();
     expect((await get(api({ enabled: true, source: s.source, erased: [{ source: "fx-claude", sessionId: "fx-unrelated" }] }).app)).status).toBe(200);
+  });
+
+  test("more than one erase batch: only the LAST recorded session erased is still never served", async () => {
+    const s = await storedSource({ cohort: withRelated(JSON.parse(cohortText), 600) });
+    const ok = api({ enabled: true, source: s.source });
+    expect((await get(ok.app)).status).toBe(200);
+    const total = ok.live.calls.erased.flat().length;
+    expect(total).toBe(golden.inputs.considered + 600);
+    expect(ok.live.calls.erased.length).toBe(Math.ceil(total / 500));
+    const last = { source: "fx-claude", sessionId: "fx-zz-rel-00599" };
+    expect(ok.live.calls.erased.at(-1)!.at(-1)).toEqual(last);
+    const r = await get(api({ enabled: true, source: s.source, erased: [last] }).app);
+    expect([r.status, r.body.error.reason]).toEqual([404, "synthesis_invalidated"]);
+  });
+
+  test("a failing erase check is a 503, never a served artifact", async () => {
+    const s = await storedSource();
+    const app = createReadApi({
+      verify, adapter: {} as never, completeSinceMs: 0, directoryWorkspaces: new Set([ID.workspaceId]),
+      liveness: { ...memoryLiveness().liveness, async erased() { throw new Error("tombstones unavailable"); } },
+      workspaceSynthesis: { enabled: true, source: s.source },
+    });
+    const r = await get(app);
+    expect([r.status, r.body.error.code]).toEqual([503, "backend_unavailable"]);
+    expect(JSON.stringify(r.body)).not.toContain("fx-s01");
+  });
+
+  test("an artifact of another workspace handed back by the source is a 500 refusal", async () => {
+    const s = await storedSource();
+    const artifact = await s.source.latest("fx-org", "fx-ws-synthesis", { since: SINCE, until: UNTIL });
+    const source: WorkspaceSynthesisSource = { async latest() { return { ...artifact!, workspace: "fx_ws-synthesis" }; } };
+    const r = await get(api({ enabled: true, source }).app);
+    expect([r.status, r.body.error.code]).toEqual([500, "internal"]);
   });
 
   test("an artifact of another org is a 500 refusal, never served", async () => {

@@ -34,8 +34,7 @@ import { createHash } from "node:crypto";
 import type { EraseCheckpoint, PagedEraser } from "../migration/neon-s3-erasure/eraser.ts";
 import { liveBufferedPrefix, liveObjectPrefix, livePointerPrefix, liveStagedPrefix } from "../migration/neon-s3-erasure/live.ts";
 import { LEGACY_EXPORT_ORIGIN_ID } from "../shared/legacy-export-machine.ts";
-import { layoutComponent } from "../shared/layout-component.ts";
-import { SYNTHESIS_PREFIX_SEGMENT, workspaceSynthesisDirectory } from "../session-analysis/workspace-synthesis-layout.ts";
+import { isSynthesisWorkspace, synthesisComponent, SYNTHESIS_PREFIX_SEGMENT, workspaceSynthesisDirectory } from "../session-analysis/workspace-synthesis-layout.ts";
 
 export class UserEraseRefused extends Error {
   constructor(readonly code: string) {
@@ -231,10 +230,11 @@ export function userErasePrefixes(keyRoot: string, req: UserEraseRequest, origin
   for (const p of out) if (!/\/m=srv_[0-9a-f]{32}\/$/.test(p)) refuse("prefix_invalid");
   // The workspace's synthesis artifacts (src/session-analysis/workspace-synthesis.ts): every window, whatever user's
   // sessions they aggregate. Derived and recomputable, so the whole directory goes; the job rebuilds it from a cohort
-  // without the erased user's sessions. An org-wide request (empty workspace) has no workspace directory to name.
-  if (req.workspaceId !== "") {
+  // without the erased user's sessions. An org-wide request (empty workspace), or a workspace id no synthesis can
+  // have (isSynthesisWorkspace), has no directory to name; the base prefixes are erased as before.
+  if (isSynthesisWorkspace(req.workspaceId)) {
     const synthesis = workspaceSynthesisDirectory(keyRoot, req.orgId, req.workspaceId);
-    if (!synthesis.endsWith(`/v1/ws=${layoutComponent(req.workspaceId)}/${SYNTHESIS_PREFIX_SEGMENT}`)) refuse("prefix_invalid");
+    if (!synthesis.endsWith(`/v1/ws=${synthesisComponent(req.workspaceId)}/${SYNTHESIS_PREFIX_SEGMENT}`)) refuse("prefix_invalid");
     out.push(synthesis);
   }
   return [...new Set(out)];

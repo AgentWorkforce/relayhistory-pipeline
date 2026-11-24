@@ -19,7 +19,7 @@
  * No clock, environment or network here: the store and `now` are injected.
  */
 import { createHash } from "node:crypto";
-import { isObjectStoreError, objectKey, readAll, type ObjectStore } from "../../packages/object-store/src/index.ts";
+import { isObjectStoreError, objectKey, type ObjectStore } from "../../packages/object-store/src/index.ts";
 import { validateWorkspaceSynthesis } from "../session-intel/synthesis/schema.ts";
 import {
   SESSION_ID, SOURCE_ID, synthesisProvenance, synthesize,
@@ -141,7 +141,8 @@ export function parseArtifact(bytes: Uint8Array, expect: { orgId: string; worksp
   if (a.workspace !== expect.workspace || a.window?.since !== expect.window.since || a.window?.until !== expect.window.until) return null;
   if (Date.parse(a.generatedAt) !== expect.generatedAtMs) return null;
   const refs = (list: unknown, max: number): list is SessionRef[] => Array.isArray(list) && list.length <= max
-    && list.every((r) => r && typeof r === "object" && Object.keys(r).length === 2 && SOURCE_ID.test(r.source) && SESSION_ID.test(r.sessionId));
+    && list.every((r) => r && typeof r === "object" && !Array.isArray(r) && Object.keys(r).length === 2
+      && typeof r.source === "string" && typeof r.sessionId === "string" && SOURCE_ID.test(r.source) && SESSION_ID.test(r.sessionId));
   if (!refs(a.considered, 500) || !refs(a.related, SYNTHESIS_MAX_RELATED)) return null;
   try {
     validateWorkspaceSynthesis(a.synthesis);
@@ -182,6 +183,27 @@ export async function latestWorkspaceSynthesis(
   return null;
 }
 
+/** The body, refused as soon as it passes `maxBytes` (the reader is cancelled; the rest is never read). */
+export async function readBounded(stream: ReadableStream<Uint8Array>, maxBytes: number): Promise<Uint8Array> {
+  const reader = stream.getReader();
+  const chunks: Uint8Array[] = [];
+  let length = 0;
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    length += value.length;
+    if (length > maxBytes) {
+      await reader.cancel().catch(() => {});
+      throw new SynthesisArtifactError("synthesis_artifact_bound");
+    }
+    chunks.push(value);
+  }
+  const out = new Uint8Array(length);
+  let offset = 0;
+  for (const c of chunks) { out.set(c, offset); offset += c.length; }
+  return out;
+}
+
 /** An ObjectStore as a SynthesisArtifactStore: paged list, bounded get, create-only put with the digest checked. */
 export function objectStoreArtifacts(store: ObjectStore): SynthesisArtifactStore {
   return {
@@ -202,9 +224,7 @@ export function objectStoreArtifacts(store: ObjectStore): SynthesisArtifactStore
       if (!head) return undefined;
       if (head.size > maxBytes) throw new SynthesisArtifactError("synthesis_artifact_bound");
       try {
-        const bytes = await readAll(await store.get(objectKey(key)));
-        if (bytes.length > maxBytes) throw new SynthesisArtifactError("synthesis_artifact_bound");
-        return bytes;
+        return await readBounded(await store.get(objectKey(key)), maxBytes);
       } catch (error) {
         if (isObjectStoreError(error, "not_found")) return undefined;
         throw error;

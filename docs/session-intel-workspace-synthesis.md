@@ -214,7 +214,11 @@ to the per-session results ([`workspace-synthesis-layout.ts`](../src/session-ana
 {keyRoot}/{org}/v1/ws={workspace}/normalized/session-analysis-v2/workspace-synthesis-v1/w={sinceMs}-{untilMs}/g={generatedAtMs, 13 digits}-{sha256}.json
 ```
 
-`{keyRoot}` is the deployment's tenant base (`PIPELINE_KEY_PREFIX`), `{workspace}` the layout component of the id.
+`{keyRoot}` is the deployment's tenant base (`PIPELINE_KEY_PREFIX`). `{workspace}` is an injective escape of the id
+(`synthesisComponent`: `_` becomes `__`, `:` becomes `_c`, every other admitted character is kept), not the raw
+layout's `layoutComponent`, which maps `:` to `_` and would give `a:b` and `a_b` one directory. An `_` in the
+component is always followed by `_` or `c`, so the escape decodes uniquely and every admitted id gets its own
+directory.
 Per-session results sit deeper, under each session's `m=/h=/d=/s=` directory; a workspace aggregate has no session to
 anchor to, so it sits under the workspace directory. Why this place:
 
@@ -231,7 +235,9 @@ anchor to, so it sits under the workspace directory. Why this place:
   `{keyRoot}/{org}/v1/ws={ws}/normalized/session-analysis-v2/workspace-synthesis-v1/`, every window and version, and
   verifies it empty with the rest. The artifacts are derived and recomputable, so a user's erase removes them for the
   whole workspace; the job rebuilds them from a cohort without that user's sessions. An org-wide request (empty
-  workspace) names no such directory. A per-session erase does not delete artifacts; the read-time check below refuses
+  workspace), or a workspace id that no synthesis can have (`isSynthesisWorkspace` false: the erase accepts any
+  1-512 character id, the synthesis only the cohort's rule), names no such directory and erases the base prefixes
+  as before. A per-session erase does not delete artifacts; the read-time check below refuses
   any artifact that names the erased session.
 
 The artifact is an envelope around the unchanged document:
@@ -282,12 +288,27 @@ GET /v1/session-intel/synthesis?workspace=<id>&since=<ISO>&until=<ISO>
 
 ### Enable condition
 
-`READ_API_WORKSPACE_SYNTHESIS_ENABLED` stays off until the job's writer and both readers (the Lambda on
-`READ_API_ANALYSIS_BUCKET`, the Worker on the raw store) are confirmed to use the same bucket and the same key root
-(`PIPELINE_KEY_PREFIX`). Who confirms it is not decided here. Note for that check: the lookup lists the window's
-prefix, and the read API role's bucket grant today is `GetObject` on the analysis-result glob only, with no
-`ListBucket`, so the hosted Lambda would answer `503` until a listing grant for that prefix exists (an IAM change,
-separately gated). Enabling, real data and any deploy are separate steps, gated by Khaliq.
+`READ_API_WORKSPACE_SYNTHESIS_ENABLED` stays off until all of these hold. Who confirms them is not decided here.
+
+- **One bucket, one key root.** The job's writer and both readers (the Lambda on `READ_API_ANALYSIS_BUCKET`, the
+  Worker on the raw store) are confirmed to use the same bucket and the same key root (`PIPELINE_KEY_PREFIX`).
+- **The hosted stack sets the key root, and can list.** `stacks/aws/session-read-api.ts` does not set
+  `PIPELINE_KEY_PREFIX` for the read API today, so with the flag on the hosted Lambda answers
+  `501 workspace_synthesis_not_configured`. Setting it is a stack change (not part of this slice). Once it is set,
+  the lookup lists the window's prefix, and the read API role's bucket grant is `GetObject` on the analysis-result
+  glob only, with no `ListBucket`: until a listing grant for that prefix exists (an IAM change, separately gated)
+  the route answers `503`.
+- **Retention.** A lookup lists at most 1,000 keys of one window; more is an error, so a window with over 1,000
+  generations answers `503` for good. Nothing prunes old generations yet: a prune (keep the newest few complete
+  artifacts per window) is a later slice and must exist before the job runs on a schedule.
+
+### Wiring the job
+
+The synthesis writer is outside the ingest fence. A job write that lands in a workspace whose user is being erased,
+during the erase's settle window, puts a new object under the synthesis directory, and the erase's verification pass
+then finds it and stays unverified (it erases it and retries, up to its byte rounds). Before the job is wired to run
+on its own, it must either take the user-erase fence (refuse a workspace with an active erase) or be scheduled so it
+cannot write during one. Enabling, real data and any deploy are separate steps, gated by Khaliq.
 
 ## Running the CLI
 

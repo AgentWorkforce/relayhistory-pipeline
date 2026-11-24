@@ -60,6 +60,18 @@ describe("user-erase entry", () => {
     expect(liveMachineId("ws-a", "o1", "user-2")).not.toBe(m);
   });
 
+  test("prefixes: a workspace id the erase accepts but no synthesis can have gets the base prefixes only, never a throw", () => {
+    for (const workspaceId of ["_ws", "ws a", "ws/a", "ws@a", "w".repeat(200)]) {
+      const req = { requestId: "r", orgId: "org-a", workspaceId, userId: "user-1" };
+      const prefixes = userErasePrefixes("96bulls", req, ["o1"]);
+      expect([workspaceId, prefixes.length]).toEqual([workspaceId, 8]);
+      expect(prefixes.every((p) => /\/m=srv_[0-9a-f]{32}\/$/.test(p))).toBe(true);
+    }
+    // An admitted id with `_` and `:` gets its injective synthesis component.
+    expect(userErasePrefixes("96bulls", { requestId: "r", orgId: "org-a", workspaceId: "ws_a:b", userId: "user-1" }, []).at(-1))
+      .toBe("96bulls/org-a/v1/ws=ws__a_cb/normalized/session-analysis-v2/workspace-synthesis-v1/");
+  });
+
   test("settle and exit codes", () => {
     expect(settleMs({})).toBe(60_000);
     expect(settleMs({ OPERATOR_USER_ERASE_SETTLE_MS: "5" })).toBe(5);

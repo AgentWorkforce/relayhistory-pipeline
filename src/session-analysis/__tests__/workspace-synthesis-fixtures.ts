@@ -12,3 +12,17 @@ export function withChild(c: any) {
   ev.relatedSessionIds = ["fx-s01-child", "fx-s01-spawned"];
   return c;
 }
+
+/** The fixture with fx-s01 naming `n` related sessions (`fx-zz-rel-00000` ...), each with no reference of its own. */
+export function withRelated(c: any, n: number) {
+  const e = c.sessions.find((x: { sessionId: string }) => x.sessionId === "fx-s01");
+  e.result.analysis.evidence.relatedSessionIds = Array.from({ length: n }, (_, i) => `fx-zz-rel-${String(i).padStart(5, "0")}`);
+  return c;
+}
+
+/** The fixture moved to another workspace id (every entry follows the wrapper). */
+export function inWorkspace(c: any, workspace: string) {
+  c.workspace = workspace;
+  for (const e of c.sessions) e.workspace = workspace;
+  return c;
+}

@@ -817,19 +817,6 @@ function recordedSizeStore(store: Store, recorded: ReadonlyMap<string, number>):
 }
 
 /**
- * Session analysis (lane F1, READ_API_ANALYSIS_ENABLED=true), the Lambda's sqlAnalysisSource:
- *   read/harnesses  sessions.analysis_read_v1 and the live harnesses through the request's
- *                   tenant runner (bulls96_read_api, READ ONLY, tenant-bound);
- *   result          the result object from the pipeline raw bucket (PIPELINE_RAW_S3_*, the
- *                   canonical store the analysis worker publishes to), at the key, SHA-256 and
- *                   size the job row recorded (never derived from the request), bounded per call;
- *                   an object larger than recorded is refused by content-length before its body
- *                   is read, and one request reads at most ANALYSIS_RESULT_REQUEST_BUDGET_BYTES;
- *   admit           the admission principal's pool (ANALYSIS_ADMIT); absent = POST 501
- *                   analysis_admission_not_configured, GET unchanged.
- * Without the raw store: undefined, so GET and POST answer 501 analysis_not_configured.
- */
-/**
  * GET /v1/session-intel/synthesis on this Worker: the artifacts in the raw store, every fetch bounded like the
  * analysis result reads. Without the raw-store secrets: enabled without a source (501
  * workspace_synthesis_not_configured).
@@ -844,6 +831,19 @@ export function workspaceSynthesisDeps(env: Env, fetcher: typeof fetch = (input,
   return raw && keyRoot ? { enabled: true, source: storeWorkspaceSynthesis(objectStoreArtifacts(raw.store), keyRoot) } : { enabled: true };
 }
 
+/**
+ * Session analysis (lane F1, READ_API_ANALYSIS_ENABLED=true), the Lambda's sqlAnalysisSource:
+ *   read/harnesses  sessions.analysis_read_v1 and the live harnesses through the request's
+ *                   tenant runner (bulls96_read_api, READ ONLY, tenant-bound);
+ *   result          the result object from the pipeline raw bucket (PIPELINE_RAW_S3_*, the
+ *                   canonical store the analysis worker publishes to), at the key, SHA-256 and
+ *                   size the job row recorded (never derived from the request), bounded per call;
+ *                   an object larger than recorded is refused by content-length before its body
+ *                   is read, and one request reads at most ANALYSIS_RESULT_REQUEST_BUDGET_BYTES;
+ *   admit           the admission principal's pool (ANALYSIS_ADMIT); absent = POST 501
+ *                   analysis_admission_not_configured, GET unchanged.
+ * Without the raw store: undefined, so GET and POST answer 501 analysis_not_configured.
+ */
 export function analysisDeps(env: Env, run: TenantRunner, admit: AdmitPool | undefined, fetcher: typeof fetch = (input, init) => fetch(input, init)): AnalysisDeps | undefined {
   const bounded: typeof fetch = (input, init) => {
     const deadline = AbortSignal.timeout(ANALYSIS_RESULT_DEADLINE_MS);
