@@ -21,6 +21,8 @@ export const STEPS = [
   /*20*/ "t2_A_candidates", /*21*/ "t2_B_slot_locks", /*22*/ "t2_C1_plan", /*23*/ "t2_upgrade", /*24*/ "t2_C2_number",
   /*25*/ "t2_D_seats", /*26*/ "t2_D_slots", /*27*/ "t2_D_decisions", /*28*/ "t2_E_count",
   /*29*/ "verify_proxy",
+  // 062250 mode p: the pre-plan statement (before the clock)
+  /*30*/ "p_preplan",
 ] as const;
 const K = (s: (typeof STEPS)[number]) => STEPS.indexOf(s) + 1;
 const P = (s: (typeof STEPS)[number]) => `_x:=extract(epoch from clock_timestamp())*1e6;_acc[${K(s)}]:=_acc[${K(s)}]+(_x-_t);_t:=_x;`;
@@ -32,7 +34,8 @@ export function instrument(def: string, opts: { verifyProxy?: boolean } = {}): s
     return src.replace(find, repl);
   };
   let s = def;
-  s = once(s, "v_t2 boolean;", `_acc float8[]:=array_fill(0::float8,ARRAY[${STEPS.length}]);_t float8;_x float8;_t0 float8;_tclock float8;_tex float8;_n integer:=0;v_t2 boolean;`);
+  const hasP = def.includes("v_p:=v_gate='fenced' AND v_mode='p';");
+  s = once(s, "v_t2 boolean;", `_acc float8[]:=array_fill(0::float8,ARRAY[${STEPS.length}]);_t float8;_x float8;_t0 float8;_tclock float8;_tex float8;_n integer:=0;_used integer:=0;v_t2 boolean;`);
   s = once(s, "BEGIN\n PERFORM sessions.ingest_lazy_guard(p->>'org_id');", `BEGIN\n _t:=extract(epoch from clock_timestamp())*1e6;_t0:=_t;\n PERFORM sessions.ingest_lazy_guard(p->>'org_id');${P("guard")}`);
   s = once(s, " PERFORM sessions.ingest_lock_fences(p->>'org_id',p->>'workspace_id',p->>'user_id');\n", ` PERFORM sessions.ingest_lock_fences(p->>'org_id',p->>'workspace_id',p->>'user_id');${P("lock_fences")}\n`);
   s = once(s, "MESSAGE='session ingest: real user seal required before any receipt';END IF;", `MESSAGE='session ingest: real user seal required before any receipt';END IF;${P("seal")}`);
@@ -76,11 +79,16 @@ export function instrument(def: string, opts: { verifyProxy?: boolean } = {}): s
     `    WHERE q.accept AND q.pos<v_lim AND q.acc_cum=i AND n.key_sha256=q.nk;\n   END LOOP;\n  END IF;${P("t2_D_slots")}\n`);
   s = once(s, "   WHERE q.pos<v_lim ORDER BY q.pos ON CONFLICT DO NOTHING;\n", `   WHERE q.pos<v_lim ORDER BY q.pos ON CONFLICT DO NOTHING;${P("t2_D_decisions")}\n`);
   s = once(s, "  v_last:=v_last+v_allocs;\n", `  v_last:=v_last+v_allocs;${P("t2_E_count")}\n`);
+  // 062250 mode p (only when the installed body has it): the pre-plan's duration, and whether its (A) was used.
+  if (s.includes("v_p:=v_gate='fenced' AND v_mode='p';")) {
+    s = once(s, "  END;\n END IF;\n -- 043800: NO KEY UPDATE", `  END;\n ${P("p_preplan")}END IF;\n -- 043800: NO KEY UPDATE`);
+    s = once(s, "   v_recs:=v_precs;\n", "   v_recs:=v_precs;_used:=1;\n");
+  }
   // tail
   s = once(s, " UPDATE sessions.ingest_receipt_seat_clock SET last_seat=v_last WHERE singleton;\n", ` UPDATE sessions.ingest_receipt_seat_clock SET last_seat=v_last WHERE singleton;${P("last_seat_update")}\n`);
   s = once(s, " PERFORM sessions.ingest_lazy_attempt(t.claim_token);\nEND",
     ` PERFORM sessions.ingest_lazy_attempt(t.claim_token);${P("final_check")}\n` +
-    ` PERFORM set_config('scb.trace',jsonb_build_object('t2',v_t2,'n',_n,'t0',_t0,'tclock',_tclock,'tend',_t,'acc',to_jsonb(_acc))::text,false);\nEND`);
+    ` PERFORM set_config('scb.trace',jsonb_build_object('t2',v_t2,${hasP ? "'p',coalesce(v_p,false),'pre',coalesce(v_pre,false)," : ""}'used',_used,'n',_n,'t0',_t0,'tclock',_tclock,'tend',_t,'acc',to_jsonb(_acc))::text,false);\nEND`);
   return s;
 }
 

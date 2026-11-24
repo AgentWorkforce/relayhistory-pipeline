@@ -42,13 +42,13 @@ const loopback = (h: string) => { const x = h.replace(/^\[|\]$/g, ""); return is
 }
 const SAFE_ID = /^[A-Za-z0-9._-]{1,80}$/;
 type Workload = "W1" | "W2";
-type Body = "main" | "t2" | "main-plain" | "t2-plain" | "t2-verify";
+type Body = "main" | "t2" | "main-plain" | "t2-plain" | "t2-verify" | "p" | "p-plain";
 type Cell = { workload: Workload; n: number; c: number; body: Body; controls?: "c2" | "none"; label?: string };
-type Plan = { runId?: string; threads?: number; totalRecords?: number; maxSeconds?: number; historyLive?: boolean; controls?: "c2" | "none"; controlEveryMs?: number; cells: Cell[] };
+type Plan = { runId?: string; threads?: number; totalRecords?: number; maxSeconds?: number; historyLive?: boolean; controls?: "c2" | "none"; controlEveryMs?: number; barrierEveryMs?: number; cells: Cell[] };
 const plan = JSON.parse(process.argv[2] ?? "{}") as Plan;
 const RUN_ID = plan.runId ?? new Date().toISOString().replace(/[:.]/g, "-");
 if (!SAFE_ID.test(RUN_ID) || RUN_ID.startsWith(".")) throw Error("runId: letters, digits, dot, dash, underscore only");
-for (const c of plan.cells ?? []) { if (c.label !== undefined && (!SAFE_ID.test(c.label) || c.label.startsWith("."))) throw Error("bad label"); if (!["main", "t2", "main-plain", "t2-plain", "t2-verify"].includes(c.body)) throw Error("cell.body: main | t2 | main-plain | t2-plain"); }
+for (const c of plan.cells ?? []) { if (c.label !== undefined && (!SAFE_ID.test(c.label) || c.label.startsWith("."))) throw Error("bad label"); if (!["main", "t2", "main-plain", "t2-plain", "t2-verify", "p", "p-plain"].includes(c.body)) throw Error("cell.body: main | t2 | main-plain | t2-plain"); }
 const CONTROL_MS = plan.controlEveryMs ?? 1000;
 const TOTAL = plan.totalRecords ?? 64000, MAX_S = plan.maxSeconds ?? 300, THREADS = plan.threads ?? 8;
 const OUT = join(import.meta.dir, "results", RUN_ID);
@@ -91,11 +91,12 @@ async function buildTemplate() {
 // probed function; "t2" and "t2-plain" also get the gate fenced and mode t2 by the shipped owner setters (no other
 // transaction is open on the copy, so their try-lock succeeds). "main-plain" / "t2-plain" are unprobed (overhead check).
 async function derive(body: Body) {
-  const tpl = `scf_tpl_${body.replace("-", "_")}_` + crypto.randomUUID().replaceAll("-", "").slice(0, 12);
+  const tpl = `scf_tpl_${body.replaceAll("-", "_")}_` + crypto.randomUUID().replaceAll("-", "").slice(0, 12);
   await admin.query(`CREATE DATABASE ${tpl} TEMPLATE ${templates.base}`); created.push(tpl);
   const c = new pg.Client({ connectionString: dbUrl(tpl) }); await c.connect();
   try {
     if (body.startsWith("t2")) { await c.query("SELECT sessions.lazy_ack_t2_set_gate('fenced')"); await c.query("SELECT sessions.lazy_ack_t2_set_mode('t2')"); }
+    if (body === "p" || body === "p-plain") { await c.query("SELECT sessions.lazy_ack_t2_set_gate('fenced')"); await c.query("SELECT sessions.lazy_ack_t2_set_mode('p')"); }
     if (!body.endsWith("-plain")) {
       const def = (await c.query("SELECT pg_get_functiondef('sessions.ingest_lazy_ack_batch(jsonb)'::regprocedure) d")).rows[0].d as string;
       await c.query(instrument(def, { verifyProxy: body === "t2-verify" }));
@@ -183,10 +184,18 @@ async function runCell(cell: Cell, index: number) {
       }
     };
     const loops = ctlKind === "c2" ? [controlLoop()] : [];
+    // Barrier prober (every cell): every barrierEveryMs one autocommit transaction TRY-locks (961996,50000) EXCLUSIVE and
+    // rolls back, changing nothing: how often a setter, a down or an erase would find the barrier free. Never queued.
+    const BARRIER_MS = plan.barrierEveryMs ?? 100;
+    const barrier = { tries: 0, free: 0 };
+    const bc = new pg.Client({ connectionString: dbUrl(db) }); await bc.connect();
+    const barrierLoop = (async () => { while (running) { await Bun.sleep(BARRIER_MS); if (!running) break;
+      try { await bc.query("BEGIN"); const r = await bc.query("SELECT pg_try_advisory_xact_lock(961996,50000) g"); barrier.tries++; if (r.rows[0].g) barrier.free++; } finally { await bc.query("ROLLBACK").catch(() => {}); } } })();
+    loops.push(barrierLoop);
     const results = threads.map((w) => onMsg<any>(w, "done"));
     for (const w of threads) w.postMessage({ kind: "go" });
     const done = await Promise.all(results);
-    running = false; await Promise.all(loops); await cc.end();
+    running = false; await Promise.all(loops); await cc.end(); await bc.end();
     const loadEnd = Math.max(...done.map((d) => d.end as number));
     const txns: Txn[] = done.flatMap((d) => d.txns);
     const start = Math.min(...done.map((d) => d.start)), lastDone = Math.max(...done.map((d) => d.lastDone));
@@ -205,7 +214,8 @@ async function runCell(cell: Cell, index: number) {
       const lockStep = tr.t2 ? STEPS.indexOf("t2_upgrade") : STEPS.indexOf("clock_lock");
       const holdStart = toClient(tr.tclock), ackEnd = toClient(tr.tend);
       // in-ACK steps after the exclusive lock: every step recorded after the lock statement in body order.
-      const after = tr.t2 ? ["t2_C2_number", "t2_D_seats", "t2_D_slots", "t2_D_decisions", "t2_E_count", "last_seat_update", "final_check"]
+      const after = tr.p ? ["origin_lock", "stage_row", "attempt_check1", "attempt_row", "t2_A_candidates", "t2_B_slot_locks", "t2_C1_plan", "t2_C2_number", "t2_D_seats", "t2_D_slots", "t2_D_decisions", "t2_E_count", "last_seat_update", "final_check"]
+        : tr.t2 ? ["t2_C2_number", "t2_D_seats", "t2_D_slots", "t2_D_decisions", "t2_E_count", "last_seat_update", "final_check"]
         : ["origin_lock", "stage_row", "attempt_check1", "attempt_row", "loop_fetch", "loop_key", "loop_slot_lock", "loop_checks", "loop_seat", "loop_slot_update", "loop_decision_insert", "loop_decision_check", "last_seat_update", "final_check"];
       const steps: Record<string, number> = Object.fromEntries(STEPS.map((s, i) => [s, acc[i]!]));
       return {
@@ -223,6 +233,12 @@ async function runCell(cell: Cell, index: number) {
       cell, threads: T, drained: undrained === 0, drainSeconds: Math.round(seconds * 100) / 100,
       durableRecords: durable, durableRecordsPerSec: Math.round(durable / seconds), retriesPerBatch: Math.round((tries - nBatches) / nBatches * 100) / 100,
       stageFailures: failures,
+      barrierProbe: { everyMs: BARRIER_MS, tries: barrier.tries, free: barrier.free, freeShare: barrier.tries ? Math.round(barrier.free / barrier.tries * 1000) / 1000 : null },
+      // Mode p only: commits whose pre-plan was valid / whose (A) was used (the rest recomputed under the lock), and the
+      // pre-plan statement's own run time (it runs while the fence row and 50000 are held, before the clock).
+      preplan: traced.some((t) => t.trace.p) ? { commits: traced.filter((t) => t.trace.p).length, valid: traced.filter((t) => t.trace.p && t.trace.pre).length,
+        used: traced.filter((t) => t.trace.p && t.trace.used === 1).length, recomputed: traced.filter((t) => t.trace.p && t.trace.used !== 1).length,
+        statementMs: dist(traced.filter((t) => t.trace.p).map((t) => (t.trace.acc as number[])[STEPS.indexOf("p_preplan")]! / 1000)) } : null,
       controls: { kind: ctlKind, everyMs: CONTROL_MS, scheduledSlots: controls.length + missed, missedSlots: missed, started: controls.length,
         completedDuringLoad: controls.filter((c) => c.ok && c.t1 <= loadEnd).length, completedAfterLoadEnd: controls.filter((c) => c.ok && c.t1 > loadEnd).length,
         failed: controls.filter((c) => !c.ok).reduce((a, c) => ({ ...a, [c.code!]: (a[c.code!] ?? 0) + 1 }), {} as Record<string, number>),
