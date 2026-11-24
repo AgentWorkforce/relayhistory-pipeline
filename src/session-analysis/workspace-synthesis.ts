@@ -22,9 +22,13 @@ import { createHash } from "node:crypto";
 import { isObjectStoreError, objectKey, type ObjectStore } from "../../packages/object-store/src/index.ts";
 import { validateWorkspaceSynthesis } from "../session-intel/synthesis/schema.ts";
 import {
-  SESSION_ID, SOURCE_ID, synthesisProvenance, synthesize,
+  SESSION_ID, SOURCE_ID, synthesisJson, synthesisProvenance, synthesize,
   type SessionRef, type SynthesisOptions, type WorkspaceSynthesis,
 } from "../session-intel/synthesis/synthesize.ts";
+import {
+  runStage2, stage1Of, stage2Errors, stage2FlagOn,
+  type Stage2Deps, type WorkspaceSynthesisV2,
+} from "../session-intel/synthesis/stage2.ts";
 import { ORG_SEGMENT, SYNTHESIS_PREFIX_SEGMENT, workspaceSynthesisDirectory, workspaceSynthesisPrefix } from "./workspace-synthesis-layout.ts";
 
 export { SYNTHESIS_PREFIX_SEGMENT, workspaceSynthesisDirectory, workspaceSynthesisPrefix };
@@ -90,7 +94,9 @@ export async function runWorkspaceSynthesisJob(input: {
   orgId: string;
   cohort: unknown;
   options: SynthesisOptions;
-}): Promise<{ key: string; sha256: string; bytes: number; outcome: "created" | "exists"; synthesis: WorkspaceSynthesis }> {
+  /** Stage 2, default off: it runs only when `flag` (WORKSPACE_SYNTHESIS_STAGE2_ENABLED) is exactly `true`. */
+  stage2?: Stage2JobOptions;
+}): Promise<{ key: string; sha256: string; bytes: number; outcome: "created" | "exists"; synthesis: WorkspaceSynthesis; stage2?: Stage2JobResult }> {
   if (!ORG_SEGMENT.test(input.orgId) || input.orgId.startsWith(".")) throw new SynthesisArtifactError("synthesis_org_invalid");
   const synthesis = synthesize(input.cohort, input.options);
   const provenance = synthesisProvenance(input.cohort, input.options);
@@ -112,7 +118,85 @@ export async function runWorkspaceSynthesisJob(input: {
   const outcome = await input.store.putNew(key, bytes, digest);
   const back = await input.store.get(key, SYNTHESIS_ARTIFACT_MAX_BYTES);
   if (!back || back.length !== bytes.length || sha256(back) !== digest) throw new SynthesisArtifactError("synthesis_write_verification_failed");
-  return { key, sha256: digest, bytes: bytes.length, outcome, synthesis };
+  const v1 = { key, sha256: digest, bytes: bytes.length, outcome, synthesis };
+  // Flag off (the default): exactly the Stage 1 job, nothing else read, called or written.
+  if (!stage2FlagOn(input.stage2?.flag)) return v1;
+  return { ...v1, stage2: await runStage2Step(input, artifact, key) };
+}
+
+export const SYNTHESIS_ARTIFACT_FORMAT_V2 = "workspace-synthesis-artifact/2";
+/** The v2 envelope: the v1 envelope's fields, with the workspace-synthesis/2 document as `synthesis`. Never served yet. */
+export type SynthesisArtifactV2 = Omit<SynthesisArtifact, "format" | "synthesis"> & { format: typeof SYNTHESIS_ARTIFACT_FORMAT_V2; synthesis: WorkspaceSynthesisV2 };
+
+export interface Stage2JobOptions extends Omit<Stage2Deps, "enabled"> {
+  /** The raw WORKSPACE_SYNTHESIS_STAGE2_ENABLED value; the caller reads it, the job reads no environment. */
+  flag: string | undefined;
+}
+export interface Stage2JobResult {
+  /** `{v1 window prefix}stage2/g={generation}-{v1 artifact sha256}.json`: one per Stage 1 artifact. */
+  key: string;
+  /** `created`: a v2 artifact was written; `exists`: one was already there (no call made); `not_written`: stage2 is null. */
+  outcome: "created" | "exists" | "not_written";
+  document: WorkspaceSynthesisV2;
+  called: boolean;
+  usage: { inputTokens: number; outputTokens: number } | null;
+}
+
+/** The Stage 2 artifact key of one Stage 1 artifact. Not a v1 key (the `stage2/` segment), so a v1 lookup ignores it. */
+export function workspaceSynthesisStage2Key(v1Key: string): string {
+  const i = v1Key.lastIndexOf("/");
+  return `${v1Key.slice(0, i + 1)}stage2/${v1Key.slice(i + 1)}`;
+}
+
+async function runStage2Step(
+  input: { store: SynthesisArtifactStore; orgId: string; cohort: unknown; options: SynthesisOptions; stage2?: Stage2JobOptions },
+  v1Artifact: SynthesisArtifact,
+  v1Key: string,
+): Promise<Stage2JobResult> {
+  const { flag: _flag, ...deps } = input.stage2!;
+  const key = workspaceSynthesisStage2Key(v1Key);
+  const listed = new Set(v1Artifact.considered.map((r) => `${r.source}\u0000${r.sessionId}`));
+  // One Stage 2 per Stage 1 artifact: a rerun of the same cohort and now finds it and makes no second call.
+  const prior = await input.store.get(key, SYNTHESIS_ARTIFACT_MAX_BYTES);
+  if (prior) {
+    const parsed = parseStage2Artifact(prior, v1Artifact, listed);
+    if (!parsed) throw new SynthesisArtifactError("synthesis_stage2_conflict");
+    return { key, outcome: "exists", document: parsed.synthesis, called: false, usage: null };
+  }
+  const run = await runStage2({ v1: v1Artifact.synthesis, cohort: input.cohort, options: input.options, orgId: input.orgId, deps: { ...deps, enabled: true } });
+  const base = { key, document: run.document, called: run.called, usage: run.usage };
+  // Only a complete Stage 2 is stored; a null one is returned, so a later run (within the caps) may still try.
+  if (run.document.stage2 === null) return { ...base, outcome: "not_written" };
+  const errors = stage2Errors(run.document, listed);
+  if (errors.length) throw new SynthesisArtifactError("synthesis_stage2_invalid");
+  const artifact: SynthesisArtifactV2 = { ...v1Artifact, format: SYNTHESIS_ARTIFACT_FORMAT_V2, synthesis: run.document };
+  const bytes = new TextEncoder().encode(`${JSON.stringify(artifact)}\n`);
+  if (bytes.length > SYNTHESIS_ARTIFACT_MAX_BYTES) throw new SynthesisArtifactError("synthesis_artifact_bound");
+  const digest = sha256(bytes);
+  const outcome = await input.store.putNew(key, bytes, digest);
+  const back = await input.store.get(key, SYNTHESIS_ARTIFACT_MAX_BYTES);
+  if (!back || back.length !== bytes.length || sha256(back) !== digest) throw new SynthesisArtifactError("synthesis_write_verification_failed");
+  return { ...base, outcome };
+}
+
+/** A stored v2 artifact, checked against the v1 artifact it extends; null when it is not one. */
+export function parseStage2Artifact(bytes: Uint8Array, v1: SynthesisArtifact, listed: ReadonlySet<string>): SynthesisArtifactV2 | null {
+  let a: SynthesisArtifactV2;
+  try {
+    a = JSON.parse(new TextDecoder("utf-8", { fatal: true, ignoreBOM: false }).decode(bytes)) as SynthesisArtifactV2;
+  } catch {
+    return null;
+  }
+  if (!a || typeof a !== "object" || a.format !== SYNTHESIS_ARTIFACT_FORMAT_V2 || !a.synthesis || typeof a.synthesis !== "object") return null;
+  if (a.orgId !== v1.orgId) throw new SynthesisArtifactError("synthesis_cross_tenant");
+  const same = (x: unknown, y: unknown) => JSON.stringify(x) === JSON.stringify(y);
+  if (a.workspace !== v1.workspace || !same(a.window, v1.window) || a.generatedAt !== v1.generatedAt || !same(a.considered, v1.considered) || !same(a.related, v1.related)) return null;
+  try {
+    if (synthesisJson(stage1Of(a.synthesis)) !== synthesisJson(v1.synthesis)) return null;
+  } catch {
+    return null;
+  }
+  return stage2Errors(a.synthesis, listed).length ? null : a;
 }
 
 /** Every session the synthesis names in a drilldown, an issue or its evidence. */
