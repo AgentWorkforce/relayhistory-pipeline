@@ -10,9 +10,14 @@ Two default-off options of the private ingest Worker. They build on the buffered
 
 ## Enable conditions
 
+- **Prove the proxy first.** Before any enable of the statement budget, a dev proof through the
+  connection proxy (Hyperdrive) is needed. Two things are unproven: the multi-statement opening message,
+  and transaction pinning across the three flights. If the proxy refuses the message, every buffered
+  commit answers 503 once the budget is set.
 - **Turn on the timeout class first.** Do not enable `INGEST_BUFFER_COMMIT_LOCK_WAIT_MS` before
   `INGEST_BUFFER_TIMEOUT_BUSY` is on. A longer lock wait can move a commit refusal from 55P03, which is
   retried and answered 429, to 57014, which is otherwise one attempt and a 503 with no `Retry-After`.
+  This order is advice: nothing in validation enforces it.
 - **What the timeout class does to alerting.** With `INGEST_BUFFER_TIMEOUT_BUSY` on together with
   `INGEST_BUFFER_LOCK_BUSY`, a commit or stage-intent statement timeout is answered 429. It then no
   longer feeds the DB-error alert, which counts 503s only (`src/session-ingest/ingest-error-alert.ts`).
@@ -49,10 +54,14 @@ for the previous answer: three round trips instead of one.
 ### Range: 5001..7000 ms, buffered only
 
 - **Lower bound**: above the role's 5 s, because a shorter budget is not this option's purpose.
-- **Upper bound**: 7000 ms. The commit stage with its one `INGEST_BUFFER_LOCK_RETRY` retry,
-  2 × 7 s + 250 ms, stays under 15 s, the shortest sender request timeout we were told of. That
-  timeout is not in this repository, and the whole request can exceed 15 s on the base already; see
-  the finding table.
+- **Upper bound**: 7000 ms. The commit stage's statement time with its one `INGEST_BUFFER_LOCK_RETRY`
+  retry, 2 × 7 s + 250 ms, stays under 15 s, the shortest sender request timeout we were told of. That
+  timeout is not in this repository.
+  - The bound covers commit-stage statement time only.
+  - Round trips add to it: about 6 with a retry.
+  - Earlier stages add to it. With `INGEST_BUFFER_TIMEOUT_BUSY` and `INGEST_BUFFER_LOCK_RETRY` on,
+    `buffer_intent` can itself retry a 57014 (up to 5 s + 250 ms) before the commit stage starts.
+  - The whole request can exceed 15 s on the base already.
 - **Lock wait**: the commit's lock wait (`INGEST_BUFFER_COMMIT_LOCK_WAIT_MS`, or the role's 2 s) must
   end at least 1 s before the budget. Validation refuses the combination otherwise. Within the two
   ranges it always holds (4000 ≤ 5001 − 1000).
@@ -68,7 +77,8 @@ for the previous answer: three round trips instead of one.
 | Before the call (opening flight fails) | Nothing written; `ROLLBACK` | 503 (mapped SQLSTATE) | The same commit, from scratch |
 | During the call (55P03 / 57014 / other) | Rolled back | As today for that cause | The same commit |
 | At `COMMIT` with a SQLSTATE | Rolled back | 503 (mapped) | The same commit |
-| `COMMIT` sent, answer lost | **Unknown to the Worker; in the proof it had committed** | 503 `ledger_connection`, never a refusal | The function answers the repeat with the same result and does not move the seat (proved) |
+| `COMMIT` sent, answer lost | **Unknown to the Worker; in the proof it had committed** | 503 `ledger_connection` (an 08xxx or E* code) or `ledger_error` (no code, e.g. pg's "Connection terminated unexpectedly"); never a refusal. The proof injects a synthetic ECONNRESET. | The function answers the repeat with the same result and does not move the seat (proved) |
+| More than 1 s between flights while the Worker is alive | Rolled back for certain: the server ends the session at the 1 s idle-in-transaction bound | 503 `ledger_error`. Reproduced on 15/16/17 with a 1.2 s pause before the call: the server sent 25P03 and "Connection terminated unexpectedly", seen only on the client's error event; the next flight failed "not queryable" with no SQLSTATE; ROLLBACK was attempted; nothing was written. Not `ledger_timeout`, so part 2 never retries it. | The same commit on a new connection. On the admission consumer one client serves the whole queue batch, so the later messages of that batch fail too and go to queue backoff |
 | Worker dies between flights, socket closed | Rolled back by the server at once | (none) | The same commit |
 | Worker stops but the connection stays open | Rolled back by the 1 s idle-in-transaction bound | (none) | The same commit |
 
@@ -124,7 +134,12 @@ statement releases before it answers. Median of 5 runs, loopback:
 | 500 | 0 ms | about 2.4 ms |
 
 Over a real network the extra hold is at least one round trip from the Worker to the database through
-the pooled proxy; that was not measured. Commit-stage wall time was within noise off and on (250
+the pooled proxy; that was not measured.
+
+**Failure path.** When the call fails inside the explicit transaction (55P03 or 57014), the aborted
+transaction keeps the locks it took before the failure until the `ROLLBACK` round trip arrives. Before
+this option, the autocommit statement released them when it failed. With the retry flag, the retry's
+pause starts after that `ROLLBACK`. Commit-stage wall time was within noise off and on (250
 records about 50 ms, 500 records about 105 ms, loopback).
 
 ## Not proven

@@ -107,7 +107,9 @@ export const bufferCommitLockWaitSql = (fn: string): string =>
 /**
  * INGEST_BUFFER_COMMIT_STATEMENT_BUDGET_MS bounds (ms): the buffered commit's own statement_timeout, run in its own
  * short explicit transaction. Above the role's 5 s (a shorter budget is not this option's purpose); at most 7 s so
- * that the commit stage with its one INGEST_BUFFER_LOCK_RETRY retry (2 x 7 s + 250 ms) stays under 15 s.
+ * that the commit stage's statement time with its one INGEST_BUFFER_LOCK_RETRY retry (2 x 7 s + 250 ms) stays under
+ * 15 s. Commit-stage statement time only: round trips (about 6 with a retry) and earlier stages add to it, and with
+ * INGEST_BUFFER_TIMEOUT_BUSY + INGEST_BUFFER_LOCK_RETRY buffer_intent can retry a 57014 (up to 5 s + 250 ms) first.
  * docs/design/buffer-commit-statement-budget.md.
  */
 export const BUFFER_COMMIT_BUDGET_MS_MIN = 5001;
@@ -131,8 +133,12 @@ export const bufferCommitBudgetOpen = (budgetMs: number, lockWaitMs?: number): s
  * flight 3 COMMIT. Every SET is LOCAL, so it ends with the transaction and never reaches the next use of the
  * connection. Any failure before COMMIT is answered by ROLLBACK (its own failure ignored) and the first error is
  * thrown: the transaction wrote nothing. A COMMIT that fails with a database SQLSTATE rolled back; a COMMIT whose
- * answer is lost (connection error) is UNKNOWN: it maps to ledger_connection (503), and the client's retry repeats
- * the same commit, which the function answers with the same receipt when the first one did commit.
+ * answer is lost (connection error) is UNKNOWN: it maps to ledger_connection (an 08xxx / E* code) or ledger_error (no
+ * code, e.g. "Connection terminated unexpectedly"), a 503 either way, and the client's retry repeats the same commit,
+ * which the function answers with the same receipt when the first one did commit. More than
+ * BUFFER_COMMIT_IDLE_IN_TRANSACTION_MS between flights: the server ends the session (25P03), the next flight fails
+ * with no SQLSTATE (ledger_error), and the transaction is rolled back for certain. While the transaction is open, a
+ * failed call keeps the locks it took until the ROLLBACK round trip arrives.
  * Requires a `run` bound to ONE connection used sequentially (the Worker's per-request / per-batch pg Client).
  */
 export async function inBufferCommitBudget<T>(run: SqlRun, budgetMs: number, lockWaitMs: number | undefined, work: () => Promise<T>): Promise<T> {

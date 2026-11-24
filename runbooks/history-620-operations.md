@@ -241,7 +241,9 @@ unbind refuses `native_binding_target`.
   `private_ingest_profile_buffer_commit_budget`): the buffered commit runs in its own explicit transaction (3 round
   trips instead of 1) with this statement budget. `INGEST_BUFFER_TIMEOUT_BUSY` (stack input
   `sessionIngest.bufferTimeoutBusy: "on"`, `PRIVATE_INGEST_BUFFER_TIMEOUT_BUSY` `on` or unset/empty, else
-  `private_ingest_profile_buffer_timeout_busy`): a buffer-stage 57014 is retried and answered 429 like the lock wait.
+  `private_ingest_profile_buffer_timeout_busy`): a buffer-stage 57014 is retried (only with
+  `INGEST_BUFFER_LOCK_RETRY`) and answered 429 (only with `INGEST_BUFFER_LOCK_BUSY`) like the lock wait; alone it
+  changes nothing.
   With it on, a sustained commit timeout no longer feeds the DB-error alert and is seen only through the lock alert.
   Turn it on before `INGEST_BUFFER_COMMIT_LOCK_WAIT_MS`. See `docs/design/buffer-commit-statement-budget.md`. Change:
   set another value, plan, deploy, and the readback shows exactly that value. Rollback of either: unset (or empty), then

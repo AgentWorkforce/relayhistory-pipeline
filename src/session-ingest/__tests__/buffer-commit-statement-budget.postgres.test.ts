@@ -10,6 +10,8 @@
  *   certainty  a COMMIT whose answer is lost committed; the repeat of the same commit answers the same result, also
  *              when it arrives while the first transaction is still open.
  *   cost       round trips (1 vs 3) and how much longer the seat clock is held past the call's answer, at 250 and 500.
+ *   gap        more than the 1 s idle bound between flights: the server ends the session (25P03), the caller gets
+ *              ledger_error (not ledger_timeout), nothing is written.
  */
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import pg, { type PoolClient } from "pg";
@@ -206,13 +208,17 @@ describe.skipIf(!url)("buffered commit statement budget (owned PostgreSQL)", () 
       const input = await stagedCommit(`budget-${label}`);
       const sent: Sent[] = [];
       const clock = await holdClock(3000), origin = await holdOrigin(originHold);
+      const flightMs: Record<string, number> = {}; const base = waiterRun(sent);
+      const timed = async (text: string, params: unknown[]) => { const f0 = performance.now(); try { return await base(text, params); } finally { flightMs[text.split(" ")[0]!] = Math.round(performance.now() - f0); } };
       const t0 = performance.now();
-      const pending = outcome(budgetLedger(sent, { budget, lockWait: 4000 }).commitBuffered!(input), t0);
-      const r = await pending;
+      const r = await outcome(budgetLedger(sent, { budget, lockWait: 4000 }, timed).commitBuffered!(input), t0);
       const held = [await clock.released, await origin.released];
       const h = await hygiene();
-      receipts.push({ case: `budget:${label}`, budget: budget ?? null, lockWait: 4000, clockHeld: held[0], originHeld: held[1], ...r, flights: sent.length, hygiene: h });
-      if (expect_ === "ok") { expect(r.ok).toBe(true); expect(r.ms).toBeGreaterThanOrEqual(5500); expect(r.ms).toBeLessThan(6900); }
+      receipts.push({ case: `budget:${label}`, budget: budget ?? null, lockWait: 4000, clockHeld: held[0], originHeld: held[1], ...r, flights: sent.length, flightMs, hygiene: h });
+      // The call waited past the single statement's 5 s and ended inside the budget (per-flight timing). Total wall
+      // time is not bounded here: it also holds the COMMIT flight and host scheduling, and one run on a loaded shared
+      // host took 8.3 s in total (that run had no per-flight timing; later runs measured COMMIT at 1-3 ms).
+      if (expect_ === "ok") { expect(r.ok).toBe(true); expect(r.ms).toBeGreaterThanOrEqual(5500); expect(flightMs.SELECT!).toBeLessThan(budget!); }
       else { expect(r).toMatchObject({ ok: false, code: "ledger_timeout", sqlstate: "57014" }); expect(r.ms).toBeGreaterThanOrEqual((budget ?? 5000) - 100); expect(r.ms).toBeLessThan((budget ?? 5000) + 900); }
       expect(sent.length).toBe(budget === undefined ? 1 : expect_ === "ok" ? 3 : 3); // open, call, COMMIT or ROLLBACK
       if (budget !== undefined) { expect(sent[0]!.text).toBe(bufferCommitBudgetOpen(budget, 4000)); expect(sent[1]!.text).toBe("SELECT sessions.ingest_commit_buffered_batch($1::jsonb) AS result"); expect(sent[2]!.text).toBe(expect_ === "ok" ? "COMMIT" : "ROLLBACK"); }
@@ -335,4 +341,38 @@ describe.skipIf(!url)("buffered commit statement budget (owned PostgreSQL)", () 
     console.log(JSON.stringify({ proof: "buffer-commit-budget-cost", rows }));
     for (const r of rows) expect(r.flights).toBe(r.budget === null ? 1 : 3);
   }, 600000);
+
+  test("a gap over the 1 s idle bound between flights (Worker alive): the server ends the session; the caller gets a non-timeout 503 class; nothing written", async () => {
+    const as = new URL(url!); as.pathname = "/" + name; as.username = login;
+    const input = await stagedCommit("gap");
+    const g = new pg.Client({ connectionString: as.href });
+    const clientErrors: string[] = [];
+    g.on("error", (e: any) => clientErrors.push(String(e.code ?? e.message)));
+    await g.connect(); await g.query("SET ROLE bulls96_session_ingest");
+    const gpid = (await g.query("SELECT pg_backend_pid() p")).rows[0].p as number;
+    // The real ledger path; the run pauses 1.2 s before flight 2 (the call), as a slow Worker would.
+    const sent: string[] = [];
+    const run = async (text: string, params: unknown[]) => {
+      sent.push(text.split(" ")[0]!);
+      if (text.includes("ingest_commit_buffered_batch")) await Bun.sleep(1200);
+      return (await g.query(text, params as never[])) as unknown as { rows: Record<string, unknown>[] };
+    };
+    const t0 = performance.now();
+    const got = await budgetLedger([], { budget: 6000 }, run).commitBuffered!(input)
+      .then(() => ({ ok: true as const }), (e: unknown) => ({ ok: false as const, code: e instanceof LedgerUnavailableError ? e.code : String(e), sqlstate: e instanceof LedgerUnavailableError ? e.db?.db_error_code ?? null : null }));
+    const ms = Math.round(performance.now() - t0);
+    const alive = (await pool.query("SELECT count(*)::int n FROM pg_stat_activity WHERE pid=$1", [gpid])).rows[0].n;
+    const state = await batchState(input);
+    receipts.push({ case: "gap-over-idle-bound", gapMs: 1200, ms, ...got, flights: sent, clientErrorEvents: clientErrors, backendAlive: alive, batchState: state });
+    expect(got.ok).toBe(false);
+    if (!got.ok) {
+      expect(got.code).not.toBe("ledger_timeout");      // not the statement-timeout class: part 2 never retries it
+      expect(got.code).not.toBe("ledger_lock_timeout");
+      expect(got.code).toBe("ledger_error");             // pg's "not queryable" error carries no SQLSTATE
+    }
+    expect(clientErrors).toContain("25P03");             // the server's own reason, seen only on the client error event
+    expect(alive).toBe(0);                               // the server ended the session
+    expect(state).not.toBe("committed");                 // rolled back, nothing written
+    await g.end().catch(() => {});
+  }, 120000);
 });
