@@ -128,7 +128,7 @@ export const SYNTHESIS_ARTIFACT_FORMAT_V2 = "workspace-synthesis-artifact/2";
 /**
  * The v2 envelope: the v1 envelope's fields, `v1Sha256` (the Stage 1 artifact's digest, binding it to those bytes),
  * `stage2Sha256` (sha256 of the v2 document's two-space JSON, verified on every read) and the
- * workspace-synthesis/2 document as `synthesis`. Not served yet.
+ * workspace-synthesis/2 document as `synthesis`. Served behind READ_API_WORKSPACE_SYNTHESIS_V2_ENABLED (latestWorkspaceSynthesisV2).
  */
 export interface SynthesisArtifactV2 extends Omit<SynthesisArtifact, "format" | "synthesis"> {
   format: typeof SYNTHESIS_ARTIFACT_FORMAT_V2;
@@ -313,6 +313,14 @@ export async function latestWorkspaceSynthesis(
   store: SynthesisArtifactStore,
   lookup: { keyRoot: string; orgId: string; workspace: string; window: { since: string; until: string } },
 ): Promise<SynthesisArtifact | null> {
+  return (await latestWorkspaceSynthesisEntry(store, lookup))?.artifact ?? null;
+}
+
+/** latestWorkspaceSynthesis with the artifact's key and digest (the Stage 2 lookup needs both). */
+export async function latestWorkspaceSynthesisEntry(
+  store: SynthesisArtifactStore,
+  lookup: { keyRoot: string; orgId: string; workspace: string; window: { since: string; until: string } },
+): Promise<{ artifact: SynthesisArtifact; key: string; sha256: string } | null> {
   const prefix = workspaceSynthesisPrefix(lookup.keyRoot, lookup.orgId, lookup.workspace, lookup.window);
   const keys = (await store.list(prefix, SYNTHESIS_LOOKUP_MAX_KEYS))
     .filter((k) => k.startsWith(prefix) && KEY_TAIL.test(k.slice(prefix.length)))
@@ -324,9 +332,28 @@ export async function latestWorkspaceSynthesis(
     const bytes = await store.get(key, SYNTHESIS_ARTIFACT_MAX_BYTES);
     if (!bytes) continue;
     const a = parseArtifact(bytes, { orgId: lookup.orgId, workspace: lookup.workspace, window: lookup.window, generatedAtMs: Number(ms), sha256: digest! });
-    if (a) return a;
+    if (a) return { artifact: a, key, sha256: digest! };
   }
   return null;
+}
+
+/**
+ * The Stage 2 lookup: the authoritative (newest complete) Stage 1 artifact of the window, and the v2 artifact stored
+ * for exactly that artifact and the current prompt version (workspaceSynthesisStage2Key), read through the strict
+ * reader (parseStage2Artifact). Null when there is no Stage 1 artifact; `v2: null` when that artifact has no v2 (an
+ * older generation's v2 is never served in its place). A stored v2 that does not verify throws its typed
+ * SynthesisArtifactError (never a silent skip). The caller still runs the erase check before serving it.
+ */
+export async function latestWorkspaceSynthesisV2(
+  store: SynthesisArtifactStore,
+  lookup: { keyRoot: string; orgId: string; workspace: string; window: { since: string; until: string } },
+): Promise<{ v1: SynthesisArtifact; v2: SynthesisArtifactV2 | null } | null> {
+  const entry = await latestWorkspaceSynthesisEntry(store, lookup);
+  if (!entry) return null;
+  const key = workspaceSynthesisStage2Key(lookup.keyRoot, lookup.orgId, entry.artifact.workspace, entry.artifact.window, entry.key);
+  const bytes = await store.get(key, SYNTHESIS_ARTIFACT_MAX_BYTES);
+  if (!bytes) return { v1: entry.artifact, v2: null };
+  return { v1: entry.artifact, v2: parseStage2Artifact(bytes, entry.artifact, entry.sha256) };
 }
 
 /** The body, refused as soon as it passes `maxBytes` (the reader is cancelled; the rest is never read). */

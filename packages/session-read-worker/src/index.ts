@@ -43,7 +43,8 @@
  * READ_API_WORKSPACE_SYNTHESIS_ENABLED (exactly "true": GET /v1/session-intel/synthesis, the stored
  * workspace-synthesis/1 artifacts through the raw-store secrets (PIPELINE_RAW_S3_*) under PIPELINE_KEY_PREFIX; without them 501
  * workspace_synthesis_not_configured; every other value = 501 unsupported_by_backend, reason
- * workspace_synthesis_disabled),
+ * workspace_synthesis_disabled; READ_API_WORKSPACE_SYNTHESIS_V2_ENABLED exactly "true" adds `stage=2`, the stored
+ * workspace-synthesis/2, else `stage=2` = 501 workspace_synthesis_v2_disabled),
  * READ_API_ANALYSIS_ENABLED (exactly "true": GET and POST /v1/sessions/:sessionId/analysis, lane
  * F1, migration 20261105046000, src/session-read-api/analysis-source.ts; see analysisDeps below;
  * every other value = GET 501 analysis_not_configured and POST 405, exactly as before the flag),
@@ -211,6 +212,8 @@ export interface Env extends CanonicalEnv {
   READ_API_SESSION_INTEL_ENABLED?: string;
   /** Exactly "true": serve GET /v1/session-intel/synthesis (the stored artifacts in the raw store). */
   READ_API_WORKSPACE_SYNTHESIS_ENABLED?: string;
+  /** Exactly "true" (with the above): `stage=2` serves the stored workspace-synthesis/2 document. */
+  READ_API_WORKSPACE_SYNTHESIS_V2_ENABLED?: string;
   /**
    * `<kind>:<urgency>` rows whose advisories are notifyEligible (advisory-priority.ts); default empty. Malformed: the
    * two advisory routes (GET /v1/coordination/advisories and GET /v1/session-intel/workspace) answer 503; every other
@@ -821,14 +824,15 @@ function recordedSizeStore(store: Store, recorded: ReadonlyMap<string, number>):
  * analysis result reads. Without the raw-store secrets: enabled without a source (501
  * workspace_synthesis_not_configured).
  */
-export function workspaceSynthesisDeps(env: Env, fetcher: typeof fetch = (input, init) => fetch(input, init)): { enabled: true; source?: WorkspaceSynthesisSource } {
+export function workspaceSynthesisDeps(env: Env, fetcher: typeof fetch = (input, init) => fetch(input, init)): { enabled: true; source?: WorkspaceSynthesisSource; stage2Enabled?: true } {
   const bounded: typeof fetch = (input, init) => {
     const deadline = AbortSignal.timeout(ANALYSIS_RESULT_DEADLINE_MS);
     return fetcher(input, { ...init, signal: init?.signal ? AbortSignal.any([init.signal, deadline]) : deadline });
   };
   const raw = rawStoreFromEnv(env, bounded);
   const keyRoot = synthesisKeyRoot(env.PIPELINE_KEY_PREFIX);
-  return raw && keyRoot ? { enabled: true, source: storeWorkspaceSynthesis(objectStoreArtifacts(raw.store), keyRoot) } : { enabled: true };
+  const stage2 = exactTrueFlag(env.READ_API_WORKSPACE_SYNTHESIS_V2_ENABLED) ? { stage2Enabled: true as const } : {};
+  return raw && keyRoot ? { enabled: true, source: storeWorkspaceSynthesis(objectStoreArtifacts(raw.store), keyRoot), ...stage2 } : { enabled: true, ...stage2 };
 }
 
 /**

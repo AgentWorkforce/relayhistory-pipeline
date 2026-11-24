@@ -48,6 +48,11 @@ export const READ_API_SESSION_INTEL_ENABLED = "READ_API_SESSION_INTEL_ENABLED";
  * anything else = 501 `unsupported_by_backend`, reason `workspace_synthesis_disabled`.
  */
 export const READ_API_WORKSPACE_SYNTHESIS_ENABLED = "READ_API_WORKSPACE_SYNTHESIS_ENABLED";
+/**
+ * Exactly "true" (exactTrueFlag), and only with READ_API_WORKSPACE_SYNTHESIS_ENABLED: `stage=2` on that route serves
+ * the stored workspace-synthesis/2 document; anything else = `stage=2` is 501, reason `workspace_synthesis_v2_disabled`.
+ */
+export const READ_API_WORKSPACE_SYNTHESIS_V2_ENABLED = "READ_API_WORKSPACE_SYNTHESIS_V2_ENABLED";
 
 /**
  * READ_API_OUTPUT_BACKEND / READ_API_DIGEST_BACKEND: unset or "" = "clickhouse" (the default,

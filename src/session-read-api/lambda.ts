@@ -43,7 +43,8 @@ import { sqlRelayfacts } from "./relayfacts.ts";
  * self-host service: the Function URL handler is GET-only); READ_API_SESSION_INTEL_ENABLED (exactly "true")
  * exposes GET /v1/session-intel/workspace (migration 20261105062170 and the directory); READ_API_WORKSPACE_SYNTHESIS_ENABLED
  * (exactly "true") exposes GET /v1/session-intel/synthesis from READ_API_ANALYSIS_BUCKET under PIPELINE_KEY_PREFIX (either unset = 501
- * workspace_synthesis_not_configured; flag off = 501 workspace_synthesis_disabled); READ_API_COORDINATION_OVERLAPS_BACKEND selects
+ * workspace_synthesis_not_configured; flag off = 501 workspace_synthesis_disabled), and READ_API_WORKSPACE_SYNTHESIS_V2_ENABLED
+ * (exactly "true") adds its `stage=2` (the stored workspace-synthesis/2; off = 501 workspace_synthesis_v2_disabled); READ_API_COORDINATION_OVERLAPS_BACKEND selects
  * clickhouse (default) or postgres (self-host service only). READ_API_BRIEF_SUMMARY_ENABLED (exactly
  * "true") wires the brief-summary read (GET /v1/sessions/:id/summary and
  * /v1/sessions/summaries/activity) on this entry too; unset/any other value = 501
@@ -101,7 +102,7 @@ import {
   coordinationOverlapsEnabled, exactTrueFlag, parseCompleteSince, parseFactsBackend, parseSummarySearchBackend, readApiRouteEnabled,
   type SummarySearchBackendKind,
   READ_API_BRIEF_SUMMARY_ENABLED, READ_API_COORDINATION_ADVISORIES_ENABLED, READ_API_COORDINATION_OVERLAPS_BACKEND, READ_API_COORDINATION_OVERLAPS_ENABLED,
-  READ_API_LIST_READINESS_ENABLED, READ_API_LIST_SHORT_SUMMARY_ENABLED, READ_API_RELAYFACTS_ENABLED, READ_API_SESSION_INTEL_ENABLED, READ_API_SESSION_SOURCES_ENABLED, READ_API_WORKSPACE_SYNTHESIS_ENABLED, READ_API_SUMMARY_SEARCH_ENABLED,
+  READ_API_LIST_READINESS_ENABLED, READ_API_LIST_SHORT_SUMMARY_ENABLED, READ_API_RELAYFACTS_ENABLED, READ_API_SESSION_INTEL_ENABLED, READ_API_SESSION_SOURCES_ENABLED, READ_API_WORKSPACE_SYNTHESIS_ENABLED, READ_API_WORKSPACE_SYNTHESIS_V2_ENABLED, READ_API_SUMMARY_SEARCH_ENABLED,
   READ_API_DIGEST_BACKEND, READ_API_OUTPUT_BACKEND, READ_API_ADVISORY_PRIORITY_ENABLED, READ_API_ADVISORY_INSTANCE_ENABLED,
   READ_API_SESSION_PARTIAL_RETRYABLE, sessionPartialRetryableFlag,
 } from "./config.ts";
@@ -739,6 +740,7 @@ export async function readApiDepsFromSecret(secretText: string, env: NodeJS.Proc
         ...(analysisBucket && synthesisKeyRoot(env.PIPELINE_KEY_PREFIX)
           ? { source: storeWorkspaceSynthesis(objectStoreArtifacts(createS3Store({ bucket: analysisBucket, region: env.AWS_REGION ?? "", credentials: async () => lambdaCredentials() })), synthesisKeyRoot(env.PIPELINE_KEY_PREFIX)!) }
           : {}),
+        ...(exactTrueFlag(env[READ_API_WORKSPACE_SYNTHESIS_V2_ENABLED]) ? { stage2Enabled: true } : {}),
       }
     : undefined;
   let narrative: Awaited<ReturnType<typeof selfhostNarrativeFromEnv>>;
