@@ -68,8 +68,12 @@ export function scopeLockKey(scope: SessionScope, stage: "pointer" | "search" = 
   return [`96bulls:${stage}`, scope.orgId, scope.workspaceId, scope.harness, scope.sessionId].join("\u001f");
 }
 
-/** Run `work` while holding the session's lock (lambda.ts: pg_advisory_xact_lock in Supabase). */
-export type ScopeLock = <T>(scope: SessionScope, work: () => Promise<T>) => Promise<T>;
+/**
+ * Run `work` while holding the session's lock (lambda.ts: pg_advisory_xact_lock in Supabase).
+ * `ensureLive` throws once the lock's connection reported an error (the lock is then gone) and is
+ * a no-op otherwise; `work` calls it immediately before each write it makes under the lock.
+ */
+export type ScopeLock = <T>(scope: SessionScope, work: (ensureLive: () => void) => Promise<T>) => Promise<T>;
 
 export interface PointerDeps {
   db: HoopDb;
@@ -121,7 +125,7 @@ export async function indexPointer(landed: ObjectLanded, deps: PointerDeps): Pro
     sessionId: location.sessionId,
   };
 
-  return deps.lock(scope, () => indexLocked(landed, orgId, scope, deps));
+  return deps.lock(scope, (ensureLive) => indexLocked(landed, orgId, scope, deps, ensureLive));
 }
 
 /** How far either side of a deleted key's date the same session is looked for (an exporter date move). */
@@ -149,7 +153,14 @@ export async function findMovedSibling(key: string, exists: (key: string) => Pro
   return undefined;
 }
 
-async function indexLocked(landed: ObjectLanded, orgId: string, scope: SessionScope, deps: PointerDeps, followed = false): Promise<PointerOutcome> {
+async function indexLocked(
+  landed: ObjectLanded,
+  orgId: string,
+  scope: SessionScope,
+  deps: PointerDeps,
+  ensureLive: () => void,
+  followed = false,
+): Promise<PointerOutcome> {
   // Canonical state, not the event: re-read the manifest, under the lock.
   const read = await deps.reader.read(landed.key);
   if (!read && !followed) {
@@ -157,7 +168,7 @@ async function indexLocked(landed: ObjectLanded, orgId: string, scope: SessionSc
     const sibling = await findMovedSibling(landed.key, deps.exists);
     if (sibling) {
       const { etag: _e, version: _v, size: _s, deleted: _d, ...rest } = landed;
-      return indexLocked({ ...rest, key: sibling }, orgId, scope, deps, true);
+      return indexLocked({ ...rest, key: sibling }, orgId, scope, deps, ensureLive, true);
     }
   }
   const built = read
@@ -192,7 +203,11 @@ async function indexLocked(landed: ObjectLanded, orgId: string, scope: SessionSc
   const message = await enrichMessage(indexed, deps.reader);
 
   const index = hoopDbSessionIndex({ db: deps.db, reader: deps.reader, queue: deps.fanout, current: () => message });
-  const upsert = () => index.upsertRawPointer(message.payload as Parameters<typeof index.upsertRawPointer>[0], message.ctx);
+  // Every write below first checks that the lock is still ours (ScopeLock).
+  const upsert = () => {
+    ensureLive();
+    return index.upsertRawPointer(message.payload as Parameters<typeof index.upsertRawPointer>[0], message.ctx);
+  };
   const result = await upsert();
   const revision = message.revision;
   if (!read) return { status: "deleted", scope, manifestKey: landed.key };
@@ -215,6 +230,7 @@ async function indexLocked(landed: ObjectLanded, orgId: string, scope: SessionSc
       throw new PipelineError("pointer_move_pending", "the session's other key is still live; retry after its erasure", true);
     // The stored key is gone (or tombstoned): re-key the row to this one. The
     // row is derived, and the upsert rebuilds it from this manifest.
+    ensureLive();
     await deps.db.query(
       `DELETE FROM sessions.session_index
         WHERE org_id = $1 AND workspace_id = $2 AND harness = $3 AND session_id = $4 AND machine_id = $5

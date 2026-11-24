@@ -11,7 +11,6 @@
  * a scope.
  */
 import { afterEach, describe, expect, spyOn, test } from "bun:test";
-import { EventEmitter } from "node:events";
 import type { HoopDb } from "../../shared/db.ts";
 import { manifestKey, prefixAllowed, prefixOrgResolver, type ManifestReader, type ObjectStore } from "../../shared/vendor.ts";
 import { processBatch, type ConsumerDeps } from "../consumer.ts";
@@ -19,6 +18,7 @@ import { scopeLock, searchTransaction } from "../lambda.ts";
 import * as pointerModule from "../pointer.ts";
 import { droppedFanout, type SessionScope } from "../pointer.ts";
 import type { ClickHouseClient } from "../vendor/search-index/clickhouse.ts";
+import { dropConnection, dropped, fakePool as fakePoolWith } from "./support.ts";
 
 const scope: SessionScope = { orgId: "org_1", workspaceId: "ws_1", harness: "claude", sessionId: "sess_1" };
 const key = manifestKey({ prefix: "96bulls/org_1", workspaceId: "ws_1", machineId: "srv_1", harness: "claude", sessionId: "sess_1", startDate: "2026-11-01" });
@@ -26,45 +26,8 @@ const put = JSON.stringify({
   Records: [{ eventSource: "aws:s3", eventName: "ObjectCreated:Put", eventTime: "2026-11-01T10:00:00.000Z", s3: { bucket: { name: "bucket" }, object: { key, eTag: "e", sequencer: "01" } } }],
 });
 const bindings = { PIPELINE_ORG_FROM_PREFIX: "true", PIPELINE_KEY_PREFIX: "96bulls" };
+const fakePool = () => fakePoolWith((text) => (text.startsWith("SELECT pg_try_advisory_xact_lock") ? [{ ok: true }] : []));
 
-/** One client for every checkout (as a pool reuses an idle client), recording statements and releases. */
-function fakePool() {
-  const client = Object.assign(new EventEmitter(), {
-    statements: [] as string[],
-    released: [] as unknown[],
-    listenersSeen: [] as number[],
-    async query(text: string) {
-      client.statements.push(text);
-      client.listenersSeen.push(client.listenerCount("error"));
-      return { rows: text.startsWith("SELECT pg_try_advisory_xact_lock") ? [{ ok: true }] : [] };
-    },
-    release(error?: unknown) {
-      client.released.push(error === undefined ? "release()" : error);
-    },
-  });
-  const db = { pool: { connect: async () => client } } as unknown as HoopDb;
-  return { client, db };
-}
-
-const dropped = () => Object.assign(new Error("Connection terminated unexpectedly"), { code: "ECONNRESET" });
-
-/**
- * What pg does when the server ends an idle session: 'error' from its own macrotask, outside any
- * query. With no listener on the client the emit throws there, outside the batch's promise chain;
- * the test runner reports that as an unhandled error and the test fails (checked by hand with
- * scopeLock and searchTransaction unguarded).
- */
-async function dropConnection(client: EventEmitter, error: Error) {
-  await new Promise<void>((resolve) =>
-    setImmediate(() => {
-      try {
-        client.emit("error", error);
-      } finally {
-        resolve();
-      }
-    }),
-  );
-}
 
 /** Uncaught exceptions while `run` runs (the emit's throw when no listener holds it). */
 async function catchingUncaught<T>(run: () => Promise<T>): Promise<{ result: T; uncaught: unknown[] }> {
@@ -80,8 +43,12 @@ async function catchingUncaught<T>(run: () => Promise<T>): Promise<{ result: T; 
   }
 }
 
-/** Pointer deps with the scope lock on the fake pool; the manifest re-read is where the connection drops. */
-function pointerDeps(lockDb: HoopDb, onRead: () => Promise<void>): ConsumerDeps["pointer"] {
+/**
+ * Pointer deps with the scope lock on the fake pool; the manifest re-read is where the connection
+ * drops. The manifest is gone, so the work's one write is the tombstone; `writes` records the
+ * statements sent on the pointer stage's other connection.
+ */
+function pointerDeps(lockDb: HoopDb, onRead: () => Promise<void>, writes: string[] = []): ConsumerDeps["pointer"] {
   const reader: ManifestReader = {
     provider: "s3",
     bucket: "bucket",
@@ -90,7 +57,12 @@ function pointerDeps(lockDb: HoopDb, onRead: () => Promise<void>): ConsumerDeps[
       return null;
     },
   } as unknown as ManifestReader;
-  const rows = { async query<R>() { return { rows: [] as R[] }; } };
+  const rows = {
+    async query<R>(text: string) {
+      writes.push(text.trim().split(/\s+/).slice(0, 3).join(" "));
+      return { rows: [] as R[] };
+    },
+  };
   return {
     db: { ...rows, pool: undefined, end: async () => {} } as unknown as HoopDb,
     lock: scopeLock(lockDb),
@@ -105,8 +77,10 @@ function pointerDeps(lockDb: HoopDb, onRead: () => Promise<void>): ConsumerDeps[
 describe("scope lock (pointer stage)", () => {
   test("no error: the same statements and release() as before, the listener only while checked out", async () => {
     const { client, db } = fakePool();
-    const out = await processBatch([{ messageId: "m1", body: put }], { pointer: pointerDeps(db, async () => {}) });
+    const writes: string[] = [];
+    const out = await processBatch([{ messageId: "m1", body: put }], { pointer: pointerDeps(db, async () => {}, writes) });
     expect(out.batchItemFailures).toEqual([]);
+    expect(writes).toEqual(["UPDATE sessions.session_index SET"]);
     expect(client.statements).toEqual(["BEGIN", "SET LOCAL statement_timeout = '60s'", "SET LOCAL lock_timeout = '30s'", "SELECT pg_advisory_xact_lock(hashtextextended($1, 0))", "COMMIT"]);
     expect(client.released).toEqual(["release()"]);
     expect(client.listenersSeen.every((n) => n === 1)).toBe(true);
@@ -117,12 +91,15 @@ describe("scope lock (pointer stage)", () => {
     const { client, db } = fakePool();
     const error = dropped();
     let emitted = 0;
+    const writes: string[] = [];
     const deps = pointerDeps(db, async () => {
       if (emitted++ === 0) await dropConnection(client, error);
-    });
+    }, writes);
     const { result, uncaught } = await catchingUncaught(() => processBatch([{ messageId: "m1", body: put }], { pointer: deps }));
     expect(uncaught).toEqual([]);
     expect(result.batchItemFailures).toEqual([{ itemIdentifier: "m1" }]);
+    // The work checks the lock before its tombstone: the write is not made.
+    expect(writes).toEqual([]);
     // COMMIT and ROLLBACK never reach the dead connection.
     expect(client.statements).toEqual(["BEGIN", "SET LOCAL statement_timeout = '60s'", "SET LOCAL lock_timeout = '30s'", "SELECT pg_advisory_xact_lock(hashtextextended($1, 0))"]);
     expect(client.released).toEqual([error]);

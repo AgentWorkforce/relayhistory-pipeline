@@ -34,14 +34,14 @@ import type { IndexRow } from "../vendor/search-index/rows.ts";
 import { EVENTS_TABLE, SESSION_STATE_TABLE } from "../vendor/search-index/schema.ts";
 import { SEARCH_INDEX_STREAM_CH_BUDGET, STREAM_TAIL_RESERVE_MS, indexSearchScope, projectedToNeonRow, readChunkRecords, type SearchIndexDeps } from "../search-index.ts";
 import { STREAM_PASSES, streamScope } from "../search-index-stream.ts";
-import { transaction } from "../lambda.ts";
+import { searchTransaction, transaction } from "../lambda.ts";
 import { chunkKeys } from "../../shared/vendor.ts";
 import { EventEmitter } from "node:events";
 import { zstdDecompressSync } from "node:zlib";
 import { processBatch, type ConsumerDeps } from "../consumer.ts";
 import { requeueBody } from "../s3-events.ts";
 import { droppedFanout, type SessionScope } from "../pointer.ts";
-import { memoryLock } from "./support.ts";
+import { dropConnection, dropped, fakePool, memoryLock } from "./support.ts";
 
 const TRACE = "019a1f3c-8e2b-7c41-9d3a-5b6f0e2a7c18";
 const NOW = new Date("2026-11-01T12:00:00.000Z");
@@ -976,5 +976,142 @@ describe("streamed reconcile", () => {
     expect(ch.state.at(-1)!.needs_full).toBe(1);
     expect(await indexSearchScope(scope, deps(ch.ch, () => keys, armed).d)).toMatchObject({ complete: true, deleted: 700 });
     expect(ch.final()).toEqual(truth.final());
+  });
+});
+
+/**
+ * The unstreamed pass through the real guarded transaction (searchTransaction on a fake pg pool):
+ * it sends no statement on the lock's connection between its ClickHouse writes, so it checks the
+ * transaction before each one. An 'error' emitted while the pass is between a read and a write
+ * means the write is not made and the scope fails with that error; with no 'error', the pg and
+ * ClickHouse statements are exactly those of the plain transaction.
+ */
+describe("unstreamed pass on a guarded transaction: checked before each ClickHouse write", () => {
+  const livePool = (keys: string[]) =>
+    fakePool((text) =>
+      text.includes("pg_try_advisory_xact_lock")
+        ? [{ ok: true }]
+        : text.includes("FROM sessions.session_index") && text.includes("deleted_at IS NULL")
+          ? keys.map((manifest_key) => ({ manifest_key }))
+          : [],
+    );
+  const norm = (q: string) => q.trim().replace(/\s+/g, " ");
+  type Call = { kind: "select" | "command" | "insert"; text: string };
+  /** `ch` with an 'error' emitted on `client` during the first call `when` matches (after the call ran). */
+  function dropDuring(ch: ClickHouseClient, client: EventEmitter, error: Error, when: (call: Call) => boolean) {
+    let done = false;
+    const after = async (call: Call) => {
+      if (done || !when(call)) return;
+      done = true;
+      await dropConnection(client, error);
+    };
+    const out: ClickHouseClient = {
+      ...ch,
+      async select<T>(q: string, o?: unknown) {
+        const rows = await ch.select<T>(q, o as never);
+        await after({ kind: "select", text: q });
+        return rows;
+      },
+      async command(q: string, o?: unknown) {
+        await ch.command(q, o as never);
+        await after({ kind: "command", text: q });
+      },
+      async insert(table: string, batch: unknown[], o?: unknown) {
+        await ch.insert(table, batch as never, o as never);
+        await after({ kind: "insert", text: table });
+      },
+    };
+    return { ch: out, emitted: () => done };
+  }
+  const scopeRead = (c: Call) => c.kind === "select" && c.text.includes(EVENTS_TABLE);
+  const isDelete = (c: Call) => c.kind === "command" && c.text.includes(`DELETE FROM ${EVENTS_TABLE}`);
+  const writes = (statements: string[]) => statements.filter((s) => s.startsWith("insert ") || s.startsWith("command "));
+  /** One live manifest; `drop` leaves r2 out at revision 2, so a pass after the first has one row to delete and none to insert. */
+  const small = (drop = false) =>
+    writeSession("srv_bb", [drop ? [say("r1", "1", 1, "one")] : [say("r1", "1", 1, "one"), say("r2", "1", 2, "two")]], drop ? 2 : 1);
+
+  test("no error: the same pg statements as the plain transaction, the same ClickHouse statements, and release()", async () => {
+    const keys = await richScope();
+    const plain = fakeClickHouse();
+    const p = deps(plain.ch, () => keys);
+    expect(await indexSearchScope(scope, p.d)).toMatchObject({ complete: true });
+    const guarded = fakeClickHouse();
+    const { client, db } = livePool(keys);
+    const g = deps(guarded.ch, () => keys, { transact: searchTransaction(db) });
+    expect(await indexSearchScope(scope, g.d)).toMatchObject({ complete: true });
+    expect(client.statements.map(norm)).toEqual(["BEGIN", "SET LOCAL statement_timeout = '60s'", ...p.sb.calls, "COMMIT"]);
+    expect(guarded.statements).toEqual(plain.statements);
+    expect(writes(guarded.statements).length).toBeGreaterThan(1);
+    expect(client.released).toEqual(["release()"]);
+    expect(client.listenerCount("error")).toBe(0);
+  });
+
+  test("an 'error' after the scope's ClickHouse read: no insert, no delete, no state row; the scope fails with that error", async () => {
+    const keys = await richScope();
+    const f = fakeClickHouse();
+    const { client, db } = livePool(keys);
+    const error = dropped();
+    const d = dropDuring(f.ch, client, error, scopeRead);
+    await expect(indexSearchScope(scope, deps(d.ch, () => keys, { transact: searchTransaction(db) }).d)).rejects.toBe(error);
+    expect(d.emitted()).toBe(true);
+    expect(writes(f.statements)).toEqual([]);
+    expect(f.rows).toEqual([]);
+    expect(f.state).toEqual([]);
+    expect(client.statements).not.toContain("COMMIT");
+    expect(client.released).toEqual([error]);
+    expect(client.listenerCount("error")).toBe(0);
+  });
+
+  test("an 'error' after the scope's ClickHouse read, with only deletes owed: deleteRows is not called", async () => {
+    const keys = [await small()];
+    const f = fakeClickHouse();
+    expect(await indexSearchScope(scope, deps(f.ch, () => keys).d)).toMatchObject({ complete: true, inserted: 2 });
+    await small(true);
+    const before = f.final();
+    const stateRows = f.state.length;
+    const { client, db } = livePool(keys);
+    const error = dropped();
+    const d = dropDuring(f.ch, client, error, scopeRead);
+    const mark = f.statements.length;
+    await expect(indexSearchScope(scope, deps(d.ch, () => keys, { transact: searchTransaction(db) }).d)).rejects.toBe(error);
+    expect(d.emitted()).toBe(true);
+    expect(writes(f.statements.slice(mark))).toEqual([]);
+    expect(f.final()).toEqual(before);
+    expect(f.state).toHaveLength(stateRows);
+    // What that pass owed: one delete and nothing to insert (so the delete's check is the one that stopped it).
+    expect(await indexSearchScope(scope, deps(f.ch, () => keys).d)).toMatchObject({ complete: true, inserted: 0, deleted: 1 });
+  });
+
+  test("an 'error' during the delete: the state row is not written (the pass is not recorded complete)", async () => {
+    const keys = [await small()];
+    const f = fakeClickHouse();
+    await indexSearchScope(scope, deps(f.ch, () => keys).d);
+    await small(true);
+    const stateRows = f.state.length;
+    const { client, db } = livePool(keys);
+    const error = dropped();
+    const d = dropDuring(f.ch, client, error, isDelete);
+    await expect(indexSearchScope(scope, deps(d.ch, () => keys, { transact: searchTransaction(db) }).d)).rejects.toBe(error);
+    expect(d.emitted()).toBe(true);
+    expect(f.final()).toHaveLength(1);
+    expect(f.state).toHaveLength(stateRows);
+    expect(client.released).toEqual([error]);
+  });
+
+  test("an 'error' while a refused scope reads: its owing-a-pass state row is not written", async () => {
+    const keys = await richScope();
+    const f = fakeClickHouse();
+    const { client, db } = livePool(keys);
+    const error = dropped();
+    // The window read is the pass's one ClickHouse call before the bucket read and the refusal.
+    const d = dropDuring(f.ch, client, error, (c) => c.kind === "select");
+    await expect(indexSearchScope(scope, deps(d.ch, () => keys, { limits: tiny, transact: searchTransaction(db) }).d)).rejects.toBe(error);
+    expect(d.emitted()).toBe(true);
+    expect(writes(f.statements)).toEqual([]);
+    expect(f.state).toEqual([]);
+    // With no error, the same refusal writes that row.
+    const g = fakeClickHouse();
+    expect(await indexSearchScope(scope, deps(g.ch, () => keys, { limits: tiny }).d)).toMatchObject({ partial: true });
+    expect(g.state.map((r) => r.needs_full)).toEqual([1]);
   });
 });

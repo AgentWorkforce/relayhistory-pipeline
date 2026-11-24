@@ -323,21 +323,35 @@ export function supabasePool(url: string, max: number, timeouts: DbTimeouts = {}
  * connection ends between statements (no query in flight), so a transaction holding the client
  * idle (the scope lock while the pointer work runs on other clients, a search pass while it reads
  * the bucket) would crash the invocation with an uncaught exception. Guarded, a per-checkout
- * listener keeps the error: the next statement (the pass's keepalive, its forced lock check
- * before any delete, COMMIT) rejects with it, the transaction fails as a normal rejected promise,
- * and the broken client is destroyed (`release(err)`), not returned to the pool. The listener is
- * removed before release. With no 'error' emitted, guarded and unguarded send the same statements
- * and release the client the same way (`release()`).
+ * listener keeps the first error, and from then on the transaction fails as a normal rejected
+ * promise: the next statement on this client (the pass's keepalive, its forced lock check before
+ * any delete, COMMIT) rejects with it, and so does `ensureLive`, the synchronous check handed to
+ * `work` as its second argument. A dropped connection frees its advisory lock, so `work`
+ * calls `ensureLive()` immediately before each write it makes elsewhere (other pool clients,
+ * ClickHouse): once an error was emitted, the write is not made and the work fails with that
+ * error. The check sends no statement. It cannot stop a write already in flight when the error
+ * is emitted, and it sees only a drop that pg reported; a drop pg has not noticed yet surfaces at
+ * the next statement on this client. The broken client is destroyed (`release(err)`), not
+ * returned to the pool, and the listener is removed before release. Unguarded, `ensureLive` is
+ * always a no-op. With no 'error' emitted, guarded and unguarded send the same statements and
+ * release the client the same way (`release()`).
  */
-export async function transaction<T>(db: HoopDb, work: (tx: SqlExecutor) => Promise<T>, guarded = false): Promise<T> {
+export async function transaction<T>(
+  db: HoopDb,
+  work: (tx: SqlExecutor, ensureLive: () => void) => Promise<T>,
+  guarded = false,
+): Promise<T> {
   const client = await db.pool.connect();
   let broken: Error | undefined;
   const onError = (error: Error) => {
     broken ??= error;
   };
   if (guarded) client.on("error", onError);
-  const query = async (text: string, params?: unknown[]) => {
+  const ensureLive = () => {
     if (broken) throw broken;
+  };
+  const query = async (text: string, params?: unknown[]) => {
+    ensureLive();
     return client.query(text, params as unknown[]);
   };
   try {
@@ -348,7 +362,7 @@ export async function transaction<T>(db: HoopDb, work: (tx: SqlExecutor) => Prom
         const r = await query(text, params);
         return { rows: r.rows as R[] };
       },
-    });
+    }, ensureLive);
     await query("COMMIT");
     return result;
   } catch (error) {
@@ -368,16 +382,17 @@ export function searchTransaction(db: HoopDb): SearchIndexDeps["transact"] {
 
 /**
  * The pointer stage's scope lock: a guarded transaction (transaction() above) holding the scope's
- * advisory lock, waiting at most 30 s for it, while `work` runs.
+ * advisory lock, waiting at most 30 s for it, while `work` runs. `work` gets the transaction's
+ * `ensureLive` check and calls it before each write it makes under the lock.
  */
 export function scopeLock(db: HoopDb): ScopeLock {
   return (scope, work) =>
     transaction(
       db,
-      async (tx) => {
+      async (tx, ensureLive) => {
         await tx.query("SET LOCAL lock_timeout = '30s'");
         await tx.query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))", [scopeLockKey(scope)]);
-        return work();
+        return work(ensureLive);
       },
       true,
     );

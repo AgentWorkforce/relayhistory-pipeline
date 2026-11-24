@@ -93,7 +93,12 @@ import {
 } from "./search-index-stream.ts";
 import { ACCEPTANCE_MISSING, contenderSeatsOfRecords, type ContenderSeats } from "./contender-seats.ts";
 
-export type Transact = <T>(work: (tx: SqlExecutor) => Promise<T>) => Promise<T>;
+/**
+ * One transaction on one connection. `ensureLive`, when given (lambda.ts transaction()), throws
+ * once that connection reported an error, which also frees the advisory lock it took, and is a
+ * no-op otherwise; it sends no statement.
+ */
+export type Transact = <T>(work: (tx: SqlExecutor, ensureLive?: () => void) => Promise<T>) => Promise<T>;
 
 export interface SearchIndexDeps {
   /** One Supabase transaction on one connection (for the advisory lock). */
@@ -904,7 +909,10 @@ async function overBoundBeforeRead(
 export async function indexSearchScope(scope: SessionScope, deps: SearchIndexDeps): Promise<SearchIndexResult> {
   const limits = { ...DEFAULT_LIMITS, ...deps.limits };
   const now = deps.now ?? (() => new Date());
-  return deps.transact(async (tx) => {
+  // The unstreamed pass makes its ClickHouse writes with no statement on `tx` in between, so it
+  // calls ensureLive() before each (a dropped lock connection has freed the search lock). The
+  // streamed pass checks with its keepalive statement instead (streamedReconcile).
+  return deps.transact(async (tx, ensureLive = () => {}) => {
     // Non-blocking: a pass already running for this session is busy for as long
     // as its ClickHouse work takes. The caller re-enqueues this event with a
     // delay instead of waiting (and timing out into the DLQ behind a hot session).
@@ -989,6 +997,7 @@ export async function indexSearchScope(scope: SessionScope, deps: SearchIndexDep
     if (s3.partial) {
       // Not indexed from S3 and never treated as current: the state row says the
       // session owes a full pass (needs_full = 1), and nothing else is written.
+      ensureLive();
       await recordState(deps.ch, scope, s3.revision, 0, false, at);
       return settle({ manifests: s3.manifests, rows: 0, inserted: 0, deleted: 0, complete: false, partial: true, reasons: s3.reasons });
     }
@@ -1003,8 +1012,10 @@ export async function indexSearchScope(scope: SessionScope, deps: SearchIndexDep
       const same = existing.get(keyOf({ machineId: r.machine_id, source: r.source, kind: r.kind, eventId: r.event_id })) ?? [];
       return !same.some((c) => c.workspaceId === r.workspace_id && c.tsMs === tsMs && c.fingerprint === r.fingerprint);
     });
-    for (let i = 0; i < toInsert.length; i += limits.insertBatch)
+    for (let i = 0; i < toInsert.length; i += limits.insertBatch) {
+      ensureLive();
       await deps.ch.insert(EVENTS_TABLE, toInsert.slice(i, i + limits.insertBatch), { timeoutMs: 60_000 });
+    }
 
     const deletes: PendingDelete[] = [];
     const complete = s3.complete && !truncated;
@@ -1023,6 +1034,7 @@ export async function indexSearchScope(scope: SessionScope, deps: SearchIndexDep
             deletes.push({ orgId: scope.orgId, sessionId: scope.sessionId, identity: c } as PendingDelete);
         }
       }
+      ensureLive();
       await deleteRows(deps.ch, deletes);
     }
     // Catalog dimensions are authoritative only after every live manifest and raw
@@ -1040,6 +1052,7 @@ export async function indexSearchScope(scope: SessionScope, deps: SearchIndexDep
         s3.catalog,
       );
     // Only a complete pass makes the session current; any other leaves it owing one.
+    ensureLive();
     await recordState(deps.ch, scope, s3.revision, inWindow.length, complete, at);
     const result: SearchIndexResult = {
       manifests: s3.manifests,

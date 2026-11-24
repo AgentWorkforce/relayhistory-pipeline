@@ -126,5 +126,35 @@ with the error (destroyed, not returned to the pool). The listener is removed be
 
 With no `'error'` emitted the guarded mode sends the same statements and releases the client
 the same way (`release()`); the only difference is one listener on the client while it is
-checked out. If a connection drops after the pointer work has written, the work stays written
-and the key is redelivered; the pointer stage is idempotent under the revision fence.
+checked out.
+
+Writes made while the lock may be gone. The pointer stage takes its lock because the revision
+fence alone is not enough: a put whose read raced an erasure could upsert after the delete's
+tombstone and bring the row back (`upsert_session_index` lets a newer revision undelete; see
+the header of `src/session-pipeline/pointer.ts`). An advisory lock lives on its connection, so
+when that connection drops the lock is freed, and another invocation can take it while this one
+still runs. The pointer work writes on other connections and the unstreamed search pass writes
+to ClickHouse, so without a check the drop would be noticed only at the next statement on the
+lock's own client, after those writes. `transaction()` therefore hands its work a synchronous check (`ensureLive`)
+that throws the recorded error once one was emitted and sends no statement. The pointer work
+calls it immediately before each write it makes under the lock (each pointer upsert and the
+re-key delete of a moved session), and the unstreamed pass calls it before each ClickHouse
+insert batch, before `deleteRows` and before writing its state row (complete or owing a pass).
+Once an error was emitted, that write is not made and the key or scope fails with the error.
+The streamed pass is unchanged: its keepalive and forced lock check are statements on the lock's
+client.
+
+What the check does not cover:
+
+- a write already in flight when the error is emitted, and the statements inside one pointer
+  upsert (`upsertRawPointer` sends several; the check runs once before the first);
+- a drop that pg has not reported yet: the client emits nothing until it next uses the
+  connection. The streamed pass forces a round trip with its keepalive; the unstreamed pass has
+  no such statement between its ClickHouse writes, so such a drop is seen only at its next
+  statement on the lock's client (the catalog write of a complete pass, or `COMMIT`);
+- the delete batches inside one `deleteRows` call, which are not checked one by one.
+
+In these cases the key or scope still fails (at the latest at `COMMIT`) and its messages are
+redelivered, and the next delivery re-reads S3 under a fresh lock and writes from that state.
+That repair does not happen if the message reaches the dead-letter queue first, and it does not
+undo what a reader already took from the intermediate row.
