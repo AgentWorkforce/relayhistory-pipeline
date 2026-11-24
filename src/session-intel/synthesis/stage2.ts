@@ -3,7 +3,8 @@
  * themes and improvement hypotheses over ONE workspace synthesis.
  *
  * Input is only a projection of the Stage 1 document (enums, counts, session aliases) and, for the analyzed
- * sessions, their scrubbed F1 intent, decision, blocker and outcome titles (claim texts cut to 280 characters). No
+ * sessions, their F1 intent, decision, blocker and outcome titles (claim texts cut to 280 characters), each sent only
+ * when relayscrubber's scrubText leaves it unchanged (a title the scrubber would change is withheld and counted). No
  * transcript, evidence summary, issue key, path, org, workspace, source or session id is sent: sessions appear only
  * as aliases `s1`, `s2`, ... and the alias map stays local.
  *
@@ -16,6 +17,7 @@
  * Pure apart from the injected transport, ledger and clock: no environment, no network, no SDK.
  */
 import type { ModelTransportResponse } from "../../session-analysis/engine/model.ts";
+import { scrubText } from "../../shared/vendor.ts";
 import {
   analyzedSessions, capText, SESSION_ID, SOURCE_ID, SYNTHESIS_BOUNDS,
   type AnalyzedSession, type SessionRef, type SynthesisOptions, type WorkspaceSynthesis,
@@ -107,6 +109,8 @@ export interface Stage2 {
   truncatedSessions: number;
   /** The kept sessions, in (source, sessionId) order (alias order). A partial v2 when truncatedSessions > 0. */
   sessions: SessionRef[];
+  /** Titles of the kept sessions left out of the prompt because scrubText would change them (policy: withhold, never redact). */
+  titlesWithheldByScrub: number;
   basis: "model";
 }
 /** The Stage 1 document unchanged except `contract`, plus `stage2` (or null) and `stage2Reason` (null when present). */
@@ -207,12 +211,28 @@ export interface BuiltStage2Prompt {
   schema: Record<string, unknown>;
   /** alias -> session; local only, never sent. */
   aliases: Map<string, SessionRef>;
-  /** alias -> the title refs that session has in the prompt. */
+  /** alias -> the title refs that session has in the prompt (only titles actually sent). */
   titleRefs: Map<string, Set<string>>;
+  /** Titles of the kept sessions withheld because the scrubber would change them. */
+  titlesWithheldByScrub: number;
 }
 
-/** The session's prompt titles: the first STAGE2_BOUNDS.titlesPerKind of each kind, each cut to 280 characters. */
-export function sessionTitles(a: AnalyzedSession): Array<[string, string]> {
+/** True when the scrubber leaves `text` exactly as it is (and does not refuse it): the check decision-records.ts makes. */
+function scrubClean(text: string): boolean {
+  try {
+    return scrubText(text) === text;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * The session's prompt titles: the first STAGE2_BOUNDS.titlesPerKind of each kind, each cut to 280 characters.
+ * Scrub policy (Khaliq's decision, 2026-11-24): a title is WITHHELD, never redacted, when relayscrubber's scrubText
+ * would change either the whole claim text or its 280-character cut (or refuses it), as decision-records.ts does; a
+ * redacted fragment is never sent. A withheld title's ref is not reused, so a reply citing it is a title_mismatch.
+ */
+export function sessionTitlesScrubbed(a: AnalyzedSession): { titles: Array<[string, string]>; withheldByScrub: number } {
   const u = a.result.analysis.understanding;
   const texts: Record<(typeof TITLE_KINDS)[number][1], string[]> = {
     intents: u.intents.map((c) => c.text),
@@ -221,13 +241,22 @@ export function sessionTitles(a: AnalyzedSession): Array<[string, string]> {
     outcomes: u.outcomes.map((o) => o.assessment.text),
   };
   const out: Array<[string, string]> = [];
+  let withheldByScrub = 0;
   for (const [letter, field] of TITLE_KINDS)
     texts[field].slice(0, STAGE2_BOUNDS.titlesPerKind).forEach((t, i) => {
       const text = capText(t, STAGE2_BOUNDS.titleTextChars).text;
       // A title with a Unicode format character (zero-width, bidi override, BOM) is left out; its ref is not reused.
-      if (!FORMAT.test(text)) out.push([`${letter}${i + 1}`, text]);
+      if (FORMAT.test(text)) return;
+      // A title the scrubber would change is withheld and counted; its ref is not reused.
+      if (!scrubClean(t) || !scrubClean(text)) { withheldByScrub++; return; }
+      out.push([`${letter}${i + 1}`, text]);
     });
-  return out;
+  return { titles: out, withheldByScrub };
+}
+
+/** The titles sent for the session (see sessionTitlesScrubbed). */
+export function sessionTitles(a: AnalyzedSession): Array<[string, string]> {
+  return sessionTitlesScrubbed(a).titles;
 }
 
 const s = (maxLength?: number) => ({ type: "string", minLength: 1, ...(maxLength ? { maxLength } : {}) });
@@ -269,12 +298,14 @@ export function buildStage2Prompt(v1: WorkspaceSynthesis, kept: readonly Analyze
   const aliasesMap = new Map<string, SessionRef>();
   const byKey = new Map<string, string>();
   const titleRefs = new Map<string, Set<string>>();
+  let titlesWithheldByScrub = 0;
   const rows = sessions.map((a, i) => {
     const alias = `s${i + 1}`;
     const ref = { source: a.source, sessionId: a.sessionId };
     aliasesMap.set(alias, ref);
     byKey.set(`${a.source}\u0000${a.sessionId}`, alias);
-    const titles = sessionTitles(a);
+    const { titles, withheldByScrub } = sessionTitlesScrubbed(a);
+    titlesWithheldByScrub += withheldByScrub;
     titleRefs.set(alias, new Set(titles.map(([r]) => r)));
     return { alias, sessionType: a.result.analysis.understanding.sessionType.value, titles: Object.fromEntries(titles) };
   });
@@ -294,7 +325,7 @@ export function buildStage2Prompt(v1: WorkspaceSynthesis, kept: readonly Analyze
     },
     sessions: rows,
   };
-  return { instructions: STAGE2_INSTRUCTIONS, input: JSON.stringify(data), schema: STAGE2_REPLY_SCHEMA, aliases: aliasesMap, titleRefs };
+  return { instructions: STAGE2_INSTRUCTIONS, input: JSON.stringify(data), schema: STAGE2_REPLY_SCHEMA, aliases: aliasesMap, titleRefs, titlesWithheldByScrub };
 }
 
 /**
@@ -598,7 +629,8 @@ export async function runStage2(input: {
   const stage2: Stage2 = {
     model: respondedModel, promptVersion: STAGE2_PROMPT_VERSION, usage,
     initiatives: parsed.initiatives, themes: parsed.themes, hypotheses: parsed.hypotheses, dropped: parsed.dropped,
-    keptSessions: kept.length, truncatedSessions: all.length - kept.length, sessions: kept, basis: "model",
+    keptSessions: kept.length, truncatedSessions: all.length - kept.length, sessions: kept,
+    titlesWithheldByScrub: prompt.titlesWithheldByScrub, basis: "model",
   };
   return { ...ran, document: toV2(v1, stage2, null), refusal: null, modelMismatch: false };
 }
@@ -648,7 +680,7 @@ export function validateStoredStage2(value: unknown, analyzed: ReadonlySet<strin
   };
 
   if (analyzed.size !== analyzedCount) fail("analyzed set != analyzed count");
-  const s2 = exact(value, ["model", "promptVersion", "usage", "initiatives", "themes", "hypotheses", "dropped", "keptSessions", "truncatedSessions", "sessions", "basis"], "stage2");
+  const s2 = exact(value, ["model", "promptVersion", "usage", "initiatives", "themes", "hypotheses", "dropped", "keptSessions", "truncatedSessions", "sessions", "titlesWithheldByScrub", "basis"], "stage2");
   if (typeof s2.model !== "string" || !STAGE2_APPROVED_MODELS.includes(s2.model)) fail("model");
   if (s2.promptVersion !== STAGE2_PROMPT_VERSION) fail("promptVersion");
   if (s2.basis !== "model") fail("basis");
@@ -665,6 +697,8 @@ export function validateStoredStage2(value: unknown, analyzed: ReadonlySet<strin
     if (i > 0 && !(k(sessions[i - 1]!) < k(r))) fail("sessions: order");
     kept.add(k(r));
   });
+  // At most titlesPerKind of each of the four kinds per kept session can be withheld.
+  count(s2.titlesWithheldByScrub, "titlesWithheldByScrub", keptCount * STAGE2_BOUNDS.titlesPerKind * TITLE_KINDS.length);
   const dropped = exact(s2.dropped, ["initiatives", "themes", "hypotheses", "byReason"], "dropped");
   for (const x of ["initiatives", "themes", "hypotheses"]) count(dropped[x], `dropped.${x}`);
   const byReason = exact(dropped.byReason, DROP_REASONS, "dropped.byReason");

@@ -357,6 +357,15 @@ The prompt has two parts: fixed instructions (`STAGE2_INSTRUCTIONS`) and one JSO
   order). A title containing a Unicode format character (category Cf: zero-width characters, bidi controls such as
   U+202E, U+FEFF and the rest) is left out, and its ref is not reused.
 
+**Titles are scrubbed before the call** (Khaliq's decision, 2026-11-24). Every title goes through relayscrubber's
+`scrubText` (the binding in `src/shared/vendor.ts`, the same check `decision-records.ts` makes; no scrub logic here).
+The policy is to **withhold, never redact**: a title is left out when `scrubText` would change the whole claim text or
+its 280-character cut, or refuses it, so a secret past the cut still withholds the title. A redacted fragment is never
+sent, so the model never sees a `[REDACTED]` marker it might over-interpret. A withheld title's ref is not reused, the
+title-ref map holds only the titles actually sent, and a reply citing a withheld ref is dropped as `title_mismatch`.
+`stage2.titlesWithheldByScrub` counts the withheld titles of the kept sessions. Clean titles are sent unchanged, so
+the prompt over scrub-clean titles is byte for byte what it was.
+
 Aliases are `s1`, `s2`, ... in `(source, sessionId)` order over the kept sessions; the alias map stays in the
 process. **Never sent:** session ids, sources, the workspace, the org, repos and projects, issue keys (paths and
 commands), issue texts, evidence summaries and details, descriptions, the overall outcome, the window, freshness and
@@ -419,6 +428,7 @@ stage2: { model, promptVersion: "workspace-synthesis-stage2/1", usage: {inputTok
           dropped: {initiatives, themes, hypotheses, byReason: {over_limit, invalid_shape, unknown_key, over_length,
                     duplicate, foreign_alias, missing_citation, title_mismatch, bad_basis}},
           keptSessions, truncatedSessions, sessions: [{source, sessionId}],
+          titlesWithheldByScrub,
           basis: "model" } | null
 stage2Reason: null | "budget_exhausted" | "cap_exceeded" | "transport_failed" | "invalid_reply" | "disabled"
               | "insufficient_sessions"
@@ -510,7 +520,7 @@ among the kept sessions and the kept ones among the Stage 1 ANALYZED sessions (t
 checked against the v1 artifact: as many as `inputs.analyzed`, sorted, each among `considered`, covering every
 drilldown session and equal to their union when no drilldown was cut; a considered-but-skipped session is never a
 kept one), each named session cited, the item, length
-and usage bounds (usage within the per-run caps), ids and bases consistent, and the Stage 1 part equal to the v1
+and usage bounds (usage within the per-run caps, `titlesWithheldByScrub` a count of at most 12 per kept session), ids and bases consistent, and the Stage 1 part equal to the v1
 document byte for byte. Any failure is a typed `SynthesisArtifactError`: `synthesis_cross_tenant`,
 `synthesis_stage2_digest`, `synthesis_stage2_stage1_mismatch` or `synthesis_stage2_invalid` (never a raw
 `TypeError`), with an additive `detail` naming the rule that failed (diagnostic only; the read route serves `code`). The reader cannot re-check that a title ref is that session's actual title (that needs the cohort); the
@@ -595,14 +605,16 @@ A real run needs, each separately gated by Khaliq:
   will run it takes the key from 1Password at runtime (`op run`), never from disk; which process, and its key, are
   a deploy and credential step.
 - **The durable ledger** above.
-- **Scrub posture of the titles.** F1 titles are model-written text derived from transcripts. The F1 input is the
+- **Scrub posture of the titles: resolved** by Khaliq's decision of 2026-11-24 (titles must be scrubbed before they
+  enter the Stage 2 prompt), implemented as the withhold policy in [Inputs](#inputs-and-what-is-never-sent). The
+  background: F1 titles are model-written text derived from transcripts. The F1 input is the
   scrubbed canonical raw: the canonical read refuses an unscrubbed manifest (`manifest_unscrubbed`,
   `src/session-read-api/canonical-transcript.ts`, quarantined by `src/session-analysis/processor.ts`
   `classifyAnalysisFailure`). The F1 output, the claim texts Stage 2 sends as titles, is **not** passed through the
   scrubber again: `src/session-analysis/processor.ts`, `store.ts`, `results.ts` and `engine/` call no `scrubText`
   or `scrubJson` (only `decision-records.ts` checks its own texts with `scrubText`). Stage 2 sends those titles to the
-  model provider in a second call. Whether to require scrub-clean titles (as `decision-records.ts` does) before the
-  call is Khaliq's open decision, made before a real run; any such check uses relayscrubber, with no scrub logic here.
+  model provider in a second call, so it now checks each one with relayscrubber's `scrubText` first and withholds any
+  title the scrubber would change (`stage2.titlesWithheldByScrub`).
 - **Erase posture.** The job reads the cohort, then calls. A session erased or fenced after the cohort read still has
   its titles sent in that run, and the v2 artifact stays until the workspace directory is erased (the per-user
   erase). The job has no `Liveness` interface today (it is the read API's, `src/session-read-api/page.ts`), so the

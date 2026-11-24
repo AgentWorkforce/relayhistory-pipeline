@@ -8,6 +8,7 @@ import {
   type BudgetLedger, type Stage2Deps, type Stage2ModelRequest, type Stage2ModelTransport, type Stage2Timer,
 } from "../synthesis/stage2.ts";
 import type { ModelTransportResponse } from "../../session-analysis/engine/model.ts";
+import { scrubText } from "../../shared/vendor.ts";
 
 const FIXTURE_DIR = new URL("./fixtures/synthesis/", import.meta.url);
 const cohortText = readFileSync(new URL("cohort.json", FIXTURE_DIR), "utf8");
@@ -160,6 +161,92 @@ describe("the prompt", () => {
   test("the estimate is ceil(ascii/3) + one per other code point + the overhead", () => {
     expect(estimateInputTokens({ instructions: "abcd", input: "e", schema: {} })).toBe(Math.ceil(7 / 3) + 1_024);
     expect(estimateInputTokens({ instructions: "", input: "一二", schema: {} })).toBe(1 + 2 + 1_024);
+  });
+});
+
+describe("the title scrub (policy: withhold a title the scrubber would change; Khaliq's decision, 2026-11-24)", () => {
+  // The vendor scrubber tests' own fixtures (packages/pipeline/test/scrub-bindgen-pin-alpha10.test.ts, scrub-bindgen-faults.test.ts).
+  const GHP = "token=ghp_abcdefghijklmnopqrstuvwxyz0123456789";
+  const AKIA = "AKIAIOSFODNN7EXAMPLE";
+  const withSecrets = () => {
+    const c = cohort();
+    const s01 = c.sessions.find((x) => x.sessionId === "fx-s01")!;
+    s01.result.analysis.understanding.intents[0].text = `Rotate the deploy key ${GHP} after the move.`;
+    const s3 = c.sessions.find((x) => x.sessionId === "fx-s06")!; // alias s3
+    // A secret beyond the 280-character cut still withholds the title: the whole claim text must be clean too.
+    s3.result.analysis.understanding.blockers[0].text = `${"Plain words here. ".repeat(20)}key ${AKIA}`;
+    return c;
+  };
+  const NEEDLES = ["ghp_", AKIA, "REDACTED"];
+
+  test("a title holding a secret-like token is not in the prompt, is counted, and its ref is gone", () => {
+    for (const t of [`Rotate the deploy key ${GHP} after the move.`, `${"Plain words here. ".repeat(20)}key ${AKIA}`]) expect(scrubText(t)).not.toBe(t);
+    const p = prompt(withSecrets());
+    for (const n of NEEDLES) expect(p.input.includes(n)).toBe(false);
+    const data = JSON.parse(p.input);
+    expect(data.sessions[0].titles).toEqual({ o1: "Fixture assessment: the outcome is blocked." });
+    expect(data.sessions[2].titles).toEqual({ i1: "Fixture intent of the session.", o1: "Fixture assessment: the outcome is blocked." });
+    expect(p.titleRefs.get("s1")).toEqual(new Set(["o1"]));
+    expect(p.titleRefs.get("s3")).toEqual(new Set(["i1", "o1"]));
+    expect(p.titlesWithheldByScrub).toBe(2);
+    expect(prompt().titlesWithheldByScrub).toBe(0);
+  });
+
+  test("clean titles are unaffected: every other title and session row is byte-identical", () => {
+    const base = JSON.parse(prompt().input), scrubbed = JSON.parse(prompt(withSecrets()).input);
+    expect(scrubbed.stage1).toEqual(base.stage1);
+    expect(scrubbed.sessions.length).toBe(base.sessions.length);
+    scrubbed.sessions.forEach((row: any, i: number) => {
+      const want = { ...base.sessions[i], titles: { ...base.sessions[i].titles } };
+      if (i === 0) delete want.titles.i1;
+      if (i === 2) delete want.titles.b1;
+      expect(row).toEqual(want);
+    });
+    // The fixture's titles are all clean: the golden prompt is unchanged.
+    expect(`${JSON.stringify(base, null, 2)}\n`).toBe(readFileSync(new URL("expected-stage2-input.json", FIXTURE_DIR), "utf8"));
+  });
+
+  test("a reply citing a withheld title's ref is dropped as title_mismatch", () => {
+    const p = prompt(withSecrets());
+    const parsed = parseStage2Reply(JSON.stringify({
+      initiatives: [{ title: "t", goal: "g", sessions: ["s1", "s2"], evidence: [{ alias: "s1", titleRef: "i1" }, { alias: "s2", titleRef: "i1" }] }],
+      themes: [{ title: "t", kind: "workflow", sessions: ["s3", "s2"], evidence: [{ alias: "s3", titleRef: "b1" }, { alias: "s2", titleRef: "i1" }] }],
+      hypotheses: [],
+    }), p);
+    expect(parsed.ok && [parsed.initiatives.length, parsed.themes.length, parsed.dropped.byReason.title_mismatch]).toEqual([0, 0, 2]);
+    // The same item citing a title that was sent survives.
+    const ok = parseStage2Reply(JSON.stringify({ initiatives: [{ title: "t", goal: "g", sessions: ["s1", "s2"], evidence: [{ alias: "s1", titleRef: "o1" }, { alias: "s2", titleRef: "i1" }] }], themes: [], hypotheses: [] }), p);
+    expect(ok.ok && ok.initiatives.length).toBe(1);
+  });
+
+  test("the prompt stays deterministic with withheld titles", () => {
+    const p0 = prompt(withSecrets());
+    for (const seed of [1, 7, 42]) {
+      const c = withSecrets();
+      c.sessions = shuffled(c.sessions, seed);
+      const p = prompt(c);
+      expect([p.input, p.titlesWithheldByScrub]).toEqual([p0.input, 2]);
+    }
+  });
+
+  test("runStage2 records the count in stage2.titlesWithheldByScrub, never sends the secret, and the stored check holds", async () => {
+    const c = withSecrets();
+    const { transport, calls } = fakeTransport();
+    const r = await run({ transport }, c);
+    expect(calls).toHaveLength(1);
+    for (const n of NEEDLES) expect(calls[0]!.input.includes(n)).toBe(false);
+    const s2 = r.document.stage2!;
+    expect(s2.titlesWithheldByScrub).toBe(2);
+    for (const n of NEEDLES) expect(synthesisV2Json(r.document).includes(n)).toBe(false);
+    const analyzed = new Set(analyzedSessions(c, OPTS).map((a) => `${a.source}\u0000${a.sessionId}`));
+    expect(() => validateStoredStage2(s2, analyzed, 40)).not.toThrow();
+    const bound = s2.keptSessions * 3 * 4;
+    for (const [bad, where] of [[-1, "titlesWithheldByScrub"], [1.5, "titlesWithheldByScrub"], ["2", "titlesWithheldByScrub"], [bound + 1, "titlesWithheldByScrub"], [undefined, "stage2: keys"]] as const) {
+      const x: Record<string, unknown> = structuredClone(s2);
+      if (bad === undefined) delete x.titlesWithheldByScrub; else x.titlesWithheldByScrub = bad;
+      expect(() => validateStoredStage2(x, analyzed, 40)).toThrow(where);
+    }
+    expect(() => validateStoredStage2({ ...structuredClone(s2), titlesWithheldByScrub: bound }, analyzed, 40)).not.toThrow();
   });
 });
 

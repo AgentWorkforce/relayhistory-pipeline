@@ -965,6 +965,7 @@
         "sessionId": "fx-s40"
       }
     ],
+    "titlesWithheldByScrub": 0,
     "basis": "model"
   },
   "stage2Reason": null
