@@ -84,10 +84,33 @@ type LedgerFunction =
   | "ingest_turn_capability"
   | "ingest_turn_register";
 
-async function call(run: SqlRun, fn: LedgerFunction | OriginScopedFunction, input: unknown): Promise<unknown> {
+/**
+ * INGEST_BUFFER_COMMIT_LOCK_WAIT_MS bounds (ms): the buffered commit's own lock wait, strictly longer than the
+ * role's lock_timeout (2 s) and at least 1 s below its statement_timeout (5 s), both in
+ * supabase/bootstrap/session_ingest_role.sql. The headroom leaves room for parse, plan and the commit's work
+ * before and after the wait, so ONE wait that starts early in the statement ends 55P03 (ledger_lock_timeout),
+ * not 57014 (ledger_timeout). docs/design/buffer-commit-lock-wait.md.
+ */
+export const BUFFER_COMMIT_LOCK_WAIT_MS_MIN = 2001;
+export const BUFFER_COMMIT_LOCK_WAIT_MS_MAX = 4000;
+/**
+ * The buffered commit with its own lock wait, still ONE autocommit statement (no BEGIN, no extra round trip):
+ * the transaction-local set_config is the CASE condition that produces the function's only argument, so it is
+ * evaluated before the function runs on every execution (a data dependency the planner can neither drop nor
+ * reorder; set_config is volatile, so it is never folded). set_config(..., true) is SET LOCAL: it ends with the
+ * statement's implicit transaction, committed or rolled back, and never reaches the next use of the connection.
+ * $2 is `<ms>ms`. set_config never returns NULL here, so the argument is always $1.
+ */
+export const bufferCommitLockWaitSql = (fn: string): string =>
+  `SELECT sessions.${fn}(CASE WHEN set_config('lock_timeout', $2, true) IS NOT NULL THEN $1::jsonb END) AS result`;
+
+/** `lockWaitMs` (buffered commit only, validated by sqlLedger): absent sends exactly the plain one-parameter statement. */
+async function call(run: SqlRun, fn: LedgerFunction | OriginScopedFunction, input: unknown, lockWaitMs?: number): Promise<unknown> {
   let rows: Record<string, unknown>[];
   try {
-    ({ rows } = await run(`SELECT sessions.${fn}($1::jsonb) AS result`, [JSON.stringify(input)]));
+    ({ rows } = lockWaitMs === undefined
+      ? await run(`SELECT sessions.${fn}($1::jsonb) AS result`, [JSON.stringify(input)])
+      : await run(bufferCommitLockWaitSql(fn), [JSON.stringify(input), `${lockWaitMs}ms`]));
   } catch (error) {
     // One guarded snapshot for every consumer: a throwing getter/proxy cannot escape this path.
     const s = dbErrorSnapshot(error);
@@ -296,7 +319,12 @@ export function sqlLedger(run: SqlRun, options: { acceptanceMode?: IngestAccepta
   /** INGEST_CLAIM_LOCK_WAIT_MS: each claim attempt waits at most this long for a lock (25..2000 ms). Absent: the role's lock_timeout, unchanged. */
   claimLockWaitMs?: number;
   /** INGEST_ORIGIN_CLAIM_FENCE=on: buffered claim/stage/commit through the 062010 origin-scoped entry points. Absent: per-user, unchanged. */
-  originClaimFence?: boolean } = {}): Ledger {
+  originClaimFence?: boolean;
+  /** INGEST_BUFFER_COMMIT_LOCK_WAIT_MS (buffered only, 2001..4000 ms): the buffered commit (and only it) waits at most this long for each
+   *  lock, inside its one statement (bufferCommitLockWaitSql). Absent: the role's lock_timeout, the statement byte-identical. */
+  bufferCommitLockWaitMs?: number } = {}): Ledger {
+  if(options.bufferCommitLockWaitMs!==undefined&&(!Number.isSafeInteger(options.bufferCommitLockWaitMs)||options.bufferCommitLockWaitMs<BUFFER_COMMIT_LOCK_WAIT_MS_MIN||options.bufferCommitLockWaitMs>BUFFER_COMMIT_LOCK_WAIT_MS_MAX||options.acceptanceMode!=="buffered"))throw new LedgerUnavailableError("ledger_buffer_commit_lock_wait_invalid");
+  const bufferCommitLockWaitMs=options.bufferCommitLockWaitMs;
   if(options.claimLockWaitMs!==undefined&&(!Number.isSafeInteger(options.claimLockWaitMs)||options.claimLockWaitMs<CLAIM_LOCK_WAIT_MS_MIN||options.claimLockWaitMs>CLAIM_LOCK_WAIT_MS_MAX))throw new LedgerUnavailableError("ledger_claim_lock_wait_invalid");
   const claimLockWaitMs=options.claimLockWaitMs;
   if(options.originClaimFence&&options.acceptanceMode!=="buffered")throw new LedgerUnavailableError("ledger_origin_fence_refused");
@@ -413,7 +441,7 @@ export function sqlLedger(run: SqlRun, options: { acceptanceMode?: IngestAccepta
     },
     async commitBuffered(input) {
       if (options.acceptanceMode !== "buffered") throw new LedgerUnavailableError("ledger_mode_refused");
-      const r = await originScoped(originFence,"ingest_commit_buffered_batch",(fn)=>call(run,fn,buffered(input,forClaim(input.claimToken)))) as Record<string,unknown>;
+      const r = await originScoped(originFence,"ingest_commit_buffered_batch",(fn)=>call(run,fn,buffered(input,forClaim(input.claimToken)),bufferCommitLockWaitMs)) as Record<string,unknown>;
       if (r.kind === "intent_invalid") throw new LedgerUnavailableError("ledger_stage_invalidated");
       if (r.kind !== "committed") throw new LedgerUnavailableError("ledger_bad_result");
       if(r.custodyAck!==undefined){try{return validatedCustodyAck(r.custodyAck)}catch{throw new LedgerUnavailableError("ledger_custody_ack_refused")}}

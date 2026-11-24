@@ -56,6 +56,11 @@ import {validatedCustodyAck} from "./custody-ack.ts";
  * the 5 s statement_timeout (past that it is a 57014, never retried). The retry adds at most 250 ms + 5 s
  * = 5.25 s per stage (a stage worst case of about 10.25 s); a request where both buffer stages retry adds
  * at most about 10.5 s, and holds its Hyperdrive connection for that long.
+ * INGEST_BUFFER_COMMIT_LOCK_WAIT_MS (default unset; ledger-sql.ts bufferCommitLockWaitSql) raises only the
+ * `buffer_receipt` commit's per-lock wait to 2001..4000 ms inside the same one statement. The 5 s
+ * statement_timeout is unchanged and still bounds each attempt, so the bounds above hold; a failed attempt
+ * holds its connection up to the configured wait instead of 2 s, and a wait that reaches the statement budget
+ * ends 57014 (`ledger_timeout`), which this stage neither retries nor converts.
  */
 import { log } from "../shared/log.ts";
 import type { Ledger, LedgerTenant, RevisionConflict, SlotRequest } from "./ledger.ts";

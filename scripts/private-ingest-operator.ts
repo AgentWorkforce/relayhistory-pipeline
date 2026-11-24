@@ -896,6 +896,22 @@ export function bufferLockBusyDeletionAllowed(
     proposedEnv?.INGEST_BUFFER_LOCK_BUSY === undefined &&
     live === "on";
 }
+/**
+ * The only plan that may unbind INGEST_BUFFER_COMMIT_LOCK_WAIT_MS (rollback to the role's lock_timeout): the
+ * candidate profile omits bufferCommitLockWaitMs, no value is proposed, and the live value is exactly four digits
+ * within 2001..4000 (strict, no trim, as the private-ingest release guard reads it in private-ingest-release.ts).
+ * Any other live value (out of range, spaced, signed, a unit, not a string) refuses.
+ */
+export function bufferCommitLockWaitDeletionAllowed(
+  sessionIngest: CloudflareStageInputs["sessionIngest"],
+  currentEnv: Record<string, unknown> | undefined,
+  proposedEnv: Record<string, unknown> | undefined,
+): boolean {
+  const live = currentEnv?.INGEST_BUFFER_COMMIT_LOCK_WAIT_MS;
+  return sessionIngest.bufferCommitLockWaitMs === undefined &&
+    proposedEnv?.INGEST_BUFFER_COMMIT_LOCK_WAIT_MS === undefined &&
+    typeof live === "string" && /^[1-9][0-9]{3}$/u.test(live) && Number(live) >= 2001 && Number(live) <= 4000;
+}
 export function assertOperatorSnapshot(
   snapshot: any,
   input: CloudflareStageInputs,
@@ -1061,6 +1077,11 @@ export function assertOperatorSnapshot(
             if (!bufferLockBusyDeletionAllowed(input.sessionIngest, currentEnv, proposedEnv))
               refuse("native_binding_target");
             deletedValue = currentEnv.INGEST_BUFFER_LOCK_BUSY;
+          } else if (b.sid === "INGEST_BUFFER_COMMIT_LOCK_WAIT_MS") {
+            // Rolling the buffered commit lock wait back to the role default: only a strict, in-range live value.
+            if (!bufferCommitLockWaitDeletionAllowed(input.sessionIngest, currentEnv, proposedEnv))
+              refuse("native_binding_target");
+            deletedValue = currentEnv.INGEST_BUFFER_COMMIT_LOCK_WAIT_MS;
           } else {
             refuse("native_binding_target");
           }

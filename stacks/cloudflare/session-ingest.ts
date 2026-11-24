@@ -207,6 +207,14 @@ export interface SessionIngestInputs {
    */
   claimLockWaitMs?: number;
   /**
+   * INGEST_BUFFER_COMMIT_LOCK_WAIT_MS: the buffered commit (buffer_receipt), and only it, sends its one autocommit
+   * statement with a transaction-local lock_timeout of this many ms (2001..4000) instead of the role's 2 s. The role's
+   * 5 s statement_timeout still caps the statement, so a wait that reaches it ends 57014, not 55P03
+   * (docs/design/buffer-commit-lock-wait.md). Buffered mode only. Present: the var only. Omit for the role default
+   * (no var rendered, vars byte-identical to before).
+   */
+  bufferCommitLockWaitMs?: number;
+  /**
    * INGEST_ADVERTISED_MAX_RECORDS: the records-per-batch limit the Worker ADVERTISES (GET /v1/delivery/limits and
    * receipts), an integer from 1 to 500. Acceptance stays 500, so already-persisted batches are never refused.
    * Omit for the default (500 advertised; nothing rendered).
@@ -285,7 +293,9 @@ const AUTHORITY_ENV_KEYS = [
   "INGEST_AUTHORITY_EXPECT_AUTH_EPOCH",
   "INGEST_AUTHORITY_EXPECT_SOURCE_IDENTITY",
 ] as const;
-const KEYS = ["custodySource", "privacyAuthority", "expectedGeneration", "overlapGeneration", "acceptanceMode", "accountId", "hyperdriveId", "secretsStoreId", "kmsKeyArn", "maxPerUser", "maxPerOrg", "inlineMaxSessions", "replicaMode", "neonReplicaQueue", "authority", "asyncAdmission", "syncAdmissionFrozenReceipt", "claimLockBusy", "claimTimeoutBusy", "bufferLockBusy", "bufferLockRetry", "inflightLease", "claimLockWaitMs", "advertisedMaxRecords", "originClaimFence", "turnFenceRegister", "neonExit", "uploadConsent", "s3FenceMirror", "httpAdmissionStoppedOrgs"];
+/** INGEST_BUFFER_COMMIT_LOCK_WAIT_MS bounds; the same numbers as src/session-ingest/ledger-sql.ts (a test pins them equal). */
+export const STACK_BUFFER_COMMIT_LOCK_WAIT_MS = Object.freeze({ min: 2001, max: 4000 });
+const KEYS = ["custodySource", "privacyAuthority", "expectedGeneration", "overlapGeneration", "acceptanceMode", "accountId", "hyperdriveId", "secretsStoreId", "kmsKeyArn", "maxPerUser", "maxPerOrg", "inlineMaxSessions", "replicaMode", "neonReplicaQueue", "authority", "asyncAdmission", "syncAdmissionFrozenReceipt", "claimLockBusy", "claimTimeoutBusy", "bufferLockBusy", "bufferLockRetry", "inflightLease", "claimLockWaitMs", "bufferCommitLockWaitMs", "advertisedMaxRecords", "originClaimFence", "turnFenceRegister", "neonExit", "uploadConsent", "s3FenceMirror", "httpAdmissionStoppedOrgs"];
 
 function validAuthorityKeyRoot(value: unknown): value is string {
   if (typeof value !== "string" || !/^96bulls\/[A-Za-z0-9][A-Za-z0-9_/-]{0,151}$/.test(value) || value.endsWith("/")) return false;
@@ -407,6 +417,9 @@ export function assertSessionIngestInputs(p: unknown, refuse: (why: string) => n
     refuse('sessionIngest.inflightLease must be "observe" or "on" (omit for off)');
   if (v.claimLockWaitMs !== undefined && (typeof v.claimLockWaitMs !== "number" || !Number.isSafeInteger(v.claimLockWaitMs) || v.claimLockWaitMs < 25 || v.claimLockWaitMs > 2000))
     refuse("sessionIngest.claimLockWaitMs must be an integer from 25 to 2000 (omit for the role default)");
+  if (v.bufferCommitLockWaitMs !== undefined && (typeof v.bufferCommitLockWaitMs !== "number" || !Number.isSafeInteger(v.bufferCommitLockWaitMs) ||
+      v.bufferCommitLockWaitMs < STACK_BUFFER_COMMIT_LOCK_WAIT_MS.min || v.bufferCommitLockWaitMs > STACK_BUFFER_COMMIT_LOCK_WAIT_MS.max || v.acceptanceMode !== "buffered"))
+    refuse(`sessionIngest.bufferCommitLockWaitMs must be an integer from ${STACK_BUFFER_COMMIT_LOCK_WAIT_MS.min} to ${STACK_BUFFER_COMMIT_LOCK_WAIT_MS.max}, in buffered mode only (omit for the role default)`);
   if (v.advertisedMaxRecords !== undefined && (typeof v.advertisedMaxRecords !== "number" || !Number.isSafeInteger(v.advertisedMaxRecords) || v.advertisedMaxRecords < 1 || v.advertisedMaxRecords > 500))
     refuse("sessionIngest.advertisedMaxRecords must be an integer from 1 to 500 (omit for the default 500)");
   if (v.originClaimFence !== undefined && (v.originClaimFence !== "on" || v.acceptanceMode !== "buffered"))
@@ -461,6 +474,7 @@ export function sessionIngestVars(p: SessionIngestInputs) {
     ...(p.bufferLockRetry === "on" ? { INGEST_BUFFER_LOCK_RETRY: "on" } : {}),
     ...(p.inflightLease === "observe" || p.inflightLease === "on" ? { INGEST_INFLIGHT_LEASE: p.inflightLease } : {}),
     ...(p.claimLockWaitMs !== undefined ? { INGEST_CLAIM_LOCK_WAIT_MS: String(p.claimLockWaitMs) } : {}),
+    ...(p.bufferCommitLockWaitMs !== undefined ? { INGEST_BUFFER_COMMIT_LOCK_WAIT_MS: String(p.bufferCommitLockWaitMs) } : {}),
     ...(p.advertisedMaxRecords !== undefined ? { INGEST_ADVERTISED_MAX_RECORDS: String(p.advertisedMaxRecords) } : {}),
     ...(p.originClaimFence === "on" ? { INGEST_ORIGIN_CLAIM_FENCE: "on" } : {}),
     ...(p.turnFenceRegister === "on" ? { INGEST_TURN_FENCE_REGISTER: "on" } : {}),

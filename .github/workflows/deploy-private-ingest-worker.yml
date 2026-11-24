@@ -91,6 +91,8 @@ jobs:
       # Buffer-stage lock controls (deliver.ts BufferLockBusy / bufferLedgerStage). Unset or empty = off.
       PRIVATE_INGEST_BUFFER_LOCK_BUSY: ${{ vars.PRIVATE_INGEST_BUFFER_LOCK_BUSY }}
       PRIVATE_INGEST_BUFFER_LOCK_RETRY: ${{ vars.PRIVATE_INGEST_BUFFER_LOCK_RETRY }}
+      # Buffered commit lock wait (ledger-sql.ts bufferCommitLockWaitSql): 2001..4000 ms. Unset or empty = role default.
+      PRIVATE_INGEST_BUFFER_COMMIT_LOCK_WAIT_MS: ${{ vars.PRIVATE_INGEST_BUFFER_COMMIT_LOCK_WAIT_MS }}
       # Per-isolate in-flight lease (inflight-lease.ts): observe or on. Unset or empty = off.
       PRIVATE_INGEST_INFLIGHT_LEASE: ${{ vars.PRIVATE_INGEST_INFLIGHT_LEASE }}
       # Per-origin claim fence (ledger-sql.ts originClaimFence, migration 20261105062010). Unset or empty = off.

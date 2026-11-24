@@ -225,6 +225,17 @@ unbind refuses `native_binding_target`.
   independent of `INGEST_BUFFER_LOCK_BUSY`: removing the BUSY var leaves a rendered RETRY var as it is, and a
   second failure then answers 503 again.
 
+- `INGEST_BUFFER_COMMIT_LOCK_WAIT_MS` (stack input `sessionIngest.bufferCommitLockWaitMs`, 2001..4000, buffered
+  only; `PRIVATE_INGEST_BUFFER_COMMIT_LOCK_WAIT_MS` four digits or unset/empty, anything else refuses
+  `private_ingest_profile_buffer_commit_lock_wait`): the `buffer_receipt` commit's own lock wait inside its one
+  statement. The 5 s `statement_timeout` still caps it, so a wait that reaches the budget ends 57014
+  (`ledger_timeout`: no retry, no 429) instead of 55P03. See `docs/design/buffer-commit-lock-wait.md`. Change:
+  set another value in range, plan, deploy, and the readback shows exactly that value. Rollback: unset (or empty)
+  the variable, then plan and deploy. The plan shows one `unbind`, which the operator
+  (`bufferCommitLockWaitDeletionAllowed`) admits only when the candidate omits the value, nothing is proposed,
+  the live value is exactly four digits in range and the deleted binding carries that exact text. It never
+  shares a plan with another unbind (below).
+
 The operator admits at most one unbind per plan (`native_binding_inventory`). Each supported unbind is its
 own plan, deploy and readback of the live Worker; a following unbind is planned only from the live state
 that deploy produced, never two in one plan.

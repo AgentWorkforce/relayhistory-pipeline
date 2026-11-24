@@ -378,6 +378,10 @@ those stages the same 429 `delivery_busy` as the claim flag, and
 `INGEST_BUFFER_LOCK_RETRY=on` re-issues that ledger call once after 50-250 ms.
 Both change only the error shape and the client's backoff; neither removes the
 underlying lock contention.
+`INGEST_BUFFER_COMMIT_LOCK_WAIT_MS` (hosted Worker only, default unset) is not
+read by the self-host server either: it lengthens the buffered commit's own lock
+wait, a stage self-host never runs
+(`docs/design/buffer-commit-lock-wait.md`).
 
 `INGEST_ADVERTISED_MAX_RECORDS` (hosted Worker only, default off) is not read by
 the self-host server, which keeps publishing `maxRecords` 500. On the Worker it

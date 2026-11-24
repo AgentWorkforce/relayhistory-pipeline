@@ -70,6 +70,14 @@
  *                              with INGEST_CLAIM_LOCK_BUSY the 429) instead of waiting the role's 2 s.
  *                              Same function, input and lock order; a free lock is unchanged. The
  *                              Cloudflare stack renders it only from sessionIngest.claimLockWaitMs
+ *   INGEST_BUFFER_COMMIT_LOCK_WAIT_MS  unset (default) | 2001..4000 (buffered acceptance only; exactly four digits,
+ *                              no sign, space, unit or fraction; an empty or any other value refuses the settings, so
+ *                              every request is 503 not_configured): the buffer_receipt commit, and only it, sends
+ *                              its one autocommit statement with a transaction-local lock_timeout of this many ms
+ *                              (ledger-sql.ts bufferCommitLockWaitSql) instead of the role's 2 s. The role's 5 s
+ *                              statement_timeout is unchanged and still caps the whole statement: a wait that reaches
+ *                              it ends 57014 (ledger_timeout), not 55P03. docs/design/buffer-commit-lock-wait.md.
+ *                              Rendered only from sessionIngest.bufferCommitLockWaitMs
  *   INGEST_ORIGIN_CLAIM_FENCE  unset/off (default) | on (any case; buffered acceptance only): the buffered claim,
  *                              stage prepare and commit call the 20261105062010 origin-scoped entry points
  *                              (ledger-sql.ts originClaimFence, docs/design/per-origin-claim-fence.md), so one
@@ -121,7 +129,7 @@ import { dbClientErrorFields } from "./db-error-class.ts";
 import { assertNoNeonEdge, neonExitProfile, NeonExitRefusal } from "../shared/neon-exit.ts";
 import { createIngestApp } from "./app.ts";
 import { httpAdmissionStoppedOrgs } from "./http-admission-stop.ts";
-import { CLAIM_LOCK_WAIT_MS_MAX, CLAIM_LOCK_WAIT_MS_MIN, sqlLedger } from "./ledger-sql.ts";
+import { BUFFER_COMMIT_LOCK_WAIT_MS_MAX, BUFFER_COMMIT_LOCK_WAIT_MS_MIN, CLAIM_LOCK_WAIT_MS_MAX, CLAIM_LOCK_WAIT_MS_MIN, sqlLedger } from "./ledger-sql.ts";
 import type { ReplicaMode, ReplicaSink, NeonReplicaMessage } from "./replica.ts";
 import { fanout, type FanoutMessage } from "./staging.ts";
 import type { StageLatencyFields } from "./deliver.ts";
@@ -212,6 +220,8 @@ export interface IngestWorkerEnv {
   INGEST_CLAIM_LOCK_WAIT_MS?: string;
   /** "on" (any case): buffered claim/stage/commit through the 062010 origin-scoped entry points. Default off. */
   INGEST_ORIGIN_CLAIM_FENCE?: string;
+  /** 2001..4000 ms, four digits exactly, buffered only: the buffered commit's own lock wait (ledger-sql.ts). Unset (default): the role's lock_timeout. */
+  INGEST_BUFFER_COMMIT_LOCK_WAIT_MS?: string;
   /** "on" (any case): register turn writers and serve the turn-fence capability receipt. Buffered only; default off. */
   INGEST_TURN_FENCE_REGISTER?: string;
   /** Operator per-session erase route (session-erase.ts): exactly "1" enables; unset, "" or "0" is off (default). */
@@ -251,6 +261,19 @@ interface Ctx {
 function claimLockWaitMs(raw: string): number {
   if (!/^\d+$/.test(raw.trim())) throw new Error(`session ingest: INGEST_CLAIM_LOCK_WAIT_MS must be an integer from ${CLAIM_LOCK_WAIT_MS_MIN} to ${CLAIM_LOCK_WAIT_MS_MAX}`);
   return bounded(raw, CLAIM_LOCK_WAIT_MS_MIN, CLAIM_LOCK_WAIT_MS_MAX, "INGEST_CLAIM_LOCK_WAIT_MS");
+}
+
+/**
+ * INGEST_BUFFER_COMMIT_LOCK_WAIT_MS: exactly four decimal digits, no trim (a space, sign, unit, exponent or fraction
+ * refuses), then 2001..4000. Never echoes the value. A refusal fails the settings: every request 503 not_configured,
+ * so a Worker never runs with a wait it did not validate.
+ */
+export function bufferCommitLockWaitMs(raw: string): number {
+  const refuse = () => { throw new Error(`session ingest: INGEST_BUFFER_COMMIT_LOCK_WAIT_MS must be an integer from ${BUFFER_COMMIT_LOCK_WAIT_MS_MIN} to ${BUFFER_COMMIT_LOCK_WAIT_MS_MAX} (buffered acceptance only)`); };
+  if (!/^[1-9][0-9]{3}$/u.test(raw)) refuse();
+  const n = Number(raw);
+  if (n < BUFFER_COMMIT_LOCK_WAIT_MS_MIN || n > BUFFER_COMMIT_LOCK_WAIT_MS_MAX) refuse();
+  return n;
 }
 
 /** A required integer setting within [lo, hi]; never echoes the value. */
@@ -310,6 +333,8 @@ export interface IngestSettings {
   claimLockWaitMs?: number;
   /** INGEST_ORIGIN_CLAIM_FENCE=on (buffered only): per-origin claim serialization (ledger-sql.ts). Absent (the default): per-user. */
   originClaimFence?: true;
+  /** INGEST_BUFFER_COMMIT_LOCK_WAIT_MS (2001..4000, buffered only): the buffered commit's own lock wait (ledger-sql.ts). Absent (the default): the role's lock_timeout. */
+  bufferCommitLockWaitMs?: number;
   /** INGEST_TURN_FENCE_REGISTER=on (buffered only): turn writer registration + receipt. Absent (the default): old route behavior. */
   turnFenceRegister?: true;
   /** INGEST_ASYNC_ADMISSION: absent = off (the default). */
@@ -369,6 +394,9 @@ export async function ingestSettings(env: IngestWorkerEnv): Promise<IngestSettin
   if (asyncMode !== "off" && acceptanceMode !== "buffered") throw new Error("session ingest: INGEST_ASYNC_ADMISSION needs buffered acceptance");
   const originClaimFence = routingFlag(env.INGEST_ORIGIN_CLAIM_FENCE);
   if (originClaimFence && acceptanceMode !== "buffered") throw new Error("session ingest: INGEST_ORIGIN_CLAIM_FENCE needs buffered acceptance");
+  // Present means set: an empty value refuses like any other malformed one (the stack never renders it empty).
+  const commitLockWait = env.INGEST_BUFFER_COMMIT_LOCK_WAIT_MS === undefined ? undefined : bufferCommitLockWaitMs(env.INGEST_BUFFER_COMMIT_LOCK_WAIT_MS);
+  if (commitLockWait !== undefined && acceptanceMode !== "buffered") throw new Error("session ingest: INGEST_BUFFER_COMMIT_LOCK_WAIT_MS needs buffered acceptance");
   const turnFenceRegister = routingFlag(env.INGEST_TURN_FENCE_REGISTER);
   if (turnFenceRegister && acceptanceMode !== "buffered") throw new Error("session ingest: INGEST_TURN_FENCE_REGISTER needs buffered acceptance");
   // Async admission without its queue would refuse every opted-in batch: not configured.
@@ -433,6 +461,7 @@ export async function ingestSettings(env: IngestWorkerEnv): Promise<IngestSettin
     ...advertisedSetting(env.INGEST_ADVERTISED_MAX_RECORDS),
     ...(env.INGEST_CLAIM_LOCK_WAIT_MS ? { claimLockWaitMs: claimLockWaitMs(env.INGEST_CLAIM_LOCK_WAIT_MS) } : {}),
     ...(originClaimFence ? { originClaimFence: true as const } : {}),
+    ...(commitLockWait !== undefined ? { bufferCommitLockWaitMs: commitLockWait } : {}),
     ...(turnFenceRegister ? { turnFenceRegister: true as const } : {}),
     ...(asyncMode !== "off" ? { asyncAdmission: asyncMode } : {}),
     ...(syncFrozenReceipt === "on" ? { syncAdmissionFrozenReceipt: true as const } : {}),
@@ -495,7 +524,7 @@ function custodyConfig(env: IngestWorkerEnv) {
 /** The deliver deps for one invocation (request or admission consumer): the same ledger, slots and target. */
 export function deliverDepsFor(settings: IngestSettings, run: Run, target: WriteTarget, replica?: ReplicaSink): DeliverDeps {
   return {
-    ledger: sqlLedger(run, {acceptanceMode:settings.acceptanceMode,expectedGeneration:settings.expectedGeneration,...(settings.acceptGenerations?{acceptGenerations:settings.acceptGenerations}:{}),...(settings.claimLockWaitMs!==undefined?{claimLockWaitMs:settings.claimLockWaitMs}:{}),...(settings.originClaimFence?{originClaimFence:true}:{})}),
+    ledger: sqlLedger(run, {acceptanceMode:settings.acceptanceMode,expectedGeneration:settings.expectedGeneration,...(settings.acceptGenerations?{acceptGenerations:settings.acceptGenerations}:{}),...(settings.claimLockWaitMs!==undefined?{claimLockWaitMs:settings.claimLockWaitMs}:{}),...(settings.originClaimFence?{originClaimFence:true}:{}),...(settings.bufferCommitLockWaitMs!==undefined?{bufferCommitLockWaitMs:settings.bufferCommitLockWaitMs}:{})}),
     acceptanceMode:settings.acceptanceMode,
     target,
     replica,

@@ -351,3 +351,64 @@ test("turn-fence registration control is strict and independently default-off", 
       .toBe("private_ingest_live_cutover");
   }
 });
+
+// Buffered commit lock wait (ledger-sql.ts bufferCommitLockWaitSql; docs/design/buffer-commit-lock-wait.md): a numeric
+// cutover control like claimLockWaitMs, 2001..4000. Unset or empty is off and renders nothing; add, change (the live
+// replacement path) and remove pass the transition guard at the held phase, and the version readback is exact.
+// Removal is an unbind the operator admits only through bufferCommitLockWaitDeletionAllowed (private-ingest-operator.test.ts).
+test("buffer commit lock wait: env shapes, profile refusals, render, add / change / remove at a held phase, exact readback", () => {
+  const name = "INGEST_BUFFER_COMMIT_LOCK_WAIT_MS", envName = "PRIVATE_INGEST_BUFFER_COMMIT_LOCK_WAIT_MS";
+  const refusal = "private_ingest_profile_buffer_commit_lock_wait";
+  expect(PRIVATE_INGEST_CUTOVER_KEYS).toContain("bufferCommitLockWaitMs");
+  expect(privateIngestCutoverFromEnv({ [envName]: "" })).toEqual({});
+  expect(privateIngestCutoverFromEnv({})).toEqual({});
+  for (const [v, ms] of [["2001", 2001], ["3000", 3000], ["4000", 4000]] as const)
+    expect(privateIngestCutoverFromEnv({ [envName]: v })).toEqual({ bufferCommitLockWaitMs: ms });
+  for (const v of [" ", "2000", "4001", "5000", "0", "02500", " 3000", "3000 ", "+3000", "-3000", "3000ms", "3s", "3e3", "3000.0", "0xBB8", "3,000", "30000", "abc", "on"])
+    expect(code(() => privateIngestCutoverFromEnv({ [envName]: v }))).toBe(refusal);
+  for (const v of [2000, 4001, 0, 3000.5, "3000", true, null])
+    expect(code(() => privateIngestReleasePhase(at("baseline-drain", { bufferCommitLockWaitMs: v })))).toBe(refusal);
+
+  for (const phase of ["baseline-drain", "step-0-shadow", "step-1-custody", "step-2-frozen-receipt", "step-4-async-on"] as const) {
+    expect(Object.hasOwn(sessionIngestVars(at(phase).sessionIngest), name)).toBe(false);
+    const on = at(phase, { bufferCommitLockWaitMs: 3000 });
+    expect(privateIngestReleasePhase(on)).toBe(phase);
+    expect(sessionIngestVars(on.sessionIngest)).toEqual({ ...sessionIngestVars(at(phase).sessionIngest), [name]: "3000" });
+  }
+
+  const plain = at("baseline-drain"), on = at("baseline-drain", { bufferCommitLockWaitMs: 3000 }), longer = at("baseline-drain", { bufferCommitLockWaitMs: 3500 });
+  const pass = { status: "PRIVATE_INGEST_LIVE_TRANSITION_PASS", from: "baseline-drain", to: "baseline-drain" };
+  const fromPlain = live(plain), fromOn = live(on), fromLonger = live(longer);
+  expect(privateIngestTransitionReadback(on, fromPlain.active, fromPlain.version)).toMatchObject(pass);    // add
+  expect(privateIngestTransitionReadback(longer, fromOn.active, fromOn.version)).toMatchObject(pass);     // change (replacement)
+  expect(privateIngestTransitionReadback(on, fromLonger.active, fromLonger.version)).toMatchObject(pass); // change back
+  expect(privateIngestTransitionReadback(plain, fromOn.active, fromOn.version)).toMatchObject(pass);      // remove (rollback)
+  // Exact readback: the live version must carry exactly the candidate's value (or none).
+  expect(privateIngestVersionReadback(on, fromOn.active, fromOn.version)).toMatchObject({ phase: "baseline-drain" });
+  expect(privateIngestVersionReadback(longer, fromLonger.active, fromLonger.version)).toMatchObject({ phase: "baseline-drain" });
+  expect(privateIngestVersionReadback(plain, fromPlain.active, fromPlain.version)).toMatchObject({ phase: "baseline-drain" });
+  expect(code(() => privateIngestVersionReadback(longer, fromOn.active, fromOn.version))).not.toBeNull();
+  expect(code(() => privateIngestVersionReadback(plain, fromOn.active, fromOn.version))).not.toBeNull();
+  expect(code(() => privateIngestVersionReadback(on, fromPlain.active, fromPlain.version))).not.toBeNull();
+  // A malformed live value refuses the transition (never read as off or clamped).
+  for (const bad of [
+    [{ name, type: "plain_text", text: "6000" }], [{ name, type: "plain_text", text: "2000" }], [{ name, type: "plain_text", text: " 3000" }],
+    [{ name, type: "plain_text", text: "3000ms" }], [{ name, type: "plain_text", text: "" }], [{ name, type: "secret_text" }],
+    [{ name, type: "plain_text", text: "3000" }, { name, type: "plain_text", text: "3000" }],
+  ]) {
+    const fixture = live(plain, bad);
+    expect(code(() => privateIngestTransitionReadback(plain, fixture.active, fixture.version))).toBe("private_ingest_live_cutover");
+  }
+  // Independent of the buffer lock and claim controls: all together pass.
+  const all = at("baseline-drain", { bufferCommitLockWaitMs: 4000, bufferLockBusy: "on", bufferLockRetry: "on", claimTimeoutBusy: "on", claimLockWaitMs: 250 });
+  expect(privateIngestReleasePhase(all)).toBe("baseline-drain");
+  const fromAll = live(all);
+  expect(privateIngestVersionReadback(all, fromAll.active, fromAll.version)).toMatchObject({ phase: "baseline-drain" });
+  // Tracked production profile: no var with the variable unset; the workflow supplies it only from the protected environment.
+  const tracked = JSON.parse(readFileSync("config/cloudflare/private-ingest-production.json", "utf8"));
+  const production = { ...tracked, sessionIngest: { ...tracked.sessionIngest, kmsKeyArn, ...privateIngestCutoverFromEnv({}) } };
+  expect(Object.hasOwn(sessionIngestVars(production.sessionIngest), name)).toBe(false);
+  const workflow = readFileSync(".github/workflows/deploy-private-ingest-worker.yml", "utf8");
+  expect(workflow).toContain(`${envName}: \${{ vars.${envName} }}`);
+  expect(workflow.split("\npermissions:")[0]).not.toContain(envName);
+});

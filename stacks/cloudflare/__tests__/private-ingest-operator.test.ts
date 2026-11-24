@@ -9,6 +9,7 @@ import {
   assertOperatorSnapshot,
   advertisedMaxRecordsDeletionAllowed,
   inflightLeaseDeletionAllowed,
+  bufferCommitLockWaitDeletionAllowed,
   bufferLockBusyDeletionAllowed,
   retainedOperatorPlan,
   requireStateAuthority,
@@ -75,7 +76,7 @@ const tools = {
     nativeBindingsSha256: "f".repeat(64),
   };
 const digest = (v: string) => createHash("sha256").update(v).digest("hex");
-async function actualPlanProof(declared: "canonical" | "buffered" | "admission" | "admission-default" | "admission-drain" | "custody" | "custody-shadow" | "custody-shadow-drain" | "frozen-receipt" | "neon-exit" | "advertised" | "inflight" | "buffer-busy") {
+async function actualPlanProof(declared: "canonical" | "buffered" | "admission" | "admission-default" | "admission-drain" | "custody" | "custody-shadow" | "custody-shadow-drain" | "frozen-receipt" | "neon-exit" | "advertised" | "inflight" | "buffer-busy" | "buffer-commit-wait") {
   // "admission": buffered + asyncAdmission "on" (the three admission resources and two more bindings).
   // "admission-default": buffered with asyncAdmission OMITTED, which resolves to "on" (same as "admission").
   // "admission-drain": buffered + asyncAdmission "drain" (same resources, the var says drain).
@@ -86,6 +87,7 @@ async function actualPlanProof(declared: "canonical" | "buffered" | "admission" 
   // "advertised": buffered + explicit asyncAdmission "off" + advertisedMaxRecords 120 (one more plain-text binding).
   // "inflight": buffered + explicit asyncAdmission "off" + inflightLease "on" (one more plain-text binding).
   // "buffer-busy": buffered + explicit asyncAdmission "off" + bufferLockBusy "on" (one more plain-text binding).
+  // "buffer-commit-wait": buffered + explicit asyncAdmission "off" + bufferCommitLockWaitMs 3000 (one more plain-text binding).
   const mode = declared === "canonical" ? "canonical" : "buffered";
   const neonExit = declared === "neon-exit";
   const shadowDrain = declared === "custody-shadow-drain", shadow = declared === "custody-shadow" || shadowDrain;
@@ -94,21 +96,23 @@ async function actualPlanProof(declared: "canonical" | "buffered" | "admission" 
   const advertised = declared === "advertised";
   const inflight = declared === "inflight";
   const bufferBusy = declared === "buffer-busy";
+  const commitWait = declared === "buffer-commit-wait";
   const frozenReceipt = declared === "frozen-receipt", custody = declared === "custody" || shadow || frozenReceipt || neonExit;
-  const bindingCount = (admission ? 17 : mode === "buffered" ? 15 : 13) + (custody ? 1 : 0) + (frozenReceipt ? 1 : 0) + (neonExit ? 1 : 0) + (advertised ? 1 : 0) + (inflight ? 1 : 0) + (bufferBusy ? 1 : 0);
+  const bindingCount = (admission ? 17 : mode === "buffered" ? 15 : 13) + (custody ? 1 : 0) + (frozenReceipt ? 1 : 0) + (neonExit ? 1 : 0) + (advertised ? 1 : 0) + (inflight ? 1 : 0) + (bufferBusy ? 1 : 0) + (commitWait ? 1 : 0);
   const input = {
     ...baseInput,
     sessionIngest: {
       ...baseInput.sessionIngest,
       ...(declared === "admission" ? { asyncAdmission: "on" as const } : {}),
       ...(declared === "admission-drain" ? { asyncAdmission: "drain" as const } : {}),
-      ...(declared === "buffered" || advertised || inflight || bufferBusy || custody ? { asyncAdmission: shadowDrain ? "drain" as const : "off" as const } : {}),
+      ...(declared === "buffered" || advertised || inflight || bufferBusy || commitWait || custody ? { asyncAdmission: shadowDrain ? "drain" as const : "off" as const } : {}),
       ...(custody ? { custodySource: shadow ? "shadow" as const : "frozen-supabase" as const } : {}),
       ...(frozenReceipt ? { syncAdmissionFrozenReceipt: "on" as const } : {}),
       ...(neonExit ? { neonExit: "on" as const } : {}),
       ...(advertised ? { advertisedMaxRecords: 120 } : {}),
       ...(inflight ? { inflightLease: "on" as const } : {}),
       ...(bufferBusy ? { bufferLockBusy: "on" as const } : {}),
+      ...(commitWait ? { bufferCommitLockWaitMs: 3000 } : {}),
       ...(mode === "buffered"
         ? {
             acceptanceMode: "buffered" as const,
@@ -804,6 +808,97 @@ async function actualPlanProof(declared: "canonical" | "buffered" | "admission" 
         expect(() => assertOperatorSnapshot(at(swapped), omitted)).toThrow("native_binding_target");
       }
     }
+    if (commitWait) {
+      const NAME = "INGEST_BUFFER_COMMIT_LOCK_WAIT_MS";
+      const rowsOf = native.native.resources, worker = rowsOf["session-ingest"];
+      const waitBinding = worker.bindings.find((b: any) => b.sid === NAME);
+      // Create: the plan binds exactly the plain-text value.
+      expect(waitBinding.data.bindings[0]).toEqual({ type: "plain_text", name: NAME, text: "3000" });
+      expect(worker.props.env[NAME]).toBe("3000");
+      const { [NAME]: _wait, ...unbindEnv } = worker.props.env;
+      const { bufferCommitLockWaitMs: _ms, ...withoutWait } = input.sessionIngest as any;
+      const omitted = { ...input, sessionIngest: withoutWait };
+      const unbindWorker = {
+        ...worker,
+        action: "update",
+        props: { ...worker.props, env: unbindEnv },
+        state: { status: "updated", props: worker.props },
+        bindings: worker.bindings.map((b: any) => b === waitBinding ? { ...b, action: "delete" } : b),
+      };
+      const at = (w: any) => ({ ...native, native: { ...native.native, resources: { ...rowsOf, "session-ingest": w } } });
+      const withLive = (w: any, live: unknown) => ({ ...w, state: { ...w.state, props: {
+        ...w.state.props, env: { ...w.state.props.env, [NAME]: live } } } });
+      const withDeleted = (w: any, value: unknown) => ({ ...w, bindings: w.bindings.map((b: any) =>
+        b.sid !== NAME ? b : { ...b, data: { bindings: [value] } }) });
+      // Delete (rollback to the role default): admitted, pinned to the live text, the only delete.
+      const admitted = assertOperatorSnapshot(at(unbindWorker), omitted);
+      expect(admitted).toHaveLength(bindingCount);
+      expect(admitted.filter((e) => e.action === "delete")).toEqual([
+        { sid: NAME, action: "delete", target: { type: "plain_text", name: NAME, text: "3000" } }]);
+      // Every in-range live value is admitted when the deleted binding carries that exact text.
+      for (const live of ["2001", "3500", "4000"]) {
+        const each = assertOperatorSnapshot(at(withDeleted(withLive(unbindWorker, live), { type: "plain_text", name: NAME, text: live })), omitted);
+        expect(each.find((e) => e.sid === NAME)).toEqual({ sid: NAME, action: "delete", target: { type: "plain_text", name: NAME, text: live } });
+      }
+      // The candidate still sets a value: the inventory no longer matches, or the delete names an expected binding.
+      const keeps = { ...input, sessionIngest: { ...withoutWait, bufferCommitLockWaitMs: 3000 } };
+      expect(() => assertOperatorSnapshot(at(unbindWorker), keeps)).toThrow("native_binding_inventory");
+      expect(() => assertOperatorSnapshot(at({ ...unbindWorker, bindings: [...unbindWorker.bindings, {
+        sid: NAME, action: "update", data: { bindings: [{ type: "plain_text", name: NAME, text: "3000" }] },
+      }] }), keeps)).toThrow("native_binding_target");
+      // The proposed env still carries the variable (any value).
+      expect(() => assertOperatorSnapshot(at({ ...unbindWorker, props: worker.props }), omitted)).toThrow("native_binding_target");
+      for (const proposed of ["3000", "", "6000"])
+        expect(() => assertOperatorSnapshot(at({ ...unbindWorker, props: { ...worker.props,
+          env: { ...unbindEnv, [NAME]: proposed } } }), omitted)).toThrow("native_binding_target");
+      // Malformed or unknown live values; the deleted binding is forged to match, so only the live-value check refuses.
+      for (const live of ["2000", "4001", "6000", "0", "02500", " 3000", "3000 ", "+3000", "3000ms", "3e3", "on", "", 3000, true, null, undefined])
+        expect(() => assertOperatorSnapshot(at(withDeleted(withLive(unbindWorker, live), {
+          type: "plain_text", name: NAME, text: live })), omitted)).toThrow("native_binding_target");
+      // The native binding differs from the live "3000": type, name, text, a non-string text, an extra key, not plain text.
+      for (const value of [
+        { type: "secret_text", name: NAME, text: "3000" },
+        { type: "plain_text", name: "FOREIGN", text: "3000" },
+        { type: "plain_text", name: "INGEST_CLAIM_LOCK_WAIT_MS", text: "3000" },
+        { type: "plain_text", name: NAME, text: "3500" },
+        { type: "plain_text", name: NAME, text: 3000 },
+        { type: "plain_text", name: NAME, text: "3000", extra: "x" },
+        { type: "queue", name: NAME, queue_name: "foreign" },
+      ])
+        expect(() => assertOperatorSnapshot(at(withDeleted(unbindWorker, value)), omitted)).toThrow("native_binding_target");
+      expect(() => assertOperatorSnapshot(at({ ...unbindWorker, bindings: unbindWorker.bindings.map((b: any) =>
+        b.sid !== NAME ? b : { ...b, data: { ...b.data, shim: "x" } }) }), omitted)).toThrow("native_binding_target");
+      for (const action of ["create", "noop"])
+        expect(() => assertOperatorSnapshot(at({ ...unbindWorker, action }), omitted)).toThrow("native_binding_target");
+      // A second deletion in the same plan, each admissible alone, refuses on the single-delete limit.
+      const second = {
+        ...unbindWorker,
+        state: { ...unbindWorker.state, props: { ...unbindWorker.state.props, env: { ...unbindWorker.state.props.env, INGEST_INFLIGHT_LEASE: "on" } } },
+        bindings: [...unbindWorker.bindings, { sid: "INGEST_INFLIGHT_LEASE", action: "delete",
+          data: { bindings: [{ type: "plain_text", name: "INGEST_INFLIGHT_LEASE", text: "on" }] } }],
+      };
+      expect(() => assertOperatorSnapshot(at(second), omitted)).toThrow("native_binding_inventory");
+      // No arm for INGEST_CLAIM_LOCK_WAIT_MS: the same delete row under that sid still refuses by name.
+      const claimWait = {
+        ...worker, action: "update",
+        state: { status: "updated", props: { ...worker.props, env: { ...worker.props.env, INGEST_CLAIM_LOCK_WAIT_MS: "250" } } },
+        bindings: [...worker.bindings, { sid: "INGEST_CLAIM_LOCK_WAIT_MS", action: "delete",
+          data: { bindings: [{ type: "plain_text", name: "INGEST_CLAIM_LOCK_WAIT_MS", text: "250" }] } }],
+      };
+      expect(() => assertOperatorSnapshot(at(claimWait), input)).toThrow("native_binding_target");
+      // Update (the live replacement path, 3000 -> 3500): an update row checked against the candidate alone, no delete.
+      const longer = {
+        ...worker, action: "update",
+        props: { ...worker.props, env: { ...worker.props.env, [NAME]: "3500" } },
+        state: { status: "updated", props: worker.props },
+        bindings: worker.bindings.map((b: any) => b !== waitBinding ? b : { ...b, action: "update",
+          data: { bindings: [{ type: "plain_text", name: NAME, text: "3500" }] } }),
+      };
+      const updated = assertOperatorSnapshot(at(longer), { ...input, sessionIngest: { ...withoutWait, bufferCommitLockWaitMs: 3500 } });
+      expect(updated.some((e) => e.action === "delete")).toBe(false);
+      expect(updated.find((e) => e.sid === NAME)).toMatchObject({ action: "update" });
+      expect(() => assertOperatorSnapshot(at(longer), input)).toThrow("native_binding_target");
+    }
     if (custody && !frozenReceipt && !neonExit) {
       const rowsOf = native.native.resources, worker = rowsOf["session-ingest"];
       const custodyBinding = worker.bindings.find((b: any) => b.sid === "INGEST_CUSTODY_SOURCE");
@@ -1009,7 +1104,7 @@ async function actualPlanProof(declared: "canonical" | "buffered" | "admission" 
     await rm(dir, { recursive: true, force: true });
   }
 }
-test.each(["canonical", "buffered", "admission", "admission-default", "admission-drain", "custody", "custody-shadow", "custody-shadow-drain", "frozen-receipt", "neon-exit", "advertised", "inflight", "buffer-busy"] as const)(
+test.each(["canonical", "buffered", "admission", "admission-default", "admission-drain", "custody", "custody-shadow", "custody-shadow-drain", "frozen-receipt", "neon-exit", "advertised", "inflight", "buffer-busy", "buffer-commit-wait"] as const)(
   "actual original four-resource declaration %s uses authenticated HTTP state and retained plan",
   actualPlanProof,
 );
@@ -1392,6 +1487,29 @@ describe("operatorSafePlans: async admission follows the resolved mode; a deploy
       .toThrow("binding_render_summary");
   });
 
+  test("buffer commit lock wait removal renders one reviewed binding deletion", () => {
+    const unbind = {
+      sid: "INGEST_BUFFER_COMMIT_LOCK_WAIT_MS",
+      action: "delete",
+      target: { type: "plain_text", name: "INGEST_BUFFER_COMMIT_LOCK_WAIT_MS", text: "3000" },
+    };
+    const removal = [queue("noop"), flag("noop", "drain"), unbind];
+    expect(() => run(SEVEN, {}, removal)).not.toThrow();
+    const rendered = plans(SEVEN, {}, removal);
+    expect(rendered.planText).toContain("[session-ingest/INGEST_BUFFER_COMMIT_LOCK_WAIT_MS] unbind");
+    expect(rendered.planText).toContain(", 1 binding changes");
+    const altered = (from: string, to: string) => ({
+      planText: rendered.planText.replace(from, to),
+      detailedText: rendered.detailedText.replace(from, to),
+    });
+    expect(() => operatorSafePlans(altered(
+      "[session-ingest/INGEST_BUFFER_COMMIT_LOCK_WAIT_MS] unbind",
+      "[session-ingest/INGEST_BUFFER_COMMIT_LOCK_WAIT_MS] delete",
+    ), secrets, removal)).toThrow("binding_render_inventory");
+    expect(() => operatorSafePlans(altered(", 1 binding changes", ", 2 binding changes"), secrets, removal))
+      .toThrow("binding_render_summary");
+  });
+
   test("a refused contract exposes actions only, never binding values", () => {
     let refusal: unknown;
     try {
@@ -1497,6 +1615,22 @@ test("the retained plan unbinds INGEST_INFLIGHT_LEASE only for an omitted candid
   for (const value of ["On", "ON", "Observe", "OBSERVE", " on", "on ", "observe\t", "off", "true", "1", "", 0, 1, null, undefined])
     expect(inflightLeaseDeletionAllowed(profile(), live(value), {})).toBe(false);
   expect(inflightLeaseDeletionAllowed(profile(), undefined, {})).toBe(false);
+});
+test("the retained plan unbinds INGEST_BUFFER_COMMIT_LOCK_WAIT_MS only for an omitted candidate value, nothing proposed and a strict in-range live value", () => {
+  const profile = (extra: Record<string, unknown> = {}) => ({ ...baseInput.sessionIngest, ...extra }) as any;
+  const live = (value: unknown) => ({ INGEST_BUFFER_COMMIT_LOCK_WAIT_MS: value });
+  for (const v of ["2001", "3000", "4000"]) {
+    expect(bufferCommitLockWaitDeletionAllowed(profile(), live(v), {})).toBe(true);
+    expect(bufferCommitLockWaitDeletionAllowed(profile(), live(v), undefined)).toBe(true);
+  }
+  for (const ms of [3000, 2001, 4000, 6000, "3000"])
+    expect(bufferCommitLockWaitDeletionAllowed(profile({ bufferCommitLockWaitMs: ms }), live("3000"), {})).toBe(false);
+  for (const proposed of ["3000", "", "6000"])
+    expect(bufferCommitLockWaitDeletionAllowed(profile(), live("3000"), live(proposed))).toBe(false);
+  for (const value of ["2000", "4001", "6000", "0", "02500", " 3000", "3000 ", "3000\n", "+3000", "-3000", "3000ms", "3s", "3e3", "3000.0", "on", "", 3000, true, null, undefined])
+    expect(bufferCommitLockWaitDeletionAllowed(profile(), live(value), {})).toBe(false);
+  expect(bufferCommitLockWaitDeletionAllowed(profile(), undefined, {})).toBe(false);
+  expect(bufferCommitLockWaitDeletionAllowed(profile(), { INGEST_CLAIM_LOCK_WAIT_MS: "3000" }, {})).toBe(false);
 });
 test("the retained plan unbinds INGEST_BUFFER_LOCK_BUSY only for an omitted candidate value, nothing proposed and a live exactly on", () => {
   const profile = (extra: Record<string, unknown> = {}) =>

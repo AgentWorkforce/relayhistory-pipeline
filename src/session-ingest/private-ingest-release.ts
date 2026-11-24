@@ -220,6 +220,10 @@ function overlapShape(profile: Record<string, unknown>): string | undefined {
  *                             incident: a deploy may add or change both, like the other cutover controls, so
  *                             they live here and not in COMMON_PROFILE (a COMMON_PROFILE change can never match the
  *                             live version it replaces, private_ingest_live_phase).
+ *   bufferCommitLockWaitMs    an integer 2001..4000 (omit for the role default): INGEST_BUFFER_COMMIT_LOCK_WAIT_MS, the
+ *                             buffered commit's transaction-local lock wait inside its one statement (ledger-sql.ts
+ *                             bufferCommitLockWaitSql; docs/design/buffer-commit-lock-wait.md). The role's 5 s
+ *                             statement_timeout still caps it. Buffered only (the release profile always is).
  *   originClaimFence          "on" only (omit for off): INGEST_ORIGIN_CLAIM_FENCE, buffered claim/stage/commit through
  *                             the 20261105062010 origin-scoped entry points (docs/design/per-origin-claim-fence.md).
  *   turnFenceRegister         "on" only (omit for off): INGEST_TURN_FENCE_REGISTER, exact-session privacy
@@ -233,15 +237,15 @@ function overlapShape(profile: Record<string, unknown>): string | undefined {
  *                             (turns batches are tracked, never refused).
  * Removing a rendered cutover var is a binding deletion in the plan, which the operator admits only through its
  * reviewed delete allowlist (scripts/private-ingest-operator.ts). Of these controls that covers bufferLockBusy,
- * advertisedMaxRecords and inflightLease, each under its own conditions; every other one (bufferLockRetry,
+ * bufferCommitLockWaitMs, advertisedMaxRecords and inflightLease, each under its own conditions; every other one (bufferLockRetry,
  * claimTimeoutBusy and claimLockWaitMs included) refuses native_binding_target when removed.
  * These controls are never tracked in config/cloudflare/private-ingest-production.json (public repository): CI supplies them
  * from the protected environment's variables (privateIngestCutoverFromEnv), as it supplies kmsKeyArn.
  */
-export const PRIVATE_INGEST_CUTOVER_KEYS = ["s3FenceMirror", "httpAdmissionStoppedOrgs", "claimTimeoutBusy", "bufferLockBusy", "bufferLockRetry", "claimLockWaitMs", "originClaimFence", "turnFenceRegister", "advertisedMaxRecords", "inflightLease"] as const;
+export const PRIVATE_INGEST_CUTOVER_KEYS = ["s3FenceMirror", "httpAdmissionStoppedOrgs", "claimTimeoutBusy", "bufferLockBusy", "bufferLockRetry", "claimLockWaitMs", "bufferCommitLockWaitMs", "originClaimFence", "turnFenceRegister", "advertisedMaxRecords", "inflightLease"] as const;
 export type PrivateIngestCutover = {
   s3FenceMirror?: "on"; httpAdmissionStoppedOrgs?: string[]; claimTimeoutBusy?: "on"; bufferLockBusy?: "on"; bufferLockRetry?: "on";
-  claimLockWaitMs?: number; originClaimFence?: "on"; turnFenceRegister?: "on"; advertisedMaxRecords?: number;
+  claimLockWaitMs?: number; bufferCommitLockWaitMs?: number; originClaimFence?: "on"; turnFenceRegister?: "on"; advertisedMaxRecords?: number;
   inflightLease?: "observe" | "on";
 };
 const inflightLeaseOk = (v: unknown): v is "observe" | "on" => v === "observe" || v === "on";
@@ -250,6 +254,11 @@ const advertisedOk = (n: unknown): n is number => typeof n === "number" && Numbe
 const CLAIM_LOCK_WAIT_DIGITS = /^[0-9]{2,4}$/u;
 const claimLockWaitOk = (ms: unknown): ms is number =>
   typeof ms === "number" && Number.isSafeInteger(ms) && ms >= 25 && ms <= 2000;
+/** Four digits, no leading zero, sign, space, unit or fraction; the range is checked after (bufferCommitLockWaitOk). */
+const BUFFER_COMMIT_LOCK_WAIT_DIGITS = /^[1-9][0-9]{3}$/u;
+/** The same bounds as ledger-sql.ts BUFFER_COMMIT_LOCK_WAIT_MS_MIN / _MAX (a test pins them equal). */
+const bufferCommitLockWaitOk = (ms: unknown): ms is number =>
+  typeof ms === "number" && Number.isSafeInteger(ms) && ms >= 2001 && ms <= 4000;
 const STOPPED_ORG = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/u;
 
 function checkedCutover(profile: Record<string, unknown>, live = false): PrivateIngestCutover {
@@ -257,6 +266,7 @@ function checkedCutover(profile: Record<string, unknown>, live = false): Private
   const timeoutBusy = profile.claimTimeoutBusy, lockWait = profile.claimLockWaitMs, originFence = profile.originClaimFence;
   const turnFenceRegister = profile.turnFenceRegister;
   const bufferBusy = profile.bufferLockBusy, bufferRetry = profile.bufferLockRetry;
+  const commitLockWait = profile.bufferCommitLockWaitMs;
   const advertised = profile.advertisedMaxRecords;
   const inflight = profile.inflightLease;
   if (inflight !== undefined && !inflightLeaseOk(inflight))
@@ -273,6 +283,8 @@ function checkedCutover(profile: Record<string, unknown>, live = false): Private
     privateIngestRefuse(live ? "private_ingest_live_cutover" : "private_ingest_profile_buffer_lock_retry");
   if (lockWait !== undefined && !claimLockWaitOk(lockWait))
     privateIngestRefuse(live ? "private_ingest_live_cutover" : "private_ingest_profile_claim_lock_wait");
+  if (commitLockWait !== undefined && !bufferCommitLockWaitOk(commitLockWait))
+    privateIngestRefuse(live ? "private_ingest_live_cutover" : "private_ingest_profile_buffer_commit_lock_wait");
   if (originFence !== undefined && originFence !== "on")
     privateIngestRefuse(live ? "private_ingest_live_cutover" : "private_ingest_profile_origin_claim_fence");
   if (turnFenceRegister !== undefined && turnFenceRegister !== "on")
@@ -287,6 +299,7 @@ function checkedCutover(profile: Record<string, unknown>, live = false): Private
     ...(bufferBusy === "on" ? { bufferLockBusy: "on" as const } : {}),
     ...(bufferRetry === "on" ? { bufferLockRetry: "on" as const } : {}),
     ...(lockWait === undefined ? {} : { claimLockWaitMs: lockWait as number }),
+    ...(commitLockWait === undefined ? {} : { bufferCommitLockWaitMs: commitLockWait as number }),
     ...(originFence === "on" ? { originClaimFence: "on" as const } : {}),
     ...(turnFenceRegister === "on" ? { turnFenceRegister: "on" as const } : {}),
     ...(advertised === undefined ? {} : { advertisedMaxRecords: advertised as number }),
@@ -304,6 +317,9 @@ function checkedCutover(profile: Record<string, unknown>, live = false): Private
  *   PRIVATE_INGEST_BUFFER_LOCK_RETRY           "on" or unset/empty; anything else refuses.
  *   PRIVATE_INGEST_CLAIM_LOCK_WAIT_MS          decimal digits, 25..2000, or unset/empty; signs, spaces, exponents,
  *                                              hex and fractions refuse.
+ *   PRIVATE_INGEST_BUFFER_COMMIT_LOCK_WAIT_MS  four decimal digits, 2001..4000, or unset/empty (a GitHub variable that
+ *                                              is not set renders empty, so empty is off); signs, spaces, units,
+ *                                              exponents, hex, fractions and any other value refuse.
  *   PRIVATE_INGEST_ORIGIN_CLAIM_FENCE          "on" or unset/empty; anything else refuses.
  *   PRIVATE_INGEST_TURN_FENCE_REGISTER         "on" or unset/empty; anything else refuses.
  *   PRIVATE_INGEST_ADVERTISED_MAX_RECORDS      decimal digits 1..500 (no sign, leading zero, space or fraction), or
@@ -320,6 +336,8 @@ export function privateIngestCutoverFromEnv(env: Record<string, string | undefin
   if (bufferBusy !== "" && bufferBusy !== "on") privateIngestRefuse("private_ingest_profile_buffer_lock_busy");
   if (bufferRetry !== "" && bufferRetry !== "on") privateIngestRefuse("private_ingest_profile_buffer_lock_retry");
   if (lockWait !== "" && !CLAIM_LOCK_WAIT_DIGITS.test(lockWait)) privateIngestRefuse("private_ingest_profile_claim_lock_wait");
+  const commitLockWait = env.PRIVATE_INGEST_BUFFER_COMMIT_LOCK_WAIT_MS ?? "";
+  if (commitLockWait !== "" && !BUFFER_COMMIT_LOCK_WAIT_DIGITS.test(commitLockWait)) privateIngestRefuse("private_ingest_profile_buffer_commit_lock_wait");
   const originFence = env.PRIVATE_INGEST_ORIGIN_CLAIM_FENCE ?? "";
   const turnFenceRegister = env.PRIVATE_INGEST_TURN_FENCE_REGISTER ?? "";
   if (originFence !== "" && originFence !== "on") privateIngestRefuse("private_ingest_profile_origin_claim_fence");
@@ -335,6 +353,7 @@ export function privateIngestCutoverFromEnv(env: Record<string, string | undefin
     ...(bufferBusy === "on" ? { bufferLockBusy: "on" } : {}),
     ...(bufferRetry === "on" ? { bufferLockRetry: "on" } : {}),
     ...(lockWait === "" ? {} : { claimLockWaitMs: Number(lockWait) }),
+    ...(commitLockWait === "" ? {} : { bufferCommitLockWaitMs: Number(commitLockWait) }),
     ...(originFence === "on" ? { originClaimFence: "on" } : {}),
     ...(turnFenceRegister === "on" ? { turnFenceRegister: "on" } : {}),
     ...(advertised === "" ? {} : { advertisedMaxRecords: Number(advertised) }),
@@ -356,6 +375,8 @@ function liveCutover(version: CloudflareWorkerVersion): PrivateIngestCutover {
   const timeoutBusy = text("INGEST_CLAIM_TIMEOUT_BUSY"), lockWait = text("INGEST_CLAIM_LOCK_WAIT_MS");
   const bufferBusy = text("INGEST_BUFFER_LOCK_BUSY"), bufferRetry = text("INGEST_BUFFER_LOCK_RETRY");
   const originFence = text("INGEST_ORIGIN_CLAIM_FENCE");
+  const commitLockWait = text("INGEST_BUFFER_COMMIT_LOCK_WAIT_MS");
+  if (commitLockWait !== undefined && !BUFFER_COMMIT_LOCK_WAIT_DIGITS.test(commitLockWait)) privateIngestRefuse("private_ingest_live_cutover");
   const turnFenceRegister = text("INGEST_TURN_FENCE_REGISTER");
   const advertised = text("INGEST_ADVERTISED_MAX_RECORDS");
   const inflight = text("INGEST_INFLIGHT_LEASE");
@@ -368,6 +389,7 @@ function liveCutover(version: CloudflareWorkerVersion): PrivateIngestCutover {
     ...(bufferBusy === undefined ? {} : { bufferLockBusy: bufferBusy }),
     ...(bufferRetry === undefined ? {} : { bufferLockRetry: bufferRetry }),
     ...(lockWait === undefined ? {} : { claimLockWaitMs: Number(lockWait) }),
+    ...(commitLockWait === undefined ? {} : { bufferCommitLockWaitMs: Number(commitLockWait) }),
     ...(originFence === undefined ? {} : { originClaimFence: originFence }),
     ...(turnFenceRegister === undefined ? {} : { turnFenceRegister }),
     ...(advertised === undefined ? {} : { advertisedMaxRecords: Number(advertised) }),

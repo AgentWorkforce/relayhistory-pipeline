@@ -947,6 +947,34 @@ describe("session ingest: INGEST_CLAIM_LOCK_WAIT_MS (claimLockWaitMs, default ab
   });
 });
 
+describe("session ingest: INGEST_BUFFER_COMMIT_LOCK_WAIT_MS (bufferCommitLockWaitMs, default absent, buffered only)", () => {
+  const buffered: SessionIngestInputs = { ...inputs, acceptanceMode: "buffered", expectedGeneration: "a".repeat(64), inlineMaxSessions: 0, asyncAdmission: "off" };
+  const why = "sessionIngest.bufferCommitLockWaitMs must be an integer from 2001 to 4000, in buffered mode only (omit for the role default)";
+  it("omitted: no var, props byte-identical to a stack without the input", () => {
+    for (const p of [inputs, buffered]) {
+      expect(Object.hasOwn(sessionIngestVars(p), "INGEST_BUFFER_COMMIT_LOCK_WAIT_MS")).toBe(false);
+      expect(JSON.stringify(props(p))).toBe(JSON.stringify(props({ ...p, bufferCommitLockWaitMs: undefined })));
+    }
+  });
+
+  it("set in buffered acceptance: exactly one more var (the number as text), no new binding", () => {
+    for (const ms of [2001, 3000, 4000]) {
+      const on: SessionIngestInputs = { ...buffered, bufferCommitLockWaitMs: ms };
+      expect(() => assertSessionIngestInputs(on, refuse)).not.toThrow();
+      expect(sessionIngestVars(on)).toEqual({ ...sessionIngestVars(buffered), INGEST_BUFFER_COMMIT_LOCK_WAIT_MS: String(ms) });
+      expect(Object.keys(props(on).env).sort()).toEqual([...Object.keys(props(buffered).env), "INGEST_BUFFER_COMMIT_LOCK_WAIT_MS"].sort());
+    }
+    const all = { ...buffered, bufferCommitLockWaitMs: 3000, bufferLockBusy: "on" as const, bufferLockRetry: "on" as const, claimLockWaitMs: 250 };
+    expect(() => assertSessionIngestInputs(all, refuse)).not.toThrow();
+  });
+
+  it("is refused outside 2001..4000, when not an integer, and outside buffered acceptance", () => {
+    for (const value of [2000, 4001, 5000, 0, -3000, 3000.5, "3000", null, true, Number.NaN])
+      expect(() => assertSessionIngestInputs({ ...buffered, bufferCommitLockWaitMs: value } as never, refuse)).toThrow(why);
+    expect(() => assertSessionIngestInputs({ ...inputs, acceptanceMode: "canonical", bufferCommitLockWaitMs: 3000 }, refuse)).toThrow(why);
+  });
+});
+
 describe("session ingest: INGEST_ADVERTISED_MAX_RECORDS (advertisedMaxRecords, default absent)", () => {
   it("omitted: no INGEST_ADVERTISED_MAX_RECORDS var, props byte-identical to a stack without the input", () => {
     expect(Object.hasOwn(sessionIngestVars(inputs), "INGEST_ADVERTISED_MAX_RECORDS")).toBe(false);
