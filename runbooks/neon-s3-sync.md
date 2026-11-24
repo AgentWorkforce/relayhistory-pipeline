@@ -193,6 +193,10 @@ kind `prefix` with reason `stale_prefix`.
   incomplete or refused result, or a refused done claim. It records that
   entry exactly as the full job would (error code, backoff), touches nothing
   after it, and exits non-zero (`stale_prefix_pass_stopped`).
+- A state error inside the guard during an `--execute` run (for example the
+  state file cannot be read) is recorded as a failure on that entry, with the
+  normal error code and backoff, and stops the pass the same way. In a dry run
+  the same error ends the run with that error; nothing is written.
 
 **What it does not do**
 
@@ -202,8 +206,9 @@ kind `prefix` with reason `stale_prefix`.
 - It writes no `erasure_seen` rows and no sweep bookkeeping.
 - It never reads or changes any other queued entry (objects, or prefixes with
   other reasons).
-- It does not release other erasers' leases. A prefix leased by the exporter
-  or another eraser is skipped untouched.
+- It never releases any lease but its own. A prefix leased by the exporter is
+  skipped untouched (`lease_busy`); an unexpired lease of another eraser stops
+  an `--execute` run before it starts (see below).
 - Without `--execute` it deletes nothing, takes no lease and writes nothing
   to the queue.
 
@@ -223,10 +228,32 @@ The mode refuses to start in any of these cases:
 - Any flag other than `--execute`, `--once` and `--max <n>` is given
   (`stale_prefix_mode_flag_refused`).
 - `--max` is invalid or repeated (`stale_prefix_max_invalid`).
+- With `--execute`: the state holds an unexpired lease (younger than 2 hours)
+  of another eraser process (`stale_prefix_mode_other_eraser_lease`). Nothing
+  is erased or written. Exporter leases do not refuse. A dry run does not
+  refuse; it reports the count as `other_eraser_leases`.
 
-`--max` without the switch is refused (`stale_prefix_max_without_mode`).
+Without the switch:
+
+- `--max` is refused (`stale_prefix_max_without_mode`).
+- Any other argument starting with `--stale` or `--max` is refused
+  (`stale_prefix_mode_flag_refused`). This catches a misspelled switch such as
+  `--stale-prefix-only` or `--stale-prefixes-only=1`: the full job ignores
+  unknown flags, so with `--execute` it would otherwise run the full job,
+  sweeps included.
+
+All of these refusals exit non-zero before stdin is read and before the state
+file is opened, except the lease refusal, which needs the state file and is
+checked before the first lease is taken.
 
 Do not run it at the same time as another eraser on the same state file.
+
+**Leases after a run that dies.** A run that dies (crash, kill, lost host)
+leaves its leases in the state file. This mode never releases leases; they
+expire after 2 hours. Until then the affected prefixes skip as `lease_busy`,
+and an `--execute` run refuses to start
+(`stale_prefix_mode_other_eraser_lease`). Wait for the expiry. Do not edit the
+state file to clear them.
 
 **Reading the output.** The logs carry counts and key hashes (`key_sha256`)
 only.
@@ -235,6 +262,8 @@ only.
 - One `stale prefix skipped` line per skipped entry, with `reason`.
 - One `stale prefix erased` line per erase.
 - On a stop, `stale prefix pass stopped` with `outcome` and `error_code`.
+- On the lease refusal, `stale prefix pass refused` with `error_code` and
+  `other_eraser_leases`, and no final line.
 - A final `stale prefix pass` line with:
   - `selected`: queued stale prefixes.
   - `due` and `backing_off`.
@@ -244,11 +273,14 @@ only.
   - `erased` and `versions_deleted`.
   - `skipped`: counts by reason.
   - `sibling_checked`.
+  - `other_eraser_leases`: unexpired leases of other eraser processes.
   - `stopped_by`: `max`, `signal` or the failing outcome.
 
 A dry run has no bucket credentials, so it does not make the bucket check in
-(b): `sibling_checked: false`. Its `eligible` count is therefore an upper bound
-for the execute run.
+(b): `sibling_checked: false`. The dry run applies the state checks only; the
+execute run additionally requires a live sibling manifest in the bucket, and
+the state can change between the two runs, so the two `eligible` counts can
+differ in either direction.
 
 Skip reasons:
 

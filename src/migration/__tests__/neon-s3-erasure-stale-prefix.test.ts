@@ -8,6 +8,7 @@
 import { afterAll as __modeAfterAll, beforeEach as __modeBeforeEach } from "bun:test";
 import { describe, expect, test } from "bun:test";
 import { spawn } from "node:child_process";
+import { existsSync } from "node:fs";
 import { mkdtemp } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -18,7 +19,7 @@ import type { ErasureAuthority } from "../neon-s3-erasure/authority.ts";
 import { storeEraser, type LiveObjectProbe } from "../neon-s3-erasure/eraser.ts";
 import { DEFAULT_ERASURE_CONFIG, ErasureJob, sessionPrefixParts } from "../neon-s3-erasure/job.ts";
 import { staleprefixOptions } from "../neon-s3-erasure/main.ts";
-import { SyncState } from "../neon-s3-sync/state.ts";
+import { LEASE_TTL_MS, SyncState } from "../neon-s3-sync/state.ts";
 import { FORBIDDEN_CREDENTIAL_ENV } from "../stdin-credentials.ts";
 import { FakeS3Versions } from "./fake-s3-versions.ts";
 
@@ -146,8 +147,9 @@ describe("stale-prefixes-only mode", () => {
   test("no sweep of any kind: no authority sweep reads, no erasure_seen rows, no sweep bookkeeping, no stale-lease release", async () => {
     const f = await fixture();
     f.dateMove();
-    // Another eraser's live lease on an unrelated prefix: a default run() would release it; the mode never does.
-    f.st.acquireLease(pfx("2026/10/01", "sess-9"), "eraser:424242", undefined, NOW - 1000);
+    // Another eraser's expired lease on an unrelated prefix (a live one refuses execute): a default run() would
+    // release it; the mode never does.
+    f.st.acquireLease(pfx("2026/10/01", "sess-9"), "eraser:424242", undefined, NOW - LEASE_TTL_MS);
     const metaBefore = rowsOf(f.path, "meta");
     const r = await f.job().staleprefixPass({ execute: true, probe: f.s.eraser() });
     expect(r.erased).toBe(1);
@@ -155,7 +157,7 @@ describe("stale-prefixes-only mode", () => {
     expect(f.calls.length).toBeGreaterThan(0); // the per-page authority readiness gate still ran
     expect(rowsOf(f.path, "erasure_seen")).toEqual([]);
     expect(rowsOf(f.path, "meta")).toEqual(metaBefore);
-    expect(rowsOf(f.path, "leases")).toEqual([JSON.stringify({ prefix: pfx("2026/10/01", "sess-9"), holder: "eraser:424242", at: NOW - 1000 })]);
+    expect(rowsOf(f.path, "leases")).toEqual([JSON.stringify({ prefix: pfx("2026/10/01", "sess-9"), holder: "eraser:424242", at: NOW - LEASE_TTL_MS })]);
   });
 
   test("guard (a): an old prefix that still holds a current exported or pending key is skipped current_key, untouched", async () => {
@@ -302,11 +304,64 @@ describe("stale-prefixes-only mode", () => {
     f.s.onDelete = () => void seen.push(...(f.st.db.prepare("SELECT prefix, holder FROM leases WHERE prefix = ?").all(a.oldP) as { holder: string }[]).map((l) => l.holder));
     const bRow = JSON.stringify(erasureRow(f.st, b.oldP));
     const r = await f.job().staleprefixPass({ execute: true, probe: f.s.eraser() });
-    expect(r).toMatchObject({ ok: true, erased: 1, skipped: { lease_busy: 1 } });
+    expect(r).toMatchObject({ ok: true, erased: 1, skipped: { lease_busy: 1 }, otherEraserLeases: 0 });
+    expect(r.refused).toBeUndefined();
     expect(new Set(seen)).toEqual(new Set([`eraser:${process.pid}`]));
     expect(rowsOf(f.path, "leases")).toEqual([JSON.stringify({ prefix: b.oldP, holder: "exporter:31337", at: NOW - 1000 })]);
     expect(JSON.stringify(erasureRow(f.st, b.oldP))).toBe(bRow);
     expect(f.s.count(b.oldP)).toBe(3);
+  });
+
+  test("another eraser's unexpired lease: execute refuses to start (nothing erased, state byte-identical); dry run reports it", async () => {
+    const f = await fixture();
+    const a = f.dateMove("sess-1", "g-1", NOW - 60_000);
+    // Live by one millisecond under acquireLease's own expiry rule, on an unrelated prefix.
+    f.st.acquireLease(pfx("2026/10/01", "sess-9"), "eraser:424242", undefined, NOW - LEASE_TTL_MS + 1);
+    const before = dump(f.path);
+    const r = await f.job().staleprefixPass({ execute: true, probe: f.s.eraser() });
+    expect(r).toMatchObject({ ok: false, refused: "stale_prefix_mode_other_eraser_lease", otherEraserLeases: 1, erased: 0, eligible: 0, versionsDeleted: 0, skipped: {} });
+    expect(f.s.deletes).toEqual([]);
+    expect(f.s.lists).toBe(0);
+    expect(dump(f.path)).toEqual(before);
+    expect(f.s.count(a.oldP)).toBe(3);
+    expect(f.logs.find((l) => l.message === "stale prefix pass refused")).toMatchObject({ error_code: "stale_prefix_mode_other_eraser_lease", other_eraser_leases: 1 });
+    // The dry run does not refuse: it reports the count and writes nothing.
+    const dry = await f.job().staleprefixPass({ execute: false });
+    expect(dry).toMatchObject({ ok: true, otherEraserLeases: 1, eligible: 1 });
+    expect(dry.refused).toBeUndefined();
+    expect(passLine(f.logs)).toMatchObject({ execute: false, other_eraser_leases: 1 });
+    expect(dump(f.path)).toEqual(before);
+  });
+
+  test("another eraser's expired lease, and this process's own lease, do not refuse; neither lease is released", async () => {
+    for (const [holder, at] of [["eraser:424242", NOW - LEASE_TTL_MS], [`eraser:${process.pid}`, NOW - 1000]] as const) {
+      const f = await fixture();
+      const a = f.dateMove("sess-1", "g-1", NOW - 60_000);
+      const other = pfx("2026/10/01", "sess-9");
+      f.st.acquireLease(other, holder, undefined, at);
+      const r = await f.job().staleprefixPass({ execute: true, probe: f.s.eraser() });
+      expect(r).toMatchObject({ ok: true, erased: 1, otherEraserLeases: 0 });
+      expect(r.refused).toBeUndefined();
+      expect(f.s.count(a.oldP)).toBe(0);
+      expect(rowsOf(f.path, "leases")).toEqual([JSON.stringify({ prefix: other, holder, at })]);
+    }
+  });
+
+  test("a state error inside the guard during execute is recorded as a failure on that entry (backoff) and stops the pass; the dry run surfaces it as an error", async () => {
+    const f = await fixture();
+    const a = f.dateMove("sess-1", "g-1", NOW - 60_000);
+    const b = f.dateMove("sess-2", "g-2", NOW - 50_000);
+    const bRow = JSON.stringify(erasureRow(f.st, b.oldP));
+    f.st.exportedKeysOf = () => { throw Object.assign(new Error("state read"), { code: "state_read_failed" }); };
+    const r = await f.job().staleprefixPass({ execute: true, probe: f.s.eraser() });
+    expect(r).toMatchObject({ ok: false, stoppedBy: "failed", erased: 0 });
+    const aRow = erasureRow(f.st, a.oldP)!;
+    expect(aRow).toMatchObject({ error: "state_read_failed", attempts: 1 });
+    expect(Number(aRow.next_try)).toBeGreaterThan(NOW);
+    expect(JSON.stringify(erasureRow(f.st, b.oldP))).toBe(bRow);
+    expect(f.s.deletes).toEqual([]);
+    expect(rowsOf(f.path, "leases")).toEqual([]);
+    await expect(f.job().staleprefixPass({ execute: false })).rejects.toMatchObject({ code: "state_read_failed" });
   });
 
   test("refusals in the job: S3X_OBLIGATIONS on, and --execute without an existence check", async () => {
@@ -370,6 +425,13 @@ describe("CLI options", () => {
     expect(code(() => staleprefixOptions(["--max=3"], env()))).toBe("stale_prefix_max_without_mode");
   });
 
+  test("near-miss switches and --max forms without the exact switch are refused (the default job would ignore them)", () => {
+    for (const args of [["--stale-prefix-only", "--execute"], ["--stale-prefixes", "--execute"], ["--stale_prefixes_only"], ["--stale-prefixes-only=1"], ["--maximum", "3"], ["--max-count=3"], ["--execute", "--stale"]])
+      expect(code(() => staleprefixOptions(args, env()))).toBe("stale_prefix_mode_flag_refused");
+    // Unchanged for every other default-path argument.
+    expect(staleprefixOptions(["--execute", "--once", "--loop", "--dry-run", "extra"], env())).toBeUndefined();
+  });
+
   test("accepted forms", () => {
     expect(staleprefixOptions(["--stale-prefixes-only"], env())).toEqual({ execute: false });
     expect(staleprefixOptions(["--stale-prefixes-only", "--execute", "--once", "--max", "25"], env({ BABYSITTER_RETENTION_SWEEP: " OFF " }))).toEqual({ execute: true, max: 25 });
@@ -397,7 +459,7 @@ describe("CLI options", () => {
   test("the CLI refuses before reading stdin, exits 1 and logs only the code", async () => {
     const main = new URL("../neon-s3-erasure/main.ts", import.meta.url).pathname;
     const run = (args: string[], extra: Record<string, string> = {}) =>
-      new Promise<{ lines: Record<string, unknown>[]; code: number | null }>(async (resolve, reject) => {
+      new Promise<{ lines: Record<string, unknown>[]; code: number | null; state: string }>(async (resolve, reject) => {
         const home = await mkdtemp(join(process.env.TMPDIR ?? tmpdir(), "e3-stale-cli-"));
         const e: Record<string, string | undefined> = { ...process.env, HOME: home, S3X_STATE: join(home, "s.sqlite"), ...extra };
         for (const k of FORBIDDEN_CREDENTIAL_ENV) delete e[k];
@@ -407,17 +469,25 @@ describe("CLI options", () => {
         let text = "";
         child.stdout.on("data", (b) => (text += b));
         child.on("error", reject);
-        child.on("exit", (c) => resolve({ lines: text.trim().split("\n").filter(Boolean).map((l) => JSON.parse(l)), code: c }));
+        child.on("exit", (c) => resolve({ lines: text.trim().split("\n").filter(Boolean).map((l) => JSON.parse(l)), code: c, state: join(home, "s.sqlite") }));
         child.stdin.end("{}");
       });
     for (const [args, extra, want] of [
       [["--stale-prefixes-only", "--max", "0"], {}, "stale_prefix_max_invalid"],
       [["--execute", "--max", "5"], {}, "stale_prefix_max_without_mode"],
       [["--stale-prefixes-only", "--execute"], { BABYSITTER_RETENTION_SWEEP: "on" }, "stale_prefix_mode_retention_refused"],
+      [["--stale-prefix-only", "--execute"], {}, "stale_prefix_mode_flag_refused"],
+      [["--stale-prefixes", "--execute"], {}, "stale_prefix_mode_flag_refused"],
+      [["--stale_prefixes_only"], {}, "stale_prefix_mode_flag_refused"],
+      [["--stale-prefixes-only=1"], {}, "stale_prefix_mode_flag_refused"],
+      [["--maximum", "3"], {}, "stale_prefix_mode_flag_refused"],
+      [["--max-count=3"], {}, "stale_prefix_mode_flag_refused"],
     ] as [string[], Record<string, string>, string][]) {
       const r = await run(args, extra);
       expect(r.code).toBe(1);
       expect(r.lines.map((l) => [l.message, l.error_code])).toEqual([["exit on error", want]]);
+      // Refused before stdin is read (that would fail on the empty JSON with another code) and before the state opens.
+      expect(existsSync(r.state)).toBe(false);
     }
   });
 });

@@ -142,6 +142,10 @@ export interface StalePrefixResult {
   versionsDeleted: number;
   skipped: Partial<Record<StalePrefixSkip, number>>;
   siblingChecked: boolean;
+  /** Unexpired leases held by another eraser process at the start. Execute refuses to start when any exist. */
+  otherEraserLeases: number;
+  /** Set when execute refused to start (nothing erased, nothing written). */
+  refused?: "stale_prefix_mode_other_eraser_lease";
   stoppedBy?: string;
 }
 
@@ -1018,7 +1022,16 @@ export class ErasureJob {
     const res: StalePrefixResult = {
       ok: true, execute: opts.execute, selected: selected.length, due: due.length, backingOff: selected.length - due.length,
       otherEntries: queued - selected.length, eligible: 0, erased: 0, versionsDeleted: 0, skipped, siblingChecked: !!opts.probe,
+      otherEraserLeases: this.state.otherEraserLeases(LEASE_HOLDER, now),
     };
+    // Another eraser may be mid-run (or crashed less than the lease TTL ago): execute never runs beside it and never
+    // releases its leases. Exporter leases do not refuse; those prefixes skip as lease_busy. A dry run only reports.
+    if (opts.execute && res.otherEraserLeases > 0) {
+      res.ok = false;
+      res.refused = "stale_prefix_mode_other_eraser_lease";
+      this.log({ message: "stale prefix pass refused", error_code: res.refused, other_eraser_leases: res.otherEraserLeases });
+      return res;
+    }
     const skip = (reason: StalePrefixSkip, key: string) => {
       skipped[reason] = (skipped[reason] ?? 0) + 1;
       this.log({ message: "stale prefix skipped", reason, key_sha256: keyHash(key), execute: opts.execute });
@@ -1055,7 +1068,7 @@ export class ErasureJob {
     this.log({
       message: "stale prefix pass", execute: opts.execute, ok: res.ok, selected: res.selected, due: res.due, backing_off: res.backingOff,
       other_entries: res.otherEntries, eligible: res.eligible, erased: res.erased, versions_deleted: res.versionsDeleted, skipped,
-      sibling_checked: res.siblingChecked, ...(opts.max !== undefined ? { max: opts.max } : {}), ...(res.stoppedBy ? { stopped_by: res.stoppedBy } : {}),
+      sibling_checked: res.siblingChecked, other_eraser_leases: res.otherEraserLeases, ...(opts.max !== undefined ? { max: opts.max } : {}), ...(res.stoppedBy ? { stopped_by: res.stoppedBy } : {}),
     });
     return res;
   }
