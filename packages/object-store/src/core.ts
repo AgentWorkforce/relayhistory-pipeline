@@ -361,21 +361,120 @@ export async function errorBody(response: Response): Promise<string> {
   }
 }
 
-/** Wrap `fetch` so network failures are `transient`. */
+/**
+ * Wrap `fetch` so network failures are `transient`.
+ *
+ * `timeoutMs` (optional): one deadline from the call to the end of the response
+ * body. Before the response arrives, crossing it aborts the request and
+ * rejects with a `transient` error; afterwards, a body read still pending when
+ * it passes errors the body stream with the same `transient` error. The timer
+ * stops when the body ends, errors or is cancelled, or at once when the
+ * response has no body. Signing and other work before the call are not
+ * covered. Undefined: no abort signal and no wrapping, exactly as without it.
+ */
 export async function send(
   backend: string,
   key: string,
   url: URL | string,
   init: RequestInit,
   fetchImpl: typeof fetch,
+  timeoutMs?: number,
 ): Promise<Response> {
+  if (timeoutMs === undefined) {
+    try {
+      return await fetchImpl(url, init);
+    } catch (cause) {
+      throw new ObjectStoreError(
+        "transient",
+        backend,
+        `${key}: request failed`,
+        {
+          cause,
+        },
+      );
+    }
+  }
+  return sendWithTimeout(backend, key, url, init, fetchImpl, timeoutMs);
+}
+
+async function sendWithTimeout(
+  backend: string,
+  key: string,
+  url: URL | string,
+  init: RequestInit,
+  fetchImpl: typeof fetch,
+  timeoutMs: number,
+): Promise<Response> {
+  const timedOut = (cause?: unknown) =>
+    new ObjectStoreError(
+      "transient",
+      backend,
+      `${key}: request timed out after ${timeoutMs} ms`,
+      cause === undefined ? {} : { cause },
+    );
+  const controller = new AbortController();
+  // Settles only on the deadline; raced against the fetch and every body read,
+  // so a fetch implementation that ignores the signal is still cut off.
+  const deadline = new Promise<never>((_, reject) => {
+    controller.signal.addEventListener("abort", () => reject(timedOut()), {
+      once: true,
+    });
+  });
+  deadline.catch(() => {});
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  let res: Response;
   try {
-    return await fetchImpl(url, init);
+    res = await Promise.race([
+      fetchImpl(url, { ...init, signal: controller.signal }),
+      deadline,
+    ]);
   } catch (cause) {
+    clearTimeout(timer);
+    if (controller.signal.aborted)
+      throw isObjectStoreError(cause) ? cause : timedOut(cause);
     throw new ObjectStoreError("transient", backend, `${key}: request failed`, {
       cause,
     });
   }
+  if (!res.body) {
+    clearTimeout(timer);
+    return res;
+  }
+  const reader = res.body.getReader();
+  const body = new ReadableStream<Uint8Array>({
+    async pull(stream) {
+      let chunk: Awaited<ReturnType<typeof reader.read>>;
+      try {
+        chunk = await Promise.race([reader.read(), deadline]);
+      } catch (cause) {
+        clearTimeout(timer);
+        reader.cancel().catch(() => {});
+        stream.error(
+          controller.signal.aborted
+            ? isObjectStoreError(cause)
+              ? cause
+              : timedOut(cause)
+            : cause,
+        );
+        return;
+      }
+      if (chunk.done) {
+        clearTimeout(timer);
+        stream.close();
+        return;
+      }
+      stream.enqueue(chunk.value);
+    },
+    cancel(reason) {
+      clearTimeout(timer);
+      return reader.cancel(reason);
+    },
+  });
+  return new Response(body, {
+    status: res.status,
+    statusText: res.statusText,
+    headers: res.headers,
+  });
 }
 
 /** Whole-object size from a GET response (range responses carry it in Content-Range). */

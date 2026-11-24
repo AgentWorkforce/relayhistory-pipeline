@@ -97,6 +97,12 @@ export interface LambdaEnv {
    * is requeued (consumer.ts batch deadline). Absent: as before.
    */
   searchBatchDeadlineMarginMs?: number;
+  /**
+   * SESSION_PIPELINE_OBJECT_READ_TIMEOUT_MS (default off): a deadline on every object GET
+   * (including its body) and HEAD this function sends to the bucket; a timed-out call fails as a
+   * transient object-store error (packages/object-store core.ts send). Absent: no deadline.
+   */
+  objectReadTimeoutMs?: number;
 }
 
 /** SEARCH_INDEX_BATCH_DEADLINE_MARGIN_MS bounds (ms): at least one second, below the function's 300 s timeout. */
@@ -116,6 +122,26 @@ export function batchDeadlineMarginFromEnv(env: Record<string, string | undefine
       `session pipeline: SEARCH_INDEX_BATCH_DEADLINE_MARGIN_MS must be an integer from ${SEARCH_INDEX_BATCH_DEADLINE_MARGIN_MIN_MS} to ${SEARCH_INDEX_BATCH_DEADLINE_MARGIN_MAX_MS}`,
     );
   if (env.SEARCH_INDEX_ENABLED !== "1") throw new Error("session pipeline: SEARCH_INDEX_BATCH_DEADLINE_MARGIN_MS needs SEARCH_INDEX_ENABLED=1");
+  return ms;
+}
+
+/** SESSION_PIPELINE_OBJECT_READ_TIMEOUT_MS bounds (ms): at least one second, below the function's 300 s timeout. */
+export const OBJECT_READ_TIMEOUT_MIN_MS = 1_000;
+export const OBJECT_READ_TIMEOUT_MAX_MS = 299_000;
+
+/**
+ * SESSION_PIPELINE_OBJECT_READ_TIMEOUT_MS: unset or "" is off; otherwise a decimal integer of
+ * milliseconds within the bounds above, else init fails naming the variable, never the value.
+ * Not tied to SEARCH_INDEX_ENABLED: the pointer stage and reconcile read objects too.
+ */
+export function objectReadTimeoutFromEnv(env: Record<string, string | undefined>): number | undefined {
+  const value = env.SESSION_PIPELINE_OBJECT_READ_TIMEOUT_MS;
+  if (value === undefined || value === "") return undefined;
+  const ms = /^[1-9][0-9]{0,8}$/.test(value) ? Number(value) : NaN;
+  if (!(ms >= OBJECT_READ_TIMEOUT_MIN_MS && ms <= OBJECT_READ_TIMEOUT_MAX_MS))
+    throw new Error(
+      `session pipeline: SESSION_PIPELINE_OBJECT_READ_TIMEOUT_MS must be an integer from ${OBJECT_READ_TIMEOUT_MIN_MS} to ${OBJECT_READ_TIMEOUT_MAX_MS}`,
+    );
   return ms;
 }
 
@@ -149,6 +175,7 @@ export function lambdaEnv(env: NodeJS.ProcessEnv = process.env): LambdaEnv {
   // SESSION_POINTER_SKIP_ORIGIN_BUCKET_ENABLED: strict grammar, default off, no SEARCH_INDEX_ENABLED coupling.
   const pointerSkipOriginBucket = pointerSkipOriginBucketFromEnv(env);
   const searchBatchDeadlineMarginMs = batchDeadlineMarginFromEnv(env);
+  const objectReadTimeoutMs = objectReadTimeoutFromEnv(env);
   return {
     region: need("AWS_REGION"),
     bucket: need("PIPELINE_RAW_S3_BUCKET"),
@@ -164,6 +191,7 @@ export function lambdaEnv(env: NodeJS.ProcessEnv = process.env): LambdaEnv {
     ...(searchSkipAcceptanceMissing ? { searchSkipAcceptanceMissing: true as const } : {}),
     ...(pointerSkipOriginBucket ? { pointerSkipOriginBucketEnabled: true as const } : {}),
     ...(searchBatchDeadlineMarginMs !== undefined ? { searchBatchDeadlineMarginMs } : {}),
+    ...(objectReadTimeoutMs !== undefined ? { objectReadTimeoutMs } : {}),
   };
 }
 
@@ -323,7 +351,7 @@ async function init(): Promise<Runtime> {
   if (!SecretString) throw new Error("session pipeline secret has no value yet");
   const secret = parseSecret(SecretString);
   const db = supabasePool(secret.hoopdb_url, env.dbPoolMax);
-  const store = createS3Store({ bucket: env.bucket, region: env.region, credentials: async () => lambdaCredentials() });
+  const store = pipelineStore(env);
   const reader = objectStoreManifestReader(store, { provider: "s3", bucket: env.bucket });
   const bindings = { PIPELINE_ORG_FROM_PREFIX: "true", PIPELINE_KEY_PREFIX: env.keyPrefix };
   const fanout: PipelineQueue = env.fanout === "postgres" ? postgresPipelineQueue(db) : droppedFanout;
@@ -504,6 +532,20 @@ interface ReconcileEvent {
   link?: number;
 }
 
+/** The function's bucket client; the read deadline only when SESSION_PIPELINE_OBJECT_READ_TIMEOUT_MS is set. */
+export function pipelineStore(
+  env: Pick<LambdaEnv, "bucket" | "region" | "objectReadTimeoutMs">,
+  options: { credentials?: Parameters<typeof createS3Store>[0]["credentials"]; fetch?: typeof fetch } = {},
+) {
+  return createS3Store({
+    bucket: env.bucket,
+    region: env.region,
+    credentials: options.credentials ?? (async () => lambdaCredentials()),
+    ...(options.fetch ? { fetch: options.fetch } : {}),
+    ...(env.objectReadTimeoutMs !== undefined ? { readTimeoutMs: env.objectReadTimeoutMs } : {}),
+  });
+}
+
 /** A chain never outlives two cadences of listing: a runaway is cut off, the next schedule starts over. */
 export const MAX_RECONCILE_LINKS = 24;
 
@@ -512,7 +554,7 @@ async function runReconcile(rt: Runtime, event: ReconcileEvent) {
   const since = event.since ? new Date(event.since) : new Date(Date.now() - env.reconcileLookbackMinutes * 60_000);
   if (!Number.isFinite(since.getTime())) throw new Error("reconcile: invalid since");
   const summary = await reconcileRecent({
-    store: createS3Store({ bucket: env.bucket, region: env.region, credentials: async () => lambdaCredentials() }),
+    store: pipelineStore(env),
     db: rt.deps.pointer.db,
     keyPrefix: env.keyPrefix,
     since,

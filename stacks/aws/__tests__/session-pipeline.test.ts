@@ -9,6 +9,8 @@ import {
   BATCH_DEADLINE_MARGIN_MIN_MS,
   DELIVERY_DELAY_SECONDS,
   FUNCTION_TIMEOUT_SECONDS,
+  OBJECT_READ_TIMEOUT_MAX_MS,
+  OBJECT_READ_TIMEOUT_MIN_MS,
   SESSION_BRIEF_RESOURCES,
   SESSION_PIPELINE_RESOURCES,
   VISIBILITY_TIMEOUT_SECONDS,
@@ -24,7 +26,12 @@ import {
   sessionQueuePolicy,
   sessionSecretPolicy,
 } from "../session-pipeline.ts";
-import { SEARCH_INDEX_BATCH_DEADLINE_MARGIN_MAX_MS, SEARCH_INDEX_BATCH_DEADLINE_MARGIN_MIN_MS } from "../../../src/session-pipeline/lambda.ts";
+import {
+  OBJECT_READ_TIMEOUT_MAX_MS as FN_OBJECT_READ_TIMEOUT_MAX_MS,
+  OBJECT_READ_TIMEOUT_MIN_MS as FN_OBJECT_READ_TIMEOUT_MIN_MS,
+  SEARCH_INDEX_BATCH_DEADLINE_MARGIN_MAX_MS,
+  SEARCH_INDEX_BATCH_DEADLINE_MARGIN_MIN_MS,
+} from "../../../src/session-pipeline/lambda.ts";
 import { assertTranscriptStoreInputs, assertTranscriptStorePlanContract, transcriptBucketPolicy, transcriptKeyPolicy, transcriptNames } from "../transcript-store.ts";
 
 const STAGE = "aws-sessions-prod";
@@ -639,5 +646,42 @@ describe("session pipeline: search batch deadline", () => {
     const on = sessionPipelineFunctionProps({ ...i, p: { searchIndex: true, searchBatchDeadline: { marginMs: 90_000 } } });
     expect({ ...on, env: undefined }).toEqual({ ...off, env: undefined });
     expect(on.env).toEqual({ ...off.env, SEARCH_INDEX_BATCH_DEADLINE_MARGIN_MS: "90000" });
+  });
+});
+
+describe("session pipeline: object read timeout", () => {
+  const refuse = (why: string): never => {
+    throw new Error(why);
+  };
+  it("absent renders nothing new; set renders SESSION_PIPELINE_OBJECT_READ_TIMEOUT_MS only, with or without search", () => {
+    for (const searchIndex of [false, true]) {
+      const off = sessionPipelineEnv({ stage: STAGE, bucket: t.bucket, names: p, p: { searchIndex } });
+      expect(Object.keys(off)).not.toContain("SESSION_PIPELINE_OBJECT_READ_TIMEOUT_MS");
+      const on = sessionPipelineEnv({ stage: STAGE, bucket: t.bucket, names: p, p: { searchIndex, objectReadTimeout: { ms: 20_000 } } });
+      expect(on).toEqual({ ...off, SESSION_PIPELINE_OBJECT_READ_TIMEOUT_MS: "20000" });
+    }
+  });
+
+  it("the bounds are the function's own and stay below the function timeout", () => {
+    expect(OBJECT_READ_TIMEOUT_MIN_MS).toBe(FN_OBJECT_READ_TIMEOUT_MIN_MS);
+    expect(OBJECT_READ_TIMEOUT_MAX_MS).toBe(FN_OBJECT_READ_TIMEOUT_MAX_MS);
+    expect(OBJECT_READ_TIMEOUT_MAX_MS).toBeLessThan(FUNCTION_TIMEOUT_SECONDS * 1000);
+  });
+
+  it("validates the shape and the value strictly", () => {
+    const ok = (v: unknown) => assertSessionPipelineInputs(v, refuse);
+    for (const ms of [OBJECT_READ_TIMEOUT_MIN_MS, 20_000, OBJECT_READ_TIMEOUT_MAX_MS]) expect(() => ok({ objectReadTimeout: { ms } })).not.toThrow();
+    for (const ms of [-1, 0, 999, OBJECT_READ_TIMEOUT_MAX_MS + 1, FUNCTION_TIMEOUT_SECONDS * 1000, 1.5, Number.NaN, Number.POSITIVE_INFINITY, "20000", null, undefined])
+      expect(() => ok({ objectReadTimeout: { ms } })).toThrow(/objectReadTimeout.ms must be an integer from 1000 to 299000/);
+    expect(() => ok({ objectReadTimeout: { ms: 20_000, put: true } })).toThrow(/objectReadTimeout.put is not a known setting/);
+    for (const bad of [20_000, true, null, [], "20000"]) expect(() => ok({ objectReadTimeout: bad })).toThrow(/objectReadTimeout must be a plain object/);
+  });
+
+  it("the function's resources and props are the same with it set, but the env", () => {
+    const i = { stage: STAGE, accountId: ACCOUNT, region: REGION, bucket: t.bucket, tags: () => ({}) };
+    const off = sessionPipelineFunctionProps({ ...i, p: { searchIndex: true } });
+    const on = sessionPipelineFunctionProps({ ...i, p: { searchIndex: true, objectReadTimeout: { ms: 20_000 } } });
+    expect({ ...on, env: undefined }).toEqual({ ...off, env: undefined });
+    expect(on.env).toEqual({ ...off.env, SESSION_PIPELINE_OBJECT_READ_TIMEOUT_MS: "20000" });
   });
 });

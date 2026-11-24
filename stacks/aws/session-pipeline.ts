@@ -61,6 +61,13 @@ export interface SessionPipelineInputs {
    * invocation's remaining time is under it, no further scope's pass starts and the rest are requeued.
    */
   searchBatchDeadline?: { marginMs: number };
+  /**
+   * A deadline on the function's object GETs (body included) and HEADs (packages/object-store
+   * core.ts send). Absent: no variable is rendered and reads have no deadline. `ms` (an integer from
+   * OBJECT_READ_TIMEOUT_MIN_MS to OBJECT_READ_TIMEOUT_MAX_MS) renders
+   * SESSION_PIPELINE_OBJECT_READ_TIMEOUT_MS; a read past it fails as a transient error.
+   */
+  objectReadTimeout?: { ms: number };
 }
 
 /**
@@ -110,6 +117,9 @@ export const DELIVERY_DELAY_SECONDS = 30;
 /** searchBatchDeadline.marginMs bounds: the same as the function's own check (src/session-pipeline/lambda.ts). */
 export const BATCH_DEADLINE_MARGIN_MIN_MS = 1_000;
 export const BATCH_DEADLINE_MARGIN_MAX_MS = FUNCTION_TIMEOUT_SECONDS * 1000 - 1_000;
+/** objectReadTimeout.ms bounds: the same as the function's own check (src/session-pipeline/lambda.ts). */
+export const OBJECT_READ_TIMEOUT_MIN_MS = 1_000;
+export const OBJECT_READ_TIMEOUT_MAX_MS = FUNCTION_TIMEOUT_SECONDS * 1000 - 1_000;
 
 export interface SessionPipelineNames {
   function: string;
@@ -143,7 +153,7 @@ export function assertSessionPipelineInputs(p: unknown, refuse: (why: string) =>
     refuse("transcriptStore.sessionPipeline must be a plain object");
   const v = p as Record<string, unknown>;
   for (const k of Object.keys(v))
-    if (k !== "searchIndex" && k !== "maxConcurrency" && k !== "reconcileMinutes" && k !== "briefs" && k !== "streamReconcile" && k !== "searchBatchDeadline") refuse(`transcriptStore.sessionPipeline.${k} is not a known setting`);
+    if (k !== "searchIndex" && k !== "maxConcurrency" && k !== "reconcileMinutes" && k !== "briefs" && k !== "streamReconcile" && k !== "searchBatchDeadline" && k !== "objectReadTimeout") refuse(`transcriptStore.sessionPipeline.${k} is not a known setting`);
   if (v.searchIndex !== undefined && typeof v.searchIndex !== "boolean") refuse("transcriptStore.sessionPipeline.searchIndex must be a boolean");
   if (v.maxConcurrency !== undefined && !(Number.isInteger(v.maxConcurrency) && (v.maxConcurrency as number) >= 2 && (v.maxConcurrency as number) <= 10))
     refuse("transcriptStore.sessionPipeline.maxConcurrency must be an integer from 2 to 10");
@@ -178,6 +188,14 @@ export function assertSessionPipelineInputs(p: unknown, refuse: (why: string) =>
     if (!(Number.isInteger(d.marginMs) && (d.marginMs as number) >= BATCH_DEADLINE_MARGIN_MIN_MS && (d.marginMs as number) <= BATCH_DEADLINE_MARGIN_MAX_MS))
       refuse(`transcriptStore.sessionPipeline.searchBatchDeadline.marginMs must be an integer from ${BATCH_DEADLINE_MARGIN_MIN_MS} to ${BATCH_DEADLINE_MARGIN_MAX_MS}`);
     if (v.searchIndex !== true) refuse("transcriptStore.sessionPipeline.searchBatchDeadline requires searchIndex: true");
+  }
+  if (v.objectReadTimeout !== undefined) {
+    const o = v.objectReadTimeout as Record<string, unknown> | null;
+    if (o === null || typeof o !== "object" || Array.isArray(o) || Object.getPrototypeOf(o) !== Object.prototype)
+      refuse("transcriptStore.sessionPipeline.objectReadTimeout must be a plain object");
+    for (const k of Object.keys(o)) if (k !== "ms") refuse(`transcriptStore.sessionPipeline.objectReadTimeout.${k} is not a known setting`);
+    if (!(Number.isInteger(o.ms) && (o.ms as number) >= OBJECT_READ_TIMEOUT_MIN_MS && (o.ms as number) <= OBJECT_READ_TIMEOUT_MAX_MS))
+      refuse(`transcriptStore.sessionPipeline.objectReadTimeout.ms must be an integer from ${OBJECT_READ_TIMEOUT_MIN_MS} to ${OBJECT_READ_TIMEOUT_MAX_MS}`);
   }
 }
 
@@ -309,6 +327,8 @@ export function sessionPipelineEnv(i: { stage: string; bucket: string; names: Se
     ...(i.p.streamReconcile?.enabled === true ? { SEARCH_INDEX_STREAMING_CH: "1" } : {}),
     // Only when set: a stage without searchBatchDeadline renders nothing new.
     ...(i.p.searchBatchDeadline !== undefined ? { SEARCH_INDEX_BATCH_DEADLINE_MARGIN_MS: String(i.p.searchBatchDeadline.marginMs) } : {}),
+    // Only when set: a stage without objectReadTimeout renders nothing new.
+    ...(i.p.objectReadTimeout !== undefined ? { SESSION_PIPELINE_OBJECT_READ_TIMEOUT_MS: String(i.p.objectReadTimeout.ms) } : {}),
     PIPELINE_FANOUT: "off",
     PIPELINE_RECONCILE_LOOKBACK_MINUTES: String(2 * (i.p.reconcileMinutes ?? 30)),
     HOOPDB_POOL_MAX: "4",

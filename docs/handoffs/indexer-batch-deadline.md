@@ -50,3 +50,31 @@ body and ignores it. The pointer loop is not changed. With
 and the stream deadline's path and reason (`stream_batch_deadline`) are unchanged.
 
 New log field: `batch_deadline_deferrals` (non-negative integer only).
+
+## Object read deadline
+
+`SESSION_PIPELINE_OBJECT_READ_TIMEOUT_MS`, read once at Lambda init (`objectReadTimeoutFromEnv`
+in `src/session-pipeline/lambda.ts`):
+
+| value | effect |
+| --- | --- |
+| unset, `""` | off (the default): no abort signal, responses returned as before |
+| a decimal integer from `1000` to `299000` (milliseconds) | on, for every stage (not tied to `SEARCH_INDEX_ENABLED`) |
+| anything else | init fails, naming the variable, never the value |
+
+The stack renders it only from `transcriptStore.sessionPipeline.objectReadTimeout: { ms }`
+(same bounds, unknown keys refused).
+
+When set, the function's bucket client (`pipelineStore`, used by init and by reconcile)
+gives each object GET and HEAD one deadline from the call to the end of the response body
+(`send` in `packages/object-store/src/core.ts`, option `readTimeoutMs` on the S3 store).
+Before the headers arrive, crossing it aborts the request; during the body, a pending read
+errors the body stream. Either way the error is an `ObjectStoreError` with code
+`transient` (retryable). Request signing before the call is not covered. Put, delete, list
+and presign are unchanged.
+
+A timed-out manifest read is rethrown by the manifest reader (only `not_found` reads as
+missing), so the key or scope fails and its messages are redelivered. A timed-out raw chunk
+read becomes the retryable `chunk_unavailable` (`readChunkRecords` in
+`src/session-pipeline/search-index.ts`), which the search pass rethrows, so the scope fails
+the same way rather than being recorded as incomplete.

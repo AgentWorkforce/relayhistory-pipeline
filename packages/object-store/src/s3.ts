@@ -55,6 +55,13 @@ export interface S3Config {
    * refuses `aws:kms` without naming the bucket's own key.
    */
   sseKmsKeyId?: string;
+  /**
+   * Optional deadline in milliseconds (a positive safe integer) on object GET
+   * (`getObject`, including its body read) and HEAD; a timed-out call fails
+   * with a `transient` error (see `send` in core.ts). Put, delete, list and
+   * presign are unchanged. Absent: no deadline and no abort signal.
+   */
+  readTimeoutMs?: number;
 }
 
 const BACKEND = "s3";
@@ -69,6 +76,13 @@ class S3Transport implements Transport {
     this.#config = config;
     this.#credentials = cachedProvider(config.credentials);
     this.#fetch = config.fetch ?? ((...a) => fetch(...a));
+    const t = config.readTimeoutMs;
+    if (t !== undefined && !(Number.isSafeInteger(t) && t > 0))
+      throw new ObjectStoreError(
+        "invalid_argument",
+        BACKEND,
+        "readTimeoutMs must be a positive integer",
+      );
   }
 
   #url(key = ""): URL {
@@ -93,6 +107,7 @@ class S3Transport implements Transport {
     url: URL,
     headers: Headers,
     body?: Uint8Array,
+    timeoutMs?: number,
   ): Promise<Response> {
     await signRequest({
       method,
@@ -112,6 +127,7 @@ class S3Transport implements Transport {
         ...(body ? { body: body as Uint8Array<ArrayBuffer> } : {}),
       },
       this.#fetch,
+      timeoutMs,
     );
   }
 
@@ -187,7 +203,14 @@ class S3Transport implements Transport {
   }
 
   async head(key: ObjectKey): Promise<ObjectMeta | undefined> {
-    const res = await this.#request(key, "HEAD", this.#url(key), new Headers());
+    const res = await this.#request(
+      key,
+      "HEAD",
+      this.#url(key),
+      new Headers(),
+      undefined,
+      this.#config.readTimeoutMs,
+    );
     if (res.status === 404) return undefined;
     if (!res.ok) throw errorForStatus(BACKEND, key, res.status, "");
     return {
@@ -205,7 +228,14 @@ class S3Transport implements Transport {
   async getObject(key: ObjectKey, range?: ByteRange): Promise<GetObject> {
     const headers = new Headers();
     if (range) headers.set("range", `bytes=${range.start}-${range.end - 1}`);
-    const res = await this.#request(key, "GET", this.#url(key), headers);
+    const res = await this.#request(
+      key,
+      "GET",
+      this.#url(key),
+      headers,
+      undefined,
+      this.#config.readTimeoutMs,
+    );
     if (!res.ok || !res.body)
       throw errorForStatus(BACKEND, key, res.status, await errorBody(res));
     return {
