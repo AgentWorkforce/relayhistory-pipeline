@@ -14,7 +14,7 @@ things are missing:
 3. **De-duplication.** A parent session and the children it delegates to, the same work seen by two harnesses, or one
    session shared by several users would each be counted more than once by a naive sum.
 
-## Sources (read-only map, 2026-11-25)
+## Sources (read-only map, 2026-11-24)
 
 | Link | Source | Owner | Notes |
 |---|---|---|---|
@@ -30,8 +30,18 @@ Attribute observed spend by **organization, workspace, person and project/repo**
 
 Rules:
 
-- **Observed only.** Sum only `observed` usage. Sum `costUSD` only where it is known, and report the known-cost
-  coverage next to every sum. Nothing is imputed or extrapolated.
+- **Observed only, on two independent axes.** Token sums cover sessions with `observed` usage. Cost sums cover
+  sessions with a known `costUSD`. Each sum carries its own denominator (`observedSessions` over `sessions`;
+  `knownCostSessions` over `sessions`), because a session can have observed tokens and an unknown cost. When
+  `knownCostSessions` is 0, `costUSD` is null, never 0. Nothing is imputed or extrapolated.
+- **What the window means.** F1 usage is a session total, not event-time spend. The window SELECTS sessions (by the
+  same rule as Stage 1: analyzed and active within `[since, until)`), and each selected session contributes its whole
+  recorded total once. The result is labelled "recorded usage of sessions active in the window", never "spend in that
+  week". Successive windows must not be summed, because a long session can appear in several. Splitting by event time
+  needs per-event usage, which the producer does not report today.
+- **Token semantics.** `inputTokens`, `outputTokens`, `cachedInputTokens` and `totalTokens` are summed as the source
+  reports them, never recombined (a source's `totalTokens` may or may not include cached input). F1's list of models
+  used is shown as which models were used; cost is never split per model.
 - **Once per session.** A session's usage counts once, never once per user. A session with one user is attributed to
   that user. A session with several users goes to a `shared` bucket for its project, with the user count. It is never
   split by guesswork.
@@ -40,7 +50,9 @@ Rules:
   `includesChildren` and its children are excluded from the sum. The producer must state which applies, per source.
   This is the open question below.
 - **Cross-harness duplicates.** One logical piece of work seen by two harnesses is not merged by text or time. Without
-  a shared canonical id it counts twice and is labelled as such. Merging needs an explicit producer-side link.
+  a shared canonical id, sums are labelled "observed recorded usage, duplication possible", never "deduplicated spend".
+  Each sum carries counts of unresolved and excluded sessions (`unresolvedLinks`, `excludedSessions` with reasons).
+  Merging needs an explicit producer-side link.
 - **Bounds and privacy.** The same window and session caps as Stage 1. Person ids are the Control user ids the reader
   already scopes by. No names or e-mail addresses enter the artifact.
 
