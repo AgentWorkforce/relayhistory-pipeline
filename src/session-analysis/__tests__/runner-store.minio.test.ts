@@ -38,7 +38,17 @@ describe.skipIf(!enabled)("session-analysis runner on versioned MinIO", () => {
     const bytes = new TextEncoder().encode('{"synthetic":true}');
     const first = await deps.store.put(key as never, bytes, { ifNoneMatch: true, contentType: "application/json" });
     expect(first.created).toBe(true);
-    await expect(deps.store.put(key as never, bytes, { ifNoneMatch: true, contentType: "application/json" })).rejects.toBeDefined();
+    expect(first.version.version).toBeTruthy();
+    // Create-only is idempotent for identical bytes: no new version, the same one reported back.
+    const again = await deps.store.put(key as never, bytes, { ifNoneMatch: true, contentType: "application/json" });
+    expect(again.created).toBe(false);
+    expect(again.version.version).toBe(first.version.version);
+    // Different bytes at the same key are refused: the write-once guarantee.
+    await expect(deps.store.put(key as never, new TextEncoder().encode('{"synthetic":false}'), { ifNoneMatch: true, contentType: "application/json" })).rejects.toMatchObject({ code: "already_exists" });
+    // The refused put changed nothing: the current object is still the first version, with the first bytes.
+    const current = await deps.store.getObject(key as never);
+    expect(current.meta.version.version).toBe(first.version.version);
+    expect(new Uint8Array(await new Response(current.body).arrayBuffer())).toEqual(bytes);
     const authorize = async () => {};
     for (let i = 0; i < 10; i++) if ((await deps.eraser!.eraseStep(prefix, { scope: "proof", authorize })).status === "traversed") break;
     expect(await deps.eraser!.verifyErased(prefix, { authorize })).toMatchObject({ status: "erased" });
