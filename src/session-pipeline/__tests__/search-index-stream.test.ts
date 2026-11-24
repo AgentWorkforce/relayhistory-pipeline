@@ -847,7 +847,7 @@ describe("streamed reconcile", () => {
     expect(client.released[0]).toMatchObject({ code: "ECONNRESET" });
     expect(client.listenerCount("error")).toBe(0);
     noDelete(ch);
-    // Unguarded (as the flag-off path always was), the same emit has no listener and throws.
+    // Unguarded (transaction()'s default), the same emit has no listener and throws.
     const bare = Object.assign(new EventEmitter(), { query: client.query, release() {} });
     await transaction({ pool: { connect: async () => bare } } as unknown as HoopDb, async () => {
       expect(() => bare.emit("error", new Error("x"))).toThrow("x");

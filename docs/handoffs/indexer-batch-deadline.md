@@ -108,3 +108,23 @@ these on.
 
 An acquire timeout rejects the checkout with pg-pool's "timeout exceeded when trying to
 connect"; the key or scope fails and its messages are redelivered.
+
+## Guarded transactions
+
+No knob. The scope lock (`scopeLock` in `src/session-pipeline/lambda.ts`, the pointer stage) and
+the search transaction (`searchTransaction`, streamed or not) both run `transaction()` in its
+guarded mode; before this only the streamed search transaction did.
+
+pg-pool removes its idle `'error'` listener when a client is checked out, and pg emits
+`'error'` on the client when the connection ends while no query is in flight. The scope lock
+holds its client idle while the pointer work runs on other connections, and an unstreamed search
+pass holds its client idle while it reads the bucket and ClickHouse, so such an emit had no
+listener and ended the invocation with an uncaught exception. Guarded, a listener added at
+checkout keeps the error: the next statement on that client (at the latest `COMMIT`) rejects
+with it, the key or scope fails and its messages are redelivered, and the client is released
+with the error (destroyed, not returned to the pool). The listener is removed before release.
+
+With no `'error'` emitted the guarded mode sends the same statements and releases the client
+the same way (`release()`); the only difference is one listener on the client while it is
+checked out. If a connection drops after the pointer work has written, the work stays written
+and the key is redelivered; the pointer stage is idempotent under the revision fence.

@@ -7,7 +7,7 @@ import { describe, expect, test } from "bun:test";
 import { EventEmitter } from "node:events";
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
-import { handler, invocationDeps, lambdaEnv, searchTransaction, transaction } from "../lambda.ts";
+import { handler, invocationDeps, lambdaEnv, scopeLock, searchTransaction, transaction } from "../lambda.ts";
 import type { HoopDb } from "../../shared/db.ts";
 import type { ConsumerDeps } from "../consumer.ts";
 import { SEARCH_INDEX_STREAM_CH_BUDGET, SEARCH_INDEX_STREAM_DEADLINE_MARGIN_MS, type SearchIndexDeps } from "../search-index.ts";
@@ -186,30 +186,40 @@ describe("transaction()", () => {
     });
   });
 
-  test("the search stage's transaction is guarded exactly when SEARCH_INDEX_STREAMING_CH=1 armed it", async () => {
-    for (const [env, guarded] of [[{ searchStreamCh: true as const }, true], [{}, false]] as const) {
-      const { client, db } = fakeClient();
-      let listeners = -1;
-      await searchTransaction(db, env)(async () => {
-        listeners = client.listenerCount("error");
-      });
-      expect(listeners).toBe(guarded ? 1 : 0);
-    }
-    // And lambdaEnv only ever produces searchStreamCh: true from SEARCH_INDEX_STREAMING_CH=1.
-    expect(lambdaEnv({ ...base, SEARCH_INDEX_ENABLED: "1", SEARCH_INDEX_STREAMING_CH: "1" }).searchStreamCh).toBe(true);
-    expect(lambdaEnv({ ...base, SEARCH_INDEX_ENABLED: "1" }).searchStreamCh).toBeUndefined();
+  test("the search stage's transaction and the scope lock are guarded, streaming armed or not", async () => {
+    const { client, db } = fakeClient();
+    let listeners = -1;
+    await searchTransaction(db)(async () => {
+      listeners = client.listenerCount("error");
+    });
+    expect(listeners).toBe(1);
+    expect(client.statements).toEqual(["BEGIN", "SET LOCAL statement_timeout = '60s'", "COMMIT"]);
+    expect(client.released).toEqual(["release()"]);
+    const lock = fakeClient();
+    listeners = -1;
+    expect(await scopeLock(lock.db)({ orgId: "o", workspaceId: "w", harness: "h", sessionId: "s" }, async () => {
+      listeners = lock.client.listenerCount("error");
+      return 7;
+    })).toBe(7);
+    expect(listeners).toBe(1);
+    expect(lock.client.statements).toEqual(["BEGIN", "SET LOCAL statement_timeout = '60s'", "SET LOCAL lock_timeout = '30s'", "SELECT pg_advisory_xact_lock(hashtextextended($1, 0))", "COMMIT"]);
+    expect(lock.client.released).toEqual(["release()"]);
+    expect(lock.client.listenerCount("error")).toBe(0);
   });
 });
 
-describe("init's search transaction (source check)", () => {
+describe("init's search transaction and scope lock (source check)", () => {
   // init() is not exported and needs the secret, a pg pool and S3 to run; driving it end to end
-  // would change src or leave a cached runtime behind for other test files. This pins the one
-  // line that wires it instead: the search deps take searchTransaction(db, env), whose guard is
-  // tested above, and no unguarded transaction(db, work) of their own.
-  test("the search deps use searchTransaction(db, env)", () => {
+  // would change src or leave a cached runtime behind for other test files. This pins the lines
+  // that wire them instead: the search deps take searchTransaction(db) and the pointer deps
+  // scopeLock(db), both guarded and tested above, and init opens no transaction(db, ...) of its own.
+  test("init uses searchTransaction(db) and scopeLock(db)", () => {
     const source = readFileSync(fileURLToPath(new URL("../lambda.ts", import.meta.url)), "utf8");
     const search = source.slice(source.indexOf("deps.search = {"), source.indexOf("};", source.indexOf("deps.search = {")));
-    expect(search).toContain("transact: searchTransaction(db, env),");
+    expect(search).toContain("transact: searchTransaction(db),");
     expect(search).not.toMatch(/transaction\(db, work/);
+    const init = source.slice(source.indexOf("async function init()"), source.indexOf("deps.search = {"));
+    expect(init).toContain("const lock = scopeLock(db);");
+    expect(init).not.toMatch(/\btransaction\(db/);
   });
 });

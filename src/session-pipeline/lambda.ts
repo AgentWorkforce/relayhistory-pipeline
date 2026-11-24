@@ -318,14 +318,16 @@ export function supabasePool(url: string, max: number, timeouts: DbTimeouts = {}
 }
 
 /**
- * One transaction on one checked-out client. `guarded` (SEARCH_INDEX_STREAMING_CH=1, the search
- * stage only): pg-pool drops its idle 'error' listener at checkout, and pg's client emits
- * 'error' when its connection ends, also between statements, so a streamed pass holding the
- * client for minutes would crash the invocation with an uncaught exception. Guarded, a
- * per-checkout listener keeps the error: the next statement (the pass's keepalive, its forced
- * lock check before any delete, COMMIT) rejects with it, the transaction fails as a normal
- * rejected promise, and the broken client is destroyed (`release(err)`), not returned to the
- * pool. Unguarded: exactly as before.
+ * One transaction on one checked-out client. `guarded` (the scope lock and the search stage):
+ * pg-pool drops its idle 'error' listener at checkout, and pg's client emits 'error' when its
+ * connection ends between statements (no query in flight), so a transaction holding the client
+ * idle (the scope lock while the pointer work runs on other clients, a search pass while it reads
+ * the bucket) would crash the invocation with an uncaught exception. Guarded, a per-checkout
+ * listener keeps the error: the next statement (the pass's keepalive, its forced lock check
+ * before any delete, COMMIT) rejects with it, the transaction fails as a normal rejected promise,
+ * and the broken client is destroyed (`release(err)`), not returned to the pool. The listener is
+ * removed before release. With no 'error' emitted, guarded and unguarded send the same statements
+ * and release the client the same way (`release()`).
  */
 export async function transaction<T>(db: HoopDb, work: (tx: SqlExecutor) => Promise<T>, guarded = false): Promise<T> {
   const client = await db.pool.connect();
@@ -359,9 +361,26 @@ export async function transaction<T>(db: HoopDb, work: (tx: SqlExecutor) => Prom
   }
 }
 
-/** The search stage's transaction: guarded (transaction() above) exactly when streaming is armed. */
-export function searchTransaction(db: HoopDb, env: Pick<LambdaEnv, "searchStreamCh">): SearchIndexDeps["transact"] {
-  return (work) => transaction(db, work, env.searchStreamCh === true);
+/** The search stage's transaction: always guarded (transaction() above), streamed or not. */
+export function searchTransaction(db: HoopDb): SearchIndexDeps["transact"] {
+  return (work) => transaction(db, work, true);
+}
+
+/**
+ * The pointer stage's scope lock: a guarded transaction (transaction() above) holding the scope's
+ * advisory lock, waiting at most 30 s for it, while `work` runs.
+ */
+export function scopeLock(db: HoopDb): ScopeLock {
+  return (scope, work) =>
+    transaction(
+      db,
+      async (tx) => {
+        await tx.query("SET LOCAL lock_timeout = '30s'");
+        await tx.query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))", [scopeLockKey(scope)]);
+        return work();
+      },
+      true,
+    );
 }
 
 /** A search pass that found its session busy runs again this much later. */
@@ -415,12 +434,7 @@ async function init(): Promise<Runtime> {
   const reader = objectStoreManifestReader(store, { provider: "s3", bucket: env.bucket });
   const bindings = { PIPELINE_ORG_FROM_PREFIX: "true", PIPELINE_KEY_PREFIX: env.keyPrefix };
   const fanout: PipelineQueue = env.fanout === "postgres" ? postgresPipelineQueue(db) : droppedFanout;
-  const lock: ScopeLock = (scope, work) =>
-    transaction(db, async (tx) => {
-      await tx.query("SET LOCAL lock_timeout = '30s'");
-      await tx.query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))", [scopeLockKey(scope)]);
-      return work();
-    });
+  const lock = scopeLock(db);
   const deps: ConsumerDeps = {
     pointer: {
       db,
@@ -438,8 +452,8 @@ async function init(): Promise<Runtime> {
   if (env.searchEnabled) {
     if (!secret.clickhouse) throw new Error("SEARCH_INDEX_ENABLED=1 but the secret has no clickhouse block");
     deps.search = {
-      // Guarded only when streaming is armed: unarmed, the search transaction is exactly as before.
-      transact: searchTransaction(db, env),
+      // Guarded, streamed or not: a dropped connection fails the scope instead of the invocation.
+      transact: searchTransaction(db),
       reader,
       store,
       ch: createClickHouseClient(secret.clickhouse),
