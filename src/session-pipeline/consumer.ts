@@ -22,7 +22,25 @@ import { feedBufferedStageByKey, isBufferedStageKey, type BufferedFeedDeps } fro
 export interface QueueRecord {
   messageId: string;
   body: string;
+  /**
+   * The SQS receipt handle: passed through only while `ConsumerDeps.retryVisibility` is set (lambda.ts
+   * queueRecords), and used only as the ChangeMessageVisibility argument. Never logged.
+   */
+  receiptHandle?: string;
 }
+
+/** Pointer-stage error codes whose messages are retried after `retryVisibility.seconds`, not the queue's full timeout. */
+export const FAST_RETRY_CODES: ReadonlySet<string> = new Set(["pointer_move_pending"]);
+
+/** A ChangeMessageVisibility call that has not settled after this long is abandoned (the message keeps its full timeout). */
+export const RETRY_VISIBILITY_TIMEOUT_MS = 2_000;
+
+/**
+ * Time kept back for returning the batch response after the calls. With less than
+ * RETRY_VISIBILITY_TIMEOUT_MS + this left in the invocation no call is made, so a near-deadline batch still
+ * returns its partial response (and acknowledges its successes) before Lambda times out.
+ */
+export const RETRY_VISIBILITY_MARGIN_MS = 1_000;
 
 export interface BatchResponse {
   batchItemFailures: { itemIdentifier: string }[];
@@ -56,12 +74,69 @@ export interface ConsumerDeps {
    * never fail a message of the batch. Absent: exactly the previous behavior.
    */
   searchJobs?: { drain(): Promise<unknown> };
+  /**
+   * SESSION_PIPELINE_RETRY_VISIBILITY_S (default off; absent, failures behave and log exactly as before): a
+   * message that failed only with a FAST_RETRY_CODES pointer error gets its visibility set to `seconds` before
+   * it is returned in batchItemFailures, so SQS redelivers it then instead of after the queue's full
+   * visibility timeout. A message that also fed any other failure of the batch (another key, an invalid body,
+   * a buffered stage, the large-read route, search or replay) keeps the full timeout. Best-effort: a rejected
+   * or timed-out call logs a warn and the message still fails with the normal timeout. `remainingMs` (the
+   * invocation's remaining time, set per invocation by lambda.ts invocationDeps) is checked right before the
+   * calls: too little left and none is made; otherwise each is bounded by
+   * min(RETRY_VISIBILITY_TIMEOUT_MS, remaining - RETRY_VISIBILITY_MARGIN_MS). Needs
+   * sqs:ChangeMessageVisibility on the source queue for the Lambda role.
+   */
+  retryVisibility?: {
+    seconds: number;
+    change: (receiptHandle: string, seconds: number, timeoutMs: number) => Promise<void>;
+    remainingMs?: () => number;
+  };
+}
+
+/** Set each message's visibility to `seconds`, bounded and best-effort: never throws, never changes which messages fail. */
+async function shortenRetries(handles: readonly (string | undefined)[], rv: NonNullable<ConsumerDeps["retryVisibility"]>): Promise<void> {
+  // Rechecked here, after every stage of the batch: it may have used most of the invocation.
+  const remaining = rv.remainingMs?.();
+  let bound = RETRY_VISIBILITY_TIMEOUT_MS;
+  if (remaining !== undefined && Number.isFinite(remaining)) {
+    if (remaining < RETRY_VISIBILITY_TIMEOUT_MS + RETRY_VISIBILITY_MARGIN_MS) {
+      log.warn("retry visibility not shortened", { stage: "session-indexed", reason: "retry_visibility_deadline", count: handles.length });
+      return;
+    }
+    bound = Math.min(RETRY_VISIBILITY_TIMEOUT_MS, remaining - RETRY_VISIBILITY_MARGIN_MS);
+  }
+  await Promise.allSettled(
+    handles.map(async (handle) => {
+      if (!handle) {
+        log.warn("retry visibility not shortened", { stage: "session-indexed", reason: "no_receipt_handle" });
+        return;
+      }
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      const timeout = new Promise<"timeout">((resolve) => (timer = setTimeout(() => resolve("timeout"), bound)));
+      try {
+        const settled = await Promise.race([rv.change(handle, rv.seconds, bound).then(() => "ok" as const), timeout]);
+        if (settled === "timeout") log.warn("retry visibility not shortened", { stage: "session-indexed", reason: "change_visibility_timeout" });
+      } catch (error) {
+        log.warn("retry visibility not shortened", { stage: "session-indexed", reason: "change_visibility_failed", ...errorFields(error) });
+      } finally {
+        clearTimeout(timer);
+      }
+    }),
+  );
 }
 
 const scopeId = (s: SessionScope) => JSON.stringify([s.orgId, s.workspaceId, s.harness, s.sessionId]);
 
 export async function processBatch(records: readonly QueueRecord[], deps: ConsumerDeps): Promise<BatchResponse> {
   const failed = new Set<string>();
+  // retryVisibility only: messages with a fast-retry pointer failure, and messages with any other failure.
+  const fastRetry = new Set<string>();
+  const slowRetry = new Set<string>();
+  /** Fail `id`; with retryVisibility armed, also note whether this failure allows the short redelivery. */
+  const fail = (id: string, fast = false) => {
+    failed.add(id);
+    if (deps.retryVisibility) (fast ? fastRetry : slowRetry).add(id);
+  };
   const byKey = new Map<string, { event: LandedEvent; messageIds: string[] }>();
   for (const record of records) {
     // Events carry the provider of the Locker the pointer stage reads from (s3 on the
@@ -71,7 +146,7 @@ export async function processBatch(records: readonly QueueRecord[], deps: Consum
     if (parsed.kind === "invalid") {
       // Never succeeds on retry; the DLQ keeps it for an operator.
       log.warn("object event unreadable", { stage: "object-landed", reason: "invalid_body" });
-      failed.add(record.messageId);
+      fail(record.messageId);
       continue;
     }
     for (const event of parsed.events) {
@@ -104,7 +179,7 @@ export async function processBatch(records: readonly QueueRecord[], deps: Consum
           ...(fed.outcome === "indexed" ? { count: fed.rows, deleted: fed.deleted } : { reason: fed.reason }), duration_ms: Date.now() - started });
       } catch (error) {
         log.error("buffered stage search feed failed", { stage: "buffered-search-feed", ...errorFields(error), duration_ms: Date.now() - started });
-        for (const id of messageIds) failed.add(id);
+        for (const id of messageIds) fail(id);
       }
       continue;
     }
@@ -139,8 +214,9 @@ export async function processBatch(records: readonly QueueRecord[], deps: Consum
       if (held) held.messageIds.push(...messageIds);
       else scopes.set(id, { scope: outcome.scope, messageIds: [...messageIds], manifestKey: outcome.manifestKey });
     } catch (error) {
-      log.error("pointer index failed", { stage: "session-indexed", ...errorFields(error), duration_ms: Date.now() - started });
-      for (const id of messageIds) failed.add(id);
+      const fields = errorFields(error);
+      log.error("pointer index failed", { stage: "session-indexed", ...fields, duration_ms: Date.now() - started });
+      for (const id of messageIds) fail(id, FAST_RETRY_CODES.has(fields.error_code as string));
     }
   }
 
@@ -160,7 +236,7 @@ export async function processBatch(records: readonly QueueRecord[], deps: Consum
       const refusal=classifyReplayFailure(error);
       if(refusal){log.warn("large scope handoff refused",{stage:"large-read",...ids,...errorFields(error),reason:refusal.reason,error_code:refusal.code});continue}
       if(captureRefusal(error)==="capture_ambiguous_source"){log.warn("large scope handoff refused",{stage:"large-read",...ids,...errorFields(error),reason:"large_handoff_ambiguous_source",error_code:"55000"});continue}
-      log.error("large scope handoff failed",{stage:"large-read",...ids,...errorFields(error)});for(const id of messageIds)failed.add(id);continue;
+      log.error("large scope handoff failed",{stage:"large-read",...ids,...errorFields(error)});for(const id of messageIds)fail(id);continue;
     }
     if(!routed.delegated)continue;
     delegated.add(scopeId(scope));
@@ -246,7 +322,7 @@ export async function processBatch(records: readonly QueueRecord[], deps: Consum
           ...phaseFields(),
           duration_ms: Date.now() - started,
         });
-        for (const id of messageIds) failed.add(id);
+        for (const id of messageIds) fail(id);
       }
     }
   }
@@ -279,7 +355,7 @@ export async function processBatch(records: readonly QueueRecord[], deps: Consum
           continue;
         }
         log.error("canonical replay publication failed", fields);
-        for (const id of messageIds) failed.add(id);
+        for (const id of messageIds) fail(id);
       }
     }
   }
@@ -289,6 +365,13 @@ export async function processBatch(records: readonly QueueRecord[], deps: Consum
     } catch (error) {
       log.error("search jobs follow-on failed", { stage: "search-index", ...errorFields(error) });
     }
+  }
+  // Last, after the search-jobs follow-on (which never fails a message), so a 60 s visibility cannot lapse
+  // while this invocation still runs; the remaining-time recheck covers a follow-on that ran long.
+  if (deps.retryVisibility && fastRetry.size > 0) {
+    const handles = new Map(records.map((r) => [r.messageId, r.receiptHandle]));
+    const ids = [...fastRetry].filter((id) => failed.has(id) && !slowRetry.has(id));
+    await shortenRetries(ids.map((id) => handles.get(id)), deps.retryVisibility);
   }
   return { batchItemFailures: [...failed].map((itemIdentifier) => ({ itemIdentifier })) };
 }
