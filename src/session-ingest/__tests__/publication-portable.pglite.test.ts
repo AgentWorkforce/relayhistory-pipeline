@@ -3,7 +3,7 @@
  * MinIO-shaped path-style fake, a buffered stage from the real ingest path, then
  * runPortablePublicationRuntime publish and GC. No AWS, Supabase, IMDS or network.
  */
-import { beforeAll, afterAll, expect, test, setDefaultTimeout } from "bun:test";
+import { beforeAll, afterAll, expect, mock, test, setDefaultTimeout } from "bun:test";
 import { PGlite } from "@electric-sql/pglite";
 import { btree_gin } from "@electric-sql/pglite/contrib/btree_gin";
 import { pg_trgm } from "@electric-sql/pglite/contrib/pg_trgm";
@@ -12,7 +12,8 @@ import { join } from "node:path";
 import { zstdDecompressSync } from "node:zlib";
 import { SESSION_BOOTSTRAP_FILES } from "../../hoopdb/session-bootstrap-chain.ts";
 import { createS3Store, type ObjectStore } from "../../../packages/object-store/src/index.ts";
-import { SCRUB_RULESET_VERSION } from "../../../packages/pipeline/src/lib/pipeline/raw-chunks.ts";
+import { SCRUB_RULESET_VERSION, sealRawChunk } from "../../../packages/pipeline/src/lib/pipeline/raw-chunks.ts";
+import { tsScrubEngine } from "../../../packages/pipeline/src/lib/scrub-engine/engine.ts";
 import { parseSessionKey, rawChunkKey } from "../../shared/vendor.ts";
 import { derivedSchemaAssets } from "../../session-pipeline/derived-schema.ts";
 import { sqlLedger } from "../ledger-sql.ts";
@@ -237,15 +238,19 @@ test("disposable scoped v1 binds candidates, claim and final commit to one admit
     }
     return {rows:[{result:await call(method,p)}]};
   }} as never;
-  const deps={target,store:()=>store};
+  const rawChunkSealer = Object.assign(mock(sealRawChunk), { marker: tsScrubEngine.marker });
+  const deps={target,store:()=>store,rawChunkSealer};
   expect(await scopedPublicationCycle(transport,binding,deps)).toMatchObject({enabled:false});
   expect(calls).toEqual([]);
+  expect(rawChunkSealer).toHaveBeenCalledTimes(0);
   expect(await scopedPublicationCycle(transport,binding,deps,{enabled:true})).toMatchObject({examined:1,published:1});
+  expect(rawChunkSealer).toHaveBeenCalledTimes(1);
   expect(calls).toContain("scoped_claim_v1");
   expect(calls).toContain("scoped_publish_v1");
   expect(new Set(calls)).toEqual(new Set(["scoped_candidates_v1","scoped_claim_v1","scoped_heartbeat_v1","scoped_prepare_v1","scoped_register_objects_v1","scoped_publish_v1"]));
   const activeCalls=calls.length, objectRequests=s3.requests.length;
   expect(await scopedPublicationCycle(transport,binding,deps,{enabled:false})).toMatchObject({enabled:false});
+  expect(rawChunkSealer).toHaveBeenCalledTimes(1);
   expect(calls).toHaveLength(activeCalls);
   expect(s3.requests).toHaveLength(objectRequests);
   expect(await call("scoped_candidates_v1",{...scopeArgs,limit:1})).toEqual({stageTokens:[]});
