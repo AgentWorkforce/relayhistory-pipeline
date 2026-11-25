@@ -72,7 +72,9 @@ EventBridge rate(30 minutes) --> Lambda {"reconcile":true}:
 - **Backpressure.** The mapping caps concurrency at `maxConcurrency` (default
   4). Each invocation holds at most 4 Supabase connections. A slow downstream
   backs messages up in SQS (4-day retention). The backlog-age alarm fires
-  after 15 minutes.
+  after 15 minutes. The optional search-queue split (default off) moves the
+  search stage to its own queue and mapping, with `hoopdbPoolMax` and a fixed
+  80-connection budget: docs/handoffs/search-queue-split.md.
 - **Scrubbed raw only.** A manifest without `raw.scrub` gets a quarantined
   pointer, and its chunks are never read.
 - **Logs** carry ids, counts and codes only, through `src/shared/log.ts`.
