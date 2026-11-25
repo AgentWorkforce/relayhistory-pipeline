@@ -22,6 +22,8 @@ export const ALLOWED_LOG_FIELDS = new Set([
   "event_age_ms", "s3_event_age_ms", "queue_origin",
   // How a search pass's acceptance refusal looked (session-pipeline/contender-seats.ts); value rule below.
   "contender_seats",
+  // Which SQS queue a session pipeline line's messages came from (session-pipeline/consumer.ts); value rule below.
+  "queue",
 ]);
 
 /** Allowlisted keys that survive only as a non-negative safe integer; any other value is dropped. */
@@ -31,6 +33,7 @@ export const NON_NEGATIVE_INTEGER_FIELDS: ReadonlySet<string> = new Set(["event_
 export const EXACT_VALUE_FIELDS: ReadonlyMap<string, ReadonlySet<string>> = new Map([
   ["queue_origin", new Set(["s3", "requeue", "sweep"])],
   ["contender_seats", new Set(["all_unseated", "seated_unseated", "both", "catalog_key"])],
+  ["queue", new Set(["pointer", "search", "other"])],
 ]);
 
 /** Whether an allowlisted key's value passes its value rule (keys without a rule: always). */

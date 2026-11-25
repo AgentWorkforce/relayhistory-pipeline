@@ -40,7 +40,7 @@ import type { HoopDb } from "../shared/db.ts";
 import { errorFields, log } from "../shared/log.ts";
 import { awsJsonCall, invokeAsync, lambdaCredentials, type AwsSessionCredentials } from "./aws-json.ts";
 import { createClickHouseClient } from "./vendor/search-index/clickhouse.ts";
-import { processBatch, type BatchResponse, type ConsumerDeps, type QueueRecord } from "./consumer.ts";
+import { processBatch, type BatchResponse, type ConsumerDeps, type QueueRecord, type QueueSource } from "./consumer.ts";
 import { droppedFanout, scopeLockKey, type PointerDeps, type ScopeLock } from "./pointer.ts";
 import { SEARCH_INDEX_STREAM_CH_BUDGET, SEARCH_INDEX_STREAM_DEADLINE_MARGIN_MS, type SearchIndexDeps } from "./search-index.ts";
 import { RECONCILE_BODY_KEY, requeueBody } from "./s3-events.ts";
@@ -91,6 +91,14 @@ export interface LambdaEnv {
    * need SEARCH_INDEX_ENABLED. Absent: as before.
    */
   pointerSkipOriginBucketEnabled?: true;
+  /**
+   * SESSION_PIPELINE_SEARCH_QUEUE_URL=<SQS queue URL> (unset or "": off; needs SEARCH_INDEX_ENABLED=1):
+   * the pointer path hands each scope's search pass to this queue instead of running it inline, and
+   * records whose eventSourceARN is exactly this queue's ARN run only the search stage
+   * (consumer.ts searchHandoff). Init refuses a URL outside this function's region and partition,
+   * in another account than SESSION_PIPELINE_QUEUE_URL, or naming the same queue. Absent: as before.
+   */
+  searchQueueUrl?: string;
 }
 
 export function lambdaEnv(env: NodeJS.ProcessEnv = process.env): LambdaEnv {
@@ -122,6 +130,7 @@ export function lambdaEnv(env: NodeJS.ProcessEnv = process.env): LambdaEnv {
     throw new Error("session pipeline: SEARCH_INDEX_SKIP_ACCEPTANCE_MISSING_ENABLED=true needs SEARCH_INDEX_ENABLED=1");
   // SESSION_POINTER_SKIP_ORIGIN_BUCKET_ENABLED: strict grammar, default off, no SEARCH_INDEX_ENABLED coupling.
   const pointerSkipOriginBucket = pointerSkipOriginBucketFromEnv(env);
+  const searchQueueUrl = searchQueueUrlFromEnv(env);
   return {
     region: need("AWS_REGION"),
     bucket: need("PIPELINE_RAW_S3_BUCKET"),
@@ -136,7 +145,65 @@ export function lambdaEnv(env: NodeJS.ProcessEnv = process.env): LambdaEnv {
     ...(searchSkipOverBound ? { searchSkipOverBound: true as const } : {}),
     ...(searchSkipAcceptanceMissing ? { searchSkipAcceptanceMissing: true as const } : {}),
     ...(pointerSkipOriginBucket ? { pointerSkipOriginBucketEnabled: true as const } : {}),
+    ...(searchQueueUrl ? { searchQueueUrl } : {}),
   };
+}
+
+/** A standard SQS queue URL: the regional endpoint host, a 12-digit account, a queue name. */
+const SQS_QUEUE_URL = /^https:\/\/sqs\.([a-z]{2}(?:-gov)?-[a-z]+-[0-9])\.(amazonaws\.com(?:\.cn)?)\/([0-9]{12})\/([A-Za-z0-9_-]{1,80})$/;
+
+/** The partition and endpoint suffix of a region, for the partitions this function supports. */
+function regionPartition(region: string): { partition: string; suffix: string } | undefined {
+  if (/^cn-[a-z]+-[0-9]$/.test(region)) return { partition: "aws-cn", suffix: "amazonaws.com.cn" };
+  if (/^us-gov-[a-z]+-[0-9]$/.test(region)) return { partition: "aws-us-gov", suffix: "amazonaws.com" };
+  if (/^[a-z]{2}-[a-z]+-[0-9]$/.test(region)) return { partition: "aws", suffix: "amazonaws.com" };
+  return undefined;
+}
+
+/**
+ * The full ARN (`arn:<partition>:sqs:<region>:<account>:<name>`) of the queue at `url`, or undefined
+ * unless the URL is a regional SQS endpoint URL in `region` (this function's AWS_REGION) with that
+ * region's partition suffix. An event source mapping only polls a queue in its own region, so a
+ * record whose eventSourceARN differs from this string in any part is not from this queue.
+ */
+export function sqsQueueArn(url: string, region: string): string | undefined {
+  const m = SQS_QUEUE_URL.exec(url);
+  const p = regionPartition(region);
+  if (!m || !p || m[1] !== region || m[2] !== p.suffix) return undefined;
+  return `arn:${p.partition}:sqs:${region}:${m[3]}:${m[4]}`;
+}
+
+/**
+ * SESSION_PIPELINE_SEARCH_QUEUE_URL: unset and "" are off (undefined). Else, before anything is
+ * consumed, it must be an SQS queue URL in AWS_REGION, SESSION_PIPELINE_QUEUE_URL must be one too,
+ * in the same account, the two must name different queues, and SEARCH_INDEX_ENABLED must be 1;
+ * otherwise init fails naming the variable, never the value.
+ */
+export function searchQueueUrlFromEnv(env: Record<string, string | undefined>): string | undefined {
+  const value = env.SESSION_PIPELINE_SEARCH_QUEUE_URL;
+  if (value === undefined || value === "") return undefined;
+  const region = env.AWS_REGION ?? "";
+  const search = sqsQueueArn(value, region);
+  if (!search) throw new Error("session pipeline: SESSION_PIPELINE_SEARCH_QUEUE_URL must be an SQS queue URL in this function's region and partition");
+  const pointer = sqsQueueArn(env.SESSION_PIPELINE_QUEUE_URL ?? "", region);
+  if (!pointer) throw new Error("session pipeline: SESSION_PIPELINE_SEARCH_QUEUE_URL needs SESSION_PIPELINE_QUEUE_URL to be an SQS queue URL in this function's region and partition");
+  if (search.split(":")[4] !== pointer.split(":")[4]) throw new Error("session pipeline: SESSION_PIPELINE_SEARCH_QUEUE_URL must be in the account of SESSION_PIPELINE_QUEUE_URL");
+  if (search === pointer) throw new Error("session pipeline: SESSION_PIPELINE_SEARCH_QUEUE_URL must name a different queue than SESSION_PIPELINE_QUEUE_URL");
+  if (env.SEARCH_INDEX_ENABLED !== "1") throw new Error("session pipeline: SESSION_PIPELINE_SEARCH_QUEUE_URL needs SEARCH_INDEX_ENABLED=1");
+  return value;
+}
+
+/** The ARNs records are matched against (QueueRecord.queue): the pointer queue's always, when derivable; the search queue's while armed. */
+export interface QueueSourceArns {
+  pointer?: string;
+  search?: string;
+}
+
+export function queueSourceArns(env: Partial<Pick<LambdaEnv, "region" | "queueUrl" | "searchQueueUrl">>): QueueSourceArns {
+  const region = env.region ?? "";
+  const pointer = env.queueUrl ? sqsQueueArn(env.queueUrl, region) : undefined;
+  const search = env.searchQueueUrl ? sqsQueueArn(env.searchQueueUrl, region) : undefined;
+  return { ...(pointer ? { pointer } : {}), ...(search && search !== pointer ? { search } : {}) };
 }
 
 /**
@@ -280,10 +347,38 @@ export function sqsRequeue(
   };
 }
 
+/**
+ * The consumer's `searchHandoff` dep (SESSION_PIPELINE_SEARCH_QUEUE_URL armed), both to the search
+ * queue with the requeue body: `send` with no delay (a fresh handoff) and the consumer's time bound
+ * as the request timeout; `requeue` exactly as `sqsRequeue` (busy delay) for a busy, deferred or
+ * past-deadline search pass.
+ */
+export function sqsSearchHandoff(
+  env: Pick<LambdaEnv, "region"> & { searchQueueUrl: string },
+  call: typeof awsJsonCall = awsJsonCall,
+  credentials: () => AwsSessionCredentials = () => lambdaCredentials(),
+): NonNullable<ConsumerDeps["searchHandoff"]> {
+  return {
+    send: async (manifestKey, oldestEventTime, timeoutMs) => {
+      await call({
+        service: "sqs",
+        target: "AmazonSQS.SendMessage",
+        region: env.region,
+        body: { QueueUrl: env.searchQueueUrl, MessageBody: requeueBody(manifestKey, oldestEventTime), DelaySeconds: 0 },
+        credentials: credentials(),
+        timeoutMs,
+      });
+    },
+    requeue: sqsRequeue({ region: env.region, queueUrl: env.searchQueueUrl }, call, credentials),
+  };
+}
+
 interface Runtime {
   env: LambdaEnv;
   deps: ConsumerDeps;
   brief: ReturnType<typeof briefTick>;
+  /** Derived once from env: which queue each SQS record came from (queueRecords). */
+  sources: QueueSourceArns;
 }
 
 let runtime: Promise<Runtime> | undefined;
@@ -340,6 +435,8 @@ async function init(): Promise<Runtime> {
       // Default off (SEARCH_INDEX_SKIP_ACCEPTANCE_MISSING_ENABLED=true).
       ...(env.searchSkipAcceptanceMissing ? { skipAcceptanceMissing: true as const } : {}),
     };
+    // Default off (SESSION_PIPELINE_SEARCH_QUEUE_URL; lambdaEnv refuses it without SEARCH_INDEX_ENABLED=1).
+    if (env.searchQueueUrl) deps.searchHandoff = sqsSearchHandoff({ region: env.region, searchQueueUrl: env.searchQueueUrl });
   }
   // The key comes from the secret only; "-disabled" or blank means no model, as in config.ts.
   const key = modelKey({ OPENAI_API_KEY: secret.openai_api_key });
@@ -350,7 +447,17 @@ async function init(): Promise<Runtime> {
     config: briefConfig(),
   });
   log.info("session pipeline ready", { stage: "init", ok: true, state: env.searchEnabled ? "search_on" : "search_off" });
-  return { env, deps, brief };
+  return { env, deps, brief, sources: queueSourceArns(env) };
+}
+
+/**
+ * Tests only: `handler` runs SQS batches over these consumer deps and this env (queue URLs, region)
+ * instead of init()'s (no secret, pool or S3); undefined clears it. Nothing in the Lambda runtime calls this.
+ */
+export function setRuntimeForTests(deps: ConsumerDeps | undefined, env: Partial<LambdaEnv> = {}): void {
+  runtime = deps
+    ? Promise.resolve({ env: env as LambdaEnv, deps, brief: (async () => {}) as unknown as Runtime["brief"], sources: queueSourceArns(env) })
+    : undefined;
 }
 
 function ready(): Promise<Runtime> {
@@ -523,14 +630,18 @@ export interface LambdaInvocationContext {
 /**
  * The consumer deps for one SQS batch: `deps` itself unless streaming is armed; then the
  * search stage streams at most one scope of the batch (a second is requeued) and, with a
- * Lambda context, stops streaming at the remaining time less the margin.
+ * Lambda context, stops streaming at the remaining time less the margin. With the search handoff
+ * armed and a Lambda context, the handoff reads the invocation's remaining time (consumer.ts).
  */
 export function invocationDeps(deps: ConsumerDeps, context?: LambdaInvocationContext, now: () => number = Date.now): ConsumerDeps {
-  const search = deps.search;
-  if (!search?.stream) return deps;
-  const remaining = typeof context?.getRemainingTimeInMillis === "function" ? context.getRemainingTimeInMillis() : NaN;
+  const hasContext = typeof context?.getRemainingTimeInMillis === "function";
+  // Split armed only: the handoff sends are bounded by the invocation's remaining time, read right before them.
+  const base = deps.searchHandoff && hasContext ? { ...deps, searchHandoff: { ...deps.searchHandoff, remainingMs: () => context!.getRemainingTimeInMillis() } } : deps;
+  const search = base.search;
+  if (!search?.stream) return base;
+  const remaining = hasContext ? context!.getRemainingTimeInMillis() : NaN;
   return {
-    ...deps,
+    ...base,
     search: {
       ...search,
       streamSlot: { used: false },
@@ -539,14 +650,28 @@ export function invocationDeps(deps: ConsumerDeps, context?: LambdaInvocationCon
   };
 }
 
-type SqsRecord = { messageId: string; body: string; eventSource?: string; attributes?: { SentTimestamp?: unknown } | null };
+type SqsRecord = { messageId: string; body: string; eventSource?: string; eventSourceARN?: unknown; attributes?: { SentTimestamp?: unknown } | null };
+
+/** A record's queue by its eventSourceARN, compared in full (partition, region, account, name). */
+function queueOf(arn: string, sources: QueueSourceArns): QueueSource {
+  if (arn === sources.pointer) return "pointer";
+  if (sources.search !== undefined && arn === sources.search) return "search";
+  return "other";
+}
 
 /**
  * The consumer's view of the Lambda's SQS records. Of the message attributes only
  * SentTimestamp is passed on (for the event_age_ms log field); SenderId and the rest stay here.
+ * With `sources` (the runtime's, whenever the pointer queue's ARN is derivable, split armed or not),
+ * each record with an eventSourceARN also gets its `queue`; the ARN itself is not passed on.
  */
-export function queueRecords(records: readonly SqsRecord[]): QueueRecord[] {
-  return records.map((r) => ({ messageId: r.messageId, body: r.body, sentTimestamp: r.attributes?.SentTimestamp }));
+export function queueRecords(records: readonly SqsRecord[], sources?: QueueSourceArns): QueueRecord[] {
+  return records.map((r) => ({
+    messageId: r.messageId,
+    body: r.body,
+    sentTimestamp: r.attributes?.SentTimestamp,
+    ...(sources?.pointer && typeof r.eventSourceARN === "string" ? { queue: queueOf(r.eventSourceARN, sources) } : {}),
+  }));
 }
 
 type LambdaEvent = { Records?: SqsRecord[]; reconcile?: unknown; brief?: unknown; cursor?: string; since?: string; link?: number };
@@ -561,7 +686,7 @@ export async function handler(event: LambdaEvent, context?: LambdaInvocationCont
       // Nothing was processed: every message goes back to the queue.
       return { batchItemFailures: event.Records.map((r) => ({ itemIdentifier: r.messageId })) };
     }
-    return processBatch(queueRecords(event.Records), invocationDeps(rt.deps, context));
+    return processBatch(queueRecords(event.Records, rt.sources), invocationDeps(rt.deps, context));
   }
   if (event?.reconcile === true) {
     const started = Date.now();

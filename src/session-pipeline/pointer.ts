@@ -98,6 +98,21 @@ export const droppedFanout: PipelineQueue = {
 };
 
 export async function indexPointer(landed: ObjectLanded, deps: PointerDeps): Promise<PointerOutcome> {
+  const resolved = await resolveScope(landed, deps);
+  if ("status" in resolved) return resolved;
+  const { orgId, scope } = resolved;
+  return deps.lock(scope, () => indexLocked(landed, orgId, scope, deps));
+}
+
+/**
+ * The session scope a manifest key names, or why it is ignored: the key parse, org and prefix
+ * checks of indexPointer, read-only (no lock, no S3 read, no database write). The search-queue
+ * path (consumer.ts) uses it to rebuild the scope a handed-off search pass is for.
+ */
+export async function resolveScope(
+  landed: Pick<ObjectLanded, "key" | "bucket">,
+  deps: Pick<PointerDeps, "reader" | "orgs" | "allowPrefix" | "skipOriginBucket">,
+): Promise<{ status: "ignored"; reason: string } | { orgId: string; scope: SessionScope }> {
   const location = parseSessionKey(landed.key);
   if (!location) return { status: "ignored", reason: "not_a_session_key" };
   // Flagged (default off): the sessionless per-origin bucket is an archival carrier, not a session.
@@ -120,8 +135,7 @@ export async function indexPointer(landed: ObjectLanded, deps: PointerDeps): Pro
     harness: location.harness,
     sessionId: location.sessionId,
   };
-
-  return deps.lock(scope, () => indexLocked(landed, orgId, scope, deps));
+  return { orgId, scope };
 }
 
 /** How far either side of a deleted key's date the same session is looked for (an exporter date move). */
