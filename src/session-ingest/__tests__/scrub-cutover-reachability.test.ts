@@ -282,9 +282,8 @@ describe('production constructors install the routed sealer', () => {
 
 describe('wiring inventory is complete (source scan)', () => {
   // Every site that can reach the seam's sealRawChunk, by the shape that installs a sealer. Each
-  // must be classified; a new site fails here until it is wired or added to UNWIRED (with a row
-  // above proving it refuses). WIRED regions must spread routedRawChunkSealerDeps(); UNWIRED and
-  // NOT_SEAL regions must not.
+  // must be classified. Constructors install the routed sealer; the scoped adapter forwards
+  // the caller’s dependencies. Each unwired sealing path has a refusal control above.
   const root = new URL('../../../', import.meta.url);
   const SITE_PATTERNS: Record<string, RegExp> = {
     'seal-fallback': /\?\?\s*sealRawChunk\b/g,
@@ -306,6 +305,9 @@ describe('wiring inventory is complete (source scan)', () => {
     ['write/export target', 'src/migration/neon-s3-sync/main.ts', 1],
     ['write/export target', 'src/migration/legacy-export/main.ts', 1],
     ['write/export target', 'src/session-ingest/buffered-drain.ts', 1], // buffered backlog drain (0005)
+  ] as const;
+  const FORWARDING_SITES = [
+    ['PublicationJobDeps', 'src/session-ingest/publication-scoped-rpc.ts', 1],
   ] as const;
   const UNWIRED_SITES = [
     ['PublicationJobDeps', 'src/session-ingest/publication-canary.ts', 1], // row publication-canary
@@ -369,10 +371,17 @@ describe('wiring inventory is complete (source scan)', () => {
   }
   const key = ([kind, file, n]: readonly [string, string, number]) => `${kind} ${file} #${n}`;
 
-  test('every site is classified exactly once (wired, unwired-refuses, seam fallback, not a seal)', () => {
-    const classified = [...WIRED_SITES, ...UNWIRED_SITES, ...FALLBACK_SITES, ...NOT_SEAL_SITES].map(key).sort();
+  test('every site is classified exactly once (wired, forwarding, unwired-refuses, seam fallback, not a seal)', () => {
+    const classified = [...WIRED_SITES, ...FORWARDING_SITES, ...UNWIRED_SITES, ...FALLBACK_SITES, ...NOT_SEAL_SITES].map(key).sort();
     expect(new Set(classified).size).toBe(classified.length);
     expect([...found.keys()].sort()).toStrictEqual(classified);
+  });
+  test('the scoped publication adapter forwards all caller deps and replaces only rpc', () => {
+    for (const site of FORWARDING_SITES) {
+      const call = found.get(key(site))!;
+      expect(call).toMatch(/^canonicalPublicationTick\(\s*\{/);
+      expect(region(call, call.indexOf('{'))).toMatch(/^\{\s*\.\.\.deps\s*,\s*rpc\s*\}$/);
+    }
   });
   test('wired sites spread routedRawChunkSealerDeps(); unwired and non-seal sites do not', () => {
     for (const site of WIRED_SITES) expect(found.get(key(site))).toMatch(/\.\.\.routedRawChunkSealerDeps\(\)/);
