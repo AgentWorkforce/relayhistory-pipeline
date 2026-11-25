@@ -17,7 +17,7 @@ const searchFile="20261105062300_search_index_stage.sql";
 const privateName="upstream:"+privateFile;
 const searchName="upstream:"+searchFile;
 const ordered=[privateName, publicationKernelSlot.name,publicationRecoverySlot.name,searchName];
-const profile={mode:"local" as const,shim:true,bootstrap:true,verify:false,runtimeRole:"fixture_owner"};
+const profile={mode:"local" as const,shim:true,bootstrap:true,verify:true,runtimeRole:"fixture_owner"};
 const initial=await plan(profile);
 assert.deepEqual(initial.map(s=>s.name).filter(n=>ordered.includes(n)),[searchName]);
 // The private precondition is synthetic. Its filename deliberately cannot be

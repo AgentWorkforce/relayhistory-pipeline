@@ -769,7 +769,7 @@ describe.skipIf(!url)("062270 independent synthetic receipt inventory",()=>{
       await d.pool.query("DROP OWNED BY "+role);await d.pool.query("DROP ROLE "+role);
     }});
     await d.pool.query("GRANT "+reader+" TO "+login+"; GRANT USAGE ON SCHEMA sessions TO "+reader);
-    await d.pool.query(read("supabase/proposals/continuous-publication/062270-private-read-profile.up.sql"));
+    if (!orderedTemplate) await d.pool.query(read("supabase/proposals/continuous-publication/062270-private-read-profile.up.sql"));
     await d.pool.query(read("src/session-ingest/__tests__/fixtures/frontier-independent-receipt-domain.sql"));
     await d.pool.query("GRANT USAGE ON SCHEMA fixture_receipt_inventory TO "+issuer+","+destination+
       "; GRANT INSERT,SELECT ON fixture_receipt_inventory.enrollment,fixture_receipt_inventory.expected TO "+issuer+
