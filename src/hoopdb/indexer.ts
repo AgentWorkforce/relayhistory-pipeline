@@ -43,7 +43,7 @@ await runWorker({
       reader: lockerManifestReader(),
       queue: postgresPipelineQueue(db),
       current,
-      publication:{schemaGeneration:publicationSchema.generation,transact:work=>inTransaction(db,async tx=>{
+      publication:{schemaGeneration:publicationSchema.generation,enqueueSearchWake:process.env.PIPELINE_MANAGED_SEARCH_WAKE_ENABLED==="true",transact:work=>inTransaction(db,async tx=>{
         await tx.query("SET LOCAL statement_timeout='5s';SET LOCAL lock_timeout='1s'");return work(tx);
       })},
     }),

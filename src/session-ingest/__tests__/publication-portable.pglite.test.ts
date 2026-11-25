@@ -54,6 +54,16 @@ async function installScopedProposal() {
   if ((await owner("SELECT to_regnamespace('publication_private') AS installed")).rows[0].installed) return;
   await db.exec("CREATE ROLE bulls96_publication_scoped NOLOGIN; CREATE ROLE bulls96_publication_recovery NOLOGIN; GRANT USAGE ON SCHEMA sessions TO bulls96_publication_scoped");
   await db.exec(read("supabase/proposals/continuous-publication/062280-scoped-kernels.up.sql"));
+  await db.exec("CREATE ROLE bulls96_search_wake_consumer NOLOGIN");
+  const wake = "supabase/proposals/continuous-publication/managed-search-wake";
+  const checks=()=>owner("SELECT conname,pg_get_constraintdef(oid) definition FROM pg_constraint WHERE conrelid IN ('sessions.pipeline_jobs'::regclass,'sessions.pipeline_events'::regclass,'sessions.pipeline_dead_letters'::regclass) AND conname IN ('pipeline_jobs_stage_check','pipeline_events_stage_check','pipeline_dead_letters_stage_check') ORDER BY conname");
+  const original=(await checks()).rows;
+  expect(original).toHaveLength(3);
+  await db.exec(read(wake+".up.sql"));
+  expect((await checks()).rows.every(row=>row.definition.includes("search-index"))).toBe(true);
+  await db.exec(read(wake+".down.sql"));
+  expect((await checks()).rows).toEqual(original);
+  await db.exec(read(wake+".up.sql"));
 }
 beforeAll(async () => {
   db = new PGlite({ extensions: { btree_gin, pg_trgm } });
@@ -257,7 +267,7 @@ test("generation PUT before scoped finalization cannot promote a committed or in
   await installScopedProposal();
 
   for (const commit of [false, true]) {
-    const id = commit ? "early-final" : "early-abort";
+    const id = commit ? "early:final" : "early-abort";
     const payload = await batch([record({ record_id: id, session_id: id, payload: {text:"needle publication proof", ts_ms:1761955200000} })], { batch_id: id,account_id:await deliveryAccount(cohort) });
     expect((await deliverBatch({ ledger, target: { store, keyRoot: "96bulls" }, acceptanceMode: "buffered" }, cohort, payload)).outcome).toBe("accepted_buffered");
     const binding = { planSha256: "c".repeat(64), admissionId: crypto.randomUUID(), frontierSha256: "e".repeat(64),
@@ -306,6 +316,7 @@ test("generation PUT before scoped finalization cannot promote a committed or in
     expect((await owner(`SELECT a.state FROM sessions.ingest_publication_attempts a
       JOIN publication_private.admission f ON f.stage=a.stage_token WHERE f.id=$1`, [binding.admissionId])).rows)
       .toEqual([{state: commit ? "published" : "prepared"}]);
+    expect((await owner("SELECT 1 FROM sessions.pipeline_jobs WHERE stage='search-index' AND workspace_id=$1",[cohort.workspaceId])).rows).toHaveLength(0);
     const expected = commit ? 1 : 0;
     await deliverPut(); // duplicate may arrive after the outcome
     expect(await counts()).toEqual({pointers: expected, revisions: expected, jobs: expected});
