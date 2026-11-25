@@ -886,7 +886,7 @@ describe("streamed reconcile on the Lambda: one streamed scope per invocation, w
     const tx: SqlExecutor = {
       async query<R>(text: string, params: unknown[] = []) {
         if (text.includes("pg_catalog.pg_attribute") && text.includes("recorded_catalog_title")) return { rows: [{ supported: false }] as R[] };
-        if (text.includes("pg_try_advisory_xact_lock")) return { rows: [{ ok: true }] as R[] };
+        if (text.includes("pg_try_advisory_xact_lock") || text.includes("pg_catalog.pg_locks")) return { rows: [{ ok: true }] as R[] };
         if (text.includes("event_projection_sources")) return { rows: [{ written: true }] as R[] };
         const session = String(params[3]);
         if (text.includes("FROM sessions.session_index") && text.includes("deleted_at IS NULL"))
@@ -921,9 +921,10 @@ describe("streamed reconcile on the Lambda: one streamed scope per invocation, w
     expect(l.reads()).toBe(1); // the context's remaining time is read once per invocation
     expect(l.requeued).toEqual([l.keys.sess_2]);
     expect(l.indexed()).toEqual(["sess_1", "sess_3"]); // sess_1 only by streaming: its whole read is refused
-    // sess_1's streamed pass first records needs_full=1 (the backport's pre-mark, 1 ms before its own state row), then
-    // its final state; sess_2: no state written.
-    expect(l.ch.state.map((s) => [s.session_id, s.needs_full])).toEqual([["sess_1", 1], ["sess_1", 0], ["sess_3", 0]]);
+    // Every hosted pass first records needs_full=1 before its first read (the backport's pre-mark), and its
+    // completing row only after COMMIT: sess_1 streams and completes; sess_2 is deferred and stays owed; sess_3's
+    // whole read completes.
+    expect(l.ch.state.map((s) => [s.session_id, s.needs_full])).toEqual([["sess_1", 1], ["sess_1", 0], ["sess_2", 1], ["sess_3", 1], ["sess_3", 0]]);
     // The redelivered event is the next invocation's one streamed scope.
     expect((await l.invoke(["sess_2"], l.context(300_000))).batchItemFailures).toEqual([]);
     expect(l.indexed()).toEqual(["sess_1", "sess_2", "sess_3"]);
