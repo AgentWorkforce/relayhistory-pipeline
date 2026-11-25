@@ -57,6 +57,15 @@ Before raising the cap:
 
 The stack bound stays at 20. Raising it is a separate reviewed change that carries the pool-size proof, the headroom check and the connect timeout.
 
+## Visibility timeout
+
+AWS recommends a queue visibility of at least 6 x the function timeout (300 s) plus the batching window. With
+`batchingWindowSeconds` set, the stack renders exactly 1800 + window (2 s gives 1802; 300 s gives 2100). Unset, it stays
+1800 s, which is 20 s under the recommendation at the default 20 s window. It is kept unchanged so an unset stage is
+byte-identical. The hand-applied 2026-11-25 change (window 2 s) left the live visibility at 1800 s, 2 s under the
+recommendation. That is advisory only (AWS enforces visibility >= function timeout). It is corrected to 1802 when
+the stage sets `batchingWindowSeconds: 2`.
+
 ## Rollback values and stop lines
 
 Rollback for every step is today's values: delay 30, window 20, concurrency 20, busy requeue unset (60 s). Roll back

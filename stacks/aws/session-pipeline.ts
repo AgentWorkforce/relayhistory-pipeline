@@ -904,11 +904,21 @@ export const sessionPipelineFunction = (i: SessionPipelineStageInputs & { bucket
  * The session-events queue's timing props, exactly as the wiring passes them: delivery delay (deliveryDelaySeconds,
  * default DELIVERY_DELAY_SECONDS) and the visibility timeout (fixed).
  */
-export function sessionEventsQueueTiming(p: Pick<SessionPipelineInputs, "deliveryDelaySeconds">) {
+export function sessionEventsQueueTiming(p: Pick<SessionPipelineInputs, "deliveryDelaySeconds" | "batchingWindowSeconds">) {
   return {
     delay: `${p.deliveryDelaySeconds ?? DELIVERY_DELAY_SECONDS} seconds`,
-    visibilityTimeout: `${VISIBILITY_TIMEOUT_SECONDS} seconds`,
+    visibilityTimeout: `${sessionEventsVisibilitySeconds(p)} seconds`,
   };
+}
+
+/**
+ * The queue visibility timeout. AWS recommends at least 6 x the function timeout plus the mapping's batching window,
+ * so a message cannot reappear while a batch that waited the full window is still being processed. With
+ * batchingWindowSeconds set it is exactly that. Omitted, it stays VISIBILITY_TIMEOUT_SECONDS (1800 s), unchanged:
+ * that is 20 s under the recommendation at the default 20 s window, kept so an unset stage renders byte-identical.
+ */
+export function sessionEventsVisibilitySeconds(p: Pick<SessionPipelineInputs, "batchingWindowSeconds">): number {
+  return p.batchingWindowSeconds === undefined ? VISIBILITY_TIMEOUT_SECONDS : 6 * FUNCTION_TIMEOUT_SECONDS + p.batchingWindowSeconds;
 }
 
 /**

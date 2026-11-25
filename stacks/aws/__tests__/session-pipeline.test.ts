@@ -8,6 +8,7 @@ import {
   DELIVERY_DELAY_SECONDS,
   sessionEventsMappingTiming,
   sessionEventsQueueTiming,
+  sessionEventsVisibilitySeconds,
   FUNCTION_TIMEOUT_SECONDS,
   SESSION_BRIEF_RESOURCES,
   SESSION_ANALYSIS_CACHE_RESOURCES,
@@ -1101,20 +1102,25 @@ describe("session pipeline: pointer skips the sessionless per-origin bucket (SES
 
 describe("session pipeline: queue and mapping timing props (as the wiring passes them)", () => {
   const props = (p: SessionPipelineInputs) => ({ ...sessionEventsQueueTiming(p), ...sessionEventsMappingTiming(p) });
-  const fixed = { batchSize: 10, functionResponseTypes: ["ReportBatchItemFailures"], visibilityTimeout: "1800 seconds" };
+  const fixed = { batchSize: 10, functionResponseTypes: ["ReportBatchItemFailures"] };
+  const vis = (n: number) => ({ visibilityTimeout: `${n} seconds` });
   it("omitted and explicit defaults render 30 s / 20 s / 4", () => {
     for (const p of [{}, { deliveryDelaySeconds: 30, batchingWindowSeconds: 20, maxConcurrency: 4 }] as SessionPipelineInputs[])
-      expect(props(p)).toEqual({ ...fixed, delay: "30 seconds", maximumBatchingWindow: "20 seconds", scalingConfig: { MaximumConcurrency: 4 } });
+      expect(props(p)).toEqual({ ...fixed, ...vis(p.batchingWindowSeconds === undefined ? 1800 : 1820), delay: "30 seconds", maximumBatchingWindow: "20 seconds", scalingConfig: { MaximumConcurrency: 4 } });
   });
   it("explicit zeros render zero, never the default", () => {
     expect(props({ deliveryDelaySeconds: 0, batchingWindowSeconds: 0, maxConcurrency: 2 }))
-      .toEqual({ ...fixed, delay: "0 seconds", maximumBatchingWindow: "0 seconds", scalingConfig: { MaximumConcurrency: 2 } });
+      .toEqual({ ...fixed, ...vis(1800), delay: "0 seconds", maximumBatchingWindow: "0 seconds", scalingConfig: { MaximumConcurrency: 2 } });
   });
   it("the proposed values and the upper edges render exactly", () => {
     expect(props({ deliveryDelaySeconds: 5, batchingWindowSeconds: 2, maxConcurrency: 20 }))
-      .toEqual({ ...fixed, delay: "5 seconds", maximumBatchingWindow: "2 seconds", scalingConfig: { MaximumConcurrency: 20 } });
+      .toEqual({ ...fixed, ...vis(1802), delay: "5 seconds", maximumBatchingWindow: "2 seconds", scalingConfig: { MaximumConcurrency: 20 } });
     expect(props({ deliveryDelaySeconds: 900, batchingWindowSeconds: 300, maxConcurrency: 20 }))
-      .toEqual({ ...fixed, delay: "900 seconds", maximumBatchingWindow: "300 seconds", scalingConfig: { MaximumConcurrency: 20 } });
+      .toEqual({ ...fixed, ...vis(2100), delay: "900 seconds", maximumBatchingWindow: "300 seconds", scalingConfig: { MaximumConcurrency: 20 } });
+  });
+  it("visibility covers 6 x the handler timeout plus the batching window whenever the window is set", () => {
+    expect(sessionEventsVisibilitySeconds({})).toBe(1800);
+    for (const w of [0, 2, 20, 300]) expect(sessionEventsVisibilitySeconds({ batchingWindowSeconds: w })).toBe(6 * 300 + w);
   });
   it("the busy requeue delay is independent of the queue timing", () => {
     expect(props({ busyRequeueDelaySeconds: 10 })).toEqual(props({}));
