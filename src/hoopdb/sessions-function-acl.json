@@ -177,6 +177,10 @@
       "<owner>:EXECUTE",
       "service_role:EXECUTE"
     ],
+    "sessions.claim_search_probe_v1()": [
+      "<owner>:EXECUTE",
+      "service_role:EXECUTE"
+    ],
     "sessions.claim_session_analysis_cache()": [
       "<owner>:EXECUTE",
       "service_role:EXECUTE"
@@ -1495,6 +1499,9 @@
       "<owner>:EXECUTE"
     ],
     "sessions.search_job_claim_attempts_v1()": [
+      "<owner>:EXECUTE"
+    ],
+    "sessions.search_job_lease_v1(bigint,boolean)": [
       "<owner>:EXECUTE"
     ],
     "sessions.search_letter_id_v1(text,text,text)": [

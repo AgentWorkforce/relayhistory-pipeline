@@ -24,7 +24,7 @@ DO $rollback_guard$ DECLARE v_sha text; BEGIN
  IF EXISTS(SELECT 1 FROM sessions.__96bulls_migrations WHERE name LIKE 'upstream:%' AND name COLLATE "C">'upstream:20261105062300_search_index_stage.sql')
  THEN RAISE EXCEPTION USING ERRCODE='55000',MESSAGE='search index stage: a later migration is applied; roll it back first';END IF;
  SELECT sha256 INTO v_sha FROM sessions.__96bulls_migrations WHERE name='upstream:20261105062300_search_index_stage.sql' FOR UPDATE;
- IF NOT FOUND OR v_sha<>'e2658298b66153eb78bee40bffe53c574e9e67da0894684c5b38063be7f7bea9'
+ IF NOT FOUND OR v_sha<>'17852a866106ec73b3e3a8cb88937207abda76d91a1c602998943070485ecd01'
  THEN RAISE EXCEPTION USING ERRCODE='55000',MESSAGE='search index stage: own applied checksum required';END IF;
  -- §8: the additive migration stays until the stage is fully empty, in all three tables.
  LOCK TABLE sessions.pipeline_jobs, sessions.pipeline_events, sessions.pipeline_dead_letters, sessions.search_job_claims,
@@ -51,6 +51,8 @@ DROP TRIGGER search_job_claim_attempts ON sessions.pipeline_jobs;
 DROP FUNCTION sessions.settle_search_job_v1(bigint,uuid,text);
 DROP FUNCTION sessions.resume_search_contention_v1(bigint,text);
 DROP FUNCTION sessions.claim_search_jobs_v1(integer);
+DROP FUNCTION sessions.claim_search_probe_v1();
+DROP FUNCTION sessions.search_job_lease_v1(bigint,boolean);
 DROP FUNCTION sessions.search_letter_id_v1(text,text,text);
 DROP FUNCTION sessions.search_job_claim_attempts_v1();
 DROP TABLE sessions.search_job_claims;

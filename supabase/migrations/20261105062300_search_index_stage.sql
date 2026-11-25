@@ -382,7 +382,7 @@ REVOKE ALL ON sessions.search_job_claims FROM PUBLIC, anon, authenticated, servi
 -- Bounded `busy` (scope lock contention), kept OUTSIDE the claim receipt: one row per contended job, at the epoch it
 -- was contended at. Owner-only, no grant. A busy settlement never spends the failure budget and never parks; it holds
 -- the job 30 s, escalates at 2 h of same-epoch contention (then at most hourly), and at 24 h HOLDS it (the 24 h cap,
--- held_at / next_probe_at): the claim then admits one probe per hour until an operator resumes it
+-- held_at / next_probe_at): the probe lane (claim_search_probe_v1) then admits one probe an hour until an operator resumes it
 -- (resume_search_contention_v1) or a newer epoch releases it. Any non-busy settlement, and a busy one that finds a
 -- newer epoch, clears the row.
 CREATE TABLE sessions.search_job_contention (
@@ -400,8 +400,8 @@ CREATE TABLE sessions.search_job_contention (
 ALTER TABLE sessions.search_job_contention ENABLE ROW LEVEL SECURITY;
 REVOKE ALL ON sessions.search_job_contention FROM PUBLIC, anon, authenticated, service_role;
 
--- The fleet-wide probe budget for held jobs: one owner-only row, a token bucket shared by every concurrent claimer
--- (claim_search_jobs_v1 updates it under FOR UPDATE, so two claims never spend the same token). rate_per_minute (R)
+-- The fleet-wide probe budget for held jobs: one owner-only row, a token bucket shared by every concurrent prober
+-- (claim_search_probe_v1 updates it under FOR UPDATE, so two probes never spend the same token). rate_per_minute (R)
 -- and burst (C) are its tunable policy; defaults R = 6/min, C = 6, initial balance 6 tokens (an owner UPDATE changes
 -- them, no code change). Probes admitted over any interval are at most C + R x elapsed minutes, fleet-wide.
 CREATE TABLE sessions.search_probe_budget (
@@ -410,9 +410,6 @@ CREATE TABLE sessions.search_probe_budget (
   burst           numeric     NOT NULL DEFAULT 6 CHECK (burst >= 1),
   tokens          numeric     NOT NULL DEFAULT 6 CHECK (tokens >= 0),
   refilled_at     timestamptz NOT NULL DEFAULT now(),
-  -- The ordinary turn: what the last claim that served work served. A probe is served only if it was not a probe,
-  -- unless no ordinary work is ready, so with limit 1 probes take at most every other call under ordinary load.
-  last_served_kind text       NOT NULL DEFAULT 'ordinary' CHECK (last_served_kind IN ('ordinary', 'probe')),
   CHECK (tokens <= burst)
 );
 INSERT INTO sessions.search_probe_budget DEFAULT VALUES;
@@ -453,117 +450,133 @@ LANGUAGE sql STABLE STRICT SET search_path = pg_catalog, pg_temp AS $letter$
 $letter$;
 REVOKE ALL ON FUNCTION sessions.search_letter_id_v1(text, text, text) FROM PUBLIC, anon, authenticated, service_role;
 
--- §3.2: claim up to p_limit (clamped to 1..10) search-index rows: visible, non-dlq, FOR UPDATE SKIP LOCKED; each counts
--- an attempt, takes a fresh lease of the server's 300 s and upserts the receipt (the claim-time snapshot). Returns the
--- STORED snapshot.
---   Held probes (the 24 h contention cap): a job held at its current epoch is never ordinary work. When one is due
---   (next_probe_at passed; oldest due first, then job id) AND the fleet bucket (search_probe_budget, under FOR UPDATE)
---   has a token, the probe takes ONE of this call's slots and spends the token; the remaining slots are ordinary.
---   At most one probe per call; the bucket's rate bounds probes fleet-wide. The ordinary turn (last_served_kind):
---   after a probe, the next call serves ordinary work if any is ready, so with limit 1 ordinary work gets at least
---   every other call however slowly calls arrive; with no ordinary work ready, probes may run back to back.
---   A newer epoch releases a hold (the contention row is deleted when the job is claimed at that epoch).
---   Expired-lease reclaim bound: a row whose previous lease expired unsettled at the same epoch counts a consecutive
---   abandoned lease (the persisted receipt's reclaim_count); at exactly 6 the claim parks the previous claim's
---   snapshot (code expired_lease_reclaims) and deletes the row and its receipt and contention, atomically.
+-- Owner-internal: lease ONE job the calling claim function has already locked (FOR UPDATE), or park it. Counts the
+-- attempt, takes the server's 300 s lease and upserts the receipt (the claim-time snapshot); returns the STORED
+-- snapshot, or no row when it parked.
+--   Expired-lease reclaim bound: a receipt still present means the previous lease expired unsettled (every settlement
+--   deletes it); consecutive abandoned leases at one epoch are counted on the persisted receipt (reclaim_count), and at
+--   exactly 6 the job is parked with the previous claim's snapshot (code expired_lease_reclaims) and its row, receipt
+--   and contention deleted, atomically.
+--   A newer epoch releases a hold (the contention resets). A probe (p_probe) moves the next probe an hour on and
+--   writes exactly one durable scope_contention_probe event with its lease id; a park writes none.
+-- Not SECURITY DEFINER and granted to no one: it runs only inside the owner's claim functions below.
+CREATE FUNCTION sessions.search_job_lease_v1(p_job_id bigint, p_probe boolean)
+RETURNS TABLE (job_id bigint, lease_id uuid, message jsonb, epoch bigint, attempts integer)
+LANGUAGE plpgsql SET search_path = pg_catalog, pg_temp AS $lease$
+#variable_conflict use_column
+DECLARE
+ reclaim_cap constant integer := 6;
+ q sessions.pipeline_jobs; prior sessions.search_job_claims; had_prior boolean;
+ cur_epoch bigint; reclaims integer; at_ts timestamptz := clock_timestamp(); m jsonb; letter text; dead integer;
+ new_lease uuid; new_attempts integer;
+BEGIN
+ SELECT * INTO q FROM sessions.pipeline_jobs x WHERE x.id = p_job_id AND x.stage = 'search-index' FOR UPDATE;
+ IF NOT FOUND THEN RETURN; END IF;
+ cur_epoch := (q.message->'payload'->>'epoch')::bigint;
+ SELECT * INTO prior FROM sessions.search_job_claims c WHERE c.job_id = q.id FOR UPDATE;
+ had_prior := FOUND;
+ reclaims := CASE WHEN had_prior AND prior.claimed_epoch = cur_epoch THEN prior.reclaim_count + 1 ELSE 0 END;
+ IF reclaims >= reclaim_cap THEN
+   m := prior.claimed_message;
+   letter := sessions.search_letter_id_v1(m->'ctx'->>'orgId', m->'ctx'->>'workspaceId', m->>'workKey');
+   INSERT INTO sessions.pipeline_dead_letters AS d
+          (id, stage, trace_id, org_id, workspace_id, session_id, machine_id, message, first_dead_at, last_dead_at)
+   VALUES (letter, 'search-index', (m->'ctx'->>'traceId')::uuid, m->'ctx'->>'orgId', m->'ctx'->>'workspaceId',
+           m->'ctx'->>'sessionId', m->'ctx'->>'machineId', m, at_ts, at_ts)
+   ON CONFLICT (id) DO UPDATE SET message = EXCLUDED.message, trace_id = EXCLUDED.trace_id, org_id = EXCLUDED.org_id,
+          workspace_id = EXCLUDED.workspace_id, session_id = EXCLUDED.session_id, machine_id = EXCLUDED.machine_id,
+          state = 'dead', last_dead_at = EXCLUDED.last_dead_at, dead_count = d.dead_count + 1, resolved_at = NULL, resolution = NULL
+   RETURNING d.dead_count INTO dead;
+   INSERT INTO sessions.pipeline_events (trace_id, stage, status, error, attrs, attempt, idempotency_key, org_id, workspace_id, machine_id, harness, session_id)
+   VALUES ((m->'ctx'->>'traceId')::uuid, 'search-index', 'dead_lettered',
+           jsonb_build_object('name', 'SearchJobError', 'code', 'expired_lease_reclaims', 'retryable', false),
+           jsonb_build_object('work_key', m->>'workKey', 'epoch', prior.claimed_epoch, 'dead_letter_id', letter, 'expired_leases', reclaims),
+           greatest(1, prior.claimed_attempts),
+           concat_ws(':', m->'ctx'->>'traceId', 'search-index', 'dead_lettered', greatest(1, prior.claimed_attempts)::text,
+                     (m->>'workKey') || '@' || prior.claimed_epoch::text, 'reclaims', prior.lease_id::text),
+           m->'ctx'->>'orgId', m->'ctx'->>'workspaceId', m->'ctx'->>'machineId', m->'ctx'->>'harness', m->'ctx'->>'sessionId');
+   DELETE FROM sessions.pipeline_jobs x WHERE x.id = q.id;
+   DELETE FROM sessions.search_job_claims c WHERE c.job_id = q.id;
+   DELETE FROM sessions.search_job_contention k WHERE k.job_id = q.id;
+   RETURN;
+ END IF;
+ DELETE FROM sessions.search_job_contention k WHERE k.job_id = q.id AND k.epoch < cur_epoch;
+ IF p_probe THEN
+   UPDATE sessions.search_job_contention k SET next_probe_at = at_ts + interval '1 hour'
+    WHERE k.job_id = q.id AND k.held_at IS NOT NULL AND k.epoch = cur_epoch;
+ END IF;
+ UPDATE sessions.pipeline_jobs AS x
+    SET lease_id = gen_random_uuid(), visible_at = at_ts + interval '300 seconds', attempts = x.attempts + 1
+  WHERE x.id = q.id
+ RETURNING x.lease_id, x.attempts INTO new_lease, new_attempts;
+ INSERT INTO sessions.search_job_claims AS c (job_id, lease_id, claimed_epoch, claimed_message, claimed_attempts, claimed_at, lease_until, reclaim_count)
+ VALUES (q.id, new_lease, cur_epoch, q.message, new_attempts, at_ts, at_ts + interval '300 seconds', reclaims)
+ ON CONFLICT ON CONSTRAINT search_job_claims_pkey DO UPDATE
+   SET lease_id = EXCLUDED.lease_id, claimed_epoch = EXCLUDED.claimed_epoch, claimed_message = EXCLUDED.claimed_message,
+       claimed_attempts = EXCLUDED.claimed_attempts, claimed_at = EXCLUDED.claimed_at, lease_until = EXCLUDED.lease_until,
+       reclaim_count = EXCLUDED.reclaim_count;
+ IF p_probe THEN
+   INSERT INTO sessions.pipeline_events (trace_id, stage, status, error, attrs, attempt, idempotency_key, org_id, workspace_id, machine_id, harness, session_id)
+   VALUES ((q.message->'ctx'->>'traceId')::uuid, 'search-index', 'retrying',
+           jsonb_build_object('name', 'SearchJobError', 'code', 'scope_contention_probe', 'retryable', true),
+           jsonb_build_object('work_key', q.message->>'workKey', 'epoch', cur_epoch, 'severity', 'warn', 'admitted_at', at_ts,
+                              'next_probe_in_s', 3600),
+           new_attempts,
+           concat_ws(':', q.message->'ctx'->>'traceId', 'search-index', 'retrying', new_attempts::text,
+                     (q.message->>'workKey') || '@' || cur_epoch::text, 'probe', new_lease::text),
+           q.message->'ctx'->>'orgId', q.message->'ctx'->>'workspaceId', q.message->'ctx'->>'machineId', q.message->'ctx'->>'harness', q.message->'ctx'->>'sessionId');
+ END IF;
+ job_id := q.id; lease_id := new_lease; message := q.message; epoch := cur_epoch; attempts := new_attempts;
+ RETURN NEXT;
+END $lease$;
+REVOKE ALL ON FUNCTION sessions.search_job_lease_v1(bigint, boolean) FROM PUBLIC, anon, authenticated, service_role;
+
+-- §3.2: the ORDINARY lane. Claims up to p_limit (clamped to 1..10) visible, non-dlq search-index rows that are not held
+-- at their current epoch (FOR UPDATE SKIP LOCKED), each leased through search_job_lease_v1. Held jobs are never
+-- ordinary work, so probes never take an ordinary slot.
 CREATE FUNCTION sessions.claim_search_jobs_v1(p_limit integer)
 RETURNS TABLE (job_id bigint, lease_id uuid, message jsonb, epoch bigint, attempts integer)
 LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, pg_temp AS $claim$
 #variable_conflict use_column
-DECLARE
- reclaim_cap constant integer := 6;
- n integer := least(10, greatest(1, coalesce(p_limit, 1)));
- probe_id bigint; b sessions.search_probe_budget; ids bigint[] := '{}';
- q sessions.pipeline_jobs; prior sessions.search_job_claims; had_prior boolean;
- cur_epoch bigint; reclaims integer; at_ts timestamptz; m jsonb; letter text; dead integer; new_lease uuid; new_attempts integer;
+DECLARE n integer := least(10, greatest(1, coalesce(p_limit, 1))); v_id bigint;
 BEGIN
- -- The probe slot: the oldest due held job, only if the fleet bucket has a token.
+ FOR v_id IN SELECT x.id FROM sessions.pipeline_jobs x
+            WHERE x.stage = 'search-index' AND NOT x.dlq AND x.visible_at <= clock_timestamp()
+              AND NOT EXISTS (SELECT 1 FROM sessions.search_job_contention k
+                               WHERE k.job_id = x.id AND k.held_at IS NOT NULL AND k.epoch = (x.message->'payload'->>'epoch')::bigint)
+            ORDER BY x.visible_at, x.id LIMIT n FOR UPDATE SKIP LOCKED LOOP
+   RETURN QUERY SELECT * FROM sessions.search_job_lease_v1(v_id, false);
+ END LOOP;
+END $claim$;
+
+-- The PROBE lane (the 24 h cap), separate from ordinary capacity: at most ONE held job whose hourly probe is due
+-- (oldest due first, then job id; FOR UPDATE SKIP LOCKED), and only if the fleet bucket (search_probe_budget, under
+-- FOR UPDATE, shared by every concurrent prober) has a token, which it spends. The probe is leased like any claim and
+-- writes its one durable scope_contention_probe event (search_job_lease_v1). No token, no due job: no row, no event.
+CREATE FUNCTION sessions.claim_search_probe_v1()
+RETURNS TABLE (job_id bigint, lease_id uuid, message jsonb, epoch bigint, attempts integer)
+LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, pg_temp AS $probe$
+#variable_conflict use_column
+DECLARE probe_id bigint; b sessions.search_probe_budget; at_ts timestamptz;
+BEGIN
  SELECT x.id INTO probe_id
    FROM sessions.pipeline_jobs x JOIN sessions.search_job_contention k ON k.job_id = x.id
   WHERE x.stage = 'search-index' AND NOT x.dlq AND x.visible_at <= clock_timestamp()
     AND k.held_at IS NOT NULL AND k.next_probe_at <= clock_timestamp() AND k.epoch = (x.message->'payload'->>'epoch')::bigint
   ORDER BY k.next_probe_at, k.job_id LIMIT 1
   FOR UPDATE OF x SKIP LOCKED;
- IF probe_id IS NOT NULL THEN
-   SELECT * INTO b FROM sessions.search_probe_budget WHERE singleton FOR UPDATE;
-   at_ts := clock_timestamp();
-   IF FOUND THEN
-     b.tokens := least(b.burst, b.tokens + greatest(0, extract(epoch FROM at_ts - b.refilled_at)) * b.rate_per_minute / 60.0);
-     -- The ordinary turn: after a probe, the next call that can serve ordinary work does.
-     IF b.tokens >= 1 AND (b.last_served_kind <> 'probe' OR NOT EXISTS (
-          SELECT 1 FROM sessions.pipeline_jobs x
-           WHERE x.stage = 'search-index' AND NOT x.dlq AND x.visible_at <= clock_timestamp() AND x.id <> probe_id
-             AND NOT EXISTS (SELECT 1 FROM sessions.search_job_contention k
-                              WHERE k.job_id = x.id AND k.held_at IS NOT NULL AND k.epoch = (x.message->'payload'->>'epoch')::bigint))) THEN
-       b.tokens := b.tokens - 1;
-       ids := ARRAY[probe_id];
-       b.last_served_kind := 'probe';
-     END IF;
-     UPDATE sessions.search_probe_budget SET tokens = b.tokens, refilled_at = at_ts, last_served_kind = b.last_served_kind WHERE singleton;
-   END IF;
+ IF probe_id IS NULL THEN RETURN; END IF;
+ SELECT * INTO b FROM sessions.search_probe_budget WHERE singleton FOR UPDATE;
+ IF NOT FOUND THEN RETURN; END IF;
+ at_ts := clock_timestamp();
+ b.tokens := least(b.burst, b.tokens + greatest(0, extract(epoch FROM at_ts - b.refilled_at)) * b.rate_per_minute / 60.0);
+ IF b.tokens < 1 THEN
+   UPDATE sessions.search_probe_budget SET tokens = b.tokens, refilled_at = at_ts WHERE singleton;
+   RETURN;
  END IF;
- -- The ordinary slots: visible work that is not held at its current epoch.
- ids := ids || coalesce((SELECT array_agg(t.id ORDER BY t.visible_at, t.id) FROM (
-   SELECT x.id, x.visible_at FROM sessions.pipeline_jobs x
-    WHERE x.stage = 'search-index' AND NOT x.dlq AND x.visible_at <= clock_timestamp()
-      AND x.id IS DISTINCT FROM ids[1]
-      AND NOT EXISTS (SELECT 1 FROM sessions.search_job_contention k
-                       WHERE k.job_id = x.id AND k.held_at IS NOT NULL AND k.epoch = (x.message->'payload'->>'epoch')::bigint)
-    ORDER BY x.visible_at, x.id LIMIT n - cardinality(ids)
-    FOR UPDATE SKIP LOCKED) t), '{}');
- -- A call that served ordinary work and no probe gives the next call its probe turn back (row-locked only on change).
- IF cardinality(ids) > 0 AND NOT (probe_id IS NOT NULL AND ids[1] = probe_id) THEN
-   UPDATE sessions.search_probe_budget SET last_served_kind = 'ordinary' WHERE singleton AND last_served_kind = 'probe';
- END IF;
- FOR q IN SELECT x.* FROM sessions.pipeline_jobs x WHERE x.id = ANY (ids) ORDER BY array_position(ids, x.id) LOOP
-   at_ts := clock_timestamp();
-   cur_epoch := (q.message->'payload'->>'epoch')::bigint;
-   SELECT * INTO prior FROM sessions.search_job_claims c WHERE c.job_id = q.id FOR UPDATE;
-   had_prior := FOUND;
-   -- A receipt still present means the previous lease expired unsettled (every settlement deletes it).
-   reclaims := CASE WHEN had_prior AND prior.claimed_epoch = cur_epoch THEN prior.reclaim_count + 1 ELSE 0 END;
-   IF reclaims >= reclaim_cap THEN
-     m := prior.claimed_message;
-     letter := sessions.search_letter_id_v1(m->'ctx'->>'orgId', m->'ctx'->>'workspaceId', m->>'workKey');
-     INSERT INTO sessions.pipeline_dead_letters AS d
-            (id, stage, trace_id, org_id, workspace_id, session_id, machine_id, message, first_dead_at, last_dead_at)
-     VALUES (letter, 'search-index', (m->'ctx'->>'traceId')::uuid, m->'ctx'->>'orgId', m->'ctx'->>'workspaceId',
-             m->'ctx'->>'sessionId', m->'ctx'->>'machineId', m, at_ts, at_ts)
-     ON CONFLICT (id) DO UPDATE SET message = EXCLUDED.message, trace_id = EXCLUDED.trace_id, org_id = EXCLUDED.org_id,
-            workspace_id = EXCLUDED.workspace_id, session_id = EXCLUDED.session_id, machine_id = EXCLUDED.machine_id,
-            state = 'dead', last_dead_at = EXCLUDED.last_dead_at, dead_count = d.dead_count + 1, resolved_at = NULL, resolution = NULL
-     RETURNING d.dead_count INTO dead;
-     INSERT INTO sessions.pipeline_events (trace_id, stage, status, error, attrs, attempt, idempotency_key, org_id, workspace_id, machine_id, harness, session_id)
-     VALUES ((m->'ctx'->>'traceId')::uuid, 'search-index', 'dead_lettered',
-             jsonb_build_object('name', 'SearchJobError', 'code', 'expired_lease_reclaims', 'retryable', false),
-             jsonb_build_object('work_key', m->>'workKey', 'epoch', prior.claimed_epoch, 'dead_letter_id', letter, 'expired_leases', reclaims),
-             greatest(1, prior.claimed_attempts),
-             concat_ws(':', m->'ctx'->>'traceId', 'search-index', 'dead_lettered', greatest(1, prior.claimed_attempts)::text,
-                       (m->>'workKey') || '@' || prior.claimed_epoch::text, 'reclaims', prior.lease_id::text),
-             m->'ctx'->>'orgId', m->'ctx'->>'workspaceId', m->'ctx'->>'machineId', m->'ctx'->>'harness', m->'ctx'->>'sessionId');
-     DELETE FROM sessions.pipeline_jobs x WHERE x.id = q.id;
-     DELETE FROM sessions.search_job_claims c WHERE c.job_id = q.id;
-     DELETE FROM sessions.search_job_contention k WHERE k.job_id = q.id;
-     CONTINUE;
-   END IF;
-   -- A newer epoch releases a hold (the contention resets); an admitted probe moves the next one an hour on.
-   DELETE FROM sessions.search_job_contention k WHERE k.job_id = q.id AND k.epoch < cur_epoch;
-   UPDATE sessions.search_job_contention k SET next_probe_at = at_ts + interval '1 hour'
-    WHERE k.job_id = q.id AND k.held_at IS NOT NULL AND k.epoch = cur_epoch;
-   UPDATE sessions.pipeline_jobs AS x
-      SET lease_id = gen_random_uuid(), visible_at = at_ts + interval '300 seconds', attempts = x.attempts + 1
-    WHERE x.id = q.id
-   RETURNING x.lease_id, x.attempts INTO new_lease, new_attempts;
-   INSERT INTO sessions.search_job_claims AS c (job_id, lease_id, claimed_epoch, claimed_message, claimed_attempts, claimed_at, lease_until, reclaim_count)
-   VALUES (q.id, new_lease, cur_epoch, q.message, new_attempts, at_ts, at_ts + interval '300 seconds', reclaims)
-   ON CONFLICT ON CONSTRAINT search_job_claims_pkey DO UPDATE
-     SET lease_id = EXCLUDED.lease_id, claimed_epoch = EXCLUDED.claimed_epoch, claimed_message = EXCLUDED.claimed_message,
-         claimed_attempts = EXCLUDED.claimed_attempts, claimed_at = EXCLUDED.claimed_at, lease_until = EXCLUDED.lease_until,
-         reclaim_count = EXCLUDED.reclaim_count;
-   job_id := q.id; lease_id := new_lease; message := q.message; epoch := cur_epoch; attempts := new_attempts;
-   RETURN NEXT;
- END LOOP;
-END $claim$;
+ UPDATE sessions.search_probe_budget SET tokens = b.tokens - 1, refilled_at = at_ts WHERE singleton;
+ RETURN QUERY SELECT * FROM sessions.search_job_lease_v1(probe_id, true);
+END $probe$;
 
 -- §3.3 (+ §3.3b completion): settle one claimed search-index job. Outcomes are allowlisted ('done' | 'retry' | 'busy';
 -- anything else raises 22023). 'busy' (scope lock contention) is bounded: see sessions.search_job_contention. Bound to the stage, the job, the CURRENT unexpired lease (the row's lease and visible_at, and the
@@ -631,7 +644,7 @@ BEGIN
       WHERE k.job_id = j.id RETURNING * INTO cont;
    END IF;
    contended_s := floor(extract(epoch FROM checked_at - cont.first_contended_at))::bigint;
-   -- The 24 h cap (isolated here and in the claim's hold filter): hold the job, one probe claim an hour.
+   -- The 24 h cap (isolated here, in the ordinary claim's hold filter and in the probe lane): hold the job, one probe claim an hour.
    IF cont.held_at IS NOT NULL THEN
      probe := true;
      UPDATE sessions.search_job_contention k SET next_probe_at = checked_at + interval '1 hour' WHERE k.job_id = j.id RETURNING * INTO cont;
@@ -661,13 +674,14 @@ BEGIN
              concat_ws(':', m->'ctx'->>'traceId', 'search-index', 'retrying', attempt::text, disc, 'escalated'),
              m->'ctx'->>'orgId', m->'ctx'->>'workspaceId', m->'ctx'->>'machineId', m->'ctx'->>'harness', m->'ctx'->>'sessionId');
    END IF;
-   IF held_now OR probe THEN
+   -- The hold transition's alert (once per hold). A probe's event is the claim's (one per admitted probe), never here.
+   IF held_now THEN
      INSERT INTO sessions.pipeline_events (trace_id, stage, status, error, attrs, attempt, idempotency_key, org_id, workspace_id, machine_id, harness, session_id)
      VALUES ((m->'ctx'->>'traceId')::uuid, 'search-index', 'retrying',
-             jsonb_build_object('name', 'SearchJobError', 'code', CASE WHEN held_now THEN 'scope_contention_held' ELSE 'scope_contention_probe' END, 'retryable', true),
-             attrs || jsonb_build_object('severity', CASE WHEN held_now THEN 'error' ELSE 'warn' END,
+             jsonb_build_object('name', 'SearchJobError', 'code', 'scope_contention_held', 'retryable', true),
+             attrs || jsonb_build_object('severity', 'error',
                                          'next_probe_in_s', floor(extract(epoch FROM cont.next_probe_at - checked_at))::bigint), attempt,
-             concat_ws(':', m->'ctx'->>'traceId', 'search-index', 'retrying', attempt::text, disc, CASE WHEN held_now THEN 'held' ELSE 'probe' END),
+             concat_ws(':', m->'ctx'->>'traceId', 'search-index', 'retrying', attempt::text, disc, 'held'),
              m->'ctx'->>'orgId', m->'ctx'->>'workspaceId', m->'ctx'->>'machineId', m->'ctx'->>'harness', m->'ctx'->>'sessionId');
    END IF;
    extra := jsonb_build_object('escalated', escalated, 'held', cont.held_at IS NOT NULL, 'held_now', held_now, 'probe', probe,
@@ -768,11 +782,14 @@ END $resume$;
 REVOKE ALL ON FUNCTION sessions.resume_search_contention_v1(bigint, text) FROM PUBLIC, anon, authenticated, service_role;
 GRANT EXECUTE ON FUNCTION sessions.resume_search_contention_v1(bigint, text) TO service_role;
 
--- The runtime boundary: EXECUTE on claim and settle only, PUBLIC revoked in this transaction. service_role is the
+-- The runtime boundary: EXECUTE on the ordinary claim, the probe claim and settle only, PUBLIC revoked in this
+-- transaction. service_role is the
 -- grant source; the migrator mirrors it onto the runtime role (RUNTIME_APPLICATION_FUNCTIONS). The operator paths
 -- (replay, catch-up, park: owner-run TypeScript over the guarded queue; archive: service_role only) get no runtime
 -- grant.
 REVOKE ALL ON FUNCTION sessions.claim_search_jobs_v1(integer) FROM PUBLIC, anon, authenticated, service_role;
+REVOKE ALL ON FUNCTION sessions.claim_search_probe_v1() FROM PUBLIC, anon, authenticated, service_role;
 REVOKE ALL ON FUNCTION sessions.settle_search_job_v1(bigint, uuid, text) FROM PUBLIC, anon, authenticated, service_role;
 GRANT EXECUTE ON FUNCTION sessions.claim_search_jobs_v1(integer) TO service_role;
+GRANT EXECUTE ON FUNCTION sessions.claim_search_probe_v1() TO service_role;
 GRANT EXECUTE ON FUNCTION sessions.settle_search_job_v1(bigint, uuid, text) TO service_role;

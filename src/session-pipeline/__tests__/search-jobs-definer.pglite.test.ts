@@ -22,7 +22,7 @@ import { join } from "node:path";
 import { deadLetterId, type StageMessage } from "@rhc/lib/pipeline/dlq.ts";
 import { RUNTIME_APPLICATION_TABLE_PRIVILEGES } from "../../hoopdb/migrate-guards.ts";
 import {
-  archiveSearchStage, catchUpTick, claimSearchJobs, enqueueSearchWake, parkSearchJobs, replaySearchDeadLetter, searchLetterId,
+  archiveSearchStage, catchUpTick, claimSearchJobs, claimSearchProbe, enqueueSearchWake, parkSearchJobs, replaySearchDeadLetter, searchLetterId,
   searchWorkKey, settleSearchJob, type ClaimedSearchJob, type SearchWakeMessage,
 } from "../search-jobs.ts";
 import { clonedReplayDatabase, closeReplayTemplate, warmReplayTemplate } from "./replay-fixture.ts";
@@ -36,6 +36,7 @@ const LOGIN = "search_runtime_login";
 const HOSTED = "search_runtime_hosted";
 const CLAIM = "sessions.claim_search_jobs_v1(integer)";
 const SETTLE = "sessions.settle_search_job_v1(bigint,uuid,text)";
+const PROBE = "sessions.claim_search_probe_v1()";
 
 type Scope = { orgId: string; workspaceId: string; harness: string; sessionId: string };
 const scope: Scope = { orgId: "org:def enc", workspaceId: "ws def", harness: "claude", sessionId: "s_def" };
@@ -162,7 +163,7 @@ async function asLogin(kind: "bare" | "hosted", seed: (pg: PGlite) => Promise<vo
   const role = kind === "bare" ? LOGIN : HOSTED;
   await pg.exec(`CREATE ROLE ${role} LOGIN NOSUPERUSER NOINHERIT NOCREATEDB NOCREATEROLE NOBYPASSRLS NOREPLICATION;
     GRANT USAGE ON SCHEMA sessions TO ${role};
-    GRANT EXECUTE ON FUNCTION ${CLAIM}, ${SETTLE} TO ${role};`);
+    GRANT EXECUTE ON FUNCTION ${CLAIM}, ${PROBE}, ${SETTLE} TO ${role};`);
   if (kind === "hosted") {
     for (const t of ["sessions.pipeline_jobs", "sessions.pipeline_events", "sessions.pipeline_dead_letters"] as const) {
       const privileges = (RUNTIME_APPLICATION_TABLE_PRIVILEGES as Record<string, readonly string[]>)[t]!;
@@ -188,6 +189,12 @@ async function asLogin(kind: "bare" | "hosted", seed: (pg: PGlite) => Promise<vo
     budget: (tokens: number, ageSeconds = 0) => pg.query("SELECT public.fx_budget($1::numeric, $2::numeric)", [tokens, ageSeconds]) };
 }
 const seeded = (...wakes: SearchWakeMessage[]) => async (pg: PGlite) => { for (const w of wakes) await enqueueSearchWake(pg, w); };
+/** One probe through the probe lane (claim_search_probe_v1), checked present. */
+async function probeOne(pg: PGlite): Promise<ClaimedSearchJob> {
+  const c = await claimSearchProbe(pg);
+  expect(c).toBeDefined();
+  return c!;
+}
 async function claimOne(pg: PGlite): Promise<ClaimedSearchJob> {
   const c = await claimSearchJobs(pg, 1);
   expect(c).toHaveLength(1);
@@ -477,6 +484,7 @@ describe("claim and settle as the unprivileged login (EXECUTE on the two RPCs on
       enqueue: await codeOf(() => enqueueSearchWake(pg, wake(scope, 9))),
       managedWake: await codeOf(pg.query("SELECT sessions.managed_search_wake_v1('{}'::jsonb, gen_random_uuid())")),
       letterId: await codeOf(pg.query("SELECT sessions.search_letter_id_v1('o', 'w', 'k')")),
+      leaseHelper: await codeOf(pg.query("SELECT * FROM sessions.search_job_lease_v1(1, true)")),
     };
     expect(denied).toEqual(Object.fromEntries(Object.keys(denied).map((k) => [k, "42501"])));
     expect(await state()).toEqual(before);
@@ -535,27 +543,28 @@ describe("hosted-equivalent runtime role (the runtime's pipeline-table privilege
 
 // ---------------------------------------------------------------------------------------------------------
 describe("ACL receipt (catalog, as the owner)", () => {
-  test("claim and settle: owner-owned SECURITY DEFINER, search_path pinned, no PUBLIC; the login executes exactly these two; the receipt table is owner-only", async () => {
+  test("claim, probe and settle: owner-owned SECURITY DEFINER, search_path pinned, no PUBLIC; the login executes exactly these three; the receipt table is owner-only", async () => {
     const { pg } = await clonedReplayDatabase();
     cleanup.push(() => pg.close());
     await pg.exec(`CREATE ROLE ${LOGIN} LOGIN NOSUPERUSER NOINHERIT; GRANT USAGE ON SCHEMA sessions TO ${LOGIN};
-      GRANT EXECUTE ON FUNCTION ${CLAIM}, ${SETTLE} TO ${LOGIN};`);
+      GRANT EXECUTE ON FUNCTION ${CLAIM}, ${PROBE}, ${SETTLE} TO ${LOGIN};`);
     const owner = (await pg.query<{ o: string }>("SELECT pg_get_userbyid(relowner) AS o FROM pg_class WHERE oid = 'sessions.pipeline_jobs'::regclass")).rows[0]!.o;
     const fns = (await pg.query<{ fn: string; owner: string; secdef: boolean; config: string[] | null; public_exec: boolean; grantees: string[] }>(
       `SELECT p.oid::regprocedure::text AS fn, pg_get_userbyid(p.proowner) AS owner, p.prosecdef AS secdef, p.proconfig AS config,
               EXISTS (SELECT 1 FROM aclexplode(coalesce(p.proacl, acldefault('f', p.proowner))) a WHERE a.grantee = 0 AND a.privilege_type = 'EXECUTE') AS public_exec,
               coalesce((SELECT array_agg(DISTINCT pg_get_userbyid(a.grantee) ORDER BY pg_get_userbyid(a.grantee)) FROM aclexplode(p.proacl) a
                          WHERE a.privilege_type = 'EXECUTE' AND a.grantee <> 0 AND a.grantee <> p.proowner), '{}') AS grantees
-         FROM pg_proc p WHERE p.oid IN ($1::regprocedure, $2::regprocedure) ORDER BY 1`, [CLAIM, SETTLE])).rows;
+         FROM pg_proc p WHERE p.oid IN ($1::regprocedure, $2::regprocedure, $3::regprocedure) ORDER BY 1`, [CLAIM, PROBE, SETTLE])).rows;
     expect(fns).toEqual([
       { fn: CLAIM, owner, secdef: true, config: ["search_path=pg_catalog, pg_temp"], public_exec: false, grantees: [LOGIN, "service_role"] },
+      { fn: PROBE, owner, secdef: true, config: ["search_path=pg_catalog, pg_temp"], public_exec: false, grantees: [LOGIN, "service_role"] },
       { fn: SETTLE, owner, secdef: true, config: ["search_path=pg_catalog, pg_temp"], public_exec: false, grantees: [LOGIN, "service_role"] },
     ]);
     // Of every sessions function, the login (no membership) can execute exactly claim and settle.
     const executable = (await pg.query<{ fn: string }>(
       `SELECT p.oid::regprocedure::text AS fn FROM pg_proc p WHERE p.pronamespace = 'sessions'::regnamespace
           AND has_function_privilege($1, p.oid, 'EXECUTE') ORDER BY 1`, [LOGIN])).rows.map((r) => r.fn);
-    expect(executable).toEqual([CLAIM, SETTLE]);
+    expect(executable).toEqual([CLAIM, PROBE, SETTLE]);
     // The stage's other functions: no PUBLIC, never the runtime; the archive is service_role's only.
     const stage = (await pg.query<{ fn: string; grantees: string[]; public_exec: boolean; secdef: boolean; config: string[] | null }>(
       `SELECT p.oid::regprocedure::text AS fn, p.prosecdef AS secdef, p.proconfig AS config,
@@ -565,13 +574,15 @@ describe("ACL receipt (catalog, as the owner)", () => {
          FROM pg_proc p WHERE p.oid IN ('sessions.archive_search_stage_v1()'::regprocedure, 'sessions.search_letter_id_v1(text,text,text)'::regprocedure,
                                         'sessions.search_job_claim_attempts_v1()'::regprocedure, 'sessions.enqueue_managed_search_wake_v1(jsonb,uuid)'::regprocedure,
                                         'sessions.managed_search_wake_v1(jsonb,uuid)'::regprocedure,
-                                        'sessions.resume_search_contention_v1(bigint,text)'::regprocedure) ORDER BY 1`)).rows;
+                                        'sessions.resume_search_contention_v1(bigint,text)'::regprocedure,
+                                        'sessions.search_job_lease_v1(bigint,boolean)'::regprocedure) ORDER BY 1`)).rows;
     expect(stage.map((f) => ({ fn: f.fn, grantees: f.grantees, public_exec: f.public_exec }))).toEqual([
       { fn: "sessions.archive_search_stage_v1()", grantees: ["service_role"], public_exec: false },
       { fn: "sessions.enqueue_managed_search_wake_v1(jsonb,uuid)", grantees: [], public_exec: false },
       { fn: "sessions.managed_search_wake_v1(jsonb,uuid)", grantees: [], public_exec: false },
       { fn: "sessions.resume_search_contention_v1(bigint,text)", grantees: ["service_role"], public_exec: false },
       { fn: "sessions.search_job_claim_attempts_v1()", grantees: [], public_exec: false },
+      { fn: "sessions.search_job_lease_v1(bigint,boolean)", grantees: [], public_exec: false },
       { fn: "sessions.search_letter_id_v1(text,text,text)", grantees: [], public_exec: false },
     ]);
     expect(stage.every((f) => JSON.stringify(f.config) === JSON.stringify(["search_path=pg_catalog, pg_temp"]))).toBe(true);
@@ -729,7 +740,7 @@ describe("bounded busy (scope lock contention) and the expired-lease reclaim cap
     for (let n = 0; n < 3; n++) { await expire(); expect(await claimSearchJobs(pg, 10)).toEqual([]); }
     // An hour on, the probe is due: ONE claim is admitted; busy again moves the next probe an hour on.
     await probeDue();
-    const p = await claimOne(pg);
+    const p = await probeOne(pg);
     expect(await claimSearchJobs(pg, 10)).toEqual([]);
     expect(await settleSearchJob(pg, p, "busy")).toMatchObject({ action: "busy", held: true, held_now: false, probe: true });
     s = await state();
@@ -742,6 +753,49 @@ describe("bounded busy (scope lock contention) and the expired-lease reclaim cap
     expect(await claimSearchJobs(pg, 10)).toEqual([]);
   }, 120_000);
 
+  test("one durable probe event per ADMITTED probe, from the claim: success, busy and abandoned give one each; a token rejection and a sixth-expiry park give none", async () => {
+    const probeEvents = (s: State) => s.events.filter((e) => e.code === "scope_contention_probe");
+    // Success, busy, abandoned: three scopes, each admitted once.
+    const ok = wake({ ...scope, sessionId: "s_pe_ok" }, 1), busy = wake({ ...scope, sessionId: "s_pe_busy" }, 1), gone = wake({ ...scope, sessionId: "s_pe_gone" }, 1);
+    const { pg, state, expire, budget, probeDue } = await asLogin("bare", async (p) => { await seeded(ok, busy, gone)(p); await p.query("SELECT public.fx_hold_all(true)"); });
+    // A token rejection: no token, no probe, no event.
+    await budget(0, 0);
+    expect(await claimSearchProbe(pg)).toBeUndefined();
+    expect(await claimSearchJobs(pg, 10)).toEqual([]);
+    expect(probeEvents(await state())).toEqual([]);
+    await budget(6, 0);
+    const claimed = new Map<string, ClaimedSearchJob>();
+    for (let n = 0; n < 3; n++) { const c = await probeOne(pg); claimed.set(c.claimedMessage.workKey, c); }
+    let s = await state();
+    expect(probeEvents(s)).toHaveLength(3);
+    for (const c of claimed.values()) expect(probeEvents(s).filter((e) => e.key.endsWith(`:probe:${c.lease}`))).toHaveLength(1);
+    expect(await settleSearchJob(pg, claimed.get(ok.workKey)!, "done")).toEqual({ applied: true, action: "deleted" });
+    expect(await settleSearchJob(pg, claimed.get(busy.workKey)!, "busy")).toMatchObject({ action: "busy", probe: true });
+    // The third is abandoned: its lease simply expires.
+    await expire();
+    s = await state();
+    const byScope = (w: SearchWakeMessage) => probeEvents(s).filter((e) => e.attrs.work_key === w.workKey).length;
+    expect({ ok: byScope(ok), busy: byScope(busy), gone: byScope(gone) }).toEqual({ ok: 1, busy: 1, gone: 1 });
+    // The busy scope's next probe finds the lock free and recovers (it is first by job id among equally due probes).
+    await probeDue(); await budget(6, 0); await expire();
+    const again = await probeOne(pg);
+    expect(again.claimedMessage.workKey).toBe(busy.workKey);
+    expect(await settleSearchJob(pg, again, "done")).toEqual({ applied: true, action: "deleted" });
+    // A sixth-expiry park leases nothing and writes no probe event: five more abandoned probes of the same scope, then the park.
+    for (let n = 2; n <= 6; n++) {
+      await probeDue(); await budget(6, 0); await expire();
+      const got = [await claimSearchProbe(pg)].filter((c): c is ClaimedSearchJob => !!c).filter((c) => c.claimedMessage.workKey === gone.workKey);
+      expect(got).toHaveLength(1);
+    }
+    s = await state();
+    expect(probeEvents(s).filter((e) => e.attrs.work_key === gone.workKey)).toHaveLength(6);
+    await probeDue(); await budget(6, 0); await expire();
+    expect([await claimSearchProbe(pg)].filter((c): c is ClaimedSearchJob => !!c).some((c) => c.claimedMessage.workKey === gone.workKey)).toBe(false);
+    s = await state();
+    expect(s.events.filter((e) => e.code === "expired_lease_reclaims")).toHaveLength(1);
+    expect(probeEvents(s).filter((e) => e.attrs.work_key === gone.workKey)).toHaveLength(6);
+  }, 120_000);
+
   test("a static scope held past 24 h recovers by itself: hourly probes until contention clears, then it completes (no replay)", async () => {
     const { pg, state, expire, contendedSince, probeDue } = await asLogin("bare", seeded(wake(scope, 7)));
     expect(await settleSearchJob(pg, await claimOne(pg), "busy")).toMatchObject({ held: false });
@@ -752,12 +806,12 @@ describe("bounded busy (scope lock contention) and the expired-lease reclaim cap
       await expire();
       expect(await claimSearchJobs(pg, 10)).toEqual([]);
       await probeDue();
-      expect(await settleSearchJob(pg, await claimOne(pg), "busy")).toMatchObject({ probe: true });
+      expect(await settleSearchJob(pg, await probeOne(pg), "busy")).toMatchObject({ probe: true });
     }
     // The lock clears; the next hourly probe (an hour on: the 30 s backoff long past) completes the pass.
     await expire();
     await probeDue();
-    expect(await settleSearchJob(pg, await claimOne(pg), "done")).toEqual({ applied: true, action: "deleted" });
+    expect(await settleSearchJob(pg, await probeOne(pg), "done")).toEqual({ applied: true, action: "deleted" });
     const s = await state();
     expect({ jobs: s.jobs, contention: s.contention, receipts: s.receipts, letters: s.letters }).toEqual({ jobs: [], contention: [], receipts: [], letters: [] });
     expect(s.events.filter((e) => e.status === "replayed")).toEqual([]);
@@ -782,7 +836,7 @@ describe("bounded busy (scope lock contention) and the expired-lease reclaim cap
     await budget(6, 0);
     const admitted: string[] = [];
     for (let n = 0; n < 10; n++) {
-      const got = await claimSearchJobs(pg, 1);
+      const got = [await claimSearchProbe(pg)].filter((c): c is ClaimedSearchJob => !!c);
       // At most one probe per call, even when more slots are asked for.
       if (got.length) { admitted.push(got[0]!.id); expect(await settleSearchJob(pg, got[0]!, "busy")).toMatchObject({ probe: true }); }
     }
@@ -791,14 +845,14 @@ describe("bounded busy (scope lock contention) and the expired-lease reclaim cap
     // 30 s of refill at R = 6/min: three more.
     await budget(0, 30);
     const more = [];
-    for (let n = 0; n < 5; n++) { const got = await claimSearchJobs(pg, 10); expect(got.length).toBeLessThanOrEqual(1); more.push(...got); }
+    for (let n = 0; n < 5; n++) { const got = [await claimSearchProbe(pg)].filter((c): c is ClaimedSearchJob => !!c); expect(got.length).toBeLessThanOrEqual(1); more.push(...got); }
     expect(more.length).toBe(3);
     // Oldest-due first: the probes taken are distinct scopes, none twice.
     expect(new Set([...admitted, ...more.map((m) => m.id)]).size).toBe(9);
     expect((await state()).letters).toEqual([]);
   }, 120_000);
 
-  test("sequential mixed load: ordinary work is always ready; 22 held-due scopes get probes only from the bucket and recover", async () => {
+  test("sequential mixed load: ordinary work is always ready; every pass is ordinary; 22 held-due scopes get extra probes only from the bucket and recover", async () => {
     let next = 0;
     const ordinary = () => wake({ ...scope, sessionId: `s_ord_${next++}` }, 1);
     const held = Array.from({ length: 22 }, (_, n) => wake({ ...scope, sessionId: `s_hot_${String(n).padStart(2, "0")}` }, 1));
@@ -811,54 +865,63 @@ describe("bounded busy (scope lock contention) and the expired-lease reclaim cap
     await budget(6, 0);
     let probes = 0, done = 0;
     const started = Date.now();
+    // 60 invocations, each one ordinary pass then one extra probe opportunity (the SQS follow-on shape).
     for (let n = 0; n < 60; n++) {
       await wakeNow(ordinary());
       const c = await claimOne(pg);
-      if (heldKeys.has(c.claimedMessage.workKey)) {
+      expect(heldKeys.has(c.claimedMessage.workKey)).toBe(false);
+      expect(await settleSearchJob(pg, c, "done")).toEqual({ applied: true, action: "deleted" });
+      done += 1;
+      const p = await claimSearchProbe(pg);
+      if (p) {
+        expect(heldKeys.has(p.claimedMessage.workKey)).toBe(true);
         probes += 1;
-        // The probe finds the lock free: the held scope recovers.
-        expect(await settleSearchJob(pg, c, "done")).toEqual({ applied: true, action: "deleted" });
-      } else {
-        done += 1;
-        expect(await settleSearchJob(pg, c, "done")).toEqual({ applied: true, action: "deleted" });
+        expect(await settleSearchJob(pg, p, "done")).toEqual({ applied: true, action: "deleted" });
       }
     }
     const minutes = (Date.now() - started) / 60_000;
-    expect(probes).toBeGreaterThanOrEqual(1);
+    expect(done).toBe(60);
+    expect(probes).toBeGreaterThanOrEqual(6);
     expect(probes).toBeLessThanOrEqual(6 + Math.ceil(6 * minutes));
-    expect(done).toBe(60 - probes);
     const s = await state();
-    // Recovered held scopes are gone with their contention; the rest stay held, unparked.
     expect(s.contention).toHaveLength(22 - probes);
     expect(s.letters).toEqual([]);
-    // The ordinary queue never emptied.
     expect(s.jobs.filter((j) => !heldKeys.has(j.message.workKey)).length).toBeGreaterThanOrEqual(4);
-    console.log(JSON.stringify({ sequentialMixedLoad: { claims: 60, ordinaryCompleted: done, probesAdmitted: probes, heldRemaining: 22 - probes } }));
+    console.log(JSON.stringify({ sequentialMixedLoad: { invocations: 60, ordinaryCompleted: done, probesAdmitted: probes, heldRemaining: 22 - probes } }));
   }, 120_000);
 
-  test("low cadence, limit 1: calls spaced wider than the refill interval, both queues ready: probes take at most every other call", async () => {
+  test("low cadence, limit 1: ordinary calls return ordinary jobs only; the probe lane is separate and token-bounded", async () => {
     let next = 0;
     const ordinary = () => wake({ ...scope, sessionId: `s_low_${next++}` }, 1);
     const held = Array.from({ length: 12 }, (_, n) => wake({ ...scope, sessionId: `s_lowheld_${String(n).padStart(2, "0")}` }, 1));
     const heldKeys = new Set(held.map((w) => w.workKey));
     const { pg, state, budget, wakeNow } = await asLogin("bare", async (p) => { await seeded(...held)(p); await p.query("SELECT public.fx_hold_all(true)"); });
     for (let n = 0; n < 3; n++) await wakeNow(ordinary());
-    const kinds: Array<"probe" | "ordinary"> = [];
-    for (let n = 0; n < 24; n++) {
-      // Each call arrives after a full refill interval: the bucket is never the limit.
-      await budget(6, 60);
+    let ordinaryDone = 0, probes = 0, rejected = 0;
+    const invocation = async () => {
       await wakeNow(ordinary());
       const c = await claimOne(pg);
-      kinds.push(heldKeys.has(c.claimedMessage.workKey) ? "probe" : "ordinary");
+      expect(heldKeys.has(c.claimedMessage.workKey)).toBe(false);
       expect(await settleSearchJob(pg, c, "done")).toEqual({ applied: true, action: "deleted" });
-    }
-    const probes = kinds.filter((k) => k === "probe").length;
-    // Never two probes in a row while ordinary work is ready; so ordinary waits at most one call.
-    expect(kinds.some((k, i) => k === "probe" && kinds[i - 1] === "probe")).toBe(false);
+      ordinaryDone += 1;
+      const p = await claimSearchProbe(pg);
+      if (!p) { rejected += 1; return; }
+      probes += 1;
+      expect(heldKeys.has(p.claimedMessage.workKey)).toBe(true);
+      expect(await settleSearchJob(pg, p, "done")).toEqual({ applied: true, action: "deleted" });
+    };
+    // Token-bounded: with an empty bucket the probe lane admits nothing; the ordinary pass still runs.
+    await budget(0, 0);
+    await invocation();
+    expect({ ordinaryDone, probes, rejected }).toEqual({ ordinaryDone: 1, probes: 0, rejected: 1 });
+    // Each later invocation arrives after a full refill interval, so the bucket alone never limits.
+    for (let n = 0; n < 24; n++) { await budget(6, 60); await invocation(); }
+    expect(ordinaryDone).toBe(25);
     expect(probes).toBe(12);
-    expect(kinds.length - probes).toBeGreaterThanOrEqual(kinds.length / 2);
+    expect(rejected).toBe(13);
     expect((await state()).contention).toEqual([]);
-    console.log(JSON.stringify({ lowCadence: { calls: kinds.length, ordinary: kinds.length - probes, probes, sequence: kinds.map((k) => k[0]).join("") } }));
+    expect((await state()).letters).toEqual([]);
+    console.log(JSON.stringify({ lowCadence: { invocations: 25, ordinaryCompleted: ordinaryDone, probesAdmitted: probes, noProbe: rejected } }));
   }, 120_000);
 
   test("expired-lease reclaims: 5 consecutive expiries do not park, the 6th parks atomically (persisted across a fresh client)", async () => {
@@ -919,7 +982,7 @@ describe("resume_search_contention_v1 (operator, service_role only)", () => {
     const id = (await pg.query<{ id: string }>("SELECT id::text FROM sessions.pipeline_jobs WHERE stage = 'search-index'")).rows[0]!.id;
     const resume = (operator: string) => pg.query<{ r: { applied: boolean; reason?: string } }>("SELECT sessions.resume_search_contention_v1($1::bigint, $2) AS r", [id, operator]);
     // A live lease (a probe in flight): refused, nothing changed.
-    const [probe] = await claimSearchJobs(pg, 1);
+    const probe = await claimSearchProbe(pg);
     expect(probe).toBeDefined();
     await pg.exec("SET ROLE service_role");
     expect((await resume("ops-oncall")).rows[0]!.r).toEqual({ applied: false, reason: "lease_live" });

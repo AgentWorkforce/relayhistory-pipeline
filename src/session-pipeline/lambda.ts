@@ -43,8 +43,10 @@ import { largeReadJobState, routeLargeRead } from "./large-read-worker.ts";
  * SEARCH_JOBS_ENABLED=1 (only the literal "1"; default off; needs SEARCH_INDEX_ENABLED=1) runs the committed search
  * wake's consumer (docs/handoffs/incremental-search-indexing.md §5.1, search-jobs.ts): after every SQS batch the
  * invocation claims (one at a time, through claim_search_jobs_v1) and runs up to SEARCH_JOBS_CLAIM (1-20, default 5)
- * open `search-index` jobs, settling each through settle_search_job_v1 (its only search SQL), and the
- * {"searchJobs": true} schedule does the same without SQS traffic. SEARCH_WAKE_ENQUEUE=1 (only "1"; default off)
+ * open `search-index` jobs, settling each through settle_search_job_v1, then (time permitting) one extra probe of a
+ * held scope (claim_search_probe_v1, fleet-bucket bounded); the {"searchJobs": true} schedule probes first, then
+ * runs the same ordinary passes, without SQS traffic. Those three RPCs are its only search SQL. Hosted
+ * once-a-minute recovery of held scopes depends on that schedule rule being provisioned and enabled (its own go). SEARCH_WAKE_ENQUEUE=1 (only "1"; default off)
  * writes the managed wake in the publication-authority transaction (migration 20261105062300 and the owner's
  * EXECUTE grant first). Off, neither touches the stage.
  * (BUFFERED_SEARCH_GATE_CONTRACT, "buffered-search-gate/v1"; the read Worker deploys with
@@ -84,7 +86,7 @@ import { createClickHouseClient } from "./vendor/search-index/clickhouse.ts";
 import { processBatch, type BatchResponse, type ConsumerDeps, type QueueRecord } from "./consumer.ts";
 import { droppedFanout, scopeLockKey, type ScopeLock } from "./pointer.ts";
 import { searchIndexLimits, searchIndexStreamChFromEnv, type SearchIndexDeps, type SearchIndexStreamCh } from "./search-index.ts";
-import { claimSearchJobs, runSearchJob, searchJobLogFields, searchSettlementFor, settleSearchJob, SEARCH_JOBS_DEFAULT_CLAIM, type SearchSql } from "./search-jobs.ts";
+import { claimSearchJobs, claimSearchProbe, runSearchJob, searchJobLogFields, searchSettlementFor, settleSearchJob, SEARCH_JOBS_DEFAULT_CLAIM, type ClaimedSearchJob, type SearchSql } from "./search-jobs.ts";
 import { BufferedFeedError, bufferedFeedConfig, bufferedFeedGateRefusal, bufferedFeedVersionRefusal, clickhouseTieLedger, runBufferedFeed, sqlBufferedFeedSource, type BufferedFeedConfig } from "./buffered-search-feed.ts";
 import { bufferedErasureConfig, runBufferedErasureDelete, type BufferedErasureConfig, type BufferedErasureDeps } from "./buffered-erasure-delete.ts";
 import { RECONCILE_BODY_KEY } from "./s3-events.ts";
@@ -874,21 +876,26 @@ function searchJobsDeadline(env: LambdaEnv, context?: LambdaInvocationContext): 
   return () => !(context.getRemainingTimeInMillis() > margin);
 }
 
-export interface SearchJobsSummary { claimed: number; acked: number; retried: number; exhausted: number; busy: number; lost: number; failed: number }
+export interface SearchJobsSummary {
+  claimed: number; acked: number; retried: number; exhausted: number; busy: number; lost: number; failed: number;
+  /** Probes admitted (the probe lane); counted in claimed and settled like any job, never an ordinary pass. */
+  probes: number;
+  /** The invocation stopped because the remaining time reached the margin. */
+  deadlineExit: boolean;
+}
 
 /**
- * The Lambda consumer's search-job loop (design §5.1, §3.3): up to `claim` passes, each claimed one at a time through
- * claim_search_jobs_v1 just before it runs (so the deadline never strands a claimed job, and no claimed attempt is
- * spent without a pass), run (runSearchJob) and settled through settle_search_job_v1. A pass error is a retry; the
- * server derives the backoff and the exhaustion from its receipt. A settlement error is logged and the lease expires
- * into a reclaim.
+ * The Lambda consumer's search-job loop (design §5.1, §3.3). Ordinary capacity: up to `claim` ordinary passes, each
+ * claimed (claim_search_jobs_v1, one job) just before it runs, then run (runSearchJob) and settled
+ * (settle_search_job_v1). The probe lane (claim_search_probe_v1: one due held job, fleet-bucket bounded) is EXTRA and
+ * never takes an ordinary pass: the SQS follow-on probes once after its ordinary passes if time remains; the
+ * scheduled invocation (`probeFirst`) probes FIRST, so held scopes recover even when ordinary passes always run to
+ * the deadline. Hosted once-a-minute recovery is conditional on the schedule rule being provisioned and enabled (a
+ * stack change with its own go); this loop only defines what an invocation does.
  */
-export async function drainSearchJobs(deps: { sql: SearchSql; search: SearchIndexDeps; claim: number; deadline?: () => boolean }): Promise<SearchJobsSummary> {
-  const summary: SearchJobsSummary = { claimed: 0, acked: 0, retried: 0, exhausted: 0, busy: 0, lost: 0, failed: 0 };
-  for (let n = 0; n < deps.claim; n++) {
-    if (deps.deadline?.()) break;
-    const [job] = await claimSearchJobs(deps.sql, 1);
-    if (!job) break;
+export async function drainSearchJobs(deps: { sql: SearchSql; search: SearchIndexDeps; claim: number; deadline?: () => boolean; probeFirst?: boolean }): Promise<SearchJobsSummary> {
+  const summary: SearchJobsSummary = { claimed: 0, acked: 0, retried: 0, exhausted: 0, busy: 0, lost: 0, failed: 0, probes: 0, deadlineExit: false };
+  const pass = async (job: ClaimedSearchJob) => {
     summary.claimed += 1;
     const started = Date.now();
     try {
@@ -908,16 +915,30 @@ export async function drainSearchJobs(deps: { sql: SearchSql; search: SearchInde
       const busy = settled.applied && settled.action === "busy" ? settled : undefined;
       if ("error" in result) log.error("search job failed", fields);
       else if (exhausted) log.error("search job exhausted", fields);
-      // Rate-limited by the server (last_escalated_at): an escalation arrives at most hourly per contended job.
+      // Rate-limited by the server: a hold alerts once; an escalation at most hourly per contended job.
       else if (busy?.held_now) log.error("search job contention held", { ...fields, reason: "scope_contention_held", count: busy.contention_count });
       else if (busy?.escalated) log.warn("search job contention escalated", { ...fields, reason: "scope_contention_escalated", count: busy.contention_count });
-      else if (busy?.probe) log.warn("search job contention probe", { ...fields, reason: "scope_contention_probe", count: busy.contention_count });
       else log.info("search job settled", fields);
     } catch (error) {
       summary.failed += 1;
       log.error("search job settlement failed", { stage: "search-index", epoch: job.claimedEpoch, attempt: job.attempts, ...errorFields(error), duration_ms: Date.now() - started });
     }
+  };
+  const probe = async () => {
+    if (deps.deadline?.()) { summary.deadlineExit = true; return; }
+    const job = await claimSearchProbe(deps.sql);
+    if (!job) return;
+    summary.probes += 1;
+    await pass(job);
+  };
+  if (deps.probeFirst) await probe();
+  for (let n = 0; n < deps.claim && !summary.deadlineExit; n++) {
+    if (deps.deadline?.()) { summary.deadlineExit = true; break; }
+    const [job] = await claimSearchJobs(deps.sql, 1);
+    if (!job) break;
+    await pass(job);
   }
+  if (!deps.probeFirst && !summary.deadlineExit) await probe();
   return summary;
 }
 
@@ -949,9 +970,11 @@ async function dispatchLambdaEvent(event: PipelineLambdaEvent, ready: () => Prom
     try {
       const rt = await ready();
       if (!rt.env.searchJobs || !rt.deps.search) throw new Error("search jobs unavailable");
-      const s = await drainSearchJobs({ sql: searchJobsSql(rt.deps.pointer.db), search: rt.deps.search, claim: rt.env.searchJobs.claim, deadline: searchJobsDeadline(rt.env, context) });
+      // The scheduled invocation probes FIRST (independently budgeted probe opportunity), then its ordinary passes.
+      const s = await drainSearchJobs({ sql: searchJobsSql(rt.deps.pointer.db), search: rt.deps.search, claim: rt.env.searchJobs.claim,
+        deadline: searchJobsDeadline(rt.env, context), probeFirst: true });
       log.info("search jobs run", { stage: "search-index", claimed: s.claimed, acked: s.acked, retried: s.retried, exhausted: s.exhausted, skipped: s.lost, failed: s.failed,
-        ok: s.failed === 0, duration_ms: Date.now() - started });
+        count: s.probes, state: s.deadlineExit ? "deadline" : "complete", ok: s.failed === 0, duration_ms: Date.now() - started });
       return { ok: s.failed === 0 };
     } catch (error) {
       log.error("search jobs run failed", { stage: "search-index", ...errorFields(error), duration_ms: Date.now() - started });

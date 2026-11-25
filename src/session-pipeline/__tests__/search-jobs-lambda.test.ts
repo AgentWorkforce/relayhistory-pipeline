@@ -23,9 +23,9 @@ function recordingDb() {
   const transact: SearchIndexDeps["transact"] = (work) => work(tx);
   return { sql, db, transact };
 }
-const searchSql = (sql: string[]) => sql.filter((s) => /search-index|pipeline_jobs|search_catchup_cursor|search_stage_archive|enqueue_managed_search_wake|claim_search_jobs_v1|settle_search_job_v1|search_job_claims/.test(s));
+const searchSql = (sql: string[]) => sql.filter((s) => /search-index|pipeline_jobs|search_catchup_cursor|search_stage_archive|enqueue_managed_search_wake|claim_search_jobs_v1|claim_search_probe_v1|settle_search_job_v1|search_job_claims/.test(s));
 /** The runtime boundary's two RPCs (migration 20261105062300): the only search SQL the Lambda may send. */
-const searchRpcs = (sql: string[]) => sql.filter((s) => /claim_search_jobs_v1|settle_search_job_v1/.test(s));
+const searchRpcs = (sql: string[]) => sql.filter((s) => /claim_search_jobs_v1|claim_search_probe_v1|settle_search_job_v1/.test(s));
 
 const saved = { ...process.env };
 afterEach(() => { process.env = { ...saved }; });
@@ -62,7 +62,7 @@ describe("flags off: the Lambda is unchanged", () => {
     // SEARCH_JOBS_ENABLED off: no search RPC at all, neither a claim nor a settlement.
     expect(searchSql(sql)).toEqual([]);
     expect(searchRpcs(sql)).toEqual([]);
-    expect(sql.some((s) => /claim_search_jobs_v1|settle_search_job_v1/.test(s))).toBe(false);
+    expect(sql.some((s) => /claim_search_jobs_v1|claim_search_probe_v1|settle_search_job_v1/.test(s))).toBe(false);
   });
 });
 
@@ -101,7 +101,7 @@ describe("flags on: the stage-specific loop", () => {
     expect(await handler({ Records: [{ messageId: "m1", body }] } as never, context as never)).toEqual({ batchItemFailures: [] });
     const claims = () => searchSql(sql).filter((s) => s.includes("sessions.claim_search_jobs_v1("));
     // The loop's only search SQL is the runtime boundary: no direct pipeline_jobs statement.
-    const direct = () => searchSql(sql).filter((s) => !/claim_search_jobs_v1|settle_search_job_v1/.test(s));
+    const direct = () => searchSql(sql).filter((s) => !/claim_search_jobs_v1|claim_search_probe_v1|settle_search_job_v1/.test(s));
     expect(claims()).toHaveLength(1);
     expect(await handler({ searchJobs: true } as never, context as never)).toEqual({ ok: true });
     expect(claims()).toHaveLength(2);

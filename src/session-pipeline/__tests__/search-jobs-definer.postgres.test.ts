@@ -11,6 +11,8 @@ import pg from "pg";
 import { readFileSync, readdirSync } from "node:fs";
 import { join } from "node:path";
 import { SESSION_BOOTSTRAP_FILES } from "../../hoopdb/session-bootstrap-chain.ts";
+import { drainSearchJobs } from "../lambda.ts";
+import type { SearchIndexDeps } from "../search-index.ts";
 import {
   archiveSearchStage, catchUpTick, claimSearchJobs, enqueueSearchWake, parkSearchJobs, replaySearchDeadLetter, searchLetterId,
   searchWorkKey, settleSearchJob, type SearchSql, type SearchWakeMessage,
@@ -29,6 +31,7 @@ afterEach(async () => { for (const f of cleanup.splice(0).reverse()) await f(); 
 
 const CLAIM = "sessions.claim_search_jobs_v1(integer)";
 const SETTLE = "sessions.settle_search_job_v1(bigint,uuid,text)";
+const PROBE = "sessions.claim_search_probe_v1()";
 type Scope = { orgId: string; workspaceId: string; harness: string; sessionId: string };
 const scope: Scope = { orgId: "org:pg enc", workspaceId: "ws_pg", harness: "claude", sessionId: "s_pg" };
 const wake = (s: Scope, epoch: number): SearchWakeMessage => ({
@@ -66,7 +69,7 @@ async function rig() {
   await admin.query(`CREATE ROLE ${login} LOGIN NOSUPERUSER NOINHERIT NOCREATEDB NOCREATEROLE NOBYPASSRLS`);
   const target = new URL(url!);
   target.pathname = `/${name}`;
-  const owner = new pg.Pool({ connectionString: target.href, max: 2 });
+  const owner = new pg.Pool({ connectionString: target.href, max: 10 });
   target.username = login;
   const runtime = new pg.Pool({ connectionString: target.href, max: 1 });
   const loginUrl = target.href;
@@ -83,7 +86,7 @@ async function rig() {
   await owner.query("CREATE EXTENSION IF NOT EXISTS pg_trgm; CREATE EXTENSION IF NOT EXISTS btree_gin");
   for (const f of SESSION_BOOTSTRAP_FILES) await owner.query(sql(f));
   for (const f of readdirSync(join(root, "supabase/migrations")).filter((f) => f.endsWith(".sql")).sort()) await owner.query(sql("supabase/migrations/" + f));
-  await owner.query(`GRANT USAGE ON SCHEMA sessions TO ${login}; GRANT EXECUTE ON FUNCTION ${CLAIM}, ${SETTLE} TO ${login}`);
+  await owner.query(`GRANT USAGE ON SCHEMA sessions TO ${login}; GRANT EXECUTE ON FUNCTION ${CLAIM}, ${PROBE}, ${SETTLE} TO ${login}`);
   /** More genuine login connections (concurrent claimers). */
   const loginPool = (max: number) => { const p = new pg.Pool({ connectionString: loginUrl, max }); extra.push(p); return p; };
   return { owner, runtime, login, loginPool };
@@ -97,10 +100,10 @@ describe.skipIf(!url)("062300 runtime boundary: a genuine unprivileged login (re
     expect((await owner.query("SELECT 1 FROM pg_auth_members m JOIN pg_roles r ON r.oid IN (m.member, m.roleid) WHERE r.rolname = $1", [login])).rows).toEqual([]);
     expect((await owner.query<{ fn: string }>(
       "SELECT p.oid::regprocedure::text AS fn FROM pg_proc p WHERE p.pronamespace = 'sessions'::regnamespace AND has_function_privilege($1, p.oid, 'EXECUTE') ORDER BY 1",
-      [login])).rows.map((r) => r.fn)).toEqual([CLAIM, SETTLE]);
+      [login])).rows.map((r) => r.fn)).toEqual([CLAIM, PROBE, SETTLE]);
     expect((await owner.query(
-      `SELECT p.prosecdef AS secdef, p.proconfig AS config FROM pg_proc p WHERE p.oid IN ($1::regprocedure, $2::regprocedure)`, [CLAIM, SETTLE])).rows)
-      .toEqual([1, 2].map(() => ({ secdef: true, config: ["search_path=pg_catalog, pg_temp"] })));
+      `SELECT p.prosecdef AS secdef, p.proconfig AS config FROM pg_proc p WHERE p.oid IN ($1::regprocedure, $2::regprocedure, $3::regprocedure)`, [CLAIM, PROBE, SETTLE])).rows)
+      .toEqual([1, 2, 3].map(() => ({ secdef: true, config: ["search_path=pg_catalog, pg_temp"] })));
 
     // Success: claim, then done.
     await enqueueSearchWake(owner, wake(scope, 7));
@@ -196,86 +199,107 @@ describe.skipIf(!url)("062300 runtime boundary: a genuine unprivileged login (re
     expect(denied).toEqual({ contention: "42501", budget: "42501", resume: "42501" });
   }, 300_000);
 
-  test("concurrent saturation: 52 synchronized held scopes, ordinary work always ready, 4 claimers; the fleet bound holds and every held scope recovers", async () => {
-    const { owner, loginPool } = await rig();
-    // Test-only policy through the owner's config row (no code change): R = 120/min, C = 6, initial balance 6.
-    const R = 120, C = 6;
-    await owner.query("UPDATE sessions.search_probe_budget SET rate_per_minute = $1, burst = $2, tokens = $2, refilled_at = clock_timestamp(), last_served_kind = 'ordinary'", [R, C]);
-    const held = Array.from({ length: 52 }, (_, n) => wake({ ...scope, sessionId: `s_held_${String(n).padStart(2, "0")}` }, 1));
-    const heldKeys = new Set(held.map((w) => w.workKey));
-    for (const w of held) await enqueueSearchWake(owner, w);
-    const due = (await owner.query<{ due: Date }>(
-      `INSERT INTO sessions.search_job_contention (job_id, epoch, first_contended_at, last_contended_at, contention_count, last_escalated_at, held_at, next_probe_at)
-       SELECT id, 1, clock_timestamp() - interval '25 hours', clock_timestamp(), 100, clock_timestamp() - interval '10 minutes',
-              clock_timestamp() - interval '1 hour', date_trunc('milliseconds', clock_timestamp())
-         FROM sessions.pipeline_jobs WHERE stage = 'search-index'
-       RETURNING next_probe_at AS due`)).rows.map((r) => r.due.getTime());
-    const dueAt = Math.max(...due);
-    expect(new Set(due).size).toBe(1);
-    const backlog = async () => Number((await owner.query<{ n: string }>(
-      `SELECT count(*) AS n FROM sessions.pipeline_jobs x WHERE x.stage = 'search-index' AND x.lease_id IS NULL
-          AND NOT EXISTS (SELECT 1 FROM sessions.search_job_contention k WHERE k.job_id = x.id AND k.held_at IS NOT NULL)`)).rows[0]!.n);
-    // The producer keeps ordinary work continuously ready.
-    let enqueued = 0, producing = true, producerDone = false, minBacklog = Infinity;
-    for (let n = 0; n < 60; n++) await enqueueSearchWake(owner, wake({ ...scope, sessionId: `s_ord_${enqueued++}` }, 1));
-    const producer = (async () => {
-      while (producing) {
-        const b = await backlog();
-        minBacklog = Math.min(minBacklog, b);
-        if (b < 60) for (let n = 0; n < 30; n++) await enqueueSearchWake(owner, wake({ ...scope, sessionId: `s_ord_${enqueued++}` }, 1));
-        await Bun.sleep(10);
-      }
-      producerDone = true;
-    })();
-    const probes: { at: number; key: string }[] = [];
-    let ordinary = 0, backlogAtLastProbe = -1, running = true;
-    const started = Date.now();
-    const claimer = async (limit: number) => {
-      const pool = loginPool(1);
-      let empty = 0;
-      while (running || !producerDone || empty < 2) {
-        const jobs = await claimSearchJobs(pool, limit);
-        if (!jobs.length) { empty += 1; if (!running) await Bun.sleep(50); else await Bun.sleep(5); continue; }
-        empty = 0;
-        for (const j of jobs) {
-          if (heldKeys.has(j.claimedMessage.workKey)) {
-            // Admission time on the server's clock: the claim moved next_probe_at to its lease time + 1 h.
-            const at = (await owner.query<{ at: Date }>("SELECT next_probe_at - interval '1 hour' AS at FROM sessions.search_job_contention WHERE job_id = $1::bigint", [j.id])).rows[0]!.at.getTime();
-            probes.push({ at, key: j.claimedMessage.workKey });
-            if (new Set(probes.map((p) => p.key)).size === heldKeys.size) { backlogAtLastProbe = await backlog(); running = false; producing = false; }
-          } else ordinary += 1;
-          // The probe finds the lock free: the held scope recovers.
-          expect(await settleSearchJob(pool, j, "done")).toEqual({ applied: true, action: "deleted" });
+  test("sustained load through the Lambda loop: ordinary throughput with 52 held scopes stays within 90% of the no-held control; the fleet bound holds and every held scope recovers", async () => {
+    const R = 120, C = 6, K = 3, WINDOW_MS = 30_000, INVOCATION_BUDGET_MS = 200, CADENCE_MS = 20;
+    /** One sustained run: 3 SQS-style claimers (ordinary first, then an extra probe if time remains) and 1
+     *  scheduled-style claimer (probe first), each looping drainSearchJobs invocations for WINDOW_MS. */
+    async function run(heldCount: number) {
+      const { owner, loginPool } = await rig();
+      // Test-only policy through the owner's config row (no code change): R = 120/min, C = 6, initial balance 6.
+      await owner.query("UPDATE sessions.search_probe_budget SET rate_per_minute = $1, burst = $2, tokens = $2, refilled_at = clock_timestamp()", [R, C]);
+      const held = Array.from({ length: heldCount }, (_, n) => wake({ ...scope, sessionId: `s_held_${String(n).padStart(2, "0")}` }, 1));
+      const heldKeys = new Set(held.map((w) => w.workKey));
+      for (const w of held) await enqueueSearchWake(owner, w);
+      // Synchronized: one due time for every held scope (statement_timestamp(), one value per statement).
+      const due = heldCount ? (await owner.query<{ due: Date }>(
+        `INSERT INTO sessions.search_job_contention (job_id, epoch, first_contended_at, last_contended_at, contention_count, last_escalated_at, held_at, next_probe_at)
+         SELECT id, 1, clock_timestamp() - interval '25 hours', clock_timestamp(), 100, clock_timestamp() - interval '10 minutes',
+                clock_timestamp() - interval '1 hour', statement_timestamp()
+           FROM sessions.pipeline_jobs WHERE stage = 'search-index'
+         RETURNING next_probe_at AS due`)).rows.map((r) => r.due.getTime()) : [];
+      expect(new Set(due).size).toBe(heldCount ? 1 : 0);
+      const backlog = async () => Number((await owner.query<{ n: string }>(
+        `SELECT count(*) AS n FROM sessions.pipeline_jobs x WHERE x.stage = 'search-index' AND x.lease_id IS NULL
+            AND NOT EXISTS (SELECT 1 FROM sessions.search_job_contention k WHERE k.job_id = x.id AND k.held_at IS NOT NULL)`)).rows[0]!.n);
+      let enqueued = 0, minBacklog = Infinity, backlogAtLastProbe = -1;
+      for (let n = 0; n < 60; n++) await enqueueSearchWake(owner, wake({ ...scope, sessionId: `s_ord_${enqueued++}` }, 1));
+      const started = Date.now();
+      const live = () => Date.now() - started < WINDOW_MS;
+      // The producer keeps ordinary work continuously ready for the whole window (no stop-and-drain).
+      const producer = (async () => {
+        while (live()) {
+          const b = await backlog();
+          minBacklog = Math.min(minBacklog, b);
+          if (b < 60) for (let n = 0; n < 30; n++) await enqueueSearchWake(owner, wake({ ...scope, sessionId: `s_ord_${enqueued++}` }, 1));
+          await Bun.sleep(10);
         }
-        await Bun.sleep(20);
-      }
-    };
-    await Promise.all([claimer(1), claimer(1), claimer(3), claimer(3)]);
-    await producer;
-    const elapsedS = (Date.now() - started) / 1000;
-    // Every held scope got exactly one probe and recovered; no letter, no replay.
-    expect(new Set(probes.map((p) => p.key)).size).toBe(52);
-    expect(probes).toHaveLength(52);
-    expect((await owner.query("SELECT count(*)::int AS n FROM sessions.search_job_contention")).rows).toEqual([{ n: 0 }]);
-    expect((await owner.query("SELECT count(*)::int AS n FROM sessions.pipeline_dead_letters")).rows).toEqual([{ n: 0 }]);
-    // Every ordinary job completed.
-    expect(ordinary).toBe(enqueued);
-    expect((await owner.query("SELECT count(*)::int AS n FROM sessions.pipeline_jobs WHERE stage = 'search-index'")).rows).toEqual([{ n: 0 }]);
-    // The backlog stayed positive, including when the last held scope was probed.
-    expect(backlogAtLastProbe).toBeGreaterThan(0);
-    expect(minBacklog).toBeGreaterThan(0);
-    // The fleet bound over every interval of observed probe times: count <= C + R x minutes.
-    const t = probes.map((p) => p.at).sort((a, b) => a - b);
+      })();
+      // The pass reads as the owner (the runtime's own read privileges are not this test's subject).
+      const search = { transact: async (work) => {
+        const client = await owner.connect();
+        try { await client.query("BEGIN"); const r = await work({ query: (t: string, p?: unknown[]) => client.query(t, p as unknown[]) as never }); await client.query("COMMIT"); return r; }
+        catch (e) { await client.query("ROLLBACK").catch(() => {}); throw e; } finally { client.release(); }
+      } } as SearchIndexDeps;
+      const tally = { sqs: { invocations: 0, ordinary: 0, probes: 0, deadlineExits: 0 }, scheduled: { invocations: 0, ordinary: 0, probes: 0, deadlineExits: 0 } };
+      const probedKeys = new Set<string>();
+      const claimer = async (kind: "sqs" | "scheduled") => {
+        const pool = loginPool(1);
+        // Observe which scopes each probe took (the summary counts them; the keys come from the probe events below).
+        while (live()) {
+          const t0 = Date.now();
+          const s = await drainSearchJobs({ sql: pool, search, claim: K, deadline: () => Date.now() - t0 > INVOCATION_BUDGET_MS, probeFirst: kind === "scheduled" });
+          const t = tally[kind];
+          t.invocations += 1; t.ordinary += s.acked - s.probes; t.probes += s.probes; t.deadlineExits += s.deadlineExit ? 1 : 0;
+          if (s.probes && heldCount) {
+            const keys = (await owner.query<{ key: string }>(
+              "SELECT DISTINCT attrs->>'work_key' AS key FROM sessions.pipeline_events WHERE error->>'code' = 'scope_contention_probe'")).rows.map((r) => r.key);
+            for (const k of keys) probedKeys.add(k);
+            if (probedKeys.size === heldKeys.size && backlogAtLastProbe < 0) backlogAtLastProbe = await backlog();
+          }
+          await Bun.sleep(CADENCE_MS);
+        }
+      };
+      await Promise.all([claimer("sqs"), claimer("sqs"), claimer("sqs"), claimer("scheduled")]);
+      await producer;
+      const seconds = (Date.now() - started) / 1000;
+      const ordinary = tally.sqs.ordinary + tally.scheduled.ordinary;
+      const probes = (await owner.query<{ key: string; at: number; lease_key: string }>(
+        `SELECT attrs->>'work_key' AS key, (extract(epoch FROM (attrs->>'admitted_at')::timestamptz) * 1000)::float8 AS at,
+                idempotency_key AS lease_key FROM sessions.pipeline_events
+          WHERE stage = 'search-index' AND error->>'code' = 'scope_contention_probe'`)).rows.map((r) => ({ key: r.key, at: Number(r.at), leaseKey: r.lease_key }));
+      return { owner, tally, ordinary, perSecond: ordinary / seconds, seconds, probes, heldKeys, due: due[0], minBacklog, backlogAtLastProbe, enqueued };
+    }
+
+    const control = await run(0);
+    expect(control.probes).toEqual([]);
+    const loaded = await run(52);
+    // Ordinary throughput under sustained load keeps >= 90% of the control's.
+    expect(loaded.perSecond).toBeGreaterThanOrEqual(0.9 * control.perSecond);
+    // Every held scope was probed once (one durable event per admitted probe) and recovered; nothing parked.
+    expect(new Set(loaded.probes.map((p) => p.leaseKey)).size).toBe(loaded.probes.length);
+    expect(new Set(loaded.probes.map((p) => p.key)).size).toBe(52);
+    expect(loaded.probes).toHaveLength(52);
+    expect((await loaded.owner.query("SELECT count(*)::int AS n FROM sessions.search_job_contention")).rows).toEqual([{ n: 0 }]);
+    expect((await loaded.owner.query("SELECT count(*)::int AS n FROM sessions.pipeline_dead_letters")).rows).toEqual([{ n: 0 }]);
+    // The ordinary backlog stayed positive, including when the last held scope was probed.
+    expect(loaded.minBacklog).toBeGreaterThan(0);
+    expect(loaded.backlogAtLastProbe).toBeGreaterThan(0);
+    // The fleet bound over every interval of the observed (server-clock) admissions: count <= C + R x minutes.
+    const t = loaded.probes.map((p) => p.at).sort((x, y) => x - y);
     let worst = -Infinity;
     for (let i = 0; i < t.length; i++) for (let j = i; j < t.length; j++)
       worst = Math.max(worst, (j - i + 1) - (C + R * (t[j]! - t[i]!) / 60_000));
     expect(worst).toBeLessThanOrEqual(0.01);
     // Progress deadline: all probed within ceil((N - C) / R) minutes of the synchronized due time.
     const deadlineMs = Math.ceil((52 - C) / R) * 60_000;
-    const maxWaitMs = t.at(-1)! - dueAt;
+    const maxWaitMs = t.at(-1)! - loaded.due!;
     expect(maxWaitMs).toBeLessThanOrEqual(deadlineMs);
-    console.log(JSON.stringify({ concurrentSaturation: { claimers: "4 (limit 1, 1, 3, 3; 20 ms between calls)", R, C, heldScopes: 52,
-      distinctProbed: new Set(probes.map((p) => p.key)).size, probes: probes.length, boundAtEnd: C + R * (t.at(-1)! - t[0]!) / 60_000,
-      ordinaryCompleted: ordinary, ordinaryEnqueued: enqueued, minBacklog, backlogAtLastProbe, maxProbeWaitMs: maxWaitMs, deadlineMs, elapsedS } }));
-  }, 300_000);
+    const receipt = (r: typeof control) => ({ ordinaryPerSecond: Number(r.perSecond.toFixed(1)), ordinary: r.ordinary, seconds: Number(r.seconds.toFixed(1)),
+      sqs: r.tally.sqs, scheduled: r.tally.scheduled, minBacklog: r.minBacklog });
+    console.log(JSON.stringify({ sustainedThroughput: {
+      setup: { claimers: "3 SQS-style + 1 scheduled-style, K = 3, 200 ms invocation budget, 20 ms between invocations", R, C, windowS: WINDOW_MS / 1000 },
+      control: receipt(control), loaded: { ...receipt(loaded), heldScopes: 52, distinctProbed: new Set(loaded.probes.map((p) => p.key)).size,
+        probes: loaded.probes.length, boundAtLast: C + R * (t.at(-1)! - t[0]!) / 60_000, backlogAtLastProbe: loaded.backlogAtLastProbe, maxProbeWaitMs: maxWaitMs, deadlineMs },
+      ratio: Number((loaded.perSecond / control.perSecond).toFixed(3)) } }));
+  }, 600_000);
 });

@@ -294,19 +294,26 @@ functions, in their own transactions:
 - **Escalation:** at 2 h of same-epoch contention, then at most hourly (`last_escalated_at`), a
   `scope_contention_escalated` event; the settle result carries `escalated`, `contended_for_s`, `contention_count`.
 - **The 24 h cap (hold and hourly probe):** at 24 h the job is HELD (`held_at`, `next_probe_at` = now + 1 h; event
-  `scope_contention_held`). A held job is never ordinary work; the claim admits it as a probe once `next_probe_at`
-  is due (oldest due first, then job id), moving the next probe an hour on; a busy probe writes
-  `scope_contention_probe`. A probe that finds the lock free completes normally, so a static scope recovers with no
-  replay. A newer epoch releases the hold. `sessions.resume_search_contention_v1(job_id, operator)` (service_role
-  only; search-index only; row locks; refuses while a lease is live) clears a hold and audits the operator text,
-  `session_user`, `current_user` and the clock.
-- **Fleet probe budget:** `sessions.search_probe_budget`, one owner-only row, a token bucket shared by every claimer
+  `scope_contention_held`, once per hold). A held job is never ordinary work: `claim_search_jobs_v1` skips it.
+- **The probe lane:** `sessions.claim_search_probe_v1()` (SECURITY DEFINER, pinned search_path, PUBLIC revoked,
+  EXECUTE to the runtime through the service_role mirror, like the ordinary claim) returns at most ONE held job whose
+  `next_probe_at` is due (oldest due first, then job id), and only if the fleet bucket has a token, which it spends.
+  It leases the job like any claim, moves the next probe an hour on, and writes exactly one `scope_contention_probe`
+  event per admitted probe in that transaction (its lease in the key), whether the probe then completes, is busy or
+  is abandoned; a token rejection or a park writes none. A probe that finds the lock free completes normally, so a
+  static scope recovers with no replay. A newer epoch releases the hold.
+  `sessions.resume_search_contention_v1(job_id, operator)` (service_role only; search-index only; row locks; refuses
+  while a lease is live) clears a hold and audits the operator text, `session_user`, `current_user` and the clock.
+- **Fleet probe budget:** `sessions.search_probe_budget`, one owner-only row, a token bucket shared by every prober
   under `FOR UPDATE`. Defaults: refill **R = 6 per minute**, burst **C = 6**, initial balance **6 tokens**; tunable by
-  an owner UPDATE of the row. Probes admitted over any interval are at most C + R x elapsed minutes. Per claim call:
-  if a held scope is due and a token is available, the probe takes ONE slot and the rest are ordinary; at most one
-  probe per call. **Ordinary turn:** after a call that served a probe, the next call serves ordinary work if any is
-  ready (`last_served_kind`), so with limit 1 probes take at most every other call however slowly calls arrive; with
-  no ordinary work ready, probes may run back to back within the bucket.
+  an owner UPDATE of the row. Probes admitted over any interval are at most C + R x elapsed minutes.
+- **Ordinary capacity is isolated:** the Lambda's `drainSearchJobs` runs up to K ordinary passes (SEARCH_JOBS_CLAIM),
+  each claimed with `claim_search_jobs_v1(1)` just before it runs; probes are EXTRA and never take an ordinary pass.
+  The SQS follow-on probes once after its ordinary passes if time remains; the scheduled invocation
+  (`{"searchJobs": true}`) probes FIRST, then runs its K ordinary passes, so held scopes recover even when ordinary
+  passes always run to the deadline. Hosted once-a-minute recovery is CONDITIONAL on that schedule rule being
+  provisioned and enabled (a stack change with its own go); the handler test qualifies what an invocation does when
+  invoked, not that the schedule exists.
 - **Expired-lease reclaim cap** (a worker that dies or hangs; this may park): the persisted receipt counts consecutive
   abandoned leases at one epoch (`reclaim_count`); it resets on a newer epoch and on any settled pass (every
   settlement deletes the receipt). At exactly 6 consecutive same-epoch expiries the claim parks the previous claim's

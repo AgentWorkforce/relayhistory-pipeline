@@ -17,7 +17,8 @@
  *
  * Roles (least privilege). The runtime boundary of the stage is exactly two SECURITY DEFINER functions of migration
  * 20261105062300: sessions.claim_search_jobs_v1 (claimSearchJobs) and sessions.settle_search_job_v1 (settleSearchJob).
- * The runtime role (the Lambda) holds EXECUTE on those two only; it needs no search-index row DML (the queue guard
+ * (plus the probe lane, sessions.claim_search_probe_v1 / claimSearchProbe). The runtime role (the Lambda) holds
+ * EXECUTE on those three only; it needs no search-index row DML (the queue guard
  * refuses it) and never sees the owner-only claim receipts (sessions.search_job_claims). Settlement takes the claimed
  * epoch, message and attempt from the server's receipt and derives the backoff and exhaustion from server policy.
  * Operator paths, run with owner (or, for the archive, service_role) credentials and never granted to the runtime
@@ -190,6 +191,19 @@ export async function claimSearchJobs(sql: SqlExecutor, n: number): Promise<Clai
   return rows
     .map((r) => ({ id: r.id, lease: r.lease, attempts: Number(r.attempts), claimedEpoch: Number(r.epoch), claimedMessage: r.message }))
     .sort((a, b) => Number(BigInt(a.id) - BigInt(b.id)));
+}
+
+/**
+ * The PROBE lane, through sessions.claim_search_probe_v1 (SECURITY DEFINER): at most one held job whose hourly probe
+ * is due, only if the fleet probe bucket has a token. Separate from claimSearchJobs, so a probe never takes an
+ * ordinary slot. Settled like any claim.
+ */
+export async function claimSearchProbe(sql: SqlExecutor): Promise<ClaimedSearchJob | undefined> {
+  const { rows } = await sql.query<{ id: string; lease: string; attempts: number; epoch: string; message: SearchWakeMessage }>(
+    `SELECT c.job_id::text AS id, c.lease_id::text AS lease, c.attempts, c.epoch::text AS epoch, c.message
+       FROM sessions.claim_search_probe_v1() AS c`);
+  const r = rows[0];
+  return r ? { id: r.id, lease: r.lease, attempts: Number(r.attempts), claimedEpoch: Number(r.epoch), claimedMessage: r.message } : undefined;
 }
 
 /**

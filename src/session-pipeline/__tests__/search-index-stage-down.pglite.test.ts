@@ -58,20 +58,23 @@ const checks = async (pg: PGlite) => (await pg.query<{ def: string }>(
     WHERE conname IN ('pipeline_jobs_stage_check','pipeline_events_stage_check','pipeline_dead_letters_stage_check') AND conrelid IN
       ('sessions.pipeline_jobs'::regclass,'sessions.pipeline_events'::regclass,'sessions.pipeline_dead_letters'::regclass) ORDER BY conname`)).rows.map((r) => r.def);
 /** The runtime boundary and its receipts: present after the up, gone after the down (re-created by a re-apply). */
-const runtimeBoundary = async (pg: PGlite) => (await pg.query<{ claim: string | null; settle: string | null; receipts: string | null; contention: string | null; budget: string | null; resume: string | null; letter: string | null; attempts: string | null; trigger: boolean }>(
+const runtimeBoundary = async (pg: PGlite) => (await pg.query<{ claim: string | null; settle: string | null; receipts: string | null; contention: string | null; budget: string | null; resume: string | null; probe: string | null; lease: string | null; letter: string | null; attempts: string | null; trigger: boolean }>(
   `SELECT to_regprocedure('sessions.claim_search_jobs_v1(integer)')::text AS claim,
           to_regprocedure('sessions.settle_search_job_v1(bigint,uuid,text)')::text AS settle,
           to_regclass('sessions.search_job_claims')::text AS receipts,
           to_regclass('sessions.search_job_contention')::text AS contention,
           to_regclass('sessions.search_probe_budget')::text AS budget,
           to_regprocedure('sessions.resume_search_contention_v1(bigint,text)')::text AS resume,
+          to_regprocedure('sessions.claim_search_probe_v1()')::text AS probe,
+          to_regprocedure('sessions.search_job_lease_v1(bigint,boolean)')::text AS lease,
           to_regprocedure('sessions.search_letter_id_v1(text,text,text)')::text AS letter,
           to_regprocedure('sessions.search_job_claim_attempts_v1()')::text AS attempts,
           EXISTS (SELECT 1 FROM pg_trigger WHERE tgname = 'search_job_claim_attempts' AND tgrelid = 'sessions.pipeline_jobs'::regclass) AS trigger`)).rows[0]!;
 const BOUNDARY_PRESENT = { claim: "sessions.claim_search_jobs_v1(integer)", settle: "sessions.settle_search_job_v1(bigint,uuid,text)",
   receipts: "sessions.search_job_claims", contention: "sessions.search_job_contention", budget: "sessions.search_probe_budget",
-  resume: "sessions.resume_search_contention_v1(bigint,text)", letter: "sessions.search_letter_id_v1(text,text,text)", attempts: "sessions.search_job_claim_attempts_v1()", trigger: true };
-const BOUNDARY_GONE = { claim: null, settle: null, receipts: null, contention: null, budget: null, resume: null, letter: null, attempts: null, trigger: false };
+  resume: "sessions.resume_search_contention_v1(bigint,text)", probe: "sessions.claim_search_probe_v1()",
+  lease: "sessions.search_job_lease_v1(bigint,boolean)", letter: "sessions.search_letter_id_v1(text,text,text)", attempts: "sessions.search_job_claim_attempts_v1()", trigger: true };
+const BOUNDARY_GONE = { claim: null, settle: null, receipts: null, contention: null, budget: null, resume: null, probe: null, lease: null, letter: null, attempts: null, trigger: false };
 const ledgered = async (pg: PGlite) => (await pg.query("SELECT 1 FROM sessions.__96bulls_migrations WHERE name = $1", [STEP])).rows.length === 1;
 
 test("refuses with a search-index job, then with its letter and events; changes nothing", async () => {

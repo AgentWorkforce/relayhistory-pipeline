@@ -12,6 +12,8 @@
  *                                       (the operator) ONLY: never a runtime application function
  *   search_job_claim_attempts_v1        SECURITY DEFINER trigger function: keeps the claim receipt's attempt; no grant
  *   search_letter_id_v1                 dlq.ts deadLetterId in SQL, owner-internal (settle calls it); no grant
+ *   claim_search_probe_v1               SECURITY DEFINER; the runtime's probe lane (held jobs, fleet bucket); as claim
+ *   search_job_lease_v1                 owner-internal lease/park helper of both claims; no grant
  *   claim_search_jobs_v1                SECURITY DEFINER; THE RUNTIME BOUNDARY (§3.2): EXECUTE to service_role, mirrored
  *   settle_search_job_v1                onto the runtime role (RUNTIME_APPLICATION_FUNCTIONS); the only functions of
  *                                       the stage the runtime role executes (§3.3, the server's claim receipt)
@@ -41,6 +43,8 @@ export const searchIndexStage: LaneManifest = {
     "sessions.claim_search_jobs_v1(",
     "sessions.settle_search_job_v1(",
     "sessions.resume_search_contention_v1(",
+    "sessions.claim_search_probe_v1(",
+    "sessions.search_job_lease_v1(",
   ],
   grantSources: [{ path: MIGRATION, roles: ["service_role"] }],
   functions: {
@@ -55,6 +59,10 @@ export const searchIndexStage: LaneManifest = {
     "sessions.search_letter_id_v1(text,text,text)": { secdef: false, grants: [] },
     // The runtime boundary: service_role EXECUTE, mirrored onto the runtime role (no operatorOnly).
     "sessions.claim_search_jobs_v1(integer)": { secdef: true, grants: ["service_role"] },
+    // The probe lane (held jobs, fleet bucket): runtime boundary like the ordinary claim.
+    "sessions.claim_search_probe_v1()": { secdef: true, grants: ["service_role"] },
+    // Owner-internal lease helper (called only inside the claim functions): no grant.
+    "sessions.search_job_lease_v1(bigint,boolean)": { secdef: false, grants: [] },
     "sessions.settle_search_job_v1(bigint,uuid,text)": { secdef: true, grants: ["service_role"] },
     // The 24 h contention cap's operator release: service_role only, never the runtime role.
     "sessions.resume_search_contention_v1(bigint,text)": { secdef: true, grants: ["service_role"], operatorOnly: true },
