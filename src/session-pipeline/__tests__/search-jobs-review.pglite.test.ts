@@ -154,6 +154,8 @@ describe("visibility and trace (review finding 7)", () => {
     // A letter at 7 (exhausted), then a fresh wake 7 that is backed off.
     await enqueueSearchWake(pg, wake(scope, 7));
     const [c] = await claimSearchJobs(pg, 1);
+    // Exhaustion is the server's (settle_search_job_v1, max 12 attempts): the leased row is on its last attempt.
+    await pg.query("UPDATE sessions.pipeline_jobs SET attempts = 12 WHERE id = $1::bigint AND lease_id = $2::uuid", [c!.id, c!.lease]);
     expect(await settleSearchJob(pg, c!, "exhausted")).toMatchObject({ applied: true, action: "parked" });
     const { r } = await backedOff(pg, 7);
     expect(await replaySearchDeadLetter(pg, searchLetterId(c!.claimedMessage))).toEqual({ replayed: true });
