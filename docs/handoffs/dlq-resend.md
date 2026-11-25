@@ -26,6 +26,17 @@ bun scripts/dlq-resend.ts --dlq-url <dlq-url> --target-url <source-queue-url> --
   QueueArns match their URLs and differ, that the target's `RedrivePolicy`
   dead-letters into this DLQ, and that the DLQ has no `RedrivePolicy` of its
   own.
+- **Provenance:** a DLQ can serve several sources. A message is considered
+  only if its `DeadLetterQueueSourceArn`, which the tool requests on every
+  receive, is exactly the verified target's ARN. A message with no source
+  (for example a direct insert) or another source is released at once and
+  counted as `provenance_mismatch`. Such a message is never sent.
+- **Attributes:** message attributes are carried over exactly, including names
+  such as `__proto__`, with String, Number and Binary types and custom
+  suffixes. If any attribute cannot be serialized and round-tripped unchanged
+  (a list value, a missing or extra value, an unknown type, invalid base64), the
+  message is not sent. It is released and counted as
+  `attributes_unserializable`.
 - **Identity:** `sha256_hex("<org>/<ws>/<m>/<h>/<s>")` of the manifest key the
   consumer itself reads from the body (`parseQueueBody`). Reconcile keys are
   used literally, and S3 keys are decoded as the consumer decodes them. A body
@@ -41,7 +52,10 @@ bun scripts/dlq-resend.ts --dlq-url <dlq-url> --target-url <source-queue-url> --
   batch and leaves the message in the DLQ. Unproven sends are a timeout, a lost
   response, an HTTP 5xx, or an acknowledgement without a `MessageId` or with an
   MD5 that does not match the body. A failed delete after a valid send also
-  halts. The summary's `reconcile` list names each such message by identity and
+  halts. So does a valid acknowledgement that arrives with less hold left than
+  the delete timeout plus margin. In that case the tool does not delete,
+  because the receipt may have lapsed and another receiver may hold the
+  message. The summary's `reconcile` list names each such message by identity and
   body digest.
 - **Output:** JSON lines with hashes and fixed codes only (class names are
   printed as `class_<hash>`). Exit 0 means done, 1 means errors or a duplicate

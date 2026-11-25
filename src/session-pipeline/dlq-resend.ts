@@ -333,6 +333,8 @@ export interface SqsMessage {
   ReceiptHandle: string;
   Body: string;
   MessageAttributes?: Record<string, SqsMessageAttribute & Record<string, unknown>>;
+  /** System attributes; the resend requests DeadLetterQueueSourceArn (the queue that dead-lettered it). */
+  Attributes?: Record<string, string>;
 }
 export interface SendAck {
   MessageId?: unknown;
@@ -371,6 +373,7 @@ export function awsSqsClient(credentials: () => Promise<AwsSessionCredentials>, 
         VisibilityTimeout: visibilitySeconds,
         WaitTimeSeconds: waitSeconds,
         MessageAttributeNames: ["All"],
+        MessageSystemAttributeNames: ["DeadLetterQueueSourceArn"],
       }, (waitSeconds + 10) * 1000);
       return out.Messages ?? [];
     },
@@ -386,19 +389,46 @@ export function awsSqsClient(credentials: () => Promise<AwsSessionCredentials>, 
   };
 }
 
-/** Only the fields SendMessage accepts; received attributes may carry list fields or checksums. */
-export function sendableAttributes(attrs: SqsMessage["MessageAttributes"]): Record<string, SqsMessageAttribute> | undefined {
-  if (!attrs) return undefined;
-  const out: Record<string, SqsMessageAttribute> = {};
-  for (const [name, a] of Object.entries(attrs)) {
-    if (!a || typeof a.DataType !== "string") continue;
-    out[name] = {
-      DataType: a.DataType,
-      ...(typeof a.StringValue === "string" ? { StringValue: a.StringValue } : {}),
-      ...(typeof a.BinaryValue === "string" ? { BinaryValue: a.BinaryValue } : {}),
-    };
+const DATA_TYPE = /^(String|Number|Binary)(\.[A-Za-z0-9_.-]{1,250})?$/;
+const BASE64 = /^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/;
+const emptyList = (v: unknown) => v === undefined || (Array.isArray(v) && v.length === 0);
+
+/**
+ * The received message attributes as SendMessage takes them (DataType plus StringValue or BinaryValue),
+ * or `null` (fail closed) when any one of them cannot be carried over exactly: an unknown type, a
+ * missing or extra value, a non-empty list value, invalid base64, or a name/type/value that does not
+ * survive JSON serialization unchanged. Built on a null-prototype object so a name such as `__proto__`
+ * is an ordinary key, not dropped. `undefined` when the message has none.
+ */
+export function sendableAttributes(attrs: SqsMessage["MessageAttributes"]): Record<string, SqsMessageAttribute> | null | undefined {
+  if (attrs === undefined) return undefined;
+  if (!attrs || typeof attrs !== "object" || Array.isArray(attrs)) return null;
+  const entries = Object.entries(attrs);
+  if (entries.length === 0) return undefined;
+  const out: Record<string, SqsMessageAttribute> = Object.create(null);
+  for (const [name, a] of entries) {
+    if (!name || !a || typeof a !== "object" || typeof a.DataType !== "string" || !DATA_TYPE.test(a.DataType)) return null;
+    if (!emptyList(a.StringListValues) || !emptyList(a.BinaryListValues)) return null;
+    const binary = a.DataType.startsWith("Binary");
+    if (binary) {
+      if (typeof a.BinaryValue !== "string" || a.StringValue !== undefined || !BASE64.test(a.BinaryValue)) return null;
+      Object.defineProperty(out, name, { value: { DataType: a.DataType, BinaryValue: a.BinaryValue }, enumerable: true, writable: true, configurable: true });
+    } else {
+      if (typeof a.StringValue !== "string" || a.BinaryValue !== undefined) return null;
+      Object.defineProperty(out, name, { value: { DataType: a.DataType, StringValue: a.StringValue }, enumerable: true, writable: true, configurable: true });
+    }
   }
-  return Object.keys(out).length ? out : undefined;
+  // Round-trip proof: exactly the same names, types and values after serialization.
+  const back = JSON.parse(JSON.stringify(out)) as Record<string, Record<string, unknown>>;
+  const names = Object.keys(back);
+  if (names.length !== entries.length) return null;
+  for (const [name, a] of entries) {
+    if (!Object.prototype.hasOwnProperty.call(back, name)) return null;
+    const b = back[name]!;
+    const valueKey = a.DataType.startsWith("Binary") ? "BinaryValue" : "StringValue";
+    if (Object.keys(b).length !== 2 || b.DataType !== a.DataType || b[valueKey] !== a[valueKey]) return null;
+  }
+  return out;
 }
 
 /**
@@ -428,7 +458,7 @@ export async function verifyQueuePair(sqs: SqsClient, dlq: QueueRef, target: Que
 // ---------------------------------------------------------------------------------------------
 // The scan
 
-export type StopReason = "cap_reached" | "empty_receives" | "max_scan" | "receive_failed" | "halted_ambiguous_send" | "halted_delete_failure";
+export type StopReason = "cap_reached" | "empty_receives" | "max_scan" | "receive_failed" | "halted_ambiguous_send" | "halted_delete_failure" | "halted_hold_lapsed";
 
 export interface DlqResendSummary {
   event: "summary";
@@ -542,11 +572,21 @@ export async function runDlqResend(options: DlqResendOptions, deps: DlqResendDep
       if (decided.has(m.MessageId)) { await release(m, "repeat"); continue; }
       decided.add(m.MessageId);
       s.unique++;
+      // A DLQ can serve several sources: only messages dead-lettered by the verified target go back to it.
+      // Absent (a direct insert) or another source: released, never sent.
+      if (m.Attributes?.DeadLetterQueueSourceArn !== options.target.arn) { await release(m, "provenance_mismatch"); continue; }
       const id = identityOfBody(m.Body);
       if (!id.ok) { await release(m, id.reason); continue; }
       const cls = options.selection.get(id.identity);
       if (cls === undefined) { await release(m, "not_selected"); continue; }
       s.selected++;
+      const attributes = sendableAttributes(m.MessageAttributes);
+      if (attributes === null) {
+        s.errors++;
+        bump(s.errorCodes, "attributes_unserializable");
+        await release(m, "attributes_unserializable");
+        continue;
+      }
       if (attempts >= options.max) { await release(m, "after_cap"); continue; }
       attempts++;
       const code = classCode(cls);
@@ -585,7 +625,7 @@ export async function runDlqResend(options: DlqResendOptions, deps: DlqResendDep
       lastSendAt = now();
       let ack: SendAck;
       try {
-        ack = await sqs.send(options.target.url, m.Body, sendableAttributes(m.MessageAttributes), SEND_TIMEOUT_MS);
+        ack = await sqs.send(options.target.url, m.Body, attributes, SEND_TIMEOUT_MS);
       } catch (e) {
         if (definitelyNotSent(e)) {
           // Refused by SQS: left in the DLQ (no delete); it reappears when its hold ends.
@@ -603,6 +643,12 @@ export async function runDlqResend(options: DlqResendOptions, deps: DlqResendDep
       }
       s.resent++;
       bump(s.perClass, code);
+      // A slow ack (or a suspended process) can outlive the hold; past it another receiver may hold the
+      // message, so this receipt must not be used. Halt and reconcile instead of deleting.
+      if (deadline - now() < DELETE_TIMEOUT_MS + HOLD_MARGIN_MS) {
+        ambiguous(line, "hold_lapsed_before_delete", "halted_hold_lapsed");
+        continue;
+      }
       try {
         await sqs.delete(dlqUrl, m.ReceiptHandle, DELETE_TIMEOUT_MS);
       } catch (e) {

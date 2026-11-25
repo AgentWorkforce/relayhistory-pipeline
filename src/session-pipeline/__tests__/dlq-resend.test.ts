@@ -66,9 +66,9 @@ const goodAttrs = () => ({
 });
 
 /** An in-memory DLQ with SQS visibility semantics on a fake monotonic clock. */
-function fakeSqs(bodies: { body: string; attributes?: SqsMessage["MessageAttributes"] }[], opts: FakeOptions = {}) {
+function fakeSqs(bodies: { body: string; attributes?: SqsMessage["MessageAttributes"]; source?: string | null }[], opts: FakeOptions = {}) {
   const clock = { t: 0 };
-  const messages = bodies.map((b, i) => ({ id: `m-${i}`, body: b.body, attributes: b.attributes, visible: true, deleted: false, receives: 0 }));
+  const messages = bodies.map((b, i) => ({ id: `m-${i}`, body: b.body, attributes: b.attributes, source: b.source === undefined ? arn(TARGET) : b.source, visible: true, deleted: false, receives: 0 }));
   const calls: Call[] = [];
   let handle = 0;
   const handles = new Map<string, number>();
@@ -83,6 +83,7 @@ function fakeSqs(bodies: { body: string; attributes?: SqsMessage["MessageAttribu
     },
     async receive(queue, { max, visibilitySeconds }) {
       calls.push({ op: "receive", queue, seconds: visibilitySeconds, at: clock.t });
+      // Delivered as SQS delivers it: through JSON.
       clock.t += opts.receiveDelayMs ?? 0;
       const out: SqsMessage[] = [];
       for (const [i, m] of messages.entries()) {
@@ -92,13 +93,15 @@ function fakeSqs(bodies: { body: string; attributes?: SqsMessage["MessageAttribu
         m.receives++;
         const h = `rh-${++handle}`;
         handles.set(h, i);
-        out.push({ MessageId: m.id, ReceiptHandle: h, Body: m.body, ...(m.attributes ? { MessageAttributes: m.attributes } : {}) });
+        out.push(JSON.parse(JSON.stringify({ MessageId: m.id, ReceiptHandle: h, Body: m.body, ...(m.source ? { Attributes: { DeadLetterQueueSourceArn: m.source } } : {}) })));
+        if (m.attributes) out[out.length - 1]!.MessageAttributes = m.attributes;
       }
       return out;
     },
     async send(queue, body, attributes, timeoutMs): Promise<SendAck> {
       const index = messages.findIndex((m) => m.body === body);
-      calls.push({ op: "send", queue, body, id: messages[index]?.id, timeoutMs, at: clock.t, ...(attributes ? { attributes } : {}) });
+      // Captured as it would go on the wire (serialized), so a dropped attribute name shows.
+      calls.push({ op: "send", queue, body, id: messages[index]?.id, timeoutMs, at: clock.t, ...(attributes ? { attributes: JSON.parse(JSON.stringify({ MessageAttributes: attributes })).MessageAttributes } : {}) });
       clock.t += opts.sendDelayMs ?? 0;
       switch (opts.sendBehaviour?.(index) ?? "ok") {
         case "lost": throw Object.assign(new Error("timed out"), { name: "TimeoutError" });
@@ -419,6 +422,90 @@ describe("execute", () => {
     await run(options({ execute: true, ratePerSecond: 2 }), f);
     expect(f.calls.filter((c) => c.op === "send").map((c) => c.at)).toEqual([0, 500, 1000]);
   });
+});
+
+describe("provenance, delete deadline and attributes", () => {
+  const OTHER_SOURCE = `https://sqs.us-east-1.amazonaws.com/${ACCOUNT}/fixture-other-source`;
+  test("two sources share one DLQ: only messages dead-lettered by the verified target are resent", async () => {
+    const f = fakeSqs([
+      { body: reconcileBody(A, "e0"), source: arn(OTHER_SOURCE) },
+      { body: reconcileBody(A, "e1") },
+      { body: reconcileBody(A, "e2"), source: null },
+      { body: reconcileBody(A, "e3"), source: arn(DLQ) },
+      { body: reconcileBody(A, "e4") },
+    ]);
+    const { summary } = await run(options({ execute: true }), f);
+    expect(f.calls.filter((c) => c.op === "send").map((c) => c.id)).toEqual(["m-1", "m-4"]);
+    expect(summary).toMatchObject({ resent: 2, selected: 2, skipReasons: { provenance_mismatch: 3 } });
+    for (const id of ["m-0", "m-2", "m-3"]) {
+      const own = f.calls.filter((c) => c.id === id);
+      expect(own.length).toBeGreaterThan(0);
+      expect(own.every((c) => c.op === "visibility" && c.seconds === 0)).toBe(true);
+    }
+  });
+  test("provenance is checked in a dry run too", async () => {
+    const f = fakeSqs([{ body: reconcileBody(A, "e0"), source: arn(OTHER_SOURCE) }, { body: reconcileBody(A, "e1") }]);
+    const { summary } = await run(options({ maxScan: 100 }), f);
+    expect(summary).toMatchObject({ wouldResend: 1, skipReasons: { provenance_mismatch: 1 } });
+  });
+  test("receive asks for DeadLetterQueueSourceArn", async () => {
+    const seen: Record<string, unknown>[] = [];
+    const fetcher = (async (_url: string, init: { body: string }) => {
+      seen.push(JSON.parse(init.body));
+      return new Response(JSON.stringify({ Messages: [] }), { status: 200 });
+    }) as unknown as typeof fetch;
+    const { awsSqsClient } = await import("../dlq-resend.ts");
+    const client = awsSqsClient(async () => ({ accessKeyId: "AKIDFIXTURE", secretAccessKey: "s", sessionToken: "t" }), { fetcher });
+    await client.receive(DLQ, { max: 10, visibilitySeconds: 120, waitSeconds: 0 });
+    expect(seen[0]).toMatchObject({ QueueUrl: DLQ, VisibilityTimeout: 120, MessageAttributeNames: ["All"], MessageSystemAttributeNames: ["DeadLetterQueueSourceArn"] });
+  });
+  test("a valid ack that arrives after the hold lapsed: halt, no delete, reconcile entry", async () => {
+    const f = fakeSqs([{ body: reconcileBody(A, "e0") }, { body: reconcileBody(A, "e1") }, { body: s3Body(B) }], { sendDelayMs: 105_000 });
+    const { summary } = await run(options({ execute: true }), f);
+    expect(f.calls.filter((c) => c.op === "send").map((c) => c.id)).toEqual(["m-0"]);
+    expect(f.calls.some((c) => c.op === "delete")).toBe(false);
+    expect(summary).toMatchObject({ stop: "halted_hold_lapsed", resent: 1, duplicateRisk: 1, skipReasons: { halted: 2 } });
+    expect(summary.reconcile).toEqual([{ identity: identity(A), bodySha256: sha(reconcileBody(A, "e0")).slice(0, 16), class: classCode("now_indexes"), outcome: "hold_lapsed_before_delete" }]);
+    for (const id of ["m-1", "m-2"]) expect(f.calls.filter((c) => c.id === id).map((c) => [c.op, c.seconds])).toEqual([["visibility", 0]]);
+  });
+  test("attributes round-trip exactly on the serialized send, including __proto__, Binary and custom types", async () => {
+    // As SQS delivers it (JSON text): `__proto__` arrives as an ordinary own key.
+    const received = JSON.parse(
+      '{"__proto__":{"DataType":"String","StringValue":"proto-value"},' +
+        '"bin":{"DataType":"Binary","BinaryValue":"AAECAw==","StringListValues":[],"BinaryListValues":[]},' +
+        '"num":{"DataType":"Number.int","StringValue":"42"},"txt":{"DataType":"String.custom","StringValue":""}}',
+    ) as SqsMessage["MessageAttributes"];
+    expect(Object.keys(received!)).toContain("__proto__");
+    const f = fakeSqs([{ body: reconcileBody(A), attributes: received }]);
+    const { summary } = await run(options({ execute: true }), f);
+    expect(summary.resent).toBe(1);
+    const sent = f.calls.find((c) => c.op === "send")!.attributes!;
+    expect(Object.keys(sent).sort()).toEqual(["__proto__", "bin", "num", "txt"]);
+    expect(Object.getOwnPropertyDescriptor(sent, "__proto__")!.value).toEqual({ DataType: "String", StringValue: "proto-value" });
+    expect(sent.bin).toEqual({ DataType: "Binary", BinaryValue: "AAECAw==" });
+    expect(sent.num).toEqual({ DataType: "Number.int", StringValue: "42" });
+    expect(sent.txt).toEqual({ DataType: "String.custom", StringValue: "" });
+  });
+  const bad: [string, Record<string, unknown>][] = [
+    ["a list value", { l: { DataType: "String", StringValue: "x", StringListValues: ["a"] } }],
+    ["no value", { n: { DataType: "String" } }],
+    ["both values", { b: { DataType: "String", StringValue: "x", BinaryValue: "AA==" } }],
+    ["an unknown type", { u: { DataType: "Blob", StringValue: "x" } }],
+    ["invalid base64", { b: { DataType: "Binary", BinaryValue: "not base64!" } }],
+    ["a non-string value", { v: { DataType: "Number", StringValue: 5 } }],
+  ];
+  for (const [name, attrs] of bad) {
+    test(`fails closed on ${name}: not sent, released, counted`, async () => {
+      const f = fakeSqs([{ body: reconcileBody(A, "e0"), attributes: attrs as SqsMessage["MessageAttributes"] }, { body: reconcileBody(A, "e1") }]);
+      const { summary } = await run(options({ execute: true }), f);
+      expect(f.calls.filter((c) => c.op === "send").map((c) => c.id)).toEqual(["m-1"]);
+      // Released at once (and again on each repeat receive); never sent or deleted.
+      const own = f.calls.filter((c) => c.id === "m-0");
+      expect(own.length).toBeGreaterThan(0);
+      expect(own.every((c) => c.op === "visibility" && c.seconds === 0)).toBe(true);
+      expect(summary).toMatchObject({ resent: 1, errorCodes: { attributes_unserializable: 1 }, skipReasons: { attributes_unserializable: 1 } });
+    });
+  }
 });
 
 describe("stopping", () => {
