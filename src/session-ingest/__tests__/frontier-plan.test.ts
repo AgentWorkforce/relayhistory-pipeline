@@ -1,4 +1,5 @@
 import { describe, expect, test } from "bun:test";
+import { installApprovedFrontier, type FrontierInstallApproval } from "../frontier-install.ts";
 import { parseFrontierJson, readFrontierBundle, MAX_FRONTIER_BUNDLE_BYTES } from "../frontier-plan-input.ts";
 import { mkdtempSync, rmSync, writeFileSync, symlinkSync, truncateSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -412,5 +413,71 @@ describe("canonical frontier read-only planner", () => {
       expect(malformed.status).toBe(1);
       expect(JSON.parse(malformed.stderr)).toMatchObject({ code: "frontier_capture_config_shape" });
     } finally { rmSync(directory, { recursive: true, force: true }); }
+  });
+});
+
+describe("guarded frontier installation boundary (synthetic owner ports)", () => {
+  const nonce = "12345678-1111-2222-3333-444444444444";
+  function fixture() {
+    const capture = readyCapture();
+    const plan = evaluate(capture);
+    if (plan.status !== "ready") throw Error("fixture not ready");
+    const approval: FrontierInstallApproval = {
+      nonce, tenant, planSha256: plan.planSha256, verifierReceiptSha256: H("verified separately"),
+      wholeUserEvidenceSha256: H("whole user independently checked"), predecessorSha256: null,
+    };
+    const calls: string[] = [];
+    const ports = {
+      now: () => NOW,
+      readVerifiedApproval: async () => approval,
+      installGuarded: async (commandJson: string) => {
+        calls.push(commandJson);
+        return createHash("sha256").update(commandJson).digest("hex");
+      },
+    };
+    return { capture, approval, ports, calls, bindings: bindingsFor(capture) };
+  }
+
+  test("rebuilds approved plan and binds absent/renewal CAS and approval identity into one guarded call", async () => {
+    for (const predecessor of [null, H("previous image")]) {
+      const f = fixture();
+      f.approval.predecessorSha256 = predecessor;
+      expect(await installApprovedFrontier(true, nonce, f.capture, f.bindings, f.ports)).toBe("committed");
+      expect(f.calls).toHaveLength(1);
+      expect(JSON.parse(f.calls[0]!)).toMatchObject({ nonce, predecessorSha256: predecessor,
+        planSha256: f.approval.planSha256, verifierReceiptSha256: f.approval.verifierReceiptSha256,
+        wholeUserEvidenceSha256: f.approval.wholeUserEvidenceSha256,
+        row: { user_id: tenant.userId, origin_id: tenant.originId, schema_generation: f.capture.target.schemaGeneration } });
+    }
+  });
+  test("self-consistent changed generation and incomplete receipt capture cannot use approved plan", async () => {
+    for (const mutate of [
+      (c: CanonicalFrontierCapture) => { c.target.schemaGeneration = H("different generation"); },
+      (c: CanonicalFrontierCapture) => { c.origins[0]!.scans = c.origins[0]!.scans.filter(s => s.kind !== "receipt-decisions"); },
+      (c: CanonicalFrontierCapture) => { c.origins[0]!.closing.privacyVersion = "20"; },
+    ]) {
+      const f = fixture(); mutate(f.capture); reseal(f.capture);
+      expect(await installApprovedFrontier(true, nonce, f.capture, f.bindings, f.ports)).toBe("held");
+      expect(f.calls).toHaveLength(0);
+    }
+  });
+  test("disabled, missing verified approval, insufficient validity and wrong origin never invoke installer", async () => {
+    const f = fixture();
+    const req = (enabled: boolean, overrides = {}) => installApprovedFrontier(enabled, nonce, f.capture, f.bindings, {...f.ports,...overrides});
+    expect(await req(false, {readVerifiedApproval: () => { throw Error("disabled read"); }})).toBe("disabled");
+    expect(await req(true, {readVerifiedApproval: async () => null})).toBe("held");
+    expect(await req(true, {now: () => new Date(Date.parse(AT) + 151000)})).toBe("held");
+    f.approval.tenant = {...tenant, originId: "other"};
+    expect(await req(true)).toBe("held");
+    expect(f.calls).toHaveLength(0);
+  });
+  test("ambiguous acknowledgement returns lookup-required and makes no second call", async () => {
+    for (const throws of [true,false]) {
+      const f = fixture(); let attempts = 0;
+      expect(await installApprovedFrontier(true, nonce, f.capture, f.bindings, {...f.ports, installGuarded: async () => {
+        attempts++; if (throws) throw Error("lost connection"); return H("unrelated command");
+      }})).toBe("audit_lookup_required");
+      expect(attempts).toBe(1);
+    }
   });
 });
