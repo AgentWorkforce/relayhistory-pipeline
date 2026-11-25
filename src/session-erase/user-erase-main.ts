@@ -120,6 +120,9 @@ export async function runUserEraseMain(
   const req = parseUserEraseRequest(await request());
   let eraser: PagedEraser;
   if (s3cfg.azure) {
+    // The per-user erase has no dry run: a shared erase Job environment that asks for one must never revoke and
+    // delete instead. Refused before the target, the probe or any SQL.
+    if (s3cfg.dryRun) refuse("dry_run_unsupported");
     // The writer store exactly, then the data-plane preflight, all before any SQL (begin revokes and fences).
     const target = azureEraseTarget(env, refuse);
     await azureErasePreflight(target, s3cfg.keyRoot, refuse, overrides.preflight);

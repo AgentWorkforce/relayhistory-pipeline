@@ -45,7 +45,7 @@ function env(extra: Record<string, string | undefined> = {}): NodeJS.ProcessEnv 
     OPERATOR_USER_ERASE_ENABLED: "1", LOCKER_PROVIDER: "azure",
     LOCKER_AZURE_ACCOUNT: "fxacct", LOCKER_BUCKET: "fx-container", LOCKER_ENDPOINT: FAKE_ENDPOINT,
     SESSION_ERASE_AZURE_ACCOUNT: "fxacct", SESSION_ERASE_AZURE_CONTAINER: "fx-container", SESSION_ERASE_AZURE_ENDPOINT: FAKE_ENDPOINT,
-    SESSION_ERASE_AZURE_ACCOUNT_KEY_FILE: keyFile, SESSION_ERASE_KEY_ROOT: ROOT, ...extra,
+    SESSION_ERASE_AZURE_ACCOUNT_KEY_FILE: keyFile, SESSION_ERASE_KEY_ROOT: ROOT, INGEST_KEY_ROOT: ROOT, ...extra,
   };
   for (const k of Object.keys(e)) if (e[k] === undefined) delete e[k];
   return e as NodeJS.ProcessEnv;
@@ -115,6 +115,8 @@ describe("per-user erase on azure", () => {
     const cases: [Record<string, string | undefined>, FakeAzureOptions, string][] = [
       [{ LOCKER_BUCKET: "fx-other-container" }, {}, "azure_target_not_writer_store"],
       [{ SESSION_ERASE_S3_BUCKET: "fx-bucket" }, {}, "azure_s3_settings_conflict"],
+      [{ INGEST_KEY_ROOT: undefined }, {}, "azure_writer_key_root_missing"],
+      [{ INGEST_KEY_ROOT: "fx-other-root" }, {}, "azure_key_root_not_writer"],
       [{}, { versioning: false }, "azure_blob_not_versioned"],
       [{}, { softDelete: true, permanentDelete: false }, "azure_blob_soft_delete_retained"],
     ];
@@ -136,6 +138,16 @@ describe("per-user erase on azure", () => {
       const e = await runUserEraseMain(env(), () => JSON.stringify(good), ports(fake)).catch((x) => x);
       expect([method, exit === 2 ? codeOf(e) : errorEvent(e).error, exitCodeForError(e)]).toEqual([method, want, exit]);
     }
+  });
+
+  test("SESSION_ERASE_DRY_RUN=1 is refused on azure (the per-user erase has no dry run) before any request, probe or SQL", async () => {
+    const fake = seed();
+    const db = fakeDb();
+    let probes = 0;
+    const e = await runUserEraseMain(env({ SESSION_ERASE_DRY_RUN: "1" }), () => JSON.stringify(good), {
+      ...ports(fake, db), preflight: { probe: async () => { probes++; return "Enabled"; } },
+    }).catch((x) => x);
+    expect([codeOf(e), exitCodeForError(e), probes, fake.requests.length, db.seen]).toEqual(["dry_run_unsupported", 2, 0, 0, []]);
   });
 
   test("a refusal AFTER begin (user already revoked and fenced): fix the account, rerun the SAME request, it resumes and verifies", async () => {

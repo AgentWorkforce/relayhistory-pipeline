@@ -45,7 +45,7 @@ function env(extra: Record<string, string | undefined> = {}): NodeJS.ProcessEnv 
     SESSION_ERASE_BYTES_ENABLED: "1", LOCKER_PROVIDER: "azure",
     LOCKER_AZURE_ACCOUNT: "fxacct", LOCKER_BUCKET: "fx-container", LOCKER_ENDPOINT: FAKE_ENDPOINT,
     SESSION_ERASE_AZURE_ACCOUNT: "fxacct", SESSION_ERASE_AZURE_CONTAINER: "fx-container", SESSION_ERASE_AZURE_ENDPOINT: FAKE_ENDPOINT,
-    SESSION_ERASE_AZURE_ACCOUNT_KEY_FILE: keyFile, SESSION_ERASE_KEY_ROOT: ROOT, ...extra,
+    SESSION_ERASE_AZURE_ACCOUNT_KEY_FILE: keyFile, SESSION_ERASE_KEY_ROOT: ROOT, INGEST_KEY_ROOT: ROOT, ...extra,
   };
   for (const k of Object.keys(e)) if (e[k] === undefined) delete e[k];
   return e as NodeJS.ProcessEnv;
@@ -185,6 +185,11 @@ describe("refusals before any destructive work", () => {
       [{ SESSION_ERASE_AZURE_ACCOUNT_KEY: KEY }, "azure_account_key_plaintext"],
       [{ SESSION_ERASE_AZURE_ACCOUNT_KEY_FILE: undefined }, "azure_account_key_missing"],
       [{ SESSION_ERASE_AZURE_CONTAINER: "Fx_Bad" }, "azure_container_invalid"],
+      // The writer's key root, exactly: required explicitly, and the erase root must equal it.
+      [{ INGEST_KEY_ROOT: undefined }, "azure_writer_key_root_missing"],
+      [{ INGEST_KEY_ROOT: "fx-other-root" }, "azure_key_root_not_writer"],
+      [{ INGEST_KEY_ROOT: "fx root" }, "azure_writer_key_root_invalid"],
+      [{ SESSION_ERASE_KEY_ROOT: "fx-other-root" }, "azure_key_root_not_writer"],
     ];
     for (const [extra, want] of cases) {
       const fake = seed();
