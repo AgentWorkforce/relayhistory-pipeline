@@ -158,6 +158,11 @@ export interface SessionPipelineInputs {
    */
   pointerSkipOriginBucket?: boolean;
   /**
+   * Default unset (60 s). An integer 1-900 renders SESSION_PIPELINE_BUSY_REQUEUE_DELAY_SECONDS: the SQS delay before
+   * a search pass that found its session held by another pass (scope_busy) runs again. Every other requeue keeps 60 s.
+   */
+  busyRequeueDelaySeconds?: number;
+  /**
    * Lambda concurrency cap from the queue (2-30). Default 4. The upper bound exists because each
    * concurrent invocation can hold up to HOOPDB_POOL_MAX (4, set below) database connections, so
    * 30 means up to 120 connections from this function alone: check the pooler's pool size first. It is also capped in practice by the
@@ -338,7 +343,7 @@ export function assertSessionPipelineInputs(p: unknown, refuse: (why: string) =>
     refuse("transcriptStore.sessionPipeline must be a plain object");
   const v = p as Record<string, unknown>;
   for (const k of Object.keys(v))
-    if (k !== "searchIndex" && k !== "replayPages" && k!=="analysisCache" && k !== "legacyReadSource" && k !== "desktopCatalog" && k !== "maxConcurrency" && k !== "deliveryDelaySeconds" && k !== "batchingWindowSeconds" && k !== "reconcileMinutes" && k !== "briefs" && k !== "semanticCopy" && k !== "analysisJobs" && k !== "bufferedSearchFeed" && k !== "bufferedErasureDelete" && k !== "neonExit" && k !== "relayfacts" && k !== "schedules" && k !== "streamReconcile" && k !== "summaryRegen" && k !== "skipCurrent" && k !== "searchPreRead" && k !== "pointerPreRead" && k !== "pointerSkipOriginBucket") refuse(`transcriptStore.sessionPipeline.${k} is not a known setting`);
+    if (k !== "searchIndex" && k !== "replayPages" && k!=="analysisCache" && k !== "legacyReadSource" && k !== "desktopCatalog" && k !== "maxConcurrency" && k !== "deliveryDelaySeconds" && k !== "batchingWindowSeconds" && k !== "reconcileMinutes" && k !== "briefs" && k !== "semanticCopy" && k !== "analysisJobs" && k !== "bufferedSearchFeed" && k !== "bufferedErasureDelete" && k !== "neonExit" && k !== "relayfacts" && k !== "schedules" && k !== "streamReconcile" && k !== "summaryRegen" && k !== "skipCurrent" && k !== "searchPreRead" && k !== "pointerPreRead" && k !== "pointerSkipOriginBucket" && k !== "busyRequeueDelaySeconds") refuse(`transcriptStore.sessionPipeline.${k} is not a known setting`);
   if (v.searchIndex !== undefined && typeof v.searchIndex !== "boolean") refuse("transcriptStore.sessionPipeline.searchIndex must be a boolean");
   if (v.replayPages !== undefined && typeof v.replayPages !== "boolean") refuse("transcriptStore.sessionPipeline.replayPages must be a boolean");
   if(v.analysisCache!==undefined&&typeof v.analysisCache!=="boolean")refuse("transcriptStore.sessionPipeline.analysisCache must be a boolean");
@@ -362,6 +367,7 @@ export function assertSessionPipelineInputs(p: unknown, refuse: (why: string) =>
   if (v.searchPreRead === true && v.searchIndex !== true) refuse("transcriptStore.sessionPipeline.searchPreRead requires searchIndex: true");
   if (v.pointerPreRead !== undefined && typeof v.pointerPreRead !== "boolean") refuse("transcriptStore.sessionPipeline.pointerPreRead must be a boolean");
   if (v.pointerSkipOriginBucket !== undefined && typeof v.pointerSkipOriginBucket !== "boolean") refuse("transcriptStore.sessionPipeline.pointerSkipOriginBucket must be a boolean");
+  if (v.busyRequeueDelaySeconds !== undefined && (typeof v.busyRequeueDelaySeconds !== "number" || !Number.isInteger(v.busyRequeueDelaySeconds) || v.busyRequeueDelaySeconds < 1 || v.busyRequeueDelaySeconds > 900)) refuse("transcriptStore.sessionPipeline.busyRequeueDelaySeconds must be an integer 1-900");
   // SEARCH_INDEX_ENABLED=1 must never activate the desktop catalog writer; its own flag waits on 031000.
   if (v.desktopCatalog === true) refuse("transcriptStore.sessionPipeline.desktopCatalog requires the forget/reproject fix (migration 20261105031000) and its review; not wired yet");
   if (v.maxConcurrency !== undefined && !(Number.isInteger(v.maxConcurrency) && (v.maxConcurrency as number) >= 2 && (v.maxConcurrency as number) <= 30))
@@ -727,6 +733,8 @@ export function sessionPipelineEnv(i: { stage: string; bucket: string; names: Se
     ...(i.p.pointerPreRead === true ? { SESSION_POINTER_PREREAD_ENABLED: "true" } : {}),
     // Only when armed: a stage without pointerSkipOriginBucket: true renders nothing and indexes h=_none/s=_origin as before.
     ...(i.p.pointerSkipOriginBucket === true ? { SESSION_POINTER_SKIP_ORIGIN_BUCKET_ENABLED: "true" } : {}),
+    // Only when set: a stage without busyRequeueDelaySeconds renders nothing and keeps the 60 s busy requeue.
+    ...(i.p.busyRequeueDelaySeconds !== undefined ? { SESSION_PIPELINE_BUSY_REQUEUE_DELAY_SECONDS: String(i.p.busyRequeueDelaySeconds) } : {}),
     // Only when armed: a stage without streamReconcile.enabled renders none of these and never streams.
     ...(i.p.streamReconcile?.enabled === true ? { SEARCH_INDEX_STREAMING_CH: "1" } : {}),
     ...(i.p.streamReconcile?.enabled === true && i.p.streamReconcile.maxReadBytes !== undefined ? { SEARCH_INDEX_STREAM_CH_MAX_READ_BYTES: String(i.p.streamReconcile.maxReadBytes) } : {}),
@@ -891,6 +899,30 @@ export const sessionPipelineFunction = (i: SessionPipelineStageInputs & { bucket
     return yield* AWS.Lambda.Function("session-pipeline", sessionPipelineFunctionProps(i) as never);
   });
 
+/**
+ * The session-events queue's timing props, exactly as the wiring passes them: delivery delay (deliveryDelaySeconds,
+ * default DELIVERY_DELAY_SECONDS) and the visibility timeout (fixed).
+ */
+export function sessionEventsQueueTiming(p: Pick<SessionPipelineInputs, "deliveryDelaySeconds">) {
+  return {
+    delay: `${p.deliveryDelaySeconds ?? DELIVERY_DELAY_SECONDS} seconds`,
+    visibilityTimeout: `${VISIBILITY_TIMEOUT_SECONDS} seconds`,
+  };
+}
+
+/**
+ * The session-events mapping's batching props, exactly as the wiring passes them: batch size 10 and per-item
+ * failures (ReportBatchItemFailures) always; the batching window (default 20 s) and concurrency (default 4) per stage.
+ */
+export function sessionEventsMappingTiming(p: Pick<SessionPipelineInputs, "batchingWindowSeconds" | "maxConcurrency">) {
+  return {
+    batchSize: 10,
+    maximumBatchingWindow: `${p.batchingWindowSeconds ?? 20} seconds`,
+    functionResponseTypes: ["ReportBatchItemFailures"],
+    scalingConfig: { MaximumConcurrency: p.maxConcurrency ?? 4 },
+  };
+}
+
 /** Step 2, after the bucket: queues, secret, mapping, schedule, alarms. */
 export const sessionPipelineWiring = (
   i: SessionPipelineStageInputs & { bucketArn: string; fn: { functionName: unknown; functionArn: unknown; roleArn: unknown }; uploadQueueArn?: string },
@@ -907,8 +939,7 @@ export const sessionPipelineWiring = (
     } as never);
     const queue = yield* AWS.SQS.Queue("session-events", {
       queueName: names.queue,
-      delay: `${i.p.deliveryDelaySeconds ?? DELIVERY_DELAY_SECONDS} seconds`,
-      visibilityTimeout: `${VISIBILITY_TIMEOUT_SECONDS} seconds`,
+      ...sessionEventsQueueTiming(i.p),
       messageRetentionPeriod: "4 days",
       receiveMessageWaitTime: "20 seconds",
       sqsManagedSseEnabled: true,
@@ -927,10 +958,7 @@ export const sessionPipelineWiring = (
     const mapping = yield* AWS.Lambda.EventSourceMapping("session-events-mapping", {
       functionName: i.fn.functionName as unknown as string,
       eventSourceArn: queue.queueArn as unknown as string,
-      batchSize: 10,
-      maximumBatchingWindow: `${i.p.batchingWindowSeconds ?? 20} seconds`,
-      functionResponseTypes: ["ReportBatchItemFailures"],
-      scalingConfig: { MaximumConcurrency: i.p.maxConcurrency ?? 4 },
+      ...sessionEventsMappingTiming(i.p),
       enabled: true,
       tags: i.tags("session-pipeline"),
     } as never);

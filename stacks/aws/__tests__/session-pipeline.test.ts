@@ -6,6 +6,8 @@ import { fileURLToPath } from "node:url";
 import type { AwsInputs } from "../inputs.ts";
 import {
   DELIVERY_DELAY_SECONDS,
+  sessionEventsMappingTiming,
+  sessionEventsQueueTiming,
   FUNCTION_TIMEOUT_SECONDS,
   SESSION_BRIEF_RESOURCES,
   SESSION_ANALYSIS_CACHE_RESOURCES,
@@ -39,7 +41,7 @@ import { assertTranscriptStoreInputs, assertTranscriptStorePlanContract, transcr
 import { bufferedFeedConfig, bufferedFeedGateRefusal, BUFFERED_SEARCH_GATE_CONTRACT } from "../../../src/session-pipeline/buffered-search-feed.ts";
 import { bufferedErasureConfig } from "../../../src/session-pipeline/buffered-erasure-delete.ts";
 import { searchIndexLimits, searchIndexStreamChFromEnv, searchIndexStreamFloor, SEARCH_INDEX_STREAM_CH_CEILING } from "../../../src/session-pipeline/search-index.ts";
-import { lambdaEnv, pointerPreReadFromEnv, pointerSkipOriginBucketFromEnv, searchIndexPreReadFromEnv, searchIndexSkipCurrentFromEnv } from "../../../src/session-pipeline/lambda.ts";
+import { busyRequeueDelayFromEnv, lambdaEnv, pointerPreReadFromEnv, pointerSkipOriginBucketFromEnv, searchIndexPreReadFromEnv, searchIndexSkipCurrentFromEnv } from "../../../src/session-pipeline/lambda.ts";
 import { NeonExitRefusal } from "../../../src/shared/neon-exit.ts";
 import { analysisConfig } from "../../../src/session-analysis/worker.ts";
 
@@ -1094,6 +1096,53 @@ describe("session pipeline: pointer skips the sessionless per-origin bucket (SES
   });
   it("a non-boolean is refused", () => {
     for (const bad of ["true", 1, null, {}]) expect(refusedBy({ pointerSkipOriginBucket: bad })).toMatch(/pointerSkipOriginBucket must be a boolean/);
+  });
+});
+
+describe("session pipeline: queue and mapping timing props (as the wiring passes them)", () => {
+  const props = (p: SessionPipelineInputs) => ({ ...sessionEventsQueueTiming(p), ...sessionEventsMappingTiming(p) });
+  const fixed = { batchSize: 10, functionResponseTypes: ["ReportBatchItemFailures"], visibilityTimeout: "1800 seconds" };
+  it("omitted and explicit defaults render 30 s / 20 s / 4", () => {
+    for (const p of [{}, { deliveryDelaySeconds: 30, batchingWindowSeconds: 20, maxConcurrency: 4 }] as SessionPipelineInputs[])
+      expect(props(p)).toEqual({ ...fixed, delay: "30 seconds", maximumBatchingWindow: "20 seconds", scalingConfig: { MaximumConcurrency: 4 } });
+  });
+  it("explicit zeros render zero, never the default", () => {
+    expect(props({ deliveryDelaySeconds: 0, batchingWindowSeconds: 0, maxConcurrency: 2 }))
+      .toEqual({ ...fixed, delay: "0 seconds", maximumBatchingWindow: "0 seconds", scalingConfig: { MaximumConcurrency: 2 } });
+  });
+  it("the proposed values and the upper edges render exactly", () => {
+    expect(props({ deliveryDelaySeconds: 5, batchingWindowSeconds: 2, maxConcurrency: 30 }))
+      .toEqual({ ...fixed, delay: "5 seconds", maximumBatchingWindow: "2 seconds", scalingConfig: { MaximumConcurrency: 30 } });
+    expect(props({ deliveryDelaySeconds: 900, batchingWindowSeconds: 300, maxConcurrency: 30 }))
+      .toEqual({ ...fixed, delay: "900 seconds", maximumBatchingWindow: "300 seconds", scalingConfig: { MaximumConcurrency: 30 } });
+  });
+  it("the busy requeue delay is independent of the queue timing", () => {
+    expect(props({ busyRequeueDelaySeconds: 10 })).toEqual(props({}));
+  });
+  it("the wiring uses these helpers, not inline values", async () => {
+    const src = await Bun.file(new URL("../session-pipeline.ts", import.meta.url)).text();
+    expect(src).toContain("...sessionEventsQueueTiming(i.p),");
+    expect(src).toContain("...sessionEventsMappingTiming(i.p),");
+    expect(src.match(/maximumBatchingWindow:/g)?.length).toBe(1);
+    expect(src.match(/delay: `\$\{/g)?.length).toBe(1);
+  });
+});
+
+describe("session pipeline: busy requeue delay (SESSION_PIPELINE_BUSY_REQUEUE_DELAY_SECONDS)", () => {
+  const envOf = (cfg: SessionPipelineInputs) => sessionPipelineEnv({ stage: STAGE, bucket: t.bucket, names: p, p: cfg });
+  const refusedBy = (v: unknown) => { let why = ""; try { assertSessionPipelineInputs(v, (w: string) => { throw new Error(w); }); } catch (e) { why = (e as Error).message; } return why; };
+  it("unset renders nothing (60 s); a value renders exactly that key; the Lambda parses it", () => {
+    const base = Object.keys(envOf({})).sort();
+    expect(base).not.toContain("SESSION_PIPELINE_BUSY_REQUEUE_DELAY_SECONDS");
+    expect(busyRequeueDelayFromEnv(envOf({}))).toBe(60);
+    expect(refusedBy({ busyRequeueDelaySeconds: 10 })).toBe("");
+    const env = envOf({ busyRequeueDelaySeconds: 10 });
+    expect(Object.keys(env).sort()).toEqual([...base, "SESSION_PIPELINE_BUSY_REQUEUE_DELAY_SECONDS"].sort());
+    expect(env.SESSION_PIPELINE_BUSY_REQUEUE_DELAY_SECONDS).toBe("10");
+    expect(busyRequeueDelayFromEnv(env)).toBe(10);
+  });
+  it("anything but an integer 1-900 is refused", () => {
+    for (const bad of [0, 901, 10.5, -1, "10", null, true]) expect(refusedBy({ busyRequeueDelaySeconds: bad })).toMatch(/busyRequeueDelaySeconds must be an integer 1-900/);
   });
 });
 
