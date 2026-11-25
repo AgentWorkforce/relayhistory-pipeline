@@ -308,6 +308,18 @@ export function isPagedEraser(e: unknown): e is PagedEraser {
   return !!e && typeof (e as PagedEraser).eraseStep === "function" && typeof (e as PagedEraser).verifyErased === "function";
 }
 
+/**
+ * A read-only existence check: true only when the key's CURRENT version exists and is not a delete marker. Used by
+ * the stale-prefix-only mode (job.ts) to prove a live sibling copy before an old prefix is erased.
+ */
+export interface LiveObjectProbe {
+  objectLive(key: string): Promise<boolean>;
+}
+
+export function isLiveObjectProbe(e: unknown): e is LiveObjectProbe {
+  return !!e && typeof (e as LiveObjectProbe).objectLive === "function";
+}
+
 export interface PreservedVersionEraser {
   /** Keep the current non-delete barrier version; permanently remove only older versions. */
   eraseObjectExcept(key: string, preservedVersionId: string): Promise<{ deleted: number; kept: number }>;
@@ -352,7 +364,7 @@ function assertInventoryXml(xml: string): void {
   if (stack.length || roots !== 1 || xml.slice(at).trim()) throw coded("erasure_inventory", "incomplete version inventory");
 }
 
-export function createS3Eraser(cfg: S3EraserConfig): Eraser & PreservedVersionEraser & PagedEraser {
+export function createS3Eraser(cfg: S3EraserConfig): Eraser & PreservedVersionEraser & PagedEraser & LiveObjectProbe {
   const doFetch = cfg.fetch ?? ((...a: Parameters<typeof fetch>) => fetch(...a));
   const url = (key = "") => {
     if (cfg.endpoint) {
@@ -507,6 +519,16 @@ export function createS3Eraser(cfg: S3EraserConfig): Eraser & PreservedVersionEr
       if (!prefix.endsWith("/")) throw coded("erasure_prefix_shape", "a prefix ends in /");
       return [...new Set((await versions(prefix)).map((v) => v.key))];
     },
+    // One strict ListObjectVersions page at the exact key (no GetObject/HeadObject grant needed). The exact key sorts
+    // first under its own prefix and S3 lists its versions newest first, so its IsLatest entry is on the first page.
+    objectLive: async (key) => {
+      if (!key || key.endsWith("/") || key.split("/").some((seg) => seg === "." || seg === ".."))
+        throw coded("erasure_key_shape", "an existence check names one object");
+      const page = await fetchPage(key);
+      checkPage(key, page, undefined, undefined, true);
+      const latest = page.entries.filter((v) => v.key === key && v.latest);
+      return latest.length === 1 && !latest[0]!.deleteMarker;
+    },
   };
 }
 
@@ -518,7 +540,7 @@ export function createS3Eraser(cfg: S3EraserConfig): Eraser & PreservedVersionEr
  * contract, NOT a bounded remote-store implementation and NOT evidence of a production budget
  * (the versioned S3 eraser issues one bounded, key-prefix ListObjectVersions request per page).
  */
-export function storeEraser(store: ObjectStore): Eraser & PagedEraser {
+export function storeEraser(store: ObjectStore): Eraser & PagedEraser & LiveObjectProbe {
   // Unversioned: one "null" version per key, pages of 1000 keys after the key marker.
   const fetchPage: PageFetcher = async (prefix, keyMarker) => {
     const items: { key: string; lastModified?: number }[] = [];
@@ -595,6 +617,11 @@ export function storeEraser(store: ObjectStore): Eraser & PagedEraser {
         cursor = page.nextCursor;
       } while (cursor);
       return keys;
+    },
+    async objectLive(key) {
+      if (!key || key.endsWith("/") || key.split("/").some((seg) => seg === "." || seg === ".."))
+        throw coded("erasure_key_shape", "an existence check names one object");
+      return !!(await store.head(objectKey(key)));
     },
   };
 }
