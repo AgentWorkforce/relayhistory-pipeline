@@ -143,7 +143,11 @@ Rollback (from C2), each step within the budget; the pool stays 3 throughout:
 | --- | --- | --- | --- |
 | R1 | `handoff: false` (URL removed). Search runs inline on the pointer path again at once. | 78 | 78 |
 | R2 | `mappingEnabled: false`, only after the drain below | 30 | 78 |
-| R3 | `maxConcurrency: 20` | 60 | 60 |
+| R3 | `maxConcurrency: 20` (the agreed rollback state) | 60 | 60 |
+
+Each stage rolls back to its agreed state, never to whatever ran before: the pointer cap's
+rollback is 20. A trial above the staged caps (for example an owner-approved 26) is not restored
+by this rollout; its own agreed rollback is 20, and the guard refuses any planned cap above 20.
 
 R1 is the fast rollback. Leave the search mapping enabled after it: records still in the search
 queue drain through it. With the URL unset they are `queue: "other"`, take the ordinary path
@@ -214,33 +218,54 @@ Consequences for this rollout:
   DLQ is the search DLQ; the mapping on the search queue for the pipeline function, with batch 10,
   partial batch responses, MaximumConcurrency 2-20 and `enabled: false`; the two alarms with
   `ActionsEnabled: false`.
-- **In place, while the search resources exist** (B, C1, C2, R1, R2, R3): exactly one staged change,
-  each read from the detailed plan as its whole old and new props (Alchemy prints a changed key's
-  old value `-` and its new value `+` among the unchanged lines) and pinned:
-  - B, R3: only `session-events-mapping`, only `scalingConfig.MaximumConcurrency` (2-20); old and
-    new are otherwise exactly its rendered props (the pipeline function, the events queue, batch
-    10, the 20 s window, partial batch responses, enabled).
-  - C1, R2: only `session-search-mapping`, only `enabled` and `MaximumConcurrency`; old and new are
-    otherwise exactly its rendered props on the search queue for the pipeline function.
+- **In place, while the search resources exist** (B, C1, C2, R1, R2, R3): a plan that touches a
+  search resource, the events mapping or the function is exactly one staged change, read from the
+  detailed plan as its whole old and new props (Alchemy prints a changed key's old value `-` and its
+  new value `+` among the unchanged lines), pinned, and compared with the verified live readback:
+  - B, R3: only `session-events-mapping`, only `scalingConfig.MaximumConcurrency`; old and new are
+    otherwise exactly its rendered props (the pipeline function, the events queue, batch 10, the
+    20 s window, partial batch responses, enabled). The plan's old cap must be the live cap (a stale
+    plan is refused); the live cap may be anything up to the account limit (1000, e.g. a trial at
+    26); the new cap must be within the staged 2-20.
+  - C1, R2: only `session-search-mapping`, only `enabled` and `MaximumConcurrency`, otherwise its
+    rendered props on the search queue for the pipeline function. The plan's old values must be
+    the live mapping's. R2 (disable) requires R1 first: the live env has no
+    `SESSION_PIPELINE_SEARCH_QUEUE_URL`.
   - C2, R1: `session-pipeline` with the role-ARN cascade of its grants (the search queue's policy
-    included), every non-env property unchanged, and the env changed by nothing (code only) or by
-    exactly one key, `SESSION_PIPELINE_SEARCH_QUEUE_URL`, added with this stage's search queue URL
-    or removed. Every other env key stays present and unchanged.
+    included) and no non-env property change. Both the planned old -> new env and the env after the
+    apply against the **live** env (Alchemy writes the planned env whole) may differ by exactly one
+    key, `SESSION_PIPELINE_SEARCH_QUEUE_URL`: added with this stage's search queue URL (C2) or
+    removed (R1). Any other key the live env lacks and the apply would add (a stale
+    `SESSION_PIPELINE_RETRY_VISIBILITY_S`, for example), or the reverse, is refused. C2 also
+    requires the live search mapping to exist, be enabled, and point at this queue and function.
   - Anything else is refused: a DLQ or alarm update, two of these in one plan, a function update
-    with a mapping change, any other resource.
-  - The budget is recomputed from the plan's new values over the effective live capacity (the
-    other mapping and the pool): the new configured demand and the apply's worst moment must both
-    be within 80.
+    with a mapping change, any other resource beside them. A plan whose search resources are all
+    noop and that touches neither the events mapping nor the function (a read API update, say) is
+    judged by its own phase as before.
+  - The budget is recomputed from the plan's new values over **every enabled mapping on the
+    function** in the live readback; the new configured demand and the apply's worst moment must
+    both be within 80 (26 + 16 at pool 3 is 126: refused).
+- **Verified live source state** (`verifiedLive`): the readback must be this stage's function; every
+  mapping on it stable (`Enabled` or `Disabled`, never `Creating`, `Updating`, `Enabling`,
+  `Disabling` or `Deleting`), targeting this function, one of the two this stack declares (an
+  unknown or duplicate mapping is refused: its connections would be outside the budget), with the
+  rendered settings and a MaximumConcurrency within the account limit; the events mapping enabled.
+- **Bound to the capture.** The capture records the live function's RevisionId, an env digest (never
+  the values) and every mapping's UUID, state and settings in the provenance (`pipelineLive`). The
+  deploy reads the live function again and refuses unless that fingerprint is unchanged: a hand
+  edit, another apply or a mapping change since the capture means capturing again.
+- **No readback, no in-place change**: every in-place deploy and capture of the split is refused
+  without the live readback.
 - **Every pipeline plan**: an events mapping update is pinned as in B; and a function update may not
   drop or silently overwrite a live variable: every key in the live env must be in the planned env
   with its live value, unless the plan itself visibly changes or removes that key.
-- **Live inputs.** The capture (`src/cli/aws-provenance-io.ts`) and the deploy
-  (`stacks/aws/alchemy.aws.run.ts`) both read the live function back first
-  (`stacks/aws/pipeline-live.ts`: `lambda get-function-configuration` and
-  `list-event-source-mappings`, read-only, held in memory, never written) and hand it to the guard.
-  The effective capacity is the live readback's; without it, the state snapshot's. A capture of an
-  in-place search change without the readback is refused. With neither (unit tests of the shape
-  alone) only the shapes are checked.
+- **The readback** (`stacks/aws/pipeline-live.ts`): `lambda get-function-configuration` and
+  `list-event-source-mappings`, read-only, held in memory. Empty output, unparseable output, a CLI
+  failure, a config without its name, RevisionId or env Variables, an `Environment.Error` (an env
+  the CLI could not read), a non-string value, another function's config and an incomplete mapping
+  are refused with fixed codes (`live_cli_failed`, `live_output_empty`, `live_parse_failed`,
+  `live_incomplete`, `live_env_error`, `live_wrong_function`). No CLI output, exception text or env
+  value is ever put in a message or log; guard refusals name env keys, never values.
 - A plan that lists only some search resources is refused; delete and replace are refused.
 
 ## Per-queue guards
@@ -294,7 +319,7 @@ Queue metrics (namespace `AWS/SQS`, dimension `QueueName`):
 | search age | `96bulls-<stage>-session-search` | `ApproximateAgeOfOldestMessage` max > 900 s, 3 x 5 min | `session-search-age-alarm` |
 | pointer DLQ depth | `96bulls-<stage>-session-events-dlq` | as above | `session-events-dlq-alarm` (existing) |
 | pointer age | `96bulls-<stage>-session-events` | as above | `session-events-age-alarm` (existing) |
-| drain before R2 | `96bulls-<stage>-session-search` | `ApproximateNumberOfMessagesVisible` and `ApproximateNumberOfMessagesNotVisible` both 0 | none |
+| drain before R2 | `96bulls-<stage>-session-search` | `ApproximateNumberOfMessagesVisible`, `ApproximateNumberOfMessagesNotVisible` and `ApproximateNumberOfMessagesDelayed` all 0, three polls 60 s apart | none |
 
 Like the existing alarms, the two new ones are created with `ActionsEnabled: false`. The Lambda
 `Errors` metric and alarm stay function-wide: an invocation error is not attributable to a queue
@@ -341,5 +366,5 @@ for an operator.
   provisioning only); production already has the pipeline.
 - The guard's in-place pins were exercised with update blocks generated in Alchemy's format (and the
   parser on the checked-in production plan), not with a real capture of B, C1 or C2.
-- The live readback is read again at deploy, but a change made by hand between that readback and
-  the apply itself is not seen.
+- The live readback is read again at deploy and compared with the capture's, but a change made by
+  hand between that readback and Alchemy's own API calls in the same run is not seen.
