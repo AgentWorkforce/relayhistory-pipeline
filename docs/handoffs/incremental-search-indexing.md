@@ -82,7 +82,8 @@ schedule claim.
 - **Hosted facts (read-only, 2026-11-25):**
   - `sessions.pipeline_jobs` is empty.
   - The Lambda connects as the runtime role, which holds SELECT/INSERT/UPDATE/DELETE on `pipeline_jobs` (granted by
-    the migrator, `src/hoopdb/migrate-guards.ts:282`; verified with `has_table_privilege`).
+    the migrator, `src/hoopdb/migrate-guards.ts:282`; verified with `has_table_privilege`). For `search-index` rows
+    that DML is refused by the queue guard; the consumer goes through the two SECURITY DEFINER RPCs (§3.2, §3.3).
   - The Lambda's fan-out is `droppedFanout` unless `PIPELINE_FANOUT=postgres` (`lambda.ts:481`).
   - There are about 600 live tenants (org × workspace).
 
@@ -189,13 +190,42 @@ DO UPDATE SET
 
 ### 3.2 Claim
 
-The generic claim (`queue.ts:229-241`) with `stage = 'search-index'`, unchanged. The claimer records the epoch it
-read from `message.payload.epoch` at claim time: `claimed_epoch`.
+[least privilege] The claim is `sessions.claim_search_jobs_v1(p_limit integer)`, SECURITY DEFINER,
+`SET search_path = pg_catalog, pg_temp`, every relation schema-qualified. It takes only a page size and applies
+server policy:
+
+- the limit is clamped to 1..10; it claims only `stage = 'search-index' AND NOT dlq AND visible_at <= now()`,
+  `FOR UPDATE SKIP LOCKED`;
+- it counts the attempt and sets a fresh lease of the server's 300 s;
+- it upserts the **claim receipt** and returns the STORED receipt `(job_id, lease_id, message, epoch, attempts)`.
+
+**The claim receipt** is `sessions.search_job_claims (job_id PRIMARY KEY, lease_id, claimed_epoch, claimed_message,
+claimed_attempts, claimed_at, lease_until)`: owner-only (REVOKE ALL from PUBLIC, anon, authenticated and service_role;
+no grant), one row per leased job. A reclaim after expiry replaces it; every settlement deletes it in the settling
+transaction. The receipt's attempt follows an owner-side raise of the leased row's attempts and survives a newer wake's
+budget reset on the leased row (§3.4: N leased at attempt 12, wake N+1, N exhausts).
 
 ### 3.3 Settlement
 
 A stage-specific settlement, in the Lambda's search-job loop; not the generic one. The generic DELETE on `done` would
 lose a follow-up wake that arrived during the pass. Each statement keys on `(id, lease_id)`.
+
+[least privilege] The settlement is `sessions.settle_search_job_v1(p_job_id bigint, p_lease uuid, p_outcome text)`,
+SECURITY DEFINER with the same pinned search_path, returning `{applied, action}`. The SQL below is its body; the
+caller supplies no epoch, message, attempt, scope or delay:
+
+- outcomes are allowlisted: `done` | `retry` (anything else raises 22023). `exhausted` is not a caller outcome: the
+  server exhausts a `retry` at its max attempts (12) and backs off `min(900, 30 * 2^(attempt-1))` s otherwise;
+- it loads the job row and the receipt `FOR UPDATE` and requires `stage = 'search-index'`, the row's lease and the
+  receipt's lease both equal to `p_lease`, and the lease unexpired (`visible_at > now()` and `lease_until > now()`).
+  Otherwise it returns `{applied: false}` and changes nothing (lost, expired or replaced lease, another stage's id,
+  a duplicate settlement);
+- `$claimed_epoch`, `$claimed_msg` and the attempt below come ONLY from the receipt. So a lease holder cannot submit
+  N+1 as its claimed epoch (and delete later work), or park a fabricated message;
+- the letter id is computed in SQL from the receipt's message (`sessions.search_letter_id_v1`, dlq.ts `deadLetterId`
+  byte for byte, parity-tested);
+- the row change, the receipt delete, the letter (park or §3.3b resolution) and the `pipeline_events` audit row are
+  one transaction.
 
 - **done:**
   ```sql
@@ -377,7 +407,14 @@ Tests R3a-R3d.
 
 ### 5.2 Surfaces (infra and config, each needing a go)
 
-- **DB role:** none new. The runtime role already holds the needed privileges on `pipeline_jobs` (verified).
+- **DB role and boundary:** no new role. The runtime role's only stage surface is EXECUTE on
+  `sessions.claim_search_jobs_v1` and `sessions.settle_search_job_v1` (granted to service_role in migration
+  20261105062300 and mirrored onto the runtime role by the migrator, RUNTIME_APPLICATION_FUNCTIONS). It needs no
+  search-index row DML: the queue guard refuses search-index writes from anyone but the schema owner, and the claim
+  receipts are owner-only.
+- **Operator-only, never runtime:** replay (`replaySearchDeadLetter`), catch-up (`catchUpTick`) and park
+  (`parkSearchJobs`) are owner-run TypeScript over the guarded queue (owner credentials); the archive is
+  `archive_search_stage_v1()`, EXECUTE to service_role only. A future scheduled catch-up needs its own scoped grant.
 - **Migration:** §7.
 - **Stack** (`stacks/aws/session-pipeline.ts`):
   - the new rule `session-search-jobs-schedule` (rate 1 min), its Lambda permission, and a stage setting
@@ -453,10 +490,10 @@ CREATE UNIQUE INDEX search_stage_archive_one_manifest ON sessions.search_stage_a
 -- schema owner, SET search_path = pg_catalog, pg_temp. It performs §8's whole archive (lock, refusals, insert rows
 -- and manifest, delete) in one transaction, so no role can append to a completed batch or forge one.
 -- Cleanup is a separate, explicitly approved owner migration.
-REVOKE ALL ON sessions.search_stage_archive FROM PUBLIC;
-GRANT SELECT ON sessions.search_stage_archive TO <runtime role>;
+REVOKE ALL ON sessions.search_stage_archive FROM PUBLIC, anon, authenticated, service_role;
+GRANT SELECT ON sessions.search_stage_archive TO service_role;
 REVOKE ALL ON FUNCTION sessions.archive_search_stage_v1() FROM PUBLIC;
-GRANT EXECUTE ON FUNCTION sessions.archive_search_stage_v1() TO <runtime role>;   -- archiveSearchStage calls it
+GRANT EXECUTE ON FUNCTION sessions.archive_search_stage_v1() TO service_role;   -- operator only, never the runtime role
 ```
 
 **TypeScript** (`packages/pipeline/src/lib/pipeline/` unless a path is given):
@@ -560,7 +597,8 @@ promise of replay, so the two cannot coexist with a down migration.
   (`ok` / `retrying` / `dead_lettered` / `replayed` / `skipped`), so a used stage always has events. That is why
   the down precondition needs the archive.
 - The down migration takes `LOCK TABLE … SHARE ROW EXCLUSIVE` on all three, checks all three counts are 0,
-  refuses otherwise, then drops the index and the cursor table and restores the three CHECKs.
+  refuses otherwise, then drops the runtime RPCs (claim and settle), the claim-receipt table, the index and the
+  cursor table and restores the three CHECKs. It keeps the sealed archive.
 - **Tests:**
   - R9a: after a park, down REFUSES (letters exist; events > 0 from the park's `dead_lettered` rows);
   - R9g [rev 8]: each guard on its own: job-only gives false; letter-only gives false; event-only gives false; all
@@ -577,7 +615,14 @@ promise of replay, so the two cannot coexist with a down migration.
   - R9e [rev 8]: an archived row cannot be updated or deleted by the runtime role (append-only);
   - R9f [rev 9]: a direct INSERT by a non-owner role (an append to a completed batch, or a forged batch) is refused
     with 42501; `archive_search_stage_v1` is SECURITY DEFINER with a pinned search_path, owned by the archive's
-    owner, with no PUBLIC execute and runtime EXECUTE; every non-owner holds SELECT only on the table.
+    owner, with no PUBLIC execute and service_role (operator) EXECUTE only, never the runtime role; every non-owner
+    holds SELECT only on the table.
+  - Least privilege (search-jobs-definer.pglite.test.ts, and search-jobs-definer.postgres.test.ts on a real server):
+    an unprivileged LOGIN with no membership and only EXECUTE on claim and settle claims and settles; an expired or
+    replaced lease, another stage's id, a duplicate settlement and a forged outcome (22023) change nothing; a
+    forged epoch or message has no effect (the receipt decides); a settlement error rolls back whole; direct
+    search-job or receipt DML, TRUNCATE, replay, catch-up, park and archive give 42501, also with the runtime role's
+    own table privileges.
 
 ## 9. Production steps (each needs its own go, one at a time)
 
