@@ -62,6 +62,7 @@
     "scripts/sessions-function-boundary",
     "scripts/opensearch-proof",
     "scripts/buffered-drain.ts",
+    "scripts/dlq-resend.ts",
     "scripts/accepted-stage-export.ts",
     "scripts/upload-fence-backfill.ts",
     "scripts/backlog-ops.ts",
