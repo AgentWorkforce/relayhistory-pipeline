@@ -18,10 +18,26 @@ describe("user-erase entry", () => {
 
   test("disabled: returns before reading the request, any config or credential", async () => {
     let read = false;
-    const r = await runUserEraseMain({}, () => { read = true; return "{}"; });
+    const r = await runUserEraseMain({ SESSION_ERASE_DRY_RUN: "1" }, () => { read = true; return "{}"; });
     expect(r).toEqual({ enabled: false });
     expect(read).toBe(false);
     expect(exitCodeForResult(r)).toBe(0);
+  });
+
+  test("an enabled S3 or default user erase refuses dry-run before config, request, eraser or SQL", async () => {
+    for (const provider of [undefined, "s3"]) {
+      const e = await runUserEraseMain(
+        { OPERATOR_USER_ERASE_ENABLED: "1", LOCKER_PROVIDER: provider, SESSION_ERASE_DRY_RUN: "1" },
+        () => { throw Error("unexpected request read"); },
+        {
+          eraser: () => { throw Error("unexpected eraser construction"); },
+          db: { query: async () => { throw Error("unexpected SQL"); } },
+        },
+      ).catch((error: unknown) => error);
+      expect(e).toBeInstanceOf(UserEraseRefused);
+      expect(errorEvent(e)).toEqual({event: "user_erase", error: "dry_run_unsupported"});
+      expect(exitCodeForError(e)).toBe(2);
+    }
   });
 
   test("request: exact keys, the confirmation phrase, well-formed ids; values never echoed", () => {
@@ -124,7 +140,7 @@ describe("user-erase relayfacts step (20261105062100, SUMMARY_DECISION_RECORDS_E
   });
 
   test("flag off: no SQL names relayfacts, no relayfacts key in the result, no relayfacts log event", async () => {
-    for (const env of [ENV, { ...ENV, SUMMARY_DECISION_RECORDS_ENABLED: "1" }, { ...ENV, SUMMARY_DECISION_RECORDS_ENABLED: "TRUE" }]) {
+    for (const env of [ENV, { ...ENV, LOCKER_PROVIDER: "s3", SESSION_ERASE_DRY_RUN: "0" }, { ...ENV, SUMMARY_DECISION_RECORDS_ENABLED: "1" }, { ...ENV, SUMMARY_DECISION_RECORDS_ENABLED: "TRUE" }]) {
       const db = fakeDb(), logs: Record<string, unknown>[] = [];
       const r = await run(env, db, logs);
       expect(db.seen.some((q) => /relayfacts/i.test(q.text))).toBe(false);
