@@ -135,6 +135,10 @@ stays off there (decision records are refused until the operator-erase slice). `
 (`provider_unsupported`) until their versioned erasers land (S3), and any other value is refused
 (`provider_invalid`). Full contract: [session-analysis-runner.md](session-analysis-runner.md#azure-blob-slice-s2).
 
+On `LOCKER_PROVIDER=azure`, both operator erase Jobs and the in-service erase worker erase Azure Blob
+(`SESSION_ERASE_AZURE_*`, the writer store exactly, `INGEST_KEY_ROOT` explicit in the Jobs, a data-plane preflight
+before any erase; [operator-session-erase-selfhost-eraser.md, Azure Blob](operator-session-erase-selfhost-eraser.md#azure-blob-locker_providerazure)).
+
 ### `SERVICE=session-erase-bytes`
 
 The self-host per-session byte eraser
