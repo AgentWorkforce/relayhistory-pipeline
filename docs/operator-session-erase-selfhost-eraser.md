@@ -267,7 +267,8 @@ erase outstanding.
 
 **Proof.** The fake-server tests cover every path: `selfhost-eraser-azure`, `user-erase-azure` and
 `selfhost-runtime-azure`. Azurite (pg-proof) covers the versioned erase end to end and the unversioned refusal.
-Azurite has no soft delete, and **a run against a real Azure storage account is still owed.**
+Azurite has no soft delete, and **a run against a real Azure storage account is still owed**; the plan is
+[azure-real-account-proof.md](azure-real-account-proof.md).
 
 ## Limits
 

@@ -287,7 +287,7 @@ Specific to this Job:
   resumes. Do not start a new request, and do not undo the revoke.
 - The relayfacts step (`SUMMARY_DECISION_RECORDS_ENABLED=true`) runs as on S3, before `begin`. The session-analysis
   runner still refuses decision records on Azure (`azure_decision_records_unsupported`). Lifting that refusal is a
-  separate decision, and it needs a real-Azure run of this Job.
+  separate decision, and it needs a real-Azure run of this Job ([azure-real-account-proof.md](azure-real-account-proof.md)).
 
 ## Before the first production run
 
