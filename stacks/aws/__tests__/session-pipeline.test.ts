@@ -234,9 +234,9 @@ describe("session pipeline: inputs", () => {
     expect(() => validate(withPipeline({ searchIndex: true, replayPages: false, maxConcurrency: 4, reconcileMinutes: 30 }))).not.toThrow(/sessionPipeline/);
     expect(() => validate(withPipeline({ queue: "x" }))).toThrow(/sessionPipeline.queue is not a known setting/);
     expect(() => validate(withPipeline({ maxConcurrency: 50 }))).toThrow(/maxConcurrency/);
-    for (const ok of [2, 10, 20, 30]) expect(() => validate(withPipeline({ maxConcurrency: ok }))).not.toThrow(/sessionPipeline/);
-    for (const bad of [1, 31, 4.5, "4", 0, -4, Number.NaN])
-      expect(() => validate(withPipeline({ maxConcurrency: bad }))).toThrow("transcriptStore.sessionPipeline.maxConcurrency must be an integer from 2 to 30");
+    for (const ok of [2, 10, 20]) expect(() => validate(withPipeline({ maxConcurrency: ok }))).not.toThrow(/sessionPipeline/);
+    for (const bad of [1, 21, 30, 4.5, "4", 0, -4, Number.NaN])
+      expect(() => validate(withPipeline({ maxConcurrency: bad }))).toThrow("transcriptStore.sessionPipeline.maxConcurrency must be an integer from 2 to 20");
     // Queue delivery delay and ESM batching window: unset keeps 30 s / 20 s; integers in range only.
     for (const ok of [0, 2, 5, 30, 900]) expect(() => validate(withPipeline({ deliveryDelaySeconds: ok }))).not.toThrow(/sessionPipeline/);
     for (const bad of [-1, 901, 2.5, "5", Number.NaN])
@@ -1111,10 +1111,10 @@ describe("session pipeline: queue and mapping timing props (as the wiring passes
       .toEqual({ ...fixed, delay: "0 seconds", maximumBatchingWindow: "0 seconds", scalingConfig: { MaximumConcurrency: 2 } });
   });
   it("the proposed values and the upper edges render exactly", () => {
-    expect(props({ deliveryDelaySeconds: 5, batchingWindowSeconds: 2, maxConcurrency: 30 }))
-      .toEqual({ ...fixed, delay: "5 seconds", maximumBatchingWindow: "2 seconds", scalingConfig: { MaximumConcurrency: 30 } });
-    expect(props({ deliveryDelaySeconds: 900, batchingWindowSeconds: 300, maxConcurrency: 30 }))
-      .toEqual({ ...fixed, delay: "900 seconds", maximumBatchingWindow: "300 seconds", scalingConfig: { MaximumConcurrency: 30 } });
+    expect(props({ deliveryDelaySeconds: 5, batchingWindowSeconds: 2, maxConcurrency: 20 }))
+      .toEqual({ ...fixed, delay: "5 seconds", maximumBatchingWindow: "2 seconds", scalingConfig: { MaximumConcurrency: 20 } });
+    expect(props({ deliveryDelaySeconds: 900, batchingWindowSeconds: 300, maxConcurrency: 20 }))
+      .toEqual({ ...fixed, delay: "900 seconds", maximumBatchingWindow: "300 seconds", scalingConfig: { MaximumConcurrency: 20 } });
   });
   it("the busy requeue delay is independent of the queue timing", () => {
     expect(props({ busyRequeueDelaySeconds: 10 })).toEqual(props({}));

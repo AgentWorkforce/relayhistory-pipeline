@@ -163,9 +163,10 @@ export interface SessionPipelineInputs {
    */
   busyRequeueDelaySeconds?: number;
   /**
-   * Lambda concurrency cap from the queue (2-30). Default 4. The upper bound exists because each
+   * Lambda concurrency cap from the queue (2-20). Default 4. The upper bound exists because each
    * concurrent invocation can hold up to HOOPDB_POOL_MAX (4, set below) database connections, so
-   * 30 means up to 120 connections from this function alone: check the pooler's pool size first. It is also capped in practice by the
+   * 20 means up to 80 connections from this function alone. Raise it only with the pooler's pool size, 25% headroom
+   * and a pool connect timeout in the same change (docs/handoffs/indexing-batching-plan.md). It is also capped in practice by the
    * account's Lambda concurrent-executions quota: this function has no reserved concurrency and
    * also serves every schedule, so a value at or above the quota lets the queue starve them.
    */
@@ -370,8 +371,8 @@ export function assertSessionPipelineInputs(p: unknown, refuse: (why: string) =>
   if (v.busyRequeueDelaySeconds !== undefined && (typeof v.busyRequeueDelaySeconds !== "number" || !Number.isInteger(v.busyRequeueDelaySeconds) || v.busyRequeueDelaySeconds < 1 || v.busyRequeueDelaySeconds > 900)) refuse("transcriptStore.sessionPipeline.busyRequeueDelaySeconds must be an integer 1-900");
   // SEARCH_INDEX_ENABLED=1 must never activate the desktop catalog writer; its own flag waits on 031000.
   if (v.desktopCatalog === true) refuse("transcriptStore.sessionPipeline.desktopCatalog requires the forget/reproject fix (migration 20261105031000) and its review; not wired yet");
-  if (v.maxConcurrency !== undefined && !(Number.isInteger(v.maxConcurrency) && (v.maxConcurrency as number) >= 2 && (v.maxConcurrency as number) <= 30))
-    refuse("transcriptStore.sessionPipeline.maxConcurrency must be an integer from 2 to 30");
+  if (v.maxConcurrency !== undefined && !(Number.isInteger(v.maxConcurrency) && (v.maxConcurrency as number) >= 2 && (v.maxConcurrency as number) <= 20))
+    refuse("transcriptStore.sessionPipeline.maxConcurrency must be an integer from 2 to 20");
   if (v.deliveryDelaySeconds !== undefined && !(Number.isInteger(v.deliveryDelaySeconds) && (v.deliveryDelaySeconds as number) >= 0 && (v.deliveryDelaySeconds as number) <= 900))
     refuse("transcriptStore.sessionPipeline.deliveryDelaySeconds must be an integer from 0 to 900");
   if (v.batchingWindowSeconds !== undefined && !(Number.isInteger(v.batchingWindowSeconds) && (v.batchingWindowSeconds as number) >= 0 && (v.batchingWindowSeconds as number) <= 300))

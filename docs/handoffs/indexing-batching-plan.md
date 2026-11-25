@@ -53,7 +53,7 @@ Before raising the cap:
 - add a connect timeout to the pipeline pool, so a stall fails fast and the message retries instead of
   holding the invocation until its 300 s limit.
 
-The stack bound allows 30 so the setting exists; production does not start at 30.
+The stack bound stays at 20. Raising it is a separate reviewed change that carries the pool-size proof, the headroom check and the connect timeout.
 
 ## Rollback values and stop lines
 
