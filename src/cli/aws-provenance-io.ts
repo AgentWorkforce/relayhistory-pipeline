@@ -14,6 +14,7 @@ import { tmpdir } from "node:os";
 import { mkdtempSync, rmSync } from "node:fs";
 import { awsInvocation } from "./aws.ts";
 import { assertTranscriptStorePlanContract, TRANSCRIPT_STAGE } from "../../stacks/aws/transcript-store.ts";
+import { readPipelineLive } from "../../stacks/aws/pipeline-live.ts";
 
 type Env = Record<string, string | undefined>;
 const run = (cmd: string, args: string[], cwd: string, baseEnv: Env = process.env) => {
@@ -125,7 +126,11 @@ export function capturePlan(root: string, stage: string, env: Env) {
   };
   const provenanceText = `${JSON.stringify(record, null, 2)}\n`;
   // Reject an unsafe production capture before it can replace the reviewed files.
-  if (stage === TRANSCRIPT_STAGE) assertTranscriptStorePlanContract(plan, { detailedPlanText: detailed, provenanceText, stateSnapshotText: snapText });
+  // The live function and mappings (read-only, in memory): a hand-set variable is visible only there.
+  if (stage === TRANSCRIPT_STAGE) {
+    const liveSnapshotText = readPipelineLive((cmd, args) => run(cmd, args, root, env), stage, inputs.accountId, inputs.region);
+    assertTranscriptStorePlanContract(plan, { detailedPlanText: detailed, provenanceText, stateSnapshotText: snapText, ...(liveSnapshotText ? { liveSnapshotText } : {}) });
+  }
   writeFileSync(p.inputs, sanitized);
   writeFileSync(p.plan, plan);
   writeFileSync(p.detailed, detailed);

@@ -46,6 +46,7 @@ import { assertSandboxAlchemyCredentials } from "./sandbox-credentials.ts";
 import { spawnSync } from "node:child_process";
 import { Project as SupabaseProject, SupabaseProvider } from "../supabase/project.ts";
 import { assertTranscriptStorePlanContract, TRANSCRIPT_STAGE, transcriptStoreStage } from "./transcript-store.ts";
+import { readPipelineLive } from "./pipeline-live.ts";
 
 const ROOT = fileURLToPath(new URL("../..", import.meta.url));
 const REPO = "AgentWorkforce/sessions-pipeline";
@@ -85,7 +86,21 @@ function readInputs(stage: string): AwsInputs & { mode: AwsMode } {
       throw new Error(`96bulls: deploy needs the reviewed capture docs/plans/${stage}.{provenance.json,plan.txt,plan.detailed.txt}. Nothing was changed.`);
     }
     assertApprovalBinding(inputs.approval?.capture, { provenanceText, planText, inputsText });
-    if (stage === TRANSCRIPT_STAGE) assertTranscriptStorePlanContract(planText, { detailedPlanText, provenanceText });
+    if (stage === TRANSCRIPT_STAGE) {
+      // The live function and mappings again at deploy (read-only, in memory): nothing set by hand
+      // since the capture may be dropped, and the budget is recomputed over what runs now.
+      const liveSnapshotText = readPipelineLive(
+        (cmd, args) => {
+          const r = spawnSync(cmd, args, { cwd: ROOT, encoding: "utf8", env: process.env, maxBuffer: 64 * 1024 * 1024 });
+          if (r.status !== 0) throw new Error(`${cmd} ${args.slice(0, 2).join(" ")} failed: ${(r.stderr || "").trim().split("\n").pop()}`);
+          return r.stdout;
+        },
+        stage,
+        inputs.accountId,
+        inputs.region,
+      );
+      assertTranscriptStorePlanContract(planText, { detailedPlanText, provenanceText, ...(liveSnapshotText ? { liveSnapshotText } : {}) });
+    }
     // And this deploy really is that capture: source commit and tree, live state, plan files,
     // inputs. Here, not only in bin/96bulls, so a direct `alchemy deploy` is held to it too.
     verifyDeployCapture(

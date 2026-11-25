@@ -38,6 +38,7 @@ import {
   sessionSecretPolicy,
 } from "../session-pipeline.ts";
 import { assertTranscriptStoreInputs, assertTranscriptStorePlanContract, planProperties, transcriptBucketPolicy, transcriptKeyPolicy, transcriptNames } from "../transcript-store.ts";
+import { readPipelineLive } from "../pipeline-live.ts";
 import { SEARCH_SPLIT_REFUSED, SEARCH_SPLIT_ROLLBACK, SEARCH_SPLIT_ROLLOUT, STAGED_RENDER_PATH, renderSearchSplitStages } from "../../../scripts/search-split-staged-render.ts";
 
 const STAGE = "aws-sessions-prod";
@@ -886,67 +887,193 @@ describe("search-queue split: the deploy plan contract", () => {
     expect(() => check(detailed({ ...creates(), "session-search": { action: "create", body: [] } }))).toThrow(/no properties for session-search/);
   });
 
-  it("stages B1, C2, R1 and R3: a function env update with the role-ARN cascade, now including the search queue's policy", () => {
-    const withEnv = (lines: string[]) => detailed({ "session-pipeline": envChange(lines), "session-search": searchCascade() }, true);
-    const pool = withEnv(['  -     HOOPDB_POOL_MAX: "4"', '  +     HOOPDB_POOL_MAX: "3"']);
-    expect(check(pool)).toBe("session pipeline update");
-    expect(check(pool, undefined)).toBe("session pipeline update");
-    expect(check(withEnv([`  +     SESSION_PIPELINE_SEARCH_QUEUE_URL: ${p.searchQueueUrl}`]))).toBe("session pipeline update");
-    expect(check(withEnv([`  -     SESSION_PIPELINE_SEARCH_QUEUE_URL: ${p.searchQueueUrl}`]))).toBe("session pipeline update");
-    // The URL must be this stage's search queue, and the pool may not be raised past 4.
-    expect(() => check(withEnv([`  +     SESSION_PIPELINE_SEARCH_QUEUE_URL: ${p.queueUrl}`]))).toThrow(/SESSION_PIPELINE_SEARCH_QUEUE_URL is not this stage's search queue URL/);
-    expect(() => check(withEnv(['  -     HOOPDB_POOL_MAX: "4"', '  +     HOOPDB_POOL_MAX: "8"']))).toThrow(/HOOPDB_POOL_MAX must stay between 1 and 4/);
-    // The search queue's policy may change only by the cascade.
-    const widened = searchCascade();
-    widened.body = widened.body.map((l) => (l.startsWith("  + ") ? l.replace("sqs:SendMessage", "sqs:PurgeQueue") : l));
-    expect(() => check(detailed({ "session-pipeline": envChange([]), "session-search": widened }, true))).toThrow(/session-search changes .* not only the role-ARN cascade/);
-    // Without a function update it may not change at all.
-    expect(() => check(detailed({ "session-search": searchCascade() }))).toThrow(/session-search updates only by the role-ARN cascade of a pipeline update/);
-    // The pool and a mapping never move in one apply, even where no grant cascades.
-    for (const m of ["session-events-mapping", "session-search-mapping"])
-      expect(() => check(detailed({ "session-pipeline": envChange(['  -     HOOPDB_POOL_MAX: "3"', '  +     HOOPDB_POOL_MAX: "2"']), [m]: { action: "update", body: change([], "enabled", "false", "true") } }))).toThrow(
-        /HOOPDB_POOL_MAX and a mapping change in separate plans/,
-      );
-    // A function update may not come with a mapping change (the existing cascade rule).
-    expect(() => check(detailed({ "session-pipeline": envChange([]), "session-search": searchCascade(), "session-search-mapping": { action: "update", body: change([], "enabled", "false", "true") } }, true))).toThrow(
-      /role-ARN cascade comes with other changes: .*session-search-mapping:update/,
-    );
-  });
-
-  it("stages B2, C1, R2 and R4: one mapping at a time, and the search mapping only in enabled or MaximumConcurrency", () => {
-    const events = { action: "update", body: change(["scalingConfig"], "MaximumConcurrency", "20", "10") };
-    expect(check(detailed({ "session-events-mapping": events }))).toBe("session pipeline update");
-    for (const body of [change([], "enabled", "false", "true"), change([], "enabled", "true", "false"), change(["scalingConfig"], "MaximumConcurrency", "16", "8")])
-      expect(check(detailed({ "session-search-mapping": { action: "update", body } }))).toBe("session pipeline update");
-    expect(() => check(detailed({ "session-events-mapping": events, "session-search-mapping": { action: "update", body: change([], "enabled", "false", "true") } }))).toThrow(
-      /the events and search mappings change in separate plans/,
-    );
-    for (const [key, from, to] of [["eventSourceArn", p.searchQueueArn, p.queueArn], ["functionName", p.function, "someone-else"], ["batchSize", "10", "100"]] as const)
-      expect(() => check(detailed({ "session-search-mapping": { action: "update", body: change([], key, from, to) } }))).toThrow(/session-search-mapping changes .* not only enabled or MaximumConcurrency/);
-    expect(() => check(detailed({ "session-search-mapping": { action: "update", body: ["  no declared property changes"] } }))).toThrow(/updates without changing enabled or MaximumConcurrency/);
-  });
-
-  it("refuses a DLQ or alarm update, a delete or replace, and a plan that lists only some search resources", () => {
-    for (const r of ["session-search-dlq", "session-search-dlq-alarm", "session-search-age-alarm"])
-      expect(() => check(detailed({ [r]: { action: "update", body: ["  no declared property changes"] } }))).toThrow(new RegExp(`${r} never changes in place`));
-    for (const action of ["delete", "replace"]) expect(() => check(detailed({ "session-search": { action, body: [] } }))).toThrow(/forbidden action/);
-    const partial = detailed({}).replace("[session-search-dlq] noop\n", "");
-    expect(() => check(partial)).toThrow(/missing resource session-search-dlq/);
-  });
-
-  it("each staged capture is judged as the staged render says", () => {
-    const blocks: Record<string, Record<string, { action: string; body: string[] }>> = {
-      A: creates(),
-      B: { "session-events-mapping": { action: "update", body: change(["scalingConfig"], "MaximumConcurrency", "20", "10") } },
-      C1: { "session-search-mapping": { action: "update", body: change([], "enabled", "false", "true") } },
-      C2: { "session-pipeline": envChange([`  +     SESSION_PIPELINE_SEARCH_QUEUE_URL: ${p.searchQueueUrl}`]), "session-search": searchCascade() },
-      R1: { "session-pipeline": envChange([`  -     SESSION_PIPELINE_SEARCH_QUEUE_URL: ${p.searchQueueUrl}`]), "session-search": searchCascade() },
-      R2: { "session-search-mapping": { action: "update", body: change([], "enabled", "true", "false") } },
-      R3: { "session-events-mapping": { action: "update", body: change(["scalingConfig"], "MaximumConcurrency", "10", "20") } },
+  /** An Alchemy update block from whole old and new props: unchanged keys plain, a changed key's whole old value `  - `, then its new value `  + `. */
+  const update = (old: Record<string, unknown>, now: Record<string, unknown>) => {
+    const body = ["  properties:"];
+    const mark = (m: string, ls: string[]) => ls.map((l) => `  ${m} ${l.slice(2)}`);
+    const walk = (a: Record<string, unknown>, b: Record<string, unknown>, indent: number) => {
+      for (const k of [...new Set([...Object.keys(a), ...Object.keys(b)])].sort()) {
+        const x = a[k], y = b[k];
+        if (JSON.stringify(x) === JSON.stringify(y)) {
+          if (x !== undefined) body.push(...yaml({ [k]: x }, indent));
+        } else if (x && y && typeof x === "object" && typeof y === "object" && !Array.isArray(x) && !Array.isArray(y)) {
+          body.push(`${" ".repeat(indent)}${k}:`);
+          walk(x as Record<string, unknown>, y as Record<string, unknown>, indent + 2);
+        } else {
+          if (x !== undefined) body.push(...mark("-", yaml({ [k]: x }, indent)));
+          if (y !== undefined) body.push(...mark("+", yaml({ [k]: y }, indent)));
+        }
+      }
     };
-    for (const s of [...SEARCH_SPLIT_ROLLOUT.slice(1), ...SEARCH_SPLIT_ROLLBACK]) {
-      const b = blocks[s.id]!;
-      expect([s.id, check(detailed(b, "session-pipeline" in b))]).toEqual([s.id, s.phase]);
+    walk(old, now, 4);
+    return { action: "update", body };
+  };
+  const eventsMapping = (max: number, over: Record<string, unknown> = {}) => ({ ...sessionEventsMappingProps({ p: { maxConcurrency: max }, functionName: p.function, queueArn: p.queueArn, tags }), ...over });
+  const searchMapping = (enabled: boolean, max = 16, over: Record<string, unknown> = {}) => ({ ...sessionSearchMappingProps({ q: { enabled: true, mappingEnabled: enabled, maxConcurrency: max }, functionName: p.function, queueArn: p.searchQueueArn, tags }), ...over });
+  const fnProps = (pi: SessionPipelineInputs, env: Record<string, string> = {}, drop: string[] = []) => {
+    const props = sessionPipelineFunctionProps({ stage: STAGE, accountId: ACCOUNT, region: REGION, bucket: t.bucket, p: pi, tags: () => tags });
+    const e: Record<string, string> = { ...props.env, ...env };
+    for (const k of drop) delete e[k];
+    return { ...props, env: e } as Record<string, unknown>;
+  };
+  const SPLIT = { searchIndex: true, maxConcurrency: 10, hoopdbPoolMax: 3 } as const;
+  const Q = { enabled: true, maxConcurrency: 16 } as const;
+  /** The live readback (pipeline-live.ts shape): the function's env and its two mappings. */
+  const live = (o: { env?: Record<string, unknown>; pointer?: number; search?: "Enabled" | "Disabled" | null; searchMax?: number }) =>
+    JSON.stringify({
+      schema: 1,
+      env: o.env ?? (fnProps({ ...SPLIT, searchQueue: Q }).env as Record<string, string>),
+      mappings: [
+        { eventSourceArn: p.queueArn, state: "Enabled", maximumConcurrency: o.pointer ?? 10 },
+        ...(o.search === null ? [] : [{ eventSourceArn: p.searchQueueArn, state: o.search ?? "Disabled", maximumConcurrency: o.searchMax ?? 16 }]),
+      ],
+    });
+  /** `state` null: the deploy's check (no state snapshot). */
+  const capture = (full: string, liveText?: string, state: string | null = snapshot) => {
+    const compact = `${full.split("\n").filter((l) => l.startsWith("Plan:") || isResourceLine(l)).join("\n")}\n`;
+    return assertTranscriptStorePlanContract(compact, {
+      detailedPlanText: full,
+      provenanceText: JSON.stringify({
+        schema: 1,
+        stage: STAGE,
+        outputs: { plan: { path: `docs/plans/${STAGE}.plan.txt`, sha256: h(compact) }, detailed: { path: `docs/plans/${STAGE}.plan.detailed.txt`, sha256: h(full) } },
+        summary: compact.split("\n")[0],
+      }),
+      stateSnapshotText: state ?? undefined,
+      liveSnapshotText: liveText,
+    });
+  };
+  const fnUpdate = (oldP: Record<string, unknown>, newP: Record<string, unknown>) => detailed({ "session-pipeline": update(oldP, newP), "session-search": searchCascade() }, true);
+  const URL_KEY = "SESSION_PIPELINE_SEARCH_QUEUE_URL";
+
+  it("B and R3: the pointer cap alone, pinned old -> new, budget from the live search mapping and pool", () => {
+    const b = detailed({ "session-events-mapping": update(eventsMapping(20), eventsMapping(10)) });
+    expect(capture(b, live({ pointer: 20 }))).toBe("session pipeline update");
+    expect(capture(detailed({ "session-events-mapping": update(eventsMapping(10), eventsMapping(20)) }), live({}))).toBe("session pipeline update");
+    // The deploy (no snapshot) still pins the shape.
+    expect(capture(b, undefined, null)).toBe("session pipeline update");
+    // A capture without the live readback is refused.
+    expect(() => capture(b)).toThrow(/captured only with the live function and mapping readback/);
+    // Raising the pointer cap while search polls: (20 + 16) x 3 = 108.
+    expect(() => capture(detailed({ "session-events-mapping": update(eventsMapping(10), eventsMapping(20)) }), live({ search: "Enabled" }))).toThrow(/108 pooler connections/);
+  });
+
+  it("negative control (a): the pointer mapping retargeted to another function, or another queue, is refused", () => {
+    const retarget = (over: Record<string, unknown>, max = 20) => detailed({ "session-events-mapping": update(eventsMapping(20), eventsMapping(max, over)) });
+    for (const [over, max] of [[{ functionName: "someone-else" }, 20], [{ functionName: "someone-else" }, 10], [{ eventSourceArn: p.searchQueueArn }, 10], [{ batchSize: 100 }, 10], [{ enabled: false }, 20]] as const) {
+      expect(() => capture(retarget(over, max), live({ pointer: 20 }))).toThrow(/session-events-mapping may change only its MaximumConcurrency/);
+      expect(() => capture(retarget(over, max), undefined, null)).toThrow(/session-events-mapping may change only its MaximumConcurrency/);
     }
+    // Retargeted on both sides (old and new identical except the cap): not its rendered props.
+    const both = detailed({ "session-events-mapping": update(eventsMapping(20, { functionName: "someone-else" }), eventsMapping(10, { functionName: "someone-else" })) });
+    expect(() => capture(both, live({ pointer: 20 }))).toThrow(/not its rendered props on the events queue \(functionName\)/);
+    // Pinned in every pipeline plan, search resources or not.
+    const plain = REAL.replace(/^\[([a-z0-9-]+)\] update\n[\s\S]*?(?=\n\[)/gm, "[$1] noop\n").replace("[session-events-mapping] noop", `[session-events-mapping] update\n${update(eventsMapping(4), eventsMapping(4, { functionName: "someone-else" })).body.join("\n")}`);
+    expect(() => capture(plain.replace(/^Plan: .*$/m, "Plan: 1 to update"), undefined, null)).toThrow(/session-events-mapping may change only its MaximumConcurrency/);
+  });
+
+  it("C1 and R2: the search mapping alone, enabled flipped at 16, budget recomputed from the plan's new values", () => {
+    expect(capture(detailed({ "session-search-mapping": update(searchMapping(false), searchMapping(true)) }), live({}))).toBe("session pipeline update");
+    expect(capture(detailed({ "session-search-mapping": update(searchMapping(true), searchMapping(false)) }), live({ search: "Enabled" }))).toBe("session pipeline update");
+    // Enabling before the pointer cap is lowered: live pointer 20 -> (20 + 16) x 3 = 108.
+    expect(() => capture(detailed({ "session-search-mapping": update(searchMapping(false), searchMapping(true)) }), live({ pointer: 20 }))).toThrow(/108 pooler connections/);
+    // Retargeted, or any other key.
+    expect(() => capture(detailed({ "session-search-mapping": update(searchMapping(false), searchMapping(true, 16, { eventSourceArn: p.queueArn })) }), live({}))).toThrow(/may change only enabled or MaximumConcurrency/);
+    expect(() => capture(detailed({ "session-search-mapping": update(searchMapping(false, 16, { functionName: "x" }), searchMapping(true, 16, { functionName: "x" })) }), live({}))).toThrow(/not its rendered props on the search queue \(functionName\)/);
+  });
+
+  it("negative control (b): the search cap raised 16 -> 20 at pointer 10 / pool 3 (90) is refused", () => {
+    const raise = detailed({ "session-search-mapping": update(searchMapping(true, 16), searchMapping(true, 20)) });
+    expect(() => capture(raise, live({ search: "Enabled" }))).toThrow(/\(pointer 10 \+ search 20\) x pool 3 is 90 pooler connections/);
+    // Lowering it is fine.
+    expect(capture(detailed({ "session-search-mapping": update(searchMapping(true, 16), searchMapping(true, 8)) }), live({ search: "Enabled" }))).toBe("session pipeline update");
+  });
+
+  it("C2 and R1: the function env changes by exactly the search queue URL, with the role-ARN cascade", () => {
+    const off = fnProps({ ...SPLIT, searchQueue: { ...Q, mappingEnabled: true } });
+    const on = fnProps({ ...SPLIT, searchQueue: { ...Q, mappingEnabled: true, handoff: true } });
+    expect((on.env as Record<string, string>)[URL_KEY]).toBe(p.searchQueueUrl);
+    expect(capture(fnUpdate(off, on), live({ env: off.env as Record<string, unknown>, search: "Enabled" }))).toBe("session pipeline update");
+    expect(capture(fnUpdate(on, off), live({ env: on.env as Record<string, unknown>, search: "Enabled" }))).toBe("session pipeline update");
+    expect(capture(fnUpdate(off, on), undefined, null)).toBe("session pipeline update");
+    // Another URL, a pool change, a non-env change: refused.
+    expect(() => capture(fnUpdate(off, { ...on, env: { ...(on.env as object), [URL_KEY]: p.queueUrl } }), live({ env: off.env as Record<string, unknown>, search: "Enabled" }))).toThrow(/may change only by adding or removing SESSION_PIPELINE_SEARCH_QUEUE_URL/);
+    expect(() => capture(fnUpdate(off, { ...off, env: { ...(off.env as object), HOOPDB_POOL_MAX: "4" } }), live({ env: off.env as Record<string, unknown>, search: "Enabled" }))).toThrow(/HOOPDB_POOL_MAX changed/);
+    expect(() => capture(fnUpdate(off, { ...on, memorySize: 10240 }), live({ env: off.env as Record<string, unknown>, search: "Enabled" }))).toThrow(/changes more than its env: memorySize/);
+  });
+
+  it("negative control (c): the URL added while visibly removing SEARCH_INDEX_SKIP_OVER_BOUND_ENABLED is refused; so is an invisible loss", () => {
+    const flag = { SEARCH_INDEX_SKIP_OVER_BOUND_ENABLED: "true" };
+    const base = { ...SPLIT, searchQueue: { ...Q, mappingEnabled: true } };
+    const old = fnProps(base, flag);
+    const visible = fnProps({ ...base, searchQueue: { ...base.searchQueue, handoff: true } });
+    expect(() => capture(fnUpdate(old, visible), live({ env: old.env as Record<string, unknown>, search: "Enabled" }))).toThrow(
+      /may change only by adding or removing SESSION_PIPELINE_SEARCH_QUEUE_URL .*found SEARCH_INDEX_SKIP_OVER_BOUND_ENABLED removed, SESSION_PIPELINE_SEARCH_QUEUE_URL added/,
+    );
+    expect(() => capture(fnUpdate(old, visible), undefined, null)).toThrow(/SEARCH_INDEX_SKIP_OVER_BOUND_ENABLED removed/);
+    // Invisible: the flag was set by hand, so neither side of the plan has it; only the live readback does.
+    const plain = fnProps(base);
+    const liveEnv = { ...(plain.env as object), ...flag };
+    expect(() => capture(fnUpdate(plain, visible), live({ env: liveEnv, search: "Enabled" }))).toThrow(/the live function has SEARCH_INDEX_SKIP_OVER_BOUND_ENABLED, which this plan does not render \(the update would drop it\)/);
+    // A live value changed by hand and not shown by the plan is not silently overwritten.
+    expect(() => capture(fnUpdate(plain, visible), live({ env: { ...(plain.env as object), HOOPDB_POOL_MAX: "2" }, search: "Enabled" }))).toThrow(/the live HOOPDB_POOL_MAX differs from the planned value/);
+  });
+
+  it("refuses a DLQ or alarm update, two staged changes at once, a delete or replace, and a partial resource list", () => {
+    for (const r of ["session-search-dlq", "session-search-dlq-alarm", "session-search-age-alarm"])
+      expect(() => capture(detailed({ [r]: { action: "update", body: ["  no declared property changes"] } }), live({}))).toThrow(/not one staged change/);
+    expect(() => capture(detailed({ "session-events-mapping": update(eventsMapping(20), eventsMapping(10)), "session-search-mapping": update(searchMapping(false), searchMapping(true)) }), live({ pointer: 20 }))).toThrow(/not one staged change/);
+    expect(() => capture(detailed({ "session-search": searchCascade() }), live({}))).toThrow(/not one staged change/);
+    for (const action of ["delete", "replace"]) expect(() => capture(detailed({ "session-search": { action, body: [] } }), live({}))).toThrow(/forbidden action/);
+    expect(() => capture(detailed({}).replace("[session-search-dlq] noop\n", ""), live({}))).toThrow(/missing resource session-search-dlq/);
+  });
+
+  it("each staged capture is judged as the staged render says, against the live state of the stage before it", () => {
+    const fn = (pi: SessionPipelineInputs) => fnProps(pi);
+    const at = (id: string) => [...SEARCH_SPLIT_ROLLOUT, ...SEARCH_SPLIT_ROLLBACK].find((s) => s.id === id)!.p;
+    const liveOf = (pi: SessionPipelineInputs) => {
+      const s = sessionPoolSettings(pi);
+      return live({ env: fn(pi).env as Record<string, unknown>, pointer: s.pointer, search: pi.searchQueue?.mappingEnabled ? "Enabled" : "Disabled", searchMax: pi.searchQueue?.maxConcurrency ?? 16 });
+    };
+    const blocks: Record<string, (prev: SessionPipelineInputs, next: SessionPipelineInputs) => string> = {
+      A: () => detailed(creates()),
+      B: (a, b) => detailed({ "session-events-mapping": update(eventsMapping(a.maxConcurrency!), eventsMapping(b.maxConcurrency!)) }),
+      C1: (a, b) => detailed({ "session-search-mapping": update(searchMapping(!!a.searchQueue?.mappingEnabled), searchMapping(!!b.searchQueue?.mappingEnabled)) }),
+      C2: (a, b) => fnUpdate(fn(a), fn(b)),
+      R1: (a, b) => fnUpdate(fn(a), fn(b)),
+      R2: (a, b) => detailed({ "session-search-mapping": update(searchMapping(!!a.searchQueue?.mappingEnabled), searchMapping(!!b.searchQueue?.mappingEnabled)) }),
+      R3: (a, b) => detailed({ "session-events-mapping": update(eventsMapping(a.maxConcurrency!), eventsMapping(b.maxConcurrency!)) }),
+    };
+    const chain = [...SEARCH_SPLIT_ROLLOUT, ...SEARCH_SPLIT_ROLLBACK];
+    for (let n = 1; n < chain.length; n++) {
+      const s = chain[n]!, prev = chain[n - 1]!;
+      const text = blocks[s.id]!(prev.p, s.p);
+      expect([s.id, capture(text, s.id === "A" ? undefined : liveOf(prev.p))]).toEqual([s.id, s.phase]);
+    }
+    expect(at("C2").searchQueue?.handoff).toBe(true);
+  });
+
+});
+
+describe("search-queue split: the live readback", () => {
+  it("reads the function env and its mappings read-only, and is absent before the function exists", () => {
+    const calls: string[][] = [];
+    const run = (cmd: string, args: string[]) => {
+      calls.push([cmd, ...args]);
+      if (args[1] === "get-function-configuration") return JSON.stringify({ Environment: { Variables: { HOOPDB_POOL_MAX: "3", SEARCH_INDEX_SKIP_OVER_BOUND_ENABLED: "true" } } });
+      return JSON.stringify({ EventSourceMappings: [{ EventSourceArn: p.queueArn, State: "Enabled", ScalingConfig: { MaximumConcurrency: 20 } }, { EventSourceArn: p.searchQueueArn, State: "Disabled" }] });
+    };
+    expect(JSON.parse(readPipelineLive(run, STAGE, ACCOUNT, REGION)!)).toEqual({
+      schema: 1,
+      env: { HOOPDB_POOL_MAX: "3", SEARCH_INDEX_SKIP_OVER_BOUND_ENABLED: "true" },
+      mappings: [{ eventSourceArn: p.queueArn, state: "Enabled", maximumConcurrency: 20 }, { eventSourceArn: p.searchQueueArn, state: "Disabled" }],
+    });
+    expect(calls.map((c) => c.slice(0, 3))).toEqual([["aws", "lambda", "get-function-configuration"], ["aws", "lambda", "list-event-source-mappings"]]);
+    expect(calls.every((c) => c.includes(p.function))).toBe(true);
+    const missing = () => {
+      throw new Error("aws lambda failed: An error occurred (ResourceNotFoundException) when calling the GetFunctionConfiguration operation");
+    };
+    expect(readPipelineLive(missing, STAGE, ACCOUNT, REGION)).toBeUndefined();
+    expect(() => readPipelineLive(() => { throw new Error("AccessDeniedException"); }, STAGE, ACCOUNT, REGION)).toThrow(/AccessDenied/);
   });
 });

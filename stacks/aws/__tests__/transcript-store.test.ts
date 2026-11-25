@@ -548,10 +548,13 @@ describe("transcript store: deploy plan contract", () => {
   });
 
   it("checks the production contract before a capture can replace reviewed files, and again before deploy", () => {
-    const captureCheck = captureWorkflow.indexOf("if (stage === TRANSCRIPT_STAGE) assertTranscriptStorePlanContract(plan, { detailedPlanText: detailed, provenanceText, stateSnapshotText: snapText });");
+    const captureCheck = captureWorkflow.indexOf("assertTranscriptStorePlanContract(plan, { detailedPlanText: detailed, provenanceText, stateSnapshotText: snapText, ...(liveSnapshotText ? { liveSnapshotText } : {}) });");
     expect(captureCheck).toBeGreaterThan(0);
     expect(captureCheck).toBeLessThan(captureWorkflow.indexOf("writeFileSync(p.plan, plan)"));
-    expect(stack).toContain("assertTranscriptStorePlanContract(planText, { detailedPlanText, provenanceText })");
+    // Both read the live function back first (pipeline-live.ts), for the production stage only.
+    expect(captureWorkflow.indexOf("const liveSnapshotText = readPipelineLive(")).toBeGreaterThan(captureWorkflow.indexOf("if (stage === TRANSCRIPT_STAGE) {"));
+    expect(stack).toContain("assertTranscriptStorePlanContract(planText, { detailedPlanText, provenanceText, ...(liveSnapshotText ? { liveSnapshotText } : {}) })");
+    expect(stack.indexOf("const liveSnapshotText = readPipelineLive(")).toBeGreaterThan(stack.indexOf("if (stage === TRANSCRIPT_STAGE) {"));
   });
 });
 
@@ -593,7 +596,7 @@ describe("transcript store: inputs", () => {
     expect(at).toBeGreaterThan(0);
     expect(at).toBeLessThan(stack.indexOf('AWS.KMS.Key("locker-key"'));
     expect(stack).not.toContain("if (inputs.transcriptStore)");
-    expect(stack).toContain("assertTranscriptStorePlanContract(planText, { detailedPlanText, provenanceText })");
+    expect(stack).toContain("assertTranscriptStorePlanContract(planText, { detailedPlanText, provenanceText, ...(liveSnapshotText ? { liveSnapshotText } : {}) })");
   });
 
   it("accepts only an exact named audit role in the intended account and partition", () => {
