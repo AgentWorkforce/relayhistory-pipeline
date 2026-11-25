@@ -1,4 +1,4 @@
-# Incremental search indexing: committed wake and revision-aware passes (design M1, rev 8)
+# Incremental search indexing: committed wake and revision-aware passes (design M1, rev 9)
 
 Status: design for review. Code and plans only. No migration, deploy, flag, schedule or config change follows from
 this document without a separate production go per step (§9). Rev 2 closed the nine findings of the M1 review. Rev 3 closes the seven rev-2 findings (B1-B7), marked inline.
@@ -448,10 +448,15 @@ CREATE TABLE sessions.search_stage_archive (
   PRIMARY KEY (batch_id, kind, source_id)
 );
 CREATE UNIQUE INDEX search_stage_archive_one_manifest ON sessions.search_stage_archive (batch_id) WHERE kind = 'manifest';
--- Append-only: UPDATE and DELETE are refused for every role but the schema owner (a trigger raises 42501), so the
--- archive cannot be altered after the fact. Cleanup is a separate, explicitly approved owner migration.
+-- Sealed and append-only [rev 9]: INSERT, UPDATE and DELETE are refused for every role but the schema owner (a
+-- trigger raises 42501). The ONLY write path is sessions.archive_search_stage_v1(): SECURITY DEFINER, owned by the
+-- schema owner, SET search_path = pg_catalog, pg_temp. It performs §8's whole archive (lock, refusals, insert rows
+-- and manifest, delete) in one transaction, so no role can append to a completed batch or forge one.
+-- Cleanup is a separate, explicitly approved owner migration.
 REVOKE ALL ON sessions.search_stage_archive FROM PUBLIC;
-GRANT SELECT, INSERT ON sessions.search_stage_archive TO <runtime role>;   -- archiveSearchStage runs as it
+GRANT SELECT ON sessions.search_stage_archive TO <runtime role>;
+REVOKE ALL ON FUNCTION sessions.archive_search_stage_v1() FROM PUBLIC;
+GRANT EXECUTE ON FUNCTION sessions.archive_search_stage_v1() TO <runtime role>;   -- archiveSearchStage calls it
 ```
 
 **TypeScript** (`packages/pipeline/src/lib/pipeline/` unless a path is given):
@@ -569,7 +574,9 @@ promise of replay, so the two cannot coexist with a down migration.
     - another stage's seeded letter, job and REAL event survive;
   - R9c: archive with one letter still `dead` REFUSES, and nothing is archived or deleted (failure-safe);
   - R9d [rev 8]: archive with a `search-index` job row present REFUSES, and nothing changes;
-  - R9e [rev 8]: an archived row cannot be updated or deleted by the runtime role (append-only).
+  - R9e [rev 8]: an archived row cannot be updated or deleted by the runtime role (append-only);
+  - R9f [rev 9]: a direct INSERT by a non-owner role (an append to a completed batch, or a forged batch) is refused
+    with 42501; `archive_search_stage_v1` is SECURITY DEFINER.
 
 ## 9. Production steps (each needs its own go, one at a time)
 

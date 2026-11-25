@@ -7,7 +7,8 @@
  *   catchUpTick, runSearchJob, parkSearchJobs, and (§8) searchStageDownPrecondition, archiveSearchStage [rev 7: failure-safe,
  *   into sessions.search_stage_archive with a sha256 manifest; with an unresolved letter it THROWS and changes nothing (R9c)];
  *   rev 8: the manifest digest is recomputed in-test from the pre-archive rows with §8's exact rule (R9b); each down
- *   guard on its own (R9g); a search-index job refuses the archive (R9d); the archive is append-only (R9e).
+ *   guard on its own (R9g); a search-index job refuses the archive (R9d); the archive is append-only (R9e) and sealed
+ *   against direct inserts (R9f).
  * No test runs the design's enqueue / settlement / replay / tick / park SQL itself, so a migration (or a stub export
  * plus a migration) can never turn them green: each asserts concrete table state after the call that a no-op
  * export cannot produce. Fixtures (seeding rows, simulating a crash by expiring a lease, raising `attempts`) use
@@ -1326,6 +1327,38 @@ describe("R9: the park path, the held down migration and the failure-safe archiv
 
     expect(await asRuntime("UPDATE sessions.search_stage_archive SET row = row || '{\"tampered\": true}'::jsonb WHERE kind = 'manifest'")).toBe("42501");
     expect(await asRuntime("DELETE FROM sessions.search_stage_archive WHERE kind = 'letter'")).toBe("42501");
+    expect(await archive()).toEqual(before);
+  }, 120_000);
+
+  test("R9f: the archive is sealed: a direct INSERT by a non-owner role (a forged row or an append to a completed batch) is refused with 42501; archiving only through the SECURITY DEFINER function", async () => {
+    const db = await migrated();
+    const f = await m2r9();
+    await parked(db, f);
+    await replayAndResolve(db, f, [a, b]);
+    await f.archiveSearchStage(db.pg);
+    const archive = () => snapshot(db.pg, "search_stage_archive");
+    const before = await archive();
+    const batch = (await db.pg.query<{ batch_id: string }>("SELECT batch_id::text FROM sessions.search_stage_archive WHERE kind = 'manifest'")).rows[0]!.batch_id;
+
+    // Sealed: the runtime role holds no INSERT on the table; the only write path is the owner's SECURITY DEFINER function.
+    const fn = (await db.pg.query<{ secdef: boolean }>(
+      "SELECT p.prosecdef AS secdef FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace WHERE n.nspname = 'sessions' AND p.proname = 'archive_search_stage_v1'")).rows;
+    expect(fn).toEqual([{ secdef: true }]);
+
+    // A non-owner stand-in for the runtime role, deliberately GRANTED INSERT so a refusal can only come from the seal
+    // (the insert trigger), never from a missing privilege.
+    const role = "r9f_runtime_standin";
+    await db.pg.exec(`CREATE ROLE ${role} NOLOGIN NOSUPERUSER NOBYPASSRLS;
+      GRANT USAGE ON SCHEMA sessions TO ${role};
+      GRANT SELECT, INSERT ON sessions.search_stage_archive TO ${role};`);
+    const asRuntime = async (sql: string, params: unknown[] = []): Promise<string> => {
+      await db.pg.exec(`SET ROLE ${role}`);
+      try { await db.pg.query(sql, params); return "ok"; } catch (e) { return String((e as { code?: string }).code ?? e); } finally { await db.pg.exec("RESET ROLE"); }
+    };
+    // Append to the completed batch, after its manifest.
+    expect(await asRuntime(`INSERT INTO sessions.search_stage_archive (batch_id, kind, source_id, row) VALUES ($1::uuid, 'letter', 'forged-letter', '{}'::jsonb)`, [batch])).toBe("42501");
+    // A forged new batch with its own manifest.
+    expect(await asRuntime(`INSERT INTO sessions.search_stage_archive (batch_id, kind, source_id, row) VALUES (gen_random_uuid(), 'manifest', 'manifest', '{"letters":0,"events":0,"sha256":"00"}'::jsonb)`)).toBe("42501");
     expect(await archive()).toEqual(before);
   }, 120_000);
 
