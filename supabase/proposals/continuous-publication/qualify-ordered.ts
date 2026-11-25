@@ -5,7 +5,7 @@ import pg from "pg";
 import assert from "node:assert/strict";
 import {sequencePreflight,sessionsFunctionAcl,sessionsFunctionAclManifest} from "../../../src/hoopdb/migrate-guards.ts";
 import { MIGRATION_SENTINELS } from "../../../src/hoopdb/migration-sentinels.ts";
-import { plan, runMigrations } from "../../../src/hoopdb/migrate.ts";
+import { plan, runMigrations, sha256Text } from "../../../src/hoopdb/migrate.ts";
 import { publicationKernelSlot, publicationRecoverySlot, heldPublicationSentinels } from "./held-profile.ts";
 
 const root=realpathSync(join(import.meta.dir,"../../.."));
@@ -72,7 +72,20 @@ try {
   await c.query(searchDown);
   await c.query(publicationRecoverySlot.down);
   await c.query(publicationKernelSlot.down);
-  await c.query(readFileSync(join(source,"062270-private-read-profile.down.sql"),"utf8"));
+  // This fixture ledger entry belongs only to the private read-profile bytes.
+  // Close it atomically with the private component's own retention guard.
+  await c.query("BEGIN; SET LOCAL lock_timeout='5s'; SELECT pg_advisory_xact_lock(961996,1); LOCK TABLE sessions.__96bulls_migrations IN SHARE ROW EXCLUSIVE MODE");
+  try {
+    const latest=await c.query("SELECT name,sha256 FROM sessions.__96bulls_migrations WHERE name LIKE 'upstream:%' ORDER BY name COLLATE \"C\" DESC LIMIT 1");
+    const privateSha=sha256Text(readFileSync(join(discovery,privateFile),"utf8"));
+    assert.deepEqual(latest.rows,[{name:privateName,sha256:privateSha}]);
+    const down=readFileSync(join(source,"062270-private-read-profile.down.sql"),"utf8")
+      .replace(/^BEGIN;\n/m,"").replace(/\nCOMMIT;\s*$/,"\n");
+    await c.query(down);
+    await c.query("DELETE FROM sessions.__96bulls_migrations WHERE name=$1 AND sha256=$2",[privateName,privateSha]);
+    await c.query("COMMIT");
+  } catch(e) {await c.query("ROLLBACK"); throw e;}
+  assert.equal((await c.query("SELECT count(*)::int n FROM sessions.__96bulls_migrations WHERE name=ANY($1)",[ordered])).rows[0].n,0);
   assert.equal((await c.query("SELECT to_regclass('sessions.search_stage_archive') IS NOT NULL retained")).rows[0].retained,true);
   for(const s of Object.values(heldPublicationSentinels)) assert.equal((await c.query(s.sql)).rows[0].applied,false);
   console.log(JSON.stringify({server:(await c.query("SHOW server_version")).rows[0].server_version,encoding:"UTF8",discovered:ordered,rerunApplied:rerun.applied,prior300Refusal:"ledger_gap",pendingAclEntries:proposed.length,rollback:"300/290/280/270",searchArchiveRetained:true,captureRpc:"absent"}));
