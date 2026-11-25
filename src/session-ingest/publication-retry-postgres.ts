@@ -15,14 +15,19 @@ function retryFromRow(row: RetryRow) {
 // Both CAS paths return a row only to the winning writer. Retry mutations
 // depend on that row; a constraint/connection failure cannot partially commit.
 // A lost acknowledgement still requires a full scoped reload by the caller.
-const insertFirst = `INSERT INTO sessions.publication_retry_checkpoints(scope,version,scan,retry_turn)
-  SELECT $1,$2::bigint,$3::jsonb,$4::boolean WHERE $5::bigint=0
+const insertFirst = (guard: string) => `INSERT INTO sessions.publication_retry_checkpoints(scope,version,scan,retry_turn)
+  SELECT $1,$2::bigint,$3::jsonb,$4::boolean WHERE $5::bigint=0${guard}
   ON CONFLICT(scope) DO NOTHING RETURNING scope`;
-const advance = `UPDATE sessions.publication_retry_checkpoints
+const advance = (guard: string) => `UPDATE sessions.publication_retry_checkpoints
   SET version=$2::bigint,scan=$3::jsonb,retry_turn=$4::boolean
-  WHERE scope=$1 AND version=$5::bigint RETURNING scope`;
-function commitSql(cas: string) {
-  return `WITH won AS (${cas}), changes AS (
+  WHERE scope=$1 AND version=$5::bigint${guard} RETURNING scope`;
+interface FleetReservation { fleet: string; token: string }
+
+function commitSql(cas: string, fenced: boolean) {
+  // Serialize checkpoint advancement against another replica taking over an expired lease.
+  const guard = fenced ? `reservation AS (SELECT 1 FROM sessions.publication_fleet_cursors
+    WHERE fleet=$7 AND lease_token=$8 AND last_scope=$1 AND lease_until>clock_timestamp() FOR UPDATE),` : "";
+  return `WITH ${guard} won AS (${cas}), changes AS (
     SELECT * FROM jsonb_to_recordset($6::jsonb) AS c(token uuid, attempts int, state text, due_ms bigint)
   ), upserts AS (
     INSERT INTO sessions.publication_receipt_retries(scope,stage_token,attempts,state,due_ms)
@@ -36,7 +41,7 @@ function commitSql(cas: string) {
 
 /** Default-unwired scheduling storage. The caller binds the digest of its exact
  * authorized target and tenant when constructing the store. No claim authority. */
-export function postgresPublicationRetryStore(db: SqlExecutor, boundScope: string): ReceiptRetryStore {
+export function postgresPublicationRetryStore(db: SqlExecutor, boundScope: string, lease?: FleetReservation): ReceiptRetryStore {
   if (!/^[a-f0-9]{64}$/.test(boundScope)) throw Error("invalid receipt scope");
   function checkScope(scope: string) {
     if (scope !== boundScope) throw Error("receipt scope mismatch");
@@ -85,8 +90,11 @@ export function postgresPublicationRetryStore(db: SqlExecutor, boundScope: strin
         validateRetry(retry, token);
         return { token, state: retry.state, attempts: retry.attempts, due_ms: retry.due };
       });
-      const { rows } = await db.query<{ committed: boolean }>(commitSql(version === 0 ? insertFirst : advance),
-        [scope, next.version, JSON.stringify(scan), next.retryTurn, version, JSON.stringify(mutations)]);
+      const guard = lease ? " AND EXISTS (SELECT 1 FROM reservation)" : "";
+      const cas = version === 0 ? insertFirst(guard) : advance(guard);
+      const { rows } = await db.query<{ committed: boolean }>(commitSql(cas, !!lease),
+        [scope, next.version, JSON.stringify(scan), next.retryTurn, version, JSON.stringify(mutations),
+          ...(lease ? [lease.fleet, lease.token] : [])]);
       if (rows.length !== 1 || typeof rows[0]!.committed !== "boolean") throw Error("unknown checkpoint outcome");
       return rows[0]!.committed;
     },

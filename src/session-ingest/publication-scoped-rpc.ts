@@ -22,7 +22,7 @@ const refuse = (code: string): never => {
   throw Object.assign(new Error("publication_scoped_" + code), { code: "publication_scoped_" + code });
 };
 
-function bindScope(binding: PublicationScopeBinding, expected: PublicationTarget): PublicationScopeBinding {
+export function validatedPublicationScope(binding: PublicationScopeBinding, expected: PublicationTarget): PublicationScopeBinding {
   if (!binding || !expected) refuse("binding");
   const { planSha256, admissionId, frontierSha256, tenant, target } = binding;
   if (typeof planSha256 !== "string" || typeof frontierSha256 !== "string" || typeof admissionId !== "string" || !SHA.test(planSha256) || !SHA.test(frontierSha256) || !UUID.test(admissionId) || !tenant || !target) refuse("binding");
@@ -38,7 +38,7 @@ function bindScope(binding: PublicationScopeBinding, expected: PublicationTarget
 }
 
 export function scopedPublicationRpc(db: SemanticBoundedSql, expected: PublicationTarget, input: PublicationScopeBinding): PublicationRpc {
-  const binding = bindScope(input, expected);
+  const binding = validatedPublicationScope(input, expected);
   const { target, tenant } = binding;
   const ordinary = publicationRpc(db, target);
   const call = publicationRpcCaller(db, target.generation);
