@@ -5,6 +5,10 @@
  * publisher against a MinIO-shaped fake), then the real queue consumers drive the committed head through
  * `object-landed` and the managed authority path of `session-indexed` (hoopDbSessionIndex with the
  * publication transaction), as publication-pickup.ts does. Nothing here reads a credential or the network.
+ *
+ * Rev 6 (R5f, R5g): `beforeAuthority` mutates the committed publication state BEFORE the retired case and the
+ * current authority transaction run, so the real §2 writer sees it; `siblingHead` seeds a second live head of the
+ * same canonical scope (cloned from the real one, triggers off) for the clock aggregate.
  */
 import { expect } from "bun:test";
 import { PGlite } from "@electric-sql/pglite";
@@ -15,7 +19,7 @@ import { join } from "node:path";
 import { SESSION_BOOTSTRAP_FILES } from "../../hoopdb/session-bootstrap-chain.ts";
 import { createS3Store, type ObjectStore } from "../../../packages/object-store/src/index.ts";
 import { objectStoreManifestReader, type StageMessage } from "../../shared/vendor.ts";
-import { pollPostgresStage, postgresPipelineQueue } from "@rhc/lib/pipeline/queue.ts";
+import { pollPostgresStage, postgresPipelineQueue, type PollResult } from "@rhc/lib/pipeline/queue.ts";
 import { objectLandedHandler, sessionIndexedHandler } from "@rhc/lib/pipeline/stages.ts";
 import { InMemoryPipelineEventSink } from "@rhc/lib/pipeline/events.ts";
 import { InMemoryDeadLetterStore, type StageQueueDeps } from "@rhc/lib/pipeline/dlq.ts";
@@ -59,13 +63,57 @@ export interface PublishedHead {
   retired: { outcome: unknown; jobsWritten: number };
   /** All pipeline_jobs rows after the current authority path committed. */
   jobsAfter: Array<{ stage: string; message: StageMessage }>;
-  /** session_directory epoch of the canonical scope after the authority transaction. */
-  epoch: string;
+  /** session_directory epoch of the canonical scope after the authority transaction (null when none committed). */
+  epoch: string | null;
+  /** The real consumer's result for the current `session-indexed` delivery (the authority transaction). */
+  authority: PollResult;
   close(): Promise<void>;
 }
 
+export interface PublishedHeadOptions {
+  /**
+   * Runs after the publish and `object-landed`, BEFORE the retired case and the current authority transaction:
+   * the committed state the §2 writer then reads. `key` is the real head's current_key.
+   */
+  beforeAuthority?: (fixture: { db: PGlite; key: string; publishedAt: string }) => Promise<void>;
+  /**
+   * Default true: the current authority delivery must ack, and the fan-out soundness checks run. false (R5g): the
+   * delivery's poll result is returned unchecked, for the test to assert.
+   */
+  expectAuthorityAck?: boolean;
+}
+
+/**
+ * A sibling head of the real one (heads, generations, attempts, images, session_index cloned, each column overridden
+ * as given), seeded with triggers off (session_replication_role = replica): the rows are the state the §2 clock
+ * query reads, not a path under test. Its key is `<real key>.<tag>`, its machine `srv_<tag with '-' as '_'>`.
+ */
+export async function siblingHead(db: PGlite, realKey: string, tag: string,
+  o: { publishedAt: string; headState?: "live" | "retired"; deleted?: boolean; canonical?: string }) {
+  const generation = crypto.randomUUID(), attempt = crypto.randomUUID();
+  const machine = `srv_${tag.replace(/-/g, "_")}`, origin = `origin-${tag}`;
+  await db.transaction(async (tx) => {
+    await tx.query("SET LOCAL session_replication_role = replica");
+    const key = (await tx.query<{ key: string }>("SELECT current_key || '.' || $1 AS key FROM sessions.ingest_publication_heads WHERE current_key = $2", [tag, realKey])).rows[0]!.key;
+    const clone = (table: string, where: string, patch: Record<string, unknown>) => tx.query(
+      `INSERT INTO sessions.${table} SELECT (jsonb_populate_record(NULL::sessions.${table}, to_jsonb(t) || $1::jsonb)).* FROM sessions.${table} t WHERE ${where}`,
+      [JSON.stringify(patch)]);
+    const one = async (p: Promise<{ affectedRows?: number }>) => expect((await p).affectedRows).toBe(1);
+    await one(clone("ingest_publication_heads", `current_key = '${realKey}'`, { origin_id: origin, machine_id: machine, generation, current_key: key, state: o.headState ?? "live" }));
+    await one(clone("ingest_publication_generations", `generation = (SELECT generation FROM sessions.ingest_publication_heads WHERE current_key = '${realKey}')`,
+      { generation, prefix: `${tag}-${generation}`, origin_id: origin, state: o.headState ?? "live" }));
+    await one(clone("ingest_publication_attempts", "state = 'published' AND attempt_token = (SELECT attempt_token FROM sessions.ingest_publication_images WHERE manifest_key = '" + realKey + "')",
+      { attempt_token: attempt, published_at: o.publishedAt }));
+    await one(clone("ingest_publication_images", `manifest_key = '${realKey}'`, { attempt_token: attempt, generation, manifest_key: key }));
+    await one(clone("session_index", `manifest_key = '${realKey}'`, {
+      machine_id: machine, manifest_key: key, deleted_at: o.deleted ? o.publishedAt : null,
+      ...(o.canonical ? { session_id: o.canonical, canonical_session_id: o.canonical } : {}),
+    }));
+  });
+}
+
 /** Publishes one session, then runs `object-landed` and the managed `session-indexed` authority path. */
-export async function publishedHead(): Promise<PublishedHead> {
+export async function publishedHead(opts: PublishedHeadOptions = {}): Promise<PublishedHead> {
   const db = new PGlite({ extensions: { btree_gin, pg_trgm } });
   const owner = async (sql: string, args: unknown[] = []) => db.query<any>(sql, args as never);
   const asIngest = async (sql: string, args: unknown[] = []) => {
@@ -122,6 +170,7 @@ export async function publishedHead(): Promise<PublishedHead> {
   expect(indexedRows).toHaveLength(1);
   const indexed = indexedRows[0].message as StageMessage;
   await owner("UPDATE sessions.pipeline_jobs SET visible_at='2000-01-01' WHERE stage='session-indexed'");
+  await opts.beforeAuthority?.({ db, key, publishedAt: attempt[0].published_at });
 
   // The retired case: a retirement ordered before the worker's final lock. Count what the authority path
   // writes inside that transaction, then roll the whole scenario back (publication-pickup.ts's pattern).
@@ -137,19 +186,23 @@ export async function publishedHead(): Promise<PublishedHead> {
     throw rollback;
   })).rejects.toBe(rollback);
 
-  // The current case: the real authority transaction commits.
-  expect(await pollPostgresStage({ ...options, stage: "session-indexed" })).toMatchObject({ claimed: 1, acked: 1, retried: 0 });
+  // The current case: the real authority transaction.
+  const authority = await pollPostgresStage({ ...options, stage: "session-indexed" });
+  const ack = opts.expectAuthorityAck ?? true;
+  if (ack) expect(authority).toMatchObject({ claimed: 1, acked: 1, retried: 0 });
   const jobsAfter = (await owner("SELECT stage, message FROM sessions.pipeline_jobs ORDER BY id")).rows as PublishedHead["jobsAfter"];
   const p = pointer[0];
   const dir = (await owner("SELECT event_projection_epoch::text AS epoch FROM sessions.session_directory WHERE org_id=$1 AND workspace_id=$2 AND harness=$3 AND session_id=$4",
     [p.org_id, p.workspace_id, p.harness, p.canonical])).rows;
   // Fixture soundness: the authority transaction projected the directory row and fanned out.
-  expect(dir).toHaveLength(1);
-  expect(jobsAfter.some((j) => j.stage === "summary-short")).toBe(true);
+  if (ack) {
+    expect(dir).toHaveLength(1);
+    expect(jobsAfter.some((j) => j.stage === "summary-short")).toBe(true);
+  }
   return {
     db, store, key,
     scope: { orgId: p.org_id, workspaceId: p.workspace_id, harness: p.harness, sessionId: p.session_id, canonicalSessionId: p.canonical },
-    publishedAt: attempt[0].published_at, indexed, retired, jobsAfter, epoch: dir[0].epoch,
+    publishedAt: attempt[0].published_at, indexed, retired, jobsAfter, epoch: dir[0]?.epoch ?? null, authority,
     close: () => db.close(),
   };
 }

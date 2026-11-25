@@ -1,10 +1,10 @@
 /**
- * RED until M2 (docs/handoffs/incremental-search-indexing.md rev 5, §10): the committed `search-index` wake.
+ * RED until M2 (docs/handoffs/incremental-search-indexing.md rev 6, §10): the committed `search-index` wake.
  *
  * Production-path coupling (rev 5 §10). Every race, settlement, replay, park and catch-up test drives the REAL
  * M2 entry points of `src/session-pipeline/search-jobs.ts`:
  *   enqueueSearchWake, claimSearchJobs, settleSearchJob (done | {retry} | exhausted), replaySearchDeadLetter,
- *   catchUpTick, runSearchJob, parkSearchJobs.
+ *   catchUpTick, runSearchJob, parkSearchJobs, and (rev 6 §8) searchStageDownPrecondition, archiveSearchStage.
  * No test runs the design's enqueue / settlement / replay / tick / park SQL itself, so a migration (or a stub export
  * plus a migration) can never turn them green: each asserts concrete table state after the call that a no-op
  * export cannot produce. Fixtures (seeding rows, simulating a crash by expiring a lease, raising `attempts`) use
@@ -12,14 +12,23 @@
  *
  * What stays red for another reason, each the intended absence:
  *   - R6 / R6m: the closed stage lists (§7) and therefore `checked()`;
- *   - R1c+ / R5a: the authority-path writer (§2);
+ *   - R1c+ / R5a / R5f / R5g: the authority-path writer (§2);
  *   - R3a: today's erase-on-absence behaviour of `indexSearchScope` (§4.2);
  *   - R6w: the Lambda's search-job loop (lambda.ts imports and calls claimSearchJobs / settleSearchJob).
- * Green guards (green today, must stay green): R1c- (a retired publication writes no job) and R6g (no generic
- * runWorker registers the stage).
+ * Green guards (green today, must stay green): R1c- (a retired publication writes no job), R5f- (a retired trigger
+ * writes no job even beside a valid newer sibling) and R6g (no generic runWorker registers the stage).
  *
  * Message shape (§2): `payload = { epoch, clock: { source: 'publish' | 'pointer', at } }`. One dead letter per
- * scope (§3.3, §3.3b): id `'search-index:' || work_key`. R7 is deferred to M3 and is not in this file.
+ * scope (§3.3, §3.3b) [rev 6]: id = the repository's canonical `deadLetterId('search-index', ctx, workKey)`
+ * (dlq.ts), imported here, never re-derived; the R8 and R9 scopes carry ':' and ' ' so the URI encoding is proven.
+ * The `resolution` column (rev 6 §3.3b) is read only after an M2 call, so its absence is never the red reason.
+ *
+ * Contracts this file fixes where the design leaves a choice:
+ *   - settleSearchJob under a lost lease returns `{ applied: false }` (never throws) and touches nothing (R1d, R4b).
+ *   - R5g, a managed scope with no provable publish clock: the authority-path writer THROWS, so the session-indexed
+ *     delivery does not ack (it retries) and the authority transaction rolls back: no job of any stage, and never a
+ *     `pointer` clock. That is the design's "fail closed" with the delivery's error as the surfaced error.
+ * R7 is deferred to M3 and is not in this file.
  *
  * Synthetic, secret-free data only.
  * Run: ~/.local/bin/aw-heavy -- bun test src/session-pipeline/__tests__/search-jobs.red.pglite.test.ts
@@ -30,7 +39,7 @@ import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import { PIPELINE_STAGES } from "@rhc/lib/pipeline/trace.ts";
 import { QUEUED_STAGES, STAGE_REGISTRY } from "@rhc/lib/pipeline/registry.ts";
-import { InMemoryDeadLetterStore, isStageMessage, stageForQueue, stageQueueName, type StageMessage, type StageQueueDeps } from "@rhc/lib/pipeline/dlq.ts";
+import { InMemoryDeadLetterStore, deadLetterId, isStageMessage, stageForQueue, stageQueueName, type StageMessage, type StageQueueDeps } from "@rhc/lib/pipeline/dlq.ts";
 import { MemoryPipelineQueue, postgresPipelineQueue, postgresStageConsumer } from "@rhc/lib/pipeline/queue.ts";
 import { InMemoryPipelineEventSink } from "@rhc/lib/pipeline/events.ts";
 import { postgresDeadLetterStore } from "@rhc/lib/pipeline/postgres-dead-letters.ts";
@@ -42,7 +51,7 @@ import { indexSearchScope, type SearchIndexDeps } from "../search-index.ts";
 import { SCOPE, activity, exportStreamScope, generate, type ExportedScope, type Line } from "../../session-read-api/__tests__/stream-fixture.ts";
 import { addReplayPointer, clonedReplayDatabase, closeReplayTemplate, warmReplayTemplate } from "./replay-fixture.ts";
 import { hostedRig } from "./search-index-hosted-harness.ts";
-import { publishedHead, type PublishedHead } from "./search-jobs-publication.ts";
+import { publishedHead, siblingHead, type PublishedHead } from "./search-jobs-publication.ts";
 
 const STAGE = "search-index";
 const root = join(import.meta.dir, "../../..");
@@ -104,8 +113,11 @@ function stageMessage(stage: string, scope: Scope, workKey: string, payload: Rec
 
 /** Design §2: `search␟<org>␟<ws>␟<harness>␟<canonical session id>`. */
 const searchWorkKey = (s: Scope) => ["search", s.orgId, s.workspaceId, s.harness, s.sessionId].join("\u001f");
-/** Design §3.3 / §3.3b [rev 5]: one dead letter per scope, id `'search-index:' || work_key`. */
-const letterIdOf = (s: Scope) => `${STAGE}:${searchWorkKey(s)}`;
+/**
+ * Design §3.3 / §3.3b [rev 6]: one dead letter per scope, id = the canonical deadLetterId('search-index', ctx,
+ * workKey) of dlq.ts ('search-index:' || encodeURIComponent(org) || ':' || encodeURIComponent(ws) || ':' || workKey).
+ */
+const letterIdOf = (s: Scope) => deadLetterId(STAGE as never, s, searchWorkKey(s));
 
 const publishClock = (at: string = new Date().toISOString()): Clock => ({ source: "publish", at });
 
@@ -129,8 +141,11 @@ type SearchJobsModule = {
   enqueueSearchWake: (sql: PGlite, message: StageMessage) => Promise<unknown>;
   /** §3.2: claims up to n visible search-index jobs (lease + counted attempt), recording the claimed epoch and message. */
   claimSearchJobs: (sql: PGlite, n: number) => Promise<ClaimedSearchJob[]>;
-  /** §3.3 (+ §3.3b completion): the stage-specific, lease-bound, claimed-epoch-aware settlement. */
-  settleSearchJob: (sql: PGlite, claim: { id: string | number; lease: string; claimedEpoch: number; claimedMessage: StageMessage }, outcome: SettleOutcome) => Promise<unknown>;
+  /**
+   * §3.3 (+ §3.3b completion): the stage-specific, lease-bound, claimed-epoch-aware settlement. A lost lease
+   * (0 rows for (id, lease)) returns `{ applied: false }` and changes nothing.
+   */
+  settleSearchJob: (sql: PGlite, claim: { id: string | number; lease: string; claimedEpoch: number; claimedMessage: StageMessage }, outcome: SettleOutcome) => Promise<{ applied: boolean } | unknown>;
   /** §3.3b: the stage-aware replay of one letter. */
   replaySearchDeadLetter: (sql: PGlite, letterId: string) => Promise<unknown>;
   /** §6: one catch-up tick (global keyset cursor, fairness, wrap) with the §2 clock lookup. */
@@ -143,6 +158,10 @@ type SearchJobsModule = {
   }>;
   /** §8 park path: one fenced transaction parks every search-index row into its scope letter. */
   parkSearchJobs: (sql: PGlite, opts: { operator: string }) => Promise<unknown>;
+  /** §8 [rev 6]: the down migration's precondition: 0 search-index rows in pipeline_jobs, pipeline_events AND pipeline_dead_letters. */
+  searchStageDownPrecondition: (sql: PGlite) => Promise<boolean>;
+  /** §8 [rev 6]: the operator archive: export the stage's resolved letters and its events (counts, sha256), then delete them. */
+  archiveSearchStage: (sql: PGlite) => Promise<{ letters: number; events: number; sha256: string }>;
 };
 type M2Name = keyof SearchJobsModule;
 
@@ -354,8 +373,8 @@ describe("R1: one row per scope, claim and settlement (design §3)", () => {
     await enqueueSearchWake(db.pg, wake(scope, 7));
     const c = await claimOne(db.pg, claimSearchJobs);
     await enqueueSearchWake(db.pg, wake(scope, 8));
-    // A settlement under a lost lease touches nothing.
-    await Promise.resolve(settleSearchJob(db.pg, { ...c, lease: crypto.randomUUID() }, "done")).catch(() => undefined);
+    // A settlement under a lost lease reports {applied: false} (the contract this file fixes) and touches nothing.
+    expect(await settleSearchJob(db.pg, { ...c, lease: crypto.randomUUID() }, "done")).toEqual({ applied: false });
     expect((await jobs(db.pg, WK)).map((j) => ({ epoch: j.epoch, lease_id: j.lease_id }))).toEqual([{ epoch: "8", lease_id: c.lease }]);
     await settleSearchJob(db.pg, c, "done");
     expect((await jobs(db.pg, WK)).map((j) => ({ id: j.id, epoch: j.epoch, lease_id: j.lease_id, visible: j.visible, attempts: j.attempts })))
@@ -492,33 +511,8 @@ describe("R1c/R5a/R5c/R5e: the wake is written inside the publication-authority 
   // Mutates head.db (adds sibling heads, drops the wake): keep it last in this block.
   test("R5e: two live heads for one canonical scope: the clock is the later published_at; retired, deleted and other-scope heads are excluded", async () => {
     const at = (ms: number) => new Date(Date.parse(head.publishedAt) + ms).toISOString();
-    /**
-     * Fixture: a sibling head cloned from the real one (heads, generations, attempts, images, session_index), each
-     * column overridden as given. Seeded with triggers off (session_replication_role = replica): the rows are the
-     * state the §2 clock query reads, not a path under test.
-     */
-    async function sibling(n: number, o: { publishedAt: string; headState?: "live" | "retired"; deleted?: boolean; canonical?: string }) {
-      const generation = crypto.randomUUID(), attempt = crypto.randomUUID();
-      const machine = `srv_r5e_${n}`, origin = `origin-r5e-${n}`;
-      await head.db.transaction(async (tx) => {
-        await tx.query("SET LOCAL session_replication_role = replica");
-        const key = (await tx.query<{ key: string }>("SELECT current_key || '.r5e-' || $1 AS key FROM sessions.ingest_publication_heads WHERE current_key = $2", [String(n), head.key])).rows[0]!.key;
-        const clone = (table: string, where: string, patch: Record<string, unknown>) => tx.query(
-          `INSERT INTO sessions.${table} SELECT (jsonb_populate_record(NULL::sessions.${table}, to_jsonb(t) || $1::jsonb)).* FROM sessions.${table} t WHERE ${where}`,
-          [JSON.stringify(patch)]);
-        const one = async (p: Promise<{ affectedRows?: number }>) => expect((await p).affectedRows).toBe(1);
-        await one(clone("ingest_publication_heads", `current_key = '${head.key}'`, { origin_id: origin, machine_id: machine, generation, current_key: key, state: o.headState ?? "live" }));
-        await one(clone("ingest_publication_generations", `generation = (SELECT generation FROM sessions.ingest_publication_heads WHERE current_key = '${head.key}')`,
-          { generation, prefix: `r5e-${n}-${generation}`, origin_id: origin, state: o.headState ?? "live" }));
-        await one(clone("ingest_publication_attempts", "state = 'published' AND attempt_token = (SELECT attempt_token FROM sessions.ingest_publication_images WHERE manifest_key = '" + head.key + "')",
-          { attempt_token: attempt, published_at: o.publishedAt }));
-        await one(clone("ingest_publication_images", `manifest_key = '${head.key}'`, { attempt_token: attempt, generation, manifest_key: key }));
-        await one(clone("session_index", `manifest_key = '${head.key}'`, {
-          machine_id: machine, manifest_key: key, deleted_at: o.deleted ? o.publishedAt : null,
-          ...(o.canonical ? { session_id: o.canonical, canonical_session_id: o.canonical } : {}),
-        }));
-      });
-    }
+    // Fixture: sibling heads cloned from the real one (siblingHead, triggers off): the state the §2 clock query reads.
+    const sibling = (n: number, o: Parameters<typeof siblingHead>[3]) => siblingHead(head.db, head.key, `r5e-${n}`, o);
     await sibling(1, { publishedAt: at(5_000) });                                  // the later live head: the expected clock
     await sibling(2, { publishedAt: at(60_000), headState: "retired" });           // excluded: retired head
     await sibling(3, { publishedAt: at(60_000), deleted: true });                  // excluded: its pointer row is deleted
@@ -537,6 +531,103 @@ describe("R1c/R5a/R5c/R5e: the wake is written inside the publication-authority 
     expect(found).toHaveLength(1);
     expect(found[0]!.message.payload.clock.source).toBe("publish");
     expect(new Date(found[0]!.message.payload.clock.at).toISOString()).toBe(at(5_000));
+  });
+});
+
+// ---------------------------------------------------------------------------------------------------------
+describe("R5f: an OLDER live head triggers the authority enqueue beside a NEWER sibling of the same canonical scope (design §2 [rev 6])", () => {
+  // Built with ONE real publication through the authority path plus seeded sibling heads (triggers off, as R5e):
+  // a second real publication of the same canonical session from another machine needs a second frontier, seat
+  // clock and ledger origin the portable fixture does not model. The siblings are seeded BEFORE the real authority
+  // transaction (publishedHead's beforeAuthority hook), so the real §2 writer reads them when it enqueues.
+  let head: PublishedHead;
+  let newer = "", retiredLater = "";
+  beforeAll(async () => {
+    head = await publishedHead({
+      beforeAuthority: async ({ db, key, publishedAt }) => {
+        const at = (ms: number) => new Date(Date.parse(publishedAt) + ms).toISOString();
+        newer = at(5_000);
+        retiredLater = at(60_000);
+        await siblingHead(db, key, "r5f-1", { publishedAt: newer });                                // the NEWER live sibling
+        await siblingHead(db, key, "r5f-2", { publishedAt: retiredLater, headState: "retired" });    // excluded: retired
+      },
+    });
+  }, 180_000);
+  afterAll(() => head?.close());
+
+  /** Fixture soundness: two live heads of the canonical scope; the trigger is the OLDER one; the newer is a sibling. */
+  async function siblingsAreSound() {
+    const { rows } = await head.db.query<{ key: string; machine_id: string; state: string; published_at: string }>(
+      `SELECT h.current_key AS key, h.machine_id, h.state, to_char(a.published_at AT TIME ZONE 'UTC','YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS published_at
+         FROM sessions.ingest_publication_heads h
+         JOIN sessions.ingest_publication_images i ON i.manifest_key = h.current_key
+         JOIN sessions.ingest_publication_attempts a ON a.attempt_token = i.attempt_token
+        ORDER BY a.published_at`);
+    expect(rows.map((r) => [r.key, r.state, r.published_at])).toEqual([
+      [head.key, "live", head.publishedAt], [`${head.key}.r5f-1`, "live", newer], [`${head.key}.r5f-2`, "retired", retiredLater]]);
+    // The session-indexed delivery that ran the authority path names the real (older) head's key.
+    expect((head.indexed.payload as { manifestKey?: string }).manifestKey).toBe(head.key);
+    expect(Date.parse(newer)).toBeGreaterThan(Date.parse(head.publishedAt));
+  }
+
+  test("R5f+: the job written by the OLDER head's authority transaction carries clock.at = the NEWER live sibling's published_at", async () => {
+    await siblingsAreSound();
+    const found = head.jobsAfter.filter((j) => j.stage === STAGE);
+    expect(found).toHaveLength(1);
+    const m = found[0]!.message as StageMessage<WakePayload>;
+    expect(m.ctx.sessionId).toBe(head.scope.canonicalSessionId);
+    expect(m.payload.clock.source).toBe("publish");
+    expect(new Date(m.payload.clock.at).toISOString()).toBe(newer);
+    expect(new Date(m.payload.clock.at).toISOString()).not.toBe(head.publishedAt);
+  });
+
+  test("R5f- (guard, green today): a RETIRED trigger writes no job even though a valid newer sibling exists", async () => {
+    // The trigger is validated by its OWN authority (session_publication_lock), never by a sibling's clock. The
+    // retired case ran after the siblings were seeded (beforeAuthority), inside its own rolled-back transaction.
+    await siblingsAreSound();
+    expect(head.retired.outcome).toEqual({ status: "skipped", reason: "publication_retired" });
+    expect(head.retired.jobsWritten).toBe(0);
+  });
+});
+
+// ---------------------------------------------------------------------------------------------------------
+describe("R5g: a managed scope whose publish clock is unprovable fails closed (design §2 [rev 6])", () => {
+  // The real head's own attempt loses its published_at (triggers off) BEFORE the real authority transaction, so the
+  // §2 clock aggregate is NULL for a managed, live, current scope. The contract this file fixes (header): the writer
+  // THROWS, the delivery does not ack and the authority transaction rolls back. No job, never a pointer clock.
+  let head: PublishedHead;
+  beforeAll(async () => {
+    head = await publishedHead({
+      expectAuthorityAck: false,
+      beforeAuthority: async ({ db, key }) => {
+        await db.transaction(async (tx) => {
+          await tx.query("SET LOCAL session_replication_role = replica");
+          const r = await tx.query(`UPDATE sessions.ingest_publication_attempts SET published_at = NULL
+            WHERE attempt_token = (SELECT attempt_token FROM sessions.ingest_publication_images WHERE manifest_key = $1) RETURNING 1`, [key]);
+          expect(r.rows).toHaveLength(1);
+        });
+      },
+    });
+  }, 180_000);
+  afterAll(() => head?.close());
+
+  test("R5g: NULL published_at on the managed head: no search-index job, the authority delivery surfaces an error (no ack), never clock.source 'pointer'", async () => {
+    // Fixture soundness: the head is live, its generation live and its attempt published; only the clock is missing.
+    const { rows } = await head.db.query<{ state: string; gen_state: string; attempt_state: string; unclocked: boolean }>(
+      `SELECT h.state, g.state AS gen_state, a.state AS attempt_state, a.published_at IS NULL AS unclocked
+         FROM sessions.ingest_publication_heads h
+         JOIN sessions.ingest_publication_generations g ON g.generation = h.generation
+         JOIN sessions.ingest_publication_images i ON i.manifest_key = h.current_key
+         JOIN sessions.ingest_publication_attempts a ON a.attempt_token = i.attempt_token
+        WHERE h.current_key = $1`, [head.key]);
+    expect(rows).toEqual([{ state: "live", gen_state: "live", attempt_state: "published", unclocked: true }]);
+    // Never a job with a pointer clock, and no search-index job at all.
+    expect(head.jobsAfter.filter((j) => (j.message.payload as Partial<WakePayload> | undefined)?.clock?.source === "pointer")).toEqual([]);
+    expect(head.jobsAfter.filter((j) => j.stage === STAGE)).toEqual([]);
+    // The error is surfaced: the authority delivery does not ack; it is retried and its transaction rolled back, so
+    // the queue holds only the session-indexed delivery (no fan-out, no wake).
+    expect(head.authority).toMatchObject({ claimed: 1, acked: 0, retried: 1, exhausted: 0 });
+    expect(head.jobsAfter.map((j) => j.stage)).toEqual(["session-indexed"]);
   });
 });
 
@@ -742,7 +833,7 @@ describe("R4: acceptance held past max attempts, quarantined through settleSearc
   }, 120_000);
   afterAll(() => held?.dispose());
 
-  test("R4: twelve held passes exhaust: ONE letter 'search-index:'||work_key with the claimed snapshot; the scope stays not ready and out of search; a re-death increments dead_count", async () => {
+  test("R4: twelve held passes exhaust: ONE letter deadLetterId('search-index', ctx, work_key) with the claimed snapshot; the scope stays not ready and out of search; a re-death increments dead_count", async () => {
     const r = await hostedRig(held, cleanup);
     await queueIsSound(r.db.pg);
     await deadLettersAreSound(r.db.pg);
@@ -809,8 +900,8 @@ describe("R4: acceptance held past max attempts, quarantined through settleSearc
     await enqueueSearchWake(db.pg, wake(scope, 8));
     expect((await jobs(db.pg, WK)).map((j) => ({ id: j.id, epoch: j.epoch, lease_id: j.lease_id, attempts: j.attempts })))
       .toEqual([{ id: String(c.id), epoch: "8", lease_id: c.lease, attempts: 0 }]);
-    // A lost lease aborts the whole settlement: nothing parked, nothing deleted, the lease untouched.
-    await Promise.resolve(settleSearchJob(db.pg, { ...c, lease: crypto.randomUUID() }, "exhausted")).catch(() => undefined);
+    // A lost lease aborts the whole settlement: {applied: false}, nothing parked, nothing deleted, the lease untouched.
+    expect(await settleSearchJob(db.pg, { ...c, lease: crypto.randomUUID() }, "exhausted")).toEqual({ applied: false });
     expect(await letters(db.pg)).toEqual([]);
     expect((await jobs(db.pg, WK)).map((j) => ({ epoch: j.epoch, lease_id: j.lease_id }))).toEqual([{ epoch: "8", lease_id: c.lease }]);
     // N exhausts under its lease.
@@ -826,9 +917,13 @@ describe("R4: acceptance held past max attempts, quarantined through settleSearc
 
 // ---------------------------------------------------------------------------------------------------------
 describe("R8: scope-keyed dead-letter replay, through replaySearchDeadLetter and settleSearchJob (design §3.3b)", () => {
-  const scope = { orgId: "org_r8", workspaceId: "ws_r8", harness: "claude", sessionId: "s_r8" };
+  // An org and a workspace that need URI encoding: the letter id must be dlq.ts's canonical deadLetterId.
+  const scope = { orgId: "org:r8 enc", workspaceId: "ws r8:x", harness: "claude", sessionId: "s_r8" };
   const WK = searchWorkKey(scope);
   const LETTER = letterIdOf(scope);
+  /** The rev 6 `resolution` column. Read only after an M2 call (the column is absent until M2's migration). */
+  const resolutionOf = async (pg: PGlite) => (await pg.query<{ resolution: string | null }>(
+    "SELECT resolution FROM sessions.pipeline_dead_letters WHERE id = $1", [LETTER])).rows.map((r) => r.resolution);
   const m2r8 = () => m2("enqueueSearchWake", "claimSearchJobs", "settleSearchJob", "replaySearchDeadLetter");
   type R8 = Awaited<ReturnType<typeof m2r8>>;
   const letter = async (pg: PGlite) => {
@@ -849,6 +944,8 @@ describe("R8: scope-keyed dead-letter replay, through replaySearchDeadLetter and
   }
 
   async function letterAt(db: Db, f: R8, epoch: number) {
+    // Fixture soundness: the canonical id encodes this scope's ':' and ' ' (dlq.ts deadLetterId).
+    expect(LETTER).toBe(`search-index:org%3Ar8%20enc:ws%20r8%3Ax:${WK}`);
     await deadLettersAreSound(db.pg);
     const snapshot = await deathAt(db.pg, f, epoch);
     const l = await letter(db.pg);
@@ -875,6 +972,8 @@ describe("R8: scope-keyed dead-letter replay, through replaySearchDeadLetter and
     await f.settleSearchJob(db.pg, c, "done");
     expect(await jobs(db.pg, WK)).toEqual([]);
     expect(await letter(db.pg)).toMatchObject({ state: "resolved", resolved: true, replay_count: 1 });
+    // A newer epoch (8) covered the letter's (7).
+    expect(await resolutionOf(db.pg)).toEqual(["superseded"]);
   }, 120_000);
 
   test("R8b: merged — no row exists: the replay enqueues the letter's message N; its done resolves the letter; a second replay of a resolved letter is a no-op", async () => {
@@ -892,10 +991,13 @@ describe("R8: scope-keyed dead-letter replay, through replaySearchDeadLetter and
     await f.settleSearchJob(db.pg, c, "done");
     expect(await jobs(db.pg, WK)).toEqual([]);
     expect(await letter(db.pg)).toMatchObject({ state: "resolved", resolved: true });
+    // The completed epoch equals the letter's.
+    expect(await resolutionOf(db.pg)).toEqual(["completed"]);
     // Replay claims only a dead letter.
     await Promise.resolve(f.replaySearchDeadLetter(db.pg, LETTER)).catch(() => undefined);
     expect(await jobs(db.pg, WK)).toEqual([]);
     expect(await letter(db.pg)).toMatchObject({ state: "resolved", resolved: true, replay_count: 1 });
+    expect(await resolutionOf(db.pg)).toEqual(["completed"]);
   }, 120_000);
 
   test("R8c: the rev-4 race — replay N, claim N, wake N+1, done N reopens, claim N+1, done N+1: the letter is resolved", async () => {
@@ -910,11 +1012,16 @@ describe("R8: scope-keyed dead-letter replay, through replaySearchDeadLetter and
     // done N fails the epoch guard and reopens the single row with N+1 (no replay handle in the message).
     expect((await jobs(db.pg, WK)).map((j) => ({ id: j.id, epoch: j.epoch, lease_id: j.lease_id, visible: j.visible, attempts: j.attempts })))
       .toEqual([{ id: String(cN.id), epoch: "8", lease_id: null, visible: true, attempts: 0 }]);
+    // The reopened row is not a completion: the letter is still replaying, unresolved.
+    expect(await letter(db.pg)).toMatchObject({ state: "replaying", resolved: false, replay_count: 1, dead_count: 1 });
+    expect(await resolutionOf(db.pg)).toEqual([null]);
     const cN1 = await claimOne(db.pg, f.claimSearchJobs);
     expect(cN1.claimedEpoch).toBe(8);
     await f.settleSearchJob(db.pg, cN1, "done");
     expect(await jobs(db.pg, WK)).toEqual([]);
+    // Only N+1's completion resolves it, as superseded.
     expect(await letter(db.pg)).toMatchObject({ state: "resolved", resolved: true, replay_count: 1, dead_count: 1 });
+    expect(await resolutionOf(db.pg)).toEqual(["superseded"]);
     expect(await postgresDeadLetterStore(db.pg).list({ stage: STAGE as never, states: ["replaying"] })).toEqual([]);
   }, 120_000);
 
@@ -948,43 +1055,87 @@ describe("R8: scope-keyed dead-letter replay, through replaySearchDeadLetter and
 });
 
 // ---------------------------------------------------------------------------------------------------------
-describe("R9: the park path, through parkSearchJobs (design §8)", () => {
-  test("R9: park moves every search-index row into its scope letter (state dead, current message, dead_count bumped); the down-migration precondition holds", async () => {
-    const db = await migrated();
+describe("R9: the park path and the held down migration, through parkSearchJobs (design §8 [rev 6])", () => {
+  // An org that needs URI encoding: the parked letter ids are dlq.ts's canonical deadLetterId.
+  const a = { orgId: "org:r9 enc", workspaceId: "ws_r9", harness: "claude", sessionId: "s_a" };
+  const b = { ...a, sessionId: "s_b" };
+  const m2r9 = () => m2("enqueueSearchWake", "claimSearchJobs", "settleSearchJob", "replaySearchDeadLetter", "parkSearchJobs",
+    "searchStageDownPrecondition", "archiveSearchStage");
+  type R9 = Awaited<ReturnType<typeof m2r9>>;
+
+  /** The stage's rows in the three tables the down migration checks (plain SELECTs). */
+  async function stageCounts(pg: PGlite) {
+    const n = async (t: string) => (await pg.query<{ n: number }>(`SELECT count(*)::int AS n FROM sessions.${t} WHERE stage = 'search-index'`)).rows[0]!.n;
+    return { jobs: await n("pipeline_jobs"), events: await n("pipeline_events"), letters: await n("pipeline_dead_letters") };
+  }
+
+  /** B died once and was woken again; A is leased by a straggler; another stage's job exists. Then the park. */
+  async function parked(db: Db, f: R9) {
     await deadLettersAreSound(db.pg);
-    const a = { orgId: "org_r9", workspaceId: "ws_r9", harness: "claude", sessionId: "s_a" };
-    const b = { ...a, sessionId: "s_b" };
-    const { enqueueSearchWake, claimSearchJobs, settleSearchJob, parkSearchJobs } = await m2("enqueueSearchWake", "claimSearchJobs", "settleSearchJob", "parkSearchJobs");
-    // B died once already and was woken again at a newer epoch.
-    await enqueueSearchWake(db.pg, wake(b, 3));
-    const cb = await claimOne(db.pg, claimSearchJobs);
+    // Fixture soundness: the canonical ids encode the org's ':' and ' '.
+    expect(letterIdOf(a)).toBe(`search-index:org%3Ar9%20enc:ws_r9:${searchWorkKey(a)}`);
+    await f.enqueueSearchWake(db.pg, wake(b, 3));
+    const cb = await claimOne(db.pg, f.claimSearchJobs);
     await db.pg.query("UPDATE sessions.pipeline_jobs SET attempts = 12 WHERE id = $1::bigint AND lease_id = $2::uuid", [String(cb.id), cb.lease]);
-    await settleSearchJob(db.pg, cb, "exhausted");
+    await f.settleSearchJob(db.pg, cb, "exhausted");
     expect((await letters(db.pg)).map((l) => [l.id, l.dead_count])).toEqual([[letterIdOf(b), 1]]);
-    await enqueueSearchWake(db.pg, wake(b, 4));
+    await f.enqueueSearchWake(db.pg, wake(b, 4));
     // A is leased (a straggler's claim) at the time of the park.
-    await enqueueSearchWake(db.pg, wake(a, 7));
+    await f.enqueueSearchWake(db.pg, wake(a, 7));
     await elapse(db.pg);
-    const claimed = await claimSearchJobs(db.pg, 1);
+    const claimed = await f.claimSearchJobs(db.pg, 1);
     expect(claimed).toHaveLength(1);
     // Another stage's job is never touched.
     await postgresPipelineQueue(db.pg).send(stageMessage("session-indexed", a, "r9-other@1", {}));
     const before = Object.fromEntries([a, b].map((s) => [s.sessionId, null as StageMessage | null]));
     for (const s of [a, b]) { const rows = await jobs(db.pg, searchWorkKey(s)); expect(rows).toHaveLength(1); before[s.sessionId] = rows[0]!.message; }
 
-    await parkSearchJobs(db.pg, { operator: "r9-fixture-operator" });
+    await f.parkSearchJobs(db.pg, { operator: "r9-fixture-operator" });
 
-    // The down-migration precondition (§8): 0 search-index rows in pipeline_jobs.
-    expect((await db.pg.query<{ n: number }>("SELECT count(*)::int AS n FROM sessions.pipeline_jobs WHERE stage = 'search-index'")).rows).toEqual([{ n: 0 }]);
     expect((await db.pg.query<{ stage: string }>("SELECT stage FROM sessions.pipeline_jobs")).rows).toEqual([{ stage: "session-indexed" }]);
-    const parked = await letters(db.pg);
-    expect(parked.map((l) => ({ id: l.id, stage: l.stage, state: l.state, dead_count: l.dead_count, resolved: l.resolved, epoch: l.epoch }))).toEqual([
+    const parkedLetters = await letters(db.pg);
+    expect(parkedLetters.map((l) => ({ id: l.id, stage: l.stage, state: l.state, dead_count: l.dead_count, resolved: l.resolved, epoch: l.epoch }))).toEqual([
       { id: letterIdOf(a), stage: STAGE, state: "dead", dead_count: 1, resolved: false, epoch: "7" },
       { id: letterIdOf(b), stage: STAGE, state: "dead", dead_count: 2, resolved: false, epoch: "4" },
     ].sort((x, y) => (x.id < y.id ? -1 : 1)));
-    for (const l of parked) expect(l.message).toEqual(before[(l.message.ctx as { sessionId: string }).sessionId]!);
-    // Every search-index letter is replayable: none is left replaying.
-    expect(parked.every((l) => l.state === "dead")).toBe(true);
+    for (const l of parkedLetters) expect(l.message).toEqual(before[(l.message.ctx as { sessionId: string }).sessionId]!);
+  }
+
+  test("R9a: after a park (every row in its scope letter, state dead, current message), the down precondition does NOT hold: letters exist", async () => {
+    const db = await migrated();
+    const f = await m2r9();
+    await parked(db, f);
+    const counts = await stageCounts(db.pg);
+    // No search-index job is left, but the parked letters are a promise of replay.
+    expect({ jobs: counts.jobs, letters: counts.letters }).toEqual({ jobs: 0, letters: 2 });
+    expect(counts.events).toBeGreaterThanOrEqual(0);
+    expect(await f.searchStageDownPrecondition(db.pg)).toBe(false);
+  }, 120_000);
+
+  test("R9b: after replay and resolve of every parked letter, then archiveSearchStage, jobs, events and letters are all 0 and the down precondition holds", async () => {
+    const db = await migrated();
+    const f = await m2r9();
+    await parked(db, f);
+    // The consumer is back: replay every parked letter, then claim and complete each scope through the real settler.
+    for (const s of [a, b]) await f.replaySearchDeadLetter(db.pg, letterIdOf(s));
+    for (let n = 0; n < 2; n++) {
+      const c = await claimOne(db.pg, f.claimSearchJobs);
+      expect(await f.settleSearchJob(db.pg, c, "done")).not.toEqual({ applied: false });
+    }
+    expect((await letters(db.pg)).map((l) => ({ id: l.id, state: l.state, resolved: l.resolved }))).toEqual(
+      [a, b].map((s) => ({ id: letterIdOf(s), state: "resolved", resolved: true })).sort((x, y) => (x.id < y.id ? -1 : 1)));
+    expect(await f.searchStageDownPrecondition(db.pg)).toBe(false);
+    // Controls: another stage's letter and job survive the archive.
+    const other = await postgresDeadLetterStore(db.pg).quarantine(stageMessage("session-indexed", a, "r9-other-dl@1", {}), new Date());
+    const { events } = await stageCounts(db.pg);
+
+    const archived = await f.archiveSearchStage(db.pg);
+
+    expect(archived).toEqual({ letters: 2, events, sha256: expect.stringMatching(/^[a-f0-9]{64}$/) });
+    expect(await stageCounts(db.pg)).toEqual({ jobs: 0, events: 0, letters: 0 });
+    expect(await f.searchStageDownPrecondition(db.pg)).toBe(true);
+    expect((await letters(db.pg)).map((l) => l.id)).toEqual([other.id]);
+    expect((await db.pg.query<{ stage: string }>("SELECT stage FROM sessions.pipeline_jobs")).rows).toEqual([{ stage: "session-indexed" }]);
   }, 120_000);
 });
 
