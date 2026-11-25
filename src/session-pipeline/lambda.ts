@@ -156,6 +156,13 @@ export interface LambdaEnv {
   originLabelsEnabled?: boolean;
   /** SEARCH_INDEX_SKIP_CURRENT_ENABLED=true: skip a pass a complete pass already covers (search-index.ts alreadyCurrent). Default off. */
   skipCurrentEnabled?: boolean;
+  /**
+   * SEARCH_INDEX_SKIP_ACCEPTANCE_MISSING_ENABLED=true (default off; same grammar as on the backport lineage): a
+   * scope whose last S3-event pass ended incomplete for relayhistory_acceptance_missing alone, over the same
+   * pointer set, returns that outcome again before any manifest read (search-index.ts acceptance stamp). The
+   * managed search-jobs pass never skips. Absent: as before.
+   */
+  searchSkipAcceptanceMissing?: true;
   /** SEARCH_INDEX_PREREAD_ENABLED=true: read a legacy ClickHouse whole scope before its search lock. Default off. */
   searchPreReadEnabled?: boolean;
   /** SESSION_POINTER_PREREAD_ENABLED=true: the pointer stage reads before its scope lock (pointer.ts indexPreRead). Default off. */
@@ -252,6 +259,10 @@ export function lambdaEnv(env: NodeJS.ProcessEnv = process.env, composition?: Se
   const searchPreRead = searchIndexPreReadFromEnv(env);
   if (searchPreRead && env.SEARCH_INDEX_ENABLED !== "1")
     throw new Error("session pipeline: SEARCH_INDEX_PREREAD_ENABLED=true needs SEARCH_INDEX_ENABLED=1");
+  // SEARCH_INDEX_SKIP_ACCEPTANCE_MISSING_ENABLED: strict grammar, default off; on needs the search stage.
+  const skipAcceptanceMissing = searchIndexSkipAcceptanceMissingFromEnv(env);
+  if (skipAcceptanceMissing && env.SEARCH_INDEX_ENABLED !== "1")
+    throw new Error("session pipeline: SEARCH_INDEX_SKIP_ACCEPTANCE_MISSING_ENABLED=true needs SEARCH_INDEX_ENABLED=1");
   // SESSION_POINTER_PREREAD_ENABLED: strict grammar, default off.
   const pointerPreRead = pointerPreReadFromEnv(env);
   // SESSION_POINTER_SKIP_ORIGIN_BUCKET_ENABLED: strict grammar, default off.
@@ -283,6 +294,7 @@ export function lambdaEnv(env: NodeJS.ProcessEnv = process.env, composition?: Se
     originLabelsEnabled: messageOriginLabelsEnabled(env[MESSAGE_ORIGIN_LABELS_VAR]),
     ...(skipCurrent ? { skipCurrentEnabled: true } : {}),
     ...(searchPreRead ? { searchPreReadEnabled: true } : {}),
+    ...(skipAcceptanceMissing ? { searchSkipAcceptanceMissing: true as const } : {}),
     ...(pointerPreRead ? { pointerPreReadEnabled: true } : {}),
     ...(pointerSkipOriginBucket ? { pointerSkipOriginBucketEnabled: true } : {}),
     ...(searchStreamCh ? { searchStreamCh } : {}),
@@ -579,6 +591,8 @@ export function runtimeFromSecret(env: LambdaEnv, secretText: string, schemaGene
       // Default off; on, a pass the session directory proves current returns before any read (already_current).
       ...(env.skipCurrentEnabled ? { skipCurrent: true as const } : {}),
       ...(env.searchPreReadEnabled ? { preRead: true as const } : {}),
+      // Default off (SEARCH_INDEX_SKIP_ACCEPTANCE_MISSING_ENABLED=true, ClickHouse only).
+      ...(env.searchSkipAcceptanceMissing && !binding ? { skipAcceptanceMissing: true as const } : {}),
       // Default off (SEARCH_INDEX_STREAMING_CH=1, ClickHouse only); the deadline is set per invocation.
       ...(env.searchStreamCh && !binding ? { stream: { maxReadBytes: env.searchStreamCh.maxReadBytes, maxReadEvents: env.searchStreamCh.maxReadEvents } } : {}),
     };
@@ -1170,6 +1184,17 @@ export function searchIndexSkipCurrentFromEnv(env: Record<string, string | undef
   if (value === undefined || value === "" || value === "false") return false;
   if (value === "true") return true;
   throw new Error("session pipeline: SEARCH_INDEX_SKIP_CURRENT_ENABLED must be true or false");
+}
+
+/**
+ * SEARCH_INDEX_SKIP_ACCEPTANCE_MISSING_ENABLED for the hosted Lambda: unset, "" and "false" are off; "true" is
+ * on; anything else fails init naming the variable, never the value (the backport lineage's grammar).
+ */
+export function searchIndexSkipAcceptanceMissingFromEnv(env: Record<string, string | undefined>): boolean {
+  const value = env.SEARCH_INDEX_SKIP_ACCEPTANCE_MISSING_ENABLED;
+  if (value === undefined || value === "" || value === "false") return false;
+  if (value === "true") return true;
+  throw new Error("session pipeline: SEARCH_INDEX_SKIP_ACCEPTANCE_MISSING_ENABLED must be true or false");
 }
 
 /**
