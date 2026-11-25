@@ -43,6 +43,7 @@ import {
   ADOPTABLE_INDEXES,
   MIGRATION_SENTINELS,
   NON_CREATE_STEPS,
+  RETAINED_BY_ROLLBACK,
 } from "../migration-sentinels.ts";
 import {
   expectedSchema,
@@ -173,12 +174,15 @@ type RuntimeAclCatalog = ReturnType<typeof migrateGuards.runtimeApplicationAclCa
  * could not yet list a function, table or sequence a later step creates; the current ones do, so on a database without
  * them the ACL install regclass/regprocedure-casts a missing object (42P01/42883) and the non-local exact-ACL check
  * refuses (function_acl_drift). Relations: CREATE [UNLOGGED|TEMP] TABLE/SEQUENCE in sessions, plus the
- * <table>_<column>_seq a serial/identity column of such a table implies. Functions: CREATE FUNCTION in sessions
+ * <table>_<column>_seq a serial/identity column of such a table implies. Functions: CREATE FUNCTION in sessions, plus
+ * the functions a step re-creates with CREATE OR REPLACE because its own rollback keeps them (RETAINED_BY_ROLLBACK)
  * (catalog entries and manifest keys are matched by name, before the argument list).
  */
-function previousReleaseAcl(laterSteps: ReadonlyArray<{ path: string }>, manifest: FunctionAclManifest, catalog: RuntimeAclCatalog) {
-  const laterFns = new Set(laterSteps.flatMap((s) =>
-    [...readFileSync(s.path, "utf8").matchAll(/\bCREATE\s+FUNCTION\s+(sessions\.\w+)\s*\(/gi)].map((m) => m[1]!.toLowerCase())));
+function previousReleaseAcl(laterSteps: ReadonlyArray<{ path: string; name?: string }>, manifest: FunctionAclManifest, catalog: RuntimeAclCatalog) {
+  const laterFns = new Set(laterSteps.flatMap((s) => [
+    ...[...readFileSync(s.path, "utf8").matchAll(/\bCREATE\s+FUNCTION\s+(sessions\.\w+)\s*\(/gi)].map((m) => m[1]!.toLowerCase()),
+    ...(RETAINED_BY_ROLLBACK[s.name ?? ""] ?? []).filter((k) => k.startsWith("function:")).map((k) => k.slice("function:".length)),
+  ]));
   const laterRels = new Set(laterSteps.flatMap((s) =>
     [...readFileSync(s.path, "utf8").matchAll(
       /\bCREATE\s+(?:(?:UNLOGGED|TEMP|TEMPORARY)\s+)?(?:TABLE|SEQUENCE)\s+(?:IF\s+NOT\s+EXISTS\s+)?(sessions\.\w+)/gi,
