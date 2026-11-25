@@ -301,6 +301,38 @@ describe("the scheduled {searchJobs:true} path carries the same guards; M2 settl
     expect((await j.jobs()).some((x) => x.attempts === 1 && !x.leased)).toBe(true);
   }, 120_000);
 
+  test("M2: the fence finds the canonical lock held by another session: an error result, retried; the scope stays owed", async () => {
+    const j = await jobsRig();
+    // Search transactions of the job pass: 1 the decision, 2 the pass, 3 the completion fence (lock held elsewhere).
+    const transact = j.rt.deps.search!.transact;
+    let n = 0;
+    j.rt.deps.search = { ...j.rt.deps.search!, transact: (work) => {
+      const fence = ++n === 3;
+      return transact((tx) => work({ query: (text: string, params?: unknown[]) =>
+        fence && text.includes("pg_try_advisory_xact_lock") && String(params?.[0]).startsWith("96bulls:directory-events")
+          ? Promise.resolve({ rows: [{ ok: false }] }) as never
+          : tx.query(text, params) }));
+    } };
+    const out = await j.run(300_000);
+    expect(out.lines.filter((l) => l.message === "search job failed")).toEqual([expect.objectContaining({ error_code: "search_completion_unrecorded", state: "retried" })]);
+    expect(out.lines.filter((l) => l.message === "search index completion not recorded")).toEqual([expect.objectContaining({ reason: "completion_lock_contended" })]);
+    expect((await j.jobs()).some((x) => x.attempts === 1 && !x.leased)).toBe(true);
+  }, 120_000);
+
+  test("M2: a malformed 'newer' first-key fence reply: no supersession, an error result, retried", async () => {
+    const j = await jobsRig();
+    const select = j.r.fake.ch.select.bind(j.r.fake.ch);
+    let reads = 0;
+    j.r.fake.ch.select = (async (q: string, o?: never) => {
+      const rows = await select(q, o);
+      if (q.includes("FROM search_ingest_session_state") && ++reads === 3) return [{ revision: null, needs_full: 9, scanned_rows: null, synced_ms: 9_999_999_999_999 }];
+      return rows;
+    }) as never;
+    const out = await j.run(300_000);
+    expect(out.lines.filter((l) => l.message === "search job failed")).toEqual([expect.objectContaining({ error_code: "search_completion_unrecorded", state: "retried" })]);
+    expect(out.lines.filter((l) => l.message === "search index completion not recorded")).toEqual([expect.objectContaining({ reason: "completion_marker_malformed" })]);
+  }, 120_000);
+
   test("a job claimed and then deferred (the start minimum crossed after the claim) settles busy: the attempt is given back", async () => {
     const { searchSettlementFor } = await import("../search-jobs.ts");
     expect(searchSettlementFor({ outcome: "busy", reasons: ["stream_deferred"] }, 3)).toBe("busy");
