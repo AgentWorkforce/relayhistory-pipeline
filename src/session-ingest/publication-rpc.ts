@@ -42,7 +42,7 @@ export function parsePublicationTicket(v:any,target:PublicationTarget):Publicati
 type CallOptions = {now?:()=>number;queryTimeoutMs?:number};
 /** Fixed function suffixes only. Callers bind every payload as a JSON parameter. */
 const functions = ["candidates","defer","claim","heartbeat","prepare","register_objects","publish","abandon",
- "scoped_candidates_v1","scoped_claim_v1","scoped_publish_v1"] as const;
+ "scoped_candidates_v1","scoped_claim_v1","scoped_heartbeat_v1","scoped_prepare_v1","scoped_register_objects_v1","scoped_abandon_v1","scoped_publish_v1"] as const;
 type PublicationFunction = typeof functions[number];
 export function publicationRpcCaller(db:SemanticBoundedSql,generation:string,options:CallOptions={}){
  const now=options.now??Date.now,timeout=options.queryTimeoutMs??15000;

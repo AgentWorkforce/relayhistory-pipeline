@@ -4,7 +4,7 @@
 import { canonicalPublicationTick, type PublicationJobDeps, type PublicationJobOptions } from "./publication-job.ts";
 import type { SemanticBoundedSql } from "../search-features/semantic-copy-postgres.ts";
 import type { PublicationRpc, PublicationTarget, PublicationTicket } from "./publication-protocol.ts";
-import { parsePublicationTicket, publicationRpc, publicationRpcCaller } from "./publication-rpc.ts";
+import { parsePublicationTicket, publicationRpcCaller } from "./publication-rpc.ts";
 
 export interface PublicationScopeBinding {
   planSha256: string;
@@ -40,7 +40,6 @@ export function validatedPublicationScope(binding: PublicationScopeBinding, expe
 export function scopedPublicationRpc(db: SemanticBoundedSql, expected: PublicationTarget, input: PublicationScopeBinding): PublicationRpc {
   const binding = validatedPublicationScope(input, expected);
   const { target, tenant } = binding;
-  const ordinary = publicationRpc(db, target);
   const call = publicationRpcCaller(db, target.generation);
   const address = { keyRoot: target.keyRoot, bucket: target.bucket, region: target.region };
   let candidate: string | undefined;
@@ -79,10 +78,23 @@ export function scopedPublicationRpc(db: SemanticBoundedSql, expected: Publicati
     // Defer(stageToken) has no lease or scope argument. Keep the error visible
     // until the scoped scheduler can persist a retry; never fall back to it.
     async defer() { return refuse("lease_free_defer"); },
-    heartbeat(ticket, signal) { checked(ticket); return ordinary.heartbeat(ticket, signal); },
-    prepare(ticket, images, signal) { checked(ticket); return ordinary.prepare(ticket, images, signal); },
-    register(ticket, objects, signal) { checked(ticket); return ordinary.register(ticket, objects, signal); },
-    abandon(ticket, signal) { checked(ticket); return ordinary.abandon(ticket, signal); },
+    async heartbeat(ticket, signal) {
+      const { leaseUntil } = await call("scoped_heartbeat_v1", { binding, ...checked(ticket) }, signal);
+      if (typeof leaseUntil !== "string" || !Number.isFinite(Date.parse(leaseUntil))) refuse("heartbeat_result");
+      ticket.leaseUntil = leaseUntil;
+    },
+    async prepare(ticket, images, signal) {
+      const result = await call("scoped_prepare_v1", { binding, ...checked(ticket), images }, signal);
+      if (result.prepared !== true) refuse("prepare_result");
+    },
+    async register(ticket, objects, signal) {
+      const result = await call("scoped_register_objects_v1", { binding, ...checked(ticket), objects }, signal);
+      if (result.registered !== true) refuse("register_result");
+    },
+    async abandon(ticket, signal) {
+      const result = await call("scoped_abandon_v1", { binding, ...checked(ticket) }, signal);
+      if (typeof result.abandoned !== "boolean") refuse("abandon_result");
+    },
     async publish(ticket, messages, signal) {
       const pin = checked(ticket);
       const result = await call("scoped_publish_v1", { binding, ...pin, messages }, signal);
