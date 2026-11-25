@@ -208,3 +208,123 @@ Each call is best effort:
 The Lambda role needs `sqs:ChangeMessageVisibility` on the source queue. The in-repo stack policy
 (`stacks/aws/session-pipeline.ts`) lists it. Whether the deployed role has it is not checked here. Without
 it, each call fails safely with a warn line.
+
+## Pool checkout timeout (not a flag)
+
+The pipeline pool now sets `connectionTimeoutMillis: HOOPDB_CONNECT_TIMEOUT_MS` (10 000 ms), the same
+constant and value as the deployed backport (6d88b638). Before this, main's `supabasePool` had no checkout
+bound. A checkout can fail in two ways:
+
+- **No connection.** The pooler accepts TCP but never answers.
+- **No free client.** Every client is in use (`HOOPDB_POOL_MAX`).
+
+In either case the checkout now fails after about 10 s. The stage that asked for it fails its messages, and
+the batch reports them in `batchItemFailures` for SQS to redeliver. Without the bound, the invocation would
+run to the 300 s Lambda timeout. `lambda-pool-timeout.test.ts` tests both cases through the real batch
+path.
+
+## SEARCH_INDEX_STREAMING_CH=1: guards carried over from the backport
+
+The backport commits are 59b74b18, 6264d119 and 51f876b6. This flag is live in production, so each item
+below changes real behaviour on main to match the deployed backport. With the flag unset, nothing here runs.
+
+- **Guarded search transaction.** `transaction(db, work, guarded)` is guarded exactly when the flag is
+  armed (`searchTransaction`). Guarded, a per-checkout `'error'` listener keeps a dropped connection's
+  error, so it cannot become an uncaught exception that crashes the invocation and loses the batch
+  response. The next statement rejects with that error, and the pass fails as a normal rejection. The
+  ROLLBACK attempt is skipped because the connection is gone. The listener is removed, and the client is
+  released with the error, which destroys it instead of returning it to the pool. Unguarded, the statements
+  are the same as before.
+  - **S3-event path.** The scope's messages fail and SQS redelivers them. The redelivered batch completes.
+  - **M2 job paths.** The job's result is `{ error }`. It is settled on M2's own backoff (`retried`),
+    unchanged.
+  - **Claim and settle.** These use `searchJobsSql`, which is unguarded. Only the search pass inside a job
+    shares the guarded transaction.
+- **Start minimum.** A stream does not start with less than `STREAM_MIN_START_MS` (120 s) left before the
+  invocation's stream deadline. The deadline is the remaining time less `SEARCH_INDEX_STREAM_DEADLINE_MARGIN_MS`,
+  60 s by default. So a stream needs at least 180 s of remaining time to start. With less, it returns
+  `deferred`, like a second streamed scope:
+  - **S3-event batch.** The scope is requeued with `stream_deferred`.
+  - **M2 job.** The outcome is `busy`, which `searchSettlementFor` already maps to the short retry
+    (`SEARCH_JOB_BUSY_RETRY_SECONDS`). The mapping is unchanged.
+  - Only a pass that has a deadline checks the start minimum. The self-host consumer never sets one.
+- **One stream per invocation, even without a context.** `invocationSearchDeps` gives every invocation its
+  own `streamSlot` whenever streaming is armed. That includes the case with no Lambda context or a
+  non-finite remaining time. 9d1adf84 set no slot there, so such an invocation could stream every scope it
+  held, with no limit. Without a context there is still no deadline, as on the backport.
+- **Scheduled `{searchJobs: true}` path.** This path now uses `invocationSearchDeps(rt, context)`, so it
+  gets the same slot, deadline, start minimum and guarded transaction as an SQS batch and its follow-on.
+  It used to pass `rt.deps.search` directly, with no slot and no deadline. `search-jobs.ts`, the claim, the
+  lease and the settlement mapping are unchanged.
+
+Tests in `stream-guards.pglite.test.ts`, through the real exported handler:
+
+- remaining time 1 ms below and exactly at the threshold;
+- no context;
+- a connection dropped mid-stream, on the SQS path and on the scheduled path;
+- the scheduled path's slot, start minimum and no-context cases;
+- `transaction()` and `searchTransaction` statement parity and guard wiring.
+
+### Backport stream behaviours still not on main
+
+These were not asked for and are not ported. A reviewer should decide whether they are needed.
+
+- **Batch deadline requeue.** On the backport (6264d119 and 51f876b6), once the invocation's stream deadline
+  has passed, no further scope of the batch starts, whole read or streamed. Each is requeued with the reason
+  `stream_batch_deadline`. On main, later scopes still run.
+- **Tail reserve.** The backport does not start its delete and catalog tail with less than
+  `STREAM_TAIL_RESERVE_MS` (30 s) left before the deadline.
+- **Keepalive check.** The backport's keepalive re-takes the scope lock and fails with
+  `stream_keepalive_failed` unless the lock is held. Main's keepalive is `SELECT 1`.
+- **Early state mark.** Before reading anything, the backport records `needs_full = 1` one millisecond
+  before the pass's own state time. Main records it when the pass stops.
+
+## Acceptance-stamp cold start (salt acceptance-skip-v2)
+
+The cold start is estimated from the code paths only, with no production access.
+
+- **Why it happens.** A stamp written by the backport (salt `acceptance-skip-v1`) never matches on main. So
+  after the deploy, the first acceptance-only pass of each stamped scope reads in full and writes a v2
+  stamp. Repeats of that scope skip again from then on.
+- **How many scopes it can touch.** A scope is affected only if it meets both conditions:
+  1. it held a live v1 stamp in the six hours before the deploy (`SKIP_STATE_MAX_AGE_MS`; an older stamp
+     already no longer skips on the backport);
+  2. it gets another S3 event, or a scheduled reconcile re-enqueue, after the deploy.
+
+  Each such scope costs one full read: the manifests, then a size or fold refusal. That is the same cost
+  the backport pays at least every six hours while a scope keeps receiving events. A scope with no new
+  events costs nothing.
+- **Counting the bound.** Stamp names hash the scope, so they do not reveal orgs. An operator can count
+  from logs: distinct (`org_id`, `session_id`) on `search index reconciled` lines whose `reason` is
+  `relayhistory_acceptance_missing,skipped_before_read`, over the last six hours before the deploy. Or,
+  without org detail:
+  `SELECT count() FROM search_ingest_state FINAL WHERE startsWith(name, 'acceptance_skip/') AND value != '' AND updated_at > now() - INTERVAL 6 HOUR`.
+- **Scopes whose digest changes anyway.** On main the digest also covers canonical sibling unions and the
+  directory epoch. For a scope whose pointers changed at deploy, the digest would differ regardless of the
+  salt.
+- **The over-bound skip has no cold start.** It reads `search_ingest_session_state`, whose format is the
+  same on both lines. One exception: for a scope with canonical siblings, main records the highest revision
+  across the siblings. The first pass on main may then run once normally before it skips.
+
+## ClickHouse permission for the acceptance stamp
+
+The stamp needs INSERT on `<database>.search_ingest_state`. Reading the stamp, and `window_start`, needs
+SELECT on the same table.
+
+- **Who the Lambda connects as.** It uses the user in the pipeline secret's `clickhouse` block
+  (`clickhouse.user`, with `url`, `password` and `database`). It reads that secret from
+  `SESSION_PIPELINE_SECRET_ARN` (`parseSecret` and `createClickHouseClient` in `lambda.ts`; the
+  `X-ClickHouse-User` header in `vendor/search-index/clickhouse.ts`).
+- **Where the secret comes from.** The stack creates the secret container only
+  (`stacks/aws/session-pipeline.ts`, "session-pipeline-secret", "Supabase HoopDb URL and ClickHouse ingest
+  credentials"). Its value is set by the lead from 1Password.
+- **No grant in this repository.** No ClickHouse user, role or `GRANT` for `search_ingest_state` is defined
+  anywhere in this repository. The grant is an operator-side ClickHouse admin step. The checks to run first
+  (`SHOW GRANTS` and `system.grants`) are listed under the acceptance flag above.
+- **Production status.** The backport runs with this flag on, so the production user very likely already
+  has the grant. This is not verified here.
+- **Without the grant.** Each stamp write logs `acceptance_stamp_write_failed`, nothing is stamped, and
+  every pass reads in full. Results are unaffected.
+- **Other writers on main.** The buffered search feed (default off) also writes `search_ingest_state` with
+  the same client: its refusal ledger `buffered-tie:<token>`, and the buffered erasure cursor.
+- **Access is not changed by this work.**
