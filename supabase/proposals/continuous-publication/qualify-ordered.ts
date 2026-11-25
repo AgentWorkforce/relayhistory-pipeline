@@ -51,6 +51,7 @@ try {
   }
   assert.equal((await c.query("SELECT to_regprocedure('sessions.ingest_scoped_publication_receipt_capture_v1(jsonb)') IS NULL missing")).rows[0].missing,true);
   for(const s of Object.values(heldPublicationSentinels)) assert.equal((await c.query(s.sql)).rows[0].applied,true);
+  await c.query("CREATE DATABASE publication_release_fixture TEMPLATE postgres");
   await assert.rejects(c.query(publicationRecoverySlot.down),{code:"55000"}); await c.query("ROLLBACK");
   const searchDown=readFileSync(join(root,"supabase/rollbacks",searchFile.replace(".sql",".down.sql")),"utf8");
   await c.query(searchDown);

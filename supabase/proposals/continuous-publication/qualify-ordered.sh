@@ -14,3 +14,10 @@ git -C "$repo" archive HEAD | tar -xf - -C "$scratch/tree"
 "$bin/initdb" -D "$scratch/data" -U fixture_owner -E UTF8 --locale=C -A trust >/dev/null
 "$bin/pg_ctl" -D "$scratch/data" -l "$scratch/server.log" -o "-c listen_addresses='' -k $scratch -p 5549" -w start
 PUBLICATION_PROOF_SCRATCH="$scratch" bun "$scratch/tree/supabase/proposals/continuous-publication/qualify-ordered.ts"
+
+cd "$scratch/tree"
+# New per-test databases are cloned from the fully applied UTF8 image. Use
+# template1 as the admin connection; postgres contains the rollback exercise.
+export SESSION_INGEST_TEST_PG_URL="postgresql://fixture_owner@localhost/template1?host=$scratch&port=5549"
+PUBLICATION_PROOF_TEMPLATE=publication_release_fixture bun test -t 'post-H scoped kernel proposal|062270 private read profile' src/session-ingest/__tests__/publication.postgres.test.ts
+bun test src/session-ingest/__tests__/{publication-fleet.postgres,publication-retry-cas.postgres,publication-fleet-storage-access.postgres,publication-fleet.pglite}.test.ts
