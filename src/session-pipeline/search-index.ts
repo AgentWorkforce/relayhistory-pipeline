@@ -1127,9 +1127,14 @@ class HostedState {
     return [...new Set([this.scope.sessionId, canonicalId])];
   }
 
-  /** The latest state row of one key (the over-bound skip's statement), or undefined; throws when unreadable. */
-  private async latest(sessionId: string): Promise<{ ms: number; needsFull: number; scanned: number; revision: string } | undefined> {
-    const rows = await this.deps.ch!.select<{ revision: unknown; needs_full: unknown; scanned_rows: unknown; synced_ms: unknown }>(
+  /**
+   * The latest state row of one key (the over-bound skip's statement), validated: exactly the four columns,
+   * synced_ms a finite integer, needs_full 0 or 1, scanned_rows and revision non-null non-negative integers (numbers or
+   * decimal strings, as ClickHouse's JSON renders UInt64). `none` without a row, `malformed` for anything else.
+   * Throws when the read fails.
+   */
+  private async latest(sessionId: string): Promise<StateRead> {
+    const rows = await this.deps.ch!.select<Record<string, unknown>>(
       `SELECT revision, needs_full, scanned_rows, toUnixTimestamp64Milli(synced_at) AS synced_ms
          FROM ${SESSION_STATE_TABLE}
         WHERE org_id = {org:String} AND session_id = {session:String}
@@ -1137,9 +1142,10 @@ class HostedState {
         LIMIT 1`,
       { params: { org: this.scope.orgId, session: sessionId }, timeoutMs: 5_000 },
     );
+    if (!Array.isArray(rows)) return { kind: "malformed" };
     const row = rows[0];
-    if (row === undefined) return undefined;
-    return { ms: Number(row.synced_ms), needsFull: Number(row.needs_full), scanned: Number(row.scanned_rows), revision: String(row.revision) };
+    if (row === undefined) return { kind: "none" };
+    return validStateRow(row);
   }
 
   /** Under the pass's locks, before any source read: the owed marker on every key. Throws when the state is unreadable. */
@@ -1147,10 +1153,8 @@ class HostedState {
     let ms = at.getTime() - 1;
     for (const key of this.keys(canonicalId)) {
       const found = await this.latest(key);
-      if (found !== undefined) {
-        if (!Number.isFinite(found.ms)) throw new PipelineError("search_state_unreadable", "the session state's latest row has no time", true);
-        ms = Math.max(ms, found.ms + 2);
-      }
+      if (found.kind === "malformed") throw new PipelineError("search_state_unreadable", "the session state's latest row is malformed", true);
+      if (found.kind === "row") ms = Math.max(ms, found.ms + 2);
     }
     const token = 1 + randomInt(2_147_483_646);
     // Written before `marker` is set, so the wrapped io keeps the marker's own time (M, not M + 1).
@@ -1183,20 +1187,27 @@ class HostedState {
     let cause: unknown;
     try {
       await this.deps.transact(async (tx) => {
+        // Lock contention certifies nothing (the holder may roll back without writing): retry, the scope stays owed.
         const scopeLock = await tx.query<{ ok: boolean }>("SELECT pg_try_advisory_xact_lock(hashtextextended($1, 0)) AS ok", [scopeLockKey(this.scope, "search")]);
-        if (scopeLock.rows[0]?.ok !== true) return skip("completion_superseded");
+        if (scopeLock.rows[0]?.ok !== true) { anomaly = "completion_lock_contended"; return; }
         const canonicalLock = await tx.query<{ ok: boolean }>("SELECT pg_try_advisory_xact_lock(hashtextextended($1,0)) AS ok",
           [["96bulls:directory-events", this.scope.orgId, this.scope.workspaceId, this.scope.harness, marker.canonicalId].join("\u001f")]);
-        if (canonicalLock.rows[0]?.ok !== true) return skip("completion_superseded");
-        for (const key of this.keys(marker.canonicalId)) {
-          const found = await this.latest(key);
-          if (found === undefined) { anomaly = "completion_marker_missing"; return; }
-          if (![found.ms, found.needsFull, found.scanned].every(Number.isFinite)) { anomaly = "completion_marker_malformed"; return; }
-          const ours = found.ms === marker.ms && found.needsFull === 1 && found.scanned === marker.token && found.revision === String(marker.revision);
-          if (ours) continue;
-          // A later valid row (another pass's marker or outcome) owns the scope; anything else is not ours to judge.
-          if (found.ms > marker.ms) return skip("completion_superseded");
-          anomaly = "completion_marker_foreign";
+        if (canonicalLock.rows[0]?.ok !== true) { anomaly = "completion_lock_contended"; return; }
+        // Every key is read and validated before any decision.
+        const found: StateRead[] = [];
+        for (const key of this.keys(marker.canonicalId)) found.push(await this.latest(key));
+        if (found.some((f) => f.kind === "none")) { anomaly = "completion_marker_missing"; return; }
+        if (found.some((f) => f.kind === "malformed")) { anomaly = "completion_marker_malformed"; return; }
+        const rows = found as Array<Extract<StateRead, { kind: "row" }>>;
+        const ours = (f: Extract<StateRead, { kind: "row" }>) =>
+          f.ms === marker.ms && f.needsFull === 1 && f.scanned === marker.token && f.revision === String(marker.revision);
+        if (!rows.every(ours)) {
+          // Superseded only when every key shows the same valid successor row, later than this pass's marker.
+          const [first] = rows;
+          const same = (f: Extract<StateRead, { kind: "row" }>) =>
+            f.ms === first!.ms && f.needsFull === first!.needsFull && f.scanned === first!.scanned && f.revision === first!.revision;
+          if (rows.every((f) => f.ms > marker.ms && same(f))) return skip("completion_superseded");
+          anomaly = rows.some((f) => f.ms > marker.ms) ? "completion_successor_divergent" : "completion_marker_foreign";
           return;
         }
         await recordState(this.deps.ch!, this.scope, pending.revision, pending.rows, true, new Date(marker.ms + 1), marker.canonicalId);
@@ -1213,6 +1224,25 @@ class HostedState {
       throw new PipelineError(SEARCH_COMPLETION_UNRECORDED, `the completing state was not recorded (${anomaly})`, true);
     }
   }
+}
+
+/** One key's latest session state row as the fence sees it. */
+type StateRead = { kind: "none" } | { kind: "malformed" } | { kind: "row"; ms: number; needsFull: 0 | 1; scanned: number; revision: string };
+
+const STATE_ROW_COLUMNS = ["needs_full", "revision", "scanned_rows", "synced_ms"];
+/** A non-negative safe integer from a number or a decimal string, else undefined (null, booleans, text, fractions). */
+function wholeNumber(v: unknown): number | undefined {
+  const n = typeof v === "number" ? v : typeof v === "string" && /^[0-9]{1,20}$/.test(v) ? Number(v) : NaN;
+  return Number.isSafeInteger(n) && n >= 0 ? n : undefined;
+}
+/** Validate one raw state row: exactly the fence's columns, each in its domain. */
+export function validStateRow(row: unknown): StateRead {
+  if (typeof row !== "object" || row === null || Array.isArray(row)) return { kind: "malformed" };
+  const r = row as Record<string, unknown>;
+  if (Object.keys(r).sort().join(",") !== STATE_ROW_COLUMNS.join(",")) return { kind: "malformed" };
+  const ms = wholeNumber(r.synced_ms), needs = wholeNumber(r.needs_full), scanned = wholeNumber(r.scanned_rows), revision = wholeNumber(r.revision);
+  if (ms === undefined || scanned === undefined || revision === undefined || (needs !== 0 && needs !== 1)) return { kind: "malformed" };
+  return { kind: "row", ms, needsFull: needs, scanned, revision: String(revision) };
 }
 
 /** A hosted pass committed but its completing state could not be verified and written: retried, the scope owed. */

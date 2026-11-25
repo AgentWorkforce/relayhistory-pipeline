@@ -12,7 +12,7 @@
  * Synthetic data only.
  */
 import { afterAll, afterEach, beforeAll, describe, expect, test } from "bun:test";
-import { STREAM_DELETE_KEY_TOO_LARGE, STREAM_LOCK_HELD_SQL, STREAM_TAIL_RESERVE_MS, SCAN_PAGE_INVALID, deleteStatementChunks, type SearchIndexDeps } from "../search-index.ts";
+import { validStateRow, STREAM_DELETE_KEY_TOO_LARGE, STREAM_LOCK_HELD_SQL, STREAM_TAIL_RESERVE_MS, SCAN_PAGE_INVALID, deleteStatementChunks, type SearchIndexDeps } from "../search-index.ts";
 import { scopeLockKey } from "../pointer.ts";
 import { requeueBody } from "../s3-events.ts";
 import { lambdaEnv } from "../lambda.ts";
@@ -414,6 +414,66 @@ describe("the owed marker until the Postgres outcome is durable", () => {
       expect(c.latestState()!.needs_full).toBe(0);
     }, 120_000);
   }
+
+  /**
+   * A faithful second session for PGlite (one session, so its advisory locks are re-entrant): the pass's
+   * `nth` search transaction (2 = the completion fence's own) sees `lock` held elsewhere: its try-lock answers false.
+   */
+  function heldElsewhere(c: Awaited<ReturnType<typeof clocked>>, nth: number, lock: "scope" | "canonical"): void {
+    const transact = c.rt.deps.search!.transact;
+    let n = 0;
+    c.rt.deps.search = { ...c.rt.deps.search!, transact: (work) => {
+      const mine = ++n === nth;
+      return transact((tx) => work({ query: (text: string, params?: unknown[]) => {
+        const key = String(params?.[0] ?? "");
+        if (mine && text.includes("pg_try_advisory_xact_lock") && (lock === "canonical" ? key.startsWith("96bulls:directory-events") : key.startsWith("96bulls:search"))) return Promise.resolve({ rows: [{ ok: false }] }) as never;
+        return tx.query(text, params);
+      } }));
+    } };
+  }
+  for (const lock of ["canonical", "scope"] as const) {
+    test(`the fence finds the ${lock} lock held by another session (which may roll back): the message fails retryably, both keys stay owed`, async () => {
+      const c = await clocked();
+      heldElsewhere(c, 2, lock);
+      const out = await c.send(c.s3Messages.slice(0, 1));
+      expect(out.result).toEqual({ batchItemFailures: [{ itemIdentifier: "s3-0" }] });
+      expect(out.lines.filter((l) => l.message === "search index completion not recorded")).toEqual([expect.objectContaining({ reason: "completion_lock_contended" })]);
+      expect(out.lines.filter((l) => l.message === "search index failed")).toEqual([expect.objectContaining({ error_code: "search_completion_unrecorded" })]);
+      for (const key of [SCOPE.sessionId, c.x.canonicalId]) {
+        const top = c.r.fake.state.filter((r) => r.session_id === key).find((r) => Date.parse(`${String(r.synced_at).replace(" ", "T")}Z`) === latestMs(c, key))!;
+        expect(top.needs_full).toBe(1);
+      }
+    }, 120_000);
+  }
+
+  for (const [name, firstKey, reason] of [
+    ["a 'newer' first-key reply outside the domains (needs_full 9, null token and revision)", { revision: null, needs_full: 9, scanned_rows: null, synced_ms: 9_999_999_999_999 }, "completion_marker_malformed"],
+    ["a reply with an extra column", { revision: "1", needs_full: 1, scanned_rows: 1, synced_ms: 9_999_999_999_999, other: 1 }, "completion_marker_malformed"],
+    ["a valid successor on the first key only (the canonical key still this pass's marker)", { revision: "1", needs_full: 1, scanned_rows: 5, synced_ms: 9_999_999_999_999 }, "completion_successor_divergent"],
+  ] as const) {
+    test(`${name}: every key is read, no supersession, the message fails retryably`, async () => {
+      const c = await clocked();
+      let canonicalRead = false;
+      const restore = stateReads(c, (n, rows) => {
+        if (n === 4) canonicalRead = true;
+        return n === 3 ? [firstKey] : rows;
+      });
+      const out = await c.send(c.s3Messages.slice(0, 1));
+      restore();
+      expect(canonicalRead).toBe(true);
+      expect(out.result).toEqual({ batchItemFailures: [{ itemIdentifier: "s3-0" }] });
+      expect(out.lines.filter((l) => l.message === "search index completion not recorded")).toEqual([expect.objectContaining({ reason })]);
+      expect(c.latestState()!.needs_full).toBe(1);
+    }, 120_000);
+  }
+
+  test("validStateRow: exact columns and domains", () => {
+    const ok = { revision: "3", needs_full: 1, scanned_rows: "12", synced_ms: 1_700_000_000_000 };
+    expect(validStateRow(ok)).toEqual({ kind: "row", ms: 1_700_000_000_000, needsFull: 1, scanned: 12, revision: "3" });
+    for (const bad of [{ ...ok, needs_full: 2 }, { ...ok, needs_full: "1" + "x" }, { ...ok, scanned_rows: null }, { ...ok, revision: null }, { ...ok, revision: -1 },
+      { ...ok, synced_ms: "soon" }, { ...ok, synced_ms: 1.5 }, { ...ok, extra: 0 }, { revision: "3", needs_full: 1, scanned_rows: 1 }, null, [ok]])
+      expect(validStateRow(bad).kind).toBe("malformed");
+  });
 
   test("a fence SELECT that throws: observable (the message fails, reason completion_fence_unreadable), the marker stays 1", async () => {
     const c = await clocked();
