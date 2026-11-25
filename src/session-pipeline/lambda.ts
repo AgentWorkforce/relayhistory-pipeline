@@ -178,6 +178,13 @@ export function parseSecret(text: string): PipelineSecret {
 }
 
 /**
+ * How long a pool checkout may wait, for a free client or for a new connection, before it fails. Without it a
+ * stalled pooler holds the invocation until the Lambda timeout (300 s) and the whole batch times out. With it the
+ * checkout fails after 10 s, the message is reported as failed and SQS redelivers it.
+ */
+export const HOOPDB_CONNECT_TIMEOUT_MS = 10_000;
+
+/**
  * A pg pool that verifies Supabase's certificate against the pinned root. The
  * URL's own ssl parameters are dropped so they cannot weaken that.
  */
@@ -190,6 +197,7 @@ export function supabasePool(url: string, max: number): HoopDb {
     application_name: "96bulls-session-pipeline",
     ssl: { ca: SUPABASE_PROD_CA_2021, rejectUnauthorized: true },
     idleTimeoutMillis: 60_000,
+    connectionTimeoutMillis: HOOPDB_CONNECT_TIMEOUT_MS,
   });
   pool.on("error", (err) => log.error("hoopdb pool error", { error_code: (err as { code?: string }).code ?? "pool_error" }));
   return {
