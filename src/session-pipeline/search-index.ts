@@ -445,6 +445,12 @@ export interface SearchIndexResult {
   skippedBeforeRead?: true;
 }
 
+/**
+ * A scope is not started streaming with less than this left before its stream deadline (half a fresh
+ * invocation's; the backport lineage's value). Only a pass with a deadline (the hosted Lambda) checks it.
+ */
+export const STREAM_MIN_START_MS = 120_000;
+
 /** The reason code a pass returned before any manifest read adds to the outcome it repeats. */
 export const SKIPPED_BEFORE_READ = "skipped_before_read";
 /**
@@ -838,7 +844,9 @@ async function indexSearchScopeBase(scope: SessionScope, deps: SearchIndexDeps, 
       deps.stream && !deps.outputFacts && (!deps.outputFactsStore || stagedFacts) && siblingKeys.length &&
       s3.partial && s3.admitted && s3.reasons.length === 1 && s3.reasons[0] === "scope_too_large"
     ) {
-      if (deps.streamSlot?.used)
+      // The backport lineage's start minimum (6264d119): with a deadline, a stream is not started with less than
+      // STREAM_MIN_START_MS left before it; deferred and requeued like a second streamed scope.
+      if (deps.streamSlot?.used || (deps.streamDeadline && deps.streamDeadline.at - (deps.streamDeadline.now ?? Date.now)() < STREAM_MIN_START_MS))
         return { manifests: s3.manifests, rows: 0, inserted: 0, deleted: 0, complete: false, deferred: true, reasons: ["stream_deferred"] };
       if (deps.streamSlot) deps.streamSlot.used = true;
       if (deps.staged && deps.adapter) {
