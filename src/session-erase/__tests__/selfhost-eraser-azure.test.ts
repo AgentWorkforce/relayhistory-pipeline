@@ -194,6 +194,15 @@ describe("refusals before any destructive work", () => {
     expect(() => planTargets(s3RowOnAzure, { keyRoot: ROOT, bucket: "fx-container", provider: "azure" })).toThrow("store_not_azure");
     const otherContainer = request({ locations: [{ ...request().locations[0]!, bucket: "fx-other-container" }] });
     expect(() => planTargets(otherContainer, { keyRoot: ROOT, bucket: "fx-container", provider: "azure" })).toThrow("bucket_mismatch");
+    // A row that omits its provider or bucket is refused on Azure (it could name another store); the S3 path keeps its
+    // null tolerance.
+    const { storageProvider: _p, ...noProvider } = request().locations[0]!;
+    const { bucket: _b, ...noBucket } = request().locations[0]!;
+    expect(() => planTargets(request({ locations: [noProvider] }), { keyRoot: ROOT, bucket: "fx-container", provider: "azure" })).toThrow("store_not_azure");
+    expect(() => planTargets(request({ locations: [noBucket] }), { keyRoot: ROOT, bucket: "fx-container", provider: "azure" })).toThrow("bucket_mismatch");
+    expect(() => planTargets(request({ locations: [{ ...noProvider, bucket: null, storageProvider: null }] }), { keyRoot: ROOT, bucket: "fx-container", provider: "azure" })).toThrow("store_not_azure");
+    const { storageProvider: _q, bucket: _c, ...bare } = request().locations[0]!;
+    expect(planTargets(request({ locations: [bare] }), { keyRoot: ROOT, bucket: "b" }).length).toBeGreaterThan(0);
     expect(planTargets(request(), { keyRoot: ROOT, bucket: "fx-container", provider: "azure" }).length).toBeGreaterThan(0);
   });
 });

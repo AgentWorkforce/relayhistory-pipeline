@@ -230,11 +230,15 @@ export function planTargets(req: SessionEraseBytesRequest, opts: Pick<SessionEra
     const lws = physical(loc.workspaceId), m = physical(loc.machineId), h = physical(loc.harness), s = physical(loc.sessionId);
     // A row of another session (or another workspace / source) is never erased under this key.
     if (lws !== ws || h !== harness || s !== sid) refuse("location_not_this_session");
-    if (loc.storageProvider != null) {
-      if (opts.provider === "azure") { if (loc.storageProvider !== "azure") refuse("store_not_azure"); }
-      else if (!S3_PROVIDERS.has(loc.storageProvider)) refuse("store_not_versioned_s3");
+    if (opts.provider === "azure") {
+      // New path, nothing to stay compatible with: the row must name this store. A row without its provider or
+      // bucket (an operator-built request) could hold bytes elsewhere, so it is refused, never reported erased.
+      if (loc.storageProvider !== "azure") refuse("store_not_azure");
+      if (loc.bucket !== opts.bucket) refuse("bucket_mismatch");
+    } else {
+      if (loc.storageProvider != null && !S3_PROVIDERS.has(loc.storageProvider)) refuse("store_not_versioned_s3");
+      if (loc.bucket != null && loc.bucket !== opts.bucket) refuse("bucket_mismatch");
     }
-    if (loc.bucket != null && loc.bucket !== opts.bucket) refuse("bucket_mismatch");
     const machineBase = `${org}/v1/ws=${lws}/m=${m}/h=${h}/`;
     const dates = new Set<string>();
     if (loc.dates !== undefined) {

@@ -66,7 +66,11 @@ export interface AzureEraseTarget {
   readonly accountKey: () => string;
 }
 
-/** Settings plus the key (SESSION_ERASE_AZURE_ACCOUNT_KEY_FILE only, behind a closure). */
+/**
+ * Settings plus the key (SESSION_ERASE_AZURE_ACCOUNT_KEY_FILE only, behind a closure). It parses the settings again on
+ * purpose: sessionEraseConfig validates them (no secret) at config time, and this is where the key is read; the parse
+ * is pure, so both see the same result.
+ */
 export function azureEraseTarget(env: NodeJS.ProcessEnv, fail: SettingsFail): AzureEraseTarget {
   const settings = azureEraseSettings(env, fail);
   const { accountKey } = azureAccountKey(env, fail, "SESSION_ERASE_AZURE");
