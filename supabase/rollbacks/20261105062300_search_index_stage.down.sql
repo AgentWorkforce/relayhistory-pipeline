@@ -5,10 +5,11 @@
 -- until the parked letters are replayed, resolved and archived (sessions.archive_search_stage_v1(), §8 [rev 7]).
 -- It refuses while ANY search-index row exists in pipeline_jobs, pipeline_events or pipeline_dead_letters.
 -- It drops the guards, the managed enqueue, the scope index, the cursor, the archive function and the resolution
--- column, and restores the three stage CHECKs to the 20261031000100 sets. sessions.search_stage_archive and its
--- seal stay while the archive holds any row: it is an audit artifact, removed only by a separate, explicitly
--- approved cleanup (until then this slot cannot be re-applied: the migrator refuses its unledgered objects). An
--- empty archive goes with the rest.
+-- column, and restores the three stage CHECKs to the 20261031000100 sets. It NEVER drops
+-- sessions.search_stage_archive or its seal (the manifest index, sessions.search_stage_archive_seal_v1() and both
+-- seal triggers), empty or not (§8): the archive is an audit artifact, removed only by a separate, explicitly
+-- approved cleanup. Re-applying the slot afterwards keeps and re-verifies it (the up file creates each archive
+-- object only if absent, and the migrator accepts exactly those retained objects: RETAINED_BY_ROLLBACK).
 -- Guard, object removal and ledger removal are one transaction under the migrator lock.
 -- Code only: hosted execution needs Khaliq's separate explicit approval. On refusal the caller must ROLLBACK or disconnect.
 BEGIN;
@@ -21,7 +22,7 @@ DO $rollback_guard$ DECLARE v_sha text; BEGIN
  IF EXISTS(SELECT 1 FROM sessions.__96bulls_migrations WHERE name LIKE 'upstream:%' AND name COLLATE "C">'upstream:20261105062300_search_index_stage.sql')
  THEN RAISE EXCEPTION USING ERRCODE='55000',MESSAGE='search index stage: a later migration is applied; roll it back first';END IF;
  SELECT sha256 INTO v_sha FROM sessions.__96bulls_migrations WHERE name='upstream:20261105062300_search_index_stage.sql' FOR UPDATE;
- IF NOT FOUND OR v_sha<>'c1717d64b760d4ad3bcb69f5256bc1bab7c86ef29472db6ee225b55ecfb95ccb'
+ IF NOT FOUND OR v_sha<>'21deffca474cae2a2800bfded7d16c5d6ae077c030a78fcd1a94f598b0e0d159'
  THEN RAISE EXCEPTION USING ERRCODE='55000',MESSAGE='search index stage: own applied checksum required';END IF;
  -- §8: the additive migration stays until the stage is fully empty, in all three tables.
  LOCK TABLE sessions.pipeline_jobs, sessions.pipeline_events, sessions.pipeline_dead_letters IN ACCESS EXCLUSIVE MODE;
@@ -44,12 +45,6 @@ DROP FUNCTION sessions.archive_search_stage_v1();
 DROP INDEX sessions.pipeline_jobs_search_index_scope;
 DROP TABLE sessions.search_catchup_cursor;
 ALTER TABLE sessions.pipeline_dead_letters DROP COLUMN resolution;
-DO $archive$ BEGIN
- IF NOT EXISTS (SELECT 1 FROM sessions.search_stage_archive) THEN
-   DROP TABLE sessions.search_stage_archive;
-   DROP FUNCTION sessions.search_stage_archive_seal_v1();
- END IF;
-END $archive$;
 ALTER TABLE sessions.pipeline_events DROP CONSTRAINT pipeline_events_stage_check;
 ALTER TABLE sessions.pipeline_events ADD CONSTRAINT pipeline_events_stage_check
   CHECK (stage IN ('ingest', 'deliver.put', 'object-landed', 'session-indexed',

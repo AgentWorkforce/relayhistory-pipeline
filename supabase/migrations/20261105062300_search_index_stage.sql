@@ -13,7 +13,7 @@
 -- Consumer half: sessions.search_catchup_cursor (§6), pipeline_dead_letters.resolution (§3.3b) and the sealed,
 -- append-only sessions.search_stage_archive with its only write path sessions.archive_search_stage_v1() (§7, §8).
 -- The rollback (supabase/rollbacks/20261105062300_search_index_stage.down.sql) refuses while any search-index
--- job, event or dead letter exists (§8) and never drops an archive that holds a row.
+-- job, event or dead letter exists (§8) and never drops the archive or its seal, empty or not.
 SET LOCAL lock_timeout = '5s';
 
 LOCK TABLE sessions.pipeline_jobs, sessions.pipeline_events, sessions.pipeline_dead_letters IN ACCESS EXCLUSIVE MODE;
@@ -249,11 +249,15 @@ REVOKE ALL ON sessions.search_catchup_cursor FROM PUBLIC, anon, authenticated;
 -- admits only for the owner, so the catch-up runs on an owner-qualified path; no runtime-role grant here.
 GRANT SELECT, UPDATE ON sessions.search_catchup_cursor TO service_role;
 
--- §7, §8 [rev 8, rev 9]: the stage's audit archive. The rollback never drops it while it holds a row. Sealed and
--- append-only: INSERT, UPDATE, DELETE and TRUNCATE are refused (42501) for every role but the table's owner, so
--- the ONLY write path is sessions.archive_search_stage_v1() (SECURITY DEFINER, owned by the owner). Cleanup is a
--- separate, explicitly approved owner migration.
-CREATE TABLE sessions.search_stage_archive (
+-- §7, §8 [rev 8, rev 9]: the stage's audit archive. Created here and NEVER dropped by the rollback, empty or not
+-- (§8: an audit artifact, removed only by a separate, explicitly approved cleanup). Sealed and append-only: INSERT,
+-- UPDATE, DELETE and TRUNCATE are refused (42501) for every role but the table's owner, so the ONLY write path is
+-- sessions.archive_search_stage_v1() (SECURITY DEFINER, owned by the owner).
+-- Re-apply after the rollback: the archive, its manifest index, its seal function and both seal triggers may
+-- already exist (the rollback keeps them). Each is therefore created only if absent (IF NOT EXISTS / OR REPLACE),
+-- the migrator accepts exactly these retained objects for this step (RETAINED_BY_ROLLBACK,
+-- src/hoopdb/migration-sentinels.ts), and the retained table's shape and owner are verified below before any use.
+CREATE TABLE IF NOT EXISTS sessions.search_stage_archive (
   batch_id    uuid        NOT NULL,
   kind        text        NOT NULL CHECK (kind IN ('letter', 'event', 'manifest')),
   -- letter id | event sha256 | 'manifest'
@@ -263,11 +267,28 @@ CREATE TABLE sessions.search_stage_archive (
   archived_at timestamptz NOT NULL DEFAULT now(),
   PRIMARY KEY (batch_id, kind, source_id)
 );
-CREATE UNIQUE INDEX search_stage_archive_one_manifest ON sessions.search_stage_archive (batch_id) WHERE kind = 'manifest';
+CREATE UNIQUE INDEX IF NOT EXISTS search_stage_archive_one_manifest ON sessions.search_stage_archive (batch_id) WHERE kind = 'manifest';
 -- No row-level security: a reader granted SELECT sees every archived row (no tenant data is filtered here; the
--- table is granted only to the operator and runtime roles), and the seal trigger, not a policy, refuses writes.
+-- table is granted only to the operator role), and the seal trigger, not a policy, refuses writes.
+-- A retained archive must be exactly this one: the columns, both unique indexes, the kind CHECK, and owned by the
+-- migrating role (the seal admits only the owner, and archive_search_stage_v1 below is owned by it). Else 55000.
+DO $archive_shape$
+BEGIN
+ IF (SELECT pg_get_userbyid(relowner) FROM pg_class WHERE oid = 'sessions.search_stage_archive'::regclass) <> current_user
+    OR (SELECT string_agg(attname || ' ' || format_type(atttypid, atttypmod) || CASE WHEN attnotnull THEN ' not null' ELSE '' END, ', ' ORDER BY attnum)
+          FROM pg_attribute WHERE attrelid = 'sessions.search_stage_archive'::regclass AND attnum > 0 AND NOT attisdropped)
+       IS DISTINCT FROM 'batch_id uuid not null, kind text not null, source_id text not null, row jsonb not null, archived_at timestamp with time zone not null'
+    OR (SELECT array_agg(pg_get_indexdef(indexrelid)::text ORDER BY pg_get_indexdef(indexrelid)::text) FROM pg_index WHERE indrelid = 'sessions.search_stage_archive'::regclass)
+       IS DISTINCT FROM ARRAY['CREATE UNIQUE INDEX search_stage_archive_one_manifest ON sessions.search_stage_archive USING btree (batch_id) WHERE (kind = ''manifest''::text)',
+                              'CREATE UNIQUE INDEX search_stage_archive_pkey ON sessions.search_stage_archive USING btree (batch_id, kind, source_id)']::text[]
+    OR (SELECT array_agg(pg_get_constraintdef(oid)::text ORDER BY conname) FROM pg_constraint WHERE conrelid = 'sessions.search_stage_archive'::regclass AND contype = 'c')
+       IS DISTINCT FROM ARRAY['CHECK ((kind = ANY (ARRAY[''letter''::text, ''event''::text, ''manifest''::text])))']::text[]
+ THEN
+   RAISE EXCEPTION USING ERRCODE = '55000', MESSAGE = 'search stage archive: an existing sessions.search_stage_archive is not the stage''s archive; nothing applied';
+ END IF;
+END $archive_shape$;
 
-CREATE FUNCTION sessions.search_stage_archive_seal_v1() RETURNS trigger
+CREATE OR REPLACE FUNCTION sessions.search_stage_archive_seal_v1() RETURNS trigger
 LANGUAGE plpgsql SET search_path = pg_catalog, pg_temp AS $seal$
 BEGIN
  IF current_user <> (SELECT pg_get_userbyid(c.relowner) FROM pg_class c WHERE c.oid = TG_RELID) THEN
@@ -277,9 +298,9 @@ BEGIN
  RETURN NEW;
 END $seal$;
 REVOKE ALL ON FUNCTION sessions.search_stage_archive_seal_v1() FROM PUBLIC;
-CREATE TRIGGER search_stage_archive_seal BEFORE INSERT OR UPDATE OR DELETE ON sessions.search_stage_archive
+CREATE OR REPLACE TRIGGER search_stage_archive_seal BEFORE INSERT OR UPDATE OR DELETE ON sessions.search_stage_archive
   FOR EACH ROW EXECUTE FUNCTION sessions.search_stage_archive_seal_v1();
-CREATE TRIGGER search_stage_archive_seal_truncate BEFORE TRUNCATE ON sessions.search_stage_archive
+CREATE OR REPLACE TRIGGER search_stage_archive_seal_truncate BEFORE TRUNCATE ON sessions.search_stage_archive
   FOR EACH STATEMENT EXECUTE FUNCTION sessions.search_stage_archive_seal_v1();
 
 -- §8 [rev 7, rev 8]: the failure-safe archive, in ONE transaction under the table locks. Refuses (55000, nothing

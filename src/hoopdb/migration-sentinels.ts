@@ -158,6 +158,29 @@ export const ADOPTABLE_INDEXES: Readonly<Record<string, readonly AdoptableIndex[
   ],
 };
 
+/**
+ * Objects a step's own rollback deliberately keeps (an audit artifact), which an unledgered re-apply of that step
+ * therefore finds present. For the step listed here, and only for these inventory keys (the migrator's
+ * `kind:name[@on]`), sequencePreflight does not count a present object as unledgered_schema. The step's migration
+ * creates each one only if absent (IF NOT EXISTS / OR REPLACE) and verifies the retained shape and owner itself
+ * (55000 otherwise). The step's sentinel must name objects its rollback DOES drop, so it still detects an
+ * unledgered apply.
+ *
+ * 20261105062300 (docs/handoffs/incremental-search-indexing.md §8): sessions.search_stage_archive and its seal are
+ * created by the up and never dropped by the down; its sentinel is the cursor and archive_search_stage_v1(), which
+ * the down drops.
+ */
+export const RETAINED_BY_ROLLBACK: Readonly<Record<string, readonly string[]>> = {
+  "upstream:20261105062300_search_index_stage.sql": [
+    "relation:sessions.search_stage_archive",
+    "index:search_stage_archive_pkey",
+    "index:search_stage_archive_one_manifest",
+    "function:sessions.search_stage_archive_seal_v1",
+    "trigger:search_stage_archive_seal@sessions.search_stage_archive",
+    "trigger:search_stage_archive_seal_truncate@sessions.search_stage_archive",
+  ],
+};
+
 /** How an ADOPTABLE_INDEXES step is prebuilt, and what else its CREATE inventory names. */
 export interface AdoptableIndexStep {
   /** The out-of-band CONCURRENTLY packet the index_prebuild_required refusal names. */

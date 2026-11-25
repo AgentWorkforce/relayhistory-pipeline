@@ -14,6 +14,7 @@ import {
   type AdoptableIndex,
   type ExactBody,
   MIGRATION_SENTINELS,
+  RETAINED_BY_ROLLBACK,
 } from "./migration-sentinels.ts";
 
 export interface GuardClient {
@@ -1460,7 +1461,7 @@ async function tablePopulated(client: GuardClient, table: string): Promise<boole
  *   ledger_gap            one lane isn't a contiguous prefix of its ordered steps;
  *   migration_changed     a ledgered step's file changed;
  *   unledgered_schema     an object that an unledgered step creates already exists.
- * The one exception is ADOPTABLE_INDEXES: a declared index built out of band, exact,
+ * RETAINED_BY_ROLLBACK names the objects a step's own rollback keeps; they never count. The other exception is ADOPTABLE_INDEXES: a declared index built out of band, exact,
  * valid and ready, is accepted for its step (the step adopts it). A step that also
  * replaces functions (ADOPTABLE_INDEX_STEPS) keeps its body sentinel; that sentinel is only
  * set aside when the step declares exactBodies and every one is live byte-identical to the
@@ -1542,6 +1543,8 @@ export async function sequencePreflight(
       const id = key(o);
       if (seen.has(id)) continue;
       seen.add(id);
+      // An object this step's own rollback keeps (RETAINED_BY_ROLLBACK): the step re-adopts and re-verifies it.
+      if (RETAINED_BY_ROLLBACK[names[i]!]?.includes(id)) continue;
       if (
         (await exists(client, o)) &&
         !(o.kind === "index" &&
