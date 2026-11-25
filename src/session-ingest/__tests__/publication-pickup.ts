@@ -3,10 +3,10 @@ import { expect } from "bun:test";
 import { PGlite } from "@electric-sql/pglite";
 import { pg_trgm } from "@electric-sql/pglite/contrib/pg_trgm";
 import { objectStoreManifestReader, type ObjectStore, type StageMessage } from "../../shared/vendor.ts";
-import { pollPostgresStage, postgresPipelineQueue, postgresStageConsumer } from "@rhc/lib/pipeline/queue.ts";
+import { MemoryPipelineQueue, pollPostgresStage, postgresPipelineQueue, postgresStageConsumer } from "@rhc/lib/pipeline/queue.ts";
 import { objectLandedHandler, sessionIndexedHandler } from "@rhc/lib/pipeline/stages.ts";
 import { InMemoryPipelineEventSink } from "@rhc/lib/pipeline/events.ts";
-import { InMemoryDeadLetterStore, type StageQueueDeps } from "@rhc/lib/pipeline/dlq.ts";
+import { isStageMessage, InMemoryDeadLetterStore, type StageQueueDeps } from "@rhc/lib/pipeline/dlq.ts";
 import { hoopDbSessionIndex } from "../../hoopdb/index.ts";
 import { createReadApi } from "../../session-read-api/app.ts";
 import { sqlDirectory } from "../../session-read-api/directory.ts";
@@ -51,7 +51,7 @@ export async function checkPublicationPickup(pg:PGlite, store:ObjectStore, key:s
     expect((await tx.query("SELECT 1 FROM sessions.pipeline_jobs WHERE work_key=$1 AND stage='summary-short'",[job.workKey])).rows).toHaveLength(0);
     throw rollback;
   })).rejects.toBe(rollback);
-  const wakes=()=>pg.query<{work_key:string;message:{scope:{session:string};epoch:number;generation:string;revision:number}}>(
+  const wakes=()=>pg.query<{work_key:string;message:StageMessage<{epoch:number;published_at:string}>}>(
     "SELECT work_key,message FROM sessions.pipeline_jobs WHERE stage='search-index' AND org_id=$1 AND workspace_id=$2",[job.ctx.orgId,job.ctx.workspaceId]);
   expect((await wakes()).rows).toHaveLength(0);
   // Reject wake persistence, and prove projection, queue fanout and wake roll
@@ -68,11 +68,18 @@ export async function checkPublicationPickup(pg:PGlite, store:ObjectStore, key:s
     FROM sessions.ingest_publication_heads h JOIN sessions.session_directory d ON (d.org_id,d.workspace_id,d.harness,d.session_id)=(h.org_id,h.workspace_id,h.physical_source,h.session_id) WHERE h.current_key=$1`,[key]);
   expect(head).toBeDefined();
   expect(head!.physical).not.toBe(head!.canonical);
-  const wk=["search",scope.orgId,scope.workspaceId,scope.harness,head!.canonical].join("␟");
+  const wk=["search",scope.orgId,scope.workspaceId,scope.harness,head!.canonical].join("\u001f");
   const beforeReplay=(await wakes()).rows;
   expect(beforeReplay).toHaveLength(1);
-  expect(beforeReplay[0]).toMatchObject({work_key:wk,message:{scope:{org:scope.orgId,ws:scope.workspaceId,harness:scope.harness,session:head!.physical},
-    canonical:head!.canonical,epoch:head!.epoch,generation:head!.generation,revision:head!.revision,schema_generation:generation,committed_at:expect.any(String)}});
+  const emitted=beforeReplay[0]!.message;
+  expect(isStageMessage(emitted)).toBe(true);
+  await new MemoryPipelineQueue().send(emitted);
+  expect(emitted).toMatchObject({v:1,stage:"search-index",workKey:wk,ctx:{traceId:job.ctx.traceId,orgId:scope.orgId,
+    workspaceId:scope.workspaceId,harness:scope.harness,sessionId:head!.canonical},revision:head!.revision,
+    payload:{epoch:head!.epoch,generation:head!.generation,schema_generation:generation}});
+  const clock=await pg.query("SELECT a.published_at=$1::text::timestamptz AS exact FROM sessions.ingest_publication_attempts a JOIN sessions.ingest_publication_images i USING(attempt_token) WHERE i.manifest_key=$2 AND i.generation=$3 AND i.pointer_revision=$4",
+    [emitted.payload.published_at,key,head!.generation,head!.revision]);
+  expect(clock.rows).toEqual([{exact:true}]);
   // Session-indexed ACK and search ACK are independent. Same-revision redelivery
   // passes the fanout early-return path and cannot duplicate the open wake.
   await queue.send(indexed);
@@ -92,13 +99,48 @@ export async function checkPublicationPickup(pg:PGlite, store:ObjectStore, key:s
       await enqueue();
     };
     await advance(2); await advance(1);
-    const epochs=async()=>(await tx.query("SELECT (message->>'epoch')::int AS epoch,lease_id IS NOT NULL AS leased FROM sessions.pipeline_jobs WHERE stage='search-index' AND work_key=$1 ORDER BY leased DESC",[wk])).rows;
-    expect(await epochs()).toEqual([{epoch:head!.epoch+2,leased:false}]);
-    await tx.query("UPDATE sessions.pipeline_jobs SET lease_id=gen_random_uuid() WHERE stage='search-index' AND work_key=$1",[wk]);
-    await advance(3); await advance(4);
-    expect(await epochs()).toEqual([{epoch:head!.epoch+2,leased:true},{epoch:head!.epoch+4,leased:false}]);
+    const jobRow=async()=>(await tx.query<{id:string;epoch:number;lease:string|null;visible:string;dlq:boolean;attempts:number}>(
+      "SELECT id::text,(message->'payload'->>'epoch')::int AS epoch,lease_id::text AS lease,visible_at::text AS visible,dlq,attempts FROM sessions.pipeline_jobs WHERE stage='search-index' AND work_key=$1",[wk])).rows;
+    const [prior]=await jobRow();
+    expect(prior!.epoch).toBe(head!.epoch+2);
+    await tx.query("UPDATE sessions.pipeline_jobs SET lease_id=gen_random_uuid(),visible_at=now()+interval '5 minutes',attempts=2 WHERE id=$1",[prior!.id]);
+    const [claimed]=await jobRow();
+    await advance(3); await advance(4); await advance(0);
+    expect(await jobRow()).toEqual([{...claimed!,epoch:head!.epoch+4}]);
+    // The consumer contract's guarded ACK cannot delete a newer wanted epoch.
+    const deleted=await tx.query("DELETE FROM sessions.pipeline_jobs WHERE id=$1 AND lease_id=$2 AND (message->'payload'->>'epoch')::bigint <= $3 RETURNING id",
+      [claimed!.id,claimed!.lease,claimed!.epoch]);
+    expect(deleted.rows).toHaveLength(0);
+    await tx.query("UPDATE sessions.pipeline_jobs SET lease_id=NULL,visible_at=now(),attempts=0 WHERE id=$1 AND lease_id=$2",[claimed!.id,claimed!.lease]);
+    expect(await jobRow()).toMatchObject([{id:claimed!.id,lease:null,epoch:head!.epoch+4,attempts:0}]);
+    // A retried leased job reopens the same row without a uniqueness conflict.
+    await tx.query("UPDATE sessions.pipeline_jobs SET lease_id=gen_random_uuid(),attempts=3 WHERE id=$1",[claimed!.id]);
+    await advance(5);
+    await tx.query("UPDATE sessions.pipeline_jobs SET lease_id=NULL,visible_at=now()+interval '30 seconds' WHERE id=$1",[claimed!.id]);
+    expect(await jobRow()).toMatchObject([{id:claimed!.id,lease:null,epoch:head!.epoch+5,attempts:3}]);
+    // Preserve quarantine and its deadline, even if a new epoch wakes the scope.
+    await tx.query("UPDATE sessions.pipeline_jobs SET dlq=true,attempts=12 WHERE id=$1",[claimed!.id]);
+    const [parked]=await jobRow();
+    await advance(6);
+    expect(await jobRow()).toEqual([{...parked!,epoch:head!.epoch+6}]);
     throw rollbackEpoch;
   })).rejects.toBe(rollbackEpoch);
+  // When the real source clock is absent, fail before touching the existing
+  // job. The transaction rolls the fixture clock change back.
+  await expect(pg.transaction(async tx=>{
+    const cleared=await tx.query("UPDATE sessions.ingest_publication_attempts a SET published_at=NULL FROM sessions.ingest_publication_images i WHERE a.attempt_token=i.attempt_token AND i.manifest_key=$1 RETURNING a.attempt_token",[key]);
+    expect(cleared.rows).toHaveLength(1);
+    await tx.query("SELECT sessions.enqueue_managed_search_wake_v1($1,$2)",[
+      {orgId:scope.orgId,workspaceId:scope.workspaceId,harness:scope.harness,sessionId:scope.sessionId,machineId:indexed.ctx.machineId,
+        manifestKey:key,revision:String(head!.revision),schemaGeneration:generation},job.ctx.traceId]);
+  })).rejects.toMatchObject({code:"P0002"});
+  await expect(pg.transaction(async tx=>{
+    await tx.query("UPDATE sessions.session_directory SET event_projection_epoch=9007199254740992 WHERE org_id=$1 AND workspace_id=$2 AND harness=$3 AND session_id=$4",
+      [scope.orgId,scope.workspaceId,scope.harness,head!.canonical]);
+    await tx.query("SELECT sessions.enqueue_managed_search_wake_v1($1,$2)",[
+      {orgId:scope.orgId,workspaceId:scope.workspaceId,harness:scope.harness,sessionId:scope.sessionId,machineId:indexed.ctx.machineId,
+        manifestKey:key,revision:String(head!.revision),schemaGeneration:generation},job.ctx.traceId]);
+  })).rejects.toThrow("ambiguous directory scope");
   await expect(pg.transaction(async tx=>{
     const row=await tx.query("UPDATE sessions.session_index SET scrubbed=false WHERE manifest_key=$1 RETURNING scrub_quarantined",[key]);
     expect(row.rows).toEqual([{scrub_quarantined:true}]);

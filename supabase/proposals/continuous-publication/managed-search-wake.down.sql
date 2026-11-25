@@ -7,7 +7,7 @@ DROP TRIGGER guard_search_wake_update ON sessions.pipeline_jobs;
 DROP TRIGGER guard_search_wake_insert ON sessions.pipeline_jobs;
 DROP FUNCTION sessions.guard_managed_search_wake_v1();
 DROP FUNCTION sessions.enqueue_managed_search_wake_v1(jsonb,uuid);
-DROP INDEX sessions.pipeline_jobs_search_index_open;
+DROP INDEX sessions.pipeline_jobs_search_index_scope;
 -- Restoring the checks refuses rollback atomically if any search-stage history remains.
 DO $checks$
 DECLARE entry record; cname text; current_def text;
