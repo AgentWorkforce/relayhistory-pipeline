@@ -745,3 +745,113 @@ describe.skipIf(!url)("062270 private read profile",()=>{
     } finally {await first.end();await other.end();}
   },30000);
 });
+
+describe.skipIf(!url)("062270 independent synthetic receipt inventory",()=>{
+  test("requires enrollment, both sides of all receipt classes and unchanged evidence on the closing pass",async()=>{
+    const {captureFrontierReceiptSource,RECEIPT_CAPTURE_IDENTITY_SQL}=await import("../frontier-receipt-source.ts");
+    const d=await fixture(),reader="bulls96_frontier_receipt_reader",suffix=crypto.randomUUID().replaceAll("-","");
+    const login="reader_"+suffix,issuer="inventory_"+suffix,destination="dest_"+suffix;
+    await d.pool.query("CREATE ROLE "+reader+" NOLOGIN NOINHERIT; CREATE ROLE "+login+" LOGIN NOINHERIT; CREATE ROLE "+issuer+" NOLOGIN; CREATE ROLE "+destination+" NOLOGIN");
+    clean.push(async()=>{for(const role of [login,reader,issuer,destination]){
+      await d.pool.query("DROP OWNED BY "+role);await d.pool.query("DROP ROLE "+role);
+    }});
+    await d.pool.query("GRANT "+reader+" TO "+login+"; GRANT USAGE ON SCHEMA sessions TO "+reader);
+    await d.pool.query(read("supabase/proposals/continuous-publication/062270-private-read-profile.up.sql"));
+    await d.pool.query(read("src/session-ingest/__tests__/fixtures/frontier-independent-receipt-domain.sql"));
+    await d.pool.query("GRANT USAGE ON SCHEMA fixture_receipt_inventory TO "+issuer+","+destination+
+      "; GRANT INSERT,SELECT ON fixture_receipt_inventory.enrollment,fixture_receipt_inventory.expected TO "+issuer+
+      "; GRANT INSERT,SELECT ON fixture_receipt_inventory.observed TO "+destination);
+    const profileId=crypto.randomUUID(),profileSha256="d".repeat(64);
+    const tenant={orgId:"org-a",workspaceId:"ws-a",userId:"user-a",originId:"origin-1"};
+    const authority={sourceIdentitySha256:"1".repeat(64),sourceGenerationSha256:"2".repeat(64),sourceHead:"3".repeat(40),
+      controlEpoch:"4".repeat(64),privacyBaselineSha256:"5".repeat(64),privacyVersion:"9"};
+    await d.pool.query(`INSERT INTO frontier_receipt_private.read_profiles SELECT
+      $1,$2,r.oid,r.rolname,$3,$4,$5,$6,clock_timestamp(),clock_timestamp()+interval '5 minutes',2,32,16384
+      FROM pg_roles r WHERE r.rolname=$7`,[profileId,profileSha256,tenant,GEN,d.target,authority,login]);
+    const db=(await d.pool.query("SELECT current_database() db")).rows[0].db;
+    const u=new URL(url!);u.pathname="/"+db;u.username=login;u.password="";
+    const client=new pg.Client({connectionString:u.href});await client.connect();
+    const source=await d.pool.connect(),target=await d.pool.connect();
+    try{
+      await source.query("SET ROLE "+issuer);await target.query("SET ROLE "+destination);await client.query("SET ROLE "+reader);
+      await expect(source.query("SELECT * FROM fixture_receipt_inventory.observed")).rejects.toMatchObject({code:"42501"});
+      await expect(target.query("SELECT * FROM fixture_receipt_inventory.expected")).rejects.toMatchObject({code:"42501"});
+      await expect(client.query("SELECT * FROM fixture_receipt_inventory.enrollment")).rejects.toMatchObject({code:"42501"});
+      // Independently authored terminal observations, deliberately delivered out of order.
+      await target.query(`INSERT INTO fixture_receipt_inventory.observed
+        SELECT $1,source,ack,jsonb_build_object('tenant',$2::jsonb,'recordId',record,'revision',rev,'revisionId',rid,
+          'source','fixture','sessionId',NULL,'seat',seat,'bodyAccepted',accept,'candidateDigest',repeat(body,64),'firstDigest',repeat(first,64)),true
+        FROM (VALUES ('queue','D','r3','2','v4','23',true,'d','d'),
+          ('native','A','r1','7','v1','21',true,'a','a'),('legacy','C','r2','1','v3','22',true,'c','c'),
+          ('s3_first','E','r4','3','v5','24',true,'e','e'),('equal_revision_loser','B','r1','7','v2','21',false,'b','a')
+        ) raw(source,ack,record,rev,rid,seat,accept,body,first)`,[profileId,tenant]);
+      // Catalog extraction is only the disposable fixture's pin; real pins must be reviewed separately.
+      const identity=(await d.pool.query(RECEIPT_CAPTURE_IDENTITY_SQL)).rows[0];
+      const input={tenant,generation:GEN,profileId,profileSha256,functionOwner:identity.function_owner,functionSha256:identity.definition_sha256,
+        bounds:{pageLimit:2,maxPages:8,maxDecisions:32,maxBytes:64000,maxDurationMs:10000}};
+      const capture=()=>captureFrontierReceiptSource(client as never,input);
+      const assertHeld=async(reason:string)=>{
+        await expect(capture()).rejects.toThrow("frontier_receipt_unavailable");
+        await client.query("BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY");
+        try {
+          await expect(client.query("SELECT sessions.ingest_scoped_publication_receipt_capture_v1($1)",[
+            {protocol:"first-ack-seat-capture-v1",profileId,profileSha256,tenant,generation:GEN,after:null,limit:2},
+          ])).rejects.toThrow(reason);
+        } finally {await client.query("ROLLBACK");}
+      };
+      await assertHeld("enrollment held");
+      // Fixed independent known answer. No observed destination row is read to issue the enrollment.
+      const root="38a3d36d1f50f2380a4def8f89c6cc847a176f5e4205217bac973c0feb34cedd";
+      const counts={native:1,equal_revision_loser:1,legacy:1,queue:1,s3_first:1};
+      await source.query("INSERT INTO fixture_receipt_inventory.enrollment VALUES ($1,$2,$3,$4,$5,$6,$7)",
+        [profileId,tenant,GEN,d.target,authority,counts,root]);
+      const manifest=[
+        ["native","A","r1","7","v1","21","a","a"],["equal_revision_loser","B","r1","7","v2","21","b","a"],
+        ["legacy","C","r2","1","v3","22","c","c"],["queue","D","r3","2","v4","23","d","d"],["s3_first","E","r4","3","v5","24","e","e"],
+      ];
+      for(const [population,ack,recordId,revision,revisionId,seat,body,first] of manifest){
+        await source.query("INSERT INTO fixture_receipt_inventory.expected VALUES ($1,$2,$3,$4)",
+          [profileId,population,ack,{tenant,recordId,revision,revisionId,seat,source:"fixture",sessionId:null,
+            bodyAccepted:body===first,candidateDigest:body.repeat(64),firstDigest:first.repeat(64)}]);
+      }
+      const complete=await capture();
+      expect(complete.scan.pageItemCounts).toEqual([2,2,1,0]);
+      expect(complete.decisions.map(x=>[x.revisionId,x.bodyAccepted])).toEqual([["v1",true],["v2",false],["v3",true],["v4",true],["v5",true]]);
+      for(const population of Object.keys(counts)){
+        const lost=(await d.pool.query("DELETE FROM fixture_receipt_inventory.observed WHERE profile_id=$1 AND source=$2 RETURNING *",[profileId,population])).rows[0];
+        await assertHeld("terminal comparison held");
+        await target.query("INSERT INTO fixture_receipt_inventory.observed VALUES ($1,$2,$3,$4,$5)",
+          [profileId,population,lost.ack_id,lost.decision,lost.terminal]);
+      }
+      let commits=0;
+      const interrupted={query:async(q:string,args?:unknown[])=>{
+        const result=await client.query(q,args);
+        if(q==="COMMIT" && ++commits===1){
+          await d.pool.query("UPDATE fixture_receipt_inventory.observed SET terminal=false WHERE source='equal_revision_loser'");
+        }
+        return result;
+      }};
+      await expect(captureFrontierReceiptSource(interrupted as never,input)).rejects.toThrow("frontier_receipt_unavailable");
+      expect(commits).toBe(1);
+      await d.pool.query("UPDATE fixture_receipt_inventory.observed SET terminal=true WHERE source='equal_revision_loser'");
+      // Same number of entries on both sides cannot rescue a forged decision.
+      await d.pool.query("UPDATE fixture_receipt_inventory.observed SET decision=jsonb_set(decision,'{seat}','\"99\"') WHERE source='queue'");
+      await assertHeld("terminal comparison held");
+      await d.pool.query("UPDATE fixture_receipt_inventory.observed SET decision=jsonb_set(decision,'{seat}','\"23\"') WHERE source='queue'");
+      // Even simultaneous corruption of both row stores is detected by the immutable test vector.
+      for(const table of ["expected","observed"]){
+        await d.pool.query("UPDATE fixture_receipt_inventory."+table+" SET decision=jsonb_set(decision,'{seat}','\"98\"') WHERE source='queue'");
+      }
+      await assertHeld("independent root mismatch");
+      for(const table of ["expected","observed"]){
+        await d.pool.query("UPDATE fixture_receipt_inventory."+table+" SET decision=jsonb_set(decision,'{seat}','\"23\"') WHERE source='queue'");
+      }
+      // A missing cohort on BOTH sides still disagrees with the issuer's independent terminal count.
+      await d.pool.query("DELETE FROM fixture_receipt_inventory.expected WHERE source='legacy'");
+      await d.pool.query("DELETE FROM fixture_receipt_inventory.observed WHERE source='legacy'");
+      await assertHeld("terminal comparison held");
+    } finally {
+      await client.end();await source.query("RESET ROLE");await target.query("RESET ROLE");source.release();target.release();
+    }
+  },30000);
+});
