@@ -1,4 +1,6 @@
-import { expect, test } from "bun:test";
+import { expect, test, spyOn } from "bun:test";
+import { createS3Store } from "../../../packages/object-store/src/s3.ts";
+import { objectKey } from "../../../packages/object-store/src/key.ts";
 import { publicationPodCredentials } from "../publication-pod-credentials.ts";
 
 const env = {
@@ -69,4 +71,49 @@ test("refuses malformed responses, insufficient lifetime, mismatched or ambiguou
     sts().replace("<Account>111122223333", "<Account>111111111111"), sts(role + "/extra")])
     await expect(fake(JSON.stringify(doc), bad)()).rejects.toThrow("publication_pod_identity");
   await expect(fake(JSON.stringify(doc), sts())(AbortSignal.abort())).rejects.toThrow();
+});
+
+test("a versioned S3 client rotates its signing identity and refuses the wrong replacement before transport", async () => {
+  let clock = Date.UTC(2026, 0, 1), issued = 0, acceptedRole = role;
+  const time = spyOn(Date, "now").mockImplementation(() => clock);
+  try {
+    const credentials = publicationPodCredentials(env, identity, {
+      readToken: async () => "test.synthetic.token",
+      request: async url => {
+        if (url !== env.AWS_CONTAINER_CREDENTIALS_FULL_URI) return sts(acceptedRole);
+        issued++;
+        return JSON.stringify({
+          AccessKeyId: "ASIA" + String(issued).padStart(16, "0"), SecretAccessKey: "synthetic-test-secret",
+          Token: "fixture-" + issued, Expiration: new Date(clock + 3_600_000).toISOString(),
+        });
+      },
+    });
+    const tokens: string[] = [];
+    const key = objectKey("fixture/workspace/object");
+    const store = createS3Store({
+      bucket: "publication-test", region: "us-east-1", credentials,
+      fetch: (async (url, init) => {
+        expect(String(url)).toBe("https://publication-test.s3.us-east-1.amazonaws.com/fixture/workspace/object");
+        const headers = new Headers(init?.headers);
+        expect(headers.get("authorization")).toContain("/us-east-1/s3/aws4_request");
+        tokens.push(headers.get("x-amz-security-token")!);
+        return new Response(null, { headers: { "x-amz-version-id": "fixture-version" } });
+      }) as typeof fetch,
+    });
+    const copy = await credentials();
+    copy.expiresAt!.setTime(clock + 86_400_000);
+    expect((await credentials()).expiresAt!.getTime()).toBe(clock + 300_000);
+    expect((await store.head(key))?.version.version).toBe("fixture-version");
+    clock += 299_999;
+    await store.head(key);
+    clock++;
+    await store.head(key);
+    acceptedRole = role.replace("test-session-publication", "unqualified");
+    clock += 300_000;
+    await expect(store.head(key)).rejects.toThrow("publication_pod_identity");
+    expect(tokens).toEqual(["fixture-1", "fixture-1", "fixture-2"]);
+    expect(issued).toBe(3);
+  } finally {
+    time.mockRestore();
+  }
 });
