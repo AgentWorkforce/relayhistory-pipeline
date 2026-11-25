@@ -39,3 +39,18 @@ Run these cases on the integrated server bytes under the intended roles on PG15/
 The parked 062240 candidate checks for live source rows and scans all other authority tables. Its PGlite suite exercised 38 cases (209 assertions). That suite does not consume a creator-issued witness. The older candidate and its race fixtures are retained separately. The 194-org operator repair supplies evidence for those individual repairs only. This branch adds no migration, identity grant or activation path.
 
 An independent disposable PostgreSQL 16 run of the parked race suite passed three of five cases. Bare source-row deletion serialized in both lock orders, and duplicate first claims produced one admission and one audit row. Both cases using the self-host erase entry point failed their assertions. The integrated witness must pass those two cases through the actual erase entry point as well as the matrix above. PostgreSQL 15 and 17 results for this design are pending.
+
+## Directory owner source review
+
+The directory owner reviewed cached Cloud `e6a51900f6b5` and relay-control `c8fca01d77a3` (receipt `251254668272951296`). These pins describe source behavior. Effective deployment and routing remain unverified.
+
+| Creation path | Candidate transaction boundary |
+|---|---|
+| Cloud additional organization | The browser session reaches `app/api/v1/organizations/route.ts:31` and `lib/auth/store.ts:399`. The org, owner membership and default workspace commit together. |
+| Cloud signup | Verified OAuth reaches `lib/auth/oauth-sign-in.ts:144` and `lib/auth/store.ts:312`. User, identity and directory rows commit together. |
+| Control self-serve or personal org | Account-session route `src/identity/routes.ts:1156` calls the directory creation paths in `src/identity/store.ts:305` and `:939`. Those transactions include a creation audit. |
+| Control operator or bootstrap | Bootstrap bearer route `src/app.ts:2707` reaches `src/store.ts:319`. That path creates the org and owner without a creation audit. Startup bootstrap audits separately. |
+
+Cloud emits telemetry after commit without awaiting delivery. Control imports preserve source UUIDs and creation timestamps (`scripts/cloud-import/mapping.ts:308`). Both creation audits and the import ledger (`0063_cloud_import_ledger.sql`) cascade when the org is deleted. A missing audit or import row therefore leaves prior existence unknown. The owner found no persistent incarnation record or recreation tombstone.
+
+Layered Control owns the issuer contract. Cloud creation hooks need matching relay-control coverage until their retirement is verified. Signup, self-serve, reviewer, legacy self-host, bootstrap/operator, import, restore and manual writer paths each need either qualified coverage or explicit exclusion from automatic admission. Add a disposable case that imports an org, deletes it with cascading audit and ledger removal, and recreates its UUID. First admission must still refuse the old incarnation. Also pause outbox delivery between directory commit and first upload and verify that ingest refuses the exemption until it has accepted both the witness and the privacy baseline.
