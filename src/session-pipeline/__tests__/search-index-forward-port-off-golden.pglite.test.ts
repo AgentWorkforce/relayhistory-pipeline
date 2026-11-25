@@ -83,7 +83,15 @@ async function wakeOf(r: Rig, x: ExportedScope) {
   };
 }
 
-async function record(s: Scenario, overlay: Partial<SearchIndexDeps> = {}): Promise<Entry[]> {
+/**
+ * The additive telemetry the golden capture strips, and nothing else: on the log lines, `event_age_ms`,
+ * `s3_event_age_ms` and `queue_origin` (ecb5d981) and `contender_seats` (9279264f); on the results, `contenderSeats`.
+ * (`ts`, `duration_ms` and the search phase timers were already stripped at 9d1adf84.)
+ */
+export const STRIPPED_LOG_FIELDS = ["event_age_ms", "s3_event_age_ms", "queue_origin", "contender_seats"] as const;
+export const STRIPPED_RESULT_FIELDS = ["contenderSeats"] as const;
+
+async function record(s: Scenario, overlay: Partial<SearchIndexDeps> = {}, raw = false): Promise<Entry[]> {
   const x = await exportStreamScope(s.lines(), 1200);
   cleanup.push(x.dispose);
   const r = await hostedRig(x, cleanup);
@@ -101,8 +109,9 @@ async function record(s: Scenario, overlay: Partial<SearchIndexDeps> = {}): Prom
         for (const line of String(chunk).split("\n"))
           if (line.startsWith("{"))
             try {
-              const { ts: _ts, duration_ms: _d, event_age_ms: _ea, s3_event_age_ms: _sa, queue_origin: _qo, contender_seats: _cs, source_read_ms: _sr, index_scan_ms: _is, locked_apply_ms: _la,
-                write_calls: _wc, write_batches: _wb, ...entry } = JSON.parse(line) as Entry;
+              const { ts: _ts, duration_ms: _d, source_read_ms: _sr, index_scan_ms: _is, locked_apply_ms: _la,
+                write_calls: _wc, write_batches: _wb, ...kept } = JSON.parse(line) as Entry;
+              const entry = raw ? kept : Object.fromEntries(Object.entries(kept).filter(([k]) => !(STRIPPED_LOG_FIELDS as readonly string[]).includes(k)));
               if (entry.stage === "search-index") lines.push(entry);
             } catch {}
         return (w as (...a: unknown[]) => boolean).call(stream, chunk, ...rest);
@@ -119,7 +128,7 @@ async function record(s: Scenario, overlay: Partial<SearchIndexDeps> = {}): Prom
       process.stderr.write = stderr;
     }
     // contenderSeats is additive telemetry (the backport's 9279264f), pinned in stream-protections.pglite.test.ts.
-    const stripped = JSON.parse(JSON.stringify(result, (k, v) => (k === "contenderSeats" ? undefined : v)));
+    const stripped = raw ? result : JSON.parse(JSON.stringify(result, (k, v) => ((STRIPPED_RESULT_FIELDS as readonly string[]).includes(k) ? undefined : v)));
     out.push({ run: i, result: stripped, reads: r.reads.count - reads, sql: [...r.sql], clickhouse: [...r.fake.calls], log: lines });
   }
   return out;
@@ -142,4 +151,30 @@ test("both forward-ported flags unset: SQL, ClickHouse calls, reads, results and
 test("M2 managed pass with both flags ON: byte-identical to the flag-off golden (the managed pass never skips)", async () => {
   const golden = JSON.parse(readFileSync(GOLDEN, "utf8")) as Record<string, Entry[]>;
   for (const m2 of SCENARIOS.filter((s) => s.m2)) expect(await record(m2, BOTH_ON)).toEqual(golden[m2.name]!);
+}, 300_000);
+
+test("flags off: the stripped telemetry fields are the only difference from the 9d1adf84 golden (and they are present)", async () => {
+  const golden = JSON.parse(readFileSync(GOLDEN, "utf8")) as Record<string, Entry[]>;
+  const seen = new Set<string>();
+  const strip = (v: unknown): unknown => JSON.parse(JSON.stringify(v, (k, x) => ((STRIPPED_RESULT_FIELDS as readonly string[]).includes(k) ? undefined : x)));
+  for (const s of SCENARIOS) {
+    const raw = await record(s, {}, true);
+    const want = golden[s.name]!;
+    expect(raw.length).toBe(want.length);
+    for (const [i, run] of raw.entries()) {
+      const g = want[i]!;
+      const rawLog = run.log as Entry[];
+      const goldenLog = g.log as Entry[];
+      expect(rawLog.length).toBe(goldenLog.length);
+      for (const [n, line] of rawLog.entries()) {
+        const extra = Object.keys(line).filter((k) => !(k in goldenLog[n]!));
+        for (const k of extra) seen.add(k);
+        expect(extra.every((k) => (STRIPPED_LOG_FIELDS as readonly string[]).includes(k))).toBe(true);
+        expect(Object.fromEntries(Object.entries(line).filter(([k]) => !extra.includes(k)))).toEqual(goldenLog[n]!);
+      }
+      // Everything else (SQL, ClickHouse calls, reads) is exactly the golden; results differ by contenderSeats only.
+      expect({ ...run, log: undefined, result: strip(run.result) }).toEqual({ ...g, log: undefined });
+    }
+  }
+  expect([...seen].sort()).toEqual(["contender_seats", "queue_origin"]);
 }, 300_000);

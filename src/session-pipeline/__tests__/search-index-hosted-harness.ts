@@ -75,6 +75,13 @@ export function fakeClickHouse() {
         if (facts.fail) throw new Error("facts state unavailable");
         return (facts.complete === undefined ? [] : [{ complete: facts.complete }]) as T[];
       }
+      // The scope's latest session state row (the hosted pass's completion fence; the over-bound skip).
+      if (query.includes(`FROM ${SESSION_STATE_TABLE}`)) {
+        const p = options!.params!;
+        const ms = (v: unknown) => Date.parse(`${String(v).replace(" ", "T")}Z`);
+        const row = state.filter((r) => r.org_id === p.org && r.session_id === p.session).sort((a, b) => ms(b.synced_at) - ms(a.synced_at))[0];
+        return (row ? [{ revision: String(row.revision), needs_full: row.needs_full, scanned_rows: row.scanned_rows, synced_ms: ms(row.synced_at) }] : []) as T[];
+      }
       if (!query.includes(`FROM ${EVENTS_TABLE} FINAL`)) throw new Error(`unexpected select ${query.slice(0, 40)}`);
       const p = options!.params!;
       let matched = final()

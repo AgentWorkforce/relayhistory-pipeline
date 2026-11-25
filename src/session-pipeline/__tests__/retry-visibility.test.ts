@@ -47,13 +47,18 @@ const ids = (r: { batchItemFailures: { itemIdentifier: string }[] }) => r.batchI
 
 describe("retry visibility off (default)", () => {
   test("no change call, the same failures and the same log lines as without receipt handles", async () => {
-    const base: ConsumerDeps = { pointer, search: brokenSearch };
+    // A frozen consumer clock: the latency fields (s3_event_age_ms from the records' eventTime) are exact, so the
+    // two runs' lines compare equal without wall-clock jitter.
+    const FROZEN = Date.parse("2026-11-06T00:00:05.000Z");
+    const base: ConsumerDeps = { pointer, search: brokenSearch, now: () => FROZEN };
     const batch = records(["pmp-1"], ["err-1"], ["srch-1"], ["ok-1"]);
     const withHandles = await captureLogs(() => processBatch(batch, base));
     const without = await captureLogs(() => processBatch(batch.map(({ receiptHandle: _r, ...r }) => r), base));
     expect(ids(withHandles.result)).toEqual(["msg-err-1", "msg-pmp-1", "msg-srch-1"]);
     expect(withHandles.result).toEqual(without.result);
     expect(stable(withHandles.lines)).toEqual(stable(without.lines));
+    // The exact telemetry of the one pointer line that reaches it (srch-1): five seconds after the upload, from S3.
+    expect(withHandles.lines.filter((l) => l.message === "pointer indexed").map((l) => [l.s3_event_age_ms, l.queue_origin])).toEqual([[5_000, "s3"]]);
     expect(withHandles.lines.some((l) => String(l.message).includes("retry visibility"))).toBe(false);
   });
 
