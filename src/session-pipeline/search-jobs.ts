@@ -349,12 +349,15 @@ export async function catchUpTick(deps: { sql: SearchSql; pageSize?: number }): 
               AND coalesce(i.canonical_session_id, i.session_id) = d.session_id AND i.deleted_at IS NULL
            HAVING count(*) > 0
          ) live
-         -- §2's publish clock: the latest current live update of the canonical scope.
+         -- §2's publish clock: the latest current live update of the canonical scope. Each head contributes only its
+         -- OWN attempt: the attempt's tenant, user and origin equal that head's (attempt.origin_id = head.origin_id);
+         -- heads of different origins may sit in one scope, but no head is ever clocked by another origin's attempt.
          CROSS JOIN LATERAL (
            SELECT to_char(max(a.published_at) AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.US"Z"') AS publish_at
              FROM sessions.ingest_publication_heads h
              JOIN sessions.ingest_publication_images i ON i.manifest_key = h.current_key
              JOIN sessions.ingest_publication_attempts a ON a.attempt_token = i.attempt_token AND a.state = 'published'
+              AND (a.org_id, a.workspace_id, a.user_id, a.origin_id) = (h.org_id, h.workspace_id, h.user_id, h.origin_id)
              JOIN sessions.session_index p ON p.manifest_key = h.current_key AND p.deleted_at IS NULL
             WHERE h.state = 'live' AND h.org_id = d.org_id AND h.workspace_id = d.workspace_id AND h.physical_source = d.harness
               AND coalesce(p.canonical_session_id, p.session_id) = d.session_id

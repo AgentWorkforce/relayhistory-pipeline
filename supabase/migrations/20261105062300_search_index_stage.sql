@@ -128,10 +128,11 @@ BEGIN
  LEFT JOIN sessions.ingest_publication_images i ON
    (i.manifest_key, i.generation, i.pointer_revision, i.raw_sha256) =
    (sibling.current_key, sibling.generation, sibling.pointer_revision, sibling.current_raw_sha256)
- -- The sibling's own image names its attempt exactly (attempt_token). The tenant and user must match; the origin is
- -- not compared here: the sibling only supplies the clock (it never validates the trigger), as §2's aggregate.
+ -- The sibling's own image names its attempt exactly (attempt_token), and that attempt must carry the sibling
+ -- head's OWN tenant, user and origin (attempt.origin_id = sibling.origin_id). Sibling and trigger origins may
+ -- differ; another origin's attempt never clocks a sibling: it counts as unclocked, so the scope is refused.
  LEFT JOIN sessions.ingest_publication_attempts a ON a.attempt_token = i.attempt_token AND a.state = 'published'
-   AND (a.org_id, a.workspace_id, a.user_id) = (sibling.org_id, sibling.workspace_id, sibling.user_id)
+   AND (a.org_id, a.workspace_id, a.user_id, a.origin_id) = (sibling.org_id, sibling.workspace_id, sibling.user_id, sibling.origin_id)
  WHERE sibling.state = 'live' AND p.deleted_at IS NULL AND p.scrubbed IS TRUE AND NOT p.scrub_quarantined
    AND (p.org_id, p.workspace_id, p.harness, coalesce(p.canonical_session_id, p.session_id)) =
        (h.org_id, h.workspace_id, h.physical_source, canonical_id)
@@ -201,8 +202,9 @@ BEGIN
        LEFT JOIN sessions.ingest_publication_images i ON
          (i.manifest_key, i.generation, i.pointer_revision, i.raw_sha256) =
          (sibling.current_key, sibling.generation, sibling.pointer_revision, sibling.current_raw_sha256)
+       -- Each sibling's attempt must match ITS OWN head's origin (as enqueue_managed_search_wake_v1): a mismatch is unclocked.
        LEFT JOIN sessions.ingest_publication_attempts a ON a.attempt_token = i.attempt_token AND a.state = 'published'
-         AND (a.org_id, a.workspace_id, a.user_id) = (sibling.org_id, sibling.workspace_id, sibling.user_id)
+         AND (a.org_id, a.workspace_id, a.user_id, a.origin_id) = (sibling.org_id, sibling.workspace_id, sibling.user_id, sibling.origin_id)
       WHERE sibling.state = 'live' AND p.deleted_at IS NULL AND p.scrubbed IS TRUE AND NOT p.scrub_quarantined
         AND (p.org_id, p.workspace_id, p.harness, coalesce(p.canonical_session_id, p.session_id)) =
             (h.org_id, h.workspace_id, h.physical_source, canonical_id);

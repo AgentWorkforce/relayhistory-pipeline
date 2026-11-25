@@ -93,9 +93,11 @@ export interface PublishedHeadOptions {
  * A sibling head of the real one (heads, generations, attempts, images, session_index cloned, each column overridden
  * as given), seeded with triggers off (session_replication_role = replica): the rows are the state the §2 clock
  * query reads, not a path under test. Its key is `<real key>.<tag>`, its machine `srv_<tag with '-' as '_'>`.
+ * A VALID second origin: `origin-<tag>` on its head, its generation AND its attempt (§2: each sibling's attempt
+ * matches its own head's origin). `attemptOrigin` forges a mismatch (the negative case).
  */
 export async function siblingHead(db: PGlite, realKey: string, tag: string,
-  o: { publishedAt: string; headState?: "live" | "retired"; deleted?: boolean; canonical?: string }) {
+  o: { publishedAt: string; headState?: "live" | "retired"; deleted?: boolean; canonical?: string; attemptOrigin?: string }) {
   const generation = crypto.randomUUID(), attempt = crypto.randomUUID();
   const machine = `srv_${tag.replace(/-/g, "_")}`, origin = `origin-${tag}`;
   await db.transaction(async (tx) => {
@@ -109,7 +111,7 @@ export async function siblingHead(db: PGlite, realKey: string, tag: string,
     await one(clone("ingest_publication_generations", `generation = (SELECT generation FROM sessions.ingest_publication_heads WHERE current_key = '${realKey}')`,
       { generation, prefix: `${tag}-${generation}`, origin_id: origin, state: o.headState ?? "live" }));
     await one(clone("ingest_publication_attempts", "state = 'published' AND attempt_token = (SELECT attempt_token FROM sessions.ingest_publication_images WHERE manifest_key = '" + realKey + "')",
-      { attempt_token: attempt, published_at: o.publishedAt }));
+      { attempt_token: attempt, published_at: o.publishedAt, origin_id: o.attemptOrigin ?? origin }));
     await one(clone("ingest_publication_images", `manifest_key = '${realKey}'`, { attempt_token: attempt, generation, manifest_key: key }));
     await one(clone("session_index", `manifest_key = '${realKey}'`, {
       machine_id: machine, manifest_key: key, deleted_at: o.deleted ? o.publishedAt : null,
