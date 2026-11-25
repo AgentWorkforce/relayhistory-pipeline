@@ -40,7 +40,7 @@ import type { HoopDb } from "../shared/db.ts";
 import { errorFields, log } from "../shared/log.ts";
 import { awsJsonCall, invokeAsync, lambdaCredentials, type AwsSessionCredentials } from "./aws-json.ts";
 import { createClickHouseClient } from "./vendor/search-index/clickhouse.ts";
-import { processBatch, type BatchResponse, type ConsumerDeps, type QueueRecord } from "./consumer.ts";
+import { processBatch, RETRY_VISIBILITY_TIMEOUT_MS, type BatchResponse, type ConsumerDeps, type QueueRecord } from "./consumer.ts";
 import { droppedFanout, scopeLockKey, type PointerDeps, type ScopeLock } from "./pointer.ts";
 import { SEARCH_INDEX_STREAM_CH_BUDGET, SEARCH_INDEX_STREAM_DEADLINE_MARGIN_MS, type SearchIndexDeps } from "./search-index.ts";
 import { RECONCILE_BODY_KEY, requeueBody } from "./s3-events.ts";
@@ -91,6 +91,14 @@ export interface LambdaEnv {
    * need SEARCH_INDEX_ENABLED. Absent: as before.
    */
   pointerSkipOriginBucketEnabled?: true;
+  /**
+   * SESSION_PIPELINE_RETRY_VISIBILITY_S=<1..43200> (unset, "" or "0": off; 60 is the intended
+   * value): a message whose pointer stage failed with pointer_move_pending is redelivered after
+   * this many seconds instead of the queue's visibility timeout (consumer.ts retryVisibility).
+   * Needs sqs:ChangeMessageVisibility on the source queue for the Lambda role; without it the
+   * call fails, a warn is logged, and the message keeps the full timeout. Absent: as before.
+   */
+  retryVisibilityS?: number;
 }
 
 export function lambdaEnv(env: NodeJS.ProcessEnv = process.env): LambdaEnv {
@@ -122,6 +130,7 @@ export function lambdaEnv(env: NodeJS.ProcessEnv = process.env): LambdaEnv {
     throw new Error("session pipeline: SEARCH_INDEX_SKIP_ACCEPTANCE_MISSING_ENABLED=true needs SEARCH_INDEX_ENABLED=1");
   // SESSION_POINTER_SKIP_ORIGIN_BUCKET_ENABLED: strict grammar, default off, no SEARCH_INDEX_ENABLED coupling.
   const pointerSkipOriginBucket = pointerSkipOriginBucketFromEnv(env);
+  const retryVisibilityS = retryVisibilityFromEnv(env);
   return {
     region: need("AWS_REGION"),
     bucket: need("PIPELINE_RAW_S3_BUCKET"),
@@ -136,7 +145,17 @@ export function lambdaEnv(env: NodeJS.ProcessEnv = process.env): LambdaEnv {
     ...(searchSkipOverBound ? { searchSkipOverBound: true as const } : {}),
     ...(searchSkipAcceptanceMissing ? { searchSkipAcceptanceMissing: true as const } : {}),
     ...(pointerSkipOriginBucket ? { pointerSkipOriginBucketEnabled: true as const } : {}),
+    ...(retryVisibilityS ? { retryVisibilityS } : {}),
   };
+}
+
+/** SESSION_PIPELINE_RETRY_VISIBILITY_S: unset, "" and "0" are off (0); else an integer 1..43200, or init fails naming the variable. */
+export function retryVisibilityFromEnv(env: Record<string, string | undefined>): number {
+  const value = env.SESSION_PIPELINE_RETRY_VISIBILITY_S;
+  if (value === undefined || value === "" || value === "0") return 0;
+  const n = /^[0-9]{1,5}$/.test(value) ? Number(value) : NaN;
+  if (!Number.isInteger(n) || n < 1 || n > 43_200) throw new Error("session pipeline: SESSION_PIPELINE_RETRY_VISIBILITY_S must be an integer from 0 to 43200");
+  return n;
 }
 
 /**
@@ -280,6 +299,29 @@ export function sqsRequeue(
   };
 }
 
+/**
+ * The consumer's `retryVisibility.change` dep: one SQS ChangeMessageVisibility on the pipeline queue
+ * (SESSION_PIPELINE_QUEUE_URL, the same queue `requeue` and the reconcile send to), bounded by
+ * RETRY_VISIBILITY_TIMEOUT_MS. Requires sqs:ChangeMessageVisibility on that queue for the Lambda role.
+ * `call` and `credentials` are injectable for tests.
+ */
+export function sqsChangeVisibility(
+  env: Pick<LambdaEnv, "region" | "queueUrl">,
+  call: typeof awsJsonCall = awsJsonCall,
+  credentials: () => AwsSessionCredentials = () => lambdaCredentials(),
+): NonNullable<ConsumerDeps["retryVisibility"]>["change"] {
+  return async (receiptHandle, seconds) => {
+    await call({
+      service: "sqs",
+      target: "AmazonSQS.ChangeMessageVisibility",
+      region: env.region,
+      body: { QueueUrl: env.queueUrl, ReceiptHandle: receiptHandle, VisibilityTimeout: seconds },
+      credentials: credentials(),
+      timeoutMs: RETRY_VISIBILITY_TIMEOUT_MS,
+    });
+  };
+}
+
 interface Runtime {
   env: LambdaEnv;
   deps: ConsumerDeps;
@@ -323,6 +365,8 @@ async function init(): Promise<Runtime> {
       ...pointerFlagDeps(env),
     },
     requeue: sqsRequeue(env),
+    // Default off (SESSION_PIPELINE_RETRY_VISIBILITY_S).
+    ...(env.retryVisibilityS ? { retryVisibility: { seconds: env.retryVisibilityS, change: sqsChangeVisibility(env) } } : {}),
   };
   if (env.searchEnabled) {
     if (!secret.clickhouse) throw new Error("SEARCH_INDEX_ENABLED=1 but the secret has no clickhouse block");
@@ -539,14 +583,20 @@ export function invocationDeps(deps: ConsumerDeps, context?: LambdaInvocationCon
   };
 }
 
-type SqsRecord = { messageId: string; body: string; eventSource?: string; attributes?: { SentTimestamp?: unknown } | null };
+type SqsRecord = { messageId: string; body: string; receiptHandle?: string; eventSource?: string; attributes?: { SentTimestamp?: unknown } | null };
 
 /**
  * The consumer's view of the Lambda's SQS records. Of the message attributes only
  * SentTimestamp is passed on (for the event_age_ms log field); SenderId and the rest stay here.
+ * The receipt handle is passed on only with `withReceiptHandle` (retryVisibility armed).
  */
-export function queueRecords(records: readonly SqsRecord[]): QueueRecord[] {
-  return records.map((r) => ({ messageId: r.messageId, body: r.body, sentTimestamp: r.attributes?.SentTimestamp }));
+export function queueRecords(records: readonly SqsRecord[], withReceiptHandle = false): QueueRecord[] {
+  return records.map((r) => ({
+    messageId: r.messageId,
+    body: r.body,
+    sentTimestamp: r.attributes?.SentTimestamp,
+    ...(withReceiptHandle && typeof r.receiptHandle === "string" ? { receiptHandle: r.receiptHandle } : {}),
+  }));
 }
 
 type LambdaEvent = { Records?: SqsRecord[]; reconcile?: unknown; brief?: unknown; cursor?: string; since?: string; link?: number };
@@ -561,7 +611,7 @@ export async function handler(event: LambdaEvent, context?: LambdaInvocationCont
       // Nothing was processed: every message goes back to the queue.
       return { batchItemFailures: event.Records.map((r) => ({ itemIdentifier: r.messageId })) };
     }
-    return processBatch(queueRecords(event.Records), invocationDeps(rt.deps, context));
+    return processBatch(queueRecords(event.Records, rt.deps.retryVisibility !== undefined), invocationDeps(rt.deps, context));
   }
   if (event?.reconcile === true) {
     const started = Date.now();
