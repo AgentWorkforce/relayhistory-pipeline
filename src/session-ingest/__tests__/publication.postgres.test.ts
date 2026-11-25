@@ -25,6 +25,8 @@ import { SESSION_BOOTSTRAP_FILES } from "../../hoopdb/session-bootstrap-chain.ts
 import {VersionedMemoryStore} from "./versioned-store.ts";
 import {heldPublicationSentinels,publicationKernelSlot,publicationRecoverySlot} from "../../../supabase/proposals/continuous-publication/held-profile.ts";
 const url=process.env.SESSION_INGEST_TEST_PG_URL;
+const orderedTemplate=process.env.PUBLICATION_PROOF_TEMPLATE === "publication_release_fixture";
+const searchDown="supabase/rollbacks/20261105062300_search_index_stage.down.sql";
 const GEN="a".repeat(64);
 const FRONTIER_CAPTURE="4".repeat(64),FRONTIER_PLAN="5".repeat(64),FRONTIER_EVIDENCE="6".repeat(64);
 const CANARY_PLAN_ID="77777777-7777-4777-8777-777777777777";
@@ -34,15 +36,17 @@ const clean:Array<()=>Promise<void>>=[];
 afterEach(async()=>{for(const f of clean.splice(0).reverse())await f();},30000);
 async function fixture(frontier=true,initialRecords=[record({record_id:"new-r1"})],guard=false, storeOverride?: ObjectStore){
  const admin=new pg.Client({connectionString:url});await admin.connect();const name="publisher_"+crypto.randomUUID().replaceAll("-","");
- await admin.query("CREATE DATABASE "+name);const u=new URL(url!);u.pathname="/"+name;
+ await admin.query("CREATE DATABASE "+name+(orderedTemplate ? " TEMPLATE publication_release_fixture" : ""));const u=new URL(url!);u.pathname="/"+name;
  const pool=new pg.Pool({connectionString:u.href});const dir=mkdtempSync(join(tmpdir(),"publisher-"));
  clean.push(async()=>{await pool.end();await admin.query("DROP DATABASE "+name);await admin.end();rmSync(dir,{recursive:true,force:true});});
+ if (!orderedTemplate) {
  await pool.query(read("supabase/tests/supabase_shim.sql"));await pool.query("CREATE EXTENSION pg_trgm;CREATE EXTENSION btree_gin");
  for(const f of SESSION_BOOTSTRAP_FILES)await pool.query(read(f));
  for(const f of readdirSync(join(root,"supabase/migrations")).sort())await pool.query(read("supabase/migrations/"+f));
  for(const f of readdirSync(join(root,"src/hoopdb/migrations")).sort())await pool.query(read("src/hoopdb/migrations/"+f));
+ }
  await pool.query("CREATE TABLE IF NOT EXISTS sessions.__96bulls_role_validation(name text PRIMARY KEY,generation text,status text,updated_at timestamptz DEFAULT now())");
- await pool.query("INSERT INTO sessions.__96bulls_role_validation(name,generation,status)VALUES('session_directory_search_worker',$1,'pass')",[GEN]);
+ await pool.query("INSERT INTO sessions.__96bulls_role_validation(name,generation,status)VALUES('session_directory_search_worker',$1,'pass') ON CONFLICT (name) DO UPDATE SET generation=EXCLUDED.generation,status=EXCLUDED.status",[GEN]);
  await pool.query("INSERT INTO sessions.ingest_buffer_admission(org_id,privacy_baseline_sha256,retention_contract_sha256,schema_generation,valid_until,control_epoch)VALUES($1,$2,$2,$3,clock_timestamp()+interval'1 hour',repeat('3',64))",[TENANT.orgId,"a".repeat(64),GEN]);
  await initializeFixtureSeatClock(pool,GEN);
  if(frontier)await pool.query("INSERT INTO sessions.ingest_publication_frontiers VALUES($1,$2,$3,'origin-1',$4,$4,clock_timestamp()+interval'1 hour','synthetic','us-east-1','96bulls',$5)",[TENANT.orgId,TENANT.workspaceId,TENANT.userId,"b".repeat(64),GEN]);
@@ -463,9 +467,10 @@ describe.skipIf(!url)("post-H scoped kernel proposal", () => {
     const d = await fixture(true,undefined,false,store);
     const login = "scope_" + crypto.randomUUID().replaceAll("-", "");
     // The fixture URL is an explicitly disposable cluster. Refuse existing roles.
-    await d.pool.query("CREATE ROLE "+runtime+" NOLOGIN; CREATE ROLE "+recovery+" NOLOGIN; CREATE ROLE "+login+" LOGIN NOINHERIT");
+    if (!orderedTemplate) await d.pool.query("CREATE ROLE "+runtime+" NOLOGIN; CREATE ROLE "+recovery+" NOLOGIN");
+    await d.pool.query("CREATE ROLE "+login+" LOGIN NOINHERIT");
     clean.push(async()=>{
-      for(const role of [login,runtime,recovery]) {
+      for(const role of (orderedTemplate ? [login] : [login,runtime,recovery])) {
         await d.pool.query("DROP OWNED BY "+role); await d.pool.query("DROP ROLE "+role);
       }
     });
@@ -474,6 +479,12 @@ describe.skipIf(!url)("post-H scoped kernel proposal", () => {
     // supplies synthetic admissions and does not stand in for a 062270 issuer.
     await d.pool.query("CREATE TABLE IF NOT EXISTS sessions.__96bulls_migrations(name text PRIMARY KEY, sha256 text NOT NULL)");
     for (const slot of [publicationKernelSlot, publicationRecoverySlot]) {
+      if (orderedTemplate) {
+        const row=await d.pool.query("SELECT sha256 FROM sessions.__96bulls_migrations WHERE name=$1",[slot.name]);
+        expect(row.rows).toEqual([{sha256:slot.sha256}]);
+        expect((await d.pool.query(heldPublicationSentinels[slot.name].sql)).rows[0].applied).toBe(true);
+        continue;
+      }
       const c = await d.pool.connect();
       try {
         const sentinel=heldPublicationSentinels[slot.name].sql;
@@ -617,6 +628,7 @@ describe.skipIf(!url)("post-H scoped kernel proposal", () => {
         previous=p;
       }
       expect((await d.pool.query("SELECT count(*)::int n FROM publication_private.expired_tickets")).rows[0].n).toBe(3);
+      if (orderedTemplate) await d.pool.query(read(searchDown));
       const rollback=await d.pool.connect();
       try {
         await expect(rollback.query(publicationRecoverySlot.down)).rejects.toThrow("retain recovery receipts");
@@ -660,6 +672,7 @@ describe.skipIf(!url)("post-H scoped kernel proposal", () => {
 
   test("empty-state rollback removes new APIs and leaves ordinary ingest grants intact",async()=>{
     const {d}=await setup();
+    if (orderedTemplate) await d.pool.query(read(searchDown));
     const c=await d.pool.connect();
     try {
       await expect(c.query(publicationKernelSlot.down)).rejects.toMatchObject({code:"55000"});
@@ -691,7 +704,7 @@ describe.skipIf(!url)("062270 private read profile",()=>{
     });
     await d.pool.query("GRANT "+reader+" TO "+issuerLogin+","+secondLogin+"; GRANT USAGE ON SCHEMA sessions TO "+reader);
     const proposal="supabase/proposals/continuous-publication/062270-private-read-profile";
-    await d.pool.query(read(proposal+".up.sql"));
+    if (!orderedTemplate) await d.pool.query(read(proposal+".up.sql"));
     await d.pool.query(read(proposal+".down.sql"));
     expect((await d.pool.query("SELECT to_regnamespace('frontier_receipt_private') AS gone")).rows[0].gone).toBeNull();
     await d.pool.query(read(proposal+".up.sql"));
