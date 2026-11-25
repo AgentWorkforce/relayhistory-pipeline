@@ -44,8 +44,10 @@ Observation window: at least 60 min per step, with latency reports at +30 and +6
 Each invocation holds up to HOOPDB_POOL_MAX = 4 connections. The pooler runs in session mode: one server
 connection per client connection. At concurrency 20, the pipeline role was seen holding 44 server connections
 (2026-11-25 06:5xZ), 21 of them idle in transaction. Postgres max_connections is 240; about 76 were in use in total.
-The pooler's own pool size for this role is NOT known. A connect stall that timed out six invocations at
-06:25-06:32Z is consistent with pool exhaustion.
+The pooler's default_pool_size was last recorded as 80 (2026-11-22; current value and any per-user override
+unverified). That means 20 x 4 = 80: the current cap can already fill the whole pool. A connect stall that timed out
+six invocations at 06:25-06:32Z is consistent with that. Before ANY raise, and ideally at 20 as well, cap the
+pipeline's per-invocation pool, add a connect timeout, or both.
 
 Before raising the cap:
 - read the pooler pool size;
