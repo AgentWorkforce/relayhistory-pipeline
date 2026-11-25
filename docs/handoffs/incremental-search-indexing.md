@@ -1,4 +1,4 @@
-# Incremental search indexing: committed wake and revision-aware passes (design M1, rev 6)
+# Incremental search indexing: committed wake and revision-aware passes (design M1, rev 7)
 
 Status: design for review. Code and plans only. No migration, deploy, flag, schedule or config change follows from
 this document without a separate production go per step (§9). Rev 2 closed the nine findings of the M1 review. Rev 3 closes the seven rev-2 findings (B1-B7), marked inline.
@@ -134,8 +134,13 @@ replay tooling works unchanged:
     - If the aggregate is NULL for a managed scope, FAIL CLOSED FOR SEARCH ONLY:
       - the authority transaction still commits the pointer and directory, so the session is readable;
       - a search-side defect never blocks upload or read;
-      - the writer enqueues NO search-index job and records a refusal (`clock_unprovable`): a counter and an alert,
-        exposed as `searchWakeRefusals`;
+      - the writer enqueues NO search-index job, and records the refusal [rev 7] as a `sessions.pipeline_events` row
+        IN THE SAME authority transaction: `stage = 'search-index'`, `status = 'skipped'`,
+        `error = {code: 'clock_unprovable', retryable: false}`, with the scope's org, ws, harness and session columns,
+        `idempotency_key = trace:search-index:skipped:1:<manifest_key>`;
+      - durable and committed with the pointer. It is observable through the existing trace and operator tooling over
+        `pipeline_events` (the stage's skipped/error counts), plus the Lambda log metric. The alert fires on any
+        `clock_unprovable` in 15 min;
       - the `pointer` clock is only for non-managed catch-up, never a fallback here.
       - Test R5g.
     - R5e covers the older head triggering, plus the exclusions.
@@ -268,7 +273,7 @@ UPDATE sessions.pipeline_dead_letters SET state = 'resolved', resolved_at = now(
   epoch completes. The predicate holds, because the completed epoch is at or above the letter's.
 - **Exhausted again:** the quarantine statement (§3.3) refreshes the same letter to `dead`, so it is never left
   `replaying`.
-- The M2 migration adds a nullable `resolution text`. Completion sets `completed` (equal epoch) or `superseded`
+- The M2 migration adds a nullable `resolution text` and the `search_stage_archive` table. Completion sets `completed` (equal epoch) or `superseded`
   (a newer epoch covered it); R8a asserts `superseded` and R8b asserts `completed`.
 
 Tests:
@@ -461,7 +466,8 @@ Two flags:
 - `SEARCH_WAKE_ENQUEUE`: the writers, i.e. the authority-path enqueue and the catch-up;
 - `SEARCH_JOBS_ENABLED`: the consumer, i.e. the follow-on claim and the schedule.
 
-**Drain path** (the default; the consumer is healthy):
+**Drain path** (the default; the consumer is healthy). Its step 5 runs only once the stage is empty under the rule
+below:
 
 1. writers off (`SEARCH_WAKE_ENQUEUE=0`, catch-up off). The consumer stays ON;
 2. drain: wait until `pipeline_jobs` has 0 `search-index` rows (held rows exhaust into dead letters within their
@@ -491,8 +497,9 @@ Two flags:
      table.
    - The parked messages are replayable once the consumer is back.
    - Test R9: park, then the down-migration precondition holds (0 rows).
-4. roll the code back;
-5. down migration.
+4. roll the code back (writer and consumer code), with flags off;
+5. STOP. The down migration is NOT run on this path: it refuses while parked letters exist. The stage's schema
+   stays in place (inert without the code and flags) until the replay, resolve and archive path below empties it.
 
 **Down migration [rev 6]: the additive migration STAYS until the stage is fully empty.** Parked letters are a
 promise of replay, so the two cannot coexist with a down migration.
@@ -500,16 +507,31 @@ promise of replay, so the two cannot coexist with a down migration.
 - After a park, the stage's letters and events still exist. The down migration's precondition is therefore NOT met,
   and it REFUSES. That is the expected state: the CHECK values, the unique index and the cursor table are inert
   without the code and flags, so keeping them costs nothing.
-- **To reach down:** bring the consumer back, replay the parked letters until each is `resolved`, then archive the
-  stage's resolved letters and its `pipeline_events` rows. The archive is an operator export: a file with counts and
-  sha256, recorded in the run log. Then delete them. Only then does the precondition hold: 0 rows for the stage in
-  `pipeline_jobs`, `pipeline_events` AND `pipeline_dead_letters`.
+- **To reach down:** bring the consumer back, replay the parked letters until each is `resolved`, then run
+  `archiveSearchStage` [rev 7]. The archive is durable and failure-safe. In ONE transaction, under
+  `LOCK TABLE pipeline_dead_letters, pipeline_events IN SHARE ROW EXCLUSIVE MODE`:
+  1. REFUSE (raise and roll back; nothing archived or deleted) if any `search-index` letter is not `resolved`, or if
+     any `search-index` job row exists;
+  2. `INSERT INTO sessions.search_stage_archive (batch_id, kind, source_id, row, archived_at)`: every `search-index`
+     letter and event row as jsonb, with `batch_id` a fresh uuid;
+  3. compute `sha256` over the batch's rows, ordered by (kind, source_id), and insert one manifest row
+     (`kind = 'manifest'`) with the counts and the sha256;
+  4. DELETE the archived letters and events.
+  
+  A failure at any step rolls back everything. `search_stage_archive` is created by the up migration and is NOT
+  dropped by the down migration: it is an audit artifact, removed only by a separate, explicitly approved cleanup.
+  Only after a successful archive does the precondition hold: 0 rows for the stage in `pipeline_jobs`,
+  `pipeline_events` AND `pipeline_dead_letters`.
+- **Events written by the stage:** settlement writes `pipeline_events` rows like every stage
+  (`ok` / `retrying` / `dead_lettered` / `replayed` / `skipped`), so a used stage always has events. That is why
+  the down precondition needs the archive.
 - The down migration takes `LOCK TABLE … SHARE ROW EXCLUSIVE` on all three, checks all three counts are 0,
   refuses otherwise, then drops the index and the cursor table and restores the three CHECKs.
 - **Tests:**
-  - R9a: after a park, down REFUSES (letters exist);
-  - R9b: after replay plus resolve plus the archive delete across jobs, events and letters, down's precondition
-    holds.
+  - R9a: after a park, down REFUSES (letters exist; events > 0 from the park's `dead_lettered` rows);
+  - R9b: replay, resolve, archive: jobs, events and letters all 0; the archive holds every row plus a manifest whose
+    sha256 matches; the precondition holds; another stage is untouched;
+  - R9c: archive with one letter still `dead` REFUSES, and nothing is archived or deleted (failure-safe).
 
 ## 9. Production steps (each needs its own go, one at a time)
 
@@ -548,7 +570,7 @@ Stop lines for 4 and 5 are the A+C set, plus: `search-index` oldest open job ove
 | R6g | the generic runWorker / postgresStageConsumer is not registered for `search-index` | absent |
 | R8a-d | stage-aware replay: superseded resolves on the newer completion; merged on done; the replay/new-wake race; re-death refreshes | absent |
 | R5e | two current live heads: the clock is the later published_at | absent |
-| R9a/b | after a park, down refuses (letters exist); after replay, resolve and archive across jobs, events and letters, the precondition holds | absent |
+| R9a-c | park, then down refuses (letters and events present); replay, resolve, archive (durable, sha256 manifest), then the precondition holds; an archive with an unresolved letter refuses and changes nothing | absent |
 | R5f | an OLDER live head triggers the authority enqueue while a newer sibling supplies max(published_at): the job clock is the newer one, and the trigger is still validated by its own authority | absent |
 | R5g | a managed scope with a NULL or unprovable publication clock: no job, an error metric, never a pointer fallback | absent |
 | R5c/d | catch-up clock: publish for managed, pointer for non-managed; no null clock | absent |
