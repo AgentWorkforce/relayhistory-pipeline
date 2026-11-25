@@ -13,6 +13,12 @@ export interface OwnedFunction {
   readonly secdef: boolean;
   /** Roles granted EXECUTE by this lane's grant sources, in emitted order (compared as a set). */
   readonly grants: readonly string[];
+  /**
+   * The service_role EXECUTE is the operator's only. By default a service_role grant also makes the function a
+   * runtime application function (RUNTIME_APPLICATION_FUNCTIONS, the boundary's v_runtime_fns), so the migrator
+   * mirrors it onto the runtime role; true keeps it off both lists (no runtime-role EXECUTE).
+   */
+  readonly operatorOnly?: boolean;
 }
 
 /** A function another migration owns that this lane CREATE OR REPLACEs (its ACL is kept). */

@@ -8,8 +8,8 @@
  *   managed_search_wake_v1              SECURITY DEFINER; the writer's entry: proves the publish clock, then enqueues or
  *                                       records the clock_unprovable refusal (§2 [rev 7]). No grant here (as above)
  *   search_stage_archive_seal_v1        the archive's append-only seal trigger function; no grant
- *   archive_search_stage_v1             SECURITY DEFINER; the only archive write path (§8); EXECUTE to service_role,
- *                                       so it is also a runtime application function
+ *   archive_search_stage_v1             SECURITY DEFINER; the only archive write path (§8); EXECUTE to service_role
+ *                                       (the operator) ONLY: never a runtime application function
  * The rollback (supabase/rollbacks/20261105062300_search_index_stage.down.sql) is hand-written: it carries §8's
  * refusal rules (no search-index job, event or letter) and keeps the archive.
  */
@@ -36,7 +36,8 @@ export const searchIndexStage: LaneManifest = {
     "sessions.enqueue_managed_search_wake_v1(jsonb,uuid)": { secdef: true, grants: [] },
     "sessions.managed_search_wake_v1(jsonb,uuid)": { secdef: true, grants: [] },
     "sessions.search_stage_archive_seal_v1()": { secdef: false, grants: [] },
-    "sessions.archive_search_stage_v1()": { secdef: true, grants: ["service_role"] },
+    // Operator-only (review finding 5): service_role EXECUTE, never mirrored onto the runtime role.
+    "sessions.archive_search_stage_v1()": { secdef: true, grants: ["service_role"], operatorOnly: true },
   },
   replaces: {},
 };

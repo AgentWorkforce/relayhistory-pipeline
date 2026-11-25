@@ -404,7 +404,6 @@ DECLARE
   v_runtime_fns text[] := ARRAY[
     'sessions.ack_session_brief_documents(uuid,jsonb)',
     'sessions.applied_repo_evidence(jsonb,jsonb)',
-    'sessions.archive_search_stage_v1()',
     'sessions.backfill_session_brief_documents(integer)',
     'sessions.canonical_remote(text)',
     'sessions.capture_session_replay_pages(text,text,text,text)',

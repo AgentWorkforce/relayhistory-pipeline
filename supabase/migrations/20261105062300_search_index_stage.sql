@@ -341,7 +341,7 @@ BEGIN
  RETURN jsonb_build_object('batchId', batch, 'letters', n_letters, 'events', n_events, 'sha256', digest);
 END $archive$;
 REVOKE ALL ON FUNCTION sessions.archive_search_stage_v1() FROM PUBLIC;
--- The operator's service role; the migrator also grants the runtime role (RUNTIME_APPLICATION_FUNCTIONS, from the lane).
+-- Operator-only: EXECUTE to service_role (the operator) and to no runtime role (not in RUNTIME_APPLICATION_FUNCTIONS).
 GRANT EXECUTE ON FUNCTION sessions.archive_search_stage_v1() TO service_role;
 
 REVOKE ALL ON sessions.search_stage_archive FROM PUBLIC, anon, authenticated, service_role;

@@ -139,7 +139,8 @@ export async function generate(read: Reader, lanes: readonly LaneManifest[], ver
   for (const [sig, entries] of appended)
     acl.functions[sig] = [...acl.functions[sig]!, ...[...entries].sort(byCodeUnit).filter((e) => !acl.functions[sig]!.includes(e))];
   acl.functions = Object.fromEntries(Object.entries(acl.functions).sort(([a], [b]) => byCodeUnit(a, b)));
-  const runtimeNew = lanes.flatMap((l) => Object.entries(l.functions).filter(([, f]) => f.grants.includes("service_role")).map(([s]) => s));
+  // service_role grants are mirrored onto the runtime role, except an operator-only function (OwnedFunction.operatorOnly).
+  const runtimeNew = lanes.flatMap((l) => Object.entries(l.functions).filter(([, f]) => f.grants.includes("service_role") && f.operatorOnly !== true).map(([s]) => s));
 
   let wrapper = (await read(WRAPPER_PATH)) ?? fail(`${WRAPPER_PATH} missing`);
   wrapper = wrapper.replace(/v_manifest jsonb := \$manifest\$[\s\S]*?\$manifest\$::jsonb;/,

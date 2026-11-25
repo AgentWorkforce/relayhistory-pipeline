@@ -386,7 +386,6 @@ export function runtimeApplicationAclCatalog(): {
 export const RUNTIME_APPLICATION_FUNCTIONS = [
   "sessions.ack_session_brief_documents(uuid,jsonb)",
   "sessions.applied_repo_evidence(jsonb,jsonb)",
-  "sessions.archive_search_stage_v1()",
   "sessions.backfill_session_brief_documents(integer)",
   "sessions.canonical_remote(text)",
   "sessions.capture_session_replay_pages(text,text,text,text)",
@@ -1680,7 +1679,7 @@ export const SESSIONS_FUNCTION_EVENT_TRIGGER_TAGS: readonly string[] =
  * `__RUNTIME_ROLE__`: exactly the reviewed body in the bootstrap file.
  */
 export const SESSIONS_FUNCTION_EVENT_TRIGGER_PROSRC_SHA256 =
-  "9e1f0195039bed819f2906c62f8dd53e401d61d197e41a5b1679e9e4fcb4d02c";
+  "cf2e40ff987964811ce4e71b0962430c746f83b5075e24b818c1eba9ef847e77";
 export const SESSIONS_FUNCTION_EVENT_TRIGGER_PROCONFIG: readonly string[] =
   Object.freeze(["search_path=pg_catalog, pg_temp"]);
 const RUNTIME_LITERAL = /v_runtime text := '([a-z_][a-z0-9_]{0,62})';/g;
