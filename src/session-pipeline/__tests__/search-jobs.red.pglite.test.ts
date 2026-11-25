@@ -789,7 +789,7 @@ describe("R3: committed-state guard and erase only on authority (design §4.2, �
     expect((await r.db.pg.query("SELECT 1 FROM sessions.session_index WHERE session_id = $1 OR canonical_session_id = $1", [never.sessionId])).rows).toHaveLength(0);
     const before = JSON.stringify(scopeRows(r, [never.sessionId]));
     expect(seeded.length).toBe(3);
-    const result = await indexSearchScope(never, r.search());
+    const result = await indexSearchScope(never, { ...r.search(), committedGuard: true }); // the search-jobs contract: the managed pass opts in (§4.2)
     expect(JSON.stringify(scopeRows(r, [never.sessionId]))).toBe(before);
     expect(result.reasons).not.toContain("erased");
   }, 120_000);

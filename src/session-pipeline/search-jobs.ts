@@ -475,7 +475,9 @@ export async function runSearchJob(message: StageMessage, deps: { search: Search
     return "work";
   });
   if (decision !== "work") return decision;
-  const result = await indexSearchScope(scope, deps.search);
+  // §4.2 again, under the final write locks: the managed pass opts in to the committed-state guard (the shared
+  // S3-event path never does), so a scope that lost its rows between the decision and the work erases nothing.
+  const result = await indexSearchScope(scope, { ...deps.search, committedGuard: true });
   const out = (outcome: SearchJobOutcome): SearchJobResult => ({ outcome, reasons: result.reasons, search: result });
   if (result.busy || result.deferred) return out("busy");
   if (result.reasons.includes(NOT_COMMITTED)) return out("not_committed");

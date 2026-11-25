@@ -131,6 +131,13 @@ export interface SearchIndexDeps {
    * pass rewrites its rows once.
    */
   originLabels?: boolean;
+  /**
+   * The managed search-jobs pass only (search-jobs.ts runSearchJob sets it; design §4.2): before erasing a scope
+   * with no live keys, require committed state (a session_index row of the scope, live or tombstoned, or an erasure
+   * fence), checked under the final locks; otherwise acknowledge NOT_COMMITTED and write nothing. Absent or false
+   * (the S3-event path): the pre-M2 behaviour, byte-identical (erase on empty keys, no extra SQL).
+   */
+  committedGuard?: boolean;
   /** Test seam (replaces the writer `desktopCatalog` selects); production writes the catalog in the same Supabase transaction. */
   writeCatalog?: typeof writeDirectoryCatalog;
   writeEvents?: typeof writeDirectoryEvents;
@@ -689,10 +696,12 @@ async function indexSearchScopeBase(scope: SessionScope, deps: SearchIndexDeps, 
       await io.record(scope,0,0,false,at,pointerSnapshot.canonicalId);
       return {manifests:0,rows:0,inserted:0,deleted:0,complete:false,reasons:["canonical_scope_still_live"]};
     }
-    // Committed-state guard (docs/handoffs/incremental-search-indexing.md §4.2): absence is not authority. A scope
-    // with no session_index row at all (live or tombstoned) and no erasure fence was never committed; a stray event,
-    // a catch-up or a redelivery for it erases nothing.
-    if (keys.length === 0 && !(await scopeEverCommitted(tx, scope, pointerSnapshot.canonicalId)))
+    // Committed-state guard (docs/handoffs/incremental-search-indexing.md §4.2), the managed search-jobs path only
+    // (deps.committedGuard, set by search-jobs.ts runSearchJob): absence is not authority. A scope with no
+    // session_index row at all (live or tombstoned) and no erasure fence was never committed; a catch-up or a
+    // redelivered wake for it erases nothing. Rechecked here, under the final scope and canonical locks, right
+    // before the erase. Absent (every S3-event caller): no extra SQL, the pre-M2 erase-on-empty path exactly.
+    if (deps.committedGuard === true && keys.length === 0 && !(await scopeEverCommitted(tx, scope, pointerSnapshot.canonicalId)))
       return { manifests: 0, rows: 0, inserted: 0, deleted: 0, complete: true, reasons: [NOT_COMMITTED] };
     if (keys.length === 0) {
       // Erased: no live manifest is left, so every row of the scope goes, in or
