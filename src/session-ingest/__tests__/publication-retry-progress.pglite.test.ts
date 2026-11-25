@@ -83,3 +83,50 @@ test("quiet and hot origins have independent progress only when the caller sched
     expect((await hotStore.load(hot.scope)).version).toBe(12);
   } finally { await db.close(); }
 },60000);
+
+test("three-origin synthetic rotation isolates persistent failures while arrivals continue every global tick", async () => {
+  const db = new PGlite();
+  try {
+    await db.exec(schema);
+    const hotRows = [1, 2], quietRows: number[] = [];
+    const hot = origin("a".repeat(64), hotRows);
+    const failing = origin("b".repeat(64), [1, 2]);
+    const quiet = origin("c".repeat(64), quietRows);
+    hot.poison.add(1);
+    failing.poison.add(1);
+
+    const sources = [hot, failing, quiet];
+    const stores = sources.map(source => postgresPublicationRetryStore(db, source.scope));
+    const turns = sources.map(() => [] as number[]);
+    let quietPublishedAt: number | undefined;
+    let hotPublishedAtMidpoint = 0;
+    for (let tick = 0; tick < 90; tick++) {
+      hotRows.push(3 + tick);
+      if (tick === 3) quietRows.push(1); // Same token as both failing receipts, different scope.
+      // The test supplies a rotation. runPublicationRetryTurn schedules work only within the selected scope.
+      const i = tick % sources.length;
+      const source = sources[i]!;
+      turns[i]!.push(tick);
+      const outcome = await runPublicationRetryTurn(source.scope, source, stores[i]!, 1, tick * 60_001);
+      expect(outcome).toBe("committed");
+      if (quiet.committed.has(1)) quietPublishedAt ??= tick;
+      if (tick === 44) hotPublishedAtMidpoint = hot.committed.size;
+    }
+
+    for (const originTurns of turns) {
+      expect(originTurns).toHaveLength(30);
+      expect(originTurns.slice(1).every((t, i) => t - originTurns[i]! === 3)).toBe(true);
+    }
+    // Quiet's turn at 5 is a retry turn. Its next tail scan at 8 sees the new receipt.
+    expect(quietPublishedAt).toBe(8);
+    expect(quiet.committed.size).toBe(1);
+    expect(hot.committed.size).toBeGreaterThan(hotPublishedAtMidpoint);
+    expect(hot.committed.size).toBeLessThan(hotRows.length - 1);
+    expect([...failing.committed]).toEqual([2]);
+    for (const [i, source] of [hot, failing].entries()) {
+      expect(source.visits.filter(id => id === 1)).toHaveLength(6);
+      expect(await stores[i]!.lookup(source.scope,pos(1).stageToken)).toMatchObject({state:"exhausted",attempts:6});
+    }
+    expect(await stores[2]!.lookup(quiet.scope,pos(1).stageToken)).toBeNull();
+  } finally { await db.close(); }
+},60000);
