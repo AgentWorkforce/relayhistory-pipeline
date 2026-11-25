@@ -3,6 +3,7 @@ import { readFileSync, realpathSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import pg from "pg";
 import assert from "node:assert/strict";
+import {sequencePreflight,sessionsFunctionAcl,sessionsFunctionAclManifest} from "../../../src/hoopdb/migrate-guards.ts";
 import { MIGRATION_SENTINELS } from "../../../src/hoopdb/migration-sentinels.ts";
 import { plan, runMigrations } from "../../../src/hoopdb/migrate.ts";
 import { publicationKernelSlot, publicationRecoverySlot, heldPublicationSentinels } from "./held-profile.ts";
@@ -52,6 +53,19 @@ try {
   assert.deepEqual(rows.rows.map(row=>row.name),ordered);
   assert.equal((await c.query("SELECT to_regprocedure('sessions.ingest_scoped_publication_receipt_capture_v1(jsonb)') IS NULL missing")).rows[0].missing,true);
   for(const s of Object.values(heldPublicationSentinels)) assert.equal((await c.query(s.sql)).rows[0].applied,true);
+  const schema=steps.filter(s=>s.name.startsWith("upstream:")||s.name.startsWith("96bulls:"));
+  const physical=await c.query<{name:string,sha256:string}>("SELECT name,sha256 FROM sessions.__96bulls_migrations");
+  const priorLedger=new Map(physical.rows.filter(r=>!ordered.slice(0,3).includes(r.name)).map(r=>[r.name,r.sha256]));
+  await assert.rejects(sequencePreflight(c,schema,priorLedger),{code:"ledger_gap"});
+  const actual=await sessionsFunctionAcl(c), baseline=await sessionsFunctionAclManifest();
+  const proposed=Object.keys(actual).filter(fn=>fn.startsWith("sessions.ingest_publication_scoped_")).sort();
+  const expectedOps=["abandon","candidates","claim","heartbeat","prepare","publish","recover","register_objects"];
+  assert.deepEqual(proposed,expectedOps.map(op=>"sessions.ingest_publication_scoped_"+op+"_v1(jsonb)").sort());
+  for (const fn of proposed) {
+    assert.equal(baseline[fn],undefined);
+    const role=fn.includes("_recover_v1") ? "bulls96_publication_recovery" : "bulls96_publication_scoped";
+    assert.deepEqual(actual[fn],["<owner>:EXECUTE",role+":EXECUTE"]);
+  }
   await c.query("CREATE DATABASE publication_release_fixture TEMPLATE postgres");
   await assert.rejects(c.query(publicationRecoverySlot.down),{code:"55000"}); await c.query("ROLLBACK");
   const searchDown=readFileSync(join(root,"supabase/rollbacks",searchFile.replace(".sql",".down.sql")),"utf8");
@@ -61,5 +75,5 @@ try {
   await c.query(readFileSync(join(source,"062270-private-read-profile.down.sql"),"utf8"));
   assert.equal((await c.query("SELECT to_regclass('sessions.search_stage_archive') IS NOT NULL retained")).rows[0].retained,true);
   for(const s of Object.values(heldPublicationSentinels)) assert.equal((await c.query(s.sql)).rows[0].applied,false);
-  console.log(JSON.stringify({server:(await c.query("SHOW server_version")).rows[0].server_version,encoding:"UTF8",discovered:ordered,rerunApplied:rerun.applied,rollback:"300/290/280/270",searchArchiveRetained:true,captureRpc:"absent"}));
+  console.log(JSON.stringify({server:(await c.query("SHOW server_version")).rows[0].server_version,encoding:"UTF8",discovered:ordered,rerunApplied:rerun.applied,prior300Refusal:"ledger_gap",pendingAclEntries:proposed.length,rollback:"300/290/280/270",searchArchiveRetained:true,captureRpc:"absent"}));
 } finally {await c.end();}
