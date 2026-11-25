@@ -315,15 +315,24 @@ meaning a pass that carries the invocation's `streamSlot`. The self-host consume
     each row is exactly this pass's marker: same time, `needs_full = 1`, same token, same revision.
   - **Serialized.** A later pass needs those locks to write its marker, so the fence read and the completing
     write cannot interleave with it.
+  - **Validation.** Every key's latest row is read and validated before any decision (`validStateRow`). The
+    row must have exactly four columns (`revision`, `needs_full`, `scanned_rows`, `synced_ms`), each in its
+    domain:
+    - `needs_full` is 0 or 1;
+    - `synced_ms`, `scanned_rows` and `revision` are non-null, non-negative integers.
   - **Outcomes other than a clear:**
 
     | Case | Effect |
     | --- | --- |
-    | A lock held by another pass, or a newer valid marker | That pass owns the outcome. Logged as `completion_superseded`. |
-    | An empty, malformed, foreign or unreadable reply | Logged as `completion_marker_missing`, `_malformed`, `_foreign` or `completion_fence_unreadable`. The pass fails retryably with `search_completion_unrecorded`, so SQS redelivers the message and M2 retries the job. |
+    | Every key shows the same valid successor row, later than this pass's marker | That successor owns the outcome. Logged as `completion_superseded`; the message is acknowledged. |
+    | Either lock held by another session | Logged as `completion_lock_contended`. The holder may roll back without writing, so contention proves nothing. |
+    | A missing, malformed or foreign row on any key, or successors that differ between keys | Logged as `completion_marker_missing`, `_malformed`, `_foreign` or `completion_successor_divergent`. |
+    | An unreadable fence | Logged as `completion_fence_unreadable`. |
     | A rollback, or a COMMIT error with an unknown outcome | Nothing is written. |
 
-    In every case the scope stays owed, and the next pass is full.
+    Every case except a proven successor and a rollback fails the pass retryably with
+    `search_completion_unrecorded`, so SQS redelivers the message and M2 retries the job. In every case the
+    scope stays owed, and the next pass is full.
   - **Erase.** An erase pass is marked and fenced the same way.
 - **Strict keyset pages.** Every keyset page of the ClickHouse scan must meet three conditions before
   anything is projected or written:
