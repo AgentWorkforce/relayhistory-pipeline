@@ -1,5 +1,5 @@
 /**
- * A real managed publication for the search-index wake red tests (design §2, R1c, R5a), offline and
+ * A real managed publication for the search-index wake red tests (design §2, R1c, R5a, R5c), offline and
  * synthetic. The setup is the one of src/session-ingest/__tests__/publication-portable.pglite.test.ts
  * (real migrations and verifiers on PGlite, a buffered stage from the real ingest path, the portable
  * publisher against a MinIO-shaped fake), then the real queue consumers drive the committed head through
