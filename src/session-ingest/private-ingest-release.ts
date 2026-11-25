@@ -163,8 +163,19 @@ const COMMON_PROFILE = {
  * G+H -> H transition; step (3) sets it to null after the live Worker reads back exactly H.
  * Done: the H-only deploy 43951438815 (2026-11-16 20:37Z) read back exactly H, so lifecycle step (3)
  * returns the contract to dormant (null).
+ *
+ * Planned release through upstream step 062220, step (1) of the required order: Worker G+H before the
+ * window opens (runbooks/guarded-session-schema-release.md "Buffered ingest: required order").
+ * G = 3eef01d7... is the live policy/expected generation; H = 778af686... is the release
+ * targetGeneration (`bun src/hoopdb/migrate.ts --generation` at b3594f11, last step 20261105062220).
+ * The tracked profile carries overlapGeneration H and expectedGeneration stays G; deploy G+H, then
+ * open the window, apply, rebind G -> H. The pair returns to null after the H-only deploy reads back
+ * exactly H.
  */
-export const PRIVATE_INGEST_OVERLAP: PrivateIngestOverlap | null = null;
+export const PRIVATE_INGEST_OVERLAP: PrivateIngestOverlap | null = {
+  from: "3eef01d763c3a724d5a8f46f552fe50773e65d5a7a15cce7500f6ddd9d37904c",
+  to: "778af6866b9b28b64ff5af46bc59b1d6c7de4b43e24302bf64321b222cdf23df",
+};
 
 export const PRIVATE_INGEST_GENERATION_CONTRACT: PrivateIngestGenerationContract = {
   generation: COMMON_PROFILE.expectedGeneration,

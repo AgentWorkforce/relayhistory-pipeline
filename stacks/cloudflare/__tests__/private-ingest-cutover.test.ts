@@ -207,7 +207,8 @@ test("buffer lock controls: absent renders nothing, on renders, anything else re
   // as protected-environment variables (like PRIVATE_INGEST_CLAIM_TIMEOUT_BUSY), never as a dispatch input.
   const tracked = JSON.parse(readFileSync("config/cloudflare/private-ingest-production.json", "utf8"));
   const production = { ...tracked, sessionIngest: { ...tracked.sessionIngest, kmsKeyArn, ...privateIngestCutoverFromEnv({}) } };
-  expect(privateIngestReleasePhase(production)).toBe("baseline-drain");
+  // The tracked profile is at step (1) of the planned 062220 release (G+H overlap at the baseline-drain phase).
+  expect(privateIngestReleasePhase(production)).toBe("baseline-drain-overlap");
   for (const name of Object.values(keys)) expect(Object.hasOwn(sessionIngestVars(production.sessionIngest), name)).toBe(false);
   const workflow = readFileSync(".github/workflows/deploy-private-ingest-worker.yml", "utf8");
   for (const name of Object.values(envName)) {
@@ -262,7 +263,8 @@ test("inflight lease control: absent renders nothing, observe / on render, anyth
   }
   const tracked = JSON.parse(readFileSync("config/cloudflare/private-ingest-production.json", "utf8"));
   const production = { ...tracked, sessionIngest: { ...tracked.sessionIngest, kmsKeyArn, ...privateIngestCutoverFromEnv({}) } };
-  expect(privateIngestReleasePhase(production)).toBe("baseline-drain");
+  // The tracked profile is at step (1) of the planned 062220 release (G+H overlap at the baseline-drain phase).
+  expect(privateIngestReleasePhase(production)).toBe("baseline-drain-overlap");
   expect(Object.hasOwn(sessionIngestVars(production.sessionIngest), name)).toBe(false);
   const workflow = readFileSync(".github/workflows/deploy-private-ingest-worker.yml", "utf8");
   expect(workflow).toContain(`${envName}: \${{ vars.${envName} }}`);
