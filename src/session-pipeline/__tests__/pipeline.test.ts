@@ -928,21 +928,22 @@ describe("streamed reconcile on the Lambda: one streamed scope per invocation, w
     expect(l.requeued).toEqual([l.keys.sess_2]);
   }, 60_000);
 
-  test("the Lambda context's remaining time less the margin is the deadline; the slot is taken even when the deadline stops the stream", async () => {
+  test("the Lambda context's remaining time less the margin is the deadline; under STREAM_MIN_START_MS before it no stream starts", async () => {
     const l = await lambda();
-    // 30 s left, 60 s margin: the deadline has passed before the first chunk.
+    // 30 s left, 60 s margin: the deadline has passed, far under the 120 s start minimum (the backport lineage's
+    // 6264d119): neither scope starts streaming; both are deferred and requeued before any read or write.
     expect((await l.invoke(["sess_1", "sess_2"], l.context(30_000))).batchItemFailures).toEqual([]);
     expect(l.reads()).toBe(1);
     expect(l.indexed()).toEqual([]);
-    expect(l.ch.state.map((s) => [s.session_id, s.needs_full])).toEqual([["sess_1", 1]]);
-    expect(l.requeued).toEqual([l.keys.sess_2]);
+    expect(l.ch.state).toEqual([]);
+    expect(l.requeued).toEqual([l.keys.sess_1, l.keys.sess_2]);
   }, 60_000);
 
-  test("no Lambda context: no deadline and no per-invocation slot, so both scopes stream as before", async () => {
+  test("no Lambda context: no deadline, but still one streamed scope per invocation (the backport's bound)", async () => {
     const l = await lambda();
     expect((await l.invoke(["sess_1", "sess_2"])).batchItemFailures).toEqual([]);
-    expect(l.indexed()).toEqual(["sess_1", "sess_2"]);
-    expect(l.requeued).toEqual([]);
+    expect(l.indexed()).toEqual(["sess_1"]);
+    expect(l.requeued).toEqual([l.keys.sess_2]);
   }, 60_000);
 });
 

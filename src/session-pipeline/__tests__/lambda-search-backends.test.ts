@@ -111,9 +111,13 @@ describe("SEARCH_INDEX_STREAMING_CH on the hosted Lambda (default off)", () => {
     expect(per.search!.streamDeadline).toEqual({ at: 1_000_000 + 900_000 - 45_000 });
     expect(per.search!.stream).toBe(armed.deps.search!.stream);
     expect("streamDeadline" in armed.deps.search!).toBe(false);
-    // No usable context (a direct invoke or a test harness): no deadline.
-    expect(invocationDeps(armed)).toBe(armed.deps);
-    expect(invocationDeps(armed, {} as never)).toBe(armed.deps);
-    expect(invocationDeps(armed, { getRemainingTimeInMillis: () => Number.NaN })).toBe(armed.deps);
+    // No usable context (a direct invoke or a test harness): no deadline, but still one streamed scope per
+    // invocation (the backport lineage's bound; 9d1adf84 set no slot here).
+    for (const ctx of [undefined, {} as never, { getRemainingTimeInMillis: () => Number.NaN }]) {
+      const bare = invocationDeps(armed, ctx);
+      expect("streamDeadline" in bare.search!).toBe(false);
+      expect(bare.search!.streamSlot).toEqual({ used: false });
+      expect(bare.search!.stream).toBe(armed.deps.search!.stream);
+    }
   });
 });
