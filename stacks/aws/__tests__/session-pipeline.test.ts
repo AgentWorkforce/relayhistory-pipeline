@@ -232,9 +232,16 @@ describe("session pipeline: inputs", () => {
     expect(() => validate(withPipeline({ searchIndex: true, replayPages: false, maxConcurrency: 4, reconcileMinutes: 30 }))).not.toThrow(/sessionPipeline/);
     expect(() => validate(withPipeline({ queue: "x" }))).toThrow(/sessionPipeline.queue is not a known setting/);
     expect(() => validate(withPipeline({ maxConcurrency: 50 }))).toThrow(/maxConcurrency/);
-    for (const ok of [2, 10, 20]) expect(() => validate(withPipeline({ maxConcurrency: ok }))).not.toThrow(/sessionPipeline/);
-    for (const bad of [1, 21, 4.5, "4", 0, -4, Number.NaN])
-      expect(() => validate(withPipeline({ maxConcurrency: bad }))).toThrow("transcriptStore.sessionPipeline.maxConcurrency must be an integer from 2 to 20");
+    for (const ok of [2, 10, 20, 30]) expect(() => validate(withPipeline({ maxConcurrency: ok }))).not.toThrow(/sessionPipeline/);
+    for (const bad of [1, 31, 4.5, "4", 0, -4, Number.NaN])
+      expect(() => validate(withPipeline({ maxConcurrency: bad }))).toThrow("transcriptStore.sessionPipeline.maxConcurrency must be an integer from 2 to 30");
+    // Queue delivery delay and ESM batching window: unset keeps 30 s / 20 s; integers in range only.
+    for (const ok of [0, 2, 5, 30, 900]) expect(() => validate(withPipeline({ deliveryDelaySeconds: ok }))).not.toThrow(/sessionPipeline/);
+    for (const bad of [-1, 901, 2.5, "5", Number.NaN])
+      expect(() => validate(withPipeline({ deliveryDelaySeconds: bad }))).toThrow("transcriptStore.sessionPipeline.deliveryDelaySeconds must be an integer from 0 to 900");
+    for (const ok of [0, 2, 20, 300]) expect(() => validate(withPipeline({ batchingWindowSeconds: ok }))).not.toThrow(/sessionPipeline/);
+    for (const bad of [-1, 301, 1.5, "2", Number.NaN])
+      expect(() => validate(withPipeline({ batchingWindowSeconds: bad }))).toThrow("transcriptStore.sessionPipeline.batchingWindowSeconds must be an integer from 0 to 300");
     expect(() => validate(withPipeline({ reconcileMinutes: 1 }))).toThrow(/reconcileMinutes/);
     expect(() => validate(withPipeline([]))).toThrow(/plain object/);
   });

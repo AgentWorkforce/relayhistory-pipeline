@@ -158,13 +158,21 @@ export interface SessionPipelineInputs {
    */
   pointerSkipOriginBucket?: boolean;
   /**
-   * Lambda concurrency cap from the queue (2-20). Default 4. The upper bound exists because each
+   * Lambda concurrency cap from the queue (2-30). Default 4. The upper bound exists because each
    * concurrent invocation can hold up to HOOPDB_POOL_MAX (4, set below) database connections, so
-   * 20 means up to 80 connections from this function alone. It is also capped in practice by the
+   * 30 means up to 120 connections from this function alone: check the pooler's pool size first. It is also capped in practice by the
    * account's Lambda concurrent-executions quota: this function has no reserved concurrency and
    * also serves every schedule, so a value at or above the quota lets the queue starve them.
    */
   maxConcurrency?: number;
+  /**
+   * SQS delivery delay of the session-events queue, seconds (0-900). Default DELIVERY_DELAY_SECONDS (30): a burst of
+   * manifest writes coalesces before the first delivery. Lower brings indexing forward at the cost of more
+   * invocations, more unchanged re-sends and more scope_busy collisions.
+   */
+  deliveryDelaySeconds?: number;
+  /** The event source mapping's maximum batching window, seconds (0-300). Default 20. */
+  batchingWindowSeconds?: number;
   /** Reconcile cadence in minutes (15-120). Default 30; lookback is twice this. */
   reconcileMinutes?: number;
   /** Session briefs (src/session-brief). Absent or `enabled: false`: off. */
@@ -330,7 +338,7 @@ export function assertSessionPipelineInputs(p: unknown, refuse: (why: string) =>
     refuse("transcriptStore.sessionPipeline must be a plain object");
   const v = p as Record<string, unknown>;
   for (const k of Object.keys(v))
-    if (k !== "searchIndex" && k !== "replayPages" && k!=="analysisCache" && k !== "legacyReadSource" && k !== "desktopCatalog" && k !== "maxConcurrency" && k !== "reconcileMinutes" && k !== "briefs" && k !== "semanticCopy" && k !== "analysisJobs" && k !== "bufferedSearchFeed" && k !== "bufferedErasureDelete" && k !== "neonExit" && k !== "relayfacts" && k !== "schedules" && k !== "streamReconcile" && k !== "summaryRegen" && k !== "skipCurrent" && k !== "searchPreRead" && k !== "pointerPreRead" && k !== "pointerSkipOriginBucket") refuse(`transcriptStore.sessionPipeline.${k} is not a known setting`);
+    if (k !== "searchIndex" && k !== "replayPages" && k!=="analysisCache" && k !== "legacyReadSource" && k !== "desktopCatalog" && k !== "maxConcurrency" && k !== "deliveryDelaySeconds" && k !== "batchingWindowSeconds" && k !== "reconcileMinutes" && k !== "briefs" && k !== "semanticCopy" && k !== "analysisJobs" && k !== "bufferedSearchFeed" && k !== "bufferedErasureDelete" && k !== "neonExit" && k !== "relayfacts" && k !== "schedules" && k !== "streamReconcile" && k !== "summaryRegen" && k !== "skipCurrent" && k !== "searchPreRead" && k !== "pointerPreRead" && k !== "pointerSkipOriginBucket") refuse(`transcriptStore.sessionPipeline.${k} is not a known setting`);
   if (v.searchIndex !== undefined && typeof v.searchIndex !== "boolean") refuse("transcriptStore.sessionPipeline.searchIndex must be a boolean");
   if (v.replayPages !== undefined && typeof v.replayPages !== "boolean") refuse("transcriptStore.sessionPipeline.replayPages must be a boolean");
   if(v.analysisCache!==undefined&&typeof v.analysisCache!=="boolean")refuse("transcriptStore.sessionPipeline.analysisCache must be a boolean");
@@ -356,8 +364,12 @@ export function assertSessionPipelineInputs(p: unknown, refuse: (why: string) =>
   if (v.pointerSkipOriginBucket !== undefined && typeof v.pointerSkipOriginBucket !== "boolean") refuse("transcriptStore.sessionPipeline.pointerSkipOriginBucket must be a boolean");
   // SEARCH_INDEX_ENABLED=1 must never activate the desktop catalog writer; its own flag waits on 031000.
   if (v.desktopCatalog === true) refuse("transcriptStore.sessionPipeline.desktopCatalog requires the forget/reproject fix (migration 20261105031000) and its review; not wired yet");
-  if (v.maxConcurrency !== undefined && !(Number.isInteger(v.maxConcurrency) && (v.maxConcurrency as number) >= 2 && (v.maxConcurrency as number) <= 20))
-    refuse("transcriptStore.sessionPipeline.maxConcurrency must be an integer from 2 to 20");
+  if (v.maxConcurrency !== undefined && !(Number.isInteger(v.maxConcurrency) && (v.maxConcurrency as number) >= 2 && (v.maxConcurrency as number) <= 30))
+    refuse("transcriptStore.sessionPipeline.maxConcurrency must be an integer from 2 to 30");
+  if (v.deliveryDelaySeconds !== undefined && !(Number.isInteger(v.deliveryDelaySeconds) && (v.deliveryDelaySeconds as number) >= 0 && (v.deliveryDelaySeconds as number) <= 900))
+    refuse("transcriptStore.sessionPipeline.deliveryDelaySeconds must be an integer from 0 to 900");
+  if (v.batchingWindowSeconds !== undefined && !(Number.isInteger(v.batchingWindowSeconds) && (v.batchingWindowSeconds as number) >= 0 && (v.batchingWindowSeconds as number) <= 300))
+    refuse("transcriptStore.sessionPipeline.batchingWindowSeconds must be an integer from 0 to 300");
   if (v.reconcileMinutes !== undefined && !(Number.isInteger(v.reconcileMinutes) && (v.reconcileMinutes as number) >= 15 && (v.reconcileMinutes as number) <= 120))
     refuse("transcriptStore.sessionPipeline.reconcileMinutes must be an integer from 15 to 120");
   if(v.analysisJobs!==undefined){const c=v.analysisJobs as Record<string,unknown>|null;
@@ -895,7 +907,7 @@ export const sessionPipelineWiring = (
     } as never);
     const queue = yield* AWS.SQS.Queue("session-events", {
       queueName: names.queue,
-      delay: `${DELIVERY_DELAY_SECONDS} seconds`,
+      delay: `${i.p.deliveryDelaySeconds ?? DELIVERY_DELAY_SECONDS} seconds`,
       visibilityTimeout: `${VISIBILITY_TIMEOUT_SECONDS} seconds`,
       messageRetentionPeriod: "4 days",
       receiveMessageWaitTime: "20 seconds",
@@ -916,7 +928,7 @@ export const sessionPipelineWiring = (
       functionName: i.fn.functionName as unknown as string,
       eventSourceArn: queue.queueArn as unknown as string,
       batchSize: 10,
-      maximumBatchingWindow: "20 seconds",
+      maximumBatchingWindow: `${i.p.batchingWindowSeconds ?? 20} seconds`,
       functionResponseTypes: ["ReportBatchItemFailures"],
       scalingConfig: { MaximumConcurrency: i.p.maxConcurrency ?? 4 },
       enabled: true,
