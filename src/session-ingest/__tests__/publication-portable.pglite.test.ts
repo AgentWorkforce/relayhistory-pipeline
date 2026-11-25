@@ -16,6 +16,7 @@ import { SCRUB_RULESET_VERSION } from "../../../packages/pipeline/src/lib/pipeli
 import { parseSessionKey, rawChunkKey } from "../../shared/vendor.ts";
 import { derivedSchemaAssets } from "../../session-pipeline/derived-schema.ts";
 import { sqlLedger } from "../ledger-sql.ts";
+import { deliveryAccount } from "../vendor/delivery/prepare.ts";
 import { deliverBatch } from "../deliver.ts";
 import { runPortablePublicationRuntime } from "../publication-portable.ts";
 import { batch, record, TENANT } from "./support.ts";
@@ -43,10 +44,17 @@ const ENV = {
 };
 let db: PGlite, s3: MinioShapedS3, store: ObjectStore, stage: string;
 const owner = async (sql: string, args: unknown[] = []) => db.query<any>(sql, args as never);
-const asIngest = async (sql: string, args: unknown[] = []) => {
-  await db.exec("BEGIN; SET LOCAL ROLE bulls96_session_ingest");
+const asRole = async (role: "bulls96_session_ingest" | "bulls96_publication_scoped", sql: string, args: unknown[] = []) => {
+  await db.exec("BEGIN; SET LOCAL ROLE "+role);
   try { const r = await db.query<any>(sql, args as never); await db.exec("COMMIT"); return r; } catch (e) { await db.exec("ROLLBACK"); throw e; }
 };
+const asIngest = (sql: string,args: unknown[] = []) => asRole("bulls96_session_ingest",sql,args);
+const asPublisher = (sql: string,args: unknown[] = []) => asRole("bulls96_publication_scoped",sql,args);
+async function installScopedProposal() {
+  if ((await owner("SELECT to_regnamespace('publication_private') AS installed")).rows[0].installed) return;
+  await db.exec("CREATE ROLE bulls96_publication_scoped NOLOGIN; CREATE ROLE bulls96_publication_recovery NOLOGIN; GRANT USAGE ON SCHEMA sessions TO bulls96_publication_scoped");
+  await db.exec(read("supabase/proposals/continuous-publication/062280-scoped-kernels.up.sql"));
+}
 beforeAll(async () => {
   db = new PGlite({ extensions: { btree_gin, pg_trgm } });
   await db.exec(read("supabase/tests/supabase_shim.sql"));
@@ -161,15 +169,26 @@ test("disposable scoped v1 binds candidates, claim and final commit to one admit
     return (await owner("SELECT active_stage_token token FROM sessions.ingest_buffer_outbox WHERE batch_id=$1",[payload.batch_id])).rows[0].token as string;
   };
   const admitted=await submit("scoped-once"), other=await submit("not-admitted");
-  await db.exec(read("src/session-ingest/__tests__/fixtures/publication-scoped-v1.sql"));
+  await installScopedProposal();
   const binding={planSha256:"c".repeat(64),admissionId:"77777777-1111-2222-3333-444444444444",frontierSha256:"e".repeat(64),
     tenant:{...TENANT,originId:"origin-1"},target};
-  await owner(`INSERT INTO sessions.fixture_scoped_admission(id,binding,stage,frontier_image,admission_image,stage_sha)
-    SELECT $1::uuid,$2::jsonb,s.stage_token,to_jsonb(f),to_jsonb(d),s.stage_sha256 FROM sessions.ingest_stage_intents s
+  await owner(`INSERT INTO publication_private.admission(id,binding,stage,frontier_image,admission_image,stage_sha,enabled,valid_until)
+    SELECT $1::uuid,$2::jsonb,s.stage_token,to_jsonb(f),to_jsonb(d),s.stage_sha256,true,clock_timestamp()+interval '5 minutes' FROM sessions.ingest_stage_intents s
     JOIN sessions.ingest_publication_frontiers f USING(org_id,workspace_id,user_id,origin_id)
     JOIN sessions.ingest_buffer_admission d USING(org_id) WHERE s.stage_token=$3::uuid`,[binding.admissionId,JSON.stringify(binding),admitted]);
   const scopeArgs={generation:GEN,keyRoot:"96bulls",bucket:BUCKET,region:REGION,binding};
-  const call=async(name:string,p:unknown)=>(await asIngest("SELECT sessions.ingest_publication_"+name+"($1::jsonb) AS result",[JSON.stringify(p)])).rows[0].result;
+  // A buffered receipt alone cannot authorize an image. Remove the first-ACK
+  // seat in a disposable transaction before the real candidate can be claimed.
+  await db.exec("BEGIN");
+  try {
+    const removed=await owner("DELETE FROM sessions.ingest_receipt_ord_seats WHERE claim_token=(SELECT claim_token FROM sessions.ingest_stage_intents WHERE stage_token=$1) RETURNING ord",[admitted]);
+    expect(removed.rows).toHaveLength(1);
+    await db.exec("SET LOCAL ROLE bulls96_publication_scoped");
+    await expect(owner("SELECT sessions.ingest_publication_scoped_claim_v1($1::jsonb)",[JSON.stringify({...scopeArgs,stageToken:admitted})]))
+      .rejects.toMatchObject({code:"55000"});
+  } finally { await db.exec("ROLLBACK"); }
+  expect((await owner("SELECT 1 FROM sessions.ingest_publication_attempts WHERE stage_token=$1",[admitted])).rows).toHaveLength(0);
+  const call=async(name:string,p:unknown)=>(await asPublisher("SELECT sessions.ingest_publication_"+name+"($1::jsonb) AS result",[JSON.stringify(p)])).rows[0].result;
   expect(await call("scoped_candidates_v1",{...scopeArgs,limit:1})).toEqual({stageTokens:[admitted]});
   await expect(call("scoped_claim_v1",{...scopeArgs,stageToken:other})).rejects.toThrow();
   await expect(call("scoped_candidates_v1",{...scopeArgs,limit:1,binding:{...binding,planSha256:"b".repeat(64)}})).rejects.toThrow();
@@ -188,7 +207,7 @@ test("disposable scoped v1 binds candidates, claim and final commit to one admit
       await db.exec("BEGIN");
       try {
         await owner("UPDATE sessions.ingest_publication_attempts SET lease_until=clock_timestamp()-interval '1s' WHERE attempt_token=$1",[p.attemptToken]);
-        await db.exec("SET LOCAL ROLE bulls96_session_ingest");
+        await db.exec("SET LOCAL ROLE bulls96_publication_scoped");
         await expect(owner("SELECT sessions.ingest_publication_scoped_claim_v1($1::jsonb)",[JSON.stringify({...scopeArgs,stageToken:admitted})])).rejects.toThrow("admission busy");
       } finally { await db.exec("ROLLBACK"); }
       // Model a real source authority/retention invalidation just before commit.
@@ -196,14 +215,14 @@ test("disposable scoped v1 binds candidates, claim and final commit to one admit
       await db.exec("BEGIN");
       try {
         await owner("UPDATE sessions.ingest_buffer_admission SET privacy_baseline_sha256=repeat('f',64) WHERE org_id=$1",[TENANT.orgId]);
-        await db.exec("SET LOCAL ROLE bulls96_session_ingest");
+        await db.exec("SET LOCAL ROLE bulls96_publication_scoped");
         await expect(owner("SELECT sessions.ingest_publication_scoped_publish_v1($1::jsonb)",[JSON.stringify(final)])).rejects.toThrow("authority stale");
       } finally { await db.exec("ROLLBACK"); }
       // Two transactions interleave after the live claim and before the final write.
-      await owner("UPDATE sessions.fixture_scoped_admission SET enabled=false WHERE id=$1",[binding.admissionId]);
+      await owner("UPDATE publication_private.admission SET enabled=false WHERE id=$1",[binding.admissionId]);
       await expect(call("scoped_publish_v1",final)).rejects.toThrow("authority stale");
       expect((await owner("SELECT state FROM sessions.ingest_publication_attempts WHERE attempt_token=$1",[p.attemptToken])).rows[0].state).not.toBe("published");
-      await owner("UPDATE sessions.fixture_scoped_admission SET enabled=true WHERE id=$1",[binding.admissionId]);
+      await owner("UPDATE publication_private.admission SET enabled=true WHERE id=$1",[binding.admissionId]);
       await expect(call("scoped_publish_v1",{...final,stageToken:other})).rejects.toThrow();
       await expect(call("scoped_publish_v1",{...final,leaseToken:binding.admissionId})).rejects.toThrow();
       const result=await call("scoped_publish_v1",final);
@@ -218,7 +237,7 @@ test("disposable scoped v1 binds candidates, claim and final commit to one admit
   expect(await scopedPublicationCycle(transport,binding,deps,{enabled:true})).toMatchObject({examined:1,published:1});
   expect(calls).toContain("scoped_claim_v1");
   expect(calls).toContain("scoped_publish_v1");
-  expect(calls.filter(name=>["candidates","claim","publish","defer"].includes(name))).toEqual([]);
+  expect(new Set(calls)).toEqual(new Set(["scoped_candidates_v1","scoped_claim_v1","scoped_heartbeat_v1","scoped_prepare_v1","scoped_register_objects_v1","scoped_publish_v1"]));
   const activeCalls=calls.length, objectRequests=s3.requests.length;
   expect(await scopedPublicationCycle(transport,binding,deps,{enabled:false})).toMatchObject({enabled:false});
   expect(calls).toHaveLength(activeCalls);
@@ -227,23 +246,24 @@ test("disposable scoped v1 binds candidates, claim and final commit to one admit
   expect((await owner("SELECT count(*)::int n FROM sessions.ingest_publication_attempts WHERE stage_token=$1",[other])).rows[0].n).toBe(0);
 });
 
-test("generation PUT before scoped finalization cannot promote a finalized or abandoned session", async () => {
+test("generation PUT before scoped finalization cannot promote a committed or invalidated stage", async () => {
   const { processBatch } = await import("../../session-pipeline/consumer.ts");
   const { scopedPublicationCycle } = await import("../publication-scoped-rpc.ts");
   const { relayhistoryNewestAcrossOrigins } = await import("../../../packages/pipeline/src/lib/pipeline/relayhistory-transform.ts");
   const target = { bucket: BUCKET, region: REGION, keyRoot: "96bulls", generation: GEN, provider: "s3" as const };
+  const cohort={...TENANT,workspaceId:"ws-pickup"};
+  await owner("INSERT INTO sessions.ingest_publication_frontiers VALUES($1,$2,$3,'origin-1',$4,$4,clock_timestamp()+interval'1 hour',$5,$6,'96bulls',$7)", [cohort.orgId,cohort.workspaceId,cohort.userId,"b".repeat(64),BUCKET,REGION,GEN]);
   const ledger = orderedFixtureLedger(sqlLedger(asIngest, { acceptanceMode: "buffered", expectedGeneration: GEN }), { query: owner });
-  if (!(await owner("SELECT to_regclass('sessions.fixture_scoped_admission') AS fixture")).rows[0].fixture)
-    await db.exec(read("src/session-ingest/__tests__/fixtures/publication-scoped-v1.sql"));
+  await installScopedProposal();
 
   for (const commit of [false, true]) {
     const id = commit ? "early-final" : "early-abort";
-    const payload = await batch([record({ record_id: id, session_id: id })], { batch_id: id });
-    expect((await deliverBatch({ ledger, target: { store, keyRoot: "96bulls" }, acceptanceMode: "buffered" }, TENANT, payload)).outcome).toBe("accepted_buffered");
+    const payload = await batch([record({ record_id: id, session_id: id, payload: {text:"needle publication proof", ts_ms:1761955200000} })], { batch_id: id,account_id:await deliveryAccount(cohort) });
+    expect((await deliverBatch({ ledger, target: { store, keyRoot: "96bulls" }, acceptanceMode: "buffered" }, cohort, payload)).outcome).toBe("accepted_buffered");
     const binding = { planSha256: "c".repeat(64), admissionId: crypto.randomUUID(), frontierSha256: "e".repeat(64),
-      tenant: { ...TENANT, originId: "origin-1" }, target };
-    await owner(`INSERT INTO sessions.fixture_scoped_admission(id,binding,stage,frontier_image,admission_image,stage_sha)
-      SELECT $1::uuid,$2::jsonb,s.stage_token,to_jsonb(f),to_jsonb(d),s.stage_sha256 FROM sessions.ingest_stage_intents s
+      tenant: { ...cohort, originId: "origin-1" }, target };
+    await owner(`INSERT INTO publication_private.admission(id,binding,stage,frontier_image,admission_image,stage_sha,enabled,valid_until)
+      SELECT $1::uuid,$2::jsonb,s.stage_token,to_jsonb(f),to_jsonb(d),s.stage_sha256,true,clock_timestamp()+interval '5 minutes' FROM sessions.ingest_stage_intents s
       JOIN sessions.ingest_publication_frontiers f USING(org_id,workspace_id,user_id,origin_id)
       JOIN sessions.ingest_buffer_admission d USING(org_id) WHERE s.batch_id=$3`, [binding.admissionId, JSON.stringify(binding), id]);
 
@@ -275,20 +295,21 @@ test("generation PUT before scoped finalization cannot promote a finalized or ab
         expect(s3.objects.has(key)).toBe(true);
         await deliverPut();
         expect(await counts()).toEqual({ pointers: 0, revisions: 0, jobs: 0 });
-        if (!commit) await owner("UPDATE sessions.fixture_scoped_admission SET enabled=false WHERE id=$1", [binding.admissionId]);
+        if (!commit) await owner("UPDATE publication_private.admission SET enabled=false WHERE id=$1", [binding.admissionId]);
       }
-      return asIngest(sql, args);
+      return asPublisher(sql, args);
     }};
     const cycle = scopedPublicationCycle(transport as never, binding, {target, store: () => store}, {enabled: true});
     if (commit) expect(await cycle).toMatchObject({published:1});
     else await expect(cycle).rejects.toThrow("P0001");
     expect(notifications).toBe(1);
     expect((await owner(`SELECT a.state FROM sessions.ingest_publication_attempts a
-      JOIN sessions.fixture_scoped_admission f ON f.stage=a.stage_token WHERE f.id=$1`, [binding.admissionId])).rows)
-      .toEqual([{state: commit ? "published" : "rejected"}]);
+      JOIN publication_private.admission f ON f.stage=a.stage_token WHERE f.id=$1`, [binding.admissionId])).rows)
+      .toEqual([{state: commit ? "published" : "prepared"}]);
     const expected = commit ? 1 : 0;
     await deliverPut(); // duplicate may arrive after the outcome
     expect(await counts()).toEqual({pointers: expected, revisions: expected, jobs: expected});
+    if (commit) await (await import("./publication-pickup.ts")).checkPublicationPickup(db,store,key,GEN,read("supabase/bootstrap/session_read_api_role.sql"));
   }
 
   // Separate projection boundary: a queue hint cannot supply an acceptance seat
