@@ -61,7 +61,7 @@ export const STREAM_READ_CEILING: Readonly<StreamReadLimits> = Object.freeze({
   maxReadEvents: nodeReadBudget("large").sourceRecords,
 });
 export { manifestUserId, readManifestRecords, projectedToNeonRow } from "../session-read-api/canonical-projection.ts";
-import { createHash } from "node:crypto";
+import { createHash, randomInt } from "node:crypto";
 import * as zlib from "node:zlib";
 import { layoutComponent } from "../shared/layout-component.ts";
 import { errorFields, log } from "../shared/log.ts";
@@ -781,10 +781,11 @@ async function indexSearchScopeBase(scope: SessionScope, deps: SearchIndexDeps, 
   const scanBefore = deps.metrics?.indexScanMs ?? 0;
   let first: SearchIndexResult | typeof SEARCH_SCOPE_CHANGED;
   // Hosted (SEARCH_INDEX_STREAMING_CH=1, the invocation's stream slot, the ClickHouse binding): the pass owes a full
-  // pass (needs_full = 1) from before its first source read until its Postgres outcome is durable. A completing
-  // state row is written only after COMMIT, and only if no newer pass has marked the scope since (finalizeAfterCommit).
+  // pass (needs_full = 1) from before its first source read until its Postgres outcome is durable; its completing
+  // state rows are written after COMMIT, under the scope and canonical locks, and only over its own verified marker
+  // (HostedState).
   const hostedPass = hostedStream(deps) && !prepared && !!deps.ch && !deps.adapter;
-  const afterCommit: Array<() => Promise<void>> = [];
+  const hostedState = hostedPass ? new HostedState(deps, scope) : null;
   try {
     first = await deps.transact(async (tx): Promise<SearchIndexResult | typeof SEARCH_SCOPE_CHANGED> => {
     const rawIo = deps.adapter
@@ -793,7 +794,7 @@ async function indexSearchScopeBase(scope: SessionScope, deps: SearchIndexDeps, 
         : adapterProjectionIo(deps.adapter, tx)
       : legacyProjectionIo(deps.ch!);
     const observedIo = observedProjectionIo(rawIo, deps.metrics);
-    const io: SearchProjectionIo = hostedPass ? deferCompleteRecord(observedIo, deps.ch!, afterCommit) : observedIo;
+    const io: SearchProjectionIo = hostedState ? hostedState.io(observedIo) : observedIo;
     const chFacts = deps.ch ? clickhouseOutputFactsStore(deps.ch, { maxRows: limits.maxRows, insertBatch: limits.insertBatch }) : undefined;
     const pgFacts = deps.outputFactsStore?.(tx);
     // Non-blocking: a pass already running for this session is busy for as long
@@ -847,6 +848,8 @@ async function indexSearchScopeBase(scope: SessionScope, deps: SearchIndexDeps, 
       // run already past its scope-lock check can put erased rows back after the index erase
       // (a write page takes the same scope lock this transaction holds).
       if (deps.staged && deps.adapter) await eraseStagedReconcileRuns(tx, scope, [...new Set([scope.sessionId, pointerSnapshot.canonicalId])]);
+      // Hosted: the erase owes its outcome too until COMMIT (its completing rows are fenced like any pass's).
+      if (hostedState) await hostedState.premark(io, 0, at, pointerSnapshot.canonicalId);
       await io.erase(scope,pointerSnapshot.canonicalId);
       // Erasure purges the fact tables whenever they exist, flag or not: turning the producer
       // off must never leave an erased session's facts behind.
@@ -896,14 +899,12 @@ async function indexSearchScopeBase(scope: SessionScope, deps: SearchIndexDeps, 
         return { manifests: 0, rows: 0, inserted: 0, deleted: 0, complete: false, skippedBeforeRead: true, reasons: [ACCEPTANCE_MISSING, SKIPPED_BEFORE_READ] };
       acceptance = { stamp, digest, observed: new Map() };
     } else fromMs = prepared?.fromMs ?? await io.fromMs(at);
-    if (hostedPass) {
-      // Before any source read of the pass (the backport's pre-mark, moved ahead of manifest admission): the scope
-      // owes a full pass until this one's outcome is durable, also if the invocation dies on the way. At the highest
-      // live sibling revision, one millisecond before the pass's own state rows, which replace it.
+    if (hostedState) {
+      // Before any source read of the pass (the backport's pre-mark, ahead of manifest admission), under the locks.
       const { rows: top } = await tx.query<{ revision: string }>(`SELECT coalesce(max(revision), 0)::text AS revision FROM sessions.session_index
         WHERE org_id=$1 AND workspace_id=$2 AND harness=$3 AND coalesce(canonical_session_id,session_id)=$4 AND deleted_at IS NULL`,
         [scope.orgId, scope.workspaceId, scope.harness, pointerSnapshot.canonicalId]);
-      await io.record(scope, Number(top[0]?.revision ?? 0), 0, false, new Date(at.getTime() - 1), pointerSnapshot.canonicalId);
+      await hostedState.premark(io, Number(top[0]?.revision ?? 0), at, pointerSnapshot.canonicalId);
     }
     const observedReader = acceptance ? { reader: observingReader(deps.reader, acceptance.observed) } : {};
     const s3 = prepared?.s3 ?? await measurePhase(deps.metrics, "sourceReadMs", () =>
@@ -1094,45 +1095,128 @@ async function indexSearchScopeBase(scope: SessionScope, deps: SearchIndexDeps, 
       deps.metrics.lockedApplyMs += Math.max(0, Date.now() - lockedStarted - source - scan);
     }
   }
-  // Committed: now the completing state rows (each fenced against a newer pass's marker).
-  for (const finalize of afterCommit) await finalize();
+  // Committed: now the completing state rows, fenced under the locks against everything but this pass's marker.
+  if (hostedState) await hostedState.finalize();
   return handoff ? stagedSearchScope(scope, deps, limits, handoff) : first;
 }
 
 /**
- * Hosted passes: `io` whose completing state rows (needs_full = 0) wait for COMMIT (indexSearchScopeBase runs
- * `afterCommit` once the transaction resolved). A rollback or an ambiguous COMMIT error rejects the transaction, the
- * rows are never written, and the owed marker (needs_full = 1, written before the first read) stands. After COMMIT
- * each row is written only if the scope's latest state row is not newer than this pass's own marker (`at` - 1 ms):
- * a newer pass has marked it since and owns its outcome. A failed fence read writes nothing (the scope stays owed).
+ * A hosted pass's state rows (search_ingest_session_state, every key recordState writes: the scope's session id and
+ * its canonical id). Ordering and ownership are per scope and monotonic, never wall time across invocations:
+ *  - the marker (`premark`, under the pass's scope and canonical locks, before any source read) is written at
+ *    M = max(the pass time - 1 ms, every key's latest synced_at + 2 ms), so it sorts above every earlier pass's rows
+ *    on every key, even within one millisecond or with clock skew, with needs_full = 1 and a random per-pass token
+ *    in scanned_rows. The 2 ms step leaves M + 1 to this pass alone: a later marker, computed from this pass's
+ *    marker or any of its rows, is at least M + 2 and so always sorts above this pass's completing rows;
+ *  - the pass's other incomplete rows are written at M + 1 (still owed);
+ *  - its completing rows (needs_full = 0) wait for COMMIT; `finalize` then takes the scope and canonical try-locks
+ *    in a transaction of its own (the same keys every pass takes first), reads every key's latest row, and writes
+ *    the completing rows at M + 1 only if each is exactly this pass's marker (time, needs_full = 1, token,
+ *    revision). A later pass needs those locks to write its own marker, so the check and the write are serialized
+ *    against it. A lock held by another pass, or a newer pass's valid marker: that pass owns the outcome, nothing is
+ *    cleared (completion_superseded). An empty, malformed or unreadable reply: nothing is cleared and the pass
+ *    fails retryably (search_completion_unrecorded), so SQS or M2 retries it. A rollback or an ambiguous COMMIT
+ *    error writes nothing either. In every such case the scope stays owed (the next pass is full).
  */
-function deferCompleteRecord(io: SearchProjectionIo, ch: ClickHouseClient, afterCommit: Array<() => Promise<void>>): SearchProjectionIo {
-  return {
-    ...io,
-    async record(scope, revision, rows, complete, at, canonicalId) {
-      if (!complete) return io.record(scope, revision, rows, complete, at, canonicalId);
-      afterCommit.push(async () => {
-        let latest: number;
-        try {
-          const found = await ch.select<{ synced_ms: unknown }>(
-            `SELECT toUnixTimestamp64Milli(synced_at) AS synced_ms FROM ${SESSION_STATE_TABLE}
-              WHERE org_id = {org:String} AND session_id = {session:String} ORDER BY synced_at DESC LIMIT 1`,
-            { params: { org: scope.orgId, session: scope.sessionId }, timeoutMs: 5_000 },
-          );
-          latest = Number(found[0]?.synced_ms);
-        } catch (error) {
-          log.warn("search index completion not recorded", { stage: "search-index", org_id: scope.orgId, session_id: scope.sessionId, reason: "completion_fence_unreadable", ...errorFields(error) });
+class HostedState {
+  private marker?: { ms: number; token: number; revision: number; canonicalId: string };
+  private pending?: { revision: number; rows: number; canonicalId: string };
+  constructor(private readonly deps: SearchIndexDeps, private readonly scope: SessionScope) {}
+
+  private keys(canonicalId: string): string[] {
+    return [...new Set([this.scope.sessionId, canonicalId])];
+  }
+
+  /** The latest state row of one key (the over-bound skip's statement), or undefined; throws when unreadable. */
+  private async latest(sessionId: string): Promise<{ ms: number; needsFull: number; scanned: number; revision: string } | undefined> {
+    const rows = await this.deps.ch!.select<{ revision: unknown; needs_full: unknown; scanned_rows: unknown; synced_ms: unknown }>(
+      `SELECT revision, needs_full, scanned_rows, toUnixTimestamp64Milli(synced_at) AS synced_ms
+         FROM ${SESSION_STATE_TABLE}
+        WHERE org_id = {org:String} AND session_id = {session:String}
+        ORDER BY synced_at DESC
+        LIMIT 1`,
+      { params: { org: this.scope.orgId, session: sessionId }, timeoutMs: 5_000 },
+    );
+    const row = rows[0];
+    if (row === undefined) return undefined;
+    return { ms: Number(row.synced_ms), needsFull: Number(row.needs_full), scanned: Number(row.scanned_rows), revision: String(row.revision) };
+  }
+
+  /** Under the pass's locks, before any source read: the owed marker on every key. Throws when the state is unreadable. */
+  async premark(io: SearchProjectionIo, revision: number, at: Date, canonicalId: string): Promise<void> {
+    let ms = at.getTime() - 1;
+    for (const key of this.keys(canonicalId)) {
+      const found = await this.latest(key);
+      if (found !== undefined) {
+        if (!Number.isFinite(found.ms)) throw new PipelineError("search_state_unreadable", "the session state's latest row has no time", true);
+        ms = Math.max(ms, found.ms + 2);
+      }
+    }
+    const token = 1 + randomInt(2_147_483_646);
+    // Written before `marker` is set, so the wrapped io keeps the marker's own time (M, not M + 1).
+    this.marker = undefined;
+    await io.record(this.scope, revision, token, false, new Date(ms), canonicalId);
+    this.marker = { ms, token, revision, canonicalId };
+  }
+
+  io(inner: SearchProjectionIo): SearchProjectionIo {
+    return {
+      ...inner,
+      record: async (scope, revision, rows, complete, at, canonicalId) => {
+        // Before the marker (none of the hosted paths writes one there): the pass's own time, as before.
+        if (!this.marker) return complete ? void (this.pending = { revision, rows, canonicalId: canonicalId ?? scope.sessionId }) : inner.record(scope, revision, rows, complete, at, canonicalId);
+        if (!complete) return inner.record(scope, revision, rows, complete, new Date(this.marker.ms + 1), canonicalId);
+        this.pending = { revision, rows, canonicalId: canonicalId ?? scope.sessionId };
+      },
+    };
+  }
+
+  /** After COMMIT: the completing rows, serialized under the locks and only over this pass's verified marker. */
+  async finalize(): Promise<void> {
+    const pending = this.pending;
+    const marker = this.marker;
+    if (!pending) return;
+    const skip = (reason: string, error?: unknown) =>
+      log.warn("search index completion not recorded", { stage: "search-index", org_id: this.scope.orgId, session_id: this.scope.sessionId, reason, ...(error ? errorFields(error) : {}) });
+    if (!marker || marker.canonicalId !== pending.canonicalId) return skip("completion_unmarked");
+    let anomaly: string | undefined;
+    let cause: unknown;
+    try {
+      await this.deps.transact(async (tx) => {
+        const scopeLock = await tx.query<{ ok: boolean }>("SELECT pg_try_advisory_xact_lock(hashtextextended($1, 0)) AS ok", [scopeLockKey(this.scope, "search")]);
+        if (scopeLock.rows[0]?.ok !== true) return skip("completion_superseded");
+        const canonicalLock = await tx.query<{ ok: boolean }>("SELECT pg_try_advisory_xact_lock(hashtextextended($1,0)) AS ok",
+          [["96bulls:directory-events", this.scope.orgId, this.scope.workspaceId, this.scope.harness, marker.canonicalId].join("\u001f")]);
+        if (canonicalLock.rows[0]?.ok !== true) return skip("completion_superseded");
+        for (const key of this.keys(marker.canonicalId)) {
+          const found = await this.latest(key);
+          if (found === undefined) { anomaly = "completion_marker_missing"; return; }
+          if (![found.ms, found.needsFull, found.scanned].every(Number.isFinite)) { anomaly = "completion_marker_malformed"; return; }
+          const ours = found.ms === marker.ms && found.needsFull === 1 && found.scanned === marker.token && found.revision === String(marker.revision);
+          if (ours) continue;
+          // A later valid row (another pass's marker or outcome) owns the scope; anything else is not ours to judge.
+          if (found.ms > marker.ms) return skip("completion_superseded");
+          anomaly = "completion_marker_foreign";
           return;
         }
-        if (Number.isFinite(latest) && latest > at.getTime() - 1) {
-          log.info("search index completion not recorded", { stage: "search-index", org_id: scope.orgId, session_id: scope.sessionId, reason: "completion_superseded" });
-          return;
-        }
-        await io.record(scope, revision, rows, complete, at, canonicalId);
+        await recordState(this.deps.ch!, this.scope, pending.revision, pending.rows, true, new Date(marker.ms + 1), marker.canonicalId);
+        if (this.deps.metrics) { this.deps.metrics.writeCalls += 1; this.deps.metrics.writeBatches += 1; }
       });
-    },
-  };
+    } catch (error) {
+      anomaly = "completion_fence_unreadable";
+      cause = error;
+    }
+    if (anomaly) {
+      // Observable to SQS and M2: the pass fails retryably (the message is redelivered, the job retried); the scope
+      // stays owed, so the retry is a full pass.
+      skip(anomaly, cause);
+      throw new PipelineError(SEARCH_COMPLETION_UNRECORDED, `the completing state was not recorded (${anomaly})`, true);
+    }
+  }
 }
+
+/** A hosted pass committed but its completing state could not be verified and written: retried, the scope owed. */
+export const SEARCH_COMPLETION_UNRECORDED = "search_completion_unrecorded";
 
 /** What the index transaction hands a staged run: the admitted read and the source stamp it saw. */
 interface StagedHandoff {
@@ -2029,6 +2113,8 @@ async function streamedReconcile(
       for (const [n, chunk] of chunks.entries()) {
         if (n > 0 && tailReserved()) return owing(["scope_too_large", STREAM_DEADLINE], true, inserted, deletedCount);
         await keepalive(true);
+        // Again after the lock check (it can itself take time), immediately before the statement.
+        if (tailReserved()) return owing(["scope_too_large", STREAM_DEADLINE], true, inserted, deletedCount);
         deletedCount += await io.remove(scope, chunk);
       }
       // After the last delete and before the directory and catalog writes: the reserve and the lock again, and the

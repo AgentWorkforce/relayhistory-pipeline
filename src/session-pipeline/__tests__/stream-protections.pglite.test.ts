@@ -161,6 +161,29 @@ describe("the 30 s tail reserve", () => {
     expect(c.latestState()!.needs_full).toBe(1);
   }, 120_000);
 
+  test("the reserve crossed during the lock check before the first DELETE: no DELETE runs", async () => {
+    const c = await clocked();
+    await indexedWithStale(c, 2);
+    const deadline = c.clock.ms + REMAINING - MARGIN;
+    const key = scopeLockKey(SCOPE, "search");
+    let checks = 0;
+    const transact = c.rt.deps.search!.transact;
+    c.rt.deps.search = { ...c.rt.deps.search!, transact: (work) => transact((tx) => work({
+      query: async (text: string, params?: unknown[]) => {
+        const r = await tx.query(text, params);
+        // The continuity checks: 1 the first (unthrottled) ping during the chunk reads, 2 and 3 around the keyset
+        // scan, 4 immediately before the first DELETE. The 4th succeeds but takes the pass into the reserve.
+        if (text === STREAM_LOCK_HELD_SQL && params?.[0] === key && ++checks === 4) c.clock.ms = deadline - (STREAM_TAIL_RESERVE_MS - 1);
+        return r;
+      },
+    })) };
+    const out = await c.send(c.s3Messages.slice(0, 1));
+    expect(checks).toBe(4);
+    expect(c.deletes()).toEqual([]);
+    expect(reconciled(out.lines)).toEqual([expect.objectContaining({ ok: false, deleted: 0, reason: "scope_too_large,stream_deadline" })]);
+    expect(c.latestState()!.needs_full).toBe(1);
+  }, 120_000);
+
   test("the gap after the final delete: past the deadline inside the last DELETE, the pass is not finalized", async () => {
     const c = await clocked();
     await indexedWithStale(c, 1);
@@ -337,28 +360,110 @@ describe("the owed marker until the Postgres outcome is durable", () => {
     }, 120_000);
   }
 
-  test("overlapping redelivery: a newer pass marked the scope after this one committed; this one does not clear the newer marker", async () => {
-    const c = await clocked();
+  /** The fake's session-state reads, numbered: a hosted pass makes two (one per key) for its marker, then two for its fence. */
+  function stateReads(c: Awaited<ReturnType<typeof clocked>>, onRead: (n: number, rows: unknown[]) => Promise<unknown[]> | unknown[]) {
     const select = c.r.fake.ch.select.bind(c.r.fake.ch);
-    let raced = false;
+    let n = 0;
     c.r.fake.ch.select = (async (q: string, o?: { params?: Record<string, unknown> }) => {
-      // The completion fence's read: a redelivered pass of the same scope started (and marked it) just now.
-      if (!raced && q.includes(`FROM ${SESSION_STATE_TABLE}`) && q.includes("synced_ms") && !q.includes("needs_full")) {
-        raced = true;
-        await c.r.fake.ch.insert(SESSION_STATE_TABLE, [{ org_id: SCOPE.orgId, session_id: SCOPE.sessionId, revision: 2, synced_at: new Date(c.clock.ms + 5_000).toISOString().replace("T", " ").replace("Z", ""), full_synced_at: "1970-01-01 00:00:00.000", scanned_rows: 0, needs_full: 1 }]);
-      }
-      return select(q, o as never);
+      const rows = await select(q, o as never) as unknown[];
+      if (!q.includes(`FROM ${SESSION_STATE_TABLE}`)) return rows;
+      n += 1;
+      return onRead(n, rows);
     }) as never;
+    return () => { c.r.fake.ch.select = select as never; };
+  }
+  const stateRow = (ms: number, needs: number, scanned: number, revision = 1) => ({
+    org_id: SCOPE.orgId, revision, synced_at: new Date(ms).toISOString().replace("T", " ").replace("Z", ""), full_synced_at: "1970-01-01 00:00:00.000", scanned_rows: scanned, needs_full: needs,
+  });
+  const latestMs = (c: Awaited<ReturnType<typeof clocked>>, session: string) =>
+    Math.max(...c.r.fake.state.filter((r) => r.session_id === session).map((r) => Date.parse(`${String(r.synced_at).replace(" ", "T")}Z`)));
+
+  test("same millisecond: a completed pass, then a rolled-back one; the second's marker sorts above the first's clear (needs_full=1)", async () => {
+    const c = await clocked();
+    expect(reconciled((await c.send(c.s3Messages.slice(0, 1))).lines)).toEqual([expect.objectContaining({ ok: true })]);
+    expect(c.latestState()!.needs_full).toBe(0);
+    // Same clock, same millisecond: the second pass rolls back.
+    const transact = c.rt.deps.search!.transact;
+    c.rt.deps.search = { ...c.rt.deps.search!, transact: async (work) => c.r.transact(async (tx) => { await work(tx); throw Object.assign(new Error("synthetic rollback"), { code: "40001" }); }) };
     const out = await c.send(c.s3Messages.slice(0, 1));
-    expect(raced).toBe(true);
+    expect(out.result).toEqual({ batchItemFailures: [{ itemIdentifier: "s3-0" }] });
+    for (const key of [SCOPE.sessionId, c.x.canonicalId]) {
+      const rows = c.r.fake.state.filter((r) => r.session_id === key);
+      const top = rows.find((r) => Date.parse(`${String(r.synced_at).replace(" ", "T")}Z`) === latestMs(c, key))!;
+      expect(top.needs_full).toBe(1);
+    }
+    c.rt.deps.search = { ...c.rt.deps.search!, transact };
+  }, 120_000);
+
+  for (const [name, reply, reason] of [
+    ["empty", () => [], "completion_marker_missing"],
+    ["malformed", () => [{ revision: "1", needs_full: "x", scanned_rows: null, synced_ms: "not-a-time" }], "completion_marker_malformed"],
+    ["foreign (an older row with another token)", () => [{ revision: "1", needs_full: 1, scanned_rows: 7, synced_ms: 1 }], "completion_marker_foreign"],
+  ] as const) {
+    test(`a ${name} fence reply never clears; the message fails retryably (search_completion_unrecorded) and the redelivery completes`, async () => {
+      const c = await clocked();
+      const restore = stateReads(c, (n, rows) => (n === 3 ? (reply as () => unknown[])() : rows));
+      const out = await c.send(c.s3Messages.slice(0, 1));
+      restore();
+      expect(out.result).toEqual({ batchItemFailures: [{ itemIdentifier: "s3-0" }] });
+      expect(out.lines.filter((l) => l.message === "search index completion not recorded")).toEqual([expect.objectContaining({ reason })]);
+      expect(out.lines.filter((l) => l.message === "search index failed")).toEqual([expect.objectContaining({ error_code: "search_completion_unrecorded" })]);
+      expect(c.r.fake.state.filter((r) => r.session_id === SCOPE.sessionId).every((r) => r.needs_full === 1)).toBe(true);
+      c.clock.ms += 60_000;
+      expect(reconciled((await c.send(c.s3Messages.slice(0, 1))).lines)).toEqual([expect.objectContaining({ ok: true })]);
+      expect(c.latestState()!.needs_full).toBe(0);
+    }, 120_000);
+  }
+
+  test("a fence SELECT that throws: observable (the message fails, reason completion_fence_unreadable), the marker stays 1", async () => {
+    const c = await clocked();
+    const restore = stateReads(c, (n, rows) => { if (n === 3) throw new Error("synthetic ClickHouse timeout"); return rows; });
+    const out = await c.send(c.s3Messages.slice(0, 1));
+    restore();
+    expect(out.result).toEqual({ batchItemFailures: [{ itemIdentifier: "s3-0" }] });
+    expect(out.lines.filter((l) => l.message === "search index completion not recorded")).toEqual([expect.objectContaining({ reason: "completion_fence_unreadable" })]);
+    expect(reconciled(out.lines)).toEqual([]);
+    expect(c.latestState()!.needs_full).toBe(1);
+  }, 120_000);
+
+  test("a newer marker after this pass committed (before its fence): this pass does not clear it", async () => {
+    const c = await clocked();
+    const restore = stateReads(c, async (n, rows) => {
+      // Before the fence's first read: a redelivered pass of the same scope marked it (rule: this marker + 2 ms).
+      if (n === 3) {
+        const m = latestMs(c, SCOPE.sessionId);
+        await c.r.fake.ch.insert(SESSION_STATE_TABLE, [{ ...stateRow(m + 2, 1, 99), session_id: SCOPE.sessionId }, { ...stateRow(m + 2, 1, 99), session_id: c.x.canonicalId }]);
+        return (await c.r.fake.ch.select(`SELECT revision, needs_full, scanned_rows, toUnixTimestamp64Milli(synced_at) AS synced_ms FROM ${SESSION_STATE_TABLE} WHERE x ORDER BY synced_at DESC LIMIT 1`, { params: { org: SCOPE.orgId, session: SCOPE.sessionId } } as never)) as unknown[];
+      }
+      return rows;
+    });
+    const out = await c.send(c.s3Messages.slice(0, 1));
+    restore();
     expect(reconciled(out.lines)).toEqual([expect.objectContaining({ ok: true })]);
     expect(out.lines.filter((l) => l.message === "search index completion not recorded")).toEqual([expect.objectContaining({ reason: "completion_superseded" })]);
     expect(c.latestState()!.needs_full).toBe(1);
-    // The newer pass itself then completes.
-    c.r.fake.ch.select = select as never;
-    c.clock.ms += 60_000;
-    expect(reconciled((await c.send(c.s3Messages.slice(0, 1))).lines)).toEqual([expect.objectContaining({ ok: true })]);
-    expect(c.latestState()!.needs_full).toBe(0);
+  }, 120_000);
+
+  test("same-millisecond newer marker injected between the fence SELECT and the completing INSERT: it still sorts above (needs_full=1)", async () => {
+    const c = await clocked();
+    const insert = c.r.fake.ch.insert.bind(c.r.fake.ch);
+    let injected = false;
+    c.r.fake.ch.insert = (async (table: string, rows: Array<Record<string, unknown>>, o?: never) => {
+      if (!injected && table === SESSION_STATE_TABLE && rows.some((r) => r.needs_full === 0)) {
+        injected = true;
+        // A newer pass at the same clock computes its marker from this pass's marker M: M + 2 (above our M + 1).
+        const m = Math.max(...rows.map(() => latestMs(c, SCOPE.sessionId)));
+        await insert(SESSION_STATE_TABLE, [{ ...stateRow(m + 2, 1, 99), session_id: SCOPE.sessionId }, { ...stateRow(m + 2, 1, 99), session_id: c.x.canonicalId }], o);
+      }
+      return insert(table, rows, o);
+    }) as never;
+    const out = await c.send(c.s3Messages.slice(0, 1));
+    expect(injected).toBe(true);
+    expect(reconciled(out.lines)).toEqual([expect.objectContaining({ ok: true })]);
+    for (const key of [SCOPE.sessionId, c.x.canonicalId]) {
+      const top = c.r.fake.state.filter((r) => r.session_id === key).find((r) => Date.parse(`${String(r.synced_at).replace(" ", "T")}Z`) === latestMs(c, key))!;
+      expect(top.needs_full).toBe(1);
+    }
   }, 120_000);
 });
 
