@@ -433,10 +433,12 @@ describe("selfhost-local nginx.conf", () => {
       "= /v1/cli/login -> read_api",
       "= /v1/delivery/records -> read_api",
       "= /v1/events -> read_api",
+      "= /v1/relayfacts -> read_api",
       "= /v1/sessions -> read_api",
       "^~ /v1/delivery/ -> ingest",
       "^~ /v1/digest/ -> read_api",
       "^~ /v1/onboarding/ -> ingest",
+      "^~ /v1/relayfacts/ -> read_api",
       "^~ /v1/sessions/ -> read_api",
       "^~ /v1/turns/ -> ingest",
     ]);
@@ -445,6 +447,19 @@ describe("selfhost-local nginx.conf", () => {
     // proxy_pass with a variable and no URI part forwards the raw request URI, never a rewritten one.
     expect(nginx).not.toMatch(/proxy_pass \$\w+\//);
     expect(nginx).not.toMatch(/location[^{]*(internal|healthz|readyz)/);
+  });
+
+  test("every routed path is in the docs/selfhost-composition.md section 2 table", () => {
+    const doc = readFileSync(join(ROOT, "docs/selfhost-composition.md"), "utf8");
+    const table = doc.slice(doc.indexOf("## 2. One public origin"), doc.indexOf("Requirements on the router"));
+    expect(table.length).toBeGreaterThan(0);
+    for (const entry of locations) {
+      const [kind, path] = entry.split(" ");
+      // An exact rule is listed as `METHOD path` or `path`; a prefix rule as `path*`.
+      expect(table).toMatch(new RegExp("`(?:[A-Z]+ )?" + path!.replace(/[/.]/g, "\\$&") + (kind === "^~" ? "\\*" : "") + "`"));
+    }
+    expect(table).toContain("`GET /v1/relayfacts`");
+    expect(table).toContain("`/v1/relayfacts/*`");
   });
 
   test("TLS edge, client identity headers stripped, body cap, raw-path guard", () => {
