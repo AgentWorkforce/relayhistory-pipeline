@@ -115,6 +115,7 @@ describe("stage registry", () => {
       "file-normalize",
       "file-maintenance",
       "backfill-activation",
+      "search-index",
     ]);
     expect(
       QUEUED_STAGES.filter((stage) => STAGE_REGISTRY[stage].implemented),

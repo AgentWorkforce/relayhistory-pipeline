@@ -28,6 +28,7 @@ export const QUEUED_STAGES = [
   "file-normalize",
   "file-maintenance",
   "backfill-activation",
+  "search-index",
 ] as const satisfies readonly PipelineStage[];
 export type QueuedStage = (typeof QUEUED_STAGES)[number];
 
@@ -102,6 +103,14 @@ export const STAGE_REGISTRY: { readonly [S in QueuedStage]: StageDefinition } =
       binding: "PIPELINE_FILE_MAINTENANCE",
       next: [],
       maxAttempts: 4,
+    },
+    "search-index": {
+      stage: "search-index",
+      summary: "Index the current committed directory epoch",
+      implemented: false,
+      binding: "PIPELINE_SEARCH_INDEX",
+      next: [],
+      maxAttempts: 12,
     },
     "backfill-activation": {
       stage: "backfill-activation",

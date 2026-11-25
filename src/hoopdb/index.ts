@@ -16,7 +16,7 @@ import {
   type TraceContext,
 } from "../shared/vendor.ts";
 import type { HoopDb,Transact } from "../shared/db.ts";
-import {publicationEvidence,withPublicationAuthority}from "../shared/publication-authority.ts";
+import {publicationEvidence,withPublicationAuthority,type PublicationEvidence}from "../shared/publication-authority.ts";
 import { ctxOf, enrichMessage, sessionExt } from "../shared/enrich.ts";
 import { log } from "../shared/log.ts";
 import { uuidv7 } from "../shared/ids.ts";
@@ -43,7 +43,7 @@ export interface IndexDeps {
   /** The message being handled, so fan-out continues its trace and ids. */
   current: () => StageMessage | undefined;
   /** Compiled schema identity and one short final metadata transaction. */
-  publication?:{schemaGeneration:string;transact:Transact};
+  publication?:{schemaGeneration:string;transact:Transact; enqueueSearchWake?:boolean};
   /**
    * Session briefs (src/session-brief): the wakeup debounce, or null when briefs are off.
    * Defaults to SESSION_BRIEF_ENABLED and its timings from env.
@@ -88,7 +88,7 @@ const movedFenced = (reason: "operator_erased" | "move_guarded") =>
 
 const ROW_IDENTITY=(p:{org_id:string;workspace_id:string;harness:string;session_id:string;machine_id:string})=>JSON.stringify([p.org_id,p.workspace_id,p.harness,p.session_id,p.machine_id]);
 export function hoopDbSessionIndex(deps: IndexDeps): HoopDbSessionPointerIndex {return sessionIndex(deps,false);}
-function sessionIndex(deps:IndexDeps,authorized:boolean):HoopDbSessionPointerIndex{
+function sessionIndex(deps:IndexDeps,authorized:boolean,managedSearch?:PublicationEvidence):HoopDbSessionPointerIndex{
   const operatorErase = eraseRuntimeFlag(process.env, ERASE_FENCE_FLAG);
   const fromEnv = briefConfig();
   const brief =
@@ -151,9 +151,9 @@ function sessionIndex(deps:IndexDeps,authorized:boolean):HoopDbSessionPointerInd
         const cached:ManifestReader={provider:deps.reader.provider,bucket:deps.reader.bucket,async read(key){
           if(key!==pointer.manifestKey)throw new Error("publication_cached_manifest_key");return read;
         }};
-        const final=await withPublicationAuthority(config.transact,evidence,async tx=>{
+        const final=await withPublicationAuthority(config.transact,evidence,async (tx,authority)=>{
           const db={...deps.db,query:tx.query.bind(tx)}as HoopDb;
-          return sessionIndex({...deps,db,reader:cached,queue:postgresPipelineQueue(tx)},true).upsertRawPointer(pointer,ctx,opts);
+          return sessionIndex({...deps,db,reader:cached,queue:postgresPipelineQueue(tx)},true,authority.managed && config.enqueueSearchWake === true ? evidence : undefined).upsertRawPointer(pointer,ctx,opts);
         });
         return final.current?final.value:{status:"skipped",reason:"publication_retired"};
       }
@@ -334,6 +334,10 @@ function sessionIndex(deps:IndexDeps,authorized:boolean):HoopDbSessionPointerInd
         harness: pk.harness,
         sessionId: pk.session_id,
       });
+      if (managedSearch) {
+        await deps.db.query("SELECT sessions.enqueue_managed_search_wake_v1($1::jsonb,$2::uuid)",
+          [JSON.stringify(managedSearch), ctx.traceId]);
+      }
       const fanoutDone = existing
         ? Number(existing.fanout_revision) >= f.manifestRevision
         : false;
