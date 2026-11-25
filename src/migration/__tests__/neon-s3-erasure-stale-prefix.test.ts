@@ -484,6 +484,55 @@ describe("identity allowlist (--only-identity)", () => {
     expect(passLine(f.logs)).toMatchObject({ allowlist_size: 3, allowlist_matched_identities: 2, allowlist_unmatched: 1 });
   });
 
+  test("allowlist_eligible_identities: A with two eligible dates, B only backing off -> eligible 2 prefixes but 1 identity (B has none)", async () => {
+    const f = await fixture();
+    const a = f.dateMove("sess-1", "g-1", NOW - 60_000);
+    const older = pfx("2026/10/31", "sess-1");
+    seedCopy(f.s, older);
+    f.st.enqueueErasure([{ key: older, kind: "prefix", org_id: ORG, reason: "stale_prefix" }], NOW - 55_000);
+    const b = f.dateMove("sess-2", "g-2", NOW - 50_000);
+    f.st.erasureFailed(b.oldP, "x", NOW); // B's only entry backs off
+    const before = dump(f.path);
+    const dry = await f.job().staleprefixPass({ execute: false, onlyIdentities: [ID_A, ID_B] });
+    expect(dry).toMatchObject({ ok: true, eligible: 2, allowlistSize: 2, allowlistMatchedIdentities: 2, allowlistUnmatched: 0, allowlistEligibleIdentities: 1 });
+    expect(passLine(f.logs)).toMatchObject({ eligible: 2, allowlist_size: 2, allowlist_matched_identities: 2, allowlist_unmatched: 0, allowlist_eligible_identities: 1 });
+    expect(dump(f.path)).toEqual(before);
+    // Execute: eligible identities are those with an erase.
+    const r = await f.job().staleprefixPass({ execute: true, onlyIdentities: [ID_A, ID_B], probe: f.s.eraser() });
+    expect(r).toMatchObject({ ok: true, erased: 2, allowlistEligibleIdentities: 1 });
+    expect([f.s.count(a.oldP), f.s.count(older), f.s.count(b.oldP)]).toEqual([0, 0, 3]);
+    // Both identities eligible: the gate equality holds.
+    const g = await fixture();
+    g.dateMove("sess-1", "g-1", NOW - 60_000);
+    g.dateMove("sess-2", "g-2", NOW - 50_000);
+    expect(await g.job().staleprefixPass({ execute: false, onlyIdentities: [ID_A, ID_B] })).toMatchObject({ eligible: 2, allowlistSize: 2, allowlistEligibleIdentities: 2 });
+  });
+
+  test("a sparse allowlist ([<hole>, A]) is refused at the job boundary: no queue read, no lease, no write, no erase", async () => {
+    const f = await fixture();
+    const a = f.dateMove("sess-1", "g-1", NOW - 60_000);
+    const reads: string[] = [];
+    for (const m of ["staleprefixErasures", "erasureBacklog", "otherEraserLeases", "exportedKeysOf", "pendingKeysOf"] as const) {
+      const orig = (f.st[m] as (...x: unknown[]) => unknown).bind(f.st);
+      (f.st as unknown as Record<string, unknown>)[m] = (...x: unknown[]) => (reads.push(m), orig(...x));
+    }
+    const leased = leaseSpy(f.st);
+    const before = dump(f.path);
+    const sparse: string[] = [];
+    sparse[1] = ID_A;
+    expect(sparse.length).toBe(2);
+    expect(sparse.every((h) => /^[0-9a-f]{64}$/.test(h))).toBe(true); // what the old check relied on
+    for (const ids of [sparse, [ID_A, , ID_B] as string[]])
+      await expect(f.job().staleprefixPass({ execute: true, onlyIdentities: ids, probe: f.s.eraser() })).rejects.toMatchObject({ code: "stale_prefix_mode_allowlist_invalid" });
+    expect(reads).toEqual([]);
+    expect(leased).toEqual([]);
+    expect(f.s.deletes).toEqual([]);
+    expect(f.s.lists).toBe(0);
+    expect(f.s.count(a.oldP)).toBe(3);
+    expect(f.logs).toEqual([]);
+    expect(dump(f.path)).toEqual(before);
+  });
+
   test("the job refuses a missing, empty, malformed, duplicated or oversized allowlist before reading the queue", async () => {
     const f = await fixture();
     f.dateMove();

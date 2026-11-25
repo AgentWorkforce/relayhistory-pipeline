@@ -167,6 +167,11 @@ export interface StalePrefixResult {
   allowlistMatchedIdentities: number;
   /** Allowlisted identities with no queued stale-prefix entry. */
   allowlistUnmatched: number;
+  /**
+   * Distinct allowlisted identities with at least one entry eligible THIS pass (due and passing every guard; with
+   * `execute`, erased). The operator gate before an execute: equal to `allowlistSize`.
+   */
+  allowlistEligibleIdentities: number;
   /** Set when execute refused to start (nothing erased, nothing written). */
   refused?: "stale_prefix_mode_other_eraser_lease";
   stoppedBy?: string;
@@ -1041,10 +1046,21 @@ export class ErasureJob {
     if (this.state.obligations) throw refusal("stale_prefix_mode_requires_obligations_off");
     if (opts.max !== undefined && !(Number.isSafeInteger(opts.max) && opts.max > 0)) throw refusal("stale_prefix_mode_max_invalid");
     if (opts.execute && !opts.probe) throw refusal("stale_prefix_mode_requires_existence_check");
-    const ids = opts.onlyIdentities;
-    if (!Array.isArray(ids) || ids.length === 0 || ids.length > STALE_PREFIX_ALLOWLIST_MAX || !ids.every((h) => typeof h === "string" && IDENTITY_HASH.test(h)) || new Set(ids).size !== ids.length)
-      throw refusal("stale_prefix_mode_allowlist_invalid");
+    // One dense snapshot, read index by index (Array#every skips holes, so a sparse array would pass it); every check
+    // and the Set below use that SAME snapshot, never the caller's array again.
+    const raw: unknown = opts.onlyIdentities;
+    if (!Array.isArray(raw)) throw refusal("stale_prefix_mode_allowlist_invalid");
+    const len = raw.length;
+    if (!Number.isSafeInteger(len) || len === 0 || len > STALE_PREFIX_ALLOWLIST_MAX) throw refusal("stale_prefix_mode_allowlist_invalid");
+    const ids: string[] = [];
+    for (let i = 0; i < len; i++) {
+      if (!Object.prototype.hasOwnProperty.call(raw, i)) throw refusal("stale_prefix_mode_allowlist_invalid");
+      const h: unknown = raw[i];
+      if (typeof h !== "string" || !IDENTITY_HASH.test(h)) throw refusal("stale_prefix_mode_allowlist_invalid");
+      ids.push(h);
+    }
     const allow = new Set(ids);
+    if (allow.size !== ids.length) throw refusal("stale_prefix_mode_allowlist_invalid");
     const now = this.now();
     const selected = this.state.staleprefixErasures();
     const due = selected.filter((i) => i.next_try <= now);
@@ -1061,7 +1077,9 @@ export class ErasureJob {
       otherEntries: queued - selected.length, eligible: 0, erased: 0, versionsDeleted: 0, skipped, siblingChecked: !!opts.probe,
       otherEraserLeases: this.state.otherEraserLeases(LEASE_HOLDER, now),
       allowlistSize: allow.size, allowlistMatchedIdentities: matched.size, allowlistUnmatched: allow.size - matched.size,
+      allowlistEligibleIdentities: 0,
     };
+    const eligibleIds = new Set<string>();
     // Another eraser may be mid-run (or crashed less than the lease TTL ago): execute never runs beside it and never
     // releases its leases. Exporter leases do not refuse; those prefixes skip as lease_busy. A dry run only reports.
     if (opts.execute && res.otherEraserLeases > 0) {
@@ -1085,13 +1103,17 @@ export class ErasureJob {
       if (!opts.execute) {
         const reason = await this.#staleGuard(item, opts.probe);
         if (reason) skip(reason, item.key);
-        else res.eligible += 1;
+        else {
+          res.eligible += 1;
+          eligibleIds.add(identity);
+        }
         continue;
       }
       const r = await this.#leasedItem(item, item.key, () => this.#staleGuard(item, opts.probe));
       res.versionsDeleted += r.deleted;
       if (r.outcome === "erased") {
         res.eligible += 1;
+        eligibleIds.add(identity);
         res.erased += 1;
         this.log({ message: "stale prefix erased", key_sha256: keyHash(item.key), versions_deleted: r.deleted });
         continue;
@@ -1107,11 +1129,13 @@ export class ErasureJob {
       this.log({ message: "stale prefix pass stopped", outcome: r.outcome, ...(r.status ? { status: r.status } : {}), ...(r.error ? { error_code: r.error } : {}), key_sha256: keyHash(item.key) });
       break;
     }
+    res.allowlistEligibleIdentities = eligibleIds.size;
     this.log({
       message: "stale prefix pass", execute: opts.execute, ok: res.ok, selected: res.selected, due: res.due, backing_off: res.backingOff,
       other_entries: res.otherEntries, eligible: res.eligible, erased: res.erased, versions_deleted: res.versionsDeleted, skipped,
       sibling_checked: res.siblingChecked, other_eraser_leases: res.otherEraserLeases, allowlist_size: res.allowlistSize,
-      allowlist_matched_identities: res.allowlistMatchedIdentities, allowlist_unmatched: res.allowlistUnmatched, ...(opts.max !== undefined ? { max: opts.max } : {}), ...(res.stoppedBy ? { stopped_by: res.stoppedBy } : {}),
+      allowlist_matched_identities: res.allowlistMatchedIdentities, allowlist_unmatched: res.allowlistUnmatched,
+      allowlist_eligible_identities: res.allowlistEligibleIdentities, ...(opts.max !== undefined ? { max: opts.max } : {}), ...(res.stoppedBy ? { stopped_by: res.stoppedBy } : {}),
     });
     return res;
   }

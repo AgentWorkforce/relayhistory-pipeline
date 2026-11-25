@@ -198,7 +198,22 @@ is not a session prefix of that org. There is no mode that prints keys.
 
 **Procedure.** Run the dry run first with the exact command. Confirm that its
 `start` log line carries `mode: "stale_prefixes_only"`; the full job's `start`
-line does not. Only then re-run the SAME command with `--execute` appended.
+line does not. Confirm that its final `stale prefix pass` line has
+`allowlist_eligible_identities` **equal to** `allowlist_size`: every listed
+session has at least one prefix eligible now. `eligible` counts prefixes, and
+`allowlist_matched_identities` counts listed sessions with any queued entry
+(backing-off ones included), so neither of them proves this. If the two
+differ, do not execute; find which sessions have no eligible prefix (their
+skip reasons) and fix the list or wait. Only then re-run the SAME command with
+`--execute` appended.
+
+The dry run's check is weaker than the execute run's: it has no bucket
+credentials, so it does not check that the date-moved sibling manifest is live
+in the bucket (`sibling_checked: false`). A prefix the dry run counted
+eligible can still be skipped at execute (`sibling_manifest_missing`,
+`no_live_sibling` if the state changed in between, or `sibling_check_failed`),
+so the execute run's `allowlist_eligible_identities` can come out lower. Check
+it again on the execute run's final line.
 
 **What it does**
 
@@ -329,6 +344,9 @@ only.
   - `allowlist_matched_identities`: given identities with at least one queued
     stale prefix (backing-off entries included).
   - `allowlist_unmatched`: given identities with no queued stale prefix.
+  - `allowlist_eligible_identities`: given identities with at least one
+    prefix eligible in this pass (due and passing every guard; with
+    `--execute`, erased). Must equal `allowlist_size` before an `--execute`.
 
 A dry run has no bucket credentials, so it does not make the bucket check in
 (b): `sibling_checked: false`. The dry run applies the state checks only; the
