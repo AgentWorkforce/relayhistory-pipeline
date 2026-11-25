@@ -11,7 +11,10 @@ import { createHash } from "node:crypto";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { readApiAnalysisBucket, readApiAnalysisSource } from "../lambda.ts";
+import pg from "pg";
+import { READER_LOGIN_SQL, readApiAnalysisBucket, readApiAnalysisSource, readApiDepsFromSecret } from "../lambda.ts";
+import { selfhostSearchComposition } from "../server.ts";
+import { READER_LOGIN_ROW, readerLoginAnswer } from "./reader-login-support.ts";
 import { AuthError, createReadApi, type AnalysisDeps } from "../app.ts";
 import { createAzureBlobStore, type AzureBlobConfig } from "../../../packages/object-store/src/azure.ts";
 import type { ObjectStore } from "../../../packages/object-store/src/index.ts";
@@ -154,4 +157,61 @@ test("end to end on azure: a completed result is served from the Azure store; a 
   expect(post.status).toBe(202);
   expect(admitted).toEqual(["admit"]);
   expect(fake.requests.every((r) => r.redirect === "manual")).toBe(true);
+});
+
+test("the DEFAULT Azure store wiring never follows a redirect (real fetch, two local origins): nothing reaches the second origin", async () => {
+  let reachedB = 0, reachedA = 0;
+  const b = Bun.serve({ hostname: "127.0.0.1", port: 0, fetch: () => { reachedB++; return new Response("fx-foreign"); } });
+  const a = Bun.serve({ hostname: "127.0.0.1", port: 0, fetch: (req) => {
+    reachedA++;
+    return new Response(null, { status: 302, headers: { location: `http://127.0.0.1:${b.port}${new URL(req.url).pathname}` } });
+  } });
+  try {
+    const source = readApiAnalysisSource(azureEnv({ SESSION_ANALYSIS_AZURE_ENDPOINT: `http://127.0.0.1:${a.port}/fxacct` }), noRun, undefined, noS3)!;
+    expect(source).toBeDefined();
+    const ref = { key: `fxroot/fx-org/v1/normalized/session-analysis-v2/${"0".repeat(8)}-0000-4000-8000-${"0".repeat(12)}/${"a".repeat(64)}.json`, sha256: "a".repeat(64), bytes: 10 };
+    const error = await source.result(ref).then(() => null, (e) => e);
+    expect((error?.cause as { code?: string })?.code).toBe("azure_redirect");
+    expect([reachedA, reachedB]).toEqual([1, 0]);
+  } finally {
+    a.stop(true); b.stop(true);
+  }
+});
+
+test("composition on the self-host service with LOCKER_PROVIDER=azure: the Azure analysis source with its admission pool", async () => {
+  const RealPool = pg.Pool;
+  const built: string[] = [];
+  const answer = async (text: string) => ({ rows: text === READER_LOGIN_SQL ? [{ ...READER_LOGIN_ROW }] : readerLoginAnswer(text) ?? [] });
+  class RecordingPool {
+    constructor(config: { application_name?: string }) { built.push(config?.application_name ?? "pool"); }
+    on() { return this; }
+    async query(text: string) { return answer(text); }
+    async connect() { return { query: async (text: string) => answer(text), release() {} }; }
+    async end() {}
+  }
+  pg.Pool = RecordingPool as unknown as typeof pg.Pool;
+  try {
+    const env = {
+      RELAYHISTORY_SELFHOST_READ_API: "true", READ_API_COMPLETE_SINCE: "epoch", SESSION_POSTGRES_TLS_PROFILE: "supabase",
+      SEARCH_INDEX_POSTGRES_BACKEND_ID: "selfhost-pg",
+      PIPELINE_ORG_FROM_PREFIX: "true", PIPELINE_KEY_PREFIX: "fxroot",
+      LOCKER_BUCKET: "fx-container", LOCKER_AZURE_ACCOUNT: "fxacct", LOCKER_AZURE_ACCOUNT_KEY: KEY, LOCKER_ENDPOINT: FAKE_ENDPOINT,
+      ...azureEnv(),
+    } as NodeJS.ProcessEnv;
+    const secret = JSON.stringify({ supabase_url: "postgresql://reader:pw@db.selfhost.internal:6543/history",
+      analysis_admit_url: "postgresql://admit:pw@db.selfhost.internal:6543/history" });
+    const { value: deps, lines } = capture(() => readApiDepsFromSecret(secret, env, selfhostSearchComposition(env), { entry: "service" }));
+    const result = await deps;
+    try {
+      expect(lines.filter((l) => l.includes("read_api_analysis"))).toEqual([]);
+      expect(result.deps.analysis).toBeDefined();
+      expect(typeof result.deps.analysis!.admit).toBe("function");
+      expect(typeof result.deps.analysis!.result).toBe("function");
+      expect(built).toContain("96bulls-session-analysis-admit");
+    } finally {
+      await result.close();
+    }
+  } finally {
+    pg.Pool = RealPool;
+  }
 });
