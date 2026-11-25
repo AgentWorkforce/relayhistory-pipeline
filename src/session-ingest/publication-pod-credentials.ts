@@ -80,9 +80,15 @@ export function publicationPodCredentials(
   const expectedPrefix = "arn:aws:sts::" + accountId + ":assumed-role/" + roleName + "/";
   const request = tests.request ?? directRequest;
   const now = tests.now ?? Date.now;
-  let cached: { value: AwsCredentials; verified: number; expires: number } | undefined;
-  let pending: Promise<AwsCredentials> | undefined;
-  const refresh = async (caller?: AbortSignal): Promise<AwsCredentials> => {
+  type Verified = { value: AwsCredentials; verified: number; expires: number };
+  // Export the authority deadline to downstream caches as well. STS identity
+  // must be rechecked even when the underlying pod session lasts for hours.
+  const snapshot = (entry: Verified): AwsCredentials => ({
+    ...entry.value, expiresAt: new Date(Math.min(entry.expires - TTL_MARGIN, entry.verified + TTL_MARGIN)),
+  });
+  let cached: Verified | undefined;
+  let pending: Promise<Verified> | undefined;
+  const refresh = async (caller?: AbortSignal): Promise<Verified> => {
     const signal = AbortSignal.any([AbortSignal.timeout(5000), ...(caller ? [caller] : [])]);
     let token: string;
     try { token = await (tests.readToken ?? projectedToken)(); } catch { return refuse("token_file"); }
@@ -109,16 +115,16 @@ export function publicationPodCredentials(
     signal.throwIfAborted();
     if (expires <= now() + TTL_MARGIN) refuse("expiration");
     cached = { value, expires, verified: now() };
-    return value;
+    return cached;
   };
   return async caller => {
     caller?.throwIfAborted();
     const start = now();
-    if (cached && start >= cached.verified && start - cached.verified < TTL_MARGIN && cached.expires > start + TTL_MARGIN) return { ...cached.value };
+    if (cached && start >= cached.verified && start - cached.verified < TTL_MARGIN && cached.expires > start + TTL_MARGIN) return snapshot(cached);
     cached = undefined;
     pending ??= refresh(caller).finally(() => { pending = undefined; });
     const value = await pending;
     caller?.throwIfAborted();
-    return { ...value };
+    return snapshot(value);
   };
 }
