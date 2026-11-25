@@ -1,4 +1,5 @@
 import { describe, expect, test } from "bun:test";
+import { installApprovedFrontier, type FrontierInstallApproval } from "../frontier-install.ts";
 import { parseFrontierJson, readFrontierBundle, MAX_FRONTIER_BUNDLE_BYTES } from "../frontier-plan-input.ts";
 import { mkdtempSync, rmSync, writeFileSync, symlinkSync, truncateSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -414,3 +415,149 @@ describe("canonical frontier read-only planner", () => {
     } finally { rmSync(directory, { recursive: true, force: true }); }
   });
 });
+
+describe("guarded frontier installation boundary (synthetic owner ports)", () => {
+  const nonce = "12345678-1111-2222-3333-444444444444";
+  function fixture() {
+    const capture = readyCapture();
+    const plan = evaluate(capture);
+    if (plan.status !== "ready") throw Error("fixture not ready");
+    const approval: FrontierInstallApproval = {
+      nonce, tenant, planSha256: plan.planSha256, verifierReceiptSha256: H("verified separately"),
+      wholeUserEvidenceSha256: H("whole user independently checked"), predecessorSha256: null,
+    };
+    const calls: string[] = [];
+    const ports = {
+      now: () => NOW,
+      readVerifiedApproval: async () => approval,
+      installGuarded: async (commandJson: string) => {
+        calls.push(commandJson);
+        return createHash("sha256").update(commandJson).digest("hex");
+      },
+    };
+    return { capture, approval, ports, calls, bindings: bindingsFor(capture) };
+  }
+
+  test("rebuilds approved plan and binds absent/renewal CAS and approval identity into one guarded call", async () => {
+    for (const predecessor of [null, H("previous image")]) {
+      const f = fixture();
+      f.approval.predecessorSha256 = predecessor;
+      expect(await installApprovedFrontier(true, nonce, f.capture, f.bindings, f.ports)).toBe("committed");
+      expect(f.calls).toHaveLength(1);
+      expect(JSON.parse(f.calls[0]!)).toMatchObject({ nonce, predecessorSha256: predecessor,
+        planSha256: f.approval.planSha256, verifierReceiptSha256: f.approval.verifierReceiptSha256,
+        wholeUserEvidenceSha256: f.approval.wholeUserEvidenceSha256,
+        row: { user_id: tenant.userId, origin_id: tenant.originId, schema_generation: f.capture.target.schemaGeneration } });
+    }
+  });
+  test("self-consistent changed generation and incomplete receipt capture cannot use approved plan", async () => {
+    for (const mutate of [
+      (c: CanonicalFrontierCapture) => { c.target.schemaGeneration = H("different generation"); },
+      (c: CanonicalFrontierCapture) => { c.origins[0]!.scans = c.origins[0]!.scans.filter(s => s.kind !== "receipt-decisions"); },
+      (c: CanonicalFrontierCapture) => { c.origins[0]!.closing.privacyVersion = "20"; },
+    ]) {
+      const f = fixture(); mutate(f.capture); reseal(f.capture);
+      expect(await installApprovedFrontier(true, nonce, f.capture, f.bindings, f.ports)).toBe("held");
+      expect(f.calls).toHaveLength(0);
+    }
+  });
+  test("disabled, missing verified approval, insufficient validity and wrong origin never invoke installer", async () => {
+    const f = fixture();
+    const req = (enabled: boolean, overrides = {}) => installApprovedFrontier(enabled, nonce, f.capture, f.bindings, {...f.ports,...overrides});
+    expect(await req(false, {readVerifiedApproval: () => { throw Error("disabled read"); }})).toBe("disabled");
+    expect(await req(true, {readVerifiedApproval: async () => null})).toBe("held");
+    expect(await req(true, {now: () => new Date(Date.parse(AT) + 151000)})).toBe("held");
+    f.approval.tenant = {...tenant, originId: "other"};
+    expect(await req(true)).toBe("held");
+    expect(f.calls).toHaveLength(0);
+  });
+  test("ambiguous acknowledgement returns lookup-required and makes no second call", async () => {
+    for (const throws of [true,false]) {
+      const f = fixture(); let attempts = 0;
+      expect(await installApprovedFrontier(true, nonce, f.capture, f.bindings, {...f.ports, installGuarded: async () => {
+        attempts++; if (throws) throw Error("lost connection"); return H("unrelated command");
+      }})).toBe("audit_lookup_required");
+      expect(attempts).toBe(1);
+    }
+  });
+});
+
+test("disposable installer transaction rehearsal: rollback, audit, pause, invalidation and fresh generation recovery", async () => {
+  const { PGlite } = await import("@electric-sql/pglite");
+  const db = new PGlite();
+  try {
+    await db.exec(readFileSync(new URL("./fixtures/frontier-install-rehearsal.sql", import.meta.url), "utf8"));
+    const capture = readyCapture();
+    await db.query("INSERT INTO gate VALUES(true,true,$1,0,$2)", [capture.target.schemaGeneration, NOW.toISOString()]);
+    const image = async () => (await db.query<{image:Record<string,unknown>}>("SELECT image FROM frontier")).rows[0]?.image ?? null;
+    let simulate: "none"|"rollback"|"lost_ack" = "none";
+    const installGuarded = async (raw:string) => {
+      const result = await db.transaction(async tx => {
+        const got = (await tx.query<{digest:string}>("SELECT pg_temp.try_install($1) AS digest",[raw])).rows[0]!.digest;
+        if(simulate === "rollback") throw Error("injected precommit failure");
+        return got;
+      });
+      if(simulate === "lost_ack") throw Error("injected response loss");
+      return result;
+    };
+    const prepare = async (nonce:string) => {
+      const plan = evaluate(capture);
+      if(plan.status!=="ready") throw Error("fixture capture held");
+      const old = await image();
+      const approval:FrontierInstallApproval={nonce,tenant,planSha256:plan.planSha256,
+        verifierReceiptSha256:H("synthetic verifier "+nonce),wholeUserEvidenceSha256:H("synthetic whole-user receipt"),
+        predecessorSha256:old===null?null:frontierSha256(old)};
+      const command = {protocol:"publication-frontier-guarded-install-v1",nonce,planSha256:plan.planSha256,
+        predecessorSha256:approval.predecessorSha256,verifierReceiptSha256:approval.verifierReceiptSha256,
+        wholeUserEvidenceSha256:approval.wholeUserEvidenceSha256,captureId:capture.captureId,evidenceSha256:plan.evidenceSha256,row:plan.frontiers[0]};
+      await db.query("INSERT INTO approval(nonce,command,expected_old) VALUES($1,$2::jsonb,$3::jsonb)",
+        [nonce,JSON.stringify(command),old===null?null:JSON.stringify(old)]);
+      return () => installApprovedFrontier(true,nonce,capture,bindingsFor(capture),{
+        now:()=>NOW,readVerifiedApproval:async()=>approval,installGuarded,
+      });
+    };
+    const nonce = "11111111-1111-1111-1111-111111111111";
+    const first = await prepare(nonce);
+    simulate = "rollback";
+    expect(await first()).toBe("audit_lookup_required");
+    expect(await image()).toBeNull();
+    expect((await db.query("SELECT used FROM approval")).rows).toEqual([{used:false}]);
+    expect((await db.query("SELECT nonce FROM audit")).rows).toEqual([]);
+    simulate = "lost_ack";
+    expect(await first()).toBe("audit_lookup_required");
+    expect((await db.query("SELECT nonce FROM audit")).rows).toEqual([{nonce}]);
+    expect(await image()).not.toBeNull();
+    simulate = "none";
+    expect(await first()).toBe("audit_lookup_required"); // consumed nonce cannot mutate again
+    await db.exec("UPDATE gate SET enabled=false");
+    const installed = await image();
+    expect(Number(Date.parse(String(installed?.valid_until)))).toBeGreaterThan(NOW.getTime()); // pausing installer does not invalidate
+    // The synthetic control path expires the row and rotates generation in one transaction.
+    await db.transaction(async tx=>{
+      await tx.query("SELECT singleton FROM gate FOR UPDATE");
+      await tx.query("UPDATE frontier SET image=jsonb_set(image,'{valid_until}',to_jsonb($1::text))",[NOW.toISOString()]);
+      await tx.query("UPDATE gate SET generation=$1",[H("generation after invalidation")]);
+    });
+    capture.target.schemaGeneration=H("generation after invalidation");
+    capture.capturedAt=NOW.toISOString(); reseal(capture);
+    const recovery=await prepare("22222222-2222-2222-2222-222222222222");
+    expect(await recovery()).toBe("audit_lookup_required"); // server still paused
+    await db.exec("UPDATE gate SET enabled=true,live_leases=1");
+    expect(await recovery()).toBe("audit_lookup_required");
+    expect((await image())?.valid_until).toBe(NOW.toISOString());
+    await db.query("UPDATE gate SET live_leases=0,generation=$1", [H("unexpected rebind")]);
+    expect(await recovery()).toBe("audit_lookup_required");
+    await db.query("UPDATE gate SET generation=$1", [capture.target.schemaGeneration]);
+    const actualPredecessor = await image();
+    // Another control changes the row after preparation. The approved predecessor cannot match.
+    await db.query("UPDATE frontier SET image=jsonb_set(image,'{valid_until}',to_jsonb($1::text))",
+      [new Date(NOW.getTime()-1).toISOString()]);
+    expect(await recovery()).toBe("audit_lookup_required");
+    expect((await db.query("SELECT nonce FROM audit")).rows).toHaveLength(1);
+    expect((await image())?.valid_until).not.toBe(actualPredecessor?.valid_until);
+    const afterRace = await prepare("33333333-3333-3333-3333-333333333333");
+    expect(await afterRace()).toBe("committed");
+    expect((await image())?.schema_generation).toBe(capture.target.schemaGeneration);
+    expect((await db.query("SELECT nonce FROM audit")).rows).toHaveLength(2);
+  } finally { await db.close(); }
+},30_000);

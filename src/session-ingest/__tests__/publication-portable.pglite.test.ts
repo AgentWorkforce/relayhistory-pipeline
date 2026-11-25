@@ -149,3 +149,71 @@ test("portable runtime refuses a frontier for another bucket: nothing is a candi
   expect(await runPortablePublicationRuntime({ ...ENV, INGEST_PUBLISH_BUCKET: "other-bucket" }, "publish", overrides())).toMatchObject({ enabled: true, examined: 0 });
   expect(await runPortablePublicationRuntime({ ...ENV, INGEST_PUBLISH_S3_REGION: "us-east-1" }, "gc", overrides({ eraser: () => ({ eraseObjectExcept: async () => { throw new Error("no erase expected"); } }) }))).toMatchObject({ enabled: true, examined: 0 });
 });
+
+test("disposable scoped v1 binds candidates, claim and final commit to one admitted stage and live authority", async () => {
+  const { publicationRpc } = await import("../publication-rpc.ts");
+  const { canonicalPublicationTick } = await import("../publication-job.ts");
+  const target = {bucket:BUCKET,region:REGION,keyRoot:"96bulls",generation:GEN,provider:"s3" as const};
+  const ledger = orderedFixtureLedger(sqlLedger(asIngest, { acceptanceMode:"buffered", expectedGeneration:GEN }),{ query:owner });
+  const submit=async(id:string)=>{
+    const payload=await batch([record({record_id:id,session_id:id,payload:{text:"scoped offline fixture",ts_ms:1761955200000}})],{batch_id:id});
+    const accepted=await deliverBatch({ledger,target:{store,keyRoot:"96bulls"},acceptanceMode:"buffered"},TENANT,payload);
+    expect(accepted.outcome).toBe("accepted_buffered");
+    return (await owner("SELECT active_stage_token token FROM sessions.ingest_buffer_outbox WHERE batch_id=$1",[payload.batch_id])).rows[0].token as string;
+  };
+  const admitted=await submit("scoped-once"), other=await submit("not-admitted");
+  await db.exec(read("src/session-ingest/__tests__/fixtures/publication-scoped-v1.sql"));
+  const binding={planSha256:"c".repeat(64),admissionId:"77777777-1111-2222-3333-444444444444",frontierSha256:"e".repeat(64),
+    tenant:{...TENANT,originId:"origin-1"},target};
+  await owner(`INSERT INTO sessions.fixture_scoped_admission(id,binding,stage,frontier_image,admission_image,stage_sha)
+    SELECT $1::uuid,$2::jsonb,s.stage_token,to_jsonb(f),to_jsonb(d),s.stage_sha256 FROM sessions.ingest_stage_intents s
+    JOIN sessions.ingest_publication_frontiers f USING(org_id,workspace_id,user_id,origin_id)
+    JOIN sessions.ingest_buffer_admission d USING(org_id) WHERE s.stage_token=$3::uuid`,[binding.admissionId,JSON.stringify(binding),admitted]);
+  const scopeArgs={generation:GEN,keyRoot:"96bulls",bucket:BUCKET,region:REGION,binding};
+  const call=async(name:string,p:unknown)=>(await asIngest("SELECT sessions.ingest_publication_"+name+"($1::jsonb) AS result",[JSON.stringify(p)])).rows[0].result;
+  expect(await call("scoped_candidates_v1",{...scopeArgs,limit:1})).toEqual({stageTokens:[admitted]});
+  await expect(call("scoped_claim_v1",{...scopeArgs,stageToken:other})).rejects.toThrow();
+  await expect(call("scoped_candidates_v1",{...scopeArgs,limit:1,binding:{...binding,planSha256:"b".repeat(64)}})).rejects.toThrow();
+  await expect(call("claim",{stageToken:other,generation:GEN,keyRoot:"96bulls",bucket:BUCKET,region:REGION})).rejects.toThrow("permission denied");
+
+  // Exercise the ordinary ticket parser/job and stage-bound downstream operations with a
+  // fixture transport. The host's real scoped transport is a separate integration unit.
+  const rpc=publicationRpc({queryBounded:async(text:string,args:unknown[])=>{
+    const p=JSON.parse(String(args[0]));
+    const method=text.match(/ingest_publication_([a-z_]+)\(/)![1]!;
+    if(method==="candidates"||method==="claim")return {rows:[{result:await call("scoped_"+method+"_v1",{...p,binding})}]};
+    if(method==="publish"){
+      const final={...p,stageToken:admitted,binding};
+      // A lost claim response must not allocate another attempt. Even when its
+      // lease has expired, this one-shot admission is held for audited recovery.
+      await db.exec("BEGIN");
+      try {
+        await owner("UPDATE sessions.ingest_publication_attempts SET lease_until=clock_timestamp()-interval '1s' WHERE attempt_token=$1",[p.attemptToken]);
+        await db.exec("SET LOCAL ROLE bulls96_session_ingest");
+        await expect(owner("SELECT sessions.ingest_publication_scoped_claim_v1($1::jsonb)",[JSON.stringify({...scopeArgs,stageToken:admitted})])).rejects.toThrow("admission busy");
+      } finally { await db.exec("ROLLBACK"); }
+      // Model a real source authority/retention invalidation just before commit.
+      // Roll the complete scenario back to exercise the independent success case.
+      await db.exec("BEGIN");
+      try {
+        await owner("UPDATE sessions.ingest_buffer_admission SET privacy_baseline_sha256=repeat('f',64) WHERE org_id=$1",[TENANT.orgId]);
+        await db.exec("SET LOCAL ROLE bulls96_session_ingest");
+        await expect(owner("SELECT sessions.ingest_publication_scoped_publish_v1($1::jsonb)",[JSON.stringify(final)])).rejects.toThrow("authority stale");
+      } finally { await db.exec("ROLLBACK"); }
+      // Two transactions interleave after the live claim and before the final write.
+      await owner("UPDATE sessions.fixture_scoped_admission SET enabled=false WHERE id=$1",[binding.admissionId]);
+      await expect(call("scoped_publish_v1",final)).rejects.toThrow("authority stale");
+      expect((await owner("SELECT state FROM sessions.ingest_publication_attempts WHERE attempt_token=$1",[p.attemptToken])).rows[0].state).not.toBe("published");
+      await owner("UPDATE sessions.fixture_scoped_admission SET enabled=true WHERE id=$1",[binding.admissionId]);
+      await expect(call("scoped_publish_v1",{...final,stageToken:other})).rejects.toThrow();
+      await expect(call("scoped_publish_v1",{...final,leaseToken:binding.admissionId})).rejects.toThrow();
+      const result=await call("scoped_publish_v1",final);
+      expect(await call("scoped_publish_v1",final)).toMatchObject({published:true,replay:true});
+      return {rows:[{result}]};
+    }
+    return {rows:[{result:await call(method,p)}]};
+  }} as never,target);
+  expect(await canonicalPublicationTick({rpc,target,store:()=>store},{enabled:true,candidateLimit:1})).toMatchObject({examined:1,published:1});
+  expect(await call("scoped_candidates_v1",{...scopeArgs,limit:1})).toEqual({stageTokens:[]});
+  expect((await owner("SELECT count(*)::int n FROM sessions.ingest_publication_attempts WHERE stage_token=$1",[other])).rows[0].n).toBe(0);
+});

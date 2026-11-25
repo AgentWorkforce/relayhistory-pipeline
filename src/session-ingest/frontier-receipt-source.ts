@@ -180,8 +180,20 @@ export async function captureFrontierReceiptSource(db: FrontierCaptureSql, input
     await db.query("COMMIT"); transactionAttempted = false;
     // A repeatable-read snapshot alone cannot prove the authority still holds.
     await begin();
-    const closing = await page(null, 1);
-    if (!equal(signature(opening!), signature(closing))) fail("frontier_receipt_changed");
+    // Verify the observed closing rows through EOF, not just the RPC's count/digest
+    // header. A changed join/page stream can report an unchanged summary. Reuse
+    // the opening page chain without retaining a second copy of the decisions.
+    let closing: Page | undefined;
+    let closingAfter: Cursor | null = null;
+    for (const expectedHash of hashes) {
+      const p = await page(closingAfter, b.pageLimit);
+      closing ??= p;
+      if (p.snapshot !== closing.snapshot || !equal(signature(opening!), signature(p)) ||
+          frontierSha256({ after: closingAfter, rows: p.rows, next: p.next }) !== expectedHash)
+        fail("frontier_receipt_changed");
+      closingAfter = p.next;
+    }
+    if (!closing || closingAfter !== null) fail("frontier_receipt_changed");
     await db.query("COMMIT"); transactionAttempted = false; check();
     const finishedAt = new Date().toISOString();
     if (Date.parse(finishedAt) < Date.parse(startedAt)) fail("frontier_receipt_clock");
