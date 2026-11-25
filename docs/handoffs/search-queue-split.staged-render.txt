@@ -1,16 +1,18 @@
 Search-queue split: staged render (placeholders only; scripts/search-split-staged-render.ts)
 Budget: 80 pooler connections, never raised. Each capture changes one capacity setting.
 Resources not listed are noop in every stage (store, grants, schedules, other alarms).
+Live HOOPDB_POOL_MAX is 3 (set by hand); hoopdbPoolMax: 3 is required in every stage and is never raised.
+A function env update (C2, R1) replaces the function's whole env with the rendered one: see the doc, hand-set variables.
 
-== live: Live before the split (pointer mapping 20, HOOPDB_POOL_MAX 4)
-inputs: {"searchIndex":true,"maxConcurrency":20}
+== live: Live before the split (pointer mapping 20, HOOPDB_POOL_MAX 3)
+inputs: {"searchIndex":true,"maxConcurrency":20,"hoopdbPoolMax":3}
 [session-events-mapping] rendered
 [session-pipeline] rendered
-pooler demand: (pointer 20 + search 0) x HOOPDB_POOL_MAX 4 = 80 <= 80
+pooler demand: (pointer 20 + search 0) x HOOPDB_POOL_MAX 3 = 60 <= 80
 deploy guard: post-apply
 
 == A: Provisioning only: search queue, DLQ, queue policy, alarms, search mapping created DISABLED
-inputs: {"searchIndex":true,"maxConcurrency":20,"searchQueue":{"enabled":true,"maxConcurrency":16}}
+inputs: {"searchIndex":true,"maxConcurrency":20,"hoopdbPoolMax":3,"searchQueue":{"enabled":true,"maxConcurrency":16}}
 [session-events-mapping] noop
 [session-pipeline] noop
 [session-search] create
@@ -89,25 +91,11 @@ inputs: {"searchIndex":true,"maxConcurrency":20,"searchQueue":{"enabled":true,"m
     maximumBatchingWindow: "20 seconds"
     scalingConfig.MaximumConcurrency: 16
     tags.96bulls:component: "session-pipeline"
-pooler demand: (pointer 20 + search 0 (search mapping disabled)) x HOOPDB_POOL_MAX 4 = 80 <= 80
-apply worst case live -> A: 80 <= 80
+pooler demand: (pointer 20 + search 0 (search mapping disabled)) x HOOPDB_POOL_MAX 3 = 60 <= 80
+apply worst case live -> A: 60 <= 80
 deploy guard: session search queue rollout
 
-== B1: HOOPDB_POOL_MAX 4 -> 3 (function env only)
-inputs: {"searchIndex":true,"maxConcurrency":20,"hoopdbPoolMax":3,"searchQueue":{"enabled":true,"maxConcurrency":16}}
-[session-events-mapping] noop
-[session-pipeline] update
-    env.HOOPDB_POOL_MAX: "4" -> "3"
-[session-search] noop
-[session-search-age-alarm] noop
-[session-search-dlq] noop
-[session-search-dlq-alarm] noop
-[session-search-mapping] noop
-pooler demand: (pointer 20 + search 0 (search mapping disabled)) x HOOPDB_POOL_MAX 3 = 60 <= 80
-apply worst case A -> B1: 80 <= 80
-deploy guard: session pipeline update
-
-== B2: Pointer mapping MaximumConcurrency 20 -> 10
+== B: Pointer mapping MaximumConcurrency 20 -> 10
 inputs: {"searchIndex":true,"maxConcurrency":10,"hoopdbPoolMax":3,"searchQueue":{"enabled":true,"maxConcurrency":16}}
 [session-events-mapping] update
     scalingConfig.MaximumConcurrency: 20 -> 10
@@ -118,7 +106,7 @@ inputs: {"searchIndex":true,"maxConcurrency":10,"hoopdbPoolMax":3,"searchQueue":
 [session-search-dlq-alarm] noop
 [session-search-mapping] noop
 pooler demand: (pointer 10 + search 0 (search mapping disabled)) x HOOPDB_POOL_MAX 3 = 30 <= 80
-apply worst case B1 -> B2: 60 <= 80
+apply worst case A -> B: 60 <= 80
 deploy guard: session pipeline update
 
 == C1: Search mapping enabled (MaximumConcurrency 16)
@@ -132,7 +120,7 @@ inputs: {"searchIndex":true,"maxConcurrency":10,"hoopdbPoolMax":3,"searchQueue":
 [session-search-mapping] update
     enabled: false -> true
 pooler demand: (pointer 10 + search 16) x HOOPDB_POOL_MAX 3 = 78 <= 80
-apply worst case B2 -> C1: 78 <= 80
+apply worst case B -> C1: 78 <= 80
 deploy guard: session pipeline update
 
 == C2: Handoff on: SESSION_PIPELINE_SEARCH_QUEUE_URL set (function env only)
@@ -179,22 +167,8 @@ pooler demand: (pointer 10 + search 0 (search mapping disabled)) x HOOPDB_POOL_M
 apply worst case R1 -> R2: 78 <= 80
 deploy guard: session pipeline update
 
-== R3: HOOPDB_POOL_MAX 3 -> 4 (function env only)
-inputs: {"searchIndex":true,"maxConcurrency":10,"searchQueue":{"enabled":true,"maxConcurrency":16}}
-[session-events-mapping] noop
-[session-pipeline] update
-    env.HOOPDB_POOL_MAX: "3" -> "4"
-[session-search] noop
-[session-search-age-alarm] noop
-[session-search-dlq] noop
-[session-search-dlq-alarm] noop
-[session-search-mapping] noop
-pooler demand: (pointer 10 + search 0 (search mapping disabled)) x HOOPDB_POOL_MAX 4 = 40 <= 80
-apply worst case R2 -> R3: 40 <= 80
-deploy guard: session pipeline update
-
-== R4: Pointer mapping MaximumConcurrency 10 -> 20 (search resources stay, mapping disabled)
-inputs: {"searchIndex":true,"maxConcurrency":20,"searchQueue":{"enabled":true,"maxConcurrency":16}}
+== R3: Pointer mapping MaximumConcurrency 10 -> 20 (HOOPDB_POOL_MAX stays 3; search resources stay, mapping disabled)
+inputs: {"searchIndex":true,"maxConcurrency":20,"hoopdbPoolMax":3,"searchQueue":{"enabled":true,"maxConcurrency":16}}
 [session-events-mapping] update
     scalingConfig.MaximumConcurrency: 10 -> 20
 [session-pipeline] noop
@@ -203,8 +177,8 @@ inputs: {"searchIndex":true,"maxConcurrency":20,"searchQueue":{"enabled":true,"m
 [session-search-dlq] noop
 [session-search-dlq-alarm] noop
 [session-search-mapping] noop
-pooler demand: (pointer 20 + search 0 (search mapping disabled)) x HOOPDB_POOL_MAX 4 = 80 <= 80
-apply worst case R3 -> R4: 80 <= 80
+pooler demand: (pointer 20 + search 0 (search mapping disabled)) x HOOPDB_POOL_MAX 3 = 60 <= 80
+apply worst case R2 -> R3: 60 <= 80
 deploy guard: session pipeline update
 
 -- Refused shortcuts --
@@ -213,11 +187,11 @@ x Enable search before lowering the pointer cap (pointer 20 + search 16 at HOOPD
     target (pointer 20 + search 16) x HOOPDB_POOL_MAX 3 = 108 > 80
     apply worst case 108 > 80
     refused by the stack render (assertSessionPipelineInputs: over the budget)
-x Lower the pointer cap and enable search in one apply (from B1)
+x Lower the pointer cap and enable search in one apply (from A)
     target (pointer 10 + search 16) x HOOPDB_POOL_MAX 3 = 78 <= 80
     apply worst case 108 > 80
     refused by the deploy guard (the events and search mappings change in separate plans)
-x Lower the pool, lower the pointer cap and enable search in one apply (from A)
-    target (pointer 10 + search 16) x HOOPDB_POOL_MAX 3 = 78 <= 80
-    apply worst case 144 > 80
-    refused by the deploy guard (the events and search mappings change in separate plans; a function update comes with no mapping change)
+x Raise the pool back to 4 at the split's caps (pointer 10 + search 16)
+    target (pointer 10 + search 16) x HOOPDB_POOL_MAX 4 = 104 > 80
+    apply worst case 104 > 80
+    refused by the stack render (assertSessionPipelineInputs: over the budget)

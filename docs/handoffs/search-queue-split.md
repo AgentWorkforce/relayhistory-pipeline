@@ -49,7 +49,7 @@ Function env (rendered by the stack only with `searchQueue.handoff`):
 | --- | --- | --- |
 | `SESSION_PIPELINE_SEARCH_QUEUE_URL` | unset or empty | off (as before) |
 | | `https://sqs.<region>.<suffix>/<account>/<name>` | armed (see Startup) |
-| `HOOPDB_POOL_MAX` | `hoopdbPoolMax`, default 4 | Supabase connections per invocation |
+| `HOOPDB_POOL_MAX` | `hoopdbPoolMax` (required) | Supabase connections per invocation |
 
 Stage inputs (`transcriptStore.sessionPipeline`, `stacks/aws/session-pipeline.ts`):
 
@@ -64,8 +64,12 @@ Stage inputs (`transcriptStore.sessionPipeline`, `stacks/aws/session-pipeline.ts
 
 - `maxConcurrency`: the events (pointer) mapping, 2-20, default 4. 20 is representable so the
   live value renders unchanged.
-- `hoopdbPoolMax`: 1-4, default 4. Absent, the env is the live env (`HOOPDB_POOL_MAX: "4"`). The
-  rendered env and the budget check read this one value.
+- `hoopdbPoolMax`: 1-4, **required whenever `sessionPipeline` is declared** (the render is refused
+  without it). The live function's `HOOPDB_POOL_MAX` is 3, set by hand; before this input the stack
+  hard-coded 4, so any render that omitted it would put 4 back over the live 3. Requiring it (rather
+  than defaulting) is the option chosen; stages that declare no `sessionPipeline` render exactly as
+  before. The production stage input must carry `"hoopdbPoolMax": 3`. The rendered env and the
+  budget check read this one value.
 - `searchQueue.enabled`: creates `<prefix>-session-search`, `<prefix>-session-search-dlq`
   (14 days), the search mapping (created disabled), and two alarms (below). The queue keeps the
   events queue's visibility timeout, retention, long poll, SSE and redrive (`maxReceiveCount` 8),
@@ -80,8 +84,9 @@ Stage inputs (`transcriptStore.sessionPipeline`, `stacks/aws/session-pipeline.ts
     (pointer MaximumConcurrency + search MaximumConcurrency while polling) x HOOPDB_POOL_MAX <= 80
 
 The budget (`POOLER_BUDGET`) is fixed; there is no input to raise it. The render is refused above
-it. Production values: (10 + 16) x 3 = 78. At the live pool of 4 the same caps are 104 (refused);
-enabling search before lowering the pointer cap is (20 + 16) x 3 = 108 (refused).
+it. Live today: 20 x 3 = 60. Production split values: (10 + 16) x 3 = 78. The same caps at a pool
+of 4 are 104 (refused), so the pool is never raised back to 4 while the split is on; enabling
+search before lowering the pointer cap is (20 + 16) x 3 = 108 (refused).
 
 An apply moves resources one at a time, and warm instances keep the old pool until replaced, so
 any mix of old and new values can coexist: the worst moment is
@@ -98,33 +103,59 @@ next:
 
 | stage | change | guard phase | demand | worst during apply |
 | --- | --- | --- | --- | --- |
-| live | pointer 20, pool 4 | post-apply | 80 | |
-| A | `searchQueue: { enabled: true, maxConcurrency: 16 }`: queue, DLQ, policy, alarms, mapping DISABLED | session search queue rollout | 80 | 80 |
-| B1 | `hoopdbPoolMax: 3` (function env) | session pipeline update | 60 | 80 |
-| B2 | `maxConcurrency: 10` (events mapping) | session pipeline update | 30 | 60 |
+| live | pointer 20, pool 3 (hand-set) | post-apply | 60 | |
+| A | `searchQueue: { enabled: true, maxConcurrency: 16 }`: queue, DLQ, policy, alarms, mapping DISABLED | session search queue rollout | 60 | 60 |
+| B | `maxConcurrency: 10` (events mapping) | session pipeline update | 30 | 60 |
 | C1 | `mappingEnabled: true` (search mapping) | session pipeline update | 78 | 78 |
 | C2 | `handoff: true` (function env: URL) | session pipeline update | 78 | 78 |
 
-B and C are two captures each because the guard refuses a function update together with any
-mapping change (the role-ARN cascade rule), and the two mappings together (one capacity setting
-per apply). Lowering the pointer cap and enabling search in one apply could reach 108 (from B1)
-or 144 (from A). Apply B1 only after the live function shows `HOOPDB_POOL_MAX` 4 and the pointer
-mapping 20; apply C1 only after B2's mapping update has finished.
+C is two captures because the guard refuses a function update together with any mapping change
+(the role-ARN cascade rule), and the two mappings together (one capacity setting per apply).
+Lowering the pointer cap and enabling search in one apply could reach 108 (from A). Apply C1 only
+after B's mapping update has finished and the live mapping reads 10.
 
-Rollback (from C2), each step within the budget:
+Rollback (from C2), each step within the budget; the pool stays 3 throughout:
 
 | stage | change | demand | worst during apply |
 | --- | --- | --- | --- |
 | R1 | `handoff: false` (URL removed). Search runs inline on the pointer path again at once. | 78 | 78 |
 | R2 | `mappingEnabled: false`, once the search queue's visible and in-flight counts are 0 | 30 | 78 |
-| R3 | `hoopdbPoolMax` removed (back to 4) | 40 | 40 |
-| R4 | `maxConcurrency: 20` | 80 | 80 |
+| R3 | `maxConcurrency: 20` | 60 | 60 |
 
 R1 is the fast rollback. Leave the search mapping enabled after it: records still in the search
 queue drain through it. With the URL unset they are `queue: "other"`, take the ordinary path
 (pointer stage, idempotent, then search inline; a busy pass is a new pointer-queue message) and
-nothing acts on their receipt handles. The search resources stay (disabled) after R4; deleting
+nothing acts on their receipt handles. The search resources stay (disabled) after R3; deleting
 them is refused by the guard, as for every pipeline resource.
+
+## Hand-set function variables: the stack renders the full env
+
+This stack renders the pipeline function's **whole** environment. Alchemy's Lambda provider
+(`@alchemy.run/aws` `Lambda/Function.ts`) sends `Environment.Variables` as exactly the rendered
+env on every create and every `UpdateFunctionConfiguration`, so any function update replaces the
+live env and **drops every variable set by hand** that `sessionPipelineEnv` does not render. The
+plan does not show this: it diffs against Alchemy state (the last applied props), not the live
+function, so a hand-set variable is invisible in the capture.
+
+What `sessionPipelineEnv` renders (and so survives): the fixed ids, `SEARCH_INDEX_ENABLED`,
+`SEARCH_INDEX_STREAMING_CH` (`streamReconcile`), `HOOPDB_POOL_MAX` (`hoopdbPoolMax`, now required),
+`SESSION_PIPELINE_SEARCH_QUEUE_URL` (`searchQueue.handoff`), and the brief settings. What it does not
+render, so a function update would drop it if set by hand: `SEARCH_INDEX_SKIP_OVER_BOUND_ENABLED`,
+`SEARCH_INDEX_SKIP_ACCEPTANCE_MISSING_ENABLED`, `SESSION_POINTER_SKIP_ORIGIN_BUCKET_ENABLED`, and any
+other variable added by hand.
+
+Consequences for this rollout:
+
+- A, B, C1, R2 and R3 change only queues, mappings and alarms: the function's env is not touched.
+- C2 and R1 are function env updates. Before either is captured, read the live env back and
+  compare it with the rendered env; every hand-set variable must first become a stack input (or
+  the capture is not applied). This branch does not add inputs for the `SEARCH_INDEX_SKIP_*` or
+  `SESSION_POINTER_SKIP_*` flags.
+- Alchemy state still holds `HOOPDB_POOL_MAX: "4"` from the last apply if the 3 was set only by
+  hand. Then the first capture with `hoopdbPoolMax: 3` shows `session-pipeline` updating
+  `HOOPDB_POOL_MAX` "4" -> "3", and stage A's provisioning-only guard refuses it. That state
+  reconcile is its own capture before A (a session pipeline update: env only, live stays 3,
+  60 connections throughout), and it is a full env write, so the previous point applies to it too.
 
 ## Deploy guard (stacks/aws/transcript-store.ts)
 

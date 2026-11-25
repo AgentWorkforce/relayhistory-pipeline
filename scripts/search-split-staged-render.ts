@@ -40,45 +40,46 @@ export interface SearchSplitStage {
   phase: string;
 }
 
-/** The live shape this rollout starts from: search on, the pointer mapping at 20, HOOPDB_POOL_MAX 4 (20 x 4 = 80). */
-const LIVE: SessionPipelineInputs = { searchIndex: true, maxConcurrency: 20 };
+/**
+ * The live shape this rollout starts from: search on, the pointer mapping at 20, HOOPDB_POOL_MAX 3
+ * (set by hand on the function; 20 x 3 = 60). The pool is never raised back to 4, in either direction.
+ */
+const LIVE: SessionPipelineInputs = { searchIndex: true, maxConcurrency: 20, hoopdbPoolMax: 3 };
 const QUEUE = { enabled: true, maxConcurrency: 16 } as const;
 
 export const SEARCH_SPLIT_ROLLOUT: readonly SearchSplitStage[] = [
-  { id: "live", title: "Live before the split (pointer mapping 20, HOOPDB_POOL_MAX 4)", p: LIVE, phase: "post-apply" },
+  { id: "live", title: "Live before the split (pointer mapping 20, HOOPDB_POOL_MAX 3)", p: LIVE, phase: "post-apply" },
   { id: "A", title: "Provisioning only: search queue, DLQ, queue policy, alarms, search mapping created DISABLED", p: { ...LIVE, searchQueue: QUEUE }, phase: "session search queue rollout" },
-  { id: "B1", title: "HOOPDB_POOL_MAX 4 -> 3 (function env only)", p: { ...LIVE, hoopdbPoolMax: 3, searchQueue: QUEUE }, phase: "session pipeline update" },
-  { id: "B2", title: "Pointer mapping MaximumConcurrency 20 -> 10", p: { ...LIVE, maxConcurrency: 10, hoopdbPoolMax: 3, searchQueue: QUEUE }, phase: "session pipeline update" },
-  { id: "C1", title: "Search mapping enabled (MaximumConcurrency 16)", p: { ...LIVE, maxConcurrency: 10, hoopdbPoolMax: 3, searchQueue: { ...QUEUE, mappingEnabled: true } }, phase: "session pipeline update" },
-  { id: "C2", title: "Handoff on: SESSION_PIPELINE_SEARCH_QUEUE_URL set (function env only)", p: { ...LIVE, maxConcurrency: 10, hoopdbPoolMax: 3, searchQueue: { ...QUEUE, mappingEnabled: true, handoff: true } }, phase: "session pipeline update" },
+  { id: "B", title: "Pointer mapping MaximumConcurrency 20 -> 10", p: { ...LIVE, maxConcurrency: 10, searchQueue: QUEUE }, phase: "session pipeline update" },
+  { id: "C1", title: "Search mapping enabled (MaximumConcurrency 16)", p: { ...LIVE, maxConcurrency: 10, searchQueue: { ...QUEUE, mappingEnabled: true } }, phase: "session pipeline update" },
+  { id: "C2", title: "Handoff on: SESSION_PIPELINE_SEARCH_QUEUE_URL set (function env only)", p: { ...LIVE, maxConcurrency: 10, searchQueue: { ...QUEUE, mappingEnabled: true, handoff: true } }, phase: "session pipeline update" },
 ];
 
 export const SEARCH_SPLIT_ROLLBACK: readonly SearchSplitStage[] = [
-  { id: "R1", title: "Handoff off: SESSION_PIPELINE_SEARCH_QUEUE_URL removed; the search mapping keeps draining the search queue", p: { ...LIVE, maxConcurrency: 10, hoopdbPoolMax: 3, searchQueue: { ...QUEUE, mappingEnabled: true } }, phase: "session pipeline update" },
-  { id: "R2", title: "Search mapping disabled (once the search queue and its in-flight count are 0)", p: { ...LIVE, maxConcurrency: 10, hoopdbPoolMax: 3, searchQueue: QUEUE }, phase: "session pipeline update" },
-  { id: "R3", title: "HOOPDB_POOL_MAX 3 -> 4 (function env only)", p: { ...LIVE, maxConcurrency: 10, searchQueue: QUEUE }, phase: "session pipeline update" },
-  { id: "R4", title: "Pointer mapping MaximumConcurrency 10 -> 20 (search resources stay, mapping disabled)", p: { ...LIVE, searchQueue: QUEUE }, phase: "session pipeline update" },
+  { id: "R1", title: "Handoff off: SESSION_PIPELINE_SEARCH_QUEUE_URL removed; the search mapping keeps draining the search queue", p: { ...LIVE, maxConcurrency: 10, searchQueue: { ...QUEUE, mappingEnabled: true } }, phase: "session pipeline update" },
+  { id: "R2", title: "Search mapping disabled (once the search queue and its in-flight count are 0)", p: { ...LIVE, maxConcurrency: 10, searchQueue: QUEUE }, phase: "session pipeline update" },
+  { id: "R3", title: "Pointer mapping MaximumConcurrency 10 -> 20 (HOOPDB_POOL_MAX stays 3; search resources stay, mapping disabled)", p: { ...LIVE, searchQueue: QUEUE }, phase: "session pipeline update" },
 ];
 
 /** Shortcuts the stack or the guard refuses, with why (each is asserted in the stack tests). */
 export const SEARCH_SPLIT_REFUSED: readonly { title: string; from: SessionPipelineInputs; to: SessionPipelineInputs; refusedBy: string }[] = [
   {
     title: "Enable search before lowering the pointer cap (pointer 20 + search 16 at HOOPDB_POOL_MAX 3)",
-    from: SEARCH_SPLIT_ROLLOUT[2]!.p,
-    to: { ...SEARCH_SPLIT_ROLLOUT[2]!.p, searchQueue: { ...QUEUE, mappingEnabled: true } },
+    from: SEARCH_SPLIT_ROLLOUT[1]!.p,
+    to: { ...SEARCH_SPLIT_ROLLOUT[1]!.p, searchQueue: { ...QUEUE, mappingEnabled: true } },
     refusedBy: "the stack render (assertSessionPipelineInputs: over the budget)",
   },
   {
-    title: "Lower the pointer cap and enable search in one apply (from B1)",
-    from: SEARCH_SPLIT_ROLLOUT[2]!.p,
-    to: SEARCH_SPLIT_ROLLOUT[4]!.p,
+    title: "Lower the pointer cap and enable search in one apply (from A)",
+    from: SEARCH_SPLIT_ROLLOUT[1]!.p,
+    to: SEARCH_SPLIT_ROLLOUT[3]!.p,
     refusedBy: "the deploy guard (the events and search mappings change in separate plans)",
   },
   {
-    title: "Lower the pool, lower the pointer cap and enable search in one apply (from A)",
-    from: SEARCH_SPLIT_ROLLOUT[1]!.p,
-    to: SEARCH_SPLIT_ROLLOUT[4]!.p,
-    refusedBy: "the deploy guard (the events and search mappings change in separate plans; a function update comes with no mapping change)",
+    title: "Raise the pool back to 4 at the split's caps (pointer 10 + search 16)",
+    from: SEARCH_SPLIT_ROLLOUT[4]!.p,
+    to: { ...SEARCH_SPLIT_ROLLOUT[4]!.p, hoopdbPoolMax: 4 },
+    refusedBy: "the stack render (assertSessionPipelineInputs: over the budget)",
   },
 ];
 
@@ -167,6 +168,8 @@ export function renderSearchSplitStages(): string {
     "Search-queue split: staged render (placeholders only; scripts/search-split-staged-render.ts)",
     `Budget: ${POOLER_BUDGET} pooler connections, never raised. Each capture changes one capacity setting.`,
     "Resources not listed are noop in every stage (store, grants, schedules, other alarms).",
+    "Live HOOPDB_POOL_MAX is 3 (set by hand); hoopdbPoolMax: 3 is required in every stage and is never raised.",
+    "A function env update (C2, R1) replaces the function's whole env with the rendered one: see the doc, hand-set variables.",
     "",
   ];
   const forward = SEARCH_SPLIT_ROLLOUT;

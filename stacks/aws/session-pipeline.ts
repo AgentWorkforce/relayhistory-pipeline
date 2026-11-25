@@ -46,8 +46,9 @@ export interface SessionPipelineInputs {
   /** Lambda concurrency cap from the events (pointer) queue (2-20). Default 4. */
   maxConcurrency?: number;
   /**
-   * Supabase connections per invocation (HOOPDB_POOL_MAX, 1-4). Default 4, the value rendered before
-   * this input existed. Both the rendered env and the pool budget check use it.
+   * Supabase connections per invocation (HOOPDB_POOL_MAX, 1-4). Required whenever sessionPipeline is
+   * declared: the live function's value was set by hand (3), and a render that left it out would
+   * replace it with the old hard-coded 4. Both the rendered env and the pool budget check use it.
    */
   hoopdbPoolMax?: number;
   /** Reconcile cadence in minutes (15-120). Default 30; lookback is twice this. */
@@ -126,7 +127,10 @@ export const BRIEF_SCHEDULE_MINUTES = 1;
 /** Function timeout; the queue's visibility timeout is six times this (AWS guidance for SQS sources). */
 export const FUNCTION_TIMEOUT_SECONDS = 300;
 export const VISIBILITY_TIMEOUT_SECONDS = 6 * FUNCTION_TIMEOUT_SECONDS;
-/** HOOPDB_POOL_MAX when `hoopdbPoolMax` is absent: the value rendered before the input existed. */
+/**
+ * The upper bound of `hoopdbPoolMax`, and the value the pure helpers fall back to when called without
+ * it (tests). A stage render never falls back: assertSessionPipelineInputs requires the input.
+ */
 export const DEFAULT_HOOPDB_POOL_MAX = 4;
 /** Default MaximumConcurrency of the pointer and search mappings. */
 export const DEFAULT_POINTER_CONCURRENCY = 4;
@@ -221,7 +225,9 @@ export function assertSessionPipelineInputs(p: unknown, refuse: (why: string) =>
   if (v.searchIndex !== undefined && typeof v.searchIndex !== "boolean") refuse("transcriptStore.sessionPipeline.searchIndex must be a boolean");
   if (v.maxConcurrency !== undefined && !(Number.isInteger(v.maxConcurrency) && (v.maxConcurrency as number) >= 2 && (v.maxConcurrency as number) <= 20))
     refuse("transcriptStore.sessionPipeline.maxConcurrency must be an integer from 2 to 20");
-  if (v.hoopdbPoolMax !== undefined && !(Number.isInteger(v.hoopdbPoolMax) && (v.hoopdbPoolMax as number) >= 1 && (v.hoopdbPoolMax as number) <= DEFAULT_HOOPDB_POOL_MAX))
+  if (v.hoopdbPoolMax === undefined)
+    refuse("transcriptStore.sessionPipeline.hoopdbPoolMax is required: set the live HOOPDB_POOL_MAX (3), or the render resets the function to 4");
+  if (!(Number.isInteger(v.hoopdbPoolMax) && (v.hoopdbPoolMax as number) >= 1 && (v.hoopdbPoolMax as number) <= DEFAULT_HOOPDB_POOL_MAX))
     refuse(`transcriptStore.sessionPipeline.hoopdbPoolMax must be an integer from 1 to ${DEFAULT_HOOPDB_POOL_MAX}`);
   if (v.reconcileMinutes !== undefined && !(Number.isInteger(v.reconcileMinutes) && (v.reconcileMinutes as number) >= 15 && (v.reconcileMinutes as number) <= 120))
     refuse("transcriptStore.sessionPipeline.reconcileMinutes must be an integer from 15 to 120");

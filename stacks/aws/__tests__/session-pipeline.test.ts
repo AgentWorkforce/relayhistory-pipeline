@@ -46,6 +46,8 @@ const REGION = "us-east-1";
 const ROLE = `arn:aws:iam::${ACCOUNT}:role/session-pipeline-role`;
 const t = transcriptNames(STAGE, ACCOUNT);
 const p = sessionPipelineNames(STAGE, ACCOUNT, REGION);
+/** hoopdbPoolMax is required with any sessionPipeline: tests that are not about it carry the live 3. */
+const withPool = (v: unknown) => (v !== null && typeof v === "object" && !Array.isArray(v) && !("hoopdbPoolMax" in v) ? { hoopdbPoolMax: 3, ...v } : v);
 const example = JSON.parse(readFileSync(fileURLToPath(new URL("../examples/aws-sessions-prod.inputs.example.json", import.meta.url)), "utf8")) as AwsInputs;
 
 describe("session pipeline: grants", () => {
@@ -204,7 +206,7 @@ describe("session pipeline: not reachable from the internet", () => {
 
 describe("session pipeline: inputs", () => {
   const withPipeline = (sessionPipeline: unknown) =>
-    ({ ...example, transcriptStore: { ...example.transcriptStore, sessionPipeline } }) as unknown as AwsInputs & Record<string, unknown>;
+    ({ ...example, transcriptStore: { ...example.transcriptStore, sessionPipeline: withPool(sessionPipeline) } }) as unknown as AwsInputs & Record<string, unknown>;
   const validate = (i: AwsInputs & Record<string, unknown>) => assertTranscriptStoreInputs(STAGE, i);
   it("accepts the documented settings and refuses anything else", () => {
     expect(() => validate(withPipeline({ searchIndex: true, maxConcurrency: 4, reconcileMinutes: 30 }))).not.toThrow(/sessionPipeline/);
@@ -595,7 +597,7 @@ describe("session pipeline: streamed reconcile switch", () => {
   });
 
   it("validates the shape and needs searchIndex: true when enabled", () => {
-    const ok = (v: unknown) => assertSessionPipelineInputs(v, refuse);
+    const ok = (v: unknown) => assertSessionPipelineInputs(withPool(v), refuse);
     expect(() => ok({ searchIndex: true, streamReconcile: { enabled: true } })).not.toThrow();
     expect(() => ok({ streamReconcile: { enabled: false } })).not.toThrow();
     expect(() => ok({ streamReconcile: { enabled: true } })).toThrow(/requires searchIndex: true/);
@@ -618,7 +620,7 @@ describe("search-queue split: inputs, env and the pool budget", () => {
   const refuse = (why: string): never => {
     throw new Error(why);
   };
-  const ok = (v: unknown) => assertSessionPipelineInputs(v, refuse);
+  const ok = (v: unknown) => assertSessionPipelineInputs(withPool(v), refuse);
   const env = (pi: SessionPipelineInputs) => sessionPipelineEnv({ stage: STAGE, bucket: t.bucket, names: p, p: pi });
 
   it("without hoopdbPoolMax or a handoff the live env is rendered unchanged (HOOPDB_POOL_MAX 4, no search URL)", () => {
@@ -634,6 +636,23 @@ describe("search-queue split: inputs, env and the pool budget", () => {
     expect(on.SESSION_PIPELINE_SEARCH_QUEUE_URL).toBe(p.searchQueueUrl);
     expect(p.searchQueueUrl).toBe(`https://sqs.${REGION}.amazonaws.com/${ACCOUNT}/96bulls-${STAGE}-session-search`);
     expect(p.searchQueueUrl).not.toBe(p.queueUrl);
+  });
+
+  it("hoopdbPoolMax is required with any sessionPipeline, so no render silently puts 4 over the live 3", () => {
+    const raw = (v: unknown) => assertSessionPipelineInputs(v, refuse);
+    for (const v of [{}, { searchIndex: true, maxConcurrency: 20 }, { searchIndex: true, searchQueue: { enabled: true } }])
+      expect(() => raw(v)).toThrow(/hoopdbPoolMax is required: set the live HOOPDB_POOL_MAX \(3\), or the render resets the function to 4/);
+    // A stage that declares no pipeline is untouched.
+    expect(() => assertTranscriptStoreInputs(STAGE, example as unknown as Parameters<typeof assertTranscriptStoreInputs>[1])).not.toThrow(/hoopdbPoolMax/);
+    // The production-shaped stage: inputs validated as the stage does, then the function's props rendered from them.
+    const prod = { ...example, transcriptStore: { ...example.transcriptStore, sessionPipeline: { searchIndex: true, maxConcurrency: 20, hoopdbPoolMax: 3 } } } as unknown as AwsInputs & Record<string, unknown>;
+    expect(() => assertTranscriptStoreInputs(STAGE, prod as never)).not.toThrow(/sessionPipeline/);
+    const pipeline = (prod.transcriptStore as { sessionPipeline: SessionPipelineInputs }).sessionPipeline;
+    const fn = sessionPipelineFunctionProps({ stage: STAGE, accountId: ACCOUNT, region: REGION, bucket: t.bucket, p: pipeline, tags: () => ({}) });
+    expect(fn.env.HOOPDB_POOL_MAX).toBe("3");
+    for (const s of [...SEARCH_SPLIT_ROLLOUT, ...SEARCH_SPLIT_ROLLBACK])
+      expect([s.id, sessionPipelineFunctionProps({ stage: STAGE, accountId: ACCOUNT, region: REGION, bucket: t.bucket, p: s.p, tags: () => ({}) }).env.HOOPDB_POOL_MAX]).toEqual([s.id, "3"]);
+    expect(() => raw({ maxConcurrency: 20 })).toThrow(/hoopdbPoolMax is required/);
   });
 
   it("validates the shape: handoff needs mappingEnabled and searchIndex; mappingEnabled needs enabled; concurrency 2-20; pool 1-4", () => {
@@ -656,16 +675,17 @@ describe("search-queue split: inputs, env and the pool budget", () => {
 
   it("(pointer + polling search) x HOOPDB_POOL_MAX <= 80: exact production values 10 + 16 at 3 are 78; at 4 they are 104 and refused", () => {
     expect(POOLER_BUDGET).toBe(80);
-    const split = (pool?: number, pointer = 10) => ({ searchIndex: true, maxConcurrency: pointer, ...(pool ? { hoopdbPoolMax: pool } : {}), searchQueue: { enabled: true, mappingEnabled: true, handoff: true, maxConcurrency: 16 } });
+    const split = (pool: number, pointer = 10) => ({ searchIndex: true, maxConcurrency: pointer, hoopdbPoolMax: pool, searchQueue: { enabled: true, mappingEnabled: true, handoff: true, maxConcurrency: 16 } });
     expect(sessionPoolDemand(split(3))).toBe(78);
     expect(() => ok(split(3))).not.toThrow();
-    expect(sessionPoolDemand(split())).toBe(104);
-    expect(() => ok(split())).toThrow(/\(maxConcurrency 10 \+ polling searchQueue.maxConcurrency 16\) x hoopdbPoolMax 4 is 104 pooler connections, over the budget of 80/);
+    expect(sessionPoolDemand(split(4))).toBe(104);
+    expect(() => ok(split(4))).toThrow(/\(maxConcurrency 10 \+ polling searchQueue.maxConcurrency 16\) x hoopdbPoolMax 4 is 104 pooler connections, over the budget of 80/);
     // Enabling search before lowering the pointer cap: 20 + 16 at 3 is 108.
     expect(() => ok(split(3, 20))).toThrow(/is 108 pooler connections/);
-    // Live: the pointer mapping alone at 20 x 4 = 80; a created but disabled search mapping holds nothing.
-    expect(sessionPoolDemand({ maxConcurrency: 20 })).toBe(80);
-    expect(sessionPoolDemand({ maxConcurrency: 20, searchQueue: { enabled: true, maxConcurrency: 16 } })).toBe(80);
+    // Live: the pointer mapping alone at 20 x 3 = 60; a created but disabled search mapping holds nothing.
+    expect(sessionPoolDemand({ maxConcurrency: 20, hoopdbPoolMax: 3 })).toBe(60);
+    expect(sessionPoolDemand({ maxConcurrency: 20, hoopdbPoolMax: 3, searchQueue: { enabled: true, maxConcurrency: 16 } })).toBe(60);
+    expect(sessionPoolDemand({ maxConcurrency: 20, hoopdbPoolMax: 4 })).toBe(80);
     expect(() => ok({ maxConcurrency: 20, searchQueue: { enabled: true, maxConcurrency: 16 } })).not.toThrow();
     expect(sessionPoolDemand({})).toBe(16);
   });
@@ -702,10 +722,13 @@ describe("search-queue split: inputs, env and the pool budget", () => {
     }
     const chain = [...SEARCH_SPLIT_ROLLOUT, ...SEARCH_SPLIT_ROLLBACK];
     const worst = chain.slice(1).map((s, n) => [`${chain[n]!.id}->${s.id}`, sessionPoolTransitionDemand(chain[n]!.p, s.p)]);
-    expect(worst).toEqual([["live->A", 80], ["A->B1", 80], ["B1->B2", 60], ["B2->C1", 78], ["C1->C2", 78], ["C2->R1", 78], ["R1->R2", 78], ["R2->R3", 40], ["R3->R4", 80]]);
+    expect(worst).toEqual([["live->A", 60], ["A->B", 60], ["B->C1", 78], ["C1->C2", 78], ["C2->R1", 78], ["R1->R2", 78], ["R2->R3", 60]]);
+    // The pool is 3 in every stage: never raised back to 4.
+    expect(chain.map((s) => s.p.hoopdbPoolMax)).toEqual(chain.map(() => 3));
     expect(sessionPoolDemand(SEARCH_SPLIT_ROLLOUT.at(-1)!.p)).toBe(78);
-    expect(SEARCH_SPLIT_REFUSED.map((r) => sessionPoolTransitionDemand(r.from, r.to))).toEqual([108, 108, 144]);
+    expect(SEARCH_SPLIT_REFUSED.map((r) => sessionPoolTransitionDemand(r.from, r.to))).toEqual([108, 108, 104]);
     expect(() => ok(SEARCH_SPLIT_REFUSED[0]!.to)).toThrow(/108 pooler connections/);
+    expect(() => ok(SEARCH_SPLIT_REFUSED[2]!.to)).toThrow(/104 pooler connections/);
   });
 
   it("the checked-in staged render is the script's output, and it carries placeholders only", () => {
@@ -914,14 +937,12 @@ describe("search-queue split: the deploy plan contract", () => {
   it("each staged capture is judged as the staged render says", () => {
     const blocks: Record<string, Record<string, { action: string; body: string[] }>> = {
       A: creates(),
-      B1: { "session-pipeline": envChange(['  -     HOOPDB_POOL_MAX: "4"', '  +     HOOPDB_POOL_MAX: "3"']), "session-search": searchCascade() },
-      B2: { "session-events-mapping": { action: "update", body: change(["scalingConfig"], "MaximumConcurrency", "20", "10") } },
+      B: { "session-events-mapping": { action: "update", body: change(["scalingConfig"], "MaximumConcurrency", "20", "10") } },
       C1: { "session-search-mapping": { action: "update", body: change([], "enabled", "false", "true") } },
       C2: { "session-pipeline": envChange([`  +     SESSION_PIPELINE_SEARCH_QUEUE_URL: ${p.searchQueueUrl}`]), "session-search": searchCascade() },
       R1: { "session-pipeline": envChange([`  -     SESSION_PIPELINE_SEARCH_QUEUE_URL: ${p.searchQueueUrl}`]), "session-search": searchCascade() },
       R2: { "session-search-mapping": { action: "update", body: change([], "enabled", "true", "false") } },
-      R3: { "session-pipeline": envChange(['  -     HOOPDB_POOL_MAX: "3"', '  +     HOOPDB_POOL_MAX: "4"']), "session-search": searchCascade() },
-      R4: { "session-events-mapping": { action: "update", body: change(["scalingConfig"], "MaximumConcurrency", "10", "20") } },
+      R3: { "session-events-mapping": { action: "update", body: change(["scalingConfig"], "MaximumConcurrency", "10", "20") } },
     };
     for (const s of [...SEARCH_SPLIT_ROLLOUT.slice(1), ...SEARCH_SPLIT_ROLLBACK]) {
       const b = blocks[s.id]!;
