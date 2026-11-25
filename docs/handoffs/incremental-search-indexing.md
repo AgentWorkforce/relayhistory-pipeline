@@ -727,7 +727,9 @@ alone can never turn them green. One wiring test asserts that the Lambda consume
 Immutability is VERIFIED, not assumed. Each manifest chunk already carries `seq`, `epoch`, `start_offset` and the
 content `sha256` (`packages/object-store/src/manifest.ts:53-62`).
 
-- **Watermark:** `sessions.search_batch_watermark` (scope, canonical, manifest_key, last_seq, chain_digest), where
+- **Watermark:** the code-only proposal `supabase/proposals/incremental-search` has an owner-only
+  `sessions.search_scope_watermark_versions` row and `sessions.search_batch_watermarks` children
+  `(scope, manifest_key, last_seq, chain_digest)`, where
   `chain_digest_n = sha256(chain_digest_{n-1} ‖ seq_n ‖ epoch_n ‖ start_offset_n ‖ sha256_n)`.
   Content is bound, not just ids.
 - **Exact chain encoding:** `chain_digest_(-1)` is 32 zero bytes. Every integer is an unsigned 64-bit big-endian
@@ -738,7 +740,11 @@ content `sha256` (`packages/object-store/src/manifest.ts:53-62`).
   the stored digest. If they are equal, those chunks are byte-identical in content and order, and only chunks with
   `seq > last_seq` are read and upserted. If they differ, the chunks were mutated, compacted, rewritten or
   re-epoched: do a full pass and reset the watermark.
-- **CAS:** `UPDATE … WHERE last_seq = $old_seq AND chain_digest = $old_digest`. A lost CAS retries the pass.
+- **CAS:** the proposed `read_search_batch_watermarks_v1` / `cas_search_batch_watermarks_v1` runtime boundary
+  compares a monotonic scope version and the complete canonical watermark set, then replaces all siblings in one
+  transaction. The version prevents an ABA (`A -> B -> A`) set from admitting a stale writer. A lost CAS re-reads
+  and replans; it never overwrites the winner. The proposal is outside the migration chain and has no production
+  effect until it receives a slot and separate apply/grant/deploy/flag approvals.
 - **Canonical scopes with siblings:** the live manifest-key set must equal the watermark-key set and every sibling
   must prove its recorded prefix. A new, removed, duplicated or mutated sibling selects one full scope pass. When
   the sets match, only siblings with appended chunks are read; the complete new watermark set commits in one CAS.

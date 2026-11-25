@@ -1,12 +1,13 @@
 import { describe, expect, test } from "bun:test";
 import {
   commitSearchScopeWatermarksCas,
-  commitSearchWatermarkCas,
+  canonicalSearchWatermarks,
   planSearchIncrementalApply,
   planSearchScopeIncrementalApply,
   searchChunkChain,
   type SearchBatchWatermark,
   type SearchChainChunk,
+  type SearchScopeWatermarkSnapshot,
 } from "../search-incremental.ts";
 
 const hash = (digit: string) => digit.repeat(64);
@@ -62,13 +63,6 @@ describe("M3 search chunk watermark", () => {
       .toEqual({ mode: "full", reason: "missing_watermark" });
     expect(planSearchIncrementalApply({ manifestKey: watermark(0).manifestKey, chunks: [{ ...chunks[0]!, seq: 2 }], watermark: watermark(0) }))
       .toEqual({ mode: "full", reason: "invalid_chunks" });
-  });
-
-  test("a lost CAS asks the caller to re-read instead of overwriting the winner", async () => {
-    const expected = watermark(1);
-    const next = watermark(2);
-    expect(await commitSearchWatermarkCas({ expected, next, compareAndSet: async () => false })).toBe("retry");
-    expect(await commitSearchWatermarkCas({ expected, next, compareAndSet: async (old, value) => old === expected && value === next })).toBe("committed");
   });
 
   test("a multi-manifest scope reads only siblings with appended chunks", () => {
@@ -133,10 +127,33 @@ describe("M3 search chunk watermark", () => {
     }
   });
 
-  test("scope CAS never overwrites a winner", async () => {
-    const expected = [{ ...watermark(1), manifestKey: "a" }];
+  test("scope CAS canonicalizes the complete set and never overwrites a winner", async () => {
+    const expected: SearchScopeWatermarkSnapshot = { version: 7, watermarks: [{ ...watermark(1), manifestKey: "b" }, { ...watermark(1), manifestKey: "a" }] };
     const next = [{ ...watermark(2), manifestKey: "a" }];
-    expect(await commitSearchScopeWatermarksCas({ expected, next, compareAndSet: async () => false })).toBe("retry");
-    expect(await commitSearchScopeWatermarksCas({ expected, next, compareAndSet: async (old, value) => old === expected && value === next })).toBe("committed");
+    expect(await commitSearchScopeWatermarksCas({ expected, next, compareAndSet: async () => null })).toEqual({ status: "retry" });
+    expect(await commitSearchScopeWatermarksCas({
+      expected,
+      next,
+      compareAndSet: async (old, value) => {
+        expect(old).toEqual({ version: 7, watermarks: [
+          { ...watermark(1), manifestKey: "a" },
+          { ...watermark(1), manifestKey: "b" },
+        ] });
+        expect(value).toEqual(next);
+        return { version: 8, watermarks: value.slice().reverse() };
+      },
+    })).toEqual({ status: "committed", snapshot: { version: 8, watermarks: next } });
+  });
+
+  test("scope CAS rejects malformed evidence before reaching storage", async () => {
+    let called = false;
+    const compareAndSet = async () => { called = true; return null; };
+    await expect(commitSearchScopeWatermarksCas({
+      expected: { version: 0, watermarks: [] },
+      next: [{ ...watermark(1), manifestKey: "same" }, { ...watermark(2), manifestKey: "same" }],
+      compareAndSet,
+    })).rejects.toThrow("unique and valid");
+    expect(called).toBe(false);
+    expect(canonicalSearchWatermarks([{ ...watermark(1), chainDigest: "BAD" }])).toBeNull();
   });
 });
