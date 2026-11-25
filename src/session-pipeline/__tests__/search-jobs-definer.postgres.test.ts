@@ -221,16 +221,50 @@ describe.skipIf(!url)("062300 runtime boundary: a genuine unprivileged login (re
       const backlog = async () => Number((await owner.query<{ n: string }>(
         `SELECT count(*) AS n FROM sessions.pipeline_jobs x WHERE x.stage = 'search-index' AND x.lease_id IS NULL
             AND NOT EXISTS (SELECT 1 FROM sessions.search_job_contention k WHERE k.job_id = x.id AND k.held_at IS NOT NULL)`)).rows[0]!.n);
-      let enqueued = 0, minBacklog = Infinity, backlogAtLastProbe = -1;
-      for (let n = 0; n < 60; n++) await enqueueSearchWake(owner, wake({ ...scope, sessionId: `s_ord_${enqueued++}` }, 1));
+      /**
+       * Host-speed-invariant load: ONE statement samples the ordinary backlog and tops it up to WATERMARK, returning
+       * the backlog seen before the top-up (the drain evidence: it must never reach 0) and after it, in one snapshot.
+       * The rows are valid §2 wakes (owner-written, as the writer would).
+       */
+      const WATERMARK = 2_000;
+      let enqueued = 0;
+      const samples: Array<{ before: number; after: number }> = [];
+      const replenish = async () => {
+        const r = (await owner.query<{ before: string; added: string }>(
+          `WITH cur AS (
+             SELECT count(*) AS n FROM sessions.pipeline_jobs x WHERE x.stage = 'search-index' AND x.lease_id IS NULL
+                AND NOT EXISTS (SELECT 1 FROM sessions.search_job_contention k WHERE k.job_id = x.id AND k.held_at IS NOT NULL)
+           ), rows AS (
+             SELECT 's_ord_' || g AS sid, gen_random_uuid() AS t
+               FROM generate_series($1::bigint, $1::bigint + greatest(0, $2::bigint - (SELECT n FROM cur)) - 1) g
+           ), ins AS (
+             INSERT INTO sessions.pipeline_jobs (stage, work_key, trace_id, org_id, workspace_id, session_id, message, visible_at)
+             SELECT 'search-index', concat_ws(chr(31), 'search', $3::text, $4::text, 'claude', sid), t, $3, $4, sid,
+                    jsonb_build_object('v', 1, 'stage', 'search-index', 'revision', 1,
+                      'workKey', concat_ws(chr(31), 'search', $3::text, $4::text, 'claude', sid),
+                      'ctx', jsonb_build_object('traceId', t, 'orgId', $3::text, 'workspaceId', $4::text, 'harness', 'claude', 'sessionId', sid),
+                      'payload', jsonb_build_object('epoch', 1, 'clock', jsonb_build_object('source', 'pointer', 'at', '2026-11-01T10:00:00.000Z'))),
+                    now()
+               FROM rows
+             RETURNING 1)
+           SELECT (SELECT n FROM cur) AS before, (SELECT count(*) FROM ins) AS added`,
+          [enqueued, WATERMARK, scope.orgId, scope.workspaceId])).rows[0]!;
+        const before = Number(r.before), added = Number(r.added);
+        enqueued += added;
+        samples.push({ before, after: before + added });
+        return before + added;
+      };
+      let backlogAtLastProbe = -1;
+      // Preseed to the watermark (far above a window's per-poll demand on any host), then keep it there.
+      await replenish();
+      // The preseed's own pre-top-up sample is the empty start, not a window sample.
+      samples.length = 0;
       const started = Date.now();
       const live = () => Date.now() - started < WINDOW_MS;
       // The producer keeps ordinary work continuously ready for the whole window (no stop-and-drain).
       const producer = (async () => {
         while (live()) {
-          const b = await backlog();
-          minBacklog = Math.min(minBacklog, b);
-          if (b < 60) for (let n = 0; n < 30; n++) await enqueueSearchWake(owner, wake({ ...scope, sessionId: `s_ord_${enqueued++}` }, 1));
+          await replenish();
           await Bun.sleep(10);
         }
       })();
@@ -267,12 +301,16 @@ describe.skipIf(!url)("062300 runtime boundary: a genuine unprivileged login (re
         `SELECT attrs->>'work_key' AS key, (extract(epoch FROM (attrs->>'admitted_at')::timestamptz) * 1000)::float8 AS at,
                 idempotency_key AS lease_key FROM sessions.pipeline_events
           WHERE stage = 'search-index' AND error->>'code' = 'scope_contention_probe'`)).rows.map((r) => ({ key: r.key, at: Number(r.at), leaseKey: r.lease_key }));
-      return { owner, tally, ordinary, perSecond: ordinary / seconds, seconds, probes, heldKeys, due: due[0], minBacklog, backlogAtLastProbe, enqueued };
+      const minBacklog = Math.min(...samples.map((x) => x.before));
+      return { owner, tally, ordinary, perSecond: ordinary / seconds, seconds, probes, heldKeys, due: due[0], minBacklog, backlogAtLastProbe, enqueued, samples };
     }
 
     const control = await run(0);
     expect(control.probes).toEqual([]);
+    // Ordinary work was ready at EVERY sample, before each top-up, in the control window too.
+    expect(control.samples.every((x) => x.before > 0 && x.after >= 2_000)).toBe(true);
     const loaded = await run(52);
+    expect(loaded.samples.every((x) => x.before > 0 && x.after >= 2_000)).toBe(true);
     // Ordinary throughput under sustained load keeps >= 90% of the control's.
     expect(loaded.perSecond).toBeGreaterThanOrEqual(0.9 * control.perSecond);
     // Every held scope was probed once (one durable event per admitted probe) and recovered; nothing parked.
@@ -295,7 +333,7 @@ describe.skipIf(!url)("062300 runtime boundary: a genuine unprivileged login (re
     const maxWaitMs = t.at(-1)! - loaded.due!;
     expect(maxWaitMs).toBeLessThanOrEqual(deadlineMs);
     const receipt = (r: typeof control) => ({ ordinaryPerSecond: Number(r.perSecond.toFixed(1)), ordinary: r.ordinary, seconds: Number(r.seconds.toFixed(1)),
-      sqs: r.tally.sqs, scheduled: r.tally.scheduled, minBacklog: r.minBacklog });
+      sqs: r.tally.sqs, scheduled: r.tally.scheduled, minBacklog: r.minBacklog, samples: r.samples.length });
     console.log(JSON.stringify({ sustainedThroughput: {
       setup: { claimers: "3 SQS-style + 1 scheduled-style, K = 3, 200 ms invocation budget, 20 ms between invocations", R, C, windowS: WINDOW_MS / 1000 },
       control: receipt(control), loaded: { ...receipt(loaded), heldScopes: 52, distinctProbed: new Set(loaded.probes.map((p) => p.key)).size,
