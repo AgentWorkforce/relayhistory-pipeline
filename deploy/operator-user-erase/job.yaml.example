@@ -1,0 +1,76 @@
+# Review template. Separate approval is required for a real job.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  generateName: operator-user-erase-
+  namespace: "<approved-runner-namespace>"
+spec:
+  suspend: true
+  completions: 1
+  parallelism: 1
+  backoffLimit: 0
+  template:
+    spec:
+      restartPolicy: Never
+      serviceAccountName: "<approved-eraser-service-account>"
+      automountServiceAccountToken: false
+      containers:
+        - name: user-erase
+          image: "<reviewed-services-image>@sha256:<digest>"
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          env:
+            - name: SERVICE
+              value: user-erase
+            - name: OPERATOR_USER_ERASE_ENABLED
+              value: "0"
+            - name: OPERATOR_USER_ERASE_REQUEST_FILE
+              value: /run/user-erase/request/request.json
+            - name: OPERATOR_USER_ERASE_DATABASE_URL_FILE
+              value: /run/user-erase/owner/url
+            - name: SESSION_ERASE_S3_ACCESS_KEY_ID_FILE
+              value: /run/user-erase/sts/access-key-id
+            - name: SESSION_ERASE_S3_SECRET_ACCESS_KEY_FILE
+              value: /run/user-erase/sts/secret-access-key
+            - name: SESSION_ERASE_S3_SESSION_TOKEN_FILE
+              value: /run/user-erase/sts/session-token
+            - name: SESSION_ERASE_S3_BUCKET
+              value: "<writer-transcript-bucket>"
+            - name: SESSION_ERASE_S3_REGION
+              value: "<writer-region>"
+            - name: SESSION_ERASE_KEY_ROOT
+              value: "<writer-key-root>"
+            - name: SUMMARY_DECISION_RECORDS_ENABLED
+              value: "true"
+          volumeMounts:
+            - name: sts
+              mountPath: /run/user-erase/sts
+              readOnly: true
+            - name: request
+              mountPath: /run/user-erase/request
+              readOnly: true
+            - name: owner
+              mountPath: /run/user-erase/owner
+              readOnly: true
+      volumes:
+        - name: sts
+          csi:
+            driver: "<approved-runtime-credential-provider>"
+            readOnly: true
+            volumeAttributes:
+              secretProviderClass: "<request-scoped-temporary-credentials>"
+        - name: request
+          secret:
+            secretName: "<approved-single-request-secret>"
+            items:
+              - key: request.json
+                path: request.json
+        - name: owner
+          secret:
+            secretName: "<approved-owner-url-secret>"
+            items:
+              - key: url
+                path: url

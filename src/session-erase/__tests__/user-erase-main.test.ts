@@ -117,6 +117,15 @@ describe("user-erase relayfacts step (20261105062100, SUMMARY_DECISION_RECORDS_E
   const run = (env: Record<string, string | undefined>, db: ReturnType<typeof fakeDb>, logs: Record<string, unknown>[] = []) =>
     runUserEraseMain(env, () => JSON.stringify(good), { db, eraser, log: (e) => logs.push(e) });
 
+  test("S3 dry-run refuses before request, store or SQL access", async () => {
+    const db = fakeDb();
+    const unexpected = (): never => { throw new Error("unexpected access"); };
+    await expect(runUserEraseMain({ ...ENV, SESSION_ERASE_DRY_RUN: "1" }, unexpected, {
+      eraser: unexpected, db,
+    })).rejects.toThrow("dry_run_unsupported");
+    expect(db.seen).toEqual([]);
+  });
+
   test("flag: exactly \"true\" enables; unset, \"1\", \"TRUE\" and empty are off", () => {
     expect(relayfactsUserEraseEnabled({})).toBe(false);
     for (const v of ["1", "TRUE", "", "yes", " true"]) expect(relayfactsUserEraseEnabled({ SUMMARY_DECISION_RECORDS_ENABLED: v })).toBe(false);

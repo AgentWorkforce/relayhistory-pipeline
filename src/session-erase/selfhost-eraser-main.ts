@@ -9,6 +9,7 @@
  *   SESSION_ERASE_S3_ENDPOINT                bare origin (MinIO etc.); unset = AWS S3. https, or
  *                                            loopback / ALLOW_IN_CLUSTER_HTTP Service http
  *   SESSION_ERASE_S3_ACCESS_KEY_ID[_FILE]    exactly one of the pair; the ERASER key
+ *   SESSION_ERASE_S3_SESSION_TOKEN_FILE     optional mounted STS session token
  *   SESSION_ERASE_S3_SECRET_ACCESS_KEY[_FILE] (ListBucketVersions + DeleteObjectVersion only)
  *   SESSION_ERASE_KEY_ROOT                   object key root, default "96bulls" (= INGEST_KEY_ROOT)
  *   SESSION_ERASE_DRY_RUN                    "1": list and count only
@@ -146,7 +147,11 @@ function secret(env: NodeJS.ProcessEnv, name: string): string {
 export function sessionEraseCredentials(env: NodeJS.ProcessEnv): S3EraserConfig["credentials"] {
   const accessKeyId = secret(env, "SESSION_ERASE_S3_ACCESS_KEY_ID"), secretAccessKey = secret(env, "SESSION_ERASE_S3_SECRET_ACCESS_KEY");
   if (!/^[A-Za-z0-9._~+=-]{3,128}$/.test(accessKeyId) || secretAccessKey.length < 8 || secretAccessKey.length > 256 || /\s/.test(secretAccessKey)) refuse("secret_invalid");
-  return { accessKeyId, secretAccessKey };
+  if (env.SESSION_ERASE_S3_SESSION_TOKEN !== undefined) refuse("secret_invalid");
+  if (env.SESSION_ERASE_S3_SESSION_TOKEN_FILE === undefined) return { accessKeyId, secretAccessKey };
+  const sessionToken = secret(env, "SESSION_ERASE_S3_SESSION_TOKEN");
+  if (sessionToken.length > MAX_SECRET_FILE || /[^!-~]/.test(sessionToken)) refuse("secret_invalid");
+  return { accessKeyId, secretAccessKey, sessionToken };
 }
 
 export function parseRequest(text: string): SessionEraseBytesRequest {

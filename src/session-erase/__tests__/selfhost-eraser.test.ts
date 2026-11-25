@@ -5,13 +5,17 @@
  * listing; prefix allow-list refusals; dry run; default-off entry; idempotence.
  */
 import { describe, expect, test } from "bun:test";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { createS3Eraser } from "../../migration/neon-s3-erasure/eraser.ts";
 import { FakeS3Versions } from "../../migration/__tests__/fake-s3-versions.ts";
 import { STAGED_ERASE_AFTER_MS } from "../../migration/neon-s3-erasure/job.ts";
 import { liveMachineId } from "../../session-ingest/writer.ts";
 import { legacyMachineId } from "../../shared/legacy-export-machine.ts";
 import { stagedKey } from "../../session-ingest/staging.ts";
 import { assertAllowed, eraseDiscoveredSessionBytes, eraseSessionBytes, planDiscoveryTargets, planTargets, STAGED_MIN_AGE_MS, SessionEraseRefused, type SessionEraseBytesRequest } from "../selfhost-eraser.ts";
-import { exitCodeForError, exitCodeForResult, requestPathFrom, runSessionEraseBytes, sessionEraseBytesEnabled } from "../selfhost-eraser-main.ts";
+import { exitCodeForError, exitCodeForResult, requestPathFrom, runSessionEraseBytes, sessionEraseBytesEnabled, sessionEraseCredentials } from "../selfhost-eraser-main.ts";
 
 const ROOT = "96bulls", ORG = "org-a", WS = "ws-1", SRC = "claude-code", SID = "sess:one/a";
 const SEG = "sess_one_a"; // layoutComponent(SID)
@@ -349,6 +353,44 @@ describe("never deletes outside the computed prefixes", () => {
 
 describe("process entry (default off)", () => {
   const ENV = { SESSION_ERASE_S3_BUCKET: "bkt", SESSION_ERASE_S3_REGION: "us-east-1", SESSION_ERASE_S3_ENDPOINT: "http://127.0.0.1:9000", SESSION_ERASE_S3_ACCESS_KEY_ID: "erase-key", SESSION_ERASE_S3_SECRET_ACCESS_KEY: "erase-secret-x" };
+
+  test("mounted temporary credentials sign list and delete, and expired credentials fail closed", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "erase-test-"));
+    const file = join(dir, "fixture");
+    const env = { ...ENV, SESSION_ERASE_S3_SESSION_TOKEN_FILE: file };
+    try {
+      expect(() => sessionEraseCredentials({ ...ENV, SESSION_ERASE_S3_SESSION_TOKEN: "fixture" })).toThrow("secret_invalid");
+      for (const invalid of ["", "two words", "one\ntwo", "x".repeat(65537)]) {
+        writeFileSync(file, invalid);
+        expect(() => sessionEraseCredentials(env)).toThrow();
+      }
+      writeFileSync(file, "synthetic+/=\n");
+      const store = new FakeS3Versions();
+      store.put("prefix/item");
+      const methods: string[] = [];
+      let expired = false;
+      const eraser = createS3Eraser({
+        bucket: "b", region: "us-east-1", endpoint: "http://localhost", credentials: sessionEraseCredentials(env),
+        fetch: (async (input, init) => {
+          const headers = new Headers(init?.headers);
+          expect(headers.get("x-amz-security-token")).toBe("synthetic+/=");
+          expect(headers.get("authorization")).toMatch(/SignedHeaders=[^,]*x-amz-security-token/);
+          methods.push(init!.method!);
+          if (expired && init?.method === "DELETE") return new Response(null, { status: 403 });
+          return store.fetch(input, init);
+        }) as typeof fetch,
+      });
+      expired = true;
+      await expect(eraser.erasePrefix("prefix/")).rejects.toMatchObject({ code: "s3_403" });
+      expect(store.count()).toBe(1);
+      expired = false;
+      expect(await eraser.erasePrefix("prefix/")).toBe(1);
+      expect(methods).toContain("GET");
+      expect(methods).toContain("DELETE");
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
 
   test("flag unset, empty or 0 returns disabled without reading the request or touching the store", async () => {
     for (const flag of [undefined, "", "0"]) {

@@ -15,7 +15,9 @@ import { liveMachineId } from "../../migration/neon-s3-erasure/live.ts";
 import { legacyMachineId } from "../../shared/legacy-export-machine.ts";
 import { objectKey } from "../../shared/vendor.ts";
 import { RelayfactsEraseFailed, relayfactsUserEraseApplied, runUserErase, sqlUserEraseRelayfacts, UserEraseRefused, type UserEraseDb } from "../user-erase.ts";
-import { exitCodeForError } from "../user-erase-main.ts";
+import { FakeS3Versions } from "../../migration/__tests__/fake-s3-versions.ts";
+import { CONFIRMATION } from "../user-erase.ts";
+import { runUserEraseMain, exitCodeForError } from "../user-erase-main.ts";
 
 setDefaultTimeout(300_000);
 const open: Array<() => unknown> = [];
@@ -748,6 +750,61 @@ describe("operator per-user erase: relayfacts pre-begin step (062100)", () => {
   });
   const evidence = async (f: Fixture) => (await f.db.query<{ s: string }>(
     "SELECT session_id s FROM sessions.relayfacts_evidence_v1 ORDER BY 1")).rows.map((r) => r.s);
+
+  const foreign = { ...ALICE, orgId: "other-org", workspaceId: "other-workspace" };
+  function hostedRun(f: Fixture, versions: FakeS3Versions, log = (_event: Record<string, unknown>) => {}) {
+    return runUserEraseMain({
+      OPERATOR_USER_ERASE_ENABLED: "1", OPERATOR_USER_ERASE_SETTLE_MS: "0", SUMMARY_DECISION_RECORDS_ENABLED: "true",
+      SESSION_ERASE_S3_BUCKET: "bkt", SESSION_ERASE_S3_REGION: "us-east-1",
+      SESSION_ERASE_S3_ACCESS_KEY_ID: "erase-key", SESSION_ERASE_S3_SECRET_ACCESS_KEY: "erase-secret-x",
+    }, () => JSON.stringify({ request_id: "hosted-request", org_id: ALICE.orgId, workspace_id: ALICE.workspaceId,
+      user_id: ALICE.userId, confirmation: CONFIRMATION }), { db: pgDb(f), eraser: () => versions.eraser(), log });
+  }
+
+  test("hosted entry erases buffered metadata and object versions once across overlapping tenant identifiers", async () => {
+    const f = await fixture(), versions = new FakeS3Versions();
+    const batchRows = async (tenant: Tenant) => (await f.db.query(
+      "SELECT * FROM sessions.ingest_batches WHERE org_id=$1 AND workspace_id=$2 AND user_id=$3",
+      [tenant.orgId, tenant.workspaceId, tenant.userId])).rows;
+    for (const tenant of [ALICE, foreign]) await deliver(f, tenant, "shared-batch", 1);
+    expect(await batchRows(ALICE)).toHaveLength(1);
+    const foreignRows = await batchRows(foreign);
+    expect(foreignRows).toHaveLength(1);
+    const keys = await storeKeys(f);
+    expect(keys).toHaveLength(2);
+    for (const key of keys) {
+      versions.put(key, 1);
+      versions.put(key, 2);
+    }
+    const other = keys.find(k => k.startsWith(`96bulls/${foreign.orgId}/`))!;
+    const preserved = structuredClone(versions.keys.get(other));
+    expect(preserved).toHaveLength(2);
+    expect(await hostedRun(f, versions)).toMatchObject({ enabled: true, state: "bytes_verified", versionsDeleted: 2, verified: true });
+    expect(await hostedRun(f, versions)).toMatchObject({ state: "bytes_verified", versionsDeleted: 0, prefixes: 0 });
+    expect([...versions.keys.entries()]).toEqual([[other, preserved]]);
+    expect(await batchRows(ALICE)).toEqual([]);
+    expect(await batchRows(foreign)).toEqual(foreignRows);
+  });
+
+  test("hosted entry commits the published Relayfacts fence once and preserves foreign evidence for the same session ID", async () => {
+    const f = await fixture(), versions = new FakeS3Versions();
+    await f.db.query("SET session_replication_role=replica");
+    for (const t of [ALICE, foreign]) await insertMinimal(f, "session_index", { org_id: t.orgId, workspace_id: t.workspaceId,
+      harness: "claude", session_id: "shared-session", machine_id: "srv_x", user_id: t.userId, storage_provider: "s3" });
+    await f.db.query("SET session_replication_role=origin");
+    await fact(f, ALICE, "Target decision", "shared-session");
+    await fact(f, foreign, "Foreign decision", "shared-session");
+    for (const first of [true, false]) {
+      const logs: Record<string, unknown>[] = [];
+      expect(await sqlstate(hostedRun(f, versions, e => logs.push(e)))).toBe("RH040");
+      expect(logs[0]).toMatchObject({ sessions: 1, fencesAdded: first ? 1 : 0, evidenceRows: first ? 1 : 0, recordsDeleted: first ? 1 : 0 });
+    }
+    expect(await sqlstate(fact(f, ALICE, "Late decision", "shared-session"))).toBe("RH016");
+    expect(await evidence(f)).toEqual(["shared-session"]);
+    expect((await f.db.query("SELECT title FROM sessions.relayfacts_v1")).rows).toEqual([{ title: "Foreign decision" }]);
+    await fact(f, foreign, "Later foreign decision", "shared-session");
+    expect(versions.lists).toBe(0);
+  });
 
   test("a buffered-only user: the step runs first through the real function, finds no session, and the erase completes", async () => {
     const f = await fixture();
