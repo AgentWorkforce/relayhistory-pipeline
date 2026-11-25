@@ -3,9 +3,11 @@
 -- PIPELINE_MANAGED_SEARCH_WAKE_ENABLED, the catch-up), the stage drained, the consumer off (SEARCH_JOBS_ENABLED),
 -- the code rolled back. After a park, the stage's letters and events still exist: this rollback REFUSES (55000)
 -- until the parked letters are replayed, resolved and archived (sessions.archive_search_stage_v1(), §8 [rev 7]).
--- It refuses while ANY search-index row exists in pipeline_jobs, pipeline_events or pipeline_dead_letters.
--- It drops the guards, the managed enqueue, the runtime claim/settle functions and their claim-receipt table, the
--- scope index, the cursor, the archive function and the resolution column, and restores the three stage CHECKs to the 20261031000100 sets. It NEVER drops
+-- It refuses while ANY search-index row exists in pipeline_jobs, pipeline_events or pipeline_dead_letters, or any
+-- claim receipt or contention row exists.
+-- It drops the guards, the managed enqueue, the runtime claim/settle functions with their claim-receipt and
+-- contention tables and the probe budget, the scope index, the cursor, the archive function and the resolution column, and restores the
+-- three stage CHECKs to the 20261031000100 sets. It NEVER drops
 -- sessions.search_stage_archive or its seal (the manifest index, sessions.search_stage_archive_seal_v1() and both
 -- seal triggers), empty or not (§8): the archive is an audit artifact, removed only by a separate, explicitly
 -- approved cleanup. Re-applying the slot afterwards keeps and re-verifies it (the up file creates each archive
@@ -22,16 +24,22 @@ DO $rollback_guard$ DECLARE v_sha text; BEGIN
  IF EXISTS(SELECT 1 FROM sessions.__96bulls_migrations WHERE name LIKE 'upstream:%' AND name COLLATE "C">'upstream:20261105062300_search_index_stage.sql')
  THEN RAISE EXCEPTION USING ERRCODE='55000',MESSAGE='search index stage: a later migration is applied; roll it back first';END IF;
  SELECT sha256 INTO v_sha FROM sessions.__96bulls_migrations WHERE name='upstream:20261105062300_search_index_stage.sql' FOR UPDATE;
- IF NOT FOUND OR v_sha<>'a6b2e2f1406c7da333c70a12687361795cf9a8c985f3ca923d7bd64f70ba2bb3'
+ IF NOT FOUND OR v_sha<>'e2658298b66153eb78bee40bffe53c574e9e67da0894684c5b38063be7f7bea9'
  THEN RAISE EXCEPTION USING ERRCODE='55000',MESSAGE='search index stage: own applied checksum required';END IF;
  -- §8: the additive migration stays until the stage is fully empty, in all three tables.
- LOCK TABLE sessions.pipeline_jobs, sessions.pipeline_events, sessions.pipeline_dead_letters IN ACCESS EXCLUSIVE MODE;
+ LOCK TABLE sessions.pipeline_jobs, sessions.pipeline_events, sessions.pipeline_dead_letters, sessions.search_job_claims,
+   sessions.search_job_contention IN ACCESS EXCLUSIVE MODE;
  IF EXISTS(SELECT 1 FROM sessions.pipeline_jobs WHERE stage='search-index')
  THEN RAISE EXCEPTION USING ERRCODE='55000',MESSAGE='search index stage: search-index jobs exist; drain or park them first';END IF;
  IF EXISTS(SELECT 1 FROM sessions.pipeline_dead_letters WHERE stage='search-index')
  THEN RAISE EXCEPTION USING ERRCODE='55000',MESSAGE='search index stage: search-index dead letters exist; replay, resolve and archive them first';END IF;
  IF EXISTS(SELECT 1 FROM sessions.pipeline_events WHERE stage='search-index')
  THEN RAISE EXCEPTION USING ERRCODE='55000',MESSAGE='search index stage: search-index events exist; archive them first';END IF;
+ -- The runtime boundary's own state must be empty too: no claim receipt, no contention row.
+ IF EXISTS(SELECT 1 FROM sessions.search_job_claims)
+ THEN RAISE EXCEPTION USING ERRCODE='55000',MESSAGE='search index stage: search-index claim receipts exist; settle or clear them first';END IF;
+ IF EXISTS(SELECT 1 FROM sessions.search_job_contention)
+ THEN RAISE EXCEPTION USING ERRCODE='55000',MESSAGE='search index stage: search-index contention rows exist; settle or clear them first';END IF;
 END $rollback_guard$;
 DROP TRIGGER guard_search_wake_delete ON sessions.pipeline_jobs;
 DROP TRIGGER guard_search_wake_truncate ON sessions.pipeline_jobs;
@@ -41,10 +49,13 @@ DROP TRIGGER guard_search_wake_update ON sessions.pipeline_jobs;
 -- so any receipt left is a stale one of a deleted job).
 DROP TRIGGER search_job_claim_attempts ON sessions.pipeline_jobs;
 DROP FUNCTION sessions.settle_search_job_v1(bigint,uuid,text);
+DROP FUNCTION sessions.resume_search_contention_v1(bigint,text);
 DROP FUNCTION sessions.claim_search_jobs_v1(integer);
 DROP FUNCTION sessions.search_letter_id_v1(text,text,text);
 DROP FUNCTION sessions.search_job_claim_attempts_v1();
 DROP TABLE sessions.search_job_claims;
+DROP TABLE sessions.search_job_contention;
+DROP TABLE sessions.search_probe_budget;
 DROP FUNCTION sessions.guard_managed_search_truncate_v1();
 DROP FUNCTION sessions.guard_managed_search_wake_v1();
 DROP FUNCTION sessions.managed_search_wake_v1(jsonb,uuid);

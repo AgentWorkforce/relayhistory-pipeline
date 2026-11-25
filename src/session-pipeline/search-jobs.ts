@@ -195,11 +195,26 @@ export async function claimSearchJobs(sql: SqlExecutor, n: number): Promise<Clai
 /**
  * What the caller asks for. The server decides the rest: `{ retry }`'s delay is ignored (server backoff
  * min(900, 30 * 2^(attempt-1)) s) and `exhausted` is a retry the server exhausts only at its own max attempts (12).
+ * `busy` (scope lock contention) never spends the failure budget and never parks: the server gives back the counted
+ * attempt and holds the job 30 s, escalating at 2 h and then at most hourly. At 24 h of same-epoch contention it HOLDS
+ * the job: one probe claim an hour, until a newer epoch or an operator (resumeSearchContention) releases it.
  */
-export type SearchSettleOutcome = "done" | { retry: number } | "exhausted";
+export type SearchSettleOutcome = "done" | { retry: number } | "exhausted" | "busy";
+/** A busy settlement's contention state, as the server reports it (search_job_contention). */
+export interface SearchBusyState {
+  escalated: boolean;
+  /** Held by the 24 h cap (now or before); `held_now` the settlement that set it; `probe` an hourly probe's. */
+  held: boolean;
+  held_now: boolean;
+  probe: boolean;
+  contended_for_s: number;
+  contention_count: number;
+  delay_seconds: number;
+}
 export type SearchSettleResult =
   | { applied: false }
-  | { applied: true; action: "deleted" | "reopened" | "retried" | "parked" | "parked_reopened" };
+  | { applied: true; action: "deleted" | "reopened" | "retried" | "parked" | "parked_reopened" | "busy_reopened" }
+  | ({ applied: true; action: "busy" } & SearchBusyState);
 /**
  * The job and its lease. claimedEpoch, claimedMessage and attempts are accepted for compatibility (the accepted
  * tests and the Lambda pass a whole ClaimedSearchJob) and IGNORED: the server's claim receipt is authoritative.
@@ -212,12 +227,24 @@ type SettleClaim = { id: string | number; lease: string; claimedEpoch?: unknown;
  * replaced lease, another stage's job or a second settlement returns `{ applied: false }` and changes nothing.
  */
 export async function settleSearchJob(sql: SqlExecutor, claim: SettleClaim, outcome: SearchSettleOutcome): Promise<SearchSettleResult> {
-  const wire = outcome === "done" ? "done" : "retry";
+  const wire = outcome === "done" || outcome === "busy" ? outcome : "retry";
   const { rows } = await sql.query<{ r: SearchSettleResult }>(
     "SELECT sessions.settle_search_job_v1($1::bigint, $2::uuid, $3::text) AS r", [String(claim.id), claim.lease, wire]);
   const r = rows[0]?.r;
   if (!r || r.applied !== true) return { applied: false };
-  return { applied: true, action: r.action };
+  return r;
+}
+
+/**
+ * Operator path (service_role or owner credentials; never the runtime role): release a job held by the 24 h contention
+ * cap through sessions.resume_search_contention_v1, which restarts its contention episode and writes an audit event
+ * naming the operator and the database identities. `{ applied: false }` while a lease is live or when it is not held.
+ */
+export async function resumeSearchContention(sql: SqlExecutor, jobId: string | number, operator: string): Promise<{ applied: boolean; reason?: string }> {
+  const { rows } = await sql.query<{ r: { applied: boolean; reason?: string } }>(
+    "SELECT sessions.resume_search_contention_v1($1::bigint, $2::text) AS r", [String(jobId), operator]);
+  const r = rows[0]?.r;
+  return r?.applied === true ? { applied: true } : { applied: false, ...(r?.reason ? { reason: r.reason } : {}) };
 }
 
 // ---------------------------------------------------------------------------------------------------------
@@ -466,6 +493,7 @@ export async function parkSearchJobs(sql: SearchSql, opts: { operator: string })
     if (deleted.rows.length !== rows.length) throw new Error("search park: deleted count differs from the parked rows");
     // A parked row's claim receipt (a straggler's lease) goes with it: no settlement can apply to a deleted row.
     await tx.query("DELETE FROM sessions.search_job_claims WHERE job_id = ANY($1::bigint[])", [rows.map((r) => r.id)]);
+    await tx.query("DELETE FROM sessions.search_job_contention WHERE job_id = ANY($1::bigint[])", [rows.map((r) => r.id)]);
     const deadCount = new Map(inserted.rows.map((r) => [r.id, r.dead_count]));
     for (const r of rows) {
       const letter = searchLetterId(r.message);
@@ -480,12 +508,17 @@ export async function parkSearchJobs(sql: SearchSql, opts: { operator: string })
   return { parked };
 }
 
-/** §8 [rev 6]: the down migration's precondition: 0 search-index rows in pipeline_jobs, pipeline_events AND pipeline_dead_letters. */
+/**
+ * §8 [rev 6]: the down migration's precondition: 0 search-index rows in pipeline_jobs, pipeline_events AND
+ * pipeline_dead_letters, and no claim receipt or contention row.
+ */
 export async function searchStageDownPrecondition(sql: SqlExecutor): Promise<boolean> {
   const { rows } = await sql.query<{ empty: boolean }>(
     `SELECT NOT EXISTS (SELECT 1 FROM sessions.pipeline_jobs WHERE stage = 'search-index')
         AND NOT EXISTS (SELECT 1 FROM sessions.pipeline_events WHERE stage = 'search-index')
-        AND NOT EXISTS (SELECT 1 FROM sessions.pipeline_dead_letters WHERE stage = 'search-index') AS empty`);
+        AND NOT EXISTS (SELECT 1 FROM sessions.pipeline_dead_letters WHERE stage = 'search-index')
+        AND NOT EXISTS (SELECT 1 FROM sessions.search_job_claims)
+        AND NOT EXISTS (SELECT 1 FROM sessions.search_job_contention) AS empty`);
   return rows[0]?.empty === true;
 }
 
@@ -514,7 +547,10 @@ export function searchSettlementFor(result: SearchJobResult | { error: unknown }
   if ("error" in result || result.outcome === "held") {
     return attempts >= SEARCH_JOB_MAX_ATTEMPTS ? "exhausted" : { retry: searchJobBackoffSeconds(attempts) };
   }
-  if (result.outcome === "busy") return { retry: SEARCH_JOB_BUSY_RETRY_SECONDS };
+  // Scope lock contention is the bounded `busy`; any other not-yet (an epoch behind the wake, a deferred stream) is a
+  // short retry.
+  if (result.outcome === "busy")
+    return result.reasons?.some((r) => r === "scope_busy" || r === "canonical_scope_busy") ? "busy" : { retry: SEARCH_JOB_BUSY_RETRY_SECONDS };
   return "done";
 }
 

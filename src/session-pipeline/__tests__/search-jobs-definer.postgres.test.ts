@@ -69,7 +69,10 @@ async function rig() {
   const owner = new pg.Pool({ connectionString: target.href, max: 2 });
   target.username = login;
   const runtime = new pg.Pool({ connectionString: target.href, max: 1 });
+  const loginUrl = target.href;
+  const extra: pg.Pool[] = [];
   cleanup.push(async () => {
+    for (const p of extra) await p.end();
     await runtime.end();
     await owner.end();
     await admin.query(`DROP DATABASE ${name} WITH (FORCE)`);
@@ -81,7 +84,9 @@ async function rig() {
   for (const f of SESSION_BOOTSTRAP_FILES) await owner.query(sql(f));
   for (const f of readdirSync(join(root, "supabase/migrations")).filter((f) => f.endsWith(".sql")).sort()) await owner.query(sql("supabase/migrations/" + f));
   await owner.query(`GRANT USAGE ON SCHEMA sessions TO ${login}; GRANT EXECUTE ON FUNCTION ${CLAIM}, ${SETTLE} TO ${login}`);
-  return { owner, runtime, login };
+  /** More genuine login connections (concurrent claimers). */
+  const loginPool = (max: number) => { const p = new pg.Pool({ connectionString: loginUrl, max }); extra.push(p); return p; };
+  return { owner, runtime, login, loginPool };
 }
 
 describe.skipIf(!url)("062300 runtime boundary: a genuine unprivileged login (real PostgreSQL)", () => {
@@ -179,5 +184,98 @@ describe.skipIf(!url)("062300 runtime boundary: a genuine unprivileged login (re
     }
     expect((await owner.query("SELECT lease_id::text AS l FROM sessions.pipeline_jobs WHERE id = $1::bigint", [c!.id])).rows).toEqual([{ l: c!.lease }]);
     expect((await owner.query("SELECT count(*)::int AS n FROM sessions.search_job_claims")).rows).toEqual([{ n: 1 }]);
+  }, 300_000);
+
+  test("contention, budget and resume are out of the login's reach (42501)", async () => {
+    const { runtime } = await rig();
+    const denied = {
+      contention: await codeOf(() => runtime.query("SELECT * FROM sessions.search_job_contention")),
+      budget: await codeOf(() => runtime.query("UPDATE sessions.search_probe_budget SET tokens = 6")),
+      resume: await codeOf(() => runtime.query("SELECT sessions.resume_search_contention_v1(1, 'login')")),
+    };
+    expect(denied).toEqual({ contention: "42501", budget: "42501", resume: "42501" });
+  }, 300_000);
+
+  test("concurrent saturation: 52 synchronized held scopes, ordinary work always ready, 4 claimers; the fleet bound holds and every held scope recovers", async () => {
+    const { owner, loginPool } = await rig();
+    // Test-only policy through the owner's config row (no code change): R = 120/min, C = 6, initial balance 6.
+    const R = 120, C = 6;
+    await owner.query("UPDATE sessions.search_probe_budget SET rate_per_minute = $1, burst = $2, tokens = $2, refilled_at = clock_timestamp(), last_served_kind = 'ordinary'", [R, C]);
+    const held = Array.from({ length: 52 }, (_, n) => wake({ ...scope, sessionId: `s_held_${String(n).padStart(2, "0")}` }, 1));
+    const heldKeys = new Set(held.map((w) => w.workKey));
+    for (const w of held) await enqueueSearchWake(owner, w);
+    const due = (await owner.query<{ due: Date }>(
+      `INSERT INTO sessions.search_job_contention (job_id, epoch, first_contended_at, last_contended_at, contention_count, last_escalated_at, held_at, next_probe_at)
+       SELECT id, 1, clock_timestamp() - interval '25 hours', clock_timestamp(), 100, clock_timestamp() - interval '10 minutes',
+              clock_timestamp() - interval '1 hour', date_trunc('milliseconds', clock_timestamp())
+         FROM sessions.pipeline_jobs WHERE stage = 'search-index'
+       RETURNING next_probe_at AS due`)).rows.map((r) => r.due.getTime());
+    const dueAt = Math.max(...due);
+    expect(new Set(due).size).toBe(1);
+    const backlog = async () => Number((await owner.query<{ n: string }>(
+      `SELECT count(*) AS n FROM sessions.pipeline_jobs x WHERE x.stage = 'search-index' AND x.lease_id IS NULL
+          AND NOT EXISTS (SELECT 1 FROM sessions.search_job_contention k WHERE k.job_id = x.id AND k.held_at IS NOT NULL)`)).rows[0]!.n);
+    // The producer keeps ordinary work continuously ready.
+    let enqueued = 0, producing = true, producerDone = false, minBacklog = Infinity;
+    for (let n = 0; n < 60; n++) await enqueueSearchWake(owner, wake({ ...scope, sessionId: `s_ord_${enqueued++}` }, 1));
+    const producer = (async () => {
+      while (producing) {
+        const b = await backlog();
+        minBacklog = Math.min(minBacklog, b);
+        if (b < 60) for (let n = 0; n < 30; n++) await enqueueSearchWake(owner, wake({ ...scope, sessionId: `s_ord_${enqueued++}` }, 1));
+        await Bun.sleep(10);
+      }
+      producerDone = true;
+    })();
+    const probes: { at: number; key: string }[] = [];
+    let ordinary = 0, backlogAtLastProbe = -1, running = true;
+    const started = Date.now();
+    const claimer = async (limit: number) => {
+      const pool = loginPool(1);
+      let empty = 0;
+      while (running || !producerDone || empty < 2) {
+        const jobs = await claimSearchJobs(pool, limit);
+        if (!jobs.length) { empty += 1; if (!running) await Bun.sleep(50); else await Bun.sleep(5); continue; }
+        empty = 0;
+        for (const j of jobs) {
+          if (heldKeys.has(j.claimedMessage.workKey)) {
+            // Admission time on the server's clock: the claim moved next_probe_at to its lease time + 1 h.
+            const at = (await owner.query<{ at: Date }>("SELECT next_probe_at - interval '1 hour' AS at FROM sessions.search_job_contention WHERE job_id = $1::bigint", [j.id])).rows[0]!.at.getTime();
+            probes.push({ at, key: j.claimedMessage.workKey });
+            if (new Set(probes.map((p) => p.key)).size === heldKeys.size) { backlogAtLastProbe = await backlog(); running = false; producing = false; }
+          } else ordinary += 1;
+          // The probe finds the lock free: the held scope recovers.
+          expect(await settleSearchJob(pool, j, "done")).toEqual({ applied: true, action: "deleted" });
+        }
+        await Bun.sleep(20);
+      }
+    };
+    await Promise.all([claimer(1), claimer(1), claimer(3), claimer(3)]);
+    await producer;
+    const elapsedS = (Date.now() - started) / 1000;
+    // Every held scope got exactly one probe and recovered; no letter, no replay.
+    expect(new Set(probes.map((p) => p.key)).size).toBe(52);
+    expect(probes).toHaveLength(52);
+    expect((await owner.query("SELECT count(*)::int AS n FROM sessions.search_job_contention")).rows).toEqual([{ n: 0 }]);
+    expect((await owner.query("SELECT count(*)::int AS n FROM sessions.pipeline_dead_letters")).rows).toEqual([{ n: 0 }]);
+    // Every ordinary job completed.
+    expect(ordinary).toBe(enqueued);
+    expect((await owner.query("SELECT count(*)::int AS n FROM sessions.pipeline_jobs WHERE stage = 'search-index'")).rows).toEqual([{ n: 0 }]);
+    // The backlog stayed positive, including when the last held scope was probed.
+    expect(backlogAtLastProbe).toBeGreaterThan(0);
+    expect(minBacklog).toBeGreaterThan(0);
+    // The fleet bound over every interval of observed probe times: count <= C + R x minutes.
+    const t = probes.map((p) => p.at).sort((a, b) => a - b);
+    let worst = -Infinity;
+    for (let i = 0; i < t.length; i++) for (let j = i; j < t.length; j++)
+      worst = Math.max(worst, (j - i + 1) - (C + R * (t[j]! - t[i]!) / 60_000));
+    expect(worst).toBeLessThanOrEqual(0.01);
+    // Progress deadline: all probed within ceil((N - C) / R) minutes of the synchronized due time.
+    const deadlineMs = Math.ceil((52 - C) / R) * 60_000;
+    const maxWaitMs = t.at(-1)! - dueAt;
+    expect(maxWaitMs).toBeLessThanOrEqual(deadlineMs);
+    console.log(JSON.stringify({ concurrentSaturation: { claimers: "4 (limit 1, 1, 3, 3; 20 ms between calls)", R, C, heldScopes: 52,
+      distinctProbed: new Set(probes.map((p) => p.key)).size, probes: probes.length, boundAtEnd: C + R * (t.at(-1)! - t[0]!) / 60_000,
+      ordinaryCompleted: ordinary, ordinaryEnqueued: enqueued, minBacklog, backlogAtLastProbe, maxProbeWaitMs: maxWaitMs, deadlineMs, elapsedS } }));
   }, 300_000);
 });

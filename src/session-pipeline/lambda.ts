@@ -874,7 +874,7 @@ function searchJobsDeadline(env: LambdaEnv, context?: LambdaInvocationContext): 
   return () => !(context.getRemainingTimeInMillis() > margin);
 }
 
-export interface SearchJobsSummary { claimed: number; acked: number; retried: number; exhausted: number; lost: number; failed: number }
+export interface SearchJobsSummary { claimed: number; acked: number; retried: number; exhausted: number; busy: number; lost: number; failed: number }
 
 /**
  * The Lambda consumer's search-job loop (design §5.1, §3.3): up to `claim` passes, each claimed one at a time through
@@ -884,7 +884,7 @@ export interface SearchJobsSummary { claimed: number; acked: number; retried: nu
  * into a reclaim.
  */
 export async function drainSearchJobs(deps: { sql: SearchSql; search: SearchIndexDeps; claim: number; deadline?: () => boolean }): Promise<SearchJobsSummary> {
-  const summary: SearchJobsSummary = { claimed: 0, acked: 0, retried: 0, exhausted: 0, lost: 0, failed: 0 };
+  const summary: SearchJobsSummary = { claimed: 0, acked: 0, retried: 0, exhausted: 0, busy: 0, lost: 0, failed: 0 };
   for (let n = 0; n < deps.claim; n++) {
     if (deps.deadline?.()) break;
     const [job] = await claimSearchJobs(deps.sql, 1);
@@ -902,10 +902,16 @@ export async function drainSearchJobs(deps: { sql: SearchSql; search: SearchInde
       if (!settled.applied) summary.lost += 1;
       else if (outcome === "done") summary.acked += 1;
       else if (exhausted) summary.exhausted += 1;
+      else if (outcome === "busy") summary.busy += 1;
       else summary.retried += 1;
       const fields = { ...searchJobLogFields(job, result), ok: outcome === "done" && settled.applied, state: settled.applied ? settled.action : "lease_lost", duration_ms: Date.now() - started };
+      const busy = settled.applied && settled.action === "busy" ? settled : undefined;
       if ("error" in result) log.error("search job failed", fields);
       else if (exhausted) log.error("search job exhausted", fields);
+      // Rate-limited by the server (last_escalated_at): an escalation arrives at most hourly per contended job.
+      else if (busy?.held_now) log.error("search job contention held", { ...fields, reason: "scope_contention_held", count: busy.contention_count });
+      else if (busy?.escalated) log.warn("search job contention escalated", { ...fields, reason: "scope_contention_escalated", count: busy.contention_count });
+      else if (busy?.probe) log.warn("search job contention probe", { ...fields, reason: "scope_contention_probe", count: busy.contention_count });
       else log.info("search job settled", fields);
     } catch (error) {
       summary.failed += 1;

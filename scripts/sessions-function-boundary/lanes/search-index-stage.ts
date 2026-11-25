@@ -15,6 +15,7 @@
  *   claim_search_jobs_v1                SECURITY DEFINER; THE RUNTIME BOUNDARY (§3.2): EXECUTE to service_role, mirrored
  *   settle_search_job_v1                onto the runtime role (RUNTIME_APPLICATION_FUNCTIONS); the only functions of
  *                                       the stage the runtime role executes (§3.3, the server's claim receipt)
+ *   resume_search_contention_v1         SECURITY DEFINER; operator release of a 24 h contention hold; service_role only
  * Operator-only, never runtime: replay, catch-up and park are owner-run TypeScript over the guarded queue (no
  * function); the archive is archive_search_stage_v1 above.
  * The rollback (supabase/rollbacks/20261105062300_search_index_stage.down.sql) is hand-written: it carries §8's
@@ -39,6 +40,7 @@ export const searchIndexStage: LaneManifest = {
     "sessions.search_letter_id_v1(",
     "sessions.claim_search_jobs_v1(",
     "sessions.settle_search_job_v1(",
+    "sessions.resume_search_contention_v1(",
   ],
   grantSources: [{ path: MIGRATION, roles: ["service_role"] }],
   functions: {
@@ -54,6 +56,8 @@ export const searchIndexStage: LaneManifest = {
     // The runtime boundary: service_role EXECUTE, mirrored onto the runtime role (no operatorOnly).
     "sessions.claim_search_jobs_v1(integer)": { secdef: true, grants: ["service_role"] },
     "sessions.settle_search_job_v1(bigint,uuid,text)": { secdef: true, grants: ["service_role"] },
+    // The 24 h contention cap's operator release: service_role only, never the runtime role.
+    "sessions.resume_search_contention_v1(bigint,text)": { secdef: true, grants: ["service_role"], operatorOnly: true },
   },
   replaces: {},
 };

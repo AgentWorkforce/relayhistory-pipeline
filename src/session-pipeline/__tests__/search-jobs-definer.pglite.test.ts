@@ -59,8 +59,12 @@ CREATE FUNCTION public.fx_state() RETURNS jsonb LANGUAGE sql SECURITY DEFINER SE
              FROM sessions.pipeline_jobs j), '[]'::jsonb),
     'receipts', coalesce((SELECT jsonb_agg(jsonb_build_object('id', c.job_id::text, 'lease', c.lease_id::text, 'epoch', c.claimed_epoch,
               'attempts', c.claimed_attempts, 'message', c.claimed_message, 'ttl', round(extract(epoch FROM c.lease_until - now()))::int,
-              'live_at_tx_start', c.lease_until > now(), 'live_on_clock', c.lease_until > clock_timestamp()) ORDER BY c.job_id)
+              'live_at_tx_start', c.lease_until > now(), 'live_on_clock', c.lease_until > clock_timestamp(), 'reclaims', c.reclaim_count) ORDER BY c.job_id)
              FROM sessions.search_job_claims c), '[]'::jsonb),
+    'contention', coalesce((SELECT jsonb_agg(jsonb_build_object('id', k.job_id::text, 'epoch', k.epoch, 'count', k.contention_count,
+              'escalated', k.last_escalated_at IS NOT NULL, 'held', k.held_at IS NOT NULL,
+              'probe_in', round(extract(epoch FROM k.next_probe_at - clock_timestamp()))::int) ORDER BY k.job_id)
+             FROM sessions.search_job_contention k), '[]'::jsonb),
     'letters', coalesce((SELECT jsonb_agg(jsonb_build_object('id', d.id, 'state', d.state, 'dead_count', d.dead_count,
               'resolution', d.resolution, 'message', d.message, 'provenance', jsonb_build_object('trace', d.trace_id::text,
               'org', d.org_id, 'ws', d.workspace_id, 'session', d.session_id, 'machine', d.machine_id)) ORDER BY d.id) FROM sessions.pipeline_dead_letters d), '[]'::jsonb),
@@ -87,6 +91,28 @@ CREATE FUNCTION public.fx_lease_ends_in(p_ms integer) RETURNS void LANGUAGE sql 
   UPDATE sessions.pipeline_jobs SET visible_at = clock_timestamp() + make_interval(secs => p_ms / 1000.0) WHERE stage = 'search-index' AND lease_id IS NOT NULL;
   UPDATE sessions.search_job_claims SET lease_until = clock_timestamp() + make_interval(secs => p_ms / 1000.0);
 $$;
+-- Contention began p_hours ago; the last escalation (if p_escalated_hours is given) p_escalated_hours ago.
+CREATE FUNCTION public.fx_contended_since(p_hours numeric, p_escalated_hours numeric) RETURNS void LANGUAGE sql SECURITY DEFINER SET search_path = pg_catalog AS $$
+  UPDATE sessions.search_job_contention SET first_contended_at = clock_timestamp() - make_interval(secs => p_hours * 3600),
+    last_escalated_at = CASE WHEN p_escalated_hours IS NULL THEN last_escalated_at ELSE clock_timestamp() - make_interval(secs => p_escalated_hours * 3600) END
+$$;
+-- Every search-index job held by the 24 h cap at its current epoch; its probe due now (p_due) or in an hour.
+CREATE FUNCTION public.fx_hold_all(p_due boolean) RETURNS void LANGUAGE sql SECURITY DEFINER SET search_path = pg_catalog AS $$
+  INSERT INTO sessions.search_job_contention (job_id, epoch, first_contended_at, last_contended_at, contention_count, last_escalated_at, held_at, next_probe_at)
+  SELECT j.id, (j.message->'payload'->>'epoch')::bigint, clock_timestamp() - interval '25 hours', clock_timestamp(), 100,
+         clock_timestamp() - interval '10 minutes', clock_timestamp() - interval '1 hour',
+         CASE WHEN p_due THEN clock_timestamp() - interval '1 second' ELSE clock_timestamp() + interval '1 hour' END
+    FROM sessions.pipeline_jobs j WHERE j.stage = 'search-index'
+  ON CONFLICT (job_id) DO UPDATE SET held_at = EXCLUDED.held_at, next_probe_at = EXCLUDED.next_probe_at, epoch = EXCLUDED.epoch
+$$;
+-- An hour passes for every hold: each held job's probe is due.
+CREATE FUNCTION public.fx_probe_due() RETURNS void LANGUAGE sql SECURITY DEFINER SET search_path = pg_catalog AS $$
+  UPDATE sessions.search_job_contention SET next_probe_at = clock_timestamp() - interval '1 second' WHERE held_at IS NOT NULL
+$$;
+-- The fleet probe bucket holds p_tokens, last refilled p_age_s ago.
+CREATE FUNCTION public.fx_budget(p_tokens numeric, p_age_s numeric) RETURNS void LANGUAGE sql SECURITY DEFINER SET search_path = pg_catalog AS $$
+  UPDATE sessions.search_probe_budget SET tokens = p_tokens, refilled_at = clock_timestamp() - make_interval(secs => p_age_s)
+$$;
 CREATE FUNCTION public.fx_attempts(p_id bigint, n integer) RETURNS void LANGUAGE sql SECURITY DEFINER SET search_path = pg_catalog AS $$
   UPDATE sessions.pipeline_jobs SET attempts = n WHERE id = p_id
 $$;
@@ -105,13 +131,14 @@ BEGIN
   RETURN NEW;
 END $$;
 CREATE TRIGGER fx_fail_events BEFORE INSERT ON sessions.pipeline_events FOR EACH ROW EXECUTE FUNCTION public.fx_fail_events();
-GRANT EXECUTE ON FUNCTION public.fx_state(), public.fx_wake(jsonb), public.fx_expire(), public.fx_lease_ends_in(integer), public.fx_attempts(bigint, integer),
+GRANT EXECUTE ON FUNCTION public.fx_state(), public.fx_wake(jsonb), public.fx_expire(), public.fx_lease_ends_in(integer), public.fx_contended_since(numeric, numeric), public.fx_hold_all(boolean), public.fx_probe_due(), public.fx_budget(numeric, numeric), public.fx_attempts(bigint, integer),
   public.fx_other_stage(uuid, text) TO PUBLIC;
 `;
 
 type State = {
   jobs: Array<{ id: string; stage: string; epoch: string; trace: string; lease: string | null; attempts: number; dlq: boolean; visible: boolean; in: number; message: StageMessage }>;
-  receipts: Array<{ id: string; lease: string; epoch: number; attempts: number; message: StageMessage; ttl: number; live_at_tx_start: boolean; live_on_clock: boolean }>;
+  receipts: Array<{ id: string; lease: string; epoch: number; attempts: number; message: StageMessage; ttl: number; live_at_tx_start: boolean; live_on_clock: boolean; reclaims: number }>;
+  contention: Array<{ id: string; epoch: number; count: number; escalated: boolean; held: boolean; probe_in: number | null }>;
   letters: Array<{ id: string; state: string; dead_count: number; resolution: string | null; message: StageMessage;
     provenance: { trace: string; org: string; ws: string; session: string | null; machine: string | null } }>;
   events: Array<{ status: string; attempt: number; trace: string; key: string; attrs: Record<string, unknown>; code: string | null }>;
@@ -121,11 +148,17 @@ type State = {
  * A clone, seeded by the owner, then switched to a fresh LOGIN: `bare` holds only USAGE on sessions and EXECUTE on
  * claim and settle; `hosted` adds the runtime role's exact pipeline-table privileges and an all-row policy.
  */
-async function asLogin(kind: "bare" | "hosted", seed: (pg: PGlite) => Promise<void> = async () => {}) {
-  const { pg } = await clonedReplayDatabase();
+async function asLogin(kind: "bare" | "hosted", seed: (pg: PGlite) => Promise<void> = async () => {}, opts: { restart?: boolean } = {}) {
+  let pg = (await clonedReplayDatabase()).pg;
   cleanup.push(() => pg.close());
   await pg.exec(FIXTURES);
   await seed(pg);
+  if (opts.restart) {
+    // A fresh client on the same data (a new process's view): only persisted state carries over.
+    const fresh = await pg.clone() as PGlite;
+    await pg.close();
+    pg = fresh;
+  }
   const role = kind === "bare" ? LOGIN : HOSTED;
   await pg.exec(`CREATE ROLE ${role} LOGIN NOSUPERUSER NOINHERIT NOCREATEDB NOCREATEROLE NOBYPASSRLS NOREPLICATION;
     GRANT USAGE ON SCHEMA sessions TO ${role};
@@ -147,7 +180,12 @@ async function asLogin(kind: "bare" | "hosted", seed: (pg: PGlite) => Promise<vo
   const state = async () => (await pg.query<{ s: State }>("SELECT public.fx_state() AS s")).rows[0]!.s;
   return { pg, state, wakeNow: (m: SearchWakeMessage) => pg.query("SELECT public.fx_wake($1::jsonb)", [JSON.stringify(m)]),
     expire: () => pg.query("SELECT public.fx_expire()"),
-    attempts: (id: string, n: number) => pg.query("SELECT public.fx_attempts($1::bigint, $2)", [id, n]) };
+    attempts: (id: string, n: number) => pg.query("SELECT public.fx_attempts($1::bigint, $2)", [id, n]),
+    contendedSince: (hours: number, escalatedHours: number | null = null) =>
+      pg.query("SELECT public.fx_contended_since($1::numeric, $2::numeric)", [hours, escalatedHours]),
+    holdAll: (due: boolean) => pg.query("SELECT public.fx_hold_all($1)", [due]),
+    probeDue: () => pg.query("SELECT public.fx_probe_due()"),
+    budget: (tokens: number, ageSeconds = 0) => pg.query("SELECT public.fx_budget($1::numeric, $2::numeric)", [tokens, ageSeconds]) };
 }
 const seeded = (...wakes: SearchWakeMessage[]) => async (pg: PGlite) => { for (const w of wakes) await enqueueSearchWake(pg, w); };
 async function claimOne(pg: PGlite): Promise<ClaimedSearchJob> {
@@ -424,6 +462,14 @@ describe("claim and settle as the unprivileged login (EXECUTE on the two RPCs on
       updateReceipt: await codeOf(pg.query("UPDATE sessions.search_job_claims SET claimed_epoch = 99")),
       deleteReceipt: await codeOf(pg.query("DELETE FROM sessions.search_job_claims")),
       truncateReceipt: await codeOf(pg.query("TRUNCATE sessions.search_job_claims")),
+      selectContention: await codeOf(pg.query("SELECT * FROM sessions.search_job_contention")),
+      insertContention: await codeOf(pg.query("INSERT INTO sessions.search_job_contention VALUES (1, 1, now(), now(), 0, NULL, NULL)")),
+      updateContention: await codeOf(pg.query("UPDATE sessions.search_job_contention SET contention_count = 0")),
+      deleteContention: await codeOf(pg.query("DELETE FROM sessions.search_job_contention")),
+      truncateContention: await codeOf(pg.query("TRUNCATE sessions.search_job_contention")),
+      selectBudget: await codeOf(pg.query("SELECT * FROM sessions.search_probe_budget")),
+      updateBudget: await codeOf(pg.query("UPDATE sessions.search_probe_budget SET tokens = 6")),
+      resume: await codeOf(pg.query("SELECT sessions.resume_search_contention_v1(1, 'definer-test')")),
       replay: await codeOf(() => replaySearchDeadLetter(pg, searchLetterId(wake(scope, 7)))),
       catchUp: await codeOf(() => catchUpTick({ sql: pg, pageSize: 10 })),
       park: await codeOf(() => parkSearchJobs(pg, { operator: "definer-test" })),
@@ -518,15 +564,22 @@ describe("ACL receipt (catalog, as the owner)", () => {
                          WHERE a.privilege_type = 'EXECUTE' AND a.grantee <> 0 AND a.grantee <> p.proowner), '{}') AS grantees
          FROM pg_proc p WHERE p.oid IN ('sessions.archive_search_stage_v1()'::regprocedure, 'sessions.search_letter_id_v1(text,text,text)'::regprocedure,
                                         'sessions.search_job_claim_attempts_v1()'::regprocedure, 'sessions.enqueue_managed_search_wake_v1(jsonb,uuid)'::regprocedure,
-                                        'sessions.managed_search_wake_v1(jsonb,uuid)'::regprocedure) ORDER BY 1`)).rows;
+                                        'sessions.managed_search_wake_v1(jsonb,uuid)'::regprocedure,
+                                        'sessions.resume_search_contention_v1(bigint,text)'::regprocedure) ORDER BY 1`)).rows;
     expect(stage.map((f) => ({ fn: f.fn, grantees: f.grantees, public_exec: f.public_exec }))).toEqual([
       { fn: "sessions.archive_search_stage_v1()", grantees: ["service_role"], public_exec: false },
       { fn: "sessions.enqueue_managed_search_wake_v1(jsonb,uuid)", grantees: [], public_exec: false },
       { fn: "sessions.managed_search_wake_v1(jsonb,uuid)", grantees: [], public_exec: false },
+      { fn: "sessions.resume_search_contention_v1(bigint,text)", grantees: ["service_role"], public_exec: false },
       { fn: "sessions.search_job_claim_attempts_v1()", grantees: [], public_exec: false },
       { fn: "sessions.search_letter_id_v1(text,text,text)", grantees: [], public_exec: false },
     ]);
     expect(stage.every((f) => JSON.stringify(f.config) === JSON.stringify(["search_path=pg_catalog, pg_temp"]))).toBe(true);
+    for (const table of ["sessions.search_job_contention", "sessions.search_probe_budget"]) {
+      const t = (await pg.query<{ owner: string; acl: string[] | null; rls: boolean }>(
+        "SELECT pg_get_userbyid(relowner) AS owner, relacl::text[] AS acl, relrowsecurity AS rls FROM pg_class WHERE oid = $1::regclass", [table])).rows[0]!;
+      expect({ table, owner: t.owner, rls: t.rls, foreign: (t.acl ?? []).filter((e) => !e.startsWith(`${owner}=`)) }).toEqual({ table, owner, rls: true, foreign: [] });
+    }
     const receipts = (await pg.query<{ owner: string; acl: string[] | null; rls: boolean }>(
       "SELECT pg_get_userbyid(relowner) AS owner, relacl::text[] AS acl, relrowsecurity AS rls FROM pg_class WHERE oid = 'sessions.search_job_claims'::regclass")).rows[0]!;
     expect(receipts.owner).toBe(owner);
@@ -569,4 +622,330 @@ describe("no legacy consumer role path", () => {
     const hits = files.filter((f) => { try { return readFileSync(join(root, f), "utf8").includes(NAME); } catch { return false; } });
     expect(hits).toEqual([]);
   });
+});
+
+// ---------------------------------------------------------------------------------------------------------
+describe("bounded busy (scope lock contention) and the expired-lease reclaim cap, as the unprivileged login", () => {
+  const eventCodes = (s: State) => s.events.map((e) => e.code);
+
+  test("22 busy settlements never park and never spend the budget: attempts stay at the pre-claim value", async () => {
+    const { pg, state, expire } = await asLogin("bare", seeded(wake(scope, 7)));
+    const leases = new Set<string>();
+    for (let n = 1; n <= 22; n++) {
+      await expire();
+      const c = await claimOne(pg);
+      expect(c.attempts).toBe(1);
+      leases.add(c.lease);
+      expect(await settleSearchJob(pg, c, "busy")).toMatchObject({ applied: true, action: "busy", escalated: false, held: false, contention_count: n, delay_seconds: 30 });
+      const s = await state();
+      expect(s.jobs.map((j) => ({ lease: j.lease, attempts: j.attempts, visible: j.visible }))).toEqual([{ lease: null, attempts: 0, visible: false }]);
+      expect(s.jobs[0]!.in).toBeGreaterThanOrEqual(29);
+      expect(s.jobs[0]!.in).toBeLessThanOrEqual(30);
+      expect(s.receipts).toEqual([]);
+    }
+    const s = await state();
+    expect(s.letters).toEqual([]);
+    expect(s.contention.map((k) => ({ epoch: k.epoch, count: k.count, held: k.held }))).toEqual([{ epoch: 7, count: 22, held: false }]);
+    // One durable, retryable scope_busy event per lease (the key carries the lease id).
+    expect(s.events).toHaveLength(22);
+    expect(s.events.every((e) => e.status === "retrying" && e.code === "scope_busy")).toBe(true);
+    expect(new Set(s.events.map((e) => e.key)).size).toBe(22);
+    expect(leases.size).toBe(22);
+    for (const l of leases) expect(s.events.some((e) => e.key.includes(l))).toBe(true);
+  }, 120_000);
+
+  test("a busy cycle, then a real retry: it starts at attempt 1 (30 s), and the contention episode ends", async () => {
+    const { pg, state, expire } = await asLogin("bare", seeded(wake(scope, 7)));
+    for (let n = 0; n < 3; n++) { await expire(); expect(await settleSearchJob(pg, await claimOne(pg), "busy")).toMatchObject({ action: "busy" }); }
+    expect((await state()).contention).toHaveLength(1);
+    await expire();
+    const c = await claimOne(pg);
+    expect(c.attempts).toBe(1);
+    expect(await settleSearchJob(pg, c, { retry: 0 })).toEqual({ applied: true, action: "retried" });
+    const s = await state();
+    expect(s.jobs.map((j) => ({ attempts: j.attempts, in: j.in }))).toEqual([{ attempts: 1, in: 30 }]);
+    expect(s.contention).toEqual([]);
+  }, 120_000);
+
+  test("busy with N+1 merged during the lease: an immediate reopen at attempts 0, contention reset", async () => {
+    const w8 = wake(scope, 8);
+    const { pg, state, expire, wakeNow } = await asLogin("bare", seeded(wake(scope, 7)));
+    expect(await settleSearchJob(pg, await claimOne(pg), "busy")).toMatchObject({ action: "busy" });
+    expect((await state()).contention).toHaveLength(1);
+    await expire();
+    const c = await claimOne(pg);
+    await wakeNow(w8);
+    expect(await settleSearchJob(pg, c, "busy")).toEqual({ applied: true, action: "busy_reopened" });
+    const s = await state();
+    expect(s.jobs.map((j) => ({ lease: j.lease, attempts: j.attempts, visible: j.visible, message: j.message }))).toEqual([{ lease: null, attempts: 0, visible: true, message: w8 }]);
+    expect(s.contention).toEqual([]);
+    expect(s.receipts).toEqual([]);
+    expect(s.letters).toEqual([]);
+  }, 120_000);
+
+  test("fairness: the hot scope settled busy is hidden for 30 s; the next claim takes and completes another visible scope", async () => {
+    const hot = wake(scope, 7), cold = wake(other, 3);
+    const { pg, state } = await asLogin("bare", seeded(hot, cold));
+    const first = await claimOne(pg);
+    expect(first.claimedMessage).toEqual(hot);
+    expect(await settleSearchJob(pg, first, "busy")).toMatchObject({ action: "busy", delay_seconds: 30 });
+    const next = await claimOne(pg);
+    expect(next.claimedMessage).toEqual(cold);
+    expect(await settleSearchJob(pg, next, "done")).toEqual({ applied: true, action: "deleted" });
+    expect(await claimSearchJobs(pg, 10)).toEqual([]);
+    const s = await state();
+    expect(s.jobs.map((j) => ({ message: j.message, visible: j.visible, in: j.in }))).toEqual([{ message: hot, visible: false, in: 30 }]);
+  }, 120_000);
+
+  test("escalation starts at 2 h and is rate-limited to one per hour", async () => {
+    const { pg, state, expire, contendedSince } = await asLogin("bare", seeded(wake(scope, 7)));
+    expect(await settleSearchJob(pg, await claimOne(pg), "busy")).toMatchObject({ escalated: false });
+    await contendedSince(1.9);
+    await expire();
+    expect(await settleSearchJob(pg, await claimOne(pg), "busy")).toMatchObject({ escalated: false });
+    await contendedSince(3);
+    await expire();
+    expect(await settleSearchJob(pg, await claimOne(pg), "busy")).toMatchObject({ escalated: true, held: false, delay_seconds: 30 });
+    await expire();
+    expect(await settleSearchJob(pg, await claimOne(pg), "busy")).toMatchObject({ escalated: false });
+    expect(eventCodes(await state()).filter((c) => c === "scope_contention_escalated")).toHaveLength(1);
+    await contendedSince(3, 1.01);
+    await expire();
+    expect(await settleSearchJob(pg, await claimOne(pg), "busy")).toMatchObject({ escalated: true });
+    expect(eventCodes(await state()).filter((c) => c === "scope_contention_escalated")).toHaveLength(2);
+  }, 120_000);
+
+  test("the 24 h cap: the job is held (not claimable on the 30 s cadence); an hourly probe is admitted when due; never parked", async () => {
+    const { pg, state, expire, contendedSince, probeDue } = await asLogin("bare", seeded(wake(scope, 7)));
+    expect(await settleSearchJob(pg, await claimOne(pg), "busy")).toMatchObject({ action: "busy", held: false });
+    await contendedSince(25);
+    await expire();
+    const r = await settleSearchJob(pg, await claimOne(pg), "busy");
+    expect(r).toMatchObject({ applied: true, action: "busy", held: true, held_now: true, probe: false, escalated: true, delay_seconds: 30 });
+    let s = await state();
+    expect(s.contention.map((k) => ({ held: k.held, probe_in: k.probe_in }))).toEqual([{ held: true, probe_in: 3600 }]);
+    expect(eventCodes(s).filter((c) => c !== "scope_busy").sort()).toEqual(["scope_contention_escalated", "scope_contention_held"]);
+    // The 30 s backoff passes (and passes again): the held job is not claimable.
+    for (let n = 0; n < 3; n++) { await expire(); expect(await claimSearchJobs(pg, 10)).toEqual([]); }
+    // An hour on, the probe is due: ONE claim is admitted; busy again moves the next probe an hour on.
+    await probeDue();
+    const p = await claimOne(pg);
+    expect(await claimSearchJobs(pg, 10)).toEqual([]);
+    expect(await settleSearchJob(pg, p, "busy")).toMatchObject({ action: "busy", held: true, held_now: false, probe: true });
+    s = await state();
+    expect(s.contention.map((k) => k.probe_in)).toEqual([3600]);
+    expect(eventCodes(s).filter((c) => c === "scope_contention_probe")).toHaveLength(1);
+    expect(eventCodes(s).filter((c) => c === "scope_contention_held")).toHaveLength(1);
+    expect(s.events.find((e) => e.code === "scope_contention_probe")!.key).toContain(p.lease);
+    expect(s.letters).toEqual([]);
+    await expire();
+    expect(await claimSearchJobs(pg, 10)).toEqual([]);
+  }, 120_000);
+
+  test("a static scope held past 24 h recovers by itself: hourly probes until contention clears, then it completes (no replay)", async () => {
+    const { pg, state, expire, contendedSince, probeDue } = await asLogin("bare", seeded(wake(scope, 7)));
+    expect(await settleSearchJob(pg, await claimOne(pg), "busy")).toMatchObject({ held: false });
+    await contendedSince(30);
+    await expire();
+    expect(await settleSearchJob(pg, await claimOne(pg), "busy")).toMatchObject({ held_now: true });
+    for (let hour = 1; hour <= 3; hour++) {
+      await expire();
+      expect(await claimSearchJobs(pg, 10)).toEqual([]);
+      await probeDue();
+      expect(await settleSearchJob(pg, await claimOne(pg), "busy")).toMatchObject({ probe: true });
+    }
+    // The lock clears; the next hourly probe (an hour on: the 30 s backoff long past) completes the pass.
+    await expire();
+    await probeDue();
+    expect(await settleSearchJob(pg, await claimOne(pg), "done")).toEqual({ applied: true, action: "deleted" });
+    const s = await state();
+    expect({ jobs: s.jobs, contention: s.contention, receipts: s.receipts, letters: s.letters }).toEqual({ jobs: [], contention: [], receipts: [], letters: [] });
+    expect(s.events.filter((e) => e.status === "replayed")).toEqual([]);
+  }, 120_000);
+
+  test("a newer epoch releases a hold: claimable now at its own epoch, contention reset", async () => {
+    const w8 = wake(scope, 8);
+    const { pg, state, holdAll, wakeNow } = await asLogin("bare", seeded(wake(scope, 7)));
+    await holdAll(false);
+    expect(await claimSearchJobs(pg, 10)).toEqual([]);
+    await wakeNow(w8);
+    const c = await claimOne(pg);
+    expect({ epoch: c.claimedEpoch, attempts: c.attempts, message: c.claimedMessage }).toEqual({ epoch: 8, attempts: 1, message: w8 });
+    expect((await state()).contention).toEqual([]);
+    expect(await settleSearchJob(pg, c, "done")).toEqual({ applied: true, action: "deleted" });
+  }, 120_000);
+
+  test("the fleet probe budget: with 10 held-due scopes and C = 6, at most 6 probes are admitted; a refill admits more", async () => {
+    const held = Array.from({ length: 10 }, (_, n) => wake({ ...scope, sessionId: `s_held_${n}` }, 1));
+    const { pg, state, holdAll, budget } = await asLogin("bare", async (p) => { await seeded(...held)(p); await p.query("SELECT public.fx_hold_all(true)"); });
+    void holdAll;
+    await budget(6, 0);
+    const admitted: string[] = [];
+    for (let n = 0; n < 10; n++) {
+      const got = await claimSearchJobs(pg, 1);
+      // At most one probe per call, even when more slots are asked for.
+      if (got.length) { admitted.push(got[0]!.id); expect(await settleSearchJob(pg, got[0]!, "busy")).toMatchObject({ probe: true }); }
+    }
+    expect(admitted).toHaveLength(6);
+    expect(await claimSearchJobs(pg, 10)).toEqual([]);
+    // 30 s of refill at R = 6/min: three more.
+    await budget(0, 30);
+    const more = [];
+    for (let n = 0; n < 5; n++) { const got = await claimSearchJobs(pg, 10); expect(got.length).toBeLessThanOrEqual(1); more.push(...got); }
+    expect(more.length).toBe(3);
+    // Oldest-due first: the probes taken are distinct scopes, none twice.
+    expect(new Set([...admitted, ...more.map((m) => m.id)]).size).toBe(9);
+    expect((await state()).letters).toEqual([]);
+  }, 120_000);
+
+  test("sequential mixed load: ordinary work is always ready; 22 held-due scopes get probes only from the bucket and recover", async () => {
+    let next = 0;
+    const ordinary = () => wake({ ...scope, sessionId: `s_ord_${next++}` }, 1);
+    const held = Array.from({ length: 22 }, (_, n) => wake({ ...scope, sessionId: `s_hot_${String(n).padStart(2, "0")}` }, 1));
+    const heldKeys = new Set(held.map((w) => w.workKey));
+    const { pg, state, budget, wakeNow } = await asLogin("bare", async (p) => {
+      await seeded(...held)(p);
+      await p.query("SELECT public.fx_hold_all(true)");
+    });
+    for (let n = 0; n < 4; n++) await wakeNow(ordinary());
+    await budget(6, 0);
+    let probes = 0, done = 0;
+    const started = Date.now();
+    for (let n = 0; n < 60; n++) {
+      await wakeNow(ordinary());
+      const c = await claimOne(pg);
+      if (heldKeys.has(c.claimedMessage.workKey)) {
+        probes += 1;
+        // The probe finds the lock free: the held scope recovers.
+        expect(await settleSearchJob(pg, c, "done")).toEqual({ applied: true, action: "deleted" });
+      } else {
+        done += 1;
+        expect(await settleSearchJob(pg, c, "done")).toEqual({ applied: true, action: "deleted" });
+      }
+    }
+    const minutes = (Date.now() - started) / 60_000;
+    expect(probes).toBeGreaterThanOrEqual(1);
+    expect(probes).toBeLessThanOrEqual(6 + Math.ceil(6 * minutes));
+    expect(done).toBe(60 - probes);
+    const s = await state();
+    // Recovered held scopes are gone with their contention; the rest stay held, unparked.
+    expect(s.contention).toHaveLength(22 - probes);
+    expect(s.letters).toEqual([]);
+    // The ordinary queue never emptied.
+    expect(s.jobs.filter((j) => !heldKeys.has(j.message.workKey)).length).toBeGreaterThanOrEqual(4);
+    console.log(JSON.stringify({ sequentialMixedLoad: { claims: 60, ordinaryCompleted: done, probesAdmitted: probes, heldRemaining: 22 - probes } }));
+  }, 120_000);
+
+  test("low cadence, limit 1: calls spaced wider than the refill interval, both queues ready: probes take at most every other call", async () => {
+    let next = 0;
+    const ordinary = () => wake({ ...scope, sessionId: `s_low_${next++}` }, 1);
+    const held = Array.from({ length: 12 }, (_, n) => wake({ ...scope, sessionId: `s_lowheld_${String(n).padStart(2, "0")}` }, 1));
+    const heldKeys = new Set(held.map((w) => w.workKey));
+    const { pg, state, budget, wakeNow } = await asLogin("bare", async (p) => { await seeded(...held)(p); await p.query("SELECT public.fx_hold_all(true)"); });
+    for (let n = 0; n < 3; n++) await wakeNow(ordinary());
+    const kinds: Array<"probe" | "ordinary"> = [];
+    for (let n = 0; n < 24; n++) {
+      // Each call arrives after a full refill interval: the bucket is never the limit.
+      await budget(6, 60);
+      await wakeNow(ordinary());
+      const c = await claimOne(pg);
+      kinds.push(heldKeys.has(c.claimedMessage.workKey) ? "probe" : "ordinary");
+      expect(await settleSearchJob(pg, c, "done")).toEqual({ applied: true, action: "deleted" });
+    }
+    const probes = kinds.filter((k) => k === "probe").length;
+    // Never two probes in a row while ordinary work is ready; so ordinary waits at most one call.
+    expect(kinds.some((k, i) => k === "probe" && kinds[i - 1] === "probe")).toBe(false);
+    expect(probes).toBe(12);
+    expect(kinds.length - probes).toBeGreaterThanOrEqual(kinds.length / 2);
+    expect((await state()).contention).toEqual([]);
+    console.log(JSON.stringify({ lowCadence: { calls: kinds.length, ordinary: kinds.length - probes, probes, sequence: kinds.map((k) => k[0]).join("") } }));
+  }, 120_000);
+
+  test("expired-lease reclaims: 5 consecutive expiries do not park, the 6th parks atomically (persisted across a fresh client)", async () => {
+    const w = wake(scope, 7);
+    let last: ClaimedSearchJob | undefined;
+    // Phase one as the owner, then a FRESH client on the same data: the count is persisted, not process state.
+    const { pg, state, expire } = await asLogin("bare", async (p) => {
+      await seeded(w)(p);
+      await claimSearchJobs(p, 1);
+      for (let n = 1; n <= 3; n++) { await p.query("SELECT public.fx_expire()"); await claimSearchJobs(p, 1); }
+    }, { restart: true });
+    expect((await state()).receipts.map((r) => r.reclaims)).toEqual([3]);
+    for (let n = 4; n <= 5; n++) { await expire(); last = await claimOne(pg); expect((await state()).receipts.map((r) => r.reclaims)).toEqual([n]); }
+    // The 6th: an atomic park. A failure midway changes nothing.
+    await expire();
+    await pg.exec("SET fx.fail = 'on'");
+    const before = await state();
+    expect(await codeOf(claimSearchJobs(pg, 10))).toBe("P0001");
+    expect(await state()).toEqual(before);
+    await pg.exec("SET fx.fail = 'off'");
+    expect(await claimSearchJobs(pg, 10)).toEqual([]);
+    const s = await state();
+    expect({ jobs: s.jobs, receipts: s.receipts, contention: s.contention }).toEqual({ jobs: [], receipts: [], contention: [] });
+    expect(s.letters.map((l) => ({ id: l.id, message: l.message, trace: l.provenance.trace }))).toEqual([{ id: searchLetterId(w), message: last!.claimedMessage, trace: w.ctx.traceId }]);
+    expect(s.events.filter((e) => e.status === "dead_lettered").map((e) => ({ code: e.code, expired: e.attrs.expired_leases }))).toEqual([{ code: "expired_lease_reclaims", expired: 6 }]);
+  }, 120_000);
+
+  test("the reclaim count resets on a settled pass (busy) and on a newer epoch", async () => {
+    const { pg, state, expire, wakeNow } = await asLogin("bare", seeded(wake(scope, 7)));
+    await claimOne(pg);
+    for (let n = 1; n <= 4; n++) { await expire(); await claimOne(pg); }
+    expect((await state()).receipts.map((r) => r.reclaims)).toEqual([4]);
+    // A newer epoch merged during the lease: the next expiry's reclaim counts from 0.
+    await wakeNow(wake(scope, 8));
+    await expire();
+    const c = await claimOne(pg);
+    expect((await state()).receipts.map((r) => r.reclaims)).toEqual([0]);
+    for (let n = 1; n <= 3; n++) { await expire(); await claimOne(pg); }
+    expect((await state()).receipts.map((r) => r.reclaims)).toEqual([3]);
+    void c;
+    // Any settled pass (busy here) deletes the receipt: the count is gone.
+    const [cur] = (await state()).receipts;
+    expect(await settleSearchJob(pg, { id: cur!.id, lease: cur!.lease }, "busy")).toMatchObject({ action: "busy" });
+    await expire();
+    await claimOne(pg);
+    expect((await state()).receipts.map((r) => r.reclaims)).toEqual([0]);
+  }, 120_000);
+});
+
+// ---------------------------------------------------------------------------------------------------------
+describe("resume_search_contention_v1 (operator, service_role only)", () => {
+  test("service_role resumes a held job with an audit event (operator text, session_user, current_user, clock); refused while a lease is live", async () => {
+    const { pg } = await clonedReplayDatabase();
+    cleanup.push(() => pg.close());
+    await pg.exec(FIXTURES);
+    await enqueueSearchWake(pg, wake(scope, 7));
+    await pg.query("SELECT public.fx_hold_all(true)");
+    const id = (await pg.query<{ id: string }>("SELECT id::text FROM sessions.pipeline_jobs WHERE stage = 'search-index'")).rows[0]!.id;
+    const resume = (operator: string) => pg.query<{ r: { applied: boolean; reason?: string } }>("SELECT sessions.resume_search_contention_v1($1::bigint, $2) AS r", [id, operator]);
+    // A live lease (a probe in flight): refused, nothing changed.
+    const [probe] = await claimSearchJobs(pg, 1);
+    expect(probe).toBeDefined();
+    await pg.exec("SET ROLE service_role");
+    expect((await resume("ops-oncall")).rows[0]!.r).toEqual({ applied: false, reason: "lease_live" });
+    expect(await codeOf(resume(""))).toBe("22023");
+    await pg.exec("RESET ROLE");
+    expect(await settleSearchJob(pg, probe!, "busy")).toMatchObject({ probe: true });
+    await pg.exec("SET ROLE service_role");
+    expect((await resume("ops-oncall")).rows[0]!.r).toEqual({ applied: true, epoch: 7 });
+    expect((await resume("ops-oncall")).rows[0]!.r).toEqual({ applied: false, reason: "not_held" });
+    await pg.exec("RESET ROLE");
+    const audit = (await pg.query<{ attrs: Record<string, unknown>; code: string }>(
+      "SELECT attrs, error->>'code' AS code FROM sessions.pipeline_events WHERE error->>'code' = 'scope_contention_resumed'")).rows;
+    expect(audit).toHaveLength(1);
+    expect(audit[0]!.attrs).toMatchObject({ operator: "ops-oncall", session_user: "postgres", epoch: 7 });
+    expect(typeof audit[0]!.attrs.current_user).toBe("string");
+    expect(Number.isFinite(Date.parse(String(audit[0]!.attrs.resumed_at)))).toBe(true);
+    expect((await pg.query("SELECT held_at, next_probe_at FROM sessions.search_job_contention")).rows).toEqual([{ held_at: null, next_probe_at: null }]);
+    // Released: claimable on the ordinary cadence again (once its 30 s backoff passes).
+    await pg.query("SELECT public.fx_expire()");
+    expect(await claimSearchJobs(pg, 1)).toHaveLength(1);
+  }, 120_000);
+
+  test("the unprivileged LOGIN cannot resume (42501)", async () => {
+    const { pg } = await asLogin("bare", async (p) => { await enqueueSearchWake(p, wake(scope, 7)); await p.query("SELECT public.fx_hold_all(true)"); });
+    expect(await codeOf(pg.query("SELECT sessions.resume_search_contention_v1(1, 'login')"))).toBe("42501");
+    expect(await codeOf(pg.query("SELECT * FROM sessions.search_probe_budget"))).toBe("42501");
+    expect(await codeOf(pg.query("SELECT * FROM sessions.search_job_contention"))).toBe("42501");
+  }, 120_000);
 });

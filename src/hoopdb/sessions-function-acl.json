@@ -1472,6 +1472,10 @@
       "service_role:EXECUTE",
       "search_consumer_runtime:EXECUTE"
     ],
+    "sessions.resume_search_contention_v1(bigint,text)": [
+      "<owner>:EXECUTE",
+      "service_role:EXECUTE"
+    ],
     "sessions.retry_session_brief_documents(uuid,text)": [
       "<owner>:EXECUTE",
       "service_role:EXECUTE"

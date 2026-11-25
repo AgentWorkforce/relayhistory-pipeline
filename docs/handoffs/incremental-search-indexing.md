@@ -214,8 +214,9 @@ lose a follow-up wake that arrived during the pass. Each statement keys on `(id,
 SECURITY DEFINER with the same pinned search_path, returning `{applied, action}`. The SQL below is its body; the
 caller supplies no epoch, message, attempt, scope or delay:
 
-- outcomes are allowlisted: `done` | `retry` (anything else raises 22023). `exhausted` is not a caller outcome: the
-  server exhausts a `retry` at its max attempts (12) and backs off `min(900, 30 * 2^(attempt-1))` s otherwise;
+- outcomes are allowlisted: `done` | `retry` | `busy` (anything else raises 22023). `exhausted` is not a caller
+  outcome: the server exhausts a `retry` at its max attempts (12) and backs off `min(900, 30 * 2^(attempt-1))` s
+  otherwise; `busy` is bounded below;
 - it loads the job row and the receipt `FOR UPDATE` and requires `stage = 'search-index'`, the row's lease and the
   receipt's lease both equal to `p_lease`, and the lease unexpired on the wall clock read after both row locks
   (`visible_at` and `lease_until` both after `clock_timestamp()`, never the transaction start).
@@ -278,6 +279,39 @@ caller supplies no epoch, message, attempt, scope or delay:
   - A later wake inserts a fresh row, so a newly accepted revision is not blocked by an old quarantine.
   - Test R4b: N exhausts after N+1 merged into the leased row. N lands in dead letters; the row survives with
     epoch N+1 and attempts 0.
+
+**Bounded busy, contention and the reclaim cap [least privilege, M2].** All server-side, inside the claim and settle
+functions, in their own transactions:
+
+- **`busy`** (the pass found `scope_busy` or `canonical_scope_busy`; the Lambda sends it) never spends the 12-attempt
+  budget and never parks. At the claimed epoch it gives back the attempt the claim counted (attempts = the receipt's
+  attempt - 1), deletes the receipt, holds the job a fixed 30 s, and writes a durable `retrying` event
+  (`scope_busy`, retryable; the idempotency key carries the lease id). If a newer epoch merged during the lease it
+  reopens now at attempts 0 instead.
+- **Contention state** lives outside the receipt in `sessions.search_job_contention` (owner-only, no grant): one row
+  per contended job at its epoch (first and last contended, count, last escalation, `held_at`, `next_probe_at`). A
+  done, a substantive retry, an exhaustion or a newer epoch clears it in the same transaction.
+- **Escalation:** at 2 h of same-epoch contention, then at most hourly (`last_escalated_at`), a
+  `scope_contention_escalated` event; the settle result carries `escalated`, `contended_for_s`, `contention_count`.
+- **The 24 h cap (hold and hourly probe):** at 24 h the job is HELD (`held_at`, `next_probe_at` = now + 1 h; event
+  `scope_contention_held`). A held job is never ordinary work; the claim admits it as a probe once `next_probe_at`
+  is due (oldest due first, then job id), moving the next probe an hour on; a busy probe writes
+  `scope_contention_probe`. A probe that finds the lock free completes normally, so a static scope recovers with no
+  replay. A newer epoch releases the hold. `sessions.resume_search_contention_v1(job_id, operator)` (service_role
+  only; search-index only; row locks; refuses while a lease is live) clears a hold and audits the operator text,
+  `session_user`, `current_user` and the clock.
+- **Fleet probe budget:** `sessions.search_probe_budget`, one owner-only row, a token bucket shared by every claimer
+  under `FOR UPDATE`. Defaults: refill **R = 6 per minute**, burst **C = 6**, initial balance **6 tokens**; tunable by
+  an owner UPDATE of the row. Probes admitted over any interval are at most C + R x elapsed minutes. Per claim call:
+  if a held scope is due and a token is available, the probe takes ONE slot and the rest are ordinary; at most one
+  probe per call. **Ordinary turn:** after a call that served a probe, the next call serves ordinary work if any is
+  ready (`last_served_kind`), so with limit 1 probes take at most every other call however slowly calls arrive; with
+  no ordinary work ready, probes may run back to back within the bucket.
+- **Expired-lease reclaim cap** (a worker that dies or hangs; this may park): the persisted receipt counts consecutive
+  abandoned leases at one epoch (`reclaim_count`); it resets on a newer epoch and on any settled pass (every
+  settlement deletes the receipt). At exactly 6 consecutive same-epoch expiries the claim parks the previous claim's
+  snapshot (code `expired_lease_reclaims`) and deletes the row, receipt and contention, atomically.
+- The down migration refuses while any receipt or contention row exists, and drops both tables and the budget row.
 
 ### 3.3b Dead-letter replay [rev 4, rev 5]
 
