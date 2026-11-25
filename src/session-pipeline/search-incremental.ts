@@ -17,10 +17,29 @@ export interface SearchBatchWatermark {
   chainDigest: string;
 }
 
+export interface SearchManifestChain {
+  manifestKey: string;
+  chunks: readonly SearchChainChunk[];
+}
+
 export type SearchIncrementalPlan =
   | { mode: "full"; reason: "missing_watermark" | "manifest_changed" | "invalid_chunks" | "watermark_out_of_range" | "prefix_mismatch" }
   | { mode: "noop"; lastSeq: number; chainDigest: string }
   | { mode: "incremental"; fromSeq: number; lastSeq: number; chainDigest: string };
+type SearchIncrementalFullReason = Extract<SearchIncrementalPlan, { mode: "full" }>["reason"];
+
+export type SearchScopeIncrementalPlan =
+  | {
+      mode: "full";
+      reason: "invalid_manifest_set" | "watermark_set_changed" | SearchIncrementalFullReason;
+      manifestKey?: string;
+    }
+  | { mode: "noop"; watermarks: SearchBatchWatermark[] }
+  | {
+      mode: "incremental";
+      reads: Array<{ manifestKey: string; fromSeq: number }>;
+      watermarks: SearchBatchWatermark[];
+    };
 
 const HEX_64 = /^[0-9a-f]{64}$/u;
 const ZERO_DIGEST = Buffer.alloc(32);
@@ -94,11 +113,64 @@ export function planSearchIncrementalApply(input: {
   return { mode: "incremental", fromSeq: watermark.lastSeq + 1, lastSeq, chainDigest };
 }
 
+function uniqueManifestMap<T extends { manifestKey: string }>(rows: readonly T[]): Map<string, T> | null {
+  const out = new Map<string, T>();
+  for (const row of rows) {
+    if (!row.manifestKey || out.has(row.manifestKey)) return null;
+    out.set(row.manifestKey, row);
+  }
+  return out;
+}
+
+/**
+ * Plan one canonical scope, which can contain several live manifests. A scope
+ * is incremental only when the watermark set is exactly the live manifest set
+ * and every manifest proves the prefix it previously recorded. A new, removed
+ * or duplicate manifest therefore selects the full path.
+ *
+ * `reads` contains only manifests with appended chunks. The caller may skip
+ * unchanged siblings, but must commit the complete returned watermark set in
+ * one CAS with the scope's search update.
+ */
+export function planSearchScopeIncrementalApply(input: {
+  manifests: readonly SearchManifestChain[];
+  watermarks: readonly SearchBatchWatermark[] | null;
+}): SearchScopeIncrementalPlan {
+  const manifests = uniqueManifestMap(input.manifests);
+  if (!manifests || manifests.size === 0) return { mode: "full", reason: "invalid_manifest_set" };
+  const watermarks = input.watermarks && uniqueManifestMap(input.watermarks);
+  if (!watermarks || watermarks.size !== manifests.size || [...manifests.keys()].some((key) => !watermarks.has(key)))
+    return { mode: "full", reason: "watermark_set_changed" };
+
+  const reads: Array<{ manifestKey: string; fromSeq: number }> = [];
+  const next: SearchBatchWatermark[] = [];
+  for (const manifestKey of [...manifests.keys()].sort()) {
+    const manifest = manifests.get(manifestKey)!;
+    const plan = planSearchIncrementalApply({ manifestKey, chunks: manifest.chunks, watermark: watermarks.get(manifestKey)! });
+    if (plan.mode === "full") return { mode: "full", reason: plan.reason, manifestKey };
+    next.push({ manifestKey, lastSeq: plan.lastSeq, chainDigest: plan.chainDigest });
+    if (plan.mode === "incremental") reads.push({ manifestKey, fromSeq: plan.fromSeq });
+  }
+  return reads.length === 0 ? { mode: "noop", watermarks: next } : { mode: "incremental", reads, watermarks: next };
+}
+
 /** The database adapter maps `retry` to a fresh read and plan; it never overwrites a winner. */
 export async function commitSearchWatermarkCas(input: {
   expected: SearchBatchWatermark;
   next: SearchBatchWatermark;
   compareAndSet: (expected: SearchBatchWatermark, next: SearchBatchWatermark) => Promise<boolean>;
+}): Promise<"committed" | "retry"> {
+  return (await input.compareAndSet(input.expected, input.next)) ? "committed" : "retry";
+}
+
+/** Scope-level CAS: the database adapter updates every manifest watermark atomically. */
+export async function commitSearchScopeWatermarksCas(input: {
+  expected: readonly SearchBatchWatermark[];
+  next: readonly SearchBatchWatermark[];
+  compareAndSet: (
+    expected: readonly SearchBatchWatermark[],
+    next: readonly SearchBatchWatermark[],
+  ) => Promise<boolean>;
 }): Promise<"committed" | "retry"> {
   return (await input.compareAndSet(input.expected, input.next)) ? "committed" : "retry";
 }

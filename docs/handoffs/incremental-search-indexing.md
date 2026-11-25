@@ -739,12 +739,17 @@ content `sha256` (`packages/object-store/src/manifest.ts:53-62`).
   `seq > last_seq` are read and upserted. If they differ, the chunks were mutated, compacted, rewritten or
   re-epoched: do a full pass and reset the watermark.
 - **CAS:** `UPDATE … WHERE last_seq = $old_seq AND chain_digest = $old_digest`. A lost CAS retries the pass.
+- **Canonical scopes with siblings:** the live manifest-key set must equal the watermark-key set and every sibling
+  must prove its recorded prefix. A new, removed, duplicated or mutated sibling selects one full scope pass. When
+  the sets match, only siblings with appended chunks are read; the complete new watermark set commits in one CAS.
 - **Erasure or a recreate with a new canonical id:** a full pass, then reset.
 - **Tests:**
   - incremental equals full on every fixture;
   - R7: same seq, changed `sha256`, forces a full pass;
   - compaction forces a full pass;
   - a lost CAS retries.
+- **Offline planner benchmark:** `bun scripts/bench/search-incremental-plan.ts`. It reports metadata-plan p50/p90 and
+  the full-versus-incremental chunk-object read counts; it performs no network, database or object-store I/O.
 
 ## 12. Milestones
 

@@ -1,7 +1,9 @@
 import { describe, expect, test } from "bun:test";
 import {
+  commitSearchScopeWatermarksCas,
   commitSearchWatermarkCas,
   planSearchIncrementalApply,
+  planSearchScopeIncrementalApply,
   searchChunkChain,
   type SearchBatchWatermark,
   type SearchChainChunk,
@@ -67,5 +69,74 @@ describe("M3 search chunk watermark", () => {
     const next = watermark(2);
     expect(await commitSearchWatermarkCas({ expected, next, compareAndSet: async () => false })).toBe("retry");
     expect(await commitSearchWatermarkCas({ expected, next, compareAndSet: async (old, value) => old === expected && value === next })).toBe("committed");
+  });
+
+  test("a multi-manifest scope reads only siblings with appended chunks", () => {
+    const sibling = chunks.map((chunk) => ({ ...chunk, sha256: hash(String(chunk.seq + 4)) }));
+    const manifests = [
+      { manifestKey: "a/manifest.json", chunks },
+      { manifestKey: "b/manifest.json", chunks: sibling },
+    ];
+    const watermarks = [
+      { ...watermark(1), manifestKey: manifests[0]!.manifestKey },
+      { ...watermark(2, sibling), manifestKey: manifests[1]!.manifestKey },
+    ];
+    const plan = planSearchScopeIncrementalApply({ manifests, watermarks });
+    expect(plan).toEqual({
+      mode: "incremental",
+      reads: [{ manifestKey: "a/manifest.json", fromSeq: 2 }],
+      watermarks: [
+        { manifestKey: "a/manifest.json", lastSeq: 2, chainDigest: searchChunkChain(chunks)[2] },
+        { manifestKey: "b/manifest.json", lastSeq: 2, chainDigest: searchChunkChain(sibling)[2] },
+      ],
+    });
+  });
+
+  test("a changed manifest set or one changed sibling forces the whole scope full", () => {
+    const key = "a/manifest.json";
+    expect(planSearchScopeIncrementalApply({ manifests: [{ manifestKey: key, chunks }], watermarks: [] }))
+      .toEqual({ mode: "full", reason: "watermark_set_changed" });
+    expect(planSearchScopeIncrementalApply({ manifests: [{ manifestKey: key, chunks }, { manifestKey: key, chunks }], watermarks: [] }))
+      .toEqual({ mode: "full", reason: "invalid_manifest_set" });
+    const changed = chunks.map((chunk, i) => i === 0 ? { ...chunk, sha256: hash("9") } : chunk);
+    expect(planSearchScopeIncrementalApply({
+      manifests: [{ manifestKey: key, chunks: changed }],
+      watermarks: [{ ...watermark(1), manifestKey: key }],
+    })).toEqual({ mode: "full", reason: "prefix_mismatch", manifestKey: key });
+  });
+
+  test("incremental chunk selection equals the full ordered fixture", () => {
+    let state = 0x96b115;
+    const random = () => (state = (state * 1664525 + 1013904223) >>> 0);
+    for (let fixture = 0; fixture < 100; fixture++) {
+      const count = 2 + (random() % 30);
+      const split = random() % (count - 1);
+      const generated = Array.from({ length: count }, (_, seq): SearchChainChunk => ({
+        seq,
+        epoch: 1 + (random() % 4),
+        start_offset: seq * 100,
+        sha256: random().toString(16).padStart(8, "0").repeat(8),
+      }));
+      const key = `fixture-${fixture}/manifest.json`;
+      const prior = generated.slice(0, split + 1).map((chunk) => `${chunk.seq}:${chunk.sha256}`);
+      const expected = generated.map((chunk) => `${chunk.seq}:${chunk.sha256}`);
+      const wm: SearchBatchWatermark = {
+        manifestKey: key,
+        lastSeq: split,
+        chainDigest: searchChunkChain(generated.slice(0, split + 1))[split]!,
+      };
+      const plan = planSearchScopeIncrementalApply({ manifests: [{ manifestKey: key, chunks: generated }], watermarks: [wm] });
+      expect(plan.mode).toBe("incremental");
+      if (plan.mode !== "incremental") throw new Error("fixture did not plan incrementally");
+      const appended = generated.slice(plan.reads[0]!.fromSeq).map((chunk) => `${chunk.seq}:${chunk.sha256}`);
+      expect([...prior, ...appended]).toEqual(expected);
+    }
+  });
+
+  test("scope CAS never overwrites a winner", async () => {
+    const expected = [{ ...watermark(1), manifestKey: "a" }];
+    const next = [{ ...watermark(2), manifestKey: "a" }];
+    expect(await commitSearchScopeWatermarksCas({ expected, next, compareAndSet: async () => false })).toBe("retry");
+    expect(await commitSearchScopeWatermarksCas({ expected, next, compareAndSet: async (old, value) => old === expected && value === next })).toBe("committed");
   });
 });
