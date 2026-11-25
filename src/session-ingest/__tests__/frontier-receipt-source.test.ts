@@ -179,6 +179,8 @@ describe("bounded receipt source capability client (synthetic SQL only)", () => 
       { ...input, functionOwner: FRONTIER_RECEIPT_READER_ROLE },
       { ...input, functionOwner: "bulls96_session_ingest_seeder" },
       { ...input, functionOwner: "bulls96_session_ingest" },
+      { ...input, functionOwner: "bulls96_publication_scoped" },
+      { ...input, functionOwner: "bulls96_publication_recovery" },
       { ...input, functionOwner: "unqualified owner" },
       { ...input, bounds: { ...input.bounds, maxDurationMs: 120_001 } },
     ]) await expect(captureFrontierReceiptSource(f.db, request)).rejects.toMatchObject({ code: "frontier_receipt_input" });
