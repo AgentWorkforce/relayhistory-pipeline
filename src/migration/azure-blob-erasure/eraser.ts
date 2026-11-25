@@ -52,6 +52,10 @@ const MAX_INVENTORY_BYTES = 16 * 1024 * 1024;
 const DELETED = "deleted:";
 const SNAPSHOT = "snapshot:";
 const cmpC = (a: string, b: string) => (a < b ? -1 : a > b ? 1 : 0);
+
+/** Which request an Azure status error came from, so a caller classifies a 403 or 404 by operation, never in bulk. */
+export type AzureEraseOp = "list" | "delete";
+const opError = (code: string, message: string, op: AzureEraseOp) => Object.assign(coded(code, message), { op });
 const CONTROL = /[\x00-\x1f\x7f]/u;
 
 /** The checkpoint binding label: account and container, so a checkpoint never crosses either. */
@@ -70,6 +74,7 @@ export function createAzureBlobEraser(cfg: AzureBlobEraserConfig): PagedEraser {
 
   /** One signed request; never follows a redirect; the caller maps statuses. */
   async function request(method: "GET" | "DELETE", url: URL, extra: Record<string, string> = {}): Promise<Response> {
+    const op: AzureEraseOp = method === "GET" ? "list" : "delete";
     const headers = new Headers(extra);
     headers.set("x-ms-version", AZURE_API_VERSION);
     headers.set("x-ms-date", new Date().toUTCString());
@@ -78,11 +83,11 @@ export function createAzureBlobEraser(cfg: AzureBlobEraserConfig): PagedEraser {
     try {
       res = await doFetch(url, { method, headers, redirect: "manual", signal: AbortSignal.timeout(cfg.timeoutMs ?? 30_000) });
     } catch {
-      throw coded("azure_unavailable", `Azure ${method} failed`);
+      throw opError("azure_unavailable", `Azure ${method} failed`, op);
     }
     if (res.type === "opaqueredirect" || res.redirected || (res.status >= 300 && res.status < 400)) {
       await res.body?.cancel().catch(() => {});
-      throw coded("azure_redirect", `Azure ${method} answered a redirect`);
+      throw opError("azure_redirect", `Azure ${method} answered a redirect`, op);
     }
     return res;
   }
@@ -127,7 +132,7 @@ export function createAzureBlobEraser(cfg: AzureBlobEraserConfig): PagedEraser {
     u.searchParams.set("maxresults", String(pageSize));
     if (marker !== undefined) u.searchParams.set("marker", marker);
     const res = await request("GET", u);
-    if (!res.ok) { await res.body?.cancel().catch(() => {}); throw coded(`azure_${res.status}`, "Azure list failed"); }
+    if (!res.ok) { await res.body?.cancel().catch(() => {}); throw opError(`azure_${res.status}`, "Azure list failed", "list"); }
     const xml = await boundedText(res);
     assertInventoryXml(xml, "EnumerationResults");
     // An Encoded name (characters XML cannot carry) is refused rather than guessed.
@@ -219,10 +224,10 @@ export function createAzureBlobEraser(cfg: AzureBlobEraserConfig): PagedEraser {
     if (res.ok || res.status === 404) return;
     // A permanent delete refused: 403 is a permission the key or account lacks; 400/409 is the account's retention
     // (soft delete without permanent delete enabled). Both keep the copy, so both block erasure.
-    if (onRefused && res.status === 403) throw coded("azure_permanent_delete_forbidden", "Azure forbade a permanent delete");
-    if (onRefused && (res.status === 400 || res.status === 409)) throw coded(onRefused, "Azure refused a permanent delete");
-    if (res.status === 412) throw coded("azure_current_changed", "the current version changed");
-    throw coded(`azure_${res.status}`, "Azure DELETE failed");
+    if (onRefused && res.status === 403) throw opError("azure_permanent_delete_forbidden", "Azure forbade a permanent delete", "delete");
+    if (onRefused && (res.status === 400 || res.status === 409)) throw opError(onRefused, "Azure refused a permanent delete", "delete");
+    if (res.status === 412) throw opError("azure_current_changed", "the current version changed", "delete");
+    throw opError(`azure_${res.status}`, "Azure DELETE failed", "delete");
   }
 
   /** Deletion class: snapshots, the current version, other versions, soft-deleted entries. */

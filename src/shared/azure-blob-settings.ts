@@ -1,7 +1,7 @@
 /**
- * THE parser of the Azure Blob settings that the session-analysis runner (runner.ts, LOCKER_PROVIDER=azure) and the
- * read API's analysis source (session-read-api/lambda.ts) both use, so the two cannot reach different stores or
- * validate differently:
+ * THE parser of the Azure Blob settings that the session-analysis runner (runner.ts, LOCKER_PROVIDER=azure), the
+ * read API's analysis source (session-read-api/lambda.ts) and the operator erase jobs (session-erase/*, with the
+ * SESSION_ERASE_AZURE_* family) all use, so none of them can validate differently. Shown with the default family:
  *
  *   SESSION_ANALYSIS_AZURE_ACCOUNT           3-24 lowercase letters or digits          azure_account_invalid
  *   SESSION_ANALYSIS_AZURE_CONTAINER         an Azure container name                   azure_container_invalid
@@ -31,20 +31,27 @@ export interface AzureBlobSettings {
   endpoint?: string;
 }
 
+/**
+ * The variable family: SESSION_ANALYSIS_AZURE (the runner and the read API, the default) or SESSION_ERASE_AZURE (the
+ * operator erase jobs). The rules and the refusal codes are the same for both.
+ */
+export type AzureSettingsPrefix = "SESSION_ANALYSIS_AZURE" | "SESSION_ERASE_AZURE";
+export const DEFAULT_AZURE_SETTINGS_PREFIX: AzureSettingsPrefix = "SESSION_ANALYSIS_AZURE";
+
 /** Account, container and endpoint (no secret is read; the plaintext key variable is refused by presence). */
-export function azureBlobSettings(env: NodeJS.ProcessEnv, fail: SettingsFail): AzureBlobSettings {
-  const account = env.SESSION_ANALYSIS_AZURE_ACCOUNT ?? "";
+export function azureBlobSettings(env: NodeJS.ProcessEnv, fail: SettingsFail, prefix: AzureSettingsPrefix = DEFAULT_AZURE_SETTINGS_PREFIX): AzureBlobSettings {
+  const account = env[`${prefix}_ACCOUNT`] ?? "";
   if (!/^[a-z0-9]{3,24}$/.test(account)) fail("azure_account_invalid");
-  const container = env.SESSION_ANALYSIS_AZURE_CONTAINER ?? "";
+  const container = env[`${prefix}_CONTAINER`] ?? "";
   if (!/^(?=.{3,63}$)[a-z0-9]+(?:-[a-z0-9]+)*$/.test(container)) fail("azure_container_invalid");
-  const plain = env.SESSION_ANALYSIS_AZURE_ACCOUNT_KEY;
+  const plain = env[`${prefix}_ACCOUNT_KEY`];
   if (plain !== undefined && plain !== "") fail("azure_account_key_plaintext");
-  const raw = env.SESSION_ANALYSIS_AZURE_ENDPOINT;
+  const raw = env[`${prefix}_ENDPOINT`];
   if (raw === undefined || raw === "") return { account, container };
   let policy: ReturnType<typeof destinationPolicy>;
   try { policy = destinationPolicy(env); } catch { return fail("allow_in_cluster_http_invalid"); }
   let url: URL;
-  try { url = assertDestinationUrl("SESSION_ANALYSIS_AZURE_ENDPOINT", raw, policy); } catch { return fail("azure_endpoint_invalid"); }
+  try { url = assertDestinationUrl(`${prefix}_ENDPOINT`, raw, policy); } catch { return fail("azure_endpoint_invalid"); }
   const path = url.pathname.replace(/\/+$/, "");
   if (path !== "" && path !== `/${account}`) fail("azure_endpoint_invalid");
   return { account, container, endpoint: `${url.origin}${path}` };
@@ -77,13 +84,13 @@ export function envSecret(env: NodeJS.ProcessEnv, name: string, code: string, fa
   return text;
 }
 
-/** The Shared Key from SESSION_ANALYSIS_AZURE_ACCOUNT_KEY_FILE only, behind a closure. */
-export function azureAccountKey(env: NodeJS.ProcessEnv, fail: SettingsFail): { accountKey: () => string } {
-  const plain = env.SESSION_ANALYSIS_AZURE_ACCOUNT_KEY;
+/** The Shared Key from <prefix>_ACCOUNT_KEY_FILE only, behind a closure. */
+export function azureAccountKey(env: NodeJS.ProcessEnv, fail: SettingsFail, prefix: AzureSettingsPrefix = DEFAULT_AZURE_SETTINGS_PREFIX): { accountKey: () => string } {
+  const plain = env[`${prefix}_ACCOUNT_KEY`];
   if (plain !== undefined && plain !== "") fail("azure_account_key_plaintext");
-  const file = env.SESSION_ANALYSIS_AZURE_ACCOUNT_KEY_FILE;
+  const file = env[`${prefix}_ACCOUNT_KEY_FILE`];
   if (file === undefined || file === "") fail("azure_account_key_missing");
-  const key = envSecret(env, "SESSION_ANALYSIS_AZURE_ACCOUNT_KEY", "azure_account_key", fail);
+  const key = envSecret(env, `${prefix}_ACCOUNT_KEY`, "azure_account_key", fail);
   let bytes = 0;
   if (key.length % 4 === 0 && /^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/.test(key)) {
     try { bytes = fromBase64(key).length; } catch { bytes = 0; }
