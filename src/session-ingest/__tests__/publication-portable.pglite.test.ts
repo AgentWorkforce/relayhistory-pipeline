@@ -226,3 +226,75 @@ test("disposable scoped v1 binds candidates, claim and final commit to one admit
   expect(await call("scoped_candidates_v1",{...scopeArgs,limit:1})).toEqual({stageTokens:[]});
   expect((await owner("SELECT count(*)::int n FROM sessions.ingest_publication_attempts WHERE stage_token=$1",[other])).rows[0].n).toBe(0);
 });
+
+test("generation PUT before scoped finalization cannot promote a finalized or abandoned session", async () => {
+  const { processBatch } = await import("../../session-pipeline/consumer.ts");
+  const { scopedPublicationCycle } = await import("../publication-scoped-rpc.ts");
+  const { relayhistoryNewestAcrossOrigins } = await import("../../../packages/pipeline/src/lib/pipeline/relayhistory-transform.ts");
+  const target = { bucket: BUCKET, region: REGION, keyRoot: "96bulls", generation: GEN, provider: "s3" as const };
+  const ledger = orderedFixtureLedger(sqlLedger(asIngest, { acceptanceMode: "buffered", expectedGeneration: GEN }), { query: owner });
+  if (!(await owner("SELECT to_regclass('sessions.fixture_scoped_admission') AS fixture")).rows[0].fixture)
+    await db.exec(read("src/session-ingest/__tests__/fixtures/publication-scoped-v1.sql"));
+
+  for (const commit of [false, true]) {
+    const id = commit ? "early-final" : "early-abort";
+    const payload = await batch([record({ record_id: id, session_id: id })], { batch_id: id });
+    expect((await deliverBatch({ ledger, target: { store, keyRoot: "96bulls" }, acceptanceMode: "buffered" }, TENANT, payload)).outcome).toBe("accepted_buffered");
+    const binding = { planSha256: "c".repeat(64), admissionId: crypto.randomUUID(), frontierSha256: "e".repeat(64),
+      tenant: { ...TENANT, originId: "origin-1" }, target };
+    await owner(`INSERT INTO sessions.fixture_scoped_admission(id,binding,stage,frontier_image,admission_image,stage_sha)
+      SELECT $1::uuid,$2::jsonb,s.stage_token,to_jsonb(f),to_jsonb(d),s.stage_sha256 FROM sessions.ingest_stage_intents s
+      JOIN sessions.ingest_publication_frontiers f USING(org_id,workspace_id,user_id,origin_id)
+      JOIN sessions.ingest_buffer_admission d USING(org_id) WHERE s.batch_id=$3`, [binding.admissionId, JSON.stringify(binding), id]);
+
+    const counts = async () => (await owner(`SELECT
+      (SELECT count(*)::int FROM sessions.session_index WHERE manifest_key=$1) AS pointers,
+      (SELECT count(*)::int FROM sessions.ingest_record_revisions WHERE record_id=$2) AS revisions,
+      (SELECT count(*)::int FROM sessions.pipeline_jobs WHERE stage='object-landed' AND work_key LIKE $1 || '@%') AS jobs`, [key, id])).rows[0];
+    let key = "";
+    const before = s3.requests.length;
+    let notifications = 0;
+    async function deliverPut() {
+      // processBatch uses only the reader provider to decode the S3 envelope.
+      // Any manifest read, DB lookup, search or fanout caused by this event fails the test.
+      const pointer = new Proxy({ reader: { provider: "s3" } }, {
+        get(target, prop) { if (prop === "reader") return target.reader; throw Error("early event accessed " + String(prop)); },
+      });
+      const result = await processBatch([{messageId: id, body: JSON.stringify({Records:[{
+        eventSource:"aws:s3", eventName:"ObjectCreated:Put", eventTime:"2026-11-01T00:00:00Z",
+        s3:{bucket:{name:BUCKET},object:{key:encodeURIComponent(key),eTag:"fixture-etag",sequencer:"01"}},
+      }]})}], {pointer: pointer as never});
+      expect(result.batchItemFailures).toEqual([]);
+      notifications++;
+    }
+    const transport = { queryBounded: async (sql: string, args: unknown[]) => {
+      if (sql.includes("ingest_publication_scoped_publish_v1(")) {
+        const manifests = s3.requests.slice(before).filter(r => r.method === "PUT" && r.key.includes("/upload-generations/") && r.key.endsWith("/manifest.json"));
+        expect(manifests).toHaveLength(1);
+        key = manifests[0]!.key;
+        expect(s3.objects.has(key)).toBe(true);
+        await deliverPut();
+        expect(await counts()).toEqual({ pointers: 0, revisions: 0, jobs: 0 });
+        if (!commit) await owner("UPDATE sessions.fixture_scoped_admission SET enabled=false WHERE id=$1", [binding.admissionId]);
+      }
+      return asIngest(sql, args);
+    }};
+    const cycle = scopedPublicationCycle(transport as never, binding, {target, store: () => store}, {enabled: true});
+    if (commit) expect(await cycle).toMatchObject({published:1});
+    else await expect(cycle).rejects.toThrow("P0001");
+    expect(notifications).toBe(1);
+    expect((await owner(`SELECT a.state FROM sessions.ingest_publication_attempts a
+      JOIN sessions.fixture_scoped_admission f ON f.stage=a.stage_token WHERE f.id=$1`, [binding.admissionId])).rows)
+      .toEqual([{state: commit ? "published" : "rejected"}]);
+    const expected = commit ? 1 : 0;
+    await deliverPut(); // duplicate may arrive after the outcome
+    expect(await counts()).toEqual({pointers: expected, revisions: expected, jobs: expected});
+  }
+
+  // Separate projection boundary: a queue hint cannot supply an acceptance seat
+  // for two contending records. This is the actual fold used by the Reader.
+  expect(() => relayhistoryNewestAcrossOrigins([
+    {kind:"history",record_id:"contender",accepted_seq:"1"},
+    {kind:"history",record_id:"contender"},
+  ])).toThrow(expect.objectContaining({code:"relayhistory_acceptance_missing"}));
+});
