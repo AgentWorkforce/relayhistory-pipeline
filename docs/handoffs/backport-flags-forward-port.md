@@ -245,8 +245,8 @@ below changes real behaviour on main to match the deployed backport. With the fl
   60 s by default. So a stream needs at least 180 s of remaining time to start. With less, it returns
   `deferred`, like a second streamed scope:
   - **S3-event batch.** The scope is requeued with `stream_deferred`.
-  - **M2 job.** The outcome is `busy`, which `searchSettlementFor` already maps to the short retry
-    (`SEARCH_JOB_BUSY_RETRY_SECONDS`). The mapping is unchanged.
+  - **M2 job.** No job is claimed when the work could only be deferred (see "M2: no claim a deferral would
+    waste" below). A job that is deferred after its claim settles `busy`, which gives the attempt back.
   - Only a pass that has a deadline checks the start minimum. The self-host consumer never sets one.
 - **One stream per invocation, even without a context.** `invocationSearchDeps` gives every invocation its
   own `streamSlot` whenever streaming is armed. That includes the case with no Lambda context or a
@@ -254,8 +254,8 @@ below changes real behaviour on main to match the deployed backport. With the fl
   held, with no limit. Without a context there is still no deadline, as on the backport.
 - **Scheduled `{searchJobs: true}` path.** This path now uses `invocationSearchDeps(rt, context)`, so it
   gets the same slot, deadline, start minimum and guarded transaction as an SQS batch and its follow-on.
-  It used to pass `rt.deps.search` directly, with no slot and no deadline. `search-jobs.ts`, the claim, the
-  lease and the settlement mapping are unchanged.
+  It used to pass `rt.deps.search` directly, with no slot and no deadline. The claim SQL, the lease and the
+  epoch boundaries are unchanged.
 
 Tests in `stream-guards.pglite.test.ts`, through the real exported handler:
 
@@ -265,19 +265,87 @@ Tests in `stream-guards.pglite.test.ts`, through the real exported handler:
 - the scheduled path's slot, start minimum and no-context cases;
 - `transaction()` and `searchTransaction` statement parity and guard wiring.
 
-### Backport stream behaviours still not on main
+### The rest of the backport's streamed-reconcile protections
 
-These were not asked for and are not ported. A reviewer should decide whether they are needed.
+The backport commits are e79df11b, 6264d119, 51f876b6 and c9a0c68e. They apply only to a hosted streamed pass,
+meaning a pass that carries the invocation's `streamSlot`. The self-host consumer's streamed pass is unchanged.
 
-- **Batch deadline requeue.** On the backport (6264d119 and 51f876b6), once the invocation's stream deadline
-  has passed, no further scope of the batch starts, whole read or streamed. Each is requeued with the reason
-  `stream_batch_deadline`. On main, later scopes still run.
-- **Tail reserve.** The backport does not start its delete and catalog tail with less than
-  `STREAM_TAIL_RESERVE_MS` (30 s) left before the deadline.
-- **Keepalive check.** The backport's keepalive re-takes the scope lock and fails with
-  `stream_keepalive_failed` unless the lock is held. Main's keepalive is `SELECT 1`.
-- **Early state mark.** Before reading anything, the backport records `needs_full = 1` one millisecond
-  before the pass's own state time. Main records it when the pass stops.
+- **Batch deadline requeue (`stream_batch_deadline`).** Once the invocation's stream deadline has passed, no
+  further scope of an SQS batch starts, whole read or streamed. Each remaining scope is requeued with the
+  reason `stream_batch_deadline`, carrying the original upload time.
+  - If the requeue itself fails, that scope's messages fail and SQS redelivers them. Scopes already done
+    are acknowledged.
+  - The M2 analogue is the existing claim deadline: no job is claimed once the remaining time reaches the
+    margin.
+- **Tail reserve (`STREAM_TAIL_RESERVE_MS`, 30 s).** The pass does not start its tail with less than 30 s
+  left before the deadline. The tail is the delete statements, then the directory and catalog writes, the
+  state row and COMMIT.
+  - The check runs before the first delete statement, even with nothing to delete, and before every later
+    delete statement.
+  - Deletes go in chunks, each of which `deleteRows` sends as one statement: at most 500 keys, and within
+    its byte budget by an upper-bound estimate (`deleteStatementChunks`). An unthrottled lock check comes
+    before every chunk.
+  - A stop between chunks keeps the deletes already done and leaves the scope owing a pass
+    (`scope_too_large, stream_deadline`, `needs_full = 1`).
+- **Lock-checking keepalive.** The keepalive re-takes the scope lock the transaction already holds, which
+  is re-entrant. Any answer but `ok = true` throws `stream_keepalive_failed`, which is retryable. After
+  that no row is inserted or deleted, no directory or catalog write happens and no final state row is
+  written. The message fails and is redelivered.
+- **`needs_full = 1` before reading.** The pass records `needs_full = 1` one millisecond before its own
+  state time, before anything is read. A pass interrupted on the way, even one whose best-effort final
+  state write is lost, therefore leaves the scope owing a full pass. A previously failed or partial state
+  is never overwritten as complete. The next pass reads in full.
+- **Strict keyset pages.** Every keyset page of the ClickHouse scan must meet three conditions before
+  anything is projected or written:
+  - it holds at most the rows asked for;
+  - its keys are in strictly increasing order of (ts, session_id, machine_id, kind, event_id), with strings
+    compared as UTF-8 bytes;
+  - it comes after the previous page's last key.
+
+  Otherwise the pass stops with `clickhouse_page_invalid`. Nothing is written and the scope is owed a pass.
+  This check applies to every user of `legacyProjectionIo.scanPages`.
+
+### M2: no claim a deferral would waste
+
+Migration 062300 charges an attempt for a `retry` settlement and parks a job at attempt 12. Settling
+`stream_deferred` as a retry could therefore park a healthy job: on cc2ab4bb, twelve low-time invocations
+produced two dead letters.
+
+The search-jobs loop now checks, before every ordinary claim (`claim_search_jobs_v1`) and before the probe
+claim (`claim_search_probe_v1`), whether the invocation's stream slot is used or less than
+`STREAM_MIN_START_MS` is left before its stream deadline (`searchJobsStreamExhausted`). If either holds, it
+stops claiming. The run logs `state: stream_exhausted`.
+
+- **Jobs not claimed.** They keep their attempts, lease and contention state exactly as they were. The SQL
+  and its lease and epoch boundaries are unchanged.
+- **Jobs deferred after their claim.** This happens when the start minimum is crossed between the check and
+  the pass. Such a job settles `busy`, which 062300 settles without spending an attempt (`searchSettlementFor`
+  maps `stream_deferred` with the scope-lock codes).
+- **Throughput cost.** Once the slot is used, the rest of that invocation's jobs wait for the next
+  invocation.
+
+### Init check
+
+`SEARCH_INDEX_STREAM_DEADLINE_MARGIN_MS` plus the 120 s start minimum must fit in the 300 s function
+timeout (`LAMBDA_FUNCTION_TIMEOUT_MS`, pinned equal to the stack's `FUNCTION_TIMEOUT_SECONDS`). A larger
+margin is refused at init, and the error names the variable. The accepted range is 10 000 to 180 000.
+
+### Telemetry carried over
+
+The backport commits are ecb5d981 and 9279264f.
+
+- **Latency fields.** `event_age_ms`, `s3_event_age_ms` and `queue_origin` appear on "pointer indexed",
+  "search index reconciled" and "search index partial".
+- **Requeue bodies.** These are now `{"reconcile":{"key","requeued":true,"oldest_event_time"?}}`, so
+  `s3_event_age_ms` stays end to end across busy, deferred and batch-deadline requeues. The carried time is
+  stripped before any stage sees the event.
+- **`contender_seats`.** This is one of `all_unseated`, `seated_unseated`, `both` or `catalog_key`. It is set
+  on a whole-read pass refused with `relayhistory_acceptance_missing`.
+  - **Gap.** Main's streamed reader (`canonical-stream-projection.ts`) does not classify its acceptance
+    refusals, so a streamed pass carries no `contender_seats`.
+- **Log rules.** The allowlist keeps the ages only as non-negative integers and the words only as their
+  closed sets.
+- **Goldens.** The off-goldens drop these additive keys, as the backport's golden capture did.
 
 ## Acceptance-stamp cold start (salt acceptance-skip-v2)
 
