@@ -5,7 +5,9 @@ import * as AWS from "@alchemy.run/aws";
 import { fileURLToPath } from "node:url";
 import type { AwsInputs } from "../inputs.ts";
 import {
+  DEFAULT_POOLER_BUDGET,
   DELIVERY_DELAY_SECONDS,
+  HOOPDB_POOL_MAX,
   FUNCTION_TIMEOUT_SECONDS,
   SESSION_BRIEF_RESOURCES,
   SESSION_PIPELINE_RESOURCES,
@@ -25,6 +27,7 @@ import {
   sessionSearchMappingProps,
   sessionSearchQueuePolicy,
   sessionSearchQueueProps,
+  sessionPoolDemand,
   sessionSecretPolicy,
 } from "../session-pipeline.ts";
 import { assertTranscriptStoreInputs, assertTranscriptStorePlanContract, transcriptBucketPolicy, transcriptKeyPolicy, transcriptNames } from "../transcript-store.ts";
@@ -629,7 +632,8 @@ describe("session pipeline: search-queue split", () => {
     expect(() => ok({ searchQueue: { enabled: true, handoff: true } })).toThrow(/handoff requires searchIndex: true/);
     expect(() => ok({ searchIndex: true, searchQueue: { enabled: false, handoff: true } })).toThrow(/require enabled: true/);
     expect(() => ok({ searchQueue: { enabled: false, mappingEnabled: true } })).toThrow(/require enabled: true/);
-    for (const maxConcurrency of [1, 11, 2.5, "4"]) expect(() => ok({ searchQueue: { enabled: true, maxConcurrency } })).toThrow(/maxConcurrency must be an integer from 2 to 10/);
+    for (const maxConcurrency of [1, 21, 2.5, "4"]) expect(() => ok({ searchQueue: { enabled: true, maxConcurrency } })).toThrow(/maxConcurrency must be an integer from 2 to 20/);
+    expect(() => ok({ searchQueue: { enabled: true, maxConcurrency: 16 } })).not.toThrow();
     expect(() => ok({ searchQueue: { enabled: true, queueName: "x" } })).toThrow(/searchQueue.queueName is not a known setting/);
     expect(() => ok({ searchQueue: true })).toThrow(/searchQueue must be a plain object/);
   });
@@ -662,6 +666,31 @@ describe("session pipeline: search-queue split", () => {
     expect(consume.Principal).toEqual({ AWS: ROLE });
     expect(consume.Resource).toBe(p.searchQueueArn);
     expect([...consume.Action].sort()).toEqual(["sqs:ChangeMessageVisibility", "sqs:DeleteMessage", "sqs:GetQueueAttributes", "sqs:ReceiveMessage", "sqs:SendMessage"]);
+  });
+
+  it("pointer concurrency is representable at 10 and the live 20; its default 4 and the rendered env are unchanged", () => {
+    for (const maxConcurrency of [2, 10, 20]) expect(() => ok({ maxConcurrency })).not.toThrow();
+    for (const maxConcurrency of [1, 21, 2.5, "10"]) expect(() => ok({ maxConcurrency })).toThrow(/maxConcurrency must be an integer from 2 to 20/);
+    expect(sessionPipelineEnv({ stage: STAGE, bucket: t.bucket, names: p, p: {} }).HOOPDB_POOL_MAX).toBe("4");
+    expect(sessionPoolDemand({})).toBe(4 * HOOPDB_POOL_MAX);
+  });
+
+  it("the pool budget: (pointer + search concurrency) x HOOPDB_POOL_MAX must fit the pooler budget (default 80)", () => {
+    expect(DEFAULT_POOLER_BUDGET).toBe(80);
+    // The live pointer mapping alone at 20: 80 connections, exactly the default budget.
+    expect(sessionPoolDemand({ maxConcurrency: 20 })).toBe(80);
+    expect(() => ok({ maxConcurrency: 20 })).not.toThrow();
+    // A disabled search queue holds no connections.
+    expect(sessionPoolDemand({ maxConcurrency: 20, searchQueue: { enabled: false, maxConcurrency: 16 } })).toBe(80);
+    // Pointer 10 + search 16 at HOOPDB_POOL_MAX 4: 104, over the default budget; accepted only with a budget that covers it.
+    const split = { searchIndex: true, maxConcurrency: 10, searchQueue: { enabled: true, mappingEnabled: true, handoff: true, maxConcurrency: 16 } };
+    expect(sessionPoolDemand(split)).toBe(104);
+    expect(() => ok(split)).toThrow(/is 104 connections, over the pooler budget 80 \(poolerBudget\)/);
+    expect(() => ok({ ...split, poolerBudget: 104 })).not.toThrow();
+    expect(() => ok({ ...split, poolerBudget: 103 })).toThrow(/over the pooler budget 103/);
+    expect(() => ok({ maxConcurrency: 18, searchQueue: { enabled: true } })).not.toThrow();
+    expect(() => ok({ maxConcurrency: 19, searchQueue: { enabled: true } })).toThrow(/is 84 connections/);
+    for (const poolerBudget of [0, 10_001, 1.5, "80"]) expect(() => ok({ poolerBudget })).toThrow(/poolerBudget must be an integer from 1 to 10000/);
   });
 
   describe("deploy plan contract", () => {

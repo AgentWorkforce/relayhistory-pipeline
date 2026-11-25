@@ -42,8 +42,13 @@ import { TENANT_KEY_BASE } from "./tenants.ts";
 export interface SessionPipelineInputs {
   /** Turn the ClickHouse stage on (SEARCH_INDEX_ENABLED=1). Off: pointers only. */
   searchIndex?: boolean;
-  /** Lambda concurrency cap from the queue (2-10). Default 4. */
+  /** Lambda concurrency cap from the events queue (2-20). Default 4. */
   maxConcurrency?: number;
+  /**
+   * The Supabase pooler's connection budget for this function (1-10000). Default 80. The render is
+   * refused unless (maxConcurrency + searchQueue.maxConcurrency when enabled) x HOOPDB_POOL_MAX fits.
+   */
+  poolerBudget?: number;
   /** Reconcile cadence in minutes (15-120). Default 30; lookback is twice this. */
   reconcileMinutes?: number;
   /** Session briefs (src/session-brief). Absent or `enabled: false`: off. */
@@ -69,7 +74,7 @@ export interface SessionSearchQueueInputs {
   enabled: boolean;
   mappingEnabled?: boolean;
   handoff?: boolean;
-  /** The search mapping's MaximumConcurrency (2-10). Default 2. */
+  /** The search mapping's MaximumConcurrency (2-20). Default 2. */
   maxConcurrency?: number;
 }
 
@@ -120,6 +125,17 @@ export const BRIEF_SCHEDULE_MINUTES = 1;
 /** Function timeout; the queue's visibility timeout is six times this (AWS guidance for SQS sources). */
 export const FUNCTION_TIMEOUT_SECONDS = 300;
 export const VISIBILITY_TIMEOUT_SECONDS = 6 * FUNCTION_TIMEOUT_SECONDS;
+/** Supabase connections per invocation (HOOPDB_POOL_MAX). */
+export const HOOPDB_POOL_MAX = 4;
+/** The default pooler connection budget the function's mappings must fit in (poolerBudget). */
+export const DEFAULT_POOLER_BUDGET = 80;
+
+/** Connections the function's mappings can hold at once: (pointer + search concurrency) x HOOPDB_POOL_MAX. */
+export function sessionPoolDemand(p: SessionPipelineInputs): number {
+  const search = p.searchQueue?.enabled === true ? (p.searchQueue.maxConcurrency ?? 2) : 0;
+  return ((p.maxConcurrency ?? 4) + search) * HOOPDB_POOL_MAX;
+}
+
 /** Receives before a message moves to the DLQ. */
 export const MAX_RECEIVE_COUNT = 8;
 /** S3 events wait this long before the first delivery, so a burst of manifest writes coalesces. */
@@ -167,10 +183,12 @@ export function assertSessionPipelineInputs(p: unknown, refuse: (why: string) =>
     refuse("transcriptStore.sessionPipeline must be a plain object");
   const v = p as Record<string, unknown>;
   for (const k of Object.keys(v))
-    if (k !== "searchIndex" && k !== "maxConcurrency" && k !== "reconcileMinutes" && k !== "briefs" && k !== "streamReconcile" && k !== "searchQueue") refuse(`transcriptStore.sessionPipeline.${k} is not a known setting`);
+    if (k !== "searchIndex" && k !== "maxConcurrency" && k !== "poolerBudget" && k !== "reconcileMinutes" && k !== "briefs" && k !== "streamReconcile" && k !== "searchQueue") refuse(`transcriptStore.sessionPipeline.${k} is not a known setting`);
   if (v.searchIndex !== undefined && typeof v.searchIndex !== "boolean") refuse("transcriptStore.sessionPipeline.searchIndex must be a boolean");
-  if (v.maxConcurrency !== undefined && !(Number.isInteger(v.maxConcurrency) && (v.maxConcurrency as number) >= 2 && (v.maxConcurrency as number) <= 10))
-    refuse("transcriptStore.sessionPipeline.maxConcurrency must be an integer from 2 to 10");
+  if (v.maxConcurrency !== undefined && !(Number.isInteger(v.maxConcurrency) && (v.maxConcurrency as number) >= 2 && (v.maxConcurrency as number) <= 20))
+    refuse("transcriptStore.sessionPipeline.maxConcurrency must be an integer from 2 to 20");
+  if (v.poolerBudget !== undefined && !(Number.isInteger(v.poolerBudget) && (v.poolerBudget as number) >= 1 && (v.poolerBudget as number) <= 10_000))
+    refuse("transcriptStore.sessionPipeline.poolerBudget must be an integer from 1 to 10000");
   if (v.reconcileMinutes !== undefined && !(Number.isInteger(v.reconcileMinutes) && (v.reconcileMinutes as number) >= 15 && (v.reconcileMinutes as number) <= 120))
     refuse("transcriptStore.sessionPipeline.reconcileMinutes must be an integer from 15 to 120");
   if (v.briefs !== undefined) {
@@ -201,11 +219,17 @@ export function assertSessionPipelineInputs(p: unknown, refuse: (why: string) =>
     for (const k of Object.keys(q)) if (k !== "enabled" && k !== "mappingEnabled" && k !== "handoff" && k !== "maxConcurrency") refuse(`${at}.${k} is not a known setting`);
     for (const k of ["enabled", "mappingEnabled", "handoff"]) if (q[k] !== undefined && typeof q[k] !== "boolean") refuse(`${at}.${k} must be a boolean`);
     if (q.enabled === undefined) refuse(`${at}.enabled must be a boolean`);
-    if (q.maxConcurrency !== undefined && !(Number.isInteger(q.maxConcurrency) && (q.maxConcurrency as number) >= 2 && (q.maxConcurrency as number) <= 10))
-      refuse(`${at}.maxConcurrency must be an integer from 2 to 10`);
+    if (q.maxConcurrency !== undefined && !(Number.isInteger(q.maxConcurrency) && (q.maxConcurrency as number) >= 2 && (q.maxConcurrency as number) <= 20))
+      refuse(`${at}.maxConcurrency must be an integer from 2 to 20`);
     if (q.enabled !== true && (q.mappingEnabled === true || q.handoff === true)) refuse(`${at}.mappingEnabled and handoff require enabled: true`);
     if (q.handoff === true && v.searchIndex !== true) refuse(`${at}.handoff requires searchIndex: true`);
   }
+  const demand = sessionPoolDemand(v as SessionPipelineInputs);
+  const budget = (v.poolerBudget as number | undefined) ?? DEFAULT_POOLER_BUDGET;
+  if (demand > budget)
+    refuse(
+      `transcriptStore.sessionPipeline: (maxConcurrency + searchQueue.maxConcurrency) x HOOPDB_POOL_MAX ${HOOPDB_POOL_MAX} is ${demand} connections, over the pooler budget ${budget} (poolerBudget)`,
+    );
 }
 
 /** The pipeline role reads session objects through S3 only, for objects under `96bulls/` (as the reader user). */
@@ -390,7 +414,7 @@ export function sessionPipelineEnv(i: { stage: string; bucket: string; names: Se
     ...(i.p.searchQueue?.enabled === true && i.p.searchQueue.handoff === true ? { SESSION_PIPELINE_SEARCH_QUEUE_URL: i.names.searchQueueUrl } : {}),
     PIPELINE_FANOUT: "off",
     PIPELINE_RECONCILE_LOOKBACK_MINUTES: String(2 * (i.p.reconcileMinutes ?? 30)),
-    HOOPDB_POOL_MAX: "4",
+    HOOPDB_POOL_MAX: String(HOOPDB_POOL_MAX),
     NODE_OPTIONS: "--enable-source-maps",
     SESSION_BRIEF_ENABLED: i.p.briefs?.enabled ? "true" : "false",
     ...(i.p.briefs?.backgroundDailyBudget !== undefined ? { SESSION_BRIEF_BACKGROUND_DAILY_BUDGET: String(i.p.briefs.backgroundDailyBudget) } : {}),

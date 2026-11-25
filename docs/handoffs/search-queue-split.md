@@ -57,7 +57,7 @@ all off by default:
   SendMessage, TLS only (the role has no identity policy; grants are resource-based).
 - `mappingEnabled`: the search mapping polls (default false: created disabled).
 - `handoff`: render `SESSION_PIPELINE_SEARCH_QUEUE_URL` (needs `enabled` and `searchIndex`).
-- `maxConcurrency`: the search mapping's MaximumConcurrency (2-10, default 2).
+- `maxConcurrency`: the search mapping's MaximumConcurrency (2-20, default 2).
 
 The deploy plan contract judges the three new resources with the pipeline's own phases:
 creating them is a `session pipeline rollout`, updating them a `session pipeline update`.
@@ -86,6 +86,11 @@ Every concurrent invocation opens up to `HOOPDB_POOL_MAX` Supabase connections. 
     (pointer MaximumConcurrency + search MaximumConcurrency) x HOOPDB_POOL_MAX <= the pooler limit
 
 including any other client of the same pooler. Raise one mapping only after lowering the other.
+The stack refuses to render when `(sessionPipeline.maxConcurrency (2-20, default 4) +
+searchQueue.maxConcurrency when enabled) x HOOPDB_POOL_MAX (4)` exceeds
+`sessionPipeline.poolerBudget` (default 80). Example: pointer 10 + search 16 is 104
+connections at HOOPDB_POOL_MAX 4, so it needs a confirmed `poolerBudget` of at least 104
+(or a smaller pool per invocation) before it renders.
 
 ## Not covered
 
