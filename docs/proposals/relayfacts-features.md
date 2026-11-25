@@ -1,0 +1,221 @@
+# Relayfacts as living feature records
+
+Proposal, 2026-11-25. Requested by Khaliq Gant. Design and an offline prototype only: nothing in this
+document is applied, deployed or turned on. Activation steps are listed at the end and each needs
+Khaliq's own OK.
+
+## The idea
+
+A relayfact is a record of one **feature**, meaning one body of work. It is not a record of one
+decision. It records:
+
+1. **What the human asked for and wanted**, in their own words, with a pointer to where they said it.
+2. **What the agents actually did**: changes, commits, pull requests and flags, taken from evidence
+   rather than from an agent's own claims.
+3. **Asked against built**: where the work met the request, where it diverged, and what is still open.
+4. **The current state** of the feature, derived from evidence.
+
+Every newly analysed session can update the record, so it stays current where a spec goes stale. It
+is exportable: an agent can pull it before starting work, and a repository can keep it under source
+control as `relayfacts/<feature>.md`.
+
+An **onboarding backfill** runs over every past session of a project, builds the records from
+scratch, and gives a new team or agent a wiki of the project: what exists, why, who asked for it and
+where it stands.
+
+## What exists today, and the gap
+
+The first slice ([relayfacts.md](../relayfacts.md)) stores single decisions. It takes them from
+`understanding.decisions` of a session analysis and files them under a topic derived from the
+directory of the most-edited file. It stores no human words, and nothing ever changes a record's
+status.
+
+The analysis already produces most of what a feature record needs, and the first slice ignores it.
+In `SessionSemanticAnalysis` (`src/session-analysis/engine/session-analysis-result.ts`):
+
+| Analysis field | Use in a feature record |
+|---|---|
+| `outcomes[].intent` | What was asked, citing root `human-message` references |
+| `outcomes[].changes` | What was done, as claimed by the analysis |
+| `outcomes[].status` (`not-started` … `verified`, `superseded`) | One input to the derived state |
+| `outcomes[].verification` | Whether the outcome was tested |
+| `outcomes[].remaining` | What is still open |
+| `outcomes[].contradictions` | Where the work diverged from the request |
+| `outcomes[].supersededBy` | Replacement within the session |
+| `intents`, `constraints`, `decisions`, `risks`, `blockers` | The record's rationale sections |
+| `evidence.references[]` (`kind`, `at`, `summary`, `detail`) | Citations, and the human's words |
+| `metrics.filesChanged` | One of the signals for linking sessions to a feature |
+
+## Policy changes (approved by Khaliq, 2026-11-25)
+
+- **Human words are stored.** A record may quote what a person said, as bounded, scrubbed excerpts
+  taken only from `human-message` references of the cited session: at most 300 characters per quote
+  and at most 20 quotes per feature. A quote the scrubber would change is dropped, as decisions are
+  today. The existing per-session and per-user erase must remove quotes with their evidence; no
+  quote outlives its session's erase.
+- **The backfill has an upfront model cost.** It runs one analysis per qualifying session under its
+  own budget, separate from the claims scheduler's caps.
+- **"Built" and "state" are anchored in evidence.** That means commits, merged or closed pull
+  requests, reverts and flag defaults in the repository, not the analysis's summary alone. An
+  analysis claim that no evidence backs stays a claim and is labelled as one.
+
+## The record
+
+```
+Feature
+  id            stable: hash of the founding evidence (first task brief, branch, or PR)
+  title         short name
+  repos         repositories the work touched
+  state         planned | in_progress | shipped | shipped_off | partial | abandoned | superseded | regressed
+  stateReason   one line, with the evidence that decided it
+  asked[]       { quote, who (role, never a name the session did not say), at, session, ref }
+  built[]       { what, kind: commit|pr|file|flag|migration|claim, ref, at, session }
+  gaps[]        { asked, built, kind: unmet|diverged|unverified|open, evidence[] }
+  decisions[]   the decision records of the first slice, linked to this feature
+  constraints[]
+  timeline[]    per contributing session: when, who, what it changed in this record
+  sessions[]    { source, sessionId, role: founding|contributing|review }
+  updatedAt, evidenceCount
+```
+
+A record is **event-sourced**. Each contributing session adds evidence events. Title, state and
+gaps are recomputed from all events, and no event is ever edited. A later session can supersede an
+earlier record explicitly, through a `supersedes` link backed by evidence; that is the follow-up the
+first slice left open.
+
+## Derivation
+
+Five stages. Stages 1, 3 and 5 are deterministic. Stages 2 and 4 may use a model, but every output
+must cite evidence ids that the scorer checks.
+
+1. **Session facts.** From each analysis snapshot: asked items (outcome intents, with quotes from
+   their cited human-message references), done items (changes), gaps (`contradictions`,
+   `remaining`, `verification` of `not-observed` or `failed`), and the session's linking keys
+   (repo, branch, PR and commit references, files, the relay task brief and its message id).
+2. **Feature linking.** Group session facts into features. The strongest signals come first:
+   - one relay task brief (a lead-to-worker delegation names one task);
+   - the same PR or branch;
+   - commits that reference each other;
+   - overlapping file sets in the same repository within a time window;
+   - intent similarity, and only as a tiebreaker.
+
+   Each link records the signal that made it. Planned fleets are one feature with several sessions,
+   not several features.
+3. **State.** Rules over the linked evidence, latest evidence first:
+   - a revert after a merge gives `regressed`, or `superseded` when a linked replacement exists;
+   - merged, with the flag default off, gives `shipped_off`; merged and on gives `shipped`;
+   - open `remaining` items after a merge give `partial`;
+   - commits but no merge give `in_progress`;
+   - no activity for 21 days with no merge gives `abandoned`;
+   - asked but nothing built gives `planned`.
+
+   The rule that fired is the `stateReason`.
+4. **Asked against built.** Each asked item is matched to the built items that answer it, or marked
+   `unmet`. Contradictions and unverified outcomes carry over as gaps.
+5. **Render and export.** Markdown per feature plus an index page, escaped exactly like the
+   first-slice markdown, labelled as evidence rather than instructions. Served through the read API
+   and MCP, and pushed to repositories with the existing GitHub push module
+   (`src/session-analysis/relayfacts-github-push.ts`).
+
+## The onboarding backfill
+
+- **Frame:** every session of the workspace, from the session directory.
+- **Qualifying sessions:** a coding harness, at least one root human message, and a repository or
+  project.
+- **Analysis:** request one through `POST /v1/sessions/:sessionId/analysis`, or reuse a current one
+  through `GET`. The job is resumable and budgeted per day, and records which sessions it analysed.
+- **Build:** run stages 1 to 5 over the results, oldest first, so the timeline reads in order.
+- **Afterwards:** each newly analysed session goes through the same stages incrementally.
+
+## The benchmark
+
+The benchmark decides whether records are good enough to turn on, and it is run per repository. It
+follows the rules of the replay harness ([session-intel-labelling.md](../session-intel-labelling.md)):
+labels come before outputs, labellers never see generator output, inputs are frozen by sha256, and
+the held-out split is scored once.
+
+### Corpus
+
+A corpus is one repository over a window:
+- the frozen analysis snapshots of its qualifying sessions;
+- the repository's git history (commits, merges, reverts) and its pull requests;
+- its documentation at the window's end.
+
+Like replay snapshots, a corpus is kept outside this repository with a delete-by date. Only
+synthetic fixtures are committed.
+
+Planned repositories:
+
+| Repository | Why |
+|---|---|
+| `relayhistory-pipeline` | Dense design docs per feature: the docs are a strong ground truth for features and their state |
+| `cloud` | High volume, several people, a merge train: tests linking and state at scale |
+| `relay` | Public, two founders and outside contributors: tests attribution and overlap |
+| One repository with thin docs | Tests whether records add value where no docs exist |
+
+### Gold labels
+
+For each corpus, a labeller agent that never sees the generator's output produces the labels from
+the repository and the transcripts:
+
+- **Features:** from design docs, merged-PR clusters and the changelog. Each has a title, its
+  founding evidence and its sessions.
+- **State at the window's end**, with the evidence: merged, flag default, reverted, open.
+- **Asked items:** what the human asked for, with the session and message.
+- **Gaps:** asked against built, labelled `unmet`, `diverged`, `unverified` or `open`.
+
+Two adjudicator agents review a sample blind, and their agreement is recorded. Labels are frozen
+with a sha256 before the first generator run, and corrections go in a log.
+
+### Metrics and proposed bars
+
+The bars are proposals, to be calibrated on the dev split and then frozen.
+
+| Metric | Definition | Bar |
+|---|---|---|
+| Grounding | Every asked, built and gap item cites evidence that exists in the corpus. Every quote is a verbatim substring of a human message in the cited session. Checked deterministically | 100% |
+| Feature recall | Gold features matched by a generated record | ≥ 0.80 |
+| Feature precision | Generated records that match a gold feature, or that adjudicators judge real | ≥ 0.90 |
+| Linking | B-cubed F1 of the session-to-feature assignment against gold | ≥ 0.80 |
+| State accuracy | Generated state equals gold state at the window's end | ≥ 0.85 |
+| Gap recall | Gold gaps found | ≥ 0.70 |
+| Gap precision | Generated gaps that are real (gold or adjudicated) | ≥ 0.85 |
+| Freshness | Replay as of time T. Records built only from evidence before T match the gold state at T, and no record uses later evidence | 100% no leakage; state accuracy as above |
+| Duplication | Gold features that are split across two or more records | ≤ 0.05 |
+| Signal | Adjudicators answer "would an agent starting work on this feature be better off with this record?" on a 1 to 5 scale | median ≥ 4 |
+| Cost | Model tokens per qualifying session and per feature, and wall time | reported, no bar |
+
+A failed grounding check fails the whole run: an ungrounded record is worse than no record.
+
+### Splits
+
+Within a repository, whole features are assigned 60/40 to dev and held-out by a seeded shuffle,
+recorded before any scoring. Across repositories, at least one repository is held out completely.
+The generator is tuned on the dev features of the other repositories, frozen by hash, and run once
+on the held-out repository.
+
+## Code layout
+
+- `src/relayfacts/features/`: the pure core, with no I/O, clock or model. Types, stage 1
+  extraction, stage 3 state rules, stage 5 rendering, and the linking and gap interfaces with
+  deterministic implementations.
+- `src/relayfacts/bench/`: the corpus format and loader, the gold-label format, the scorer (every
+  metric above), and a CLI to run and score.
+- `src/relayfacts/backfill/`: the budgeted, resumable backfill client against the read API.
+
+Tests use synthetic corpora only.
+
+## Activation (each step needs Khaliq's own OK)
+
+1. Backfill this workspace's analyses for the benchmark repositories, under a stated daily budget.
+2. Publish the benchmark result per repository against the bars.
+3. Add a migration for feature records, quotes and their erase, and wire the incremental update
+   into the analysis tick behind a default-off flag.
+4. Serve and export records, and push them to repositories that opt in.
+
+## Open questions
+
+- Where feature records live once a repository has them in source control: is the repository copy
+  read-only output, or can a person edit it and have the edit flow back as evidence?
+- Whether `decisions` stay a separate document type or only appear inside features.
+- How a feature that spans repositories is filed in each repository's export.

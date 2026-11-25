@@ -1,0 +1,247 @@
+/**
+ * The relayfacts benchmark scorer (docs/proposals/relayfacts-features.md, "Metrics and proposed bars").
+ *
+ * Deterministic. Grounding is checked against the corpus itself: every cited evidence id must exist in
+ * the cited session's snapshot with the cited kind, and every quote must be a verbatim substring of the
+ * whitespace-collapsed text of a human-message reference. One grounding violation fails the run.
+ * Semantic matches (asked items, gaps) use a token-overlap proxy here; the signal metric and any
+ * disputed match go to blind adjudication (adjudicationPackets), not to this scorer.
+ */
+import type { FeatureRecord, SessionKey } from "../features/types.ts";
+import { sessionKeyString, textCompare } from "../features/types.ts";
+import type { Corpus } from "./corpus.ts";
+import type { Gold, GoldFeature } from "./gold.ts";
+
+export const BARS = {
+  grounding: 1,
+  featureRecall: 0.8,
+  featurePrecision: 0.9,
+  linkingF1: 0.8,
+  stateAccuracy: 0.85,
+  askedRecall: 0.8,
+  gapRecall: 0.7,
+  gapPrecision: 0.85,
+  duplicationMax: 0.05,
+} as const;
+
+/** A gold and a generated feature match when each holds at least this share of the other's sessions. */
+export const MATCH_SHARE = 0.5;
+/** Token Jaccard above which two texts in the same session count as the same item. */
+export const TEXT_MATCH = 0.3;
+/** A generated feature holding at least this share of a gold feature's sessions counts as a fragment of it. */
+export const FRAGMENT_SHARE = 0.3;
+
+export interface GroundingViolation { feature: string; item: string; reason: string }
+
+export interface SplitScore {
+  goldFeatures: number;
+  generatedFeatures: number;
+  matched: number;
+  featureRecall: number | null;
+  featurePrecision: number | null;
+  linkingF1: number | null;
+  stateAccuracy: number | null;
+  stateConfusion: Record<string, number>;
+  askedRecall: number | null;
+  gapRecall: number | null;
+  gapPrecision: number | null;
+  duplication: number | null;
+}
+
+export interface ScoreReport {
+  format: "relayfacts-score/1";
+  corpus: string;
+  asOf: string;
+  grounding: { checkedItems: number; violations: GroundingViolation[]; pass: boolean };
+  splits: Record<"dev" | "heldout" | "all", SplitScore>;
+  bars: typeof BARS;
+  verdicts: Record<string, "pass" | "fail" | "insufficient">;
+  matches: Array<{ gold: string; generated: string; goldState: string; generatedState: string }>;
+}
+
+const collapse = (t: string) => t.replace(/\s+/gu, " ").trim();
+const tokens = (t: string) => new Set(t.toLowerCase().split(/[^a-z0-9]+/u).filter((w) => w.length > 2));
+export function textSimilarity(a: string, b: string): number {
+  const ta = tokens(a), tb = tokens(b);
+  let shared = 0;
+  for (const w of ta) if (tb.has(w)) shared++;
+  const union = ta.size + tb.size - shared;
+  return union ? shared / union : 0;
+}
+const ratio = (n: number, d: number) => (d ? n / d : null);
+
+/** Every cited pointer resolves in the corpus, and every quote is verbatim. */
+export function checkGrounding(corpus: Corpus, features: readonly FeatureRecord[]) {
+  const refs = new Map<string, Map<string, { kind: string; text: string }>>();
+  for (const s of corpus.sessions) {
+    const m = new Map<string, { kind: string; text: string }>();
+    for (const r of s.snapshot.evidence?.references ?? []) if (!m.has(r.id)) m.set(r.id, { kind: r.kind, text: collapse(r.summary ?? "") });
+    refs.set(sessionKeyString(s), m);
+  }
+  const violations: GroundingViolation[] = [];
+  let checked = 0;
+  for (const f of features) {
+    const members = new Set(f.sessions.map(sessionKeyString));
+    for (const s of f.sessions) if (!refs.has(sessionKeyString(s))) violations.push({ feature: f.id, item: sessionKeyString(s), reason: "session not in corpus" });
+    const items = [...f.asked, ...f.built, ...f.gaps, ...f.rationale];
+    for (const item of items) {
+      checked++;
+      if (!members.has(sessionKeyString(item.session))) violations.push({ feature: f.id, item: item.id, reason: "item from a session outside the feature" });
+      if (item.evidence.length === 0 && !("kind" in item && item.kind === "migration")) violations.push({ feature: f.id, item: item.id, reason: "no evidence" });
+      for (const p of item.evidence) {
+        const ref = refs.get(sessionKeyString(item.session))?.get(p.refId);
+        if (!ref) violations.push({ feature: f.id, item: item.id, reason: `evidence ${p.refId} not in the session` });
+        else if (p.kind !== null && ref.kind !== p.kind) violations.push({ feature: f.id, item: item.id, reason: `evidence ${p.refId} kind differs` });
+      }
+    }
+    for (const a of f.asked) for (const q of a.quotes) {
+      checked++;
+      const ref = refs.get(sessionKeyString(a.session))?.get(q.evidence.refId);
+      if (!ref || ref.kind !== "human-message") violations.push({ feature: f.id, item: a.id, reason: "quote not from a human message" });
+      else if (!ref.text.includes(q.text)) violations.push({ feature: f.id, item: a.id, reason: "quote not verbatim" });
+    }
+  }
+  return { checkedItems: checked, violations, pass: violations.length === 0 };
+}
+
+function matchFeatures(gold: readonly GoldFeature[], generated: readonly FeatureRecord[]) {
+  const cands: Array<{ g: GoldFeature; f: FeatureRecord; score: number }> = [];
+  for (const g of gold) {
+    const gs = new Set(g.sessions.map(sessionKeyString));
+    for (const f of generated) {
+      const shared = f.sessions.filter((s) => gs.has(sessionKeyString(s))).length;
+      if (!shared) continue;
+      if (shared / gs.size >= MATCH_SHARE && shared / f.sessions.length >= MATCH_SHARE)
+        cands.push({ g, f, score: shared / (gs.size + f.sessions.length - shared) });
+    }
+  }
+  cands.sort((a, b) => b.score - a.score || textCompare(a.g.id, b.g.id) || textCompare(a.f.id, b.f.id));
+  const usedG = new Set<string>(), usedF = new Set<string>();
+  const pairs: Array<{ g: GoldFeature; f: FeatureRecord }> = [];
+  for (const c of cands) {
+    if (usedG.has(c.g.id) || usedF.has(c.f.id)) continue;
+    usedG.add(c.g.id); usedF.add(c.f.id);
+    pairs.push({ g: c.g, f: c.f });
+  }
+  return pairs;
+}
+
+function scoreSplit(gold: readonly GoldFeature[], generatedAll: readonly FeatureRecord[], coverage: Gold["coverage"], allGold: readonly GoldFeature[]): { score: SplitScore; pairs: Array<{ g: GoldFeature; f: FeatureRecord }> } {
+  const goldKeys = new Set(gold.flatMap((g) => g.sessions.map(sessionKeyString)));
+  const otherGoldKeys = new Set(allGold.filter((g) => !gold.includes(g)).flatMap((g) => g.sessions.map(sessionKeyString)));
+  // A generated record belongs to this split when most of its labelled sessions are this split's.
+  const generated = generatedAll.filter((f) => {
+    const mine = f.sessions.filter((s) => goldKeys.has(sessionKeyString(s))).length;
+    const other = f.sessions.filter((s) => otherGoldKeys.has(sessionKeyString(s))).length;
+    if (mine === 0 && other === 0) return coverage === "complete" && gold.length === allGold.length;
+    return mine >= other && mine > 0;
+  });
+  const pairs = matchFeatures(gold, generated);
+
+  // B-cubed over labelled sessions of this split.
+  const goldOf = new Map<string, Set<string>>();
+  for (const g of gold) { const set = new Set(g.sessions.map(sessionKeyString)); for (const k of set) goldOf.set(k, set); }
+  const genOf = new Map<string, Set<string>>();
+  for (const f of generatedAll) { const set = new Set(f.sessions.map(sessionKeyString).filter((k) => goldKeys.has(k))); for (const k of set) genOf.set(k, set); }
+  let p = 0, r = 0, n = 0;
+  for (const [k, gset] of goldOf) {
+    const fset = genOf.get(k) ?? new Set([k]);
+    let both = 0;
+    for (const x of fset) if (gset.has(x)) both++;
+    p += both / fset.size; r += both / gset.size; n++;
+  }
+  const bp = n ? p / n : null, br = n ? r / n : null;
+  const linkingF1 = bp !== null && br !== null && bp + br > 0 ? (2 * bp * br) / (bp + br) : null;
+
+  const confusion: Record<string, number> = {};
+  let stateRight = 0;
+  for (const { g, f } of pairs) {
+    const k = `${g.state}->${f.state}`;
+    confusion[k] = (confusion[k] ?? 0) + 1;
+    if (g.state === f.state) stateRight++;
+  }
+
+  let askedTotal = 0, askedFound = 0, gapTotal = 0, gapFound = 0, genGaps = 0, genGapsReal = 0;
+  for (const { g, f } of pairs) {
+    for (const a of g.asked) {
+      askedTotal++;
+      if (f.asked.some((x) => sessionKeyString(x.session) === sessionKeyString(a) && (textSimilarity(x.text, a.text) >= TEXT_MATCH || x.quotes.some((q) => textSimilarity(q.text, a.text) >= TEXT_MATCH)))) askedFound++;
+    }
+    for (const gap of g.gaps) {
+      gapTotal++;
+      if (f.gaps.some((x) => x.kind === gap.kind && sessionKeyString(x.session) === sessionKeyString(gap) && textSimilarity(x.text, gap.text) >= TEXT_MATCH)) gapFound++;
+    }
+    for (const x of f.gaps) {
+      if (!goldKeys.has(sessionKeyString(x.session))) continue;
+      genGaps++;
+      if (g.gaps.some((gap) => gap.kind === x.kind && sessionKeyString(gap) === sessionKeyString(x.session) && textSimilarity(x.text, gap.text) >= TEXT_MATCH)) genGapsReal++;
+    }
+  }
+
+  let duplicated = 0;
+  for (const g of gold) {
+    const gs = new Set(g.sessions.map(sessionKeyString));
+    const fragments = generatedAll.filter((f) => f.sessions.filter((s) => gs.has(sessionKeyString(s))).length / gs.size >= FRAGMENT_SHARE);
+    if (fragments.length >= 2) duplicated++;
+  }
+
+  return {
+    pairs,
+    score: {
+      goldFeatures: gold.length,
+      generatedFeatures: generated.length,
+      matched: pairs.length,
+      featureRecall: ratio(pairs.length, gold.length),
+      featurePrecision: ratio(pairs.length, generated.length),
+      linkingF1,
+      stateAccuracy: ratio(stateRight, pairs.length),
+      stateConfusion: confusion,
+      askedRecall: ratio(askedFound, askedTotal),
+      gapRecall: ratio(gapFound, gapTotal),
+      gapPrecision: ratio(genGapsReal, genGaps),
+      duplication: ratio(duplicated, gold.length),
+    },
+  };
+}
+
+/** Bars need enough labelled features to mean anything. */
+export const MIN_FEATURES_FOR_VERDICT = 10;
+
+export function scoreRun(corpus: Corpus, gold: Gold, generated: readonly FeatureRecord[]): ScoreReport {
+  const grounding = checkGrounding(corpus, generated);
+  const dev = scoreSplit(gold.features.filter((g) => g.split === "dev"), generated, gold.coverage, gold.features);
+  const heldout = scoreSplit(gold.features.filter((g) => g.split === "heldout"), generated, gold.coverage, gold.features);
+  const all = scoreSplit(gold.features, generated, gold.coverage, gold.features);
+  const s = all.score;
+  const enough = s.goldFeatures >= MIN_FEATURES_FOR_VERDICT;
+  const atLeast = (v: number | null, bar: number) => (v === null || !enough ? "insufficient" : v >= bar ? "pass" : "fail");
+  const verdicts: ScoreReport["verdicts"] = {
+    grounding: grounding.pass ? "pass" : "fail",
+    featureRecall: atLeast(s.featureRecall, BARS.featureRecall),
+    featurePrecision: atLeast(s.featurePrecision, BARS.featurePrecision),
+    linkingF1: atLeast(s.linkingF1, BARS.linkingF1),
+    stateAccuracy: atLeast(s.stateAccuracy, BARS.stateAccuracy),
+    askedRecall: atLeast(s.askedRecall, BARS.askedRecall),
+    gapRecall: atLeast(s.gapRecall, BARS.gapRecall),
+    gapPrecision: atLeast(s.gapPrecision, BARS.gapPrecision),
+    duplication: s.duplication === null || !enough ? "insufficient" : s.duplication <= BARS.duplicationMax ? "pass" : "fail",
+  };
+  return {
+    format: "relayfacts-score/1",
+    corpus: corpus.manifestSha256,
+    asOf: gold.asOf,
+    grounding,
+    splits: { dev: dev.score, heldout: heldout.score, all: all.score },
+    bars: BARS,
+    verdicts,
+    matches: all.pairs.map(({ g, f }) => ({ gold: g.id, generated: f.id, goldState: g.state, generatedState: f.state })),
+  };
+}
+
+/** Blind packets for the signal metric and disputed matches: rendered records with no generator name, shuffled by a seed. */
+export function adjudicationPackets(features: readonly FeatureRecord[], render: (f: FeatureRecord) => string, seed: number, limit = 30) {
+  let x = seed >>> 0 || 1;
+  const rand = () => ((x = (x * 1664525 + 1013904223) >>> 0) / 2 ** 32);
+  const order = [...features].sort((a, b) => textCompare(a.id, b.id)).map((f) => ({ f, k: rand() })).sort((a, b) => a.k - b.k).slice(0, limit);
+  return order.map(({ f }, i) => ({ packet: `p${String(i + 1).padStart(3, "0")}`, featureId: f.id, sessions: f.sessions.map((s: SessionKey) => ({ source: s.source, sessionId: s.sessionId })), markdown: render(f) }));
+}

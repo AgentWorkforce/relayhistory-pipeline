@@ -1,0 +1,121 @@
+/**
+ * The relayfacts benchmark corpus (docs/proposals/relayfacts-features.md, "The benchmark"): one
+ * repository over a window, frozen. A directory kept outside this repository:
+ *
+ *   manifest.json   {"format": "relayfacts-corpus/1", "repo", "window": {since, until}, "createdAt",
+ *                    "deleteBy", "files": {"sessions.jsonl": sha256, "forge.json": sha256}}
+ *   sessions.jsonl  one {"source", "sessionId", "context"?, "snapshot"} per line: a session analysis
+ *                   snapshot and the directory facts it lacks
+ *   forge.json      ForgeFacts: the repository's PRs, commits (default branch, reverts) and flag defaults
+ *
+ * The loader refuses a corpus past its delete-by date, a file whose sha256 differs, a symlink, an
+ * unknown field, and anything over its bounds. It never writes.
+ */
+import { createHash } from "node:crypto";
+import { lstatSync, readFileSync } from "node:fs";
+import { join } from "node:path";
+import type { SessionAnalysisSnapshot } from "../../session-analysis/engine/session-analysis-result.ts";
+import type { ForgeFacts, SessionContext } from "../features/types.ts";
+
+export const CORPUS_FORMAT = "relayfacts-corpus/1";
+export const CORPUS_BOUNDS = { fileBytes: 512 * 1024 * 1024, lineBytes: 16 * 1024 * 1024, sessions: 50_000, deleteByDays: 30 } as const;
+
+export class CorpusError extends Error {
+  constructor(message: string) { super(message); this.name = "CorpusError"; }
+}
+
+export interface CorpusSession {
+  source: string;
+  sessionId: string;
+  context: SessionContext;
+  snapshot: SessionAnalysisSnapshot;
+}
+
+export interface CorpusManifest {
+  format: typeof CORPUS_FORMAT;
+  repo: string;
+  window: { since: string; until: string };
+  createdAt: string;
+  deleteBy: string;
+  files: Record<string, string>;
+}
+
+export interface Corpus {
+  manifest: CorpusManifest;
+  /** sha256 of manifest.json: what gold labels name. */
+  manifestSha256: string;
+  sessions: CorpusSession[];
+  forge: ForgeFacts;
+}
+
+export const sha256Hex = (bytes: string | Uint8Array) => createHash("sha256").update(bytes).digest("hex");
+const iso = (v: unknown) => typeof v === "string" && Number.isFinite(Date.parse(v)) && /Z$|[+-]\d\d:\d\d$/u.test(v);
+
+function readFile(dir: string, name: string): Buffer {
+  if (!/^[a-z][a-z0-9_.-]{0,63}$/u.test(name) || name.includes("..")) throw new CorpusError(`bad file name: ${name}`);
+  const path = join(dir, name);
+  const st = lstatSync(path);
+  if (!st.isFile() || st.isSymbolicLink()) throw new CorpusError(`${name}: not a regular file`);
+  if (st.size > CORPUS_BOUNDS.fileBytes) throw new CorpusError(`${name}: over ${CORPUS_BOUNDS.fileBytes} bytes`);
+  return readFileSync(path);
+}
+
+function only(obj: Record<string, unknown>, allowed: string[], where: string) {
+  for (const k of Object.keys(obj)) if (!allowed.includes(k)) throw new CorpusError(`${where}: unknown field ${k}`);
+}
+
+export function parseForge(raw: unknown): ForgeFacts {
+  if (!raw || typeof raw !== "object") throw new CorpusError("forge.json: not an object");
+  const f = raw as Record<string, unknown>;
+  only(f, ["defaultBranch", "prs", "commits", "flags"], "forge.json");
+  if (!Array.isArray(f.prs) || !Array.isArray(f.commits) || !Array.isArray(f.flags)) throw new CorpusError("forge.json: prs, commits and flags must be arrays");
+  for (const p of f.prs as Record<string, unknown>[]) {
+    only(p, ["ref", "state", "at", "mergedAt", "closedAt", "branch"], "forge.json pr");
+    if (typeof p.ref !== "string" || !["open", "merged", "closed"].includes(p.state as string) || !iso(p.at)) throw new CorpusError("forge.json: bad pr");
+  }
+  for (const c of f.commits as Record<string, unknown>[]) {
+    only(c, ["sha", "at", "onDefaultBranch", "revertedBy", "revertedAt"], "forge.json commit");
+    if (typeof c.sha !== "string" || !/^[0-9a-f]{7,40}$/u.test(c.sha) || !iso(c.at) || typeof c.onDefaultBranch !== "boolean") throw new CorpusError("forge.json: bad commit");
+  }
+  for (const g of f.flags as Record<string, unknown>[]) {
+    only(g, ["name", "defaultOn"], "forge.json flag");
+    if (typeof g.name !== "string" || typeof g.defaultOn !== "boolean") throw new CorpusError("forge.json: bad flag");
+  }
+  return f as unknown as ForgeFacts;
+}
+
+export function loadCorpus(dir: string, now: Date = new Date()): Corpus {
+  const manifestBytes = readFile(dir, "manifest.json");
+  const manifest = JSON.parse(manifestBytes.toString("utf8")) as CorpusManifest;
+  only(manifest as unknown as Record<string, unknown>, ["format", "repo", "window", "createdAt", "deleteBy", "files"], "manifest.json");
+  if (manifest.format !== CORPUS_FORMAT) throw new CorpusError(`manifest.json: format must be ${CORPUS_FORMAT}`);
+  if (!iso(manifest.deleteBy) || !iso(manifest.createdAt) || !iso(manifest.window?.since) || !iso(manifest.window?.until)) throw new CorpusError("manifest.json: bad times");
+  if (Date.parse(manifest.deleteBy) <= now.getTime()) throw new CorpusError("corpus is past its delete-by date: delete it");
+  if (Date.parse(manifest.deleteBy) - Date.parse(manifest.createdAt) > CORPUS_BOUNDS.deleteByDays * 86_400_000) throw new CorpusError(`deleteBy is more than ${CORPUS_BOUNDS.deleteByDays} days after createdAt`);
+  for (const name of ["sessions.jsonl", "forge.json"]) if (typeof manifest.files?.[name] !== "string") throw new CorpusError(`manifest.json: files must list ${name}`);
+  const verified = (name: string) => {
+    const bytes = readFile(dir, name);
+    if (sha256Hex(bytes) !== manifest.files[name]) throw new CorpusError(`${name}: sha256 differs from the manifest`);
+    return bytes.toString("utf8");
+  };
+  const sessions: CorpusSession[] = [];
+  const seen = new Set<string>();
+  for (const [i, line] of verified("sessions.jsonl").split("\n").entries()) {
+    if (!line.trim()) continue;
+    if (Buffer.byteLength(line) > CORPUS_BOUNDS.lineBytes) throw new CorpusError(`sessions.jsonl:${i + 1}: line over bounds`);
+    const row = JSON.parse(line) as Record<string, unknown>;
+    only(row, ["source", "sessionId", "context", "snapshot"], `sessions.jsonl:${i + 1}`);
+    const snapshot = row.snapshot as SessionAnalysisSnapshot;
+    if (typeof row.source !== "string" || typeof row.sessionId !== "string" || !snapshot || snapshot.source !== row.source || snapshot.sessionId !== row.sessionId)
+      throw new CorpusError(`sessions.jsonl:${i + 1}: source and sessionId must match the snapshot`);
+    const key = `${row.source}\u0000${row.sessionId}`;
+    if (seen.has(key)) throw new CorpusError(`sessions.jsonl:${i + 1}: duplicate session`);
+    seen.add(key);
+    if (seen.size > CORPUS_BOUNDS.sessions) throw new CorpusError("too many sessions");
+    const context = (row.context ?? {}) as Record<string, unknown>;
+    only(context, ["repo", "branch", "taskRef", "userRole"], `sessions.jsonl:${i + 1} context`);
+    sessions.push({ source: row.source, sessionId: row.sessionId, context: context as SessionContext, snapshot });
+  }
+  const forge = parseForge(JSON.parse(verified("forge.json")));
+  return { manifest, manifestSha256: sha256Hex(manifestBytes), sessions, forge };
+}
