@@ -55,15 +55,12 @@ async function installScopedProposal() {
   await db.exec("CREATE ROLE bulls96_publication_scoped NOLOGIN; CREATE ROLE bulls96_publication_recovery NOLOGIN; GRANT USAGE ON SCHEMA sessions TO bulls96_publication_scoped");
   await db.exec(read("supabase/proposals/continuous-publication/062280-scoped-kernels.up.sql"));
   await db.exec("CREATE ROLE bulls96_search_wake_consumer NOLOGIN");
-  const wake = "supabase/proposals/continuous-publication/managed-search-wake";
+  // The managed search wake proposal is promoted into migration 20261105062230 (applied by beforeAll with the
+  // rest of supabase/migrations): the stage CHECKs, the scope index, the guards and the enqueue are already in place.
   const checks=()=>owner("SELECT conname,pg_get_constraintdef(oid) definition FROM pg_constraint WHERE conrelid IN ('sessions.pipeline_jobs'::regclass,'sessions.pipeline_events'::regclass,'sessions.pipeline_dead_letters'::regclass) AND conname IN ('pipeline_jobs_stage_check','pipeline_events_stage_check','pipeline_dead_letters_stage_check') ORDER BY conname");
-  const original=(await checks()).rows;
-  expect(original).toHaveLength(3);
-  await db.exec(read(wake+".up.sql"));
+  expect((await checks()).rows).toHaveLength(3);
   expect((await checks()).rows.every(row=>row.definition.includes("search-index"))).toBe(true);
-  await db.exec(read(wake+".down.sql"));
-  expect((await checks()).rows).toEqual(original);
-  await db.exec(read(wake+".up.sql"));
+  expect((await owner("SELECT to_regprocedure('sessions.enqueue_managed_search_wake_v1(jsonb,uuid)') IS NOT NULL AS installed")).rows).toEqual([{installed:true}]);
 }
 beforeAll(async () => {
   db = new PGlite({ extensions: { btree_gin, pg_trgm } });

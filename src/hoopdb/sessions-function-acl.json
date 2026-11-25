@@ -24,6 +24,10 @@
       "service_role:EXECUTE",
       "search_consumer_runtime:EXECUTE"
     ],
+    "sessions.archive_search_stage_v1()": [
+      "<owner>:EXECUTE",
+      "service_role:EXECUTE"
+    ],
     "sessions.auth_session_resolve(text,timestamp with time zone,timestamp with time zone)": [
       "<owner>:EXECUTE",
       "service_role:EXECUTE"
@@ -268,6 +272,9 @@
       "<owner>:EXECUTE",
       "service_role:EXECUTE"
     ],
+    "sessions.enqueue_managed_search_wake_v1(jsonb,uuid)": [
+      "<owner>:EXECUTE"
+    ],
     "sessions.enqueue_session_analysis_cache(text,text,text,text)": [
       "<owner>:EXECUTE",
       "service_role:EXECUTE"
@@ -287,6 +294,12 @@
     "sessions.finish_session_analysis_cache(text,text,text,text,bigint,text,uuid,text)": [
       "<owner>:EXECUTE",
       "service_role:EXECUTE"
+    ],
+    "sessions.guard_managed_search_truncate_v1()": [
+      "<owner>:EXECUTE"
+    ],
+    "sessions.guard_managed_search_wake_v1()": [
+      "<owner>:EXECUTE"
     ],
     "sessions.heartbeat_search_feature_copy(text,text,uuid,bigint)": [
       "<owner>:EXECUTE",
@@ -1507,6 +1520,9 @@
     "sessions.search_session_directory(text,text,text,text,text,boolean,text,text,text,text,text,timestamp with time zone,timestamp with time zone,text,timestamp with time zone,text,text,text,integer)": [
       "<owner>:EXECUTE",
       "session_directory_search_worker:EXECUTE"
+    ],
+    "sessions.search_stage_archive_seal_v1()": [
+      "<owner>:EXECUTE"
     ],
     "sessions.session_analysis_admit_job_v1(text,text,text)": [
       "<owner>:EXECUTE"

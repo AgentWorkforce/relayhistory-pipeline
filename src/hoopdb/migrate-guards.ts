@@ -312,6 +312,10 @@ export const RUNTIME_APPLICATION_TABLE_PRIVILEGES = {
   "sessions.session_analysis_result_tickets": ["SELECT", "INSERT", "UPDATE", "DELETE"],
   "sessions.session_analysis_ticket_invocations": ["SELECT", "INSERT", "UPDATE", "DELETE"],
   "sessions.session_analysis_ticket_reservations": ["SELECT", "INSERT"],
+  // The search-index stage (20261105062230): the catch-up cursor's one row (§6) and the sealed archive (read only;
+  // archive_search_stage_v1 is its only write path, §8).
+  "sessions.search_catchup_cursor": ["SELECT", "UPDATE"],
+  "sessions.search_stage_archive": ["SELECT"],
 } as const satisfies Record<string, readonly string[]>;
 
 export const RUNTIME_APPLICATION_SEQUENCES = [
@@ -357,6 +361,7 @@ export const RUNTIME_APPLICATION_RLS_TABLES = [
   "sessions.session_analysis_result_tickets",
   "sessions.session_analysis_ticket_invocations",
   "sessions.session_analysis_ticket_reservations",
+  "sessions.search_catchup_cursor",
 ] as const;
 
 /**
@@ -385,6 +390,7 @@ export function runtimeApplicationAclCatalog(): {
 export const RUNTIME_APPLICATION_FUNCTIONS = [
   "sessions.ack_session_brief_documents(uuid,jsonb)",
   "sessions.applied_repo_evidence(jsonb,jsonb)",
+  "sessions.archive_search_stage_v1()",
   "sessions.backfill_session_brief_documents(integer)",
   "sessions.canonical_remote(text)",
   "sessions.capture_session_replay_pages(text,text,text,text)",
@@ -1676,7 +1682,7 @@ export const SESSIONS_FUNCTION_EVENT_TRIGGER_TAGS: readonly string[] =
  * `__RUNTIME_ROLE__`: exactly the reviewed body in the bootstrap file.
  */
 export const SESSIONS_FUNCTION_EVENT_TRIGGER_PROSRC_SHA256 =
-  "5af2f6281ec2d109b53398c1343f3ffc1573d255884cf04fda38bce54c730cd2";
+  "558bae165002b410690d55866b1959f33032d02ebc8d484a38a8bc68f17cdb66";
 export const SESSIONS_FUNCTION_EVENT_TRIGGER_PROCONFIG: readonly string[] =
   Object.freeze(["search_path=pg_catalog, pg_temp"]);
 const RUNTIME_LITERAL = /v_runtime text := '([a-z_][a-z0-9_]{0,62})';/g;
