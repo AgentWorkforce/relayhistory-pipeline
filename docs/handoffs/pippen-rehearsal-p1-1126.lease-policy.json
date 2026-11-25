@@ -160,7 +160,12 @@
             "Action": [
               "sqs:CreateQueue"
             ],
-            "Resource": "arn:aws:sqs:us-west-2:<account>:96bulls-aws-rehearse-p1-1126-*",
+            "Resource": [
+              "arn:aws:sqs:us-west-2:<account>:96bulls-aws-rehearse-p1-1126-session-events",
+              "arn:aws:sqs:us-west-2:<account>:96bulls-aws-rehearse-p1-1126-session-events-dlq",
+              "arn:aws:sqs:us-west-2:<account>:96bulls-aws-rehearse-p1-1126-session-search",
+              "arn:aws:sqs:us-west-2:<account>:96bulls-aws-rehearse-p1-1126-session-search-dlq"
+            ],
             "Condition": {
               "DateLessThan": {
                 "aws:CurrentTime": "2026-11-27T08:00:00Z"
@@ -176,7 +181,7 @@
             "Action": [
               "lambda:CreateFunction"
             ],
-            "Resource": "arn:aws:lambda:us-west-2:<account>:function:96bulls-aws-rehearse-p1-1126-*",
+            "Resource": "arn:aws:lambda:us-west-2:<account>:function:96bulls-aws-rehearse-p1-1126-session-pipeline",
             "Condition": {
               "DateLessThan": {
                 "aws:CurrentTime": "2026-11-27T08:00:00Z"
@@ -200,8 +205,8 @@
               "StringEquals": {
                 "aws:RequestTag/rehearsal": "p1-1126"
               },
-              "ArnLike": {
-                "lambda:FunctionArn": "arn:aws:lambda:us-west-2:<account>:function:96bulls-aws-rehearse-p1-1126-*"
+              "ArnEquals": {
+                "lambda:FunctionArn": "arn:aws:lambda:us-west-2:<account>:function:96bulls-aws-rehearse-p1-1126-session-pipeline"
               }
             }
           },
@@ -211,7 +216,13 @@
             "Action": [
               "cloudwatch:PutMetricAlarm"
             ],
-            "Resource": "arn:aws:cloudwatch:us-west-2:<account>:alarm:96bulls-aws-rehearse-p1-1126-*",
+            "Resource": [
+              "arn:aws:cloudwatch:us-west-2:<account>:alarm:96bulls-aws-rehearse-p1-1126-session-events-dlq-not-empty",
+              "arn:aws:cloudwatch:us-west-2:<account>:alarm:96bulls-aws-rehearse-p1-1126-session-events-backlog-age",
+              "arn:aws:cloudwatch:us-west-2:<account>:alarm:96bulls-aws-rehearse-p1-1126-session-pipeline-errors",
+              "arn:aws:cloudwatch:us-west-2:<account>:alarm:96bulls-aws-rehearse-p1-1126-session-search-dlq-not-empty",
+              "arn:aws:cloudwatch:us-west-2:<account>:alarm:96bulls-aws-rehearse-p1-1126-session-search-backlog-age"
+            ],
             "Condition": {
               "DateLessThan": {
                 "aws:CurrentTime": "2026-11-27T08:00:00Z"
@@ -228,8 +239,8 @@
               "logs:CreateLogGroup"
             ],
             "Resource": [
-              "arn:aws:logs:us-west-2:<account>:log-group:/aws/lambda/96bulls-aws-rehearse-p1-1126-*",
-              "arn:aws:logs:us-west-2:<account>:log-group:/aws/lambda/96bulls-aws-rehearse-p1-1126-*:*"
+              "arn:aws:logs:us-west-2:<account>:log-group:/aws/lambda/96bulls-aws-rehearse-p1-1126-session-pipeline",
+              "arn:aws:logs:us-west-2:<account>:log-group:/aws/lambda/96bulls-aws-rehearse-p1-1126-session-pipeline:*"
             ],
             "Condition": {
               "DateLessThan": {
@@ -250,21 +261,25 @@
               "logs:TagResource"
             ],
             "Resource": [
-              "arn:aws:sqs:us-west-2:<account>:96bulls-aws-rehearse-p1-1126-*",
-              "arn:aws:lambda:us-west-2:<account>:function:96bulls-aws-rehearse-p1-1126-*",
-              "arn:aws:lambda:us-west-2:<account>:event-source-mapping:*",
-              "arn:aws:cloudwatch:us-west-2:<account>:alarm:96bulls-aws-rehearse-p1-1126-*",
-              "arn:aws:logs:us-west-2:<account>:log-group:/aws/lambda/96bulls-aws-rehearse-p1-1126-*",
-              "arn:aws:logs:us-west-2:<account>:log-group:/aws/lambda/96bulls-aws-rehearse-p1-1126-*:*"
+              "arn:aws:sqs:us-west-2:<account>:96bulls-aws-rehearse-p1-1126-session-events",
+              "arn:aws:sqs:us-west-2:<account>:96bulls-aws-rehearse-p1-1126-session-events-dlq",
+              "arn:aws:sqs:us-west-2:<account>:96bulls-aws-rehearse-p1-1126-session-search",
+              "arn:aws:sqs:us-west-2:<account>:96bulls-aws-rehearse-p1-1126-session-search-dlq",
+              "arn:aws:lambda:us-west-2:<account>:function:96bulls-aws-rehearse-p1-1126-session-pipeline",
+              "arn:aws:cloudwatch:us-west-2:<account>:alarm:96bulls-aws-rehearse-p1-1126-session-events-dlq-not-empty",
+              "arn:aws:cloudwatch:us-west-2:<account>:alarm:96bulls-aws-rehearse-p1-1126-session-events-backlog-age",
+              "arn:aws:cloudwatch:us-west-2:<account>:alarm:96bulls-aws-rehearse-p1-1126-session-pipeline-errors",
+              "arn:aws:cloudwatch:us-west-2:<account>:alarm:96bulls-aws-rehearse-p1-1126-session-search-dlq-not-empty",
+              "arn:aws:cloudwatch:us-west-2:<account>:alarm:96bulls-aws-rehearse-p1-1126-session-search-backlog-age",
+              "arn:aws:logs:us-west-2:<account>:log-group:/aws/lambda/96bulls-aws-rehearse-p1-1126-session-pipeline",
+              "arn:aws:logs:us-west-2:<account>:log-group:/aws/lambda/96bulls-aws-rehearse-p1-1126-session-pipeline:*"
             ],
             "Condition": {
               "DateLessThan": {
                 "aws:CurrentTime": "2026-11-27T08:00:00Z"
               },
               "StringEquals": {
-                "aws:RequestTag/rehearsal": "p1-1126"
-              },
-              "StringEqualsIfExists": {
+                "aws:RequestTag/rehearsal": "p1-1126",
                 "aws:ResourceTag/rehearsal": "p1-1126"
               }
             }
@@ -290,7 +305,12 @@
               "sqs:DeleteMessage",
               "sqs:ChangeMessageVisibility"
             ],
-            "Resource": "arn:aws:sqs:us-west-2:<account>:96bulls-aws-rehearse-p1-1126-*",
+            "Resource": [
+              "arn:aws:sqs:us-west-2:<account>:96bulls-aws-rehearse-p1-1126-session-events",
+              "arn:aws:sqs:us-west-2:<account>:96bulls-aws-rehearse-p1-1126-session-events-dlq",
+              "arn:aws:sqs:us-west-2:<account>:96bulls-aws-rehearse-p1-1126-session-search",
+              "arn:aws:sqs:us-west-2:<account>:96bulls-aws-rehearse-p1-1126-session-search-dlq"
+            ],
             "Condition": {
               "DateLessThan": {
                 "aws:CurrentTime": "2026-11-27T08:00:00Z"
@@ -318,7 +338,7 @@
               "lambda:ListTags",
               "lambda:InvokeFunction"
             ],
-            "Resource": "arn:aws:lambda:us-west-2:<account>:function:96bulls-aws-rehearse-p1-1126-*",
+            "Resource": "arn:aws:lambda:us-west-2:<account>:function:96bulls-aws-rehearse-p1-1126-session-pipeline",
             "Condition": {
               "DateLessThan": {
                 "aws:CurrentTime": "2026-11-27T08:00:00Z"
@@ -344,8 +364,8 @@
               "StringEquals": {
                 "aws:ResourceTag/rehearsal": "p1-1126"
               },
-              "ArnLike": {
-                "lambda:FunctionArn": "arn:aws:lambda:us-west-2:<account>:function:96bulls-aws-rehearse-p1-1126-*"
+              "ArnEquals": {
+                "lambda:FunctionArn": "arn:aws:lambda:us-west-2:<account>:function:96bulls-aws-rehearse-p1-1126-session-pipeline"
               }
             }
           },
@@ -357,7 +377,13 @@
               "cloudwatch:DeleteAlarms",
               "cloudwatch:ListTagsForResource"
             ],
-            "Resource": "arn:aws:cloudwatch:us-west-2:<account>:alarm:96bulls-aws-rehearse-p1-1126-*",
+            "Resource": [
+              "arn:aws:cloudwatch:us-west-2:<account>:alarm:96bulls-aws-rehearse-p1-1126-session-events-dlq-not-empty",
+              "arn:aws:cloudwatch:us-west-2:<account>:alarm:96bulls-aws-rehearse-p1-1126-session-events-backlog-age",
+              "arn:aws:cloudwatch:us-west-2:<account>:alarm:96bulls-aws-rehearse-p1-1126-session-pipeline-errors",
+              "arn:aws:cloudwatch:us-west-2:<account>:alarm:96bulls-aws-rehearse-p1-1126-session-search-dlq-not-empty",
+              "arn:aws:cloudwatch:us-west-2:<account>:alarm:96bulls-aws-rehearse-p1-1126-session-search-backlog-age"
+            ],
             "Condition": {
               "DateLessThan": {
                 "aws:CurrentTime": "2026-11-27T08:00:00Z"
@@ -378,8 +404,8 @@
               "logs:FilterLogEvents"
             ],
             "Resource": [
-              "arn:aws:logs:us-west-2:<account>:log-group:/aws/lambda/96bulls-aws-rehearse-p1-1126-*",
-              "arn:aws:logs:us-west-2:<account>:log-group:/aws/lambda/96bulls-aws-rehearse-p1-1126-*:*"
+              "arn:aws:logs:us-west-2:<account>:log-group:/aws/lambda/96bulls-aws-rehearse-p1-1126-session-pipeline",
+              "arn:aws:logs:us-west-2:<account>:log-group:/aws/lambda/96bulls-aws-rehearse-p1-1126-session-pipeline:*"
             ],
             "Condition": {
               "DateLessThan": {
@@ -398,8 +424,15 @@
               "cloudwatch:DescribeAlarms"
             ],
             "Resource": [
-              "arn:aws:sqs:us-west-2:<account>:96bulls-aws-rehearse-p1-1126-*",
-              "arn:aws:cloudwatch:us-west-2:<account>:alarm:96bulls-aws-rehearse-p1-1126-*"
+              "arn:aws:sqs:us-west-2:<account>:96bulls-aws-rehearse-p1-1126-session-events",
+              "arn:aws:sqs:us-west-2:<account>:96bulls-aws-rehearse-p1-1126-session-events-dlq",
+              "arn:aws:sqs:us-west-2:<account>:96bulls-aws-rehearse-p1-1126-session-search",
+              "arn:aws:sqs:us-west-2:<account>:96bulls-aws-rehearse-p1-1126-session-search-dlq",
+              "arn:aws:cloudwatch:us-west-2:<account>:alarm:96bulls-aws-rehearse-p1-1126-session-events-dlq-not-empty",
+              "arn:aws:cloudwatch:us-west-2:<account>:alarm:96bulls-aws-rehearse-p1-1126-session-events-backlog-age",
+              "arn:aws:cloudwatch:us-west-2:<account>:alarm:96bulls-aws-rehearse-p1-1126-session-pipeline-errors",
+              "arn:aws:cloudwatch:us-west-2:<account>:alarm:96bulls-aws-rehearse-p1-1126-session-search-dlq-not-empty",
+              "arn:aws:cloudwatch:us-west-2:<account>:alarm:96bulls-aws-rehearse-p1-1126-session-search-backlog-age"
             ],
             "Condition": {
               "DateLessThan": {
@@ -413,10 +446,7 @@
             "Action": [
               "iam:GetRole"
             ],
-            "Resource": [
-              "arn:aws:iam::<account>:role/pippen/workload/*",
-              "arn:aws:iam::<account>:role/96bulls-aws-session-pipeline-aws-rehearse-p1-1126-*"
-            ],
+            "Resource": "<execution-role-arn>",
             "Condition": {
               "DateLessThan": {
                 "aws:CurrentTime": "2026-11-27T08:00:00Z"

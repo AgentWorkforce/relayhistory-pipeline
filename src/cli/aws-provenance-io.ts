@@ -6,7 +6,7 @@ import { spawnSync } from "node:child_process";
 import { existsSync, readFileSync, writeFileSync, mkdirSync } from "node:fs";
 import { join } from "node:path";
 import { ensurePippenStateBucket } from "../../stacks/aws/state-bucket.ts";
-import { prepareStateBackend, stateBackendFor } from "../../stacks/aws/pippen-rehearsal.ts";
+import { prepareStateBackend, rehearsalRunContext } from "../../stacks/aws/pippen-rehearsal.ts";
 import { currentObjects, sanitizeInputs, sanitizePlan, sha256, type Provenance } from "./plan-provenance.ts";
 import { capturePaths, observeSource, observeState, verifyDeployCapture, type CaptureIO } from "../../stacks/aws/capture-verify.ts";
 import type { StateSnapshot } from "../../stacks/aws/state-snapshot.ts";
@@ -59,9 +59,9 @@ export function capturePlan(root: string, stage: string, env: Env) {
   const inputsPath = join(root, ".96bulls", stage, "aws-inputs.json");
   const rawInputs = readFileSync(inputsPath, "utf8");
   const inputs = JSON.parse(rawInputs) as { accountId: string; region: string; pippenSandbox?: unknown; eks?: { apiAccess?: { publicAccessCidrs?: string[] } } };
-  // The state backend is decided from validated inputs before anything else (a declared validate-only
-  // stage with missing or malformed inputs throws here, before any AWS call).
-  stateBackendFor(stage, inputs);
+  // Before ANY AWS call (and before git): the inputs, the backend, and for a validate-only stage the
+  // lease env, the issuer pin and the lease's end (pippen-rehearsal.ts rehearsalRunContext).
+  rehearsalRunContext(stage, inputs, env);
   const pippen = Boolean(inputs.pippenSandbox);
   const src = observeSourceAt(root, env);
   if (!src.clean) throw new Error("commit the stack source first: a plan must describe committed code");

@@ -47,7 +47,7 @@ import { spawnSync } from "node:child_process";
 import { Project as SupabaseProject, SupabaseProvider } from "../supabase/project.ts";
 import { assertTranscriptStorePlanContract, TRANSCRIPT_STAGE, transcriptStoreStage } from "./transcript-store.ts";
 import { readPipelineLive, spawnAwsRun } from "./pipeline-live.ts";
-import { prepareStateBackend, stateBackendFor } from "./pippen-rehearsal.ts";
+import { prepareStateBackend, rehearsalRunContext } from "./pippen-rehearsal.ts";
 
 const ROOT = fileURLToPath(new URL("../..", import.meta.url));
 const REPO = "AgentWorkforce/sessions-pipeline";
@@ -143,7 +143,7 @@ const stateTarget = stateTargetFromArgv(process.argv, (stage) => {
 // A declared validate-only stage is decided from its validated inputs before any state backend is
 // chosen: missing or malformed inputs throw here, never falling through to ensure or the default store.
 const argvStage = stageFromArgv(process.argv);
-if (argvStage) stateBackendFor(argvStage, stateTarget);
+if (argvStage) rehearsalRunContext(argvStage, stateTarget, process.env);
 const pippenStateLayer = (t: NonNullable<typeof stateTarget>) =>
   Layer.unwrap(
     Effect.sync(() => {

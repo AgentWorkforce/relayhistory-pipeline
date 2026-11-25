@@ -58,7 +58,7 @@ export interface AwsInputs {
    * `stateBucket: "validate-only"` (pippen-rehearsal.ts): the shared sandbox state bucket is only
    * read and checked, never created or changed. Required for every Pippen sandbox stage but the proof stage.
    */
-  pippenSandbox?: { permissionsBoundaryArn: string; stateBucket?: "validate-only" };
+  pippenSandbox?: { permissionsBoundaryArn: string; stateBucket?: "validate-only"; executionRole?: { arn: string; disposition: "deleted" | "retained" } };
   /**
    * Read-only cross-account pull from this stage's `96bulls-services` ECR
    * repository (ecrPullPolicy). Each entry is a 12-digit account id that gets

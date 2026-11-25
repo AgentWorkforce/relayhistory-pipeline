@@ -11,7 +11,10 @@ the repository: `<account>` below is the sandbox account, `<session_id>` the lea
 | region | `us-west-2` (the lease denies every other region) |
 | account | `<account>` (from `.96bulls/aws-rehearse-p1-1126/aws-inputs.json`, gitignored; must equal the broker's `PIPPEN_SANDBOX_ACCOUNT_ID`) |
 | caller | `arn:aws:sts::<account>:assumed-role/agent-session/agent-<session_id>`; `<session_id>` = `NINETY_SIX_BULLS_PIPPEN_SESSION` = the broker's `PIPPEN_SANDBOX_SESSION_ID` |
-| issuer pin | `PIPPEN_REHEARSAL_ISSUER_PIN_SHA256` = sha256 of `["aws-rehearse-p1-1126","us-west-2","<account>","<boundary ARN>"]` (JSON), set by the broker at issuance from its own records; the inputs' account and boundary must hash to it |
+| execution role | `pippenSandbox.executionRole` in the inputs: `{ "arn": "<execution-role-arn>", "disposition": "deleted" \| "retained" }` (retained only under `/pippen/workload/`); pinned by the issuer |
+| issuer pin | `PIPPEN_REHEARSAL_ISSUER_PIN_SHA256` = sha256 of `["aws-rehearse-p1-1126","us-west-2","<account>","<boundary ARN>","<execution-role-arn>","<disposition>","<session_id>","<issued_at>"]` (JSON), set by the broker at issuance from its own records; the inputs and the lease env must hash to it |
+| lease issuance time | `PIPPEN_REHEARSAL_ISSUED_AT` (ISO, UTC), set by the broker; the run is refused before it and at or after the effective end |
+| run id | `NINETY_SIX_BULLS_REHEARSAL_RUN_ID` (a UUID the operator chooses for the run; the same for the manifest and the teardown) |
 | state bucket (shared, never changed) | `pippen-sbx-alchemy-state-<account>-us-west-2-an` |
 | state prefix (this stage only) | `96bulls/96bulls-aws/aws-rehearse-p1-1126/` |
 | resource tag | `rehearsal=p1-1126` on every resource (required on create and on every act by the lease) |
@@ -45,8 +48,15 @@ bound it. Hence:
   store. Every other stage keeps its old choice (the proof stage and fresh-account sandbox stages
   such as `aws-proof` ensure; stages without `pippenSandbox` use the default store); a
   `stateBucket` value outside a declared stage is refused.
+- Before **any** AWS call (and before git), `rehearsalRunContext` checks everything that needs no
+  AWS: the inputs, the lease env (account, session, issuance time), the issuer pin over all of them,
+  and that the lease has not ended. The capture calls it right after reading the inputs; the stack
+  calls it at module load; a full-entry test drives `capturePlan` with fake `aws` and `git` and
+  asserts zero calls for malformed inputs, a wrong pin and an ended lease.
 - `prepareStateBackend` then either validates (validate-only: the attested caller, the exact
-  prefix, the bucket already in shape; no writes) or runs the old ensure path. Only reads:
+  prefix, the bucket already in shape, and, while this stage's state is empty, that none of the
+  stage's names is in use; no writes) or runs the old ensure path. It is the state layer of both the
+  capture and the Alchemy plan/deploy for the stage, so stage A's creates cannot run before it. Only reads:
   `sts:GetCallerIdentity`, `GetBucketVersioning` (it also answers NoSuchBucket),
   `GetBucketEncryption`, `GetPublicAccessBlock`, `GetBucketOwnershipControls`, `GetBucketTagging`.
   Never CreateBucket, never any Put. `HeadBucket` is not used: it needs `s3:ListBucket` without an
@@ -86,8 +96,21 @@ bound it. Hence:
    independent re-list that must show zero versions and zero delete markers.
 
 Without `--execute` it is a dry run (counts only). The bucket itself and sibling stages are never
-touched. Before stage A, `assertRehearsalNamesUnused` requires that none of the stage's names is in
-use, so no existing resource can be adopted into the rehearsal.
+touched.
+
+The manifest is bound to its run: it carries the run id, the lease session, the issuance time and
+the issuer pin, and a digest of its own content. `--execute` refuses a manifest from another run,
+lease or pin, or one whose content no longer matches its digest. The role in it is exactly the
+pinned ARN (account, path, name), the pinned disposition and the pinned boundary: deleted means
+`iam get-role` on that exact name is not found; retained means it shows exactly that ARN, path and
+permissions boundary. The digest is printed when the manifest is written and belongs in the run's
+handoff and the broker receipt (the file is local and an editor could recompute the digest; the
+recorded digest is what detects that).
+
+Non-adoption: while this stage's state is empty (stage A not yet applied), the state layer refuses
+if any of the stage's names is in use (`assertRehearsalNamesUnused`). That preflight cannot enforce
+non-adoption against a resource created concurrently after it ran, or against the lease used
+outside this tooling: the issuer must scope the grant (below) and that residual is the issuer's.
 
 ## Lease: issuer mechanism and actions
 
@@ -99,7 +122,7 @@ The broker (layered-infra-ops) issues the lease with `sts:AssumeRole` on the san
   outside `us-west-2`, any write to a `pippen-sbx-alchemy-state-*` bucket, and removing the
   `rehearsal` tag;
 - `PolicyArns`: three customer-managed policies the broker creates from `managed`
-  (`96bulls-rehearse-p1-1126-state` 1,500, `-create` 2,468, `-act` 3,239 characters; limit 6,144);
+  (`96bulls-rehearse-p1-1126-state` 1,500, `-create` 3,919, `-act` about 4,700 (it names the role ARN); limit 6,144);
 - `DurationSeconds`: no more than `rehearsalLeaseEnd({ issuedAt })` minus issuance (at most 6 h);
 - the environment `pippen sandbox exec` gives the session: `PIPPEN_SANDBOX_ACCOUNT_ID`,
   `PIPPEN_SANDBOX_SESSION_ID` and `PIPPEN_REHEARSAL_ISSUER_PIN_SHA256`.
@@ -109,25 +132,29 @@ The session's permissions are the role's policies intersected with these session
 - `-state`: `s3:ListBucket`/`ListBucketVersions` only with `s3:prefix` like the stage prefix;
   object reads, writes and deletes only on `<bucket>/96bulls/96bulls-aws/aws-rehearse-p1-1126/*`;
   the bucket's five settings readable; explicit denies on other prefixes and other objects.
-- `-create`, only with `aws:RequestTag/rehearsal = p1-1126` and the stage's names:
-  `sqs:CreateQueue`, `lambda:CreateFunction`, `lambda:CreateEventSourceMapping` (on
-  `event-source-mapping:*`, only for the stage's function by `lambda:FunctionArn`),
-  `cloudwatch:PutMetricAlarm`, `logs:CreateLogGroup`. Tagging (`sqs:TagQueue`,
-  `lambda:TagResource`, `cloudwatch:TagResource`, `logs:TagResource`) is a separate statement: the
-  request must carry `rehearsal = p1-1126` and the resource, if it already has a `rehearsal` tag,
-  must carry that value. IAM cannot tell create-time tagging from a standalone tag call for these
-  services, so an untagged existing resource is excluded in code: `assertRehearsalNamesUnused`
-  before stage A (no stage name may exist).
+- Every resource is exact: the function
+  `arn:aws:lambda:us-west-2:<account>:function:96bulls-aws-rehearse-p1-1126-session-pipeline`, the
+  four queue ARNs, the five alarm ARNs, the log group. Only mapping ARNs are `event-source-mapping:*`
+  (their UUIDs do not exist before creation), always conditioned on `lambda:FunctionArn` equal
+  (`ArnEquals`) to that exact function.
+- `-create`, only with `aws:RequestTag/rehearsal = p1-1126`: `sqs:CreateQueue`,
+  `lambda:CreateFunction`, `lambda:CreateEventSourceMapping`, `cloudwatch:PutMetricAlarm`,
+  `logs:CreateLogGroup`. Standalone tagging (`sqs:TagQueue`, `lambda:TagResource`,
+  `cloudwatch:TagResource`, `logs:TagResource`, on the exact queues, function, alarms and log group,
+  never on mappings) only where the resource already carries `rehearsal = p1-1126` and the request
+  sets it (no `IfExists`): an untagged resource cannot be tagged into the rehearsal. **Residual for
+  the issuer:** if a service also authorizes its tag action at create time against a resource tag
+  that does not exist yet, creating with tags fails closed; the issuer must confirm the create calls
+  succeed under these policies, or grant create-time tagging in a way it can bind to the create.
 - `-act`, only on resources tagged `rehearsal = p1-1126`: queue attributes, messages and deletion;
   the function's reads, updates, `PublishVersion`, `ListAliases`, `ListVersionsByFunction`,
   permissions, tag reads, invoke and deletion; the mappings' get, update and delete on
-  `event-source-mapping:*` by their own tag **and** `lambda:FunctionArn` (the UUIDs do not exist
-  before creation; teardown checks each recorded UUID); alarm put and delete; the log group's
+  `event-source-mapping:*` by their own tag **and** `lambda:FunctionArn` equal to the exact function
+  (teardown checks each recorded UUID); alarm put and delete; the log group's
   retention, deletion, tag reads, `StartQuery` and `FilterLogEvents`.
 - Reads narrowed to the stage's names (no tag condition, since they must also answer "not found"):
-  `sqs:GetQueueUrl` and `cloudwatch:DescribeAlarms`; `iam:GetRole` only on
-  `role/pippen/workload/*` and `role/96bulls-aws-session-pipeline-aws-rehearse-p1-1126-*` (the
-  role-disposition check).
+  `sqs:GetQueueUrl` and `cloudwatch:DescribeAlarms` on the exact queues and alarms; `iam:GetRole`
+  only on the pinned execution role ARN (the role-disposition check).
 - **Reads IAM cannot narrow** (resource `*`): `lambda:ListEventSourceMappings` (no resource-level
   permission), `cloudwatch:GetMetricStatistics` and `cloudwatch:GetMetricData` (no resource-level
   permission and no namespace or dimension condition key for reads; `cloudwatch:namespace` applies
@@ -156,17 +183,24 @@ absolute cutoff); the broker generates the issued one.
 
 ## What the broker must attest, and the receipts required
 
-Code checks: the issuer pin (inputs' account and boundary hash to the broker's pin), the lease env
+Code checks: the issuer pin (the inputs' account, boundary, execution role and disposition, and the
+lease's session and issuance time hash to the broker's pin), the lease env
 (`PIPPEN_SANDBOX_ACCOUNT_ID`, `PIPPEN_SANDBOX_SESSION_ID` equal to the inputs' account and
-`NINETY_SIX_BULLS_PIPPEN_SESSION`), and STS (exactly `agent-session/agent-<session_id>` in that
-account). The real account id is not in the repository, so the pin is the broker's attestation: it
-must be computed from the broker's own record of the approved sandbox account and boundary, never
-from the stage inputs.
+`NINETY_SIX_BULLS_PIPPEN_SESSION`), the lease's end, and STS (exactly
+`agent-session/agent-<session_id>` in that account).
+
+**Provenance:** the code compares the inputs with a digest it receives in the environment. That
+proves consistency, not origin: anyone who can set the environment can set a matching digest. Only
+the broker can establish where the pin came from (its issuance receipt, below), so the code-side
+check is necessary but not sufficient. A broker-signed attestation verified against a broker
+public key pinned in the repository would close this; no broker key exists yet, so it is not
+implemented. The pin must be computed from the broker's own records, never from the stage inputs.
 
 Generating policies does not issue or revoke anything. The rehearsal record needs these broker
 receipts (kept outside the repository, referenced by hash in the run's handoff):
 
-1. The issuer pin and the records it was computed from (approved account and boundary).
+1. The issuer pin and the records it was computed from (approved account, boundary, execution role
+   and disposition, lease session and issuance time).
 2. For each managed session policy: its ARN, the default version id, and the sha256 of that
    version's document, equal to the generated `managed[n].document` (canonical JSON).
 3. The sha256 of the inline session policy passed, equal to the generated `inline`.
@@ -175,6 +209,7 @@ receipts (kept outside the repository, referenced by hash in the run's handoff):
 5. Revocation at teardown completion: the revocation action taken (for example the role's
    revoke-older-sessions deny, or deleting the managed policy versions) with its time, and a
    failed call with the lease's credentials after it.
+6. The physical manifest's digest as printed at `--manifest`, and the run id.
 
 ## Not covered (blockers before the rehearsal can run)
 
@@ -195,4 +230,6 @@ receipts (kept outside the repository, referenced by hash in the run's handoff):
 - The broker reviewed source and Node only; the Bun test counts are author-reported (reproduction
   commands in the handoff report).
 - The issuance itself (pin, policy versions, STS duration) and the revocation are the broker's, and
-  their receipts (above) are not produced by this code.
+  their receipts (above) are not produced by this code; the pin's provenance is the broker's alone.
+- Non-adoption under concurrent creation or standalone use of the lease, and create-time tagging
+  under the strict tag statement, are residuals for the issuer (see Teardown and Lease).
