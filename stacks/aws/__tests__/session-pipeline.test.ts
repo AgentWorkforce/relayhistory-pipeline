@@ -9,6 +9,7 @@ import {
   FUNCTION_TIMEOUT_SECONDS,
   SESSION_BRIEF_RESOURCES,
   SESSION_PIPELINE_RESOURCES,
+  SESSION_SEARCH_QUEUE_RESOURCES,
   VISIBILITY_TIMEOUT_SECONDS,
   assertSessionPipelineInputs,
   briefScheduleProps,
@@ -20,6 +21,10 @@ import {
   sessionPipelineNames,
   sessionPipelinePermissions,
   sessionQueuePolicy,
+  sessionSearchDlqProps,
+  sessionSearchMappingProps,
+  sessionSearchQueuePolicy,
+  sessionSearchQueueProps,
   sessionSecretPolicy,
 } from "../session-pipeline.ts";
 import { assertTranscriptStoreInputs, assertTranscriptStorePlanContract, transcriptBucketPolicy, transcriptKeyPolicy, transcriptNames } from "../transcript-store.ts";
@@ -595,5 +600,112 @@ describe("session pipeline: streamed reconcile switch", () => {
     const on = sessionPipelineFunctionProps({ ...i, p: { searchIndex: true, streamReconcile: { enabled: true } } });
     expect({ ...on, env: undefined }).toEqual({ ...off, env: undefined });
     expect(on.env).toEqual({ ...off.env, SEARCH_INDEX_STREAMING_CH: "1" });
+  });
+});
+
+describe("session pipeline: search-queue split", () => {
+  const refuse = (why: string): never => {
+    throw new Error(why);
+  };
+  const ok = (v: unknown) => assertSessionPipelineInputs(v, refuse);
+
+  it("absent, disabled or not handed off renders nothing new; handoff renders the search queue URL only", () => {
+    const off = sessionPipelineEnv({ stage: STAGE, bucket: t.bucket, names: p, p: { searchIndex: true } });
+    expect(Object.keys(off)).not.toContain("SESSION_PIPELINE_SEARCH_QUEUE_URL");
+    for (const searchQueue of [{ enabled: false }, { enabled: true }, { enabled: true, mappingEnabled: true }, { enabled: false, handoff: false }])
+      expect(sessionPipelineEnv({ stage: STAGE, bucket: t.bucket, names: p, p: { searchIndex: true, searchQueue } })).toEqual(off);
+    const on = sessionPipelineEnv({ stage: STAGE, bucket: t.bucket, names: p, p: { searchIndex: true, searchQueue: { enabled: true, handoff: true } } });
+    expect(on).toEqual({ ...off, SESSION_PIPELINE_SEARCH_QUEUE_URL: p.searchQueueUrl });
+    expect(p.searchQueueUrl).toBe(`https://sqs.${REGION}.amazonaws.com/${ACCOUNT}/96bulls-${STAGE}-session-search`);
+  });
+
+  it("validates the shape: enabled is required, handoff needs enabled and searchIndex, concurrency 2-10", () => {
+    expect(() => ok({ searchIndex: true, searchQueue: { enabled: true, mappingEnabled: true, handoff: true, maxConcurrency: 6 } })).not.toThrow();
+    expect(() => ok({ searchQueue: { enabled: true } })).not.toThrow();
+    expect(() => ok({ searchQueue: { enabled: false } })).not.toThrow();
+    expect(() => ok({ searchQueue: {} })).toThrow(/searchQueue.enabled must be a boolean/);
+    expect(() => ok({ searchQueue: { enabled: "yes" } })).toThrow(/searchQueue.enabled must be a boolean/);
+    expect(() => ok({ searchQueue: { enabled: true, handoff: 1 } })).toThrow(/searchQueue.handoff must be a boolean/);
+    expect(() => ok({ searchQueue: { enabled: true, handoff: true } })).toThrow(/handoff requires searchIndex: true/);
+    expect(() => ok({ searchIndex: true, searchQueue: { enabled: false, handoff: true } })).toThrow(/require enabled: true/);
+    expect(() => ok({ searchQueue: { enabled: false, mappingEnabled: true } })).toThrow(/require enabled: true/);
+    for (const maxConcurrency of [1, 11, 2.5, "4"]) expect(() => ok({ searchQueue: { enabled: true, maxConcurrency } })).toThrow(/maxConcurrency must be an integer from 2 to 10/);
+    expect(() => ok({ searchQueue: { enabled: true, queueName: "x" } })).toThrow(/searchQueue.queueName is not a known setting/);
+    expect(() => ok({ searchQueue: true })).toThrow(/searchQueue must be a plain object/);
+  });
+
+  it("the queue and DLQ keep the events queue's conventions; the mapping starts disabled with its own concurrency", () => {
+    const tags = { component: "session-pipeline" };
+    const dlq = sessionSearchDlqProps({ names: p, tags });
+    expect(dlq).toEqual({ queueName: p.searchDlq, messageRetentionPeriod: "14 days", sqsManagedSseEnabled: true, policy: expect.anything(), tags });
+    expect(dlq.policy.Statement.map((s) => s.Sid)).toEqual(["DenyInsecureTransport"]);
+    const queue = sessionSearchQueueProps({ names: p, roleArn: ROLE, dlqArn: p.searchDlqArn, tags });
+    expect(queue).toMatchObject({
+      queueName: p.searchQueue,
+      visibilityTimeout: `${VISIBILITY_TIMEOUT_SECONDS} seconds`,
+      messageRetentionPeriod: "4 days",
+      receiveMessageWaitTime: "20 seconds",
+      sqsManagedSseEnabled: true,
+      redrivePolicy: { deadLetterTargetArn: p.searchDlqArn, maxReceiveCount: 8 },
+    });
+    expect("delay" in queue).toBe(false);
+    const mapping = (q: Parameters<typeof sessionSearchMappingProps>[0]["q"]) => sessionSearchMappingProps({ q, functionName: p.function, queueArn: p.searchQueueArn, tags });
+    expect(mapping({ enabled: true })).toMatchObject({ eventSourceArn: p.searchQueueArn, functionResponseTypes: ["ReportBatchItemFailures"], scalingConfig: { MaximumConcurrency: 2 }, enabled: false });
+    expect(mapping({ enabled: true, mappingEnabled: true, maxConcurrency: 6 })).toMatchObject({ scalingConfig: { MaximumConcurrency: 6 }, enabled: true });
+  });
+
+  it("only the role uses the search queue: consume and send, TLS only, no S3 statement", () => {
+    const policy = sessionSearchQueuePolicy({ queueArn: p.searchQueueArn, roleArn: ROLE });
+    expect(policy.Statement.map((s) => s.Sid)).toEqual(["DenyInsecureTransport", "SessionPipelineConsumes"]);
+    expect(policy.Statement[0]).toMatchObject({ Effect: "Deny", Resource: p.searchQueueArn, Condition: { Bool: { "aws:SecureTransport": "false" } } });
+    const consume = policy.Statement[1]!;
+    expect(consume.Principal).toEqual({ AWS: ROLE });
+    expect(consume.Resource).toBe(p.searchQueueArn);
+    expect([...consume.Action].sort()).toEqual(["sqs:ChangeMessageVisibility", "sqs:DeleteMessage", "sqs:GetQueueAttributes", "sqs:ReceiveMessage", "sqs:SendMessage"]);
+  });
+
+  describe("deploy plan contract", () => {
+    const store = [
+      "access-logs", "budget", "trail", "trail-key", "trail-key-alias", "trail-logs",
+      "transcript-eraser", "transcript-reader", "transcript-srv-writer", "transcript-writer", "transcripts",
+      "transcripts-key", "transcripts-key-alias",
+    ];
+    const all = [...store, ...SESSION_PIPELINE_RESOURCES, ...SESSION_SEARCH_QUEUE_RESOURCES];
+    const h = (text: string) => createHash("sha256").update(text).digest("hex");
+    const plan = (actions: Record<string, string>, resources = all) => {
+      const counts = new Map<string, number>();
+      for (const [r, a] of Object.entries(actions)) if (resources.includes(r)) counts.set(a, (counts.get(a) ?? 0) + 1);
+      const summary = counts.size ? `Plan: ${[...counts].map(([a, c]) => `${c} to ${a}`).join(", ")}` : "Plan: 0 changes";
+      return `${summary}\n${resources.map((r) => `[${r}] ${actions[r] ?? "noop"}`).join("\n")}\n`;
+    };
+    const check = (compact: string) => {
+      const full = compact.split("\n").map((l) => (l.startsWith("[") ? `  ${l}` : l)).join("\n");
+      return assertTranscriptStorePlanContract(compact, {
+        detailedPlanText: full,
+        provenanceText: JSON.stringify({
+          schema: 1,
+          stage: STAGE,
+          outputs: { plan: { path: `docs/plans/${STAGE}.plan.txt`, sha256: h(compact) }, detailed: { path: `docs/plans/${STAGE}.plan.detailed.txt`, sha256: h(full) } },
+          summary: compact.split("\n")[0],
+        }),
+      });
+    };
+    const creates = Object.fromEntries(SESSION_SEARCH_QUEUE_RESOURCES.map((r) => [r, "create"]));
+
+    it("creating the search queue is a pipeline rollout; enabling the mapping or the handoff is a pipeline update; all noop is post-apply", () => {
+      expect(check(plan(creates))).toBe("session pipeline rollout");
+      expect(check(plan({ "session-search-mapping": "create" }))).toBe("session pipeline rollout");
+      expect(check(plan({ "session-search-mapping": "update" }))).toBe("session pipeline update");
+      expect(check(plan({ "session-pipeline": "update" }))).toBe("session pipeline update");
+      expect(check(plan({ "session-search-mapping": "update", "session-events-mapping": "update" }))).toBe("session pipeline update");
+      expect(check(plan({}))).toBe("post-apply");
+    });
+
+    it("refuses a partial list, a delete or replace, a mixed create and update, and search resources without the pipeline's", () => {
+      expect(() => check(plan(creates, all.filter((r) => r !== "session-search-dlq")))).toThrow(/missing resource session-search-dlq/);
+      for (const action of ["replace", "delete"]) expect(() => check(plan({ "session-search": action }))).toThrow(/forbidden action/);
+      expect(() => check(plan({ ...creates, "session-pipeline": "update" }))).toThrow(/action set does not match/);
+      expect(() => check(plan(creates, [...store, ...SESSION_SEARCH_QUEUE_RESOURCES]))).toThrow(/missing resource session-pipeline/);
+    });
   });
 });

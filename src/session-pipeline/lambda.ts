@@ -99,6 +99,13 @@ export interface LambdaEnv {
    * call fails, a warn is logged, and the message keeps the full timeout. Absent: as before.
    */
   retryVisibilityS?: number;
+  /**
+   * SESSION_PIPELINE_SEARCH_QUEUE_URL=<https SQS queue URL> (unset or "": off; needs
+   * SEARCH_INDEX_ENABLED=1): the pointer path hands each scope's search pass to this queue instead
+   * of running it inline, and records from this queue (by eventSourceARN) run only the search stage
+   * (consumer.ts searchHandoff). Needs sqs:SendMessage on it for the Lambda role. Absent: as before.
+   */
+  searchQueueUrl?: string;
 }
 
 export function lambdaEnv(env: NodeJS.ProcessEnv = process.env): LambdaEnv {
@@ -131,6 +138,7 @@ export function lambdaEnv(env: NodeJS.ProcessEnv = process.env): LambdaEnv {
   // SESSION_POINTER_SKIP_ORIGIN_BUCKET_ENABLED: strict grammar, default off, no SEARCH_INDEX_ENABLED coupling.
   const pointerSkipOriginBucket = pointerSkipOriginBucketFromEnv(env);
   const retryVisibilityS = retryVisibilityFromEnv(env);
+  const searchQueueUrl = searchQueueUrlFromEnv(env);
   return {
     region: need("AWS_REGION"),
     bucket: need("PIPELINE_RAW_S3_BUCKET"),
@@ -146,7 +154,35 @@ export function lambdaEnv(env: NodeJS.ProcessEnv = process.env): LambdaEnv {
     ...(searchSkipAcceptanceMissing ? { searchSkipAcceptanceMissing: true as const } : {}),
     ...(pointerSkipOriginBucket ? { pointerSkipOriginBucketEnabled: true as const } : {}),
     ...(retryVisibilityS ? { retryVisibilityS } : {}),
+    ...(searchQueueUrl ? { searchQueueUrl } : {}),
   };
+}
+
+/** An SQS queue URL: https, a host, then the owner and queue-name path segments. */
+const SQS_QUEUE_URL = /^https:\/\/[a-z0-9][a-z0-9.-]*\/([A-Za-z0-9_-]{1,64})\/([A-Za-z0-9_-]{1,80}(?:\.fifo)?)$/;
+
+/**
+ * SESSION_PIPELINE_SEARCH_QUEUE_URL: unset and "" are off (undefined); else an SQS queue URL with
+ * SEARCH_INDEX_ENABLED=1, or init fails naming the variable, never the value.
+ */
+export function searchQueueUrlFromEnv(env: Record<string, string | undefined>): string | undefined {
+  const value = env.SESSION_PIPELINE_SEARCH_QUEUE_URL;
+  if (value === undefined || value === "") return undefined;
+  if (!SQS_QUEUE_URL.test(value)) throw new Error("session pipeline: SESSION_PIPELINE_SEARCH_QUEUE_URL must be an https SQS queue URL");
+  if (env.SEARCH_INDEX_ENABLED !== "1") throw new Error("session pipeline: SESSION_PIPELINE_SEARCH_QUEUE_URL needs SEARCH_INDEX_ENABLED=1");
+  return value;
+}
+
+/**
+ * Whether an SQS record's eventSourceARN (`arn:<partition>:sqs:<region>:<owner>:<name>`) is the queue
+ * at `queueUrl`: the same owner and queue name, compared exactly. The ARN is set by the event source
+ * mapping, not by any message producer, so no body can route itself past the pointer stage.
+ */
+export function isFromQueue(eventSourceArn: unknown, queueUrl: string): boolean {
+  const url = SQS_QUEUE_URL.exec(queueUrl);
+  if (!url || typeof eventSourceArn !== "string") return false;
+  const arn = eventSourceArn.split(":");
+  return arn.length === 6 && arn[0] === "arn" && arn[2] === "sqs" && arn[4] === url[1] && arn[5] === url[2];
 }
 
 /** SESSION_PIPELINE_RETRY_VISIBILITY_S: unset, "" and "0" are off (0); else an integer 1..43200, or init fails naming the variable. */
@@ -287,16 +323,31 @@ export function sqsRequeue(
   env: Pick<LambdaEnv, "region" | "queueUrl">,
   call: typeof awsJsonCall = awsJsonCall,
   credentials: () => AwsSessionCredentials = () => lambdaCredentials(),
+  delaySeconds: number = BUSY_REQUEUE_DELAY_SECONDS,
 ): NonNullable<ConsumerDeps["requeue"]> {
   return async (manifestKey, oldestEventTime) => {
     await call({
       service: "sqs",
       target: "AmazonSQS.SendMessage",
       region: env.region,
-      body: { QueueUrl: env.queueUrl, MessageBody: requeueBody(manifestKey, oldestEventTime), DelaySeconds: BUSY_REQUEUE_DELAY_SECONDS },
+      body: { QueueUrl: env.queueUrl, MessageBody: requeueBody(manifestKey, oldestEventTime), DelaySeconds: delaySeconds },
       credentials: credentials(),
     });
   };
+}
+
+/**
+ * The consumer's `searchHandoff` dep (SESSION_PIPELINE_SEARCH_QUEUE_URL armed): the same SendMessage
+ * and body as `sqsRequeue`, to the search queue; `send` with no delay (a fresh handoff), `requeue`
+ * with the busy delay (a busy, deferred or past-deadline search pass).
+ */
+export function sqsSearchHandoff(
+  env: Pick<LambdaEnv, "region"> & { searchQueueUrl: string },
+  call: typeof awsJsonCall = awsJsonCall,
+  credentials: () => AwsSessionCredentials = () => lambdaCredentials(),
+): NonNullable<ConsumerDeps["searchHandoff"]> {
+  const target = { region: env.region, queueUrl: env.searchQueueUrl };
+  return { send: sqsRequeue(target, call, credentials, 0), requeue: sqsRequeue(target, call, credentials) };
 }
 
 /**
@@ -384,6 +435,8 @@ async function init(): Promise<Runtime> {
       // Default off (SEARCH_INDEX_SKIP_ACCEPTANCE_MISSING_ENABLED=true).
       ...(env.searchSkipAcceptanceMissing ? { skipAcceptanceMissing: true as const } : {}),
     };
+    // Default off (SESSION_PIPELINE_SEARCH_QUEUE_URL; lambdaEnv refuses it without SEARCH_INDEX_ENABLED=1).
+    if (env.searchQueueUrl) deps.searchHandoff = sqsSearchHandoff({ region: env.region, searchQueueUrl: env.searchQueueUrl });
   }
   // The key comes from the secret only; "-disabled" or blank means no model, as in config.ts.
   const key = modelKey({ OPENAI_API_KEY: secret.openai_api_key });
@@ -401,8 +454,8 @@ async function init(): Promise<Runtime> {
  * Tests only: `handler` runs SQS batches over these consumer deps instead of init()'s (no secret,
  * pool or S3); undefined clears it. Nothing in the Lambda runtime calls this.
  */
-export function setRuntimeForTests(deps: ConsumerDeps | undefined): void {
-  runtime = deps ? Promise.resolve({ env: {} as LambdaEnv, deps, brief: (async () => {}) as unknown as Runtime["brief"] }) : undefined;
+export function setRuntimeForTests(deps: ConsumerDeps | undefined, env: Partial<LambdaEnv> = {}): void {
+  runtime = deps ? Promise.resolve({ env: env as LambdaEnv, deps, brief: (async () => {}) as unknown as Runtime["brief"] }) : undefined;
 }
 
 function ready(): Promise<Runtime> {
@@ -598,19 +651,21 @@ export function invocationDeps(deps: ConsumerDeps, context?: LambdaInvocationCon
   };
 }
 
-type SqsRecord = { messageId: string; body: string; receiptHandle?: string; eventSource?: string; attributes?: { SentTimestamp?: unknown } | null };
+type SqsRecord = { messageId: string; body: string; receiptHandle?: string; eventSource?: string; eventSourceARN?: unknown; attributes?: { SentTimestamp?: unknown } | null };
 
 /**
  * The consumer's view of the Lambda's SQS records. Of the message attributes only
  * SentTimestamp is passed on (for the event_age_ms log field); SenderId and the rest stay here.
- * The receipt handle is passed on only with `withReceiptHandle` (retryVisibility armed).
+ * The receipt handle is passed on only with `withReceiptHandle` (retryVisibility armed); the
+ * `fromSearchQueue` mark only with `searchQueueUrl` (the split armed) and a matching eventSourceARN.
  */
-export function queueRecords(records: readonly SqsRecord[], withReceiptHandle = false): QueueRecord[] {
+export function queueRecords(records: readonly SqsRecord[], withReceiptHandle = false, searchQueueUrl?: string): QueueRecord[] {
   return records.map((r) => ({
     messageId: r.messageId,
     body: r.body,
     sentTimestamp: r.attributes?.SentTimestamp,
     ...(withReceiptHandle && typeof r.receiptHandle === "string" ? { receiptHandle: r.receiptHandle } : {}),
+    ...(searchQueueUrl && isFromQueue(r.eventSourceARN, searchQueueUrl) ? { fromSearchQueue: true as const } : {}),
   }));
 }
 
@@ -626,7 +681,8 @@ export async function handler(event: LambdaEvent, context?: LambdaInvocationCont
       // Nothing was processed: every message goes back to the queue.
       return { batchItemFailures: event.Records.map((r) => ({ itemIdentifier: r.messageId })) };
     }
-    return processBatch(queueRecords(event.Records, rt.deps.retryVisibility !== undefined), invocationDeps(rt.deps, context));
+    const searchQueueUrl = rt.deps.searchHandoff ? rt.env.searchQueueUrl : undefined;
+    return processBatch(queueRecords(event.Records, rt.deps.retryVisibility !== undefined, searchQueueUrl), invocationDeps(rt.deps, context));
   }
   if (event?.reconcile === true) {
     const started = Date.now();

@@ -51,6 +51,7 @@ import { TENANT_KEY_BASE } from "./tenants.ts";
 import {
   SESSION_BRIEF_RESOURCES,
   SESSION_PIPELINE_RESOURCES,
+  SESSION_SEARCH_QUEUE_RESOURCES,
   assertSessionPipelineInputs,
   pipelineBucketStatements,
   pipelineKeyStatement,
@@ -253,7 +254,8 @@ function isReadApiRolloutWithPipelineCascade(operations: ReadonlyMap<string, str
  */
 function sessionPipelinePhase(operations: ReadonlyMap<string, string>): TranscriptStorePlanPhase | undefined {
   if (!SESSION_PIPELINE_RESOURCES.some((r) => operations.has(r))) return undefined;
-  const pipeline = SESSION_PIPELINE_RESOURCES.map((r) => operations.get(r));
+  // The search-queue split's resources, when the plan lists them, are judged as pipeline resources.
+  const pipeline = [...SESSION_PIPELINE_RESOURCES, ...SESSION_SEARCH_QUEUE_RESOURCES.filter((r) => operations.has(r))].map((r) => operations.get(r));
   const store = (r: string) => operations.get(r);
   const othersNoop = TRANSCRIPT_RESOURCES.filter((r) => r !== "transcripts" && r !== "transcripts-key").every((r) => store(r) === "noop");
   if (!othersNoop) return undefined;
@@ -351,11 +353,14 @@ function expectedResources(names: Iterable<string>): readonly string[] {
   const pipeline = new Set<string>(SESSION_PIPELINE_RESOURCES);
   const readApi = new Set<string>(SESSION_READ_API_RESOURCES);
   const brief = new Set<string>(SESSION_BRIEF_RESOURCES);
+  const search = new Set<string>(SESSION_SEARCH_QUEUE_RESOURCES);
   const withBrief = list.some((n) => brief.has(n));
+  const withSearch = list.some((n) => search.has(n));
   return [
     ...TRANSCRIPT_RESOURCES,
-    ...(withBrief || list.some((n) => pipeline.has(n)) ? SESSION_PIPELINE_RESOURCES : []),
+    ...(withBrief || withSearch || list.some((n) => pipeline.has(n)) ? SESSION_PIPELINE_RESOURCES : []),
     ...(withBrief ? SESSION_BRIEF_RESOURCES : []),
+    ...(withSearch ? SESSION_SEARCH_QUEUE_RESOURCES : []),
     ...(list.some((n) => readApi.has(n)) ? SESSION_READ_API_RESOURCES : []),
   ];
 }
@@ -459,7 +464,8 @@ export function assertTranscriptStorePlanContract(planText: string, capture: Tra
   }
   const withPipeline = SESSION_PIPELINE_RESOURCES.some((r) => compact.operations.has(r));
   if (withPipeline) {
-    if (SESSION_PIPELINE_RESOURCES.every((r) => compact.operations.get(r) === "noop") && TRANSCRIPT_RESOURCES.every((r) => compact.operations.get(r) === "noop"))
+    const searchNoop = SESSION_SEARCH_QUEUE_RESOURCES.every((r) => !compact.operations.has(r) || compact.operations.get(r) === "noop");
+    if (searchNoop && SESSION_PIPELINE_RESOURCES.every((r) => compact.operations.get(r) === "noop") && TRANSCRIPT_RESOURCES.every((r) => compact.operations.get(r) === "noop"))
       return "post-apply";
     const pipelinePhase = sessionPipelinePhase(compact.operations);
     if (pipelinePhase === "session pipeline update")

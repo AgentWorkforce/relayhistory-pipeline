@@ -10,6 +10,10 @@
  * batch response); SQS redelivers them after the visibility timeout and moves
  * them to the DLQ after `maxReceiveCount`.
  *
+ * With `searchHandoff` armed (SESSION_PIPELINE_SEARCH_QUEUE_URL, default off) the two stages run
+ * from two queues: the pointer queue's batches hand each scope to the search queue after the
+ * pointer stage, and the search queue's records run only the search stage (ConsumerDeps.searchHandoff).
+ *
  * Latency fields on "pointer indexed" (per key), "search index reconciled" and
  * "search index partial" (per scope), each over the SQS messages behind the line:
  * - `s3_event_age_ms`: floor(log time - the oldest upload event time covered),
@@ -29,7 +33,7 @@
  */
 import { errorFields, log } from "../shared/log.ts";
 import { parseQueueBody, sequencerAfter, type LandedEvent, type QueueOrigin } from "./s3-events.ts";
-import { indexPointer, type PointerDeps, type SessionScope } from "./pointer.ts";
+import { indexPointer, resolveScope, type PointerDeps, type SessionScope } from "./pointer.ts";
 import { indexSearchScope, type SearchIndexDeps } from "./search-index.ts";
 import { streamDeadlinePassed } from "./search-index-stream.ts";
 
@@ -43,6 +47,11 @@ export interface QueueRecord {
    * used only as the ChangeMessageVisibility argument. Never logged.
    */
   receiptHandle?: string;
+  /**
+   * Set by lambda.ts queueRecords only while ConsumerDeps.searchHandoff is armed, when the record's
+   * eventSourceARN is the configured search queue: the record is a search pass, not a pointer event.
+   */
+  fromSearchQueue?: true;
 }
 
 /** Pointer-stage error codes whose messages are retried after `retryVisibility.seconds`, not the queue's full timeout. */
@@ -85,6 +94,19 @@ export interface ConsumerDeps {
     seconds: number;
     change: (receiptHandle: string, seconds: number, timeoutMs: number) => Promise<void>;
     remainingMs?: () => number;
+  };
+  /**
+   * SESSION_PIPELINE_SEARCH_QUEUE_URL (default off; absent, the search stage runs inline after the
+   * pointer stage exactly as before). Armed, with `search` set: a pointer-queue batch runs the
+   * pointer stage, then `send`s one requeue-shaped body per scope to the search queue instead of
+   * running the search stage (a failed send fails that scope's messages). A record marked
+   * `fromSearchQueue` skips the pointer stage: its scope is rebuilt read-only from the key
+   * (pointer.ts resolveScope) and the search stage runs for it, with busy, deferred and
+   * stream-deadline requeues going to the search queue (`requeue`), not to `ConsumerDeps.requeue`.
+   */
+  searchHandoff?: {
+    send: (manifestKey: string, oldestEventTime?: string) => Promise<void>;
+    requeue: (manifestKey: string, oldestEventTime?: string) => Promise<void>;
   };
   /** Clock for `event_age_ms` and `s3_event_age_ms` only (default Date.now). */
   now?: () => number;
@@ -216,6 +238,8 @@ export async function processBatch(records: readonly QueueRecord[], deps: Consum
   const now = deps.now ?? Date.now;
   const messages = new Map<string, Message>();
   const byKey = new Map<string, { event: LandedEvent; messageIds: string[]; covered: Covered }>();
+  // searchHandoff only: search-queue records, collapsed by key the same way, never given to the pointer stage.
+  const searchByKey: typeof byKey = new Map();
   for (const record of records) {
     const parsed = parseQueueBody(record.body);
     if (parsed.kind === "test") continue;
@@ -227,12 +251,13 @@ export async function processBatch(records: readonly QueueRecord[], deps: Consum
     }
     const sentMs = sentTimestampMs(record.sentTimestamp);
     messages.set(record.messageId, { origin: parsed.origin, ...(sentMs === undefined ? {} : { sentMs }) });
+    const into = deps.searchHandoff && record.fromSearchQueue ? searchByKey : byKey;
     for (const event of parsed.events) {
-      const held = byKey.get(event.key);
+      const held = into.get(event.key);
       if (!held) {
         const covered: Covered = { unknown: false };
         cover(covered, event);
-        byKey.set(event.key, { event, messageIds: [record.messageId], covered });
+        into.set(event.key, { event, messageIds: [record.messageId], covered });
       } else {
         held.messageIds.push(record.messageId);
         cover(held.covered, event);
@@ -241,7 +266,16 @@ export async function processBatch(records: readonly QueueRecord[], deps: Consum
     }
   }
 
-  const scopes = new Map<string, { scope: SessionScope; messageIds: string[]; manifestKey: string; covered: Covered }>();
+  type Scopes = Map<string, { scope: SessionScope; messageIds: string[]; manifestKey: string; covered: Covered }>;
+  const scopes: Scopes = new Map();
+  const addScope = (into: Scopes, scope: SessionScope, messageIds: readonly string[], manifestKey: string, covered: Covered) => {
+    const id = scopeId(scope);
+    const held = into.get(id);
+    if (held) {
+      held.messageIds.push(...messageIds);
+      merge(held.covered, covered);
+    } else into.set(id, { scope, messageIds: [...messageIds], manifestKey, covered: { ...covered } });
+  };
   for (const { event, messageIds, covered } of byKey.values()) {
     const started = Date.now();
     // The carried time is telemetry only: no stage sees it.
@@ -263,12 +297,7 @@ export async function processBatch(records: readonly QueueRecord[], deps: Consum
         duration_ms: Date.now() - started,
         ...lagFields(covered, messageIds, messages, now()),
       });
-      const id = scopeId(outcome.scope);
-      const held = scopes.get(id);
-      if (held) {
-        held.messageIds.push(...messageIds);
-        merge(held.covered, covered);
-      } else scopes.set(id, { scope: outcome.scope, messageIds: [...messageIds], manifestKey: outcome.manifestKey, covered: { ...covered } });
+      addScope(scopes, outcome.scope, messageIds, outcome.manifestKey, covered);
     } catch (error) {
       const fields = errorFields(error);
       log.error("pointer index failed", { stage: "session-indexed", ...fields, duration_ms: Date.now() - started });
@@ -277,31 +306,31 @@ export async function processBatch(records: readonly QueueRecord[], deps: Consum
     }
   }
 
-  if (deps.search) {
+  const runSearch = async (search: SearchIndexDeps, scopes: Scopes, requeue: ConsumerDeps["requeue"]) => {
     for (const { scope, messageIds, manifestKey, covered } of scopes.values()) {
       if (messageIds.every((id) => failed.has(id))) continue;
       const started = Date.now();
       try {
         // SEARCH_INDEX_STREAMING_CH=1 only: past the invocation's stream deadline no scope of the
         // batch is started (whole read or streamed); the rest are requeued instead.
-        if (deps.search.stream && streamDeadlinePassed(deps.search.streamDeadline)) {
-          if (!deps.requeue) throw new Error("batch past its stream deadline and no requeue");
-          await deps.requeue(manifestKey, carriedTime(covered));
+        if (search.stream && streamDeadlinePassed(search.streamDeadline)) {
+          if (!requeue) throw new Error("batch past its stream deadline and no requeue");
+          await requeue(manifestKey, carriedTime(covered));
           log.info("search index past the batch deadline, requeued", { stage: "search-index", org_id: scope.orgId, session_id: scope.sessionId, reason: "stream_batch_deadline" });
           continue;
         }
-        const result = await indexSearchScope(scope, deps.search);
+        const result = await indexSearchScope(scope, search);
         if (result.busy) {
           // The running pass may have read S3 before this event's write: run again later.
-          if (!deps.requeue) throw new Error("scope busy and no requeue");
-          await deps.requeue(manifestKey, carriedTime(covered));
+          if (!requeue) throw new Error("scope busy and no requeue");
+          await requeue(manifestKey, carriedTime(covered));
           log.info("search index busy, requeued", { stage: "search-index", org_id: scope.orgId, session_id: scope.sessionId, reason: "scope_busy" });
           continue;
         }
         if (result.deferred) {
           // SEARCH_INDEX_STREAMING_CH=1 only: this invocation already streamed a scope; stream this one later.
-          if (!deps.requeue) throw new Error("stream deferred and no requeue");
-          await deps.requeue(manifestKey, carriedTime(covered));
+          if (!requeue) throw new Error("stream deferred and no requeue");
+          await requeue(manifestKey, carriedTime(covered));
           log.info("search index stream deferred, requeued", { stage: "search-index", org_id: scope.orgId, session_id: scope.sessionId, reason: "stream_deferred" });
           continue;
         }
@@ -337,6 +366,40 @@ export async function processBatch(records: readonly QueueRecord[], deps: Consum
         if (deps.retryVisibility) for (const id of messageIds) slowRetry.add(id);
       }
     }
+  };
+
+  const handoff = deps.searchHandoff;
+  if (deps.search && !handoff) await runSearch(deps.search, scopes, deps.requeue);
+  if (deps.search && handoff) {
+    // Pointer-queue scopes: hand the search pass to the search queue instead of running it here.
+    for (const { scope, messageIds, manifestKey, covered } of scopes.values()) {
+      if (messageIds.every((id) => failed.has(id))) continue;
+      try {
+        await handoff.send(manifestKey, carriedTime(covered));
+        log.info("search index handed off", { stage: "search-index", org_id: scope.orgId, session_id: scope.sessionId, reason: "search_handoff" });
+      } catch (error) {
+        log.error("search index handoff failed", { stage: "search-index", org_id: scope.orgId, session_id: scope.sessionId, reason: "search_handoff", ...errorFields(error) });
+        for (const id of messageIds) failed.add(id);
+        if (deps.retryVisibility) for (const id of messageIds) slowRetry.add(id);
+      }
+    }
+    // Search-queue records: the scope from the key alone (read-only, no pointer write), then the search stage.
+    const searchScopes: Scopes = new Map();
+    for (const { event, messageIds, covered } of searchByKey.values()) {
+      try {
+        const resolved = await resolveScope(event, deps.pointer);
+        if ("status" in resolved) {
+          log.info("object event ignored", { stage: "object-landed", reason: resolved.reason });
+          continue;
+        }
+        addScope(searchScopes, resolved.scope, messageIds, event.key, covered);
+      } catch (error) {
+        log.error("search index failed", { stage: "search-index", ...errorFields(error) });
+        for (const id of messageIds) failed.add(id);
+        if (deps.retryVisibility) for (const id of messageIds) slowRetry.add(id);
+      }
+    }
+    await runSearch(deps.search, searchScopes, handoff.requeue);
   }
   if (deps.retryVisibility && fastRetry.size > 0) {
     // A message with any other failure (invalid body, another key, the search stage) keeps the full timeout.
