@@ -193,7 +193,8 @@ export const REGEN_REASON_VALUES: ReadonlySet<string> = new Set([
 export const REGEN_SYSTEM_VALUES: ReadonlySet<string> = new Set(["bob_costas", "brief"]);
 const ENUM_FIELDS: ReadonlyMap<string, ReadonlySet<string>> = new Map([
   ["queue_origin", new Set(["s3", "requeue", "sweep"])],
-  ["contender_seats", new Set(["all_unseated", "seated_unseated", "both", "catalog_key"])],
+  // "unknown": a streamed pass's acceptance refusal, which main's streamed reader does not classify.
+  ["contender_seats", new Set(["all_unseated", "seated_unseated", "both", "catalog_key", "unknown"])],
   ["store_cause", STORE_CAUSE_VALUES], ["streaming", STREAMING_VALUES],
   ["db_refusal", DB_REFUSAL_VALUES], ["client_kind", CLIENT_KIND_VALUES], ["client_os", CLIENT_OS_VALUES],
   ["regeneration_reason", REGEN_REASON_VALUES], ["system", REGEN_SYSTEM_VALUES],

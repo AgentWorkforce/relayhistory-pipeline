@@ -264,6 +264,29 @@ describe("the scheduled {searchJobs:true} path carries the same guards; M2 settl
     expect(await letters()).toBe(0);
   }, 120_000);
 
+  test("real handler on migrated PGlite: the start minimum crossed after the claim settles busy in 062300 (attempt given back, receipt gone)", async () => {
+    const j = await jobsRig();
+    // The decision transaction of the first pass is slowed by 300 ms: the claim (checked with ~120.1 s left) happens,
+    // then the pass finds less than STREAM_MIN_START_MS before its deadline and defers.
+    const transact = j.rt.deps.search!.transact;
+    let slowed = false;
+    j.rt.deps.search = { ...j.rt.deps.search!, transact: async (work) => {
+      if (!slowed) { slowed = true; await new Promise((res) => setTimeout(res, 300)); }
+      return transact(work);
+    } };
+    const out = await j.run(THRESHOLD + 100);
+    expect(slowed).toBe(true);
+    expect(out.lines.filter((l) => l.message === "search job settled")).toEqual([expect.objectContaining({ outcome: "busy", reason: "stream_deferred", state: "busy", attempt: 1 })]);
+    const rows = (await j.r.db.pg.query<{ id: string; attempts: number; leased: boolean; dlq: boolean; delay: number }>(
+      "SELECT id::text, attempts, lease_id IS NOT NULL AS leased, dlq, extract(epoch FROM visible_at - now())::int AS delay FROM sessions.pipeline_jobs WHERE stage='search-index' ORDER BY id")).rows;
+    // The deferred job: attempts back to 0, no lease, no DLQ, held 30 s; the other was never claimed (the slot check).
+    expect(rows.map((r) => [r.attempts, r.leased, r.dlq])).toEqual([[0, false, false], [0, false, false]]);
+    expect(rows.some((r) => Math.abs(r.delay - 30) <= 5)).toBe(true);
+    expect((await j.r.db.pg.query("SELECT 1 FROM sessions.search_job_claims")).rows).toEqual([]);
+    expect((await j.r.db.pg.query<{ n: number }>("SELECT contention_count AS n FROM sessions.search_job_contention")).rows).toEqual([{ n: 1 }]);
+    expect(await j.letters()).toBe(0);
+  }, 120_000);
+
   test("a job claimed and then deferred (the start minimum crossed after the claim) settles busy: the attempt is given back", async () => {
     const { searchSettlementFor } = await import("../search-jobs.ts");
     expect(searchSettlementFor({ outcome: "busy", reasons: ["stream_deferred"] }, 3)).toBe("busy");
