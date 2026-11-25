@@ -57,11 +57,11 @@ The key is mounted as a file and never printed; the run's logs carry codes and c
 
 After the run, the owner of the disposable accounts (layered-infra-ops):
 
-1. Deletes every container the run created, on every account. This removes what the run left by design: the
-   neighbours, the objects a refused run on C or D did not touch, and any young probe copy.
-2. On B and C (soft delete on), waits out or permanently deletes the soft-deleted copies. Then lists each container
-   with `include=versions,deleted,snapshots` before it is deleted (or confirms the container is gone), so that nothing
-   recoverable remains.
+1. On B and C (soft delete on), permanently deletes or waits out the soft-deleted copies. Then, on every account,
+   lists each container the run created with `include=versions,deleted,snapshots` and removes what the run left by
+   design: the neighbours, the objects a refused run on C or D did not touch, and any young probe copy. The final
+   listing must show nothing recoverable.
+2. Deletes every container the run created.
 3. Deletes the disposable accounts, or returns them to the pool empty, and revokes the run's short-lived credentials
    (both account keys are regenerated, including the one rotated in step 4).
 4. Records that teardown is done next to the run's results: codes and counts only, no account name.
