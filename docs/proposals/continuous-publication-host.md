@@ -25,3 +25,9 @@ Host implementation timing depends on acceptance of the EKS target, credential o
 ## Local dormant image preview
 
 Build the services image locally with `docker build -f docker/services.Dockerfile -t session-publication-preview .`. From the repository root run `SESSION_PUBLICATION_PREVIEW_IMAGE=session-publication-preview docker compose -f deploy/publication-preview/compose.yaml up --wait`. The preview has no external network, credential bindings or published ports. Its in-container probe checks both endpoints report dormant. Remove it with the same environment assignment and Compose file followed by `down`.
+
+### EKS credential boundary
+
+`src/session-ingest/publication-pod-credentials.ts` implements the provider component for a future explicit EKS target. It requires the EKS agent address and its standard projected token mount, checks the opened inode on Linux, and verifies each new credential session with a signed regional STS GetCallerIdentity request against the expected role and account. Direct requests refuse redirects. Refreshes re-read the mounted token and require more than five minutes of remaining credential lifetime. The component runs only when its caller explicitly asks for credentials. The existing EC2 target continues to refuse pod indicators.
+
+Before adding an EKS target to the runtime selector, separate the runner identity account from the target storage/KMS account in the publisher config. Bind the reviewed database login to the intended project and generation and integrate the rotating provider at each AWS operation, including version-specific erasure (the current runtime passes the eraser one resolved credential set). Exercise these boundaries with a disposable runtime and approved target fixture. The credential component alone does not select a deployment, grant permission or prove hosted connectivity.
