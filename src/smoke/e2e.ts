@@ -95,6 +95,8 @@ export async function runSmoke(stage: string): Promise<boolean> {
     );
     const okStages = new Set(events.filter((e) => e.status === "ok").map((e) => e.stage));
     check("pipeline events recorded for object-landed, session-indexed, summaries and classify", ["object-landed", "session-indexed", "summary-short", "summary-long", "status-classify"].every((s) => okStages.has(s)), [...okStages].join(","));
+    // The committed search wake (default off): when its stage-specific pass ran for this trace, it never failed.
+    check("no search-index pass errored or dead-lettered", !events.some((e) => e.stage === "search-index" && (e.status === "error" || e.status === "dead_lettered")));
     const verdicts = await q<{ state: string; rule: string }>("SELECT state, rule FROM sessions.session_verdicts WHERE session_uuid = $1::uuid", [plantedUuid]);
     check("referee wrote a verdict for the planted session", verdicts.length > 0, verdicts[0] ? `${verdicts[0].state}/${verdicts[0].rule}` : undefined);
     const dlq = await q<{ c: string }>("SELECT count(*)::text AS c FROM sessions.pipeline_dead_letters WHERE org_id = $1", [TENANT.orgId]);

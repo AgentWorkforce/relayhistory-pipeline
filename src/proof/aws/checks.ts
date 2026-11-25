@@ -559,7 +559,7 @@ interface DbState {
   index: Set<string>;
   directoryPresent: boolean;
   searchRpcPresent: boolean;
-  times: Map<string, { objectLanded?: number; indexed?: number; summary?: number }>;
+  times: Map<string, { objectLanded?: number; indexed?: number; summary?: number; searchIndexed?: number }>;
   directory: Map<string, { short_summary: string | null; generated_at_ms: number | null; deleted: boolean; org_id: string }>;
 }
 
@@ -569,7 +569,7 @@ function readDb(ctx: Ctx, pod: string, sessions: readonly PlantedSession[], labe
   const times = sql<Array<{ trace_id: string; stage: string; at_ms: number }>>(ctx, `hoopdb.stage-times.${label}`, pod, stageTimesSql(sessions.map((p) => p.traceId)));
   if (!state || !times) return undefined;
   const byTrace = new Map(sessions.map((p) => [p.traceId, p.sessionId]));
-  const t = new Map<string, { objectLanded?: number; indexed?: number; summary?: number }>();
+  const t = new Map<string, { objectLanded?: number; indexed?: number; summary?: number; searchIndexed?: number }>();
   for (const row of times) {
     const sid = byTrace.get(row.trace_id);
     if (!sid) continue;
@@ -577,6 +577,8 @@ function readDb(ctx: Ctx, pod: string, sessions: readonly PlantedSession[], labe
     if (row.stage === "object-landed") e.objectLanded = Number(row.at_ms);
     if (row.stage === "session-indexed") e.indexed = Number(row.at_ms);
     if (row.stage === "summary-short") e.summary = Number(row.at_ms);
+    // The committed search wake's pass (default off): recorded when the stage-specific consumer runs.
+    if (row.stage === "search-index") e.searchIndexed = Number(row.at_ms);
     t.set(sid, e);
   }
   const directory = new Map<string, { short_summary: string | null; generated_at_ms: number | null; deleted: boolean; org_id: string }>();

@@ -17,6 +17,7 @@ import type {
   StageQueueDeps,
 } from "./dlq.js";
 import { cloudflarePipelineQueue, type PipelineQueue } from "./queue.js";
+import { PipelineError } from "./errors.js";
 import { QUEUED_STAGES, STAGE_REGISTRY, type QueuedStage } from "./registry.js";
 import { postgrestDeadLetterStore } from "./postgrest-dead-letters.js";
 import {
@@ -183,7 +184,23 @@ export function pipelineQueueDeps(
       ...(impl.transform && transformEnabled
         ? { "file-normalize": fileNormalizeHandler(impl.transform) }
         : {}),
+      "search-index": searchIndexElsewhere,
       ...impl.handlers,
     },
   };
 }
+
+/**
+ * `search-index` has exactly one consumer: the session-pipeline Lambda's stage-specific search-job loop
+ * (src/session-pipeline/search-jobs.ts: one row per scope, claimed-epoch-aware settlement). A generic consumer
+ * must never run or settle it (a plain delete on done would lose a newer wake). If one is ever delivered here,
+ * it is refused without retries, so the generic path parks it in the scope's own letter
+ * (`deadLetterId('search-index', ctx, workKey)`), from where the stage-aware replay picks it up.
+ */
+const searchIndexElsewhere: StageHandler = async () => {
+  throw new PipelineError(
+    "search_index_stage_specific",
+    "search-index is consumed only by the session pipeline's stage-specific search-job loop",
+    false,
+  );
+};

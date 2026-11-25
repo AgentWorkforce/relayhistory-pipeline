@@ -107,7 +107,9 @@ export const STAGE_REGISTRY: { readonly [S in QueuedStage]: StageDefinition } =
     "search-index": {
       stage: "search-index",
       summary: "Index the current committed directory epoch",
-      implemented: false,
+      // The hosted consumer is the session-pipeline Lambda's stage-specific search-job loop
+      // (src/session-pipeline/search-jobs.ts); the generic consumers never settle this stage.
+      implemented: true,
       binding: "PIPELINE_SEARCH_INDEX",
       next: [],
       maxAttempts: 12,

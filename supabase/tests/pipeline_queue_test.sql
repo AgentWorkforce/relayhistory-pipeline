@@ -6,7 +6,8 @@ BEGIN
   INSERT INTO sessions.pipeline_events (trace_id, stage, status)
   SELECT gen_random_uuid(), s, 'ok'
     FROM unnest(ARRAY['ingest', 'deliver.put', 'object-landed', 'session-indexed', 'summary-short',
-                      'summary-long', 'status-classify', 'file-normalize', 'file-maintenance', 'fetch']) AS s;
+                      'summary-long', 'status-classify', 'file-normalize', 'file-maintenance', 'search-index',
+                      'fetch']) AS s;
   BEGIN
     INSERT INTO sessions.pipeline_events (trace_id, stage, status)
       VALUES (gen_random_uuid(), 'storage.event', 'ok');

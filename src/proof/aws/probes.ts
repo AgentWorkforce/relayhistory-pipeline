@@ -54,7 +54,7 @@ export function stageTimesSql(traceIds: readonly string[]): string {
   SELECT trace_id::text AS trace_id, stage, (extract(epoch FROM min(at)) * 1000)::bigint AS at_ms
     FROM sessions.pipeline_events
    WHERE trace_id = ANY(${sqlList(traceIds, "uuid")}) AND status = 'ok'
-     AND stage IN ('object-landed', 'session-indexed', 'summary-short')
+     AND stage IN ('object-landed', 'session-indexed', 'summary-short', 'search-index')
    GROUP BY 1, 2) r;`;
 }
 

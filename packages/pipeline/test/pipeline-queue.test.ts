@@ -119,7 +119,7 @@ describe("stage registry", () => {
     ]);
     expect(
       QUEUED_STAGES.filter((stage) => STAGE_REGISTRY[stage].implemented),
-    ).toEqual(["object-landed", "session-indexed", "backfill-activation"]);
+    ).toEqual(["object-landed", "session-indexed", "backfill-activation", "search-index"]);
     const bindings = new Set<string>();
     for (const stage of QUEUED_STAGES) {
       const definition = STAGE_REGISTRY[stage];
