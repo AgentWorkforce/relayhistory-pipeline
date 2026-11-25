@@ -287,14 +287,31 @@ meaning a pass that carries the invocation's `streamSlot`. The self-host consume
     before every chunk.
   - A stop between chunks keeps the deletes already done and leaves the scope owing a pass
     (`scope_too_large, stream_deadline`, `needs_full = 1`).
-- **Lock-checking keepalive.** The keepalive re-takes the scope lock the transaction already holds, which
-  is re-entrant. Any answer but `ok = true` throws `stream_keepalive_failed`, which is retryable. After
+  - After the last delete statement and before the directory and catalog writes, the reserve is checked,
+    then the lock, then the reserve again. The lock check can itself take time, so the second reserve check
+    closes that gap.
+  - A single key whose literal could exceed the statement's byte budget is refused, by the same upper-bound
+    estimate. Nothing is deleted and the pass is owed (`stream_delete_key_too_large`).
+- **Lock-checking keepalive.** The keepalive checks lock continuity, not re-acquisition. The scope's
+  transaction advisory lock must already be granted to this backend (`pg_locks`: `locktype = 'advisory'`,
+  `granted`, `pid = pg_backend_pid()`, the key in `classid`/`objid` with `objsubid = 1`;
+  `STREAM_LOCK_HELD_SQL`). A try-lock could take a lock that had become free, which would prove nothing.
+  Any answer but `ok = true` throws `stream_keepalive_failed`, which is retryable. After
   that no row is inserted or deleted, no directory or catalog write happens and no final state row is
   written. The message fails and is redelivered.
-- **`needs_full = 1` before reading.** The pass records `needs_full = 1` one millisecond before its own
-  state time, before anything is read. A pass interrupted on the way, even one whose best-effort final
-  state write is lost, therefore leaves the scope owing a full pass. A previously failed or partial state
-  is never overwritten as complete. The next pass reads in full.
+- **`needs_full = 1` before any read, cleared only after COMMIT.** A hosted pass records `needs_full = 1`
+  at the highest live sibling revision, one millisecond before its own state time. It does this before
+  any source read, including manifest admission (`readCanonicalScope`).
+  - **Completing rows wait for COMMIT.** The rows that clear the marker (needs_full = 0) are written only
+    after the Postgres transaction commits (`deferCompleteRecord`).
+  - **On rollback.** A rollback, or a COMMIT error with an unknown outcome, never writes them, so the
+    marker stands.
+  - **Fenced against newer passes.** After COMMIT a completing row is written only if the scope's latest
+    state row is not newer than this pass's own marker. A newer pass may have marked the scope in the
+    meantime (an overlapping redelivery); it then owns the outcome, and the line "search index completion
+    not recorded" is logged with `completion_superseded`. If the fence read fails, nothing is written.
+  - **Result.** An interrupted pass leaves the scope owing a full pass, and a failed or partial state is
+    never overwritten as complete. The next pass reads in full.
 - **Strict keyset pages.** Every keyset page of the ClickHouse scan must meet three conditions before
   anything is projected or written:
   - it holds at most the rows asked for;
@@ -302,7 +319,9 @@ meaning a pass that carries the invocation's `streamSlot`. The self-host consume
     compared as UTF-8 bytes;
   - it comes after the previous page's last key.
 
-  Otherwise the pass stops with `clickhouse_page_invalid`. Nothing is written and the scope is owed a pass.
+  Otherwise the pass stops with `clickhouse_page_invalid`. No projection row is inserted or deleted.
+  Intentionally, the pass still writes the owed marker (`needs_full = 1`) and invalidates the directory
+  (`event_projection_ready = false`), so the next pass is a full one.
   This check applies to every user of `legacyProjectionIo.scanPages`.
 
 ### M2: no claim a deferral would waste
@@ -341,11 +360,19 @@ The backport commits are ecb5d981 and 9279264f.
   stripped before any stage sees the event.
 - **`contender_seats`.** This is one of `all_unseated`, `seated_unseated`, `both` or `catalog_key`. It is set
   on a whole-read pass refused with `relayhistory_acceptance_missing`.
-  - **Gap.** Main's streamed reader (`canonical-stream-projection.ts`) does not classify its acceptance
-    refusals, so a streamed pass carries no `contender_seats`.
+  - **Gap, made explicit.** Main's streamed reader (`canonical-stream-projection.ts`) does not classify its
+    acceptance refusals. A streamed pass refused for acceptance therefore carries `contender_seats: "unknown"`
+    rather than omitting the field.
 - **Log rules.** The allowlist keeps the ages only as non-negative integers and the words only as their
   closed sets.
-- **Goldens.** The off-goldens drop these additive keys, as the backport's golden capture did.
+- **Goldens.** The off-goldens strip exactly these keys, as the backport's golden capture did:
+  - log lines: `event_age_ms`, `s3_event_age_ms`, `queue_origin` and `contender_seats`;
+  - results: `contenderSeats`.
+
+  `ts`, `duration_ms` and the search phase timers were already stripped at 9d1adf84.
+  `search-index-forward-port-off-golden` asserts, with flags off, that these keys are the only difference
+  from the 9d1adf84 golden. In its scenarios only `queue_origin` and `contender_seats` appear: reconcile
+  bodies carry no event or send times, so the two age fields are absent there.
 
 ## Acceptance-stamp cold start (salt acceptance-skip-v2)
 
