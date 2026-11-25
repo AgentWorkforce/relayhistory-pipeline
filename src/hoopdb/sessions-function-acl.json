@@ -1217,6 +1217,9 @@
       "service_role:EXECUTE",
       "search_consumer_runtime:EXECUTE"
     ],
+    "sessions.managed_search_wake_v1(jsonb,uuid)": [
+      "<owner>:EXECUTE"
+    ],
     "sessions.member_of(text,text[])": [
       "<owner>:EXECUTE",
       "service_role:EXECUTE",

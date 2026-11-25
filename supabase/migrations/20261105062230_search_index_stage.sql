@@ -153,6 +153,73 @@ REVOKE ALL ON FUNCTION sessions.enqueue_managed_search_wake_v1(jsonb, uuid) FROM
 -- The queue/schema owner grants EXECUTE to the independently qualified indexer login (and, for the Lambda writer,
 -- its runtime role) in a separate, approved owner step. This migration grants it to no one.
 
+-- §2 [rev 7] (R5g): the writer's entry point. Inside the authority transaction it re-checks the trigger's own
+-- authority, then proves the publish clock exactly as enqueue_managed_search_wake_v1 does (the head's own published
+-- attempt, and a published_at on every live sibling of its canonical scope). Provable: the enqueue runs (and raises,
+-- rolling the authority back, on anything else, as before). Unprovable: FAIL CLOSED FOR SEARCH ONLY: no job, never
+-- a pointer clock, and one durable refusal row (pipeline_events search-index / skipped / clock_unprovable,
+-- idempotency key trace:search-index:skipped:1:<manifest key>) committed with the pointer, so the session stays
+-- readable. SECURITY DEFINER: the publication tables it reads are not the writer's. Returns 'enqueued' or
+-- 'clock_unprovable'. No grant here: the owner grants the qualified writer login with the enqueue.
+CREATE FUNCTION sessions.managed_search_wake_v1(evidence jsonb, trace uuid) RETURNS text
+LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, pg_temp AS $wake$
+DECLARE
+ authority jsonb; h sessions.ingest_publication_heads; canonical_id text; own_clocked bigint; siblings bigint; clocked bigint;
+BEGIN
+ IF trace IS NULL OR trace = '00000000-0000-0000-0000-000000000000'::uuid
+    OR coalesce(evidence->>'orgId', '') = '' OR coalesce(evidence->>'workspaceId', '') = '' THEN
+   RAISE EXCEPTION USING ERRCODE = '22023', MESSAGE = 'search wake: invalid trace or tenant context';
+ END IF;
+ authority := sessions.session_publication_lock(evidence);
+ IF authority->'managed' IS DISTINCT FROM 'true'::jsonb OR authority->'current' IS DISTINCT FROM 'true'::jsonb THEN
+   RAISE EXCEPTION 'search wake: publication no longer current';
+ END IF;
+ SELECT * INTO h FROM sessions.ingest_publication_heads
+  WHERE generation = (authority->>'generation')::uuid AND current_key = evidence->>'manifestKey' AND state = 'live';
+ IF FOUND AND NOT (h.source = '_none' AND h.session_id = '_origin') THEN
+   SELECT coalesce(p.canonical_session_id, p.session_id) INTO canonical_id
+     FROM sessions.session_index p
+    WHERE (p.org_id, p.workspace_id, p.harness, p.session_id, p.machine_id) = (h.org_id, h.workspace_id, h.physical_source, h.physical_session, h.machine_id)
+      AND p.manifest_key = h.current_key AND p.revision = h.pointer_revision AND p.deleted_at IS NULL;
+   IF canonical_id IS NOT NULL THEN
+     SELECT count(*) INTO own_clocked
+       FROM sessions.ingest_publication_images i
+       JOIN sessions.ingest_publication_attempts a ON a.attempt_token = i.attempt_token
+       JOIN sessions.ingest_stage_intents s ON s.stage_token = a.stage_token
+      WHERE i.manifest_key = h.current_key AND i.generation = h.generation AND i.pointer_revision = h.pointer_revision
+        AND i.raw_sha256 = h.current_raw_sha256 AND a.schema_generation = evidence->>'schemaGeneration'
+        AND (a.org_id, a.workspace_id, a.user_id, a.origin_id) = (h.org_id, h.workspace_id, h.user_id, h.origin_id)
+        AND (s.org_id, s.workspace_id, s.user_id, s.origin_id, s.batch_id, s.digest) = (a.org_id, a.workspace_id, a.user_id, a.origin_id, a.batch_id, a.digest)
+        AND a.state = 'published' AND a.published_at IS NOT NULL;
+     SELECT count(*), count(a.published_at) INTO siblings, clocked
+       FROM sessions.ingest_publication_heads sibling
+       JOIN sessions.session_index p ON
+         (p.org_id, p.workspace_id, p.harness, p.session_id, p.machine_id, p.manifest_key, p.revision) =
+         (sibling.org_id, sibling.workspace_id, sibling.physical_source, sibling.physical_session, sibling.machine_id, sibling.current_key, sibling.pointer_revision)
+       LEFT JOIN sessions.ingest_publication_images i ON
+         (i.manifest_key, i.generation, i.pointer_revision, i.raw_sha256) =
+         (sibling.current_key, sibling.generation, sibling.pointer_revision, sibling.current_raw_sha256)
+       LEFT JOIN sessions.ingest_publication_attempts a ON a.attempt_token = i.attempt_token AND a.state = 'published'
+         AND (a.org_id, a.workspace_id, a.user_id) = (sibling.org_id, sibling.workspace_id, sibling.user_id)
+      WHERE sibling.state = 'live' AND p.deleted_at IS NULL AND p.scrubbed IS TRUE AND NOT p.scrub_quarantined
+        AND (p.org_id, p.workspace_id, p.harness, coalesce(p.canonical_session_id, p.session_id)) =
+            (h.org_id, h.workspace_id, h.physical_source, canonical_id);
+     IF own_clocked = 0 OR siblings = 0 OR clocked < siblings THEN
+       INSERT INTO sessions.pipeline_events (trace_id, stage, status, error, attrs, attempt, idempotency_key, org_id, workspace_id, harness, session_id)
+       VALUES (trace, 'search-index', 'skipped',
+               jsonb_build_object('code', 'clock_unprovable', 'name', 'SearchWakeRefused', 'retryable', false),
+               jsonb_build_object('manifest_key_sha256', encode(sha256(convert_to(h.current_key, 'UTF8')), 'hex')),
+               1, concat_ws(':', trace::text, 'search-index', 'skipped', '1', h.current_key),
+               h.org_id, h.workspace_id, h.physical_source, canonical_id);
+       RETURN 'clock_unprovable';
+     END IF;
+   END IF;
+ END IF;
+ PERFORM sessions.enqueue_managed_search_wake_v1(evidence, trace);
+ RETURN 'enqueued';
+END $wake$;
+REVOKE ALL ON FUNCTION sessions.managed_search_wake_v1(jsonb, uuid) FROM PUBLIC;
+
 CREATE TRIGGER guard_search_wake_delete BEFORE DELETE ON sessions.pipeline_jobs FOR EACH ROW
  WHEN (OLD.stage = 'search-index') EXECUTE FUNCTION sessions.guard_managed_search_wake_v1();
 CREATE TRIGGER guard_search_wake_truncate BEFORE TRUNCATE ON sessions.pipeline_jobs FOR EACH STATEMENT

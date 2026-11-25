@@ -21,7 +21,7 @@ DO $rollback_guard$ DECLARE v_sha text; BEGIN
  IF EXISTS(SELECT 1 FROM sessions.__96bulls_migrations WHERE name LIKE 'upstream:%' AND name COLLATE "C">'upstream:20261105062230_search_index_stage.sql')
  THEN RAISE EXCEPTION USING ERRCODE='55000',MESSAGE='search index stage: a later migration is applied; roll it back first';END IF;
  SELECT sha256 INTO v_sha FROM sessions.__96bulls_migrations WHERE name='upstream:20261105062230_search_index_stage.sql' FOR UPDATE;
- IF NOT FOUND OR v_sha<>'ffb00e6d54c3b8500f1bceecb9553debb610425937ce30f21912186304f3eb84'
+ IF NOT FOUND OR v_sha<>'869fba38c24ff7db15d6f6b89b25cca166117ddc770697e008664e1d746162e2'
  THEN RAISE EXCEPTION USING ERRCODE='55000',MESSAGE='search index stage: own applied checksum required';END IF;
  -- §8: the additive migration stays until the stage is fully empty, in all three tables.
  LOCK TABLE sessions.pipeline_jobs, sessions.pipeline_events, sessions.pipeline_dead_letters IN ACCESS EXCLUSIVE MODE;
@@ -38,6 +38,7 @@ DROP TRIGGER guard_search_wake_insert ON sessions.pipeline_jobs;
 DROP TRIGGER guard_search_wake_update ON sessions.pipeline_jobs;
 DROP FUNCTION sessions.guard_managed_search_truncate_v1();
 DROP FUNCTION sessions.guard_managed_search_wake_v1();
+DROP FUNCTION sessions.managed_search_wake_v1(jsonb,uuid);
 DROP FUNCTION sessions.enqueue_managed_search_wake_v1(jsonb,uuid);
 DROP FUNCTION sessions.archive_search_stage_v1();
 DROP INDEX sessions.pipeline_jobs_search_index_scope;

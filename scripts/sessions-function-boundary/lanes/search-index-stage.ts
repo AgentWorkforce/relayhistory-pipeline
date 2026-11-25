@@ -5,6 +5,8 @@
  *   guard_managed_search_truncate_v1    queue truncate guard trigger function; no grant
  *   enqueue_managed_search_wake_v1      SECURITY DEFINER; the managed wake (§2). No grant here: the owner grants the
  *                                       qualified writer login in a separate, approved step
+ *   managed_search_wake_v1              SECURITY DEFINER; the writer's entry: proves the publish clock, then enqueues or
+ *                                       records the clock_unprovable refusal (§2 [rev 7]). No grant here (as above)
  *   search_stage_archive_seal_v1        the archive's append-only seal trigger function; no grant
  *   archive_search_stage_v1             SECURITY DEFINER; the only archive write path (§8); EXECUTE to service_role,
  *                                       so it is also a runtime application function
@@ -23,6 +25,7 @@ export const searchIndexStage: LaneManifest = {
     "sessions.guard_managed_search_wake_v1(",
     "sessions.guard_managed_search_truncate_v1(",
     "sessions.enqueue_managed_search_wake_v1(",
+    "sessions.managed_search_wake_v1(",
     "sessions.search_stage_archive_seal_v1(",
     "sessions.archive_search_stage_v1(",
   ],
@@ -31,6 +34,7 @@ export const searchIndexStage: LaneManifest = {
     "sessions.guard_managed_search_wake_v1()": { secdef: false, grants: [] },
     "sessions.guard_managed_search_truncate_v1()": { secdef: false, grants: [] },
     "sessions.enqueue_managed_search_wake_v1(jsonb,uuid)": { secdef: true, grants: [] },
+    "sessions.managed_search_wake_v1(jsonb,uuid)": { secdef: true, grants: [] },
     "sessions.search_stage_archive_seal_v1()": { secdef: false, grants: [] },
     "sessions.archive_search_stage_v1()": { secdef: true, grants: ["service_role"] },
   },
