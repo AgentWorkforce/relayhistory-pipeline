@@ -84,20 +84,27 @@ function eraseRunSettings(env: NodeJS.ProcessEnv): Pick<SessionEraseConfig, "key
   return { keyRoot, dryRun: dry === "1", concurrency };
 }
 
+/**
+ * LOCKER_PROVIDER=azure's erase config, bound to the writer's key root (the standalone Jobs pass INGEST_KEY_ROOT; the
+ * in-service runtime passes the root its ingest service runs with). Every prefix is derived from that root, and a
+ * different root on the same container would leave the real bytes untouched while empty prefixes verify, so
+ * SESSION_ERASE_KEY_ROOT, when set, must equal it.
+ */
+export function azureEraseConfig(env: NodeJS.ProcessEnv, writerRoot: string): SessionEraseConfig {
+  const azure = azureEraseSettings(env, refuse);
+  const run = eraseRunSettings(env);
+  if (writerRoot !== writerRoot.trim() || !/^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$/.test(writerRoot)) refuse("azure_writer_key_root_invalid");
+  const own = env.SESSION_ERASE_KEY_ROOT;
+  if (own !== undefined && own !== "" && own.trim() !== writerRoot) refuse("azure_key_root_not_writer");
+  return { bucket: azure.container, region: "", ...run, keyRoot: writerRoot, azure };
+}
+
 export function sessionEraseConfig(env: NodeJS.ProcessEnv): SessionEraseConfig {
   if (eraseOnAzure(env)) {
-    const azure = azureEraseSettings(env, refuse);
-    const run = eraseRunSettings(env);
-    // The writer's key root, exactly (as the in-service runtime binds it): every prefix is derived from it, and a
-    // different root on the same container would leave the real bytes untouched while empty prefixes verify. The Job
-    // carries the writer's pinned INGEST_KEY_ROOT explicitly (never assumed to be the default); SESSION_ERASE_KEY_ROOT,
-    // when set, must equal it.
+    // The standalone Job carries the writer's pinned INGEST_KEY_ROOT explicitly (never assumed to be the default).
     const writerRoot = env.INGEST_KEY_ROOT;
     if (writerRoot === undefined || writerRoot === "") refuse("azure_writer_key_root_missing");
-    if (writerRoot !== writerRoot!.trim() || !/^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$/.test(writerRoot!)) refuse("azure_writer_key_root_invalid");
-    const own = env.SESSION_ERASE_KEY_ROOT;
-    if (own !== undefined && own !== "" && own.trim() !== writerRoot) refuse("azure_key_root_not_writer");
-    return { bucket: azure.container, region: "", ...run, keyRoot: writerRoot!, azure };
+    return azureEraseConfig(env, writerRoot!);
   }
   const bucket = env.SESSION_ERASE_S3_BUCKET ?? "", region = env.SESSION_ERASE_S3_REGION ?? "";
   if (!/^[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]$/.test(bucket) || !/^[a-z0-9-]{1,63}$/.test(region)) refuse("config_invalid");

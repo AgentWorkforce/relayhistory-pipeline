@@ -57,6 +57,12 @@ function normalizedEndpoint(raw: string | undefined, account: string): string | 
   return path === "" || path === `/${account}` ? `${url.origin}${path}` : INVALID;
 }
 
+/** The writer's LOCKER_ENDPOINT normalized (null when unset), or undefined when it breaks the writer's rule. */
+export function writerAzureEndpoint(raw: string | undefined, account: string): string | null | undefined {
+  const e = normalizedEndpoint(raw, account);
+  return e === INVALID ? undefined : e;
+}
+
 /** The settings only (no secret): conflicts, the shared parser, and the exact writer-store match. */
 export function azureEraseSettings(env: NodeJS.ProcessEnv, fail: SettingsFail): AzureBlobSettings {
   if (S3_ERASE_VARS.some((name) => env[name] !== undefined && env[name] !== "")) fail("azure_s3_settings_conflict");

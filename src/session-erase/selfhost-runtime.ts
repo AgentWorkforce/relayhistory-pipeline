@@ -3,7 +3,9 @@ import { createHash } from "node:crypto";
 import pg from "pg";
 import { createPostgresSearchIndex } from "../../packages/pipeline/src/search-index/postgres.ts";
 import { createOpenSearchSearchIndex, DEFAULT_OPENSEARCH_INDEX_PREFIX } from "../../packages/pipeline/src/search-index/opensearch.ts";
-import { createS3Eraser } from "../migration/neon-s3-erasure/eraser.ts";
+import { createS3Eraser, type PagedEraser } from "../migration/neon-s3-erasure/eraser.ts";
+import { createAzureBlobEraser } from "../migration/azure-blob-erasure/eraser.ts";
+import { azureErasePreflight, azureEraseTarget, createAzureEraseEraser, eraseOnAzure, writerAzureEndpoint } from "./azure-target.ts";
 import { postgresConnectionString, postgresTlsOptions } from "../shared/postgres-tls.ts";
 import { assertDestinationUrl, destinationPolicy } from "../shared/destination-url.ts";
 import type { SqlRun } from "../session-ingest/ledger-sql.ts";
@@ -11,7 +13,7 @@ import type { SessionEraseConfig } from "../session-ingest/session-erase.ts";
 import { INBOX_NAMESPACE } from "../session-ingest/async-admission.ts";
 import { INBOX_UPLOAD_NAMESPACE } from "../session-ingest/upload-inbox-contract.ts";
 import { eraseDiscoveredSessionBytes } from "./selfhost-eraser.ts";
-import { sessionEraseConfig as bytesConfig, sessionEraseCredentials } from "./selfhost-eraser-main.ts";
+import { azureEraseConfig, sessionEraseConfig as bytesConfig, sessionEraseCredentials } from "./selfhost-eraser-main.ts";
 import { sessionEraseWorker, sqlDecisionRecordsErase, sqlEraseLedger, sqlSessionWriteGuard, type EraseDecisionRecordsPort, type EraseSearchPort, type EraseStoreIdentity, type EraseWork } from "./runtime.ts";
 import { SessionEraseServiceError } from "./receipt.ts";
 
@@ -21,10 +23,34 @@ function writerEndpoint(env: NodeJS.ProcessEnv): string | null {
   catch { throw Error("96bulls: operator erase object-store endpoint invalid"); }
 }
 export function eraseStoreIdentity(env: NodeJS.ProcessEnv, keyRoot: string): EraseStoreIdentity {
-  if (env.LOCKER_PROVIDER && env.LOCKER_PROVIDER !== "s3") throw Error("96bulls: operator erase requires versioned S3");
+  if (eraseOnAzure(env)) return azureStoreIdentity(env, keyRoot);
+  if (env.LOCKER_PROVIDER && env.LOCKER_PROVIDER !== "s3") throw Error("96bulls: operator erase requires versioned S3 or Azure Blob");
   const bucket = env.LOCKER_BUCKET;
   if (!bucket) throw Error("96bulls: LOCKER_BUCKET required for operator erase");
   const endpoint = writerEndpoint(env);
+  const searchIdentity = eraseSearchIdentity(env);
+  // Credentials may rotate. Resource identity must not change behind an outstanding receipt.
+  const storeRef = createHash("sha256").update(JSON.stringify(["s3", bucket, env.LOCKER_REGION || "us-east-1", endpoint, keyRoot, searchIdentity])).digest("hex");
+  return { bucket, keyRoot, storeRef };
+}
+
+/**
+ * LOCKER_PROVIDER=azure: the writer's Azure store (LOCKER_AZURE_ACCOUNT, LOCKER_BUCKET as the container, LOCKER_ENDPOINT
+ * normalized; the Locker key is never read). storeRef hashes ["azure", account, container, endpoint, keyRoot, search],
+ * so two endpoints of the same account and container (Azurite path-style versus the default host) are two identities,
+ * on purpose: a receipt never moves to another endpoint. The S3 identity above is unchanged.
+ */
+function azureStoreIdentity(env: NodeJS.ProcessEnv, keyRoot: string): EraseStoreIdentity {
+  const account = env.LOCKER_AZURE_ACCOUNT?.trim() ?? "";
+  const bucket = env.LOCKER_BUCKET ?? "";
+  if (!/^[a-z0-9]{3,24}$/.test(account) || !bucket) throw Error("96bulls: LOCKER_AZURE_ACCOUNT and LOCKER_BUCKET required for operator erase");
+  const endpoint = writerAzureEndpoint(env.LOCKER_ENDPOINT, account);
+  if (endpoint === undefined) throw Error("96bulls: operator erase object-store endpoint invalid");
+  const storeRef = createHash("sha256").update(JSON.stringify(["azure", account, bucket, endpoint, keyRoot, eraseSearchIdentity(env)])).digest("hex");
+  return { bucket, keyRoot, storeRef };
+}
+
+function eraseSearchIdentity(env: NodeJS.ProcessEnv): unknown {
   const backend = env.SEARCH_INDEX_BACKEND || "postgres";
   let searchIdentity: unknown;
   if (backend === "postgres") searchIdentity = [backend, env.SEARCH_INDEX_POSTGRES_SCHEMA || "search_index"];
@@ -34,9 +60,7 @@ export function eraseStoreIdentity(env: NodeJS.ProcessEnv, keyRoot: string): Era
       env.SEARCH_INDEX_OPENSEARCH_INDEX_PREFIX ?? DEFAULT_OPENSEARCH_INDEX_PREFIX]; }
     catch { throw Error("96bulls: operator erase search endpoint invalid"); }
   } else throw Error("96bulls: operator erase search backend unsupported");
-  // Credentials may rotate. Resource identity must not change behind an outstanding receipt.
-  const storeRef = createHash("sha256").update(JSON.stringify(["s3", bucket, env.LOCKER_REGION || "us-east-1", endpoint, keyRoot, searchIdentity])).digest("hex");
-  return { bucket, keyRoot, storeRef };
+  return searchIdentity;
 }
 
 const SEARCH_ROLE = "bulls96_session_erase_search";
@@ -179,16 +203,32 @@ export async function buildSelfhostEraseRuntime(input: {
   if (!input.bytesEnabled) return { service: ledger, withSessionWrites: guard, start() {}, close: async () => {} };
   // Holding the consumer's search lock needs one connection while lease/purge RPCs use another.
   if ((input.metadata.max ?? 4) < 2) throw Error("96bulls: operator erase requires an ingest pool of at least two connections");
-  const config = bytesConfig(env);
-  if (config.dryRun || config.bucket !== identity.bucket || config.keyRoot !== identity.keyRoot || config.region !== (env.LOCKER_REGION || "us-east-1")
-    || (config.endpoint ?? null) !== writerEndpoint(env)) throw Error("96bulls: operator eraser must target the writer store, without dry run");
-  const eraser = createS3Eraser({ bucket: config.bucket, region: config.region, endpoint: config.endpoint, credentials: sessionEraseCredentials(env),
-    fetch: (url, init) => fetch(url, { ...init, signal: init?.signal ? AbortSignal.any([init.signal, AbortSignal.timeout(10_000)]) : AbortSignal.timeout(10_000) }) });
+  const timed: typeof fetch = ((url: Parameters<typeof fetch>[0], init?: RequestInit) =>
+    fetch(url, { ...init, signal: init?.signal ? AbortSignal.any([init.signal, AbortSignal.timeout(10_000)]) : AbortSignal.timeout(10_000) })) as typeof fetch;
+  let config: ReturnType<typeof bytesConfig>;
+  let eraser: PagedEraser;
+  if (eraseOnAzure(env)) {
+    // The writer's own root (this ingest service's), the writer's store exactly, then the data-plane preflight,
+    // before the worker starts. A refusal is a startup error naming the code, never a value.
+    const startupFail = (code: string): never => { throw Error(`96bulls: operator erase refused: ${code}`); };
+    try { config = azureEraseConfig(env, input.keyRoot); } catch (e) { return startupFail((e as { code?: string }).code ?? "config_invalid"); }
+    if (config.dryRun || config.bucket !== identity.bucket || config.keyRoot !== identity.keyRoot)
+      throw Error("96bulls: operator eraser must target the writer store, without dry run");
+    const target = azureEraseTarget(env, startupFail);
+    await azureErasePreflight(target, config.keyRoot, startupFail);
+    eraser = createAzureEraseEraser(target, (c) => createAzureBlobEraser({ ...c, fetch: timed }));
+  } else {
+    config = bytesConfig(env);
+    if (config.dryRun || config.bucket !== identity.bucket || config.keyRoot !== identity.keyRoot || config.region !== (env.LOCKER_REGION || "us-east-1")
+      || (config.endpoint ?? null) !== writerEndpoint(env)) throw Error("96bulls: operator eraser must target the writer store, without dry run");
+    eraser = createS3Eraser({ bucket: config.bucket, region: config.region, endpoint: config.endpoint, credentials: sessionEraseCredentials(env), fetch: timed });
+  }
+  const provider = config.azure ? { provider: "azure" as const } : {};
   const search = await searchPort(env, input.metadata);
   const worker = sessionEraseWorker({ ledger, identity, search: search.port, log: input.log, ...(decisionRecords ? { decisionRecords } : {}),
     bytes: {
       erase: (key, authorize) => eraseDiscoveredSessionBytes(eraser, key, { keyRoot: config.keyRoot, bucket: config.bucket, concurrency: config.concurrency,
-        authorize, log: input.log }),
+        authorize, log: input.log, ...provider }),
       stagesAbsent: (key, authorize) => stagedObjectsAbsent(eraser, config.keyRoot, key, authorize),
     },
     async searchLock(work, action) {
