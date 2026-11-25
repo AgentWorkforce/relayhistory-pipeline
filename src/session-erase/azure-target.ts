@@ -36,16 +36,25 @@ const S3_ERASE_VARS = ["SESSION_ERASE_S3_BUCKET", "SESSION_ERASE_S3_REGION", "SE
   "SESSION_ERASE_S3_ACCESS_KEY_ID", "SESSION_ERASE_S3_SECRET_ACCESS_KEY",
   "SESSION_ERASE_S3_ACCESS_KEY_ID_FILE", "SESSION_ERASE_S3_SECRET_ACCESS_KEY_FILE"] as const;
 
-/** The Locker writer's endpoint as the shared parser normalizes one (origin plus an optional /<account>). */
-function normalizedEndpoint(raw: string | undefined, account: string): string | null {
-  if (raw === undefined || raw.trim() === "") return null;
-  try {
-    const url = new URL(raw.trim());
-    const path = url.pathname.replace(/\/+$/, "");
-    return path === "" || path === `/${account}` ? `${url.origin}${path}` : `invalid:${url.origin}${path}`;
-  } catch {
-    return "invalid";
-  }
+const INVALID = Symbol("invalid writer endpoint");
+
+/**
+ * The Locker writer's endpoint as the shared parser normalizes one (origin plus an optional /<account>), or INVALID.
+ * The writer's own rule (locker-selection.ts trustedAzureEndpoint) is applied here too, explicitly: https anywhere or
+ * http to loopback only, and never userinfo, a query or a fragment. Nothing is dropped before the comparison, so a
+ * malformed writer URL can never compare equal to the erase target.
+ */
+function normalizedEndpoint(raw: string | undefined, account: string): string | null | typeof INVALID {
+  if (raw === undefined || raw === "") return null;
+  if (raw !== raw.trim() || /[?#@\s]/.test(raw)) return INVALID;
+  let url: URL;
+  try { url = new URL(raw); } catch { return INVALID; }
+  if (url.username || url.password || url.search || url.hash) return INVALID;
+  const host = url.hostname.toLowerCase();
+  const loopback = host === "localhost" || host === "[::1]" || /^127\.\d{1,3}\.\d{1,3}\.\d{1,3}$/.test(host);
+  if (url.protocol !== "https:" && !(url.protocol === "http:" && loopback)) return INVALID;
+  const path = url.pathname.replace(/\/+$/, "");
+  return path === "" || path === `/${account}` ? `${url.origin}${path}` : INVALID;
 }
 
 /** The settings only (no secret): conflicts, the shared parser, and the exact writer-store match. */
@@ -55,8 +64,9 @@ export function azureEraseSettings(env: NodeJS.ProcessEnv, fail: SettingsFail): 
   // Exact match against the writer's own settings. The Locker's key (LOCKER_AZURE_ACCOUNT_KEY) is never read here:
   // the erase job holds only its own key file.
   const writerAccount = env.LOCKER_AZURE_ACCOUNT?.trim() ?? "";
+  const writerEndpoint = normalizedEndpoint(env.LOCKER_ENDPOINT, writerAccount);
   if (writerAccount !== settings.account || (env.LOCKER_BUCKET ?? "") !== settings.container
-      || normalizedEndpoint(env.LOCKER_ENDPOINT, writerAccount) !== (settings.endpoint ?? null))
+      || writerEndpoint === INVALID || writerEndpoint !== (settings.endpoint ?? null))
     fail("azure_target_not_writer_store");
   return settings;
 }

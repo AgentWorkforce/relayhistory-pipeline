@@ -40,7 +40,7 @@ import type { AzureBlobEraserConfig } from "../migration/azure-blob-erasure/eras
 import type { AzureBlobSettings } from "../shared/azure-blob-settings.ts";
 import { azureEraseFailureCode, azureErasePreflight, azureEraseRefusal, azureEraseSettings, azureEraseTarget, createAzureEraseEraser, eraseOnAzure, type AzureErasePreflightPorts } from "./azure-target.ts";
 import { assertDestinationUrl, destinationPolicy } from "../shared/destination-url.ts";
-import { eraseSessionBytes, SessionEraseRefused, type SessionEraseBytesRequest, type SessionEraseBytesResult } from "./selfhost-eraser.ts";
+import { eraseSessionBytes, planTargets, SessionEraseRefused, type SessionEraseBytesRequest, type SessionEraseBytesResult } from "./selfhost-eraser.ts";
 
 export const ENABLE_FLAG = "SESSION_ERASE_BYTES_ENABLED";
 const MAX_FILE = 1 << 20;
@@ -182,6 +182,9 @@ export interface AzurePreflightReport {
 
 async function runAzure(env: NodeJS.ProcessEnv, cfg: SessionEraseConfig, req: SessionEraseBytesRequest, overrides: SessionEraseOverrides) {
   const target = azureEraseTarget(env, refuse);
+  // Every pure check first: the request's plan (ids, rows, provider, bucket) is validated before the preflight, which
+  // writes and deletes a probe blob. An invalid request makes no request at all.
+  planTargets(req, { keyRoot: cfg.keyRoot, bucket: cfg.bucket, provider: "azure" });
   if (!cfg.dryRun) await azureErasePreflight(target, cfg.keyRoot, refuse, overrides.preflight);
   const eraser = createAzureEraseEraser(target, overrides.azureEraser);
   let result: SessionEraseBytesResult;

@@ -138,6 +138,22 @@ describe("per-user erase on azure", () => {
     }
   });
 
+  test("a refusal AFTER begin (user already revoked and fenced): fix the account, rerun the SAME request, it resumes and verifies", async () => {
+    const fake = seed();
+    const db = fakeDb();
+    let broken = true;
+    fake.hook = (req) => (broken && req.method === "GET" && !decodeURIComponent(req.url.pathname + req.url.search).includes(".runner-probe")
+      ? new Response(null, { status: 403 }) : undefined);
+    const first = await runUserEraseMain(env(), () => JSON.stringify(good), ports(fake, db)).catch((x) => x);
+    expect([codeOf(first), exitCodeForError(first)]).toEqual(["azure_forbidden", 2]);
+    expect(db.seen.some((t) => t.startsWith("SELECT sessions.operator_user_erase_begin"))).toBe(true);
+    expect(mine(fake).length).toBeGreaterThan(0);
+    broken = false;   // the operator fixes the account (here: the key's list permission)
+    const second = await runUserEraseMain(env(), () => JSON.stringify(good), ports(fake, db));
+    expect(second).toMatchObject({ verified: true });
+    expect(mine(fake)).toEqual([]);
+  });
+
   test("unset LOCKER_PROVIDER keeps the S3 path: no Azure eraser, no preflight", async () => {
     let azure = 0;
     const e = await runUserEraseMain(env({ LOCKER_PROVIDER: undefined, SESSION_ERASE_S3_BUCKET: "fx-bucket", SESSION_ERASE_S3_REGION: "us-east-1",

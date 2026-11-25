@@ -173,6 +173,13 @@ describe("refusals before any destructive work", () => {
       [{ LOCKER_AZURE_ACCOUNT: "fxother" }, "azure_target_not_writer_store"],
       [{ LOCKER_ENDPOINT: undefined }, "azure_target_not_writer_store"],
       [{ LOCKER_ENDPOINT: "http://127.0.0.1:2/fxacct" }, "azure_target_not_writer_store"],
+      // A malformed writer URL never compares equal: nothing is dropped before the comparison.
+      [{ LOCKER_ENDPOINT: `${FAKE_ENDPOINT}?sv=1` }, "azure_target_not_writer_store"],
+      [{ LOCKER_ENDPOINT: `${FAKE_ENDPOINT}#frag` }, "azure_target_not_writer_store"],
+      [{ LOCKER_ENDPOINT: FAKE_ENDPOINT.replace("http://", "http://u:p@") }, "azure_target_not_writer_store"],
+      [{ LOCKER_ENDPOINT: ` ${FAKE_ENDPOINT}` }, "azure_target_not_writer_store"],
+      [{ LOCKER_ENDPOINT: `${FAKE_ENDPOINT}/extra` }, "azure_target_not_writer_store"],
+      [{ LOCKER_ENDPOINT: "http://fxacct.blob.example.test", SESSION_ERASE_AZURE_ENDPOINT: "https://fxacct.blob.example.test" }, "azure_target_not_writer_store"],
       [{ SESSION_ERASE_S3_BUCKET: "fx-bucket" }, "azure_s3_settings_conflict"],
       [{ SESSION_ERASE_S3_ACCESS_KEY_ID_FILE: "/x" }, "azure_s3_settings_conflict"],
       [{ SESSION_ERASE_AZURE_ACCOUNT_KEY: KEY }, "azure_account_key_plaintext"],
@@ -184,6 +191,25 @@ describe("refusals before any destructive work", () => {
       const got = await refusal(runSessionEraseBytes(env(extra), () => JSON.stringify(request()), ports(fake)));
       expect([extra, got]).toEqual([extra, want]);
       expect([extra, fake.requests.length]).toEqual([extra, 0]);
+    }
+  });
+
+  test("an invalid request is refused by the pure plan before the preflight: zero fetches, zero probe calls (execute and dry run)", async () => {
+    const base = request().locations[0]!;
+    const cases: [Partial<SessionEraseBytesRequest>, string][] = [
+      [{ locations: [{ ...base, storageProvider: "s3" }] }, "store_not_azure"],
+      [{ locations: [{ ...base, bucket: "fx-other-container" }] }, "bucket_mismatch"],
+      [{ locations: [{ ...base, sessionId: "fx-other" }] }, "location_not_this_session"],
+      [{ key: { ...request().key, orgId: ".runner-probe" } }, "org_invalid"],
+      [{ stagedKeys: [`${ROOT}/${ORG}/buffered-batches/v1/x`] }, "staged_buffered_owned_by_gc"],
+    ];
+    for (const dry of [undefined, "1"]) for (const [over, want] of cases) {
+      const fake = seed();
+      let probes = 0;
+      const got = await refusal(runSessionEraseBytes(env({ SESSION_ERASE_DRY_RUN: dry }), () => JSON.stringify(request(over)), {
+        ...ports(fake), preflight: { probe: async () => { probes++; return "Enabled"; } },
+      }));
+      expect([dry, want, got, probes, fake.requests.length]).toEqual([dry, want, want, 0, 0]);
     }
   });
 
