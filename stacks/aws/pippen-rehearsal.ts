@@ -13,6 +13,7 @@
  *
  * Nothing here runs unless a stage sets that mode; the proof stage and every other stage are as before.
  */
+import { createHash } from "node:crypto";
 import { PIPPEN_PROOF_SANDBOX } from "./sandbox-rules.ts";
 import { alchemyStatePrefix, pippenStateBucket, type AwsRun } from "./state-bucket.ts";
 
@@ -76,6 +77,8 @@ export function assertStateBucketMode(stage: string, inputs: { accountId?: unkno
 
 export type StateBucketErrorCode =
   | "state_inputs_invalid"
+  | "state_issuer_pin_mismatch"
+  | "state_manifest_invalid"
   | "state_lease_expired"
   | "state_teardown_not_empty"
   | "state_resources_remain"
@@ -130,6 +133,28 @@ export function leaseCallerArn(accountId: string, env: Record<string, string | u
   if (!/^\d{12}$/.test(accountId) || id === undefined || !PIPPEN_SESSION_ID.test(id)) throw new StateBucketError("state_caller_mismatch");
   if (env[sbx.execSessionEnv] !== id || env[sbx.execAccountEnv] !== accountId) throw new StateBucketError("state_caller_mismatch");
   return `arn:aws:sts::${accountId}:assumed-role/${sbx.callerRole.roleName}/${sbx.callerRole.sessionPrefix}${id}`;
+}
+
+/** The env variable the broker sets at issuance with the issuer pin (rehearsalIssuerPin). */
+export const ISSUER_PIN_ENV = "PIPPEN_REHEARSAL_ISSUER_PIN_SHA256";
+
+/**
+ * The issuer pin: sha256 of the canonical JSON of the approved stage, region, sandbox account and
+ * boundary ARN. The broker computes it from its own records (not from the stage inputs) and passes
+ * it at issuance in PIPPEN_REHEARSAL_ISSUER_PIN_SHA256; the real values never enter the repository.
+ */
+export function rehearsalIssuerPin(i: { stage: string; region: string; accountId: string; boundaryArn: string }): string {
+  return createHash("sha256").update(JSON.stringify([i.stage, i.region, i.accountId, i.boundaryArn])).digest("hex");
+}
+
+/**
+ * The inputs' account and boundary must be the issuer's: the pin from the broker's env must equal
+ * the pin of (stage, region, inputs' account, inputs' boundary). A different well-formed account with
+ * a matching boundary in it fails, because the broker pinned another account.
+ */
+export function assertIssuerPin(i: { stage: string; region: string; accountId: string; boundaryArn: string }, env: Record<string, string | undefined>): void {
+  const pin = env[ISSUER_PIN_ENV];
+  if (pin === undefined || !/^[0-9a-f]{64}$/.test(pin) || pin !== rehearsalIssuerPin(i)) throw new StateBucketError("state_issuer_pin_mismatch");
 }
 
 /** STS's caller must be exactly the attested lease session for this stage. */
@@ -210,9 +235,12 @@ export function validatePippenStateBucket(aws: AwsRun, i: { accountId: string; r
  * the caller is this stage's attested lease session, the prefix is exactly this stage's, and the
  * shared bucket is already in shape. Nothing is created or written.
  */
-export function assertValidateOnlyState(aws: AwsRun, i: { accountId: string; region: string; stage: string; env: Record<string, string | undefined> }): { bucket: string; prefix: string } {
+export function assertValidateOnlyState(aws: AwsRun, i: { accountId: string; region: string; stage: string; boundaryArn: string; env: Record<string, string | undefined> }): { bucket: string; prefix: string } {
   const prefix = rehearsalStatePrefix(i.stage);
   if (i.region !== REHEARSAL_REGION) throw new StateBucketError("state_inputs_invalid");
+  // The issuer's pin (not the inputs) decides which account and boundary are approved; STS then
+  // proves the credentials are the attested session in that account.
+  assertIssuerPin(i, i.env);
   assertLeaseCaller(aws, i.accountId, i.env);
   return { bucket: validatePippenStateBucket(aws, i), prefix };
 }
@@ -229,8 +257,9 @@ export function prepareStateBackend(
   ensure: (aws: AwsRun, t: { accountId: string; region: string; stage: string }) => unknown,
 ): StateBackend {
   const backend = stateBackendFor(i.stage, i.inputs);
-  const v = i.inputs as { accountId: string; region: string };
-  if (backend === "validate-only") assertValidateOnlyState(aws, { accountId: v.accountId, region: v.region, stage: i.stage, env: i.env });
+  const v = i.inputs as { accountId: string; region: string; pippenSandbox?: { permissionsBoundaryArn?: string } };
+  if (backend === "validate-only")
+    assertValidateOnlyState(aws, { accountId: v.accountId, region: v.region, stage: i.stage, boundaryArn: v.pippenSandbox!.permissionsBoundaryArn!, env: i.env });
   else if (backend === "ensure") ensure(aws, { accountId: v.accountId, region: v.region, stage: i.stage });
   return backend;
 }
@@ -303,7 +332,7 @@ export function listStageStateVersions(aws: AwsRun, i: { bucket: string; region:
  * the prefix before each call, and then an independent re-list that must show zero versions and
  * zero delete markers (`state_teardown_not_empty` otherwise) before success is reported.
  * `execute: false` (the default) lists and deletes nothing. Sibling stages and the bucket itself
- * are never touched. Run it only after assertRehearsalResourcesGone.
+ * are never touched. Run it only after assertManifestGone has passed.
  */
 export function teardownStageState(aws: AwsRun, i: { bucket: string; region: string; stage: string; execute?: boolean }): { listed: number; deleted: number; remaining: number } {
   const prefix = rehearsalStatePrefix(i.stage);
@@ -346,17 +375,120 @@ export function rehearsalResourceNames(stage: string = REHEARSAL_STAGE) {
   };
 }
 
-const NOT_FOUND = /ResourceNotFoundException|NonExistentQueue|QueueDoesNotExist/;
+const NOT_FOUND = /ResourceNotFoundException|NonExistentQueue|QueueDoesNotExist|NoSuchEntity/;
+const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
 
 /**
- * Before the state is discarded: every recorded physical resource is gone. Each must read back as
- * not found (the function, each queue, each recorded mapping UUID), the alarms must list empty, and
- * no log group of the function's exact name may remain. Any resource that still exists refuses
- * (`state_resources_remain`); any other failure refuses (`state_teardown_failed`). Read-only.
+ * The pre-destroy physical manifest: every id the stage's resources have, read from AWS before any
+ * destroy, persisted (scripts/rehearsal-state-teardown.ts writes it once under the gitignored
+ * .96bulls/<stage>/ and never rewrites it), and checked id by id before the state is discarded, so
+ * a partial destroy cannot leave a resource the state no longer names.
  */
-export function assertRehearsalResourcesGone(aws: AwsRun, i: { region: string; stage: string; mappingUuids: readonly string[] }): void {
+export interface PhysicalManifest {
+  schema: 1;
+  stage: string;
+  region: string;
+  accountId: string;
+  function: { name: string; arn: string };
+  /** The execution role, and what teardown does with it: deleted, or kept as the boundary-pathed role by decision. */
+  role: { arn: string; disposition: "deleted" | "retained" };
+  queues: { name: string; url: string; arn: string }[];
+  mappings: { uuid: string; eventSourceArn: string }[];
+  alarms: string[];
+  logGroup: string;
+}
+
+const cliJson = (aws: AwsRun, args: string[]): Record<string, unknown> => {
+  let text: string;
+  try {
+    text = aws([...args, "--output", "json"]);
+  } catch {
+    throw new StateBucketError("state_manifest_invalid");
+  }
+  try {
+    const v = JSON.parse(text) as unknown;
+    if (v === null || typeof v !== "object" || Array.isArray(v)) throw new Error("shape");
+    return v as Record<string, unknown>;
+  } catch {
+    throw new StateBucketError("state_manifest_invalid");
+  }
+};
+
+/**
+ * Read the manifest from the live resources (before any destroy). Every resource must exist and be
+ * this stage's: the function and its role, the four queues, exactly two mappings (one on the events
+ * queue, one on the search queue, both on the function), the five alarms and the log group.
+ */
+export function readPhysicalManifest(aws: AwsRun, i: { accountId: string; region: string; stage: string; roleDisposition: string }): PhysicalManifest {
   rehearsalStatePrefix(i.stage);
+  if (i.roleDisposition !== "deleted" && i.roleDisposition !== "retained") throw new StateBucketError("state_manifest_invalid");
   const names = rehearsalResourceNames(i.stage);
+  const r = ["--region", i.region];
+  const fn = cliJson(aws, ["lambda", "get-function-configuration", "--function-name", names.function, ...r]);
+  const fnArn = `arn:aws:lambda:${i.region}:${i.accountId}:function:${names.function}`;
+  if (fn.FunctionArn !== fnArn || typeof fn.Role !== "string" || !/^arn:aws:iam::\d{12}:role\/[A-Za-z0-9_+=,.@/-]+$/.test(fn.Role)) throw new StateBucketError("state_manifest_invalid");
+  const queues = names.queues.map((name) => {
+    const url = cliJson(aws, ["sqs", "get-queue-url", "--queue-name", name, ...r]).QueueUrl;
+    if (url !== `https://sqs.${i.region}.amazonaws.com/${i.accountId}/${name}`) throw new StateBucketError("state_manifest_invalid");
+    return { name, url, arn: `arn:aws:sqs:${i.region}:${i.accountId}:${name}` };
+  });
+  const listed = cliJson(aws, ["lambda", "list-event-source-mappings", "--function-name", names.function, ...r]).EventSourceMappings;
+  if (!Array.isArray(listed)) throw new StateBucketError("state_manifest_invalid");
+  const mappings = listed.map((m: Record<string, unknown>) => {
+    if (typeof m.UUID !== "string" || !UUID.test(m.UUID) || m.FunctionArn !== fnArn || typeof m.EventSourceArn !== "string") throw new StateBucketError("state_manifest_invalid");
+    return { uuid: m.UUID, eventSourceArn: m.EventSourceArn };
+  });
+  const alarms = cliJson(aws, ["cloudwatch", "describe-alarms", "--alarm-names", ...names.alarms, ...r]).MetricAlarms;
+  if (!Array.isArray(alarms)) throw new StateBucketError("state_manifest_invalid");
+  const groups = cliJson(aws, ["logs", "describe-log-groups", "--log-group-name-prefix", names.logGroup, ...r]).logGroups;
+  if (!Array.isArray(groups) || !groups.some((g: { logGroupName?: unknown }) => g?.logGroupName === names.logGroup)) throw new StateBucketError("state_manifest_invalid");
+  const manifest: PhysicalManifest = {
+    schema: 1,
+    stage: i.stage,
+    region: i.region,
+    accountId: i.accountId,
+    function: { name: names.function, arn: fnArn },
+    role: { arn: fn.Role, disposition: i.roleDisposition },
+    queues,
+    mappings: mappings.sort((a, b) => (a.eventSourceArn < b.eventSourceArn ? -1 : 1)),
+    alarms: (alarms as { AlarmName?: unknown }[]).map((a) => String(a?.AlarmName)).sort(),
+    logGroup: names.logGroup,
+  };
+  assertManifestComplete(manifest, i);
+  return manifest;
+}
+
+/**
+ * A manifest is complete only with every expected id: the stage's function, a role with its
+ * disposition, the four queues with their URLs and ARNs, exactly two mapping UUIDs (one on the
+ * events queue, one on the search queue), all five alarms and the log group. Missing or fewer ids refuse.
+ */
+export function assertManifestComplete(m: unknown, i: { accountId: string; region: string; stage: string }): asserts m is PhysicalManifest {
+  const names = rehearsalResourceNames(i.stage);
+  const v = m as PhysicalManifest | null | undefined;
+  const ok =
+    v !== null && typeof v === "object" && v.schema === 1 && v.stage === i.stage && v.region === i.region && v.accountId === i.accountId &&
+    v.function?.name === names.function && v.function.arn === `arn:aws:lambda:${i.region}:${i.accountId}:function:${names.function}` &&
+    typeof v.role?.arn === "string" && /^arn:aws:iam::\d{12}:role\/[A-Za-z0-9_+=,.@/-]+$/.test(v.role.arn) && (v.role.disposition === "deleted" || v.role.disposition === "retained") &&
+    Array.isArray(v.queues) && v.queues.length === names.queues.length &&
+    names.queues.every((n) => v.queues.some((q) => q?.name === n && q.url === `https://sqs.${i.region}.amazonaws.com/${i.accountId}/${n}` && q.arn === `arn:aws:sqs:${i.region}:${i.accountId}:${n}`)) &&
+    Array.isArray(v.mappings) && v.mappings.length === 2 &&
+    v.mappings.every((x) => typeof x?.uuid === "string" && UUID.test(x.uuid)) && new Set(v.mappings.map((x) => x.uuid)).size === 2 &&
+    [`arn:aws:sqs:${i.region}:${i.accountId}:${names.queues[0]}`, `arn:aws:sqs:${i.region}:${i.accountId}:${names.queues[2]}`].every((arn) => v.mappings.some((x) => x.eventSourceArn === arn)) &&
+    Array.isArray(v.alarms) && v.alarms.length === names.alarms.length && names.alarms.every((a) => v.alarms.includes(a)) &&
+    v.logGroup === names.logGroup;
+  if (!ok) throw new StateBucketError("state_manifest_invalid");
+}
+
+/**
+ * Before the state is discarded: each id in the (complete) manifest reads back as gone: the function
+ * by ARN, each queue by URL, each mapping by UUID, the alarms list empty, no log group of the exact
+ * name; and the role per its disposition (deleted: not found; retained: present under the sandbox's
+ * /pippen/workload/ path). Anything still present refuses (`state_resources_remain`); any other
+ * failure refuses (`state_teardown_failed`). Read-only. Run it after every partial destroy until it passes.
+ */
+export function assertManifestGone(aws: AwsRun, m: unknown, i: { accountId: string; region: string; stage: string }): void {
+  assertManifestComplete(m, i);
   const r = ["--region", i.region, "--output", "json"];
   const gone = (args: string[]) => {
     try {
@@ -367,12 +499,9 @@ export function assertRehearsalResourcesGone(aws: AwsRun, i: { region: string; s
     }
     throw new StateBucketError("state_resources_remain");
   };
-  gone(["lambda", "get-function-configuration", "--function-name", names.function]);
-  for (const q of names.queues) gone(["sqs", "get-queue-url", "--queue-name", q]);
-  for (const u of i.mappingUuids) {
-    if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(u)) throw new StateBucketError("state_teardown_failed");
-    gone(["lambda", "get-event-source-mapping", "--uuid", u]);
-  }
+  gone(["lambda", "get-function-configuration", "--function-name", m.function.arn]);
+  for (const q of m.queues) gone(["sqs", "get-queue-attributes", "--queue-url", q.url, "--attribute-names", "QueueArn"]);
+  for (const x of m.mappings) gone(["lambda", "get-event-source-mapping", "--uuid", x.uuid]);
   const read = (args: string[]) => {
     try {
       const text = aws([...args, ...r]);
@@ -382,12 +511,48 @@ export function assertRehearsalResourcesGone(aws: AwsRun, i: { region: string; s
       throw new StateBucketError("state_teardown_failed");
     }
   };
-  const alarms = read(["cloudwatch", "describe-alarms", "--alarm-names", ...names.alarms]);
+  const alarms = read(["cloudwatch", "describe-alarms", "--alarm-names", ...m.alarms]);
   if (!Array.isArray(alarms.MetricAlarms) || (alarms.CompositeAlarms !== undefined && !Array.isArray(alarms.CompositeAlarms))) throw new StateBucketError("state_teardown_failed");
   if (alarms.MetricAlarms.length > 0 || ((alarms.CompositeAlarms as unknown[] | undefined)?.length ?? 0) > 0) throw new StateBucketError("state_resources_remain");
-  const groups = read(["logs", "describe-log-groups", "--log-group-name-prefix", names.logGroup]);
+  const groups = read(["logs", "describe-log-groups", "--log-group-name-prefix", m.logGroup]);
   if (!Array.isArray(groups.logGroups)) throw new StateBucketError("state_teardown_failed");
-  if ((groups.logGroups as { logGroupName?: unknown }[]).some((g) => g?.logGroupName === names.logGroup)) throw new StateBucketError("state_resources_remain");
+  if ((groups.logGroups as { logGroupName?: unknown }[]).some((g) => g?.logGroupName === m.logGroup)) throw new StateBucketError("state_resources_remain");
+  const roleName = m.role.arn.slice(m.role.arn.lastIndexOf("/") + 1);
+  if (m.role.disposition === "deleted") gone(["iam", "get-role", "--role-name", roleName]);
+  else {
+    const role = read(["iam", "get-role", "--role-name", roleName]).Role as { Arn?: unknown; Path?: unknown } | undefined;
+    if (role?.Arn !== m.role.arn || role.Path !== "/pippen/workload/") throw new StateBucketError("state_resources_remain");
+  }
+}
+
+/**
+ * Before stage A: none of the stage's names is in use yet, so no existing resource can be adopted
+ * (tagged into the rehearsal) by the lease's create-time tagging grants.
+ */
+export function assertRehearsalNamesUnused(aws: AwsRun, i: { region: string; stage: string }): void {
+  rehearsalStatePrefix(i.stage);
+  const names = rehearsalResourceNames(i.stage);
+  const r = ["--region", i.region, "--output", "json"];
+  const unused = (args: string[]) => {
+    try {
+      aws([...args, ...r]);
+    } catch (e) {
+      if (NOT_FOUND.test(e instanceof Error ? e.message : String(e))) return;
+      throw new StateBucketError("state_teardown_failed");
+    }
+    throw new StateBucketError("state_resources_remain");
+  };
+  unused(["lambda", "get-function-configuration", "--function-name", names.function]);
+  for (const q of names.queues) unused(["sqs", "get-queue-url", "--queue-name", q]);
+  let alarms: Record<string, unknown>, groups: Record<string, unknown>;
+  try {
+    alarms = JSON.parse(aws(["cloudwatch", "describe-alarms", "--alarm-names", ...names.alarms, ...r]));
+    groups = JSON.parse(aws(["logs", "describe-log-groups", "--log-group-name-prefix", names.logGroup, ...r]));
+  } catch {
+    throw new StateBucketError("state_teardown_failed");
+  }
+  if (!Array.isArray(alarms.MetricAlarms) || !Array.isArray(groups.logGroups)) throw new StateBucketError("state_teardown_failed");
+  if (alarms.MetricAlarms.length > 0 || (groups.logGroups as { logGroupName?: unknown }[]).some((g) => g?.logGroupName === names.logGroup)) throw new StateBucketError("state_resources_remain");
 }
 
 /** The tag every rehearsal resource carries, required on create and on every act (lease policy). */
@@ -433,10 +598,18 @@ export function rehearsalLeasePolicies(i: { accountId: string; stage?: string; r
   const a = i.accountId;
   const name = `96bulls-${stage}-*`;
   const fnArn = `arn:aws:lambda:${region}:${a}:function:${name}`;
+  const esmArn = `arn:aws:lambda:${region}:${a}:event-source-mapping:*`;
+  const queueArn = `arn:aws:sqs:${region}:${a}:${name}`;
+  const alarmArn = `arn:aws:cloudwatch:${region}:${a}:alarm:${name}`;
   const logArn = `arn:aws:logs:${region}:${a}:log-group:/aws/lambda/${name}`;
   const before = { DateLessThan: { "aws:CurrentTime": end } };
   const tagged = { StringEquals: { [`aws:ResourceTag/${REHEARSAL_TAG.key}`]: REHEARSAL_TAG.value } };
   const tagging = { StringEquals: { [`aws:RequestTag/${REHEARSAL_TAG.key}`]: REHEARSAL_TAG.value } };
+  // Tag calls: only with the rehearsal tag in the request, and never on a resource that carries
+  // another rehearsal value. IAM cannot tell create-time tagging from a standalone tag call for these
+  // services; an untagged existing resource is excluded in code instead (assertRehearsalNamesUnused
+  // before stage A: none of the names may exist).
+  const retag = { StringEquals: { [`aws:RequestTag/${REHEARSAL_TAG.key}`]: REHEARSAL_TAG.value }, StringEqualsIfExists: { [`aws:ResourceTag/${REHEARSAL_TAG.key}`]: REHEARSAL_TAG.value } };
   const statement = (Sid: string, Action: string[], Resource: string | string[], Condition: Record<string, unknown>) => ({ Sid, Effect: "Allow" as const, Action, Resource, Condition: { ...before, ...Condition } });
   const inline = {
     Version: "2012-10-17" as const,
@@ -466,11 +639,12 @@ export function rehearsalLeasePolicies(i: { accountId: string; stage?: string; r
       document: {
         Version: "2012-10-17" as const,
         Statement: [
-          statement("Queues", ["sqs:CreateQueue", "sqs:TagQueue"], `arn:aws:sqs:${region}:${a}:${name}`, tagging),
-          statement("Function", ["lambda:CreateFunction", "lambda:TagResource"], fnArn, tagging),
-          statement("Mappings", ["lambda:CreateEventSourceMapping", "lambda:TagResource"], "*", { ...tagging, ArnLike: { "lambda:FunctionArn": fnArn } }),
-          statement("Alarms", ["cloudwatch:PutMetricAlarm", "cloudwatch:TagResource"], `arn:aws:cloudwatch:${region}:${a}:alarm:${name}`, tagging),
-          statement("Logs", ["logs:CreateLogGroup", "logs:TagResource"], [logArn, `${logArn}:*`], tagging),
+          statement("Queues", ["sqs:CreateQueue"], queueArn, tagging),
+          statement("Function", ["lambda:CreateFunction"], fnArn, tagging),
+          statement("Mappings", ["lambda:CreateEventSourceMapping"], esmArn, { ...tagging, ArnLike: { "lambda:FunctionArn": fnArn } }),
+          statement("Alarms", ["cloudwatch:PutMetricAlarm"], alarmArn, tagging),
+          statement("Logs", ["logs:CreateLogGroup"], [logArn, `${logArn}:*`], tagging),
+          statement("Tags", ["sqs:TagQueue", "lambda:TagResource", "cloudwatch:TagResource", "logs:TagResource"], [queueArn, fnArn, esmArn, alarmArn, logArn, `${logArn}:*`], retag),
         ],
       },
     },
@@ -479,15 +653,21 @@ export function rehearsalLeasePolicies(i: { accountId: string; stage?: string; r
       document: {
         Version: "2012-10-17" as const,
         Statement: [
-          statement("Queues", ["sqs:GetQueueAttributes", "sqs:SetQueueAttributes", "sqs:ListQueueTags", "sqs:DeleteQueue", "sqs:SendMessage", "sqs:ReceiveMessage", "sqs:DeleteMessage", "sqs:ChangeMessageVisibility"], `arn:aws:sqs:${region}:${a}:${name}`, tagged),
+          statement("Queues", ["sqs:GetQueueAttributes", "sqs:SetQueueAttributes", "sqs:ListQueueTags", "sqs:DeleteQueue", "sqs:SendMessage", "sqs:ReceiveMessage", "sqs:DeleteMessage", "sqs:ChangeMessageVisibility"], queueArn, tagged),
           statement("Function", [
             "lambda:GetFunction", "lambda:GetFunctionConfiguration", "lambda:UpdateFunctionCode", "lambda:UpdateFunctionConfiguration", "lambda:DeleteFunction", "lambda:PublishVersion",
             "lambda:ListAliases", "lambda:ListVersionsByFunction", "lambda:AddPermission", "lambda:RemovePermission", "lambda:GetPolicy", "lambda:ListTags", "lambda:InvokeFunction",
           ], fnArn, tagged),
-          statement("Mappings", ["lambda:GetEventSourceMapping", "lambda:UpdateEventSourceMapping", "lambda:DeleteEventSourceMapping"], "*", { ArnLike: { "lambda:FunctionArn": fnArn } }),
-          statement("Alarms", ["cloudwatch:PutMetricAlarm", "cloudwatch:DeleteAlarms", "cloudwatch:ListTagsForResource"], `arn:aws:cloudwatch:${region}:${a}:alarm:${name}`, tagged),
+          // The mappings by their own tag and the function they target (the UUIDs are not known before
+          // creation; teardown checks each recorded UUID: assertManifestGone).
+          statement("Mappings", ["lambda:GetEventSourceMapping", "lambda:UpdateEventSourceMapping", "lambda:DeleteEventSourceMapping"], esmArn, { ...tagged, ArnLike: { "lambda:FunctionArn": fnArn } }),
+          statement("Alarms", ["cloudwatch:PutMetricAlarm", "cloudwatch:DeleteAlarms", "cloudwatch:ListTagsForResource"], alarmArn, tagged),
           statement("Logs", ["logs:PutRetentionPolicy", "logs:DeleteLogGroup", "logs:ListTagsForResource", "logs:StartQuery", "logs:FilterLogEvents"], [logArn, `${logArn}:*`], tagged),
-          statement("Reads", ["sqs:GetQueueUrl", "sqs:ListQueues", "lambda:ListEventSourceMappings", "cloudwatch:DescribeAlarms", "cloudwatch:GetMetricStatistics", "cloudwatch:GetMetricData", "logs:DescribeLogGroups", "logs:GetQueryResults"], "*", {}),
+          // Reads narrowed to the stage's names (no tag condition: they must also answer "not found").
+          statement("NamedReads", ["sqs:GetQueueUrl", "cloudwatch:DescribeAlarms"], [queueArn, alarmArn], {}),
+          statement("RoleRead", ["iam:GetRole"], [`arn:aws:iam::${a}:role/pippen/workload/*`, `arn:aws:iam::${a}:role/96bulls-aws-session-pipeline-${stage}-*`], {}),
+          // Reads IAM cannot narrow to a resource (documented): listing mappings, metric data, query results.
+          statement("Reads", ["lambda:ListEventSourceMappings", "cloudwatch:GetMetricStatistics", "cloudwatch:GetMetricData", "logs:DescribeLogGroups", "logs:GetQueryResults"], "*", {}),
         ],
       },
     },
@@ -495,30 +675,3 @@ export function rehearsalLeasePolicies(i: { accountId: string; stage?: string; r
   return { expiresAt: end, inline, managed };
 }
 
-/**
- * The mapping UUIDs Alchemy recorded for this stage (its state objects `<prefix>session-events-mapping.json`
- * and `<prefix>session-search-mapping.json`, attr.uuid), for assertRehearsalResourcesGone. An absent
- * object records nothing; an unreadable or malformed one refuses.
- */
-export function recordedMappingUuids(aws: AwsRun, i: { bucket: string; region: string; stage: string }): string[] {
-  const prefix = rehearsalStatePrefix(i.stage);
-  const out: string[] = [];
-  for (const id of ["session-events-mapping", "session-search-mapping"]) {
-    let text: string;
-    try {
-      text = aws(["s3", "cp", `s3://${i.bucket}/${prefix}${id}.json`, "-", "--region", i.region]);
-    } catch (e) {
-      if (/NoSuchKey|\(404\)/.test(e instanceof Error ? e.message : String(e))) continue;
-      throw new StateBucketError("state_teardown_failed");
-    }
-    let uuid: unknown;
-    try {
-      uuid = (JSON.parse(text) as { attr?: { uuid?: unknown } }).attr?.uuid;
-    } catch {
-      throw new StateBucketError("state_teardown_failed");
-    }
-    if (typeof uuid !== "string" || !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(uuid)) throw new StateBucketError("state_teardown_failed");
-    out.push(uuid);
-  }
-  return out;
-}

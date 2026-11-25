@@ -14,14 +14,20 @@ import {
   REHEARSAL_STAGE,
   REHEARSAL_TAG,
   StateBucketError,
-  assertRehearsalResourcesGone,
+  ISSUER_PIN_ENV,
+  assertIssuerPin,
+  assertManifestComplete,
+  assertManifestGone,
+  assertRehearsalNamesUnused,
+  readPhysicalManifest,
+  rehearsalIssuerPin,
+  type PhysicalManifest,
   assertStateBucketMode,
   assertStatePrefix,
   assertValidateOnlyState,
   leaseCallerArn,
   listStageStateVersions,
   prepareStateBackend,
-  recordedMappingUuids,
   rehearsalLeaseEnd,
   rehearsalLeasePolicies,
   rehearsalResourceNames,
@@ -40,11 +46,13 @@ const REGION = "us-west-2";
 const BUCKET = pippenStateBucket(ACCOUNT, REGION);
 const PREFIX = "96bulls/96bulls-aws/aws-rehearse-p1-1126/";
 const SESSION = "0f1e2d3c-4b5a-4968-8776-a5b4c3d2e1f0";
-/** What `pippen sandbox exec` attests, plus the operator's lease id. */
-const ENV = { NINETY_SIX_BULLS_PIPPEN_SESSION: SESSION, PIPPEN_SANDBOX_SESSION_ID: SESSION, PIPPEN_SANDBOX_ACCOUNT_ID: ACCOUNT };
+const BOUNDARY = `arn:aws:iam::${ACCOUNT}:policy/boundary`;
+const PIN = rehearsalIssuerPin({ stage: REHEARSAL_STAGE, region: REGION, accountId: ACCOUNT, boundaryArn: BOUNDARY });
+/** What `pippen sandbox exec` attests (lease, account, the issuer's pin), plus the operator's lease id. */
+const ENV = { NINETY_SIX_BULLS_PIPPEN_SESSION: SESSION, PIPPEN_SANDBOX_SESSION_ID: SESSION, PIPPEN_SANDBOX_ACCOUNT_ID: ACCOUNT, [ISSUER_PIN_ENV]: PIN };
 const CALLER = `arn:aws:sts::${ACCOUNT}:assumed-role/agent-session/agent-${SESSION}`;
 const IN_SHAPE = fixture<Record<string, unknown>>("state-bucket.in-shape.json");
-const INPUTS = { accountId: ACCOUNT, region: REGION, pippenSandbox: { permissionsBoundaryArn: `arn:aws:iam::${ACCOUNT}:policy/boundary`, stateBucket: "validate-only" } };
+const INPUTS = { accountId: ACCOUNT, region: REGION, pippenSandbox: { permissionsBoundaryArn: BOUNDARY, stateBucket: "validate-only" } };
 
 /** A fake aws CLI over the fixture responses; every call is recorded. */
 function fakeBucket(over: Record<string, unknown> = {}, opts: { absent?: boolean; caller?: string; account?: string; errors?: Record<string, string> } = {}) {
@@ -148,7 +156,7 @@ describe("backend selection: decided from validated inputs, before any state bac
 describe("validate-only: the shared state bucket is read, never created or changed", () => {
   it("an in-shape bucket passes with reads only (no head-bucket, no create, no put)", () => {
     const f = fakeBucket();
-    expect(assertValidateOnlyState(f.aws, { accountId: ACCOUNT, region: REGION, stage: REHEARSAL_STAGE, env: ENV })).toEqual({ bucket: BUCKET, prefix: PREFIX });
+    expect(assertValidateOnlyState(f.aws, { accountId: ACCOUNT, region: REGION, stage: REHEARSAL_STAGE, boundaryArn: BOUNDARY, env: ENV })).toEqual({ bucket: BUCKET, prefix: PREFIX });
     expect(f.writes()).toEqual([]);
     expect(f.calls.map((c) => `${c[0]} ${c[1]}`)).toEqual([
       "sts get-caller-identity",
@@ -204,6 +212,28 @@ describe("validate-only: the shared state bucket is read, never created or chang
   });
 });
 
+describe("the issuer pin: the approved account and boundary come from the broker, not the inputs", () => {
+  it("a different well-formed account with a matching boundary is refused, even with matching lease env and STS", () => {
+    const OTHER = "444455556666";
+    const other = { accountId: OTHER, region: REGION, pippenSandbox: { permissionsBoundaryArn: `arn:aws:iam::${OTHER}:policy/boundary`, stateBucket: "validate-only" } };
+    // The inputs alone are well formed: stateBackendFor accepts them.
+    expect(stateBackendFor(REHEARSAL_STAGE, other)).toBe("validate-only");
+    // Lease env and STS agree with the other account; only the broker's pin (for ACCOUNT) refuses.
+    const env = { ...ENV, PIPPEN_SANDBOX_ACCOUNT_ID: OTHER };
+    const f = fakeBucket({}, { account: OTHER, caller: `arn:aws:sts::${OTHER}:assumed-role/agent-session/agent-${SESSION}` });
+    let ensured = 0;
+    expect(codeOf(() => prepareStateBackend(f.aws, { stage: REHEARSAL_STAGE, inputs: other, env }, () => void ensured++))).toBe("state_issuer_pin_mismatch");
+    expect([f.calls.length, ensured]).toEqual([0, 0]);
+    // Another boundary in the right account is refused too, and so is a missing or malformed pin.
+    expect(codeOf(() => assertIssuerPin({ stage: REHEARSAL_STAGE, region: REGION, accountId: ACCOUNT, boundaryArn: `arn:aws:iam::${ACCOUNT}:policy/other` }, ENV))).toBe("state_issuer_pin_mismatch");
+    for (const pin of [undefined, "", "abc", PIN.toUpperCase()]) expect(codeOf(() => assertIssuerPin({ stage: REHEARSAL_STAGE, region: REGION, accountId: ACCOUNT, boundaryArn: BOUNDARY }, { ...ENV, [ISSUER_PIN_ENV]: pin }))).toBe("state_issuer_pin_mismatch");
+    expect(codeOf(() => assertIssuerPin({ stage: REHEARSAL_STAGE, region: REGION, accountId: ACCOUNT, boundaryArn: BOUNDARY }, ENV))).toBe("ok");
+    // The pin is a digest only: it does not carry the account in clear.
+    expect(PIN).toMatch(/^[0-9a-f]{64}$/);
+    expect(PIN).not.toContain(ACCOUNT);
+  });
+});
+
 describe("caller and prefix guards", () => {
   it("the caller must be the broker-attested lease session in the attested account", () => {
     expect(leaseCallerArn(ACCOUNT, ENV)).toBe(CALLER);
@@ -215,11 +245,11 @@ describe("caller and prefix guards", () => {
     ];
     for (const caller of wrong) {
       const f = fakeBucket({}, { caller });
-      expect([caller, codeOf(() => assertValidateOnlyState(f.aws, { accountId: ACCOUNT, region: REGION, stage: REHEARSAL_STAGE, env: ENV }))]).toEqual([caller, "state_caller_mismatch"]);
+      expect([caller, codeOf(() => assertValidateOnlyState(f.aws, { accountId: ACCOUNT, region: REGION, stage: REHEARSAL_STAGE, boundaryArn: BOUNDARY, env: ENV }))]).toEqual([caller, "state_caller_mismatch"]);
       expect(f.calls.filter((c) => c[0] === "s3api")).toEqual([]);
     }
     // STS reporting another account for the same ARN text is refused too.
-    expect(codeOf(() => assertValidateOnlyState(fakeBucket({}, { account: "444455556666" }).aws, { accountId: ACCOUNT, region: REGION, stage: REHEARSAL_STAGE, env: ENV }))).toBe("state_caller_mismatch");
+    expect(codeOf(() => assertValidateOnlyState(fakeBucket({}, { account: "444455556666" }).aws, { accountId: ACCOUNT, region: REGION, stage: REHEARSAL_STAGE, boundaryArn: BOUNDARY, env: ENV }))).toBe("state_caller_mismatch");
     // The attestation is required, not optional, and must match the inputs and the lease id.
     for (const env of [
       { NINETY_SIX_BULLS_PIPPEN_SESSION: SESSION },
@@ -317,65 +347,138 @@ describe("teardown: only this stage's state keys, with evidence", () => {
     expect(codeOf(() => teardownStageState(fakeListing([]).aws, { ...target, stage: "aws-proof-sandbox", execute: true }))).toBe("state_prefix_mismatch");
   });
 
-  it("the physical-resource readback: every recorded id must read back as gone before the state is discarded", () => {
-    const names = rehearsalResourceNames();
-    const U = "44444444-4444-4444-8444-444444444444";
-    const fakeGone = (remaining: string[] = [], other: string[] = [], alarms: unknown[] = [], groups: unknown[] = []) => {
-      const calls: string[][] = [];
-      const aws: AwsRun = (args) => {
-        calls.push(args);
-        const key = `${args[0]} ${args[1]} ${args[3]}`;
-        if (other.some((o) => key.includes(o))) throw new Error("An error occurred (AccessDenied) canary-77");
-        if (args[1] === "describe-alarms") return JSON.stringify({ MetricAlarms: alarms, CompositeAlarms: [] });
-        if (args[1] === "describe-log-groups") return JSON.stringify({ logGroups: groups });
-        if (remaining.some((r) => key.includes(r))) return "{}";
-        throw new Error(args[0] === "sqs" ? "An error occurred (AWS.SimpleQueueService.NonExistentQueue)" : "An error occurred (ResourceNotFoundException)");
-      };
-      return { aws, calls };
+  const names = rehearsalResourceNames();
+  const ROLE = `arn:aws:iam::${ACCOUNT}:role/96bulls-aws-session-pipeline-aws-rehearse-p1-1126-abc123`;
+  const U1 = "44444444-4444-4444-8444-444444444444";
+  const U2 = "55555555-5555-4555-8555-555555555555";
+  const FN = `arn:aws:lambda:${REGION}:${ACCOUNT}:function:${names.function}`;
+  const qArn = (n: string) => `arn:aws:sqs:${REGION}:${ACCOUNT}:${n}`;
+  /** A fake account where `present` ids still exist (by any substring of the call), for the manifest and its readback. */
+  const fakeAccount = (present: Set<string>, opts: { alarms?: string[]; group?: boolean; roleRetained?: boolean; mappings?: { UUID: string; EventSourceArn: string }[]; denied?: string } = {}) => {
+    const calls: string[][] = [];
+    const aws: AwsRun = (args) => {
+      calls.push(args);
+      const line = args.join(" ");
+      if (opts.denied && line.includes(opts.denied)) throw new Error("An error occurred (AccessDenied) canary-77");
+      const has = [...present].some((id) => line.includes(id));
+      switch (`${args[0]} ${args[1]}`) {
+        case "lambda get-function-configuration":
+          if (!has) throw new Error("An error occurred (ResourceNotFoundException)");
+          return JSON.stringify({ FunctionArn: FN, Role: ROLE });
+        case "sqs get-queue-url": {
+          const n = args[args.indexOf("--queue-name") + 1]!;
+          if (!present.has(n)) throw new Error("An error occurred (AWS.SimpleQueueService.NonExistentQueue)");
+          return JSON.stringify({ QueueUrl: `https://sqs.${REGION}.amazonaws.com/${ACCOUNT}/${n}` });
+        }
+        case "sqs get-queue-attributes":
+          if (!has) throw new Error("An error occurred (AWS.SimpleQueueService.NonExistentQueue)");
+          return "{}";
+        case "lambda list-event-source-mappings":
+          return JSON.stringify({ EventSourceMappings: (opts.mappings ?? [{ UUID: U1, EventSourceArn: qArn(names.queues[0]!) }, { UUID: U2, EventSourceArn: qArn(names.queues[2]!) }]).map((m) => ({ ...m, FunctionArn: FN })) });
+        case "lambda get-event-source-mapping":
+          if (!has) throw new Error("An error occurred (ResourceNotFoundException)");
+          return "{}";
+        case "cloudwatch describe-alarms":
+          return JSON.stringify({ MetricAlarms: (opts.alarms ?? []).map((AlarmName) => ({ AlarmName })), CompositeAlarms: [] });
+        case "logs describe-log-groups":
+          return JSON.stringify({ logGroups: opts.group ? [{ logGroupName: names.logGroup }] : [] });
+        case "iam get-role":
+          if (opts.roleRetained) return JSON.stringify({ Role: { Arn: ROLE, Path: "/pippen/workload/" } });
+          if (!has) throw new Error("An error occurred (NoSuchEntity)");
+          return JSON.stringify({ Role: { Arn: ROLE, Path: "/" } });
+      }
+      throw new Error(`unexpected ${line}`);
     };
-    const ok = fakeGone();
-    expect(codeOf(() => assertRehearsalResourcesGone(ok.aws, { region: REGION, stage: REHEARSAL_STAGE, mappingUuids: [U] }))).toBe("ok");
-    expect(ok.calls.map((c) => `${c[0]} ${c[1]}`)).toEqual([
-      "lambda get-function-configuration",
-      ...names.queues.map(() => "sqs get-queue-url"),
-      "lambda get-event-source-mapping",
-      "cloudwatch describe-alarms",
-      "logs describe-log-groups",
-    ]);
-    for (const left of [names.function, names.queues[2]!, U])
-      expect([left, codeOf(() => assertRehearsalResourcesGone(fakeGone([left]).aws, { region: REGION, stage: REHEARSAL_STAGE, mappingUuids: [U] }))]).toEqual([left, "state_resources_remain"]);
-    expect(codeOf(() => assertRehearsalResourcesGone(fakeGone([], [], [{ AlarmName: names.alarms[0] }]).aws, { region: REGION, stage: REHEARSAL_STAGE, mappingUuids: [] }))).toBe("state_resources_remain");
-    expect(codeOf(() => assertRehearsalResourcesGone(fakeGone([], [], [], [{ logGroupName: names.logGroup }]).aws, { region: REGION, stage: REHEARSAL_STAGE, mappingUuids: [] }))).toBe("state_resources_remain");
-    // A different log group under the same prefix is not this one.
-    expect(codeOf(() => assertRehearsalResourcesGone(fakeGone([], [], [], [{ logGroupName: `${names.logGroup}-other` }]).aws, { region: REGION, stage: REHEARSAL_STAGE, mappingUuids: [] }))).toBe("ok");
-    // An access error is not "gone".
+    return { aws, calls };
+  };
+  const live = () => new Set([names.function, ...names.queues, U1, U2, "96bulls-aws-session-pipeline-aws-rehearse-p1-1126-abc123"]);
+  const T = { accountId: ACCOUNT, region: REGION, stage: REHEARSAL_STAGE };
+
+  it("the pre-destroy manifest records every id: function, role and its disposition, four queues, both mapping UUIDs, five alarms, the log group", () => {
+    const f = fakeAccount(live(), { alarms: names.alarms, group: true });
+    const m = readPhysicalManifest(f.aws, { ...T, roleDisposition: "deleted" });
+    expect(m.function).toEqual({ name: names.function, arn: FN });
+    expect(m.role).toEqual({ arn: ROLE, disposition: "deleted" });
+    expect(m.queues.map((q) => q.name)).toEqual(names.queues);
+    expect(m.mappings.map((x) => x.uuid).sort()).toEqual([U1, U2]);
+    expect(m.alarms).toEqual([...names.alarms].sort());
+    expect(m.logGroup).toBe(names.logGroup);
+    // Missing ids refuse at read time: one mapping only, an alarm missing, the log group missing, a bad disposition.
+    expect(codeOf(() => readPhysicalManifest(fakeAccount(live(), { alarms: names.alarms, group: true, mappings: [{ UUID: U1, EventSourceArn: qArn(names.queues[0]!) }] }).aws, { ...T, roleDisposition: "deleted" }))).toBe("state_manifest_invalid");
+    expect(codeOf(() => readPhysicalManifest(fakeAccount(live(), { alarms: names.alarms.slice(1), group: true }).aws, { ...T, roleDisposition: "deleted" }))).toBe("state_manifest_invalid");
+    expect(codeOf(() => readPhysicalManifest(fakeAccount(live(), { alarms: names.alarms }).aws, { ...T, roleDisposition: "deleted" }))).toBe("state_manifest_invalid");
+    expect(codeOf(() => readPhysicalManifest(f.aws, { ...T, roleDisposition: "kept" }))).toBe("state_manifest_invalid");
+  });
+
+  it("a missing manifest, or one with fewer ids than expected, refuses before anything is checked or deleted", () => {
+    const m = readPhysicalManifest(fakeAccount(live(), { alarms: names.alarms, group: true }).aws, { ...T, roleDisposition: "deleted" });
+    expect(codeOf(() => assertManifestComplete(m, T))).toBe("ok");
+    const fewer: [string, unknown][] = [
+      ["missing", undefined],
+      ["empty", {}],
+      ["one mapping", { ...m, mappings: m.mappings.slice(0, 1) }],
+      ["no mappings", { ...m, mappings: [] }],
+      ["duplicate mapping", { ...m, mappings: [m.mappings[0], m.mappings[0]] }],
+      ["both mappings on the events queue", { ...m, mappings: m.mappings.map((x) => ({ ...x, eventSourceArn: qArn(names.queues[0]!) })) }],
+      ["three queues", { ...m, queues: m.queues.slice(1) }],
+      ["four alarms", { ...m, alarms: m.alarms.slice(1) }],
+      ["no role disposition", { ...m, role: { arn: ROLE } }],
+      ["another stage", { ...m, stage: "aws-proof-sandbox" }],
+      ["another account", { ...m, accountId: "444455556666" }],
+    ];
+    for (const [why, x] of fewer) expect([why, codeOf(() => assertManifestComplete(x, T))]).toEqual([why, "state_manifest_invalid"]);
+    expect(codeOf(() => assertManifestGone(fakeAccount(new Set()).aws, { ...m, mappings: [] }, T))).toBe("state_manifest_invalid");
+  });
+
+  it("partial destroy: each recorded id is checked; a remaining mapping, queue, alarm, log group or role refuses until everything is gone", () => {
+    const m: PhysicalManifest = readPhysicalManifest(fakeAccount(live(), { alarms: names.alarms, group: true }).aws, { ...T, roleDisposition: "deleted" });
+    // After a partial destroy: the function and three queues are gone, one mapping and one queue remain.
+    for (const left of [U2, names.queues[3]!, names.function, "96bulls-aws-session-pipeline-aws-rehearse-p1-1126-abc123"])
+      expect([left, codeOf(() => assertManifestGone(fakeAccount(new Set([left])).aws, m, T))]).toEqual([left, "state_resources_remain"]);
+    expect(codeOf(() => assertManifestGone(fakeAccount(new Set(), { alarms: [names.alarms[4]!] }).aws, m, T))).toBe("state_resources_remain");
+    expect(codeOf(() => assertManifestGone(fakeAccount(new Set(), { group: true }).aws, m, T))).toBe("state_resources_remain");
+    // Everything gone (the role deleted): passes, having checked each recorded id.
+    const done = fakeAccount(new Set());
+    expect(codeOf(() => assertManifestGone(done.aws, m, T))).toBe("ok");
+    const checked = done.calls.map((c) => c.join(" "));
+    for (const id of [FN, ...m.queues.map((q) => q.url), U1, U2]) expect([id, checked.some((c) => c.includes(id))]).toEqual([id, true]);
+    expect(checked.some((c) => c.startsWith("iam get-role"))).toBe(true);
+    // A retained role must be the boundary-pathed one.
+    const kept = { ...m, role: { ...m.role, disposition: "retained" as const } };
+    expect(codeOf(() => assertManifestGone(fakeAccount(new Set(), { roleRetained: true }).aws, kept, T))).toBe("ok");
+    expect(codeOf(() => assertManifestGone(fakeAccount(new Set(["96bulls-aws-session-pipeline-aws-rehearse-p1-1126-abc123"])).aws, kept, T))).toBe("state_resources_remain");
+    // An access error is not "gone", and its text is not echoed.
     let message = "";
     try {
-      assertRehearsalResourcesGone(fakeGone([], [names.function]).aws, { region: REGION, stage: REHEARSAL_STAGE, mappingUuids: [] });
+      assertManifestGone(fakeAccount(new Set(), { denied: "get-event-source-mapping" }).aws, m, T);
     } catch (e) {
       message = (e as Error).message;
     }
     expect(message).toMatch(/state_teardown_failed/);
     expect(message).not.toContain("canary-77");
-    expect(codeOf(() => assertRehearsalResourcesGone(ok.aws, { region: REGION, stage: REHEARSAL_STAGE, mappingUuids: ["not-a-uuid"] }))).toBe("state_teardown_failed");
   });
 
-  it("the recorded mapping UUIDs come from this stage's state objects only", () => {
-    const U = "44444444-4444-4444-8444-444444444444";
-    const calls: string[][] = [];
-    const aws: AwsRun = (args) => {
-      calls.push(args);
-      if (args[2]!.endsWith("session-events-mapping.json")) return JSON.stringify({ status: "created", attr: { uuid: U } });
-      throw new Error("An error occurred (404) NoSuchKey");
-    };
-    expect(recordedMappingUuids(aws, target)).toEqual([U]);
-    expect(calls.map((c) => c[2])).toEqual([`s3://${BUCKET}/${PREFIX}session-events-mapping.json`, `s3://${BUCKET}/${PREFIX}session-search-mapping.json`]);
-    expect(codeOf(() => recordedMappingUuids(() => JSON.stringify({ attr: { uuid: "x" } }), target))).toBe("state_teardown_failed");
+  it("before stage A no stage name may be in use (no existing resource can be adopted by tagging)", () => {
+    expect(codeOf(() => assertRehearsalNamesUnused(fakeAccount(new Set()).aws, { region: REGION, stage: REHEARSAL_STAGE }))).toBe("ok");
+    for (const used of [names.function, names.queues[1]!]) expect([used, codeOf(() => assertRehearsalNamesUnused(fakeAccount(new Set([used])).aws, { region: REGION, stage: REHEARSAL_STAGE }))]).toEqual([used, "state_resources_remain"]);
+    expect(codeOf(() => assertRehearsalNamesUnused(fakeAccount(new Set(), { alarms: [names.alarms[0]!] }).aws, { region: REGION, stage: REHEARSAL_STAGE }))).toBe("state_resources_remain");
+    expect(codeOf(() => assertRehearsalNamesUnused(fakeAccount(new Set(), { group: true }).aws, { region: REGION, stage: REHEARSAL_STAGE }))).toBe("state_resources_remain");
   });
 
-  it("the teardown script checks inputs, the attested caller and the bucket, then the resources, before any delete", () => {
+  it("the teardown script checks inputs, the pin, the attested caller and the bucket, then every manifest id, before any delete", () => {
     const script = src("scripts/rehearsal-state-teardown.ts");
-    const order = ["stateBackendFor(REHEARSAL_STAGE, inputs);", "assertLeaseCaller(aws, accountId, process.env);", "validatePippenStateBucket(aws, { accountId, region });", "assertRehearsalResourcesGone(aws,", "teardownStageState(aws,"].map((s) => script.indexOf(s));
+    const order = [
+      "stateBackendFor(REHEARSAL_STAGE, inputs);",
+      "assertIssuerPin(",
+      "assertLeaseCaller(aws, accountId, process.env);",
+      "validatePippenStateBucket(aws, { accountId, region });",
+      "assertManifestComplete(manifest, target);",
+      "assertManifestGone(aws, manifest, target);",
+      "teardownStageState(aws,",
+    ].map((s) => script.indexOf(s));
+    // The manifest is written once (never overwritten) before any destroy.
+    expect(script).toContain('if (existsSync(manifestPath)) throw new StateBucketError("state_manifest_invalid");');
+    expect(script).toContain('flag: "wx"');
     expect(order.every((n) => n > 0)).toBe(true);
     expect([...order].sort((a, b) => a - b)).toEqual(order);
   });
@@ -408,10 +511,18 @@ describe("the lease session policies", () => {
   it("tags: create only with the rehearsal tag; act only on resources that carry it; the tag cannot be removed", () => {
     const create = lease.managed[1]!.document.Statement as Record<string, unknown>[];
     for (const s of create) expect([s.Sid, (s.Condition as Record<string, Record<string, string>>).StringEquals]).toEqual([s.Sid, { [`aws:RequestTag/${REHEARSAL_TAG.key}`]: REHEARSAL_TAG.value }]);
+    // Tag calls only in their own statement, never beside a create action, and never onto a resource tagged otherwise.
+    for (const s of create.filter((x) => x.Sid !== "Tags")) expect([s.Sid, actions(s).some((a) => /Tag(Queue|Resource)$/.test(a))]).toEqual([s.Sid, false]);
+    expect(create.find((s) => s.Sid === "Tags")).toMatchObject({ Condition: { StringEqualsIfExists: { "aws:ResourceTag/rehearsal": "p1-1126" } } });
     const act = lease.managed[2]!.document.Statement as Record<string, unknown>[];
-    for (const s of act.filter((x) => x.Sid !== "Reads" && x.Sid !== "Mappings"))
+    for (const s of act.filter((x) => !["Reads", "NamedReads", "RoleRead"].includes(x.Sid as string)))
       expect([s.Sid, (s.Condition as Record<string, Record<string, string>>).StringEquals]).toEqual([s.Sid, { [`aws:ResourceTag/${REHEARSAL_TAG.key}`]: REHEARSAL_TAG.value }]);
-    expect(act.find((s) => s.Sid === "Mappings")).toMatchObject({ Condition: { ArnLike: { "lambda:FunctionArn": `arn:aws:lambda:${REGION}:${ACCOUNT}:function:96bulls-aws-rehearse-p1-1126-*` } } });
+    // Mappings: by their own tag and their function, on mapping ARNs only (no function-name wildcard on "*").
+    expect(act.find((s) => s.Sid === "Mappings")).toMatchObject({
+      Resource: `arn:aws:lambda:${REGION}:${ACCOUNT}:event-source-mapping:*`,
+      Condition: { StringEquals: { "aws:ResourceTag/rehearsal": "p1-1126" }, ArnLike: { "lambda:FunctionArn": `arn:aws:lambda:${REGION}:${ACCOUNT}:function:96bulls-aws-rehearse-p1-1126-*` } },
+    });
+    expect(create.find((s) => s.Sid === "Mappings")).toMatchObject({ Resource: `arn:aws:lambda:${REGION}:${ACCOUNT}:event-source-mapping:*` });
     expect((lease.inline.Statement as Record<string, unknown>[]).find((s) => s.Sid === "KeepTag")).toMatchObject({ Effect: "Deny", Condition: { "ForAnyValue:StringEquals": { "aws:TagKeys": ["rehearsal"] } } });
   });
 
@@ -419,11 +530,16 @@ describe("the lease session policies", () => {
     const every = statements.flatMap(actions);
     for (const a of ["lambda:ListAliases", "lambda:ListVersionsByFunction", "lambda:PublishVersion", "lambda:GetFunctionConfiguration", "lambda:ListEventSourceMappings", "cloudwatch:GetMetricStatistics", "cloudwatch:GetMetricData", "logs:StartQuery", "logs:GetQueryResults", "logs:FilterLogEvents", "sqs:GetQueueUrl", "cloudwatch:DescribeAlarms", "logs:DescribeLogGroups", "lambda:GetEventSourceMapping"])
       expect([a, every.includes(a)]).toEqual([a, true]);
-    expect(every.filter((a) => /^(events|secretsmanager|iam):/.test(a))).toEqual([]);
+    expect(every.filter((a) => /^(events|secretsmanager|iam):/.test(a))).toEqual(["iam:GetRole"]);
+    // The unscoped reads are exactly those IAM cannot narrow to a resource.
+    const act = lease.managed[2]!.document.Statement as Record<string, unknown>[];
+    expect(act.find((s) => s.Sid === "Reads")).toMatchObject({ Resource: "*" });
+    expect(actions(act.find((s) => s.Sid === "Reads")!)).toEqual(["lambda:ListEventSourceMappings", "cloudwatch:GetMetricStatistics", "cloudwatch:GetMetricData", "logs:DescribeLogGroups", "logs:GetQueryResults"]);
+    expect(act.find((s) => s.Sid === "NamedReads")!.Resource).toEqual([`arn:aws:sqs:${REGION}:${ACCOUNT}:96bulls-aws-rehearse-p1-1126-*`, `arn:aws:cloudwatch:${REGION}:${ACCOUNT}:alarm:96bulls-aws-rehearse-p1-1126-*`]);
     // Every scoped resource is this stage's, in us-west-2 and the account.
     for (const s of statements.filter((x) => x.Effect === "Allow" && x.Resource !== "*"))
       for (const r of ([] as string[]).concat(s.Resource as string | string[]))
-        expect([s.Sid, r.includes("96bulls-aws-rehearse-p1-1126-") || r.includes(PREFIX) || r === `arn:aws:s3:::${BUCKET}`]).toEqual([s.Sid, true]);
+        expect([s.Sid, r, r.includes("96bulls-aws-rehearse-p1-1126-") || r.includes(PREFIX) || r === `arn:aws:s3:::${BUCKET}` || r.endsWith(":event-source-mapping:*") || r.includes("rehearse-p1-1126-*") || r.endsWith(":role/pippen/workload/*")]).toEqual([s.Sid, r, true]);
     // The policies' inventory: five alarms (the three the pipeline always has plus the two search alarms), matching the doc.
     const names = rehearsalResourceNames();
     expect(names.alarms.length).toBe(5);

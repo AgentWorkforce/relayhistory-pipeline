@@ -158,8 +158,7 @@
             "Sid": "Queues",
             "Effect": "Allow",
             "Action": [
-              "sqs:CreateQueue",
-              "sqs:TagQueue"
+              "sqs:CreateQueue"
             ],
             "Resource": "arn:aws:sqs:us-west-2:<account>:96bulls-aws-rehearse-p1-1126-*",
             "Condition": {
@@ -175,8 +174,7 @@
             "Sid": "Function",
             "Effect": "Allow",
             "Action": [
-              "lambda:CreateFunction",
-              "lambda:TagResource"
+              "lambda:CreateFunction"
             ],
             "Resource": "arn:aws:lambda:us-west-2:<account>:function:96bulls-aws-rehearse-p1-1126-*",
             "Condition": {
@@ -192,10 +190,9 @@
             "Sid": "Mappings",
             "Effect": "Allow",
             "Action": [
-              "lambda:CreateEventSourceMapping",
-              "lambda:TagResource"
+              "lambda:CreateEventSourceMapping"
             ],
-            "Resource": "*",
+            "Resource": "arn:aws:lambda:us-west-2:<account>:event-source-mapping:*",
             "Condition": {
               "DateLessThan": {
                 "aws:CurrentTime": "2026-11-27T08:00:00Z"
@@ -212,8 +209,7 @@
             "Sid": "Alarms",
             "Effect": "Allow",
             "Action": [
-              "cloudwatch:PutMetricAlarm",
-              "cloudwatch:TagResource"
+              "cloudwatch:PutMetricAlarm"
             ],
             "Resource": "arn:aws:cloudwatch:us-west-2:<account>:alarm:96bulls-aws-rehearse-p1-1126-*",
             "Condition": {
@@ -229,8 +225,7 @@
             "Sid": "Logs",
             "Effect": "Allow",
             "Action": [
-              "logs:CreateLogGroup",
-              "logs:TagResource"
+              "logs:CreateLogGroup"
             ],
             "Resource": [
               "arn:aws:logs:us-west-2:<account>:log-group:/aws/lambda/96bulls-aws-rehearse-p1-1126-*",
@@ -242,6 +237,35 @@
               },
               "StringEquals": {
                 "aws:RequestTag/rehearsal": "p1-1126"
+              }
+            }
+          },
+          {
+            "Sid": "Tags",
+            "Effect": "Allow",
+            "Action": [
+              "sqs:TagQueue",
+              "lambda:TagResource",
+              "cloudwatch:TagResource",
+              "logs:TagResource"
+            ],
+            "Resource": [
+              "arn:aws:sqs:us-west-2:<account>:96bulls-aws-rehearse-p1-1126-*",
+              "arn:aws:lambda:us-west-2:<account>:function:96bulls-aws-rehearse-p1-1126-*",
+              "arn:aws:lambda:us-west-2:<account>:event-source-mapping:*",
+              "arn:aws:cloudwatch:us-west-2:<account>:alarm:96bulls-aws-rehearse-p1-1126-*",
+              "arn:aws:logs:us-west-2:<account>:log-group:/aws/lambda/96bulls-aws-rehearse-p1-1126-*",
+              "arn:aws:logs:us-west-2:<account>:log-group:/aws/lambda/96bulls-aws-rehearse-p1-1126-*:*"
+            ],
+            "Condition": {
+              "DateLessThan": {
+                "aws:CurrentTime": "2026-11-27T08:00:00Z"
+              },
+              "StringEquals": {
+                "aws:RequestTag/rehearsal": "p1-1126"
+              },
+              "StringEqualsIfExists": {
+                "aws:ResourceTag/rehearsal": "p1-1126"
               }
             }
           }
@@ -312,10 +336,13 @@
               "lambda:UpdateEventSourceMapping",
               "lambda:DeleteEventSourceMapping"
             ],
-            "Resource": "*",
+            "Resource": "arn:aws:lambda:us-west-2:<account>:event-source-mapping:*",
             "Condition": {
               "DateLessThan": {
                 "aws:CurrentTime": "2026-11-27T08:00:00Z"
+              },
+              "StringEquals": {
+                "aws:ResourceTag/rehearsal": "p1-1126"
               },
               "ArnLike": {
                 "lambda:FunctionArn": "arn:aws:lambda:us-west-2:<account>:function:96bulls-aws-rehearse-p1-1126-*"
@@ -364,13 +391,43 @@
             }
           },
           {
-            "Sid": "Reads",
+            "Sid": "NamedReads",
             "Effect": "Allow",
             "Action": [
               "sqs:GetQueueUrl",
-              "sqs:ListQueues",
+              "cloudwatch:DescribeAlarms"
+            ],
+            "Resource": [
+              "arn:aws:sqs:us-west-2:<account>:96bulls-aws-rehearse-p1-1126-*",
+              "arn:aws:cloudwatch:us-west-2:<account>:alarm:96bulls-aws-rehearse-p1-1126-*"
+            ],
+            "Condition": {
+              "DateLessThan": {
+                "aws:CurrentTime": "2026-11-27T08:00:00Z"
+              }
+            }
+          },
+          {
+            "Sid": "RoleRead",
+            "Effect": "Allow",
+            "Action": [
+              "iam:GetRole"
+            ],
+            "Resource": [
+              "arn:aws:iam::<account>:role/pippen/workload/*",
+              "arn:aws:iam::<account>:role/96bulls-aws-session-pipeline-aws-rehearse-p1-1126-*"
+            ],
+            "Condition": {
+              "DateLessThan": {
+                "aws:CurrentTime": "2026-11-27T08:00:00Z"
+              }
+            }
+          },
+          {
+            "Sid": "Reads",
+            "Effect": "Allow",
+            "Action": [
               "lambda:ListEventSourceMappings",
-              "cloudwatch:DescribeAlarms",
               "cloudwatch:GetMetricStatistics",
               "cloudwatch:GetMetricData",
               "logs:DescribeLogGroups",

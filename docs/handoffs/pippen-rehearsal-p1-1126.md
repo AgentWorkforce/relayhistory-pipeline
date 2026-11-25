@@ -11,6 +11,7 @@ the repository: `<account>` below is the sandbox account, `<session_id>` the lea
 | region | `us-west-2` (the lease denies every other region) |
 | account | `<account>` (from `.96bulls/aws-rehearse-p1-1126/aws-inputs.json`, gitignored; must equal the broker's `PIPPEN_SANDBOX_ACCOUNT_ID`) |
 | caller | `arn:aws:sts::<account>:assumed-role/agent-session/agent-<session_id>`; `<session_id>` = `NINETY_SIX_BULLS_PIPPEN_SESSION` = the broker's `PIPPEN_SANDBOX_SESSION_ID` |
+| issuer pin | `PIPPEN_REHEARSAL_ISSUER_PIN_SHA256` = sha256 of `["aws-rehearse-p1-1126","us-west-2","<account>","<boundary ARN>"]` (JSON), set by the broker at issuance from its own records; the inputs' account and boundary must hash to it |
 | state bucket (shared, never changed) | `pippen-sbx-alchemy-state-<account>-us-west-2-an` |
 | state prefix (this stage only) | `96bulls/96bulls-aws/aws-rehearse-p1-1126/` |
 | resource tag | `rehearsal=p1-1126` on every resource (required on create and on every act by the lease) |
@@ -62,27 +63,31 @@ bound it. Hence:
 
 ## Teardown (this stage's state only)
 
-`bun scripts/rehearsal-state-teardown.ts` (dry run) or `... --execute`, after `alchemy destroy` for
-the stage (or the pippen sweeper) has removed the stage's resources. In order:
+`scripts/rehearsal-state-teardown.ts`, in three uses:
 
-1. Inputs validated as the state layer does (`stateBackendFor`); the caller is the attested lease
-   session (`assertLeaseCaller`); the shared bucket is in shape (`validatePippenStateBucket`).
-2. **Physical resources gone** (`--execute` only, before any state is discarded):
-   `assertRehearsalResourcesGone` reads back the function, each queue and each mapping UUID recorded
-   in this stage's state (`recordedMappingUuids`) and requires not-found for each; the five alarms
-   must list empty and no log group of the function's exact name may remain. Anything still present
-   refuses (`state_resources_remain`); any other failure refuses (`state_teardown_failed`).
-3. List every object version and delete marker under exactly
-   `96bulls/96bulls-aws/aws-rehearse-p1-1126/` (`ListObjectVersions --prefix`, key and version-id
-   markers). Every page is validated strictly: blank or unparseable output, a missing or non-boolean
-   `IsTruncated`, a truncated page without both markers, a non-array `Versions`/`DeleteMarkers`, an
-   unknown field or another `Prefix` refuses. Any key outside the prefix (a sibling stage,
-   `aws-rehearse-p1-1126x/`, a parent key, the prefix itself) refuses before anything is deleted.
-4. `DeleteObjects` by key and version id, 1000 per call, rechecking each batch.
-5. **Empty-prefix evidence**: an independent re-list must show zero versions and zero delete markers
-   (`state_teardown_not_empty` otherwise) before success (`{ listed, deleted, remaining: 0 }`).
+1. **Before any destroy**, `--manifest --role-disposition deleted|retained`: reads every resource
+   id from AWS (`readPhysicalManifest`) and writes the physical manifest
+   `.96bulls/aws-rehearse-p1-1126/physical-manifest.json` (gitignored; it names the account). It
+   records the function ARN, the execution role ARN and its disposition (deleted, or retained as the
+   boundary-pathed role by decision), the four queues (name, URL, ARN), exactly two mapping UUIDs
+   (one on the events queue, one on the search queue), the five alarms and the log group. Every one
+   must exist; fewer ids refuse. The file is written once (`wx`) and never overwritten, so it
+   survives partial destroys.
+2. `alchemy destroy` for the stage (or the pippen sweeper), possibly in several partial passes.
+3. `--execute`: inputs, issuer pin, attested caller and bucket checked; then the manifest must be
+   present and complete (`assertManifestComplete`; missing, or fewer than the expected ids, refuses)
+   and **every recorded id must read back as gone** (`assertManifestGone`): the function by ARN, each
+   queue by URL, each mapping by UUID, the alarms list empty, no log group of the exact name, and
+   the role per its disposition (deleted: not found; retained: present at `/pippen/workload/`). A
+   remaining id refuses (`state_resources_remain`); rerun after the next destroy pass. Only then the
+   state teardown: list every version and delete marker under exactly
+   `96bulls/96bulls-aws/aws-rehearse-p1-1126/` (strict page validation as before; any key outside the
+   prefix refuses before anything is deleted), `DeleteObjects` by key and version id, and an
+   independent re-list that must show zero versions and zero delete markers.
 
-The bucket itself and sibling stages are never touched.
+Without `--execute` it is a dry run (counts only). The bucket itself and sibling stages are never
+touched. Before stage A, `assertRehearsalNamesUnused` requires that none of the stage's names is in
+use, so no existing resource can be adopted into the rehearsal.
 
 ## Lease: issuer mechanism and actions
 
@@ -90,36 +95,49 @@ The broker (layered-infra-ops) issues the lease with `sts:AssumeRole` on the san
 `agent-session` role, session name `agent-<session_id>`, passing:
 
 - `Policy`: the inline session policy (`inline`, 768 compact characters, under the 2,048 packed
-  limit with room for the ARNs and tags), holding the denies: everything at and after the effective
-  end, every non-IAM/STS/S3 call outside `us-west-2`, any write to a `pippen-sbx-alchemy-state-*`
-  bucket, and removing the `rehearsal` tag;
+  limit), holding the denies: everything at and after the effective end, every non-IAM/STS/S3 call
+  outside `us-west-2`, any write to a `pippen-sbx-alchemy-state-*` bucket, and removing the
+  `rehearsal` tag;
 - `PolicyArns`: three customer-managed policies the broker creates from `managed`
-  (`96bulls-rehearse-p1-1126-state`, `-create`, `-act`; each well under 6,144 characters);
-- `DurationSeconds`: no more than `rehearsalLeaseEnd({ issuedAt })` minus issuance (at most 6 h).
+  (`96bulls-rehearse-p1-1126-state` 1,500, `-create` 2,468, `-act` 3,239 characters; limit 6,144);
+- `DurationSeconds`: no more than `rehearsalLeaseEnd({ issuedAt })` minus issuance (at most 6 h);
+- the environment `pippen sandbox exec` gives the session: `PIPPEN_SANDBOX_ACCOUNT_ID`,
+  `PIPPEN_SANDBOX_SESSION_ID` and `PIPPEN_REHEARSAL_ISSUER_PIN_SHA256`.
 
-The session's permissions are the role's policies intersected with these session policies, so
-nothing the role grants beyond them is usable. The actions:
+The session's permissions are the role's policies intersected with these session policies. The actions:
 
 - `-state`: `s3:ListBucket`/`ListBucketVersions` only with `s3:prefix` like the stage prefix;
-  `s3:GetObject`, `GetObjectVersion`, `PutObject`, `DeleteObject`, `DeleteObjectVersion` only on
-  `<bucket>/96bulls/96bulls-aws/aws-rehearse-p1-1126/*`; the bucket's five settings readable;
-  explicit denies on listing other prefixes and on object access outside the prefix.
-- `-create` (only with `aws:RequestTag/rehearsal = p1-1126`, names `96bulls-aws-rehearse-p1-1126-*`):
-  `sqs:CreateQueue`, `TagQueue`; `lambda:CreateFunction`, `TagResource`;
-  `lambda:CreateEventSourceMapping` (only for the stage's function, `lambda:FunctionArn`);
-  `cloudwatch:PutMetricAlarm`, `TagResource`; `logs:CreateLogGroup`, `TagResource`.
-- `-act` (only on resources tagged `rehearsal = p1-1126`): queue attributes, messages and deletion;
+  object reads, writes and deletes only on `<bucket>/96bulls/96bulls-aws/aws-rehearse-p1-1126/*`;
+  the bucket's five settings readable; explicit denies on other prefixes and other objects.
+- `-create`, only with `aws:RequestTag/rehearsal = p1-1126` and the stage's names:
+  `sqs:CreateQueue`, `lambda:CreateFunction`, `lambda:CreateEventSourceMapping` (on
+  `event-source-mapping:*`, only for the stage's function by `lambda:FunctionArn`),
+  `cloudwatch:PutMetricAlarm`, `logs:CreateLogGroup`. Tagging (`sqs:TagQueue`,
+  `lambda:TagResource`, `cloudwatch:TagResource`, `logs:TagResource`) is a separate statement: the
+  request must carry `rehearsal = p1-1126` and the resource, if it already has a `rehearsal` tag,
+  must carry that value. IAM cannot tell create-time tagging from a standalone tag call for these
+  services, so an untagged existing resource is excluded in code: `assertRehearsalNamesUnused`
+  before stage A (no stage name may exist).
+- `-act`, only on resources tagged `rehearsal = p1-1126`: queue attributes, messages and deletion;
   the function's reads, updates, `PublishVersion`, `ListAliases`, `ListVersionsByFunction`,
-  permissions, tags, invoke and deletion; the mappings' get, update and delete (by
-  `lambda:FunctionArn`, as mappings are not tag-scoped here); alarm put, delete and tag reads; the
-  log group's retention, deletion, tag reads, `StartQuery` and `FilterLogEvents`; and reads that
-  cannot be scoped: `sqs:GetQueueUrl`, `sqs:ListQueues`, `lambda:ListEventSourceMappings`,
-  `cloudwatch:DescribeAlarms`, `GetMetricStatistics`, `GetMetricData`, `logs:DescribeLogGroups`,
-  `GetQueryResults`.
-- Not granted: any EventBridge, Secrets Manager or IAM action (see the inventory).
+  permissions, tag reads, invoke and deletion; the mappings' get, update and delete on
+  `event-source-mapping:*` by their own tag **and** `lambda:FunctionArn` (the UUIDs do not exist
+  before creation; teardown checks each recorded UUID); alarm put and delete; the log group's
+  retention, deletion, tag reads, `StartQuery` and `FilterLogEvents`.
+- Reads narrowed to the stage's names (no tag condition, since they must also answer "not found"):
+  `sqs:GetQueueUrl` and `cloudwatch:DescribeAlarms`; `iam:GetRole` only on
+  `role/pippen/workload/*` and `role/96bulls-aws-session-pipeline-aws-rehearse-p1-1126-*` (the
+  role-disposition check).
+- **Reads IAM cannot narrow** (resource `*`): `lambda:ListEventSourceMappings` (no resource-level
+  permission), `cloudwatch:GetMetricStatistics` and `cloudwatch:GetMetricData` (no resource-level
+  permission and no namespace or dimension condition key for reads; `cloudwatch:namespace` applies
+  to `PutMetricData` only), `logs:DescribeLogGroups` and `logs:GetQueryResults` (no resource-level
+  permission; the query itself, `logs:StartQuery`, is limited to the stage's log group, so results
+  can only come from it).
+- Not granted: any EventBridge or Secrets Manager action, and no IAM action besides `GetRole`.
 
-Tag-condition support (`aws:RequestTag`/`aws:ResourceTag` per action) follows the AWS service
-authorization reference; it was not exercised against AWS here.
+Tag-condition support (`aws:RequestTag`/`aws:ResourceTag` per action and resource type) follows the
+AWS service authorization reference; it was not exercised against AWS here.
 
 ## Lease lifetime
 
@@ -136,15 +154,27 @@ The effective lease must end at the **earliest** of:
 refused, never silently shortened. The checked-in document is the template without `issuedAt` (the
 absolute cutoff); the broker generates the issued one.
 
-## What the broker must attest
+## What the broker must attest, and the receipts required
 
-Code checks the caller (STS: exactly `agent-session/agent-<session_id>` in `<account>`) and requires
-`PIPPEN_SANDBOX_ACCOUNT_ID` and `PIPPEN_SANDBOX_SESSION_ID` from `pippen sandbox exec`, equal to the
-inputs' account and `NINETY_SIX_BULLS_PIPPEN_SESSION`. The real account id is not in the repository,
-so the code cannot prove the account is the approved sandbox; the broker must attest, for the
-recorded run: the account is the approved non-prod sandbox; the lease UUID is the one issued for
-this rehearsal; the lease was issued with exactly these session policies and `DurationSeconds`; its
-issuance time; and its revocation at teardown.
+Code checks: the issuer pin (inputs' account and boundary hash to the broker's pin), the lease env
+(`PIPPEN_SANDBOX_ACCOUNT_ID`, `PIPPEN_SANDBOX_SESSION_ID` equal to the inputs' account and
+`NINETY_SIX_BULLS_PIPPEN_SESSION`), and STS (exactly `agent-session/agent-<session_id>` in that
+account). The real account id is not in the repository, so the pin is the broker's attestation: it
+must be computed from the broker's own record of the approved sandbox account and boundary, never
+from the stage inputs.
+
+Generating policies does not issue or revoke anything. The rehearsal record needs these broker
+receipts (kept outside the repository, referenced by hash in the run's handoff):
+
+1. The issuer pin and the records it was computed from (approved account and boundary).
+2. For each managed session policy: its ARN, the default version id, and the sha256 of that
+   version's document, equal to the generated `managed[n].document` (canonical JSON).
+3. The sha256 of the inline session policy passed, equal to the generated `inline`.
+4. The AssumeRole receipt: request id, role and session name, `DurationSeconds`, and the
+   credentials' `Expiration` (not later than `rehearsalLeaseEnd({ issuedAt })`).
+5. Revocation at teardown completion: the revocation action taken (for example the role's
+   revoke-older-sessions deny, or deleting the managed policy versions) with its time, and a
+   failed call with the lease's credentials after it.
 
 ## Not covered (blockers before the rehearsal can run)
 
@@ -164,3 +194,5 @@ issuance time; and its revocation at teardown.
 - The lease policies are documents and a generator; creating and attaching them is the broker's step.
 - The broker reviewed source and Node only; the Bun test counts are author-reported (reproduction
   commands in the handoff report).
+- The issuance itself (pin, policy versions, STS duration) and the revocation are the broker's, and
+  their receipts (above) are not produced by this code.
