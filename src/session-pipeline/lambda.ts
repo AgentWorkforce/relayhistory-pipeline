@@ -42,7 +42,8 @@ import { largeReadJobState, routeLargeRead } from "./large-read-worker.ts";
  * unless BUFFERED_SEARCH_FEED_GATE_DECLARED equals the read gate's contract id
  * SEARCH_JOBS_ENABLED=1 (only the literal "1"; default off; needs SEARCH_INDEX_ENABLED=1) runs the committed search
  * wake's consumer (docs/handoffs/incremental-search-indexing.md §5.1, search-jobs.ts): after every SQS batch the
- * invocation claims up to SEARCH_JOBS_CLAIM (1-20, default 5) open `search-index` jobs and runs them, and the
+ * invocation claims (one at a time, through claim_search_jobs_v1) and runs up to SEARCH_JOBS_CLAIM (1-20, default 5)
+ * open `search-index` jobs, settling each through settle_search_job_v1 (its only search SQL), and the
  * {"searchJobs": true} schedule does the same without SQS traffic. SEARCH_WAKE_ENQUEUE=1 (only "1"; default off)
  * writes the managed wake in the publication-authority transaction (migration 20261105062300 and the owner's
  * EXECUTE grant first). Off, neither touches the stage.
@@ -876,37 +877,35 @@ function searchJobsDeadline(env: LambdaEnv, context?: LambdaInvocationContext): 
 export interface SearchJobsSummary { claimed: number; acked: number; retried: number; exhausted: number; lost: number; failed: number }
 
 /**
- * The Lambda consumer's search-job loop (design §5.1, §3.3): claim up to `claim` open search-index jobs, run each
- * pass (runSearchJob) and settle it through the stage-specific, lease-bound settlement. A pass error is a retry
- * (exhausted past the budget); a settlement error is logged and the lease expires into a reclaim. Jobs left when
- * the deadline arrives are released for the next claim.
+ * The Lambda consumer's search-job loop (design §5.1, §3.3): up to `claim` passes, each claimed one at a time through
+ * claim_search_jobs_v1 just before it runs (so the deadline never strands a claimed job, and no claimed attempt is
+ * spent without a pass), run (runSearchJob) and settled through settle_search_job_v1. A pass error is a retry; the
+ * server derives the backoff and the exhaustion from its receipt. A settlement error is logged and the lease expires
+ * into a reclaim.
  */
 export async function drainSearchJobs(deps: { sql: SearchSql; search: SearchIndexDeps; claim: number; deadline?: () => boolean }): Promise<SearchJobsSummary> {
   const summary: SearchJobsSummary = { claimed: 0, acked: 0, retried: 0, exhausted: 0, lost: 0, failed: 0 };
-  if (deps.deadline?.()) return summary;
-  const jobs = await claimSearchJobs(deps.sql, deps.claim);
-  summary.claimed = jobs.length;
-  for (const job of jobs) {
+  for (let n = 0; n < deps.claim; n++) {
+    if (deps.deadline?.()) break;
+    const [job] = await claimSearchJobs(deps.sql, 1);
+    if (!job) break;
+    summary.claimed += 1;
     const started = Date.now();
     try {
-      if (deps.deadline?.()) {
-        // Out of time before this pass started: hand it back for the next claim (the counted attempt stays).
-        if (!(await settleSearchJob(deps.sql, job, { retry: 0 })).applied) summary.lost += 1;
-        else summary.retried += 1;
-        continue;
-      }
       let result: Awaited<ReturnType<typeof runSearchJob>> | { error: unknown };
       try { result = await runSearchJob(job.claimedMessage, { search: deps.search }); }
       catch (error) { result = { error }; }
       const outcome = searchSettlementFor(result, job.attempts);
       const settled = await settleSearchJob(deps.sql, job, outcome);
+      // The server decides retry vs exhaustion (settle_search_job_v1): count what it did, not what was asked.
+      const exhausted = settled.applied && (settled.action === "parked" || settled.action === "parked_reopened");
       if (!settled.applied) summary.lost += 1;
       else if (outcome === "done") summary.acked += 1;
-      else if (outcome === "exhausted") summary.exhausted += 1;
+      else if (exhausted) summary.exhausted += 1;
       else summary.retried += 1;
       const fields = { ...searchJobLogFields(job, result), ok: outcome === "done" && settled.applied, state: settled.applied ? settled.action : "lease_lost", duration_ms: Date.now() - started };
       if ("error" in result) log.error("search job failed", fields);
-      else if (outcome === "exhausted") log.error("search job exhausted", fields);
+      else if (exhausted) log.error("search job exhausted", fields);
       else log.info("search job settled", fields);
     } catch (error) {
       summary.failed += 1;

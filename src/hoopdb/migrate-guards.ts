@@ -390,6 +390,7 @@ export const RUNTIME_APPLICATION_FUNCTIONS = [
   "sessions.canonical_remote(text)",
   "sessions.capture_session_replay_pages(text,text,text,text)",
   "sessions.claim_search_feature_copy(text,text,text,uuid)",
+  "sessions.claim_search_jobs_v1(integer)",
   "sessions.claim_session_analysis_cache()",
   "sessions.claim_session_brief_documents(uuid,integer)",
   "sessions.claim_session_large_read(uuid,integer)",
@@ -454,6 +455,7 @@ export const RUNTIME_APPLICATION_FUNCTIONS = [
   "sessions.session_publication_register_object(jsonb)",
   "sessions.set_session_state(text,text,text,text,text,text,timestamp with time zone)",
   "sessions.set_session_state_for_publication(text,text,text,text,text,text,bigint,text,timestamp with time zone,text)",
+  "sessions.settle_search_job_v1(bigint,uuid,text)",
   "sessions.summary_regeneration_audit_append_v1(jsonb)",
   "sessions.summary_regeneration_audit_purge_v1(integer)",
   "sessions.upsert_machine(text,text,text,text,text,text,timestamp with time zone)",
@@ -1679,7 +1681,7 @@ export const SESSIONS_FUNCTION_EVENT_TRIGGER_TAGS: readonly string[] =
  * `__RUNTIME_ROLE__`: exactly the reviewed body in the bootstrap file.
  */
 export const SESSIONS_FUNCTION_EVENT_TRIGGER_PROSRC_SHA256 =
-  "cf2e40ff987964811ce4e71b0962430c746f83b5075e24b818c1eba9ef847e77";
+  "9b95a37b4510cbe7d0fc7a8760d9dead8468a311b39629388d1b97c5fd912fd7";
 export const SESSIONS_FUNCTION_EVENT_TRIGGER_PROCONFIG: readonly string[] =
   Object.freeze(["search_path=pg_catalog, pg_temp"]);
 const RUNTIME_LITERAL = /v_runtime text := '([a-z_][a-z0-9_]{0,62})';/g;

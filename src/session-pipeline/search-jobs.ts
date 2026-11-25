@@ -15,11 +15,15 @@
  * register the stage (a plain delete on done would lose a newer wake that arrived during the pass). The hosted
  * consumer is the session-pipeline Lambda (lambda.ts, SEARCH_JOBS_ENABLED, default off).
  *
- * Roles. Migration 20261105062300 carries the producer's queue guard: a search-index row is written only by the
- * schema owner (through its SECURITY DEFINER functions) and leased or acknowledged only by the owner or the dedicated
- * `bulls96_search_wake_consumer` role. Claims and settlement therefore run as that consumer role (or the owner); the
- * message-writing paths here (enqueueSearchWake, so the catch-up and the replay) need the owner. Provisioning and
- * granting those roles is a separate, approved owner step.
+ * Roles (least privilege). The runtime boundary of the stage is exactly two SECURITY DEFINER functions of migration
+ * 20261105062300: sessions.claim_search_jobs_v1 (claimSearchJobs) and sessions.settle_search_job_v1 (settleSearchJob).
+ * The runtime role (the Lambda) holds EXECUTE on those two only; it needs no search-index row DML (the queue guard
+ * refuses it) and never sees the owner-only claim receipts (sessions.search_job_claims). Settlement takes the claimed
+ * epoch, message and attempt from the server's receipt and derives the backoff and exhaustion from server policy.
+ * Operator paths, run with owner (or, for the archive, service_role) credentials and never granted to the runtime
+ * role: enqueueSearchWake, replaySearchDeadLetter, catchUpTick and parkSearchJobs (TypeScript over the guarded queue,
+ * which admits search-index writes only from the schema owner) and archiveSearchStage (archive_search_stage_v1,
+ * EXECUTE to service_role only). A future scheduled catch-up needs its own scoped grant.
  */
 import { deadLetterId, isStageMessage, type StageMessage } from "@rhc/lib/pipeline/dlq.ts";
 import { pipelineEventKey } from "@rhc/lib/pipeline/events.ts";
@@ -46,12 +50,12 @@ export const SEARCH_JOB_MAX_ATTEMPTS = STAGE_REGISTRY[SEARCH_INDEX_STAGE].maxAtt
 export const SEARCH_JOBS_DEFAULT_CLAIM = 5;
 /** §6: scopes one catch-up tick visits. */
 export const SEARCH_CATCHUP_DEFAULT_PAGE = 500;
-/** A claim holds its rows this long; a worker that dies leaves them to be reclaimed after it. */
+/** The server's lease (claim_search_jobs_v1); a worker that dies leaves its rows to be reclaimed after it. Mirrors SQL. */
 export const SEARCH_JOB_LEASE_SECONDS = 300;
 /** `scope_busy`: retried after this short delay (coalesced into the one row). */
 export const SEARCH_JOB_BUSY_RETRY_SECONDS = 30;
 
-/** §4.5: the registry backoff, 30 s · 2^(n-1) capped at 900 s, for the attempt that just failed. */
+/** §4.5: the registry backoff, 30 s · 2^(n-1) capped at 900 s, for the attempt that just failed (settle_search_job_v1's policy). */
 export const searchJobBackoffSeconds = (attempt: number) => Math.min(900, 30 * 2 ** Math.max(0, attempt - 1));
 
 export type SearchClock = { source: "publish" | "pointer"; at: string };
@@ -157,10 +161,10 @@ async function enqueueSearchWakes(sql: SqlExecutor, messages: readonly SearchWak
 }
 
 // ---------------------------------------------------------------------------------------------------------
-// §3.2 claim
+// §3.2 claim, §3.3 settlement: the runtime boundary (migration 20261105062300)
 // ---------------------------------------------------------------------------------------------------------
 
-/** What a claim hands the pass and its settlement: the lease and the claim-time snapshot of the message. */
+/** What a claim hands the pass and its settlement: the lease and the server's stored claim-time snapshot. */
 export interface ClaimedSearchJob {
   id: string;
   lease: string;
@@ -170,120 +174,50 @@ export interface ClaimedSearchJob {
   claimedMessage: SearchWakeMessage;
 }
 
-/** §3.2: the generic claim with stage = 'search-index', a lease per row and a counted attempt; never a dlq row. */
-export async function claimSearchJobs(sql: SqlExecutor, n: number, opts: { leaseSeconds?: number } = {}): Promise<ClaimedSearchJob[]> {
+/**
+ * §3.2 through sessions.claim_search_jobs_v1 (SECURITY DEFINER): up to n visible, non-dlq search-index rows, a lease
+ * per row (the server's 300 s), a counted attempt, and the claim receipt the server keeps. The server clamps n to
+ * 1..10. What is returned is the STORED receipt (message, epoch, attempt); settlement reads it back from the server,
+ * never from here.
+ */
+export async function claimSearchJobs(sql: SqlExecutor, n: number): Promise<ClaimedSearchJob[]> {
   const limit = Math.max(0, Math.floor(n));
   if (!limit) return [];
-  const lease = Math.max(1, Math.floor(opts.leaseSeconds ?? SEARCH_JOB_LEASE_SECONDS));
-  const { rows } = await sql.query<{ id: string; lease: string; attempts: number; message: SearchWakeMessage }>(
-    `WITH next AS (
-       SELECT id FROM sessions.pipeline_jobs
-        WHERE stage = 'search-index' AND visible_at <= now() AND NOT dlq
-        ORDER BY visible_at, id
-        LIMIT $1
-        FOR UPDATE SKIP LOCKED
-     )
-     UPDATE sessions.pipeline_jobs AS j
-        SET lease_id = gen_random_uuid(),
-            visible_at = now() + make_interval(secs => $2::integer),
-            attempts = j.attempts + 1
-       FROM next
-      WHERE j.id = next.id
-     RETURNING j.id::text AS id, j.lease_id::text AS lease, j.attempts, j.message`,
-    [limit, lease],
-  );
+  const { rows } = await sql.query<{ id: string; lease: string; attempts: number; epoch: string; message: SearchWakeMessage }>(
+    `SELECT c.job_id::text AS id, c.lease_id::text AS lease, c.attempts, c.epoch::text AS epoch, c.message
+       FROM sessions.claim_search_jobs_v1($1::integer) AS c`,
+    [limit]);
   return rows
-    .map((r) => ({ id: r.id, lease: r.lease, attempts: Number(r.attempts), claimedEpoch: Number(r.message?.payload?.epoch), claimedMessage: r.message }))
+    .map((r) => ({ id: r.id, lease: r.lease, attempts: Number(r.attempts), claimedEpoch: Number(r.epoch), claimedMessage: r.message }))
     .sort((a, b) => Number(BigInt(a.id) - BigInt(b.id)));
 }
 
-// ---------------------------------------------------------------------------------------------------------
-// §3.3 settlement (+ §3.3b completion)
-// ---------------------------------------------------------------------------------------------------------
-
+/**
+ * What the caller asks for. The server decides the rest: `{ retry }`'s delay is ignored (server backoff
+ * min(900, 30 * 2^(attempt-1)) s) and `exhausted` is a retry the server exhausts only at its own max attempts (12).
+ */
 export type SearchSettleOutcome = "done" | { retry: number } | "exhausted";
 export type SearchSettleResult =
   | { applied: false }
   | { applied: true; action: "deleted" | "reopened" | "retried" | "parked" | "parked_reopened" };
-type SettleClaim = { id: string | number; lease: string; claimedEpoch: number; claimedMessage: StageMessage; attempts?: number };
-
-/** Reopen the single row now with a fresh budget: the wanted epoch moved on during the lease. */
-const REOPEN_SQL = `UPDATE sessions.pipeline_jobs SET lease_id = NULL, visible_at = now(), attempts = 0
-  WHERE id = $1::bigint AND lease_id = $2::uuid AND stage = 'search-index' RETURNING id`;
-/** Delete the row only if no newer epoch merged into it during the lease. */
-const GUARDED_DELETE_SQL = `DELETE FROM sessions.pipeline_jobs WHERE id = $1::bigint AND lease_id = $2::uuid AND stage = 'search-index'
-  AND (message->'payload'->>'epoch')::bigint <= $3::bigint RETURNING id`;
+/**
+ * The job and its lease. claimedEpoch, claimedMessage and attempts are accepted for compatibility (the accepted
+ * tests and the Lambda pass a whole ClaimedSearchJob) and IGNORED: the server's claim receipt is authoritative.
+ */
+type SettleClaim = { id: string | number; lease: string; claimedEpoch?: unknown; claimedMessage?: unknown; attempts?: unknown };
 
 /**
- * §3.3: the stage-specific settlement. Every statement keys on (id, lease); a lost lease (0 rows) returns
- * `{ applied: false }` and changes nothing.
+ * §3.3 (+ §3.3b completion) through sessions.settle_search_job_v1 (SECURITY DEFINER, one transaction): bound to the
+ * stage, the job, the current unexpired lease and the receipt's recorded epoch and message. A lost, expired or
+ * replaced lease, another stage's job or a second settlement returns `{ applied: false }` and changes nothing.
  */
-export async function settleSearchJob(sql: SearchSql, claim: SettleClaim, outcome: SearchSettleOutcome): Promise<SearchSettleResult> {
-  const id = String(claim.id), lease = claim.lease, epoch = claim.claimedEpoch;
-  if (!SAFE_EPOCH(epoch)) throw new Error("search settle: claimed epoch invalid");
-  const m = claim.claimedMessage;
-  const attempt = claim.attempts ?? 1;
-  const discriminator = `${m.workKey}@${epoch}`;
-  if (outcome === "done") {
-    return atomically(sql, async (tx) => {
-      const deleted = await tx.query(GUARDED_DELETE_SQL, [id, lease, epoch]);
-      if (deleted.rows.length) {
-        // §3.3b completion, keyed by SCOPE: the completed epoch covers a replaying letter at or below it.
-        await tx.query(
-          `UPDATE sessions.pipeline_dead_letters SET state = 'resolved', resolved_at = now(),
-                  resolution = CASE WHEN (message->'payload'->>'epoch')::bigint = $2::bigint THEN 'completed' ELSE 'superseded' END
-            WHERE id = $1 AND stage = 'search-index' AND state = 'replaying'
-              AND (message->'payload'->>'epoch')::bigint <= $2::bigint`,
-          [searchLetterId(m), epoch]);
-        await recordEvent(tx, m, "ok", attempt, discriminator, { attrs: { epoch } });
-        return { applied: true, action: "deleted" } as const;
-      }
-      // 0 rows: the wanted epoch moved on during the pass (or the lease is gone): reopen instead of deleting.
-      const reopened = await tx.query(REOPEN_SQL, [id, lease]);
-      if (!reopened.rows.length) return { applied: false } as const;
-      await recordEvent(tx, m, "ok", attempt, discriminator, { attrs: { epoch, reason: "newer_epoch_reopened" } });
-      return { applied: true, action: "reopened" } as const;
-    });
-  }
-  if (outcome === "exhausted") {
-    // One transaction bound to the lease: park the CLAIMED message only, then delete or reopen.
-    return atomically(sql, async (tx) => {
-      const letterId = searchLetterId(m);
-      const parked = await tx.query(
-        `INSERT INTO sessions.pipeline_dead_letters AS d
-                (id, stage, trace_id, org_id, workspace_id, session_id, machine_id, message, first_dead_at, last_dead_at)
-         SELECT $3, 'search-index', j.trace_id, j.org_id, j.workspace_id, j.session_id, j.machine_id, $4::jsonb, now(), now()
-           FROM sessions.pipeline_jobs j WHERE j.id = $1::bigint AND j.lease_id = $2::uuid AND j.stage = 'search-index'
-         ON CONFLICT (id) DO UPDATE SET message = EXCLUDED.message, state = 'dead', last_dead_at = EXCLUDED.last_dead_at,
-                dead_count = d.dead_count + 1, resolved_at = NULL, resolution = NULL,
-                session_id = COALESCE(EXCLUDED.session_id, d.session_id), machine_id = COALESCE(EXCLUDED.machine_id, d.machine_id)
-         RETURNING d.id, d.dead_count`,
-        [id, lease, letterId, JSON.stringify(m)]);
-      // The lease was lost: nothing is parked, deleted or reopened.
-      if (!parked.rows.length) return { applied: false } as const;
-      await recordEvent(tx, m, "dead_lettered", attempt, `${discriminator}:${(parked.rows[0] as { dead_count: number }).dead_count}`,
-        { error: { code: "search_index_held_exhausted", retryable: false }, attrs: { epoch, dead_letter_id: letterId } });
-      const deleted = await tx.query(GUARDED_DELETE_SQL, [id, lease, epoch]);
-      if (deleted.rows.length) return { applied: true, action: "parked" } as const;
-      // A newer wake arrived during the lease: keep the row, with a fresh budget, visible now.
-      const reopened = await tx.query(REOPEN_SQL, [id, lease]);
-      if (!reopened.rows.length) throw new Error("search settle: lease lost inside the exhausted settlement");
-      return { applied: true, action: "parked_reopened" } as const;
-    });
-  }
-  const backoff = Math.max(0, Math.floor(outcome.retry));
-  return atomically(sql, async (tx) => {
-    const { rows } = await tx.query(
-      `UPDATE sessions.pipeline_jobs
-          SET lease_id = NULL,
-              visible_at = CASE WHEN (message->'payload'->>'epoch')::bigint > $3::bigint THEN now() ELSE now() + make_interval(secs => $4::integer) END,
-              attempts   = CASE WHEN (message->'payload'->>'epoch')::bigint > $3::bigint THEN 0 ELSE attempts END
-        WHERE id = $1::bigint AND lease_id = $2::uuid AND stage = 'search-index' RETURNING id`,
-      [id, lease, epoch, backoff]);
-    if (!rows.length) return { applied: false } as const;
-    await recordEvent(tx, m, "retrying", attempt, discriminator, { attrs: { epoch, delay_seconds: backoff } });
-    return { applied: true, action: "retried" } as const;
-  });
+export async function settleSearchJob(sql: SqlExecutor, claim: SettleClaim, outcome: SearchSettleOutcome): Promise<SearchSettleResult> {
+  const wire = outcome === "done" ? "done" : "retry";
+  const { rows } = await sql.query<{ r: SearchSettleResult }>(
+    "SELECT sessions.settle_search_job_v1($1::bigint, $2::uuid, $3::text) AS r", [String(claim.id), claim.lease, wire]);
+  const r = rows[0]?.r;
+  if (!r || r.applied !== true) return { applied: false };
+  return { applied: true, action: r.action };
 }
 
 // ---------------------------------------------------------------------------------------------------------
@@ -530,6 +464,8 @@ export async function parkSearchJobs(sql: SearchSql, opts: { operator: string })
     if (inserted.rows.length !== rows.length) throw new Error("search park: letter count differs from the parked rows");
     const deleted = await tx.query("DELETE FROM sessions.pipeline_jobs WHERE stage = 'search-index' RETURNING id");
     if (deleted.rows.length !== rows.length) throw new Error("search park: deleted count differs from the parked rows");
+    // A parked row's claim receipt (a straggler's lease) goes with it: no settlement can apply to a deleted row.
+    await tx.query("DELETE FROM sessions.search_job_claims WHERE job_id = ANY($1::bigint[])", [rows.map((r) => r.id)]);
     const deadCount = new Map(inserted.rows.map((r) => [r.id, r.dead_count]));
     for (const r of rows) {
       const letter = searchLetterId(r.message);
@@ -570,7 +506,10 @@ export async function archiveSearchStage(sql: SqlExecutor): Promise<{ letters: n
 // The settlement a pass result maps to (the consumer loop, lambda.ts)
 // ---------------------------------------------------------------------------------------------------------
 
-/** What the consumer loop settles a pass with: done, a retry delay, or exhaustion past the attempt budget. */
+/**
+ * What the consumer loop asks a pass to be settled with: done, or a retry (named `exhausted` past the attempt budget,
+ * for the log). The delay and the exhaustion are the server's (settle_search_job_v1); these values are advisory.
+ */
 export function searchSettlementFor(result: SearchJobResult | { error: unknown }, attempts: number): SearchSettleOutcome {
   if ("error" in result || result.outcome === "held") {
     return attempts >= SEARCH_JOB_MAX_ATTEMPTS ? "exhausted" : { retry: searchJobBackoffSeconds(attempts) };

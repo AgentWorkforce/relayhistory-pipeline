@@ -173,6 +173,10 @@
       "<owner>:EXECUTE",
       "service_role:EXECUTE"
     ],
+    "sessions.claim_search_jobs_v1(integer)": [
+      "<owner>:EXECUTE",
+      "service_role:EXECUTE"
+    ],
     "sessions.claim_session_analysis_cache()": [
       "<owner>:EXECUTE",
       "service_role:EXECUTE"
@@ -1486,6 +1490,12 @@
     "sessions.search_feature_copy_state_valid(jsonb)": [
       "<owner>:EXECUTE"
     ],
+    "sessions.search_job_claim_attempts_v1()": [
+      "<owner>:EXECUTE"
+    ],
+    "sessions.search_letter_id_v1(text,text,text)": [
+      "<owner>:EXECUTE"
+    ],
     "sessions.search_reconcile_abandon_v1(bigint,uuid,text)": [
       "<owner>:EXECUTE",
       "search_consumer_runtime:EXECUTE"
@@ -1829,6 +1839,10 @@
       "service_role:EXECUTE"
     ],
     "sessions.set_session_state_for_publication(text,text,text,text,text,text,bigint,text,timestamp with time zone,text)": [
+      "<owner>:EXECUTE",
+      "service_role:EXECUTE"
+    ],
+    "sessions.settle_search_job_v1(bigint,uuid,text)": [
       "<owner>:EXECUTE",
       "service_role:EXECUTE"
     ],

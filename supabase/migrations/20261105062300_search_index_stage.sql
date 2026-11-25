@@ -10,8 +10,10 @@
 -- proposal's publication_private.search_stage_checks bookkeeping is not needed; and the consumer role is not
 -- required to exist here (the guard compares its name only; provisioning it is a separate owner step).
 --
--- Consumer half: sessions.search_catchup_cursor (§6), pipeline_dead_letters.resolution (§3.3b) and the sealed,
--- append-only sessions.search_stage_archive with its only write path sessions.archive_search_stage_v1() (§7, §8).
+-- Consumer half: sessions.search_catchup_cursor (§6), pipeline_dead_letters.resolution (§3.3b), the sealed,
+-- append-only sessions.search_stage_archive with its only write path sessions.archive_search_stage_v1() (§7, §8), and
+-- the runtime boundary: sessions.claim_search_jobs_v1 / sessions.settle_search_job_v1 (SECURITY DEFINER, the only
+-- functions of the stage the runtime role may execute) over the owner-only claim receipts sessions.search_job_claims.
 -- The rollback (supabase/rollbacks/20261105062300_search_index_stage.down.sql) refuses while any search-index
 -- job, event or dead letter exists (§8) and never drops the archive or its seal, empty or not.
 SET LOCAL lock_timeout = '5s';
@@ -357,3 +359,186 @@ GRANT EXECUTE ON FUNCTION sessions.archive_search_stage_v1() TO service_role;
 
 REVOKE ALL ON sessions.search_stage_archive FROM PUBLIC, anon, authenticated, service_role;
 GRANT SELECT ON sessions.search_stage_archive TO service_role;
+
+-- §3.2, §3.3 [least privilege]: the runtime boundary of the stage is exactly two stage-scoped SECURITY DEFINER
+-- functions, sessions.claim_search_jobs_v1(integer) and sessions.settle_search_job_v1(bigint, uuid, text). The runtime
+-- role (the Lambda) gets EXECUTE on these two and nothing else of the stage: no search-index row DML (the queue guard
+-- above still refuses it), no replay, catch-up, park or archive (operator paths, service_role or the owner only).
+--
+-- The claim receipt: what a claim saw, persisted with its lease, owner-only. Settlement reads the claimed epoch,
+-- message and attempt ONLY from here, never from the caller, so a lease holder cannot claim a later epoch (and delete
+-- later work) or park a fabricated message. One row per leased job; a reclaim after expiry replaces it; every
+-- settlement deletes it in the settling transaction.
+CREATE TABLE sessions.search_job_claims (
+  job_id           bigint      PRIMARY KEY,
+  lease_id         uuid        NOT NULL,
+  claimed_epoch    bigint      NOT NULL CHECK (claimed_epoch >= 0),
+  claimed_message  jsonb       NOT NULL,
+  -- The attempt this claim counts. Only ever raised while the same lease holds (search_job_claim_attempts_v1).
+  claimed_attempts integer     NOT NULL CHECK (claimed_attempts >= 1),
+  claimed_at       timestamptz NOT NULL,
+  lease_until      timestamptz NOT NULL
+);
+ALTER TABLE sessions.search_job_claims ENABLE ROW LEVEL SECURITY;
+REVOKE ALL ON sessions.search_job_claims FROM PUBLIC, anon, authenticated, service_role;
+
+-- The receipt's attempt follows an owner-side raise of the leased row's attempts (an operator or test adjustment)
+-- and survives a newer wake's budget reset (§3.1 sets attempts 0 on the leased row): the attempt the lease holder
+-- is on stays the one that counts at settlement (§3.4: N leased at attempt 12, wake N+1, N exhausts). Only for the
+-- same lease; a claim or a settlement (the lease changes) never fires it. Trigger function: no EXECUTE grant.
+CREATE FUNCTION sessions.search_job_claim_attempts_v1() RETURNS trigger
+LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, pg_temp AS $attempts$
+BEGIN
+ UPDATE sessions.search_job_claims c
+    SET claimed_attempts = greatest(c.claimed_attempts, OLD.attempts, NEW.attempts)
+  WHERE c.job_id = OLD.id AND c.lease_id = OLD.lease_id;
+ RETURN NULL;
+END $attempts$;
+REVOKE ALL ON FUNCTION sessions.search_job_claim_attempts_v1() FROM PUBLIC, anon, authenticated, service_role;
+CREATE TRIGGER search_job_claim_attempts AFTER UPDATE OF attempts ON sessions.pipeline_jobs FOR EACH ROW
+ WHEN (OLD.stage = 'search-index' AND OLD.lease_id IS NOT NULL AND NEW.lease_id IS NOT DISTINCT FROM OLD.lease_id
+       AND NEW.attempts IS DISTINCT FROM OLD.attempts)
+ EXECUTE FUNCTION sessions.search_job_claim_attempts_v1();
+
+-- The scope's one dead letter id, exactly dlq.ts deadLetterId('search-index', ctx, workKey):
+-- 'search-index:' || encodeURIComponent(org) || ':' || encodeURIComponent(ws) || ':' || workKey. encodeURIComponent
+-- keeps A-Z a-z 0-9 - _ . ! ~ * ' ( ) and percent-encodes every other character's UTF-8 bytes in upper-case hex.
+-- Owner-internal (settle_search_job_v1 calls it): no grant.
+CREATE FUNCTION sessions.search_letter_id_v1(p_org text, p_ws text, p_work_key text) RETURNS text
+LANGUAGE sql STABLE STRICT SET search_path = pg_catalog, pg_temp AS $letter$
+ SELECT 'search-index:' || e.org || ':' || e.ws || ':' || p_work_key
+   FROM (SELECT (SELECT coalesce(string_agg(CASE WHEN strpos('ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_.!~*''()', c) > 0 THEN c
+                     ELSE upper(regexp_replace(encode(convert_to(c, 'UTF8'), 'hex'), '(..)', '%\1', 'g')) END, '' ORDER BY i), '')
+                   FROM regexp_split_to_table(p_org, '') WITH ORDINALITY AS o(c, i)) AS org,
+                (SELECT coalesce(string_agg(CASE WHEN strpos('ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_.!~*''()', c) > 0 THEN c
+                     ELSE upper(regexp_replace(encode(convert_to(c, 'UTF8'), 'hex'), '(..)', '%\1', 'g')) END, '' ORDER BY i), '')
+                   FROM regexp_split_to_table(p_ws, '') WITH ORDINALITY AS w(c, i)) AS ws) e
+$letter$;
+REVOKE ALL ON FUNCTION sessions.search_letter_id_v1(text, text, text) FROM PUBLIC, anon, authenticated, service_role;
+
+-- §3.2: claim up to p_limit (clamped to 1..10) visible, non-dlq search-index rows: FOR UPDATE SKIP LOCKED, one
+-- counted attempt, a fresh lease of the server's 300 s, and the receipt (the claim-time snapshot) upserted with it. A
+-- reclaim after expiry replaces the previous lease's receipt. Returns the STORED snapshot.
+CREATE FUNCTION sessions.claim_search_jobs_v1(p_limit integer)
+RETURNS TABLE (job_id bigint, lease_id uuid, message jsonb, epoch bigint, attempts integer)
+LANGUAGE sql SECURITY DEFINER SET search_path = pg_catalog, pg_temp AS $claim$
+ WITH next AS (
+   SELECT j.id FROM sessions.pipeline_jobs j
+    WHERE j.stage = 'search-index' AND NOT j.dlq AND j.visible_at <= now()
+    ORDER BY j.visible_at, j.id
+    LIMIT least(10, greatest(1, coalesce(p_limit, 1)))
+    FOR UPDATE SKIP LOCKED
+ ), leased AS (
+   UPDATE sessions.pipeline_jobs AS j
+      SET lease_id = gen_random_uuid(), visible_at = now() + interval '300 seconds', attempts = j.attempts + 1
+     FROM next WHERE j.id = next.id AND j.stage = 'search-index'
+   RETURNING j.id, j.lease_id, j.message, j.attempts, j.visible_at
+ ), receipts AS (
+   INSERT INTO sessions.search_job_claims AS c (job_id, lease_id, claimed_epoch, claimed_message, claimed_attempts, claimed_at, lease_until)
+   SELECT l.id, l.lease_id, (l.message->'payload'->>'epoch')::bigint, l.message, l.attempts, now(), l.visible_at FROM leased l
+   ON CONFLICT ON CONSTRAINT search_job_claims_pkey DO UPDATE
+     SET lease_id = EXCLUDED.lease_id, claimed_epoch = EXCLUDED.claimed_epoch, claimed_message = EXCLUDED.claimed_message,
+         claimed_attempts = EXCLUDED.claimed_attempts, claimed_at = EXCLUDED.claimed_at, lease_until = EXCLUDED.lease_until
+   RETURNING c.job_id, c.lease_id, c.claimed_message, c.claimed_epoch, c.claimed_attempts
+ )
+ SELECT r.job_id, r.lease_id, r.claimed_message, r.claimed_epoch, r.claimed_attempts FROM receipts r ORDER BY r.job_id
+$claim$;
+
+-- §3.3 (+ §3.3b completion): settle one claimed search-index job. Outcomes are allowlisted ('done' | 'retry'; anything
+-- else raises 22023). Bound to the stage, the job, the CURRENT unexpired lease (the row's lease and visible_at, and the
+-- receipt's lease and lease_until) and the receipt's recorded epoch, message and attempt; anything else returns
+-- {applied:false} and changes nothing. The caller never supplies an epoch, a message, an attempt or a delay.
+--   done:  the current epoch at or below the claimed one: delete the row and resolve the scope's replaying letter
+--          (§3.3b, completed | superseded); else a newer wake merged during the pass: reopen now, attempts 0.
+--   retry: at the server's max attempts (12): park the CLAIMED snapshot into the scope's letter (§3.3, the
+--          quarantine upsert; re-death refreshes it), then delete the row, or reopen it fresh if a newer wake merged;
+--          else a newer wake merged: reopen now, attempts 0; else back off min(900, 30 * 2^(attempt-1)) seconds.
+-- Every action deletes the receipt and writes the stage's pipeline_events row, all in this one transaction.
+CREATE FUNCTION sessions.settle_search_job_v1(p_job_id bigint, p_lease uuid, p_outcome text) RETURNS jsonb
+LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, pg_temp AS $settle$
+DECLARE
+ max_attempts constant integer := 12;
+ j sessions.pipeline_jobs; r sessions.search_job_claims;
+ current_epoch bigint; m jsonb; letter text; dead integer; attempt integer; delay integer; action text;
+ status text; disc text; err jsonb := NULL; attrs jsonb;
+BEGIN
+ IF p_outcome IS NULL OR p_outcome NOT IN ('done', 'retry') THEN
+   RAISE EXCEPTION USING ERRCODE = '22023', MESSAGE = 'search settle: outcome must be done or retry';
+ END IF;
+ IF p_job_id IS NULL OR p_lease IS NULL THEN RETURN jsonb_build_object('applied', false); END IF;
+ SELECT * INTO j FROM sessions.pipeline_jobs WHERE id = p_job_id AND stage = 'search-index' FOR UPDATE;
+ IF NOT FOUND OR j.lease_id IS DISTINCT FROM p_lease OR j.visible_at <= now() THEN
+   RETURN jsonb_build_object('applied', false);
+ END IF;
+ SELECT * INTO r FROM sessions.search_job_claims WHERE search_job_claims.job_id = p_job_id FOR UPDATE;
+ IF NOT FOUND OR r.lease_id <> p_lease OR r.lease_until <= now() THEN RETURN jsonb_build_object('applied', false); END IF;
+
+ m := r.claimed_message;
+ current_epoch := (j.message->'payload'->>'epoch')::bigint;
+ attempt := greatest(1, r.claimed_attempts);
+ disc := (m->>'workKey') || '@' || r.claimed_epoch::text;
+ attrs := jsonb_build_object('work_key', m->>'workKey', 'epoch', r.claimed_epoch);
+ letter := sessions.search_letter_id_v1(m->'ctx'->>'orgId', m->'ctx'->>'workspaceId', m->>'workKey');
+
+ IF p_outcome = 'done' THEN
+   status := 'ok';
+   IF current_epoch <= r.claimed_epoch THEN
+     DELETE FROM sessions.pipeline_jobs WHERE id = j.id AND lease_id = p_lease;
+     UPDATE sessions.pipeline_dead_letters SET state = 'resolved', resolved_at = now(),
+            resolution = CASE WHEN (message->'payload'->>'epoch')::bigint = r.claimed_epoch THEN 'completed' ELSE 'superseded' END
+      WHERE id = letter AND stage = 'search-index' AND state = 'replaying'
+        AND (message->'payload'->>'epoch')::bigint <= r.claimed_epoch;
+     action := 'deleted';
+   ELSE
+     UPDATE sessions.pipeline_jobs SET lease_id = NULL, visible_at = now(), attempts = 0 WHERE id = j.id AND lease_id = p_lease;
+     attrs := attrs || jsonb_build_object('reason', 'newer_epoch_reopened');
+     action := 'reopened';
+   END IF;
+ ELSIF attempt >= max_attempts THEN
+   INSERT INTO sessions.pipeline_dead_letters AS d
+          (id, stage, trace_id, org_id, workspace_id, session_id, machine_id, message, first_dead_at, last_dead_at)
+   VALUES (letter, 'search-index', j.trace_id, j.org_id, j.workspace_id, j.session_id, j.machine_id, m, now(), now())
+   ON CONFLICT (id) DO UPDATE SET message = EXCLUDED.message, state = 'dead', last_dead_at = EXCLUDED.last_dead_at,
+          dead_count = d.dead_count + 1, resolved_at = NULL, resolution = NULL,
+          session_id = COALESCE(EXCLUDED.session_id, d.session_id), machine_id = COALESCE(EXCLUDED.machine_id, d.machine_id)
+   RETURNING d.dead_count INTO dead;
+   status := 'dead_lettered';
+   disc := disc || ':' || dead::text;
+   err := jsonb_build_object('name', 'SearchJobError', 'code', 'search_index_held_exhausted', 'retryable', false);
+   attrs := attrs || jsonb_build_object('dead_letter_id', letter);
+   IF current_epoch <= r.claimed_epoch THEN
+     DELETE FROM sessions.pipeline_jobs WHERE id = j.id AND lease_id = p_lease;
+     action := 'parked';
+   ELSE
+     UPDATE sessions.pipeline_jobs SET lease_id = NULL, visible_at = now(), attempts = 0 WHERE id = j.id AND lease_id = p_lease;
+     action := 'parked_reopened';
+   END IF;
+ ELSE
+   status := 'retrying';
+   IF current_epoch > r.claimed_epoch THEN
+     delay := 0;
+     UPDATE sessions.pipeline_jobs SET lease_id = NULL, visible_at = now(), attempts = 0 WHERE id = j.id AND lease_id = p_lease;
+   ELSE
+     delay := least(900, 30 * power(2, least(attempt, 16) - 1))::integer;
+     UPDATE sessions.pipeline_jobs SET lease_id = NULL, visible_at = now() + make_interval(secs => delay) WHERE id = j.id AND lease_id = p_lease;
+   END IF;
+   attrs := attrs || jsonb_build_object('delay_seconds', delay);
+   action := 'retried';
+ END IF;
+
+ DELETE FROM sessions.search_job_claims WHERE search_job_claims.job_id = j.id;
+ INSERT INTO sessions.pipeline_events (trace_id, stage, status, error, attrs, attempt, idempotency_key, org_id, workspace_id, machine_id, harness, session_id)
+ VALUES ((m->'ctx'->>'traceId')::uuid, 'search-index', status, err, attrs, attempt,
+         concat_ws(':', m->'ctx'->>'traceId', 'search-index', status, attempt::text, disc),
+         m->'ctx'->>'orgId', m->'ctx'->>'workspaceId', m->'ctx'->>'machineId', m->'ctx'->>'harness', m->'ctx'->>'sessionId');
+ RETURN jsonb_build_object('applied', true, 'action', action);
+END $settle$;
+
+-- The runtime boundary: EXECUTE on claim and settle only, PUBLIC revoked in this transaction. service_role is the
+-- grant source; the migrator mirrors it onto the runtime role (RUNTIME_APPLICATION_FUNCTIONS). The operator paths
+-- (replay, catch-up, park: owner-run TypeScript over the guarded queue; archive: service_role only) get no runtime
+-- grant.
+REVOKE ALL ON FUNCTION sessions.claim_search_jobs_v1(integer) FROM PUBLIC, anon, authenticated, service_role;
+REVOKE ALL ON FUNCTION sessions.settle_search_job_v1(bigint, uuid, text) FROM PUBLIC, anon, authenticated, service_role;
+GRANT EXECUTE ON FUNCTION sessions.claim_search_jobs_v1(integer) TO service_role;
+GRANT EXECUTE ON FUNCTION sessions.settle_search_job_v1(bigint, uuid, text) TO service_role;

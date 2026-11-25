@@ -4,8 +4,8 @@
 -- the code rolled back. After a park, the stage's letters and events still exist: this rollback REFUSES (55000)
 -- until the parked letters are replayed, resolved and archived (sessions.archive_search_stage_v1(), §8 [rev 7]).
 -- It refuses while ANY search-index row exists in pipeline_jobs, pipeline_events or pipeline_dead_letters.
--- It drops the guards, the managed enqueue, the scope index, the cursor, the archive function and the resolution
--- column, and restores the three stage CHECKs to the 20261031000100 sets. It NEVER drops
+-- It drops the guards, the managed enqueue, the runtime claim/settle functions and their claim-receipt table, the
+-- scope index, the cursor, the archive function and the resolution column, and restores the three stage CHECKs to the 20261031000100 sets. It NEVER drops
 -- sessions.search_stage_archive or its seal (the manifest index, sessions.search_stage_archive_seal_v1() and both
 -- seal triggers), empty or not (§8): the archive is an audit artifact, removed only by a separate, explicitly
 -- approved cleanup. Re-applying the slot afterwards keeps and re-verifies it (the up file creates each archive
@@ -22,7 +22,7 @@ DO $rollback_guard$ DECLARE v_sha text; BEGIN
  IF EXISTS(SELECT 1 FROM sessions.__96bulls_migrations WHERE name LIKE 'upstream:%' AND name COLLATE "C">'upstream:20261105062300_search_index_stage.sql')
  THEN RAISE EXCEPTION USING ERRCODE='55000',MESSAGE='search index stage: a later migration is applied; roll it back first';END IF;
  SELECT sha256 INTO v_sha FROM sessions.__96bulls_migrations WHERE name='upstream:20261105062300_search_index_stage.sql' FOR UPDATE;
- IF NOT FOUND OR v_sha<>'2aa3b9c92f1722e9976733ff9db41422f919fba9f2bc3a8f481d8271569b0bd6'
+ IF NOT FOUND OR v_sha<>'ff3a5131605a29935f2388c0d94878d01641d9c17f566a179bd24a09c16956e6'
  THEN RAISE EXCEPTION USING ERRCODE='55000',MESSAGE='search index stage: own applied checksum required';END IF;
  -- §8: the additive migration stays until the stage is fully empty, in all three tables.
  LOCK TABLE sessions.pipeline_jobs, sessions.pipeline_events, sessions.pipeline_dead_letters IN ACCESS EXCLUSIVE MODE;
@@ -37,6 +37,14 @@ DROP TRIGGER guard_search_wake_delete ON sessions.pipeline_jobs;
 DROP TRIGGER guard_search_wake_truncate ON sessions.pipeline_jobs;
 DROP TRIGGER guard_search_wake_insert ON sessions.pipeline_jobs;
 DROP TRIGGER guard_search_wake_update ON sessions.pipeline_jobs;
+-- The runtime boundary (claim and settle) and its owner-only claim receipts: gone with the stage (the stage is empty,
+-- so any receipt left is a stale one of a deleted job).
+DROP TRIGGER search_job_claim_attempts ON sessions.pipeline_jobs;
+DROP FUNCTION sessions.settle_search_job_v1(bigint,uuid,text);
+DROP FUNCTION sessions.claim_search_jobs_v1(integer);
+DROP FUNCTION sessions.search_letter_id_v1(text,text,text);
+DROP FUNCTION sessions.search_job_claim_attempts_v1();
+DROP TABLE sessions.search_job_claims;
 DROP FUNCTION sessions.guard_managed_search_truncate_v1();
 DROP FUNCTION sessions.guard_managed_search_wake_v1();
 DROP FUNCTION sessions.managed_search_wake_v1(jsonb,uuid);
