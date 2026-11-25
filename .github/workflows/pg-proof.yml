@@ -497,7 +497,7 @@ jobs:
       # The session-analysis runner on LOCKER_PROVIDER=azure against Azurite: loopback-only, random host port,
       # in-memory data, two accounts (one with blob versioning, one without) whose throwaway keys live only in
       # this step's environment. Azurite has no soft delete; those paths are fake-server tests in the unit shards.
-      - name: Session-analysis runner on Azurite (versioned and unversioned accounts)
+      - name: Session-analysis runner and operator erase on Azurite (versioned and unversioned accounts)
         run: |
           set -euo pipefail
           AZURITE_TEST_VERSIONED_ACCOUNT="fxver$(openssl rand -hex 4)"
@@ -521,7 +521,7 @@ jobs:
           done
           if [ "$ready" != 1 ]; then docker logs "$AZURITE_NAME"; exit 1; fi
           log=azurite-pg${{ matrix.pg }}.log
-          bun test src/session-analysis/__tests__/runner-store.azurite.test.ts 2>&1 | tee "$log"
+          bun test src/session-analysis/__tests__/runner-store.azurite.test.ts src/session-erase/__tests__/selfhost-eraser.azurite.test.ts 2>&1 | tee "$log"
           grep -Eq '^ *[1-9][0-9]* pass$' "$log"
           if grep -Eq '^ *[1-9][0-9]* skip$' "$log"; then echo "tests were skipped"; exit 1; fi
           grep -E '^ *[0-9]+ (pass|fail)$' "$log" | tr -s ' ' | paste -sd, | sed "s/^/azurite PostgreSQL ${{ matrix.pg }}:/" >> "$GITHUB_STEP_SUMMARY"
