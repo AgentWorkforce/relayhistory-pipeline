@@ -17,13 +17,15 @@ export interface ReceiptRetry {
   due: number;
 }
 
+type StoreResult<T> = T | Promise<T>;
+
 export interface ReceiptRetryStore {
-  load(scope: string): RetryCheckpoint;
-  lookup(scope: string, token: string): ReceiptRetry | null;
+  load(scope: string): StoreResult<RetryCheckpoint>;
+  lookup(scope: string, token: string): StoreResult<ReceiptRetry | null>;
   /** Sorted by (due, token), only retry rows where due <= now. */
-  due(scope: string, now: number, limit: number): ReceiptRetry[];
+  due(scope: string, now: number, limit: number): StoreResult<ReceiptRetry[]>;
   /** One transaction: CAS scope/version, checkpoint and every upsert/deletion. */
-  commit(scope: string, version: number, next: RetryCheckpoint, changes: ReadonlyMap<string, ReceiptRetry | null>): boolean;
+  commit(scope: string, version: number, next: RetryCheckpoint, changes: ReadonlyMap<string, ReceiptRetry | null>): StoreResult<boolean>;
 }
 
 /** Throw only after establishing the operation had no ambiguous side effect (or can safely be retried). */
@@ -31,7 +33,7 @@ export class RetryablePublicationError extends Error {}
 const maxAttempts = 6;
 const tokenShape = /^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/;
 
-function validateRetry(row: ReceiptRetry, token: string) {
+export function validateRetry(row: ReceiptRetry, token: string) {
   if (row.token !== token || !tokenShape.test(token) || !Number.isSafeInteger(row.attempts) ||
       row.attempts < 1 || row.attempts > maxAttempts || !Number.isSafeInteger(row.due) || row.due < 0 ||
       !(row.state === "audit" || (row.state === "exhausted" && row.attempts === maxAttempts) ||
@@ -47,7 +49,7 @@ export async function runPublicationRetryTurn(
   if (!/^[a-f0-9]{64}$/.test(scope) || source.scope !== scope) throw Error("receipt scope mismatch");
   if (!Number.isInteger(limit) || limit < 1 || limit > 20 || !Number.isSafeInteger(now) ||
       now < 0 || now > Number.MAX_SAFE_INTEGER - 60_000) throw Error("invalid retry budget");
-  const checkpoint = store.load(scope);
+  const checkpoint = await store.load(scope);
   if (!Number.isSafeInteger(checkpoint.version) || checkpoint.version < 0 ||
       checkpoint.version >= Number.MAX_SAFE_INTEGER || typeof checkpoint.retryTurn !== "boolean")
     throw Error("invalid retry checkpoint");
@@ -68,7 +70,7 @@ export async function runPublicationRetryTurn(
   }
   let scan = checkpoint.scan;
   if (checkpoint.retryTurn) {
-    const due = store.due(scope, now, limit);
+    const due = await store.due(scope, now, limit);
     if (due.length > limit) throw Error("oversized retry page");
     const tokens = new Set<string>();
     for (const row of due) {
@@ -81,7 +83,7 @@ export async function runPublicationRetryTurn(
     const page = await reconcilePublicationPage(scan, {
       highest: () => source.highest(), page: (after, through, n) => source.page(after, through, n),
       reconcile: async token => {
-        const row = store.lookup(scope, token);
+        const row = await store.lookup(scope, token);
         if (row) validateRetry(row, token);
         else await attempt(token, 0);
         // The legacy page's visit counts are deliberately discarded.
@@ -92,5 +94,5 @@ export async function runPublicationRetryTurn(
   }
   const next = { version: checkpoint.version + 1, scan, retryTurn: !checkpoint.retryTurn };
   // Never publish an in-memory advancement. If commit throws, reload by scope before any further attempt.
-  return store.commit(scope, checkpoint.version, next, changes) ? "committed" : "conflict";
+  return await store.commit(scope, checkpoint.version, next, changes) ? "committed" : "conflict";
 }

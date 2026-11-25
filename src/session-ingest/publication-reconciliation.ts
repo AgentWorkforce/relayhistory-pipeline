@@ -28,7 +28,8 @@ export interface ReconciliationSource {
 }
 
 function checkPosition(p: ReceiptPosition) {
-  if (!/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{6}Z$/.test(p.createdAt) ||
+  if (!p || typeof p.createdAt !== "string" || typeof p.stageToken !== "string" ||
+      !/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{6}Z$/.test(p.createdAt) ||
       !/^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/.test(p.stageToken))
     throw Error("invalid receipt position");
 }
@@ -36,6 +37,15 @@ function checkPosition(p: ReceiptPosition) {
 function compare(a: ReceiptPosition, b: ReceiptPosition) {
   if (a.createdAt !== b.createdAt) return a.createdAt < b.createdAt ? -1 : 1;
   return a.stageToken < b.stageToken ? -1 : Number(a.stageToken > b.stageToken);
+}
+
+export function validateReconciliationState(state: ReconciliationState) {
+  if (state.lane !== "catchup" && state.lane !== "tail") throw Error("invalid receipt lane");
+  const { after: prior, through: upper } = state.catchup;
+  if (prior !== null) checkPosition(prior);
+  if (upper !== null) checkPosition(upper);
+  if (state.tailAfter !== null) checkPosition(state.tailAfter);
+  if (prior && (!upper || compare(prior, upper) > 0)) throw Error("invalid receipt checkpoint");
 }
 
 /** One bounded page. Persist the returned state with a scoped CAS after success.
@@ -46,12 +56,7 @@ export async function reconcilePublicationPage(
   state: ReconciliationState, source: ReconciliationSource, limit: number,
 ) {
   if (!Number.isSafeInteger(limit) || limit < 1 || limit > 20) throw Error("invalid receipt limit");
-  if (state.lane !== "catchup" && state.lane !== "tail") throw Error("invalid receipt lane");
-  const { after: prior, through: upper } = state.catchup;
-  if (prior) checkPosition(prior);
-  if (upper) checkPosition(upper);
-  if (state.tailAfter) checkPosition(state.tailAfter);
-  if (prior && (!upper || compare(prior, upper) > 0)) throw Error("invalid receipt checkpoint");
+  validateReconciliationState(state);
   const catchup = state.lane === "catchup";
   const next = { ...state, lane: catchup ? "tail" as const : "catchup" as const };
   const counts = { published: 0, already_published: 0, held: 0, missing: 0 };
