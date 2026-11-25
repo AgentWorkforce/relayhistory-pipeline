@@ -13,9 +13,10 @@
  *
  * Aliases: a session is addressed by its physical id (session_index.session_id) or its source RelayHistory id
  * (canonical_session_id), and a fence or tombstone may be written under either. Where an alias reader is bound, every
- * recorded session is expanded to each form its pointer rows (live and tombstoned) hold under the same source, both
- * directions, before both checks. The fence bound without an alias reader is refused (503): it would see one form only.
- * A fence lookup that fails, a row out of contract or more forms than SYNTHESIS_FENCE_MAX_KEYS is a 503: nothing is
+ * recorded session is expanded to the closure of the forms its pointer rows (live and tombstoned) hold under the same
+ * source, both directions and through shared source ids (siblings), before both checks. The fence bound without an
+ * alias reader is refused (503): it would see one form only. A fence lookup that fails, a row out of contract, more
+ * forms than SYNTHESIS_FENCE_MAX_KEYS or a closure not complete within SYNTHESIS_ALIAS_MAX_ROUNDS is a 503: nothing is
  * served. All lookups run in batches of SYNTHESIS_ERASE_CHECK_BATCH keys.
  */
 import {
@@ -51,6 +52,8 @@ export const SYNTHESIS_ERASE_CHECK_BATCH = 500;
 export const SYNTHESIS_FENCE_MAX_KEYS = 25_000;
 /** At most this many pointer rows are read per alias batch; more is out of contract (a 503), never a silent cut. */
 export const SYNTHESIS_ALIAS_ROWS_MAX = 4_000;
+/** Alias closure rounds (each queries the forms the previous one found); still growing after this many is a 503. */
+export const SYNTHESIS_ALIAS_MAX_ROUNDS = 8;
 
 /**
  * The batched operator erase fence over a set of keys: the subset fenced, as `keyOf` strings. Any failure throws
@@ -113,30 +116,44 @@ export interface SynthesisChecks {
   aliases?: SessionAliases;
 }
 
-/** Every (source, id) form of `refs`: each ref itself plus the physical and source ids its pointer rows hold. */
+/**
+ * Every (source, id) form of `refs`: the same-tenant, same-source alias closure. Each round queries every form not yet
+ * queried (a physical id finds its rows' source ids; a source id finds every physical id recorded under it, siblings
+ * included), until no new form appears. So a recorded physical A whose source id C is shared by a physical B brings in
+ * B (and any further source id B's rows hold). Bounded: SYNTHESIS_FENCE_MAX_KEYS forms, SYNTHESIS_ALIAS_ROWS_MAX rows a
+ * batch and SYNTHESIS_ALIAS_MAX_ROUNDS rounds; a closure not complete within them is an error (the route's 503).
+ */
 async function aliasForms(input: SynthesisChecks, refs: readonly SessionKey[]): Promise<SessionKey[]> {
   const forms = new Map<string, SessionKey>();
+  let frontier: SessionKey[] = [];
   const add = (k: SessionKey) => {
-    if (!forms.has(keyOf(k))) forms.set(keyOf(k), { source: k.source, sessionId: k.sessionId });
+    if (forms.has(keyOf(k))) return;
+    forms.set(keyOf(k), { source: k.source, sessionId: k.sessionId });
     if (forms.size > SYNTHESIS_FENCE_MAX_KEYS) throw new Error("synthesis_fence_bound");
+    frontier.push({ source: k.source, sessionId: k.sessionId });
   };
   refs.forEach(add);
   if (!input.aliases) return [...forms.values()];
-  for (let i = 0; i < refs.length; i += SYNTHESIS_ERASE_CHECK_BATCH) {
-    const batch = refs.slice(i, i + SYNTHESIS_ERASE_CHECK_BATCH);
-    const asked = new Set(batch.map(keyOf));
-    const rows = await input.aliases(input.orgId, input.workspaceId, batch);
-    if (!Array.isArray(rows) || rows.length > SYNTHESIS_ALIAS_ROWS_MAX) throw new Error("synthesis_aliases_out_of_contract");
-    for (const row of rows) {
-      if (row.org_id !== input.orgId || row.workspace_id !== input.workspaceId) throw new TenantMismatchError();
-      const canonical = row.canonical_session_id;
-      if (typeof row.harness !== "string" || typeof row.session_id !== "string" || row.session_id === "" ||
-          (canonical !== null && (typeof canonical !== "string" || canonical === "")) ||
-          (!asked.has(keyOf({ source: row.harness, sessionId: row.session_id })) &&
-            (canonical === null || !asked.has(keyOf({ source: row.harness, sessionId: canonical })))))
-        throw new Error("synthesis_aliases_out_of_contract");
-      add({ source: row.harness, sessionId: row.session_id });
-      if (canonical !== null) add({ source: row.harness, sessionId: canonical });
+  for (let round = 0; frontier.length > 0; round++) {
+    if (round >= SYNTHESIS_ALIAS_MAX_ROUNDS) throw new Error("synthesis_aliases_incomplete");
+    const query = frontier;
+    frontier = [];
+    for (let i = 0; i < query.length; i += SYNTHESIS_ERASE_CHECK_BATCH) {
+      const batch = query.slice(i, i + SYNTHESIS_ERASE_CHECK_BATCH);
+      const asked = new Set(batch.map(keyOf));
+      const rows = await input.aliases(input.orgId, input.workspaceId, batch);
+      if (!Array.isArray(rows) || rows.length > SYNTHESIS_ALIAS_ROWS_MAX) throw new Error("synthesis_aliases_out_of_contract");
+      for (const row of rows) {
+        if (row.org_id !== input.orgId || row.workspace_id !== input.workspaceId) throw new TenantMismatchError();
+        const canonical = row.canonical_session_id;
+        if (typeof row.harness !== "string" || typeof row.session_id !== "string" || row.session_id === "" ||
+            (canonical !== null && (typeof canonical !== "string" || canonical === "")) ||
+            (!asked.has(keyOf({ source: row.harness, sessionId: row.session_id })) &&
+              (canonical === null || !asked.has(keyOf({ source: row.harness, sessionId: canonical })))))
+          throw new Error("synthesis_aliases_out_of_contract");
+        add({ source: row.harness, sessionId: row.session_id });
+        if (canonical !== null) add({ source: row.harness, sessionId: canonical });
+      }
     }
   }
   return [...forms.values()];

@@ -287,9 +287,11 @@ GET /v1/session-intel/synthesis?workspace=<id>&since=<ISO>&until=<ISO>
   too, after the read and in batches of 500: a fenced session (an operator erase in progress, no tombstone yet) is the
   same `404 synthesis_invalidated`. The fence unavailable or failing is a `503`, nothing served.
 - **Aliases.** A session is addressed by its physical id or its source RelayHistory id (`canonical_session_id`), and
-  a tombstone or fence may be under either. Each recorded session is expanded, per source, to every id its pointer
-  rows (live and tombstoned) hold, both directions, before both checks (batches of 500, at most 4,000 rows a batch and
-  25,000 forms in all; more is a `503`). With the fence bound and no alias reader, the route answers `503`.
+  a tombstone or fence may be under either. Each recorded session is expanded, per source and within the tenant, to
+  the closure of the ids its pointer rows (live and tombstoned) hold, both directions: a source id brings in every
+  physical id recorded under it (a sibling sharing it included), and each new id is queried in turn until none is
+  new. Bounded: batches of 500, at most 4,000 rows a batch, 25,000 forms in all and 8 rounds; past any bound is a
+  `503`. With the fence bound and no alias reader, the route answers `503`.
 - **Freshness.** The job is rerun when the cohort changes; the new artifact's later generation makes it the
   authoritative one. `generatedAt` and `freshness` in the body say how current it is.
 - **Body.** The `workspace-synthesis/1` document only (no org id, no provenance lists). A store failure is `503`.
