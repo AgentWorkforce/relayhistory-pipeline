@@ -1,93 +1,56 @@
 /**
  * Per-message dead-letter resend for the indexing queue (operator tool; CLI: scripts/dlq-resend.ts,
- * runbook: docs/handoffs/dlq-resend.md).
+ * usage: docs/handoffs/dlq-resend.md; the operator procedure lives in the private ops repository).
  *
  * SQS StartMessageMoveTask moves a DLQ in queue order and cannot pick messages. This scans the DLQ
- * with ReceiveMessage (each received message is hidden for `visibilitySeconds` while it is decided)
- * and resends ONLY messages whose session identity is selected:
+ * with ReceiveMessage (each received message is hidden while it is decided) and resends ONLY messages
+ * whose session identity is selected:
  *
- *   selected, under the cap, execute   SendMessage(identical body + attributes) to the target, then,
- *                                      only after the send succeeded, DeleteMessage from the DLQ
+ *   selected, under the cap, execute   SendMessage(identical body + attributes) to the target; only after
+ *                                      a VALID acknowledgement (MessageId, MD5 of the body) DeleteMessage
  *   anything else (and every dry run)  ChangeMessageVisibility 0 at once, so nothing stays held
  *
- * The identity is sha256_hex(utf8("<org>/<ws>/<m>/<h>/<s>")) from the decoded S3 key: the org is the
- * last segment of the key's deployment prefix (the prefix org resolver's rule), the ws=, m=, h= and
- * s= values without their labels. The date is not part of it. The sessionless origin bucket
- * (h=_none) has no identity and is never resent.
+ * Before any receive (dry run included) the queue pair is proven: both URLs are canonical SQS URLs, the
+ * QueueArns match the URLs and differ, the target's RedrivePolicy dead-letters into exactly this DLQ,
+ * and the DLQ has no RedrivePolicy of its own (so receive counts on it trigger nothing).
  *
- * Output is JSON lines carrying identity hashes, a body digest prefix and the class only: never a
- * key, queue URL, org, workspace or session id. No production identifier lives here; queue URLs come
- * from the operator at run time.
+ * An outcome that may have committed without proof (a send timeout or lost response, a malformed
+ * acknowledgement, a delete failure) is a duplicate risk: nothing more is sent, the rest of the batch is
+ * released, and the summary names it for reconciliation.
+ *
+ * The identity is sha256_hex(utf8("<org>/<ws>/<m>/<h>/<s>")) of the key(s) the consumer itself would
+ * read from the body (s3-events.ts parseQueueBody, the consumer's parser). An identity selects EVERY
+ * message of that session, not one body or revision.
+ *
+ * Output is JSON lines carrying hashes and fixed codes only: never a key, queue URL, org, workspace or
+ * session id, nor an operator-supplied class name. No production identifier lives here.
  */
 import { createHash } from "node:crypto";
 import { parseSessionKey, parseUploadGenerationPrefix } from "@rhc-object-store";
-import { awsJsonCall, type AwsSessionCredentials } from "./aws-json.ts";
-import { decodeS3Key, RECONCILE_BODY_KEY } from "./s3-events.ts";
+import { RETENTION_BUCKET_HARNESS } from "@rhc/lib/pipeline/adapter.ts";
+import { awsJsonCall, AwsCallError, type AwsSessionCredentials } from "./aws-json.ts";
+import { parseQueueBody, RECONCILE_BODY_KEY } from "./s3-events.ts";
 import { NO_SESSION_HARNESS } from "../session-ingest/writer.ts";
 
 export const MAX_RESEND_CAP = 100;
 export const MAX_RATE_PER_SECOND = 5;
 export const DEFAULT_VISIBILITY_SECONDS = 120;
+export const MIN_VISIBILITY_SECONDS = 60;
 export const DEFAULT_EMPTY_RECEIVES = 3;
 export const CONFIRM_ENV = "DLQ_RESEND_CONFIRM";
 export const CONFIRM_VALUE = "resend";
-/** A send is not started with less than this much of the hold left (the receipt could lapse mid-send). */
-export const HOLD_MARGIN_SECONDS = 10;
+export const SEND_TIMEOUT_MS = 10_000;
+export const DELETE_TIMEOUT_MS = 10_000;
+/** Remaining hold required before a send: both bounded calls plus this margin. */
+export const HOLD_MARGIN_MS = 10_000;
+export const HOLD_NEEDED_MS = SEND_TIMEOUT_MS + DELETE_TIMEOUT_MS + HOLD_MARGIN_MS;
+export const SELECTED_CLASS = "selected";
 
 const HASH = /^[0-9a-f]{64}$/;
 const sha256Hex = (s: string) => createHash("sha256").update(s, "utf8").digest("hex");
-
-// ---------------------------------------------------------------------------------------------
-// Identity
-
-export type IdentityResult =
-  | { ok: true; identity: string }
-  | { ok: false; reason: "unparseable_body" | "no_key" | "undecodable_key" | "not_session_key" | "no_org" | "origin_bucket" | "mixed_records" };
-
-/** The identity of one S3 object key as S3 delivers it (URL-encoded, `+` for space). */
-export function identityOfKey(rawKey: string): IdentityResult {
-  const key = decodeS3Key(rawKey);
-  if (!key) return { ok: false, reason: "undecodable_key" };
-  const location = parseSessionKey(key);
-  if (!location) return { ok: false, reason: "not_session_key" };
-  const org = (parseUploadGenerationPrefix(location.prefix)?.base ?? location.prefix)?.split("/").filter(Boolean).pop();
-  if (!org) return { ok: false, reason: "no_org" };
-  if (location.harness === NO_SESSION_HARNESS) return { ok: false, reason: "origin_bucket" };
-  return { ok: true, identity: sha256Hex(`${org}/${location.workspaceId}/${location.machineId}/${location.harness}/${location.sessionId}`) };
-}
-
-/**
- * The identity of one DLQ message body: an S3 event (`Records[*].s3.object.key`) or a reconcile body
- * (`{"reconcile":{"key"}}`). The reconcile key is passed through the same decode, which leaves an
- * already-decoded key unchanged unless it contains `%` or `+` (session keys never do). A multi-record
- * event is accepted only when every record names the same identity.
- */
-export function identityOfBody(body: string): IdentityResult {
-  let value: unknown;
-  try {
-    value = JSON.parse(body);
-  } catch {
-    return { ok: false, reason: "unparseable_body" };
-  }
-  if (!value || typeof value !== "object" || Array.isArray(value)) return { ok: false, reason: "unparseable_body" };
-  const v = value as Record<string, unknown>;
-  const reconcile = v[RECONCILE_BODY_KEY] as { key?: unknown } | undefined;
-  if (reconcile && typeof reconcile === "object") {
-    return typeof reconcile.key === "string" && reconcile.key ? identityOfKey(reconcile.key) : { ok: false, reason: "no_key" };
-  }
-  if (!Array.isArray(v.Records) || v.Records.length === 0) return { ok: false, reason: "no_key" };
-  let first: IdentityResult | undefined;
-  for (const record of v.Records as { s3?: { object?: { key?: unknown } } }[]) {
-    const key = record?.s3?.object?.key;
-    const result: IdentityResult = typeof key === "string" && key ? identityOfKey(key) : { ok: false, reason: "no_key" };
-    if (!first) first = result;
-    else if (!first.ok || !result.ok || first.identity !== result.identity) return { ok: false, reason: "mixed_records" };
-  }
-  return first!;
-}
-
-// ---------------------------------------------------------------------------------------------
-// Selection files
+const md5Hex = (s: string) => createHash("md5").update(s, "utf8").digest("hex");
+/** The printable form of an operator-supplied class name: a fixed code or a hash, never the string. */
+export const classCode = (cls: string) => (cls === SELECTED_CLASS ? SELECTED_CLASS : `class_${sha256Hex(cls).slice(0, 12)}`);
 
 export class DlqResendRefusal extends Error {
   readonly reason: string;
@@ -100,6 +63,69 @@ export class DlqResendRefusal extends Error {
 const refuse = (reason: string): never => {
   throw new DlqResendRefusal(reason);
 };
+
+// ---------------------------------------------------------------------------------------------
+// Identity (selector parity with the consumer)
+
+export type IdentityReject =
+  | "test_event"
+  | "invalid_body"
+  | "no_events"
+  | "malformed_records"
+  | "mixed_records"
+  | "not_session_key"
+  | "managed_publication_hint"
+  | "retention_bucket"
+  | "origin_bucket"
+  | "not_a_manifest"
+  | "no_org";
+export type IdentityResult = { ok: true; identity: string } | { ok: false; reason: IdentityReject };
+
+/**
+ * The identity of one already-normalized object key (as the consumer holds it after parseQueueBody),
+ * with the pointer stage's pre-lookup ignores (pointer.ts indexPointer) applied in the same order.
+ * The org is the prefix org resolver's (adapter.ts prefixOrgResolver): the last segment of the
+ * deployment prefix, upload-generation suffix removed.
+ */
+export function identityOfKey(key: string): IdentityResult {
+  const location = parseSessionKey(key);
+  if (!location) return { ok: false, reason: "not_session_key" };
+  if (location.prefix?.includes("/upload-generations/")) return { ok: false, reason: "managed_publication_hint" };
+  if (location.harness === RETENTION_BUCKET_HARNESS) return { ok: false, reason: "retention_bucket" };
+  if (location.harness === NO_SESSION_HARNESS) return { ok: false, reason: "origin_bucket" };
+  if (location.rest !== "manifest.json") return { ok: false, reason: "not_a_manifest" };
+  const org = (parseUploadGenerationPrefix(location.prefix)?.base ?? location.prefix)?.split("/").filter(Boolean).pop();
+  if (!org) return { ok: false, reason: "no_org" };
+  return { ok: true, identity: sha256Hex(`${org}/${location.workspaceId}/${location.machineId}/${location.harness}/${location.sessionId}`) };
+}
+
+/**
+ * The identity of one DLQ message body, normalized by the consumer's own parser: a TestEvent is ignored
+ * first, reconcile keys are used literally, S3 records are validated (event source and name) and their
+ * keys decoded exactly as the consumer decodes them. Every record must yield the same identity; a body
+ * with a record the consumer drops, or with mixed identities, is rejected.
+ */
+export function identityOfBody(body: string): IdentityResult {
+  const parsed = parseQueueBody(body);
+  if (parsed.kind === "test") return { ok: false, reason: "test_event" };
+  if (parsed.kind === "invalid") return { ok: false, reason: "invalid_body" };
+  if (parsed.events.length === 0) return { ok: false, reason: "no_events" };
+  // parseQueueBody silently drops S3 records it cannot use; the selector refuses such a body instead.
+  const value = JSON.parse(body) as Record<string, unknown>;
+  const reconcile = value[RECONCILE_BODY_KEY];
+  if (!(reconcile && typeof reconcile === "object") && (!Array.isArray(value.Records) || value.Records.length !== parsed.events.length)) return { ok: false, reason: "malformed_records" };
+  let identity: string | undefined;
+  for (const event of parsed.events) {
+    const result = identityOfKey(event.key);
+    if (!result.ok) return result;
+    if (identity !== undefined && identity !== result.identity) return { ok: false, reason: "mixed_records" };
+    identity = result.identity;
+  }
+  return { ok: true, identity: identity! };
+}
+
+// ---------------------------------------------------------------------------------------------
+// Selection files
 
 /** `--select`: one bare lowercase identity hash per line; blank lines and `#` comments ignored. */
 export function parseSelectFile(text: string): Set<string> {
@@ -132,12 +158,47 @@ export function parseClassesFile(text: string): Map<string, string> {
 }
 
 // ---------------------------------------------------------------------------------------------
+// Queue URLs
+
+export interface QueueRef {
+  url: string;
+  region: string;
+  account: string;
+  name: string;
+  /** The ARN the URL names; GetQueueAttributes must return exactly this. */
+  arn: string;
+}
+
+/**
+ * A canonical SQS queue URL in the commercial or GovCloud partition: `https://sqs.<region>.amazonaws.com/
+ * <12-digit account>/<name>`. Legacy (`<region>.queue.amazonaws.com`), VPC endpoint, China, custom and
+ * unknown hosts are refused: no region is ever guessed.
+ */
+export function parseQueueUrl(raw: string): QueueRef {
+  let url: URL;
+  try {
+    url = new URL(raw);
+  } catch {
+    return refuse("queue_url_invalid");
+  }
+  if (url.protocol !== "https:" || url.port || url.search || url.hash || url.username || url.password) refuse("queue_url_invalid");
+  const host = /^sqs\.((?:us-gov-[a-z]+-\d)|(?:[a-z]{2}-[a-z]+-\d))\.amazonaws\.com$/.exec(url.host);
+  if (!host) refuse("queue_host_unsupported");
+  const path = /^\/(\d{12})\/([A-Za-z0-9_-]{1,80})\/?$/.exec(url.pathname);
+  if (!path) refuse("queue_url_path_invalid");
+  const region = host![1]!;
+  const partition = region.startsWith("us-gov-") ? "aws-us-gov" : "aws";
+  const [, account, name] = path!;
+  return { url: `https://${url.host}/${account}/${name}`, region, account: account!, name: name!, arn: `arn:${partition}:sqs:${region}:${account}:${name}` };
+}
+
+// ---------------------------------------------------------------------------------------------
 // Options
 
 export interface DlqResendOptions {
-  dlqUrl: string;
-  targetUrl: string;
-  /** Identity hash -> class (the class is "selected" when none was given). */
+  dlq: QueueRef;
+  target: QueueRef;
+  /** Identity hash -> class name (SELECTED_CLASS when none was given). Printed only as classCode(). */
   selection: Map<string, string>;
   max: number;
   ratePerSecond: number;
@@ -184,29 +245,6 @@ function numArg(name: string, raw: string | undefined, fallback: number, min: nu
   return n;
 }
 
-/** Compare queue URLs case-insensitively on scheme and host and without a trailing slash. */
-export function normalizeQueueUrl(raw: string): string {
-  let url: URL;
-  try {
-    url = new URL(raw);
-  } catch {
-    return refuse("queue_url_invalid");
-  }
-  if (url.protocol !== "https:" || url.search || url.hash || url.username || url.password) refuse("queue_url_invalid");
-  const path = url.pathname.replace(/\/+$/, "");
-  if (path.split("/").filter(Boolean).length !== 2) refuse("queue_url_invalid");
-  return `${url.protocol}//${url.host.toLowerCase()}${path}`;
-}
-
-/** The region in an SQS queue URL (`https://sqs.<region>.amazonaws.com/...`), or the fallback. */
-export function queueRegion(queueUrl: string, fallback?: string): string {
-  const host = new URL(queueUrl).host.toLowerCase();
-  const m = /^sqs\.([a-z0-9-]+)\.amazonaws\.com(?:\.cn)?$/.exec(host) ?? /^([a-z0-9-]+)\.queue\.amazonaws\.com$/.exec(host);
-  if (m) return m[1]!;
-  if (fallback) return fallback;
-  return refuse("queue_region_unknown");
-}
-
 /**
  * Every refusal the operator can hit before any AWS call. `readFile` and `env` are injected so tests
  * need no files. The DLQ_RESEND_CONFIRM check runs only when executing.
@@ -218,13 +256,14 @@ export function resolveOptions(
 ): DlqResendOptions {
   if (!args["dlq-url"]) refuse("dlq_url_required");
   if (!args["target-url"]) refuse("target_url_required");
-  const dlqUrl = normalizeQueueUrl(args["dlq-url"]!);
-  const targetUrl = normalizeQueueUrl(args["target-url"]!);
-  if (dlqUrl === targetUrl) refuse("dlq_url_equals_target_url");
-  if (dlqUrl.endsWith(".fifo") || targetUrl.endsWith(".fifo")) refuse("fifo_queue_unsupported");
+  const dlq = parseQueueUrl(args["dlq-url"]!);
+  const target = parseQueueUrl(args["target-url"]!);
+  if (dlq.arn === target.arn) refuse("dlq_url_equals_target_url");
+  if (dlq.region !== target.region || dlq.account !== target.account) refuse("queues_not_in_one_account_and_region");
+  if (dlq.name.endsWith(".fifo") || target.name.endsWith(".fifo")) refuse("fifo_queue_unsupported");
   const max = intArg("max", args.max, undefined, 1, MAX_RESEND_CAP);
   const ratePerSecond = numArg("rate", args.rate, 1, 0.01, MAX_RATE_PER_SECOND);
-  const visibilitySeconds = intArg("visibility_seconds", args["visibility-seconds"], DEFAULT_VISIBILITY_SECONDS, 30, 43_200);
+  const visibilitySeconds = intArg("visibility_seconds", args["visibility-seconds"], DEFAULT_VISIBILITY_SECONDS, MIN_VISIBILITY_SECONDS, 43_200);
   const emptyReceivesToStop = intArg("empty_receives", args["empty-receives"], DEFAULT_EMPTY_RECEIVES, 1, 100);
   const maxScan = args["max-scan"] === undefined ? undefined : intArg("max_scan", args["max-scan"], undefined, 1, 1_000_000);
   const waitSeconds = intArg("wait_seconds", args["wait-seconds"], 2, 0, 20);
@@ -234,7 +273,7 @@ export function resolveOptions(
   const classes = args.classes ? parseClassesFile(readFile(args.classes)) : undefined;
   const selection = new Map<string, string>();
   if (args.select) {
-    for (const hash of parseSelectFile(readFile(args.select))) selection.set(hash, classes?.get(hash) ?? "selected");
+    for (const hash of parseSelectFile(readFile(args.select))) selection.set(hash, classes?.get(hash) ?? SELECTED_CLASS);
   } else {
     if (!classes) refuse("select_class_needs_classes_file");
     for (const [hash, cls] of classes!) if (cls === args["select-class"]) selection.set(hash, cls);
@@ -243,7 +282,42 @@ export function resolveOptions(
 
   const execute = args.execute === true;
   if (execute && env[CONFIRM_ENV] !== CONFIRM_VALUE) refuse("execute_needs_DLQ_RESEND_CONFIRM");
-  return { dlqUrl, targetUrl, selection, max, ratePerSecond, execute, visibilitySeconds, emptyReceivesToStop, maxScan, waitSeconds };
+  return { dlq, target, selection, max, ratePerSecond, execute, visibilitySeconds, emptyReceivesToStop, maxScan, waitSeconds };
+}
+
+// ---------------------------------------------------------------------------------------------
+// Credentials
+
+const ENV_KEYS = ["AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY", "AWS_SESSION_TOKEN"] as const;
+
+/**
+ * An assumed-role session from the environment (all three of AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY,
+ * AWS_SESSION_TOKEN), or, when none of them is set, AWS_PROFILE through `aws configure
+ * export-credentials --format process` (`exportProfile`), parsed and held in memory only. Some but not
+ * all of the three set is refused rather than falling through to the profile.
+ */
+export function operatorCredentials(
+  env: Record<string, string | undefined>,
+  exportProfile: (profile: string) => string,
+): AwsSessionCredentials {
+  const set = ENV_KEYS.filter((k) => !!env[k]);
+  if (set.length === ENV_KEYS.length)
+    return { accessKeyId: env.AWS_ACCESS_KEY_ID!, secretAccessKey: env.AWS_SECRET_ACCESS_KEY!, sessionToken: env.AWS_SESSION_TOKEN! };
+  if (set.length > 0) refuse("env_credentials_incomplete");
+  if (!env.AWS_PROFILE) refuse("no_aws_credentials");
+  let parsed: { AccessKeyId?: unknown; SecretAccessKey?: unknown; SessionToken?: unknown };
+  try {
+    parsed = JSON.parse(exportProfile(env.AWS_PROFILE!));
+  } catch {
+    return refuse("profile_credentials_unavailable");
+  }
+  if (typeof parsed.AccessKeyId !== "string" || !parsed.AccessKeyId || typeof parsed.SecretAccessKey !== "string" || !parsed.SecretAccessKey)
+    refuse("profile_credentials_incomplete");
+  return {
+    accessKeyId: parsed.AccessKeyId as string,
+    secretAccessKey: parsed.SecretAccessKey as string,
+    ...(typeof parsed.SessionToken === "string" && parsed.SessionToken ? { sessionToken: parsed.SessionToken } : {}),
+  };
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -260,33 +334,36 @@ export interface SqsMessage {
   Body: string;
   MessageAttributes?: Record<string, SqsMessageAttribute & Record<string, unknown>>;
 }
+export interface SendAck {
+  MessageId?: unknown;
+  MD5OfMessageBody?: unknown;
+}
 
-/** The five SQS calls the resend makes. Tests inject a fake; `awsSqsClient` is the real one. */
+/** The SQS calls the resend makes. Tests inject a fake; `awsSqsClient` is the real one. */
 export interface SqsClient {
-  approximateSize(queueUrl: string): Promise<number>;
+  attributes(queueUrl: string, names: string[]): Promise<Record<string, string>>;
   receive(queueUrl: string, args: { max: number; visibilitySeconds: number; waitSeconds: number }): Promise<SqsMessage[]>;
-  send(queueUrl: string, body: string, attributes?: Record<string, SqsMessageAttribute>): Promise<void>;
-  delete(queueUrl: string, receiptHandle: string): Promise<void>;
+  send(queueUrl: string, body: string, attributes: Record<string, SqsMessageAttribute> | undefined, timeoutMs: number): Promise<SendAck>;
+  delete(queueUrl: string, receiptHandle: string, timeoutMs: number): Promise<void>;
   setVisibility(queueUrl: string, receiptHandle: string, seconds: number): Promise<void>;
 }
 
-/** SQS over the JSON protocol (awsJsonCall: SigV4, no SDK). The region comes from each queue URL. */
-export function awsSqsClient(credentials: () => Promise<AwsSessionCredentials>, opts: { fallbackRegion?: string; fetcher?: typeof fetch } = {}): SqsClient {
-  const call = async <T>(queueUrl: string, action: string, body: Record<string, unknown>) =>
+/** SQS over the JSON protocol (awsJsonCall: SigV4, no SDK). The region comes from the validated queue URL. */
+export function awsSqsClient(credentials: () => Promise<AwsSessionCredentials>, opts: { fetcher?: typeof fetch } = {}): SqsClient {
+  const call = async <T>(queueUrl: string, action: string, body: Record<string, unknown>, timeoutMs: number) =>
     awsJsonCall<T>({
       service: "sqs",
       target: `AmazonSQS.${action}`,
-      region: queueRegion(queueUrl, opts.fallbackRegion),
+      region: parseQueueUrl(queueUrl).region,
       body: { QueueUrl: queueUrl, ...body },
       credentials: await credentials(),
-      timeoutMs: 30_000,
+      timeoutMs,
       ...(opts.fetcher ? { fetcher: opts.fetcher } : {}),
     });
   return {
-    async approximateSize(queueUrl) {
-      const out = await call<{ Attributes?: Record<string, string> }>(queueUrl, "GetQueueAttributes", { AttributeNames: ["ApproximateNumberOfMessages"] });
-      const n = Number(out.Attributes?.ApproximateNumberOfMessages ?? "0");
-      return Number.isFinite(n) && n >= 0 ? n : 0;
+    async attributes(queueUrl, names) {
+      const out = await call<{ Attributes?: Record<string, string> }>(queueUrl, "GetQueueAttributes", { AttributeNames: names }, 10_000);
+      return out.Attributes ?? {};
     },
     async receive(queueUrl, { max, visibilitySeconds, waitSeconds }) {
       const out = await call<{ Messages?: SqsMessage[] }>(queueUrl, "ReceiveMessage", {
@@ -294,17 +371,17 @@ export function awsSqsClient(credentials: () => Promise<AwsSessionCredentials>, 
         VisibilityTimeout: visibilitySeconds,
         WaitTimeSeconds: waitSeconds,
         MessageAttributeNames: ["All"],
-      });
+      }, (waitSeconds + 10) * 1000);
       return out.Messages ?? [];
     },
-    async send(queueUrl, body, attributes) {
-      await call(queueUrl, "SendMessage", { MessageBody: body, ...(attributes && Object.keys(attributes).length ? { MessageAttributes: attributes } : {}) });
+    async send(queueUrl, body, attributes, timeoutMs) {
+      return call<SendAck>(queueUrl, "SendMessage", { MessageBody: body, ...(attributes ? { MessageAttributes: attributes } : {}) }, timeoutMs);
     },
-    async delete(queueUrl, receiptHandle) {
-      await call(queueUrl, "DeleteMessage", { ReceiptHandle: receiptHandle });
+    async delete(queueUrl, receiptHandle, timeoutMs) {
+      await call(queueUrl, "DeleteMessage", { ReceiptHandle: receiptHandle }, timeoutMs);
     },
     async setVisibility(queueUrl, receiptHandle, seconds) {
-      await call(queueUrl, "ChangeMessageVisibility", { ReceiptHandle: receiptHandle, VisibilityTimeout: seconds });
+      await call(queueUrl, "ChangeMessageVisibility", { ReceiptHandle: receiptHandle, VisibilityTimeout: seconds }, 10_000);
     },
   };
 }
@@ -324,10 +401,34 @@ export function sendableAttributes(attrs: SqsMessage["MessageAttributes"]): Reco
   return Object.keys(out).length ? out : undefined;
 }
 
+/**
+ * The queue pair, proven before any receive: QueueArns equal to the URLs' ARNs and distinct, the
+ * target's RedrivePolicy dead-lettering into exactly this DLQ, and no RedrivePolicy on the DLQ.
+ * Returns the DLQ's approximate size.
+ */
+export async function verifyQueuePair(sqs: SqsClient, dlq: QueueRef, target: QueueRef): Promise<number> {
+  const names = ["QueueArn", "RedrivePolicy", "ApproximateNumberOfMessages"];
+  const d = await sqs.attributes(dlq.url, names);
+  const t = await sqs.attributes(target.url, names);
+  if (d.QueueArn !== dlq.arn) refuse("dlq_arn_does_not_match_url");
+  if (t.QueueArn !== target.arn) refuse("target_arn_does_not_match_url");
+  if (d.QueueArn === t.QueueArn) refuse("dlq_arn_equals_target_arn");
+  if (d.RedrivePolicy !== undefined && d.RedrivePolicy !== "") refuse("dlq_has_redrive_policy");
+  let deadLetterTargetArn: unknown;
+  try {
+    deadLetterTargetArn = (JSON.parse(t.RedrivePolicy ?? "") as { deadLetterTargetArn?: unknown }).deadLetterTargetArn;
+  } catch {
+    return refuse("target_has_no_redrive_policy");
+  }
+  if (deadLetterTargetArn !== dlq.arn) refuse("target_redrive_is_not_this_dlq");
+  const n = Number(d.ApproximateNumberOfMessages ?? "0");
+  return Number.isFinite(n) && n >= 0 ? n : 0;
+}
+
 // ---------------------------------------------------------------------------------------------
 // The scan
 
-export type StopReason = "cap_reached" | "empty_receives" | "max_scan" | "receive_failed";
+export type StopReason = "cap_reached" | "empty_receives" | "max_scan" | "receive_failed" | "halted_ambiguous_send" | "halted_delete_failure";
 
 export interface DlqResendSummary {
   event: "summary";
@@ -343,6 +444,10 @@ export interface DlqResendSummary {
   errors: number;
   errorCodes: Record<string, number>;
   duplicateRisk: number;
+  /** Holds extended (ChangeMessageVisibility) so a send and delete fit inside them. */
+  holdExtended: number;
+  /** Messages whose fate is unproven (sent or not): reconcile these by identity and bodySha256. */
+  reconcile: { identity: string; bodySha256: string; class: string; outcome: string }[];
   perClass: Record<string, number>;
   maxScan: number;
 }
@@ -351,30 +456,35 @@ export interface DlqResendDeps {
   sqs: SqsClient;
   /** One JSON-lines record (already hash-only). */
   emit: (record: Record<string, unknown>) => void;
+  /** Monotonic milliseconds. */
   now?: () => number;
   sleep?: (ms: number) => Promise<void>;
 }
 
 const errorCode = (e: unknown) => {
-  const code = (e as { code?: unknown })?.code;
+  const code = (e as { code?: unknown })?.code ?? (e as { name?: unknown })?.name;
   return typeof code === "string" && /^[A-Za-z0-9_.:-]{1,64}$/.test(code) ? code : "error";
 };
+/** Only an HTTP error answer from SQS proves a send did not commit; a 5xx, timeout or lost response may have. */
+const definitelyNotSent = (e: unknown) => e instanceof AwsCallError && e.status >= 400 && e.status < 500;
 const bump = (m: Record<string, number>, k: string) => {
   m[k] = (m[k] ?? 0) + 1;
 };
 
 export async function runDlqResend(options: DlqResendOptions, deps: DlqResendDeps): Promise<DlqResendSummary> {
-  const now = deps.now ?? Date.now;
+  const now = deps.now ?? (() => performance.now());
   const sleep = deps.sleep ?? ((ms: number) => new Promise<void>((r) => setTimeout(r, ms)));
   const { sqs, emit } = deps;
+  const dlqUrl = options.dlq.url;
   const mode = options.execute ? "execute" : "dry_run";
-  const sizeAtStart = await sqs.approximateSize(options.dlqUrl);
+  if (options.visibilitySeconds * 1000 <= HOLD_NEEDED_MS) refuse("visibility_shorter_than_send_and_delete");
+  const sizeAtStart = await verifyQueuePair(sqs, options.dlq, options.target);
   const maxScan = options.maxScan ?? Math.max(2 * sizeAtStart, 10);
-  emit({ event: "start", mode, max: options.max, rate: options.ratePerSecond, visibilitySeconds: options.visibilitySeconds, dlqApproximateSize: sizeAtStart, maxScan, selectionSize: options.selection.size });
+  emit({ event: "start", mode, max: options.max, rate: options.ratePerSecond, visibilitySeconds: options.visibilitySeconds, dlqApproximateSize: sizeAtStart, maxScan, selectionSize: options.selection.size, queuePair: "verified" });
 
   const s: DlqResendSummary = {
     event: "summary", mode, stop: "max_scan", scanned: 0, unique: 0, selected: 0, resent: 0, wouldResend: 0, skipped: 0,
-    skipReasons: {}, errors: 0, errorCodes: {}, duplicateRisk: 0, perClass: {}, maxScan,
+    skipReasons: {}, errors: 0, errorCodes: {}, duplicateRisk: 0, holdExtended: 0, reconcile: [], perClass: {}, maxScan,
   };
   /** Message ids already decided this run: a message seen again (visibility reset, a lapsed hold) is never acted on twice. */
   const decided = new Set<string>();
@@ -382,6 +492,7 @@ export async function runDlqResend(options: DlqResendOptions, deps: DlqResendDep
   let lastSendAt = -Infinity;
   let attempts = 0;
   let emptyStreak = 0;
+  let halted: StopReason | null = null;
 
   /** Visibility back to 0 at once; `reason` null (a dry-run would-resend) is not counted as skipped. */
   const release = async (m: SqsMessage, reason: string | null) => {
@@ -390,32 +501,35 @@ export async function runDlqResend(options: DlqResendOptions, deps: DlqResendDep
       bump(s.skipReasons, reason);
     }
     try {
-      await sqs.setVisibility(options.dlqUrl, m.ReceiptHandle, 0);
+      await sqs.setVisibility(dlqUrl, m.ReceiptHandle, 0);
     } catch (e) {
       s.errors++;
       bump(s.errorCodes, `visibility_reset:${errorCode(e)}`);
     }
   };
+  const ambiguous = (line: { identity: string; bodySha256: string; class: string }, outcome: string, stop: StopReason) => {
+    s.duplicateRisk++;
+    bump(s.errorCodes, outcome);
+    s.reconcile.push({ ...line, outcome });
+    emit({ event: "duplicate_risk", ...line, outcome });
+    halted = stop;
+  };
 
-  scan: while (true) {
+  while (true) {
     if (attempts >= options.max) { s.stop = "cap_reached"; break; }
     if (s.scanned >= maxScan) { s.stop = "max_scan"; break; }
+    // The hold is measured from before the call: the conservative end of every message in the batch.
+    const holdDeadline = now() + options.visibilitySeconds * 1000;
     let batch: SqsMessage[];
     try {
-      batch = await sqs.receive(options.dlqUrl, {
-        max: Math.min(10, maxScan - s.scanned),
-        visibilitySeconds: options.visibilitySeconds,
-        waitSeconds: options.waitSeconds,
-      });
+      batch = await sqs.receive(dlqUrl, { max: Math.min(10, maxScan - s.scanned), visibilitySeconds: options.visibilitySeconds, waitSeconds: options.waitSeconds });
     } catch (e) {
       s.errors++;
       bump(s.errorCodes, `receive:${errorCode(e)}`);
       s.stop = "receive_failed";
       break;
     }
-    const receivedAt = now();
-    // "Empty" means nothing new: a receive that returns only messages already decided this run
-    // (released ones come straight back) is no progress.
+    // "Empty" means nothing new: released messages come straight back, so repeats are no progress.
     if (!batch.some((m) => !decided.has(m.MessageId))) {
       for (const m of batch) { s.scanned++; await release(m, "repeat"); }
       if (++emptyStreak >= options.emptyReceivesToStop) { s.stop = "empty_receives"; break; }
@@ -424,6 +538,7 @@ export async function runDlqResend(options: DlqResendOptions, deps: DlqResendDep
     emptyStreak = 0;
     for (const m of batch) {
       s.scanned++;
+      if (halted) { await release(m, "halted"); continue; }
       if (decided.has(m.MessageId)) { await release(m, "repeat"); continue; }
       decided.add(m.MessageId);
       s.unique++;
@@ -434,47 +549,72 @@ export async function runDlqResend(options: DlqResendOptions, deps: DlqResendDep
       s.selected++;
       if (attempts >= options.max) { await release(m, "after_cap"); continue; }
       attempts++;
-      const line = { identity: id.identity, bodySha256: sha256Hex(m.Body).slice(0, 16), class: cls };
+      const code = classCode(cls);
+      const line = { identity: id.identity, bodySha256: sha256Hex(m.Body).slice(0, 16), class: code };
       if (!options.execute) {
         s.wouldResend++;
-        bump(s.perClass, cls);
+        bump(s.perClass, code);
         emit({ event: "would_resend", ...line });
         await release(m, null);
         continue;
       }
       const wait = lastSendAt + minIntervalMs - now();
       if (wait > 0) await sleep(wait);
-      if (now() - receivedAt > (options.visibilitySeconds - HOLD_MARGIN_SECONDS) * 1000) {
-        // The hold may lapse during the send: leave it in the DLQ rather than risk a second copy.
+      // Send and delete must both finish inside the hold, or the receipt could lapse and another receive
+      // (this run or a later one) could resend it. Extend the hold when it is short.
+      let deadline = holdDeadline;
+      if (deadline - now() < HOLD_NEEDED_MS) {
+        const before = now();
+        try {
+          await sqs.setVisibility(dlqUrl, m.ReceiptHandle, options.visibilitySeconds);
+          deadline = before + options.visibilitySeconds * 1000;
+          s.holdExtended++;
+        } catch (e) {
+          s.errors++;
+          bump(s.errorCodes, `hold_extend:${errorCode(e)}`);
+          emit({ event: "send_skipped", ...line, code: "hold_extend_failed" });
+          continue;
+        }
+      }
+      if (deadline - now() < HOLD_NEEDED_MS) {
         s.errors++;
-        bump(s.errorCodes, "hold_expiring");
-        emit({ event: "send_skipped", ...line, code: "hold_expiring" });
+        bump(s.errorCodes, "hold_too_short");
+        emit({ event: "send_skipped", ...line, code: "hold_too_short" });
         continue;
       }
       lastSendAt = now();
+      let ack: SendAck;
       try {
-        await sqs.send(options.targetUrl, m.Body, sendableAttributes(m.MessageAttributes));
+        ack = await sqs.send(options.target.url, m.Body, sendableAttributes(m.MessageAttributes), SEND_TIMEOUT_MS);
       } catch (e) {
-        // Left in the DLQ (no delete); it becomes visible again when the hold ends.
-        s.errors++;
-        bump(s.errorCodes, `send:${errorCode(e)}`);
-        emit({ event: "send_failed", ...line, code: errorCode(e) });
+        if (definitelyNotSent(e)) {
+          // Refused by SQS: left in the DLQ (no delete); it reappears when its hold ends.
+          s.errors++;
+          bump(s.errorCodes, `send:${errorCode(e)}`);
+          emit({ event: "send_failed", ...line, code: errorCode(e) });
+          continue;
+        }
+        ambiguous(line, `send_unconfirmed:${errorCode(e)}`, "halted_ambiguous_send");
+        continue;
+      }
+      if (typeof ack?.MessageId !== "string" || !ack.MessageId || ack.MD5OfMessageBody !== md5Hex(m.Body)) {
+        ambiguous(line, "send_ack_invalid", "halted_ambiguous_send");
         continue;
       }
       s.resent++;
-      bump(s.perClass, cls);
+      bump(s.perClass, code);
       try {
-        await sqs.delete(options.dlqUrl, m.ReceiptHandle);
-        emit({ event: "resent", ...line });
+        await sqs.delete(dlqUrl, m.ReceiptHandle, DELETE_TIMEOUT_MS);
       } catch (e) {
-        // Sent but still in the DLQ: a second copy may be resent later. The consumer is idempotent
-        // on the same key and revision, so this is a counted risk, not a loss.
-        s.duplicateRisk++;
-        bump(s.errorCodes, `delete:${errorCode(e)}`);
-        emit({ event: "resent", ...line, duplicateRisk: true, code: errorCode(e) });
+        // Sent but maybe still in the DLQ: a later run could resend it. Idempotent downstream on the same
+        // key and revision, but counted, reported and nothing more is sent.
+        ambiguous(line, `delete_unconfirmed:${errorCode(e)}`, "halted_delete_failure");
+        continue;
       }
+      emit({ event: "resent", ...line });
     }
-    if (attempts >= options.max) { s.stop = "cap_reached"; break scan; }
+    if (halted) { s.stop = halted; break; }
+    if (attempts >= options.max) { s.stop = "cap_reached"; break; }
   }
   emit({ ...s });
   return s;
