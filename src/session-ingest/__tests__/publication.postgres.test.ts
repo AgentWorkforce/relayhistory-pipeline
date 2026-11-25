@@ -451,22 +451,7 @@ describe.skipIf(!url)("scoped v1 real PostgreSQL qualification", () => {
       control.release();claimer.release(true);
     }
   },30000);
-  test("lost final acknowledgement replays only the same message set on the committed attempt",async()=>{
-    const {scopedPublicationRpc}=await import("../publication-scoped-rpc.ts");
-    const {d,binding}=await scopedFixture();
-    const rpc=scopedPublicationRpc({queryBounded:async(q:string,params:unknown[])=>d.run(q,params)} as never,d.target,binding);
-    let replays=0;
-    const watched={...rpc,publish:async(...args:Parameters<typeof rpc.publish>)=>{
-      const first=await rpc.publish(...args);expect(first.replay).toBe(false);
-      // New SQL transaction via pool; ignore the original success receipt to model response loss.
-      const second=await rpc.publish(...args);expect(second).toEqual({...first,replay:true});replays++;
-      await expect(rpc.publish(args[0],[],args[2])).rejects.toMatchObject({code:"40001"});
-      return second;
-    }};
-    expect(await canonicalPublicationTick({rpc:watched,target:d.target,store:()=>d.store},{enabled:true,candidateLimit:1})).toMatchObject({published:1});
-    expect(replays).toBe(1);
-    expect((await d.pool.query("SELECT state FROM sessions.ingest_publication_attempts")).rows).toEqual([{state:"published"}]);
-  },30000);
+
 });
 
 describe.skipIf(!url)("post-H scoped kernel proposal", () => {
@@ -556,6 +541,31 @@ describe.skipIf(!url)("post-H scoped kernel proposal", () => {
       expect(await canonicalPublicationTick({rpc,target:d.target,store:()=>d.store},{enabled:true,candidateLimit:1})).toMatchObject({published:1});
       expect((await d.pool.query("SELECT state FROM sessions.ingest_publication_attempts")).rows).toEqual([{state:"published"}]);
     } finally {await c.end();}
+  },30000);
+
+  test("the scoped host replays a lost final acknowledgement across dedicated connections",async()=>{
+    const {scopedPublicationRpc}=await import("../publication-scoped-rpc.ts");
+    const {d,binding,admit,connect}=await setup();
+    await admit();
+    let client=await connect();
+    const rpc=scopedPublicationRpc({queryBounded:async(q:string,params:unknown[])=>client.query(q,params)} as never,d.target,binding);
+    let replays=0;
+    const watched={...rpc,publish:async(...args:Parameters<typeof rpc.publish>)=>{
+      const first=await rpc.publish(...args);
+      expect(first.replay).toBe(false);
+      // Discard the acknowledged connection. Retry on a fresh dedicated login.
+      await client.end();client=await connect();
+      const second=await rpc.publish(...args);
+      expect(second).toEqual({...first,replay:true});
+      await expect(rpc.publish(args[0],[],args[2])).rejects.toMatchObject({code:"40001"});
+      replays++;
+      return second;
+    }};
+    try {
+      expect(await canonicalPublicationTick({rpc:watched,target:d.target,store:()=>d.store},{enabled:true,candidateLimit:1})).toMatchObject({published:1});
+      expect(replays).toBe(1);
+      expect((await d.pool.query("SELECT state FROM sessions.ingest_publication_attempts")).rows).toEqual([{state:"published"}]);
+    } finally {await client.end();}
   },30000);
 
   test("operator may recover exactly three expired claims; replay and stale tickets cannot supersede a newer attempt",async()=>{
