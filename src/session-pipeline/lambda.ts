@@ -81,9 +81,9 @@ import {
 import type { SqlExecutor } from "@rhc/lib/pipeline/queue.ts";
 import type { HoopDb } from "../shared/db.ts";
 import { errorFields, log } from "../shared/log.ts";
-import { awsJsonCall, invokeAsync, lambdaCredentials } from "./aws-json.ts";
+import { awsJsonCall, invokeAsync, lambdaCredentials, type AwsSessionCredentials } from "./aws-json.ts";
 import { createClickHouseClient } from "./vendor/search-index/clickhouse.ts";
-import { processBatch, type BatchResponse, type ConsumerDeps, type QueueRecord } from "./consumer.ts";
+import { processBatch, RETRY_VISIBILITY_TIMEOUT_MS, type BatchResponse, type ConsumerDeps, type QueueRecord } from "./consumer.ts";
 import { droppedFanout, scopeLockKey, type ScopeLock } from "./pointer.ts";
 import { searchIndexLimits, searchIndexStreamChFromEnv, type SearchIndexDeps, type SearchIndexStreamCh } from "./search-index.ts";
 import { claimSearchJobs, claimSearchProbe, runSearchJob, searchJobLogFields, searchSettlementFor, settleSearchJob, SEARCH_JOBS_DEFAULT_CLAIM, type ClaimedSearchJob, type SearchSql } from "./search-jobs.ts";
@@ -201,6 +201,14 @@ export interface LambdaEnv {
   searchJobs?: { claim: number };
   /** SEARCH_WAKE_ENQUEUE=1: the authority transaction writes the managed search-index wake. Absent (default): off. */
   searchWakeEnqueue?: true;
+  /**
+   * SESSION_PIPELINE_RETRY_VISIBILITY_S=<1..43200> (unset, "" or "0": off; 60 is the intended value; the backport
+   * lineage's grammar): a message whose pointer stage failed only with pointer_move_pending is redelivered after
+   * this many seconds instead of the queue's visibility timeout (consumer.ts retryVisibility). Needs
+   * sqs:ChangeMessageVisibility on the source queue for the Lambda role; without it the call fails, a warn is
+   * logged, and the message keeps the full timeout. Absent: as before.
+   */
+  retryVisibilityS?: number;
 }
 
 /**
@@ -285,6 +293,7 @@ export function lambdaEnv(env: NodeJS.ProcessEnv = process.env, composition?: Se
   if (searchJobs && env.SEARCH_INDEX_ENABLED !== "1")
     throw new Error("session pipeline: SEARCH_JOBS_ENABLED=1 needs SEARCH_INDEX_ENABLED=1");
   const searchWakeEnqueue = flagOne(env, "SEARCH_WAKE_ENQUEUE");
+  const retryVisibilityS = retryVisibilityFromEnv(env);
   return {
     searchBackend: selected.search,
     adapterEnv: Object.freeze(Object.fromEntries(Object.entries(env).filter(([key]) => key.startsWith("SEARCH_INDEX_") || ["PIPELINE_RUNTIME", "AWS_REGION", "READ_API_COMPLETE_SINCE"].includes(key)))),
@@ -320,7 +329,54 @@ export function lambdaEnv(env: NodeJS.ProcessEnv = process.env, composition?: Se
     ...(maximum === undefined ? {} : { readerMaxRuleset: maximum }),
     ...(searchJobs ? { searchJobs } : {}),
     ...(searchWakeEnqueue ? { searchWakeEnqueue: true as const } : {}),
+    ...(retryVisibilityS ? { retryVisibilityS } : {}),
   };
+}
+
+/** SESSION_PIPELINE_RETRY_VISIBILITY_S: unset, "" and "0" are off (0); else an integer 1..43200, or init fails naming the variable. */
+export function retryVisibilityFromEnv(env: Record<string, string | undefined>): number {
+  const value = env.SESSION_PIPELINE_RETRY_VISIBILITY_S;
+  if (value === undefined || value === "" || value === "0") return 0;
+  const n = /^[0-9]{1,5}$/.test(value) ? Number(value) : NaN;
+  if (!Number.isInteger(n) || n < 1 || n > 43_200) throw new Error("session pipeline: SESSION_PIPELINE_RETRY_VISIBILITY_S must be an integer from 0 to 43200");
+  return n;
+}
+
+/**
+ * The consumer's `retryVisibility.change` dep: one SQS ChangeMessageVisibility on the pipeline queue
+ * (SESSION_PIPELINE_QUEUE_URL, the queue `requeue` and the reconcile already send to), bounded by the caller's
+ * timeout and never more than RETRY_VISIBILITY_TIMEOUT_MS. Requires sqs:ChangeMessageVisibility on that queue
+ * for the Lambda role. `call` and `credentials` are injectable for tests.
+ */
+export function sqsChangeVisibility(
+  env: Pick<LambdaEnv, "region" | "queueUrl">,
+  call: typeof awsJsonCall = awsJsonCall,
+  credentials: () => AwsSessionCredentials = () => lambdaCredentials(),
+): NonNullable<ConsumerDeps["retryVisibility"]>["change"] {
+  return async (receiptHandle, seconds, timeoutMs) => {
+    await call({
+      service: "sqs",
+      target: "AmazonSQS.ChangeMessageVisibility",
+      region: env.region,
+      body: { QueueUrl: env.queueUrl, ReceiptHandle: receiptHandle, VisibilityTimeout: seconds },
+      credentials: credentials(),
+      timeoutMs: Math.min(timeoutMs, RETRY_VISIBILITY_TIMEOUT_MS),
+    });
+  };
+}
+
+type SqsRecord = { messageId: string; body: string; receiptHandle?: unknown };
+
+/**
+ * The consumer's view of the Lambda's SQS records: the message id and body, and the receipt handle only with
+ * `withReceiptHandle` (retryVisibility armed). Off: exactly the records as before.
+ */
+export function queueRecords(records: readonly SqsRecord[], withReceiptHandle = false): QueueRecord[] {
+  return records.map((r) => ({
+    messageId: r.messageId,
+    body: r.body,
+    ...(withReceiptHandle && typeof r.receiptHandle === "string" ? { receiptHandle: r.receiptHandle } : {}),
+  }));
 }
 
 /** A strict "1" switch: unset, "" and "0" are off; "1" is on; anything else fails init naming the variable. */
@@ -575,6 +631,8 @@ export function runtimeFromSecret(env: LambdaEnv, secretText: string, schemaGene
         credentials: lambdaCredentials(),
       });
     },
+    // Default off (SESSION_PIPELINE_RETRY_VISIBILITY_S).
+    ...(env.retryVisibilityS ? { retryVisibility: { seconds: env.retryVisibilityS, change: sqsChangeVisibility(env) } } : {}),
   };
   if (env.searchEnabled) {
     const portable = env.searchBackend && env.searchBackend !== "clickhouse";
@@ -875,11 +933,20 @@ export interface LambdaInvocationContext {
  * requeued, so the margin only has to cover the batch's whole reads and replay, never another stream.
  */
 export function invocationDeps(rt: Pick<Runtime, "env" | "deps">, context?: LambdaInvocationContext, now: () => number = Date.now): ConsumerDeps {
-  const deps = streamDeps(rt, context, now);
+  const deps = retryDeadlineDeps(streamDeps(rt, context, now), context);
   // SEARCH_JOBS_ENABLED (default off): the §5.1 follow-on claim after the batch. Off: the deps are unchanged.
   if (!rt.env.searchJobs || !deps.search) return deps;
   const search = deps.search;
   return { ...deps, searchJobs: { drain: () => drainSearchJobs({ sql: searchJobsSql(rt.deps.pointer.db), search, claim: rt.env.searchJobs!.claim, deadline: searchJobsDeadline(rt.env, context) }) } };
+}
+
+/**
+ * SESSION_PIPELINE_RETRY_VISIBILITY_S armed and a Lambda context (streaming or not): the consumer reads the
+ * invocation's remaining time right before its ChangeMessageVisibility calls. Otherwise `deps` itself.
+ */
+function retryDeadlineDeps(deps: ConsumerDeps, context?: LambdaInvocationContext): ConsumerDeps {
+  if (!deps.retryVisibility || typeof context?.getRemainingTimeInMillis !== "function") return deps;
+  return { ...deps, retryVisibility: { ...deps.retryVisibility, remainingMs: () => context.getRemainingTimeInMillis() } };
 }
 
 function streamDeps(rt: Pick<Runtime, "env" | "deps">, context?: LambdaInvocationContext, now: () => number = Date.now): ConsumerDeps {
@@ -988,7 +1055,7 @@ async function dispatchLambdaEvent(event: PipelineLambdaEvent, ready: () => Prom
       // Nothing was processed: every message goes back to the queue.
       return { batchItemFailures: event.Records.map((r) => ({ itemIdentifier: r.messageId })) };
     }
-    const records: QueueRecord[] = event.Records.map((r) => ({ messageId: r.messageId, body: r.body }));
+    const records: QueueRecord[] = queueRecords(event.Records, rt.deps.retryVisibility !== undefined);
     return processBatch(records, invocationDeps(rt, context));
   }
   if (event?.searchJobs === true) {
