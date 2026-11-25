@@ -133,3 +133,13 @@ test("a retained archive whose shape is not the stage's refuses the re-apply (55
   expect(await ledgered(pg)).toBe(false);
   expect((await checks(pg)).some((d) => d.includes("search-index"))).toBe(false);
 }, 180_000);
+
+test("a retained archive with a foreign trigger refuses the re-apply (55000) and leaves the slot unledgered", async () => {
+  const pg = await db();
+  expect(await down(pg)).toBeNull();
+  await pg.exec(`CREATE FUNCTION public.forged_archive_tap() RETURNS trigger LANGUAGE plpgsql AS $$BEGIN RETURN NEW; END$$;
+    CREATE TRIGGER forged_tap AFTER INSERT ON sessions.search_stage_archive FOR EACH ROW EXECUTE FUNCTION public.forged_archive_tap();`);
+  await expect(migrate(pg)).rejects.toThrow(/a trigger other than its seal/);
+  await pg.exec("ROLLBACK").catch(() => {});
+  expect(await ledgered(pg)).toBe(false);
+}, 180_000);

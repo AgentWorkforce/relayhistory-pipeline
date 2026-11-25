@@ -304,6 +304,15 @@ CREATE OR REPLACE TRIGGER search_stage_archive_seal BEFORE INSERT OR UPDATE OR D
   FOR EACH ROW EXECUTE FUNCTION sessions.search_stage_archive_seal_v1();
 CREATE OR REPLACE TRIGGER search_stage_archive_seal_truncate BEFORE TRUNCATE ON sessions.search_stage_archive
   FOR EACH STATEMENT EXECUTE FUNCTION sessions.search_stage_archive_seal_v1();
+-- A retained archive carries no other user trigger (only the two seal triggers above may fire on it). Else 55000.
+DO $archive_triggers$
+BEGIN
+ IF (SELECT array_agg(tgname::text ORDER BY tgname) FROM pg_trigger WHERE tgrelid = 'sessions.search_stage_archive'::regclass AND NOT tgisinternal)
+    IS DISTINCT FROM ARRAY['search_stage_archive_seal', 'search_stage_archive_seal_truncate']::text[]
+ THEN
+   RAISE EXCEPTION USING ERRCODE = '55000', MESSAGE = 'search stage archive: the retained archive carries a trigger other than its seal; nothing applied';
+ END IF;
+END $archive_triggers$;
 
 -- §8 [rev 7, rev 8]: the failure-safe archive, in ONE transaction under the table locks. Refuses (55000, nothing
 -- archived or deleted) while any search-index letter is not resolved or any search-index job row exists; then
