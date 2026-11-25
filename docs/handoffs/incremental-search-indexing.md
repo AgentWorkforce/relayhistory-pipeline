@@ -1,4 +1,4 @@
-# Incremental search indexing: committed wake and revision-aware passes (design M1, rev 3)
+# Incremental search indexing: committed wake and revision-aware passes (design M1, rev 4)
 
 Status: design for review. Code and plans only. No migration, deploy, flag, schedule or config change follows from
 this document without a separate production go per step (§9). Rev 2 closed the nine findings of the M1 review. Rev 3 closes the seven rev-2 findings (B1-B7), marked inline.
@@ -42,14 +42,18 @@ time):
 
 | Step | Budget |
 |---|---|
-| wake enqueue, inside the authority transaction (§2) | 0 s, same commit |
+| publish commit → authority transaction (object-landed queue, S3 event, SQS delay 30 s, ESM window up to 20 s; measured 7-10 s only with the reverted 5 s / 2 s settings) | today about 35-60 s; this is a SEPARATE commit from the publish |
+| wake enqueue, inside the authority transaction (§2) | 0 s after the authority commit |
 | claim: the in-invocation follow-on (§5.1) | under 1 s; else the next invocation or the schedule |
 | claim, worst case without traffic: the 1-min schedule | ≤ 60 s. This is the p99 driver, not p50 |
 | pass: committed-epoch check plus whole read (median scope) | about 0.5-2 s (today: pointer 0.7 s, reconcile 0.4 s median) |
 | total p50 | about 2-5 s after the authority transaction commits |
 
-The authority transaction runs when the Lambda processes the publication's event. After tonight's queue change
-(delay 5 s, window 2 s) that is about 7-10 s after the PUT, so commit → searchable p50 is about 10-15 s. The 1-min
+The authority transaction is a separate commit, made when the Lambda processes the publication's event: 30 s of
+queue delay plus up to 20 s of batching window today. A trial of 5 s / 2 s on 2026-11-25 raised latency at saturated
+concurrency and was reverted. So commit → searchable p50 is about 40-60 s until per-slot capacity rises (incremental
+apply, M3) and the queue settings can then be lowered. The 30 s p50 objective therefore depends on M3, and on
+re-running that batching trial afterwards. The 1-min
 schedule is only the floor for lost-wake recovery, never the primary path; that is the correction to rev 1's
 schedule claim.
 
@@ -105,11 +109,20 @@ replay tooling works unchanged:
   "workKey": "search␟<org>␟<ws>␟<harness>␟<canonical session id>",
   "revision": <pointer revision of this write, informational>,
   "payload": { "epoch": <session_directory.event_projection_epoch after this transaction's writes>,
-               "published_at": "<ingest_publication_attempts.published_at, ISO>" } }
+               "clock": { "source": "publish", "at": "<ingest_publication_attempts.published_at, ISO>" } } }
 ```
 
 - `epoch` is THE authority token for search (§4.4): one counter, the directory epoch, bumped by trigger on every
   `session_index` change, including tombstones.
+- **Clock source [rev 4]:** `payload.clock = {source, at}`. It is never null and never silently missing.
+  - `publish`: `ingest_publication_attempts.published_at` of the head's current attempt. Used by the managed enqueue,
+    and by managed catch-up through the same lookup.
+  - `pointer`: max(`session_index.indexed_at`) of the scope's live rows. Used by non-managed catch-up, which has no
+    publication attempt. That is the pointer write time, a later origin than the upload commit.
+  - `commit_to_searchable_ms` is emitted only for `source = publish`, and is labelled by source. `pointer` jobs report
+    `pointer_to_searchable_ms`, a separate series excluded from the commit SLO and shown beside it.
+  - Tests R5c (a managed catch-up job carries the publish clock) and R5d (a non-managed catch-up job carries the
+    pointer clock and emits no commit metric).
 - `revision` is carried for traces only and is never compared.
 
 ## 3. One row per scope: coalescing, claim, settlement [F3, B2, B3]
@@ -137,6 +150,11 @@ ON CONFLICT (work_key) WHERE stage = 'search-index'
 DO UPDATE SET
   message = CASE WHEN (EXCLUDED.message->'payload'->>'epoch')::bigint > (pipeline_jobs.message->'payload'->>'epoch')::bigint
                  THEN EXCLUDED.message ELSE pipeline_jobs.message END,
+  -- [rev 4] A NEW epoch is new work and gets its own budget. The active lease is kept; settlement compares epochs.
+  attempts = CASE WHEN (EXCLUDED.message->'payload'->>'epoch')::bigint > (pipeline_jobs.message->'payload'->>'epoch')::bigint
+                  THEN 0 ELSE pipeline_jobs.attempts END,
+  dlq = CASE WHEN (EXCLUDED.message->'payload'->>'epoch')::bigint > (pipeline_jobs.message->'payload'->>'epoch')::bigint
+             THEN false ELSE pipeline_jobs.dlq END,
   -- An unleased row becomes visible now. A leased row keeps its lease; settlement (3.3) reopens it if the wanted
   -- epoch moved on during the pass.
   visible_at = CASE WHEN pipeline_jobs.lease_id IS NULL THEN least(pipeline_jobs.visible_at, now()) ELSE pipeline_jobs.visible_at END;
@@ -160,8 +178,19 @@ lose a follow-up wake that arrived during the pass. Each statement keys on `(id,
   UPDATE sessions.pipeline_jobs SET lease_id = NULL, visible_at = now(), attempts = 0
    WHERE id = $id AND lease_id = $lease;
   ```
-- **retry:** `UPDATE … SET lease_id = NULL, visible_at = now() + backoff`. The single row cannot collide with
-  anything, because there is no second row.
+- **retry** [rev 4]: claimed-epoch aware, lease-bound:
+  ```sql
+  UPDATE sessions.pipeline_jobs
+     SET lease_id = NULL,
+         visible_at = CASE WHEN (message->'payload'->>'epoch')::bigint > $claimed_epoch THEN now() ELSE now() + $backoff END,
+         attempts   = CASE WHEN (message->'payload'->>'epoch')::bigint > $claimed_epoch THEN 0 ELSE attempts END
+   WHERE id = $id AND lease_id = $lease;
+  ```
+  - If the wanted epoch moved during the attempt, the row reopens now with a fresh budget.
+  - The single row cannot collide with anything.
+  - Only this stage-specific settler is authoritative for `search-index`. The generic `postgresStageConsumer`
+    settlement must never settle this stage (enforced by not registering the stage with the generic runWorker;
+    test R6g).
 - **exhausted** (held acceptance after 12 attempts, §4.5): the same claimed-epoch guard as `done`, in ONE
   transaction bound to the lease, so exhaustion can never discard a newer wake:
   ```sql
@@ -181,6 +210,23 @@ lose a follow-up wake that arrived during the pass. Each statement keys on `(id,
   - Test R4b: N exhausts after N+1 merged into the leased row. N lands in dead letters; the row survives with
     epoch N+1 and attempts 0.
 
+### 3.3b Dead-letter replay [rev 4]
+
+Replay of a `search-index` dead letter is stage-aware. It never uses the generic replay send, because that would hit
+the unique scope row. One transaction:
+
+1. mark the letter `replaying` with a new replay id (the existing `postgres-dead-letters.ts` states);
+2. run the §3.1 upsert with the letter's message, plus `payload.replay_id`;
+3. then one of:
+   - **superseded:** the row already carries an epoch at or above the letter's (the upsert kept the row's message).
+     Mark the letter `resolved` (reason `superseded`) in the SAME transaction. Newer work covers it, so it can never
+     stay stuck in `replaying`;
+   - **merged:** the row now carries the letter's epoch and replay id. The §3.3 `done` settlement resolves the letter
+     by `last_replay_id = payload.replay_id`, in the same transaction as its DELETE. `exhausted` re-quarantines it
+     (state back to `quarantined`).
+
+Tests: R8a (superseded resolves at once), R8b (merged resolves on done).
+
 ### 3.4 Races
 
 | Case | Outcome |
@@ -189,6 +235,9 @@ lose a follow-up wake that arrived during the pass. Each statement keys on `(id,
 | N leased, wake N+1 during the pass | the same row's message becomes N+1; `done` with claimed N fails the DELETE guard and reopens; N+1 runs next |
 | N leased, the pass retries, wake N+1 arrives | the retry reopens the single row, now carrying N+1; no collision |
 | N leased, then the worker crashes | the lease expires; the same row is reclaimed with the max epoch |
+| unleased N at attempt 11, wake N+1 | the row carries N+1 with attempts 0 (new budget) |
+| N leased at attempt 11, wake N+1, the attempt fails | the retry reopens now with attempts 0, carrying N+1 |
+| N leased at attempt 12, wake N+1, N exhausts | N parked (claimed snapshot); the row stays with N+1, attempts 0 |
 | late older wake (epoch below the row's) | the CASE keeps the higher epoch |
 
 Tests R1a (coalescing), R1b (crash reclaim), R1d (done with a follow-up reopens), R1e (retry with a follow-up: one
@@ -423,7 +472,11 @@ Stop lines for 4 and 5 are the A+C set, plus: `search-index` oldest open job ove
 | R4 | acceptance missing past max attempts: quarantined, scope not ready, never in a search result | absent |
 | R4b | N exhausts after a wake N+1 merged into the leased row: only N is parked; the row survives with N+1 and a fresh budget | absent |
 | R5 | the publish clock: a job delayed in the queue reports `commit_to_searchable_ms` that includes the delay, measured from `published_at` | absent |
-| R7 | M3: a chunk with the same seq and a changed content sha256 forces a full pass (watermark mismatch) | absent |
+| R7 | M3 milestone (not in the M1b file): a chunk with the same seq and a changed content sha256 forces a full pass. It lands as a red fixture at the start of M3, with the compaction and CAS cases | deferred to M3 |
+| R1f | wake N+1 during N's exhausting attempt: no N+1 dead letter, the row survives with N+1 | absent |
+| R6g | the generic runWorker / postgresStageConsumer is not registered for `search-index` | absent |
+| R8a/b | stage-aware replay: superseded resolves at once; merged resolves on done | absent |
+| R5c/d | catch-up clock: publish for managed, pointer for non-managed; no null clock | absent |
 | R6 | every closed stage list has the same set, including `search-index` | absent |
 
 These tests land on a separate head after this doc, with exact commands and outputs.
