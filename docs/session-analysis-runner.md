@@ -154,10 +154,10 @@ With `LOCKER_PROVIDER=azure`, every `SESSION_ANALYSIS_S3_*` setting must be unse
 operator erase can erase decision records on Azure. Shared Key is the only auth: SAS is out of scope, and Entra
 workload identity is a later slice.
 
-**What S2 delivers, and what it does not.** S2 delivers the Azure store, the startup proof, the sweeper and the strict
-erase. **On its own it runs no analysis job on Azure:** the read API's POST is not wired to Azure until S2b, and the
-claims scheduler needs `SUMMARY_DECISION_RECORDS_ENABLED=true`, which this path refuses. The first job on Azure needs
-S2b (the read API on the Azure store) or the operator-erase slice (which lifts the decision-records refusal).
+**What S2 and S2b deliver, and what they do not.** S2 delivers the Azure store, the startup proof, the sweeper and
+the strict erase. S2b wires the read API to the same Azure store, so `POST /v1/sessions/:id/analysis` admits jobs on
+Azure and `GET` serves their results ([below](#read-api-on-azure-slice-s2b)). The claims scheduler stays off on Azure: it
+needs `SUMMARY_DECISION_RECORDS_ENABLED=true`, which this path refuses until the operator-erase slice.
 
 **Account prerequisites.**
 
@@ -223,10 +223,6 @@ meets one fails as `analysis_store_redirect`, non-retryable, rather than burning
 
 **Not covered yet on Azure.**
 
-- **The read API on Azure.** Its `POST /v1/sessions/:id/analysis` and its result reads use an S3 client
-  (`READ_API_ANALYSIS_BUCKET`). On `LOCKER_PROVIDER=azure` the read API ignores that variable with one startup warning
-  (`read_api_analysis_bucket_ignored_on_azure`), builds neither the S3 client nor the admission pool, and answers 501
-  `analysis_not_configured`. Until S2b, results on Azure are not readable through the read API either.
 - **`SUMMARY_DECISION_RECORDS_ENABLED` is refused on Azure** (`azure_decision_records_unsupported`) until the
   self-host operator erase adopts the Azure eraser (its own slice). Today that erase refuses anything but S3.
 - **Proof.** CI (`pg-proof.yml`) runs `runner-store.azurite.test.ts` against Azurite 3.38.0 pinned by digest.
@@ -235,6 +231,27 @@ meets one fails as `analysis_store_redirect`, non-retryable, rather than burning
   against the in-memory fake server (`azure-blob-eraser.test.ts`, `blob-versioning.test.ts`). **A run against a
   real Azure storage account (soft delete on and off, permanent delete on and off) is still owed** and is not
   part of S2.
+
+### Read API on Azure (slice S2b)
+
+On `LOCKER_PROVIDER=azure` the read API builds its analysis store with **the runner's own settings parser**
+(`src/shared/azure-blob-settings.ts`: `SESSION_ANALYSIS_AZURE_ACCOUNT`, `_CONTAINER`, optional `_ENDPOINT`, and
+`_ACCOUNT_KEY_FILE`). It uses Shared Key and never follows a redirect. `READ_API_ANALYSIS_BUCKET` switches analysis on,
+exactly as on S3, and must name that same container. Admission (`POST`) uses the existing admission pool. Default
+off: with `READ_API_ANALYSIS_BUCKET` unset, the routes answer 501 `analysis_not_configured` as before.
+
+A setting the parser refuses, or a `READ_API_ANALYSIS_BUCKET` naming another container, leaves analysis unconfigured
+(501) and logs one startup warning: `read_api_analysis_azure_settings_invalid` (with the parser's `error_code`) or
+`read_api_analysis_container_mismatch`. The read API still starts; analysis never takes reads down.
+
+**Result reads are the current object at the job's result key**, verified against the recorded sha256 and size
+(`readAnalysisResult`), exactly as the S3 read API does. They are not pinned to the owned version id. That is safe
+because result keys are written create-only, one per job and digest. A later version at the same key can only be
+a re-put of identical bytes, which is served and is correct, or a write from outside the runner, which fails the
+digest check. A version with different bytes makes the result unavailable (503 `backend_unavailable`); its bytes
+are never served. What this does not give is a fallback to the owned version when someone else overwrites the key.
+**Version-pinned reads are slice S2c** (a migration exposing `result_version_id` in the read RPC, plus a versioned
+get on both stores). S2c needs a migration author and is listed as an unassigned follow-up.
 
 The runner does not read `OPENAI_BASE_URL`, `AWS_REGION` or the Lambda's
 `SESSION_PIPELINE_SECRET_ARN`. This keeps the model endpoint and the bucket region exactly the

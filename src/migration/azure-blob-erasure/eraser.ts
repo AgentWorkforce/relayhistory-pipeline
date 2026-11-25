@@ -54,24 +54,6 @@ const SNAPSHOT = "snapshot:";
 const cmpC = (a: string, b: string) => (a < b ? -1 : a > b ? 1 : 0);
 const CONTROL = /[\x00-\x1f\x7f]/u;
 
-/**
- * A fetch for the Azure STORE (createAzureBlobStore) that never follows a redirect: every request is sent with
- * redirect "manual", and a 3xx (or an opaque redirect) is cancelled and thrown as `azure_redirect`, so a Shared Key
- * signed request (a put body included) is never replayed to another location. core.ts `send` wraps the throw as a
- * transient store error whose `cause` carries the code.
- */
-export function azureNoRedirectFetch(inner?: typeof fetch): typeof fetch {
-  const doFetch = inner ?? ((...a: Parameters<typeof fetch>) => fetch(...a));
-  return (async (input: Parameters<typeof fetch>[0], init?: RequestInit) => {
-    const res = await doFetch(input, { ...init, redirect: "manual" });
-    if (res.type === "opaqueredirect" || res.redirected || (res.status >= 300 && res.status < 400)) {
-      await res.body?.cancel().catch(() => {});
-      throw coded("azure_redirect", "Azure answered a redirect");
-    }
-    return res;
-  }) as typeof fetch;
-}
-
 /** The checkpoint binding label: account and container, so a checkpoint never crosses either. */
 export function azureEraserLabel(account: string, container: string): string {
   return `azure:${account}/${container}`;

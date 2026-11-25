@@ -14,10 +14,12 @@ import { sqlRelayfacts } from "./relayfacts.ts";
  * Session analysis (lane F1), off unless configured:
  *   READ_API_ANALYSIS_BUCKET   the canonical bucket holding analysis result objects (the
  *                              read role's GET is served; unset = 501 analysis_not_configured).
- *                              S3 only: with LOCKER_PROVIDER=azure it is ignored (analysis stays
- *                              unconfigured, no S3 client is built) with one startup warning,
- *                              read_api_analysis_bucket_ignored_on_azure, until the Locker-store
- *                              read path (S2b) lands.
+ *                              With LOCKER_PROVIDER=azure it names the Azure container instead:
+ *                              the store is built from the runner's own settings parser
+ *                              (src/shared/azure-blob-settings.ts, SESSION_ANALYSIS_AZURE_*), Shared
+ *                              Key, never following a redirect, and must name the same container.
+ *                              Invalid settings or another container leave analysis unconfigured
+ *                              (501) with one coded startup warning; reads never fail to start.
  *   "analysis_admit_url"       optional secret field: postgresql://bulls96_analysis_admit:…,
  *                              the separate admission principal; absent = POST 501.
  * POST is accepted for exactly /v1/sessions/:id/analysis; every other method/path is 405.
@@ -112,6 +114,9 @@ import { parseAdvisoryNotifyRows, READ_API_ADVISORY_NOTIFY_ROWS } from "./adviso
 import { poolTenantRunner, sqlLiveness, sqlOperatorErased, type SqlQuery } from "./liveness.ts";
 import { ERASE_FENCE_FLAG, eraseRuntimeFlag } from "../session-erase/flags.ts";
 import { createS3Store } from "../shared/vendor.ts";
+import { createAzureBlobStore, type AzureBlobConfig } from "../../packages/object-store/src/azure.ts";
+import type { ObjectStore } from "../../packages/object-store/src/index.ts";
+import { azureAccountKey, azureBlobSettings, azureNoRedirectFetch } from "../shared/azure-blob-settings.ts";
 import { sqlAnalysisSource } from "./analysis-source.ts";
 import { sqlNarrativeCache, type DigestNarrativeDeps } from "./digest-narrative.ts";
 import { postgresOutputBackend } from "./postgres/output-query.ts";
@@ -710,9 +715,8 @@ export async function readApiDepsFromSecret(secretText: string, env: NodeJS.Proc
     options: "-c statement_timeout=2000", // Nonempty: pg otherwise uses PGOPTIONS.
   });
   pool.on("error", (err) => log.error("read api pool error", { error_code: (err as { code?: string }).code ?? "pool_error" }));
-  // The admission principal: its own pool, never the read role's. Not built on LOCKER_PROVIDER=azure, where
-  // analysis is unconfigured until S2b (readApiAnalysisBucket), so the pool would never be used.
-  const admitPool = secret.analysis_admit_url && env.LOCKER_PROVIDER?.trim() !== "azure"
+  // The admission principal: its own pool, never the read role's.
+  const admitPool = secret.analysis_admit_url
     ? new pg.Pool({
         connectionString: postgresConnectionString(secret.analysis_admit_url),
         max: 1,
@@ -893,32 +897,48 @@ return async function readApiHandler(event: FunctionUrlEvent): Promise<FunctionU
 
 export const handler = createReadApiLambdaHandler();
 
-/**
- * READ_API_ANALYSIS_BUCKET as the analysis source's S3 bucket, or undefined (analysis unconfigured: 501). On
- * LOCKER_PROVIDER=azure the S3 result reader does not apply, so the variable is ignored with one coded startup
- * warning and no S3 client is built; the Azure store path is S2b.
- */
+/** READ_API_ANALYSIS_BUCKET, trimmed; unset or blank leaves analysis unconfigured (the routes answer 501). */
 export function readApiAnalysisBucket(env: NodeJS.ProcessEnv): string | undefined {
-  const bucket = env.READ_API_ANALYSIS_BUCKET?.trim();
-  if (!bucket) return undefined;
-  if (env.LOCKER_PROVIDER?.trim() !== "azure") return bucket;
-  log.warn("read api analysis not configured", { reason: "read_api_analysis_bucket_ignored_on_azure" });
-  return undefined;
+  return env.READ_API_ANALYSIS_BUCKET?.trim() || undefined;
 }
 
 /**
- * The read API's analysis source: the S3 result store over READ_API_ANALYSIS_BUCKET, or undefined (the routes
- * answer 501 analysis_not_configured). On LOCKER_PROVIDER=azure it is always undefined and no S3 client is built
- * (readApiAnalysisBucket). `makeStore` is a test port.
+ * The read API's analysis source, or undefined (the routes answer 501 analysis_not_configured):
+ *   - unset LOCKER_PROVIDER, s3, gcs, fs: the S3 result store over READ_API_ANALYSIS_BUCKET, exactly as before;
+ *   - LOCKER_PROVIDER=azure: the Azure store over the runner's settings (azureBlobSettings, azureAccountKey), Shared
+ *     Key, never following a redirect; READ_API_ANALYSIS_BUCKET must name that container. A settings failure or
+ *     another container logs one coded warning and leaves analysis unconfigured, so reads still start.
+ * Results are the CURRENT object at the job's result key, verified against its recorded sha256 and size
+ * (readAnalysisResult); reading the exact owned version (analysis_read_v2 + a versioned get) is slice S2c.
+ * `makeStore` / `makeAzureStore` are test ports.
  */
 export function readApiAnalysisSource(
   env: NodeJS.ProcessEnv,
   run: Parameters<typeof sqlAnalysisSource>[0],
   admit?: Parameters<typeof sqlAnalysisSource>[2],
   makeStore: typeof createS3Store = createS3Store,
+  makeAzureStore: (config: AzureBlobConfig) => ObjectStore = (c) => createAzureBlobStore(c) as unknown as ObjectStore,
 ): ReturnType<typeof sqlAnalysisSource> | undefined {
   const bucket = readApiAnalysisBucket(env);
-  return bucket
-    ? sqlAnalysisSource(run, makeStore({ bucket, region: env.AWS_REGION ?? "", credentials: async () => lambdaCredentials() }), admit)
-    : undefined;
+  if (!bucket) return undefined;
+  if (env.LOCKER_PROVIDER?.trim() !== "azure")
+    return sqlAnalysisSource(run, makeStore({ bucket, region: env.AWS_REGION ?? "", credentials: async () => lambdaCredentials() }), admit);
+  const fail = (code: string): never => { throw Object.assign(new Error(code), { code }); };
+  let settings: ReturnType<typeof azureBlobSettings>, key: ReturnType<typeof azureAccountKey>;
+  try {
+    settings = azureBlobSettings(env, fail);
+    key = azureAccountKey(env, fail);
+  } catch (error) {
+    log.warn("read api analysis not configured", { reason: "read_api_analysis_azure_settings_invalid", error_code: (error as { code?: string }).code ?? "invalid" });
+    return undefined;
+  }
+  if (settings.container !== bucket) {
+    log.warn("read api analysis not configured", { reason: "read_api_analysis_container_mismatch" });
+    return undefined;
+  }
+  const store = makeAzureStore({
+    account: settings.account, container: settings.container, ...(settings.endpoint ? { endpoint: settings.endpoint } : {}),
+    auth: { kind: "sharedKey", accountKey: key.accountKey() }, fetch: azureNoRedirectFetch(),
+  });
+  return sqlAnalysisSource(run, store, admit);
 }

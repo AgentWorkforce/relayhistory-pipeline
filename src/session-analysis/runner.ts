@@ -67,13 +67,11 @@
  */
 import { createServer, type Server } from "node:http";
 import type { AddressInfo } from "node:net";
-import { readFileSync, statSync } from "node:fs";
-import { isAbsolute } from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
 import { createS3Store, type ObjectStore } from "../../packages/object-store/src/index.ts";
 import { createAzureBlobStore, type AzureBlobConfig } from "../../packages/object-store/src/azure.ts";
-import { fromBase64 } from "../../packages/object-store/src/crypto.ts";
-import { azureNoRedirectFetch, createAzureBlobEraser, type AzureBlobEraserConfig } from "../migration/azure-blob-erasure/eraser.ts";
+import { azureAccountKey, azureBlobSettings, azureNoRedirectFetch, envSecret, type AzureBlobSettings } from "../shared/azure-blob-settings.ts";
+import { createAzureBlobEraser, type AzureBlobEraserConfig } from "../migration/azure-blob-erasure/eraser.ts";
 import { probeBlobVersioning, runnerProbePrefix, type BlobVersioningCheck, type BlobVersioningVerdict } from "./blob-versioning.ts";
 import { cachedProvider } from "../../packages/object-store/src/core.ts";
 import type { AwsCredentials } from "../../packages/object-store/src/sigv4.ts";
@@ -123,13 +121,8 @@ export function analysisRunnerEnabled(env: NodeJS.ProcessEnv): boolean {
 /** "sharedKey": LOCKER_PROVIDER=azure (the account key file); never an S3 credentials source. */
 export type RunnerCredentialMode = "podIdentity" | "role" | "static" | "sharedKey";
 
-/** LOCKER_PROVIDER=azure's store settings (no secret). */
-export interface RunnerAzureConfig {
-  account: string;
-  container: string;
-  /** The blob endpoint as validated (origin, plus /<account> for path-style). Absent: the public Azure endpoint. */
-  endpoint?: string;
-}
+/** LOCKER_PROVIDER=azure's store settings (no secret): the shared parser's result (src/shared/azure-blob-settings.ts). */
+export type RunnerAzureConfig = AzureBlobSettings;
 
 export interface AnalysisRunnerConfig {
   tickMs: number;
@@ -203,21 +196,7 @@ const AZURE_CONFLICTING_S3_VARS = [
  */
 export function runnerAzureConfig(env: NodeJS.ProcessEnv): RunnerAzureConfig {
   if (AZURE_CONFLICTING_S3_VARS.some((name) => env[name] !== undefined && env[name] !== "")) refuse("azure_s3_settings_conflict");
-  const account = env.SESSION_ANALYSIS_AZURE_ACCOUNT ?? "";
-  if (!/^[a-z0-9]{3,24}$/.test(account)) refuse("azure_account_invalid");
-  const container = env.SESSION_ANALYSIS_AZURE_CONTAINER ?? "";
-  if (!/^(?=.{3,63}$)[a-z0-9]+(?:-[a-z0-9]+)*$/.test(container)) refuse("azure_container_invalid");
-  const plain = env.SESSION_ANALYSIS_AZURE_ACCOUNT_KEY;
-  if (plain !== undefined && plain !== "") refuse("azure_account_key_plaintext");
-  const raw = env.SESSION_ANALYSIS_AZURE_ENDPOINT;
-  if (raw === undefined || raw === "") return { account, container };
-  let policy: ReturnType<typeof destinationPolicy>;
-  try { policy = destinationPolicy(env); } catch { return refuse("allow_in_cluster_http_invalid"); }
-  let url: URL;
-  try { url = assertDestinationUrl("SESSION_ANALYSIS_AZURE_ENDPOINT", raw, policy); } catch { return refuse("azure_endpoint_invalid"); }
-  const path = url.pathname.replace(/\/+$/, "");
-  if (path !== "" && path !== `/${account}`) refuse("azure_endpoint_invalid");
-  return { account, container, endpoint: `${url.origin}${path}` };
+  return azureBlobSettings(env, refuse);
 }
 
 /** Every setting of an enabled runner, validated before anything listens. Never reads a secret. */
@@ -313,24 +292,7 @@ function runnerProcessSettings(env: NodeJS.ProcessEnv) {
  * 1..65536 bytes; one trailing newline is dropped). Refusal codes name the variable, never its value.
  */
 export function runnerSecret(env: NodeJS.ProcessEnv, name: string, code: string): string {
-  const value = env[name], file = env[`${name}_FILE`];
-  if (value !== undefined && value !== "" && file !== undefined && file !== "") refuse(`${code}_ambiguous`);
-  let text = value ?? "";
-  if (file !== undefined && file !== "") {
-    if (!isAbsolute(file)) refuse(`${code}_invalid`);
-    try {
-      const st = statSync(file);
-      if (!st.isFile() || st.size < 1 || st.size > 65_536) refuse(`${code}_invalid`);
-      text = readFileSync(file, "utf8").replace(/\r?\n$/, "");
-    } catch (e) {
-      if (e instanceof AnalysisRunnerRefused) throw e;
-      refuse(`${code}_unreadable`);
-    }
-  }
-  if (!text) refuse(`${code}_missing`);
-  // eslint-disable-next-line no-control-regex
-  if (/[\u0000-\u001f\u007f\s]/.test(text)) refuse(`${code}_invalid`);
-  return text;
+  return envSecret(env, name, code, refuse);
 }
 
 export interface RunnerSecrets {
@@ -357,17 +319,7 @@ export function runnerSecrets(env: NodeJS.ProcessEnv): RunnerSecrets {
  * strict padded base64 of at least 32 bytes. Returned behind a closure.
  */
 export function runnerAzureKey(env: NodeJS.ProcessEnv): { accountKey: () => string } {
-  const plain = env.SESSION_ANALYSIS_AZURE_ACCOUNT_KEY;
-  if (plain !== undefined && plain !== "") refuse("azure_account_key_plaintext");
-  const file = env.SESSION_ANALYSIS_AZURE_ACCOUNT_KEY_FILE;
-  if (file === undefined || file === "") refuse("azure_account_key_missing");
-  const key = runnerSecret(env, "SESSION_ANALYSIS_AZURE_ACCOUNT_KEY", "azure_account_key");
-  let bytes = 0;
-  if (key.length % 4 === 0 && /^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/.test(key)) {
-    try { bytes = fromBase64(key).length; } catch { bytes = 0; }
-  }
-  if (bytes < 32) refuse("azure_account_key_invalid");
-  return { accountKey: () => key };
+  return azureAccountKey(env, refuse);
 }
 
 /** Static S3 keys (MinIO, or any S3-compatible store), each from exactly one of `<name>` or `<name>_FILE`. */
