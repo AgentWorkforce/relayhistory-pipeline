@@ -162,9 +162,24 @@ lose a follow-up wake that arrived during the pass. Each statement keys on `(id,
   ```
 - **retry:** `UPDATE … SET lease_id = NULL, visible_at = now() + backoff`. The single row cannot collide with
   anything, because there is no second row.
-- **exhausted** (held acceptance after 12 attempts, §4.5): in ONE transaction, INSERT into `pipeline_dead_letters`
-  (stage `search-index`, reason `retries_exhausted`, the StageMessage), then DELETE the row.
+- **exhausted** (held acceptance after 12 attempts, §4.5): the same claimed-epoch guard as `done`, in ONE
+  transaction bound to the lease, so exhaustion can never discard a newer wake:
+  ```sql
+  -- a) Park the CLAIMED message only (the message as it was at claim time, $claimed_msg; epoch = claimed_epoch).
+  INSERT INTO sessions.pipeline_dead_letters (stage, …, message, error_code)
+    SELECT 'search-index', …, $claimed_msg, 'retries_exhausted'
+      FROM sessions.pipeline_jobs WHERE id = $id AND lease_id = $lease;     -- 0 rows if the lease was lost: abort
+  -- b) No newer wake: delete the row.
+  DELETE FROM sessions.pipeline_jobs WHERE id = $id AND lease_id = $lease
+    AND (message->'payload'->>'epoch')::bigint <= $claimed_epoch;
+  -- c) A newer wake arrived during the lease: keep the row, with a fresh budget, visible now.
+  UPDATE sessions.pipeline_jobs SET lease_id = NULL, visible_at = now(), attempts = 0
+   WHERE id = $id AND lease_id = $lease;
+  ```
+  - If (a) matched 0 rows (the lease was lost), the transaction aborts and nothing is parked or deleted.
   - A later wake inserts a fresh row, so a newly accepted revision is not blocked by an old quarantine.
+  - Test R4b: N exhausts after N+1 merged into the leased row. N lands in dead letters; the row survives with
+    epoch N+1 and attempts 0.
 
 ### 3.4 Races
 
@@ -406,6 +421,7 @@ Stop lines for 4 and 5 are the A+C set, plus: `search-index` oldest open job ove
 | R3c | a recreate race (fence, then a newer live generation): live wins | absent |
 | R3d | a stale queued epoch after a newer one is indexed: `unchanged` | absent |
 | R4 | acceptance missing past max attempts: quarantined, scope not ready, never in a search result | absent |
+| R4b | N exhausts after a wake N+1 merged into the leased row: only N is parked; the row survives with N+1 and a fresh budget | absent |
 | R5 | the publish clock: a job delayed in the queue reports `commit_to_searchable_ms` that includes the delay, measured from `published_at` | absent |
 | R7 | M3: a chunk with the same seq and a changed content sha256 forces a full pass (watermark mismatch) | absent |
 | R6 | every closed stage list has the same set, including `search-index` | absent |
