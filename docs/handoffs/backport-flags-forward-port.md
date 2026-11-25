@@ -141,3 +141,70 @@ the message and does not report a batch item failure.
 - **Known gap.** A live scrubbed row that the read would still refuse is counted in the sum. Two such
   refusals are a key mismatch and a scrub ruleset above `READER_MAX_RULESET`. The normal pass for such a
   scope is incomplete as well, and it indexes nothing either.
+
+## SESSION_PIPELINE_RETRY_VISIBILITY_S
+
+The backport commits are ae153e62 and 35cf5404, on `review/pipeline-handoff-sfmini-pmp-fast-retry`.
+
+### Grammar
+
+| Value | Result |
+| --- | --- |
+| unset, `""`, `0` | Off. |
+| an integer from 1 to 43200 | On. 60 is the intended value. |
+| anything else | Init fails and names the variable. Examples: `60s`, ` 60`, `1.5`, `43201`, a value of more than five digits. |
+
+### What it does
+
+A message can fail in the pointer stage with exactly `pointer_move_pending`. If that message fed no other
+failure of the batch, it gets one SQS `ChangeMessageVisibility` call with the configured seconds. The
+message is still returned in `batchItemFailures`. A message that also fed any other failure keeps the
+queue's full visibility timeout. The other failures are:
+
+- another key's pointer error;
+- an invalid record;
+- a buffered-stage feed;
+- the large-read route;
+- the search pass;
+- the replay publication.
+
+On main, the search pass skips a scope whose every message already failed. A pmp message that only shares
+such a scope is therefore still pmp-only.
+
+The receipt handle reaches the consumer only while the flag is armed (`queueRecords`). It is used only as
+the call's argument and is never logged.
+
+Each call is best effort:
+
+- **Bound.** Each call is bounded by `min(2 s, remaining - 1 s)`. The same bound goes to the SQS request
+  timeout. The calls run concurrently.
+- **Failure.** A rejected call logs the warn line `retry visibility not shortened` with the reason
+  `change_visibility_failed`. A call that times out logs it with the reason `change_visibility_timeout`. A
+  missing receipt handle logs it with the reason `no_receipt_handle`. In every case the message still fails
+  with the normal timeout.
+- **Deadline.** `invocationDeps` passes the invocation's remaining time whenever the flag is armed and a
+  context is present, with or without streaming. Right before the calls, if less than 3 s is left, the
+  consumer makes no call. It logs one warn line with the reason `retry_visibility_deadline` and the count,
+  and returns the response at once.
+- **No context.** Without a context, each call has the fixed 2 s bound.
+
+### How main differs from the backport
+
+- **Failure sites.** Main's consumer has more failure sites than the backport's: buffered stages, the
+  large-read route and replay. Every failure site goes through one `fail(id, fast)` helper, so each new
+  site keeps the full timeout. With the flag off, the helper only adds the message to the failed set, as
+  before.
+- **When the calls run.** The calls run last, after the search-jobs follow-on (`SEARCH_JOBS_ENABLED`),
+  which never fails a message. So a 60 s visibility cannot lapse while the invocation is still running. A
+  follow-on that runs close to the deadline is covered by the deadline check. With the M2 flags off, there
+  is no follow-on.
+- **Batch records.** The batch records are `{ messageId, body }` plus `receiptHandle` only when the flag is
+  armed. Main has no `sentTimestamp`.
+- **Tests.** The tests drive the real exported handler through `createPipelineLambdaHandler({ loadRuntime })`.
+  The backport used `setRuntimeForTests`, which is not ported.
+
+### IAM
+
+The Lambda role needs `sqs:ChangeMessageVisibility` on the source queue. The in-repo stack policy
+(`stacks/aws/session-pipeline.ts`) lists it. Whether the deployed role has it is not checked here. Without
+it, each call fails safely with a warn line.
