@@ -1,0 +1,27 @@
+# Local process/probe preview for the hosted image. Contains no provider bindings.
+services:
+  publisher:
+    image: ${SESSION_PUBLICATION_PREVIEW_IMAGE:?set to a locally built services image}
+    pull_policy: never
+    network_mode: none
+    environment:
+      SERVICE: session-publication
+      INGEST_PUBLISH_ENABLED: "false"
+      WORKER_HEALTH_PORT: "8081"
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    healthcheck:
+      test:
+        - CMD
+        - bun
+        - -e
+        - |
+          for (const path of ["/healthz", "/readyz"]) {
+            const response = await fetch("http://127.0.0.1:8081" + path);
+            const body = await response.json();
+            if (response.status !== 200 || body.ok !== true || body.enabled !== false) process.exit(1);
+          }
+      interval: 5s
+      timeout: 3s
+      retries: 3

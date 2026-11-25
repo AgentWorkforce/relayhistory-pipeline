@@ -21,3 +21,7 @@ Use a disposable DB and versioned store with synthetic data. Test acknowledgemen
 For a separately approved dormant rollout, verify the image identity, effective flag, Pod Identity association and probe responses. For a separately approved canary, capture eligible and deferred backlog and oldest age, frontier age and coverage, last successful cycle, claim/commit outcomes, DB load, downstream lag and retirement backlog. Alert on stalled progress with eligible work even when probes remain green. Stop on a privacy/fencing failure, wrong generation or scope, missing erasure coverage, or unexplained downstream mismatch. Disable the publisher, wait for in-flight leases to resolve, and reconcile public heads with the journal before resuming. Keep erasure running.
 
 Host implementation timing depends on acceptance of the EKS target, credential ownership and reviewed frontier scope. A hosted launch also needs an approved image, chart release, network and IAM changes and evidence from the disposable proof.
+
+## Local dormant image preview
+
+Build the services image locally with `docker build -f docker/services.Dockerfile -t session-publication-preview .`. From the repository root run `SESSION_PUBLICATION_PREVIEW_IMAGE=session-publication-preview docker compose -f deploy/publication-preview/compose.yaml up --wait`. The preview has no external network, credential bindings or published ports. Its in-container probe checks both endpoints report dormant. Remove it with the same environment assignment and Compose file followed by `down`.
