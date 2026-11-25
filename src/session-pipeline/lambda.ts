@@ -487,6 +487,14 @@ export function refuseEnvOptions(env: NodeJS.ProcessEnv = process.env): void {
     throw new Error("pipeline consumer: refusing PGOPTIONS environment fallback (pool options are pinned)");
 }
 
+/**
+ * How long a pool checkout may wait, for a free client or for a new connection, before it fails (the backport
+ * lineage's 6d88b638, same constant and value). Without it a stalled pooler holds the invocation until the Lambda
+ * timeout (300 s) and the whole batch times out. With it the checkout fails after 10 s, the message is reported
+ * as failed and SQS redelivers it.
+ */
+export const HOOPDB_CONNECT_TIMEOUT_MS = 10_000;
+
 export function supabasePool(url: string, max: number, tls = postgresTlsOptions()): HoopDb {
   refuseEnvOptions();
   const pool = new pg.Pool({
@@ -495,6 +503,7 @@ export function supabasePool(url: string, max: number, tls = postgresTlsOptions(
     application_name: "96bulls-session-pipeline",
     ssl: tls,
     idleTimeoutMillis: 60_000,
+    connectionTimeoutMillis: HOOPDB_CONNECT_TIMEOUT_MS,
   });
   pool.on("error", (err) => log.error("hoopdb pool error", { error_code: (err as { code?: string }).code ?? "pool_error" }));
   return {
