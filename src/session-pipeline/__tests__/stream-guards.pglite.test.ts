@@ -287,6 +287,20 @@ describe("the scheduled {searchJobs:true} path carries the same guards; M2 settl
     expect(await j.letters()).toBe(0);
   }, 120_000);
 
+  test("a fence failure after COMMIT is observable to M2: the job fails as an error and is retried; the scope stays owed", async () => {
+    const j = await jobsRig();
+    const select = j.r.fake.ch.select.bind(j.r.fake.ch);
+    let reads = 0;
+    j.r.fake.ch.select = (async (q: string, o?: never) => {
+      if (q.includes("FROM search_ingest_session_state") && ++reads === 3) throw new Error("synthetic fence timeout");
+      return select(q, o);
+    }) as never;
+    const out = await j.run(300_000);
+    expect(out.lines.filter((l) => l.message === "search job failed")).toEqual([expect.objectContaining({ error_code: "search_completion_unrecorded", state: "retried" })]);
+    expect(out.lines.filter((l) => l.message === "search index completion not recorded")).toEqual([expect.objectContaining({ reason: "completion_fence_unreadable" })]);
+    expect((await j.jobs()).some((x) => x.attempts === 1 && !x.leased)).toBe(true);
+  }, 120_000);
+
   test("a job claimed and then deferred (the start minimum crossed after the claim) settles busy: the attempt is given back", async () => {
     const { searchSettlementFor } = await import("../search-jobs.ts");
     expect(searchSettlementFor({ outcome: "busy", reasons: ["stream_deferred"] }, 3)).toBe("busy");
