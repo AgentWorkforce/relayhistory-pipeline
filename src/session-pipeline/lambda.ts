@@ -516,25 +516,50 @@ export function supabasePool(url: string, max: number, tls = postgresTlsOptions(
   };
 }
 
-export async function transaction<T>(db: HoopDb, work: (tx: SqlExecutor) => Promise<T>): Promise<T> {
+/**
+ * One transaction on one checked-out client. `guarded` (SEARCH_INDEX_STREAMING_CH=1, the search stage only; the
+ * backport lineage's 6264d119 / 51f876b6): pg-pool drops its idle 'error' listener at checkout, and pg's client
+ * emits 'error' when its connection ends, also between statements, so a streamed pass holding the client for
+ * minutes would crash the invocation with an uncaught exception. Guarded, a per-checkout listener keeps the error:
+ * the next statement (the pass's keepalive, its lock check, COMMIT) rejects with it, the transaction fails as a
+ * normal rejected promise (the batch fails that scope's messages for redelivery), the listener is removed and the
+ * broken client is destroyed (`release(err)`), not returned to the pool. Unguarded: the same statements as before.
+ */
+export async function transaction<T>(db: HoopDb, work: (tx: SqlExecutor) => Promise<T>, guarded = false): Promise<T> {
   const client = await db.pool.connect();
+  let broken: Error | undefined;
+  const onError = (error: Error) => {
+    broken ??= error;
+  };
+  if (guarded) client.on("error", onError);
+  const query = async (text: string, params?: unknown[]) => {
+    if (broken) throw broken;
+    return client.query(text, params as unknown[]);
+  };
   try {
-    await client.query("BEGIN");
-    await client.query("SET LOCAL statement_timeout = '60s'");
+    await query("BEGIN");
+    await query("SET LOCAL statement_timeout = '60s'");
     const result = await work({
       async query<R = Record<string, unknown>>(text: string, params?: unknown[]) {
-        const r = await client.query(text, params as unknown[]);
+        const r = await query(text, params);
         return { rows: r.rows as R[] };
       },
     });
-    await client.query("COMMIT");
+    await query("COMMIT");
     return result;
   } catch (error) {
-    await client.query("ROLLBACK").catch(() => {});
+    await query("ROLLBACK").catch(() => {});
     throw error;
   } finally {
-    client.release();
+    if (guarded) client.removeListener("error", onError);
+    if (broken) client.release(broken);
+    else client.release();
   }
+}
+
+/** The search stage's transaction: guarded (transaction() above) exactly when streaming is armed. */
+export function searchTransaction(db: HoopDb, env: Pick<LambdaEnv, "searchStreamCh">, wrap: (tx: SqlExecutor, work: () => Promise<unknown>) => Promise<unknown> = (_tx, work) => work()): SearchIndexDeps["transact"] {
+  return (work) => transaction(db, (tx) => wrap(tx, () => work(tx)) as never, env.searchStreamCh !== undefined);
 }
 
 /** A search pass that found its session busy runs again this much later. */
@@ -652,7 +677,8 @@ export function runtimeFromSecret(env: LambdaEnv, secretText: string, schemaGene
     const writerSql = portable ? writerTransactionSql(db) : undefined;
     const binding = portable ? composeSearchService(composition!, { env: { ...env.adapterEnv, SEARCH_INDEX_BACKEND: env.searchBackend }, sql: writerSql!.sql, secrets: searchSecret(secret.search) }, "writer") : undefined;
     deps.search = {
-      transact: (work) => transaction(db, tx => writerSql ? writerSql.run(tx, () => work(tx)) : work(tx)),
+      // Guarded only when SEARCH_INDEX_STREAMING_CH=1: unarmed, the search transaction is exactly as before.
+      transact: searchTransaction(db, env, (tx, work) => (writerSql ? writerSql.run(tx, work) : work())),
       reader,
       store,
       ...(binding ? { adapter: binding } : { ch: createClickHouseClient(secret.clickhouse!) }),
@@ -959,12 +985,24 @@ function retryDeadlineDeps(deps: ConsumerDeps, context?: LambdaInvocationContext
 }
 
 function streamDeps(rt: Pick<Runtime, "env" | "deps">, context?: LambdaInvocationContext, now: () => number = Date.now): ConsumerDeps {
+  const search = invocationSearchDeps(rt, context, now);
+  return search === rt.deps.search ? rt.deps : { ...rt.deps, search };
+}
+
+/**
+ * The search deps of one invocation (an SQS batch with its search-jobs follow-on, or a scheduled searchJobs run):
+ * unchanged unless SEARCH_INDEX_STREAMING_CH=1 armed the streamed reconcile. Armed, as on the backport lineage
+ * (59b74b18 / 6264d119): the invocation streams at most one scope (`streamSlot`, also with no Lambda context, so no
+ * entry point can stream more than one scope per invocation), and with a finite remaining time the streamed pass
+ * stops at the remaining time less the margin (`streamDeadline`), and none starts with less than
+ * STREAM_MIN_START_MS left before that deadline.
+ */
+export function invocationSearchDeps(rt: Pick<Runtime, "env" | "deps">, context?: LambdaInvocationContext, now: () => number = Date.now): SearchIndexDeps | undefined {
   const search = rt.deps.search;
   const margin = rt.env.searchStreamCh?.deadlineMarginMs;
-  if (!search?.stream || margin === undefined || typeof context?.getRemainingTimeInMillis !== "function") return rt.deps;
-  const remaining = context.getRemainingTimeInMillis();
-  if (!Number.isFinite(remaining)) return rt.deps;
-  return { ...rt.deps, search: { ...search, streamDeadline: { at: now() + remaining - margin }, streamSlot: { used: false } } };
+  if (!search?.stream || margin === undefined) return search;
+  const remaining = typeof context?.getRemainingTimeInMillis === "function" ? context.getRemainingTimeInMillis() : NaN;
+  return { ...search, ...(Number.isFinite(remaining) ? { streamDeadline: { at: now() + remaining - margin } } : {}), streamSlot: { used: false } };
 }
 
 /** The search-job loop's SQL: the runtime pool, and its transactions (lambda.ts transaction). */
@@ -1075,7 +1113,8 @@ async function dispatchLambdaEvent(event: PipelineLambdaEvent, ready: () => Prom
       const rt = await ready();
       if (!rt.env.searchJobs || !rt.deps.search) throw new Error("search jobs unavailable");
       // The scheduled invocation probes FIRST (independently budgeted probe opportunity), then its ordinary passes.
-      const s = await drainSearchJobs({ sql: searchJobsSql(rt.deps.pointer.db), search: rt.deps.search, claim: rt.env.searchJobs.claim,
+      // The same stream guards as an SQS batch (slot, deadline, start minimum); unchanged unless streaming is armed.
+      const s = await drainSearchJobs({ sql: searchJobsSql(rt.deps.pointer.db), search: invocationSearchDeps(rt, context)!, claim: rt.env.searchJobs.claim,
         deadline: searchJobsDeadline(rt.env, context), probeFirst: true });
       log.info("search jobs run", { stage: "search-index", claimed: s.claimed, acked: s.acked, retried: s.retried, exhausted: s.exhausted, skipped: s.lost, failed: s.failed,
         count: s.probes, state: s.deadlineExit ? "deadline" : "complete", ok: s.failed === 0, duration_ms: Date.now() - started });
