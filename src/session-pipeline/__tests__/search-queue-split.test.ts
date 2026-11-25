@@ -243,7 +243,7 @@ describe("startup: the split is refused before anything is consumed", () => {
         Object.assign(process.env, base, { AWS_ACCESS_KEY_ID: "test", AWS_SECRET_ACCESS_KEY: "test" }, env);
         const { result, lines } = await capture(() => handler({ Records: [rec("m1", s3Body(keyOf("s-1"))), rec("m2", requeueBody(keyOf("s-2")), SEARCH_ARN)] }, ctx(300_000)));
         expect([why, failures(result)]).toEqual([why, ["m1", "m2"]]);
-        expect(lines.map((l) => l.message)).toEqual(["session pipeline init failed"]);
+        expect(lines.map((l) => [l.message, l.queue, l.count])).toEqual([["session pipeline init failed", "unattributed", 2]]);
         expect(JSON.stringify(lines)).not.toContain(ACCOUNT);
       }
       expect(calls).toBe(0);

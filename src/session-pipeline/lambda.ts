@@ -682,8 +682,10 @@ export async function handler(event: LambdaEvent, context?: LambdaInvocationCont
     try {
       rt = await ready();
     } catch (error) {
-      log.error("session pipeline init failed", { stage: "init", ...errorFields(error) });
-      // Nothing was processed: every message goes back to the queue.
+      // Nothing was processed: every message goes back to the queue. Before init no queue is known (a
+      // refused SESSION_PIPELINE_SEARCH_QUEUE_URL among the causes), so the line is "unattributed",
+      // never folded into either queue's counts; `count` is the batch's records.
+      log.error("session pipeline init failed", { stage: "init", ...errorFields(error), queue: "unattributed", count: event.Records.length });
       return { batchItemFailures: event.Records.map((r) => ({ itemIdentifier: r.messageId })) };
     }
     return processBatch(queueRecords(event.Records, rt.sources), invocationDeps(rt.deps, context));

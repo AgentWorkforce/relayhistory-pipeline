@@ -47,10 +47,10 @@ describe("telemetry allowlist", () => {
       expect(out.stage).toBe("search-index");
     }
   });
-  test("queue survives the real logLine only as one of pointer, search, other", () => {
-    expect([...EXACT_VALUE_FIELDS.get("queue")!].sort()).toEqual(["other", "pointer", "search"]);
+  test("queue survives the real logLine only as one of pointer, search, other, unattributed", () => {
+    expect([...EXACT_VALUE_FIELDS.get("queue")!].sort()).toEqual(["other", "pointer", "search", "unattributed"]);
     const line = (v: unknown) => JSON.parse(logLine("error", "search index failed", { stage: "search-index", queue: v })) as Record<string, unknown>;
-    for (const v of ["pointer", "search", "other"]) expect(line(v).queue).toBe(v);
+    for (const v of ["pointer", "search", "other", "unattributed"]) expect(line(v).queue).toBe(v);
     for (const v of ["Search", "", "https://sqs.example.invalid/q", "arn:aws:sqs:r:a:q", 1, true, null, ["search"]]) expect([v, "queue" in line(v)]).toEqual([v, false]);
   });
   test("the value rules apply at every level, not only info", () => {

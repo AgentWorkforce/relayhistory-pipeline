@@ -33,7 +33,7 @@ export const NON_NEGATIVE_INTEGER_FIELDS: ReadonlySet<string> = new Set(["event_
 export const EXACT_VALUE_FIELDS: ReadonlyMap<string, ReadonlySet<string>> = new Map([
   ["queue_origin", new Set(["s3", "requeue", "sweep"])],
   ["contender_seats", new Set(["all_unseated", "seated_unseated", "both", "catalog_key"])],
-  ["queue", new Set(["pointer", "search", "other"])],
+  ["queue", new Set(["pointer", "search", "other", "unattributed"])],
 ]);
 
 /** Whether an allowlisted key's value passes its value rule (keys without a rule: always). */
