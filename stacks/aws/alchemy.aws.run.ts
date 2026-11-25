@@ -46,7 +46,7 @@ import { assertSandboxAlchemyCredentials } from "./sandbox-credentials.ts";
 import { spawnSync } from "node:child_process";
 import { Project as SupabaseProject, SupabaseProvider } from "../supabase/project.ts";
 import { assertTranscriptStorePlanContract, TRANSCRIPT_STAGE, transcriptStoreStage } from "./transcript-store.ts";
-import { readPipelineLive } from "./pipeline-live.ts";
+import { readPipelineLive, spawnAwsRun } from "./pipeline-live.ts";
 
 const ROOT = fileURLToPath(new URL("../..", import.meta.url));
 const REPO = "AgentWorkforce/sessions-pipeline";
@@ -89,12 +89,9 @@ function readInputs(stage: string): AwsInputs & { mode: AwsMode } {
     if (stage === TRANSCRIPT_STAGE) {
       // The live function and mappings again at deploy (read-only, in memory): nothing set by hand
       // since the capture may be dropped, and the budget is recomputed over what runs now.
+      // Output is returned, never thrown: readPipelineLive reports fixed codes only (the env is in it).
       const liveSnapshotText = readPipelineLive(
-        (cmd, args) => {
-          const r = spawnSync(cmd, args, { cwd: ROOT, encoding: "utf8", env: process.env, maxBuffer: 64 * 1024 * 1024 });
-          if (r.status !== 0) throw new Error(`${cmd} ${args.slice(0, 2).join(" ")} failed: ${(r.stderr || "").trim().split("\n").pop()}`);
-          return r.stdout;
-        },
+        spawnAwsRun((cmd, args) => spawnSync(cmd, args, { cwd: ROOT, encoding: "utf8", env: process.env, maxBuffer: 64 * 1024 * 1024 })),
         stage,
         inputs.accountId,
         inputs.region,

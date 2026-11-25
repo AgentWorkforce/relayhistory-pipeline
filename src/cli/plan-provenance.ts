@@ -49,6 +49,12 @@ export interface Provenance {
   outputs: { plan: { path: string; sha256: string }; detailed: { path: string; sha256: string } };
   summary: string;
   note: string;
+  /**
+   * The production stage only (stacks/aws/pipeline-live.ts pipelineLiveFingerprint): the live
+   * pipeline function's RevisionId, env digest and mappings at capture. The deploy requires them
+   * unchanged (transcript-store.ts). Absent when the function did not exist.
+   */
+  pipelineLive?: ReturnType<typeof import("../../stacks/aws/pipeline-live.ts").pipelineLiveFingerprint>;
 }
 
 export interface VersionListing {

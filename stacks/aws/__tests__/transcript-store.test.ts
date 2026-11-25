@@ -552,9 +552,12 @@ describe("transcript store: deploy plan contract", () => {
     expect(captureCheck).toBeGreaterThan(0);
     expect(captureCheck).toBeLessThan(captureWorkflow.indexOf("writeFileSync(p.plan, plan)"));
     // Both read the live function back first (pipeline-live.ts), for the production stage only.
-    expect(captureWorkflow.indexOf("const liveSnapshotText = readPipelineLive(")).toBeGreaterThan(captureWorkflow.indexOf("if (stage === TRANSCRIPT_STAGE) {"));
+    expect(captureWorkflow).toContain("stage === TRANSCRIPT_STAGE\n      ? readPipelineLive(spawnAwsRun(");
+    // The capture records the live fingerprint in the provenance the deploy is bound to.
+    expect(captureWorkflow).toContain("pipelineLive: pipelineLiveFingerprint(");
     expect(stack).toContain("assertTranscriptStorePlanContract(planText, { detailedPlanText, provenanceText, ...(liveSnapshotText ? { liveSnapshotText } : {}) })");
     expect(stack.indexOf("const liveSnapshotText = readPipelineLive(")).toBeGreaterThan(stack.indexOf("if (stage === TRANSCRIPT_STAGE) {"));
+    expect(stack).toContain("readPipelineLive(\n        spawnAwsRun(");
   });
 });
 

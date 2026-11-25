@@ -14,7 +14,7 @@ import { tmpdir } from "node:os";
 import { mkdtempSync, rmSync } from "node:fs";
 import { awsInvocation } from "./aws.ts";
 import { assertTranscriptStorePlanContract, TRANSCRIPT_STAGE } from "../../stacks/aws/transcript-store.ts";
-import { readPipelineLive } from "../../stacks/aws/pipeline-live.ts";
+import { pipelineLiveFingerprint, readPipelineLive, spawnAwsRun, type PipelineLive } from "../../stacks/aws/pipeline-live.ts";
 
 type Env = Record<string, string | undefined>;
 const run = (cmd: string, args: string[], cwd: string, baseEnv: Env = process.env) => {
@@ -90,6 +90,12 @@ export function capturePlan(root: string, stage: string, env: Env) {
   const p = planPaths(root, stage);
   mkdirSync(p.dir, { recursive: true });
   const sanitized = `${JSON.stringify(sanitizeInputs(inputs), null, 2)}\n`;
+  // The live function and mappings (read-only, in memory; never the env values on disk): a hand-set
+  // variable is visible only there, and the deploy requires the same RevisionId, env and mappings.
+  const liveSnapshotText =
+    stage === TRANSCRIPT_STAGE
+      ? readPipelineLive(spawnAwsRun((cmd, args) => spawnSync(cmd, args, { cwd: root, encoding: "utf8", env, maxBuffer: 64 * 1024 * 1024 })), stage, inputs.accountId, inputs.region)
+      : undefined;
   const version = (pkg: string) => (JSON.parse(readFileSync(join(root, "node_modules", pkg, "package.json"), "utf8")) as { version: string }).version;
   const record: Provenance = {
     schema: 1,
@@ -122,13 +128,12 @@ export function capturePlan(root: string, stage: string, env: Env) {
       detailed: { path: `docs/plans/${stage}.plan.detailed.txt`, sha256: sha256(detailed) },
     },
     summary: /Plan: .*/.exec(plan)?.[0] ?? "no summary line",
+    ...(liveSnapshotText ? { pipelineLive: pipelineLiveFingerprint(JSON.parse(liveSnapshotText) as PipelineLive) } : {}),
     note: "Planned against a read-only snapshot of the state (GETs pinned to version ids, in-memory Alchemy state): no state-bucket writes, no lease. The version listing (all versions and delete markers) was identical before and after. AWS provider reads only (Describe/List/Get). `96bulls up` re-checks everything before any change.",
   };
   const provenanceText = `${JSON.stringify(record, null, 2)}\n`;
   // Reject an unsafe production capture before it can replace the reviewed files.
-  // The live function and mappings (read-only, in memory): a hand-set variable is visible only there.
   if (stage === TRANSCRIPT_STAGE) {
-    const liveSnapshotText = readPipelineLive((cmd, args) => run(cmd, args, root, env), stage, inputs.accountId, inputs.region);
     assertTranscriptStorePlanContract(plan, { detailedPlanText: detailed, provenanceText, stateSnapshotText: snapText, ...(liveSnapshotText ? { liveSnapshotText } : {}) });
   }
   writeFileSync(p.inputs, sanitized);

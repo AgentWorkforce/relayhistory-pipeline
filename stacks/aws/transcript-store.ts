@@ -48,6 +48,7 @@ import { sha256, type Provenance } from "../../src/cli/plan-provenance.ts";
 import { KMS_ADMIN_ACTIONS, denyInsecureTransport, trailKeyPolicy } from "./hardening.ts";
 import { alchemyStatePrefix } from "./preflight.ts";
 import { TENANT_KEY_BASE } from "./tenants.ts";
+import { pipelineLiveFingerprint, type PipelineLive, type PipelineLiveMapping } from "./pipeline-live.ts";
 import {
   SESSION_BRIEF_RESOURCES,
   SESSION_PIPELINE_RESOURCES,
@@ -460,7 +461,7 @@ export function assertTranscriptStorePlanContract(planText: string, capture: Tra
   }
   // The search-queue split: its provisioning is a phase of its own (everything else noop, every
   // created resource pinned to its rendered props); its in-place changes are pinned, then judged below.
-  const searchPhase = sessionSearchQueuePhase(compact.operations, capture.detailedPlanText, capture.stateSnapshotText, refuse, capture.liveSnapshotText);
+  const searchPhase = sessionSearchQueuePhase(compact.operations, capture.detailedPlanText, capture.stateSnapshotText, refuse, capture.liveSnapshotText, capture.provenanceText);
   if (searchPhase) return searchPhase;
   const phase = judgePlanPhase(compact, capture, refuse);
   // Every accepted pipeline plan, last: the events mapping changes only its cap, and no function
@@ -542,7 +543,8 @@ function sessionSearchQueuePhase(
   detailedPlanText: string,
   stateSnapshotText: string | undefined,
   refuse: (why: string) => never,
-  liveSnapshotText?: string,
+  liveSnapshotText: string | undefined,
+  provenanceText: string,
 ): TranscriptStorePlanPhase | undefined {
   const search = SESSION_SEARCH_QUEUE_RESOURCES as readonly string[];
   if (!search.some((r) => operations.has(r))) return undefined;
@@ -583,32 +585,40 @@ function sessionSearchQueuePhase(
     }
     return label;
   }
-  return assertSearchSplitInPlace(operations, lines, stateSnapshotText, liveSnapshotText, refuse);
+  return assertSearchSplitInPlace(operations, lines, provenanceText, liveSnapshotText, refuse);
 }
 
 const SEARCH_LABEL = "session search queue";
+/** What a live mapping's MaximumConcurrency may be (the account limit for SQS mappings): a trial may run above the staged caps. */
+const LIVE_MAX_CONCURRENCY = 1000;
+/** The staged caps for a planned (new) MaximumConcurrency. */
+const STAGED_MIN_CONCURRENCY = 2;
+const STAGED_MAX_CONCURRENCY = 20;
+const URL_KEY = "SESSION_PIPELINE_SEARCH_QUEUE_URL";
 
 /**
- * An in-place plan while the search resources exist: exactly one staged change, each pinned to its
- * exact old and new props, and the pooler budget recomputed from the plan's new values over the
- * effective live capacity:
- *   - the pointer cap (B, R3): only session-events-mapping, only scalingConfig.MaximumConcurrency
- *     (assertEventsMappingUpdate);
+ * An in-place plan that touches the search split (a search resource, the events mapping or the
+ * function) while the search resources exist: exactly one staged change, each pinned to its exact
+ * old and new props, the old values equal to the verified live readback, and the pooler budget
+ * recomputed over every enabled mapping on the function with the plan's new values:
+ *   - the pointer cap (B, R3): only session-events-mapping, only scalingConfig.MaximumConcurrency;
+ *     its old cap is the live one (which may be above the staged caps, up to the account limit),
+ *     its new cap is 2-20;
  *   - the search mapping (C1, R2): only session-search-mapping, only `enabled` and
- *     scalingConfig.MaximumConcurrency, the rest exactly its rendered props on the search queue for
- *     the pipeline function;
- *   - the function env (C2, R1): session-pipeline (and the role-ARN cascade of its grants,
- *     session-search included, checked later), with every non-env property unchanged and the env
- *     changed by nothing (code only) or by exactly one key, SESSION_PIPELINE_SEARCH_QUEUE_URL,
- *     added with this stage's search queue URL or removed.
- * Anything else (a DLQ or alarm update, two of these at once, any other resource) is refused.
- * The capacity before the plan is the live snapshot's (capture and deploy), else the state
- * snapshot's; with neither (a test of the shape alone) the budget is not recomputed.
+ *     MaximumConcurrency; old values are the live mapping's; disabling (R2) requires the live env to
+ *     have no SESSION_PIPELINE_SEARCH_QUEUE_URL (R1 already applied);
+ *   - the function env (C2, R1): session-pipeline (and the role-ARN cascade), every non-env property
+ *     unchanged, and both the planned env and the env after the apply differing from the live env by
+ *     exactly that URL (added with this stage's search queue for C2, removed for R1); adding it (C2)
+ *     requires the search mapping to exist, be enabled, and point at this queue and this function.
+ * The live readback is required, verified (verifiedLive) and bound to the capture (provenance
+ * `pipelineLive`). A plan whose search resources are all noop and that touches neither the events
+ * mapping nor the function is left to the other phases.
  */
 function assertSearchSplitInPlace(
   operations: ReadonlyMap<string, string>,
   lines: readonly string[],
-  stateSnapshotText: string | undefined,
+  provenanceText: string,
   liveSnapshotText: string | undefined,
   refuse: (why: string) => never,
 ): undefined {
@@ -616,90 +626,79 @@ function assertSearchSplitInPlace(
   const changed = [...operations].filter(([, a]) => a !== "noop").map(([r]) => r);
   const changes = () => [...operations].filter(([, a]) => a !== "noop").map(([r, a]) => `${r}:${a}`).join(", ");
   if (changed.length === 0) return undefined;
-  if (stateSnapshotText !== undefined && liveSnapshotText === undefined)
-    refuse(`${SEARCH_LABEL}: an in-place change is captured only with the live function and mapping readback`);
+  const searchTouched = (SESSION_SEARCH_QUEUE_RESOURCES as readonly string[]).some((r) => (operations.get(r) ?? "noop") !== "noop");
+  if (!searchTouched && !changed.includes("session-events-mapping") && !changed.includes("session-pipeline")) return undefined;
+  if (liveSnapshotText === undefined) return refuse(`${SEARCH_LABEL}: an in-place change needs the live function and mapping readback`);
+  const live = verifiedLive(parseLive(liveSnapshotText, refuse), names, provenanceText, refuse);
   const grants = new Set<string>([...ROLE_GRANT_RESOURCES, ...SEARCH_ROLE_GRANT_RESOURCES]);
   const only = (r: string) => changed.length === 1 && changed[0] === r && operations.get(r) === "update";
-  const before = pipelineCapacity(liveSnapshotText, stateSnapshotText, names, refuse);
-  let after: Partial<PipelineCapacity> = {};
-  let planBefore: Partial<PipelineCapacity> = {};
+  const liveCap = (m: PipelineLiveMapping | undefined) => (m && m.state === "Enabled" ? m.maximumConcurrency! : 0);
+  const before = { pointer: liveCap(live.pointer), search: liveCap(live.search), pool: Number(live.env.HOOPDB_POOL_MAX) };
+  if (!(Number.isInteger(before.pool) && before.pool >= 1)) refuse(`${SEARCH_LABEL}: the live HOOPDB_POOL_MAX is not readable`);
+  const after = { ...before };
   if (only("session-events-mapping")) {
     const cap = assertEventsMappingUpdate(lines, names, refuse);
-    planBefore = { pointer: cap.old };
-    after = { pointer: cap.new };
+    if (cap.old !== live.pointer.maximumConcurrency)
+      refuse(`${SEARCH_LABEL}: the plan's old events mapping MaximumConcurrency ${cap.old} is not the live ${live.pointer.maximumConcurrency} (a stale plan)`);
+    after.pointer = cap.new;
   } else if (only("session-search-mapping")) {
+    if (!live.search) return refuse(`${SEARCH_LABEL}: the live function has no search mapping`);
     const sides = planUpdateSides(lines, "session-search-mapping");
     if (sides === undefined || sides === "unchanged") return refuse(`${SEARCH_LABEL}: session-search-mapping updates without changing enabled or MaximumConcurrency`);
-    const diff = changedLeaves(sides.old, sides.new).filter((k) => !k.startsWith("tags."));
-    const allowed = new Set(["enabled", "scalingConfig.MaximumConcurrency"]);
-    if (diff.length === 0 || diff.some((k) => !allowed.has(k)) || changedLeaves(sides.old, sides.new).length !== diff.length)
-      refuse(`${SEARCH_LABEL}: session-search-mapping may change only enabled or MaximumConcurrency, found ${changedLeaves(sides.old, sides.new).join(", ") || "nothing"}`);
-    const side = (v: PlanValue) => {
+    const diff = changedLeaves(sides.old, sides.new);
+    if (diff.length === 0 || diff.some((k) => k !== "enabled" && k !== "scalingConfig.MaximumConcurrency"))
+      refuse(`${SEARCH_LABEL}: session-search-mapping may change only enabled or MaximumConcurrency, found ${diff.join(", ") || "nothing"}`);
+    const side = (v: PlanValue, cap: number) => {
       const m = v as Record<string, PlanValue>;
       const enabled = m.enabled === "true" ? true : m.enabled === "false" ? false : refuse(`${SEARCH_LABEL}: session-search-mapping enabled is not a boolean`);
       const max = Number((m.scalingConfig as Record<string, PlanValue> | undefined)?.MaximumConcurrency);
-      if (!(Number.isInteger(max) && max >= 2 && max <= 20)) refuse(`${SEARCH_LABEL}: session-search-mapping MaximumConcurrency must be 2-20`);
+      if (!(Number.isInteger(max) && max >= STAGED_MIN_CONCURRENCY && max <= cap)) refuse(`${SEARCH_LABEL}: session-search-mapping MaximumConcurrency must be ${STAGED_MIN_CONCURRENCY}-${cap}`);
       const { tags: _t, ...props } = m;
       const { tags: _e, ...want } = sessionSearchMappingProps({ q: { enabled: true, mappingEnabled: enabled, maxConcurrency: max }, functionName: names.function, queueArn: names.searchQueueArn, tags: {} });
       const d = planMismatch(props, want, "");
       if (d !== undefined) refuse(`${SEARCH_LABEL}: session-search-mapping is not its rendered props on the search queue (${d})`);
-      return enabled ? max : 0;
+      return { enabled, max };
     };
-    planBefore = { search: side(sides.old) };
-    after = { search: side(sides.new) };
+    const old = side(sides.old, LIVE_MAX_CONCURRENCY);
+    const now = side(sides.new, STAGED_MAX_CONCURRENCY);
+    if (old.enabled !== (live.search.state === "Enabled") || old.max !== live.search.maximumConcurrency)
+      refuse(`${SEARCH_LABEL}: the plan's old search mapping (enabled ${old.enabled}, MaximumConcurrency ${old.max}) is not the live one (a stale plan)`);
+    if (old.enabled && !now.enabled && URL_KEY in live.env)
+      refuse(`${SEARCH_LABEL}: disabling the search mapping needs R1 first: the live function still has ${URL_KEY}`);
+    after.search = now.enabled ? now.max : 0;
   } else if (operations.get("session-pipeline") === "update" && changed.every((r) => r === "session-pipeline" || grants.has(r))) {
     const sides = planUpdateSides(lines, "session-pipeline");
-    if (sides === undefined) refuse(`${SEARCH_LABEL}: session-pipeline update has no readable properties`);
+    if (sides === undefined) return refuse(`${SEARCH_LABEL}: session-pipeline update has no readable properties`);
+    let newEnv: Record<string, string> = live.env;
     if (sides !== "unchanged") {
       const other = changedLeaves(sides.old, sides.new).filter((k) => !k.startsWith("env."));
       if (other.length) refuse(`${SEARCH_LABEL}: the function update changes more than its env: ${other.join(", ")}`);
-      const env = (v: PlanValue) => ((v as Record<string, PlanValue>).env ?? {}) as Record<string, PlanValue>;
-      const oldEnv = env(sides.old), newEnv = env(sides.new);
-      const keys = [...new Set([...Object.keys(oldEnv), ...Object.keys(newEnv)])].filter((k) => oldEnv[k] !== newEnv[k]);
-      const url = "SESSION_PIPELINE_SEARCH_QUEUE_URL";
+      const env = (v: PlanValue) => ((v as Record<string, PlanValue>).env ?? {}) as Record<string, string>;
+      const oldEnv = env(sides.old);
+      newEnv = env(sides.new);
+      const keys = envDelta(oldEnv, newEnv);
       const ok =
         keys.length === 0 ||
-        (keys.length === 1 && keys[0] === url && ((oldEnv[url] === undefined && newEnv[url] === names.searchQueueUrl) || (newEnv[url] === undefined && oldEnv[url] === names.searchQueueUrl)));
-      if (!ok)
-        refuse(`${SEARCH_LABEL}: the function env may change only by adding or removing ${url} (this stage's search queue), found ${keys.map((k) => `${k}${newEnv[k] === undefined ? " removed" : oldEnv[k] === undefined ? " added" : " changed"}`).join(", ")}`);
-      const pool = Number(newEnv.HOOPDB_POOL_MAX);
-      if (Number.isInteger(pool)) after = { pool };
+        (keys.length === 1 && keys[0] === URL_KEY && ((oldEnv[URL_KEY] === undefined && newEnv[URL_KEY] === names.searchQueueUrl) || (newEnv[URL_KEY] === undefined && oldEnv[URL_KEY] === names.searchQueueUrl)));
+      if (!ok) refuse(`${SEARCH_LABEL}: the function env may change only by adding or removing ${URL_KEY} (this stage's search queue), found ${describeDelta(oldEnv, newEnv, keys)}`);
     }
-  } else refuse(`${SEARCH_LABEL}: not one staged change (the pointer mapping's cap, the search mapping, or the function env alone): ${changes()}`);
-  if (before === undefined) return undefined;
-  const b = before;
-  const max = (k: keyof PipelineCapacity) => Math.max(b[k], planBefore[k] ?? b[k], after[k] ?? b[k]);
-  const next = { ...b, ...after };
-  const demand = (next.pointer + next.search) * next.pool;
-  const worst = (max("pointer") + max("search")) * max("pool");
+    // The env after the apply is exactly the planned env (Alchemy writes it whole): against the live
+    // env it may differ by the stage's URL alone, in either direction, never by any other key.
+    const liveDelta = envDelta(live.env, newEnv);
+    const adds = newEnv[URL_KEY] !== undefined && live.env[URL_KEY] === undefined;
+    const removes = newEnv[URL_KEY] === undefined && live.env[URL_KEY] !== undefined;
+    if (!(liveDelta.length === 0 || (liveDelta.length === 1 && liveDelta[0] === URL_KEY && (adds ? newEnv[URL_KEY] === names.searchQueueUrl : removes))))
+      refuse(`${SEARCH_LABEL}: after this apply the function env would differ from the live env by ${describeDelta(live.env, newEnv, liveDelta)}; only ${URL_KEY} may`);
+    if (adds && !(live.search && live.search.state === "Enabled"))
+      refuse(`${SEARCH_LABEL}: setting ${URL_KEY} needs the search mapping on this function and queue, enabled (C1) first`);
+    const pool = Number(newEnv.HOOPDB_POOL_MAX);
+    if (Number.isInteger(pool) && pool >= 1) after.pool = pool;
+  } else return refuse(`${SEARCH_LABEL}: not one staged change (the pointer mapping's cap, the search mapping, or the function env alone): ${changes()}`);
+  const demand = (after.pointer + after.search) * after.pool;
+  const worst = (Math.max(before.pointer, after.pointer) + Math.max(before.search, after.search)) * Math.max(before.pool, after.pool);
   if (demand > POOLER_BUDGET || worst > POOLER_BUDGET)
-    refuse(`${SEARCH_LABEL}: after this plan (pointer ${next.pointer} + search ${next.search}) x pool ${next.pool} is ${demand} pooler connections and the apply's worst moment ${worst}, over the budget of ${POOLER_BUDGET}`);
+    refuse(`${SEARCH_LABEL}: after this plan (pointer ${after.pointer} + search ${after.search}) x pool ${after.pool} is ${demand} pooler connections and the apply's worst moment ${worst}, over the budget of ${POOLER_BUDGET}`);
   return undefined;
-}
-
-/** The function's pooler capacity: each mapping's MaximumConcurrency (0 for a disabled search mapping) and HOOPDB_POOL_MAX. */
-interface PipelineCapacity {
-  pointer: number;
-  search: number;
-  pool: number;
-}
-
-/** The live function and its mappings, as pipeline-live.ts readPipelineLive records them. */
-interface PipelineLive {
-  schema: 1;
-  env: Record<string, string>;
-  mappings: { eventSourceArn: string; state: string; maximumConcurrency?: number }[];
-}
-
-function parseLive(text: string, refuse: (why: string) => never): PipelineLive {
-  let v: PipelineLive;
-  try {
-    v = JSON.parse(text) as PipelineLive;
-  } catch {
-    return refuse("the live pipeline snapshot is not valid JSON");
-  }
-  if (v?.schema !== 1 || v.env === null || typeof v.env !== "object" || !Array.isArray(v.mappings)) refuse("the live pipeline snapshot is not schema 1");
-  return v;
 }
 
 /** One resource's declared props in the capture's state snapshot, or undefined. */
@@ -713,42 +712,82 @@ function stateProps(stateSnapshotText: string, resource: string): Record<string,
   }
 }
 
-/**
- * The capacity before the plan: from the live snapshot when there is one, else from the state
- * snapshot; undefined with neither. A value that cannot be read (an uncapped mapping, a missing
- * HOOPDB_POOL_MAX) is refused rather than guessed.
- */
-function pipelineCapacity(
-  liveSnapshotText: string | undefined,
-  stateSnapshotText: string | undefined,
-  names: ReturnType<typeof sessionPipelineNames>,
-  refuse: (why: string) => never,
-): PipelineCapacity | undefined {
-  const need = (v: unknown, what: string) => (Number.isInteger(v) && (v as number) > 0 ? (v as number) : refuse(`${SEARCH_LABEL}: cannot read the ${what}`));
-  if (liveSnapshotText !== undefined) {
-    const live = parseLive(liveSnapshotText, refuse);
-    const mapping = (arn: string) => live.mappings.filter((m) => m.eventSourceArn === arn);
-    const pointer = mapping(names.queueArn);
-    const search = mapping(names.searchQueueArn);
-    if (pointer.length !== 1 || search.length > 1) refuse(`${SEARCH_LABEL}: the live function has ${pointer.length} events and ${search.length} search mappings`);
-    const searchCap = search.length === 0 || search[0]!.state === "Disabled" ? 0 : need(search[0]!.maximumConcurrency, "live search mapping's MaximumConcurrency");
-    return { pointer: need(pointer[0]!.maximumConcurrency, "live events mapping's MaximumConcurrency"), search: searchCap, pool: need(Number(live.env.HOOPDB_POOL_MAX), "live HOOPDB_POOL_MAX") };
+/** The keys whose values differ between two envs (either side may lack the key). */
+function envDelta(a: Record<string, string>, b: Record<string, string>): string[] {
+  return [...new Set([...Object.keys(a), ...Object.keys(b)])].filter((k) => a[k] !== b[k]).sort();
+}
+
+/** Key names only, never values (the env may hold anything). */
+function describeDelta(a: Record<string, string>, b: Record<string, string>, keys: readonly string[]): string {
+  return keys.map((k) => `${k}${b[k] === undefined ? " removed" : a[k] === undefined ? " added" : " changed"}`).join(", ") || "nothing";
+}
+
+/** The live function and its mappings (pipeline-live.ts PipelineLive, schema 2). */
+function parseLive(text: string, refuse: (why: string) => never): PipelineLive {
+  let v: PipelineLive;
+  try {
+    v = JSON.parse(text) as PipelineLive;
+  } catch {
+    return refuse("the live pipeline snapshot is not valid JSON");
   }
-  if (stateSnapshotText === undefined) return undefined;
-  const cap = (r: string) => ((stateProps(stateSnapshotText, r)?.scalingConfig as { MaximumConcurrency?: unknown } | undefined)?.MaximumConcurrency);
-  const searchProps = stateProps(stateSnapshotText, "session-search-mapping");
-  const env = (stateProps(stateSnapshotText, "session-pipeline")?.env ?? {}) as Record<string, unknown>;
-  return {
-    pointer: need(cap("session-events-mapping"), "events mapping's MaximumConcurrency in state"),
-    search: searchProps?.enabled === true ? need(cap("session-search-mapping"), "search mapping's MaximumConcurrency in state") : 0,
-    pool: need(Number(env.HOOPDB_POOL_MAX), "HOOPDB_POOL_MAX in state"),
-  };
+  const env = v?.function?.env;
+  if (v?.schema !== 2 || typeof v.function?.name !== "string" || typeof v.function.revisionId !== "string" || env === null || typeof env !== "object" || !Array.isArray(v.mappings))
+    refuse("the live pipeline snapshot is not schema 2");
+  if (Object.values(env).some((x) => typeof x !== "string")) refuse("the live pipeline snapshot has a non-string env value");
+  return v;
 }
 
 /**
- * An events (pointer) mapping update changes only scalingConfig.MaximumConcurrency (2-20); old and new
+ * The live readback, verified: it is this stage's function; it is the readback the capture recorded
+ * (provenance `pipelineLive`: RevisionId, env digest, every mapping's UUID, state and settings), so a
+ * hand edit or another apply since the capture refuses the deploy; every mapping on the function is
+ * stable (Enabled or Disabled, never Creating, Updating, Enabling, Disabling or Deleting), targets
+ * this function, and is one of the two this stack declares (an unknown mapping would hold pooler
+ * connections the budget cannot see); both carry the rendered settings (batch 10, 20 s window,
+ * partial batch responses) and a MaximumConcurrency within the account limit; the events mapping is
+ * enabled.
+ */
+function verifiedLive(
+  live: PipelineLive,
+  names: ReturnType<typeof sessionPipelineNames>,
+  provenanceText: string,
+  refuse: (why: string) => never,
+): { env: Record<string, string>; pointer: PipelineLiveMapping; search?: PipelineLiveMapping } {
+  if (live.function.name !== names.function) refuse(`${SEARCH_LABEL}: the live readback is not this stage's function`);
+  let recorded: unknown;
+  try {
+    recorded = (JSON.parse(provenanceText) as { pipelineLive?: unknown }).pipelineLive;
+  } catch {
+    recorded = undefined;
+  }
+  if (recorded === undefined) refuse(`${SEARCH_LABEL}: the capture did not record the live function (provenance pipelineLive)`);
+  if (stableJson(recorded) !== stableJson(pipelineLiveFingerprint(live)))
+    refuse(`${SEARCH_LABEL}: the live function or its mappings changed since the capture (RevisionId, env or mapping UUID, state or settings); capture again`);
+  const functionArn = `arn:aws:lambda:${TRANSCRIPT_REGION}:${TRANSCRIPT_ACCOUNT_ID}:function:${names.function}`;
+  let pointer: PipelineLiveMapping | undefined;
+  let search: PipelineLiveMapping | undefined;
+  for (const m of live.mappings) {
+    if (m.state !== "Enabled" && m.state !== "Disabled") refuse(`${SEARCH_LABEL}: live mapping ${m.uuid} is ${m.state}, not stable; wait for it`);
+    if (m.functionArn !== functionArn) refuse(`${SEARCH_LABEL}: live mapping ${m.uuid} does not target this function`);
+    if (m.eventSourceArn === names.queueArn && !pointer) pointer = m;
+    else if (m.eventSourceArn === names.searchQueueArn && !search) search = m;
+    else refuse(`${SEARCH_LABEL}: live mapping ${m.uuid} is not one this stack declares (or a duplicate); its connections are outside the budget`);
+    if (m.batchSize !== 10 || m.maximumBatchingWindowInSeconds !== 20 || stableJson(m.functionResponseTypes) !== stableJson(["ReportBatchItemFailures"]))
+      refuse(`${SEARCH_LABEL}: live mapping ${m.uuid} does not carry the rendered settings`);
+    if (!(Number.isInteger(m.maximumConcurrency) && m.maximumConcurrency! >= STAGED_MIN_CONCURRENCY && m.maximumConcurrency! <= LIVE_MAX_CONCURRENCY))
+      refuse(`${SEARCH_LABEL}: live mapping ${m.uuid} has no MaximumConcurrency within ${STAGED_MIN_CONCURRENCY}-${LIVE_MAX_CONCURRENCY}`);
+  }
+  if (!pointer) return refuse(`${SEARCH_LABEL}: the live function has no events mapping`);
+  if (pointer.state !== "Enabled") refuse(`${SEARCH_LABEL}: the live events mapping is not enabled`);
+  return { env: live.function.env, pointer, ...(search ? { search } : {}) };
+}
+
+/**
+ * An events (pointer) mapping update changes only scalingConfig.MaximumConcurrency; old and new
  * are otherwise exactly its rendered props: the pipeline function, the events queue, batch 10, the
- * 20 s window, partial batch responses, enabled. Returns the old and new caps.
+ * 20 s window, partial batch responses, enabled. The old cap may be anything up to the account limit
+ * (it is compared with the live one by the caller); the new cap is within the staged 2-20. Returns
+ * the old and new caps.
  */
 function assertEventsMappingUpdate(lines: readonly string[], names: ReturnType<typeof sessionPipelineNames>, refuse: (why: string) => never): { old: number; new: number } {
   const label = "session pipeline update";
@@ -757,16 +796,16 @@ function assertEventsMappingUpdate(lines: readonly string[], names: ReturnType<t
   const diff = changedLeaves(sides.old, sides.new);
   if (diff.length !== 1 || diff[0] !== "scalingConfig.MaximumConcurrency")
     refuse(`${label}: session-events-mapping may change only its MaximumConcurrency, found ${diff.join(", ") || "nothing"}`);
-  const side = (v: PlanValue) => {
+  const side = (v: PlanValue, cap: number) => {
     const { tags: _t, ...props } = v as Record<string, PlanValue>;
     const max = Number((props.scalingConfig as Record<string, PlanValue> | undefined)?.MaximumConcurrency);
-    if (!(Number.isInteger(max) && max >= 2 && max <= 20)) refuse(`${label}: session-events-mapping MaximumConcurrency must be 2-20`);
+    if (!(Number.isInteger(max) && max >= STAGED_MIN_CONCURRENCY && max <= cap)) refuse(`${label}: session-events-mapping MaximumConcurrency must be ${STAGED_MIN_CONCURRENCY}-${cap}`);
     const { tags: _e, ...want } = sessionEventsMappingProps({ p: { maxConcurrency: max }, functionName: names.function, queueArn: names.queueArn, tags: {} });
     const d = planMismatch(props, want, "");
     if (d !== undefined) refuse(`${label}: session-events-mapping is not its rendered props on the events queue (${d})`);
     return max;
   };
-  return { old: side(sides.old), new: side(sides.new) };
+  return { old: side(sides.old, LIVE_MAX_CONCURRENCY), new: side(sides.new, STAGED_MAX_CONCURRENCY) };
 }
 
 /**
@@ -782,7 +821,7 @@ function assertPipelineInPlace(operations: ReadonlyMap<string, string>, capture:
   const lines = capture.detailedPlanText.split(/\r?\n/);
   if (operations.get("session-events-mapping") === "update") assertEventsMappingUpdate(lines, names, refuse);
   if (operations.get("session-pipeline") !== "update" || capture.liveSnapshotText === undefined) return;
-  const live = parseLive(capture.liveSnapshotText, refuse).env;
+  const live = parseLive(capture.liveSnapshotText, refuse).function.env;
   const sides = planUpdateSides(lines, "session-pipeline");
   const envOf = (v: unknown) => (((v as Record<string, unknown> | undefined)?.env ?? undefined) as Record<string, unknown> | undefined);
   const stateEnv = capture.stateSnapshotText === undefined ? undefined : envOf(stateProps(capture.stateSnapshotText, "session-pipeline"));

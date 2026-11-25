@@ -38,7 +38,7 @@ import {
   sessionSecretPolicy,
 } from "../session-pipeline.ts";
 import { assertTranscriptStoreInputs, assertTranscriptStorePlanContract, planProperties, transcriptBucketPolicy, transcriptKeyPolicy, transcriptNames } from "../transcript-store.ts";
-import { readPipelineLive } from "../pipeline-live.ts";
+import { PipelineLiveError, pipelineLiveFingerprint, readPipelineLive } from "../pipeline-live.ts";
 import { SEARCH_SPLIT_REFUSED, SEARCH_SPLIT_ROLLBACK, SEARCH_SPLIT_ROLLOUT, STAGED_RENDER_PATH, renderSearchSplitStages } from "../../../scripts/search-split-staged-render.ts";
 
 const STAGE = "aws-sessions-prod";
@@ -918,18 +918,31 @@ describe("search-queue split: the deploy plan contract", () => {
   };
   const SPLIT = { searchIndex: true, maxConcurrency: 10, hoopdbPoolMax: 3 } as const;
   const Q = { enabled: true, maxConcurrency: 16 } as const;
-  /** The live readback (pipeline-live.ts shape): the function's env and its two mappings. */
-  const live = (o: { env?: Record<string, unknown>; pointer?: number; search?: "Enabled" | "Disabled" | null; searchMax?: number }) =>
+  const FN_ARN = `arn:aws:lambda:${REGION}:${ACCOUNT}:function:${p.function}`;
+  const mapping = (eventSourceArn: string, state: string, max: number | undefined, uuid: string, over: Record<string, unknown> = {}) => ({
+    uuid,
+    eventSourceArn,
+    functionArn: FN_ARN,
+    state,
+    batchSize: 10,
+    maximumBatchingWindowInSeconds: 20,
+    functionResponseTypes: ["ReportBatchItemFailures"],
+    ...(max === undefined ? {} : { maximumConcurrency: max }),
+    ...over,
+  });
+  /** The live readback (pipeline-live.ts PipelineLive): the function and every mapping on it. */
+  const live = (o: { env?: Record<string, unknown>; pointer?: number; search?: "Enabled" | "Disabled" | null; searchMax?: number; extra?: Record<string, unknown>[]; revision?: string; pointerOver?: Record<string, unknown> }) =>
     JSON.stringify({
-      schema: 1,
-      env: o.env ?? (fnProps({ ...SPLIT, searchQueue: Q }).env as Record<string, string>),
+      schema: 2,
+      function: { name: p.function, revisionId: o.revision ?? "rev-synthetic-1", env: o.env ?? (fnProps({ ...SPLIT, searchQueue: Q }).env as Record<string, string>) },
       mappings: [
-        { eventSourceArn: p.queueArn, state: "Enabled", maximumConcurrency: o.pointer ?? 10 },
-        ...(o.search === null ? [] : [{ eventSourceArn: p.searchQueueArn, state: o.search ?? "Disabled", maximumConcurrency: o.searchMax ?? 16 }]),
+        mapping(p.queueArn, "Enabled", o.pointer ?? 10, "uuid-events-synthetic", o.pointerOver),
+        ...(o.search === null ? [] : [mapping(p.searchQueueArn, o.search ?? "Disabled", o.searchMax ?? 16, "uuid-search-synthetic")]),
+        ...(o.extra ?? []),
       ],
     });
-  /** `state` null: the deploy's check (no state snapshot). */
-  const capture = (full: string, liveText?: string, state: string | null = snapshot) => {
+  /** `state` null: the deploy's check (no state snapshot). `recorded`: the live text the capture saw (default: the same). */
+  const capture = (full: string, liveText?: string, state: string | null = snapshot, recorded: string | undefined = liveText) => {
     const compact = `${full.split("\n").filter((l) => l.startsWith("Plan:") || isResourceLine(l)).join("\n")}\n`;
     return assertTranscriptStorePlanContract(compact, {
       detailedPlanText: full,
@@ -938,6 +951,7 @@ describe("search-queue split: the deploy plan contract", () => {
         stage: STAGE,
         outputs: { plan: { path: `docs/plans/${STAGE}.plan.txt`, sha256: h(compact) }, detailed: { path: `docs/plans/${STAGE}.plan.detailed.txt`, sha256: h(full) } },
         summary: compact.split("\n")[0],
+        ...(recorded ? { pipelineLive: pipelineLiveFingerprint(JSON.parse(recorded)) } : {}),
       }),
       stateSnapshotText: state ?? undefined,
       liveSnapshotText: liveText,
@@ -945,26 +959,39 @@ describe("search-queue split: the deploy plan contract", () => {
   };
   const fnUpdate = (oldP: Record<string, unknown>, newP: Record<string, unknown>) => detailed({ "session-pipeline": update(oldP, newP), "session-search": searchCascade() }, true);
   const URL_KEY = "SESSION_PIPELINE_SEARCH_QUEUE_URL";
+  const C1_BASE = { ...SPLIT, searchQueue: { ...Q, mappingEnabled: true } };
+  const C2_ON = { ...SPLIT, searchQueue: { ...Q, mappingEnabled: true, handoff: true } };
 
-  it("B and R3: the pointer cap alone, pinned old -> new, budget from the live search mapping and pool", () => {
+  it("B and R3: the pointer cap alone, pinned old -> new, old equal to the live cap", () => {
     const b = detailed({ "session-events-mapping": update(eventsMapping(20), eventsMapping(10)) });
     expect(capture(b, live({ pointer: 20 }))).toBe("session pipeline update");
     expect(capture(detailed({ "session-events-mapping": update(eventsMapping(10), eventsMapping(20)) }), live({}))).toBe("session pipeline update");
-    // The deploy (no snapshot) still pins the shape.
-    expect(capture(b, undefined, null)).toBe("session pipeline update");
-    // A capture without the live readback is refused.
-    expect(() => capture(b)).toThrow(/captured only with the live function and mapping readback/);
     // Raising the pointer cap while search polls: (20 + 16) x 3 = 108.
     expect(() => capture(detailed({ "session-events-mapping": update(eventsMapping(10), eventsMapping(20)) }), live({ search: "Enabled" }))).toThrow(/108 pooler connections/);
   });
 
+  it("control 1: a stale B (plan 20 -> 10 while the live cap is 26) is refused", () => {
+    const stale = detailed({ "session-events-mapping": update(eventsMapping(20), eventsMapping(10)) });
+    expect(() => capture(stale, live({ pointer: 26 }))).toThrow(/the plan's old events mapping MaximumConcurrency 20 is not the live 26 \(a stale plan\)/);
+  });
+
+  it("control 2: a truthful B (26 -> 10) is accepted; the new cap keeps the staged 2-20, and the rollback never restores 26", () => {
+    expect(capture(detailed({ "session-events-mapping": update(eventsMapping(26), eventsMapping(10)) }), live({ pointer: 26 }))).toBe("session pipeline update");
+    // The trial's agreed rollback is 20, not 26: a planned 26 is outside the staged caps.
+    expect(() => capture(detailed({ "session-events-mapping": update(eventsMapping(10), eventsMapping(26)) }), live({}))).toThrow(/MaximumConcurrency must be 2-20/);
+    expect(capture(detailed({ "session-events-mapping": update(eventsMapping(10), eventsMapping(20)) }), live({}))).toBe("session pipeline update");
+    // Above the account limit, or uncapped, the live value is refused.
+    expect(() => capture(detailed({ "session-events-mapping": update(eventsMapping(1001), eventsMapping(10)) }), live({ pointer: 1001 }))).toThrow(/no MaximumConcurrency within 2-1000/);
+  });
+
+  it("peak control: enabling search at 16 with the live pointer still 26 (pool 3) is 126 and refused", () => {
+    expect(() => capture(detailed({ "session-search-mapping": update(searchMapping(false), searchMapping(true)) }), live({ pointer: 26 }))).toThrow(/\(pointer 26 \+ search 16\) x pool 3 is 126 pooler connections/);
+  });
+
   it("negative control (a): the pointer mapping retargeted to another function, or another queue, is refused", () => {
     const retarget = (over: Record<string, unknown>, max = 20) => detailed({ "session-events-mapping": update(eventsMapping(20), eventsMapping(max, over)) });
-    for (const [over, max] of [[{ functionName: "someone-else" }, 20], [{ functionName: "someone-else" }, 10], [{ eventSourceArn: p.searchQueueArn }, 10], [{ batchSize: 100 }, 10], [{ enabled: false }, 20]] as const) {
+    for (const [over, max] of [[{ functionName: "someone-else" }, 20], [{ functionName: "someone-else" }, 10], [{ eventSourceArn: p.searchQueueArn }, 10], [{ batchSize: 100 }, 10], [{ enabled: false }, 20]] as const)
       expect(() => capture(retarget(over, max), live({ pointer: 20 }))).toThrow(/session-events-mapping may change only its MaximumConcurrency/);
-      expect(() => capture(retarget(over, max), undefined, null)).toThrow(/session-events-mapping may change only its MaximumConcurrency/);
-    }
-    // Retargeted on both sides (old and new identical except the cap): not its rendered props.
     const both = detailed({ "session-events-mapping": update(eventsMapping(20, { functionName: "someone-else" }), eventsMapping(10, { functionName: "someone-else" })) });
     expect(() => capture(both, live({ pointer: 20 }))).toThrow(/not its rendered props on the events queue \(functionName\)/);
     // Pinned in every pipeline plan, search resources or not.
@@ -972,51 +999,119 @@ describe("search-queue split: the deploy plan contract", () => {
     expect(() => capture(plain.replace(/^Plan: .*$/m, "Plan: 1 to update"), undefined, null)).toThrow(/session-events-mapping may change only its MaximumConcurrency/);
   });
 
-  it("C1 and R2: the search mapping alone, enabled flipped at 16, budget recomputed from the plan's new values", () => {
+  it("C1 and R2: the search mapping alone, old values equal to the live mapping, budget over every enabled mapping", () => {
     expect(capture(detailed({ "session-search-mapping": update(searchMapping(false), searchMapping(true)) }), live({}))).toBe("session pipeline update");
     expect(capture(detailed({ "session-search-mapping": update(searchMapping(true), searchMapping(false)) }), live({ search: "Enabled" }))).toBe("session pipeline update");
-    // Enabling before the pointer cap is lowered: live pointer 20 -> (20 + 16) x 3 = 108.
+    // Stale: the plan says disabled but the live mapping is enabled (or another cap).
+    expect(() => capture(detailed({ "session-search-mapping": update(searchMapping(false), searchMapping(true)) }), live({ search: "Enabled" }))).toThrow(/is not the live one \(a stale plan\)/);
+    expect(() => capture(detailed({ "session-search-mapping": update(searchMapping(false), searchMapping(true)) }), live({ searchMax: 8 }))).toThrow(/is not the live one/);
+    // Enabling before the pointer cap is lowered: live pointer 20 -> 108.
     expect(() => capture(detailed({ "session-search-mapping": update(searchMapping(false), searchMapping(true)) }), live({ pointer: 20 }))).toThrow(/108 pooler connections/);
-    // Retargeted, or any other key.
+    // No live search mapping at all.
+    expect(() => capture(detailed({ "session-search-mapping": update(searchMapping(false), searchMapping(true)) }), live({ search: null }))).toThrow(/the live function has no search mapping/);
     expect(() => capture(detailed({ "session-search-mapping": update(searchMapping(false), searchMapping(true, 16, { eventSourceArn: p.queueArn })) }), live({}))).toThrow(/may change only enabled or MaximumConcurrency/);
-    expect(() => capture(detailed({ "session-search-mapping": update(searchMapping(false, 16, { functionName: "x" }), searchMapping(true, 16, { functionName: "x" })) }), live({}))).toThrow(/not its rendered props on the search queue \(functionName\)/);
   });
 
   it("negative control (b): the search cap raised 16 -> 20 at pointer 10 / pool 3 (90) is refused", () => {
-    const raise = detailed({ "session-search-mapping": update(searchMapping(true, 16), searchMapping(true, 20)) });
-    expect(() => capture(raise, live({ search: "Enabled" }))).toThrow(/\(pointer 10 \+ search 20\) x pool 3 is 90 pooler connections/);
-    // Lowering it is fine.
+    expect(() => capture(detailed({ "session-search-mapping": update(searchMapping(true, 16), searchMapping(true, 20)) }), live({ search: "Enabled" }))).toThrow(/\(pointer 10 \+ search 20\) x pool 3 is 90 pooler connections/);
     expect(capture(detailed({ "session-search-mapping": update(searchMapping(true, 16), searchMapping(true, 8)) }), live({ search: "Enabled" }))).toBe("session pipeline update");
   });
 
-  it("C2 and R1: the function env changes by exactly the search queue URL, with the role-ARN cascade", () => {
-    const off = fnProps({ ...SPLIT, searchQueue: { ...Q, mappingEnabled: true } });
-    const on = fnProps({ ...SPLIT, searchQueue: { ...Q, mappingEnabled: true, handoff: true } });
+  it("control 4: R2 (disable search) is refused while the live env still has the handoff URL", () => {
+    const r2 = detailed({ "session-search-mapping": update(searchMapping(true), searchMapping(false)) });
+    expect(() => capture(r2, live({ search: "Enabled", env: fnProps(C2_ON).env as Record<string, unknown> }))).toThrow(/disabling the search mapping needs R1 first/);
+  });
+
+  it("control 5: an extra mapping on the function (an unknown, enabled, cap 20) is refused, not left out of the budget", () => {
+    const c1 = detailed({ "session-search-mapping": update(searchMapping(false), searchMapping(true)) });
+    const extra = mapping(`arn:aws:sqs:${REGION}:${ACCOUNT}:someone-elses-queue`, "Enabled", 20, "uuid-extra-synthetic");
+    expect(() => capture(c1, live({ extra: [extra] }))).toThrow(/live mapping uuid-extra-synthetic is not one this stack declares/);
+    // A second mapping on the events queue too.
+    expect(() => capture(c1, live({ extra: [mapping(p.queueArn, "Enabled", 20, "uuid-dup-synthetic")] }))).toThrow(/is not one this stack declares \(or a duplicate\)/);
+  });
+
+  it("control 6: no in-place change is accepted without the live readback, at capture or at deploy", () => {
+    for (const b of [
+      detailed({ "session-search-mapping": update(searchMapping(false), searchMapping(true)) }),
+      detailed({ "session-events-mapping": update(eventsMapping(20), eventsMapping(10)) }),
+      fnUpdate(fnProps(C1_BASE), fnProps(C2_ON)),
+    ]) {
+      expect(() => capture(b, undefined, null)).toThrow(/needs the live function and mapping readback/);
+      expect(() => capture(b, undefined)).toThrow(/needs the live function and mapping readback/);
+    }
+  });
+
+  it("the verified source state: bound to the capture's RevisionId, mapping UUIDs, state and settings; stable mappings only", () => {
+    const c1 = detailed({ "session-search-mapping": update(searchMapping(false), searchMapping(true)) });
+    // The deploy reads the live function again: a changed RevisionId, env, or mapping since the capture refuses.
+    expect(() => capture(c1, live({ revision: "rev-synthetic-2" }), null, live({}))).toThrow(/changed since the capture/);
+    expect(() => capture(c1, live({ env: { ...(fnProps({ ...SPLIT, searchQueue: Q }).env as object), EXTRA: "1" } }), null, live({}))).toThrow(/changed since the capture/);
+    expect(() => capture(c1, live({}), null, live({ pointerOver: { uuid: "uuid-events-other" } }))).toThrow(/changed since the capture/);
+    // A capture that did not record it.
+    expect(() => capture(c1, live({}), null, "")).toThrow(/did not record the live function/);
+    // Same readback at deploy: accepted.
+    expect(capture(c1, live({}), null)).toBe("session pipeline update");
+    for (const state of ["Creating", "Updating", "Enabling", "Disabling", "Deleting"])
+      expect(() => capture(c1, live({ pointerOver: { state } }))).toThrow(new RegExp(`live mapping uuid-events-synthetic is ${state}, not stable`));
+    expect(() => capture(c1, live({ pointerOver: { functionArn: `${FN_ARN}-other` } }))).toThrow(/does not target this function/);
+    expect(() => capture(c1, live({ pointerOver: { batchSize: 100 } }))).toThrow(/does not carry the rendered settings/);
+    expect(() => capture(c1, live({ pointerOver: { maximumConcurrency: undefined } }))).toThrow(/no MaximumConcurrency/);
+    expect(() => capture(c1, live({ pointerOver: { state: "Disabled" } }))).toThrow(/the live events mapping is not enabled/);
+  });
+
+  it("C2 and R1: the function env changes by exactly the search queue URL, against the plan and against the live env", () => {
+    const off = fnProps(C1_BASE);
+    const on = fnProps(C2_ON);
     expect((on.env as Record<string, string>)[URL_KEY]).toBe(p.searchQueueUrl);
     expect(capture(fnUpdate(off, on), live({ env: off.env as Record<string, unknown>, search: "Enabled" }))).toBe("session pipeline update");
     expect(capture(fnUpdate(on, off), live({ env: on.env as Record<string, unknown>, search: "Enabled" }))).toBe("session pipeline update");
-    expect(capture(fnUpdate(off, on), undefined, null)).toBe("session pipeline update");
-    // Another URL, a pool change, a non-env change: refused.
     expect(() => capture(fnUpdate(off, { ...on, env: { ...(on.env as object), [URL_KEY]: p.queueUrl } }), live({ env: off.env as Record<string, unknown>, search: "Enabled" }))).toThrow(/may change only by adding or removing SESSION_PIPELINE_SEARCH_QUEUE_URL/);
     expect(() => capture(fnUpdate(off, { ...off, env: { ...(off.env as object), HOOPDB_POOL_MAX: "4" } }), live({ env: off.env as Record<string, unknown>, search: "Enabled" }))).toThrow(/HOOPDB_POOL_MAX changed/);
     expect(() => capture(fnUpdate(off, { ...on, memorySize: 10240 }), live({ env: off.env as Record<string, unknown>, search: "Enabled" }))).toThrow(/changes more than its env: memorySize/);
   });
 
+  it("control 3: C2 is refused unless the search mapping exists, is enabled, and points at this queue and function", () => {
+    const off = fnProps(C1_BASE), on = fnProps(C2_ON);
+    const c2 = fnUpdate(off, on);
+    expect(() => capture(c2, live({ env: off.env as Record<string, unknown>, search: null }))).toThrow(/needs the search mapping on this function and queue, enabled \(C1\) first/);
+    expect(() => capture(c2, live({ env: off.env as Record<string, unknown>, search: "Disabled" }))).toThrow(/enabled \(C1\) first/);
+  });
+
+  it("control (retry var): a key in both plan sides but absent live would be re-introduced by C2, and is refused", () => {
+    const retry = { SESSION_PIPELINE_RETRY_VISIBILITY_S: "60" };
+    const off = fnProps(C1_BASE, retry), on = fnProps(C2_ON, retry);
+    const liveEnv = fnProps(C1_BASE).env as Record<string, unknown>;
+    expect(() => capture(fnUpdate(off, on), live({ env: liveEnv, search: "Enabled" }))).toThrow(
+      /after this apply the function env would differ from the live env by SESSION_PIPELINE_RETRY_VISIBILITY_S added, SESSION_PIPELINE_SEARCH_QUEUE_URL added; only SESSION_PIPELINE_SEARCH_QUEUE_URL may/,
+    );
+    // The reverse for R1: a live key the plan does not render is dropped.
+    expect(() => capture(fnUpdate(fnProps(C2_ON), fnProps(C1_BASE)), live({ env: { ...(fnProps(C2_ON).env as object), ...retry }, search: "Enabled" }))).toThrow(/SESSION_PIPELINE_RETRY_VISIBILITY_S removed/);
+  });
+
   it("negative control (c): the URL added while visibly removing SEARCH_INDEX_SKIP_OVER_BOUND_ENABLED is refused; so is an invisible loss", () => {
     const flag = { SEARCH_INDEX_SKIP_OVER_BOUND_ENABLED: "true" };
-    const base = { ...SPLIT, searchQueue: { ...Q, mappingEnabled: true } };
-    const old = fnProps(base, flag);
-    const visible = fnProps({ ...base, searchQueue: { ...base.searchQueue, handoff: true } });
+    const old = fnProps(C1_BASE, flag);
+    const visible = fnProps(C2_ON);
     expect(() => capture(fnUpdate(old, visible), live({ env: old.env as Record<string, unknown>, search: "Enabled" }))).toThrow(
       /may change only by adding or removing SESSION_PIPELINE_SEARCH_QUEUE_URL .*found SEARCH_INDEX_SKIP_OVER_BOUND_ENABLED removed, SESSION_PIPELINE_SEARCH_QUEUE_URL added/,
     );
-    expect(() => capture(fnUpdate(old, visible), undefined, null)).toThrow(/SEARCH_INDEX_SKIP_OVER_BOUND_ENABLED removed/);
-    // Invisible: the flag was set by hand, so neither side of the plan has it; only the live readback does.
-    const plain = fnProps(base);
-    const liveEnv = { ...(plain.env as object), ...flag };
-    expect(() => capture(fnUpdate(plain, visible), live({ env: liveEnv, search: "Enabled" }))).toThrow(/the live function has SEARCH_INDEX_SKIP_OVER_BOUND_ENABLED, which this plan does not render \(the update would drop it\)/);
-    // A live value changed by hand and not shown by the plan is not silently overwritten.
-    expect(() => capture(fnUpdate(plain, visible), live({ env: { ...(plain.env as object), HOOPDB_POOL_MAX: "2" }, search: "Enabled" }))).toThrow(/the live HOOPDB_POOL_MAX differs from the planned value/);
+    const plain = fnProps(C1_BASE);
+    expect(() => capture(fnUpdate(plain, visible), live({ env: { ...(plain.env as object), ...flag }, search: "Enabled" }))).toThrow(/SEARCH_INDEX_SKIP_OVER_BOUND_ENABLED removed/);
+    expect(() => capture(fnUpdate(plain, visible), live({ env: { ...(plain.env as object), HOOPDB_POOL_MAX: "2" }, search: "Enabled" }))).toThrow(/HOOPDB_POOL_MAX changed/);
+  });
+
+  it("all search resources noop: an unrelated read-api update is judged by its own phase; mixed changes stay refused", () => {
+    // The same reader-only update with and without the five noop search entries.
+    const readApi = REAL.replace(/^\[([a-z0-9-]+)\] update\n[\s\S]*?(?=\n\[)/gm, "[$1] noop\n");
+    const withReader = (text: string) =>
+      `${text.trimEnd()}\n\n${["session-read-api", "session-read-api-errors-alarm", "session-read-api-secret", "session-read-api-throttles-alarm"].map((r) => (r === "session-read-api" ? "[session-read-api] update\n  no declared property changes" : `[${r}] noop`)).join("\n\n")}\n`.replace(/^Plan: .*$/m, "Plan: 1 to update");
+    const without = withReader(readApi);
+    const withSearch = withReader(detailed({}));
+    expect(capture(without, undefined, null)).toBe("session read api update");
+    expect(capture(withSearch, undefined, null)).toBe("session read api update");
+    // Mixed with a staged change: still refused.
+    const mixed = withReader(detailed({ "session-events-mapping": update(eventsMapping(20), eventsMapping(10)) })).replace(/^Plan: .*$/m, "Plan: 2 to update");
+    expect(() => capture(mixed, live({ pointer: 20 }))).toThrow(/not one staged change/);
   });
 
   it("refuses a DLQ or alarm update, two staged changes at once, a delete or replace, and a partial resource list", () => {
@@ -1030,10 +1125,9 @@ describe("search-queue split: the deploy plan contract", () => {
 
   it("each staged capture is judged as the staged render says, against the live state of the stage before it", () => {
     const fn = (pi: SessionPipelineInputs) => fnProps(pi);
-    const at = (id: string) => [...SEARCH_SPLIT_ROLLOUT, ...SEARCH_SPLIT_ROLLBACK].find((s) => s.id === id)!.p;
     const liveOf = (pi: SessionPipelineInputs) => {
-      const s = sessionPoolSettings(pi);
-      return live({ env: fn(pi).env as Record<string, unknown>, pointer: s.pointer, search: pi.searchQueue?.mappingEnabled ? "Enabled" : "Disabled", searchMax: pi.searchQueue?.maxConcurrency ?? 16 });
+      const st = sessionPoolSettings(pi);
+      return live({ env: fn(pi).env as Record<string, unknown>, pointer: st.pointer, search: pi.searchQueue?.mappingEnabled ? "Enabled" : "Disabled", searchMax: pi.searchQueue?.maxConcurrency ?? 16 });
     };
     const blocks: Record<string, (prev: SessionPipelineInputs, next: SessionPipelineInputs) => string> = {
       A: () => detailed(creates()),
@@ -1046,34 +1140,95 @@ describe("search-queue split: the deploy plan contract", () => {
     };
     const chain = [...SEARCH_SPLIT_ROLLOUT, ...SEARCH_SPLIT_ROLLBACK];
     for (let n = 1; n < chain.length; n++) {
-      const s = chain[n]!, prev = chain[n - 1]!;
-      const text = blocks[s.id]!(prev.p, s.p);
-      expect([s.id, capture(text, s.id === "A" ? undefined : liveOf(prev.p))]).toEqual([s.id, s.phase]);
+      const st = chain[n]!, prev = chain[n - 1]!;
+      expect([st.id, capture(blocks[st.id]!(prev.p, st.p), st.id === "A" ? undefined : liveOf(prev.p))]).toEqual([st.id, st.phase]);
     }
-    expect(at("C2").searchQueue?.handoff).toBe(true);
   });
-
 });
 
 describe("search-queue split: the live readback", () => {
-  it("reads the function env and its mappings read-only, and is absent before the function exists", () => {
+  const CANARY = "canary-env-value-7f3a";
+  const REAL = readFileSync(fileURLToPath(new URL("./fixtures/aws-sessions-prod.pipeline-update.detailed.txt", import.meta.url)), "utf8");
+  const FN_ARN = `arn:aws:lambda:${REGION}:${ACCOUNT}:function:${p.function}`;
+  const okConfig = { FunctionName: p.function, RevisionId: "rev-synthetic-1", Environment: { Variables: { HOOPDB_POOL_MAX: "3", SECRETISH: CANARY } } };
+  const okMappings = { EventSourceMappings: [{ UUID: "u1", EventSourceArn: p.queueArn, FunctionArn: FN_ARN, State: "Enabled", BatchSize: 10, MaximumBatchingWindowInSeconds: 20, FunctionResponseTypes: ["ReportBatchItemFailures"], ScalingConfig: { MaximumConcurrency: 26 } }] };
+  const fake = (config: unknown, mappings: unknown = okMappings) => (_cmd: string, args: string[]) => {
+    const body = args[1] === "get-function-configuration" ? config : mappings;
+    if (body && typeof body === "object" && "fail" in (body as object)) return { status: 255, stdout: `${CANARY}`, stderr: (body as { fail: string }).fail };
+    return { status: 0, stdout: typeof body === "string" ? body : JSON.stringify(body), stderr: "" };
+  };
+  const codeOf = (run: Parameters<typeof readPipelineLive>[0]) => {
+    try {
+      readPipelineLive(run, STAGE, ACCOUNT, REGION);
+      return "ok";
+    } catch (e) {
+      const err = e as PipelineLiveError;
+      // No CLI output, no exception text, no env value in any message.
+      expect([err.message, String(err.stack ?? ""), JSON.stringify(err)].join("\n")).not.toContain(CANARY);
+      return err.code ?? err.message;
+    }
+  };
+
+  it("reads the function, its RevisionId and env, and every mapping read-only; absent before the function exists", () => {
     const calls: string[][] = [];
     const run = (cmd: string, args: string[]) => {
       calls.push([cmd, ...args]);
-      if (args[1] === "get-function-configuration") return JSON.stringify({ Environment: { Variables: { HOOPDB_POOL_MAX: "3", SEARCH_INDEX_SKIP_OVER_BOUND_ENABLED: "true" } } });
-      return JSON.stringify({ EventSourceMappings: [{ EventSourceArn: p.queueArn, State: "Enabled", ScalingConfig: { MaximumConcurrency: 20 } }, { EventSourceArn: p.searchQueueArn, State: "Disabled" }] });
+      return fake(okConfig)(cmd, args);
     };
-    expect(JSON.parse(readPipelineLive(run, STAGE, ACCOUNT, REGION)!)).toEqual({
-      schema: 1,
-      env: { HOOPDB_POOL_MAX: "3", SEARCH_INDEX_SKIP_OVER_BOUND_ENABLED: "true" },
-      mappings: [{ eventSourceArn: p.queueArn, state: "Enabled", maximumConcurrency: 20 }, { eventSourceArn: p.searchQueueArn, state: "Disabled" }],
+    const got = JSON.parse(readPipelineLive(run, STAGE, ACCOUNT, REGION)!);
+    expect(got).toEqual({
+      schema: 2,
+      function: { name: p.function, revisionId: "rev-synthetic-1", env: { HOOPDB_POOL_MAX: "3", SECRETISH: CANARY } },
+      mappings: [{ uuid: "u1", eventSourceArn: p.queueArn, functionArn: FN_ARN, state: "Enabled", batchSize: 10, maximumBatchingWindowInSeconds: 20, functionResponseTypes: ["ReportBatchItemFailures"], maximumConcurrency: 26 }],
     });
     expect(calls.map((c) => c.slice(0, 3))).toEqual([["aws", "lambda", "get-function-configuration"], ["aws", "lambda", "list-event-source-mappings"]]);
-    expect(calls.every((c) => c.includes(p.function))).toBe(true);
-    const missing = () => {
-      throw new Error("aws lambda failed: An error occurred (ResourceNotFoundException) when calling the GetFunctionConfiguration operation");
-    };
-    expect(readPipelineLive(missing, STAGE, ACCOUNT, REGION)).toBeUndefined();
-    expect(() => readPipelineLive(() => { throw new Error("AccessDeniedException"); }, STAGE, ACCOUNT, REGION)).toThrow(/AccessDenied/);
+    // The fingerprint keeps the RevisionId and mappings, and only a digest of the env.
+    const fp = pipelineLiveFingerprint(got);
+    expect(fp.revisionId).toBe("rev-synthetic-1");
+    expect(fp.mappings.map((m) => m.uuid)).toEqual(["u1"]);
+    expect(JSON.stringify(fp)).not.toContain(CANARY);
+    expect(readPipelineLive(fake({ fail: "An error occurred (ResourceNotFoundException) when calling GetFunctionConfiguration" }), STAGE, ACCOUNT, REGION)).toBeUndefined();
+  });
+
+  it("refuses incomplete, redacted or unreadable output with fixed codes, never echoing the canary env value", () => {
+    expect(codeOf(fake(okConfig))).toBe("ok");
+    expect(codeOf(fake("", okMappings))).toBe("live_output_empty");
+    expect(codeOf(fake(`{"FunctionName":"${p.function}","Environment":{"Variables":{"X":"${CANARY}"`))).toBe("live_parse_failed");
+    expect(codeOf(fake({ fail: `AccessDenied ${CANARY}` }))).toBe("live_cli_failed");
+    expect(codeOf(() => { throw new Error(`spawn failed ${CANARY}`); })).toBe("live_cli_failed");
+    expect(codeOf(fake({ ...okConfig, Environment: { Error: { ErrorCode: "KMSAccessDeniedException", Message: `cannot decrypt ${CANARY}` } } }))).toBe("live_env_error");
+    expect(codeOf(fake({ ...okConfig, Environment: undefined }))).toBe("live_incomplete");
+    expect(codeOf(fake({ ...okConfig, Environment: { Variables: { X: 1 } } }))).toBe("live_incomplete");
+    expect(codeOf(fake({ ...okConfig, RevisionId: undefined }))).toBe("live_incomplete");
+    expect(codeOf(fake({ ...okConfig, FunctionName: "someone-else" }))).toBe("live_wrong_function");
+    expect(codeOf(fake(okConfig, {}))).toBe("live_incomplete");
+    expect(codeOf(fake(okConfig, `[${CANARY}`))).toBe("live_parse_failed");
+    expect(codeOf(fake(okConfig, { EventSourceMappings: [{ ...okMappings.EventSourceMappings[0], UUID: undefined }] }))).toBe("live_incomplete");
+    expect(codeOf(fake(okConfig, { fail: `throttled ${CANARY}` }))).toBe("live_cli_failed");
+  });
+
+  it("guard refusals about the live env name keys, never values", () => {
+    const run = fake({ ...okConfig, Environment: { Variables: { ...okConfig.Environment.Variables } } });
+    const text = readPipelineLive(run, STAGE, ACCOUNT, REGION)!;
+    const env = JSON.parse(text).function.env as Record<string, string>;
+    expect(env.SECRETISH).toBe(CANARY);
+    // A plan whose env lacks the live key: the general env-loss check refuses by name only.
+    // The captured #141 cascade: a code-only function update (no declared property changes), env from state.
+    const plan = REAL;
+    const compact = `${plan.split("\n").filter((l) => l.startsWith("Plan:") || /^\[[a-z0-9-]+\] \S+$/.test(l)).join("\n")}\n`;
+    const h2 = (x: string) => createHash("sha256").update(x).digest("hex");
+    let message = "";
+    try {
+      assertTranscriptStorePlanContract(compact, {
+        detailedPlanText: plan,
+        provenanceText: JSON.stringify({ schema: 1, stage: STAGE, outputs: { plan: { path: `docs/plans/${STAGE}.plan.txt`, sha256: h2(compact) }, detailed: { path: `docs/plans/${STAGE}.plan.detailed.txt`, sha256: h2(plan) } }, summary: compact.split("\n")[0] }),
+        stateSnapshotText: JSON.stringify({ schema: 1, objects: [{ key: `96bulls/96bulls-aws/${STAGE}/session-pipeline.json`, text: JSON.stringify({ status: "created", attr: { roleArn: /^  - \s*AWS: (arn:aws:iam::\S+)$/m.exec(REAL)![1] }, props: { env: { HOOPDB_POOL_MAX: "3" } } }) }] }),
+        liveSnapshotText: text,
+      });
+    } catch (e) {
+      message = (e as Error).message;
+    }
+    expect(message).toMatch(/the live function has SECRETISH, which this plan does not render/);
+    expect(message).not.toContain(CANARY);
   });
 });
