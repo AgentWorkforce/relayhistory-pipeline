@@ -15,7 +15,8 @@ import {sqlLedger} from "../ledger-sql.ts";
 import {deliverBatch} from "../deliver.ts";
 import {batch,record,TENANT} from "./support.ts";
 import {orderedFixtureLedger,initializeFixtureSeatClock}from "./ordered-support.ts";
-import {publicationRpc} from "../publication-rpc.ts";
+import {parsePublicationTicket,publicationRpc} from "../publication-rpc.ts";
+import type {PublicationRpc,PublicationTicket} from "../publication-protocol.ts";
 import {canonicalPublicationTick,publishBufferedStage} from "../publication-job.ts";
 import {lazyAckT2FlipOutcome,type FlipResult} from "../lazy-ack-t2-flip.ts";
 import {layoutComponent} from "../../shared/layout-component.ts";
@@ -465,5 +466,175 @@ describe.skipIf(!url)("scoped v1 real PostgreSQL qualification", () => {
     expect(await canonicalPublicationTick({rpc:watched,target:d.target,store:()=>d.store},{enabled:true,candidateLimit:1})).toMatchObject({published:1});
     expect(replays).toBe(1);
     expect((await d.pool.query("SELECT state FROM sessions.ingest_publication_attempts")).rows).toEqual([{state:"published"}]);
+  },30000);
+});
+
+describe.skipIf(!url)("post-H scoped kernel proposal", () => {
+  const runtime = "bulls96_publication_scoped", recovery = "bulls96_publication_recovery";
+  const source = "supabase/proposals/continuous-publication/";
+  async function setup() {
+    const d = await fixture();
+    const login = "scope_" + crypto.randomUUID().replaceAll("-", "");
+    // The fixture URL is an explicitly disposable cluster. Refuse existing roles.
+    await d.pool.query("CREATE ROLE "+runtime+" NOLOGIN; CREATE ROLE "+recovery+" NOLOGIN; CREATE ROLE "+login+" LOGIN NOINHERIT");
+    clean.push(async()=>{
+      for(const role of [login,runtime,recovery]) {
+        await d.pool.query("DROP OWNED BY "+role); await d.pool.query("DROP ROLE "+role);
+      }
+    });
+    await d.pool.query("GRANT "+runtime+" TO "+login+"; GRANT USAGE ON SCHEMA sessions TO "+runtime+","+recovery);
+    await d.pool.query(read(source+"062280-scoped-kernels.up.sql"));
+    await d.pool.query(read(source+"062290-scoped-recover.up.sql"));
+    const binding = {planSha256:"c".repeat(64), admissionId:CANARY_PLAN_ID,frontierSha256:"e".repeat(64),
+      tenant:{...TENANT,originId:"origin-1"},target:d.target};
+    const admit = () => d.pool.query(`INSERT INTO publication_private.admission(id,binding,stage,frontier_image,admission_image,stage_sha,enabled,valid_until)
+      SELECT $1,$2,s.stage_token,to_jsonb(f),to_jsonb(a),s.stage_sha256,true,clock_timestamp()+interval '5 minutes' FROM sessions.ingest_stage_intents s
+      JOIN sessions.ingest_publication_frontiers f USING(org_id,workspace_id,user_id,origin_id)
+      JOIN sessions.ingest_buffer_admission a USING(org_id) WHERE s.stage_token=$3`,[binding.admissionId,binding,d.stage]);
+    const db=(await d.pool.query("SELECT current_database() AS db")).rows[0].db;
+    const u=new URL(url!);u.pathname="/"+db;u.username=login;u.password="";
+    const connect=async()=>{
+      const c=new pg.Client({connectionString:u.href});await c.connect();await c.query("SET ROLE "+runtime);return c;
+    };
+    const addr={generation:GEN,binding,bucket:d.target.bucket,region:d.target.region,keyRoot:d.target.keyRoot};
+    const invoke=async(c: {query:Function}, op:string, p:object) =>
+      (await c.query("SELECT sessions.ingest_publication_scoped_"+op+"_v1($1) AS result",[p])).rows[0].result;
+    return {d,binding,admit,connect,addr,invoke};
+  }
+
+  test("isolated LOGIN can claim and heartbeat; each mutation refuses foreign bindings and ordinary calls remain available to ingest",async()=>{
+    const {d,connect,invoke,admit,addr,binding}=await setup(); await admit();
+    const c=await connect();
+    try {
+      for(const role of [recovery,"bulls96_session_ingest"]) await expect(c.query("SET ROLE "+role)).rejects.toMatchObject({code:"42501"});
+      await expect(c.query("SELECT * FROM publication_private.admission")).rejects.toMatchObject({code:"42501"});
+      await expect(c.query("SELECT publication_private.claim('{}')")).rejects.toMatchObject({code:"42501"});
+      for(const op of ["candidates","claim","heartbeat","prepare","register_objects","publish","abandon"]) {
+        await expect(c.query("SELECT sessions.ingest_publication_"+op+"('{}')")).rejects.toMatchObject({code:"42501"});
+      }
+      expect((await d.call("ingest_publication_candidates",{...d.target,provider:undefined,limit:1})).stageTokens).toEqual([d.stage]);
+      expect(await invoke(c,"candidates",{...addr,limit:1})).toEqual({stageTokens:[d.stage]});
+      await d.call("ingest_publication_defer",{stageToken:d.stage,code:"40001"});
+      expect(await invoke(c,"candidates",{...addr,limit:1})).toEqual({stageTokens:[]});
+      await expect(invoke(c,"claim",{...addr,stageToken:d.stage})).rejects.toThrow("deferred stage");
+      await d.pool.query("UPDATE sessions.ingest_publication_deferrals SET retry_after=clock_timestamp() WHERE stage_token=$1",[d.stage]);
+      const t=await invoke(c,"claim",{...addr,stageToken:d.stage});
+      const p={generation:GEN,binding,stageToken:d.stage,attemptToken:t.attemptToken,leaseToken:t.leaseToken};
+      expect(await invoke(c,"heartbeat",p)).toHaveProperty("leaseUntil");
+      for(const [op,extra] of [["heartbeat",{}],["prepare",{images:[]}],["register_objects",{objects:[]}],["publish",{messages:[]}],["abandon",{}]] as const) {
+        await expect(invoke(c,op,{...p,...extra,binding:{...binding,planSha256:"a".repeat(64)}})).rejects.toThrow("binding mismatch");
+      }
+      await expect(invoke(c,"recover",p)).rejects.toMatchObject({code:"42501"});
+      expect(await invoke(c,"abandon",p)).toEqual({abandoned:true});
+      await expect(invoke(c,"candidates",{...addr,limit:1})).rejects.toThrow("authority stale");
+    } finally {await c.end();}
+  },30000);
+
+  test("the dedicated role completes a canonical publication and replays only its exact final request",async()=>{
+    const {d,connect,invoke,admit,addr,binding}=await setup(); await admit();
+    const c=await connect();
+    const pin=(t:PublicationTicket)=>({stageToken:t.stageToken,attemptToken:t.attemptToken,leaseToken:t.leaseToken,generation:GEN,binding});
+    // Exercise SQL independently of the separately packaged host adapter.
+    const rpc:PublicationRpc={
+      candidates:async limit=>(await invoke(c,"candidates",{...addr,limit})).stageTokens,
+      claim:async stageToken=>parsePublicationTicket(await invoke(c,"claim",{...addr,stageToken}),d.target),
+      heartbeat:async t=>{t.leaseUntil=(await invoke(c,"heartbeat",pin(t))).leaseUntil;},
+      register:async(t,objects)=>{expect(await invoke(c,"register_objects",{...pin(t),objects})).toEqual({registered:true});},
+      prepare:async(t,images)=>{expect((await invoke(c,"prepare",{...pin(t),images})).prepared).toBe(true);},
+      publish:async(t,messages)=>{
+        const request={...pin(t),messages};
+        const result=await invoke(c,"publish",request);
+        expect(result).toMatchObject({published:true,replay:false});
+        expect(await invoke(c,"publish",request)).toEqual({...result,replay:true});
+        await expect(invoke(c,"publish",{...request,messages:[]})).rejects.toMatchObject({code:"40001"});
+        return result;
+      },
+      abandon:async t=>{await invoke(c,"abandon",pin(t));},
+      defer:async()=>{throw new Error("unexpected defer");},
+    };
+    try {
+      expect(await canonicalPublicationTick({rpc,target:d.target,store:()=>d.store},{enabled:true,candidateLimit:1})).toMatchObject({published:1});
+      expect((await d.pool.query("SELECT state FROM sessions.ingest_publication_attempts")).rows).toEqual([{state:"published"}]);
+    } finally {await c.end();}
+  },30000);
+
+  test("operator may recover exactly three expired claims; replay and stale tickets cannot supersede a newer attempt",async()=>{
+    const {d,connect,invoke,admit,addr,binding}=await setup(); await admit();
+    const operator=await d.pool.connect(); await operator.query("SET ROLE "+recovery);
+    const c=await connect();
+    try {
+      let previous: object | undefined;
+      for(let i=0;i<4;i++){
+        const claimant=await connect();
+        let ticket;
+        try { ticket=await invoke(claimant,"claim",{...addr,stageToken:d.stage}); } finally { await claimant.end(); }
+        const p={generation:GEN,stageToken:d.stage,binding,attemptToken:ticket.attemptToken,leaseToken:ticket.leaseToken};
+        await expect(invoke(operator,"recover",p)).rejects.toThrow(i===3?"recovery not admitted":"recovery lease or stage changed");
+        await d.pool.query("UPDATE sessions.ingest_publication_attempts SET lease_until=clock_timestamp()-interval '1s' WHERE attempt_token=$1",[ticket.attemptToken]);
+        await d.pool.query("UPDATE sessions.ingest_stage_intents SET gc_lease_until=clock_timestamp()-interval '1s' WHERE stage_token=$1",[d.stage]);
+        await d.pool.query("UPDATE sessions.ingest_publication_heads SET build_lease_until=clock_timestamp()-interval '1s' WHERE build_attempt_token=$1",[ticket.attemptToken]);
+        if(previous){
+          expect(await invoke(operator,"recover",previous)).toEqual({recovered:true,replay:true});
+          expect((await d.pool.query("SELECT attempt FROM publication_private.admission")).rows[0].attempt).toBe(ticket.attemptToken);
+        }
+        if(i===3){
+          await expect(invoke(operator,"recover",p)).rejects.toThrow("recovery not admitted");
+          expect(await invoke(c,"candidates",{...addr,limit:1})).toEqual({stageTokens:[]});
+          break;
+        }
+        expect(await invoke(operator,"recover",p)).toEqual({recovered:true,replay:false});
+        expect(await invoke(operator,"recover",p)).toEqual({recovered:true,replay:true});
+        await expect(invoke(c,"heartbeat",p)).rejects.toThrow("attempt mismatch");
+        expect(await invoke(c,"candidates",{...addr,limit:1})).toEqual({stageTokens:[d.stage]});
+        previous=p;
+      }
+      expect((await d.pool.query("SELECT count(*)::int n FROM publication_private.expired_tickets")).rows[0].n).toBe(3);
+      const rollback=await d.pool.connect();
+      try {
+        await expect(rollback.query(read(source+"062290-scoped-recover.down.sql"))).rejects.toThrow("retain recovery receipts");
+        await rollback.query("ROLLBACK");
+        expect((await rollback.query("SELECT count(*)::int n FROM publication_private.expired_tickets")).rows[0].n).toBe(3);
+      } finally {rollback.release(true);}
+    } finally {await c.end();await operator.query("RESET ROLE");operator.release();}
+  },30000);
+
+  test("a privacy change commits ahead of blocked recovery and leaves the claim and receipts intact",async()=>{
+    const {d,connect,invoke,admit,addr,binding}=await setup(); await admit();
+    const c=await connect(), operator=await d.pool.connect(), control=await d.pool.connect();
+    let pending:Promise<unknown>|undefined;
+    try {
+      const t=await invoke(c,"claim",{...addr,stageToken:d.stage});
+      const p={generation:GEN,stageToken:d.stage,binding,attemptToken:t.attemptToken,leaseToken:t.leaseToken};
+      await d.pool.query("UPDATE sessions.ingest_publication_attempts SET lease_until=clock_timestamp()-interval '1s' WHERE attempt_token=$1",[t.attemptToken]);
+      await d.pool.query("UPDATE sessions.ingest_stage_intents SET gc_lease_until=clock_timestamp()-interval '1s' WHERE stage_token=$1",[d.stage]);
+      await operator.query("SET ROLE "+recovery);
+      const pid=(await operator.query("SELECT pg_backend_pid() pid")).rows[0].pid;
+      await control.query("BEGIN");
+      await control.query("SELECT sessions.ingest_lock_fences($1,$2,$3)",[TENANT.orgId,TENANT.workspaceId,TENANT.userId]);
+      await control.query("UPDATE sessions.ingest_buffer_admission SET privacy_baseline_sha256=repeat('d',64)");
+      pending=invoke(operator,"recover",p).then(()=>null,e=>e.message);
+      const deadline=Date.now()+3000;
+      let blocked=false;
+      do {
+        blocked=(await control.query("SELECT pg_backend_pid()=ANY(pg_blocking_pids($1)) blocked",[pid])).rows[0].blocked;
+        if(!blocked) await Bun.sleep(10);
+      } while(!blocked&&Date.now()<deadline);
+      expect(blocked).toBe(true);
+      await control.query("COMMIT");
+      expect(await pending).toBe("scoped publication: authority stale");
+      expect((await d.pool.query("SELECT attempts_recovered,attempt FROM publication_private.admission")).rows[0]).toEqual({attempts_recovered:0,attempt:t.attemptToken});
+      expect((await d.pool.query("SELECT count(*)::int n FROM publication_private.expired_tickets")).rows[0].n).toBe(0);
+    } finally {
+      await control.query("ROLLBACK");await pending;await c.end();
+      await operator.query("RESET ROLE");operator.release();control.release();
+    }
+  },30000);
+
+  test("empty-state rollback removes new APIs and leaves ordinary ingest grants intact",async()=>{
+    const {d}=await setup();
+    await d.pool.query(read(source+"062290-scoped-recover.down.sql"));
+    await d.pool.query(read(source+"062280-scoped-kernels.down.sql"));
+    expect((await d.pool.query("SELECT to_regnamespace('publication_private') gone")).rows[0].gone).toBeNull();
+    expect((await d.call("ingest_publication_candidates",{...d.target,provider:undefined,limit:1})).stageTokens).toEqual([d.stage]);
   },30000);
 });
