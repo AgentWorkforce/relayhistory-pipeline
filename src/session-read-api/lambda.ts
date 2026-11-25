@@ -14,6 +14,10 @@ import { sqlRelayfacts } from "./relayfacts.ts";
  * Session analysis (lane F1), off unless configured:
  *   READ_API_ANALYSIS_BUCKET   the canonical bucket holding analysis result objects (the
  *                              read role's GET is served; unset = 501 analysis_not_configured).
+ *                              S3 only: with LOCKER_PROVIDER=azure it is ignored (analysis stays
+ *                              unconfigured, no S3 client is built) with one startup warning,
+ *                              read_api_analysis_bucket_ignored_on_azure, until the Locker-store
+ *                              read path (S2b) lands.
  *   "analysis_admit_url"       optional secret field: postgresql://bulls96_analysis_admit:…,
  *                              the separate admission principal; absent = POST 501.
  * POST is accepted for exactly /v1/sessions/:id/analysis; every other method/path is 405.
@@ -706,8 +710,9 @@ export async function readApiDepsFromSecret(secretText: string, env: NodeJS.Proc
     options: "-c statement_timeout=2000", // Nonempty: pg otherwise uses PGOPTIONS.
   });
   pool.on("error", (err) => log.error("read api pool error", { error_code: (err as { code?: string }).code ?? "pool_error" }));
-  // The admission principal: its own pool, never the read role's.
-  const admitPool = secret.analysis_admit_url
+  // The admission principal: its own pool, never the read role's. Not built on LOCKER_PROVIDER=azure, where
+  // analysis is unconfigured until S2b (readApiAnalysisBucket), so the pool would never be used.
+  const admitPool = secret.analysis_admit_url && env.LOCKER_PROVIDER?.trim() !== "azure"
     ? new pg.Pool({
         connectionString: postgresConnectionString(secret.analysis_admit_url),
         max: 1,
@@ -720,14 +725,7 @@ export async function readApiDepsFromSecret(secretText: string, env: NodeJS.Proc
       })
     : undefined;
   admitPool?.on("error", (err) => log.error("analysis admit pool error", { error_code: (err as { code?: string }).code ?? "pool_error" }));
-  const analysisBucket = env.READ_API_ANALYSIS_BUCKET?.trim();
-  const analysis = analysisBucket
-    ? sqlAnalysisSource(
-        poolTenantRunner(pool as never),
-        createS3Store({ bucket: analysisBucket, region: env.AWS_REGION ?? "", credentials: async () => lambdaCredentials() }),
-        admitPool as never,
-      )
-    : undefined;
+  const analysis = readApiAnalysisSource(env, poolTenantRunner(pool as never), admitPool as never);
   let narrative: Awaited<ReturnType<typeof selfhostNarrativeFromEnv>>;
   try {
   // Directory, liveness and Postgres search isolation is forced RLS. Checked on
@@ -894,3 +892,33 @@ return async function readApiHandler(event: FunctionUrlEvent): Promise<FunctionU
 }
 
 export const handler = createReadApiLambdaHandler();
+
+/**
+ * READ_API_ANALYSIS_BUCKET as the analysis source's S3 bucket, or undefined (analysis unconfigured: 501). On
+ * LOCKER_PROVIDER=azure the S3 result reader does not apply, so the variable is ignored with one coded startup
+ * warning and no S3 client is built; the Azure store path is S2b.
+ */
+export function readApiAnalysisBucket(env: NodeJS.ProcessEnv): string | undefined {
+  const bucket = env.READ_API_ANALYSIS_BUCKET?.trim();
+  if (!bucket) return undefined;
+  if (env.LOCKER_PROVIDER?.trim() !== "azure") return bucket;
+  log.warn("read api analysis not configured", { reason: "read_api_analysis_bucket_ignored_on_azure" });
+  return undefined;
+}
+
+/**
+ * The read API's analysis source: the S3 result store over READ_API_ANALYSIS_BUCKET, or undefined (the routes
+ * answer 501 analysis_not_configured). On LOCKER_PROVIDER=azure it is always undefined and no S3 client is built
+ * (readApiAnalysisBucket). `makeStore` is a test port.
+ */
+export function readApiAnalysisSource(
+  env: NodeJS.ProcessEnv,
+  run: Parameters<typeof sqlAnalysisSource>[0],
+  admit?: Parameters<typeof sqlAnalysisSource>[2],
+  makeStore: typeof createS3Store = createS3Store,
+): ReturnType<typeof sqlAnalysisSource> | undefined {
+  const bucket = readApiAnalysisBucket(env);
+  return bucket
+    ? sqlAnalysisSource(run, makeStore({ bucket, region: env.AWS_REGION ?? "", credentials: async () => lambdaCredentials() }), admit)
+    : undefined;
+}

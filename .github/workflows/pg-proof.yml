@@ -412,6 +412,9 @@ jobs:
       # The MinIO digest pinned in versions.lock.json and stacks/local/topology.ts.
       FRONTIER_MINIO_IMAGE: cgr.dev/chainguard/minio@sha256:e70b2b1e74d79457f808710483bd726ff364529ca30736eaa15a6ab547d3a5a7
       FRONTIER_MINIO_NAME: frontier-minio-${{ github.run_id }}-${{ github.run_attempt }}-pg${{ matrix.pg }}
+      # Azurite 3.38.0 (opt-in per-account blob versioning), pinned by its image index digest.
+      AZURITE_IMAGE: mcr.microsoft.com/azure-storage/azurite:3.38.0@sha256:c26024d62bf4a5b88a40968afd217234c00e1fc9a4790dc6105d1ca7979f6eec
+      AZURITE_NAME: analysis-azurite-${{ github.run_id }}-${{ github.run_attempt }}-pg${{ matrix.pg }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -484,13 +487,47 @@ jobs:
             await s3("PUT", "?versioning", `<VersioningConfiguration xmlns="http://s3.amazonaws.com/doc/2006-03-01/"><Status>Enabled</Status></VersioningConfiguration>`);
           '
           log=frontier-plan-pg${{ matrix.pg }}.log
-          bun test src/session-ingest/__tests__/frontier-plan.postgres.test.ts src/session-erase/__tests__/selfhost-eraser.minio.test.ts src/session-erase/__tests__/operator-flow.minio.test.ts 2>&1 | tee "$log"
+          bun test src/session-ingest/__tests__/frontier-plan.postgres.test.ts src/session-erase/__tests__/selfhost-eraser.minio.test.ts src/session-erase/__tests__/operator-flow.minio.test.ts src/session-analysis/__tests__/runner-store.minio.test.ts 2>&1 | tee "$log"
           grep -Eq '^ *[1-9][0-9]* pass$' "$log"
           if grep -Eq '^ *[1-9][0-9]* skip$' "$log"; then echo "tests were skipped"; exit 1; fi
           grep -E '^ *[0-9]+ (pass|fail)$' "$log" | tr -s ' ' | paste -sd, | sed "s/^/frontier-plan PostgreSQL ${{ matrix.pg }}:/" >> "$GITHUB_STEP_SUMMARY"
       - name: Remove the MinIO fixture
         if: always()
         run: docker rm -f "$FRONTIER_MINIO_NAME" >/dev/null 2>&1 || true
+      # The session-analysis runner on LOCKER_PROVIDER=azure against Azurite: loopback-only, random host port,
+      # in-memory data, two accounts (one with blob versioning, one without) whose throwaway keys live only in
+      # this step's environment. Azurite has no soft delete; those paths are fake-server tests in the unit shards.
+      - name: Session-analysis runner on Azurite (versioned and unversioned accounts)
+        run: |
+          set -euo pipefail
+          AZURITE_TEST_VERSIONED_ACCOUNT="fxver$(openssl rand -hex 4)"
+          AZURITE_TEST_PLAIN_ACCOUNT="fxplain$(openssl rand -hex 4)"
+          AZURITE_TEST_VERSIONED_KEY="$(openssl rand -base64 64 | tr -d '\n')"
+          AZURITE_TEST_PLAIN_KEY="$(openssl rand -base64 64 | tr -d '\n')"
+          echo "::add-mask::$AZURITE_TEST_VERSIONED_KEY"
+          echo "::add-mask::$AZURITE_TEST_PLAIN_KEY"
+          export AZURITE_TEST_VERSIONED_ACCOUNT AZURITE_TEST_PLAIN_ACCOUNT AZURITE_TEST_VERSIONED_KEY AZURITE_TEST_PLAIN_KEY
+          AZURITE_ACCOUNTS="$AZURITE_TEST_VERSIONED_ACCOUNT:$AZURITE_TEST_VERSIONED_KEY;$AZURITE_TEST_PLAIN_ACCOUNT:$AZURITE_TEST_PLAIN_KEY" \
+            docker run -d --name "$AZURITE_NAME" -p 127.0.0.1::10000 -e AZURITE_ACCOUNTS \
+            "$AZURITE_IMAGE" azurite-blob --blobHost 0.0.0.0 --blobPort 10000 --inMemoryPersistence --disableTelemetry \
+            --accountConfigAsJson "$AZURITE_TEST_VERSIONED_ACCOUNT:{\"isBlobVersioningEnabled\":true},$AZURITE_TEST_PLAIN_ACCOUNT:{\"isBlobVersioningEnabled\":false}" \
+            < /dev/null > /dev/null
+          hostport="$(docker port "$AZURITE_NAME" 10000/tcp | grep '^127\.0\.0\.1:' | head -1)"
+          export AZURITE_TEST_BLOB_ORIGIN="http://$hostport"
+          ready=0
+          for _ in $(seq 1 60); do
+            if docker logs "$AZURITE_NAME" 2>&1 | grep -q 'successfully listens'; then ready=1; break; fi
+            sleep 1
+          done
+          if [ "$ready" != 1 ]; then docker logs "$AZURITE_NAME"; exit 1; fi
+          log=azurite-pg${{ matrix.pg }}.log
+          bun test src/session-analysis/__tests__/runner-store.azurite.test.ts 2>&1 | tee "$log"
+          grep -Eq '^ *[1-9][0-9]* pass$' "$log"
+          if grep -Eq '^ *[1-9][0-9]* skip$' "$log"; then echo "tests were skipped"; exit 1; fi
+          grep -E '^ *[0-9]+ (pass|fail)$' "$log" | tr -s ' ' | paste -sd, | sed "s/^/azurite PostgreSQL ${{ matrix.pg }}:/" >> "$GITHUB_STEP_SUMMARY"
+      - name: Remove the Azurite fixture
+        if: always()
+        run: docker rm -f "$AZURITE_NAME" >/dev/null 2>&1 || true
       - uses: actions/upload-artifact@v4
         if: always()
         with:
@@ -498,6 +535,7 @@ jobs:
           path: |
             publication-pg${{ matrix.pg }}.log
             frontier-plan-pg${{ matrix.pg }}.log
+            azurite-pg${{ matrix.pg }}.log
           if-no-files-found: ignore
 
   consumer-writer:
