@@ -151,8 +151,7 @@ test("portable runtime refuses a frontier for another bucket: nothing is a candi
 });
 
 test("disposable scoped v1 binds candidates, claim and final commit to one admitted stage and live authority", async () => {
-  const { publicationRpc } = await import("../publication-rpc.ts");
-  const { canonicalPublicationTick } = await import("../publication-job.ts");
+  const { scopedPublicationCycle } = await import("../publication-scoped-rpc.ts");
   const target = {bucket:BUCKET,region:REGION,keyRoot:"96bulls",generation:GEN,provider:"s3" as const};
   const ledger = orderedFixtureLedger(sqlLedger(asIngest, { acceptanceMode:"buffered", expectedGeneration:GEN }),{ query:owner });
   const submit=async(id:string)=>{
@@ -176,14 +175,14 @@ test("disposable scoped v1 binds candidates, claim and final commit to one admit
   await expect(call("scoped_candidates_v1",{...scopeArgs,limit:1,binding:{...binding,planSha256:"b".repeat(64)}})).rejects.toThrow();
   await expect(call("claim",{stageToken:other,generation:GEN,keyRoot:"96bulls",bucket:BUCKET,region:REGION})).rejects.toThrow("permission denied");
 
-  // Exercise the ordinary ticket parser/job and stage-bound downstream operations with a
-  // fixture transport. The host's real scoped transport is a separate integration unit.
-  const rpc=publicationRpc({queryBounded:async(text:string,args:unknown[])=>{
+  // Forward the host adapter's parameter and function selection unchanged to SQL.
+  const calls:string[]=[];
+  const transport={queryBounded:async(text:string,args:unknown[])=>{
     const p=JSON.parse(String(args[0]));
-    const method=text.match(/ingest_publication_([a-z_]+)\(/)![1]!;
-    if(method==="candidates"||method==="claim")return {rows:[{result:await call("scoped_"+method+"_v1",{...p,binding})}]};
-    if(method==="publish"){
-      const final={...p,stageToken:admitted,binding};
+    const method=text.match(/^SELECT sessions\.ingest_publication_([a-z_0-9]+)\(\$1::jsonb\) AS result$/)![1]!;
+    calls.push(method);
+    if(method==="scoped_publish_v1"){
+      const final=p;
       // A lost claim response must not allocate another attempt. Even when its
       // lease has expired, this one-shot admission is held for audited recovery.
       await db.exec("BEGIN");
@@ -212,8 +211,18 @@ test("disposable scoped v1 binds candidates, claim and final commit to one admit
       return {rows:[{result}]};
     }
     return {rows:[{result:await call(method,p)}]};
-  }} as never,target);
-  expect(await canonicalPublicationTick({rpc,target,store:()=>store},{enabled:true,candidateLimit:1})).toMatchObject({examined:1,published:1});
+  }} as never;
+  const deps={target,store:()=>store};
+  expect(await scopedPublicationCycle(transport,binding,deps)).toMatchObject({enabled:false});
+  expect(calls).toEqual([]);
+  expect(await scopedPublicationCycle(transport,binding,deps,{enabled:true})).toMatchObject({examined:1,published:1});
+  expect(calls).toContain("scoped_claim_v1");
+  expect(calls).toContain("scoped_publish_v1");
+  expect(calls.filter(name=>["candidates","claim","publish","defer"].includes(name))).toEqual([]);
+  const activeCalls=calls.length, objectRequests=s3.requests.length;
+  expect(await scopedPublicationCycle(transport,binding,deps,{enabled:false})).toMatchObject({enabled:false});
+  expect(calls).toHaveLength(activeCalls);
+  expect(s3.requests).toHaveLength(objectRequests);
   expect(await call("scoped_candidates_v1",{...scopeArgs,limit:1})).toEqual({stageTokens:[]});
   expect((await owner("SELECT count(*)::int n FROM sessions.ingest_publication_attempts WHERE stage_token=$1",[other])).rows[0].n).toBe(0);
 });
