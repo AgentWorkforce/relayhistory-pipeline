@@ -514,8 +514,15 @@ promise of replay, so the two cannot coexist with a down migration.
      any `search-index` job row exists;
   2. `INSERT INTO sessions.search_stage_archive (batch_id, kind, source_id, row, archived_at)`: every `search-index`
      letter and event row as jsonb, with `batch_id` a fresh uuid;
-  3. compute `sha256` over the batch's rows, ordered by (kind, source_id), and insert one manifest row
-     (`kind = 'manifest'`) with the counts and the sha256;
+  3. compute the manifest digest and insert one manifest row (`kind = 'manifest'`) with
+     `{letters, events, sha256}`. The digest is exactly:
+     ```sql
+     encode(sha256(convert_to(string_agg(kind || ':' || source_id || ':' || row::text, E'\n'
+            ORDER BY kind, source_id), 'UTF8')), 'hex')
+     ```
+     It is taken over the batch's `letter` and `event` rows. A letter's `source_id` is its letter id. An event's
+     `source_id` is `md5(row::text)`, because `pipeline_events` has no primary key; it is unique within the batch
+     (each event row carries its own idempotency key and timestamp). Each `row` is `to_jsonb` of the source row;
   4. DELETE the archived letters and events.
   
   A failure at any step rolls back everything. `search_stage_archive` is created by the up migration and is NOT
