@@ -84,8 +84,13 @@ export interface SessionEraseBytesRequest {
 
 export interface SessionEraseBytesOptions {
   keyRoot: string;
-  /** The eraser's bucket (checked against each location's `bucket`). */
+  /** The eraser's bucket (checked against each location's `bucket`; on Azure, the container). */
   bucket: string;
+  /**
+   * The eraser's store: absent is the versioned S3-compatible store (rows of `s3` / `r2`), "azure" the Azure Blob
+   * eraser (rows of `azure` only). A row of the other provider is refused, never erased through the wrong store.
+   */
+  provider?: "azure";
   dryRun?: boolean;
   /** Targets processed at once (default 4, max 16). */
   concurrency?: number;
@@ -205,7 +210,7 @@ function validDate(raw: string): [string, string, string] {
  * is not this location's session dir, a non-S3 or other-bucket row, and any staged key that is
  * not a `live-batches` staged object of one of the request's machines.
  */
-export function planTargets(req: SessionEraseBytesRequest, opts: Pick<SessionEraseBytesOptions, "keyRoot" | "bucket">): EraseTarget[] {
+export function planTargets(req: SessionEraseBytesRequest, opts: Pick<SessionEraseBytesOptions, "keyRoot" | "bucket" | "provider">): EraseTarget[] {
   if (!KEY_ROOT.test(opts.keyRoot)) refuse("key_root_invalid");
   const { key } = req;
   if (!key || typeof key.orgId !== "string" || !SEGMENT.test(key.orgId) || key.orgId.startsWith(".")) refuse("org_invalid");
@@ -225,7 +230,10 @@ export function planTargets(req: SessionEraseBytesRequest, opts: Pick<SessionEra
     const lws = physical(loc.workspaceId), m = physical(loc.machineId), h = physical(loc.harness), s = physical(loc.sessionId);
     // A row of another session (or another workspace / source) is never erased under this key.
     if (lws !== ws || h !== harness || s !== sid) refuse("location_not_this_session");
-    if (loc.storageProvider != null && !S3_PROVIDERS.has(loc.storageProvider)) refuse("store_not_versioned_s3");
+    if (loc.storageProvider != null) {
+      if (opts.provider === "azure") { if (loc.storageProvider !== "azure") refuse("store_not_azure"); }
+      else if (!S3_PROVIDERS.has(loc.storageProvider)) refuse("store_not_versioned_s3");
+    }
     if (loc.bucket != null && loc.bucket !== opts.bucket) refuse("bucket_mismatch");
     const machineBase = `${org}/v1/ws=${lws}/m=${m}/h=${h}/`;
     const dates = new Set<string>();
