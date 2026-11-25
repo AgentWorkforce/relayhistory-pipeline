@@ -22,6 +22,8 @@ import {lazyAckT2FlipOutcome,type FlipResult} from "../lazy-ack-t2-flip.ts";
 import {layoutComponent} from "../../shared/layout-component.ts";
 import type {ObjectStore} from "../../shared/vendor.ts";
 import { SESSION_BOOTSTRAP_FILES } from "../../hoopdb/session-bootstrap-chain.ts";
+import {VersionedMemoryStore} from "./versioned-store.ts";
+import {heldPublicationSentinels,publicationKernelSlot,publicationRecoverySlot} from "../../../supabase/proposals/continuous-publication/held-profile.ts";
 const url=process.env.SESSION_INGEST_TEST_PG_URL;
 const GEN="a".repeat(64);
 const FRONTIER_CAPTURE="4".repeat(64),FRONTIER_PLAN="5".repeat(64),FRONTIER_EVIDENCE="6".repeat(64);
@@ -30,7 +32,7 @@ const root=join(import.meta.dir,"../../..");
 const read=(p:string)=>readFileSync(join(root,p),"utf8").split("\n").filter(l=>!l.startsWith("\\")).join("\n");
 const clean:Array<()=>Promise<void>>=[];
 afterEach(async()=>{for(const f of clean.splice(0).reverse())await f();},30000);
-async function fixture(frontier=true,initialRecords=[record({record_id:"new-r1"})],guard=false){
+async function fixture(frontier=true,initialRecords=[record({record_id:"new-r1"})],guard=false, storeOverride?: ObjectStore){
  const admin=new pg.Client({connectionString:url});await admin.connect();const name="publisher_"+crypto.randomUUID().replaceAll("-","");
  await admin.query("CREATE DATABASE "+name);const u=new URL(url!);u.pathname="/"+name;
  const pool=new pg.Pool({connectionString:u.href});const dir=mkdtempSync(join(tmpdir(),"publisher-"));
@@ -55,7 +57,7 @@ async function fixture(frontier=true,initialRecords=[record({record_id:"new-r1"}
  }
  const run=async(t:string,p:unknown[])=>{const c=await pool.connect();try{await c.query("SET ROLE bulls96_session_ingest");return await c.query(t,p);}finally{await c.query("RESET ROLE");c.release();}};
  const ledger=orderedFixtureLedger(sqlLedger(run,{acceptanceMode:"buffered",expectedGeneration:GEN}),pool);
- const store=createFsStore({root:dir}) as unknown as ObjectStore;
+ const store=storeOverride ?? createFsStore({root:dir}) as unknown as ObjectStore;
  await deliverBatch({ledger,target:{store,keyRoot:"96bulls"},acceptanceMode:"buffered"},TENANT,await batch(initialRecords));
  const stage=(await pool.query("SELECT active_stage_token token FROM sessions.ingest_buffer_outbox")).rows[0].token as string;
  const call=async(fn:string,p:unknown)=>(await run("SELECT sessions."+fn+"($1::jsonb) result",[JSON.stringify(fn.startsWith("ingest_publication_")||fn==="ingest_buffer_gc_claim"?{...p as any,generation:GEN}:p)])).rows[0].result;
@@ -456,9 +458,9 @@ describe.skipIf(!url)("scoped v1 real PostgreSQL qualification", () => {
 
 describe.skipIf(!url)("post-H scoped kernel proposal", () => {
   const runtime = "bulls96_publication_scoped", recovery = "bulls96_publication_recovery";
-  const source = "supabase/proposals/continuous-publication/";
-  async function setup() {
-    const d = await fixture();
+
+  async function setup(store?: ObjectStore) {
+    const d = await fixture(true,undefined,false,store);
     const login = "scope_" + crypto.randomUUID().replaceAll("-", "");
     // The fixture URL is an explicitly disposable cluster. Refuse existing roles.
     await d.pool.query("CREATE ROLE "+runtime+" NOLOGIN; CREATE ROLE "+recovery+" NOLOGIN; CREATE ROLE "+login+" LOGIN NOINHERIT");
@@ -468,8 +470,20 @@ describe.skipIf(!url)("post-H scoped kernel proposal", () => {
       }
     });
     await d.pool.query("GRANT "+runtime+" TO "+login+"; GRANT USAGE ON SCHEMA sessions TO "+runtime+","+recovery);
-    await d.pool.query(read(source+"062280-scoped-kernels.up.sql"));
-    await d.pool.query(read(source+"062290-scoped-recover.up.sql"));
+    // Only these held slots enter this disposable rollback ledger. The fixture
+    // supplies synthetic admissions and does not stand in for a 062270 issuer.
+    await d.pool.query("CREATE TABLE IF NOT EXISTS sessions.__96bulls_migrations(name text PRIMARY KEY, sha256 text NOT NULL)");
+    for (const slot of [publicationKernelSlot, publicationRecoverySlot]) {
+      const c = await d.pool.connect();
+      try {
+        const sentinel=heldPublicationSentinels[slot.name].sql;
+        expect((await c.query(sentinel)).rows[0].applied).toBe(false);
+        await c.query("BEGIN"); await c.query(slot.up);
+        expect((await c.query(sentinel)).rows[0].applied).toBe(true);
+        await c.query("INSERT INTO sessions.__96bulls_migrations(name,sha256) VALUES($1,$2)",[slot.name,slot.sha256]);
+        await c.query("COMMIT");
+      } finally { await c.query("ROLLBACK"); c.release(); }
+    }
     const binding = {planSha256:"c".repeat(64), admissionId:CANARY_PLAN_ID,frontierSha256:"e".repeat(64),
       tenant:{...TENANT,originId:"origin-1"},target:d.target};
     const admit = () => d.pool.query(`INSERT INTO publication_private.admission(id,binding,stage,frontier_image,admission_image,stage_sha,enabled,valid_until)
@@ -545,7 +559,8 @@ describe.skipIf(!url)("post-H scoped kernel proposal", () => {
 
   test("the scoped host replays a lost final acknowledgement across dedicated connections",async()=>{
     const {scopedPublicationRpc}=await import("../publication-scoped-rpc.ts");
-    const {d,binding,admit,connect}=await setup();
+    const store=new VersionedMemoryStore();
+    const {d,binding,admit,connect}=await setup(store as unknown as ObjectStore);
     await admit();
     let client=await connect();
     const rpc=scopedPublicationRpc({queryBounded:async(q:string,params:unknown[])=>client.query(q,params)} as never,d.target,binding);
@@ -553,11 +568,14 @@ describe.skipIf(!url)("post-H scoped kernel proposal", () => {
     const watched={...rpc,publish:async(...args:Parameters<typeof rpc.publish>)=>{
       const first=await rpc.publish(...args);
       expect(first.replay).toBe(false);
+      const versions = store.versions().map(({key,id})=>({key,id}));
+      expect(versions.length).toBeGreaterThan(1);
       // Discard the acknowledged connection. Retry on a fresh dedicated login.
       await client.end();client=await connect();
       const second=await rpc.publish(...args);
       expect(second).toEqual({...first,replay:true});
       await expect(rpc.publish(args[0],[],args[2])).rejects.toMatchObject({code:"40001"});
+      expect(store.versions().map(({key,id})=>({key,id}))).toEqual(versions);
       replays++;
       return second;
     }};
@@ -601,7 +619,7 @@ describe.skipIf(!url)("post-H scoped kernel proposal", () => {
       expect((await d.pool.query("SELECT count(*)::int n FROM publication_private.expired_tickets")).rows[0].n).toBe(3);
       const rollback=await d.pool.connect();
       try {
-        await expect(rollback.query(read(source+"062290-scoped-recover.down.sql"))).rejects.toThrow("retain recovery receipts");
+        await expect(rollback.query(publicationRecoverySlot.down)).rejects.toThrow("retain recovery receipts");
         await rollback.query("ROLLBACK");
         expect((await rollback.query("SELECT count(*)::int n FROM publication_private.expired_tickets")).rows[0].n).toBe(3);
       } finally {rollback.release(true);}
@@ -642,8 +660,18 @@ describe.skipIf(!url)("post-H scoped kernel proposal", () => {
 
   test("empty-state rollback removes new APIs and leaves ordinary ingest grants intact",async()=>{
     const {d}=await setup();
-    await d.pool.query(read(source+"062290-scoped-recover.down.sql"));
-    await d.pool.query(read(source+"062280-scoped-kernels.down.sql"));
+    const c=await d.pool.connect();
+    try {
+      await expect(c.query(publicationKernelSlot.down)).rejects.toMatchObject({code:"55000"});
+      await c.query("ROLLBACK");
+      await c.query("UPDATE sessions.__96bulls_migrations SET sha256=repeat('0',64) WHERE name=$1",[publicationRecoverySlot.name]);
+      await expect(c.query(publicationRecoverySlot.down)).rejects.toMatchObject({code:"55000"});
+      await c.query("ROLLBACK");
+      await c.query("UPDATE sessions.__96bulls_migrations SET sha256=$2 WHERE name=$1",[publicationRecoverySlot.name,publicationRecoverySlot.sha256]);
+    } finally {c.release();}
+    await d.pool.query(publicationRecoverySlot.down);
+    await d.pool.query(publicationKernelSlot.down);
+    for (const {sql} of Object.values(heldPublicationSentinels)) expect((await d.pool.query(sql)).rows[0].applied).toBe(false);
     expect((await d.pool.query("SELECT to_regnamespace('publication_private') gone")).rows[0].gone).toBeNull();
     expect((await d.call("ingest_publication_candidates",{...d.target,provider:undefined,limit:1})).stageTokens).toEqual([d.stage]);
   },30000);
