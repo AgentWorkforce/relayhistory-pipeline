@@ -51,11 +51,19 @@ import { TENANT_KEY_BASE } from "./tenants.ts";
 import {
   SESSION_BRIEF_RESOURCES,
   SESSION_PIPELINE_RESOURCES,
+  SESSION_SEARCH_QUEUE_RESOURCES,
+  ALARM_DEFAULTS,
+  DEFAULT_HOOPDB_POOL_MAX,
   assertSessionPipelineInputs,
   pipelineBucketStatements,
   pipelineKeyStatement,
   sessionPipelineFunction,
+  sessionPipelineNames,
   sessionPipelineWiring,
+  sessionSearchAlarms,
+  sessionSearchDlqProps,
+  sessionSearchMappingProps,
+  sessionSearchQueueProps,
   type SessionPipelineInputs,
 } from "./session-pipeline.ts";
 import {
@@ -200,6 +208,7 @@ export type TranscriptStorePlanPhase =
   | "post-apply"
   | "session pipeline rollout"
   | "session pipeline update"
+  | "session search queue rollout"
   | "session read api rollout"
   | "session read api update"
   | "session brief rollout"
@@ -253,7 +262,9 @@ function isReadApiRolloutWithPipelineCascade(operations: ReadonlyMap<string, str
  */
 function sessionPipelinePhase(operations: ReadonlyMap<string, string>): TranscriptStorePlanPhase | undefined {
   if (!SESSION_PIPELINE_RESOURCES.some((r) => operations.has(r))) return undefined;
-  const pipeline = SESSION_PIPELINE_RESOURCES.map((r) => operations.get(r));
+  // The search-queue split's resources, when the plan lists them, change in place as pipeline resources
+  // (their creation is its own phase: sessionSearchQueuePhase, judged first).
+  const pipeline = [...SESSION_PIPELINE_RESOURCES, ...SESSION_SEARCH_QUEUE_RESOURCES.filter((r) => operations.has(r))].map((r) => operations.get(r));
   const store = (r: string) => operations.get(r);
   const othersNoop = TRANSCRIPT_RESOURCES.filter((r) => r !== "transcripts" && r !== "transcripts-key").every((r) => store(r) === "noop");
   if (!othersNoop) return undefined;
@@ -351,11 +362,14 @@ function expectedResources(names: Iterable<string>): readonly string[] {
   const pipeline = new Set<string>(SESSION_PIPELINE_RESOURCES);
   const readApi = new Set<string>(SESSION_READ_API_RESOURCES);
   const brief = new Set<string>(SESSION_BRIEF_RESOURCES);
+  const search = new Set<string>(SESSION_SEARCH_QUEUE_RESOURCES);
   const withBrief = list.some((n) => brief.has(n));
+  const withSearch = list.some((n) => search.has(n));
   return [
     ...TRANSCRIPT_RESOURCES,
-    ...(withBrief || list.some((n) => pipeline.has(n)) ? SESSION_PIPELINE_RESOURCES : []),
+    ...(withBrief || withSearch || list.some((n) => pipeline.has(n)) ? SESSION_PIPELINE_RESOURCES : []),
     ...(withBrief ? SESSION_BRIEF_RESOURCES : []),
+    ...(withSearch ? SESSION_SEARCH_QUEUE_RESOURCES : []),
     ...(list.some((n) => readApi.has(n)) ? SESSION_READ_API_RESOURCES : []),
   ];
 }
@@ -436,6 +450,10 @@ export function assertTranscriptStorePlanContract(planText: string, capture: Tra
     assertRepoTagRenameDiff(compact.operations, capture.detailedPlanText, capture.stateSnapshotText, refuse);
     return "repo tag rename";
   }
+  // The search-queue split: its provisioning is a phase of its own (everything else noop, every
+  // created resource pinned to its rendered props); its in-place changes are pinned, then judged below.
+  const searchPhase = sessionSearchQueuePhase(compact.operations, capture.detailedPlanText, capture.stateSnapshotText, refuse);
+  if (searchPhase) return searchPhase;
   // The brief schedule changes alone, or with exactly a session pipeline update.
   const briefPhase = sessionBriefPhase(compact.operations, capture.detailedPlanText, capture.stateSnapshotText, refuse);
   if (briefPhase) return briefPhase;
@@ -459,7 +477,8 @@ export function assertTranscriptStorePlanContract(planText: string, capture: Tra
   }
   const withPipeline = SESSION_PIPELINE_RESOURCES.some((r) => compact.operations.has(r));
   if (withPipeline) {
-    if (SESSION_PIPELINE_RESOURCES.every((r) => compact.operations.get(r) === "noop") && TRANSCRIPT_RESOURCES.every((r) => compact.operations.get(r) === "noop"))
+    const searchNoop = SESSION_SEARCH_QUEUE_RESOURCES.every((r) => (compact.operations.get(r) ?? "noop") === "noop");
+    if (searchNoop && SESSION_PIPELINE_RESOURCES.every((r) => compact.operations.get(r) === "noop") && TRANSCRIPT_RESOURCES.every((r) => compact.operations.get(r) === "noop"))
       return "post-apply";
     const pipelinePhase = sessionPipelinePhase(compact.operations);
     if (pipelinePhase === "session pipeline update")
@@ -477,6 +496,220 @@ export function assertTranscriptStorePlanContract(planText: string, capture: Tra
   }
   if (phase.name === "srv-writer propagation recovery") assertSrvWriterRecoveryDiff(capture.detailedPlanText, capture.stateSnapshotText, refuse);
   return phase.name;
+}
+
+/** The search-queue split's resource whose policy names the pipeline role: it updates only by the role-ARN cascade. */
+const SEARCH_ROLE_GRANT_RESOURCES = ["session-search"] as const;
+/** The only keys a search mapping update may change: polling on or off, and its MaximumConcurrency. */
+const SEARCH_MAPPING_SETTING_LINE = /^(\s*(?:enabled|MaximumConcurrency): )(.*)$/;
+
+/**
+ * The search-queue split (session-pipeline.ts SESSION_SEARCH_QUEUE_RESOURCES). Undefined when the plan
+ * lists none of its resources, or (after the checks below) when none is created: the plan is then
+ * judged as a pipeline plan, with the search resources as pipeline resources.
+ *
+ * Rollout ("session search queue rollout"): provisioning only. Its resources are created (all, or
+ * the rest after a partial apply), and every other resource in the plan is noop, so no function,
+ * env, mapping or grant change rides along. Each created resource's detailed block must be exactly
+ * its rendered props (tags aside): the DLQ, the queue with its policy naming only the pipeline role
+ * (the state snapshot's role when there is one, else one role in the production account), the
+ * mapping on the search queue for the pipeline function, created disabled, and the two alarms with
+ * no actions.
+ *
+ * In place: the DLQ and the alarms never update; the queue only by the role-ARN cascade (checked
+ * with the pipeline's grants); the mapping only in `enabled` and `MaximumConcurrency`, and never in
+ * the same plan as the events mapping, and HOOPDB_POOL_MAX never with either mapping, so each apply
+ * moves one capacity setting and every moment of it stays within the two rendered (budget-checked)
+ * states. A pipeline update that sets
+ * SESSION_PIPELINE_SEARCH_QUEUE_URL must set it to exactly this stage's search queue URL, and one
+ * that sets HOOPDB_POOL_MAX must keep it between 1 and DEFAULT_HOOPDB_POOL_MAX.
+ */
+function sessionSearchQueuePhase(
+  operations: ReadonlyMap<string, string>,
+  detailedPlanText: string,
+  stateSnapshotText: string | undefined,
+  refuse: (why: string) => never,
+): TranscriptStorePlanPhase | undefined {
+  const search = SESSION_SEARCH_QUEUE_RESOURCES as readonly string[];
+  if (!search.some((r) => operations.has(r))) return undefined;
+  const lines = detailedPlanText.split(/\r?\n/);
+  const names = sessionPipelineNames(TRANSCRIPT_STAGE, TRANSCRIPT_ACCOUNT_ID, TRANSCRIPT_REGION);
+  const changes = () => [...operations].filter(([, a]) => a !== "noop").map(([r, a]) => `${r}:${a}`).join(", ");
+  const created = search.filter((r) => operations.get(r) === "create");
+  if (created.length > 0) {
+    const label = "session search queue rollout";
+    if (!search.every((r) => operations.get(r) === "create" || operations.get(r) === "noop"))
+      refuse(`${label}: the search resources may only be created or noop: ${changes()}`);
+    const others = [...operations].filter(([r, a]) => !search.includes(r) && a !== "noop");
+    if (others.length) refuse(`${label}: provisioning only, every other resource must be noop: ${changes()}`);
+    const role =
+      stateSnapshotText === undefined
+        ? (v: string) => new RegExp(`^arn:aws:iam::${TRANSCRIPT_ACCOUNT_ID}:role/[A-Za-z0-9_+=,.@-]+$`).test(v)
+        : ((arn: string) => (v: string) => v === arn)(roleArnFromState(stateSnapshotText, "session-pipeline", label, refuse));
+    const known = (value: string) => (v: string) => v === value || v === KNOWN_AFTER_APPLY;
+    const concurrency = (v: string) => /^(?:[2-9]|1[0-9]|20)$/.test(v);
+    const tags = {};
+    const expected: Record<string, unknown> = {
+      "session-search-dlq": sessionSearchDlqProps({ names, tags }),
+      "session-search": sessionSearchQueueProps({ names, roleArn: role as never, dlqArn: known(names.searchDlqArn) as never, tags }),
+      "session-search-mapping": {
+        ...sessionSearchMappingProps({ q: { enabled: true }, functionName: names.function, queueArn: known(names.searchQueueArn) as never, tags }),
+        scalingConfig: { MaximumConcurrency: concurrency },
+        enabled: "false",
+      },
+      ...Object.fromEntries(sessionSearchAlarms(names).map(({ id, props }) => [id, { ...ALARM_DEFAULTS, ...props, tags }])),
+    };
+    for (const resource of created) {
+      const actual = planProperties(lines, resource, "create");
+      if (actual === undefined) refuse(`${label}: the detailed plan has no properties for ${resource}`);
+      const { tags: _tags, ...props } = actual as Record<string, PlanValue>;
+      const { tags: _expectedTags, ...want } = expected[resource] as Record<string, unknown>;
+      const diff = planMismatch(props, want, "");
+      if (diff !== undefined) refuse(`${label}: ${resource} is not exactly its rendered props (${diff})`);
+    }
+    return label;
+  }
+  for (const r of ["session-search-dlq", "session-search-dlq-alarm", "session-search-age-alarm"])
+    if (operations.get(r) !== "noop") refuse(`session search queue: ${r} never changes in place: ${changes()}`);
+  if (operations.get("session-search") === "update" && operations.get("session-pipeline") !== "update")
+    refuse(`session search queue: session-search updates only by the role-ARN cascade of a pipeline update: ${changes()}`);
+  if (operations.get("session-search-mapping") === "update") {
+    if (operations.get("session-events-mapping") !== "noop")
+      refuse(`session search queue: the events and search mappings change in separate plans (one capacity setting per apply): ${changes()}`);
+    const block = detailedBlock(lines, "session-search-mapping");
+    const marked = block.map((line) => /^  ([+-]) (.*)$/.exec(line));
+    let settings = 0;
+    for (let i = 0; i < block.length; ) {
+      if (!marked[i]) {
+        i++;
+        continue;
+      }
+      let j = i;
+      while (j < block.length && marked[j]?.[1] === "-") j++;
+      let k = j;
+      while (k < block.length && marked[k]?.[1] === "+") k++;
+      const minus = marked.slice(i, j).map((m) => m![2]!);
+      const plus = marked.slice(j, k).map((m) => m![2]!);
+      if (minus.length === 0 || minus.length !== plus.length) refuse(`session search queue: session-search-mapping adds or removes lines, not only enabled or MaximumConcurrency`);
+      for (let n = 0; n < minus.length; n++) {
+        if (minus[n] === plus[n]) continue;
+        const was = SEARCH_MAPPING_SETTING_LINE.exec(minus[n]!);
+        const now = SEARCH_MAPPING_SETTING_LINE.exec(plus[n]!);
+        if (!was || !now || was[1] !== now[1]) refuse(`session search queue: session-search-mapping changes ${JSON.stringify(minus[n]!.trim())}, not only enabled or MaximumConcurrency`);
+        settings++;
+      }
+      i = k;
+    }
+    if (settings === 0) refuse("session search queue: session-search-mapping updates without changing enabled or MaximumConcurrency");
+  }
+  if (operations.get("session-pipeline") === "update") {
+    for (const line of detailedBlock(lines, "session-pipeline")) {
+      if (/^  [+-] \s*HOOPDB_POOL_MAX: /.test(line) && (operations.get("session-events-mapping") !== "noop" || (operations.get("session-search-mapping") ?? "noop") !== "noop"))
+        refuse(`session search queue: HOOPDB_POOL_MAX and a mapping change in separate plans (one capacity setting per apply): ${changes()}`);
+      const m = /^  \+ \s*(SESSION_PIPELINE_SEARCH_QUEUE_URL|HOOPDB_POOL_MAX): (.*)$/.exec(line);
+      if (!m) continue;
+      const value = m[2]!.replace(/^"(.*)"$/, "$1");
+      if (m[1] === "SESSION_PIPELINE_SEARCH_QUEUE_URL" && value !== names.searchQueueUrl)
+        refuse("session search queue: SESSION_PIPELINE_SEARCH_QUEUE_URL is not this stage's search queue URL");
+      if (m[1] === "HOOPDB_POOL_MAX" && !(/^[0-9]+$/.test(value) && Number(value) >= 1 && Number(value) <= DEFAULT_HOOPDB_POOL_MAX))
+        refuse(`session search queue: HOOPDB_POOL_MAX must stay between 1 and ${DEFAULT_HOOPDB_POOL_MAX}`);
+    }
+  }
+  return undefined;
+}
+
+/** A detailed plan's property value: Alchemy prints declared props as block YAML (maps, lists, scalars). */
+type PlanValue = string | PlanValue[] | { [key: string]: PlanValue };
+
+/** The `properties:` of one resource's `[resource] <action>` block in a detailed plan, parsed; undefined when absent or not fully parsed. */
+export function planProperties(lines: readonly string[], resource: string, action: string): PlanValue | undefined {
+  const start = lines.findIndex((line) => line.trim() === `[${resource}] ${action}`);
+  if (start < 0) return undefined;
+  const rest = lines.slice(start + 1);
+  const end = rest.findIndex((line) => /^\s*\[[^\]]+\]\s+\S+\s*$/.test(line));
+  const block = (end < 0 ? rest : rest.slice(0, end)).filter((line) => line.trim() !== "");
+  if (block[0]?.trim() !== "properties:") return undefined;
+  const items = block.slice(1).map((line) => ({ indent: line.length - line.trimStart().length, text: line.trim() }));
+  if (items.length === 0) return undefined;
+  const at = { i: 0 };
+  const value = parsePlanYaml(items, at, items[0]!.indent);
+  return at.i === items.length ? value : undefined;
+}
+
+function planScalar(text: string): string {
+  if (text.startsWith('"') && text.endsWith('"') && text.length >= 2) {
+    try {
+      return JSON.parse(text) as string;
+    } catch {
+      return text;
+    }
+  }
+  if (text.startsWith("'") && text.endsWith("'") && text.length >= 2) return text.slice(1, -1).replace(/''/g, "'");
+  return text;
+}
+
+/** Block YAML as Alchemy prints it: `key: value`, `key:` with a deeper block, `- item` lists (of scalars or maps). */
+function parsePlanYaml(items: { indent: number; text: string }[], at: { i: number }, indent: number): PlanValue {
+  if (items[at.i]!.text.startsWith("- ") || items[at.i]!.text === "-") {
+    const list: PlanValue[] = [];
+    while (at.i < items.length && items[at.i]!.indent === indent && items[at.i]!.text.startsWith("- ")) {
+      const rest = items[at.i]!.text.slice(2);
+      if (/^[^"'][^:]*(?::[^ ][^:]*)*:(?: |$)/.test(rest)) {
+        // A map item: its first key sits after the dash, the rest at the dash's indent + 2.
+        items[at.i] = { indent: indent + 2, text: rest };
+        list.push(parsePlanYaml(items, at, indent + 2));
+      } else {
+        list.push(planScalar(rest));
+        at.i++;
+      }
+    }
+    return list;
+  }
+  const map: { [key: string]: PlanValue } = {};
+  while (at.i < items.length && items[at.i]!.indent === indent && !items[at.i]!.text.startsWith("- ")) {
+    const text = items[at.i]!.text;
+    at.i++;
+    const nested = text.endsWith(":") && !text.includes(": ");
+    if (nested) {
+      const key = text.slice(0, -1);
+      const next = items[at.i];
+      map[key] = next && (next.indent > indent || (next.indent === indent && next.text.startsWith("- "))) ? parsePlanYaml(items, at, next.indent) : "";
+      continue;
+    }
+    const split = text.indexOf(": ");
+    if (split < 0) return map;
+    map[text.slice(0, split)] = planScalar(text.slice(split + 2));
+  }
+  return map;
+}
+
+/**
+ * Where `actual` (a parsed detailed-plan value) differs from `expected` (rendered props, whose
+ * scalars are compared as printed strings; a function is a predicate on the printed value), or
+ * undefined when it is exactly that.
+ */
+function planMismatch(actual: PlanValue | undefined, expected: unknown, path: string): string | undefined {
+  if (typeof expected === "function") return typeof actual === "string" && (expected as (v: string) => boolean)(actual) ? undefined : `${path || "value"}`;
+  if (Array.isArray(expected)) {
+    if (!Array.isArray(actual) || actual.length !== expected.length) return `${path || "value"} length`;
+    for (let n = 0; n < expected.length; n++) {
+      const d = planMismatch(actual[n], expected[n], `${path}[${n}]`);
+      if (d) return d;
+    }
+    return undefined;
+  }
+  if (expected !== null && typeof expected === "object") {
+    if (actual === undefined || typeof actual !== "object" || Array.isArray(actual)) return `${path || "value"} is not a map`;
+    const want = Object.entries(expected as Record<string, unknown>).filter(([, v]) => v !== undefined);
+    const keys = new Set(want.map(([k]) => k));
+    for (const k of Object.keys(actual)) if (!keys.has(k)) return `${path ? `${path}.` : ""}${k} is not rendered`;
+    for (const [k, v] of want) {
+      const d = planMismatch(actual[k], v, path ? `${path}.${k}` : k);
+      if (d) return d;
+    }
+    return undefined;
+  }
+  return actual === String(expected) ? undefined : `${path || "value"}`;
 }
 
 /**
@@ -522,7 +755,8 @@ function assertPipelineRoleCascadeDiff(
   stateSnapshotText: string | undefined,
   refuse: (why: string) => never,
 ) {
-  const updated = ROLE_GRANT_RESOURCES.filter((r) => operations.get(r) === "update");
+  // The search queue's policy names the same role (sessionSearchQueuePolicy), so it cascades too.
+  const updated = [...ROLE_GRANT_RESOURCES, ...SEARCH_ROLE_GRANT_RESOURCES].filter((r) => operations.get(r) === "update");
   if (updated.length === 0) return;
   if (operations.get("session-pipeline") !== "update")
     refuse(`session pipeline update: ${updated.join(", ")} update but session-pipeline does not`);

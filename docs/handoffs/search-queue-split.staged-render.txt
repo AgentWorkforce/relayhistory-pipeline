@@ -1,0 +1,223 @@
+Search-queue split: staged render (placeholders only; scripts/search-split-staged-render.ts)
+Budget: 80 pooler connections, never raised. Each capture changes one capacity setting.
+Resources not listed are noop in every stage (store, grants, schedules, other alarms).
+
+== live: Live before the split (pointer mapping 20, HOOPDB_POOL_MAX 4)
+inputs: {"searchIndex":true,"maxConcurrency":20}
+[session-events-mapping] rendered
+[session-pipeline] rendered
+pooler demand: (pointer 20 + search 0) x HOOPDB_POOL_MAX 4 = 80 <= 80
+deploy guard: post-apply
+
+== A: Provisioning only: search queue, DLQ, queue policy, alarms, search mapping created DISABLED
+inputs: {"searchIndex":true,"maxConcurrency":20,"searchQueue":{"enabled":true,"maxConcurrency":16}}
+[session-events-mapping] noop
+[session-pipeline] noop
+[session-search] create
+    messageRetentionPeriod: "4 days"
+    policy.Statement[0].Action: "sqs:*"
+    policy.Statement[0].Condition.Bool.aws:SecureTransport: "false"
+    policy.Statement[0].Effect: "Deny"
+    policy.Statement[0].Principal: "*"
+    policy.Statement[0].Resource: "arn:aws:sqs:<region>:<account>:96bulls-<stage>-session-search"
+    policy.Statement[0].Sid: "DenyInsecureTransport"
+    policy.Statement[1].Action[0]: "sqs:ReceiveMessage"
+    policy.Statement[1].Action[1]: "sqs:DeleteMessage"
+    policy.Statement[1].Action[2]: "sqs:ChangeMessageVisibility"
+    policy.Statement[1].Action[3]: "sqs:GetQueueAttributes"
+    policy.Statement[1].Action[4]: "sqs:SendMessage"
+    policy.Statement[1].Effect: "Allow"
+    policy.Statement[1].Principal.AWS: "<pipeline-role-arn>"
+    policy.Statement[1].Resource: "arn:aws:sqs:<region>:<account>:96bulls-<stage>-session-search"
+    policy.Statement[1].Sid: "SessionPipelineConsumes"
+    policy.Version: "2012-10-17"
+    queueName: "96bulls-<stage>-session-search"
+    receiveMessageWaitTime: "20 seconds"
+    redrivePolicy.deadLetterTargetArn: "arn:aws:sqs:<region>:<account>:96bulls-<stage>-session-search-dlq"
+    redrivePolicy.maxReceiveCount: 8
+    sqsManagedSseEnabled: true
+    tags.96bulls:component: "session-pipeline"
+    visibilityTimeout: "1800 seconds"
+[session-search-age-alarm] create
+    ActionsEnabled: false
+    AlarmDescription: "Oldest search pass is older than 15 minutes, so the search side is behind or failing."
+    ComparisonOperator: "GreaterThanThreshold"
+    Dimensions[0].Name: "QueueName"
+    Dimensions[0].Value: "96bulls-<stage>-session-search"
+    EvaluationPeriods: 3
+    MetricName: "ApproximateAgeOfOldestMessage"
+    Namespace: "AWS/SQS"
+    Period: 300
+    Statistic: "Maximum"
+    Threshold: 900
+    TreatMissingData: "notBreaching"
+    name: "96bulls-<stage>-session-search-backlog-age"
+    tags.96bulls:component: "session-pipeline"
+[session-search-dlq] create
+    messageRetentionPeriod: "14 days"
+    policy.Statement[0].Action: "sqs:*"
+    policy.Statement[0].Condition.Bool.aws:SecureTransport: "false"
+    policy.Statement[0].Effect: "Deny"
+    policy.Statement[0].Principal: "*"
+    policy.Statement[0].Resource: "arn:aws:sqs:<region>:<account>:96bulls-<stage>-session-search-dlq"
+    policy.Statement[0].Sid: "DenyInsecureTransport"
+    policy.Version: "2012-10-17"
+    queueName: "96bulls-<stage>-session-search-dlq"
+    sqsManagedSseEnabled: true
+    tags.96bulls:component: "session-pipeline"
+[session-search-dlq-alarm] create
+    ActionsEnabled: false
+    AlarmDescription: "Session search passes exhausted their retries (docs/handoffs/search-queue-split.md, guards)."
+    ComparisonOperator: "GreaterThanThreshold"
+    Dimensions[0].Name: "QueueName"
+    Dimensions[0].Value: "96bulls-<stage>-session-search-dlq"
+    EvaluationPeriods: 1
+    MetricName: "ApproximateNumberOfMessagesVisible"
+    Namespace: "AWS/SQS"
+    Period: 300
+    Statistic: "Maximum"
+    Threshold: 0
+    TreatMissingData: "notBreaching"
+    name: "96bulls-<stage>-session-search-dlq-not-empty"
+    tags.96bulls:component: "session-pipeline"
+[session-search-mapping] create
+    batchSize: 10
+    enabled: false
+    eventSourceArn: "arn:aws:sqs:<region>:<account>:96bulls-<stage>-session-search"
+    functionName: "96bulls-<stage>-session-pipeline"
+    functionResponseTypes[0]: "ReportBatchItemFailures"
+    maximumBatchingWindow: "20 seconds"
+    scalingConfig.MaximumConcurrency: 16
+    tags.96bulls:component: "session-pipeline"
+pooler demand: (pointer 20 + search 0 (search mapping disabled)) x HOOPDB_POOL_MAX 4 = 80 <= 80
+apply worst case live -> A: 80 <= 80
+deploy guard: session search queue rollout
+
+== B1: HOOPDB_POOL_MAX 4 -> 3 (function env only)
+inputs: {"searchIndex":true,"maxConcurrency":20,"hoopdbPoolMax":3,"searchQueue":{"enabled":true,"maxConcurrency":16}}
+[session-events-mapping] noop
+[session-pipeline] update
+    env.HOOPDB_POOL_MAX: "4" -> "3"
+[session-search] noop
+[session-search-age-alarm] noop
+[session-search-dlq] noop
+[session-search-dlq-alarm] noop
+[session-search-mapping] noop
+pooler demand: (pointer 20 + search 0 (search mapping disabled)) x HOOPDB_POOL_MAX 3 = 60 <= 80
+apply worst case A -> B1: 80 <= 80
+deploy guard: session pipeline update
+
+== B2: Pointer mapping MaximumConcurrency 20 -> 10
+inputs: {"searchIndex":true,"maxConcurrency":10,"hoopdbPoolMax":3,"searchQueue":{"enabled":true,"maxConcurrency":16}}
+[session-events-mapping] update
+    scalingConfig.MaximumConcurrency: 20 -> 10
+[session-pipeline] noop
+[session-search] noop
+[session-search-age-alarm] noop
+[session-search-dlq] noop
+[session-search-dlq-alarm] noop
+[session-search-mapping] noop
+pooler demand: (pointer 10 + search 0 (search mapping disabled)) x HOOPDB_POOL_MAX 3 = 30 <= 80
+apply worst case B1 -> B2: 60 <= 80
+deploy guard: session pipeline update
+
+== C1: Search mapping enabled (MaximumConcurrency 16)
+inputs: {"searchIndex":true,"maxConcurrency":10,"hoopdbPoolMax":3,"searchQueue":{"enabled":true,"maxConcurrency":16,"mappingEnabled":true}}
+[session-events-mapping] noop
+[session-pipeline] noop
+[session-search] noop
+[session-search-age-alarm] noop
+[session-search-dlq] noop
+[session-search-dlq-alarm] noop
+[session-search-mapping] update
+    enabled: false -> true
+pooler demand: (pointer 10 + search 16) x HOOPDB_POOL_MAX 3 = 78 <= 80
+apply worst case B2 -> C1: 78 <= 80
+deploy guard: session pipeline update
+
+== C2: Handoff on: SESSION_PIPELINE_SEARCH_QUEUE_URL set (function env only)
+inputs: {"searchIndex":true,"maxConcurrency":10,"hoopdbPoolMax":3,"searchQueue":{"enabled":true,"maxConcurrency":16,"mappingEnabled":true,"handoff":true}}
+[session-events-mapping] noop
+[session-pipeline] update
+    env.SESSION_PIPELINE_SEARCH_QUEUE_URL: (absent) -> "https://sqs.<region>.amazonaws.com/<account>/96bulls-<stage>-session-search"
+[session-search] noop
+[session-search-age-alarm] noop
+[session-search-dlq] noop
+[session-search-dlq-alarm] noop
+[session-search-mapping] noop
+pooler demand: (pointer 10 + search 16) x HOOPDB_POOL_MAX 3 = 78 <= 80
+apply worst case C1 -> C2: 78 <= 80
+deploy guard: session pipeline update
+
+-- Rollback (from C2) --
+
+== R1: Handoff off: SESSION_PIPELINE_SEARCH_QUEUE_URL removed; the search mapping keeps draining the search queue
+inputs: {"searchIndex":true,"maxConcurrency":10,"hoopdbPoolMax":3,"searchQueue":{"enabled":true,"maxConcurrency":16,"mappingEnabled":true}}
+[session-events-mapping] noop
+[session-pipeline] update
+    env.SESSION_PIPELINE_SEARCH_QUEUE_URL: "https://sqs.<region>.amazonaws.com/<account>/96bulls-<stage>-session-search" -> (absent)
+[session-search] noop
+[session-search-age-alarm] noop
+[session-search-dlq] noop
+[session-search-dlq-alarm] noop
+[session-search-mapping] noop
+pooler demand: (pointer 10 + search 16) x HOOPDB_POOL_MAX 3 = 78 <= 80
+apply worst case C2 -> R1: 78 <= 80
+deploy guard: session pipeline update
+
+== R2: Search mapping disabled (once the search queue and its in-flight count are 0)
+inputs: {"searchIndex":true,"maxConcurrency":10,"hoopdbPoolMax":3,"searchQueue":{"enabled":true,"maxConcurrency":16}}
+[session-events-mapping] noop
+[session-pipeline] noop
+[session-search] noop
+[session-search-age-alarm] noop
+[session-search-dlq] noop
+[session-search-dlq-alarm] noop
+[session-search-mapping] update
+    enabled: true -> false
+pooler demand: (pointer 10 + search 0 (search mapping disabled)) x HOOPDB_POOL_MAX 3 = 30 <= 80
+apply worst case R1 -> R2: 78 <= 80
+deploy guard: session pipeline update
+
+== R3: HOOPDB_POOL_MAX 3 -> 4 (function env only)
+inputs: {"searchIndex":true,"maxConcurrency":10,"searchQueue":{"enabled":true,"maxConcurrency":16}}
+[session-events-mapping] noop
+[session-pipeline] update
+    env.HOOPDB_POOL_MAX: "3" -> "4"
+[session-search] noop
+[session-search-age-alarm] noop
+[session-search-dlq] noop
+[session-search-dlq-alarm] noop
+[session-search-mapping] noop
+pooler demand: (pointer 10 + search 0 (search mapping disabled)) x HOOPDB_POOL_MAX 4 = 40 <= 80
+apply worst case R2 -> R3: 40 <= 80
+deploy guard: session pipeline update
+
+== R4: Pointer mapping MaximumConcurrency 10 -> 20 (search resources stay, mapping disabled)
+inputs: {"searchIndex":true,"maxConcurrency":20,"searchQueue":{"enabled":true,"maxConcurrency":16}}
+[session-events-mapping] update
+    scalingConfig.MaximumConcurrency: 10 -> 20
+[session-pipeline] noop
+[session-search] noop
+[session-search-age-alarm] noop
+[session-search-dlq] noop
+[session-search-dlq-alarm] noop
+[session-search-mapping] noop
+pooler demand: (pointer 20 + search 0 (search mapping disabled)) x HOOPDB_POOL_MAX 4 = 80 <= 80
+apply worst case R3 -> R4: 80 <= 80
+deploy guard: session pipeline update
+
+-- Refused shortcuts --
+
+x Enable search before lowering the pointer cap (pointer 20 + search 16 at HOOPDB_POOL_MAX 3)
+    target (pointer 20 + search 16) x HOOPDB_POOL_MAX 3 = 108 > 80
+    apply worst case 108 > 80
+    refused by the stack render (assertSessionPipelineInputs: over the budget)
+x Lower the pointer cap and enable search in one apply (from B1)
+    target (pointer 10 + search 16) x HOOPDB_POOL_MAX 3 = 78 <= 80
+    apply worst case 108 > 80
+    refused by the deploy guard (the events and search mappings change in separate plans)
+x Lower the pool, lower the pointer cap and enable search in one apply (from A)
+    target (pointer 10 + search 16) x HOOPDB_POOL_MAX 3 = 78 <= 80
+    apply worst case 144 > 80
+    refused by the deploy guard (the events and search mappings change in separate plans; a function update comes with no mapping change)
