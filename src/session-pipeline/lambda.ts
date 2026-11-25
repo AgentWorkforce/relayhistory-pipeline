@@ -11,6 +11,7 @@ import { largeReadJobState, routeLargeRead } from "./large-read-worker.ts";
  *   schedule {"bufferedSearchFeed": true}         -> one bounded buffered-stage feed run (default off)
  *   schedule {"bufferedErasureDelete": true}      -> one bounded later-erasure delete pass over buffered rows (default off)
  *   invoke {"briefDocuments": true}               -> one bounded session_brief_documents publication run (default off)
+ *   schedule {"searchJobs": true}                 -> claim and run up to SEARCH_JOBS_CLAIM search-index jobs (default off)
  *
  * Configuration: plain env for ids and switches; credentials only from one
  * Secrets Manager secret (`SESSION_PIPELINE_SECRET_ARN`), read once per
@@ -39,6 +40,12 @@ import { largeReadJobState, routeLargeRead } from "./large-read-worker.ts";
  * INGEST_BUFFERED_SEARCH_FEED=on (only the literal "on"; default "off", anything else refuses)
  * feeds accepted buffered stages into transcript_events (buffered-search-feed.ts); it is refused
  * unless BUFFERED_SEARCH_FEED_GATE_DECLARED equals the read gate's contract id
+ * SEARCH_JOBS_ENABLED=1 (only the literal "1"; default off; needs SEARCH_INDEX_ENABLED=1) runs the committed search
+ * wake's consumer (docs/handoffs/incremental-search-indexing.md §5.1, search-jobs.ts): after every SQS batch the
+ * invocation claims up to SEARCH_JOBS_CLAIM (1-20, default 5) open `search-index` jobs and runs them, and the
+ * {"searchJobs": true} schedule does the same without SQS traffic. SEARCH_WAKE_ENQUEUE=1 (only "1"; default off)
+ * writes the managed wake in the publication-authority transaction (migration 20261105062230 and the owner's
+ * EXECUTE grant first). Off, neither touches the stage.
  * (BUFFERED_SEARCH_GATE_CONTRACT, "buffered-search-gate/v1"; the read Worker deploys with
  * READ_API_BUFFERED_SEARCH_GATE=on first), and needs SEARCH_INDEX_ENABLED=1 on the ClickHouse backend, the feed RPCs
  * (migration 20261105043870) and the origin columns (docs/proposals/buffered-search-feed.clickhouse.draft.sql) applied.
@@ -75,7 +82,8 @@ import { awsJsonCall, invokeAsync, lambdaCredentials } from "./aws-json.ts";
 import { createClickHouseClient } from "./vendor/search-index/clickhouse.ts";
 import { processBatch, type BatchResponse, type ConsumerDeps, type QueueRecord } from "./consumer.ts";
 import { droppedFanout, scopeLockKey, type ScopeLock } from "./pointer.ts";
-import { searchIndexLimits, searchIndexStreamChFromEnv, type SearchIndexStreamCh } from "./search-index.ts";
+import { searchIndexLimits, searchIndexStreamChFromEnv, type SearchIndexDeps, type SearchIndexStreamCh } from "./search-index.ts";
+import { claimSearchJobs, runSearchJob, searchJobLogFields, searchSettlementFor, settleSearchJob, SEARCH_JOBS_DEFAULT_CLAIM, type SearchSql } from "./search-jobs.ts";
 import { BufferedFeedError, bufferedFeedConfig, bufferedFeedGateRefusal, bufferedFeedVersionRefusal, clickhouseTieLedger, runBufferedFeed, sqlBufferedFeedSource, type BufferedFeedConfig } from "./buffered-search-feed.ts";
 import { bufferedErasureConfig, runBufferedErasureDelete, type BufferedErasureConfig, type BufferedErasureDeps } from "./buffered-erasure-delete.ts";
 import { RECONCILE_BODY_KEY } from "./s3-events.ts";
@@ -172,6 +180,10 @@ export interface LambdaEnv {
   bufferedErasureDelete?: BufferedErasureConfig;
   /** READER_MAX_RULESET: absent (default) keeps legacy sealed reads; set, every raw reader built here enforces it. */
   readerMaxRuleset?: number;
+  /** SEARCH_JOBS_ENABLED=1: the search-index consumer (follow-on claim and schedule), `claim` jobs per run. Absent (default): off. */
+  searchJobs?: { claim: number };
+  /** SEARCH_WAKE_ENQUEUE=1: the authority transaction writes the managed search-index wake. Absent (default): off. */
+  searchWakeEnqueue?: true;
 }
 
 /**
@@ -243,6 +255,11 @@ export function lambdaEnv(env: NodeJS.ProcessEnv = process.env, composition?: Se
   const pointerSkipOriginBucket = pointerSkipOriginBucketFromEnv(env);
   // Unset is undefined (legacy reads, no field); a malformed value refuses init, as briefConfig() already does.
   const maximum = readerMaxRuleset(env);
+  // SEARCH_JOBS_ENABLED / SEARCH_WAKE_ENQUEUE: default off; on, the consumer needs the search stage.
+  const searchJobs = searchJobsFromEnv(env);
+  if (searchJobs && env.SEARCH_INDEX_ENABLED !== "1")
+    throw new Error("session pipeline: SEARCH_JOBS_ENABLED=1 needs SEARCH_INDEX_ENABLED=1");
+  const searchWakeEnqueue = flagOne(env, "SEARCH_WAKE_ENQUEUE");
   return {
     searchBackend: selected.search,
     adapterEnv: Object.freeze(Object.fromEntries(Object.entries(env).filter(([key]) => key.startsWith("SEARCH_INDEX_") || ["PIPELINE_RUNTIME", "AWS_REGION", "READ_API_COMPLETE_SINCE"].includes(key)))),
@@ -274,7 +291,26 @@ export function lambdaEnv(env: NodeJS.ProcessEnv = process.env, composition?: Se
     reconcileLookbackMinutes: Number(env.PIPELINE_RECONCILE_LOOKBACK_MINUTES ?? "30") || 30,
     dbPoolMax: Number(env.HOOPDB_POOL_MAX ?? "4") || 4,
     ...(maximum === undefined ? {} : { readerMaxRuleset: maximum }),
+    ...(searchJobs ? { searchJobs } : {}),
+    ...(searchWakeEnqueue ? { searchWakeEnqueue: true as const } : {}),
   };
+}
+
+/** A strict "1" switch: unset, "" and "0" are off; "1" is on; anything else fails init naming the variable. */
+function flagOne(env: NodeJS.ProcessEnv, name: string): boolean {
+  const value = env[name];
+  if (value === undefined || value === "" || value === "0") return false;
+  if (value === "1") return true;
+  throw new Error(`session pipeline: ${name} must be 1 or 0`);
+}
+
+/** SEARCH_JOBS_ENABLED and SEARCH_JOBS_CLAIM (1-20, default 5); undefined when off. */
+export function searchJobsFromEnv(env: NodeJS.ProcessEnv): { claim: number } | undefined {
+  if (!flagOne(env, "SEARCH_JOBS_ENABLED")) return undefined;
+  const raw = env.SEARCH_JOBS_CLAIM;
+  const claim = raw === undefined || raw === "" ? SEARCH_JOBS_DEFAULT_CLAIM : Number(raw);
+  if (!Number.isSafeInteger(claim) || claim < 1 || claim > 20) throw new Error("session pipeline: SEARCH_JOBS_CLAIM must be an integer from 1 to 20");
+  return { claim };
 }
 
 export function legacyReadSourceFromEnv(env: NodeJS.ProcessEnv): "legacy" | "frozen-supabase" {
@@ -494,7 +530,8 @@ export function runtimeFromSecret(env: LambdaEnv, secretText: string, schemaGene
       orgs: prefixOrgResolver,
       allowPrefix: (prefix, orgId) => prefixAllowed(bindings, prefix, orgId),
       fanout,
-      publication:{schemaGeneration,transact:work=>transaction(db,async tx=>{
+      // The managed search wake: explicitly off unless SEARCH_WAKE_ENQUEUE=1 (hoopdb/index.ts treats absent as on).
+      publication:{schemaGeneration,enqueueSearchWake:env.searchWakeEnqueue===true,transact:work=>transaction(db,async tx=>{
         await tx.query("SET LOCAL statement_timeout='5s';SET LOCAL lock_timeout='1s'");return work(tx);
       })},
       // Default off; on, the object-store reads run before the scope lock and the lock holds SQL only.
@@ -807,12 +844,76 @@ export interface LambdaInvocationContext {
  * requeued, so the margin only has to cover the batch's whole reads and replay, never another stream.
  */
 export function invocationDeps(rt: Pick<Runtime, "env" | "deps">, context?: LambdaInvocationContext, now: () => number = Date.now): ConsumerDeps {
+  const deps = streamDeps(rt, context, now);
+  // SEARCH_JOBS_ENABLED (default off): the §5.1 follow-on claim after the batch. Off: the deps are unchanged.
+  if (!rt.env.searchJobs || !deps.search) return deps;
+  const search = deps.search;
+  return { ...deps, searchJobs: { drain: () => drainSearchJobs({ sql: searchJobsSql(rt.deps.pointer.db), search, claim: rt.env.searchJobs!.claim, deadline: searchJobsDeadline(rt.env, context) }) } };
+}
+
+function streamDeps(rt: Pick<Runtime, "env" | "deps">, context?: LambdaInvocationContext, now: () => number = Date.now): ConsumerDeps {
   const search = rt.deps.search;
   const margin = rt.env.searchStreamCh?.deadlineMarginMs;
   if (!search?.stream || margin === undefined || typeof context?.getRemainingTimeInMillis !== "function") return rt.deps;
   const remaining = context.getRemainingTimeInMillis();
   if (!Number.isFinite(remaining)) return rt.deps;
   return { ...rt.deps, search: { ...search, streamDeadline: { at: now() + remaining - margin }, streamSlot: { used: false } } };
+}
+
+/** The search-job loop's SQL: the runtime pool, and its transactions (lambda.ts transaction). */
+export function searchJobsSql(db: HoopDb): SearchSql {
+  return { query: (text, params) => db.query(text, params), transaction: (work) => transaction(db, work) };
+}
+
+/** Stop claiming new passes this long before the invocation ends (the stream margin, or 60 s). */
+export const SEARCH_JOBS_DEADLINE_MARGIN_MS = 60_000;
+function searchJobsDeadline(env: LambdaEnv, context?: LambdaInvocationContext): (() => boolean) | undefined {
+  if (typeof context?.getRemainingTimeInMillis !== "function") return undefined;
+  const margin = env.searchStreamCh?.deadlineMarginMs ?? SEARCH_JOBS_DEADLINE_MARGIN_MS;
+  return () => !(context.getRemainingTimeInMillis() > margin);
+}
+
+export interface SearchJobsSummary { claimed: number; acked: number; retried: number; exhausted: number; lost: number; failed: number }
+
+/**
+ * The Lambda consumer's search-job loop (design §5.1, §3.3): claim up to `claim` open search-index jobs, run each
+ * pass (runSearchJob) and settle it through the stage-specific, lease-bound settlement. A pass error is a retry
+ * (exhausted past the budget); a settlement error is logged and the lease expires into a reclaim. Jobs left when
+ * the deadline arrives are released for the next claim.
+ */
+export async function drainSearchJobs(deps: { sql: SearchSql; search: SearchIndexDeps; claim: number; deadline?: () => boolean }): Promise<SearchJobsSummary> {
+  const summary: SearchJobsSummary = { claimed: 0, acked: 0, retried: 0, exhausted: 0, lost: 0, failed: 0 };
+  if (deps.deadline?.()) return summary;
+  const jobs = await claimSearchJobs(deps.sql, deps.claim);
+  summary.claimed = jobs.length;
+  for (const job of jobs) {
+    const started = Date.now();
+    try {
+      if (deps.deadline?.()) {
+        // Out of time before this pass started: hand it back for the next claim (the counted attempt stays).
+        if (!(await settleSearchJob(deps.sql, job, { retry: 0 })).applied) summary.lost += 1;
+        else summary.retried += 1;
+        continue;
+      }
+      let result: Awaited<ReturnType<typeof runSearchJob>> | { error: unknown };
+      try { result = await runSearchJob(job.claimedMessage, { search: deps.search }); }
+      catch (error) { result = { error }; }
+      const outcome = searchSettlementFor(result, job.attempts);
+      const settled = await settleSearchJob(deps.sql, job, outcome);
+      if (!settled.applied) summary.lost += 1;
+      else if (outcome === "done") summary.acked += 1;
+      else if (outcome === "exhausted") summary.exhausted += 1;
+      else summary.retried += 1;
+      const fields = { ...searchJobLogFields(job, result), ok: outcome === "done" && settled.applied, state: settled.applied ? settled.action : "lease_lost", duration_ms: Date.now() - started };
+      if ("error" in result) log.error("search job failed", fields);
+      else if (outcome === "exhausted") log.error("search job exhausted", fields);
+      else log.info("search job settled", fields);
+    } catch (error) {
+      summary.failed += 1;
+      log.error("search job settlement failed", { stage: "search-index", epoch: job.claimedEpoch, attempt: job.attempts, ...errorFields(error), duration_ms: Date.now() - started });
+    }
+  }
+  return summary;
 }
 
 async function dispatchLambdaEvent(event: PipelineLambdaEvent, ready: () => Promise<Runtime>, context?: LambdaInvocationContext): Promise<BatchResponse | { ok: boolean }> {
@@ -835,6 +936,22 @@ async function dispatchLambdaEvent(event: PipelineLambdaEvent, ready: () => Prom
     }
     const records: QueueRecord[] = event.Records.map((r) => ({ messageId: r.messageId, body: r.body }));
     return processBatch(records, invocationDeps(rt, context));
+  }
+  if (event?.searchJobs === true) {
+    // Default off before secret lookup, connection pools or any search-index SQL.
+    if (process.env.SEARCH_JOBS_ENABLED !== "1") return { ok: true };
+    const started = Date.now();
+    try {
+      const rt = await ready();
+      if (!rt.env.searchJobs || !rt.deps.search) throw new Error("search jobs unavailable");
+      const s = await drainSearchJobs({ sql: searchJobsSql(rt.deps.pointer.db), search: rt.deps.search, claim: rt.env.searchJobs.claim, deadline: searchJobsDeadline(rt.env, context) });
+      log.info("search jobs run", { stage: "search-index", claimed: s.claimed, acked: s.acked, retried: s.retried, exhausted: s.exhausted, skipped: s.lost, failed: s.failed,
+        ok: s.failed === 0, duration_ms: Date.now() - started });
+      return { ok: s.failed === 0 };
+    } catch (error) {
+      log.error("search jobs run failed", { stage: "search-index", ...errorFields(error), duration_ms: Date.now() - started });
+      return { ok: false };
+    }
   }
   if (event?.reconcile === true) {
     const started = Date.now();

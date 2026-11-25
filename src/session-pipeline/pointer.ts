@@ -74,7 +74,7 @@ export interface PointerDeps {
   allowPrefix(prefix: string | undefined, orgId: string): boolean;
   /** Where the index's fan-out (summary-short, summary-long, status-classify) goes. */
   fanout: PipelineQueue;
-  publication?:{schemaGeneration:string;transact:Transact};
+  publication?:{schemaGeneration:string;transact:Transact;enqueueSearchWake?:boolean};
   now?: () => Date;
   /**
    * SESSION_POINTER_PREREAD_ENABLED=true only (the hosted Lambda): the normal path runs every object-store

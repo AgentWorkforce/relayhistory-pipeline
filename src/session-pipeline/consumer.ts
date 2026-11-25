@@ -50,6 +50,12 @@ export interface ConsumerDeps {
    * pointer stage, which ignores such keys anyway. Absent: exactly the previous behavior.
    */
   bufferedFeed?: BufferedFeedDeps;
+  /**
+   * Absent by default (SEARCH_JOBS_ENABLED): after the batch, the follow-on claim of open `search-index` jobs
+   * (docs/handoffs/incremental-search-indexing.md §5.1; lambda.ts drainSearchJobs). Its failures are logged and
+   * never fail a message of the batch. Absent: exactly the previous behavior.
+   */
+  searchJobs?: { drain(): Promise<unknown> };
 }
 
 const scopeId = (s: SessionScope) => JSON.stringify([s.orgId, s.workspaceId, s.harness, s.sessionId]);
@@ -275,6 +281,13 @@ export async function processBatch(records: readonly QueueRecord[], deps: Consum
         log.error("canonical replay publication failed", fields);
         for (const id of messageIds) failed.add(id);
       }
+    }
+  }
+  if (deps.searchJobs) {
+    try {
+      await deps.searchJobs.drain();
+    } catch (error) {
+      log.error("search jobs follow-on failed", { stage: "search-index", ...errorFields(error) });
     }
   }
   return { batchItemFailures: [...failed].map((itemIdentifier) => ({ itemIdentifier })) };

@@ -16,6 +16,7 @@ import { postgresSearchState } from "../../session-pipeline/postgres-search-stat
 import { reconcileStaleProjections } from "../../session-pipeline/consumer-service.ts";
 import { processBatch } from "../../session-pipeline/consumer.ts";
 import { indexSearchScope } from "../../session-pipeline/search-index.ts";
+import { drainSearchJobs } from "../../session-pipeline/lambda.ts";
 import { AuthError } from "../../session-read-api/app.ts";
 import type { Transact } from "../../shared/db.ts";
 
@@ -253,7 +254,11 @@ export async function checkPublicationPickup(pg:PGlite, store:ObjectStore, key:s
       if(prop==="reader")return target.reader;
       throw Error("managed reconcile hint attempted pointer work: "+String(prop));
     }});
-    expect(await processBatch([{messageId:"freshness",body:collected[0]!}],{pointer:pointer as never,search:searchDeps}))
+    // The rollout acceptance condition opts the consumer in (SEARCH_JOBS_ENABLED on the Lambda): the batch's
+    // follow-on claim runs the committed search-index wake through the stage-specific loop. Off, no search job runs.
+    const automatic = process.env.PUBLICATION_REQUIRE_AUTOMATIC_SEARCH === "1";
+    expect(await processBatch([{messageId:"freshness",body:collected[0]!}],{pointer:pointer as never,search:searchDeps,
+      ...(automatic ? {searchJobs:{drain:()=>drainSearchJobs({sql:pg,search:searchDeps,claim:5})}} : {})}))
       .toEqual({batchItemFailures:[]});
     // The local service's freshness message follows the same managed-hint
     // path as an S3 event. It acknowledged the hint without projecting search.
