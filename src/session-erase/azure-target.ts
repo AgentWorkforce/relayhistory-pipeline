@@ -130,6 +130,36 @@ export async function azureErasePreflight(target: AzureEraseTarget, keyRoot: str
 }
 
 /**
+ * The in-service worker's preflight, OFF the ingest startup path (an operator-only feature must never block uploads):
+ * run lazily before the first byte work of the process, cached once it passes, and run again after any Azure refusal
+ * mid-run. While it fails, `gate` throws (the worker records the pass as failed_retryable and erases nothing) and one
+ * coded line is logged: "operator erase refused: <code>". The pure checks (config, writer store, key file, root) stay
+ * at startup, as on S3.
+ */
+export function createAzurePreflightGate(target: AzureEraseTarget, keyRoot: string,
+  log: (fields: Record<string, unknown>) => void = () => {}, ports: AzureErasePreflightPorts = {}) {
+  let passed = false;
+  const ensure = async () => {
+    if (passed) return;
+    try {
+      await azureErasePreflight(target, keyRoot, (code) => { throw Object.assign(new Error(`operator erase refused: ${code}`), { code }); }, ports);
+      passed = true;
+    } catch (error) {
+      log({ event: "operator_session_erase_preflight", outcome: "refused", reason: (error as { code?: string })?.code ?? "unavailable" });
+      throw error;
+    }
+  };
+  return {
+    async gate<T>(work: () => Promise<T>): Promise<T> {
+      await ensure();
+      try { return await work(); }
+      catch (error) { if (azureEraseRefusal(error)) passed = false; throw error; }
+    },
+    get passed() { return passed; },
+  };
+}
+
+/**
  * A mid-run Azure error that a rerun cannot fix: its refusal code (exit 2). Classified by code AND operation; anything
  * else (a 5xx, a network failure, a delete 403, an inventory error) returns undefined and stays a failure (exit 4).
  */

@@ -5,7 +5,7 @@ import { createPostgresSearchIndex } from "../../packages/pipeline/src/search-in
 import { createOpenSearchSearchIndex, DEFAULT_OPENSEARCH_INDEX_PREFIX } from "../../packages/pipeline/src/search-index/opensearch.ts";
 import { createS3Eraser, type PagedEraser } from "../migration/neon-s3-erasure/eraser.ts";
 import { createAzureBlobEraser } from "../migration/azure-blob-erasure/eraser.ts";
-import { azureErasePreflight, azureEraseTarget, createAzureEraseEraser, eraseOnAzure, writerAzureEndpoint } from "./azure-target.ts";
+import { azureEraseTarget, createAzureEraseEraser, createAzurePreflightGate, eraseOnAzure, writerAzureEndpoint } from "./azure-target.ts";
 import { postgresConnectionString, postgresTlsOptions } from "../shared/postgres-tls.ts";
 import { assertDestinationUrl, destinationPolicy } from "../shared/destination-url.ts";
 import type { SqlRun } from "../session-ingest/ledger-sql.ts";
@@ -207,16 +207,19 @@ export async function buildSelfhostEraseRuntime(input: {
     fetch(url, { ...init, signal: init?.signal ? AbortSignal.any([init.signal, AbortSignal.timeout(10_000)]) : AbortSignal.timeout(10_000) })) as typeof fetch;
   let config: ReturnType<typeof bytesConfig>;
   let eraser: PagedEraser;
+  // Azure: the data-plane preflight gates the worker's byte work, never this startup (azure-target.ts).
+  let gate = <T>(work: () => Promise<T>) => work();
   if (eraseOnAzure(env)) {
-    // The writer's own root (this ingest service's), the writer's store exactly, then the data-plane preflight,
-    // before the worker starts. A refusal is a startup error naming the code, never a value.
+    // Pure checks only at startup (config errors, as on S3): this service's own root and the writer's store exactly.
+    // A refusal is a startup error naming the code, never a value.
     const startupFail = (code: string): never => { throw Error(`96bulls: operator erase refused: ${code}`); };
     try { config = azureEraseConfig(env, input.keyRoot); } catch (e) { return startupFail((e as { code?: string }).code ?? "config_invalid"); }
     if (config.dryRun || config.bucket !== identity.bucket || config.keyRoot !== identity.keyRoot)
       throw Error("96bulls: operator eraser must target the writer store, without dry run");
     const target = azureEraseTarget(env, startupFail);
-    await azureErasePreflight(target, config.keyRoot, startupFail);
     eraser = createAzureEraseEraser(target, (c) => createAzureBlobEraser({ ...c, fetch: timed }));
+    const preflight = createAzurePreflightGate(target, config.keyRoot, input.log, { fetch: timed });
+    gate = (work) => preflight.gate(work);
   } else {
     config = bytesConfig(env);
     if (config.dryRun || config.bucket !== identity.bucket || config.keyRoot !== identity.keyRoot || config.region !== (env.LOCKER_REGION || "us-east-1")
@@ -227,9 +230,9 @@ export async function buildSelfhostEraseRuntime(input: {
   const search = await searchPort(env, input.metadata);
   const worker = sessionEraseWorker({ ledger, identity, search: search.port, log: input.log, ...(decisionRecords ? { decisionRecords } : {}),
     bytes: {
-      erase: (key, authorize) => eraseDiscoveredSessionBytes(eraser, key, { keyRoot: config.keyRoot, bucket: config.bucket, concurrency: config.concurrency,
-        authorize, log: input.log, ...provider }),
-      stagesAbsent: (key, authorize) => stagedObjectsAbsent(eraser, config.keyRoot, key, authorize),
+      erase: (key, authorize) => gate(() => eraseDiscoveredSessionBytes(eraser, key, { keyRoot: config.keyRoot, bucket: config.bucket, concurrency: config.concurrency,
+        authorize, log: input.log, ...provider })),
+      stagesAbsent: (key, authorize) => gate(() => stagedObjectsAbsent(eraser, config.keyRoot, key, authorize)),
     },
     async searchLock(work, action) {
       const client = await input.pool.connect();
