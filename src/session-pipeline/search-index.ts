@@ -541,7 +541,8 @@ export async function scopeEverCommitted(tx: SqlExecutor, scope: SessionScope, c
             coalesce(has_table_privilege(to_regclass('sessions.session_erasure_fences'), 'SELECT'), false) AS fences`,
     args,
   );
-  if (rows[0]?.committed === true) return true;
+  // Only the database's definite "no row" refuses the erase; anything else keeps today's erase-on-empty path.
+  if (rows[0]?.committed !== false) return true;
   if (rows[0]?.fences !== true) return false;
   const fenced = await tx.query<{ fenced: boolean }>(
     `SELECT EXISTS (SELECT 1 FROM sessions.session_erasure_fences
