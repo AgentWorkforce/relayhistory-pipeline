@@ -522,6 +522,35 @@ async function livePointerSnapshot(tx: SqlExecutor, scope: SessionScope): Promis
 
 const SEARCH_SCOPE_CHANGED = Symbol("search_scope_changed");
 
+/** The pass found no committed state for the scope (§4.2): it acknowledges and writes nothing. */
+export const NOT_COMMITTED = "not_committed";
+
+/**
+ * Was the scope ever committed? A session_index row of the physical id or its canonical id (live or tombstoned),
+ * or an erasure fence for either (an operator erase may purge the pointer rows; the fence is its authority, and
+ * that erase purges the search documents itself). The fences are owner-only (20261105050000 revokes them from
+ * every role), so they are read only by a role that holds SELECT on them; a separate statement, so a role without
+ * it never fails the pass on a permission check.
+ */
+export async function scopeEverCommitted(tx: SqlExecutor, scope: SessionScope, canonicalId: string): Promise<boolean> {
+  const args = [scope.orgId, scope.workspaceId, scope.harness, scope.sessionId, canonicalId];
+  const { rows } = await tx.query<{ committed: boolean; fences: boolean }>(
+    `SELECT EXISTS (SELECT 1 FROM sessions.session_index
+                     WHERE org_id=$1 AND workspace_id=$2 AND harness=$3
+                       AND (session_id=$4 OR coalesce(canonical_session_id,session_id)=$5)) AS committed,
+            coalesce(has_table_privilege(to_regclass('sessions.session_erasure_fences'), 'SELECT'), false) AS fences`,
+    args,
+  );
+  if (rows[0]?.committed === true) return true;
+  if (rows[0]?.fences !== true) return false;
+  const fenced = await tx.query<{ fenced: boolean }>(
+    `SELECT EXISTS (SELECT 1 FROM sessions.session_erasure_fences
+                     WHERE org_id=$1 AND workspace_id=$2 AND source=$3 AND session_id IN ($4,$5)) AS fenced`,
+    args,
+  );
+  return fenced.rows[0]?.fenced === true;
+}
+
 interface SearchPreRead {
   stamp: SourceStamp;
   siblingKeys: string[];
@@ -659,6 +688,11 @@ async function indexSearchScopeBase(scope: SessionScope, deps: SearchIndexDeps, 
       await io.record(scope,0,0,false,at,pointerSnapshot.canonicalId);
       return {manifests:0,rows:0,inserted:0,deleted:0,complete:false,reasons:["canonical_scope_still_live"]};
     }
+    // Committed-state guard (docs/handoffs/incremental-search-indexing.md §4.2): absence is not authority. A scope
+    // with no session_index row at all (live or tombstoned) and no erasure fence was never committed; a stray event,
+    // a catch-up or a redelivery for it erases nothing.
+    if (keys.length === 0 && !(await scopeEverCommitted(tx, scope, pointerSnapshot.canonicalId)))
+      return { manifests: 0, rows: 0, inserted: 0, deleted: 0, complete: true, reasons: [NOT_COMMITTED] };
     if (keys.length === 0) {
       // Erased: no live manifest is left, so every row of the scope goes, in or
       // out of the window. One predicate delete, no listing, so no size can
@@ -1302,7 +1336,7 @@ export const ALREADY_CURRENT = "already_current";
  * too: a complete search pass can record its facts incomplete. Not detected: a change of reader ruleset,
  * origin labels or projection code that re-fingerprints rows without a pointer change.
  */
-async function alreadyCurrent(
+export async function alreadyCurrent(
   tx: SqlExecutor,
   scope: SessionScope,
   snapshot: { canonicalId: string },

@@ -40,7 +40,9 @@ const SUMMARY_INPUT_FIELDS = [
 const STREAM_BUDGET_FIELDS = ["max_read_bytes", "max_read_events", "largest_streamed_scope_bytes", "largest_streamed_scope_events"];
 
 /** The search pass's phase timers and write counters (session-pipeline/consumer.ts). */
-const SEARCH_PHASE_FIELDS = ["source_read_ms", "index_scan_ms", "locked_apply_ms", "write_calls", "write_batches"];
+const SEARCH_PHASE_FIELDS = ["source_read_ms", "index_scan_ms", "locked_apply_ms", "write_calls", "write_batches",
+  // The committed search wake's clocks (session-pipeline/search-jobs.ts, design §0): publish and pointer series.
+  "commit_to_searchable_ms", "pointer_to_searchable_ms"];
 
 export const ALLOWED_LOG_FIELDS = new Set([
   // The staged run summary line: the pass was answered from a cached size refusal (search-index.ts StagedRefusals).

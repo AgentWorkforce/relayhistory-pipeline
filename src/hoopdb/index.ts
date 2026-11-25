@@ -15,6 +15,8 @@ import {
   type StageMessage,
   type TraceContext,
 } from "../shared/vendor.ts";
+import { createHash } from "node:crypto";
+import { pipelineEventKey } from "@rhc/lib/pipeline/events.ts";
 import type { HoopDb,Transact } from "../shared/db.ts";
 import {publicationEvidence,withPublicationAuthority,type PublicationEvidence}from "../shared/publication-authority.ts";
 import { ctxOf, enrichMessage, sessionExt } from "../shared/enrich.ts";
@@ -43,6 +45,12 @@ export interface IndexDeps {
   /** The message being handled, so fan-out continues its trace and ids. */
   current: () => StageMessage | undefined;
   /** Compiled schema identity and one short final metadata transaction. */
+  /**
+   * `enqueueSearchWake`: write the managed `search-index` wake inside the authority transaction
+   * (docs/handoffs/incremental-search-indexing.md §2; needs migration 20261105062230). Absent means on, so
+   * every production caller passes it explicitly from its own flag (lambda.ts SEARCH_WAKE_ENQUEUE, indexer.ts
+   * PIPELINE_MANAGED_SEARCH_WAKE_ENABLED, consumer-service.ts SEARCH_WAKE_ENQUEUE; each default off).
+   */
   publication?:{schemaGeneration:string;transact:Transact; enqueueSearchWake?:boolean};
   /**
    * Session briefs (src/session-brief): the wakeup debounce, or null when briefs are off.
@@ -88,7 +96,8 @@ const movedFenced = (reason: "operator_erased" | "move_guarded") =>
 
 const ROW_IDENTITY=(p:{org_id:string;workspace_id:string;harness:string;session_id:string;machine_id:string})=>JSON.stringify([p.org_id,p.workspace_id,p.harness,p.session_id,p.machine_id]);
 export function hoopDbSessionIndex(deps: IndexDeps): HoopDbSessionPointerIndex {return sessionIndex(deps,false);}
-function sessionIndex(deps:IndexDeps,authorized:boolean,managedSearch?:PublicationEvidence):HoopDbSessionPointerIndex{
+type ManagedSearchWake={evidence:PublicationEvidence;generation:string};
+function sessionIndex(deps:IndexDeps,authorized:boolean,managedSearch?:ManagedSearchWake):HoopDbSessionPointerIndex{
   const operatorErase = eraseRuntimeFlag(process.env, ERASE_FENCE_FLAG);
   const fromEnv = briefConfig();
   const brief =
@@ -153,7 +162,7 @@ function sessionIndex(deps:IndexDeps,authorized:boolean,managedSearch?:Publicati
         }};
         const final=await withPublicationAuthority(config.transact,evidence,async (tx,authority)=>{
           const db={...deps.db,query:tx.query.bind(tx)}as HoopDb;
-          return sessionIndex({...deps,db,reader:cached,queue:postgresPipelineQueue(tx)},true,authority.managed && config.enqueueSearchWake === true ? evidence : undefined).upsertRawPointer(pointer,ctx,opts);
+          return sessionIndex({...deps,db,reader:cached,queue:postgresPipelineQueue(tx)},true,authority.managed && config.enqueueSearchWake !== false && authority.generation ? {evidence,generation:authority.generation} : undefined).upsertRawPointer(pointer,ctx,opts);
         });
         return final.current?final.value:{status:"skipped",reason:"publication_retired"};
       }
@@ -334,10 +343,7 @@ function sessionIndex(deps:IndexDeps,authorized:boolean,managedSearch?:Publicati
         harness: pk.harness,
         sessionId: pk.session_id,
       });
-      if (managedSearch) {
-        await deps.db.query("SELECT sessions.enqueue_managed_search_wake_v1($1::jsonb,$2::uuid)",
-          [JSON.stringify(managedSearch), ctx.traceId]);
-      }
+      if (managedSearch) await enqueueManagedSearchWake(deps.db, managedSearch, ctx.traceId);
       const fanoutDone = existing
         ? Number(existing.fanout_revision) >= f.manifestRevision
         : false;
@@ -408,4 +414,75 @@ function sessionIndex(deps:IndexDeps,authorized:boolean,managedSearch?:Publicati
       return;
     },
   };
+}
+
+
+/**
+ * The publish clock of a managed head, proven the way sessions.enqueue_managed_search_wake_v1 proves it: the
+ * head's own published attempt, and a published_at on every live sibling of its canonical scope. `unprovable`
+ * only when the head and its canonical scope resolve but a clock does not; anything else is left to the
+ * function, which raises (and rolls the authority transaction back) exactly as before.
+ */
+const MANAGED_SEARCH_CLOCK_SQL = `
+WITH h AS (
+  SELECT * FROM sessions.ingest_publication_heads
+   WHERE generation = $2::uuid AND current_key = $1 AND state = 'live'
+), canon AS (
+  SELECT coalesce(p.canonical_session_id, p.session_id) AS canonical_id
+    FROM h JOIN sessions.session_index p
+      ON (p.org_id, p.workspace_id, p.harness, p.session_id, p.machine_id) = (h.org_id, h.workspace_id, h.physical_source, h.physical_session, h.machine_id)
+     AND p.manifest_key = h.current_key AND p.revision = h.pointer_revision AND p.deleted_at IS NULL
+), own AS (
+  SELECT count(*) AS n FROM h
+    JOIN sessions.ingest_publication_images i
+      ON i.manifest_key = h.current_key AND i.generation = h.generation AND i.pointer_revision = h.pointer_revision AND i.raw_sha256 = h.current_raw_sha256
+    JOIN sessions.ingest_publication_attempts a ON a.attempt_token = i.attempt_token
+    JOIN sessions.ingest_stage_intents s ON s.stage_token = a.stage_token
+   WHERE a.schema_generation = $3
+     AND (a.org_id, a.workspace_id, a.user_id, a.origin_id) = (h.org_id, h.workspace_id, h.user_id, h.origin_id)
+     AND (s.org_id, s.workspace_id, s.user_id, s.origin_id, s.batch_id, s.digest) = (a.org_id, a.workspace_id, a.user_id, a.origin_id, a.batch_id, a.digest)
+     AND a.state = 'published' AND a.published_at IS NOT NULL
+), sib AS (
+  SELECT count(*) AS n, count(a.published_at) AS clocked
+    FROM h CROSS JOIN canon
+    JOIN sessions.ingest_publication_heads sibling ON true
+    JOIN sessions.session_index p ON
+      (p.org_id, p.workspace_id, p.harness, p.session_id, p.machine_id, p.manifest_key, p.revision) =
+      (sibling.org_id, sibling.workspace_id, sibling.physical_source, sibling.physical_session, sibling.machine_id, sibling.current_key, sibling.pointer_revision)
+    LEFT JOIN sessions.ingest_publication_images i ON
+      (i.manifest_key, i.generation, i.pointer_revision, i.raw_sha256) = (sibling.current_key, sibling.generation, sibling.pointer_revision, sibling.current_raw_sha256)
+    LEFT JOIN sessions.ingest_publication_attempts a ON a.attempt_token = i.attempt_token AND a.state = 'published'
+      AND (a.org_id, a.workspace_id, a.user_id) = (sibling.org_id, sibling.workspace_id, sibling.user_id)
+   WHERE sibling.state = 'live' AND p.deleted_at IS NULL AND p.scrubbed IS TRUE AND NOT p.scrub_quarantined
+     AND (p.org_id, p.workspace_id, p.harness, coalesce(p.canonical_session_id, p.session_id)) = (h.org_id, h.workspace_id, h.physical_source, canon.canonical_id)
+)
+SELECT h.org_id, h.workspace_id, h.physical_source AS harness, (h.source = '_none' AND h.session_id = '_origin') AS origin_bucket,
+       (SELECT canonical_id FROM canon LIMIT 1) AS canonical_id,
+       (SELECT n FROM own)::int AS own, (SELECT n FROM sib)::int AS siblings, (SELECT clocked FROM sib)::int AS clocked
+  FROM h`;
+
+/**
+ * §2: the managed wake, inside the authority transaction. When the publish clock is unprovable it fails closed FOR
+ * SEARCH ONLY [rev 7]: no job, never a pointer clock, and one durable refusal (pipeline_events search-index /
+ * skipped / clock_unprovable) committed with the pointer, so the session stays readable.
+ */
+async function enqueueManagedSearchWake(db: HoopDb, wake: ManagedSearchWake, traceId: string): Promise<void> {
+  const { evidence } = wake;
+  const probe = (await db.query<{ org_id: string; workspace_id: string; harness: string; origin_bucket: boolean; canonical_id: string | null; own: number; siblings: number; clocked: number }>(
+    MANAGED_SEARCH_CLOCK_SQL, [evidence.manifestKey, wake.generation, evidence.schemaGeneration])).rows[0];
+  const unprovable = probe && !probe.origin_bucket && probe.canonical_id !== null &&
+    (Number(probe.own) === 0 || Number(probe.siblings) === 0 || Number(probe.clocked) < Number(probe.siblings));
+  if (probe && unprovable) {
+    await db.query(
+      `INSERT INTO sessions.pipeline_events (trace_id, stage, status, error, attrs, attempt, idempotency_key, org_id, workspace_id, harness, session_id)
+       VALUES ($1::uuid, 'search-index', 'skipped', $2::jsonb, $3::jsonb, 1, $4, $5, $6, $7, $8)`,
+      [traceId, JSON.stringify({ code: "clock_unprovable", name: "SearchWakeRefused", retryable: false }),
+        JSON.stringify({ manifest_key_sha256: createHash("sha256").update(evidence.manifestKey).digest("hex") }),
+        pipelineEventKey(traceId, "search-index", "skipped", 1, evidence.manifestKey),
+        probe.org_id, probe.workspace_id, probe.harness, probe.canonical_id]);
+    log.error("search wake refused", { stage: "search-index", outcome: "skipped", reason: "clock_unprovable", error_code: "clock_unprovable",
+      org_id: probe.org_id, workspace_id: probe.workspace_id, harness: probe.harness, session_id: probe.canonical_id ?? undefined, trace_id: traceId });
+    return;
+  }
+  await db.query("SELECT sessions.enqueue_managed_search_wake_v1($1::jsonb,$2::uuid)", [JSON.stringify(evidence), traceId]);
 }
