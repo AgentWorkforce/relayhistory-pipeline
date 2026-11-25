@@ -3,7 +3,7 @@ import { createHash } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { signV4 } from "../aws-json.ts";
-import { decodeS3Key, parseQueueBody, sequencerAfter } from "../s3-events.ts";
+import { decodeS3Key, parseQueueBody, requeueBody, sequencerAfter } from "../s3-events.ts";
 import { SUPABASE_PROD_CA_2021 } from "../supabase-ca.ts";
 import { analysisDeps, analysisSourceReadonlyUrl, handler, lambdaEnv, parseSecret, runtimeFromSecret, semanticCopyDeps, semanticTickState } from "../lambda.ts";
 import { processBatch } from "../consumer.ts";
@@ -85,6 +85,7 @@ describe("S3 event notifications", () => {
           sequencer: "0055AED6DCD90281E5",
         },
       ],
+      origin: "s3",
     });
   });
 
@@ -94,15 +95,17 @@ describe("S3 event notifications", () => {
       expect(parsed).toEqual({
         kind: "events",
         events: [{ provider: "s3", key: "a", bucket: "bucket", eventTime: "2026-11-01T18:00:00.000Z", sequencer: "01", deleted: true }],
+        origin: "s3",
       });
     }
   });
 
   test("restores, replication and other sources are ignored; the test event is recognized", () => {
-    expect(parseQueueBody(s3Body("ObjectRestore:Completed", { key: "a" }))).toEqual({ kind: "events", events: [] });
+    expect(parseQueueBody(s3Body("ObjectRestore:Completed", { key: "a" }))).toEqual({ kind: "events", events: [], origin: "s3" });
     expect(parseQueueBody(JSON.stringify({ Records: [{ eventSource: "aws:sqs", eventName: "ObjectCreated:Put", s3: { object: { key: "a" } } }] }))).toEqual({
       kind: "events",
       events: [],
+      origin: "s3",
     });
     expect(parseQueueBody(JSON.stringify({ Service: "Amazon S3", Event: "s3:TestEvent", Bucket: "b" }))).toEqual({ kind: "test" });
     expect(parseQueueBody("not json")).toEqual({ kind: "invalid" });
@@ -113,7 +116,19 @@ describe("S3 event notifications", () => {
     expect(parseQueueBody(JSON.stringify({ reconcile: { key: KEY, etag: "e" } }))).toEqual({
       kind: "events",
       events: [{ provider: "s3", key: KEY, etag: "e" }],
+      origin: "sweep",
     });
+  });
+
+  test("requeue bodies (the backport's ecb5d981): the marker and the carried upload time; telemetry only", () => {
+    expect(JSON.parse(requeueBody(KEY))).toEqual({ reconcile: { key: KEY, requeued: true } });
+    expect(JSON.parse(requeueBody(KEY, "2026-11-01T18:00:00.000Z"))).toEqual({ reconcile: { key: KEY, requeued: true, oldest_event_time: "2026-11-01T18:00:00.000Z" } });
+    expect(parseQueueBody(requeueBody(KEY, "2026-11-01T18:00:00.000Z"))).toEqual({
+      kind: "events", events: [{ provider: "s3", key: KEY, oldestEventTime: "2026-11-01T18:00:00.000Z" }], origin: "requeue",
+    });
+    expect(parseQueueBody(requeueBody(KEY))).toEqual({ kind: "events", events: [{ provider: "s3", key: KEY }], origin: "requeue" });
+    // A requeue written before the marker existed is still a requeue when it carries a time.
+    expect((parseQueueBody(JSON.stringify({ reconcile: { key: KEY, oldest_event_time: "2026-11-01T18:00:00.000Z" } })) as { origin: string }).origin).toBe("requeue");
   });
 
   test("events carry the provider they are parsed for; omitted, s3 (the Lambda's)", () => {

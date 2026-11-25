@@ -21,6 +21,7 @@ import type { SearchIndexDeps } from "../search-index.ts";
 import { runSearchJob } from "../search-jobs.ts";
 import { SCOPE, activity, exportStreamScope, generate, type ExportedScope, type Line } from "../../session-read-api/__tests__/stream-fixture.ts";
 import { closeReplayTemplate, warmReplayTemplate } from "./replay-fixture.ts";
+import { crossManifestAcceptanceLines } from "./acceptance-fixture.ts";
 import { hostedRig, plain } from "./search-index-hosted-harness.ts";
 
 const GOLDEN = join(import.meta.dir, "fixtures", "search-index-forward-port-off.golden.json");
@@ -44,21 +45,6 @@ export function acceptanceLines(): Line[] {
   lines.push(
     activity(machine, `capacity:${machine}`, "session_event", "unseated", Date.parse("2026-11-01T10:00:00.600Z"), { role: "user", text: "a" }),
     activity(machine, "capacity:other", "session_event", "unseated", Date.parse("2026-11-01T10:00:00.700Z"), { role: "user", text: "b" }),
-  );
-  return lines;
-}
-
-/**
- * generate(8) (one machine, so no record is copied across manifests) plus two manifests of their own (machines
- * contend-a and contend-b), each carrying one record id
- * from its own origin without an acceptance seat: the whole fold refuses with relayhistory_acceptance_missing
- * alone, and each manifest still folds on its own (the outcome SEARCH_INDEX_SKIP_ACCEPTANCE_MISSING_ENABLED stamps).
- */
-export function crossManifestAcceptanceLines(): Line[] {
-  const lines: Line[] = generate(8);
-  lines.push(
-    activity("machine:contend-a", "capacity:contend-a", "session_event", "unseated", Date.parse("2026-11-01T10:00:00.600Z"), { role: "user", text: "a" }),
-    activity("machine:contend-b", "capacity:contend-b", "session_event", "unseated", Date.parse("2026-11-01T10:00:00.700Z"), { role: "user", text: "b" }),
   );
   return lines;
 }
@@ -115,7 +101,7 @@ async function record(s: Scenario, overlay: Partial<SearchIndexDeps> = {}): Prom
         for (const line of String(chunk).split("\n"))
           if (line.startsWith("{"))
             try {
-              const { ts: _ts, duration_ms: _d, source_read_ms: _sr, index_scan_ms: _is, locked_apply_ms: _la,
+              const { ts: _ts, duration_ms: _d, event_age_ms: _ea, s3_event_age_ms: _sa, queue_origin: _qo, contender_seats: _cs, source_read_ms: _sr, index_scan_ms: _is, locked_apply_ms: _la,
                 write_calls: _wc, write_batches: _wb, ...entry } = JSON.parse(line) as Entry;
               if (entry.stage === "search-index") lines.push(entry);
             } catch {}
@@ -132,7 +118,9 @@ async function record(s: Scenario, overlay: Partial<SearchIndexDeps> = {}): Prom
       process.stdout.write = stdout;
       process.stderr.write = stderr;
     }
-    out.push({ run: i, result, reads: r.reads.count - reads, sql: [...r.sql], clickhouse: [...r.fake.calls], log: lines });
+    // contenderSeats is additive telemetry (the backport's 9279264f), pinned in stream-protections.pglite.test.ts.
+    const stripped = JSON.parse(JSON.stringify(result, (k, v) => (k === "contenderSeats" ? undefined : v)));
+    out.push({ run: i, result: stripped, reads: r.reads.count - reads, sql: [...r.sql], clickhouse: [...r.fake.calls], log: lines });
   }
   return out;
 }

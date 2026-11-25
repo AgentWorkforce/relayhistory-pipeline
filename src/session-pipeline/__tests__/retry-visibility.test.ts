@@ -74,8 +74,9 @@ describe("retry visibility off (default)", () => {
       }
     }
     const sqs = [{ messageId: "m", body: "{}", receiptHandle: HANDLE, attributes: { SentTimestamp: "1" } }];
-    expect(queueRecords(sqs)).toEqual([{ messageId: "m", body: "{}" }]);
-    expect(queueRecords(sqs, true)).toEqual([{ messageId: "m", body: "{}", receiptHandle: HANDLE }]);
+    // SentTimestamp reaches the consumer for event_age_ms (the backport's ecb5d981); the handle only when armed.
+    expect(queueRecords(sqs)).toEqual([{ messageId: "m", body: "{}", sentTimestamp: "1" }]);
+    expect(queueRecords(sqs, true)).toEqual([{ messageId: "m", body: "{}", sentTimestamp: "1", receiptHandle: HANDLE }]);
   });
 
   test("the backport's grammar: integers 1..43200, anything else fails init naming the variable", () => {

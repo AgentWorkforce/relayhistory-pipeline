@@ -561,10 +561,12 @@ export function searchSettlementFor(result: SearchJobResult | { error: unknown }
   if ("error" in result || result.outcome === "held") {
     return attempts >= SEARCH_JOB_MAX_ATTEMPTS ? "exhausted" : { retry: searchJobBackoffSeconds(attempts) };
   }
-  // Scope lock contention is the bounded `busy`; any other not-yet (an epoch behind the wake, a deferred stream) is a
+  // Scope lock contention is the bounded `busy`; so is a deferred stream (the invocation's stream slot was taken or too
+  // little time was left: SEARCH_INDEX_STREAMING_CH=1 only), which settle_search_job_v1's `busy` settles without
+  // spending an attempt, so a deferral can never park a healthy job. Any other not-yet (an epoch behind the wake) is a
   // short retry.
   if (result.outcome === "busy")
-    return result.reasons?.some((r) => r === "scope_busy" || r === "canonical_scope_busy") ? "busy" : { retry: SEARCH_JOB_BUSY_RETRY_SECONDS };
+    return result.reasons?.some((r) => r === "scope_busy" || r === "canonical_scope_busy" || r === "stream_deferred") ? "busy" : { retry: SEARCH_JOB_BUSY_RETRY_SECONDS };
   return "done";
 }
 
