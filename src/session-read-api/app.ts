@@ -116,7 +116,10 @@ import { COORDINATION_EVIDENCE_LOOKBACK_MS, clickhouseCoordinationBackend, type 
 import { detectCoordination } from "../../packages/coordination-detect/src/index.ts";
 import { ADVISORIES_CONTRACT, ADVISORIES_INSTANCE_CONTRACT, advisoryItem, type AdvisoriesSource } from "./coordination-advisories.ts";
 import { SessionIntelUnsupported, workspaceView, type SessionIntelSource } from "./session-intel-workspace.ts";
-import { readWorkspaceSynthesis, readWorkspaceSynthesisV2, synthesisWindow, type WorkspaceSynthesisSource } from "./workspace-synthesis.ts";
+import {
+  perKeyOperatorFence, readWorkspaceSynthesis, readWorkspaceSynthesisV2, synthesisWindow, type SessionAliases, type SynthesisChecks,
+  type SynthesisOperatorFence, type WorkspaceSynthesisSource,
+} from "./workspace-synthesis.ts";
 import { MESSAGE_ORIGINS, isMessageOrigin, type MessageOrigin } from "../../packages/pipeline/src/lib/pipeline/message-origin.ts";
 import { READ_SETTINGS } from "./queries.ts";
 import {
@@ -228,6 +231,11 @@ export class AuthError extends Error {
 export interface ReadApiDeps {
   /** Self-host SESSION_ERASE_FENCE_ENFORCED=1 only; pre/post IO gate for exact session routes. */
   operatorErased?: (key: { orgId: string; workspaceId: string; source: string; sessionId: string }) => Promise<boolean>;
+  /**
+   * The same fence over many keys in one statement (liveness.ts sqlOperatorErasedBatch), wired beside operatorErased.
+   * Used by routes that check a set of sessions (the workspace synthesis); absent, they call operatorErased per key.
+   */
+  operatorErasedBatch?: SynthesisOperatorFence;
   verify: Verifier;
   ch?: ClickHouseClient;
   adapter?: SearchServiceBinding;
@@ -355,7 +363,16 @@ export interface ReadApiDeps {
    * (READ_API_WORKSPACE_SYNTHESIS_V2_ENABLED=true) adds `stage=2`, the stored workspace-synthesis/2 document; without
    * it `stage=2` is 501 `workspace_synthesis_v2_disabled` and the route is otherwise unchanged.
    */
-  workspaceSynthesis?: { enabled: boolean; source?: WorkspaceSynthesisSource; stage2Enabled?: boolean };
+  workspaceSynthesis?: {
+    enabled: boolean;
+    source?: WorkspaceSynthesisSource;
+    stage2Enabled?: boolean;
+    /**
+     * The alias reader (workspace-synthesis.ts sqlSessionAliases): each recorded session is checked under every
+     * physical and source id its pointer rows hold. Required where the operator erase fence is bound (else 503).
+     */
+    aliases?: SessionAliases;
+  };
   /**
    * READ_API_ADVISORY_NOTIFY_ROWS, parsed (advisory-priority.ts parseAdvisoryNotifyRows): the (kind, urgency) rows
    * whose advisories carry `notifyEligible: true` on both advisory routes. Absent = empty: none.
@@ -2480,7 +2497,20 @@ export function createReadApi(deps: ReadApiDeps) {
    * `stage=2` (exactly once) serves the stored workspace-synthesis/2 document instead, only with
    * `stage2Enabled` (else 501 workspace_synthesis_v2_disabled): no v2 is 404 `stage2_not_found`, a stored v2 that does
    * not verify is a 500 with the reader's code as the reason, and the erase check also covers the kept sessions.
+   * Where the operator erase fence is bound (operatorErased / operatorErasedBatch), every recorded session, under
+   * each of its aliases, is checked against it too, after the read: fenced = the same 404; the fence (or the alias
+   * reader it needs) unavailable or failing = 503, nothing served.
    */
+  /** The synthesis reads' erase and fence checks for this tenant (workspace-synthesis.ts SynthesisChecks). */
+  function synthesisChecks(identity: VerifiedIdentity, aliases: SessionAliases | undefined): SynthesisChecks {
+    const operatorFence = deps.operatorErasedBatch ?? (deps.operatorErased ? perKeyOperatorFence(deps.operatorErased) : undefined);
+    return {
+      liveness: deps.liveness, orgId: identity.orgId, workspaceId: identity.workspaceId,
+      ...(operatorFence ? { operatorFence } : {}),
+      ...(aliases ? { aliases } : {}),
+    };
+  }
+
   app.get("/v1/session-intel/synthesis", async (c) => {
     const synthesis = deps.workspaceSynthesis;
     if (synthesis?.enabled !== true) return fail(c, unsupported("workspace_synthesis_disabled"));
@@ -2510,7 +2540,7 @@ export function createReadApi(deps: ReadApiDeps) {
         if (read2.status === "invalid") throw new HttpError(500, "internal", "the stored Stage 2 workspace synthesis failed verification", read2.code);
         return c.json(read2.synthesis);
       }
-      const read = await readWorkspaceSynthesis({ source: synthesis.source, liveness: deps.liveness, orgId: identity.orgId, workspaceId: identity.workspaceId, window });
+      const read = await readWorkspaceSynthesis({ source: synthesis.source, ...synthesisChecks(identity, synthesis.aliases), window });
       if (read.status === "not_found") throw new HttpError(404, "not_found", "no workspace synthesis for this window");
       if (read.status === "invalidated")
         throw new HttpError(404, "not_found", "the workspace synthesis for this window cites an erased session and awaits recomputation", "synthesis_invalidated");

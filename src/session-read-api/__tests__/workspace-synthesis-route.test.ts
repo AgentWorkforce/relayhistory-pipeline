@@ -7,11 +7,14 @@ import { describe, expect, test } from "bun:test";
 import { readFileSync } from "node:fs";
 import { AuthError, createReadApi, type VerifiedIdentity } from "../app.ts";
 import { memoryLiveness } from "./support.ts";
-import { storeWorkspaceSynthesis, synthesisKeyRoot, synthesisWindow, type WorkspaceSynthesisSource } from "../workspace-synthesis.ts";
+import {
+  SYNTHESIS_ALIAS_ROWS_MAX, storeWorkspaceSynthesis, synthesisKeyRoot, synthesisWindow, type SessionAliasRow, type SessionAliases,
+  type WorkspaceSynthesisSource,
+} from "../workspace-synthesis.ts";
 import { memoryArtifactStore, runWorkspaceSynthesisJob } from "../../session-analysis/workspace-synthesis.ts";
 import { workspaceSynthesisDeps } from "../../../packages/session-read-worker/src/index.ts";
 import { withChild, withRelated } from "../../session-analysis/__tests__/workspace-synthesis-fixtures.ts";
-import type { SessionKey } from "../page.ts";
+import { keyOf, type SessionKey } from "../page.ts";
 
 const FIXTURE = new URL("../../session-intel/__tests__/fixtures/synthesis/", import.meta.url);
 const cohortText = readFileSync(new URL("cohort.json", FIXTURE), "utf8");
@@ -186,6 +189,164 @@ describe("GET /v1/session-intel/synthesis: serving and invalidation", () => {
     expect(synthesisWindow("2026-11-01T01:00:00+01:00", UNTIL)).toEqual({ since: SINCE, until: UNTIL });
     expect(typeof synthesisWindow(UNTIL, SINCE)).toBe("string");
     expect(typeof synthesisWindow(undefined, UNTIL)).toBe("string");
+  });
+});
+
+/** The pointer rows of the alias SQL, in memory: rows whose physical or source id is a key under the key's source. */
+function memoryAliases(rows: Array<{ harness: string; session_id: string; canonical_session_id: string | null }>) {
+  const calls: SessionKey[][] = [];
+  const aliases: SessionAliases = async (orgId, workspaceId, keys) => {
+    calls.push(keys);
+    const asked = new Set(keys.map(keyOf));
+    return rows
+      .filter((r) => asked.has(keyOf({ source: r.harness, sessionId: r.session_id })) ||
+        (r.canonical_session_id !== null && asked.has(keyOf({ source: r.harness, sessionId: r.canonical_session_id }))))
+      .map((r): SessionAliasRow => ({ org_id: orgId, workspace_id: workspaceId, ...r }));
+  };
+  return { aliases, calls };
+}
+
+/**
+ * The operator erase fence (self-host SESSION_ERASE_FENCE_ENFORCED=1), bound as the Lambda binds it (operatorErased
+ * and operatorErasedBatch) or per key only. Ordinary liveness has no tombstone in any of these cases: an operator erase
+ * is in progress.
+ */
+const fenced = (opts: {
+  source: WorkspaceSynthesisSource;
+  fence?: SessionKey[];
+  mode?: "batch" | "perKey" | "outage" | "perKeyOutage";
+  aliasRows?: Array<{ harness: string; session_id: string; canonical_session_id: string | null }>;
+  aliases?: SessionAliases | null;
+}) => {
+  const live = memoryLiveness();
+  const fence = new Set((opts.fence ?? []).map(keyOf));
+  const calls = { batch: [] as SessionKey[][], perKey: [] as SessionKey[] };
+  const mode = opts.mode ?? "batch";
+  const alias = memoryAliases(opts.aliasRows ?? []);
+  const aliases = opts.aliases === null ? undefined : opts.aliases ?? alias.aliases;
+  const app = createReadApi({
+    verify, adapter: {} as never, liveness: live.liveness, completeSinceMs: 0, directoryWorkspaces: new Set([ID.workspaceId]),
+    operatorErased: async (key) => {
+      calls.perKey.push({ source: key.source, sessionId: key.sessionId });
+      if (key.orgId !== ID.orgId || key.workspaceId !== ID.workspaceId) throw new Error("tenant");
+      if (mode === "perKeyOutage") throw new Error("operator_fence_unavailable fx-s01");
+      return fence.has(keyOf(key));
+    },
+    ...(mode === "batch" || mode === "outage" ? {
+      operatorErasedBatch: async (orgId: string, workspaceId: string, keys: SessionKey[]) => {
+        calls.batch.push(keys);
+        if (orgId !== ID.orgId || workspaceId !== ID.workspaceId) throw new Error("tenant");
+        if (mode === "outage") throw new Error("operator_fence_unavailable fx-s01");
+        return new Set(keys.map(keyOf).filter((k) => fence.has(k)));
+      },
+    } : {}),
+    workspaceSynthesis: { enabled: true, source: opts.source, ...(aliases ? { aliases } : {}) },
+  });
+  return { app, live, calls, alias };
+};
+
+describe("GET /v1/session-intel/synthesis: the operator erase fence", () => {
+  const invalidated = (r: { status: number; body: any }, id: string) => {
+    expect([id, r.status, r.body.error?.reason]).toEqual([id, 404, "synthesis_invalidated"]);
+    expect(JSON.stringify(r.body)).not.toContain(id);
+  };
+
+  test("nothing fenced still serves exactly the golden, every recorded session checked against the fence", async () => {
+    const s = await storedSource();
+    const f = fenced({ source: s.source });
+    const r = await get(f.app);
+    expect(r.status).toBe(200);
+    expect(r.body).toEqual(golden);
+    expect(f.calls.batch.length).toBe(1);
+    expect(f.calls.batch[0]!.length).toBe(golden.inputs.considered);
+    expect(f.calls.perKey).toEqual([]);
+    expect(f.alias.calls.length).toBe(1);
+  });
+
+  test("a fenced considered session (no tombstone yet) is never served: the lander's fx-s01 case and a skipped one", async () => {
+    for (const key of [{ source: "fx-claude", sessionId: "fx-s01" }, { source: "fx-claude", sessionId: "fx-skip-not-analyzed" }]) {
+      const s = await storedSource();
+      const f = fenced({ source: s.source, fence: [key] });
+      invalidated(await get(f.app), key.sessionId);
+      expect(f.live.calls.erased.flat()).toContainEqual(key);
+    }
+    // The same id fenced under another source is another session: still served.
+    const s = await storedSource();
+    expect((await get(fenced({ source: s.source, fence: [{ source: "fx-codex", sessionId: "fx-s01" }] }).app)).status).toBe(200);
+  });
+
+  test("a fenced RELATED-only session (a child the evidence belongs to, not in the cohort) is never served", async () => {
+    for (const child of ["fx-s01-child", "fx-s01-spawned"]) {
+      const s = await storedSource({ cohort: withChild(JSON.parse(cohortText)) });
+      expect((await get(fenced({ source: s.source }).app)).body).toEqual(golden);
+      invalidated(await get(fenced({ source: s.source, fence: [{ source: "fx-claude", sessionId: child }] }).app), child);
+    }
+  });
+
+  test("a fence under a canonical or physical alias of a recorded session is never served, both directions", async () => {
+    // fx-s01 recorded as its physical id; the fence written under its source (canonical) id.
+    const s = await storedSource();
+    const toCanonical = [{ harness: "fx-claude", session_id: "fx-s01", canonical_session_id: "fx-canon-s01" }];
+    invalidated(await get(fenced({ source: s.source, aliasRows: toCanonical, fence: [{ source: "fx-claude", sessionId: "fx-canon-s01" }] }).app), "fx-s01");
+    // fx-s01 recorded as a source id whose pointer's physical id differs; the fence written under the physical id.
+    const toPhysical = [{ harness: "fx-claude", session_id: "fx-phys-s01", canonical_session_id: "fx-s01" }];
+    const f = fenced({ source: s.source, aliasRows: toPhysical, fence: [{ source: "fx-claude", sessionId: "fx-phys-s01" }] });
+    invalidated(await get(f.app), "fx-s01");
+    expect(f.calls.batch.flat()).toContainEqual({ source: "fx-claude", sessionId: "fx-phys-s01" });
+    // The per-key fallback (operatorErased alone) sees the alias as well.
+    invalidated(await get(fenced({ source: s.source, mode: "perKey", aliasRows: toCanonical, fence: [{ source: "fx-claude", sessionId: "fx-canon-s01" }] }).app), "fx-s01");
+    // An alias is per source: the fence on the same id under another source does not invalidate.
+    expect((await get(fenced({ source: s.source, aliasRows: toCanonical, fence: [{ source: "fx-codex", sessionId: "fx-canon-s01" }] }).app)).status).toBe(200);
+    // The alias forms reach ordinary liveness too: a tombstoned physical alias invalidates.
+    const live = memoryLiveness({ erased: [{ source: "fx-claude", sessionId: "fx-phys-s01" }] });
+    const app = createReadApi({
+      verify, adapter: {} as never, liveness: live.liveness, completeSinceMs: 0, directoryWorkspaces: new Set([ID.workspaceId]),
+      workspaceSynthesis: { enabled: true, source: s.source, aliases: memoryAliases(toPhysical).aliases },
+    });
+    invalidated(await get(app), "fx-s01");
+  });
+
+  test("the per-key fence alone (no batch bound) covers the set too", async () => {
+    const s = await storedSource();
+    const ok = fenced({ source: s.source, mode: "perKey" });
+    expect((await get(ok.app)).body).toEqual(golden);
+    expect(ok.calls.perKey.length).toBe(golden.inputs.considered);
+    invalidated(await get(fenced({ source: s.source, mode: "perKey", fence: [{ source: "fx-codex", sessionId: "fx-s40" }] }).app), "fx-s40");
+  });
+
+  test("more than one fence batch: only the LAST recorded session fenced is still never served", async () => {
+    const s = await storedSource({ cohort: withRelated(JSON.parse(cohortText), 600) });
+    const ok = fenced({ source: s.source });
+    expect((await get(ok.app)).status).toBe(200);
+    const total = golden.inputs.considered + 600;
+    expect(ok.calls.batch.flat().length).toBe(total);
+    expect(ok.calls.batch.length).toBe(Math.ceil(total / 500));
+    expect(ok.alias.calls.length).toBe(Math.ceil(total / 500));
+    expect(ok.calls.batch.every((b) => b.length <= 500)).toBe(true);
+    const last = { source: "fx-claude", sessionId: "fx-zz-rel-00599" };
+    invalidated(await get(fenced({ source: s.source, fence: [last] }).app), last.sessionId);
+  });
+
+  test("fails closed: the fence unavailable or throwing, or the alias reader missing, failing or out of contract, is a 503", async () => {
+    const s = await storedSource();
+    const closed = async (app: ReturnType<typeof fenced>["app"]) => {
+      const r = await get(app);
+      expect([r.status, r.body.error.code]).toEqual([503, "backend_unavailable"]);
+      expect(JSON.stringify(r.body)).not.toContain("fx-s01");
+    };
+    await closed(fenced({ source: s.source, mode: "outage" }).app);
+    await closed(fenced({ source: s.source, mode: "perKeyOutage" }).app);
+    // The fence bound without an alias reader would see one form only: refused.
+    const noAliases = fenced({ source: s.source, aliases: null });
+    await closed(noAliases.app);
+    expect(noAliases.calls.batch).toEqual([]);
+    await closed(fenced({ source: s.source, aliases: async () => { throw new Error("pointers down fx-s01"); } }).app);
+    const tooMany = Array.from({ length: SYNTHESIS_ALIAS_ROWS_MAX + 1 }, (_, i) => ({ org_id: ID.orgId, workspace_id: ID.workspaceId, harness: "fx-claude", session_id: "fx-s01", canonical_session_id: `fx-c-${i}` }));
+    await closed(fenced({ source: s.source, aliases: async () => tooMany }).app);
+    // A row for a session not asked about, or of another tenant, is out of contract.
+    await closed(fenced({ source: s.source, aliases: async () => [{ org_id: ID.orgId, workspace_id: ID.workspaceId, harness: "fx-claude", session_id: "fx-other", canonical_session_id: null }] }).app);
+    const other = fenced({ source: s.source, aliases: async () => [{ org_id: "fx-org-other", workspace_id: ID.workspaceId, harness: "fx-claude", session_id: "fx-s01", canonical_session_id: null }] });
+    expect((await get(other.app)).status).toBe(500);
   });
 });
 

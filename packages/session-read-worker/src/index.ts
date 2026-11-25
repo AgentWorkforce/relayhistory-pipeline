@@ -120,7 +120,7 @@ import { readerMaxRuleset } from "../../pipeline/src/lib/scrub-engine/reader-pol
 import pg from "pg";
 import { Decompress, decompress } from "fzstd";
 import { canonicalAnalysisHandle } from "./analysis-cache.ts";
-import { storeWorkspaceSynthesis, synthesisKeyRoot, type WorkspaceSynthesisSource } from "../../../src/session-read-api/workspace-synthesis.ts";
+import { sqlSessionAliases, storeWorkspaceSynthesis, synthesisKeyRoot, type WorkspaceSynthesisSource } from "../../../src/session-read-api/workspace-synthesis.ts";
 import { objectStoreArtifacts } from "../../../src/session-analysis/workspace-synthesis.ts";
 import { canonicalHandle, type CanonicalEnv } from "./canonical.ts";
 import { endPg, isPgEnding, pgClientErrorLog } from "./pg-close.ts";
@@ -681,7 +681,7 @@ export async function handle(request: Request, env: Env, ctx: ExecutionContext, 
     ...(coordinationOverlapsEnabled(env.READ_API_COORDINATION_OVERLAPS_ENABLED) ? { coordination: { enabled: true as const } } : {}),
     ...workerAdvisoryDeps(env, tenant.run, advisoryNotifyRows),
     ...(exactTrueFlag(env.READ_API_SESSION_INTEL_ENABLED) ? { sessionIntel: { enabled: true as const, source: sqlSessionIntel(tenant.run) } } : {}),
-    ...(exactTrueFlag(env.READ_API_WORKSPACE_SYNTHESIS_ENABLED) ? { workspaceSynthesis: workspaceSynthesisDeps(env, overrides.fetcher) } : {}),
+    ...(exactTrueFlag(env.READ_API_WORKSPACE_SYNTHESIS_ENABLED) ? { workspaceSynthesis: { ...workspaceSynthesisDeps(env, overrides.fetcher), aliases: sqlSessionAliases(tenant.run) } } : {}),
     // Parity with the hosted Lambda (src/session-read-api/lambda.ts): each only with the exact flag.
     ...(exactTrueFlag(env.READ_API_BRIEF_SUMMARY_ENABLED) ? { briefSummary: sqlBriefSummary(tenant.run) } : {}),
     ...(exactTrueFlag(env.READ_API_BRIEF_SUMMARY_ENABLED) && exactTrueFlag(env.READ_API_SUMMARY_FALLBACK_ENABLED)

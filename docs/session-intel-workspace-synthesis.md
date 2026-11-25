@@ -283,6 +283,14 @@ GET /v1/session-intel/synthesis?workspace=<id>&since=<ISO>&until=<ISO>
   tombstones (`Liveness.erased`, in batches of 500: a session whose every pointer row is tombstoned). If any is erased
   the artifact is not served: `404 not_found`, reason `synthesis_invalidated`, until the job recomputes it. So an
   erased session, a child only the evidence belongs to included, never stays in a drilldown or a count.
+- **Operator erase fence.** Where the self-host operator fence is bound (`SESSION_ERASE_FENCE_ENFORCED=1`, the same
+  `sessions.ingest_operator_runtime_erased` the exact session routes check), the same sessions are checked against it
+  too, after the read and in batches of 500: a fenced session (an operator erase in progress, no tombstone yet) is the
+  same `404 synthesis_invalidated`. The fence unavailable or failing is a `503`, nothing served.
+- **Aliases.** A session is addressed by its physical id or its source RelayHistory id (`canonical_session_id`), and
+  a tombstone or fence may be under either. Each recorded session is expanded, per source, to every id its pointer
+  rows (live and tombstoned) hold, both directions, before both checks (batches of 500, at most 4,000 rows a batch and
+  25,000 forms in all; more is a `503`). With the fence bound and no alias reader, the route answers `503`.
 - **Freshness.** The job is rerun when the cohort changes; the new artifact's later generation makes it the
   authoritative one. `generatedAt` and `freshness` in the body say how current it is.
 - **Body.** The `workspace-synthesis/1` document only (no org id, no provenance lists). A store failure is `503`.
