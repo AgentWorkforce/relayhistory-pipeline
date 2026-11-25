@@ -263,12 +263,18 @@ export async function checkPublicationPickup(pg:PGlite, store:ObjectStore, key:s
     // The local service's freshness message follows the same managed-hint
     // path as an S3 event. It acknowledged the hint without projecting search.
     const afterWake=(await state.partials(scope,{limit:10})).sessions;
-    // Opt into the rollout acceptance condition to reproduce the missing trigger.
-    if (process.env.PUBLICATION_REQUIRE_AUTOMATIC_SEARCH === "1") expect(afterWake).not.toContain(head!.canonical);
-    else expect(afterWake).toContain(head!.canonical);
-    // Explicit one-scope qualification of the writer, independent of its trigger.
-    expect(await indexSearchScope(scope,searchDeps)).toMatchObject({complete:true});
-    expect((await state.partials(scope,{limit:10})).sessions).not.toContain(head!.canonical);
+    if (automatic) {
+      // The rollout acceptance condition: the committed wake alone made the scope searchable. NO explicit
+      // indexSearchScope call runs in this mode, so the authorized peer list/point/search reads below can only
+      // see what the automatic search-index path wrote.
+      expect(afterWake).not.toContain(head!.canonical);
+    } else {
+      // The positive control: without the consumer the hint projects nothing, and the explicit one-scope
+      // qualification of the writer, independent of its trigger, makes the scope searchable.
+      expect(afterWake).toContain(head!.canonical);
+      expect(await indexSearchScope(scope,searchDeps)).toMatchObject({complete:true});
+      expect((await state.partials(scope,{limit:10})).sessions).not.toContain(head!.canonical);
+    }
     await search.exec("CREATE ROLE bulls96_read_api NOLOGIN; GRANT USAGE ON SCHEMA search_index TO bulls96_read_api; GRANT SELECT ON search_index.transcript_events TO bulls96_read_api");
     const peerSearch:TenantRunner=(org,ws,work)=>search.transaction(async tx=>{
       await tx.exec("SET LOCAL ROLE bulls96_read_api");
