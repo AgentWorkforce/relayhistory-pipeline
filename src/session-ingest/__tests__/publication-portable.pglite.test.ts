@@ -81,6 +81,12 @@ const overrides = (extra: Record<string, unknown> = {}) => ({
 test("portable publish: verifiers pass as the ingest login, scrubbed canonical image lands in the S3-compatible bucket", async () => {
   let poolConfig: any;
   const before = s3.requests.length;
+  // Pause with accepted work already waiting. A fresh disabled runtime must
+  // leave even that eligible stage unclaimed, without touching the store.
+  const paused = { ...ENV, INGEST_PUBLISH_ENABLED: "false" };
+  expect(await runPortablePublicationRuntime(paused, "publish", overrides())).toEqual({ enabled: false });
+  expect(s3.requests.length).toBe(before);
+  expect((await owner("SELECT count(*)::int AS n FROM sessions.ingest_publication_attempts")).rows[0].n).toBe(0);
   const result = await runPortablePublicationRuntime(ENV, "publish", overrides({ pool: (c: any) => { poolConfig = c; return pgliteTestPool(db, "bulls96_session_ingest", c); } }));
   expect(result).toMatchObject({ enabled: true, examined: 1, published: 1 });
   // Discrete pool fields from the mounted URL: no connectionString, URL sslmode ignored, pinned TLS profile applied.
@@ -114,8 +120,12 @@ test("portable GC: retired generation is barriered in the same bucket and erased
   const ledger = orderedFixtureLedger(sqlLedger(asIngest, { acceptanceMode: "buffered", expectedGeneration: GEN }), { query: owner });
   await ledger.setSessionUploads!({ tenant: TENANT, originId: "origin-1", sessions: [["claude", "sess-1"]], enabled: false });
   await ledger.setSessionUploads!({ tenant: TENANT, originId: "origin-1", sessions: [["claude", "sess-1"]], enabled: true });
+  const paused = { ...ENV, INGEST_PUBLISH_ENABLED: "false" };
+  const before = s3.requests.length;
+  expect(await runPortablePublicationRuntime(paused, "publish", overrides())).toEqual({ enabled: false });
+  expect(s3.requests.length).toBe(before);
   let eraserConfig: any; const erased: string[] = [];
-  const result = await runPortablePublicationRuntime(ENV, "gc", overrides({ eraser: (c: any) => { eraserConfig = c; return { eraseObjectExcept: async (key: string) => { erased.push(key); return { deleted: 0 }; } }; } }));
+  const result = await runPortablePublicationRuntime(paused, "gc", overrides({ eraser: (c: any) => { eraserConfig = c; return { eraseObjectExcept: async (key: string) => { erased.push(key); return { deleted: 0 }; } }; } }));
   expect(result.enabled).toBe(true);
   expect((result as any).finished).toBeGreaterThan(0);
   expect(eraserConfig).toMatchObject({ bucket: BUCKET, region: REGION, endpoint: ORIGIN, credentials: { accessKeyId: ACCESS, secretAccessKey: SECRET } });
