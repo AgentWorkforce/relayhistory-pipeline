@@ -6,8 +6,9 @@
  */
 import { describe, expect, test } from "bun:test";
 import { PipelineError } from "@rhc/lib/pipeline/errors.ts";
-import { processBatch, RETRY_VISIBILITY_TIMEOUT_MS, type ConsumerDeps, type QueueRecord } from "../consumer.ts";
-import { lambdaEnv, queueRecords, retryVisibilityFromEnv, sqsChangeVisibility } from "../lambda.ts";
+import { processBatch, RETRY_VISIBILITY_MARGIN_MS, RETRY_VISIBILITY_TIMEOUT_MS, type ConsumerDeps, type QueueRecord } from "../consumer.ts";
+import { handler, invocationDeps, lambdaEnv, queueRecords, retryVisibilityFromEnv, setRuntimeForTests, sqsChangeVisibility } from "../lambda.ts";
+import type { SearchIndexDeps } from "../search-index.ts";
 import type { PointerDeps } from "../pointer.ts";
 
 const HANDLE = "receipt-handle-synthetic-SECRET-7f3a";
@@ -136,11 +137,99 @@ describe("retry visibility on", () => {
   test("sqsChangeVisibility sends one bounded ChangeMessageVisibility to the pipeline queue", async () => {
     const sent: unknown[] = [];
     const change = sqsChangeVisibility({ region: "us-east-1", queueUrl: "queue-url-synthetic" }, (async (args: unknown) => { sent.push(args); return {}; }) as never, () => ({}) as never);
-    await change(HANDLE, 60);
-    expect(sent).toEqual([{
+    await change(HANDLE, 60, RETRY_VISIBILITY_TIMEOUT_MS);
+    await change(HANDLE, 60, 1_500);
+    const call = (timeoutMs: number) => ({
       service: "sqs", target: "AmazonSQS.ChangeMessageVisibility", region: "us-east-1",
       body: { QueueUrl: "queue-url-synthetic", ReceiptHandle: HANDLE, VisibilityTimeout: 60 },
-      credentials: {}, timeoutMs: RETRY_VISIBILITY_TIMEOUT_MS,
-    }]);
+      credentials: {}, timeoutMs,
+    });
+    expect(sent).toEqual([call(RETRY_VISIBILITY_TIMEOUT_MS), call(1_500)]);
+  });
+});
+
+/**
+ * Through the exported Lambda handler (setRuntimeForTests replaces init's deps): "pmp-*" records fail
+ * with pointer_move_pending, "ok-*" records are acknowledged (the org lookup answers none: ignored),
+ * and the SQS transport takes 350 ms per ChangeMessageVisibility.
+ */
+describe("handler near the invocation deadline", () => {
+  const SQS_MS = 350;
+  /** Pointer deps: pointer_move_pending for pmp-*, "no org" (acknowledged) for everything else. */
+  const pointer = {
+    reader: { bucket: undefined },
+    orgs: { orgFor: async (loc: { sessionId: string }) => { if (loc.sessionId.startsWith("pmp")) throw new PipelineError("pointer_move_pending", "synthetic", true); return null; } },
+  } as unknown as PointerDeps;
+  const sqsRecords = (...sessions: string[]) =>
+    sessions.map((s, i) => ({ messageId: `msg-${s}`, body: s3Body(s), receiptHandle: `${HANDLE}-${i}`, attributes: { SentTimestamp: "1" } }));
+  const streamingSearch = new Proxy({ stream: { maxReadBytes: 1, maxReadEvents: 1 } } as unknown as SearchIndexDeps, {
+    get: (t, p) => { if (p in t) return (t as unknown as Record<string | symbol, unknown>)[p]; throw new Error(`search touched: ${String(p)}`); },
+  });
+
+  async function run(opts: { streaming: boolean; remaining?: number }) {
+    const calls: Array<{ handle: string; seconds: number; timeoutMs: number }> = [];
+    setRuntimeForTests({
+      pointer,
+      ...(opts.streaming ? { search: streamingSearch } : {}),
+      retryVisibility: {
+        seconds: 60,
+        change: async (handle, seconds, timeoutMs) => { calls.push({ handle, seconds, timeoutMs }); await new Promise((r) => setTimeout(r, SQS_MS)); },
+      },
+    });
+    try {
+      const context = opts.remaining === undefined ? undefined : { getRemainingTimeInMillis: () => opts.remaining! };
+      const started = Date.now();
+      const { result, lines } = await capture(() => handler({ Records: sqsRecords("pmp-1", "pmp-2", "ok-1") }, context));
+      return { result, lines, calls, elapsed: Date.now() - started };
+    } finally {
+      setRuntimeForTests(undefined);
+    }
+  }
+
+  const FAILED = { batchItemFailures: [{ itemIdentifier: "msg-pmp-1" }, { itemIdentifier: "msg-pmp-2" }] };
+
+  for (const streaming of [false, true]) {
+    const path = streaming ? "streaming" : "non-streaming";
+    test(`${path}: 100 ms remaining makes no call and returns the same failures at once, the success acknowledged`, async () => {
+      const { result, lines, calls, elapsed } = await run({ streaming, remaining: 100 });
+      expect(result).toEqual(FAILED);
+      expect(calls).toEqual([]);
+      expect(elapsed).toBeLessThan(100);
+      const warns = lines.map((l) => JSON.parse(l)).filter((l) => l.message === "retry visibility not shortened");
+      expect(warns).toEqual([expect.objectContaining({ level: "warn", reason: "retry_visibility_deadline", count: 2 })]);
+      expect(lines.join("\n")).not.toContain(HANDLE);
+    });
+
+    test(`${path}: just under the call bound plus margin still makes no call`, async () => {
+      const { result, calls } = await run({ streaming, remaining: RETRY_VISIBILITY_TIMEOUT_MS + RETRY_VISIBILITY_MARGIN_MS - 1 });
+      expect(result).toEqual(FAILED);
+      expect(calls).toEqual([]);
+    });
+
+    test(`${path}: an ample budget makes both calls, concurrently and bounded, and the same failures`, async () => {
+      const { result, lines, calls, elapsed } = await run({ streaming, remaining: 300_000 });
+      expect(result).toEqual(FAILED);
+      expect(calls.map((c) => c.handle).sort()).toEqual([`${HANDLE}-0`, `${HANDLE}-1`]);
+      for (const c of calls) expect(c).toMatchObject({ seconds: 60, timeoutMs: RETRY_VISIBILITY_TIMEOUT_MS });
+      expect(elapsed).toBeLessThan(2 * SQS_MS);
+      expect(lines.join("\n")).not.toContain(HANDLE);
+    });
+  }
+
+  test("no context: today's bounded behaviour (calls made, each bounded by the fixed cap)", async () => {
+    const { result, calls } = await run({ streaming: false });
+    expect(result).toEqual(FAILED);
+    expect(calls.map((c) => c.timeoutMs)).toEqual([RETRY_VISIBILITY_TIMEOUT_MS, RETRY_VISIBILITY_TIMEOUT_MS]);
+  });
+
+  test("invocationDeps: remaining time reaches retryVisibility with or without streaming; neither armed is deps itself", () => {
+    const rv = { seconds: 60, change: async () => {} };
+    const ctx = { getRemainingTimeInMillis: () => 4_321 };
+    expect(invocationDeps({ pointer, retryVisibility: rv }, ctx).retryVisibility!.remainingMs!()).toBe(4_321);
+    expect(invocationDeps({ pointer, search: streamingSearch, retryVisibility: rv }, ctx).retryVisibility!.remainingMs!()).toBe(4_321);
+    const bare = { pointer, retryVisibility: rv };
+    expect(invocationDeps(bare)).toBe(bare);
+    const plain = { pointer };
+    expect(invocationDeps(plain, ctx)).toBe(plain);
   });
 });

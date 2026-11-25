@@ -51,6 +51,13 @@ export const FAST_RETRY_CODES: ReadonlySet<string> = new Set(["pointer_move_pend
 /** A ChangeMessageVisibility call that has not settled after this long is abandoned (the message keeps its full timeout). */
 export const RETRY_VISIBILITY_TIMEOUT_MS = 2_000;
 
+/**
+ * Time kept back for returning the batch response after the calls. With less than
+ * RETRY_VISIBILITY_TIMEOUT_MS + this left in the invocation no call is made, so a near-deadline
+ * batch still returns its partial response (and acknowledges its successes) before Lambda times out.
+ */
+export const RETRY_VISIBILITY_MARGIN_MS = 1_000;
+
 export interface BatchResponse {
   batchItemFailures: { itemIdentifier: string }[];
 }
@@ -70,9 +77,15 @@ export interface ConsumerDeps {
    * set to `seconds` before it is returned in batchItemFailures, so SQS redelivers it then instead
    * of after the queue's full visibility timeout. Best-effort: a rejected or timed-out call logs a
    * warn and the message still fails with the normal timeout. Needs sqs:ChangeMessageVisibility on
-   * the source queue for the Lambda role.
+   * the source queue for the Lambda role. `remainingMs` (the invocation's remaining time, set per
+   * invocation by lambda.ts invocationDeps) is checked right before the calls: too little left and
+   * none is made; otherwise each is bounded by min(RETRY_VISIBILITY_TIMEOUT_MS, remaining - margin).
    */
-  retryVisibility?: { seconds: number; change: (receiptHandle: string, seconds: number) => Promise<void> };
+  retryVisibility?: {
+    seconds: number;
+    change: (receiptHandle: string, seconds: number, timeoutMs: number) => Promise<void>;
+    remainingMs?: () => number;
+  };
   /** Clock for `event_age_ms` and `s3_event_age_ms` only (default Date.now). */
   now?: () => number;
 }
@@ -163,16 +176,26 @@ function carriedTime(c: Covered): string | undefined {
 
 /** Set each message's visibility to `seconds`, bounded and best-effort: never throws, never changes which messages fail. */
 async function shortenRetries(handles: readonly (string | undefined)[], rv: NonNullable<ConsumerDeps["retryVisibility"]>): Promise<void> {
-  await Promise.all(
+  // Rechecked here, after both stages: the batch may have used most of the invocation.
+  const remaining = rv.remainingMs?.();
+  let bound = RETRY_VISIBILITY_TIMEOUT_MS;
+  if (remaining !== undefined && Number.isFinite(remaining)) {
+    if (remaining < RETRY_VISIBILITY_TIMEOUT_MS + RETRY_VISIBILITY_MARGIN_MS) {
+      log.warn("retry visibility not shortened", { stage: "session-indexed", reason: "retry_visibility_deadline", count: handles.length });
+      return;
+    }
+    bound = Math.min(RETRY_VISIBILITY_TIMEOUT_MS, remaining - RETRY_VISIBILITY_MARGIN_MS);
+  }
+  await Promise.allSettled(
     handles.map(async (handle) => {
       if (!handle) {
         log.warn("retry visibility not shortened", { stage: "session-indexed", reason: "no_receipt_handle" });
         return;
       }
       let timer: ReturnType<typeof setTimeout> | undefined;
-      const timeout = new Promise<"timeout">((resolve) => (timer = setTimeout(() => resolve("timeout"), RETRY_VISIBILITY_TIMEOUT_MS)));
+      const timeout = new Promise<"timeout">((resolve) => (timer = setTimeout(() => resolve("timeout"), bound)));
       try {
-        const settled = await Promise.race([rv.change(handle, rv.seconds).then(() => "ok" as const), timeout]);
+        const settled = await Promise.race([rv.change(handle, rv.seconds, bound).then(() => "ok" as const), timeout]);
         if (settled === "timeout") log.warn("retry visibility not shortened", { stage: "session-indexed", reason: "change_visibility_timeout" });
       } catch (error) {
         log.warn("retry visibility not shortened", { stage: "session-indexed", reason: "change_visibility_failed", ...errorFields(error) });

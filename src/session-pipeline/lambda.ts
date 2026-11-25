@@ -310,14 +310,14 @@ export function sqsChangeVisibility(
   call: typeof awsJsonCall = awsJsonCall,
   credentials: () => AwsSessionCredentials = () => lambdaCredentials(),
 ): NonNullable<ConsumerDeps["retryVisibility"]>["change"] {
-  return async (receiptHandle, seconds) => {
+  return async (receiptHandle, seconds, timeoutMs) => {
     await call({
       service: "sqs",
       target: "AmazonSQS.ChangeMessageVisibility",
       region: env.region,
       body: { QueueUrl: env.queueUrl, ReceiptHandle: receiptHandle, VisibilityTimeout: seconds },
       credentials: credentials(),
-      timeoutMs: RETRY_VISIBILITY_TIMEOUT_MS,
+      timeoutMs: Math.min(timeoutMs, RETRY_VISIBILITY_TIMEOUT_MS),
     });
   };
 }
@@ -395,6 +395,14 @@ async function init(): Promise<Runtime> {
   });
   log.info("session pipeline ready", { stage: "init", ok: true, state: env.searchEnabled ? "search_on" : "search_off" });
   return { env, deps, brief };
+}
+
+/**
+ * Tests only: `handler` runs SQS batches over these consumer deps instead of init()'s (no secret,
+ * pool or S3); undefined clears it. Nothing in the Lambda runtime calls this.
+ */
+export function setRuntimeForTests(deps: ConsumerDeps | undefined): void {
+  runtime = deps ? Promise.resolve({ env: {} as LambdaEnv, deps, brief: (async () => {}) as unknown as Runtime["brief"] }) : undefined;
 }
 
 function ready(): Promise<Runtime> {
@@ -567,14 +575,21 @@ export interface LambdaInvocationContext {
 /**
  * The consumer deps for one SQS batch: `deps` itself unless streaming is armed; then the
  * search stage streams at most one scope of the batch (a second is requeued) and, with a
- * Lambda context, stops streaming at the remaining time less the margin.
+ * Lambda context, stops streaming at the remaining time less the margin. With retryVisibility
+ * armed and a Lambda context (streaming or not), the consumer reads the invocation's remaining time
+ * right before its ChangeMessageVisibility calls. Neither armed: `deps` itself.
  */
 export function invocationDeps(deps: ConsumerDeps, context?: LambdaInvocationContext, now: () => number = Date.now): ConsumerDeps {
+  const hasContext = typeof context?.getRemainingTimeInMillis === "function";
+  const out: ConsumerDeps =
+    deps.retryVisibility && hasContext
+      ? { ...deps, retryVisibility: { ...deps.retryVisibility, remainingMs: () => context!.getRemainingTimeInMillis() } }
+      : deps;
   const search = deps.search;
-  if (!search?.stream) return deps;
-  const remaining = typeof context?.getRemainingTimeInMillis === "function" ? context.getRemainingTimeInMillis() : NaN;
+  if (!search?.stream) return out;
+  const remaining = hasContext ? context!.getRemainingTimeInMillis() : NaN;
   return {
-    ...deps,
+    ...out,
     search: {
       ...search,
       streamSlot: { used: false },
