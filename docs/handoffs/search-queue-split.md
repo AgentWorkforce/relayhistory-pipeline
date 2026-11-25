@@ -147,7 +147,8 @@ Rollback (from C2), each step within the budget; the pool stays 3 throughout:
 
 Each stage rolls back to its agreed state, never to whatever ran before: the pointer cap's
 rollback is 20. A trial above the staged caps (for example an owner-approved 26) is not restored
-by this rollout; its own agreed rollback is 20, and the guard refuses any planned cap above 20.
+by this rollout; its own agreed rollback is 20, and the guard refuses any planned cap above 20. While the live pointer is at such a trial value, B is refused (B starts only from the settled
+Enabled/20); apply the trial's own rollback to 20 first.
 
 R1 is the fast rollback. Leave the search mapping enabled after it: records still in the search
 queue drain through it. With the URL unset they are `queue: "other"`, take the ordinary path
@@ -211,61 +212,70 @@ Consequences for this rollout:
 
 ## Deploy guard (stacks/aws/transcript-store.ts)
 
+- **Approved values, exactly** (`APPROVED` in `stacks/aws/transcript-store.ts`): live pointer 20,
+  split pointer 10, search 16, pool 3. Every stage is pinned to them from the plan's old -> new values
+  and the verified live state; budget compliance alone is not enough (pointer 12 / search 8, pool 2,
+  or a pointer of 26 are all refused even where they fit 80).
 - **session search queue rollout** (stage A): the search resources are created (all, or the rest
-  after a partial apply) and every other resource is noop. Each created resource's detailed block
-  must be exactly its rendered props (tags aside): the DLQ; the queue, whose policy names only the
-  pipeline role (the state snapshot's role, else one role in the production account) and whose
-  DLQ is the search DLQ; the mapping on the search queue for the pipeline function, with batch 10,
-  partial batch responses, MaximumConcurrency 2-20 and `enabled: false`; the two alarms with
-  `ActionsEnabled: false`.
-- **In place, while the search resources exist** (B, C1, C2, R1, R2, R3): a plan that touches a
-  search resource, the events mapping or the function is exactly one staged change, read from the
-  detailed plan as its whole old and new props (Alchemy prints a changed key's old value `-` and its
-  new value `+` among the unchanged lines), pinned, and compared with the verified live readback:
-  - B, R3: only `session-events-mapping`, only `scalingConfig.MaximumConcurrency`; old and new are
-    otherwise exactly its rendered props (the pipeline function, the events queue, batch 10, the
-    20 s window, partial batch responses, enabled). The plan's old cap must be the live cap (a stale
-    plan is refused); the live cap may be anything up to the account limit (1000, e.g. a trial at
-    26); the new cap must be within the staged 2-20.
-  - C1, R2: only `session-search-mapping`, only `enabled` and `MaximumConcurrency`, otherwise its
-    rendered props on the search queue for the pipeline function. The plan's old values must be
-    the live mapping's. R2 (disable) requires R1 first: the live env has no
-    `SESSION_PIPELINE_SEARCH_QUEUE_URL`.
-  - C2, R1: `session-pipeline` with the role-ARN cascade of its grants (the search queue's policy
-    included) and no non-env property change. Both the planned old -> new env and the env after the
-    apply against the **live** env (Alchemy writes the planned env whole) may differ by exactly one
-    key, `SESSION_PIPELINE_SEARCH_QUEUE_URL`: added with this stage's search queue URL (C2) or
-    removed (R1). Any other key the live env lacks and the apply would add (a stale
-    `SESSION_PIPELINE_RETRY_VISIBILITY_S`, for example), or the reverse, is refused. C2 also
-    requires the live search mapping to exist, be enabled, and point at this queue and function.
-  - Anything else is refused: a DLQ or alarm update, two of these in one plan, a function update
-    with a mapping change, any other resource beside them. A plan whose search resources are all
-    noop and that touches neither the events mapping nor the function (a read API update, say) is
-    judged by its own phase as before.
-  - The budget is recomputed from the plan's new values over **every enabled mapping on the
-    function** in the live readback; the new configured demand and the apply's worst moment must
-    both be within 80 (26 + 16 at pool 3 is 126: refused).
-- **Verified live source state** (`verifiedLive`): the readback must be this stage's function; every
-  mapping on it stable (`Enabled` or `Disabled`, never `Creating`, `Updating`, `Enabling`,
-  `Disabling` or `Deleting`), targeting this function, one of the two this stack declares (an
-  unknown or duplicate mapping is refused: its connections would be outside the budget), with the
-  rendered settings and a MaximumConcurrency within the account limit; the events mapping enabled.
-- **Bound to the capture.** The capture records the live function's RevisionId, an env digest (never
-  the values) and every mapping's UUID, state and settings in the provenance (`pipelineLive`). The
-  deploy reads the live function again and refuses unless that fingerprint is unchanged: a hand
-  edit, another apply or a mapping change since the capture means capturing again.
-- **No readback, no in-place change**: every in-place deploy and capture of the split is refused
-  without the live readback.
-- **Every pipeline plan**: an events mapping update is pinned as in B; and a function update may not
-  drop or silently overwrite a live variable: every key in the live env must be in the planned env
-  with its live value, unless the plan itself visibly changes or removes that key.
-- **The readback** (`stacks/aws/pipeline-live.ts`): `lambda get-function-configuration` and
-  `list-event-source-mappings`, read-only, held in memory. Empty output, unparseable output, a CLI
-  failure, a config without its name, RevisionId or env Variables, an `Environment.Error` (an env
-  the CLI could not read), a non-string value, another function's config and an incomplete mapping
-  are refused with fixed codes (`live_cli_failed`, `live_output_empty`, `live_parse_failed`,
-  `live_incomplete`, `live_env_error`, `live_wrong_function`). No CLI output, exception text or env
-  value is ever put in a message or log; guard refusals name env keys, never values.
+  after a partial apply) and every other resource is noop. Live baseline required, at capture and
+  at deploy: events mapping Enabled at exactly 20, `HOOPDB_POOL_MAX` exactly 3, no
+  `SESSION_PIPELINE_SEARCH_QUEUE_URL`, and no search mapping (after a partial apply only this stage's,
+  Disabled at 16). Each created resource's detailed block must be exactly its rendered props,
+  **tags included** (exactly `96bulls:component=session-pipeline`,
+  `96bulls:repo=AgentWorkforce/sessions-pipeline`, `96bulls:stack=aws-sessions-prod`; a foreign tag is
+  refused): the DLQ; the queue, whose policy names exactly the function's **live** role (from the
+  readback, so the deploy, which has no state snapshot, refuses any other role even in the same
+  account; at capture the role in state must equal it) and whose DLQ is the search DLQ; the
+  mapping on the search queue for the pipeline function, batch 10, partial batch responses,
+  MaximumConcurrency exactly 16, `enabled: false`; the two alarms with `ActionsEnabled: false`.
+- **In place, while the search resources exist**: a plan that touches a search resource, the events
+  mapping or the function must be exactly one approved stage, recognised from its old -> new values
+  and the live state (old values must equal the live ones: a stale plan is refused):
+
+  | stage | plan | live state required |
+  | --- | --- | --- |
+  | B | events mapping MaximumConcurrency 20 -> 10, nothing else | events Enabled 20, search Disabled 16, pool 3, no URL |
+  | C1 | search mapping `enabled` false -> true at 16, nothing else | events Enabled 10, search Disabled 16, pool 3, no URL |
+  | C2 | function env adds exactly `SESSION_PIPELINE_SEARCH_QUEUE_URL` (this stage's), pool exactly 3 | events Enabled 10, search Enabled 16 on this queue and function, pool 3, no URL |
+  | R1 | function env removes exactly that URL | events Enabled 10, search Enabled 16, pool 3, the URL |
+  | R2 | search mapping `enabled` true -> false at 16 | events Enabled 10, search Enabled 16, pool 3, no URL (R1 applied) |
+  | R3 | events mapping MaximumConcurrency 10 -> 20 | events Enabled 10, search Disabled 16, pool 3, no URL |
+
+  For C2 and R1 the full intended post-apply env (the planned new env, which Alchemy writes whole)
+  is compared with the live env: the URL is the only permitted delta, in the stage's direction; a
+  key the live env lacks and the apply would add (a stale `SESSION_PIPELINE_RETRY_VISIBILITY_S`, for
+  example), or the reverse, is refused. A code-only function update is not a split stage. Anything
+  else is refused: a DLQ or alarm update, two changes in one plan, a function update with a mapping
+  change, any other resource beside them, a planned cap outside the table (the trial value 26 is
+  never restored: R3's rollback state is 20). A plan whose search resources are all noop and that
+  touches neither the events mapping nor the function is judged by its own phase as before. The
+  budget over every enabled mapping is checked on top (26 + 16 at pool 3 is 126: refused).
+- **Verified live source state** (`verifiedLive`): exactly this stage's function (name and full
+  FunctionArn), `State: Active`, `LastUpdateStatus: Successful`, its role in the production account;
+  every mapping stable (`Enabled` or `Disabled`), targeting the unqualified function (a mapping on an
+  alias or a version is refused), one of the two this stack declares (unknown or duplicate refused),
+  with the rendered settings and a MaximumConcurrency read within the account limit.
+- **Bound to the capture.** The capture records the live function's FunctionArn, role, RevisionId,
+  aliases, versions, an env digest (never the values) and every mapping's UUID, state and settings in
+  the provenance (`pipelineLive`). The deploy reads the live function again and refuses any difference.
+- **No readback, no change**: stage A and every in-place change are refused without the live readback,
+  at capture and at deploy.
+- **Every pipeline plan**: an events mapping update is pinned as in B; and a function update's full
+  intended post-apply env is compared with the live env: the planned new env when the plan declares
+  an env change, the env in state when it does not (a code-only update still writes the stored env
+  whole). Every key that differs between them, in either direction, must be one the plan visibly
+  changes; with no declared change none may differ. At deploy, without state, a code-only update is
+  accepted only for the exact live function the capture compared (the fingerprint).
+- **The readback** (`stacks/aws/pipeline-live.ts`): `lambda get-function-configuration`,
+  `list-aliases`, `list-versions-by-function`, and `list-event-source-mappings` for the function, every
+  alias and every published version (a name-filtered listing need not show an alias's mapping), each
+  listing followed through `NextMarker` to its end (a page that fails or repeats refuses: never a
+  partial list), mappings deduplicated by UUID (one reported differently on two targets refuses).
+  External fields are checked against allow-lists (UUID format, state enum, ARN, role, alias,
+  version, env-key and response-type patterns) before any use, so no refusal can carry a malformed
+  value. Failures have fixed codes (`live_cli_failed`, `live_output_empty`, `live_parse_failed`,
+  `live_incomplete`, `live_env_error`, `live_wrong_function`, `live_not_settled`); no CLI output,
+  exception text or env value is ever put in a message; guard refusals name env keys, never values.
 - A plan that lists only some search resources is refused; delete and replace are refused.
 
 ## Per-queue guards
@@ -343,7 +353,7 @@ this branch cannot check them.
 
 | stage | actions |
 | --- | --- |
-| capture and deploy (every stage) | `lambda:GetFunctionConfiguration`, `lambda:ListEventSourceMappings` (live readback), plus the existing state-bucket reads |
+| capture and deploy (every stage) | `lambda:GetFunctionConfiguration`, `lambda:ListAliases`, `lambda:ListVersionsByFunction`, `lambda:ListEventSourceMappings` (live readback), plus the existing state-bucket reads |
 | A: queues | `sqs:CreateQueue`, `sqs:GetQueueUrl`, `sqs:GetQueueAttributes`, `sqs:SetQueueAttributes` (policy, redrive, timeouts, SSE), `sqs:TagQueue`, `sqs:UntagQueue`, `sqs:ListQueueTags`, `sqs:ListQueues` |
 | A: mapping | `lambda:CreateEventSourceMapping`, `lambda:GetEventSourceMapping`, `lambda:ListEventSourceMappings`, `lambda:TagResource`, `lambda:UntagResource`, `lambda:ListTags` (no `iam:PassRole`: the mapping uses the function's existing role) |
 | A: alarms | `cloudwatch:PutMetricAlarm`, `cloudwatch:DescribeAlarms`, `cloudwatch:TagResource`, `cloudwatch:UntagResource`, `cloudwatch:ListTagsForResource` |

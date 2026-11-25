@@ -790,19 +790,10 @@ describe("search-queue split: the deploy plan contract", () => {
     const summary = counts.size ? `Plan: ${[...counts].map(([a, c]) => `${c} to ${a}`).join(", ")}` : "Plan: no changes";
     return `${text.replace(/^Plan: .*$/m, summary)}\n`;
   };
-  const check = (full: string, state: string | undefined = snapshot) => {
-    const compact = `${full.split("\n").filter((l) => l.startsWith("Plan:") || isResourceLine(l)).join("\n")}\n`;
-    return assertTranscriptStorePlanContract(compact, {
-      detailedPlanText: full,
-      provenanceText: JSON.stringify({
-        schema: 1,
-        stage: STAGE,
-        outputs: { plan: { path: `docs/plans/${STAGE}.plan.txt`, sha256: h(compact) }, detailed: { path: `docs/plans/${STAGE}.plan.detailed.txt`, sha256: h(full) } },
-        summary: compact.split("\n")[0],
-      }),
-      stateSnapshotText: state,
-    });
-  };
+  /** Stage A's approved live baseline: events Enabled at 20, pool 3, no search mapping, no URL. */
+  const liveA = (o: Parameters<typeof live>[0] = {}) => live({ pointer: 20, search: null, ...o });
+  /** A stage-A capture (`state` null: the deploy's check, no state snapshot). */
+  const check = (full: string, state: string | null = snapshot, liveText: string = liveA()) => capture(full, liveText, state);
   const creates = (props = createProps(), only: readonly string[] = SESSION_SEARCH_QUEUE_RESOURCES) =>
     Object.fromEntries(only.map((r) => [r, { action: "create", body: ["  properties:", ...yaml(props[r], 4)] }]));
   /** A `-`/`+` diff of one key line inside a resource's properties. */
@@ -817,11 +808,29 @@ describe("search-queue split: the deploy plan contract", () => {
 
   it("stage A, provisioning only: the five creates pinned to their rendered props, with and without the state snapshot", () => {
     expect(check(detailed(creates()))).toBe("session search queue rollout");
-    expect(check(detailed(creates()), undefined)).toBe("session search queue rollout");
+    expect(check(detailed(creates()), null)).toBe("session search queue rollout");
     // The rest after a partial apply.
     expect(check(detailed(creates(createProps(), ["session-search-mapping", "session-search-age-alarm"])))).toBe("session search queue rollout");
     // All noop afterwards is post-apply.
     expect(check(detailed({}))).toBe("post-apply");
+  });
+
+  it("stage A control: only from the approved live baseline (events Enabled 20, pool 3, no search mapping, no URL), never without it", () => {
+    const a = detailed(creates());
+    expect(() => capture(a, undefined, null)).toThrow(/needs the live function and mapping readback \(the approved baseline\)/);
+    expect(() => capture(a, undefined)).toThrow(/the approved baseline/);
+    for (const [why, l] of [
+      ["pointer 26", liveA({ pointer: 26 })],
+      ["pointer 10", liveA({ pointer: 10 })],
+      ["pool 2", liveA({ env: { ...(fnProps({ ...SPLIT, searchQueue: Q }).env as object), HOOPDB_POOL_MAX: "2" } })],
+    ] as const)
+      expect([why, refusal(() => check(a, snapshot, l))]).toEqual([why, expect.stringMatching(/the live baseline is not the approved one/)]);
+    expect(() => check(a, snapshot, liveA({ search: "Enabled" }))).toThrow(/a live search mapping exists that is not this stage's/);
+    expect(() => check(a, snapshot, liveA({ env: fnProps(C2_ON).env as Record<string, unknown> }))).toThrow(/already has SESSION_PIPELINE_SEARCH_QUEUE_URL/);
+    // The function's role in state must be its live role.
+    expect(() => check(a, snapshot, liveA({ role: ROLE }))).toThrow(/role in state is not its live role/);
+    // After a partial apply: the stage's own search mapping, Disabled at 16, is accepted.
+    expect(check(detailed(creates(createProps(), ["session-search-age-alarm"])), snapshot, liveA({ search: "Disabled" }))).toBe("session search queue rollout");
   });
 
   it("the props parser reads a real Alchemy create block (the brief schedule in the checked-in production plan)", () => {
@@ -859,6 +868,10 @@ describe("search-queue split: the deploy plan contract", () => {
       ["mapping on the events queue", { "session-search-mapping": { ...mapping, eventSourceArn: p.queueArn } }, /\(eventSourceArn\)/],
       ["mapping for another function", { "session-search-mapping": { ...mapping, functionName: "someone-else" } }, /\(functionName\)/],
       ["mapping concurrency 50", { "session-search-mapping": { ...mapping, scalingConfig: { MaximumConcurrency: 50 } } }, /\(scalingConfig.MaximumConcurrency\)/],
+      ["mapping concurrency 8 (not the approved 16)", { "session-search-mapping": { ...mapping, scalingConfig: { MaximumConcurrency: 8 } } }, /\(scalingConfig.MaximumConcurrency\)/],
+      ["foreign ownership tags", { "session-search": { ...queue, tags: { ...tags, owner: "someone-else" } } }, /tags.owner is not rendered/],
+      ["another stage's tags", { "session-search-dlq": { ...base["session-search-dlq"], tags: { ...tags, "96bulls:stack": "aws-sessions-dev" } } }, /tags.96bulls:stack/],
+      ["no tags", { "session-search-mapping": { ...mapping, tags: undefined } }, /tags is not a map/],
       ["mapping batch size", { "session-search-mapping": { ...mapping, batchSize: 100 } }, /\(batchSize\)/],
       ["mapping with a filter", { "session-search-mapping": { ...mapping, filterCriteria: { Filters: [] } } }, /filterCriteria is not rendered/],
       ["queue granting another role", { "session-search": policy([stmts[0], { ...stmts[1], Principal: { AWS: ROLE } }]) }, /policy.Statement\[1\].Principal.AWS/],
@@ -881,8 +894,11 @@ describe("search-queue split: the deploy plan contract", () => {
       }
       expect([why, message]).toEqual([why, expect.stringMatching(error)]);
     }
-    // Without a snapshot the principal must still be one role in the production account.
-    expect(() => check(detailed(creates(createProps({ "session-search": policy([stmts[0], { ...stmts[1], Principal: { AWS: "arn:aws:iam::444455556666:role/x" } }]) }))), undefined)).toThrow(/Principal.AWS/);
+    // At deploy (no snapshot) the principal is still exactly the function's live role: an unrelated
+    // role in the same account, or another account's, is refused.
+    for (const other of [ROLE, "arn:aws:iam::444455556666:role/x"])
+      expect(() => check(detailed(creates(createProps({ "session-search": policy([stmts[0], { ...stmts[1], Principal: { AWS: other } }]) }))), null)).toThrow(/Principal.AWS/);
+    expect(check(detailed(creates()), null)).toBe("session search queue rollout");
     // A create block with no properties is refused.
     expect(() => check(detailed({ ...creates(), "session-search": { action: "create", body: [] } }))).toThrow(/no properties for session-search/);
   });
@@ -919,6 +935,9 @@ describe("search-queue split: the deploy plan contract", () => {
   const SPLIT = { searchIndex: true, maxConcurrency: 10, hoopdbPoolMax: 3 } as const;
   const Q = { enabled: true, maxConcurrency: 16 } as const;
   const FN_ARN = `arn:aws:lambda:${REGION}:${ACCOUNT}:function:${p.function}`;
+  const U_EVENTS = "11111111-1111-4111-8111-111111111111";
+  const U_SEARCH = "22222222-2222-4222-8222-222222222222";
+  const U_EXTRA = "33333333-3333-4333-8333-333333333333";
   const mapping = (eventSourceArn: string, state: string, max: number | undefined, uuid: string, over: Record<string, unknown> = {}) => ({
     uuid,
     eventSourceArn,
@@ -930,19 +949,22 @@ describe("search-queue split: the deploy plan contract", () => {
     ...(max === undefined ? {} : { maximumConcurrency: max }),
     ...over,
   });
-  /** The live readback (pipeline-live.ts PipelineLive): the function and every mapping on it. */
-  const live = (o: { env?: Record<string, unknown>; pointer?: number; search?: "Enabled" | "Disabled" | null; searchMax?: number; extra?: Record<string, unknown>[]; revision?: string; pointerOver?: Record<string, unknown> }) =>
-    JSON.stringify({
-      schema: 2,
-      function: { name: p.function, revisionId: o.revision ?? "rev-synthetic-1", env: o.env ?? (fnProps({ ...SPLIT, searchQueue: Q }).env as Record<string, string>) },
+  /** The live readback (pipeline-live.ts PipelineLive, schema 3): the function and every mapping on it. */
+  function live(o: { env?: Record<string, unknown>; pointer?: number; search?: "Enabled" | "Disabled" | null; searchMax?: number; extra?: Record<string, unknown>[]; revision?: string; role?: string; pointerOver?: Record<string, unknown>; fn?: Record<string, unknown> } = {}) {
+    return JSON.stringify({
+      schema: 3,
+      function: { name: p.function, functionArn: FN_ARN, role: o.role ?? LIVE_ROLE, revisionId: o.revision ?? "0a1b2c3d-0000-4000-8000-000000000001", state: "Active", lastUpdateStatus: "Successful", env: o.env ?? (fnProps({ ...SPLIT, searchQueue: Q }).env as Record<string, string>), ...o.fn },
+      aliases: [],
+      versions: ["$LATEST"],
       mappings: [
-        mapping(p.queueArn, "Enabled", o.pointer ?? 10, "uuid-events-synthetic", o.pointerOver),
-        ...(o.search === null ? [] : [mapping(p.searchQueueArn, o.search ?? "Disabled", o.searchMax ?? 16, "uuid-search-synthetic")]),
+        mapping(p.queueArn, "Enabled", o.pointer ?? 10, U_EVENTS, o.pointerOver),
+        ...(o.search === null ? [] : [mapping(p.searchQueueArn, o.search ?? "Disabled", o.searchMax ?? 16, U_SEARCH)]),
         ...(o.extra ?? []),
       ],
     });
+  }
   /** `state` null: the deploy's check (no state snapshot). `recorded`: the live text the capture saw (default: the same). */
-  const capture = (full: string, liveText?: string, state: string | null = snapshot, recorded: string | undefined = liveText) => {
+  function capture(full: string, liveText?: string, state: string | null = snapshot, recorded: string | undefined = liveText) {
     const compact = `${full.split("\n").filter((l) => l.startsWith("Plan:") || isResourceLine(l)).join("\n")}\n`;
     return assertTranscriptStorePlanContract(compact, {
       detailedPlanText: full,
@@ -956,32 +978,41 @@ describe("search-queue split: the deploy plan contract", () => {
       stateSnapshotText: state ?? undefined,
       liveSnapshotText: liveText,
     });
-  };
+  }
   const fnUpdate = (oldP: Record<string, unknown>, newP: Record<string, unknown>) => detailed({ "session-pipeline": update(oldP, newP), "session-search": searchCascade() }, true);
   const URL_KEY = "SESSION_PIPELINE_SEARCH_QUEUE_URL";
   const C1_BASE = { ...SPLIT, searchQueue: { ...Q, mappingEnabled: true } };
   const C2_ON = { ...SPLIT, searchQueue: { ...Q, mappingEnabled: true, handoff: true } };
+  const refusal = (run: () => unknown) => {
+    try {
+      run();
+      return "accepted";
+    } catch (e) {
+      return (e as Error).message;
+    }
+  };
 
-  it("B and R3: the pointer cap alone, pinned old -> new, old equal to the live cap", () => {
-    const b = detailed({ "session-events-mapping": update(eventsMapping(20), eventsMapping(10)) });
-    expect(capture(b, live({ pointer: 20 }))).toBe("session pipeline update");
+  it("B and R3: exactly 20 -> 10 and 10 -> 20, from the approved live state", () => {
+    expect(capture(detailed({ "session-events-mapping": update(eventsMapping(20), eventsMapping(10)) }), live({ pointer: 20 }))).toBe("session pipeline update");
     expect(capture(detailed({ "session-events-mapping": update(eventsMapping(10), eventsMapping(20)) }), live({}))).toBe("session pipeline update");
-    // Raising the pointer cap while search polls: (20 + 16) x 3 = 108.
+    // Raising the pointer cap while search polls: (20 + 16) x 3 = 108, over the budget.
     expect(() => capture(detailed({ "session-events-mapping": update(eventsMapping(10), eventsMapping(20)) }), live({ search: "Enabled" }))).toThrow(/108 pooler connections/);
+    // Other caps, even within the budget, are not approved stages.
+    for (const [a, b] of [[20, 8], [20, 12], [10, 12], [12, 10]] as const)
+      expect([a, b, refusal(() => capture(detailed({ "session-events-mapping": update(eventsMapping(a), eventsMapping(b)) }), live({ pointer: a })))]).toEqual([a, b, expect.stringMatching(/may move only 20 -> 10 \(B\) or 10 -> 20 \(R3\)/)]);
   });
 
   it("control 1: a stale B (plan 20 -> 10 while the live cap is 26) is refused", () => {
-    const stale = detailed({ "session-events-mapping": update(eventsMapping(20), eventsMapping(10)) });
-    expect(() => capture(stale, live({ pointer: 26 }))).toThrow(/the plan's old events mapping MaximumConcurrency 20 is not the live 26 \(a stale plan\)/);
+    expect(() => capture(detailed({ "session-events-mapping": update(eventsMapping(20), eventsMapping(10)) }), live({ pointer: 26 }))).toThrow(/the plan's old events mapping MaximumConcurrency 20 is not the live 26 \(a stale plan\)/);
   });
 
-  it("control 2: a truthful B (26 -> 10) is accepted; the new cap keeps the staged 2-20, and the rollback never restores 26", () => {
-    expect(capture(detailed({ "session-events-mapping": update(eventsMapping(26), eventsMapping(10)) }), live({ pointer: 26 }))).toBe("session pipeline update");
-    // The trial's agreed rollback is 20, not 26: a planned 26 is outside the staged caps.
+  it("control 2: B from 26 is not the approved stage (B needs the settled Enabled/20 precondition); a planned 26 is never restored", () => {
+    // The live 26 is read (within the account limit), but B is exactly 20 -> 10.
+    expect(() => capture(detailed({ "session-events-mapping": update(eventsMapping(26), eventsMapping(10)) }), live({ pointer: 26 }))).toThrow(/may move only 20 -> 10 \(B\)/);
     expect(() => capture(detailed({ "session-events-mapping": update(eventsMapping(10), eventsMapping(26)) }), live({}))).toThrow(/MaximumConcurrency must be 2-20/);
-    expect(capture(detailed({ "session-events-mapping": update(eventsMapping(10), eventsMapping(20)) }), live({}))).toBe("session pipeline update");
-    // Above the account limit, or uncapped, the live value is refused.
     expect(() => capture(detailed({ "session-events-mapping": update(eventsMapping(1001), eventsMapping(10)) }), live({ pointer: 1001 }))).toThrow(/no MaximumConcurrency within 2-1000/);
+    // B with the search mapping already polling, or the pool not 3, is not B either.
+    expect(() => capture(detailed({ "session-events-mapping": update(eventsMapping(20), eventsMapping(10)) }), live({ pointer: 20, env: { ...(fnProps({ ...SPLIT, searchQueue: Q }).env as object), HOOPDB_POOL_MAX: "2" } }))).toThrow(/B needs the live state events Enabled 20, search Disabled 16, HOOPDB_POOL_MAX 3/);
   });
 
   it("peak control: enabling search at 16 with the live pointer still 26 (pool 3) is 126 and refused", () => {
@@ -994,40 +1025,41 @@ describe("search-queue split: the deploy plan contract", () => {
       expect(() => capture(retarget(over, max), live({ pointer: 20 }))).toThrow(/session-events-mapping may change only its MaximumConcurrency/);
     const both = detailed({ "session-events-mapping": update(eventsMapping(20, { functionName: "someone-else" }), eventsMapping(10, { functionName: "someone-else" })) });
     expect(() => capture(both, live({ pointer: 20 }))).toThrow(/not its rendered props on the events queue \(functionName\)/);
-    // Pinned in every pipeline plan, search resources or not.
     const plain = REAL.replace(/^\[([a-z0-9-]+)\] update\n[\s\S]*?(?=\n\[)/gm, "[$1] noop\n").replace("[session-events-mapping] noop", `[session-events-mapping] update\n${update(eventsMapping(4), eventsMapping(4, { functionName: "someone-else" })).body.join("\n")}`);
     expect(() => capture(plain.replace(/^Plan: .*$/m, "Plan: 1 to update"), undefined, null)).toThrow(/session-events-mapping may change only its MaximumConcurrency/);
   });
 
-  it("C1 and R2: the search mapping alone, old values equal to the live mapping, budget over every enabled mapping", () => {
+  it("C1 and R2: the search mapping's enabled flipped at exactly 16, from the approved live state", () => {
     expect(capture(detailed({ "session-search-mapping": update(searchMapping(false), searchMapping(true)) }), live({}))).toBe("session pipeline update");
     expect(capture(detailed({ "session-search-mapping": update(searchMapping(true), searchMapping(false)) }), live({ search: "Enabled" }))).toBe("session pipeline update");
-    // Stale: the plan says disabled but the live mapping is enabled (or another cap).
     expect(() => capture(detailed({ "session-search-mapping": update(searchMapping(false), searchMapping(true)) }), live({ search: "Enabled" }))).toThrow(/is not the live one \(a stale plan\)/);
-    expect(() => capture(detailed({ "session-search-mapping": update(searchMapping(false), searchMapping(true)) }), live({ searchMax: 8 }))).toThrow(/is not the live one/);
-    // Enabling before the pointer cap is lowered: live pointer 20 -> 108.
     expect(() => capture(detailed({ "session-search-mapping": update(searchMapping(false), searchMapping(true)) }), live({ pointer: 20 }))).toThrow(/108 pooler connections/);
-    // No live search mapping at all.
     expect(() => capture(detailed({ "session-search-mapping": update(searchMapping(false), searchMapping(true)) }), live({ search: null }))).toThrow(/the live function has no search mapping/);
-    expect(() => capture(detailed({ "session-search-mapping": update(searchMapping(false), searchMapping(true, 16, { eventSourceArn: p.queueArn })) }), live({}))).toThrow(/may change only enabled or MaximumConcurrency/);
+    expect(() => capture(detailed({ "session-search-mapping": update(searchMapping(false), searchMapping(true, 16, { eventSourceArn: p.queueArn })) }), live({}))).toThrow(/may change only enabled/);
   });
 
-  it("negative control (b): the search cap raised 16 -> 20 at pointer 10 / pool 3 (90) is refused", () => {
-    expect(() => capture(detailed({ "session-search-mapping": update(searchMapping(true, 16), searchMapping(true, 20)) }), live({ search: "Enabled" }))).toThrow(/\(pointer 10 \+ search 20\) x pool 3 is 90 pooler connections/);
-    expect(capture(detailed({ "session-search-mapping": update(searchMapping(true, 16), searchMapping(true, 8)) }), live({ search: "Enabled" }))).toBe("session pipeline update");
+  it("C1 control: pointer 12 / search 8 (within budget) is not the approved C1", () => {
+    // The live pointer is 12 (not the settled 10): refused even though (12 + 16) x 3 = 84 would also fail; at 8 it is the cap.
+    expect(() => capture(detailed({ "session-search-mapping": update(searchMapping(false, 8), searchMapping(true, 8)) }), live({ pointer: 12, searchMax: 8 }))).toThrow(/MaximumConcurrency must be exactly 16/);
+    expect(() => capture(detailed({ "session-search-mapping": update(searchMapping(false), searchMapping(true)) }), live({ pointer: 8 }))).toThrow(/C1 needs the live state events Enabled 10, search Disabled 16/);
+    expect(() => capture(detailed({ "session-search-mapping": update(searchMapping(false), searchMapping(true)) }), live({ searchMax: 8 }))).toThrow(/C1 needs the live state/);
+  });
+
+  it("negative control (b): the search cap raised 16 -> 20 (90 at pointer 10 / pool 3), or lowered, is refused", () => {
+    expect(() => capture(detailed({ "session-search-mapping": update(searchMapping(true, 16), searchMapping(true, 20)) }), live({ search: "Enabled" }))).toThrow(/may change only enabled \(at 16\)/);
+    expect(() => capture(detailed({ "session-search-mapping": update(searchMapping(true, 16), searchMapping(true, 8)) }), live({ search: "Enabled" }))).toThrow(/may change only enabled \(at 16\)/);
   });
 
   it("control 4: R2 (disable search) is refused while the live env still has the handoff URL", () => {
-    const r2 = detailed({ "session-search-mapping": update(searchMapping(true), searchMapping(false)) });
-    expect(() => capture(r2, live({ search: "Enabled", env: fnProps(C2_ON).env as Record<string, unknown> }))).toThrow(/disabling the search mapping needs R1 first/);
+    expect(() => capture(detailed({ "session-search-mapping": update(searchMapping(true), searchMapping(false)) }), live({ search: "Enabled", env: fnProps(C2_ON).env as Record<string, unknown> }))).toThrow(/disabling the search mapping needs R1 first/);
   });
 
   it("control 5: an extra mapping on the function (an unknown, enabled, cap 20) is refused, not left out of the budget", () => {
     const c1 = detailed({ "session-search-mapping": update(searchMapping(false), searchMapping(true)) });
-    const extra = mapping(`arn:aws:sqs:${REGION}:${ACCOUNT}:someone-elses-queue`, "Enabled", 20, "uuid-extra-synthetic");
-    expect(() => capture(c1, live({ extra: [extra] }))).toThrow(/live mapping uuid-extra-synthetic is not one this stack declares/);
-    // A second mapping on the events queue too.
-    expect(() => capture(c1, live({ extra: [mapping(p.queueArn, "Enabled", 20, "uuid-dup-synthetic")] }))).toThrow(/is not one this stack declares \(or a duplicate\)/);
+    expect(() => capture(c1, live({ extra: [mapping(`arn:aws:sqs:${REGION}:${ACCOUNT}:someone-elses-queue`, "Enabled", 20, U_EXTRA)] }))).toThrow(new RegExp(`live mapping ${U_EXTRA} is not one this stack declares`));
+    expect(() => capture(c1, live({ extra: [mapping(p.queueArn, "Enabled", 20, U_EXTRA)] }))).toThrow(/is not one this stack declares \(or a duplicate\)/);
+    // A mapping on an alias or a version of the function is not on this function.
+    expect(() => capture(c1, live({ extra: [mapping(`arn:aws:sqs:${REGION}:${ACCOUNT}:x`, "Enabled", 4, U_EXTRA, { functionArn: `${FN_ARN}:live` })] }))).toThrow(/does not target this function/);
   });
 
   it("control 6: no in-place change is accepted without the live readback, at capture or at deploy", () => {
@@ -1041,22 +1073,29 @@ describe("search-queue split: the deploy plan contract", () => {
     }
   });
 
-  it("the verified source state: bound to the capture's RevisionId, mapping UUIDs, state and settings; stable mappings only", () => {
+  it("the verified source state: bound to the capture, this exact function Active/Successful, stable mappings, allow-listed fields", () => {
     const c1 = detailed({ "session-search-mapping": update(searchMapping(false), searchMapping(true)) });
-    // The deploy reads the live function again: a changed RevisionId, env, or mapping since the capture refuses.
-    expect(() => capture(c1, live({ revision: "rev-synthetic-2" }), null, live({}))).toThrow(/changed since the capture/);
+    expect(() => capture(c1, live({ revision: "0a1b2c3d-0000-4000-8000-000000000002" }), null, live({}))).toThrow(/changed since the capture/);
     expect(() => capture(c1, live({ env: { ...(fnProps({ ...SPLIT, searchQueue: Q }).env as object), EXTRA: "1" } }), null, live({}))).toThrow(/changed since the capture/);
-    expect(() => capture(c1, live({}), null, live({ pointerOver: { uuid: "uuid-events-other" } }))).toThrow(/changed since the capture/);
-    // A capture that did not record it.
+    expect(() => capture(c1, live({}), null, live({ pointerOver: { uuid: U_EXTRA } }))).toThrow(/changed since the capture/);
     expect(() => capture(c1, live({}), null, "")).toThrow(/did not record the live function/);
-    // Same readback at deploy: accepted.
     expect(capture(c1, live({}), null)).toBe("session pipeline update");
     for (const state of ["Creating", "Updating", "Enabling", "Disabling", "Deleting"])
-      expect(() => capture(c1, live({ pointerOver: { state } }))).toThrow(new RegExp(`live mapping uuid-events-synthetic is ${state}, not stable`));
+      expect(() => capture(c1, live({ pointerOver: { state } }))).toThrow(new RegExp(`live mapping ${U_EVENTS} is ${state}, not stable`));
     expect(() => capture(c1, live({ pointerOver: { functionArn: `${FN_ARN}-other` } }))).toThrow(/does not target this function/);
     expect(() => capture(c1, live({ pointerOver: { batchSize: 100 } }))).toThrow(/does not carry the rendered settings/);
     expect(() => capture(c1, live({ pointerOver: { maximumConcurrency: undefined } }))).toThrow(/no MaximumConcurrency/);
     expect(() => capture(c1, live({ pointerOver: { state: "Disabled" } }))).toThrow(/the live events mapping is not enabled/);
+    for (const fn of [{ functionArn: `${FN_ARN}:1` }, { state: "Pending" }, { lastUpdateStatus: "Failed" }, { name: "someone-else" }])
+      expect([fn, refusal(() => capture(c1, live({ fn })))]).toEqual([fn, expect.stringMatching(/not this stage's function, Active and Successful/)]);
+    // A malformed state or UUID is never echoed: a fixed refusal.
+    const canary = "Enabled-canary-state-55";
+    const msg = refusal(() => capture(c1, live({ pointerOver: { state: canary } })));
+    expect(msg).toMatch(/outside its allow-list/);
+    expect(msg).not.toContain("canary");
+    const msg2 = refusal(() => capture(c1, live({ pointerOver: { uuid: "canary-uuid-55" } })));
+    expect(msg2).toMatch(/outside its allow-list/);
+    expect(msg2).not.toContain("canary");
   });
 
   it("C2 and R1: the function env changes by exactly the search queue URL, against the plan and against the live env", () => {
@@ -1068,6 +1107,14 @@ describe("search-queue split: the deploy plan contract", () => {
     expect(() => capture(fnUpdate(off, { ...on, env: { ...(on.env as object), [URL_KEY]: p.queueUrl } }), live({ env: off.env as Record<string, unknown>, search: "Enabled" }))).toThrow(/may change only by adding or removing SESSION_PIPELINE_SEARCH_QUEUE_URL/);
     expect(() => capture(fnUpdate(off, { ...off, env: { ...(off.env as object), HOOPDB_POOL_MAX: "4" } }), live({ env: off.env as Record<string, unknown>, search: "Enabled" }))).toThrow(/HOOPDB_POOL_MAX changed/);
     expect(() => capture(fnUpdate(off, { ...on, memorySize: 10240 }), live({ env: off.env as Record<string, unknown>, search: "Enabled" }))).toThrow(/changes more than its env: memorySize/);
+    // A code-only function update while the search resources exist is not a split stage.
+    expect(() => capture(detailed({ "session-pipeline": { action: "update", body: ["  no declared property changes"] }, "session-search": searchCascade() }, true), live({ search: "Enabled" }))).toThrow(/must be C2 or R1/);
+  });
+
+  it("C2 control: pool 2 is not the approved C2 (pool exactly 3)", () => {
+    const pool2 = (pi: SessionPipelineInputs) => fnProps({ ...pi, hoopdbPoolMax: 2 });
+    const off = pool2(C1_BASE), on = pool2(C2_ON);
+    expect(() => capture(fnUpdate(off, on), live({ env: off.env as Record<string, unknown>, search: "Enabled" }))).toThrow(/HOOPDB_POOL_MAX must be exactly 3/);
   });
 
   it("control 3: C2 is refused unless the search mapping exists, is enabled, and points at this queue and function", () => {
@@ -1084,8 +1131,24 @@ describe("search-queue split: the deploy plan contract", () => {
     expect(() => capture(fnUpdate(off, on), live({ env: liveEnv, search: "Enabled" }))).toThrow(
       /after this apply the function env would differ from the live env by SESSION_PIPELINE_RETRY_VISIBILITY_S added, SESSION_PIPELINE_SEARCH_QUEUE_URL added; only SESSION_PIPELINE_SEARCH_QUEUE_URL may/,
     );
-    // The reverse for R1: a live key the plan does not render is dropped.
     expect(() => capture(fnUpdate(fnProps(C2_ON), fnProps(C1_BASE)), live({ env: { ...(fnProps(C2_ON).env as object), ...retry }, search: "Enabled" }))).toThrow(/SESSION_PIPELINE_RETRY_VISIBILITY_S removed/);
+  });
+
+  it("control (code-only update): the intended env is the env in state, compared in full with the live env", () => {
+    // REAL: a function update with no declared property change (and its grants' cascade), no search resources.
+    const codeOnly = REAL;
+    const stateWith = (env: Record<string, string>) =>
+      JSON.stringify({ schema: 1, objects: [{ key: `96bulls/96bulls-aws/${STAGE}/session-pipeline.json`, text: JSON.stringify({ status: "created", attr: { roleArn: LIVE_ROLE }, props: { env } }) }] });
+    const liveEnv = fnProps(SPLIT).env as Record<string, string>;
+    // The state holds SESSION_PIPELINE_RETRY_VISIBILITY_S=60, the live env lacks it: the apply would re-add it.
+    expect(() => capture(codeOnly, live({ env: liveEnv }), stateWith({ ...liveEnv, SESSION_PIPELINE_RETRY_VISIBILITY_S: "60" }))).toThrow(/the update would add SESSION_PIPELINE_RETRY_VISIBILITY_S/);
+    // The reverse: a live key the state lacks would be dropped.
+    expect(() => capture(codeOnly, live({ env: { ...liveEnv, SEARCH_INDEX_SKIP_OVER_BOUND_ENABLED: "true" } }), stateWith(liveEnv))).toThrow(/does not render \(the update would drop it\)/);
+    // Equal: accepted.
+    expect(capture(codeOnly, live({ env: liveEnv }), stateWith(liveEnv))).toBe("session pipeline update");
+    // At deploy (no state): only the very live function the capture compared.
+    expect(capture(codeOnly, live({ env: liveEnv }), null)).toBe("session pipeline update");
+    expect(() => capture(codeOnly, live({ env: liveEnv }), null, live({ env: { ...liveEnv, X: "1" } }))).toThrow(/is not the one the capture compared/);
   });
 
   it("negative control (c): the URL added while visibly removing SEARCH_INDEX_SKIP_OVER_BOUND_ENABLED is refused; so is an invisible loss", () => {
@@ -1101,15 +1164,11 @@ describe("search-queue split: the deploy plan contract", () => {
   });
 
   it("all search resources noop: an unrelated read-api update is judged by its own phase; mixed changes stay refused", () => {
-    // The same reader-only update with and without the five noop search entries.
     const readApi = REAL.replace(/^\[([a-z0-9-]+)\] update\n[\s\S]*?(?=\n\[)/gm, "[$1] noop\n");
     const withReader = (text: string) =>
       `${text.trimEnd()}\n\n${["session-read-api", "session-read-api-errors-alarm", "session-read-api-secret", "session-read-api-throttles-alarm"].map((r) => (r === "session-read-api" ? "[session-read-api] update\n  no declared property changes" : `[${r}] noop`)).join("\n\n")}\n`.replace(/^Plan: .*$/m, "Plan: 1 to update");
-    const without = withReader(readApi);
-    const withSearch = withReader(detailed({}));
-    expect(capture(without, undefined, null)).toBe("session read api update");
-    expect(capture(withSearch, undefined, null)).toBe("session read api update");
-    // Mixed with a staged change: still refused.
+    expect(capture(withReader(readApi), undefined, null)).toBe("session read api update");
+    expect(capture(withReader(detailed({})), undefined, null)).toBe("session read api update");
     const mixed = withReader(detailed({ "session-events-mapping": update(eventsMapping(20), eventsMapping(10)) })).replace(/^Plan: .*$/m, "Plan: 2 to update");
     expect(() => capture(mixed, live({ pointer: 20 }))).toThrow(/not one staged change/);
   });
@@ -1125,9 +1184,9 @@ describe("search-queue split: the deploy plan contract", () => {
 
   it("each staged capture is judged as the staged render says, against the live state of the stage before it", () => {
     const fn = (pi: SessionPipelineInputs) => fnProps(pi);
-    const liveOf = (pi: SessionPipelineInputs) => {
+    const liveOf = (pi: SessionPipelineInputs, first = false) => {
       const st = sessionPoolSettings(pi);
-      return live({ env: fn(pi).env as Record<string, unknown>, pointer: st.pointer, search: pi.searchQueue?.mappingEnabled ? "Enabled" : "Disabled", searchMax: pi.searchQueue?.maxConcurrency ?? 16 });
+      return live({ env: fn(pi).env as Record<string, unknown>, pointer: st.pointer, search: first ? null : pi.searchQueue?.mappingEnabled ? "Enabled" : "Disabled", searchMax: pi.searchQueue?.maxConcurrency ?? 16 });
     };
     const blocks: Record<string, (prev: SessionPipelineInputs, next: SessionPipelineInputs) => string> = {
       A: () => detailed(creates()),
@@ -1141,7 +1200,7 @@ describe("search-queue split: the deploy plan contract", () => {
     const chain = [...SEARCH_SPLIT_ROLLOUT, ...SEARCH_SPLIT_ROLLBACK];
     for (let n = 1; n < chain.length; n++) {
       const st = chain[n]!, prev = chain[n - 1]!;
-      expect([st.id, capture(blocks[st.id]!(prev.p, st.p), st.id === "A" ? undefined : liveOf(prev.p))]).toEqual([st.id, st.phase]);
+      expect([st.id, capture(blocks[st.id]!(prev.p, st.p), liveOf(prev.p, st.id === "A"))]).toEqual([st.id, st.phase]);
     }
   });
 });
@@ -1149,13 +1208,35 @@ describe("search-queue split: the deploy plan contract", () => {
 describe("search-queue split: the live readback", () => {
   const CANARY = "canary-env-value-7f3a";
   const REAL = readFileSync(fileURLToPath(new URL("./fixtures/aws-sessions-prod.pipeline-update.detailed.txt", import.meta.url)), "utf8");
+  const LIVE_ROLE = /^  - \s*AWS: (arn:aws:iam::\S+)$/m.exec(REAL)![1]!;
   const FN_ARN = `arn:aws:lambda:${REGION}:${ACCOUNT}:function:${p.function}`;
-  const okConfig = { FunctionName: p.function, RevisionId: "rev-synthetic-1", Environment: { Variables: { HOOPDB_POOL_MAX: "3", SECRETISH: CANARY } } };
-  const okMappings = { EventSourceMappings: [{ UUID: "u1", EventSourceArn: p.queueArn, FunctionArn: FN_ARN, State: "Enabled", BatchSize: 10, MaximumBatchingWindowInSeconds: 20, FunctionResponseTypes: ["ReportBatchItemFailures"], ScalingConfig: { MaximumConcurrency: 26 } }] };
-  const fake = (config: unknown, mappings: unknown = okMappings) => (_cmd: string, args: string[]) => {
-    const body = args[1] === "get-function-configuration" ? config : mappings;
-    if (body && typeof body === "object" && "fail" in (body as object)) return { status: 255, stdout: `${CANARY}`, stderr: (body as { fail: string }).fail };
-    return { status: 0, stdout: typeof body === "string" ? body : JSON.stringify(body), stderr: "" };
+  const U1 = "11111111-1111-4111-8111-111111111111";
+  const U2 = "22222222-2222-4222-8222-222222222222";
+  const okConfig = { FunctionName: p.function, FunctionArn: FN_ARN, Role: LIVE_ROLE, RevisionId: "0a1b2c3d-0000-4000-8000-000000000001", State: "Active", LastUpdateStatus: "Successful", Environment: { Variables: { HOOPDB_POOL_MAX: "3", SECRETISH: CANARY } } };
+  const esm = (uuid: string, over: Record<string, unknown> = {}) => ({ UUID: uuid, EventSourceArn: p.queueArn, FunctionArn: FN_ARN, State: "Enabled", BatchSize: 10, MaximumBatchingWindowInSeconds: 20, FunctionResponseTypes: ["ReportBatchItemFailures"], ScalingConfig: { MaximumConcurrency: 20 }, ...over });
+  type Responses = { config?: unknown; aliases?: unknown[]; versions?: unknown[]; mappings?: Record<string, unknown[]> };
+  /** A fake aws CLI. `mappings` by --function-name target, each a list of pages; `aliases`/`versions` lists of pages. */
+  const fake = (r: Responses = {}) => {
+    const calls: string[][] = [];
+    const pages = (list: unknown[] | undefined, field: string, marker: string | undefined) => {
+      const all = list ?? [{ [field]: [] }];
+      const at = marker === undefined ? 0 : Number(marker.slice(1));
+      return all[at];
+    };
+    const run = (_cmd: string, args: string[]) => {
+      calls.push(args);
+      const marker = args.includes("--marker") ? args[args.indexOf("--marker") + 1] : undefined;
+      const out = (body: unknown) => {
+        if (body && typeof body === "object" && "fail" in (body as object)) return { status: 255, stdout: CANARY, stderr: (body as { fail: string }).fail };
+        return { status: 0, stdout: typeof body === "string" ? body : JSON.stringify(body), stderr: "" };
+      };
+      if (args[1] === "get-function-configuration") return out(r.config ?? okConfig);
+      if (args[1] === "list-aliases") return out(pages(r.aliases, "Aliases", marker));
+      if (args[1] === "list-versions-by-function") return out(pages(r.versions ?? [{ Versions: [{ Version: "$LATEST" }] }], "Versions", marker));
+      const target = args[args.indexOf("--function-name") + 1]!;
+      return out(pages((r.mappings ?? { [p.function]: [{ EventSourceMappings: [esm(U1)] }] })[target] ?? [{ EventSourceMappings: [] }], "EventSourceMappings", marker));
+    };
+    return { run, calls };
   };
   const codeOf = (run: Parameters<typeof readPipelineLive>[0]) => {
     try {
@@ -1169,51 +1250,66 @@ describe("search-queue split: the live readback", () => {
     }
   };
 
-  it("reads the function, its RevisionId and env, and every mapping read-only; absent before the function exists", () => {
-    const calls: string[][] = [];
-    const run = (cmd: string, args: string[]) => {
-      calls.push([cmd, ...args]);
-      return fake(okConfig)(cmd, args);
-    };
-    const got = JSON.parse(readPipelineLive(run, STAGE, ACCOUNT, REGION)!);
-    expect(got).toEqual({
-      schema: 2,
-      function: { name: p.function, revisionId: "rev-synthetic-1", env: { HOOPDB_POOL_MAX: "3", SECRETISH: CANARY } },
-      mappings: [{ uuid: "u1", eventSourceArn: p.queueArn, functionArn: FN_ARN, state: "Enabled", batchSize: 10, maximumBatchingWindowInSeconds: 20, functionResponseTypes: ["ReportBatchItemFailures"], maximumConcurrency: 26 }],
+  it("reads the exact function (Active, Successful), its role, RevisionId and env, and the mappings of the function, every alias and every version", () => {
+    const f = fake({
+      aliases: [{ Aliases: [{ Name: "live" }], NextMarker: "m1" }, { Aliases: [{ Name: "canary" }] }],
+      versions: [{ Versions: [{ Version: "$LATEST" }, { Version: "3" }] }],
+      mappings: { [p.function]: [{ EventSourceMappings: [esm(U1)], NextMarker: "m1" }, { EventSourceMappings: [esm(U2, { EventSourceArn: p.searchQueueArn, State: "Disabled", ScalingConfig: { MaximumConcurrency: 16 } })] }], [`${FN_ARN}:live`]: [{ EventSourceMappings: [esm(U1)] }] },
     });
-    expect(calls.map((c) => c.slice(0, 3))).toEqual([["aws", "lambda", "get-function-configuration"], ["aws", "lambda", "list-event-source-mappings"]]);
-    // The fingerprint keeps the RevisionId and mappings, and only a digest of the env.
+    const got = JSON.parse(readPipelineLive(f.run, STAGE, ACCOUNT, REGION)!);
+    expect(got.schema).toBe(3);
+    expect(got.function).toEqual({ name: p.function, functionArn: FN_ARN, role: LIVE_ROLE, revisionId: okConfig.RevisionId, state: "Active", lastUpdateStatus: "Successful", env: { HOOPDB_POOL_MAX: "3", SECRETISH: CANARY } });
+    expect(got.aliases).toEqual(["live", "canary"]);
+    expect(got.versions).toEqual(["$LATEST", "3"]);
+    expect(got.mappings.map((m: { uuid: string }) => m.uuid)).toEqual([U1, U2]);
+    // Every listing follows NextMarker to the end; mappings are listed per alias and version (not $LATEST twice).
+    const targets = f.calls.filter((c) => c[1] === "list-event-source-mappings").map((c) => c[c.indexOf("--function-name") + 1]);
+    expect([...new Set(targets)]).toEqual([p.function, `${FN_ARN}:live`, `${FN_ARN}:canary`, `${FN_ARN}:3`]);
+    expect(f.calls.filter((c) => c[1] === "list-aliases").map((c) => c.includes("--marker"))).toEqual([false, true]);
+    expect(f.calls.every((c) => c.includes("--no-paginate") || c[1] === "get-function-configuration")).toBe(true);
+    // The fingerprint keeps RevisionId, role and mappings, and only a digest of the env.
     const fp = pipelineLiveFingerprint(got);
-    expect(fp.revisionId).toBe("rev-synthetic-1");
-    expect(fp.mappings.map((m) => m.uuid)).toEqual(["u1"]);
+    expect(fp.revisionId).toBe(okConfig.RevisionId);
+    expect(fp.role).toBe(LIVE_ROLE);
     expect(JSON.stringify(fp)).not.toContain(CANARY);
-    expect(readPipelineLive(fake({ fail: "An error occurred (ResourceNotFoundException) when calling GetFunctionConfiguration" }), STAGE, ACCOUNT, REGION)).toBeUndefined();
+    expect(readPipelineLive(fake({ config: { fail: "An error occurred (ResourceNotFoundException) when calling GetFunctionConfiguration" } }).run, STAGE, ACCOUNT, REGION)).toBeUndefined();
   });
 
-  it("refuses incomplete, redacted or unreadable output with fixed codes, never echoing the canary env value", () => {
-    expect(codeOf(fake(okConfig))).toBe("ok");
-    expect(codeOf(fake("", okMappings))).toBe("live_output_empty");
-    expect(codeOf(fake(`{"FunctionName":"${p.function}","Environment":{"Variables":{"X":"${CANARY}"`))).toBe("live_parse_failed");
-    expect(codeOf(fake({ fail: `AccessDenied ${CANARY}` }))).toBe("live_cli_failed");
+  it("refuses incomplete, redacted, unsettled or unreadable output with fixed codes, never echoing the canary env value", () => {
+    const cfg = (over: Record<string, unknown>) => fake({ config: { ...okConfig, ...over } }).run;
+    expect(codeOf(fake().run)).toBe("ok");
+    expect(codeOf(fake({ config: "" }).run)).toBe("live_output_empty");
+    expect(codeOf(fake({ config: `{"FunctionName":"${p.function}","Environment":{"Variables":{"X":"${CANARY}"` }).run)).toBe("live_parse_failed");
+    expect(codeOf(fake({ config: { fail: `AccessDenied ${CANARY}` } }).run)).toBe("live_cli_failed");
     expect(codeOf(() => { throw new Error(`spawn failed ${CANARY}`); })).toBe("live_cli_failed");
-    expect(codeOf(fake({ ...okConfig, Environment: { Error: { ErrorCode: "KMSAccessDeniedException", Message: `cannot decrypt ${CANARY}` } } }))).toBe("live_env_error");
-    expect(codeOf(fake({ ...okConfig, Environment: undefined }))).toBe("live_incomplete");
-    expect(codeOf(fake({ ...okConfig, Environment: { Variables: { X: 1 } } }))).toBe("live_incomplete");
-    expect(codeOf(fake({ ...okConfig, RevisionId: undefined }))).toBe("live_incomplete");
-    expect(codeOf(fake({ ...okConfig, FunctionName: "someone-else" }))).toBe("live_wrong_function");
-    expect(codeOf(fake(okConfig, {}))).toBe("live_incomplete");
-    expect(codeOf(fake(okConfig, `[${CANARY}`))).toBe("live_parse_failed");
-    expect(codeOf(fake(okConfig, { EventSourceMappings: [{ ...okMappings.EventSourceMappings[0], UUID: undefined }] }))).toBe("live_incomplete");
-    expect(codeOf(fake(okConfig, { fail: `throttled ${CANARY}` }))).toBe("live_cli_failed");
+    expect(codeOf(cfg({ Environment: { Error: { ErrorCode: "KMSAccessDeniedException", Message: `cannot decrypt ${CANARY}` } } }))).toBe("live_env_error");
+    expect(codeOf(cfg({ Environment: undefined }))).toBe("live_incomplete");
+    expect(codeOf(cfg({ Environment: { Variables: { X: 1 } } }))).toBe("live_incomplete");
+    expect(codeOf(cfg({ Environment: { Variables: { [`bad key ${CANARY}`]: "1" } } }))).toBe("live_incomplete");
+    expect(codeOf(cfg({ RevisionId: undefined }))).toBe("live_incomplete");
+    expect(codeOf(cfg({ Role: `not-a-role-${CANARY}` }))).toBe("live_incomplete");
+    expect(codeOf(cfg({ FunctionName: "someone-else" }))).toBe("live_wrong_function");
+    expect(codeOf(cfg({ FunctionArn: `arn:aws:lambda:${REGION}:${ACCOUNT}:function:someone-else` }))).toBe("live_wrong_function");
+    expect(codeOf(cfg({ FunctionArn: `${FN_ARN}:1` }))).toBe("live_wrong_function");
+    for (const over of [{ State: "Pending" }, { State: "Failed" }, { LastUpdateStatus: "InProgress" }, { LastUpdateStatus: "Failed" }]) expect([over, codeOf(cfg(over))]).toEqual([over, "live_not_settled"]);
+    expect(codeOf(fake({ mappings: { [p.function]: [{}] } }).run)).toBe("live_incomplete");
+    expect(codeOf(fake({ mappings: { [p.function]: [`[${CANARY}`] } }).run)).toBe("live_parse_failed");
+    expect(codeOf(fake({ mappings: { [p.function]: [{ EventSourceMappings: [esm(U1, { UUID: undefined })] }] } }).run)).toBe("live_incomplete");
+    expect(codeOf(fake({ mappings: { [p.function]: [{ EventSourceMappings: [esm(U1, { State: `Enabled ${CANARY}` })] }] } }).run)).toBe("live_incomplete");
+    expect(codeOf(fake({ mappings: { [p.function]: [{ EventSourceMappings: [esm(`uuid-${CANARY}`)] }] } }).run)).toBe("live_incomplete");
+    expect(codeOf(fake({ mappings: { [p.function]: [{ fail: `throttled ${CANARY}` }] } }).run)).toBe("live_cli_failed");
+    // Incomplete pagination: a NextMarker whose next page cannot be read, or that repeats, is refused, never a partial list.
+    expect(codeOf(fake({ mappings: { [p.function]: [{ EventSourceMappings: [esm(U1)], NextMarker: "m1" }, { fail: "page 2 failed" }] } }).run)).toBe("live_cli_failed");
+    expect(codeOf(fake({ mappings: { [p.function]: [{ EventSourceMappings: [esm(U1)], NextMarker: "m0" }] } }).run)).toBe("live_incomplete");
+    expect(codeOf(fake({ aliases: [{ Aliases: [{ Name: `bad alias ${CANARY}` }] }] }).run)).toBe("live_incomplete");
+    // The same UUID reported differently on two targets is refused.
+    expect(codeOf(fake({ aliases: [{ Aliases: [{ Name: "live" }] }], mappings: { [p.function]: [{ EventSourceMappings: [esm(U1)] }], [`${FN_ARN}:live`]: [{ EventSourceMappings: [esm(U1, { State: "Disabled" })] }] } }).run)).toBe("live_incomplete");
   });
 
   it("guard refusals about the live env name keys, never values", () => {
-    const run = fake({ ...okConfig, Environment: { Variables: { ...okConfig.Environment.Variables } } });
-    const text = readPipelineLive(run, STAGE, ACCOUNT, REGION)!;
-    const env = JSON.parse(text).function.env as Record<string, string>;
-    expect(env.SECRETISH).toBe(CANARY);
-    // A plan whose env lacks the live key: the general env-loss check refuses by name only.
-    // The captured #141 cascade: a code-only function update (no declared property changes), env from state.
+    const text = readPipelineLive(fake().run, STAGE, ACCOUNT, REGION)!;
+    expect(JSON.parse(text).function.env.SECRETISH).toBe(CANARY);
+    // The captured #141 cascade: a code-only function update, the intended env from state.
     const plan = REAL;
     const compact = `${plan.split("\n").filter((l) => l.startsWith("Plan:") || /^\[[a-z0-9-]+\] \S+$/.test(l)).join("\n")}\n`;
     const h2 = (x: string) => createHash("sha256").update(x).digest("hex");
@@ -1222,7 +1318,7 @@ describe("search-queue split: the live readback", () => {
       assertTranscriptStorePlanContract(compact, {
         detailedPlanText: plan,
         provenanceText: JSON.stringify({ schema: 1, stage: STAGE, outputs: { plan: { path: `docs/plans/${STAGE}.plan.txt`, sha256: h2(compact) }, detailed: { path: `docs/plans/${STAGE}.plan.detailed.txt`, sha256: h2(plan) } }, summary: compact.split("\n")[0] }),
-        stateSnapshotText: JSON.stringify({ schema: 1, objects: [{ key: `96bulls/96bulls-aws/${STAGE}/session-pipeline.json`, text: JSON.stringify({ status: "created", attr: { roleArn: /^  - \s*AWS: (arn:aws:iam::\S+)$/m.exec(REAL)![1] }, props: { env: { HOOPDB_POOL_MAX: "3" } } }) }] }),
+        stateSnapshotText: JSON.stringify({ schema: 1, objects: [{ key: `96bulls/96bulls-aws/${STAGE}/session-pipeline.json`, text: JSON.stringify({ status: "created", attr: { roleArn: LIVE_ROLE }, props: { env: { HOOPDB_POOL_MAX: "3" } } }) }] }),
         liveSnapshotText: text,
       });
     } catch (e) {
