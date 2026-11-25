@@ -99,19 +99,36 @@ BEGIN
    AND (a.org_id,a.workspace_id,a.user_id,a.origin_id)=(h.org_id,h.workspace_id,h.user_id,h.origin_id)
    AND (s.org_id,s.workspace_id,s.user_id,s.origin_id,s.batch_id,s.digest)=(a.org_id,a.workspace_id,a.user_id,a.origin_id,a.batch_id,a.digest)
    AND a.state='published' AND a.published_at IS NOT NULL;
+ -- A managed scope may have multiple live machines. Require provenance for
+ -- every eligible head; MAX alone silently ignores missing timestamps.
+ SELECT max(a.published_at) INTO STRICT publication_time
+ FROM sessions.ingest_publication_heads sibling
+ JOIN sessions.session_index p ON
+   (p.org_id,p.workspace_id,p.harness,p.session_id,p.machine_id,p.manifest_key,p.revision)=
+   (sibling.org_id,sibling.workspace_id,sibling.physical_source,sibling.physical_session,sibling.machine_id,sibling.current_key,sibling.pointer_revision)
+ LEFT JOIN sessions.ingest_publication_images i ON
+   (i.manifest_key,i.generation,i.pointer_revision,i.raw_sha256)=
+   (sibling.current_key,sibling.generation,sibling.pointer_revision,sibling.current_raw_sha256)
+ LEFT JOIN sessions.ingest_publication_attempts a ON a.attempt_token=i.attempt_token AND a.state='published'
+   AND (a.org_id,a.workspace_id,a.user_id,a.origin_id)=(sibling.org_id,sibling.workspace_id,sibling.user_id,sibling.origin_id)
+ WHERE sibling.state='live' AND p.deleted_at IS NULL AND p.scrubbed IS TRUE AND NOT p.scrub_quarantined
+   AND (p.org_id,p.workspace_id,p.harness,coalesce(p.canonical_session_id,p.session_id))=
+       (h.org_id,h.workspace_id,h.physical_source,canonical_id)
+ HAVING count(*)>0 AND count(*)=count(a.published_at);
  IF epoch IS NULL OR epoch NOT BETWEEN 0 AND 9007199254740991 OR h.pointer_revision>9007199254740991 OR canonical_id<>h.session_id
     OR position(chr(31) IN concat(h.org_id,h.workspace_id,h.physical_source,canonical_id))>0
  THEN RAISE EXCEPTION 'search wake: ambiguous directory scope'; END IF;
  key:=concat_ws(chr(31),'search',h.org_id,h.workspace_id,h.physical_source,canonical_id);
  wake:=jsonb_build_object('v',1,'stage','search-index','workKey',key,'revision',h.pointer_revision,
    'ctx',jsonb_build_object('traceId',trace,'orgId',h.org_id,'workspaceId',h.workspace_id,'harness',h.physical_source,'sessionId',canonical_id),
-   'payload',jsonb_build_object('epoch',epoch,'generation',h.generation,'schema_generation',evidence->>'schemaGeneration','published_at',to_char(publication_time AT TIME ZONE 'UTC','YYYY-MM-DD"T"HH24:MI:SS.US"Z"')));
+   'payload',jsonb_build_object('epoch',epoch,'generation',h.generation,'schema_generation',evidence->>'schemaGeneration','clock',jsonb_build_object('source','publish','at',to_char(publication_time AT TIME ZONE 'UTC','YYYY-MM-DD"T"HH24:MI:SS.US"Z"'))));
  INSERT INTO sessions.pipeline_jobs AS jobs(stage,work_key,trace_id,org_id,workspace_id,session_id,message,visible_at)
  VALUES('search-index',key,trace,h.org_id,h.workspace_id,canonical_id,wake,now())
  ON CONFLICT(work_key) WHERE stage='search-index'
- DO UPDATE SET message=CASE WHEN epoch>(jobs.message->'payload'->>'epoch')::bigint THEN excluded.message ELSE jobs.message END,
-   trace_id=CASE WHEN epoch>(jobs.message->'payload'->>'epoch')::bigint THEN excluded.trace_id ELSE jobs.trace_id END,
-   visible_at=CASE WHEN jobs.lease_id IS NULL AND NOT jobs.dlq THEN least(jobs.visible_at,excluded.visible_at) ELSE jobs.visible_at END;
+ DO UPDATE SET message=excluded.message, trace_id=excluded.trace_id,
+   attempts=0, dlq=false,
+   visible_at=CASE WHEN jobs.lease_id IS NULL THEN least(jobs.visible_at,excluded.visible_at) ELSE jobs.visible_at END
+ WHERE epoch>(jobs.message->'payload'->>'epoch')::bigint;
 END $$;
 REVOKE ALL ON FUNCTION sessions.enqueue_managed_search_wake_v1(jsonb,uuid) FROM PUBLIC;
 -- The queue/schema owner grants EXECUTE to the independently qualified indexer

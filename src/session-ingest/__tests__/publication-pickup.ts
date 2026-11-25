@@ -51,7 +51,7 @@ export async function checkPublicationPickup(pg:PGlite, store:ObjectStore, key:s
     expect((await tx.query("SELECT 1 FROM sessions.pipeline_jobs WHERE work_key=$1 AND stage='summary-short'",[job.workKey])).rows).toHaveLength(0);
     throw rollback;
   })).rejects.toBe(rollback);
-  const wakes=()=>pg.query<{work_key:string;message:StageMessage<{epoch:number;published_at:string}>}>(
+  const wakes=()=>pg.query<{work_key:string;message:StageMessage<{epoch:number;clock:{source:"publish";at:string}}>}>(
     "SELECT work_key,message FROM sessions.pipeline_jobs WHERE stage='search-index' AND org_id=$1 AND workspace_id=$2",[job.ctx.orgId,job.ctx.workspaceId]);
   expect((await wakes()).rows).toHaveLength(0);
   const {rows:[current]}=await pg.query<{evidence:Record<string,string>}>(`SELECT jsonb_build_object(
@@ -90,9 +90,9 @@ export async function checkPublicationPickup(pg:PGlite, store:ObjectStore, key:s
   await new MemoryPipelineQueue().send(emitted);
   expect(emitted).toMatchObject({v:1,stage:"search-index",workKey:wk,ctx:{traceId:job.ctx.traceId,orgId:scope.orgId,
     workspaceId:scope.workspaceId,harness:scope.harness,sessionId:head!.canonical},revision:head!.revision,
-    payload:{epoch:head!.epoch,generation:head!.generation,schema_generation:generation}});
+    payload:{clock:{source:"publish"},epoch:head!.epoch,generation:head!.generation,schema_generation:generation}});
   const clock=await pg.query("SELECT a.published_at=$1::text::timestamptz AS exact FROM sessions.ingest_publication_attempts a JOIN sessions.ingest_publication_images i USING(attempt_token) WHERE i.manifest_key=$2 AND i.generation=$3 AND i.pointer_revision=$4",
-    [emitted.payload.published_at,key,head!.generation,head!.revision]);
+    [emitted.payload.clock.at,key,head!.generation,head!.revision]);
   expect(clock.rows).toEqual([{exact:true}]);
   // Session-indexed ACK and search ACK are independent. Same-revision redelivery
   // passes the fanout early-return path and cannot duplicate the open wake.
@@ -120,7 +120,7 @@ export async function checkPublicationPickup(pg:PGlite, store:ObjectStore, key:s
     await tx.query("UPDATE sessions.pipeline_jobs SET lease_id=gen_random_uuid(),visible_at=now()+interval '5 minutes',attempts=2 WHERE id=$1",[prior!.id]);
     const [claimed]=await jobRow();
     await advance(3); await advance(4); await advance(0);
-    expect(await jobRow()).toEqual([{...claimed!,epoch:head!.epoch+4}]);
+    expect(await jobRow()).toEqual([{...claimed!,attempts:0,epoch:head!.epoch+4}]);
     // The consumer contract's guarded ACK cannot delete a newer wanted epoch.
     const deleted=await tx.query("DELETE FROM sessions.pipeline_jobs WHERE id=$1 AND lease_id=$2 AND (message->'payload'->>'epoch')::bigint <= $3 RETURNING id",
       [claimed!.id,claimed!.lease,claimed!.epoch]);
@@ -131,12 +131,53 @@ export async function checkPublicationPickup(pg:PGlite, store:ObjectStore, key:s
     await tx.query("UPDATE sessions.pipeline_jobs SET lease_id=gen_random_uuid(),attempts=3 WHERE id=$1",[claimed!.id]);
     await advance(5);
     await tx.query("UPDATE sessions.pipeline_jobs SET lease_id=NULL,visible_at=now()+interval '30 seconds' WHERE id=$1",[claimed!.id]);
-    expect(await jobRow()).toMatchObject([{id:claimed!.id,lease:null,epoch:head!.epoch+5,attempts:3}]);
-    // Preserve quarantine and its deadline, even if a new epoch wakes the scope.
+    expect(await jobRow()).toMatchObject([{id:claimed!.id,lease:null,epoch:head!.epoch+5,attempts:0}]);
+    // Equal or older epochs preserve quarantine and backoff. Only new work reopens it.
     await tx.query("UPDATE sessions.pipeline_jobs SET dlq=true,attempts=12 WHERE id=$1",[claimed!.id]);
     const [parked]=await jobRow();
+    await advance(5); await advance(1);
+    expect(await jobRow()).toEqual([parked!]);
     await advance(6);
-    expect(await jobRow()).toEqual([{...parked!,epoch:head!.epoch+6}]);
+    expect(await jobRow()).toMatchObject([{id:parked!.id,lease:null,dlq:false,attempts:0,epoch:head!.epoch+6}]);
+    expect((await jobRow())[0]!.visible).not.toBe(parked!.visible);
+    // Add a second machine with a later successful publish. Enqueue through
+    // the older machine and vary the sibling's canonical membership.
+    const siblingKey = key + ".sibling";
+    const siblingAttempt = crypto.randomUUID();
+    const later = "2090-01-01T00:00:00.000000Z";
+    await tx.query(`INSERT INTO sessions.ingest_publication_attempts
+      SELECT (jsonb_populate_record(a,jsonb_build_object('attempt_token',$2::uuid,'published_at',$3::text))).*
+      FROM sessions.ingest_publication_attempts a JOIN sessions.ingest_publication_images i USING(attempt_token)
+      WHERE i.manifest_key=$1`,[key,siblingAttempt,later]);
+    await tx.query(`INSERT INTO sessions.ingest_publication_images
+      SELECT (jsonb_populate_record(i,jsonb_build_object('attempt_token',$2::uuid,'manifest_key',$3::text))).*
+      FROM sessions.ingest_publication_images i WHERE manifest_key=$1`,[key,siblingAttempt,siblingKey]);
+    await tx.query(`INSERT INTO sessions.ingest_publication_heads
+      SELECT (jsonb_populate_record(h,jsonb_build_object('source','sibling','machine_id','sibling','current_key',$2::text))).*
+      FROM sessions.ingest_publication_heads h WHERE current_key=$1`,[key,siblingKey]);
+    await tx.query(`INSERT INTO sessions.session_index
+      SELECT (jsonb_populate_record(p,jsonb_build_object('machine_id','sibling','manifest_key',$2::text))).*
+      FROM sessions.session_index p WHERE manifest_key=$1`,[key,siblingKey]);
+    const currentClock=async()=>(await tx.query<{at:string}>(
+      "SELECT message #>> '{payload,clock,at}' AS at FROM sessions.pipeline_jobs WHERE stage='search-index' AND work_key=$1",[wk])).rows[0]!.at;
+    await advance(7);
+    expect(await currentClock()).toBe(later);
+    await tx.query("UPDATE sessions.session_index SET canonical_session_id='unrelated' WHERE manifest_key=$1",[siblingKey]);
+    await advance(8);
+    expect(await currentClock()).toBe(emitted.payload.clock.at);
+    await tx.query("UPDATE sessions.session_index SET canonical_session_id=$2 WHERE manifest_key=$1",[siblingKey,head!.canonical]);
+    await tx.query("UPDATE sessions.ingest_publication_heads SET state='retired' WHERE current_key=$1",[siblingKey]);
+    await advance(9);
+    expect(await currentClock()).toBe(emitted.payload.clock.at);
+    await tx.query("UPDATE sessions.ingest_publication_heads SET state='live' WHERE current_key=$1",[siblingKey]);
+    for (const manifest of [key,siblingKey]) {
+      await tx.exec("SAVEPOINT missing_clock");
+      await tx.query(`UPDATE sessions.ingest_publication_attempts a SET published_at=NULL
+        FROM sessions.ingest_publication_images i WHERE i.attempt_token=a.attempt_token AND i.manifest_key=$1`,[manifest]);
+      await expect(advance(10)).rejects.toMatchObject({code:"P0002"});
+      await tx.exec("ROLLBACK TO SAVEPOINT missing_clock");
+      await tx.exec("RELEASE SAVEPOINT missing_clock");
+    }
     throw rollbackEpoch;
   })).rejects.toBe(rollbackEpoch);
   // When the real source clock is absent, fail before touching the existing
