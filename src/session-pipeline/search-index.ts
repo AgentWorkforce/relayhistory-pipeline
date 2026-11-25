@@ -38,6 +38,7 @@
  */
 import { ARTIFACT_MAX_SOURCE_BYTES, ARTIFACT_MAX_SOURCE_RECORDS } from "../session-read-api/canonical-artifact.ts";
 import { readCanonicalScope } from "../session-read-api/canonical-projection.ts";
+import type { ContenderSeats } from "../session-read-api/contender-seats.ts";
 import {
   STREAM_DEADLINE,
   STREAM_KEYED_RECORDS_CAP,
@@ -69,7 +70,7 @@ import type { SqlExecutor } from "@rhc/lib/pipeline/queue.ts";
 import type { ClickHouseClient } from "./vendor/search-index/clickhouse.ts";
 import { tsMillis } from "./vendor/search-index/rows.ts";
 import { EVENTS_TABLE, INGEST_STATE_TABLE, SESSION_STATE_TABLE } from "./vendor/search-index/schema.ts";
-import { DEFAULT_WINDOW_DAYS, STATE_WINDOW_START, chNow, deleteRows, readState, windowStart, type PendingDelete } from "./vendor/search-index/reconcile.ts";
+import { DEFAULT_WINDOW_DAYS, DELETE_BYTES_BUDGET, STATE_WINDOW_START, chNow, deleteRows, readState, windowStart, type PendingDelete } from "./vendor/search-index/reconcile.ts";
 import { scopeLockKey, type SessionScope } from "./pointer.ts";
 import { directoryCatalogWriter, type writeDirectoryCatalog } from "../hoopdb/session-directory-catalog.ts";
 import { writeDirectoryEvents, invalidateDirectoryEvents, completeErasedDirectoryEvents } from "../hoopdb/session-directory-events.ts";
@@ -443,6 +444,11 @@ export interface SearchIndexResult {
    * nothing was read from the object store and nothing was written.
    */
   skippedBeforeRead?: true;
+  /**
+   * Only on a whole-read pass that read and ended with `relayhistory_acceptance_missing` (never on a skipped pass):
+   * how the refused contender groups looked (session-read-api/contender-seats.ts). Telemetry only.
+   */
+  contenderSeats?: ContenderSeats;
 }
 
 /**
@@ -450,6 +456,50 @@ export interface SearchIndexResult {
  * invocation's; the backport lineage's value). Only a pass with a deadline (the hosted Lambda) checks it.
  */
 export const STREAM_MIN_START_MS = 120_000;
+/**
+ * The streamed pass's tail (its delete batches, then the directory and catalog writes, the state row and COMMIT)
+ * is not started with less than this left before the stream deadline (the backport lineage's 51f876b6): with the
+ * 60 s margin behind the deadline that leaves about 90 s to the function timeout.
+ */
+export const STREAM_TAIL_RESERVE_MS = 30_000;
+/** Keys per DELETE statement of the hosted streamed pass (deleteRows' own key batch, as on the backport). */
+const STREAM_DELETE_BATCH = 500;
+
+/**
+ * Split `deletes` into chunks deleteRows sends as one statement each: at most STREAM_DELETE_BATCH keys, and an
+ * upper bound of each key's literal (every text field escaped at worst to twice its UTF-8 length, the 64-hex digest,
+ * the timestamp and the tuple's punctuation) summed within DELETE_BYTES_BUDGET.
+ */
+export function deleteStatementChunks(scope: SessionScope, deletes: readonly ScopeIdentity[]): ScopeIdentity[][] {
+  const utf8 = (v: string) => Buffer.byteLength(v, "utf8");
+  const bound = (d: ScopeIdentity) =>
+    2 * (utf8(scope.orgId) + utf8(d.sessionId) + utf8(d.workspaceId) + utf8(d.machineId) + utf8(d.source) + utf8(d.kind)) + 64 + 24 + 32;
+  const chunks: ScopeIdentity[][] = [];
+  let chunk: ScopeIdentity[] = [];
+  let bytes = 0;
+  for (const d of deletes) {
+    const size = bound(d);
+    if (chunk.length > 0 && (chunk.length >= STREAM_DELETE_BATCH || bytes + size > DELETE_BYTES_BUDGET)) {
+      chunks.push(chunk);
+      chunk = [];
+      bytes = 0;
+    }
+    chunk.push(d);
+    bytes += size;
+  }
+  if (chunk.length > 0) chunks.push(chunk);
+  return chunks;
+}
+/** The keepalive of a hosted streamed pass found the transaction no longer holds the scope lock. */
+export const STREAM_KEEPALIVE_FAILED = "stream_keepalive_failed";
+
+/**
+ * The hosted Lambda's streamed-pass guards (the backport lineage's e79df11b, 6264d119, 51f876b6) apply to a pass
+ * that carries the invocation's stream slot: lambda.ts invocationSearchDeps gives one to every invocation with
+ * SEARCH_INDEX_STREAMING_CH=1, on the SQS path and the scheduled search-jobs path. The self-host consumer never
+ * sets a slot, so its streamed pass is unchanged.
+ */
+const hostedStream = (deps: SearchIndexDeps): boolean => deps.streamSlot !== undefined;
 
 /** The reason code a pass returned before any manifest read adds to the outcome it repeats. */
 export const SKIPPED_BEFORE_READ = "skipped_before_read";
@@ -875,7 +925,7 @@ async function indexSearchScopeBase(scope: SessionScope, deps: SearchIndexDeps, 
         const prior = await pgFacts.previousState(fScope);
         await pgFacts.recordState(fScope, { complete: false, at, range: prior.range, sourceVersion: Number(pointerSnapshot.epoch) });
       }
-      return settle({manifests:s3.manifests,rows:0,inserted:0,deleted:0,complete:false,...(s3.partial?{partial:true}:{}),reasons:s3.reasons.length?s3.reasons:["canonical_metadata_incomplete"]});
+      return settle({manifests:s3.manifests,rows:0,inserted:0,deleted:0,complete:false,...(s3.partial?{partial:true}:{}),reasons:s3.reasons.length?s3.reasons:["canonical_metadata_incomplete"],...(s3.contenderSeats!==undefined?{contenderSeats:s3.contenderSeats}:{})});
     }
     const inWindow = s3.rows.filter((r) => tsMillis(`${r.ts.replace(" ", "T")}Z`) >= fromMs);
     // Staged: keyset pages up to the keyed-records cap (never below SEARCH_INDEX_MAX_ROWS).
@@ -1758,11 +1808,39 @@ async function streamedReconcile(
   // well inside that, at most every STREAM_KEEPALIVE_MS, or now when `force`d.
   const everyMs = deps.streamKeepaliveMs ?? STREAM_KEEPALIVE_MS;
   let pinged = Number.NEGATIVE_INFINITY;
+  const hosted = hostedStream(deps);
   const keepalive = async (force = false): Promise<void> => {
     if (!force && Date.now() - pinged < everyMs) return;
+    if (hosted) {
+      // Hosted (the backport's keepalive): re-take the lock this transaction already holds (re-entrant, so the
+      // answer must be true). Anything else means it is not the transaction the pass started in: stop, with no
+      // further write and no finalization (the message fails for redelivery; the pre-mark below owes a pass).
+      pinged = Date.now();
+      const { rows } = await tx.query<{ ok: boolean }>("SELECT pg_try_advisory_xact_lock(hashtextextended($1, 0)) AS ok", [scopeLockKey(scope, "search")]);
+      if (rows[0]?.ok !== true) throw new PipelineError(STREAM_KEEPALIVE_FAILED, "the streamed reconcile's keepalive did not hold the scope lock", true);
+      return;
+    }
     await tx.query("SELECT 1 AS stream_keepalive");
     pinged = Date.now();
   };
+  if (hosted) {
+    // Before anything is read or written (the backport's pre-mark): the session owes a full pass until this one
+    // ends complete, also if the invocation dies on the way. One millisecond earlier than the pass's own state
+    // row, so that row replaces it (ReplacingMergeTree(synced_at)).
+    await io.record(scope, revision, 0, false, new Date(at.getTime() - 1), pointerSnapshot.canonicalId);
+    try {
+      return await streamedReconcileBody();
+    } catch (error) {
+      // Anything but a budget stop (a retryable read, the keepalive, ClickHouse) fails the message for redelivery;
+      // what was inserted stays and the session is left owing a full pass. Best effort: the consumer sees the
+      // original error.
+      await io.record(scope, revision, 0, false, at, pointerSnapshot.canonicalId).catch(() => {});
+      throw error;
+    }
+  }
+  return streamedReconcileBody();
+
+  async function streamedReconcileBody(): Promise<SearchIndexResult> {
   const read = await streamCanonicalScope(
     scope, admitted,
     {
@@ -1777,10 +1855,10 @@ async function streamedReconcile(
     budget, version, fromMs,
   );
   const stream = () => ({ passes: read.meter.passes, chunks: read.meter.chunks, bytes: read.meter.bytes, events: read.meter.events });
-  const owing = async (reasons: string[], partial: boolean, inserted = 0): Promise<SearchIndexResult> => {
+  const owing = async (reasons: string[], partial: boolean, inserted = 0, deleted = 0): Promise<SearchIndexResult> => {
     await invalidateDirectoryEvents(tx, scope);
     await io.record(scope, revision, 0, false, at, pointerSnapshot.canonicalId);
-    return { manifests: read.manifests, rows: 0, inserted, deleted: 0, complete: false, ...(partial ? { partial: true } : {}), reasons, stream: stream() };
+    return { manifests: read.manifests, rows: 0, inserted, deleted, complete: false, ...(partial ? { partial: true } : {}), reasons, stream: stream() };
   };
   if (!read.complete || read.directorySessionId !== pointerSnapshot.canonicalId || read.events === null)
     return owing(read.reasons.length ? read.reasons : ["canonical_metadata_incomplete"], read.partial);
@@ -1814,6 +1892,8 @@ async function streamedReconcile(
     await keepalive(true);
   } catch (error) {
     if (error instanceof StreamBudgetError) return owing(["scope_too_large", error.budget], true);
+    // An untrusted keyset scan (the backport's clickhouse_page_invalid stop): nothing written, the pass is owed.
+    if (error instanceof PipelineError && error.code === SCAN_PAGE_INVALID) return owing([SCAN_PAGE_INVALID], false);
     throw error;
   }
   if (deps.staged && io.scanPages && scan.truncated) return owing(["scope_too_large", STREAM_KEYED_RECORDS_CAP], true);
@@ -1866,6 +1946,22 @@ async function streamedReconcile(
           deletes.push(c);
       }
     }
+    // Hosted: before the tail and every later delete batch, the deadline with STREAM_TAIL_RESERVE_MS, and the
+    // lock before every batch (unthrottled). A stop between batches keeps what was deleted (rows the source no
+    // longer has) and owes a pass for the rest; a stop before the first batch also skips the directory write.
+    const tailReserved = () => hosted && !!deadline && deadline.at - (deadline.now ?? Date.now)() < STREAM_TAIL_RESERVE_MS;
+    if (tailReserved()) return owing(["scope_too_large", STREAM_DEADLINE], true, inserted);
+    if (hosted) {
+      // Hosted: deletes go in chunks that each fit one DELETE statement of deleteRows (at most STREAM_DELETE_BATCH
+      // keys and, by an upper-bound estimate, within its byte budget), and every chunk, so every statement, is
+      // preceded by the tail reserve check (after the first) and an unthrottled lock check.
+      const chunks = deleteStatementChunks(scope, deletes);
+      for (const [n, chunk] of chunks.entries()) {
+        if (n > 0 && tailReserved()) return owing(["scope_too_large", STREAM_DEADLINE], true, inserted, deletedCount);
+        await keepalive(true);
+        deletedCount += await io.remove(scope, chunk);
+      }
+    } else
     // In insert-sized batches, keeping the transaction busy between them.
     for (let i = 0; i < deletes.length; i += limits.insertBatch) {
       await keepalive();
@@ -1890,6 +1986,7 @@ async function streamedReconcile(
     reasons: [...read.reasons, ...reasons, ...(truncated ? ["search_index_truncated"] : []), ...(staleWrite ? ["search_version_conflict"] : [])],
     stream: stream(),
   };
+  }
 }
 
 /**
@@ -2351,6 +2448,22 @@ export async function clickhouseScopePage(
   }));
 }
 
+/** A keyset page that is over its LIMIT, out of order, or does not advance past the previous page. */
+export const SCAN_PAGE_INVALID = "clickhouse_page_invalid";
+
+/** The keyset order of clickhouseScopePage: (ts, session_id, machine_id, kind, event_id), strings as UTF-8 bytes. */
+export function compareScopePageKey(
+  a: Pick<ScopeIdentity, "tsMs" | "sessionId" | "machineId" | "kind" | "eventId">,
+  b: Pick<ScopeIdentity, "tsMs" | "sessionId" | "machineId" | "kind" | "eventId">,
+): number {
+  if (a.tsMs !== b.tsMs) return a.tsMs < b.tsMs ? -1 : 1;
+  for (const [x, y] of [[a.sessionId, b.sessionId], [a.machineId, b.machineId], [a.kind, b.kind], [a.eventId, b.eventId]] as const) {
+    const c = Buffer.compare(Buffer.from(x, "utf8"), Buffer.from(y, "utf8"));
+    if (c !== 0) return c;
+  }
+  return 0;
+}
+
 /** Preserve the existing SQL, retention and state behavior for an unselected
  * legacy deployment. Portable adapters never implement a fake SQL client. */
 export function legacyProjectionIo(ch: ClickHouseClient): LegacyProjectionIo {
@@ -2364,10 +2477,18 @@ export function legacyProjectionIo(ch: ClickHouseClient): LegacyProjectionIo {
         if (after) await between();
         const want = Math.min(pageSize, maxRows + 1 - rows.length);
         const page = await clickhouseScopePage(ch, scope, canonicalId, fromMs, want, after);
-        for (const r of page) rows.push(r);
+        // The backport lineage's page checks (6264d119 / 51f876b6), before anything is projected or written: at
+        // most the rows asked for, in strictly increasing keyset order (ts, session_id, machine_id, kind,
+        // event_id; strings as UTF-8 bytes, as ClickHouse compares them), and after the previous page's last key.
+        // Otherwise the scan is not trusted (SCAN_PAGE_INVALID).
+        if (page.length > want) throw new PipelineError(SCAN_PAGE_INVALID, "a keyset page returned more rows than asked", false);
+        for (const r of page) {
+          if (after && compareScopePageKey(after, r) >= 0) throw new PipelineError(SCAN_PAGE_INVALID, "a keyset page is out of order or does not advance", false);
+          after = r;
+          rows.push(r);
+        }
         if (rows.length > maxRows) return { rows, truncated: true };
         if (page.length < want) return { rows, truncated: false };
-        after = page[page.length - 1];
       }
     },
     async fromMs(at) { return Date.parse(await windowStart(ch, at)); },

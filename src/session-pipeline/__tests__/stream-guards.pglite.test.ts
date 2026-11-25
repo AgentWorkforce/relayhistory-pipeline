@@ -20,16 +20,9 @@ import type { HoopDb } from "../../shared/db.ts";
 import { ID, T0, USER, exportStreamScope, generate, type ExportedScope } from "../../session-read-api/__tests__/stream-fixture.ts";
 import { exportUnit } from "../../migration/neon-s3-sync/export-session.ts";
 import { closeReplayTemplate, warmReplayTemplate } from "./replay-fixture.ts";
-import { hostedRig } from "./search-index-hosted-harness.ts";
+import { MARGIN, STREAM_ENV, THRESHOLD, TINY, UNLIMITED, ctx, deferred, frozen, reconciled, streamRig } from "./stream-rig.ts";
 import { captureLogs } from "./search-index-skip-flags-harness.ts";
 
-const TINY = { maxScopeBytes: 1, maxScopeEvents: 1 };
-const UNLIMITED = { maxReadBytes: 1 << 30, maxReadEvents: 1 << 24 };
-const MARGIN = 60_000;
-const STREAM_ENV = { searchStreamCh: { ...UNLIMITED, deadlineMarginMs: MARGIN } };
-/** Remaining time at which the stream deadline is exactly STREAM_MIN_START_MS away. */
-const THRESHOLD = STREAM_MIN_START_MS + MARGIN;
-const SECOND = { ...ID, sessionId: "stream:second" };
 
 const cleanup: Array<() => Promise<unknown>> = [];
 afterEach(async () => {
@@ -38,56 +31,7 @@ afterEach(async () => {
 beforeAll(() => warmReplayTemplate(), 120_000);
 afterAll(() => closeReplayTemplate());
 
-/** Two sessions in one store, each too large for the whole read (TINY) and small enough to stream. */
-async function twoScopes(): Promise<ExportedScope & { allKeys: string[] }> {
-  const x = await exportStreamScope(generate(33), 1200);
-  cleanup.push(x.dispose);
-  const encoder = new TextEncoder();
-  const second = await exportUnit({ store: x.store, keyRoot: "96bulls", grantId: "stream_parity", maxChunkBytes: 1200 },
-    { orgId: SECOND.orgId, workspaceId: SECOND.workspaceId, source: SECOND.source, sessionId: SECOND.sessionId, firstMs: T0, lastMs: T0 + 60_000, machineIds: [], totals: {} },
-    { fenced: async () => false, async *lines() { for (const { machine, record } of generate(35)) yield { machine, userId: USER, bytes: encoder.encode(JSON.stringify(record) + "\n") }; } });
-  return { ...x, allKeys: [...x.keys, ...second.manifests.map((m) => m.manifestKey)] };
-}
-
-/** A pg client over the PGlite session that can drop its "connection" (emit 'error'), as pg's client does. */
-class PgliteClient extends EventEmitter {
-  released: Array<Error | undefined> = [];
-  constructor(private pg: PGlite) { super(); }
-  query(text: string, params?: unknown[]) { return this.pg.query(text, params as unknown[]); }
-  release(error?: Error) { this.released.push(error); }
-}
-/** A HoopDb whose pool hands out PgliteClients (the last one is kept for the test). */
-function pgliteHoopDb(pg: PGlite) {
-  const clients: PgliteClient[] = [];
-  const db = {
-    pool: { connect: async () => { const c = new PgliteClient(pg); clients.push(c); return c; } },
-    query: async (text: string, params?: unknown[]) => ({ rows: (await pg.query(text, params as unknown[])).rows }),
-    end: async () => {},
-  } as unknown as HoopDb;
-  return { db, clients };
-}
-
-async function rig(opts: { env?: Partial<Runtime["env"]>; search?: Partial<SearchIndexDeps> } = {}) {
-  const x = await twoScopes();
-  const r = await hostedRig(x, cleanup);
-  const messages = x.allKeys.map((key, n) => ({ messageId: `m-${n}`, body: JSON.stringify({ reconcile: { key } }) }));
-  const pool = pgliteHoopDb(r.db.pg);
-  const base = r.consumer({ limits: TINY, stream: UNLIMITED, ...opts.search });
-  const deps = { ...base, pointer: { ...base.pointer, db: { ...(base.pointer.db as object), pool: pool.db.pool } as never } };
-  const rt = { env: { ...STREAM_ENV, ...opts.env }, deps } as unknown as Runtime;
-  const handler = createPipelineLambdaHandler({ loadRuntime: async () => rt });
-  return { x, r, rt, handler, messages, pool };
-}
-
-/** Runs `work` with Date.now frozen at `at` (so the threshold arithmetic is exact). */
-async function frozen<T>(at: number, work: () => Promise<T>): Promise<T> {
-  const real = Date.now;
-  Date.now = () => at;
-  try { return await work(); } finally { Date.now = real; }
-}
-const ctx = (remaining: number) => ({ getRemainingTimeInMillis: () => remaining });
-const reconciled = (lines: Array<Record<string, unknown>>) => lines.filter((l) => l.message === "search index reconciled");
-const deferred = (lines: Array<Record<string, unknown>>) => lines.filter((l) => l.message === "search index stream deferred, requeued");
+const rig = (opts: Parameters<typeof streamRig>[1] = {}) => streamRig(cleanup, opts);
 
 describe("STREAM_MIN_START_MS through the real handler", () => {
   test("remaining just below the threshold: no stream starts; both scopes deferred and requeued, nothing failed", async () => {
@@ -217,45 +161,114 @@ describe("the scheduled {searchJobs:true} path carries the same guards; M2 settl
   }
   const settled = (lines: Array<Record<string, unknown>>) => lines.filter((l) => l.message === "search job settled").map((l) => ({ outcome: l.outcome, state: l.state, reason: l.reason }));
 
-  async function scheduled(remaining: number | undefined, prepare?: (s: Awaited<ReturnType<typeof rig>>) => void) {
+  /** A rig whose two scopes are committed (pointer stage only) and whose two wakes are claimable now. */
+  async function jobsRig(prepare?: (s: Awaited<ReturnType<typeof rig>>) => void) {
     const s = await rig({ env: { searchJobs: { claim: 5 } } });
     prepare?.(s);
     // The pointer stage for both scopes (search unarmed for this batch: whole read refused for size, nothing streamed).
     await processBatch(s.messages, s.r.consumer({ limits: TINY }));
     await wakes(s.r.db.pg);
-    // Past the wakes' coalescing delay: both jobs are claimable now.
-    await s.r.db.pg.query("UPDATE sessions.pipeline_jobs SET visible_at = now() - interval '1 second' WHERE stage = 'search-index'");
-    const saved = process.env.SEARCH_JOBS_ENABLED;
-    process.env.SEARCH_JOBS_ENABLED = "1";
-    try {
-      const run = () => s.handler({ searchJobs: true } as never, (remaining === undefined ? undefined : ctx(remaining)) as never) as Promise<unknown>;
-      // Not frozen: PGlite's now() follows the JS clock, and the claim compares visible_at with it. Below the
-      // threshold, elapsed time only moves the deadline closer.
-      return { ...s, out: await captureLogs(run) };
-    } finally {
-      if (saved === undefined) delete process.env.SEARCH_JOBS_ENABLED; else process.env.SEARCH_JOBS_ENABLED = saved;
-    }
+    const visible = () => s.r.db.pg.query("UPDATE sessions.pipeline_jobs SET visible_at = now() - interval '1 second' WHERE stage = 'search-index'");
+    await visible();
+    /** One scheduled invocation (not frozen: PGlite's now() follows the JS clock, and the claim compares visible_at with it). */
+    const run = async (remaining: number | undefined) => {
+      const saved = process.env.SEARCH_JOBS_ENABLED;
+      process.env.SEARCH_JOBS_ENABLED = "1";
+      try {
+        return await captureLogs(() => s.handler({ searchJobs: true } as never, (remaining === undefined ? undefined : ctx(remaining)) as never) as Promise<unknown>);
+      } finally {
+        if (saved === undefined) delete process.env.SEARCH_JOBS_ENABLED; else process.env.SEARCH_JOBS_ENABLED = saved;
+      }
+    };
+    const jobs = async () => (await s.r.db.pg.query<{ id: string; attempts: number; leased: boolean; dlq: boolean }>(
+      "SELECT id::text, attempts, lease_id IS NOT NULL AS leased, dlq FROM sessions.pipeline_jobs WHERE stage='search-index' ORDER BY id")).rows;
+    const letters = async () => (await s.r.db.pg.query("SELECT id FROM sessions.pipeline_dead_letters WHERE stage='search-index'")).rows.length;
+    return { ...s, run, visible, jobs, letters };
   }
+  async function scheduled(remaining: number | undefined, prepare?: (s: Awaited<ReturnType<typeof rig>>) => void) {
+    const j = await jobsRig(prepare);
+    return { ...j, out: await j.run(remaining) };
+  }
+  const runState = (lines: Array<Record<string, unknown>>) => lines.find((l) => l.message === "search jobs run")?.state;
 
-  test("ample time: one job streams (indexed, done), the other is deferred (busy, a short retry as on 9d1adf84)", async () => {
-    const { out } = await scheduled(300_000);
+  test("ample time: one job streams (indexed, done); the slot is then spent, so the other is not claimed (no attempt)", async () => {
+    const { out, jobs, letters, run } = await scheduled(300_000);
     expect(out.result).toEqual({ ok: true });
-    const s = settled(out.lines);
-    expect(s.filter((x) => x.outcome === "indexed")).toHaveLength(1);
-    expect(s.filter((x) => x.outcome === "busy" && x.reason === "stream_deferred")).toHaveLength(1);
+    expect(settled(out.lines)).toEqual([expect.objectContaining({ outcome: "indexed" })]);
+    expect(runState(out.lines)).toBe("stream_exhausted");
+    expect((await jobs()).map((j) => [j.attempts, j.leased])).toEqual([[0, false]]);
+    // The next invocation streams it.
+    const next = await run(300_000);
+    expect(settled(next.lines)).toEqual([expect.objectContaining({ outcome: "indexed" })]);
+    expect(await jobs()).toEqual([]);
+    expect(await letters()).toBe(0);
   }, 120_000);
 
-  test("just below the threshold: no job streams; both are busy (stream_deferred) and retried after the short busy delay", async () => {
-    const { out, r } = await scheduled(THRESHOLD - 1);
-    expect(out.result).toEqual({ ok: true });
-    expect(settled(out.lines)).toEqual([
-      expect.objectContaining({ outcome: "busy", reason: "stream_deferred" }),
-      expect.objectContaining({ outcome: "busy", reason: "stream_deferred" }),
-    ]);
-    const { rows } = await r.db.pg.query<{ secs: number }>("SELECT extract(epoch FROM visible_at - now())::int AS secs FROM sessions.pipeline_jobs WHERE stage='search-index'");
-    expect(rows).toHaveLength(2);
-    for (const row of rows) expect(Math.abs(row.secs - SEARCH_JOB_BUSY_RETRY_SECONDS)).toBeLessThanOrEqual(5);
+  test("just below the threshold, twelve invocations: nothing is claimed, no attempt is spent, no letter; then both complete", async () => {
+    const j = await jobsRig();
+    for (let n = 0; n < 12; n++) {
+      await j.visible();
+      const out = await j.run(THRESHOLD - 1);
+      expect(out.result).toEqual({ ok: true });
+      expect(settled(out.lines)).toEqual([]);
+      expect(runState(out.lines)).toBe("stream_exhausted");
+    }
+    expect((await j.jobs()).map((x) => [x.attempts, x.leased, x.dlq])).toEqual([[0, false, false], [0, false, false]]);
+    expect(await j.letters()).toBe(0);
+    for (let n = 0; n < 2; n++) {
+      await j.visible();
+      expect(settled((await j.run(300_000)).lines)).toEqual([expect.objectContaining({ outcome: "indexed" })]);
+    }
+    expect(await j.jobs()).toEqual([]);
+    expect(await j.letters()).toBe(0);
+  }, 300_000);
+
+  test("mixed SQS, scheduled and probe load: a held job recovers through the probe lane, no attempt is lost to a deferral", async () => {
+    const j = await jobsRig();
+    const [first, held] = await j.jobs();
+    // The second job is contention-held with its hourly probe due (the probe lane admits it, the ordinary lane skips it).
+    const epoch = (await j.r.db.pg.query<{ epoch: string }>("SELECT message->'payload'->>'epoch' AS epoch FROM sessions.pipeline_jobs WHERE id=$1::bigint", [held!.id])).rows[0]!.epoch;
+    await j.r.db.pg.query(
+      `INSERT INTO sessions.search_job_contention (job_id, epoch, first_contended_at, last_contended_at, contention_count, held_at, next_probe_at)
+       VALUES ($1::bigint, $2::bigint, now() - interval '25 hours', now() - interval '1 hour', 99, now() - interval '1 hour', now() - interval '1 minute')`,
+      [held!.id, epoch]);
+    // An SQS batch for the first scope only, ample time: its pass streams (the slot); the follow-on claims nothing.
+    const sqs = await captureLogs(() => j.handler({ Records: j.messages.slice(0, 1) } as never, ctx(300_000) as never) as Promise<unknown>);
+    expect(sqs.result).toEqual({ batchItemFailures: [] });
+    expect(reconciled(sqs.lines)).toEqual([expect.objectContaining({ ok: true })]);
+    expect(settled(sqs.lines)).toEqual([]);
+    // Scheduled, too little time: neither lane claims (the probe keeps its due time, the job its attempts).
+    await j.visible();
+    const low = await j.run(THRESHOLD - 1);
+    expect(settled(low.lines)).toEqual([]);
+    expect((await j.jobs()).map((x) => x.attempts)).toEqual([0, 0]);
+    // Scheduled, ample time: the probe lane takes the held job first and streams it; then the slot is spent.
+    await j.visible();
+    const ample = await j.run(300_000);
+    expect(ample.lines.filter((l) => l.message === "search jobs run")).toEqual([expect.objectContaining({ count: 1, state: "stream_exhausted" })]);
+    expect(settled(ample.lines)).toEqual([expect.objectContaining({ outcome: "indexed" })]);
+    expect((await j.jobs()).map((x) => x.id)).toEqual([first!.id]);
+    expect((await j.r.db.pg.query("SELECT 1 FROM sessions.search_job_contention")).rows).toEqual([]);
+    // The first scope is already current from the SQS pass: its job settles unchanged.
+    await j.visible();
+    expect(settled((await j.run(300_000)).lines)).toEqual([expect.objectContaining({ outcome: "unchanged" })]);
+    expect(await j.jobs()).toEqual([]);
+    expect(await j.letters()).toBe(0);
+  }, 300_000);
+
+  test("at the deadline margin (the M2 analogue of stream_batch_deadline): nothing is claimed, attempts unchanged", async () => {
+    const { out, jobs, letters } = await scheduled(MARGIN);
+    expect(settled(out.lines)).toEqual([]);
+    expect(runState(out.lines)).toBe("deadline");
+    expect((await jobs()).map((j) => j.attempts)).toEqual([0, 0]);
+    expect(await letters()).toBe(0);
   }, 120_000);
+
+  test("a job claimed and then deferred (the start minimum crossed after the claim) settles busy: the attempt is given back", async () => {
+    const { searchSettlementFor } = await import("../search-jobs.ts");
+    expect(searchSettlementFor({ outcome: "busy", reasons: ["stream_deferred"] }, 3)).toBe("busy");
+    expect(searchSettlementFor({ outcome: "busy", reasons: ["epoch_behind_wake"] }, 3)).toEqual({ retry: SEARCH_JOB_BUSY_RETRY_SECONDS });
+  });
 
   test("a dropped connection mid-stream: the job fails as an error result, is retried on M2's backoff, nothing crashes", async () => {
     let uncaught = 0;
@@ -290,10 +303,9 @@ describe("the scheduled {searchJobs:true} path carries the same guards; M2 settl
     }
   }, 120_000);
 
-  test("no context: still one streamed scope per run (slot), no deadline", async () => {
-    const { out } = await scheduled(undefined);
-    const s = settled(out.lines);
-    expect(s.filter((x) => x.outcome === "indexed")).toHaveLength(1);
-    expect(s.filter((x) => x.outcome === "busy" && x.reason === "stream_deferred")).toHaveLength(1);
+  test("no context: still one streamed scope per run (slot), no deadline; the other is not claimed", async () => {
+    const { out, jobs } = await scheduled(undefined);
+    expect(settled(out.lines)).toEqual([expect.objectContaining({ outcome: "indexed" })]);
+    expect((await jobs()).map((j) => [j.attempts, j.leased])).toEqual([[0, false]]);
   }, 120_000);
 });

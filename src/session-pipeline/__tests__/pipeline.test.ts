@@ -921,7 +921,9 @@ describe("streamed reconcile on the Lambda: one streamed scope per invocation, w
     expect(l.reads()).toBe(1); // the context's remaining time is read once per invocation
     expect(l.requeued).toEqual([l.keys.sess_2]);
     expect(l.indexed()).toEqual(["sess_1", "sess_3"]); // sess_1 only by streaming: its whole read is refused
-    expect(l.ch.state.map((s) => [s.session_id, s.needs_full])).toEqual([["sess_1", 0], ["sess_3", 0]]); // sess_2: no state written
+    // sess_1's streamed pass first records needs_full=1 (the backport's pre-mark, 1 ms before its own state row), then
+    // its final state; sess_2: no state written.
+    expect(l.ch.state.map((s) => [s.session_id, s.needs_full])).toEqual([["sess_1", 1], ["sess_1", 0], ["sess_3", 0]]);
     // The redelivered event is the next invocation's one streamed scope.
     expect((await l.invoke(["sess_2"], l.context(300_000))).batchItemFailures).toEqual([]);
     expect(l.indexed()).toEqual(["sess_1", "sess_2", "sess_3"]);

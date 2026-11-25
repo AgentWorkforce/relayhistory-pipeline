@@ -108,6 +108,11 @@ export const ALLOWED_LOG_FIELDS = new Set([
   "streaming",
   ...STREAM_BUDGET_FIELDS,
   ...SEARCH_PHASE_FIELDS,
+  // The session pipeline's queue and upload latency (session-pipeline/consumer.ts; the backport lineage's ecb5d981):
+  // non-negative integers only (BOUNDED_COUNT_FIELDS) and one of three words (ENUM_FIELDS).
+  "event_age_ms", "s3_event_age_ms", "queue_origin",
+  // How a search pass's acceptance refusal looked (session-pipeline/contender-seats.ts; 9279264f): one of four words.
+  "contender_seats",
   // The ingest origin claim fence fallback (src/session-ingest/ledger-sql.ts originScoped): epoch ms until which the
   // isolate uses the per-user functions; a bounded integer.
   "fallback_until_ms",
@@ -132,6 +137,8 @@ export const ALLOWED_LOG_FIELDS = new Set([
  * never carry free text or an identifier.
  */
 export const BOUNDED_COUNT_FIELDS: ReadonlyMap<string, number> = new Map([
+  ["event_age_ms", Number.MAX_SAFE_INTEGER],
+  ["s3_event_age_ms", Number.MAX_SAFE_INTEGER],
   ["buffered_checked", 100_000],
   ["buffered_dropped", 100_000],
   ["admission_backlog", 10_000_000],
@@ -191,6 +198,8 @@ export const REGEN_REASON_VALUES: ReadonlySet<string> = new Set([
 export const LOCK_RETRY_OUTCOME_VALUES: ReadonlySet<string> = new Set(["succeeded_after_retry", "exhausted", "not_retryable"]);
 export const REGEN_SYSTEM_VALUES: ReadonlySet<string> = new Set(["bob_costas", "brief"]);
 const ENUM_FIELDS: ReadonlyMap<string, ReadonlySet<string>> = new Map([
+  ["queue_origin", new Set(["s3", "requeue", "sweep"])],
+  ["contender_seats", new Set(["all_unseated", "seated_unseated", "both", "catalog_key"])],
   ["store_cause", STORE_CAUSE_VALUES], ["streaming", STREAMING_VALUES],
   ["db_refusal", DB_REFUSAL_VALUES], ["client_kind", CLIENT_KIND_VALUES], ["client_os", CLIENT_OS_VALUES],
   ["regeneration_reason", REGEN_REASON_VALUES], ["system", REGEN_SYSTEM_VALUES],

@@ -50,7 +50,7 @@ async function record(): Promise<Record<string, Entry>> {
         for (const line of String(chunk).split("\n"))
           if (line.startsWith("{"))
             try {
-              const { ts: _ts, duration_ms: _d, ...entry } = JSON.parse(line) as Entry;
+              const { ts: _ts, duration_ms: _d, event_age_ms: _ea, s3_event_age_ms: _sa, queue_origin: _qo, ...entry } = JSON.parse(line) as Entry;
               if (entry.stage === "session-indexed" || entry.stage === "object-landed") lines.push(entry);
             } catch {}
         return (w as (...a: unknown[]) => boolean).call(stream, chunk, ...rest);
