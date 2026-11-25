@@ -1344,6 +1344,24 @@ describe("R9: the park path, the held down migration and the failure-safe archiv
     const fn = (await db.pg.query<{ secdef: boolean }>(
       "SELECT p.prosecdef AS secdef FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace WHERE n.nspname = 'sessions' AND p.proname = 'archive_search_stage_v1'")).rows;
     expect(fn).toEqual([{ secdef: true }]);
+    // The rest of the boundary, from the catalog (design §7 [rev 9]):
+    const boundary = (await db.pg.query<{ path_pinned: boolean; owner_is_table_owner: boolean; public_exec: boolean; nonowner_exec: boolean }>(`
+      SELECT coalesce(p.proconfig @> ARRAY['search_path=pg_catalog, pg_temp'], false) AS path_pinned,
+             pg_get_userbyid(p.proowner) = (SELECT tableowner FROM pg_tables WHERE schemaname = 'sessions' AND tablename = 'search_stage_archive') AS owner_is_table_owner,
+             EXISTS (SELECT 1 FROM aclexplode(coalesce(p.proacl, acldefault('f', p.proowner))) x WHERE x.grantee = 0 AND x.privilege_type = 'EXECUTE') AS public_exec,
+             EXISTS (SELECT 1 FROM aclexplode(coalesce(p.proacl, acldefault('f', p.proowner))) x WHERE x.grantee NOT IN (0, p.proowner) AND x.privilege_type = 'EXECUTE') AS nonowner_exec
+        FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace
+       WHERE n.nspname = 'sessions' AND p.proname = 'archive_search_stage_v1'`)).rows;
+    // Pinned search_path; owned by the archive table's owner; no PUBLIC execute; a runtime (non-owner) grantee has EXECUTE.
+    expect(boundary).toEqual([{ path_pinned: true, owner_is_table_owner: true, public_exec: false, nonowner_exec: true }]);
+    // Table privileges: every non-owner grantee holds SELECT only (no INSERT, UPDATE, DELETE, TRUNCATE, REFERENCES, TRIGGER),
+    // and at least one non-owner grantee (the runtime role) holds SELECT.
+    const tablePrivs = (await db.pg.query<{ grantee: string; privilege_type: string }>(`
+      SELECT pg_get_userbyid(x.grantee) AS grantee, x.privilege_type
+        FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace, aclexplode(coalesce(c.relacl, acldefault('r', c.relowner))) x
+       WHERE n.nspname = 'sessions' AND c.relname = 'search_stage_archive' AND x.grantee <> c.relowner`)).rows;
+    expect(tablePrivs.filter((r) => r.privilege_type !== "SELECT")).toEqual([]);
+    expect(tablePrivs.some((r) => r.privilege_type === "SELECT")).toBe(true);
 
     // A non-owner stand-in for the runtime role, deliberately GRANTED INSERT so a refusal can only come from the seal
     // (the insert trigger), never from a missing privilege.

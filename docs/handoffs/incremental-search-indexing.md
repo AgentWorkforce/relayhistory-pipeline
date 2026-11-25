@@ -519,7 +519,7 @@ below:
    - The parked count is the INSERT's row count. It is logged with the operator and the time; there is no audit
      table.
    - The parked messages are replayable once the consumer is back.
-   - Tests R9a-R9e (below): after a park, the down precondition does NOT hold.
+   - Tests R9a-R9g (below): after a park, the down precondition does NOT hold.
 4. roll the code back (writer and consumer code), with flags off;
 5. STOP. The down migration is NOT run on this path: it refuses while parked letters exist. The stage's schema
    stays in place (inert without the code and flags) until the replay, resolve and archive path below empties it.
@@ -576,7 +576,8 @@ promise of replay, so the two cannot coexist with a down migration.
   - R9d [rev 8]: archive with a `search-index` job row present REFUSES, and nothing changes;
   - R9e [rev 8]: an archived row cannot be updated or deleted by the runtime role (append-only);
   - R9f [rev 9]: a direct INSERT by a non-owner role (an append to a completed batch, or a forged batch) is refused
-    with 42501; `archive_search_stage_v1` is SECURITY DEFINER.
+    with 42501; `archive_search_stage_v1` is SECURITY DEFINER with a pinned search_path, owned by the archive's
+    owner, with no PUBLIC execute and runtime EXECUTE; every non-owner holds SELECT only on the table.
 
 ## 9. Production steps (each needs its own go, one at a time)
 
@@ -615,7 +616,7 @@ Stop lines for 4 and 5 are the A+C set, plus: `search-index` oldest open job ove
 | R6g | the generic runWorker / postgresStageConsumer is not registered for `search-index` | absent |
 | R8a-d | stage-aware replay: superseded resolves on the newer completion; merged on done; the replay/new-wake race; re-death refreshes | absent |
 | R5e | two current live heads: the clock is the later published_at | absent |
-| R9a-c | park, then down refuses (letters and events present); replay, resolve, archive (durable, sha256 manifest), then the precondition holds; an archive with an unresolved letter refuses and changes nothing | absent |
+| R9a-g | park, then down refuses (letters and events present); replay, resolve, archive (durable, sha256 manifest), then the precondition holds; an archive with an unresolved letter refuses and changes nothing | absent |
 | R5f | an OLDER live head triggers the authority enqueue while a newer sibling supplies max(published_at): the job clock is the newer one, and the trigger is still validated by its own authority | absent |
 | R5g | a managed scope with a NULL or unprovable publication clock: no job, an error metric, never a pointer fallback | absent |
 | R5c/d | catch-up clock: publish for managed, pointer for non-managed; no null clock | absent |
