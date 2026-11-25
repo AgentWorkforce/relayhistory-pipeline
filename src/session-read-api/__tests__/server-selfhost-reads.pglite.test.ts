@@ -9,7 +9,10 @@
  *   - READ_API_AUTH_MODE=relaycontrol_only against a real relaycontrol
  *     introspection stub (node:http): valid token, wrong audience, wrong
  *     workspace, outage (5xx, dropped connection, timeout) fail closed,
- *     refusal, and a non-`sh_at_` bearer refused with zero outbound fetches.
+ *     refusal, and a non-`sh_at_` bearer refused with zero outbound fetches;
+ *   - GET /v1/relayfacts and /v1/relayfacts/:topic: flag off, empty, rows written by the
+ *     real writer (scoped to the caller's workspace and org), EXECUTE revoked, and a
+ *     workspace outside the canary allowlist.
  *
  * pg.Pool is replaced by a PGlite-backed pool (one client at a time). Every id,
  * token and secret here is synthetic.
@@ -35,6 +38,7 @@ import { readApiVerifier } from "../auth.ts";
 import { readApiDepsFromSecret, readAppFromSecret } from "../lambda.ts";
 import { startReadApiService, type ReadApiService } from "../server.ts";
 import { readerLoginAnswer } from "./reader-login-support.ts";
+import { postgresDecisionRecordsSink } from "../../session-analysis/decision-records.ts";
 import { SESSION_BOOTSTRAP_FILES } from "../../hoopdb/session-bootstrap-chain.ts";
 
 const root = join(import.meta.dir, "../../..");
@@ -809,5 +813,130 @@ describe("startup and wiring rules", () => {
     expect(calls).toEqual([]);
     expect(() => readApiVerifier({ origin: ORIGIN, mode: "relaycontrol_only", jwksUrl: "https://x.test/jwks", relaycontrol: { url: "http://127.0.0.1:1", secret: "s" } })).toThrow();
     expect(() => readApiVerifier({ origin: ORIGIN, mode: "relaycontrol_only" })).toThrow();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Relayfacts read side through the self-host SERVICE (docs/relayfacts.md "Self-host read side").
+
+describe("relayfacts through the self-host service (server.ts, real assembly)", () => {
+  const FX_ORG = "fx-org-a", FX_OTHER_ORG = "fx-org-b";
+  const FX_WS = "fx-ws-a", FX_WS_B = "fx-ws-b", FX_WS_EMPTY = "fx-ws-empty", FX_WS_OFF = "fx-ws-off";
+  const TOPIC = "fx-topic";
+  const fxEnv = (over: Record<string, string | undefined> = {}) =>
+    baseEnv({ READ_API_DIRECTORY_WORKSPACES: [FX_WS, FX_WS_B, FX_WS_EMPTY].join(","), READ_API_RELAYFACTS_ENABLED: "true", ...over });
+  const tokenFor = (workspace: string, org = FX_ORG) => {
+    const token = `sh_at_fx-${org}-${workspace}`;
+    answers.set(token, (_b, res) => json(res, 200, active({ org, workspace })));
+    return token;
+  };
+  const topics = (ws: string) => `/v1/relayfacts?workspace=${ws}`;
+  const page = (ws: string, topic = TOPIC) => `/v1/relayfacts/${topic}?workspace=${ws}`;
+  const record = (title: string, statement: string) => ({
+    topic: TOPIC, title, statement, status: "decided" as const,
+    evidence: [{ source: "codex", session_id: "fx-session-1", turn_start: 0, turn_end: 1, claim: statement, ref: null }],
+  });
+  /** The writer the session-analysis runner uses, over PGlite AS service_role (the function's only grantee). */
+  const sink = postgresDecisionRecordsSink({
+    async query<R>(text: string, params?: unknown[]) {
+      const unlock = await exclusive();
+      try {
+        await supa.exec("SET ROLE service_role");
+        return (await supa.query(text, params)) as { rows: R[] };
+      } finally {
+        await supa.exec("RESET ROLE");
+        unlock();
+      }
+    },
+  });
+
+  test("(a) flag unset or not exactly \"true\": both routes answer 501 relayfacts_disabled", async () => {
+    const token = tokenFor(FX_WS);
+    for (const flag of [undefined, "TRUE", "1", "true ", " true", "True", "yes", ""]) {
+      const get = await start(fxEnv({ READ_API_RELAYFACTS_ENABLED: flag }));
+      for (const path of [topics(FX_WS), page(FX_WS)]) {
+        const r = await get(path, token);
+        expect([flag, path, r.status]).toEqual([flag, path, 501]);
+        expect(await r.text()).toBe('{"error":"relayfacts_disabled"}');
+      }
+      for (const s of running.splice(0)) await s.close();
+    }
+  });
+
+  test("(b) flag on, migrated, workspace enabled, no rows: 200 with an empty list", async () => {
+    const get = await start(fxEnv());
+    const token = tokenFor(FX_WS_EMPTY);
+    const r = await get(topics(FX_WS_EMPTY), token);
+    expect(r.status).toBe(200);
+    expect(await r.json()).toEqual({ topics: [] });
+    const one = await get(page(FX_WS_EMPTY), token);
+    expect(one.status).toBe(200);
+    const body = (await one.json()) as { topic: string; records: number; nextCursor: string | null; markdown: string };
+    expect([body.topic, body.records, body.nextCursor]).toEqual([TOPIC, 0, null]);
+    expect(body.markdown).toContain("No decisions recorded.");
+  });
+
+  test("(c) rows written by the real writer are read back, scoped to the caller's workspace and org", async () => {
+    expect(await sink({ orgId: FX_ORG, workspaceId: FX_WS }, [record("Use keyset paging.", "Pages use a created_at, id keyset.")]))
+      .toEqual({ inserted: 1, merged: 0, evidence_added: 1 });
+    expect(await sink({ orgId: FX_ORG, workspaceId: FX_WS_B }, [record("Workspace B only.", "Only workspace B sees this.")]))
+      .toEqual({ inserted: 1, merged: 0, evidence_added: 1 });
+    // Same workspace id under another org: the org binding must keep it out too.
+    expect(await sink({ orgId: FX_OTHER_ORG, workspaceId: FX_WS }, [record("Other org only.", "Only the other org sees this.")]))
+      .toEqual({ inserted: 1, merged: 0, evidence_added: 1 });
+    const get = await start(fxEnv());
+    const token = tokenFor(FX_WS);
+
+    const list = await get(topics(FX_WS), token);
+    expect(list.status).toBe(200);
+    const l = (await list.json()) as { topics: Array<{ topic: string; records: number; decided: number }> };
+    expect(l.topics.map(({ topic, records, decided }) => ({ topic, records, decided }))).toEqual([{ topic: TOPIC, records: 1, decided: 1 }]);
+
+    const one = await get(page(FX_WS), token);
+    expect(one.status).toBe(200);
+    const body = (await one.json()) as { topic: string; records: number; markdown: string };
+    expect([body.topic, body.records]).toEqual([TOPIC, 1]);
+    expect(body.markdown).toContain("## Use keyset paging.");
+    expect(body.markdown).toContain("- session:fx-session-1 refs 0-1: Pages use a created\\_at, id keyset.");
+    expect(body.markdown).not.toContain("Workspace B only");
+    expect(body.markdown).not.toContain("Other org only");
+
+    // The second workspace reads only its own row; the other org only its own.
+    const b = await get(page(FX_WS_B), tokenFor(FX_WS_B));
+    const bm = ((await b.json()) as { markdown: string }).markdown;
+    expect([b.status, bm.includes("Workspace B only."), bm.includes("Use keyset paging")]).toEqual([200, true, false]);
+    const o = await get(page(FX_WS), tokenFor(FX_WS, FX_OTHER_ORG));
+    const om = ((await o.json()) as { markdown: string }).markdown;
+    expect([o.status, om.includes("Other org only."), om.includes("Use keyset paging")]).toEqual([200, true, false]);
+    // A's token naming B's workspace is refused at introspection (as for the session reads), before any read.
+    expect((await get(topics(FX_WS_B), token)).status).toBe(401);
+    expect((await get(page(FX_WS_B), token)).status).toBe(401);
+  });
+
+  test("(d) EXECUTE revoked from the read role: 503 backend_unavailable", async () => {
+    const fns = "sessions.relayfacts_topics_v1(text,text), sessions.relayfacts_list_v1(text,text,text,timestamptz,uuid,integer)";
+    const get = await start(fxEnv());
+    const token = tokenFor(FX_WS);
+    await supa.exec(`REVOKE EXECUTE ON FUNCTION ${fns} FROM bulls96_read_api`);
+    try {
+      for (const path of [topics(FX_WS), page(FX_WS)]) {
+        const r = await get(path, token);
+        expect([path, r.status]).toEqual([path, 503]);
+        expect((await code(r))?.code).toBe("backend_unavailable");
+      }
+    } finally {
+      await supa.exec(`GRANT EXECUTE ON FUNCTION ${fns} TO bulls96_read_api`);
+    }
+    expect((await get(topics(FX_WS), token)).status).toBe(200);
+  });
+
+  test("(e) workspace not in READ_API_DIRECTORY_WORKSPACES: 501 relayfacts_workspace_not_enabled", async () => {
+    const get = await start(fxEnv());
+    const token = tokenFor(FX_WS_OFF);
+    for (const path of [topics(FX_WS_OFF), page(FX_WS_OFF)]) {
+      const r = await get(path, token);
+      expect([path, r.status]).toEqual([path, 501]);
+      expect(await code(r)).toMatchObject({ code: "unsupported_by_backend", reason: "relayfacts_workspace_not_enabled" });
+    }
   });
 });
