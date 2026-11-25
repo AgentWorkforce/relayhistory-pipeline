@@ -1,6 +1,6 @@
 /**
- * Lane: search-index-stage (slot 062230).
- * supabase/migrations/20261105062230_search_index_stage.sql (docs/handoffs/incremental-search-indexing.md, M2) owns:
+ * Lane: search-index-stage (slot 062300).
+ * supabase/migrations/20261105062300_search_index_stage.sql (docs/handoffs/incremental-search-indexing.md, M2) owns:
  *   guard_managed_search_wake_v1        queue guard trigger function (pipeline_jobs, the search-index rows); no grant
  *   guard_managed_search_truncate_v1    queue truncate guard trigger function; no grant
  *   enqueue_managed_search_wake_v1      SECURITY DEFINER; the managed wake (§2). No grant here: the owner grants the
@@ -10,16 +10,16 @@
  *   search_stage_archive_seal_v1        the archive's append-only seal trigger function; no grant
  *   archive_search_stage_v1             SECURITY DEFINER; the only archive write path (§8); EXECUTE to service_role,
  *                                       so it is also a runtime application function
- * The rollback (supabase/rollbacks/20261105062230_search_index_stage.down.sql) is hand-written: it carries §8's
+ * The rollback (supabase/rollbacks/20261105062300_search_index_stage.down.sql) is hand-written: it carries §8's
  * refusal rules (no search-index job, event or letter) and keeps the archive.
  */
 import type { LaneManifest } from "../types.ts";
 
-const MIGRATION = "supabase/migrations/20261105062230_search_index_stage.sql";
+const MIGRATION = "supabase/migrations/20261105062300_search_index_stage.sql";
 
 export const searchIndexStage: LaneManifest = {
   lane: "search-index-stage",
-  owner: "incremental search indexing M2 (slot 062230)",
+  owner: "incremental search indexing M2 (slot 062300)",
   migration: MIGRATION,
   prefixes: [
     "sessions.guard_managed_search_wake_v1(",

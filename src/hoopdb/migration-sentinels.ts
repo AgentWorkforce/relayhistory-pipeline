@@ -641,7 +641,7 @@ export const MIGRATION_SENTINELS: Record<string, Sentinel> = {
     evidence: "tables sessions.legacy_export_scope_authority/readiness and their register/readiness/heartbeat/page/still-fenced RPCs",
     sql: "SELECT to_regclass('sessions.legacy_export_scope_authority') IS NOT NULL AND to_regclass('sessions.legacy_export_privacy_eraser_readiness') IS NOT NULL AND to_regprocedure('sessions.ingest_legacy_export_scope_authority_register(jsonb)') IS NOT NULL AND to_regprocedure('sessions.legacy_export_privacy_authority_ready()') IS NOT NULL AND to_regprocedure('sessions.legacy_export_privacy_eraser_heartbeat()') IS NOT NULL AND to_regprocedure('sessions.legacy_export_privacy_eraser_page(jsonb)') IS NOT NULL AND to_regprocedure('sessions.legacy_export_privacy_eraser_still_fenced(jsonb)') IS NOT NULL AS applied",
   },
-  "upstream:20261105062230_search_index_stage.sql": {
+  "upstream:20261105062300_search_index_stage.sql": {
     evidence: "table sessions.search_catchup_cursor and function sessions.archive_search_stage_v1() (the search-index stage)",
     sql: "SELECT to_regclass('sessions.search_catchup_cursor') IS NOT NULL AND to_regprocedure('sessions.archive_search_stage_v1()') IS NOT NULL AS applied",
   },

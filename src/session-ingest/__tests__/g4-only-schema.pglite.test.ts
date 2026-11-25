@@ -244,7 +244,7 @@ describe("G4-only schema: the post-G4 objects are absent", () => {
       // The search-index stage: the stage in the pipeline CHECKs, a queue index and guards, the catch-up cursor, the
       // dead-letter resolution column and the sealed archive; no G4 function names them, and the managed wake writer
       // calls its enqueue only with SEARCH_WAKE_ENQUEUE / PIPELINE_MANAGED_SEARCH_WAKE_ENABLED on (default off).
-      "20261105062230_search_index_stage.sql",
+      "20261105062300_search_index_stage.sql",
     ]);
     expect(() => migrationFiles(REPO_ROOT, "20261105043800_typo.sql")).toThrow(/names no migration/);
     expect(OBJECTS.newFunctions.length).toBeGreaterThan(30);

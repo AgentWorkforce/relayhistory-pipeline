@@ -456,9 +456,9 @@ const T2_DOWN = read("supabase/rollbacks/20261105062210_lazy_ack_t2.down.sql");
 // 20261105062220 (the advisory instance) sits above 062210: its down runs first of all.
 const ADVISORY_INSTANCE_STEP = "upstream:20261105062220_coordination_advisories_incarnation.sql";
 const ADVISORY_INSTANCE_DOWN = read("supabase/rollbacks/20261105062220_coordination_advisories_incarnation.down.sql");
-// 20261105062230 (the search-index stage) sits above 062220: its down runs before 062220's.
-const SEARCH_STAGE_STEP = "upstream:20261105062230_search_index_stage.sql";
-const SEARCH_STAGE_DOWN = read("supabase/rollbacks/20261105062230_search_index_stage.down.sql");
+// 20261105062300 (the search-index stage) sits above 062220: its down runs before 062220's.
+const SEARCH_STAGE_STEP = "upstream:20261105062300_search_index_stage.sql";
+const SEARCH_STAGE_DOWN = read("supabase/rollbacks/20261105062300_search_index_stage.down.sql");
 const USER_ERASE = "sessions.relayfacts_user_erase_v1(text,text,text,text)";
 const USER_ERASE_LOCK = "sessions.relayfacts_user_erase_lock_v1()";
 const USER_ERASE_GUARD = "sessions.relayfacts_user_erase_guard_v1()";

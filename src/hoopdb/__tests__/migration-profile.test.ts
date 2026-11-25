@@ -2717,18 +2717,18 @@ describe("function boundary: ACL manifest, residual, activation gate", () => {
       const open = src.indexOf(tag, start) + tag.length;
       return src.slice(open, src.indexOf(tag, open));
     };
-    // 20261105062230 (the search-index stage) is newest: 062220's down refuses (55000) while it is applied; its
+    // 20261105062300 (the search-index stage) is newest: 062220's down refuses (55000) while it is applied; its
     // checksum-pinned down (no search-index job, event or letter; an empty archive) drops the stage's objects, restores
     // the 20261031000100 stage CHECKs and removes its ledger row, and refuses on a rerun.
-    const SIS = "upstream:20261105062230_search_index_stage.sql";
+    const SIS = "upstream:20261105062300_search_index_stage.sql";
     expect(await names()).toContain(SIS);
     expect((await failure(rollback("20261105062220_coordination_advisories_incarnation.down.sql")))?.code).toBe("55000");
-    await rollback("20261105062230_search_index_stage.down.sql");
+    await rollback("20261105062300_search_index_stage.down.sql");
     expect(await names()).not.toContain(SIS);
     for (const r of ["sessions.search_catchup_cursor", "sessions.search_stage_archive", "sessions.pipeline_jobs_search_index_scope"]) expect(await relation(r)).toBeNull();
     expect((await db.query<{ n: number }>("SELECT count(*)::int n FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace WHERE n.nspname = 'sessions' AND p.proname IN ('enqueue_managed_search_wake_v1','managed_search_wake_v1','archive_search_stage_v1','guard_managed_search_wake_v1','guard_managed_search_truncate_v1','search_stage_archive_seal_v1')")).rows[0]!.n).toBe(0);
     expect((await db.query<{ n: number }>("SELECT count(*)::int n FROM pg_constraint WHERE conname IN ('pipeline_jobs_stage_check','pipeline_events_stage_check','pipeline_dead_letters_stage_check') AND pg_get_constraintdef(oid) LIKE '%search-index%'")).rows[0]!.n).toBe(0);
-    expect((await failure(rollback("20261105062230_search_index_stage.down.sql")))?.code).toBe("55000");
+    expect((await failure(rollback("20261105062300_search_index_stage.down.sql")))?.code).toBe("55000");
     // 20261105062220 is then newest: 062210's down refuses (55000) while it is applied; its checksum-pinned down restores
     // 062000's exact upsert_v1, mark_delivered_v1 and ack_v1 bodies, drops upsert_v2, ack_v2, pending_for_v3 and the
     // incarnation column and its ledger row, and refuses on a rerun.

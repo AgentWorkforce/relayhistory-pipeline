@@ -46,7 +46,7 @@ export interface IndexDeps {
   /**
    * Compiled schema identity and one short final metadata transaction. `enqueueSearchWake`: write the
    * managed `search-index` wake inside the authority transaction (docs/handoffs/incremental-search-indexing.md
-   * §2; needs migration 20261105062230 and the owner's EXECUTE grant). Absent means on, so
+   * §2; needs migration 20261105062300 and the owner's EXECUTE grant). Absent means on, so
    * every production caller passes it explicitly from its own flag (lambda.ts SEARCH_WAKE_ENQUEUE, indexer.ts
    * PIPELINE_MANAGED_SEARCH_WAKE_ENABLED, consumer-service.ts SEARCH_WAKE_ENQUEUE; each default off).
    */
@@ -417,7 +417,7 @@ function sessionIndex(deps:IndexDeps,authorized:boolean,managedSearch?:ManagedSe
 
 /**
  * §2: the managed wake, inside the authority transaction, through sessions.managed_search_wake_v1 (SECURITY
- * DEFINER, migration 20261105062230): it proves the publish clock and either enqueues or, when the clock is
+ * DEFINER, migration 20261105062300): it proves the publish clock and either enqueues or, when the clock is
  * unprovable, writes no job and commits one clock_unprovable refusal row with the pointer [rev 7]. Anything else
  * raises and rolls the authority transaction back, as the enqueue always did.
  */

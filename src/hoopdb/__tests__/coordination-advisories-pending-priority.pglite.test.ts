@@ -29,9 +29,9 @@ const V1_SQL = read("supabase/migrations/20261105062000_coordination_advisories.
 // 20261105062220 (the advisory instance) sits above 062210: its down runs first of all.
 const INSTANCE_STEP = "upstream:20261105062220_coordination_advisories_incarnation.sql";
 const INSTANCE_DOWN = read("supabase/rollbacks/20261105062220_coordination_advisories_incarnation.down.sql");
-// 20261105062230 (the search-index stage) sits above 062220: its down runs first of all.
-const SEARCH_STAGE_STEP = "upstream:20261105062230_search_index_stage.sql";
-const SEARCH_STAGE_DOWN = read("supabase/rollbacks/20261105062230_search_index_stage.down.sql");
+// 20261105062300 (the search-index stage) sits above 062220: its down runs first of all.
+const SEARCH_STAGE_STEP = "upstream:20261105062300_search_index_stage.sql";
+const SEARCH_STAGE_DOWN = read("supabase/rollbacks/20261105062300_search_index_stage.down.sql");
 const LOCAL: MigrationProfile = { mode: "local", shim: true, bootstrap: true, verify: false, runtimeRole: "postgres" };
 const V2 = "sessions.coordination_advisories_pending_for_v2(text,text,text,text,integer)";
 const V1 = "sessions.coordination_advisories_pending_for_v1(text,text,text,text)";

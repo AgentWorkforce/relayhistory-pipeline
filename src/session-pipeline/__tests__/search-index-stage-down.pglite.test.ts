@@ -1,5 +1,5 @@
 /**
- * The 20261105062230 rollback's §8 rules (docs/handoffs/incremental-search-indexing.md): it refuses (55000, nothing
+ * The 20261105062300 rollback's §8 rules (docs/handoffs/incremental-search-indexing.md): it refuses (55000, nothing
  * changed) while any search-index job, event or dead letter exists, and after the replay/resolve/archive path it
  * succeeds, restores the 20261031000100 stage CHECKs and keeps the non-empty audit archive with its seal.
  * Synthetic, secret-free data only.
@@ -12,8 +12,8 @@ import type { StageMessage } from "@rhc/lib/pipeline/dlq.ts";
 import { archiveSearchStage, claimSearchJobs, enqueueSearchWake, searchWorkKey, settleSearchJob } from "../search-jobs.ts";
 import { clonedReplayDatabase, closeReplayTemplate, warmReplayTemplate } from "./replay-fixture.ts";
 
-const DOWN = readFileSync(join(import.meta.dir, "../../../supabase/rollbacks/20261105062230_search_index_stage.down.sql"), "utf8");
-const STEP = "upstream:20261105062230_search_index_stage.sql";
+const DOWN = readFileSync(join(import.meta.dir, "../../../supabase/rollbacks/20261105062300_search_index_stage.down.sql"), "utf8");
+const STEP = "upstream:20261105062300_search_index_stage.sql";
 const cleanup: Array<() => Promise<unknown>> = [];
 afterEach(async () => { for (const c of cleanup.splice(0)) await c(); });
 beforeAll(() => warmReplayTemplate(), 120_000);

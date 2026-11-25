@@ -12,7 +12,7 @@
 --
 -- Consumer half: sessions.search_catchup_cursor (§6), pipeline_dead_letters.resolution (§3.3b) and the sealed,
 -- append-only sessions.search_stage_archive with its only write path sessions.archive_search_stage_v1() (§7, §8).
--- The rollback (supabase/rollbacks/20261105062230_search_index_stage.down.sql) refuses while any search-index
+-- The rollback (supabase/rollbacks/20261105062300_search_index_stage.down.sql) refuses while any search-index
 -- job, event or dead letter exists (§8) and never drops an archive that holds a row.
 SET LOCAL lock_timeout = '5s';
 

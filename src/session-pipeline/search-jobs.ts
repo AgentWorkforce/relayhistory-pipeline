@@ -15,7 +15,7 @@
  * register the stage (a plain delete on done would lose a newer wake that arrived during the pass). The hosted
  * consumer is the session-pipeline Lambda (lambda.ts, SEARCH_JOBS_ENABLED, default off).
  *
- * Roles. Migration 20261105062230 carries the producer's queue guard: a search-index row is written only by the
+ * Roles. Migration 20261105062300 carries the producer's queue guard: a search-index row is written only by the
  * schema owner (through its SECURITY DEFINER functions) and leased or acknowledged only by the owner or the dedicated
  * `bulls96_search_wake_consumer` role. Claims and settlement therefore run as that consumer role (or the owner); the
  * message-writing paths here (enqueueSearchWake, so the catch-up and the replay) need the owner. Provisioning and

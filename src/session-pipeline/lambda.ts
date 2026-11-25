@@ -44,7 +44,7 @@ import { largeReadJobState, routeLargeRead } from "./large-read-worker.ts";
  * wake's consumer (docs/handoffs/incremental-search-indexing.md §5.1, search-jobs.ts): after every SQS batch the
  * invocation claims up to SEARCH_JOBS_CLAIM (1-20, default 5) open `search-index` jobs and runs them, and the
  * {"searchJobs": true} schedule does the same without SQS traffic. SEARCH_WAKE_ENQUEUE=1 (only "1"; default off)
- * writes the managed wake in the publication-authority transaction (migration 20261105062230 and the owner's
+ * writes the managed wake in the publication-authority transaction (migration 20261105062300 and the owner's
  * EXECUTE grant first). Off, neither touches the stage.
  * (BUFFERED_SEARCH_GATE_CONTRACT, "buffered-search-gate/v1"; the read Worker deploys with
  * READ_API_BUFFERED_SEARCH_GATE=on first), and needs SEARCH_INDEX_ENABLED=1 on the ClickHouse backend, the feed RPCs

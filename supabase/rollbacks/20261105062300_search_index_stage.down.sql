@@ -1,4 +1,4 @@
--- Rolls back 20261105062230 (the search-index stage, docs/handoffs/incremental-search-indexing.md §8).
+-- Rolls back 20261105062300 (the search-index stage, docs/handoffs/incremental-search-indexing.md §8).
 -- Run only on the drain path, AFTER: writers off (SEARCH_WAKE_ENQUEUE, the indexer's
 -- PIPELINE_MANAGED_SEARCH_WAKE_ENABLED, the catch-up), the stage drained, the consumer off (SEARCH_JOBS_ENABLED),
 -- the code rolled back. After a park, the stage's letters and events still exist: this rollback REFUSES (55000)
@@ -18,10 +18,10 @@ DO $rollback_guard$ DECLARE v_sha text; BEGIN
  IF to_regclass('sessions.__96bulls_migrations') IS NULL
  THEN RAISE EXCEPTION USING ERRCODE='55000',MESSAGE='search index stage: migration ledger required';END IF;
  LOCK TABLE sessions.__96bulls_migrations IN SHARE ROW EXCLUSIVE MODE;
- IF EXISTS(SELECT 1 FROM sessions.__96bulls_migrations WHERE name LIKE 'upstream:%' AND name COLLATE "C">'upstream:20261105062230_search_index_stage.sql')
+ IF EXISTS(SELECT 1 FROM sessions.__96bulls_migrations WHERE name LIKE 'upstream:%' AND name COLLATE "C">'upstream:20261105062300_search_index_stage.sql')
  THEN RAISE EXCEPTION USING ERRCODE='55000',MESSAGE='search index stage: a later migration is applied; roll it back first';END IF;
- SELECT sha256 INTO v_sha FROM sessions.__96bulls_migrations WHERE name='upstream:20261105062230_search_index_stage.sql' FOR UPDATE;
- IF NOT FOUND OR v_sha<>'3c2a5a25a676808e23fa1d368eb427050c94e2bd2a6b6bb88302096ad1cd112b'
+ SELECT sha256 INTO v_sha FROM sessions.__96bulls_migrations WHERE name='upstream:20261105062300_search_index_stage.sql' FOR UPDATE;
+ IF NOT FOUND OR v_sha<>'c1717d64b760d4ad3bcb69f5256bc1bab7c86ef29472db6ee225b55ecfb95ccb'
  THEN RAISE EXCEPTION USING ERRCODE='55000',MESSAGE='search index stage: own applied checksum required';END IF;
  -- §8: the additive migration stays until the stage is fully empty, in all three tables.
  LOCK TABLE sessions.pipeline_jobs, sessions.pipeline_events, sessions.pipeline_dead_letters IN ACCESS EXCLUSIVE MODE;
@@ -65,5 +65,5 @@ ALTER TABLE sessions.pipeline_jobs ADD CONSTRAINT pipeline_jobs_stage_check
   CHECK (stage IN ('object-landed', 'session-indexed',
     'summary-short', 'summary-long', 'status-classify', 'file-normalize',
     'file-maintenance', 'backfill-activation'));
-DELETE FROM sessions.__96bulls_migrations WHERE name='upstream:20261105062230_search_index_stage.sql';
+DELETE FROM sessions.__96bulls_migrations WHERE name='upstream:20261105062300_search_index_stage.sql';
 COMMIT;

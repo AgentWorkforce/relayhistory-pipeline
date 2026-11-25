@@ -1243,7 +1243,7 @@ export async function serve(env: NodeJS.ProcessEnv = process.env): Promise<never
     fanout: droppedFanout,
     publication: {
       schemaGeneration: expected.generation,
-      // The managed search wake (migration 20261105062230): explicitly off unless SEARCH_WAKE_ENQUEUE is exactly "1".
+      // The managed search wake (migration 20261105062300): explicitly off unless SEARCH_WAKE_ENQUEUE is exactly "1".
       enqueueSearchWake: process.env.SEARCH_WAKE_ENQUEUE === "1",
       transact: (work) =>
         inTransaction(db, async (tx) => {
