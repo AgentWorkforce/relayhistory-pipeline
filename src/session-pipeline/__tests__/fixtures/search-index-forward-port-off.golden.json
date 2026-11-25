@@ -1,0 +1,3268 @@
+{
+ "whole read: complete, then the same event again": [
+  {
+   "run": 0,
+   "result": {
+    "batchItemFailures": []
+   },
+   "reads": 31,
+   "sql": [
+    {
+     "sql": "SELECT pg_try_advisory_xact_lock(hashtextextended($1, 0)) AS ok",
+     "params": [
+      "96bulls:search\u001forg_stream\u001fws_stream\u001fclaude\u001fstream_parity"
+     ]
+    },
+    {
+     "sql": "SELECT p.manifest_key, coalesce(p.canonical_session_id,p.session_id) AS canonical_id, coalesce(d.event_projection_epoch, 0)::text AS event_epoch FROM sessions.session_index p LEFT JOIN LATERAL ( SELECT d.event_projection_epoch FROM sessions.session_directory d WHERE d.org_id=p.org_id AND d.workspace_id=p.workspace_id AND d.harness=p.harness AND d.session_id IN(coalesce(p.canonical_session_id,p.session_id),p.session_id) ORDER BY (d.session_id=coalesce(p.canonical_session_id,p.session_id)) DESC LIMIT 1 ) d ON true WHERE p.org_id=$1 AND p.workspace_id=$2 AND p.harness=$3 AND p.session_id=$4 AND p.deleted_at IS NULL ORDER BY p.machine_id",
+     "params": [
+      "org_stream",
+      "ws_stream",
+      "claude",
+      "stream_parity"
+     ]
+    },
+    {
+     "sql": "SELECT pg_try_advisory_xact_lock(hashtextextended($1,0)) AS ok",
+     "params": [
+      "96bulls:directory-events\u001forg_stream\u001fws_stream\u001fclaude\u001fstream:parity"
+     ]
+    },
+    {
+     "sql": "SELECT manifest_key FROM sessions.session_index WHERE org_id=$1 AND workspace_id=$2 AND harness=$3 AND coalesce(canonical_session_id,session_id)=$4 AND deleted_at IS NULL ORDER BY session_id,machine_id",
+     "params": [
+      "org_stream",
+      "ws_stream",
+      "claude",
+      "stream:parity"
+     ]
+    },
+    {
+     "sql": "WITH captured AS MATERIALIZED ( SELECT m.source_session_id,m.epoch FROM sessions.session_directory_event_pending m WHERE m.org_id=$1 AND m.workspace_id=$2 AND m.harness=$3 AND m.source_session_id IN ( SELECT p.session_id FROM sessions.session_index p WHERE p.org_id=$1 AND p.workspace_id=$2 AND p.harness=$3 AND coalesce(p.canonical_session_id,p.session_id)=$4 AND p.deleted_at IS NULL ) ), marker AS MATERIALIZED ( SELECT m.* FROM sessions.session_directory_event_pending m WHERE m.org_id=$1 AND m.workspace_id=$2 AND m.harness=$3 AND (m.source_session_id,m.epoch) IN(SELECT source_session_id,epoch FROM captured) ORDER BY source_session_id FOR UPDATE ), live AS MATERIALIZED ( SELECT d.org_id,d.workspace_id,d.harness,d.session_id FROM sessions.session_directory d,marker m WHERE d.org_id=$1 AND d.workspace_id=$2 AND d.harness=$3 AND d.session_id IN($4,$5) AND d.deleted_at IS NULL AND (SELECT count(*) FROM marker)=(SELECT count(*) FROM captured) ORDER BY (d.session_id=$4) DESC LIMIT 1 FOR UPDATE OF d ), sources AS ( SELECT jsonb_object_agg(p.manifest_key,p.revision::text) AS revisions,count(*) AS n, count(DISTINCT coalesce(p.canonical_session_id,p.session_id)) AS identities, min(coalesce(p.canonical_session_id,p.session_id)) AS canonical_id FROM sessions.session_index p WHERE p.org_id=$1 AND p.workspace_id=$2 AND p.harness=$3 AND coalesce(p.canonical_session_id,p.session_id)=$4 AND p.deleted_at IS NULL ), updated AS ( UPDATE sessions.session_directory d SET event_count=$7::bigint,event_first_ts=$8::timestamptz,event_last_ts=$9::timestamptz, kinds=$10::text[],task_refs=$11::jsonb,task_title=$12, event_user_ids=$26::text[],event_machine_ids=$27::text[],event_models=$28::text[],event_project_id=$29,opening_event=$30::jsonb,event_project_event=$31::jsonb,project_requires_hydration=$32::boolean, input_tokens=$13::bigint,output_tokens=$14::bigint,reasoning_tokens=$15::bigint, cache_read_tokens=$16::bigint,cache_create_tokens=$17::bigint,cache_create_5m_tokens=$18::bigint,cache_create_1h_tokens=$19::bigint,cost_usd_micros=$20::bigint, work_status=$21,work_status_at=$22::timestamptz,event_projection_version=1,event_projection_ready=true,event_projected_at=now(),event_projection_sources=$6::jsonb, search_text=sessions.session_directory_search_text(d.title,$12,d.agent_name,d.project_id,d.git_repo,d.git_branch,d.model,d.short_summary) FROM live l,sources s WHERE d.org_id=l.org_id AND d.workspace_id=l.workspace_id AND d.harness=l.harness AND d.session_id=l.session_id AND s.revisions=$6::jsonb AND s.n=$23::integer AND s.identities=1 AND s.canonical_id=$4 AND d.event_projection_epoch=$24::bigint RETURNING d.org_id,d.workspace_id,d.harness,d.session_id ), clean_marker AS ( UPDATE sessions.session_directory_event_pending m SET dirty=false FROM updated u WHERE m.org_id=$1 AND m.workspace_id=$2 AND m.harness=$3 AND (m.source_session_id,m.epoch) IN(SELECT source_session_id,epoch FROM captured) ), drop_times AS ( DELETE FROM sessions.session_directory_event_times t USING updated u WHERE t.org_id=u.org_id AND t.workspace_id=u.workspace_id AND t.harness=u.harness AND t.session_id=u.session_id AND NOT(t.event_ts=ANY($25::timestamptz[])) ), put_times AS ( INSERT INTO sessions.session_directory_event_times(org_id,workspace_id,harness,session_id,event_ts) SELECT u.org_id,u.workspace_id,u.harness,u.session_id,x.ts FROM updated u,unnest($25::timestamptz[]) x(ts) ON CONFLICT DO NOTHING ) SELECT EXISTS(SELECT 1 FROM updated) AS written",
+     "params": [
+      "org_stream",
+      "ws_stream",
+      "claude",
+      "stream:parity",
+      "stream_parity",
+      "{\"96bulls/org_stream/v1/ws=ws_stream/m=machine_0/h=claude/d=2026/11/01/s=stream_parity/manifest.json\":\"1\",\"96bulls/org_stream/v1/ws=ws_stream/m=machine_1/h=claude/d=2026/11/01/s=stream_parity/manifest.json\":\"1\",\"96bulls/org_stream/v1/ws=ws_stream/m=machine_2/h=claude/d=2026/11/01/s=stream_parity/manifest.json\":\"1\"}",
+      "50",
+      "2026-11-01T10:00:00.000000Z",
+      "2026-11-01T10:00:07.000000Z",
+      [
+       "file_edit",
+       "history",
+       "session_event",
+       "tool_call"
+      ],
+      "[]",
+      null,
+      "33",
+      "55",
+      "0",
+      "0",
+      "0",
+      "0",
+      "0",
+      null,
+      "active",
+      "2026-11-01T10:00:07.000000Z",
+      3,
+      "2",
+      [
+       "2026-11-01T10:00:00.000000Z",
+       "2026-11-01T10:00:01.000000Z",
+       "2026-11-01T10:00:02.000000Z",
+       "2026-11-01T10:00:03.000000Z",
+       "2026-11-01T10:00:04.000000Z",
+       "2026-11-01T10:00:05.000000Z",
+       "2026-11-01T10:00:06.000000Z",
+       "2026-11-01T10:00:07.000000Z"
+      ],
+      [
+       "user_stream"
+      ],
+      [
+       "delivery:44b37ce55ba08dbbc4f66c90bbfaa676",
+       "delivery:ab9fe22998944278e610d2a73dabdfe3",
+       "delivery:d4ce1e3374276bd9babaccfe9f65c827",
+       "machine:0",
+       "machine:1",
+       "machine:2"
+      ],
+      [
+       "fixture-model"
+      ],
+      null,
+      "{\"session_id\":\"stream:parity\",\"event_id\":\"direct-31-55\",\"machine_id\":\"machine:2\",\"kind\":\"session_event\",\"source\":\"claude\",\"ts\":\"2026-11-01T10:00:00.000000Z\",\"fingerprint\":\"s314e72981379a4b\"}",
+      null,
+      false
+     ]
+    },
+    {
+     "sql": "SELECT EXISTS(SELECT 1 FROM pg_catalog.pg_attribute WHERE attrelid=to_regclass('sessions.session_directory') AND attname='recorded_catalog_title' AND NOT attisdropped) AS supported",
+     "params": []
+    },
+    {
+     "sql": "WITH live AS MATERIALIZED ( SELECT d.org_id, d.workspace_id, d.harness, d.session_id, d.last_activity_at FROM sessions.session_directory AS d WHERE d.org_id = $1 AND d.workspace_id = $2 AND d.harness = $3 AND d.session_id = $4 AND d.deleted_at IS NULL FOR UPDATE ), updated AS ( UPDATE sessions.session_directory AS d SET recorded_catalog_title = CASE WHEN d.event_projection_ready AND d.event_projection_epoch=$19::bigint AND EXISTS(SELECT 1 FROM sessions.session_index p WHERE p.org_id=d.org_id AND p.workspace_id=d.workspace_id AND p.harness=d.harness AND p.session_id=$20::text AND coalesce(p.canonical_session_id,p.session_id)=d.session_id AND p.deleted_at IS NULL) THEN $18::text ELSE d.recorded_catalog_title END, title = CASE WHEN d.event_projection_ready AND d.event_projection_epoch=$19::bigint AND EXISTS(SELECT 1 FROM sessions.session_index p WHERE p.org_id=d.org_id AND p.workspace_id=d.workspace_id AND p.harness=d.harness AND p.session_id=$20::text AND coalesce(p.canonical_session_id,p.session_id)=d.session_id AND p.deleted_at IS NULL) THEN coalesce((SELECT b.title FROM sessions.session_briefs b WHERE b.org_id=d.org_id AND b.workspace_id=d.workspace_id AND b.harness=d.harness AND b.session_id=$20::text AND b.title IS NOT NULL AND b.engine_version NOT LIKE 'neon-backfill:%'), (SELECT p.title FROM sessions.session_index p WHERE p.org_id=d.org_id AND p.workspace_id=d.workspace_id AND p.harness=d.harness AND p.session_id=$20::text AND p.deleted_at IS NULL ORDER BY p.last_activity_at DESC,p.revision DESC,p.machine_id DESC LIMIT 1), $18::text) ELSE d.title END, agent_names = $5::text[], catalog_models = $6::text[], project_key = $7, project_key_method = $8, initial_commit = $9, originator = $10, agent_version = $11, project_id = coalesce($12, d.project_id), git_repo = coalesce($13, d.git_repo), git_branch = coalesce($14, d.git_branch), -- The scalar agent the search RPC filters on: keep one already projected, -- else the first catalog agent, and rebuild the search document with it. agent_name = coalesce(d.agent_name, ($5::text[])[1]), agent_name_normalized = lower(btrim(coalesce(d.agent_name, ($5::text[])[1]))), search_text = sessions.session_directory_search_text( CASE WHEN d.event_projection_ready AND d.event_projection_epoch=$19::bigint AND EXISTS(SELECT 1 FROM sessions.session_index p WHERE p.org_id=d.org_id AND p.workspace_id=d.workspace_id AND p.harness=d.harness AND p.session_id=$20::text AND coalesce(p.canonical_session_id,p.session_id)=d.session_id AND p.deleted_at IS NULL) THEN coalesce((SELECT b.title FROM sessions.session_briefs b WHERE b.org_id=d.org_id AND b.workspace_id=d.workspace_id AND b.harness=d.harness AND b.session_id=$20::text AND b.title IS NOT NULL AND b.engine_version NOT LIKE 'neon-backfill:%'), (SELECT p.title FROM sessions.session_index p WHERE p.org_id=d.org_id AND p.workspace_id=d.workspace_id AND p.harness=d.harness AND p.session_id=$20::text AND p.deleted_at IS NULL ORDER BY p.last_activity_at DESC,p.revision DESC,p.machine_id DESC LIMIT 1), $18::text) ELSE d.title END, d.task_title, coalesce(d.agent_name, ($5::text[])[1]), coalesce($12, d.project_id), coalesce($13, d.git_repo), coalesce($14, d.git_branch), d.model, d.short_summary), catalog_projected_at = now() FROM live AS l WHERE d.org_id = l.org_id AND d.workspace_id = l.workspace_id AND d.harness = l.harness AND d.session_id = l.session_id RETURNING d.org_id ), drop_agents AS ( DELETE FROM sessions.session_directory_agents AS a USING live AS l WHERE a.org_id = l.org_id AND a.workspace_id = l.workspace_id AND a.harness = l.harness AND a.session_id = l.session_id AND NOT (a.agent_name_normalized = ANY ($15::text[])) ), put_agents AS ( INSERT INTO sessions.session_directory_agents (org_id, workspace_id, harness, session_id, agent_name, agent_name_normalized, last_activity_at) SELECT l.org_id, l.workspace_id, l.harness, l.session_id, x.name, lower(btrim(x.name)), l.last_activity_at FROM live AS l, unnest($5::text[]) AS x(name) ON CONFLICT (org_id, workspace_id, harness, session_id, agent_name_normalized) DO UPDATE SET agent_name = excluded.agent_name, last_activity_at = excluded.last_activity_at ), edges AS ( SELECT l.org_id, l.workspace_id, l.harness, l.session_id, e.uid, e.child FROM live AS l, unnest($16::text[], $17::text[]) AS e(uid, child) WHERE e.child IS NULL OR NOT EXISTS ( SELECT 1 FROM sessions.session_directory AS c WHERE c.org_id = l.org_id AND c.workspace_id = l.workspace_id AND c.harness = l.harness AND c.session_id = e.child AND c.deleted_at IS NOT NULL) ), drop_edges AS ( DELETE FROM sessions.session_directory_relationships AS r USING live AS l WHERE r.org_id = l.org_id AND r.workspace_id = l.workspace_id AND r.harness = l.harness AND r.parent_session_id = l.session_id AND NOT (r.relationship_uid IN (SELECT e.uid FROM edges AS e)) ), put_edges AS ( INSERT INTO sessions.session_directory_relationships (org_id, workspace_id, harness, parent_session_id, relationship_uid, child_session_id) SELECT e.org_id, e.workspace_id, e.harness, e.session_id, e.uid, e.child FROM edges AS e ON CONFLICT (org_id, workspace_id, harness, parent_session_id, relationship_uid) DO UPDATE SET child_session_id = excluded.child_session_id ) SELECT EXISTS (SELECT 1 FROM updated) AS written",
+     "params": [
+      "org_stream",
+      "ws_stream",
+      "claude",
+      "stream:parity",
+      [],
+      [],
+      null,
+      null,
+      null,
+      null,
+      null,
+      null,
+      null,
+      null,
+      [],
+      [],
+      [],
+      null,
+      "2",
+      "stream_parity"
+     ]
+    }
+   ],
+   "clickhouse": [
+    {
+     "ch": "select",
+     "query": "SELECT argMax(value, updated_at) AS value, count() AS n FROM search_ingest_state WHERE name = {name:String} HAVING n > 0",
+     "params": {
+      "name": "window_start"
+     }
+    },
+    {
+     "ch": "select",
+     "query": "SELECT workspace_id, session_id, machine_id, source, kind, event_id, toUnixTimestamp64Milli(ts) AS ts_ms, fingerprint FROM transcript_events FINAL WHERE org_id = {org:String} AND (session_id = {session:String} OR session_id = {canonical:String}) AND workspace_id = {workspace:String} AND source = {source:String} AND toUnixTimestamp64Milli(ts) >= {from:Int64} LIMIT {limit:UInt32}",
+     "params": {
+      "org": "org_stream",
+      "session": "stream_parity",
+      "canonical": "stream:parity",
+      "workspace": "ws_stream",
+      "source": "claude",
+      "from": 1792324800000,
+      "limit": 500001
+     }
+    },
+    {
+     "ch": "insert",
+     "table": "transcript_events",
+     "rows": [
+      {
+       "org_id": "org_stream",
+       "workspace_id": "ws_stream",
+       "ts": "2026-11-01 10:00:00.000",
+       "session_id": "stream:parity",
+       "source": "claude",
+       "machine_id": "machine:1",
+       "kind": "session_event",
+       "event_id": "direct-31-19",
+       "type": "assistant",
+       "user_id": "user_stream",
+       "actor_name": "StreamAgent",
+       "actor_role": "owner",
+       "subagent_id": "",
+       "project_id": "",
+       "task_title": "",
+       "task_ref": "{}",
+       "task_ref_id": "",
+       "tags": [
+        "stream"
+       ],
+       "files_touched": [],
+       "tool_name": "",
+       "tool_status": "",
+       "delivery_record_id": "",
+       "content": "answer 19 r2",
+       "content_bytes": 12,
+       "ingested_at": "2026-11-01 10:00:00.000",
+       "fingerprint": "s393058a7ba209d7",
+       "version": 1793534400000
+      },
+      {
+       "org_id": "org_stream",
+       "workspace_id": "ws_stream",
+       "ts": "2026-11-01 10:00:00.000",
+       "session_id": "stream:parity",
+       "source": "claude",
+       "machine_id": "machine:1",
+       "kind": "session_event",
+       "event_id": "direct-31-41",
+       "type": "assistant",
+       "user_id": "user_stream",
+       "actor_name": "StreamAgent",
+       "actor_role": "owner",
+       "subagent_id": "",
+       "project_id": "",
+       "task_title": "",
+       "task_ref": "{}",
+       "task_ref_id": "",
+       "tags": [
+        "stream"
+       ],
+       "files_touched": [],
+       "tool_name": "",
+       "tool_status": "",
+       "delivery_record_id": "",
+       "content": "answer 41 r1",
+       "content_bytes": 12,
+       "ingested_at": "2026-11-01 10:00:00.000",
+       "fingerprint": "s30e90b82a17e181",
+       "version": 1793534400000
+      },
+      {
+       "org_id": "org_stream",
+       "workspace_id": "ws_stream",
+       "ts": "2026-11-01 10:00:03.000",
+       "session_id": "stream:parity",
+       "source": "claude",
+       "machine_id": "machine:1",
+       "kind": "session_event",
+       "event_id": "direct-31-15",
+       "type": "user",
+       "user_id": "user_stream",
+       "actor_name": "StreamAgent",
+       "actor_role": "user",
+       "subagent_id": "",
+       "project_id": "",
+       "task_title": "",
+       "task_ref": "{}",
+       "task_ref_id": "",
+       "tags": [
+        "stream"
+       ],
+       "files_touched": [],
+       "tool_name": "",
+       "tool_status": "",
+       "delivery_record_id": "",
+       "content": "prompt 15 r2",
+       "content_bytes": 12,
+       "ingested_at": "2026-11-01 10:00:03.000",
+       "fingerprint": "s3884c307cb6cca6",
+       "version": 1793534400000
+      },
+      {
+       "org_id": "org_stream",
+       "workspace_id": "ws_stream",
+       "ts": "2026-11-01 10:00:06.000",
+       "session_id": "stream:parity",
+       "source": "claude",
+       "machine_id": "machine:1",
+       "kind": "session_event",
+       "event_id": "direct-31-10",
+       "type": "user",
+       "user_id": "user_stream",
+       "actor_name": "StreamAgent",
+       "actor_role": "user",
+       "subagent_id": "",
+       "project_id": "",
+       "task_title": "",
+       "task_ref": "{}",
+       "task_ref_id": "",
+       "tags": [
+        "stream"
+       ],
+       "files_touched": [],
+       "tool_name": "",
+       "tool_status": "",
+       "delivery_record_id": "",
+       "content": "prompt 10 r1",
+       "content_bytes": 12,
+       "ingested_at": "2026-11-01 10:00:06.000",
+       "fingerprint": "s334d74ed05f4ab4",
+       "version": 1793534400000
+      },
+      {
+       "org_id": "org_stream",
+       "workspace_id": "ws_stream",
+       "ts": "2026-11-01 10:00:07.000",
+       "session_id": "stream:parity",
+       "source": "claude",
+       "machine_id": "machine:1",
+       "kind": "session_event",
+       "event_id": "direct-31-58",
+       "type": "assistant",
+       "user_id": "user_stream",
+       "actor_name": "StreamAgent",
+       "actor_role": "owner",
+       "subagent_id": "",
+       "project_id": "",
+       "task_title": "",
+       "task_ref": "{}",
+       "task_ref_id": "",
+       "tags": [
+        "stream"
+       ],
+       "files_touched": [],
+       "tool_name": "",
+       "tool_status": "",
+       "delivery_record_id": "",
+       "content": "answer 58 r1",
+       "content_bytes": 12,
+       "ingested_at": "2026-11-01 10:00:07.000",
+       "fingerprint": "s3b529706c443d04",
+       "version": 1793534400000
+      },
+      {
+       "org_id": "org_stream",
+       "workspace_id": "ws_stream",
+       "ts": "2026-11-01 10:00:00.000",
+       "session_id": "stream:parity",
+       "source": "claude",
+       "machine_id": "machine:2",
+       "kind": "session_event",
+       "event_id": "direct-31-55",
+       "type": "user",
+       "user_id": "user_stream",
+       "actor_name": "StreamAgent",
+       "actor_role": "user",
+       "subagent_id": "",
+       "project_id": "",
+       "task_title": "",
+       "task_ref": "{}",
+       "task_ref_id": "",
+       "tags": [
+        "stream"
+       ],
+       "files_touched": [],
+       "tool_name": "",
+       "tool_status": "",
+       "delivery_record_id": "",
+       "content": "prompt 55 r1",
+       "content_bytes": 12,
+       "ingested_at": "2026-11-01 10:00:00.000",
+       "fingerprint": "s314e72981379a4b",
+       "version": 1793534400000
+      },
+      {
+       "org_id": "org_stream",
+       "workspace_id": "ws_stream",
+       "ts": "2026-11-01 10:00:02.000",
+       "session_id": "stream:parity",
+       "source": "claude",
+       "machine_id": "machine:2",
+       "kind": "session_event",
+       "event_id": "direct-31-28",
+       "type": "assistant",
+       "user_id": "user_stream",
+       "actor_name": "StreamAgent",
+       "actor_role": "owner",
+       "subagent_id": "",
+       "project_id": "",
+       "task_title": "",
+       "task_ref": "{}",
+       "task_ref_id": "",
+       "tags": [
+        "stream"
+       ],
+       "files_touched": [],
+       "tool_name": "",
+       "tool_status": "",
+       "delivery_record_id": "",
+       "content": "answer 28 r1",
+       "content_bytes": 12,
+       "ingested_at": "2026-11-01 10:00:02.000",
+       "fingerprint": "s3b694b3bd610299",
+       "version": 1793534400000
+      },
+      {
+       "org_id": "org_stream",
+       "workspace_id": "ws_stream",
+       "ts": "2026-11-01 10:00:03.000",
+       "session_id": "stream:parity",
+       "source": "claude",
+       "machine_id": "machine:0",
+       "kind": "session_event",
+       "event_id": "direct-31-6",
+       "type": "assistant",
+       "user_id": "user_stream",
+       "actor_name": "StreamAgent",
+       "actor_role": "owner",
+       "subagent_id": "",
+       "project_id": "",
+       "task_title": "",
+       "task_ref": "{}",
+       "task_ref_id": "",
+       "tags": [
+        "stream"
+       ],
+       "files_touched": [],
+       "tool_name": "",
+       "tool_status": "",
+       "delivery_record_id": "",
+       "content": "answer 6 r1",
+       "content_bytes": 11,
+       "ingested_at": "2026-11-01 10:00:03.000",
+       "fingerprint": "s3fcc4773ce2ee03",
+       "version": 1793534400000
+      },
+      {
+       "org_id": "org_stream",
+       "workspace_id": "ws_stream",
+       "ts": "2026-11-01 10:00:04.000",
+       "session_id": "stream:parity",
+       "source": "claude",
+       "machine_id": "machine:0",
+       "kind": "session_event",
+       "event_id": "direct-31-22",
+       "type": "assistant",
+       "user_id": "user_stream",
+       "actor_name": "StreamAgent",
+       "actor_role": "owner",
+       "subagent_id": "",
+       "project_id": "",
+       "task_title": "",
+       "task_ref": "{}",
+       "task_ref_id": "",
+       "tags": [
+        "stream"
+       ],
+       "files_touched": [],
+       "tool_name": "",
+       "tool_status": "",
+       "delivery_record_id": "",
+       "content": "answer 22 r1",
+       "content_bytes": 12,
+       "ingested_at": "2026-11-01 10:00:04.000",
+       "fingerprint": "s39db1805ac52c35",
+       "version": 1793534400000
+      },
+      {
+       "org_id": "org_stream",
+       "workspace_id": "ws_stream",
+       "ts": "2026-11-01 10:00:04.000",
+       "session_id": "stream:parity",
+       "source": "claude",
+       "machine_id": "machine:0",
+       "kind": "session_event",
+       "event_id": "direct-31-35",
+       "type": "user",
+       "user_id": "user_stream",
+       "actor_name": "StreamAgent",
+       "actor_role": "user",
+       "subagent_id": "",
+       "project_id": "",
+       "task_title": "",
+       "task_ref": "{}",
+       "task_ref_id": "",
+       "tags": [
+        "stream"
+       ],
+       "files_touched": [],
+       "tool_name": "",
+       "tool_status": "",
+       "delivery_record_id": "",
+       "content": "prompt 35 r1",
+       "content_bytes": 12,
+       "ingested_at": "2026-11-01 10:00:04.000",
+       "fingerprint": "s3b56bd9631b7549",
+       "version": 1793534400000
+      },
+      {
+       "org_id": "org_stream",
+       "workspace_id": "ws_stream",
+       "ts": "2026-11-01 10:00:06.000",
+       "session_id": "stream:parity",
+       "source": "claude",
+       "machine_id": "machine:0",
+       "kind": "session_event",
+       "event_id": "direct-31-44",
+       "type": "assistant",
+       "user_id": "user_stream",
+       "actor_name": "StreamAgent",
+       "actor_role": "owner",
+       "subagent_id": "",
+       "project_id": "",
+       "task_title": "",
+       "task_ref": "{}",
+       "task_ref_id": "",
+       "tags": [
+        "stream"
+       ],
+       "files_touched": [],
+       "tool_name": "",
+       "tool_status": "",
+       "delivery_record_id": "",
+       "content": "answer 44 r2",
+       "content_bytes": 12,
+       "ingested_at": "2026-11-01 10:00:06.000",
+       "fingerprint": "s3a703d29b3df610",
+       "version": 1793534400000
+      },
+      {
+       "org_id": "org_stream",
+       "workspace_id": "ws_stream",
+       "ts": "2026-11-01 10:00:00.000",
+       "session_id": "stream:parity",
+       "source": "claude",
+       "machine_id": "delivery:44b37ce55ba08dbbc4f66c90bbfaa676",
+       "kind": "session_event",
+       "event_id": "delivery:44b37ce55ba08dbbc4f66c90bbfaa676:event-31-0",
+       "type": "assistant",
+       "user_id": "user_stream",
+       "actor_name": "",
+       "actor_role": "assistant",
+       "subagent_id": "",
+       "project_id": "",
+       "task_title": "",
+       "task_ref": "{}",
+       "task_ref_id": "",
+       "tags": [],
+       "files_touched": [],
+       "tool_name": "",
+       "tool_status": "",
+       "delivery_record_id": "event-31-0",
+       "content": "reply 0 r1",
+       "content_bytes": 10,
+       "ingested_at": "2026-11-01 10:00:00.000",
+       "fingerprint": "s3cddaa63dc73702",
+       "version": 1793534400000
+      },
+      {
+       "org_id": "org_stream",
+       "workspace_id": "ws_stream",
+       "ts": "2026-11-01 10:00:00.000",
+       "session_id": "stream:parity",
+       "source": "claude",
+       "machine_id": "delivery:44b37ce55ba08dbbc4f66c90bbfaa676",
+       "kind": "history",
+       "event_id": "delivery:44b37ce55ba08dbbc4f66c90bbfaa676:event-31-17",
+       "type": "history",
+       "user_id": "user_stream",
+       "actor_name": "",
+       "actor_role": "user",
+       "subagent_id": "",
+       "project_id": "",
+       "task_title": "",
+       "task_ref": "{}",
+       "task_ref_id": "",
+       "tags": [],
+       "files_touched": [],
+       "tool_name": "",
+       "tool_status": "",
+       "delivery_record_id": "event-31-17",
+       "content": "",
+       "content_bytes": 0,
+       "ingested_at": "2026-11-01 10:00:00.000",
+       "fingerprint": "s38c81c906ef38ea",
+       "version": 1793534400000
+      },
+      {
+       "org_id": "org_stream",
+       "workspace_id": "ws_stream",
+       "ts": "2026-11-01 10:00:00.000",
+       "session_id": "stream:parity",
+       "source": "claude",
+       "machine_id": "delivery:44b37ce55ba08dbbc4f66c90bbfaa676",
+       "kind": "history",
+       "event_id": "delivery:44b37ce55ba08dbbc4f66c90bbfaa676:event-31-23",
+       "type": "history",
+       "user_id": "user_stream",
+       "actor_name": "",
+       "actor_role": "user",
+       "subagent_id": "",
+       "project_id": "",
+       "task_title": "",
+       "task_ref": "{}",
+       "task_ref_id": "",
+       "tags": [],
+       "files_touched": [],
+       "tool_name": "",
+       "tool_status": "",
+       "delivery_record_id": "event-31-23",
+       "content": "",
+       "content_bytes": 0,
+       "ingested_at": "2026-11-01 10:00:00.000",
+       "fingerprint": "s34ffee201d9f7f6",
+       "version": 1793534400000
+      },
+      {
+       "org_id": "org_stream",
+       "workspace_id": "ws_stream",
+       "ts": "2026-11-01 10:00:00.000",
+       "session_id": "stream:parity",
+       "source": "claude",
+       "machine_id": "delivery:44b37ce55ba08dbbc4f66c90bbfaa676",
+       "kind": "session_event",
+       "event_id": "delivery:44b37ce55ba08dbbc4f66c90bbfaa676:event-31-40",
+       "type": "assistant",
+       "user_id": "user_stream",
+       "actor_name": "",
+       "actor_role": "assistant",
+       "subagent_id": "",
+       "project_id": "",
+       "task_title": "",
+       "task_ref": "{}",
+       "task_ref_id": "",
+       "tags": [],
+       "files_touched": [],
+       "tool_name": "",
+       "tool_status": "",
+       "delivery_record_id": "event-31-40",
+       "content": "reply 40 r1",
+       "content_bytes": 11,
+       "ingested_at": "2026-11-01 10:00:00.000",
+       "fingerprint": "s3a4f721de5c12f9",
+       "version": 1793534400000
+      },
+      {
+       "org_id": "org_stream",
+       "workspace_id": "ws_stream",
+       "ts": "2026-11-01 10:00:00.000",
+       "session_id": "stream:parity",
+       "source": "claude",
+       "machine_id": "delivery:ab9fe22998944278e610d2a73dabdfe3",
+       "kind": "tool_call",
+       "event_id": "delivery:ab9fe22998944278e610d2a73dabdfe3:event-31-31",
+       "type": "tool_call",
+       "user_id": "user_stream",
+       "actor_name": "",
+       "actor_role": "",
+       "subagent_id": "",
+       "project_id": "",
+       "task_title": "",
+       "task_ref": "{}",
+       "task_ref_id": "",
+       "tags": [],
+       "files_touched": [],
+       "tool_name": "Read",
+       "tool_status": "",
+       "delivery_record_id": "event-31-31",
+       "content": "Read",
+       "content_bytes": 4,
+       "ingested_at": "2026-11-01 10:00:00.000",
+       "fingerprint": "s376a56ad0af4b80",
+       "version": 1793534400000
+      },
+      {
+       "org_id": "org_stream",
+       "workspace_id": "ws_stream",
+       "ts": "2026-11-01 10:00:00.000",
+       "session_id": "stream:parity",
+       "source": "claude",
+       "machine_id": "delivery:ab9fe22998944278e610d2a73dabdfe3",
+       "kind": "history",
+       "event_id": "delivery:ab9fe22998944278e610d2a73dabdfe3:event-31-47",
+       "type": "history",
+       "user_id": "user_stream",
+       "actor_name": "",
+       "actor_role": "user",
+       "subagent_id": "",
+       "project_id": "",
+       "task_title": "",
+       "task_ref": "{}",
+       "task_ref_id": "",
+       "tags": [],
+       "files_touched": [],
+       "tool_name": "",
+       "tool_status": "",
+       "delivery_record_id": "event-31-47",
+       "content": "",
+       "content_bytes": 0,
+       "ingested_at": "2026-11-01 10:00:00.000",
+       "fingerprint": "s3059f32972865bd",
+       "version": 1793534400000
+      },
+      {
+       "org_id": "org_stream",
+       "workspace_id": "ws_stream",
+       "ts": "2026-11-01 10:00:00.000",
+       "session_id": "stream:parity",
+       "source": "claude",
+       "machine_id": "delivery:ab9fe22998944278e610d2a73dabdfe3",
+       "kind": "file_edit",
+       "event_id": "delivery:ab9fe22998944278e610d2a73dabdfe3:event-31-48",
+       "type": "file_edit",
+       "user_id": "user_stream",
+       "actor_name": "",
+       "actor_role": "",
+       "subagent_id": "",
+       "project_id": "",
+       "task_title": "",
+       "task_ref": "{}",
+       "task_ref_id": "",
+       "tags": [],
+       "files_touched": [
+        "src/a.ts"
+       ],
+       "tool_name": "",
+       "tool_status": "",
+       "delivery_record_id": "event-31-48",
+       "content": "src/a.ts",
+       "content_bytes": 8,
+       "ingested_at": "2026-11-01 10:00:00.000",
+       "fingerprint": "s3a921c5206edc90",
+       "version": 1793534400000
+      },
+      {
+       "org_id": "org_stream",
+       "workspace_id": "ws_stream",
+       "ts": "2026-11-01 10:00:00.000",
+       "session_id": "stream:parity",
+       "source": "claude",
+       "machine_id": "delivery:ab9fe22998944278e610d2a73dabdfe3",
+       "kind": "file_edit",
+       "event_id": "delivery:ab9fe22998944278e610d2a73dabdfe3:event-31-59",
+       "type": "file_edit",
+       "user_id": "user_stream",
+       "actor_name": "",
+       "actor_role": "",
+       "subagent_id": "",
+       "project_id": "",
+       "task_title": "",
+       "task_ref": "{}",
+       "task_ref_id": "",
+       "tags": [],
+       "files_touched": [
+        "src/a.ts"
+       ],
+       "tool_name": "",
+       "tool_status": "",
+       "delivery_record_id": "event-31-59",
+       "content": "src/a.ts",
+       "content_bytes": 8,
+       "ingested_at": "2026-11-01 10:00:00.000",
+       "fingerprint": "s3f794f44937c58d",
+       "version": 1793534400000
+      },
+      {
+       "org_id": "org_stream",
+       "workspace_id": "ws_stream",
+       "ts": "2026-11-01 10:00:01.000",
+       "session_id": "stream:parity",
+       "source": "claude",
+       "machine_id": "delivery:ab9fe22998944278e610d2a73dabdfe3",
+       "kind": "tool_call",
+       "event_id": "delivery:ab9fe22998944278e610d2a73dabdfe3:event-31-18",
+       "type": "tool_call",
+       "user_id": "user_stream",
+       "actor_name": "",
+       "actor_role": "",
+       "subagent_id": "",
+       "project_id": "",
+       "task_title": "",
+       "task_ref": "{}",
+       "task_ref_id": "",
+       "tags": [],
+       "files_touched": [],
+       "tool_name": "Read",
+       "tool_status": "",
+       "delivery_record_id": "event-31-18",
+       "content": "Read",
+       "content_bytes": 4,
+       "ingested_at": "2026-11-01 10:00:01.000",
+       "fingerprint": "s3fcf1d023cf8f5f",
+       "version": 1793534400000
+      },
+      {
+       "org_id": "org_stream",
+       "workspace_id": "ws_stream",
+       "ts": "2026-11-01 10:00:01.000",
+       "session_id": "stream:parity",
+       "source": "claude",
+       "machine_id": "delivery:d4ce1e3374276bd9babaccfe9f65c827",
+       "kind": "session_event",
+       "event_id": "delivery:d4ce1e3374276bd9babaccfe9f65c827:event-31-30",
+       "type": "assistant",
+       "user_id": "user_stream",
+       "actor_name": "",
+       "actor_role": "assistant",
+       "subagent_id": "",
+       "project_id": "",
+       "task_title": "",
+       "task_ref": "{}",
+       "task_ref_id": "",
+       "tags": [],
+       "files_touched": [],
+       "tool_name": "",
+       "tool_status": "",
+       "delivery_record_id": "event-31-30",
+       "content": "reply 30 r2",
+       "content_bytes": 11,
+       "ingested_at": "2026-11-01 10:00:01.000",
+       "fingerprint": "s367914fd1802d74",
+       "version": 1793534400000
+      },
+      {
+       "org_id": "org_stream",
+       "workspace_id": "ws_stream",
+       "ts": "2026-11-01 10:00:02.000",
+       "session_id": "stream:parity",
+       "source": "claude",
+       "machine_id": "delivery:44b37ce55ba08dbbc4f66c90bbfaa676",
+       "kind": "history",
+       "event_id": "delivery:44b37ce55ba08dbbc4f66c90bbfaa676:event-31-32",
+       "type": "history",
+       "user_id": "user_stream",
+       "actor_name": "",
+       "actor_role": "user",
+       "subagent_id": "",
+       "project_id": "",
+       "task_title": "",
+       "task_ref": "{}",
+       "task_ref_id": "",
+       "tags": [],
+       "files_touched": [],
+       "tool_name": "",
+       "tool_status": "",
+       "delivery_record_id": "event-31-32",
+       "content": "",
+       "content_bytes": 0,
+       "ingested_at": "2026-11-01 10:00:02.000",
+       "fingerprint": "s3ef3158ee22ca98",
+       "version": 1793534400000
+      },
+      {
+       "org_id": "org_stream",
+       "workspace_id": "ws_stream",
+       "ts": "2026-11-01 10:00:02.000",
+       "session_id": "stream:parity",
+       "source": "claude",
+       "machine_id": "delivery:44b37ce55ba08dbbc4f66c90bbfaa676",
+       "kind": "history",
+       "event_id": "delivery:44b37ce55ba08dbbc4f66c90bbfaa676:event-31-50",
+       "type": "history",
+       "user_id": "user_stream",
+       "actor_name": "",
+       "actor_role": "user",
+       "subagent_id": "",
+       "project_id": "",
+       "task_title": "",
+       "task_ref": "{}",
+       "task_ref_id": "",
+       "tags": [],
+       "files_touched": [],
+       "tool_name": "",
+       "tool_status": "",
+       "delivery_record_id": "event-31-50",
+       "content": "",
+       "content_bytes": 0,
+       "ingested_at": "2026-11-01 10:00:02.000",
+       "fingerprint": "s348da44eeb94477",
+       "version": 1793534400000
+      },
+      {
+       "org_id": "org_stream",
+       "workspace_id": "ws_stream",
+       "ts": "2026-11-01 10:00:02.000",
+       "session_id": "stream:parity",
+       "source": "claude",
+       "machine_id": "delivery:44b37ce55ba08dbbc4f66c90bbfaa676",
+       "kind": "file_edit",
+       "event_id": "delivery:44b37ce55ba08dbbc4f66c90bbfaa676:event-31-8",
+       "type": "file_edit",
+       "user_id": "user_stream",
+       "actor_name": "",
+       "actor_role": "",
+       "subagent_id": "",
+       "project_id": "",
+       "task_title": "",
+       "task_ref": "{}",
+       "task_ref_id": "",
+       "tags": [],
+       "files_touched": [
+        "src/a.ts"
+       ],
+       "tool_name": "",
+       "tool_status": "",
+       "delivery_record_id": "event-31-8",
+       "content": "src/a.ts",
+       "content_bytes": 8,
+       "ingested_at": "2026-11-01 10:00:02.000",
+       "fingerprint": "s33d1d74383ddb68",
+       "version": 1793534400000
+      },
+      {
+       "org_id": "org_stream",
+       "workspace_id": "ws_stream",
+       "ts": "2026-11-01 10:00:02.000",
+       "session_id": "stream:parity",
+       "source": "claude",
+       "machine_id": "delivery:ab9fe22998944278e610d2a73dabdfe3",
+       "kind": "tool_call",
+       "event_id": "delivery:ab9fe22998944278e610d2a73dabdfe3:event-31-25",
+       "type": "tool_call",
+       "user_id": "user_stream",
+       "actor_name": "",
+       "actor_role": "",
+       "subagent_id": "",
+       "project_id": "",
+       "task_title": "",
+       "task_ref": "{}",
+       "task_ref_id": "",
+       "tags": [],
+       "files_touched": [],
+       "tool_name": "Read",
+       "tool_status": "",
+       "delivery_record_id": "event-31-25",
+       "content": "Read",
+       "content_bytes": 4,
+       "ingested_at": "2026-11-01 10:00:02.000",
+       "fingerprint": "s396b67e82bf15b9",
+       "version": 1793534400000
+      },
+      {
+       "org_id": "org_stream",
+       "workspace_id": "ws_stream",
+       "ts": "2026-11-01 10:00:02.000",
+       "session_id": "stream:parity",
+       "source": "claude",
+       "machine_id": "delivery:ab9fe22998944278e610d2a73dabdfe3",
+       "kind": "session_event",
+       "event_id": "delivery:ab9fe22998944278e610d2a73dabdfe3:event-31-27",
+       "type": "user",
+       "user_id": "user_stream",
+       "actor_name": "",
+       "actor_role": "user",
+       "subagent_id": "",
+       "project_id": "",
+       "task_title": "",
+       "task_ref": "{}",
+       "task_ref_id": "",
+       "tags": [],
+       "files_touched": [],
+       "tool_name": "",
+       "tool_status": "",
+       "delivery_record_id": "event-31-27",
+       "content": "hello 27 r1",
+       "content_bytes": 11,
+       "ingested_at": "2026-11-01 10:00:02.000",
+       "fingerprint": "s3b5622056c41d0c",
+       "version": 1793534400000
+      },
+      {
+       "org_id": "org_stream",
+       "workspace_id": "ws_stream",
+       "ts": "2026-11-01 10:00:02.000",
+       "session_id": "stream:parity",
+       "source": "claude",
+       "machine_id": "delivery:ab9fe22998944278e610d2a73dabdfe3",
+       "kind": "history",
+       "event_id": "delivery:ab9fe22998944278e610d2a73dabdfe3:event-31-4",
+       "type": "history",
+       "user_id": "user_stream",
+       "actor_name": "",
+       "actor_role": "user",
+       "subagent_id": "",
+       "project_id": "",
+       "task_title": "",
+       "task_ref": "{}",
+       "task_ref_id": "",
+       "tags": [],
+       "files_touched": [],
+       "tool_name": "",
+       "tool_status": "",
+       "delivery_record_id": "event-31-4",
+       "content": "",
+       "content_bytes": 0,
+       "ingested_at": "2026-11-01 10:00:02.000",
+       "fingerprint": "s3738e3cb8c44f6d",
+       "version": 1793534400000
+      },
+      {
+       "org_id": "org_stream",
+       "workspace_id": "ws_stream",
+       "ts": "2026-11-01 10:00:02.000",
+       "session_id": "stream:parity",
+       "source": "claude",
+       "machine_id": "delivery:ab9fe22998944278e610d2a73dabdfe3",
+       "kind": "file_edit",
+       "event_id": "delivery:ab9fe22998944278e610d2a73dabdfe3:event-31-54",
+       "type": "file_edit",
+       "user_id": "user_stream",
+       "actor_name": "",
+       "actor_role": "",
+       "subagent_id": "",
+       "project_id": "",
+       "task_title": "",
+       "task_ref": "{}",
+       "task_ref_id": "",
+       "tags": [],
+       "files_touched": [
+        "src/a.ts"
+       ],
+       "tool_name": "",
+       "tool_status": "",
+       "delivery_record_id": "event-31-54",
+       "content": "src/a.ts",
+       "content_bytes": 8,
+       "ingested_at": "2026-11-01 10:00:02.000",
+       "fingerprint": "s31c314547febc48",
+       "version": 1793534400000
+      },
+      {
+       "org_id": "org_stream",
+       "workspace_id": "ws_stream",
+       "ts": "2026-11-01 10:00:02.000",
+       "session_id": "stream:parity",
+       "source": "claude",
+       "machine_id": "delivery:d4ce1e3374276bd9babaccfe9f65c827",
+       "kind": "session_event",
+       "event_id": "delivery:d4ce1e3374276bd9babaccfe9f65c827:event-31-45",
+       "type": "assistant",
+       "user_id": "user_stream",
+       "actor_name": "",
+       "actor_role": "assistant",
+       "subagent_id": "",
+       "project_id": "",
+       "task_title": "",
+       "task_ref": "{}",
+       "task_ref_id": "",
+       "tags": [],
+       "files_touched": [],
+       "tool_name": "",
+       "tool_status": "",
+       "delivery_record_id": "event-31-45",
+       "content": "reply 45 r1",
+       "content_bytes": 11,
+       "ingested_at": "2026-11-01 10:00:02.000",
+       "fingerprint": "s3085b0bb4313946",
+       "version": 1793534400000
+      },
+      {
+       "org_id": "org_stream",
+       "workspace_id": "ws_stream",
+       "ts": "2026-11-01 10:00:02.000",
+       "session_id": "stream:parity",
+       "source": "claude",
+       "machine_id": "delivery:d4ce1e3374276bd9babaccfe9f65c827",
+       "kind": "history",
+       "event_id": "delivery:d4ce1e3374276bd9babaccfe9f65c827:event-31-53",
+       "type": "history",
+       "user_id": "user_stream",
+       "actor_name": "",
+       "actor_role": "user",
+       "subagent_id": "",
+       "project_id": "",
+       "task_title": "",
+       "task_ref": "{}",
+       "task_ref_id": "",
+       "tags": [],
+       "files_touched": [],
+       "tool_name": "",
+       "tool_status": "",
+       "delivery_record_id": "event-31-53",
+       "content": "",
+       "content_bytes": 0,
+       "ingested_at": "2026-11-01 10:00:02.000",
+       "fingerprint": "s3f3874a77e4dd86",
+       "version": 1793534400000
+      },
+      {
+       "org_id": "org_stream",
+       "workspace_id": "ws_stream",
+       "ts": "2026-11-01 10:00:03.000",
+       "session_id": "stream:parity",
+       "source": "claude",
+       "machine_id": "delivery:44b37ce55ba08dbbc4f66c90bbfaa676",
+       "kind": "session_event",
+       "event_id": "delivery:44b37ce55ba08dbbc4f66c90bbfaa676:event-31-20",
+       "type": "user",
+       "user_id": "user_stream",
+       "actor_name": "",
+       "actor_role": "user",
+       "subagent_id": "",
+       "project_id": "",
+       "task_title": "",
+       "task_ref": "{}",
+       "task_ref_id": "",
+       "tags": [],
+       "files_touched": [],
+       "tool_name": "",
+       "tool_status": "",
+       "delivery_record_id": "event-31-20",
+       "content": "hello 20 r1",
+       "content_bytes": 11,
+       "ingested_at": "2026-11-01 10:00:03.000",
+       "fingerprint": "s313ff5e8487fd82",
+       "version": 1793534400000
+      },
+      {
+       "org_id": "org_stream",
+       "workspace_id": "ws_stream",
+       "ts": "2026-11-01 10:00:03.000",
+       "session_id": "stream:parity",
+       "source": "claude",
+       "machine_id": "delivery:44b37ce55ba08dbbc4f66c90bbfaa676",
+       "kind": "session_event",
+       "event_id": "delivery:44b37ce55ba08dbbc4f66c90bbfaa676:event-31-42",
+       "type": "user",
+       "user_id": "user_stream",
+       "actor_name": "",
+       "actor_role": "user",
+       "subagent_id": "",
+       "project_id": "",
+       "task_title": "",
+       "task_ref": "{}",
+       "task_ref_id": "",
+       "tags": [],
+       "files_touched": [],
+       "tool_name": "",
+       "tool_status": "",
+       "delivery_record_id": "event-31-42",
+       "content": "hello 42 r2",
+       "content_bytes": 11,
+       "ingested_at": "2026-11-01 10:00:03.000",
+       "fingerprint": "s3baf1ac516b14bf",
+       "version": 1793534400000
+      },
+      {
+       "org_id": "org_stream",
+       "workspace_id": "ws_stream",
+       "ts": "2026-11-01 10:00:03.000",
+       "session_id": "stream:parity",
+       "source": "claude",
+       "machine_id": "delivery:44b37ce55ba08dbbc4f66c90bbfaa676",
+       "kind": "session_event",
+       "event_id": "delivery:44b37ce55ba08dbbc4f66c90bbfaa676:event-31-9",
+       "type": "user",
+       "user_id": "user_stream",
+       "actor_name": "",
+       "actor_role": "user",
+       "subagent_id": "",
+       "project_id": "",
+       "task_title": "",
+       "task_ref": "{}",
+       "task_ref_id": "",
+       "tags": [],
+       "files_touched": [],
+       "tool_name": "",
+       "tool_status": "",
+       "delivery_record_id": "event-31-9",
+       "content": "hello 9 r1",
+       "content_bytes": 10,
+       "ingested_at": "2026-11-01 10:00:03.000",
+       "fingerprint": "s36146822f71845e",
+       "version": 1793534400000
+      },
+      {
+       "org_id": "org_stream",
+       "workspace_id": "ws_stream",
+       "ts": "2026-11-01 10:00:03.000",
+       "session_id": "stream:parity",
+       "source": "claude",
+       "machine_id": "delivery:ab9fe22998944278e610d2a73dabdfe3",
+       "kind": "tool_call",
+       "event_id": "delivery:ab9fe22998944278e610d2a73dabdfe3:event-31-52",
+       "type": "tool_call",
+       "user_id": "user_stream",
+       "actor_name": "",
+       "actor_role": "",
+       "subagent_id": "",
+       "project_id": "",
+       "task_title": "",
+       "task_ref": "{}",
+       "task_ref_id": "",
+       "tags": [],
+       "files_touched": [],
+       "tool_name": "Read",
+       "tool_status": "",
+       "delivery_record_id": "event-31-52",
+       "content": "Read",
+       "content_bytes": 4,
+       "ingested_at": "2026-11-01 10:00:03.000",
+       "fingerprint": "s36d2abada4f4ca7",
+       "version": 1793534400000
+      },
+      {
+       "org_id": "org_stream",
+       "workspace_id": "ws_stream",
+       "ts": "2026-11-01 10:00:03.000",
+       "session_id": "stream:parity",
+       "source": "claude",
+       "machine_id": "delivery:ab9fe22998944278e610d2a73dabdfe3",
+       "kind": "file_edit",
+       "event_id": "delivery:ab9fe22998944278e610d2a73dabdfe3:event-31-56",
+       "type": "file_edit",
+       "user_id": "user_stream",
+       "actor_name": "",
+       "actor_role": "",
+       "subagent_id": "",
+       "project_id": "",
+       "task_title": "",
+       "task_ref": "{}",
+       "task_ref_id": "",
+       "tags": [],
+       "files_touched": [
+        "src/a.ts"
+       ],
+       "tool_name": "",
+       "tool_status": "",
+       "delivery_record_id": "event-31-56",
+       "content": "src/a.ts",
+       "content_bytes": 8,
+       "ingested_at": "2026-11-01 10:00:03.000",
+       "fingerprint": "s303e2f329b2afef",
+       "version": 1793534400000
+      },
+      {
+       "org_id": "org_stream",
+       "workspace_id": "ws_stream",
+       "ts": "2026-11-01 10:00:03.000",
+       "session_id": "stream:parity",
+       "source": "claude",
+       "machine_id": "delivery:d4ce1e3374276bd9babaccfe9f65c827",
+       "kind": "tool_call",
+       "event_id": "delivery:d4ce1e3374276bd9babaccfe9f65c827:event-31-21",
+       "type": "tool_call",
+       "user_id": "user_stream",
+       "actor_name": "",
+       "actor_role": "",
+       "subagent_id": "",
+       "project_id": "",
+       "task_title": "",
+       "task_ref": "{}",
+       "task_ref_id": "",
+       "tags": [],
+       "files_touched": [],
+       "tool_name": "Read",
+       "tool_status": "",
+       "delivery_record_id": "event-31-21",
+       "content": "Read",
+       "content_bytes": 4,
+       "ingested_at": "2026-11-01 10:00:03.000",
+       "fingerprint": "s32ffa7cfcc13b5d",
+       "version": 1793534400000
+      },
+      {
+       "org_id": "org_stream",
+       "workspace_id": "ws_stream",
+       "ts": "2026-11-01 10:00:04.000",
+       "session_id": "stream:parity",
+       "source": "claude",
+       "machine_id": "delivery:ab9fe22998944278e610d2a73dabdfe3",
+       "kind": "session_event",
+       "event_id": "delivery:ab9fe22998944278e610d2a73dabdfe3:event-31-12",
+       "type": "assistant",
+       "user_id": "user_stream",
+       "actor_name": "",
+       "actor_role": "assistant",
+       "subagent_id": "",
+       "project_id": "",
+       "task_title": "",
+       "task_ref": "{}",
+       "task_ref_id": "",
+       "tags": [],
+       "files_touched": [],
+       "tool_name": "",
+       "tool_status": "",
+       "delivery_record_id": "event-31-12",
+       "content": "reply 12 r1",
+       "content_bytes": 11,
+       "ingested_at": "2026-11-01 10:00:04.000",
+       "fingerprint": "s3f1812c4a01d62b",
+       "version": 1793534400000
+      },
+      {
+       "org_id": "org_stream",
+       "workspace_id": "ws_stream",
+       "ts": "2026-11-01 10:00:04.000",
+       "session_id": "stream:parity",
+       "source": "claude",
+       "machine_id": "delivery:ab9fe22998944278e610d2a73dabdfe3",
+       "kind": "history",
+       "event_id": "delivery:ab9fe22998944278e610d2a73dabdfe3:event-31-26",
+       "type": "history",
+       "user_id": "user_stream",
+       "actor_name": "",
+       "actor_role": "user",
+       "subagent_id": "",
+       "project_id": "",
+       "task_title": "",
+       "task_ref": "{}",
+       "task_ref_id": "",
+       "tags": [],
+       "files_touched": [],
+       "tool_name": "",
+       "tool_status": "",
+       "delivery_record_id": "event-31-26",
+       "content": "",
+       "content_bytes": 0,
+       "ingested_at": "2026-11-01 10:00:04.000",
+       "fingerprint": "s3538d2a68995079",
+       "version": 1793534400000
+      },
+      {
+       "org_id": "org_stream",
+       "workspace_id": "ws_stream",
+       "ts": "2026-11-01 10:00:04.000",
+       "session_id": "stream:parity",
+       "source": "claude",
+       "machine_id": "delivery:d4ce1e3374276bd9babaccfe9f65c827",
+       "kind": "file_edit",
+       "event_id": "delivery:d4ce1e3374276bd9babaccfe9f65c827:event-31-46",
+       "type": "file_edit",
+       "user_id": "user_stream",
+       "actor_name": "",
+       "actor_role": "",
+       "subagent_id": "",
+       "project_id": "",
+       "task_title": "",
+       "task_ref": "{}",
+       "task_ref_id": "",
+       "tags": [],
+       "files_touched": [
+        "src/a.ts"
+       ],
+       "tool_name": "",
+       "tool_status": "",
+       "delivery_record_id": "event-31-46",
+       "content": "src/a.ts",
+       "content_bytes": 8,
+       "ingested_at": "2026-11-01 10:00:04.000",
+       "fingerprint": "s3d43c29613a7dce",
+       "version": 1793534400000
+      },
+      {
+       "org_id": "org_stream",
+       "workspace_id": "ws_stream",
+       "ts": "2026-11-01 10:00:04.000",
+       "session_id": "stream:parity",
+       "source": "claude",
+       "machine_id": "delivery:d4ce1e3374276bd9babaccfe9f65c827",
+       "kind": "session_event",
+       "event_id": "delivery:d4ce1e3374276bd9babaccfe9f65c827:event-31-49",
+       "type": "assistant",
+       "user_id": "user_stream",
+       "actor_name": "",
+       "actor_role": "assistant",
+       "subagent_id": "",
+       "project_id": "",
+       "task_title": "",
+       "task_ref": "{}",
+       "task_ref_id": "",
+       "tags": [],
+       "files_touched": [],
+       "tool_name": "",
+       "tool_status": "",
+       "delivery_record_id": "event-31-49",
+       "content": "reply 49 r1",
+       "content_bytes": 11,
+       "ingested_at": "2026-11-01 10:00:04.000",
+       "fingerprint": "s30f303b9501e9c6",
+       "version": 1793534400000
+      },
+      {
+       "org_id": "org_stream",
+       "workspace_id": "ws_stream",
+       "ts": "2026-11-01 10:00:05.000",
+       "session_id": "stream:parity",
+       "source": "claude",
+       "machine_id": "delivery:ab9fe22998944278e610d2a73dabdfe3",
+       "kind": "tool_call",
+       "event_id": "delivery:ab9fe22998944278e610d2a73dabdfe3:event-31-29",
+       "type": "tool_call",
+       "user_id": "user_stream",
+       "actor_name": "",
+       "actor_role": "",
+       "subagent_id": "",
+       "project_id": "",
+       "task_title": "",
+       "task_ref": "{}",
+       "task_ref_id": "",
+       "tags": [],
+       "files_touched": [],
+       "tool_name": "Read",
+       "tool_status": "",
+       "delivery_record_id": "event-31-29",
+       "content": "Read",
+       "content_bytes": 4,
+       "ingested_at": "2026-11-01 10:00:05.000",
+       "fingerprint": "s3714d271cfc832d",
+       "version": 1793534400000
+      },
+      {
+       "org_id": "org_stream",
+       "workspace_id": "ws_stream",
+       "ts": "2026-11-01 10:00:06.000",
+       "session_id": "stream:parity",
+       "source": "claude",
+       "machine_id": "delivery:44b37ce55ba08dbbc4f66c90bbfaa676",
+       "kind": "session_event",
+       "event_id": "delivery:44b37ce55ba08dbbc4f66c90bbfaa676:event-31-2",
+       "type": "user",
+       "user_id": "user_stream",
+       "actor_name": "",
+       "actor_role": "user",
+       "subagent_id": "",
+       "project_id": "",
+       "task_title": "",
+       "task_ref": "{}",
+       "task_ref_id": "",
+       "tags": [],
+       "files_touched": [],
+       "tool_name": "",
+       "tool_status": "",
+       "delivery_record_id": "event-31-2",
+       "content": "hello 2 r1",
+       "content_bytes": 10,
+       "ingested_at": "2026-11-01 10:00:06.000",
+       "fingerprint": "s397fbe7269d6562",
+       "version": 1793534400000
+      },
+      {
+       "org_id": "org_stream",
+       "workspace_id": "ws_stream",
+       "ts": "2026-11-01 10:00:06.000",
+       "session_id": "stream:parity",
+       "source": "claude",
+       "machine_id": "delivery:ab9fe22998944278e610d2a73dabdfe3",
+       "kind": "session_event",
+       "event_id": "delivery:ab9fe22998944278e610d2a73dabdfe3:event-31-51",
+       "type": "user",
+       "user_id": "user_stream",
+       "actor_name": "",
+       "actor_role": "user",
+       "subagent_id": "",
+       "project_id": "",
+       "task_title": "",
+       "task_ref": "{}",
+       "task_ref_id": "",
+       "tags": [],
+       "files_touched": [],
+       "tool_name": "",
+       "tool_status": "",
+       "delivery_record_id": "event-31-51",
+       "content": "hello 51 r1",
+       "content_bytes": 11,
+       "ingested_at": "2026-11-01 10:00:06.000",
+       "fingerprint": "s37fcb95f810ea86",
+       "version": 1793534400000
+      },
+      {
+       "org_id": "org_stream",
+       "workspace_id": "ws_stream",
+       "ts": "2026-11-01 10:00:06.000",
+       "session_id": "stream:parity",
+       "source": "claude",
+       "machine_id": "delivery:d4ce1e3374276bd9babaccfe9f65c827",
+       "kind": "tool_call",
+       "event_id": "delivery:d4ce1e3374276bd9babaccfe9f65c827:event-31-24",
+       "type": "tool_call",
+       "user_id": "user_stream",
+       "actor_name": "",
+       "actor_role": "",
+       "subagent_id": "",
+       "project_id": "",
+       "task_title": "",
+       "task_ref": "{}",
+       "task_ref_id": "",
+       "tags": [],
+       "files_touched": [],
+       "tool_name": "Read",
+       "tool_status": "",
+       "delivery_record_id": "event-31-24",
+       "content": "Read",
+       "content_bytes": 4,
+       "ingested_at": "2026-11-01 10:00:06.000",
+       "fingerprint": "s343891c39a101a0",
+       "version": 1793534400000
+      },
+      {
+       "org_id": "org_stream",
+       "workspace_id": "ws_stream",
+       "ts": "2026-11-01 10:00:06.000",
+       "session_id": "stream:parity",
+       "source": "claude",
+       "machine_id": "delivery:d4ce1e3374276bd9babaccfe9f65c827",
+       "kind": "tool_call",
+       "event_id": "delivery:d4ce1e3374276bd9babaccfe9f65c827:event-31-7",
+       "type": "tool_call",
+       "user_id": "user_stream",
+       "actor_name": "",
+       "actor_role": "",
+       "subagent_id": "",
+       "project_id": "",
+       "task_title": "",
+       "task_ref": "{}",
+       "task_ref_id": "",
+       "tags": [],
+       "files_touched": [],
+       "tool_name": "Read",
+       "tool_status": "",
+       "delivery_record_id": "event-31-7",
+       "content": "Read",
+       "content_bytes": 4,
+       "ingested_at": "2026-11-01 10:00:06.000",
+       "fingerprint": "s33366de7af531dd",
+       "version": 1793534400000
+      },
+      {
+       "org_id": "org_stream",
+       "workspace_id": "ws_stream",
+       "ts": "2026-11-01 10:00:07.000",
+       "session_id": "stream:parity",
+       "source": "claude",
+       "machine_id": "delivery:44b37ce55ba08dbbc4f66c90bbfaa676",
+       "kind": "history",
+       "event_id": "delivery:44b37ce55ba08dbbc4f66c90bbfaa676:event-31-3",
+       "type": "history",
+       "user_id": "user_stream",
+       "actor_name": "",
+       "actor_role": "user",
+       "subagent_id": "",
+       "project_id": "",
+       "task_title": "",
+       "task_ref": "{}",
+       "task_ref_id": "",
+       "tags": [],
+       "files_touched": [],
+       "tool_name": "",
+       "tool_status": "",
+       "delivery_record_id": "event-31-3",
+       "content": "",
+       "content_bytes": 0,
+       "ingested_at": "2026-11-01 10:00:07.000",
+       "fingerprint": "s30089d7f07a2d45",
+       "version": 1793534400000
+      },
+      {
+       "org_id": "org_stream",
+       "workspace_id": "ws_stream",
+       "ts": "2026-11-01 10:00:07.000",
+       "session_id": "stream:parity",
+       "source": "claude",
+       "machine_id": "delivery:ab9fe22998944278e610d2a73dabdfe3",
+       "kind": "tool_call",
+       "event_id": "delivery:ab9fe22998944278e610d2a73dabdfe3:event-31-34",
+       "type": "tool_call",
+       "user_id": "user_stream",
+       "actor_name": "",
+       "actor_role": "",
+       "subagent_id": "",
+       "project_id": "",
+       "task_title": "",
+       "task_ref": "{}",
+       "task_ref_id": "",
+       "tags": [],
+       "files_touched": [],
+       "tool_name": "Read",
+       "tool_status": "",
+       "delivery_record_id": "event-31-34",
+       "content": "Read",
+       "content_bytes": 4,
+       "ingested_at": "2026-11-01 10:00:07.000",
+       "fingerprint": "s335c26de998ab23",
+       "version": 1793534400000
+      },
+      {
+       "org_id": "org_stream",
+       "workspace_id": "ws_stream",
+       "ts": "2026-11-01 10:00:07.000",
+       "session_id": "stream:parity",
+       "source": "claude",
+       "machine_id": "delivery:ab9fe22998944278e610d2a73dabdfe3",
+       "kind": "tool_call",
+       "event_id": "delivery:ab9fe22998944278e610d2a73dabdfe3:event-31-57",
+       "type": "tool_call",
+       "user_id": "user_stream",
+       "actor_name": "",
+       "actor_role": "",
+       "subagent_id": "",
+       "project_id": "",
+       "task_title": "",
+       "task_ref": "{}",
+       "task_ref_id": "",
+       "tags": [],
+       "files_touched": [],
+       "tool_name": "Read",
+       "tool_status": "",
+       "delivery_record_id": "event-31-57",
+       "content": "Read",
+       "content_bytes": 4,
+       "ingested_at": "2026-11-01 10:00:07.000",
+       "fingerprint": "s311ecf34d43cba0",
+       "version": 1793534400000
+      },
+      {
+       "org_id": "org_stream",
+       "workspace_id": "ws_stream",
+       "ts": "2026-11-01 10:00:07.000",
+       "session_id": "stream:parity",
+       "source": "claude",
+       "machine_id": "delivery:d4ce1e3374276bd9babaccfe9f65c827",
+       "kind": "session_event",
+       "event_id": "delivery:d4ce1e3374276bd9babaccfe9f65c827:event-31-11",
+       "type": "assistant",
+       "user_id": "user_stream",
+       "actor_name": "",
+       "actor_role": "assistant",
+       "subagent_id": "",
+       "project_id": "",
+       "task_title": "",
+       "task_ref": "{}",
+       "task_ref_id": "",
+       "tags": [],
+       "files_touched": [],
+       "tool_name": "",
+       "tool_status": "",
+       "delivery_record_id": "event-31-11",
+       "content": "reply 11 r1",
+       "content_bytes": 11,
+       "ingested_at": "2026-11-01 10:00:07.000",
+       "fingerprint": "s3eb1cb2d581aef0",
+       "version": 1793534400000
+      },
+      {
+       "org_id": "org_stream",
+       "workspace_id": "ws_stream",
+       "ts": "2026-11-01 10:00:07.000",
+       "session_id": "stream:parity",
+       "source": "claude",
+       "machine_id": "delivery:d4ce1e3374276bd9babaccfe9f65c827",
+       "kind": "tool_call",
+       "event_id": "delivery:d4ce1e3374276bd9babaccfe9f65c827:event-31-16",
+       "type": "tool_call",
+       "user_id": "user_stream",
+       "actor_name": "",
+       "actor_role": "",
+       "subagent_id": "",
+       "project_id": "",
+       "task_title": "",
+       "task_ref": "{}",
+       "task_ref_id": "",
+       "tags": [],
+       "files_touched": [],
+       "tool_name": "Read",
+       "tool_status": "",
+       "delivery_record_id": "event-31-16",
+       "content": "Read",
+       "content_bytes": 4,
+       "ingested_at": "2026-11-01 10:00:07.000",
+       "fingerprint": "s36fbe7d59a81cd2",
+       "version": 1793534400000
+      }
+     ]
+    },
+    {
+     "ch": "insert",
+     "table": "search_ingest_session_state",
+     "rows": [
+      {
+       "org_id": "org_stream",
+       "session_id": "stream_parity",
+       "revision": 1,
+       "synced_at": "2026-11-01 12:00:00.000",
+       "full_synced_at": "2026-11-01 12:00:00.000",
+       "scanned_rows": 50,
+       "needs_full": 0
+      },
+      {
+       "org_id": "org_stream",
+       "session_id": "stream:parity",
+       "revision": 1,
+       "synced_at": "2026-11-01 12:00:00.000",
+       "full_synced_at": "2026-11-01 12:00:00.000",
+       "scanned_rows": 50,
+       "needs_full": 0
+      }
+     ]
+    }
+   ],
+   "log": [
+    {
+     "level": "info",
+     "service": "96bulls",
+     "deployment": "selfhost",
+     "deployment_id": "local",
+     "message": "search index reconciled",
+     "stage": "search-index",
+     "org_id": "org_stream",
+     "workspace_id": "ws_stream",
+     "harness": "claude",
+     "session_id": "stream_parity",
+     "manifests": 3,
+     "count": 50,
+     "inserted": 50,
+     "deleted": 0,
+     "ok": true
+    }
+   ]
+  },
+  {
+   "run": 1,
+   "result": {
+    "batchItemFailures": []
+   },
+   "reads": 31,
+   "sql": [
+    {
+     "sql": "SELECT pg_try_advisory_xact_lock(hashtextextended($1, 0)) AS ok",
+     "params": [
+      "96bulls:search\u001forg_stream\u001fws_stream\u001fclaude\u001fstream_parity"
+     ]
+    },
+    {
+     "sql": "SELECT p.manifest_key, coalesce(p.canonical_session_id,p.session_id) AS canonical_id, coalesce(d.event_projection_epoch, 0)::text AS event_epoch FROM sessions.session_index p LEFT JOIN LATERAL ( SELECT d.event_projection_epoch FROM sessions.session_directory d WHERE d.org_id=p.org_id AND d.workspace_id=p.workspace_id AND d.harness=p.harness AND d.session_id IN(coalesce(p.canonical_session_id,p.session_id),p.session_id) ORDER BY (d.session_id=coalesce(p.canonical_session_id,p.session_id)) DESC LIMIT 1 ) d ON true WHERE p.org_id=$1 AND p.workspace_id=$2 AND p.harness=$3 AND p.session_id=$4 AND p.deleted_at IS NULL ORDER BY p.machine_id",
+     "params": [
+      "org_stream",
+      "ws_stream",
+      "claude",
+      "stream_parity"
+     ]
+    },
+    {
+     "sql": "SELECT pg_try_advisory_xact_lock(hashtextextended($1,0)) AS ok",
+     "params": [
+      "96bulls:directory-events\u001forg_stream\u001fws_stream\u001fclaude\u001fstream:parity"
+     ]
+    },
+    {
+     "sql": "SELECT manifest_key FROM sessions.session_index WHERE org_id=$1 AND workspace_id=$2 AND harness=$3 AND coalesce(canonical_session_id,session_id)=$4 AND deleted_at IS NULL ORDER BY session_id,machine_id",
+     "params": [
+      "org_stream",
+      "ws_stream",
+      "claude",
+      "stream:parity"
+     ]
+    },
+    {
+     "sql": "WITH captured AS MATERIALIZED ( SELECT m.source_session_id,m.epoch FROM sessions.session_directory_event_pending m WHERE m.org_id=$1 AND m.workspace_id=$2 AND m.harness=$3 AND m.source_session_id IN ( SELECT p.session_id FROM sessions.session_index p WHERE p.org_id=$1 AND p.workspace_id=$2 AND p.harness=$3 AND coalesce(p.canonical_session_id,p.session_id)=$4 AND p.deleted_at IS NULL ) ), marker AS MATERIALIZED ( SELECT m.* FROM sessions.session_directory_event_pending m WHERE m.org_id=$1 AND m.workspace_id=$2 AND m.harness=$3 AND (m.source_session_id,m.epoch) IN(SELECT source_session_id,epoch FROM captured) ORDER BY source_session_id FOR UPDATE ), live AS MATERIALIZED ( SELECT d.org_id,d.workspace_id,d.harness,d.session_id FROM sessions.session_directory d,marker m WHERE d.org_id=$1 AND d.workspace_id=$2 AND d.harness=$3 AND d.session_id IN($4,$5) AND d.deleted_at IS NULL AND (SELECT count(*) FROM marker)=(SELECT count(*) FROM captured) ORDER BY (d.session_id=$4) DESC LIMIT 1 FOR UPDATE OF d ), sources AS ( SELECT jsonb_object_agg(p.manifest_key,p.revision::text) AS revisions,count(*) AS n, count(DISTINCT coalesce(p.canonical_session_id,p.session_id)) AS identities, min(coalesce(p.canonical_session_id,p.session_id)) AS canonical_id FROM sessions.session_index p WHERE p.org_id=$1 AND p.workspace_id=$2 AND p.harness=$3 AND coalesce(p.canonical_session_id,p.session_id)=$4 AND p.deleted_at IS NULL ), updated AS ( UPDATE sessions.session_directory d SET event_count=$7::bigint,event_first_ts=$8::timestamptz,event_last_ts=$9::timestamptz, kinds=$10::text[],task_refs=$11::jsonb,task_title=$12, event_user_ids=$26::text[],event_machine_ids=$27::text[],event_models=$28::text[],event_project_id=$29,opening_event=$30::jsonb,event_project_event=$31::jsonb,project_requires_hydration=$32::boolean, input_tokens=$13::bigint,output_tokens=$14::bigint,reasoning_tokens=$15::bigint, cache_read_tokens=$16::bigint,cache_create_tokens=$17::bigint,cache_create_5m_tokens=$18::bigint,cache_create_1h_tokens=$19::bigint,cost_usd_micros=$20::bigint, work_status=$21,work_status_at=$22::timestamptz,event_projection_version=1,event_projection_ready=true,event_projected_at=now(),event_projection_sources=$6::jsonb, search_text=sessions.session_directory_search_text(d.title,$12,d.agent_name,d.project_id,d.git_repo,d.git_branch,d.model,d.short_summary) FROM live l,sources s WHERE d.org_id=l.org_id AND d.workspace_id=l.workspace_id AND d.harness=l.harness AND d.session_id=l.session_id AND s.revisions=$6::jsonb AND s.n=$23::integer AND s.identities=1 AND s.canonical_id=$4 AND d.event_projection_epoch=$24::bigint RETURNING d.org_id,d.workspace_id,d.harness,d.session_id ), clean_marker AS ( UPDATE sessions.session_directory_event_pending m SET dirty=false FROM updated u WHERE m.org_id=$1 AND m.workspace_id=$2 AND m.harness=$3 AND (m.source_session_id,m.epoch) IN(SELECT source_session_id,epoch FROM captured) ), drop_times AS ( DELETE FROM sessions.session_directory_event_times t USING updated u WHERE t.org_id=u.org_id AND t.workspace_id=u.workspace_id AND t.harness=u.harness AND t.session_id=u.session_id AND NOT(t.event_ts=ANY($25::timestamptz[])) ), put_times AS ( INSERT INTO sessions.session_directory_event_times(org_id,workspace_id,harness,session_id,event_ts) SELECT u.org_id,u.workspace_id,u.harness,u.session_id,x.ts FROM updated u,unnest($25::timestamptz[]) x(ts) ON CONFLICT DO NOTHING ) SELECT EXISTS(SELECT 1 FROM updated) AS written",
+     "params": [
+      "org_stream",
+      "ws_stream",
+      "claude",
+      "stream:parity",
+      "stream_parity",
+      "{\"96bulls/org_stream/v1/ws=ws_stream/m=machine_0/h=claude/d=2026/11/01/s=stream_parity/manifest.json\":\"1\",\"96bulls/org_stream/v1/ws=ws_stream/m=machine_1/h=claude/d=2026/11/01/s=stream_parity/manifest.json\":\"1\",\"96bulls/org_stream/v1/ws=ws_stream/m=machine_2/h=claude/d=2026/11/01/s=stream_parity/manifest.json\":\"1\"}",
+      "50",
+      "2026-11-01T10:00:00.000000Z",
+      "2026-11-01T10:00:07.000000Z",
+      [
+       "file_edit",
+       "history",
+       "session_event",
+       "tool_call"
+      ],
+      "[]",
+      null,
+      "33",
+      "55",
+      "0",
+      "0",
+      "0",
+      "0",
+      "0",
+      null,
+      "active",
+      "2026-11-01T10:00:07.000000Z",
+      3,
+      "2",
+      [
+       "2026-11-01T10:00:00.000000Z",
+       "2026-11-01T10:00:01.000000Z",
+       "2026-11-01T10:00:02.000000Z",
+       "2026-11-01T10:00:03.000000Z",
+       "2026-11-01T10:00:04.000000Z",
+       "2026-11-01T10:00:05.000000Z",
+       "2026-11-01T10:00:06.000000Z",
+       "2026-11-01T10:00:07.000000Z"
+      ],
+      [
+       "user_stream"
+      ],
+      [
+       "delivery:44b37ce55ba08dbbc4f66c90bbfaa676",
+       "delivery:ab9fe22998944278e610d2a73dabdfe3",
+       "delivery:d4ce1e3374276bd9babaccfe9f65c827",
+       "machine:0",
+       "machine:1",
+       "machine:2"
+      ],
+      [
+       "fixture-model"
+      ],
+      null,
+      "{\"session_id\":\"stream:parity\",\"event_id\":\"direct-31-55\",\"machine_id\":\"machine:2\",\"kind\":\"session_event\",\"source\":\"claude\",\"ts\":\"2026-11-01T10:00:00.000000Z\",\"fingerprint\":\"s314e72981379a4b\"}",
+      null,
+      false
+     ]
+    },
+    {
+     "sql": "SELECT EXISTS(SELECT 1 FROM pg_catalog.pg_attribute WHERE attrelid=to_regclass('sessions.session_directory') AND attname='recorded_catalog_title' AND NOT attisdropped) AS supported",
+     "params": []
+    },
+    {
+     "sql": "WITH live AS MATERIALIZED ( SELECT d.org_id, d.workspace_id, d.harness, d.session_id, d.last_activity_at FROM sessions.session_directory AS d WHERE d.org_id = $1 AND d.workspace_id = $2 AND d.harness = $3 AND d.session_id = $4 AND d.deleted_at IS NULL FOR UPDATE ), updated AS ( UPDATE sessions.session_directory AS d SET recorded_catalog_title = CASE WHEN d.event_projection_ready AND d.event_projection_epoch=$19::bigint AND EXISTS(SELECT 1 FROM sessions.session_index p WHERE p.org_id=d.org_id AND p.workspace_id=d.workspace_id AND p.harness=d.harness AND p.session_id=$20::text AND coalesce(p.canonical_session_id,p.session_id)=d.session_id AND p.deleted_at IS NULL) THEN $18::text ELSE d.recorded_catalog_title END, title = CASE WHEN d.event_projection_ready AND d.event_projection_epoch=$19::bigint AND EXISTS(SELECT 1 FROM sessions.session_index p WHERE p.org_id=d.org_id AND p.workspace_id=d.workspace_id AND p.harness=d.harness AND p.session_id=$20::text AND coalesce(p.canonical_session_id,p.session_id)=d.session_id AND p.deleted_at IS NULL) THEN coalesce((SELECT b.title FROM sessions.session_briefs b WHERE b.org_id=d.org_id AND b.workspace_id=d.workspace_id AND b.harness=d.harness AND b.session_id=$20::text AND b.title IS NOT NULL AND b.engine_version NOT LIKE 'neon-backfill:%'), (SELECT p.title FROM sessions.session_index p WHERE p.org_id=d.org_id AND p.workspace_id=d.workspace_id AND p.harness=d.harness AND p.session_id=$20::text AND p.deleted_at IS NULL ORDER BY p.last_activity_at DESC,p.revision DESC,p.machine_id DESC LIMIT 1), $18::text) ELSE d.title END, agent_names = $5::text[], catalog_models = $6::text[], project_key = $7, project_key_method = $8, initial_commit = $9, originator = $10, agent_version = $11, project_id = coalesce($12, d.project_id), git_repo = coalesce($13, d.git_repo), git_branch = coalesce($14, d.git_branch), -- The scalar agent the search RPC filters on: keep one already projected, -- else the first catalog agent, and rebuild the search document with it. agent_name = coalesce(d.agent_name, ($5::text[])[1]), agent_name_normalized = lower(btrim(coalesce(d.agent_name, ($5::text[])[1]))), search_text = sessions.session_directory_search_text( CASE WHEN d.event_projection_ready AND d.event_projection_epoch=$19::bigint AND EXISTS(SELECT 1 FROM sessions.session_index p WHERE p.org_id=d.org_id AND p.workspace_id=d.workspace_id AND p.harness=d.harness AND p.session_id=$20::text AND coalesce(p.canonical_session_id,p.session_id)=d.session_id AND p.deleted_at IS NULL) THEN coalesce((SELECT b.title FROM sessions.session_briefs b WHERE b.org_id=d.org_id AND b.workspace_id=d.workspace_id AND b.harness=d.harness AND b.session_id=$20::text AND b.title IS NOT NULL AND b.engine_version NOT LIKE 'neon-backfill:%'), (SELECT p.title FROM sessions.session_index p WHERE p.org_id=d.org_id AND p.workspace_id=d.workspace_id AND p.harness=d.harness AND p.session_id=$20::text AND p.deleted_at IS NULL ORDER BY p.last_activity_at DESC,p.revision DESC,p.machine_id DESC LIMIT 1), $18::text) ELSE d.title END, d.task_title, coalesce(d.agent_name, ($5::text[])[1]), coalesce($12, d.project_id), coalesce($13, d.git_repo), coalesce($14, d.git_branch), d.model, d.short_summary), catalog_projected_at = now() FROM live AS l WHERE d.org_id = l.org_id AND d.workspace_id = l.workspace_id AND d.harness = l.harness AND d.session_id = l.session_id RETURNING d.org_id ), drop_agents AS ( DELETE FROM sessions.session_directory_agents AS a USING live AS l WHERE a.org_id = l.org_id AND a.workspace_id = l.workspace_id AND a.harness = l.harness AND a.session_id = l.session_id AND NOT (a.agent_name_normalized = ANY ($15::text[])) ), put_agents AS ( INSERT INTO sessions.session_directory_agents (org_id, workspace_id, harness, session_id, agent_name, agent_name_normalized, last_activity_at) SELECT l.org_id, l.workspace_id, l.harness, l.session_id, x.name, lower(btrim(x.name)), l.last_activity_at FROM live AS l, unnest($5::text[]) AS x(name) ON CONFLICT (org_id, workspace_id, harness, session_id, agent_name_normalized) DO UPDATE SET agent_name = excluded.agent_name, last_activity_at = excluded.last_activity_at ), edges AS ( SELECT l.org_id, l.workspace_id, l.harness, l.session_id, e.uid, e.child FROM live AS l, unnest($16::text[], $17::text[]) AS e(uid, child) WHERE e.child IS NULL OR NOT EXISTS ( SELECT 1 FROM sessions.session_directory AS c WHERE c.org_id = l.org_id AND c.workspace_id = l.workspace_id AND c.harness = l.harness AND c.session_id = e.child AND c.deleted_at IS NOT NULL) ), drop_edges AS ( DELETE FROM sessions.session_directory_relationships AS r USING live AS l WHERE r.org_id = l.org_id AND r.workspace_id = l.workspace_id AND r.harness = l.harness AND r.parent_session_id = l.session_id AND NOT (r.relationship_uid IN (SELECT e.uid FROM edges AS e)) ), put_edges AS ( INSERT INTO sessions.session_directory_relationships (org_id, workspace_id, harness, parent_session_id, relationship_uid, child_session_id) SELECT e.org_id, e.workspace_id, e.harness, e.session_id, e.uid, e.child FROM edges AS e ON CONFLICT (org_id, workspace_id, harness, parent_session_id, relationship_uid) DO UPDATE SET child_session_id = excluded.child_session_id ) SELECT EXISTS (SELECT 1 FROM updated) AS written",
+     "params": [
+      "org_stream",
+      "ws_stream",
+      "claude",
+      "stream:parity",
+      [],
+      [],
+      null,
+      null,
+      null,
+      null,
+      null,
+      null,
+      null,
+      null,
+      [],
+      [],
+      [],
+      null,
+      "2",
+      "stream_parity"
+     ]
+    }
+   ],
+   "clickhouse": [
+    {
+     "ch": "select",
+     "query": "SELECT argMax(value, updated_at) AS value, count() AS n FROM search_ingest_state WHERE name = {name:String} HAVING n > 0",
+     "params": {
+      "name": "window_start"
+     }
+    },
+    {
+     "ch": "select",
+     "query": "SELECT workspace_id, session_id, machine_id, source, kind, event_id, toUnixTimestamp64Milli(ts) AS ts_ms, fingerprint FROM transcript_events FINAL WHERE org_id = {org:String} AND (session_id = {session:String} OR session_id = {canonical:String}) AND workspace_id = {workspace:String} AND source = {source:String} AND toUnixTimestamp64Milli(ts) >= {from:Int64} LIMIT {limit:UInt32}",
+     "params": {
+      "org": "org_stream",
+      "session": "stream_parity",
+      "canonical": "stream:parity",
+      "workspace": "ws_stream",
+      "source": "claude",
+      "from": 1792324800000,
+      "limit": 500001
+     }
+    },
+    {
+     "ch": "insert",
+     "table": "search_ingest_session_state",
+     "rows": [
+      {
+       "org_id": "org_stream",
+       "session_id": "stream_parity",
+       "revision": 1,
+       "synced_at": "2026-11-01 12:00:00.000",
+       "full_synced_at": "2026-11-01 12:00:00.000",
+       "scanned_rows": 50,
+       "needs_full": 0
+      },
+      {
+       "org_id": "org_stream",
+       "session_id": "stream:parity",
+       "revision": 1,
+       "synced_at": "2026-11-01 12:00:00.000",
+       "full_synced_at": "2026-11-01 12:00:00.000",
+       "scanned_rows": 50,
+       "needs_full": 0
+      }
+     ]
+    }
+   ],
+   "log": [
+    {
+     "level": "info",
+     "service": "96bulls",
+     "deployment": "selfhost",
+     "deployment_id": "local",
+     "message": "search index reconciled",
+     "stage": "search-index",
+     "org_id": "org_stream",
+     "workspace_id": "ws_stream",
+     "harness": "claude",
+     "session_id": "stream_parity",
+     "manifests": 3,
+     "count": 50,
+     "inserted": 0,
+     "deleted": 0,
+     "ok": true
+    }
+   ]
+  }
+ ],
+ "whole read: too large without streaming stays partial, then again": [
+  {
+   "run": 0,
+   "result": {
+    "batchItemFailures": []
+   },
+   "reads": 0,
+   "sql": [
+    {
+     "sql": "SELECT pg_try_advisory_xact_lock(hashtextextended($1, 0)) AS ok",
+     "params": [
+      "96bulls:search\u001forg_stream\u001fws_stream\u001fclaude\u001fstream_parity"
+     ]
+    },
+    {
+     "sql": "SELECT p.manifest_key, coalesce(p.canonical_session_id,p.session_id) AS canonical_id, coalesce(d.event_projection_epoch, 0)::text AS event_epoch FROM sessions.session_index p LEFT JOIN LATERAL ( SELECT d.event_projection_epoch FROM sessions.session_directory d WHERE d.org_id=p.org_id AND d.workspace_id=p.workspace_id AND d.harness=p.harness AND d.session_id IN(coalesce(p.canonical_session_id,p.session_id),p.session_id) ORDER BY (d.session_id=coalesce(p.canonical_session_id,p.session_id)) DESC LIMIT 1 ) d ON true WHERE p.org_id=$1 AND p.workspace_id=$2 AND p.harness=$3 AND p.session_id=$4 AND p.deleted_at IS NULL ORDER BY p.machine_id",
+     "params": [
+      "org_stream",
+      "ws_stream",
+      "claude",
+      "stream_parity"
+     ]
+    },
+    {
+     "sql": "SELECT pg_try_advisory_xact_lock(hashtextextended($1,0)) AS ok",
+     "params": [
+      "96bulls:directory-events\u001forg_stream\u001fws_stream\u001fclaude\u001fstream:parity"
+     ]
+    },
+    {
+     "sql": "SELECT manifest_key FROM sessions.session_index WHERE org_id=$1 AND workspace_id=$2 AND harness=$3 AND coalesce(canonical_session_id,session_id)=$4 AND deleted_at IS NULL ORDER BY session_id,machine_id",
+     "params": [
+      "org_stream",
+      "ws_stream",
+      "claude",
+      "stream:parity"
+     ]
+    },
+    {
+     "sql": "UPDATE sessions.session_directory d SET event_projection_ready=false WHERE d.org_id=$1 AND d.workspace_id=$2 AND d.harness=$3 AND (d.session_id=$4 OR d.session_id IN ( SELECT coalesce(p.canonical_session_id,p.session_id) FROM sessions.session_index p WHERE p.org_id=$1 AND p.workspace_id=$2 AND p.harness=$3 AND p.session_id=$4))",
+     "params": [
+      "org_stream",
+      "ws_stream",
+      "claude",
+      "stream_parity"
+     ]
+    }
+   ],
+   "clickhouse": [
+    {
+     "ch": "select",
+     "query": "SELECT argMax(value, updated_at) AS value, count() AS n FROM search_ingest_state WHERE name = {name:String} HAVING n > 0",
+     "params": {
+      "name": "window_start"
+     }
+    },
+    {
+     "ch": "insert",
+     "table": "search_ingest_session_state",
+     "rows": [
+      {
+       "org_id": "org_stream",
+       "session_id": "stream_parity",
+       "revision": 1,
+       "synced_at": "2026-11-01 12:00:00.000",
+       "full_synced_at": "1970-01-01 00:00:00.000",
+       "scanned_rows": 0,
+       "needs_full": 1
+      },
+      {
+       "org_id": "org_stream",
+       "session_id": "stream:parity",
+       "revision": 1,
+       "synced_at": "2026-11-01 12:00:00.000",
+       "full_synced_at": "1970-01-01 00:00:00.000",
+       "scanned_rows": 0,
+       "needs_full": 1
+      }
+     ]
+    }
+   ],
+   "log": [
+    {
+     "level": "warn",
+     "service": "96bulls",
+     "deployment": "selfhost",
+     "deployment_id": "local",
+     "message": "search index partial",
+     "stage": "search-index",
+     "org_id": "org_stream",
+     "session_id": "stream_parity",
+     "manifests": 2,
+     "reason": "scope_too_large"
+    },
+    {
+     "level": "info",
+     "service": "96bulls",
+     "deployment": "selfhost",
+     "deployment_id": "local",
+     "message": "search index reconciled",
+     "stage": "search-index",
+     "org_id": "org_stream",
+     "workspace_id": "ws_stream",
+     "harness": "claude",
+     "session_id": "stream_parity",
+     "manifests": 2,
+     "count": 0,
+     "inserted": 0,
+     "deleted": 0,
+     "ok": false,
+     "reason": "scope_too_large"
+    }
+   ]
+  },
+  {
+   "run": 1,
+   "result": {
+    "batchItemFailures": []
+   },
+   "reads": 0,
+   "sql": [
+    {
+     "sql": "SELECT pg_try_advisory_xact_lock(hashtextextended($1, 0)) AS ok",
+     "params": [
+      "96bulls:search\u001forg_stream\u001fws_stream\u001fclaude\u001fstream_parity"
+     ]
+    },
+    {
+     "sql": "SELECT p.manifest_key, coalesce(p.canonical_session_id,p.session_id) AS canonical_id, coalesce(d.event_projection_epoch, 0)::text AS event_epoch FROM sessions.session_index p LEFT JOIN LATERAL ( SELECT d.event_projection_epoch FROM sessions.session_directory d WHERE d.org_id=p.org_id AND d.workspace_id=p.workspace_id AND d.harness=p.harness AND d.session_id IN(coalesce(p.canonical_session_id,p.session_id),p.session_id) ORDER BY (d.session_id=coalesce(p.canonical_session_id,p.session_id)) DESC LIMIT 1 ) d ON true WHERE p.org_id=$1 AND p.workspace_id=$2 AND p.harness=$3 AND p.session_id=$4 AND p.deleted_at IS NULL ORDER BY p.machine_id",
+     "params": [
+      "org_stream",
+      "ws_stream",
+      "claude",
+      "stream_parity"
+     ]
+    },
+    {
+     "sql": "SELECT pg_try_advisory_xact_lock(hashtextextended($1,0)) AS ok",
+     "params": [
+      "96bulls:directory-events\u001forg_stream\u001fws_stream\u001fclaude\u001fstream:parity"
+     ]
+    },
+    {
+     "sql": "SELECT manifest_key FROM sessions.session_index WHERE org_id=$1 AND workspace_id=$2 AND harness=$3 AND coalesce(canonical_session_id,session_id)=$4 AND deleted_at IS NULL ORDER BY session_id,machine_id",
+     "params": [
+      "org_stream",
+      "ws_stream",
+      "claude",
+      "stream:parity"
+     ]
+    },
+    {
+     "sql": "UPDATE sessions.session_directory d SET event_projection_ready=false WHERE d.org_id=$1 AND d.workspace_id=$2 AND d.harness=$3 AND (d.session_id=$4 OR d.session_id IN ( SELECT coalesce(p.canonical_session_id,p.session_id) FROM sessions.session_index p WHERE p.org_id=$1 AND p.workspace_id=$2 AND p.harness=$3 AND p.session_id=$4))",
+     "params": [
+      "org_stream",
+      "ws_stream",
+      "claude",
+      "stream_parity"
+     ]
+    }
+   ],
+   "clickhouse": [
+    {
+     "ch": "select",
+     "query": "SELECT argMax(value, updated_at) AS value, count() AS n FROM search_ingest_state WHERE name = {name:String} HAVING n > 0",
+     "params": {
+      "name": "window_start"
+     }
+    },
+    {
+     "ch": "insert",
+     "table": "search_ingest_session_state",
+     "rows": [
+      {
+       "org_id": "org_stream",
+       "session_id": "stream_parity",
+       "revision": 1,
+       "synced_at": "2026-11-01 12:00:00.000",
+       "full_synced_at": "1970-01-01 00:00:00.000",
+       "scanned_rows": 0,
+       "needs_full": 1
+      },
+      {
+       "org_id": "org_stream",
+       "session_id": "stream:parity",
+       "revision": 1,
+       "synced_at": "2026-11-01 12:00:00.000",
+       "full_synced_at": "1970-01-01 00:00:00.000",
+       "scanned_rows": 0,
+       "needs_full": 1
+      }
+     ]
+    }
+   ],
+   "log": [
+    {
+     "level": "warn",
+     "service": "96bulls",
+     "deployment": "selfhost",
+     "deployment_id": "local",
+     "message": "search index partial",
+     "stage": "search-index",
+     "org_id": "org_stream",
+     "session_id": "stream_parity",
+     "manifests": 2,
+     "reason": "scope_too_large"
+    },
+    {
+     "level": "info",
+     "service": "96bulls",
+     "deployment": "selfhost",
+     "deployment_id": "local",
+     "message": "search index reconciled",
+     "stage": "search-index",
+     "org_id": "org_stream",
+     "workspace_id": "ws_stream",
+     "harness": "claude",
+     "session_id": "stream_parity",
+     "manifests": 2,
+     "count": 0,
+     "inserted": 0,
+     "deleted": 0,
+     "ok": false,
+     "reason": "scope_too_large"
+    }
+   ]
+  }
+ ],
+ "too large for the stream budgets too: partial, then again": [
+  {
+   "run": 0,
+   "result": {
+    "batchItemFailures": []
+   },
+   "reads": 0,
+   "sql": [
+    {
+     "sql": "SELECT pg_try_advisory_xact_lock(hashtextextended($1, 0)) AS ok",
+     "params": [
+      "96bulls:search\u001forg_stream\u001fws_stream\u001fclaude\u001fstream_parity"
+     ]
+    },
+    {
+     "sql": "SELECT p.manifest_key, coalesce(p.canonical_session_id,p.session_id) AS canonical_id, coalesce(d.event_projection_epoch, 0)::text AS event_epoch FROM sessions.session_index p LEFT JOIN LATERAL ( SELECT d.event_projection_epoch FROM sessions.session_directory d WHERE d.org_id=p.org_id AND d.workspace_id=p.workspace_id AND d.harness=p.harness AND d.session_id IN(coalesce(p.canonical_session_id,p.session_id),p.session_id) ORDER BY (d.session_id=coalesce(p.canonical_session_id,p.session_id)) DESC LIMIT 1 ) d ON true WHERE p.org_id=$1 AND p.workspace_id=$2 AND p.harness=$3 AND p.session_id=$4 AND p.deleted_at IS NULL ORDER BY p.machine_id",
+     "params": [
+      "org_stream",
+      "ws_stream",
+      "claude",
+      "stream_parity"
+     ]
+    },
+    {
+     "sql": "SELECT pg_try_advisory_xact_lock(hashtextextended($1,0)) AS ok",
+     "params": [
+      "96bulls:directory-events\u001forg_stream\u001fws_stream\u001fclaude\u001fstream:parity"
+     ]
+    },
+    {
+     "sql": "SELECT manifest_key FROM sessions.session_index WHERE org_id=$1 AND workspace_id=$2 AND harness=$3 AND coalesce(canonical_session_id,session_id)=$4 AND deleted_at IS NULL ORDER BY session_id,machine_id",
+     "params": [
+      "org_stream",
+      "ws_stream",
+      "claude",
+      "stream:parity"
+     ]
+    },
+    {
+     "sql": "UPDATE sessions.session_directory d SET event_projection_ready=false WHERE d.org_id=$1 AND d.workspace_id=$2 AND d.harness=$3 AND (d.session_id=$4 OR d.session_id IN ( SELECT coalesce(p.canonical_session_id,p.session_id) FROM sessions.session_index p WHERE p.org_id=$1 AND p.workspace_id=$2 AND p.harness=$3 AND p.session_id=$4))",
+     "params": [
+      "org_stream",
+      "ws_stream",
+      "claude",
+      "stream_parity"
+     ]
+    }
+   ],
+   "clickhouse": [
+    {
+     "ch": "select",
+     "query": "SELECT argMax(value, updated_at) AS value, count() AS n FROM search_ingest_state WHERE name = {name:String} HAVING n > 0",
+     "params": {
+      "name": "window_start"
+     }
+    },
+    {
+     "ch": "insert",
+     "table": "search_ingest_session_state",
+     "rows": [
+      {
+       "org_id": "org_stream",
+       "session_id": "stream_parity",
+       "revision": 1,
+       "synced_at": "2026-11-01 12:00:00.000",
+       "full_synced_at": "1970-01-01 00:00:00.000",
+       "scanned_rows": 0,
+       "needs_full": 1
+      },
+      {
+       "org_id": "org_stream",
+       "session_id": "stream:parity",
+       "revision": 1,
+       "synced_at": "2026-11-01 12:00:00.000",
+       "full_synced_at": "1970-01-01 00:00:00.000",
+       "scanned_rows": 0,
+       "needs_full": 1
+      }
+     ]
+    }
+   ],
+   "log": [
+    {
+     "level": "warn",
+     "service": "96bulls",
+     "deployment": "selfhost",
+     "deployment_id": "local",
+     "message": "search index partial",
+     "stage": "search-index",
+     "org_id": "org_stream",
+     "session_id": "stream_parity",
+     "manifests": 2,
+     "reason": "scope_too_large,stream_read_bytes_budget"
+    },
+    {
+     "level": "info",
+     "service": "96bulls",
+     "deployment": "selfhost",
+     "deployment_id": "local",
+     "message": "search index reconciled",
+     "stage": "search-index",
+     "org_id": "org_stream",
+     "workspace_id": "ws_stream",
+     "harness": "claude",
+     "session_id": "stream_parity",
+     "manifests": 2,
+     "count": 0,
+     "inserted": 0,
+     "deleted": 0,
+     "ok": false,
+     "reason": "scope_too_large,stream_read_bytes_budget"
+    }
+   ]
+  },
+  {
+   "run": 1,
+   "result": {
+    "batchItemFailures": []
+   },
+   "reads": 0,
+   "sql": [
+    {
+     "sql": "SELECT pg_try_advisory_xact_lock(hashtextextended($1, 0)) AS ok",
+     "params": [
+      "96bulls:search\u001forg_stream\u001fws_stream\u001fclaude\u001fstream_parity"
+     ]
+    },
+    {
+     "sql": "SELECT p.manifest_key, coalesce(p.canonical_session_id,p.session_id) AS canonical_id, coalesce(d.event_projection_epoch, 0)::text AS event_epoch FROM sessions.session_index p LEFT JOIN LATERAL ( SELECT d.event_projection_epoch FROM sessions.session_directory d WHERE d.org_id=p.org_id AND d.workspace_id=p.workspace_id AND d.harness=p.harness AND d.session_id IN(coalesce(p.canonical_session_id,p.session_id),p.session_id) ORDER BY (d.session_id=coalesce(p.canonical_session_id,p.session_id)) DESC LIMIT 1 ) d ON true WHERE p.org_id=$1 AND p.workspace_id=$2 AND p.harness=$3 AND p.session_id=$4 AND p.deleted_at IS NULL ORDER BY p.machine_id",
+     "params": [
+      "org_stream",
+      "ws_stream",
+      "claude",
+      "stream_parity"
+     ]
+    },
+    {
+     "sql": "SELECT pg_try_advisory_xact_lock(hashtextextended($1,0)) AS ok",
+     "params": [
+      "96bulls:directory-events\u001forg_stream\u001fws_stream\u001fclaude\u001fstream:parity"
+     ]
+    },
+    {
+     "sql": "SELECT manifest_key FROM sessions.session_index WHERE org_id=$1 AND workspace_id=$2 AND harness=$3 AND coalesce(canonical_session_id,session_id)=$4 AND deleted_at IS NULL ORDER BY session_id,machine_id",
+     "params": [
+      "org_stream",
+      "ws_stream",
+      "claude",
+      "stream:parity"
+     ]
+    },
+    {
+     "sql": "UPDATE sessions.session_directory d SET event_projection_ready=false WHERE d.org_id=$1 AND d.workspace_id=$2 AND d.harness=$3 AND (d.session_id=$4 OR d.session_id IN ( SELECT coalesce(p.canonical_session_id,p.session_id) FROM sessions.session_index p WHERE p.org_id=$1 AND p.workspace_id=$2 AND p.harness=$3 AND p.session_id=$4))",
+     "params": [
+      "org_stream",
+      "ws_stream",
+      "claude",
+      "stream_parity"
+     ]
+    }
+   ],
+   "clickhouse": [
+    {
+     "ch": "select",
+     "query": "SELECT argMax(value, updated_at) AS value, count() AS n FROM search_ingest_state WHERE name = {name:String} HAVING n > 0",
+     "params": {
+      "name": "window_start"
+     }
+    },
+    {
+     "ch": "insert",
+     "table": "search_ingest_session_state",
+     "rows": [
+      {
+       "org_id": "org_stream",
+       "session_id": "stream_parity",
+       "revision": 1,
+       "synced_at": "2026-11-01 12:00:00.000",
+       "full_synced_at": "1970-01-01 00:00:00.000",
+       "scanned_rows": 0,
+       "needs_full": 1
+      },
+      {
+       "org_id": "org_stream",
+       "session_id": "stream:parity",
+       "revision": 1,
+       "synced_at": "2026-11-01 12:00:00.000",
+       "full_synced_at": "1970-01-01 00:00:00.000",
+       "scanned_rows": 0,
+       "needs_full": 1
+      }
+     ]
+    }
+   ],
+   "log": [
+    {
+     "level": "warn",
+     "service": "96bulls",
+     "deployment": "selfhost",
+     "deployment_id": "local",
+     "message": "search index partial",
+     "stage": "search-index",
+     "org_id": "org_stream",
+     "session_id": "stream_parity",
+     "manifests": 2,
+     "reason": "scope_too_large,stream_read_bytes_budget"
+    },
+    {
+     "level": "info",
+     "service": "96bulls",
+     "deployment": "selfhost",
+     "deployment_id": "local",
+     "message": "search index reconciled",
+     "stage": "search-index",
+     "org_id": "org_stream",
+     "workspace_id": "ws_stream",
+     "harness": "claude",
+     "session_id": "stream_parity",
+     "manifests": 2,
+     "count": 0,
+     "inserted": 0,
+     "deleted": 0,
+     "ok": false,
+     "reason": "scope_too_large,stream_read_bytes_budget"
+    }
+   ]
+  }
+ ],
+ "acceptance missing: incomplete, then the same event again": [
+  {
+   "run": 0,
+   "result": {
+    "batchItemFailures": []
+   },
+   "reads": 31,
+   "sql": [
+    {
+     "sql": "SELECT pg_try_advisory_xact_lock(hashtextextended($1, 0)) AS ok",
+     "params": [
+      "96bulls:search\u001forg_stream\u001fws_stream\u001fclaude\u001fstream_parity"
+     ]
+    },
+    {
+     "sql": "SELECT p.manifest_key, coalesce(p.canonical_session_id,p.session_id) AS canonical_id, coalesce(d.event_projection_epoch, 0)::text AS event_epoch FROM sessions.session_index p LEFT JOIN LATERAL ( SELECT d.event_projection_epoch FROM sessions.session_directory d WHERE d.org_id=p.org_id AND d.workspace_id=p.workspace_id AND d.harness=p.harness AND d.session_id IN(coalesce(p.canonical_session_id,p.session_id),p.session_id) ORDER BY (d.session_id=coalesce(p.canonical_session_id,p.session_id)) DESC LIMIT 1 ) d ON true WHERE p.org_id=$1 AND p.workspace_id=$2 AND p.harness=$3 AND p.session_id=$4 AND p.deleted_at IS NULL ORDER BY p.machine_id",
+     "params": [
+      "org_stream",
+      "ws_stream",
+      "claude",
+      "stream_parity"
+     ]
+    },
+    {
+     "sql": "SELECT pg_try_advisory_xact_lock(hashtextextended($1,0)) AS ok",
+     "params": [
+      "96bulls:directory-events\u001forg_stream\u001fws_stream\u001fclaude\u001fstream:parity"
+     ]
+    },
+    {
+     "sql": "SELECT manifest_key FROM sessions.session_index WHERE org_id=$1 AND workspace_id=$2 AND harness=$3 AND coalesce(canonical_session_id,session_id)=$4 AND deleted_at IS NULL ORDER BY session_id,machine_id",
+     "params": [
+      "org_stream",
+      "ws_stream",
+      "claude",
+      "stream:parity"
+     ]
+    },
+    {
+     "sql": "UPDATE sessions.session_directory d SET event_projection_ready=false WHERE d.org_id=$1 AND d.workspace_id=$2 AND d.harness=$3 AND (d.session_id=$4 OR d.session_id IN ( SELECT coalesce(p.canonical_session_id,p.session_id) FROM sessions.session_index p WHERE p.org_id=$1 AND p.workspace_id=$2 AND p.harness=$3 AND p.session_id=$4))",
+     "params": [
+      "org_stream",
+      "ws_stream",
+      "claude",
+      "stream_parity"
+     ]
+    }
+   ],
+   "clickhouse": [
+    {
+     "ch": "select",
+     "query": "SELECT argMax(value, updated_at) AS value, count() AS n FROM search_ingest_state WHERE name = {name:String} HAVING n > 0",
+     "params": {
+      "name": "window_start"
+     }
+    },
+    {
+     "ch": "insert",
+     "table": "search_ingest_session_state",
+     "rows": [
+      {
+       "org_id": "org_stream",
+       "session_id": "stream_parity",
+       "revision": 1,
+       "synced_at": "2026-11-01 12:00:00.000",
+       "full_synced_at": "1970-01-01 00:00:00.000",
+       "scanned_rows": 0,
+       "needs_full": 1
+      },
+      {
+       "org_id": "org_stream",
+       "session_id": "stream:parity",
+       "revision": 1,
+       "synced_at": "2026-11-01 12:00:00.000",
+       "full_synced_at": "1970-01-01 00:00:00.000",
+       "scanned_rows": 0,
+       "needs_full": 1
+      }
+     ]
+    }
+   ],
+   "log": [
+    {
+     "level": "info",
+     "service": "96bulls",
+     "deployment": "selfhost",
+     "deployment_id": "local",
+     "message": "search index reconciled",
+     "stage": "search-index",
+     "org_id": "org_stream",
+     "workspace_id": "ws_stream",
+     "harness": "claude",
+     "session_id": "stream_parity",
+     "manifests": 3,
+     "count": 0,
+     "inserted": 0,
+     "deleted": 0,
+     "ok": false,
+     "reason": "relayhistory_acceptance_missing,manifest_fold_failed,relayhistory_event_identity"
+    }
+   ]
+  },
+  {
+   "run": 1,
+   "result": {
+    "batchItemFailures": []
+   },
+   "reads": 31,
+   "sql": [
+    {
+     "sql": "SELECT pg_try_advisory_xact_lock(hashtextextended($1, 0)) AS ok",
+     "params": [
+      "96bulls:search\u001forg_stream\u001fws_stream\u001fclaude\u001fstream_parity"
+     ]
+    },
+    {
+     "sql": "SELECT p.manifest_key, coalesce(p.canonical_session_id,p.session_id) AS canonical_id, coalesce(d.event_projection_epoch, 0)::text AS event_epoch FROM sessions.session_index p LEFT JOIN LATERAL ( SELECT d.event_projection_epoch FROM sessions.session_directory d WHERE d.org_id=p.org_id AND d.workspace_id=p.workspace_id AND d.harness=p.harness AND d.session_id IN(coalesce(p.canonical_session_id,p.session_id),p.session_id) ORDER BY (d.session_id=coalesce(p.canonical_session_id,p.session_id)) DESC LIMIT 1 ) d ON true WHERE p.org_id=$1 AND p.workspace_id=$2 AND p.harness=$3 AND p.session_id=$4 AND p.deleted_at IS NULL ORDER BY p.machine_id",
+     "params": [
+      "org_stream",
+      "ws_stream",
+      "claude",
+      "stream_parity"
+     ]
+    },
+    {
+     "sql": "SELECT pg_try_advisory_xact_lock(hashtextextended($1,0)) AS ok",
+     "params": [
+      "96bulls:directory-events\u001forg_stream\u001fws_stream\u001fclaude\u001fstream:parity"
+     ]
+    },
+    {
+     "sql": "SELECT manifest_key FROM sessions.session_index WHERE org_id=$1 AND workspace_id=$2 AND harness=$3 AND coalesce(canonical_session_id,session_id)=$4 AND deleted_at IS NULL ORDER BY session_id,machine_id",
+     "params": [
+      "org_stream",
+      "ws_stream",
+      "claude",
+      "stream:parity"
+     ]
+    },
+    {
+     "sql": "UPDATE sessions.session_directory d SET event_projection_ready=false WHERE d.org_id=$1 AND d.workspace_id=$2 AND d.harness=$3 AND (d.session_id=$4 OR d.session_id IN ( SELECT coalesce(p.canonical_session_id,p.session_id) FROM sessions.session_index p WHERE p.org_id=$1 AND p.workspace_id=$2 AND p.harness=$3 AND p.session_id=$4))",
+     "params": [
+      "org_stream",
+      "ws_stream",
+      "claude",
+      "stream_parity"
+     ]
+    }
+   ],
+   "clickhouse": [
+    {
+     "ch": "select",
+     "query": "SELECT argMax(value, updated_at) AS value, count() AS n FROM search_ingest_state WHERE name = {name:String} HAVING n > 0",
+     "params": {
+      "name": "window_start"
+     }
+    },
+    {
+     "ch": "insert",
+     "table": "search_ingest_session_state",
+     "rows": [
+      {
+       "org_id": "org_stream",
+       "session_id": "stream_parity",
+       "revision": 1,
+       "synced_at": "2026-11-01 12:00:00.000",
+       "full_synced_at": "1970-01-01 00:00:00.000",
+       "scanned_rows": 0,
+       "needs_full": 1
+      },
+      {
+       "org_id": "org_stream",
+       "session_id": "stream:parity",
+       "revision": 1,
+       "synced_at": "2026-11-01 12:00:00.000",
+       "full_synced_at": "1970-01-01 00:00:00.000",
+       "scanned_rows": 0,
+       "needs_full": 1
+      }
+     ]
+    }
+   ],
+   "log": [
+    {
+     "level": "info",
+     "service": "96bulls",
+     "deployment": "selfhost",
+     "deployment_id": "local",
+     "message": "search index reconciled",
+     "stage": "search-index",
+     "org_id": "org_stream",
+     "workspace_id": "ws_stream",
+     "harness": "claude",
+     "session_id": "stream_parity",
+     "manifests": 3,
+     "count": 0,
+     "inserted": 0,
+     "deleted": 0,
+     "ok": false,
+     "reason": "relayhistory_acceptance_missing,manifest_fold_failed,relayhistory_event_identity"
+    }
+   ]
+  }
+ ],
+ "M2 managed pass on an acceptance-held scope: held, then held again": [
+  {
+   "run": 0,
+   "result": {
+    "outcome": "held",
+    "reasons": [
+     "relayhistory_acceptance_missing",
+     "manifest_fold_failed",
+     "relayhistory_event_identity"
+    ],
+    "search": {
+     "manifests": 3,
+     "rows": 0,
+     "inserted": 0,
+     "deleted": 0,
+     "complete": false,
+     "reasons": [
+      "relayhistory_acceptance_missing",
+      "manifest_fold_failed",
+      "relayhistory_event_identity"
+     ]
+    }
+   },
+   "reads": 31,
+   "sql": [
+    {
+     "sql": "SELECT pg_try_advisory_xact_lock(hashtextextended($1, 0)) AS ok",
+     "params": [
+      "96bulls:search\u001forg_stream\u001fws_stream\u001fclaude\u001fstream_parity"
+     ]
+    },
+    {
+     "sql": "SELECT pg_try_advisory_xact_lock(hashtextextended($1,0)) AS ok",
+     "params": [
+      "96bulls:directory-events\u001forg_stream\u001fws_stream\u001fclaude\u001fstream:parity"
+     ]
+    },
+    {
+     "sql": "SELECT count(*) FILTER (WHERE i.deleted_at IS NULL)::int AS live, count(*) FILTER (WHERE i.deleted_at IS NULL AND i.session_id = $5)::int AS keys, count(*)::int AS rows, (SELECT d.event_projection_epoch::text FROM sessions.session_directory d WHERE d.org_id = $1 AND d.workspace_id = $2 AND d.harness = $3 AND d.session_id = $4) AS epoch FROM sessions.session_index i WHERE i.org_id = $1 AND i.workspace_id = $2 AND i.harness = $3 AND (coalesce(i.canonical_session_id, i.session_id) = $4 OR i.session_id = $5)",
+     "params": [
+      "org_stream",
+      "ws_stream",
+      "claude",
+      "stream:parity",
+      "stream_parity"
+     ]
+    },
+    {
+     "sql": "SELECT EXISTS ( SELECT 1 FROM ( SELECT d.deleted_at, d.event_projection_ready, d.event_projection_version, d.event_projection_epoch, d.event_projection_sources FROM sessions.session_directory d WHERE d.org_id=$1 AND d.workspace_id=$2 AND d.harness=$3 AND d.session_id IN ($4,$5) ORDER BY (d.session_id=$4) DESC LIMIT 1 ) d WHERE d.deleted_at IS NULL AND d.event_projection_ready AND d.event_projection_version=1 AND d.event_projection_sources=( SELECT jsonb_object_agg(p.manifest_key,p.revision::text) FROM sessions.session_index p WHERE p.org_id=$1 AND p.workspace_id=$2 AND p.harness=$3 AND coalesce(p.canonical_session_id,p.session_id)=$4 AND p.deleted_at IS NULL) ) AS current",
+     "params": [
+      "org_stream",
+      "ws_stream",
+      "claude",
+      "stream:parity",
+      "stream_parity"
+     ]
+    },
+    {
+     "sql": "SELECT pg_try_advisory_xact_lock(hashtextextended($1, 0)) AS ok",
+     "params": [
+      "96bulls:search\u001forg_stream\u001fws_stream\u001fclaude\u001fstream_parity"
+     ]
+    },
+    {
+     "sql": "SELECT p.manifest_key, coalesce(p.canonical_session_id,p.session_id) AS canonical_id, coalesce(d.event_projection_epoch, 0)::text AS event_epoch FROM sessions.session_index p LEFT JOIN LATERAL ( SELECT d.event_projection_epoch FROM sessions.session_directory d WHERE d.org_id=p.org_id AND d.workspace_id=p.workspace_id AND d.harness=p.harness AND d.session_id IN(coalesce(p.canonical_session_id,p.session_id),p.session_id) ORDER BY (d.session_id=coalesce(p.canonical_session_id,p.session_id)) DESC LIMIT 1 ) d ON true WHERE p.org_id=$1 AND p.workspace_id=$2 AND p.harness=$3 AND p.session_id=$4 AND p.deleted_at IS NULL ORDER BY p.machine_id",
+     "params": [
+      "org_stream",
+      "ws_stream",
+      "claude",
+      "stream_parity"
+     ]
+    },
+    {
+     "sql": "SELECT pg_try_advisory_xact_lock(hashtextextended($1,0)) AS ok",
+     "params": [
+      "96bulls:directory-events\u001forg_stream\u001fws_stream\u001fclaude\u001fstream:parity"
+     ]
+    },
+    {
+     "sql": "SELECT manifest_key FROM sessions.session_index WHERE org_id=$1 AND workspace_id=$2 AND harness=$3 AND coalesce(canonical_session_id,session_id)=$4 AND deleted_at IS NULL ORDER BY session_id,machine_id",
+     "params": [
+      "org_stream",
+      "ws_stream",
+      "claude",
+      "stream:parity"
+     ]
+    },
+    {
+     "sql": "UPDATE sessions.session_directory d SET event_projection_ready=false WHERE d.org_id=$1 AND d.workspace_id=$2 AND d.harness=$3 AND (d.session_id=$4 OR d.session_id IN ( SELECT coalesce(p.canonical_session_id,p.session_id) FROM sessions.session_index p WHERE p.org_id=$1 AND p.workspace_id=$2 AND p.harness=$3 AND p.session_id=$4))",
+     "params": [
+      "org_stream",
+      "ws_stream",
+      "claude",
+      "stream_parity"
+     ]
+    }
+   ],
+   "clickhouse": [
+    {
+     "ch": "select",
+     "query": "SELECT argMax(value, updated_at) AS value, count() AS n FROM search_ingest_state WHERE name = {name:String} HAVING n > 0",
+     "params": {
+      "name": "window_start"
+     }
+    },
+    {
+     "ch": "insert",
+     "table": "search_ingest_session_state",
+     "rows": [
+      {
+       "org_id": "org_stream",
+       "session_id": "stream_parity",
+       "revision": 1,
+       "synced_at": "2026-11-01 12:00:00.000",
+       "full_synced_at": "1970-01-01 00:00:00.000",
+       "scanned_rows": 0,
+       "needs_full": 1
+      },
+      {
+       "org_id": "org_stream",
+       "session_id": "stream:parity",
+       "revision": 1,
+       "synced_at": "2026-11-01 12:00:00.000",
+       "full_synced_at": "1970-01-01 00:00:00.000",
+       "scanned_rows": 0,
+       "needs_full": 1
+      }
+     ]
+    }
+   ],
+   "log": []
+  },
+  {
+   "run": 1,
+   "result": {
+    "outcome": "held",
+    "reasons": [
+     "relayhistory_acceptance_missing",
+     "manifest_fold_failed",
+     "relayhistory_event_identity"
+    ],
+    "search": {
+     "manifests": 3,
+     "rows": 0,
+     "inserted": 0,
+     "deleted": 0,
+     "complete": false,
+     "reasons": [
+      "relayhistory_acceptance_missing",
+      "manifest_fold_failed",
+      "relayhistory_event_identity"
+     ]
+    }
+   },
+   "reads": 31,
+   "sql": [
+    {
+     "sql": "SELECT pg_try_advisory_xact_lock(hashtextextended($1, 0)) AS ok",
+     "params": [
+      "96bulls:search\u001forg_stream\u001fws_stream\u001fclaude\u001fstream_parity"
+     ]
+    },
+    {
+     "sql": "SELECT pg_try_advisory_xact_lock(hashtextextended($1,0)) AS ok",
+     "params": [
+      "96bulls:directory-events\u001forg_stream\u001fws_stream\u001fclaude\u001fstream:parity"
+     ]
+    },
+    {
+     "sql": "SELECT count(*) FILTER (WHERE i.deleted_at IS NULL)::int AS live, count(*) FILTER (WHERE i.deleted_at IS NULL AND i.session_id = $5)::int AS keys, count(*)::int AS rows, (SELECT d.event_projection_epoch::text FROM sessions.session_directory d WHERE d.org_id = $1 AND d.workspace_id = $2 AND d.harness = $3 AND d.session_id = $4) AS epoch FROM sessions.session_index i WHERE i.org_id = $1 AND i.workspace_id = $2 AND i.harness = $3 AND (coalesce(i.canonical_session_id, i.session_id) = $4 OR i.session_id = $5)",
+     "params": [
+      "org_stream",
+      "ws_stream",
+      "claude",
+      "stream:parity",
+      "stream_parity"
+     ]
+    },
+    {
+     "sql": "SELECT EXISTS ( SELECT 1 FROM ( SELECT d.deleted_at, d.event_projection_ready, d.event_projection_version, d.event_projection_epoch, d.event_projection_sources FROM sessions.session_directory d WHERE d.org_id=$1 AND d.workspace_id=$2 AND d.harness=$3 AND d.session_id IN ($4,$5) ORDER BY (d.session_id=$4) DESC LIMIT 1 ) d WHERE d.deleted_at IS NULL AND d.event_projection_ready AND d.event_projection_version=1 AND d.event_projection_sources=( SELECT jsonb_object_agg(p.manifest_key,p.revision::text) FROM sessions.session_index p WHERE p.org_id=$1 AND p.workspace_id=$2 AND p.harness=$3 AND coalesce(p.canonical_session_id,p.session_id)=$4 AND p.deleted_at IS NULL) ) AS current",
+     "params": [
+      "org_stream",
+      "ws_stream",
+      "claude",
+      "stream:parity",
+      "stream_parity"
+     ]
+    },
+    {
+     "sql": "SELECT pg_try_advisory_xact_lock(hashtextextended($1, 0)) AS ok",
+     "params": [
+      "96bulls:search\u001forg_stream\u001fws_stream\u001fclaude\u001fstream_parity"
+     ]
+    },
+    {
+     "sql": "SELECT p.manifest_key, coalesce(p.canonical_session_id,p.session_id) AS canonical_id, coalesce(d.event_projection_epoch, 0)::text AS event_epoch FROM sessions.session_index p LEFT JOIN LATERAL ( SELECT d.event_projection_epoch FROM sessions.session_directory d WHERE d.org_id=p.org_id AND d.workspace_id=p.workspace_id AND d.harness=p.harness AND d.session_id IN(coalesce(p.canonical_session_id,p.session_id),p.session_id) ORDER BY (d.session_id=coalesce(p.canonical_session_id,p.session_id)) DESC LIMIT 1 ) d ON true WHERE p.org_id=$1 AND p.workspace_id=$2 AND p.harness=$3 AND p.session_id=$4 AND p.deleted_at IS NULL ORDER BY p.machine_id",
+     "params": [
+      "org_stream",
+      "ws_stream",
+      "claude",
+      "stream_parity"
+     ]
+    },
+    {
+     "sql": "SELECT pg_try_advisory_xact_lock(hashtextextended($1,0)) AS ok",
+     "params": [
+      "96bulls:directory-events\u001forg_stream\u001fws_stream\u001fclaude\u001fstream:parity"
+     ]
+    },
+    {
+     "sql": "SELECT manifest_key FROM sessions.session_index WHERE org_id=$1 AND workspace_id=$2 AND harness=$3 AND coalesce(canonical_session_id,session_id)=$4 AND deleted_at IS NULL ORDER BY session_id,machine_id",
+     "params": [
+      "org_stream",
+      "ws_stream",
+      "claude",
+      "stream:parity"
+     ]
+    },
+    {
+     "sql": "UPDATE sessions.session_directory d SET event_projection_ready=false WHERE d.org_id=$1 AND d.workspace_id=$2 AND d.harness=$3 AND (d.session_id=$4 OR d.session_id IN ( SELECT coalesce(p.canonical_session_id,p.session_id) FROM sessions.session_index p WHERE p.org_id=$1 AND p.workspace_id=$2 AND p.harness=$3 AND p.session_id=$4))",
+     "params": [
+      "org_stream",
+      "ws_stream",
+      "claude",
+      "stream_parity"
+     ]
+    }
+   ],
+   "clickhouse": [
+    {
+     "ch": "select",
+     "query": "SELECT argMax(value, updated_at) AS value, count() AS n FROM search_ingest_state WHERE name = {name:String} HAVING n > 0",
+     "params": {
+      "name": "window_start"
+     }
+    },
+    {
+     "ch": "insert",
+     "table": "search_ingest_session_state",
+     "rows": [
+      {
+       "org_id": "org_stream",
+       "session_id": "stream_parity",
+       "revision": 1,
+       "synced_at": "2026-11-01 12:00:00.000",
+       "full_synced_at": "1970-01-01 00:00:00.000",
+       "scanned_rows": 0,
+       "needs_full": 1
+      },
+      {
+       "org_id": "org_stream",
+       "session_id": "stream:parity",
+       "revision": 1,
+       "synced_at": "2026-11-01 12:00:00.000",
+       "full_synced_at": "1970-01-01 00:00:00.000",
+       "scanned_rows": 0,
+       "needs_full": 1
+      }
+     ]
+    }
+   ],
+   "log": []
+  }
+ ],
+ "acceptance missing across manifests: incomplete, then the same event again": [
+  {
+   "run": 0,
+   "result": {
+    "batchItemFailures": []
+   },
+   "reads": 30,
+   "sql": [
+    {
+     "sql": "SELECT pg_try_advisory_xact_lock(hashtextextended($1, 0)) AS ok",
+     "params": [
+      "96bulls:search\u001forg_stream\u001fws_stream\u001fclaude\u001fstream_parity"
+     ]
+    },
+    {
+     "sql": "SELECT p.manifest_key, coalesce(p.canonical_session_id,p.session_id) AS canonical_id, coalesce(d.event_projection_epoch, 0)::text AS event_epoch FROM sessions.session_index p LEFT JOIN LATERAL ( SELECT d.event_projection_epoch FROM sessions.session_directory d WHERE d.org_id=p.org_id AND d.workspace_id=p.workspace_id AND d.harness=p.harness AND d.session_id IN(coalesce(p.canonical_session_id,p.session_id),p.session_id) ORDER BY (d.session_id=coalesce(p.canonical_session_id,p.session_id)) DESC LIMIT 1 ) d ON true WHERE p.org_id=$1 AND p.workspace_id=$2 AND p.harness=$3 AND p.session_id=$4 AND p.deleted_at IS NULL ORDER BY p.machine_id",
+     "params": [
+      "org_stream",
+      "ws_stream",
+      "claude",
+      "stream_parity"
+     ]
+    },
+    {
+     "sql": "SELECT pg_try_advisory_xact_lock(hashtextextended($1,0)) AS ok",
+     "params": [
+      "96bulls:directory-events\u001forg_stream\u001fws_stream\u001fclaude\u001fstream:parity"
+     ]
+    },
+    {
+     "sql": "SELECT manifest_key FROM sessions.session_index WHERE org_id=$1 AND workspace_id=$2 AND harness=$3 AND coalesce(canonical_session_id,session_id)=$4 AND deleted_at IS NULL ORDER BY session_id,machine_id",
+     "params": [
+      "org_stream",
+      "ws_stream",
+      "claude",
+      "stream:parity"
+     ]
+    },
+    {
+     "sql": "UPDATE sessions.session_directory d SET event_projection_ready=false WHERE d.org_id=$1 AND d.workspace_id=$2 AND d.harness=$3 AND (d.session_id=$4 OR d.session_id IN ( SELECT coalesce(p.canonical_session_id,p.session_id) FROM sessions.session_index p WHERE p.org_id=$1 AND p.workspace_id=$2 AND p.harness=$3 AND p.session_id=$4))",
+     "params": [
+      "org_stream",
+      "ws_stream",
+      "claude",
+      "stream_parity"
+     ]
+    }
+   ],
+   "clickhouse": [
+    {
+     "ch": "select",
+     "query": "SELECT argMax(value, updated_at) AS value, count() AS n FROM search_ingest_state WHERE name = {name:String} HAVING n > 0",
+     "params": {
+      "name": "window_start"
+     }
+    },
+    {
+     "ch": "insert",
+     "table": "search_ingest_session_state",
+     "rows": [
+      {
+       "org_id": "org_stream",
+       "session_id": "stream_parity",
+       "revision": 1,
+       "synced_at": "2026-11-01 12:00:00.000",
+       "full_synced_at": "1970-01-01 00:00:00.000",
+       "scanned_rows": 0,
+       "needs_full": 1
+      },
+      {
+       "org_id": "org_stream",
+       "session_id": "stream:parity",
+       "revision": 1,
+       "synced_at": "2026-11-01 12:00:00.000",
+       "full_synced_at": "1970-01-01 00:00:00.000",
+       "scanned_rows": 0,
+       "needs_full": 1
+      }
+     ]
+    }
+   ],
+   "log": [
+    {
+     "level": "info",
+     "service": "96bulls",
+     "deployment": "selfhost",
+     "deployment_id": "local",
+     "message": "search index reconciled",
+     "stage": "search-index",
+     "org_id": "org_stream",
+     "workspace_id": "ws_stream",
+     "harness": "claude",
+     "session_id": "stream_parity",
+     "manifests": 3,
+     "count": 0,
+     "inserted": 0,
+     "deleted": 0,
+     "ok": false,
+     "reason": "relayhistory_acceptance_missing"
+    }
+   ]
+  },
+  {
+   "run": 1,
+   "result": {
+    "batchItemFailures": []
+   },
+   "reads": 30,
+   "sql": [
+    {
+     "sql": "SELECT pg_try_advisory_xact_lock(hashtextextended($1, 0)) AS ok",
+     "params": [
+      "96bulls:search\u001forg_stream\u001fws_stream\u001fclaude\u001fstream_parity"
+     ]
+    },
+    {
+     "sql": "SELECT p.manifest_key, coalesce(p.canonical_session_id,p.session_id) AS canonical_id, coalesce(d.event_projection_epoch, 0)::text AS event_epoch FROM sessions.session_index p LEFT JOIN LATERAL ( SELECT d.event_projection_epoch FROM sessions.session_directory d WHERE d.org_id=p.org_id AND d.workspace_id=p.workspace_id AND d.harness=p.harness AND d.session_id IN(coalesce(p.canonical_session_id,p.session_id),p.session_id) ORDER BY (d.session_id=coalesce(p.canonical_session_id,p.session_id)) DESC LIMIT 1 ) d ON true WHERE p.org_id=$1 AND p.workspace_id=$2 AND p.harness=$3 AND p.session_id=$4 AND p.deleted_at IS NULL ORDER BY p.machine_id",
+     "params": [
+      "org_stream",
+      "ws_stream",
+      "claude",
+      "stream_parity"
+     ]
+    },
+    {
+     "sql": "SELECT pg_try_advisory_xact_lock(hashtextextended($1,0)) AS ok",
+     "params": [
+      "96bulls:directory-events\u001forg_stream\u001fws_stream\u001fclaude\u001fstream:parity"
+     ]
+    },
+    {
+     "sql": "SELECT manifest_key FROM sessions.session_index WHERE org_id=$1 AND workspace_id=$2 AND harness=$3 AND coalesce(canonical_session_id,session_id)=$4 AND deleted_at IS NULL ORDER BY session_id,machine_id",
+     "params": [
+      "org_stream",
+      "ws_stream",
+      "claude",
+      "stream:parity"
+     ]
+    },
+    {
+     "sql": "UPDATE sessions.session_directory d SET event_projection_ready=false WHERE d.org_id=$1 AND d.workspace_id=$2 AND d.harness=$3 AND (d.session_id=$4 OR d.session_id IN ( SELECT coalesce(p.canonical_session_id,p.session_id) FROM sessions.session_index p WHERE p.org_id=$1 AND p.workspace_id=$2 AND p.harness=$3 AND p.session_id=$4))",
+     "params": [
+      "org_stream",
+      "ws_stream",
+      "claude",
+      "stream_parity"
+     ]
+    }
+   ],
+   "clickhouse": [
+    {
+     "ch": "select",
+     "query": "SELECT argMax(value, updated_at) AS value, count() AS n FROM search_ingest_state WHERE name = {name:String} HAVING n > 0",
+     "params": {
+      "name": "window_start"
+     }
+    },
+    {
+     "ch": "insert",
+     "table": "search_ingest_session_state",
+     "rows": [
+      {
+       "org_id": "org_stream",
+       "session_id": "stream_parity",
+       "revision": 1,
+       "synced_at": "2026-11-01 12:00:00.000",
+       "full_synced_at": "1970-01-01 00:00:00.000",
+       "scanned_rows": 0,
+       "needs_full": 1
+      },
+      {
+       "org_id": "org_stream",
+       "session_id": "stream:parity",
+       "revision": 1,
+       "synced_at": "2026-11-01 12:00:00.000",
+       "full_synced_at": "1970-01-01 00:00:00.000",
+       "scanned_rows": 0,
+       "needs_full": 1
+      }
+     ]
+    }
+   ],
+   "log": [
+    {
+     "level": "info",
+     "service": "96bulls",
+     "deployment": "selfhost",
+     "deployment_id": "local",
+     "message": "search index reconciled",
+     "stage": "search-index",
+     "org_id": "org_stream",
+     "workspace_id": "ws_stream",
+     "harness": "claude",
+     "session_id": "stream_parity",
+     "manifests": 3,
+     "count": 0,
+     "inserted": 0,
+     "deleted": 0,
+     "ok": false,
+     "reason": "relayhistory_acceptance_missing"
+    }
+   ]
+  }
+ ],
+ "M2 managed pass, acceptance missing across manifests: held, then held again": [
+  {
+   "run": 0,
+   "result": {
+    "outcome": "held",
+    "reasons": [
+     "relayhistory_acceptance_missing"
+    ],
+    "search": {
+     "manifests": 3,
+     "rows": 0,
+     "inserted": 0,
+     "deleted": 0,
+     "complete": false,
+     "reasons": [
+      "relayhistory_acceptance_missing"
+     ]
+    }
+   },
+   "reads": 30,
+   "sql": [
+    {
+     "sql": "SELECT pg_try_advisory_xact_lock(hashtextextended($1, 0)) AS ok",
+     "params": [
+      "96bulls:search\u001forg_stream\u001fws_stream\u001fclaude\u001fstream_parity"
+     ]
+    },
+    {
+     "sql": "SELECT pg_try_advisory_xact_lock(hashtextextended($1,0)) AS ok",
+     "params": [
+      "96bulls:directory-events\u001forg_stream\u001fws_stream\u001fclaude\u001fstream:parity"
+     ]
+    },
+    {
+     "sql": "SELECT count(*) FILTER (WHERE i.deleted_at IS NULL)::int AS live, count(*) FILTER (WHERE i.deleted_at IS NULL AND i.session_id = $5)::int AS keys, count(*)::int AS rows, (SELECT d.event_projection_epoch::text FROM sessions.session_directory d WHERE d.org_id = $1 AND d.workspace_id = $2 AND d.harness = $3 AND d.session_id = $4) AS epoch FROM sessions.session_index i WHERE i.org_id = $1 AND i.workspace_id = $2 AND i.harness = $3 AND (coalesce(i.canonical_session_id, i.session_id) = $4 OR i.session_id = $5)",
+     "params": [
+      "org_stream",
+      "ws_stream",
+      "claude",
+      "stream:parity",
+      "stream_parity"
+     ]
+    },
+    {
+     "sql": "SELECT EXISTS ( SELECT 1 FROM ( SELECT d.deleted_at, d.event_projection_ready, d.event_projection_version, d.event_projection_epoch, d.event_projection_sources FROM sessions.session_directory d WHERE d.org_id=$1 AND d.workspace_id=$2 AND d.harness=$3 AND d.session_id IN ($4,$5) ORDER BY (d.session_id=$4) DESC LIMIT 1 ) d WHERE d.deleted_at IS NULL AND d.event_projection_ready AND d.event_projection_version=1 AND d.event_projection_sources=( SELECT jsonb_object_agg(p.manifest_key,p.revision::text) FROM sessions.session_index p WHERE p.org_id=$1 AND p.workspace_id=$2 AND p.harness=$3 AND coalesce(p.canonical_session_id,p.session_id)=$4 AND p.deleted_at IS NULL) ) AS current",
+     "params": [
+      "org_stream",
+      "ws_stream",
+      "claude",
+      "stream:parity",
+      "stream_parity"
+     ]
+    },
+    {
+     "sql": "SELECT pg_try_advisory_xact_lock(hashtextextended($1, 0)) AS ok",
+     "params": [
+      "96bulls:search\u001forg_stream\u001fws_stream\u001fclaude\u001fstream_parity"
+     ]
+    },
+    {
+     "sql": "SELECT p.manifest_key, coalesce(p.canonical_session_id,p.session_id) AS canonical_id, coalesce(d.event_projection_epoch, 0)::text AS event_epoch FROM sessions.session_index p LEFT JOIN LATERAL ( SELECT d.event_projection_epoch FROM sessions.session_directory d WHERE d.org_id=p.org_id AND d.workspace_id=p.workspace_id AND d.harness=p.harness AND d.session_id IN(coalesce(p.canonical_session_id,p.session_id),p.session_id) ORDER BY (d.session_id=coalesce(p.canonical_session_id,p.session_id)) DESC LIMIT 1 ) d ON true WHERE p.org_id=$1 AND p.workspace_id=$2 AND p.harness=$3 AND p.session_id=$4 AND p.deleted_at IS NULL ORDER BY p.machine_id",
+     "params": [
+      "org_stream",
+      "ws_stream",
+      "claude",
+      "stream_parity"
+     ]
+    },
+    {
+     "sql": "SELECT pg_try_advisory_xact_lock(hashtextextended($1,0)) AS ok",
+     "params": [
+      "96bulls:directory-events\u001forg_stream\u001fws_stream\u001fclaude\u001fstream:parity"
+     ]
+    },
+    {
+     "sql": "SELECT manifest_key FROM sessions.session_index WHERE org_id=$1 AND workspace_id=$2 AND harness=$3 AND coalesce(canonical_session_id,session_id)=$4 AND deleted_at IS NULL ORDER BY session_id,machine_id",
+     "params": [
+      "org_stream",
+      "ws_stream",
+      "claude",
+      "stream:parity"
+     ]
+    },
+    {
+     "sql": "UPDATE sessions.session_directory d SET event_projection_ready=false WHERE d.org_id=$1 AND d.workspace_id=$2 AND d.harness=$3 AND (d.session_id=$4 OR d.session_id IN ( SELECT coalesce(p.canonical_session_id,p.session_id) FROM sessions.session_index p WHERE p.org_id=$1 AND p.workspace_id=$2 AND p.harness=$3 AND p.session_id=$4))",
+     "params": [
+      "org_stream",
+      "ws_stream",
+      "claude",
+      "stream_parity"
+     ]
+    }
+   ],
+   "clickhouse": [
+    {
+     "ch": "select",
+     "query": "SELECT argMax(value, updated_at) AS value, count() AS n FROM search_ingest_state WHERE name = {name:String} HAVING n > 0",
+     "params": {
+      "name": "window_start"
+     }
+    },
+    {
+     "ch": "insert",
+     "table": "search_ingest_session_state",
+     "rows": [
+      {
+       "org_id": "org_stream",
+       "session_id": "stream_parity",
+       "revision": 1,
+       "synced_at": "2026-11-01 12:00:00.000",
+       "full_synced_at": "1970-01-01 00:00:00.000",
+       "scanned_rows": 0,
+       "needs_full": 1
+      },
+      {
+       "org_id": "org_stream",
+       "session_id": "stream:parity",
+       "revision": 1,
+       "synced_at": "2026-11-01 12:00:00.000",
+       "full_synced_at": "1970-01-01 00:00:00.000",
+       "scanned_rows": 0,
+       "needs_full": 1
+      }
+     ]
+    }
+   ],
+   "log": []
+  },
+  {
+   "run": 1,
+   "result": {
+    "outcome": "held",
+    "reasons": [
+     "relayhistory_acceptance_missing"
+    ],
+    "search": {
+     "manifests": 3,
+     "rows": 0,
+     "inserted": 0,
+     "deleted": 0,
+     "complete": false,
+     "reasons": [
+      "relayhistory_acceptance_missing"
+     ]
+    }
+   },
+   "reads": 30,
+   "sql": [
+    {
+     "sql": "SELECT pg_try_advisory_xact_lock(hashtextextended($1, 0)) AS ok",
+     "params": [
+      "96bulls:search\u001forg_stream\u001fws_stream\u001fclaude\u001fstream_parity"
+     ]
+    },
+    {
+     "sql": "SELECT pg_try_advisory_xact_lock(hashtextextended($1,0)) AS ok",
+     "params": [
+      "96bulls:directory-events\u001forg_stream\u001fws_stream\u001fclaude\u001fstream:parity"
+     ]
+    },
+    {
+     "sql": "SELECT count(*) FILTER (WHERE i.deleted_at IS NULL)::int AS live, count(*) FILTER (WHERE i.deleted_at IS NULL AND i.session_id = $5)::int AS keys, count(*)::int AS rows, (SELECT d.event_projection_epoch::text FROM sessions.session_directory d WHERE d.org_id = $1 AND d.workspace_id = $2 AND d.harness = $3 AND d.session_id = $4) AS epoch FROM sessions.session_index i WHERE i.org_id = $1 AND i.workspace_id = $2 AND i.harness = $3 AND (coalesce(i.canonical_session_id, i.session_id) = $4 OR i.session_id = $5)",
+     "params": [
+      "org_stream",
+      "ws_stream",
+      "claude",
+      "stream:parity",
+      "stream_parity"
+     ]
+    },
+    {
+     "sql": "SELECT EXISTS ( SELECT 1 FROM ( SELECT d.deleted_at, d.event_projection_ready, d.event_projection_version, d.event_projection_epoch, d.event_projection_sources FROM sessions.session_directory d WHERE d.org_id=$1 AND d.workspace_id=$2 AND d.harness=$3 AND d.session_id IN ($4,$5) ORDER BY (d.session_id=$4) DESC LIMIT 1 ) d WHERE d.deleted_at IS NULL AND d.event_projection_ready AND d.event_projection_version=1 AND d.event_projection_sources=( SELECT jsonb_object_agg(p.manifest_key,p.revision::text) FROM sessions.session_index p WHERE p.org_id=$1 AND p.workspace_id=$2 AND p.harness=$3 AND coalesce(p.canonical_session_id,p.session_id)=$4 AND p.deleted_at IS NULL) ) AS current",
+     "params": [
+      "org_stream",
+      "ws_stream",
+      "claude",
+      "stream:parity",
+      "stream_parity"
+     ]
+    },
+    {
+     "sql": "SELECT pg_try_advisory_xact_lock(hashtextextended($1, 0)) AS ok",
+     "params": [
+      "96bulls:search\u001forg_stream\u001fws_stream\u001fclaude\u001fstream_parity"
+     ]
+    },
+    {
+     "sql": "SELECT p.manifest_key, coalesce(p.canonical_session_id,p.session_id) AS canonical_id, coalesce(d.event_projection_epoch, 0)::text AS event_epoch FROM sessions.session_index p LEFT JOIN LATERAL ( SELECT d.event_projection_epoch FROM sessions.session_directory d WHERE d.org_id=p.org_id AND d.workspace_id=p.workspace_id AND d.harness=p.harness AND d.session_id IN(coalesce(p.canonical_session_id,p.session_id),p.session_id) ORDER BY (d.session_id=coalesce(p.canonical_session_id,p.session_id)) DESC LIMIT 1 ) d ON true WHERE p.org_id=$1 AND p.workspace_id=$2 AND p.harness=$3 AND p.session_id=$4 AND p.deleted_at IS NULL ORDER BY p.machine_id",
+     "params": [
+      "org_stream",
+      "ws_stream",
+      "claude",
+      "stream_parity"
+     ]
+    },
+    {
+     "sql": "SELECT pg_try_advisory_xact_lock(hashtextextended($1,0)) AS ok",
+     "params": [
+      "96bulls:directory-events\u001forg_stream\u001fws_stream\u001fclaude\u001fstream:parity"
+     ]
+    },
+    {
+     "sql": "SELECT manifest_key FROM sessions.session_index WHERE org_id=$1 AND workspace_id=$2 AND harness=$3 AND coalesce(canonical_session_id,session_id)=$4 AND deleted_at IS NULL ORDER BY session_id,machine_id",
+     "params": [
+      "org_stream",
+      "ws_stream",
+      "claude",
+      "stream:parity"
+     ]
+    },
+    {
+     "sql": "UPDATE sessions.session_directory d SET event_projection_ready=false WHERE d.org_id=$1 AND d.workspace_id=$2 AND d.harness=$3 AND (d.session_id=$4 OR d.session_id IN ( SELECT coalesce(p.canonical_session_id,p.session_id) FROM sessions.session_index p WHERE p.org_id=$1 AND p.workspace_id=$2 AND p.harness=$3 AND p.session_id=$4))",
+     "params": [
+      "org_stream",
+      "ws_stream",
+      "claude",
+      "stream_parity"
+     ]
+    }
+   ],
+   "clickhouse": [
+    {
+     "ch": "select",
+     "query": "SELECT argMax(value, updated_at) AS value, count() AS n FROM search_ingest_state WHERE name = {name:String} HAVING n > 0",
+     "params": {
+      "name": "window_start"
+     }
+    },
+    {
+     "ch": "insert",
+     "table": "search_ingest_session_state",
+     "rows": [
+      {
+       "org_id": "org_stream",
+       "session_id": "stream_parity",
+       "revision": 1,
+       "synced_at": "2026-11-01 12:00:00.000",
+       "full_synced_at": "1970-01-01 00:00:00.000",
+       "scanned_rows": 0,
+       "needs_full": 1
+      },
+      {
+       "org_id": "org_stream",
+       "session_id": "stream:parity",
+       "revision": 1,
+       "synced_at": "2026-11-01 12:00:00.000",
+       "full_synced_at": "1970-01-01 00:00:00.000",
+       "scanned_rows": 0,
+       "needs_full": 1
+      }
+     ]
+    }
+   ],
+   "log": []
+  }
+ ]
+}

@@ -141,5 +141,5 @@ export async function hostedRig(x: ExportedScope, cleanup: Array<() => Promise<u
   const messages = x.keys.map((key, n) => ({ messageId: `m-${n}`, body: JSON.stringify({ reconcile: { key } }) }));
   /** One consumer pass over the scope's manifests (what a tick or a redelivered event sends). */
   const tick = (extra: Partial<SearchIndexDeps> = {}) => processBatch(messages, consumer(extra));
-  return { db, fake, sql, reads, store, transact, search, tick, requeued, messages };
+  return { db, fake, sql, reads, store, transact, search, consumer, tick, requeued, messages };
 }
