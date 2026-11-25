@@ -1,4 +1,4 @@
-# Incremental search indexing: committed wake and revision-aware passes (design M1, rev 5)
+# Incremental search indexing: committed wake and revision-aware passes (design M1, rev 6)
 
 Status: design for review. Code and plans only. No migration, deploy, flag, schedule or config change follows from
 this document without a separate production go per step (§9). Rev 2 closed the nine findings of the M1 review. Rev 3 closes the seven rev-2 findings (B1-B7), marked inline.
@@ -212,12 +212,14 @@ lose a follow-up wake that arrived during the pass. Each statement keys on `(id,
   transaction bound to the lease, so exhaustion can never discard a newer wake:
   ```sql
   -- a) Park the CLAIMED message only (the message as it was at claim time, $claimed_msg; epoch = claimed_epoch).
-  -- Exactly the postgres-dead-letters.ts quarantine statement [rev 5]. The letter id is deterministic,
-  -- '<stage>:<workKey>' (the table's own convention), so ONE letter per scope. Re-death refreshes the body and
+  -- Exactly the postgres-dead-letters.ts quarantine statement. [rev 6] The letter id is the repository's canonical
+  -- deadLetterId('search-index', ctx, workKey) = 'search-index:' || encodeURIComponent(org) || ':' ||
+  -- encodeURIComponent(ws) || ':' || workKey (dlq.ts:125-139). It is computed in TS and passed as $letter_id: ONE
+  -- letter per scope, the same id the store and the operator and replay tooling use. Re-death refreshes the body and
   -- un-resolves the letter.
   INSERT INTO sessions.pipeline_dead_letters AS d
          (id, stage, trace_id, org_id, workspace_id, session_id, machine_id, message, first_dead_at, last_dead_at)
-  SELECT 'search-index:' || j.work_key, 'search-index', j.trace_id, j.org_id, j.workspace_id, j.session_id, j.machine_id,
+  SELECT $letter_id, 'search-index', j.trace_id, j.org_id, j.workspace_id, j.session_id, j.machine_id,
          $claimed_msg::jsonb, now(), now()
     FROM sessions.pipeline_jobs j WHERE j.id = $id AND j.lease_id = $lease   -- 0 rows if the lease was lost: abort
   ON CONFLICT (id) DO UPDATE SET message = EXCLUDED.message, state = 'dead', last_dead_at = EXCLUDED.last_dead_at,
@@ -237,7 +239,8 @@ lose a follow-up wake that arrived during the pass. Each statement keys on `(id,
 
 ### 3.3b Dead-letter replay [rev 4, rev 5]
 
-The letter id is `'search-index:' || work_key`: one letter per scope, the same key as the job row. Resolution is
+[rev 6] The letter id is `deadLetterId('search-index', ctx, workKey)` (dlq.ts:125-139): one letter per scope, keyed
+by the same work key as the job row, in the repository's canonical form. Resolution is
 therefore keyed by SCOPE, not by a replay id carried in the message. No handle can be lost when a newer wake
 replaces the row's message (the rev-4 race: replay N, wake N+1, done N reopens, N+1 completes without the replay id).
 
@@ -250,8 +253,9 @@ Replay, in ONE transaction:
 Completion: the §3.3 `done` DELETE, in the same transaction:
 
 ```sql
-UPDATE sessions.pipeline_dead_letters SET state = 'resolved', resolved_at = now()
- WHERE id = 'search-index:' || $work_key AND state = 'replaying'
+UPDATE sessions.pipeline_dead_letters SET state = 'resolved', resolved_at = now(),
+       resolution = CASE WHEN (message->'payload'->>'epoch')::bigint = $claimed_epoch THEN 'completed' ELSE 'superseded' END
+ WHERE id = $letter_id AND state = 'replaying'
    AND (message->'payload'->>'epoch')::bigint <= $claimed_epoch;   -- the completed epoch covers the letter's
 ```
 
@@ -259,7 +263,8 @@ UPDATE sessions.pipeline_dead_letters SET state = 'resolved', resolved_at = now(
   epoch completes. The predicate holds, because the completed epoch is at or above the letter's.
 - **Exhausted again:** the quarantine statement (§3.3) refreshes the same letter to `dead`, so it is never left
   `replaying`.
-- The M2 migration adds a nullable `resolution text` (`completed` / `superseded`) for operators.
+- The M2 migration adds a nullable `resolution text`. Completion sets `completed` (equal epoch) or `superseded`
+  (a newer epoch covered it); R8a asserts `superseded` and R8b asserts `completed`.
 
 Tests:
 
@@ -470,8 +475,8 @@ Two flags:
    LOCK TABLE sessions.pipeline_jobs IN SHARE ROW EXCLUSIVE MODE;
    INSERT INTO sessions.pipeline_dead_letters AS d
           (id, stage, trace_id, org_id, workspace_id, session_id, machine_id, message, first_dead_at, last_dead_at)
-   SELECT 'search-index:' || j.work_key, 'search-index', j.trace_id, j.org_id, j.workspace_id, j.session_id, j.machine_id,
-          j.message, now(), now()
+   SELECT <deadLetterId per row, computed by parkSearchJobs in TS over the selected rows>, 'search-index', j.trace_id,
+          j.org_id, j.workspace_id, j.session_id, j.machine_id, j.message, now(), now()
      FROM sessions.pipeline_jobs j WHERE j.stage = 'search-index'
    ON CONFLICT (id) DO UPDATE SET message = EXCLUDED.message, state = 'dead', last_dead_at = EXCLUDED.last_dead_at,
           dead_count = d.dead_count + 1, resolved_at = NULL;
@@ -484,12 +489,22 @@ Two flags:
 4. roll the code back;
 5. down migration.
 
-**Down migration:**
+**Down migration [rev 6]: the additive migration STAYS until the stage is fully empty.** Parked letters are a
+promise of replay, so the two cannot coexist with a down migration.
 
-- It takes the same lock, refuses unless `search-index` has 0 rows in `pipeline_jobs`, then drops the index and the
-  cursor table and restores the three CHECKs.
-- It also refuses while the stage has rows in `pipeline_events` or `pipeline_dead_letters`, unless those are first
-  archived. The CHECKs cannot be restored with rows that violate them.
+- After a park, the stage's letters and events still exist. The down migration's precondition is therefore NOT met,
+  and it REFUSES. That is the expected state: the CHECK values, the unique index and the cursor table are inert
+  without the code and flags, so keeping them costs nothing.
+- **To reach down:** bring the consumer back, replay the parked letters until each is `resolved`, then archive the
+  stage's resolved letters and its `pipeline_events` rows. The archive is an operator export: a file with counts and
+  sha256, recorded in the run log. Then delete them. Only then does the precondition hold: 0 rows for the stage in
+  `pipeline_jobs`, `pipeline_events` AND `pipeline_dead_letters`.
+- The down migration takes `LOCK TABLE … SHARE ROW EXCLUSIVE` on all three, checks all three counts are 0,
+  refuses otherwise, then drops the index and the cursor table and restores the three CHECKs.
+- **Tests:**
+  - R9a: after a park, down REFUSES (letters exist);
+  - R9b: after replay plus resolve plus the archive delete across jobs, events and letters, down's precondition
+    holds.
 
 ## 9. Production steps (each needs its own go, one at a time)
 
@@ -528,7 +543,9 @@ Stop lines for 4 and 5 are the A+C set, plus: `search-index` oldest open job ove
 | R6g | the generic runWorker / postgresStageConsumer is not registered for `search-index` | absent |
 | R8a-d | stage-aware replay: superseded resolves on the newer completion; merged on done; the replay/new-wake race; re-death refreshes | absent |
 | R5e | two current live heads: the clock is the later published_at | absent |
-| R9 | park, then the down-migration precondition | absent |
+| R9a/b | after a park, down refuses (letters exist); after replay, resolve and archive across jobs, events and letters, the precondition holds | absent |
+| R5f | an OLDER live head triggers the authority enqueue while a newer sibling supplies max(published_at): the job clock is the newer one, and the trigger is still validated by its own authority | absent |
+| R5g | a managed scope with a NULL or unprovable publication clock: no job, an error metric, never a pointer fallback | absent |
 | R5c/d | catch-up clock: publish for managed, pointer for non-managed; no null clock | absent |
 | R6 | every closed stage list has the same set, including `search-index` | absent |
 
