@@ -7,7 +7,7 @@ import { describe, expect, test } from "bun:test";
 import { readFileSync } from "node:fs";
 import { AuthError, createReadApi, type VerifiedIdentity } from "../app.ts";
 import { memoryLiveness } from "./support.ts";
-import { storeWorkspaceSynthesis, type SessionAliasRow, type SessionAliases, type WorkspaceSynthesisSource } from "../workspace-synthesis.ts";
+import { SYNTHESIS_ALIAS_MAX_ROUNDS, storeWorkspaceSynthesis, type SessionAliasRow, type SessionAliases, type WorkspaceSynthesisSource } from "../workspace-synthesis.ts";
 import { memoryArtifactStore, runWorkspaceSynthesisJob, workspaceSynthesisStage2Key } from "../../session-analysis/workspace-synthesis.ts";
 import { memoryBudgetLedger, type Stage2ModelTransport } from "../../session-intel/synthesis/stage2.ts";
 import { workspaceSynthesisDeps } from "../../../packages/session-read-worker/src/index.ts";
@@ -230,7 +230,8 @@ describe("stage=2: the operator erase fence", () => {
     source: WorkspaceSynthesisSource;
     fence?: SessionKey[];
     outage?: boolean;
-    aliasRows?: Array<{ harness: string; session_id: string; canonical_session_id: string | null }>;
+    aliasRows?: Array<{ harness: string; session_id: string; canonical_session_id: string | null; org_id?: string; workspace_id?: string }>;
+    aliases?: SessionAliases;
     noAliases?: boolean;
   }) => {
     const live = memoryLiveness();
@@ -238,10 +239,12 @@ describe("stage=2: the operator erase fence", () => {
     const batches: SessionKey[][] = [];
     const aliases: SessionAliases = async (orgId, workspaceId, keys) => {
       const asked = new Set(keys.map(keyOf));
+      // The bound tenant's rows only (the role's RLS); a row without a tenant is the caller's.
       return (opts.aliasRows ?? [])
+        .map((r): SessionAliasRow => ({ ...r, org_id: r.org_id ?? orgId, workspace_id: r.workspace_id ?? workspaceId }))
+        .filter((r) => r.org_id === orgId && r.workspace_id === workspaceId)
         .filter((r) => asked.has(keyOf({ source: r.harness, sessionId: r.session_id })) ||
-          (r.canonical_session_id !== null && asked.has(keyOf({ source: r.harness, sessionId: r.canonical_session_id }))))
-        .map((r): SessionAliasRow => ({ org_id: orgId, workspace_id: workspaceId, ...r }));
+          (r.canonical_session_id !== null && asked.has(keyOf({ source: r.harness, sessionId: r.canonical_session_id }))));
     };
     const app = createReadApi({
       verify, adapter: {} as never, liveness: live.liveness, completeSinceMs: 0, directoryWorkspaces: new Set([ID.workspaceId]),
@@ -251,7 +254,7 @@ describe("stage=2: the operator erase fence", () => {
         if (opts.outage) throw new Error("operator_fence_unavailable fx-s01");
         return new Set(keys.map(keyOf).filter((k) => fence.has(k)));
       },
-      workspaceSynthesis: { enabled: true, source: opts.source, stage2Enabled: true, ...(opts.noAliases ? {} : { aliases }) },
+      workspaceSynthesis: { enabled: true, source: opts.source, stage2Enabled: true, ...(opts.noAliases ? {} : { aliases: opts.aliases ?? aliases }) },
     });
     return { app, live, batches };
   };
@@ -331,6 +334,50 @@ describe("stage=2: the operator erase fence", () => {
       source: s.source, aliasRows: [{ harness: "fx-claude", session_id: "fx-s06", canonical_session_id: "fx-canon-s06" }],
       fence: [{ source: "fx-codex", sessionId: "fx-canon-s06" }],
     }).app)).status).toBe(200);
+  });
+
+  test("the alias closure: a sibling physical id sharing a recorded session's source id is checked, per source and tenant", async () => {
+    const s = await stored();
+    // Recorded physical A = fx-s06 (an initiative session, source id C); physical B = fx-sib-b shares C. Only B fenced.
+    const A = { harness: "fx-claude", session_id: "fx-s06", canonical_session_id: "fx-canon-c" };
+    const sib = { harness: "fx-claude", session_id: "fx-sib-b", canonical_session_id: "fx-canon-c" };
+    const B = { source: "fx-claude", sessionId: "fx-sib-b" };
+    const f = fencedApi({ source: s.source, aliasRows: [A, sib], fence: [B] });
+    invalidated(await get(f.app), "fx-s06");
+    expect(f.batches.flat()).toContainEqual(B);
+    // A further hop: B's other pointer holds source id D, whose physical E is fenced.
+    invalidated(await get(fencedApi({
+      source: s.source, fence: [{ source: "fx-claude", sessionId: "fx-sib-e" }],
+      aliasRows: [A, sib, { ...sib, canonical_session_id: "fx-canon-d" }, { harness: "fx-claude", session_id: "fx-sib-e", canonical_session_id: "fx-canon-d" }],
+    }).app), "fx-s06");
+    // The sibling under another SOURCE is another session: served, its form never checked.
+    const os = fencedApi({ source: s.source, aliasRows: [A, { ...sib, harness: "fx-codex" }], fence: [{ source: "fx-codex", sessionId: "fx-sib-b" }] });
+    const served = await get(os.app);
+    expect([served.status, served.body]).toEqual([200, goldenV2]);
+    expect(os.batches.flat()).not.toContainEqual({ source: "fx-codex", sessionId: "fx-sib-b" });
+    // The sibling in another TENANT is invisible to the bound read: served, never checked.
+    for (const tenant of [{ org_id: "fx-org-other" }, { workspace_id: "fx-ws-other" }]) {
+      const ot = fencedApi({ source: s.source, aliasRows: [A, { ...sib, ...tenant }], fence: [B] });
+      const r = await get(ot.app);
+      expect([r.status, r.body]).toEqual([200, goldenV2]);
+      expect(ot.batches.flat()).not.toContainEqual(B);
+    }
+    // A reader that hands back another tenant's sibling row is refused (500), never served.
+    const leak = fencedApi({ source: s.source, fence: [B], aliases: async (orgId, workspaceId, keys) => keys.some((k) => k.sessionId === "fx-canon-c")
+      ? [{ ...sib, org_id: "fx-org-other", workspace_id: workspaceId }]
+      : keys.some((k) => k.sessionId === "fx-s06") ? [{ ...A, org_id: orgId, workspace_id: workspaceId }] : [] });
+    const refused = await get(leak.app);
+    expect([refused.status, refused.body.error.code]).toEqual([500, "internal"]);
+    expect(refused.text).not.toContain("initiative:");
+    // A closure still growing past the round bound is a 503.
+    const chain = [{ ...A, canonical_session_id: "fx-chain-c0" }];
+    for (let i = 1; i <= 2 * SYNTHESIS_ALIAS_MAX_ROUNDS; i++) {
+      chain.push({ harness: "fx-claude", session_id: `fx-chain-p${i}`, canonical_session_id: `fx-chain-c${i - 1}` });
+      chain.push({ harness: "fx-claude", session_id: `fx-chain-p${i}`, canonical_session_id: `fx-chain-c${i}` });
+    }
+    const over = await get(fencedApi({ source: s.source, aliasRows: chain }).app);
+    expect([over.status, over.body.error.code]).toEqual([503, "backend_unavailable"]);
+    expect(over.text).not.toContain("initiative:");
   });
 
   test("fails closed: the fence unavailable, or bound without an alias reader, is a 503 with nothing served", async () => {

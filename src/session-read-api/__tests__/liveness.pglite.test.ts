@@ -273,6 +273,12 @@ describe("workspace synthesis alias and batched operator fence reads, as the rol
     expect(await forms("codex", "X")).toEqual([["org-a", "ws-a", "codex", "X", null]]);
     expect(await forms("codex", "P")).toEqual([]);
     expect(await aliases("org-a", "ws-a", [])).toEqual([]);
+    // A sibling physical id under the same source id: the source-id query finds both (the route's closure step);
+    // the same source id under another workspace stays invisible.
+    await pointer(db, { session: "Q", harness: "claude" });
+    await pointer(db, { session: "Q", harness: "claude", ws: "ws-b", machine: "m-3" });
+    await db.query("UPDATE sessions.session_index SET canonical_session_id = 'X' WHERE session_id = 'Q'");
+    expect((await forms("claude", "X")).map((r) => r[3]).sort()).toEqual(["P", "Q"]);
     const batch = sqlOperatorErasedBatch(run), single = sqlOperatorErased(run);
     const keys = [{ source: "claude", sessionId: "P" }, { source: "claude", sessionId: "X" }, { source: "codex", sessionId: "X" }];
     expect([...await batch("org-a", "ws-a", keys)]).toEqual([]);
