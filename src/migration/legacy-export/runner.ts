@@ -19,7 +19,8 @@ import { createHash } from "node:crypto";
 import { DatabaseSync } from "node:sqlite";
 import type { Queryable } from "../relayhistory-export.ts";
 import { exportUnit, type ExportTarget } from "../neon-s3-sync/export-session.ts";
-import type { PageHook } from "../neon-s3-sync/neon-reader.ts";
+import { INVENTORY_TABLES, assertInventoryKeys, inspectEmptyLegacyScope, inventoryPage, ordinaryUnitForEmptyScope, type InventoryCursor } from "./empty-scope.ts";
+import type { PageHook, SessionUnit } from "../neon-s3-sync/neon-reader.ts";
 import {
   LEGACY_TABLES,
   legacyDiscoveryPage,
@@ -68,13 +69,13 @@ CREATE TABLE IF NOT EXISTS unbound(table_name TEXT,org TEXT,workspace TEXT,store
     if (!columns.some((c) => c.name === "user_id"))
       this.db.exec("ALTER TABLE scopes ADD COLUMN user_id TEXT");
   }
-  cursor(table: string, org: string): { after: LegacyGroup | null; done: boolean } {
+  cursor(table: string, org: string): { after: InventoryCursor | null; done: boolean } {
     const r = this.db.prepare("SELECT after,done FROM cursors WHERE table_name=? AND org=?").get(table, org) as
       | { after: string | null; done: number }
       | undefined;
-    return { after: r?.after ? (JSON.parse(r.after) as LegacyGroup) : null, done: r?.done === 1 };
+    return { after: r?.after ? (JSON.parse(r.after) as InventoryCursor) : null, done: r?.done === 1 };
   }
-  setCursor(table: string, org: string, after: LegacyGroup | null, done: boolean) {
+  setCursor(table: string, org: string, after: InventoryCursor | null, done: boolean) {
     this.db
       .prepare(
         "INSERT INTO cursors VALUES(?,?,?,?) ON CONFLICT(table_name,org) DO UPDATE SET after=excluded.after,done=excluded.done",
@@ -185,6 +186,7 @@ export interface Counters {
   userUnknown: number;
   manifestsWritten: number;
   failed: number;
+  emptyRefused: Record<string, number>;
   rows: Record<LegacyTable, number>;
 }
 export const newCounters = (): Counters => ({
@@ -200,10 +202,11 @@ export const newCounters = (): Counters => ({
   userUnknown: 0,
   manifestsWritten: 0,
   failed: 0,
+  emptyRefused: {},
   rows: { conversation_turns: 0, session_links: 0, session_outcomes: 0 },
 });
 
-const cursorName = (table: LegacyTable, window: Window | undefined) =>
+const cursorName = (table: LegacyTable | (typeof INVENTORY_TABLES)[number], window: Window | undefined) =>
   JSON.stringify([
     table,
     window?.sinceMs ?? null,
@@ -446,10 +449,21 @@ export async function runOrg(
   org: string,
   /** `refresh`: rediscover from the start (cursors ignored); unchanged fingerprints are still skipped.
    *  `force`: re-export every discovered scope even when its fingerprint is unchanged. */
-  opts: { export: boolean; window?: Window; refresh?: boolean; force?: boolean; maxScopes?: number; pageGroups?: number },
+  opts: { export: boolean; includeEmptyScopes?: boolean; window?: Window; refresh?: boolean; force?: boolean; maxScopes?: number; pageGroups?: number },
   counters: Counters,
 ): Promise<void> {
   if (opts.export) await assertLegacyErasureAuthorityReady(deps.privacyDb);
+  if (!opts.includeEmptyScopes) return scanOrg(deps, org, opts, counters);
+  // A dedicated connection must never silently omit a row under RLS.
+  await deps.db.query("SET row_security=off");
+  try {
+    await scanOrg(deps, org, opts, counters);
+  } finally {
+    await deps.db.query("RESET row_security");
+  }
+}
+
+async function scanOrg(deps: RunDeps, org: string, opts: Parameters<typeof runOrg>[2], counters: Counters) {
   const seen = new Set<string>();
   for (const spec of LEGACY_TABLES) {
     const cursor = cursorName(spec.table, opts.window);
@@ -487,6 +501,53 @@ export async function runOrg(
       if (done) break;
     }
   }
+  if (opts.includeEmptyScopes) {
+    for (const table of INVENTORY_TABLES) {
+      const cursor = cursorName(table, opts.window);
+      const prior = opts.export && !opts.refresh ? deps.checkpoint.cursor(cursor, org) : { done: false, after: null };
+      if (prior.done) continue;
+      let after = prior.after;
+      const limit = opts.pageGroups ?? 1000;
+      await assertInventoryKeys(deps.db, table, org);
+      for (;;) {
+        if (deps.stopped?.()) return;
+        const page = await inventoryPage(deps.db, table, org, after, opts.window ?? {}, limit);
+        await deps.hook(Math.ceil(page.length / 50), 0);
+        for (const row of page) {
+          if (opts.maxScopes !== undefined && counters.exported >= opts.maxScopes) return;
+          const scope = { orgId: org, workspaceId: row.workspace_id, source: row.stored_source, sessionId: row.session_id };
+          const key = scopeKey(scope);
+          if (seen.has(key)) continue;
+          seen.add(key);
+          await deps.db.query("BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY");
+          try {
+            const observation = await inspectEmptyLegacyScope(deps.db, scope);
+            if (observation === "empty_in_snapshot") {
+              counters.scopes += 1;
+              await exportScope(deps, scope, opts, counters, await ordinaryUnitForEmptyScope(deps.db, scope));
+            } else {
+              const existing = deps.checkpoint.scope(key);
+              // Nonempty scopes use normal detail discovery, including window
+              // eligibility. Preserve their checkpoint on an inventory replay.
+              const stats = await neonScopeStats(deps.db, scope);
+              if (LEGACY_TABLES.every((t) => stats[t.table]?.n === 0)) {
+                counters.emptyRefused[observation] = (counters.emptyRefused[observation] ?? 0) + 1;
+                if (opts.export) deps.checkpoint.setScope(key, org, observation, null, existing?.manifest_key ?? null, existing?.user_id ?? null);
+              }
+            }
+            await deps.db.query("COMMIT");
+          } catch (error) {
+            await deps.db.query("ROLLBACK");
+            throw error;
+          }
+        }
+        if (page.length) after = page.at(-1)!;
+        const done = page.length < limit;
+        if (opts.export) deps.checkpoint.setCursor(cursor, org, after, done);
+        if (done) break;
+      }
+    }
+  }
 }
 
 async function exportScope(
@@ -494,6 +555,7 @@ async function exportScope(
   scope: LegacyScope,
   opts: { export: boolean; force?: boolean },
   counters: Counters,
+  emptyUnit?: SessionUnit,
 ) {
   // Fresh per-scope activation gate: a healthy run-start heartbeat cannot
   // authorize a later PUT after the eraser has gone stale or changed back to
@@ -504,7 +566,10 @@ async function exportScope(
   let boundUserId: string | null = null;
   try {
     const stats = await neonScopeStats(deps.db, scope);
-    const fingerprint = sha(JSON.stringify(LEGACY_TABLES.map((s) => [s.table, stats[s.table]])));
+    const details = LEGACY_TABLES.map((s) => [s.table, stats[s.table]]);
+    const fingerprint = emptyUnit
+      ? "empty-v1:" + sha(JSON.stringify([details, emptyUnit.firstMs, emptyUnit.lastMs]))
+      : sha(JSON.stringify(details));
     const prior = deps.checkpoint.scope(key);
     if (await legacyScopeFenced(deps.db, scope)) {
       counters.fenced += 1;
@@ -559,7 +624,7 @@ async function exportScope(
       if (privacy.fenced) counters.fenced += 1;
       return;
     }
-    const fresh = await legacyUnit(deps.db, scope);
+    const fresh = emptyUnit ?? await legacyUnit(deps.db, scope);
     if (!fresh) return;
     // A re-export keeps the scope's first key: a moved d= would leave two legacy
     // manifests for one scope, which the reader refuses (gate 4).
@@ -670,6 +735,7 @@ export async function verifyScope(
   manifestKey: string,
   scope: LegacyScope,
   decompress: (b: Uint8Array) => Uint8Array,
+  empty = false,
 ): Promise<ScopeVerdict> {
   const neon = await neonScopeStats(db, scope);
   const problems: string[] = [];
@@ -691,7 +757,7 @@ export async function verifyScope(
       if (n.keys_md5 !== got.keys_md5) problems.push(`${s.table}:keys`);
     }
     if (s3.scope?.n !== 1) problems.push("coverage_marker");
-    const unit = await legacyUnit(db, scope);
+    const unit = empty ? await ordinaryUnitForEmptyScope(db, scope) : await legacyUnit(db, scope);
     if (unit) {
       const parts: Uint8Array[] = [];
       for await (const line of legacyUnitSource(db, async () => {}).lines(unit)) parts.push(line.bytes);
@@ -708,6 +774,7 @@ export async function verifyScope(
         .map((l) => parseRelayhistoryRecord(l));
       // received_at of the coverage marker follows lastMs; compare row tables only.
       const fresh = recordDigests(rebuilt);
+      if (empty && fresh.scope?.content_sha256 !== s3.scope?.content_sha256) problems.push("coverage_marker:content");
       for (const s of LEGACY_TABLES)
         if ((fresh[s.table]?.content_sha256 ?? "") !== (s3[s.table]?.content_sha256 ?? ""))
           problems.push(`${s.table}:content`);
@@ -760,8 +827,23 @@ export async function verifyExported(
       privacyFenced.push(scope);
       continue;
     }
-    const v = await verifyScope(db, store, row.manifest_key, scope, decompress);
-    if (!v.ok) mismatched.push(v);
+    const empty = checkpoint.scope(row.key)?.fingerprint?.startsWith("empty-v1:") === true;
+    if (empty) await db.query("BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY");
+    try {
+      if (empty) {
+        await db.query("SET LOCAL row_security=off");
+        const reason = await inspectEmptyLegacyScope(db, scope);
+        const owner = await legacyScopeOwner(db, scope);
+        if (reason !== "empty_in_snapshot" || owner.userId !== row.user_id) {
+          unexplained.push(`empty_unverified:${row.key}`);
+          continue;
+        }
+      }
+      const v = await verifyScope(db, store, row.manifest_key, scope, decompress, empty);
+      if (!v.ok) mismatched.push(v);
+    } finally {
+      if (empty) await db.query("ROLLBACK");
+    }
   }
   return {
     ok:

@@ -445,7 +445,7 @@ export async function legacyGroupScopes(
 }
 
 /** Orgs present in a legacy table, by index skip-scan (no full scan). */
-export async function legacyOrgs(db: Queryable, table: LegacyTable): Promise<string[]> {
+export async function legacyOrgs(db: Queryable, table: LegacyTable | "session_catalog" | "session_rollups"): Promise<string[]> {
   const { rows } = await db.query<{ org_id: string }>(
     `WITH RECURSIVE o(org_id) AS (
   (SELECT org_id FROM sessions.${table} ORDER BY org_id LIMIT 1)

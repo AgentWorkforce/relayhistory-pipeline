@@ -39,6 +39,7 @@ import {
 import { sessionReadOnly } from "../neon-s3-sync/neon-reader.ts";
 import { Throttle } from "../neon-s3-sync/throttle.ts";
 import { LEGACY_TABLES, legacyOrgs } from "../neon-s3-sync/legacy-source.ts";
+import { INVENTORY_TABLES } from "./empty-scope.ts";
 import { Checkpoint, newCounters, runOrg, verifyExported } from "./runner.ts";
 
 const args = process.argv.slice(2);
@@ -148,6 +149,18 @@ export function assertDirectUrl(raw: string, label: string): URL {
   return url;
 }
 
+export async function discoverExportOrgs(db: Queryable, includeEmptyScopes: boolean) {
+  const tables = [...LEGACY_TABLES.map((s) => s.table), ...(includeEmptyScopes ? INVENTORY_TABLES : [])];
+  if (includeEmptyScopes) {
+    await db.query("SET row_security=off");
+    for (const table of tables) {
+      const { rows } = await db.query(`SELECT 1 FROM sessions.${table} WHERE org_id IS NULL OR org_id='' LIMIT 1`);
+      if (rows.length) throw new Error("source inventory has a missing organization");
+    }
+  }
+  return [...new Set((await Promise.all(tables.map((table) => legacyOrgs(db, table)))).flat())].sort();
+}
+
 export async function main() {
   const mode = (["plan", "export", "verify"] as const).filter((m) => flag(m));
   if (mode.length !== 1) throw new Error("choose exactly one of --plan, --export, --verify");
@@ -212,7 +225,8 @@ export async function main() {
       return;
     }
     let orgs = all("org");
-    if (flag("all-orgs")) orgs = [...new Set((await Promise.all(LEGACY_TABLES.map((s) => legacyOrgs(db, s.table)))).flat())].sort();
+    const includeEmptyScopes = flag("include-empty-scopes");
+    if (flag("all-orgs")) orgs = await discoverExportOrgs(db, includeEmptyScopes);
     if (!orgs.length) throw new Error("--org=ORG (repeatable) or --all-orgs is required");
     const throttle = new Throttle({
       rowsPerSec: Number(arg("rows-per-sec") ?? 1000),
@@ -249,6 +263,7 @@ export async function main() {
         org,
         {
           export: exporting,
+          includeEmptyScopes,
           window,
           refresh: flag("refresh"),
           force: flag("force"),

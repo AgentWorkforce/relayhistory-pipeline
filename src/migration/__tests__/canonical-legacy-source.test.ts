@@ -29,6 +29,7 @@ import { groupExistsInNeon, sessionUnits } from "../neon-s3-sync/neon-reader.ts"
 import { Checkpoint, assertLegacyErasureAuthorityReady, newCounters, runOrg, verifyExported, withLegacyPrivacyFence, NEON_SCOPE_SQL } from "../legacy-export/runner.ts";
 import {
   assertDirectUrl,
+  discoverExportOrgs,
   assertPrivacySelectOnly,
   assertSelectOnly,
   readSecrets,
@@ -946,34 +947,42 @@ exporterTest("a re-export keeps the scope's first key even if its oldest row mov
 });
 
 test("empty legacy point observation requires independent inventory, owner and visibility", async () => {
-  const { inspectEmptyLegacyScope } = await import("./fixtures/empty-legacy-scope.ts");
+  const { inspectEmptyLegacyScope } = await import("../legacy-export/empty-scope.ts");
   const candidate = { orgId: "zero-org", workspaceId: "default", source: "claude", sessionId: "zero-session" };
   const observe = () => inspectEmptyLegacyScope(db, candidate);
   await pg.exec("BEGIN");
   try {
-    expect((await observe()).reason).toBe("missing_inventory");
+    expect(await observe()).toBe("missing_inventory");
     await pg.exec("INSERT INTO sessions.session_catalog(org_id,workspace_id,source,session_id) VALUES ('zero-org','default','claude','zero-session')");
-    expect((await observe()).reason).toBe("unbound_owner");
+    expect(await observe()).toBe("unbound_owner");
+    expect(await discoverExportOrgs(db, false)).not.toContain("zero-org");
+    expect(await discoverExportOrgs(db, true)).toContain("zero-org");
+    await pg.exec("INSERT INTO sessions.convergence_events VALUES ('zero-org','','claude','zero-session','other')");
+    expect(await observe()).toBe("workspace_alias_collision");
+    await pg.exec("DELETE FROM sessions.convergence_events WHERE org_id='zero-org' AND workspace_id=''");
+
     await pg.exec("INSERT INTO sessions.convergence_events VALUES ('zero-org','default','claude','zero-session','u')");
-    expect(await observe()).toEqual({ reason: "empty_in_snapshot", exportable: false });
+    expect(await observe()).toBe("empty_in_snapshot");
     await pg.exec("INSERT INTO sessions.convergence_events VALUES ('zero-org','default','claude','zero-session','v')");
-    expect((await observe()).reason).toBe("ambiguous_owner");
+    expect(await observe()).toBe("ambiguous_owner");
     await pg.exec("DELETE FROM sessions.convergence_events WHERE org_id='zero-org' AND user_id='v'");
     await pg.exec("INSERT INTO sessions.session_links(id,org_id,workspace_id,source,session_id) VALUES(819231,'zero-org','default','claude','zero-session')");
-    expect((await observe()).reason).toBe("legacy_rows_present");
+    expect(await observe()).toBe("legacy_rows_present");
     await pg.exec("INSERT INTO sessions.conversation_turns(id,org_id,workspace_id,source,session_id) VALUES('00000000-0000-0000-0000-000000000088','zero-org','default','unknown','zero-session')");
-    expect((await observe()).reason).toBe("turns_present_or_unattributable");
+    expect(await observe()).toBe("turns_present_or_unattributable");
     await pg.exec("INSERT INTO sessions.deleted_upload_sessions VALUES ('zero-org','','claude','zero-session')");
-    expect((await observe()).reason).toBe("fenced");
+    expect(await observe()).toBe("fenced");
     await pg.exec("CREATE ROLE empty_probe_select; GRANT USAGE ON SCHEMA sessions TO empty_probe_select; GRANT SELECT ON ALL TABLES IN SCHEMA sessions TO empty_probe_select; ALTER TABLE sessions.conversation_turns ENABLE ROW LEVEL SECURITY; SET LOCAL ROLE empty_probe_select");
-    expect((await observe()).reason).toBe("filtered_inventory");
+    await pg.exec("SET LOCAL row_security=on");
+    expect(await observe()).toBe("filtered_inventory");
+    await expect(discoverExportOrgs(db, true)).rejects.toThrow();
   } finally {
     await pg.exec("ROLLBACK");
   }
 });
 
 exporterTest("an independently inventoried frozen empty scope round-trips a single marker through exporter and reader", async () => {
-  const { inspectEmptyLegacyScope } = await import("./fixtures/empty-legacy-scope.ts");
+  const { inspectEmptyLegacyScope } = await import("../legacy-export/empty-scope.ts");
   const candidate = { ...scope, sessionId: "frozen-empty" };
   await pg.exec(`INSERT INTO sessions.session_catalog VALUES
     ('org_1','frozen-empty','ws_1','claude','2026-11-01','2026-11-02','2026-11-02');
@@ -985,7 +994,34 @@ exporterTest("an independently inventoried frozen empty scope round-trips a sing
   try {
     await frozen.exec("SET default_transaction_read_only=on");
     const source = frozen as unknown as Queryable;
-    expect(await inspectEmptyLegacyScope(source, candidate)).toEqual({ reason: "empty_in_snapshot", exportable: false });
+    expect(await inspectEmptyLegacyScope(source, candidate)).toBe("empty_in_snapshot");
+    const checkpoint = new Checkpoint(":memory:");
+    const opStore = createFsStore({root: join(root, "frozen-inventory-org")});
+    const deps = { db: source, privacyDb: db, target: { store: opStore, keyRoot: "96bulls", grantId: "proof" }, checkpoint, hook: async () => {}, log: () => {} };
+    const options = {includeEmptyScopes: true, export: true, pageGroups: 1, window: {sinceMs: Date.parse("2026-11-01"), untilMs: Date.parse("2026-11-02")}};
+    try {
+      const plan = newCounters();
+      await runOrg(deps, candidate.orgId, {...options, export: false}, plan);
+      expect(checkpoint.exported()).toHaveLength(0);
+      await runOrg(deps, candidate.orgId, { ...options, includeEmptyScopes: false }, newCounters());
+      expect(checkpoint.exported().some((r) => JSON.parse(r.key)[3] === candidate.sessionId)).toBe(false);
+      const first = newCounters();
+      await runOrg(deps, candidate.orgId, options, first);
+      expect(first.failed).toBe(0);
+      const saved = checkpoint.exported().find((r) => JSON.parse(r.key)[3] === candidate.sessionId);
+      expect(saved).toBeDefined();
+      const ptr = { ...await pointerFor(opStore, saved!.manifest_key), session_id: candidate.sessionId };
+      expect((await snapshot(opStore, [ptr], candidate)).legacyCoverage?.tables).toHaveLength(3);
+      const resumed = newCounters();
+      await runOrg(deps, candidate.orgId, options, resumed);
+      expect(resumed.exported).toBe(0);
+      const refreshed = newCounters();
+      await runOrg(deps, candidate.orgId, {...options, refresh: true}, refreshed);
+      expect(refreshed.skippedCheckpoint).toBeGreaterThan(0);
+      expect((await verifyExported(source, opStore, checkpoint, decompress, candidate.orgId, db)).ok).toBe(true);
+    } finally {
+      checkpoint.close();
+    }
     const owner = await legacyScopeOwner(source, candidate);
     expect(owner).toEqual({ userId: "person", reason: "events" });
     const units = await sessionUnits(source, candidate.orgId, candidate.sessionId);

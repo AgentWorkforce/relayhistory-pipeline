@@ -329,16 +329,27 @@ write-only transcript credentials and cannot perform this cleanup itself.
 
 ### Certified-empty scopes
 
-The live exporter discovers scopes from rows in the three legacy tables. A
-scope absent from discovery has unknown coverage. A production read-only
-login or a successful scan alone cannot establish that the source has stopped
-changing.
+By default discovery visits the three legacy row tables. After the source
+owner confirms the write cutover and supplies a complete immutable Neon source
+or a snapshot bound to that cutoff, add `--include-empty-scopes` to the
+existing `--plan` and `--export` commands. Use the same source for verify.
+Record the snapshot/cutoff with the checkpoint and use a fresh checkpoint
+when changing source snapshots. A read-only login alone cannot establish the
+cutoff. The option does not authorize a live export.
 
-The PGlite fixture in `canonical-legacy-source.test.ts` exercises a narrower
-case. An immutable synthetic source archive contains a catalog entry and one
-authenticated owner for a scope with zero legacy rows. Using a separate
-privacy connection, the writer registers authority, writes a single marker,
-and the reader reports explicit empty coverage. The fixture also exercises a
-subsequent live erasure fence. This proves the writer/reader representation
-for that scope. A live rollout still needs an authoritative, complete frozen
-inventory and owner bindings for its intended population.
+The option adds ordinary catalog and rollup candidates inside the selected
+organization and time window, with separate resumable cursors. `--all-orgs`
+also discovers organizations represented only there. Each empty candidate
+requires full visibility of all evidence tables, an exact independently
+inventoried scope, a valid ordinary activity clock, one authenticated event
+owner and no conflicting default-workspace alias. A turn anywhere in the
+same workspace/session conservatively blocks empty certification, including
+unattributable turns. Review `emptyRefused`, erasure/fence counts and verify
+output. A missing catalog/rollup scope has unknown coverage. These reports
+cannot establish how many historical sessions are missing from both tables.
+
+Reads for a candidate share a repeatable-read read-only transaction. The
+live privacy authority, registration, erasure locks and marker writer follow
+the normal export path. Run the existing `--verify` procedure and check the
+reader against an approved scope before relying on the result. A partial run
+only covers verified scopes it actually exported.
