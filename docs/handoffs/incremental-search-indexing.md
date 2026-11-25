@@ -221,6 +221,9 @@ What happens in the other cases:
 
 - **Recreate race:** a recreate inserts a live row and bumps the epoch, so (a) fails under the lock and the pass
   indexes the live generation.
+  - A FENCED scope cannot be recreated at all: `session_erasure_fences` refuses DELETE, and a trigger refuses any live
+    row for a fenced id. So "fence, then a newer live generation" is not a reachable state.
+  - The recreate case that IS reachable is "all rows tombstoned, then a live row returns". Test R3c covers it.
 - **Old-version delete or retired generation:** it leaves a live row (or a live sibling), so (a) fails.
 - **Never-committed scope:** no row at all, so (b) fails and the pass acks `not_committed` (§4.2).
 
@@ -269,14 +272,15 @@ Replaces the S3-reconcile-body freshness path for search. `reconcileStaleProject
 until retired.
 
 - **One global keyset cursor over stale scopes**, not per tenant: `sessions.search_catchup_cursor`, a single row
-  `(org_id, workspace_id, harness, canonical_session_id, lap, updated_at)`. Each tick, in one transaction:
+  `(org_id, workspace_id, harness, session_id, lap, updated_at)`, where `session_id` is the directory's own key: in
+  `session_directory` it IS the canonical session id (there is no `canonical_session_id` column). Each tick, in one transaction:
   ```sql
-  SELECT d.org_id, d.workspace_id, d.harness, d.canonical_session_id, d.event_projection_epoch
+  SELECT d.org_id, d.workspace_id, d.harness, d.session_id AS canonical_session_id, d.event_projection_epoch
     FROM sessions.session_directory d
    WHERE d.event_projection_ready IS NOT TRUE
      AND EXISTS (SELECT 1 FROM sessions.session_index i WHERE <live row for the canonical scope>)
-     AND (d.org_id, d.workspace_id, d.harness, d.canonical_session_id) > ($c_org, $c_ws, $c_harness, $c_canon)
-   ORDER BY d.org_id, d.workspace_id, d.harness, d.canonical_session_id
+     AND (d.org_id, d.workspace_id, d.harness, d.session_id) > ($c_org, $c_ws, $c_harness, $c_canon)
+   ORDER BY d.org_id, d.workspace_id, d.harness, d.session_id
    LIMIT $S;          -- S = 500
   ```
   - Each row gets the §3.1 enqueue. The cursor moves to the last row returned. Fewer than S rows means the cursor
