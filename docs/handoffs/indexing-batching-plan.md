@@ -59,12 +59,10 @@ The stack bound stays at 20. Raising it is a separate reviewed change that carri
 
 ## Visibility timeout
 
-AWS recommends a queue visibility of at least 6 x the function timeout (300 s) plus the batching window. With
-`batchingWindowSeconds` set, the stack renders exactly 1800 + window (2 s gives 1802; 300 s gives 2100). Unset, it stays
-1800 s, which is 20 s under the recommendation at the default 20 s window. It is kept unchanged so an unset stage is
-byte-identical. The hand-applied 2026-11-25 change (window 2 s) left the live visibility at 1800 s, 2 s under the
-recommendation. That is advisory only (AWS enforces visibility >= function timeout). It is corrected to 1802 when
-the stage sets `batchingWindowSeconds: 2`.
+The stack renders visibility = 6 x 300 s + the effective batching window: omitted or 20 gives 1820 s; 0 gives 1800 s;
+2 gives 1802 s; 300 gives 2100 s. This CHANGES the deployed queue even with every setting omitted (1800 to 1820 s).
+Applying this code is therefore a queue update, and any rollout plan must show that diff. The 2026-11-25 hand-applied
+window change was reverted (it raised latency at saturated concurrency), so live is window 20 s, visibility 1800 s.
 
 ## Rollback values and stop lines
 

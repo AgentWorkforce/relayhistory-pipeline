@@ -1106,7 +1106,7 @@ describe("session pipeline: queue and mapping timing props (as the wiring passes
   const vis = (n: number) => ({ visibilityTimeout: `${n} seconds` });
   it("omitted and explicit defaults render 30 s / 20 s / 4", () => {
     for (const p of [{}, { deliveryDelaySeconds: 30, batchingWindowSeconds: 20, maxConcurrency: 4 }] as SessionPipelineInputs[])
-      expect(props(p)).toEqual({ ...fixed, ...vis(p.batchingWindowSeconds === undefined ? 1800 : 1820), delay: "30 seconds", maximumBatchingWindow: "20 seconds", scalingConfig: { MaximumConcurrency: 4 } });
+      expect(props(p)).toEqual({ ...fixed, ...vis(1820), delay: "30 seconds", maximumBatchingWindow: "20 seconds", scalingConfig: { MaximumConcurrency: 4 } });
   });
   it("explicit zeros render zero, never the default", () => {
     expect(props({ deliveryDelaySeconds: 0, batchingWindowSeconds: 0, maxConcurrency: 2 }))
@@ -1119,7 +1119,7 @@ describe("session pipeline: queue and mapping timing props (as the wiring passes
       .toEqual({ ...fixed, ...vis(2100), delay: "900 seconds", maximumBatchingWindow: "300 seconds", scalingConfig: { MaximumConcurrency: 20 } });
   });
   it("visibility covers 6 x the handler timeout plus the batching window whenever the window is set", () => {
-    expect(sessionEventsVisibilitySeconds({})).toBe(1800);
+    expect(sessionEventsVisibilitySeconds({})).toBe(1820); // omitted = effective window 20; differs from the old fixed 1800
     for (const w of [0, 2, 20, 300]) expect(sessionEventsVisibilitySeconds({ batchingWindowSeconds: w })).toBe(6 * 300 + w);
   });
   it("the busy requeue delay is independent of the queue timing", () => {

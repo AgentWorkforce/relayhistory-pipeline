@@ -912,13 +912,14 @@ export function sessionEventsQueueTiming(p: Pick<SessionPipelineInputs, "deliver
 }
 
 /**
- * The queue visibility timeout. AWS recommends at least 6 x the function timeout plus the mapping's batching window,
- * so a message cannot reappear while a batch that waited the full window is still being processed. With
- * batchingWindowSeconds set it is exactly that. Omitted, it stays VISIBILITY_TIMEOUT_SECONDS (1800 s), unchanged:
- * that is 20 s under the recommendation at the default 20 s window, kept so an unset stage renders byte-identical.
+ * The queue visibility timeout: 6 x the function timeout plus the mapping's EFFECTIVE batching window (the same value
+ * sessionEventsMappingTiming renders, default 20 s). That is AWS's recommendation: a message must not reappear while
+ * a batch that waited the full window is still being processed. NOTE: this differs from the previous fixed 1800 s
+ * even when every setting is omitted (default window 20 gives 1820 s), so applying this code changes the deployed
+ * queue. Any rollout plan must surface that diff.
  */
 export function sessionEventsVisibilitySeconds(p: Pick<SessionPipelineInputs, "batchingWindowSeconds">): number {
-  return p.batchingWindowSeconds === undefined ? VISIBILITY_TIMEOUT_SECONDS : 6 * FUNCTION_TIMEOUT_SECONDS + p.batchingWindowSeconds;
+  return 6 * FUNCTION_TIMEOUT_SECONDS + (p.batchingWindowSeconds ?? 20);
 }
 
 /**
