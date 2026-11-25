@@ -16,3 +16,14 @@ CREATE TABLE sessions.publication_receipt_retries (
 );
 CREATE INDEX publication_receipt_retries_due ON sessions.publication_receipt_retries(scope,due_ms,stage_token)
   WHERE state='retry';
+
+-- The schedule advances on reservation, independently from each scope's receipt CAS.
+CREATE TABLE sessions.publication_fleet_cursors (
+  fleet text PRIMARY KEY CHECK (fleet ~ '^[a-f0-9]{64}$'),
+  last_org text NOT NULL CHECK (last_org ~ '^[a-f0-9]{64}$'),
+  origins jsonb NOT NULL CHECK (jsonb_typeof(origins)='object'),
+  last_scope text NOT NULL CHECK (last_scope ~ '^[a-f0-9]{64}$'),
+  lease_token uuid,
+  lease_until timestamptz,
+  CHECK ((lease_token IS NULL) = (lease_until IS NULL))
+);
