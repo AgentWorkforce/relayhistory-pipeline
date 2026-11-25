@@ -25,7 +25,8 @@
  *
  * Contracts this file fixes where the design leaves a choice:
  *   - settleSearchJob under a lost lease returns `{ applied: false }` (never throws) and touches nothing (R1d, R4b).
- *   - R5g, a managed scope with no provable publish clock: the authority-path writer THROWS, so the session-indexed
+ *   - R5g, a managed scope with no provable publish clock: the session stays readable (authority commits), no job, a recorded refusal;
+ *     (superseded rev-6 helper note follows) the authority-path writer previously THREW, so the session-indexed
  *     delivery does not ack (it retries) and the authority transaction rolls back: no job of any stage, and never a
  *     `pointer` clock. That is the design's "fail closed" with the delivery's error as the surfaced error.
  * R7 is deferred to M3 and is not in this file.
@@ -137,6 +138,8 @@ const backoff = (attempt: number) => Math.min(900, 30 * 2 ** Math.max(0, attempt
 type ClaimedSearchJob = { id: string | number; lease: string; claimedEpoch: number; claimedMessage: StageMessage<WakePayload> };
 type SettleOutcome = "done" | { retry: number } | "exhausted";
 type SearchJobsModule = {
+  /** §2 [rev 6]: refusals recorded by the authority-path writer (e.g. clock_unprovable), per manifest key. */
+  searchWakeRefusals: (sql: PGlite, manifestKey: string) => Promise<Array<{ reason: string; count: number }>>;
   /** §3.1: the one-row-per-scope coalescing upsert. */
   enqueueSearchWake: (sql: PGlite, message: StageMessage) => Promise<unknown>;
   /** §3.2: claims up to n visible search-index jobs (lease + counted attempt), recording the claimed epoch and message. */
@@ -593,12 +596,13 @@ describe("R5f: an OLDER live head triggers the authority enqueue beside a NEWER 
 // ---------------------------------------------------------------------------------------------------------
 describe("R5g: a managed scope whose publish clock is unprovable fails closed (design §2 [rev 6])", () => {
   // The real head's own attempt loses its published_at (triggers off) BEFORE the real authority transaction, so the
-  // §2 clock aggregate is NULL for a managed, live, current scope. The contract this file fixes (header): the writer
-  // THROWS, the delivery does not ack and the authority transaction rolls back. No job, never a pointer clock.
+  // §2 clock aggregate is NULL for a managed, live, current scope. Contract: the session STILL becomes readable (the
+  // authority transaction commits the pointer and directory; a search-side problem never blocks upload or read), but
+  // the writer enqueues NO search-index job, never falls back to a pointer clock, and records a refusal
+  // (clock_unprovable) that M2 exposes through searchWakeRefusals.
   let head: PublishedHead;
   beforeAll(async () => {
     head = await publishedHead({
-      expectAuthorityAck: false,
       beforeAuthority: async ({ db, key }) => {
         await db.transaction(async (tx) => {
           await tx.query("SET LOCAL session_replication_role = replica");
@@ -611,7 +615,7 @@ describe("R5g: a managed scope whose publish clock is unprovable fails closed (d
   }, 180_000);
   afterAll(() => head?.close());
 
-  test("R5g: NULL published_at on the managed head: no search-index job, the authority delivery surfaces an error (no ack), never clock.source 'pointer'", async () => {
+  test("R5g: NULL published_at on the managed head: the session is readable, no search-index job, never a pointer clock, and a clock_unprovable refusal is recorded", async () => {
     // Fixture soundness: the head is live, its generation live and its attempt published; only the clock is missing.
     const { rows } = await head.db.query<{ state: string; gen_state: string; attempt_state: string; unclocked: boolean }>(
       `SELECT h.state, g.state AS gen_state, a.state AS attempt_state, a.published_at IS NULL AS unclocked
@@ -621,13 +625,15 @@ describe("R5g: a managed scope whose publish clock is unprovable fails closed (d
          JOIN sessions.ingest_publication_attempts a ON a.attempt_token = i.attempt_token
         WHERE h.current_key = $1`, [head.key]);
     expect(rows).toEqual([{ state: "live", gen_state: "live", attempt_state: "published", unclocked: true }]);
+    // Readability is never blocked: the authority delivery acks and the live pointer row exists.
+    expect(head.authority).toMatchObject({ acked: 1 });
+    expect((await head.db.query("SELECT 1 FROM sessions.session_index WHERE manifest_key = $1 AND deleted_at IS NULL", [head.key])).rows).toHaveLength(1);
     // Never a job with a pointer clock, and no search-index job at all.
     expect(head.jobsAfter.filter((j) => (j.message.payload as Partial<WakePayload> | undefined)?.clock?.source === "pointer")).toEqual([]);
     expect(head.jobsAfter.filter((j) => j.stage === STAGE)).toEqual([]);
-    // The error is surfaced: the authority delivery does not ack; it is retried and its transaction rolled back, so
-    // the queue holds only the session-indexed delivery (no fan-out, no wake).
-    expect(head.authority).toMatchObject({ claimed: 1, acked: 0, retried: 1, exhausted: 0 });
-    expect(head.jobsAfter.map((j) => j.stage)).toEqual(["session-indexed"]);
+    // The refusal is recorded (red today: the M2 writer and its refusal record are absent).
+    const m = await m2("searchWakeRefusals");
+    expect(await m.searchWakeRefusals(head.db as unknown as PGlite, head.key)).toEqual([{ reason: "clock_unprovable", count: 1 }]);
   });
 });
 

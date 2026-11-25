@@ -131,8 +131,13 @@ replay tooling works unchanged:
     - The aggregate excludes deleted or retired heads and other-scope heads.
     - It never replaces the triggering head's own authority check: a sibling's valid timestamp cannot validate an
       unproven trigger (§2's `session_publication_lock` still gates the enqueue).
-    - If the aggregate is NULL for a managed scope, FAIL CLOSED: no job, plus an error metric. The `pointer` clock is
-      only for non-managed catch-up.
+    - If the aggregate is NULL for a managed scope, FAIL CLOSED FOR SEARCH ONLY:
+      - the authority transaction still commits the pointer and directory, so the session is readable;
+      - a search-side defect never blocks upload or read;
+      - the writer enqueues NO search-index job and records a refusal (`clock_unprovable`): a counter and an alert,
+        exposed as `searchWakeRefusals`;
+      - the `pointer` clock is only for non-managed catch-up, never a fallback here.
+      - Test R5g.
     - R5e covers the older head triggering, plus the exclusions.
   - `pointer`: max(`session_index.indexed_at`) of the scope's live rows. Used by non-managed catch-up, which has no
     publication attempt. That is the pointer write time, a later origin than the upload commit.
