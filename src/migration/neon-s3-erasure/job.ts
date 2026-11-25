@@ -108,6 +108,22 @@ export function sessionPrefixParts(keyRoot: string, orgId: string, prefix: strin
   return m ? { ws: m[1]!, m: m[2]!, h: m[3]!, d: m[4]!, s: m[5]! } : undefined;
 }
 
+/**
+ * The session identity of a stale-prefix queue entry, as the `--only-identity` allowlist names it:
+ * sha256_hex(utf8("<org>/<ws>/<m>/<h>/<s>")) over the org id and the raw ws, m, h and s segment values of
+ * `sessionPrefixParts` (the `d=` date dropped, so every date-moved prefix of one session shares one identity).
+ * `key` must be a session prefix (`<root>/<org>/v1/ws=../m=../h=../d=YYYY/MM/DD/s=../`) of the org's own tenant
+ * prefix; anything else is undefined. Operators compute the same value offline (runbooks/neon-s3-sync.md).
+ */
+export function staleprefixIdentityHash(keyRoot: string, orgId: string, key: string): string | undefined {
+  const p = sessionPrefixParts(keyRoot, orgId, key);
+  return p ? createHash("sha256").update(`${orgId}/${p.ws}/${p.m}/${p.h}/${p.s}`, "utf8").digest("hex") : undefined;
+}
+
+/** Most identities one stale-prefix pass may name. */
+export const STALE_PREFIX_ALLOWLIST_MAX = 100;
+const IDENTITY_HASH = /^[0-9a-f]{64}$/;
+
 /** Logs name a key only by its hash (public-repo / tenant hygiene). */
 const keyHash = (key: string) => createHash("sha256").update(key).digest("hex");
 
@@ -125,7 +141,8 @@ type LeasedItemResult = {
 /** Why the stale-prefix-only mode leaves an entry queued (for the full job). */
 export type StalePrefixSkip =
   | "shape_invalid" | "current_key" | "not_date_move" | "no_live_sibling" | "sibling_export_failed"
-  | "sibling_manifest_missing" | "sibling_check_failed" | "lease_busy" | "state_busy" | "cancelled";
+  | "sibling_manifest_missing" | "sibling_check_failed" | "lease_busy" | "state_busy" | "cancelled"
+  | "not_in_identity_allowlist" | "identity_unresolved";
 
 export interface StalePrefixResult {
   ok: boolean;
@@ -144,6 +161,12 @@ export interface StalePrefixResult {
   siblingChecked: boolean;
   /** Unexpired leases held by another eraser process at the start. Execute refuses to start when any exist. */
   otherEraserLeases: number;
+  /** Identities named by `onlyIdentities`. */
+  allowlistSize: number;
+  /** Allowlisted identities with at least one queued stale-prefix entry (`selected`, backing-off entries included). */
+  allowlistMatchedIdentities: number;
+  /** Allowlisted identities with no queued stale-prefix entry. */
+  allowlistUnmatched: number;
   /** Set when execute refused to start (nothing erased, nothing written). */
   refused?: "stale_prefix_mode_other_eraser_lease";
   stoppedBy?: string;
@@ -1009,20 +1032,35 @@ export class ErasureJob {
    * entry goes through the SAME leased per-item path as `drain`; the pass stops after `max` erases and at the first
    * failed erase (recorded as `drain` records it; `ok` false). Without `execute` it reads only: no lease, no queue
    * write, no delete; it reports what is eligible and why the rest would be skipped.
+   *
+   * `onlyIdentities` (required, 1..100 distinct `staleprefixIdentityHash` values) scopes the pass: an entry whose
+   * identity is not listed is skipped `not_in_identity_allowlist` (never leased, never erased, never written), one whose
+   * identity cannot be derived `identity_unresolved`; listed entries meet every guard above unchanged.
    */
-  async staleprefixPass(opts: { execute: boolean; max?: number; probe?: LiveObjectProbe }): Promise<StalePrefixResult> {
+  async staleprefixPass(opts: { execute: boolean; max?: number; probe?: LiveObjectProbe; onlyIdentities: readonly string[] }): Promise<StalePrefixResult> {
     if (this.state.obligations) throw refusal("stale_prefix_mode_requires_obligations_off");
     if (opts.max !== undefined && !(Number.isSafeInteger(opts.max) && opts.max > 0)) throw refusal("stale_prefix_mode_max_invalid");
     if (opts.execute && !opts.probe) throw refusal("stale_prefix_mode_requires_existence_check");
+    const ids = opts.onlyIdentities;
+    if (!Array.isArray(ids) || ids.length === 0 || ids.length > STALE_PREFIX_ALLOWLIST_MAX || !ids.every((h) => typeof h === "string" && IDENTITY_HASH.test(h)) || new Set(ids).size !== ids.length)
+      throw refusal("stale_prefix_mode_allowlist_invalid");
+    const allow = new Set(ids);
     const now = this.now();
     const selected = this.state.staleprefixErasures();
     const due = selected.filter((i) => i.next_try <= now);
     const queued = this.state.erasureBacklog(now).queued;
     const skipped: Partial<Record<StalePrefixSkip, number>> = {};
+    const identityOf = (i: { key: string; org_id: string }) => staleprefixIdentityHash(this.cfg.keyRoot, i.org_id, i.key);
+    const matched = new Set<string>();
+    for (const i of selected) {
+      const h = identityOf(i);
+      if (h !== undefined && allow.has(h)) matched.add(h);
+    }
     const res: StalePrefixResult = {
       ok: true, execute: opts.execute, selected: selected.length, due: due.length, backingOff: selected.length - due.length,
       otherEntries: queued - selected.length, eligible: 0, erased: 0, versionsDeleted: 0, skipped, siblingChecked: !!opts.probe,
       otherEraserLeases: this.state.otherEraserLeases(LEASE_HOLDER, now),
+      allowlistSize: allow.size, allowlistMatchedIdentities: matched.size, allowlistUnmatched: allow.size - matched.size,
     };
     // Another eraser may be mid-run (or crashed less than the lease TTL ago): execute never runs beside it and never
     // releases its leases. Exporter leases do not refuse; those prefixes skip as lease_busy. A dry run only reports.
@@ -1039,6 +1077,10 @@ export class ErasureJob {
     for (const item of due) {
       if (this.stopped()) { res.stoppedBy = "signal"; break; }
       if (opts.execute && opts.max !== undefined && res.erased >= opts.max) { res.stoppedBy = "max"; break; }
+      // The allowlist comes before every other check: an unlisted entry is never leased, read further or written.
+      const identity = identityOf(item);
+      if (identity === undefined) { skip("identity_unresolved", item.key); continue; }
+      if (!allow.has(identity)) { skip("not_in_identity_allowlist", item.key); continue; }
       if (!sessionPrefixParts(this.cfg.keyRoot, item.org_id, item.key)) { skip("shape_invalid", item.key); continue; }
       if (!opts.execute) {
         const reason = await this.#staleGuard(item, opts.probe);
@@ -1068,7 +1110,8 @@ export class ErasureJob {
     this.log({
       message: "stale prefix pass", execute: opts.execute, ok: res.ok, selected: res.selected, due: res.due, backing_off: res.backingOff,
       other_entries: res.otherEntries, eligible: res.eligible, erased: res.erased, versions_deleted: res.versionsDeleted, skipped,
-      sibling_checked: res.siblingChecked, other_eraser_leases: res.otherEraserLeases, ...(opts.max !== undefined ? { max: opts.max } : {}), ...(res.stoppedBy ? { stopped_by: res.stoppedBy } : {}),
+      sibling_checked: res.siblingChecked, other_eraser_leases: res.otherEraserLeases, allowlist_size: res.allowlistSize,
+      allowlist_matched_identities: res.allowlistMatchedIdentities, allowlist_unmatched: res.allowlistUnmatched, ...(opts.max !== undefined ? { max: opts.max } : {}), ...(res.stoppedBy ? { stopped_by: res.stoppedBy } : {}),
     });
     return res;
   }

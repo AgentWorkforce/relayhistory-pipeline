@@ -162,9 +162,39 @@ moves from one `d=YYYY/MM/DD` prefix to another, the old prefix is queued as
 kind `prefix` with reason `stale_prefix`.
 
 ```sh
-<credentials JSON> | bun run migration:neon-s3-erasure --stale-prefixes-only [--max <n>]            # dry run
-<credentials JSON> | bun run migration:neon-s3-erasure --stale-prefixes-only --execute [--max <n>]
+<credentials JSON> | bun run migration:neon-s3-erasure --stale-prefixes-only --only-identity <sha256> [--only-identity <sha256> ...] [--max <n>]            # dry run
+<credentials JSON> | bun run migration:neon-s3-erasure --stale-prefixes-only --only-identity <sha256> [--only-identity <sha256> ...] --execute [--max <n>]
 ```
+
+**Identity allowlist (`--only-identity`, required).** The pass erases only the
+sessions it is told to. Each `--only-identity` names one session identity; give
+it once per session, 1 to 100 distinct values, in the dry run and with
+`--execute` alike. Every queued stale prefix whose identity is not listed is
+skipped (`not_in_identity_allowlist`): it is never leased, read further, erased
+or written. A listed entry still meets every guard below unchanged. All the
+date-moved prefixes of one session share its identity, so one value makes all of
+that session's due stale prefixes eligible.
+
+The identity is the lowercase hex SHA-256 of the UTF-8 string
+
+```text
+<org>/<ws>/<m>/<h>/<s>
+```
+
+where `<org>` is the entry's org id and `<ws>`, `<m>`, `<h>`, `<s>` are the raw
+values of the `ws=`, `m=`, `h=` and `s=` segments of the queued session prefix
+`<key root>/<org>/v1/ws=<ws>/m=<m>/h=<h>/d=YYYY/MM/DD/s=<s>/`. The `d=` date is
+dropped; the key root and `v1` are not part of it; there is no trailing slash
+or newline. Compute it offline:
+
+```sh
+printf '%s' '<org>/<ws>/<m>/<h>/<s>' | shasum -a 256          # first field
+# or from a queued prefix key, with the code the job uses:
+bun -e 'import { staleprefixIdentityHash } from "./src/migration/neon-s3-erasure/job.ts"; console.log(staleprefixIdentityHash(process.argv[1], process.argv[2], process.argv[3]))' <key root> <org> <session prefix>
+```
+
+`staleprefixIdentityHash(keyRoot, orgId, key)` returns `undefined` for a key that
+is not a session prefix of that org. There is no mode that prints keys.
 
 **Procedure.** Run the dry run first with the exact command. Confirm that its
 `start` log line carries `mode: "stale_prefixes_only"`; the full job's `start`
@@ -175,6 +205,9 @@ line does not. Only then re-run the SAME command with `--execute` appended.
 - Reads only the queued entries with kind `prefix` AND reason `stale_prefix`
   that are past their backoff. It takes them in enqueue order and makes one
   pass, then exits. `--once` is implied.
+- Skips, before anything else, every entry whose identity is not in the
+  `--only-identity` list (`not_in_identity_allowlist`) or cannot be derived
+  (`identity_unresolved`).
 - Checks each entry inside its session-prefix lease, right before the erase:
   - (a) The old prefix holds none of the org's current exported or pending
     keys.
@@ -192,7 +225,7 @@ line does not. Only then re-run the SAME command with `--execute` appended.
   - The strict paged eraser deletes every version by id and needs a fresh
     zero proof before the entry is marked done.
 - With `--max <n>` (a positive decimal integer) it stops after `n` successful
-  erases.
+  erases. Allowlist skips do not count.
 - It stops at the first failed erase: an error, an unresolved, unverified,
   incomplete or refused result, or a refused done claim. It records that
   entry exactly as the full job would (error code, backoff), touches nothing
@@ -229,9 +262,15 @@ The mode refuses to start in any of these cases:
 - `BABYSITTER_RETENTION_SWEEP` is set to anything other than `off` or unset
   (`stale_prefix_mode_retention_refused`).
 - `S3X_OBLIGATIONS` is on (`stale_prefix_mode_requires_obligations_off`).
-- Any flag other than `--execute`, `--once` and `--max <n>` is given
-  (`stale_prefix_mode_flag_refused`).
+- Any flag other than `--execute`, `--once`, `--max <n>` and
+  `--only-identity <sha256>` is given (`stale_prefix_mode_flag_refused`;
+  `--only-identity=<sha256>` is refused this way too).
 - `--max` is invalid or repeated (`stale_prefix_max_invalid`).
+- No `--only-identity` is given (`stale_prefix_only_identity_required`).
+- An `--only-identity` has no value, or its value is not exactly 64 lowercase
+  hex characters (`stale_prefix_only_identity_invalid`).
+- The same identity is given twice (`stale_prefix_only_identity_duplicate`).
+- More than 100 are given (`stale_prefix_only_identity_too_many`).
 - With `--execute`: the state holds an unexpired lease (younger than 2 hours)
   of another eraser process (`stale_prefix_mode_other_eraser_lease`). Nothing
   is erased or written. Exporter leases do not refuse. A dry run does not
@@ -240,9 +279,12 @@ The mode refuses to start in any of these cases:
 Without the switch:
 
 - `--max` is refused (`stale_prefix_max_without_mode`).
-- Any argument that resembles the switch or `--max` is refused
-  (`stale_prefix_mode_flag_refused`): its lower-cased text contains `stale` or
-  `prefix`, or, after its leading dashes, it starts with `max` in any case.
+- `--only-identity` (or `--only-identity=...`) is refused
+  (`stale_prefix_only_identity_without_mode`).
+- Any argument that resembles the switch, `--max` or `--only-identity` is
+  refused (`stale_prefix_mode_flag_refused`): its lower-cased text contains
+  `stale`, `prefix` or `identit`, or, after its leading dashes, it starts with
+  `max` or `only` in any case.
   This catches a misspelled switch such as `--stal-prefixes-only`,
   `--prefixes-only`, `-stale-prefixes-only`, `--STALE-PREFIXES-ONLY`, a
   trailing space, a typographic dash in front, or `--stale-prefixes-only=1`:
@@ -266,7 +308,7 @@ state file to clear them.
 **Reading the output.** The logs carry counts and key hashes (`key_sha256`)
 only.
 
-- `start` with `mode: "stale_prefixes_only"`.
+- `start` with `mode: "stale_prefixes_only"` and `allowlist_size`.
 - One `stale prefix skipped` line per skipped entry, with `reason`.
 - One `stale prefix erased` line per erase.
 - On a stop, `stale prefix pass stopped` with `outcome` and `error_code`.
@@ -283,6 +325,10 @@ only.
   - `sibling_checked`.
   - `other_eraser_leases`: unexpired leases of other eraser processes.
   - `stopped_by`: `max`, `signal` or the failing outcome.
+  - `allowlist_size`: identities given.
+  - `allowlist_matched_identities`: given identities with at least one queued
+    stale prefix (backing-off entries included).
+  - `allowlist_unmatched`: given identities with no queued stale prefix.
 
 A dry run has no bucket credentials, so it does not make the bucket check in
 (b): `sibling_checked: false`. The dry run applies the state checks only; the
@@ -294,7 +340,9 @@ Skip reasons:
 
 | reason | meaning |
 | --- | --- |
-| `shape_invalid` | not a session prefix of the entry's own org |
+| `not_in_identity_allowlist` | the entry's session identity is not in the `--only-identity` list |
+| `identity_unresolved` | no session identity can be derived: not a session prefix of the entry's own org |
+| `shape_invalid` | not a session prefix of the entry's own org (unreachable after `identity_unresolved`; kept as a backstop) |
 | `current_key` | the old prefix still holds a current exported or pending key (guard a) |
 | `not_date_move` | the session's current copy differs in workspace, machine or host, not only the date |
 | `no_live_sibling` | no current exported copy of the session under another date |
