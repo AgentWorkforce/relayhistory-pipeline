@@ -168,6 +168,15 @@ describe("session read api: inputs, grants and env", () => {
         expect(() => assertSessionReadApiInputs({ completeSince: "epoch", [k]: bad }, refuse)).toThrow(new RegExp(`${k} must be a boolean`));
   });
 
+  it("enables recorded list summaries on the hosted reader and preserves an explicit opt-out", () => {
+    const render = (stage: string, options: { listShortSummary?: boolean } = {}) =>
+      sessionReadApiFunctionProps({ stage, names: sessionReadApiNames(stage), p: { completeSince: "epoch", ...options } }).env;
+    expect(render("aws-sessions-prod").READ_API_LIST_SHORT_SUMMARY_ENABLED).toBe("true");
+    expect(render("aws-sessions-prod", { listShortSummary: false }).READ_API_LIST_SHORT_SUMMARY_ENABLED).toBeUndefined();
+    expect(render("aws-sessions-dev").READ_API_LIST_SHORT_SUMMARY_ENABLED).toBeUndefined();
+    expect(render("aws-sessions-prod").READ_API_BRIEF_SUMMARY_ENABLED).toBeUndefined();
+  });
+
   it("list readiness: env present only when switched on, exactly \"true\"; the input is a boolean; independent of the short summary", () => {
     const names = sessionReadApiNames(STAGE);
     for (const p of [{ completeSince: "epoch" }, { completeSince: "epoch", listReadiness: false }, { completeSince: "epoch", listShortSummary: true }]) {

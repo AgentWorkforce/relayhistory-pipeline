@@ -55,8 +55,8 @@ export interface SessionReadApiInputs {
    */
   briefSummary?: boolean;
   /**
-   * Serve GET /v1/sessions?includeShortSummary=recorded (READ_API_LIST_SHORT_SUMMARY_ENABLED=true). Default off:
-   * absent, the param stays 501 `param_includeShortSummary` and the list shape is unchanged either way.
+   * Serve GET /v1/sessions?includeShortSummary=recorded (READ_API_LIST_SHORT_SUMMARY_ENABLED=true). Enabled by default
+   * on aws-sessions-prod only. Explicit false disables it; callers must still opt in on each list request.
    */
   listShortSummary?: boolean;
   /**
@@ -193,7 +193,10 @@ export function sessionReadApiFunctionProps(i: { stage: string; names: SessionRe
     timeout: `${READ_API_TIMEOUT_SECONDS} seconds`,
     // "none": the key is absent, so Alchemy sets no function-level reservation.
     ...(i.p.reservedConcurrency === "none" ? {} : { reservedConcurrentExecutions: i.p.reservedConcurrency ?? 10 }),
-    env: sessionReadApiEnv(i),
+    // Hosted shared-sessions requests recorded short summaries. Keep explicit stage overrides.
+    env: sessionReadApiEnv(i.stage === "aws-sessions-prod"
+      ? { ...i, p: { listShortSummary: true, ...i.p } }
+      : i),
     functionUrl: { authType: "NONE" as const, invokeMode: "BUFFERED" as const },
     logging: { retention: "30 days" },
     build: { tsconfig: "tsconfig.json" },
