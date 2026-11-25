@@ -6,6 +6,7 @@ import { spawnSync } from "node:child_process";
 import { existsSync, readFileSync, writeFileSync, mkdirSync } from "node:fs";
 import { join } from "node:path";
 import { ensurePippenStateBucket } from "../../stacks/aws/state-bucket.ts";
+import { assertValidateOnlyState, stateBucketMode } from "../../stacks/aws/pippen-rehearsal.ts";
 import { currentObjects, sanitizeInputs, sanitizePlan, sha256, type Provenance } from "./plan-provenance.ts";
 import { capturePaths, observeSource, observeState, verifyDeployCapture, type CaptureIO } from "../../stacks/aws/capture-verify.ts";
 import type { StateSnapshot } from "../../stacks/aws/state-snapshot.ts";
@@ -66,7 +67,9 @@ export function capturePlan(root: string, stage: string, env: Env) {
   // A Pippen sandbox keeps its state in its own pippen-sbx- bucket (stacks/aws/state-bucket.ts),
   // made here on the first plan of a fresh account (tagged, versioned, encrypted, no public
   // access) so the capture snapshots an existing, empty, versioned store. No state object is written.
-  if (pippen) ensurePippenStateBucket((args) => run("aws", args, root, env), { accountId: inputs.accountId, region: inputs.region, stage });
+  // validate-only (pippen-rehearsal.ts): the shared bucket is only read and checked, never made or changed.
+  if (pippen && stateBucketMode(inputs.pippenSandbox) === "validate-only") assertValidateOnlyState((args) => run("aws", args, root, env), { accountId: inputs.accountId, region: inputs.region, stage, env });
+  else if (pippen) ensurePippenStateBucket((args) => run("aws", args, root, env), { accountId: inputs.accountId, region: inputs.region, stage });
   const state = observeStateAt(root, inputs.accountId, inputs.region, stage, pippen, env);
   // Transient writes are detectable only in a versioned bucket.
   if (state.versioning !== "Enabled") throw new Error(`state bucket ${state.bucket} is not versioned; a plan's writes could not be detected`);

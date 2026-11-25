@@ -1,0 +1,11 @@
+[
+  { "IsTruncated": true, "NextKeyMarker": "96bulls/96bulls-aws/aws-rehearse-p1-1126/b.json", "NextVersionIdMarker": "v-b1",
+    "Versions": [
+      { "Key": "96bulls/96bulls-aws/aws-rehearse-p1-1126/a.json", "VersionId": "v-a1" },
+      { "Key": "96bulls/96bulls-aws/aws-rehearse-p1-1126/a.json", "VersionId": "v-a2" },
+      { "Key": "96bulls/96bulls-aws/aws-rehearse-p1-1126/b.json", "VersionId": "v-b1" }
+    ] },
+  { "IsTruncated": false,
+    "Versions": [{ "Key": "96bulls/96bulls-aws/aws-rehearse-p1-1126/c/d.json", "VersionId": "v-c1" }],
+    "DeleteMarkers": [{ "Key": "96bulls/96bulls-aws/aws-rehearse-p1-1126/b.json", "VersionId": "dm-b2" }] }
+]

@@ -1,0 +1,326 @@
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "StateListOnlyThisPrefix",
+      "Effect": "Allow",
+      "Action": [
+        "s3:ListBucket",
+        "s3:ListBucketVersions"
+      ],
+      "Resource": "arn:aws:s3:::pippen-sbx-alchemy-state-<account>-us-west-2-an",
+      "Condition": {
+        "DateLessThan": {
+          "aws:CurrentTime": "2026-11-28T00:00:00Z"
+        },
+        "StringLike": {
+          "s3:prefix": [
+            "96bulls/96bulls-aws/aws-rehearse-p1-1126/*"
+          ]
+        }
+      }
+    },
+    {
+      "Sid": "StateObjectsOnlyThisPrefix",
+      "Effect": "Allow",
+      "Action": [
+        "s3:GetObject",
+        "s3:GetObjectVersion",
+        "s3:PutObject",
+        "s3:DeleteObject",
+        "s3:DeleteObjectVersion"
+      ],
+      "Resource": "arn:aws:s3:::pippen-sbx-alchemy-state-<account>-us-west-2-an/96bulls/96bulls-aws/aws-rehearse-p1-1126/*",
+      "Condition": {
+        "DateLessThan": {
+          "aws:CurrentTime": "2026-11-28T00:00:00Z"
+        }
+      }
+    },
+    {
+      "Sid": "StateBucketSettingsReadOnly",
+      "Effect": "Allow",
+      "Action": [
+        "s3:GetBucketVersioning",
+        "s3:GetEncryptionConfiguration",
+        "s3:GetBucketPublicAccessBlock",
+        "s3:GetBucketOwnershipControls",
+        "s3:GetBucketTagging"
+      ],
+      "Resource": "arn:aws:s3:::pippen-sbx-alchemy-state-<account>-us-west-2-an",
+      "Condition": {
+        "DateLessThan": {
+          "aws:CurrentTime": "2026-11-28T00:00:00Z"
+        }
+      }
+    },
+    {
+      "Sid": "NeverChangeTheSharedBucket",
+      "Effect": "Deny",
+      "Action": [
+        "s3:CreateBucket",
+        "s3:PutBucket*",
+        "s3:DeleteBucket*",
+        "s3:PutEncryptionConfiguration",
+        "s3:PutBucketVersioning",
+        "s3:PutBucketPublicAccessBlock",
+        "s3:PutBucketOwnershipControls",
+        "s3:PutBucketTagging",
+        "s3:PutLifecycleConfiguration",
+        "s3:PutBucketPolicy",
+        "s3:PutBucketAcl"
+      ],
+      "Resource": [
+        "arn:aws:s3:::pippen-sbx-alchemy-state-<account>-us-west-2-an",
+        "arn:aws:s3:::pippen-sbx-alchemy-state-*"
+      ]
+    },
+    {
+      "Sid": "NeverListOtherPrefixes",
+      "Effect": "Deny",
+      "Action": [
+        "s3:ListBucket",
+        "s3:ListBucketVersions"
+      ],
+      "Resource": "arn:aws:s3:::pippen-sbx-alchemy-state-<account>-us-west-2-an",
+      "Condition": {
+        "StringNotLike": {
+          "s3:prefix": [
+            "96bulls/96bulls-aws/aws-rehearse-p1-1126/*"
+          ]
+        }
+      }
+    },
+    {
+      "Sid": "NeverOtherStateObjects",
+      "Effect": "Deny",
+      "Action": [
+        "s3:GetObject*",
+        "s3:PutObject*",
+        "s3:DeleteObject*",
+        "s3:RestoreObject",
+        "s3:ReplicateObject"
+      ],
+      "NotResource": [
+        "arn:aws:s3:::pippen-sbx-alchemy-state-<account>-us-west-2-an/96bulls/96bulls-aws/aws-rehearse-p1-1126/*",
+        "arn:aws:s3:::96bulls-aws-rehearse-p1-1126-*/*",
+        "arn:aws:s3:::pippen-sbx-96bulls-aws-rehearse-p1-1126-*/*"
+      ]
+    },
+    {
+      "Sid": "V2Queues",
+      "Effect": "Allow",
+      "Action": [
+        "sqs:CreateQueue",
+        "sqs:GetQueueUrl",
+        "sqs:GetQueueAttributes",
+        "sqs:SetQueueAttributes",
+        "sqs:TagQueue",
+        "sqs:UntagQueue",
+        "sqs:ListQueueTags",
+        "sqs:DeleteQueue",
+        "sqs:SendMessage",
+        "sqs:ReceiveMessage",
+        "sqs:DeleteMessage",
+        "sqs:ChangeMessageVisibility"
+      ],
+      "Resource": "arn:aws:sqs:us-west-2:<account>:96bulls-aws-rehearse-p1-1126-*",
+      "Condition": {
+        "DateLessThan": {
+          "aws:CurrentTime": "2026-11-28T00:00:00Z"
+        },
+        "StringEquals": {
+          "aws:RequestedRegion": "us-west-2"
+        }
+      }
+    },
+    {
+      "Sid": "V2Function",
+      "Effect": "Allow",
+      "Action": [
+        "lambda:CreateFunction",
+        "lambda:GetFunction",
+        "lambda:GetFunctionConfiguration",
+        "lambda:UpdateFunctionCode",
+        "lambda:UpdateFunctionConfiguration",
+        "lambda:DeleteFunction",
+        "lambda:AddPermission",
+        "lambda:RemovePermission",
+        "lambda:GetPolicy",
+        "lambda:TagResource",
+        "lambda:UntagResource",
+        "lambda:ListTags",
+        "lambda:InvokeFunction"
+      ],
+      "Resource": "arn:aws:lambda:us-west-2:<account>:function:96bulls-aws-rehearse-p1-1126-*",
+      "Condition": {
+        "DateLessThan": {
+          "aws:CurrentTime": "2026-11-28T00:00:00Z"
+        },
+        "StringEquals": {
+          "aws:RequestedRegion": "us-west-2"
+        }
+      }
+    },
+    {
+      "Sid": "V2EventSourceMappingsOnTheFunction",
+      "Effect": "Allow",
+      "Action": [
+        "lambda:CreateEventSourceMapping",
+        "lambda:GetEventSourceMapping",
+        "lambda:UpdateEventSourceMapping",
+        "lambda:DeleteEventSourceMapping",
+        "lambda:ListEventSourceMappings"
+      ],
+      "Resource": "*",
+      "Condition": {
+        "DateLessThan": {
+          "aws:CurrentTime": "2026-11-28T00:00:00Z"
+        },
+        "StringEquals": {
+          "aws:RequestedRegion": "us-west-2"
+        },
+        "ArnLike": {
+          "lambda:FunctionArn": "arn:aws:lambda:us-west-2:<account>:function:96bulls-aws-rehearse-p1-1126-*"
+        }
+      }
+    },
+    {
+      "Sid": "V2Rules",
+      "Effect": "Allow",
+      "Action": [
+        "events:PutRule",
+        "events:DescribeRule",
+        "events:DeleteRule",
+        "events:PutTargets",
+        "events:RemoveTargets",
+        "events:ListTargetsByRule",
+        "events:TagResource",
+        "events:UntagResource",
+        "events:ListTagsForResource",
+        "events:EnableRule",
+        "events:DisableRule"
+      ],
+      "Resource": "arn:aws:events:us-west-2:<account>:rule/96bulls-aws-rehearse-p1-1126-*",
+      "Condition": {
+        "DateLessThan": {
+          "aws:CurrentTime": "2026-11-28T00:00:00Z"
+        },
+        "StringEquals": {
+          "aws:RequestedRegion": "us-west-2"
+        }
+      }
+    },
+    {
+      "Sid": "V2Alarms",
+      "Effect": "Allow",
+      "Action": [
+        "cloudwatch:PutMetricAlarm",
+        "cloudwatch:DeleteAlarms",
+        "cloudwatch:TagResource",
+        "cloudwatch:UntagResource",
+        "cloudwatch:ListTagsForResource"
+      ],
+      "Resource": "arn:aws:cloudwatch:us-west-2:<account>:alarm:96bulls-aws-rehearse-p1-1126-*",
+      "Condition": {
+        "DateLessThan": {
+          "aws:CurrentTime": "2026-11-28T00:00:00Z"
+        },
+        "StringEquals": {
+          "aws:RequestedRegion": "us-west-2"
+        }
+      }
+    },
+    {
+      "Sid": "V2LogGroup",
+      "Effect": "Allow",
+      "Action": [
+        "logs:CreateLogGroup",
+        "logs:PutRetentionPolicy",
+        "logs:DeleteLogGroup",
+        "logs:TagResource",
+        "logs:UntagResource",
+        "logs:ListTagsForResource"
+      ],
+      "Resource": [
+        "arn:aws:logs:us-west-2:<account>:log-group:/aws/lambda/96bulls-aws-rehearse-p1-1126-*",
+        "arn:aws:logs:us-west-2:<account>:log-group:/aws/lambda/96bulls-aws-rehearse-p1-1126-*:*"
+      ],
+      "Condition": {
+        "DateLessThan": {
+          "aws:CurrentTime": "2026-11-28T00:00:00Z"
+        },
+        "StringEquals": {
+          "aws:RequestedRegion": "us-west-2"
+        }
+      }
+    },
+    {
+      "Sid": "V2Secret",
+      "Effect": "Allow",
+      "Action": [
+        "secretsmanager:CreateSecret",
+        "secretsmanager:DescribeSecret",
+        "secretsmanager:PutResourcePolicy",
+        "secretsmanager:GetResourcePolicy",
+        "secretsmanager:DeleteSecret",
+        "secretsmanager:TagResource",
+        "secretsmanager:UntagResource"
+      ],
+      "Resource": "arn:aws:secretsmanager:us-west-2:<account>:secret:96bulls/aws-rehearse-p1-1126/*",
+      "Condition": {
+        "DateLessThan": {
+          "aws:CurrentTime": "2026-11-28T00:00:00Z"
+        },
+        "StringEquals": {
+          "aws:RequestedRegion": "us-west-2"
+        }
+      }
+    },
+    {
+      "Sid": "V2ReadOnlyLists",
+      "Effect": "Allow",
+      "Action": [
+        "sqs:ListQueues",
+        "cloudwatch:DescribeAlarms",
+        "logs:DescribeLogGroups",
+        "events:ListRules"
+      ],
+      "Resource": "*",
+      "Condition": {
+        "DateLessThan": {
+          "aws:CurrentTime": "2026-11-28T00:00:00Z"
+        },
+        "StringEquals": {
+          "aws:RequestedRegion": "us-west-2"
+        }
+      }
+    },
+    {
+      "Sid": "OnlyThisRegion",
+      "Effect": "Deny",
+      "NotAction": [
+        "iam:*",
+        "sts:*",
+        "s3:*"
+      ],
+      "Resource": "*",
+      "Condition": {
+        "StringNotEquals": {
+          "aws:RequestedRegion": "us-west-2"
+        }
+      }
+    },
+    {
+      "Sid": "NothingAfterExpiry",
+      "Effect": "Deny",
+      "Action": "*",
+      "Resource": "*",
+      "Condition": {
+        "DateGreaterThan": {
+          "aws:CurrentTime": "2026-11-28T00:00:00Z"
+        }
+      }
+    }
+  ]
+}

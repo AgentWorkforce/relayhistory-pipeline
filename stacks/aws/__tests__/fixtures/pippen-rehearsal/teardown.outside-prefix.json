@@ -1,0 +1,10 @@
+{
+  "sibling-stage": [{ "IsTruncated": false, "Versions": [{ "Key": "96bulls/96bulls-aws/aws-rehearse-p1-1126/a.json", "VersionId": "v1" }, { "Key": "96bulls/96bulls-aws/aws-proof-sandbox/a.json", "VersionId": "v2" }] }],
+  "longer-sibling": [{ "IsTruncated": false, "Versions": [{ "Key": "96bulls/96bulls-aws/aws-rehearse-p1-1126x/a.json", "VersionId": "v1" }] }],
+  "parent-key": [{ "IsTruncated": false, "DeleteMarkers": [{ "Key": "96bulls/96bulls-aws/state.json", "VersionId": "dm1" }] }],
+  "prefix-itself": [{ "IsTruncated": false, "Versions": [{ "Key": "96bulls/96bulls-aws/aws-rehearse-p1-1126/", "VersionId": "v1" }] }],
+  "second-page": [
+    { "IsTruncated": true, "NextKeyMarker": "96bulls/96bulls-aws/aws-rehearse-p1-1126/a.json", "Versions": [{ "Key": "96bulls/96bulls-aws/aws-rehearse-p1-1126/a.json", "VersionId": "v1" }] },
+    { "IsTruncated": false, "Versions": [{ "Key": "96bulls/96bulls-aws/other/a.json", "VersionId": "v2" }] }
+  ]
+}

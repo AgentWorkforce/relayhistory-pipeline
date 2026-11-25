@@ -19,6 +19,7 @@ export interface ApprovedServicesImage {
   sourceRevision: string;
 }
 import { assertRelaycastInputs, assertSessionDirectoryPreconditions, ingressExposure, type IngestExposureInput, type RelaycastInputs } from "./proof-addons.ts";
+import { assertStateBucketMode } from "./pippen-rehearsal.ts";
 
 export interface AwsInputs {
   /** The target account id, repeated on the command line to deploy. */
@@ -53,7 +54,11 @@ export interface AwsInputs {
    * the sandbox's permissions boundary, and no GitHub OIDC provider or publisher
    * role is created (the sandbox baseline forbids them).
    */
-  pippenSandbox?: { permissionsBoundaryArn: string };
+  /**
+   * `stateBucket: "validate-only"` (pippen-rehearsal.ts): the shared sandbox state bucket is only
+   * read and checked, never created or changed. Required for every Pippen sandbox stage but the proof stage.
+   */
+  pippenSandbox?: { permissionsBoundaryArn: string; stateBucket?: "validate-only" };
   /**
    * Read-only cross-account pull from this stage's `96bulls-services` ECR
    * repository (ecrPullPolicy). Each entry is a 12-digit account id that gets
@@ -130,6 +135,7 @@ export function validateAwsInputs(stage: string, inputs: AwsInputs, approvedImag
     throw new Error("96bulls: a Pippen sandbox stage declares no ECR repository policy (its boundary denies ecr:SetRepositoryPolicy); remove ecr.pullAccounts. Nothing was created.");
   if (inputs.pippenSandbox && inputs.accountShared) throw new Error("96bulls: a Pippen sandbox account is fresh; it cannot share another stage's account resources. Nothing was created.");
   assertPippenProofSandbox(stage, inputs);
+  assertStateBucketMode(stage, inputs.pippenSandbox);
   ecrPullPolicy(inputs);
   if (inputs.transcriptStore && inputs.ecr?.pullAccounts?.length) throw new Error("96bulls: ecr.pullAccounts needs a stage with the services repository; the transcript store has none. Nothing was created.");
   lockerLifecycleRules(inputs.lockerNoncurrentVersionDays);

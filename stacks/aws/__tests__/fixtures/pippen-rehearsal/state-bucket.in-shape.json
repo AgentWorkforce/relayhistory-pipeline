@@ -1,0 +1,7 @@
+{
+  "get-bucket-versioning": { "Status": "Enabled" },
+  "get-bucket-encryption": { "ServerSideEncryptionConfiguration": { "Rules": [{ "ApplyServerSideEncryptionByDefault": { "SSEAlgorithm": "AES256" }, "BucketKeyEnabled": false }] } },
+  "get-public-access-block": { "PublicAccessBlockConfiguration": { "BlockPublicAcls": true, "IgnorePublicAcls": true, "BlockPublicPolicy": true, "RestrictPublicBuckets": true } },
+  "get-bucket-ownership-controls": { "OwnershipControls": { "Rules": [{ "ObjectOwnership": "BucketOwnerEnforced" }] } },
+  "get-bucket-tagging": { "TagSet": [{ "Key": "pippen:sandbox", "Value": "true" }, { "Key": "96bulls:component", "Value": "alchemy-state" }, { "Key": "96bulls:stack", "Value": "aws-proof-sandbox" }] }
+}
