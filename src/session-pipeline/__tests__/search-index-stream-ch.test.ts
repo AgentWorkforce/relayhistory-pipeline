@@ -10,7 +10,7 @@ import type { SqlExecutor } from "@rhc/lib/pipeline/queue.ts";
 import type { ClickHouseClient } from "../vendor/search-index/clickhouse.ts";
 import type { IndexRow } from "../vendor/search-index/rows.ts";
 import { EVENTS_TABLE, SESSION_STATE_TABLE } from "../vendor/search-index/schema.ts";
-import { clickhouseScopePage, indexSearchScope, legacyProjectionIo, type SearchIndexDeps } from "../search-index.ts";
+import { STREAM_MIN_START_MS, clickhouseScopePage, indexSearchScope, legacyProjectionIo, type SearchIndexDeps } from "../search-index.ts";
 import { STREAM_DEADLINE, STREAM_READ_EVENTS_BUDGET, type StreamDeadline } from "../../session-read-api/canonical-stream-projection.ts";
 import { SCOPE, decompress, exportStreamScope, generate, prefixFor, type ExportedScope, type Line } from "../../session-read-api/__tests__/stream-fixture.ts";
 
@@ -147,7 +147,9 @@ async function scope(lines: Line[]) {
 /** A clock that reads "before the deadline" until `cross()` is called. */
 function switchClock(): { deadline: StreamDeadline; cross(): void; reads(): number } {
   let late = false, reads = 0;
-  return { deadline: { at: 1, now: () => { reads++; return late ? 1 : 0; } }, cross: () => { late = true; }, reads: () => reads };
+  // Starts STREAM_MIN_START_MS before the deadline (the start minimum lets it start), then crosses it.
+  const at = STREAM_MIN_START_MS;
+  return { deadline: { at, now: () => { reads++; return late ? at : 0; } }, cross: () => { late = true; }, reads: () => reads };
 }
 
 test("ClickHouse binding, streaming on: a too-large scope gets the whole read's rows, in keyset pages of one insert batch", async () => {
@@ -270,9 +272,9 @@ test("deadline between chunks of the read passes: partial with stream_deadline, 
   const x = await scope(generate(39));
   const clock = switchClock();
   const b = backend(x, { limits: TINY, stream: UNLIMITED, streamDeadline: clock.deadline });
-  // Crosses after the first chunk check.
+  // Crosses after the first chunk check (read 1 is the start-minimum check before the stream starts).
   const now = clock.deadline.now!;
-  clock.deadline.now = () => { const v = now(); if (clock.reads() === 1) clock.cross(); return v; };
+  clock.deadline.now = () => { const v = now(); if (clock.reads() === 2) clock.cross(); return v; };
   const s = await indexSearchScope(SCOPE, b.deps);
   expect(s).toMatchObject({ complete: false, partial: true, inserted: 0, deleted: 0, reasons: ["scope_too_large", STREAM_DEADLINE] });
   expect(s.stream!.chunks).toBe(1);
@@ -349,7 +351,7 @@ test("deadline after pass 4, before the deletes: every regenerated row stays, th
 test("a deadline that never passes changes nothing", async () => {
   const x = await scope(generate(44));
   const plain = backend(x, { limits: TINY, stream: UNLIMITED });
-  const timed = backend(x, { limits: TINY, stream: UNLIMITED, streamDeadline: { at: 2, now: () => 1 } });
+  const timed = backend(x, { limits: TINY, stream: UNLIMITED, streamDeadline: { at: STREAM_MIN_START_MS + 1, now: () => 1 } });
   const a = await indexSearchScope(SCOPE, plain.deps);
   const c = await indexSearchScope(SCOPE, timed.deps);
   expect(c).toEqual(a);
