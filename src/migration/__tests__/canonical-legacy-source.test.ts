@@ -25,7 +25,7 @@ import {
   type LegacyScope,
 } from "../neon-s3-sync/legacy-source.ts";
 import { exportUnit } from "../neon-s3-sync/export-session.ts";
-import { groupExistsInNeon } from "../neon-s3-sync/neon-reader.ts";
+import { groupExistsInNeon, sessionUnits } from "../neon-s3-sync/neon-reader.ts";
 import { Checkpoint, assertLegacyErasureAuthorityReady, newCounters, runOrg, verifyExported, withLegacyPrivacyFence, NEON_SCOPE_SQL } from "../legacy-export/runner.ts";
 import {
   assertDirectUrl,
@@ -942,5 +942,76 @@ exporterTest("a re-export keeps the scope's first key even if its oldest row mov
   } finally {
     checkpoint.close();
     await pg.query("DELETE FROM sessions.conversation_turns WHERE id=$1", [id]);
+  }
+});
+
+test("empty legacy point observation requires independent inventory, owner and visibility", async () => {
+  const { inspectEmptyLegacyScope } = await import("./fixtures/empty-legacy-scope.ts");
+  const candidate = { orgId: "zero-org", workspaceId: "default", source: "claude", sessionId: "zero-session" };
+  const observe = () => inspectEmptyLegacyScope(db, candidate);
+  await pg.exec("BEGIN");
+  try {
+    expect((await observe()).reason).toBe("missing_inventory");
+    await pg.exec("INSERT INTO sessions.session_catalog(org_id,workspace_id,source,session_id) VALUES ('zero-org','default','claude','zero-session')");
+    expect((await observe()).reason).toBe("unbound_owner");
+    await pg.exec("INSERT INTO sessions.convergence_events VALUES ('zero-org','default','claude','zero-session','u')");
+    expect(await observe()).toEqual({ reason: "empty_in_snapshot", exportable: false });
+    await pg.exec("INSERT INTO sessions.convergence_events VALUES ('zero-org','default','claude','zero-session','v')");
+    expect((await observe()).reason).toBe("ambiguous_owner");
+    await pg.exec("DELETE FROM sessions.convergence_events WHERE org_id='zero-org' AND user_id='v'");
+    await pg.exec("INSERT INTO sessions.session_links(id,org_id,workspace_id,source,session_id) VALUES(819231,'zero-org','default','claude','zero-session')");
+    expect((await observe()).reason).toBe("legacy_rows_present");
+    await pg.exec("INSERT INTO sessions.conversation_turns(id,org_id,workspace_id,source,session_id) VALUES('00000000-0000-0000-0000-000000000088','zero-org','default','unknown','zero-session')");
+    expect((await observe()).reason).toBe("turns_present_or_unattributable");
+    await pg.exec("INSERT INTO sessions.deleted_upload_sessions VALUES ('zero-org','','claude','zero-session')");
+    expect((await observe()).reason).toBe("fenced");
+    await pg.exec("CREATE ROLE empty_probe_select; GRANT USAGE ON SCHEMA sessions TO empty_probe_select; GRANT SELECT ON ALL TABLES IN SCHEMA sessions TO empty_probe_select; ALTER TABLE sessions.conversation_turns ENABLE ROW LEVEL SECURITY; SET LOCAL ROLE empty_probe_select");
+    expect((await observe()).reason).toBe("filtered_inventory");
+  } finally {
+    await pg.exec("ROLLBACK");
+  }
+});
+
+exporterTest("an independently inventoried frozen empty scope round-trips a single marker through exporter and reader", async () => {
+  const { inspectEmptyLegacyScope } = await import("./fixtures/empty-legacy-scope.ts");
+  const candidate = { ...scope, sessionId: "frozen-empty" };
+  await pg.exec(`INSERT INTO sessions.session_catalog VALUES
+    ('org_1','frozen-empty','ws_1','claude','2026-11-01','2026-11-02','2026-11-02');
+    INSERT INTO sessions.convergence_events VALUES ('org_1','ws_1','claude','frozen-empty','person')`);
+  // This synthetic archive is immutable. The live authority remains a separate
+  // connection, and erasure can still prevent export after source capture.
+  const archive = await pg.dumpDataDir();
+  const frozen = new PGlite({ loadDataDir: archive });
+  try {
+    await frozen.exec("SET default_transaction_read_only=on");
+    const source = frozen as unknown as Queryable;
+    expect(await inspectEmptyLegacyScope(source, candidate)).toEqual({ reason: "empty_in_snapshot", exportable: false });
+    const owner = await legacyScopeOwner(source, candidate);
+    expect(owner).toEqual({ userId: "person", reason: "events" });
+    const units = await sessionUnits(source, candidate.orgId, candidate.sessionId);
+    expect(units).toHaveLength(1);
+    const unit = units[0]!;
+    expect(unit).toMatchObject(candidate);
+    const store = createFsStore({ root: join(root, "frozen-empty-proof") });
+    const attempt = () => withLegacyPrivacyFence(db, candidate, owner.userId!, () =>
+      exportUnit({ store, keyRoot: "96bulls", grantId: "proof" },
+        unit, legacyUnitSource(source, async () => {}, 1, undefined, owner.userId!)),
+      { machineId: legacyMachineId(candidate.workspaceId, owner.userId!), existing: false });
+    await assertLegacyErasureAuthorityReady(db);
+    const result = await attempt();
+    if (result.fenced) throw new Error("unexpected live privacy fence");
+    expect(result.value.lines).toBe(1);
+    expect(result.value.manifests).toHaveLength(1);
+    const key = result.value.manifests[0]!.manifestKey;
+    const pointer = { ...await pointerFor(store, key), session_id: candidate.sessionId };
+    const snap = await snapshot(store, [pointer], candidate);
+    expect(snap.legacyCoverage).toEqual({ version: 1, tables: ["conversation_turns", "session_links", "session_outcomes"] });
+    expect(snap.rows.filter((r) => ["conversation_turns", "session_links", "session_outcomes"].includes(r.table))).toEqual([]);
+    expect((await snapshot(store, [], candidate)).legacyCoverage).toBeNull();
+    await pg.exec("INSERT INTO sessions.session_erasure_receipts VALUES ('org_1','ws_1','claude','frozen-empty')");
+    expect(await attempt()).toEqual({ fenced: true });
+  } finally {
+    await frozen.close();
+    await pg.exec("DELETE FROM sessions.session_erasure_receipts WHERE session_id='frozen-empty'; DELETE FROM sessions.session_catalog WHERE session_id='frozen-empty'; DELETE FROM sessions.convergence_events WHERE session_id='frozen-empty'; DELETE FROM sessions.legacy_export_scope_authority WHERE session_id='frozen-empty'");
   }
 });

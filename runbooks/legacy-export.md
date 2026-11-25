@@ -326,3 +326,19 @@ stays red. With Khaliq's separate approval, use the production eraser to delete
 that exact manifest, its raw chunks, and its indexed pointer, verify fresh
 list/read absence, then resume with `--refresh`. The exporter deliberately has
 write-only transcript credentials and cannot perform this cleanup itself.
+
+### Certified-empty scopes
+
+The live exporter discovers scopes from rows in the three legacy tables. A
+scope absent from discovery has unknown coverage. A production read-only
+login or a successful scan alone cannot establish that the source has stopped
+changing.
+
+The PGlite fixture in `canonical-legacy-source.test.ts` exercises a narrower
+case. An immutable synthetic source archive contains a catalog entry and one
+authenticated owner for a scope with zero legacy rows. Using a separate
+privacy connection, the writer registers authority, writes a single marker,
+and the reader reports explicit empty coverage. The fixture also exercises a
+subsequent live erasure fence. This proves the writer/reader representation
+for that scope. A live rollout still needs an authoritative, complete frozen
+inventory and owner bindings for its intended population.
