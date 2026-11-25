@@ -16,6 +16,7 @@ import {
   type RelayhistoryStreamRecord,
 } from "../../packages/pipeline/src/lib/pipeline/relayhistory-transform.ts";
 import { PipelineError } from "../../packages/pipeline/src/lib/pipeline/errors.ts";
+import { ACCEPTANCE_MISSING, contenderSeatsOfRecords, type ContenderSeats } from "./contender-seats.ts";
 import { labelledActorName, messageSubagent } from "../../packages/pipeline/src/lib/pipeline/message-origin.ts";
 import {
   chunkKeys,
@@ -429,6 +430,8 @@ export interface ScopeRead {
    * exactly what this read would have.
    */
   admitted?: Array<{ manifest: ManifestV1; key: string }>;
+  /** Set only when `reasons` carries relayhistory_acceptance_missing (contender-seats.ts): telemetry only. */
+  contenderSeats?: ContenderSeats;
 }
 
 export async function readCanonicalScope(
@@ -590,6 +593,8 @@ export async function readCanonicalScope(
   // Fold every copy together; a conflicting copy (same revision, different
   // bytes) falls back to folding each manifest on its own, without deletes.
   let canonicalRecords: RelayhistoryStreamRecord[] = [];
+  let recordIdSeats: ContenderSeats | undefined;
+  let catalogRefused = false;
   let groups: { records: RelayhistoryStreamRecord[]; part: Part }[];
   try {
     const all = normalizeRelayhistoryRecords(parts.flatMap((p) => p.records));
@@ -615,6 +620,8 @@ export async function readCanonicalScope(
   } catch (error) {
     complete = false;
     reasons.push(error instanceof PipelineError ? error.code : "fold_failed");
+    // Failure path only: the record id fold's refusal, classified over the set it was handed.
+    if (error instanceof PipelineError && error.code === ACCEPTANCE_MISSING) recordIdSeats = contenderSeatsOfRecords(parts.flatMap((p) => p.records));
     groups = [];
     for (const part of parts) {
       try {
@@ -676,6 +683,8 @@ export async function readCanonicalScope(
           ? projected.error.code
           : "projection_failed",
       );
+      // The record id fold already ran: this refusal is the projection's catalog-key fold.
+      if (projected.error instanceof PipelineError && projected.error.code === ACCEPTANCE_MISSING) catalogRefused = true;
       continue;
     }
     catalogRows.push(...projected.catalogRows);
@@ -750,5 +759,7 @@ export async function readCanonicalScope(
       manifestKey: manifestKeysByBody.get(manifest)!,
       revision: String(manifest.revision),
     })),
+    // A record id word wins; with it the catalog-key fold may also have refused. Absent on every other read.
+    ...(recordIdSeats !== undefined ? { contenderSeats: recordIdSeats } : catalogRefused ? { contenderSeats: "catalog_key" as const } : {}),
   };
 }
