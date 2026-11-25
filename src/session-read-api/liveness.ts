@@ -143,3 +143,30 @@ export function sqlOperatorErased(run: TenantRunner) {
     } catch { throw Error("operator_fence_unavailable"); }
   };
 }
+
+/**
+ * The operator read gate above over many keys in one statement: the same SECURITY DEFINER function, called per key
+ * inside the tenant-bound READ ONLY transaction (so its tenant binding check holds for each). Returns the fenced
+ * subset as `keyOf` strings. Any failure, or a row that is not one of the keys asked, is operator_fence_unavailable.
+ */
+export const OPERATOR_ERASED_BATCH_SQL = `SELECT k.h AS source, k.s AS session_id
+  FROM unnest($3::text[], $4::text[]) AS k(h, s)
+ WHERE sessions.ingest_operator_runtime_erased($1, $2, k.h, k.s)`;
+
+export function sqlOperatorErasedBatch(run: TenantRunner) {
+  return async (orgId: string, workspaceId: string, keys: SessionKey[]): Promise<Set<string>> => {
+    if (keys.length === 0) return new Set();
+    try {
+      const asked = new Set(keys.map(keyOf));
+      const { rows } = await run(orgId, workspaceId, q => q.query<{ source: string; session_id: string }>(OPERATOR_ERASED_BATCH_SQL,
+        [orgId, workspaceId, keys.map(k => k.source), keys.map(k => k.sessionId)]));
+      const fenced = new Set<string>();
+      for (const r of rows) {
+        const k = keyOf({ source: r.source, sessionId: r.session_id });
+        if (!asked.has(k)) throw Error("operator_fence_unavailable");
+        fenced.add(k);
+      }
+      return fenced;
+    } catch { throw Error("operator_fence_unavailable"); }
+  };
+}

@@ -331,10 +331,10 @@ describe("workspace synthesis wiring (READ_API_WORKSPACE_SYNTHESIS_ENABLED)", ()
       try { expect([value, built.deps.workspaceSynthesis]).toEqual([value, undefined]); } finally { await built.close(); }
     }
     const bare = await buildLambda({ READ_API_WORKSPACE_SYNTHESIS_ENABLED: "true" });
-    try { expect(bare.deps.workspaceSynthesis).toEqual({ enabled: true }); } finally { await bare.close(); }
+    try { expect(bare.deps.workspaceSynthesis).toEqual({ enabled: true, aliases: expect.any(Function) }); } finally { await bare.close(); }
     // A bucket without the key root the job writes under is not configured either.
     const noRoot = await buildLambda({ READ_API_WORKSPACE_SYNTHESIS_ENABLED: "true", READ_API_ANALYSIS_BUCKET: "fx-bucket", AWS_REGION: "us-east-1" });
-    try { expect(noRoot.deps.workspaceSynthesis).toEqual({ enabled: true }); } finally { await noRoot.close(); }
+    try { expect(noRoot.deps.workspaceSynthesis).toEqual({ enabled: true, aliases: expect.any(Function) }); } finally { await noRoot.close(); }
     const bucket = await buildLambda({ READ_API_WORKSPACE_SYNTHESIS_ENABLED: "true", READ_API_ANALYSIS_BUCKET: "fx-bucket", AWS_REGION: "us-east-1", PIPELINE_KEY_PREFIX: "fxroot" });
     try {
       expect(bucket.deps.workspaceSynthesis?.enabled).toBe(true);
@@ -347,10 +347,10 @@ describe("workspace synthesis wiring (READ_API_WORKSPACE_SYNTHESIS_ENABLED)", ()
   test("READ_API_WORKSPACE_SYNTHESIS_V2_ENABLED: stage2Enabled only when exactly \"true\" and only with the v1 flag", async () => {
     for (const value of [undefined, "", "1", "TRUE", " true"]) {
       const built = await buildLambda({ READ_API_WORKSPACE_SYNTHESIS_ENABLED: "true", ...(value === undefined ? {} : { READ_API_WORKSPACE_SYNTHESIS_V2_ENABLED: value }) });
-      try { expect([value, built.deps.workspaceSynthesis]).toEqual([value, { enabled: true }]); } finally { await built.close(); }
+      try { expect([value, built.deps.workspaceSynthesis]).toEqual([value, { enabled: true, aliases: expect.any(Function) }]); } finally { await built.close(); }
     }
     const on = await buildLambda({ READ_API_WORKSPACE_SYNTHESIS_ENABLED: "true", READ_API_WORKSPACE_SYNTHESIS_V2_ENABLED: "true" });
-    try { expect(on.deps.workspaceSynthesis).toEqual({ enabled: true, stage2Enabled: true }); } finally { await on.close(); }
+    try { expect(on.deps.workspaceSynthesis).toEqual({ enabled: true, aliases: expect.any(Function), stage2Enabled: true }); } finally { await on.close(); }
     const v2Only = await buildLambda({ READ_API_WORKSPACE_SYNTHESIS_V2_ENABLED: "true" });
     try { expect(v2Only.deps.workspaceSynthesis).toBeUndefined(); } finally { await v2Only.close(); }
   });

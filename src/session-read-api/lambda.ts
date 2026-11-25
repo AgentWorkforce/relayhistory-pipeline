@@ -113,10 +113,10 @@ import {
   READ_API_SESSION_PARTIAL_RETRYABLE, sessionPartialRetryableFlag,
 } from "./config.ts";
 import { sqlSessionIntel } from "./session-intel-workspace.ts";
-import { storeWorkspaceSynthesis, synthesisKeyRoot } from "./workspace-synthesis.ts";
+import { sqlSessionAliases, storeWorkspaceSynthesis, synthesisKeyRoot } from "./workspace-synthesis.ts";
 import { objectStoreArtifacts } from "../session-analysis/workspace-synthesis.ts";
 import { parseAdvisoryNotifyRows, READ_API_ADVISORY_NOTIFY_ROWS } from "./advisory-priority.ts";
-import { poolTenantRunner, sqlLiveness, sqlOperatorErased, type SqlQuery } from "./liveness.ts";
+import { poolTenantRunner, sqlLiveness, sqlOperatorErased, sqlOperatorErasedBatch, type SqlQuery } from "./liveness.ts";
 import { ERASE_FENCE_FLAG, eraseRuntimeFlag } from "../session-erase/flags.ts";
 import { createS3Store } from "../shared/vendor.ts";
 import { createAzureBlobStore, type AzureBlobConfig } from "../../packages/object-store/src/azure.ts";
@@ -741,6 +741,8 @@ export async function readApiDepsFromSecret(secretText: string, env: NodeJS.Proc
   const workspaceSynthesis = exactTrueFlag(env[READ_API_WORKSPACE_SYNTHESIS_ENABLED])
     ? {
         enabled: true as const,
+        // Every recorded session is checked under each alias its pointer rows hold (the erase and operator fences).
+        aliases: sqlSessionAliases(poolTenantRunner(pool as never)),
         ...(analysisStore && synthesisKeyRoot(env.PIPELINE_KEY_PREFIX)
           ? { source: storeWorkspaceSynthesis(objectStoreArtifacts(analysisStore), synthesisKeyRoot(env.PIPELINE_KEY_PREFIX)!) }
           : {}),
@@ -765,6 +767,8 @@ export async function readApiDepsFromSecret(secretText: string, env: NodeJS.Proc
   const liveness = sqlLiveness(poolTenantRunner(pool as never));
   const operatorErased = entry === "service" && eraseRuntimeFlag(env, ERASE_FENCE_FLAG)
     ? sqlOperatorErased(poolTenantRunner(pool as never)) : undefined;
+  // The same fence over a set of keys (the workspace synthesis), under the same flag.
+  const operatorErasedBatch = operatorErased ? sqlOperatorErasedBatch(poolTenantRunner(pool as never)) : undefined;
   // The self-host service only, READ_API_DIGEST_ENABLED=1 (digest-narrative-selfhost.ts): the
   // narrative cache on this read pool and, with a model, key and READ_API_DIGEST_NARRATIVE_DB_URL,
   // in-process generation through a separate writer pool. Also returned beside `deps`; it serves
@@ -796,6 +800,7 @@ export async function readApiDepsFromSecret(secretText: string, env: NodeJS.Proc
     ...(adapter ? { adapter } : { ch: createClickHouseClient(secret.clickhouse!) }),
     liveness,
     ...(operatorErased ? { operatorErased } : {}),
+    ...(operatorErasedBatch ? { operatorErasedBatch } : {}),
     directory: sqlDirectory(poolTenantRunner(pool as never)),
     directoryWorkspaces: parseDirectoryWorkspaces(env.READ_API_DIRECTORY_WORKSPACES),
     ...(analysis ? { analysis } : {}),
