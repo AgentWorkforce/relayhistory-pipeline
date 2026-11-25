@@ -59,6 +59,8 @@ test("startup refusals happen before the port opens: flag, port, arguments, enab
   for (const args of [[], ["--gc"], ["--continuous", "--gc"], ["--continuous", "--continuous"]]) expect(await refused(args, {})).toBe("publication_arguments");
   // Enabled off the AWS/Supabase target (a plain self-host env) fails startup, not later.
   expect(await refused(["--continuous"], { INGEST_PUBLISH_ENABLED: "true", HOOPDB_DB_MODE: "selfhosted" })).toBe("publication_target_required");
+  // Valid EC2 pins cannot authorize use of node IMDS from a publisher pod.
+  expect(await refused(["--continuous"], { ...ENABLED, KUBERNETES_SERVICE_HOST: "10.0.0.1" })).toBe("publication_ec2_publisher_in_pod");
   const { INGEST_PUBLISH_BUCKET: _, ...noBucket } = ENABLED;
   expect(await refused(["--continuous"], noBucket)).toBe("publication_config_required");
 });

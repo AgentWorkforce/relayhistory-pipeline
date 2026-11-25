@@ -30,6 +30,21 @@ test('runtime refuses wrong compute/account/region/source generation inputs befo
  for(const arn of['INGEST_PUBLISH_SECRET_ARN','INGEST_PUBLISH_KMS_KEY_ARN','INGEST_PUBLISH_INSTANCE_PROFILE_ARN'])
   expect(codeOf(()=>publicationRuntimeConfig({...good,[arn]:(good as Record<string,string>)[arn]!.replace(ACCOUNT,other)}))).toBe('publication_target_invalid');
 });
+test("AWS publication refuses mixed pod and EC2 identity before any I/O; dormant mode skips config", async () => {
+ const indicators = [
+  "KUBERNETES_SERVICE_HOST", "AWS_CONTAINER_CREDENTIALS_FULL_URI", "AWS_CONTAINER_CREDENTIALS_RELATIVE_URI",
+  "AWS_CONTAINER_AUTHORIZATION_TOKEN_FILE", "AWS_CONTAINER_AUTHORIZATION_TOKEN", "AWS_WEB_IDENTITY_TOKEN_FILE",
+ ];
+ for (const name of indicators) {
+  // Even a partially configured (empty) binding must fail closed.
+  const env = { [name]: "", INGEST_PUBLISH_ENABLED: "true" };
+  const assets = async (): Promise<never> => { throw new Error("unexpected_asset_or_credential_work"); };
+  await expect(runCanonicalPublicationRuntime(env, "publish", { assets })).rejects.toMatchObject({ code: "publication_ec2_publisher_in_pod" });
+  expect(await runCanonicalPublicationRuntime({ ...env, INGEST_PUBLISH_ENABLED: "false" }, "publish", { assets })).toEqual({ enabled: false });
+  // Independently armed erasure keeps its existing config checks.
+  expect(() => publicationRuntimeConfig(env, "gc")).toThrow("publication_target_required");
+ }
+});
 test('runtime uses configured identity for IMDS credentials and the database login',async()=>{
  const good={AWS_REGION:'us-east-1',HOOPDB_DB_MODE:'supabase',INGEST_PUBLISH_ENABLED:'true',INGEST_PUBLISH_BUCKET:'owned-bucket',INGEST_PUBLISH_EXPECT_GENERATION:'a'.repeat(64),INGEST_PUBLISH_AWS_ACCOUNT_ID:ACCOUNT,INGEST_PUBLISH_SUPABASE_PROJECT_REF:REF,INGEST_PUBLISH_INSTANCE_ID:INSTANCE,INGEST_PUBLISH_SECRET_ARN:`arn:aws:secretsmanager:us-east-1:${ACCOUNT}:secret:96bulls/test/canonical-publisher-abcdef`,INGEST_PUBLISH_KMS_KEY_ARN:`arn:aws:kms:us-east-1:${ACCOUNT}:key/12345678-1234-1234-1234-123456789abc`,INGEST_PUBLISH_INSTANCE_PROFILE_ARN:`arn:aws:iam::${ACCOUNT}:instance-profile/owned-profile`,INGEST_PUBLISH_ROLE_NAME:'owned-role'};
  const assets=async()=>({expected:{names:['x'],generation:'a'.repeat(64)},verifiers:{searchWorker:'x',tokenVerifier:'x',ingestSeeder:'x',ingest:'x'}});
