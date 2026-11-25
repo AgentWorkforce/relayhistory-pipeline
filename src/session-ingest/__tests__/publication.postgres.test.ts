@@ -366,3 +366,104 @@ describe.skipIf(!url)("background publisher actual PostgreSQL admission",()=>{
  },15000);
 
 });
+
+describe.skipIf(!url)("scoped v1 real PostgreSQL qualification", () => {
+  async function scopedFixture() {
+    const d = await fixture();
+    const binding = {planSha256:"c".repeat(64), admissionId:CANARY_PLAN_ID, frontierSha256:"e".repeat(64),
+      tenant:{...TENANT,originId:"origin-1"},target:d.target};
+    await d.pool.query(read("src/session-ingest/__tests__/fixtures/publication-scoped-v1.sql"));
+    await d.pool.query(`INSERT INTO sessions.fixture_scoped_admission(id,binding,stage,frontier_image,admission_image,stage_sha)
+      SELECT $1::uuid,$2::jsonb,s.stage_token,to_jsonb(f),to_jsonb(a),s.stage_sha256 FROM sessions.ingest_stage_intents s
+      JOIN sessions.ingest_publication_frontiers f USING(org_id,workspace_id,user_id,origin_id)
+      JOIN sessions.ingest_buffer_admission a USING(org_id) WHERE s.stage_token=$3`,
+      [binding.admissionId,JSON.stringify(binding),d.stage]);
+    const conn = { generation:GEN, keyRoot:d.target.keyRoot, region:d.target.region, bucket:d.target.bucket, binding };
+    return { d, binding, conn };
+  }
+  test("dedicated LOGIN cannot bypass; restoring ordinary ingest grants still leaves the nested role guard unresolved", async () => {
+    const { d,conn }=await scopedFixture();
+    const role="pub_fixture_"+crypto.randomUUID().replaceAll("-","");
+    await d.pool.query("CREATE ROLE "+role+" LOGIN NOINHERIT");
+    clean.push(async()=>{await d.pool.query("DROP OWNED BY "+role);await d.pool.query("DROP ROLE "+role);});
+    await d.pool.query("GRANT USAGE ON SCHEMA sessions TO "+role);
+    for (const op of ["candidates","claim","publish"]) {
+      await d.pool.query("GRANT EXECUTE ON FUNCTION sessions.ingest_publication_scoped_"+op+"_v1(jsonb) TO "+role);
+      // Simulate retaining the historical grants for the existing runtime while a separate login is evaluated.
+      await d.pool.query("GRANT EXECUTE ON FUNCTION sessions.ingest_publication_"+op+"(jsonb) TO bulls96_session_ingest");
+    }
+    const dbName=(await d.pool.query("select current_database() db")).rows[0].db;
+    const u=new URL(url!);u.pathname="/"+dbName;u.username=role;u.password="";
+    const c=new pg.Client({connectionString:u.href});await c.connect();
+    try {
+      expect((await c.query("SELECT session_user AS login, current_user AS role")).rows[0]).toEqual({login:role,role});
+      await expect(c.query("SET ROLE bulls96_session_ingest")).rejects.toMatchObject({code:"42501"});
+      await expect(c.query("SELECT * FROM sessions.fixture_scoped_admission")).rejects.toMatchObject({code:"42501"});
+      await expect(c.query("SELECT sessions.ingest_publication_claim('{}'::jsonb)")).rejects.toMatchObject({code:"42501"});
+      await expect(c.query("SELECT sessions.ingest_publication_scoped_candidates_v1($1)",[JSON.stringify({...conn,limit:1})]))
+        .rejects.toMatchObject({code:"42501",message:"session ingest: caller is not the function's role"});
+      const live=await d.call("ingest_publication_candidates",{keyRoot:"96bulls",bucket:"synthetic",region:"us-east-1",limit:1});
+      expect(live.stageTokens).toEqual([d.stage]);
+    } finally {await c.end();}
+  },30000);
+
+  test("a committed claim survives connection loss and lease expiry without issuing a second ticket or accepting a final", async()=>{
+    const {d,conn,binding}=await scopedFixture();
+    const claimant=await d.pool.connect();
+    let ticket;
+    try {
+      await claimant.query("SET ROLE bulls96_session_ingest");
+      ticket=(await claimant.query("SELECT sessions.ingest_publication_scoped_claim_v1($1) AS ticket",
+        [JSON.stringify({...conn,stageToken:d.stage})])).rows[0].ticket;
+    } finally {claimant.release(true);}
+    await d.pool.query("UPDATE sessions.ingest_publication_attempts SET lease_until=clock_timestamp()-interval '1 second' WHERE attempt_token=$1",[ticket.attemptToken]);
+    await d.pool.query("UPDATE sessions.ingest_stage_intents SET gc_lease_until=clock_timestamp()-interval '1 second' WHERE stage_token=$1",[d.stage]);
+    expect(await d.call("ingest_publication_scoped_candidates_v1",{...conn,limit:1})).toEqual({stageTokens:[]});
+    await expect(d.call("ingest_publication_scoped_claim_v1",{...conn,stageToken:d.stage})).rejects.toThrow("admission busy");
+    await expect(d.call("ingest_publication_scoped_publish_v1",{binding,stageToken:d.stage,attemptToken:ticket.attemptToken,leaseToken:ticket.leaseToken,messages:[]})).rejects.toMatchObject({code:"40001"});
+    expect((await d.pool.query("SELECT consumed,attempt FROM sessions.fixture_scoped_admission")).rows).toEqual([{consumed:false,attempt:ticket.attemptToken}]);
+  },30000);
+
+  test("an independently committed privacy change invalidates a blocked scoped claim",async()=>{
+    const {d,conn}=await scopedFixture();
+    const control=await d.pool.connect(),claimer=await d.pool.connect();
+    let result:Promise<{code:string,message:string}|null>|undefined;
+    try{
+      await control.query("BEGIN");
+      await control.query("SELECT sessions.ingest_lock_fences($1,$2,$3)",[TENANT.orgId,TENANT.workspaceId,TENANT.userId]);
+      await control.query("UPDATE sessions.ingest_buffer_admission SET privacy_baseline_sha256=repeat('d',64) WHERE org_id=$1",[TENANT.orgId]);
+      await claimer.query("SET ROLE bulls96_session_ingest");
+      const pid=(await claimer.query("SELECT pg_backend_pid() pid")).rows[0].pid;
+      result=claimer.query("SELECT sessions.ingest_publication_scoped_claim_v1($1)",[JSON.stringify({...conn,stageToken:d.stage})]).then(()=>null,e=>({code:e.code,message:e.message}));
+      const deadline=Date.now()+3000;
+      let blocked=false;
+      do {
+        blocked=(await control.query("SELECT pg_backend_pid()=ANY(pg_blocking_pids($1)) blocked",[pid])).rows[0].blocked;
+        if(!blocked) await Bun.sleep(10);
+      } while(!blocked&&Date.now()<deadline);
+      expect(blocked).toBe(true);
+      await control.query("COMMIT");
+      expect(await result).toMatchObject({message:"scoped fixture: authority stale"});
+      expect((await d.pool.query("SELECT count(*)::int n FROM sessions.ingest_publication_attempts")).rows[0].n).toBe(0);
+    } finally {
+      await control.query("ROLLBACK"); await result;
+      control.release();claimer.release(true);
+    }
+  },30000);
+  test("lost final acknowledgement replays only the same message set on the committed attempt",async()=>{
+    const {scopedPublicationRpc}=await import("../publication-scoped-rpc.ts");
+    const {d,binding}=await scopedFixture();
+    const rpc=scopedPublicationRpc({queryBounded:async(q:string,params:unknown[])=>d.run(q,params)} as never,d.target,binding);
+    let replays=0;
+    const watched={...rpc,publish:async(...args:Parameters<typeof rpc.publish>)=>{
+      const first=await rpc.publish(...args);expect(first.replay).toBe(false);
+      // New SQL transaction via pool; ignore the original success receipt to model response loss.
+      const second=await rpc.publish(...args);expect(second).toEqual({...first,replay:true});replays++;
+      await expect(rpc.publish(args[0],[],args[2])).rejects.toMatchObject({code:"40001"});
+      return second;
+    }};
+    expect(await canonicalPublicationTick({rpc:watched,target:d.target,store:()=>d.store},{enabled:true,candidateLimit:1})).toMatchObject({published:1});
+    expect(replays).toBe(1);
+    expect((await d.pool.query("SELECT state FROM sessions.ingest_publication_attempts")).rows).toEqual([{state:"published"}]);
+  },30000);
+});
