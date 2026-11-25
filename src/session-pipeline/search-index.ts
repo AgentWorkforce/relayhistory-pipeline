@@ -228,6 +228,16 @@ export interface SearchIndexDeps {
    * query, nothing else changes.
    */
   skipAcceptanceMissing?: true;
+  /**
+   * SEARCH_INDEX_SKIP_OVER_BOUND_ENABLED=true only (lambda.ts, the hosted ClickHouse binding): before any manifest
+   * read, a scope whose live sibling pointers' scrubbed raw_bytes already exceed the whole-read bound (and, with
+   * `stream`, four times that exceeds the stream byte budget, so the streamed path refuses it too), and whose
+   * latest search state row already records the refusal at the highest live revision within
+   * SKIP_STATE_MAX_AGE_MS, returns the size refusal again without reading or writing anything
+   * (overBoundBeforeRead). Applies only where inlineSkipsApply holds. Absent: no extra query, nothing else
+   * changes.
+   */
+  skipOverBound?: true;
 }
 
 /** Additive phase counters for the existing search-pass log line. Durations are wall milliseconds. */
@@ -428,9 +438,9 @@ export interface SearchIndexResult {
   /** Present only when the streaming reader ran: what it read, summed over its passes. */
   stream?: { passes: number; chunks: number; bytes: number; events: number };
   /**
-   * SEARCH_INDEX_SKIP_ACCEPTANCE_MISSING_ENABLED=true only: the acceptance-missing outcome was repeated
-   * from stored state before any manifest read; nothing was read from the object store and nothing was
-   * written.
+   * SEARCH_INDEX_SKIP_ACCEPTANCE_MISSING_ENABLED=true or SEARCH_INDEX_SKIP_OVER_BOUND_ENABLED=true only: the
+   * acceptance-missing outcome or the size refusal was repeated from stored state before any manifest read;
+   * nothing was read from the object store and nothing was written.
    */
   skippedBeforeRead?: true;
 }
@@ -660,7 +670,7 @@ export async function indexSearchScope(scope: SessionScope, deps: SearchIndexDep
     return indexSearchScopeBase(scope, deps);
   // A SEARCH_INDEX_SKIP_* flag decides before any manifest read under the scope lock, which the pre-read
   // path would already have spent: with one armed where it applies, the locked base path runs.
-  if (deps.skipAcceptanceMissing && inlineSkipsApply(deps)) return indexSearchScopeBase(scope, deps);
+  if ((deps.skipAcceptanceMissing || deps.skipOverBound) && inlineSkipsApply(deps)) return indexSearchScopeBase(scope, deps);
   const limits = { ...SEARCH_INDEX_DEFAULT_LIMITS, ...deps.limits };
   for (let attempt = 0; attempt < 2; attempt++) {
     const captured = await captureSearchPreRead(scope, deps, limits);
@@ -726,10 +736,12 @@ async function indexSearchScopeBase(scope: SessionScope, deps: SearchIndexDeps, 
       await io.record(scope,0,0,false,at,pointerSnapshot.canonicalId);
       return {manifests:0,rows:0,inserted:0,deleted:0,complete:false,reasons:["canonical_session_mismatch"]};
     }
-    // SEARCH_INDEX_SKIP_ACCEPTANCE_MISSING_ENABLED=true (where it applies, never with a pre-read): the same
-    // listing with each row's facts. Off: the listing exactly as before.
-    const acceptanceArmed = deps.skipAcceptanceMissing === true && !prepared && inlineSkipsApply(deps);
-    const siblingFacts = acceptanceArmed ? await siblingPointerFacts(tx, scope, pointerSnapshot.canonicalId) : null;
+    // SEARCH_INDEX_SKIP_ACCEPTANCE_MISSING_ENABLED / SEARCH_INDEX_SKIP_OVER_BOUND_ENABLED=true (where they apply,
+    // never with a pre-read): the same listing with each row's facts. Both off: the listing exactly as before.
+    const skipsApply = !prepared && inlineSkipsApply(deps);
+    const acceptanceArmed = deps.skipAcceptanceMissing === true && skipsApply;
+    const overBoundArmed = deps.skipOverBound === true && skipsApply;
+    const siblingFacts = acceptanceArmed || overBoundArmed ? await siblingPointerFacts(tx, scope, pointerSnapshot.canonicalId) : null;
     const {rows:siblings}=siblingFacts ? {rows:siblingFacts} : await tx.query<{manifest_key:string}>(`SELECT manifest_key FROM sessions.session_index
       WHERE org_id=$1 AND workspace_id=$2 AND harness=$3 AND coalesce(canonical_session_id,session_id)=$4 AND deleted_at IS NULL ORDER BY session_id,machine_id`,[scope.orgId,scope.workspaceId,scope.harness,pointerSnapshot.canonicalId]);
     const siblingKeys=siblings.map(r=>r.manifest_key);
@@ -783,9 +795,16 @@ async function indexSearchScopeBase(scope: SessionScope, deps: SearchIndexDeps, 
     // mismatch, alias still live, erase), before any object read or index query.
     if (deps.skipCurrent && (await alreadyCurrent(tx, scope, pointerSnapshot, keys.length, deps.outputFacts ? deps.ch : undefined)))
       return { manifests: keys.length, rows: 0, inserted: 0, deleted: 0, complete: true, skipped: true, reasons: [ALREADY_CURRENT] };
+    // SEARCH_INDEX_SKIP_OVER_BOUND_ENABLED=true: the same refusal as the read below would give, without a
+    // manifest read or any write (overBoundBeforeRead).
+    if (overBoundArmed && siblingFacts && (await overBoundBeforeRead(deps.ch!, scope, deps, limits, siblingFacts, at)))
+      return {
+        manifests: 0, rows: 0, inserted: 0, deleted: 0, complete: false, partial: true, skippedBeforeRead: true,
+        reasons: ["scope_too_large", SKIPPED_BEFORE_READ],
+      };
     let fromMs: number;
     let acceptance: { stamp: StampRead; digest: string; observed: Map<string, ManifestObservation> } | null = null;
-    if (siblingFacts) {
+    if (acceptanceArmed && siblingFacts) {
       // SEARCH_INDEX_SKIP_ACCEPTANCE_MISSING_ENABLED=true: windowStart's own read and default (same ClickHouse
       // read, same value), kept apart so the digest tells a stored window from the rolling default.
       const stored = await measurePhase(deps.metrics, "indexScanMs", () => readState(deps.ch!, STATE_WINDOW_START));
@@ -1459,7 +1478,7 @@ function inlineSkipsApply(deps: SearchIndexDeps): boolean {
   return !!deps.ch && !deps.adapter && !deps.staged && !deps.outputFacts && !deps.outputFactsStore && deps.committedGuard !== true;
 }
 
-/** A live sibling pointer row's read-determining facts (a SEARCH_INDEX_SKIP_* flag on only). */
+/** A live sibling pointer row's read-determining facts (a SEARCH_INDEX_SKIP_* flag on only). `raw_bytes` feeds only the over-bound skip. */
 export interface SiblingPointerFacts {
   manifest_key: string;
   session_id: string;
@@ -1485,6 +1504,67 @@ async function siblingPointerFacts(tx: SqlExecutor, scope: SessionScope, canonic
     [scope.orgId, scope.workspaceId, scope.harness, canonicalId],
   );
   return rows;
+}
+
+/**
+ * SEARCH_INDEX_SKIP_OVER_BOUND_ENABLED=true only. Whether this pass may repeat the size refusal without reading a
+ * manifest. All three must hold, else the normal pass runs:
+ *
+ * 1. Pointer facts (this transaction, the listing the read would use): the summed `raw_bytes` of the live,
+ *    scrubbed sibling pointers is over `limits.maxScopeBytes`. `raw_bytes` is a lower bound of the bytes
+ *    readCanonicalScope sizes for the same manifest: the pointer stage writes `raw.raw_bytes`, the manifest
+ *    validator refuses a manifest whose `raw.raw_bytes` is not the sum of `chunks[].bytes`, and the read sizes
+ *    each chunk as max(bytes, stored_raw_bytes ?? 0). `scrubbed` is true only for a manifest carrying
+ *    `raw.scrub`, the one the read admits.
+ * 2. Stream guard: with `deps.stream`, that lower bound times STREAM_PASSES is over the stream byte budget too,
+ *    so the streamed path could not take the scope.
+ * 3. Stored state: the scope's latest `search_ingest_session_state` row has needs_full = 1, scanned_rows = 0,
+ *    the highest live sibling revision, and was written less than SKIP_STATE_MAX_AGE_MS from this pass's time.
+ *    One bounded read, made only after 1 and 2 hold; a failed or empty read runs the normal pass.
+ *
+ * Known gap (as on the backport): a live scrubbed row the read would still refuse (a key mismatch, or a scrub
+ * ruleset above READER_MAX_RULESET) counts toward 1; the normal pass for such a scope is incomplete too and,
+ * like the skip, indexes nothing.
+ */
+async function overBoundBeforeRead(
+  ch: ClickHouseClient,
+  scope: SessionScope,
+  deps: SearchIndexDeps,
+  limits: SearchIndexLimits,
+  facts: readonly SiblingPointerFacts[],
+  at: Date,
+): Promise<boolean> {
+  if (facts.length === 0) return false;
+  const lowerBound = facts.reduce((n, f) => n + (f.scrubbed ? Number(f.raw_bytes) : 0), 0);
+  const maxRevision = facts.reduce((m, f) => (BigInt(f.revision) > m ? BigInt(f.revision) : m), BigInt(facts[0]!.revision));
+  // 1. Over the whole-read bound from pointer facts alone.
+  if (!(lowerBound > limits.maxScopeBytes)) return false;
+  // 2. A scope the streamed path could take is never skipped.
+  if (deps.stream && !(lowerBound * STREAM_PASSES > deps.stream.maxReadBytes)) return false;
+  // 3. The refusal at this revision is already recorded, and recently.
+  let state: { revision: unknown; needs_full: unknown; scanned_rows: unknown; synced_ms: unknown }[];
+  try {
+    state = await ch.select(
+      `SELECT revision, needs_full, scanned_rows, toUnixTimestamp64Milli(synced_at) AS synced_ms
+         FROM ${SESSION_STATE_TABLE}
+        WHERE org_id = {org:String} AND session_id = {session:String}
+        ORDER BY synced_at DESC
+        LIMIT 1`,
+      { params: { org: scope.orgId, session: scope.sessionId }, timeoutMs: 5_000 },
+    );
+  } catch {
+    return false;
+  }
+  const latest = state[0];
+  const age = latest === undefined ? NaN : Math.abs(at.getTime() - Number(latest.synced_ms));
+  return (
+    latest !== undefined &&
+    Number.isFinite(age) &&
+    age < SKIP_STATE_MAX_AGE_MS &&
+    Number(latest.needs_full) === 1 &&
+    Number(latest.scanned_rows) === 0 &&
+    String(latest.revision) === maxRevision.toString()
+  );
 }
 
 /** What one manifest read returned (the acceptance stamp's read-as-listed check). */
