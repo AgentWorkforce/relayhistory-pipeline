@@ -854,16 +854,19 @@ describe("search index: a busy session is requeued, not waited on (review #2 N2)
     let busy = true;
     const sb = fakeSupabase(() => [key], () => busy);
     const requeued: string[] = [];
+    const reasons: unknown[] = [];
     const db = { ...sb.tx, pool: undefined, end: async () => {} } as unknown as HoopDb;
     const bindings = { PIPELINE_ORG_FROM_PREFIX: "true", PIPELINE_KEY_PREFIX: "96bulls" };
     const deps: ConsumerDeps = {
       pointer: { db, lock: memoryLock(), reader, exists: async (k) => (await store.head(objectKey(k))) !== undefined, orgs: prefixOrgResolver, allowPrefix: (prefix, org) => prefixAllowed(bindings, prefix, org), fanout: droppedFanout },
       search: searchDeps(ch.ch, sb.transact),
-      requeue: async (k) => void requeued.push(k),
+      requeue: async (k, reason) => { requeued.push(k); reasons.push(reason); },
     };
     const put = JSON.stringify({ Records: [{ eventSource: "aws:s3", eventName: "ObjectCreated:Put", eventTime: AT, s3: { bucket: { name: "bucket" }, object: { key, eTag: "e", sequencer: "01" } } }] });
     expect((await processBatch([{ messageId: "m", body: put }], deps)).batchItemFailures).toEqual([]);
     expect(requeued).toEqual([key]);
+    // Tagged, so the Lambda applies SESSION_PIPELINE_BUSY_REQUEUE_DELAY_SECONDS to this requeue only.
+    expect(reasons).toEqual(["scope_busy"]);
     expect(ch.final()).toHaveLength(0);
     busy = false;
     await processBatch([{ messageId: "m2", body: put }], deps);
@@ -898,12 +901,13 @@ describe("streamed reconcile on the Lambda: one streamed scope per invocation, w
     };
     const transact = async <T>(work: (t: SqlExecutor) => Promise<T>) => work(tx);
     const requeued: string[] = [];
+    const reasons: unknown[] = [];
     const db = { ...tx, pool: undefined, end: async () => {} } as unknown as HoopDb;
     const bindings = { PIPELINE_ORG_FROM_PREFIX: "true", PIPELINE_KEY_PREFIX: "96bulls" };
     const deps: ConsumerDeps = {
       pointer: { db, lock: memoryLock(), reader, exists: async (k) => (await store.head(objectKey(k))) !== undefined, orgs: prefixOrgResolver, allowPrefix: (prefix, org) => prefixAllowed(bindings, prefix, org), fanout: droppedFanout },
       search: { ...searchDeps(ch.ch, transact, { maxScopeEvents: 2 }), stream: { maxReadBytes: 1 << 30, maxReadEvents: 1 << 24 } },
-      requeue: async (k) => void requeued.push(k),
+      requeue: async (k, reason) => { requeued.push(k); reasons.push(reason); },
     };
     const rt = { env: { searchStreamCh: { maxReadBytes: 1 << 30, maxReadEvents: 1 << 24, deadlineMarginMs: 60_000 } }, deps } as unknown as Runtime;
     const handler = createPipelineLambdaHandler({ loadRuntime: async () => rt });
@@ -912,7 +916,7 @@ describe("streamed reconcile on the Lambda: one streamed scope per invocation, w
     const invoke = (sessions: string[], ctx?: ReturnType<typeof context>) =>
       handler({ Records: sessions.map((s, i) => ({ messageId: `m${i}`, body: put(keys[s]!) })) } as never, ctx as never) as Promise<{ batchItemFailures: unknown[] }>;
     const indexed = () => [...new Set(ch.final().map((r) => r.session_id))].sort();
-    return { keys, ch, requeued, invoke, indexed, reads: () => reads, context };
+    return { keys, ch, requeued, reasons, invoke, indexed, reads: () => reads, context };
   }
 
   test("a batch with two too-large scopes streams the first, requeues the second, and still indexes the small one", async () => {
@@ -920,6 +924,8 @@ describe("streamed reconcile on the Lambda: one streamed scope per invocation, w
     expect((await l.invoke(["sess_1", "sess_2", "sess_3"], l.context(300_000))).batchItemFailures).toEqual([]);
     expect(l.reads()).toBe(1); // the context's remaining time is read once per invocation
     expect(l.requeued).toEqual([l.keys.sess_2]);
+    // A deferred stream is not a busy session: no reason, so it keeps the default 60 s delay.
+    expect(l.reasons).toEqual([undefined]);
     expect(l.indexed()).toEqual(["sess_1", "sess_3"]); // sess_1 only by streaming: its whole read is refused
     expect(l.ch.state.map((s) => [s.session_id, s.needs_full])).toEqual([["sess_1", 0], ["sess_3", 0]]); // sess_2: no state written
     // The redelivered event is the next invocation's one streamed scope.

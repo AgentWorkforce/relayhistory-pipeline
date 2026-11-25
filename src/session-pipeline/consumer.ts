@@ -28,6 +28,9 @@ export interface BatchResponse {
   batchItemFailures: { itemIdentifier: string }[];
 }
 
+/** Why a manifest is put back on the queue, when the delay depends on it. */
+export type RequeueReason = "scope_busy";
+
 export interface ConsumerDeps {
   pointer: PointerDeps;
   /** Absent while the search index is switched off: only pointers are written. */
@@ -42,8 +45,10 @@ export interface ConsumerDeps {
   /**
    * Put a manifest back on the queue after a delay (SQS DelaySeconds): used when
    * another pass holds the session, so the event is neither lost nor failed.
+   * `reason` is "scope_busy" only for a search pass that found its session held; every other requeue
+   * passes none and keeps the default delay (lambda.ts requeueDelaySeconds).
    */
-  requeue?: (manifestKey: string) => Promise<void>;
+  requeue?: (manifestKey: string, reason?: RequeueReason) => Promise<void>;
   /**
    * Absent by default (INGEST_BUFFERED_SEARCH_FEED=on only): a buffered-stage object event
    * (`…/buffered-batches/v1/…`) feeds that stage into the search index instead of reaching the
@@ -184,7 +189,7 @@ export async function processBatch(records: readonly QueueRecord[], deps: Consum
         if (result.busy) {
           // The running pass may have read S3 before this event's write: run again later.
           if (!deps.requeue) throw new Error("scope busy and no requeue");
-          await deps.requeue(manifestKey);
+          await deps.requeue(manifestKey, "scope_busy");
           log.info("search index busy, requeued", { stage: "search-index", org_id: scope.orgId, session_id: scope.sessionId, reason: "scope_busy" });
           continue;
         }

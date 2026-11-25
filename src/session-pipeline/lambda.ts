@@ -73,7 +73,7 @@ import type { HoopDb } from "../shared/db.ts";
 import { errorFields, log } from "../shared/log.ts";
 import { awsJsonCall, invokeAsync, lambdaCredentials } from "./aws-json.ts";
 import { createClickHouseClient } from "./vendor/search-index/clickhouse.ts";
-import { processBatch, type BatchResponse, type ConsumerDeps, type QueueRecord } from "./consumer.ts";
+import { processBatch, type BatchResponse, type ConsumerDeps, type QueueRecord, type RequeueReason } from "./consumer.ts";
 import { droppedFanout, scopeLockKey, type ScopeLock } from "./pointer.ts";
 import { searchIndexLimits, searchIndexStreamChFromEnv, type SearchIndexStreamCh } from "./search-index.ts";
 import { BufferedFeedError, bufferedFeedConfig, bufferedFeedGateRefusal, bufferedFeedVersionRefusal, clickhouseTieLedger, runBufferedFeed, sqlBufferedFeedSource, type BufferedFeedConfig } from "./buffered-search-feed.ts";
@@ -151,6 +151,8 @@ export interface LambdaEnv {
   pointerPreReadEnabled?: boolean;
   /** SESSION_POINTER_SKIP_ORIGIN_BUCKET_ENABLED=true: the pointer stage ignores h=_none/s=_origin keys (pointer.ts). Default off. */
   pointerSkipOriginBucketEnabled?: boolean;
+  /** SESSION_PIPELINE_BUSY_REQUEUE_DELAY_SECONDS when set to other than the default; absent = BUSY_REQUEUE_DELAY_SECONDS. */
+  busyRequeueDelaySeconds?: number;
   /**
    * SEARCH_INDEX_STREAMING_CH=1 (default off): a scope past the whole-read bound is reconciled by the
    * streaming reader on the ClickHouse binding within these budgets, stopping at the invocation's
@@ -241,6 +243,8 @@ export function lambdaEnv(env: NodeJS.ProcessEnv = process.env, composition?: Se
   const pointerPreRead = pointerPreReadFromEnv(env);
   // SESSION_POINTER_SKIP_ORIGIN_BUCKET_ENABLED: strict grammar, default off.
   const pointerSkipOriginBucket = pointerSkipOriginBucketFromEnv(env);
+  // SESSION_PIPELINE_BUSY_REQUEUE_DELAY_SECONDS: strict, default unset (60 s, as before).
+  const busyRequeueDelay = busyRequeueDelayFromEnv(env);
   // Unset is undefined (legacy reads, no field); a malformed value refuses init, as briefConfig() already does.
   const maximum = readerMaxRuleset(env);
   return {
@@ -265,6 +269,7 @@ export function lambdaEnv(env: NodeJS.ProcessEnv = process.env, composition?: Se
     ...(searchPreRead ? { searchPreReadEnabled: true } : {}),
     ...(pointerPreRead ? { pointerPreReadEnabled: true } : {}),
     ...(pointerSkipOriginBucket ? { pointerSkipOriginBucketEnabled: true } : {}),
+    ...(busyRequeueDelay !== BUSY_REQUEUE_DELAY_SECONDS ? { busyRequeueDelaySeconds: busyRequeueDelay } : {}),
     ...(searchStreamCh ? { searchStreamCh } : {}),
     semanticCopyEnabled: env.SESSION_SEMANTIC_COPY_ENABLED === "1",
     semanticSourceId: env.SESSION_SEARCH_FEATURE_SOURCE_ID,
@@ -409,8 +414,28 @@ export async function transaction<T>(db: HoopDb, work: (tx: SqlExecutor) => Prom
   }
 }
 
-/** A search pass that found its session busy runs again this much later. */
+/** A requeued manifest (busy session, stream deferred, pointer changed, buffered stage pending) runs again this much later. */
 export const BUSY_REQUEUE_DELAY_SECONDS = 60;
+
+/**
+ * SESSION_PIPELINE_BUSY_REQUEUE_DELAY_SECONDS (default unset = BUSY_REQUEUE_DELAY_SECONDS): the delay for a search
+ * pass that found its session held by another pass (scope_busy) only. An integer 1-900 (the SQS DelaySeconds
+ * range); anything else refuses init. Every other requeue keeps BUSY_REQUEUE_DELAY_SECONDS. A shorter delay brings
+ * a hot session's next pass forward; each retry is one non-blocking advisory-lock attempt, so a held scope costs
+ * one cheap SQL round trip per retry, not a read.
+ */
+export function busyRequeueDelayFromEnv(env: Record<string, string | undefined>): number {
+  const value = env.SESSION_PIPELINE_BUSY_REQUEUE_DELAY_SECONDS;
+  if (value === undefined || value === "") return BUSY_REQUEUE_DELAY_SECONDS;
+  if (!/^[1-9][0-9]{0,2}$/.test(value) || Number(value) > 900)
+    throw new Error("session pipeline: SESSION_PIPELINE_BUSY_REQUEUE_DELAY_SECONDS must be an integer 1-900");
+  return Number(value);
+}
+
+/** The SendMessage delay of a requeue: the busy delay for scope_busy, the default for anything else. */
+export function requeueDelaySeconds(env: Pick<LambdaEnv, "busyRequeueDelaySeconds">, reason?: RequeueReason): number {
+  return reason === "scope_busy" ? env.busyRequeueDelaySeconds ?? BUSY_REQUEUE_DELAY_SECONDS : BUSY_REQUEUE_DELAY_SECONDS;
+}
 
 export interface Runtime {
   env: LambdaEnv;
@@ -502,12 +527,12 @@ export function runtimeFromSecret(env: LambdaEnv, secretText: string, schemaGene
       // Default off; on, a sessionless per-origin bucket key (h=_none/s=_origin) is ignored before any lookup.
       ...(env.pointerSkipOriginBucketEnabled ? { skipOriginBucket: true as const } : {}),
     },
-    requeue: async (manifestKey) => {
+    requeue: async (manifestKey, reason) => {
       await awsJsonCall({
         service: "sqs",
         target: "AmazonSQS.SendMessage",
         region: env.region,
-        body: { QueueUrl: env.queueUrl, MessageBody: JSON.stringify({ [RECONCILE_BODY_KEY]: { key: manifestKey } }), DelaySeconds: BUSY_REQUEUE_DELAY_SECONDS },
+        body: { QueueUrl: env.queueUrl, MessageBody: JSON.stringify({ [RECONCILE_BODY_KEY]: { key: manifestKey } }), DelaySeconds: requeueDelaySeconds(env, reason) },
         credentials: lambdaCredentials(),
       });
     },

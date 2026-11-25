@@ -39,7 +39,7 @@ import { assertTranscriptStoreInputs, assertTranscriptStorePlanContract, transcr
 import { bufferedFeedConfig, bufferedFeedGateRefusal, BUFFERED_SEARCH_GATE_CONTRACT } from "../../../src/session-pipeline/buffered-search-feed.ts";
 import { bufferedErasureConfig } from "../../../src/session-pipeline/buffered-erasure-delete.ts";
 import { searchIndexLimits, searchIndexStreamChFromEnv, searchIndexStreamFloor, SEARCH_INDEX_STREAM_CH_CEILING } from "../../../src/session-pipeline/search-index.ts";
-import { lambdaEnv, pointerPreReadFromEnv, pointerSkipOriginBucketFromEnv, searchIndexPreReadFromEnv, searchIndexSkipCurrentFromEnv } from "../../../src/session-pipeline/lambda.ts";
+import { busyRequeueDelayFromEnv, lambdaEnv, pointerPreReadFromEnv, pointerSkipOriginBucketFromEnv, searchIndexPreReadFromEnv, searchIndexSkipCurrentFromEnv } from "../../../src/session-pipeline/lambda.ts";
 import { NeonExitRefusal } from "../../../src/shared/neon-exit.ts";
 import { analysisConfig } from "../../../src/session-analysis/worker.ts";
 
@@ -1087,6 +1087,24 @@ describe("session pipeline: pointer skips the sessionless per-origin bucket (SES
   });
   it("a non-boolean is refused", () => {
     for (const bad of ["true", 1, null, {}]) expect(refusedBy({ pointerSkipOriginBucket: bad })).toMatch(/pointerSkipOriginBucket must be a boolean/);
+  });
+});
+
+describe("session pipeline: busy requeue delay (SESSION_PIPELINE_BUSY_REQUEUE_DELAY_SECONDS)", () => {
+  const envOf = (cfg: SessionPipelineInputs) => sessionPipelineEnv({ stage: STAGE, bucket: t.bucket, names: p, p: cfg });
+  const refusedBy = (v: unknown) => { let why = ""; try { assertSessionPipelineInputs(v, (w: string) => { throw new Error(w); }); } catch (e) { why = (e as Error).message; } return why; };
+  it("unset renders nothing (60 s); a value renders exactly that key; the Lambda parses it", () => {
+    const base = Object.keys(envOf({})).sort();
+    expect(base).not.toContain("SESSION_PIPELINE_BUSY_REQUEUE_DELAY_SECONDS");
+    expect(busyRequeueDelayFromEnv(envOf({}))).toBe(60);
+    expect(refusedBy({ busyRequeueDelaySeconds: 10 })).toBe("");
+    const env = envOf({ busyRequeueDelaySeconds: 10 });
+    expect(Object.keys(env).sort()).toEqual([...base, "SESSION_PIPELINE_BUSY_REQUEUE_DELAY_SECONDS"].sort());
+    expect(env.SESSION_PIPELINE_BUSY_REQUEUE_DELAY_SECONDS).toBe("10");
+    expect(busyRequeueDelayFromEnv(env)).toBe(10);
+  });
+  it("anything but an integer 1-900 is refused", () => {
+    for (const bad of [0, 901, 10.5, -1, "10", null, true]) expect(refusedBy({ busyRequeueDelaySeconds: bad })).toMatch(/busyRequeueDelaySeconds must be an integer 1-900/);
   });
 });
 
