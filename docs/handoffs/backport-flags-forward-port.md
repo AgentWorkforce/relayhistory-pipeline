@@ -91,3 +91,53 @@ line, `search index acceptance stamp not written`, and its result is unchanged.
 ### Rollback
 
 Unset the flag, or set it to `false`. Leftover stamps are then inert.
+
+## SEARCH_INDEX_SKIP_OVER_BOUND_ENABLED
+
+The backport commits are 14e9c00a and 95776f5b.
+
+### Grammar
+
+The grammar is the same as for the acceptance flag:
+
+| Value | Result |
+| --- | --- |
+| unset, `""`, `false` | Off. |
+| `true` | On. Needs `SEARCH_INDEX_ENABLED=1`. |
+| anything else | Init fails and names the variable. |
+
+The two skip flags are independent.
+
+### What it does
+
+The pass checks three conditions before any manifest read. If all three hold, it returns the size refusal
+again without reading or writing anything. The result is `partial: true`, `skippedBeforeRead: true` and the
+reasons `scope_too_large, skipped_before_read`. If any condition fails, the normal pass runs.
+
+1. **Pointer sizes.** The summed `raw_bytes` of the live, scrubbed sibling pointers is over
+   `maxScopeBytes`. The bound is strict.
+2. **Stream guard.** With stream budgets (`SEARCH_INDEX_STREAMING_CH=1`), four times that sum is also over
+   the stream byte budget, so the streamed path could not take the scope either.
+3. **State row.** The scope's latest `search_ingest_session_state` row has `needs_full = 1`,
+   `scanned_rows = 0` and the highest live sibling revision. It was written less than six hours away from
+   the pass's time. This is one bounded read, made only after 1 and 2 hold. If the read fails, the normal
+   pass runs.
+
+The consumer handles the result like a size refusal. It logs one `search index partial` warn line with the
+reason `scope_too_large,skipped_before_read` and one `search index reconciled` line. It does not requeue
+the message and does not report a batch item failure.
+
+### How main differs from the backport
+
+- **Pointer set.** The sizes, revisions and count come from the same sibling-facts listing the read uses
+  (the canonical union). The backport ran a separate aggregate query, so its "live count changed between
+  listing and facts" check is not needed here.
+- **Order of checks.** The skip runs after skip-current and before the acceptance stamp.
+- **Where the skip applies.** The same `inlineSkipsApply` rule applies as for the acceptance flag. The
+  managed search-jobs pass never skips. Its over-bound pass stays `held`, exactly as with the flag off.
+- **Reasons.** On main, a pass refused by the stream budgets reports
+  `scope_too_large, stream_read_bytes_budget`. Its skip reports `scope_too_large, skipped_before_read`, as on
+  the backport.
+- **Known gap.** A live scrubbed row that the read would still refuse is counted in the sum. Two such
+  refusals are a key mismatch and a scrub ruleset above `READER_MAX_RULESET`. The normal pass for such a
+  scope is incomplete as well, and it indexes nothing either.
