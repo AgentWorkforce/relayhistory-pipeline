@@ -112,3 +112,28 @@ test("portable target misconfiguration fails startup before the probe port opens
   expect(JSON.parse((await err).trim().split("\n").at(-1)!)).toEqual({ kind: "canonical-publication", service: "session-publication", healthy: false, code: "publication_target_invalid" });
   await expect(fetch(`http://127.0.0.1:${port}/healthz`, { signal: AbortSignal.timeout(500) })).rejects.toThrow();
 });
+
+test("dormant EKS host: attempted activation refuses before probes, rollback restores dormant mode", async () => {
+  const port = await freePort();
+  const before = accepted;
+  const config = { PATH: dir + ":" + process.env.PATH, SERVICE: "session-publication",
+    INGEST_PUBLICATION_TARGET: "eks-scoped", WORKER_HEALTH_PORT: String(port) };
+  async function verifyDormant() {
+    const { p, out, err } = launch({ ...config, INGEST_PUBLISH_ENABLED: "false" });
+    try {
+      for (const path of ["/healthz", "/readyz"]) {
+        expect(await probe(port, path)).toEqual({ status: 200, body: { ok: true, enabled: false } });
+      }
+    } finally { p.kill("SIGTERM"); }
+    expect(await p.exited).toBe(0);
+    expect(await err).toBe("");
+    expect((await out).trim().split("\n").map(line => JSON.parse(line)).some(record => record.mode === "publish" && record.healthy === true)).toBe(false);
+  }
+  await verifyDormant();
+  const { p, err } = launch({ ...config, INGEST_PUBLISH_ENABLED: "true" });
+  expect(await p.exited).toBe(1);
+  expect(JSON.parse((await err).trim().split("\n").at(-1)!)).toMatchObject({ code: "publication_eks_scoped_contract_unavailable" });
+  await expect(fetch(`http://127.0.0.1:${port}/readyz`, { signal: AbortSignal.timeout(500) })).rejects.toThrow();
+  await verifyDormant();
+  expect(accepted).toBe(before);
+});
