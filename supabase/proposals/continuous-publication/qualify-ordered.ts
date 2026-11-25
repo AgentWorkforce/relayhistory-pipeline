@@ -3,6 +3,7 @@ import { readFileSync, realpathSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import pg from "pg";
 import assert from "node:assert/strict";
+import { MIGRATION_SENTINELS } from "../../../src/hoopdb/migration-sentinels.ts";
 import { plan, runMigrations } from "../../../src/hoopdb/migrate.ts";
 import { publicationKernelSlot, publicationRecoverySlot, heldPublicationSentinels } from "./held-profile.ts";
 
@@ -36,6 +37,13 @@ try {
   // Exact on-disk discovery, SQL-byte ledger and preflight of the real migrator.
   // Its local marker describes only this disposable tree. It is never emitted
   // as a release generation or used for an enrolled receipt.
+  // Exercise the refusal before supplying the proposed sentinel registrations
+  // to this isolated process. Active tree registrations remain untouched.
+  await assert.rejects(runMigrations(c,{profile}),{code:"sentinel_missing"});
+  Object.assign(MIGRATION_SENTINELS,heldPublicationSentinels,{[privateName]:{
+    evidence:"fixture private profile, revocation ledger and request validator",
+    sql:"SELECT to_regclass('frontier_receipt_private.read_profiles') IS NOT NULL AND to_regclass('frontier_receipt_private.revoked_profiles') IS NOT NULL AND to_regprocedure('frontier_receipt_private.check_request(jsonb)') IS NOT NULL AS applied",
+  }});
   const first=await runMigrations(c,{profile});
   assert.ok(first.applied>ordered.length);
   const rerun=await runMigrations(c,{profile});
