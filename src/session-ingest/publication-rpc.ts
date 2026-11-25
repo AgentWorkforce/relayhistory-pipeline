@@ -39,17 +39,27 @@ export function parsePublicationTicket(v:any,target:PublicationTarget):Publicati
  if(JSON.stringify(covered)!==JSON.stringify(v.acceptedOrdinals))throw bad();
  return {...v,receiptSeats};
 }
-export function publicationRpc(db:SemanticBoundedSql,target:PublicationTarget,options:{now?:()=>number;queryTimeoutMs?:number}={}):PublicationRpc{
- if(!HEX.test(target.generation)||(target.provider!=="s3"&&target.provider!=="gcs")||!target.bucket||!target.region||!target.keyRoot)throw bad();
+type CallOptions = {now?:()=>number;queryTimeoutMs?:number};
+/** Fixed function suffixes only. Callers bind every payload as a JSON parameter. */
+const functions = ["candidates","defer","claim","heartbeat","prepare","register_objects","publish","abandon",
+ "scoped_candidates_v1","scoped_claim_v1","scoped_publish_v1"] as const;
+type PublicationFunction = typeof functions[number];
+export function publicationRpcCaller(db:SemanticBoundedSql,generation:string,options:CallOptions={}){
  const now=options.now??Date.now,timeout=options.queryTimeoutMs??15000;
  if(!Number.isSafeInteger(timeout)||timeout<1||timeout>60000)throw bad();
- const call=async(fn:string,p:Record<string,unknown>,signal:AbortSignal)=>{
+ return async(fn:PublicationFunction,p:Record<string,unknown>,signal:AbortSignal)=>{
+  if(!functions.includes(fn))throw bad();
   signal.throwIfAborted();
   const r=await db.queryBounded<{result:unknown}>("SELECT sessions.ingest_publication_"+fn+"($1::jsonb) AS result",
-   [JSON.stringify({...p,generation:target.generation})],{signal,deadline:now()+timeout,now});
+   [JSON.stringify({...p,generation})],{signal,deadline:now()+timeout,now});
   if(r.rows.length!==1||!r.rows[0]?.result||typeof r.rows[0].result!=="object")throw bad();
   return r.rows[0].result as any;
  };
+}
+
+export function publicationRpc(db:SemanticBoundedSql,target:PublicationTarget,options:{now?:()=>number;queryTimeoutMs?:number}={}):PublicationRpc{
+ if(!HEX.test(target.generation)||(target.provider!=="s3"&&target.provider!=="gcs")||!target.bucket||!target.region||!target.keyRoot)throw bad();
+ const call=publicationRpcCaller(db,target.generation,options);
  const attempt=(t:PublicationTicket)=>{if(t.schemaGeneration!==target.generation)throw bad();return {attemptToken:t.attemptToken,leaseToken:t.leaseToken};};
  return {
   async candidates(limit,signal){const r=await call("candidates",{limit,keyRoot:target.keyRoot,bucket:target.bucket,region:target.region},signal);if(!Array.isArray(r.stageTokens)||r.stageTokens.some((x:any)=>typeof x!=="string"||!UUID.test(x)))throw bad();return r.stageTokens;},
