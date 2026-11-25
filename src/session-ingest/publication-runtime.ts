@@ -18,7 +18,21 @@ import type{PublicationTarget}from'./publication-protocol.ts';
 import type{AwsCredentials}from'../../packages/object-store/src/sigv4.ts';
 const no=(code:string):never=>{throw Object.assign(Error('publication_'+code),{code:'publication_'+code});};
 export interface PublicationRuntimeConfig{bucket:string;region:'us-east-1';accountId:string;supabaseProjectRef:string;instanceId:string;keyRoot:'96bulls';generation:string;secretArn:string;kmsKeyArn:string;instanceProfileArn:string;roleName:string;budgetMs:number;candidateLimit:number;gcLimit:number}
-export function publicationRuntimeConfig(env:NodeJS.ProcessEnv):PublicationRuntimeConfig{
+// The AWS publisher uses EC2 instance-profile credentials. A pod must never
+// fall back to node IMDS while its own identity is absent or partly configured.
+const POD_IDENTITY_ENV = [
+ "KUBERNETES_SERVICE_HOST",
+ "AWS_CONTAINER_CREDENTIALS_FULL_URI",
+ "AWS_CONTAINER_CREDENTIALS_RELATIVE_URI",
+ "AWS_CONTAINER_AUTHORIZATION_TOKEN_FILE",
+ "AWS_CONTAINER_AUTHORIZATION_TOKEN",
+ "AWS_WEB_IDENTITY_TOKEN_FILE",
+] as const;
+
+export function publicationRuntimeConfig(env:NodeJS.ProcessEnv, mode: "publish" | "gc" = "publish"):PublicationRuntimeConfig{
+ if (mode === "publish" && POD_IDENTITY_ENV.some(name => env[name] !== undefined)) {
+  no("ec2_publisher_in_pod");
+ }
  const need=(k:string)=>{if(!env[k])no('config_required');return env[k]!};
  if(env.AWS_REGION!=='us-east-1'||env.HOOPDB_DB_MODE!=='supabase')no('target_required');
  const bucket=need('INGEST_PUBLISH_BUCKET'),generation=need('INGEST_PUBLISH_EXPECT_GENERATION'),secretArn=need('INGEST_PUBLISH_SECRET_ARN'),kmsKeyArn=need('INGEST_PUBLISH_KMS_KEY_ARN'),instanceProfileArn=need('INGEST_PUBLISH_INSTANCE_PROFILE_ARN'),roleName=need('INGEST_PUBLISH_ROLE_NAME');
@@ -57,7 +71,7 @@ export interface PublicationRuntimeOverrides{
 /** Factories are test-only ports; process entry never reads overrides from input. */
 export async function runCanonicalPublicationRuntime(env:NodeJS.ProcessEnv,mode:'publish'|'gc',overrides:PublicationRuntimeOverrides={},external?:AbortSignal){
  if(!publicationEnabled(env,mode))return{enabled:false as const};
- const config=publicationRuntimeConfig(env),assets=await(overrides.assets??derivedSchemaAssets)();
+ const config=publicationRuntimeConfig(env,mode),assets=await(overrides.assets??derivedSchemaAssets)();
  if(assets.expected.generation!==config.generation||!assets.expected.names.length||Object.values(assets.verifiers).length!==4||Object.values(assets.verifiers).some(s=>!s?.trim()))no('compiled_generation_mismatch');
  const controller=new AbortController(),timer=setTimeout(()=>controller.abort(),config.budgetMs),signal=AbortSignal.any([controller.signal,...(external?[external]:[])]),deadline=Date.now()+config.budgetMs;
  let pool:pg.Pool|undefined;

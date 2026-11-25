@@ -45,11 +45,26 @@ describe("bounded receipt source capability client (synthetic SQL only)", () => 
     expect(capture.functionOwner).toBe(input.functionOwner);
     expect(capture.scan).toMatchObject({ pageItemCounts: [1, 1, 0], itemCount: 2, pagesRead: 3, complete: true, terminalCursor: null });
     expect(f.calls.filter(c => c.text === RECEIPT_CAPTURE_IDENTITY_SQL)).toHaveLength(2);
-    expect(f.calls.filter(c => c.text === RECEIPT_CAPTURE_PAGE_SQL)).toHaveLength(4);
+    expect(f.calls.filter(c => c.text === RECEIPT_CAPTURE_PAGE_SQL)).toHaveLength(6);
     expect(f.calls.at(-1)?.text).toBe("COMMIT");
     expect(f.calls.some(c => c.text.includes("ingest_receipt_seats_for_stage"))).toBe(false);
     const req = JSON.parse(f.calls.find(c => c.text === RECEIPT_CAPTURE_PAGE_SQL)!.params![0] as string);
     expect(req).toMatchObject({ profileId: input.profileId, profileSha256: input.profileSha256, tenant, after: null, limit: 1 });
+  });
+  test("fresh closure refuses a changed losing decision behind the first page despite the same reported digest", async () => {
+    const f = fixture();
+    f.mutate = (page, index, transaction) => {
+      if (transaction === 2 && index === 2 && Array.isArray(page.rows) && page.rows.length)
+        page.rows = [{ ...loser, seat: "13" }];
+    };
+    await refused(f, "frontier_receipt_changed");
+  });
+  test("fresh closure refuses early EOF even if the reported count and digest still match", async () => {
+    const f = fixture();
+    f.mutate = (page, index, transaction) => {
+      if (transaction === 2 && index === 2) { page.rows = []; page.next = null; }
+    };
+    await refused(f, "frontier_receipt_changed");
   });
   test("zero decision domain still requires actual empty query and closure", async () => {
     const f = fixture(); f.records.splice(0);
