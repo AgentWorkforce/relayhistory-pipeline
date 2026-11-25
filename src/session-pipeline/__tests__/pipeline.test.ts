@@ -187,6 +187,12 @@ function fakeClickHouse() {
     async select<T>(query: string, options?: { params?: Record<string, unknown> }) {
       if (query.includes("search_ingest_state")) return [] as T[];
       const p = options!.params!;
+      // The latest session state row of one key (the hosted pass's marker and completion fence).
+      if (query.includes("search_ingest_session_state")) {
+        const ms = (v: unknown) => Date.parse(`${String(v).replace(" ", "T")}Z`);
+        const rows = (state as Array<Record<string, unknown>>).filter((r) => r.org_id === p.org && r.session_id === p.session).sort((a, b) => ms(b.synced_at) - ms(a.synced_at));
+        return (rows[0] ? [{ revision: String(rows[0].revision), needs_full: rows[0].needs_full, scanned_rows: rows[0].scanned_rows, synced_ms: ms(rows[0].synced_at) }] : []) as T[];
+      }
       return final()
         .filter((r) => r.org_id === p.org && (r.session_id === p.session || r.session_id === p.canonical) && r.workspace_id === p.workspace && r.source === p.source && tsMs(r) >= Number(p.from))
         .slice(0, Number(p.limit))
