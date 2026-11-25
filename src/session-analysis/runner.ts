@@ -35,7 +35,18 @@
  *   SESSION_ANALYSIS_S3_VERSIONING_CHECK  unset: the startup GetBucketVersioning check (bucket-versioning.ts) runs
  *                                     when an endpoint or static keys are set, and not on the hosted default;
  *                                     "true" forces it. A bucket that is not versioned refuses startup
- *   LOCKER_PROVIDER                   unset or "s3" only: gcs, azure and fs refuse (provider_unsupported)
+ *   LOCKER_PROVIDER                   unset or "s3": the S3 settings above. "azure": Azure Blob (below). gcs and fs refuse
+ *                                     (provider_unsupported); any other value refuses (provider_invalid)
+ *   LOCKER_PROVIDER=azure only (every SESSION_ANALYSIS_S3_* setting must then be unset: azure_s3_settings_conflict):
+ *     SESSION_ANALYSIS_AZURE_ACCOUNT  the storage account, 3-24 lowercase letters or digits
+ *     SESSION_ANALYSIS_AZURE_CONTAINER the container (the canonical pointers' bucket), an Azure container name
+ *     SESSION_ANALYSIS_AZURE_ENDPOINT optional blob endpoint (Azurite: http://127.0.0.1:10000/<account>); the shared
+ *                                     destination policy as for the S3 endpoint; path empty or exactly /<account>.
+ *                                     Unset: https://<account>.blob.core.windows.net
+ *     SESSION_ANALYSIS_AZURE_ACCOUNT_KEY_FILE  the Shared Key, from a mounted Secret file ONLY (the plaintext variable
+ *                                     refuses: azure_account_key_plaintext). No SAS, no Entra (later slices)
+ *     Startup always runs the data-plane versioning probe (blob-versioning.ts): a probe put must answer a version id
+ *     and then erase and verify through the strict Azure eraser, or startup refuses
  *   PIPELINE_KEY_PREFIX, PIPELINE_ORG_FROM_PREFIX=true, READER_MAX_RULESET   as the Lambda reads them
  *   WORKER_HEALTH_PORT                probe port, default 8081
  *   SESSION_ANALYSIS_ASSUME_NO_LEGACY_TURNS, SESSION_ANALYSIS_CUTOVER_PROOF,
@@ -56,10 +67,12 @@
  */
 import { createServer, type Server } from "node:http";
 import type { AddressInfo } from "node:net";
-import { readFileSync, statSync } from "node:fs";
-import { isAbsolute } from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
 import { createS3Store, type ObjectStore } from "../../packages/object-store/src/index.ts";
+import { createAzureBlobStore, type AzureBlobConfig } from "../../packages/object-store/src/azure.ts";
+import { azureAccountKey, azureBlobSettings, azureNoRedirectFetch, envSecret, type AzureBlobSettings } from "../shared/azure-blob-settings.ts";
+import { createAzureBlobEraser, type AzureBlobEraserConfig } from "../migration/azure-blob-erasure/eraser.ts";
+import { probeBlobVersioning, runnerProbePrefix, type BlobVersioningCheck, type BlobVersioningVerdict } from "./blob-versioning.ts";
 import { cachedProvider } from "../../packages/object-store/src/core.ts";
 import type { AwsCredentials } from "../../packages/object-store/src/sigv4.ts";
 import { readerMaxRuleset } from "../../packages/pipeline/src/lib/scrub-engine/reader-policy.ts";
@@ -105,7 +118,11 @@ export function analysisRunnerEnabled(env: NodeJS.ProcessEnv): boolean {
   return refuse("flag_invalid");
 }
 
-export type RunnerCredentialMode = "podIdentity" | "role" | "static";
+/** "sharedKey": LOCKER_PROVIDER=azure (the account key file); never an S3 credentials source. */
+export type RunnerCredentialMode = "podIdentity" | "role" | "static" | "sharedKey";
+
+/** LOCKER_PROVIDER=azure's store settings (no secret): the shared parser's result (src/shared/azure-blob-settings.ts). */
+export type RunnerAzureConfig = AzureBlobSettings;
 
 export interface AnalysisRunnerConfig {
   tickMs: number;
@@ -120,6 +137,8 @@ export interface AnalysisRunnerConfig {
   endpoint?: string;
   /** The startup versioning check runs. Absent on the hosted default (no endpoint, no static keys). */
   versioningCheck?: true;
+  /** LOCKER_PROVIDER=azure only (then bucket is the container, region is "" and credentials "sharedKey"). */
+  azure?: RunnerAzureConfig;
   /** SESSION_ANALYSIS_ASSUME_NO_LEGACY_TURNS=true was passed through (it must stay unset). */
   assumeNoLegacyTurns: boolean;
   /** SESSION_ANALYSIS_CUTOVER_PROOF is set (passed through; its value is never read here). */
@@ -145,14 +164,14 @@ const STATIC_KEY_VARS = ["SESSION_ANALYSIS_S3_ACCESS_KEY_ID", "SESSION_ANALYSIS_
 const GCS_API_HOST = /^(?:storage\.googleapis\.com|.+\.storage\.googleapis\.com|storage\.google\.com)$/;
 
 /**
- * The store's provider and endpoint. Only S3 (unset LOCKER_PROVIDER or "s3"): the sweeper's versioned
- * eraser exists for S3 only, so gcs, azure and fs refuse until theirs does. The endpoint follows the
+ * The S3 store's provider and endpoint (unset LOCKER_PROVIDER or "s3"; azure is analysisRunnerConfig's own
+ * branch, runnerAzureConfig). gcs and fs refuse until their versioned erasers exist. The endpoint follows the
  * shared destination policy (destination-url.ts), the same rule the publisher and the erase job use;
  * ALLOW_IN_CLUSTER_HTTP is read only when an endpoint is set, so the hosted default reads nothing new.
  */
 function runnerEndpoint(env: NodeJS.ProcessEnv): string | undefined {
   const provider = env.LOCKER_PROVIDER?.trim() ?? "";
-  if (provider === "gcs" || provider === "azure" || provider === "fs") refuse("provider_unsupported");
+  if (provider === "gcs" || provider === "fs") refuse("provider_unsupported");
   if (provider !== "" && provider !== "s3") refuse("provider_invalid");
   const raw = env.SESSION_ANALYSIS_S3_ENDPOINT;
   if (raw === undefined || raw === "") return undefined;
@@ -165,15 +184,29 @@ function runnerEndpoint(env: NodeJS.ProcessEnv): string | undefined {
   return url.origin;
 }
 
+const AZURE_CONFLICTING_S3_VARS = [
+  "SESSION_ANALYSIS_S3_BUCKET", "SESSION_ANALYSIS_S3_REGION", "SESSION_ANALYSIS_S3_ENDPOINT", "SESSION_ANALYSIS_S3_CREDENTIALS",
+  "SESSION_ANALYSIS_S3_VERSIONING_CHECK", ...STATIC_KEY_VARS, ...STATIC_KEY_VARS.map((name) => `${name}_FILE`),
+] as const;
+
+/**
+ * LOCKER_PROVIDER=azure's settings: account, container and endpoint (the shared destination policy, as the S3
+ * endpoint; a path only as Azurite's /<account>). The key itself is a secret (runnerAzureKey); only the presence
+ * of its plaintext variable is checked here. No SESSION_ANALYSIS_S3_* setting may be set alongside.
+ */
+export function runnerAzureConfig(env: NodeJS.ProcessEnv): RunnerAzureConfig {
+  if (AZURE_CONFLICTING_S3_VARS.some((name) => env[name] !== undefined && env[name] !== "")) refuse("azure_s3_settings_conflict");
+  return azureBlobSettings(env, refuse);
+}
+
 /** Every setting of an enabled runner, validated before anything listens. Never reads a secret. */
 export function analysisRunnerConfig(env: NodeJS.ProcessEnv): AnalysisRunnerConfig {
+  if (env.LOCKER_PROVIDER?.trim() === "azure") return analysisRunnerConfigAzure(env);
   const bucket = env.SESSION_ANALYSIS_S3_BUCKET ?? "";
   if (!/^[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]$/.test(bucket)) refuse("bucket_invalid");
   const region = env.SESSION_ANALYSIS_S3_REGION ?? "";
   if (!/^[a-z]{2}(-[a-z]+)+-\d{1,2}$/.test(region)) refuse("region_invalid");
-  if (env.PIPELINE_ORG_FROM_PREFIX !== "true") refuse("org_from_prefix_required");
-  const keyPrefix = (env.PIPELINE_KEY_PREFIX ?? "").replace(/^\/+|\/+$/g, "");
-  if (!/^[A-Za-z0-9][A-Za-z0-9._-]{0,62}$/.test(keyPrefix)) refuse("key_prefix_invalid");
+  const keyPrefix = runnerKeyPrefix(env);
   const credentials = env.SESSION_ANALYSIS_S3_CREDENTIALS || "podIdentity";
   if (credentials !== "podIdentity" && credentials !== "role" && credentials !== "static") refuse("credentials_mode_invalid");
   // Static keys are read only in "static" mode; set in any other mode they would be silently unused.
@@ -182,6 +215,58 @@ export function analysisRunnerConfig(env: NodeJS.ProcessEnv): AnalysisRunnerConf
   const check = env.SESSION_ANALYSIS_S3_VERSIONING_CHECK;
   if (check !== undefined && check !== "" && check !== "true") refuse("versioning_check_invalid");
   const versioningCheck = check === "true" || endpoint !== undefined || credentials === "static";
+  const run = runnerProcessSettings(env);
+  return {
+    tickMs: run.tickMs,
+    batch: run.batch,
+    poolMax: run.poolMax,
+    bucket,
+    region,
+    keyPrefix,
+    ...(run.readerMaxRuleset === undefined ? {} : { readerMaxRuleset: run.readerMaxRuleset }),
+    credentials: credentials as RunnerCredentialMode,
+    ...(endpoint === undefined ? {} : { endpoint }),
+    ...(versioningCheck ? { versioningCheck: true as const } : {}),
+    assumeNoLegacyTurns: run.assumeNoLegacyTurns,
+    cutoverProof: run.cutoverProof,
+  };
+}
+
+/** The azure branch: its store settings (runnerAzureConfig), then the same provider-independent checks as S3. */
+function analysisRunnerConfigAzure(env: NodeJS.ProcessEnv): AnalysisRunnerConfig {
+  const azure = runnerAzureConfig(env);
+  // Decision records (and the claims they feed) stay off on Azure until the self-host operator erase can erase
+  // them there (it adopts the Azure eraser in its own slice): a rule only in a doc would fail open.
+  if (env.SUMMARY_DECISION_RECORDS_ENABLED === "true") refuse("azure_decision_records_unsupported");
+  const keyPrefix = runnerKeyPrefix(env);
+  const run = runnerProcessSettings(env);
+  return {
+    tickMs: run.tickMs,
+    batch: run.batch,
+    poolMax: run.poolMax,
+    bucket: azure.container,
+    region: "",
+    keyPrefix,
+    ...(run.readerMaxRuleset === undefined ? {} : { readerMaxRuleset: run.readerMaxRuleset }),
+    credentials: "sharedKey",
+    // The data-plane probe always runs on azure (assertRunnerBlobVersioned).
+    versioningCheck: true,
+    azure,
+    assumeNoLegacyTurns: run.assumeNoLegacyTurns,
+    cutoverProof: run.cutoverProof,
+  };
+}
+
+/** The org-from-prefix layout and the bare key root, as the Lambda requires them (any provider). */
+function runnerKeyPrefix(env: NodeJS.ProcessEnv): string {
+  if (env.PIPELINE_ORG_FROM_PREFIX !== "true") refuse("org_from_prefix_required");
+  const keyPrefix = (env.PIPELINE_KEY_PREFIX ?? "").replace(/^\/+|\/+$/g, "");
+  if (!/^[A-Za-z0-9][A-Za-z0-9._-]{0,62}$/.test(keyPrefix)) refuse("key_prefix_invalid");
+  return keyPrefix;
+}
+
+/** The provider-independent process settings, checked in this order after the store settings (any provider). */
+function runnerProcessSettings(env: NodeJS.ProcessEnv) {
   const assume = env.SESSION_ANALYSIS_ASSUME_NO_LEGACY_TURNS;
   if (assume !== undefined && assume !== "" && assume !== "false" && assume !== "true") refuse("assume_no_legacy_turns_invalid");
   // Strict here, and it must be exactly what worker.ts analysisConfig runs (1-20, default 2): the
@@ -196,13 +281,7 @@ export function analysisRunnerConfig(env: NodeJS.ProcessEnv): AnalysisRunnerConf
     tickMs: int(env.SESSION_ANALYSIS_TICK_MS, 30_000, 1_000, 600_000, "tick_ms_invalid"),
     batch,
     poolMax: int(env.SESSION_ANALYSIS_PG_POOL_MAX, 4, 1, 16, "pool_max_invalid"),
-    bucket,
-    region,
-    keyPrefix,
-    ...(maximum === undefined ? {} : { readerMaxRuleset: maximum }),
-    credentials: credentials as RunnerCredentialMode,
-    ...(endpoint === undefined ? {} : { endpoint }),
-    ...(versioningCheck ? { versioningCheck: true as const } : {}),
+    readerMaxRuleset: maximum,
     assumeNoLegacyTurns: assume === "true",
     cutoverProof: env.SESSION_ANALYSIS_CUTOVER_PROOF !== undefined && env.SESSION_ANALYSIS_CUTOVER_PROOF !== "",
   };
@@ -213,24 +292,7 @@ export function analysisRunnerConfig(env: NodeJS.ProcessEnv): AnalysisRunnerConf
  * 1..65536 bytes; one trailing newline is dropped). Refusal codes name the variable, never its value.
  */
 export function runnerSecret(env: NodeJS.ProcessEnv, name: string, code: string): string {
-  const value = env[name], file = env[`${name}_FILE`];
-  if (value !== undefined && value !== "" && file !== undefined && file !== "") refuse(`${code}_ambiguous`);
-  let text = value ?? "";
-  if (file !== undefined && file !== "") {
-    if (!isAbsolute(file)) refuse(`${code}_invalid`);
-    try {
-      const st = statSync(file);
-      if (!st.isFile() || st.size < 1 || st.size > 65_536) refuse(`${code}_invalid`);
-      text = readFileSync(file, "utf8").replace(/\r?\n$/, "");
-    } catch (e) {
-      if (e instanceof AnalysisRunnerRefused) throw e;
-      refuse(`${code}_unreadable`);
-    }
-  }
-  if (!text) refuse(`${code}_missing`);
-  // eslint-disable-next-line no-control-regex
-  if (/[\u0000-\u001f\u007f\s]/.test(text)) refuse(`${code}_invalid`);
-  return text;
+  return envSecret(env, name, code, refuse);
 }
 
 export interface RunnerSecrets {
@@ -239,6 +301,8 @@ export interface RunnerSecrets {
   modelKey: string | null;
   /** SESSION_ANALYSIS_S3_CREDENTIALS=static only: the store's and the eraser's keys. */
   s3?: AwsCredentials;
+  /** LOCKER_PROVIDER=azure only: the Shared Key, behind a closure (never a field a log or JSON could print). */
+  azure?: { accountKey: () => string };
 }
 
 export function runnerSecrets(env: NodeJS.ProcessEnv): RunnerSecrets {
@@ -246,7 +310,16 @@ export function runnerSecrets(env: NodeJS.ProcessEnv): RunnerSecrets {
   try { postgresConnectionString(databaseUrl); } catch { refuse("database_url_invalid"); }
   const key = runnerSecret(env, "SESSION_ANALYSIS_OPENAI_API_KEY", "model_key");
   const s3 = env.SESSION_ANALYSIS_S3_CREDENTIALS === "static" ? runnerStaticKeys(env) : undefined;
-  return { databaseUrl, modelKey: modelKey({ OPENAI_API_KEY: key }), ...(s3 ? { s3 } : {}) };
+  const azure = env.LOCKER_PROVIDER?.trim() === "azure" ? runnerAzureKey(env) : undefined;
+  return { databaseUrl, modelKey: modelKey({ OPENAI_API_KEY: key }), ...(s3 ? { s3 } : {}), ...(azure ? { azure } : {}) };
+}
+
+/**
+ * The Azure Shared Key from SESSION_ANALYSIS_AZURE_ACCOUNT_KEY_FILE only (the plaintext variable refuses):
+ * strict padded base64 of at least 32 bytes. Returned behind a closure.
+ */
+export function runnerAzureKey(env: NodeJS.ProcessEnv): { accountKey: () => string } {
+  return azureAccountKey(env, refuse);
 }
 
 /** Static S3 keys (MinIO, or any S3-compatible store), each from exactly one of `<name>` or `<name>_FILE`. */
@@ -265,6 +338,7 @@ export function runnerStaticKeys(env: NodeJS.ProcessEnv): AwsCredentials {
  * role, or the static keys runnerSecrets read (a rotation needs a rollout, as for the model key).
  */
 export function runnerCredentials(env: NodeJS.ProcessEnv, mode: RunnerCredentialMode, fetcher: typeof fetch = fetch, staticKeys?: AwsCredentials): () => Promise<AwsCredentials> {
+  if (mode === "sharedKey") refuse("credentials_mode_invalid");
   if (mode === "static") {
     if (!staticKeys) refuse("credentials_missing");
     return async () => staticKeys!;
@@ -287,6 +361,10 @@ export interface RunnerPorts {
   fetcher?: typeof fetch;
   /** The startup versioning check's reader (bucket-versioning.ts readBucketVersioning). */
   versioning?: (check: BucketVersioningCheck) => Promise<BucketVersioningVerdict>;
+  /** LOCKER_PROVIDER=azure: the store, the sweeper's eraser and the startup probe (blob-versioning.ts). */
+  azureStore?: (config: AzureBlobConfig) => ObjectStore;
+  azureEraserFactory?: (config: AzureBlobEraserConfig) => PagedEraser;
+  blobVersioning?: (check: BlobVersioningCheck) => Promise<BlobVersioningVerdict>;
 }
 
 /**
@@ -329,6 +407,88 @@ export async function assertRunnerBucketVersioned(cfg: Pick<AnalysisRunnerConfig
   if (verdict === "not_versioned") refuse("bucket_not_versioned");
   if (verdict === "redirect") refuse("bucket_versioning_redirect");
   if (verdict !== "Enabled") refuse("bucket_versioning_unverified");
+}
+
+/**
+ * LOCKER_PROVIDER=azure's one resolved target: the store, the sweeper's eraser and the startup probe are all
+ * built from it. The key stays behind the closure (a JSON or log of the target carries no key).
+ */
+export interface RunnerAzureTarget {
+  readonly provider: "azure";
+  readonly account: string;
+  readonly container: string;
+  readonly endpoint?: string;
+  readonly accountKey: () => string;
+}
+
+export function runnerAzureTarget(cfg: AnalysisRunnerConfig, secrets: Pick<RunnerSecrets, "azure">): RunnerAzureTarget {
+  if (!cfg.azure || !secrets.azure) return refuse("azure_account_key_missing");
+  const { account, container, endpoint } = cfg.azure;
+  return Object.freeze({ provider: "azure" as const, account, container, ...(endpoint ? { endpoint } : {}), accountKey: secrets.azure.accountKey });
+}
+
+const transient = (code: string) => Object.assign(new Error(code), { code });
+
+/**
+ * LOCKER_PROVIDER=azure, before the pool, the store or anything listens: the data-plane versioning probe
+ * (blob-versioning.ts) under <PIPELINE_KEY_PREFIX>/.runner-probe/session-analysis/. Refusals (exit 2):
+ * blob_not_versioned, blob_versioning_unverified, blob_versioning_redirect, blob_soft_delete_retained,
+ * blob_permanent_delete_forbidden, blob_auth_refused, blob_container_missing. Only a transient failure
+ * (5xx, network, timeout) throws blob_versioning_unavailable (exit 1).
+ */
+export async function assertRunnerBlobVersioned(cfg: Pick<AnalysisRunnerConfig, "keyPrefix">, target: RunnerAzureTarget, ports: RunnerPorts = {}): Promise<void> {
+  let verdict: BlobVersioningVerdict;
+  try {
+    verdict = await (ports.blobVersioning ?? probeBlobVersioning)({
+      account: target.account, container: target.container, ...(target.endpoint ? { endpoint: target.endpoint } : {}),
+      accountKey: target.accountKey, prefix: runnerProbePrefix(cfg.keyPrefix),
+      ...(ports.fetcher ? { fetch: ports.fetcher } : {}),
+      ...(ports.azureEraserFactory ? { eraserFactory: ports.azureEraserFactory } : {}),
+    });
+  } catch (error) {
+    // Only the probe's own transient code retries (exit 1); any other failure cannot be fixed by a restart.
+    if ((error as { code?: string })?.code === "blob_versioning_unavailable") throw transient("blob_versioning_unavailable");
+    return refuse("blob_versioning_unverified");
+  }
+  if (verdict === "Enabled") return;
+  if (verdict === "not_versioned") refuse("blob_not_versioned");
+  if (verdict === "redirect") refuse("blob_versioning_redirect");
+  if (verdict === "soft_delete_retained") refuse("blob_soft_delete_retained");
+  if (verdict === "permanent_delete_forbidden") refuse("blob_permanent_delete_forbidden");
+  if (verdict === "auth_refused") refuse("blob_auth_refused");
+  if (verdict === "container_missing") refuse("blob_container_missing");
+  refuse("blob_versioning_unverified");
+}
+
+/** LOCKER_PROVIDER=azure's analysisTick deps: the same builder over the Azure store and the strict Azure eraser. */
+export function runnerAzureAnalysisDeps(env: NodeJS.ProcessEnv, cfg: AnalysisRunnerConfig, secrets: RunnerSecrets, ports: RunnerPorts = {},
+  target: RunnerAzureTarget = runnerAzureTarget(cfg, secrets)): { deps: AnalysisTickDeps; db: HoopDb; target: RunnerAzureTarget } {
+  const db = (ports.pool ?? ((url, max) => supabasePool(url, max, postgresTlsOptions(env))))(secrets.databaseUrl, cfg.poolMax);
+  const { account, container } = target;
+  const endpoint = target.endpoint ? { endpoint: target.endpoint } : {};
+  const store = (ports.azureStore ?? ((c: AzureBlobConfig) => createAzureBlobStore(c) as unknown as ObjectStore))({
+    account, container, ...endpoint, auth: { kind: "sharedKey", accountKey: target.accountKey() },
+    // Shared Key signed requests never follow a redirect (the eraser and the probe enforce the same).
+    fetch: azureNoRedirectFetch(ports.fetcher),
+    // The exact version a result put created (x-ms-version-id): the sweeper keeps exactly that one. Only this
+    // store turns it on; every other Azure store keeps its ETag-only versions.
+    versionIds: true,
+  });
+  const makeEraser = ports.azureEraserFactory ?? createAzureBlobEraser;
+  const deps = analysisTickDeps({
+    db,
+    transact: (work) => transaction(db, work),
+    store,
+    provider: "azure",
+    bucket: container,
+    region: "",
+    keyPrefix: cfg.keyPrefix,
+    readerMaxRuleset: cfg.readerMaxRuleset,
+    modelKey: secrets.modelKey,
+    pagedEraser: () => makeEraser({ account, container, ...endpoint, accountKey: target.accountKey, ...(ports.fetcher ? { fetch: ports.fetcher } : {}) }),
+    env,
+  });
+  return { deps, db, target };
 }
 
 /** The runner's analysisTick deps: the Lambda's builder over this pod's pool and its one resolved S3 target. */
@@ -494,9 +654,16 @@ export async function analysisRunnerService(env: NodeJS.ProcessEnv = process.env
     else if (cfg && secrets) {
       // Before the pool, the store or anything listening: a bucket the sweeper cannot erase by version id
       // is a refusal, and the versioning GET is the only store request made before it.
-      const target = runnerS3Target(env, cfg, secrets, options.ports?.fetcher);
-      await assertRunnerBucketVersioned(cfg, target, options.ports);
-      const built = runnerAnalysisDeps(env, cfg, secrets, options.ports, target);
+      let built: { deps: AnalysisTickDeps; db: HoopDb };
+      if (cfg.azure) {
+        const target = runnerAzureTarget(cfg, secrets);
+        await assertRunnerBlobVersioned(cfg, target, options.ports);
+        built = runnerAzureAnalysisDeps(env, cfg, secrets, options.ports, target);
+      } else {
+        const target = runnerS3Target(env, cfg, secrets, options.ports?.fetcher);
+        await assertRunnerBucketVersioned(cfg, target, options.ports);
+        built = runnerAnalysisDeps(env, cfg, secrets, options.ports, target);
+      }
       db = built.db;
       tick = runnerTick(env, analysisTick({ ...built.deps, stopping }), built.db, secrets.modelKey !== null, now);
     }

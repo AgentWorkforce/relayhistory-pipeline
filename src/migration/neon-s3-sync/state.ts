@@ -24,6 +24,9 @@ export function obligationsFlag(v: string | undefined): boolean {
   return t === "on" || t === "true";
 }
 
+/** A session-prefix lease older than this (a crashed holder) is taken over by `acquireLease`. */
+export const LEASE_TTL_MS = 2 * 60 * 60 * 1000;
+
 export interface ExportedRow {
   org_id: string;
   session_id: string;
@@ -421,7 +424,7 @@ export class SyncState {
    * same time: otherwise the eraser could delete a chunk the exporter has just
    * decided to reuse. A lease older than `ttlMs` (a crashed holder) is taken over.
    */
-  acquireLease(prefix: string, holder: string, ttlMs = 2 * 60 * 60 * 1000, now = Date.now()): boolean {
+  acquireLease(prefix: string, holder: string, ttlMs = LEASE_TTL_MS, now = Date.now()): boolean {
     let ok = false;
     this.#tx(() => {
       const row = this.db.prepare("SELECT holder, at FROM leases WHERE prefix = ?").get(prefix) as
@@ -455,6 +458,16 @@ export class SyncState {
   /** Extend a lease this holder still has; false if it was taken over. */
   renewLease(prefix: string, holder: string, now = Date.now()): boolean {
     return this.#offGuarded(() => Number(this.db.prepare("UPDATE leases SET at = ? WHERE prefix = ? AND holder = ?").run(now, prefix, holder).changes) === 1);
+  }
+
+  /**
+   * Read-only (stale-prefix-only mode): leases held by an eraser other than `holder` that `acquireLease` would still
+   * honour at `now` (younger than `ttlMs`, the same expiry rule).
+   */
+  otherEraserLeases(holder: string, now = Date.now(), ttlMs = LEASE_TTL_MS): number {
+    return Number(
+      (this.db.prepare("SELECT COUNT(*) AS n FROM leases WHERE substr(holder, 1, 7) = 'eraser:' AND holder <> ? AND ? - at < ?").get(holder, now, ttlMs) as { n: number }).n,
+    );
   }
 
   /** Leases of a holder kind other than `current` (a previous run of the same single process). */
@@ -862,6 +875,30 @@ export class SyncState {
     this.#offGuarded(() => this.db
       .prepare("UPDATE erasures SET attempts = attempts + 1, error = ?, next_try = ? + min(3600000, 60000 * (1 << min(attempts, 6))) WHERE key = ?")
       .run(code, at, key));
+  }
+
+  /**
+   * Stale-prefix-only mode (neon-s3-erasure --stale-prefixes-only), read-only: the queued session prefixes the
+   * exporter retired (kind 'prefix' AND reason 'stale_prefix'), with their backoff, oldest first.
+   */
+  staleprefixErasures(): { key: string; kind: "prefix"; org_id: string; reason: "stale_prefix"; enqueued_at: number; next_try: number }[] {
+    return this.db
+      .prepare(
+        `SELECT key, kind, org_id, reason, enqueued_at, next_try FROM erasures
+          WHERE kind = 'prefix' AND reason = 'stale_prefix' ORDER BY enqueued_at, key`,
+      )
+      .all() as unknown as { key: string; kind: "prefix"; org_id: string; reason: "stale_prefix"; enqueued_at: number; next_try: number }[];
+  }
+
+  /** Read-only: every exported group's current keys (and export error) for one org (the stale-prefix guard). */
+  exportedKeysOf(org: string): { session_id: string; keys: string[]; error: string | null }[] {
+    const rows = this.db.prepare("SELECT session_id, keys, error FROM exported WHERE org_id = ?").all(org) as { session_id: string; keys: string; error: string | null }[];
+    return rows.map((r) => ({ session_id: r.session_id, keys: JSON.parse(r.keys) as string[], error: r.error }));
+  }
+
+  /** Read-only: keys an exporter run recorded before writing (not yet folded into `exported`) for one org. */
+  pendingKeysOf(org: string): string[] {
+    return (this.db.prepare("SELECT key FROM pending_keys WHERE org_id = ?").all(org) as { key: string }[]).map((r) => r.key);
   }
 
   erasureBacklog(now = Date.now()): { queued: number; oldestAgeH: number | null; failing: number } {

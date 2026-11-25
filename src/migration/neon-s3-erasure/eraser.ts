@@ -133,8 +133,10 @@ export const ERASE_RUN_MAX_VERSIONS = 10_000;
 export const ERASE_RUN_MAX_PAGES = 100;
 const MAX_CURSOR_RESTARTS = 3;
 
-interface StrictPage { entries: ListedVersion[]; truncated: boolean; nextKey?: string; nextVersion?: string }
-type PageFetcher = (prefix: string, keyMarker?: string, versionMarker?: string) => Promise<StrictPage>;
+/** One strict inventory page; when truncated, nextKey/nextVersion name its last entry. */
+export interface StrictPage { entries: ListedVersion[]; truncated: boolean; nextKey?: string; nextVersion?: string }
+/** One bounded provider listing after (keyMarker[, versionMarker]) under `prefix`. */
+export type PageFetcher = (prefix: string, keyMarker?: string, versionMarker?: string) => Promise<StrictPage>;
 const cmpC = (a: string, b: string) => (a < b ? -1 : a > b ? 1 : 0);
 
 /**
@@ -198,8 +200,13 @@ function cutToKey(page: StrictPage, exact: string | null): StrictPage {
   return at < 0 ? page : { entries: page.entries.slice(0, at), truncated: false };
 }
 
-/** The one traversal both stores share (S3 versions, or an unversioned store's keys). */
-function pagedEraser(bucket: string, fetchPage: PageFetcher, removeExact: (list: ListedVersion[]) => Promise<number>): PagedEraser {
+/**
+ * The one traversal every store shares (S3 versions, Azure Blob versions, or an unversioned
+ * store's keys). Exported so another provider's eraser composes it instead of forking it:
+ * `bucket` is the checkpoint binding label, `fetchPage` one strict page, `removeExact` the
+ * exact-identity deletes of one page's selected entries.
+ */
+export function createPagedEraser(bucket: string, fetchPage: PageFetcher, removeExact: (list: ListedVersion[]) => Promise<number>): PagedEraser {
   return {
     async eraseStep(prefix, opts) {
       if (!prefix.endsWith("/")) throw coded("erasure_prefix_shape", "a prefix ends in /");
@@ -308,6 +315,18 @@ export function isPagedEraser(e: unknown): e is PagedEraser {
   return !!e && typeof (e as PagedEraser).eraseStep === "function" && typeof (e as PagedEraser).verifyErased === "function";
 }
 
+/**
+ * A read-only existence check: true only when the key's CURRENT version exists and is not a delete marker. Used by
+ * the stale-prefix-only mode (job.ts) to prove a live sibling copy before an old prefix is erased.
+ */
+export interface LiveObjectProbe {
+  objectLive(key: string): Promise<boolean>;
+}
+
+export function isLiveObjectProbe(e: unknown): e is LiveObjectProbe {
+  return !!e && typeof (e as LiveObjectProbe).objectLive === "function";
+}
+
 export interface PreservedVersionEraser {
   /** Keep the current non-delete barrier version; permanently remove only older versions. */
   eraseObjectExcept(key: string, preservedVersionId: string): Promise<{ deleted: number; kept: number }>;
@@ -330,11 +349,11 @@ function cut<T extends { lastModified?: number }>(list: T[], before?: Date): { e
   return { erase, kept: list.length - erase.length };
 }
 
-const coded = (code: string, message: string) => Object.assign(new Error(message), { code });
+export const coded = (code: string, message: string) => Object.assign(new Error(message), { code });
 
 // S3 inventory is destructive authority. The lightweight value extractor alone
 // cannot distinguish a complete document from truncated/malformed XML.
-function assertInventoryXml(xml: string): void {
+export function assertInventoryXml(xml: string, root = "ListVersionsResult"): void {
   const stack: string[] = []; let at = 0, roots = 0;
   const tags = /<[^>]*>/g; let token: RegExpExecArray | null;
   while ((token = tags.exec(xml))) {
@@ -346,13 +365,13 @@ function assertInventoryXml(xml: string): void {
     if (close) { if (stack.pop() !== close[1]) throw coded("erasure_inventory", "unbalanced version inventory"); continue; }
     const open = /^<([A-Za-z_][\w:.-]*)(?:\s+[A-Za-z_][\w:.-]*=(?:"[^"<>]*"|'[^'<>]*'))*\s*(\/?)>$/.exec(tag);
     if (!open) throw coded("erasure_inventory", "malformed version inventory");
-    if (!stack.length && (++roots !== 1 || open[1] !== "ListVersionsResult")) throw coded("erasure_inventory", "unknown version inventory");
+    if (!stack.length && (++roots !== 1 || open[1] !== root)) throw coded("erasure_inventory", "unknown version inventory");
     if (!open[2]) stack.push(open[1]!);
   }
   if (stack.length || roots !== 1 || xml.slice(at).trim()) throw coded("erasure_inventory", "incomplete version inventory");
 }
 
-export function createS3Eraser(cfg: S3EraserConfig): Eraser & PreservedVersionEraser & PagedEraser {
+export function createS3Eraser(cfg: S3EraserConfig): Eraser & PreservedVersionEraser & PagedEraser & LiveObjectProbe {
   const doFetch = cfg.fetch ?? ((...a: Parameters<typeof fetch>) => fetch(...a));
   const url = (key = "") => {
     if (cfg.endpoint) {
@@ -461,7 +480,7 @@ export function createS3Eraser(cfg: S3EraserConfig): Eraser & PreservedVersionEr
     return list.length;
   }
 
-  const paged = pagedEraser(cfg.bucket, (prefix, k, v) => fetchPage(prefix, k, v), (list) =>
+  const paged = createPagedEraser(cfg.bucket, (prefix, k, v) => fetchPage(prefix, k, v), (list) =>
     remove(list.map((v) => ({ key: v.key, versionId: v.versionId, latest: v.latest, deleteMarker: v.deleteMarker }))));
   return {
     eraseStep: paged.eraseStep,
@@ -507,6 +526,16 @@ export function createS3Eraser(cfg: S3EraserConfig): Eraser & PreservedVersionEr
       if (!prefix.endsWith("/")) throw coded("erasure_prefix_shape", "a prefix ends in /");
       return [...new Set((await versions(prefix)).map((v) => v.key))];
     },
+    // One strict ListObjectVersions page at the exact key (no GetObject/HeadObject grant needed). The exact key sorts
+    // first under its own prefix and S3 lists its versions newest first, so its IsLatest entry is on the first page.
+    objectLive: async (key) => {
+      if (!key || key.endsWith("/") || key.split("/").some((seg) => seg === "." || seg === ".."))
+        throw coded("erasure_key_shape", "an existence check names one object");
+      const page = await fetchPage(key);
+      checkPage(key, page, undefined, undefined, true);
+      const latest = page.entries.filter((v) => v.key === key && v.latest);
+      return latest.length === 1 && !latest[0]!.deleteMarker;
+    },
   };
 }
 
@@ -518,7 +547,7 @@ export function createS3Eraser(cfg: S3EraserConfig): Eraser & PreservedVersionEr
  * contract, NOT a bounded remote-store implementation and NOT evidence of a production budget
  * (the versioned S3 eraser issues one bounded, key-prefix ListObjectVersions request per page).
  */
-export function storeEraser(store: ObjectStore): Eraser & PagedEraser {
+export function storeEraser(store: ObjectStore): Eraser & PagedEraser & LiveObjectProbe {
   // Unversioned: one "null" version per key, pages of 1000 keys after the key marker.
   const fetchPage: PageFetcher = async (prefix, keyMarker) => {
     const items: { key: string; lastModified?: number }[] = [];
@@ -541,7 +570,7 @@ export function storeEraser(store: ObjectStore): Eraser & PagedEraser {
     const truncated = after.length > 1000;
     return truncated ? { entries, truncated, nextKey: entries[entries.length - 1]!.key, nextVersion: "null" } : { entries, truncated };
   };
-  const paged = pagedEraser("store", fetchPage, async (list) => { for (const v of list) await store.delete(objectKey(v.key)); return list.length; });
+  const paged = createPagedEraser("store", fetchPage, async (list) => { for (const v of list) await store.delete(objectKey(v.key)); return list.length; });
   return {
     eraseStep: paged.eraseStep,
     verifyErased: paged.verifyErased,
@@ -595,6 +624,11 @@ export function storeEraser(store: ObjectStore): Eraser & PagedEraser {
         cursor = page.nextCursor;
       } while (cursor);
       return keys;
+    },
+    async objectLive(key) {
+      if (!key || key.endsWith("/") || key.split("/").some((seg) => seg === "." || seg === ".."))
+        throw coded("erasure_key_shape", "an existence check names one object");
+      return !!(await store.head(objectKey(key)));
     },
   };
 }

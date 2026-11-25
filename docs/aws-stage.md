@@ -1104,6 +1104,45 @@ plans as `update`. Capture again: the contract accepts that `update` as the same
 state snapshot has the resource `updating` with `adopting` set, its detailed block shows no declared property
 changes, and the live diff is clean. Deploy it the same way (a new approval for the new capture).
 
+**Dedicated session-analysis runner.** Default off. Set
+`transcriptStore.sessionAnalysisRunnerRoleArn` only to
+the exact `SESSION_ANALYSIS_RUNNER_ROLE_ARN` compiled into
+`stacks/aws/session-analysis-runner-policy.ts`; another account, role name,
+path, user, wildcard, assumed-role session, empty string or non-string refuses
+before a provider is requested. The role is created in the agentrelay-prod
+account; this stack owns the sessions-prod resource-policy half.
+Set, it may list the bucket (including `GetBucketVersioning`), read canonical
+`96bulls/*/v1/*` objects, and put/delete/list versions only below
+`normalized/session-analysis-v2`. KMS use is via S3 in us-east-1, with the
+runner account and exact object-ARN encryption context. S3 Bucket Keys stay off.
+
+`ListBucket` is deliberately unconditioned, as in the Lambda role: a missing
+manifest must answer 404 rather than 403. This lets the runner enumerate key
+names, including names below reserved dot namespaces, but the explicit S3 and
+KMS denies below prevent it from reading or changing those objects. The
+canonical read wildcard also deliberately covers immutable publication objects
+below `upload-generations/.../v1/`: canonical pointers can name those objects,
+so they are analysis evidence rather than an upload-inbox or ledger authority.
+
+The broad canonical wildcard crosses `/`, so both policies carry an explicit
+runner-principal Deny for every `96bulls/.` reserved namespace: `s3:*` on the
+reserved object ARN and Decrypt/Encrypt/GenerateDataKey on the matching KMS
+object-ARN context. This includes upload/admission inboxes, ledger namespaces,
+and any future dot namespace. Result deletes reuse the existing
+`OnlyTheEraserOrAnalysisWorkerDeletesAnalysisResults` deny: the runner is folded
+into its principal list rather than adding a competing deny Sid.
+
+The plan contract accepts the bucket and key changes only together. Every new
+statement must match `session-analysis-runner-policy.ts` byte for byte; every
+unrelated statement must be unchanged; and an unrelated updated resource may
+show only `no declared property changes`. A one-sided grant, a different role,
+an extra KMS or S3 statement, another declared resource change, or removal while
+the input remains set is refused. Unset, the policies are byte-identical; after
+activation, omitting the input plans a guarded two-policy revocation.
+On first enablement, the result-delete exemption is derived from the live
+eraser/GC principals (excluding the rearm sweeper), then appends the runner; the
+contract never trusts a proposed exemption list as its source of authority.
+
 **Rearm sweeper role.** The rearm sweeper runs as an IAM role created outside the stack. Its bucket and key grants
 were first applied to prod by hand, and the stack owns both policies, so they are declared here like the
 cross-account worker's (docs/cross-account-sessions-worker.md). Set `transcriptStore.rearmSweeperRoleArn:
