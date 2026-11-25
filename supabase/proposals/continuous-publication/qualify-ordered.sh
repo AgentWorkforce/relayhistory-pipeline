@@ -19,5 +19,5 @@ cd "$scratch/tree"
 # New per-test databases are cloned from the fully applied UTF8 image. Use
 # template1 as the admin connection; postgres contains the rollback exercise.
 export SESSION_INGEST_TEST_PG_URL="postgresql://fixture_owner@localhost/template1?host=$scratch&port=5549"
-PUBLICATION_PROOF_TEMPLATE=publication_release_fixture bun test -t 'post-H scoped kernel proposal|062270 private read profile' src/session-ingest/__tests__/publication.postgres.test.ts
+PUBLICATION_PROOF_TEMPLATE=publication_release_fixture bun test -t 'post-H scoped kernel proposal|062270 private read profile|062270 independent synthetic receipt inventory' src/session-ingest/__tests__/publication.postgres.test.ts
 bun test src/session-ingest/__tests__/{publication-fleet.postgres,publication-retry-cas.postgres,publication-fleet-storage-access.postgres,publication-fleet.pglite}.test.ts
