@@ -8,7 +8,8 @@ import { join } from "node:path";
 import { PGlite } from "@electric-sql/pglite";
 import { btree_gin } from "@electric-sql/pglite/contrib/btree_gin";
 import { pg_trgm } from "@electric-sql/pglite/contrib/pg_trgm";
-import { poolTenantRunner, sqlLiveness, sqlOperatorErased } from "../liveness.ts";
+import { poolTenantRunner, sqlLiveness, sqlOperatorErased, sqlOperatorErasedBatch } from "../liveness.ts";
+import { sqlSessionAliases } from "../workspace-synthesis.ts";
 import { createReadApi } from "../app.ts";
 import { SESSION_SOURCES_MAX, sqlSessionSources } from "../session-sources.ts";
 import { SESSION_BOOTSTRAP_FILES } from "../../hoopdb/session-bootstrap-chain.ts";
@@ -252,5 +253,35 @@ describe("GET /v1/sessions/:sessionId/sources with the operator erase fence, as 
     // A fence under the source id hides the codex copy whose physical id is X too.
     await db.query("INSERT INTO sessions.session_erasure_fences (org_id, workspace_id, source, session_id) VALUES ('org-a', 'ws-a', 'codex', 'X')");
     expect((await get(true, "X")).sources).toEqual([]);
+  }, 60_000);
+});
+
+describe("workspace synthesis alias and batched operator fence reads, as the role", () => {
+  test("aliases both directions over live and tombstoned rows, per source and tenant; the batch fence matches the per-key one", async () => {
+    const db = await database();
+    await pointer(db, { session: "P", harness: "claude" });
+    await pointer(db, { session: "P", harness: "claude", machine: "m-2", deleted: true });
+    await db.query("UPDATE sessions.session_index SET canonical_session_id = 'X' WHERE session_id = 'P'");
+    await pointer(db, { session: "X", harness: "codex" });
+    await pointer(db, { session: "P", harness: "claude", ws: "ws-b" });
+    const run = poolTenantRunner(asRole(db));
+    const aliases = sqlSessionAliases(run);
+    const forms = async (source: string, sessionId: string) =>
+      (await aliases("org-a", "ws-a", [{ source, sessionId }])).map((r) => [r.org_id, r.workspace_id, r.harness, r.session_id, r.canonical_session_id]);
+    expect(await forms("claude", "P")).toEqual([["org-a", "ws-a", "claude", "P", "X"]]);
+    expect(await forms("claude", "X")).toEqual([["org-a", "ws-a", "claude", "P", "X"]]);
+    expect(await forms("codex", "X")).toEqual([["org-a", "ws-a", "codex", "X", null]]);
+    expect(await forms("codex", "P")).toEqual([]);
+    expect(await aliases("org-a", "ws-a", [])).toEqual([]);
+    const batch = sqlOperatorErasedBatch(run), single = sqlOperatorErased(run);
+    const keys = [{ source: "claude", sessionId: "P" }, { source: "claude", sessionId: "X" }, { source: "codex", sessionId: "X" }];
+    expect([...await batch("org-a", "ws-a", keys)]).toEqual([]);
+    await db.query("INSERT INTO sessions.session_erasure_fences (org_id, workspace_id, source, session_id) VALUES ('org-a', 'ws-a', 'claude', 'X')");
+    expect([...await batch("org-a", "ws-a", keys)]).toEqual(["claude\u0000X"]);
+    for (const k of keys) expect(await single({ orgId: "org-a", workspaceId: "ws-a", ...k })).toBe(k.source === "claude" && k.sessionId === "X");
+    // Another workspace's fence is invisible; a tenant the transaction is not bound to fails closed.
+    expect([...await batch("org-a", "ws-b", [{ source: "claude", sessionId: "X" }])]).toEqual([]);
+    const unbound = sqlOperatorErasedBatch(async (_o, _w, work) => run("org-a", "ws-a", work));
+    await expect(unbound("org-a", "ws-b", keys)).rejects.toThrow("operator_fence_unavailable");
   }, 60_000);
 });
