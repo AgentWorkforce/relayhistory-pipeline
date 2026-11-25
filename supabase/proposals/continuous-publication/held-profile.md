@@ -1,0 +1,7 @@
+# Held publication migration profile
+
+`held-profile.ts` composes the reviewed SQL in migrator order. Each slot exposes its upstream ledger name, exact up bytes, SHA-256 and guarded down SQL. The down requires the expected checksum and latest upstream ledger entry, obtains the migrator lock and refuses to discard durable state. Run the up in the migrator's transaction. The held sentinel map checks component presence.
+
+The composed artifacts are outside migration discovery. The existing release target and generation stay pinned. Promotion requires the reviewed 062270 capture definition, effective per-major owner/definition pins, a dedicated capture reader and an authoritative independently complete receipt inventory. Confirm any already-applied later upstream step with the migrator owner before adding these earlier slots. Only then promote exact up/down bytes and sentinels into the approved profile, run its complete migration and rollback proofs, and derive the resulting generation from the final bytes.
+
+The scoped worker selects the scoped RPC group on a dedicated connection. Fleet state uses a separate direct database login with no role memberships, bound to one fleet and approved scopes. Recovery selects its own operator group. The native tests provision synthetic roles and stage admission explicitly. Their object-version proof uses the in-memory versioned store, and their PostgreSQL backend uses real connections. Production source capture, provider object-store qualification and real-workspace admission each require independent evidence.
