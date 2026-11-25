@@ -113,7 +113,12 @@ async function recordEvent(tx: SqlExecutor, m: StageMessage, status: PipelineSta
 // §3.1 enqueue
 // ---------------------------------------------------------------------------------------------------------
 
-/** §3.1 over a jsonb array of StageMessages: a newer epoch replaces the message, resets the budget and reopens. */
+/**
+ * §3.1 over a jsonb array of StageMessages: only a STRICTLY newer epoch replaces the message (and with it the row's
+ * trace_id, so the row's trace is always its message's), resets the budget, clears dlq and reopens an unleased row
+ * now. An equal or older epoch (a catch-up re-visit, a replay) changes nothing: in particular it never pulls an
+ * unleased row's visible_at forward, so a retry backoff holds.
+ */
 const ENQUEUE_SQL = `
 INSERT INTO sessions.pipeline_jobs (stage, work_key, trace_id, org_id, workspace_id, session_id, machine_id, message, visible_at)
 SELECT m->>'stage', m->>'workKey', (m->'ctx'->>'traceId')::uuid, m->'ctx'->>'orgId', m->'ctx'->>'workspaceId',
@@ -123,14 +128,19 @@ ON CONFLICT (work_key) WHERE stage = 'search-index'
 DO UPDATE SET
   message = CASE WHEN (EXCLUDED.message->'payload'->>'epoch')::bigint > (pipeline_jobs.message->'payload'->>'epoch')::bigint
                  THEN EXCLUDED.message ELSE pipeline_jobs.message END,
+  -- The trace travels with the message: replaced only when the message is.
+  trace_id = CASE WHEN (EXCLUDED.message->'payload'->>'epoch')::bigint > (pipeline_jobs.message->'payload'->>'epoch')::bigint
+                  THEN EXCLUDED.trace_id ELSE pipeline_jobs.trace_id END,
   -- A NEW epoch is new work and gets its own budget. The active lease is kept; settlement compares epochs.
   attempts = CASE WHEN (EXCLUDED.message->'payload'->>'epoch')::bigint > (pipeline_jobs.message->'payload'->>'epoch')::bigint
                   THEN 0 ELSE pipeline_jobs.attempts END,
   dlq = CASE WHEN (EXCLUDED.message->'payload'->>'epoch')::bigint > (pipeline_jobs.message->'payload'->>'epoch')::bigint
              THEN false ELSE pipeline_jobs.dlq END,
-  -- An unleased row becomes visible now. A leased row keeps its lease; settlement reopens it if the wanted
-  -- epoch moved on during the pass.
-  visible_at = CASE WHEN pipeline_jobs.lease_id IS NULL THEN least(pipeline_jobs.visible_at, now()) ELSE pipeline_jobs.visible_at END
+  -- Only a strictly newer epoch makes an unleased row visible now. A leased row keeps its lease (settlement
+  -- reopens it if the wanted epoch moved on during the pass); an equal or older epoch keeps any backoff.
+  visible_at = CASE WHEN (EXCLUDED.message->'payload'->>'epoch')::bigint > (pipeline_jobs.message->'payload'->>'epoch')::bigint
+                         AND pipeline_jobs.lease_id IS NULL
+                    THEN least(pipeline_jobs.visible_at, now()) ELSE pipeline_jobs.visible_at END
 RETURNING id::text AS id`;
 
 /** §3.1: coalesce one wake into its scope's single row (inserted, or merged by max epoch). */
@@ -160,7 +170,7 @@ export interface ClaimedSearchJob {
   claimedMessage: SearchWakeMessage;
 }
 
-/** §3.2: the generic claim with stage = 'search-index', a lease per row and a counted attempt. */
+/** §3.2: the generic claim with stage = 'search-index', a lease per row and a counted attempt; never a dlq row. */
 export async function claimSearchJobs(sql: SqlExecutor, n: number, opts: { leaseSeconds?: number } = {}): Promise<ClaimedSearchJob[]> {
   const limit = Math.max(0, Math.floor(n));
   if (!limit) return [];
@@ -168,7 +178,7 @@ export async function claimSearchJobs(sql: SqlExecutor, n: number, opts: { lease
   const { rows } = await sql.query<{ id: string; lease: string; attempts: number; message: SearchWakeMessage }>(
     `WITH next AS (
        SELECT id FROM sessions.pipeline_jobs
-        WHERE stage = 'search-index' AND visible_at <= now()
+        WHERE stage = 'search-index' AND visible_at <= now() AND NOT dlq
         ORDER BY visible_at, id
         LIMIT $1
         FOR UPDATE SKIP LOCKED
