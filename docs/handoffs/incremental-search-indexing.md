@@ -1,4 +1,4 @@
-# Incremental search indexing: committed wake and revision-aware passes (design M1, rev 4)
+# Incremental search indexing: committed wake and revision-aware passes (design M1, rev 5)
 
 Status: design for review. Code and plans only. No migration, deploy, flag, schedule or config change follows from
 this document without a separate production go per step (§9). Rev 2 closed the nine findings of the M1 review. Rev 3 closes the seven rev-2 findings (B1-B7), marked inline.
@@ -26,14 +26,14 @@ time):
   searchable ≤ 15 min p90. They are reported separately until M3 makes their updates incremental.
 - **Not in the SLO:** sessions whose acceptance is unresolved (held by contract) and sessions under an erasure fence.
   Both are counted and alerted, never treated as searchable.
-- **Measurement [B1]:** time zero is `ingest_publication_attempts.published_at` for the attempt that made the
-  committed head.
+- **Measurement [B1]:** time zero is the publish clock (`payload.clock`, §2): `ingest_publication_attempts.published_at`
+  of the latest current live update of the scope.
   - That value is set by `clock_timestamp()` in the publish transaction's final UPDATE (migration
     20261105059000:192). It is a lower bound on the publish commit, within that transaction's remaining
     statements: milliseconds.
   - The authority transaction does NOT supply the clock (its `now()` is a different, later transaction's start).
-  - At enqueue (§2), the authority transaction reads `published_at` for the head's current attempt and copies it into
-    the job payload as `published_at`.
+  - At enqueue (§2), the authority transaction reads `published_at` for the head's current attempt and carries it as
+    `payload.clock = {source: 'publish', at}`.
   - The pass computes `commit_to_searchable_ms = clock_timestamp() at its search-state write − published_at`.
   - So the object-landed queue delay, the Lambda batching and every retry are inside the measurement.
   - Test R5 asserts that a job delayed in the queue reports a duration that includes the delay.
@@ -115,8 +115,19 @@ replay tooling works unchanged:
 - `epoch` is THE authority token for search (§4.4): one counter, the directory epoch, bumped by trigger on every
   `session_index` change, including tombstones.
 - **Clock source [rev 4]:** `payload.clock = {source, at}`. It is never null and never silently missing.
-  - `publish`: `ingest_publication_attempts.published_at` of the head's current attempt. Used by the managed enqueue,
-    and by managed catch-up through the same lookup.
+  - `publish`: for the canonical scope, the latest current live update:
+    ```sql
+    SELECT max(a.published_at)
+      FROM sessions.ingest_publication_heads h
+      JOIN sessions.ingest_publication_images i ON i.manifest_key = h.current_key
+      JOIN sessions.ingest_publication_attempts a ON a.attempt_token = i.attempt_token AND a.state = 'published'
+      JOIN sessions.session_index p ON p.manifest_key = h.current_key AND p.deleted_at IS NULL
+     WHERE h.state = 'live' AND h.org_id = $org AND h.workspace_id = $ws AND h.physical_source = $harness
+       AND coalesce(p.canonical_session_id, p.session_id) = $canonical;
+    ```
+    Several live sibling heads (machines) take the max: the clock of the newest committed update the pass makes
+    searchable. Used by the managed enqueue (one head; the same query) and by managed catch-up. Test R5e: two
+    current heads give the later one's `published_at`.
   - `pointer`: max(`session_index.indexed_at`) of the scope's live rows. Used by non-managed catch-up, which has no
     publication attempt. That is the pointer write time, a later origin than the upload commit.
   - `commit_to_searchable_ms` is emitted only for `source = publish`, and is labelled by source. `pointer` jobs report
@@ -195,12 +206,17 @@ lose a follow-up wake that arrived during the pass. Each statement keys on `(id,
   transaction bound to the lease, so exhaustion can never discard a newer wake:
   ```sql
   -- a) Park the CLAIMED message only (the message as it was at claim time, $claimed_msg; epoch = claimed_epoch).
-  -- Same statement shape as postgres-dead-letters.ts quarantine (state 'dead'; dead_count / last_dead_at upsert on
-  -- the letter id). The table has no error-code column: 'retries_exhausted' goes to the log line and the metric only.
-  INSERT INTO sessions.pipeline_dead_letters (id, stage, trace_id, workspace_id, message, state, first_dead_at, last_dead_at, dead_count)
-    SELECT $letter_id, 'search-index', trace_id, workspace_id, $claimed_msg, 'dead', now(), now(), 1
-      FROM sessions.pipeline_jobs WHERE id = $id AND lease_id = $lease      -- 0 rows if the lease was lost: abort
-  ON CONFLICT (id) DO UPDATE SET state = 'dead', last_dead_at = now(), dead_count = pipeline_dead_letters.dead_count + 1;
+  -- Exactly the postgres-dead-letters.ts quarantine statement [rev 5]. The letter id is deterministic,
+  -- '<stage>:<workKey>' (the table's own convention), so ONE letter per scope. Re-death refreshes the body and
+  -- un-resolves the letter.
+  INSERT INTO sessions.pipeline_dead_letters AS d
+         (id, stage, trace_id, org_id, workspace_id, session_id, machine_id, message, first_dead_at, last_dead_at)
+  SELECT 'search-index:' || j.work_key, 'search-index', j.trace_id, j.org_id, j.workspace_id, j.session_id, j.machine_id,
+         $claimed_msg::jsonb, now(), now()
+    FROM sessions.pipeline_jobs j WHERE j.id = $id AND j.lease_id = $lease   -- 0 rows if the lease was lost: abort
+  ON CONFLICT (id) DO UPDATE SET message = EXCLUDED.message, state = 'dead', last_dead_at = EXCLUDED.last_dead_at,
+         dead_count = d.dead_count + 1, resolved_at = NULL,
+         session_id = COALESCE(EXCLUDED.session_id, d.session_id), machine_id = COALESCE(EXCLUDED.machine_id, d.machine_id);
   -- b) No newer wake: delete the row.
   DELETE FROM sessions.pipeline_jobs WHERE id = $id AND lease_id = $lease
     AND (message->'payload'->>'epoch')::bigint <= $claimed_epoch;
@@ -213,24 +229,40 @@ lose a follow-up wake that arrived during the pass. Each statement keys on `(id,
   - Test R4b: N exhausts after N+1 merged into the leased row. N lands in dead letters; the row survives with
     epoch N+1 and attempts 0.
 
-### 3.3b Dead-letter replay [rev 4]
+### 3.3b Dead-letter replay [rev 4, rev 5]
 
-Replay of a `search-index` dead letter is stage-aware. It never uses the generic replay send, because that would hit
-the unique scope row. One transaction:
+The letter id is `'search-index:' || work_key`: one letter per scope, the same key as the job row. Resolution is
+therefore keyed by SCOPE, not by a replay id carried in the message. No handle can be lost when a newer wake
+replaces the row's message (the rev-4 race: replay N, wake N+1, done N reopens, N+1 completes without the replay id).
 
-1. mark the letter `replaying` with a new replay id (the existing `postgres-dead-letters.ts` states);
-2. run the §3.1 upsert with the letter's message, plus `payload.replay_id`;
-3. then one of:
-   - **superseded:** the row already carries an epoch at or above the letter's (the upsert kept the row's message).
-     Mark the letter `resolved` (`resolved_at = now()`) in the SAME transaction. The table has no reason column, so
-     `superseded` is recorded in the log line, plus a new nullable `resolution text` column added by the M2
-     migration. Newer work covers it, so it can never
-     stay stuck in `replaying`;
-   - **merged:** the row now carries the letter's epoch and replay id. The §3.3 `done` settlement resolves the letter
-     by `last_replay_id = payload.replay_id`, in the same transaction as its DELETE. `exhausted` re-quarantines it
-     (state back to `dead`, the table's own state name: `dead` / `replaying` / `resolved`).
+Replay, in ONE transaction:
 
-Tests: R8a (superseded resolves at once), R8b (merged resolves on done).
+1. `UPDATE pipeline_dead_letters SET state = 'replaying', replay_count = replay_count + 1, last_replay_id = $r,
+   last_replay_at = now() WHERE id = $letter AND state = 'dead'`;
+2. the §3.1 upsert with the letter's message. It coalesces with any newer row; epoch advance resets attempts.
+
+Completion: the §3.3 `done` DELETE, in the same transaction:
+
+```sql
+UPDATE sessions.pipeline_dead_letters SET state = 'resolved', resolved_at = now()
+ WHERE id = 'search-index:' || $work_key AND state = 'replaying'
+   AND (message->'payload'->>'epoch')::bigint <= $claimed_epoch;   -- the completed epoch covers the letter's
+```
+
+- **Superseded** (the row already carries a newer epoch when the replay runs): the letter resolves when that newer
+  epoch completes. The predicate holds, because the completed epoch is at or above the letter's.
+- **Exhausted again:** the quarantine statement (§3.3) refreshes the same letter to `dead`, so it is never left
+  `replaying`.
+- The M2 migration adds a nullable `resolution text` (`completed` / `superseded`) for operators.
+
+Tests:
+
+- R8a: superseded resolves on the newer completion;
+- R8b: merged resolves on done;
+- R8c: replay N, claim N, wake N+1, done N reopens, N+1 done, letter resolved (the rev-4 race);
+- R8d: re-death after replay refreshes the message and clears `resolved_at`.
+
+All run through the REAL M2 entry points (§10).
 
 ### 3.4 Races
 
@@ -303,8 +335,8 @@ Tests R3a-R3d.
 - On `relayhistory_acceptance_missing`, the contended records are not published. The state stays incomplete and
   `ready` stays false.
 - The job is retried with the registry backoff (30 s · 2^n, capped at 900 s), max attempts 12 (about 2.5 h).
-- At exhaustion, the queue's existing DLQ path quarantines it into `pipeline_dead_letters` with `retries_exhausted`
-  (`dlq.ts:352-371`).
+- At exhaustion, the STAGE-SPECIFIC §3.3 exhausted settlement quarantines the claimed snapshot (never the generic
+  `dlq.ts` path, which this stage never reaches).
 - Exhaustion NEVER marks the scope complete or ready. A metric and an alert count held scopes. Test R4.
 
 ### 4.6 Work
@@ -426,15 +458,23 @@ Two flags:
 
 1. writers off;
 2. consumer off;
-3. park, in ONE fenced transaction:
+3. park, in ONE fenced transaction [rev 5]. It runs only with the consumer flag off, and the table lock fences
+   any straggler:
    ```sql
    LOCK TABLE sessions.pipeline_jobs IN SHARE ROW EXCLUSIVE MODE;
-   INSERT INTO sessions.pipeline_dead_letters (stage, reason, message, …)
-     SELECT 'search-index', 'rollback_park', message, … FROM sessions.pipeline_jobs WHERE stage = 'search-index';
+   INSERT INTO sessions.pipeline_dead_letters AS d
+          (id, stage, trace_id, org_id, workspace_id, session_id, machine_id, message, first_dead_at, last_dead_at)
+   SELECT 'search-index:' || j.work_key, 'search-index', j.trace_id, j.org_id, j.workspace_id, j.session_id, j.machine_id,
+          j.message, now(), now()
+     FROM sessions.pipeline_jobs j WHERE j.stage = 'search-index'
+   ON CONFLICT (id) DO UPDATE SET message = EXCLUDED.message, state = 'dead', last_dead_at = EXCLUDED.last_dead_at,
+          dead_count = d.dead_count + 1, resolved_at = NULL;
    DELETE FROM sessions.pipeline_jobs WHERE stage = 'search-index';
-   INSERT INTO sessions.search_rollback_audit (at, operator, parked) VALUES (now(), $operator, <count>);
    ```
-   The parked messages stay replayable from dead letters once the consumer is back;
+   - The parked count is the INSERT's row count. It is logged with the operator and the time; there is no audit
+     table.
+   - The parked messages are replayable once the consumer is back.
+   - Test R9: park, then the down-migration precondition holds (0 rows).
 4. roll the code back;
 5. down migration.
 
@@ -472,7 +512,7 @@ Stop lines for 4 and 5 are the A+C set, plus: `search-index` oldest open job ove
 | R2c | the cursor wraps and `lap` increments | absent |
 | R3a | a pass on a never-committed scope acks `not_committed` and erases nothing | today it erases on empty keys |
 | R3b | an old-version delete with a newer live revision: indexes, no erase | absent |
-| R3c | a recreate race (fence, then a newer live generation): live wins | absent |
+| R3c | a recreate race (every row tombstoned, then a newer live generation; a fenced scope cannot be recreated): live wins | absent |
 | R3d | a stale queued epoch after a newer one is indexed: `unchanged` | absent |
 | R4 | acceptance missing past max attempts: quarantined, scope not ready, never in a search result | absent |
 | R4b | N exhausts after a wake N+1 merged into the leased row: only N is parked; the row survives with N+1 and a fresh budget | absent |
@@ -480,11 +520,23 @@ Stop lines for 4 and 5 are the A+C set, plus: `search-index` oldest open job ove
 | R7 | M3 milestone (not in the M1b file): a chunk with the same seq and a changed content sha256 forces a full pass. It lands as a red fixture at the start of M3, with the compaction and CAS cases | deferred to M3 |
 | R1f | wake N+1 during N's exhausting attempt: no N+1 dead letter, the row survives with N+1 | absent |
 | R6g | the generic runWorker / postgresStageConsumer is not registered for `search-index` | absent |
-| R8a/b | stage-aware replay: superseded resolves at once; merged resolves on done | absent |
+| R8a-d | stage-aware replay: superseded resolves on the newer completion; merged on done; the replay/new-wake race; re-death refreshes | absent |
+| R5e | two current live heads: the clock is the later published_at | absent |
+| R9 | park, then the down-migration precondition | absent |
 | R5c/d | catch-up clock: publish for managed, pointer for non-managed; no null clock | absent |
 | R6 | every closed stage list has the same set, including `search-index` | absent |
 
-These tests land on a separate head after this doc, with exact commands and outputs.
+**Production-path coupling [rev 5].** Every race and catch-up test calls the REAL M2 entry points:
+
+- `enqueueSearchWake`;
+- `settleSearchJob(done | retry | exhausted)`;
+- `replaySearchDeadLetter`;
+- `catchUpTick`;
+- `runSearchJob`.
+
+Each is imported from `src/session-pipeline/search-jobs.ts`. None runs the design's SQL in-test, so a migration
+alone can never turn them green. One wiring test asserts that the Lambda consumer's search-job loop calls
+`settleSearchJob`, and that the stage is absent from the generic runWorker registrations.
 
 ## 11. M3: true incremental apply [F9, B7]
 
