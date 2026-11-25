@@ -730,6 +730,10 @@ content `sha256` (`packages/object-store/src/manifest.ts:53-62`).
 - **Watermark:** `sessions.search_batch_watermark` (scope, canonical, manifest_key, last_seq, chain_digest), where
   `chain_digest_n = sha256(chain_digest_{n-1} ‖ seq_n ‖ epoch_n ‖ start_offset_n ‖ sha256_n)`.
   Content is bound, not just ids.
+- **Exact chain encoding:** `chain_digest_(-1)` is 32 zero bytes. Every integer is an unsigned 64-bit big-endian
+  value and `sha256_n` is its 32 decoded bytes, so each link hashes exactly 88 bytes. The storage-independent
+  planner is `src/session-pipeline/search-incremental.ts`; malformed or incomplete evidence always selects a full
+  pass, never an incremental one.
 - **Append-only proof:** recompute the chain over the new manifest's chunks with `seq <= last_seq` and compare it with
   the stored digest. If they are equal, those chunks are byte-identical in content and order, and only chunks with
   `seq > last_seq` are read and upserted. If they differ, the chunks were mutated, compacted, rewritten or
