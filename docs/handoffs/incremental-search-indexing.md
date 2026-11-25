@@ -128,6 +128,12 @@ replay tooling works unchanged:
     Several live sibling heads (machines) take the max: the clock of the newest committed update the pass makes
     searchable. Used by the managed enqueue (one head; the same query) and by managed catch-up. Test R5e: two
     current heads give the later one's `published_at`.
+    - The aggregate excludes deleted or retired heads and other-scope heads.
+    - It never replaces the triggering head's own authority check: a sibling's valid timestamp cannot validate an
+      unproven trigger (§2's `session_publication_lock` still gates the enqueue).
+    - If the aggregate is NULL for a managed scope, FAIL CLOSED: no job, plus an error metric. The `pointer` clock is
+      only for non-managed catch-up.
+    - R5e covers the older head triggering, plus the exclusions.
   - `pointer`: max(`session_index.indexed_at`) of the scope's live rows. Used by non-managed catch-up, which has no
     publication attempt. That is the pointer write time, a later origin than the upload commit.
   - `commit_to_searchable_ms` is emitted only for `source = publish`, and is labelled by source. `pointer` jobs report
