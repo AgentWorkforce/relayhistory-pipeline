@@ -544,10 +544,12 @@ GET /v1/session-intel/synthesis?workspace=<id>&since=<ISO>&until=<ISO>&stage=2
 - **Invalid.** A stored v2 that fails the strict reader is `500 internal` with the reader's code as the reason
   (`synthesis_stage2_digest`, `synthesis_stage2_stage1_mismatch`, `synthesis_stage2_invalid`); another org's
   envelope is the `500` tenant refusal. Nothing of it is served.
-- **Erasure.** After the read, every session in `considered`, `related`, the Stage 2 kept sessions and every session
-  an initiative or theme names (deduplicated) is checked through `Liveness.erased` in batches of 500; any erased is
+- **Erasure.** After the read, every session in `considered`, `related`, the Stage 2 kept sessions, every session
+  an initiative or theme names or cites as evidence, and every session the Stage 1 part names (deduplicated) is
+  checked, under each of its aliases, through `Liveness.erased` and, where bound, the operator erase fence, exactly as
+  for Stage 1 (see the read route's operator erase fence and aliases above): batches of 500; any erased or fenced is
   `404 not_found`, reason `synthesis_invalidated`. The kept sessions are checked directly, not assumed covered by
-  `considered`. A failing check is `503`.
+  `considered`. A failing check, the fence unavailable, or the fence bound without the alias reader is `503`.
 - **Body.** The `workspace-synthesis/2` document only (no org id, no provenance lists, no digests).
 - **Older envelopes.** A v2 envelope written before the `analyzed` field (by the Stage 2 code at 923778b5) is not
   readable by this reader (`synthesis_stage2_invalid`, envelope keys); such a window needs a prompt-version bump or a

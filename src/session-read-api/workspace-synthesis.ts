@@ -210,15 +210,6 @@ export async function readWorkspaceSynthesis(input: SynthesisChecks & {
   return { status: "ok", synthesis: artifact.synthesis };
 }
 
-/** How many of `refs` are erased; stops at the first batch with any (the answer is then only "some"). */
-async function erasedCount(input: { liveness: Liveness; orgId: string; workspaceId: string }, refs: readonly SessionRef[]): Promise<number> {
-  for (let i = 0; i < refs.length; i += SYNTHESIS_ERASE_CHECK_BATCH) {
-    const erased = await input.liveness.erased(input.orgId, input.workspaceId, refs.slice(i, i + SYNTHESIS_ERASE_CHECK_BATCH));
-    if (erased.size > 0) return erased.size;
-  }
-  return 0;
-}
-
 /** Stored-v2 failures served as a typed 500: the strict reader's codes (the cross-tenant one is a TenantMismatchError). */
 export const STAGE2_INVALID_CODES = ["synthesis_stage2_invalid", "synthesis_stage2_digest", "synthesis_stage2_stage1_mismatch"] as const;
 
@@ -229,15 +220,15 @@ export type SynthesisV2Read =
   | { status: "invalid"; code: (typeof STAGE2_INVALID_CODES)[number] };
 
 /**
- * The v2 read: the authoritative Stage 1 artifact's stored v2 through the strict reader, then the erase check over
- * `considered`, `related` and the Stage 2 kept sessions (every session an initiative or theme names is a kept one,
- * the strict reader's rule; the kept ones are checked here directly as well, never assumed covered).
+ * The v2 read: the authoritative Stage 1 artifact's stored v2 through the strict reader, then the erase and operator
+ * fence checks (invalidatedCount: every alias form, batched, fail closed) over the v2 envelope's full provenance:
+ * `considered`, `related`, the Stage 2 kept sessions, every session an initiative or theme names and its evidence, and
+ * every session the Stage 1 part names (drilldowns, issues, issue evidence). The strict reader already requires the
+ * initiative and theme sessions to be kept ones and the Stage 1 part to be covered by `considered`; each is checked
+ * here directly as well, never assumed covered.
  */
-export async function readWorkspaceSynthesisV2(input: {
+export async function readWorkspaceSynthesisV2(input: SynthesisChecks & {
   source: WorkspaceSynthesisSource;
-  liveness: Liveness;
-  orgId: string;
-  workspaceId: string;
   window: { since: string; until: string };
 }): Promise<SynthesisV2Read> {
   if (!input.source.latestStage2) return { status: "not_found", reason: "stage2_not_found" };
@@ -262,7 +253,9 @@ export async function readWorkspaceSynthesisV2(input: {
   const add = (r: SessionRef) => refs.set(`${r.source}\u0000${r.sessionId}`, { source: r.source, sessionId: r.sessionId });
   [...v2.considered, ...v2.related, ...stage2.sessions].forEach(add);
   for (const item of [...stage2.initiatives, ...stage2.themes]) { item.sessions.forEach(add); item.evidence.forEach(add); }
-  const erased = await erasedCount(input, [...refs.values()]);
+  for (const c of v2.synthesis.categories) c.sessions.forEach(add);
+  for (const i of v2.synthesis.issues) { i.sessions.forEach(add); i.evidence.forEach(add); }
+  const erased = await invalidatedCount(input, [...refs.values()]);
   if (erased > 0) return { status: "invalidated", erased };
   return { status: "ok", synthesis: v2.synthesis };
 }

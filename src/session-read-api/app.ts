@@ -2489,18 +2489,6 @@ export function createReadApi(deps: ReadApiDeps) {
     }
   });
 
-  /**
-   * The workspace synthesis (docs/session-intel-workspace-synthesis.md): the newest complete stored artifact for
-   * the exact workspace and window. Auth and scope as the workspace view: the workspace attested from the token,
-   * the `coordination` canary; `since` and `until` exactly once, no other parameter. An artifact that cites an
-   * erased session is not served (404, reason synthesis_invalidated); the erase check runs after the read.
-   * `stage=2` (exactly once) serves the stored workspace-synthesis/2 document instead, only with
-   * `stage2Enabled` (else 501 workspace_synthesis_v2_disabled): no v2 is 404 `stage2_not_found`, a stored v2 that does
-   * not verify is a 500 with the reader's code as the reason, and the erase check also covers the kept sessions.
-   * Where the operator erase fence is bound (operatorErased / operatorErasedBatch), every recorded session, under
-   * each of its aliases, is checked against it too, after the read: fenced = the same 404; the fence (or the alias
-   * reader it needs) unavailable or failing = 503, nothing served.
-   */
   /** The synthesis reads' erase and fence checks for this tenant (workspace-synthesis.ts SynthesisChecks). */
   function synthesisChecks(identity: VerifiedIdentity, aliases: SessionAliases | undefined): SynthesisChecks {
     const operatorFence = deps.operatorErasedBatch ?? (deps.operatorErased ? perKeyOperatorFence(deps.operatorErased) : undefined);
@@ -2511,6 +2499,19 @@ export function createReadApi(deps: ReadApiDeps) {
     };
   }
 
+  /**
+   * The workspace synthesis (docs/session-intel-workspace-synthesis.md): the newest complete stored artifact for
+   * the exact workspace and window. Auth and scope as the workspace view: the workspace attested from the token,
+   * the `coordination` canary; `since` and `until` exactly once, no other parameter. An artifact that cites an
+   * erased session is not served (404, reason synthesis_invalidated); the erase check runs after the read.
+   * `stage=2` (exactly once) serves the stored workspace-synthesis/2 document instead, only with
+   * `stage2Enabled` (else 501 workspace_synthesis_v2_disabled): no v2 is 404 `stage2_not_found`, a stored v2 that does
+   * not verify is a 500 with the reader's code as the reason, and the erase check also covers the kept sessions and
+   * every session an initiative or theme names or cites. Where the operator erase fence is bound (operatorErased /
+   * operatorErasedBatch), every recorded session of either stage, under each of its aliases, is checked against it
+   * too, after the read: fenced = the same 404; the fence (or the alias reader it needs) unavailable or failing = 503,
+   * nothing served.
+   */
   app.get("/v1/session-intel/synthesis", async (c) => {
     const synthesis = deps.workspaceSynthesis;
     if (synthesis?.enabled !== true) return fail(c, unsupported("workspace_synthesis_disabled"));
@@ -2530,7 +2531,7 @@ export function createReadApi(deps: ReadApiDeps) {
       if (typeof window === "string") throw bad(window);
       if (!synthesis.source) throw unsupported("workspace_synthesis_not_configured");
       if (v2 && stage !== undefined) {
-        const read2 = await readWorkspaceSynthesisV2({ source: synthesis.source, liveness: deps.liveness, orgId: identity.orgId, workspaceId: identity.workspaceId, window });
+        const read2 = await readWorkspaceSynthesisV2({ source: synthesis.source, ...synthesisChecks(identity, synthesis.aliases), window });
         if (read2.status === "not_found")
           throw read2.reason === "stage2_not_found"
             ? new HttpError(404, "not_found", "no Stage 2 workspace synthesis for this window", "stage2_not_found")

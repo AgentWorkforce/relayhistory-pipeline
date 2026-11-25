@@ -7,16 +7,18 @@ import { describe, expect, test } from "bun:test";
 import { readFileSync } from "node:fs";
 import { AuthError, createReadApi, type VerifiedIdentity } from "../app.ts";
 import { memoryLiveness } from "./support.ts";
-import { storeWorkspaceSynthesis, type WorkspaceSynthesisSource } from "../workspace-synthesis.ts";
+import { storeWorkspaceSynthesis, type SessionAliasRow, type SessionAliases, type WorkspaceSynthesisSource } from "../workspace-synthesis.ts";
 import { memoryArtifactStore, runWorkspaceSynthesisJob, workspaceSynthesisStage2Key } from "../../session-analysis/workspace-synthesis.ts";
 import { memoryBudgetLedger, type Stage2ModelTransport } from "../../session-intel/synthesis/stage2.ts";
 import { workspaceSynthesisDeps } from "../../../packages/session-read-worker/src/index.ts";
-import type { SessionKey } from "../page.ts";
+import { keyOf, type SessionKey } from "../page.ts";
+import { withChild } from "../../session-analysis/__tests__/workspace-synthesis-fixtures.ts";
 
 const FIXTURE = new URL("../../session-intel/__tests__/fixtures/synthesis/", import.meta.url);
 const cohortText = readFileSync(new URL("cohort.json", FIXTURE), "utf8");
 const REPLY = readFileSync(new URL("stage2-reply.json", FIXTURE), "utf8");
 const golden = JSON.parse(readFileSync(new URL("expected-synthesis.json", FIXTURE), "utf8"));
+const goldenV2 = JSON.parse(readFileSync(new URL("expected-synthesis-v2.json", FIXTURE), "utf8"));
 const ID: VerifiedIdentity = { userId: "u", orgId: "fx-org", workspaceId: "fx-ws-synthesis", scopes: ["rth:read"] };
 const auth = { authorization: "Bearer good" };
 const verify = async (token: string) => {
@@ -32,10 +34,10 @@ const transport: Stage2ModelTransport = {
   async complete(r) { return { outputText: REPLY, inputTokens: 4_000, outputTokens: 900, providerRequestId: "fx-req-1", model: r.model }; },
 };
 
-async function stored(opts: { stage2?: boolean } = {}) {
+async function stored(opts: { stage2?: boolean; cohort?: unknown } = {}) {
   const store = memoryArtifactStore();
   const r = await runWorkspaceSynthesisJob({
-    store, keyRoot: "fxroot", orgId: "fx-org", cohort: JSON.parse(cohortText), options: { now: UNTIL },
+    store, keyRoot: "fxroot", orgId: "fx-org", cohort: opts.cohort ?? JSON.parse(cohortText), options: { now: UNTIL },
     ...(opts.stage2 === false ? {} : { stage2: { flag: "true", transport, ledger: memoryBudgetLedger(), clock: () => new Date("2026-11-24T10:00:00.000Z"), trigger: "manual" as const } }),
   });
   const calls: string[] = [];
@@ -215,5 +217,129 @@ describe("Worker wiring", () => {
     expect(workspaceSynthesisDeps({} as never)).toEqual({ enabled: true });
     for (const v of ["", "1", "TRUE", " true"]) expect(workspaceSynthesisDeps({ READ_API_WORKSPACE_SYNTHESIS_V2_ENABLED: v } as never)).toEqual({ enabled: true });
     expect(workspaceSynthesisDeps({ READ_API_WORKSPACE_SYNTHESIS_V2_ENABLED: "true" } as never)).toEqual({ enabled: true, stage2Enabled: true });
+  });
+});
+
+/**
+ * stage=2 with the operator erase fence bound (self-host SESSION_ERASE_FENCE_ENFORCED=1) as the Lambda binds it:
+ * operatorErasedBatch beside operatorErased, and the alias reader. Ordinary liveness has no tombstone: an operator
+ * erase is in progress.
+ */
+describe("stage=2: the operator erase fence", () => {
+  const fencedApi = (opts: {
+    source: WorkspaceSynthesisSource;
+    fence?: SessionKey[];
+    outage?: boolean;
+    aliasRows?: Array<{ harness: string; session_id: string; canonical_session_id: string | null }>;
+    noAliases?: boolean;
+  }) => {
+    const live = memoryLiveness();
+    const fence = new Set((opts.fence ?? []).map(keyOf));
+    const batches: SessionKey[][] = [];
+    const aliases: SessionAliases = async (orgId, workspaceId, keys) => {
+      const asked = new Set(keys.map(keyOf));
+      return (opts.aliasRows ?? [])
+        .filter((r) => asked.has(keyOf({ source: r.harness, sessionId: r.session_id })) ||
+          (r.canonical_session_id !== null && asked.has(keyOf({ source: r.harness, sessionId: r.canonical_session_id }))))
+        .map((r): SessionAliasRow => ({ org_id: orgId, workspace_id: workspaceId, ...r }));
+    };
+    const app = createReadApi({
+      verify, adapter: {} as never, liveness: live.liveness, completeSinceMs: 0, directoryWorkspaces: new Set([ID.workspaceId]),
+      operatorErased: async (key) => fence.has(keyOf(key)),
+      operatorErasedBatch: async (_o: string, _w: string, keys: SessionKey[]) => {
+        batches.push(keys);
+        if (opts.outage) throw new Error("operator_fence_unavailable fx-s01");
+        return new Set(keys.map(keyOf).filter((k) => fence.has(k)));
+      },
+      workspaceSynthesis: { enabled: true, source: opts.source, stage2Enabled: true, ...(opts.noAliases ? {} : { aliases }) },
+    });
+    return { app, live, batches };
+  };
+  const invalidated = (r: { status: number; text: string; body: any }, id: string) => {
+    expect([id, r.status, r.body.error?.reason]).toEqual([id, 404, "synthesis_invalidated"]);
+    expect(r.text).not.toContain(id);
+    expect(r.text).not.toContain("initiative:");
+  };
+  /** The stored v2 with `edit` applied, served past the strict reader (a source that skipped its checks). */
+  async function edited(edit: (stage2: any) => void) {
+    const s = await stored();
+    const found = await s.source.latestStage2!("fx-org", "fx-ws-synthesis", WINDOW);
+    const v2 = structuredClone(found!.v2!);
+    edit(v2.synthesis.stage2);
+    const source: WorkspaceSynthesisSource = { latest: s.source.latest, async latestStage2() { return { v1: found!.v1, v2 }; } };
+    return source;
+  }
+
+  test("nothing fenced still serves exactly the v2 golden; v1 still serves the v1 golden", async () => {
+    const s = await stored();
+    const f = fencedApi({ source: s.source });
+    const r = await get(f.app);
+    expect(r.status).toBe(200);
+    expect(r.body).toEqual(goldenV2);
+    expect(f.batches.flat().length).toBe(golden.inputs.considered);
+    const v1 = await get(f.app, PATH);
+    expect([v1.status, v1.body]).toEqual([200, golden]);
+  });
+
+  test("a fenced considered session (the lander's fx-s01) is never served by stage=2", async () => {
+    for (const key of [{ source: "fx-claude", sessionId: "fx-s01" }, { source: "fx-claude", sessionId: "fx-skip-not-analyzed" }]) {
+      const s = await stored();
+      const f = fencedApi({ source: s.source, fence: [key] });
+      invalidated(await get(f.app), key.sessionId);
+      expect(f.live.calls.erased.flat()).toContainEqual(key);
+    }
+  });
+
+  test("a fenced RELATED-only session (a child only the evidence belongs to) is never served by stage=2", async () => {
+    for (const child of ["fx-s01-child", "fx-s01-spawned"]) {
+      const s = await stored({ cohort: withChild(JSON.parse(cohortText)) });
+      expect((await get(fencedApi({ source: s.source }).app)).status).toBe(200);
+      invalidated(await get(fencedApi({ source: s.source, fence: [{ source: "fx-claude", sessionId: child }] }).app), child);
+    }
+  });
+
+  test("a fenced kept-only session, initiative or theme session, or evidence-only session is never served", async () => {
+    const outside = { source: "fx-claude", sessionId: "fx-kept-outside" };
+    const cases: Array<[string, (stage2: any) => void]> = [
+      ["kept", (st) => { st.sessions.push(outside); }],
+      ["initiative session", (st) => { st.initiatives[0].sessions.push(outside); }],
+      ["initiative evidence", (st) => { st.initiatives[0].evidence.push({ ...outside, titleRef: st.initiatives[0].evidence[0].titleRef }); }],
+      ["theme session", (st) => { st.themes[0].sessions.push(outside); }],
+      ["theme evidence", (st) => { st.themes[0].evidence.push({ ...outside, titleRef: st.themes[0].evidence[0].titleRef }); }],
+    ];
+    for (const [name, edit] of cases) {
+      const source = await edited(edit);
+      expect([name, (await get(fencedApi({ source }).app)).status]).toEqual([name, 200]);
+      const f = fencedApi({ source, fence: [outside] });
+      invalidated(await get(f.app), outside.sessionId);
+      expect(f.batches.flat()).toContainEqual(outside);
+    }
+  });
+
+  test("a fence under a canonical or physical alias of a recorded session is never served by stage=2", async () => {
+    const s = await stored();
+    invalidated(await get(fencedApi({
+      source: s.source, aliasRows: [{ harness: "fx-claude", session_id: "fx-s06", canonical_session_id: "fx-canon-s06" }],
+      fence: [{ source: "fx-claude", sessionId: "fx-canon-s06" }],
+    }).app), "fx-s06");
+    invalidated(await get(fencedApi({
+      source: s.source, aliasRows: [{ harness: "fx-claude", session_id: "fx-phys-s06", canonical_session_id: "fx-s06" }],
+      fence: [{ source: "fx-claude", sessionId: "fx-phys-s06" }],
+    }).app), "fx-s06");
+    // Per source: the alias under another source is another session.
+    expect((await get(fencedApi({
+      source: s.source, aliasRows: [{ harness: "fx-claude", session_id: "fx-s06", canonical_session_id: "fx-canon-s06" }],
+      fence: [{ source: "fx-codex", sessionId: "fx-canon-s06" }],
+    }).app)).status).toBe(200);
+  });
+
+  test("fails closed: the fence unavailable, or bound without an alias reader, is a 503 with nothing served", async () => {
+    const s = await stored();
+    for (const f of [fencedApi({ source: s.source, outage: true }), fencedApi({ source: s.source, noAliases: true })]) {
+      const r = await get(f.app);
+      expect([r.status, r.body.error.code]).toEqual([503, "backend_unavailable"]);
+      expect(r.text).not.toContain("fx-s01");
+      expect(r.text).not.toContain("initiative:");
+    }
   });
 });
