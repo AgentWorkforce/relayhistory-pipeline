@@ -44,14 +44,16 @@ to a plugin.
   controls, quotas, signing material and sink credentials belong to the
   installation and are not stored in the manifest.
 - A **run** evaluates one installation over a bounded input revision.
-- A **record** is one extractor output. Its logical key is `(workspace,
-  plugin, topic, version)`. The pipeline also scopes every internal read and
-  write by the owning organization.
+- A **record identity** names one logical result within `(workspace, plugin,
+  topic)`. The pipeline also scopes every internal read and write by the owning
+  organization. Identity is distinct from a database row UUID, topic and
+  revision.
+- A **record revision** is one immutable representation of that identity. A
+  current-view store may have no revision history at all.
 - A **topic** is a plugin-defined, bounded slug used to group records. It is
   data, not an authorization boundary.
-- A **record version** is an immutable output generation for a logical topic.
-  It is distinct from the plugin release and output-schema versions, both of
-  which are carried as provenance.
+- A **plugin version** and **output-schema version** describe the code and
+  shape that produced a record. Neither is a record identity or revision.
 
 Plugin ids and topics are stable lowercase slugs. A released manifest is
 immutable: a prompt, schema, selector or sink-policy change requires a new
@@ -205,7 +207,8 @@ schema-validated payload.
 ```json
 {
   "topic": "src-session-read-api",
-  "version": "<immutable record version>",
+  "identity": "<stable logical record identity>",
+  "revision": null,
   "status": "current",
   "payload": {},
   "evidence": [
@@ -213,6 +216,9 @@ schema-validated payload.
   ]
 }
 ```
+
+`revision` is null for a current-view adapter and an immutable identifier only
+when the backing store provides real revision history.
 
 The runtime adds, rather than trusts the extractor to supply:
 
@@ -223,20 +229,29 @@ The runtime adds, rather than trusts the extractor to supply:
 - creation and update times; and
 - the payload and evidence digests used for idempotency and audit.
 
-The logical record key is `(workspace, plugin, topic, version)`. Organization
+The current-view key is `(workspace, plugin, topic, identity)`; a store that
+really retains immutable history additionally addresses a revision. Organization
 scope is always present internally even though it is not part of the portable
-key. A plugin declares whether a new version supersedes, appends to or replaces
-the prior current version; replacement changes the current pointer and never
-overwrites immutable history in place. A repeated key with a different digest
-is refused, and an extractor-proposed version cannot address another plugin or
-workspace. Supersession never deletes evidence needed for an erase. Payload
-fields, evidence entries, records per run, total bytes and topic cardinality
-are all bounded by the runtime and may be further narrowed by the manifest.
+identity. A plugin declares whether a new revision supersedes or appends to the
+prior current revision. A repeated revision key with a different digest is
+refused, and an extractor-proposed identity or revision cannot address another
+plugin or workspace. Supersession never deletes evidence needed for an erase.
+Payload fields, evidence entries, records per run, total bytes and topic
+cardinality are all bounded by the runtime and may be further narrowed by the
+manifest.
+
+A current row is not revision history. An adapter must not synthesize immutable
+revisions from a row UUID, topic, `updated_at` or successive observations of a
+mutable row. It may offer a revision-addressed read only when the backing store
+can reproduce that revision's exact bytes and erase invalidates every revision
+that depends on erased evidence.
 
 An extractor cannot set tenant scope, runtime controls, quota counters,
 provenance, retention state or sink delivery state. Invalid output commits
-nothing for that delivery. A successful commit is atomic for the delivery's
-declared output set.
+nothing for that writer operation. Atomicity is per writer operation, not
+across an analysis completion and every optional plugin view. A plugin that
+writes independently gated views uses separate deliveries for them. Within one
+writer operation, its validated record set commits atomically.
 
 ### Generated reads
 
@@ -247,7 +262,8 @@ common surface:
 GET /v1/plugins/{plugin}
 GET /v1/plugins/{plugin}/topics
 GET /v1/plugins/{plugin}/topics/{topic}
-GET /v1/plugins/{plugin}/topics/{topic}/records/{version}
+GET /v1/plugins/{plugin}/topics/{topic}/records/{identity}
+GET /v1/plugins/{plugin}/topics/{topic}/records/{identity}/revisions/{revision} # optional
 ```
 
 The first route returns plugin release and schema metadata visible to the
@@ -256,14 +272,16 @@ common envelope plus schema-validated plugin payloads. The authenticated
 workspace must exactly match the installation, and the database reader must
 enforce the same organization and workspace scope. A route that is disabled,
 not installed or unavailable keeps those states distinct and does not reveal
-whether another workspace has the plugin.
+whether another workspace has the plugin. The revision route is absent unless
+the adapter meets the exact-bytes and erase-invalidation requirements above.
 
 Generic MCP tools mirror the HTTP surface rather than introducing a second
 storage contract:
 
 - `pipeline_plugins_list` lists enabled installations visible to the caller;
 - `pipeline_plugin_topics` lists one plugin's topics; and
-- `pipeline_plugin_records_get` reads one topic or record version.
+- `pipeline_plugin_records_get` reads one topic, record identity or supported
+  revision.
 
 MCP tools use the caller's workspace identity, the same limits and cursors,
 and the same returned bytes as their HTTP adapters. Plugin-specific convenience
@@ -400,9 +418,9 @@ sink deliveries first; it does not delete records or erase durable fences.
 A run id is derived from the installation, plugin release, input projection,
 source revision or bounded cursor, and extractor contract revision. Replaying
 the same run sends the same customer `deliveryId` and can create at most one
-logical output version. Output commit uses a deterministic idempotency key and
-an atomic compare-and-commit; an ambiguous response is reconciled before a new
-extractor invocation.
+output revision per record identity in that writer operation. Output commit
+uses a deterministic idempotency key and an atomic compare-and-commit; an
+ambiguous response is reconciled before a new extractor invocation.
 
 Backfill uses the same path as live execution, with a fixed manifest release,
 fixed window, durable cursor, smaller quotas and an operator-visible receipt.
@@ -442,9 +460,16 @@ retryable and prevent completion. Durable erase fences outlive feature flags,
 plugin uninstall and normal record retention.
 
 Per-user erase applies the same evidence removal and late-write fencing across
-all of that user's sessions. Workspace deletion must remove plugin records,
-evidence, cursors, quota state and pending deliveries while preserving only the
-minimum durable erasure state required to prevent resurrection.
+all of that user's sessions. There is no workspace-wide relayfacts deletion
+path today, so this contract does not promise one. A future workspace-delete
+design must separately define records, evidence, cursors, quota state, pending
+deliveries and the durable anti-resurrection state it keeps.
+
+Disabling extraction or uninstalling a manifest must not disable erase for data
+the plugin already wrote. The runtime keeps the erase adapter and fences active
+until every retained record and pending delivery is gone. Where an existing
+flag couples writes to erase integration, operators must keep the erase side
+enabled while records exist; a generic uninstall cannot silently remove it.
 
 Each plugin declares a retention class that the runtime maps to a platform
 policy. A manifest may request a shorter window, not a longer one. A derived
@@ -467,8 +492,11 @@ Relayfacts already supplies most of the first plugin's domain behavior:
 - `understanding.decisions` is its selected event data;
 - the decision-records extractor creates bounded, scrub-clean topic records
   with session evidence;
-- migrations `062080` and `062090` provide workspace-scoped storage, readers,
-  idempotent evidence merge and per-session erase; and
+- migration `062080` provides workspace-scoped decision storage, readers and
+  idempotent evidence merge; `062090` adds per-session erase; `062100` adds the
+  owner-only per-user erase, permanent user-erase fences and writer locking;
+  and `062150` adds separately gated intent and constraint claims while
+  extending both erase paths; and
 - the existing read API provides topic listing and markdown rendering.
 
 The plugin adapter must preserve relayfacts' stricter current rules: decisions
@@ -482,6 +510,25 @@ materialize and scrub the candidate decision projection before invoking the
 generic extractor boundary, then preserve the current rule that any changed
 decision is dropped. This is a boundary refactor, not permission to change the
 records produced from scrub-clean input.
+
+Relayfacts is a current-view adapter. Its generic record identity is the
+existing organization, workspace, topic and normalized-title dedupe identity,
+namespaced by the `relayfacts` plugin; the stored UUID identifies the current
+row and is not a revision. Evidence merges update that row. The adapter
+therefore exposes no synthetic revision history and no revision-addressed
+read. A future history store must meet the exact-bytes and erase-invalidation
+requirements before it can add one.
+
+Decision and claim writes are separate deliveries. A completed analysis and a
+successful decision write survive a claims control being off, a claim refusal
+or a claim-writer failure. The plugin abstraction must not wrap both calls in a
+transaction or report claim failure as analysis failure.
+
+The existing `src/session-analysis/runner.ts` refusal
+`azure_decision_records_unsupported` remains in force. A plugin adapter does
+not relax it; Azure decision extraction stays off until its erase prerequisite
+and the runner's refusal are deliberately replaced by a separately reviewed
+implementation.
 
 Current runtime controls map to plugin capabilities without changing their
 meaning:
@@ -507,18 +554,41 @@ names, ordering, pagination, markdown escaping, bounds and error behavior:
 - MCP `relayfacts_list`; and
 - MCP `relayfacts_get`.
 
-They remain decisions-only. Generic plugin routes and generic MCP tools are
-additive. They may use the same adapter internally but cannot change the
-legacy response by adding plugin metadata, claim kinds or generic envelopes.
-Golden response fixtures should compare the complete legacy bytes with the
-adapter off and on before a canary.
+The legacy HTTP adapter continues to read through the tenant-bound
+`sessions.relayfacts_topics_v1` and `sessions.relayfacts_list_v1` functions as
+`bulls96_read_api`. Their `session_directory_read_api_scope` check, the
+workspace attestation and the shared `READ_API_DIRECTORY_WORKSPACES` relayfacts
+canary remain mandatory. Generic plugin authorization cannot replace or widen
+any of them.
+
+The exact legacy behavior includes:
+
+- disabled routes return `501 {"error":"relayfacts_disabled"}` before a read;
+- topics remain lexicographically ordered and bounded at 1,000 by the existing
+  reader;
+- topic records remain oldest first by `(created_at, id)`, at most 200 per
+  page;
+- the `md1:` cursor keeps its UTC microsecond timestamp and UUID encoding;
+- continued-page text, markdown escaping, evidence ordering and every response
+  field remain unchanged; and
+- bad topics, limits, cursors and unsupported parameters keep their current
+  status and error shapes.
+
+The legacy surfaces remain decisions-only. Generic plugin routes and tools are
+additive and cannot add plugin metadata, claim kinds or generic envelopes to a
+legacy response. HTTP golden tests in this repository are necessary but not
+sufficient for MCP byte parity. That claim waits until the MCP owner supplies
+exact `relayfacts_list` and `relayfacts_get` golden requests and response bytes,
+and those goldens pass with the adapter off and on.
 
 ### Option A: migrate into generic plugin records
 
 Option A creates a generic `plugin_records` and evidence model, backfills the
 `062080` decision rows and the `062150` claims rows, then moves relayfacts
 writes and reads to it. Compatibility views or adapters keep the old functions,
-routes and MCP tools serving their original bytes.
+routes and MCP tools serving their original bytes. The backfill represents each
+source row as current state and does not manufacture revisions from its UUID or
+timestamps.
 
 Advantages:
 
@@ -542,11 +612,11 @@ synthetic data. It is not the first rollout step.
 
 ### Option B: adapt the existing tables
 
-Option B keeps the `062080`, `062090` and `062150` tables and functions as the
-relayfacts storage implementation. A relayfacts plugin adapter maps the generic
-runtime request to the existing extractor and writers, and maps existing rows
-to the new generic read envelope. The legacy routes and MCP tools continue to
-call their current path.
+Option B keeps the `062080`, `062090`, `062100` and `062150` tables and
+functions as the relayfacts storage and erase implementation. A relayfacts
+plugin adapter maps the generic runtime request to the existing extractor and
+writers, and maps existing rows to a current-view generic read envelope. The
+legacy routes and MCP tools continue to call their current path.
 
 Advantages:
 
@@ -587,8 +657,12 @@ The adapter should model this as an optional `claims/1` output view of the same
 relayfacts plugin release, not add fields to the legacy decision view. The
 generic route may expose a claims subresource only to an explicitly authorized
 capability; the existing relayfacts routes and MCP tools remain decisions-only.
-The coordination advisor may continue to use the internal unified claims
-reader.
+The current unified claims reader is granted to `service_role` for the worker
+and advisor; it is not a public read boundary and must never be called through
+`service_role` on behalf of a read-API or MCP caller. A public claims view would
+need its own tenant-scoped SECURITY DEFINER reader, read role, workspace
+attestation, canary and negative isolation tests. Until those exist, only the
+coordination advisor may use the internal unified claims reader.
 
 Claims retain their existing semantics: kind participates in deduplication,
 scope widens only when new evidence is added, observed time moves earlier, and
@@ -597,6 +671,24 @@ Generic record normalization must not turn nullable decision scope or observed
 time into fabricated values. A backfill or rerun must preserve the current
 `SESSION_INTEL_CLAIMS_ENABLED` gate and the fail-closed global and workspace
 `claims` controls.
+
+### Relayfacts adapter proof obligations
+
+Before the adapter leaves shadow, tests must prove at least these failure and
+replay cases against the real existing writers:
+
+- with either claims control off, no claims read or write occurs, while the
+  analysis completion and decision delivery are unchanged;
+- a claims writer error or refusal leaves the analysis completed and every
+  already-committed decision intact;
+- replaying the same analysis is idempotent: it creates no duplicate record or
+  evidence and preserves the current-view bytes; and
+- an `RH016` fence refuses a duplicate input even when it would merge into an
+  existing record and add no new evidence, with no partial update.
+
+The last case is a commit-time fence requirement, not merely a row-trigger
+test: a duplicate or capped evidence set can otherwise skip the evidence-row
+write on which a trigger would fire.
 
 ## Likely second plugin: intent-versus-outcome advisories
 
@@ -639,7 +731,8 @@ still needs its existing approval.
 2. **Relayfacts adapter in shadow.** Implement Option B for an internal,
    compiled relayfacts manifest. Compare selected input, records, pagination,
    markdown and erase results without exposing generic routes. Prove complete
-   legacy HTTP and MCP byte parity.
+   legacy HTTP byte parity; do not claim MCP parity until the MCP owner supplies
+   and approves exact goldens.
 3. **Additive generic reads.** Canary generated relayfacts HTTP routes and
    generic MCP tools for synthetic and named workspaces. Keep the legacy reads
    authoritative. No customer manifests, model calls, webhooks or sinks yet.
