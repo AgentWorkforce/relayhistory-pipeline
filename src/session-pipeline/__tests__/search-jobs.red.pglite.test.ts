@@ -1,11 +1,13 @@
 /**
- * RED until M2 (docs/handoffs/incremental-search-indexing.md rev 7, §10): the committed `search-index` wake.
+ * RED until M2 (docs/handoffs/incremental-search-indexing.md rev 8, §10): the committed `search-index` wake.
  *
  * Production-path coupling (rev 5 §10). Every race, settlement, replay, park and catch-up test drives the REAL
  * M2 entry points of `src/session-pipeline/search-jobs.ts`:
  *   enqueueSearchWake, claimSearchJobs, settleSearchJob (done | {retry} | exhausted), replaySearchDeadLetter,
  *   catchUpTick, runSearchJob, parkSearchJobs, and (§8) searchStageDownPrecondition, archiveSearchStage [rev 7: failure-safe,
- *   into sessions.search_stage_archive with a sha256 manifest; with an unresolved letter it THROWS and changes nothing (R9c)].
+ *   into sessions.search_stage_archive with a sha256 manifest; with an unresolved letter it THROWS and changes nothing (R9c)];
+ *   rev 8: the manifest digest is recomputed in-test from the pre-archive rows with §8's exact rule (R9b); each down
+ *   guard on its own (R9g); a search-index job refuses the archive (R9d); the archive is append-only (R9e).
  * No test runs the design's enqueue / settlement / replay / tick / park SQL itself, so a migration (or a stub export
  * plus a migration) can never turn them green: each asserts concrete table state after the call that a no-op
  * export cannot produce. Fixtures (seeding rows, simulating a crash by expiring a lease, raising `attempts`) use
@@ -39,6 +41,7 @@
  */
 import { afterAll, afterEach, beforeAll, describe, expect, test } from "bun:test";
 import type { PGlite } from "@electric-sql/pglite";
+import { createHash } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import { PIPELINE_STAGES } from "@rhc/lib/pipeline/trace.ts";
@@ -1083,7 +1086,7 @@ describe("R8: scope-keyed dead-letter replay, through replaySearchDeadLetter and
 });
 
 // ---------------------------------------------------------------------------------------------------------
-describe("R9: the park path, the held down migration and the failure-safe archive, through parkSearchJobs and archiveSearchStage (design §8 [rev 7])", () => {
+describe("R9: the park path, the held down migration and the failure-safe archive, through parkSearchJobs and archiveSearchStage (design §8 [rev 8])", () => {
   // An org that needs URI encoding: the parked letter ids are dlq.ts's canonical deadLetterId.
   const a = { orgId: "org:r9 enc", workspaceId: "ws_r9", harness: "claude", sessionId: "s_a" };
   const b = { ...a, sessionId: "s_b" };
@@ -1159,7 +1162,7 @@ describe("R9: the park path, the held down migration and the failure-safe archiv
     expect(await f.searchStageDownPrecondition(db.pg)).toBe(false);
   }, 120_000);
 
-  test("R9b: replay, resolve, then archiveSearchStage: jobs, events and letters are 0; search_stage_archive holds every row plus one sha256 manifest; the precondition holds; another stage is untouched", async () => {
+  test("R9b: replay, resolve, then archiveSearchStage: jobs, events and letters are 0; the archive equals the pre-archive rows plus one manifest whose sha256 (and the returned one) equals §8's digest recomputed in-test; the precondition holds; another stage's letter, job and REAL event survive", async () => {
     const db = await migrated();
     const f = await m2r9();
     await parked(db, f);
@@ -1167,49 +1170,65 @@ describe("R9: the park path, the held down migration and the failure-safe archiv
     expect((await letters(db.pg)).map((l) => ({ id: l.id, state: l.state, resolved: l.resolved }))).toEqual(
       [a, b].map((s) => ({ id: letterIdOf(s), state: "resolved", resolved: true })).sort((x, y) => (x.id < y.id ? -1 : 1)));
     expect(await f.searchStageDownPrecondition(db.pg)).toBe(false);
-    // Controls: another stage's letter and job survive the archive.
+    // Controls: another stage's letter, job and a REAL pipeline_events row (a valid plain INSERT, proven landed).
     const other = await postgresDeadLetterStore(db.pg).quarantine(stageMessage("session-indexed", a, "r9-other-dl@1", {}), new Date());
-    // What the archive must carry: every search-index letter and event, as the row's jsonb (plain SELECTs).
-    const letterRows = (await db.pg.query<{ id: string; r: Record<string, unknown> }>(
-      "SELECT id, to_jsonb(d) AS r FROM sessions.pipeline_dead_letters d WHERE stage = 'search-index' ORDER BY id")).rows;
-    const eventRows = (await db.pg.query<{ r: Record<string, unknown> }>(
-      "SELECT to_jsonb(e) AS r FROM sessions.pipeline_events e WHERE stage = 'search-index'")).rows.map((x) => x.r);
-    expect(letterRows).toHaveLength(2);
-    expect(eventRows.length).toBeGreaterThan(0);
+    const otherEvent = (await db.pg.query<{ r: string }>(
+      `INSERT INTO sessions.pipeline_events (trace_id, stage, status, attempt, idempotency_key, org_id, workspace_id, harness, session_id)
+       VALUES ($1::uuid, 'object-landed', 'ok', 1, 'r9-other-event@1', $2, $3, $4, $5) RETURNING to_jsonb(pipeline_events)::text AS r`,
+      [crypto.randomUUID(), a.orgId, a.workspaceId, a.harness, a.sessionId])).rows;
+    expect(otherEvent).toHaveLength(1);
+    const otherEventRow = () => db.pg.query<{ r: string }>(
+      "SELECT to_jsonb(e)::text AS r FROM sessions.pipeline_events e WHERE stage = 'object-landed' AND idempotency_key = 'r9-other-event@1'");
+    expect((await otherEventRow()).rows).toEqual(otherEvent);
+
+    // The PRE-archive snapshot (plain SELECTs): every search-index letter and event as (kind, source_id, row), with
+    // row = to_jsonb(<source row>) as text. §8 [rev 8]: a letter's source_id is its id; an event's is the sha256 hex
+    // of to_jsonb(<event row>)::text, computed HERE in TypeScript, independently of any SQL.
+    type Src = { kind: "letter" | "event"; source_id: string; row: string };
+    const letterSnap: Src[] = (await db.pg.query<{ id: string; r: string }>(
+      "SELECT id, to_jsonb(d)::text AS r FROM sessions.pipeline_dead_letters d WHERE stage = 'search-index'")).rows
+      .map((x) => ({ kind: "letter", source_id: x.id, row: x.r }));
+    const eventSnap: Src[] = (await db.pg.query<{ r: string }>(
+      "SELECT to_jsonb(e)::text AS r FROM sessions.pipeline_events e WHERE stage = 'search-index'")).rows
+      .map((x) => ({ kind: "event", source_id: createHash("sha256").update(x.r, "utf8").digest("hex"), row: x.r }));
+    expect(letterSnap.map((l) => l.source_id).sort()).toEqual([letterIdOf(a), letterIdOf(b)].sort());
+    expect(eventSnap.length).toBeGreaterThan(0);
+    expect(new Set(eventSnap.map((e) => e.source_id)).size).toBe(eventSnap.length);
+    const snap = [...letterSnap, ...eventSnap];
+    // The expected digest, recomputed from the SNAPSHOT (a jsonb parameter, not the live tables) with §8's exact rule:
+    //   encode(sha256(convert_to(string_agg(jsonb_build_array(kind, source_id, row)::text, E'\n' ORDER BY kind, source_id), 'UTF8')), 'hex')
+    // This is observation in SQL (jsonb's text form and the database collation are the rule's), not the archive.
+    const expectedSha = (await db.pg.query<{ sha256: string }>(
+      `SELECT encode(sha256(convert_to(string_agg(jsonb_build_array(x->>'kind', x->>'source_id', (x->>'row')::jsonb)::text, E'\\n'
+                ORDER BY x->>'kind', x->>'source_id'), 'UTF8')), 'hex') AS sha256
+         FROM jsonb_array_elements($1::jsonb) AS x`, [JSON.stringify(snap)])).rows[0]!.sha256;
+    expect(expectedSha).toMatch(/^[a-f0-9]{64}$/);
     const otherEventsBefore = (await snapshot(db.pg, "pipeline_events")).filter((r) => (JSON.parse(r) as { stage: string }).stage !== STAGE);
+    expect(otherEventsBefore).toContain(otherEvent[0]!.r);
 
     const archived = await f.archiveSearchStage(db.pg);
 
-    expect(archived).toEqual({ letters: 2, events: eventRows.length, sha256: expect.stringMatching(/^[a-f0-9]{64}$/) });
+    expect(archived).toEqual({ letters: 2, events: eventSnap.length, sha256: expectedSha });
     expect(await stageCounts(db.pg)).toEqual({ jobs: 0, events: 0, letters: 0 });
 
-    // The durable archive: one batch, every letter (kind 'letter', source_id = the letter id) and every event (kind
-    // 'event', a batch-unique source_id; pipeline_events has no primary key, so the identifier is M2's choice), each
-    // row the source row's jsonb, plus exactly one 'manifest' row.
-    const arch = (await db.pg.query<{ batch_id: string; kind: string; source_id: string; row: Record<string, unknown>; stamped: boolean }>(
-      "SELECT batch_id::text, kind, source_id::text, row, archived_at IS NOT NULL AS stamped FROM sessions.search_stage_archive ORDER BY kind, source_id")).rows;
+    // The durable archive: one batch; its letter and event rows EQUAL the snapshot (kind, source_id, row); plus exactly
+    // one 'manifest' row carrying {letters, events, sha256} with the recomputed digest.
+    const arch = (await db.pg.query<{ batch_id: string; kind: string; source_id: string; row: string; stamped: boolean }>(
+      "SELECT batch_id::text, kind, source_id::text, row::text, archived_at IS NOT NULL AS stamped FROM sessions.search_stage_archive")).rows;
     expect(new Set(arch.map((r) => r.batch_id)).size).toBe(1);
     expect(arch.every((r) => r.stamped)).toBe(true);
-    expect(arch.filter((r) => r.kind === "letter").map((r) => ({ source_id: r.source_id, row: r.row })))
-      .toEqual(letterRows.map((l) => ({ source_id: l.id, row: l.r })));
-    const archivedEvents = arch.filter((r) => r.kind === "event");
-    // jsonb normalizes key order, so the parsed rows stringify identically when their jsonb is equal.
-    const canon = (rows: Array<Record<string, unknown>>) => rows.map((r) => JSON.stringify(r)).sort();
-    expect(canon(archivedEvents.map((r) => r.row))).toEqual(canon(eventRows));
-    expect(archivedEvents.every((r) => typeof r.source_id === "string" && r.source_id.length > 0)).toBe(true);
-    expect(new Set(archivedEvents.map((r) => r.source_id)).size).toBe(archivedEvents.length);
+    const key = (r: { kind: string; source_id: string }) => `${r.kind}\u0000${r.source_id}`;
+    const byKey = <T extends { kind: string; source_id: string }>(rows: T[]) => [...rows].sort((x, y) => (key(x) < key(y) ? -1 : 1));
+    expect(byKey(arch.filter((r) => r.kind !== "manifest").map(({ kind, source_id, row }) => ({ kind, source_id, row })))).toEqual(byKey(snap));
     const manifests = arch.filter((r) => r.kind === "manifest");
     expect(manifests).toHaveLength(1);
-    expect(arch.filter((r) => !["letter", "event", "manifest"].includes(r.kind))).toEqual([]);
-    // The manifest: the counts and the sha256 (64 hex), the same values archiveSearchStage returns. Design §8 [rev 7]
-    // fixes "sha256 over the batch's rows, ordered by (kind, source_id)" but not the byte serialization (row text,
-    // separators, which columns), so this test does NOT recompute the digest in-test; it asserts the counts and shape.
-    expect(manifests[0]!.row).toMatchObject({ letters: 2, events: eventRows.length, sha256: archived.sha256 });
-    expect(String(manifests[0]!.row.sha256)).toMatch(/^[a-f0-9]{64}$/);
+    expect(manifests[0]!.source_id).toBe("manifest");
+    expect(JSON.parse(manifests[0]!.row)).toMatchObject({ letters: 2, events: eventSnap.length, sha256: expectedSha });
 
     expect(await f.searchStageDownPrecondition(db.pg)).toBe(true);
     expect((await letters(db.pg)).map((l) => l.id)).toEqual([other.id]);
     expect((await db.pg.query<{ stage: string }>("SELECT stage FROM sessions.pipeline_jobs")).rows).toEqual([{ stage: "session-indexed" }]);
+    expect((await otherEventRow()).rows).toEqual(otherEvent);
     expect((await snapshot(db.pg, "pipeline_events")).filter((r) => (JSON.parse(r) as { stage: string }).stage !== STAGE)).toEqual(otherEventsBefore);
   }, 120_000);
 
@@ -1241,6 +1260,123 @@ describe("R9: the park path, the held down migration and the failure-safe archiv
     }).toEqual(before);
     expect(await f.searchStageDownPrecondition(db.pg)).toBe(false);
   }, 120_000);
+
+  test("R9d: archiveSearchStage with a search-index job row present (every letter resolved) THROWS and changes nothing", async () => {
+    const db = await migrated();
+    const f = await m2r9();
+    await parked(db, f);
+    await replayAndResolve(db, f, [a, b]);
+    // A new wake after the replay: the only thing that should block the archive is this job row.
+    await f.enqueueSearchWake(db.pg, wake(a, 9));
+    expect((await letters(db.pg)).filter((l) => l.stage === STAGE).every((l) => l.state === "resolved")).toBe(true);
+    expect((await stageCounts(db.pg)).jobs).toBe(1);
+    const before = {
+      jobs: await snapshot(db.pg, "pipeline_jobs"),
+      letters: await snapshot(db.pg, "pipeline_dead_letters"),
+      events: await snapshot(db.pg, "pipeline_events"),
+      archive: await snapshot(db.pg, "search_stage_archive"),
+    };
+    expect(before.events.length).toBeGreaterThan(0);
+
+    await expect(f.archiveSearchStage(db.pg)).rejects.toThrow();
+
+    expect({
+      jobs: await snapshot(db.pg, "pipeline_jobs"),
+      letters: await snapshot(db.pg, "pipeline_dead_letters"),
+      events: await snapshot(db.pg, "pipeline_events"),
+      archive: await snapshot(db.pg, "search_stage_archive"),
+    }).toEqual(before);
+    expect(await f.searchStageDownPrecondition(db.pg)).toBe(false);
+  }, 120_000);
+
+  test("R9e: after a successful archive, an UPDATE and a DELETE on sessions.search_stage_archive by a non-owner runtime role are refused with 42501 (append-only trigger)", async () => {
+    const db = await migrated();
+    const f = await m2r9();
+    await parked(db, f);
+    await replayAndResolve(db, f, [a, b]);
+    await f.archiveSearchStage(db.pg);
+    const archive = () => snapshot(db.pg, "search_stage_archive");
+    const before = await archive();
+    expect(before.length).toBeGreaterThan(2);
+
+    // Catalog: a user (non-internal), enabled trigger on the archive that fires on UPDATE (tgtype bit 16) and on
+    // DELETE (bit 8), in one trigger or across several.
+    const triggers = (await db.pg.query<{ tgname: string; tgtype: number }>(
+      `SELECT tgname, tgtype FROM pg_trigger WHERE tgrelid = 'sessions.search_stage_archive'::regclass AND NOT tgisinternal AND tgenabled <> 'D'`)).rows;
+    expect(triggers.some((t) => (t.tgtype & 16) !== 0)).toBe(true);
+    expect(triggers.some((t) => (t.tgtype & 8) !== 0)).toBe(true);
+
+    // The runtime role. The migrated template's configured runtime role is `postgres` (replay-fixture.ts:
+    // runtimeRole "postgres"), which is the superuser schema owner, the one role §7 exempts. So a non-owner,
+    // non-superuser stand-in plays the runtime role. It is deliberately granted UPDATE and DELETE beyond §7's
+    // SELECT, INSERT, so a refusal can only come from the append-only trigger, never from a missing privilege.
+    const role = "r9_runtime_standin";
+    await db.pg.exec(`CREATE ROLE ${role} NOLOGIN NOSUPERUSER NOBYPASSRLS;
+      GRANT USAGE ON SCHEMA sessions TO ${role};
+      GRANT SELECT, INSERT, UPDATE, DELETE ON sessions.search_stage_archive TO ${role};`);
+    const asRuntime = async (sql: string): Promise<string> => {
+      await db.pg.exec(`SET ROLE ${role}`);
+      try { await db.pg.query(sql); return "ok"; } catch (e) { return String((e as { code?: string }).code ?? e); } finally { await db.pg.exec("RESET ROLE"); }
+    };
+    // The role sees the archived rows, so a row-level trigger has rows to fire on.
+    await db.pg.exec(`SET ROLE ${role}`);
+    try {
+      expect((await db.pg.query<{ n: number }>("SELECT count(*)::int AS n FROM sessions.search_stage_archive")).rows[0]!.n).toBe(before.length);
+    } finally { await db.pg.exec("RESET ROLE"); }
+
+    expect(await asRuntime("UPDATE sessions.search_stage_archive SET row = row || '{\"tampered\": true}'::jsonb WHERE kind = 'manifest'")).toBe("42501");
+    expect(await asRuntime("DELETE FROM sessions.search_stage_archive WHERE kind = 'letter'")).toBe("42501");
+    expect(await archive()).toEqual(before);
+  }, 120_000);
+
+  // R9g: each down guard on its own. ORDERING: searchStageDownPrecondition is loaded FIRST, before any seeding. Today
+  // the stage CHECKs of all three tables refuse 'search-index', so the seed INSERT itself would fail; loading the
+  // module first keeps the red reason "module absent", never "fixture failed". Each case seeds its row with a plain
+  // INSERT (fixture), proves it landed, and runs on its own fresh clone. Another stage's job, letter and event are
+  // seeded in every case, so a precondition that ignores the stage filter also fails.
+  describe("R9g: searchStageDownPrecondition, each guard on its own (design §8 [rev 8])", () => {
+    const g = { orgId: "org:r9g enc", workspaceId: "ws_r9g", harness: "claude", sessionId: "s_g" };
+    const seed = {
+      job: async (pg: PGlite, stage: string) => (await pg.query(
+        `INSERT INTO sessions.pipeline_jobs (stage, work_key, trace_id, org_id, workspace_id, session_id, message)
+         VALUES ($1, $2, $3::uuid, $4, $5, $6, $7::jsonb) RETURNING id`,
+        [stage, stage === STAGE ? searchWorkKey(g) : "r9g-other@1", crypto.randomUUID(), g.orgId, g.workspaceId, g.sessionId,
+          JSON.stringify(stage === STAGE ? wake(g, 1) : stageMessage(stage, g, "r9g-other@1", {}))])).rows.length,
+      letter: async (pg: PGlite, stage: string) => (await pg.query(
+        `INSERT INTO sessions.pipeline_dead_letters (id, stage, trace_id, org_id, workspace_id, session_id, message)
+         VALUES ($1, $2, $3::uuid, $4, $5, $6, $7::jsonb) RETURNING id`,
+        [stage === STAGE ? letterIdOf(g) : `${stage}:r9g-other@1`, stage, crypto.randomUUID(), g.orgId, g.workspaceId, g.sessionId,
+          JSON.stringify(stage === STAGE ? wake(g, 1) : stageMessage(stage, g, "r9g-other@1", {}))])).rows.length,
+      event: async (pg: PGlite, stage: string) => (await pg.query(
+        `INSERT INTO sessions.pipeline_events (trace_id, stage, status, attempt, idempotency_key, org_id, workspace_id, harness, session_id)
+         VALUES ($1::uuid, $2, 'dead_lettered', 1, $3, $4, $5, $6, $7) RETURNING stage`,
+        [crypto.randomUUID(), stage, `r9g:${stage}@1`, g.orgId, g.workspaceId, g.harness, g.sessionId])).rows.length,
+    };
+    const cases = [
+      { name: "only a search-index job row", seeded: "job" as const, expected: false },
+      { name: "only a search-index letter", seeded: "letter" as const, expected: false },
+      { name: "only a search-index event", seeded: "event" as const, expected: false },
+      { name: "all three zero (other stages only)", seeded: null, expected: true },
+    ];
+    for (const c of cases) {
+      test(`R9g: ${c.name} gives ${c.expected}`, async () => {
+        const db = await migrated();
+        const { searchStageDownPrecondition } = await m2("searchStageDownPrecondition");
+        // Another stage's rows, every table (fixture, proven landed).
+        expect(await seed.job(db.pg, "session-indexed")).toBe(1);
+        expect(await seed.letter(db.pg, "session-indexed")).toBe(1);
+        expect(await seed.event(db.pg, "object-landed")).toBe(1);
+        if (c.seeded) expect(await seed[c.seeded](db.pg, STAGE)).toBe(1);
+        const counts = await stageCounts(db.pg);
+        expect(counts).toEqual({
+          jobs: c.seeded === "job" ? 1 : 0,
+          letters: c.seeded === "letter" ? 1 : 0,
+          events: c.seeded === "event" ? 1 : 0,
+        });
+        expect(await searchStageDownPrecondition(db.pg)).toBe(c.expected);
+      }, 120_000);
+    }
+  });
 });
 
 // ---------------------------------------------------------------------------------------------------------
