@@ -648,3 +648,72 @@ describe.skipIf(!url)("post-H scoped kernel proposal", () => {
     expect((await d.call("ingest_publication_candidates",{...d.target,provider:undefined,limit:1})).stageTokens).toEqual([d.stage]);
   },30000);
 });
+
+describe.skipIf(!url)("062270 private read profile",()=>{
+  test("two authenticated logins cannot reuse one another's profile; closing read observes committed revocation",async()=>{
+    const d=await fixture();
+    const reader="bulls96_frontier_receipt_reader";
+    const suffix=crypto.randomUUID().replaceAll("-","");
+    const issuerLogin="reader_"+suffix, secondLogin="other_"+suffix;
+    await d.pool.query("CREATE ROLE "+reader+" NOLOGIN NOINHERIT; CREATE ROLE "+issuerLogin+" LOGIN NOINHERIT; CREATE ROLE "+secondLogin+" LOGIN NOINHERIT");
+    clean.push(async()=>{
+      for(const role of [issuerLogin,secondLogin,reader]){
+        await d.pool.query("DROP OWNED BY "+role);await d.pool.query("DROP ROLE "+role);
+      }
+    });
+    await d.pool.query("GRANT "+reader+" TO "+issuerLogin+","+secondLogin+"; GRANT USAGE ON SCHEMA sessions TO "+reader);
+    const proposal="supabase/proposals/continuous-publication/062270-private-read-profile";
+    await d.pool.query(read(proposal+".up.sql"));
+    await d.pool.query(read(proposal+".down.sql"));
+    expect((await d.pool.query("SELECT to_regnamespace('frontier_receipt_private') AS gone")).rows[0].gone).toBeNull();
+    await d.pool.query(read(proposal+".up.sql"));
+    // This fixture wrapper exposes only a Boolean. It cannot enumerate receipts.
+    await d.pool.query(`CREATE FUNCTION sessions.profile_gate_probe(p jsonb) RETURNS boolean
+      LANGUAGE sql STABLE SECURITY DEFINER SET search_path=pg_catalog,pg_temp AS
+      $$ SELECT (frontier_receipt_private.check_request(p)).profile_id IS NOT NULL $$;
+      REVOKE ALL ON FUNCTION sessions.profile_gate_probe(jsonb) FROM PUBLIC;
+      GRANT EXECUTE ON FUNCTION sessions.profile_gate_probe(jsonb) TO `+reader);
+    const tenant={...TENANT,originId:"origin-1"};
+    const request={protocol:"first-ack-seat-capture-v1",profileId:crypto.randomUUID(),profileSha256:"c".repeat(64),tenant,
+      generation:GEN,after:null,limit:2};
+    const authority={sourceIdentitySha256:"1".repeat(64),sourceGenerationSha256:"2".repeat(64),sourceHead:"3".repeat(40),
+      controlEpoch:"4".repeat(64),privacyBaselineSha256:"5".repeat(64),privacyVersion:"0"};
+    await d.pool.query(`INSERT INTO frontier_receipt_private.read_profiles
+      SELECT $1,$2,r.oid,r.rolname,$3,$4,$5,$6,clock_timestamp(),clock_timestamp()+interval '5 minutes',2,100,32768
+      FROM pg_roles r WHERE r.rolname=$7`,[request.profileId,request.profileSha256,tenant,GEN,d.target,authority,issuerLogin]);
+    const db=(await d.pool.query("SELECT current_database() db")).rows[0].db;
+    const connect=async(login:string)=>{
+      const u=new URL(url!);u.pathname="/"+db;u.username=login;u.password="";
+      const c=new pg.Client({connectionString:u.href});await c.connect();await c.query("SET ROLE "+reader);return c;
+    };
+    const first=await connect(issuerLogin),other=await connect(secondLogin);
+    const select=(c:pg.Client,p:object)=>c.query("SELECT sessions.profile_gate_probe($1) ok",[p]);
+    const begin=(c:pg.Client)=>c.query("BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY");
+    async function refuse(c:pg.Client,p:object){
+      await begin(c);
+      try {await expect(select(c,p)).rejects.toMatchObject({code:"42501"});}
+      finally{await c.query("ROLLBACK");}
+    }
+    try {
+      await expect(select(first,request)).rejects.toMatchObject({code:"42501"});
+      await expect(first.query("SELECT * FROM frontier_receipt_private.read_profiles")).rejects.toMatchObject({code:"42501"});
+      await refuse(other,request);
+      await refuse(first,{...request,tenant:{...tenant,userId:"another"}});
+      await refuse(first,{...request,profileSha256:"a".repeat(64)});
+      await refuse(first,{...request,limit:3});
+      await begin(first);
+      expect((await select(first,request)).rows[0].ok).toBe(true);
+      await d.pool.query("INSERT INTO frontier_receipt_private.revoked_profiles(profile_id) VALUES($1)",[request.profileId]);
+      await first.query("COMMIT");
+      await refuse(first,request);
+      await expect(d.pool.query("UPDATE frontier_receipt_private.read_profiles SET page_limit=1000")).rejects.toThrow("append-only");
+      expect((await d.pool.query("SELECT to_regprocedure('sessions.ingest_scoped_publication_receipt_capture_v1(jsonb)') AS capture")).rows[0].capture).toBeNull();
+      const teardown=await d.pool.connect();
+      try {
+        await expect(teardown.query(read(proposal+".down.sql"))).rejects.toThrow("retain enrolled profiles");
+        await teardown.query("ROLLBACK");
+        expect((await teardown.query("SELECT count(*)::int n FROM frontier_receipt_private.revoked_profiles")).rows[0].n).toBe(1);
+      } finally {teardown.release(true);}
+    } finally {await first.end();await other.end();}
+  },30000);
+});

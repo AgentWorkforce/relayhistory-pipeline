@@ -27,7 +27,7 @@ const CONTROL = /[\u0000-\u001f\u007f]/u;
 export const FRONTIER_RECEIPT_READER_ROLE = "bulls96_frontier_receipt_reader";
 const ROLE = FRONTIER_RECEIPT_READER_ROLE;
 const ROLE_NAME = /^[A-Za-z_][A-Za-z0-9_]{0,62}$/;
-const RUNTIME_OWNERS = new Set([ROLE, "bulls96_session_ingest_seeder", "bulls96_session_ingest", "anon", "authenticated", "service_role", "public"]);
+const RUNTIME_OWNERS = new Set([ROLE, "bulls96_session_ingest_seeder", "bulls96_session_ingest", "bulls96_publication_scoped", "bulls96_publication_recovery", "anon", "authenticated", "service_role", "public"]);
 type Cursor = [string, string, string, string];
 export class FrontierReceiptSourceError extends Error {
   constructor(readonly code: string) { super(code); }
