@@ -60,6 +60,7 @@ export const STREAM_READ_CEILING: Readonly<StreamReadLimits> = Object.freeze({
   maxReadEvents: nodeReadBudget("large").sourceRecords,
 });
 export { manifestUserId, readManifestRecords, projectedToNeonRow } from "../session-read-api/canonical-projection.ts";
+import { createHash } from "node:crypto";
 import * as zlib from "node:zlib";
 import { layoutComponent } from "../shared/layout-component.ts";
 import { errorFields, log } from "../shared/log.ts";
@@ -67,8 +68,8 @@ import { PipelineError, type ManifestReader, type ObjectStore } from "../shared/
 import type { SqlExecutor } from "@rhc/lib/pipeline/queue.ts";
 import type { ClickHouseClient } from "./vendor/search-index/clickhouse.ts";
 import { tsMillis } from "./vendor/search-index/rows.ts";
-import { EVENTS_TABLE, SESSION_STATE_TABLE } from "./vendor/search-index/schema.ts";
-import { chNow, deleteRows, windowStart, type PendingDelete } from "./vendor/search-index/reconcile.ts";
+import { EVENTS_TABLE, INGEST_STATE_TABLE, SESSION_STATE_TABLE } from "./vendor/search-index/schema.ts";
+import { DEFAULT_WINDOW_DAYS, STATE_WINDOW_START, chNow, deleteRows, readState, windowStart, type PendingDelete } from "./vendor/search-index/reconcile.ts";
 import { scopeLockKey, type SessionScope } from "./pointer.ts";
 import { directoryCatalogWriter, type writeDirectoryCatalog } from "../hoopdb/session-directory-catalog.ts";
 import { writeDirectoryEvents, invalidateDirectoryEvents, completeErasedDirectoryEvents } from "../hoopdb/session-directory-events.ts";
@@ -216,6 +217,17 @@ export interface SearchIndexDeps {
    * and output-facts paths deliberately keep the base behavior.
    */
   preRead?: boolean;
+  /**
+   * SEARCH_INDEX_SKIP_ACCEPTANCE_MISSING_ENABLED=true only (lambda.ts, the hosted ClickHouse binding): a pass
+   * that ends incomplete for `relayhistory_acceptance_missing` alone stamps a digest of the pointer set it read
+   * (acceptanceDigest) into `search_ingest_state`; a later pass over the same digest, within
+   * SKIP_STATE_MAX_AGE_MS of the stamp, returns that outcome again before any manifest read
+   * (skippedBeforeRead), writing nothing. Any other outcome clears a stamp it saw. Applies only where
+   * inlineSkipsApply holds (the S3-event pass on the legacy ClickHouse whole-read path; never the managed
+   * search-jobs pass, staged, adapter or output-facts passes). Absent: no stamp is read or written, no extra
+   * query, nothing else changes.
+   */
+  skipAcceptanceMissing?: true;
 }
 
 /** Additive phase counters for the existing search-pass log line. Durations are wall milliseconds. */
@@ -415,7 +427,32 @@ export interface SearchIndexResult {
   outputFacts?: { inserted: number; deleted: number; complete: boolean; reasons: string[] };
   /** Present only when the streaming reader ran: what it read, summed over its passes. */
   stream?: { passes: number; chunks: number; bytes: number; events: number };
+  /**
+   * SEARCH_INDEX_SKIP_ACCEPTANCE_MISSING_ENABLED=true only: the acceptance-missing outcome was repeated
+   * from stored state before any manifest read; nothing was read from the object store and nothing was
+   * written.
+   */
+  skippedBeforeRead?: true;
 }
+
+/** The reason code a pass returned before any manifest read adds to the outcome it repeats. */
+export const SKIPPED_BEFORE_READ = "skipped_before_read";
+/**
+ * The oldest stamp a pass may skip on. A skip never rewrites it, so a scope that still gets events
+ * takes a normal pass (which rewrites it) at least this often, also when a pointer event was lost.
+ */
+export const SKIP_STATE_MAX_AGE_MS = 6 * 60 * 60 * 1000;
+/** The fold's refusal when same-record contenders from different origins lack accepted_seq. */
+export const ACCEPTANCE_MISSING = "relayhistory_acceptance_missing";
+/**
+ * Salt of the acceptance stamp's digest. Bump it with any change to how a pass reads, folds or
+ * projects a scope: a stamp written under another salt never matches, and the next pass reads in
+ * full. v2: this pass reads the canonical sibling union (readCanonicalScope), not the backport's
+ * per-scope set, so a v1 stamp written by the backport lineage never licenses a skip here.
+ */
+export const ACCEPTANCE_SKIP_VERSION = "acceptance-skip-v2";
+/** `search_ingest_state` names of acceptance stamps; no other state name starts with it. */
+export const ACCEPTANCE_STAMP_PREFIX = "acceptance_skip/";
 
 interface ScopeIdentity {
   machineId: string;
@@ -621,6 +658,9 @@ export async function indexSearchScope(scope: SessionScope, deps: SearchIndexDep
   // accepted but deliberately leaves them on the byte-identical base path.
   if (!deps.preRead || !deps.ch || deps.adapter || deps.staged || deps.stream || deps.outputFacts || deps.outputFactsStore)
     return indexSearchScopeBase(scope, deps);
+  // A SEARCH_INDEX_SKIP_* flag decides before any manifest read under the scope lock, which the pre-read
+  // path would already have spent: with one armed where it applies, the locked base path runs.
+  if (deps.skipAcceptanceMissing && inlineSkipsApply(deps)) return indexSearchScopeBase(scope, deps);
   const limits = { ...SEARCH_INDEX_DEFAULT_LIMITS, ...deps.limits };
   for (let attempt = 0; attempt < 2; attempt++) {
     const captured = await captureSearchPreRead(scope, deps, limits);
@@ -686,9 +726,14 @@ async function indexSearchScopeBase(scope: SessionScope, deps: SearchIndexDeps, 
       await io.record(scope,0,0,false,at,pointerSnapshot.canonicalId);
       return {manifests:0,rows:0,inserted:0,deleted:0,complete:false,reasons:["canonical_session_mismatch"]};
     }
-    const {rows:siblings}=await tx.query<{manifest_key:string}>(`SELECT manifest_key FROM sessions.session_index
+    // SEARCH_INDEX_SKIP_ACCEPTANCE_MISSING_ENABLED=true (where it applies, never with a pre-read): the same
+    // listing with each row's facts. Off: the listing exactly as before.
+    const acceptanceArmed = deps.skipAcceptanceMissing === true && !prepared && inlineSkipsApply(deps);
+    const siblingFacts = acceptanceArmed ? await siblingPointerFacts(tx, scope, pointerSnapshot.canonicalId) : null;
+    const {rows:siblings}=siblingFacts ? {rows:siblingFacts} : await tx.query<{manifest_key:string}>(`SELECT manifest_key FROM sessions.session_index
       WHERE org_id=$1 AND workspace_id=$2 AND harness=$3 AND coalesce(canonical_session_id,session_id)=$4 AND deleted_at IS NULL ORDER BY session_id,machine_id`,[scope.orgId,scope.workspaceId,scope.harness,pointerSnapshot.canonicalId]);
     const siblingKeys=siblings.map(r=>r.manifest_key);
+    const stampName = acceptanceArmed ? acceptanceStampName(scope) : "";
     if (prepared && !sourceStampEqual(await currentSourceStamp(tx, scope, pointerSnapshot), prepared.stamp)) return SEARCH_SCOPE_CHANGED;
     if(!keys.length&&siblingKeys.length){
       // Erasing one alias must never erase a live canonical sibling.
@@ -730,15 +775,43 @@ async function indexSearchScopeBase(scope: SessionScope, deps: SearchIndexDeps, 
       if (pgFacts) await pgFacts.erase(factsScope(scope, pointerSnapshot.canonicalId));
       await io.record(scope,0,0,true,at,pointerSnapshot.canonicalId);
       await completeErasedDirectoryEvents(tx,scope);
+      // Flag on: an erased scope keeps no acceptance stamp.
+      if (acceptanceArmed) await settleAcceptanceStamp(deps.ch!, scope, stampName, await readAcceptanceStamp(deps.ch!, stampName), null, at);
       return { manifests: 0, rows: 0, inserted: 0, deleted: 0, complete: true, reasons: ["erased"] };
     }
     // SEARCH_INDEX_SKIP_CURRENT_ENABLED: under both locks, after every branch that must run (canonical
     // mismatch, alias still live, erase), before any object read or index query.
     if (deps.skipCurrent && (await alreadyCurrent(tx, scope, pointerSnapshot, keys.length, deps.outputFacts ? deps.ch : undefined)))
       return { manifests: keys.length, rows: 0, inserted: 0, deleted: 0, complete: true, skipped: true, reasons: [ALREADY_CURRENT] };
-    const fromMs = prepared?.fromMs ?? await io.fromMs(at);
+    let fromMs: number;
+    let acceptance: { stamp: StampRead; digest: string; observed: Map<string, ManifestObservation> } | null = null;
+    if (siblingFacts) {
+      // SEARCH_INDEX_SKIP_ACCEPTANCE_MISSING_ENABLED=true: windowStart's own read and default (same ClickHouse
+      // read, same value), kept apart so the digest tells a stored window from the rolling default.
+      const stored = await measurePhase(deps.metrics, "indexScanMs", () => readState(deps.ch!, STATE_WINDOW_START));
+      fromMs = Date.parse(stored ?? new Date(at.getTime() - DEFAULT_WINDOW_DAYS * 24 * 60 * 60 * 1000).toISOString());
+      const digest = acceptanceDigest(scope, pointerSnapshot, siblingFacts, stored === null ? `default:${DEFAULT_WINDOW_DAYS}d` : `stored:${stored}`, limits, deps.stream, deps.readerMaxRuleset);
+      const stamp = await readAcceptanceStamp(deps.ch!, stampName);
+      // The last pass over this exact pointer set, epoch, window and limits ended incomplete for the
+      // acceptance refusal alone, recently: the same outcome, without a read or a write.
+      if (acceptanceStampMatches(stamp, digest, at))
+        return { manifests: 0, rows: 0, inserted: 0, deleted: 0, complete: false, skippedBeforeRead: true, reasons: [ACCEPTANCE_MISSING, SKIPPED_BEFORE_READ] };
+      acceptance = { stamp, digest, observed: new Map() };
+    } else fromMs = prepared?.fromMs ?? await io.fromMs(at);
+    const observedReader = acceptance ? { reader: observingReader(deps.reader, acceptance.observed) } : {};
     const s3 = prepared?.s3 ?? await measurePhase(deps.metrics, "sourceReadMs", () =>
-      readCanonicalScope(scope, siblingKeys, { ...deps, decompress: deps.decompress ?? defaultDecompress }, limits, version, pointerSnapshot.canonicalId));
+      readCanonicalScope(scope, siblingKeys, { ...deps, ...observedReader, decompress: deps.decompress ?? defaultDecompress }, limits, version, pointerSnapshot.canonicalId));
+    // Flag on: stamp or clear once the pass has its outcome. Busy and deferred passes return before this is
+    // called (the lock refusals above, the stream deferral below), so they do neither.
+    const settle = async (result: SearchIndexResult): Promise<SearchIndexResult> => {
+      if (acceptance && siblingFacts)
+        await settleAcceptanceStamp(
+          deps.ch!, scope, stampName, acceptance.stamp,
+          acceptanceOnly(result) && readAsListed(siblingFacts, acceptance.observed) ? acceptance.digest : null,
+          at,
+        );
+      return result;
+    };
     // Output facts need the whole read, or the staged run's facts hooks (Postgres store only): with a
     // facts store and no staged run, a too-large scope stays incomplete (scope_too_large) as before.
     const stagedFacts = !!deps.outputFactsStore && !!deps.staged && !!deps.adapter;
@@ -758,7 +831,7 @@ async function indexSearchScopeBase(scope: SessionScope, deps: SearchIndexDeps, 
       }
       // Never with a facts store: the in-transaction streamed reconcile builds no facts.
       if (deps.outputFactsStore) throw new Error("search index: the streamed reconcile cannot carry output facts");
-      return streamedReconcile(tx, io, scope, deps, deps.stream, limits, pointerSnapshot, s3.admitted, s3.revision, version, fromMs, at);
+      return settle(await streamedReconcile(tx, io, scope, deps, deps.stream, limits, pointerSnapshot, s3.admitted, s3.revision, version, fromMs, at));
     }
     if(!siblingKeys.length||!s3.complete||s3.directorySessionId!==pointerSnapshot.canonicalId||s3.events===null){
       await invalidateDirectoryEvents(tx,scope);
@@ -775,7 +848,7 @@ async function indexSearchScopeBase(scope: SessionScope, deps: SearchIndexDeps, 
         const prior = await pgFacts.previousState(fScope);
         await pgFacts.recordState(fScope, { complete: false, at, range: prior.range, sourceVersion: Number(pointerSnapshot.epoch) });
       }
-      return {manifests:s3.manifests,rows:0,inserted:0,deleted:0,complete:false,...(s3.partial?{partial:true}:{}),reasons:s3.reasons.length?s3.reasons:["canonical_metadata_incomplete"]};
+      return settle({manifests:s3.manifests,rows:0,inserted:0,deleted:0,complete:false,...(s3.partial?{partial:true}:{}),reasons:s3.reasons.length?s3.reasons:["canonical_metadata_incomplete"]});
     }
     const inWindow = s3.rows.filter((r) => tsMillis(`${r.ts.replace(" ", "T")}Z`) >= fromMs);
     // Staged: keyset pages up to the keyed-records cap (never below SEARCH_INDEX_MAX_ROWS).
@@ -895,7 +968,7 @@ async function indexSearchScopeBase(scope: SessionScope, deps: SearchIndexDeps, 
     }
     // Only a complete pass makes the session current; any other leaves it owing one.
     await io.record(scope, s3.revision, inWindow.length, complete, at, pointerSnapshot.canonicalId);
-    return {
+    return settle({
       manifests: s3.manifests,
       rows: inWindow.length,
       inserted,
@@ -903,7 +976,7 @@ async function indexSearchScopeBase(scope: SessionScope, deps: SearchIndexDeps, 
       complete,
       reasons: [...s3.reasons, ...(truncated ? [stagedScan ? STREAM_KEYED_RECORDS_CAP : deps.adapter ? "search_index_truncated" : "clickhouse_truncated"] : []), ...(staleWrite ? ["search_version_conflict"] : [])],
       ...(outputFacts ? { outputFacts } : {}),
-    };
+    });
     });
   } finally {
     if (deps.metrics) {
@@ -1373,6 +1446,199 @@ export async function alreadyCurrent(
   if (rows[0]?.current !== true) return false;
   if (!factsCh) return true;
   return outputFactsComplete(factsCh, { orgId: scope.orgId, workspaceId: scope.workspaceId, harness: scope.harness, sessionId: snapshot.canonicalId });
+}
+
+/**
+ * Where the SEARCH_INDEX_SKIP_* flags apply: the S3-event pass on the hosted legacy ClickHouse path. Never
+ * the managed search-jobs pass (`committedGuard`, set only by search-jobs.ts runSearchJob, so M2's
+ * held/ready/unchanged decisions and reads stay exactly as without the flags), the staged reconcile (no
+ * four-times stream refusal), a portable adapter (the stamp lives in ClickHouse) or either output facts
+ * store (their state is rewritten by every pass). Elsewhere a flag is accepted and does nothing.
+ */
+function inlineSkipsApply(deps: SearchIndexDeps): boolean {
+  return !!deps.ch && !deps.adapter && !deps.staged && !deps.outputFacts && !deps.outputFactsStore && deps.committedGuard !== true;
+}
+
+/** A live sibling pointer row's read-determining facts (a SEARCH_INDEX_SKIP_* flag on only). */
+export interface SiblingPointerFacts {
+  manifest_key: string;
+  session_id: string;
+  machine_id: string;
+  revision: string;
+  content_sha256: string | null;
+  manifest_etag: string | null;
+  scrubbed: boolean;
+  raw_bytes: string;
+}
+
+/**
+ * The canonical sibling listing of indexSearchScopeBase with each row's facts, in one statement: the same
+ * filter and the same order, so the keys and their order are exactly the flag-off listing's.
+ */
+async function siblingPointerFacts(tx: SqlExecutor, scope: SessionScope, canonicalId: string): Promise<SiblingPointerFacts[]> {
+  const { rows } = await tx.query<SiblingPointerFacts>(
+    `SELECT manifest_key, session_id, machine_id, revision::text AS revision, encode(content_sha256, 'hex') AS content_sha256,
+            manifest_etag, scrubbed, raw_bytes::text AS raw_bytes
+       FROM sessions.session_index
+      WHERE org_id=$1 AND workspace_id=$2 AND harness=$3 AND coalesce(canonical_session_id,session_id)=$4 AND deleted_at IS NULL
+      ORDER BY session_id,machine_id`,
+    [scope.orgId, scope.workspaceId, scope.harness, canonicalId],
+  );
+  return rows;
+}
+
+/** What one manifest read returned (the acceptance stamp's read-as-listed check). */
+interface ManifestObservation {
+  revision: string;
+  contentSha256: string;
+  etag: string | null;
+}
+
+/** `reader` that records what each read returned; the reads themselves are unchanged. */
+function observingReader(reader: ManifestReader, observed: Map<string, ManifestObservation>): ManifestReader {
+  return {
+    provider: reader.provider,
+    ...(reader.bucket !== undefined ? { bucket: reader.bucket } : {}),
+    async read(key) {
+      const read = await reader.read(key);
+      if (read) observed.set(key, { revision: String(read.manifest.revision), contentSha256: String(read.manifest.raw?.content_sha256 ?? ""), etag: read.etag ?? null });
+      return read;
+    },
+  };
+}
+
+/** The `search_ingest_state` name of a scope's acceptance stamp (ids hashed: fixed length, no separators). */
+export function acceptanceStampName(scope: SessionScope): string {
+  return ACCEPTANCE_STAMP_PREFIX + createHash("sha256").update(JSON.stringify([scope.orgId, scope.workspaceId, scope.harness, scope.sessionId])).digest("hex");
+}
+
+/**
+ * The digest an acceptance stamp is written and matched under: sha256 over the salt, the scope, its
+ * canonical id and directory epoch (the pointer trigger moves it on any pointer change of the scope or its
+ * canonical id), the window (the stored window_start, or the rolling default's marker), the read limits
+ * that decide whole versus streamed versus refused, the reader's scrub ruleset bound, and every live
+ * sibling pointer row's (key, session, machine, revision, content sha256, etag, scrubbed), sorted. Only
+ * pointer rows and settings enter it: nothing read from the object store or ClickHouse events.
+ */
+export function acceptanceDigest(
+  scope: SessionScope,
+  snapshot: { canonicalId: string; epoch: string },
+  pointers: readonly SiblingPointerFacts[],
+  windowMarker: string,
+  limits: Pick<SearchIndexLimits, "maxScopeBytes" | "maxScopeEvents">,
+  stream: StreamReadLimits | undefined,
+  readerMaxRuleset: number | undefined,
+): string {
+  const rows = pointers
+    .map((p) => JSON.stringify([p.manifest_key, p.session_id, p.machine_id, p.revision, p.content_sha256, p.manifest_etag, p.scrubbed]))
+    .sort();
+  return createHash("sha256")
+    .update(
+      JSON.stringify([
+        ACCEPTANCE_SKIP_VERSION,
+        [scope.orgId, scope.workspaceId, scope.harness, scope.sessionId],
+        [snapshot.canonicalId, snapshot.epoch],
+        windowMarker,
+        [limits.maxScopeBytes, limits.maxScopeEvents],
+        stream ? [stream.maxReadBytes, stream.maxReadEvents] : null,
+        readerMaxRuleset ?? null,
+        rows,
+      ]),
+    )
+    .digest("hex");
+}
+
+/** A stamp read: `none` (no row, or a cleared one), `live` (a row with a value), `failed` (unknown). */
+type StampRead = { state: "none" } | { state: "failed" } | { state: "live"; value: string; atMs: number };
+
+/** The scope's latest stamp row. One bounded read; any failure is `failed`, never a match. */
+async function readAcceptanceStamp(ch: ClickHouseClient, name: string): Promise<StampRead> {
+  try {
+    const rows = await ch.select<{ value: unknown; at_ms: unknown }>(
+      `SELECT value, toUnixTimestamp64Milli(updated_at) AS at_ms
+         FROM ${INGEST_STATE_TABLE}
+        WHERE name = {name:String}
+        ORDER BY updated_at DESC
+        LIMIT 1`,
+      { params: { name }, timeoutMs: 5_000 },
+    );
+    const row = rows[0];
+    if (row === undefined || row.value === "") return { state: "none" };
+    return { state: "live", value: typeof row.value === "string" ? row.value : "", atMs: Number(row.at_ms) };
+  } catch {
+    return { state: "failed" };
+  }
+}
+
+/** Whether a stamp licenses a skip: our format and reason, this digest, written within the age bound. */
+function acceptanceStampMatches(stamp: StampRead, digest: string, at: Date): boolean {
+  if (stamp.state !== "live") return false;
+  const age = Math.abs(at.getTime() - stamp.atMs);
+  if (!Number.isFinite(age) || !(age < SKIP_STATE_MAX_AGE_MS)) return false;
+  let value: unknown;
+  try {
+    value = JSON.parse(stamp.value);
+  } catch {
+    return false;
+  }
+  if (typeof value !== "object" || value === null) return false;
+  const v = value as Record<string, unknown>;
+  return v.v === 1 && v.reason === ACCEPTANCE_MISSING && typeof v.digest === "string" && v.digest === digest;
+}
+
+/** The pass ended incomplete for the acceptance refusal alone, from a full pass (not busy, deferred, partial or skipped). */
+function acceptanceOnly(result: SearchIndexResult): boolean {
+  return (
+    result.complete === false && !result.busy && !result.deferred && !result.partial && !result.skipped && !result.skippedBeforeRead &&
+    result.reasons.length === 1 && result.reasons[0] === ACCEPTANCE_MISSING
+  );
+}
+
+/** Every pointer row was read as listed: the manifest at the pointer's revision, content sha256 and etag. */
+function readAsListed(pointers: readonly SiblingPointerFacts[], observed: ReadonlyMap<string, ManifestObservation>): boolean {
+  return pointers.every((p) => {
+    const o = observed.get(p.manifest_key);
+    return (
+      o !== undefined && o.revision === p.revision && p.content_sha256 !== null &&
+      o.contentSha256.toLowerCase() === p.content_sha256.toLowerCase() && o.etag === p.manifest_etag
+    );
+  });
+}
+
+/**
+ * After a pass with the flag on: stamp an acceptance-only outcome read as listed, else clear a stamp that
+ * was there (or could not be read). Best effort: a failure is logged by code and the pass's result stands.
+ */
+async function settleAcceptanceStamp(
+  ch: ClickHouseClient,
+  scope: SessionScope,
+  name: string,
+  stamp: StampRead,
+  stampDigest: string | null,
+  at: Date,
+): Promise<void> {
+  try {
+    if (stampDigest !== null)
+      await ch.insert(
+        INGEST_STATE_TABLE,
+        [{ name, value: JSON.stringify({ v: 1, reason: ACCEPTANCE_MISSING, digest: stampDigest }), updated_at: chNow(at) }],
+        { timeoutMs: 5_000 },
+      );
+    else if (stamp.state !== "none") {
+      // The read takes the newest updated_at, so the tombstone must sort above the stamp it clears even
+      // when the clock that wrote the stamp ran ahead of this one (equal times never tie either).
+      const clearAt = stamp.state === "live" && Number.isFinite(stamp.atMs) ? new Date(Math.max(at.getTime(), stamp.atMs + 1)) : at;
+      await ch.insert(INGEST_STATE_TABLE, [{ name, value: "", updated_at: chNow(clearAt) }], { timeoutMs: 5_000 });
+    }
+  } catch (error) {
+    log.warn("search index acceptance stamp not written", {
+      stage: "search-index",
+      org_id: scope.orgId,
+      session_id: scope.sessionId,
+      reason: stampDigest !== null ? "acceptance_stamp_write_failed" : "acceptance_stamp_clear_failed",
+      ...errorFields(error),
+    });
+  }
 }
 
 /** The streaming reader's keepalive interval: a third of the consumer pool's 60 s idle timeout. */
