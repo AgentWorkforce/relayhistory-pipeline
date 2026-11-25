@@ -14,6 +14,9 @@
  * Nothing here runs unless a stage sets that mode; the proof stage and every other stage are as before.
  */
 import { createHash } from "node:crypto";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { PIPPEN_PROOF_SANDBOX } from "./sandbox-rules.ts";
 import { alchemyStatePrefix, pippenStateBucket, type AwsRun } from "./state-bucket.ts";
 
@@ -83,6 +86,9 @@ export function assertStateBucketMode(stage: string, inputs: { accountId?: unkno
 export type StateBucketErrorCode =
   | "state_inputs_invalid"
   | "state_issuer_pin_mismatch"
+  | "state_provenance_mismatch"
+  | "state_gone_unproven"
+  | "state_receipt_mismatch"
   | "state_manifest_invalid"
   | "state_lease_expired"
   | "state_teardown_not_empty"
@@ -172,9 +178,10 @@ export function rehearsalIssuerPin(i: IssuerPinned): string {
   return createHash("sha256").update(JSON.stringify([i.stage, i.region, i.accountId, i.boundaryArn, i.roleArn, i.roleDisposition, i.sessionId, i.issuedAt])).digest("hex");
 }
 
-/** The validated context of one rehearsal run: the pinned values, the pin itself. */
+/** The validated context of one rehearsal run: the pinned values, the pin itself, and the run id. */
 export interface RehearsalContext extends IssuerPinned {
   pin: string;
+  runId: string;
 }
 
 /**
@@ -202,7 +209,9 @@ export function rehearsalRunContext(stage: string, inputs: unknown, env: Record<
   const pin = env[ISSUER_PIN_ENV];
   if (pin === undefined || !/^[0-9a-f]{64}$/.test(pin) || pin !== rehearsalIssuerPin(pinned)) throw new StateBucketError("state_issuer_pin_mismatch");
   if (!(now >= Date.parse(issuedAt) && now < Date.parse(rehearsalLeaseEnd({ issuedAt })))) throw new StateBucketError("state_lease_expired");
-  return { ...pinned, pin };
+  const runId = env[RUN_ID_ENV];
+  if (runId === undefined || !UUID.test(runId)) throw new StateBucketError("state_inputs_invalid");
+  return { ...pinned, pin, runId };
 }
 
 /** STS's caller must be exactly the attested lease session for this stage. */
@@ -290,22 +299,68 @@ export function assertValidateOnlyState(aws: AwsRun, ctx: RehearsalContext): { b
   if (ctx.region !== REHEARSAL_REGION) throw new StateBucketError("state_inputs_invalid");
   assertLeaseCaller(aws, ctx.accountId, { [PIPPEN_PROOF_SANDBOX.sessionEnv]: ctx.sessionId, [PIPPEN_PROOF_SANDBOX.execSessionEnv]: ctx.sessionId, [PIPPEN_PROOF_SANDBOX.execAccountEnv]: ctx.accountId });
   const bucket = validatePippenStateBucket(aws, ctx);
-  if (stageStateIsEmpty(aws, { bucket, region: ctx.region, prefix })) assertRehearsalNamesUnused(aws, ctx);
+  if (stageStateIsEmpty(aws, { bucket, region: ctx.region, prefix })) {
+    // First state write of this stage: no name may be in use, then this run's marker is written
+    // before Alchemy writes anything, so a later resume can prove the state is this run's.
+    assertRehearsalNamesUnused(aws, ctx);
+    writeRunMarker(aws, { bucket, prefix, ctx });
+  } else assertRunMarker(aws, { bucket, prefix, ctx });
   return { bucket, prefix };
 }
 
-/** Whether the stage's prefix has no current state object (ListObjectsV2, one key at most). */
+/**
+ * Whether the stage's prefix has no current object (ListObjectsV2, at most one key): the reply must
+ * be well formed, KeyCount exactly 0 or 1 and matching its Contents; anything else refuses.
+ */
 function stageStateIsEmpty(aws: AwsRun, i: { bucket: string; region: string; prefix: string }): boolean {
-  let listed: { KeyCount?: unknown };
+  let listed: Record<string, unknown>;
   try {
     const text = aws(["s3api", "list-objects-v2", "--bucket", i.bucket, "--region", i.region, "--prefix", i.prefix, "--max-keys", "1", "--no-paginate", "--output", "json"]);
     if (!text.trim()) throw new Error("blank");
-    listed = JSON.parse(text) as { KeyCount?: unknown };
+    listed = JSON.parse(text) as Record<string, unknown>;
   } catch {
     throw new StateBucketError("state_bucket_unreadable");
   }
-  if (!Number.isInteger(listed.KeyCount)) throw new StateBucketError("state_bucket_unreadable");
+  if (listed === null || typeof listed !== "object" || Array.isArray(listed)) throw new StateBucketError("state_bucket_unreadable");
+  const contents = listed.Contents;
+  const ok =
+    (listed.KeyCount === 0 && (contents === undefined || (Array.isArray(contents) && contents.length === 0))) ||
+    (listed.KeyCount === 1 && Array.isArray(contents) && contents.length === 1 && typeof (contents[0] as { Key?: unknown })?.Key === "string" && ((contents[0] as { Key: string }).Key).startsWith(i.prefix));
+  if (!ok || (listed.Prefix !== undefined && listed.Prefix !== i.prefix)) throw new StateBucketError("state_bucket_unreadable");
   return listed.KeyCount === 0;
+}
+
+/** The run marker's key: not `.json`, so Alchemy's state store (which lists `*.json` resources) ignores it. */
+export const runMarkerKey = (prefix: string) => `${prefix}__rehearsal_run__.marker`;
+
+/** The run marker's body: this run, this lease, this pin. */
+export function runMarkerBody(ctx: RehearsalContext): string {
+  return JSON.stringify({ schema: 1, stage: ctx.stage, runId: ctx.runId, sessionId: ctx.sessionId, issuedAt: ctx.issuedAt, pin: ctx.pin });
+}
+
+function writeRunMarker(aws: AwsRun, i: { bucket: string; prefix: string; ctx: RehearsalContext }): void {
+  const dir = mkdtempSync(join(tmpdir(), "96bulls-marker-"));
+  try {
+    const file = join(dir, "marker");
+    writeFileSync(file, runMarkerBody(i.ctx), { mode: 0o600 });
+    // Only if absent: never overwrite another run's marker.
+    aws(["s3api", "put-object", "--bucket", i.bucket, "--region", i.ctx.region, "--key", runMarkerKey(i.prefix), "--body", file, "--if-none-match", "*", "--output", "json"]);
+  } catch {
+    throw new StateBucketError("state_provenance_mismatch");
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+}
+
+/** A populated prefix is resumed only when its marker is exactly this run's (run id, lease, pin). */
+function assertRunMarker(aws: AwsRun, i: { bucket: string; prefix: string; ctx: RehearsalContext }): void {
+  let text: string;
+  try {
+    text = aws(["s3", "cp", `s3://${i.bucket}/${runMarkerKey(i.prefix)}`, "-", "--region", i.ctx.region]);
+  } catch {
+    throw new StateBucketError("state_provenance_mismatch");
+  }
+  if (text.trim() !== runMarkerBody(i.ctx)) throw new StateBucketError("state_provenance_mismatch");
 }
 
 /**
@@ -438,6 +493,60 @@ export function rehearsalResourceNames(stage: string = REHEARSAL_STAGE) {
 }
 
 const NOT_FOUND = /ResourceNotFoundException|NonExistentQueue|QueueDoesNotExist|NoSuchEntity/;
+const DENIED = /AccessDenied|UnauthorizedOperation|not authorized/i;
+
+/**
+ * An absence readback: NotFound passes; AccessDenied is never "gone" (a tag-conditioned read of a
+ * deleted resource can answer AccessDenied): `state_gone_unproven`; a success means the resource
+ * exists: `state_resources_remain`; any other failure: `state_teardown_failed`.
+ */
+function absent(aws: AwsRun, args: string[]): void {
+  try {
+    aws(args);
+  } catch (e) {
+    const text = e instanceof Error ? e.message : String(e);
+    if (DENIED.test(text)) throw new StateBucketError("state_gone_unproven");
+    if (NOT_FOUND.test(text)) return;
+    throw new StateBucketError("state_teardown_failed");
+  }
+  throw new StateBucketError("state_resources_remain");
+}
+
+/** DescribeAlarms (metric and composite) strictly: both arrays, no other field, no NextToken. */
+function readAlarms(aws: AwsRun, names: readonly string[], region: string, code: StateBucketErrorCode): { metric: string[]; composite: string[] } {
+  let v: Record<string, unknown>;
+  try {
+    const text = aws(["cloudwatch", "describe-alarms", "--alarm-types", "MetricAlarm", "CompositeAlarm", "--alarm-names", ...names, "--region", region, "--output", "json"]);
+    if (!text.trim()) throw new Error("blank");
+    v = JSON.parse(text) as Record<string, unknown>;
+  } catch (e) {
+    if (DENIED.test(e instanceof Error ? e.message : String(e))) throw new StateBucketError("state_gone_unproven");
+    throw new StateBucketError(code);
+  }
+  if (v === null || typeof v !== "object" || Array.isArray(v) || !Array.isArray(v.MetricAlarms) || !Array.isArray(v.CompositeAlarms) || Object.keys(v).some((k) => k !== "MetricAlarms" && k !== "CompositeAlarms"))
+    throw new StateBucketError(code);
+  const nameOf = (a: unknown) => (typeof (a as { AlarmName?: unknown })?.AlarmName === "string" ? (a as { AlarmName: string }).AlarmName : null);
+  const metric = v.MetricAlarms.map(nameOf), composite = v.CompositeAlarms.map(nameOf);
+  if ([...metric, ...composite].some((n) => n === null)) throw new StateBucketError(code);
+  return { metric: metric as string[], composite: composite as string[] };
+}
+
+/** DescribeLogGroups for an exact name strictly: the array, no other field, no nextToken. */
+function readLogGroups(aws: AwsRun, name: string, region: string, code: StateBucketErrorCode): string[] {
+  let v: Record<string, unknown>;
+  try {
+    const text = aws(["logs", "describe-log-groups", "--log-group-name-prefix", name, "--region", region, "--output", "json"]);
+    if (!text.trim()) throw new Error("blank");
+    v = JSON.parse(text) as Record<string, unknown>;
+  } catch (e) {
+    if (DENIED.test(e instanceof Error ? e.message : String(e))) throw new StateBucketError("state_gone_unproven");
+    throw new StateBucketError(code);
+  }
+  if (v === null || typeof v !== "object" || Array.isArray(v) || !Array.isArray(v.logGroups) || Object.keys(v).some((k) => k !== "logGroups")) throw new StateBucketError(code);
+  const out = v.logGroups.map((g: unknown) => (g as { logGroupName?: unknown })?.logGroupName);
+  if (out.some((n) => typeof n !== "string")) throw new StateBucketError(code);
+  return out as string[];
+}
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
 
 /**
@@ -514,10 +623,9 @@ export function readPhysicalManifest(aws: AwsRun, ctx: RehearsalContext, runId: 
     if (typeof m.UUID !== "string" || !UUID.test(m.UUID) || m.FunctionArn !== fnArn || typeof m.EventSourceArn !== "string") throw new StateBucketError("state_manifest_invalid");
     return { uuid: m.UUID, eventSourceArn: m.EventSourceArn };
   });
-  const alarms = cliJson(aws, ["cloudwatch", "describe-alarms", "--alarm-names", ...names.alarms, ...r]).MetricAlarms;
-  if (!Array.isArray(alarms)) throw new StateBucketError("state_manifest_invalid");
-  const groups = cliJson(aws, ["logs", "describe-log-groups", "--log-group-name-prefix", names.logGroup, ...r]).logGroups;
-  if (!Array.isArray(groups) || !groups.some((g: { logGroupName?: unknown }) => g?.logGroupName === names.logGroup)) throw new StateBucketError("state_manifest_invalid");
+  const alarms = readAlarms(aws, names.alarms, ctx.region, "state_manifest_invalid");
+  if (alarms.composite.length > 0) throw new StateBucketError("state_manifest_invalid");
+  if (!readLogGroups(aws, names.logGroup, ctx.region, "state_manifest_invalid").includes(names.logGroup)) throw new StateBucketError("state_manifest_invalid");
   const body: Omit<PhysicalManifest, "digest"> = {
     schema: 2,
     stage: ctx.stage,
@@ -528,7 +636,7 @@ export function readPhysicalManifest(aws: AwsRun, ctx: RehearsalContext, runId: 
     role: { arn: ctx.roleArn, disposition: ctx.roleDisposition, boundaryArn: ctx.boundaryArn },
     queues,
     mappings: mappings.sort((a, b) => (a.eventSourceArn < b.eventSourceArn ? -1 : 1)),
-    alarms: (alarms as { AlarmName?: unknown }[]).map((a) => String(a?.AlarmName)).sort(),
+    alarms: [...alarms.metric].sort(),
     logGroup: names.logGroup,
   };
   const manifest: PhysicalManifest = { ...body, digest: manifestDigest(body) };
@@ -547,7 +655,7 @@ export function assertManifestComplete(m: unknown, ctx: RehearsalContext, runId:
   const v = m as PhysicalManifest | null | undefined;
   const ok =
     v !== null && typeof v === "object" && v.schema === 2 && v.stage === ctx.stage && v.region === ctx.region && v.accountId === ctx.accountId &&
-    v.binding?.runId === runId && UUID.test(runId) && v.binding.sessionId === ctx.sessionId && v.binding.issuedAt === ctx.issuedAt && v.binding.pin === ctx.pin &&
+    v.binding?.runId === runId && UUID.test(runId) && runId === ctx.runId && v.binding.sessionId === ctx.sessionId && v.binding.issuedAt === ctx.issuedAt && v.binding.pin === ctx.pin &&
     v.function?.name === names.function && v.function.arn === `arn:aws:lambda:${ctx.region}:${ctx.accountId}:function:${names.function}` &&
     v.role?.arn === ctx.roleArn && v.role.disposition === ctx.roleDisposition && v.role.boundaryArn === ctx.boundaryArn &&
     Array.isArray(v.queues) && v.queues.length === names.queues.length &&
@@ -572,39 +680,33 @@ export function assertManifestComplete(m: unknown, ctx: RehearsalContext, runId:
 export function assertManifestGone(aws: AwsRun, m: unknown, ctx: RehearsalContext, runId: string): void {
   assertManifestComplete(m, ctx, runId);
   const r = ["--region", ctx.region, "--output", "json"];
-  const gone = (args: string[]) => {
+  absent(aws, ["lambda", "get-function-configuration", "--function-name", m.function.arn, ...r]);
+  for (const q of m.queues) absent(aws, ["sqs", "get-queue-attributes", "--queue-url", q.url, "--attribute-names", "QueueArn", ...r]);
+  for (const x of m.mappings) absent(aws, ["lambda", "get-event-source-mapping", "--uuid", x.uuid, ...r]);
+  const alarms = readAlarms(aws, m.alarms, ctx.region, "state_teardown_failed");
+  if (alarms.metric.length > 0 || alarms.composite.length > 0) throw new StateBucketError("state_resources_remain");
+  if (readLogGroups(aws, m.logGroup, ctx.region, "state_teardown_failed").includes(m.logGroup)) throw new StateBucketError("state_resources_remain");
+  const { name, path } = roleParts(m.role.arn, ctx.accountId);
+  if (m.role.disposition === "deleted") absent(aws, ["iam", "get-role", "--role-name", name, ...r]);
+  else {
+    let role: { Arn?: unknown; Path?: unknown; PermissionsBoundary?: { PermissionsBoundaryArn?: unknown } } | undefined;
     try {
-      aws([...args, ...r]);
-    } catch (e) {
-      if (NOT_FOUND.test(e instanceof Error ? e.message : String(e))) return;
-      throw new StateBucketError("state_teardown_failed");
-    }
-    throw new StateBucketError("state_resources_remain");
-  };
-  gone(["lambda", "get-function-configuration", "--function-name", m.function.arn]);
-  for (const q of m.queues) gone(["sqs", "get-queue-attributes", "--queue-url", q.url, "--attribute-names", "QueueArn"]);
-  for (const x of m.mappings) gone(["lambda", "get-event-source-mapping", "--uuid", x.uuid]);
-  const read = (args: string[]) => {
-    try {
-      const text = aws([...args, ...r]);
-      if (!text.trim()) throw new Error("blank");
-      return JSON.parse(text) as Record<string, unknown>;
+      role = (JSON.parse(aws(["iam", "get-role", "--role-name", name, ...r])) as { Role?: typeof role }).Role;
     } catch {
       throw new StateBucketError("state_teardown_failed");
     }
-  };
-  const alarms = read(["cloudwatch", "describe-alarms", "--alarm-names", ...m.alarms]);
-  if (!Array.isArray(alarms.MetricAlarms) || (alarms.CompositeAlarms !== undefined && !Array.isArray(alarms.CompositeAlarms))) throw new StateBucketError("state_teardown_failed");
-  if (alarms.MetricAlarms.length > 0 || ((alarms.CompositeAlarms as unknown[] | undefined)?.length ?? 0) > 0) throw new StateBucketError("state_resources_remain");
-  const groups = read(["logs", "describe-log-groups", "--log-group-name-prefix", m.logGroup]);
-  if (!Array.isArray(groups.logGroups)) throw new StateBucketError("state_teardown_failed");
-  if ((groups.logGroups as { logGroupName?: unknown }[]).some((g) => g?.logGroupName === m.logGroup)) throw new StateBucketError("state_resources_remain");
-  const { name, path } = roleParts(m.role.arn, ctx.accountId);
-  if (m.role.disposition === "deleted") gone(["iam", "get-role", "--role-name", name]);
-  else {
-    const role = read(["iam", "get-role", "--role-name", name]).Role as { Arn?: unknown; Path?: unknown; PermissionsBoundary?: { PermissionsBoundaryArn?: unknown } } | undefined;
     if (role?.Arn !== m.role.arn || role.Path !== path || role.PermissionsBoundary?.PermissionsBoundaryArn !== m.role.boundaryArn) throw new StateBucketError("state_resources_remain");
   }
+}
+
+/**
+ * The independent receipt at execute: the digest the broker recorded when the manifest was written
+ * (its receipt), not one recomputed from the local file, must equal the manifest's digest.
+ */
+export function assertManifestReceipt(m: unknown, expectedDigest: string | undefined): void {
+  if (expectedDigest === undefined || !/^[0-9a-f]{64}$/.test(expectedDigest)) throw new StateBucketError("state_receipt_mismatch");
+  const v = m as { digest?: unknown } | null;
+  if (v === null || typeof v !== "object" || v.digest !== expectedDigest || manifestDigest(v as never) !== expectedDigest) throw new StateBucketError("state_receipt_mismatch");
 }
 
 /** A role ARN's name and path, in exactly the given account. */
@@ -622,26 +724,12 @@ export function assertRehearsalNamesUnused(aws: AwsRun, i: { region: string; sta
   rehearsalStatePrefix(i.stage);
   const names = rehearsalResourceNames(i.stage);
   const r = ["--region", i.region, "--output", "json"];
-  const unused = (args: string[]) => {
-    try {
-      aws([...args, ...r]);
-    } catch (e) {
-      if (NOT_FOUND.test(e instanceof Error ? e.message : String(e))) return;
-      throw new StateBucketError("state_teardown_failed");
-    }
-    throw new StateBucketError("state_resources_remain");
-  };
-  unused(["lambda", "get-function-configuration", "--function-name", names.function]);
-  for (const q of names.queues) unused(["sqs", "get-queue-url", "--queue-name", q]);
-  let alarms: Record<string, unknown>, groups: Record<string, unknown>;
-  try {
-    alarms = JSON.parse(aws(["cloudwatch", "describe-alarms", "--alarm-names", ...names.alarms, ...r]));
-    groups = JSON.parse(aws(["logs", "describe-log-groups", "--log-group-name-prefix", names.logGroup, ...r]));
-  } catch {
-    throw new StateBucketError("state_teardown_failed");
-  }
-  if (!Array.isArray(alarms.MetricAlarms) || !Array.isArray(groups.logGroups)) throw new StateBucketError("state_teardown_failed");
-  if (alarms.MetricAlarms.length > 0 || (groups.logGroups as { logGroupName?: unknown }[]).some((g) => g?.logGroupName === names.logGroup)) throw new StateBucketError("state_resources_remain");
+  absent(aws, ["lambda", "get-function-configuration", "--function-name", names.function, ...r]);
+  for (const q of names.queues) absent(aws, ["sqs", "get-queue-url", "--queue-name", q, ...r]);
+  // Metric and composite alarms of these names, and the exact log group.
+  const alarms = readAlarms(aws, names.alarms, i.region, "state_teardown_failed");
+  if (alarms.metric.length > 0 || alarms.composite.length > 0) throw new StateBucketError("state_resources_remain");
+  if (readLogGroups(aws, names.logGroup, i.region, "state_teardown_failed").includes(names.logGroup)) throw new StateBucketError("state_resources_remain");
 }
 
 /** The tag every rehearsal resource carries, required on create and on every act (lease policy). */
@@ -676,7 +764,7 @@ export function rehearsalLeaseEnd(i: { issuedAt?: string; teardownCompletedAt?: 
  * The session's permissions are the role's policies intersected with these. Every Allow ends before
  * the end (DateLessThan), and a Deny on everything applies at and after it (DateGreaterThanEquals).
  */
-export function rehearsalLeasePolicies(i: { accountId: string; roleArn: string; stage?: string; region?: string; issuedAt?: string; expiresAt?: string }) {
+export function rehearsalLeasePolicies(i: { accountId: string; roleArn: string; stage?: string; region?: string; issuedAt?: string; expiresAt?: string; mappingUuids?: readonly string[] }) {
   const stage = i.stage ?? REHEARSAL_STAGE;
   const region = i.region ?? REHEARSAL_REGION;
   if (region !== REHEARSAL_REGION || !/^\d{12}$/.test(i.accountId)) throw new StateBucketError("state_inputs_invalid");
@@ -761,6 +849,17 @@ export function rehearsalLeasePolicies(i: { accountId: string; roleArn: string; 
           statement("NamedReads", ["sqs:GetQueueUrl", "cloudwatch:DescribeAlarms"], [...queueArn, ...alarmArn], {}),
           // Only the pinned execution role (the role-disposition check).
           statement("RoleRead", ["iam:GetRole"], i.roleArn, {}),
+          // Absence readbacks by exact name, without the tag condition, so a deleted resource reads as
+          // NotFound rather than AccessDenied (teardown and the stage-A collision check).
+          statement("GoneReads", ["lambda:GetFunctionConfiguration", "sqs:GetQueueAttributes"], [fnArn, ...queueArn], {}),
+          // The mappings' absence readback needs their UUIDs, known only after creation: the teardown
+          // lease is issued with the manifest's UUIDs (mappingUuids); without them it is omitted.
+          ...(i.mappingUuids && i.mappingUuids.length
+            ? [statement("GoneMappings", ["lambda:GetEventSourceMapping"], i.mappingUuids.map((u) => {
+                if (!UUID.test(u)) throw new StateBucketError("state_inputs_invalid");
+                return `arn:aws:lambda:${region}:${a}:event-source-mapping:${u}`;
+              }), {})]
+            : []),
           // Reads IAM cannot narrow to a resource (documented): listing mappings, metric data, query results.
           statement("Reads", ["lambda:ListEventSourceMappings", "cloudwatch:GetMetricStatistics", "cloudwatch:GetMetricData", "logs:DescribeLogGroups", "logs:GetQueryResults"], "*", {}),
         ],

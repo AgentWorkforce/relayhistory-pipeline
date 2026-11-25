@@ -454,6 +454,26 @@
             }
           },
           {
+            "Sid": "GoneReads",
+            "Effect": "Allow",
+            "Action": [
+              "lambda:GetFunctionConfiguration",
+              "sqs:GetQueueAttributes"
+            ],
+            "Resource": [
+              "arn:aws:lambda:us-west-2:<account>:function:96bulls-aws-rehearse-p1-1126-session-pipeline",
+              "arn:aws:sqs:us-west-2:<account>:96bulls-aws-rehearse-p1-1126-session-events",
+              "arn:aws:sqs:us-west-2:<account>:96bulls-aws-rehearse-p1-1126-session-events-dlq",
+              "arn:aws:sqs:us-west-2:<account>:96bulls-aws-rehearse-p1-1126-session-search",
+              "arn:aws:sqs:us-west-2:<account>:96bulls-aws-rehearse-p1-1126-session-search-dlq"
+            ],
+            "Condition": {
+              "DateLessThan": {
+                "aws:CurrentTime": "2026-11-27T08:00:00Z"
+              }
+            }
+          },
+          {
             "Sid": "Reads",
             "Effect": "Allow",
             "Action": [

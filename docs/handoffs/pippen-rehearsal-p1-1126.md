@@ -53,9 +53,21 @@ bound it. Hence:
   and that the lease has not ended. The capture calls it right after reading the inputs; the stack
   calls it at module load; a full-entry test drives `capturePlan` with fake `aws` and `git` and
   asserts zero calls for malformed inputs, a wrong pin and an ended lease.
-- `prepareStateBackend` then either validates (validate-only: the attested caller, the exact
-  prefix, the bucket already in shape, and, while this stage's state is empty, that none of the
-  stage's names is in use; no writes) or runs the old ensure path. It is the state layer of both the
+- `prepareStateBackend` then either validates (validate-only) or runs the old ensure path. In
+  validate-only it checks the attested caller (STS), the exact prefix and the bucket, then lists the
+  stage prefix once (`ListObjectsV2 --max-keys 1`; the reply must be well formed with `KeyCount`
+  exactly 0 or 1 matching its `Contents`, anything else refuses):
+  - **empty** (stage A not applied): none of the stage's names may be in use (the function, the four
+    queues, the five names as metric **or composite** alarms, the log group; alarm and log-group
+    replies are read strictly: both alarm arrays, no pagination token, no unknown field), then
+    this run's **marker** is written (`PutObject --if-none-match "*"`) at
+    `96bulls/96bulls-aws/aws-rehearse-p1-1126/__rehearsal_run__.marker`, holding the run id, lease
+    session, issuance time and pin. It is not `.json`, so Alchemy's state store, which lists `*.json`
+    resources, ignores it; it is the stage's first state write.
+  - **populated**: resumed only if the marker is exactly this run's (run id, lease session,
+    issuance time, pin); a missing marker, another run's or another lease's refuses
+    (`state_provenance_mismatch`). A later lease therefore needs a new run against a torn-down
+    prefix. It is the state layer of both the
   capture and the Alchemy plan/deploy for the stage, so stage A's creates cannot run before it. Only reads:
   `sts:GetCallerIdentity`, `GetBucketVersioning` (it also answers NoSuchBucket),
   `GetBucketEncryption`, `GetPublicAccessBlock`, `GetBucketOwnershipControls`, `GetBucketTagging`.
@@ -84,12 +96,18 @@ bound it. Hence:
    must exist; fewer ids refuse. The file is written once (`wx`) and never overwritten, so it
    survives partial destroys.
 2. `alchemy destroy` for the stage (or the pippen sweeper), possibly in several partial passes.
-3. `--execute`: inputs, issuer pin, attested caller and bucket checked; then the manifest must be
-   present and complete (`assertManifestComplete`; missing, or fewer than the expected ids, refuses)
+3. `--execute --expect-manifest-digest <sha256>`: inputs, issuer pin, attested caller and bucket
+   checked; then the **independent receipt**: the digest the broker recorded when the manifest was
+   written (from its receipt, not recomputed from the local file) must equal the manifest's digest
+   (`assertManifestReceipt`; a manifest edited and re-sealed locally no longer matches). Then the
+   manifest must be complete (`assertManifestComplete`; missing, or fewer than the expected ids, refuses)
    and **every recorded id must read back as gone** (`assertManifestGone`): the function by ARN, each
    queue by URL, each mapping by UUID, the alarms list empty, no log group of the exact name, and
    the role per its disposition (deleted: not found; retained: present at `/pippen/workload/`). A
-   remaining id refuses (`state_resources_remain`); rerun after the next destroy pass. Only then the
+   remaining id refuses (`state_resources_remain`); rerun after the next destroy pass. An
+   **AccessDenied** answer is never "gone" (`state_gone_unproven`): a read under a resource-tag
+   condition of a deleted resource can be denied rather than not found, so the lease carries
+   untagged exact-name absence reads (below). Only then the
    state teardown: list every version and delete marker under exactly
    `96bulls/96bulls-aws/aws-rehearse-p1-1126/` (strict page validation as before; any key outside the
    prefix refuses before anything is deleted), `DeleteObjects` by key and version id, and an
@@ -122,7 +140,7 @@ The broker (layered-infra-ops) issues the lease with `sts:AssumeRole` on the san
   outside `us-west-2`, any write to a `pippen-sbx-alchemy-state-*` bucket, and removing the
   `rehearsal` tag;
 - `PolicyArns`: three customer-managed policies the broker creates from `managed`
-  (`96bulls-rehearse-p1-1126-state` 1,500, `-create` 3,919, `-act` about 4,700 (it names the role ARN); limit 6,144);
+  (`96bulls-rehearse-p1-1126-state` 1,500, `-create` 3,919, `-act` about 5,300 (it names the role ARN; about 5,650 with the two mapping UUIDs of the teardown lease); limit 6,144);
 - `DurationSeconds`: no more than `rehearsalLeaseEnd({ issuedAt })` minus issuance (at most 6 h);
 - the environment `pippen sandbox exec` gives the session: `PIPPEN_SANDBOX_ACCOUNT_ID`,
   `PIPPEN_SANDBOX_SESSION_ID` and `PIPPEN_REHEARSAL_ISSUER_PIN_SHA256`.
@@ -152,6 +170,12 @@ The session's permissions are the role's policies intersected with these session
   `event-source-mapping:*` by their own tag **and** `lambda:FunctionArn` equal to the exact function
   (teardown checks each recorded UUID); alarm put and delete; the log group's
   retention, deletion, tag reads, `StartQuery` and `FilterLogEvents`.
+- Absence readbacks (untagged, exact names, so a deleted resource answers NotFound, not
+  AccessDenied): `lambda:GetFunctionConfiguration` on the exact function and
+  `sqs:GetQueueAttributes` on the four exact queues (`GoneReads`); `lambda:GetEventSourceMapping`
+  on the two exact mapping ARNs (`GoneMappings`), which exist only after creation: the teardown
+  lease is issued with the manifest's two UUIDs (`rehearsalLeasePolicies({ mappingUuids })`), and
+  the earlier lease omits it.
 - Reads narrowed to the stage's names (no tag condition, since they must also answer "not found"):
   `sqs:GetQueueUrl` and `cloudwatch:DescribeAlarms` on the exact queues and alarms; `iam:GetRole`
   only on the pinned execution role ARN (the role-disposition check).
@@ -209,7 +233,24 @@ receipts (kept outside the repository, referenced by hash in the run's handoff):
 5. Revocation at teardown completion: the revocation action taken (for example the role's
    revoke-older-sessions deny, or deleting the managed policy versions) with its time, and a
    failed call with the lease's credentials after it.
-6. The physical manifest's digest as printed at `--manifest`, and the run id.
+6. The physical manifest's digest as printed at `--manifest`, and the run id: this is the value
+   passed to `--execute --expect-manifest-digest`, and it is evidence only because the broker
+   recorded it independently of the local file. The issuer pin needs the same trusted provenance:
+   the environment value is checked, its origin is the broker's receipt.
+7. The teardown lease, issued with the manifest's two mapping UUIDs (`GoneMappings`).
+
+## Broker and live-evidence items (not provable offline)
+
+- **Broad regional reads**, resource `*` because IAM cannot narrow them: `lambda:ListEventSourceMappings`,
+  `cloudwatch:GetMetricStatistics`, `cloudwatch:GetMetricData`, `logs:DescribeLogGroups`,
+  `logs:GetQueryResults`. The broker decides each: keep (read-only metadata and metric/log data of
+  the sandbox account), or drop and accept the guard or runbook query it serves cannot run.
+- **Live AWS behaviour** to observe in the sandbox and record: that the create calls succeed with
+  the request-tag conditions (including whether SQS, Lambda, CloudWatch and Logs also authorize
+  their tag action at create against the strict tag statement); that event source mappings accept
+  the tag and the `lambda:FunctionArn` condition on create, update, delete and get; that the
+  untagged exact-name reads answer NotFound for deleted resources; and that the session ends at the
+  issued expiry and is refused after revocation.
 
 ## Not covered (blockers before the rehearsal can run)
 
@@ -233,3 +274,6 @@ receipts (kept outside the repository, referenced by hash in the run's handoff):
   their receipts (above) are not produced by this code; the pin's provenance is the broker's alone.
 - Non-adoption under concurrent creation or standalone use of the lease, and create-time tagging
   under the strict tag statement, are residuals for the issuer (see Teardown and Lease).
+- **Gates still open:** the non-prod render of the session pipeline; the proof-account stage rule;
+  the execution-role wiring (path and boundary of the Lambda role); the revised scope decision; the
+  issuer's duration and revocation; budget and teardown evidence from a real run.

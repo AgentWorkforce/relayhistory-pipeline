@@ -10,7 +10,8 @@
  *       # BEFORE any destroy: read every resource id from AWS and write the physical manifest
  *       # (.96bulls/aws-rehearse-p1-1126/physical-manifest.json, gitignored); never overwritten
  *   bun scripts/rehearsal-state-teardown.ts             # dry run: list and count the state versions
- *   bun scripts/rehearsal-state-teardown.ts --execute   # after the destroy: every manifest id gone, then delete the state
+ *   bun scripts/rehearsal-state-teardown.ts --execute --expect-manifest-digest <sha256 from the broker receipt>
+ *       # after the destroy: the receipt's digest, every manifest id gone, then delete the state
  *
  * Account and region come from .96bulls/aws-rehearse-p1-1126/aws-inputs.json (gitignored).
  */
@@ -20,11 +21,11 @@ import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import {
   REHEARSAL_STAGE,
-  RUN_ID_ENV,
   StateBucketError,
   assertLeaseCaller,
   assertManifestComplete,
   assertManifestGone,
+  assertManifestReceipt,
   manifestDigest,
   readPhysicalManifest,
   rehearsalRunContext,
@@ -35,8 +36,10 @@ import type { AwsRun } from "../stacks/aws/state-bucket.ts";
 
 const args = process.argv.slice(2);
 const flag = (f: string) => args.includes(f);
-if (args.some((a) => a !== "--execute" && a !== "--manifest") || (flag("--manifest") && flag("--execute")))
-  throw new Error("Usage: bun scripts/rehearsal-state-teardown.ts [--manifest | --execute]   (with NINETY_SIX_BULLS_REHEARSAL_RUN_ID set)");
+const expected = args.includes("--expect-manifest-digest") ? args[args.indexOf("--expect-manifest-digest") + 1] : undefined;
+const known = new Set(["--execute", "--manifest", "--expect-manifest-digest", expected ?? ""]);
+if (args.some((a) => !known.has(a)) || (flag("--manifest") && flag("--execute")) || (flag("--execute") && !expected) || (!flag("--execute") && expected))
+  throw new Error("Usage: bun scripts/rehearsal-state-teardown.ts [--manifest | --execute --expect-manifest-digest <sha256>]   (with NINETY_SIX_BULLS_REHEARSAL_RUN_ID set)");
 const root = fileURLToPath(new URL("..", import.meta.url));
 const dir = join(root, ".96bulls", REHEARSAL_STAGE);
 const manifestPath = join(dir, "physical-manifest.json");
@@ -59,7 +62,7 @@ try {
   // Before any AWS call: inputs, lease env, the issuer pin (account, boundary, role and its
   // disposition, lease) and the lease's end; then STS proves the session.
   const ctx = rehearsalRunContext(REHEARSAL_STAGE, inputs, process.env)!;
-  const runId = process.env[RUN_ID_ENV] ?? "";
+  const runId = ctx.runId;
   assertLeaseCaller(aws, ctx.accountId, process.env);
   if (flag("--manifest")) {
     // Written once, before any destroy, and kept across partial destroys: never overwritten.
@@ -80,6 +83,8 @@ try {
     } catch {
       throw new StateBucketError("state_manifest_invalid");
     }
+    // The independent receipt first: the digest the broker recorded at --manifest, not a local recomputation.
+    assertManifestReceipt(manifest, expected);
     assertManifestComplete(manifest, ctx, runId);
     assertManifestGone(aws, manifest, ctx, runId);
   }
