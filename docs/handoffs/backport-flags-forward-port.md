@@ -287,6 +287,7 @@ meaning a pass that carries the invocation's `streamSlot`. The self-host consume
     before every chunk.
   - A stop between chunks keeps the deletes already done and leaves the scope owing a pass
     (`scope_too_large, stream_deadline`, `needs_full = 1`).
+  - The reserve is also rechecked after each pre-statement lock check, immediately before the statement runs.
   - After the last delete statement and before the directory and catalog writes, the reserve is checked,
     then the lock, then the reserve again. The lock check can itself take time, so the second reserve check
     closes that gap.
@@ -299,19 +300,31 @@ meaning a pass that carries the invocation's `streamSlot`. The self-host consume
   Any answer but `ok = true` throws `stream_keepalive_failed`, which is retryable. After
   that no row is inserted or deleted, no directory or catalog write happens and no final state row is
   written. The message fails and is redelivered.
-- **`needs_full = 1` before any read, cleared only after COMMIT.** A hosted pass records `needs_full = 1`
-  at the highest live sibling revision, one millisecond before its own state time. It does this before
-  any source read, including manifest admission (`readCanonicalScope`).
-  - **Completing rows wait for COMMIT.** The rows that clear the marker (needs_full = 0) are written only
-    after the Postgres transaction commits (`deferCompleteRecord`).
-  - **On rollback.** A rollback, or a COMMIT error with an unknown outcome, never writes them, so the
-    marker stands.
-  - **Fenced against newer passes.** After COMMIT a completing row is written only if the scope's latest
-    state row is not newer than this pass's own marker. A newer pass may have marked the scope in the
-    meantime (an overlapping redelivery); it then owns the outcome, and the line "search index completion
-    not recorded" is logged with `completion_superseded`. If the fence read fails, nothing is written.
-  - **Result.** An interrupted pass leaves the scope owing a full pass, and a failed or partial state is
-    never overwritten as complete. The next pass reads in full.
+- **`needs_full = 1` before any read, cleared only after COMMIT, with per-scope monotonic ownership
+  (`HostedState`).** This covers every key `recordState` writes: the scope's session id and its canonical id.
+  - **Marker.** Under the pass's scope and canonical locks, before any source read (including manifest
+    admission), the pass writes a marker on every key. It is written at M = max(pass time - 1 ms, every key's
+    latest `synced_at` + 2 ms), with `needs_full = 1` and a random per-pass token in `scanned_rows`. The
+    pass's other incomplete rows go at M + 1, and its completing rows at M + 1.
+  - **Ordering does not depend on wall time across invocations.** A later marker is computed from the rows
+    already there, so it is at least M + 2 and always sorts above this pass's rows. That holds for a later
+    pass in the same millisecond, under clock skew, and for one injected between this pass's fence read and
+    its write.
+  - **Completing rows wait for COMMIT.** `finalize` runs in a transaction of its own. It takes the scope and
+    canonical try-locks, the same keys a pass takes first, reads every key's latest row, and clears only if
+    each row is exactly this pass's marker: same time, `needs_full = 1`, same token, same revision.
+  - **Serialized.** A later pass needs those locks to write its marker, so the fence read and the completing
+    write cannot interleave with it.
+  - **Outcomes other than a clear:**
+
+    | Case | Effect |
+    | --- | --- |
+    | A lock held by another pass, or a newer valid marker | That pass owns the outcome. Logged as `completion_superseded`. |
+    | An empty, malformed, foreign or unreadable reply | Logged as `completion_marker_missing`, `_malformed`, `_foreign` or `completion_fence_unreadable`. The pass fails retryably with `search_completion_unrecorded`, so SQS redelivers the message and M2 retries the job. |
+    | A rollback, or a COMMIT error with an unknown outcome | Nothing is written. |
+
+    In every case the scope stays owed, and the next pass is full.
+  - **Erase.** An erase pass is marked and fenced the same way.
 - **Strict keyset pages.** Every keyset page of the ClickHouse scan must meet three conditions before
   anything is projected or written:
   - it holds at most the rows asked for;
