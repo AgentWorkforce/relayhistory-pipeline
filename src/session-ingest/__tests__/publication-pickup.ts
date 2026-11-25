@@ -215,18 +215,8 @@ export async function checkPublicationPickup(pg:PGlite, store:ObjectStore, key:s
   await expect(forge("INSERT INTO sessions.pipeline_jobs(stage,work_key,trace_id,org_id,workspace_id,session_id,message) VALUES ('search-index','forged',gen_random_uuid(),'f','f','f','{}')")).rejects.toMatchObject({code:"42501"});
 
   expect((await wakes()).rows).toEqual(beforeReplay);
-  // The independent search role can lease and ACK, but cannot change the
-  // message on an existing row. Roll back the synthetic ACK for later checks.
-  await pg.exec("GRANT USAGE ON SCHEMA sessions TO bulls96_search_wake_consumer; GRANT SELECT,UPDATE,DELETE ON sessions.pipeline_jobs TO bulls96_search_wake_consumer; CREATE POLICY fixture_search_consumer ON sessions.pipeline_jobs TO bulls96_search_wake_consumer USING(true) WITH CHECK(true)");
-  const restoreAck=Error("restore pending search wake");
-  await expect(pg.transaction(async tx=>{
-    await tx.exec("SET LOCAL ROLE bulls96_search_wake_consumer");
-    const leased=await tx.query("UPDATE sessions.pipeline_jobs SET lease_id=gen_random_uuid() WHERE stage='search-index' AND work_key=$1 RETURNING id",[wk]);
-    expect(leased.rows).toHaveLength(1);
-    const acked=await tx.query("DELETE FROM sessions.pipeline_jobs WHERE stage='search-index' AND work_key=$1 AND lease_id IS NOT NULL RETURNING id",[wk]);
-    expect(acked.rows).toEqual(leased.rows);
-    throw restoreAck;
-  })).rejects.toBe(restoreAck);
+  // There is no dedicated consumer role: the runtime leases and settles only through the owner's
+  // claim_search_jobs_v1 / settle_search_job_v1 (search-jobs-definer.pglite.test.ts).
   const search = new PGlite({extensions:{pg_trgm}});
   try {
     await search.exec("CREATE EXTENSION pg_trgm");

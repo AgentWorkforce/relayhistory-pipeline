@@ -17,6 +17,8 @@
  */
 import { afterAll, afterEach, beforeAll, describe, expect, test } from "bun:test";
 import type { PGlite } from "@electric-sql/pglite";
+import { readFileSync } from "node:fs";
+import { join } from "node:path";
 import { deadLetterId, type StageMessage } from "@rhc/lib/pipeline/dlq.ts";
 import { RUNTIME_APPLICATION_TABLE_PRIVILEGES } from "../../hoopdb/migrate-guards.ts";
 import {
@@ -52,16 +54,18 @@ const FIXTURES = `
 CREATE FUNCTION public.fx_state() RETURNS jsonb LANGUAGE sql SECURITY DEFINER SET search_path = pg_catalog AS $$
   SELECT jsonb_build_object(
     'jobs', coalesce((SELECT jsonb_agg(jsonb_build_object('id', j.id::text, 'stage', j.stage, 'epoch', j.message->'payload'->>'epoch',
-              'lease', j.lease_id::text, 'attempts', j.attempts, 'dlq', j.dlq, 'visible', j.visible_at <= now(),
+              'lease', j.lease_id::text, 'attempts', j.attempts, 'dlq', j.dlq, 'visible', j.visible_at <= now(), 'trace', j.trace_id::text,
               'in', round(extract(epoch FROM j.visible_at - now()))::int, 'message', j.message) ORDER BY j.id)
              FROM sessions.pipeline_jobs j), '[]'::jsonb),
     'receipts', coalesce((SELECT jsonb_agg(jsonb_build_object('id', c.job_id::text, 'lease', c.lease_id::text, 'epoch', c.claimed_epoch,
-              'attempts', c.claimed_attempts, 'message', c.claimed_message, 'ttl', round(extract(epoch FROM c.lease_until - now()))::int) ORDER BY c.job_id)
+              'attempts', c.claimed_attempts, 'message', c.claimed_message, 'ttl', round(extract(epoch FROM c.lease_until - now()))::int,
+              'live_at_tx_start', c.lease_until > now(), 'live_on_clock', c.lease_until > clock_timestamp()) ORDER BY c.job_id)
              FROM sessions.search_job_claims c), '[]'::jsonb),
     'letters', coalesce((SELECT jsonb_agg(jsonb_build_object('id', d.id, 'state', d.state, 'dead_count', d.dead_count,
-              'resolution', d.resolution, 'message', d.message) ORDER BY d.id) FROM sessions.pipeline_dead_letters d), '[]'::jsonb),
+              'resolution', d.resolution, 'message', d.message, 'provenance', jsonb_build_object('trace', d.trace_id::text,
+              'org', d.org_id, 'ws', d.workspace_id, 'session', d.session_id, 'machine', d.machine_id)) ORDER BY d.id) FROM sessions.pipeline_dead_letters d), '[]'::jsonb),
     'events', coalesce((SELECT jsonb_agg(jsonb_build_object('status', e.status, 'attempt', e.attempt, 'trace', e.trace_id::text,
-              'key', e.idempotency_key, 'attrs', e.attrs, 'code', e.error->>'code') ORDER BY e.at, e.status)
+              'key', e.idempotency_key, 'attrs', e.attrs, 'code', e.error->>'code') ORDER BY e.attempt, e.at, e.status)
              FROM sessions.pipeline_events e WHERE e.stage = 'search-index'), '[]'::jsonb))
 $$;
 -- §3.1's max-epoch merge, by the owner (the writer): a newer epoch replaces the message and resets the budget; a
@@ -77,6 +81,11 @@ $$;
 CREATE FUNCTION public.fx_expire() RETURNS void LANGUAGE sql SECURITY DEFINER SET search_path = pg_catalog AS $$
   UPDATE sessions.pipeline_jobs SET visible_at = now() - interval '1 second' WHERE stage = 'search-index';
   UPDATE sessions.search_job_claims SET lease_until = now() - interval '1 second';
+$$;
+-- The lease (row and receipt) ends p_ms after the wall clock now: inside a caller's transaction, after its start.
+CREATE FUNCTION public.fx_lease_ends_in(p_ms integer) RETURNS void LANGUAGE sql SECURITY DEFINER SET search_path = pg_catalog AS $$
+  UPDATE sessions.pipeline_jobs SET visible_at = clock_timestamp() + make_interval(secs => p_ms / 1000.0) WHERE stage = 'search-index' AND lease_id IS NOT NULL;
+  UPDATE sessions.search_job_claims SET lease_until = clock_timestamp() + make_interval(secs => p_ms / 1000.0);
 $$;
 CREATE FUNCTION public.fx_attempts(p_id bigint, n integer) RETURNS void LANGUAGE sql SECURITY DEFINER SET search_path = pg_catalog AS $$
   UPDATE sessions.pipeline_jobs SET attempts = n WHERE id = p_id
@@ -96,14 +105,15 @@ BEGIN
   RETURN NEW;
 END $$;
 CREATE TRIGGER fx_fail_events BEFORE INSERT ON sessions.pipeline_events FOR EACH ROW EXECUTE FUNCTION public.fx_fail_events();
-GRANT EXECUTE ON FUNCTION public.fx_state(), public.fx_wake(jsonb), public.fx_expire(), public.fx_attempts(bigint, integer),
+GRANT EXECUTE ON FUNCTION public.fx_state(), public.fx_wake(jsonb), public.fx_expire(), public.fx_lease_ends_in(integer), public.fx_attempts(bigint, integer),
   public.fx_other_stage(uuid, text) TO PUBLIC;
 `;
 
 type State = {
-  jobs: Array<{ id: string; stage: string; epoch: string; lease: string | null; attempts: number; dlq: boolean; visible: boolean; in: number; message: StageMessage }>;
-  receipts: Array<{ id: string; lease: string; epoch: number; attempts: number; message: StageMessage; ttl: number }>;
-  letters: Array<{ id: string; state: string; dead_count: number; resolution: string | null; message: StageMessage }>;
+  jobs: Array<{ id: string; stage: string; epoch: string; trace: string; lease: string | null; attempts: number; dlq: boolean; visible: boolean; in: number; message: StageMessage }>;
+  receipts: Array<{ id: string; lease: string; epoch: number; attempts: number; message: StageMessage; ttl: number; live_at_tx_start: boolean; live_on_clock: boolean }>;
+  letters: Array<{ id: string; state: string; dead_count: number; resolution: string | null; message: StageMessage;
+    provenance: { trace: string; org: string; ws: string; session: string | null; machine: string | null } }>;
   events: Array<{ status: string; attempt: number; trace: string; key: string; attrs: Record<string, unknown>; code: string | null }>;
 };
 
@@ -212,6 +222,69 @@ describe("claim and settle as the unprivileged login (EXECUTE on the two RPCs on
     expect(s.letters[0]!.message).toEqual(last!.claimedMessage);
     expect(s.letters[0]!.message).toEqual(w);
     expect(s.events.at(-1)).toMatchObject({ status: "dead_lettered", attempt: 12, code: "search_index_held_exhausted" });
+  }, 120_000);
+
+  test("the attempt-12 race: N exhausts after N+1 (another trace) merged; the letter is wholly N's receipt, the row N+1's, reopened", async () => {
+    const wN = wake(scope, 7), wN1 = wake(scope, 8);
+    expect(wN1.ctx.traceId).not.toBe(wN.ctx.traceId);
+    const { pg, state, wakeNow } = await asLogin("bare", async (p) => {
+      await seeded(wN)(p);
+      // Fixture: the row has already used 11 attempts, so the next claim is the 12th.
+      await p.query("UPDATE sessions.pipeline_jobs SET attempts = 11 WHERE stage = 'search-index'");
+    });
+    const c = await claimOne(pg);
+    expect({ attempts: c.attempts, epoch: c.claimedEpoch, message: c.claimedMessage }).toEqual({ attempts: 12, epoch: 7, message: wN });
+    await wakeNow(wN1);
+    // Fixture soundness: the live row now carries N+1's message and trace, a reset budget, still under N's lease.
+    const merged = (await state()).jobs;
+    expect(merged.map((j) => ({ lease: j.lease, attempts: j.attempts, message: j.message }))).toEqual([{ lease: c.lease, attempts: 0, message: wN1 }]);
+    expect(await settleSearchJob(pg, c, { retry: 0 })).toEqual({ applied: true, action: "parked_reopened" });
+    const s = await state();
+    expect(s.letters.map((l) => ({ id: l.id, state: l.state, message: l.message }))).toEqual([{ id: searchLetterId(wN), state: "dead", message: wN }]);
+    expect(s.letters[0]!.provenance).toEqual({ trace: wN.ctx.traceId, org: scope.orgId, ws: scope.workspaceId, session: scope.sessionId, machine: null });
+    expect(s.jobs.map((j) => ({ lease: j.lease, attempts: j.attempts, visible: j.visible, trace: j.trace, message: j.message })))
+      .toEqual([{ lease: null, attempts: 0, visible: true, trace: wN1.ctx.traceId, message: wN1 }]);
+    expect(s.receipts).toEqual([]);
+    expect(s.events.map((e) => ({ status: e.status, trace: e.trace, attempt: e.attempt }))).toEqual([{ status: "dead_lettered", trace: wN.ctx.traceId, attempt: 12 }]);
+  }, 120_000);
+
+  test("lease freshness is the wall clock after the locks: a lease that ends inside the settling transaction applies nothing", async () => {
+    const { pg, state } = await asLogin("bare", seeded(wake(scope, 7)));
+    const c = await claimOne(pg);
+    // One transaction: it starts while the lease is live (its now() is before the lease end), the lease then ends,
+    // and only then is the settlement made. Judged on the transaction start it would apply; it must not.
+    await pg.exec("BEGIN");
+    await pg.query("SELECT public.fx_lease_ends_in(300)");
+    await pg.query("SELECT pg_sleep(0.6)");
+    // Fixture soundness: on the transaction-start clock the lease is still live; on the wall clock it has ended.
+    expect((await state()).receipts.map((r) => ({ tx: r.live_at_tx_start, clock: r.live_on_clock }))).toEqual([{ tx: true, clock: false }]);
+    expect(await settleSearchJob(pg, c, "done")).toEqual({ applied: false });
+    expect(await settleSearchJob(pg, c, { retry: 0 })).toEqual({ applied: false });
+    await pg.exec("COMMIT");
+    const s = await state();
+    expect(s.jobs.map((j) => ({ lease: j.lease, attempts: j.attempts }))).toEqual([{ lease: c.lease, attempts: 1 }]);
+    expect(s.receipts.map((r) => r.lease)).toEqual([c.lease]);
+  }, 120_000);
+
+  test("a re-death refreshes the scope letter wholly from the new snapshot: park N (trace T1), then N+2 (trace T3)", async () => {
+    const t1 = wake(scope, 7), t3 = wake(scope, 9);
+    const { pg, state, wakeNow, attempts } = await asLogin("bare", seeded(t1));
+    const c1 = await claimOne(pg);
+    await attempts(c1.id, 12);
+    expect(await settleSearchJob(pg, c1, { retry: 0 })).toEqual({ applied: true, action: "parked" });
+    let s = await state();
+    expect(s.letters.map((l) => ({ message: l.message, trace: l.provenance.trace, dead_count: l.dead_count }))).toEqual([{ message: t1, trace: t1.ctx.traceId, dead_count: 1 }]);
+    await wakeNow(t3);
+    const c3 = await claimOne(pg);
+    expect(c3.claimedMessage).toEqual(t3);
+    await attempts(c3.id, 12);
+    expect(await settleSearchJob(pg, c3, { retry: 0 })).toEqual({ applied: true, action: "parked" });
+    s = await state();
+    expect(t3.ctx.traceId).not.toBe(t1.ctx.traceId);
+    expect(s.letters.map((l) => ({ id: l.id, message: l.message, provenance: l.provenance, dead_count: l.dead_count, state: l.state }))).toEqual([{
+      id: searchLetterId(t3), message: t3, dead_count: 2, state: "dead",
+      provenance: { trace: t3.ctx.traceId, org: scope.orgId, ws: scope.workspaceId, session: scope.sessionId, machine: null },
+    }]);
   }, 120_000);
 
   test("an expired lease settles nothing: {applied:false}, row and receipt unchanged", async () => {
@@ -479,4 +552,21 @@ describe("the SQL letter id is dlq.ts deadLetterId, byte for byte", () => {
       expect(sql).toBe(deadLetterId("search-index", { orgId: org, workspaceId: ws }, workKey));
     }
   }, 120_000);
+});
+
+// ---------------------------------------------------------------------------------------------------------
+describe("no legacy consumer role path", () => {
+  test("the retired role name is absent from the migration, the rollback and all non-test production code", () => {
+    const root = join(import.meta.dir, "../../..");
+    const NAME = ["bulls96", "search", "wake", "consumer"].join("_");
+    const listed = Bun.spawnSync(["git", "ls-files", "src", "packages", "supabase", "scripts"], { cwd: root });
+    expect(listed.exitCode).toBe(0);
+    const files = new TextDecoder().decode(listed.stdout).split("\n").filter(Boolean)
+      .filter((f) => !/(^|\/)(__tests__|tests?)\//.test(f));
+    // Fixture soundness: the scan covers the slot's migration and rollback and the consumer's code.
+    for (const must of ["supabase/migrations/20261105062300_search_index_stage.sql", "supabase/rollbacks/20261105062300_search_index_stage.down.sql",
+      "src/session-pipeline/search-jobs.ts", "src/session-pipeline/lambda.ts"]) expect(files).toContain(must);
+    const hits = files.filter((f) => { try { return readFileSync(join(root, f), "utf8").includes(NAME); } catch { return false; } });
+    expect(hits).toEqual([]);
+  });
 });

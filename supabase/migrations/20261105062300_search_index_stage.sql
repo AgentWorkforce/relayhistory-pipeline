@@ -7,8 +7,9 @@
 -- same semantics): the stage in the three stage CHECKs, the one-row-per-scope index (§3), the queue guard
 -- triggers and sessions.enqueue_managed_search_wake_v1 (§2). Two mechanical differences from the proposal: the
 -- CHECKs are restated as explicit lists (the 20261031000100 sets plus 'search-index', as §7 asks), so the
--- proposal's publication_private.search_stage_checks bookkeeping is not needed; and the consumer role is not
--- required to exist here (the guard compares its name only; provisioning it is a separate owner step).
+-- proposal's publication_private.search_stage_checks bookkeeping is not needed; and the proposal's dedicated
+-- consumer role path is gone: the guard admits the owner only, and the runtime leases and settles through the
+-- owner's claim/settle functions below.
 --
 -- Consumer half: sessions.search_catchup_cursor (§6), pipeline_dead_letters.resolution (§3.3b), the sealed,
 -- append-only sessions.search_stage_archive with its only write path sessions.archive_search_stage_v1() (§7, §8), and
@@ -47,21 +48,14 @@ ALTER TABLE sessions.pipeline_dead_letters ADD COLUMN resolution text
   CHECK (resolution IS NULL OR resolution IN ('completed', 'superseded'));
 
 -- §2 (producer): ordinary queue writers can enqueue every existing stage, but cannot invent a managed scope,
--- replace its envelope or move another row into this stage. Only the owner (through the SECURITY DEFINER
--- functions below) and the dedicated consumer role (lease and acknowledge, never a changed message) pass.
+-- replace its envelope or move another row into this stage. Only the owner passes: directly, or through the
+-- owner's SECURITY DEFINER functions (the wake, and the runtime's claim_search_jobs_v1 / settle_search_job_v1).
 CREATE FUNCTION sessions.guard_managed_search_wake_v1() RETURNS trigger
 LANGUAGE plpgsql SET search_path = pg_catalog, pg_temp AS $guard$
 BEGIN
  IF current_user = pg_get_userbyid((SELECT proowner FROM pg_proc WHERE oid = 'sessions.enqueue_managed_search_wake_v1(jsonb,uuid)'::regprocedure)) THEN
    IF TG_OP = 'DELETE' THEN RETURN OLD; END IF;
    RETURN NEW;
- END IF;
- IF current_user = 'bulls96_search_wake_consumer' THEN
-   IF TG_OP = 'DELETE' THEN RETURN OLD; END IF;
-   IF TG_OP = 'UPDATE' AND OLD.stage = 'search-index' AND NEW.stage = 'search-index'
-    AND (NEW.work_key, NEW.trace_id, NEW.org_id, NEW.workspace_id, NEW.session_id, NEW.machine_id, NEW.message)
-      IS NOT DISTINCT FROM (OLD.work_key, OLD.trace_id, OLD.org_id, OLD.workspace_id, OLD.session_id, OLD.machine_id, OLD.message)
-   THEN RETURN NEW; END IF;
  END IF;
  RAISE EXCEPTION USING ERRCODE = '42501', MESSAGE = 'search wake: committed managed authority required';
 END $guard$;
@@ -424,18 +418,18 @@ RETURNS TABLE (job_id bigint, lease_id uuid, message jsonb, epoch bigint, attemp
 LANGUAGE sql SECURITY DEFINER SET search_path = pg_catalog, pg_temp AS $claim$
  WITH next AS (
    SELECT j.id FROM sessions.pipeline_jobs j
-    WHERE j.stage = 'search-index' AND NOT j.dlq AND j.visible_at <= now()
+    WHERE j.stage = 'search-index' AND NOT j.dlq AND j.visible_at <= clock_timestamp()
     ORDER BY j.visible_at, j.id
     LIMIT least(10, greatest(1, coalesce(p_limit, 1)))
     FOR UPDATE SKIP LOCKED
  ), leased AS (
    UPDATE sessions.pipeline_jobs AS j
-      SET lease_id = gen_random_uuid(), visible_at = now() + interval '300 seconds', attempts = j.attempts + 1
+      SET lease_id = gen_random_uuid(), visible_at = clock_timestamp() + interval '300 seconds', attempts = j.attempts + 1
      FROM next WHERE j.id = next.id AND j.stage = 'search-index'
    RETURNING j.id, j.lease_id, j.message, j.attempts, j.visible_at
  ), receipts AS (
    INSERT INTO sessions.search_job_claims AS c (job_id, lease_id, claimed_epoch, claimed_message, claimed_attempts, claimed_at, lease_until)
-   SELECT l.id, l.lease_id, (l.message->'payload'->>'epoch')::bigint, l.message, l.attempts, now(), l.visible_at FROM leased l
+   SELECT l.id, l.lease_id, (l.message->'payload'->>'epoch')::bigint, l.message, l.attempts, clock_timestamp(), l.visible_at FROM leased l
    ON CONFLICT ON CONSTRAINT search_job_claims_pkey DO UPDATE
      SET lease_id = EXCLUDED.lease_id, claimed_epoch = EXCLUDED.claimed_epoch, claimed_message = EXCLUDED.claimed_message,
          claimed_attempts = EXCLUDED.claimed_attempts, claimed_at = EXCLUDED.claimed_at, lease_until = EXCLUDED.lease_until
@@ -446,7 +440,8 @@ $claim$;
 
 -- §3.3 (+ §3.3b completion): settle one claimed search-index job. Outcomes are allowlisted ('done' | 'retry'; anything
 -- else raises 22023). Bound to the stage, the job, the CURRENT unexpired lease (the row's lease and visible_at, and the
--- receipt's lease and lease_until) and the receipt's recorded epoch, message and attempt; anything else returns
+-- receipt's lease and lease_until, judged on clock_timestamp() after both row locks) and the receipt's recorded
+-- epoch, message and attempt; anything else returns
 -- {applied:false} and changes nothing. The caller never supplies an epoch, a message, an attempt or a delay.
 --   done:  the current epoch at or below the claimed one: delete the row and resolve the scope's replaying letter
 --          (§3.3b, completed | superseded); else a newer wake merged during the pass: reopen now, attempts 0.
@@ -460,18 +455,20 @@ DECLARE
  max_attempts constant integer := 12;
  j sessions.pipeline_jobs; r sessions.search_job_claims;
  current_epoch bigint; m jsonb; letter text; dead integer; attempt integer; delay integer; action text;
- status text; disc text; err jsonb := NULL; attrs jsonb;
+ status text; disc text; err jsonb := NULL; attrs jsonb; checked_at timestamptz;
 BEGIN
  IF p_outcome IS NULL OR p_outcome NOT IN ('done', 'retry') THEN
    RAISE EXCEPTION USING ERRCODE = '22023', MESSAGE = 'search settle: outcome must be done or retry';
  END IF;
  IF p_job_id IS NULL OR p_lease IS NULL THEN RETURN jsonb_build_object('applied', false); END IF;
  SELECT * INTO j FROM sessions.pipeline_jobs WHERE id = p_job_id AND stage = 'search-index' FOR UPDATE;
- IF NOT FOUND OR j.lease_id IS DISTINCT FROM p_lease OR j.visible_at <= now() THEN
-   RETURN jsonb_build_object('applied', false);
- END IF;
+ IF NOT FOUND OR j.lease_id IS DISTINCT FROM p_lease THEN RETURN jsonb_build_object('applied', false); END IF;
  SELECT * INTO r FROM sessions.search_job_claims WHERE search_job_claims.job_id = p_job_id FOR UPDATE;
- IF NOT FOUND OR r.lease_id <> p_lease OR r.lease_until <= now() THEN RETURN jsonb_build_object('applied', false); END IF;
+ IF NOT FOUND OR r.lease_id <> p_lease THEN RETURN jsonb_build_object('applied', false); END IF;
+ -- Lease freshness is decided on the wall clock read AFTER both row locks, never on the transaction start: a
+ -- settlement that waited on a lock (or sat in a long transaction) past the lease's end applies nothing.
+ checked_at := clock_timestamp();
+ IF j.visible_at <= checked_at OR r.lease_until <= checked_at THEN RETURN jsonb_build_object('applied', false); END IF;
 
  m := r.claimed_message;
  current_epoch := (j.message->'payload'->>'epoch')::bigint;
@@ -490,17 +487,21 @@ BEGIN
         AND (message->'payload'->>'epoch')::bigint <= r.claimed_epoch;
      action := 'deleted';
    ELSE
-     UPDATE sessions.pipeline_jobs SET lease_id = NULL, visible_at = now(), attempts = 0 WHERE id = j.id AND lease_id = p_lease;
+     UPDATE sessions.pipeline_jobs SET lease_id = NULL, visible_at = checked_at, attempts = 0 WHERE id = j.id AND lease_id = p_lease;
      attrs := attrs || jsonb_build_object('reason', 'newer_epoch_reopened');
      action := 'reopened';
    END IF;
  ELSIF attempt >= max_attempts THEN
    INSERT INTO sessions.pipeline_dead_letters AS d
           (id, stage, trace_id, org_id, workspace_id, session_id, machine_id, message, first_dead_at, last_dead_at)
-   VALUES (letter, 'search-index', j.trace_id, j.org_id, j.workspace_id, j.session_id, j.machine_id, m, now(), now())
-   ON CONFLICT (id) DO UPDATE SET message = EXCLUDED.message, state = 'dead', last_dead_at = EXCLUDED.last_dead_at,
-          dead_count = d.dead_count + 1, resolved_at = NULL, resolution = NULL,
-          session_id = COALESCE(EXCLUDED.session_id, d.session_id), machine_id = COALESCE(EXCLUDED.machine_id, d.machine_id)
+   -- Provenance wholly from the receipt's snapshot: the letter's trace and scope are the claimed message's, never
+   -- the live row's (a newer wake merged into it carries its own trace).
+   VALUES (letter, 'search-index', (m->'ctx'->>'traceId')::uuid, m->'ctx'->>'orgId', m->'ctx'->>'workspaceId',
+           m->'ctx'->>'sessionId', m->'ctx'->>'machineId', m, now(), now())
+   -- A re-death refreshes the letter wholly from this claim's snapshot: message, trace and scope columns alike.
+   ON CONFLICT (id) DO UPDATE SET message = EXCLUDED.message, trace_id = EXCLUDED.trace_id, org_id = EXCLUDED.org_id,
+          workspace_id = EXCLUDED.workspace_id, session_id = EXCLUDED.session_id, machine_id = EXCLUDED.machine_id,
+          state = 'dead', last_dead_at = EXCLUDED.last_dead_at, dead_count = d.dead_count + 1, resolved_at = NULL, resolution = NULL
    RETURNING d.dead_count INTO dead;
    status := 'dead_lettered';
    disc := disc || ':' || dead::text;
@@ -510,17 +511,17 @@ BEGIN
      DELETE FROM sessions.pipeline_jobs WHERE id = j.id AND lease_id = p_lease;
      action := 'parked';
    ELSE
-     UPDATE sessions.pipeline_jobs SET lease_id = NULL, visible_at = now(), attempts = 0 WHERE id = j.id AND lease_id = p_lease;
+     UPDATE sessions.pipeline_jobs SET lease_id = NULL, visible_at = checked_at, attempts = 0 WHERE id = j.id AND lease_id = p_lease;
      action := 'parked_reopened';
    END IF;
  ELSE
    status := 'retrying';
    IF current_epoch > r.claimed_epoch THEN
      delay := 0;
-     UPDATE sessions.pipeline_jobs SET lease_id = NULL, visible_at = now(), attempts = 0 WHERE id = j.id AND lease_id = p_lease;
+     UPDATE sessions.pipeline_jobs SET lease_id = NULL, visible_at = checked_at, attempts = 0 WHERE id = j.id AND lease_id = p_lease;
    ELSE
      delay := least(900, 30 * power(2, least(attempt, 16) - 1))::integer;
-     UPDATE sessions.pipeline_jobs SET lease_id = NULL, visible_at = now() + make_interval(secs => delay) WHERE id = j.id AND lease_id = p_lease;
+     UPDATE sessions.pipeline_jobs SET lease_id = NULL, visible_at = checked_at + make_interval(secs => delay) WHERE id = j.id AND lease_id = p_lease;
    END IF;
    attrs := attrs || jsonb_build_object('delay_seconds', delay);
    action := 'retried';

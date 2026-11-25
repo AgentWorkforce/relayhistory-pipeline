@@ -22,7 +22,7 @@ DO $rollback_guard$ DECLARE v_sha text; BEGIN
  IF EXISTS(SELECT 1 FROM sessions.__96bulls_migrations WHERE name LIKE 'upstream:%' AND name COLLATE "C">'upstream:20261105062300_search_index_stage.sql')
  THEN RAISE EXCEPTION USING ERRCODE='55000',MESSAGE='search index stage: a later migration is applied; roll it back first';END IF;
  SELECT sha256 INTO v_sha FROM sessions.__96bulls_migrations WHERE name='upstream:20261105062300_search_index_stage.sql' FOR UPDATE;
- IF NOT FOUND OR v_sha<>'ff3a5131605a29935f2388c0d94878d01641d9c17f566a179bd24a09c16956e6'
+ IF NOT FOUND OR v_sha<>'a6b2e2f1406c7da333c70a12687361795cf9a8c985f3ca923d7bd64f70ba2bb3'
  THEN RAISE EXCEPTION USING ERRCODE='55000',MESSAGE='search index stage: own applied checksum required';END IF;
  -- §8: the additive migration stays until the stage is fully empty, in all three tables.
  LOCK TABLE sessions.pipeline_jobs, sessions.pipeline_events, sessions.pipeline_dead_letters IN ACCESS EXCLUSIVE MODE;

@@ -217,12 +217,14 @@ caller supplies no epoch, message, attempt, scope or delay:
 - outcomes are allowlisted: `done` | `retry` (anything else raises 22023). `exhausted` is not a caller outcome: the
   server exhausts a `retry` at its max attempts (12) and backs off `min(900, 30 * 2^(attempt-1))` s otherwise;
 - it loads the job row and the receipt `FOR UPDATE` and requires `stage = 'search-index'`, the row's lease and the
-  receipt's lease both equal to `p_lease`, and the lease unexpired (`visible_at > now()` and `lease_until > now()`).
+  receipt's lease both equal to `p_lease`, and the lease unexpired on the wall clock read after both row locks
+  (`visible_at` and `lease_until` both after `clock_timestamp()`, never the transaction start).
   Otherwise it returns `{applied: false}` and changes nothing (lost, expired or replaced lease, another stage's id,
   a duplicate settlement);
 - `$claimed_epoch`, `$claimed_msg` and the attempt below come ONLY from the receipt. So a lease holder cannot submit
   N+1 as its claimed epoch (and delete later work), or park a fabricated message;
-- the letter id is computed in SQL from the receipt's message (`sessions.search_letter_id_v1`, dlq.ts `deadLetterId`
+- the letter's id, trace and scope columns come from the receipt's message (also on a re-death's conflict update);
+  the letter id is computed in SQL from it (`sessions.search_letter_id_v1`, dlq.ts `deadLetterId`
   byte for byte, parity-tested);
 - the row change, the receipt delete, the letter (park or §3.3b resolution) and the `pipeline_events` audit row are
   one transaction.

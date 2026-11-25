@@ -54,7 +54,6 @@ async function installScopedProposal() {
   if ((await owner("SELECT to_regnamespace('publication_private') AS installed")).rows[0].installed) return;
   await db.exec("CREATE ROLE bulls96_publication_scoped NOLOGIN; CREATE ROLE bulls96_publication_recovery NOLOGIN; GRANT USAGE ON SCHEMA sessions TO bulls96_publication_scoped");
   await db.exec(read("supabase/proposals/continuous-publication/062280-scoped-kernels.up.sql"));
-  await db.exec("CREATE ROLE bulls96_search_wake_consumer NOLOGIN");
   // The managed search wake proposal is promoted into migration 20261105062300 (applied by beforeAll with the
   // rest of supabase/migrations): the stage CHECKs, the scope index, the guards and the enqueue are already in place.
   const checks=()=>owner("SELECT conname,pg_get_constraintdef(oid) definition FROM pg_constraint WHERE conrelid IN ('sessions.pipeline_jobs'::regclass,'sessions.pipeline_events'::regclass,'sessions.pipeline_dead_letters'::regclass) AND conname IN ('pipeline_jobs_stage_check','pipeline_events_stage_check','pipeline_dead_letters_stage_check') ORDER BY conname");

@@ -13,7 +13,7 @@ import { join } from "node:path";
 import { SESSION_BOOTSTRAP_FILES } from "../../hoopdb/session-bootstrap-chain.ts";
 import {
   archiveSearchStage, catchUpTick, claimSearchJobs, enqueueSearchWake, parkSearchJobs, replaySearchDeadLetter, searchLetterId,
-  searchWorkKey, settleSearchJob, type SearchWakeMessage,
+  searchWorkKey, settleSearchJob, type SearchSql, type SearchWakeMessage,
 } from "../search-jobs.ts";
 
 const url = process.env.SESSION_INGEST_TEST_PG_URL;
@@ -38,6 +38,24 @@ const wake = (s: Scope, epoch: number): SearchWakeMessage => ({
 async function codeOf(p: () => Promise<unknown>): Promise<string> {
   try { await p(); return "ok"; } catch (e) { return String((e as { code?: string }).code ?? e); }
 }
+
+/**
+ * A transaction-capable adapter over the login's pool (BEGIN ... ROLLBACK on one client), so the operator paths that
+ * open a transaction (park's LOCK TABLE, replay, catch-up) fail on the real privilege check, not on 25P01.
+ */
+const transactional = (pool: pg.Pool): SearchSql => ({
+  query: (text, params) => pool.query(text, params as unknown[]) as never,
+  async transaction(work) {
+    const client = await pool.connect();
+    try {
+      await client.query("BEGIN");
+      return await work({ query: (text, params) => client.query(text, params as unknown[]) as never });
+    } finally {
+      await client.query("ROLLBACK").catch(() => {});
+      client.release();
+    }
+  },
+});
 
 async function rig() {
   const admin = new pg.Client({ connectionString: url });
@@ -118,12 +136,48 @@ describe.skipIf(!url)("062300 runtime boundary: a genuine unprivileged login (re
       deleteJob: await codeOf(() => runtime.query("DELETE FROM sessions.pipeline_jobs")),
       truncateJobs: await codeOf(() => runtime.query("TRUNCATE sessions.pipeline_jobs")),
       receipts: await codeOf(() => runtime.query("SELECT * FROM sessions.search_job_claims")),
-      replay: await codeOf(() => replaySearchDeadLetter(runtime, searchLetterId(wake(scope, 9)))),
-      catchUp: await codeOf(() => catchUpTick({ sql: runtime, pageSize: 10 })),
-      park: await codeOf(() => parkSearchJobs(runtime, { operator: "pg-definer-test" })),
+      replay: await codeOf(() => replaySearchDeadLetter(transactional(runtime), searchLetterId(wake(scope, 9)))),
+      catchUp: await codeOf(() => catchUpTick({ sql: transactional(runtime), pageSize: 10 })),
+      park: await codeOf(() => parkSearchJobs(transactional(runtime), { operator: "pg-definer-test" })),
       archive: await codeOf(() => archiveSearchStage(runtime)),
       enqueue: await codeOf(() => enqueueSearchWake(runtime, wake(scope, 10))),
     };
     expect(denied).toEqual(Object.fromEntries(Object.keys(denied).map((k) => [k, "42501"])));
+    // Fixture soundness for the park denial: the same adapter, as the owner, does reach and run the LOCK (no 25P01).
+    expect(await codeOf(() => transactional(owner).transaction!((tx) => tx.query("LOCK TABLE sessions.pipeline_jobs IN SHARE ROW EXCLUSIVE MODE")))).toBe("ok");
+  }, 300_000);
+
+  test("two sessions: a settlement that waited on the job's row lock past the lease end applies nothing", async () => {
+    const { owner, runtime } = await rig();
+    await enqueueSearchWake(owner, wake(scope, 7));
+    const [c] = await claimSearchJobs(runtime, 1);
+    // The lease (row and receipt) ends 1.5 s from now.
+    const leaseEnd = (await owner.query<{ at: Date }>(
+      "UPDATE sessions.pipeline_jobs SET visible_at = clock_timestamp() + interval '1.5 seconds' WHERE id = $1::bigint RETURNING visible_at AS at", [c!.id])).rows[0]!.at;
+    await owner.query("UPDATE sessions.search_job_claims SET lease_until = $2 WHERE job_id = $1::bigint", [c!.id, leaseEnd]);
+    const holder = await owner.connect();
+    const settler = await runtime.connect();
+    try {
+      // Session 1 holds the job row lock.
+      await holder.query("BEGIN");
+      await holder.query("SELECT 1 FROM sessions.pipeline_jobs WHERE id = $1::bigint FOR UPDATE", [c!.id]);
+      // Session 2 starts its transaction while the lease is live, then settles: it blocks on the lock.
+      await settler.query("BEGIN");
+      // Fixture soundness: the settling transaction's start (now()) is before the lease end.
+      const started = (await settler.query<{ at: Date }>("SELECT now() AS at")).rows[0]!.at;
+      expect(started.getTime()).toBeLessThan(new Date(leaseEnd).getTime());
+      const pending = settler.query("SELECT sessions.settle_search_job_v1($1::bigint, $2::uuid, 'done') AS r", [c!.id, c!.lease]);
+      await Bun.sleep(2_500);
+      await holder.query("COMMIT");
+      expect((await pending).rows).toEqual([{ r: { applied: false } }]);
+      await settler.query("COMMIT");
+    } finally {
+      await holder.query("ROLLBACK").catch(() => {});
+      await settler.query("ROLLBACK").catch(() => {});
+      holder.release();
+      settler.release();
+    }
+    expect((await owner.query("SELECT lease_id::text AS l FROM sessions.pipeline_jobs WHERE id = $1::bigint", [c!.id])).rows).toEqual([{ l: c!.lease }]);
+    expect((await owner.query("SELECT count(*)::int AS n FROM sessions.search_job_claims")).rows).toEqual([{ n: 1 }]);
   }, 300_000);
 });
