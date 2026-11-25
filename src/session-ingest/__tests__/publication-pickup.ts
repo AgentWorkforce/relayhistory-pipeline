@@ -54,6 +54,20 @@ export async function checkPublicationPickup(pg:PGlite, store:ObjectStore, key:s
   const wakes=()=>pg.query<{work_key:string;message:StageMessage<{epoch:number;published_at:string}>}>(
     "SELECT work_key,message FROM sessions.pipeline_jobs WHERE stage='search-index' AND org_id=$1 AND workspace_id=$2",[job.ctx.orgId,job.ctx.workspaceId]);
   expect((await wakes()).rows).toHaveLength(0);
+  const {rows:[current]}=await pg.query<{evidence:Record<string,string>}>(`SELECT jsonb_build_object(
+    'orgId',org_id,'workspaceId',workspace_id,'harness',physical_source,'sessionId',physical_session,
+    'machineId',machine_id,'manifestKey',current_key,'revision',pointer_revision::text,'schemaGeneration',$2::text) AS evidence
+    FROM sessions.ingest_publication_heads WHERE current_key=$1`,[key,generation]);
+  expect(current).toBeDefined();
+  for (const [evidence,trace] of [
+    [current!.evidence,"00000000-0000-0000-0000-000000000000"],
+    [{...current!.evidence,orgId:""},job.ctx.traceId],
+    [{...current!.evidence,workspaceId:""},job.ctx.traceId],
+  ] as const) {
+    await expect(pg.query("SELECT sessions.enqueue_managed_search_wake_v1($1,$2)",[evidence,trace]))
+      .rejects.toMatchObject({code:"22023",message:"search wake: invalid trace or tenant context"});
+  }
+  expect((await pg.query("SELECT 1 FROM sessions.pipeline_jobs WHERE stage='search-index'")).rows).toHaveLength(0);
   // Reject wake persistence, and prove projection, queue fanout and wake roll
   // back together. Remove the fixture constraint and retry the same job.
   await pg.exec("ALTER TABLE sessions.pipeline_jobs ADD CONSTRAINT fixture_reject_search CHECK(stage<>'search-index') NOT VALID");

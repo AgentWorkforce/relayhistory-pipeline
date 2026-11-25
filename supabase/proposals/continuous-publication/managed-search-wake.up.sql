@@ -72,6 +72,10 @@ DECLARE
  authority jsonb; h sessions.ingest_publication_heads; epoch bigint; canonical_id text;
  key text; wake jsonb; publication_time timestamptz;
 BEGIN
+ IF trace IS NULL OR trace='00000000-0000-0000-0000-000000000000'::uuid
+    OR coalesce(evidence->>'orgId','')='' OR coalesce(evidence->>'workspaceId','')='' THEN
+   RAISE EXCEPTION USING ERRCODE='22023', MESSAGE='search wake: invalid trace or tenant context';
+ END IF;
  authority:=sessions.session_publication_lock(evidence);
  IF authority->'managed' IS DISTINCT FROM 'true'::jsonb OR authority->'current' IS DISTINCT FROM 'true'::jsonb THEN
    RAISE EXCEPTION 'search wake: publication no longer current';
@@ -95,7 +99,7 @@ BEGIN
    AND (a.org_id,a.workspace_id,a.user_id,a.origin_id)=(h.org_id,h.workspace_id,h.user_id,h.origin_id)
    AND (s.org_id,s.workspace_id,s.user_id,s.origin_id,s.batch_id,s.digest)=(a.org_id,a.workspace_id,a.user_id,a.origin_id,a.batch_id,a.digest)
    AND a.state='published' AND a.published_at IS NOT NULL;
- IF trace IS NULL OR epoch IS NULL OR epoch NOT BETWEEN 0 AND 9007199254740991 OR h.pointer_revision>9007199254740991 OR canonical_id<>h.session_id
+ IF epoch IS NULL OR epoch NOT BETWEEN 0 AND 9007199254740991 OR h.pointer_revision>9007199254740991 OR canonical_id<>h.session_id
     OR position(chr(31) IN concat(h.org_id,h.workspace_id,h.physical_source,canonical_id))>0
  THEN RAISE EXCEPTION 'search wake: ambiguous directory scope'; END IF;
  key:=concat_ws(chr(31),'search',h.org_id,h.workspace_id,h.physical_source,canonical_id);
