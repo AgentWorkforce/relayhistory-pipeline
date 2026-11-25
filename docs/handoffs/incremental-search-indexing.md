@@ -1,4 +1,4 @@
-# Incremental search indexing: committed wake and revision-aware passes (design M1, rev 7)
+# Incremental search indexing: committed wake and revision-aware passes (design M1, rev 8)
 
 Status: design for review. Code and plans only. No migration, deploy, flag, schedule or config change follows from
 this document without a separate production go per step (§9). Rev 2 closed the nine findings of the M1 review. Rev 3 closes the seven rev-2 findings (B1-B7), marked inline.
@@ -436,6 +436,24 @@ parking fails.
 - `sessions.search_catchup_cursor` (§6);
 - `supabase/tests/pipeline_queue_test.sql:8`.
 
+**`sessions.search_stage_archive`** [rev 8], created by the up migration and NOT dropped by the down migration:
+
+```sql
+CREATE TABLE sessions.search_stage_archive (
+  batch_id    uuid        NOT NULL,
+  kind        text        NOT NULL CHECK (kind IN ('letter', 'event', 'manifest')),
+  source_id   text        NOT NULL,      -- letter id | event sha256 | 'manifest'
+  row         jsonb       NOT NULL,      -- to_jsonb(source row) | {letters, events, sha256}
+  archived_at timestamptz NOT NULL DEFAULT now(),
+  PRIMARY KEY (batch_id, kind, source_id)
+);
+CREATE UNIQUE INDEX search_stage_archive_one_manifest ON sessions.search_stage_archive (batch_id) WHERE kind = 'manifest';
+-- Append-only: UPDATE and DELETE are refused for every role but the schema owner (a trigger raises 42501), so the
+-- archive cannot be altered after the fact. Cleanup is a separate, explicitly approved owner migration.
+REVOKE ALL ON sessions.search_stage_archive FROM PUBLIC;
+GRANT SELECT, INSERT ON sessions.search_stage_archive TO <runtime role>;   -- archiveSearchStage runs as it
+```
+
 **TypeScript** (`packages/pipeline/src/lib/pipeline/` unless a path is given):
 
 - `trace.ts:23-35` `PIPELINE_STAGES`;
@@ -496,7 +514,7 @@ below:
    - The parked count is the INSERT's row count. It is logged with the operator and the time; there is no audit
      table.
    - The parked messages are replayable once the consumer is back.
-   - Test R9: park, then the down-migration precondition holds (0 rows).
+   - Tests R9a-R9e (below): after a park, the down precondition does NOT hold.
 4. roll the code back (writer and consumer code), with flags off;
 5. STOP. The down migration is NOT run on this path: it refuses while parked letters exist. The stage's schema
    stays in place (inert without the code and flags) until the replay, resolve and archive path below empties it.
@@ -514,15 +532,19 @@ promise of replay, so the two cannot coexist with a down migration.
      any `search-index` job row exists;
   2. `INSERT INTO sessions.search_stage_archive (batch_id, kind, source_id, row, archived_at)`: every `search-index`
      letter and event row as jsonb, with `batch_id` a fresh uuid;
-  3. compute the manifest digest and insert one manifest row (`kind = 'manifest'`) with
-     `{letters, events, sha256}`. The digest is exactly:
+  3. compute the manifest digest [rev 8] and insert one manifest row (`kind = 'manifest'`) with
+     `{letters, events, sha256}`. Exactly:
      ```sql
-     encode(sha256(convert_to(string_agg(kind || ':' || source_id || ':' || row::text, E'\n'
+     encode(sha256(convert_to(string_agg(jsonb_build_array(kind, source_id, row)::text, E'\n'
             ORDER BY kind, source_id), 'UTF8')), 'hex')
      ```
-     It is taken over the batch's `letter` and `event` rows. A letter's `source_id` is its letter id. An event's
-     `source_id` is `md5(row::text)`, because `pipeline_events` has no primary key; it is unique within the batch
-     (each event row carries its own idempotency key and timestamp). Each `row` is `to_jsonb` of the source row;
+     It is taken over the batch's `letter` and `event` rows.
+     - `row` is `to_jsonb(<source row>)`.
+     - A letter's `source_id` is its letter id.
+     - An event's `source_id` is `encode(sha256(convert_to(to_jsonb(<event row>)::text, 'UTF8')), 'hex')`.
+       `pipeline_events` has no primary key, and the row's own content (idempotency key, timestamp, attempt) makes it
+       unique.
+     - `jsonb_build_array` makes the serialization unambiguous: no delimiter can collide.
   4. DELETE the archived letters and events.
   
   A failure at any step rolls back everything. `search_stage_archive` is created by the up migration and is NOT
@@ -536,9 +558,18 @@ promise of replay, so the two cannot coexist with a down migration.
   refuses otherwise, then drops the index and the cursor table and restores the three CHECKs.
 - **Tests:**
   - R9a: after a park, down REFUSES (letters exist; events > 0 from the park's `dead_lettered` rows);
-  - R9b: replay, resolve, archive: jobs, events and letters all 0; the archive holds every row plus a manifest whose
-    sha256 matches; the precondition holds; another stage is untouched;
-  - R9c: archive with one letter still `dead` REFUSES, and nothing is archived or deleted (failure-safe).
+  - R9g [rev 8]: each guard on its own: job-only gives false; letter-only gives false; event-only gives false; all
+    three zero gives true. A precondition that ignores any one table fails;
+  - R9b: replay, resolve, archive:
+    - jobs, events and letters all 0;
+    - the archive holds every row plus one manifest;
+    - the manifest sha256 AND the returned sha256 both equal a digest recomputed in-test, independently, from the
+      PRE-archive source rows with the exact rule above;
+    - the precondition holds;
+    - another stage's seeded letter, job and REAL event survive;
+  - R9c: archive with one letter still `dead` REFUSES, and nothing is archived or deleted (failure-safe);
+  - R9d [rev 8]: archive with a `search-index` job row present REFUSES, and nothing changes;
+  - R9e [rev 8]: an archived row cannot be updated or deleted by the runtime role (append-only).
 
 ## 9. Production steps (each needs its own go, one at a time)
 
