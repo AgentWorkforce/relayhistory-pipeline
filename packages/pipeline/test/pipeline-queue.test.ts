@@ -364,7 +364,7 @@ afterAll(async () => {
 });
 beforeEach(async () => {
   await db.exec(
-    "TRUNCATE sessions.pipeline_jobs; TRUNCATE sessions.pipeline_dead_letters; TRUNCATE sessions.pipeline_events",
+    "DELETE FROM sessions.pipeline_jobs; TRUNCATE sessions.pipeline_dead_letters; TRUNCATE sessions.pipeline_events",
   );
 });
 

@@ -65,14 +65,16 @@ BEGIN
 END $guard$;
 REVOKE ALL ON FUNCTION sessions.guard_managed_search_wake_v1() FROM PUBLIC;
 
--- Queue writers must never have authority to truncate stage history. TRUNCATE holds ACCESS EXCLUSIVE before this
--- trigger fires, so the check is race-free: a non-owner may still truncate a queue that holds no search-index row
--- (nothing of the stage is lost; existing queue tooling and fixtures keep working).
+-- Queue writers must never have authority to truncate stage history.
+-- Unconditional non-owner refusal. A conditional "refuse only while search-index rows exist" check is unsafe: an
+-- invoker-mode presence check is filtered by the caller's RLS (a restricted role sees zero rows and truncates them
+-- away), and a definer-mode one can only identify the caller by session_user, which a SET ROLE privilege drop does
+-- not change. So only the owner (current_user, the effective role) may ever TRUNCATE the queue; everyone else
+-- deletes rows through the guarded DELETE path. Trigger functions need no EXECUTE grant.
 CREATE FUNCTION sessions.guard_managed_search_truncate_v1() RETURNS trigger
 LANGUAGE plpgsql SET search_path = pg_catalog, pg_temp AS $guard$
 BEGIN
- IF current_user <> pg_get_userbyid((SELECT proowner FROM pg_proc WHERE oid = 'sessions.enqueue_managed_search_wake_v1(jsonb,uuid)'::regprocedure))
-    AND EXISTS (SELECT 1 FROM sessions.pipeline_jobs WHERE stage = 'search-index') THEN
+ IF current_user <> pg_get_userbyid((SELECT proowner FROM pg_proc WHERE oid = 'sessions.enqueue_managed_search_wake_v1(jsonb,uuid)'::regprocedure)) THEN
    RAISE EXCEPTION USING ERRCODE = '42501', MESSAGE = 'search wake: queue truncate requires owner';
  END IF;
  RETURN NULL;

@@ -48,7 +48,7 @@ afterAll(async () => {
 });
 beforeEach(async () => {
   await db.exec(
-    "TRUNCATE sessions.migration_assertion_uses; TRUNCATE sessions.migration_base_read_uses; TRUNCATE sessions.pipeline_jobs",
+    "TRUNCATE sessions.migration_assertion_uses; TRUNCATE sessions.migration_base_read_uses; DELETE FROM sessions.pipeline_jobs",
   );
 });
 

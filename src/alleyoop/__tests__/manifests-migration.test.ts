@@ -91,7 +91,7 @@ afterAll(async () => {
 beforeEach(async () => {
   root = await mkdtemp(join(tmpdir(), "96bulls-migration-"));
   await db.exec(
-    "TRUNCATE sessions.migration_assertion_uses; TRUNCATE sessions.migration_assertion_chunks; TRUNCATE sessions.pipeline_jobs",
+    "TRUNCATE sessions.migration_assertion_uses; TRUNCATE sessions.migration_assertion_chunks; DELETE FROM sessions.pipeline_jobs",
   );
 });
 afterEach(async () => {
