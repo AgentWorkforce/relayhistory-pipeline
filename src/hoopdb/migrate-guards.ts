@@ -312,10 +312,6 @@ export const RUNTIME_APPLICATION_TABLE_PRIVILEGES = {
   "sessions.session_analysis_result_tickets": ["SELECT", "INSERT", "UPDATE", "DELETE"],
   "sessions.session_analysis_ticket_invocations": ["SELECT", "INSERT", "UPDATE", "DELETE"],
   "sessions.session_analysis_ticket_reservations": ["SELECT", "INSERT"],
-  // The search-index stage (20261105062230): the catch-up cursor's one row (§6) and the sealed archive (read only;
-  // archive_search_stage_v1 is its only write path, §8).
-  "sessions.search_catchup_cursor": ["SELECT", "UPDATE"],
-  "sessions.search_stage_archive": ["SELECT"],
 } as const satisfies Record<string, readonly string[]>;
 
 export const RUNTIME_APPLICATION_SEQUENCES = [
@@ -361,7 +357,6 @@ export const RUNTIME_APPLICATION_RLS_TABLES = [
   "sessions.session_analysis_result_tickets",
   "sessions.session_analysis_ticket_invocations",
   "sessions.session_analysis_ticket_reservations",
-  "sessions.search_catchup_cursor",
 ] as const;
 
 /**

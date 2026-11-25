@@ -13,7 +13,7 @@
 -- Consumer half: sessions.search_catchup_cursor (§6), pipeline_dead_letters.resolution (§3.3b) and the sealed,
 -- append-only sessions.search_stage_archive with its only write path sessions.archive_search_stage_v1() (§7, §8).
 -- The rollback (supabase/rollbacks/20261105062230_search_index_stage.down.sql) refuses while any search-index
--- job, event or dead letter exists (§8) and never drops the archive.
+-- job, event or dead letter exists (§8) and never drops an archive that holds a row.
 SET LOCAL lock_timeout = '5s';
 
 LOCK TABLE sessions.pipeline_jobs, sessions.pipeline_events, sessions.pipeline_dead_letters IN ACCESS EXCLUSIVE MODE;
@@ -65,11 +65,14 @@ BEGIN
 END $guard$;
 REVOKE ALL ON FUNCTION sessions.guard_managed_search_wake_v1() FROM PUBLIC;
 
--- Queue writers must never have authority to truncate stage history.
+-- Queue writers must never have authority to truncate stage history. TRUNCATE holds ACCESS EXCLUSIVE before this
+-- trigger fires, so the check is race-free: a non-owner may still truncate a queue that holds no search-index row
+-- (nothing of the stage is lost; existing queue tooling and fixtures keep working).
 CREATE FUNCTION sessions.guard_managed_search_truncate_v1() RETURNS trigger
 LANGUAGE plpgsql SET search_path = pg_catalog, pg_temp AS $guard$
 BEGIN
- IF current_user <> pg_get_userbyid((SELECT proowner FROM pg_proc WHERE oid = 'sessions.enqueue_managed_search_wake_v1(jsonb,uuid)'::regprocedure)) THEN
+ IF current_user <> pg_get_userbyid((SELECT proowner FROM pg_proc WHERE oid = 'sessions.enqueue_managed_search_wake_v1(jsonb,uuid)'::regprocedure))
+    AND EXISTS (SELECT 1 FROM sessions.pipeline_jobs WHERE stage = 'search-index') THEN
    RAISE EXCEPTION USING ERRCODE = '42501', MESSAGE = 'search wake: queue truncate requires owner';
  END IF;
  RETURN NULL;
@@ -173,12 +176,15 @@ CREATE TABLE sessions.search_catchup_cursor (
 INSERT INTO sessions.search_catchup_cursor DEFAULT VALUES;
 ALTER TABLE sessions.search_catchup_cursor ENABLE ROW LEVEL SECURITY;
 REVOKE ALL ON sessions.search_catchup_cursor FROM PUBLIC, anon, authenticated;
+-- Service-role only, like the pipeline tables. The catch-up enqueue writes search-index rows, which the queue guard
+-- admits only for the owner, so the catch-up runs on an owner-qualified path; no runtime-role grant here.
+GRANT SELECT, UPDATE ON sessions.search_catchup_cursor TO service_role;
 
--- §7, §8 [rev 8, rev 9]: the stage's audit archive. Created here and never dropped by the rollback. Sealed and
+-- §7, §8 [rev 8, rev 9]: the stage's audit archive. The rollback never drops it while it holds a row. Sealed and
 -- append-only: INSERT, UPDATE, DELETE and TRUNCATE are refused (42501) for every role but the table's owner, so
 -- the ONLY write path is sessions.archive_search_stage_v1() (SECURITY DEFINER, owned by the owner). Cleanup is a
 -- separate, explicitly approved owner migration.
-CREATE TABLE IF NOT EXISTS sessions.search_stage_archive (
+CREATE TABLE sessions.search_stage_archive (
   batch_id    uuid        NOT NULL,
   kind        text        NOT NULL CHECK (kind IN ('letter', 'event', 'manifest')),
   -- letter id | event sha256 | 'manifest'
@@ -188,11 +194,11 @@ CREATE TABLE IF NOT EXISTS sessions.search_stage_archive (
   archived_at timestamptz NOT NULL DEFAULT now(),
   PRIMARY KEY (batch_id, kind, source_id)
 );
-CREATE UNIQUE INDEX IF NOT EXISTS search_stage_archive_one_manifest ON sessions.search_stage_archive (batch_id) WHERE kind = 'manifest';
+CREATE UNIQUE INDEX search_stage_archive_one_manifest ON sessions.search_stage_archive (batch_id) WHERE kind = 'manifest';
 -- No row-level security: a reader granted SELECT sees every archived row (no tenant data is filtered here; the
 -- table is granted only to the operator and runtime roles), and the seal trigger, not a policy, refuses writes.
 
-CREATE OR REPLACE FUNCTION sessions.search_stage_archive_seal_v1() RETURNS trigger
+CREATE FUNCTION sessions.search_stage_archive_seal_v1() RETURNS trigger
 LANGUAGE plpgsql SET search_path = pg_catalog, pg_temp AS $seal$
 BEGIN
  IF current_user <> (SELECT pg_get_userbyid(c.relowner) FROM pg_class c WHERE c.oid = TG_RELID) THEN
@@ -202,10 +208,8 @@ BEGIN
  RETURN NEW;
 END $seal$;
 REVOKE ALL ON FUNCTION sessions.search_stage_archive_seal_v1() FROM PUBLIC;
-DROP TRIGGER IF EXISTS search_stage_archive_seal ON sessions.search_stage_archive;
 CREATE TRIGGER search_stage_archive_seal BEFORE INSERT OR UPDATE OR DELETE ON sessions.search_stage_archive
   FOR EACH ROW EXECUTE FUNCTION sessions.search_stage_archive_seal_v1();
-DROP TRIGGER IF EXISTS search_stage_archive_seal_truncate ON sessions.search_stage_archive;
 CREATE TRIGGER search_stage_archive_seal_truncate BEFORE TRUNCATE ON sessions.search_stage_archive
   FOR EACH STATEMENT EXECUTE FUNCTION sessions.search_stage_archive_seal_v1();
 
@@ -247,7 +251,7 @@ BEGIN
  RETURN jsonb_build_object('batchId', batch, 'letters', n_letters, 'events', n_events, 'sha256', digest);
 END $archive$;
 REVOKE ALL ON FUNCTION sessions.archive_search_stage_v1() FROM PUBLIC;
--- The operator's service role; the migrator grants the runtime role through RUNTIME_APPLICATION_FUNCTIONS.
+-- The operator's service role; the migrator also grants the runtime role (RUNTIME_APPLICATION_FUNCTIONS, from the lane).
 GRANT EXECUTE ON FUNCTION sessions.archive_search_stage_v1() TO service_role;
 
 REVOKE ALL ON sessions.search_stage_archive FROM PUBLIC, anon, authenticated, service_role;

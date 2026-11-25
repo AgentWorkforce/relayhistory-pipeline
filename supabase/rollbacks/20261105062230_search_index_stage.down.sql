@@ -6,7 +6,9 @@
 -- It refuses while ANY search-index row exists in pipeline_jobs, pipeline_events or pipeline_dead_letters.
 -- It drops the guards, the managed enqueue, the scope index, the cursor, the archive function and the resolution
 -- column, and restores the three stage CHECKs to the 20261031000100 sets. sessions.search_stage_archive and its
--- seal stay: the archive is an audit artifact, removed only by a separate, explicitly approved cleanup.
+-- seal stay while the archive holds any row: it is an audit artifact, removed only by a separate, explicitly
+-- approved cleanup (until then this slot cannot be re-applied: the migrator refuses its unledgered objects). An
+-- empty archive goes with the rest.
 -- Guard, object removal and ledger removal are one transaction under the migrator lock.
 -- Code only: hosted execution needs Khaliq's separate explicit approval. On refusal the caller must ROLLBACK or disconnect.
 BEGIN;
@@ -19,7 +21,7 @@ DO $rollback_guard$ DECLARE v_sha text; BEGIN
  IF EXISTS(SELECT 1 FROM sessions.__96bulls_migrations WHERE name LIKE 'upstream:%' AND name COLLATE "C">'upstream:20261105062230_search_index_stage.sql')
  THEN RAISE EXCEPTION USING ERRCODE='55000',MESSAGE='search index stage: a later migration is applied; roll it back first';END IF;
  SELECT sha256 INTO v_sha FROM sessions.__96bulls_migrations WHERE name='upstream:20261105062230_search_index_stage.sql' FOR UPDATE;
- IF NOT FOUND OR v_sha<>'33feed8c9ad65768ba9af1254c4fe8a833bdba3a49c835dc8fbf605628bf1d42'
+ IF NOT FOUND OR v_sha<>'ffb00e6d54c3b8500f1bceecb9553debb610425937ce30f21912186304f3eb84'
  THEN RAISE EXCEPTION USING ERRCODE='55000',MESSAGE='search index stage: own applied checksum required';END IF;
  -- §8: the additive migration stays until the stage is fully empty, in all three tables.
  LOCK TABLE sessions.pipeline_jobs, sessions.pipeline_events, sessions.pipeline_dead_letters IN ACCESS EXCLUSIVE MODE;
@@ -41,6 +43,12 @@ DROP FUNCTION sessions.archive_search_stage_v1();
 DROP INDEX sessions.pipeline_jobs_search_index_scope;
 DROP TABLE sessions.search_catchup_cursor;
 ALTER TABLE sessions.pipeline_dead_letters DROP COLUMN resolution;
+DO $archive$ BEGIN
+ IF NOT EXISTS (SELECT 1 FROM sessions.search_stage_archive) THEN
+   DROP TABLE sessions.search_stage_archive;
+   DROP FUNCTION sessions.search_stage_archive_seal_v1();
+ END IF;
+END $archive$;
 ALTER TABLE sessions.pipeline_events DROP CONSTRAINT pipeline_events_stage_check;
 ALTER TABLE sessions.pipeline_events ADD CONSTRAINT pipeline_events_stage_check
   CHECK (stage IN ('ingest', 'deliver.put', 'object-landed', 'session-indexed',
