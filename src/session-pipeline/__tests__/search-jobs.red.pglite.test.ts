@@ -1,10 +1,11 @@
 /**
- * RED until M2 (docs/handoffs/incremental-search-indexing.md rev 6, §10): the committed `search-index` wake.
+ * RED until M2 (docs/handoffs/incremental-search-indexing.md rev 7, §10): the committed `search-index` wake.
  *
  * Production-path coupling (rev 5 §10). Every race, settlement, replay, park and catch-up test drives the REAL
  * M2 entry points of `src/session-pipeline/search-jobs.ts`:
  *   enqueueSearchWake, claimSearchJobs, settleSearchJob (done | {retry} | exhausted), replaySearchDeadLetter,
- *   catchUpTick, runSearchJob, parkSearchJobs, and (rev 6 §8) searchStageDownPrecondition, archiveSearchStage.
+ *   catchUpTick, runSearchJob, parkSearchJobs, and (§8) searchStageDownPrecondition, archiveSearchStage [rev 7: failure-safe,
+ *   into sessions.search_stage_archive with a sha256 manifest; with an unresolved letter it THROWS and changes nothing (R9c)].
  * No test runs the design's enqueue / settlement / replay / tick / park SQL itself, so a migration (or a stub export
  * plus a migration) can never turn them green: each asserts concrete table state after the call that a no-op
  * export cannot produce. Fixtures (seeding rows, simulating a crash by expiring a lease, raising `attempts`) use
@@ -12,7 +13,8 @@
  *
  * What stays red for another reason, each the intended absence:
  *   - R6 / R6m: the closed stage lists (§7) and therefore `checked()`;
- *   - R1c+ / R5a / R5f / R5g: the authority-path writer (§2);
+ *   - R1c+ / R5a / R5f / R5g: the authority-path writer (§2); R5g observes its refusal row in sessions.pipeline_events
+ *     [rev 7] with a plain SELECT (no M2 call), red because no writer exists and the stage CHECK forbids the row;
  *   - R3a: today's erase-on-absence behaviour of `indexSearchScope` (§4.2);
  *   - R6w: the Lambda's search-job loop (lambda.ts imports and calls claimSearchJobs / settleSearchJob).
  * Green guards (green today, must stay green): R1c- (a retired publication writes no job), R5f- (a retired trigger
@@ -25,7 +27,8 @@
  *
  * Contracts this file fixes where the design leaves a choice:
  *   - settleSearchJob under a lost lease returns `{ applied: false }` (never throws) and touches nothing (R1d, R4b).
- *   - R5g, a managed scope with no provable publish clock: the session stays readable (authority commits), no job, a recorded refusal;
+ *   - R5g, a managed scope with no provable publish clock: the session stays readable (authority commits), no job, and one
+ *     pipeline_events refusal row (search-index / skipped / clock_unprovable) committed with the pointer [rev 7];
  *     (superseded rev-6 helper note follows) the authority-path writer previously THREW, so the session-indexed
  *     delivery does not ack (it retries) and the authority transaction rolls back: no job of any stage, and never a
  *     `pointer` clock. That is the design's "fail closed" with the delivery's error as the surfaced error.
@@ -138,8 +141,6 @@ const backoff = (attempt: number) => Math.min(900, 30 * 2 ** Math.max(0, attempt
 type ClaimedSearchJob = { id: string | number; lease: string; claimedEpoch: number; claimedMessage: StageMessage<WakePayload> };
 type SettleOutcome = "done" | { retry: number } | "exhausted";
 type SearchJobsModule = {
-  /** §2 [rev 6]: refusals recorded by the authority-path writer (e.g. clock_unprovable), per manifest key. */
-  searchWakeRefusals: (sql: PGlite, manifestKey: string) => Promise<Array<{ reason: string; count: number }>>;
   /** §3.1: the one-row-per-scope coalescing upsert. */
   enqueueSearchWake: (sql: PGlite, message: StageMessage) => Promise<unknown>;
   /** §3.2: claims up to n visible search-index jobs (lease + counted attempt), recording the claimed epoch and message. */
@@ -163,7 +164,11 @@ type SearchJobsModule = {
   parkSearchJobs: (sql: PGlite, opts: { operator: string }) => Promise<unknown>;
   /** §8 [rev 6]: the down migration's precondition: 0 search-index rows in pipeline_jobs, pipeline_events AND pipeline_dead_letters. */
   searchStageDownPrecondition: (sql: PGlite) => Promise<boolean>;
-  /** §8 [rev 6]: the operator archive: export the stage's resolved letters and its events (counts, sha256), then delete them. */
+  /**
+   * §8 [rev 7]: the failure-safe operator archive. ONE transaction: refuse (throw, roll back) on any unresolved letter or
+   * any job; copy every search-index letter and event into sessions.search_stage_archive plus one 'manifest' row
+   * (counts, sha256); delete the archived rows.
+   */
   archiveSearchStage: (sql: PGlite) => Promise<{ letters: number; events: number; sha256: string }>;
 };
 type M2Name = keyof SearchJobsModule;
@@ -594,12 +599,14 @@ describe("R5f: an OLDER live head triggers the authority enqueue beside a NEWER 
 });
 
 // ---------------------------------------------------------------------------------------------------------
-describe("R5g: a managed scope whose publish clock is unprovable fails closed (design §2 [rev 6])", () => {
+describe("R5g: a managed scope whose publish clock is unprovable fails closed (design §2 [rev 7])", () => {
   // The real head's own attempt loses its published_at (triggers off) BEFORE the real authority transaction, so the
   // §2 clock aggregate is NULL for a managed, live, current scope. Contract: the session STILL becomes readable (the
   // authority transaction commits the pointer and directory; a search-side problem never blocks upload or read), but
-  // the writer enqueues NO search-index job, never falls back to a pointer clock, and records a refusal
-  // (clock_unprovable) that M2 exposes through searchWakeRefusals.
+  // the writer enqueues NO search-index job, never falls back to a pointer clock, and records the refusal [rev 7] as a
+  // sessions.pipeline_events row IN the authority transaction (stage 'search-index', status 'skipped', error.code
+  // 'clock_unprovable'). The test OBSERVES that production substrate with a plain SELECT after the real authority run;
+  // no M2 call is made, so only the real writer can produce the row.
   let head: PublishedHead;
   beforeAll(async () => {
     head = await publishedHead({
@@ -615,7 +622,7 @@ describe("R5g: a managed scope whose publish clock is unprovable fails closed (d
   }, 180_000);
   afterAll(() => head?.close());
 
-  test("R5g: NULL published_at on the managed head: the session is readable, no search-index job, never a pointer clock, and a clock_unprovable refusal is recorded", async () => {
+  test("R5g: NULL published_at on the managed head: the session is readable, no search-index job, never a pointer clock, and one clock_unprovable refusal row in pipeline_events", async () => {
     // Fixture soundness: the head is live, its generation live and its attempt published; only the clock is missing.
     const { rows } = await head.db.query<{ state: string; gen_state: string; attempt_state: string; unclocked: boolean }>(
       `SELECT h.state, g.state AS gen_state, a.state AS attempt_state, a.published_at IS NULL AS unclocked
@@ -631,9 +638,24 @@ describe("R5g: a managed scope whose publish clock is unprovable fails closed (d
     // Never a job with a pointer clock, and no search-index job at all.
     expect(head.jobsAfter.filter((j) => (j.message.payload as Partial<WakePayload> | undefined)?.clock?.source === "pointer")).toEqual([]);
     expect(head.jobsAfter.filter((j) => j.stage === STAGE)).toEqual([]);
-    // The refusal is recorded (red today: the M2 writer and its refusal record are absent).
-    const m = await m2("searchWakeRefusals");
-    expect(await m.searchWakeRefusals(head.db as unknown as PGlite, head.key)).toEqual([{ reason: "clock_unprovable", count: 1 }]);
+    // The refusal is durable in pipeline_events, committed with the pointer (red today: no writer exists, and the
+    // pipeline_events stage CHECK does not admit 'search-index'). The scope is the canonical one (§2), and the
+    // idempotency key is §2's `trace:search-index:skipped:1:<manifest_key>`, `trace` being the trace id (the column's
+    // documented `trace:stage:status:attempt:discriminator`, events.ts pipelineEventKey) of the session-indexed message.
+    expect(head.scope.sessionId).toBe(head.scope.canonicalSessionId);
+    const refusals = (await head.db.query<Record<string, unknown>>(
+      `SELECT trace_id::text, org_id, workspace_id, harness, session_id, attempt, error, idempotency_key
+         FROM sessions.pipeline_events
+        WHERE stage = 'search-index' AND status = 'skipped' AND error->>'code' = 'clock_unprovable'
+          AND org_id = $1 AND workspace_id = $2 AND harness = $3 AND session_id = $4`,
+      [head.scope.orgId, head.scope.workspaceId, head.scope.harness, head.scope.canonicalSessionId])).rows;
+    expect(refusals).toEqual([{
+      trace_id: head.indexed.ctx.traceId,
+      org_id: head.scope.orgId, workspace_id: head.scope.workspaceId, harness: head.scope.harness, session_id: head.scope.canonicalSessionId,
+      attempt: 1,
+      error: expect.objectContaining({ code: "clock_unprovable", retryable: false }),
+      idempotency_key: `${head.indexed.ctx.traceId}:search-index:skipped:1:${head.key}`,
+    }]);
   });
 });
 
@@ -1061,7 +1083,7 @@ describe("R8: scope-keyed dead-letter replay, through replaySearchDeadLetter and
 });
 
 // ---------------------------------------------------------------------------------------------------------
-describe("R9: the park path and the held down migration, through parkSearchJobs (design §8 [rev 6])", () => {
+describe("R9: the park path, the held down migration and the failure-safe archive, through parkSearchJobs and archiveSearchStage (design §8 [rev 7])", () => {
   // An org that needs URI encoding: the parked letter ids are dlq.ts's canonical deadLetterId.
   const a = { orgId: "org:r9 enc", workspaceId: "ws_r9", harness: "claude", sessionId: "s_a" };
   const b = { ...a, sessionId: "s_b" };
@@ -1107,41 +1129,117 @@ describe("R9: the park path and the held down migration, through parkSearchJobs 
     for (const l of parkedLetters) expect(l.message).toEqual(before[(l.message.ctx as { sessionId: string }).sessionId]!);
   }
 
-  test("R9a: after a park (every row in its scope letter, state dead, current message), the down precondition does NOT hold: letters exist", async () => {
+  /** Every row of a table as jsonb text, sorted: a byte-level snapshot for "nothing changed" (plain SELECT). */
+  const snapshot = async (pg: PGlite, table: string) =>
+    (await pg.query<{ r: string }>(`SELECT to_jsonb(t)::text AS r FROM sessions.${table} t ORDER BY 1`)).rows.map((x) => x.r);
+
+  /** The consumer is back: replay the scopes' letters, then claim and complete each through the real settler. */
+  async function replayAndResolve(db: Db, f: R9, scopes: Scope[]) {
+    for (const s of scopes) await f.replaySearchDeadLetter(db.pg, letterIdOf(s));
+    for (let n = 0; n < scopes.length; n++) {
+      const c = await claimOne(db.pg, f.claimSearchJobs);
+      expect(await f.settleSearchJob(db.pg, c, "done")).not.toEqual({ applied: false });
+    }
+  }
+
+  test("R9a: after a park (every row in its scope letter, state dead, current message), the down precondition does NOT hold: letters and the park's dead_lettered events exist", async () => {
     const db = await migrated();
     const f = await m2r9();
     await parked(db, f);
     const counts = await stageCounts(db.pg);
-    // No search-index job is left, but the parked letters are a promise of replay.
-    expect({ jobs: counts.jobs, letters: counts.letters }).toEqual({ jobs: 0, letters: 2 });
-    expect(counts.events).toBeGreaterThanOrEqual(0);
+    // No search-index job is left, but the parked letters are a promise of replay, and settlement and the park wrote
+    // the stage's pipeline_events (the park's 'dead_lettered' rows among them).
+    expect(counts.jobs).toBe(0);
+    expect(counts.letters).toBeGreaterThan(0);
+    expect(counts.letters).toBe(2);
+    expect(counts.events).toBeGreaterThan(0);
+    const deadLettered = (await db.pg.query<{ n: number }>(
+      "SELECT count(*)::int AS n FROM sessions.pipeline_events WHERE stage = 'search-index' AND status = 'dead_lettered'")).rows[0]!.n;
+    expect(deadLettered).toBeGreaterThan(0);
     expect(await f.searchStageDownPrecondition(db.pg)).toBe(false);
   }, 120_000);
 
-  test("R9b: after replay and resolve of every parked letter, then archiveSearchStage, jobs, events and letters are all 0 and the down precondition holds", async () => {
+  test("R9b: replay, resolve, then archiveSearchStage: jobs, events and letters are 0; search_stage_archive holds every row plus one sha256 manifest; the precondition holds; another stage is untouched", async () => {
     const db = await migrated();
     const f = await m2r9();
     await parked(db, f);
-    // The consumer is back: replay every parked letter, then claim and complete each scope through the real settler.
-    for (const s of [a, b]) await f.replaySearchDeadLetter(db.pg, letterIdOf(s));
-    for (let n = 0; n < 2; n++) {
-      const c = await claimOne(db.pg, f.claimSearchJobs);
-      expect(await f.settleSearchJob(db.pg, c, "done")).not.toEqual({ applied: false });
-    }
+    await replayAndResolve(db, f, [a, b]);
     expect((await letters(db.pg)).map((l) => ({ id: l.id, state: l.state, resolved: l.resolved }))).toEqual(
       [a, b].map((s) => ({ id: letterIdOf(s), state: "resolved", resolved: true })).sort((x, y) => (x.id < y.id ? -1 : 1)));
     expect(await f.searchStageDownPrecondition(db.pg)).toBe(false);
     // Controls: another stage's letter and job survive the archive.
     const other = await postgresDeadLetterStore(db.pg).quarantine(stageMessage("session-indexed", a, "r9-other-dl@1", {}), new Date());
-    const { events } = await stageCounts(db.pg);
+    // What the archive must carry: every search-index letter and event, as the row's jsonb (plain SELECTs).
+    const letterRows = (await db.pg.query<{ id: string; r: Record<string, unknown> }>(
+      "SELECT id, to_jsonb(d) AS r FROM sessions.pipeline_dead_letters d WHERE stage = 'search-index' ORDER BY id")).rows;
+    const eventRows = (await db.pg.query<{ r: Record<string, unknown> }>(
+      "SELECT to_jsonb(e) AS r FROM sessions.pipeline_events e WHERE stage = 'search-index'")).rows.map((x) => x.r);
+    expect(letterRows).toHaveLength(2);
+    expect(eventRows.length).toBeGreaterThan(0);
+    const otherEventsBefore = (await snapshot(db.pg, "pipeline_events")).filter((r) => (JSON.parse(r) as { stage: string }).stage !== STAGE);
 
     const archived = await f.archiveSearchStage(db.pg);
 
-    expect(archived).toEqual({ letters: 2, events, sha256: expect.stringMatching(/^[a-f0-9]{64}$/) });
+    expect(archived).toEqual({ letters: 2, events: eventRows.length, sha256: expect.stringMatching(/^[a-f0-9]{64}$/) });
     expect(await stageCounts(db.pg)).toEqual({ jobs: 0, events: 0, letters: 0 });
+
+    // The durable archive: one batch, every letter (kind 'letter', source_id = the letter id) and every event (kind
+    // 'event', a batch-unique source_id; pipeline_events has no primary key, so the identifier is M2's choice), each
+    // row the source row's jsonb, plus exactly one 'manifest' row.
+    const arch = (await db.pg.query<{ batch_id: string; kind: string; source_id: string; row: Record<string, unknown>; stamped: boolean }>(
+      "SELECT batch_id::text, kind, source_id::text, row, archived_at IS NOT NULL AS stamped FROM sessions.search_stage_archive ORDER BY kind, source_id")).rows;
+    expect(new Set(arch.map((r) => r.batch_id)).size).toBe(1);
+    expect(arch.every((r) => r.stamped)).toBe(true);
+    expect(arch.filter((r) => r.kind === "letter").map((r) => ({ source_id: r.source_id, row: r.row })))
+      .toEqual(letterRows.map((l) => ({ source_id: l.id, row: l.r })));
+    const archivedEvents = arch.filter((r) => r.kind === "event");
+    // jsonb normalizes key order, so the parsed rows stringify identically when their jsonb is equal.
+    const canon = (rows: Array<Record<string, unknown>>) => rows.map((r) => JSON.stringify(r)).sort();
+    expect(canon(archivedEvents.map((r) => r.row))).toEqual(canon(eventRows));
+    expect(archivedEvents.every((r) => typeof r.source_id === "string" && r.source_id.length > 0)).toBe(true);
+    expect(new Set(archivedEvents.map((r) => r.source_id)).size).toBe(archivedEvents.length);
+    const manifests = arch.filter((r) => r.kind === "manifest");
+    expect(manifests).toHaveLength(1);
+    expect(arch.filter((r) => !["letter", "event", "manifest"].includes(r.kind))).toEqual([]);
+    // The manifest: the counts and the sha256 (64 hex), the same values archiveSearchStage returns. Design §8 [rev 7]
+    // fixes "sha256 over the batch's rows, ordered by (kind, source_id)" but not the byte serialization (row text,
+    // separators, which columns), so this test does NOT recompute the digest in-test; it asserts the counts and shape.
+    expect(manifests[0]!.row).toMatchObject({ letters: 2, events: eventRows.length, sha256: archived.sha256 });
+    expect(String(manifests[0]!.row.sha256)).toMatch(/^[a-f0-9]{64}$/);
+
     expect(await f.searchStageDownPrecondition(db.pg)).toBe(true);
     expect((await letters(db.pg)).map((l) => l.id)).toEqual([other.id]);
     expect((await db.pg.query<{ stage: string }>("SELECT stage FROM sessions.pipeline_jobs")).rows).toEqual([{ stage: "session-indexed" }]);
+    expect((await snapshot(db.pg, "pipeline_events")).filter((r) => (JSON.parse(r) as { stage: string }).stage !== STAGE)).toEqual(otherEventsBefore);
+  }, 120_000);
+
+  test("R9c: archiveSearchStage with one search-index letter still 'dead' THROWS and changes nothing (failure-safe)", async () => {
+    const db = await migrated();
+    const f = await m2r9();
+    await parked(db, f);
+    // Only A is replayed and resolved; B's letter stays 'dead'. No search-index job remains.
+    await replayAndResolve(db, f, [a]);
+    expect((await letters(db.pg)).map((l) => ({ id: l.id, state: l.state }))).toEqual(
+      [{ id: letterIdOf(a), state: "resolved" }, { id: letterIdOf(b), state: "dead" }].sort((x, y) => (x.id < y.id ? -1 : 1)));
+    expect((await stageCounts(db.pg)).jobs).toBe(0);
+    const before = {
+      jobs: await snapshot(db.pg, "pipeline_jobs"),
+      letters: await snapshot(db.pg, "pipeline_dead_letters"),
+      events: await snapshot(db.pg, "pipeline_events"),
+      archive: await snapshot(db.pg, "search_stage_archive"),
+    };
+    expect(before.events.length).toBeGreaterThan(0);
+
+    // Contract this file fixes: the refusal is a throw (the transaction raises and rolls back).
+    await expect(f.archiveSearchStage(db.pg)).rejects.toThrow();
+
+    expect({
+      jobs: await snapshot(db.pg, "pipeline_jobs"),
+      letters: await snapshot(db.pg, "pipeline_dead_letters"),
+      events: await snapshot(db.pg, "pipeline_events"),
+      archive: await snapshot(db.pg, "search_stage_archive"),
+    }).toEqual(before);
+    expect(await f.searchStageDownPrecondition(db.pg)).toBe(false);
   }, 120_000);
 });
 
