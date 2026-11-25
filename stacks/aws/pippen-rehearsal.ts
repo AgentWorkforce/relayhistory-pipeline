@@ -87,6 +87,8 @@ export type StateBucketErrorCode =
   | "state_inputs_invalid"
   | "state_issuer_pin_mismatch"
   | "state_provenance_mismatch"
+  | "state_not_claimed"
+  | "state_authorization_mismatch"
   | "state_gone_unproven"
   | "state_receipt_mismatch"
   | "state_manifest_invalid"
@@ -288,46 +290,66 @@ export function validatePippenStateBucket(aws: AwsRun, i: { accountId: string; r
 }
 
 /**
- * validate-only, as the state layer and the capture run it before Alchemy's first state operation:
- * the caller is this run's attested lease session (STS), the prefix is exactly this stage's, the
- * shared bucket is already in shape, and, while this stage's state is still empty (stage A has not
- * been applied), none of the stage's names is in use (assertRehearsalNamesUnused), so stage A's
- * creates cannot adopt an existing resource. Nothing is created or written.
+ * validate-only, as the state layer and the capture run it before Alchemy's first state operation.
+ * READ-ONLY: it never writes (the marker is written only by the explicit claim, claimStageState).
+ * The caller is this run's attested lease session (STS), the prefix is exactly this stage's, the
+ * shared bucket is in shape, and the stage's state must be claimed by THIS run (its marker present
+ * and exactly this run's: run id, lease session, issuance time, pin). An unclaimed (empty) prefix
+ * refuses (`state_not_claimed`). While the marker is the only current object (stage A not applied),
+ * none of the stage's names may be in use (assertRehearsalNamesUnused).
  */
 export function assertValidateOnlyState(aws: AwsRun, ctx: RehearsalContext): { bucket: string; prefix: string } {
   const prefix = rehearsalStatePrefix(ctx.stage);
   if (ctx.region !== REHEARSAL_REGION) throw new StateBucketError("state_inputs_invalid");
   assertLeaseCaller(aws, ctx.accountId, { [PIPPEN_PROOF_SANDBOX.sessionEnv]: ctx.sessionId, [PIPPEN_PROOF_SANDBOX.execSessionEnv]: ctx.sessionId, [PIPPEN_PROOF_SANDBOX.execAccountEnv]: ctx.accountId });
   const bucket = validatePippenStateBucket(aws, ctx);
-  if (stageStateIsEmpty(aws, { bucket, region: ctx.region, prefix })) {
-    // First state write of this stage: no name may be in use, then this run's marker is written
-    // before Alchemy writes anything, so a later resume can prove the state is this run's.
-    assertRehearsalNamesUnused(aws, ctx);
-    writeRunMarker(aws, { bucket, prefix, ctx });
-  } else assertRunMarker(aws, { bucket, prefix, ctx });
+  const current = currentStateKeys(aws, { bucket, region: ctx.region, prefix });
+  if (current.length === 0) throw new StateBucketError("state_not_claimed");
+  assertRunMarker(aws, { bucket, prefix, ctx });
+  if (current.length === 1 && current[0] === runMarkerKey(prefix)) assertRehearsalNamesUnused(aws, ctx);
   return { bucket, prefix };
 }
 
 /**
- * Whether the stage's prefix has no current object (ListObjectsV2, at most one key): the reply must
- * be well formed, KeyCount exactly 0 or 1 and matching its Contents; anything else refuses.
+ * The explicit claim of the stage's state by this run (scripts/rehearsal-state-teardown.ts
+ * --claim), before the first capture: the attested caller and the bucket checked; the prefix's
+ * VERSION inventory must be empty (zero versions and zero delete markers, so no prior, unowned
+ * history can be claimed and later deleted); none of the stage's names may be in use; then this
+ * run's marker is written with PutObject --if-none-match "*". The only write in validate-only mode.
  */
-function stageStateIsEmpty(aws: AwsRun, i: { bucket: string; region: string; prefix: string }): boolean {
+export function claimStageState(aws: AwsRun, ctx: RehearsalContext): { bucket: string; marker: string } {
+  const prefix = rehearsalStatePrefix(ctx.stage);
+  assertLeaseCaller(aws, ctx.accountId, { [PIPPEN_PROOF_SANDBOX.sessionEnv]: ctx.sessionId, [PIPPEN_PROOF_SANDBOX.execSessionEnv]: ctx.sessionId, [PIPPEN_PROOF_SANDBOX.execAccountEnv]: ctx.accountId });
+  const bucket = validatePippenStateBucket(aws, ctx);
+  if (listStageStateVersions(aws, { bucket, region: ctx.region, stage: ctx.stage }).length !== 0) throw new StateBucketError("state_provenance_mismatch");
+  assertRehearsalNamesUnused(aws, ctx);
+  writeRunMarker(aws, { bucket, prefix, ctx });
+  return { bucket, marker: runMarkerKey(prefix) };
+}
+
+/**
+ * The stage prefix's current keys (ListObjectsV2, at most two): the reply must be well formed, with
+ * KeyCount exactly 0, 1 or 2 matching its Contents, every key under the prefix; anything else refuses.
+ */
+function currentStateKeys(aws: AwsRun, i: { bucket: string; region: string; prefix: string }): string[] {
   let listed: Record<string, unknown>;
   try {
-    const text = aws(["s3api", "list-objects-v2", "--bucket", i.bucket, "--region", i.region, "--prefix", i.prefix, "--max-keys", "1", "--no-paginate", "--output", "json"]);
+    const text = aws(["s3api", "list-objects-v2", "--bucket", i.bucket, "--region", i.region, "--prefix", i.prefix, "--max-keys", "2", "--no-paginate", "--output", "json"]);
     if (!text.trim()) throw new Error("blank");
     listed = JSON.parse(text) as Record<string, unknown>;
   } catch {
     throw new StateBucketError("state_bucket_unreadable");
   }
   if (listed === null || typeof listed !== "object" || Array.isArray(listed)) throw new StateBucketError("state_bucket_unreadable");
-  const contents = listed.Contents;
-  const ok =
-    (listed.KeyCount === 0 && (contents === undefined || (Array.isArray(contents) && contents.length === 0))) ||
-    (listed.KeyCount === 1 && Array.isArray(contents) && contents.length === 1 && typeof (contents[0] as { Key?: unknown })?.Key === "string" && ((contents[0] as { Key: string }).Key).startsWith(i.prefix));
-  if (!ok || (listed.Prefix !== undefined && listed.Prefix !== i.prefix)) throw new StateBucketError("state_bucket_unreadable");
-  return listed.KeyCount === 0;
+  const contents = listed.Contents ?? [];
+  if (
+    !(listed.KeyCount === 0 || listed.KeyCount === 1 || listed.KeyCount === 2) ||
+    !Array.isArray(contents) || contents.length !== listed.KeyCount ||
+    !contents.every((c) => typeof (c as { Key?: unknown })?.Key === "string" && (c as { Key: string }).Key.startsWith(i.prefix) && (c as { Key: string }).Key.length > i.prefix.length) ||
+    (listed.Prefix !== undefined && listed.Prefix !== i.prefix)
+  )
+    throw new StateBucketError("state_bucket_unreadable");
+  return (contents as { Key: string }[]).map((c) => c.Key);
 }
 
 /** The run marker's key: not `.json`, so Alchemy's state store (which lists `*.json` resources) ignores it. */
@@ -376,6 +398,7 @@ export function prepareStateBackend(
 ): StateBackend {
   const backend = stateBackendFor(i.stage, i.inputs);
   const v = i.inputs as { accountId: string; region: string };
+  // Read-only in validate-only mode (the claim is a separate, explicit step).
   if (backend === "validate-only") assertValidateOnlyState(aws, rehearsalRunContext(i.stage, i.inputs, i.env, i.now)!);
   else if (backend === "ensure") ensure(aws, { accountId: v.accountId, region: v.region, stage: i.stage });
   return backend;
@@ -869,3 +892,101 @@ export function rehearsalLeasePolicies(i: { accountId: string; roleArn: string; 
   return { expiresAt: end, inline, managed };
 }
 
+
+/**
+ * The teardown authorization: the trusted handoff from the lease the run was captured and deployed
+ * under (A) to the lease issued for teardown (B, with the mappings' absence reads). The broker writes
+ * it at B's issuance and records its digest in its receipt; the code verifies it against that digest,
+ * the manifest, the current STS caller (B) and the generated teardown policy.
+ */
+export interface TeardownAuthorization {
+  schema: 1;
+  stage: string;
+  runId: string;
+  /** Lease A: the run's original lease, as the manifest and the marker record it. */
+  original: { sessionId: string; issuedAt: string; pin: string };
+  manifestDigest: string;
+  mappingUuids: string[];
+  /** Lease B: the authorized teardown principal. */
+  teardown: { sessionId: string; callerArn: string; issuedAt: string; expiresAt: string; policyDigest: string };
+}
+
+/** sha256 of the canonical JSON of a teardown authorization (the value the broker's receipt records). */
+export function authorizationDigest(a: unknown): string {
+  return createHash("sha256").update(canonical(a)).digest("hex");
+}
+
+/** sha256 of the canonical teardown lease policies for lease B (issuance time) with the manifest's mapping UUIDs. */
+export function teardownPolicyDigest(ctx: RehearsalContext, mappingUuids: readonly string[]): string {
+  return createHash("sha256").update(canonical(rehearsalLeasePolicies({ accountId: ctx.accountId, roleArn: ctx.roleArn, issuedAt: ctx.issuedAt, mappingUuids }))).digest("hex");
+}
+
+/**
+ * Verify a teardown authorization for the current lease (ctx, lease B, already proven by STS) and
+ * return the original run's context (lease A) the manifest and the marker are checked against.
+ * Refuses (`state_authorization_mismatch`) unless: its digest is the broker's recorded one; it is
+ * this stage and run; B is exactly the current session, caller ARN and issuance, not expired and
+ * expiring no later than B's lease end; B's policy digest is the generated teardown policy with the
+ * authorization's mapping UUIDs; and A's pin is the issuer pin of the same approved account,
+ * boundary, role and disposition with A's session and issuance time.
+ */
+export function assertTeardownAuthorization(ctx: RehearsalContext, auth: unknown, expectedDigest: string | undefined, now: number = Date.now()): RehearsalContext {
+  const fail = (): never => {
+    throw new StateBucketError("state_authorization_mismatch");
+  };
+  if (expectedDigest === undefined || !/^[0-9a-f]{64}$/.test(expectedDigest) || authorizationDigest(auth) !== expectedDigest) fail();
+  const a = auth as TeardownAuthorization;
+  const hex = (v: unknown) => typeof v === "string" && /^[0-9a-f]{64}$/.test(v);
+  const ok =
+    a !== null && typeof a === "object" && a.schema === 1 && a.stage === ctx.stage && a.runId === ctx.runId &&
+    typeof a.original?.sessionId === "string" && PIPPEN_SESSION_ID.test(a.original.sessionId) && typeof a.original.issuedAt === "string" && ISO.test(a.original.issuedAt) && hex(a.original.pin) &&
+    hex(a.manifestDigest) && Array.isArray(a.mappingUuids) && a.mappingUuids.length === 2 && a.mappingUuids.every((u) => typeof u === "string" && UUID.test(u)) && new Set(a.mappingUuids).size === 2 &&
+    a.teardown?.sessionId === ctx.sessionId && a.teardown.issuedAt === ctx.issuedAt &&
+    a.teardown.callerArn === `arn:aws:sts::${ctx.accountId}:assumed-role/${PIPPEN_PROOF_SANDBOX.callerRole.roleName}/${PIPPEN_PROOF_SANDBOX.callerRole.sessionPrefix}${ctx.sessionId}` &&
+    typeof a.teardown.expiresAt === "string" && ISO.test(a.teardown.expiresAt) && now < Date.parse(a.teardown.expiresAt) && Date.parse(a.teardown.expiresAt) <= Date.parse(rehearsalLeaseEnd({ issuedAt: ctx.issuedAt })) &&
+    a.teardown.policyDigest === teardownPolicyDigest(ctx, a.mappingUuids);
+  if (!ok) fail();
+  const original: IssuerPinned = { stage: ctx.stage, region: ctx.region, accountId: ctx.accountId, boundaryArn: ctx.boundaryArn, roleArn: ctx.roleArn, roleDisposition: ctx.roleDisposition, sessionId: a.original.sessionId, issuedAt: a.original.issuedAt };
+  if (rehearsalIssuerPin(original) !== a.original.pin) fail();
+  return { ...original, pin: a.original.pin, runId: a.runId };
+}
+
+/**
+ * The whole teardown, in order, with no deletion before every check passed: the run context of the
+ * current lease (before any AWS call); STS; the bucket; with a teardown authorization (lease B), the
+ * authorization (above), else the current lease must be the run's own; the independent manifest
+ * receipt (the broker's recorded digest) and, with an authorization, its manifest digest and mapping
+ * UUIDs; the manifest against the original run; every recorded id gone; the current marker owned by
+ * the original run; and only then the state versions deleted (execute) or counted (dry run).
+ */
+export function runRehearsalTeardown(
+  aws: AwsRun,
+  i: {
+    inputs: unknown;
+    env: Record<string, string | undefined>;
+    now?: number;
+    execute: boolean;
+    manifest?: unknown;
+    expectManifestDigest?: string;
+    authorization?: unknown;
+    expectAuthorizationDigest?: string;
+  },
+): { listed: number; deleted: number; remaining: number } {
+  const ctx = rehearsalRunContext(REHEARSAL_STAGE, i.inputs, i.env, i.now)!;
+  assertLeaseCaller(aws, ctx.accountId, i.env);
+  const bucket = validatePippenStateBucket(aws, ctx);
+  const prefix = rehearsalStatePrefix(ctx.stage);
+  if (!i.execute) return teardownStageState(aws, { bucket, region: ctx.region, stage: REHEARSAL_STAGE, execute: false });
+  const original = i.authorization === undefined ? ctx : assertTeardownAuthorization(ctx, i.authorization, i.expectAuthorizationDigest, i.now);
+  assertManifestReceipt(i.manifest, i.expectManifestDigest);
+  if (i.authorization !== undefined) {
+    const a = i.authorization as TeardownAuthorization;
+    const m = i.manifest as PhysicalManifest;
+    if (a.manifestDigest !== m.digest || [...a.mappingUuids].sort().join() !== m.mappings.map((x) => x.uuid).sort().join()) throw new StateBucketError("state_authorization_mismatch");
+  }
+  assertManifestComplete(i.manifest, original, original.runId);
+  assertManifestGone(aws, i.manifest, original, original.runId);
+  // The current marker must be the original run's before any version is deleted.
+  assertRunMarker(aws, { bucket, prefix, ctx: original });
+  return teardownStageState(aws, { bucket, region: ctx.region, stage: REHEARSAL_STAGE, execute: true });
+}
