@@ -3,7 +3,7 @@ import { readFileSync, realpathSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import pg from "pg";
 import assert from "node:assert/strict";
-import { plan, sha256Text } from "../../../src/hoopdb/migrate.ts";
+import { plan, runMigrations } from "../../../src/hoopdb/migrate.ts";
 import { publicationKernelSlot, publicationRecoverySlot, heldPublicationSentinels } from "./held-profile.ts";
 
 const root=realpathSync(join(import.meta.dir,"../../.."));
@@ -21,7 +21,7 @@ const initial=await plan(profile);
 assert.deepEqual(initial.map(s=>s.name).filter(n=>ordered.includes(n)),[searchName]);
 // The private precondition is synthetic. Its filename deliberately cannot be
 // confused with released capture SQL. Never compute a production generation.
-writeFileSync(join(discovery,privateFile),readFileSync(join(source,"062270-private-read-profile.up.sql")), {flag:"wx"});
+writeFileSync(join(discovery,privateFile),readFileSync(join(source,"062270-private-read-profile.up.sql"),"utf8").replace(/^BEGIN;\n/m,"").replace(/\nCOMMIT;\s*$/,"\n"), {flag:"wx"});
 for (const slot of [publicationKernelSlot,publicationRecoverySlot])
   writeFileSync(join(discovery,slot.name.slice("upstream:".length)),slot.up,{flag:"wx"});
 const steps=await plan(profile);
@@ -32,23 +32,16 @@ await c.connect();
 try {
   assert.equal((await c.query("SHOW server_encoding")).rows[0].server_encoding,"UTF8");
   await c.query("CREATE ROLE bulls96_publication_scoped NOLOGIN; CREATE ROLE bulls96_publication_recovery NOLOGIN; CREATE EXTENSION pg_trgm; CREATE EXTENSION btree_gin");
-  for(const step of steps) {
-    const raw=readFileSync(step.path,"utf8");
-    const sql=raw.split("\n").filter(line=>!line.startsWith("\\")).join("\n");
-    if(step.name===privateName){
-      await c.query("CREATE TABLE IF NOT EXISTS sessions.__96bulls_migrations(name text PRIMARY KEY,sha256 text NOT NULL)");
-      await c.query("GRANT USAGE ON SCHEMA sessions TO bulls96_publication_scoped,bulls96_publication_recovery");
-    }
-    // The private component already manages its own transaction. Preserve its
-    // exact source. Every proposed up after it uses one outer transaction.
-    if(!ordered.includes(step.name) || step.name===privateName) {await c.query(sql);continue;}
-    await c.query("BEGIN");
-    try {
-      await c.query(sql);
-      await c.query("INSERT INTO sessions.__96bulls_migrations(name,sha256) VALUES($1,$2)",[step.name,sha256Text(raw)]);
-      await c.query("COMMIT");
-    } catch(e){await c.query("ROLLBACK");throw e;}
-  }
+  await c.query("CREATE SCHEMA sessions; GRANT USAGE ON SCHEMA sessions TO bulls96_publication_scoped,bulls96_publication_recovery");
+  // Exact on-disk discovery, SQL-byte ledger and preflight of the real migrator.
+  // Its local marker describes only this disposable tree. It is never emitted
+  // as a release generation or used for an enrolled receipt.
+  const first=await runMigrations(c,{profile});
+  assert.ok(first.applied>ordered.length);
+  const rerun=await runMigrations(c,{profile});
+  assert.equal(rerun.applied,0);
+  const rows=await c.query("SELECT name FROM sessions.__96bulls_migrations WHERE name=ANY($1) ORDER BY name COLLATE \"C\"",[ordered]);
+  assert.deepEqual(rows.rows.map(row=>row.name),ordered);
   assert.equal((await c.query("SELECT to_regprocedure('sessions.ingest_scoped_publication_receipt_capture_v1(jsonb)') IS NULL missing")).rows[0].missing,true);
   for(const s of Object.values(heldPublicationSentinels)) assert.equal((await c.query(s.sql)).rows[0].applied,true);
   await c.query("CREATE DATABASE publication_release_fixture TEMPLATE postgres");
@@ -60,5 +53,5 @@ try {
   await c.query(readFileSync(join(source,"062270-private-read-profile.down.sql"),"utf8"));
   assert.equal((await c.query("SELECT to_regclass('sessions.search_stage_archive') IS NOT NULL retained")).rows[0].retained,true);
   for(const s of Object.values(heldPublicationSentinels)) assert.equal((await c.query(s.sql)).rows[0].applied,false);
-  console.log(JSON.stringify({server:(await c.query("SHOW server_version")).rows[0].server_version,encoding:"UTF8",discovered:ordered,rollback:"300/290/280/270",searchArchiveRetained:true,captureRpc:"absent"}));
+  console.log(JSON.stringify({server:(await c.query("SHOW server_version")).rows[0].server_version,encoding:"UTF8",discovered:ordered,rerunApplied:rerun.applied,rollback:"300/290/280/270",searchArchiveRetained:true,captureRpc:"absent"}));
 } finally {await c.end();}
