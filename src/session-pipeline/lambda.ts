@@ -530,7 +530,7 @@ export function runtimeFromSecret(env: LambdaEnv, secretText: string, schemaGene
       orgs: prefixOrgResolver,
       allowPrefix: (prefix, orgId) => prefixAllowed(bindings, prefix, orgId),
       fanout,
-      // The managed search wake: explicitly off unless SEARCH_WAKE_ENQUEUE=1 (hoopdb/index.ts treats absent as on).
+      // The managed search wake: off unless SEARCH_WAKE_ENQUEUE=1 (hoopdb/index.ts writes it only for exactly true).
       publication:{schemaGeneration,enqueueSearchWake:env.searchWakeEnqueue===true,transact:work=>transaction(db,async tx=>{
         await tx.query("SET LOCAL statement_timeout='5s';SET LOCAL lock_timeout='1s'");return work(tx);
       })},

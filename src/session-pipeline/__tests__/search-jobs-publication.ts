@@ -81,6 +81,12 @@ export interface PublishedHeadOptions {
    * delivery's poll result is returned unchecked, for the test to assert.
    */
   expectAuthorityAck?: boolean;
+  /**
+   * The writer's explicit opt-in (hoopDbSessionIndex publication.enqueueSearchWake; only exactly true writes the
+   * managed wake). Default true, for the retired case and the current authority transaction alike; `undefined`
+   * passes no field at all (the writer's default, off).
+   */
+  enqueueSearchWake?: boolean | undefined;
 }
 
 /**
@@ -114,6 +120,7 @@ export async function siblingHead(db: PGlite, realKey: string, tag: string,
 
 /** Publishes one session, then runs `object-landed` and the managed `session-indexed` authority path. */
 export async function publishedHead(opts: PublishedHeadOptions = {}): Promise<PublishedHead> {
+  const optIn = "enqueueSearchWake" in opts ? (opts.enqueueSearchWake === undefined ? {} : { enqueueSearchWake: opts.enqueueSearchWake }) : { enqueueSearchWake: true };
   const db = new PGlite({ extensions: { btree_gin, pg_trgm } });
   const owner = async (sql: string, args: unknown[] = []) => db.query<any>(sql, args as never);
   const asIngest = async (sql: string, args: unknown[] = []) => {
@@ -159,7 +166,7 @@ export async function publishedHead(opts: PublishedHeadOptions = {}): Promise<Pu
   const transact: Transact = (work) => db.transaction((tx) => work(tx));
   const reader = objectStoreManifestReader(store, { provider: "s3", bucket: (job.payload as { bucket: string }).bucket });
   const queue = postgresPipelineQueue(db);
-  const index = hoopDbSessionIndex({ db: db as never, reader, queue, current: () => undefined, publication: { schemaGeneration: GEN, transact } });
+  const index = hoopDbSessionIndex({ db: db as never, reader, queue, current: () => undefined, publication: { schemaGeneration: GEN, transact, ...optIn } });
   const deps: StageQueueDeps = { sink: new InMemoryPipelineEventSink(), deadLetters: new InMemoryDeadLetterStore(), handlers: {
     "object-landed": objectLandedHandler({ senders: { send: (_s, msg) => queue.send(msg) }, quarantine: async () => { throw Error("unexpected quarantine"); }, transformEnabled: false }),
     "session-indexed": sessionIndexedHandler(index),
@@ -179,7 +186,7 @@ export async function publishedHead(opts: PublishedHeadOptions = {}): Promise<Pu
   await expect(db.transaction(async (tx) => {
     const before = (await tx.query<{ n: number }>("SELECT count(*)::int n FROM sessions.pipeline_jobs")).rows[0]!.n;
     await tx.query("UPDATE sessions.ingest_publication_generations SET state='retired',retired_at=clock_timestamp() WHERE generation=(SELECT generation FROM sessions.ingest_publication_heads WHERE current_key=$1)", [key]);
-    const fenced = hoopDbSessionIndex({ db: tx as never, reader, queue: postgresPipelineQueue(tx), current: () => indexed, publication: { schemaGeneration: GEN, transact: (work) => work(tx) } });
+    const fenced = hoopDbSessionIndex({ db: tx as never, reader, queue: postgresPipelineQueue(tx), current: () => indexed, publication: { schemaGeneration: GEN, transact: (work) => work(tx), ...optIn } });
     const outcome = await sessionIndexedHandler(fenced)(indexed, {} as never, 1);
     const after = (await tx.query<{ n: number }>("SELECT count(*)::int n FROM sessions.pipeline_jobs")).rows[0]!.n;
     retired = { outcome, jobsWritten: after - before };

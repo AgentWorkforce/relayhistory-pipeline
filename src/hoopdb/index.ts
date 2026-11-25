@@ -46,9 +46,10 @@ export interface IndexDeps {
   /**
    * Compiled schema identity and one short final metadata transaction. `enqueueSearchWake`: write the
    * managed `search-index` wake inside the authority transaction (docs/handoffs/incremental-search-indexing.md
-   * §2; needs migration 20261105062300 and the owner's EXECUTE grant). Absent means on, so
-   * every production caller passes it explicitly from its own flag (lambda.ts SEARCH_WAKE_ENQUEUE, indexer.ts
-   * PIPELINE_MANAGED_SEARCH_WAKE_ENABLED, consumer-service.ts SEARCH_WAKE_ENQUEUE; each default off).
+   * §2; needs migration 20261105062300 and the owner's EXECUTE grant). Explicit opt-in: only exactly `true`
+   * writes the wake; absent or false writes nothing (the pre-M2 behaviour). Each production caller passes its own
+   * flag (lambda.ts SEARCH_WAKE_ENQUEUE, indexer.ts PIPELINE_MANAGED_SEARCH_WAKE_ENABLED, consumer-service.ts
+   * SEARCH_WAKE_ENQUEUE; each default off).
    */
   publication?:{schemaGeneration:string;transact:Transact; enqueueSearchWake?:boolean};
   /**
@@ -161,7 +162,7 @@ function sessionIndex(deps:IndexDeps,authorized:boolean,managedSearch?:ManagedSe
         }};
         const final=await withPublicationAuthority(config.transact,evidence,async (tx,authority)=>{
           const db={...deps.db,query:tx.query.bind(tx)}as HoopDb;
-          return sessionIndex({...deps,db,reader:cached,queue:postgresPipelineQueue(tx)},true,authority.managed && config.enqueueSearchWake !== false ? {evidence} : undefined).upsertRawPointer(pointer,ctx,opts);
+          return sessionIndex({...deps,db,reader:cached,queue:postgresPipelineQueue(tx)},true,authority.managed && config.enqueueSearchWake === true ? {evidence} : undefined).upsertRawPointer(pointer,ctx,opts);
         });
         return final.current?final.value:{status:"skipped",reason:"publication_retired"};
       }
