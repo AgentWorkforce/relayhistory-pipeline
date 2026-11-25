@@ -106,7 +106,7 @@ replay tooling works unchanged:
 { "v": 1, "stage": "search-index",
   "ctx": { "traceId": "<uuid, inherited from the session-indexed message>", "orgId": "...", "workspaceId": "...",
            "harness": "...", "sessionId": "<canonical session id>" },
-  "workKey": "search␟<org>␟<ws>␟<harness>␟<canonical session id>",
+  "workKey": "search\u001F<org>\u001F<ws>\u001F<harness>\u001F<canonical session id>",
   "revision": <pointer revision of this write, informational>,
   "payload": { "epoch": <session_directory.event_projection_epoch after this transaction's writes>,
                "clock": { "source": "publish", "at": "<ingest_publication_attempts.published_at, ISO>" } } }
@@ -195,9 +195,12 @@ lose a follow-up wake that arrived during the pass. Each statement keys on `(id,
   transaction bound to the lease, so exhaustion can never discard a newer wake:
   ```sql
   -- a) Park the CLAIMED message only (the message as it was at claim time, $claimed_msg; epoch = claimed_epoch).
-  INSERT INTO sessions.pipeline_dead_letters (stage, …, message, error_code)
-    SELECT 'search-index', …, $claimed_msg, 'retries_exhausted'
-      FROM sessions.pipeline_jobs WHERE id = $id AND lease_id = $lease;     -- 0 rows if the lease was lost: abort
+  -- Same statement shape as postgres-dead-letters.ts quarantine (state 'dead'; dead_count / last_dead_at upsert on
+  -- the letter id). The table has no error-code column: 'retries_exhausted' goes to the log line and the metric only.
+  INSERT INTO sessions.pipeline_dead_letters (id, stage, trace_id, workspace_id, message, state, first_dead_at, last_dead_at, dead_count)
+    SELECT $letter_id, 'search-index', trace_id, workspace_id, $claimed_msg, 'dead', now(), now(), 1
+      FROM sessions.pipeline_jobs WHERE id = $id AND lease_id = $lease      -- 0 rows if the lease was lost: abort
+  ON CONFLICT (id) DO UPDATE SET state = 'dead', last_dead_at = now(), dead_count = pipeline_dead_letters.dead_count + 1;
   -- b) No newer wake: delete the row.
   DELETE FROM sessions.pipeline_jobs WHERE id = $id AND lease_id = $lease
     AND (message->'payload'->>'epoch')::bigint <= $claimed_epoch;
@@ -219,11 +222,13 @@ the unique scope row. One transaction:
 2. run the §3.1 upsert with the letter's message, plus `payload.replay_id`;
 3. then one of:
    - **superseded:** the row already carries an epoch at or above the letter's (the upsert kept the row's message).
-     Mark the letter `resolved` (reason `superseded`) in the SAME transaction. Newer work covers it, so it can never
+     Mark the letter `resolved` (`resolved_at = now()`) in the SAME transaction. The table has no reason column, so
+     `superseded` is recorded in the log line, plus a new nullable `resolution text` column added by the M2
+     migration. Newer work covers it, so it can never
      stay stuck in `replaying`;
    - **merged:** the row now carries the letter's epoch and replay id. The §3.3 `done` settlement resolves the letter
      by `last_replay_id = payload.replay_id`, in the same transaction as its DELETE. `exhausted` re-quarantines it
-     (state back to `quarantined`).
+     (state back to `dead`, the table's own state name: `dead` / `replaying` / `resolved`).
 
 Tests: R8a (superseded resolves at once), R8b (merged resolves on done).
 
@@ -249,10 +254,10 @@ The `search-index` handler, in one `deps.transact` transaction for the decision,
 
 ### 4.1 Lock order (unchanged from `search-index.ts:636-643`)
 
-1. scope lock `96bulls:search␟org␟ws␟harness␟session` (try; `scope_busy` leads to a retry with a short delay,
+1. scope lock `96bulls:search\u001Forg\u001Fws\u001Fharness\u001Fsession` (try; `scope_busy` leads to a retry with a short delay,
    coalesced);
 2. `livePointerSnapshot` (keys, epoch, canonical);
-3. canonical lock `96bulls:directory-events␟…␟canonical` (try);
+3. canonical lock `96bulls:directory-events\u001F…\u001Fcanonical` (try);
 4. then the fence read (§4.4), `FOR SHARE` on the fence row if one exists.
 
 ### 4.2 Committed-state guard
