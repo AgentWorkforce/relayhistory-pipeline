@@ -163,6 +163,13 @@ export interface LambdaEnv {
    * managed search-jobs pass never skips. Absent: as before.
    */
   searchSkipAcceptanceMissing?: true;
+  /**
+   * SEARCH_INDEX_SKIP_OVER_BOUND_ENABLED=true (default off; same grammar as on the backport lineage): a scope whose
+   * stored pointer sizes and search state already show the size refusal at its current revision returns before
+   * any manifest read (search-index.ts overBoundBeforeRead). The managed search-jobs pass never skips. Absent: as
+   * before.
+   */
+  searchSkipOverBound?: true;
   /** SEARCH_INDEX_PREREAD_ENABLED=true: read a legacy ClickHouse whole scope before its search lock. Default off. */
   searchPreReadEnabled?: boolean;
   /** SESSION_POINTER_PREREAD_ENABLED=true: the pointer stage reads before its scope lock (pointer.ts indexPreRead). Default off. */
@@ -263,6 +270,10 @@ export function lambdaEnv(env: NodeJS.ProcessEnv = process.env, composition?: Se
   const skipAcceptanceMissing = searchIndexSkipAcceptanceMissingFromEnv(env);
   if (skipAcceptanceMissing && env.SEARCH_INDEX_ENABLED !== "1")
     throw new Error("session pipeline: SEARCH_INDEX_SKIP_ACCEPTANCE_MISSING_ENABLED=true needs SEARCH_INDEX_ENABLED=1");
+  // SEARCH_INDEX_SKIP_OVER_BOUND_ENABLED: strict grammar, default off; on needs the search stage.
+  const skipOverBound = searchIndexSkipOverBoundFromEnv(env);
+  if (skipOverBound && env.SEARCH_INDEX_ENABLED !== "1")
+    throw new Error("session pipeline: SEARCH_INDEX_SKIP_OVER_BOUND_ENABLED=true needs SEARCH_INDEX_ENABLED=1");
   // SESSION_POINTER_PREREAD_ENABLED: strict grammar, default off.
   const pointerPreRead = pointerPreReadFromEnv(env);
   // SESSION_POINTER_SKIP_ORIGIN_BUCKET_ENABLED: strict grammar, default off.
@@ -295,6 +306,7 @@ export function lambdaEnv(env: NodeJS.ProcessEnv = process.env, composition?: Se
     ...(skipCurrent ? { skipCurrentEnabled: true } : {}),
     ...(searchPreRead ? { searchPreReadEnabled: true } : {}),
     ...(skipAcceptanceMissing ? { searchSkipAcceptanceMissing: true as const } : {}),
+    ...(skipOverBound ? { searchSkipOverBound: true as const } : {}),
     ...(pointerPreRead ? { pointerPreReadEnabled: true } : {}),
     ...(pointerSkipOriginBucket ? { pointerSkipOriginBucketEnabled: true } : {}),
     ...(searchStreamCh ? { searchStreamCh } : {}),
@@ -593,6 +605,8 @@ export function runtimeFromSecret(env: LambdaEnv, secretText: string, schemaGene
       ...(env.searchPreReadEnabled ? { preRead: true as const } : {}),
       // Default off (SEARCH_INDEX_SKIP_ACCEPTANCE_MISSING_ENABLED=true, ClickHouse only).
       ...(env.searchSkipAcceptanceMissing && !binding ? { skipAcceptanceMissing: true as const } : {}),
+      // Default off (SEARCH_INDEX_SKIP_OVER_BOUND_ENABLED=true, ClickHouse only).
+      ...(env.searchSkipOverBound && !binding ? { skipOverBound: true as const } : {}),
       // Default off (SEARCH_INDEX_STREAMING_CH=1, ClickHouse only); the deadline is set per invocation.
       ...(env.searchStreamCh && !binding ? { stream: { maxReadBytes: env.searchStreamCh.maxReadBytes, maxReadEvents: env.searchStreamCh.maxReadEvents } } : {}),
     };
@@ -1195,6 +1209,17 @@ export function searchIndexSkipAcceptanceMissingFromEnv(env: Record<string, stri
   if (value === undefined || value === "" || value === "false") return false;
   if (value === "true") return true;
   throw new Error("session pipeline: SEARCH_INDEX_SKIP_ACCEPTANCE_MISSING_ENABLED must be true or false");
+}
+
+/**
+ * SEARCH_INDEX_SKIP_OVER_BOUND_ENABLED for the hosted Lambda: unset, "" and "false" are off; "true" is on;
+ * anything else fails init naming the variable, never the value (the backport lineage's grammar).
+ */
+export function searchIndexSkipOverBoundFromEnv(env: Record<string, string | undefined>): boolean {
+  const value = env.SEARCH_INDEX_SKIP_OVER_BOUND_ENABLED;
+  if (value === undefined || value === "" || value === "false") return false;
+  if (value === "true") return true;
+  throw new Error("session pipeline: SEARCH_INDEX_SKIP_OVER_BOUND_ENABLED must be true or false");
 }
 
 /**
