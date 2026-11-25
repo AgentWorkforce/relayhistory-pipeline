@@ -37,7 +37,7 @@ export default defineLayeredAgent({
   // per PR stack from the triage. Two at a time on this 4-vCPU / 16 GiB box
   // (the default is 3); in-process subagents stay the default for
   // implementation.
-  workers: { maxConcurrent: 2 },
+  workers: { maxConcurrent: 2, harness: "codex", model: "gpt-6.2-astra" },
   // The first repo is the lead's working directory and the ledger's
   // repository (LEDGER_REPO=~/build/sessions-pipeline).
   repos: ["AgentWorkforce/sessions-pipeline", "AgentWorkforce/sessions-pipeline-cloud"],
@@ -55,6 +55,9 @@ export default defineLayeredAgent({
   // left unset, so the lead rotates at the kit's defaults (60,000 events or
   // 48 MiB) and the env file carries no LEAD_ROTAT* line.
   relayDescription: "sessions-pipeline layered lead (EC2, Fable)",
+  // Codex until the Anthropic credit is topped up (Khaliq, 2026-11-24). Must match
+  // layered-agents infra/agents.ts (#69), which lets the host read this key.
+  lead: { harness: "codex", model: "gpt-6.2-astra", openaiKeyParam: `/relaycast-agent-host/${stage}/openai-api-key-sessions-pipeline` },
   names: { platformPrefix: `/relaycast-agent-host/${stage}` },
   // The Agent Relay sessions MCP (module 0.1.9): the lead can search and read
   // the team's shared sessions as agent-relay-sessions. The host role and its

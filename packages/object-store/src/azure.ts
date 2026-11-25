@@ -54,6 +54,12 @@ export interface AzureBlobConfig {
   auth: AzureAuth;
   pageSize?: number;
   fetch?: typeof fetch;
+  /**
+   * Report a versioning account's `x-ms-version-id` as `version` on put, head and get (off by default, so every
+   * existing store keeps its exact version objects and comparisons). The session-analysis runner turns it on: its
+   * sweeper keeps exactly the version a result put created.
+   */
+  versionIds?: boolean;
 }
 
 const BACKEND = "azure";
@@ -78,6 +84,10 @@ class AzureTransport implements Transport {
       this.#bearer = cachedProvider(config.auth.token);
   }
 
+  #version(headers: Headers): ObjectVersion {
+    return this.#config.versionIds ? versionOf(headers) : eTagOf(headers.get("etag"));
+  }
+
   #blobUrl(key: string): URL {
     return new URL(
       `${this.#base}/${rfc3986(this.#config.container)}/${encodeKeyPath(key)}`,
@@ -90,6 +100,7 @@ class AzureTransport implements Transport {
     url: URL,
     headers: Headers,
     body?: Uint8Array,
+    signal?: AbortSignal,
   ) {
     headers.set("x-ms-version", AZURE_API_VERSION);
     headers.set("x-ms-date", new Date().toUTCString());
@@ -97,13 +108,14 @@ class AzureTransport implements Transport {
     if (auth.kind === "sharedKey") {
       headers.set(
         "authorization",
-        `SharedKey ${this.#config.account}:${await this.#sharedKeySignature(
+        await azureSharedKeyAuthorization(
+          this.#config.account,
+          auth.accountKey,
           method,
           url,
           headers,
           body?.length ?? 0,
-          auth.accountKey,
-        )}`,
+        ),
       );
     } else if (this.#sas) {
       const sas = new URLSearchParams(
@@ -124,48 +136,10 @@ class AzureTransport implements Transport {
         method,
         headers,
         ...(body ? { body: body as Uint8Array<ArrayBuffer> } : {}),
+        ...(signal ? { signal } : {}),
       },
       this.#fetch,
     );
-  }
-
-  async #sharedKeySignature(
-    method: string,
-    url: URL,
-    headers: Headers,
-    contentLength: number,
-    accountKey: string,
-  ): Promise<string> {
-    const h = (name: string) => headers.get(name) ?? "";
-    const msHeaders: [string, string][] = [];
-    headers.forEach((value, name) => {
-      const lower = name.toLowerCase();
-      if (lower.startsWith("x-ms-")) msHeaders.push([lower, value.trim()]);
-    });
-    msHeaders.sort(([a], [b]) => (a < b ? -1 : 1));
-    const params = [...url.searchParams.entries()]
-      .map(([k, v]) => [k.toLowerCase(), v] as const)
-      .sort(([a], [b]) => (a < b ? -1 : 1));
-    const resource =
-      `/${this.#config.account}${url.pathname}` +
-      params.map(([k, v]) => `\n${k}:${v}`).join("");
-    const stringToSign = [
-      method,
-      h("content-encoding"),
-      h("content-language"),
-      contentLength > 0 ? String(contentLength) : "",
-      h("content-md5"),
-      h("content-type"),
-      "",
-      h("if-modified-since"),
-      h("if-match"),
-      h("if-none-match"),
-      h("if-unmodified-since"),
-      h("range"),
-      msHeaders.map(([k, v]) => `${k}:${v}`).join("\n"),
-      resource,
-    ].join("\n");
-    return toBase64(await hmacSha256(fromBase64(accountKey), stringToSign));
   }
 
   async put(
@@ -174,6 +148,7 @@ class AzureTransport implements Transport {
     mode: PutMode,
     metadata: Metadata,
     contentType: string,
+    signal?: AbortSignal,
   ): Promise<ObjectVersion> {
     const headers = new Headers({
       "content-type": contentType,
@@ -199,8 +174,10 @@ class AzureTransport implements Transport {
       this.#blobUrl(key),
       headers,
       body,
+      signal,
     );
-    if (res.ok) return eTagOf(res.headers.get("etag"));
+    // A versioning account names the version this put created (x-ms-version-id), as S3 does.
+    if (res.ok) return this.#version(res.headers);
     const text = await errorBody(res);
     if (mode.kind === "create" && (res.status === 409 || res.status === 412)) {
       throw new ObjectStoreError("already_exists", BACKEND, `${key} exists`, {
@@ -234,7 +211,7 @@ class AzureTransport implements Transport {
       key,
       size: Number(res.headers.get("content-length") ?? 0),
       lastModified: new Date(res.headers.get("last-modified") ?? 0),
-      version: eTagOf(res.headers.get("etag")),
+      version: this.#version(res.headers),
       metadata: metadataFromHeaders(res.headers, "x-ms-meta-", "_"),
     };
   }
@@ -251,7 +228,7 @@ class AzureTransport implements Transport {
         key,
         size: objectSizeFromHeaders(res.headers),
         lastModified: new Date(res.headers.get("last-modified") ?? 0),
-        version: eTagOf(res.headers.get("etag")),
+        version: this.#version(res.headers),
         metadata: metadataFromHeaders(res.headers, "x-ms-meta-", "_"),
       },
       body: res.body,
@@ -331,6 +308,57 @@ class AzureTransport implements Transport {
 
 function eTagOf(eTag: string | null): ObjectVersion {
   return eTag ? { eTag } : {};
+}
+
+/** ETag plus, on a versioning account, the exact version id (x-ms-version-id). */
+function versionOf(headers: Headers): ObjectVersion {
+  const version = headers.get("x-ms-version-id");
+  return { ...eTagOf(headers.get("etag")), ...(version ? { version } : {}) };
+}
+
+/**
+ * The Shared Key `Authorization` header value for one request (Blob service, the
+ * 2009-09-19+ string-to-sign). Exported so the strict Azure eraser signs with the
+ * same bytes as the store; `headers` must already carry x-ms-date and x-ms-version.
+ */
+export async function azureSharedKeyAuthorization(
+  account: string,
+  accountKey: string,
+  method: string,
+  url: URL,
+  headers: Headers,
+  contentLength: number,
+): Promise<string> {
+  const h = (name: string) => headers.get(name) ?? "";
+  const msHeaders: [string, string][] = [];
+  headers.forEach((value, name) => {
+    const lower = name.toLowerCase();
+    if (lower.startsWith("x-ms-")) msHeaders.push([lower, value.trim()]);
+  });
+  msHeaders.sort(([a], [b]) => (a < b ? -1 : 1));
+  const params = [...url.searchParams.entries()]
+    .map(([k, v]) => [k.toLowerCase(), v] as const)
+    .sort(([a], [b]) => (a < b ? -1 : 1));
+  const resource =
+    `/${account}${url.pathname}` +
+    params.map(([k, v]) => `\n${k}:${v}`).join("");
+  const stringToSign = [
+    method,
+    h("content-encoding"),
+    h("content-language"),
+    contentLength > 0 ? String(contentLength) : "",
+    h("content-md5"),
+    h("content-type"),
+    "",
+    h("if-modified-since"),
+    h("if-match"),
+    h("if-none-match"),
+    h("if-unmodified-since"),
+    h("range"),
+    msHeaders.map(([k, v]) => `${k}:${v}`).join("\n"),
+    resource,
+  ].join("\n");
+  return `SharedKey ${account}:${toBase64(await hmacSha256(fromBase64(accountKey), stringToSign))}`;
 }
 
 export function createAzureBlobStore(config: AzureBlobConfig): BaseStore {

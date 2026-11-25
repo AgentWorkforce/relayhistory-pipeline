@@ -276,6 +276,25 @@ bun run src/session-erase/user-erase-main.ts --request /abs/path/request.json
 
 Rerunning the same `request_id` is always safe: a finished erase answers from its ledger row.
 
+## Azure Blob
+
+On `LOCKER_PROVIDER=azure` the bytes phase runs against Azure Blob. The settings, preflight, refusal codes and
+soft-delete behaviour are in [operator-session-erase-selfhost-eraser.md, Azure Blob](operator-session-erase-selfhost-eraser.md#azure-blob-locker_providerazure).
+Specific to this Job:
+
+- The writer-store match, `INGEST_KEY_ROOT`, the key file and the data-plane preflight are all checked **before any
+  SQL**, so `begin` never revokes or fences against a store the erase cannot finish on.
+- `SESSION_ERASE_DRY_RUN=1` refuses `dry_run_unsupported`: this Job has no dry run.
+- The prefixes are the S3 ones exactly (`userErasePrefixes`), the workspace's synthesis directory included; only the
+  eraser differs.
+- **A refusal after `begin`.** Some Azure refusals can only appear mid-run: soft-delete retention, a forbidden listing,
+  or the container gone. By then the user is already revoked and fenced, and some bytes may be gone. Fix the account
+  (soft delete or permanent delete, the key's permissions, the container), then **rerun the same request**: it
+  resumes. Do not start a new request, and do not undo the revoke.
+- The relayfacts step (`SUMMARY_DECISION_RECORDS_ENABLED=true`) runs as on S3, before `begin`. The session-analysis
+  runner still refuses decision records on Azure (`azure_decision_records_unsupported`). Lifting that refusal is a
+  separate decision, and it needs a real-Azure run of this Job ([azure-real-account-proof.md](azure-real-account-proof.md)).
+
 ## Before the first production run
 
 1. Prebuild CONCURRENTLY every 058000 index whose table is populated; an empty table's index may be left to 058000

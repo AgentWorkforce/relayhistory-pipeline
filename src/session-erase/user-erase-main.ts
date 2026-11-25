@@ -17,6 +17,12 @@
  *   SESSION_ERASE_S3_BUCKET / _REGION / _ENDPOINT / _KEY_ROOT and SESSION_ERASE_S3_ACCESS_KEY_ID[_FILE] /
  *   SESSION_ERASE_S3_SECRET_ACCESS_KEY[_FILE]  the transcript bucket and its ERASER key (the only principal the
  *                                              production bucket policy lets delete), as the per-session byte eraser
+ *   LOCKER_PROVIDER=azure                      the user's bytes in Azure Blob instead (session-erase/azure-target.ts):
+ *                                              SESSION_ERASE_AZURE_ACCOUNT / _CONTAINER / _ENDPOINT / _ACCOUNT_KEY_FILE,
+ *                                              which must be the writer store exactly; the data-plane preflight runs
+ *                                              before any SQL (azure_blob_<reason> refusals, exit 2). Azure errors a
+ *                                              rerun cannot fix (soft-delete retention, a forbidden permanent delete or
+ *                                              list, a missing container, a redirect) are refusals
  *
  * Exit codes: 0 verified (or disabled); 3 not verified yet (rerun the same request: every phase resumes);
  * 2 refused or misconfigured (do not retry unchanged); 4 failed with any other error (rerun). With the relayfacts flag
@@ -29,6 +35,8 @@ import { readFileSync, statSync } from "node:fs";
 import { isAbsolute } from "node:path";
 import pg from "pg";
 import { createS3Eraser, type PagedEraser, type S3EraserConfig } from "../migration/neon-s3-erasure/eraser.ts";
+import type { AzureBlobEraserConfig } from "../migration/azure-blob-erasure/eraser.ts";
+import { azureEraseFailureCode, azureErasePreflight, azureEraseRefusal, azureEraseTarget, createAzureEraseEraser, type AzureErasePreflightPorts } from "./azure-target.ts";
 import { ownerClientConfig, OwnerUrlError } from "../shared/owner-pg-config.ts";
 import { sessionEraseConfig, sessionEraseCredentials } from "./selfhost-eraser-main.ts";
 import { SessionEraseRefused } from "./selfhost-eraser.ts";
@@ -93,6 +101,9 @@ export interface UserEraseOverrides {
   /** Test-only ports; the process entry never takes them from input. */
   db?: UserEraseDb;
   eraser?: (config: S3EraserConfig) => PagedEraser;
+  /** LOCKER_PROVIDER=azure test ports: the eraser and the preflight. */
+  azureEraser?: (config: AzureBlobEraserConfig) => PagedEraser;
+  preflight?: AzureErasePreflightPorts;
   sleep?: (ms: number) => Promise<void>;
   log?: (event: Record<string, unknown>) => void;
 }
@@ -107,8 +118,19 @@ export async function runUserEraseMain(
   const s3cfg = sessionEraseConfig(env);
   const settle = settleMs(env);
   const req = parseUserEraseRequest(await request());
-  const credentials = sessionEraseCredentials(env);
-  const eraser = (overrides.eraser ?? createS3Eraser)({ bucket: s3cfg.bucket, region: s3cfg.region, ...(s3cfg.endpoint ? { endpoint: s3cfg.endpoint } : {}), credentials });
+  let eraser: PagedEraser;
+  if (s3cfg.azure) {
+    // The per-user erase has no dry run: a shared erase Job environment that asks for one must never revoke and
+    // delete instead. Refused before the target, the probe or any SQL.
+    if (s3cfg.dryRun) refuse("dry_run_unsupported");
+    // The writer store exactly, then the data-plane preflight, all before any SQL (begin revokes and fences).
+    const target = azureEraseTarget(env, refuse);
+    await azureErasePreflight(target, s3cfg.keyRoot, refuse, overrides.preflight);
+    eraser = createAzureEraseEraser(target, overrides.azureEraser);
+  } else {
+    const credentials = sessionEraseCredentials(env);
+    eraser = (overrides.eraser ?? createS3Eraser)({ bucket: s3cfg.bucket, region: s3cfg.region, ...(s3cfg.endpoint ? { endpoint: s3cfg.endpoint } : {}), credentials });
+  }
   let client: pg.Client | undefined;
   let db = overrides.db;
   if (!db) {
@@ -122,12 +144,20 @@ export async function runUserEraseMain(
     // Flag on but 20261105062100 not applied: refuse before any other statement, instead of failing 42883 on
     // every rerun (exit 4) without ever reaching begin.
     if (relayfacts && !(await relayfactsUserEraseApplied(db))) refuse("relayfacts_migration_missing");
-    const result = await runUserErase(db, req, {
-      keyRoot: s3cfg.keyRoot, eraser, settleMs: settle,
-      ...(relayfacts ? { relayfacts: sqlUserEraseRelayfacts(db) } : {}),
-      ...(overrides.sleep ? { sleep: overrides.sleep } : {}),
-      log: overrides.log ?? ((e) => console.error(JSON.stringify(e))),
-    });
+    let result: UserEraseResult;
+    try {
+      result = await runUserErase(db, req, {
+        keyRoot: s3cfg.keyRoot, eraser, settleMs: settle,
+        ...(relayfacts ? { relayfacts: sqlUserEraseRelayfacts(db) } : {}),
+        ...(overrides.sleep ? { sleep: overrides.sleep } : {}),
+        log: overrides.log ?? ((e) => console.error(JSON.stringify(e))),
+      });
+    } catch (error) {
+      // Azure only (S3 errors carry no such codes): an error a rerun cannot fix is a refusal.
+      const code = s3cfg.azure ? azureEraseRefusal(error) : undefined;
+      if (code) refuse(code);
+      throw error;
+    }
     return { enabled: true, ...result };
   } finally {
     await client?.end().catch(() => {});
@@ -154,7 +184,7 @@ export function errorEvent(e: unknown): { event: "user_erase"; error: string; sq
   if (e instanceof RelayfactsEraseFailed) return { event: "user_erase", error: e.message, ...(e.sqlstate ? { sqlstate: e.sqlstate } : {}) };
   const code = e instanceof UserEraseRefused || e instanceof SessionEraseRefused ? e.message
     : e instanceof OwnerUrlError ? e.code
-    : typeof (e as { code?: unknown })?.code === "string" ? (e as { code: string }).code : "user_erase_failed";
+    : azureEraseFailureCode(e) ?? (typeof (e as { code?: unknown })?.code === "string" ? (e as { code: string }).code : "user_erase_failed");
   return { event: "user_erase", error: code };
 }
 

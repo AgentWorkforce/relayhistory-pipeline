@@ -206,6 +206,70 @@ own directories.
 protocol owns them (`docs/buffered-upload-gc.md`), and a direct delete would
 break its barrier.
 
+## Azure Blob (`LOCKER_PROVIDER=azure`)
+
+The same three operator erase entries run on Azure Blob: this per-session Job (`SERVICE=session-erase-bytes`), the
+per-user Job (`SERVICE=user-erase`, [operator-user-erase.md](operator-user-erase.md)) and the in-service erase worker
+(`buildSelfhostEraseRuntime`). They erase through the strict Azure eraser (`src/migration/azure-blob-erasure/eraser.ts`),
+and share one target, one preflight and one error classification (`src/session-erase/azure-target.ts`). With
+`LOCKER_PROVIDER` unset or `s3`, nothing here applies and the S3 path is unchanged.
+
+| Variable | Meaning |
+| --- | --- |
+| `SESSION_ERASE_AZURE_ACCOUNT`, `SESSION_ERASE_AZURE_CONTAINER`, optional `SESSION_ERASE_AZURE_ENDPOINT` | The erase target, through the same parser and rules as the session-analysis runner's `SESSION_ANALYSIS_AZURE_*` |
+| `SESSION_ERASE_AZURE_ACCOUNT_KEY_FILE` | The Shared Key, from a mounted Secret file only. A plaintext `SESSION_ERASE_AZURE_ACCOUNT_KEY` refuses |
+| `LOCKER_AZURE_ACCOUNT`, `LOCKER_BUCKET`, `LOCKER_ENDPOINT` | The writer's own settings. The target must equal them exactly: same account and container, and the same endpoint (both unset, or the same URL under the writer's rule: https, or http to loopback; no credentials, query or fragment). The Locker's key is never read |
+| `INGEST_KEY_ROOT` | **Required in both Jobs**: the writer's pinned key root, set explicitly from the same chart value as the ingest service (`96bulls` by default). Every prefix is derived from it, so a different root would leave the real bytes untouched while empty prefixes verified. `SESSION_ERASE_KEY_ROOT`, when set, must equal it. The in-service worker uses its own ingest root |
+
+Every `SESSION_ERASE_S3_*` setting must be unset on Azure.
+
+**Preflight.** Before an execute run erases anything, the Job proves the account on the data plane. This is the
+session-analysis runner's proof (`blob-versioning.ts`): blob versioning is on; the container and key are right; and
+soft delete is either off or allows permanent delete. It writes and erases one probe blob under
+`<root>/.runner-probe/session-erase/<uuid>/`, which is never a session key. Leftovers are cleaned only once they are
+older than 15 minutes, so concurrent runs never touch each other's probe. The in-service worker runs the preflight
+before its first byte work, never during ingest startup: a failing preflight leaves the erase retryable and erases
+nothing, and ingest keeps serving. Each failing claim logs one line
+(`operator_session_erase_preflight`, outcome `refused`, reason `<code>`), so expect one line **per claim** while the
+account is broken. Two claims that start together before the first pass can both run the probe; that is harmless,
+since each has its own directory and cleanup is age-gated. After a pass the result is cached for the process, and the
+probe runs again after any Azure refusal.
+
+**Dry run** (`SESSION_ERASE_DRY_RUN=1`, per-session Job only) lists and counts only. It runs no probe, so it reports
+`"preflight":"skipped","executeRequiresPreflight":true`. A dry run never certifies that execute will pass. The
+per-user Job has no dry run and refuses `dry_run_unsupported` on Azure.
+
+**Refusals (exit 2).** Codes are bare; this Job prints them with its usual `session_erase_` prefix, and the per-user
+Job prints them as they are.
+- `azure_target_not_writer_store`, `azure_s3_settings_conflict`, `azure_writer_key_root_missing`,
+  `azure_writer_key_root_invalid`, `azure_key_root_not_writer`, and the parser's `azure_account_*`, `azure_container_invalid`
+  and `azure_endpoint_invalid`: checked before any request.
+- `azure_blob_not_versioned`, `azure_blob_soft_delete_retained`, `azure_blob_permanent_delete_forbidden`,
+  `azure_blob_auth_refused`, `azure_blob_container_missing`, `azure_blob_versioning_redirect`,
+  `azure_blob_versioning_unverified`: from the preflight.
+- Mid-run, by operation: a listing 404 (`azure_blob_container_missing`) or 403 (`azure_forbidden`), soft-delete
+  retention, a forbidden permanent delete, or a redirect (`azure_redirect_refused`). A delete answered 404 means
+  already gone and is not an error. A delete answered 403 stays a failure (exit 4, printed
+  `erase_azure_delete_forbidden`): check whether the key was revoked or rotated.
+- `store_not_azure` / `bucket_mismatch`: a `session_index` row must name `storage_provider = azure` and this container.
+  A row that omits either is refused, because it could hold bytes elsewhere.
+- A transient failure (5xx, network) exits 4: rerun.
+
+**Soft-delete accounts.** With blob soft delete on and permanent delete allowed, the first execute run deletes every
+version, and Azure keeps them as soft-deleted copies. The run therefore ends **not verified (exit 3)**. That is
+expected, not a failure: the rerun deletes those copies permanently and verifies. Without permanent delete, the
+preflight refuses (`azure_blob_soft_delete_retained`), because erasure could never complete.
+
+**Receipts and endpoints.** The in-service worker's store identity (`storeRef`) hashes the account, container,
+endpoint and key root. Two endpoints of the same account and container (Azurite's path style and the default host)
+are therefore two identities, on purpose: a receipt never moves to another endpoint. Change the endpoint only with no
+erase outstanding.
+
+**Proof.** The fake-server tests cover every path: `selfhost-eraser-azure`, `user-erase-azure` and
+`selfhost-runtime-azure`. Azurite (pg-proof) covers the versioned erase end to end and the unversioned refusal.
+Azurite has no soft delete, and **a run against a real Azure storage account is still owed**; the plan is
+[azure-real-account-proof.md](azure-real-account-proof.md).
+
 ## Limits
 
 - **Versioned S3-compatible stores only** (AWS S3, MinIO, R2). It uses the
