@@ -11,7 +11,7 @@ import { readFileSync, readdirSync } from "node:fs";
 import { join } from "node:path";
 import { zstdDecompressSync } from "node:zlib";
 import { SESSION_BOOTSTRAP_FILES } from "../../hoopdb/session-bootstrap-chain.ts";
-import { createS3Store, type ObjectStore } from "../../../packages/object-store/src/index.ts";
+import { createS3Store, objectKey, type ObjectStore } from "../../../packages/object-store/src/index.ts";
 import { SCRUB_RULESET_VERSION } from "../../../packages/pipeline/src/lib/pipeline/raw-chunks.ts";
 import { parseSessionKey, rawChunkKey } from "../../shared/vendor.ts";
 import { derivedSchemaAssets } from "../../session-pipeline/derived-schema.ts";
@@ -257,6 +257,31 @@ test("generation PUT before scoped finalization cannot promote a committed or in
   const { scopedPublicationCycle } = await import("../publication-scoped-rpc.ts");
   const { relayhistoryNewestAcrossOrigins } = await import("../../../packages/pipeline/src/lib/pipeline/relayhistory-transform.ts");
   const target = { bucket: BUCKET, region: REGION, keyRoot: "96bulls", generation: GEN, provider: "s3" as const };
+  // Exercise the STS-verified provider through the real S3 signer on this scoped
+  // SQL-to-search path. Every endpoint and role response here is disposable.
+  const { publicationPodCredentials } = await import("../publication-pod-credentials.ts");
+  const access = "ASIA1234567890123456";
+  const accountId = "111122223333", roleName = "fixture-publisher";
+  const uri = "http://169.254.170.23/v1/credentials";
+  const credentials = publicationPodCredentials({
+    AWS_CONTAINER_CREDENTIALS_FULL_URI: uri,
+    AWS_CONTAINER_AUTHORIZATION_TOKEN_FILE: "/var/run/secrets/pods.eks.amazonaws.com/serviceaccount/eks-pod-identity-token",
+  }, {accountId, roleName}, {
+    readToken: async () => "synthetic.projected.token",
+    request: async (url) => {
+      if (url === uri) return JSON.stringify({AccessKeyId: access, SecretAccessKey: "synthetic-fixture-secret",
+        Token: "synthetic-session", Expiration: new Date(Date.now()+3_600_000).toISOString()});
+      expect(url).toBe("https://sts.us-east-1.amazonaws.com/");
+      return "<GetCallerIdentityResult><Account>"+accountId+"</Account><Arn>arn:aws:sts::"+accountId+
+        ":assumed-role/"+roleName+"/fixture</Arn></GetCallerIdentityResult>";
+    },
+  });
+  const s3 = new MinioShapedS3(ORIGIN, BUCKET, REGION, access);
+  const store = createS3Store({bucket:BUCKET, region:REGION, endpoint:ORIGIN, credentials,
+    fetch:(async (url, init) => {
+      expect(new Headers(init?.headers).get("x-amz-security-token")).toBe("synthetic-session");
+      return s3.fetch(url,init);
+    }) as typeof fetch});
   const cohort={...TENANT,workspaceId:"ws-pickup"};
   await owner("INSERT INTO sessions.ingest_publication_frontiers VALUES($1,$2,$3,'origin-1',$4,$4,clock_timestamp()+interval'1 hour',$5,$6,'96bulls',$7)", [cohort.orgId,cohort.workspaceId,cohort.userId,"b".repeat(64),BUCKET,REGION,GEN]);
   const ledger = orderedFixtureLedger(sqlLedger(asIngest, { acceptanceMode: "buffered", expectedGeneration: GEN }), { query: owner });
@@ -305,9 +330,11 @@ test("generation PUT before scoped finalization cannot promote a committed or in
       }
       return asPublisher(sql, args);
     }};
+    const cycleStarted = performance.now();
     const cycle = scopedPublicationCycle(transport as never, binding, {target, store: () => store}, {enabled: true});
     if (commit) expect(await cycle).toMatchObject({published:1});
     else await expect(cycle).rejects.toThrow("P0001");
+    const finalized = performance.now();
     expect(notifications).toBe(1);
     expect((await owner(`SELECT a.state FROM sessions.ingest_publication_attempts a
       JOIN publication_private.admission f ON f.stage=a.stage_token WHERE f.id=$1`, [binding.admissionId])).rows)
@@ -316,7 +343,14 @@ test("generation PUT before scoped finalization cannot promote a committed or in
     const expected = commit ? 1 : 0;
     await deliverPut(); // duplicate may arrive after the outcome
     expect(await counts()).toEqual({pointers: expected, revisions: expected, jobs: expected});
-    if (commit) await (await import("./publication-pickup.ts")).checkPublicationPickup(db,store,key,GEN,read("supabase/bootstrap/session_read_api_role.sql"));
+    if (commit) {
+      expect((await store.head(objectKey(key)))?.version.version).toMatch(/^v[0-9]+$/);
+      await (await import("./publication-pickup.ts")).checkPublicationPickup(db,store,key,GEN,read("supabase/bootstrap/session_read_api_role.sql"));
+      if (process.env.PUBLICATION_REQUIRE_AUTOMATIC_SEARCH === "1") console.info(JSON.stringify({
+        fixture:"disposable-scoped-pickup", cycleMs:Math.round(finalized-cycleStarted),
+        cycleThroughVerifiedPeerReadsMs:Math.round(performance.now()-cycleStarted),
+      }));
+    }
   }
 
   // Separate projection boundary: a queue hint cannot supply an acceptance seat
