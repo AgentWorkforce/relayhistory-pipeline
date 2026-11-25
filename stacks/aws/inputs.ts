@@ -135,7 +135,7 @@ export function validateAwsInputs(stage: string, inputs: AwsInputs, approvedImag
     throw new Error("96bulls: a Pippen sandbox stage declares no ECR repository policy (its boundary denies ecr:SetRepositoryPolicy); remove ecr.pullAccounts. Nothing was created.");
   if (inputs.pippenSandbox && inputs.accountShared) throw new Error("96bulls: a Pippen sandbox account is fresh; it cannot share another stage's account resources. Nothing was created.");
   assertPippenProofSandbox(stage, inputs);
-  assertStateBucketMode(stage, inputs.pippenSandbox);
+  assertStateBucketMode(stage, inputs);
   ecrPullPolicy(inputs);
   if (inputs.transcriptStore && inputs.ecr?.pullAccounts?.length) throw new Error("96bulls: ecr.pullAccounts needs a stage with the services repository; the transcript store has none. Nothing was created.");
   lockerLifecycleRules(inputs.lockerNoncurrentVersionDays);

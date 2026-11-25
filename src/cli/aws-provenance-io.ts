@@ -6,7 +6,7 @@ import { spawnSync } from "node:child_process";
 import { existsSync, readFileSync, writeFileSync, mkdirSync } from "node:fs";
 import { join } from "node:path";
 import { ensurePippenStateBucket } from "../../stacks/aws/state-bucket.ts";
-import { assertValidateOnlyState, stateBucketMode } from "../../stacks/aws/pippen-rehearsal.ts";
+import { prepareStateBackend, stateBackendFor } from "../../stacks/aws/pippen-rehearsal.ts";
 import { currentObjects, sanitizeInputs, sanitizePlan, sha256, type Provenance } from "./plan-provenance.ts";
 import { capturePaths, observeSource, observeState, verifyDeployCapture, type CaptureIO } from "../../stacks/aws/capture-verify.ts";
 import type { StateSnapshot } from "../../stacks/aws/state-snapshot.ts";
@@ -59,6 +59,9 @@ export function capturePlan(root: string, stage: string, env: Env) {
   const inputsPath = join(root, ".96bulls", stage, "aws-inputs.json");
   const rawInputs = readFileSync(inputsPath, "utf8");
   const inputs = JSON.parse(rawInputs) as { accountId: string; region: string; pippenSandbox?: unknown; eks?: { apiAccess?: { publicAccessCidrs?: string[] } } };
+  // The state backend is decided from validated inputs before anything else (a declared validate-only
+  // stage with missing or malformed inputs throws here, before any AWS call).
+  stateBackendFor(stage, inputs);
   const pippen = Boolean(inputs.pippenSandbox);
   const src = observeSourceAt(root, env);
   if (!src.clean) throw new Error("commit the stack source first: a plan must describe committed code");
@@ -68,8 +71,7 @@ export function capturePlan(root: string, stage: string, env: Env) {
   // made here on the first plan of a fresh account (tagged, versioned, encrypted, no public
   // access) so the capture snapshots an existing, empty, versioned store. No state object is written.
   // validate-only (pippen-rehearsal.ts): the shared bucket is only read and checked, never made or changed.
-  if (pippen && stateBucketMode(inputs.pippenSandbox) === "validate-only") assertValidateOnlyState((args) => run("aws", args, root, env), { accountId: inputs.accountId, region: inputs.region, stage, env });
-  else if (pippen) ensurePippenStateBucket((args) => run("aws", args, root, env), { accountId: inputs.accountId, region: inputs.region, stage });
+  if (pippen) prepareStateBackend((args) => run("aws", args, root, env), { stage, inputs, env }, ensurePippenStateBucket);
   const state = observeStateAt(root, inputs.accountId, inputs.region, stage, pippen, env);
   // Transient writes are detectable only in a versioned bucket.
   if (state.versioning !== "Enabled") throw new Error(`state bucket ${state.bucket} is not versioned; a plan's writes could not be detected`);

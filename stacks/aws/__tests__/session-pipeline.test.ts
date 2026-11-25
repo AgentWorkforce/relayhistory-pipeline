@@ -1302,6 +1302,17 @@ describe("search-queue split: the live readback", () => {
     expect(codeOf(fake({ mappings: { [p.function]: [{ EventSourceMappings: [esm(U1)], NextMarker: "m1" }, { fail: "page 2 failed" }] } }).run)).toBe("live_cli_failed");
     expect(codeOf(fake({ mappings: { [p.function]: [{ EventSourceMappings: [esm(U1)], NextMarker: "m0" }] } }).run)).toBe("live_incomplete");
     expect(codeOf(fake({ aliases: [{ Aliases: [{ Name: `bad alias ${CANARY}` }] }] }).run)).toBe("live_incomplete");
+    // A NextMarker presented as a continuation must be a non-empty string; any other pagination field refuses.
+    for (const page of [
+      { EventSourceMappings: [esm(U1)], NextMarker: null },
+      { EventSourceMappings: [esm(U1)], NextMarker: "" },
+      { EventSourceMappings: [esm(U1)], NextMarker: 7 },
+      { EventSourceMappings: [esm(U1)], NextToken: "t1" },
+      { EventSourceMappings: [esm(U1)], Marker: "m" },
+    ])
+      expect([page, codeOf(fake({ mappings: { [p.function]: [page] } }).run)]).toEqual([page, "live_incomplete"]);
+    expect(codeOf(fake({ aliases: [{ Aliases: [], NextToken: "x" }] }).run)).toBe("live_incomplete");
+    expect(codeOf(fake({ versions: [{ Versions: [{ Version: "$LATEST" }], NextMarker: null }] }).run)).toBe("live_incomplete");
     // The same UUID reported differently on two targets is refused.
     expect(codeOf(fake({ aliases: [{ Aliases: [{ Name: "live" }] }], mappings: { [p.function]: [{ EventSourceMappings: [esm(U1)] }], [`${FN_ARN}:live`]: [{ EventSourceMappings: [esm(U1, { State: "Disabled" })] }] } }).run)).toBe("live_incomplete");
   });

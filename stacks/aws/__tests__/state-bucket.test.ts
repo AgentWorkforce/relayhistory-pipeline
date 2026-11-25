@@ -220,7 +220,7 @@ describe("capture and deploy check in a Pippen sandbox", () => {
 
   it("`plan --capture` makes the store before it snapshots, and only in a Pippen sandbox", () => {
     const cap = readFileSync(fileURLToPath(new URL("../../../src/cli/aws-provenance-io.ts", import.meta.url)), "utf8");
-    const ensure = cap.indexOf("if (pippen) ensurePippenStateBucket(");
+    const ensure = cap.indexOf("if (pippen) prepareStateBackend((args) => run(\"aws\", args, root, env), { stage, inputs, env }, ensurePippenStateBucket);");
     expect(ensure).toBeGreaterThan(0);
     expect(ensure).toBeLessThan(cap.indexOf("const state = observeStateAt(root, inputs.accountId, inputs.region, stage, pippen, env);"));
     expect(cap).toContain("const after = observeStateAt(root, inputs.accountId, inputs.region, stage, pippen, env);");

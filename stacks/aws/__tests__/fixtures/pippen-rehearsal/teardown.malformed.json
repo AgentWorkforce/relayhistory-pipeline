@@ -1,0 +1,69 @@
+{
+  "blank": [
+    ""
+  ],
+  "not-json": [
+    "{\"Versions\": ["
+  ],
+  "is-truncated-missing": [
+    {
+      "Versions": []
+    }
+  ],
+  "is-truncated-string": [
+    {
+      "IsTruncated": "false",
+      "Versions": []
+    }
+  ],
+  "truncated-without-markers": [
+    {
+      "IsTruncated": true,
+      "Versions": [
+        {
+          "Key": "96bulls/96bulls-aws/aws-rehearse-p1-1126/a.json",
+          "VersionId": "v1"
+        }
+      ]
+    }
+  ],
+  "truncated-without-version-marker": [
+    {
+      "IsTruncated": true,
+      "NextKeyMarker": "96bulls/96bulls-aws/aws-rehearse-p1-1126/a.json",
+      "Versions": []
+    }
+  ],
+  "versions-not-array": [
+    {
+      "IsTruncated": false,
+      "Versions": {
+        "Key": "96bulls/96bulls-aws/aws-rehearse-p1-1126/a.json"
+      }
+    }
+  ],
+  "unknown-field": [
+    {
+      "IsTruncated": false,
+      "Versions": [],
+      "NextToken": "t"
+    }
+  ],
+  "other-prefix-echo": [
+    {
+      "IsTruncated": false,
+      "Prefix": "96bulls/96bulls-aws/",
+      "Versions": []
+    }
+  ],
+  "entry-without-version": [
+    {
+      "IsTruncated": false,
+      "Versions": [
+        {
+          "Key": "96bulls/96bulls-aws/aws-rehearse-p1-1126/a.json"
+        }
+      ]
+    }
+  ]
+}

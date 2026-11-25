@@ -82,17 +82,25 @@ const call = (run: AwsRun, args: string[]): unknown => {
   }
 };
 
-/** Every page of a NextMarker listing (`--no-paginate`, then `--marker`), to the end, or a refusal. */
+/**
+ * Every page of a NextMarker listing (`--no-paginate`, then `--marker`), to the end, or a refusal:
+ * the end is a page without NextMarker; a NextMarker that is null, empty, not a string or repeated,
+ * and any field besides the list and NextMarker, refuse.
+ */
 function listAll(run: AwsRun, args: string[], field: string): Record<string, unknown>[] {
   const out: Record<string, unknown>[] = [];
   let marker: string | undefined;
   for (let page = 0; page < MAX_PAGES; page++) {
     const body = call(run, [...args, "--no-paginate", ...(marker ? ["--marker", marker] : [])]) as Record<string, unknown> | undefined;
-    if (body === undefined || body === null || typeof body !== "object" || !Array.isArray(body[field])) throw new PipelineLiveError("live_incomplete");
+    if (body === undefined || body === null || typeof body !== "object" || Array.isArray(body) || !Array.isArray(body[field])) throw new PipelineLiveError("live_incomplete");
+    // Only the list and NextMarker: any other field (a NextToken, say) could be a continuation this
+    // reader does not follow, so it refuses rather than return a partial list.
+    if (Object.keys(body).some((k) => k !== field && k !== "NextMarker")) throw new PipelineLiveError("live_incomplete");
     out.push(...(body[field] as Record<string, unknown>[]));
+    if (!("NextMarker" in body)) return out;
+    // A NextMarker present is a continuation: it must be a non-empty string, and new.
     const next = body.NextMarker;
-    if (next === undefined || next === null || next === "") return out;
-    if (typeof next !== "string" || next === marker) throw new PipelineLiveError("live_incomplete");
+    if (typeof next !== "string" || next === "" || next === marker) throw new PipelineLiveError("live_incomplete");
     marker = next;
   }
   throw new PipelineLiveError("live_incomplete");

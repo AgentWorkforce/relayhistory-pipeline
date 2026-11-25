@@ -18,37 +18,67 @@ import { alchemyStatePrefix, pippenStateBucket, type AwsRun } from "./state-buck
 
 export const REHEARSAL_STAGE = "aws-rehearse-p1-1126";
 export const REHEARSAL_REGION = "us-west-2";
-/** When the rehearsal lease policy stops allowing anything (and starts denying everything). */
-export const REHEARSAL_LEASE_EXPIRES_AT = "2026-11-28T00:00:00Z";
+/** The end of the rehearsal's authority: end of day 2026-11-26 Pacific (PST, UTC-8). */
+export const REHEARSAL_AUTHORITY_END = "2026-11-27T08:00:00Z";
+/**
+ * The lease policy's absolute hard cutoff: every Allow ends and a Deny on everything starts. It is
+ * the authority's end. The effective lease ends at the EARLIEST of teardown completion, 6 h from
+ * issuance (REHEARSAL_LEASE_TTL_HOURS, the broker's issuance parameter) and this cutoff.
+ */
+export const REHEARSAL_LEASE_EXPIRES_AT = REHEARSAL_AUTHORITY_END;
+/** The broker's issuance TTL for the rehearsal lease (not expressible in the policy, which carries the absolute cutoff). */
+export const REHEARSAL_LEASE_TTL_HOURS = 6;
 /** Stages allowed in validate-only mode, each with its exact state prefix. */
 export const VALIDATE_ONLY_STAGES: Readonly<Record<string, string>> = Object.freeze({ [REHEARSAL_STAGE]: "96bulls/96bulls-aws/aws-rehearse-p1-1126/" });
 
-export type StateBucketMode = "ensure" | "validate-only";
+/**
+ * Which state backend a stage gets: Alchemy's default store (no pippenSandbox), the pippen ensure
+ * path (the proof stage and other fresh-account sandbox stages, as before), or validate-only.
+ */
+export type StateBackend = "default" | "ensure" | "validate-only";
 
-/** The mode a stage's pippenSandbox input selects: validate-only when set so, else the proof stage's ensure. */
-export function stateBucketMode(pippenSandbox: unknown): StateBucketMode {
-  return (pippenSandbox as { stateBucket?: unknown } | undefined)?.stateBucket === "validate-only" ? "validate-only" : "ensure";
+/**
+ * The backend for a stage, decided from VALIDATED inputs before anything is selected, so missing or
+ * malformed inputs can never fall through to ensure (or to Alchemy's default store). A declared
+ * validate-only stage (VALIDATE_ONLY_STAGES) must have well-formed inputs: a 12-digit account, the
+ * pinned region, pippenSandbox with a policy-ARN boundary in that account and stateBucket
+ * "validate-only"; anything else throws. For every other stage the old choice is kept, except that
+ * a stateBucket value there is refused.
+ */
+export function stateBackendFor(stage: string, inputs: unknown): StateBackend {
+  const v = (inputs ?? null) as { accountId?: unknown; region?: unknown; pippenSandbox?: unknown } | null;
+  if (stage in VALIDATE_ONLY_STAGES) {
+    if (v === null || typeof v !== "object") throw new StateBucketError("state_inputs_invalid");
+    const sbx = v.pippenSandbox as { permissionsBoundaryArn?: unknown; stateBucket?: unknown } | undefined | null;
+    if (typeof v.accountId !== "string" || !/^\d{12}$/.test(v.accountId) || v.region !== REHEARSAL_REGION) throw new StateBucketError("state_inputs_invalid");
+    if (sbx === null || typeof sbx !== "object" || sbx.stateBucket !== "validate-only") throw new StateBucketError("state_inputs_invalid");
+    if (typeof sbx.permissionsBoundaryArn !== "string" || !new RegExp(`^arn:aws:iam::${v.accountId}:policy/[\\w+=,.@/-]+$`).test(sbx.permissionsBoundaryArn)) throw new StateBucketError("state_inputs_invalid");
+    return "validate-only";
+  }
+  if (v === null || typeof v !== "object" || !v.pippenSandbox) return "default";
+  if ((v.pippenSandbox as { stateBucket?: unknown }).stateBucket !== undefined) throw new StateBucketError("state_inputs_invalid");
+  return "ensure";
 }
 
 /**
- * The inputs rule: `pippenSandbox.stateBucket` is absent or "validate-only". A stage declared for
- * validate-only (VALIDATE_ONLY_STAGES: it shares an existing sandbox's state bucket) must set it,
- * and only such a stage may; the proof stage and every other existing stage keep the ensure path
- * exactly as before (a fresh sandbox account has no bucket to share).
+ * The inputs rule (stacks/aws/inputs.ts validateAwsInputs): the same decision as stateBackendFor,
+ * with the stage's error text.
  */
-export function assertStateBucketMode(stage: string, pippenSandbox: unknown): void {
-  const declared = stage in VALIDATE_ONLY_STAGES;
-  if (declared && !pippenSandbox) throw new Error(`96bulls: stage ${stage} runs only in a Pippen sandbox (pippenSandbox with stateBucket "validate-only"). Nothing was created.`);
-  if (!pippenSandbox) return;
-  const v = (pippenSandbox as { stateBucket?: unknown }).stateBucket;
-  if (v !== undefined && v !== "validate-only") throw new Error('96bulls: pippenSandbox.stateBucket may only be "validate-only". Nothing was created.');
-  if (declared && v !== "validate-only")
-    throw new Error(`96bulls: stage ${stage} shares the sandbox's state bucket; it needs pippenSandbox.stateBucket "validate-only" (it may never create or converge it). Nothing was created.`);
-  if (stage === PIPPEN_PROOF_SANDBOX.stage && v !== undefined) throw new Error(`96bulls: ${PIPPEN_PROOF_SANDBOX.stage} keeps its own state bucket path. Nothing was created.`);
-  if (v === "validate-only" && !(stage in VALIDATE_ONLY_STAGES)) throw new Error(`96bulls: stage ${stage} has no declared state prefix for validate-only mode. Nothing was created.`);
+export function assertStateBucketMode(stage: string, inputs: { accountId?: unknown; region?: unknown; pippenSandbox?: unknown }): void {
+  try {
+    stateBackendFor(stage, inputs);
+  } catch {
+    if (stage in VALIDATE_ONLY_STAGES)
+      throw new Error(`96bulls: stage ${stage} runs only in a Pippen sandbox in ${REHEARSAL_REGION} with pippenSandbox { permissionsBoundaryArn, stateBucket: "validate-only" } (it may never create or converge the shared state bucket). Nothing was created.`);
+    throw new Error('96bulls: pippenSandbox.stateBucket is only for a declared validate-only stage. Nothing was created.');
+  }
 }
 
 export type StateBucketErrorCode =
+  | "state_inputs_invalid"
+  | "state_lease_expired"
+  | "state_teardown_not_empty"
+  | "state_resources_remain"
   | "state_bucket_absent"
   | "state_bucket_unreadable"
   | "state_bucket_versioning_drift"
@@ -89,28 +119,29 @@ const PIPPEN_SESSION_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{
 
 /**
  * The caller ARN this stage's run must have: the pippen lease's agent-session role session
- * (`agent-<session_id>`) in the stage's account, the session from NINETY_SIX_BULLS_PIPPEN_SESSION,
- * and, under `pippen sandbox exec`, the same lease and account in its env.
+ * (`agent-<session_id>`). The account and the lease are bound to the broker's attestation, not to
+ * the local inputs alone: `pippen sandbox exec` must have set PIPPEN_SANDBOX_ACCOUNT_ID and
+ * PIPPEN_SANDBOX_SESSION_ID, and both must equal the inputs' account and
+ * NINETY_SIX_BULLS_PIPPEN_SESSION. STS then proves the credentials are that session.
  */
 export function leaseCallerArn(accountId: string, env: Record<string, string | undefined>): string {
   const sbx = PIPPEN_PROOF_SANDBOX;
   const id = env[sbx.sessionEnv];
   if (!/^\d{12}$/.test(accountId) || id === undefined || !PIPPEN_SESSION_ID.test(id)) throw new StateBucketError("state_caller_mismatch");
-  if (env[sbx.execSessionEnv] !== undefined && env[sbx.execSessionEnv] !== id) throw new StateBucketError("state_caller_mismatch");
-  if (env[sbx.execAccountEnv] !== undefined && env[sbx.execAccountEnv] !== accountId) throw new StateBucketError("state_caller_mismatch");
+  if (env[sbx.execSessionEnv] !== id || env[sbx.execAccountEnv] !== accountId) throw new StateBucketError("state_caller_mismatch");
   return `arn:aws:sts::${accountId}:assumed-role/${sbx.callerRole.roleName}/${sbx.callerRole.sessionPrefix}${id}`;
 }
 
-/** STS's caller must be exactly the lease session for this stage. */
+/** STS's caller must be exactly the attested lease session for this stage. */
 export function assertLeaseCaller(aws: AwsRun, accountId: string, env: Record<string, string | undefined>): void {
   const expected = leaseCallerArn(accountId, env);
-  let arn: unknown;
+  let who: { Arn?: unknown; Account?: unknown };
   try {
-    arn = (JSON.parse(aws(["sts", "get-caller-identity", "--output", "json"]) || "{}") as { Arn?: unknown }).Arn;
+    who = JSON.parse(aws(["sts", "get-caller-identity", "--output", "json"]) || "{}") as typeof who;
   } catch {
     throw new StateBucketError("state_caller_mismatch");
   }
-  if (arn !== expected) throw new StateBucketError("state_caller_mismatch");
+  if (who.Arn !== expected || who.Account !== accountId) throw new StateBucketError("state_caller_mismatch");
 }
 
 /** The settings the shared bucket must already have (those ensurePippenStateBucket gives it). */
@@ -176,13 +207,32 @@ export function validatePippenStateBucket(aws: AwsRun, i: { accountId: string; r
 
 /**
  * validate-only, as the state layer and the capture run it before Alchemy's first state operation:
- * the caller is this stage's lease session, the prefix is exactly this stage's, and the shared
- * bucket is already in shape. Nothing is created or written.
+ * the caller is this stage's attested lease session, the prefix is exactly this stage's, and the
+ * shared bucket is already in shape. Nothing is created or written.
  */
 export function assertValidateOnlyState(aws: AwsRun, i: { accountId: string; region: string; stage: string; env: Record<string, string | undefined> }): { bucket: string; prefix: string } {
   const prefix = rehearsalStatePrefix(i.stage);
+  if (i.region !== REHEARSAL_REGION) throw new StateBucketError("state_inputs_invalid");
   assertLeaseCaller(aws, i.accountId, i.env);
   return { bucket: validatePippenStateBucket(aws, i), prefix };
+}
+
+/**
+ * The one entry both the capture (src/cli/aws-provenance-io.ts) and the stack's state layer
+ * (stacks/aws/alchemy.aws.run.ts) use: decide the backend from the validated inputs
+ * (stateBackendFor, which throws on missing or malformed inputs for a validate-only stage), then
+ * either check the bucket (validate-only, no writes) or run `ensure` (the old path). Returns the backend.
+ */
+export function prepareStateBackend(
+  aws: AwsRun,
+  i: { stage: string; inputs: unknown; env: Record<string, string | undefined> },
+  ensure: (aws: AwsRun, t: { accountId: string; region: string; stage: string }) => unknown,
+): StateBackend {
+  const backend = stateBackendFor(i.stage, i.inputs);
+  const v = i.inputs as { accountId: string; region: string };
+  if (backend === "validate-only") assertValidateOnlyState(aws, { accountId: v.accountId, region: v.region, stage: i.stage, env: i.env });
+  else if (backend === "ensure") ensure(aws, { accountId: v.accountId, region: v.region, stage: i.stage });
+  return backend;
 }
 
 interface VersionEntry {
@@ -190,38 +240,59 @@ interface VersionEntry {
   VersionId?: unknown;
 }
 
+/** The fields a ListObjectVersions response may carry (no delimiter is used, so no CommonPrefixes). */
+const LIST_VERSIONS_FIELDS = new Set(["Versions", "DeleteMarkers", "IsTruncated", "KeyMarker", "VersionIdMarker", "NextKeyMarker", "NextVersionIdMarker", "Name", "Prefix", "MaxKeys", "EncodingType", "RequestCharged"]);
+
+/** One ListObjectVersions page, strictly: blank or unparseable output, an unknown field, a non-boolean IsTruncated, a missing continuation marker or a non-array list refuse. */
+function listVersionsPage(aws: AwsRun, args: string[], prefix: string) {
+  let text: string;
+  try {
+    text = aws(args);
+  } catch {
+    throw new StateBucketError("state_teardown_failed");
+  }
+  if (!text || !text.trim()) throw new StateBucketError("state_teardown_failed");
+  let page: Record<string, unknown>;
+  try {
+    page = JSON.parse(text) as Record<string, unknown>;
+  } catch {
+    throw new StateBucketError("state_teardown_failed");
+  }
+  if (page === null || typeof page !== "object" || Array.isArray(page)) throw new StateBucketError("state_teardown_failed");
+  if (Object.keys(page).some((k) => !LIST_VERSIONS_FIELDS.has(k))) throw new StateBucketError("state_teardown_failed");
+  if (typeof page.IsTruncated !== "boolean") throw new StateBucketError("state_teardown_failed");
+  if (page.Prefix !== undefined && page.Prefix !== prefix) throw new StateBucketError("state_teardown_failed");
+  for (const k of ["Versions", "DeleteMarkers"]) if (page[k] !== undefined && !Array.isArray(page[k])) throw new StateBucketError("state_teardown_failed");
+  if (page.IsTruncated && !(typeof page.NextKeyMarker === "string" && page.NextKeyMarker && typeof page.NextVersionIdMarker === "string" && page.NextVersionIdMarker))
+    throw new StateBucketError("state_teardown_failed");
+  return page as { Versions?: VersionEntry[]; DeleteMarkers?: VersionEntry[]; IsTruncated: boolean; NextKeyMarker?: string; NextVersionIdMarker?: string };
+}
+
 /**
  * Every object version and delete marker under the stage's exact prefix (ListObjectVersions with
- * KeyMarker/VersionIdMarker pagination). Refuses, before anything is deleted, when any listed key is
- * outside the prefix or an entry has no key or version id.
+ * KeyMarker/VersionIdMarker pagination, each page validated strictly). Refuses, before anything is
+ * deleted, when any listed key is outside the prefix or an entry has no key or version id.
  */
 export function listStageStateVersions(aws: AwsRun, i: { bucket: string; region: string; stage: string }): { Key: string; VersionId: string }[] {
   const prefix = rehearsalStatePrefix(i.stage);
   const out: { Key: string; VersionId: string }[] = [];
-  let marker: { key?: string; version?: string } = {};
-  for (let page = 0; page < 10_000; page++) {
-    let listed: { Versions?: VersionEntry[]; DeleteMarkers?: VersionEntry[]; IsTruncated?: unknown; NextKeyMarker?: unknown; NextVersionIdMarker?: unknown };
-    try {
-      const text = aws([
+  let marker: { key: string; version: string } | undefined;
+  for (let n = 0; n < 10_000; n++) {
+    const page = listVersionsPage(
+      aws,
+      [
         "s3api", "list-object-versions", "--bucket", i.bucket, "--region", i.region, "--prefix", prefix, "--output", "json", "--no-paginate",
-        ...(marker.key !== undefined ? ["--key-marker", marker.key] : []),
-        ...(marker.version !== undefined ? ["--version-id-marker", marker.version] : []),
-      ]);
-      listed = text.trim() ? JSON.parse(text) : {};
-    } catch {
-      throw new StateBucketError("state_teardown_failed");
-    }
-    for (const v of [...(listed.Versions ?? []), ...(listed.DeleteMarkers ?? [])]) {
-      if (typeof v.Key !== "string" || typeof v.VersionId !== "string" || !v.VersionId) throw new StateBucketError("state_teardown_failed");
+        ...(marker ? ["--key-marker", marker.key, "--version-id-marker", marker.version] : []),
+      ],
+      prefix,
+    );
+    for (const v of [...(page.Versions ?? []), ...(page.DeleteMarkers ?? [])]) {
+      if (v === null || typeof v !== "object" || typeof v.Key !== "string" || typeof v.VersionId !== "string" || !v.VersionId) throw new StateBucketError("state_teardown_failed");
       if (!v.Key.startsWith(prefix) || v.Key.length === prefix.length) throw new StateBucketError("state_teardown_outside_prefix");
       out.push({ Key: v.Key, VersionId: v.VersionId });
     }
-    if (listed.IsTruncated !== true) return out;
-    marker = {
-      ...(typeof listed.NextKeyMarker === "string" ? { key: listed.NextKeyMarker } : {}),
-      ...(typeof listed.NextVersionIdMarker === "string" ? { version: listed.NextVersionIdMarker } : {}),
-    };
-    if (marker.key === undefined) throw new StateBucketError("state_teardown_failed");
+    if (!page.IsTruncated) return out;
+    marker = { key: page.NextKeyMarker!, version: page.NextVersionIdMarker! };
   }
   throw new StateBucketError("state_teardown_failed");
 }
@@ -229,129 +300,225 @@ export function listStageStateVersions(aws: AwsRun, i: { bucket: string; region:
 /**
  * Teardown of this stage's state only: list (above, refusing anything outside the prefix), then
  * DeleteObjects by exact key and version id, at most 1000 per call, rechecking every key against
- * the prefix before each call. `execute: false` (the default) lists and deletes nothing. Sibling
- * stages and the bucket itself are never touched.
+ * the prefix before each call, and then an independent re-list that must show zero versions and
+ * zero delete markers (`state_teardown_not_empty` otherwise) before success is reported.
+ * `execute: false` (the default) lists and deletes nothing. Sibling stages and the bucket itself
+ * are never touched. Run it only after assertRehearsalResourcesGone.
  */
-export function teardownStageState(aws: AwsRun, i: { bucket: string; region: string; stage: string; execute?: boolean }): { listed: number; deleted: number } {
+export function teardownStageState(aws: AwsRun, i: { bucket: string; region: string; stage: string; execute?: boolean }): { listed: number; deleted: number; remaining: number } {
   const prefix = rehearsalStatePrefix(i.stage);
   const all = listStageStateVersions(aws, i);
-  if (!i.execute) return { listed: all.length, deleted: 0 };
+  if (!i.execute) return { listed: all.length, deleted: 0, remaining: all.length };
   let deleted = 0;
   for (let n = 0; n < all.length; n += 1000) {
     const batch = all.slice(n, n + 1000);
     if (!batch.every((o) => o.Key.startsWith(prefix) && o.Key.length > prefix.length)) throw new StateBucketError("state_teardown_outside_prefix");
-    let result: { Errors?: unknown[] };
+    let result: { Errors?: unknown; Deleted?: unknown };
     try {
       const text = aws(["s3api", "delete-objects", "--bucket", i.bucket, "--region", i.region, "--output", "json", "--delete", JSON.stringify({ Objects: batch, Quiet: true })]);
       result = text.trim() ? JSON.parse(text) : {};
     } catch {
       throw new StateBucketError("state_teardown_failed");
     }
-    if ((result.Errors ?? []).length > 0) throw new StateBucketError("state_teardown_failed");
+    if (result === null || typeof result !== "object" || (result.Errors !== undefined && !(Array.isArray(result.Errors) && result.Errors.length === 0))) throw new StateBucketError("state_teardown_failed");
     deleted += batch.length;
   }
-  return { listed: all.length, deleted };
+  // Explicit empty-prefix evidence: an independent re-list of versions and delete markers.
+  const remaining = listStageStateVersions(aws, i).length;
+  if (remaining !== 0) throw new StateBucketError("state_teardown_not_empty");
+  return { listed: all.length, deleted, remaining };
 }
 
-/** The v2 (search-split) resources the rehearsal stage declares, by name (session-pipeline.ts naming). */
+/**
+ * The rehearsal's synthetic inventory (session-pipeline.ts naming for the v2 search split): the
+ * function, four queues, two mappings, five alarms (the three the pipeline always has plus the two
+ * search alarms) and the function's log group. The pipeline's reconcile and brief schedules and its
+ * secret are not part of it (and the lease grants nothing on them): the non-prod render must leave
+ * them out for this stage.
+ */
 export function rehearsalResourceNames(stage: string = REHEARSAL_STAGE) {
   const n = (base: string) => `96bulls-${stage}-${base}`;
   return {
     function: n("session-pipeline"),
     queues: [n("session-events"), n("session-events-dlq"), n("session-search"), n("session-search-dlq")],
-    rules: [n("session-reconcile"), n("session-brief")],
     alarms: [`${n("session-events-dlq")}-not-empty`, `${n("session-events")}-backlog-age`, `${n("session-pipeline")}-errors`, `${n("session-search-dlq")}-not-empty`, `${n("session-search")}-backlog-age`],
     logGroup: `/aws/lambda/${n("session-pipeline")}`,
-    secret: `96bulls/${stage}/session-pipeline`,
   };
 }
 
+const NOT_FOUND = /ResourceNotFoundException|NonExistentQueue|QueueDoesNotExist/;
+
 /**
- * The rehearsal lease's identity policy: state objects only under the stage's exact prefix, listing
- * only with that s3:prefix, the bucket's settings readable but never writable, no object access
- * anywhere else, the v2 resources named `96bulls-<stage>-*` (and the stage's secret path and log
- * group) only, in us-west-2 only, and nothing after `expiresAt`.
+ * Before the state is discarded: every recorded physical resource is gone. Each must read back as
+ * not found (the function, each queue, each recorded mapping UUID), the alarms must list empty, and
+ * no log group of the function's exact name may remain. Any resource that still exists refuses
+ * (`state_resources_remain`); any other failure refuses (`state_teardown_failed`). Read-only.
  */
-export function rehearsalLeasePolicy(i: { accountId: string; stage?: string; region?: string; expiresAt?: string }) {
+export function assertRehearsalResourcesGone(aws: AwsRun, i: { region: string; stage: string; mappingUuids: readonly string[] }): void {
+  rehearsalStatePrefix(i.stage);
+  const names = rehearsalResourceNames(i.stage);
+  const r = ["--region", i.region, "--output", "json"];
+  const gone = (args: string[]) => {
+    try {
+      aws([...args, ...r]);
+    } catch (e) {
+      if (NOT_FOUND.test(e instanceof Error ? e.message : String(e))) return;
+      throw new StateBucketError("state_teardown_failed");
+    }
+    throw new StateBucketError("state_resources_remain");
+  };
+  gone(["lambda", "get-function-configuration", "--function-name", names.function]);
+  for (const q of names.queues) gone(["sqs", "get-queue-url", "--queue-name", q]);
+  for (const u of i.mappingUuids) {
+    if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(u)) throw new StateBucketError("state_teardown_failed");
+    gone(["lambda", "get-event-source-mapping", "--uuid", u]);
+  }
+  const read = (args: string[]) => {
+    try {
+      const text = aws([...args, ...r]);
+      if (!text.trim()) throw new Error("blank");
+      return JSON.parse(text) as Record<string, unknown>;
+    } catch {
+      throw new StateBucketError("state_teardown_failed");
+    }
+  };
+  const alarms = read(["cloudwatch", "describe-alarms", "--alarm-names", ...names.alarms]);
+  if (!Array.isArray(alarms.MetricAlarms) || (alarms.CompositeAlarms !== undefined && !Array.isArray(alarms.CompositeAlarms))) throw new StateBucketError("state_teardown_failed");
+  if (alarms.MetricAlarms.length > 0 || ((alarms.CompositeAlarms as unknown[] | undefined)?.length ?? 0) > 0) throw new StateBucketError("state_resources_remain");
+  const groups = read(["logs", "describe-log-groups", "--log-group-name-prefix", names.logGroup]);
+  if (!Array.isArray(groups.logGroups)) throw new StateBucketError("state_teardown_failed");
+  if ((groups.logGroups as { logGroupName?: unknown }[]).some((g) => g?.logGroupName === names.logGroup)) throw new StateBucketError("state_resources_remain");
+}
+
+/** The tag every rehearsal resource carries, required on create and on every act (lease policy). */
+export const REHEARSAL_TAG = Object.freeze({ key: "rehearsal", value: "p1-1126" });
+
+const ISO = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$/;
+const iso = (ms: number) => new Date(ms).toISOString().replace(/\.\d{3}Z$/, "Z");
+
+/**
+ * The effective lease end: the EARLIEST of the hard cutoff (2026-11-27T08:00:00Z, exclusive),
+ * issuance + 6 h, teardown completion, and a requested end. A requested end later than the
+ * earliest of the others is refused, never silently shortened.
+ */
+export function rehearsalLeaseEnd(i: { issuedAt?: string; teardownCompletedAt?: string; requested?: string } = {}): string {
+  for (const t of [i.issuedAt, i.teardownCompletedAt, i.requested]) if (t !== undefined && !ISO.test(t)) throw new StateBucketError("state_lease_expired");
+  const caps = [Date.parse(REHEARSAL_AUTHORITY_END)];
+  if (i.issuedAt !== undefined) caps.push(Date.parse(i.issuedAt) + REHEARSAL_LEASE_TTL_HOURS * 3_600_000);
+  if (i.teardownCompletedAt !== undefined) caps.push(Date.parse(i.teardownCompletedAt));
+  const cap = Math.min(...caps);
+  if (i.issuedAt !== undefined && Date.parse(i.issuedAt) >= cap) throw new StateBucketError("state_lease_expired");
+  if (i.requested === undefined) return iso(cap);
+  if (Date.parse(i.requested) > cap) throw new StateBucketError("state_lease_expired");
+  return i.requested;
+}
+
+/**
+ * The rehearsal lease's session policies, sized for STS: one small inline session policy (the
+ * denies: the exclusive cutoff, other regions, any write to a shared state bucket, untagging the
+ * rehearsal tag) and three managed session policies the broker creates from `managed` and passes by
+ * ARN (AssumeRole `PolicyArns`): state access on the stage prefix only; creating the v2 resources
+ * only with the rehearsal tag and this stage's names; acting on them only when they carry the tag.
+ * The session's permissions are the role's policies intersected with these. Every Allow ends before
+ * the end (DateLessThan), and a Deny on everything applies at and after it (DateGreaterThanEquals).
+ */
+export function rehearsalLeasePolicies(i: { accountId: string; stage?: string; region?: string; issuedAt?: string; expiresAt?: string }) {
   const stage = i.stage ?? REHEARSAL_STAGE;
   const region = i.region ?? REHEARSAL_REGION;
-  if (region !== REHEARSAL_REGION) throw new StateBucketError("state_prefix_mismatch");
-  const expiresAt = i.expiresAt ?? REHEARSAL_LEASE_EXPIRES_AT;
+  if (region !== REHEARSAL_REGION || !/^\d{12}$/.test(i.accountId)) throw new StateBucketError("state_inputs_invalid");
+  const end = rehearsalLeaseEnd({ ...(i.issuedAt ? { issuedAt: i.issuedAt } : {}), ...(i.expiresAt ? { requested: i.expiresAt } : {}) });
   const prefix = rehearsalStatePrefix(stage);
   const bucket = pippenStateBucket(i.accountId, region);
   const bucketArn = `arn:aws:s3:::${bucket}`;
-  const acct = i.accountId;
+  const a = i.accountId;
   const name = `96bulls-${stage}-*`;
-  const live = { DateLessThan: { "aws:CurrentTime": expiresAt } };
-  const regional = { StringEquals: { "aws:RequestedRegion": region } };
-  return {
+  const fnArn = `arn:aws:lambda:${region}:${a}:function:${name}`;
+  const logArn = `arn:aws:logs:${region}:${a}:log-group:/aws/lambda/${name}`;
+  const before = { DateLessThan: { "aws:CurrentTime": end } };
+  const tagged = { StringEquals: { [`aws:ResourceTag/${REHEARSAL_TAG.key}`]: REHEARSAL_TAG.value } };
+  const tagging = { StringEquals: { [`aws:RequestTag/${REHEARSAL_TAG.key}`]: REHEARSAL_TAG.value } };
+  const statement = (Sid: string, Action: string[], Resource: string | string[], Condition: Record<string, unknown>) => ({ Sid, Effect: "Allow" as const, Action, Resource, Condition: { ...before, ...Condition } });
+  const inline = {
     Version: "2012-10-17" as const,
     Statement: [
-      { Sid: "StateListOnlyThisPrefix", Effect: "Allow" as const, Action: ["s3:ListBucket", "s3:ListBucketVersions"], Resource: bucketArn, Condition: { ...live, StringLike: { "s3:prefix": [`${prefix}*`] } } },
-      {
-        Sid: "StateObjectsOnlyThisPrefix",
-        Effect: "Allow" as const,
-        Action: ["s3:GetObject", "s3:GetObjectVersion", "s3:PutObject", "s3:DeleteObject", "s3:DeleteObjectVersion"],
-        Resource: `${bucketArn}/${prefix}*`,
-        Condition: live,
-      },
-      {
-        Sid: "StateBucketSettingsReadOnly",
-        Effect: "Allow" as const,
-        Action: ["s3:GetBucketVersioning", "s3:GetEncryptionConfiguration", "s3:GetBucketPublicAccessBlock", "s3:GetBucketOwnershipControls", "s3:GetBucketTagging"],
-        Resource: bucketArn,
-        Condition: live,
-      },
-      {
-        Sid: "NeverChangeTheSharedBucket",
-        Effect: "Deny" as const,
-        Action: [
-          "s3:CreateBucket", "s3:PutBucket*", "s3:DeleteBucket*", "s3:PutEncryptionConfiguration", "s3:PutBucketVersioning", "s3:PutBucketPublicAccessBlock",
-          "s3:PutBucketOwnershipControls", "s3:PutBucketTagging", "s3:PutLifecycleConfiguration", "s3:PutBucketPolicy", "s3:PutBucketAcl",
-        ],
-        Resource: [bucketArn, "arn:aws:s3:::pippen-sbx-alchemy-state-*"],
-      },
-      { Sid: "NeverListOtherPrefixes", Effect: "Deny" as const, Action: ["s3:ListBucket", "s3:ListBucketVersions"], Resource: bucketArn, Condition: { StringNotLike: { "s3:prefix": [`${prefix}*`] } } },
-      {
-        Sid: "NeverOtherStateObjects",
-        Effect: "Deny" as const,
-        Action: ["s3:GetObject*", "s3:PutObject*", "s3:DeleteObject*", "s3:RestoreObject", "s3:ReplicateObject"],
-        NotResource: [`${bucketArn}/${prefix}*`, `arn:aws:s3:::${name}/*`, `arn:aws:s3:::pippen-sbx-${name}/*`],
-      },
-      {
-        Sid: "V2Queues",
-        Effect: "Allow" as const,
-        Action: [
-          "sqs:CreateQueue", "sqs:GetQueueUrl", "sqs:GetQueueAttributes", "sqs:SetQueueAttributes", "sqs:TagQueue", "sqs:UntagQueue", "sqs:ListQueueTags",
-          "sqs:DeleteQueue", "sqs:SendMessage", "sqs:ReceiveMessage", "sqs:DeleteMessage", "sqs:ChangeMessageVisibility",
-        ],
-        Resource: `arn:aws:sqs:${region}:${acct}:${name}`,
-        Condition: { ...live, ...regional },
-      },
-      {
-        Sid: "V2Function",
-        Effect: "Allow" as const,
-        Action: [
-          "lambda:CreateFunction", "lambda:GetFunction", "lambda:GetFunctionConfiguration", "lambda:UpdateFunctionCode", "lambda:UpdateFunctionConfiguration", "lambda:DeleteFunction",
-          "lambda:AddPermission", "lambda:RemovePermission", "lambda:GetPolicy", "lambda:TagResource", "lambda:UntagResource", "lambda:ListTags", "lambda:InvokeFunction",
-        ],
-        Resource: `arn:aws:lambda:${region}:${acct}:function:${name}`,
-        Condition: { ...live, ...regional },
-      },
-      {
-        Sid: "V2EventSourceMappingsOnTheFunction",
-        Effect: "Allow" as const,
-        Action: ["lambda:CreateEventSourceMapping", "lambda:GetEventSourceMapping", "lambda:UpdateEventSourceMapping", "lambda:DeleteEventSourceMapping", "lambda:ListEventSourceMappings"],
-        Resource: "*",
-        Condition: { ...live, ...regional, ArnLike: { "lambda:FunctionArn": `arn:aws:lambda:${region}:${acct}:function:${name}` } },
-      },
-      { Sid: "V2Rules", Effect: "Allow" as const, Action: ["events:PutRule", "events:DescribeRule", "events:DeleteRule", "events:PutTargets", "events:RemoveTargets", "events:ListTargetsByRule", "events:TagResource", "events:UntagResource", "events:ListTagsForResource", "events:EnableRule", "events:DisableRule"], Resource: `arn:aws:events:${region}:${acct}:rule/${name}`, Condition: { ...live, ...regional } },
-      { Sid: "V2Alarms", Effect: "Allow" as const, Action: ["cloudwatch:PutMetricAlarm", "cloudwatch:DeleteAlarms", "cloudwatch:TagResource", "cloudwatch:UntagResource", "cloudwatch:ListTagsForResource"], Resource: `arn:aws:cloudwatch:${region}:${acct}:alarm:${name}`, Condition: { ...live, ...regional } },
-      { Sid: "V2LogGroup", Effect: "Allow" as const, Action: ["logs:CreateLogGroup", "logs:PutRetentionPolicy", "logs:DeleteLogGroup", "logs:TagResource", "logs:UntagResource", "logs:ListTagsForResource"], Resource: [`arn:aws:logs:${region}:${acct}:log-group:/aws/lambda/${name}`, `arn:aws:logs:${region}:${acct}:log-group:/aws/lambda/${name}:*`], Condition: { ...live, ...regional } },
-      { Sid: "V2Secret", Effect: "Allow" as const, Action: ["secretsmanager:CreateSecret", "secretsmanager:DescribeSecret", "secretsmanager:PutResourcePolicy", "secretsmanager:GetResourcePolicy", "secretsmanager:DeleteSecret", "secretsmanager:TagResource", "secretsmanager:UntagResource"], Resource: `arn:aws:secretsmanager:${region}:${acct}:secret:96bulls/${stage}/*`, Condition: { ...live, ...regional } },
-      { Sid: "V2ReadOnlyLists", Effect: "Allow" as const, Action: ["sqs:ListQueues", "cloudwatch:DescribeAlarms", "logs:DescribeLogGroups", "events:ListRules"], Resource: "*", Condition: { ...live, ...regional } },
-      { Sid: "OnlyThisRegion", Effect: "Deny" as const, NotAction: ["iam:*", "sts:*", "s3:*"], Resource: "*", Condition: { StringNotEquals: { "aws:RequestedRegion": region } } },
-      { Sid: "NothingAfterExpiry", Effect: "Deny" as const, Action: "*", Resource: "*", Condition: { DateGreaterThan: { "aws:CurrentTime": expiresAt } } },
+      { Sid: "End", Effect: "Deny" as const, Action: "*", Resource: "*", Condition: { DateGreaterThanEquals: { "aws:CurrentTime": end } } },
+      { Sid: "Region", Effect: "Deny" as const, NotAction: ["iam:*", "sts:*", "s3:*"], Resource: "*", Condition: { StringNotEquals: { "aws:RequestedRegion": region } } },
+      { Sid: "SharedBucket", Effect: "Deny" as const, Action: ["s3:CreateBucket", "s3:PutBucket*", "s3:DeleteBucket*", "s3:PutEncryptionConfiguration", "s3:PutLifecycleConfiguration"], Resource: "arn:aws:s3:::pippen-sbx-alchemy-state-*" },
+      { Sid: "KeepTag", Effect: "Deny" as const, Action: ["sqs:UntagQueue", "lambda:UntagResource", "cloudwatch:UntagResource", "logs:UntagResource"], Resource: "*", Condition: { "ForAnyValue:StringEquals": { "aws:TagKeys": [REHEARSAL_TAG.key] } } },
     ],
   };
+  const managed = [
+    {
+      name: `96bulls-rehearse-p1-1126-state`,
+      document: {
+        Version: "2012-10-17" as const,
+        Statement: [
+          statement("List", ["s3:ListBucket", "s3:ListBucketVersions"], bucketArn, { StringLike: { "s3:prefix": [`${prefix}*`] } }),
+          statement("Objects", ["s3:GetObject", "s3:GetObjectVersion", "s3:PutObject", "s3:DeleteObject", "s3:DeleteObjectVersion"], `${bucketArn}/${prefix}*`, {}),
+          statement("Settings", ["s3:GetBucketVersioning", "s3:GetEncryptionConfiguration", "s3:GetBucketPublicAccessBlock", "s3:GetBucketOwnershipControls", "s3:GetBucketTagging"], bucketArn, {}),
+          { Sid: "OtherPrefixes", Effect: "Deny" as const, Action: ["s3:ListBucket", "s3:ListBucketVersions"], Resource: bucketArn, Condition: { StringNotLike: { "s3:prefix": [`${prefix}*`] } } },
+          { Sid: "NotThisPrefix", Effect: "Deny" as const, Action: ["s3:GetObject*", "s3:PutObject*", "s3:DeleteObject*"], NotResource: `${bucketArn}/${prefix}*` },
+        ],
+      },
+    },
+    {
+      name: `96bulls-rehearse-p1-1126-create`,
+      document: {
+        Version: "2012-10-17" as const,
+        Statement: [
+          statement("Queues", ["sqs:CreateQueue", "sqs:TagQueue"], `arn:aws:sqs:${region}:${a}:${name}`, tagging),
+          statement("Function", ["lambda:CreateFunction", "lambda:TagResource"], fnArn, tagging),
+          statement("Mappings", ["lambda:CreateEventSourceMapping", "lambda:TagResource"], "*", { ...tagging, ArnLike: { "lambda:FunctionArn": fnArn } }),
+          statement("Alarms", ["cloudwatch:PutMetricAlarm", "cloudwatch:TagResource"], `arn:aws:cloudwatch:${region}:${a}:alarm:${name}`, tagging),
+          statement("Logs", ["logs:CreateLogGroup", "logs:TagResource"], [logArn, `${logArn}:*`], tagging),
+        ],
+      },
+    },
+    {
+      name: `96bulls-rehearse-p1-1126-act`,
+      document: {
+        Version: "2012-10-17" as const,
+        Statement: [
+          statement("Queues", ["sqs:GetQueueAttributes", "sqs:SetQueueAttributes", "sqs:ListQueueTags", "sqs:DeleteQueue", "sqs:SendMessage", "sqs:ReceiveMessage", "sqs:DeleteMessage", "sqs:ChangeMessageVisibility"], `arn:aws:sqs:${region}:${a}:${name}`, tagged),
+          statement("Function", [
+            "lambda:GetFunction", "lambda:GetFunctionConfiguration", "lambda:UpdateFunctionCode", "lambda:UpdateFunctionConfiguration", "lambda:DeleteFunction", "lambda:PublishVersion",
+            "lambda:ListAliases", "lambda:ListVersionsByFunction", "lambda:AddPermission", "lambda:RemovePermission", "lambda:GetPolicy", "lambda:ListTags", "lambda:InvokeFunction",
+          ], fnArn, tagged),
+          statement("Mappings", ["lambda:GetEventSourceMapping", "lambda:UpdateEventSourceMapping", "lambda:DeleteEventSourceMapping"], "*", { ArnLike: { "lambda:FunctionArn": fnArn } }),
+          statement("Alarms", ["cloudwatch:PutMetricAlarm", "cloudwatch:DeleteAlarms", "cloudwatch:ListTagsForResource"], `arn:aws:cloudwatch:${region}:${a}:alarm:${name}`, tagged),
+          statement("Logs", ["logs:PutRetentionPolicy", "logs:DeleteLogGroup", "logs:ListTagsForResource", "logs:StartQuery", "logs:FilterLogEvents"], [logArn, `${logArn}:*`], tagged),
+          statement("Reads", ["sqs:GetQueueUrl", "sqs:ListQueues", "lambda:ListEventSourceMappings", "cloudwatch:DescribeAlarms", "cloudwatch:GetMetricStatistics", "cloudwatch:GetMetricData", "logs:DescribeLogGroups", "logs:GetQueryResults"], "*", {}),
+        ],
+      },
+    },
+  ];
+  return { expiresAt: end, inline, managed };
+}
+
+/**
+ * The mapping UUIDs Alchemy recorded for this stage (its state objects `<prefix>session-events-mapping.json`
+ * and `<prefix>session-search-mapping.json`, attr.uuid), for assertRehearsalResourcesGone. An absent
+ * object records nothing; an unreadable or malformed one refuses.
+ */
+export function recordedMappingUuids(aws: AwsRun, i: { bucket: string; region: string; stage: string }): string[] {
+  const prefix = rehearsalStatePrefix(i.stage);
+  const out: string[] = [];
+  for (const id of ["session-events-mapping", "session-search-mapping"]) {
+    let text: string;
+    try {
+      text = aws(["s3", "cp", `s3://${i.bucket}/${prefix}${id}.json`, "-", "--region", i.region]);
+    } catch (e) {
+      if (/NoSuchKey|\(404\)/.test(e instanceof Error ? e.message : String(e))) continue;
+      throw new StateBucketError("state_teardown_failed");
+    }
+    let uuid: unknown;
+    try {
+      uuid = (JSON.parse(text) as { attr?: { uuid?: unknown } }).attr?.uuid;
+    } catch {
+      throw new StateBucketError("state_teardown_failed");
+    }
+    if (typeof uuid !== "string" || !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(uuid)) throw new StateBucketError("state_teardown_failed");
+    out.push(uuid);
+  }
+  return out;
 }

@@ -158,7 +158,8 @@ describe("aws-proof-sandbox: the E2E proof in the Pippen sandbox of agent aws-pr
     const stack = readFileSync(fileURLToPath(new URL("../alchemy.aws.run.ts", import.meta.url)), "utf8");
     // In the stack's Effect (the state layer, before it, runs the same check before making the sandbox's state bucket).
     const guard = stack.indexOf("verifyCallerArn(", stack.indexOf("export default Alchemy.Stack("));
-    expect(stack.indexOf("verifyCallerArn(")).toBeLessThan(stack.indexOf("ensurePippenStateBucket(\n"));
+    expect(stack.indexOf("verifyCallerArn(")).toBeLessThan(stack.indexOf("ensurePippenStateBucket(run, target)"));
+    expect(stack.indexOf("ensurePippenStateBucket(run, target)")).toBeGreaterThan(0);
     expect(guard).toBeGreaterThan(stack.indexOf("assertAwsDeploymentTarget("));
     expect(guard).toBeLessThan(stack.indexOf("AWS.KMS.Key("));
     expect(stack).toContain("if (stage === PIPPEN_PROOF_SANDBOX.stage)");

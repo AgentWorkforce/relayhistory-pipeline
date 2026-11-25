@@ -47,7 +47,7 @@ import { spawnSync } from "node:child_process";
 import { Project as SupabaseProject, SupabaseProvider } from "../supabase/project.ts";
 import { assertTranscriptStorePlanContract, TRANSCRIPT_STAGE, transcriptStoreStage } from "./transcript-store.ts";
 import { readPipelineLive, spawnAwsRun } from "./pipeline-live.ts";
-import { assertValidateOnlyState, stateBucketMode } from "./pippen-rehearsal.ts";
+import { prepareStateBackend, stateBackendFor } from "./pippen-rehearsal.ts";
 
 const ROOT = fileURLToPath(new URL("../..", import.meta.url));
 const REPO = "AgentWorkforce/sessions-pipeline";
@@ -140,31 +140,28 @@ const stateTarget = stateTargetFromArgv(process.argv, (stage) => {
     return undefined;
   }
 });
+// A declared validate-only stage is decided from its validated inputs before any state backend is
+// chosen: missing or malformed inputs throw here, never falling through to ensure or the default store.
+const argvStage = stageFromArgv(process.argv);
+if (argvStage) stateBackendFor(argvStage, stateTarget);
 const pippenStateLayer = (t: NonNullable<typeof stateTarget>) =>
   Layer.unwrap(
     Effect.sync(() => {
       const spawn = (cmd: string, args: string[]) => spawnSync(cmd, args, { encoding: "utf8", env: process.env });
-      // validate-only (every sandbox stage but the proof stage): the shared bucket is only read and
-      // checked, the caller must be this stage's lease session and the prefix exactly this stage's.
-      if (stateBucketMode(t.pippenSandbox) === "validate-only") {
-        assertValidateOnlyState(
-          (args) => {
-            const r = spawn("aws", args);
-            if (r.status !== 0) throw new Error(`aws ${args.slice(0, 2).join(" ")} failed: ${(r.stderr || "").trim()}`);
-            return r.stdout;
-          },
-          { accountId: t.accountId, region: t.region, stage: t.stage, env: process.env },
-        );
-        return AWS.state(stackStateOptions(t));
-      }
-      if (t.stage === PIPPEN_PROOF_SANDBOX.stage) verifyCallerArn(awsCliRunner(spawn), pippenProofSandboxCallerArn(process.env));
-      ensurePippenStateBucket(
+      // validate-only (a declared rehearsal stage): the shared bucket is only read and checked, the
+      // caller must be the attested lease session and the prefix exactly this stage's. Otherwise the
+      // old path: the proof stage's caller check, then ensurePippenStateBucket.
+      prepareStateBackend(
         (args) => {
           const r = spawn("aws", args);
           if (r.status !== 0) throw new Error(`aws ${args.slice(0, 2).join(" ")} failed: ${(r.stderr || "").trim()}`);
           return r.stdout;
         },
-        { accountId: t.accountId, region: t.region, stage: t.stage },
+        { stage: t.stage, inputs: t, env: process.env },
+        (run, target) => {
+          if (t.stage === PIPPEN_PROOF_SANDBOX.stage) verifyCallerArn(awsCliRunner(spawn), pippenProofSandboxCallerArn(process.env));
+          ensurePippenStateBucket(run, target);
+        },
       );
       return AWS.state(stackStateOptions(t));
     }),
