@@ -2,6 +2,9 @@
  * Overlap benchmark CLI (docs/session-intel-overlap-bench.md).
  *
  *   bun run src/session-intel/overlap-bench/cli.ts climb --harvest <dir>[,<dir>...] --forge <dir> --labels <labels.json> --out <dir>
+ *   bun run src/session-intel/overlap-bench/cli.ts stage2-batch --harvest ... --forge ... --labels ... --frozen <frozen.json> --split dev|heldout \
+ *     --prompt <prompt.txt> --cutoff 0.3 --seed <s> [--fresh 40] [--exclude <key.json>,...] [--verdicts <hindsight.json>] [--owner-labels <f>] --out <batch dir>
+ *   bun run src/session-intel/overlap-bench/cli.ts stage2-score --out <batch dir>
  *   bun run src/session-intel/overlap-bench/cli.ts heldout --harvest <dir> --forge <dir> --labels <labels.json> --frozen <frozen.json> --out <dir>
  *
  * `climb` scores every grid point of every detector on the dev split only and writes the log and the best point
@@ -10,7 +13,7 @@
  */
 import { createHash } from "node:crypto";
 import { closeSync, existsSync, openSync, readdirSync, readFileSync, readSync, realpathSync, statSync, writeFileSync } from "node:fs";
-import { basename, join, resolve } from "node:path";
+import { basename, dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { parseArgs } from "node:util";
 import type { DirectoryRow, SessionFacts } from "../cloud-harvest/harvest.ts";
@@ -19,9 +22,10 @@ import { type Alert, type Context, concurrentEdits, type ForgePr, openPrOverlap,
 import { outcomeFactsBaseline } from "./baseline.ts";
 import { buildModel, communicated, type ObservedPolicy } from "./model.ts";
 import { type IncidentLabel, type NegativeLabel, score, type Score } from "./score.ts";
-import { components, type Components, rank, rankerGrid } from "./ranker.ts";
-import { adjudicationSample, type AlertVerdict, ceiling, evaluate } from "./eval.ts";
+import { components, type Components, rank, rankerGrid, type RankerParams } from "./ranker.ts";
+import { adjudicationSample, type AlertVerdict, ceiling, evaluate, pairId } from "./eval.ts";
 import { describe as describePair } from "./bundle.ts";
+import { LOOSE_RANKER, scoreStage2, type Stage2Verdict, stage2Batch, type Truth } from "./stage2.ts";
 import { assertPrivateFile, assertPrivateInput, outsideRoot, readPrivate, writePrivate } from "../cloud-harvest/private-fs.ts";
 
 const readJsonl = <T>(p: string): T[] => readPrivate(p).split("\n").filter(Boolean).flatMap((l) => { try { return [JSON.parse(l) as T]; } catch { return []; } });
@@ -123,7 +127,7 @@ const REPO_ROOT = realpathSync(resolve(fileURLToPath(new URL("../../..", import.
 const inRepo = (p: string) => (p + "/").startsWith(REPO_ROOT + "/");
 export function assertOutsideRepo(out: string): string { return outsideRoot(out, REPO_ROOT); }
 
-const SOURCES = ["detectors.ts", "model.ts", "paths.ts", "score.ts", "baseline.ts", "ranker.ts", "eval.ts", "bundle.ts", "cli.ts"].map((f) => new URL(f, import.meta.url));
+const SOURCES = ["detectors.ts", "model.ts", "paths.ts", "score.ts", "baseline.ts", "ranker.ts", "eval.ts", "bundle.ts", "stage2.ts", "cli.ts"].map((f) => new URL(f, import.meta.url));
 const sourceHash = () => createHash("sha256").update(SOURCES.map((u) => readFileSync(u)).join("\u0000")).digest("hex");
 /** sha256 over files, streamed (harvest facts are large), in the given order, each prefixed with its name and size. */
 function digestFiles(files: string[]): string {
@@ -138,6 +142,19 @@ function digestFiles(files: string[]): string {
 }
 /** Everything a frozen score depends on besides the points themselves: inputs, sources, labels, budget, split. */
 export interface FreezeTerms { sourceHash: string; labelsHash: string; inputsHash: string; perHundred: number; split: "heldout"; observed: "all" }
+type Frozen = FreezeTerms & { format?: string; frozen: Array<{ detector: string; params: Record<string, unknown>; hash: string }> };
+/** A frozen file whose every term (inputs, sources, labels, budget, split, policy) matches what is on disk now. */
+function verifiedFrozen(file: string, values: { harvest?: string; forge?: string; labels?: string; "per-hundred"?: string }, perHundred: number): Frozen {
+  const frozen = JSON.parse(readPrivate(file)) as Frozen;
+  if (frozen.format !== "overlap-bench-frozen/2") throw new Error("frozen file predates input and budget freezing; climb again");
+  if (values["per-hundred"] !== undefined && perHundred !== frozen.perHundred) throw new Error("--per-hundred differs from the frozen budget");
+  const now = freezeTerms(values.harvest!, values.forge!, values.labels!, frozen.perHundred);
+  for (const k of ["sourceHash", "labelsHash", "inputsHash", "perHundred", "split", "observed"] as const) {
+    if (now[k] !== frozen[k]) throw new Error(`${k} differs from the frozen file`);
+  }
+  return frozen;
+}
+
 export function freezeTerms(harvest: string, forge: string, labels: string, perHundred: number): FreezeTerms {
   const inputs = [
     ...harvest.split(",").filter(Boolean).flatMap((d) => ["directory.jsonl", "facts.jsonl"].map((f) => join(d, f))),
@@ -157,7 +174,22 @@ async function main(argv: string[]) {
   const { values } = parseArgs({ args: rest, options: {
     harvest: { type: "string" }, forge: { type: "string" }, labels: { type: "string" }, out: { type: "string" }, frozen: { type: "string" },
     "per-hundred": { type: "string" }, verdicts: { type: "string" }, "per-detector": { type: "string" }, seed: { type: "string" }, "owner-labels": { type: "string" },
+    split: { type: "string" }, prompt: { type: "string" }, cutoff: { type: "string" }, fresh: { type: "string" }, exclude: { type: "string" },
   } });
+  if (cmd === "stage2-score") {
+    // Scores a batch's verdicts at its frozen cutoff. A held-out batch is scored once (the result is written with wx).
+    if (!values.out) throw new Error("stage2-score needs --out (the batch directory)");
+    const dir = values.out;
+    const m = JSON.parse(readPrivate(join(dir, "stage2.json"))) as { split: string; cutoff: number; promptHash: string };
+    const key = JSON.parse(readPrivate(join(dir, "key.json"))) as Array<{ pair: string; truth: Truth }>;
+    const verdicts = readdirSync(dir).filter((n) => /^verdicts-\d+\.json$/.test(n)).sort().flatMap((n) => JSON.parse(readPrivate(join(dir, n))) as Stage2Verdict[]);
+    const result = { ...scoreStage2(key, verdicts, m.cutoff), split: m.split, promptHash: m.promptHash };
+    const file = join(dir, "score.json");
+    assertPrivateFile(file);
+    writeFileSync(file, JSON.stringify(result, null, 1), { mode: 0o600, flag: m.split === "heldout" ? "wx" : "w" });
+    console.log(JSON.stringify(result));
+    return;
+  }
   if (!values.harvest || !values.forge || !values.labels || !values.out) throw new Error("--harvest, --forge, --labels and --out are required");
   // Every output (logs, scores, bundles) carries real identifiers or PR text.
   assertOutsideRepo(values.out);
@@ -183,16 +215,9 @@ async function main(argv: string[]) {
     for (const f of frozen) console.log(JSON.stringify(f));
   } else if (cmd === "heldout") {
     if (!values.frozen) throw new Error("heldout needs --frozen");
-    const frozen = JSON.parse(readPrivate(values.frozen)) as FreezeTerms & { format?: string; frozen: Array<{ detector: string; params: Record<string, unknown>; hash: string }> };
-    if (frozen.format !== "overlap-bench-frozen/2") throw new Error("frozen file predates input and budget freezing; climb again");
+    const frozen = verifiedFrozen(values.frozen, values, perHundred);
     const ledger = join(values.out, `heldout-${frozen.labelsHash.slice(0, 12)}.json`);
     if (existsSync(ledger)) throw new Error("held-out was already scored for these labels");
-    // The held-out score must use exactly the frozen inputs, sources, labels, budget and split.
-    if (values["per-hundred"] !== undefined && perHundred !== frozen.perHundred) throw new Error("--per-hundred differs from the frozen budget");
-    const now = freezeTerms(values.harvest, values.forge, values.labels, frozen.perHundred);
-    for (const k of ["sourceHash", "labelsHash", "inputsHash", "perHundred", "split", "observed"] as const) {
-      if (now[k] !== frozen[k]) throw new Error(`${k} differs from the frozen file`);
-    }
     const results = frozen.frozen.map((f) => {
       const g = grid().find((x) => x.detector === f.detector && JSON.stringify(x.params) === JSON.stringify(f.params));
       if (!g) throw new Error(`frozen point ${f.hash} is not in the grid`);
@@ -226,7 +251,50 @@ async function main(argv: string[]) {
       writePrivate(join(values.out, "bundle.jsonl"), sample.map((s) => JSON.stringify(describePair(ctx, s.sides, s.at, ownerLabel))).join("\n") + "\n");
       console.log(JSON.stringify({ sampled: sample.length }));
     }
-  } else throw new Error("command must be climb, heldout, eval or sample");
+  } else if (cmd === "stage2-batch") {
+    // A blind stage-2 batch for one split, bound to the frozen stage 1, the prompt (by hash) and the cutoff.
+    if (!values.frozen || !values.prompt || !values.cutoff || !values.seed) throw new Error("stage2-batch needs --frozen, --prompt, --cutoff and --seed");
+    const split = values.split === "heldout" ? "heldout" : values.split === "dev" ? "dev" : (() => { throw new Error("--split must be dev or heldout"); })();
+    const cutoff = Number(values.cutoff);
+    if (!(cutoff > 0 && cutoff <= 1)) throw new Error("--cutoff must be in (0, 1]");
+    const frozen = verifiedFrozen(values.frozen, values, perHundred);
+    const ranker = frozen.frozen.find((f) => f.detector === "ranker");
+    if (!ranker) throw new Error("the frozen file has no ranker point");
+    const g = grid().find((x) => x.detector === "ranker" && JSON.stringify(x.params) === JSON.stringify(ranker.params));
+    if (!g || pointHash(g) !== ranker.hash) throw new Error("the frozen ranker point does not hash to its parameters and sources");
+    const prompt = readPrivate(values.prompt);
+    if (!prompt.includes("{INPUT}") || !prompt.includes("{OUTPUT}")) throw new Error("the prompt must name {INPUT} and {OUTPUT}");
+    const promptHash = createHash("sha256").update(prompt).digest("hex");
+    // Held-out is judged once: the ledger is claimed when its batch is made, so no second batch can be drawn.
+    if (split === "heldout") {
+      // Beside the frozen file, so every batch drawn from one freeze sees the same claim.
+      const claim = join(dirname(resolve(values.frozen)), `stage2-heldout-${frozen.labelsHash.slice(0, 12)}.claim`);
+      assertPrivateFile(claim);
+      writeFileSync(claim, JSON.stringify({ promptHash, cutoff, ranker: ranker.hash, at: new Date().toISOString() }), { mode: 0o600, flag: "wx" });
+    }
+    const judged = new Set<string>();
+    for (const f of (values.exclude ?? "").split(",").filter(Boolean)) for (const k of JSON.parse(readPrivate(f)) as Array<{ pair: string }>) judged.add(k.pair);
+    const hindsight = values.verdicts ? (JSON.parse(readPrivate(values.verdicts)) as AlertVerdict[]) : [];
+    for (const v of hindsight) judged.add(v.pair);
+    const comps = componentsOf(ctx);
+    const items = stage2Batch(ctx, {
+      incidents: labels.incidents.filter((i) => i.split === split), loose: rank(ctx, comps, { ...LOOSE_RANKER }), frozen: rank(ctx, comps, ranker.params as unknown as RankerParams),
+      hindsightOverlaps: split === "dev" ? hindsight.filter((v) => v.verdict === "overlap").map((v) => v.pair) : [], judged,
+      fresh: Number(values.fresh ?? 40), seed: values.seed,
+    });
+    const names = values["owner-labels"] ? JSON.parse(readPrivate(values["owner-labels"])) as Record<string, string> : {};
+    const ownerLabel = (u: string | null) => u === null ? null : names[u] ?? "member";
+    const bundles = items.map((x) => JSON.stringify(describePair(ctx, x.sides, x.at, ownerLabel, true)));
+    const half = Math.ceil(bundles.length / 2);
+    for (const [i, part] of [bundles.slice(0, half), bundles.slice(half)].entries()) {
+      const id = String(i).padStart(2, "0");
+      writePrivate(join(values.out, `part-${id}`), part.join("\n") + "\n");
+      writePrivate(join(values.out, `prompt-${id}.txt`), prompt.replaceAll("{INPUT}", join(values.out, `part-${id}`)).replaceAll("{OUTPUT}", join(values.out, `verdicts-${id}.json`)));
+    }
+    writePrivate(join(values.out, "key.json"), JSON.stringify(items.map((x) => ({ pair: pairId(x.sides), truth: x.truth })), null, 1));
+    writePrivate(join(values.out, "stage2.json"), JSON.stringify({ format: "overlap-bench-stage2/1", split, cutoff, promptHash, ranker: ranker.hash, sourceHash: frozen.sourceHash, labelsHash: frozen.labelsHash, inputsHash: frozen.inputsHash, seed: values.seed, items: items.length }, null, 1));
+    console.log(JSON.stringify({ split, items: items.length, positives: items.filter((x) => x.truth !== "fresh").length, fresh: items.filter((x) => x.truth === "fresh").length, promptHash: promptHash.slice(0, 16) }));
+  } else throw new Error("command must be climb, heldout, eval, sample or stage2-batch");
 }
 
 if (import.meta.main) main(process.argv.slice(2)).catch((e) => { console.error(`overlap-bench: ${(e as Error).message}`); process.exit(1); });

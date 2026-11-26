@@ -103,6 +103,11 @@ A PR's title and description appear only from dated history (forge `history`), a
    - the observed-path policy.
 3. Score held-out once. `heldout` recomputes every term and every point hash and refuses any mismatch. It uses the frozen budget (a different `--per-hundred` is refused), and refuses if a ledger for these labels already exists (the ledger is written with `wx`).
 4. Precision samples use fresh seeds, and a pair is never judged twice.
+5. Stage 2 is frozen with stage 1:
+   - `stage2-batch` binds a batch to the verified frozen file, the frozen ranker point (re-hashed), the prompt (by sha256) and the cutoff;
+   - it draws positives from the split's incidents and fresh negatives that no earlier round judged (`--exclude`, `--verdicts`);
+   - it writes the rendered prompts beside the blind bundles.
+   For held-out, the batch claims a one-time file beside the frozen file (created with `wx`), so no second held-out batch can be drawn. `stage2-score` then scores the verdicts at the frozen cutoff, and on held-out it writes its result only once. The judge runs outside the bench from the rendered prompt, with no lookups.
 
 ## Findings so far (dev split)
 

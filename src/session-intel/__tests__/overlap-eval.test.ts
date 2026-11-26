@@ -59,3 +59,16 @@ describe("adjudication sample", () => {
     expect(Object.keys(s[0]!)).toEqual(["pair", "sides", "at"]);
   });
 });
+
+describe("stage 2", () => {
+  test("scores kept positives and fresh alerts at the cutoff, with unjudged items counted apart", async () => {
+    const { scoreStage2 } = await import("../overlap-bench/stage2.ts");
+    const key = [{ pair: "a", truth: "incident:1" as const }, { pair: "b", truth: "hindsight-overlap" as const }, { pair: "c", truth: "fresh" as const }, { pair: "d", truth: "fresh" as const }, { pair: "e", truth: "fresh" as const }];
+    const s = scoreStage2(key, [
+      { pair: "a", verdict: "overlap", p_overlap: 0.6 }, { pair: "b", verdict: "not_overlap", p_overlap: 0.2 },
+      { pair: "c", verdict: "not_overlap", p_overlap: 0.25 }, { pair: "d", verdict: "overlap", p_overlap: 0.3 },
+    ], 0.3);
+    expect([s.positives, s.positivesKept, s.fresh, s.freshKept, s.unjudged]).toEqual([2, 1, 2, 1, 1]);
+    expect(s.freshKeptHigh).toBeGreaterThan(0.5);
+  });
+});
