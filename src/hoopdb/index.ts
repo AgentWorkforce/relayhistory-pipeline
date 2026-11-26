@@ -23,6 +23,7 @@ import { log } from "../shared/log.ts";
 import { uuidv7 } from "../shared/ids.ts";
 import { propagatePointerTombstone } from "./session-directory-summary.ts";
 import { projectSessionDirectory } from "./session-directory-projector.ts";
+import { safeRepoUrl } from "./session-directory-catalog.ts";
 import { briefConfig } from "../session-brief/config.ts";
 import { armWakeup } from "../session-brief/store.ts";
 import { ERASE_FENCE_FLAG, eraseRuntimeFlag } from "../session-erase/flags.ts";
@@ -216,7 +217,8 @@ function sessionIndex(deps:IndexDeps,authorized:boolean,managedSearch?:ManagedSe
         state_classified_at: null,
         created_at: f.startedAt,
         last_activity_at: f.endedAt ?? m.raw.updated_at,
-        git_repo: f.gitRemoteUrl,
+        // The manifest copies the recorded remote as is; credentials never reach the index (safeRepoUrl).
+        git_repo: safeRepoUrl(f.gitRemoteUrl),
         git_branch: null,
         git_commit: null,
         model: null,

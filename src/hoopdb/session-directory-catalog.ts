@@ -93,6 +93,37 @@ function looksLikeLocalPath(value: string): boolean {
   );
 }
 
+/**
+ * The catalog's repository URL as the directory may store it: credentials never pass. A URL with
+ * userinfo keeps its scheme, host and path and loses the userinfo (`https://token@github.com/a/b` ->
+ * `https://github.com/a/b`); the SSH forms keep their `git@` user, which is not a credential, but lose
+ * any password. A scrubbed or unparseable value gives null rather than a guess, because the source
+ * copies the URL as recorded (relayhistory catalog) and may hold a token.
+ */
+export function safeRepoUrl(value: string | null): string | null {
+  if (value === null || /REDACTED|\s/u.test(value)) return null;
+  // A canonical key with no scheme (`github.com/owner/repo`) cannot carry a credential: kept as is.
+  if (/^[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)+\/[A-Za-z0-9._-]+\/[A-Za-z0-9._-]+$/u.test(value)) return value;
+  const scp = /^([A-Za-z0-9._-]+)@([A-Za-z0-9.-]+):([A-Za-z0-9._~/-]+)$/u.exec(value);
+  if (scp) return `${scp[1]}@${scp[2]}:${scp[3]}`;
+  let url: URL;
+  try {
+    url = new URL(value);
+  } catch {
+    return null;
+  }
+  if (!["https:", "http:", "ssh:", "git:"].includes(url.protocol) || !url.hostname || url.search || url.hash) return null;
+  const user = url.protocol === "ssh:" && url.username && !url.password ? `${url.username}@` : "";
+  return `${url.protocol}//${user}${url.host}${url.pathname.replace(/\/+$/u, "")}`;
+}
+
+/** A remote-derived project key (`host/owner/repo`) as a repository URL, when the catalog has no URL. */
+export function repoUrlFromProjectKey(key: string | null, method: string | null): string | null {
+  if (key === null || !["remote", "git_remote"].includes(method ?? "")) return null;
+  const m = /^([A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)+)\/([A-Za-z0-9._-]+)\/([A-Za-z0-9._-]+)$/u.exec(key);
+  return m ? `https://${m[1]}/${m[2]}/${m[3]}` : null;
+}
+
 function catalogProjectId(row: Record<string, unknown>): string | null {
   const key = bounded(row.project_key, 512);
   const method = bounded(row.project_key_method, 64);
@@ -256,6 +287,9 @@ export function directoryCatalogFromProjection(
       edges.set(uid, edge);
     }
   }
+  catalog.gitRepo =
+    safeRepoUrl(catalog.gitRepo) ??
+    repoUrlFromProjectKey(catalog.projectKey, catalog.projectKeyMethod);
   if (
     catalog.projectKey !== null &&
     (catalog.projectKeyMethod === "path" ||
