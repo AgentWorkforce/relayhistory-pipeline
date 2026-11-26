@@ -5,6 +5,7 @@
  * at the only place a service writes a log line.
  */
 import { scrubText } from "@rhc/lib/scrub.ts";
+import { PG_IDENTIFIER_SHAPE, PG_MESSAGE_CLASS_TOKENS, PG_ROUTINE_SHAPE, PG_WHERE_FRAME_SHAPE } from "./pg-diagnostics.ts";
 
 export const ALLOWED_LOG_FIELDS = new Set([
   "service", "deployment", "deployment_id", "stage", "status", "outcome", "attempt",
@@ -22,15 +23,30 @@ export const ALLOWED_LOG_FIELDS = new Set([
   "event_age_ms", "s3_event_age_ms", "queue_origin",
   // How a search pass's acceptance refusal looked (session-pipeline/contender-seats.ts); value rule below.
   "contender_seats",
+  // Database diagnostics and SQS message identity of the session pipeline's failure lines
+  // (shared/pg-diagnostics.ts, session-pipeline/consumer.ts); value rules below.
+  "pg_table", "pg_constraint", "pg_routine", "pg_where_frame", "pg_message_class",
+  "sqs_message_id", "sqs_receive_count", "sqs_message_count",
 ]);
 
 /** Allowlisted keys that survive only as a non-negative safe integer; any other value is dropped. */
-export const NON_NEGATIVE_INTEGER_FIELDS: ReadonlySet<string> = new Set(["event_age_ms", "s3_event_age_ms"]);
+export const NON_NEGATIVE_INTEGER_FIELDS: ReadonlySet<string> = new Set(["event_age_ms", "s3_event_age_ms", "sqs_receive_count", "sqs_message_count"]);
 
 /** Allowlisted keys that survive only as one of a fixed set of strings; any other value is dropped. */
 export const EXACT_VALUE_FIELDS: ReadonlyMap<string, ReadonlySet<string>> = new Map([
   ["queue_origin", new Set(["s3", "requeue", "sweep"])],
   ["contender_seats", new Set(["all_unseated", "seated_unseated", "both", "catalog_key"])],
+  ["pg_message_class", PG_MESSAGE_CLASS_TOKENS],
+]);
+
+/** Allowlisted keys that survive only as a string matching their shape; any other value is dropped. */
+export const SHAPED_VALUE_FIELDS: ReadonlyMap<string, RegExp> = new Map([
+  ["pg_table", PG_IDENTIFIER_SHAPE],
+  ["pg_constraint", PG_IDENTIFIER_SHAPE],
+  ["pg_routine", PG_ROUTINE_SHAPE],
+  ["pg_where_frame", PG_WHERE_FRAME_SHAPE],
+  // An SQS message id (a UUID in practice).
+  ["sqs_message_id", /^[A-Za-z0-9-]{1,128}$/],
 ]);
 
 /** Whether an allowlisted key's value passes its value rule (keys without a rule: always). */
@@ -38,6 +54,8 @@ function valueAllowed(k: string, v: unknown): boolean {
   if (NON_NEGATIVE_INTEGER_FIELDS.has(k)) return typeof v === "number" && Number.isSafeInteger(v) && v >= 0;
   const exact = EXACT_VALUE_FIELDS.get(k);
   if (exact) return typeof v === "string" && exact.has(v);
+  const shape = SHAPED_VALUE_FIELDS.get(k);
+  if (shape) return typeof v === "string" && shape.test(v);
   return true;
 }
 

@@ -26,8 +26,18 @@
  *   `requeue` when any is a search pass this consumer requeued (busy, deferred,
  *   batch deadline), else `sweep` (a reconcile body that marks neither).
  * All three are telemetry only: no stage sees them and nothing else depends on them.
+ *
+ * Diagnostic fields on "pointer index failed" and "search index failed", appended after the
+ * existing ones (which are unchanged):
+ * - `pg_table`, `pg_constraint`, `pg_routine`, `pg_where_frame`, `pg_message_class`: the
+ *   allow-listed Postgres diagnostics of the error (shared/pg-diagnostics.ts), only when the
+ *   error carries a SQLSTATE. Never the message text.
+ * - `sqs_message_id`: the first SQS message behind the line; `sqs_message_count`: how many;
+ *   `sqs_receive_count`: the highest `ApproximateReceiveCount` among them, omitted when none is
+ *   a positive integer.
  */
 import { errorFields, log } from "../shared/log.ts";
+import { pgErrorFields } from "../shared/pg-diagnostics.ts";
 import { parseQueueBody, sequencerAfter, type LandedEvent, type QueueOrigin } from "./s3-events.ts";
 import { indexPointer, type PointerDeps, type SessionScope } from "./pointer.ts";
 import { indexSearchScope, type SearchIndexDeps } from "./search-index.ts";
@@ -38,6 +48,8 @@ export interface QueueRecord {
   body: string;
   /** The SQS `SentTimestamp` attribute (epoch ms, a decimal string in the Lambda event): telemetry only. */
   sentTimestamp?: unknown;
+  /** The SQS `ApproximateReceiveCount` attribute (a decimal string in the Lambda event): telemetry only. */
+  receiveCount?: unknown;
 }
 
 export interface BatchResponse {
@@ -90,6 +102,7 @@ function ageMs(now: number, since: number): number | undefined {
 /** One SQS message's telemetry: its `SentTimestamp` (when usable) and its origin. */
 interface Message {
   sentMs?: number;
+  receiveCount?: number;
   origin: QueueOrigin;
 }
 
@@ -97,6 +110,29 @@ interface Message {
 export function sentTimestampMs(value: unknown): number | undefined {
   const n = typeof value === "number" ? value : typeof value === "string" && /^[0-9]{1,16}$/.test(value) ? Number(value) : NaN;
   return Number.isSafeInteger(n) && n > 0 ? n : undefined;
+}
+
+/** An `ApproximateReceiveCount` attribute: a positive safe integer (number or decimal string), else undefined. */
+export function receiveCountOf(value: unknown): number | undefined {
+  return sentTimestampMs(value);
+}
+
+interface SqsFields {
+  sqs_message_id?: string;
+  sqs_message_count?: number;
+  sqs_receive_count?: number;
+}
+
+/** The SQS identity fields of a failure line over the messages `ids` (see the file comment). */
+function sqsFields(ids: readonly string[], messages: ReadonlyMap<string, Message>): SqsFields {
+  const unique = [...new Set(ids)];
+  if (unique.length === 0) return {};
+  let receive: number | undefined;
+  for (const id of unique) {
+    const r = messages.get(id)?.receiveCount;
+    if (r !== undefined && (receive === undefined || r > receive)) receive = r;
+  }
+  return { sqs_message_id: unique[0], sqs_message_count: unique.length, ...(receive === undefined ? {} : { sqs_receive_count: receive }) };
 }
 
 interface LagFields {
@@ -158,7 +194,8 @@ export async function processBatch(records: readonly QueueRecord[], deps: Consum
       continue;
     }
     const sentMs = sentTimestampMs(record.sentTimestamp);
-    messages.set(record.messageId, { origin: parsed.origin, ...(sentMs === undefined ? {} : { sentMs }) });
+    const receiveCount = receiveCountOf(record.receiveCount);
+    messages.set(record.messageId, { origin: parsed.origin, ...(sentMs === undefined ? {} : { sentMs }), ...(receiveCount === undefined ? {} : { receiveCount }) });
     for (const event of parsed.events) {
       const held = byKey.get(event.key);
       if (!held) {
@@ -202,7 +239,13 @@ export async function processBatch(records: readonly QueueRecord[], deps: Consum
         merge(held.covered, covered);
       } else scopes.set(id, { scope: outcome.scope, messageIds: [...messageIds], manifestKey: outcome.manifestKey, covered: { ...covered } });
     } catch (error) {
-      log.error("pointer index failed", { stage: "session-indexed", ...errorFields(error), duration_ms: Date.now() - started });
+      log.error("pointer index failed", {
+        stage: "session-indexed",
+        ...errorFields(error),
+        duration_ms: Date.now() - started,
+        ...pgErrorFields(error),
+        ...sqsFields(messageIds, messages),
+      });
       for (const id of messageIds) failed.add(id);
     }
   }
@@ -262,6 +305,8 @@ export async function processBatch(records: readonly QueueRecord[], deps: Consum
           session_id: scope.sessionId,
           ...errorFields(error),
           duration_ms: Date.now() - started,
+          ...pgErrorFields(error),
+          ...sqsFields(messageIds, messages),
         });
         for (const id of messageIds) failed.add(id);
       }

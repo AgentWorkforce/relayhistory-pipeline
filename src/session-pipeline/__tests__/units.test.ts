@@ -161,7 +161,7 @@ describe("S3 event notifications", () => {
       { messageId: "m3", body: "b3", attributes: null },
     ]);
     expect(records).toEqual([
-      { messageId: "m1", body: "b1", sentTimestamp: SENT },
+      { messageId: "m1", body: "b1", sentTimestamp: SENT, receiveCount: "1" },
       { messageId: "m2", body: "b2", sentTimestamp: undefined },
       { messageId: "m3", body: "b3", sentTimestamp: undefined },
     ]);

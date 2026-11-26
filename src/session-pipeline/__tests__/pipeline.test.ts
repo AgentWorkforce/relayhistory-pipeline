@@ -31,7 +31,7 @@ import { processBatch, type ConsumerDeps } from "../consumer.ts";
 import * as pointerModule from "../pointer.ts";
 import { droppedFanout, type SessionScope } from "../pointer.ts";
 import { memoryLock } from "./support.ts";
-import { RECONCILE_DEADLINE_MS, reconcileRecent } from "../lambda.ts";
+import { RECONCILE_DEADLINE_MS, queueRecords, reconcileRecent } from "../lambda.ts";
 import { requeueBody } from "../s3-events.ts";
 
 const TRACE = "019a1f3c-8e2b-7c41-9d3a-5b6f0e2a7c18";
@@ -873,5 +873,181 @@ describe("latency fields (s3_event_age_ms, event_age_ms, queue_origin) on the po
     }
     const text = JSON.stringify(lines);
     for (const secret of [messageId, key, AT, String(T0 + 1_000), "oldest_event_time", "requeued"]) expect(text).not.toContain(secret);
+  });
+});
+
+describe("database diagnostics and SQS identity on the pointer and search failure lines", () => {
+  type Line = Record<string, unknown>;
+  const NEW = ["pg_table", "pg_constraint", "pg_routine", "pg_where_frame", "pg_message_class", "sqs_message_id", "sqs_message_count", "sqs_receive_count"];
+  const SERVICE = process.env.OTEL_SERVICE_NAME ?? "96bulls";
+  const DEPLOYMENT = process.env.DEPLOYMENT ?? "selfhost";
+  const DEPLOYMENT_ID = process.env.DEPLOYMENT_ID ?? "local";
+  const MID_A = "059f36b4-87a3-44ab-83d2-661975830a7d";
+  const MID_B = "7d1c2e90-4b5a-4f3e-9c8d-2a1b0c9d8e7f";
+
+  /** The raw JSON lines the real logger writes while `work` runs. */
+  async function rawLines(work: () => Promise<unknown>): Promise<string[]> {
+    const lines: string[] = [];
+    const out = process.stdout.write.bind(process.stdout);
+    const err = process.stderr.write.bind(process.stderr);
+    const grab = (chunk: unknown) => {
+      for (const l of String(chunk).split("\n")) if (l.startsWith("{")) lines.push(l);
+      return true;
+    };
+    process.stdout.write = grab as typeof process.stdout.write;
+    process.stderr.write = grab as typeof process.stderr.write;
+    try {
+      await work();
+    } finally {
+      process.stdout.write = out;
+      process.stderr.write = err;
+    }
+    return lines;
+  }
+  /** The line with its clock-dependent values (ts, duration_ms) fixed, key order and bytes kept. */
+  const normalised = (l: string) => l.replace(/"ts":"[^"]+"/, '"ts":"TS"').replace(/"duration_ms":[0-9]+/, '"duration_ms":0');
+  /** The line as it was before the new fields: those keys removed, the rest in order. */
+  const withoutNew = (l: string) => {
+    const o = JSON.parse(l) as Line;
+    for (const k of NEW) delete o[k];
+    return JSON.stringify(o);
+  };
+  const POINTER_GOLDEN = (code: string) =>
+    `{"ts":"TS","level":"error","service":"${SERVICE}","deployment":"${DEPLOYMENT}","deployment_id":"${DEPLOYMENT_ID}","message":"pointer index failed","stage":"session-indexed","error_code":"${code}","duration_ms":0}`;
+  const SEARCH_GOLDEN = (code: string) =>
+    `{"ts":"TS","level":"error","service":"${SERVICE}","deployment":"${DEPLOYMENT}","deployment_id":"${DEPLOYMENT_ID}","message":"search index failed","stage":"search-index","org_id":"org_1","session_id":"sess_1","error_code":"${code}","duration_ms":0}`;
+
+  /** A synthetic node-postgres DatabaseError raised by the publication guard trigger, with ids in its text. */
+  const pgFenceError = () =>
+    Object.assign(new Error("publication: user fence missing"), {
+      code: "55000",
+      severity: "ERROR",
+      detail: "org_1 ws_1 sess_1 'hello'",
+      where: [
+        "PL/pgSQL function sessions.ingest_publication_guard_pointer() line 14 at RAISE",
+        `SQL statement "UPDATE sessions.session_index SET manifest_key = '${PREFIX}/v1/ws=ws_1' WHERE session_id = 'sess_1'"`,
+        "PL/pgSQL function sessions.upsert_session_index(text,text,text,text,text,bigint) line 40 at SQL statement",
+      ].join("\n"),
+      table: "session_index",
+      routine: "exec_stmt_raise",
+      schema: "sessions",
+    });
+
+  const s3Put = (key: string, sequencer: string) =>
+    JSON.stringify({ Records: [{ eventSource: "aws:s3", eventName: "ObjectCreated:Put", eventTime: AT, s3: { bucket: { name: "bucket" }, object: { key, eTag: "e", sequencer } } }] });
+  /** SQS records exactly as the Lambda event carries them (attributes are decimal strings). */
+  const sqs = (messageId: string, body: string, receive?: string) => ({
+    messageId,
+    body,
+    eventSource: "aws:sqs",
+    attributes: { SentTimestamp: String(Date.parse(AT)), SenderId: "AIDAEXAMPLE", ...(receive === undefined ? {} : { ApproximateReceiveCount: receive }) },
+  });
+
+  function consumer(opts: { upsertError?: () => unknown; searchError?: () => unknown }) {
+    const sb = fakeSupabase(() => []);
+    const query = sb.tx.query.bind(sb.tx);
+    const failing: SqlExecutor = {
+      async query<R>(text: string, params?: unknown[]) {
+        if (opts.upsertError && text.includes("upsert_session_index")) throw opts.upsertError();
+        return query<R>(text, params as never);
+      },
+    };
+    const db = { ...failing, pool: undefined, end: async () => {} } as unknown as HoopDb;
+    const bindings = { PIPELINE_ORG_FROM_PREFIX: "true", PIPELINE_KEY_PREFIX: "96bulls" };
+    const transact: SearchIndexDeps["transact"] = async (work) => {
+      if (opts.searchError) throw opts.searchError();
+      return sb.transact(work);
+    };
+    const deps: ConsumerDeps = {
+      pointer: { db, lock: memoryLock(), reader, exists: async (k) => (await store.head(objectKey(k))) !== undefined, orgs: prefixOrgResolver, allowPrefix: (prefix, org) => prefixAllowed(bindings, prefix, org), fanout: droppedFanout },
+      search: searchDeps(fakeClickHouse().ch, transact),
+    };
+    return deps;
+  }
+  const one = () => writeSession("srv_bb", [event("r1", "1", Date.parse("2026-11-01T10:00:01Z"), "hello")]);
+
+  test("handler path (queueRecords then processBatch): a pointer failure with a pg error carries the diagnostics, the message id and the receive count", async () => {
+    const key = await one();
+    const deps = consumer({ upsertError: pgFenceError });
+    let out: Awaited<ReturnType<typeof processBatch>> | undefined;
+    const lines = await rawLines(async () => {
+      out = await processBatch(queueRecords([sqs(MID_A, s3Put(key, "01"), "3"), sqs(MID_B, s3Put(key, "02"), "5")]), deps);
+    });
+    expect(out!.batchItemFailures.map((f) => f.itemIdentifier).sort()).toEqual([MID_A, MID_B].sort());
+    const failed = lines.filter((l) => l.includes('"message":"pointer index failed"'));
+    expect(failed).toHaveLength(1);
+    const line = JSON.parse(failed[0]!) as Line;
+    expect(line).toMatchObject({
+      error_code: "55000",
+      pg_table: "session_index",
+      pg_routine: "exec_stmt_raise",
+      pg_where_frame: "PL/pgSQL function sessions.ingest_publication_guard_pointer(...) line 14 at RAISE",
+      pg_message_class: "publication_user_fence_missing",
+      sqs_message_id: MID_A,
+      sqs_message_count: 2,
+      sqs_receive_count: 5,
+    });
+    expect("pg_constraint" in line).toBe(false);
+    // Byte-level: the pre-existing fields, in order and unchanged, then only the new ones.
+    const n = normalised(failed[0]!);
+    expect(withoutNew(n)).toBe(POINTER_GOLDEN("55000"));
+    expect(n.startsWith(POINTER_GOLDEN("55000").slice(0, -1) + ",")).toBe(true);
+    expect(Object.keys(line).slice(Object.keys(JSON.parse(POINTER_GOLDEN("55000"))).length).every((k) => NEW.includes(k))).toBe(true);
+    // Nothing of the raw error text, the ids in it, the key or the SQS sender is logged.
+    const text = lines.join("\n");
+    for (const secret of ["user fence missing", "hello", "ws=ws_1", "UPDATE", "upsert_session_index(text", "AIDA", "detail"]) expect(text).not.toContain(secret);
+    expect(failed[0]!).not.toContain("sess_1");
+    expect(failed[0]!).not.toContain("org_1");
+  });
+
+  test("no receive count attribute: sqs_receive_count is omitted; a non-pg error adds no pg field and the line is otherwise as before", async () => {
+    const key = await one();
+    const deps = consumer({ upsertError: () => Object.assign(new Error("socket hang up org_1"), { code: "ECONNRESET" }) });
+    const lines = await rawLines(() => processBatch(queueRecords([sqs(MID_A, s3Put(key, "01"))]), deps));
+    const failed = lines.filter((l) => l.includes('"message":"pointer index failed"'));
+    expect(failed).toHaveLength(1);
+    const line = JSON.parse(failed[0]!) as Line;
+    expect(Object.keys(line).filter((k) => NEW.includes(k))).toEqual(["sqs_message_id", "sqs_message_count"]);
+    expect(line).toMatchObject({ sqs_message_id: MID_A, sqs_message_count: 1 });
+    expect(withoutNew(normalised(failed[0]!))).toBe(POINTER_GOLDEN("ECONNRESET"));
+    expect(failed[0]!).not.toContain("socket hang up");
+  });
+
+  test("a search failure with a pg error carries the same fields; its existing fields are unchanged", async () => {
+    const key = await one();
+    const deadlock = () =>
+      Object.assign(new Error("deadlock detected"), { code: "40P01", where: "SQL statement \"SELECT 'org_1'\"", routine: "DeadLockReport", detail: "Process 1 waits for ShareLock on transaction 2" });
+    const deps = consumer({ searchError: deadlock });
+    let out: Awaited<ReturnType<typeof processBatch>> | undefined;
+    const lines = await rawLines(async () => {
+      out = await processBatch(queueRecords([sqs(MID_B, s3Put(key, "01"), "2")]), deps);
+    });
+    expect(out!.batchItemFailures).toEqual([{ itemIdentifier: MID_B }]);
+    expect(lines.some((l) => l.includes('"message":"pointer indexed"'))).toBe(true);
+    const failed = lines.filter((l) => l.includes('"message":"search index failed"'));
+    expect(failed).toHaveLength(1);
+    expect(JSON.parse(failed[0]!)).toMatchObject({
+      error_code: "40P01",
+      pg_routine: "DeadLockReport",
+      pg_where_frame: "other",
+      pg_message_class: "pg_deadlock_detected",
+      sqs_message_id: MID_B,
+      sqs_message_count: 1,
+      sqs_receive_count: 2,
+    });
+    const n = normalised(failed[0]!);
+    expect(withoutNew(n)).toBe(SEARCH_GOLDEN("40P01"));
+    expect(n.startsWith(SEARCH_GOLDEN("40P01").slice(0, -1) + ",")).toBe(true);
+    expect(failed[0]!).not.toContain("ShareLock");
+    expect(failed[0]!).not.toContain("SELECT");
+  });
+
+  test("the success lines are untouched: no new field on pointer indexed or search index reconciled", async () => {
+    const key = await one();
+    const deps = consumer({});
+    const lines = await rawLines(() => processBatch(queueRecords([sqs(MID_A, s3Put(key, "01"), "1")]), deps));
+    expect(lines.length).toBeGreaterThan(0);
+    for (const l of lines) for (const k of NEW) expect(l).not.toContain(`"${k}"`);
+    expect(lines.join("\n")).not.toContain(MID_A);
   });
 });

@@ -539,14 +539,15 @@ export function invocationDeps(deps: ConsumerDeps, context?: LambdaInvocationCon
   };
 }
 
-type SqsRecord = { messageId: string; body: string; eventSource?: string; attributes?: { SentTimestamp?: unknown } | null };
+type SqsRecord = { messageId: string; body: string; eventSource?: string; attributes?: { SentTimestamp?: unknown; ApproximateReceiveCount?: unknown } | null };
 
 /**
  * The consumer's view of the Lambda's SQS records. Of the message attributes only
- * SentTimestamp is passed on (for the event_age_ms log field); SenderId and the rest stay here.
+ * SentTimestamp (for the event_age_ms log field) and ApproximateReceiveCount (for the
+ * sqs_receive_count field of failure lines) are passed on; SenderId and the rest stay here.
  */
 export function queueRecords(records: readonly SqsRecord[]): QueueRecord[] {
-  return records.map((r) => ({ messageId: r.messageId, body: r.body, sentTimestamp: r.attributes?.SentTimestamp }));
+  return records.map((r) => ({ messageId: r.messageId, body: r.body, sentTimestamp: r.attributes?.SentTimestamp, receiveCount: r.attributes?.ApproximateReceiveCount }));
 }
 
 type LambdaEvent = { Records?: SqsRecord[]; reconcile?: unknown; brief?: unknown; cursor?: string; since?: string; link?: number };
