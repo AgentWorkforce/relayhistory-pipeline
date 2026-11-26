@@ -14,7 +14,7 @@ import { basename, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { parseArgs } from "node:util";
 import type { DirectoryRow, SessionFacts } from "../cloud-harvest/harvest.ts";
-import type { PullRequest } from "../forge/types.ts";
+import type { PrHistory, PullRequest } from "../forge/types.ts";
 import { type Alert, type Context, concurrentEdits, type ForgePr, openPrOverlap, sharedTrigger } from "./detectors.ts";
 import { outcomeFactsBaseline } from "./baseline.ts";
 import { buildModel, communicated, type ObservedPolicy } from "./model.ts";
@@ -81,7 +81,13 @@ export function loadContext(harvest: string, forge: string, observed: ObservedPo
   assertPrivateInput(forge, "dir"); assertPrivateInput(join(forge, "prs"), "dir");
   for (const f of readdirSync(join(forge, "prs")).filter((n) => n.endsWith(".json"))) {
     const repo = `AgentWorkforce/${f.slice(0, -5)}`;
-    for (const p of JSON.parse(readPrivate(join(forge, "prs", f))) as PullRequest[]) prs.push({ ...p, repo });
+    // Dated title and description histories, when fetched (forge `history`), sit beside the PR files.
+    const hist = join(forge, "history", f);
+    const byNumber = new Map(existsSync(hist) ? (JSON.parse(readPrivate(hist)) as PrHistory[]).map((h) => [h.number, h]) : []);
+    for (const p of JSON.parse(readPrivate(join(forge, "prs", f))) as PullRequest[]) {
+      const h = byNumber.get(p.number);
+      prs.push({ ...p, repo, ...(h ? { history: { titles: h.titles, bodies: h.bodies } } : {}) });
+    }
   }
   return { sessions, prs, communicated: communicated(sessions), codingSessions: facts.length, scopes };
 }
@@ -136,6 +142,7 @@ export function freezeTerms(harvest: string, forge: string, labels: string, perH
   const inputs = [
     ...harvest.split(",").filter(Boolean).flatMap((d) => ["directory.jsonl", "facts.jsonl"].map((f) => join(d, f))),
     ...readdirSync(join(forge, "prs")).filter((n) => n.endsWith(".json")).sort().map((n) => join(forge, "prs", n)),
+    ...(existsSync(join(forge, "history")) ? readdirSync(join(forge, "history")).filter((n) => n.endsWith(".json")).sort().map((n) => join(forge, "history", n)) : []),
   ];
   return { sourceHash: sourceHash(), labelsHash: digestFiles([labels]), inputsHash: digestFiles(inputs), perHundred, split: "heldout", observed: "all" };
 }

@@ -4,7 +4,7 @@
  * login; no token is read or stored here. Network only to api.github.com, through `gh`.
  */
 import { spawn } from "node:child_process";
-import type { PullRequest } from "./types.ts";
+import type { PrHistory, PullRequest } from "./types.ts";
 
 function gh(args: string[]): Promise<string> {
   return new Promise((resolve, reject) => {
@@ -68,4 +68,47 @@ export async function fetchRepo(repo: string, since: string, until: string, opts
   });
   await Promise.all(workers);
   return out.sort((a, b) => a.number - b.number);
+}
+
+const HISTORY_BATCH = 20;
+interface RawHistory {
+  number: number; createdAt: string; title: string; body: string;
+  userContentEdits: { nodes: Array<{ editedAt: string; diff: string | null; deletedAt: string | null }> };
+  timelineItems: { nodes: Array<{ __typename: string; createdAt?: string; previousTitle?: string; currentTitle?: string }> };
+}
+
+/** Rebuilds dated title and description histories from one PR's GraphQL record. Pure. */
+export function historyOf(r: RawHistory): PrHistory {
+  const renames = r.timelineItems.nodes.filter((n) => n.__typename === "RenamedTitleEvent" && n.createdAt).sort((a, b) => (a.createdAt! < b.createdAt! ? -1 : 1));
+  const titles = [{ at: r.createdAt, title: renames[0]?.previousTitle ?? r.title }, ...renames.map((n) => ({ at: n.createdAt!, title: n.currentTitle ?? "" }))];
+  // Edits list every version of the description, the original included; with none, it was never edited.
+  const edits = r.userContentEdits.nodes.filter((n) => n.diff !== null && !n.deletedAt).sort((a, b) => (a.editedAt < b.editedAt ? -1 : 1));
+  const bodies = edits.length ? edits.map((n) => ({ at: n.editedAt < r.createdAt ? r.createdAt : n.editedAt, body: n.diff! })) : [{ at: r.createdAt, body: r.body ?? "" }];
+  return { number: r.number, titles, bodies };
+}
+
+/**
+ * Title and description histories for `numbers`, in GraphQL batches. Each PR's last 100 description versions
+ * and first 100 rename events are read; a PR with more is marked by throwing, so a truncated history is never
+ * taken for a complete one.
+ */
+export async function fetchHistories(repo: string, numbers: number[], log: (m: string) => void = () => {}): Promise<PrHistory[]> {
+  const [owner, name] = repo.split("/") as [string, string];
+  const out: PrHistory[] = [];
+  for (let i = 0; i < numbers.length; i += HISTORY_BATCH) {
+    const batch = numbers.slice(i, i + HISTORY_BATCH);
+    if (!batch.every((n) => Number.isSafeInteger(n) && n > 0)) throw new Error("PR numbers must be positive integers");
+    const fields = batch.map((n) => `p${n}: pullRequest(number: ${n}) { number createdAt title body
+      userContentEdits(last: 100) { totalCount nodes { editedAt diff deletedAt } }
+      timelineItems(first: 100, itemTypes: [RENAMED_TITLE_EVENT]) { pageInfo { hasNextPage } nodes { __typename ... on RenamedTitleEvent { createdAt previousTitle currentTitle } } } }`).join("\n");
+    const query = `query($owner: String!, $name: String!) { repository(owner: $owner, name: $name) { ${fields} } }`;
+    const data = JSON.parse(await gh(["api", "graphql", "-f", `query=${query}`, "-F", `owner=${owner}`, "-F", `name=${name}`])) as { data: { repository: Record<string, (RawHistory & { userContentEdits: { totalCount: number }; timelineItems: { pageInfo: { hasNextPage: boolean } } }) | null> } };
+    for (const r of Object.values(data.data.repository)) {
+      if (!r) continue;
+      if (r.userContentEdits.totalCount > 100 || r.timelineItems.pageInfo.hasNextPage) throw new Error(`${repo}#${r.number}: history longer than one page`);
+      out.push(historyOf(r));
+    }
+    if ((i / HISTORY_BATCH) % 25 === 0) log(`${repo}: histories ${out.length}/${numbers.length}`);
+  }
+  return out;
 }

@@ -16,6 +16,20 @@ export interface Commit {
   files: FileChange[];
 }
 
+/**
+ * A PR's title and description as they stood over time (forge.history): each entry holds from `at` until the
+ * next. The first entry is the PR's creation. Rebuilt from title-rename events and the description's edit
+ * history, so an as-of reader can show the text a live system would have seen.
+ */
+export interface PrHistory { number: number; titles: Array<{ at: string; title: string }>; bodies: Array<{ at: string; body: string }> }
+
+/** The entry in effect at `at`, or null before the first. */
+export function asOf<T extends { at: string }>(entries: T[] | undefined, at: string): T | null {
+  let cur: T | null = null;
+  for (const e of entries ?? []) { if (e.at <= at) cur = e; else break; }
+  return cur;
+}
+
 export interface PullRequest {
   number: number;
   author: string;

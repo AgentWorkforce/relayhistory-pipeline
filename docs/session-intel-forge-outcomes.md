@@ -14,6 +14,18 @@ bun run src/session-intel/forge/cli.ts fetch --repo <owner/name> --since <iso> -
 
 `git.ts` reads commits from a local bare mirror with `git log --all --no-renames --name-status`. `--no-renames` keeps a blobless mirror from fetching blobs. The parser is pure and `readCommits` is the only I/O.
 
+## History
+
+```
+bun run src/session-intel/forge/cli.ts history --repo <owner/name> --prs <file.json> --since <iso> --until <iso> --out <history.json>
+```
+
+A PR's title and description as fetched are their final versions, so they leak later edits into anything that claims to know only the past. `history` rebuilds each PR's dated versions through the GraphQL API, in batches of 20, with the same `gh` login:
+- titles from title-rename events (the first rename's previous title is the original);
+- descriptions from the description's edit history, which lists every version including the original.
+
+A PR with neither was never renamed or edited, so its current text is its original. A PR whose history is longer than one page is refused rather than kept truncated. The bench reads these from `<forge>/history/<repo>.json`.
+
 ## Signals
 
 ```

@@ -259,14 +259,18 @@ describe("prefix invariance", () => {
       facts("d", [fact("2026-09-01T11:45:00.000Z", { touched: [{ path: "src/x.ts", via: "patch" }] }), fact("2026-09-01T13:00:00.000Z", { kind: "tool_call", branches: ["b93"] })]),
     ],
     prs: [
-      pr(93, "a", { createdAt: "2026-09-01T10:00:02.000Z", mergedAt: "2026-09-01T14:00:00.000Z", files: ["src/x.ts", "src/y.ts", "src/z.ts", "src/w.ts"], comments: [{ author: "r", at: "2026-09-01T11:10:00.000Z", body: "early" }, { author: "r", at: "2026-09-01T13:30:00.000Z", body: "late" }] }),
+      pr(93, "a", { createdAt: "2026-09-01T10:00:02.000Z", mergedAt: "2026-09-01T14:00:00.000Z", files: ["src/x.ts", "src/y.ts", "src/z.ts", "src/w.ts"], comments: [{ author: "r", at: "2026-09-01T11:10:00.000Z", body: "early" }, { author: "r", at: "2026-09-01T13:30:00.000Z", body: "late" }],
+        history: { titles: [{ at: "2026-09-01T10:00:02.000Z", title: "first title" }, { at: "2026-09-01T12:00:00.000Z", title: "renamed title" }], bodies: [{ at: "2026-09-01T10:00:02.000Z", body: "v1" }, { at: "2026-09-01T13:10:00.000Z", body: "v2" }] } }),
       pr(94, "b", { createdAt: "2026-09-01T12:40:01.000Z", closedAt: "2026-09-01T15:00:00.000Z", files: ["src/x.ts"] }),
     ],
   };
   const cut = (T: string) => ({
     rows: world.rows.filter((r) => String(r.createdAt) <= T),
     facts: world.facts.map((f) => ({ ...f, events: f.events.filter((e) => e.ts <= T) })),
-    prs: world.prs.filter((p) => p.createdAt <= T).map((p) => ({ ...p, mergedAt: p.mergedAt && p.mergedAt <= T ? p.mergedAt : null, closedAt: p.closedAt && p.closedAt <= T ? p.closedAt : null, comments: (p.comments ?? []).filter((c) => c.at <= T) })),
+    prs: world.prs.filter((p) => p.createdAt <= T).map((p) => ({ ...p, mergedAt: p.mergedAt && p.mergedAt <= T ? p.mergedAt : null, closedAt: p.closedAt && p.closedAt <= T ? p.closedAt : null, comments: (p.comments ?? []).filter((c) => c.at <= T),
+      ...(p.history ? { history: { titles: p.history.titles.filter((x) => x.at <= T), bodies: p.history.bodies.filter((x) => x.at <= T) } } : {}),
+      // The current (fetched) title and description are hindsight; a cut world only knows them as of T.
+      title: p.history ? (p.history.titles.filter((x) => x.at <= T).at(-1)?.title ?? p.title) : p.title, body: p.history ? (p.history.bodies.filter((x) => x.at <= T).at(-1)?.body ?? p.body) : p.body })),
   });
   const ctxFrom = (w: { rows: DirectoryRow[]; facts: SessionFacts[]; prs: ForgePr[] }) => ctxOf(w.rows, w.facts, w.prs);
   const key = (a: { detector: string; sides: string[]; at: string; score: number }) => `${a.detector} ${a.sides.join(",")} ${a.at} ${a.score}`;
@@ -292,5 +296,29 @@ describe("prefix invariance", () => {
         expect(describePair(ctxFrom(cut(T)), sides, T, () => "member", true)).toEqual(describePair(ctxFrom(world), sides, T, () => "member", true));
       }
     }
+  });
+});
+
+describe("dated PR history", () => {
+  test("rebuilds titles from renames and descriptions from edits, and bundles show the version at the alert", async () => {
+    const { historyOf } = await import("../forge/fetch.ts");
+    const h = historyOf({
+      number: 7, createdAt: "2026-09-01T10:00:00Z", title: "final", body: "final body",
+      userContentEdits: { nodes: [{ editedAt: "2026-09-01T12:00:00Z", diff: "second", deletedAt: null }, { editedAt: "2026-09-01T10:00:00Z", diff: "first", deletedAt: null }] },
+      timelineItems: { nodes: [{ __typename: "RenamedTitleEvent", createdAt: "2026-09-01T11:00:00Z", previousTitle: "original", currentTitle: "final" }] },
+    });
+    expect(h.titles).toEqual([{ at: "2026-09-01T10:00:00Z", title: "original" }, { at: "2026-09-01T11:00:00Z", title: "final" }]);
+    expect(h.bodies.map((b) => b.body)).toEqual(["first", "second"]);
+    const never = historyOf({ number: 8, createdAt: "2026-09-01T10:00:00Z", title: "t", body: "b", userContentEdits: { nodes: [] }, timelineItems: { nodes: [] } });
+    expect([never.titles, never.bodies]).toEqual([[{ at: "2026-09-01T10:00:00Z", title: "t" }], [{ at: "2026-09-01T10:00:00Z", body: "b" }]]);
+
+    const { describe: describePair } = await import("../overlap-bench/bundle.ts");
+    const ctx = ctxOf([row("a", "K"), row("b", "W")], [
+      facts("a", [fact("2026-09-01T10:00:00.000Z", { kind: "tool_call", gh: ["pr-create"] }), fact("2026-09-01T10:00:01.000Z", { type: "tool_result", prRefs: ["agentworkforce/relayhistory#7"] })]),
+      facts("b", [fact("2026-09-01T10:30:00.000Z", { touched: [{ path: "src/a.ts", via: "patch" }] })]),
+    ], [pr(7, "a", { createdAt: "2026-09-01T10:00:00.000Z", title: "final", body: "final body", history: { titles: h.titles, bodies: h.bodies } })]);
+    const at = (t: string) => describePair(ctx, ["root:codex:a", "root:codex:b"], t, () => "member", true).sides[0]!.prsCreated[0]!;
+    expect([at("2026-09-01T10:30:00.000Z").title, at("2026-09-01T10:30:00.000Z").body]).toEqual(["original", "first"]);
+    expect([at("2026-09-01T12:30:00.000Z").title, at("2026-09-01T12:30:00.000Z").body]).toEqual(["final", "second"]);
   });
 });

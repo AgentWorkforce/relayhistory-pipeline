@@ -2,6 +2,7 @@
  * Forge outcome mining CLI (docs/session-intel-forge-outcomes.md).
  *
  *   bun run src/session-intel/forge/cli.ts fetch --repo <owner/name> --since <iso> --until <iso> --out <file.json>
+ *   bun run src/session-intel/forge/cli.ts history --repo <owner/name> --prs <file.json> --since <iso> --until <iso> --out <history.json>
  *   bun run src/session-intel/forge/cli.ts mine  --repo <owner/name> --git <mirror.git> --prs <file.json> \
  *     --since <iso> --until <iso> --out <candidates.jsonl>
  *
@@ -11,7 +12,7 @@ import { existsSync, readFileSync, realpathSync, writeFileSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { parseArgs } from "node:util";
-import { fetchRepo } from "./fetch.ts";
+import { fetchHistories, fetchRepo } from "./fetch.ts";
 import { readCommits } from "./git.ts";
 import { collisionNotes, crossIdentityReverts, migrationNumberCollisions, supersededPrs } from "./signals.ts";
 import type { Candidate, PullRequest } from "./types.ts";
@@ -63,7 +64,13 @@ async function main(argv: string[]) {
     const by: Record<string, { all: number; cross: number }> = {};
     for (const c of candidates) { by[c.signal] ??= { all: 0, cross: 0 }; by[c.signal]!.all++; if (c.crossIdentity) by[c.signal]!.cross++; }
     console.log(JSON.stringify({ repo: values.repo, commits: commits.length, prs: prs.length, candidates: by }));
-  } else throw new Error("command must be fetch or mine");
+  } else if (cmd === "history") {
+    if (!values.prs) throw new Error("history needs --prs (the fetch output)");
+    const prs = JSON.parse(readFileSync(values.prs, "utf8")) as PullRequest[];
+    const histories = await fetchHistories(values.repo, prs.map((p) => p.number), (m) => console.error(m));
+    writeFileSync(out, JSON.stringify(histories), { mode: 0o600 });
+    console.log(JSON.stringify({ repo: values.repo, prs: histories.length, renamed: histories.filter((h) => h.titles.length > 1).length, edited: histories.filter((h) => h.bodies.length > 1).length }));
+  } else throw new Error("command must be fetch, mine or history");
 }
 
 if (import.meta.main) main(process.argv.slice(2)).catch((e) => { console.error(`forge: ${(e as Error).message}`); process.exit(1); });

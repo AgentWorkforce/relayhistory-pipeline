@@ -3,12 +3,16 @@
  * function of the model, the forge state and its params, and emits alerts no earlier than its evidence. A side
  * is a work root (`root:<session key>`) or a pull request (`pr:<owner/repo>#<n>`).
  */
-import type { PullRequest } from "../forge/types.ts";
+import type { PrHistory, PullRequest } from "../forge/types.ts";
 import type { Session } from "./model.ts";
 
 export interface Alert { detector: string; sides: [string, string]; at: string; artifact: string; score: number; owners: [string | null, string | null] }
 /** Detectors read only the PR's shape; the description and comments are carried for adjudication bundles. */
-export interface ForgePr extends Pick<PullRequest, "number" | "author" | "createdAt" | "mergedAt" | "closedAt" | "headRef" | "files" | "title">, Partial<Pick<PullRequest, "body" | "comments">> { repo: string }
+export interface ForgePr extends Pick<PullRequest, "number" | "author" | "createdAt" | "mergedAt" | "closedAt" | "headRef" | "files" | "title">, Partial<Pick<PullRequest, "body" | "comments">> {
+  repo: string;
+  /** Dated title and description versions (forge `history`), when fetched; as-of bundles read only these. */
+  history?: Pick<PrHistory, "titles" | "bodies">;
+}
 
 export interface Context {
   sessions: Map<string, Session>;

@@ -85,7 +85,7 @@ With `asOf`, the bundle carries dated facts only, as a live system would have kn
 - comments made before the alert (each comment is dated);
 - the side's own branches, edits and activity up to then, counting only the sessions with dated activity by then.
 
-A PR's title, description and file list are left out, and so are merges and closes. They are known only as fetched, so a later edit would leak hindsight. A judge that reads intent from as-of bundles therefore reads it from branches, edits and dated comments.
+A PR's title and description appear only from dated history (forge `history`), as the version in effect at the alert. As fetched they would leak a later edit, so without history they are left out. File lists, merges and closes are always left out.
 
 **Prefix invariance.** A test runs every detector, the ranker and as-of bundles over a synthetic world and over the same world cut at several times T. Everything said about T must be identical in both. It fails if bundles count later sessions, or if D1 uses ownership established after its alert.
 

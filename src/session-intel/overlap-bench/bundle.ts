@@ -6,6 +6,7 @@
  */
 import type { Context } from "./detectors.ts";
 import type { Session } from "./model.ts";
+import { asOf as asOfEntry } from "../forge/types.ts";
 import { ownersAt, prOwners, prOwnership, prSide } from "./detectors.ts";
 import { pairId } from "./eval.ts";
 
@@ -13,12 +14,14 @@ const MAX_FILES = 40;
 
 interface PrInfo {
   pr: string; author: string; createdAt: string;
-  /** Hindsight bundles only: these are known only as fetched, not as of a time. */
+  /** In hindsight bundles as fetched; in as-of bundles only from dated history, the version in effect at the alert. */
   title?: string; mergedAt?: string | null; closedAt?: string | null; files?: string[] | null;
+  /** As-of bundles: the description in effect at the alert, from dated history only (absent without history). */
+  body?: string;
   /** As-of bundles only: comments made before the alert (each comment is dated). */
   comments?: Array<{ at: string; body: string }>;
 }
-const MAX_COMMENT = 400, MAX_COMMENTS = 5;
+const MAX_COMMENT = 400, MAX_COMMENTS = 5, MAX_BODY = 1500;
 export interface SideInfo {
   side: string;
   kind: "work" | "pr";
@@ -34,8 +37,9 @@ export interface BundleItem { pair: string; at: string; sides: [SideInfo, SideIn
 /**
  * `asOf` describes the pair as a live system would see it when the alert fired, from dated facts only: PRs that
  * existed and that the side owned by then, their author and creation time, comments made before the alert, and
- * the side's own branches, edits and activity up to then. A PR's title, description and file list are left out:
- * they are known only as fetched, so a later edit would leak hindsight; so are merges and closes. Without `asOf`
+ * the side's own branches, edits and activity up to then. A PR's title and description appear only from dated
+ * history (the version in effect at the alert); as fetched they would leak a later edit. File lists, merges and
+ * closes are left out. Without `asOf`
  * the bundle shows titles, files and outcomes, for adjudicating in hindsight what really happened.
  */
 export function describe(ctx: Context, sides: [string, string], at: string, ownerLabel: (u: string | null) => string | null, asOf = false): BundleItem {
@@ -46,7 +50,12 @@ export function describe(ctx: Context, sides: [string, string], at: string, owne
     if (!p || (asOf && p.createdAt > at)) return null;
     const base: PrInfo = { pr: side.slice(3), author: p.author, createdAt: p.createdAt };
     if (!asOf) return { ...base, title: p.title, mergedAt: p.mergedAt, closedAt: p.closedAt, files: p.files?.slice(0, MAX_FILES) ?? null };
-    return { ...base, comments: (p.comments ?? []).filter((c) => c.at <= at).slice(0, MAX_COMMENTS).map((c) => ({ at: c.at, body: c.body.slice(0, MAX_COMMENT) })) };
+    // Title and description only from dated history (forge `history`): the version in effect at the alert.
+    const title = asOfEntry(p.history?.titles, at)?.title, body = asOfEntry(p.history?.bodies, at)?.body;
+    return {
+      ...base, ...(title !== undefined ? { title } : {}), ...(body !== undefined ? { body: body.slice(0, MAX_BODY) } : {}),
+      comments: (p.comments ?? []).filter((c) => c.at <= at).slice(0, MAX_COMMENTS).map((c) => ({ at: c.at, body: c.body.slice(0, MAX_COMMENT) })),
+    };
   };
   const files: Array<Set<string>> = [];
   const info = sides.map((side): SideInfo => {
