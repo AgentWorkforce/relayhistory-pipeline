@@ -16,6 +16,7 @@ import { lstatSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import type { SessionAnalysisSnapshot } from "../../session-analysis/engine/session-analysis-result.ts";
 import type { ForgeFacts, SessionContext } from "../features/types.ts";
+import type { SessionArtifacts } from "../backfill/artifacts.ts";
 
 export const CORPUS_FORMAT = "relayfacts-corpus/1";
 export const CORPUS_BOUNDS = { fileBytes: 512 * 1024 * 1024, lineBytes: 16 * 1024 * 1024, sessions: 50_000, deleteByDays: 30 } as const;
@@ -29,6 +30,8 @@ export interface CorpusSession {
   sessionId: string;
   context: SessionContext;
   snapshot: SessionAnalysisSnapshot;
+  /** Build evidence from the session's canonical events (backfill/artifacts.ts); absent when not harvested. */
+  artifacts?: SessionArtifacts;
 }
 
 export interface CorpusManifest {
@@ -104,7 +107,7 @@ export function loadCorpus(dir: string, now: Date = new Date()): Corpus {
     if (!line.trim()) continue;
     if (Buffer.byteLength(line) > CORPUS_BOUNDS.lineBytes) throw new CorpusError(`sessions.jsonl:${i + 1}: line over bounds`);
     const row = JSON.parse(line) as Record<string, unknown>;
-    only(row, ["source", "sessionId", "context", "snapshot"], `sessions.jsonl:${i + 1}`);
+    only(row, ["source", "sessionId", "context", "snapshot", "artifacts"], `sessions.jsonl:${i + 1}`);
     const snapshot = row.snapshot as SessionAnalysisSnapshot;
     if (typeof row.source !== "string" || typeof row.sessionId !== "string" || !snapshot || snapshot.source !== row.source || snapshot.sessionId !== row.sessionId)
       throw new CorpusError(`sessions.jsonl:${i + 1}: source and sessionId must match the snapshot`);
@@ -114,7 +117,7 @@ export function loadCorpus(dir: string, now: Date = new Date()): Corpus {
     if (seen.size > CORPUS_BOUNDS.sessions) throw new CorpusError("too many sessions");
     const context = (row.context ?? {}) as Record<string, unknown>;
     only(context, ["repo", "branch", "taskRef", "userRole"], `sessions.jsonl:${i + 1} context`);
-    sessions.push({ source: row.source, sessionId: row.sessionId, context: context as SessionContext, snapshot });
+    sessions.push({ source: row.source, sessionId: row.sessionId, context: context as SessionContext, snapshot, ...(row.artifacts ? { artifacts: row.artifacts as SessionArtifacts } : {}) });
   }
   const forge = parseForge(JSON.parse(verified("forge.json")));
   return { manifest, manifestSha256: sha256Hex(manifestBytes), sessions, forge };

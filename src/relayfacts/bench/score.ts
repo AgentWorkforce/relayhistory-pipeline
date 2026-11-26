@@ -76,6 +76,10 @@ export function checkGrounding(corpus: Corpus, features: readonly FeatureRecord[
   for (const s of corpus.sessions) {
     const m = new Map<string, { kind: string; text: string }>();
     for (const r of s.snapshot.evidence?.references ?? []) if (!m.has(r.id)) m.set(r.id, { kind: r.kind, text: collapse(r.summary ?? "") });
+    // Transcript build evidence (backfill/artifacts.ts) is cited as `event:<eventId>` with kind "event".
+    const a = s.artifacts;
+    for (const e of [...(a?.pushes ?? []), ...(a?.commits ?? []), ...(a?.prs ?? []), ...(a?.taskRefs ?? []), ...(a?.files ?? [])])
+      if (!m.has(`event:${e.eventId}`)) m.set(`event:${e.eventId}`, { kind: "event", text: "" });
     refs.set(sessionKeyString(s), m);
   }
   const violations: GroundingViolation[] = [];

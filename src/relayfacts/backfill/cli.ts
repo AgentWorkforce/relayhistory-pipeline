@@ -22,6 +22,7 @@ import { fileURLToPath } from "node:url";
 import { parseArgs } from "node:util";
 import { normalizeRepo } from "../features/extract.ts";
 import { CORPUS_FORMAT, parseForge, sha256Hex } from "../bench/corpus.ts";
+import { extractArtifacts } from "./artifacts.ts";
 import { attributeRepo } from "./locate.ts";
 import { backfillReadSource, backfillSource, directoryRows, tenantRunner, type DirectoryRow } from "./source.ts";
 
@@ -49,6 +50,29 @@ export function rowInRepo(row: Pick<DirectoryRow, "gitRepo" | "projectId">, repo
   });
 }
 
+/** appendFileSync, retried on an interrupted system call (a busy external drive can raise EINTR). */
+function appendLine(path: string, line: string) {
+  for (let attempt = 0; ; attempt++) {
+    try {
+      appendFileSync(path, line);
+      return;
+    } catch (error) {
+      if ((error as { code?: string }).code !== "EINTR" || attempt >= 20) throw error;
+    }
+  }
+}
+
+/** The JSON lines of a resumable log; a torn last line from an interrupted run is ignored. */
+function readLines(path: string): Record<string, unknown>[] {
+  if (!existsSync(path)) return [];
+  const out: Record<string, unknown>[] = [];
+  for (const l of readFileSync(path, "utf8").split("\n")) {
+    if (!l.trim()) continue;
+    try { out.push(JSON.parse(l)); } catch { /* torn line */ }
+  }
+  return out;
+}
+
 const fileName = (row: { harness: string; sessionId: string }) =>
   `${row.harness}__${createHash("sha256").update(`${row.harness}\u0000${row.sessionId}`).digest("hex").slice(0, 24)}.json`;
 
@@ -63,7 +87,7 @@ export async function main(argv: string[]): Promise<number> {
   const [command, ...rest] = argv;
   const { values } = parseArgs({ args: rest, options: {
     repo: { type: "string" }, since: { type: "string" }, until: { type: "string" }, out: { type: "string" },
-    concurrency: { type: "string" }, max: { type: "string" }, "min-events": { type: "string" }, "delete-by": { type: "string" }, forge: { type: "string" },
+    concurrency: { type: "string" }, max: { type: "string" }, "min-events": { type: "string" }, sessions: { type: "string" }, "delete-by": { type: "string" }, forge: { type: "string" },
   } });
   const minEvents = Number(values["min-events"] ?? DEFAULT_MIN_EVENTS);
   const repos = (values.repo ?? "").split(",").map((r) => r.trim().toLowerCase()).filter(Boolean);
@@ -72,8 +96,12 @@ export async function main(argv: string[]): Promise<number> {
   if (command === "seal") {
     const out = outside(values.out ?? "");
     if (!values.since || !values.until || !values["delete-by"] || !values.forge) throw new Error("--since, --until, --delete-by and --forge are required");
-    const lines = readdirSync(join(out, "sessions")).filter((f) => f.endsWith(".json")).sort()
-      .map((f) => JSON.stringify(JSON.parse(readFileSync(join(out, "sessions", f), "utf8"))));
+    const lines = readdirSync(join(out, "sessions")).filter((f) => f.endsWith(".json")).sort().map((f) => {
+      const row = JSON.parse(readFileSync(join(out, "sessions", f), "utf8"));
+      const art = join(out, "artifacts", f);
+      if (existsSync(art)) row.artifacts = JSON.parse(readFileSync(art, "utf8"));
+      return JSON.stringify(row);
+    });
     const corpus = join(out, "corpus");
     mkdirSync(corpus, { recursive: true });
     const sessions = `${lines.join("\n")}\n`;
@@ -117,7 +145,7 @@ export async function main(argv: string[]): Promise<number> {
     const source = backfillReadSource(process.env);
     try {
       const file = join(out, "locate.jsonl");
-      const seen = new Set(existsSync(file) ? readFileSync(file, "utf8").split("\n").filter(Boolean).map((l) => { const r = JSON.parse(l); return `${r.harness}\u0000${r.sessionId}`; }) : []);
+      const seen = new Set(readLines(file).map((r) => `${r.harness}\u0000${r.sessionId}`));
       const rows: DirectoryRow[] = [];
       for await (const row of directoryRows(source.run, source.cfg, values.since, values.until))
         if (!NON_CODING_HARNESSES.has(row.harness) && row.eventCount >= minEvents && !seen.has(`${row.harness}\u0000${row.sessionId}`)) rows.push(row);
@@ -127,6 +155,7 @@ export async function main(argv: string[]): Promise<number> {
       const todo = values.max ? rows.map((r) => ({ r, k: rand() })).sort((a, b) => a.k - b.k).slice(0, Number(values.max)).map((e) => e.r) : rows;
       console.log(JSON.stringify({ event: "start", candidates: rows.length, todo: todo.length }));
       const tally: Record<string, number> = {};
+      let consecutiveFaults = 0;
       await pool(todo, Number(values.concurrency ?? 8), async (row) => {
         let line: Record<string, unknown>;
         try {
@@ -134,13 +163,54 @@ export async function main(argv: string[]): Promise<number> {
           line = { harness: row.harness, sessionId: row.sessionId, lastActivityAt: row.lastActivityAt, status: "ok", ...a, directoryRepo: normalizeRepo(row.gitRepo), directoryProject: row.projectId && !/^[/~]/u.test(row.projectId) ? row.projectId : null };
           tally[`ok:${a.basis}`] = (tally[`ok:${a.basis}`] ?? 0) + 1;
         } catch (error) {
-          const reason = String((error as { reason?: string }).reason ?? (error as { code?: string }).code ?? "error").slice(0, 60);
+          const e = error as { reason?: string; code?: string; name?: string; message?: string };
+          const reason = String(e.reason ?? e.code ?? "error").slice(0, 60);
+          // Name and message only, cut and reduced to a safe character set: never a value from the session.
+          const detail = `${e.name ?? "Error"}: ${String(e.message ?? "")}`.slice(0, 120).replace(/[^A-Za-z0-9_ :.,()-]/gu, "");
+          if (e.reason === undefined) {
+            // An error with no canonical reason is the process's fault (connection, file handles, credentials),
+            // not the session's: it is not recorded as done, and a run of them stops the pass.
+            if (++consecutiveFaults >= 50) throw new Error(`stopping: 50 consecutive process faults; last: ${detail}`);
+            tally[`fault:${detail}`] = (tally[`fault:${detail}`] ?? 0) + 1;
+            return;
+          }
           line = { harness: row.harness, sessionId: row.sessionId, lastActivityAt: row.lastActivityAt, status: "refused", reason };
           tally[`refused:${reason}`] = (tally[`refused:${reason}`] ?? 0) + 1;
         }
-        appendFileSync(file, `${JSON.stringify(line)}\n`);
+        consecutiveFaults = 0;
+        appendLine(file, `${JSON.stringify(line)}\n`);
       });
       console.log(JSON.stringify({ event: "done", tally }));
+      return 0;
+    } finally {
+      await source.close();
+    }
+  }
+
+  if (command === "artifacts") {
+    // Build evidence from each listed session's canonical events (backfill/artifacts.ts). Resumable.
+    if (!values.sessions) throw new Error("--sessions is required");
+    const out = outside(values.out ?? "");
+    mkdirSync(join(out, "artifacts"), { recursive: true });
+    const source = backfillReadSource(process.env);
+    try {
+      const todo = readLines(values.sessions).map((r) => ({ harness: String(r.harness), sessionId: String(r.sessionId), repo: typeof r.repo === "string" ? r.repo : null }))
+        .filter((r) => !existsSync(join(out, "artifacts", fileName(r))));
+      let done = 0, refused = 0, consecutiveFaults = 0;
+      console.log(JSON.stringify({ event: "start", todo: todo.length }));
+      await pool(todo, Number(values.concurrency ?? 8), async (r) => {
+        try {
+          const a = extractArtifacts(await source.canonical(r.harness, r.sessionId), r.repo);
+          writeFileSync(join(out, "artifacts", fileName(r)), JSON.stringify(a));
+          done++; consecutiveFaults = 0;
+        } catch (error) {
+          const e = error as { reason?: string; name?: string; message?: string };
+          if (e.reason === undefined && ++consecutiveFaults >= 50) throw new Error(`stopping: 50 consecutive process faults; last: ${e.name}: ${String(e.message).slice(0, 100)}`);
+          refused++;
+          appendLine(join(out, "artifacts-errors.jsonl"), `${JSON.stringify({ harness: r.harness, sessionId: r.sessionId, reason: e.reason ?? "fault" })}\n`);
+        }
+      });
+      console.log(JSON.stringify({ event: "done", harvested: done, refused }));
       return 0;
     } finally {
       await source.close();
@@ -153,8 +223,17 @@ export async function main(argv: string[]): Promise<number> {
     const source = backfillSource(process.env);
     try {
       const rows: DirectoryRow[] = [];
-      for await (const row of directoryRows(source.run, source.cfg, values.since, values.until))
-        if (!NON_CODING_HARNESSES.has(row.harness) && rowInRepo(row, repos)) rows.push(row);
+      if (values.sessions) {
+        // A located list (locate.jsonl lines): the attributed repository and branch stand in for the directory's.
+        for (const r of readLines(values.sessions)) rows.push({
+          harness: String(r.harness), sessionId: String(r.sessionId), createdAt: String(r.lastActivityAt), lastActivityAt: String(r.lastActivityAt),
+          projectId: null, gitRepo: typeof r.repo === "string" ? `https://github.com/${r.repo}` : null, gitBranch: typeof r.branch === "string" ? r.branch : null,
+          taskTitle: null, parentSessionIds: [], userIds: [], eventCount: 0,
+        });
+      } else {
+        for await (const row of directoryRows(source.run, source.cfg, values.since, values.until))
+          if (!NON_CODING_HARNESSES.has(row.harness) && rowInRepo(row, repos)) rows.push(row);
+      }
       rows.sort((a, b) => (a.createdAt < b.createdAt ? -1 : a.createdAt > b.createdAt ? 1 : 0));
       const todo = rows.filter((r) => !existsSync(join(out, "sessions", fileName(r)))).slice(0, values.max ? Number(values.max) : undefined);
       let done = 0, failed = 0, tokensIn = 0, tokensOut = 0;
@@ -170,7 +249,7 @@ export async function main(argv: string[]): Promise<number> {
               context: { repo: row.gitRepo, branch: row.gitBranch, taskRef: null, userRole: null },
               snapshot: r.snapshot,
             }));
-            appendFileSync(join(out, "analysed.jsonl"), `${JSON.stringify({ harness: row.harness, sessionId: row.sessionId, assumeNoLegacyTurns, inputTokens: r.inputTokens, outputTokens: r.outputTokens, at: new Date().toISOString() })}\n`);
+            appendLine(join(out, "analysed.jsonl"), `${JSON.stringify({ harness: row.harness, sessionId: row.sessionId, assumeNoLegacyTurns, inputTokens: r.inputTokens, outputTokens: r.outputTokens, at: new Date().toISOString() })}\n`);
             done++;
             return;
           } catch (error) {
@@ -179,7 +258,7 @@ export async function main(argv: string[]): Promise<number> {
             // A missing legacy coverage marker is retried once with the operator switch; anything else fails the row.
             if (!assumeNoLegacyTurns && /legacy|coverage|neon/iu.test(`${code} ${reason}`)) continue;
             failed++;
-            appendFileSync(join(out, "errors.jsonl"), `${JSON.stringify({ harness: row.harness, sessionId: row.sessionId, code, reason, assumeNoLegacyTurns })}\n`);
+            appendLine(join(out, "errors.jsonl"), `${JSON.stringify({ harness: row.harness, sessionId: row.sessionId, code, reason, assumeNoLegacyTurns })}\n`);
             return;
           }
         }

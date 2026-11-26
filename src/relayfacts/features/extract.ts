@@ -12,6 +12,7 @@
 import { createHash } from "node:crypto";
 import { scrubText } from "../../shared/vendor.ts";
 import type { AnalysisClaim, SessionAnalysisSnapshot, SessionEvidenceReference } from "../../session-analysis/engine/session-analysis-result.ts";
+import type { SessionArtifacts } from "../backfill/artifacts.ts";
 import type { AskedItem, BuiltItem, EvidencePointer, GapItem, LinkKeys, Quote, RationaleItem, SessionContext, SessionFacts, SessionKey } from "./types.ts";
 import { textCompare } from "./types.ts";
 
@@ -58,6 +59,8 @@ export function repoRelative(path: string): string | null {
   const raw = path.replace(/\\/gu, "/");
   const absolute = /^(?:\/|~|[A-Za-z]:\/)/u.test(raw);
   let parts = raw.split("/").filter((p) => p !== "" && p !== ".");
+  // A leading `~` is the home directory (absolute); anywhere else it, like `..`, is refused.
+  if (parts[0] === "~") parts = parts.slice(1);
   if (parts.some((p) => p === ".." || p === "~")) return null;
   if (absolute) {
     const root = parts.findIndex((p) => SOURCE_ROOTS.has(p.toLowerCase()));
@@ -113,14 +116,47 @@ function usable(ctx: Ctx, claim: AnalysisClaim | undefined, what: string): { tex
   return { text, evidence };
 }
 
-function quotes(ctx: Ctx, evidence: readonly EvidencePointer[]): Quote[] {
+const words = (t: string) => new Set(t.toLowerCase().split(/[^a-z0-9]+/u).filter((w) => w.length > 2));
+
+/**
+ * The run of whole sentences of `message` (whitespace-collapsed) that best matches `intent`, at most
+ * QUOTE_MAX characters: a verbatim substring of the collapsed message. A message's opening is often a
+ * transport or task preamble, so the start of the message is not assumed to be the request.
+ */
+export function bestQuote(message: string, intent: string): string {
+  const text = collapse(message);
+  if (text.length <= QUOTE_MAX) return text;
+  const want = words(intent);
+  const starts = [0, ...[...text.matchAll(/[.!?]\s+(?=\S)/gu)].map((m) => m.index! + m[0].length)];
+  let best = "", bestScore = -1;
+  const overlap = (t: string) => {
+    if (!want.size) return 0;
+    const have = words(t);
+    let shared = 0;
+    for (const w of want) if (have.has(w)) shared++;
+    return shared / want.size;
+  };
+  for (const start of starts) {
+    const candidate = cutWords(text.slice(start), QUOTE_MAX);
+    // The window's match, with a half-weight bonus when its first sentence is itself the match, so a
+    // window that opens with leftover preamble loses to one that opens on the request.
+    const first = /^.*?[.!?](?=\s|$)/u.exec(candidate)?.[0] ?? candidate;
+    const score = overlap(candidate) + 0.5 * overlap(first);
+    if (score > bestScore) { best = candidate; bestScore = score; }
+  }
+  return best;
+}
+
+function quotes(ctx: Ctx, evidence: readonly EvidencePointer[], intent: string): Quote[] {
   const out: Quote[] = [];
+  const seen = new Set<string>();
   for (const p of evidence) {
     if (p.kind !== "human-message" || out.length >= QUOTES_PER_ASKED) continue;
     const ref = ctx.refs.get(p.refId);
-    const text = cutWords(collapse(ref?.summary ?? ""), QUOTE_MAX);
-    if (!text) continue;
+    const text = bestQuote(ref?.summary ?? "", intent);
+    if (!text || seen.has(text)) continue;
     if (!scrubClean(text)) { drop(ctx, "quote_scrub"); continue; }
+    seen.add(text);
     out.push({ text, at: p.at, evidence: p });
   }
   return out;
@@ -159,7 +195,7 @@ function evidenceArtifacts(ctx: Ctx, snapshot: SessionAnalysisSnapshot) {
 }
 
 /** Stage 1: the facts of one session analysis. */
-export function extractSessionFacts(snapshot: SessionAnalysisSnapshot, context: SessionContext = {}): SessionFacts {
+export function extractSessionFacts(snapshot: SessionAnalysisSnapshot, context: SessionContext = {}, artifacts?: SessionArtifacts): SessionFacts {
   const key: SessionKey = { source: snapshot.source, sessionId: snapshot.sessionId };
   const refs = new Map<string, SessionEvidenceReference>();
   for (const ref of snapshot.evidence?.references ?? []) if (!refs.has(ref.id)) refs.set(ref.id, ref);
@@ -176,7 +212,7 @@ export function extractSessionFacts(snapshot: SessionAnalysisSnapshot, context: 
     statuses.push(outcome.status);
     const intent = usable(ctx, outcome.intent, "asked");
     const askedId = intent ? stableId([key, "asked", oi, intent.text]) : null;
-    if (intent && askedId) asked.push({ id: askedId, text: intent.text, quotes: quotes(ctx, intent.evidence), at: earliest(intent.evidence), session: key, outcomeId: outcome.id ?? null, evidence: intent.evidence });
+    if (intent && askedId) asked.push({ id: askedId, text: intent.text, quotes: quotes(ctx, intent.evidence, intent.text), at: earliest(intent.evidence), session: key, outcomeId: outcome.id ?? null, evidence: intent.evidence });
     (outcome.changes ?? []).forEach((change, ci) => {
       const c = usable(ctx, change, "built");
       if (c) built.push({ id: stableId([key, "built", oi, ci, c.text]), kind: "claim", what: c.text, ref: null, at: earliest(c.evidence), session: key, outcomeId: outcome.id ?? null, evidence: c.evidence });
@@ -201,7 +237,7 @@ export function extractSessionFacts(snapshot: SessionAnalysisSnapshot, context: 
   // A session analysed before outcomes existed, or with none: its top-level intents are what was asked.
   if (!outcomes.length) (u?.intents ?? []).forEach((claim, i) => {
     const c = usable(ctx, claim, "asked");
-    if (c) asked.push({ id: stableId([key, "asked-intent", i, c.text]), text: c.text, quotes: quotes(ctx, c.evidence), at: earliest(c.evidence), session: key, outcomeId: null, evidence: c.evidence });
+    if (c) asked.push({ id: stableId([key, "asked-intent", i, c.text]), text: c.text, quotes: quotes(ctx, c.evidence, c.text), at: earliest(c.evidence), session: key, outcomeId: null, evidence: c.evidence });
   });
   (u?.decisions ?? []).forEach((claim, i) => {
     const c = usable(ctx, claim, "decision");
@@ -217,7 +253,29 @@ export function extractSessionFacts(snapshot: SessionAnalysisSnapshot, context: 
     built.push({ id: stableId([key, "commit", sha]), kind: "commit", what: c.branch ? `commit ${sha.slice(0, 12)} on ${c.branch}` : `commit ${sha.slice(0, 12)}`, ref: sha, at: c.at, session: key, outcomeId: null, evidence: [c.p] });
   for (const [url, pr] of [...art.prs].sort((a, b) => textCompare(a[0], b[0])))
     built.push({ id: stableId([key, "pr", url]), kind: "pr", what: `pull request ${url.replace("https://github.com/", "")}`, ref: url, at: pr.at, session: key, outcomeId: null, evidence: [pr.p] });
+  // Build evidence from the transcript itself (backfill/artifacts.ts): cited as `event:<id>` pointers.
+  const eventPointer = (e: { eventId: string; at: string | null }): EvidencePointer => ({ source: key.source, sessionId: key.sessionId, refId: `event:${e.eventId}`, kind: "event", at: e.at });
+  const pushedBranches = new Set<string>();
+  for (const push of artifacts?.pushes ?? []) {
+    const branch = featureBranch(push.branch);
+    if (branch) pushedBranches.add(branch);
+    if (push.sha && !art.commits.has(push.sha)) {
+      art.commits.set(push.sha, { at: push.at, branch, p: eventPointer(push) });
+      built.push({ id: stableId([key, "push", push.repo, push.branch, push.sha]), kind: "commit", what: `pushed ${push.sha.slice(0, 12)} to ${push.branch}`, ref: push.sha, at: push.at, session: key, outcomeId: null, evidence: [eventPointer(push)] });
+    }
+  }
+  for (const c of artifacts?.commits ?? []) if (!art.commits.has(c.sha)) {
+    art.commits.set(c.sha, { at: c.at, branch: c.branch, p: eventPointer(c) });
+    if (c.branch && featureBranch(c.branch)) pushedBranches.add(c.branch);
+    built.push({ id: stableId([key, "commit-line", c.sha]), kind: "commit", what: c.branch ? `commit ${c.sha.slice(0, 12)} on ${c.branch}` : `commit ${c.sha.slice(0, 12)}`, ref: c.sha, at: c.at, session: key, outcomeId: null, evidence: [eventPointer(c)] });
+  }
+  for (const pr of artifacts?.prs ?? []) if (!art.prs.has(pr.url)) {
+    art.prs.set(pr.url, { at: pr.at, p: eventPointer(pr) });
+    built.push({ id: stableId([key, "pr", pr.url]), kind: "pr", what: `pull request ${pr.url.replace("https://github.com/", "")}`, ref: pr.url, at: pr.at, session: key, outcomeId: null, evidence: [eventPointer(pr)] });
+  }
+  for (const b of pushedBranches) art.branches.add(b);
   const files = new Set<string>();
+  for (const f of artifacts?.files ?? []) files.add(f.path);
   for (const f of snapshot.metrics?.filesChanged ?? []) {
     const rel = repoRelative(f.path);
     if (rel) files.add(rel); else drop(ctx, "file_unanchored");
@@ -241,7 +299,7 @@ export function extractSessionFacts(snapshot: SessionAnalysisSnapshot, context: 
     prs: [...art.prs.keys()].sort(textCompare),
     commits: [...art.commits.keys()].sort(textCompare),
     files: [...files].sort(textCompare),
-    taskRefs: context.taskRef ? [context.taskRef] : [],
+    taskRefs: [...new Set([...(context.taskRef ? [context.taskRef] : []), ...(artifacts?.taskRefs ?? []).map((t) => t.ref)])].sort(textCompare),
   };
   const titleText = cutWords(collapse(snapshot.title ?? ""), TITLE_MAX);
   return {
