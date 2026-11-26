@@ -57,7 +57,7 @@
  *                              buffer_receipt call that failed 55P03 / 40P01 / server 57014, with jittered
  *                              exponential pauses (deliver.ts withLockRetry); supersedes INGEST_BUFFER_LOCK_RETRY.
  *                              Anything else refuses (deliver.ts lockRetryBudgetRefusal: a budget the client's
- *                              timeout or the Worker's deadline cannot hold). Not rendered by the Cloudflare stack.
+ *                              timeout or the Worker's deadline cannot hold). Rendered only from sessionIngest.lockRetryBudgetMs
  *   INGEST_INFLIGHT_LEASE      unset/empty/anything else = off (default) | observe | on (any case, trimmed): a
  *                              per-isolate in-flight lease per signed (org, workspace, user), taken on the HTTP
  *                              sync path before its first ledger call (inflight-lease.ts). observe: nothing is
