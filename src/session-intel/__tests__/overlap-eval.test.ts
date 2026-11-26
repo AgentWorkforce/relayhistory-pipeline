@@ -240,3 +240,45 @@ describe("round 6", () => {
     expect(() => earliestDeleteBy([{ deleteBy: "2026-12-09" }])).toThrow("canonical UTC");
   });
 });
+
+describe("round 7", () => {
+  test("admitted times must be real calendar instants", async () => {
+    const { parseInstant, instantOf } = await import("../cloud-harvest/instant.ts");
+    const { earliestDeleteBy } = await import("../overlap-bench/cli.ts");
+    for (const ok of ["2028-02-29T00:00:00Z", "2026-12-09T00:00:00.900Z", "2026-12-31T23:59:59.123456789Z", "2000-02-29T12:00:00Z"]) expect(Number.isFinite(parseInstant(ok))).toBe(true);
+    for (const bad of ["2099-02-30T00:00:00Z", "2027-02-29T00:00:00Z", "1900-02-29T00:00:00Z", "2026-04-31T00:00:00Z", "2026-13-01T00:00:00Z", "2026-00-10T00:00:00Z",
+      "2026-12-09T24:00:00Z", "2026-12-09T23:60:00Z", "2026-12-09T23:59:60Z", "2026-12-09T00:00:00+00:00", "2026-12-09", "2026-12-09T00:00:00.Z"]) {
+      expect(Number.isNaN(parseInstant(bad))).toBe(true);
+    }
+    expect(() => instantOf("2099-02-30T00:00:00Z", "deleteBy")).toThrow("real calendar date");
+    expect(() => earliestDeleteBy([{ deleteBy: "2099-02-30T00:00:00Z" }])).toThrow("real calendar date");
+  });
+  test("a batch with an impossible deadline, or with non-private key or judge directories, is refused", async () => {
+    const { verifiedBatch } = await import("../overlap-bench/stage2.ts");
+    const { createHash } = await import("node:crypto");
+    const { mkdtempSync, mkdirSync, writeFileSync, chmodSync, cpSync } = await import("node:fs");
+    const { tmpdir } = await import("node:os");
+    const { join } = await import("node:path");
+    const sha = (t: string) => createHash("sha256").update(t).digest("hex");
+    const make = (deleteBy: string) => {
+      const d = mkdtempSync(join(tmpdir(), "b7-")), P = { mode: 0o600 };
+      mkdirSync(join(d, "judge"), { mode: 0o700 }); mkdirSync(join(d, "key"), { mode: 0o700 });
+      const keyText = JSON.stringify([{ pair: "a", truth: "fresh" }]), part = "{}\n", prompt = "p";
+      writeFileSync(join(d, "key", "key.json"), keyText, P); writeFileSync(join(d, "judge", "part-00"), part, P); writeFileSync(join(d, "judge", "prompt-00.txt"), prompt, P);
+      writeFileSync(join(d, "judge", "verdicts-00.json"), JSON.stringify([{ pair: "a", verdict: "not_overlap", p_overlap: 0.1 }]), P);
+      const body = { format: "overlap-bench-stage2/3", split: "dev", terms: {}, cutoff: 0.3, promptHash: "x", seed: "s", judge: "j", labelsHash: "l", deleteBy, items: 1, keyHash: sha(keyText), parts: { "part-00": sha(part) }, prompts: { "prompt-00.txt": sha(prompt) } };
+      writeFileSync(join(d, "key", "stage2.json"), JSON.stringify({ ...body, manifestHash: sha(JSON.stringify(body)) }), P);
+      return d;
+    };
+    expect(() => verifiedBatch(make("2099-02-30T00:00:00Z"))).toThrow("delete-by");
+    const ok = make("2099-01-01T00:00:00Z");
+    expect(verifiedBatch(ok).verdicts).toHaveLength(1);
+    // A copied batch whose subdirectories were opened up (0755) is refused before anything in them is read.
+    const copy = join(mkdtempSync(join(tmpdir(), "b7c-")), "batch");
+    cpSync(ok, copy, { recursive: true });
+    chmodSync(copy, 0o700); chmodSync(join(copy, "key"), 0o755);
+    expect(() => verifiedBatch(copy)).toThrow("open to group or others");
+    chmodSync(join(copy, "key"), 0o700); chmodSync(join(copy, "judge"), 0o755);
+    expect(() => verifiedBatch(copy)).toThrow("open to group or others");
+  });
+});

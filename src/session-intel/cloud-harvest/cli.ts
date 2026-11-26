@@ -21,6 +21,7 @@ import { fileURLToPath } from "node:url";
 import { parseArgs } from "node:util";
 import { CloudClient } from "./client.ts";
 import { READERS, type RowBudget, RowCeiling, runHarvest } from "./harvest.ts";
+import { instantOf } from "./instant.ts";
 import { lockDir, outsideRoot, readPrivate, writePrivate } from "./private-fs.ts";
 
 const REPO_ROOT = realpathSync(resolve(fileURLToPath(new URL("../../..", import.meta.url))));
@@ -99,7 +100,7 @@ async function main(argv: string[]) {
   if (!READERS[via].serverSideEventWindow && !values["accept-client-side-window"]) {
     throw new Error(`--via ${via} cannot enforce the event window on the server: it reads each session's whole history and drops events outside the window before derivation. Pass --accept-client-side-window only if the approved read scope allows that.`);
   }
-  const t = (v: string | undefined, n: string) => { if (!v || !Number.isFinite(Date.parse(v))) throw new Error(`--${n} must be an ISO time`); return new Date(v).toISOString(); };
+  const t = (v: string | undefined, n: string) => new Date(instantOf(v, `--${n}`)).toISOString();
   const since = t(values.since, "since"), until = t(values.until, "until"), deleteBy = t(values["delete-by"], "delete-by");
   if (Date.parse(until) <= Date.parse(since) || Date.parse(until) - Date.parse(since) > 120 * DAY) throw new Error("the window must be positive and at most 120 days");
   if (Date.parse(deleteBy) <= Date.now() || Date.parse(deleteBy) - Date.now() > 14 * DAY) throw new Error("--delete-by must be in the next 14 days");

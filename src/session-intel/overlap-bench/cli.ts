@@ -25,6 +25,7 @@ import { type IncidentLabel, type NegativeLabel, score, type Score } from "./sco
 import { components, type Components, rank, rankerGrid, type RankerParams } from "./ranker.ts";
 import { adjudicationSample, type AlertVerdict, ceiling, evaluate, pairId } from "./eval.ts";
 import { describe as describePair } from "./bundle.ts";
+import { instantOf } from "../cloud-harvest/instant.ts";
 import { LOOSE_RANKER, scoreStage2, stage2Batch, verifiedBatch } from "./stage2.ts";
 import { claimOnce, finishOnce, noteOnce, pinScore } from "./once.ts";
 import { assertPrivateFile, assertPrivateInput, outsideRoot, privateDir, readPrivate, writePrivate } from "../cloud-harvest/private-fs.ts";
@@ -35,13 +36,8 @@ const readJsonl = <T>(p: string): T[] => {
   if (text && !text.endsWith("\n")) throw new Error(`${p} ends in a partial record`);
   return text.split("\n").slice(0, -1).map((l, i) => { try { return JSON.parse(l) as T; } catch { throw new Error(`${p} is malformed at line ${i + 1}`); } });
 };
-/** A canonical instant: parses, and is an ISO-8601 UTC time (date, time, optional fraction, Z). */
-const INSTANT = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,9})?Z$/;
-const instant = (v: unknown, what: string): number => {
-  const t = typeof v === "string" && INSTANT.test(v) ? Date.parse(v) : NaN;
-  if (!Number.isFinite(t)) throw new Error(`${what} is not a canonical UTC timestamp`);
-  return t;
-};
+/** Admitted times use the one calendar-validating parser (cloud-harvest/instant.ts). */
+const instant = (v: unknown, what: string): number => instantOf(v, what);
 
 /**
  * Merges several harvests of one workspace (the Cloud routes before the 2026-11-05 storage move, the Reader after

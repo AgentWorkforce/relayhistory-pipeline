@@ -91,7 +91,7 @@ The judge's input is therefore more than PR text. It includes session-derived fa
 
 **Prefix invariance.** A test runs every detector (the shipped baseline included), the ranker and as-of bundles over a synthetic world and over the same world cut at several times T. Everything said about T must be identical in both. It fails if bundles count later sessions, or if D1 uses ownership established after its alert.
 
-**Harvest scopes.** `loadContext` reads each harvest's manifest. Merged harvests must be of one workspace, and none may be past its delete-by. Every input (harvest, forge, labels, verdicts, owner labels, frozen file) and every output must pass the same private-destination checks as the harvest. Scope times are validated as canonical UTC instants and compared as instants, failing closed. JSON-lines inputs are read strictly: a malformed line or a partial last record is refused, never skipped.
+**Harvest scopes.** `loadContext` reads each harvest's manifest. Merged harvests must be of one workspace, and none may be past its delete-by. Every input (harvest, forge, labels, verdicts, owner labels, frozen file) and every output must pass the same private-destination checks as the harvest. Scope times are validated as canonical UTC instants with real calendar dates (`cloud-harvest/instant.ts`, the one parser for every admitted time; February 30 or 24:00 are refused, not rolled over) and compared as instants, failing closed. JSON-lines inputs are read strictly: a malformed line or a partial last record is refused, never skipped.
 
 ## Protocol
 
@@ -120,7 +120,7 @@ The judge's input is therefore more than PR text. It includes session-derived fa
    - Receipts are written before the record is finished, so an exit in between only repeats the same deterministic run.
    - A stage-2 score pins the digest of its validated verdicts and its result in the record before any receipt is published. A resumed scoring, from any directory, must present the same verdicts, and republishes the pinned result.
    - The labels v2 held-out was spent before this identity existed, and is recorded as done under both its earlier and its byte identity.
-7. A stage-2 batch carries the earliest delete-by of the data it was drawn from, compared as instants. `stage2-score` first checks that the batch directory is a private destination outside the repository and that the batch is within its delete-by, and only then opens any part, prompt or verdict.
+7. A stage-2 batch carries the earliest delete-by of the data it was drawn from, compared as instants. `stage2-score` first checks that the batch directory and its `key/` and `judge/` subdirectories are private, owned, real directories outside the repository and that the batch is within its delete-by, and only then opens any part, prompt or verdict.
 
 ## Findings so far (dev split)
 

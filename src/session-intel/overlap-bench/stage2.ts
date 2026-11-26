@@ -10,7 +10,8 @@ import type { Alert, Context } from "./detectors.ts";
 import { budgeted, pairId, wilson } from "./eval.ts";
 import { type IncidentLabel, linker } from "./score.ts";
 import { join } from "node:path";
-import { readPrivate } from "../cloud-harvest/private-fs.ts";
+import { assertPrivateInput, readPrivate } from "../cloud-harvest/private-fs.ts";
+import { parseInstant } from "../cloud-harvest/instant.ts";
 
 /** The ranker point that collects candidates for positives: as loose as the ranker goes. */
 export const LOOSE_RANKER = { wOpenPr: 1, wTrigger: 1, wRarity: 1, rarityCap: 3, wAgree: 0, wCrossOwner: 0, threshold: 0.01 } as const;
@@ -106,11 +107,13 @@ export interface BatchManifest {
  */
 export function verifiedBatch(dir: string, now = Date.now()): { manifest: BatchManifest; key: Array<{ pair: string; truth: Truth }>; verdicts: Stage2Verdict[] } {
   const sha = (t: string) => createHash("sha256").update(t).digest("hex");
+  // The batch's directories are private, owned, real directories before anything in them is opened.
+  for (const d of [dir, join(dir, "key"), join(dir, "judge")]) assertPrivateInput(d, "dir");
   const manifest = JSON.parse(readPrivate(join(dir, "key", "stage2.json"))) as BatchManifest;
   const { manifestHash, ...body } = manifest;
   if (manifest.format !== "overlap-bench-stage2/3" || manifestHash !== sha(JSON.stringify(body))) throw new Error("the batch manifest was changed after the batch was made");
   // Retention before anything derived from the data is opened: an expired batch must be deleted, not scored.
-  const deadline = typeof manifest.deleteBy === "string" && /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,9})?Z$/.test(manifest.deleteBy) ? Date.parse(manifest.deleteBy) : NaN;
+  const deadline = parseInstant(manifest.deleteBy);
   if (!(deadline > now)) throw new Error("the batch is past (or has no valid) delete-by; it must be deleted, not scored");
   const keyText = readPrivate(join(dir, "key", "key.json"));
   if (sha(keyText) !== manifest.keyHash) throw new Error("the batch key was changed after the batch was made");

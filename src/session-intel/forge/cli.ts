@@ -13,6 +13,7 @@ import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { parseArgs } from "node:util";
 import { fetchHistories, fetchRepo } from "./fetch.ts";
+import { instantOf } from "../cloud-harvest/instant.ts";
 import { assertPrivateFile, outsideRoot, readPrivate, writePrivate } from "../cloud-harvest/private-fs.ts";
 import { readCommits } from "./git.ts";
 import { collisionNotes, crossIdentityReverts, migrationNumberCollisions, supersededPrs } from "./signals.ts";
@@ -30,8 +31,7 @@ function outsideRepo(path: string): string {
   return abs;
 }
 const iso = (v: string | undefined, name: string) => {
-  if (!v || !Number.isFinite(Date.parse(v))) throw new Error(`--${name} must be an ISO time`);
-  return new Date(v).toISOString();
+  return new Date(instantOf(v, `--${name}`)).toISOString();
 };
 
 export function mine(repo: string, commits: Parameters<typeof migrationNumberCollisions>[1], prs: PullRequest[]): Candidate[] {
