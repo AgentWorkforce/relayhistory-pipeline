@@ -3,11 +3,14 @@
  * the session's facts: what was asked (with the person's own words), what was built, the gaps, the
  * rationale, and the keys that link it to other sessions of the same feature.
  *
- * Pure and deterministic. Every stored string passes the scrubber unchanged or is dropped (counted in
- * `dropped`), as in the first-slice extractor. Quotes come only from `human-message` references, at
- * most QUOTE_MAX characters, cut at a word boundary from the start of the message, so every quote is
- * a verbatim substring of the whitespace-collapsed reference text (the benchmark's grounding check).
- * Commits, PRs, branches and migrations are read from the tool evidence itself, never from a claim.
+ * Pure and deterministic. Every stored text (asks, quotes, claims, gaps, decisions, the title) passes the
+ * scrubber unchanged or is dropped (counted in `dropped`), as in the first-slice extractor. Identifiers
+ * (branch names, commit ids, PR URLs, task refs, repository-relative paths, migration names) are kept as
+ * matched by their patterns and are not scrubbed. Quotes come only from `human-message` references, at
+ * most QUOTE_MAX characters, cut at a word boundary, so every quote is a verbatim substring of the
+ * whitespace-collapsed reference text (the benchmark's grounding check). Commits, PRs, branches and
+ * migrations are read from the tool evidence itself, never from a claim; a PR or commit URL the session
+ * only saw is a link key, not build evidence.
  */
 import { createHash } from "node:crypto";
 import { scrubText } from "../../shared/vendor.ts";
@@ -23,6 +26,7 @@ export const TITLE_MAX = 120;
 
 const DEFAULT_BRANCHES = new Set(["main", "master", "trunk", "develop", "head", "origin", "production", "staging"]);
 const SOURCE_ROOTS = new Set(["src", "packages", "apps", "lib", "libs", "services", "crates", "cmd", "internal", "scripts", "docs", "supabase", "flows", "test", "tests", "e2e", "infra", "stacks", "deploy", "runbooks", "config", "docker", "benchmarks", "agent", "macos", "gtk", "desktop-core", "web"]);
+const PR_CREATE = /\bgh\s+pr\s+create\b/u;
 const GITHUB_URL = /https:\/\/github\.com\/([A-Za-z0-9_.-]+)\/([A-Za-z0-9_.-]+)\/(pull\/[0-9]{1,10}|commit\/[0-9a-f]{7,40})(?![A-Za-z0-9_-])/gu;
 const COMMIT_LINE = /^\[([A-Za-z0-9._/-]+)(?: \(root-commit\))? ([0-9a-f]{7,40})\] /gmu;
 const BRANCH_COMMANDS = [
@@ -169,19 +173,26 @@ function quotes(ctx: Ctx, evidence: readonly EvidencePointer[], intent: string):
 function evidenceArtifacts(ctx: Ctx, snapshot: SessionAnalysisSnapshot) {
   const commits = new Map<string, { at: string | null; branch: string | null; p: EvidencePointer }>();
   const prs = new Map<string, { at: string | null; p: EvidencePointer }>();
+  /** PR and commit URLs the session only saw (a `gh pr list`, a doc, a log): link keys, never build evidence. */
+  const seenPrs = new Set<string>();
+  const seenCommits = new Set<string>();
   const branches = new Set<string>();
+  let creating = false;
   for (const ref of snapshot.evidence?.references ?? []) {
     if (ref.kind !== "tool-result" && ref.kind !== "tool-call") continue;
     const body = `${ref.summary ?? ""}\n${ref.detail ?? ""}`;
+    // A PR is built by this session only as the result of its own `gh pr create`.
+    // (the call's own reference, or a result whose summary names the command).
+    const created = ref.kind === "tool-result" && (creating || PR_CREATE.test(ref.summary ?? ""));
+    if (ref.kind === "tool-call") creating = PR_CREATE.test(body);
+    else creating = false;
     for (const m of body.matchAll(GITHUB_URL)) {
       const [, owner, repo, tail] = m;
       if (tail!.startsWith("pull/")) {
         const url = `https://github.com/${owner}/${repo}/${tail}`.toLowerCase();
-        if (!prs.has(url)) prs.set(url, { at: ref.at ?? null, p: pointer(ref) });
-      } else {
-        const sha = tail!.slice("commit/".length).toLowerCase();
-        if (!commits.has(sha)) commits.set(sha, { at: ref.at ?? null, branch: null, p: pointer(ref) });
-      }
+        if (created && !prs.has(url)) prs.set(url, { at: ref.at ?? null, p: pointer(ref) });
+        else seenPrs.add(url);
+      } else seenCommits.add(tail!.slice("commit/".length).toLowerCase());
     }
     if (ref.kind === "tool-result") for (const m of body.matchAll(COMMIT_LINE)) {
       const branch = featureBranch(m[1]!);
@@ -194,7 +205,7 @@ function evidenceArtifacts(ctx: Ctx, snapshot: SessionAnalysisSnapshot) {
       if (branch) branches.add(branch);
     }
   }
-  return { commits, prs, branches };
+  return { commits, prs, branches, seenPrs, seenCommits };
 }
 
 /** Stage 1: the facts of one session analysis. */
@@ -272,7 +283,8 @@ export function extractSessionFacts(snapshot: SessionAnalysisSnapshot, context: 
     if (c.branch && featureBranch(c.branch)) pushedBranches.add(c.branch);
     built.push({ id: stableId([key, "commit-line", c.sha]), kind: "commit", what: c.branch ? `commit ${c.sha.slice(0, 12)} on ${c.branch}` : `commit ${c.sha.slice(0, 12)}`, ref: c.sha, at: c.at, session: key, outcomeId: null, evidence: [eventPointer(c)] });
   }
-  for (const pr of artifacts?.prs ?? []) if (!art.prs.has(pr.url)) {
+  for (const pr of artifacts?.prs ?? []) if (pr.via !== "created") art.seenPrs.add(pr.url);
+  else if (!art.prs.has(pr.url)) {
     art.prs.set(pr.url, { at: pr.at, p: eventPointer(pr) });
     built.push({ id: stableId([key, "pr", pr.url]), kind: "pr", what: `pull request ${pr.url.replace("https://github.com/", "")}`, ref: pr.url, at: pr.at, session: key, outcomeId: null, evidence: [eventPointer(pr)] });
   }
@@ -309,8 +321,8 @@ export function extractSessionFacts(snapshot: SessionAnalysisSnapshot, context: 
   const keys: LinkKeys = {
     repo: normalizeRepo(context.repo),
     branches: [...new Set([...(branch ? [branch] : []), ...art.branches])].sort(textCompare),
-    prs: [...art.prs.keys()].sort(textCompare),
-    commits: [...new Set([...art.commits.keys(), ...mentionedCommits])].sort(textCompare),
+    prs: [...new Set([...art.prs.keys(), ...art.seenPrs])].sort(textCompare),
+    commits: [...new Set([...art.commits.keys(), ...mentionedCommits, ...art.seenCommits])].sort(textCompare),
     files: [...files].sort(textCompare),
     taskRefs: [...new Set([...(context.taskRef ? [context.taskRef] : []), ...(artifacts?.taskRefs ?? []).map((t) => t.ref)])].sort(textCompare),
     parents: [...new Set((context.parentSessionIds ?? []).filter((p) => p && p !== key.sessionId))].sort(textCompare),

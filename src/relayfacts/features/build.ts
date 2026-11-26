@@ -13,6 +13,8 @@ import type { FeatureRecord, FeatureState, ForgeFacts, SessionFacts } from "./ty
 import { EMPTY_FORGE, sessionKeyString, textCompare } from "./types.ts";
 
 export const ABANDON_AFTER_MS = 21 * 24 * 3_600_000;
+export const MAX_FEATURE_QUOTES = 20;
+export const BRANCH_LEAD_MS = 7 * 24 * 3_600_000;
 
 export interface BuildOptions {
   asOf: string;
@@ -56,8 +58,13 @@ export function deriveState(sessions: readonly SessionFacts[], forge: ForgeFacts
   // A feature's flags: named anywhere in its own text (asks, claims, gaps, decisions, constraints).
   const FLAG = /\b[A-Z][A-Z0-9]*(?:_[A-Z0-9]+)*_ENABLED\b/gu;
   const flags = new Set(built.filter((b) => b.kind === "flag").map((b) => b.ref!));
-  for (const t of sessions.flatMap((s) => [...s.asked.map((a) => a.text), ...s.built.map((b) => b.what), ...s.gaps.map((g) => g.text), ...s.rationale.map((r) => r.text)]))
+  // Settings the docs give a default count too when the feature's text names them (not every gate is `*_ENABLED`).
+  const SETTING = /\b[A-Z][A-Z0-9]*(?:_[A-Z0-9]+)+\b/gu;
+  const documented = new Set(forge.flags.map((f) => f.name));
+  for (const t of sessions.flatMap((s) => [...s.asked.map((a) => a.text), ...s.built.map((b) => b.what), ...s.gaps.map((g) => g.text), ...s.rationale.map((r) => r.text)])) {
     for (const m of t.matchAll(FLAG)) flags.add(m[0]);
+    for (const m of t.matchAll(SETTING)) if (documented.has(m[0])) flags.add(m[0]);
+  }
   const lastActivity = sessions.map((s) => s.endedAt).sort(textCompare).pop() ?? asOf;
   const stale = Date.parse(asOf) - Date.parse(lastActivity) > ABANDON_AFTER_MS;
   const latest = [...sessions].sort((a, b) => textCompare(a.endedAt, b.endedAt)).pop();
@@ -68,7 +75,12 @@ export function deriveState(sessions: readonly SessionFacts[], forge: ForgeFacts
   const commits = forge.commits.filter((c) => shas.has(c.sha) || [...shas].some((s) => c.sha.startsWith(s) || s.startsWith(c.sha)));
   const prs = forge.prs.filter((p) => prUrls.has(p.ref.toLowerCase()) && p.at < asOf);
   const branchNames = new Set(sessions.flatMap((s) => s.keys.branches));
-  const branches = (forge.branches ?? []).filter((b) => branchNames.has(b.name) && b.tipAt < asOf);
+  // A branch counts only for work near or after the feature's first session: a branch cut from main and pushed
+  // with no commits of its own is an ancestor of main at an older tip, which is not this feature landing. The
+  // lead allows for work committed before the first session the corpus holds (a zero lead cut shipped 69 -> 19
+  // on the first corpus, nearly all of them real landings; seven days keeps 52).
+  const firstStart = sessions.map((s) => s.startedAt).sort(textCompare)[0] ?? asOf;
+  const branches = (forge.branches ?? []).filter((b) => branchNames.has(b.name) && b.tipAt < asOf && b.tipAt >= new Date(Date.parse(firstStart) - BRANCH_LEAD_MS).toISOString());
   const merges = [
     ...prs.filter((p) => p.state === "merged" && p.mergedAt && p.mergedAt < asOf).map((p) => ({ at: p.mergedAt!, what: `merged ${p.ref.replace("https://github.com/", "")}` })),
     ...commits.filter((c) => c.onDefaultBranch && c.at < asOf).map((c) => ({ at: c.at, what: `commit ${c.sha.slice(0, 12)} on the default branch` })),
@@ -146,7 +158,13 @@ export function buildFeatures(all: readonly SessionFacts[], options: BuildOption
     const founding = sessions[0]!;
     const keys = new Set(sessions.map((s) => sessionKeyString(s)));
     const state = deriveState(sessions, forge, options.asOf);
-    const asked = sessions.flatMap((s) => s.asked);
+    // At most MAX_FEATURE_QUOTES quotes per feature (docs, "Policy changes"), earliest asks first.
+    let quoteBudget = MAX_FEATURE_QUOTES;
+    const asked = sessions.flatMap((s) => s.asked).map((a) => {
+      const quotes = a.quotes.slice(0, Math.max(0, quoteBudget));
+      quoteBudget -= quotes.length;
+      return quotes.length === a.quotes.length ? a : { ...a, quotes };
+    });
     const times = sessions.flatMap((s) => [s.startedAt, s.endedAt]).sort(textCompare);
     return {
       id: stableId(["feature", founding.source, founding.sessionId]),

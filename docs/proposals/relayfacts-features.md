@@ -50,7 +50,7 @@ In `SessionSemanticAnalysis` (`src/session-analysis/engine/session-analysis-resu
 
 - **Human words are stored.** A record may quote what a person said, as bounded, scrubbed excerpts
   taken only from `human-message` references of the cited session: at most 300 characters per quote
-  and at most 20 quotes per feature. A quote the scrubber would change is dropped, as decisions are
+  and at most 20 quotes per feature (3 per asked item). A quote the scrubber would change is dropped, as decisions are
   today. The existing per-session and per-user erase must remove quotes with their evidence; no
   quote outlives its session's erase.
 - **The backfill has an upfront model cost.** It runs one analysis per qualifying session under its
@@ -97,8 +97,7 @@ must cite evidence ids that the scorer checks.
    - the same PR or branch;
    - commits that reference each other;
    - overlapping file sets in the same repository within a time window;
-   - intent similarity, and only as a tiebreaker.
-
+   - intent similarity, and only as a tiebreaker (not implemented);
    - a small delegation family: a parent session and the sessions it spawned (the directory's
      `parent_session_ids`), while the family has at most 12 members.
 
@@ -113,14 +112,23 @@ must cite evidence ids that the scorer checks.
      forge branch that holds it, when at most two branches do.
    - Review rounds of one branch (`-r2`, `-v3`) share a key. A branch name cut off mid-word never links.
 3. **State.** Rules over the linked evidence, latest evidence first:
-   - a revert after a merge gives `regressed`, or `superseded` when a linked replacement exists;
-   - merged, with the flag default off, gives `shipped_off`; merged and on gives `shipped`;
-   - open `remaining` items after a merge give `partial`;
+   - a revert after a merge gives `regressed` (a linked replacement giving `superseded` is not
+     implemented; only analyses whose every outcome is superseded give it today);
+   - merged, with the flag default off, gives `shipped_off`; merged and on gives `shipped`. A flag the
+     docs do not list defaults off (this repository's rule for new behaviour);
+   - an `unmet` ask in the latest session after a merge gives `partial`. Open `remaining` items do
+     not: almost every analysis lists follow-ups;
    - commits but no merge give `in_progress`;
    - no activity for 21 days with no merge gives `abandoned`;
    - asked but nothing built gives `planned`.
 
-   The rule that fired is the `stateReason`.
+   The rule that fired is the `stateReason`. A branch, PR or commit counts as built only when the
+   session made it (a push, a commit line, its own `gh pr create`); one it only listed or viewed is
+   a link key. A branch whose tip predates the feature's first session is not its landing.
+
+   **As-of limits.** Session facts are cut at `asOf`, but the forge facts are the mirror's state when
+   the corpus was sealed: branch commit lists, flag defaults and base commits are not replayed. A key a
+   session only mentions has no time of its own and counts from the session's start.
 4. **Asked against built.** Each asked item is matched to the built items that answer it, or marked
    `unmet`. Contradictions and unverified outcomes carry over as gaps.
 5. **Render and export.** Markdown per feature plus an index page, escaped exactly like the
@@ -133,8 +141,16 @@ must cite evidence ids that the scorer checks.
 - **Frame:** every session of the workspace, from the session directory.
 - **Qualifying sessions:** a coding harness, at least one root human message, and a repository or
   project.
-- **Analysis:** request one through `POST /v1/sessions/:sessionId/analysis`, or reuse a current one
-  through `GET`. The job is resumable and budgeted per day, and records which sessions it analysed.
+- **Analysis (target):** request one through `POST /v1/sessions/:sessionId/analysis`, or reuse a
+  current one through `GET`, resumable and budgeted per day.
+- **Analysis (the benchmark prototype, `src/relayfacts/backfill/`):** the read API does not yet serve
+  these analyses, so the prototype reads what the read API reads, with its credentials, and runs the
+  pipeline's own `processSessionAnalysis` locally with the pinned versions. Khaliq approved this on
+  2026-11-25, read-only and for the benchmark only: the read API role (`bulls96_read_api`, tenant-bound
+  `READ ONLY` transactions through its `SECURITY DEFINER` readers, TLS verified against the pinned
+  trust), the transcript store's read key, and a model key for local analyses. Credentials come from
+  the environment and are deleted from it on read; nothing is written back. It is resumable and
+  bounded by `--max`, not by a daily budget. Every output path must be outside the repository.
 - **Build:** run stages 1 to 5 over the results, oldest first, so the timeline reads in order.
 - **Afterwards:** each newly analysed session goes through the same stages incrementally.
 
@@ -212,7 +228,10 @@ on the held-out repository.
   deterministic implementations.
 - `src/relayfacts/bench/`: the corpus format and loader, the gold-label format, the scorer (every
   metric above), and a CLI to run and score.
-- `src/relayfacts/backfill/`: the budgeted, resumable backfill client against the read API.
+- `src/relayfacts/backfill/`: the read-only, resumable backfill: `survey`, `locate` (repository
+  attribution), `artifacts` (build evidence from the transcript), `analyse`, `parents`, `seal`, and
+  `forge.ts` (forge facts from a git mirror and `gh`).
+- `src/relayfacts/out-path.ts`: the guard every tool's output goes through.
 
 Tests use synthetic corpora only.
 

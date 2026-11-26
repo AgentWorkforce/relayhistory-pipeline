@@ -39,6 +39,8 @@ export function repoNameFromCwd(cwd: unknown): string | null {
   if (dot > 0) return parts[dot - 1]!.toLowerCase();
   const wt = parts.findIndex((p) => p === "worktrees");
   if (wt >= 0 && parts.length > wt + 2) return parts[wt + 1]!.toLowerCase();
+  // A home directory (/Users/<name>, /home/<name>) is a person, not a repository.
+  if (parts.length <= 2 && (parts[0] === "Users" || parts[0] === "home")) return null;
   const last = parts[parts.length - 1]?.toLowerCase();
   return last && !GENERIC_DIRS.has(last) && !last.startsWith(".") ? last : null;
 }

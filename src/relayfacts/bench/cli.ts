@@ -7,27 +7,19 @@
  *   bun run src/relayfacts/bench/cli.ts score   --corpus <dir> --gold <file> --features <file> --out <dir>
  *   bun run src/relayfacts/bench/cli.ts packets --features <file> --out <dir> [--seed <n>] [--limit <n>]
  */
-import { mkdirSync, readFileSync, realpathSync, writeFileSync } from "node:fs";
-import { join, resolve, sep } from "node:path";
-import { fileURLToPath } from "node:url";
+import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { join } from "node:path";
 import { parseArgs } from "node:util";
 import { buildFeatures } from "../features/build.ts";
 import { extractSessionFacts } from "../features/extract.ts";
 import { renderFeature, renderIndex } from "../features/render.ts";
 import type { FeatureRecord } from "../features/types.ts";
 import { loadCorpus } from "./corpus.ts";
+import { outsideDir } from "../out-path.ts";
 import { parseGold } from "./gold.ts";
 import { adjudicationPackets, scoreRun } from "./score.ts";
 
-const REPO_ROOT = realpathSync(resolve(fileURLToPath(new URL("../../..", import.meta.url))));
-
-function outDir(path: string | undefined): string {
-  if (!path) throw new Error("--out is required");
-  mkdirSync(path, { recursive: true });
-  const real = realpathSync(path);
-  if (real === REPO_ROOT || real.startsWith(REPO_ROOT + sep)) throw new Error("--out must be outside this repository");
-  return real;
-}
+const outDir = (path: string | undefined) => outsideDir(path);
 
 export function main(argv: string[]): number {
   const [command, ...rest] = argv;

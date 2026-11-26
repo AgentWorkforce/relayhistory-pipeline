@@ -9,7 +9,9 @@
  *
  *   push       `To <remote>` followed by `<old>..<new>  <src> -> <dst>` or `* [new branch] <src> -> <dst>`
  *   commit     `[<branch> <sha>] <subject>` (git commit without -q)
- *   pr         a github.com pull URL, kept only for a repository the session pushed to or is attributed to
+ *   pr         a github.com pull URL, kept only for a repository the session pushed to or is attributed to;
+ *              `created` when it is the result of the session's own `gh pr create`, else `mention` (a listed or
+ *              viewed PR: a link key, never build evidence)
  *   task       `Delegated task <id>` in a user or history event (never the generic `startup-*` ids)
  *   files      the events' files_touched, anchored at the repository root
  */
@@ -20,7 +22,8 @@ export interface ArtifactEvent { eventId: string; at: string | null }
 export interface SessionArtifacts {
   pushes: Array<ArtifactEvent & { repo: string; branch: string; sha: string | null }>;
   commits: Array<ArtifactEvent & { sha: string; branch: string | null }>;
-  prs: Array<ArtifactEvent & { url: string }>;
+  /** `via` is absent in corpora harvested before it existed: read as `mention`. */
+  prs: Array<ArtifactEvent & { url: string; via?: "created" | "mention" }>;
   taskRefs: Array<ArtifactEvent & { ref: string }>;
   files: Array<ArtifactEvent & { path: string }>;
   /** Feature branches the session created or pushed (`command`) or was told to work on or review (`mention`). */
@@ -37,9 +40,10 @@ const BRANCH_COMMANDS = [
 const BRANCH_MENTION = /\b[Bb]ranch(?: under review)?[:\s]+`?([A-Za-z0-9._-]+\/[A-Za-z0-9._/-]*[A-Za-z0-9_-])`?/gu;
 
 const PUSH_BLOCK = /To ((?:https:\/\/|git@)github\.com[:/][A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+?(?:\.git)?)\s*\n((?:[ \t]+[^\n]*\n?)+)/gu;
-const PUSH_LINE = /^\s+(?:\+?\s*([0-9a-f]{7,40})\.\.\.?([0-9a-f]{7,40})|\*\s+\[new (?:branch|tag)\])\s+([A-Za-z0-9._/-]+)\s+->\s+([A-Za-z0-9._/-]+)/gmu;
+const PUSH_LINE = /^\s+(?:\+?\s*([0-9a-f]{7,40})\.\.\.?([0-9a-f]{7,40})|\*\s+\[new branch\])\s+([A-Za-z0-9._/-]+)\s+->\s+([A-Za-z0-9._/-]+)/gmu;
 const COMMIT_LINE = /^\[([A-Za-z0-9._/-]+)(?: \(root-commit\))? ([0-9a-f]{7,40})\] /gmu;
 const PR_URL = /https:\/\/github\.com\/([A-Za-z0-9_.-]+)\/([A-Za-z0-9_.-]+)\/pull\/([0-9]{1,10})(?![0-9A-Za-z_-])/gu;
+const PR_CREATE = /\bgh\s+pr\s+create\b/u;
 const TASK = /Delegated task ([A-Za-z0-9][A-Za-z0-9._:-]{2,127})/gu;
 const DEFAULT_BRANCH = /^(?:main|master|trunk|HEAD)$/u;
 
@@ -55,7 +59,9 @@ export function extractArtifacts(rows: ReadonlyArray<{ table: string; row: Recor
     seen.branches.add(branch);
     out.branches.push({ ...ev, branch, via });
   };
-  const prCandidates: Array<ArtifactEvent & { url: string; repo: string }> = [];
+  const prCandidates: Array<ArtifactEvent & { url: string; repo: string; via: "created" | "mention" }> = [];
+  // The result of a `gh pr create` call is the created PR's URL; any other PR URL is only seen.
+  let creating = false;
   for (const { table, row } of rows) {
     if (table !== "convergence_events") continue;
     const ev: ArtifactEvent = { eventId: String(row.event_id ?? ""), at: timeOf(row.ts) };
@@ -81,8 +87,10 @@ export function extractArtifacts(rows: ReadonlyArray<{ table: string; row: Recor
         seen.commits.add(sha);
         out.commits.push({ ...ev, sha, branch: DEFAULT_BRANCH.test(m[1]!) ? null : m[1]! });
       }
-      for (const m of body.matchAll(PR_URL)) prCandidates.push({ ...ev, url: `https://github.com/${m[1]}/${m[2]}/pull/${m[3]}`.toLowerCase(), repo: `${m[1]}/${m[2]}`.toLowerCase() });
+      for (const m of body.matchAll(PR_URL)) prCandidates.push({ ...ev, url: `https://github.com/${m[1]}/${m[2]}/pull/${m[3]}`.toLowerCase(), repo: `${m[1]}/${m[2]}`.toLowerCase(), via: creating ? "created" : "mention" });
+      creating = false;
     }
+    if (type === "tool_call" || row.kind === "tool_call") creating = PR_CREATE.test(body);
     if (type === "tool_call" || row.kind === "tool_call") for (const re of BRANCH_COMMANDS) for (const m of body.matchAll(re)) addBranch(ev, m[1]!, "command");
     if (type === "user" || type === "history") for (const m of body.matchAll(BRANCH_MENTION)) addBranch(ev, m[1]!, "mention");
     if (type === "user" || type === "history") for (const m of body.matchAll(TASK)) {
@@ -100,9 +108,14 @@ export function extractArtifacts(rows: ReadonlyArray<{ table: string; row: Recor
   }
   const repos = new Set([...out.pushes.map((p) => p.repo), ...(attributedRepo ? [attributedRepo] : [])]);
   for (const pr of prCandidates) {
-    if (!repos.has(pr.repo) || seen.prs.has(pr.url) || out.prs.length >= ARTIFACT_BOUNDS.prs) continue;
+    if (!repos.has(pr.repo) || out.prs.length >= ARTIFACT_BOUNDS.prs) continue;
+    if (seen.prs.has(pr.url)) {
+      // A PR first seen and later created by this session is created.
+      if (pr.via === "created") for (const p of out.prs) if (p.url === pr.url) p.via = "created";
+      continue;
+    }
     seen.prs.add(pr.url);
-    out.prs.push({ eventId: pr.eventId, at: pr.at, url: pr.url });
+    out.prs.push({ eventId: pr.eventId, at: pr.at, url: pr.url, via: pr.via });
   }
   return out;
 }

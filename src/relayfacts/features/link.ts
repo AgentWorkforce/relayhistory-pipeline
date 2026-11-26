@@ -34,6 +34,8 @@ export interface LinkParams {
   maxSessionBranches: number;
   /** The same for commits: a session naming more commits than this (a release, a lander's queue) links on none. */
   maxSessionCommits: number;
+  /** The same for pull requests (a `gh pr list` names dozens). */
+  maxSessionPrs: number;
 }
 
 export const DEFAULT_LINK_PARAMS: LinkParams = {
@@ -44,6 +46,7 @@ export const DEFAULT_LINK_PARAMS: LinkParams = {
   maxKeyFanout: 12,
   maxSessionBranches: 4,
   maxSessionCommits: 4,
+  maxSessionPrs: 4,
 };
 
 export interface LinkResult {
@@ -103,7 +106,7 @@ export function linkSessions(facts: readonly SessionFacts[], params: LinkParams 
   const scoped = (f: SessionFacts, values: string[]) => values.map((v) => `${f.keys.repo ?? ""}\u0001${v}`);
   const branchKeys = (f: SessionFacts) => [...new Set(f.keys.branches.map(branchStem).filter((b): b is string => b !== null))];
   index("task", (f) => f.keys.taskRefs);
-  index("pr", (f) => f.keys.prs);
+  index("pr", (f) => (f.keys.prs.length <= params.maxSessionPrs ? f.keys.prs : []));
   index("branch", (f) => (f.keys.repo && f.keys.branches.length <= params.maxSessionBranches ? scoped(f, branchKeys(f)) : []));
   // Commit ids are written at different lengths (push output, briefs, logs): link on the 7-character prefix.
   index("commit", (f) => {

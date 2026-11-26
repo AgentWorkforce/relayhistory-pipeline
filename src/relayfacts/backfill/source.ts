@@ -18,6 +18,7 @@ import pg from "pg";
 import { rawStoreFromEnv } from "../../../packages/pipeline/src/lib/pipeline/adapter.ts";
 import { canonicalProducerSnapshot } from "../../session-read-api/canonical.ts";
 import { TENANT_SETTINGS_SQL, type TenantRunner } from "../../session-read-api/liveness.ts";
+import { postgresTlsOptions } from "../../shared/postgres-tls.ts";
 import { sqlCanonicalPointers } from "../../session-read-api/session-timing-source.ts";
 import { sqlSessionHarnesses } from "../../session-read-api/session-turns-source.ts";
 import { createAnalysisTransport } from "../../session-brief/engine/transport.ts";
@@ -147,8 +148,23 @@ export function backfillReadSource(env: NodeJS.ProcessEnv = process.env): Backfi
   return backfillSource(env);
 }
 
-export function backfillSource(env: NodeJS.ProcessEnv = process.env): BackfillSource {
+/**
+ * The tenant and a pool of the read API role, from the environment, which it then leaves: RF_ORG_ID,
+ * RF_WORKSPACE_ID and PGPASSWORD are taken and deleted before any connection is opened (pg reads PGHOST,
+ * PGPORT, PGDATABASE and PGUSER itself, lazily, per connect). TLS is verified against the repository's pinned
+ * trust (shared/postgres-tls.ts, as the read API connects), never unverified.
+ */
+export function readPool(env: NodeJS.ProcessEnv, max: number): { cfg: BackfillConfig; pool: pg.Pool } {
   const cfg: BackfillConfig = { orgId: take(env, "RF_ORG_ID"), workspaceId: take(env, "RF_WORKSPACE_ID") };
+  const password = take(env, "PGPASSWORD");
+  const pool = new pg.Pool({ max, password, ssl: postgresTlsOptions(env), idleTimeoutMillis: 30_000 });
+  // An idle client's error (a dropped connection) surfaces on the next query, not as a process crash.
+  pool.on("error", () => {});
+  return { cfg, pool };
+}
+
+export function backfillSource(env: NodeJS.ProcessEnv = process.env): BackfillSource {
+  const { cfg, pool } = readPool(env, 8);
   const modelKey = take(env, "SESSION_ANALYSIS_OPENAI_API_KEY");
   const keyPrefix = env.PIPELINE_KEY_PREFIX?.trim() || "96bulls";
   const raw = rawStoreFromEnv({
@@ -158,10 +174,6 @@ export function backfillSource(env: NodeJS.ProcessEnv = process.env): BackfillSo
     PIPELINE_RAW_S3_SECRET_ACCESS_KEY: take(env, "PIPELINE_RAW_S3_SECRET_ACCESS_KEY"),
   } as never);
   if (!raw) throw new Error("raw store not configured");
-  // pg reads PGHOST, PGPORT, PGDATABASE and PGUSER itself; the password is taken here so it can leave
-  // the environment before any connection is opened (pg reads the environment lazily, per connect).
-  const password = take(env, "PGPASSWORD");
-  const pool = new pg.Pool({ max: 8, password, ssl: { rejectUnauthorized: false }, idleTimeoutMillis: 30_000 });
   const run = tenantRunner(pool);
   const pointers = sqlCanonicalPointers(run);
   const harnesses = sqlSessionHarnesses(run);

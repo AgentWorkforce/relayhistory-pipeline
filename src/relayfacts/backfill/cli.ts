@@ -9,36 +9,32 @@
  * SESSION_ANALYSIS_OPENAI_API_KEY (analyse only).
  *
  *   survey  --repo <owner/name>[,<alias>...] --since <iso> --until <iso>
- *   analyse --repo ... --since ... --until ... --out <dir> [--concurrency 4] [--max <n>]
+ *   locate    --repo ... --since ... --until ... --out <dir> [--max <n>] [--min-events 5]   repository attribution, to <out>/locate.jsonl
+ *   artifacts --repo ... --sessions <located.jsonl> --out <dir>   build evidence from each session's transcript
+ *   analyse   --repo ... --since ... --until ... --out <dir> [--concurrency 4] [--max <n>] [--sessions <located.jsonl>]
  *   parents --out <dir> --repo <owner/name>   directory parent_session_ids of every analysed session, to <out>/parents.jsonl
  *   seal    --out <dir> --repo <owner/name> --since ... --until ... --delete-by <iso> --forge <forge.json> [--parents <file>]
  *
  * `analyse` is resumable: each finished session is one file under <out>/sessions/, and a rerun skips
- * it. Failures go to <out>/errors.jsonl with a reason code only, never transcript text.
+ * it. Failures go to <out>/errors.jsonl with the error code only, never a message or transcript text.
  */
 import { createHash, randomUUID } from "node:crypto";
-import { appendFileSync, existsSync, mkdirSync, readdirSync, readFileSync, realpathSync, writeFileSync } from "node:fs";
-import { join, resolve, sep } from "node:path";
-import { fileURLToPath } from "node:url";
+import { appendFileSync, existsSync, mkdirSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
+import { join } from "node:path";
 import { parseArgs } from "node:util";
 import { normalizeRepo } from "../features/extract.ts";
 import { CORPUS_FORMAT, parseForge, sha256Hex } from "../bench/corpus.ts";
 import { extractArtifacts } from "./artifacts.ts";
+import { outsideDir } from "../out-path.ts";
 import { attributeRepo } from "./locate.ts";
-import { backfillReadSource, backfillSource, directoryRows, parentsOf, tenantRunner, type DirectoryRow } from "./source.ts";
+import { backfillReadSource, backfillSource, directoryRows, parentsOf, readPool, tenantRunner, type DirectoryRow } from "./source.ts";
 
-const REPO_ROOT = realpathSync(resolve(fileURLToPath(new URL("../../..", import.meta.url))));
 /** Harnesses that are chats or bots rather than coding agents: never analysed for feature records. */
 export const NON_CODING_HARNESSES = new Set(["grok-bot", "chatgpt", "muse", "muse-assistant", "mcp", "claude-ai", "slack", "relaycast", "company-brain"]);
 /** Sessions with fewer directory events than this hold no feature work worth a record (a one-shot stub). */
 export const DEFAULT_MIN_EVENTS = 5;
 
-function outside(path: string): string {
-  mkdirSync(path, { recursive: true });
-  const real = realpathSync(path);
-  if (real === REPO_ROOT || real.startsWith(REPO_ROOT + sep)) throw new Error("--out must be outside this repository");
-  return real;
-}
+const outside = (path: string) => outsideDir(path);
 
 /** True when the directory row belongs to one of the named repositories (git remote, else the project path's last segment). */
 export function rowInRepo(row: Pick<DirectoryRow, "gitRepo" | "projectId">, repos: readonly string[]): boolean {
@@ -144,9 +140,7 @@ export async function main(argv: string[]): Promise<number> {
 
   if (!values.since || !values.until) throw new Error("--since and --until are required");
   if (command === "survey") {
-    const pg = (await import("pg")).default;
-    const cfg = { orgId: process.env.RF_ORG_ID ?? "", workspaceId: process.env.RF_WORKSPACE_ID ?? "" };
-    const p = new pg.Pool({ max: 2, ssl: { rejectUnauthorized: false } });
+    const { cfg, pool: p } = readPool(process.env, 2);
     const counts: Record<string, { all: number; repo: number }> = {};
     const users = new Map<string, number>();
     let repoRows = 0;
@@ -279,11 +273,12 @@ export async function main(argv: string[]): Promise<number> {
             return;
           } catch (error) {
             const code = (error as { code?: string; message?: string }).code ?? (error as Error).constructor?.name ?? "error";
-            const reason = String((error as Error).message ?? "").slice(0, 80).replace(/[^A-Za-z0-9_ :.-]/gu, "");
             // A missing legacy coverage marker is retried once with the operator switch; anything else fails the row.
-            if (!assumeNoLegacyTurns && /legacy|coverage|neon/iu.test(`${code} ${reason}`)) continue;
+            // The message is only classified, never stored: errors.jsonl holds the error code alone.
+            const legacy = /legacy|coverage/iu.test(`${code} ${String((error as Error).message ?? "")}`);
+            if (!assumeNoLegacyTurns && legacy) continue;
             failed++;
-            appendLine(join(out, "errors.jsonl"), `${JSON.stringify({ harness: row.harness, sessionId: row.sessionId, code, reason, assumeNoLegacyTurns })}\n`);
+            appendLine(join(out, "errors.jsonl"), `${JSON.stringify({ harness: row.harness, sessionId: row.sessionId, code, assumeNoLegacyTurns })}\n`);
             return;
           }
         }
@@ -294,7 +289,7 @@ export async function main(argv: string[]): Promise<number> {
       await source.close();
     }
   }
-  console.error("usage: cli.ts survey|analyse|seal ...");
+  console.error("usage: cli.ts survey|locate|artifacts|analyse|parents|seal ...");
   return 2;
 }
 

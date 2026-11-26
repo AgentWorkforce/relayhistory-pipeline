@@ -10,8 +10,11 @@ import { writeFileSync } from "node:fs";
 import { parseArgs } from "node:util";
 import type { ForgeFacts } from "../features/types.ts";
 import { parseForge } from "../bench/corpus.ts";
+import { outsideFile } from "../out-path.ts";
 
 const git = (dir: string, args: string[]) => execFileSync("git", ["-C", dir, ...args], { encoding: "utf8", maxBuffer: 512 * 1024 * 1024 });
+
+const VALUE_SETTING = /_(?:MS|S|SECONDS|TTL|MODE|PROVIDER|ENGINE|KIND|BUCKET|URL|ID|BYTES|SIZE|COUNT|MAX|MIN)$/u;
 
 /** `FLAG` rows of markdown tables whose cells say the default is on or off. */
 export function flagDefaults(markdown: string): Map<string, boolean> {
@@ -25,13 +28,30 @@ export function flagDefaults(markdown: string): Map<string, boolean> {
     const verdict = cells.slice(2).map((c) => /^(?:default\s+)?(on|off)\b/iu.exec(c)?.[1]?.toLowerCase()).find((v) => v !== undefined);
     if (verdict && !out.has(flag)) out.set(flag, verdict === "on");
   }
+  // Prose: a backticked setting name in the same sentence as "default off" / "defaults to on" / "off by
+  // default" (many gates are not `*_ENABLED`, such as INGEST_LEDGER_LOG_COMMIT). Tables win; the first
+  // prose statement wins over later ones.
+  const prose = new Map<string, boolean>();
+  const text = markdown.split("\n").filter((l) => !l.trimStart().startsWith("|")).join("\n");
+  for (const sentence of text.replace(/\n(?!\n)/gu, " ").split(/(?<=[.;])\s+|\n\n/u)) {
+    const verdict = /\bdefaults?\s+(?:to\s+|is\s+)?(on|off|true|false)\b|\b(on|off)\s+by\s+default\b/iu.exec(sentence);
+    if (!verdict) continue;
+    const on = /^(?:on|true)$/iu.test(verdict[1] ?? verdict[2] ?? "");
+    const names = [...sentence.matchAll(/`([A-Z][A-Z0-9]*(?:_[A-Z0-9]+)+)(?:=[^`]*)?`/gu)].map((m) => m[1]!);
+    // One verdict, one setting: a sentence naming several settings does not say which one it means.
+    // Value settings (a duration, a mode, a provider) are not on/off gates even when "default off" describes them.
+    if (names.length === 1 && !VALUE_SETTING.test(names[0]!) && !prose.has(names[0]!)) prose.set(names[0]!, on);
+  }
+  for (const [name, on] of prose) if (!out.has(name)) out.set(name, on);
   return out;
 }
 
 export function forgeFacts(repo: string, mirror: string, since: string, until: string, defaultBranch = "main"): ForgeFacts {
   const prsRaw = execFileSync("gh", ["pr", "list", "-R", repo, "--state", "all", "--limit", "5000", "--search", `updated:>=${since.slice(0, 10)}`,
     "--json", "url,state,createdAt,mergedAt,closedAt,headRefName"], { encoding: "utf8", maxBuffer: 256 * 1024 * 1024 });
-  const prs = (JSON.parse(prsRaw) as Array<Record<string, string | null>>)
+  const listed = JSON.parse(prsRaw) as Array<Record<string, string | null>>;
+  if (listed.length >= 5000) throw new Error("gh pr list hit its 5000 limit: narrow the window");
+  const prs = listed
     .filter((p) => (p.createdAt ?? "") < until)
     .map((p) => ({
       ref: String(p.url).toLowerCase(),
@@ -71,6 +91,13 @@ export function forgeFacts(repo: string, mirror: string, since: string, until: s
   const mainPatch = new Map<string, string>();
   for (const c of commits) if (c.onDefaultBranch) { const pid = patchOf.get(c.sha); if (pid && !mainPatch.has(pid)) mainPatch.set(pid, c.at); }
   const sh = (cmd: string, ...args: string[]) => { try { return execFileSync("sh", ["-c", cmd, ...args], { encoding: "utf8", maxBuffer: 256 * 1024 * 1024 }).trim(); } catch { return ""; } };
+  let docs = "";
+  try {
+    for (const path of git(mirror, ["ls-tree", "-r", "--name-only", defaultBranch, "--", "docs"]).split("\n").filter((p) => p.endsWith(".md")))
+      docs += git(mirror, ["show", `${defaultBranch}:${path}`]) + "\n";
+  } catch { /* a repository without docs has no flag table */ }
+  const known = flagDefaults(docs);
+  const flags = [...known].map(([name, defaultOn]) => ({ name, defaultOn })).sort((a, b) => (a.name < b.name ? -1 : 1));
   const branches: NonNullable<ForgeFacts["branches"]> = [];
   for (const name of git(mirror, ["for-each-ref", "--format=%(refname:short)", "refs/heads"]).split("\n").filter((b) => b && b !== defaultBranch)) {
     const tipAt = git(mirror, ["log", "-1", "--format=%cI", name]).trim();
@@ -86,17 +113,11 @@ export function forgeFacts(repo: string, mirror: string, since: string, until: s
       const pid = sh(`git -C "$0" diff "$(git -C "$0" merge-base "$2" "$1")" "$1" | git patch-id --stable | cut -d' ' -f1`, mirror, name, defaultBranch);
       if (pid) landedAt = mainPatch.get(pid) ?? null;
     }
-    // Flags the branch introduces: `*_ENABLED` names on added lines of its combined diff.
-    const added = sh(`git -C "$0" diff "$(git -C "$0" merge-base "$2" "$1")" "$1" | grep '^+' | grep -oE '[A-Z][A-Z0-9]*(_[A-Z0-9]+)*_ENABLED' | sort -u`, mirror, name, defaultBranch);
-    const flagsAdded = added.split("\n").filter(Boolean).slice(0, 50);
+    // Flags the branch introduces: `*_ENABLED` names, and settings the docs give a default, on added lines.
+    const added = sh(`git -C "$0" diff "$(git -C "$0" merge-base "$2" "$1")" "$1" | grep '^+' | grep -oE '[A-Z][A-Z0-9]*(_[A-Z0-9]+)+' | sort -u`, mirror, name, defaultBranch);
+    const flagsAdded = added.split("\n").filter((f) => f && (f.endsWith("_ENABLED") || known.has(f))).slice(0, 50);
     branches.push({ name, landed: landedAt !== null, landedAt, tipAt, ...(flagsAdded.length ? { flagsAdded } : {}), ...(own.length ? { commits: own } : {}) });
   }
-  let docs = "";
-  try {
-    for (const path of git(mirror, ["ls-tree", "-r", "--name-only", defaultBranch, "--", "docs"]).split("\n").filter((p) => p.endsWith(".md")))
-      docs += git(mirror, ["show", `${defaultBranch}:${path}`]) + "\n";
-  } catch { /* a repository without docs has no flag table */ }
-  const flags = [...flagDefaults(docs)].map(([name, defaultOn]) => ({ name, defaultOn })).sort((a, b) => (a.name < b.name ? -1 : 1));
   return parseForge({ defaultBranch, prs, commits, flags, branches });
 }
 
@@ -104,6 +125,6 @@ if (import.meta.main) {
   const { values } = parseArgs({ options: { repo: { type: "string" }, git: { type: "string" }, since: { type: "string" }, until: { type: "string" }, out: { type: "string" }, branch: { type: "string" } } });
   if (!values.repo || !values.git || !values.since || !values.until || !values.out) throw new Error("--repo, --git, --since, --until and --out are required");
   const facts = forgeFacts(values.repo, values.git, values.since, values.until, values.branch ?? "main");
-  writeFileSync(values.out, JSON.stringify(facts));
+  writeFileSync(outsideFile(values.out), JSON.stringify(facts));
   console.log(JSON.stringify({ prs: facts.prs.length, commits: facts.commits.length, onDefault: facts.commits.filter((c) => c.onDefaultBranch).length, reverted: facts.commits.filter((c) => c.revertedBy).length, flags: facts.flags.length, branches: facts.branches?.length ?? 0, landedBranches: facts.branches?.filter((b) => b.landed).length ?? 0 }));
 }
