@@ -361,17 +361,7 @@ export function runMarkerBody(ctx: RehearsalContext): string {
 }
 
 function writeRunMarker(aws: AwsRun, i: { bucket: string; prefix: string; ctx: RehearsalContext }): void {
-  const dir = mkdtempSync(join(tmpdir(), "96bulls-marker-"));
-  try {
-    const file = join(dir, "marker");
-    writeFileSync(file, runMarkerBody(i.ctx), { mode: 0o600 });
-    // Only if absent: never overwrite another run's marker.
-    aws(["s3api", "put-object", "--bucket", i.bucket, "--region", i.ctx.region, "--key", runMarkerKey(i.prefix), "--body", file, "--if-none-match", "*", "--output", "json"]);
-  } catch {
-    throw new StateBucketError("state_provenance_mismatch");
-  } finally {
-    rmSync(dir, { recursive: true, force: true });
-  }
+  putMarker(aws, { bucket: i.bucket, region: i.ctx.region, key: runMarkerKey(i.prefix), body: runMarkerBody(i.ctx) });
 }
 
 /** A populated prefix is resumed only when its marker is exactly this run's (run id, lease, pin). */
@@ -466,23 +456,15 @@ export function listStageStateVersions(aws: AwsRun, i: { bucket: string; region:
   throw new StateBucketError("state_teardown_failed");
 }
 
-/**
- * Teardown of this stage's state only: list (above, refusing anything outside the prefix), then
- * DeleteObjects by exact key and version id, at most 1000 per call, rechecking every key against
- * the prefix before each call, and then an independent re-list that must show zero versions and
- * zero delete markers (`state_teardown_not_empty` otherwise) before success is reported.
- * `execute: false` (the default) lists and deletes nothing. Sibling stages and the bucket itself
- * are never touched. Run it only after assertManifestGone has passed.
- */
-export function teardownStageState(aws: AwsRun, i: { bucket: string; region: string; stage: string; execute?: boolean }): { listed: number; deleted: number; remaining: number } {
-  const prefix = rehearsalStatePrefix(i.stage);
-  const all = listStageStateVersions(aws, i);
-  if (!i.execute) return { listed: all.length, deleted: 0, remaining: all.length };
-  let deleted = 0;
-  for (let n = 0; n < all.length; n += 1000) {
-    const batch = all.slice(n, n + 1000);
-    if (!batch.every((o) => o.Key.startsWith(prefix) && o.Key.length > prefix.length)) throw new StateBucketError("state_teardown_outside_prefix");
-    let result: { Errors?: unknown; Deleted?: unknown };
+/** The teardown marker's key: written before the first deletion, deleted last; not `.json`. */
+export const teardownMarkerKey = (prefix: string) => `${prefix}__rehearsal_teardown__.marker`;
+
+/** One DeleteObjects call by exact key and version id, every key rechecked against the prefix. */
+function deleteVersions(aws: AwsRun, i: { bucket: string; region: string; prefix: string }, objects: readonly { Key: string; VersionId: string }[]): void {
+  for (let n = 0; n < objects.length; n += 1000) {
+    const batch = objects.slice(n, n + 1000);
+    if (!batch.every((o) => o.Key.startsWith(i.prefix) && o.Key.length > i.prefix.length)) throw new StateBucketError("state_teardown_outside_prefix");
+    let result: { Errors?: unknown };
     try {
       const text = aws(["s3api", "delete-objects", "--bucket", i.bucket, "--region", i.region, "--output", "json", "--delete", JSON.stringify({ Objects: batch, Quiet: true })]);
       result = text.trim() ? JSON.parse(text) : {};
@@ -490,12 +472,70 @@ export function teardownStageState(aws: AwsRun, i: { bucket: string; region: str
       throw new StateBucketError("state_teardown_failed");
     }
     if (result === null || typeof result !== "object" || (result.Errors !== undefined && !(Array.isArray(result.Errors) && result.Errors.length === 0))) throw new StateBucketError("state_teardown_failed");
-    deleted += batch.length;
   }
+}
+
+/** A marker's current body, or undefined when it does not exist (NoSuchKey); any other failure refuses. */
+function readMarker(aws: AwsRun, i: { bucket: string; region: string; key: string }): string | undefined {
+  try {
+    return aws(["s3", "cp", `s3://${i.bucket}/${i.key}`, "-", "--region", i.region]).trim();
+  } catch (e) {
+    if (/NoSuchKey|\(404\)|Not Found/.test(e instanceof Error ? e.message : String(e))) return undefined;
+    throw new StateBucketError("state_provenance_mismatch");
+  }
+}
+
+/** Write a marker only if absent (PutObject --if-none-match "*"). */
+function putMarker(aws: AwsRun, i: { bucket: string; region: string; key: string; body: string }): void {
+  const dir = mkdtempSync(join(tmpdir(), "96bulls-marker-"));
+  try {
+    const file = join(dir, "marker");
+    writeFileSync(file, i.body, { mode: 0o600 });
+    aws(["s3api", "put-object", "--bucket", i.bucket, "--region", i.region, "--key", i.key, "--body", file, "--if-none-match", "*", "--output", "json"]);
+  } catch {
+    throw new StateBucketError("state_provenance_mismatch");
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+}
+
+/**
+ * Teardown of this stage's state only, ordered so an interrupted run can always resume:
+ *   1. the teardown marker (`teardownMarker`, bound to this teardown's receipts) is written if
+ *      absent, or must already be exactly this teardown's;
+ *   2. every version and delete marker EXCEPT the two markers is deleted; a re-list must then show
+ *      only the markers' versions (else `state_teardown_not_empty`, with the run marker intact);
+ *   3. the run marker's versions, alone; a re-list must then show only the teardown marker;
+ *   4. the teardown marker, last and alone; a final re-list must show nothing.
+ * Every listed key is checked against the exact prefix before anything is deleted. `execute: false`
+ * (the default) lists and deletes nothing. Sibling stages and the bucket are never touched. A claim
+ * cannot interleave: it needs an empty version inventory, and the teardown marker exists until the
+ * very last call. Run it only through runRehearsalTeardown (every check first).
+ */
+export function teardownStageState(aws: AwsRun, i: { bucket: string; region: string; stage: string; execute?: boolean; teardownMarker?: string }): { listed: number; deleted: number; remaining: number } {
+  const prefix = rehearsalStatePrefix(i.stage);
+  const all = listStageStateVersions(aws, i);
+  if (!i.execute) return { listed: all.length, deleted: 0, remaining: all.length };
+  if (i.teardownMarker === undefined) throw new StateBucketError("state_teardown_failed");
+  const run = runMarkerKey(prefix);
+  const td = teardownMarkerKey(prefix);
+  const where = { bucket: i.bucket, region: i.region, prefix };
+  const existing = readMarker(aws, { bucket: i.bucket, region: i.region, key: td });
+  if (existing === undefined) putMarker(aws, { bucket: i.bucket, region: i.region, key: td, body: i.teardownMarker });
+  else if (existing !== i.teardownMarker) throw new StateBucketError("state_provenance_mismatch");
+  const others = listStageStateVersions(aws, i).filter((o) => o.Key !== run && o.Key !== td);
+  deleteVersions(aws, where, others);
+  const afterOthers = listStageStateVersions(aws, i);
+  if (afterOthers.some((o) => o.Key !== run && o.Key !== td)) throw new StateBucketError("state_teardown_not_empty");
+  const runVersions = afterOthers.filter((o) => o.Key === run);
+  deleteVersions(aws, where, runVersions);
+  const afterRun = listStageStateVersions(aws, i);
+  if (afterRun.some((o) => o.Key !== td)) throw new StateBucketError("state_teardown_not_empty");
+  deleteVersions(aws, where, afterRun);
   // Explicit empty-prefix evidence: an independent re-list of versions and delete markers.
   const remaining = listStageStateVersions(aws, i).length;
   if (remaining !== 0) throw new StateBucketError("state_teardown_not_empty");
-  return { listed: all.length, deleted, remaining };
+  return { listed: all.length, deleted: others.length + runVersions.length + afterRun.length, remaining };
 }
 
 /**
@@ -894,6 +934,87 @@ export function rehearsalLeasePolicies(i: { accountId: string; roleArn: string; 
 
 
 /**
+ * The CLEANUP-ONLY session policies of the teardown lease B: deletes of the stage's own resources
+ * (tag-conditioned, the mappings by their exact UUIDs), the exact-name absence reads, the state
+ * prefix's list, reads and deletes, and one put: the teardown marker. No create, update, tag or
+ * invoke action, and an explicit Deny of them. Every Allow ends before B's effective expiry and a
+ * Deny on everything applies at and after it, so the policy (and its digest) carries that expiry.
+ */
+export function rehearsalTeardownPolicies(i: { accountId: string; roleArn: string; roleDisposition: "deleted" | "retained"; expiresAt: string; mappingUuids: readonly string[]; stage?: string; region?: string }) {
+  const stage = i.stage ?? REHEARSAL_STAGE;
+  const region = i.region ?? REHEARSAL_REGION;
+  if (region !== REHEARSAL_REGION || !/^\d{12}$/.test(i.accountId) || !ISO.test(i.expiresAt) || Date.parse(i.expiresAt) > Date.parse(REHEARSAL_AUTHORITY_END)) throw new StateBucketError("state_inputs_invalid");
+  if (i.mappingUuids.length !== 2 || !i.mappingUuids.every((u) => UUID.test(u))) throw new StateBucketError("state_inputs_invalid");
+  roleParts(i.roleArn, i.accountId);
+  const prefix = rehearsalStatePrefix(stage);
+  const bucketArn = `arn:aws:s3:::${pippenStateBucket(i.accountId, region)}`;
+  const a = i.accountId;
+  const names = rehearsalResourceNames(stage);
+  const fnArn = `arn:aws:lambda:${region}:${a}:function:${names.function}`;
+  const queueArn = names.queues.map((q) => `arn:aws:sqs:${region}:${a}:${q}`);
+  const alarmArn = names.alarms.map((x) => `arn:aws:cloudwatch:${region}:${a}:alarm:${x}`);
+  const logArn = `arn:aws:logs:${region}:${a}:log-group:${names.logGroup}`;
+  const esmArns = i.mappingUuids.map((u) => `arn:aws:lambda:${region}:${a}:event-source-mapping:${u}`);
+  const before = { DateLessThan: { "aws:CurrentTime": i.expiresAt } };
+  const tagged = { StringEquals: { [`aws:ResourceTag/${REHEARSAL_TAG.key}`]: REHEARSAL_TAG.value } };
+  const statement = (Sid: string, Action: string[], Resource: string | string[], Condition: Record<string, unknown>) => ({ Sid, Effect: "Allow" as const, Action, Resource, Condition: { ...before, ...Condition } });
+  const inline = {
+    Version: "2012-10-17" as const,
+    Statement: [
+      { Sid: "End", Effect: "Deny" as const, Action: "*", Resource: "*", Condition: { DateGreaterThanEquals: { "aws:CurrentTime": i.expiresAt } } },
+      { Sid: "Region", Effect: "Deny" as const, NotAction: ["iam:*", "sts:*", "s3:*"], Resource: "*", Condition: { StringNotEquals: { "aws:RequestedRegion": region } } },
+      { Sid: "SharedBucket", Effect: "Deny" as const, Action: ["s3:CreateBucket", "s3:PutBucket*", "s3:DeleteBucket*", "s3:PutEncryptionConfiguration", "s3:PutLifecycleConfiguration"], Resource: "arn:aws:s3:::pippen-sbx-alchemy-state-*" },
+      { Sid: "CleanupOnly", Effect: "Deny" as const, Action: TEARDOWN_DENIED_ACTIONS, Resource: "*" },
+    ],
+  };
+  const managed = [
+    {
+      name: "96bulls-rehearse-p1-1126-teardown-state",
+      document: {
+        Version: "2012-10-17" as const,
+        Statement: [
+          statement("List", ["s3:ListBucket", "s3:ListBucketVersions"], bucketArn, { StringLike: { "s3:prefix": [`${prefix}*`] } }),
+          statement("Objects", ["s3:GetObject", "s3:GetObjectVersion", "s3:DeleteObject", "s3:DeleteObjectVersion"], `${bucketArn}/${prefix}*`, {}),
+          statement("TeardownMarker", ["s3:PutObject"], `${bucketArn}/${teardownMarkerKey(prefix)}`, {}),
+          statement("Settings", ["s3:GetBucketVersioning", "s3:GetEncryptionConfiguration", "s3:GetBucketPublicAccessBlock", "s3:GetBucketOwnershipControls", "s3:GetBucketTagging"], bucketArn, {}),
+          { Sid: "OtherPrefixes", Effect: "Deny" as const, Action: ["s3:ListBucket", "s3:ListBucketVersions"], Resource: bucketArn, Condition: { StringNotLike: { "s3:prefix": [`${prefix}*`] } } },
+          { Sid: "NotThisPrefix", Effect: "Deny" as const, Action: ["s3:GetObject*", "s3:PutObject*", "s3:DeleteObject*"], NotResource: `${bucketArn}/${prefix}*` },
+        ],
+      },
+    },
+    {
+      name: "96bulls-rehearse-p1-1126-teardown-cleanup",
+      document: {
+        Version: "2012-10-17" as const,
+        Statement: [
+          statement("Queues", ["sqs:DeleteQueue", "sqs:GetQueueAttributes"], queueArn, tagged),
+          statement("Function", ["lambda:DeleteFunction", "lambda:GetFunction"], fnArn, tagged),
+          statement("Mappings", ["lambda:DeleteEventSourceMapping", "lambda:GetEventSourceMapping"], esmArns, {}),
+          statement("Alarms", ["cloudwatch:DeleteAlarms"], alarmArn, tagged),
+          statement("Logs", ["logs:DeleteLogGroup"], [logArn, `${logArn}:*`], tagged),
+          ...(i.roleDisposition === "deleted"
+            ? [statement("Role", ["iam:DeleteRole", "iam:ListAttachedRolePolicies", "iam:DetachRolePolicy", "iam:ListRolePolicies", "iam:DeleteRolePolicy"], i.roleArn, {})]
+            : []),
+          statement("GoneReads", ["lambda:GetFunctionConfiguration", "sqs:GetQueueAttributes", "sqs:GetQueueUrl"], [fnArn, ...queueArn], {}),
+          statement("NamedReads", ["cloudwatch:DescribeAlarms"], alarmArn, {}),
+          statement("RoleRead", ["iam:GetRole"], i.roleArn, {}),
+          statement("Reads", ["lambda:ListEventSourceMappings", "logs:DescribeLogGroups"], "*", {}),
+        ],
+      },
+    },
+  ];
+  return { expiresAt: i.expiresAt, inline, managed };
+}
+
+/** What the teardown lease may never do: create, update, tag, publish or invoke anything. */
+export const TEARDOWN_DENIED_ACTIONS = [
+  "sqs:CreateQueue", "sqs:SetQueueAttributes", "sqs:TagQueue", "sqs:SendMessage",
+  "lambda:CreateFunction", "lambda:UpdateFunctionCode", "lambda:UpdateFunctionConfiguration", "lambda:PublishVersion", "lambda:CreateEventSourceMapping", "lambda:UpdateEventSourceMapping", "lambda:AddPermission", "lambda:TagResource", "lambda:InvokeFunction",
+  "cloudwatch:PutMetricAlarm", "cloudwatch:TagResource", "logs:CreateLogGroup", "logs:PutRetentionPolicy", "logs:TagResource",
+  "iam:CreateRole", "iam:PutRolePolicy", "iam:AttachRolePolicy", "iam:UpdateRole", "iam:PassRole",
+];
+
+/**
  * The teardown authorization: the trusted handoff from the lease the run was captured and deployed
  * under (A) to the lease issued for teardown (B, with the mappings' absence reads). The broker writes
  * it at B's issuance and records its digest in its receipt; the code verifies it against that digest,
@@ -907,8 +1028,16 @@ export interface TeardownAuthorization {
   original: { sessionId: string; issuedAt: string; pin: string };
   manifestDigest: string;
   mappingUuids: string[];
-  /** Lease B: the authorized teardown principal. */
-  teardown: { sessionId: string; callerArn: string; issuedAt: string; expiresAt: string; policyDigest: string };
+  /**
+   * Lease B: the authorized teardown principal, its approved teardown window end, its effective
+   * expiry (no later than the run deadline) and the digest of its cleanup-only policies.
+   */
+  teardown: { sessionId: string; callerArn: string; issuedAt: string; windowEnd: string; expiresAt: string; policyDigest: string };
+}
+
+/** The teardown marker's body: the run and this teardown's receipts. */
+export function teardownMarkerBody(i: { stage: string; runId: string; manifestDigest: string; authorizationDigest: string | null }): string {
+  return JSON.stringify({ schema: 1, stage: i.stage, runId: i.runId, manifestDigest: i.manifestDigest, authorizationDigest: i.authorizationDigest });
 }
 
 /** sha256 of the canonical JSON of a teardown authorization (the value the broker's receipt records). */
@@ -916,9 +1045,18 @@ export function authorizationDigest(a: unknown): string {
   return createHash("sha256").update(canonical(a)).digest("hex");
 }
 
-/** sha256 of the canonical teardown lease policies for lease B (issuance time) with the manifest's mapping UUIDs. */
-export function teardownPolicyDigest(ctx: RehearsalContext, mappingUuids: readonly string[]): string {
-  return createHash("sha256").update(canonical(rehearsalLeasePolicies({ accountId: ctx.accountId, roleArn: ctx.roleArn, issuedAt: ctx.issuedAt, mappingUuids }))).digest("hex");
+/** sha256 of lease B's canonical cleanup-only policies: its effective expiry and the manifest's mapping UUIDs. */
+export function teardownPolicyDigest(ctx: RehearsalContext, mappingUuids: readonly string[], expiresAt: string): string {
+  return createHash("sha256").update(canonical(rehearsalTeardownPolicies({ accountId: ctx.accountId, roleArn: ctx.roleArn, roleDisposition: ctx.roleDisposition, expiresAt, mappingUuids }))).digest("hex");
+}
+
+/**
+ * The authorized run deadline: the earliest of lease A's issuance + 6 h, the hard cutoff and the
+ * approved teardown window end the authorization carries. Lease B is valid only before it.
+ */
+export function teardownDeadline(originalIssuedAt: string, windowEnd: string): string {
+  if (!ISO.test(originalIssuedAt) || !ISO.test(windowEnd)) throw new StateBucketError("state_authorization_mismatch");
+  return iso(Math.min(Date.parse(originalIssuedAt) + REHEARSAL_LEASE_TTL_HOURS * 3_600_000, Date.parse(REHEARSAL_AUTHORITY_END), Date.parse(windowEnd)));
 }
 
 /**
@@ -943,9 +1081,20 @@ export function assertTeardownAuthorization(ctx: RehearsalContext, auth: unknown
     hex(a.manifestDigest) && Array.isArray(a.mappingUuids) && a.mappingUuids.length === 2 && a.mappingUuids.every((u) => typeof u === "string" && UUID.test(u)) && new Set(a.mappingUuids).size === 2 &&
     a.teardown?.sessionId === ctx.sessionId && a.teardown.issuedAt === ctx.issuedAt &&
     a.teardown.callerArn === `arn:aws:sts::${ctx.accountId}:assumed-role/${PIPPEN_PROOF_SANDBOX.callerRole.roleName}/${PIPPEN_PROOF_SANDBOX.callerRole.sessionPrefix}${ctx.sessionId}` &&
-    typeof a.teardown.expiresAt === "string" && ISO.test(a.teardown.expiresAt) && now < Date.parse(a.teardown.expiresAt) && Date.parse(a.teardown.expiresAt) <= Date.parse(rehearsalLeaseEnd({ issuedAt: ctx.issuedAt })) &&
-    a.teardown.policyDigest === teardownPolicyDigest(ctx, a.mappingUuids);
+    typeof a.teardown.windowEnd === "string" && ISO.test(a.teardown.windowEnd) &&
+    typeof a.teardown.expiresAt === "string" && ISO.test(a.teardown.expiresAt);
   if (!ok) fail();
+  // B is valid only before the authorized run deadline (A + 6 h, the cutoff, the approved window),
+  // and its effective expiry and cleanup-only policy are bound to the digest.
+  const deadline = Date.parse(teardownDeadline(a.original.issuedAt, a.teardown.windowEnd));
+  const expires = Date.parse(a.teardown.expiresAt);
+  if (
+    !(Date.parse(ctx.issuedAt) >= Date.parse(a.original.issuedAt) && Date.parse(ctx.issuedAt) < deadline) ||
+    !(expires <= deadline && expires <= Date.parse(rehearsalLeaseEnd({ issuedAt: ctx.issuedAt }))) ||
+    !(now >= Date.parse(ctx.issuedAt) && now < expires) ||
+    a.teardown.policyDigest !== teardownPolicyDigest(ctx, a.mappingUuids, a.teardown.expiresAt)
+  )
+    fail();
   const original: IssuerPinned = { stage: ctx.stage, region: ctx.region, accountId: ctx.accountId, boundaryArn: ctx.boundaryArn, roleArn: ctx.roleArn, roleDisposition: ctx.roleDisposition, sessionId: a.original.sessionId, issuedAt: a.original.issuedAt };
   if (rehearsalIssuerPin(original) !== a.original.pin) fail();
   return { ...original, pin: a.original.pin, runId: a.runId };
@@ -986,7 +1135,17 @@ export function runRehearsalTeardown(
   }
   assertManifestComplete(i.manifest, original, original.runId);
   assertManifestGone(aws, i.manifest, original, original.runId);
-  // The current marker must be the original run's before any version is deleted.
-  assertRunMarker(aws, { bucket, prefix, ctx: original });
-  return teardownStageState(aws, { bucket, region: ctx.region, stage: REHEARSAL_STAGE, execute: true });
+  // Bound to this teardown's receipts (the manifest digest and the authorization, if any).
+  const teardownMarker = teardownMarkerBody({ stage: REHEARSAL_STAGE, runId: original.runId, manifestDigest: (i.manifest as PhysicalManifest).digest, authorizationDigest: i.authorization === undefined ? null : authorizationDigest(i.authorization) });
+  // Resume states, all under these receipts: nothing left (an earlier run completed: its last
+  // response may have been lost); only this teardown's marker left; or the run's marker present and
+  // the original run's. Anything else keeps the state.
+  const inventory = listStageStateVersions(aws, { bucket, region: ctx.region, stage: REHEARSAL_STAGE });
+  if (inventory.length === 0) return { listed: 0, deleted: 0, remaining: 0 };
+  const runMarker = readMarker(aws, { bucket, region: ctx.region, key: runMarkerKey(prefix) });
+  if (runMarker === undefined) {
+    const td = teardownMarkerKey(prefix);
+    if (!inventory.every((o) => o.Key === td) || readMarker(aws, { bucket, region: ctx.region, key: td }) !== teardownMarker) throw new StateBucketError("state_provenance_mismatch");
+  } else if (runMarker !== runMarkerBody(original)) throw new StateBucketError("state_provenance_mismatch");
+  return teardownStageState(aws, { bucket, region: ctx.region, stage: REHEARSAL_STAGE, execute: true, teardownMarker });
 }

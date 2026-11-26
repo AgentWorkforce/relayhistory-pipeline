@@ -122,10 +122,24 @@ pin, lease end) before any AWS call:
       name, and the role per its pinned disposition (deleted: not found; retained: exactly the pinned
       ARN, path and boundary). A remaining id refuses (`state_resources_remain`); AccessDenied is
       never "gone" (`state_gone_unproven`); rerun after the next destroy pass;
-   7. the current marker owned by the original run (lease A's session, issuance time, pin);
-   8. only then: list every version and delete marker under exactly the prefix (strict page
-      validation; any key outside it refuses before anything is deleted), `DeleteObjects` by key
-      and version id, and an independent re-list that must show zero versions and zero delete markers.
+   7. the resume state, under these receipts: no version left (an earlier execute completed and
+      only its last response was lost): complete, nothing deleted; only this teardown's marker left:
+      continue with step 8's last call; otherwise the run marker must be current and the original
+      run's (lease A's session, issuance time, pin). Anything else keeps the state;
+   8. only then, in this order (`teardownStageState`), each step re-listed before the next:
+      1. the **teardown marker** `__rehearsal_teardown__.marker` (run id, manifest digest,
+         authorization digest) is written if absent (`--if-none-match "*"`), or must already be
+         exactly this teardown's;
+      2. every version and delete marker except the two markers, by key and version id (strict
+         page validation; any key outside the prefix refuses before anything is deleted); the
+         re-list must then show only the markers;
+      3. the run marker's versions, alone; the re-list must then show only the teardown marker;
+      4. the teardown marker, last and alone; the final re-list must show nothing.
+
+   A partial batch, or a delete that reports success and leaves a version, stops with the run marker
+   intact, and the next execute resumes. A claim cannot interleave: it requires an empty version
+   inventory, and the teardown marker exists until the very last call. Once the prefix is empty a new
+   claim is a new run; a retry of a completed teardown before that is recognised as complete.
 
    So the digest check runs after the STS and bucket reads and before any deletion. Without
    `--execute` it is a dry run (counts only). The bucket itself and sibling stages are never touched.
@@ -144,16 +158,31 @@ records its digest (`authorizationDigest`, sha256 of the canonical JSON) in its 
   "original": { "sessionId": "<lease A>", "issuedAt": "<A issuance>", "pin": "<A pin>" },
   "manifestDigest": "<manifest digest>", "mappingUuids": ["<uuid 1>", "<uuid 2>"],
   "teardown": { "sessionId": "<lease B>", "callerArn": "arn:aws:sts::<account>:assumed-role/agent-session/agent-<lease B>",
-                "issuedAt": "<B issuance>", "expiresAt": "<B expiry>", "policyDigest": "<B policy digest>" } }
+                "issuedAt": "<B issuance>", "windowEnd": "<approved teardown window end>",
+                "expiresAt": "<B effective expiry>", "policyDigest": "<B cleanup-only policy digest>" } }
 ```
 
 `assertTeardownAuthorization` refuses (`state_authorization_mismatch`) unless the record's digest is
 the receipt's; it is this stage and run; B is exactly the current session, STS caller ARN and
-issuance; B has not expired and expires no later than B's lease end; B's policy digest is the
-generated teardown policy (`teardownPolicyDigest`: `rehearsalLeasePolicies` for B's issuance with
-these mapping UUIDs); and A's pin is the issuer pin of the same approved account, boundary, role and
-disposition with A's session and issuance. The manifest and the marker are then checked against
-lease A's context. Any failure keeps the state.
+issuance; and A's pin is the issuer pin of the same approved account, boundary, role and
+disposition with A's session and issuance. B's validity is capped at the **authorized run
+deadline** (`teardownDeadline`): the earliest of A's issuance + 6 h, the hard cutoff
+2026-11-27T08:00:00Z and the approved teardown window end the record carries explicitly. B must be
+issued before it, its effective expiry must not be later than it (nor than B's own lease end), and
+the teardown runs only before that expiry. B's policy digest must be the digest of the
+**cleanup-only** teardown policies generated for B's effective expiry and the two mapping UUIDs
+(`rehearsalTeardownPolicies`, `teardownPolicyDigest`), so the receipt binds both the expiry and the
+action set. The manifest and the marker are then checked against lease A's context. Any failure
+keeps the state.
+
+The cleanup-only policies (inline 1,150 characters; two managed documents, 1,773 and about 4,500; limit 6,144):
+deletes of the stage's own resources (`sqs:DeleteQueue`, `lambda:DeleteFunction`,
+`cloudwatch:DeleteAlarms`, `logs:DeleteLogGroup` on tagged resources; `lambda:DeleteEventSourceMapping`
+and `GetEventSourceMapping` on the two exact mapping ARNs; the role's deletion on its exact ARN only
+when its pinned disposition is deleted); the exact-name absence reads; the state prefix's list, reads
+and version deletes; one `s3:PutObject`, on the teardown marker's exact key. No create, update, tag,
+publish or invoke action is allowed, and an explicit Deny (`CleanupOnly`) lists them. Every Allow
+holds only before B's effective expiry and a Deny on everything applies at and after it.
 
 ## Lease: issuer mechanism and actions
 
@@ -302,6 +331,6 @@ receipts (kept outside the repository, referenced by hash in the run's handoff):
 - Non-adoption under concurrent creation or standalone use of the lease, and create-time tagging
   under the strict tag statement, are residuals for the issuer (see Teardown and Lease).
 - **Gates still open:** the non-prod render of the session pipeline; the proof-account stage rule;
-  the execution-role wiring (path and boundary of the Lambda role); the revised authorization,
-  including the teardown lease and its authorization record; the issuer's enforcement, duration and
+  the execution-role path and boundary; the revised scope, including the teardown lease B, its
+  approved window and its authorization record; the issuer's provenance, expiration and
   revocation; the cost cap; and live evidence (budget and teardown) from a real run.
