@@ -63,8 +63,10 @@ import {validatedCustodyAck} from "./custody-ack.ts";
  * only). Each of those calls is one autocommit statement (the claim with INGEST_CLAIM_LOCK_WAIT_MS: one
  * BEGIN..COMMIT transaction that is rolled back on any error), and an ERROR answer with a SQLSTATE means that
  * statement's transaction was rolled back whole, so a repeat is a fresh first call (see withLockRetry). A retry
- * starts only if the time already spent retrying, plus its pause, plus one worst-case attempt (the role's 5 s
- * statement_timeout) fits the budget, so the delay the retries add never exceeds the budget. A success is never
+ * is re-issued only if, read on the clock after its pause and any consent re-check, the time already spent
+ * retrying plus one attempt reservation (the role's 5 s statement_timeout) fits the budget. That bounds when
+ * retries start; a multi-statement claim attempt can outrun its reservation, so it is not a wall-clock cap
+ * (withLockRetry). A success is never
  * repeated; no other cause and no other stage (buffer_put, slot, consent, ...) is retried. On exhaustion the
  * last error answers exactly as today (claimLockBusy / claimTimeoutBusy / bufferLockBusy apply to it). With the
  * budget set it replaces INGEST_BUFFER_LOCK_RETRY's one-shot retry. Every delivery then carries
@@ -521,9 +523,10 @@ async function bufferLedgerStage<T>(
 
 /**
  * INGEST_LOCK_RETRY_BUDGET_MS constants (all ms).
- *   attemptMaxMs       one ledger attempt's worst case: the ingest role's statement_timeout (5 s,
- *                      supabase/bootstrap/session_ingest_role.sql). lock_timeout (2 s, or INGEST_CLAIM_LOCK_WAIT_MS)
- *                      applies per lock acquisition, so a 55P03 attempt can also take up to the statement_timeout.
+ *   attemptMaxMs       the reservation for one re-issued attempt: the ingest role's statement_timeout (5 s,
+ *                      supabase/bootstrap/session_ingest_role.sql), which bounds one SQL statement. lock_timeout (2 s,
+ *                      or INGEST_CLAIM_LOCK_WAIT_MS) applies per lock acquisition, so a 55P03 attempt can also take up
+ *                      to the statement_timeout. A claim attempt can be several statements and run past it.
  *   pauseBaseMs/pauseMaxMs  retry k (1-based, counted per delivery) pauses in [c/2, c], c = min(pauseMaxMs, pauseBaseMs * 2^(k-1)).
  *   maxRetries         hard cap on retries per delivery, whatever the budget.
  *   clientTimeoutMs    the uploader's per-request timeout: Relay Desktop's delivery drain (desktop-core
@@ -624,6 +627,14 @@ function isRetryableLockFailure(error: unknown, stage: LockRetryStage): boolean 
  * answers `intent_invalid` / 55000 (expired), which are final. A success returns at once (never repeated); only the
  * errors isRetryableLockFailure admits are retried; the S3 put between intent and receipt is outside every attempt.
  * `beforeRetry` runs after each pause and before the repeat (the receipt re-checks upload consent there).
+ * Budget: a retry is planned only while the time spent retrying plus its pause plus one attempt reservation
+ * (LOCK_RETRY.attemptMaxMs) fits, and is re-issued only if, read on the clock after the pause and `beforeRetry`,
+ * the time spent plus one reservation still fits. Spent time is measured, not estimated: every pause, re-check and
+ * retried attempt is charged at its real duration. The reservation is one statement_timeout, which bounds one SQL
+ * statement; a claim attempt can be several (BEGIN, the lock-wait setting, the claim, COMMIT or ROLLBACK, and a
+ * generation fallback), so a re-issued attempt can run past its reservation. The guarantee is therefore on when
+ * retries start (none starts once the budget cannot hold one more reservation), not a wall-clock cap: the retries
+ * can end later than the budget by the last re-issued attempt's excess over its reservation.
  */
 async function withLockRetry<T>(
   deps: Pick<DeliverDeps, "random" | "sleep" | "lockRetryClock">,
@@ -655,12 +666,11 @@ async function withLockRetry<T>(
     if (!isRetryableLockFailure(error, stage)) { tally.outcome = "not_retryable"; throw error; }
     const next = tally.attempts + 1;
     const pause = lockRetryPauseMs(next, random);
-    // Start a retry only if its pause and one worst-case attempt still fit what is left of the budget.
+    // Plan a retry only if its pause and one attempt reservation still fit what is left of the budget.
     if (next > LOCK_RETRY.maxRetries || tally.spentMs + pause + LOCK_RETRY.attemptMaxMs > tally.budgetMs) {
       tally.outcome = "exhausted";
       throw error;
     }
-    tally.attempts = next;
     retryStarted = clock();
     try {
       await sleep(pause);
@@ -670,6 +680,15 @@ async function withLockRetry<T>(
       tally.outcome = "not_retryable";
       throw refused;
     }
+    // Recheck on the clock immediately before re-issuing: a late timer wake or a slow consent re-check may have used
+    // what the plan reserved. Nothing was re-issued, so the delivery answers with the failure it already has.
+    if (tally.spentMs + Math.max(0, clock() - retryStarted) + LOCK_RETRY.attemptMaxMs > tally.budgetMs) {
+      charge();
+      tally.outcome = "exhausted";
+      throw error;
+    }
+    // Counted only here, when the ledger call is actually re-issued.
+    tally.attempts = next;
   }
 }
 

@@ -8,6 +8,9 @@
  * - exhaustion answers exactly what the flag-off delivery answers (503, or the 429 with the busy flags);
  * - a successful call is never repeated, and no other stage (buffer_put) is re-run by a retry;
  * - pause jitter bounds, the budget accounting and the budget vs deadline refusal (deliver.ts and worker.ts);
+ * - the budget is rechecked on the clock after the pause and the consent re-check, immediately before a re-issue: a
+ *   late timer wake or a slow consent check that used the reservation re-issues nothing (exhausted, 0 attempts);
+ * - `lock_retry_attempts` counts only ledger calls actually re-issued (a consent refusal before the repeat is 0);
  * - PGlite (every migration, origin fence on): a first attempt that did the work and was rolled back is repeated into
  *   exactly one committed batch, one stage intent and one outbox row (the idempotency the retry relies on).
  */
@@ -49,7 +52,7 @@ type Flags = Record<string, unknown> & { lockRetryBudgetMs?: number };
  * lists what each successive call of that stage throws (undefined: succeed). A fake clock advances by every pause and
  * by `attemptMs` per covered call, so the budget accounting is deterministic.
  */
-async function recovery(failures: Partial<Record<Stage, unknown[]>>, flags: Flags, opts: { attemptMs?: number; random?: () => number } = {}) {
+async function recovery(failures: Partial<Record<Stage, unknown[]>>, flags: Flags, opts: { attemptMs?: number; random?: () => number; lateWakeMs?: number } = {}) {
   const s = scratchStore();
   cleanups.push(s.done);
   const ledger = new MemoryLedger();
@@ -94,7 +97,7 @@ async function recovery(failures: Partial<Record<Stage, unknown[]>>, flags: Flag
   const app = createIngestApp({
     deliver: {
       ledger, target: { store, keyRoot: "96bulls", sleep: async () => {} }, acceptanceMode: "buffered",
-      random: opts.random ?? (() => 0.5), sleep: async (ms: number) => { sleeps.push(ms); now += ms; }, lockRetryClock: () => now,
+      random: opts.random ?? (() => 0.5), sleep: async (ms: number) => { sleeps.push(ms); now += ms + (opts.lateWakeMs ?? 0); }, lockRetryClock: () => now,
       bufferLockRetryLog: (f: BufferLockRetryFields) => { oneShot.push(f); }, ...flags,
     } as never,
     log: (fields) => logged.push(fields),
@@ -260,7 +263,63 @@ describe("budget on: what is never retried", () => {
     expect(phases).toEqual(["admit", "commit", "commit"]);
     expect(commits).toBe(1); // the refused re-check stops the repeat before the second commit call
     expect((err as IngestUnavailable).stage).toBe("consent_commit");
-    expect(lockRetryFieldsOf(err)).toEqual({ lock_retry_attempts: 1, lock_retry_outcome: "not_retryable" });
+    // No ledger call was re-issued, so no retry is counted.
+    expect(lockRetryFieldsOf(err)).toEqual({ lock_retry_attempts: 0, lock_retry_outcome: "not_retryable" });
+  });
+});
+
+describe("budget on: rechecked on the clock immediately before a re-issue", () => {
+  test("a late timer wake past the reservation re-issues nothing: one claim, the flag-off answer, exhausted with 0 attempts", async () => {
+    for (const busy of [{}, BUSY_FLAGS]) {
+      const thrown = await ledgerError("55P03");
+      // Budget 5050: the plan admits the first retry (pause <= 50 + one 5000 ms reservation); the timer wakes 6000 ms late.
+      const late = await recovery({ claim: [thrown] }, { ...busy, lockRetryBudgetMs: LOCK_RETRY_BUDGET_MS_MIN }, { lateWakeMs: 6_000 });
+      const off = await recovery({ claim: [thrown] }, { ...busy });
+      expect(late.calls.claim.length).toBe(1);
+      expect(late.sleeps.length).toBe(1);
+      expect(late.status).toBe("claimLockBusy" in busy ? 429 : 503);
+      const { lock_retry_attempts, lock_retry_outcome, ...rest } = late.route;
+      expect({ lock_retry_attempts, lock_retry_outcome }).toEqual({ lock_retry_attempts: 0, lock_retry_outcome: "exhausted" });
+      expect({ ...norm(late), route: { ...rest, duration_ms: 0 } }).toEqual(norm(off));
+    }
+    // Control: the same failure with an on-time wake is re-issued once and succeeds.
+    const onTime = await recovery({ claim: [await ledgerError("55P03")] }, { lockRetryBudgetMs: LOCK_RETRY_BUDGET_MS_MIN });
+    expect(onTime.calls.claim.length).toBe(2);
+    expect(onTime.route).toMatchObject({ lock_retry_attempts: 1, lock_retry_outcome: "succeeded_after_retry" });
+  });
+
+  test("a late wake on a later retry stops there: only the retries actually issued are counted", async () => {
+    const thrown = await ledgerError("40P01");
+    // Attempts take 2000 ms, wakes come 2500 ms late, budget 10000. Retry 1: planned (0 + pause + 5000) and, after its
+    // late wake, still fits (about 2525 + 5000), so it is issued and fails (spent about 4525). Retry 2: planned
+    // (4525 + pause + 5000 <= 10000), but after its late wake 4525 + about 2575 + 5000 > 10000, so it is not issued.
+    const r = await recovery({ buffer_intent: [thrown, thrown, thrown] }, { lockRetryBudgetMs: BUDGET }, { attemptMs: 2_000, lateWakeMs: 2_500 });
+    expect(r.calls.buffer_intent.length).toBe(2);
+    expect(r.sleeps.length).toBe(2);
+    expect(r.route).toMatchObject({ lock_retry_attempts: 1, lock_retry_outcome: "exhausted" });
+    expect(r.status).toBe(503);
+  });
+
+  test("a slow consent re-check past the reservation re-issues nothing: one commit call, the lock failure, exhausted", async () => {
+    const s = scratchStore();
+    cleanups.push(s.done);
+    const thrown = await ledgerError("55P03");
+    let commits = 0;
+    let now = 5_000_000;
+    let checks = 0;
+    const ledger = Object.assign(new MemoryLedger(), {
+      prepareBufferStage: async () => ({ stageToken: "00000000-0000-4000-8000-000000000004", expiresAt: new Date(Date.now() + 60_000).toISOString() }),
+      commitBuffered: async () => { commits++; if (commits === 1) throw thrown; return { version: 1, sourceDigest: "d".repeat(64), sourceControlVersion: "0", privacySealed: true }; },
+    });
+    // The third consent check is the retry's re-check: it succeeds, but takes 6000 ms.
+    const consentGate = async () => { checks++; if (checks === 3) now += 6_000; };
+    const err = await deliverBatch({ ledger, target: { store: s.store, keyRoot: "96bulls", sleep: async () => {} }, acceptanceMode: "buffered", consentGate,
+      lockRetryBudgetMs: LOCK_RETRY_BUDGET_MS_MIN, lockRetryClock: () => now, sleep: async (ms: number) => { now += ms; } } as never, TENANT,
+      await batch([record({ record_id: "slow-consent" })])).then(() => null, (e: unknown) => e);
+    expect(checks).toBe(3);
+    expect(commits).toBe(1);
+    expect([(err as IngestUnavailable).stage, (err as IngestUnavailable).cause_code]).toEqual(["buffer_receipt", "ledger_lock_timeout"]);
+    expect(lockRetryFieldsOf(err)).toEqual({ lock_retry_attempts: 0, lock_retry_outcome: "exhausted" });
   });
 });
 
