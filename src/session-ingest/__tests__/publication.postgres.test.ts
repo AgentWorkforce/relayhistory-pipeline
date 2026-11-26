@@ -22,7 +22,11 @@ import {lazyAckT2FlipOutcome,type FlipResult} from "../lazy-ack-t2-flip.ts";
 import {layoutComponent} from "../../shared/layout-component.ts";
 import type {ObjectStore} from "../../shared/vendor.ts";
 import { SESSION_BOOTSTRAP_FILES } from "../../hoopdb/session-bootstrap-chain.ts";
+import {VersionedMemoryStore} from "./versioned-store.ts";
+import {heldPublicationSentinels,publicationKernelSlot,publicationRecoverySlot} from "../../../supabase/proposals/continuous-publication/held-profile.ts";
 const url=process.env.SESSION_INGEST_TEST_PG_URL;
+const orderedTemplate=process.env.PUBLICATION_PROOF_TEMPLATE === "publication_release_fixture";
+const searchDown="supabase/rollbacks/20261105062300_search_index_stage.down.sql";
 const GEN="a".repeat(64);
 const FRONTIER_CAPTURE="4".repeat(64),FRONTIER_PLAN="5".repeat(64),FRONTIER_EVIDENCE="6".repeat(64);
 const CANARY_PLAN_ID="77777777-7777-4777-8777-777777777777";
@@ -30,17 +34,19 @@ const root=join(import.meta.dir,"../../..");
 const read=(p:string)=>readFileSync(join(root,p),"utf8").split("\n").filter(l=>!l.startsWith("\\")).join("\n");
 const clean:Array<()=>Promise<void>>=[];
 afterEach(async()=>{for(const f of clean.splice(0).reverse())await f();},30000);
-async function fixture(frontier=true,initialRecords=[record({record_id:"new-r1"})],guard=false){
+async function fixture(frontier=true,initialRecords=[record({record_id:"new-r1"})],guard=false, storeOverride?: ObjectStore){
  const admin=new pg.Client({connectionString:url});await admin.connect();const name="publisher_"+crypto.randomUUID().replaceAll("-","");
- await admin.query("CREATE DATABASE "+name);const u=new URL(url!);u.pathname="/"+name;
+ await admin.query("CREATE DATABASE "+name+(orderedTemplate ? " TEMPLATE publication_release_fixture" : ""));const u=new URL(url!);u.pathname="/"+name;
  const pool=new pg.Pool({connectionString:u.href});const dir=mkdtempSync(join(tmpdir(),"publisher-"));
  clean.push(async()=>{await pool.end();await admin.query("DROP DATABASE "+name);await admin.end();rmSync(dir,{recursive:true,force:true});});
+ if (!orderedTemplate) {
  await pool.query(read("supabase/tests/supabase_shim.sql"));await pool.query("CREATE EXTENSION pg_trgm;CREATE EXTENSION btree_gin");
  for(const f of SESSION_BOOTSTRAP_FILES)await pool.query(read(f));
  for(const f of readdirSync(join(root,"supabase/migrations")).sort())await pool.query(read("supabase/migrations/"+f));
  for(const f of readdirSync(join(root,"src/hoopdb/migrations")).sort())await pool.query(read("src/hoopdb/migrations/"+f));
+ }
  await pool.query("CREATE TABLE IF NOT EXISTS sessions.__96bulls_role_validation(name text PRIMARY KEY,generation text,status text,updated_at timestamptz DEFAULT now())");
- await pool.query("INSERT INTO sessions.__96bulls_role_validation(name,generation,status)VALUES('session_directory_search_worker',$1,'pass')",[GEN]);
+ await pool.query("INSERT INTO sessions.__96bulls_role_validation(name,generation,status)VALUES('session_directory_search_worker',$1,'pass') ON CONFLICT (name) DO UPDATE SET generation=EXCLUDED.generation,status=EXCLUDED.status",[GEN]);
  await pool.query("INSERT INTO sessions.ingest_buffer_admission(org_id,privacy_baseline_sha256,retention_contract_sha256,schema_generation,valid_until,control_epoch)VALUES($1,$2,$2,$3,clock_timestamp()+interval'1 hour',repeat('3',64))",[TENANT.orgId,"a".repeat(64),GEN]);
  await initializeFixtureSeatClock(pool,GEN);
  if(frontier)await pool.query("INSERT INTO sessions.ingest_publication_frontiers VALUES($1,$2,$3,'origin-1',$4,$4,clock_timestamp()+interval'1 hour','synthetic','us-east-1','96bulls',$5)",[TENANT.orgId,TENANT.workspaceId,TENANT.userId,"b".repeat(64),GEN]);
@@ -55,7 +61,7 @@ async function fixture(frontier=true,initialRecords=[record({record_id:"new-r1"}
  }
  const run=async(t:string,p:unknown[])=>{const c=await pool.connect();try{await c.query("SET ROLE bulls96_session_ingest");return await c.query(t,p);}finally{await c.query("RESET ROLE");c.release();}};
  const ledger=orderedFixtureLedger(sqlLedger(run,{acceptanceMode:"buffered",expectedGeneration:GEN}),pool);
- const store=createFsStore({root:dir}) as unknown as ObjectStore;
+ const store=storeOverride ?? createFsStore({root:dir}) as unknown as ObjectStore;
  await deliverBatch({ledger,target:{store,keyRoot:"96bulls"},acceptanceMode:"buffered"},TENANT,await batch(initialRecords));
  const stage=(await pool.query("SELECT active_stage_token token FROM sessions.ingest_buffer_outbox")).rows[0].token as string;
  const call=async(fn:string,p:unknown)=>(await run("SELECT sessions."+fn+"($1::jsonb) result",[JSON.stringify(fn.startsWith("ingest_publication_")||fn==="ingest_buffer_gc_claim"?{...p as any,generation:GEN}:p)])).rows[0].result;
@@ -456,20 +462,39 @@ describe.skipIf(!url)("scoped v1 real PostgreSQL qualification", () => {
 
 describe.skipIf(!url)("post-H scoped kernel proposal", () => {
   const runtime = "bulls96_publication_scoped", recovery = "bulls96_publication_recovery";
-  const source = "supabase/proposals/continuous-publication/";
-  async function setup() {
-    const d = await fixture();
+
+  async function setup(store?: ObjectStore) {
+    const d = await fixture(true,undefined,false,store);
     const login = "scope_" + crypto.randomUUID().replaceAll("-", "");
     // The fixture URL is an explicitly disposable cluster. Refuse existing roles.
-    await d.pool.query("CREATE ROLE "+runtime+" NOLOGIN; CREATE ROLE "+recovery+" NOLOGIN; CREATE ROLE "+login+" LOGIN NOINHERIT");
+    if (!orderedTemplate) await d.pool.query("CREATE ROLE "+runtime+" NOLOGIN; CREATE ROLE "+recovery+" NOLOGIN");
+    await d.pool.query("CREATE ROLE "+login+" LOGIN NOINHERIT");
     clean.push(async()=>{
-      for(const role of [login,runtime,recovery]) {
+      for(const role of (orderedTemplate ? [login] : [login,runtime,recovery])) {
         await d.pool.query("DROP OWNED BY "+role); await d.pool.query("DROP ROLE "+role);
       }
     });
     await d.pool.query("GRANT "+runtime+" TO "+login+"; GRANT USAGE ON SCHEMA sessions TO "+runtime+","+recovery);
-    await d.pool.query(read(source+"062280-scoped-kernels.up.sql"));
-    await d.pool.query(read(source+"062290-scoped-recover.up.sql"));
+    // Only these held slots enter this disposable rollback ledger. The fixture
+    // supplies synthetic admissions and does not stand in for a 062270 issuer.
+    await d.pool.query("CREATE TABLE IF NOT EXISTS sessions.__96bulls_migrations(name text PRIMARY KEY, sha256 text NOT NULL)");
+    for (const slot of [publicationKernelSlot, publicationRecoverySlot]) {
+      if (orderedTemplate) {
+        const row=await d.pool.query("SELECT sha256 FROM sessions.__96bulls_migrations WHERE name=$1",[slot.name]);
+        expect(row.rows).toEqual([{sha256:slot.sha256}]);
+        expect((await d.pool.query(heldPublicationSentinels[slot.name].sql)).rows[0].applied).toBe(true);
+        continue;
+      }
+      const c = await d.pool.connect();
+      try {
+        const sentinel=heldPublicationSentinels[slot.name].sql;
+        expect((await c.query(sentinel)).rows[0].applied).toBe(false);
+        await c.query("BEGIN"); await c.query(slot.up);
+        expect((await c.query(sentinel)).rows[0].applied).toBe(true);
+        await c.query("INSERT INTO sessions.__96bulls_migrations(name,sha256) VALUES($1,$2)",[slot.name,slot.sha256]);
+        await c.query("COMMIT");
+      } finally { await c.query("ROLLBACK"); c.release(); }
+    }
     const binding = {planSha256:"c".repeat(64), admissionId:CANARY_PLAN_ID,frontierSha256:"e".repeat(64),
       tenant:{...TENANT,originId:"origin-1"},target:d.target};
     const admit = () => d.pool.query(`INSERT INTO publication_private.admission(id,binding,stage,frontier_image,admission_image,stage_sha,enabled,valid_until)
@@ -545,7 +570,8 @@ describe.skipIf(!url)("post-H scoped kernel proposal", () => {
 
   test("the scoped host replays a lost final acknowledgement across dedicated connections",async()=>{
     const {scopedPublicationRpc}=await import("../publication-scoped-rpc.ts");
-    const {d,binding,admit,connect}=await setup();
+    const store=new VersionedMemoryStore();
+    const {d,binding,admit,connect}=await setup(store as unknown as ObjectStore);
     await admit();
     let client=await connect();
     const rpc=scopedPublicationRpc({queryBounded:async(q:string,params:unknown[])=>client.query(q,params)} as never,d.target,binding);
@@ -553,11 +579,14 @@ describe.skipIf(!url)("post-H scoped kernel proposal", () => {
     const watched={...rpc,publish:async(...args:Parameters<typeof rpc.publish>)=>{
       const first=await rpc.publish(...args);
       expect(first.replay).toBe(false);
+      const versions = store.versions().map(({key,id})=>({key,id}));
+      expect(versions.length).toBeGreaterThan(1);
       // Discard the acknowledged connection. Retry on a fresh dedicated login.
       await client.end();client=await connect();
       const second=await rpc.publish(...args);
       expect(second).toEqual({...first,replay:true});
       await expect(rpc.publish(args[0],[],args[2])).rejects.toMatchObject({code:"40001"});
+      expect(store.versions().map(({key,id})=>({key,id}))).toEqual(versions);
       replays++;
       return second;
     }};
@@ -599,9 +628,10 @@ describe.skipIf(!url)("post-H scoped kernel proposal", () => {
         previous=p;
       }
       expect((await d.pool.query("SELECT count(*)::int n FROM publication_private.expired_tickets")).rows[0].n).toBe(3);
+      if (orderedTemplate) await d.pool.query(read(searchDown));
       const rollback=await d.pool.connect();
       try {
-        await expect(rollback.query(read(source+"062290-scoped-recover.down.sql"))).rejects.toThrow("retain recovery receipts");
+        await expect(rollback.query(publicationRecoverySlot.down)).rejects.toThrow("retain recovery receipts");
         await rollback.query("ROLLBACK");
         expect((await rollback.query("SELECT count(*)::int n FROM publication_private.expired_tickets")).rows[0].n).toBe(3);
       } finally {rollback.release(true);}
@@ -642,9 +672,199 @@ describe.skipIf(!url)("post-H scoped kernel proposal", () => {
 
   test("empty-state rollback removes new APIs and leaves ordinary ingest grants intact",async()=>{
     const {d}=await setup();
-    await d.pool.query(read(source+"062290-scoped-recover.down.sql"));
-    await d.pool.query(read(source+"062280-scoped-kernels.down.sql"));
+    if (orderedTemplate) await d.pool.query(read(searchDown));
+    const c=await d.pool.connect();
+    try {
+      await expect(c.query(publicationKernelSlot.down)).rejects.toMatchObject({code:"55000"});
+      await c.query("ROLLBACK");
+      await c.query("UPDATE sessions.__96bulls_migrations SET sha256=repeat('0',64) WHERE name=$1",[publicationRecoverySlot.name]);
+      await expect(c.query(publicationRecoverySlot.down)).rejects.toMatchObject({code:"55000"});
+      await c.query("ROLLBACK");
+      await c.query("UPDATE sessions.__96bulls_migrations SET sha256=$2 WHERE name=$1",[publicationRecoverySlot.name,publicationRecoverySlot.sha256]);
+    } finally {c.release();}
+    await d.pool.query(publicationRecoverySlot.down);
+    await d.pool.query(publicationKernelSlot.down);
+    for (const {sql} of Object.values(heldPublicationSentinels)) expect((await d.pool.query(sql)).rows[0].applied).toBe(false);
     expect((await d.pool.query("SELECT to_regnamespace('publication_private') gone")).rows[0].gone).toBeNull();
     expect((await d.call("ingest_publication_candidates",{...d.target,provider:undefined,limit:1})).stageTokens).toEqual([d.stage]);
+  },30000);
+});
+
+describe.skipIf(!url)("062270 private read profile",()=>{
+  test("two authenticated logins cannot reuse one another's profile; closing read observes committed revocation",async()=>{
+    const d=await fixture();
+    const reader="bulls96_frontier_receipt_reader";
+    const suffix=crypto.randomUUID().replaceAll("-","");
+    const issuerLogin="reader_"+suffix, secondLogin="other_"+suffix;
+    await d.pool.query("CREATE ROLE "+reader+" NOLOGIN NOINHERIT; CREATE ROLE "+issuerLogin+" LOGIN NOINHERIT; CREATE ROLE "+secondLogin+" LOGIN NOINHERIT");
+    clean.push(async()=>{
+      for(const role of [issuerLogin,secondLogin,reader]){
+        await d.pool.query("DROP OWNED BY "+role);await d.pool.query("DROP ROLE "+role);
+      }
+    });
+    await d.pool.query("GRANT "+reader+" TO "+issuerLogin+","+secondLogin+"; GRANT USAGE ON SCHEMA sessions TO "+reader);
+    const proposal="supabase/proposals/continuous-publication/062270-private-read-profile";
+    if (!orderedTemplate) await d.pool.query(read(proposal+".up.sql"));
+    await d.pool.query(read(proposal+".down.sql"));
+    expect((await d.pool.query("SELECT to_regnamespace('frontier_receipt_private') AS gone")).rows[0].gone).toBeNull();
+    await d.pool.query(read(proposal+".up.sql"));
+    // This fixture wrapper exposes only a Boolean. It cannot enumerate receipts.
+    await d.pool.query(`CREATE FUNCTION sessions.profile_gate_probe(p jsonb) RETURNS boolean
+      LANGUAGE sql STABLE SECURITY DEFINER SET search_path=pg_catalog,pg_temp AS
+      $$ SELECT (frontier_receipt_private.check_request(p)).profile_id IS NOT NULL $$;
+      REVOKE ALL ON FUNCTION sessions.profile_gate_probe(jsonb) FROM PUBLIC;
+      GRANT EXECUTE ON FUNCTION sessions.profile_gate_probe(jsonb) TO `+reader);
+    const tenant={...TENANT,originId:"origin-1"};
+    const request={protocol:"first-ack-seat-capture-v1",profileId:crypto.randomUUID(),profileSha256:"c".repeat(64),tenant,
+      generation:GEN,after:null,limit:2};
+    const authority={sourceIdentitySha256:"1".repeat(64),sourceGenerationSha256:"2".repeat(64),sourceHead:"3".repeat(40),
+      controlEpoch:"4".repeat(64),privacyBaselineSha256:"5".repeat(64),privacyVersion:"0"};
+    await d.pool.query(`INSERT INTO frontier_receipt_private.read_profiles
+      SELECT $1,$2,r.oid,r.rolname,$3,$4,$5,$6,clock_timestamp(),clock_timestamp()+interval '5 minutes',2,100,32768
+      FROM pg_roles r WHERE r.rolname=$7`,[request.profileId,request.profileSha256,tenant,GEN,d.target,authority,issuerLogin]);
+    const db=(await d.pool.query("SELECT current_database() db")).rows[0].db;
+    const connect=async(login:string)=>{
+      const u=new URL(url!);u.pathname="/"+db;u.username=login;u.password="";
+      const c=new pg.Client({connectionString:u.href});await c.connect();await c.query("SET ROLE "+reader);return c;
+    };
+    const first=await connect(issuerLogin),other=await connect(secondLogin);
+    const select=(c:pg.Client,p:object)=>c.query("SELECT sessions.profile_gate_probe($1) ok",[p]);
+    const begin=(c:pg.Client)=>c.query("BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY");
+    async function refuse(c:pg.Client,p:object){
+      await begin(c);
+      try {await expect(select(c,p)).rejects.toMatchObject({code:"42501"});}
+      finally{await c.query("ROLLBACK");}
+    }
+    try {
+      await expect(select(first,request)).rejects.toMatchObject({code:"42501"});
+      await expect(first.query("SELECT * FROM frontier_receipt_private.read_profiles")).rejects.toMatchObject({code:"42501"});
+      await refuse(other,request);
+      await refuse(first,{...request,tenant:{...tenant,userId:"another"}});
+      await refuse(first,{...request,profileSha256:"a".repeat(64)});
+      await refuse(first,{...request,limit:3});
+      await begin(first);
+      expect((await select(first,request)).rows[0].ok).toBe(true);
+      await d.pool.query("INSERT INTO frontier_receipt_private.revoked_profiles(profile_id) VALUES($1)",[request.profileId]);
+      await first.query("COMMIT");
+      await refuse(first,request);
+      await expect(d.pool.query("UPDATE frontier_receipt_private.read_profiles SET page_limit=1000")).rejects.toThrow("append-only");
+      expect((await d.pool.query("SELECT to_regprocedure('sessions.ingest_scoped_publication_receipt_capture_v1(jsonb)') AS capture")).rows[0].capture).toBeNull();
+      const teardown=await d.pool.connect();
+      try {
+        await expect(teardown.query(read(proposal+".down.sql"))).rejects.toThrow("retain enrolled profiles");
+        await teardown.query("ROLLBACK");
+        expect((await teardown.query("SELECT count(*)::int n FROM frontier_receipt_private.revoked_profiles")).rows[0].n).toBe(1);
+      } finally {teardown.release(true);}
+    } finally {await first.end();await other.end();}
+  },30000);
+});
+
+describe.skipIf(!url)("062270 independent synthetic receipt inventory",()=>{
+  test("requires enrollment, both sides of all receipt classes and unchanged evidence on the closing pass",async()=>{
+    const {captureFrontierReceiptSource,RECEIPT_CAPTURE_IDENTITY_SQL}=await import("../frontier-receipt-source.ts");
+    const d=await fixture(),reader="bulls96_frontier_receipt_reader",suffix=crypto.randomUUID().replaceAll("-","");
+    const login="reader_"+suffix,issuer="inventory_"+suffix,destination="dest_"+suffix;
+    await d.pool.query("CREATE ROLE "+reader+" NOLOGIN NOINHERIT; CREATE ROLE "+login+" LOGIN NOINHERIT; CREATE ROLE "+issuer+" NOLOGIN; CREATE ROLE "+destination+" NOLOGIN");
+    clean.push(async()=>{for(const role of [login,reader,issuer,destination]){
+      await d.pool.query("DROP OWNED BY "+role);await d.pool.query("DROP ROLE "+role);
+    }});
+    await d.pool.query("GRANT "+reader+" TO "+login+"; GRANT USAGE ON SCHEMA sessions TO "+reader);
+    if (!orderedTemplate) await d.pool.query(read("supabase/proposals/continuous-publication/062270-private-read-profile.up.sql"));
+    await d.pool.query(read("src/session-ingest/__tests__/fixtures/frontier-independent-receipt-domain.sql"));
+    await d.pool.query("GRANT USAGE ON SCHEMA fixture_receipt_inventory TO "+issuer+","+destination+
+      "; GRANT INSERT,SELECT ON fixture_receipt_inventory.enrollment,fixture_receipt_inventory.expected TO "+issuer+
+      "; GRANT INSERT,SELECT ON fixture_receipt_inventory.observed TO "+destination);
+    const profileId=crypto.randomUUID(),profileSha256="d".repeat(64);
+    const tenant={orgId:"org-a",workspaceId:"ws-a",userId:"user-a",originId:"origin-1"};
+    const authority={sourceIdentitySha256:"1".repeat(64),sourceGenerationSha256:"2".repeat(64),sourceHead:"3".repeat(40),
+      controlEpoch:"4".repeat(64),privacyBaselineSha256:"5".repeat(64),privacyVersion:"9"};
+    await d.pool.query(`INSERT INTO frontier_receipt_private.read_profiles SELECT
+      $1,$2,r.oid,r.rolname,$3,$4,$5,$6,clock_timestamp(),clock_timestamp()+interval '5 minutes',2,32,16384
+      FROM pg_roles r WHERE r.rolname=$7`,[profileId,profileSha256,tenant,GEN,d.target,authority,login]);
+    const db=(await d.pool.query("SELECT current_database() db")).rows[0].db;
+    const u=new URL(url!);u.pathname="/"+db;u.username=login;u.password="";
+    const client=new pg.Client({connectionString:u.href});await client.connect();
+    const source=await d.pool.connect(),target=await d.pool.connect();
+    try{
+      await source.query("SET ROLE "+issuer);await target.query("SET ROLE "+destination);await client.query("SET ROLE "+reader);
+      await expect(source.query("SELECT * FROM fixture_receipt_inventory.observed")).rejects.toMatchObject({code:"42501"});
+      await expect(target.query("SELECT * FROM fixture_receipt_inventory.expected")).rejects.toMatchObject({code:"42501"});
+      await expect(client.query("SELECT * FROM fixture_receipt_inventory.enrollment")).rejects.toMatchObject({code:"42501"});
+      // Independently authored terminal observations, deliberately delivered out of order.
+      await target.query(`INSERT INTO fixture_receipt_inventory.observed
+        SELECT $1,source,ack,jsonb_build_object('tenant',$2::jsonb,'recordId',record,'revision',rev,'revisionId',rid,
+          'source','fixture','sessionId',NULL,'seat',seat,'bodyAccepted',accept,'candidateDigest',repeat(body,64),'firstDigest',repeat(first,64)),true
+        FROM (VALUES ('queue','D','r3','2','v4','23',true,'d','d'),
+          ('native','A','r1','7','v1','21',true,'a','a'),('legacy','C','r2','1','v3','22',true,'c','c'),
+          ('s3_first','E','r4','3','v5','24',true,'e','e'),('equal_revision_loser','B','r1','7','v2','21',false,'b','a')
+        ) raw(source,ack,record,rev,rid,seat,accept,body,first)`,[profileId,tenant]);
+      // Catalog extraction is only the disposable fixture's pin; real pins must be reviewed separately.
+      const identity=(await d.pool.query(RECEIPT_CAPTURE_IDENTITY_SQL)).rows[0];
+      const input={tenant,generation:GEN,profileId,profileSha256,functionOwner:identity.function_owner,functionSha256:identity.definition_sha256,
+        bounds:{pageLimit:2,maxPages:8,maxDecisions:32,maxBytes:64000,maxDurationMs:10000}};
+      const capture=()=>captureFrontierReceiptSource(client as never,input);
+      const assertHeld=async(reason:string)=>{
+        await expect(capture()).rejects.toThrow("frontier_receipt_unavailable");
+        await client.query("BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY");
+        try {
+          await expect(client.query("SELECT sessions.ingest_scoped_publication_receipt_capture_v1($1)",[
+            {protocol:"first-ack-seat-capture-v1",profileId,profileSha256,tenant,generation:GEN,after:null,limit:2},
+          ])).rejects.toThrow(reason);
+        } finally {await client.query("ROLLBACK");}
+      };
+      await assertHeld("enrollment held");
+      // Fixed independent known answer. No observed destination row is read to issue the enrollment.
+      const root="38a3d36d1f50f2380a4def8f89c6cc847a176f5e4205217bac973c0feb34cedd";
+      const counts={native:1,equal_revision_loser:1,legacy:1,queue:1,s3_first:1};
+      await source.query("INSERT INTO fixture_receipt_inventory.enrollment VALUES ($1,$2,$3,$4,$5,$6,$7)",
+        [profileId,tenant,GEN,d.target,authority,counts,root]);
+      const manifest=[
+        ["native","A","r1","7","v1","21","a","a"],["equal_revision_loser","B","r1","7","v2","21","b","a"],
+        ["legacy","C","r2","1","v3","22","c","c"],["queue","D","r3","2","v4","23","d","d"],["s3_first","E","r4","3","v5","24","e","e"],
+      ];
+      for(const [population,ack,recordId,revision,revisionId,seat,body,first] of manifest){
+        await source.query("INSERT INTO fixture_receipt_inventory.expected VALUES ($1,$2,$3,$4)",
+          [profileId,population,ack,{tenant,recordId,revision,revisionId,seat,source:"fixture",sessionId:null,
+            bodyAccepted:body===first,candidateDigest:body.repeat(64),firstDigest:first.repeat(64)}]);
+      }
+      const complete=await capture();
+      expect(complete.scan.pageItemCounts).toEqual([2,2,1,0]);
+      expect(complete.decisions.map(x=>[x.revisionId,x.bodyAccepted])).toEqual([["v1",true],["v2",false],["v3",true],["v4",true],["v5",true]]);
+      for(const population of Object.keys(counts)){
+        const lost=(await d.pool.query("DELETE FROM fixture_receipt_inventory.observed WHERE profile_id=$1 AND source=$2 RETURNING *",[profileId,population])).rows[0];
+        await assertHeld("terminal comparison held");
+        await target.query("INSERT INTO fixture_receipt_inventory.observed VALUES ($1,$2,$3,$4,$5)",
+          [profileId,population,lost.ack_id,lost.decision,lost.terminal]);
+      }
+      let commits=0;
+      const interrupted={query:async(q:string,args?:unknown[])=>{
+        const result=await client.query(q,args);
+        if(q==="COMMIT" && ++commits===1){
+          await d.pool.query("UPDATE fixture_receipt_inventory.observed SET terminal=false WHERE source='equal_revision_loser'");
+        }
+        return result;
+      }};
+      await expect(captureFrontierReceiptSource(interrupted as never,input)).rejects.toThrow("frontier_receipt_unavailable");
+      expect(commits).toBe(1);
+      await d.pool.query("UPDATE fixture_receipt_inventory.observed SET terminal=true WHERE source='equal_revision_loser'");
+      // Same number of entries on both sides cannot rescue a forged decision.
+      await d.pool.query("UPDATE fixture_receipt_inventory.observed SET decision=jsonb_set(decision,'{seat}','\"99\"') WHERE source='queue'");
+      await assertHeld("terminal comparison held");
+      await d.pool.query("UPDATE fixture_receipt_inventory.observed SET decision=jsonb_set(decision,'{seat}','\"23\"') WHERE source='queue'");
+      // Even simultaneous corruption of both row stores is detected by the immutable test vector.
+      for(const table of ["expected","observed"]){
+        await d.pool.query("UPDATE fixture_receipt_inventory."+table+" SET decision=jsonb_set(decision,'{seat}','\"98\"') WHERE source='queue'");
+      }
+      await assertHeld("independent root mismatch");
+      for(const table of ["expected","observed"]){
+        await d.pool.query("UPDATE fixture_receipt_inventory."+table+" SET decision=jsonb_set(decision,'{seat}','\"23\"') WHERE source='queue'");
+      }
+      // A missing cohort on BOTH sides still disagrees with the issuer's independent terminal count.
+      await d.pool.query("DELETE FROM fixture_receipt_inventory.expected WHERE source='legacy'");
+      await d.pool.query("DELETE FROM fixture_receipt_inventory.observed WHERE source='legacy'");
+      await assertHeld("terminal comparison held");
+    } finally {
+      await client.end();await source.query("RESET ROLE");await target.query("RESET ROLE");source.release();target.release();
+    }
   },30000);
 });
