@@ -15,7 +15,8 @@ const fact = (ts: string, extra: Partial<EventFacts> = {}): EventFacts => ({
   eventId: ts, ts, kind: null, type: null, role: null, tool: null, toolStatus: null, subagentId: null, userId: null,
   files: [], touched: [], git: [], gh: [], branches: [], prRefs: [], shas: [], relay: null, ...extra,
 });
-const facts = (id: string, events: EventFacts[]): SessionFacts => ({ source: "codex", sessionId: id, eventsRead: events.length, censored: false, error: null, events });
+/** Events are numbered in order (`seq`) unless a test sets the raw sequence itself. */
+const facts = (id: string, events: EventFacts[]): SessionFacts => ({ source: "codex", sessionId: id, eventsRead: events.length, censored: false, error: null, events: events.map((e, i) => ({ ...e, seq: e.seq ?? i })) });
 const pr = (number: number, author: string, extra: Partial<ForgePr> = {}): ForgePr => ({
   repo: REPO, number, author, title: `t${number}`, headRef: `b${number}`, createdAt: "2026-09-01T16:00:00.000Z", mergedAt: null, closedAt: null,
   files: ["crates/core/src/lib.rs"], ...extra,
@@ -141,6 +142,15 @@ describe("PR ownership", () => {
     expect(prsOf([call, fact("2026-10-01T10:00:02.000Z", { type: "assistant", prRefs: ["agentworkforce/relayhistory#5001"] })])).toEqual([]);
     // A result past the window does not claim.
     expect(prsOf([call, fact("2026-10-01T10:30:00.000Z", { type: "tool_result", prRefs: ["agentworkforce/relayhistory#5002"] })])).toEqual([]);
+    // A discarded raw event between the call and the result (seq 1 was not kept): not the call's own result.
+    expect(prsOf([{ ...call, seq: 0 }, fact("2026-10-01T10:00:05.000Z", { type: "tool_result", prRefs: ["agentworkforce/relayhistory#5003"], seq: 2 })])).toEqual([]);
+    // Parallel calls: the result after the second call may be the first's; the create abstains.
+    expect(prsOf([{ ...call, seq: 0 }, fact("2026-10-01T10:00:01.000Z", { kind: "tool_call", gh: ["pr-view"], seq: 1 }), fact("2026-10-01T10:00:05.000Z", { type: "tool_result", prRefs: ["agentworkforce/relayhistory#5004"], seq: 2 })])).toEqual([]);
+    // Facts harvested before `seq` existed: abstain.
+    const noSeq = ctxOf([row("a", "K")], [{ source: "codex", sessionId: "a", eventsRead: 2, censored: false, error: null, events: [call, fact("2026-10-01T10:00:05.000Z", { type: "tool_result", prRefs: ["agentworkforce/relayhistory#5005"] })] }], []);
+    expect(noSeq.sessions.get("codex:a")!.prs.filter((p) => p.number > 0 && p.action === "create")).toEqual([]);
+    // The adjacent, successful result claims.
+    expect(prsOf([{ ...call, seq: 0 }, fact("2026-10-01T10:00:05.000Z", { type: "tool_result", prRefs: ["agentworkforce/relayhistory#5006"], seq: 1 })]).map((p) => p.number)).toEqual([5006]);
   });
 });
 
@@ -194,7 +204,9 @@ describe("as-of bundles", () => {
     const text = JSON.stringify(b);
     for (const leak of ["HINDSIGHT", "mergedAt", "crates/core", "after"]) expect(text).not.toContain(leak);
     // PR 94 existed by then but its line only took it at 23:00.
-    expect(b.sides[0]!.prsCreated.map((p) => [p.pr, p.comments?.map((c) => c.body)])).toEqual([["agentworkforce/relayhistory#93", ["before"]]]);
+    // Comment text is not dated (fetched in its latest form), so none appears, before the alert or after.
+    expect(b.sides[0]!.prsCreated.map((p) => p.pr)).toEqual(["agentworkforce/relayhistory#93"]);
+    expect(text).not.toContain("before");
   });
 });
 
@@ -207,7 +219,7 @@ describe("held-out freeze", () => {
     const d = mkdtempSync(join(tmpdir(), "freeze-")), h = join(d, "h"), f = join(d, "forge"), l = join(d, "labels.json");
     mkdirSync(h, { mode: 0o700 }); mkdirSync(join(f, "prs"), { recursive: true, mode: 0o700 });
     const P = { mode: 0o600 };
-    writeFileSync(join(h, "directory.jsonl"), "a\n", P); writeFileSync(join(h, "facts.jsonl"), "b\n", P); writeFileSync(join(f, "prs", "r.json"), "[]", P); writeFileSync(l, "{}", P);
+    writeFileSync(join(h, "manifest.json"), "{}", P); writeFileSync(join(h, "directory.jsonl"), "a\n", P); writeFileSync(join(h, "facts.jsonl"), "b\n", P); writeFileSync(join(f, "prs", "r.json"), "[]", P); writeFileSync(l, "{}", P);
     const a = freezeTerms(h, f, l, 5);
     expect(a).toMatchObject({ perHundred: 5, split: "heldout", observed: "all" });
     writeFileSync(join(h, "facts.jsonl"), "c\n");
@@ -277,6 +289,7 @@ describe("prefix invariance", () => {
 
   test("every detector's alerts up to T, and every as-of bundle at T, ignore the world after T", async () => {
     const { components, rank } = await import("../overlap-bench/ranker.ts");
+    const { outcomeFactsBaseline } = await import("../overlap-bench/baseline.ts");
     const { describe: describePair } = await import("../overlap-bench/bundle.ts");
     const run = (c: Context) => {
       const comps = components(c);
@@ -285,6 +298,7 @@ describe("prefix invariance", () => {
         ...sharedTrigger(c, { windowMin: 240, requireEdit: false, suppressCommunicated: true }),
         ...concurrentEdits(c, { windowH: 6, minShared: 1, maxRootsPerPath: 8, skipHot: true, crossOwnerOnly: false, suppressCommunicated: true }),
         ...rank(c, comps, { wOpenPr: 1, wTrigger: 1, wRarity: 1, rarityCap: 3, wAgree: 0, wCrossOwner: 0, threshold: 0.5 }),
+        ...outcomeFactsBaseline(c, { since: "2026-09-01T00:00:00.000Z", until: "2026-09-03T00:00:00.000Z" }, { limit: 200 }),
       ];
     };
     const full = run(ctxFrom(world));
@@ -320,5 +334,21 @@ describe("dated PR history", () => {
     const at = (t: string) => describePair(ctx, ["root:codex:a", "root:codex:b"], t, () => "member", true).sides[0]!.prsCreated[0]!;
     expect([at("2026-09-01T10:30:00.000Z").title, at("2026-09-01T10:30:00.000Z").body]).toEqual(["original", "first"]);
     expect([at("2026-09-01T12:30:00.000Z").title, at("2026-09-01T12:30:00.000Z").body]).toEqual(["final", "second"]);
+  });
+});
+
+describe("history gaps", () => {
+  test("a deleted or empty description version is unknown, never filled from the current text", async () => {
+    const { historyOf } = await import("../forge/fetch.ts");
+    const { asOf } = await import("../forge/types.ts");
+    const h = historyOf({
+      number: 9, createdAt: "2026-09-01T10:00:00Z", title: "t", body: "CURRENT-BODY",
+      userContentEdits: { nodes: [{ editedAt: "2026-09-01T10:00:00Z", diff: null, deletedAt: "2026-09-02T00:00:00Z" }, { editedAt: "2026-09-01T12:00:00Z", diff: "CURRENT-BODY", deletedAt: null }] },
+      timelineItems: { nodes: [] },
+    });
+    expect(asOf(h.bodies, "2026-09-01T11:00:00Z")?.body).toBeNull();
+    expect(asOf(h.bodies, "2026-09-01T13:00:00Z")?.body).toBe("CURRENT-BODY");
+    const only = historyOf({ number: 10, createdAt: "2026-09-01T10:00:00Z", title: "t", body: "CURRENT-BODY", userContentEdits: { nodes: [{ editedAt: "2026-09-01T10:00:00Z", diff: null, deletedAt: "2026-09-01T10:30:00Z" }] }, timelineItems: { nodes: [] } });
+    expect(only.bodies).toEqual([{ at: "2026-09-01T10:00:00Z", body: null }]);
   });
 });

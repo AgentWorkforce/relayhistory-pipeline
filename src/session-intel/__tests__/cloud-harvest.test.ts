@@ -342,11 +342,87 @@ describe("read scope limits", () => {
     await expect(harvestMcpFrame(mcp(() => ({ sessions: [] })), w)).rejects.toThrow("different workspace");
     await expect(harvestMcpSession(mcp(() => ({ workspace_id: "x", events: [] })), { sessionId: "s", source: "codex", lastTs: "" }, w)).rejects.toThrow("different workspace");
   });
-  test("a directory beyond the row ceiling is refused before any event is read", async () => {
+  test("directory rows count as received, cumulatively, and the page that passes the ceiling is not projected", async () => {
     const { harvestMcpFrame } = await import("../cloud-harvest/mcp-source.ts");
+    const { RowCeiling } = await import("../cloud-harvest/harvest.ts");
     const rows = Array.from({ length: 3 }, (_, i) => ({ session_id: `s${i}`, source: "codex", owner: [], last_active: "2026-11-20T00:00:00Z" }));
-    const client = mcp(() => ({ workspace_id: WS, sessions: rows, next_cursor: null }));
-    await expect(harvestMcpFrame(client, { since: "2026-11-01T00:00:00Z", until: "2026-12-01T00:00:00Z" }, () => {}, 2)).rejects.toThrow("ceiling of 2 rows");
-    expect((await harvestMcpFrame(client, { since: "2026-11-01T00:00:00Z", until: "2026-12-01T00:00:00Z" }, () => {}, 3)).rows).toHaveLength(3);
+    // Duplicates and rows filtered out (before the window) still count: they were received.
+    const client = mcp(() => ({ workspace_id: WS, sessions: [...rows, rows[0], { session_id: "old", source: "codex", owner: [], last_active: "2026-01-01T00:00:00Z" }], next_cursor: null }));
+    let received = 0;
+    const budget = (max: number) => (n: number) => { received += n; if (received > max) throw new RowCeiling("ceiling"); };
+    await expect(harvestMcpFrame(client, { since: "2026-11-01T00:00:00Z", until: "2026-12-01T00:00:00Z" }, () => {}, budget(4))).rejects.toThrow("ceiling");
+    expect(received).toBe(5);
+    received = 0;
+    expect((await harvestMcpFrame(client, { since: "2026-11-01T00:00:00Z", until: "2026-12-01T00:00:00Z" }, () => {}, budget(5))).rows).toHaveLength(3);
+  });
+
+});
+
+describe("round 3 boundaries", () => {
+  test("one limiter bounds requests in flight across every caller, bodies included", async () => {
+    let inFlight = 0, peak = 0;
+    const fetchImpl = (async () => {
+      inFlight++; peak = Math.max(peak, inFlight);
+      await new Promise((r) => setTimeout(r, 5));
+      return { status: 200, headers: new Headers({ "content-type": "application/json" }), text: async () => { await new Promise((r) => setTimeout(r, 5)); inFlight--; return "{}"; } } as unknown as Response;
+    }) as unknown as typeof fetch;
+    const c = new CloudClient({ base: "https://cloud.example.invalid/api/v1", workspaceId: "00000000-0000-0000-0000-000000000000", maxRequests: 100, fetchImpl, sleep: async () => {}, concurrency: 2 }, "x".repeat(32));
+    await Promise.all(Array.from({ length: 8 }, () => c.get("list", "/sessions")));
+    expect(peak).toBe(2);
+    expect(() => new CloudClient({ base: "https://cloud.example.invalid", workspaceId: "00000000-0000-0000-0000-000000000000", maxRequests: 1, concurrency: 6 }, "x".repeat(32))).toThrow("1 to 5");
+  });
+  test("a sliced listing of eight never has more than the limit in flight", async () => {
+    const { harvestFrameSliced } = await import("../cloud-harvest/harvest.ts");
+    let inFlight = 0, peak = 0;
+    const fetchImpl = (async () => {
+      inFlight++; peak = Math.max(peak, inFlight); await new Promise((r) => setTimeout(r, 3)); inFlight--;
+      return new Response(JSON.stringify({ items: [], nextCursor: null }), { status: 200 });
+    }) as unknown as typeof fetch;
+    const c = new CloudClient({ base: "https://cloud.example.invalid/api/v1", workspaceId: "00000000-0000-0000-0000-000000000000", maxRequests: 100, fetchImpl, sleep: async () => {}, concurrency: 5 }, "x".repeat(32));
+    await harvestFrameSliced(c, { since: "2026-11-01T00:00:00Z", until: "2026-11-09T00:00:00Z" }, 8);
+    expect(peak).toBeLessThanOrEqual(5);
+  });
+  test("a torn last record is cut away under the lock; a malformed line elsewhere stops the run", async () => {
+    const { recoverTornTail, readFactsStrict } = await import("../cloud-harvest/harvest.ts");
+    const { mkdtempSync, writeFileSync, readFileSync } = await import("node:fs");
+    const { tmpdir } = await import("node:os");
+    const { join } = await import("node:path");
+    const f = join(mkdtempSync(join(tmpdir(), "torn-")), "facts.jsonl");
+    writeFileSync(f, '{"source":"codex","sessionId":"a"}\n{"source":"co', { mode: 0o600 });
+    expect(() => readFactsStrict(f)).toThrow("partial record");
+    expect(recoverTornTail(f)).toBe(13);
+    expect(readFileSync(f, "utf8")).toBe('{"source":"codex","sessionId":"a"}\n');
+    expect(readFactsStrict(f).map((x) => x.sessionId)).toEqual(["a"]);
+    writeFileSync(f, '{"a":1}\nnot json\n{"b":2}\n', { mode: 0o600 });
+    expect(() => readFactsStrict(f)).toThrow("corrupt at line 2");
+  });
+  test("restored counters and limits are validated before any request", async () => {
+    const { openLedger } = await import("../cloud-harvest/cli.ts");
+    const { mkdtempSync, writeFileSync } = await import("node:fs");
+    const { tmpdir } = await import("node:os");
+    const { join } = await import("node:path");
+    const bad = (m: object) => { const f = join(mkdtempSync(join(tmpdir(), "ledger-")), "manifest.json"); writeFileSync(f, JSON.stringify({ format: "session-intel-cloud-harvest/4", params: {}, createdAt: "x", ...m }), { mode: 0o600 }); return f; };
+    const limits = { maxRequests: 10, maxRows: 10, concurrency: 2 };
+    for (const m of [{ limits, requestsUsed: -1, rowsReceived: 0 }, { limits, requestsUsed: 0, rowsReceived: 11 }, { limits: { ...limits, concurrency: 9 }, requestsUsed: 0, rowsReceived: 0 }, { limits, requestsUsed: 1.5, rowsReceived: 0 }]) {
+      expect(() => openLedger(bad(m), {}, {})).toThrow("does not validate");
+    }
+    expect(openLedger(bad({ limits, requestsUsed: 3, rowsReceived: 4 }), {}, {}).remaining()).toBe(7);
+  });
+  test("a lock holding anything but a pid is refused without echoing it; links in ancestors are refused", async () => {
+    const { lockDir, privateDir, assertPrivateFile } = await import("../cloud-harvest/private-fs.ts");
+    const { mkdtempSync, writeFileSync, symlinkSync, mkdirSync } = await import("node:fs");
+    const { tmpdir } = await import("node:os");
+    const { join } = await import("node:path");
+    const dir = mkdtempSync(join(tmpdir(), "lock-"));
+    writeFileSync(join(dir, "harvest.lock"), "SYNTHETIC-MARKER-TEXT", { mode: 0o600 });
+    let msg = "";
+    try { lockDir(dir); } catch (e) { msg = (e as Error).message; }
+    expect(msg).toContain("does not hold a process id");
+    expect(msg).not.toContain("SYNTHETIC-MARKER");
+    const base = mkdtempSync(join(tmpdir(), "anc-"));
+    mkdirSync(join(base, "real"), { mode: 0o700 });
+    symlinkSync(join(base, "real"), join(base, "link"));
+    expect(() => privateDir(join(base, "link", "child"))).toThrow("symbolic link");
+    expect(() => assertPrivateFile(join(base, "link", "f.json"))).toThrow("symbolic link");
   });
 });

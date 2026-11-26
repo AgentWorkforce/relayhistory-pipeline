@@ -61,14 +61,69 @@ describe("adjudication sample", () => {
 });
 
 describe("stage 2", () => {
-  test("scores kept positives and fresh alerts at the cutoff, with unjudged items counted apart", async () => {
+  const key = [{ pair: "a", truth: "incident:1" as const }, { pair: "b", truth: "hindsight-overlap" as const }, { pair: "c", truth: "fresh" as const }, { pair: "d", truth: "fresh" as const }];
+  const ok = [
+    { pair: "a", verdict: "overlap", p_overlap: 0.6 }, { pair: "b", verdict: "not_overlap", p_overlap: 0.2 },
+    { pair: "c", verdict: "not_overlap", p_overlap: 0.25 }, { pair: "d", verdict: "overlap", p_overlap: 0.3 },
+  ];
+  test("scores kept positives and fresh alerts at the cutoff", async () => {
     const { scoreStage2 } = await import("../overlap-bench/stage2.ts");
-    const key = [{ pair: "a", truth: "incident:1" as const }, { pair: "b", truth: "hindsight-overlap" as const }, { pair: "c", truth: "fresh" as const }, { pair: "d", truth: "fresh" as const }, { pair: "e", truth: "fresh" as const }];
-    const s = scoreStage2(key, [
-      { pair: "a", verdict: "overlap", p_overlap: 0.6 }, { pair: "b", verdict: "not_overlap", p_overlap: 0.2 },
-      { pair: "c", verdict: "not_overlap", p_overlap: 0.25 }, { pair: "d", verdict: "overlap", p_overlap: 0.3 },
-    ], 0.3);
-    expect([s.positives, s.positivesKept, s.fresh, s.freshKept, s.unjudged]).toEqual([2, 1, 2, 1, 1]);
-    expect(s.freshKeptHigh).toBeGreaterThan(0.5);
+    const s = scoreStage2(key, ok, 0.3);
+    expect([s.positives, s.positivesKept, s.fresh, s.freshKept]).toEqual([2, 1, 2, 1]);
+  });
+  test("refuses missing, duplicated, foreign, out-of-range and unknown verdicts", async () => {
+    const { scoreStage2 } = await import("../overlap-bench/stage2.ts");
+    expect(() => scoreStage2(key, ok.slice(0, 3), 0.3)).toThrow("cover 3 of 4");
+    expect(() => scoreStage2(key, [...ok, { pair: "d", verdict: "overlap", p_overlap: 2 }], 0.3)).toThrow("more than one");
+    expect(() => scoreStage2(key, [...ok.slice(0, 3), { pair: "d", verdict: "overlap", p_overlap: 2 }], 0.3)).toThrow("probability");
+    expect(() => scoreStage2(key, [...ok.slice(0, 3), { pair: "z", verdict: "overlap", p_overlap: 0.1 }], 0.3)).toThrow("not in the batch");
+    expect(() => scoreStage2(key, [...ok.slice(0, 3), { pair: "d", verdict: "maybe", p_overlap: 0.1 }], 0.3)).toThrow("not overlap");
+    expect(() => scoreStage2([], [], 0.3)).not.toThrow();
+  });
+  test("a batch changed after it was made is refused", async () => {
+    const { verifiedBatch } = await import("../overlap-bench/stage2.ts");
+    const { createHash } = await import("node:crypto");
+    const { mkdtempSync, mkdirSync, writeFileSync } = await import("node:fs");
+    const { tmpdir } = await import("node:os");
+    const { join } = await import("node:path");
+    const sha = (t: string) => createHash("sha256").update(t).digest("hex");
+    const make = () => {
+      const d = mkdtempSync(join(tmpdir(), "batch-")), P = { mode: 0o600 };
+      mkdirSync(join(d, "judge"), { mode: 0o700 }); mkdirSync(join(d, "key"), { mode: 0o700 });
+      const keyText = JSON.stringify(key), part = "{}\n", prompt = "p";
+      writeFileSync(join(d, "key", "key.json"), keyText, P); writeFileSync(join(d, "judge", "part-00"), part, P); writeFileSync(join(d, "judge", "prompt-00.txt"), prompt, P);
+      writeFileSync(join(d, "judge", "verdicts-00.json"), JSON.stringify(ok), P);
+      const body = { format: "overlap-bench-stage2/2", split: "dev", cutoff: 0.3, promptHash: "x", seed: "s", judge: "j", labelsHash: "l", items: key.length, keyHash: sha(keyText), parts: { "part-00": sha(part) }, prompts: { "prompt-00.txt": sha(prompt) } };
+      writeFileSync(join(d, "key", "stage2.json"), JSON.stringify({ ...body, manifestHash: sha(JSON.stringify(body)) }), P);
+      return d;
+    };
+    expect(verifiedBatch(make()).verdicts).toHaveLength(4);
+    const k = make(); writeFileSync(join(k, "key", "key.json"), JSON.stringify(key.slice(0, 1)), { mode: 0o600 });
+    expect(() => verifiedBatch(k)).toThrow("key was changed");
+    const m = make(); const man = JSON.parse(await Bun.file(join(m, "key", "stage2.json")).text()); man.cutoff = 0.01;
+    writeFileSync(join(m, "key", "stage2.json"), JSON.stringify(man), { mode: 0o600 });
+    expect(() => verifiedBatch(m)).toThrow("manifest was changed");
+    const pt = make(); writeFileSync(join(pt, "judge", "part-00"), "{\"x\":1}\n", { mode: 0o600 });
+    expect(() => verifiedBatch(pt)).toThrow("part-00 was changed");
+  });
+});
+
+describe("once-only held-out", () => {
+  test("one evaluation per labels digest, whatever the paths; an interrupted claim resumes only under the same terms", async () => {
+    const { claimOnce, finishOnce, noteOnce } = await import("../overlap-bench/once.ts");
+    const { mkdtempSync } = await import("node:fs");
+    const { tmpdir } = await import("node:os");
+    const { join } = await import("node:path");
+    const reg = join(mkdtempSync(join(tmpdir(), "reg-")), "heldout"), L = "a".repeat(64);
+    const rec = claimOnce("stage2", L, { freezeHash: "f", promptHash: "p" }, reg);
+    // Interrupted before the batch was made: the same terms resume, other terms are refused.
+    expect(claimOnce("stage2", L, { freezeHash: "f", promptHash: "p" }, reg).state).toBe("claimed");
+    expect(() => claimOnce("stage2", L, { freezeHash: "g", promptHash: "p" }, reg)).toThrow("under other terms");
+    noteOnce(rec, "m1", reg);
+    expect(() => noteOnce(rec, "m2", reg)).toThrow("already has a batch");
+    finishOnce(rec, { ok: true }, reg);
+    expect(() => claimOnce("stage2", L, { freezeHash: "f", promptHash: "p" }, reg)).toThrow("already evaluated");
+    expect(() => finishOnce(rec, {}, reg)).toThrow("already evaluated");
+    expect(() => claimOnce("stage1", "not-a-digest", {}, reg)).toThrow("sha256");
   });
 });

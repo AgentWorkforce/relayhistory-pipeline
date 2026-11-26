@@ -12,6 +12,8 @@ export interface CloudClientOptions {
   base: string; workspaceId: string; maxRequests: number; fetchImpl?: typeof fetch; sleep?: (ms: number) => Promise<void>;
   /** Called synchronously before each request is sent, so a ledger can record it even if the process dies. */
   onRequest?: () => void;
+  /** Requests in flight at once, across every caller (directory slices and session workers alike); at most 5. */
+  concurrency?: number;
 }
 
 export class CloudClient {
@@ -20,6 +22,15 @@ export class CloudClient {
   #base: string;
   #mcp: string;
   #rpcId = 0;
+  #slots = 1;
+  readonly #waiting: Array<() => void> = [];
+  /** One limiter at the request boundary: a request waits for a free slot, whoever sends it. */
+  async #acquire(): Promise<() => void> {
+    if (this.#slots > 0) this.#slots--;
+    else await new Promise<void>((r) => this.#waiting.push(r));
+    let done = false;
+    return () => { if (done) return; done = true; const next = this.#waiting.shift(); if (next) next(); else this.#slots++; };
+  }
   #fetch: typeof fetch;
   #sleep: (ms: number) => Promise<void>;
   constructor(readonly opts: CloudClientOptions, token: string) {
@@ -28,6 +39,9 @@ export class CloudClient {
     if (url.protocol !== "https:" || url.username || url.password || url.search || url.hash) throw new Error("--cloud-api must be a plain https URL");
     if (!/^[0-9a-f-]{36}$/.test(opts.workspaceId)) throw new Error("--workspace must be a workspace uuid");
     if (!Number.isSafeInteger(opts.maxRequests) || opts.maxRequests <= 0) throw new Error("--max-requests must be a positive integer");
+    const c = opts.concurrency ?? 1;
+    if (!Number.isSafeInteger(c) || c < 1 || c > 5) throw new Error("--concurrency must be an integer from 1 to 5");
+    this.#slots = c;
     this.#token = token;
     const api = `${url.origin}${url.pathname.replace(/\/+$/, "")}`;
     this.#base = `${api}/workspaces/${opts.workspaceId}`;
@@ -61,7 +75,7 @@ export class CloudClient {
   get workspaceId(): string { return this.opts.workspaceId; }
 
   get(route: "list" | "events", path: string): Promise<unknown> {
-    return this.#send(route, this.#base + path, { method: "GET" }).then((r) => r.json());
+    return this.#send(route, this.#base + path, { method: "GET" }).then((r) => JSON.parse(r.text));
   }
 
   /**
@@ -72,9 +86,9 @@ export class CloudClient {
   async callTool(name: McpReadTool, args: Record<string, unknown>): Promise<Record<string, unknown>> {
     const body = JSON.stringify({ jsonrpc: "2.0", id: ++this.#rpcId, method: "tools/call", params: { name, arguments: args } });
     const res = await this.#send("mcp", this.#mcp, { method: "POST", body, headers: { "content-type": "application/json", accept: "application/json, text/event-stream" } });
-    const raw = await res.text();
+    const raw = res.text;
     // Streamable HTTP may answer as an event stream; the JSON-RPC response is its last `data:` line.
-    const json = res.headers.get("content-type")?.includes("text/event-stream")
+    const json = res.contentType?.includes("text/event-stream")
       ? raw.split("\n").filter((l) => l.startsWith("data:")).map((l) => l.slice(5).trim()).at(-1) ?? ""
       : raw;
     const msg = JSON.parse(json) as { result?: { isError?: boolean; content?: Array<{ type: string; text?: string }>; structuredContent?: Record<string, unknown> }; error?: { code: number; message: string } };
@@ -88,26 +102,34 @@ export class CloudClient {
     return JSON.parse(text.slice(at + 1));
   }
 
-  async #send(route: "list" | "events" | "mcp", url: string, init: { method: string; body?: string; headers?: Record<string, string> }): Promise<Response> {
+  /** Sends one request and reads its body inside a limiter slot, so "in flight" includes reading the answer. */
+  async #send(route: "list" | "events" | "mcp", url: string, init: { method: string; body?: string; headers?: Record<string, string> }): Promise<{ text: string; contentType: string | null }> {
     for (let attempt = 0; ; attempt++) {
       if (this.requests.total >= this.opts.maxRequests) throw new HarvestCap();
       this.requests.total++; this.requests.byRoute[route]++;
       this.opts.onRequest?.();
-      let res: Response;
+      let wait: number | null = null;
+      const release = await this.#acquire();
       try {
-        res = await this.#fetch(url, { method: init.method, body: init.body, headers: { accept: "application/json", ...init.headers, authorization: `Bearer ${this.#token}`, "user-agent": USER_AGENT }, redirect: "manual" });
-      } catch (e) {
-        if (attempt >= 5) throw new Error(this.redact(`transport: ${(e as Error).message}`));
-        this.requests.retries++; await this.#sleep(1000 * 2 ** attempt); continue;
-      }
-      if (res.status === 200) return res;
-      if ([429, 500, 502, 503, 504].includes(res.status) && attempt < 5) {
-        const ra = Number(res.headers.get("retry-after"));
-        this.requests.retries++; await this.#sleep(Number.isFinite(ra) && ra > 0 ? Math.min(ra, 120) * 1000 : 1000 * 2 ** attempt); continue;
-      }
-      throw new HttpError(res.status, route);
+        let res: Response;
+        try {
+          res = await this.#fetch(url, { method: init.method, body: init.body, headers: { accept: "application/json", ...init.headers, authorization: `Bearer ${this.#token}`, "user-agent": USER_AGENT }, redirect: "manual" });
+        } catch (e) {
+          if (attempt >= 5) throw new Error(this.redact(`transport: ${(e as Error).message}`));
+          wait = 1000 * 2 ** attempt;
+        }
+        if (wait === null) {
+          if (res!.status === 200) return { text: await res!.text(), contentType: res!.headers.get("content-type") };
+          if ([429, 500, 502, 503, 504].includes(res!.status) && attempt < 5) {
+            const ra = Number(res!.headers.get("retry-after"));
+            wait = Number.isFinite(ra) && ra > 0 ? Math.min(ra, 120) * 1000 : 1000 * 2 ** attempt;
+          } else throw new HttpError(res!.status, route);
+        }
+      } finally { release(); }
+      this.requests.retries++; await this.#sleep(wait!);
     }
   }
+
 }
 
 /** The only MCP tools the harvest calls: both are reads. */

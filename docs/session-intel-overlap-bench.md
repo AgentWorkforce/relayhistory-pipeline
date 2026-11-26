@@ -17,7 +17,7 @@ All harvested data, labels, verdicts and bundles stay outside this repository. T
 
 Events stamped before 2025 or with unparseable times are dropped.
 
-**PR ownership.** A root owns a PR only when it created it or created or pushed its head branch, and only from the time that became known (`prOwnership`). A `gh pr create` call usually has no number. Only the call's own result may claim one: the first tool result after the call, within 10 minutes, not failed, that prints a full PR URL. The PR is then owned from that result's time. Any other event ends the wait, so a later, unrelated URL is never claimed. An unresolved call stays an act of opening a PR that owns nothing. A root that only names a PR (a view, a review, a merge, a merge train listing it) does not own it. Otherwise one reviewer touching two PRs would make both look like one line of work. Detectors and as-of bundles ask who owned a PR as of the alert (`ownersAt`). Only scoring and hindsight adjudication use every owner a PR ever had.
+**PR ownership.** A root owns a PR only when it created it or created or pushed its head branch, and only from the time that became known (`prOwnership`). A `gh pr create` call usually has no number. Only the call's own result may claim one: the very next raw event, by the harvest's `seq` (which counts events that were not kept), a tool result within 10 minutes, not failed, printing a full PR URL. Facts carry no tool-use id. So with parallel calls (the next raw event is another call), or in facts harvested before `seq` existed, the claim abstains. The Cloud harvest used here predates `seq`, so in it PR ownership comes from branches only. The PR is then owned from that result's time. Any other event ends the wait, so a later, unrelated URL is never claimed. An unresolved call stays an act of opening a PR that owns nothing. A root that only names a PR (a view, a review, a merge, a merge train listing it) does not own it. Otherwise one reviewer touching two PRs would make both look like one line of work. Detectors and as-of bundles ask who owned a PR as of the alert (`ownersAt`). Only scoring and hindsight adjudication use every owner a PR ever had.
 
 **Observed paths.** `git status` and `--stat` output list what is dirty or changed, not what this session wrote. `ObservedPolicy` sets how they count:
 
@@ -85,29 +85,35 @@ With `asOf`, the bundle carries dated facts only, as a live system would have kn
 - comments made before the alert (each comment is dated);
 - the side's own branches, edits and activity up to then, counting only the sessions with dated activity by then.
 
-A PR's title and description appear only from dated history (forge `history`), as the version in effect at the alert. As fetched they would leak a later edit, so without history they are left out. File lists, merges and closes are always left out.
+A PR's title and description appear only from dated history (forge `history`), as the version in effect at the alert. As fetched they would leak a later edit, so without history they are left out. A version whose edit record was deleted or empty is an unknown interval, and nothing is shown for it. Comment text is left out, because comments are fetched in their latest form and dated only by creation. File lists, merges and closes are always left out.
 
-**Prefix invariance.** A test runs every detector, the ranker and as-of bundles over a synthetic world and over the same world cut at several times T. Everything said about T must be identical in both. It fails if bundles count later sessions, or if D1 uses ownership established after its alert.
+The judge's input is therefore more than PR text. It includes session-derived facts (branches named, files edited, activity span) and owner labels.
 
-**Harvest scopes.** `loadContext` reads each harvest's manifest. Merged harvests must be of one workspace, and none may be past its delete-by. Every input (harvest, forge, labels, verdicts, owner labels, frozen file) and every output must pass the same private-destination checks as the harvest.
+**Prefix invariance.** A test runs every detector (the shipped baseline included), the ranker and as-of bundles over a synthetic world and over the same world cut at several times T. Everything said about T must be identical in both. It fails if bundles count later sessions, or if D1 uses ownership established after its alert.
+
+**Harvest scopes.** `loadContext` reads each harvest's manifest. Merged harvests must be of one workspace, and none may be past its delete-by. Every input (harvest, forge, labels, verdicts, owner labels, frozen file) and every output must pass the same private-destination checks as the harvest. Scope times are validated as canonical UTC instants and compared as instants, failing closed. JSON-lines inputs are read strictly: a malformed line or a partial last record is refused, never skipped.
 
 ## Protocol
 
 1. Climb on the dev split only. Labels are split by workstream, 44 dev incidents and 20 held-out.
-2. Freeze the best point per detector (`overlap-bench-frozen/2`). The freeze records each point's hash (detector, params and sources) together with:
+2. Freeze the best point per detector (`overlap-bench-frozen/3`). The freeze records each point's hash (detector, params and sources) together with:
    - the sources hash;
    - the labels digest;
-   - a digest of every input file (each harvest's directory and facts, and the forge PR files);
+   - a digest of every input file (each harvest's manifest, directory and facts, and the forge PR and history files);
    - the alert budget;
    - the split scored (`heldout`);
    - the observed-path policy.
-3. Score held-out once. `heldout` recomputes every term and every point hash and refuses any mismatch. It uses the frozen budget (a different `--per-hundred` is refused), and refuses if a ledger for these labels already exists (the ledger is written with `wx`).
+   The sources hash covers the bench, the shared code it imports, and the shipped detector the baseline runs (`packages/coordination-detect`). The freeze carries a hash of all of its own terms and points (`freezeHash`), so an edited freeze, such as a changed budget, is refused.
+3. Score held-out once. `heldout` recomputes every term and every point hash and refuses any mismatch. It uses the frozen budget (a different `--per-hundred` is refused). The once-only ledgers (`heldout-stage1-*`, `heldout-stage2-*`) sit beside the labels, keyed by the labels digest, and each is claimed with an exclusive create before scoring. Neither a new output directory nor a new freeze can score the same held-out labels again.
 4. Precision samples use fresh seeds, and a pair is never judged twice.
 5. Stage 2 is frozen with stage 1:
-   - `stage2-batch` binds a batch to the verified frozen file, the frozen ranker point (re-hashed), the prompt (by sha256) and the cutoff;
-   - it draws positives from the split's incidents and fresh negatives that no earlier round judged (`--exclude`, `--verdicts`);
-   - it writes the rendered prompts beside the blind bundles.
-   For held-out, the batch claims a one-time file beside the frozen file (created with `wx`), so no second held-out batch can be drawn. `stage2-score` then scores the verdicts at the frozen cutoff, and on held-out it writes its result only once. The judge runs outside the bench from the rendered prompt, with no lookups.
+   - `stage2-batch` binds a batch to the verified frozen file, the frozen ranker point (re-hashed), the prompt (by sha256), the cutoff, the seed, the exclusions and the judge (`--judge`, recorded);
+   - it draws positives from the split's incidents and fresh negatives that no earlier round judged (`--exclude`, `--verdicts`), within the frozen budget;
+   - judge-readable material (parts and rendered prompts) goes to `<out>/judge`, and the key and manifest go to `<out>/key`, which no prompt names;
+   - the manifest records every part, prompt and the key by hash, and itself by hash.
+
+   `stage2-score` verifies all of that, and requires exactly one valid verdict per pair: a known verdict, and a probability in [0, 1]. A partial, duplicated, foreign or out-of-range answer gets no score.
+6. Held-out is evaluated once per labels digest, in a per-user registry (`once.ts`) that no command-line path chooses. Copying labels, freezes or inputs, or choosing a new output directory, opens no second evaluation. A claim records its terms, so an interrupted run may finish under identical terms, and any other run is refused. A stage-2 claim also records the batch made under it, and only that batch can be scored.
 
 ## Findings so far (dev split)
 
@@ -147,18 +153,21 @@ The earlier separation came from undated intent text. Branches, edited files and
 | p ≥ 0.5 | 3 / 6 | 0 / 40 |
 | p ≥ 0.7 | 2 / 6 | 0 / 40 |
 
-At p ≥ 0.3, 0 of 40 bounds the false-alert rate below about 9% (95% Wilson). Fresh alerts scored at most 0.25. The positives are dev items that earlier rounds also used, and the prompt was written on dev, so this is a dev result. The claim needs the held-out score.
+Fresh alerts scored at most 0.25. As on held-out, 0 of 40 is an observed keep rate among top alerts, not a false-alert rate. These bundles still carried comment text as fetched. The positives are dev items that earlier rounds also used, and the prompt was written on dev, so this is a dev result. The claim needs the held-out score.
 
 ## Held-out (scored once)
 
-The freeze covered the sources at `cbc76e21`, the purged Cloud harvest, the forge PRs and histories, labels v2, a budget of 5 per 100 sessions, and the held-out split. It was then scored once:
+The freeze covered the sources at `cbc76e21`, the purged Cloud harvest, the forge PRs and histories, labels v2, a budget of 5 per 100 sessions, and the held-out split. It was then scored once. Later rounds changed how PR create claims are matched and removed comment text from as-of bundles, so these figures belong to that revision. The held-out set is spent and will not be rerun.
 
-- **Stage 1.** The ranker caught 1 of 5 linkable held-out incidents at the headline budget, with 2 negative hits and a median lead time of 1.5 h. Every other detector, the shipped `outcome-facts` included, caught 0.
-- **Stage 2.** Prompt v3 (sha256 `a0127f22…`) ran at cutoff 0.3 on a one-time batch. The loose ranker reached only 1 held-out incident pair before its harm, so the batch held that 1 positive and 40 fresh top-ranked alerts no round had judged. The judge kept the positive (p 0.4) and none of the 40 fresh alerts (highest 0.25). That bounds the share of top alerts it would still raise below 8.8% (95% Wilson).
+- **Stage 1.** Of the held-out incidents, 5 were linkable: both lines linked to session evidence. The ranker caught 1 of those 5 at the headline budget, with 2 negative hits and a median lead time of 1.5 h. Every other detector, the shipped `outcome-facts` included, caught 0. Recall is conditional on linkability; most held-out incidents were not linkable at all.
+- **Stage 2.** Prompt v3 (sha256 `a0127f22…`) ran at cutoff 0.3 on a one-time batch, with comment text (as fetched) still in the bundles. The loose ranker reached only 1 held-out incident pair before its harm, so the batch held that 1 positive and 40 fresh top-ranked alerts no round had judged. The judge kept the positive (p 0.4) and none of the 40 (highest 0.25).
 
-The held-out positives are too few to estimate stage 2's recall. What held-out does support is the false-alert side: stage 2 removes nearly all of stage 1's top alerts without being tuned on them. Recall is limited by coverage first: most incidents lack session evidence on one or both sides.
+What this supports and what it does not:
+- One positive cannot estimate stage 2's recall.
+- 0 of 40 is an observed keep rate among top-ranked alerts. It is not a false-alert rate: fresh alerts have no independent truth (in the hindsight round about 1 in 70 top alerts was a real overlap), and its Wilson upper bound of about 8.8% assumes independent draws, which top-ranked alerts from one workspace are not.
+- It does show that the judge, untuned on these alerts, passed none of 40 top alerts on.
 
-## Stage 2 (proposed)
+## Stage 2 (proposed)## Stage 2 (proposed)
 
 Structure gives recall but not precision, and an intent judge without dated intent text gives neither. Stage 2 therefore needs **dated intent**: what each line meant to do, as it stood at the alert. Two sources keep that inside the rules here:
 
@@ -182,7 +191,7 @@ These findings apply to the live overlap path. Each change goes through review s
 | + shell writes and `git add` | 3,901 | 0 / 21 | 6 / 21 |
 | + `git status` and `--stat` listings | 5,591 | 5 / 21 | 6 / 21 |
 
-Recovering shell writes and `git add` widens coverage but adds no recall, so it is not worth porting on this evidence. What lifts the ranker within budget is what sessions see in `git status` and `--stat`. Status alone gives 2 hits; counting only paths that became dirty during the session gives 0. The signal is therefore not what a session wrote. It is **two lines of work seeing the same dirty working tree**: two agents in one checkout, or one line picking up another's uncommitted work. That is a real collision class, and production has no evidence for it today. The sample is 5 hits, so treat it as a lead, not a result.
+Recovering shell writes and `git add` widens coverage but adds no recall, so it is not worth porting on this evidence. What lifts the ranker within budget is what sessions see in `git status` and `--stat`. Status alone gives 2 hits; counting only paths that became dirty during the session gives 0. The signal is therefore not what a session wrote. Two lines listing the same dirty paths **suggests** they shared a checkout, or that one picked up the other's uncommitted work. It does not establish either without independent evidence of the checkout or of the lineage. If confirmed, that is a real collision class with no production evidence today. The 5 hits are exploratory: a lead to test, not a result.
 
 Porting it means a projection that derives observed-dirty paths from `git status` and `--stat` tool results. It must be a field of its own, never mixed into `files_touched` (they are observations, not writes), so it needs a schema decision.
 

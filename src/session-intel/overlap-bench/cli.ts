@@ -25,10 +25,23 @@ import { type IncidentLabel, type NegativeLabel, score, type Score } from "./sco
 import { components, type Components, rank, rankerGrid, type RankerParams } from "./ranker.ts";
 import { adjudicationSample, type AlertVerdict, ceiling, evaluate, pairId } from "./eval.ts";
 import { describe as describePair } from "./bundle.ts";
-import { LOOSE_RANKER, scoreStage2, type Stage2Verdict, stage2Batch, type Truth } from "./stage2.ts";
-import { assertPrivateFile, assertPrivateInput, outsideRoot, readPrivate, writePrivate } from "../cloud-harvest/private-fs.ts";
+import { LOOSE_RANKER, scoreStage2, stage2Batch, verifiedBatch } from "./stage2.ts";
+import { claimOnce, finishOnce, noteOnce, onceState } from "./once.ts";
+import { assertPrivateFile, assertPrivateInput, outsideRoot, privateDir, readPrivate, writePrivate } from "../cloud-harvest/private-fs.ts";
 
-const readJsonl = <T>(p: string): T[] => readPrivate(p).split("\n").filter(Boolean).flatMap((l) => { try { return [JSON.parse(l) as T]; } catch { return []; } });
+/** Every record of a JSON-lines input; a malformed line or a partial last record is refused, never skipped. */
+const readJsonl = <T>(p: string): T[] => {
+  const text = readPrivate(p);
+  if (text && !text.endsWith("\n")) throw new Error(`${p} ends in a partial record`);
+  return text.split("\n").slice(0, -1).map((l, i) => { try { return JSON.parse(l) as T; } catch { throw new Error(`${p} is malformed at line ${i + 1}`); } });
+};
+/** A canonical instant: parses, and is an ISO-8601 UTC time (date, time, optional fraction, Z). */
+const INSTANT = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,9})?Z$/;
+const instant = (v: unknown, what: string): number => {
+  const t = typeof v === "string" && INSTANT.test(v) ? Date.parse(v) : NaN;
+  if (!Number.isFinite(t)) throw new Error(`${what} is not a canonical UTC timestamp`);
+  return t;
+};
 
 /**
  * Merges several harvests of one workspace (the Cloud routes before the 2026-11-05 storage move, the Reader after
@@ -67,11 +80,14 @@ export function harvestScopes(harvest: string, now = new Date().toISOString()): 
     assertPrivateInput(dir, "dir");
     const m = JSON.parse(readPrivate(join(dir, "manifest.json"))) as { params?: Record<string, string> };
     const p = m.params ?? {};
-    if (!p.workspace || !p.since || !p.until || !p.deleteBy) throw new Error(`${dir}: the manifest does not record its scope`);
-    return { dir, workspace: p.workspace, since: p.since, until: p.until, deleteBy: p.deleteBy, via: p.via ?? "cloud" };
+    if (typeof p.workspace !== "string" || !/^[0-9a-f-]{36}$|^[A-Za-z0-9._-]{1,64}$/.test(p.workspace)) throw new Error(`${dir}: the manifest does not record its workspace`);
+    // Compared as instants, and fail closed: a scope that does not validate is not read.
+    const since = instant(p.since, `${dir}: since`), until = instant(p.until, `${dir}: until`), deleteBy = instant(p.deleteBy, `${dir}: deleteBy`);
+    if (!(since < until)) throw new Error(`${dir}: the window is empty or reversed`);
+    if (!(deleteBy > instant(now, "now"))) throw new Error(`${dir}: past its delete-by date; it must be deleted, not read`);
+    return { dir, workspace: p.workspace, since: p.since!, until: p.until!, deleteBy: p.deleteBy!, via: p.via ?? "cloud" };
   });
   if (new Set(scopes.map((x) => x.workspace)).size > 1) throw new Error("the harvests are of different workspaces");
-  for (const x of scopes) if (x.deleteBy <= now) throw new Error(`${x.dir}: past its delete-by date (${x.deleteBy}); it must be deleted, not read`);
   return scopes;
 }
 
@@ -127,7 +143,15 @@ const REPO_ROOT = realpathSync(resolve(fileURLToPath(new URL("../../..", import.
 const inRepo = (p: string) => (p + "/").startsWith(REPO_ROOT + "/");
 export function assertOutsideRepo(out: string): string { return outsideRoot(out, REPO_ROOT); }
 
-const SOURCES = ["detectors.ts", "model.ts", "paths.ts", "score.ts", "baseline.ts", "ranker.ts", "eval.ts", "bundle.ts", "stage2.ts", "cli.ts"].map((f) => new URL(f, import.meta.url));
+/**
+ * Every source a score depends on, transitively: the bench, the shared code it imports (the harvest's facts and
+ * directory types and its private I/O, the forge types), and the shipped detector the baseline runs.
+ */
+const SOURCES = [
+  ...["detectors.ts", "model.ts", "paths.ts", "score.ts", "baseline.ts", "ranker.ts", "eval.ts", "bundle.ts", "stage2.ts", "once.ts", "cli.ts"],
+  "../cloud-harvest/features.ts", "../cloud-harvest/harvest.ts", "../cloud-harvest/private-fs.ts", "../forge/types.ts",
+  "../../../packages/coordination-detect/src/index.ts",
+].map((f) => new URL(f, import.meta.url));
 const sourceHash = () => createHash("sha256").update(SOURCES.map((u) => readFileSync(u)).join("\u0000")).digest("hex");
 /** sha256 over files, streamed (harvest facts are large), in the given order, each prefixed with its name and size. */
 function digestFiles(files: string[]): string {
@@ -142,11 +166,15 @@ function digestFiles(files: string[]): string {
 }
 /** Everything a frozen score depends on besides the points themselves: inputs, sources, labels, budget, split. */
 export interface FreezeTerms { sourceHash: string; labelsHash: string; inputsHash: string; perHundred: number; split: "heldout"; observed: "all" }
-type Frozen = FreezeTerms & { format?: string; frozen: Array<{ detector: string; params: Record<string, unknown>; hash: string }> };
+type Frozen = FreezeTerms & { format?: string; freezeHash?: string; frozen: Array<{ detector: string; params: Record<string, unknown>; hash: string }> };
+/** The identity of a freeze: every term and point, so editing any of them (the budget, say) breaks it. */
+const freezeHashOf = (body: object) => createHash("sha256").update(JSON.stringify(body)).digest("hex");
 /** A frozen file whose every term (inputs, sources, labels, budget, split, policy) matches what is on disk now. */
 function verifiedFrozen(file: string, values: { harvest?: string; forge?: string; labels?: string; "per-hundred"?: string }, perHundred: number): Frozen {
   const frozen = JSON.parse(readPrivate(file)) as Frozen;
-  if (frozen.format !== "overlap-bench-frozen/2") throw new Error("frozen file predates input and budget freezing; climb again");
+  if (frozen.format !== "overlap-bench-frozen/3") throw new Error("frozen file predates the freeze identity; climb again");
+  const { freezeHash, ...body } = frozen;
+  if (freezeHash !== freezeHashOf(body)) throw new Error("the frozen file was changed after freezing");
   if (values["per-hundred"] !== undefined && perHundred !== frozen.perHundred) throw new Error("--per-hundred differs from the frozen budget");
   const now = freezeTerms(values.harvest!, values.forge!, values.labels!, frozen.perHundred);
   for (const k of ["sourceHash", "labelsHash", "inputsHash", "perHundred", "split", "observed"] as const) {
@@ -157,7 +185,7 @@ function verifiedFrozen(file: string, values: { harvest?: string; forge?: string
 
 export function freezeTerms(harvest: string, forge: string, labels: string, perHundred: number): FreezeTerms {
   const inputs = [
-    ...harvest.split(",").filter(Boolean).flatMap((d) => ["directory.jsonl", "facts.jsonl"].map((f) => join(d, f))),
+    ...harvest.split(",").filter(Boolean).flatMap((d) => ["manifest.json", "directory.jsonl", "facts.jsonl"].map((f) => join(d, f))),
     ...readdirSync(join(forge, "prs")).filter((n) => n.endsWith(".json")).sort().map((n) => join(forge, "prs", n)),
     ...(existsSync(join(forge, "history")) ? readdirSync(join(forge, "history")).filter((n) => n.endsWith(".json")).sort().map((n) => join(forge, "history", n)) : []),
   ];
@@ -174,19 +202,20 @@ async function main(argv: string[]) {
   const { values } = parseArgs({ args: rest, options: {
     harvest: { type: "string" }, forge: { type: "string" }, labels: { type: "string" }, out: { type: "string" }, frozen: { type: "string" },
     "per-hundred": { type: "string" }, verdicts: { type: "string" }, "per-detector": { type: "string" }, seed: { type: "string" }, "owner-labels": { type: "string" },
-    split: { type: "string" }, prompt: { type: "string" }, cutoff: { type: "string" }, fresh: { type: "string" }, exclude: { type: "string" },
+    split: { type: "string" }, prompt: { type: "string" }, cutoff: { type: "string" }, fresh: { type: "string" }, exclude: { type: "string" }, judge: { type: "string" },
   } });
   if (cmd === "stage2-score") {
-    // Scores a batch's verdicts at its frozen cutoff. A held-out batch is scored once (the result is written with wx).
+    // Scores a batch at its frozen cutoff, only after verifying the batch is the one that was made (every part,
+    // prompt and the key by hash, the manifest by its own hash) and that the verdicts cover it exactly.
     if (!values.out) throw new Error("stage2-score needs --out (the batch directory)");
-    const dir = values.out;
-    const m = JSON.parse(readPrivate(join(dir, "stage2.json"))) as { split: string; cutoff: number; promptHash: string };
-    const key = JSON.parse(readPrivate(join(dir, "key.json"))) as Array<{ pair: string; truth: Truth }>;
-    const verdicts = readdirSync(dir).filter((n) => /^verdicts-\d+\.json$/.test(n)).sort().flatMap((n) => JSON.parse(readPrivate(join(dir, n))) as Stage2Verdict[]);
-    const result = { ...scoreStage2(key, verdicts, m.cutoff), split: m.split, promptHash: m.promptHash };
-    const file = join(dir, "score.json");
-    assertPrivateFile(file);
-    writeFileSync(file, JSON.stringify(result, null, 1), { mode: 0o600, flag: m.split === "heldout" ? "wx" : "w" });
+    const { manifest, key, verdicts } = verifiedBatch(values.out);
+    const result = { ...scoreStage2(key, verdicts, manifest.cutoff), split: manifest.split, promptHash: manifest.promptHash, judge: manifest.judge, manifestHash: manifest.manifestHash };
+    if (manifest.split === "heldout") {
+      const rec = onceState("stage2", manifest.labelsHash);
+      if (!rec || rec.state !== "claimed" || rec.batch !== manifest.manifestHash) throw new Error("this held-out batch is not the one claimed for these labels, or it was already scored");
+      finishOnce(rec, result);
+    }
+    writePrivate(join(values.out, "key", "score.json"), JSON.stringify(result, null, 1));
     console.log(JSON.stringify(result));
     return;
   }
@@ -211,21 +240,22 @@ async function main(argv: string[]) {
     writePrivate(join(values.out, "climb-log.json"), JSON.stringify(log, null, 1));
     const frozen = [...best.values()].map(({ g, s }) => ({ detector: g.detector, params: g.params, hash: pointHash(g), dev: { hits: s.hits.length, linkable: s.linkable, negativeHits: s.negativeHits, alerts: s.alerts, medianLeadH: s.medianLeadH } }));
     const terms = freezeTerms(values.harvest, values.forge, values.labels, perHundred);
-    writePrivate(join(values.out, "frozen.json"), JSON.stringify({ format: "overlap-bench-frozen/2", ...terms, frozen }, null, 1));
+    const body = { format: "overlap-bench-frozen/3", ...terms, frozen };
+    writePrivate(join(values.out, "frozen.json"), JSON.stringify({ ...body, freezeHash: freezeHashOf(body) }, null, 1));
     for (const f of frozen) console.log(JSON.stringify(f));
   } else if (cmd === "heldout") {
     if (!values.frozen) throw new Error("heldout needs --frozen");
     const frozen = verifiedFrozen(values.frozen, values, perHundred);
-    const ledger = join(values.out, `heldout-${frozen.labelsHash.slice(0, 12)}.json`);
-    if (existsSync(ledger)) throw new Error("held-out was already scored for these labels");
+    // One evaluation per labels digest, recorded in the per-user registry (once.ts), whatever paths are used.
+    const rec = claimOnce("stage1", frozen.labelsHash, { freezeHash: frozen.freezeHash });
     const results = frozen.frozen.map((f) => {
       const g = grid().find((x) => x.detector === f.detector && JSON.stringify(x.params) === JSON.stringify(f.params));
       if (!g) throw new Error(`frozen point ${f.hash} is not in the grid`);
       if (pointHash(g) !== f.hash) throw new Error(`frozen point ${f.hash} does not hash to its parameters and sources`);
       return { hash: f.hash, ...score(g.detector, ctx, g.run(ctx), labels.incidents.filter((i) => i.split === frozen.split), labels.negatives, { sessions: ctx.codingSessions, perHundred: frozen.perHundred }) };
     });
-    assertPrivateFile(ledger);
-    writeFileSync(ledger, JSON.stringify(results, null, 1), { mode: 0o600, flag: "wx" });
+    finishOnce(rec, { freezeHash: frozen.freezeHash, results });
+    writePrivate(join(values.out, "heldout.json"), JSON.stringify({ freezeHash: frozen.freezeHash, results }, null, 1));
     for (const r of results) console.log(JSON.stringify({ detector: r.detector, hits: r.hits.length, linkable: r.linkable, recall: r.recall, negativeHits: r.negativeHits, medianLeadH: r.medianLeadH }));
   } else if (cmd === "eval" || cmd === "sample") {
     // Both read the frozen points and the dev split only; held-out stays behind `heldout`.
@@ -252,11 +282,15 @@ async function main(argv: string[]) {
       console.log(JSON.stringify({ sampled: sample.length }));
     }
   } else if (cmd === "stage2-batch") {
-    // A blind stage-2 batch for one split, bound to the frozen stage 1, the prompt (by hash) and the cutoff.
-    if (!values.frozen || !values.prompt || !values.cutoff || !values.seed) throw new Error("stage2-batch needs --frozen, --prompt, --cutoff and --seed");
+    // A blind stage-2 batch for one split, bound to the frozen stage 1, the prompt (by hash), the cutoff, the seed,
+    // the exclusions and the judge. Judge-readable material (parts, rendered prompts) goes to <out>/judge; the key
+    // and the manifest go to <out>/key, which no prompt names.
+    if (!values.frozen || !values.prompt || !values.cutoff || !values.seed || !values.judge) throw new Error("stage2-batch needs --frozen, --prompt, --cutoff, --seed and --judge");
     const split = values.split === "heldout" ? "heldout" : values.split === "dev" ? "dev" : (() => { throw new Error("--split must be dev or heldout"); })();
     const cutoff = Number(values.cutoff);
     if (!(cutoff > 0 && cutoff <= 1)) throw new Error("--cutoff must be in (0, 1]");
+    const fresh = Number(values.fresh ?? 40);
+    if (!Number.isSafeInteger(fresh) || fresh < 1) throw new Error("--fresh must be a positive integer");
     const frozen = verifiedFrozen(values.frozen, values, perHundred);
     const ranker = frozen.frozen.find((f) => f.detector === "ranker");
     if (!ranker) throw new Error("the frozen file has no ranker point");
@@ -264,36 +298,41 @@ async function main(argv: string[]) {
     if (!g || pointHash(g) !== ranker.hash) throw new Error("the frozen ranker point does not hash to its parameters and sources");
     const prompt = readPrivate(values.prompt);
     if (!prompt.includes("{INPUT}") || !prompt.includes("{OUTPUT}")) throw new Error("the prompt must name {INPUT} and {OUTPUT}");
-    const promptHash = createHash("sha256").update(prompt).digest("hex");
-    // Held-out is judged once: the ledger is claimed when its batch is made, so no second batch can be drawn.
-    if (split === "heldout") {
-      // Beside the frozen file, so every batch drawn from one freeze sees the same claim.
-      const claim = join(dirname(resolve(values.frozen)), `stage2-heldout-${frozen.labelsHash.slice(0, 12)}.claim`);
-      assertPrivateFile(claim);
-      writeFileSync(claim, JSON.stringify({ promptHash, cutoff, ranker: ranker.hash, at: new Date().toISOString() }), { mode: 0o600, flag: "wx" });
-    }
+    const sha = (t: string) => createHash("sha256").update(t).digest("hex");
     const judged = new Set<string>();
-    for (const f of (values.exclude ?? "").split(",").filter(Boolean)) for (const k of JSON.parse(readPrivate(f)) as Array<{ pair: string }>) judged.add(k.pair);
+    const exclusionFiles = (values.exclude ?? "").split(",").filter(Boolean);
+    for (const f of exclusionFiles) for (const k of JSON.parse(readPrivate(f)) as Array<{ pair: string }>) judged.add(k.pair);
     const hindsight = values.verdicts ? (JSON.parse(readPrivate(values.verdicts)) as AlertVerdict[]) : [];
     for (const v of hindsight) judged.add(v.pair);
+    const terms = { freezeHash: frozen.freezeHash, promptHash: sha(prompt), cutoff, seed: values.seed, fresh, judge: values.judge, exclusionsHash: sha([...judged].sort().join("\n")) };
+    // Held-out: claimed (or an interrupted claim under identical terms resumed) before anything is drawn.
+    const rec = split === "heldout" ? claimOnce("stage2", frozen.labelsHash, terms) : null;
+    // A claim whose batch was already made is not drawn again (a resumed claim without one may finish).
+    if (rec?.batch) throw new Error("the held-out batch for these labels was already made");
     const comps = componentsOf(ctx);
     const items = stage2Batch(ctx, {
       incidents: labels.incidents.filter((i) => i.split === split), loose: rank(ctx, comps, { ...LOOSE_RANKER }), frozen: rank(ctx, comps, ranker.params as unknown as RankerParams),
       hindsightOverlaps: split === "dev" ? hindsight.filter((v) => v.verdict === "overlap").map((v) => v.pair) : [], judged,
-      fresh: Number(values.fresh ?? 40), seed: values.seed,
+      fresh, seed: values.seed, perHundred: frozen.perHundred,
     });
     const names = values["owner-labels"] ? JSON.parse(readPrivate(values["owner-labels"])) as Record<string, string> : {};
     const ownerLabel = (u: string | null) => u === null ? null : names[u] ?? "member";
     const bundles = items.map((x) => JSON.stringify(describePair(ctx, x.sides, x.at, ownerLabel, true)));
-    const half = Math.ceil(bundles.length / 2);
+    const judgeDir = privateDir(join(values.out, "judge")), keyDir = privateDir(join(values.out, "key"));
+    const half = Math.ceil(bundles.length / 2), parts: Record<string, string> = {}, prompts: Record<string, string> = {};
     for (const [i, part] of [bundles.slice(0, half), bundles.slice(half)].entries()) {
-      const id = String(i).padStart(2, "0");
-      writePrivate(join(values.out, `part-${id}`), part.join("\n") + "\n");
-      writePrivate(join(values.out, `prompt-${id}.txt`), prompt.replaceAll("{INPUT}", join(values.out, `part-${id}`)).replaceAll("{OUTPUT}", join(values.out, `verdicts-${id}.json`)));
+      const id = String(i).padStart(2, "0"), body = part.length ? part.join("\n") + "\n" : "";
+      const rendered = prompt.replaceAll("{INPUT}", join(judgeDir, `part-${id}`)).replaceAll("{OUTPUT}", join(judgeDir, `verdicts-${id}.json`));
+      writePrivate(join(judgeDir, `part-${id}`), body); writePrivate(join(judgeDir, `prompt-${id}.txt`), rendered);
+      parts[`part-${id}`] = sha(body); prompts[`prompt-${id}.txt`] = sha(rendered);
     }
-    writePrivate(join(values.out, "key.json"), JSON.stringify(items.map((x) => ({ pair: pairId(x.sides), truth: x.truth })), null, 1));
-    writePrivate(join(values.out, "stage2.json"), JSON.stringify({ format: "overlap-bench-stage2/1", split, cutoff, promptHash, ranker: ranker.hash, sourceHash: frozen.sourceHash, labelsHash: frozen.labelsHash, inputsHash: frozen.inputsHash, seed: values.seed, items: items.length }, null, 1));
-    console.log(JSON.stringify({ split, items: items.length, positives: items.filter((x) => x.truth !== "fresh").length, fresh: items.filter((x) => x.truth === "fresh").length, promptHash: promptHash.slice(0, 16) }));
+    const keyText = JSON.stringify(items.map((x) => ({ pair: pairId(x.sides), truth: x.truth })), null, 1);
+    writePrivate(join(keyDir, "key.json"), keyText);
+    const body = { format: "overlap-bench-stage2/2", split, ...terms, labelsHash: frozen.labelsHash, ranker: ranker.hash, perHundred: frozen.perHundred, items: items.length, keyHash: sha(keyText), parts, prompts };
+    const manifest = { ...body, manifestHash: sha(JSON.stringify(body)) };
+    writePrivate(join(keyDir, "stage2.json"), JSON.stringify(manifest, null, 1));
+    if (rec) noteOnce(rec, manifest.manifestHash);
+    console.log(JSON.stringify({ split, items: items.length, positives: items.filter((x) => x.truth !== "fresh").length, fresh: items.filter((x) => x.truth === "fresh").length, promptHash: terms.promptHash.slice(0, 16) }));
   } else throw new Error("command must be climb, heldout, eval, sample or stage2-batch");
 }
 

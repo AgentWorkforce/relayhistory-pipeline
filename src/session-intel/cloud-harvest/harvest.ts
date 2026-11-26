@@ -3,7 +3,7 @@
  * session's events reduced to derived facts. Output is append-only so a rerun resumes; nothing is ever rewritten
  * except the coverage receipt.
  */
-import { appendFileSync, existsSync } from "node:fs";
+import { appendFileSync, closeSync, existsSync, ftruncateSync, openSync, readFileSync, readSync, statSync } from "node:fs";
 import { assertPrivateFile, readPrivate, writePrivate } from "./private-fs.ts";
 import { join } from "node:path";
 import { type CloudClient, HarvestCap, HttpError } from "./client.ts";
@@ -20,6 +20,37 @@ export interface Gap { from: string; to: string; reason: string }
 /** `outOfWindow` counts events read but dropped, unreduced, for falling outside the approved window. */
 export interface SessionFacts { source: string; sessionId: string; eventsRead: number; censored: boolean; error: string | null; events: EventFacts[]; outOfWindow?: number }
 export interface Window { since: string; until: string }
+
+/**
+ * An interrupted append can leave a final record without its newline. Under the harvest lock, that partial tail
+ * (and only it: everything after the last newline) is cut away, so the session is read again and the next append
+ * starts on a fresh line. Returns the bytes removed.
+ */
+export function recoverTornTail(file: string): number {
+  if (!existsSync(file)) return 0;
+  const size = statSync(file).size;
+  if (size === 0) return 0;
+  const fd = openSync(file, "r+");
+  try {
+    const last = Buffer.alloc(1);
+    readSync(fd, last, 0, 1, size - 1);
+    if (last[0] === 0x0a) return 0;
+    const text = readFileSync(file);
+    const keep = text.lastIndexOf(0x0a) + 1;
+    ftruncateSync(fd, keep);
+    return size - keep;
+  } finally { closeSync(fd); }
+}
+
+/** Every record of a facts file; a malformed line anywhere is corruption and stops the run (no line is skipped). */
+export function readFactsStrict(file: string): SessionFacts[] {
+  if (!existsSync(file)) return [];
+  const text = readPrivate(file);
+  if (text && !text.endsWith("\n")) throw new Error(`${file} ends in a partial record; resume the harvest to recover it`);
+  return text.split("\n").slice(0, -1).map((line, i) => {
+    try { return JSON.parse(line) as SessionFacts; } catch { throw new Error(`${file} is corrupt at line ${i + 1}`); }
+  });
+}
 
 /**
  * What each reader can enforce at the read boundary. Neither current reader can bound event times on the server:
@@ -52,17 +83,19 @@ const failed = (p: ListPage) => p.error === true && (p.items ?? []).length === 0
  * a page succeeds, then binary-search down to `resolutionMs`. Rows between that cursor and `t` are unreachable
  * through the list and are returned as the gap.
  */
-export async function stepPastBadRow(client: CloudClient, t: string, floor: string, resolutionMs = 250) {
+export async function stepPastBadRow(client: CloudClient, t: string, floor: string, resolutionMs = 250, takeRows: TakeRows = noTake) {
   let bad = 0, good = 1_000, page: ListPage | null = null;
   for (;;) {
     if (minus(t, good) <= floor) return { gapFrom: floor, page: null, probes: 0 };
     const p = await client.get("list", `/sessions?cursor=${encodeURIComponent(cursorAt(minus(t, good)))}`) as ListPage;
+    takeRows(p.items?.length ?? 0);
     if (!failed(p)) { page = p; break; }
     bad = good; good *= 4;
   }
   while (good - bad > resolutionMs) {
     const mid = Math.floor((bad + good) / 2);
     const p = await client.get("list", `/sessions?cursor=${encodeURIComponent(cursorAt(minus(t, mid)))}`) as ListPage;
+    takeRows(p.items?.length ?? 0);
     if (failed(p)) bad = mid; else { good = mid; page = p; }
   }
   return { gapFrom: minus(t, good), page };
@@ -73,22 +106,31 @@ export async function stepPastBadRow(client: CloudClient, t: string, floor: stri
  * skipped span is recorded as a gap, never silently dropped.
  */
 /** Thrown when a directory listing would exceed the approved row ceiling: nothing beyond it is read. */
+/**
+ * Thrown when the directory rows received would pass the approved ceiling. Rows are counted as received, every
+ * page (probes, filtered and duplicate rows included), cumulatively across slices and resumes; the page that
+ * crosses the ceiling is not projected. The overshoot is that one page, received and dropped.
+ */
 export class RowCeiling extends Error {}
-export const checkRows = (n: number, maxRows: number) => { if (n > maxRows) throw new RowCeiling(`the directory exceeds the approved ceiling of ${maxRows} rows`); };
+export type TakeRows = (n: number) => void;
+const noTake: TakeRows = () => {};
 
-export async function harvestFrame(client: CloudClient, window: { since: string; until: string }, log: (m: string) => void = () => {}, maxRows = Number.MAX_SAFE_INTEGER) {
+export async function harvestFrame(client: CloudClient, window: { since: string; until: string }, log: (m: string) => void = () => {}, takeRows: TakeRows = noTake) {
   const rows = new Map<string, DirectoryRow>();
   const gaps: Gap[] = [];
   let cursor: string | null = cursorAt(window.until);
   let pages = 0, lastTs = window.until;
   let pending: ListPage | null = null;
   while (cursor || pending) {
+    const fresh = !pending;
     const page: ListPage = pending ?? await client.get("list", `/sessions?cursor=${encodeURIComponent(cursor!)}`) as ListPage;
+    // A page handed over by the bad-row probe was counted when the probe received it.
+    if (fresh) takeRows(page.items?.length ?? 0);
     pending = null;
     pages++;
     const items = page.items ?? [];
     if (failed(page)) {
-      const step = await stepPastBadRow(client, lastTs, window.since);
+      const step = await stepPastBadRow(client, lastTs, window.since, 250, takeRows);
       gaps.push({ from: step.gapFrom, to: lastTs, reason: "directory_page_error" });
       log(`directory error page below ${lastTs}; resumed at ${step.gapFrom}`);
       lastTs = step.gapFrom;
@@ -101,7 +143,7 @@ export async function harvestFrame(client: CloudClient, window: { since: string;
       const ts = String(it.lastTs ?? "");
       if (ts && ts < window.since) { reachedSince = true; continue; }
       const row = directoryProjection(it, "cloud") as DirectoryRow | null;
-      if (row) { rows.set(`${row.source}\u0000${row.sessionId}`, row); checkRows(rows.size, maxRows); }
+      if (row) rows.set(`${row.source}\u0000${row.sessionId}`, row);
       if (ts) lastTs = ts;
     }
     if (pages % 25 === 0) log(`directory pages ${pages}, sessions ${rows.size}, at ${lastTs}`);
@@ -115,7 +157,7 @@ interface EventsPage { events?: RawEvent[]; nextCursor?: string | null }
 
 export async function harvestSession(client: CloudClient, row: DirectoryRow, window: Window): Promise<SessionFacts> {
   const out: SessionFacts = { source: row.source, sessionId: row.sessionId, eventsRead: 0, censored: false, error: null, events: [], outOfWindow: 0 };
-  let cursor: string | null = null;
+  let cursor: string | null = null, seq = 0;
   for (let page = 0; ; page++) {
     if (page >= MAX_EVENT_PAGES) { out.censored = true; break; }
     const q = new URLSearchParams({ limit: String(EVENTS_PAGE), order: "asc" });
@@ -133,7 +175,7 @@ export async function harvestSession(client: CloudClient, row: DirectoryRow, win
       // The window is enforced before an event is reduced: nothing outside it is derived or kept.
       const w = inWindow(raw.ts, window);
       if (w !== 0) { out.outOfWindow!++; if (w > 0) past = true; continue; }
-      const f = eventFacts(raw);
+      const f = { ...eventFacts(raw), seq: seq++ };
       if (informative(f)) out.events.push(f);
     }
     cursor = body.nextCursor ?? null;
@@ -144,14 +186,13 @@ export async function harvestSession(client: CloudClient, row: DirectoryRow, win
 }
 
 /** Pages `slices` equal sub-windows concurrently and merges them; each slice records its own gaps. */
-export async function harvestFrameSliced(client: CloudClient, window: { since: string; until: string }, slices: number, log: (m: string) => void = () => {}, maxRows = Number.MAX_SAFE_INTEGER) {
+export async function harvestFrameSliced(client: CloudClient, window: { since: string; until: string }, slices: number, log: (m: string) => void = () => {}, takeRows: TakeRows = noTake) {
   const a = Date.parse(window.since), b = Date.parse(window.until), w = (b - a) / slices;
   const parts = await Promise.all(Array.from({ length: slices }, (_, i) => harvestFrame(client, {
     since: new Date(a + i * w).toISOString(), until: new Date(i === slices - 1 ? b : a + (i + 1) * w).toISOString(),
-  }, (m) => log(`[slice ${i + 1}/${slices}] ${m}`), maxRows)));
+  }, (m) => log(`[slice ${i + 1}/${slices}] ${m}`), takeRows)));
   const rows = new Map<string, DirectoryRow>();
   for (const p of parts) for (const r of p.rows) rows.set(`${r.source}\u0000${r.sessionId}`, r);
-  checkRows(rows.size, maxRows);
   return { rows: [...rows.values()], gaps: parts.flatMap((p) => p.gaps), pages: parts.reduce((n, p) => n + p.pages, 0) };
 }
 
@@ -159,8 +200,8 @@ export interface HarvestOptions {
   out: string; window: { since: string; until: string }; concurrency: number; frameSlices?: number; log?: (m: string) => void;
   /** Sessions whose project name is one of these are read first (newest first within each group). */
   priorityProjects?: string[];
-  /** The approved directory row ceiling: a listing beyond it is refused before any event is read. */
-  maxRows?: number;
+  /** Counts directory rows as received against the approved ceiling (throws RowCeiling); see `RowCeiling`. */
+  takeRows?: TakeRows;
   /** Sessions whose project name is one of these are not read at all, and are counted as skipped. */
   skipProjects?: string[];
   /**
@@ -179,20 +220,19 @@ export async function runHarvest(client: CloudClient, opts: HarvestOptions) {
   let frame: { rows: DirectoryRow[]; gaps: Gap[]; pages: number };
   // Every file the harvest resumes from or writes must be private (private-fs.ts); the caller holds the lock.
   for (const f of [dirFile, factsFile, frameFile, join(opts.out, "coverage.json")]) assertPrivateFile(f);
-  const maxRows = opts.maxRows ?? Number.MAX_SAFE_INTEGER;
-  if (existsSync(frameFile)) { frame = JSON.parse(readPrivate(frameFile)); checkRows(frame.rows.length, maxRows); }
+  recoverTornTail(factsFile);
+  const takeRows = opts.takeRows ?? noTake;
+  // A finished listing was counted when it was received; a resume does not list again.
+  if (existsSync(frameFile)) frame = JSON.parse(readPrivate(frameFile));
   else {
     frame = opts.via === "reader-mcp"
-      ? await harvestMcpFrame(client, opts.window, log, maxRows)
-      : await harvestFrameSliced(client, opts.window, Math.max(1, opts.frameSlices ?? 1), log, maxRows);
+      ? await harvestMcpFrame(client, opts.window, log, takeRows)
+      : await harvestFrameSliced(client, opts.window, Math.max(1, opts.frameSlices ?? 1), log, takeRows);
     writePrivate(dirFile, frame.rows.map((r) => JSON.stringify(r)).join("\n") + "\n");
     writePrivate(frameFile, JSON.stringify(frame));
   }
   const done = new Set<string>();
-  if (existsSync(factsFile)) for (const line of readPrivate(factsFile).split("\n")) {
-    if (!line.trim()) continue;
-    try { const s = JSON.parse(line) as SessionFacts; done.add(`${s.source}\u0000${s.sessionId}`); } catch { /* a torn last line is re-read */ }
-  }
+  for (const s of readFactsStrict(factsFile)) done.add(`${s.source}\u0000${s.sessionId}`);
   const skip = new Set((opts.skipProjects ?? []).map((x) => x.toLowerCase()));
   const prio = new Set((opts.priorityProjects ?? []).map((x) => x.toLowerCase()));
   const rank = (r: DirectoryRow) => (prio.has(projectNameOf(r)) ? 0 : 1);
@@ -219,9 +259,8 @@ export async function runHarvest(client: CloudClient, opts: HarvestOptions) {
 function writeCoverage(opts: HarvestOptions, frame: { rows: DirectoryRow[]; gaps: Gap[]; pages: number }, factsFile: string, client: CloudClient, capped: boolean) {
   const bySource: Record<string, { sessions: number; read: number; events: number; informative: number; withFiles: number; censored: number; errors: number; noTranscript: number; truncated: number; outOfWindow: number }> = {};
   for (const r of frame.rows) { bySource[r.source] ??= { sessions: 0, read: 0, events: 0, informative: 0, withFiles: 0, censored: 0, errors: 0, noTranscript: 0, truncated: 0, outOfWindow: 0 }; bySource[r.source]!.sessions++; }
-  if (existsSync(factsFile)) for (const line of readPrivate(factsFile).split("\n")) {
-    if (!line.trim()) continue;
-    const s = JSON.parse(line) as SessionFacts & { truncated?: number }, b = bySource[s.source];
+  for (const s of readFactsStrict(factsFile) as Array<SessionFacts & { truncated?: number }>) {
+    const b = bySource[s.source];
     if (!b) continue;
     b.read++; b.events += s.eventsRead; b.informative += s.events.length;
     if (s.events.some((e) => e.files.length || e.touched.length)) b.withFiles++;

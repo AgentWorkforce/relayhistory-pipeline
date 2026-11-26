@@ -8,11 +8,12 @@
  *
  * Both outputs hold real identifiers and text, so `--out` must be outside this repository.
  */
-import { existsSync, readFileSync, realpathSync, writeFileSync } from "node:fs";
+import { realpathSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { parseArgs } from "node:util";
 import { fetchHistories, fetchRepo } from "./fetch.ts";
+import { assertPrivateFile, outsideRoot, readPrivate, writePrivate } from "../cloud-harvest/private-fs.ts";
 import { readCommits } from "./git.ts";
 import { collisionNotes, crossIdentityReverts, migrationNumberCollisions, supersededPrs } from "./signals.ts";
 import type { Candidate, PullRequest } from "./types.ts";
@@ -21,10 +22,11 @@ const REPO_ROOT = realpathSync(resolve(fileURLToPath(new URL("../../..", import.
 /** Merge-train promotion PRs are closed by design and never carry overlap. */
 export const TRAIN_HEAD = /^(?:trunk-train|merge-train)\//;
 
+/** The output file, refused inside this repository and checked as a private destination (private-fs.ts). */
 function outsideRepo(path: string): string {
   const abs = resolve(path);
-  const parent = realpathSync(existsSync(abs) ? dirname(abs) : dirname(abs));
-  if ((parent + "/").startsWith(REPO_ROOT + "/") || parent === REPO_ROOT) throw new Error("--out must be outside this repository");
+  outsideRoot(dirname(abs), REPO_ROOT);
+  assertPrivateFile(abs);
   return abs;
 }
 const iso = (v: string | undefined, name: string) => {
@@ -53,22 +55,22 @@ async function main(argv: string[]) {
   const out = outsideRepo(values.out);
   if (cmd === "fetch") {
     const prs = await fetchRepo(values.repo, since, until);
-    writeFileSync(out, JSON.stringify(prs), { mode: 0o600 });
+    writePrivate(out, JSON.stringify(prs));
     console.log(JSON.stringify({ repo: values.repo, prs: prs.length, comments: prs.reduce((n, p) => n + p.comments.length, 0) }));
   } else if (cmd === "mine") {
     if (!values.git || !values.prs) throw new Error("mine needs --git and --prs");
     const commits = await readCommits(values.git, since, until);
-    const prs = JSON.parse(readFileSync(values.prs, "utf8")) as PullRequest[];
+    const prs = JSON.parse(readPrivate(values.prs)) as PullRequest[];
     const candidates = mine(values.repo, commits, prs);
-    writeFileSync(out, candidates.map((c) => JSON.stringify(c)).join("\n") + (candidates.length ? "\n" : ""), { mode: 0o600 });
+    writePrivate(out, candidates.map((c) => JSON.stringify(c)).join("\n") + (candidates.length ? "\n" : ""));
     const by: Record<string, { all: number; cross: number }> = {};
     for (const c of candidates) { by[c.signal] ??= { all: 0, cross: 0 }; by[c.signal]!.all++; if (c.crossIdentity) by[c.signal]!.cross++; }
     console.log(JSON.stringify({ repo: values.repo, commits: commits.length, prs: prs.length, candidates: by }));
   } else if (cmd === "history") {
     if (!values.prs) throw new Error("history needs --prs (the fetch output)");
-    const prs = JSON.parse(readFileSync(values.prs, "utf8")) as PullRequest[];
+    const prs = JSON.parse(readPrivate(values.prs)) as PullRequest[];
     const histories = await fetchHistories(values.repo, prs.map((p) => p.number), (m) => console.error(m));
-    writeFileSync(out, JSON.stringify(histories), { mode: 0o600 });
+    writePrivate(out, JSON.stringify(histories));
     console.log(JSON.stringify({ repo: values.repo, prs: histories.length, renamed: histories.filter((h) => h.titles.length > 1).length, edited: histories.filter((h) => h.bodies.length > 1).length }));
   } else throw new Error("command must be fetch, mine or history");
 }

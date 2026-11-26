@@ -51,6 +51,11 @@ export interface EventFacts {
   /** Commit shas printed by `git commit` / `git rev-parse` style output (7 to 40 hex, in tool results only). */
   shas: string[];
   relay: RelayEnvelope | null;
+  /**
+   * The event's position among the session's in-window events as read (every event, informative or not), so a
+   * reader can tell whether two kept events were adjacent. Absent in facts harvested before it existed.
+   */
+  seq?: number;
 }
 
 const MAX_LIST = 50;

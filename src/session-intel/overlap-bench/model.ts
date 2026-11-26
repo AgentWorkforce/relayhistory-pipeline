@@ -62,7 +62,7 @@ function pushMention(s: Session, ref: string, ts: string) {
 }
 
 function fromFacts(s: Session, events: EventFacts[], observed: ObservedPolicy) {
-  let pendingCreate: { ts: string; index: number } | null = null;
+  let pendingCreate: { ts: string; index: number; seq: number | undefined } | null = null;
   let baseline: Set<string> | null = null;
   for (const e of events) {
     if (!(e.ts >= EARLIEST_TS) || !Number.isFinite(Date.parse(e.ts))) continue;
@@ -80,13 +80,16 @@ function fromFacts(s: Session, events: EventFacts[], observed: ObservedPolicy) {
     }
     if (first) baseline = new Set(seen);
     const creates = e.gh.includes("pr-create");
-    // A create call usually names no number; its own result does. Only the first tool result after the call,
-    // within CREATE_RESULT_MS and not failed, may claim the number, and the PR is owned from that result's time
-    // (when the number became known). Any other event ends the wait, so a later, unrelated URL is never claimed.
+    // A create call usually names no number; its own result does. Only the call's own result may claim it: the
+    // very next raw event (by `seq`, counting events that were not kept), a tool result, within CREATE_RESULT_MS,
+    // not failed. Facts carry no tool-use id, so with parallel calls (the next raw event is another call) or without
+    // `seq` (facts harvested before it) the claim abstains. The PR is owned from the result's time.
     // An unresolved call stays as a placeholder (number -1): an act of opening a PR, owning nothing. A failed
     // result removes it.
     const isResult = e.type === "tool_result" || e.role === "tool_result";
     if (pendingCreate && (Date.parse(e.ts) - Date.parse(pendingCreate.ts) > CREATE_RESULT_MS || (!isResult && !creates))) pendingCreate = null;
+    const adjacent = pendingCreate !== null && pendingCreate.seq !== undefined && e.seq === pendingCreate.seq + 1;
+    if (pendingCreate && isResult && !adjacent) pendingCreate = null;
     if (pendingCreate && isResult) {
       const url = e.prRefs.map((r) => PR_KEY.exec(r)).find((m) => m?.[1]);
       const failed = /error|fail/i.test(e.toolStatus ?? "");
@@ -103,7 +106,7 @@ function fromFacts(s: Session, events: EventFacts[], observed: ObservedPolicy) {
       }
       if (creates && !e.prRefs.length) {
         s.prs.push({ ts: e.ts, repo: s.repo?.toLowerCase() ?? null, number: -1, action: "create" });
-        pendingCreate = { ts: e.ts, index: s.prs.length - 1 };
+        pendingCreate = { ts: e.ts, index: s.prs.length - 1, seq: e.seq };
       }
     }
     for (const b of e.branches) s.branches.push({ ts: e.ts, name: b });

@@ -81,9 +81,12 @@ interface RawHistory {
 export function historyOf(r: RawHistory): PrHistory {
   const renames = r.timelineItems.nodes.filter((n) => n.__typename === "RenamedTitleEvent" && n.createdAt).sort((a, b) => (a.createdAt! < b.createdAt! ? -1 : 1));
   const titles = [{ at: r.createdAt, title: renames[0]?.previousTitle ?? r.title }, ...renames.map((n) => ({ at: n.createdAt!, title: n.currentTitle ?? "" }))];
-  // Edits list every version of the description, the original included; with none, it was never edited.
-  const edits = r.userContentEdits.nodes.filter((n) => n.diff !== null && !n.deletedAt).sort((a, b) => (a.editedAt < b.editedAt ? -1 : 1));
-  const bodies = edits.length ? edits.map((n) => ({ at: n.editedAt < r.createdAt ? r.createdAt : n.editedAt, body: n.diff! })) : [{ at: r.createdAt, body: r.body ?? "" }];
+  // Edits list every version of the description, the original included; with none, it was never edited. A version
+  // whose record was deleted or carries no text is unknown (null), never filled in from another version.
+  const edits = [...r.userContentEdits.nodes].sort((a, b) => (a.editedAt < b.editedAt ? -1 : 1));
+  const bodies = edits.length
+    ? edits.map((n) => ({ at: n.editedAt < r.createdAt ? r.createdAt : n.editedAt, body: n.diff !== null && !n.deletedAt ? n.diff : null }))
+    : [{ at: r.createdAt, body: r.body ?? "" }];
   return { number: r.number, titles, bodies };
 }
 

@@ -19,9 +19,10 @@ export interface Commit {
 /**
  * A PR's title and description as they stood over time (forge.history): each entry holds from `at` until the
  * next. The first entry is the PR's creation. Rebuilt from title-rename events and the description's edit
- * history, so an as-of reader can show the text a live system would have seen.
+ * history, so an as-of reader can show the text a live system would have seen. A description version that cannot
+ * be recovered (a deleted or empty edit record) is `null`: that interval is unknown, and readers show nothing for it.
  */
-export interface PrHistory { number: number; titles: Array<{ at: string; title: string }>; bodies: Array<{ at: string; body: string }> }
+export interface PrHistory { number: number; titles: Array<{ at: string; title: string }>; bodies: Array<{ at: string; body: string | null }> }
 
 /** The entry in effect at `at`, or null before the first. */
 export function asOf<T extends { at: string }>(entries: T[] | undefined, at: string): T | null {

@@ -18,10 +18,9 @@ interface PrInfo {
   title?: string; mergedAt?: string | null; closedAt?: string | null; files?: string[] | null;
   /** As-of bundles: the description in effect at the alert, from dated history only (absent without history). */
   body?: string;
-  /** As-of bundles only: comments made before the alert (each comment is dated). */
-  comments?: Array<{ at: string; body: string }>;
+  /** Hindsight bundles never carry comments; as-of bundles leave them out (see `describe`). */
 }
-const MAX_COMMENT = 400, MAX_COMMENTS = 5, MAX_BODY = 1500;
+const MAX_BODY = 1500;
 export interface SideInfo {
   side: string;
   kind: "work" | "pr";
@@ -36,10 +35,10 @@ export interface BundleItem { pair: string; at: string; sides: [SideInfo, SideIn
 
 /**
  * `asOf` describes the pair as a live system would see it when the alert fired, from dated facts only: PRs that
- * existed and that the side owned by then, their author and creation time, comments made before the alert, and
- * the side's own branches, edits and activity up to then. A PR's title and description appear only from dated
- * history (the version in effect at the alert); as fetched they would leak a later edit. File lists, merges and
- * closes are left out. Without `asOf`
+ * existed and that the side owned by then, their author and creation time, and the side's own branches, edits and
+ * activity up to then (derived from its sessions). A PR's title and description appear only from dated history (the
+ * version in effect at the alert); as fetched they would leak a later edit. Comment text, file lists, merges and
+ * closes are left out: comments are fetched in their latest form, so their text is not dated. Without `asOf`
  * the bundle shows titles, files and outcomes, for adjudicating in hindsight what really happened.
  */
 export function describe(ctx: Context, sides: [string, string], at: string, ownerLabel: (u: string | null) => string | null, asOf = false): BundleItem {
@@ -51,11 +50,10 @@ export function describe(ctx: Context, sides: [string, string], at: string, owne
     const base: PrInfo = { pr: side.slice(3), author: p.author, createdAt: p.createdAt };
     if (!asOf) return { ...base, title: p.title, mergedAt: p.mergedAt, closedAt: p.closedAt, files: p.files?.slice(0, MAX_FILES) ?? null };
     // Title and description only from dated history (forge `history`): the version in effect at the alert.
+    // Comment text is left out: comments are fetched in their latest form and dated only by creation, so a later
+    // edit would leak. An unknown description interval (null) shows nothing.
     const title = asOfEntry(p.history?.titles, at)?.title, body = asOfEntry(p.history?.bodies, at)?.body;
-    return {
-      ...base, ...(title !== undefined ? { title } : {}), ...(body !== undefined ? { body: body.slice(0, MAX_BODY) } : {}),
-      comments: (p.comments ?? []).filter((c) => c.at <= at).slice(0, MAX_COMMENTS).map((c) => ({ at: c.at, body: c.body.slice(0, MAX_COMMENT) })),
-    };
+    return { ...base, ...(title !== undefined ? { title } : {}), ...(typeof body === "string" ? { body: body.slice(0, MAX_BODY) } : {}) };
   };
   const files: Array<Set<string>> = [];
   const info = sides.map((side): SideInfo => {
