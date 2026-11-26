@@ -315,10 +315,9 @@ export type EventRowOwner = (
   row: Json,
 ) => { userId: string; sessionId: string } | undefined;
 
-/** The generic delivery projection uses role as type. Codex tool-use captures
- * carry an explicit non-chat kind; restore it only with a same-origin, same
- * physical-session/message-id tool-call witness from the verified record union.
- * This changes classification only: content, identities, ordering and counts stay.
+/** Explicit tool-use captures already carry their display type. Only a unique
+ * same-origin, same physical-session/message-id call in the verified union
+ * supplies the recorded Codex tool name.
  */
 function codexToolCaptures(records: readonly RelayhistoryStreamRecord[], scope: SessionScope) {
   const calls = new Map<string, RelayhistoryStreamRecord | null>();

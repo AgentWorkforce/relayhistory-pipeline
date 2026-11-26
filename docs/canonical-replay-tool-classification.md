@@ -1,25 +1,17 @@
 # Codex tool-use classification in canonical replay
 
-A Codex tool call can carry two delivered facts: a `session_event` with
-`role=assistant` and `kind=tool_use`, and a structured `tool_call`. The generic
-delivery projection uses the role as its display type. That can make a scrubbed
-tool input appear as an assistant chat message.
+A delivered `session_event` carries its speaker in `payload.role` and may
+identify its content in `payload.kind`. The delivery stream projection uses
+explicit `tool_use`, `tool_result` and `thinking` kinds as the display type,
+preserving the speaker separately in `actor_role`. Other session events keep
+the role-based display type, including ordinary assistant messages containing
+tool-shaped or redacted text.
 
-Canonical read/index projection restores `type=tool_use` and the recorded tool
-name only when the verified record union supplies an unambiguous tool-call
-witness with the same origin, physical session and nonempty message ID. An equal
-timestamp, a redaction placeholder or similar content is insufficient. Other
-sources, normal assistant messages, absent/ambiguous witnesses and mismatched
-identities keep their existing classification.
+For Codex tool-use events, the canonical read/index projection can also supply
+the recorded tool name from a unique structured `tool_call` in the verified
+record union with the same origin, physical session and nonempty message ID.
+Unpaired or ambiguous captures keep the explicit event type without a tool
+name. The classification preserves event identities, counts, ordering and content.
 
-This does not remove events, recover redacted text or rewrite objects. Event
-identities, counts, ordering and content remain intact. The transcript renderer
-already treats `tool_use` as activity rather than a conversational speaker. A
-normal assistant message containing a scrubbed placeholder remains an assistant
-message.
-
-The correction applies to full canonical object replay and future canonical
-index writes. Existing index-only rows need the normal qualified re-projection
-path before their classification changes. The generic SQL-parity delivery
-projection, schema generation, grants, authentication, erasure checks and
-source-generation cursor rules are unchanged.
+This applies to newly projected delivery streams and canonical object replay.
+Previously materialized rows need a separately qualified reprojection to change.

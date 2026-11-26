@@ -1,7 +1,6 @@
 /**
  * The delivery projection for exported sessions: turns one session's latest
- * records into the rows the live triggers leave in `sessions`, so replay,
- * briefs and summaries read an exported session exactly like a live one.
+ * records into event and catalog rows for replay, briefs and summaries.
  *
  * The live projection is plpgsql (project_delivery_activity_row 0060,
  * project_delivery_catalog_row 0058, settle_delivery_request 0024,
@@ -9,7 +8,9 @@
  * transform has no database to run it in. This is its port, and those functions
  * stay the authority: `relayhistory-projection.test.ts` runs the same records
  * through the vendored migrations and requires equal rows, so a migration that
- * changes the projection fails until this file follows it.
+ * changes the projection fails until this file follows it. One display field
+ * intentionally differs from 0060: an explicit session-event tool_use,
+ * tool_result or thinking kind supplies the exported event's type.
  *
  * Rows hold no tenant columns. Delivery-projected rows also have no `user_id`
  * or `embedding`; the session index holds the owner.
@@ -773,6 +774,11 @@ function activityEvent(
   const received = canonicalTimestamp(record.received_at);
   const machine = deliveryMachine(context.workspaceId, record.origin_id);
   const ms = activityMs(p);
+  const eventKind = kind === "session_event" ? p.kind : null;
+  const type =
+    eventKind === "tool_use" || eventKind === "tool_result" || eventKind === "thinking"
+      ? eventKind
+      : text(p, "role") ?? kind;
   const tool =
     kind === "tool_call"
       ? toolCall(p, nullIfEmpty(text(p, "tool_use_id")), context.source)
@@ -786,7 +792,7 @@ function activityEvent(
     session_id: context.sessionId,
     event_id: `${machine}:${record.record_id}`,
     kind,
-    type: text(p, "role") ?? kind,
+    type,
     ts: ms === null ? received : timeFromMs(ms),
     actor_name: null,
     actor_role: kind === "history" ? "user" : text(p, "role"),

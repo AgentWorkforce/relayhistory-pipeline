@@ -269,6 +269,26 @@ describe("streaming fold parity", () => {
   });
 });
 
+describe("session event display type", () => {
+  it.each([
+    ["session_event", "tool_use", "assistant", "tool_use"],
+    ["session_event", "tool_result", "user", "tool_result"],
+    ["session_event", "thinking", "assistant", "thinking"],
+    ["session_event", "message", "assistant", "assistant"],
+    ["session_event", "unexpected", "user", "user"],
+    ["session_event", undefined, undefined, "session_event"],
+    ["history", "tool_use", "user", "user"],
+  ])("projects %s / %s / %s as %s", (kind, payloadKind, role, type) => {
+    const text = 'exec {"input":"fixture"}';
+    const record = parseRelayhistoryRecord(JSON.stringify({
+      kind, origin_id: "fixture", record_id: "event", revision: "1",
+      received_at: "2026-10-30T12:00:00Z", payload: { kind: payloadKind, role, text, prompt: text },
+    }));
+    const event = relayhistoryActivityEvent(record, context("codex"));
+    expect(event).toMatchObject({ kind, type, actor_role: role ?? null, content: text, tool_name: null });
+  });
+});
+
 describe("two-pass settlement parity", () => {
   for (const source of ["claude", "codex"])
     it(`projects the same rows as projectRelayhistorySession (${source})`, () => {

@@ -38,7 +38,7 @@ test("a real assistant redaction is never hidden or reclassified by a neighborin
   }
 });
 
-test("missing, ambiguous, foreign-origin or foreign-physical-session witnesses cannot reclassify chat", () => {
+test("missing, ambiguous or foreign witnesses cannot supply a tool name", () => {
   for (const records of [
     [capture()], [capture(), call({ message_id: "other-message" })],
     [capture(), call({}, "other-origin")], [capture(), call({ session_id: "other-physical" })],
@@ -46,8 +46,8 @@ test("missing, ambiguous, foreign-origin or foreign-physical-session witnesses c
     [capture(), call({ name: " " })],
     [event("capture", "session_event", { role: "assistant", kind: "tool_use", message_id: " ", text: "[REDACTED]" }), call({ message_id: " " })],
     [capture(), call(), event("second-call", "tool_call", { message_id: "recorded-message", name: "another_tool" })],
-  ]) expect(captured(project(records)).row.type).toBe("assistant");
-  expect(captured(project([capture(), call()], "claude")).row.type).toBe("assistant");
+  ]) expect(captured(project(records)).row).toMatchObject({ type: "tool_use", tool_name: null });
+  expect(captured(project([capture(), call()], "claude")).row).toMatchObject({ type: "tool_use", tool_name: null });
 });
 
 test("canonical page preserves identities, content and count while publishing the recorded non-chat classification", async () => {
