@@ -39,6 +39,7 @@ import {
 import { log } from "../shared/log.ts";
 import { initScrubEngine } from "@rhc/lib/scrub-engine/index.ts";
 import { optional } from "../shared/env.ts";
+import { AR_DB_LOGIN, AR_DB_LOGIN_DOC, AR_DB_LOGIN_FIX } from "../shared/support-codes.ts";
 import { SESSION_BOOTSTRAP_FILES } from "./session-bootstrap-chain.ts";
 import { markHeldScope, type HeldScope } from "./held-scope.ts";
 
@@ -147,6 +148,55 @@ export type RdsLayout = "master-owner" | "separate-database";
 
 function profileError(code: string, message: string): Error {
   return Object.assign(new Error(`96bulls: ${message}`), { code });
+}
+
+/** What a support-coded refusal carries beside its error_code (support-codes.ts). */
+export interface DbLoginRefusal {
+  code: string;
+  support_code: typeof AR_DB_LOGIN;
+  doc: typeof AR_DB_LOGIN_DOC;
+  /** The one-sentence fix: what happened, then the fix and the doc link. Role names only, never a URL or password. */
+  hint: string;
+}
+
+/**
+ * A refusal whose fix is creating the database logins (AR_DB_LOGIN). `error_code` is
+ * unchanged (tests, runbooks and infra's diagnose-install.py key on it); `support_code`
+ * and `doc` are added, and the message leads with `hint`, the actionable sentence.
+ */
+export function dbLoginError(code: string, what: string, detail?: string): Error & DbLoginRefusal {
+  const hint = `${what}: the database logins haven't been created. ${AR_DB_LOGIN_FIX}, or see ${AR_DB_LOGIN_DOC}`;
+  return Object.assign(new Error(`96bulls: ${hint}${detail ? `; ${detail}` : ""}`), {
+    code,
+    support_code: AR_DB_LOGIN,
+    doc: AR_DB_LOGIN_DOC,
+    hint,
+  } as const);
+}
+
+/** The support fields of a refusal built by dbLoginError, or undefined for any other error. */
+export function dbLoginRefusal(err: unknown): DbLoginRefusal | undefined {
+  const e = err as Partial<DbLoginRefusal> | null;
+  return e && e.support_code === AR_DB_LOGIN && e.doc === AR_DB_LOGIN_DOC && typeof e.code === "string" && typeof e.hint === "string"
+    ? { code: e.code, support_code: AR_DB_LOGIN, doc: AR_DB_LOGIN_DOC, hint: e.hint }
+    : undefined;
+}
+
+/**
+ * The fatal lines the migrate Job writes for a refusal: a plain stderr sentence first
+ * (what an operator reads in `kubectl logs`), then the JSON line with error_code,
+ * support_code and doc. The JSON message is capped at 200 characters by log.ts, so it
+ * names the fix and leaves the link to the `doc` field.
+ */
+export function fatalLines(err: unknown): { plain?: string; message: string; fields: Record<string, unknown> } {
+  const code = (err as { code?: string }).code ?? "migrate_failed";
+  const r = dbLoginRefusal(err);
+  if (!r) return { message: "hoopdb migrate exited", fields: { error_code: code } };
+  return {
+    plain: r.hint,
+    message: `${r.hint.slice(0, r.hint.indexOf(", or see "))}, or see the doc link`,
+    fields: { error_code: r.code, support_code: r.support_code, doc: r.doc },
+  };
 }
 
 function strictFlag(
@@ -1164,9 +1214,10 @@ async function runtimeRolePreflight(
     )
   ).rows[0];
   if (!r)
-    throw profileError(
+    throw dbLoginError(
       "runtime_role_missing",
-      `HOOPDB_RUNTIME_ROLE ${profile.runtimeRole} does not exist; nothing was written`,
+      `role ${JSON.stringify(profile.runtimeRole)} does not exist`,
+      "HOOPDB_RUNTIME_ROLE names it; nothing was written",
     );
   if (r.rolname === r.me) {
     if (profile.mode !== "local")
@@ -1278,6 +1329,8 @@ export async function rdsSeparateOwnerPreflight(client: MigrationClient): Promis
       owns_database: boolean;
       owns_sessions: boolean;
       executor_present: boolean;
+      owner_name: string;
+      owner_rds_superuser: boolean;
     }>(
       `SELECT current_setting('server_version_num')::int AS server_version_num,
               session_user = current_user AS same_session,
@@ -1289,7 +1342,10 @@ export async function rdsSeparateOwnerPreflight(client: MigrationClient): Promis
               coalesce((SELECT NOT s.rolsuper AND NOT s.rolcanlogin FROM pg_catalog.pg_roles s WHERE s.rolname = 'rds_superuser'), false) AS rds_superuser_shape,
               EXISTS (SELECT 1 FROM pg_catalog.pg_database d WHERE d.datname = current_database() AND d.datdba = me.oid) AS owns_database,
               EXISTS (SELECT 1 FROM pg_catalog.pg_namespace n WHERE n.nspname = 'sessions' AND n.nspowner = me.oid) AS owns_sessions,
-              EXISTS (SELECT 1 FROM pg_catalog.pg_roles WHERE rolname = 'hoopdb_activation_executor') AS executor_present
+              EXISTS (SELECT 1 FROM pg_catalog.pg_roles WHERE rolname = 'hoopdb_activation_executor') AS executor_present,
+              me.rolname::text AS owner_name,
+              EXISTS (SELECT 1 FROM pg_catalog.pg_auth_members m JOIN pg_catalog.pg_roles s ON s.oid = m.roleid
+                       WHERE m.member = me.oid AND s.rolname = 'rds_superuser') AS owner_rds_superuser
          FROM pg_catalog.pg_roles me WHERE me.rolname = current_user`,
     )
   ).rows[0];
@@ -1311,11 +1367,16 @@ export async function rdsSeparateOwnerPreflight(client: MigrationClient): Promis
         ...(r.owns_sessions ? [] : ["owner does not own schema sessions (run rds-activation first)"]),
         ...(r.executor_present ? ["the activation executor hoopdb_activation_executor still exists"] : []),
       ];
-  if (problems.length)
-    throw profileError(
+  const detail = `rds separate-database layout needs a plain migration owner (member of no role, no CREATEROLE) that owns this database and sessions on an RDS-shaped server: ${problems.join("; ")}; nothing was written`;
+  // The RDS master's signature (a CREATEROLE member of rds_superuser): the migration URL
+  // logs in as the master because the dedicated owner login was never created.
+  if (problems.length && r?.owner_createrole && r.owner_rds_superuser)
+    throw dbLoginError(
       "rds_profile_unproven",
-      `rds separate-database layout needs a plain migration owner (member of no role, no CREATEROLE) that owns this database and sessions on an RDS-shaped server: ${problems.join("; ")}; nothing was written`,
+      `the migration login ${JSON.stringify(r.owner_name)} is the RDS master, not the HoopDb owner`,
+      detail,
     );
+  if (problems.length) throw profileError("rds_profile_unproven", detail);
 }
 
 /**
@@ -1553,9 +1614,9 @@ if (import.meta.main) {
     migrate()
       .then(() => process.exit(0))
       .catch((err) => {
-        log.error("hoopdb migrate exited", {
-          error_code: (err as { code?: string }).code ?? "migrate_failed",
-        });
+        const fatal = fatalLines(err);
+        if (fatal.plain) process.stderr.write(`${fatal.plain}\n`);
+        log.error(fatal.message, fatal.fields);
         if (optional("DEBUG", "") === "1") console.error(err);
         process.exit(1);
       });

@@ -5,6 +5,7 @@
  * at the only place a service writes a log line.
  */
 import { scrubTextForLog as scrubText } from "@rhc/lib/scrub-engine/index.ts";
+import { SUPPORT_CODE_VALUES, SUPPORT_DOC_VALUES } from "./support-codes.ts";
 
 /** The analytics sink's operator counters (never analytics events themselves). */
 const ANALYTICS_COUNTER_FIELDS = [
@@ -51,6 +52,8 @@ export const ALLOWED_LOG_FIELDS = new Set([
   "trace_id", "span_id", "traceparent", "session_uuid", "session_uuid_source",
   "tenant_id", "org_id", "workspace_id", "machine_id", "harness", "session_id",
   "revision", "work_key", "error_code", "retryable", "duration_ms",
+  // A shared cross-repo support code and its doc link (support-codes.ts): closed values only.
+  "support_code", "doc",
   "scrub_ruleset", "scrub_version", "redaction_count",
   "object_sha256", "bytes_raw", "bytes_stored", "chunk_count", "seq", "epoch", "offset",
   "model_id", "tokens_in", "tokens_out",
@@ -196,6 +199,7 @@ const ENUM_FIELDS: ReadonlyMap<string, ReadonlySet<string>> = new Map([
   ["regeneration_reason", REGEN_REASON_VALUES], ["system", REGEN_SYSTEM_VALUES],
   ["db_error_detail", DB_ERROR_DETAIL_VALUES], ["db_client_phase", DB_CLIENT_PHASE_VALUES],
   ["lock_retry_outcome", LOCK_RETRY_OUTCOME_VALUES],
+  ["support_code", SUPPORT_CODE_VALUES], ["doc", SUPPORT_DOC_VALUES],
 ]);
 /** Shaped fields: emitted only when the string matches its pattern AND the scrubber leaves it unchanged (else
  * dropped). `client_version` is a release version (client-agent.ts CLIENT_VERSION, pinned equal in

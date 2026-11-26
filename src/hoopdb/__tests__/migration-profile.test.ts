@@ -39,6 +39,7 @@ import {
 import * as migrateGuards from "../migrate-guards.ts";
 import { gateOpen, workerTick } from "../../shared/worker.ts";
 import { SESSION_BOOTSTRAP_FILES } from "../session-bootstrap-chain.ts";
+import { logLine } from "../../shared/log.ts";
 import {
   ADOPTABLE_INDEXES,
   MIGRATION_SENTINELS,
@@ -46,7 +47,9 @@ import {
   RETAINED_BY_ROLLBACK,
 } from "../migration-sentinels.ts";
 import {
+  dbLoginRefusal,
   expectedSchema,
+  fatalLines,
   inspectMigrations,
   generation,
   migrationLedgerSha256,
@@ -469,6 +472,23 @@ describe("runtime role: required, existing, SELECT only", () => {
     );
     expect(error?.code).toBe("runtime_role_missing");
     expect(await snapshot(empty)).toEqual({ ledger: null, marker: null });
+    // Same error_code, plus the shared support code, doc link and the actionable sentence.
+    const doc = "https://agentrelay.com/docs/self-hosting/troubleshooting#database-logins";
+    const hint = `role "g6_nope" does not exist: the database logins haven't been created. Run scripts/selfhost/configure-rds.sh (AgentWorkforce/infra), or see ${doc}`;
+    expect(dbLoginRefusal(error)).toEqual({ code: "runtime_role_missing", support_code: "AR_DB_LOGIN", doc, hint });
+    expect((error as Error).message).toBe(`96bulls: ${hint}; HOOPDB_RUNTIME_ROLE names it; nothing was written`);
+    // The migrate Job's fatal output: the plain sentence first, then the JSON line.
+    const fatal = fatalLines(error);
+    expect(fatal.plain).toBe(hint);
+    const line = JSON.parse(logLine("error", fatal.message, fatal.fields));
+    expect(line).toMatchObject({
+      level: "error",
+      message: `role "g6_nope" does not exist: the database logins haven't been created. Run scripts/selfhost/configure-rds.sh (AgentWorkforce/infra), or see the doc link`,
+      error_code: "runtime_role_missing",
+      support_code: "AR_DB_LOGIN",
+      doc,
+    });
+    expect(line.message.length).toBeLessThanOrEqual(200);
     expect(
       (
         await empty.query(
@@ -489,6 +509,18 @@ describe("runtime role: required, existing, SELECT only", () => {
       )?.code,
     ).toBe("runtime_role_missing");
     expect(await snapshot(db)).toEqual(before);
+  });
+
+  test("fatal output: any other refusal keeps the old single JSON line, with no support code", () => {
+    const other = Object.assign(new Error("96bulls: postgres://u:secret@h/db unreachable"), { code: "runtime_role_unsafe" });
+    expect(dbLoginRefusal(other)).toBeUndefined();
+    const fatal = fatalLines(other);
+    expect(fatal).toEqual({ message: "hoopdb migrate exited", fields: { error_code: "runtime_role_unsafe" } });
+    expect(fatalLines(new Error("x"))).toEqual({ message: "hoopdb migrate exited", fields: { error_code: "migrate_failed" } });
+    // A forged support field never reaches the log: support_code and doc are closed values.
+    const line = JSON.parse(logLine("error", "m", { error_code: "x", support_code: "postgres://u:pw@h", doc: "https://evil.example/" }));
+    expect(line.support_code).toBeUndefined();
+    expect(line.doc).toBeUndefined();
   });
 
   test("unsafe runtime roles are refused before any write: superuser, BYPASSRLS, the search Worker, and the owner in supabase mode", async () => {

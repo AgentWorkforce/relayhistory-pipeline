@@ -32,7 +32,8 @@ import {
   type RoleSpec,
 } from "../rds-activation.ts";
 import { isRdsCreatorEdge } from "../migrate-guards.ts";
-import { migrationProfile, rdsSeparateOwnerPreflight, type MigrationClient } from "../migrate.ts";
+import { dbLoginRefusal, fatalLines, migrationProfile, rdsSeparateOwnerPreflight, type MigrationClient } from "../migrate.ts";
+import { logLine } from "../../shared/log.ts";
 
 const root = join(import.meta.dir, "../../..");
 const bootstrap = join(root, "supabase/bootstrap");
@@ -346,6 +347,34 @@ describe("migrator: HOOPDB_RDS_LAYOUT=separate-database", () => {
       expect(r).toMatch(/nothing was written/);
     }
     expect(await code(undefined)).toMatch(/^rds_profile_unproven: .*owner role not found/);
+  });
+  test("the RDS master as migration login (CREATEROLE member of rds_superuser): same error_code, AR_DB_LOGIN pointer first", async () => {
+    const doc = "https://agentrelay.com/docs/self-hosting/troubleshooting#database-logins";
+    const master = { ...good, owner_name: "postgres", owner_createrole: true, owner_memberships: 1, owner_rds_superuser: true };
+    let err: unknown;
+    try {
+      await rdsSeparateOwnerPreflight(fake(master));
+    } catch (e) {
+      err = e;
+    }
+    const hint = `the migration login "postgres" is the RDS master, not the HoopDb owner: the database logins haven't been created. Run scripts/selfhost/configure-rds.sh (AgentWorkforce/infra), or see ${doc}`;
+    expect(dbLoginRefusal(err)).toEqual({ code: "rds_profile_unproven", support_code: "AR_DB_LOGIN", doc, hint });
+    expect((err as Error).message).toStartWith(`96bulls: ${hint}; rds separate-database layout needs`);
+    expect((err as Error).message).toMatch(/owner has CREATEROLE.*nothing was written/);
+    // The JSON line's message (capped at 200 by log.ts) keeps the whole fix for the default master name.
+    const line = JSON.parse(logLine("error", fatalLines(err).message, fatalLines(err).fields));
+    expect(line.message).toBe(`${hint.slice(0, hint.indexOf(", or see "))}, or see the doc link`);
+    expect(line).toMatchObject({ error_code: "rds_profile_unproven", support_code: "AR_DB_LOGIN", doc });
+    // CREATEROLE alone, or rds_superuser membership alone, is not the master: no pointer.
+    for (const patch of [{ owner_createrole: true }, { owner_memberships: 1, owner_rds_superuser: true }]) {
+      try {
+        await rdsSeparateOwnerPreflight(fake({ ...good, owner_name: "hoop", ...patch }));
+        throw new Error("expected a refusal");
+      } catch (e) {
+        expect((e as { code?: string }).code).toBe("rds_profile_unproven");
+        expect(dbLoginRefusal(e)).toBeUndefined();
+      }
+    }
   });
 });
 

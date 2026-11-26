@@ -14,7 +14,7 @@ import { closeSync, mkdtempSync, openSync, readFileSync, rmSync, writeFileSync }
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { PGlite } from "../../../packages/pipeline/node_modules/@electric-sql/pglite/dist/index.js";
-import { rdsSeparateOwnerPreflight, type MigrationClient } from "../migrate.ts";
+import { dbLoginRefusal, rdsSeparateOwnerPreflight, type MigrationClient } from "../migrate.ts";
 import {
   commitRecheckStatus,
   EXIT,
@@ -99,6 +99,27 @@ describe("rdsSeparateOwnerPreflight on real catalogs (PGlite)", () => {
       expect(r).toMatch(/^rds_profile_unproven: /);
       expect(r).toMatch(why);
     });
+  test("the RDS master as migration login (CREATEROLE member of rds_superuser) carries the AR_DB_LOGIN pointer", async () => {
+    const db = await separateLayout("ALTER ROLE hoop CREATEROLE; GRANT rds_superuser TO hoop");
+    let err: unknown;
+    try {
+      await rdsSeparateOwnerPreflight(client(db));
+    } catch (e) {
+      err = e;
+    }
+    expect((err as { code?: string }).code).toBe("rds_profile_unproven");
+    expect(dbLoginRefusal(err)?.hint).toBe(
+      `the migration login "hoop" is the RDS master, not the HoopDb owner: the database logins haven't been created. Run scripts/selfhost/configure-rds.sh (AgentWorkforce/infra), or see https://agentrelay.com/docs/self-hosting/troubleshooting#database-logins`,
+    );
+    // A plain rds_superuser member without CREATEROLE is refused without the pointer.
+    const member = await separateLayout("GRANT rds_superuser TO hoop");
+    try {
+      await rdsSeparateOwnerPreflight(client(member));
+    } catch (e) {
+      err = e;
+    }
+    expect(dbLoginRefusal(err)).toBeUndefined();
+  });
   test("refuses a SET ROLE session (session_user differs from current_user)", async () => {
     // session_user stays the bootstrap superuser; current_user becomes hoop.
     const db = await separateLayout("", false);

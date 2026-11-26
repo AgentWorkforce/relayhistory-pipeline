@@ -189,7 +189,21 @@ advisory lock before any write (before the ledger and marker tables are created,
 the pending marker upsert, before any step), and again after the last migration, before
 phase 2 can mark PASS.
 
-- **Missing role:** `runtime_role_missing`.
+- **Missing role:** `runtime_role_missing`, with the shared support code `AR_DB_LOGIN`.
+  The migrate Job writes one plain stderr line, then the JSON line (a URL or password is
+  never printed):
+
+  ```
+  role "sessions_pipeline_runtime" does not exist: the database logins haven't been created. Run scripts/selfhost/configure-rds.sh (AgentWorkforce/infra), or see https://agentrelay.com/docs/self-hosting/troubleshooting#database-logins
+  {"ts":"...","level":"error","service":"...","deployment":"...","deployment_id":"...","message":"role \"sessions_pipeline_runtime\" does not exist: the database logins haven't been created. Run scripts/selfhost/configure-rds.sh (AgentWorkforce/infra), or see the doc link","error_code":"runtime_role_missing","support_code":"AR_DB_LOGIN","doc":"https://agentrelay.com/docs/self-hosting/troubleshooting#database-logins"}
+  ```
+
+  The same pointer is added to `rds_profile_unproven` in the `separate-database` layout when
+  the migration login is the RDS master (a CREATEROLE member of `rds_superuser`): the
+  dedicated owner login was never created, and the sentence reads `the migration login
+  "postgres" is the RDS master, not the HoopDb owner: the database logins haven't been
+  created. ...`. `error_code` is unchanged in both cases. The JSON `message` is capped at
+  200 characters, so it leaves the link to the `doc` field.
 - **The migrator itself (owner-as-runtime):** accepted only in `local` (the Docker
   stack, where one superuser runs everything). Refused in `selfhosted`, `cloudsql`, `supabase` and `rds`
   (`runtime_role_unsafe`).
