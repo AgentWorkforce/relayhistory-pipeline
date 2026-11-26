@@ -273,6 +273,7 @@ export function extractSessionFacts(snapshot: SessionAnalysisSnapshot, context: 
     art.prs.set(pr.url, { at: pr.at, p: eventPointer(pr) });
     built.push({ id: stableId([key, "pr", pr.url]), kind: "pr", what: `pull request ${pr.url.replace("https://github.com/", "")}`, ref: pr.url, at: pr.at, session: key, outcomeId: null, evidence: [eventPointer(pr)] });
   }
+  for (const b of artifacts?.branches ?? []) { const fb = featureBranch(b.branch); if (fb) pushedBranches.add(fb); }
   for (const b of pushedBranches) art.branches.add(b);
   const files = new Set<string>();
   for (const f of artifacts?.files ?? []) files.add(f.path);

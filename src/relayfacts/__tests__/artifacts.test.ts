@@ -57,3 +57,15 @@ describe("bestQuote", () => {
     expect(message.replace(/\s+/gu, " ").includes(q)).toBe(true);
   });
 });
+
+describe("extractArtifacts branches", () => {
+  test("branches from quiet git commands and from briefs; default and remote-tracking names are not features", () => {
+    const a = extractArtifacts([
+      ev("e1", "tool_call", "git push -q origin review/claude-x && git worktree add -q -b w-memdocs/first-slice ../wt origin/main"),
+      ev("e2", "user", "Branch under review: review/pipe-uploads-2-backfill-c (shared; do NOT git checkout)"),
+      ev("e3", "user", "Work on branch `main` and compare with origin/main"),
+      ev("e4", "tool_result", "Branch under review: review/should-not-count"),
+    ], null);
+    expect(a.branches.map((b) => [b.branch, b.via])).toEqual([["review/claude-x", "command"], ["w-memdocs/first-slice", "command"], ["review/pipe-uploads-2-backfill-c", "mention"]]);
+  });
+});

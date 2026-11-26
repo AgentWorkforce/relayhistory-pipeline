@@ -23,9 +23,18 @@ export interface SessionArtifacts {
   prs: Array<ArtifactEvent & { url: string }>;
   taskRefs: Array<ArtifactEvent & { ref: string }>;
   files: Array<ArtifactEvent & { path: string }>;
+  /** Feature branches the session created or pushed (`command`) or was told to work on or review (`mention`). */
+  branches: Array<ArtifactEvent & { branch: string; via: "command" | "mention" }>;
 }
 
-export const ARTIFACT_BOUNDS = { pushes: 200, commits: 200, prs: 50, taskRefs: 10, files: 500 } as const;
+export const ARTIFACT_BOUNDS = { pushes: 200, commits: 200, prs: 50, taskRefs: 10, files: 500, branches: 50 } as const;
+const BRANCH_COMMANDS = [
+  /\bgit\s+push\b(?:\s+-{1,2}[A-Za-z-]+)*\s+(?:-u\s+)?origin\s+(?:HEAD:)?(?:refs\/heads\/)?([A-Za-z0-9._-]+\/[A-Za-z0-9._/-]+)/gu,
+  /\bgit\s+(?:checkout|switch)\s+(?:-b|-B|-c|-C|--create)\s+([A-Za-z0-9._-]+\/[A-Za-z0-9._/-]+)/gu,
+  /\bgit\s+worktree\s+add\s+(?:-q\s+)?(?:-b|-B)\s+([A-Za-z0-9._-]+\/[A-Za-z0-9._/-]+)/gu,
+];
+/** A branch named in a brief: `branch <name>`, `Branch under review: <name>`, `on branch <name>`; the name must hold a slash. */
+const BRANCH_MENTION = /\b[Bb]ranch(?: under review)?[:\s]+`?([A-Za-z0-9._-]+\/[A-Za-z0-9._/-]*[A-Za-z0-9_-])`?/gu;
 
 const PUSH_BLOCK = /To ((?:https:\/\/|git@)github\.com[:/][A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+?(?:\.git)?)\s*\n((?:[ \t]+[^\n]*\n?)+)/gu;
 const PUSH_LINE = /^\s+(?:\+?\s*([0-9a-f]{7,40})\.\.\.?([0-9a-f]{7,40})|\*\s+\[new (?:branch|tag)\])\s+([A-Za-z0-9._/-]+)\s+->\s+([A-Za-z0-9._/-]+)/gmu;
@@ -38,8 +47,14 @@ const text = (v: unknown) => (typeof v === "string" ? v : v == null ? "" : JSON.
 const timeOf = (v: unknown) => (typeof v === "string" && Number.isFinite(Date.parse(v)) ? new Date(v).toISOString() : null);
 
 export function extractArtifacts(rows: ReadonlyArray<{ table: string; row: Record<string, unknown> }>, attributedRepo: string | null): SessionArtifacts {
-  const out: SessionArtifacts = { pushes: [], commits: [], prs: [], taskRefs: [], files: [] };
-  const seen = { pushes: new Set<string>(), commits: new Set<string>(), prs: new Set<string>(), taskRefs: new Set<string>(), files: new Set<string>() };
+  const out: SessionArtifacts = { pushes: [], commits: [], prs: [], taskRefs: [], files: [], branches: [] };
+  const seen = { pushes: new Set<string>(), commits: new Set<string>(), prs: new Set<string>(), taskRefs: new Set<string>(), files: new Set<string>(), branches: new Set<string>() };
+  const addBranch = (ev: ArtifactEvent, raw: string, via: "command" | "mention") => {
+    const branch = raw.replace(/[.,:;]+$/u, "");
+    if (DEFAULT_BRANCH.test(branch) || branch.startsWith("origin/") || seen.branches.has(branch) || out.branches.length >= ARTIFACT_BOUNDS.branches) return;
+    seen.branches.add(branch);
+    out.branches.push({ ...ev, branch, via });
+  };
   const prCandidates: Array<ArtifactEvent & { url: string; repo: string }> = [];
   for (const { table, row } of rows) {
     if (table !== "convergence_events") continue;
@@ -57,6 +72,7 @@ export function extractArtifacts(rows: ReadonlyArray<{ table: string; row: Recor
           if (seen.pushes.has(key) || out.pushes.length >= ARTIFACT_BOUNDS.pushes) continue;
           seen.pushes.add(key);
           out.pushes.push({ ...ev, repo, branch, sha: line[2]?.toLowerCase() ?? null });
+          if (branch.includes("/")) addBranch(ev, branch, "command");
         }
       }
       for (const m of body.matchAll(COMMIT_LINE)) {
@@ -67,6 +83,8 @@ export function extractArtifacts(rows: ReadonlyArray<{ table: string; row: Recor
       }
       for (const m of body.matchAll(PR_URL)) prCandidates.push({ ...ev, url: `https://github.com/${m[1]}/${m[2]}/pull/${m[3]}`.toLowerCase(), repo: `${m[1]}/${m[2]}`.toLowerCase() });
     }
+    if (type === "tool_call" || row.kind === "tool_call") for (const re of BRANCH_COMMANDS) for (const m of body.matchAll(re)) addBranch(ev, m[1]!, "command");
+    if (type === "user" || type === "history") for (const m of body.matchAll(BRANCH_MENTION)) addBranch(ev, m[1]!, "mention");
     if (type === "user" || type === "history") for (const m of body.matchAll(TASK)) {
       const ref = m[1]!.replace(/[.:]+$/u, "");
       if (ref.startsWith("startup-") || seen.taskRefs.has(ref) || out.taskRefs.length >= ARTIFACT_BOUNDS.taskRefs) continue;
