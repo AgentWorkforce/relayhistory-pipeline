@@ -45,7 +45,7 @@ import { Hono, type Context } from "hono";
 import { log } from "../shared/log.ts";
 import { captureSafely, ingestOutcome, type AnalyticsPort } from "../shared/analytics.ts";
 import { AuthError, type VerifiedIdentity } from "../session-read-api/app.ts";
-import { batchIdConflict, BufferLockBusy, ClaimLockBusy, deliverBatch, deliverPrepared, IngestUnavailable, type DeliverDeps } from "./deliver.ts";
+import { batchIdConflict, BufferLockBusy, ClaimLockBusy, deliverBatch, deliverPrepared, IngestUnavailable, lockRetryFieldsOf, type DeliverDeps } from "./deliver.ts";
 import { prepareForAdmission } from "./admission-core.ts";
 import { clientFields } from "./client-agent.ts";
 import { UPLOAD_DIRECT_OFF, uploadAdmissionStatus, type UploadDirectConfig } from "./upload-admission.ts";
@@ -920,7 +920,7 @@ export function createIngestApp(deps: IngestAppDeps) {
         ? async (dropped: ReadonlySet<string>, phase: "admit" | "commit") => { await checkUploadConsent(deps.uploadConsent, tenant, batch.origin_id, batch.records, { dropped, phase, route, ...(operator ? { operator } : {}) }, (f) => emit({ ...fields, ...f })); }
         : undefined;
       const result = await deliverBatch({...deps.deliver,...(custody?{custody}:{}),...(consentGate?{consentGate}:{})}, { orgId: identity.orgId, workspaceId: identity.workspaceId, userId: identity.userId }, batch);
-      emit({ ...fields, outcome: result.outcome, count: result.stats.records, manifests: result.stats.manifests_written, deleted: result.stats.deleted_sessions, state: result.stats.replica, duration_ms: Date.now() - started, bytes_raw: read.bytes });
+      emit({ ...fields, outcome: result.outcome, count: result.stats.records, manifests: result.stats.manifests_written, deleted: result.stats.deleted_sessions, state: result.stats.replica, ...lockRetryFieldsOf(result), duration_ms: Date.now() - started, bytes_raw: read.bytes });
       completed({ outcome: result.outcome }, result.stats.records);
       custodyHeader(c,result.custodyAck);
       return c.json({ ...result.receipt, limits: { ...result.receipt.limits, contentEncodings: contentEncodings() } });
@@ -930,6 +930,7 @@ export function createIngestApp(deps: IngestAppDeps) {
         ...fields,
         outcome: code,
         ...unavailableFields(error),
+        ...lockRetryFieldsOf(error),
         ...(error instanceof DeliveryError && error.conflictCount ? { count: error.conflictCount } : {}),
         duration_ms: Date.now() - started,
         bytes_raw: read.bytes,
@@ -982,12 +983,12 @@ export function createIngestApp(deps: IngestAppDeps) {
         ? async (dropped: ReadonlySet<string>, phase: "admit" | "commit") => { await checkUploadConsent(deps.uploadConsent, tenant, prepared.originId, prepared.records, { dropped, phase, route: "delivery.recovery" }, (f) => emit({ ...fields, ...f })); }
         : undefined;
       const result = await deliverPrepared({ ...deps.deliver, custody, ...(consentGate ? { consentGate } : {}) }, tenant, prepared);
-      emit({ ...fields, outcome: result.outcome, count: result.stats.records, manifests: result.stats.manifests_written, deleted: result.stats.deleted_sessions, state: result.stats.replica, duration_ms: Date.now() - started, bytes_raw: c.get("body").byteLength });
+      emit({ ...fields, outcome: result.outcome, count: result.stats.records, manifests: result.stats.manifests_written, deleted: result.stats.deleted_sessions, state: result.stats.replica, ...lockRetryFieldsOf(result), duration_ms: Date.now() - started, bytes_raw: c.get("body").byteLength });
       custodyHeader(c, result.custodyAck);
       return c.json({ ...result.receipt, limits: { ...result.receipt.limits, contentEncodings: contentEncodings() } });
     } catch (error) {
       const code = error instanceof DeliveryError ? error.code : "delivery_unavailable";
-      emit({ ...fields, outcome: code, ...unavailableFields(error), duration_ms: Date.now() - started, bytes_raw: c.get("body").byteLength });
+      emit({ ...fields, outcome: code, ...unavailableFields(error), ...lockRetryFieldsOf(error), duration_ms: Date.now() - started, bytes_raw: c.get("body").byteLength });
       const lockAlert = lockAlertFields(error, deps.deliver.acceptanceMode);
       if (lockAlert) emit(lockAlert);
       return failure(c, error);
