@@ -26,7 +26,7 @@ import { components, type Components, rank, rankerGrid, type RankerParams } from
 import { adjudicationSample, type AlertVerdict, ceiling, evaluate, pairId } from "./eval.ts";
 import { describe as describePair } from "./bundle.ts";
 import { LOOSE_RANKER, scoreStage2, stage2Batch, verifiedBatch } from "./stage2.ts";
-import { claimOnce, finishOnce, noteOnce, onceState } from "./once.ts";
+import { claimOnce, finishOnce, noteOnce, pinScore } from "./once.ts";
 import { assertPrivateFile, assertPrivateInput, outsideRoot, privateDir, readPrivate, writePrivate } from "../cloud-harvest/private-fs.ts";
 
 /** Every record of a JSON-lines input; a malformed line or a partial last record is refused, never skipped. */
@@ -89,6 +89,12 @@ export function harvestScopes(harvest: string, now = new Date().toISOString()): 
   });
   if (new Set(scopes.map((x) => x.workspace)).size > 1) throw new Error("the harvests are of different workspaces");
   return scopes;
+}
+
+/** The earliest delete-by of several scopes, compared as instants (formats differ: whole or fractional seconds). */
+export function earliestDeleteBy(scopes: Array<{ deleteBy: string }>): string {
+  if (!scopes.length) throw new Error("no harvest scope");
+  return new Date(Math.min(...scopes.map((x) => instant(x.deleteBy, "deleteBy")))).toISOString();
 }
 
 export function loadContext(harvest: string, forge: string, observed: ObservedPolicy = "all"): Context & { codingSessions: number; scopes: HarvestScope[] } {
@@ -219,12 +225,17 @@ async function main(argv: string[]) {
     if (!values.out) throw new Error("stage2-score needs --out (the batch directory)");
     assertOutsideRepo(values.out);
     const { manifest, key, verdicts } = verifiedBatch(values.out);
-    const result = { ...scoreStage2(key, verdicts, manifest.cutoff), split: manifest.split, promptHash: manifest.promptHash, judge: manifest.judge, manifestHash: manifest.manifestHash };
+    // The verdicts' identity: their validated content in pair order, independent of file layout and formatting.
+    const verdictsHash = createHash("sha256").update(JSON.stringify([...verdicts].sort((a, b) => (a.pair < b.pair ? -1 : 1)).map((v) => [v.pair, v.verdict, v.p_overlap]))).digest("hex");
+    let result: unknown = { ...scoreStage2(key, verdicts, manifest.cutoff), split: manifest.split, promptHash: manifest.promptHash, judge: manifest.judge, manifestHash: manifest.manifestHash, verdictsHash };
     const receipt = join(values.out, "key", "score.json");
     if (manifest.split === "heldout") {
-      // Ownership is taken over from the batch's (finished) process under the batch's exact terms.
+      // Ownership is taken over from the batch's (finished) process under the batch's exact terms. The score is
+      // pinned (verdicts digest and result) before the receipt is published; a resumed scoring must present the
+      // same verdicts and republishes the pinned result, wherever its receipt goes.
       const rec = claimOnce("stage2", manifest.labelsHash, manifest.terms);
       if (rec.batch !== manifest.manifestHash) throw new Error("this held-out batch is not the one claimed for these labels");
+      result = pinScore(rec, { verdictsHash, result }).score!.result;
       writePrivate(receipt, JSON.stringify(result, null, 1));
       finishOnce(rec, result);
     } else writePrivate(receipt, JSON.stringify(result, null, 1));
@@ -342,7 +353,7 @@ async function main(argv: string[]) {
     const keyText = JSON.stringify(items.map((x) => ({ pair: pairId(x.sides), truth: x.truth })), null, 1);
     writePrivate(join(keyDir, "key.json"), keyText);
     // The batch inherits the earliest delete-by of the data it was drawn from; scoring refuses it after that.
-    const deleteBy = ctx.scopes.map((x) => x.deleteBy).sort()[0]!;
+    const deleteBy = earliestDeleteBy(ctx.scopes);
     const body = { format: "overlap-bench-stage2/3", split, terms, ...terms, labelsHash: frozen.labelsHash, ranker: ranker.hash, perHundred: frozen.perHundred, deleteBy, items: items.length, keyHash: sha(keyText), parts, prompts };
     const manifest = { ...body, manifestHash: sha(JSON.stringify(body)) };
     writePrivate(join(keyDir, "stage2.json"), JSON.stringify(manifest, null, 1));

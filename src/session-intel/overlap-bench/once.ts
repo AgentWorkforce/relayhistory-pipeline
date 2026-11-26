@@ -22,6 +22,8 @@ export interface OnceRecord {
   owner: number;
   /** Stage 2: the manifest hash of the batch made under the claim; once set, no other batch can be scored. */
   batch?: string;
+  /** Stage 2: the validated verdicts' digest and the result, pinned before any receipt is published. */
+  score?: { verdictsHash: string; result: unknown };
   result?: unknown;
 }
 
@@ -87,6 +89,20 @@ export function noteOnce(rec: OnceRecord, batch: string, registry = REGISTRY, pi
   return transition(rec, registry, pid, (cur) => {
     if (cur.batch && cur.batch !== batch) throw new Error(`held-out ${rec.kind} already has a batch for these labels`);
     return { ...cur, batch };
+  });
+}
+
+/**
+ * Pins a stage-2 score (the verdicts' digest and the result) before its receipt is published. A score is pinned
+ * once: a resumed scoring must present the same verdicts and publishes the pinned result.
+ */
+export function pinScore(rec: OnceRecord, score: { verdictsHash: string; result: unknown }, registry = REGISTRY, pid = process.pid): OnceRecord {
+  return transition(rec, registry, pid, (cur) => {
+    if (cur.score) {
+      if (cur.score.verdictsHash !== score.verdictsHash) throw new Error("the verdicts differ from the ones this held-out score was pinned with");
+      return cur;
+    }
+    return { ...cur, score };
   });
 }
 

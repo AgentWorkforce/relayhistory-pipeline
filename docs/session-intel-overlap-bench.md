@@ -118,8 +118,9 @@ The judge's input is therefore more than PR text. It includes session-derived fa
    - A claim names its owner process. An active claim is never shared. A claim whose owner died is interrupted, and may be resumed under identical terms.
    - A stage-2 claim pins the batch made under it, and only that batch can be scored.
    - Receipts are written before the record is finished, so an exit in between only repeats the same deterministic run.
+   - A stage-2 score pins the digest of its validated verdicts and its result in the record before any receipt is published. A resumed scoring, from any directory, must present the same verdicts, and republishes the pinned result.
    - The labels v2 held-out was spent before this identity existed, and is recorded as done under both its earlier and its byte identity.
-7. A stage-2 batch carries the earliest delete-by of the data it was drawn from. `stage2-score` first checks that the batch directory is a private destination outside the repository and that the batch is within its delete-by, and only then opens any part, prompt or verdict.
+7. A stage-2 batch carries the earliest delete-by of the data it was drawn from, compared as instants. `stage2-score` first checks that the batch directory is a private destination outside the repository and that the batch is within its delete-by, and only then opens any part, prompt or verdict.
 
 ## Findings so far (dev split)
 

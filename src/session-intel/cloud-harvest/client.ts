@@ -83,9 +83,13 @@ export class CloudClient {
    * preamble and then one JSON object. A tool error (`isError`) is thrown as McpToolError with its first line,
    * which names the condition ("No shared session was found ..."), never transcript content.
    */
-  async callTool(name: McpReadTool, args: Record<string, unknown>): Promise<Record<string, unknown>> {
+  /**
+   * `retry: false` sends exactly one physical request: a failure is thrown, never re-sent. Used where each send is
+   * charged against a hard allowance (directory rows), since a lost answer may still have been served.
+   */
+  async callTool(name: McpReadTool, args: Record<string, unknown>, opts: { retry?: boolean } = {}): Promise<Record<string, unknown>> {
     const body = JSON.stringify({ jsonrpc: "2.0", id: ++this.#rpcId, method: "tools/call", params: { name, arguments: args } });
-    const res = await this.#send("mcp", this.#mcp, { method: "POST", body, headers: { "content-type": "application/json", accept: "application/json, text/event-stream" } });
+    const res = await this.#send("mcp", this.#mcp, { method: "POST", body, headers: { "content-type": "application/json", accept: "application/json, text/event-stream" } }, opts.retry ?? true);
     const raw = res.text;
     // Streamable HTTP may answer as an event stream; the JSON-RPC response is its last `data:` line.
     const json = res.contentType?.includes("text/event-stream")
@@ -103,7 +107,7 @@ export class CloudClient {
   }
 
   /** Sends one request and reads its body inside a limiter slot, so "in flight" includes reading the answer. */
-  async #send(route: "list" | "events" | "mcp", url: string, init: { method: string; body?: string; headers?: Record<string, string> }): Promise<{ text: string; contentType: string | null }> {
+  async #send(route: "list" | "events" | "mcp", url: string, init: { method: string; body?: string; headers?: Record<string, string> }, retry = true): Promise<{ text: string; contentType: string | null }> {
     for (let attempt = 0; ; attempt++) {
       if (this.requests.total >= this.opts.maxRequests) throw new HarvestCap();
       this.requests.total++; this.requests.byRoute[route]++;
@@ -115,12 +119,12 @@ export class CloudClient {
         try {
           res = await this.#fetch(url, { method: init.method, body: init.body, headers: { accept: "application/json", ...init.headers, authorization: `Bearer ${this.#token}`, "user-agent": USER_AGENT }, redirect: "manual" });
         } catch (e) {
-          if (attempt >= 5) throw new Error(this.redact(`transport: ${(e as Error).message}`));
+          if (!retry || attempt >= 5) throw new Error(this.redact(`transport: ${(e as Error).message}`));
           wait = 1000 * 2 ** attempt;
         }
         if (wait === null) {
           if (res!.status === 200) return { text: await res!.text(), contentType: res!.headers.get("content-type") };
-          if ([429, 500, 502, 503, 504].includes(res!.status) && attempt < 5) {
+          if (retry && [429, 500, 502, 503, 504].includes(res!.status) && attempt < 5) {
             const ra = Number(res!.headers.get("retry-after"));
             wait = Number.isFinite(ra) && ra > 0 ? Math.min(ra, 120) * 1000 : 1000 * 2 ** attempt;
           } else throw new HttpError(res!.status, route);

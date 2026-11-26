@@ -62,7 +62,9 @@ export async function harvestMcpFrame(client: CloudClient, window: { since: stri
   do {
     // The page size is the allowance left (reserved before sending), so no request asks for rows beyond the ceiling.
     const limit = budget ? budget.reserve(LIST_PAGE) : LIST_PAGE;
-    const page = await client.callTool("list_session_summaries", { since: window.since, limit, ...(cursor ? { cursor } : {}) });
+    // Under a row allowance a list request is sent once: a retry could have the server serve the rows twice against
+    // one reservation. A lost answer stops the listing (resumable), with the reservation kept as spent.
+    const page = await client.callTool("list_session_summaries", { since: window.since, limit, ...(cursor ? { cursor } : {}) }, { retry: !budget });
     pages++;
     sameWorkspace(client, page);
     const received = Array.isArray(page.sessions) ? page.sessions.length : 0;

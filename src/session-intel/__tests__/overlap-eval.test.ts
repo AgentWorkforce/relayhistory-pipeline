@@ -176,3 +176,67 @@ describe("once-only held-out", () => {
     expect(() => claimOnce("stage1", b, { f: 1 }, reg)).toThrow("already evaluated");
   });
 });
+
+describe("round 6", () => {
+  test("an interrupted held-out score cannot be redone with other verdicts, in any directory", async () => {
+    const { createHash } = await import("node:crypto");
+    const { mkdtempSync, mkdirSync, writeFileSync, cpSync, readFileSync } = await import("node:fs");
+    const { tmpdir } = await import("node:os");
+    const { join } = await import("node:path");
+    const sha = (t: string) => createHash("sha256").update(t).digest("hex");
+    const home = mkdtempSync(join(tmpdir(), "home-")), L = "b".repeat(64), P = { mode: 0o600 };
+    const batch = join(mkdtempSync(join(tmpdir(), "b-")), "batch");
+    mkdirSync(join(batch, "judge"), { recursive: true, mode: 0o700 }); mkdirSync(join(batch, "key"), { mode: 0o700 });
+    const key = [{ pair: "p1", truth: "incident:x" }], keyText = JSON.stringify(key), part = "{}\n", prompt = "p";
+    const verdicts = (p: number) => JSON.stringify([{ pair: "p1", verdict: "overlap", p_overlap: p }]);
+    writeFileSync(join(batch, "key", "key.json"), keyText, P); writeFileSync(join(batch, "judge", "part-00"), part, P); writeFileSync(join(batch, "judge", "prompt-00.txt"), prompt, P);
+    writeFileSync(join(batch, "judge", "verdicts-00.json"), verdicts(0.9), P);
+    const terms = { t: 1 };
+    const body = { format: "overlap-bench-stage2/3", split: "heldout", terms, cutoff: 0.3, promptHash: "x", seed: "s", judge: "j", labelsHash: L, deleteBy: "2099-01-01T00:00:00.000Z", items: 1, keyHash: sha(keyText), parts: { "part-00": sha(part) }, prompts: { "prompt-00.txt": sha(prompt) } };
+    const manifestHash = sha(JSON.stringify(body));
+    writeFileSync(join(batch, "key", "stage2.json"), JSON.stringify({ ...body, manifestHash }), P);
+    // The registry as an interrupted run left it: batch pinned, score pinned with the first verdicts, not finished.
+    const reg = join(home, ".local", "state", "overlap-bench", "heldout");
+    mkdirSync(reg, { recursive: true, mode: 0o700 });
+    const vh = sha(JSON.stringify([["p1", "overlap", 0.9]]));
+    const pinned = { positives: 1, positivesKept: 1, fresh: 0, freshKept: 0, cutoff: 0.3, marker: "PINNED" };
+    writeFileSync(join(reg, `stage2-${L}.json`), JSON.stringify({ kind: "stage2", labelsHash: L, terms, state: "claimed", claimedAt: "x", owner: 999_999_99, batch: manifestHash, score: { verdictsHash: vh, result: pinned } }), P);
+    const cli = join(import.meta.dir, "..", "overlap-bench", "cli.ts");
+    const run = async (dir: string) => {
+      const p = Bun.spawn([process.execPath, cli, "stage2-score", "--out", dir], { env: { ...process.env, HOME: home }, stdout: "pipe", stderr: "pipe" });
+      await p.exited;
+      return { code: p.exitCode, err: await new Response(p.stderr).text() };
+    };
+    // Changed verdicts in a copy elsewhere: refused, and the registry is untouched.
+    const copy = join(mkdtempSync(join(tmpdir(), "c-")), "batch");
+    cpSync(batch, copy, { recursive: true });
+    writeFileSync(join(copy, "judge", "verdicts-00.json"), verdicts(0.1), P);
+    const r1 = await run(copy);
+    expect(r1.code).not.toBe(0);
+    expect(r1.err).toContain("differ from the ones this held-out score was pinned with");
+    // The original verdicts: the pinned result is published and the evaluation completes.
+    const r2 = await run(batch);
+    expect(r2.code).toBe(0);
+    expect(JSON.parse(readFileSync(join(batch, "key", "score.json"), "utf8")).marker).toBe("PINNED");
+    expect(JSON.parse(readFileSync(join(reg, `stage2-${L}.json`), "utf8")).state).toBe("done");
+    expect((await run(batch)).code).not.toBe(0);
+  });
+  test("a reserved list request is sent once: a lost answer is not retried", async () => {
+    const { harvestMcpFrame } = await import("../cloud-harvest/mcp-source.ts");
+    const { CloudClient } = await import("../cloud-harvest/client.ts");
+    const limits: number[] = [];
+    const fetchImpl = (async (_u: string, init: RequestInit) => { limits.push(JSON.parse(String(init.body)).params.arguments.limit); throw new Error("connection reset"); }) as unknown as typeof fetch;
+    const c = new CloudClient({ base: "https://cloud.example/cloud/api/v1", workspaceId: "00000000-0000-4000-8000-000000000001", maxRequests: 100, fetchImpl, sleep: async () => {} }, "cld_test_token_abcdefghijklmnop");
+    let spent = 0;
+    const budget = { reserve: (w: number) => { const g = Math.min(w, 3 - spent); spent += g; return g; }, settle: () => {} };
+    await expect(harvestMcpFrame(c, { since: "2026-11-01T00:00:00Z", until: "2026-12-01T00:00:00Z" }, () => {}, budget)).rejects.toThrow("transport");
+    expect(limits).toEqual([3]);
+    expect(spent).toBe(3); // the reservation stays spent: the server may have served it
+  });
+  test("a batch's deadline is the earliest delete-by as an instant, whatever the format", async () => {
+    const { earliestDeleteBy } = await import("../overlap-bench/cli.ts");
+    // As strings, ".900Z" sorts before "Z"; as instants it is 900 ms later.
+    expect(earliestDeleteBy([{ deleteBy: "2026-12-09T00:00:00.900Z" }, { deleteBy: "2026-12-09T00:00:00Z" }])).toBe("2026-12-09T00:00:00.000Z");
+    expect(() => earliestDeleteBy([{ deleteBy: "2026-12-09" }])).toThrow("canonical UTC");
+  });
+});
