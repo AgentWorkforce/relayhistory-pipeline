@@ -5,6 +5,7 @@
  */
 import { appendFileSync, closeSync, existsSync, ftruncateSync, openSync, readFileSync, readSync, statSync } from "node:fs";
 import { assertPrivateFile, readPrivate, writePrivate } from "./private-fs.ts";
+import { eventNanos, instantOf } from "./instant.ts";
 import { join } from "node:path";
 import { type CloudClient, HarvestCap, HttpError } from "./client.ts";
 import { directoryProjection, eventFacts, informative, type EventFacts, type RawEvent } from "./features.ts";
@@ -62,11 +63,14 @@ export const READERS = {
   "reader-mcp": { serverSideEventWindow: false, workspaceInPath: false, boundedListPages: true },
 } as const;
 
-/** -1 before the window, 0 inside it, 1 after it. An unparseable time is treated as outside (before). */
+/**
+ * -1 before the window, 0 inside it, 1 after it, comparing the event's time at its full precision against the
+ * admitted bounds (millisecond-exact, cloud-harvest/instant.ts). A time that does not parse counts as outside.
+ */
 export function inWindow(ts: unknown, w: Window): -1 | 0 | 1 {
-  const t = typeof ts === "string" ? Date.parse(ts) : NaN;
-  if (!Number.isFinite(t) || t < Date.parse(w.since)) return -1;
-  return t > Date.parse(w.until) ? 1 : 0;
+  const t = eventNanos(ts), since = BigInt(instantOf(w.since, "window since")) * 1_000_000n, until = BigInt(instantOf(w.until, "window until")) * 1_000_000n;
+  if (t === null || t < since) return -1;
+  return t > until ? 1 : 0;
 }
 
 interface ListPage { items?: Array<Record<string, unknown>>; nextCursor?: string | null; error?: boolean }

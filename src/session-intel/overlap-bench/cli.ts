@@ -146,15 +146,27 @@ const inRepo = (p: string) => (p + "/").startsWith(REPO_ROOT + "/");
 export function assertOutsideRepo(out: string): string { return outsideRoot(out, REPO_ROOT); }
 
 /**
- * Every source a score depends on, transitively: the bench, the shared code it imports (the harvest's facts and
- * directory types and its private I/O, the forge types), and the shipped detector the baseline runs.
+ * Every source a score depends on: every local module the bench CLI reaches through its imports, transitively (the
+ * bench, the shared harvest, forge and parser code, the shipped detector the baseline runs). Derived from the import
+ * graph, so a new dependency cannot be left out of the freeze identity.
  */
-const SOURCES = [
-  ...["detectors.ts", "model.ts", "paths.ts", "score.ts", "baseline.ts", "ranker.ts", "eval.ts", "bundle.ts", "stage2.ts", "once.ts", "cli.ts"],
-  "../cloud-harvest/features.ts", "../cloud-harvest/harvest.ts", "../cloud-harvest/private-fs.ts", "../forge/types.ts",
-  "../../../packages/coordination-detect/src/index.ts",
-].map((f) => new URL(f, import.meta.url));
-const sourceHash = () => createHash("sha256").update(SOURCES.map((u) => readFileSync(u)).join("\u0000")).digest("hex");
+export function sourceFiles(entry = fileURLToPath(import.meta.url), read = (f: string) => readFileSync(f, "utf8")): string[] {
+  const seen = new Set<string>(), queue = [entry];
+  while (queue.length) {
+    const f = queue.shift()!;
+    if (seen.has(f)) continue;
+    seen.add(f);
+    for (const m of read(f).matchAll(/^(?:import|export)[^;]*?\sfrom\s+"(\.{1,2}\/[^"]+\.ts)"/gm)) queue.push(resolve(dirname(f), m[1]!));
+  }
+  return [...seen].sort();
+}
+/** The sources' identity: each file's path relative to the repository and its bytes. */
+export function sourceHashOf(files: string[], read = (f: string) => readFileSync(f)): string {
+  const h = createHash("sha256");
+  for (const f of files) h.update(`${f.slice(REPO_ROOT.length + 1)}\u0000`).update(read(f)).update("\u0000");
+  return h.digest("hex");
+}
+const sourceHash = () => sourceHashOf(sourceFiles());
 /** sha256 over files, streamed (harvest facts are large), in the given order, each prefixed with its name and size. */
 function digestFiles(files: string[]): string {
   const h = createHash("sha256"), buf = Buffer.alloc(1 << 20);

@@ -197,6 +197,20 @@ describe("reader source (shared-sessions MCP)", () => {
     expect(JSON.stringify(s)).not.toContain(MARKER);
   });
 
+  test("both window edges hold at sub-millisecond precision through the collector", async () => {
+    const at = (t: string, i: number) => mcpEvent(i, { timestamp: t, content: `*** Update File: src/e${i}.ts` });
+    const { client } = fakeMcp(() => ({ events: [
+      at("2026-11-01T00:00:00.000100000Z", 1), // before a start of .001
+      at("2026-11-01T00:00:00.001000000Z", 2),
+      at("2026-11-02T00:00:00.000000000Z", 3),
+      at("2026-11-02T00:00:00.000900000Z", 4), // after an end of .000
+    ], next_cursor: null }));
+    const { harvestMcpSession } = await import("../cloud-harvest/mcp-source.ts");
+    const s = await harvestMcpSession(client, { sessionId: "s", source: "codex", lastTs: "" }, { since: "2026-11-01T00:00:00.001Z", until: "2026-11-02T00:00:00.000Z" });
+    expect(s.events.map((e) => e.touched[0]!.path)).toEqual(["src/e2.ts", "src/e3.ts"]);
+    expect(s.outOfWindow).toBe(2);
+  });
+
   test("a credential bound to another workspace is refused before any read", async () => {
     const { runHarvest } = await import("../cloud-harvest/harvest.ts");
     const { mkdtempSync } = await import("node:fs");

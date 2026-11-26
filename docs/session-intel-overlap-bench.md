@@ -103,7 +103,7 @@ The judge's input is therefore more than PR text. It includes session-derived fa
    - the alert budget;
    - the split scored (`heldout`);
    - the observed-path policy.
-   The sources hash covers the bench, the shared code it imports, and the shipped detector the baseline runs (`packages/coordination-detect`). The freeze carries a hash of all of its own terms and points (`freezeHash`), so an edited freeze, such as a changed budget, is refused.
+   The sources hash covers every local module the bench CLI reaches through its imports, transitively (`sourceFiles`, derived from the import graph): the bench, the shared harvest, forge and parser code, and the shipped detector the baseline runs (`packages/coordination-detect`). The freeze carries a hash of all of its own terms and points (`freezeHash`), so an edited freeze, such as a changed budget, is refused.
 3. Score held-out once. `heldout` recomputes every term and every point hash and refuses any mismatch. It uses the frozen budget (a different `--per-hundred` is refused). The once-only ledgers (`heldout-stage1-*`, `heldout-stage2-*`) sit beside the labels, keyed by the labels digest, and each is claimed with an exclusive create before scoring. Neither a new output directory nor a new freeze can score the same held-out labels again.
 4. Precision samples use fresh seeds, and a pair is never judged twice.
 5. Stage 2 is frozen with stage 1:

@@ -245,9 +245,9 @@ describe("round 7", () => {
   test("admitted times must be real calendar instants", async () => {
     const { parseInstant, instantOf } = await import("../cloud-harvest/instant.ts");
     const { earliestDeleteBy } = await import("../overlap-bench/cli.ts");
-    for (const ok of ["2028-02-29T00:00:00Z", "2026-12-09T00:00:00.900Z", "2026-12-31T23:59:59.123456789Z", "2000-02-29T12:00:00Z"]) expect(Number.isFinite(parseInstant(ok))).toBe(true);
+    for (const ok of ["2028-02-29T00:00:00Z", "2026-12-09T00:00:00.900Z", "2026-12-31T23:59:59.123000000Z", "2000-02-29T12:00:00Z"]) expect(Number.isFinite(parseInstant(ok))).toBe(true);
     for (const bad of ["2099-02-30T00:00:00Z", "2027-02-29T00:00:00Z", "1900-02-29T00:00:00Z", "2026-04-31T00:00:00Z", "2026-13-01T00:00:00Z", "2026-00-10T00:00:00Z",
-      "2026-12-09T24:00:00Z", "2026-12-09T23:60:00Z", "2026-12-09T23:59:60Z", "2026-12-09T00:00:00+00:00", "2026-12-09", "2026-12-09T00:00:00.Z"]) {
+      "2026-12-09T24:00:00Z", "2026-12-09T23:60:00Z", "2026-12-09T23:59:60Z", "2026-12-09T00:00:00+00:00", "2026-12-09", "2026-12-09T00:00:00.Z", "2026-12-31T23:59:59.123456789Z"]) {
       expect(Number.isNaN(parseInstant(bad))).toBe(true);
     }
     expect(() => instantOf("2099-02-30T00:00:00Z", "deleteBy")).toThrow("real calendar date");
@@ -280,5 +280,39 @@ describe("round 7", () => {
     expect(() => verifiedBatch(copy)).toThrow("open to group or others");
     chmodSync(join(copy, "key"), 0o700); chmodSync(join(copy, "judge"), 0o755);
     expect(() => verifiedBatch(copy)).toThrow("open to group or others");
+  });
+});
+
+describe("round 8", () => {
+  test("admitted bounds are millisecond-exact; sub-millisecond digits are refused, not dropped", async () => {
+    const { parseInstant } = await import("../cloud-harvest/instant.ts");
+    expect(parseInstant("2026-11-01T00:00:00.900000000Z")).toBe(Date.parse("2026-11-01T00:00:00.900Z"));
+    expect(Number.isNaN(parseInstant("2026-11-01T00:00:00.000900000Z"))).toBe(true);
+    expect(Number.isNaN(parseInstant("2026-11-01T00:00:00.0001Z"))).toBe(true);
+  });
+  test("event times are compared at full precision at both edges, through the collector", async () => {
+    const { inWindow } = await import("../cloud-harvest/harvest.ts");
+    const w = { since: "2026-11-01T00:00:00.001Z", until: "2026-11-02T00:00:00.000Z" };
+    expect(inWindow("2026-11-01T00:00:00.000100000Z", w)).toBe(-1); // 0.9 ms before the start
+    expect(inWindow("2026-11-01T00:00:00.001000000Z", w)).toBe(0);
+    expect(inWindow("2026-11-02T00:00:00.000000000Z", w)).toBe(0);
+    expect(inWindow("2026-11-02T00:00:00.000000001Z", w)).toBe(1); // 1 ns after the end
+    expect(inWindow("2026-11-02T00:00:00.000900000Z", w)).toBe(1);
+    expect(inWindow("2026-11-01T01:00:00.000+01:00", w)).toBe(-1); // = 00:00:00.000Z, before the start
+  });
+  test("a window bound with sub-millisecond digits is refused", async () => {
+    const { inWindow } = await import("../cloud-harvest/harvest.ts");
+    expect(() => inWindow("2026-11-02T00:00:00Z", { since: "2026-11-01T00:00:00.000900000Z", until: "2026-11-03T00:00:00Z" })).toThrow("millisecond precision");
+  });
+  test("the freeze's sources follow the import graph, and a change to the parser changes the identity", async () => {
+    const { sourceFiles, sourceHashOf } = await import("../overlap-bench/cli.ts");
+    const { readFileSync } = await import("node:fs");
+    const files = sourceFiles();
+    for (const f of ["cloud-harvest/instant.ts", "cloud-harvest/private-fs.ts", "overlap-bench/once.ts", "overlap-bench/stage2.ts", "packages/coordination-detect/src/index.ts"]) {
+      expect(files.some((x) => x.endsWith(f))).toBe(true);
+    }
+    const parser = files.find((x) => x.endsWith("cloud-harvest/instant.ts"))!;
+    const changed = (f: string) => (f === parser ? Buffer.from(readFileSync(f, "utf8").replace("1_000_000n", "1_000_001n")) : readFileSync(f));
+    expect(sourceHashOf(files, changed)).not.toBe(sourceHashOf(files));
   });
 });
