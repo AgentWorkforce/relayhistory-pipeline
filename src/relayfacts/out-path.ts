@@ -13,7 +13,7 @@
  *   modes are stored but every user sees the files as their own: keep such output on a single-user machine.
  */
 import { randomBytes } from "node:crypto";
-import { chmodSync, closeSync, constants, existsSync, fchmodSync, fstatSync, fsyncSync, linkSync, lstatSync, mkdirSync, openSync, readSync, readdirSync, readFileSync, realpathSync, renameSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, closeSync, constants, existsSync, fchmodSync, fstatSync, fsyncSync, ftruncateSync, linkSync, lstatSync, mkdirSync, openSync, readSync, readdirSync, readFileSync, realpathSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { basename, dirname, join, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 import { UsageError } from "./errors.ts";
@@ -86,6 +86,19 @@ export function readPrivateBytes(path: string, maxBytes = 512 * 1024 * 1024): Bu
 
 /** Read a private file (an input such as --features, --gold or --forge): no links, checked descriptor. */
 export const readPrivateFile = (path: string): string => readPrivateBytes(path).toString("utf8");
+
+/** The offset just past the last newline in the file's first `size` bytes (0 when there is none). */
+function lastNewlineEnd(fd: number, size: number): number {
+  const chunk = Buffer.alloc(64 * 1024);
+  for (let end = size; end > 0;) {
+    const start = Math.max(0, end - chunk.length);
+    const n = readSync(fd, chunk, 0, end - start, start);
+    const i = chunk.subarray(0, n).lastIndexOf(0x0a);
+    if (i >= 0) return start + i + 1;
+    end = start;
+  }
+  return 0;
+}
 
 /** A private output directory: every read and write goes through validated child names. */
 export class PrivateDir {
@@ -165,9 +178,9 @@ export class PrivateDir {
   }
 
   /**
-   * Append one line to a private log (retried on EINTR); the opened file is checked before writing. A line torn by
-   * an interrupted earlier append is closed off first (a newline is written before the new line), so only the torn
-   * line is lost on resume, never the next one.
+   * Append one line to a private log (retried on EINTR); the opened file is checked before writing. A fragment torn
+   * by an interrupted earlier append (bytes after the last newline) is truncated away first, so every complete line
+   * in a log is whole: only the torn line is lost on resume, and any malformed complete line is real corruption.
    */
   append(name: string, line: string): void {
     for (let attempt = 0; ; attempt++) {
@@ -176,13 +189,12 @@ export class PrivateDir {
         try {
           checkOpened(fd);
           const size = fstatSync(fd).size;
-          let torn = false;
           if (size > 0) {
             const last = Buffer.alloc(1);
             readSync(fd, last, 0, 1, size - 1);
-            torn = last[0] !== 0x0a;
+            if (last[0] !== 0x0a) ftruncateSync(fd, lastNewlineEnd(fd, size));
           }
-          writeFileSync(fd, torn ? `\n${line}` : line);
+          writeFileSync(fd, line.endsWith("\n") ? line : `${line}\n`);
         } finally { closeSync(fd); }
         return;
       } catch (error) {

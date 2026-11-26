@@ -54,10 +54,10 @@ describe("attributeRepo", () => {
 });
 
 describe("rowInRepo", () => {
-  test("a renamed repository matches under either name", () => {
+  test("a renamed repository matches under either full name; a project path alone abstains", () => {
     const repos = ["acme/widgets", "acme/widgets-old"];
     expect(rowInRepo({ gitRepo: "git@github.com:acme/widgets-old.git", projectId: null }, repos)).toBe(true);
-    expect(rowInRepo({ gitRepo: null, projectId: "Acme/widgets" }, repos)).toBe(true);
+    expect(rowInRepo({ gitRepo: null, projectId: "Acme/widgets" }, repos)).toBe(false);
     expect(rowInRepo({ gitRepo: null, projectId: null }, repos)).toBe(false);
   });
 });

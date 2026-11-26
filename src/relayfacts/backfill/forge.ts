@@ -7,7 +7,7 @@
  */
 import { execFileSync } from "node:child_process";
 import { parseArgs } from "node:util";
-import type { ForgeFacts } from "../features/types.ts";
+import { utcForge, type ForgeFacts } from "../features/types.ts";
 import { parseForge } from "../bench/corpus.ts";
 import { writeOutsideFile } from "../out-path.ts";
 import { printable, UsageError } from "../errors.ts";
@@ -142,7 +142,7 @@ export function forgeFacts(repo: string, mirror: string, since: string, until: s
     const flagsAdded = added.split("\n").filter((f) => f && (f.endsWith("_ENABLED") || known.has(f))).slice(0, 50);
     branches.push({ name, landed: landedAt !== null, landedAt, tipAt, ...(flagsAdded.length ? { flagsAdded } : {}), ...(own.length ? { commits: own } : {}) });
   }
-  return parseForge({ defaultBranch, prs, commits, flags, branches });
+  return utcForge(parseForge({ defaultBranch, prs, commits, flags, branches }));
 }
 
 if (import.meta.main) {

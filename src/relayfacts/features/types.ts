@@ -173,3 +173,30 @@ export interface FeatureRecord {
 
 export const sessionKeyString = (k: SessionKey) => `${k.source}\u0000${k.sessionId}`;
 export const textCompare = (a: string, b: string) => (a < b ? -1 : a > b ? 1 : 0);
+
+/**
+ * One instant as canonical UTC (`YYYY-MM-DDTHH:MM:SS.sssZ`), so that text order is time order everywhere: git
+ * writes offsets (`+00:00`, `-05:00`), analyses write `Z`. Null for a missing or unparseable time.
+ */
+export function utc(t: string | null | undefined): string | null {
+  if (typeof t !== "string" || !t) return null;
+  const ms = Date.parse(t);
+  return Number.isFinite(ms) ? new Date(ms).toISOString() : null;
+}
+
+const normalized = new WeakMap<ForgeFacts, ForgeFacts>();
+/** The forge facts with every time canonical (cached per object). */
+export function utcForge(forge: ForgeFacts): ForgeFacts {
+  const hit = normalized.get(forge);
+  if (hit) return hit;
+  const req = (t: string) => utc(t) ?? t;
+  const out: ForgeFacts = {
+    ...forge,
+    prs: forge.prs.map((p) => ({ ...p, at: req(p.at), ...(p.mergedAt !== undefined ? { mergedAt: utc(p.mergedAt) } : {}), ...(p.closedAt !== undefined ? { closedAt: utc(p.closedAt) } : {}) })),
+    commits: forge.commits.map((c) => ({ ...c, at: req(c.at), ...(c.defaultAt !== undefined ? { defaultAt: utc(c.defaultAt) } : {}), ...(c.revertedAt !== undefined ? { revertedAt: utc(c.revertedAt) } : {}) })),
+    ...(forge.branches ? { branches: forge.branches.map((b) => ({ ...b, tipAt: req(b.tipAt), landedAt: utc(b.landedAt) })) } : {}),
+  };
+  normalized.set(forge, out);
+  normalized.set(out, out);
+  return out;
+}

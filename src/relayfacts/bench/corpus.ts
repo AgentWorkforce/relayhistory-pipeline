@@ -16,7 +16,7 @@ import { readPrivateBytes } from "../out-path.ts";
 import { UsageError } from "../errors.ts";
 import { join } from "node:path";
 import type { SessionAnalysisSnapshot } from "../../session-analysis/engine/session-analysis-result.ts";
-import type { ForgeFacts, SessionContext } from "../features/types.ts";
+import { utcForge, type ForgeFacts, type SessionContext } from "../features/types.ts";
 import type { SessionArtifacts } from "../backfill/artifacts.ts";
 
 export const CORPUS_FORMAT = "relayfacts-corpus/1";
@@ -90,7 +90,7 @@ export function parseForge(raw: unknown): ForgeFacts {
     if (b.commits !== undefined && (!Array.isArray(b.commits) || b.commits.length > 200 || b.commits.some((c) => typeof c !== "string" || !/^[0-9a-f]{40}$/u.test(c))))
       throw new CorpusError("forge.json: a branch's commits must be at most 200 full commit ids");
   }
-  return f as unknown as ForgeFacts;
+  return utcForge(f as unknown as ForgeFacts);
 }
 
 export function loadCorpus(dir: string, now: Date = new Date()): Corpus {

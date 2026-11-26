@@ -172,7 +172,9 @@ export function linkSessions(facts: readonly SessionFacts[], params: LinkParams 
       const near = (o: typeof g) => Date.parse(o.first) - params.intentWindowMs <= Date.parse(g.last) && Date.parse(g.first) <= Date.parse(o.last) + params.intentWindowMs;
       let best: { o: typeof g; sim: number } | null = null;
       for (const o of groups) {
-        if (o === g || !near(o) || (g.members[0]!.keys.repo ?? null) !== (o.members[0]!.keys.repo ?? null)) continue;
+        // Positive same-repository evidence only: a session or group with no known repository never links by intent.
+        const repo = g.members[0]!.keys.repo;
+        if (o === g || !near(o) || !repo || !o.members.every((m) => m.keys.repo === repo)) continue;
         let dot = 0;
         for (const w of g.text) if (o.text.has(w)) dot += weight(w) ** 2;
         const d = norm.get(g.root)! * norm.get(o.root)!;

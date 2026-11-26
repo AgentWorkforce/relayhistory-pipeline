@@ -99,7 +99,8 @@ must cite evidence ids that the scorer checks.
    - overlapping file sets in the same repository within a time window;
    - intent similarity, and only as a tiebreaker: a session no key linked attaches to the group active
      within three days in the same repository whose asks, title and claimed changes are most alike
-     (idf-weighted cosine of content words, at least 0.15), with words that only say what a delegated
+     (idf-weighted cosine of content words, at least 0.15; both must have the same known repository),
+     with words that only say what a delegated
      session does ("review", "report", "findings", "commit") and commit ids left out. On the first
      corpus's dev split it attached 21 labelled singletons, 20 to the right feature;
    - a small delegation family: a parent session and the sessions it spawned (the directory's
@@ -184,8 +185,12 @@ must cite evidence ids that the scorer checks.
     Session lists come only from the same collection's own `locate.jsonl` (the repository attribution
     this tool derived from canonical evidence), cut to the scope's repositories and to what the
     directory itself lists for the tenant inside the window, with the directory's own time; the rest
-    are counted by reason. Built records carry the corpus's delete-by date, and `score` and `packets`
-    refuse them after it.
+    are counted by reason. Without `--from-locate`, `analyse` selects only sessions whose directory git
+    remote is exactly a scoped owner/name; a session with no remote is selected only through the
+    collection's own attribution. Artifacts rows name their session and must match the row they join.
+    A log's torn final fragment is truncated away by the next append; a malformed complete line is
+    refused as corruption. Times are compared as instants (canonical UTC; git's offsets are converted).
+    Built records carry the corpus's delete-by date, and `score` and `packets` refuse them after it.
   - **Private output.** Every output path is refused inside the repository before anything is created.
     Directories the tools create are 0700; an existing directory is never re-permissioned and must
     already be the user's own and closed to group and others. Files are written atomically (a fresh

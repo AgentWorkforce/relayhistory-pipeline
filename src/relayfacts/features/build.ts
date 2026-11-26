@@ -10,7 +10,7 @@
 import { stableId } from "./extract.ts";
 import { DEFAULT_LINK_PARAMS, linkSessions, type LinkParams } from "./link.ts";
 import type { EvidencePointer, FeatureRecord, FeatureState, ForgeFacts, SessionFacts } from "./types.ts";
-import { EMPTY_FORGE, sessionKeyString, textCompare } from "./types.ts";
+import { EMPTY_FORGE, sessionKeyString, textCompare, utc, utcForge } from "./types.ts";
 
 export const ABANDON_AFTER_MS = 21 * 24 * 3_600_000;
 export const MAX_FEATURE_QUOTES = 20;
@@ -31,7 +31,8 @@ export interface BuildOptions {
  * item's. A replay at T is therefore invariant to everything observed after T.
  * The directory's own facts (repository, parent sessions) are known from the session's start.
  */
-export function factsAsOf(f: SessionFacts, asOf: string): SessionFacts | null {
+export function factsAsOf(f: SessionFacts, asOfIn: string): SessionFacts | null {
+  const asOf = utc(asOfIn)!;
   if (f.startedAt >= asOf) return null;
   const ended = f.endedAt < asOf;
   const seen = (at: string | null) => (at === null ? ended : at < asOf);
@@ -67,7 +68,8 @@ export function factsAsOf(f: SessionFacts, asOf: string): SessionFacts | null {
 
 interface StateResult { state: FeatureState; basis: "forge" | "analysis"; reason: string }
 
-export function deriveState(sessions: readonly SessionFacts[], forge: ForgeFacts, asOf: string, unknownFlagDefault: "on" | "off" = "off"): StateResult {
+export function deriveState(sessions: readonly SessionFacts[], forgeIn: ForgeFacts, asOfIn: string, unknownFlagDefault: "on" | "off" = "off"): StateResult {
+  const forge = utcForge(forgeIn), asOf = utc(asOfIn)!;
   const built = sessions.flatMap((s) => s.built);
   const shas = new Set(built.filter((b) => b.kind === "commit").map((b) => b.ref!));
   const prUrls = new Set(built.filter((b) => b.kind === "pr").map((b) => b.ref!));
@@ -138,7 +140,8 @@ export function deriveState(sessions: readonly SessionFacts[], forge: ForgeFacts
  * "base 9d1adf84"), not its work: it is dropped as a link key, so every review cut from one main tip does not
  * become one feature. The session's own built commits stay.
  */
-export function withoutBaseCommits(f: SessionFacts, forge: ForgeFacts): SessionFacts {
+export function withoutBaseCommits(f: SessionFacts, forgeIn: ForgeFacts): SessionFacts {
+  const forge = utcForge(forgeIn);
   const builtShas = new Set(f.built.filter((b) => b.kind === "commit").map((b) => b.ref!));
   // On the default branch by the session's start: the time it became reachable from it (defaultAt), not its commit time.
   const base = (sha: string) => !builtShas.has(sha) && forge.commits.some((c) => c.onDefaultBranch && (c.defaultAt ?? c.at) < f.startedAt && (c.sha.startsWith(sha) || sha.startsWith(c.sha)));
@@ -155,7 +158,8 @@ export const MAX_COMMIT_BRANCHES = 2;
  * and to the session that pushed it. As of `asOf`, only branches whose whole history predates it count (tip before
  * `asOf`); a branch the mirror shows only later is never used for an earlier replay.
  */
-export function withCommitBranches(f: SessionFacts, forge: ForgeFacts, asOf: string): SessionFacts {
+export function withCommitBranches(f: SessionFacts, forgeIn: ForgeFacts, asOfIn: string): SessionFacts {
+  const forge = utcForge(forgeIn), asOf = utc(asOfIn)!;
   if (!f.keys.commits.length || !forge.branches?.length) return f;
   const known = forge.branches.filter((b) => b.tipAt < asOf);
   const added = new Set<string>();
@@ -170,7 +174,8 @@ export function withCommitBranches(f: SessionFacts, forge: ForgeFacts, asOf: str
 
 /** Stages 2 to 4: every feature record as of `asOf`. */
 export function buildFeatures(all: readonly SessionFacts[], options: BuildOptions): FeatureRecord[] {
-  const forge = options.forge ?? EMPTY_FORGE;
+  const forge = utcForge(options.forge ?? EMPTY_FORGE);
+  options = { ...options, asOf: utc(options.asOf)! };
   const facts = all.map((f) => factsAsOf(f, options.asOf)).filter((f): f is SessionFacts => f !== null).map((f) => withoutBaseCommits(f, forge)).map((f) => withCommitBranches(f, forge, options.asOf));
   const { groups, links } = linkSessions(facts, options.link ?? DEFAULT_LINK_PARAMS);
   return groups.map((sessions) => {

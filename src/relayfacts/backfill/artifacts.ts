@@ -131,8 +131,9 @@ export function extractArtifacts(rows: ReadonlyArray<{ table: string; row: Recor
   for (const pr of prCandidates) {
     if (!repos.has(pr.repo) || out.prs.length >= ARTIFACT_BOUNDS.prs) continue;
     if (seen.prs.has(pr.url)) {
-      // A PR first seen and later created by this session is created.
-      if (pr.via === "created") for (const p of out.prs) if (p.url === pr.url) p.via = "created";
+      // A PR first seen and later created by this session is created, and its evidence is the creation result
+      // (its event and time), never the earlier view.
+      if (pr.via === "created") for (const p of out.prs) if (p.url === pr.url && p.via !== "created") { p.via = "created"; p.eventId = pr.eventId; p.at = pr.at; }
       continue;
     }
     seen.prs.add(pr.url);

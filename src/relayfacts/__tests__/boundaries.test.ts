@@ -12,9 +12,9 @@ import { extractSessionFacts } from "../features/extract.ts";
 import { outsideDir, PrivateDir, REPO_ROOT, writeOutsideFile } from "../out-path.ts";
 import { bindScope, readScope } from "../backfill/scope.ts";
 import { errorCode, fileName, scopedSessions } from "../backfill/cli.ts";
-import { buildFeatures } from "../features/build.ts";
+import { buildFeatures, factsAsOf as factsAt, withCommitBranches } from "../features/build.ts";
 import { closeSync, linkSync, lstatSync, openSync, readdirSync, readFileSync, statSync, writeSync } from "node:fs";
-import { DEFAULT_LINK_PARAMS } from "../features/link.ts";
+import { DEFAULT_LINK_PARAMS, linkSessions } from "../features/link.ts";
 import type { SessionFacts } from "../features/types.ts";
 
 const tmp = mkdtempSync(join(tmpdir(), "relayfacts-bounds-"));
@@ -388,10 +388,10 @@ describe("round-2 re-review controls", () => {
     const scope = bindScope(dir, { ...want, deleteBy: new Date(Date.now() + 86_400_000).toISOString() });
     const name = fileName({ harness: "claude", sessionId: "s1" });
     dir.child("sessions").write(name, JSON.stringify({ scope: scope.id, source: "claude", sessionId: "s1", context: {}, snapshot: { source: "claude", sessionId: "s1" } }));
-    dir.child("artifacts").write(name, JSON.stringify({ scope: "another", artifacts: {} }));
+    dir.child("artifacts").write(name, JSON.stringify({ scope: "another", harness: "claude", sessionId: "s1", artifacts: {} }));
     const forgePath = join(tmp, "r3-forge.json");
     writeFileSync(forgePath, JSON.stringify({ prs: [], commits: [], flags: [] }), { mode: 0o600 });
-    await expect(main(["seal", "--out", dir.path, "--repo", "example/widgets", "--since", want.since, "--until", want.until, "--forge", forgePath])).rejects.toThrow(/artifacts row was not collected under this scope/);
+    await expect(main(["seal", "--out", dir.path, "--repo", "example/widgets", "--since", want.since, "--until", want.until, "--forge", forgePath])).rejects.toThrow(/artifacts row was not collected under this scope for this session/);
   });
   test("forge: when each commit reached the default branch, and how that is known", async () => {
     const { execFileSync } = await import("node:child_process");
@@ -413,15 +413,82 @@ describe("round-2 re-review controls", () => {
     const direct = commit("direct.txt", "2026-10-09T00:00:00Z");
     const facts = forgeFacts("example/widgets", repo, "2026-09-30T00:00:00Z", "2026-10-31T00:00:00Z", "main", () => []);
     const by = (sha: string) => facts.commits.find((c) => c.sha === sha)!;
-    expect([by(merged).defaultAt, by(merged).defaultAtBasis]).toEqual(["2026-10-05T00:00:00Z", "merge"]);
+    expect([by(merged).defaultAt, by(merged).defaultAtBasis]).toEqual(["2026-10-05T00:00:00.000Z", "merge"]);
     expect([by(recut).onDefaultBranch, by(recut).defaultAtBasis]).toEqual([true, "patch"]);
     expect(Date.parse(by(recut).defaultAt!)).toBe(Date.parse("2026-10-08T00:00:00Z"));
-    expect([by(direct).defaultAt, by(direct).defaultAtBasis]).toEqual(["2026-10-09T00:00:00Z", "committer"]);
+    expect([by(direct).defaultAt, by(direct).defaultAtBasis]).toEqual(["2026-10-09T00:00:00.000Z", "committer"]);
     // As of before the merge, the merged commit is not on the default branch yet (not a base for a session then).
     const { withoutBaseCommits } = await import("../features/build.ts");
     const s = { source: "claude", sessionId: "s", analyzedAt: "2026-10-04T00:00:00.000Z", startedAt: "2026-10-04T00:00:00.000Z", endedAt: "2026-10-04T01:00:00.000Z", title: "", asked: [], built: [], gaps: [], rationale: [], outcomeStatuses: [], dropped: {},
       keys: { repo: "example/widgets", branches: [], prs: [], commits: [merged.slice(0, 7)], files: [], taskRefs: [], parents: [] } } as SessionFacts;
     expect(withoutBaseCommits(s, facts).keys.commits).toEqual([merged.slice(0, 7)]);
     expect(withoutBaseCommits({ ...s, startedAt: "2026-10-06T00:00:00.000Z" }, facts).keys.commits).toEqual([]);
+  });
+});
+
+describe("round-3 controls", () => {
+  test("default selection needs the exact owner/name remote; path-only rows abstain", async () => {
+    const { rowInRepo } = await import("../backfill/cli.ts");
+    expect(rowInRepo({ gitRepo: "https://github.com/example/widgets.git", projectId: null }, ["example/widgets"])).toBe(true);
+    expect(rowInRepo({ gitRepo: "git@github.com:other/widgets.git", projectId: null }, ["example/widgets"])).toBe(false);
+    expect(rowInRepo({ gitRepo: null, projectId: "/work/widgets" }, ["example/widgets"])).toBe(false);
+  });
+  test("a PR viewed on day 1 and created on day 3 is created from the day-3 result", () => {
+    const ev = (id: string, ts: string, type: string, content: string, payload: Record<string, unknown> = {}, toolCalls?: unknown[]) => ({ table: "convergence_events", row: { event_id: id, ts, type, content, record: { payload }, ...(toolCalls ? { tool_calls: toolCalls } : {}) } });
+    const art = extractArtifacts([
+      ev("v1", "2026-10-01T00:00:00Z", "tool_call", "gh pr view 9", { tool_use_id: "a" }, [{ name: "Bash", args: { command: "gh pr view 9" }, toolUseId: "a" }]),
+      ev("v2", "2026-10-01T00:00:01Z", "tool_result", "https://github.com/example/widgets/pull/9", { tool_use_id: "a" }),
+      ev("c1", "2026-10-03T00:00:00Z", "tool_call", "gh pr create -f", { tool_use_id: "b" }, [{ name: "Bash", args: { command: "gh pr create -f" }, toolUseId: "b" }]),
+      ev("c2", "2026-10-03T00:00:01Z", "tool_result", "https://github.com/example/widgets/pull/9", { tool_use_id: "b", result_status: "success" }),
+    ], "example/widgets");
+    expect(art.prs).toEqual([{ eventId: "c2", at: "2026-10-03T00:00:01.000Z", url: "https://github.com/example/widgets/pull/9", via: "created" }]);
+    // As of day 2 the session's facts carry no built PR.
+    const snap = { source: "claude", sessionId: "s", title: "t", analyzedAt: "2026-10-04T00:00:00.000Z", evidence: { references: [{ id: "h", kind: "human-message", at: "2026-10-01T00:00:00Z", summary: "x", detail: null, source: "claude", sessionId: "s", truncated: false, isError: null, toolCallId: null, locator: { eventUid: null, toolUseId: null, fileEditId: null } }, { id: "z", kind: "assistant-message", at: "2026-10-03T12:00:00Z", summary: "done", detail: null, source: "claude", sessionId: "s", truncated: false, isError: null, toolCallId: null, locator: { eventUid: null, toolUseId: null, fileEditId: null } }] }, metrics: { filesChanged: [] }, understanding: { intents: [], constraints: [], decisions: [], outcomes: [] } } as unknown as SessionAnalysisSnapshot;
+    const f = extractSessionFacts(snap, { repo: "https://github.com/example/widgets" }, art);
+    expect(f.built.filter((b) => b.kind === "pr").map((b) => b.at)).toEqual(["2026-10-03T00:00:01.000Z"]);
+    expect(factsAt(f, "2026-10-02T00:00:00Z")!.built.filter((b) => b.kind === "pr")).toEqual([]);
+  });
+  test("seal refuses artifacts swapped between two sessions of the same collection", async () => {
+    const { main } = await import("../backfill/cli.ts");
+    const dir = PrivateDir.open(join(tmp, "r4-swap"));
+    const want = { orgId: "org-a", workspaceId: "ws-a", repos: ["example/widgets"], since: "2026-10-01T00:00:00.000Z", until: "2026-11-01T00:00:00.000Z" };
+    const scope = bindScope(dir, { ...want, deleteBy: new Date(Date.now() + 86_400_000).toISOString() });
+    const ses = dir.child("sessions"), art = dir.child("artifacts");
+    for (const id of ["a", "b"]) ses.write(fileName({ harness: "claude", sessionId: id }), JSON.stringify({ scope: scope.id, source: "claude", sessionId: id, context: {}, snapshot: { source: "claude", sessionId: id } }));
+    art.write(fileName({ harness: "claude", sessionId: "a" }), JSON.stringify({ scope: scope.id, harness: "claude", sessionId: "b", artifacts: {} }));
+    const forgePath = join(tmp, "r4-forge.json");
+    writeFileSync(forgePath, JSON.stringify({ prs: [], commits: [], flags: [] }), { mode: 0o600 });
+    await expect(main(["seal", "--out", dir.path, "--repo", "example/widgets", "--since", want.since, "--until", want.until, "--forge", forgePath])).rejects.toThrow(/for this session/);
+  });
+  test("times compare as instants: offsets and Z agree, and a tip exactly at the cut is excluded", () => {
+    const sha = "a".repeat(40);
+    const forge = { prs: [], flags: [], commits: [], branches: [
+      { name: "feat/at-cut", landed: false, landedAt: null, tipAt: "2026-10-31T19:00:00-05:00", commits: [sha] },
+    ] };
+    const s = { source: "claude", sessionId: "s", analyzedAt: "2026-10-01T00:00:00.000Z", startedAt: "2026-10-01T00:00:00.000Z", endedAt: "2026-10-01T01:00:00.000Z", title: "", asked: [], built: [], gaps: [], rationale: [], outcomeStatuses: [], dropped: {}, keys: { repo: "example/widgets", branches: [], prs: [], commits: ["aaaaaaa"], files: [], taskRefs: [], parents: [] } } as SessionFacts;
+    // 2026-10-31T19:00:00-05:00 is exactly 2026-11-01T00:00:00Z: not before the cut.
+    expect(withCommitBranches(s, forge, "2026-11-01T00:00:00Z").keys.branches).toEqual([]);
+    expect(withCommitBranches(s, forge, "2026-11-01T00:00:00.001Z").keys.branches).toEqual(["feat/at-cut"]);
+    expect(withCommitBranches(s, { ...forge, branches: [{ ...forge.branches[0]!, tipAt: "2026-11-01T00:00:00+00:00" }] }, "2026-11-01T00:00:00Z").keys.branches).toEqual([]);
+  });
+  test("intent never links sessions with no known repository, or across repositories", () => {
+    const one = (id: string, repo: string | null) => ({ source: "claude", sessionId: id, analyzedAt: "2026-10-01T00:00:00.000Z", startedAt: "2026-10-01T00:00:00.000Z", endedAt: "2026-10-01T01:00:00.000Z", title: "inflight lease release on worker crash", asked: [], built: [], gaps: [], rationale: [], outcomeStatuses: [], dropped: {}, keys: { repo, branches: [], prs: [], commits: [], files: [], taskRefs: [], parents: [] } }) as SessionFacts;
+    // Unrelated work in the same corpus gives the shared words their weight.
+    const others = ["dashboard palette legend colours", "billing invoice export csv", "search index shard rebalance"].map((t, i) => ({ ...one(`o${i}`, "example/widgets"), title: t }));
+    expect(linkSessions([...others, one("a", null), one("b", null)]).groups).toHaveLength(5);
+    expect(linkSessions([...others, one("a", null), one("b", "example/widgets")]).groups).toHaveLength(5);
+    expect(linkSessions([...others, one("a", "example/widgets"), one("b", "example/other")]).groups).toHaveLength(5);
+    expect(linkSessions([...others, one("a", "example/widgets"), one("b", "example/widgets")]).groups).toHaveLength(4);
+  });
+  test("a log's interior corruption is refused; only a torn final fragment is recoverable", async () => {
+    const { parseLines } = await import("../backfill/cli.ts");
+    expect(parseLines('{"n":1}\n{"n":2')).toEqual([{ n: 1 }]);
+    expect(() => parseLines('{"n":1}\n{"n":2\n{"n":3}\n')).toThrow(/corrupt line/);
+    const dir = PrivateDir.open(join(tmp, "r4-log"));
+    dir.append("log.jsonl", '{"n":1}\n');
+    const fd = openSync(join(dir.path, "log.jsonl"), "a"); writeSync(fd, '{"n":2,"ha'); closeSync(fd);
+    dir.append("log.jsonl", '{"n":3}\n');
+    expect(dir.read("log.jsonl")).toBe('{"n":1}\n{"n":3}\n');
+    expect(parseLines(dir.read("log.jsonl"))).toEqual([{ n: 1 }, { n: 3 }]);
   });
 });

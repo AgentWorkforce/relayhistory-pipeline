@@ -50,24 +50,33 @@ export const NON_CODING_HARNESSES = new Set(["grok-bot", "chatgpt", "muse", "mus
 /** Sessions with fewer directory events than this hold no feature work worth a record (a one-shot stub). */
 export const DEFAULT_MIN_EVENTS = 5;
 
-/** True when the directory row belongs to one of the named repositories (git remote, else the project path's last segment). */
+/**
+ * True only when the directory row's own git remote is exactly one of the named repositories (owner and name).
+ * A row with no remote (path-only, or a scrubbed project) abstains here: such sessions are selected only through
+ * `--from-locate`, whose attribution this tool derived from the session's own canonical evidence.
+ */
 export function rowInRepo(row: Pick<DirectoryRow, "gitRepo" | "projectId">, repos: readonly string[]): boolean {
   const remote = normalizeRepo(row.gitRepo);
-  if (remote) return repos.some((r) => remote === r || remote.endsWith(`/${r.split("/").pop()}`));
-  const project = (row.projectId ?? "").replace(/\\/gu, "/").toLowerCase().replace(/\/+$/u, "");
-  return repos.some((r) => {
-    const name = r.split("/").pop()!;
-    return project === r || project.endsWith(`/${name}`) || project === name || project.includes(`/${name}/`) || project.includes(`/worktrees/${name}`);
-  });
+  return remote !== null && repos.includes(remote);
 }
 
-/** The JSON lines of a resumable log; a torn last line from an interrupted run is ignored. */
-function parseLines(text: string): Record<string, unknown>[] {
+/**
+ * The JSON lines of a resumable log. Only a final fragment with no newline (an interrupted last append) is
+ * recoverable and ignored; a malformed complete line is corruption and refused (PrivateDir.append removes a torn
+ * fragment before it writes, so complete lines are always whole).
+ */
+export function parseLines(text: string): Record<string, unknown>[] {
   const out: Record<string, unknown>[] = [];
-  for (const l of text.split("\n")) {
+  const lines = text.split("\n");
+  const tail = lines.pop();
+  for (const l of lines) {
     if (!l.trim()) continue;
-    try { out.push(JSON.parse(l)); } catch { /* torn line */ }
+    let row: unknown;
+    try { row = JSON.parse(l); } catch { throw new UsageError("a log holds a corrupt line: recollect it"); }
+    if (!row || typeof row !== "object" || Array.isArray(row)) throw new UsageError("a log holds a corrupt line: recollect it");
+    out.push(row as Record<string, unknown>);
   }
+  void tail; // no trailing newline: the fragment of an interrupted append
   return out;
 }
 const readLines = (dir: PrivateDir, name: string) => (dir.has(name) ? parseLines(dir.read(name)) : []);
@@ -175,7 +184,8 @@ export async function main(argv: string[]): Promise<number> {
       if (rowScope !== scope.id || fileName({ harness: String(row.source), sessionId: String(row.sessionId) }) !== f) throw new UsageError("seal: a session row was not collected under this scope");
       if (artifactsDir.has(f)) {
         const a = JSON.parse(artifactsDir.read(f));
-        if (a.scope !== scope.id) throw new UsageError("seal: an artifacts row was not collected under this scope");
+        // Bound to the same session as the row it joins: scope, harness, session id and the name derived from them.
+        if (a.scope !== scope.id || a.harness !== row.source || a.sessionId !== row.sessionId) throw new UsageError("seal: an artifacts row was not collected under this scope for this session");
         row.artifacts = a.artifacts;
       }
       const parents = parentsBy.get(`${row.source}\u0000${row.sessionId}`);
@@ -276,7 +286,7 @@ export async function main(argv: string[]): Promise<number> {
       await pool(todo, Number(values.concurrency ?? 8), async (r) => {
         try {
           const a = extractArtifacts(await source.canonical(r.harness, r.sessionId), r.repo);
-          dir.write(fileName(r), JSON.stringify({ scope: scope.id, artifacts: a }));
+          dir.write(fileName(r), JSON.stringify({ scope: scope.id, harness: r.harness, sessionId: r.sessionId, artifacts: a }));
           done++; consecutiveFaults = 0;
         } catch (error) {
           const code = errorCode(error);

@@ -18,7 +18,7 @@ import { runsPrCreate, shellCommand } from "./commands.ts";
 import type { AnalysisClaim, SessionAnalysisSnapshot, SessionEvidenceReference } from "../../session-analysis/engine/session-analysis-result.ts";
 import type { SessionArtifacts } from "../backfill/artifacts.ts";
 import type { AskedItem, BuiltItem, EvidencePointer, GapItem, LinkKeys, Quote, RationaleItem, SessionContext, SessionFacts, SessionKey } from "./types.ts";
-import { textCompare } from "./types.ts";
+import { textCompare, utc } from "./types.ts";
 
 export const QUOTE_MAX = 300;
 export const QUOTES_PER_ASKED = 3;
@@ -227,6 +227,8 @@ function evidenceArtifacts(ctx: Ctx, snapshot: SessionAnalysisSnapshot) {
 /** Stage 1: the facts of one session analysis. */
 export function extractSessionFacts(snapshot: SessionAnalysisSnapshot, context: SessionContext = {}, artifacts?: SessionArtifacts): SessionFacts {
   const key: SessionKey = { source: snapshot.source, sessionId: snapshot.sessionId };
+  // Every time canonical UTC (types.ts utc), so text order is time order downstream.
+  snapshot = { ...snapshot, evidence: snapshot.evidence ? { ...snapshot.evidence, references: (snapshot.evidence.references ?? []).map((r) => ({ ...r, at: utc(r.at) })) } : snapshot.evidence };
   const refs = new Map<string, SessionEvidenceReference>();
   for (const ref of snapshot.evidence?.references ?? []) if (!refs.has(ref.id)) refs.set(ref.id, ref);
   const ctx: Ctx = { key, refs, dropped: {} };
@@ -347,9 +349,9 @@ export function extractSessionFacts(snapshot: SessionAnalysisSnapshot, context: 
   return {
     source: key.source,
     sessionId: key.sessionId,
-    analyzedAt: snapshot.analyzedAt,
-    startedAt: times[0] ?? snapshot.analyzedAt,
-    endedAt: times[times.length - 1] ?? snapshot.analyzedAt,
+    analyzedAt: utc(snapshot.analyzedAt) ?? snapshot.analyzedAt,
+    startedAt: times[0] ?? utc(snapshot.analyzedAt) ?? snapshot.analyzedAt,
+    endedAt: times[times.length - 1] ?? utc(snapshot.analyzedAt) ?? snapshot.analyzedAt,
     title: titleText && scrubClean(titleText) ? titleText : asked[0]?.text.slice(0, TITLE_MAX) ?? "Untitled work",
     asked,
     built,
