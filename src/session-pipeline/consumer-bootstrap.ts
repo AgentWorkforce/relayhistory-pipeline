@@ -30,6 +30,7 @@ import {
   searchSecret,
 } from "../shared/search-composition.ts";
 import type { SqlExecutor } from "@rhc/lib/pipeline/queue.ts";
+import { SearchIndexError } from "@rhc/search-index/contracts.ts";
 import { writerTransactionSql } from "./transaction-sql.ts";
 import { supabasePool } from "./lambda.ts";
 import { writerComposition, writerSearchEnv, type WriterProjectionState } from "./consumer-service.ts";
@@ -163,7 +164,114 @@ export async function ensureServiceTables(owner: SqlExecutor): Promise<void> {
     await owner.query(`ALTER TABLE sessions.search_consumer_progress ADD COLUMN IF NOT EXISTS ${column}`);
 }
 
+/**
+ * The host of SEARCH_INDEX_OPENSEARCH_URL for an operator message: `URL.host` (name and
+ * port) only, never the userinfo, path or query, and never the raw value when it does
+ * not parse.
+ */
+export function openSearchHost(env: NodeJS.ProcessEnv): string {
+  const raw = env.SEARCH_INDEX_OPENSEARCH_URL?.trim();
+  if (!raw) return "(SEARCH_INDEX_OPENSEARCH_URL unset)";
+  try {
+    const host = new URL(raw).host;
+    return host || "(SEARCH_INDEX_OPENSEARCH_URL has no host)";
+  } catch {
+    return "(SEARCH_INDEX_OPENSEARCH_URL is not a URL)";
+  }
+}
+
+/** What an OpenSearch SearchIndexError means for an operator, and where to look. */
+function openSearchCause(error: SearchIndexError, host: string): string {
+  const os = `OpenSearch ${host}`;
+  const detail = error.detail ?? "";
+  const status = /^http_(\d{3})/.exec(detail)?.[1];
+  if (error.code === "unavailable") {
+    if (detail === "network")
+      return `${os} unreachable (network): check search.opensearch.url, the VPC/security group and Pod Identity (the OpenSearch role mapping)`;
+    if (detail === "timeout")
+      return `${os} did not answer in time (timeout): check search.opensearch.url, the VPC/security group and the domain's health`;
+    if (detail === "credentials")
+      return `${os}: no AWS credentials to sign requests (credentials): check the search indexer's Pod Identity association`;
+    if (status === "403")
+      return `${os} refused the request (${detail}): check the OpenSearch role mapping for the search indexer's Pod Identity role, and the Pod Identity association`;
+    if (status === "401")
+      return `${os} rejected the credentials (${detail}): check search.opensearch.auth, the OpenSearch role mapping and Pod Identity`;
+    if (status)
+      return `${os} answered HTTP ${status} (${detail}): check search.opensearch.url and the domain's health`;
+    if (detail === "bad_response")
+      return `${os} sent a reply that is not OpenSearch (bad_response): check search.opensearch.url`;
+    return `${os} unavailable (${detail || "unavailable"}): check search.opensearch.url, the VPC/security group and Pod Identity (the OpenSearch role mapping)`;
+  }
+  if (error.code === "unsupported" && detail === "dialect_mismatch")
+    return `${os} is not the configured product (dialect_mismatch): check search.opensearch.dialect`;
+  if (error.code === "invalid_argument" || error.code === "unsupported")
+    return `the OpenSearch settings are invalid (${error.code}${detail ? `: ${detail}` : ""}): check search.opensearch.* in your values file`;
+  if (error.code === "schema_missing" || error.code === "schema_mismatch")
+    return `the OpenSearch index on ${host} exists with a conflicting mapping or settings (${error.code}${detail ? `: ${detail}` : ""}): check search.opensearch.indexPrefix, or remove the stale index`;
+  return `${os} failed (${error.code}${detail ? `: ${detail}` : ""})`;
+}
+
+/**
+ * The one plain stderr line the bootstrap Job prints before its stack trace when the
+ * OpenSearch half fails. `postgresApplied` says whether the Postgres half (state tables,
+ * grants for search_consumer_runtime) had already committed. In this bootstrap it never
+ * has: OpenSearch ensureSchema runs inside the single owner transaction, so a failure
+ * rolls the Postgres half back. Names, codes and the URL host only; never a URL with
+ * credentials or a password. Undefined for anything that is not a SearchIndexError.
+ */
+export function searchBootstrapFailureLine(
+  error: unknown,
+  env: NodeJS.ProcessEnv,
+  postgresApplied: boolean,
+): string | undefined {
+  if (!(error instanceof SearchIndexError)) return undefined;
+  const postgres = postgresApplied
+    ? "the search Postgres part (state tables and grants for search_consumer_runtime) already succeeded and is kept"
+    : 'the search Postgres grants were NOT applied, so the search indexer will report "permission denied for schema sessions" until this Job succeeds';
+  return `search bootstrap failed: ${openSearchCause(error, openSearchHost(env))}; ${postgres}`;
+}
+
+/** Runs a piece of the OpenSearch half; a throw from it marks the OpenSearch half failed. */
+export type OpenSearchStep = <T>(work: () => T | Promise<T>) => Promise<T>;
+export interface BootstrapProgress {
+  /** Set by the bootstrap after its owner transaction commits. */
+  postgresCommitted: boolean;
+}
+
+/**
+ * Runs the bootstrap and, when it fails in the OpenSearch half, writes
+ * searchBootstrapFailureLine to stderr before rethrowing (so the Job still exits
+ * non-zero with its stack trace). Exported for tests.
+ */
+export async function withSearchBootstrapDiagnosis<T>(
+  env: NodeJS.ProcessEnv,
+  run: (openSearch: OpenSearchStep, progress: BootstrapProgress) => Promise<T>,
+  stderr: (line: string) => void = (line) => process.stderr.write(line),
+): Promise<T> {
+  const progress: BootstrapProgress = { postgresCommitted: false };
+  let openSearchFailed = false;
+  const openSearch: OpenSearchStep = async (work) => {
+    try {
+      return await work();
+    } catch (error) {
+      openSearchFailed = true;
+      throw error;
+    }
+  };
+  try {
+    return await run(openSearch, progress);
+  } catch (error) {
+    const line = openSearchFailed ? searchBootstrapFailureLine(error, env, progress.postgresCommitted) : undefined;
+    if (line) stderr(`${line}\n`);
+    throw error;
+  }
+}
+
 export async function serve(env: NodeJS.ProcessEnv = process.env): Promise<never> {
+  return withSearchBootstrapDiagnosis(env, (openSearch, progress) => bootstrap(env, openSearch, progress));
+}
+
+async function bootstrap(env: NodeJS.ProcessEnv, openSearch: OpenSearchStep, progress: BootstrapProgress): Promise<never> {
   const config = consumerServiceConfig(env);
   if (!config.enabled) {
     // A default-off one-shot Job must not report failure when disabled: exit
@@ -202,11 +310,11 @@ export async function serve(env: NodeJS.ProcessEnv = process.env): Promise<never
     );
     const remoteIndex = config.searchBackend === "postgres"
       ? undefined
-      : composeSearchService(
+      : await openSearch(() => composeSearchService(
           writerComposition(config.backendId, config.floorMs, config.searchBackend, env),
           { env: writerSearchEnv(config, env), sql: writerSql.sql, secrets: searchSecret(config.secret.search) },
           "writer",
-        ).index;
+        ).index);
     const state = binding.state as WriterProjectionState;
     await owner.query("BEGIN");
     try {
@@ -216,7 +324,7 @@ export async function serve(env: NodeJS.ProcessEnv = process.env): Promise<never
         checkOwner: () => bootstrapCheckOwner(owner),
         ensureIndexSchema: async () => {
           await binding.index.ensureSchema();
-          await remoteIndex?.ensureSchema();
+          if (remoteIndex) await openSearch(() => remoteIndex.ensureSchema());
         },
         ensureProjectionState: (o) => state.ensureSchema(o),
         ensureServiceTables: (o) => ensureServiceTables(o),
@@ -225,6 +333,7 @@ export async function serve(env: NodeJS.ProcessEnv = process.env): Promise<never
         generation: expected.generation,
       });
       await owner.query("COMMIT");
+      progress.postgresCommitted = true;
     } catch (error) {
       await owner.query("ROLLBACK").catch(() => {});
       throw error;

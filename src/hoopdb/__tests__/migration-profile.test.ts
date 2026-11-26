@@ -390,6 +390,8 @@ describe("HOOPDB_DB_MODE profile (no default, no host inference)", () => {
         functionBoundary: "global-default-revoke",
         // Unset HOOPDB_RDS_LAYOUT keeps today's master-owner contract.
         rdsLayout: "master-owner",
+        // ...and is recorded, only so the legacy preflight can name a dropped overlay.
+        rdsLayoutDefaulted: true,
       });
   });
 

@@ -137,6 +137,12 @@ export interface MigrationProfile {
    */
   rdsLayout?: RdsLayout;
   /**
+   * True only when HOOPDB_RDS_LAYOUT was unset (rdsLayout is then the master-owner
+   * default). It changes no gate: it lets the legacy preflight name the likely cause when
+   * a later `helm upgrade` dropped configure-rds.sh's separate-database overlay.
+   */
+  rdsLayoutDefaulted?: true;
+  /**
    * HOOPDB_ALLOW_BLOCKING_INDEX_BUILD (default off): lets an index migration run a blocking
    * CREATE INDEX on a populated table instead of refusing. Bound per migration transaction as
    * hoopdb.allow_blocking_index_build (on/off); read by 20261105044020.
@@ -290,7 +296,10 @@ export function migrationProfile(
         "db_profile_invalid",
         `HOOPDB_RDS_LAYOUT must be master-owner or separate-database (got "${layout}")`,
       );
-    return { mode, shim: false, bootstrap: false, verify, ...runtime, rdsLayout: layout };
+    return {
+      mode, shim: false, bootstrap: false, verify, ...runtime, rdsLayout: layout,
+      ...(env.HOOPDB_RDS_LAYOUT ? {} : { rdsLayoutDefaulted: true as const }),
+    };
   }
   if (shim === undefined)
     throw profileError(
@@ -637,7 +646,7 @@ async function migrationPreflight(
   if (profile.mode === "rds")
     await (profile.rdsLayout === "separate-database"
       ? rdsSeparateOwnerPreflight(client)
-      : rdsOwnerPreflight(client));
+      : rdsOwnerPreflight(client, profile.rdsLayoutDefaulted === true));
   const runtime = await runtimeRolePreflight(client, profile);
   // Durable function boundary gate, every non-local mode: the selected control must be
   // proven by the catalog. Only explicit local (Docker dev) mode is ungated.
@@ -1204,7 +1213,7 @@ async function runtimeRolePreflight(
  * rds exceptions (rdsadmin excluded from creator coverage, the exact owner creator edge
  * on the runtime role) from being selected against a server that is not RDS-shaped.
  */
-async function rdsOwnerPreflight(client: MigrationClient): Promise<void> {
+export async function rdsOwnerPreflight(client: MigrationClient, layoutDefaulted = false): Promise<void> {
   const r = (
     await client.query<{
       owner_super: boolean;
@@ -1212,27 +1221,51 @@ async function rdsOwnerPreflight(client: MigrationClient): Promise<void> {
       owner_rds_superuser: boolean;
       rdsadmin_super: boolean;
       server_version_num: number;
+      db_owner: string | null;
+      db_owner_dedicated: boolean;
     }>(
       `SELECT me.rolsuper AS owner_super, me.rolcreaterole AS owner_createrole,
               EXISTS (SELECT 1 FROM pg_roles r
                        WHERE r.rolname = 'rds_superuser' AND pg_has_role(me.oid, r.oid, 'MEMBER')) AS owner_rds_superuser,
               current_setting('server_version_num')::int AS server_version_num,
-              coalesce((SELECT a.rolsuper AND a.oid <> me.oid FROM pg_roles a WHERE a.rolname = 'rdsadmin'), false) AS rdsadmin_super
-         FROM pg_roles me WHERE me.rolname = current_user`,
+              coalesce((SELECT a.rolsuper AND a.oid <> me.oid FROM pg_roles a WHERE a.rolname = 'rdsadmin'), false) AS rdsadmin_super,
+              o.rolname::text AS db_owner,
+              coalesce(NOT o.rolsuper AND NOT o.rolcreaterole AND o.rolname <> 'rdsadmin'
+                AND NOT EXISTS (SELECT 1 FROM pg_catalog.pg_roles s
+                                 WHERE s.rolname = 'rds_superuser' AND pg_catalog.pg_has_role(o.oid, s.oid, 'MEMBER')),
+                false) AS db_owner_dedicated
+         FROM pg_roles me
+         LEFT JOIN pg_catalog.pg_database d ON d.datname = current_database()
+         LEFT JOIN pg_catalog.pg_roles o ON o.oid = d.datdba
+        WHERE me.rolname = current_user`,
     )
   ).rows[0];
-  if (
+  const unproven =
     !r ||
     r.owner_super ||
     !r.owner_createrole ||
     !r.owner_rds_superuser ||
     !r.rdsadmin_super ||
-    r.server_version_num < 160000
-  )
-    throw profileError(
-      "rds_profile_unproven",
-      `rds mode needs PostgreSQL 16+, a non-superuser CREATEROLE rds_superuser member as migration owner and the fixed rdsadmin SUPERUSER: ${JSON.stringify(r ?? null)}; nothing was written`,
-    );
+    r.server_version_num < 160000;
+  if (!unproven) return;
+  // HOOPDB_RDS_LAYOUT unset selects this legacy preflight, but a dedicated, non-admin
+  // owner holds the database: the separate-database layout configure-rds.sh set up, whose
+  // values overlay a later plain `helm upgrade` dropped. Same error_code; the message says
+  // which value to restore. A role name only, never a URL or password.
+  // Only when the login is not the master's shape (a CREATEROLE rds_superuser member):
+  // a master-owner install failing on some other proof keeps the generic message.
+  if (layoutDefaulted && r?.db_owner && r.db_owner_dedicated && !(r.owner_createrole && r.owner_rds_superuser)) {
+    const line = `HOOPDB_RDS_LAYOUT is unset but hoopdb is owned by ${JSON.stringify(r.db_owner)} (a dedicated owner): set sessions-pipeline.worker.migrations.rdsLayout: separate-database in your values file (scripts/selfhost/configure-rds.sh writes it) and run helm upgrade again`;
+    throw Object.assign(profileError("rds_profile_unproven", line), { operatorLine: line });
+  }
+  // The generic refusal is unchanged: it reports exactly the five original proofs.
+  const legacy = r
+    ? (({ db_owner: _owner, db_owner_dedicated: _dedicated, ...proofs }) => proofs)(r)
+    : null;
+  throw profileError(
+    "rds_profile_unproven",
+    `rds mode needs PostgreSQL 16+, a non-superuser CREATEROLE rds_superuser member as migration owner and the fixed rdsadmin SUPERUSER: ${JSON.stringify(legacy)}; nothing was written`,
+  );
 }
 
 /**
@@ -1426,6 +1459,12 @@ function migrationProfileMode(): FunctionBoundaryMode | undefined {
   return v === "global-default-revoke" || v === "event-trigger" ? v : undefined;
 }
 
+/** The plain operator sentence a refusal carries (rdsOwnerPreflight), or undefined. */
+export function operatorLine(err: unknown): string | undefined {
+  const line = (err as { operatorLine?: unknown } | null)?.operatorLine;
+  return typeof line === "string" && line ? line : undefined;
+}
+
 export async function migrate(): Promise<{ applied: number; skipped: number }> {
   // Before any connection: an invalid profile fails here, having written nothing.
   const profile = migrationProfile();
@@ -1434,6 +1473,12 @@ export async function migrate(): Promise<{ applied: number; skipped: number }> {
   const client = await db.pool.connect();
   try {
     return await runMigrations(client, { profile });
+  } catch (err) {
+    // A refusal with an operator sentence prints it as one plain stderr line first (what
+    // `kubectl logs` shows above the JSON error line).
+    const line = operatorLine(err);
+    if (line) process.stderr.write(`${line}\n`);
+    throw err;
   } finally {
     client.release();
     await db.end();

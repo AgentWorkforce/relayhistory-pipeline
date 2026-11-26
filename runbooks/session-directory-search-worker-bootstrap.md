@@ -833,6 +833,12 @@ This is a self-host/customer profile. Production remains Supabase + S3 under
 ADR 0001; enabling this profile does not authorize a production database change.
 `HOOPDB_DB_MODE=rds` is now accepted (previously it was `db_mode_invalid`), and it
 refuses a server without the required RDS catalog shape before any migration write.
+When `HOOPDB_RDS_LAYOUT` is unset (the legacy master-owner preflight) but the database
+is owned by a dedicated owner (not a superuser, no CREATEROLE, not an `rds_superuser`
+member) and the login is not the master, the refusal keeps `rds_profile_unproven` and says to set
+`sessions-pipeline.worker.migrations.rdsLayout: separate-database` (a later plain
+`helm upgrade` dropped the overlay `configure-rds.sh` writes). The migrate Job prints
+that sentence as a plain stderr line before its JSON error line.
 
 RDS for PostgreSQL 16+ only (CI emulates PostgreSQL 16 and 17). **Aurora is a
 separate variant and is NOT covered** (`aurora` is `db_mode_invalid`). The master user is a

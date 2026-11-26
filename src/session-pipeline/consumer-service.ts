@@ -1132,6 +1132,22 @@ export const CONSUMER_WORKER: Pick<WorkerOptions, "service" | "searchBackends" |
  * structurally. PGlite never reads this variable.
  */
 
+/**
+ * The one plain stderr line the search indexer prints before its stack trace when it
+ * fails at startup on Postgres 42501 for the sessions (or search_index) schema or a
+ * table: the login is still missing the privileges the search-indexer-bootstrap Job
+ * grants. POD_NAMESPACE names the namespace when set to a valid one; otherwise the line
+ * says `<namespace>`. Undefined for any other error.
+ */
+export function searchIndexerStartupHint(error: unknown, env: NodeJS.ProcessEnv): string | undefined {
+  const e = error as { code?: unknown; message?: unknown } | null;
+  if (e?.code !== "42501" || typeof e.message !== "string") return undefined;
+  if (!/^permission denied for (schema (sessions|search_index)|table [a-z_][a-z0-9_$]*)$/.test(e.message)) return undefined;
+  const raw = env.POD_NAMESPACE?.trim() ?? "";
+  const namespace = /^[a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?$/.test(raw) ? raw : "<namespace>";
+  return `search indexer: the search bootstrap has not completed (the search-indexer-bootstrap Job grants this login its sessions privileges). Check: kubectl -n ${namespace} get jobs | grep search-indexer-bootstrap; if it failed, read its log, fix the cause (often OpenSearch reachability), delete the Job and run helm upgrade again.`;
+}
+
 export async function serve(env: NodeJS.ProcessEnv = process.env): Promise<never> {
   const maximum = readerMaxRuleset(env);
   const config = consumerServiceConfig(env);
@@ -1481,5 +1497,10 @@ export async function serve(env: NodeJS.ProcessEnv = process.env): Promise<never
 // SCRUB_ENGINE (docs/scrub-engine.md): select, and for wasm verify the pinned engine, before serving.
 if (import.meta.main) {
   await initScrubEngine();
-  await serve();
+  // Only startup throws reach here: runWorker's own failures exit through process.exit.
+  await serve().catch((error: unknown) => {
+    const hint = searchIndexerStartupHint(error, process.env);
+    if (hint) process.stderr.write(`${hint}\n`);
+    throw error;
+  });
 }
