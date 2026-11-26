@@ -241,6 +241,10 @@ describe("flag-off golden: the runner's tick is the analysis tick itself", () =>
     // Tuning alone changes nothing.
     expect(runnerTick({ SESSION_INTEL_CLAIMS_WORKSPACE_HOURLY_CAP: "9", SESSION_INTEL_CLAIMS_SCHEDULER_INTERVAL_SECONDS: "60" }, analysis, db, true)).toBe(analysis);
   });
+  test("a workspace-bound runner refuses the global scheduler before it can select candidates", () => {
+    expect(() => runnerTick({ ...ALL_ON, SESSION_ANALYSIS_WORKSPACE_ID: "aaaaaaaa-0000-4000-8000-000000000001" }, analysis, db, true))
+      .toThrow("workspace_global_scheduler_conflict");
+  });
   test("every gate on with a model: wrapped, and a failing database leaves the analysis result alone", async () => {
     const wrapped = runnerTick(ALL_ON, analysis, db, true);
     expect(wrapped).not.toBe(analysis);
