@@ -130,23 +130,20 @@ The D1, ranker and stage-2 numbers are withdrawn until they are rerun. The other
 
 **Naming and reference features do not separate them either.** PRs referencing each other, concurrency, a shared relay lead, and title and branch token similarity were each tried. None separated the two classes, and the experiment was not kept.
 
-**An as-of intent judge (withdrawn).** A first blind test suggested that a judge reading each pair as of its alert separates duplicated from planned work, where structure cannot. Its bundles included PR titles and descriptions as fetched, which the strict as-of rules now exclude, so its result is withdrawn. It has to be rerun on strict as-of bundles, and on held-out, before it supports any claim.
+**An as-of intent judge, rerun strictly: no separation.** A first blind test suggested that a judge reading each pair as of its alert separates duplicated from planned work. Its bundles included PR titles and descriptions as fetched, so that result is withdrawn. The rerun used the same prompt (versioned), strict as-of bundles (dated facts only), the ranker frozen at the current revision, 6 positives (5 dev incident pairs and the hindsight overlap) and 40 fresh top-ranked alerts no judge had seen. The judge called all 46 not overlap. Positives scored p 0.05–0.25, and fresh alerts up to 0.3, so no threshold separates them.
+
+The earlier separation came from undated intent text. Branches, edited files and dated comments do not carry enough intent on their own.
 
 ## Stage 2 (proposed)
 
-The provisional evidence points to two stages:
+Structure gives recall but not precision, and an intent judge without dated intent text gives neither. Stage 2 therefore needs **dated intent**: what each line meant to do, as it stood at the alert. Two sources keep that inside the rules here:
 
-1. A cheap structural **recall** stage: the D4 ranker at a loose budget.
-2. An **intent judge** on each candidate's `asOf` bundle.
+1. **Forge history.** The forge records a PR's title and description edits with timestamps (title-rename timeline events and content-edit history). The title and description as of any time can be rebuilt from them. Fetching that history is forge metadata, read with the operator's own `gh`, and needs no transcript text.
+2. **The live pipeline.** A judge running in the pipeline reads each session as of now, so its intent text (the brief, the create call's title) is dated by construction. Offline, this benchmark keeps no transcript text, so carrying such text across the privacy boundary would need its own decision.
 
-Stage 2 should be the existing conflict model-judge seam ([session-intel-conflicts.md](session-intel-conflicts.md)), not a second judge. That seam provides an injected transport, verdicts that must cite their inputs, and no key read by the module.
+Option 1 can be built and measured here. The next step is to add dated PR titles and descriptions to as-of bundles, rerun this test, and score held-out once only if dev shows separation.
 
-Before it is wired anywhere, it needs:
-
-- a versioned prompt and a structured verdict, frozen by hash with stage 1;
-- one held-out score: the 20 held-out incidents plus a fresh negative sample.
-
-Enabling it in production needs Khaliq's explicit OK. At the loose budget it would cost roughly 60 judge calls a day for this workspace.
+Stage 2 should be the existing conflict model-judge seam ([session-intel-conflicts.md](session-intel-conflicts.md)), not a second judge. That seam provides an injected transport, verdicts that must cite their inputs, and no key read by the module. Enabling it in production needs Khaliq's explicit OK.
 
 ## For production
 
