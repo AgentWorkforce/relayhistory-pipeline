@@ -12,6 +12,7 @@
  *
  * Pure apart from the snapshot it is given. No path is returned: only a repository name or slug.
  */
+import { githubSlug } from "../features/repo.ts";
 const SLUG = /^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/u;
 const GENERIC_DIRS = new Set(["src", "projects", "work", "workers", "worktrees", "tmp", "private", "users", "home", "volumes", "t7", "agentworkforce", "repos", "code", "dev", "build", "packages"]);
 
@@ -24,11 +25,7 @@ export interface RepoAttribution {
 }
 
 export function slugFromRemote(value: unknown): string | null {
-  if (typeof value !== "string" || !value || /REDACTED/u.test(value)) return null;
-  const v = value.trim().replace(/^[a-z+]+:\/\/[^@/]*@/iu, "https://").replace(/^git@([^:]+):/u, "https://$1/");
-  const m = /github\.com[/:]([A-Za-z0-9_.-]+)\/([A-Za-z0-9_.-]+?)(?:\.git)?\/?$/iu.exec(v);
-  if (m) return `${m[1]}/${m[2]}`.toLowerCase();
-  return SLUG.test(value) ? value.toLowerCase() : null;
+  return githubSlug(value);
 }
 
 /** The repository directory a working directory sits in, by layout; never the path itself. */
@@ -70,9 +67,3 @@ export function attributeRepo(rows: ReadonlyArray<{ table: string; row: Record<s
   return { repo: null, basis: repoName ? "path" : "none", repoName, branch };
 }
 
-/** True when an attribution names one of the repositories (owner/name, or a bare name for path-only attributions). */
-export function attributionInRepos(a: RepoAttribution, repos: readonly string[]): boolean {
-  const names = repos.map((r) => r.split("/").pop()!);
-  if (a.repo) return repos.includes(a.repo) || names.includes(a.repo.split("/").pop()!);
-  return a.repoName !== null && names.includes(a.repoName);
-}

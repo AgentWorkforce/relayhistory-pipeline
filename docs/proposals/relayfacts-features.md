@@ -189,7 +189,11 @@ must cite evidence ids that the scorer checks.
     remote is exactly a scoped owner/name; a session with no remote is selected only through the
     collection's own attribution. Artifacts rows name their session and must match the row they join.
     A log's torn final fragment is truncated away by the next append; a malformed complete line is
-    refused as corruption. Times are compared as instants (canonical UTC; git's offsets are converted).
+    refused as corruption. Times are compared as instants (canonical UTC; git's offsets are converted),
+    and only a zoned ISO 8601 instant with real calendar fields is a time: a bad cut, window or forge
+    time is refused before anything is built or written. Repository names come from one exact parser
+    (`features/repo.ts`): the host must be exactly github.com, so a mirror whose path merely contains
+    `github.com` abstains.
     Built records carry the corpus's delete-by date, and `score` and `packets` refuse them after it.
   - **Private output.** Every output path is refused inside the repository before anything is created.
     Directories the tools create are 0700; an existing directory is never re-permissioned and must

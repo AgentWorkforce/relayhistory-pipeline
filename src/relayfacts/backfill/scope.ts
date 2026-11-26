@@ -7,6 +7,7 @@
 import { createHash } from "node:crypto";
 import { readdirSync } from "node:fs";
 import type { PrivateDir } from "../out-path.ts";
+import { utc } from "../features/types.ts";
 
 export const SCOPE_FORMAT = "relayfacts-scope/1";
 export const MAX_RETENTION_DAYS = 30;
@@ -21,7 +22,7 @@ export interface CollectionScope {
   deleteBy: string;
 }
 
-const iso = (v: unknown): v is string => typeof v === "string" && Number.isFinite(Date.parse(v)) && /Z$/u.test(v);
+const iso = (v: unknown): v is string => typeof v === "string" && /Z$/u.test(v) && utc(v) === v;
 
 export class ScopeError extends Error {
   constructor(message: string) { super(message); this.name = "ScopeError"; }

@@ -1,6 +1,6 @@
 /** Repository attribution from canonical evidence, on synthetic rows only. */
 import { describe, expect, test } from "bun:test";
-import { attributeRepo, attributionInRepos, repoNameFromCwd, slugFromRemote } from "../backfill/locate.ts";
+import { attributeRepo, repoNameFromCwd, slugFromRemote } from "../backfill/locate.ts";
 import { rowInRepo } from "../backfill/cli.ts";
 
 describe("slugFromRemote", () => {
@@ -45,8 +45,6 @@ describe("attributeRepo", () => {
   test("no catalog: the events' path stands in for the working directory, as a name only", () => {
     const a = attributeRepo([{ table: "convergence_events", row: { project_id: "/home/someone/src/widgets" } }]);
     expect(a).toEqual({ repo: null, basis: "path", repoName: "widgets", branch: null });
-    expect(attributionInRepos(a, ["acme/widgets"])).toBe(true);
-    expect(attributionInRepos(a, ["acme/gadgets"])).toBe(false);
   });
   test("nothing at all", () => {
     expect(attributeRepo([])).toEqual({ repo: null, basis: "none", repoName: null, branch: null });

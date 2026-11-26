@@ -15,7 +15,7 @@ import { errorCode, fileName, scopedSessions } from "../backfill/cli.ts";
 import { buildFeatures, factsAsOf as factsAt, withCommitBranches } from "../features/build.ts";
 import { closeSync, linkSync, lstatSync, openSync, readdirSync, readFileSync, statSync, writeSync } from "node:fs";
 import { DEFAULT_LINK_PARAMS, linkSessions } from "../features/link.ts";
-import type { SessionFacts } from "../features/types.ts";
+import { utc, type SessionFacts } from "../features/types.ts";
 
 const tmp = mkdtempSync(join(tmpdir(), "relayfacts-bounds-"));
 chmodSync(tmp, 0o700);
@@ -490,5 +490,33 @@ describe("round-3 controls", () => {
     dir.append("log.jsonl", '{"n":3}\n');
     expect(dir.read("log.jsonl")).toBe('{"n":1}\n{"n":3}\n');
     expect(parseLines(dir.read("log.jsonl"))).toEqual([{ n: 1 }, { n: 3 }]);
+  });
+});
+
+describe("round-4 controls", () => {
+  test("one exact GitHub parser: a mirror host whose path contains github.com abstains everywhere", async () => {
+    const { githubSlug } = await import("../features/repo.ts");
+    const { attributeRepo, slugFromRemote } = await import("../backfill/locate.ts");
+    for (const ok of ["example/widgets", "github.com/example/widgets", "https://github.com/example/widgets.git", "https://tok@github.com/example/widgets", "ssh://git@github.com/example/widgets.git", "git@github.com:example/widgets.git", "HTTPS://GitHub.com/Example/Widgets/"])
+      expect(githubSlug(ok)).toBe("example/widgets");
+    for (const bad of ["https://mirror.example/github.com/example/widgets.git", "https://github.com.evil/example/widgets", "https://github.com:8443/example/widgets", "https://github.com/example/widgets/tree/main", "https://github.com/example/widgets?x=1", "git@mirror.example:github.com/example/widgets", "[REDACTED]", "../widgets"])
+      expect(githubSlug(bad)).toBeNull();
+    expect(slugFromRemote("https://mirror.example/github.com/example/widgets.git")).toBeNull();
+    // The catalog's own remote is the strongest attribution: a mirror remote must not become example/widgets.
+    const mirror = [{ table: "session_catalog", row: { repo_url: "https://mirror.example/github.com/example/widgets.git", cwd: "/work/widgets" } }];
+    expect(attributeRepo(mirror).repo).toBeNull();
+    expect(attributeRepo([{ table: "session_catalog", row: { repo_url: "https://github.com/example/widgets.git", cwd: "/work/widgets" } }]).repo).toBe("example/widgets");
+    // And a path-only attribution (no owner) is never selected for a scoped collection.
+    const { scopedSessions } = await import("../backfill/cli.ts");
+    const scope = { format: "relayfacts-scope/1" as const, orgId: "o", workspaceId: "w", repos: ["example/widgets"], since: "2026-10-01T00:00:00.000Z", until: "2026-11-01T00:00:00.000Z", deleteBy: "2026-12-01T00:00:00.000Z", id: "s1" };
+    const located = { scope: "s1", harness: "claude", sessionId: "x", status: "ok", ...attributeRepo(mirror) };
+    expect(scopedSessions([located], scope, new Map([["claude\u0000x", "2026-10-10T00:00:00.000Z"]])).rows).toEqual([]);
+  });
+  test("invalid times fail closed: no build from a bad cut, no rolled-over calendar dates", () => {
+    for (const bad of ["invalid", "2099-02-30T00:00:00Z", "2026-10-01", "2026-10-01T24:00:00Z", "2026-10-01T00:00:00", "2026-10-01T00:00:00+15:00"]) expect(utc(bad)).toBeNull();
+    expect(utc("2026-10-31T19:00:00-05:00")).toBe("2026-11-01T00:00:00.000Z");
+    const s = { source: "claude", sessionId: "s", analyzedAt: "2026-10-01T00:00:00.000Z", startedAt: "2026-10-01T00:00:00.000Z", endedAt: "2026-10-01T01:00:00.000Z", title: "", asked: [], built: [], gaps: [], rationale: [], outcomeStatuses: [], dropped: {}, keys: { repo: "example/widgets", branches: [], prs: [], commits: [], files: [], taskRefs: [], parents: [] } } as SessionFacts;
+    expect(() => buildFeatures([s], { asOf: "invalid" })).toThrow(/asOf is not a valid/);
+    expect(() => parseForge({ prs: [], commits: [{ sha: "a".repeat(40), at: "2099-02-30T00:00:00Z", onDefaultBranch: true }], flags: [] })).toThrow();
   });
 });

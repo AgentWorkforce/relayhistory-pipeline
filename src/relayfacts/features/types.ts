@@ -174,14 +174,32 @@ export interface FeatureRecord {
 export const sessionKeyString = (k: SessionKey) => `${k.source}\u0000${k.sessionId}`;
 export const textCompare = (a: string, b: string) => (a < b ? -1 : a > b ? 1 : 0);
 
+const INSTANT = /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2})(?::(\d{2})(?:\.(\d{1,9}))?)?(Z|[+-](\d{2}):(\d{2}))$/u;
+
 /**
  * One instant as canonical UTC (`YYYY-MM-DDTHH:MM:SS.sssZ`), so that text order is time order everywhere: git
- * writes offsets (`+00:00`, `-05:00`), analyses write `Z`. Null for a missing or unparseable time.
+ * writes offsets (`+00:00`, `-05:00`), analyses write `Z`. Only a zoned ISO 8601 date-time whose calendar fields
+ * are real (no 2026-02-30, no hour 24, offsets within ±14:00) is an instant; anything else is null, never rolled
+ * over to a neighbouring day.
  */
 export function utc(t: string | null | undefined): string | null {
-  if (typeof t !== "string" || !t) return null;
+  if (typeof t !== "string") return null;
+  const m = INSTANT.exec(t);
+  if (!m) return null;
+  const [y, mo, d, h, mi, s = "0"] = m.slice(1, 7).map((x) => Number(x ?? 0));
+  const day = new Date(Date.UTC(y!, mo! - 1, d!));
+  if (day.getUTCFullYear() !== y || day.getUTCMonth() !== mo! - 1 || day.getUTCDate() !== d) return null;
+  if (h! > 23 || mi! > 59 || Number(s) > 59) return null;
+  if (m[8] !== "Z" && (Number(m[9]) > 14 || Number(m[10]) > 59)) return null;
   const ms = Date.parse(t);
   return Number.isFinite(ms) ? new Date(ms).toISOString() : null;
+}
+
+/** The instant, or a refusal naming only the role of the value (never the value). */
+export function requireUtc(t: string | null | undefined, role: string): string {
+  const v = utc(t);
+  if (v === null) throw new TypeError(`${role} is not a valid zoned ISO 8601 instant`);
+  return v;
 }
 
 const normalized = new WeakMap<ForgeFacts, ForgeFacts>();
@@ -189,12 +207,13 @@ const normalized = new WeakMap<ForgeFacts, ForgeFacts>();
 export function utcForge(forge: ForgeFacts): ForgeFacts {
   const hit = normalized.get(forge);
   if (hit) return hit;
-  const req = (t: string) => utc(t) ?? t;
+  const req = (t: string) => requireUtc(t, "a forge time");
+  const opt = (t: string | null | undefined) => (t === null || t === undefined ? null : requireUtc(t, "a forge time"));
   const out: ForgeFacts = {
     ...forge,
-    prs: forge.prs.map((p) => ({ ...p, at: req(p.at), ...(p.mergedAt !== undefined ? { mergedAt: utc(p.mergedAt) } : {}), ...(p.closedAt !== undefined ? { closedAt: utc(p.closedAt) } : {}) })),
-    commits: forge.commits.map((c) => ({ ...c, at: req(c.at), ...(c.defaultAt !== undefined ? { defaultAt: utc(c.defaultAt) } : {}), ...(c.revertedAt !== undefined ? { revertedAt: utc(c.revertedAt) } : {}) })),
-    ...(forge.branches ? { branches: forge.branches.map((b) => ({ ...b, tipAt: req(b.tipAt), landedAt: utc(b.landedAt) })) } : {}),
+    prs: forge.prs.map((p) => ({ ...p, at: req(p.at), ...(p.mergedAt !== undefined ? { mergedAt: opt(p.mergedAt) } : {}), ...(p.closedAt !== undefined ? { closedAt: opt(p.closedAt) } : {}) })),
+    commits: forge.commits.map((c) => ({ ...c, at: req(c.at), ...(c.defaultAt !== undefined ? { defaultAt: opt(c.defaultAt) } : {}), ...(c.revertedAt !== undefined ? { revertedAt: opt(c.revertedAt) } : {}) })),
+    ...(forge.branches ? { branches: forge.branches.map((b) => ({ ...b, tipAt: req(b.tipAt), landedAt: opt(b.landedAt) })) } : {}),
   };
   normalized.set(forge, out);
   normalized.set(out, out);

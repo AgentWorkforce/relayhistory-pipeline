@@ -15,6 +15,7 @@
 import { createHash } from "node:crypto";
 import { scrubText } from "../../shared/vendor.ts";
 import { runsPrCreate, shellCommand } from "./commands.ts";
+import { githubSlug } from "./repo.ts";
 import type { AnalysisClaim, SessionAnalysisSnapshot, SessionEvidenceReference } from "../../session-analysis/engine/session-analysis-result.ts";
 import type { SessionArtifacts } from "../backfill/artifacts.ts";
 import type { AskedItem, BuiltItem, EvidencePointer, GapItem, LinkKeys, Quote, RationaleItem, SessionContext, SessionFacts, SessionKey } from "./types.ts";
@@ -77,10 +78,9 @@ export function repoRelative(path: string): string | null {
   return parts.length ? parts.join("/") : null;
 }
 
+/** `owner/name` of a GitHub remote or slug, by the one exact parser (repo.ts); null for anything else. */
 export function normalizeRepo(value: string | null | undefined): string | null {
-  if (!value) return null;
-  const repo = value.trim().replace(/^https?:\/\/github\.com\//iu, "").replace(/^git@github\.com:/iu, "").replace(/\.git$/iu, "").replace(/^\/+|\/+$/gu, "").toLowerCase();
-  return /^[a-z0-9_.-]+\/[a-z0-9_.-]+$/u.test(repo) ? repo : null;
+  return githubSlug(value);
 }
 
 const featureBranch = (name: string) => {

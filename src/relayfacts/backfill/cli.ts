@@ -32,6 +32,7 @@
 import { createHash, randomUUID } from "node:crypto";
 import { parseArgs } from "node:util";
 import { normalizeRepo } from "../features/extract.ts";
+import { utc } from "../features/types.ts";
 import { CORPUS_FORMAT, parseForge, sha256Hex } from "../bench/corpus.ts";
 import { PrivateDir, readPrivateFile } from "../out-path.ts";
 import { errorCode, printable, UsageError } from "../errors.ts";
@@ -142,9 +143,10 @@ export async function main(argv: string[]): Promise<number> {
   const repos = (values.repo ?? "").split(",").map((r) => r.trim().toLowerCase()).filter(Boolean);
   if (!repos.length) throw new UsageError("--repo is required");
   if (!values.since || !values.until) throw new UsageError("--since and --until are required");
-  const window = { since: new Date(values.since).toISOString(), until: new Date(values.until).toISOString() };
+  const instant = (v: string, role: string) => { const t = utc(v); if (t === null) throw new UsageError(`${role} must be a valid zoned ISO 8601 instant`); return t; };
+  const window = { since: instant(values.since, "--since"), until: instant(values.until, "--until") };
   const bind = (out: PrivateDir, cfg: { orgId: string; workspaceId: string }) =>
-    bindScope(out, { ...cfg, repos, ...window, ...(values["delete-by"] ? { deleteBy: new Date(values["delete-by"]).toISOString() } : {}) });
+    bindScope(out, { ...cfg, repos, ...window, ...(values["delete-by"] ? { deleteBy: instant(values["delete-by"], "--delete-by") } : {}) });
 
   if (command === "survey") {
     const { cfg, pool: p } = readPool(process.env, 2);
@@ -172,7 +174,7 @@ export async function main(argv: string[]): Promise<number> {
     const out = PrivateDir.open(values.out);
     const scope = readScope(out);
     if (scope.since !== window.since || scope.until !== window.until || JSON.stringify([...new Set(repos)].sort()) !== JSON.stringify(scope.repos)) throw new UsageError("seal: --repo, --since and --until must match the collection's scope exactly");
-    if (values["delete-by"] && new Date(values["delete-by"]).toISOString() !== scope.deleteBy) throw new UsageError("seal: --delete-by must match the collection's scope");
+    if (values["delete-by"] && instant(values["delete-by"], "--delete-by") !== scope.deleteBy) throw new UsageError("seal: --delete-by must match the collection's scope");
     // Directory parent_session_ids, from this collection's own `parents` run.
     const parentsBy = new Map(readLines(out, "parents.jsonl").filter((r) => r.scope === scope.id).map((r) => [`${String(r.source)}\u0000${String(r.sessionId)}`, (r.parents as string[] | undefined) ?? []]));
     const sessionsDir = out.child("sessions"), artifactsDir = out.child("artifacts");

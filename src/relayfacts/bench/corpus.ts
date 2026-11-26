@@ -16,7 +16,7 @@ import { readPrivateBytes } from "../out-path.ts";
 import { UsageError } from "../errors.ts";
 import { join } from "node:path";
 import type { SessionAnalysisSnapshot } from "../../session-analysis/engine/session-analysis-result.ts";
-import { utcForge, type ForgeFacts, type SessionContext } from "../features/types.ts";
+import { utc, utcForge, type ForgeFacts, type SessionContext } from "../features/types.ts";
 import type { SessionArtifacts } from "../backfill/artifacts.ts";
 
 export const CORPUS_FORMAT = "relayfacts-corpus/1";
@@ -53,7 +53,7 @@ export interface Corpus {
 }
 
 export const sha256Hex = (bytes: string | Uint8Array) => createHash("sha256").update(bytes).digest("hex");
-const iso = (v: unknown) => typeof v === "string" && Number.isFinite(Date.parse(v)) && /Z$|[+-]\d\d:\d\d$/u.test(v);
+const iso = (v: unknown) => typeof v === "string" && utc(v) !== null;
 
 function readFile(dir: string, name: string): Buffer {
   if (!/^[a-z][a-z0-9_.-]{0,63}$/u.test(name) || name.includes("..")) throw new CorpusError(`bad file name: ${name}`);
@@ -90,7 +90,7 @@ export function parseForge(raw: unknown): ForgeFacts {
     if (b.commits !== undefined && (!Array.isArray(b.commits) || b.commits.length > 200 || b.commits.some((c) => typeof c !== "string" || !/^[0-9a-f]{40}$/u.test(c))))
       throw new CorpusError("forge.json: a branch's commits must be at most 200 full commit ids");
   }
-  return utcForge(f as unknown as ForgeFacts);
+  try { return utcForge(f as unknown as ForgeFacts); } catch { throw new CorpusError("forge.json: a time is not a valid instant"); }
 }
 
 export function loadCorpus(dir: string, now: Date = new Date()): Corpus {

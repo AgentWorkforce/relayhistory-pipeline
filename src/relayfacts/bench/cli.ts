@@ -11,7 +11,7 @@ import { parseArgs } from "node:util";
 import { buildFeatures } from "../features/build.ts";
 import { extractSessionFacts } from "../features/extract.ts";
 import { renderFeature, renderIndex } from "../features/render.ts";
-import type { FeatureRecord } from "../features/types.ts";
+import { utc, type FeatureRecord } from "../features/types.ts";
 import { loadCorpus } from "./corpus.ts";
 import { PrivateDir, readPrivateFile } from "../out-path.ts";
 import { printable, UsageError } from "../errors.ts";
@@ -36,7 +36,9 @@ export function main(argv: string[]): number {
   if (command === "build") {
     if (!values.corpus) throw new UsageError("--corpus is required");
     const corpus = loadCorpus(values.corpus);
-    const asOf = values["as-of"] ?? corpus.manifest.window.until;
+    // The cut is refused before anything is built or written.
+    const asOf = utc(values["as-of"] ?? corpus.manifest.window.until);
+    if (asOf === null) throw new UsageError("--as-of must be a valid zoned ISO 8601 instant");
     const facts = corpus.sessions.map((s) => extractSessionFacts(s.snapshot, s.context, s.artifacts));
     const features = buildFeatures(facts, { asOf, forge: corpus.forge });
     const out = PrivateDir.open(values.out);
@@ -58,7 +60,8 @@ export function main(argv: string[]): number {
     const gold = parseGold(JSON.parse(readPrivateFile(values.gold)), corpus.manifestSha256);
     const run = readFeatures(values.features);
     if (run.corpus !== corpus.manifestSha256) throw new UsageError("--features was built from a different corpus");
-    if (run.asOf !== gold.asOf) throw new UsageError("--features and the gold labels are as of different times");
+    const runAt = utc(run.asOf), goldAt = utc(gold.asOf);
+    if (runAt === null || goldAt === null || runAt !== goldAt) throw new UsageError("--features and the gold labels are not as of the same valid instant");
     const report = scoreRun(corpus, gold, run.features);
     PrivateDir.open(values.out).write("score.json", JSON.stringify(report, null, 2));
     console.log(JSON.stringify({ grounding: report.grounding.pass, violations: report.grounding.violations.length, verdicts: report.verdicts, all: report.splits.all }));
