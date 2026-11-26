@@ -141,7 +141,10 @@ pin, lease end) before any AWS call:
    7. the code's own **drain check** (`assertStateDrained`, `state_not_drained`): every state version
       and delete marker under the prefix except the generation object was last modified strictly
       before A's revocation, and no Alchemy deploy lease (`__lease__.json`, held and refreshed by a
-      running deploy and deleted on close) is current unless its `expiresAt` has passed;
+      running deploy and deleted on close) is current unless its `expiresAt` has passed. Every
+      listed entry must carry a boolean `IsLatest` and every key exactly one current entry across
+      versions and delete markers; a current delete marker means the lease is released, a current
+      version is read by its version id and evaluated;
    8. every recorded id gone (`assertManifestGone`): the function by ARN, each queue by URL, each
       mapping by UUID, no metric or composite alarm of the five names, no log group of the exact
       name, and the role per its pinned disposition (deleted: not found; retained: exactly the pinned
@@ -448,7 +451,24 @@ receipts (kept outside the repository, referenced by hash in the run's handoff):
   `aws-rehearse-p1-1126`, the synthetic inventory without schedules and secret) is still open.
 - The lease policies are documents and a generator; creating and attaching them is the broker's step.
 - The broker reviewed source and Node only; the Bun test counts are author-reported (reproduction
-  commands in the handoff report).
+  below).
+
+## Reproduction (offline)
+
+Bun 1.4.0 or later (`package.json` `engines`), from a fresh checkout of this branch. The install
+must be a real one in that checkout (the tests import `@alchemy.run/aws` and `alchemy`, which a
+bare checkout does not have):
+
+```sh
+bun install --frozen-lockfile
+bun test ./stacks src/cli
+bun test ./stacks/aws/__tests__/pippen-rehearsal.test.ts
+bunx tsc --noEmit
+bun scripts/search-split-staged-render.ts --check
+bun scripts/aws-hardening-mutations.ts --only "rehearsal:"
+```
+
+None of these call AWS: every AWS interaction in the tests is a recorded fake.
 - The issuance itself (pin, policy versions, STS duration) and the revocation are the broker's, and
   their receipts (above) are not produced by this code; the pin's provenance is the broker's alone.
 - Non-adoption under concurrent creation or standalone use of the lease, and create-time tagging

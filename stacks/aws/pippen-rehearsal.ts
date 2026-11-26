@@ -1209,7 +1209,9 @@ export function assertTeardownAuthorization(ctx: RehearsalContext, auth: unknown
  * (which only the claim under A and the teardown swap under B write) was last modified strictly
  * before A's revocation, so no write under A landed after it; and no Alchemy deploy lease
  * (`__lease__.json`, which a running deploy holds and refreshes, and deletes on close) is current
- * unless it expired before `now`. A missing or malformed time or lease refuses (`state_not_drained`).
+ * unless it expired before `now`. Every listed entry must carry a boolean IsLatest and every key
+ * exactly one current entry (version or delete marker); a missing or malformed time, IsLatest or
+ * lease refuses (`state_not_drained`).
  * The function and mappings need no separate state check: the physical readback requires them gone,
  * and a function or mapping mid-update or mid-delete still answers its read (`state_resources_remain`).
  */
@@ -1217,10 +1219,20 @@ export function assertStateDrained(aws: AwsRun, i: { bucket: string; region: str
   const prefix = rehearsalStatePrefix(i.stage);
   const revoked = Date.parse(i.revokedAt);
   if (!ISO.test(i.revokedAt) || !Number.isFinite(revoked)) throw new StateBucketError("state_not_drained");
-  for (const v of listStageStateEntries(aws, i)) {
+  const entries = listStageStateEntries(aws, i);
+  // Every entry states whether it is the key's current one (a real boolean), and each listed key has
+  // exactly one current entry across versions and delete markers; anything else is unknown.
+  const latest = new Map<string, number>();
+  for (const v of entries) {
+    if (typeof v.IsLatest !== "boolean") throw new StateBucketError("state_not_drained");
+    latest.set(v.Key, (latest.get(v.Key) ?? 0) + (v.IsLatest ? 1 : 0));
+  }
+  if ([...latest.values()].some((n) => n !== 1)) throw new StateBucketError("state_not_drained");
+  for (const v of entries) {
     if (v.Key === generationKey(prefix)) continue;
     const at = typeof v.LastModified === "string" ? Date.parse(v.LastModified) : NaN;
     if (!Number.isFinite(at) || !(at < revoked)) throw new StateBucketError("state_not_drained");
+    // The deploy lease's current entry: a delete marker means released; a version is read and evaluated.
     if (v.Key === `${prefix}__lease__.json` && v.IsLatest === true && !v.deleteMarker) {
       const dir = mkdtempSync(join(tmpdir(), "96bulls-lease-"));
       try {

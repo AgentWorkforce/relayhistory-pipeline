@@ -1128,7 +1128,7 @@ describe("teardown under an authorized teardown lease (B) of a run captured unde
     };
   };
   /** The account after the destroy: every recorded id gone; the stage prefix stateful (A's claimed generation, one state version). */
-  const fakeAfterDestroy = (o: { caller?: string | ((n: number) => string); generation?: string; remaining?: string; s3Opts?: Parameters<typeof statefulS3>[1]; initial?: [string, string, string?, string?][] } = {}) => {
+  const fakeAfterDestroy = (o: { caller?: string | ((n: number) => string); generation?: string; remaining?: string; s3Opts?: Parameters<typeof statefulS3>[1]; initial?: [string, string, string?, string?][]; listing?: (page: { Versions: Record<string, unknown>[]; DeleteMarkers: Record<string, unknown>[] }) => unknown } = {}) => {
     const s3 = statefulS3(o.initial ?? [[generationKey(PREFIX), "g1", o.generation ?? generationBody(CTX, "claimed")], [`${PREFIX}session-search.json`, "v1"]], o.s3Opts ?? {});
     const calls: string[][] = [];
     let sts = 0;
@@ -1136,6 +1136,7 @@ describe("teardown under an authorized teardown lease (B) of a run captured unde
       calls.push(args);
       const line = args.join(" ");
       if (args[0] === "sts") return JSON.stringify({ Account: ACCOUNT, Arn: typeof o.caller === "function" ? o.caller(++sts) : (o.caller ?? CALLER_B) });
+      if (args[1] === "list-object-versions" && o.listing) return JSON.stringify(o.listing(JSON.parse(s3.aws(args))));
       if (["list-object-versions", "delete-objects", "put-object", "get-object"].includes(args[1]!)) return s3.aws(args);
       if (o.remaining && line.includes(o.remaining)) return "{}";
       const body = IN_SHAPE[args[1]!];
@@ -1244,6 +1245,34 @@ describe("teardown under an authorized teardown lease (B) of a run captured unde
       // Before the physical readback and before any write or delete.
       expect([why, f.calls.some((c) => c[1] === "get-function-configuration"), f.calls.some((c) => c[1] === "put-object"), f.deletes()]).toEqual([why, false, false, 0]);
     }
+    // The lease's current entry must be known: IsLatest a real boolean on every entry, exactly one
+    // current entry per key. Otherwise refused with zero lease reads and nothing deleted.
+    const LK = `${PREFIX}__lease__.json`;
+    const held = (): [string, string, string?, string?][] => [G(), [LK, "l1", JSON.stringify({ token: "t", expiresAt: NOW_B + 60_000 })]];
+    const onLease = (f: (v: Record<string, unknown>) => void) => (page: { Versions: Record<string, unknown>[]; DeleteMarkers: Record<string, unknown>[] }) => {
+      for (const v of [...page.Versions, ...page.DeleteMarkers]) if (v.Key === LK) f(v);
+      return { IsTruncated: false, ...page };
+    };
+    for (const [why, o] of [
+      ["IsLatest omitted", { initial: held(), listing: onLease((v) => delete v.IsLatest) }],
+      ["IsLatest the string \"true\"", { initial: held(), listing: onLease((v) => (v.IsLatest = "true")) }],
+      ["only IsLatest=false entries", { initial: held(), listing: onLease((v) => (v.IsLatest = false)) }],
+      ["two current entries", { initial: [...held(), [LK, "l2", JSON.stringify({ token: "t", expiresAt: 0 })]], listing: onLease((v) => (v.IsLatest = true)) }],
+      ["IsLatest omitted on another key", { listing: (page: { Versions: Record<string, unknown>[]; DeleteMarkers: Record<string, unknown>[] }) => (page.Versions.forEach((v) => v.Key === `${PREFIX}session-search.json` && delete v.IsLatest), { IsTruncated: false, ...page }) }],
+    ] as [string, Parameters<typeof fakeAfterDestroy>[0]][]) {
+      const f = fakeAfterDestroy(o);
+      expect([why, teardown(f, withAuth(m, auth))]).toEqual([why, "state_not_drained"]);
+      expect([why, f.calls.some((c) => c[1] === "get-object" && c.includes(LK)), f.calls.some((c) => c[1] === "get-function-configuration"), f.deletes()]).toEqual([why, false, false, 0]);
+    }
+    // A held lease as the one current version is read (by its version id) and refused.
+    const live = fakeAfterDestroy({ initial: held() });
+    expect(teardown(live, withAuth(m, auth))).toBe("state_not_drained");
+    const read = live.calls.filter((c) => c[1] === "get-object" && c.includes(LK));
+    expect(read.map((c) => c[c.indexOf("--version-id") + 1])).toEqual(["l1"]);
+    // A live lease version under a current delete marker: released (absent), not read.
+    const released = fakeAfterDestroy({ initial: [...held(), [LK, "dm1", "{}", "2026-11-26T19:10:00Z"]] });
+    expect(teardown(released, withAuth(m, auth))).toBe("ok");
+    expect(released.calls.some((c) => c[1] === "get-object" && c.includes(LK))).toBe(false);
     // An expired deploy lease (its holder gone) and a released one (a delete marker) are drained.
     for (const initial of [
       [G(), [`${PREFIX}__lease__.json`, "l1", JSON.stringify({ token: "t", expiresAt: Date.parse(REVOKED_A) })]],
