@@ -22,6 +22,19 @@ export const ALLOWED_LOG_FIELDS = new Set([
   "event_age_ms", "s3_event_age_ms", "queue_origin",
   // How a search pass's acceptance refusal looked (session-pipeline/contender-seats.ts); value rule below.
   "contender_seats",
+  // How a pointer move with both keys live was resolved (session-pipeline/move-resolve.ts); value rule below.
+  "move_resolution",
+]);
+
+/** The values `move_resolution` may take (session-pipeline/move-resolve.ts MOVE_PENDING_REASONS; a test pins parity). */
+export const MOVE_RESOLUTION_VALUES: ReadonlySet<string> = new Set([
+  "resolved_complete",
+  "resolved_skip",
+  ...[
+    "not_date_move", "identity_mismatch", "writer_mismatch", "open_session", "epoch_mismatch", "ambiguous_order",
+    "not_covered", "multi_hop", "too_many_chunks", "dest_chunk_missing", "dest_chunk_mismatch", "no_etag",
+    "concurrent_write", "check_failed",
+  ].map((r) => `still_pending:${r}`),
 ]);
 
 /** Allowlisted keys that survive only as a non-negative safe integer; any other value is dropped. */
@@ -31,6 +44,7 @@ export const NON_NEGATIVE_INTEGER_FIELDS: ReadonlySet<string> = new Set(["event_
 export const EXACT_VALUE_FIELDS: ReadonlyMap<string, ReadonlySet<string>> = new Map([
   ["queue_origin", new Set(["s3", "requeue", "sweep"])],
   ["contender_seats", new Set(["all_unseated", "seated_unseated", "both", "catalog_key"])],
+  ["move_resolution", MOVE_RESOLUTION_VALUES],
 ]);
 
 /** Whether an allowlisted key's value passes its value rule (keys without a rule: always). */

@@ -141,6 +141,12 @@ function carriedTime(c: Covered): string | undefined {
   return oldest === undefined ? undefined : new Date(oldest).toISOString();
 }
 
+/** `still_pending:<reason>` from a pointer_move_pending raised with the resolution armed; empty otherwise. */
+function moveResolutionField(error: unknown): { move_resolution?: string } {
+  const value = (error as { moveResolution?: unknown } | null)?.moveResolution;
+  return typeof value === "string" ? { move_resolution: value } : {};
+}
+
 const scopeId = (s: SessionScope) => JSON.stringify([s.orgId, s.workspaceId, s.harness, s.sessionId]);
 
 export async function processBatch(records: readonly QueueRecord[], deps: ConsumerDeps): Promise<BatchResponse> {
@@ -194,6 +200,8 @@ export async function processBatch(records: readonly QueueRecord[], deps: Consum
         revision: outcome.revision,
         duration_ms: Date.now() - started,
         ...lagFields(covered, messageIds, messages, now()),
+        // SESSION_POINTER_RESOLVE_MOVE_PENDING=true only; absent otherwise, so the line is as before.
+        ...(outcome.moveResolution ? { move_resolution: outcome.moveResolution } : {}),
       });
       const id = scopeId(outcome.scope);
       const held = scopes.get(id);
@@ -202,7 +210,7 @@ export async function processBatch(records: readonly QueueRecord[], deps: Consum
         merge(held.covered, covered);
       } else scopes.set(id, { scope: outcome.scope, messageIds: [...messageIds], manifestKey: outcome.manifestKey, covered: { ...covered } });
     } catch (error) {
-      log.error("pointer index failed", { stage: "session-indexed", ...errorFields(error), duration_ms: Date.now() - started });
+      log.error("pointer index failed", { stage: "session-indexed", ...errorFields(error), ...moveResolutionField(error), duration_ms: Date.now() - started });
       for (const id of messageIds) failed.add(id);
     }
   }

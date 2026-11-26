@@ -38,6 +38,7 @@ import type { ObjectLanded } from "@rhc/lib/pipeline/adapter.ts";
 import type { HoopDb } from "../shared/db.ts";
 import { enrichMessage } from "../shared/enrich.ts";
 import { hoopDbSessionIndex } from "../hoopdb/index.ts";
+import { moveResolutionOf, resolveMovePending, type MoveResolution, type MoveResolveDeps } from "./move-resolve.ts";
 
 /**
  * The ingest writer's spelling of the sessionless per-origin bucket: records without a session id
@@ -56,7 +57,14 @@ export interface SessionScope {
 
 export type PointerOutcome =
   | { status: "ignored"; reason: string }
-  | { status: "indexed" | "unchanged" | "deleted" | "moved"; scope: SessionScope; manifestKey: string; revision?: number };
+  | {
+      status: "indexed" | "unchanged" | "deleted" | "moved";
+      scope: SessionScope;
+      manifestKey: string;
+      revision?: number;
+      /** SESSION_POINTER_RESOLVE_MOVE_PENDING=true only: how a move with both keys live was resolved. */
+      moveResolution?: Extract<MoveResolution, "resolved_complete" | "resolved_skip">;
+    };
 
 /**
  * The per-session lock keys. The pointer stage and the search stage each
@@ -88,6 +96,18 @@ export interface PointerDeps {
    * Absent: such a key is indexed as a session, as before.
    */
   skipOriginBucket?: boolean;
+  /**
+   * SESSION_POINTER_RESOLVE_MOVE_PENDING=true only (move-resolve.ts): a move with both keys live is resolved
+   * when one copy is provably authoritative, else fails as before with a `still_pending:<reason>` resolution.
+   * Absent: such a move fails with pointer_move_pending exactly as before.
+   */
+  resolveMovePending?: MoveResolveDeps;
+}
+
+/** The pointer_move_pending failure; with the resolution armed it carries `moveResolution` for the log line. */
+function movePending(moveResolution?: MoveResolution): PipelineError {
+  const error = new PipelineError("pointer_move_pending", "the session's other key is still live; retry after its erasure", true);
+  return moveResolution === undefined ? error : Object.assign(error, { moveResolution });
 }
 
 /** A fan-out queue that drops messages: no summary or state consumer runs in production yet. */
@@ -210,9 +230,28 @@ async function indexLocked(landed: ObjectLanded, orgId: string, scope: SessionSc
     )
   ).rows[0];
   if (stored && stored.manifest_key !== landed.key) {
-    const otherLive = !stored.deleted && (await deps.reader.read(stored.manifest_key)) !== null;
-    if (otherLive)
-      throw new PipelineError("pointer_move_pending", "the session's other key is still live; retry after its erasure", true);
+    const storedRead = stored.deleted ? null : await deps.reader.read(stored.manifest_key);
+    let resolved: "resolved_complete" | undefined;
+    if (storedRead !== null) {
+      if (!deps.resolveMovePending) throw movePending();
+      const verdict = await resolveMovePending({
+        landedKey: landed.key,
+        landed: read,
+        storedKey: stored.manifest_key,
+        stored: storedRead,
+        pk,
+        db: deps.db,
+        reader: deps.reader,
+        exists: deps.exists,
+        resolve: deps.resolveMovePending,
+      });
+      if (verdict.outcome === "still_pending") throw movePending(moveResolutionOf(verdict));
+      // The row's key is the authoritative copy; this event is for a stale one. The row stays as it is.
+      if (verdict.outcome === "resolved_skip")
+        return { status: "unchanged", scope, manifestKey: stored.manifest_key, moveResolution: "resolved_skip" };
+      // The landed key is the authoritative copy: re-key below, as when the other key is gone.
+      resolved = "resolved_complete";
+    }
     // The stored key is gone (or tombstoned): re-key the row to this one. The
     // row is derived, and the upsert rebuilds it from this manifest.
     await deps.db.query(
@@ -222,7 +261,7 @@ async function indexLocked(landed: ObjectLanded, orgId: string, scope: SessionSc
       [...pk, stored.manifest_key],
     );
     await upsert();
-    return { status: "moved", scope, manifestKey: landed.key, ...(revision !== undefined ? { revision } : {}) };
+    return { status: "moved", scope, manifestKey: landed.key, ...(revision !== undefined ? { revision } : {}), ...(resolved ? { moveResolution: resolved } : {}) };
   }
   return {
     status: result && result.status === "skipped" ? "unchanged" : "indexed",

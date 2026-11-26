@@ -91,6 +91,12 @@ export interface LambdaEnv {
    * need SEARCH_INDEX_ENABLED. Absent: as before.
    */
   pointerSkipOriginBucketEnabled?: true;
+  /**
+   * SESSION_POINTER_RESOLVE_MOVE_PENDING=true (default off): a pointer move with both keys live is resolved when
+   * one copy is provably authoritative (move-resolve.ts), else fails as before. A pointer-stage flag: it does not
+   * need SEARCH_INDEX_ENABLED. Absent: as before.
+   */
+  pointerResolveMovePending?: true;
 }
 
 export function lambdaEnv(env: NodeJS.ProcessEnv = process.env): LambdaEnv {
@@ -122,6 +128,7 @@ export function lambdaEnv(env: NodeJS.ProcessEnv = process.env): LambdaEnv {
     throw new Error("session pipeline: SEARCH_INDEX_SKIP_ACCEPTANCE_MISSING_ENABLED=true needs SEARCH_INDEX_ENABLED=1");
   // SESSION_POINTER_SKIP_ORIGIN_BUCKET_ENABLED: strict grammar, default off, no SEARCH_INDEX_ENABLED coupling.
   const pointerSkipOriginBucket = pointerSkipOriginBucketFromEnv(env);
+  const pointerResolveMovePending = pointerResolveMovePendingFromEnv(env);
   return {
     region: need("AWS_REGION"),
     bucket: need("PIPELINE_RAW_S3_BUCKET"),
@@ -136,7 +143,19 @@ export function lambdaEnv(env: NodeJS.ProcessEnv = process.env): LambdaEnv {
     ...(searchSkipOverBound ? { searchSkipOverBound: true as const } : {}),
     ...(searchSkipAcceptanceMissing ? { searchSkipAcceptanceMissing: true as const } : {}),
     ...(pointerSkipOriginBucket ? { pointerSkipOriginBucketEnabled: true as const } : {}),
+    ...(pointerResolveMovePending ? { pointerResolveMovePending: true as const } : {}),
   };
+}
+
+/**
+ * SESSION_POINTER_RESOLVE_MOVE_PENDING for the hosted Lambda: unset, "" and "false" are off; "true" is on;
+ * anything else fails init naming the variable, never the value.
+ */
+export function pointerResolveMovePendingFromEnv(env: Record<string, string | undefined>): boolean {
+  const value = env.SESSION_POINTER_RESOLVE_MOVE_PENDING;
+  if (value === undefined || value === "" || value === "false") return false;
+  if (value === "true") return true;
+  throw new Error("session pipeline: SESSION_POINTER_RESOLVE_MOVE_PENDING must be true or false");
 }
 
 /**
@@ -151,9 +170,26 @@ export function pointerSkipOriginBucketFromEnv(env: Record<string, string | unde
 }
 
 /** The pointer deps' flag fields from the parsed env: empty when off, so the deps object is as before. */
-export function pointerFlagDeps(env: Pick<LambdaEnv, "pointerSkipOriginBucketEnabled">): Pick<PointerDeps, "skipOriginBucket"> {
-  // Default off; on, a sessionless per-origin bucket key (h=_none/s=_origin) is ignored before any lookup.
-  return env.pointerSkipOriginBucketEnabled ? { skipOriginBucket: true as const } : {};
+export function pointerFlagDeps(
+  env: Pick<LambdaEnv, "pointerSkipOriginBucketEnabled" | "pointerResolveMovePending">,
+  store?: Pick<ObjectStore, "head">,
+): Pick<PointerDeps, "skipOriginBucket" | "resolveMovePending"> {
+  return {
+    // Default off; on, a sessionless per-origin bucket key (h=_none/s=_origin) is ignored before any lookup.
+    ...(env.pointerSkipOriginBucketEnabled ? { skipOriginBucket: true as const } : {}),
+    // Default off; on, a move with both keys live is resolved when provable (move-resolve.ts).
+    ...(env.pointerResolveMovePending && store ? { resolveMovePending: moveResolveDeps(store) } : {}),
+  };
+}
+
+/** The move resolution's HEAD: the object's length and user metadata, never its body. */
+export function moveResolveDeps(store: Pick<ObjectStore, "head">): NonNullable<PointerDeps["resolveMovePending"]> {
+  return {
+    async head(key) {
+      const meta = await store.head(objectKey(key));
+      return meta ? { size: meta.size, metadata: { ...meta.metadata } } : undefined;
+    },
+  };
 }
 
 /** Parse and check the secret's shape. Never echoes a value. */
@@ -319,8 +355,8 @@ async function init(): Promise<Runtime> {
       orgs: prefixOrgResolver,
       allowPrefix: (prefix, orgId) => prefixAllowed(bindings, prefix, orgId),
       fanout,
-      // Default off (SESSION_POINTER_SKIP_ORIGIN_BUCKET_ENABLED=true).
-      ...pointerFlagDeps(env),
+      // Default off (SESSION_POINTER_SKIP_ORIGIN_BUCKET_ENABLED=true, SESSION_POINTER_RESOLVE_MOVE_PENDING=true).
+      ...pointerFlagDeps(env, store),
     },
     requeue: sqsRequeue(env),
   };

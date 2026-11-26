@@ -180,6 +180,6 @@ describe("SESSION_POINTER_SKIP_ORIGIN_BUCKET_ENABLED in the Lambda", () => {
     const source = readFileSync(join(import.meta.dir, "../lambda.ts"), "utf8");
     const start = source.indexOf("pointer: {", source.indexOf("async function init("));
     const pointer = source.slice(start, source.indexOf("},", source.indexOf("fanout,", start)) + 2);
-    expect(pointer).toContain("...pointerFlagDeps(env),");
+    expect(pointer).toContain("...pointerFlagDeps(env, store),");
   });
 });
