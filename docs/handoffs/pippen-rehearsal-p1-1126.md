@@ -55,33 +55,47 @@ bound it. Hence:
   asserts zero calls for malformed inputs, a wrong pin and an ended lease.
 - `prepareStateBackend` then either validates (validate-only) or runs the old ensure path. It is the
   state layer of both the capture and the Alchemy plan/deploy for the stage. In validate-only it is
-  **read-only**: it checks the attested caller (STS), the exact prefix and the bucket, then lists the
-  stage prefix (`ListObjectsV2 --max-keys 2`; the reply must be well formed, `KeyCount` exactly 0, 1
-  or 2 matching its `Contents`, every key under the prefix; anything else refuses):
-  - **empty**: refused (`state_not_claimed`): run the explicit claim first;
-  - otherwise the current marker must be exactly this run's (run id, lease session, issuance time,
-    pin), else `state_provenance_mismatch`;
-  - while the marker is the only current object (stage A not applied), none of the stage's names may
+  **read-only**: it checks the attested caller (STS), the exact prefix and the bucket, lists the
+  stage prefix (`ListObjectsV2 --max-keys 1000`, one page that must be the whole listing: well
+  formed, not truncated, `KeyCount` matching its `Contents`, every key under the prefix; anything
+  else refuses), then reads the **generation object** (below):
+  - **no generation object**: refused (`state_not_claimed`): run the explicit claim first;
+  - generation `tearing-down`: refused (`state_teardown_in_progress`): no capture or deploy runs
+    while a teardown is open;
+  - otherwise it must be exactly this run's `claimed` generation (run id, lease session, issuance
+    time, pin), else `state_provenance_mismatch`;
+  - while the generation object (and Alchemy's `__lease__.json` / `__stack_output__.json`
+    bookkeeping) are the only current objects (stage A not applied), none of the stage's names may
     be in use: the function, the four queues, the five names as metric **or composite** alarms, the
     log group (alarm and log-group replies read strictly: both alarm arrays, no pagination token, no
     unknown field). AccessDenied is never "unused" (`state_gone_unproven`).
   Reads only: `sts:GetCallerIdentity`, `GetBucketVersioning` (it also answers NoSuchBucket),
   `GetBucketEncryption`, `GetPublicAccessBlock`, `GetBucketOwnershipControls`, `GetBucketTagging`,
-  `ListObjectsV2`, the marker's `GetObject`, and the names' reads. `HeadBucket` is not used: it needs
-  `s3:ListBucket` without an `s3:prefix` condition, which would let the lease list every stage's keys.
+  `ListObjectsV2`, the generation object's `GetObject`, and the names' reads. `HeadBucket` is not
+  used: it needs `s3:ListBucket` without an `s3:prefix` condition, which would let the lease list
+  every stage's keys.
 - **Which call writes.** The capture (`96bulls plan --capture`) and plain plans write nothing to
   the state bucket. The only state-tooling writes are the explicit **claim**
-  (`scripts/rehearsal-state-teardown.ts --claim`, before the first capture: one conditional
-  `PutObject --if-none-match "*"` of the marker) and the **teardown** (`--execute`: `DeleteObjects`
-  of the stage's versions). Alchemy's own deploy writes its state under the prefix as usual.
+  (`scripts/rehearsal-state-teardown.ts --claim`, before the first capture: one create-only
+  `PutObject --if-none-match "*"` of the generation object) and the **teardown** (`--execute`: one
+  compare-and-swap `PutObject --if-match <ETag>` of the generation object, then `DeleteObjects` of
+  the stage's versions). Alchemy's own deploy writes its state under the prefix as usual.
+- **The generation lock.** A single object,
+  `96bulls/96bulls-aws/aws-rehearse-p1-1126/__rehearsal_generation__.marker`, holds
+  `{ schema, stage, runId, sessionId, issuedAt, pin, state: "claimed" | "tearing-down", receipts }`
+  (receipts: the teardown's manifest and authorization digests, set exactly when tearing down). It
+  is changed only by compare-and-swap: created with `If-None-Match: *`, replaced with `If-Match`
+  on the ETag just read, deleted by its recorded version id. It serializes the claim-to-cleanup
+  transition: a claim fails while any generation object (or any other version) exists; a teardown
+  must move this run's generation from `claimed` to `tearing-down` before it touches anything; a
+  stale teardown's swap or fence fails once a new generation exists. It is not `.json`: Alchemy's
+  state store and the capture's snapshot layer list `*.json` resources only, so they ignore it.
 - The claim (`claimStageState`) requires an **empty version inventory** under the prefix
   (`ListObjectVersions`: zero versions and zero delete markers), so a prefix holding only
   noncurrent versions or delete markers, which looks empty to `ListObjectsV2`, can never be claimed
-  (and its history later deleted); then none of the stage's names may be in use; then the marker
-  `96bulls/96bulls-aws/aws-rehearse-p1-1126/__rehearsal_run__.marker` is written, holding the run id,
-  lease session, issuance time and pin. It is not `.json`: Alchemy's state store and the capture's
-  snapshot layer list `*.json` resources only, so they ignore it. A later lease needs a new run
-  against a torn-down prefix (or a teardown authorization, below).
+  (and its history later deleted); then none of the stage's names may be in use; then the
+  generation object is created `claimed` (`If-None-Match: *`; a concurrent claim's create fails). A
+  later lease needs a new run against a torn-down prefix (or a teardown authorization, below).
 - Expected settings: versioning `Enabled`; one SSE rule, `AES256`, no KMS key, bucket key off; all
   four public access blocks on; `BucketOwnerEnforced`; tags `pippen:sandbox=true` and
   `96bulls:component=alchemy-state` (the `96bulls:stack` tag names the stage that made it, so it is
@@ -105,71 +119,110 @@ pin, lease end) before any AWS call:
    the four queues, exactly two mapping UUIDs (one per queue), the five alarms (no same-name
    composite alarm allowed) and the log group, bound to the run (run id, lease A's session,
    issuance time and pin) with a digest. It prints the digest; the broker records it.
-3. `alchemy destroy` for the stage (or the pippen sweeper), possibly in several partial passes.
-4. `--execute --expect-manifest-digest <sha256>` (and, under a teardown lease B,
-   `--authorization <file> --expect-authorization-digest <sha256>`): `runRehearsalTeardown`, which
-   deletes nothing until every check has passed, in this order:
-   1. the run context of the current lease and STS (the current caller is exactly that lease);
+3. `alchemy destroy` for the stage (or the pippen sweeper), possibly in several partial passes,
+   still under lease A.
+4. The broker **revokes lease A**, waits until A's sessions have expired, then issues the
+   cleanup-only teardown lease B and the teardown authorization (below).
+5. `--execute --expect-manifest-digest <sha256> --authorization <file>
+   --expect-authorization-digest <sha256>`, under lease B only (all four are required; lease A
+   cannot execute): `runRehearsalTeardown`, which deletes nothing until every check has passed, in
+   this order:
+   1. the run context of the current lease and STS (the current caller is exactly lease B);
    2. the shared bucket's settings (reads);
-   3. under lease B, the **teardown authorization** (below); without one, the current lease must be
-      the run's own lease A;
+   3. the **teardown authorization** (below), including A's revocation and session expiry no later
+      than B's issuance;
    4. the **independent receipt**: the manifest digest the broker recorded at step 2 (not one
-      recomputed from the local file) must equal the manifest's digest, and, with an authorization,
-      its manifest digest and mapping UUIDs must be the manifest's;
+      recomputed from the local file) must equal the manifest's digest, and the authorization's
+      manifest digest and mapping UUIDs must be the manifest's;
    5. the manifest complete and bound to the original run (`assertManifestComplete`);
-   6. every recorded id gone (`assertManifestGone`): the function by ARN, each queue by URL, each
+   6. STS again: the caller is still B, immediately before the physical readback;
+   7. every recorded id gone (`assertManifestGone`): the function by ARN, each queue by URL, each
       mapping by UUID, no metric or composite alarm of the five names, no log group of the exact
       name, and the role per its pinned disposition (deleted: not found; retained: exactly the pinned
       ARN, path and boundary). A remaining id refuses (`state_resources_remain`); AccessDenied is
       never "gone" (`state_gone_unproven`); rerun after the next destroy pass;
-   7. no capture or deploy may run while a teardown marker exists (`state_teardown_in_progress`):
-      the state layer refuses, which fences Alchemy writers against an open teardown;
-   8. the resume state, under these receipts: no version left (an earlier execute completed and
-      only its last response was lost): complete, nothing deleted; only this teardown's marker left:
-      continue with step 8's last call; otherwise the run marker must be current and the original
-      run's (lease A's session, issuance time, pin). Anything else keeps the state;
-   9. only then, in this order (`teardownStageState`), with **generation fencing**:
-      1. the **teardown marker** `__rehearsal_teardown__.marker` (run id, manifest digest,
-         authorization digest) is written only over this run's own marker, if absent
-         (`--if-none-match "*"`), or must already be exactly this teardown's;
-      2. the generation is recorded: the exact version ids of the teardown marker (exactly one) and
-         of the run marker (exactly one, and its body this run's; none on a teardown-marker-only
-         resume);
-      3. before **every** delete step the fence is re-checked: the teardown marker is still exactly
-         that one version with this teardown's body, and no run-marker version other than the
-         recorded one exists; otherwise the executor stops;
-      4. every other version and delete marker, by the key and version ids listed at the start of
-         the generation (strict page validation; any key outside the prefix refuses before
-         anything is deleted); the re-list must then show only the markers;
-      5. the run marker, alone, by its recorded version id only;
-      6. the teardown marker, last and alone, by its recorded version id only; the final re-list
-         must show nothing.
+   8. no version left (an earlier execute with these receipts completed and only its last response
+      was lost; the generation object is deleted last, so an empty inventory means it ended):
+      complete, nothing deleted;
+   9. otherwise the state under the **generation lock** (`teardownStageState`), STS re-checked
+      before the swap and inside every fence:
+      1. read the generation object with its ETag and version id. This run's `claimed` generation
+         (A's run id, session, issuance, pin): swap it to `tearing-down` with these receipts by
+         `PutObject --if-match <that ETag>`; the swap's ETag and version id are recorded. Already
+         `tearing-down` with exactly these receipts (a retry): resume, recording its current ETag
+         and version id. No generation, another run's, or another teardown's: refused
+         (`state_provenance_mismatch`), nothing written or deleted;
+      2. the **fence**, before every delete step: the caller is B, and the generation object's
+         current ETag, version id and body are still the recorded `tearing-down` ones; otherwise the
+         executor stops;
+      3. every other version and delete marker (including the generation's old `claimed` version),
+         by the key and version ids listed after the swap (strict page validation; any key outside
+         the prefix refuses before anything is deleted); fence; the re-list must then show exactly
+         the recorded generation version;
+      4. fence; the generation object, last and alone, by its recorded version id only; the final
+         re-list must show nothing.
 
-   Version-id fencing is what makes a stale executor harmless: if teardown T1 pauses, a second
-   teardown T2 with the same receipts completes, and a new run claims the now-empty prefix, T1's
-   next fence check finds its teardown marker gone and stops, and any delete it still issues names
-   only the old generation's version ids, never the new run's marker (tested at every pause point).
+   Why a stale executor is harmless: if teardown T1 has read A's `claimed` generation and pauses,
+   and meanwhile T2 completes the teardown and a new run B claims the empty prefix, T1's swap
+   (`If-Match` on A's ETag) fails against B's generation and T1 stops with B's generation intact.
+   If T1 pauses later (after its swap, before any delete), its next fence sees B's ETag and stops;
+   any delete it already has in flight names only A's generation's version ids, never B's (tested:
+   this interleaving, a replaced generation between the swap and the first delete, and a pause
+   before each delete).
 
-   A partial batch, or a delete that reports success and leaves a version, stops with the run marker
-   intact, and the next execute resumes. A claim cannot interleave: it requires an empty version
-   inventory, and the teardown marker exists until the very last call. Once the prefix is empty a new
-   claim is a new run; a retry of a completed teardown before that is recognised as complete.
+   A partial batch, or a delete that reports success and leaves a version, stops with the
+   `tearing-down` generation intact, so no capture or deploy can start; the next execute with the
+   same receipts resumes. A claim cannot interleave: it requires an empty version inventory and its
+   create fails while any generation object exists. Once the prefix is empty a new claim is a new
+   run; a retry of a completed teardown before that is recognised as complete.
+
+   **Recovery from a wedged state** is receipt-bound only: a `tearing-down` generation is resumed
+   by re-running `--execute` with the same manifest receipt and authorization (a new lease B needs a
+   new authorization, whose digest differs, so the broker must reissue the record for that
+   generation's receipts or an operator with the broker's approval removes the generation by hand).
+   There is no code path that clears or overrides a generation object; any manual removal must be
+   recorded with the generation object's version id and body.
 
    So the digest check runs after the STS and bucket reads and before any deletion. Without
    `--execute` it is a dry run (counts only). The bucket itself and sibling stages are never touched.
    The CLI wrapper keeps the error class (not found, AccessDenied, other), never the CLI's text, so
    a denied read refuses as `state_gone_unproven`, not a generic failure.
 
+   **S3 conditional writes (not provable offline).** The lock relies on `PutObject` honouring
+   `If-None-Match: *` and `If-Match: <ETag>` (failing with 412 PreconditionFailed, or 409 on a
+   concurrent conditional write) for this bucket in us-west-2. AWS documents conditional writes for
+   general purpose buckets; whether this bucket's type (its name ends in `-an`) supports both on
+   PutObject cannot be shown from this repository. It must be observed in the sandbox before the rehearsal: a create over an existing
+   generation and a replace with a stale ETag must both fail. If either succeeds, the lock does not
+   hold and the rehearsal must not run.
+
+### Writer exclusion
+
+In-flight lease A writers (a deploy or destroy still running) are excluded **by revocation, not by
+code**: the teardown runs only under lease B, which the broker issues only after A is revoked and
+A's sessions have expired, and the authorization record attests both (`revokedAt`,
+`sessionsExpireAt`, each no later than B's issuance). The code checks those attested times, that
+the current caller is B at the start, before the physical readback and before every delete, and
+it refuses an execute without an authorization; it cannot itself observe that A's credentials no
+longer work (that is broker receipt 5).
+
+A deploy that holds A does not re-check the generation object before each Alchemy apply step:
+Alchemy (`alchemy.run`) exposes no per-resource pre-apply hook this stack uses, so the check runs
+once, at the state layer's entry (`prepareStateBackend`, which refuses a `tearing-down` or foreign
+generation). A deploy already past that entry when a teardown starts is excluded only by A's
+revocation. This is a documented limit.
+
 ### Teardown authorization (lease A to lease B)
 
 The teardown lease B (issued with the manifest's two mapping UUIDs for the absence reads) is a
-different session from lease A, so the manifest and the marker, which name A, cannot be checked
+different session from lease A, so the manifest and the generation object, which name A, cannot be checked
 against B's context directly. The broker writes a **teardown authorization** at B's issuance and
 records its digest (`authorizationDigest`, sha256 of the canonical JSON) in its receipt:
 
 ```json
 { "schema": 1, "stage": "aws-rehearse-p1-1126", "runId": "<run id>",
-  "original": { "sessionId": "<lease A>", "issuedAt": "<A issuance>", "pin": "<A pin>" },
+  "original": { "sessionId": "<lease A>", "issuedAt": "<A issuance>", "pin": "<A pin>",
+                "revokedAt": "<A revocation time>", "sessionsExpireAt": "<latest expiry of A's sessions>" },
   "manifestDigest": "<manifest digest>", "mappingUuids": ["<uuid 1>", "<uuid 2>"],
   "teardown": { "sessionId": "<lease B>", "callerArn": "arn:aws:sts::<account>:assumed-role/agent-session/agent-<lease B>",
                 "issuedAt": "<B issuance>", "windowEnd": "<approved teardown window end>",
@@ -178,7 +231,8 @@ records its digest (`authorizationDigest`, sha256 of the canonical JSON) in its 
 
 `assertTeardownAuthorization` refuses (`state_authorization_mismatch`) unless the record's digest is
 the receipt's; it is this stage and run; B is exactly the current session, STS caller ARN and
-issuance; and A's pin is the issuer pin of the same approved account, boundary, role and
+issuance; A was revoked at or after its issuance and no later than B's issuance, and A's sessions
+expire no later than B's issuance; and A's pin is the issuer pin of the same approved account, boundary, role and
 disposition with A's session and issuance. B's validity is capped at the **authorized run
 deadline** (`teardownDeadline`): the earliest of A's issuance + 6 h, the hard cutoff
 2026-11-27T08:00:00Z and the approved teardown window end the record carries explicitly. B must be
@@ -186,7 +240,7 @@ issued before it, its effective expiry must not be later than it (nor than B's o
 the teardown runs only before that expiry. B's policy digest must be the digest of the
 **cleanup-only** teardown policies generated for B's effective expiry and the two mapping UUIDs
 (`rehearsalTeardownPolicies`, `teardownPolicyDigest`), so the receipt binds both the expiry and the
-action set. The manifest and the marker are then checked against lease A's context. Any failure
+action set. The manifest and the generation object are then checked against lease A's context. Any failure
 keeps the state.
 
 The cleanup-only policies (inline 1,150 characters; two managed documents, 1,773 and about 4,500; limit 6,144):
@@ -194,7 +248,7 @@ deletes of the stage's own resources (`sqs:DeleteQueue`, `lambda:DeleteFunction`
 `cloudwatch:DeleteAlarms`, `logs:DeleteLogGroup` on tagged resources; `lambda:DeleteEventSourceMapping`
 and `GetEventSourceMapping` on the two exact mapping ARNs; the role's deletion on its exact ARN only
 when its pinned disposition is deleted); the exact-name absence reads; the state prefix's list, reads
-and version deletes; one `s3:PutObject`, on the teardown marker's exact key. No create, update, tag,
+and version deletes; one `s3:PutObject`, on the generation object's exact key (the swap). No create, update, tag,
 publish or invoke action is allowed, and an explicit Deny (`CleanupOnly`) lists them. Every Allow
 holds only before B's effective expiry and a Deny on everything applies at and after it.
 
@@ -298,9 +352,10 @@ receipts (kept outside the repository, referenced by hash in the run's handoff):
 3. The sha256 of the inline session policy passed, equal to the generated `inline`.
 4. The AssumeRole receipt: request id, role and session name, `DurationSeconds`, and the
    credentials' `Expiration` (not later than `rehearsalLeaseEnd({ issuedAt })`).
-5. Revocation at teardown completion: the revocation action taken (for example the role's
-   revoke-older-sessions deny, or deleting the managed policy versions) with its time, and a
-   failed call with the lease's credentials after it.
+5. Revocation of lease A **before lease B is issued**: the revocation action taken (for example the
+   role's revoke-older-sessions deny, or deleting the managed policy versions) with its time (the
+   authorization's `revokedAt`), the latest expiry of A's sessions (`sessionsExpireAt`), and a
+   failed call with A's credentials after it; then the same for B at teardown completion.
 6. The physical manifest's digest as printed at `--manifest`, and the run id: this is the value
    passed to `--execute --expect-manifest-digest`, and it is evidence only because the broker
    recorded it independently of the local file.
@@ -350,6 +405,10 @@ receipts (kept outside the repository, referenced by hash in the run's handoff):
   their receipts (above) are not produced by this code; the pin's provenance is the broker's alone.
 - Non-adoption under concurrent creation or standalone use of the lease, and create-time tagging
   under the strict tag statement, are residuals for the issuer (see Teardown and Lease).
+- **S3 conditional writes** on this bucket in us-west-2 (`If-None-Match: *` and
+  `If-Match` on PutObject) are not provable offline; observe both refusals in the sandbox first.
+- **No per-apply generation check:** Alchemy has no pre-apply hook here; a deploy under A is
+  checked once at entry and otherwise excluded only by A's revocation.
 - **Gates still open:** the non-prod render of the session pipeline; the proof-account stage rule;
   the execution-role wiring (path and boundary); the revised scope and teardown window, including
   lease B and its authorization record; trusted issuance, expiry and revocation; the cost cap; and

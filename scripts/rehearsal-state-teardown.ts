@@ -7,17 +7,17 @@
  * the run id from NINETY_SIX_BULLS_REHEARSAL_RUN_ID.
  *
  *   bun scripts/rehearsal-state-teardown.ts --claim
- *       # BEFORE the first capture (lease A): empty version inventory, names unused, then this run's
- *       # marker (the only write of the state tooling besides --execute)
+ *       # BEFORE the first capture (lease A): empty version inventory, names unused, then the
+ *       # generation object created (the only write of the state tooling besides --execute)
  *   bun scripts/rehearsal-state-teardown.ts --manifest
  *       # BEFORE any destroy (lease A): read every resource id and write the physical manifest
  *       # (.96bulls/aws-rehearse-p1-1126/physical-manifest.json, gitignored); never overwritten;
  *       # prints its digest for the broker's receipt
  *   bun scripts/rehearsal-state-teardown.ts             # dry run: count the state versions
  *   bun scripts/rehearsal-state-teardown.ts --execute --expect-manifest-digest <sha256>
- *       [--authorization <file> --expect-authorization-digest <sha256>]
- *       # after the destroy: under lease A, or under the authorized teardown lease B (the broker's
- *       # authorization record and its receipt digest); every check before any deletion
+ *       --authorization <file> --expect-authorization-digest <sha256>
+ *       # after the destroy, only under the authorized cleanup-only lease B (issued after lease A was
+ *       # revoked and A's sessions expired); every check before any deletion
  */
 import { spawnSync } from "node:child_process";
 import { existsSync, readFileSync, writeFileSync } from "node:fs";
@@ -34,10 +34,10 @@ const known = new Set([...flags, ...values.filter((v) => args.includes(v)), ...v
 const execute = args.includes("--execute");
 if (
   args.some((a) => !known.has(a)) || flags.length > 1 ||
-  (execute && !valueOf("--expect-manifest-digest")) || (!execute && values.some((v) => args.includes(v))) ||
+  (execute && (!valueOf("--expect-manifest-digest") || !valueOf("--authorization"))) || (!execute && values.some((v) => args.includes(v))) ||
   (args.includes("--authorization") !== args.includes("--expect-authorization-digest"))
 )
-  throw new Error("Usage: bun scripts/rehearsal-state-teardown.ts [--claim | --manifest | --execute --expect-manifest-digest <sha256> [--authorization <file> --expect-authorization-digest <sha256>]]");
+  throw new Error("Usage: bun scripts/rehearsal-state-teardown.ts [--claim | --manifest | --execute --expect-manifest-digest <sha256> --authorization <file> --expect-authorization-digest <sha256>]");
 const root = fileURLToPath(new URL("..", import.meta.url));
 const dir = join(root, ".96bulls", REHEARSAL_STAGE);
 const manifestPath = join(dir, "physical-manifest.json");

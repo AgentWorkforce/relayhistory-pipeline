@@ -14,7 +14,7 @@
  * Nothing here runs unless a stage sets that mode; the proof stage and every other stage are as before.
  */
 import { createHash } from "node:crypto";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { PIPPEN_PROOF_SANDBOX } from "./sandbox-rules.ts";
@@ -292,12 +292,12 @@ export function validatePippenStateBucket(aws: AwsRun, i: { accountId: string; r
 
 /**
  * validate-only, as the state layer and the capture run it before Alchemy's first state operation.
- * READ-ONLY: it never writes (the marker is written only by the explicit claim, claimStageState).
- * The caller is this run's attested lease session (STS), the prefix is exactly this stage's, the
- * shared bucket is in shape, and the stage's state must be claimed by THIS run (its marker present
- * and exactly this run's: run id, lease session, issuance time, pin). An unclaimed (empty) prefix
- * refuses (`state_not_claimed`). While the marker is the only current object (stage A not applied),
- * none of the stage's names may be in use (assertRehearsalNamesUnused).
+ * READ-ONLY: it never writes. The caller is this run's attested lease session (STS), the prefix is
+ * exactly this stage's, the shared bucket is in shape, and the stage's **generation object** must
+ * exist, be in state `claimed`, and be exactly this run's (run id, lease session, issuance time,
+ * pin). No generation object refuses (`state_not_claimed`); state `tearing-down` refuses
+ * (`state_teardown_in_progress`); any other generation refuses (`state_provenance_mismatch`). While
+ * the stage has no resource state yet (stage A not applied), none of the stage's names may be in use.
  */
 export function assertValidateOnlyState(aws: AwsRun, ctx: RehearsalContext): { bucket: string; prefix: string } {
   const prefix = rehearsalStatePrefix(ctx.stage);
@@ -305,13 +305,13 @@ export function assertValidateOnlyState(aws: AwsRun, ctx: RehearsalContext): { b
   assertLeaseCaller(aws, ctx.accountId, { [PIPPEN_PROOF_SANDBOX.sessionEnv]: ctx.sessionId, [PIPPEN_PROOF_SANDBOX.execSessionEnv]: ctx.sessionId, [PIPPEN_PROOF_SANDBOX.execAccountEnv]: ctx.accountId });
   const bucket = validatePippenStateBucket(aws, ctx);
   const current = currentStateKeys(aws, { bucket, region: ctx.region, prefix });
-  if (current.length === 0) throw new StateBucketError("state_not_claimed");
-  // No capture or deploy while a teardown is open (fences every writer against an active cleanup).
-  if (current.includes(teardownMarkerKey(prefix)) || readMarker(aws, { bucket, region: ctx.region, key: teardownMarkerKey(prefix) }) !== undefined)
-    throw new StateBucketError("state_teardown_in_progress");
-  assertRunMarker(aws, { bucket, prefix, ctx });
-  // Stage A not applied yet: no resource state (only bookkeeping and the marker).
-  const bookkeeping = new Set([runMarkerKey(prefix), `${prefix}__lease__.json`, `${prefix}__stack_output__.json`]);
+  const gen = readGeneration(aws, { bucket, region: ctx.region, prefix });
+  if (gen === undefined) throw new StateBucketError("state_not_claimed");
+  const state = generationState(gen.body);
+  if (state === "tearing-down") throw new StateBucketError("state_teardown_in_progress");
+  if (gen.body !== generationBody(ctx, "claimed")) throw new StateBucketError("state_provenance_mismatch");
+  // Stage A not applied yet: no resource state (only bookkeeping and the generation object).
+  const bookkeeping = new Set([generationKey(prefix), `${prefix}__lease__.json`, `${prefix}__stack_output__.json`]);
   if (current.every((k) => bookkeeping.has(k))) assertRehearsalNamesUnused(aws, ctx);
   return { bucket, prefix };
 }
@@ -319,18 +319,19 @@ export function assertValidateOnlyState(aws: AwsRun, ctx: RehearsalContext): { b
 /**
  * The explicit claim of the stage's state by this run (scripts/rehearsal-state-teardown.ts
  * --claim), before the first capture: the attested caller and the bucket checked; the prefix's
- * VERSION inventory must be empty (zero versions and zero delete markers, so no prior, unowned
- * history can be claimed and later deleted); none of the stage's names may be in use; then this
- * run's marker is written with PutObject --if-none-match "*". The only write in validate-only mode.
+ * VERSION inventory must be empty (zero versions and zero delete markers); none of the stage's names
+ * may be in use; then the generation object is CREATED in state `claimed` with PutObject
+ * --if-none-match "*" (a claim fails while any generation object exists). The only write in
+ * validate-only mode besides the teardown.
  */
-export function claimStageState(aws: AwsRun, ctx: RehearsalContext): { bucket: string; marker: string } {
+export function claimStageState(aws: AwsRun, ctx: RehearsalContext): { bucket: string; generation: string } {
   const prefix = rehearsalStatePrefix(ctx.stage);
   assertLeaseCaller(aws, ctx.accountId, { [PIPPEN_PROOF_SANDBOX.sessionEnv]: ctx.sessionId, [PIPPEN_PROOF_SANDBOX.execSessionEnv]: ctx.sessionId, [PIPPEN_PROOF_SANDBOX.execAccountEnv]: ctx.accountId });
   const bucket = validatePippenStateBucket(aws, ctx);
   if (listStageStateVersions(aws, { bucket, region: ctx.region, stage: ctx.stage }).length !== 0) throw new StateBucketError("state_provenance_mismatch");
   assertRehearsalNamesUnused(aws, ctx);
-  writeRunMarker(aws, { bucket, prefix, ctx });
-  return { bucket, marker: runMarkerKey(prefix) };
+  putGeneration(aws, { bucket, region: ctx.region, prefix, body: generationBody(ctx, "claimed") });
+  return { bucket, generation: generationKey(prefix) };
 }
 
 /**
@@ -360,27 +361,83 @@ function currentStateKeys(aws: AwsRun, i: { bucket: string; region: string; pref
   return (contents as { Key: string }[]).map((c) => c.Key);
 }
 
-/** The run marker's key: not `.json`, so Alchemy's state store (which lists `*.json` resources) ignores it. */
-export const runMarkerKey = (prefix: string) => `${prefix}__rehearsal_run__.marker`;
+/**
+ * The generation object's key: the single lock that serializes claim and cleanup. Not `.json`, so
+ * Alchemy's state store and the capture's snapshot layer (which list `*.json` resources) ignore it.
+ */
+export const generationKey = (prefix: string) => `${prefix}__rehearsal_generation__.marker`;
 
-/** The run marker's body: this run, this lease, this pin. */
-export function runMarkerBody(ctx: RehearsalContext): string {
-  return JSON.stringify({ schema: 1, stage: ctx.stage, runId: ctx.runId, sessionId: ctx.sessionId, issuedAt: ctx.issuedAt, pin: ctx.pin });
+/** This teardown's receipts, as the generation records them in state `tearing-down`. */
+export interface GenerationReceipts {
+  manifestDigest: string;
+  authorizationDigest: string;
 }
 
-function writeRunMarker(aws: AwsRun, i: { bucket: string; prefix: string; ctx: RehearsalContext }): void {
-  putMarker(aws, { bucket: i.bucket, region: i.ctx.region, key: runMarkerKey(i.prefix), body: runMarkerBody(i.ctx) });
+/** The generation object's body: the run, its lease and pin, the state, and (tearing down) the receipts. */
+export function generationBody(ctx: Pick<RehearsalContext, "stage" | "runId" | "sessionId" | "issuedAt" | "pin">, state: "claimed" | "tearing-down", receipts: GenerationReceipts | null = null): string {
+  if ((state === "tearing-down") !== (receipts !== null)) throw new StateBucketError("state_teardown_failed");
+  return JSON.stringify({ schema: 1, stage: ctx.stage, runId: ctx.runId, sessionId: ctx.sessionId, issuedAt: ctx.issuedAt, pin: ctx.pin, state, receipts });
 }
 
-/** A populated prefix is resumed only when its marker is exactly this run's (run id, lease, pin). */
-function assertRunMarker(aws: AwsRun, i: { bucket: string; prefix: string; ctx: RehearsalContext }): void {
-  let text: string;
+/** A generation body's state, or refuses when it is not a generation object. */
+function generationState(body: string): "claimed" | "tearing-down" {
+  let v: { schema?: unknown; state?: unknown };
   try {
-    text = aws(["s3", "cp", `s3://${i.bucket}/${runMarkerKey(i.prefix)}`, "-", "--region", i.ctx.region]);
+    v = JSON.parse(body) as typeof v;
   } catch {
     throw new StateBucketError("state_provenance_mismatch");
   }
-  if (text.trim() !== runMarkerBody(i.ctx)) throw new StateBucketError("state_provenance_mismatch");
+  if (v?.schema !== 1 || (v.state !== "claimed" && v.state !== "tearing-down")) throw new StateBucketError("state_provenance_mismatch");
+  return v.state;
+}
+
+/** The generation object read together with its ETag and version id (GetObject), or undefined when absent. */
+interface GenerationRead {
+  body: string;
+  etag: string;
+  versionId: string;
+}
+
+function readGeneration(aws: AwsRun, i: { bucket: string; region: string; prefix: string }): GenerationRead | undefined {
+  const dir = mkdtempSync(join(tmpdir(), "96bulls-generation-"));
+  try {
+    const file = join(dir, "generation");
+    let meta: { ETag?: unknown; VersionId?: unknown };
+    try {
+      meta = JSON.parse(aws(["s3api", "get-object", "--bucket", i.bucket, "--region", i.region, "--key", generationKey(i.prefix), "--output", "json", file])) as typeof meta;
+    } catch (e) {
+      if (/NoSuchKey|\(404\)|Not Found/.test(e instanceof Error ? e.message : String(e))) return undefined;
+      throw new StateBucketError("state_provenance_mismatch");
+    }
+    if (typeof meta?.ETag !== "string" || !meta.ETag || typeof meta.VersionId !== "string" || !meta.VersionId || meta.VersionId === "null") throw new StateBucketError("state_provenance_mismatch");
+    return { body: readFileSync(file, "utf8").trim(), etag: meta.ETag, versionId: meta.VersionId };
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+}
+
+/**
+ * Write the generation object by compare-and-swap: created only if absent (`--if-none-match "*"`),
+ * or replaced only while it still has `ifMatch` (`--if-match <ETag>`). A failed condition refuses
+ * (`state_provenance_mismatch`). Returns the new ETag and version id.
+ */
+function putGeneration(aws: AwsRun, i: { bucket: string; region: string; prefix: string; body: string; ifMatch?: string }): { etag: string; versionId: string } {
+  const dir = mkdtempSync(join(tmpdir(), "96bulls-generation-"));
+  try {
+    const file = join(dir, "generation");
+    writeFileSync(file, i.body, { mode: 0o600 });
+    const condition = i.ifMatch === undefined ? ["--if-none-match", "*"] : ["--if-match", i.ifMatch];
+    let out: { ETag?: unknown; VersionId?: unknown };
+    try {
+      out = JSON.parse(aws(["s3api", "put-object", "--bucket", i.bucket, "--region", i.region, "--key", generationKey(i.prefix), "--body", file, ...condition, "--output", "json"])) as typeof out;
+    } catch {
+      throw new StateBucketError("state_provenance_mismatch");
+    }
+    if (typeof out?.ETag !== "string" || !out.ETag || typeof out.VersionId !== "string" || !out.VersionId) throw new StateBucketError("state_provenance_mismatch");
+    return { etag: out.ETag, versionId: out.VersionId };
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
 }
 
 /**
@@ -464,9 +521,6 @@ export function listStageStateVersions(aws: AwsRun, i: { bucket: string; region:
   throw new StateBucketError("state_teardown_failed");
 }
 
-/** The teardown marker's key: written before the first deletion, deleted last; not `.json`. */
-export const teardownMarkerKey = (prefix: string) => `${prefix}__rehearsal_teardown__.marker`;
-
 /** One DeleteObjects call by exact key and version id, every key rechecked against the prefix. */
 function deleteVersions(aws: AwsRun, i: { bucket: string; region: string; prefix: string }, objects: readonly { Key: string; VersionId: string }[]): void {
   for (let n = 0; n < objects.length; n += 1000) {
@@ -483,96 +537,62 @@ function deleteVersions(aws: AwsRun, i: { bucket: string; region: string; prefix
   }
 }
 
-/** A marker's current body, or undefined when it does not exist (NoSuchKey); any other failure refuses. */
-function readMarker(aws: AwsRun, i: { bucket: string; region: string; key: string }): string | undefined {
-  try {
-    return aws(["s3", "cp", `s3://${i.bucket}/${i.key}`, "-", "--region", i.region]).trim();
-  } catch (e) {
-    if (/NoSuchKey|\(404\)|Not Found/.test(e instanceof Error ? e.message : String(e))) return undefined;
-    throw new StateBucketError("state_provenance_mismatch");
-  }
-}
-
-/** Write a marker only if absent (PutObject --if-none-match "*"). */
-function putMarker(aws: AwsRun, i: { bucket: string; region: string; key: string; body: string }): void {
-  const dir = mkdtempSync(join(tmpdir(), "96bulls-marker-"));
-  try {
-    const file = join(dir, "marker");
-    writeFileSync(file, i.body, { mode: 0o600 });
-    aws(["s3api", "put-object", "--bucket", i.bucket, "--region", i.region, "--key", i.key, "--body", file, "--if-none-match", "*", "--output", "json"]);
-  } catch {
-    throw new StateBucketError("state_provenance_mismatch");
-  } finally {
-    rmSync(dir, { recursive: true, force: true });
-  }
-}
-
 /**
- * Teardown of this stage's state only, ordered so an interrupted run can always resume:
- *   1. the teardown marker (`teardownMarker`, bound to this teardown's receipts) is written if
- *      absent, or must already be exactly this teardown's;
- *   2. every version and delete marker EXCEPT the two markers is deleted; a re-list must then show
- *      only the markers' versions (else `state_teardown_not_empty`, with the run marker intact);
- *   3. the run marker's versions, alone; a re-list must then show only the teardown marker;
- *   4. the teardown marker, last and alone; a final re-list must show nothing.
- * Every listed key is checked against the exact prefix before anything is deleted. `execute: false`
- * (the default) lists and deletes nothing. Sibling stages and the bucket are never touched. A claim
- * cannot interleave: it needs an empty version inventory, and the teardown marker exists until the
- * very last call. Run it only through runRehearsalTeardown (every check first).
+ * Teardown of this stage's state only, under the generation lock:
+ *   1. the generation object must be the original run's: in state `claimed` it is moved to
+ *      `tearing-down` (with this teardown's receipts) by compare-and-swap (`--if-match` its ETag);
+ *      already `tearing-down` with these receipts (a retry) it is taken as is; anything else
+ *      refuses. Nothing else is touched before this succeeds;
+ *   2. the generation is recorded: that object's ETag and version id;
+ *   3. before **every** delete the fence is re-checked: the caller (`assertCaller`) and the
+ *      generation object still exactly that ETag, version id and body; otherwise it stops;
+ *   4. every version and delete marker except the generation's current version, by the ids listed
+ *      after the transition; a re-list must then show only that version;
+ *   5. the generation object, last and alone, by its recorded version id; the final re-list must
+ *      show nothing.
+ * A stale executor's compare-and-swap fails once another generation exists, and a fence check
+ * fails once its generation is gone or replaced, so it can never delete a newer run's versions. A
+ * claim fails while any generation object (or any version) exists. `execute: false` lists only.
  */
 export function teardownStageState(
   aws: AwsRun,
-  i: { bucket: string; region: string; stage: string; execute?: boolean; teardownMarker?: string; runMarker?: string | null },
+  i: { bucket: string; region: string; stage: string; execute?: boolean; original?: RehearsalContext; receipts?: GenerationReceipts; assertCaller?: () => void },
 ): { listed: number; deleted: number; remaining: number } {
   const prefix = rehearsalStatePrefix(i.stage);
   const all = listStageStateVersions(aws, i);
   if (!i.execute) return { listed: all.length, deleted: 0, remaining: all.length };
-  if (i.teardownMarker === undefined || i.runMarker === undefined) throw new StateBucketError("state_teardown_failed");
-  const run = runMarkerKey(prefix);
-  const td = teardownMarkerKey(prefix);
+  if (i.original === undefined || i.receipts === undefined) throw new StateBucketError("state_teardown_failed");
   const where = { bucket: i.bucket, region: i.region, prefix };
-  const read = (key: string) => readMarker(aws, { bucket: i.bucket, region: i.region, key });
-  // 1. The teardown marker: written only over this run's own marker (or found, exactly this teardown's).
-  const existing = read(td);
-  if (existing === undefined) {
-    if (i.runMarker === null || read(run) !== i.runMarker) throw new StateBucketError("state_provenance_mismatch");
-    putMarker(aws, { bucket: i.bucket, region: i.region, key: td, body: i.teardownMarker });
-  } else if (existing !== i.teardownMarker) throw new StateBucketError("state_provenance_mismatch");
-  // 2. The generation: the exact version ids of the teardown marker and the run marker, recorded now.
-  const start = listStageStateVersions(aws, i);
-  const tdVersions = start.filter((o) => o.Key === td);
-  const runVersions = start.filter((o) => o.Key === run);
-  if (tdVersions.length !== 1) throw new StateBucketError("state_provenance_mismatch");
-  if (i.runMarker === null ? runVersions.length !== 0 : runVersions.length !== 1 || read(run) !== i.runMarker) throw new StateBucketError("state_provenance_mismatch");
-  const tdV = tdVersions[0]!.VersionId;
-  const runV = runVersions[0]?.VersionId;
-  // The fence, before every delete: the original teardown marker (same version id, same body) is
-  // still the only teardown marker, and no run marker version other than the recorded one exists.
-  // A stale executor whose generation was completed by another, and whose prefix was then claimed
-  // by a new run, stops here instead of deleting the new run's versions.
+  const gk = generationKey(prefix);
+  const tearing = generationBody(i.original, "tearing-down", i.receipts);
+  i.assertCaller?.();
+  // 1-2. The transition (or the retry) and the recorded generation.
+  const gen = readGeneration(aws, where);
+  if (gen === undefined) throw new StateBucketError("state_provenance_mismatch");
+  let recorded: { etag: string; versionId: string };
+  if (gen.body === generationBody(i.original, "claimed")) recorded = putGeneration(aws, { ...where, body: tearing, ifMatch: gen.etag });
+  else if (gen.body === tearing) recorded = { etag: gen.etag, versionId: gen.versionId };
+  else throw new StateBucketError("state_provenance_mismatch");
   const fence = () => {
-    const now = listStageStateVersions(aws, i);
-    const t = now.filter((o) => o.Key === td);
-    if (t.length !== 1 || t[0]!.VersionId !== tdV || read(td) !== i.teardownMarker) throw new StateBucketError("state_provenance_mismatch");
-    if (now.some((o) => o.Key === run && o.VersionId !== runV)) throw new StateBucketError("state_provenance_mismatch");
-    return now;
+    i.assertCaller?.();
+    const now = readGeneration(aws, where);
+    if (now === undefined || now.etag !== recorded.etag || now.versionId !== recorded.versionId || now.body !== tearing) throw new StateBucketError("state_provenance_mismatch");
   };
-  // 3. Every other version, by the ids listed at the start of this generation.
-  const others = start.filter((o) => o.Key !== run && o.Key !== td);
+  // 3-4. Everything but the generation's current version.
+  const start = listStageStateVersions(aws, i);
+  const others = start.filter((o) => !(o.Key === gk && o.VersionId === recorded.versionId));
   fence();
   deleteVersions(aws, where, others);
-  // 4. The run marker, alone, by its recorded version id only.
-  const afterOthers = fence();
-  if (afterOthers.some((o) => o.Key !== run && o.Key !== td)) throw new StateBucketError("state_teardown_not_empty");
-  if (runV !== undefined) deleteVersions(aws, where, [{ Key: run, VersionId: runV }]);
-  // 5. The teardown marker, last and alone, by its recorded version id only.
-  const afterRun = fence();
-  if (afterRun.length !== 1) throw new StateBucketError("state_teardown_not_empty");
-  deleteVersions(aws, where, [{ Key: td, VersionId: tdV }]);
+  fence();
+  const after = listStageStateVersions(aws, i);
+  if (after.length !== 1 || after[0]!.Key !== gk || after[0]!.VersionId !== recorded.versionId) throw new StateBucketError("state_teardown_not_empty");
+  // 5. The generation object, last and alone, by its recorded version id.
+  fence();
+  deleteVersions(aws, where, [{ Key: gk, VersionId: recorded.versionId }]);
   // Explicit empty-prefix evidence: an independent re-list of versions and delete markers.
   const remaining = listStageStateVersions(aws, i).length;
   if (remaining !== 0) throw new StateBucketError("state_teardown_not_empty");
-  return { listed: all.length, deleted: others.length + (runV === undefined ? 0 : 1) + 1, remaining };
+  return { listed: all.length, deleted: others.length + 1, remaining };
 }
 
 /**
@@ -1012,7 +1032,7 @@ export function rehearsalTeardownPolicies(i: { accountId: string; roleArn: strin
         Statement: [
           statement("List", ["s3:ListBucket", "s3:ListBucketVersions"], bucketArn, { StringLike: { "s3:prefix": [`${prefix}*`] } }),
           statement("Objects", ["s3:GetObject", "s3:GetObjectVersion", "s3:DeleteObject", "s3:DeleteObjectVersion"], `${bucketArn}/${prefix}*`, {}),
-          statement("TeardownMarker", ["s3:PutObject"], `${bucketArn}/${teardownMarkerKey(prefix)}`, {}),
+          statement("Generation", ["s3:PutObject"], `${bucketArn}/${generationKey(prefix)}`, {}),
           statement("Settings", ["s3:GetBucketVersioning", "s3:GetEncryptionConfiguration", "s3:GetBucketPublicAccessBlock", "s3:GetBucketOwnershipControls", "s3:GetBucketTagging"], bucketArn, {}),
           { Sid: "OtherPrefixes", Effect: "Deny" as const, Action: ["s3:ListBucket", "s3:ListBucketVersions"], Resource: bucketArn, Condition: { StringNotLike: { "s3:prefix": [`${prefix}*`] } } },
           { Sid: "NotThisPrefix", Effect: "Deny" as const, Action: ["s3:GetObject*", "s3:PutObject*", "s3:DeleteObject*"], NotResource: `${bucketArn}/${prefix}*` },
@@ -1061,8 +1081,12 @@ export interface TeardownAuthorization {
   schema: 1;
   stage: string;
   runId: string;
-  /** Lease A: the run's original lease, as the manifest and the marker record it. */
-  original: { sessionId: string; issuedAt: string; pin: string };
+  /**
+   * Lease A: the run's original lease, as the manifest and the generation record it, with the
+   * broker's attestation that A was revoked and that A's sessions had expired, both no later than
+   * B's issuance (in-flight A writers are excluded by that revocation, not by code).
+   */
+  original: { sessionId: string; issuedAt: string; pin: string; revokedAt: string; sessionsExpireAt: string };
   manifestDigest: string;
   mappingUuids: string[];
   /**
@@ -1070,11 +1094,6 @@ export interface TeardownAuthorization {
    * expiry (no later than the run deadline) and the digest of its cleanup-only policies.
    */
   teardown: { sessionId: string; callerArn: string; issuedAt: string; windowEnd: string; expiresAt: string; policyDigest: string };
-}
-
-/** The teardown marker's body: the run and this teardown's receipts. */
-export function teardownMarkerBody(i: { stage: string; runId: string; manifestDigest: string; authorizationDigest: string | null }): string {
-  return JSON.stringify({ schema: 1, stage: i.stage, runId: i.runId, manifestDigest: i.manifestDigest, authorizationDigest: i.authorizationDigest });
 }
 
 /** sha256 of the canonical JSON of a teardown authorization (the value the broker's receipt records). */
@@ -1115,6 +1134,9 @@ export function assertTeardownAuthorization(ctx: RehearsalContext, auth: unknown
   const ok =
     a !== null && typeof a === "object" && a.schema === 1 && a.stage === ctx.stage && a.runId === ctx.runId &&
     typeof a.original?.sessionId === "string" && PIPPEN_SESSION_ID.test(a.original.sessionId) && typeof a.original.issuedAt === "string" && ISO.test(a.original.issuedAt) && hex(a.original.pin) &&
+    typeof a.original.revokedAt === "string" && ISO.test(a.original.revokedAt) && typeof a.original.sessionsExpireAt === "string" && ISO.test(a.original.sessionsExpireAt) &&
+    // A revoked, and A's sessions expired, before B was issued (and not before A existed).
+    Date.parse(a.original.revokedAt) >= Date.parse(a.original.issuedAt) && Date.parse(a.original.revokedAt) <= Date.parse(ctx.issuedAt) && Date.parse(a.original.sessionsExpireAt) <= Date.parse(ctx.issuedAt) &&
     hex(a.manifestDigest) && Array.isArray(a.mappingUuids) && a.mappingUuids.length === 2 && a.mappingUuids.every((u) => typeof u === "string" && UUID.test(u)) && new Set(a.mappingUuids).size === 2 &&
     a.teardown?.sessionId === ctx.sessionId && a.teardown.issuedAt === ctx.issuedAt &&
     a.teardown.callerArn === `arn:aws:sts::${ctx.accountId}:assumed-role/${PIPPEN_PROOF_SANDBOX.callerRole.roleName}/${PIPPEN_PROOF_SANDBOX.callerRole.sessionPrefix}${ctx.sessionId}` &&
@@ -1139,11 +1161,12 @@ export function assertTeardownAuthorization(ctx: RehearsalContext, auth: unknown
 
 /**
  * The whole teardown, in order, with no deletion before every check passed: the run context of the
- * current lease (before any AWS call); STS; the bucket; with a teardown authorization (lease B), the
- * authorization (above), else the current lease must be the run's own; the independent manifest
- * receipt (the broker's recorded digest) and, with an authorization, its manifest digest and mapping
- * UUIDs; the manifest against the original run; every recorded id gone; the current marker owned by
- * the original run; and only then the state versions deleted (execute) or counted (dry run).
+ * current lease (before any AWS call); STS; the bucket; the teardown authorization (required: the
+ * teardown runs only under the authorized lease B, issued after lease A was revoked and A's sessions
+ * expired); the independent manifest receipt (the broker's recorded digest) and the authorization's
+ * manifest digest and mapping UUIDs; the manifest against the original run; the caller re-checked
+ * before the physical readback; every recorded id gone; then the state under the generation lock
+ * (teardownStageState), with the caller re-checked before every delete. A dry run only counts.
  */
 export function runRehearsalTeardown(
   aws: AwsRun,
@@ -1159,30 +1182,29 @@ export function runRehearsalTeardown(
   },
 ): { listed: number; deleted: number; remaining: number } {
   const ctx = rehearsalRunContext(REHEARSAL_STAGE, i.inputs, i.env, i.now)!;
-  assertLeaseCaller(aws, ctx.accountId, i.env);
+  const caller = () => assertLeaseCaller(aws, ctx.accountId, i.env);
+  caller();
   const bucket = validatePippenStateBucket(aws, ctx);
-  const prefix = rehearsalStatePrefix(ctx.stage);
   if (!i.execute) return teardownStageState(aws, { bucket, region: ctx.region, stage: REHEARSAL_STAGE, execute: false });
-  const original = i.authorization === undefined ? ctx : assertTeardownAuthorization(ctx, i.authorization, i.expectAuthorizationDigest, i.now);
+  if (i.authorization === undefined) throw new StateBucketError("state_authorization_mismatch");
+  const original = assertTeardownAuthorization(ctx, i.authorization, i.expectAuthorizationDigest, i.now);
   assertManifestReceipt(i.manifest, i.expectManifestDigest);
-  if (i.authorization !== undefined) {
-    const a = i.authorization as TeardownAuthorization;
-    const m = i.manifest as PhysicalManifest;
-    if (a.manifestDigest !== m.digest || [...a.mappingUuids].sort().join() !== m.mappings.map((x) => x.uuid).sort().join()) throw new StateBucketError("state_authorization_mismatch");
-  }
+  const a = i.authorization as TeardownAuthorization;
+  const m = i.manifest as PhysicalManifest;
+  if (a.manifestDigest !== m.digest || [...a.mappingUuids].sort().join() !== m.mappings.map((x) => x.uuid).sort().join()) throw new StateBucketError("state_authorization_mismatch");
   assertManifestComplete(i.manifest, original, original.runId);
+  caller();
   assertManifestGone(aws, i.manifest, original, original.runId);
-  // Bound to this teardown's receipts (the manifest digest and the authorization, if any).
-  const teardownMarker = teardownMarkerBody({ stage: REHEARSAL_STAGE, runId: original.runId, manifestDigest: (i.manifest as PhysicalManifest).digest, authorizationDigest: i.authorization === undefined ? null : authorizationDigest(i.authorization) });
-  // Resume states, all under these receipts: nothing left (an earlier run completed: its last
-  // response may have been lost); only this teardown's marker left; or the run's marker present and
-  // the original run's. Anything else keeps the state.
-  const inventory = listStageStateVersions(aws, { bucket, region: ctx.region, stage: REHEARSAL_STAGE });
-  if (inventory.length === 0) return { listed: 0, deleted: 0, remaining: 0 };
-  const runMarker = readMarker(aws, { bucket, region: ctx.region, key: runMarkerKey(prefix) });
-  if (runMarker === undefined) {
-    const td = teardownMarkerKey(prefix);
-    if (!inventory.every((o) => o.Key === td) || readMarker(aws, { bucket, region: ctx.region, key: td }) !== teardownMarker) throw new StateBucketError("state_provenance_mismatch");
-  } else if (runMarker !== runMarkerBody(original)) throw new StateBucketError("state_provenance_mismatch");
-  return teardownStageState(aws, { bucket, region: ctx.region, stage: REHEARSAL_STAGE, execute: true, teardownMarker, runMarker: runMarker === undefined ? null : runMarker });
+  // Nothing left: an earlier execute with these receipts completed (its last response may have been
+  // lost). The generation object is deleted last, so an empty inventory means the teardown ended.
+  if (listStageStateVersions(aws, { bucket, region: ctx.region, stage: REHEARSAL_STAGE }).length === 0) return { listed: 0, deleted: 0, remaining: 0 };
+  return teardownStageState(aws, {
+    bucket,
+    region: ctx.region,
+    stage: REHEARSAL_STAGE,
+    execute: true,
+    original,
+    receipts: { manifestDigest: m.digest, authorizationDigest: authorizationDigest(i.authorization) },
+    assertCaller: caller,
+  });
 }
