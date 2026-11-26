@@ -75,11 +75,36 @@ export function fakeClickHouse() {
         if (facts.fail) throw new Error("facts state unavailable");
         return (facts.complete === undefined ? [] : [{ complete: facts.complete }]) as T[];
       }
+      // The scope's latest session state row (the hosted pass's completion fence; the over-bound skip).
+      if (query.includes(`FROM ${SESSION_STATE_TABLE}`)) {
+        const p = options!.params!;
+        const ms = (v: unknown) => Date.parse(`${String(v).replace(" ", "T")}Z`);
+        const row = state.filter((r) => r.org_id === p.org && r.session_id === p.session).sort((a, b) => ms(b.synced_at) - ms(a.synced_at))[0];
+        return (row ? [{ revision: String(row.revision), needs_full: row.needs_full, scanned_rows: row.scanned_rows, synced_ms: ms(row.synced_at) }] : []) as T[];
+      }
       if (!query.includes(`FROM ${EVENTS_TABLE} FINAL`)) throw new Error(`unexpected select ${query.slice(0, 40)}`);
       const p = options!.params!;
-      const found = final()
-        .filter((r) => r.org_id === p.org && (r.session_id === p.session || r.session_id === p.canonical) && r.workspace_id === p.workspace && r.source === p.source && tsMs(r) >= Number(p.from))
-        .slice(0, Number(p.limit));
+      let matched = final()
+        .filter((r) => r.org_id === p.org && (r.session_id === p.session || r.session_id === p.canonical) && r.workspace_id === p.workspace && r.source === p.source && tsMs(r) >= Number(p.from));
+      // The keyset scan (clickhouseScopePage): ordered as ClickHouse orders it (strings as UTF-8 bytes), after the
+      // cursor. The whole-scope scan has no ORDER BY and keeps the table order.
+      if (query.includes("ORDER BY ts, session_id, machine_id, kind, event_id")) {
+        const key = (r: IndexRow) => [r.session_id, r.machine_id, r.kind, r.event_id];
+        const cmp = (a: [number, string[]], b: [number, string[]]) => {
+          if (a[0] !== b[0]) return a[0] < b[0] ? -1 : 1;
+          for (let i = 0; i < a[1].length; i++) {
+            const c = Buffer.compare(Buffer.from(a[1][i]!, "utf8"), Buffer.from(b[1][i]!, "utf8"));
+            if (c !== 0) return c;
+          }
+          return 0;
+        };
+        matched = matched.sort((a, b) => cmp([tsMs(a), key(a)], [tsMs(b), key(b)]));
+        if (p.after_ts !== undefined) {
+          const after: [number, string[]] = [Number(p.after_ts), [String(p.after_session), String(p.after_machine), String(p.after_kind), String(p.after_event)]];
+          matched = matched.filter((r) => cmp([tsMs(r), key(r)], after) > 0);
+        }
+      }
+      const found = matched.slice(0, Number(p.limit));
       return found.map((r) => ({ workspace_id: r.workspace_id, session_id: r.session_id, machine_id: r.machine_id, source: r.source, kind: r.kind, event_id: r.event_id, ts_ms: tsMs(r), fingerprint: r.fingerprint })) as T[];
     },
     async insert(table, batch) {
@@ -141,5 +166,5 @@ export async function hostedRig(x: ExportedScope, cleanup: Array<() => Promise<u
   const messages = x.keys.map((key, n) => ({ messageId: `m-${n}`, body: JSON.stringify({ reconcile: { key } }) }));
   /** One consumer pass over the scope's manifests (what a tick or a redelivered event sends). */
   const tick = (extra: Partial<SearchIndexDeps> = {}) => processBatch(messages, consumer(extra));
-  return { db, fake, sql, reads, store, transact, search, tick, requeued, messages };
+  return { db, fake, sql, reads, store, transact, search, consumer, tick, requeued, messages };
 }

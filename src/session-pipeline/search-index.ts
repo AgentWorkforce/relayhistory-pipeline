@@ -38,6 +38,7 @@
  */
 import { ARTIFACT_MAX_SOURCE_BYTES, ARTIFACT_MAX_SOURCE_RECORDS } from "../session-read-api/canonical-artifact.ts";
 import { readCanonicalScope } from "../session-read-api/canonical-projection.ts";
+import type { ContenderSeats } from "../session-read-api/contender-seats.ts";
 import {
   STREAM_DEADLINE,
   STREAM_KEYED_RECORDS_CAP,
@@ -60,6 +61,7 @@ export const STREAM_READ_CEILING: Readonly<StreamReadLimits> = Object.freeze({
   maxReadEvents: nodeReadBudget("large").sourceRecords,
 });
 export { manifestUserId, readManifestRecords, projectedToNeonRow } from "../session-read-api/canonical-projection.ts";
+import { createHash, randomInt } from "node:crypto";
 import * as zlib from "node:zlib";
 import { layoutComponent } from "../shared/layout-component.ts";
 import { errorFields, log } from "../shared/log.ts";
@@ -67,8 +69,8 @@ import { PipelineError, type ManifestReader, type ObjectStore } from "../shared/
 import type { SqlExecutor } from "@rhc/lib/pipeline/queue.ts";
 import type { ClickHouseClient } from "./vendor/search-index/clickhouse.ts";
 import { tsMillis } from "./vendor/search-index/rows.ts";
-import { EVENTS_TABLE, SESSION_STATE_TABLE } from "./vendor/search-index/schema.ts";
-import { chNow, deleteRows, windowStart, type PendingDelete } from "./vendor/search-index/reconcile.ts";
+import { EVENTS_TABLE, INGEST_STATE_TABLE, SESSION_STATE_TABLE } from "./vendor/search-index/schema.ts";
+import { DEFAULT_WINDOW_DAYS, DELETE_BYTES_BUDGET, STATE_WINDOW_START, chNow, deleteRows, readState, windowStart, type PendingDelete } from "./vendor/search-index/reconcile.ts";
 import { scopeLockKey, type SessionScope } from "./pointer.ts";
 import { directoryCatalogWriter, type writeDirectoryCatalog } from "../hoopdb/session-directory-catalog.ts";
 import { writeDirectoryEvents, invalidateDirectoryEvents, completeErasedDirectoryEvents } from "../hoopdb/session-directory-events.ts";
@@ -216,6 +218,27 @@ export interface SearchIndexDeps {
    * and output-facts paths deliberately keep the base behavior.
    */
   preRead?: boolean;
+  /**
+   * SEARCH_INDEX_SKIP_ACCEPTANCE_MISSING_ENABLED=true only (lambda.ts, the hosted ClickHouse binding): a pass
+   * that ends incomplete for `relayhistory_acceptance_missing` alone stamps a digest of the pointer set it read
+   * (acceptanceDigest) into `search_ingest_state`; a later pass over the same digest, within
+   * SKIP_STATE_MAX_AGE_MS of the stamp, returns that outcome again before any manifest read
+   * (skippedBeforeRead), writing nothing. Any other outcome clears a stamp it saw. Applies only where
+   * inlineSkipsApply holds (the S3-event pass on the legacy ClickHouse whole-read path; never the managed
+   * search-jobs pass, staged, adapter or output-facts passes). Absent: no stamp is read or written, no extra
+   * query, nothing else changes.
+   */
+  skipAcceptanceMissing?: true;
+  /**
+   * SEARCH_INDEX_SKIP_OVER_BOUND_ENABLED=true only (lambda.ts, the hosted ClickHouse binding): before any manifest
+   * read, a scope whose live sibling pointers' scrubbed raw_bytes already exceed the whole-read bound (and, with
+   * `stream`, four times that exceeds the stream byte budget, so the streamed path refuses it too), and whose
+   * latest search state row already records the refusal at the highest live revision within
+   * SKIP_STATE_MAX_AGE_MS, returns the size refusal again without reading or writing anything
+   * (overBoundBeforeRead). Applies only where inlineSkipsApply holds. Absent: no extra query, nothing else
+   * changes.
+   */
+  skipOverBound?: true;
 }
 
 /** Additive phase counters for the existing search-pass log line. Durations are wall milliseconds. */
@@ -415,7 +438,104 @@ export interface SearchIndexResult {
   outputFacts?: { inserted: number; deleted: number; complete: boolean; reasons: string[] };
   /** Present only when the streaming reader ran: what it read, summed over its passes. */
   stream?: { passes: number; chunks: number; bytes: number; events: number };
+  /**
+   * SEARCH_INDEX_SKIP_ACCEPTANCE_MISSING_ENABLED=true or SEARCH_INDEX_SKIP_OVER_BOUND_ENABLED=true only: the
+   * acceptance-missing outcome or the size refusal was repeated from stored state before any manifest read;
+   * nothing was read from the object store and nothing was written.
+   */
+  skippedBeforeRead?: true;
+  /**
+   * Only on a whole-read pass that read and ended with `relayhistory_acceptance_missing` (never on a skipped pass):
+   * how the refused contender groups looked (session-read-api/contender-seats.ts). Telemetry only.
+   */
+  contenderSeats?: ContenderSeats | typeof CONTENDER_SEATS_UNKNOWN;
 }
+
+/** contender_seats of a streamed pass refused for acceptance: main's streamed reader does not classify the refusal. */
+export const CONTENDER_SEATS_UNKNOWN = "unknown" as const;
+/** A streamed result's contender_seats: explicitly unknown on an acceptance refusal, absent otherwise. */
+const streamedSeats = (reasons: readonly string[]): { contenderSeats?: typeof CONTENDER_SEATS_UNKNOWN } => (reasons.includes(ACCEPTANCE_MISSING) ? { contenderSeats: CONTENDER_SEATS_UNKNOWN } : {});
+
+/**
+ * A scope is not started streaming with less than this left before its stream deadline (half a fresh
+ * invocation's; the backport lineage's value). Only a pass with a deadline (the hosted Lambda) checks it.
+ */
+export const STREAM_MIN_START_MS = 120_000;
+/**
+ * The streamed pass's tail (its delete batches, then the directory and catalog writes, the state row and COMMIT)
+ * is not started with less than this left before the stream deadline (the backport lineage's 51f876b6): with the
+ * 60 s margin behind the deadline that leaves about 90 s to the function timeout.
+ */
+export const STREAM_TAIL_RESERVE_MS = 30_000;
+/** A delete key whose literal could exceed DELETE_BYTES_BUDGET: the hosted streamed pass deletes nothing and is owed. */
+export const STREAM_DELETE_KEY_TOO_LARGE = "stream_delete_key_too_large";
+/** Keys per DELETE statement of the hosted streamed pass (deleteRows' own key batch, as on the backport). */
+const STREAM_DELETE_BATCH = 500;
+
+/**
+ * Split `deletes` into chunks deleteRows sends as one statement each: at most STREAM_DELETE_BATCH keys, and an
+ * upper bound of each key's literal (every text field escaped at worst to twice its UTF-8 length, the 64-hex digest,
+ * the timestamp and the tuple's punctuation) summed within DELETE_BYTES_BUDGET.
+ */
+export function deleteStatementChunks(scope: SessionScope, deletes: readonly ScopeIdentity[]): ScopeIdentity[][] | null {
+  const utf8 = (v: string) => Buffer.byteLength(v, "utf8");
+  const bound = (d: ScopeIdentity) =>
+    2 * (utf8(scope.orgId) + utf8(d.sessionId) + utf8(d.workspaceId) + utf8(d.machineId) + utf8(d.source) + utf8(d.kind)) + 64 + 24 + 32;
+  const chunks: ScopeIdentity[][] = [];
+  let chunk: ScopeIdentity[] = [];
+  let bytes = 0;
+  for (const d of deletes) {
+    const size = bound(d);
+    // One key whose literal could exceed the statement's byte budget cannot be deleted safely: refuse (the pass is
+    // owed; nothing is deleted).
+    if (size > DELETE_BYTES_BUDGET) return null;
+    if (chunk.length > 0 && (chunk.length >= STREAM_DELETE_BATCH || bytes + size > DELETE_BYTES_BUDGET)) {
+      chunks.push(chunk);
+      chunk = [];
+      bytes = 0;
+    }
+    chunk.push(d);
+    bytes += size;
+  }
+  if (chunk.length > 0) chunks.push(chunk);
+  return chunks;
+}
+/**
+ * Whether this backend holds the scope's transaction advisory lock (pg_advisory_xact_lock(bigint) is recorded in
+ * pg_locks as classid = the key's high 32 bits, objid = its low 32 bits, objsubid = 1).
+ */
+export const STREAM_LOCK_HELD_SQL = `SELECT EXISTS (SELECT 1 FROM pg_catalog.pg_locks
+  WHERE locktype = 'advisory' AND granted AND pid = pg_catalog.pg_backend_pid() AND objsubid = 1
+    AND ((classid::bigint << 32) | objid::bigint) = hashtextextended($1, 0)) AS ok`;
+/** The keepalive of a hosted streamed pass found the transaction no longer holds the scope lock. */
+export const STREAM_KEEPALIVE_FAILED = "stream_keepalive_failed";
+
+/**
+ * The hosted Lambda's streamed-pass guards (the backport lineage's e79df11b, 6264d119, 51f876b6) apply to a pass
+ * that carries the invocation's stream slot: lambda.ts invocationSearchDeps gives one to every invocation with
+ * SEARCH_INDEX_STREAMING_CH=1, on the SQS path and the scheduled search-jobs path. The self-host consumer never
+ * sets a slot, so its streamed pass is unchanged.
+ */
+const hostedStream = (deps: SearchIndexDeps): boolean => deps.streamSlot !== undefined;
+
+/** The reason code a pass returned before any manifest read adds to the outcome it repeats. */
+export const SKIPPED_BEFORE_READ = "skipped_before_read";
+/**
+ * The oldest stamp a pass may skip on. A skip never rewrites it, so a scope that still gets events
+ * takes a normal pass (which rewrites it) at least this often, also when a pointer event was lost.
+ */
+export const SKIP_STATE_MAX_AGE_MS = 6 * 60 * 60 * 1000;
+/** The fold's refusal when same-record contenders from different origins lack accepted_seq. */
+export const ACCEPTANCE_MISSING = "relayhistory_acceptance_missing";
+/**
+ * Salt of the acceptance stamp's digest. Bump it with any change to how a pass reads, folds or
+ * projects a scope: a stamp written under another salt never matches, and the next pass reads in
+ * full. v2: this pass reads the canonical sibling union (readCanonicalScope), not the backport's
+ * per-scope set, so a v1 stamp written by the backport lineage never licenses a skip here.
+ */
+export const ACCEPTANCE_SKIP_VERSION = "acceptance-skip-v2";
+/** `search_ingest_state` names of acceptance stamps; no other state name starts with it. */
+export const ACCEPTANCE_STAMP_PREFIX = "acceptance_skip/";
 
 interface ScopeIdentity {
   machineId: string;
@@ -621,6 +741,9 @@ export async function indexSearchScope(scope: SessionScope, deps: SearchIndexDep
   // accepted but deliberately leaves them on the byte-identical base path.
   if (!deps.preRead || !deps.ch || deps.adapter || deps.staged || deps.stream || deps.outputFacts || deps.outputFactsStore)
     return indexSearchScopeBase(scope, deps);
+  // A SEARCH_INDEX_SKIP_* flag decides before any manifest read under the scope lock, which the pre-read
+  // path would already have spent: with one armed where it applies, the locked base path runs.
+  if ((deps.skipAcceptanceMissing || deps.skipOverBound) && inlineSkipsApply(deps)) return indexSearchScopeBase(scope, deps);
   const limits = { ...SEARCH_INDEX_DEFAULT_LIMITS, ...deps.limits };
   for (let attempt = 0; attempt < 2; attempt++) {
     const captured = await captureSearchPreRead(scope, deps, limits);
@@ -657,6 +780,12 @@ async function indexSearchScopeBase(scope: SessionScope, deps: SearchIndexDeps, 
   const sourceBefore = deps.metrics?.sourceReadMs ?? 0;
   const scanBefore = deps.metrics?.indexScanMs ?? 0;
   let first: SearchIndexResult | typeof SEARCH_SCOPE_CHANGED;
+  // Hosted (SEARCH_INDEX_STREAMING_CH=1, the invocation's stream slot, the ClickHouse binding): the pass owes a full
+  // pass (needs_full = 1) from before its first source read until its Postgres outcome is durable; its completing
+  // state rows are written after COMMIT, under the scope and canonical locks, and only over its own verified marker
+  // (HostedState).
+  const hostedPass = hostedStream(deps) && !prepared && !!deps.ch && !deps.adapter;
+  const hostedState = hostedPass ? new HostedState(deps, scope) : null;
   try {
     first = await deps.transact(async (tx): Promise<SearchIndexResult | typeof SEARCH_SCOPE_CHANGED> => {
     const rawIo = deps.adapter
@@ -664,7 +793,8 @@ async function indexSearchScopeBase(scope: SessionScope, deps: SearchIndexDeps, 
         ? adapterProjectionIo(deps.adapter, tx, { pagedScan: true })
         : adapterProjectionIo(deps.adapter, tx)
       : legacyProjectionIo(deps.ch!);
-    const io = observedProjectionIo(rawIo, deps.metrics);
+    const observedIo = observedProjectionIo(rawIo, deps.metrics);
+    const io: SearchProjectionIo = hostedState ? hostedState.io(observedIo) : observedIo;
     const chFacts = deps.ch ? clickhouseOutputFactsStore(deps.ch, { maxRows: limits.maxRows, insertBatch: limits.insertBatch }) : undefined;
     const pgFacts = deps.outputFactsStore?.(tx);
     // Non-blocking: a pass already running for this session is busy for as long
@@ -686,9 +816,16 @@ async function indexSearchScopeBase(scope: SessionScope, deps: SearchIndexDeps, 
       await io.record(scope,0,0,false,at,pointerSnapshot.canonicalId);
       return {manifests:0,rows:0,inserted:0,deleted:0,complete:false,reasons:["canonical_session_mismatch"]};
     }
-    const {rows:siblings}=await tx.query<{manifest_key:string}>(`SELECT manifest_key FROM sessions.session_index
+    // SEARCH_INDEX_SKIP_ACCEPTANCE_MISSING_ENABLED / SEARCH_INDEX_SKIP_OVER_BOUND_ENABLED=true (where they apply,
+    // never with a pre-read): the same listing with each row's facts. Both off: the listing exactly as before.
+    const skipsApply = !prepared && inlineSkipsApply(deps);
+    const acceptanceArmed = deps.skipAcceptanceMissing === true && skipsApply;
+    const overBoundArmed = deps.skipOverBound === true && skipsApply;
+    const siblingFacts = acceptanceArmed || overBoundArmed ? await siblingPointerFacts(tx, scope, pointerSnapshot.canonicalId) : null;
+    const {rows:siblings}=siblingFacts ? {rows:siblingFacts} : await tx.query<{manifest_key:string}>(`SELECT manifest_key FROM sessions.session_index
       WHERE org_id=$1 AND workspace_id=$2 AND harness=$3 AND coalesce(canonical_session_id,session_id)=$4 AND deleted_at IS NULL ORDER BY session_id,machine_id`,[scope.orgId,scope.workspaceId,scope.harness,pointerSnapshot.canonicalId]);
     const siblingKeys=siblings.map(r=>r.manifest_key);
+    const stampName = acceptanceArmed ? acceptanceStampName(scope) : "";
     if (prepared && !sourceStampEqual(await currentSourceStamp(tx, scope, pointerSnapshot), prepared.stamp)) return SEARCH_SCOPE_CHANGED;
     if(!keys.length&&siblingKeys.length){
       // Erasing one alias must never erase a live canonical sibling.
@@ -711,6 +848,8 @@ async function indexSearchScopeBase(scope: SessionScope, deps: SearchIndexDeps, 
       // run already past its scope-lock check can put erased rows back after the index erase
       // (a write page takes the same scope lock this transaction holds).
       if (deps.staged && deps.adapter) await eraseStagedReconcileRuns(tx, scope, [...new Set([scope.sessionId, pointerSnapshot.canonicalId])]);
+      // Hosted: the erase owes its outcome too until COMMIT (its completing rows are fenced like any pass's).
+      if (hostedState) await hostedState.premark(io, 0, at, pointerSnapshot.canonicalId);
       await io.erase(scope,pointerSnapshot.canonicalId);
       // Erasure purges the fact tables whenever they exist, flag or not: turning the producer
       // off must never leave an erased session's facts behind.
@@ -730,15 +869,57 @@ async function indexSearchScopeBase(scope: SessionScope, deps: SearchIndexDeps, 
       if (pgFacts) await pgFacts.erase(factsScope(scope, pointerSnapshot.canonicalId));
       await io.record(scope,0,0,true,at,pointerSnapshot.canonicalId);
       await completeErasedDirectoryEvents(tx,scope);
+      // Flag on: an erased scope keeps no acceptance stamp.
+      if (acceptanceArmed) await settleAcceptanceStamp(deps.ch!, scope, stampName, await readAcceptanceStamp(deps.ch!, stampName), null, at);
       return { manifests: 0, rows: 0, inserted: 0, deleted: 0, complete: true, reasons: ["erased"] };
     }
     // SEARCH_INDEX_SKIP_CURRENT_ENABLED: under both locks, after every branch that must run (canonical
     // mismatch, alias still live, erase), before any object read or index query.
     if (deps.skipCurrent && (await alreadyCurrent(tx, scope, pointerSnapshot, keys.length, deps.outputFacts ? deps.ch : undefined)))
       return { manifests: keys.length, rows: 0, inserted: 0, deleted: 0, complete: true, skipped: true, reasons: [ALREADY_CURRENT] };
-    const fromMs = prepared?.fromMs ?? await io.fromMs(at);
+    // SEARCH_INDEX_SKIP_OVER_BOUND_ENABLED=true: the same refusal as the read below would give, without a
+    // manifest read or any write (overBoundBeforeRead).
+    if (overBoundArmed && siblingFacts && (await overBoundBeforeRead(deps.ch!, scope, deps, limits, siblingFacts, at)))
+      return {
+        manifests: 0, rows: 0, inserted: 0, deleted: 0, complete: false, partial: true, skippedBeforeRead: true,
+        reasons: ["scope_too_large", SKIPPED_BEFORE_READ],
+      };
+    let fromMs: number;
+    let acceptance: { stamp: StampRead; digest: string; observed: Map<string, ManifestObservation> } | null = null;
+    if (acceptanceArmed && siblingFacts) {
+      // SEARCH_INDEX_SKIP_ACCEPTANCE_MISSING_ENABLED=true: windowStart's own read and default (same ClickHouse
+      // read, same value), kept apart so the digest tells a stored window from the rolling default.
+      const stored = await measurePhase(deps.metrics, "indexScanMs", () => readState(deps.ch!, STATE_WINDOW_START));
+      fromMs = Date.parse(stored ?? new Date(at.getTime() - DEFAULT_WINDOW_DAYS * 24 * 60 * 60 * 1000).toISOString());
+      const digest = acceptanceDigest(scope, pointerSnapshot, siblingFacts, stored === null ? `default:${DEFAULT_WINDOW_DAYS}d` : `stored:${stored}`, limits, deps.stream, deps.readerMaxRuleset);
+      const stamp = await readAcceptanceStamp(deps.ch!, stampName);
+      // The last pass over this exact pointer set, epoch, window and limits ended incomplete for the
+      // acceptance refusal alone, recently: the same outcome, without a read or a write.
+      if (acceptanceStampMatches(stamp, digest, at))
+        return { manifests: 0, rows: 0, inserted: 0, deleted: 0, complete: false, skippedBeforeRead: true, reasons: [ACCEPTANCE_MISSING, SKIPPED_BEFORE_READ] };
+      acceptance = { stamp, digest, observed: new Map() };
+    } else fromMs = prepared?.fromMs ?? await io.fromMs(at);
+    if (hostedState) {
+      // Before any source read of the pass (the backport's pre-mark, ahead of manifest admission), under the locks.
+      const { rows: top } = await tx.query<{ revision: string }>(`SELECT coalesce(max(revision), 0)::text AS revision FROM sessions.session_index
+        WHERE org_id=$1 AND workspace_id=$2 AND harness=$3 AND coalesce(canonical_session_id,session_id)=$4 AND deleted_at IS NULL`,
+        [scope.orgId, scope.workspaceId, scope.harness, pointerSnapshot.canonicalId]);
+      await hostedState.premark(io, Number(top[0]?.revision ?? 0), at, pointerSnapshot.canonicalId);
+    }
+    const observedReader = acceptance ? { reader: observingReader(deps.reader, acceptance.observed) } : {};
     const s3 = prepared?.s3 ?? await measurePhase(deps.metrics, "sourceReadMs", () =>
-      readCanonicalScope(scope, siblingKeys, { ...deps, decompress: deps.decompress ?? defaultDecompress }, limits, version, pointerSnapshot.canonicalId));
+      readCanonicalScope(scope, siblingKeys, { ...deps, ...observedReader, decompress: deps.decompress ?? defaultDecompress }, limits, version, pointerSnapshot.canonicalId));
+    // Flag on: stamp or clear once the pass has its outcome. Busy and deferred passes return before this is
+    // called (the lock refusals above, the stream deferral below), so they do neither.
+    const settle = async (result: SearchIndexResult): Promise<SearchIndexResult> => {
+      if (acceptance && siblingFacts)
+        await settleAcceptanceStamp(
+          deps.ch!, scope, stampName, acceptance.stamp,
+          acceptanceOnly(result) && readAsListed(siblingFacts, acceptance.observed) ? acceptance.digest : null,
+          at,
+        );
+      return result;
+    };
     // Output facts need the whole read, or the staged run's facts hooks (Postgres store only): with a
     // facts store and no staged run, a too-large scope stays incomplete (scope_too_large) as before.
     const stagedFacts = !!deps.outputFactsStore && !!deps.staged && !!deps.adapter;
@@ -746,7 +927,9 @@ async function indexSearchScopeBase(scope: SessionScope, deps: SearchIndexDeps, 
       deps.stream && !deps.outputFacts && (!deps.outputFactsStore || stagedFacts) && siblingKeys.length &&
       s3.partial && s3.admitted && s3.reasons.length === 1 && s3.reasons[0] === "scope_too_large"
     ) {
-      if (deps.streamSlot?.used)
+      // The backport lineage's start minimum (6264d119): with a deadline, a stream is not started with less than
+      // STREAM_MIN_START_MS left before it; deferred and requeued like a second streamed scope.
+      if (deps.streamSlot?.used || (deps.streamDeadline && deps.streamDeadline.at - (deps.streamDeadline.now ?? Date.now)() < STREAM_MIN_START_MS))
         return { manifests: s3.manifests, rows: 0, inserted: 0, deleted: 0, complete: false, deferred: true, reasons: ["stream_deferred"] };
       if (deps.streamSlot) deps.streamSlot.used = true;
       if (deps.staged && deps.adapter) {
@@ -758,7 +941,7 @@ async function indexSearchScopeBase(scope: SessionScope, deps: SearchIndexDeps, 
       }
       // Never with a facts store: the in-transaction streamed reconcile builds no facts.
       if (deps.outputFactsStore) throw new Error("search index: the streamed reconcile cannot carry output facts");
-      return streamedReconcile(tx, io, scope, deps, deps.stream, limits, pointerSnapshot, s3.admitted, s3.revision, version, fromMs, at);
+      return settle(await streamedReconcile(tx, io, scope, deps, deps.stream, limits, pointerSnapshot, s3.admitted, s3.revision, version, fromMs, at));
     }
     if(!siblingKeys.length||!s3.complete||s3.directorySessionId!==pointerSnapshot.canonicalId||s3.events===null){
       await invalidateDirectoryEvents(tx,scope);
@@ -775,7 +958,7 @@ async function indexSearchScopeBase(scope: SessionScope, deps: SearchIndexDeps, 
         const prior = await pgFacts.previousState(fScope);
         await pgFacts.recordState(fScope, { complete: false, at, range: prior.range, sourceVersion: Number(pointerSnapshot.epoch) });
       }
-      return {manifests:s3.manifests,rows:0,inserted:0,deleted:0,complete:false,...(s3.partial?{partial:true}:{}),reasons:s3.reasons.length?s3.reasons:["canonical_metadata_incomplete"]};
+      return settle({manifests:s3.manifests,rows:0,inserted:0,deleted:0,complete:false,...(s3.partial?{partial:true}:{}),reasons:s3.reasons.length?s3.reasons:["canonical_metadata_incomplete"],...(s3.contenderSeats!==undefined?{contenderSeats:s3.contenderSeats}:{})});
     }
     const inWindow = s3.rows.filter((r) => tsMillis(`${r.ts.replace(" ", "T")}Z`) >= fromMs);
     // Staged: keyset pages up to the keyed-records cap (never below SEARCH_INDEX_MAX_ROWS).
@@ -895,7 +1078,7 @@ async function indexSearchScopeBase(scope: SessionScope, deps: SearchIndexDeps, 
     }
     // Only a complete pass makes the session current; any other leaves it owing one.
     await io.record(scope, s3.revision, inWindow.length, complete, at, pointerSnapshot.canonicalId);
-    return {
+    return settle({
       manifests: s3.manifests,
       rows: inWindow.length,
       inserted,
@@ -903,7 +1086,7 @@ async function indexSearchScopeBase(scope: SessionScope, deps: SearchIndexDeps, 
       complete,
       reasons: [...s3.reasons, ...(truncated ? [stagedScan ? STREAM_KEYED_RECORDS_CAP : deps.adapter ? "search_index_truncated" : "clickhouse_truncated"] : []), ...(staleWrite ? ["search_version_conflict"] : [])],
       ...(outputFacts ? { outputFacts } : {}),
-    };
+    });
     });
   } finally {
     if (deps.metrics) {
@@ -912,8 +1095,158 @@ async function indexSearchScopeBase(scope: SessionScope, deps: SearchIndexDeps, 
       deps.metrics.lockedApplyMs += Math.max(0, Date.now() - lockedStarted - source - scan);
     }
   }
+  // Committed: now the completing state rows, fenced under the locks against everything but this pass's marker.
+  if (hostedState) await hostedState.finalize();
   return handoff ? stagedSearchScope(scope, deps, limits, handoff) : first;
 }
+
+/**
+ * A hosted pass's state rows (search_ingest_session_state, every key recordState writes: the scope's session id and
+ * its canonical id). Ordering and ownership are per scope and monotonic, never wall time across invocations:
+ *  - the marker (`premark`, under the pass's scope and canonical locks, before any source read) is written at
+ *    M = max(the pass time - 1 ms, every key's latest synced_at + 2 ms), so it sorts above every earlier pass's rows
+ *    on every key, even within one millisecond or with clock skew, with needs_full = 1 and a random per-pass token
+ *    in scanned_rows. The 2 ms step leaves M + 1 to this pass alone: a later marker, computed from this pass's
+ *    marker or any of its rows, is at least M + 2 and so always sorts above this pass's completing rows;
+ *  - the pass's other incomplete rows are written at M + 1 (still owed);
+ *  - its completing rows (needs_full = 0) wait for COMMIT; `finalize` then takes the scope and canonical try-locks
+ *    in a transaction of its own (the same keys every pass takes first), reads every key's latest row, and writes
+ *    the completing rows at M + 1 only if each is exactly this pass's marker (time, needs_full = 1, token,
+ *    revision). A later pass needs those locks to write its own marker, so the check and the write are serialized
+ *    against it. A lock held by another pass, or a newer pass's valid marker: that pass owns the outcome, nothing is
+ *    cleared (completion_superseded). An empty, malformed or unreadable reply: nothing is cleared and the pass
+ *    fails retryably (search_completion_unrecorded), so SQS or M2 retries it. A rollback or an ambiguous COMMIT
+ *    error writes nothing either. In every such case the scope stays owed (the next pass is full).
+ */
+class HostedState {
+  private marker?: { ms: number; token: number; revision: number; canonicalId: string };
+  private pending?: { revision: number; rows: number; canonicalId: string };
+  constructor(private readonly deps: SearchIndexDeps, private readonly scope: SessionScope) {}
+
+  private keys(canonicalId: string): string[] {
+    return [...new Set([this.scope.sessionId, canonicalId])];
+  }
+
+  /**
+   * The latest state row of one key (the over-bound skip's statement), validated: exactly the four columns,
+   * synced_ms a finite integer, needs_full 0 or 1, scanned_rows and revision non-null non-negative integers (numbers or
+   * decimal strings, as ClickHouse's JSON renders UInt64). `none` without a row, `malformed` for anything else.
+   * Throws when the read fails.
+   */
+  private async latest(sessionId: string): Promise<StateRead> {
+    const rows = await this.deps.ch!.select<Record<string, unknown>>(
+      `SELECT revision, needs_full, scanned_rows, toUnixTimestamp64Milli(synced_at) AS synced_ms
+         FROM ${SESSION_STATE_TABLE}
+        WHERE org_id = {org:String} AND session_id = {session:String}
+        ORDER BY synced_at DESC
+        LIMIT 1`,
+      { params: { org: this.scope.orgId, session: sessionId }, timeoutMs: 5_000 },
+    );
+    if (!Array.isArray(rows)) return { kind: "malformed" };
+    const row = rows[0];
+    if (row === undefined) return { kind: "none" };
+    return validStateRow(row);
+  }
+
+  /** Under the pass's locks, before any source read: the owed marker on every key. Throws when the state is unreadable. */
+  async premark(io: SearchProjectionIo, revision: number, at: Date, canonicalId: string): Promise<void> {
+    let ms = at.getTime() - 1;
+    for (const key of this.keys(canonicalId)) {
+      const found = await this.latest(key);
+      if (found.kind === "malformed") throw new PipelineError("search_state_unreadable", "the session state's latest row is malformed", true);
+      if (found.kind === "row") ms = Math.max(ms, found.ms + 2);
+    }
+    const token = 1 + randomInt(2_147_483_646);
+    // Written before `marker` is set, so the wrapped io keeps the marker's own time (M, not M + 1).
+    this.marker = undefined;
+    await io.record(this.scope, revision, token, false, new Date(ms), canonicalId);
+    this.marker = { ms, token, revision, canonicalId };
+  }
+
+  io(inner: SearchProjectionIo): SearchProjectionIo {
+    return {
+      ...inner,
+      record: async (scope, revision, rows, complete, at, canonicalId) => {
+        // Before the marker (none of the hosted paths writes one there): the pass's own time, as before.
+        if (!this.marker) return complete ? void (this.pending = { revision, rows, canonicalId: canonicalId ?? scope.sessionId }) : inner.record(scope, revision, rows, complete, at, canonicalId);
+        if (!complete) return inner.record(scope, revision, rows, complete, new Date(this.marker.ms + 1), canonicalId);
+        this.pending = { revision, rows, canonicalId: canonicalId ?? scope.sessionId };
+      },
+    };
+  }
+
+  /** After COMMIT: the completing rows, serialized under the locks and only over this pass's verified marker. */
+  async finalize(): Promise<void> {
+    const pending = this.pending;
+    const marker = this.marker;
+    if (!pending) return;
+    const skip = (reason: string, error?: unknown) =>
+      log.warn("search index completion not recorded", { stage: "search-index", org_id: this.scope.orgId, session_id: this.scope.sessionId, reason, ...(error ? errorFields(error) : {}) });
+    if (!marker || marker.canonicalId !== pending.canonicalId) return skip("completion_unmarked");
+    let anomaly: string | undefined;
+    let cause: unknown;
+    try {
+      await this.deps.transact(async (tx) => {
+        // Lock contention certifies nothing (the holder may roll back without writing): retry, the scope stays owed.
+        const scopeLock = await tx.query<{ ok: boolean }>("SELECT pg_try_advisory_xact_lock(hashtextextended($1, 0)) AS ok", [scopeLockKey(this.scope, "search")]);
+        if (scopeLock.rows[0]?.ok !== true) { anomaly = "completion_lock_contended"; return; }
+        const canonicalLock = await tx.query<{ ok: boolean }>("SELECT pg_try_advisory_xact_lock(hashtextextended($1,0)) AS ok",
+          [["96bulls:directory-events", this.scope.orgId, this.scope.workspaceId, this.scope.harness, marker.canonicalId].join("\u001f")]);
+        if (canonicalLock.rows[0]?.ok !== true) { anomaly = "completion_lock_contended"; return; }
+        // Every key is read and validated before any decision.
+        const found: StateRead[] = [];
+        for (const key of this.keys(marker.canonicalId)) found.push(await this.latest(key));
+        if (found.some((f) => f.kind === "none")) { anomaly = "completion_marker_missing"; return; }
+        if (found.some((f) => f.kind === "malformed")) { anomaly = "completion_marker_malformed"; return; }
+        const rows = found as Array<Extract<StateRead, { kind: "row" }>>;
+        const ours = (f: Extract<StateRead, { kind: "row" }>) =>
+          f.ms === marker.ms && f.needsFull === 1 && f.scanned === marker.token && f.revision === String(marker.revision);
+        if (!rows.every(ours)) {
+          // Superseded only when every key shows the same valid successor row, later than this pass's marker.
+          const [first] = rows;
+          const same = (f: Extract<StateRead, { kind: "row" }>) =>
+            f.ms === first!.ms && f.needsFull === first!.needsFull && f.scanned === first!.scanned && f.revision === first!.revision;
+          if (rows.every((f) => f.ms > marker.ms && same(f))) return skip("completion_superseded");
+          anomaly = rows.some((f) => f.ms > marker.ms) ? "completion_successor_divergent" : "completion_marker_foreign";
+          return;
+        }
+        await recordState(this.deps.ch!, this.scope, pending.revision, pending.rows, true, new Date(marker.ms + 1), marker.canonicalId);
+        if (this.deps.metrics) { this.deps.metrics.writeCalls += 1; this.deps.metrics.writeBatches += 1; }
+      });
+    } catch (error) {
+      anomaly = "completion_fence_unreadable";
+      cause = error;
+    }
+    if (anomaly) {
+      // Observable to SQS and M2: the pass fails retryably (the message is redelivered, the job retried); the scope
+      // stays owed, so the retry is a full pass.
+      skip(anomaly, cause);
+      throw new PipelineError(SEARCH_COMPLETION_UNRECORDED, `the completing state was not recorded (${anomaly})`, true);
+    }
+  }
+}
+
+/** One key's latest session state row as the fence sees it. */
+type StateRead = { kind: "none" } | { kind: "malformed" } | { kind: "row"; ms: number; needsFull: 0 | 1; scanned: number; revision: string };
+
+const STATE_ROW_COLUMNS = ["needs_full", "revision", "scanned_rows", "synced_ms"];
+/** A non-negative safe integer from a number or a decimal string, else undefined (null, booleans, text, fractions). */
+function wholeNumber(v: unknown): number | undefined {
+  const n = typeof v === "number" ? v : typeof v === "string" && /^[0-9]{1,20}$/.test(v) ? Number(v) : NaN;
+  return Number.isSafeInteger(n) && n >= 0 ? n : undefined;
+}
+/** Validate one raw state row: exactly the fence's columns, each in its domain. */
+export function validStateRow(row: unknown): StateRead {
+  if (typeof row !== "object" || row === null || Array.isArray(row)) return { kind: "malformed" };
+  const r = row as Record<string, unknown>;
+  if (Object.keys(r).sort().join(",") !== STATE_ROW_COLUMNS.join(",")) return { kind: "malformed" };
+  const ms = wholeNumber(r.synced_ms), needs = wholeNumber(r.needs_full), scanned = wholeNumber(r.scanned_rows), revision = wholeNumber(r.revision);
+  if (ms === undefined || scanned === undefined || revision === undefined || (needs !== 0 && needs !== 1)) return { kind: "malformed" };
+  return { kind: "row", ms, needsFull: needs, scanned, revision: String(revision) };
+}
+
+/** A hosted pass committed but its completing state could not be verified and written: retried, the scope owed. */
+export const SEARCH_COMPLETION_UNRECORDED = "search_completion_unrecorded";
 
 /** What the index transaction hands a staged run: the admitted read and the source stamp it saw. */
 interface StagedHandoff {
@@ -1375,6 +1708,260 @@ export async function alreadyCurrent(
   return outputFactsComplete(factsCh, { orgId: scope.orgId, workspaceId: scope.workspaceId, harness: scope.harness, sessionId: snapshot.canonicalId });
 }
 
+/**
+ * Where the SEARCH_INDEX_SKIP_* flags apply: the S3-event pass on the hosted legacy ClickHouse path. Never
+ * the managed search-jobs pass (`committedGuard`, set only by search-jobs.ts runSearchJob, so M2's
+ * held/ready/unchanged decisions and reads stay exactly as without the flags), the staged reconcile (no
+ * four-times stream refusal), a portable adapter (the stamp lives in ClickHouse) or either output facts
+ * store (their state is rewritten by every pass). Elsewhere a flag is accepted and does nothing.
+ */
+function inlineSkipsApply(deps: SearchIndexDeps): boolean {
+  return !!deps.ch && !deps.adapter && !deps.staged && !deps.outputFacts && !deps.outputFactsStore && deps.committedGuard !== true;
+}
+
+/** A live sibling pointer row's read-determining facts (a SEARCH_INDEX_SKIP_* flag on only). `raw_bytes` feeds only the over-bound skip. */
+export interface SiblingPointerFacts {
+  manifest_key: string;
+  session_id: string;
+  machine_id: string;
+  revision: string;
+  content_sha256: string | null;
+  manifest_etag: string | null;
+  scrubbed: boolean;
+  raw_bytes: string;
+}
+
+/**
+ * The canonical sibling listing of indexSearchScopeBase with each row's facts, in one statement: the same
+ * filter and the same order, so the keys and their order are exactly the flag-off listing's.
+ */
+async function siblingPointerFacts(tx: SqlExecutor, scope: SessionScope, canonicalId: string): Promise<SiblingPointerFacts[]> {
+  const { rows } = await tx.query<SiblingPointerFacts>(
+    `SELECT manifest_key, session_id, machine_id, revision::text AS revision, encode(content_sha256, 'hex') AS content_sha256,
+            manifest_etag, scrubbed, raw_bytes::text AS raw_bytes
+       FROM sessions.session_index
+      WHERE org_id=$1 AND workspace_id=$2 AND harness=$3 AND coalesce(canonical_session_id,session_id)=$4 AND deleted_at IS NULL
+      ORDER BY session_id,machine_id`,
+    [scope.orgId, scope.workspaceId, scope.harness, canonicalId],
+  );
+  return rows;
+}
+
+/**
+ * SEARCH_INDEX_SKIP_OVER_BOUND_ENABLED=true only. Whether this pass may repeat the size refusal without reading a
+ * manifest. All three must hold, else the normal pass runs:
+ *
+ * 1. Pointer facts (this transaction, the listing the read would use): the summed `raw_bytes` of the live,
+ *    scrubbed sibling pointers is over `limits.maxScopeBytes`. `raw_bytes` is a lower bound of the bytes
+ *    readCanonicalScope sizes for the same manifest: the pointer stage writes `raw.raw_bytes`, the manifest
+ *    validator refuses a manifest whose `raw.raw_bytes` is not the sum of `chunks[].bytes`, and the read sizes
+ *    each chunk as max(bytes, stored_raw_bytes ?? 0). `scrubbed` is true only for a manifest carrying
+ *    `raw.scrub`, the one the read admits.
+ * 2. Stream guard: with `deps.stream`, that lower bound times STREAM_PASSES is over the stream byte budget too,
+ *    so the streamed path could not take the scope.
+ * 3. Stored state: the scope's latest `search_ingest_session_state` row has needs_full = 1, scanned_rows = 0,
+ *    the highest live sibling revision, and was written less than SKIP_STATE_MAX_AGE_MS from this pass's time.
+ *    One bounded read, made only after 1 and 2 hold; a failed or empty read runs the normal pass.
+ *
+ * Known gap (as on the backport): a live scrubbed row the read would still refuse (a key mismatch, or a scrub
+ * ruleset above READER_MAX_RULESET) counts toward 1; the normal pass for such a scope is incomplete too and,
+ * like the skip, indexes nothing.
+ */
+async function overBoundBeforeRead(
+  ch: ClickHouseClient,
+  scope: SessionScope,
+  deps: SearchIndexDeps,
+  limits: SearchIndexLimits,
+  facts: readonly SiblingPointerFacts[],
+  at: Date,
+): Promise<boolean> {
+  if (facts.length === 0) return false;
+  const lowerBound = facts.reduce((n, f) => n + (f.scrubbed ? Number(f.raw_bytes) : 0), 0);
+  const maxRevision = facts.reduce((m, f) => (BigInt(f.revision) > m ? BigInt(f.revision) : m), BigInt(facts[0]!.revision));
+  // 1. Over the whole-read bound from pointer facts alone.
+  if (!(lowerBound > limits.maxScopeBytes)) return false;
+  // 2. A scope the streamed path could take is never skipped.
+  if (deps.stream && !(lowerBound * STREAM_PASSES > deps.stream.maxReadBytes)) return false;
+  // 3. The refusal at this revision is already recorded, and recently.
+  let state: { revision: unknown; needs_full: unknown; scanned_rows: unknown; synced_ms: unknown }[];
+  try {
+    state = await ch.select(
+      `SELECT revision, needs_full, scanned_rows, toUnixTimestamp64Milli(synced_at) AS synced_ms
+         FROM ${SESSION_STATE_TABLE}
+        WHERE org_id = {org:String} AND session_id = {session:String}
+        ORDER BY synced_at DESC
+        LIMIT 1`,
+      { params: { org: scope.orgId, session: scope.sessionId }, timeoutMs: 5_000 },
+    );
+  } catch {
+    return false;
+  }
+  const latest = state[0];
+  const age = latest === undefined ? NaN : Math.abs(at.getTime() - Number(latest.synced_ms));
+  return (
+    latest !== undefined &&
+    Number.isFinite(age) &&
+    age < SKIP_STATE_MAX_AGE_MS &&
+    Number(latest.needs_full) === 1 &&
+    Number(latest.scanned_rows) === 0 &&
+    String(latest.revision) === maxRevision.toString()
+  );
+}
+
+/** What one manifest read returned (the acceptance stamp's read-as-listed check). */
+interface ManifestObservation {
+  revision: string;
+  contentSha256: string;
+  etag: string | null;
+}
+
+/** `reader` that records what each read returned; the reads themselves are unchanged. */
+function observingReader(reader: ManifestReader, observed: Map<string, ManifestObservation>): ManifestReader {
+  return {
+    provider: reader.provider,
+    ...(reader.bucket !== undefined ? { bucket: reader.bucket } : {}),
+    async read(key) {
+      const read = await reader.read(key);
+      if (read) observed.set(key, { revision: String(read.manifest.revision), contentSha256: String(read.manifest.raw?.content_sha256 ?? ""), etag: read.etag ?? null });
+      return read;
+    },
+  };
+}
+
+/** The `search_ingest_state` name of a scope's acceptance stamp (ids hashed: fixed length, no separators). */
+export function acceptanceStampName(scope: SessionScope): string {
+  return ACCEPTANCE_STAMP_PREFIX + createHash("sha256").update(JSON.stringify([scope.orgId, scope.workspaceId, scope.harness, scope.sessionId])).digest("hex");
+}
+
+/**
+ * The digest an acceptance stamp is written and matched under: sha256 over the salt, the scope, its
+ * canonical id and directory epoch (the pointer trigger moves it on any pointer change of the scope or its
+ * canonical id), the window (the stored window_start, or the rolling default's marker), the read limits
+ * that decide whole versus streamed versus refused, the reader's scrub ruleset bound, and every live
+ * sibling pointer row's (key, session, machine, revision, content sha256, etag, scrubbed), sorted. Only
+ * pointer rows and settings enter it: nothing read from the object store or ClickHouse events.
+ */
+export function acceptanceDigest(
+  scope: SessionScope,
+  snapshot: { canonicalId: string; epoch: string },
+  pointers: readonly SiblingPointerFacts[],
+  windowMarker: string,
+  limits: Pick<SearchIndexLimits, "maxScopeBytes" | "maxScopeEvents">,
+  stream: StreamReadLimits | undefined,
+  readerMaxRuleset: number | undefined,
+): string {
+  const rows = pointers
+    .map((p) => JSON.stringify([p.manifest_key, p.session_id, p.machine_id, p.revision, p.content_sha256, p.manifest_etag, p.scrubbed]))
+    .sort();
+  return createHash("sha256")
+    .update(
+      JSON.stringify([
+        ACCEPTANCE_SKIP_VERSION,
+        [scope.orgId, scope.workspaceId, scope.harness, scope.sessionId],
+        [snapshot.canonicalId, snapshot.epoch],
+        windowMarker,
+        [limits.maxScopeBytes, limits.maxScopeEvents],
+        stream ? [stream.maxReadBytes, stream.maxReadEvents] : null,
+        readerMaxRuleset ?? null,
+        rows,
+      ]),
+    )
+    .digest("hex");
+}
+
+/** A stamp read: `none` (no row, or a cleared one), `live` (a row with a value), `failed` (unknown). */
+type StampRead = { state: "none" } | { state: "failed" } | { state: "live"; value: string; atMs: number };
+
+/** The scope's latest stamp row. One bounded read; any failure is `failed`, never a match. */
+async function readAcceptanceStamp(ch: ClickHouseClient, name: string): Promise<StampRead> {
+  try {
+    const rows = await ch.select<{ value: unknown; at_ms: unknown }>(
+      `SELECT value, toUnixTimestamp64Milli(updated_at) AS at_ms
+         FROM ${INGEST_STATE_TABLE}
+        WHERE name = {name:String}
+        ORDER BY updated_at DESC
+        LIMIT 1`,
+      { params: { name }, timeoutMs: 5_000 },
+    );
+    const row = rows[0];
+    if (row === undefined || row.value === "") return { state: "none" };
+    return { state: "live", value: typeof row.value === "string" ? row.value : "", atMs: Number(row.at_ms) };
+  } catch {
+    return { state: "failed" };
+  }
+}
+
+/** Whether a stamp licenses a skip: our format and reason, this digest, written within the age bound. */
+function acceptanceStampMatches(stamp: StampRead, digest: string, at: Date): boolean {
+  if (stamp.state !== "live") return false;
+  const age = Math.abs(at.getTime() - stamp.atMs);
+  if (!Number.isFinite(age) || !(age < SKIP_STATE_MAX_AGE_MS)) return false;
+  let value: unknown;
+  try {
+    value = JSON.parse(stamp.value);
+  } catch {
+    return false;
+  }
+  if (typeof value !== "object" || value === null) return false;
+  const v = value as Record<string, unknown>;
+  return v.v === 1 && v.reason === ACCEPTANCE_MISSING && typeof v.digest === "string" && v.digest === digest;
+}
+
+/** The pass ended incomplete for the acceptance refusal alone, from a full pass (not busy, deferred, partial or skipped). */
+function acceptanceOnly(result: SearchIndexResult): boolean {
+  return (
+    result.complete === false && !result.busy && !result.deferred && !result.partial && !result.skipped && !result.skippedBeforeRead &&
+    result.reasons.length === 1 && result.reasons[0] === ACCEPTANCE_MISSING
+  );
+}
+
+/** Every pointer row was read as listed: the manifest at the pointer's revision, content sha256 and etag. */
+function readAsListed(pointers: readonly SiblingPointerFacts[], observed: ReadonlyMap<string, ManifestObservation>): boolean {
+  return pointers.every((p) => {
+    const o = observed.get(p.manifest_key);
+    return (
+      o !== undefined && o.revision === p.revision && p.content_sha256 !== null &&
+      o.contentSha256.toLowerCase() === p.content_sha256.toLowerCase() && o.etag === p.manifest_etag
+    );
+  });
+}
+
+/**
+ * After a pass with the flag on: stamp an acceptance-only outcome read as listed, else clear a stamp that
+ * was there (or could not be read). Best effort: a failure is logged by code and the pass's result stands.
+ */
+async function settleAcceptanceStamp(
+  ch: ClickHouseClient,
+  scope: SessionScope,
+  name: string,
+  stamp: StampRead,
+  stampDigest: string | null,
+  at: Date,
+): Promise<void> {
+  try {
+    if (stampDigest !== null)
+      await ch.insert(
+        INGEST_STATE_TABLE,
+        [{ name, value: JSON.stringify({ v: 1, reason: ACCEPTANCE_MISSING, digest: stampDigest }), updated_at: chNow(at) }],
+        { timeoutMs: 5_000 },
+      );
+    else if (stamp.state !== "none") {
+      // The read takes the newest updated_at, so the tombstone must sort above the stamp it clears even
+      // when the clock that wrote the stamp ran ahead of this one (equal times never tie either).
+      const clearAt = stamp.state === "live" && Number.isFinite(stamp.atMs) ? new Date(Math.max(at.getTime(), stamp.atMs + 1)) : at;
+      await ch.insert(INGEST_STATE_TABLE, [{ name, value: "", updated_at: chNow(clearAt) }], { timeoutMs: 5_000 });
+    }
+  } catch (error) {
+    log.warn("search index acceptance stamp not written", {
+      stage: "search-index",
+      org_id: scope.orgId,
+      session_id: scope.sessionId,
+      reason: stampDigest !== null ? "acceptance_stamp_write_failed" : "acceptance_stamp_clear_failed",
+      ...errorFields(error),
+    });
+  }
+}
+
 /** The streaming reader's keepalive interval: a third of the consumer pool's 60 s idle timeout. */
 const STREAM_KEEPALIVE_MS = 20_000;
 
@@ -1404,11 +1991,39 @@ async function streamedReconcile(
   // well inside that, at most every STREAM_KEEPALIVE_MS, or now when `force`d.
   const everyMs = deps.streamKeepaliveMs ?? STREAM_KEEPALIVE_MS;
   let pinged = Number.NEGATIVE_INFINITY;
+  const hosted = hostedStream(deps);
   const keepalive = async (force = false): Promise<void> => {
     if (!force && Date.now() - pinged < everyMs) return;
+    if (hosted) {
+      // Hosted (the backport's keepalive): re-take the lock this transaction already holds (re-entrant, so the
+      // answer must be true). Anything else means it is not the transaction the pass started in: stop, with no
+      // further write and no finalization (the message fails for redelivery; the pre-mark below owes a pass).
+      pinged = Date.now();
+      // Continuity, not re-acquisition: the scope's advisory lock must already be granted to this backend (the
+      // transaction that took it at the pass's start; an xact lock ends with its transaction). A try-lock could take
+      // a lock that had become free, which proves nothing.
+      const { rows } = await tx.query<{ ok: boolean }>(STREAM_LOCK_HELD_SQL, [scopeLockKey(scope, "search")]);
+      if (rows[0]?.ok !== true) throw new PipelineError(STREAM_KEEPALIVE_FAILED, "the streamed reconcile's keepalive did not hold the scope lock", true);
+      return;
+    }
     await tx.query("SELECT 1 AS stream_keepalive");
     pinged = Date.now();
   };
+  if (hosted) {
+    // The owed marker was written before the pass's first read (indexSearchScopeBase).
+    try {
+      return await streamedReconcileBody();
+    } catch (error) {
+      // Anything but a budget stop (a retryable read, the keepalive, ClickHouse) fails the message for redelivery;
+      // what was inserted stays and the session is left owing a full pass. Best effort: the consumer sees the
+      // original error.
+      await io.record(scope, revision, 0, false, at, pointerSnapshot.canonicalId).catch(() => {});
+      throw error;
+    }
+  }
+  return streamedReconcileBody();
+
+  async function streamedReconcileBody(): Promise<SearchIndexResult> {
   const read = await streamCanonicalScope(
     scope, admitted,
     {
@@ -1423,10 +2038,10 @@ async function streamedReconcile(
     budget, version, fromMs,
   );
   const stream = () => ({ passes: read.meter.passes, chunks: read.meter.chunks, bytes: read.meter.bytes, events: read.meter.events });
-  const owing = async (reasons: string[], partial: boolean, inserted = 0): Promise<SearchIndexResult> => {
+  const owing = async (reasons: string[], partial: boolean, inserted = 0, deleted = 0): Promise<SearchIndexResult> => {
     await invalidateDirectoryEvents(tx, scope);
     await io.record(scope, revision, 0, false, at, pointerSnapshot.canonicalId);
-    return { manifests: read.manifests, rows: 0, inserted, deleted: 0, complete: false, ...(partial ? { partial: true } : {}), reasons, stream: stream() };
+    return { manifests: read.manifests, rows: 0, inserted, deleted, complete: false, ...(partial ? { partial: true } : {}), reasons, stream: stream(), ...streamedSeats(reasons) };
   };
   if (!read.complete || read.directorySessionId !== pointerSnapshot.canonicalId || read.events === null)
     return owing(read.reasons.length ? read.reasons : ["canonical_metadata_incomplete"], read.partial);
@@ -1460,6 +2075,8 @@ async function streamedReconcile(
     await keepalive(true);
   } catch (error) {
     if (error instanceof StreamBudgetError) return owing(["scope_too_large", error.budget], true);
+    // An untrusted keyset scan (the backport's clickhouse_page_invalid stop): nothing written, the pass is owed.
+    if (error instanceof PipelineError && error.code === SCAN_PAGE_INVALID) return owing([SCAN_PAGE_INVALID], false);
     throw error;
   }
   if (deps.staged && io.scanPages && scan.truncated) return owing(["scope_too_large", STREAM_KEYED_RECORDS_CAP], true);
@@ -1512,6 +2129,32 @@ async function streamedReconcile(
           deletes.push(c);
       }
     }
+    // Hosted: before the tail and every later delete batch, the deadline with STREAM_TAIL_RESERVE_MS, and the
+    // lock before every batch (unthrottled). A stop between batches keeps what was deleted (rows the source no
+    // longer has) and owes a pass for the rest; a stop before the first batch also skips the directory write.
+    const tailReserved = () => hosted && !!deadline && deadline.at - (deadline.now ?? Date.now)() < STREAM_TAIL_RESERVE_MS;
+    if (tailReserved()) return owing(["scope_too_large", STREAM_DEADLINE], true, inserted);
+    if (hosted) {
+      // Hosted: deletes go in chunks that each fit one DELETE statement of deleteRows (at most STREAM_DELETE_BATCH
+      // keys and, by an upper-bound estimate, within its byte budget), and every chunk, so every statement, is
+      // preceded by the tail reserve check (after the first) and an unthrottled lock check.
+      const chunks = deleteStatementChunks(scope, deletes);
+      if (chunks === null) return owing([STREAM_DELETE_KEY_TOO_LARGE], false, inserted);
+      for (const [n, chunk] of chunks.entries()) {
+        if (n > 0 && tailReserved()) return owing(["scope_too_large", STREAM_DEADLINE], true, inserted, deletedCount);
+        await keepalive(true);
+        // Again after the lock check (it can itself take time), immediately before the statement.
+        if (tailReserved()) return owing(["scope_too_large", STREAM_DEADLINE], true, inserted, deletedCount);
+        deletedCount += await io.remove(scope, chunk);
+      }
+      // After the last delete and before the directory and catalog writes: the reserve and the lock again, and the
+      // reserve once more after that lock check (it can itself take time).
+      if (chunks.length > 0) {
+        if (tailReserved()) return owing(["scope_too_large", STREAM_DEADLINE], true, inserted, deletedCount);
+        await keepalive(true);
+        if (tailReserved()) return owing(["scope_too_large", STREAM_DEADLINE], true, inserted, deletedCount);
+      }
+    } else
     // In insert-sized batches, keeping the transaction busy between them.
     for (let i = 0; i < deletes.length; i += limits.insertBatch) {
       await keepalive();
@@ -1535,7 +2178,9 @@ async function streamedReconcile(
     complete,
     reasons: [...read.reasons, ...reasons, ...(truncated ? ["search_index_truncated"] : []), ...(staleWrite ? ["search_version_conflict"] : [])],
     stream: stream(),
+    ...streamedSeats(read.reasons),
   };
+  }
 }
 
 /**
@@ -1997,6 +2642,22 @@ export async function clickhouseScopePage(
   }));
 }
 
+/** A keyset page that is over its LIMIT, out of order, or does not advance past the previous page. */
+export const SCAN_PAGE_INVALID = "clickhouse_page_invalid";
+
+/** The keyset order of clickhouseScopePage: (ts, session_id, machine_id, kind, event_id), strings as UTF-8 bytes. */
+export function compareScopePageKey(
+  a: Pick<ScopeIdentity, "tsMs" | "sessionId" | "machineId" | "kind" | "eventId">,
+  b: Pick<ScopeIdentity, "tsMs" | "sessionId" | "machineId" | "kind" | "eventId">,
+): number {
+  if (a.tsMs !== b.tsMs) return a.tsMs < b.tsMs ? -1 : 1;
+  for (const [x, y] of [[a.sessionId, b.sessionId], [a.machineId, b.machineId], [a.kind, b.kind], [a.eventId, b.eventId]] as const) {
+    const c = Buffer.compare(Buffer.from(x, "utf8"), Buffer.from(y, "utf8"));
+    if (c !== 0) return c;
+  }
+  return 0;
+}
+
 /** Preserve the existing SQL, retention and state behavior for an unselected
  * legacy deployment. Portable adapters never implement a fake SQL client. */
 export function legacyProjectionIo(ch: ClickHouseClient): LegacyProjectionIo {
@@ -2010,10 +2671,18 @@ export function legacyProjectionIo(ch: ClickHouseClient): LegacyProjectionIo {
         if (after) await between();
         const want = Math.min(pageSize, maxRows + 1 - rows.length);
         const page = await clickhouseScopePage(ch, scope, canonicalId, fromMs, want, after);
-        for (const r of page) rows.push(r);
+        // The backport lineage's page checks (6264d119 / 51f876b6), before anything is projected or written: at
+        // most the rows asked for, in strictly increasing keyset order (ts, session_id, machine_id, kind,
+        // event_id; strings as UTF-8 bytes, as ClickHouse compares them), and after the previous page's last key.
+        // Otherwise the scan is not trusted (SCAN_PAGE_INVALID).
+        if (page.length > want) throw new PipelineError(SCAN_PAGE_INVALID, "a keyset page returned more rows than asked", false);
+        for (const r of page) {
+          if (after && compareScopePageKey(after, r) >= 0) throw new PipelineError(SCAN_PAGE_INVALID, "a keyset page is out of order or does not advance", false);
+          after = r;
+          rows.push(r);
+        }
         if (rows.length > maxRows) return { rows, truncated: true };
         if (page.length < want) return { rows, truncated: false };
-        after = page[page.length - 1];
       }
     },
     async fromMs(at) { return Date.parse(await windowStart(ch, at)); },

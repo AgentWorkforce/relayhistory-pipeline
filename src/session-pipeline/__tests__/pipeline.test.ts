@@ -187,6 +187,12 @@ function fakeClickHouse() {
     async select<T>(query: string, options?: { params?: Record<string, unknown> }) {
       if (query.includes("search_ingest_state")) return [] as T[];
       const p = options!.params!;
+      // The latest session state row of one key (the hosted pass's marker and completion fence).
+      if (query.includes("search_ingest_session_state")) {
+        const ms = (v: unknown) => Date.parse(`${String(v).replace(" ", "T")}Z`);
+        const rows = (state as Array<Record<string, unknown>>).filter((r) => r.org_id === p.org && r.session_id === p.session).sort((a, b) => ms(b.synced_at) - ms(a.synced_at));
+        return (rows[0] ? [{ revision: String(rows[0].revision), needs_full: rows[0].needs_full, scanned_rows: rows[0].scanned_rows, synced_ms: ms(rows[0].synced_at) }] : []) as T[];
+      }
       return final()
         .filter((r) => r.org_id === p.org && (r.session_id === p.session || r.session_id === p.canonical) && r.workspace_id === p.workspace && r.source === p.source && tsMs(r) >= Number(p.from))
         .slice(0, Number(p.limit))
@@ -886,7 +892,7 @@ describe("streamed reconcile on the Lambda: one streamed scope per invocation, w
     const tx: SqlExecutor = {
       async query<R>(text: string, params: unknown[] = []) {
         if (text.includes("pg_catalog.pg_attribute") && text.includes("recorded_catalog_title")) return { rows: [{ supported: false }] as R[] };
-        if (text.includes("pg_try_advisory_xact_lock")) return { rows: [{ ok: true }] as R[] };
+        if (text.includes("pg_try_advisory_xact_lock") || text.includes("pg_catalog.pg_locks")) return { rows: [{ ok: true }] as R[] };
         if (text.includes("event_projection_sources")) return { rows: [{ written: true }] as R[] };
         const session = String(params[3]);
         if (text.includes("FROM sessions.session_index") && text.includes("deleted_at IS NULL"))
@@ -921,28 +927,32 @@ describe("streamed reconcile on the Lambda: one streamed scope per invocation, w
     expect(l.reads()).toBe(1); // the context's remaining time is read once per invocation
     expect(l.requeued).toEqual([l.keys.sess_2]);
     expect(l.indexed()).toEqual(["sess_1", "sess_3"]); // sess_1 only by streaming: its whole read is refused
-    expect(l.ch.state.map((s) => [s.session_id, s.needs_full])).toEqual([["sess_1", 0], ["sess_3", 0]]); // sess_2: no state written
+    // Every hosted pass first records needs_full=1 before its first read (the backport's pre-mark), and its
+    // completing row only after COMMIT: sess_1 streams and completes; sess_2 is deferred and stays owed; sess_3's
+    // whole read completes.
+    expect(l.ch.state.map((s) => [s.session_id, s.needs_full])).toEqual([["sess_1", 1], ["sess_1", 0], ["sess_2", 1], ["sess_3", 1], ["sess_3", 0]]);
     // The redelivered event is the next invocation's one streamed scope.
     expect((await l.invoke(["sess_2"], l.context(300_000))).batchItemFailures).toEqual([]);
     expect(l.indexed()).toEqual(["sess_1", "sess_2", "sess_3"]);
     expect(l.requeued).toEqual([l.keys.sess_2]);
   }, 60_000);
 
-  test("the Lambda context's remaining time less the margin is the deadline; the slot is taken even when the deadline stops the stream", async () => {
+  test("the Lambda context's remaining time less the margin is the deadline; under STREAM_MIN_START_MS before it no stream starts", async () => {
     const l = await lambda();
-    // 30 s left, 60 s margin: the deadline has passed before the first chunk.
+    // 30 s left, 60 s margin: the deadline has passed, far under the 120 s start minimum (the backport lineage's
+    // 6264d119): neither scope starts streaming; both are deferred and requeued before any read or write.
     expect((await l.invoke(["sess_1", "sess_2"], l.context(30_000))).batchItemFailures).toEqual([]);
     expect(l.reads()).toBe(1);
     expect(l.indexed()).toEqual([]);
-    expect(l.ch.state.map((s) => [s.session_id, s.needs_full])).toEqual([["sess_1", 1]]);
-    expect(l.requeued).toEqual([l.keys.sess_2]);
+    expect(l.ch.state).toEqual([]);
+    expect(l.requeued).toEqual([l.keys.sess_1, l.keys.sess_2]);
   }, 60_000);
 
-  test("no Lambda context: no deadline and no per-invocation slot, so both scopes stream as before", async () => {
+  test("no Lambda context: no deadline, but still one streamed scope per invocation (the backport's bound)", async () => {
     const l = await lambda();
     expect((await l.invoke(["sess_1", "sess_2"])).batchItemFailures).toEqual([]);
-    expect(l.indexed()).toEqual(["sess_1", "sess_2"]);
-    expect(l.requeued).toEqual([]);
+    expect(l.indexed()).toEqual(["sess_1"]);
+    expect(l.requeued).toEqual([l.keys.sess_2]);
   }, 60_000);
 });
 

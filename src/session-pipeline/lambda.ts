@@ -81,15 +81,15 @@ import {
 import type { SqlExecutor } from "@rhc/lib/pipeline/queue.ts";
 import type { HoopDb } from "../shared/db.ts";
 import { errorFields, log } from "../shared/log.ts";
-import { awsJsonCall, invokeAsync, lambdaCredentials } from "./aws-json.ts";
+import { awsJsonCall, invokeAsync, lambdaCredentials, type AwsSessionCredentials } from "./aws-json.ts";
 import { createClickHouseClient } from "./vendor/search-index/clickhouse.ts";
-import { processBatch, type BatchResponse, type ConsumerDeps, type QueueRecord } from "./consumer.ts";
+import { processBatch, RETRY_VISIBILITY_TIMEOUT_MS, type BatchResponse, type ConsumerDeps, type QueueRecord } from "./consumer.ts";
 import { droppedFanout, scopeLockKey, type ScopeLock } from "./pointer.ts";
-import { searchIndexLimits, searchIndexStreamChFromEnv, type SearchIndexDeps, type SearchIndexStreamCh } from "./search-index.ts";
+import { STREAM_MIN_START_MS, searchIndexLimits, searchIndexStreamChFromEnv, type SearchIndexDeps, type SearchIndexStreamCh } from "./search-index.ts";
 import { claimSearchJobs, claimSearchProbe, runSearchJob, searchJobLogFields, searchSettlementFor, settleSearchJob, SEARCH_JOBS_DEFAULT_CLAIM, type ClaimedSearchJob, type SearchSql } from "./search-jobs.ts";
 import { BufferedFeedError, bufferedFeedConfig, bufferedFeedGateRefusal, bufferedFeedVersionRefusal, clickhouseTieLedger, runBufferedFeed, sqlBufferedFeedSource, type BufferedFeedConfig } from "./buffered-search-feed.ts";
 import { bufferedErasureConfig, runBufferedErasureDelete, type BufferedErasureConfig, type BufferedErasureDeps } from "./buffered-erasure-delete.ts";
-import { RECONCILE_BODY_KEY } from "./s3-events.ts";
+import { RECONCILE_BODY_KEY, requeueBody } from "./s3-events.ts";
 import { BUFFERED_FEED_CA_FIELD, BUFFERED_FEED_URL_FIELD, bufferedFeedClientConfig, loginCheckedFeedExecutor } from "./buffered-feed-login.ts";
 import { postgresConnectionString, postgresTlsOptions } from "../shared/postgres-tls.ts";
 import { composeSearchService, searchSecret, type SearchComposition } from "../shared/search-composition.ts";
@@ -156,6 +156,20 @@ export interface LambdaEnv {
   originLabelsEnabled?: boolean;
   /** SEARCH_INDEX_SKIP_CURRENT_ENABLED=true: skip a pass a complete pass already covers (search-index.ts alreadyCurrent). Default off. */
   skipCurrentEnabled?: boolean;
+  /**
+   * SEARCH_INDEX_SKIP_ACCEPTANCE_MISSING_ENABLED=true (default off; same grammar as on the backport lineage): a
+   * scope whose last S3-event pass ended incomplete for relayhistory_acceptance_missing alone, over the same
+   * pointer set, returns that outcome again before any manifest read (search-index.ts acceptance stamp). The
+   * managed search-jobs pass never skips. Absent: as before.
+   */
+  searchSkipAcceptanceMissing?: true;
+  /**
+   * SEARCH_INDEX_SKIP_OVER_BOUND_ENABLED=true (default off; same grammar as on the backport lineage): a scope whose
+   * stored pointer sizes and search state already show the size refusal at its current revision returns before
+   * any manifest read (search-index.ts overBoundBeforeRead). The managed search-jobs pass never skips. Absent: as
+   * before.
+   */
+  searchSkipOverBound?: true;
   /** SEARCH_INDEX_PREREAD_ENABLED=true: read a legacy ClickHouse whole scope before its search lock. Default off. */
   searchPreReadEnabled?: boolean;
   /** SESSION_POINTER_PREREAD_ENABLED=true: the pointer stage reads before its scope lock (pointer.ts indexPreRead). Default off. */
@@ -187,6 +201,14 @@ export interface LambdaEnv {
   searchJobs?: { claim: number };
   /** SEARCH_WAKE_ENQUEUE=1: the authority transaction writes the managed search-index wake. Absent (default): off. */
   searchWakeEnqueue?: true;
+  /**
+   * SESSION_PIPELINE_RETRY_VISIBILITY_S=<1..43200> (unset, "" or "0": off; 60 is the intended value; the backport
+   * lineage's grammar): a message whose pointer stage failed only with pointer_move_pending is redelivered after
+   * this many seconds instead of the queue's visibility timeout (consumer.ts retryVisibility). Needs
+   * sqs:ChangeMessageVisibility on the source queue for the Lambda role; without it the call fails, a warn is
+   * logged, and the message keeps the full timeout. Absent: as before.
+   */
+  retryVisibilityS?: number;
 }
 
 /**
@@ -242,6 +264,10 @@ export function lambdaEnv(env: NodeJS.ProcessEnv = process.env, composition?: Se
   if (searchStreamCh && selected.search !== "clickhouse")
     throw new Error("session pipeline: SEARCH_INDEX_STREAMING_CH=1 needs the clickhouse search backend");
   // The facts are built from a whole read; the streamed path never writes them.
+  // The backport's start minimum must be reachable: a fresh invocation (the function timeout) less the margin must
+  // leave STREAM_MIN_START_MS, or no stream could ever start.
+  if (searchStreamCh && searchStreamCh.deadlineMarginMs + STREAM_MIN_START_MS > LAMBDA_FUNCTION_TIMEOUT_MS)
+    throw new Error(`session pipeline: SEARCH_INDEX_STREAM_DEADLINE_MARGIN_MS must be at most ${LAMBDA_FUNCTION_TIMEOUT_MS - STREAM_MIN_START_MS} (the ${LAMBDA_FUNCTION_TIMEOUT_MS / 1000} s function timeout less the ${STREAM_MIN_START_MS / 1000} s stream start minimum)`);
   if (searchStreamCh && env.SEARCH_INDEX_OUTPUT_FACTS === "1")
     throw new Error("session pipeline: SEARCH_INDEX_STREAMING_CH=1 cannot be combined with SEARCH_INDEX_OUTPUT_FACTS=1");
   // SEARCH_INDEX_SKIP_CURRENT_ENABLED: strict grammar, default off; on needs the search stage.
@@ -252,6 +278,14 @@ export function lambdaEnv(env: NodeJS.ProcessEnv = process.env, composition?: Se
   const searchPreRead = searchIndexPreReadFromEnv(env);
   if (searchPreRead && env.SEARCH_INDEX_ENABLED !== "1")
     throw new Error("session pipeline: SEARCH_INDEX_PREREAD_ENABLED=true needs SEARCH_INDEX_ENABLED=1");
+  // SEARCH_INDEX_SKIP_ACCEPTANCE_MISSING_ENABLED: strict grammar, default off; on needs the search stage.
+  const skipAcceptanceMissing = searchIndexSkipAcceptanceMissingFromEnv(env);
+  if (skipAcceptanceMissing && env.SEARCH_INDEX_ENABLED !== "1")
+    throw new Error("session pipeline: SEARCH_INDEX_SKIP_ACCEPTANCE_MISSING_ENABLED=true needs SEARCH_INDEX_ENABLED=1");
+  // SEARCH_INDEX_SKIP_OVER_BOUND_ENABLED: strict grammar, default off; on needs the search stage.
+  const skipOverBound = searchIndexSkipOverBoundFromEnv(env);
+  if (skipOverBound && env.SEARCH_INDEX_ENABLED !== "1")
+    throw new Error("session pipeline: SEARCH_INDEX_SKIP_OVER_BOUND_ENABLED=true needs SEARCH_INDEX_ENABLED=1");
   // SESSION_POINTER_PREREAD_ENABLED: strict grammar, default off.
   const pointerPreRead = pointerPreReadFromEnv(env);
   // SESSION_POINTER_SKIP_ORIGIN_BUCKET_ENABLED: strict grammar, default off.
@@ -263,6 +297,7 @@ export function lambdaEnv(env: NodeJS.ProcessEnv = process.env, composition?: Se
   if (searchJobs && env.SEARCH_INDEX_ENABLED !== "1")
     throw new Error("session pipeline: SEARCH_JOBS_ENABLED=1 needs SEARCH_INDEX_ENABLED=1");
   const searchWakeEnqueue = flagOne(env, "SEARCH_WAKE_ENQUEUE");
+  const retryVisibilityS = retryVisibilityFromEnv(env);
   return {
     searchBackend: selected.search,
     adapterEnv: Object.freeze(Object.fromEntries(Object.entries(env).filter(([key]) => key.startsWith("SEARCH_INDEX_") || ["PIPELINE_RUNTIME", "AWS_REGION", "READ_API_COMPLETE_SINCE"].includes(key)))),
@@ -283,6 +318,8 @@ export function lambdaEnv(env: NodeJS.ProcessEnv = process.env, composition?: Se
     originLabelsEnabled: messageOriginLabelsEnabled(env[MESSAGE_ORIGIN_LABELS_VAR]),
     ...(skipCurrent ? { skipCurrentEnabled: true } : {}),
     ...(searchPreRead ? { searchPreReadEnabled: true } : {}),
+    ...(skipAcceptanceMissing ? { searchSkipAcceptanceMissing: true as const } : {}),
+    ...(skipOverBound ? { searchSkipOverBound: true as const } : {}),
     ...(pointerPreRead ? { pointerPreReadEnabled: true } : {}),
     ...(pointerSkipOriginBucket ? { pointerSkipOriginBucketEnabled: true } : {}),
     ...(searchStreamCh ? { searchStreamCh } : {}),
@@ -296,7 +333,77 @@ export function lambdaEnv(env: NodeJS.ProcessEnv = process.env, composition?: Se
     ...(maximum === undefined ? {} : { readerMaxRuleset: maximum }),
     ...(searchJobs ? { searchJobs } : {}),
     ...(searchWakeEnqueue ? { searchWakeEnqueue: true as const } : {}),
+    ...(retryVisibilityS ? { retryVisibilityS } : {}),
   };
+}
+
+/**
+ * The consumer's `requeue` dep: one SQS SendMessage of the requeue body (the key, the `requeued` marker, and the
+ * oldest upload event time when known; s3-events.ts requeueBody) with the fixed delay. `call` and `credentials`
+ * are injectable for tests.
+ */
+export function sqsRequeue(
+  env: Pick<LambdaEnv, "region" | "queueUrl">,
+  call: typeof awsJsonCall = awsJsonCall,
+  credentials: () => AwsSessionCredentials = () => lambdaCredentials(),
+): NonNullable<ConsumerDeps["requeue"]> {
+  return async (manifestKey, oldestEventTime) => {
+    await call({
+      service: "sqs",
+      target: "AmazonSQS.SendMessage",
+      region: env.region,
+      body: { QueueUrl: env.queueUrl, MessageBody: requeueBody(manifestKey, oldestEventTime), DelaySeconds: BUSY_REQUEUE_DELAY_SECONDS },
+      credentials: credentials(),
+    });
+  };
+}
+
+/** SESSION_PIPELINE_RETRY_VISIBILITY_S: unset, "" and "0" are off (0); else an integer 1..43200, or init fails naming the variable. */
+export function retryVisibilityFromEnv(env: Record<string, string | undefined>): number {
+  const value = env.SESSION_PIPELINE_RETRY_VISIBILITY_S;
+  if (value === undefined || value === "" || value === "0") return 0;
+  const n = /^[0-9]{1,5}$/.test(value) ? Number(value) : NaN;
+  if (!Number.isInteger(n) || n < 1 || n > 43_200) throw new Error("session pipeline: SESSION_PIPELINE_RETRY_VISIBILITY_S must be an integer from 0 to 43200");
+  return n;
+}
+
+/**
+ * The consumer's `retryVisibility.change` dep: one SQS ChangeMessageVisibility on the pipeline queue
+ * (SESSION_PIPELINE_QUEUE_URL, the queue `requeue` and the reconcile already send to), bounded by the caller's
+ * timeout and never more than RETRY_VISIBILITY_TIMEOUT_MS. Requires sqs:ChangeMessageVisibility on that queue
+ * for the Lambda role. `call` and `credentials` are injectable for tests.
+ */
+export function sqsChangeVisibility(
+  env: Pick<LambdaEnv, "region" | "queueUrl">,
+  call: typeof awsJsonCall = awsJsonCall,
+  credentials: () => AwsSessionCredentials = () => lambdaCredentials(),
+): NonNullable<ConsumerDeps["retryVisibility"]>["change"] {
+  return async (receiptHandle, seconds, timeoutMs) => {
+    await call({
+      service: "sqs",
+      target: "AmazonSQS.ChangeMessageVisibility",
+      region: env.region,
+      body: { QueueUrl: env.queueUrl, ReceiptHandle: receiptHandle, VisibilityTimeout: seconds },
+      credentials: credentials(),
+      timeoutMs: Math.min(timeoutMs, RETRY_VISIBILITY_TIMEOUT_MS),
+    });
+  };
+}
+
+type SqsRecord = { messageId: string; body: string; receiptHandle?: unknown; attributes?: { SentTimestamp?: unknown } | null };
+
+/**
+ * The consumer's view of the Lambda's SQS records: the message id and body, and the receipt handle only with
+ * `withReceiptHandle` (retryVisibility armed). Off: exactly the records as before.
+ */
+export function queueRecords(records: readonly SqsRecord[], withReceiptHandle = false): QueueRecord[] {
+  return records.map((r) => ({
+    messageId: r.messageId,
+    body: r.body,
+    // Of the message attributes only SentTimestamp is passed on (the event_age_ms log field).
+    ...(r.attributes?.SentTimestamp !== undefined ? { sentTimestamp: r.attributes.SentTimestamp } : {}),
+    ...(withReceiptHandle && typeof r.receiptHandle === "string" ? { receiptHandle: r.receiptHandle } : {}),
+  }));
 }
 
 /** A strict "1" switch: unset, "" and "0" are off; "1" is on; anything else fails init naming the variable. */
@@ -407,6 +514,14 @@ export function refuseEnvOptions(env: NodeJS.ProcessEnv = process.env): void {
     throw new Error("pipeline consumer: refusing PGOPTIONS environment fallback (pool options are pinned)");
 }
 
+/**
+ * How long a pool checkout may wait, for a free client or for a new connection, before it fails (the backport
+ * lineage's 6d88b638, same constant and value). Without it a stalled pooler holds the invocation until the Lambda
+ * timeout (300 s) and the whole batch times out. With it the checkout fails after 10 s, the message is reported
+ * as failed and SQS redelivers it.
+ */
+export const HOOPDB_CONNECT_TIMEOUT_MS = 10_000;
+
 export function supabasePool(url: string, max: number, tls = postgresTlsOptions()): HoopDb {
   refuseEnvOptions();
   const pool = new pg.Pool({
@@ -415,6 +530,7 @@ export function supabasePool(url: string, max: number, tls = postgresTlsOptions(
     application_name: "96bulls-session-pipeline",
     ssl: tls,
     idleTimeoutMillis: 60_000,
+    connectionTimeoutMillis: HOOPDB_CONNECT_TIMEOUT_MS,
   });
   pool.on("error", (err) => log.error("hoopdb pool error", { error_code: (err as { code?: string }).code ?? "pool_error" }));
   return {
@@ -427,25 +543,65 @@ export function supabasePool(url: string, max: number, tls = postgresTlsOptions(
   };
 }
 
-export async function transaction<T>(db: HoopDb, work: (tx: SqlExecutor) => Promise<T>): Promise<T> {
+/**
+ * One transaction on one checked-out client. `guarded` (SEARCH_INDEX_STREAMING_CH=1, the search stage only; the
+ * backport lineage's 6264d119 / 51f876b6): pg-pool drops its idle 'error' listener at checkout, and pg's client
+ * emits 'error' when its connection ends, also between statements, so a streamed pass holding the client for
+ * minutes would crash the invocation with an uncaught exception. Guarded, a per-checkout listener keeps the error:
+ * the next statement (the pass's keepalive, its lock check, COMMIT) rejects with it, the transaction fails as a
+ * normal rejected promise (the batch fails that scope's messages for redelivery), the listener is removed and the
+ * broken client is destroyed (`release(err)`), not returned to the pool. Unguarded: the same statements as before.
+ */
+export async function transaction<T>(db: HoopDb, work: (tx: SqlExecutor) => Promise<T>, guarded = false): Promise<T> {
   const client = await db.pool.connect();
+  let broken: Error | undefined;
+  const onError = (error: Error) => {
+    broken ??= error;
+  };
+  if (guarded) client.on("error", onError);
+  const query = async (text: string, params?: unknown[]) => {
+    if (broken) throw broken;
+    return client.query(text, params as unknown[]);
+  };
   try {
-    await client.query("BEGIN");
-    await client.query("SET LOCAL statement_timeout = '60s'");
+    await query("BEGIN");
+    await query("SET LOCAL statement_timeout = '60s'");
     const result = await work({
       async query<R = Record<string, unknown>>(text: string, params?: unknown[]) {
-        const r = await client.query(text, params as unknown[]);
+        const r = await query(text, params);
         return { rows: r.rows as R[] };
       },
     });
-    await client.query("COMMIT");
+    await query("COMMIT");
     return result;
   } catch (error) {
-    await client.query("ROLLBACK").catch(() => {});
+    await query("ROLLBACK").catch(() => {});
     throw error;
   } finally {
-    client.release();
+    if (guarded) client.removeListener("error", onError);
+    if (broken) client.release(broken);
+    else client.release();
   }
+}
+
+/** The search stage's transaction: guarded (transaction() above) exactly when streaming is armed. */
+export function searchTransaction(db: HoopDb, env: Pick<LambdaEnv, "searchStreamCh">, wrap: (tx: SqlExecutor, work: () => Promise<unknown>) => Promise<unknown> = (_tx, work) => work()): SearchIndexDeps["transact"] {
+  return (work) => transaction(db, (tx) => wrap(tx, () => work(tx)) as never, env.searchStreamCh !== undefined);
+}
+
+/** The function timeout (stacks/aws/session-pipeline.ts FUNCTION_TIMEOUT_SECONDS; pinned equal by a test). */
+export const LAMBDA_FUNCTION_TIMEOUT_MS = 300_000;
+
+/**
+ * Whether a search-jobs invocation must stop claiming (SEARCH_INDEX_STREAMING_CH=1 only): its stream slot is used or
+ * less than STREAM_MIN_START_MS is left before its stream deadline, so a job that needs a stream could only be
+ * deferred. Not claimed, a job keeps its attempts and lease state on the server exactly as it was.
+ */
+export function searchJobsStreamExhausted(search: SearchIndexDeps): boolean {
+  if (!search.stream) return false;
+  if (search.streamSlot?.used) return true;
+  const d = search.streamDeadline;
+  return d !== undefined && d.at - (d.now ?? Date.now)() < STREAM_MIN_START_MS;
 }
 
 /** A search pass that found its session busy runs again this much later. */
@@ -542,15 +698,9 @@ export function runtimeFromSecret(env: LambdaEnv, secretText: string, schemaGene
       // Default off; on, a sessionless per-origin bucket key (h=_none/s=_origin) is ignored before any lookup.
       ...(env.pointerSkipOriginBucketEnabled ? { skipOriginBucket: true as const } : {}),
     },
-    requeue: async (manifestKey) => {
-      await awsJsonCall({
-        service: "sqs",
-        target: "AmazonSQS.SendMessage",
-        region: env.region,
-        body: { QueueUrl: env.queueUrl, MessageBody: JSON.stringify({ [RECONCILE_BODY_KEY]: { key: manifestKey } }), DelaySeconds: BUSY_REQUEUE_DELAY_SECONDS },
-        credentials: lambdaCredentials(),
-      });
-    },
+    requeue: sqsRequeue(env),
+    // Default off (SESSION_PIPELINE_RETRY_VISIBILITY_S).
+    ...(env.retryVisibilityS ? { retryVisibility: { seconds: env.retryVisibilityS, change: sqsChangeVisibility(env) } } : {}),
   };
   if (env.searchEnabled) {
     const portable = env.searchBackend && env.searchBackend !== "clickhouse";
@@ -561,7 +711,8 @@ export function runtimeFromSecret(env: LambdaEnv, secretText: string, schemaGene
     const writerSql = portable ? writerTransactionSql(db) : undefined;
     const binding = portable ? composeSearchService(composition!, { env: { ...env.adapterEnv, SEARCH_INDEX_BACKEND: env.searchBackend }, sql: writerSql!.sql, secrets: searchSecret(secret.search) }, "writer") : undefined;
     deps.search = {
-      transact: (work) => transaction(db, tx => writerSql ? writerSql.run(tx, () => work(tx)) : work(tx)),
+      // Guarded only when SEARCH_INDEX_STREAMING_CH=1: unarmed, the search transaction is exactly as before.
+      transact: searchTransaction(db, env, (tx, work) => (writerSql ? writerSql.run(tx, work) : work())),
       reader,
       store,
       ...(binding ? { adapter: binding } : { ch: createClickHouseClient(secret.clickhouse!) }),
@@ -579,6 +730,10 @@ export function runtimeFromSecret(env: LambdaEnv, secretText: string, schemaGene
       // Default off; on, a pass the session directory proves current returns before any read (already_current).
       ...(env.skipCurrentEnabled ? { skipCurrent: true as const } : {}),
       ...(env.searchPreReadEnabled ? { preRead: true as const } : {}),
+      // Default off (SEARCH_INDEX_SKIP_ACCEPTANCE_MISSING_ENABLED=true, ClickHouse only).
+      ...(env.searchSkipAcceptanceMissing && !binding ? { skipAcceptanceMissing: true as const } : {}),
+      // Default off (SEARCH_INDEX_SKIP_OVER_BOUND_ENABLED=true, ClickHouse only).
+      ...(env.searchSkipOverBound && !binding ? { skipOverBound: true as const } : {}),
       // Default off (SEARCH_INDEX_STREAMING_CH=1, ClickHouse only); the deadline is set per invocation.
       ...(env.searchStreamCh && !binding ? { stream: { maxReadBytes: env.searchStreamCh.maxReadBytes, maxReadEvents: env.searchStreamCh.maxReadEvents } } : {}),
     };
@@ -847,20 +1002,41 @@ export interface LambdaInvocationContext {
  * requeued, so the margin only has to cover the batch's whole reads and replay, never another stream.
  */
 export function invocationDeps(rt: Pick<Runtime, "env" | "deps">, context?: LambdaInvocationContext, now: () => number = Date.now): ConsumerDeps {
-  const deps = streamDeps(rt, context, now);
+  const deps = retryDeadlineDeps(streamDeps(rt, context, now), context);
   // SEARCH_JOBS_ENABLED (default off): the §5.1 follow-on claim after the batch. Off: the deps are unchanged.
   if (!rt.env.searchJobs || !deps.search) return deps;
   const search = deps.search;
   return { ...deps, searchJobs: { drain: () => drainSearchJobs({ sql: searchJobsSql(rt.deps.pointer.db), search, claim: rt.env.searchJobs!.claim, deadline: searchJobsDeadline(rt.env, context) }) } };
 }
 
+/**
+ * SESSION_PIPELINE_RETRY_VISIBILITY_S armed and a Lambda context (streaming or not): the consumer reads the
+ * invocation's remaining time right before its ChangeMessageVisibility calls. Otherwise `deps` itself.
+ */
+function retryDeadlineDeps(deps: ConsumerDeps, context?: LambdaInvocationContext): ConsumerDeps {
+  if (!deps.retryVisibility || typeof context?.getRemainingTimeInMillis !== "function") return deps;
+  return { ...deps, retryVisibility: { ...deps.retryVisibility, remainingMs: () => context.getRemainingTimeInMillis() } };
+}
+
 function streamDeps(rt: Pick<Runtime, "env" | "deps">, context?: LambdaInvocationContext, now: () => number = Date.now): ConsumerDeps {
+  const search = invocationSearchDeps(rt, context, now);
+  return search === rt.deps.search ? rt.deps : { ...rt.deps, search };
+}
+
+/**
+ * The search deps of one invocation (an SQS batch with its search-jobs follow-on, or a scheduled searchJobs run):
+ * unchanged unless SEARCH_INDEX_STREAMING_CH=1 armed the streamed reconcile. Armed, as on the backport lineage
+ * (59b74b18 / 6264d119): the invocation streams at most one scope (`streamSlot`, also with no Lambda context, so no
+ * entry point can stream more than one scope per invocation), and with a finite remaining time the streamed pass
+ * stops at the remaining time less the margin (`streamDeadline`), and none starts with less than
+ * STREAM_MIN_START_MS left before that deadline.
+ */
+export function invocationSearchDeps(rt: Pick<Runtime, "env" | "deps">, context?: LambdaInvocationContext, now: () => number = Date.now): SearchIndexDeps | undefined {
   const search = rt.deps.search;
   const margin = rt.env.searchStreamCh?.deadlineMarginMs;
-  if (!search?.stream || margin === undefined || typeof context?.getRemainingTimeInMillis !== "function") return rt.deps;
-  const remaining = context.getRemainingTimeInMillis();
-  if (!Number.isFinite(remaining)) return rt.deps;
-  return { ...rt.deps, search: { ...search, streamDeadline: { at: now() + remaining - margin }, streamSlot: { used: false } } };
+  if (!search?.stream || margin === undefined) return search;
+  const remaining = typeof context?.getRemainingTimeInMillis === "function" ? context.getRemainingTimeInMillis() : NaN;
+  return { ...search, ...(Number.isFinite(remaining) ? { streamDeadline: { at: now() + remaining - margin } } : {}), streamSlot: { used: false } };
 }
 
 /** The search-job loop's SQL: the runtime pool, and its transactions (lambda.ts transaction). */
@@ -882,6 +1058,8 @@ export interface SearchJobsSummary {
   probes: number;
   /** The invocation stopped because the remaining time reached the margin. */
   deadlineExit: boolean;
+  /** SEARCH_INDEX_STREAMING_CH=1: the invocation stopped claiming because its stream slot or start time was spent. */
+  streamExit?: boolean;
 }
 
 /**
@@ -926,19 +1104,21 @@ export async function drainSearchJobs(deps: { sql: SearchSql; search: SearchInde
   };
   const probe = async () => {
     if (deps.deadline?.()) { summary.deadlineExit = true; return; }
+    if (searchJobsStreamExhausted(deps.search)) { summary.streamExit = true; return; }
     const job = await claimSearchProbe(deps.sql);
     if (!job) return;
     summary.probes += 1;
     await pass(job);
   };
   if (deps.probeFirst) await probe();
-  for (let n = 0; n < deps.claim && !summary.deadlineExit; n++) {
+  for (let n = 0; n < deps.claim && !summary.deadlineExit && !summary.streamExit; n++) {
     if (deps.deadline?.()) { summary.deadlineExit = true; break; }
+    if (searchJobsStreamExhausted(deps.search)) { summary.streamExit = true; break; }
     const [job] = await claimSearchJobs(deps.sql, 1);
     if (!job) break;
     await pass(job);
   }
-  if (!deps.probeFirst && !summary.deadlineExit) await probe();
+  if (!deps.probeFirst && !summary.deadlineExit && !summary.streamExit) await probe();
   return summary;
 }
 
@@ -960,7 +1140,7 @@ async function dispatchLambdaEvent(event: PipelineLambdaEvent, ready: () => Prom
       // Nothing was processed: every message goes back to the queue.
       return { batchItemFailures: event.Records.map((r) => ({ itemIdentifier: r.messageId })) };
     }
-    const records: QueueRecord[] = event.Records.map((r) => ({ messageId: r.messageId, body: r.body }));
+    const records: QueueRecord[] = queueRecords(event.Records, rt.deps.retryVisibility !== undefined);
     return processBatch(records, invocationDeps(rt, context));
   }
   if (event?.searchJobs === true) {
@@ -971,10 +1151,11 @@ async function dispatchLambdaEvent(event: PipelineLambdaEvent, ready: () => Prom
       const rt = await ready();
       if (!rt.env.searchJobs || !rt.deps.search) throw new Error("search jobs unavailable");
       // The scheduled invocation probes FIRST (independently budgeted probe opportunity), then its ordinary passes.
-      const s = await drainSearchJobs({ sql: searchJobsSql(rt.deps.pointer.db), search: rt.deps.search, claim: rt.env.searchJobs.claim,
+      // The same stream guards as an SQS batch (slot, deadline, start minimum); unchanged unless streaming is armed.
+      const s = await drainSearchJobs({ sql: searchJobsSql(rt.deps.pointer.db), search: invocationSearchDeps(rt, context)!, claim: rt.env.searchJobs.claim,
         deadline: searchJobsDeadline(rt.env, context), probeFirst: true });
       log.info("search jobs run", { stage: "search-index", claimed: s.claimed, acked: s.acked, retried: s.retried, exhausted: s.exhausted, skipped: s.lost, failed: s.failed,
-        count: s.probes, state: s.deadlineExit ? "deadline" : "complete", ok: s.failed === 0, duration_ms: Date.now() - started });
+        count: s.probes, state: s.deadlineExit ? "deadline" : s.streamExit ? "stream_exhausted" : "complete", ok: s.failed === 0, duration_ms: Date.now() - started });
       return { ok: s.failed === 0 };
     } catch (error) {
       log.error("search jobs run failed", { stage: "search-index", ...errorFields(error), duration_ms: Date.now() - started });
@@ -1170,6 +1351,28 @@ export function searchIndexSkipCurrentFromEnv(env: Record<string, string | undef
   if (value === undefined || value === "" || value === "false") return false;
   if (value === "true") return true;
   throw new Error("session pipeline: SEARCH_INDEX_SKIP_CURRENT_ENABLED must be true or false");
+}
+
+/**
+ * SEARCH_INDEX_SKIP_ACCEPTANCE_MISSING_ENABLED for the hosted Lambda: unset, "" and "false" are off; "true" is
+ * on; anything else fails init naming the variable, never the value (the backport lineage's grammar).
+ */
+export function searchIndexSkipAcceptanceMissingFromEnv(env: Record<string, string | undefined>): boolean {
+  const value = env.SEARCH_INDEX_SKIP_ACCEPTANCE_MISSING_ENABLED;
+  if (value === undefined || value === "" || value === "false") return false;
+  if (value === "true") return true;
+  throw new Error("session pipeline: SEARCH_INDEX_SKIP_ACCEPTANCE_MISSING_ENABLED must be true or false");
+}
+
+/**
+ * SEARCH_INDEX_SKIP_OVER_BOUND_ENABLED for the hosted Lambda: unset, "" and "false" are off; "true" is on;
+ * anything else fails init naming the variable, never the value (the backport lineage's grammar).
+ */
+export function searchIndexSkipOverBoundFromEnv(env: Record<string, string | undefined>): boolean {
+  const value = env.SEARCH_INDEX_SKIP_OVER_BOUND_ENABLED;
+  if (value === undefined || value === "" || value === "false") return false;
+  if (value === "true") return true;
+  throw new Error("session pipeline: SEARCH_INDEX_SKIP_OVER_BOUND_ENABLED must be true or false");
 }
 
 /**

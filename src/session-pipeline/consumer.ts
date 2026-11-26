@@ -11,10 +11,11 @@
  * them to the DLQ after `maxReceiveCount`.
  */
 import { errorFields, log, searchIndexErrorDetail } from "../shared/log.ts";
-import { parseQueueBody, sequencerAfter, type LandedEvent } from "./s3-events.ts";
+import { parseQueueBody, sequencerAfter, type LandedEvent, type QueueOrigin } from "./s3-events.ts";
 import { indexPointer, type PointerDeps, type SessionScope } from "./pointer.ts";
 import { indexSearchScope, searchIndexPhaseMetrics, type SearchIndexDeps } from "./search-index.ts";
 import { LEGACY_PROVENANCE_INVALID } from "../session-read-api/legacy-provenance.ts";
+import { streamDeadlinePassed } from "../session-read-api/canonical-stream-projection.ts";
 import { captureRefusal, classifyReplayFailure, produceCanonicalReplay, type ReplayProducerDeps } from "./replay-publication.ts";
 import type { LargeJobState, LargeRoute } from "./large-read-worker.ts";
 import { feedBufferedStageByKey, isBufferedStageKey, type BufferedFeedDeps } from "./buffered-search-feed.ts";
@@ -22,7 +23,27 @@ import { feedBufferedStageByKey, isBufferedStageKey, type BufferedFeedDeps } fro
 export interface QueueRecord {
   messageId: string;
   body: string;
+  /** The SQS `SentTimestamp` attribute (epoch ms, a decimal string in the Lambda event): telemetry only. */
+  sentTimestamp?: unknown;
+  /**
+   * The SQS receipt handle: passed through only while `ConsumerDeps.retryVisibility` is set (lambda.ts
+   * queueRecords), and used only as the ChangeMessageVisibility argument. Never logged.
+   */
+  receiptHandle?: string;
 }
+
+/** Pointer-stage error codes whose messages are retried after `retryVisibility.seconds`, not the queue's full timeout. */
+export const FAST_RETRY_CODES: ReadonlySet<string> = new Set(["pointer_move_pending"]);
+
+/** A ChangeMessageVisibility call that has not settled after this long is abandoned (the message keeps its full timeout). */
+export const RETRY_VISIBILITY_TIMEOUT_MS = 2_000;
+
+/**
+ * Time kept back for returning the batch response after the calls. With less than
+ * RETRY_VISIBILITY_TIMEOUT_MS + this left in the invocation no call is made, so a near-deadline batch still
+ * returns its partial response (and acknowledges its successes) before Lambda times out.
+ */
+export const RETRY_VISIBILITY_MARGIN_MS = 1_000;
 
 export interface BatchResponse {
   batchItemFailures: { itemIdentifier: string }[];
@@ -43,7 +64,9 @@ export interface ConsumerDeps {
    * Put a manifest back on the queue after a delay (SQS DelaySeconds): used when
    * another pass holds the session, so the event is neither lost nor failed.
    */
-  requeue?: (manifestKey: string) => Promise<void>;
+  requeue?: (manifestKey: string, oldestEventTime?: string) => Promise<void>;
+  /** Clock for `event_age_ms` and `s3_event_age_ms` only (default Date.now). */
+  now?: () => number;
   /**
    * Absent by default (INGEST_BUFFERED_SEARCH_FEED=on only): a buffered-stage object event
    * (`…/buffered-batches/v1/…`) feeds that stage into the search index instead of reaching the
@@ -56,13 +79,162 @@ export interface ConsumerDeps {
    * never fail a message of the batch. Absent: exactly the previous behavior.
    */
   searchJobs?: { drain(): Promise<unknown> };
+  /**
+   * SESSION_PIPELINE_RETRY_VISIBILITY_S (default off; absent, failures behave and log exactly as before): a
+   * message that failed only with a FAST_RETRY_CODES pointer error gets its visibility set to `seconds` before
+   * it is returned in batchItemFailures, so SQS redelivers it then instead of after the queue's full
+   * visibility timeout. A message that also fed any other failure of the batch (another key, an invalid body,
+   * a buffered stage, the large-read route, search or replay) keeps the full timeout. Best-effort: a rejected
+   * or timed-out call logs a warn and the message still fails with the normal timeout. `remainingMs` (the
+   * invocation's remaining time, set per invocation by lambda.ts invocationDeps) is checked right before the
+   * calls: too little left and none is made; otherwise each is bounded by
+   * min(RETRY_VISIBILITY_TIMEOUT_MS, remaining - RETRY_VISIBILITY_MARGIN_MS). Needs
+   * sqs:ChangeMessageVisibility on the source queue for the Lambda role.
+   */
+  retryVisibility?: {
+    seconds: number;
+    change: (receiptHandle: string, seconds: number, timeoutMs: number) => Promise<void>;
+    remainingMs?: () => number;
+  };
+}
+
+/** Set each message's visibility to `seconds`, bounded and best-effort: never throws, never changes which messages fail. */
+async function shortenRetries(handles: readonly (string | undefined)[], rv: NonNullable<ConsumerDeps["retryVisibility"]>): Promise<void> {
+  // Rechecked here, after every stage of the batch: it may have used most of the invocation.
+  const remaining = rv.remainingMs?.();
+  let bound = RETRY_VISIBILITY_TIMEOUT_MS;
+  if (remaining !== undefined && Number.isFinite(remaining)) {
+    if (remaining < RETRY_VISIBILITY_TIMEOUT_MS + RETRY_VISIBILITY_MARGIN_MS) {
+      log.warn("retry visibility not shortened", { stage: "session-indexed", reason: "retry_visibility_deadline", count: handles.length });
+      return;
+    }
+    bound = Math.min(RETRY_VISIBILITY_TIMEOUT_MS, remaining - RETRY_VISIBILITY_MARGIN_MS);
+  }
+  await Promise.allSettled(
+    handles.map(async (handle) => {
+      if (!handle) {
+        log.warn("retry visibility not shortened", { stage: "session-indexed", reason: "no_receipt_handle" });
+        return;
+      }
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      const timeout = new Promise<"timeout">((resolve) => (timer = setTimeout(() => resolve("timeout"), bound)));
+      try {
+        const settled = await Promise.race([rv.change(handle, rv.seconds, bound).then(() => "ok" as const), timeout]);
+        if (settled === "timeout") log.warn("retry visibility not shortened", { stage: "session-indexed", reason: "change_visibility_timeout" });
+      } catch (error) {
+        log.warn("retry visibility not shortened", { stage: "session-indexed", reason: "change_visibility_failed", ...errorFields(error) });
+      } finally {
+        clearTimeout(timer);
+      }
+    }),
+  );
+}
+
+/*
+ * Latency fields (the backport lineage's ecb5d981) on "pointer indexed" (per key), "search index reconciled" and
+ * "search index partial" (per scope), each over the SQS messages behind the line:
+ * - `s3_event_age_ms`: floor(log time - the oldest upload event time covered), clamped at 0: an S3 ObjectCreated
+ *   record's eventTime, or the `oldest_event_time` a requeued body carries, so it stays end to end across busy,
+ *   deferred and batch-deadline requeues. Deletes are not counted. Omitted when any covered upload has no usable time.
+ * - `event_age_ms`: floor(log time - the oldest SQS SentTimestamp of the messages), clamped at 0; omitted when any
+ *   message has none.
+ * - `queue_origin`: `s3` when every message is an S3 notification, else `requeue` when any is this consumer's
+ *   requeue, else `sweep`.
+ * Telemetry only: no stage sees them, and no decision depends on them.
+ */
+/** The upload event times a key or scope covers: the oldest known, and whether any was unknown. */
+interface Covered {
+  oldestMs?: number;
+  unknown: boolean;
+}
+
+function cover(into: Covered, event: LandedEvent): void {
+  if (event.deleted) return;
+  const at = event.oldestEventTime ?? event.eventTime;
+  const ms = at === undefined ? NaN : Date.parse(at);
+  if (!Number.isFinite(ms)) into.unknown = true;
+  else if (into.oldestMs === undefined || ms < into.oldestMs) into.oldestMs = ms;
+}
+
+function merge(into: Covered, from: Covered): void {
+  if (from.unknown) into.unknown = true;
+  if (from.oldestMs !== undefined && (into.oldestMs === undefined || from.oldestMs < into.oldestMs)) into.oldestMs = from.oldestMs;
+}
+
+const knownOldest = (c: Covered): number | undefined => (c.unknown ? undefined : c.oldestMs);
+
+function ageMs(now: number, since: number): number | undefined {
+  const age = Math.floor(now - since);
+  return Number.isFinite(age) ? Math.max(0, age) : undefined;
+}
+
+interface Message {
+  sentMs?: number;
+  origin: QueueOrigin;
+}
+
+/** A `SentTimestamp` attribute as epoch ms: a positive safe integer (number or decimal string), else undefined. */
+export function sentTimestampMs(value: unknown): number | undefined {
+  const n = typeof value === "number" ? value : typeof value === "string" && /^[0-9]{1,16}$/.test(value) ? Number(value) : NaN;
+  return Number.isSafeInteger(n) && n > 0 ? n : undefined;
+}
+
+interface LagFields {
+  event_age_ms?: number;
+  s3_event_age_ms?: number;
+  queue_origin?: QueueOrigin;
+}
+
+function lagFields(covered: Covered, ids: readonly string[], messages: ReadonlyMap<string, Message>, now: number): LagFields {
+  const out: LagFields = {};
+  let oldestSent: number | undefined;
+  let sentUnknown = false;
+  let seen = false;
+  let allS3 = true;
+  let anyRequeue = false;
+  for (const id of ids) {
+    const m = messages.get(id);
+    if (!m) continue;
+    seen = true;
+    if (m.sentMs === undefined) sentUnknown = true;
+    else if (oldestSent === undefined || m.sentMs < oldestSent) oldestSent = m.sentMs;
+    if (m.origin !== "s3") allS3 = false;
+    if (m.origin === "requeue") anyRequeue = true;
+  }
+  if (seen && !sentUnknown && oldestSent !== undefined) {
+    const age = ageMs(now, oldestSent);
+    if (age !== undefined) out.event_age_ms = age;
+  }
+  const oldest = knownOldest(covered);
+  if (oldest !== undefined) {
+    const age = ageMs(now, oldest);
+    if (age !== undefined) out.s3_event_age_ms = age;
+  }
+  if (seen) out.queue_origin = allS3 ? "s3" : anyRequeue ? "requeue" : "sweep";
+  return out;
+}
+
+/** The carried time for a requeue body, or undefined. */
+function carriedTime(c: Covered): string | undefined {
+  const oldest = knownOldest(c);
+  return oldest === undefined ? undefined : new Date(oldest).toISOString();
 }
 
 const scopeId = (s: SessionScope) => JSON.stringify([s.orgId, s.workspaceId, s.harness, s.sessionId]);
 
 export async function processBatch(records: readonly QueueRecord[], deps: ConsumerDeps): Promise<BatchResponse> {
   const failed = new Set<string>();
-  const byKey = new Map<string, { event: LandedEvent; messageIds: string[] }>();
+  // retryVisibility only: messages with a fast-retry pointer failure, and messages with any other failure.
+  const fastRetry = new Set<string>();
+  const slowRetry = new Set<string>();
+  /** Fail `id`; with retryVisibility armed, also note whether this failure allows the short redelivery. */
+  const fail = (id: string, fast = false) => {
+    failed.add(id);
+    if (deps.retryVisibility) (fast ? fastRetry : slowRetry).add(id);
+  };
+  const now = deps.now ?? Date.now;
+  const messages = new Map<string, Message>();
+  const byKey = new Map<string, { event: LandedEvent; messageIds: string[]; covered: Covered }>();
   for (const record of records) {
     // Events carry the provider of the Locker the pointer stage reads from (s3 on the
     // Lambda, LOCKER_PROVIDER on self-host), which is what the row's storage_provider records.
@@ -71,22 +243,30 @@ export async function processBatch(records: readonly QueueRecord[], deps: Consum
     if (parsed.kind === "invalid") {
       // Never succeeds on retry; the DLQ keeps it for an operator.
       log.warn("object event unreadable", { stage: "object-landed", reason: "invalid_body" });
-      failed.add(record.messageId);
+      fail(record.messageId);
       continue;
     }
+    const sentMs = sentTimestampMs(record.sentTimestamp);
+    messages.set(record.messageId, { origin: parsed.origin, ...(sentMs === undefined ? {} : { sentMs }) });
     for (const event of parsed.events) {
       const held = byKey.get(event.key);
-      if (!held) byKey.set(event.key, { event, messageIds: [record.messageId] });
-      else {
+      if (!held) {
+        const covered: Covered = { unknown: false };
+        cover(covered, event);
+        byKey.set(event.key, { event, messageIds: [record.messageId], covered });
+      } else {
         held.messageIds.push(record.messageId);
+        cover(held.covered, event);
         if (sequencerAfter(event.sequencer, held.event.sequencer)) held.event = event;
       }
     }
   }
 
-  const scopes = new Map<string, { scope: SessionScope; messageIds: string[]; manifestKey: string }>();
-  for (const { event, messageIds } of byKey.values()) {
+  const scopes = new Map<string, { scope: SessionScope; messageIds: string[]; manifestKey: string; covered: Covered }>();
+  for (const { event: carriedEvent, messageIds, covered } of byKey.values()) {
     const started = Date.now();
+    // The carried time is telemetry only: no stage sees it.
+    const { oldestEventTime: _carried, ...event } = carriedEvent;
     if (deps.bufferedFeed && isBufferedStageKey(event.key)) {
       // KEEP-UP. A delete event is a GC removal: index-row deletes are their own lane, so it is a no-op here.
       if (event.deleted) continue;
@@ -104,7 +284,7 @@ export async function processBatch(records: readonly QueueRecord[], deps: Consum
           ...(fed.outcome === "indexed" ? { count: fed.rows, deleted: fed.deleted } : { reason: fed.reason }), duration_ms: Date.now() - started });
       } catch (error) {
         log.error("buffered stage search feed failed", { stage: "buffered-search-feed", ...errorFields(error), duration_ms: Date.now() - started });
-        for (const id of messageIds) failed.add(id);
+        for (const id of messageIds) fail(id);
       }
       continue;
     }
@@ -133,14 +313,18 @@ export async function processBatch(records: readonly QueueRecord[], deps: Consum
         session_id: outcome.scope.sessionId,
         revision: outcome.revision,
         duration_ms: Date.now() - started,
+        ...lagFields(covered, messageIds, messages, now()),
       });
       const id = scopeId(outcome.scope);
       const held = scopes.get(id);
-      if (held) held.messageIds.push(...messageIds);
-      else scopes.set(id, { scope: outcome.scope, messageIds: [...messageIds], manifestKey: outcome.manifestKey });
+      if (held) {
+        held.messageIds.push(...messageIds);
+        merge(held.covered, covered);
+      } else scopes.set(id, { scope: outcome.scope, messageIds: [...messageIds], manifestKey: outcome.manifestKey, covered: { ...covered } });
     } catch (error) {
-      log.error("pointer index failed", { stage: "session-indexed", ...errorFields(error), duration_ms: Date.now() - started });
-      for (const id of messageIds) failed.add(id);
+      const fields = errorFields(error);
+      log.error("pointer index failed", { stage: "session-indexed", ...fields, duration_ms: Date.now() - started });
+      for (const id of messageIds) fail(id, FAST_RETRY_CODES.has(fields.error_code as string));
     }
   }
 
@@ -160,7 +344,7 @@ export async function processBatch(records: readonly QueueRecord[], deps: Consum
       const refusal=classifyReplayFailure(error);
       if(refusal){log.warn("large scope handoff refused",{stage:"large-read",...ids,...errorFields(error),reason:refusal.reason,error_code:refusal.code});continue}
       if(captureRefusal(error)==="capture_ambiguous_source"){log.warn("large scope handoff refused",{stage:"large-read",...ids,...errorFields(error),reason:"large_handoff_ambiguous_source",error_code:"55000"});continue}
-      log.error("large scope handoff failed",{stage:"large-read",...ids,...errorFields(error)});for(const id of messageIds)failed.add(id);continue;
+      log.error("large scope handoff failed",{stage:"large-read",...ids,...errorFields(error)});for(const id of messageIds)fail(id);continue;
     }
     if(!routed.delegated)continue;
     delegated.add(scopeId(scope));
@@ -174,7 +358,7 @@ export async function processBatch(records: readonly QueueRecord[], deps: Consum
     }catch(error){log.warn("large scope job state unavailable",{stage:"large-read",...ids,...errorFields(error)})}
   }
   if (deps.search) {
-    for (const { scope, messageIds, manifestKey } of scopes.values()) {
+    for (const { scope, messageIds, manifestKey, covered } of scopes.values()) {
       if (delegated.has(scopeId(scope)) || messageIds.every((id) => failed.has(id))) continue;
       const started = Date.now();
       const phase = searchIndexPhaseMetrics();
@@ -186,11 +370,20 @@ export async function processBatch(records: readonly QueueRecord[], deps: Consum
         write_batches: phase.writeBatches,
       });
       try {
+        // SEARCH_INDEX_STREAMING_CH=1 only (the backport lineage's 6264d119 / 51f876b6): past the invocation's
+        // stream deadline no scope of the batch is started (whole read or streamed); the rest are requeued. A
+        // requeue that fails fails that scope's messages for redelivery (the catch below), never silently.
+        if (deps.search.stream && streamDeadlinePassed(deps.search.streamDeadline)) {
+          if (!deps.requeue) throw new Error("batch past its stream deadline and no requeue");
+          await deps.requeue(manifestKey, carriedTime(covered));
+          log.info("search index past the batch deadline, requeued", { stage: "search-index", org_id: scope.orgId, session_id: scope.sessionId, reason: "stream_batch_deadline" });
+          continue;
+        }
         const result = await indexSearchScope(scope, { ...deps.search, metrics: phase });
         if (result.busy) {
           // The running pass may have read S3 before this event's write: run again later.
           if (!deps.requeue) throw new Error("scope busy and no requeue");
-          await deps.requeue(manifestKey);
+          await deps.requeue(manifestKey, carriedTime(covered));
           log.info("search index busy, requeued", { stage: "search-index", org_id: scope.orgId, session_id: scope.sessionId, reason: "scope_busy" });
           continue;
         }
@@ -205,7 +398,7 @@ export async function processBatch(records: readonly QueueRecord[], deps: Consum
         if (result.deferred) {
           // This invocation already streamed a scope (streamSlot): stream this one in a later invocation.
           if (!deps.requeue) throw new Error("stream deferred and no requeue");
-          await deps.requeue(manifestKey);
+          await deps.requeue(manifestKey, carriedTime(covered));
           log.info("search index stream deferred, requeued", { stage: "search-index", org_id: scope.orgId, session_id: scope.sessionId, reason: "stream_deferred" });
           continue;
         }
@@ -214,12 +407,15 @@ export async function processBatch(records: readonly QueueRecord[], deps: Consum
             stage: "search-index",
             reason: LEGACY_PROVENANCE_INVALID,
           });
+        const lag = lagFields(covered, messageIds, messages, now());
         if (result.partial)
           log.warn("search index partial", {
             stage: "search-index", org_id: scope.orgId, session_id: scope.sessionId, manifests: result.manifests,
             // scope_too_large, then the streaming budget that stopped it, if one did.
             reason: result.reasons.join(",") || "scope_too_large",
             ...(result.stream ? { stream: result.stream } : {}),
+            contender_seats: result.contenderSeats,
+            ...lag,
           });
         log.info("search index reconciled", {
           stage: "search-index",
@@ -233,8 +429,11 @@ export async function processBatch(records: readonly QueueRecord[], deps: Consum
           deleted: result.deleted,
           ok: result.complete,
           reason: result.reasons.join(",") || undefined,
+          // Only on a read pass refused for acceptance (search-index.ts SearchIndexResult.contenderSeats).
+          contender_seats: result.contenderSeats,
           ...phaseFields(),
           duration_ms: Date.now() - started,
+          ...lag,
         });
       } catch (error) {
         log.error("search index failed", {
@@ -246,7 +445,7 @@ export async function processBatch(records: readonly QueueRecord[], deps: Consum
           ...phaseFields(),
           duration_ms: Date.now() - started,
         });
-        for (const id of messageIds) failed.add(id);
+        for (const id of messageIds) fail(id);
       }
     }
   }
@@ -279,7 +478,7 @@ export async function processBatch(records: readonly QueueRecord[], deps: Consum
           continue;
         }
         log.error("canonical replay publication failed", fields);
-        for (const id of messageIds) failed.add(id);
+        for (const id of messageIds) fail(id);
       }
     }
   }
@@ -289,6 +488,13 @@ export async function processBatch(records: readonly QueueRecord[], deps: Consum
     } catch (error) {
       log.error("search jobs follow-on failed", { stage: "search-index", ...errorFields(error) });
     }
+  }
+  // Last, after the search-jobs follow-on (which never fails a message), so a 60 s visibility cannot lapse
+  // while this invocation still runs; the remaining-time recheck covers a follow-on that ran long.
+  if (deps.retryVisibility && fastRetry.size > 0) {
+    const handles = new Map(records.map((r) => [r.messageId, r.receiptHandle]));
+    const ids = [...fastRetry].filter((id) => failed.has(id) && !slowRetry.has(id));
+    await shortenRetries(ids.map((id) => handles.get(id)), deps.retryVisibility);
   }
   return { batchItemFailures: [...failed].map((itemIdentifier) => ({ itemIdentifier })) };
 }

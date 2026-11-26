@@ -167,7 +167,7 @@ async function record(s: Scenario, off: OffEnv = "false"): Promise<Entry[]> {
                   if (typeof parsed[field] !== "number" || (parsed[field] as number) < 0) phaseMetricError = `missing search phase metric ${field}`;
               // Commit 1 adds phase metrics to both flag modes. Validate them above, then remove
               // their nondeterministic durations from this pre-existing flag-off golden.
-              const { ts: _ts, duration_ms: _d, source_read_ms: _sr, index_scan_ms: _is, locked_apply_ms: _la,
+              const { ts: _ts, duration_ms: _d, event_age_ms: _ea, s3_event_age_ms: _sa, queue_origin: _qo, source_read_ms: _sr, index_scan_ms: _is, locked_apply_ms: _la,
                 write_calls: _wc, write_batches: _wb, ...entry } = parsed;
               if (entry.stage === "search-index") lines.push(entry);
             } catch {}
