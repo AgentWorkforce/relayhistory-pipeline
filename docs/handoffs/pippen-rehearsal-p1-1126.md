@@ -122,19 +122,33 @@ pin, lease end) before any AWS call:
       name, and the role per its pinned disposition (deleted: not found; retained: exactly the pinned
       ARN, path and boundary). A remaining id refuses (`state_resources_remain`); AccessDenied is
       never "gone" (`state_gone_unproven`); rerun after the next destroy pass;
-   7. the resume state, under these receipts: no version left (an earlier execute completed and
+   7. no capture or deploy may run while a teardown marker exists (`state_teardown_in_progress`):
+      the state layer refuses, which fences Alchemy writers against an open teardown;
+   8. the resume state, under these receipts: no version left (an earlier execute completed and
       only its last response was lost): complete, nothing deleted; only this teardown's marker left:
       continue with step 8's last call; otherwise the run marker must be current and the original
       run's (lease A's session, issuance time, pin). Anything else keeps the state;
-   8. only then, in this order (`teardownStageState`), each step re-listed before the next:
+   9. only then, in this order (`teardownStageState`), with **generation fencing**:
       1. the **teardown marker** `__rehearsal_teardown__.marker` (run id, manifest digest,
-         authorization digest) is written if absent (`--if-none-match "*"`), or must already be
-         exactly this teardown's;
-      2. every version and delete marker except the two markers, by key and version id (strict
-         page validation; any key outside the prefix refuses before anything is deleted); the
-         re-list must then show only the markers;
-      3. the run marker's versions, alone; the re-list must then show only the teardown marker;
-      4. the teardown marker, last and alone; the final re-list must show nothing.
+         authorization digest) is written only over this run's own marker, if absent
+         (`--if-none-match "*"`), or must already be exactly this teardown's;
+      2. the generation is recorded: the exact version ids of the teardown marker (exactly one) and
+         of the run marker (exactly one, and its body this run's; none on a teardown-marker-only
+         resume);
+      3. before **every** delete step the fence is re-checked: the teardown marker is still exactly
+         that one version with this teardown's body, and no run-marker version other than the
+         recorded one exists; otherwise the executor stops;
+      4. every other version and delete marker, by the key and version ids listed at the start of
+         the generation (strict page validation; any key outside the prefix refuses before
+         anything is deleted); the re-list must then show only the markers;
+      5. the run marker, alone, by its recorded version id only;
+      6. the teardown marker, last and alone, by its recorded version id only; the final re-list
+         must show nothing.
+
+   Version-id fencing is what makes a stale executor harmless: if teardown T1 pauses, a second
+   teardown T2 with the same receipts completes, and a new run claims the now-empty prefix, T1's
+   next fence check finds its teardown marker gone and stops, and any delete it still issues names
+   only the old generation's version ids, never the new run's marker (tested at every pause point).
 
    A partial batch, or a delete that reports success and leaves a version, stops with the run marker
    intact, and the next execute resumes. A claim cannot interleave: it requires an empty version
@@ -297,6 +311,12 @@ receipts (kept outside the repository, referenced by hash in the run's handoff):
 
 ## Broker and live-evidence items (not provable offline)
 
+- **Teardown lease discovery reads**, resource `*` (IAM cannot narrow them): `lambda:ListEventSourceMappings`
+  and `logs:DescribeLogGroups`. The broker decides whether to keep them; without them the
+  physical-manifest and absence checks for mappings and the log group cannot run. The teardown
+  lease's role rights (`iam:DeleteRole`, `ListAttachedRolePolicies`, `DetachRolePolicy`,
+  `ListRolePolicies`, `DeleteRolePolicy`) are on the exact pinned role ARN only, and only when its
+  disposition is "deleted"; a retained role gets none of them.
 - **Broad regional reads**, resource `*` because IAM cannot narrow them: `lambda:ListEventSourceMappings`,
   `cloudwatch:GetMetricStatistics`, `cloudwatch:GetMetricData`, `logs:DescribeLogGroups`,
   `logs:GetQueryResults`. The broker decides each: keep (read-only metadata and metric/log data of
@@ -331,6 +351,6 @@ receipts (kept outside the repository, referenced by hash in the run's handoff):
 - Non-adoption under concurrent creation or standalone use of the lease, and create-time tagging
   under the strict tag statement, are residuals for the issuer (see Teardown and Lease).
 - **Gates still open:** the non-prod render of the session pipeline; the proof-account stage rule;
-  the execution-role path and boundary; the revised scope, including the teardown lease B, its
-  approved window and its authorization record; the issuer's provenance, expiration and
-  revocation; the cost cap; and live evidence (budget and teardown) from a real run.
+  the execution-role wiring (path and boundary); the revised scope and teardown window, including
+  lease B and its authorization record; trusted issuance, expiry and revocation; the cost cap; and
+  live evidence (budget and teardown) from a real run.

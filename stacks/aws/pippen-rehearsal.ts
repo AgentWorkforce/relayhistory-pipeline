@@ -88,6 +88,7 @@ export type StateBucketErrorCode =
   | "state_issuer_pin_mismatch"
   | "state_provenance_mismatch"
   | "state_not_claimed"
+  | "state_teardown_in_progress"
   | "state_authorization_mismatch"
   | "state_gone_unproven"
   | "state_receipt_mismatch"
@@ -305,8 +306,13 @@ export function assertValidateOnlyState(aws: AwsRun, ctx: RehearsalContext): { b
   const bucket = validatePippenStateBucket(aws, ctx);
   const current = currentStateKeys(aws, { bucket, region: ctx.region, prefix });
   if (current.length === 0) throw new StateBucketError("state_not_claimed");
+  // No capture or deploy while a teardown is open (fences every writer against an active cleanup).
+  if (current.includes(teardownMarkerKey(prefix)) || readMarker(aws, { bucket, region: ctx.region, key: teardownMarkerKey(prefix) }) !== undefined)
+    throw new StateBucketError("state_teardown_in_progress");
   assertRunMarker(aws, { bucket, prefix, ctx });
-  if (current.length === 1 && current[0] === runMarkerKey(prefix)) assertRehearsalNamesUnused(aws, ctx);
+  // Stage A not applied yet: no resource state (only bookkeeping and the marker).
+  const bookkeeping = new Set([runMarkerKey(prefix), `${prefix}__lease__.json`, `${prefix}__stack_output__.json`]);
+  if (current.every((k) => bookkeeping.has(k))) assertRehearsalNamesUnused(aws, ctx);
   return { bucket, prefix };
 }
 
@@ -328,13 +334,14 @@ export function claimStageState(aws: AwsRun, ctx: RehearsalContext): { bucket: s
 }
 
 /**
- * The stage prefix's current keys (ListObjectsV2, at most two): the reply must be well formed, with
- * KeyCount exactly 0, 1 or 2 matching its Contents, every key under the prefix; anything else refuses.
+ * The stage prefix's current keys (ListObjectsV2, one page of at most 1000, which must be the whole
+ * listing): the reply must be well formed, not truncated, KeyCount matching its Contents, every key
+ * under the prefix; anything else refuses.
  */
 function currentStateKeys(aws: AwsRun, i: { bucket: string; region: string; prefix: string }): string[] {
   let listed: Record<string, unknown>;
   try {
-    const text = aws(["s3api", "list-objects-v2", "--bucket", i.bucket, "--region", i.region, "--prefix", i.prefix, "--max-keys", "2", "--no-paginate", "--output", "json"]);
+    const text = aws(["s3api", "list-objects-v2", "--bucket", i.bucket, "--region", i.region, "--prefix", i.prefix, "--max-keys", "1000", "--no-paginate", "--output", "json"]);
     if (!text.trim()) throw new Error("blank");
     listed = JSON.parse(text) as Record<string, unknown>;
   } catch {
@@ -343,7 +350,8 @@ function currentStateKeys(aws: AwsRun, i: { bucket: string; region: string; pref
   if (listed === null || typeof listed !== "object" || Array.isArray(listed)) throw new StateBucketError("state_bucket_unreadable");
   const contents = listed.Contents ?? [];
   if (
-    !(listed.KeyCount === 0 || listed.KeyCount === 1 || listed.KeyCount === 2) ||
+    !Number.isInteger(listed.KeyCount) || (listed.KeyCount as number) < 0 || (listed.KeyCount as number) > 1000 ||
+    (listed.IsTruncated !== undefined && listed.IsTruncated !== false) || listed.NextContinuationToken !== undefined ||
     !Array.isArray(contents) || contents.length !== listed.KeyCount ||
     !contents.every((c) => typeof (c as { Key?: unknown })?.Key === "string" && (c as { Key: string }).Key.startsWith(i.prefix) && (c as { Key: string }).Key.length > i.prefix.length) ||
     (listed.Prefix !== undefined && listed.Prefix !== i.prefix)
@@ -512,30 +520,59 @@ function putMarker(aws: AwsRun, i: { bucket: string; region: string; key: string
  * cannot interleave: it needs an empty version inventory, and the teardown marker exists until the
  * very last call. Run it only through runRehearsalTeardown (every check first).
  */
-export function teardownStageState(aws: AwsRun, i: { bucket: string; region: string; stage: string; execute?: boolean; teardownMarker?: string }): { listed: number; deleted: number; remaining: number } {
+export function teardownStageState(
+  aws: AwsRun,
+  i: { bucket: string; region: string; stage: string; execute?: boolean; teardownMarker?: string; runMarker?: string | null },
+): { listed: number; deleted: number; remaining: number } {
   const prefix = rehearsalStatePrefix(i.stage);
   const all = listStageStateVersions(aws, i);
   if (!i.execute) return { listed: all.length, deleted: 0, remaining: all.length };
-  if (i.teardownMarker === undefined) throw new StateBucketError("state_teardown_failed");
+  if (i.teardownMarker === undefined || i.runMarker === undefined) throw new StateBucketError("state_teardown_failed");
   const run = runMarkerKey(prefix);
   const td = teardownMarkerKey(prefix);
   const where = { bucket: i.bucket, region: i.region, prefix };
-  const existing = readMarker(aws, { bucket: i.bucket, region: i.region, key: td });
-  if (existing === undefined) putMarker(aws, { bucket: i.bucket, region: i.region, key: td, body: i.teardownMarker });
-  else if (existing !== i.teardownMarker) throw new StateBucketError("state_provenance_mismatch");
-  const others = listStageStateVersions(aws, i).filter((o) => o.Key !== run && o.Key !== td);
+  const read = (key: string) => readMarker(aws, { bucket: i.bucket, region: i.region, key });
+  // 1. The teardown marker: written only over this run's own marker (or found, exactly this teardown's).
+  const existing = read(td);
+  if (existing === undefined) {
+    if (i.runMarker === null || read(run) !== i.runMarker) throw new StateBucketError("state_provenance_mismatch");
+    putMarker(aws, { bucket: i.bucket, region: i.region, key: td, body: i.teardownMarker });
+  } else if (existing !== i.teardownMarker) throw new StateBucketError("state_provenance_mismatch");
+  // 2. The generation: the exact version ids of the teardown marker and the run marker, recorded now.
+  const start = listStageStateVersions(aws, i);
+  const tdVersions = start.filter((o) => o.Key === td);
+  const runVersions = start.filter((o) => o.Key === run);
+  if (tdVersions.length !== 1) throw new StateBucketError("state_provenance_mismatch");
+  if (i.runMarker === null ? runVersions.length !== 0 : runVersions.length !== 1 || read(run) !== i.runMarker) throw new StateBucketError("state_provenance_mismatch");
+  const tdV = tdVersions[0]!.VersionId;
+  const runV = runVersions[0]?.VersionId;
+  // The fence, before every delete: the original teardown marker (same version id, same body) is
+  // still the only teardown marker, and no run marker version other than the recorded one exists.
+  // A stale executor whose generation was completed by another, and whose prefix was then claimed
+  // by a new run, stops here instead of deleting the new run's versions.
+  const fence = () => {
+    const now = listStageStateVersions(aws, i);
+    const t = now.filter((o) => o.Key === td);
+    if (t.length !== 1 || t[0]!.VersionId !== tdV || read(td) !== i.teardownMarker) throw new StateBucketError("state_provenance_mismatch");
+    if (now.some((o) => o.Key === run && o.VersionId !== runV)) throw new StateBucketError("state_provenance_mismatch");
+    return now;
+  };
+  // 3. Every other version, by the ids listed at the start of this generation.
+  const others = start.filter((o) => o.Key !== run && o.Key !== td);
+  fence();
   deleteVersions(aws, where, others);
-  const afterOthers = listStageStateVersions(aws, i);
+  // 4. The run marker, alone, by its recorded version id only.
+  const afterOthers = fence();
   if (afterOthers.some((o) => o.Key !== run && o.Key !== td)) throw new StateBucketError("state_teardown_not_empty");
-  const runVersions = afterOthers.filter((o) => o.Key === run);
-  deleteVersions(aws, where, runVersions);
-  const afterRun = listStageStateVersions(aws, i);
-  if (afterRun.some((o) => o.Key !== td)) throw new StateBucketError("state_teardown_not_empty");
-  deleteVersions(aws, where, afterRun);
+  if (runV !== undefined) deleteVersions(aws, where, [{ Key: run, VersionId: runV }]);
+  // 5. The teardown marker, last and alone, by its recorded version id only.
+  const afterRun = fence();
+  if (afterRun.length !== 1) throw new StateBucketError("state_teardown_not_empty");
+  deleteVersions(aws, where, [{ Key: td, VersionId: tdV }]);
   // Explicit empty-prefix evidence: an independent re-list of versions and delete markers.
   const remaining = listStageStateVersions(aws, i).length;
   if (remaining !== 0) throw new StateBucketError("state_teardown_not_empty");
-  return { listed: all.length, deleted: others.length + runVersions.length + afterRun.length, remaining };
+  return { listed: all.length, deleted: others.length + (runV === undefined ? 0 : 1) + 1, remaining };
 }
 
 /**
@@ -1147,5 +1184,5 @@ export function runRehearsalTeardown(
     const td = teardownMarkerKey(prefix);
     if (!inventory.every((o) => o.Key === td) || readMarker(aws, { bucket, region: ctx.region, key: td }) !== teardownMarker) throw new StateBucketError("state_provenance_mismatch");
   } else if (runMarker !== runMarkerBody(original)) throw new StateBucketError("state_provenance_mismatch");
-  return teardownStageState(aws, { bucket, region: ctx.region, stage: REHEARSAL_STAGE, execute: true, teardownMarker });
+  return teardownStageState(aws, { bucket, region: ctx.region, stage: REHEARSAL_STAGE, execute: true, teardownMarker, runMarker: runMarker === undefined ? null : runMarker });
 }

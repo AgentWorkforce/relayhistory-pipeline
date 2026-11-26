@@ -86,7 +86,7 @@ const CTX: RehearsalContext = rehearsalRunContext(REHEARSAL_STAGE, INPUTS, ENV, 
 /** A fake aws CLI over the fixture responses; every call is recorded. */
 function fakeBucket(
   over: Record<string, unknown> = {},
-  opts: { absent?: boolean; caller?: string; account?: string; errors?: Record<string, string>; stateEmpty?: boolean; inUse?: string[]; composite?: string[]; listing?: unknown; alarmsReply?: unknown; groupsReply?: unknown; marker?: string | null; denied?: string } = {},
+  opts: { absent?: boolean; caller?: string; account?: string; errors?: Record<string, string>; stateEmpty?: boolean; inUse?: string[]; composite?: string[]; listing?: unknown; alarmsReply?: unknown; groupsReply?: unknown; marker?: string | null; denied?: string; teardownMarker?: string } = {},
 ) {
   const calls: string[][] = [];
   const aws: AwsRun = (args) => {
@@ -98,6 +98,10 @@ function fakeBucket(
     if (op === "list-objects-v2") return JSON.stringify(opts.listing ?? (opts.stateEmpty ? { KeyCount: 0 } : { KeyCount: 1, Contents: [{ Key: `${PREFIX}session-pipeline.json` }] }));
     if (op === "put-object") return JSON.stringify({ ETag: '"e"' });
     if (args[0] === "s3" && op === "cp") {
+      if (args[2]!.endsWith("__rehearsal_teardown__.marker")) {
+        if (opts.teardownMarker === undefined) throw new Error("An error occurred (404) NoSuchKey");
+        return opts.teardownMarker;
+      }
       const marker = opts.marker === undefined ? runMarkerBody(CTX) : opts.marker;
       if (marker === null) throw new Error("An error occurred (404) NoSuchKey");
       return marker;
@@ -197,6 +201,14 @@ describe("backend selection: decided from validated inputs, before any state bac
     const clean = fakeBucket({}, { listing: markerOnly });
     expect(run(clean)).toBe("ok");
     expect(clean.writes()).toEqual([]);
+    // Alchemy's lease file alone does not mean stage A was applied: the names are still checked.
+    expect(run(fakeBucket({}, { listing: { KeyCount: 2, Contents: [{ Key: `${PREFIX}__lease__.json` }, { Key: runMarkerKey(PREFIX) }] }, inUse: ["96bulls-aws-rehearse-p1-1126-session-pipeline"] }))).toBe("state_resources_remain");
+    // While a teardown is open (its marker present), no capture or deploy runs, whatever else is there.
+    for (const listing of [{ KeyCount: 2, Contents: [{ Key: runMarkerKey(PREFIX) }, { Key: teardownMarkerKey(PREFIX) }] }, { KeyCount: 2, Contents: [{ Key: runMarkerKey(PREFIX) }, { Key: `${PREFIX}session-search.json` }] }]) {
+      const f = fakeBucket({}, { listing, teardownMarker: TD });
+      expect([listing, run(f)]).toEqual([listing, "state_teardown_in_progress"]);
+      expect(f.writes()).toEqual([]);
+    }
     // Stage A applied (the marker and resources): resumed with this run's marker, no names check, no write.
     const later = fakeBucket({}, { listing: { KeyCount: 2, Contents: [{ Key: runMarkerKey(PREFIX) }, { Key: `${PREFIX}session-search.json` }] }, inUse: ["96bulls-aws-rehearse-p1-1126-session-pipeline"] });
     expect(run(later)).toBe("ok");
@@ -204,7 +216,7 @@ describe("backend selection: decided from validated inputs, before any state bac
     expect(later.writes()).toEqual([]);
     for (const marker of [null, "", runMarkerBody({ ...CTX, runId: "77777777-7777-4777-8777-777777777777" }), runMarkerBody({ ...CTX, sessionId: "11111111-1111-4111-8111-111111111111" }), runMarkerBody({ ...CTX, pin: "0".repeat(64) })])
       expect([marker, run(fakeBucket({}, { marker }))]).toEqual([marker, "state_provenance_mismatch"]);
-    for (const listing of [{ KeyCount: 3, Contents: [{ Key: `${PREFIX}a.json` }, { Key: `${PREFIX}b.json` }, { Key: `${PREFIX}c.json` }] }, { KeyCount: -1 }, { KeyCount: "1", Contents: [{ Key: `${PREFIX}a.json` }] }, { KeyCount: 1 }, { KeyCount: 0, Contents: [{ Key: `${PREFIX}a.json` }] }, { KeyCount: 1, Contents: [{ Key: "96bulls/96bulls-aws/aws-proof-sandbox/a.json" }] }, { KeyCount: 1, Contents: [{ Key: PREFIX }] }, []])
+    for (const listing of [{ KeyCount: 1, IsTruncated: true, Contents: [{ Key: `${PREFIX}a.json` }] }, { KeyCount: 1, NextContinuationToken: "t", Contents: [{ Key: `${PREFIX}a.json` }] }, { KeyCount: -1 }, { KeyCount: "1", Contents: [{ Key: `${PREFIX}a.json` }] }, { KeyCount: 1 }, { KeyCount: 0, Contents: [{ Key: `${PREFIX}a.json` }] }, { KeyCount: 1, Contents: [{ Key: "96bulls/96bulls-aws/aws-proof-sandbox/a.json" }] }, { KeyCount: 1, Contents: [{ Key: PREFIX }] }, []])
       expect([listing, run(fakeBucket({}, { listing }))]).toEqual([listing, "state_bucket_unreadable"]);
     expect(ensured).toBe(0);
   });
@@ -285,6 +297,7 @@ describe("validate-only: the shared state bucket is read, never created or chang
       "s3api get-bucket-ownership-controls",
       "s3api get-bucket-tagging",
       "s3api list-objects-v2",
+      "s3 cp",
       "s3 cp",
     ]);
   });
@@ -501,7 +514,12 @@ function statefulS3(initial: [string, string][], bodies: Record<string, string>,
     }
     throw new Error(`unexpected ${args.join(" ")}`);
   };
-  return { aws, calls, versions: () => versions, deleteBatches: () => batches };
+  /** A writer outside the executor under test (another run's claim). */
+  const put = (key: string, body: string) => {
+    current[key] = body;
+    versions.push([key, `p${++n}`]);
+  };
+  return { aws, calls, versions: () => versions, deleteBatches: () => batches, put };
 }
 
 /** The bucket, caller and names reads around a stateful prefix (for the claim). */
@@ -544,7 +562,7 @@ describe("teardown: only this stage's state keys, with evidence", () => {
 
   it("ordered deletion: all other versions first, then the run marker alone, then the teardown marker last and alone", () => {
     const s3 = statefulS3([[`${PREFIX}session-search.json`, "v1"], [`${PREFIX}session-search.json`, "v2"], [`${PREFIX}gone.json`, "dm1"], [runMarkerKey(PREFIX), "m1"]], { [runMarkerKey(PREFIX)]: runMarkerBody(CTX) });
-    expect(teardownStageState(s3.aws, { ...target, execute: true, teardownMarker: TD })).toEqual({ listed: 4, deleted: 5, remaining: 0 });
+    expect(teardownStageState(s3.aws, { ...target, execute: true, teardownMarker: TD, runMarker: runMarkerBody(CTX) })).toEqual({ listed: 4, deleted: 5, remaining: 0 });
     const deletes = s3.deleteBatches();
     expect(deletes).toEqual([
       [`${PREFIX}session-search.json`, `${PREFIX}session-search.json`, `${PREFIX}gone.json`],
@@ -561,31 +579,97 @@ describe("teardown: only this stage's state keys, with evidence", () => {
 
   it("partial batch success: the run marker survives, the retry resumes and completes", () => {
     const s3 = statefulS3([[`${PREFIX}a.json`, "v1"], [`${PREFIX}b.json`, "v2"], [runMarkerKey(PREFIX), "m1"]], { [runMarkerKey(PREFIX)]: runMarkerBody(CTX) }, { partialFirstDelete: true });
-    expect(codeOf(() => teardownStageState(s3.aws, { ...target, execute: true, teardownMarker: TD }))).toBe("state_teardown_failed");
+    expect(codeOf(() => teardownStageState(s3.aws, { ...target, execute: true, teardownMarker: TD, runMarker: runMarkerBody(CTX) }))).toBe("state_teardown_failed");
     // The run marker is still there, with the surviving version.
     expect(s3.versions().map((v) => v[0]).sort()).toEqual([`${PREFIX}b.json`, teardownMarkerKey(PREFIX), runMarkerKey(PREFIX)].sort());
-    expect(teardownStageState(s3.aws, { ...target, execute: true, teardownMarker: TD })).toMatchObject({ remaining: 0 });
+    expect(teardownStageState(s3.aws, { ...target, execute: true, teardownMarker: TD, runMarker: runMarkerBody(CTX) })).toMatchObject({ remaining: 0 });
     expect(s3.versions()).toEqual([]);
   });
 
   it("a delete that reports success but leaves a version is refused before the markers are touched", () => {
     const s3 = statefulS3([[`${PREFIX}a.json`, "v1"], [runMarkerKey(PREFIX), "m1"]], { [runMarkerKey(PREFIX)]: runMarkerBody(CTX) }, { silentlyKeep: `${PREFIX}a.json` });
-    expect(codeOf(() => teardownStageState(s3.aws, { ...target, execute: true, teardownMarker: TD }))).toBe("state_teardown_not_empty");
+    expect(codeOf(() => teardownStageState(s3.aws, { ...target, execute: true, teardownMarker: TD, runMarker: runMarkerBody(CTX) }))).toBe("state_teardown_not_empty");
     expect(s3.versions().map((v) => v[0])).toContain(runMarkerKey(PREFIX));
   });
 
   it("the final re-list is the evidence: a teardown marker that survives its delete refuses success", () => {
     const s3 = statefulS3([[`${PREFIX}a.json`, "v1"], [runMarkerKey(PREFIX), "m1"]], { [runMarkerKey(PREFIX)]: runMarkerBody(CTX) }, { silentlyKeep: teardownMarkerKey(PREFIX) });
-    expect(codeOf(() => teardownStageState(s3.aws, { ...target, execute: true, teardownMarker: TD }))).toBe("state_teardown_not_empty");
+    expect(codeOf(() => teardownStageState(s3.aws, { ...target, execute: true, teardownMarker: TD, runMarker: runMarkerBody(CTX) }))).toBe("state_teardown_not_empty");
+  });
+
+  it("generation fencing: a stale executor T1, overtaken by T2 and a NEW claim, never deletes the new run's marker (each pause point)", () => {
+    const NEW = runMarkerBody({ ...CTX, runId: "77777777-7777-4777-8777-777777777777" });
+    // T1 pauses before its k-th DeleteObjects; meanwhile T2 (same receipts) completes and a new run claims the empty prefix.
+    for (const k of [1, 2, 3]) {
+      const s3 = statefulS3([[`${PREFIX}a.json`, "v1"], [`${PREFIX}b.json`, "v2"], [runMarkerKey(PREFIX), "m1"]], { [runMarkerKey(PREFIX)]: runMarkerBody(CTX) });
+      let deletes = 0;
+      let interleaved = false;
+      const t1: AwsRun = (args) => {
+        if (args[1] === "delete-objects" && ++deletes === k && !interleaved) {
+          interleaved = true;
+          // T2 decides its resume state as runRehearsalTeardown does: the run marker if present, else teardown-marker-only.
+          const t2Marker = s3.versions().some(([key]) => key === runMarkerKey(PREFIX)) ? runMarkerBody(CTX) : null;
+          expect(teardownStageState(s3.aws, { ...target, execute: true, teardownMarker: TD, runMarker: t2Marker })).toMatchObject({ remaining: 0 });
+          s3.put(runMarkerKey(PREFIX), NEW);
+        }
+        return s3.aws(args);
+      };
+      // Pausing inside the delete call itself would pass T1's fence first; T1 must recheck before each next step.
+      const code = codeOf(() => teardownStageState(t1, { ...target, execute: true, teardownMarker: TD, runMarker: runMarkerBody(CTX) }));
+      expect([k, code]).toEqual([k, k === 1 ? "state_provenance_mismatch" : expect.stringMatching(/^state_(provenance_mismatch|teardown_not_empty)$/)]);
+      // The new run's marker survives, untouched.
+      expect([k, s3.versions().filter(([key]) => key === runMarkerKey(PREFIX)).length]).toEqual([k, 1]);
+    }
+    // The exact reproduction: T1 has deleted the ordinary versions (its first DeleteObjects returned),
+    // then T2 completes and a new run claims; T1 resumes at the run-marker step and must stop.
+    const s3 = statefulS3([[`${PREFIX}a.json`, "v1"], [runMarkerKey(PREFIX), "m1"]], { [runMarkerKey(PREFIX)]: runMarkerBody(CTX) });
+    let first = true;
+    const t1: AwsRun = (args) => {
+      const out = s3.aws(args);
+      if (args[1] === "delete-objects" && first) {
+        first = false;
+        teardownStageState(s3.aws, { ...target, execute: true, teardownMarker: TD, runMarker: runMarkerBody(CTX) });
+        s3.put(runMarkerKey(PREFIX), NEW);
+      }
+      return out;
+    };
+    expect(codeOf(() => teardownStageState(t1, { ...target, execute: true, teardownMarker: TD, runMarker: runMarkerBody(CTX) }))).toBe("state_provenance_mismatch");
+    expect(s3.versions()).toEqual([[runMarkerKey(PREFIX), expect.any(String)]]);
+    // A new run's marker, a missing run marker, or a second teardown-marker version also stop T1 at the start.
+    const swapped = statefulS3([[`${PREFIX}a.json`, "v1"], [runMarkerKey(PREFIX), "m9"]], { [runMarkerKey(PREFIX)]: NEW });
+    expect(codeOf(() => teardownStageState(swapped.aws, { ...target, execute: true, teardownMarker: TD, runMarker: runMarkerBody(CTX) }))).toBe("state_provenance_mismatch");
+    expect(swapped.deleteBatches()).toEqual([]);
+    // ...and no teardown marker is written into another run's prefix.
+    expect(swapped.calls.some((c) => c[1] === "put-object")).toBe(false);
+    // Isolated fences: during a pause, only the teardown marker's version changes (same body), or only a
+    // new run-marker version appears: either stops T1 before its next delete.
+    for (const disturb of ["teardown marker re-put", "run marker overwritten"] as const) {
+      const d = statefulS3([[`${PREFIX}a.json`, "v1"], [runMarkerKey(PREFIX), "m1"]], { [runMarkerKey(PREFIX)]: runMarkerBody(CTX) });
+      let done = false;
+      const t: AwsRun = (args) => {
+        const out = d.aws(args);
+        if (args[1] === "delete-objects" && !done) {
+          done = true;
+          if (disturb === "teardown marker re-put") {
+            const v = d.versions().find(([key]) => key === teardownMarkerKey(PREFIX))!;
+            d.aws(["s3api", "delete-objects", "--delete", JSON.stringify({ Objects: [{ Key: v[0], VersionId: v[1] }] })]);
+            d.put(teardownMarkerKey(PREFIX), TD);
+          } else d.put(runMarkerKey(PREFIX), NEW);
+        }
+        return out;
+      };
+      expect([disturb, codeOf(() => teardownStageState(t, { ...target, execute: true, teardownMarker: TD, runMarker: runMarkerBody(CTX) }))]).toEqual([disturb, "state_provenance_mismatch"]);
+      expect([disturb, d.versions().some(([key]) => key === runMarkerKey(PREFIX))]).toEqual([disturb, true]);
+    }
   });
 
   it("a claim cannot interleave: while any version or either marker exists the claim refuses", () => {
     const s3 = statefulS3([[`${PREFIX}a.json`, "v1"], [runMarkerKey(PREFIX), "m1"]], { [runMarkerKey(PREFIX)]: runMarkerBody(CTX) }, { partialFirstDelete: true });
-    expect(codeOf(() => teardownStageState(s3.aws, { ...target, execute: true, teardownMarker: TD }))).toBe("state_teardown_failed");
+    expect(codeOf(() => teardownStageState(s3.aws, { ...target, execute: true, teardownMarker: TD, runMarker: runMarkerBody(CTX) }))).toBe("state_teardown_failed");
     const other = { ...CTX, runId: "77777777-7777-4777-8777-777777777777" };
     expect(codeOf(() => claimStageState(withStateAndBucket(s3.aws), other))).toBe("state_provenance_mismatch");
     // Down to the teardown marker only: still refused.
-    teardownStageState(s3.aws, { ...target, execute: true, teardownMarker: TD });
+    teardownStageState(s3.aws, { ...target, execute: true, teardownMarker: TD, runMarker: runMarkerBody(CTX) });
     expect(s3.versions()).toEqual([]);
     expect(codeOf(() => claimStageState(withStateAndBucket(s3.aws), other))).toBe("ok");
   });
@@ -602,7 +686,7 @@ describe("teardown: only this stage's state keys, with evidence", () => {
   it("validates every page strictly: blank output, a missing or non-boolean IsTruncated, missing markers, non-arrays, unknown fields, another prefix", () => {
     for (const [name, pages] of Object.entries(fixture<Record<string, unknown[]>>("teardown.malformed.json"))) {
       const f = fakeListing(pages);
-      expect([name, codeOf(() => teardownStageState(f.aws, { ...target, execute: true, teardownMarker: TD }))]).toEqual([name, "state_teardown_failed"]);
+      expect([name, codeOf(() => teardownStageState(f.aws, { ...target, execute: true, teardownMarker: TD, runMarker: runMarkerBody(CTX) }))]).toEqual([name, "state_teardown_failed"]);
       expect([name, f.calls.filter((c) => c[1] === "delete-objects").length]).toEqual([name, 0]);
     }
     const failing: AwsRun = () => {
@@ -616,10 +700,10 @@ describe("teardown: only this stage's state keys, with evidence", () => {
     }
     expect(message).toMatch(/state_teardown_failed/);
     expect(message).not.toContain("secret-ish-canary");
-    expect(codeOf(() => teardownStageState(statefulS3([[`${PREFIX}a.json`, "v1"], [`${PREFIX}b.json`, "v2"]], {}, { partialFirstDelete: true }).aws, { ...target, execute: true, teardownMarker: TD }))).toBe("state_teardown_failed");
+    expect(codeOf(() => teardownStageState(statefulS3([[`${PREFIX}a.json`, "v1"], [`${PREFIX}b.json`, "v2"], [runMarkerKey(PREFIX), "m1"]], { [runMarkerKey(PREFIX)]: runMarkerBody(CTX) }, { partialFirstDelete: true }).aws, { ...target, execute: true, teardownMarker: TD, runMarker: runMarkerBody(CTX) }))).toBe("state_teardown_failed");
     // Another teardown's marker already there: refused before any delete.
     const foreignTd = statefulS3([[`${PREFIX}a.json`, "v1"], [teardownMarkerKey(PREFIX), "t1"]], { [teardownMarkerKey(PREFIX)]: "{}" });
-    expect(codeOf(() => teardownStageState(foreignTd.aws, { ...target, execute: true, teardownMarker: TD }))).toBe("state_provenance_mismatch");
+    expect(codeOf(() => teardownStageState(foreignTd.aws, { ...target, execute: true, teardownMarker: TD, runMarker: runMarkerBody(CTX) }))).toBe("state_provenance_mismatch");
     expect(foreignTd.deleteBatches()).toEqual([]);
     expect(codeOf(() => teardownStageState(fakeListing([]).aws, { ...target, stage: "aws-proof-sandbox", execute: true }))).toBe("state_prefix_mismatch");
   });
@@ -1141,7 +1225,13 @@ describe("teardown under an authorized teardown lease (B) of a run captured unde
     expect(mappings.Resource).toEqual([U1, U2].map((u) => `arn:aws:lambda:${REGION}:${ACCOUNT}:event-source-mapping:${u}`));
     // A retained role is never deleted.
     const kept = rehearsalTeardownPolicies({ accountId: ACCOUNT, roleArn: ROLE, roleDisposition: "retained", expiresAt: EXPIRES_B, mappingUuids: [U1, U2] });
-    expect(JSON.stringify(kept)).not.toContain("iam:DeleteRole");
+    for (const x of ["iam:DeleteRole", "iam:DetachRolePolicy", "iam:DeleteRolePolicy", "iam:ListAttachedRolePolicies", "iam:ListRolePolicies"]) expect([x, JSON.stringify(kept.managed).includes(x)]).toEqual([x, false]);
+    // The deleted disposition's role rights are scoped to exactly the pinned role ARN.
+    const role = allows.find((x) => x.Sid === "Role")!;
+    expect(role).toMatchObject({ Action: ["iam:DeleteRole", "iam:ListAttachedRolePolicies", "iam:DetachRolePolicy", "iam:ListRolePolicies", "iam:DeleteRolePolicy"], Resource: ROLE });
+    expect(allows.filter((x) => ([] as string[]).concat(x.Action as string[]).some((y) => y.startsWith("iam:"))).map((x) => [x.Sid, x.Resource])).toEqual([["Role", ROLE], ["RoleRead", ROLE]]);
+    // The only wildcard resources are the two discovery reads IAM cannot narrow (broker decisions).
+    expect(allows.filter((x) => x.Resource === "*").flatMap((x) => x.Action as string[])).toEqual(["lambda:ListEventSourceMappings", "logs:DescribeLogGroups"]);
     // The expiry is in every Allow and the inline Deny; the digest changes with it.
     expect(allows.every((x) => (x.Condition as Record<string, Record<string, string>>).DateLessThan["aws:CurrentTime"] === EXPIRES_B)).toBe(true);
     expect((t.inline.Statement as Record<string, unknown>[]).find((x) => x.Sid === "End")).toMatchObject({ Condition: { DateGreaterThanEquals: { "aws:CurrentTime": EXPIRES_B } } });
