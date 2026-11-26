@@ -32,6 +32,8 @@ const INSTANCE_DOWN = read("supabase/rollbacks/20261105062220_coordination_advis
 // 20261105062300 (the search-index stage) sits above 062220: its down runs first of all.
 const SEARCH_STAGE_STEP = "upstream:20261105062300_search_index_stage.sql";
 const SEARCH_STAGE_DOWN = read("supabase/rollbacks/20261105062300_search_index_stage.down.sql");
+// 062310 is newer than 062300: its down comes off first.
+const OBSERVED_PATHS_DOWN = read("supabase/rollbacks/20261105062310_event_facts_observed_paths.down.sql");
 const LOCAL: MigrationProfile = { mode: "local", shim: true, bootstrap: true, verify: false, runtimeRole: "postgres" };
 const V2 = "sessions.coordination_advisories_pending_for_v2(text,text,text,text,integer)";
 const V1 = "sessions.coordination_advisories_pending_for_v1(text,text,text,text)";
@@ -176,6 +178,7 @@ describe("20261105062190 coordination_advisories_pending_for_v2", () => {
     expect(warns).toEqual([]);
     // 20261105062200 (session list readiness), 062210 (T2 staged ACK) and 062220 (the advisory instance) sit above
     // 062190: their downs run first, newest first.
+    await db.exec(OBSERVED_PATHS_DOWN);
     await db.exec(SEARCH_STAGE_DOWN);
     await db.exec(INSTANCE_DOWN);
     await db.exec(read("supabase/rollbacks/20261105062210_lazy_ack_t2.down.sql")); // 062210 (T2 staged ACK) sits above 062200: first.
@@ -196,9 +199,10 @@ describe("20261105062190 rollback", () => {
     try {
       // 20261105062200 (session list readiness), 20261105062210 (T2 staged ACK) and 20261105062220 (the advisory
       // instance) are the later steps: this down refuses under them; they come off first, newest first.
-      expect((await plan(LOCAL)).filter((s) => s.name.startsWith("upstream:") && s.name > STEP).map((s) => s.name)).toEqual(["upstream:20261105062200_session_directory_list_readiness.sql", "upstream:20261105062210_lazy_ack_t2.sql", INSTANCE_STEP, SEARCH_STAGE_STEP]);
+      expect((await plan(LOCAL)).filter((s) => s.name.startsWith("upstream:") && s.name > STEP).map((s) => s.name)).toEqual(["upstream:20261105062200_session_directory_list_readiness.sql", "upstream:20261105062210_lazy_ack_t2.sql", INSTANCE_STEP, SEARCH_STAGE_STEP, "upstream:20261105062310_event_facts_observed_paths.sql"]);
       expect(await message(DOWN)).toContain("a later migration is applied");
-      await db.exec(SEARCH_STAGE_DOWN);
+      await db.exec(OBSERVED_PATHS_DOWN);
+    await db.exec(SEARCH_STAGE_DOWN);
       await db.exec(INSTANCE_DOWN);
       await db.exec(read("supabase/rollbacks/20261105062210_lazy_ack_t2.down.sql")); // 062210 (T2 staged ACK) sits above 062200: first.
       await db.exec(read("supabase/rollbacks/20261105062200_session_directory_list_readiness.down.sql"));

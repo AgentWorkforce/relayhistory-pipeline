@@ -399,3 +399,34 @@ describe("legacyAndTurns: linear append, no argument spread (the whole-set path 
     expect(() => [].push(...(items as never[]))).toThrow(RangeError);
   });
 });
+
+describe("observed paths (dormant option)", () => {
+  /** The fixture plus one tool result that is a git status listing. */
+  const withStatus = () => {
+    const fx = outputFixture();
+    const result = fx.projectionRows.find((r) => r.table === "convergence_events" && r.row.actor_role === "tool_result")!;
+    fx.projectionRows.push({ table: "convergence_events", row: { ...result.row, event_id: "status-1", content: " M src/a.ts\n?? docs/b.md\n" } });
+    return fx;
+  };
+  test("off (the default): rows are byte-identical to before and carry no observed_paths key", () => {
+    const fx = withStatus();
+    const off = outputFactsFromScope(OUTPUT_FIXTURE_SCOPE, fx, 1);
+    expect(outputFactsFromScope(OUTPUT_FIXTURE_SCOPE, fx, 1, { observedPaths: false })).toEqual(off);
+    for (const e of off.events) expect("observed_paths" in e).toBe(false);
+  });
+  test("on: only tool results that are listings gain paths, and only their fingerprints change", () => {
+    const fx = withStatus();
+    const off = outputFactsFromScope(OUTPUT_FIXTURE_SCOPE, fx, 1), on = outputFactsFromScope(OUTPUT_FIXTURE_SCOPE, fx, 1, { observedPaths: true });
+    expect(on.events).toHaveLength(off.events.length);
+    const status = on.events.find((e) => e.event_id === "status-1")!;
+    expect(status.observed_paths).toEqual(["src/a.ts", "docs/b.md"]);
+    expect(status.fingerprint).not.toBe(off.events.find((e) => e.event_id === "status-1")!.fingerprint);
+    for (const [i, e] of on.events.entries()) {
+      if (e.event_id === "status-1") continue;
+      expect(e.observed_paths).toEqual([]);
+      expect(e.fingerprint).toBe(off.events[i]!.fingerprint);
+      expect(e.row_id).toBe(off.events[i]!.row_id);
+    }
+    expect(on.facts).toEqual(off.facts);
+  });
+});
