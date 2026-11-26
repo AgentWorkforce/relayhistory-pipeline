@@ -89,6 +89,7 @@ export type StateBucketErrorCode =
   | "state_provenance_mismatch"
   | "state_not_claimed"
   | "state_teardown_in_progress"
+  | "state_not_drained"
   | "state_authorization_mismatch"
   | "state_gone_unproven"
   | "state_receipt_mismatch"
@@ -462,6 +463,17 @@ export function prepareStateBackend(
 interface VersionEntry {
   Key?: unknown;
   VersionId?: unknown;
+  LastModified?: unknown;
+  IsLatest?: unknown;
+}
+
+/** A listed version or delete marker, with what the drain check reads. */
+interface StateEntry {
+  Key: string;
+  VersionId: string;
+  LastModified: unknown;
+  IsLatest: unknown;
+  deleteMarker: boolean;
 }
 
 /** The fields a ListObjectVersions response may carry (no delimiter is used, so no CommonPrefixes). */
@@ -498,8 +510,12 @@ function listVersionsPage(aws: AwsRun, args: string[], prefix: string) {
  * deleted, when any listed key is outside the prefix or an entry has no key or version id.
  */
 export function listStageStateVersions(aws: AwsRun, i: { bucket: string; region: string; stage: string }): { Key: string; VersionId: string }[] {
+  return listStageStateEntries(aws, i).map((v) => ({ Key: v.Key, VersionId: v.VersionId }));
+}
+
+function listStageStateEntries(aws: AwsRun, i: { bucket: string; region: string; stage: string }): StateEntry[] {
   const prefix = rehearsalStatePrefix(i.stage);
-  const out: { Key: string; VersionId: string }[] = [];
+  const out: StateEntry[] = [];
   let marker: { key: string; version: string } | undefined;
   for (let n = 0; n < 10_000; n++) {
     const page = listVersionsPage(
@@ -510,10 +526,12 @@ export function listStageStateVersions(aws: AwsRun, i: { bucket: string; region:
       ],
       prefix,
     );
-    for (const v of [...(page.Versions ?? []), ...(page.DeleteMarkers ?? [])]) {
+    const versions = (page.Versions ?? []).map((v) => [v, false] as const);
+    const markers = (page.DeleteMarkers ?? []).map((v) => [v, true] as const);
+    for (const [v, deleteMarker] of [...versions, ...markers]) {
       if (v === null || typeof v !== "object" || typeof v.Key !== "string" || typeof v.VersionId !== "string" || !v.VersionId) throw new StateBucketError("state_teardown_failed");
       if (!v.Key.startsWith(prefix) || v.Key.length === prefix.length) throw new StateBucketError("state_teardown_outside_prefix");
-      out.push({ Key: v.Key, VersionId: v.VersionId });
+      out.push({ Key: v.Key, VersionId: v.VersionId, LastModified: v.LastModified, IsLatest: v.IsLatest, deleteMarker });
     }
     if (!page.IsTruncated) return out;
     marker = { key: page.NextKeyMarker!, version: page.NextVersionIdMarker! };
@@ -521,11 +539,15 @@ export function listStageStateVersions(aws: AwsRun, i: { bucket: string; region:
   throw new StateBucketError("state_teardown_failed");
 }
 
-/** One DeleteObjects call by exact key and version id, every key rechecked against the prefix. */
-function deleteVersions(aws: AwsRun, i: { bucket: string; region: string; prefix: string }, objects: readonly { Key: string; VersionId: string }[]): void {
+/**
+ * DeleteObjects by exact key and version id, in batches of at most 1000, every key rechecked against
+ * the prefix, and `beforeBatch` (the teardown's caller and generation fence) run before EACH batch.
+ */
+function deleteVersions(aws: AwsRun, i: { bucket: string; region: string; prefix: string }, objects: readonly { Key: string; VersionId: string }[], beforeBatch: () => void): void {
   for (let n = 0; n < objects.length; n += 1000) {
-    const batch = objects.slice(n, n + 1000);
+    const batch = objects.slice(n, n + 1000).map((o) => ({ Key: o.Key, VersionId: o.VersionId }));
     if (!batch.every((o) => o.Key.startsWith(i.prefix) && o.Key.length > i.prefix.length)) throw new StateBucketError("state_teardown_outside_prefix");
+    beforeBatch();
     let result: { Errors?: unknown };
     try {
       const text = aws(["s3api", "delete-objects", "--bucket", i.bucket, "--region", i.region, "--output", "json", "--delete", JSON.stringify({ Objects: batch, Quiet: true })]);
@@ -556,7 +578,7 @@ function deleteVersions(aws: AwsRun, i: { bucket: string; region: string; prefix
  */
 export function teardownStageState(
   aws: AwsRun,
-  i: { bucket: string; region: string; stage: string; execute?: boolean; original?: RehearsalContext; receipts?: GenerationReceipts; assertCaller?: () => void },
+  i: { bucket: string; region: string; stage: string; execute?: boolean; original?: RehearsalContext; receipts?: GenerationReceipts; supersedes?: GenerationReceipts; assertCaller?: () => void },
 ): { listed: number; deleted: number; remaining: number } {
   const prefix = rehearsalStatePrefix(i.stage);
   const all = listStageStateVersions(aws, i);
@@ -570,7 +592,11 @@ export function teardownStageState(
   const gen = readGeneration(aws, where);
   if (gen === undefined) throw new StateBucketError("state_provenance_mismatch");
   let recorded: { etag: string; versionId: string };
-  if (gen.body === generationBody(i.original, "claimed")) recorded = putGeneration(aws, { ...where, body: tearing, ifMatch: gen.etag });
+  // The swap source: this run's claimed generation, or (a successor lease only) the tearing-down
+  // generation of the superseded authorization, same run and manifest. A retry takes its own as is.
+  const from = i.supersedes === undefined ? generationBody(i.original, "claimed") : generationBody(i.original, "tearing-down", i.supersedes);
+  if (i.supersedes !== undefined && i.supersedes.manifestDigest !== i.receipts.manifestDigest) throw new StateBucketError("state_provenance_mismatch");
+  if (gen.body === from) recorded = putGeneration(aws, { ...where, body: tearing, ifMatch: gen.etag });
   else if (gen.body === tearing) recorded = { etag: gen.etag, versionId: gen.versionId };
   else throw new StateBucketError("state_provenance_mismatch");
   const fence = () => {
@@ -581,14 +607,12 @@ export function teardownStageState(
   // 3-4. Everything but the generation's current version.
   const start = listStageStateVersions(aws, i);
   const others = start.filter((o) => !(o.Key === gk && o.VersionId === recorded.versionId));
-  fence();
-  deleteVersions(aws, where, others);
+  deleteVersions(aws, where, others, fence);
   fence();
   const after = listStageStateVersions(aws, i);
   if (after.length !== 1 || after[0]!.Key !== gk || after[0]!.VersionId !== recorded.versionId) throw new StateBucketError("state_teardown_not_empty");
   // 5. The generation object, last and alone, by its recorded version id.
-  fence();
-  deleteVersions(aws, where, [{ Key: gk, VersionId: recorded.versionId }]);
+  deleteVersions(aws, where, [{ Key: gk, VersionId: recorded.versionId }], fence);
   // Explicit empty-prefix evidence: an independent re-list of versions and delete markers.
   const remaining = listStageStateVersions(aws, i).length;
   if (remaining !== 0) throw new StateBucketError("state_teardown_not_empty");
@@ -1087,6 +1111,19 @@ export interface TeardownAuthorization {
    * B's issuance (in-flight A writers are excluded by that revocation, not by code).
    */
   original: { sessionId: string; issuedAt: string; pin: string; revokedAt: string; sessionsExpireAt: string };
+  /**
+   * The broker's drain receipt: that every operation started under A (an Alchemy apply or destroy,
+   * AWS asynchronous work) had finished, checked at `checkedAt` (after A's revocation and session
+   * expiry, no later than B's issuance); `receiptDigest` is the sha256 of the broker's drain record.
+   * The code also checks the drain independently (assertStateDrained) before the physical readback.
+   */
+  drain: { checkedAt: string; receiptDigest: string };
+  /**
+   * A successor teardown lease (B2) only: the authorization it supersedes (its digest, which the
+   * tearing-down generation records) and the time the superseded lease ended (revoked, its sessions
+   * expired, or its expiry), attested by the broker. The superseded record itself is passed too.
+   */
+  supersedes?: { authorizationDigest: string; endedAt: string };
   manifestDigest: string;
   mappingUuids: string[];
   /**
@@ -1135,8 +1172,15 @@ export function assertTeardownAuthorization(ctx: RehearsalContext, auth: unknown
     a !== null && typeof a === "object" && a.schema === 1 && a.stage === ctx.stage && a.runId === ctx.runId &&
     typeof a.original?.sessionId === "string" && PIPPEN_SESSION_ID.test(a.original.sessionId) && typeof a.original.issuedAt === "string" && ISO.test(a.original.issuedAt) && hex(a.original.pin) &&
     typeof a.original.revokedAt === "string" && ISO.test(a.original.revokedAt) && typeof a.original.sessionsExpireAt === "string" && ISO.test(a.original.sessionsExpireAt) &&
-    // A revoked, and A's sessions expired, before B was issued (and not before A existed).
-    Date.parse(a.original.revokedAt) >= Date.parse(a.original.issuedAt) && Date.parse(a.original.revokedAt) <= Date.parse(ctx.issuedAt) && Date.parse(a.original.sessionsExpireAt) <= Date.parse(ctx.issuedAt) &&
+    // A and B are different leases.
+    a.original.sessionId !== ctx.sessionId &&
+    // A revoked (not before it was issued), and A's sessions expired (after its issuance), no later than B's issuance.
+    Date.parse(a.original.issuedAt) <= Date.parse(a.original.revokedAt) && Date.parse(a.original.revokedAt) <= Date.parse(ctx.issuedAt) &&
+    Date.parse(a.original.issuedAt) < Date.parse(a.original.sessionsExpireAt) && Date.parse(a.original.sessionsExpireAt) <= Date.parse(ctx.issuedAt) &&
+    // The drain receipt: checked after A ended, no later than B's issuance.
+    typeof a.drain?.checkedAt === "string" && ISO.test(a.drain.checkedAt) && hex(a.drain.receiptDigest) &&
+    Date.parse(a.drain.checkedAt) >= Date.parse(a.original.revokedAt) && Date.parse(a.drain.checkedAt) >= Date.parse(a.original.sessionsExpireAt) && Date.parse(a.drain.checkedAt) <= Date.parse(ctx.issuedAt) &&
+    (a.supersedes === undefined || (hex(a.supersedes.authorizationDigest) && typeof a.supersedes.endedAt === "string" && ISO.test(a.supersedes.endedAt))) &&
     hex(a.manifestDigest) && Array.isArray(a.mappingUuids) && a.mappingUuids.length === 2 && a.mappingUuids.every((u) => typeof u === "string" && UUID.test(u)) && new Set(a.mappingUuids).size === 2 &&
     a.teardown?.sessionId === ctx.sessionId && a.teardown.issuedAt === ctx.issuedAt &&
     a.teardown.callerArn === `arn:aws:sts::${ctx.accountId}:assumed-role/${PIPPEN_PROOF_SANDBOX.callerRole.roleName}/${PIPPEN_PROOF_SANDBOX.callerRole.sessionPrefix}${ctx.sessionId}` &&
@@ -1160,6 +1204,67 @@ export function assertTeardownAuthorization(ctx: RehearsalContext, auth: unknown
 }
 
 /**
+ * The code's own drain check (the broker's drain receipt is the other half), before the physical
+ * readback: every state version and delete marker under the prefix other than the generation object
+ * (which only the claim under A and the teardown swap under B write) was last modified strictly
+ * before A's revocation, so no write under A landed after it; and no Alchemy deploy lease
+ * (`__lease__.json`, which a running deploy holds and refreshes, and deletes on close) is current
+ * unless it expired before `now`. A missing or malformed time or lease refuses (`state_not_drained`).
+ * The function and mappings need no separate state check: the physical readback requires them gone,
+ * and a function or mapping mid-update or mid-delete still answers its read (`state_resources_remain`).
+ */
+export function assertStateDrained(aws: AwsRun, i: { bucket: string; region: string; stage: string; revokedAt: string; now: number }): void {
+  const prefix = rehearsalStatePrefix(i.stage);
+  const revoked = Date.parse(i.revokedAt);
+  if (!ISO.test(i.revokedAt) || !Number.isFinite(revoked)) throw new StateBucketError("state_not_drained");
+  for (const v of listStageStateEntries(aws, i)) {
+    if (v.Key === generationKey(prefix)) continue;
+    const at = typeof v.LastModified === "string" ? Date.parse(v.LastModified) : NaN;
+    if (!Number.isFinite(at) || !(at < revoked)) throw new StateBucketError("state_not_drained");
+    if (v.Key === `${prefix}__lease__.json` && v.IsLatest === true && !v.deleteMarker) {
+      const dir = mkdtempSync(join(tmpdir(), "96bulls-lease-"));
+      try {
+        const file = join(dir, "lease");
+        let expiresAt: unknown;
+        try {
+          aws(["s3api", "get-object", "--bucket", i.bucket, "--region", i.region, "--key", v.Key, "--version-id", v.VersionId, "--output", "json", file]);
+          expiresAt = (JSON.parse(readFileSync(file, "utf8")) as { expiresAt?: unknown }).expiresAt;
+        } catch {
+          throw new StateBucketError("state_not_drained");
+        }
+        if (typeof expiresAt !== "number" || !(expiresAt < i.now)) throw new StateBucketError("state_not_drained");
+      } finally {
+        rmSync(dir, { recursive: true, force: true });
+      }
+    }
+  }
+}
+
+/**
+ * A successor teardown lease (B2): its authorization names the superseded one (B) by digest, and B's
+ * record itself is passed. B must be the same run, original lease, manifest and mappings; a lease
+ * other than A and B2; and attested ended (revoked, sessions expired, or expired) after its issuance,
+ * no later than its own expiry and no later than B2's issuance. Returns the superseded receipts the
+ * tearing-down generation must still hold.
+ */
+function assertSuccessor(ctx: RehearsalContext, a: TeardownAuthorization, previous: unknown): GenerationReceipts {
+  const fail = (): never => {
+    throw new StateBucketError("state_authorization_mismatch");
+  };
+  const sup = a.supersedes!;
+  if (previous === undefined || authorizationDigest(previous) !== sup.authorizationDigest) fail();
+  const b = previous as TeardownAuthorization;
+  const ok =
+    b !== null && typeof b === "object" && b.schema === 1 && b.stage === a.stage && b.runId === a.runId &&
+    canonical(b.original) === canonical(a.original) && b.manifestDigest === a.manifestDigest && canonical(b.mappingUuids) === canonical(a.mappingUuids) &&
+    typeof b.teardown?.sessionId === "string" && b.teardown.sessionId !== ctx.sessionId && b.teardown.sessionId !== a.original.sessionId &&
+    typeof b.teardown.issuedAt === "string" && ISO.test(b.teardown.issuedAt) && typeof b.teardown.expiresAt === "string" && ISO.test(b.teardown.expiresAt) &&
+    Date.parse(b.teardown.issuedAt) < Date.parse(sup.endedAt) && Date.parse(sup.endedAt) <= Date.parse(b.teardown.expiresAt) && Date.parse(sup.endedAt) <= Date.parse(ctx.issuedAt);
+  if (!ok) fail();
+  return { manifestDigest: b.manifestDigest, authorizationDigest: sup.authorizationDigest };
+}
+
+/**
  * The whole teardown, in order, with no deletion before every check passed: the run context of the
  * current lease (before any AWS call); STS; the bucket; the teardown authorization (required: the
  * teardown runs only under the authorized lease B, issued after lease A was revoked and A's sessions
@@ -1179,6 +1284,8 @@ export function runRehearsalTeardown(
     expectManifestDigest?: string;
     authorization?: unknown;
     expectAuthorizationDigest?: string;
+    /** A successor lease only: the superseded authorization record (its digest is in `supersedes`). */
+    previousAuthorization?: unknown;
   },
 ): { listed: number; deleted: number; remaining: number } {
   const ctx = rehearsalRunContext(REHEARSAL_STAGE, i.inputs, i.env, i.now)!;
@@ -1193,7 +1300,10 @@ export function runRehearsalTeardown(
   const m = i.manifest as PhysicalManifest;
   if (a.manifestDigest !== m.digest || [...a.mappingUuids].sort().join() !== m.mappings.map((x) => x.uuid).sort().join()) throw new StateBucketError("state_authorization_mismatch");
   assertManifestComplete(i.manifest, original, original.runId);
+  const supersedes = a.supersedes === undefined ? undefined : assertSuccessor(ctx, a, i.previousAuthorization);
+  if (a.supersedes === undefined && i.previousAuthorization !== undefined) throw new StateBucketError("state_authorization_mismatch");
   caller();
+  assertStateDrained(aws, { bucket, region: ctx.region, stage: REHEARSAL_STAGE, revokedAt: a.original.revokedAt, now: i.now ?? Date.now() });
   assertManifestGone(aws, i.manifest, original, original.runId);
   // Nothing left: an earlier execute with these receipts completed (its last response may have been
   // lost). The generation object is deleted last, so an empty inventory means the teardown ended.
@@ -1205,6 +1315,7 @@ export function runRehearsalTeardown(
     execute: true,
     original,
     receipts: { manifestDigest: m.digest, authorizationDigest: authorizationDigest(i.authorization) },
+    ...(supersedes ? { supersedes } : {}),
     assertCaller: caller,
   });
 }

@@ -17,7 +17,10 @@
  *   bun scripts/rehearsal-state-teardown.ts --execute --expect-manifest-digest <sha256>
  *       --authorization <file> --expect-authorization-digest <sha256>
  *       # after the destroy, only under the authorized cleanup-only lease B (issued after lease A was
- *       # revoked and A's sessions expired); every check before any deletion
+ *       # revoked, A's sessions expired and the drain was attested); every check before any deletion
+ *   ... --execute ... --previous-authorization <file>
+ *       # a successor lease B2 only: resume a tearing-down generation of the superseded lease B (its
+ *       # record passed here; B2's authorization names its digest in `supersedes`)
  */
 import { spawnSync } from "node:child_process";
 import { existsSync, readFileSync, writeFileSync } from "node:fs";
@@ -29,7 +32,7 @@ import type { AwsRun } from "../stacks/aws/state-bucket.ts";
 const args = process.argv.slice(2);
 const valueOf = (f: string) => (args.includes(f) ? args[args.indexOf(f) + 1] : undefined);
 const flags = ["--claim", "--manifest", "--execute"].filter((f) => args.includes(f));
-const values = ["--expect-manifest-digest", "--authorization", "--expect-authorization-digest"];
+const values = ["--expect-manifest-digest", "--authorization", "--expect-authorization-digest", "--previous-authorization"];
 const known = new Set([...flags, ...values.filter((v) => args.includes(v)), ...values.map(valueOf).filter((v): v is string => v !== undefined)]);
 const execute = args.includes("--execute");
 if (
@@ -37,7 +40,7 @@ if (
   (execute && (!valueOf("--expect-manifest-digest") || !valueOf("--authorization"))) || (!execute && values.some((v) => args.includes(v))) ||
   (args.includes("--authorization") !== args.includes("--expect-authorization-digest"))
 )
-  throw new Error("Usage: bun scripts/rehearsal-state-teardown.ts [--claim | --manifest | --execute --expect-manifest-digest <sha256> --authorization <file> --expect-authorization-digest <sha256>]");
+  throw new Error("Usage: bun scripts/rehearsal-state-teardown.ts [--claim | --manifest | --execute --expect-manifest-digest <sha256> --authorization <file> --expect-authorization-digest <sha256> [--previous-authorization <file>]]");
 const root = fileURLToPath(new URL("..", import.meta.url));
 const dir = join(root, ".96bulls", REHEARSAL_STAGE);
 const manifestPath = join(dir, "physical-manifest.json");
@@ -93,6 +96,7 @@ try {
     execute,
     ...(execute ? { manifest: readJson(manifestPath, "state_manifest_invalid"), expectManifestDigest: valueOf("--expect-manifest-digest") } : {}),
     ...(authorizationPath ? { authorization: readJson(authorizationPath, "state_authorization_mismatch"), expectAuthorizationDigest: valueOf("--expect-authorization-digest") } : {}),
+    ...(valueOf("--previous-authorization") ? { previousAuthorization: readJson(valueOf("--previous-authorization")!, "state_authorization_mismatch") } : {}),
   });
   console.log(JSON.stringify({ stage: REHEARSAL_STAGE, ...result, executed: execute }));
 } catch (e) {

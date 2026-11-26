@@ -121,7 +121,8 @@ pin, lease end) before any AWS call:
    issuance time and pin) with a digest. It prints the digest; the broker records it.
 3. `alchemy destroy` for the stage (or the pippen sweeper), possibly in several partial passes,
    still under lease A.
-4. The broker **revokes lease A**, waits until A's sessions have expired, then issues the
+4. The broker **revokes lease A**, waits until A's sessions have expired, checks that every
+   operation started under A has finished (its **drain** check, below), then issues the
    cleanup-only teardown lease B and the teardown authorization (below).
 5. `--execute --expect-manifest-digest <sha256> --authorization <file>
    --expect-authorization-digest <sha256>`, under lease B only (all four are required; lease A
@@ -129,37 +130,44 @@ pin, lease end) before any AWS call:
    this order:
    1. the run context of the current lease and STS (the current caller is exactly lease B);
    2. the shared bucket's settings (reads);
-   3. the **teardown authorization** (below), including A's revocation and session expiry no later
-      than B's issuance;
+   3. the **teardown authorization** (below), including distinct leases A and B, A's revocation and
+      session expiry no later than B's issuance, and the broker's drain receipt (and, for a
+      successor lease, the superseded authorization);
    4. the **independent receipt**: the manifest digest the broker recorded at step 2 (not one
       recomputed from the local file) must equal the manifest's digest, and the authorization's
       manifest digest and mapping UUIDs must be the manifest's;
    5. the manifest complete and bound to the original run (`assertManifestComplete`);
-   6. STS again: the caller is still B, immediately before the physical readback;
-   7. every recorded id gone (`assertManifestGone`): the function by ARN, each queue by URL, each
+   6. STS again: the caller is still B, immediately before the drain check and the physical readback;
+   7. the code's own **drain check** (`assertStateDrained`, `state_not_drained`): every state version
+      and delete marker under the prefix except the generation object was last modified strictly
+      before A's revocation, and no Alchemy deploy lease (`__lease__.json`, held and refreshed by a
+      running deploy and deleted on close) is current unless its `expiresAt` has passed;
+   8. every recorded id gone (`assertManifestGone`): the function by ARN, each queue by URL, each
       mapping by UUID, no metric or composite alarm of the five names, no log group of the exact
       name, and the role per its pinned disposition (deleted: not found; retained: exactly the pinned
       ARN, path and boundary). A remaining id refuses (`state_resources_remain`); AccessDenied is
       never "gone" (`state_gone_unproven`); rerun after the next destroy pass;
-   8. no version left (an earlier execute with these receipts completed and only its last response
+   9. no version left (an earlier execute with these receipts completed and only its last response
       was lost; the generation object is deleted last, so an empty inventory means it ended):
       complete, nothing deleted;
-   9. otherwise the state under the **generation lock** (`teardownStageState`), STS re-checked
+   10. otherwise the state under the **generation lock** (`teardownStageState`), STS re-checked
       before the swap and inside every fence:
       1. read the generation object with its ETag and version id. This run's `claimed` generation
          (A's run id, session, issuance, pin): swap it to `tearing-down` with these receipts by
          `PutObject --if-match <that ETag>`; the swap's ETag and version id are recorded. Already
          `tearing-down` with exactly these receipts (a retry): resume, recording its current ETag
-         and version id. No generation, another run's, or another teardown's: refused
+         and version id. A successor lease B2 swaps B's `tearing-down` generation instead (below).
+         No generation, another run's, or another teardown's: refused
          (`state_provenance_mismatch`), nothing written or deleted;
-      2. the **fence**, before every delete step: the caller is B, and the generation object's
+      2. the **fence**, before **each DeleteObjects batch** (at most 1,000 objects) and after the
+         bulk delete: the caller is B, and the generation object's
          current ETag, version id and body are still the recorded `tearing-down` ones; otherwise the
          executor stops;
       3. every other version and delete marker (including the generation's old `claimed` version),
          by the key and version ids listed after the swap (strict page validation; any key outside
-         the prefix refuses before anything is deleted); fence; the re-list must then show exactly
-         the recorded generation version;
-      4. fence; the generation object, last and alone, by its recorded version id only; the final
+         the prefix refuses before anything is deleted), fenced per batch; fence; the re-list must
+         then show exactly the recorded generation version;
+      4. fenced, the generation object, last and alone, by its recorded version id only; the final
          re-list must show nothing.
 
    Why a stale executor is harmless: if teardown T1 has read A's `claimed` generation and pauses,
@@ -167,8 +175,8 @@ pin, lease end) before any AWS call:
    (`If-Match` on A's ETag) fails against B's generation and T1 stops with B's generation intact.
    If T1 pauses later (after its swap, before any delete), its next fence sees B's ETag and stops;
    any delete it already has in flight names only A's generation's version ids, never B's (tested:
-   this interleaving, a replaced generation between the swap and the first delete, and a pause
-   before each delete).
+   this interleaving, a replaced generation between the swap and the first delete, a pause before
+   each delete, and a replaced generation or changed caller between two 1,000-object batches).
 
    A partial batch, or a delete that reports success and leaves a version, stops with the
    `tearing-down` generation intact, so no capture or deploy can start; the next execute with the
@@ -176,12 +184,21 @@ pin, lease end) before any AWS call:
    create fails while any generation object exists. Once the prefix is empty a new claim is a new
    run; a retry of a completed teardown before that is recognised as complete.
 
-   **Recovery from a wedged state** is receipt-bound only: a `tearing-down` generation is resumed
-   by re-running `--execute` with the same manifest receipt and authorization (a new lease B needs a
-   new authorization, whose digest differs, so the broker must reissue the record for that
-   generation's receipts or an operator with the broker's approval removes the generation by hand).
-   There is no code path that clears or overrides a generation object; any manual removal must be
-   recorded with the generation object's version id and body.
+   **Recovery from a wedged state** is receipt-bound. With lease B still valid, re-run `--execute`
+   with the same manifest receipt and authorization. When B has ended (expired or revoked) before
+   the teardown finished, the generation records B's authorization digest, so a plain new lease
+   cannot resume it; the **successor path** can: the broker issues lease B2 with an authorization
+   that carries `supersedes: { authorizationDigest: <B's digest>, endedAt: <when B ended> }`, and
+   `--execute` is run with `--previous-authorization <B's record>`. `assertSuccessor` requires B's
+   record to have exactly that digest, the same run, original lease A, manifest and mapping UUIDs;
+   B2 on a different session from A and B; and B attested ended after its issuance, no later than
+   its own expiry and no later than B2's issuance (so B2 while B is still valid is refused). Then
+   the generation must still be `tearing-down` under B's receipts for the same run (a `claimed` or
+   foreign generation is refused), and it is swapped to B2's receipts by `If-Match` on its ETag
+   before anything else is touched. B2 obeys every other check (A's revocation, the drain, the run
+   deadline). There is no code path that clears or overrides a generation object; a manual removal,
+   if ever approved, is outside the code and must be recorded with the object's version id and
+   body.
 
    So the digest check runs after the STS and bucket reads and before any deletion. Without
    `--execute` it is a dry run (counts only). The bucket itself and sibling stages are never touched.
@@ -201,7 +218,8 @@ pin, lease end) before any AWS call:
 In-flight lease A writers (a deploy or destroy still running) are excluded **by revocation, not by
 code**: the teardown runs only under lease B, which the broker issues only after A is revoked and
 A's sessions have expired, and the authorization record attests both (`revokedAt`,
-`sessionsExpireAt`, each no later than B's issuance). The code checks those attested times, that
+`sessionsExpireAt`, each no later than B's issuance) and the broker's drain check (below). The
+code checks those attested times, that
 the current caller is B at the start, before the physical readback and before every delete, and
 it refuses an execute without an authorization; it cannot itself observe that A's credentials no
 longer work (that is broker receipt 5).
@@ -211,6 +229,30 @@ Alchemy (`alchemy.run`) exposes no per-resource pre-apply hook this stack uses, 
 once, at the state layer's entry (`prepareStateBackend`, which refuses a `tearing-down` or foreign
 generation). A deploy already past that entry when a teardown starts is excluded only by A's
 revocation. This is a documented limit.
+
+### Drain
+
+Revocation and expiry stop A from starting anything new; they do not prove that work A already
+started has finished (an Alchemy apply or destroy mid-flight, or AWS asynchronous work it
+triggered). Two halves:
+
+- **The broker's drain receipt**, in the authorization: `drain: { checkedAt, receiptDigest }`,
+  checked no earlier than A's revocation and A's session expiry and no later than B's issuance;
+  `receiptDigest` is the sha256 of the broker's drain record (what it checked: no Alchemy process
+  for the stage running, no Lambda function or event source mapping update or delete pending, the
+  sweeper idle).
+- **The code's own check** before the physical readback (`assertStateDrained`): no state write
+  under the prefix at or after A's revocation (by `LastModified` of every version and delete
+  marker, the generation object excepted) and no current, unexpired `__lease__.json`. The physical
+  readback then requires every recorded resource gone: a function or event source mapping still
+  updating or deleting still answers its read and refuses (`state_resources_remain`), which covers
+  the "no Lambda update in progress, mappings stable" checks by requiring absence.
+
+**Residual:** AWS-side work that leaves no readable trace on the recorded names (for example a
+deletion AWS accepted but has not finished propagating, or CloudWatch/Logs ingestion of an already
+deleted resource) and a writer outside this account's lease system are not observable by this code;
+`LastModified` is S3's clock and is trusted as such. The drain receipt is the broker's evidence for
+these.
 
 ### Teardown authorization (lease A to lease B)
 
@@ -223,16 +265,21 @@ records its digest (`authorizationDigest`, sha256 of the canonical JSON) in its 
 { "schema": 1, "stage": "aws-rehearse-p1-1126", "runId": "<run id>",
   "original": { "sessionId": "<lease A>", "issuedAt": "<A issuance>", "pin": "<A pin>",
                 "revokedAt": "<A revocation time>", "sessionsExpireAt": "<latest expiry of A's sessions>" },
+  "drain": { "checkedAt": "<broker drain check time>", "receiptDigest": "<sha256 of the drain record>" },
+  "supersedes": { "authorizationDigest": "<superseded B digest>", "endedAt": "<when B ended>" },
   "manifestDigest": "<manifest digest>", "mappingUuids": ["<uuid 1>", "<uuid 2>"],
   "teardown": { "sessionId": "<lease B>", "callerArn": "arn:aws:sts::<account>:assumed-role/agent-session/agent-<lease B>",
                 "issuedAt": "<B issuance>", "windowEnd": "<approved teardown window end>",
                 "expiresAt": "<B effective expiry>", "policyDigest": "<B cleanup-only policy digest>" } }
 ```
 
+(`supersedes` only in a successor lease B2's record; see Recovery above.)
+
 `assertTeardownAuthorization` refuses (`state_authorization_mismatch`) unless the record's digest is
 the receipt's; it is this stage and run; B is exactly the current session, STS caller ARN and
-issuance; A was revoked at or after its issuance and no later than B's issuance, and A's sessions
-expire no later than B's issuance; and A's pin is the issuer pin of the same approved account, boundary, role and
+issuance; A and B are different sessions; A was revoked at or after its issuance and no later than
+B's issuance; A's sessions expire after A's issuance and no later than B's issuance; the drain was
+checked after A's revocation and session expiry and no later than B's issuance; and A's pin is the issuer pin of the same approved account, boundary, role and
 disposition with A's session and issuance. B's validity is capped at the **authorized run
 deadline** (`teardownDeadline`): the earliest of A's issuance + 6 h, the hard cutoff
 2026-11-27T08:00:00Z and the approved teardown window end the record carries explicitly. B must be
@@ -352,7 +399,8 @@ receipts (kept outside the repository, referenced by hash in the run's handoff):
 3. The sha256 of the inline session policy passed, equal to the generated `inline`.
 4. The AssumeRole receipt: request id, role and session name, `DurationSeconds`, and the
    credentials' `Expiration` (not later than `rehearsalLeaseEnd({ issuedAt })`).
-5. Revocation of lease A **before lease B is issued**: the revocation action taken (for example the
+5. Revocation of lease A **before lease B is issued** (and the drain record whose digest is the
+   authorization's `drain.receiptDigest`): the revocation action taken (for example the
    role's revoke-older-sessions deny, or deleting the managed policy versions) with its time (the
    authorization's `revokedAt`), the latest expiry of A's sessions (`sessionsExpireAt`), and a
    failed call with A's credentials after it; then the same for B at teardown completion.
@@ -407,9 +455,12 @@ receipts (kept outside the repository, referenced by hash in the run's handoff):
   under the strict tag statement, are residuals for the issuer (see Teardown and Lease).
 - **S3 conditional writes** on this bucket in us-west-2 (`If-None-Match: *` and
   `If-Match` on PutObject) are not provable offline; observe both refusals in the sandbox first.
+- **Drain residual:** AWS-side work with no readable trace on the recorded names, and writers
+  outside the lease system, are covered only by the broker's drain receipt (see Drain).
 - **No per-apply generation check:** Alchemy has no pre-apply hook here; a deploy under A is
   checked once at entry and otherwise excluded only by A's revocation.
 - **Gates still open:** the non-prod render of the session pipeline; the proof-account stage rule;
   the execution-role wiring (path and boundary); the revised scope and teardown window, including
-  lease B and its authorization record; trusted issuance, expiry and revocation; the cost cap; and
-  live evidence (budget and teardown) from a real run.
+  lease B and its authorization record; trusted issuance, expiry and revocation; the cost cap; the issuer receipts (pin, policies, revocation of A and B, the drain record, any
+  successor B2 record); real conditional-write evidence for this bucket; and live evidence
+  (budget and teardown) from a real run.
