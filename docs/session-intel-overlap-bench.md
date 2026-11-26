@@ -171,9 +171,23 @@ Stage 2 should be the existing conflict model-judge seam ([session-intel-conflic
 
 ## For production
 
-These findings apply to the live overlap path, and each change goes through review separately:
+These findings apply to the live overlap path. Each change goes through review separately, and enabling anything needs Khaliq's explicit OK.
 
-- **Edit evidence.** Lane writes come only from `filesTouched` (`src/session-read-api/coordination-backend.ts`), which most harness sessions lack. Recovering writes from commands (`patch`, `add`, `shell`) would cover far more lines of work.
-- **PR ownership.** Ownership should come from the create result, not from mentions.
-- **Relay suppression.** Pairs that communicated over Agent Relay should not alert.
-- **Budget.** The alert budget should be weekly.
+**Which edit evidence matters (dev, frozen ranker, provisional).** Production lanes take writes from `files_touched`, which #485 extends with `apply_patch` paths (Codex code-mode included) and Claude MultiEdit. Rerunning the frozen ranker with only some evidence sources:
+
+| Lane evidence | Sessions with edits | Hits at budget 5 | Hits, no budget |
+|---|---|---|---|
+| `files_touched` | 1,314 | 0 / 21 | 6 / 21 |
+| + patch paths (about what production has now) | 1,314 | 0 / 21 | 6 / 21 |
+| + shell writes and `git add` | 3,901 | 0 / 21 | 6 / 21 |
+| + `git status` and `--stat` listings | 5,591 | 5 / 21 | 6 / 21 |
+
+Recovering shell writes and `git add` widens coverage but adds no recall, so it is not worth porting on this evidence. What lifts the ranker within budget is what sessions see in `git status` and `--stat`. Status alone gives 2 hits; counting only paths that became dirty during the session gives 0. The signal is therefore not what a session wrote. It is **two lines of work seeing the same dirty working tree**: two agents in one checkout, or one line picking up another's uncommitted work. That is a real collision class, and production has no evidence for it today. The sample is 5 hits, so treat it as a lead, not a result.
+
+Porting it means a projection that derives observed-dirty paths from `git status` and `--stat` tool results. It must be a field of its own, never mixed into `files_touched` (they are observations, not writes), so it needs a schema decision.
+
+**Other ports.**
+- **PR ownership** from the create call's own result, dated, never from mentions.
+- **Relay suppression:** pairs that communicated over Agent Relay should not alert. The facts store has no relay evidence yet.
+- **Budget:** a weekly alert budget per 100 active coding sessions.
+- **Two stages:** the ranker for candidates, then an intent judge on as-of bundles with dated PR titles and descriptions. The judge goes through the conflict model-judge seam.
