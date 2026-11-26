@@ -110,6 +110,27 @@ export async function* directoryRows(run: TenantRunner, cfg: BackfillConfig, sin
   }
 }
 
+const PARENTS_SQL = `SELECT harness, session_id, parent_session_ids
+  FROM sessions.list_session_directory_for($1, p_session_harnesses => $2, p_session_ids => $3, p_limit => 200)`;
+
+/** The directory's parent_session_ids of the given sessions, 100 per read; sessions the directory lacks are left out. */
+export async function parentsOf(run: TenantRunner, cfg: BackfillConfig, keys: ReadonlyArray<{ harness: string; sessionId: string }>): Promise<Array<{ harness: string; sessionId: string; parents: string[] }>> {
+  const out: Array<{ harness: string; sessionId: string; parents: string[] }> = [];
+  for (let i = 0; i < keys.length; i += 100) {
+    const batch = keys.slice(i, i + 100);
+    const { rows } = await run(cfg.orgId, cfg.workspaceId, (q) =>
+      q.query<Record<string, unknown>>(PARENTS_SQL, [cfg.workspaceId, batch.map((k) => k.harness), batch.map((k) => k.sessionId)]));
+    const wanted = new Set(batch.map((k) => `${k.harness}\u0000${k.sessionId}`));
+    for (const r of rows) {
+      const harness = String(r.harness), sessionId = String(r.session_id);
+      // The reader matches harnesses and ids as two lists: keep only the exact pairs asked for.
+      if (!wanted.has(`${harness}\u0000${sessionId}`)) continue;
+      out.push({ harness, sessionId, parents: ((r.parent_session_ids as string[] | null) ?? []).filter((p) => typeof p === "string" && p !== sessionId) });
+    }
+  }
+  return out.sort((a, b) => (a.harness + a.sessionId < b.harness + b.sessionId ? -1 : 1));
+}
+
 export interface BackfillSource {
   run: TenantRunner;
   cfg: BackfillConfig;

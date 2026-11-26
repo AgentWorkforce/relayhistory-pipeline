@@ -99,8 +99,19 @@ must cite evidence ids that the scorer checks.
    - overlapping file sets in the same repository within a time window;
    - intent similarity, and only as a tiebreaker.
 
+   - a small delegation family: a parent session and the sessions it spawned (the directory's
+     `parent_session_ids`), while the family has at most 12 members.
+
    Each link records the signal that made it. Planned fleets are one feature with several sessions,
-   not several features.
+   not several features. Measured on the first corpus's dev split, these rules decide linking quality:
+   - A lead's large family mixes features (223 of 1,281 sibling pairs in the two families over 30
+     shared a gold feature), while every sibling pair in a family of at most 12 did.
+   - A session naming more than four feature branches or four commits is a coordinator (a lander, a
+     release) and links on none of them. Its keys bridged unrelated features into one 38-session record.
+   - A commit already on the default branch when the session started is its base, not its work, and
+     never links. A commit a session only mentions, such as a reviewer's "review <sha>", resolves to the
+     forge branch that holds it, when at most two branches do.
+   - Review rounds of one branch (`-r2`, `-v3`) share a key. A branch name cut off mid-word never links.
 3. **State.** Rules over the linked evidence, latest evidence first:
    - a revert after a merge gives `regressed`, or `superseded` when a linked replacement exists;
    - merged, with the flag default off, gives `shipped_off`; merged and on gives `shipped`;

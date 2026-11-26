@@ -77,7 +77,8 @@ export function forgeFacts(repo: string, mirror: string, since: string, until: s
     if (!tipAt || tipAt < since) continue;
     const ancestor = sh(`git -C "$0" merge-base --is-ancestor "$1" "$2" && echo yes`, mirror, name, defaultBranch) === "yes";
     let landedAt: string | null = ancestor ? tipAt : null;
-    if (!landedAt) for (const sha of git(mirror, ["rev-list", "--max-count=200", `${defaultBranch}..${name}`]).split("\n").filter(Boolean)) {
+    const own = git(mirror, ["rev-list", "--max-count=200", `${defaultBranch}..${name}`]).split("\n").filter(Boolean);
+    if (!landedAt) for (const sha of own) {
       const at = mainPatch.get(patchOf.get(sha) ?? "");
       if (at && (!landedAt || at > landedAt)) landedAt = at;
     }
@@ -88,7 +89,7 @@ export function forgeFacts(repo: string, mirror: string, since: string, until: s
     // Flags the branch introduces: `*_ENABLED` names on added lines of its combined diff.
     const added = sh(`git -C "$0" diff "$(git -C "$0" merge-base "$2" "$1")" "$1" | grep '^+' | grep -oE '[A-Z][A-Z0-9]*(_[A-Z0-9]+)*_ENABLED' | sort -u`, mirror, name, defaultBranch);
     const flagsAdded = added.split("\n").filter(Boolean).slice(0, 50);
-    branches.push({ name, landed: landedAt !== null, landedAt, tipAt, ...(flagsAdded.length ? { flagsAdded } : {}) });
+    branches.push({ name, landed: landedAt !== null, landedAt, tipAt, ...(flagsAdded.length ? { flagsAdded } : {}), ...(own.length ? { commits: own } : {}) });
   }
   let docs = "";
   try {

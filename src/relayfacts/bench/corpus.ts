@@ -19,7 +19,7 @@ import type { ForgeFacts, SessionContext } from "../features/types.ts";
 import type { SessionArtifacts } from "../backfill/artifacts.ts";
 
 export const CORPUS_FORMAT = "relayfacts-corpus/1";
-export const CORPUS_BOUNDS = { fileBytes: 512 * 1024 * 1024, lineBytes: 16 * 1024 * 1024, sessions: 50_000, deleteByDays: 30 } as const;
+export const CORPUS_BOUNDS = { fileBytes: 512 * 1024 * 1024, lineBytes: 16 * 1024 * 1024, sessions: 50_000, deleteByDays: 30, parents: 16 } as const;
 
 export class CorpusError extends Error {
   constructor(message: string) { super(message); this.name = "CorpusError"; }
@@ -85,8 +85,10 @@ export function parseForge(raw: unknown): ForgeFacts {
     if (typeof g.name !== "string" || typeof g.defaultOn !== "boolean") throw new CorpusError("forge.json: bad flag");
   }
   for (const b of (f.branches ?? []) as Record<string, unknown>[]) {
-    only(b, ["name", "landed", "landedAt", "tipAt", "flagsAdded"], "forge.json branch");
+    only(b, ["name", "landed", "landedAt", "tipAt", "flagsAdded", "commits"], "forge.json branch");
     if (typeof b.name !== "string" || typeof b.landed !== "boolean" || !iso(b.tipAt) || (b.landedAt !== null && !iso(b.landedAt))) throw new CorpusError("forge.json: bad branch");
+    if (b.commits !== undefined && (!Array.isArray(b.commits) || b.commits.length > 200 || b.commits.some((c) => typeof c !== "string" || !/^[0-9a-f]{40}$/u.test(c))))
+      throw new CorpusError("forge.json: a branch's commits must be at most 200 full commit ids");
   }
   return f as unknown as ForgeFacts;
 }
@@ -120,7 +122,10 @@ export function loadCorpus(dir: string, now: Date = new Date()): Corpus {
     seen.add(key);
     if (seen.size > CORPUS_BOUNDS.sessions) throw new CorpusError("too many sessions");
     const context = (row.context ?? {}) as Record<string, unknown>;
-    only(context, ["repo", "branch", "taskRef", "userRole"], `sessions.jsonl:${i + 1} context`);
+    only(context, ["repo", "branch", "taskRef", "userRole", "parentSessionIds"], `sessions.jsonl:${i + 1} context`);
+    const parents = context.parentSessionIds;
+    if (parents !== undefined && (!Array.isArray(parents) || parents.length > CORPUS_BOUNDS.parents || parents.some((p) => typeof p !== "string" || !p || p.length > 200)))
+      throw new CorpusError(`sessions.jsonl:${i + 1}: context.parentSessionIds must be at most ${CORPUS_BOUNDS.parents} session ids`);
     sessions.push({ source: row.source, sessionId: row.sessionId, context: context as SessionContext, snapshot, ...(row.artifacts ? { artifacts: row.artifacts as SessionArtifacts } : {}) });
   }
   const forge = parseForge(JSON.parse(verified("forge.json")));

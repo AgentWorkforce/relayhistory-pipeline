@@ -10,7 +10,8 @@
  *
  *   survey  --repo <owner/name>[,<alias>...] --since <iso> --until <iso>
  *   analyse --repo ... --since ... --until ... --out <dir> [--concurrency 4] [--max <n>]
- *   seal    --out <dir> --repo <owner/name> --since ... --until ... --delete-by <iso> --forge <forge.json>
+ *   parents --out <dir> --repo <owner/name>   directory parent_session_ids of every analysed session, to <out>/parents.jsonl
+ *   seal    --out <dir> --repo <owner/name> --since ... --until ... --delete-by <iso> --forge <forge.json> [--parents <file>]
  *
  * `analyse` is resumable: each finished session is one file under <out>/sessions/, and a rerun skips
  * it. Failures go to <out>/errors.jsonl with a reason code only, never transcript text.
@@ -24,7 +25,7 @@ import { normalizeRepo } from "../features/extract.ts";
 import { CORPUS_FORMAT, parseForge, sha256Hex } from "../bench/corpus.ts";
 import { extractArtifacts } from "./artifacts.ts";
 import { attributeRepo } from "./locate.ts";
-import { backfillReadSource, backfillSource, directoryRows, tenantRunner, type DirectoryRow } from "./source.ts";
+import { backfillReadSource, backfillSource, directoryRows, parentsOf, tenantRunner, type DirectoryRow } from "./source.ts";
 
 const REPO_ROOT = realpathSync(resolve(fileURLToPath(new URL("../../..", import.meta.url))));
 /** Harnesses that are chats or bots rather than coding agents: never analysed for feature records. */
@@ -88,6 +89,7 @@ export async function main(argv: string[]): Promise<number> {
   const { values } = parseArgs({ args: rest, options: {
     repo: { type: "string" }, since: { type: "string" }, until: { type: "string" }, out: { type: "string" },
     concurrency: { type: "string" }, max: { type: "string" }, "min-events": { type: "string" }, sessions: { type: "string" }, "delete-by": { type: "string" }, forge: { type: "string" },
+    parents: { type: "string" },
   } });
   const minEvents = Number(values["min-events"] ?? DEFAULT_MIN_EVENTS);
   const repos = (values.repo ?? "").split(",").map((r) => r.trim().toLowerCase()).filter(Boolean);
@@ -96,10 +98,16 @@ export async function main(argv: string[]): Promise<number> {
   if (command === "seal") {
     const out = outside(values.out ?? "");
     if (!values.since || !values.until || !values["delete-by"] || !values.forge) throw new Error("--since, --until, --delete-by and --forge are required");
+    // --parents: directory parent_session_ids for sessions analysed from a located list (one {source, sessionId, parents} per line).
+    const parentsBy = values.parents
+      ? new Map(readLines(values.parents).map((r) => [`${String(r.source)}\u0000${String(r.sessionId)}`, (r.parents as string[] | undefined) ?? []]))
+      : undefined;
     const lines = readdirSync(join(out, "sessions")).filter((f) => f.endsWith(".json")).sort().map((f) => {
       const row = JSON.parse(readFileSync(join(out, "sessions", f), "utf8"));
       const art = join(out, "artifacts", f);
       if (existsSync(art)) row.artifacts = JSON.parse(readFileSync(art, "utf8"));
+      const parents = parentsBy?.get(`${row.source}\u0000${row.sessionId}`);
+      if (parents?.length) row.context = { ...row.context, parentSessionIds: parents };
       return JSON.stringify(row);
     });
     const corpus = join(out, "corpus");
@@ -114,6 +122,23 @@ export async function main(argv: string[]): Promise<number> {
       files: { "sessions.jsonl": sha256Hex(sessions), "forge.json": sha256Hex(forge) },
     }, null, 2));
     console.log(JSON.stringify({ corpus, sessions: lines.length }));
+    return 0;
+  }
+
+  if (command === "parents") {
+    const out = outside(values.out ?? "");
+    const keys = readdirSync(join(out, "sessions")).filter((f) => f.endsWith(".json")).sort().map((f) => {
+      const row = JSON.parse(readFileSync(join(out, "sessions", f), "utf8")) as { source: string; sessionId: string };
+      return { harness: row.source, sessionId: row.sessionId };
+    });
+    const source = backfillReadSource();
+    try {
+      const found = await parentsOf(source.run, source.cfg, keys);
+      writeFileSync(join(out, "parents.jsonl"), found.map((r) => JSON.stringify({ source: r.harness, sessionId: r.sessionId, parents: r.parents })).join("\n") + "\n");
+      console.log(JSON.stringify({ sessions: keys.length, found: found.length, withParents: found.filter((r) => r.parents.length).length }));
+    } finally {
+      await source.close();
+    }
     return 0;
   }
 
@@ -246,7 +271,7 @@ export async function main(argv: string[]): Promise<number> {
             tokensIn += r.inputTokens; tokensOut += r.outputTokens;
             writeFileSync(join(out, "sessions", fileName(row)), JSON.stringify({
               source: row.harness, sessionId: row.sessionId,
-              context: { repo: row.gitRepo, branch: row.gitBranch, taskRef: null, userRole: null },
+              context: { repo: row.gitRepo, branch: row.gitBranch, taskRef: null, userRole: null, ...(row.parentSessionIds.length ? { parentSessionIds: row.parentSessionIds } : {}) },
               snapshot: r.snapshot,
             }));
             appendLine(join(out, "analysed.jsonl"), `${JSON.stringify({ harness: row.harness, sessionId: row.sessionId, assumeNoLegacyTurns, inputTokens: r.inputTokens, outputTokens: r.outputTokens, at: new Date().toISOString() })}\n`);

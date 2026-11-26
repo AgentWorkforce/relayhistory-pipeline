@@ -5,8 +5,13 @@
  * request, a shared feature branch in the same repository, a shared commit, and (only when enabled) a
  * strong file overlap in the same repository within a time window. Every merge records the signal and
  * value that caused it, so a record can say why two sessions are one feature and the benchmark can
- * measure which signal over-merges. Parent/child delegation never links on its own: a lead session
- * coordinates many features.
+ * measure which signal over-merges.
+ *
+ * Delegation links through a family: a parent session and the sessions it spawned share the family key, and
+ * like every key it links only while the family is small (at most `maxKeyFanout` members). A lead session
+ * coordinates many features through dozens of subagents and never links that way; a parent with a handful of
+ * reviewers or workers is one piece of work (dev split of the first corpus: every sibling pair in a family of
+ * at most 12 shared a gold feature, against 223 of 1,281 pairs in the two families over 30).
  */
 import type { FeatureLink, SessionFacts, SessionKey } from "./types.ts";
 import { sessionKeyString, textCompare } from "./types.ts";
@@ -22,6 +27,13 @@ export interface LinkParams {
   filesWindowMs: number;
   /** A key shared by more sessions than this is too common to link on (a hot branch, a shared file). */
   maxKeyFanout: number;
+  /**
+   * A session naming more feature branches than this coordinates work (a lander, a lead, a release): its branch
+   * keys would bridge unrelated features, so none of them links.
+   */
+  maxSessionBranches: number;
+  /** The same for commits: a session naming more commits than this (a release, a lander's queue) links on none. */
+  maxSessionCommits: number;
 }
 
 export const DEFAULT_LINK_PARAMS: LinkParams = {
@@ -30,6 +42,8 @@ export const DEFAULT_LINK_PARAMS: LinkParams = {
   filesMinJaccard: 0.5,
   filesWindowMs: 72 * 3_600_000,
   maxKeyFanout: 12,
+  maxSessionBranches: 4,
+  maxSessionCommits: 4,
 };
 
 export interface LinkResult {
@@ -57,6 +71,15 @@ class UnionFind {
 const keyOf = (f: SessionFacts): SessionKey => ({ source: f.source, sessionId: f.sessionId });
 const byStart = (a: SessionFacts, b: SessionFacts) => textCompare(a.startedAt, b.startedAt) || textCompare(sessionKeyString(keyOf(a)), sessionKeyString(keyOf(b)));
 
+/**
+ * The link key of a branch name: review rounds of one change (`-r2`, `-r3`, `-v2`) share it. A name cut off
+ * mid-word in a transcript (ending in `-`, `_` or `/`) is not a branch and never links.
+ */
+export function branchStem(name: string): string | null {
+  if (/[-_/]$/u.test(name)) return null;
+  return name.replace(/-(?:r|v|round)\d+$/u, "");
+}
+
 export function linkSessions(facts: readonly SessionFacts[], params: LinkParams = DEFAULT_LINK_PARAMS): LinkResult {
   const sorted = [...facts].sort(byStart);
   const uf = new UnionFind();
@@ -78,11 +101,17 @@ export function linkSessions(facts: readonly SessionFacts[], params: LinkParams 
     }
   };
   const scoped = (f: SessionFacts, values: string[]) => values.map((v) => `${f.keys.repo ?? ""}\u0001${v}`);
+  const branchKeys = (f: SessionFacts) => [...new Set(f.keys.branches.map(branchStem).filter((b): b is string => b !== null))];
   index("task", (f) => f.keys.taskRefs);
   index("pr", (f) => f.keys.prs);
-  index("branch", (f) => (f.keys.repo ? scoped(f, f.keys.branches) : []));
+  index("branch", (f) => (f.keys.repo && f.keys.branches.length <= params.maxSessionBranches ? scoped(f, branchKeys(f)) : []));
   // Commit ids are written at different lengths (push output, briefs, logs): link on the 7-character prefix.
-  index("commit", (f) => [...new Set(f.keys.commits.map((c) => c.slice(0, 7)))]);
+  index("commit", (f) => {
+    const short = [...new Set(f.keys.commits.map((c) => c.slice(0, 7)))];
+    return short.length <= params.maxSessionCommits ? short : [];
+  });
+  // A session's own id is its family key as a parent; its parents' ids are its family keys as a child.
+  index("family", (f) => [f.sessionId, ...f.keys.parents].map((p) => `${f.source}\u0001${p}`));
 
   if (params.files) {
     const fileFanout = new Map<string, number>();

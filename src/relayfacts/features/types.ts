@@ -94,6 +94,8 @@ export interface LinkKeys {
   files: string[];
   /** A delegated task id or relay task brief reference, when the directory or evidence names one. */
   taskRefs: string[];
+  /** The directory's parent sessions (the session that spawned this one, as a subagent or delegate). */
+  parents: string[];
 }
 
 /** Directory facts the snapshot does not carry. All optional. */
@@ -102,6 +104,8 @@ export interface SessionContext {
   branch?: string | null;
   taskRef?: string | null;
   userRole?: string | null;
+  /** The directory row's parent_session_ids. */
+  parentSessionIds?: string[];
 }
 
 export interface SessionFacts {
@@ -130,7 +134,11 @@ export interface ForgeFacts {
   commits: Array<{ sha: string; at: string; onDefaultBranch: boolean; revertedBy?: string | null; revertedAt?: string | null }>;
   flags: Array<{ name: string; defaultOn: boolean }>;
   /** Branches of the repository and whether their work reached the default branch (by ancestry or patch id). */
-  branches?: Array<{ name: string; landed: boolean; landedAt: string | null; tipAt: string; flagsAdded?: string[] }>;
+  branches?: Array<{
+    name: string; landed: boolean; landedAt: string | null; tipAt: string; flagsAdded?: string[];
+    /** The branch's own commits (not on the default branch by ancestry), newest first, at most 200. */
+    commits?: string[];
+  }>;
 }
 
 export const EMPTY_FORGE: ForgeFacts = { prs: [], commits: [], flags: [] };
@@ -138,7 +146,7 @@ export const EMPTY_FORGE: ForgeFacts = { prs: [], commits: [], flags: [] };
 export interface FeatureLink {
   a: SessionKey;
   b: SessionKey;
-  signal: "task" | "pr" | "branch" | "commit" | "files";
+  signal: "task" | "pr" | "branch" | "commit" | "family" | "files";
   value: string;
 }
 

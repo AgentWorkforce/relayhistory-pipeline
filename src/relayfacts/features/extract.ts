@@ -313,6 +313,7 @@ export function extractSessionFacts(snapshot: SessionAnalysisSnapshot, context: 
     commits: [...new Set([...art.commits.keys(), ...mentionedCommits])].sort(textCompare),
     files: [...files].sort(textCompare),
     taskRefs: [...new Set([...(context.taskRef ? [context.taskRef] : []), ...(artifacts?.taskRefs ?? []).map((t) => t.ref)])].sort(textCompare),
+    parents: [...new Set((context.parentSessionIds ?? []).filter((p) => p && p !== key.sessionId))].sort(textCompare),
   };
   const titleText = cutWords(collapse(snapshot.title ?? ""), TITLE_MAX);
   return {

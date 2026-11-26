@@ -27,6 +27,11 @@ export function factsAsOf(f: SessionFacts, asOf: string): SessionFacts | null {
   if (f.startedAt >= asOf) return null;
   const keep = <T extends { at: string | null }>(items: T[]) => items.filter((i) => before(i.at, f.endedAt, asOf));
   const built = keep(f.built);
+  // A key backed by a built item follows that item's time; a key only mentioned (a brief naming a commit under
+  // review) has no time of its own and is known from the session's start, which is before `asOf` here.
+  const allBuilt = new Set(f.built.filter((b) => b.ref).map((b) => `${b.kind}\u0000${b.ref}`));
+  const keptBuilt = new Set(built.filter((b) => b.ref).map((b) => `${b.kind}\u0000${b.ref}`));
+  const known = (kind: "commit" | "pr", ref: string) => !allBuilt.has(`${kind}\u0000${ref}`) || keptBuilt.has(`${kind}\u0000${ref}`);
   return {
     ...f,
     endedAt: f.endedAt < asOf ? f.endedAt : asOf,
@@ -36,8 +41,8 @@ export function factsAsOf(f: SessionFacts, asOf: string): SessionFacts | null {
     rationale: keep(f.rationale),
     keys: {
       ...f.keys,
-      commits: f.keys.commits.filter((sha) => built.some((b) => b.kind === "commit" && b.ref === sha)),
-      prs: f.keys.prs.filter((url) => built.some((b) => b.kind === "pr" && b.ref === url)),
+      commits: f.keys.commits.filter((sha) => known("commit", sha)),
+      prs: f.keys.prs.filter((url) => known("pr", url)),
     },
   };
 }
@@ -100,10 +105,42 @@ export function deriveState(sessions: readonly SessionFacts[], forge: ForgeFacts
   return { state: "in_progress", basis: "analysis", reason: "work recorded, no merge the forge shows" };
 }
 
+/**
+ * A commit already on the default branch when the session started is the base it worked from (a brief's
+ * "base 9d1adf84"), not its work: it is dropped as a link key, so every review cut from one main tip does not
+ * become one feature. The session's own built commits stay.
+ */
+export function withoutBaseCommits(f: SessionFacts, forge: ForgeFacts): SessionFacts {
+  const builtShas = new Set(f.built.filter((b) => b.kind === "commit").map((b) => b.ref!));
+  const base = (sha: string) => !builtShas.has(sha) && forge.commits.some((c) => c.onDefaultBranch && c.at < f.startedAt && (c.sha.startsWith(sha) || sha.startsWith(c.sha)));
+  const commits = f.keys.commits.filter((sha) => !base(sha));
+  return commits.length === f.keys.commits.length ? f : { ...f, keys: { ...f.keys, commits } };
+}
+
+/** At most this many feature branches may hold a commit for it to name its branch (a commit cut into many is shared). */
+export const MAX_COMMIT_BRANCHES = 2;
+
+/**
+ * A session that names a commit (a reviewer given "review <sha>") without naming its branch: the forge's branches
+ * holding that commit become the session's branch keys, so each review round of one branch links to the others
+ * and to the session that pushed it.
+ */
+export function withCommitBranches(f: SessionFacts, forge: ForgeFacts): SessionFacts {
+  if (!f.keys.commits.length || !forge.branches?.length) return f;
+  const added = new Set<string>();
+  for (const sha of f.keys.commits) {
+    if (sha.length < 7) continue;
+    const holders = forge.branches.filter((b) => (b.commits ?? []).some((c) => c.startsWith(sha) || sha.startsWith(c)));
+    if (holders.length && holders.length <= MAX_COMMIT_BRANCHES) for (const b of holders) added.add(b.name);
+  }
+  const branches = [...new Set([...f.keys.branches, ...added])].sort(textCompare);
+  return branches.length === f.keys.branches.length ? f : { ...f, keys: { ...f.keys, branches } };
+}
+
 /** Stages 2 to 4: every feature record as of `asOf`. */
 export function buildFeatures(all: readonly SessionFacts[], options: BuildOptions): FeatureRecord[] {
   const forge = options.forge ?? EMPTY_FORGE;
-  const facts = all.map((f) => factsAsOf(f, options.asOf)).filter((f): f is SessionFacts => f !== null);
+  const facts = all.map((f) => factsAsOf(f, options.asOf)).filter((f): f is SessionFacts => f !== null).map((f) => withoutBaseCommits(f, forge)).map((f) => withCommitBranches(f, forge));
   const { groups, links } = linkSessions(facts, options.link ?? DEFAULT_LINK_PARAMS);
   return groups.map((sessions) => {
     const founding = sessions[0]!;
