@@ -3,6 +3,7 @@
  * goes in, and only identifiers, paths, refs and short closed-vocabulary codes come out. No content string, or
  * any substring of one longer than an identifier, is ever returned.
  */
+import { createHash } from "node:crypto";
 
 export interface RawEvent {
   eventId: string;
@@ -55,7 +56,13 @@ export interface EventFacts {
 const MAX_LIST = 50;
 const SAFE_NAME = /^[A-Za-z0-9][A-Za-z0-9._\/-]{0,199}$/;
 const cap = <T>(xs: Iterable<T>) => [...new Set(xs)].slice(0, MAX_LIST);
-const short = (v: string | null | undefined, max = 128) => (typeof v === "string" && v.length <= max ? v : null);
+/** An event id as given when it is identifier-shaped, else a short hash of it, so ids stay distinct but carry no text. */
+const eventIdOf = (v: unknown) => {
+  const raw = typeof v === "string" ? v : String(v ?? "");
+  return idOf(raw) ?? `h:${createHash("sha256").update(raw).digest("hex").slice(0, 24)}`;
+};
+/** An event time as canonical ISO, or "" when it is not one (such events are dropped by the window check). */
+const isoOf = (v: unknown) => (typeof v === "string" && Number.isFinite(Date.parse(v)) ? new Date(v).toISOString() : "");
 
 const GIT = /\bgit\s+(?:-C\s+\S+\s+)?(commit|push|checkout|switch|branch|rebase|merge|revert|reset|cherry-pick|worktree|pull|fetch|stash)\b/g;
 const GH = /\bgh\s+(pr|issue|api)\s*(create|merge|close|view|checkout|comment|review|list)?\b/g;
@@ -73,7 +80,18 @@ const SHELL_WRITE = new RegExp(String.raw`(?:\bsed\s+-i(?:\s*''|\s+'')?(?:\s+-e)
 const GIT_ADD = /\bgit\s+(?:-C\s+\S+\s+)?add\s+((?:[^;&|\n]+))/g;
 const STATUS_LINE = /^ ?[MADRCU?!]{1,2} +(?:\S+ -> )?(\S+)$/gm;
 const STAT_LINE = /^ (\S+?)\s+\|\s+(?:\d+|Bin)\b/gm;
-const looksLikePath = (p: string) => p.length <= 400 && !p.startsWith("-") && /[A-Za-z]/.test(p) && !/^[0-9a-f]{7,40}$/.test(p) && !/^\.+$/.test(p);
+/**
+ * A recovered path must look like one: path characters only (no whitespace, quotes or punctuation that prose
+ * carries), and either a directory separator or a file extension. Anything else is dropped, so free text that
+ * lands where a path is expected (a patch header, a redirect target) never leaves the reducer.
+ */
+const PATH_CHARS = /^[A-Za-z0-9_.~\/@+-]{1,400}$/;
+export const looksLikePath = (p: string) =>
+  PATH_CHARS.test(p) && !p.startsWith("-") && /[A-Za-z]/.test(p) && !/^[0-9a-f]{7,40}$/.test(p) && !/^\.+$/.test(p)
+  && (p.includes("/") || /\.[A-Za-z0-9]{1,12}$/.test(p));
+/** Identifiers and closed-vocabulary codes: no whitespace, so no prose. */
+const ID = /^[A-Za-z0-9._:@\/-]{1,128}$/;
+const idOf = (v: string | null | undefined, max = 128) => (typeof v === "string" && v.length <= max && ID.test(v) ? v : null);
 
 /** Edited paths recovered from commands (tool calls) and from git's own output (tool results). */
 function touchedPaths(text: string, isCall: boolean, isResult: boolean): EventFacts["touched"] {
@@ -117,9 +135,9 @@ export function eventFacts(e: RawEvent): EventFacts {
   ];
   const relayMatch = e.actorRole === "user" || e.type === "user" || e.kind === "history" ? RELAY.exec(text) : null;
   return {
-    eventId: e.eventId, ts: e.ts, kind: short(e.kind, 40), type: short(e.type, 40), role: short(e.actorRole, 40),
-    tool: short(e.toolName, 80), toolStatus: short(e.toolStatus, 40), subagentId: short(e.subagentId), userId: short(e.userId),
-    files: cap((e.filesTouched ?? []).filter((f) => typeof f === "string" && f.length > 0 && f.length <= 4096)),
+    eventId: eventIdOf(e.eventId), ts: isoOf(e.ts), kind: idOf(e.kind, 40), type: idOf(e.type, 40), role: idOf(e.actorRole, 40),
+    tool: idOf(e.toolName, 80), toolStatus: idOf(e.toolStatus, 40), subagentId: idOf(e.subagentId), userId: idOf(e.userId),
+    files: cap((e.filesTouched ?? []).filter((f) => typeof f === "string" && looksLikePath(f))),
     touched: touchedPaths(text, isCall, isResult),
     git: cap([...commandText.matchAll(GIT)].map((m) => m[1] as GitOp)),
     gh: cap(ghOps(commandText)),
@@ -132,3 +150,39 @@ export function eventFacts(e: RawEvent): EventFacts {
 /** True when the facts carry anything a detector can use; empty events are counted, not stored. */
 export const informative = (f: EventFacts) =>
   f.files.length > 0 || f.touched.length > 0 || f.git.length > 0 || f.gh.length > 0 || f.branches.length > 0 || f.prRefs.length > 0 || f.shas.length > 0 || f.relay !== null || f.subagentId !== null;
+
+const LIMIT_IDS = 50;
+const ids = (v: unknown) => (Array.isArray(v) ? [...new Set(v.map((x) => idOf(typeof x === "string" ? x : null)).filter((x): x is string => !!x))].slice(0, LIMIT_IDS) : []);
+const isoOrNull = (v: unknown) => isoOf(v) || null;
+const PR_URL_EXACT = /^https:\/\/github\.com\/[A-Za-z0-9._-]{1,100}\/[A-Za-z0-9._-]{1,100}\/pull\/\d{1,7}$/;
+
+/**
+ * The directory row the harvest keeps, as a closed schema: every field is named here and validated, and nested
+ * objects are rebuilt from validated leaves, never copied. A row without a valid session id and source is dropped.
+ * Fields the source does not serve are null or empty.
+ */
+export interface DirectoryProjection {
+  sessionId: string; source: string; lastTs: string; createdAt: string | null; projectId: string | null;
+  project: { name: string | null; detail: string | null } | null; parentSessionIds: string[]; userIds: string[];
+  machineIds: string[]; eventCount: number | null; pullRequest: { number: number; url: string | null } | null;
+  workState: string | null; model: string | null; branch: string | null; via: "cloud" | "reader-mcp";
+}
+
+export function directoryProjection(raw: Record<string, unknown>, via: "cloud" | "reader-mcp"): DirectoryProjection | null {
+  const sessionId = idOf(raw.sessionId as string), source = idOf(raw.source as string, 40), lastTs = isoOf(raw.lastTs);
+  if (!sessionId || !source || !lastTs) return null;
+  const p = raw.project && typeof raw.project === "object" ? raw.project as Record<string, unknown> : null;
+  const name = idOf(typeof p?.name === "string" ? p.name : null, 200), detail = typeof p?.detail === "string" && looksLikePath(p.detail) ? p.detail : null;
+  const pr = raw.pullRequest && typeof raw.pullRequest === "object" ? raw.pullRequest as Record<string, unknown> : null;
+  const prNumber = Number(pr?.number);
+  const eventCount = Number(raw.eventCount);
+  return {
+    sessionId, source, lastTs, createdAt: isoOrNull(raw.createdAt), projectId: idOf(raw.projectId as string, 200),
+    project: name || detail ? { name, detail } : null,
+    parentSessionIds: ids(raw.parentSessionIds), userIds: ids(raw.userIds), machineIds: ids(raw.machineIds),
+    eventCount: Number.isSafeInteger(eventCount) && eventCount >= 0 ? eventCount : null,
+    pullRequest: Number.isSafeInteger(prNumber) && prNumber > 0 ? { number: prNumber, url: typeof pr?.url === "string" && PR_URL_EXACT.test(pr.url) ? pr.url : null } : null,
+    workState: idOf(raw.workState as string, 40), model: idOf(raw.model as string, 80),
+    branch: typeof raw.branch === "string" && SAFE_NAME.test(raw.branch) ? raw.branch : null, via,
+  };
+}

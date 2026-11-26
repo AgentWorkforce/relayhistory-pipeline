@@ -4,7 +4,10 @@
  *  - recall at several alert budgets (alerts per hundred coding sessions, spent per week), with lead time and
  *    alerts on adjudicated non-overlaps: what a team would get at each alert rate;
  *  - precision at the headline budget, from blind verdicts on the alerts themselves, with a Wilson interval
- *    (the incident labels only cover overlaps the forge shows, so they cannot measure precision);
+ *    (the incident labels only cover overlaps the forge shows, so they cannot measure precision). It is
+ *    conditional: the rate among the alerts that were judged (`judged`, unclear verdicts excluded), which the
+ *    sample draws from each detector's top-ranked alerts, so it estimates precision at the top of the ranking,
+ *    not across every alert the budget admits (`unjudged` says how many were not judged);
  *  - a ceiling analysis of every incident: is a miss the data's fault (no session on a side) or the detector's.
  */
 import { createHash } from "node:crypto";

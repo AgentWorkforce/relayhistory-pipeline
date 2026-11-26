@@ -86,14 +86,14 @@ describe("harvestSession", () => {
     const { client } = fakeClient((url) => url.includes("cursor=")
       ? { events: [ev({ eventId: "e2", kind: "tool_call", content: "git push origin x" })], nextCursor: null }
       : { events: [ev({ type: "assistant", content: MARKER }), ev({ eventId: "e3", filesTouched: ["a.ts"] })], nextCursor: "p2" });
-    const s = await harvestSession(client, { sessionId: "s1", source: "codex", lastTs: "2026-09-01T00:00:00Z" });
+    const s = await harvestSession(client, { sessionId: "s1", source: "codex", lastTs: "2026-09-01T00:00:00Z" }, { since: "2026-08-01T00:00:00Z", until: "2026-10-01T00:00:00Z" });
     expect(s.eventsRead).toBe(3);
     expect(s.events.map((e) => e.eventId)).toEqual(["e3", "e2"]);
     expect(JSON.stringify(s)).not.toContain(MARKER);
 
     const failing = new CloudClient({ base: "https://cloud.example.invalid/api/v1", workspaceId: "00000000-0000-0000-0000-000000000000", maxRequests: 10,
       fetchImpl: (async () => new Response("{}", { status: 404 })) as unknown as typeof fetch, sleep: async () => {} }, "y".repeat(32));
-    expect((await harvestSession(failing, { sessionId: "s2", source: "codex", lastTs: "2026-09-01T00:00:00Z" })).error).toBe("http_404");
+    expect((await harvestSession(failing, { sessionId: "s2", source: "codex", lastTs: "2026-09-01T00:00:00Z" }, { since: "2026-08-01T00:00:00Z", until: "2026-10-01T00:00:00Z" })).error).toBe("http_404");
   });
   test("the client refuses a non-https base and redacts its token", () => {
     expect(() => new CloudClient({ base: "http://cloud.example.invalid", workspaceId: "00000000-0000-0000-0000-000000000000", maxRequests: 1 }, "z".repeat(32))).toThrow();
@@ -164,20 +164,119 @@ describe("reader source (shared-sessions MCP)", () => {
       ? { events: [mcpEvent(2, { content_truncated: true }), mcpEvent(3, { kind: "message", type: "assistant", tool_name: null, content: `${MARKER} I will run git push` })], next_cursor: null }
       : { events: [mcpEvent(1)], next_cursor: "b96e1:next" });
     const { harvestMcpSession } = await import("../cloud-harvest/mcp-source.ts");
-    const s = await harvestMcpSession(client, { sessionId: "s1", source: "codex", lastTs: "2026-11-20T00:00:00Z" });
+    const s = await harvestMcpSession(client, { sessionId: "s1", source: "codex", lastTs: "2026-11-20T00:00:00Z" }, { since: "2026-11-01T00:00:00Z", until: "2026-12-01T00:00:00Z" });
     expect(s.error).toBeNull();
     expect(s.eventsRead).toBe(3);
     expect(s.truncated).toBe(1);
     expect(s.events.map((e) => [e.ts, e.branches])).toEqual([["2026-11-20T00:00:01.000Z", ["fix/x-1"]], ["2026-11-20T00:00:02.000Z", ["fix/x-2"]]]);
-    expect(calls.map((c) => [c.args.session_id, c.args.source, c.args.order, c.args.cursor ?? null])).toEqual([["s1", "codex", "asc", null], ["s1", "codex", "asc", "b96e1:next"]]);
+    expect(calls.map((c) => [c.args.session_id, c.args.source, c.args.workspace_id, c.args.order, c.args.cursor ?? null])).toEqual([["s1", "codex", WS, "asc", null], ["s1", "codex", WS, "asc", "b96e1:next"]]);
     expect(JSON.stringify(s)).not.toContain(MARKER);
   });
 
   test("a session with no published transcript is recorded as such, and other tool errors as failures", async () => {
     const { harvestMcpSession } = await import("../cloud-harvest/mcp-source.ts");
     const missing = fakeMcp(() => "No shared session was found with that session ID and source in this workspace.");
-    expect((await harvestMcpSession(missing.client, { sessionId: "s", source: "claude", lastTs: "" })).error).toBe("no_transcript");
+    expect((await harvestMcpSession(missing.client, { sessionId: "s", source: "claude", lastTs: "" }, { since: "2026-11-01T00:00:00Z", until: "2026-12-01T00:00:00Z" })).error).toBe("no_transcript");
     const broken = fakeMcp(() => "Session history is temporarily unavailable.");
-    expect((await harvestMcpSession(broken.client, { sessionId: "s", source: "claude", lastTs: "" })).error).toBe("tool_error");
+    expect((await harvestMcpSession(broken.client, { sessionId: "s", source: "claude", lastTs: "" }, { since: "2026-11-01T00:00:00Z", until: "2026-12-01T00:00:00Z" })).error).toBe("tool_error");
+  });
+
+  test("drops events outside the window before reducing them, and stops paging once past it", async () => {
+    const at = (t: string, i: number) => mcpEvent(i, { timestamp: t, content: `*** Update File: src/f${i}.ts\n${MARKER}` });
+    const { client, calls } = fakeMcp((_n, a) => a.cursor
+      ? { events: [at("2026-11-29T00:00:00.000Z", 3), at("2026-12-02T00:00:00.000Z", 4)], next_cursor: "b96e1:more" }
+      : { events: [at("2026-10-01T00:00:00.000Z", 1), at("not a time", 2)], next_cursor: "b96e1:next" });
+    const { harvestMcpSession } = await import("../cloud-harvest/mcp-source.ts");
+    const s = await harvestMcpSession(client, { sessionId: "s1", source: "codex", lastTs: "2026-11-29T00:00:00Z" }, { since: "2026-11-01T00:00:00Z", until: "2026-12-01T00:00:00Z" });
+    expect(s.eventsRead).toBe(4);
+    expect(s.outOfWindow).toBe(3);
+    expect(s.events.map((e) => e.touched.map((t) => t.path))).toEqual([["src/f3.ts"]]);
+    expect(calls).toHaveLength(2);
+    expect(JSON.stringify(s)).not.toContain(MARKER);
+  });
+
+  test("a credential bound to another workspace is refused before any read", async () => {
+    const { runHarvest } = await import("../cloud-harvest/harvest.ts");
+    const { mkdtempSync } = await import("node:fs");
+    const { tmpdir } = await import("node:os");
+    const { join } = await import("node:path");
+    const other = fakeMcp((n) => (n === "describe_capabilities" ? { workspace: { workspace_id: "00000000-0000-4000-8000-0000000000ff" } } : { sessions: [], next_cursor: null }));
+    const out = mkdtempSync(join(tmpdir(), "harvest-test-"));
+    await expect(runHarvest(other.client, { out, window: { since: "2026-11-01T00:00:00Z", until: "2026-12-01T00:00:00Z" }, concurrency: 1, via: "reader-mcp" })).rejects.toThrow("not bound to the requested workspace");
+    expect(other.calls.map((c) => c.name)).toEqual(["describe_capabilities"]);
+    const same = fakeMcp((n) => (n === "describe_capabilities" ? { workspace: { workspace_id: WS } } : { sessions: [], next_cursor: null }));
+    await runHarvest(same.client, { out: mkdtempSync(join(tmpdir(), "harvest-test-")), window: { since: "2026-11-01T00:00:00Z", until: "2026-12-01T00:00:00Z" }, concurrency: 1, via: "reader-mcp" });
+    expect(same.calls.map((c) => c.name)).toEqual(["describe_capabilities", "list_session_summaries"]);
+  });
+});
+
+describe("privacy boundary", () => {
+  test("free text where a path is expected is never kept", () => {
+    const f = eventFacts(ev({ kind: "tool_call", filesTouched: ["synthetic free text marker", "src/ok.ts"],
+      content: "*** Update File: synthetic free text marker\n*** Add File: src/new.ts\ncat > notes about the plan.txt\ntee 'a b'" }));
+    expect(f.files).toEqual(["src/ok.ts"]);
+    expect(f.touched.map((t) => t.path)).toEqual(["src/new.ts"]);
+    expect(JSON.stringify(f)).not.toContain("synthetic free text");
+  });
+  test("identifier fields carry identifiers only", () => {
+    const f = eventFacts(ev({ kind: "a sentence of prose", toolName: "Bash", userId: "user said something private", subagentId: "sub-1" }));
+    expect([f.kind, f.tool, f.userId, f.subagentId]).toEqual([null, "Bash", null, "sub-1"]);
+  });
+  test("directory rows are rebuilt from validated fields, never copied", async () => {
+    const { directoryProjection } = await import("../cloud-harvest/features.ts");
+    const row = directoryProjection({
+      sessionId: "s1", source: "codex", lastTs: "2026-11-20T00:00:00.123456Z", title: MARKER, summary: MARKER,
+      project: { name: "AgentWorkforce/cloud", detail: "~/Projects/AgentWorkforce/cloud", description: MARKER },
+      pullRequest: { number: 93, url: "https://github.com/AgentWorkforce/cloud/pull/93", title: MARKER },
+      userIds: ["u1", MARKER + " with spaces"], workState: "free text state", model: "gpt-x", eventCount: "12",
+    }, "cloud");
+    expect(row).toEqual({
+      sessionId: "s1", source: "codex", lastTs: "2026-11-20T00:00:00.123Z", createdAt: null, projectId: null,
+      project: { name: "AgentWorkforce/cloud", detail: "~/Projects/AgentWorkforce/cloud" }, parentSessionIds: [], userIds: ["u1"], machineIds: [],
+      eventCount: 12, pullRequest: { number: 93, url: "https://github.com/AgentWorkforce/cloud/pull/93" }, workState: null, model: "gpt-x", branch: null, via: "cloud",
+    });
+    expect(JSON.stringify(row)).not.toContain(MARKER);
+    expect(directoryProjection({ sessionId: "has spaces", source: "codex", lastTs: "2026-11-20T00:00:00Z" }, "cloud")).toBeNull();
+  });
+  test("the request cap must be a positive integer", () => {
+    for (const maxRequests of [NaN, 0, -1, 1.5, Infinity]) {
+      expect(() => new CloudClient({ base: "https://cloud.example.invalid", workspaceId: "00000000-0000-0000-0000-000000000000", maxRequests }, "x".repeat(32))).toThrow("positive integer");
+    }
+  });
+});
+
+describe("request ledger", () => {
+  test("is fixed at creation, counts across resumes, and is written before each request", async () => {
+    const { openLedger } = await import("../cloud-harvest/cli.ts");
+    const { mkdtempSync, readFileSync } = await import("node:fs");
+    const { tmpdir } = await import("node:os");
+    const { join } = await import("node:path");
+    const file = join(mkdtempSync(join(tmpdir(), "ledger-")), "manifest.json");
+    const a = openLedger(file, { w: 1 }, "3");
+    a.record(); a.record();
+    expect(JSON.parse(readFileSync(file, "utf8")).requestsUsed).toBe(2);
+    // A resumed (or interrupted and restarted) run sees what was already spent.
+    const b = openLedger(file, { w: 1 }, undefined);
+    expect(b.remaining()).toBe(1);
+    expect(() => openLedger(file, { w: 1 }, "10")).toThrow("fixed when the harvest is created");
+    expect(() => openLedger(file, { w: 2 }, undefined)).toThrow("other parameters");
+    expect(() => openLedger(join(mkdtempSync(join(tmpdir(), "ledger-")), "manifest.json"), {}, "NaN")).toThrow("positive integer");
+  });
+  test("each retry is a request", async () => {
+    let n = 0, recorded = 0;
+    const fetchImpl = (async () => (++n < 3 ? new Response("{}", { status: 503 }) : new Response(JSON.stringify({ events: [], nextCursor: null }), { status: 200 }))) as unknown as typeof fetch;
+    const c = new CloudClient({ base: "https://cloud.example.invalid/api/v1", workspaceId: "00000000-0000-0000-0000-000000000000", maxRequests: 10, fetchImpl, sleep: async () => {}, onRequest: () => recorded++ }, "x".repeat(32));
+    await c.get("events", "/reflex/sessions/s/events");
+    expect(recorded).toBe(3);
+  });
+});
+
+describe("event ids", () => {
+  test("an id that is not identifier-shaped is kept as a distinct hash, never as text", () => {
+    const a = eventFacts(ev({ eventId: "row 1 of a note", kind: "tool_call", content: "git push origin x" }));
+    const b = eventFacts(ev({ eventId: "row 2 of a note", kind: "tool_call", content: "git push origin x" }));
+    expect(a.eventId).toMatch(/^h:[0-9a-f]{24}$/);
+    expect(a.eventId).not.toBe(b.eventId);
+    expect(eventFacts(ev({ eventId: "evt_01J", kind: "tool_call" })).eventId).toBe("evt_01J");
   });
 });

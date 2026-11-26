@@ -38,24 +38,42 @@ describe("paths", () => {
 });
 
 describe("open-pr overlap (D1)", () => {
-  test("a session editing a file of another author's open PR alerts at that edit, before the harm", () => {
-    const ctx = ctxOf([row("bob", "W")], [facts("bob", [fact("2026-09-01T21:00:00.000Z", { touched: [{ path: "crates/core/src/lib.rs", via: "status" }] })])], [pr(93, "machine-c")]);
-    const alerts = openPrOverlap(ctx, { minShared: 1, maxPrFiles: 100, skipHot: true, suppressCommunicated: true });
+  // Line C creates PR 93 at 17:00 and edits lib.rs at 17:30; bob, another line, edits lib.rs at 21:00.
+  const creator = facts("cee", [
+    fact("2026-09-01T17:00:00.000Z", { gh: ["pr-create"], prRefs: ["agentworkforce/relayhistory#93"] }),
+    fact("2026-09-01T17:30:00.000Z", { touched: [{ path: "crates/core/src/lib.rs", via: "patch" }] }),
+  ]);
+  const P = { minShared: 1, maxPrFiles: 100, skipHot: true, suppressCommunicated: true };
+  test("a session editing a file another line's open PR had worked on alerts at that edit, before the harm", () => {
+    const ctx = ctxOf([row("bob", "W"), row("cee", "C")], [creator, facts("bob", [fact("2026-09-01T21:00:00.000Z", { touched: [{ path: "crates/core/src/lib.rs", via: "patch" }] })])], [pr(93, "machine-c")]);
+    const alerts = openPrOverlap(ctx, P);
     expect(alerts).toHaveLength(1);
     expect(alerts[0]!.sides).toEqual(["root:codex:bob", "pr:agentworkforce/relayhistory#93"]);
-    const s = score("open-pr", ctx, alerts, [{ id: "i1", repo: REPO, kind: "intent_conflict", lines: ["pr:93", "commit:d00dfee"], harmAt: "2026-09-09T14:43:00.000Z", split: "dev" }], [], { sessions: 100, perHundred: 5 });
+    expect(alerts[0]!.at).toBe("2026-09-01T21:00:00.000Z");
+    const incident = [{ id: "i1", repo: REPO, kind: "intent_conflict", lines: ["pr:93", "commit:d00dfee"], harmAt: "2026-09-09T14:43:00.000Z", split: "dev" as const }];
     // The commit line links through the sha the session printed; this session printed none, so it is unlinkable.
-    expect(s.linkable).toBe(0);
-    const ctx2 = ctxOf([row("bob", "W")], [facts("bob", [fact("2026-09-01T21:00:00.000Z", { touched: [{ path: "crates/core/src/lib.rs", via: "status" }] }), fact("2026-09-01T21:18:00.000Z", { shas: ["d00dfee"] })])], [pr(93, "machine-c")]);
-    const s2 = score("open-pr", ctx2, openPrOverlap(ctx2, { minShared: 1, maxPrFiles: 100, skipHot: true, suppressCommunicated: true }), [{ id: "i1", repo: REPO, kind: "intent_conflict", lines: ["pr:93", "commit:d00dfee"], harmAt: "2026-09-09T14:43:00.000Z", split: "dev" }], [], { sessions: 100, perHundred: 5 });
+    expect(score("open-pr", ctx, alerts, incident, [], { sessions: 100, perHundred: 5 }).linkable).toBe(0);
+    const ctx2 = ctxOf([row("bob", "W"), row("cee", "C")], [creator, facts("bob", [fact("2026-09-01T21:00:00.000Z", { touched: [{ path: "crates/core/src/lib.rs", via: "patch" }] }), fact("2026-09-01T21:18:00.000Z", { shas: ["d00dfee"] })])], [pr(93, "machine-c")]);
+    const s2 = score("open-pr", ctx2, openPrOverlap(ctx2, P), incident, [], { sessions: 100, perHundred: 5 });
     expect(s2.hits.map((h) => h.id)).toEqual(["i1"]);
     expect(Math.round(s2.hits[0]!.leadH)).toBe(186);
   });
+  test("never uses hindsight: a PR's final file list, or edits and ownership dated after the alert", () => {
+    const bob = facts("bob", [fact("2026-09-01T21:00:00.000Z", { touched: [{ path: "crates/core/src/lib.rs", via: "patch" }] })]);
+    // No owning line: the forge file list alone is known only in hindsight.
+    expect(openPrOverlap(ctxOf([row("bob", "W")], [bob], [pr(93, "machine-c")]), P)).toEqual([]);
+    // The owner edits lib.rs only after bob does.
+    const late = facts("cee", [fact("2026-09-01T17:00:00.000Z", { gh: ["pr-create"], prRefs: ["agentworkforce/relayhistory#93"] }), fact("2026-09-01T22:00:00.000Z", { touched: [{ path: "crates/core/src/lib.rs", via: "patch" }] })]);
+    expect(openPrOverlap(ctxOf([row("bob", "W"), row("cee", "C")], [bob, late], [pr(93, "machine-c")]), P)).toEqual([]);
+    // The line edits lib.rs early but takes the PR (pushes its branch) only after bob's edit.
+    const later = facts("cee", [fact("2026-09-01T17:30:00.000Z", { touched: [{ path: "crates/core/src/lib.rs", via: "patch" }] }), fact("2026-09-01T23:00:00.000Z", { branches: ["b93"] })]);
+    expect(openPrOverlap(ctxOf([row("bob", "W"), row("cee", "C")], [bob, later], [pr(93, "machine-c")]), P)).toEqual([]);
+  });
   test("a PR the session itself created, or one already merged, never alerts", () => {
     const own = ctxOf([row("k", "K")], [facts("k", [fact("2026-09-01T17:00:00.000Z", { gh: ["pr-create"], prRefs: ["agentworkforce/relayhistory#93"] }), fact("2026-09-01T18:00:00.000Z", { touched: [{ path: "crates/core/src/lib.rs", via: "add" }] })])], [pr(93, "k")]);
-    expect(openPrOverlap(own, { minShared: 1, maxPrFiles: 100, skipHot: true, suppressCommunicated: true })).toEqual([]);
-    const merged = ctxOf([row("w", "W")], [facts("w", [fact("2026-09-03T00:00:00.000Z", { touched: [{ path: "crates/core/src/lib.rs", via: "add" }] })])], [pr(93, "x", { mergedAt: "2026-09-02T00:00:00.000Z" })]);
-    expect(openPrOverlap(merged, { minShared: 1, maxPrFiles: 100, skipHot: true, suppressCommunicated: true })).toEqual([]);
+    expect(openPrOverlap(own, P)).toEqual([]);
+    const merged = ctxOf([row("w", "W"), row("cee", "C")], [creator, facts("w", [fact("2026-09-03T00:00:00.000Z", { touched: [{ path: "crates/core/src/lib.rs", via: "add" }] })])], [pr(93, "x", { mergedAt: "2026-09-02T00:00:00.000Z" })]);
+    expect(openPrOverlap(merged, P)).toEqual([]);
   });
 });
 
@@ -148,5 +166,41 @@ describe("bench outputs", () => {
     const { assertOutsideRepo } = await import("../overlap-bench/cli.ts");
     expect(() => assertOutsideRepo("docs/bench-out")).toThrow("outside this repository");
     expect(existsSync("docs/bench-out")).toBe(false);
+  });
+});
+
+describe("as-of bundles", () => {
+  test("carry dated facts only: no title, description, file list or outcome, and ownership as of the alert", async () => {
+    const { describe: describePair } = await import("../overlap-bench/bundle.ts");
+    const ctx = ctxOf([row("cee", "C"), row("bob", "W")], [
+      facts("cee", [fact("2026-09-01T17:00:00.000Z", { gh: ["pr-create"], prRefs: ["agentworkforce/relayhistory#93"] }), fact("2026-09-01T23:00:00.000Z", { gh: ["pr-create"], prRefs: ["agentworkforce/relayhistory#94"] })]),
+      facts("bob", [fact("2026-09-01T21:00:00.000Z", { touched: [{ path: "src/a.ts", via: "patch" }] })]),
+    ], [
+      pr(93, "c", { title: "HINDSIGHT-TITLE", body: "HINDSIGHT-BODY", mergedAt: "2026-09-02T00:00:00.000Z", comments: [{ author: "x", at: "2026-09-01T18:00:00.000Z", body: "before" }, { author: "x", at: "2026-09-01T22:00:00.000Z", body: "after" }] }),
+      pr(94, "c", { createdAt: "2026-09-01T16:00:00.000Z" }),
+    ]);
+    const b = describePair(ctx, ["root:codex:cee", "root:codex:bob"], "2026-09-01T21:00:00.000Z", () => "member", true);
+    const text = JSON.stringify(b);
+    for (const leak of ["HINDSIGHT", "mergedAt", "crates/core", "after"]) expect(text).not.toContain(leak);
+    // PR 94 existed by then but its line only took it at 23:00.
+    expect(b.sides[0]!.prsCreated.map((p) => [p.pr, p.comments?.map((c) => c.body)])).toEqual([["agentworkforce/relayhistory#93", ["before"]]]);
+  });
+});
+
+describe("held-out freeze", () => {
+  test("binds inputs, labels, budget and split", async () => {
+    const { freezeTerms } = await import("../overlap-bench/cli.ts");
+    const { mkdtempSync, mkdirSync, writeFileSync } = await import("node:fs");
+    const { tmpdir } = await import("node:os");
+    const { join } = await import("node:path");
+    const d = mkdtempSync(join(tmpdir(), "freeze-")), h = join(d, "h"), f = join(d, "forge"), l = join(d, "labels.json");
+    mkdirSync(h); mkdirSync(join(f, "prs"), { recursive: true });
+    writeFileSync(join(h, "directory.jsonl"), "a\n"); writeFileSync(join(h, "facts.jsonl"), "b\n"); writeFileSync(join(f, "prs", "r.json"), "[]"); writeFileSync(l, "{}");
+    const a = freezeTerms(h, f, l, 5);
+    expect(a).toMatchObject({ perHundred: 5, split: "heldout", observed: "all" });
+    writeFileSync(join(h, "facts.jsonl"), "c\n");
+    expect(freezeTerms(h, f, l, 5).inputsHash).not.toBe(a.inputsHash);
+    writeFileSync(l, "{ }");
+    expect(freezeTerms(h, f, l, 5).labelsHash).not.toBe(a.labelsHash);
   });
 });

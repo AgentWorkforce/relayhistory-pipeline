@@ -9,8 +9,8 @@
  * and refuses to run twice for the same frozen file.
  */
 import { createHash } from "node:crypto";
-import { existsSync, mkdirSync, readdirSync, readFileSync, realpathSync, writeFileSync } from "node:fs";
-import { join, resolve } from "node:path";
+import { closeSync, existsSync, mkdirSync, openSync, readdirSync, readFileSync, readSync, realpathSync, statSync, writeFileSync } from "node:fs";
+import { basename, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { parseArgs } from "node:util";
 import type { DirectoryRow, SessionFacts } from "../cloud-harvest/harvest.ts";
@@ -101,8 +101,27 @@ export function assertOutsideRepo(out: string) {
   if (inRepo(realpathSync(abs))) throw new Error("--out must be outside this repository");
 }
 
-const SOURCES = ["detectors.ts", "model.ts", "paths.ts", "score.ts", "baseline.ts", "ranker.ts", "eval.ts", "cli.ts"].map((f) => new URL(f, import.meta.url));
+const SOURCES = ["detectors.ts", "model.ts", "paths.ts", "score.ts", "baseline.ts", "ranker.ts", "eval.ts", "bundle.ts", "cli.ts"].map((f) => new URL(f, import.meta.url));
 const sourceHash = () => createHash("sha256").update(SOURCES.map((u) => readFileSync(u)).join("\u0000")).digest("hex");
+/** sha256 over files, streamed (harvest facts are large), in the given order, each prefixed with its name and size. */
+function digestFiles(files: string[]): string {
+  const h = createHash("sha256"), buf = Buffer.alloc(1 << 20);
+  for (const f of files) {
+    h.update(`${basename(f)}\u0000${statSync(f).size}\u0000`);
+    const fd = openSync(f, "r");
+    try { for (let n; (n = readSync(fd, buf, 0, buf.length, null)) > 0;) h.update(buf.subarray(0, n)); } finally { closeSync(fd); }
+  }
+  return h.digest("hex");
+}
+/** Everything a frozen score depends on besides the points themselves: inputs, sources, labels, budget, split. */
+export interface FreezeTerms { sourceHash: string; labelsHash: string; inputsHash: string; perHundred: number; split: "heldout"; observed: "all" }
+export function freezeTerms(harvest: string, forge: string, labels: string, perHundred: number): FreezeTerms {
+  const inputs = [
+    ...harvest.split(",").filter(Boolean).flatMap((d) => ["directory.jsonl", "facts.jsonl"].map((f) => join(d, f))),
+    ...readdirSync(join(forge, "prs")).filter((n) => n.endsWith(".json")).sort().map((n) => join(forge, "prs", n)),
+  ];
+  return { sourceHash: sourceHash(), labelsHash: digestFiles([labels]), inputsHash: digestFiles(inputs), perHundred, split: "heldout", observed: "all" };
+}
 const pointHash = (g: { detector: string; params: unknown }) => createHash("sha256").update(JSON.stringify([g.detector, g.params, sourceHash()])).digest("hex").slice(0, 16);
 
 /** Ranking used for the climb: recall first, then fewer alerts on adjudicated non-overlaps, then lead time. */
@@ -121,6 +140,7 @@ async function main(argv: string[]) {
   const labels = JSON.parse(readFileSync(values.labels, "utf8")) as { incidents: IncidentLabel[]; negatives: NegativeLabel[] };
   const ctx = loadContext(values.harvest, values.forge);
   const perHundred = Number(values["per-hundred"] ?? 5);
+  if (!(perHundred > 0) || !Number.isFinite(perHundred)) throw new Error("--per-hundred must be a positive number");
   const scoreOn = (split: "dev" | "heldout", g: GridPoint) =>
     score(g.detector, ctx, g.run(ctx), labels.incidents.filter((i) => i.split === split), labels.negatives, { sessions: ctx.codingSessions, perHundred });
   if (cmd === "climb") {
@@ -134,19 +154,26 @@ async function main(argv: string[]) {
     }
     writeFileSync(join(values.out, "climb-log.json"), JSON.stringify(log, null, 1), { mode: 0o600 });
     const frozen = [...best.values()].map(({ g, s }) => ({ detector: g.detector, params: g.params, hash: pointHash(g), dev: { hits: s.hits.length, linkable: s.linkable, negativeHits: s.negativeHits, alerts: s.alerts, medianLeadH: s.medianLeadH } }));
-    writeFileSync(join(values.out, "frozen.json"), JSON.stringify({ sourceHash: sourceHash(), labelsHash: createHash("sha256").update(readFileSync(values.labels)).digest("hex"), frozen }, null, 1), { mode: 0o600 });
+    const terms = freezeTerms(values.harvest, values.forge, values.labels, perHundred);
+    writeFileSync(join(values.out, "frozen.json"), JSON.stringify({ format: "overlap-bench-frozen/2", ...terms, frozen }, null, 1), { mode: 0o600 });
     for (const f of frozen) console.log(JSON.stringify(f));
   } else if (cmd === "heldout") {
     if (!values.frozen) throw new Error("heldout needs --frozen");
-    const frozen = JSON.parse(readFileSync(values.frozen, "utf8")) as { sourceHash: string; labelsHash: string; frozen: Array<{ detector: string; params: Record<string, unknown>; hash: string }> };
+    const frozen = JSON.parse(readFileSync(values.frozen, "utf8")) as FreezeTerms & { format?: string; frozen: Array<{ detector: string; params: Record<string, unknown>; hash: string }> };
+    if (frozen.format !== "overlap-bench-frozen/2") throw new Error("frozen file predates input and budget freezing; climb again");
     const ledger = join(values.out, `heldout-${frozen.labelsHash.slice(0, 12)}.json`);
     if (existsSync(ledger)) throw new Error("held-out was already scored for these labels");
-    if (frozen.sourceHash !== sourceHash()) throw new Error("detector sources changed since freezing");
-    if (frozen.labelsHash !== createHash("sha256").update(readFileSync(values.labels)).digest("hex")) throw new Error("labels changed since freezing");
+    // The held-out score must use exactly the frozen inputs, sources, labels, budget and split.
+    if (values["per-hundred"] !== undefined && perHundred !== frozen.perHundred) throw new Error("--per-hundred differs from the frozen budget");
+    const now = freezeTerms(values.harvest, values.forge, values.labels, frozen.perHundred);
+    for (const k of ["sourceHash", "labelsHash", "inputsHash", "perHundred", "split", "observed"] as const) {
+      if (now[k] !== frozen[k]) throw new Error(`${k} differs from the frozen file`);
+    }
     const results = frozen.frozen.map((f) => {
       const g = grid().find((x) => x.detector === f.detector && JSON.stringify(x.params) === JSON.stringify(f.params));
       if (!g) throw new Error(`frozen point ${f.hash} is not in the grid`);
-      return { hash: f.hash, ...scoreOn("heldout", g) };
+      if (pointHash(g) !== f.hash) throw new Error(`frozen point ${f.hash} does not hash to its parameters and sources`);
+      return { hash: f.hash, ...score(g.detector, ctx, g.run(ctx), labels.incidents.filter((i) => i.split === frozen.split), labels.negatives, { sessions: ctx.codingSessions, perHundred: frozen.perHundred }) };
     });
     writeFileSync(ledger, JSON.stringify(results, null, 1), { mode: 0o600, flag: "wx" });
     for (const r of results) console.log(JSON.stringify({ detector: r.detector, hits: r.hits.length, linkable: r.linkable, recall: r.recall, negativeHits: r.negativeHits, medianLeadH: r.medianLeadH }));

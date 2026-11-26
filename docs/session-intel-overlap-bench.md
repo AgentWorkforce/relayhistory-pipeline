@@ -17,7 +17,7 @@ All harvested data, labels, verdicts and bundles stay outside this repository. T
 
 Events stamped before 2025 or with unparseable times are dropped.
 
-**PR ownership.** A root owns a PR only when it created it or created or pushed its head branch. A `gh pr create` call usually has no number; the first full PR URL within 10 minutes after it claims the number. A root that only names a PR (a view, a review, a merge, a merge train listing it) does not own it. Otherwise one reviewer touching two PRs would make both look like one line of work.
+**PR ownership.** A root owns a PR only when it created it or created or pushed its head branch, and only from that call's time (`prOwnership`). A `gh pr create` call usually has no number; the first full PR URL within 10 minutes after it claims the number. A root that only names a PR (a view, a review, a merge, a merge train listing it) does not own it. Otherwise one reviewer touching two PRs would make both look like one line of work. Detectors and as-of bundles ask who owned a PR as of the alert (`ownersAt`). Only scoring and hindsight adjudication use every owner a PR ever had.
 
 **Observed paths.** `git status` and `--stat` output list what is dirty or changed, not what this session wrote. `ObservedPolicy` sets how they count:
 
@@ -25,7 +25,7 @@ Events stamped before 2025 or with unparseable times are dropped.
 - `fresh` keeps only status paths the session's first status did not already list;
 - `none` drops them.
 
-On the dev split, observed paths are 84% of recovered edit events. Dropping them does not change the ceiling: the combined ranker reaches 6 dev incidents with no budget under every policy. At the headline budget, `fresh` moves the ranker from 5 hits and 2 negatives to 4 hits and 0 negatives. With samples this small that is not a clear win, so the default stays `all`.
+On the dev split (provisional, see "Findings so far"), observed paths are 84% of recovered edit events. Dropping them does not change the ceiling: the combined ranker reaches 6 dev incidents with no budget under every policy. At the headline budget, `fresh` moves the ranker from 5 hits and 2 negatives to 4 hits and 0 negatives. With samples this small that is not a clear win, so the default stays `all`.
 
 **Relay suppression.** A pair that communicated over Agent Relay before an alert is coordinated, not overlapping. `communicated` keys this by work root, so a lead messaging a worker covers both roots.
 
@@ -39,10 +39,12 @@ A **side** is a work root (`root:<session key>`) or a pull request (`pr:<owner/r
 
 | Detector | Fires when |
 |---|---|
-| D1 `open-pr` | A root edits `minShared` files that another line's open PR changes |
+| D1 `open-pr` | A root edits `minShared` files that another line's open PR had worked on by then |
 | D2 `shared-trigger` | Two roots react to the same PR they do not own, opening a PR or editing within `windowMin` of naming it |
 | D3 `concurrent` | Two roots edit the same uncommon paths in one repository within `windowH` hours. A path that more than `maxRootsPerPath` roots have edited is treated as hot. |
 | `outcome-facts` | The shipped detector, run unchanged over the same evidence mapped onto its `LaneFacts` (`baseline.ts`) |
+
+**Dated evidence only.** Every detector reads only what is dated before its alert. For D1 this means a PR's final file list is never used, because it is known only in hindsight. What a PR is working on at time t is the set of paths its owners (as of t) had edited before t, and `maxPrFiles` applies to that set. A PR with no owning root gives D1 no evidence.
 
 D3's score sums each shared path's rarity, which is 1 over the number of roots that had edited the path by then. Lines meeting on files few others touch outrank lines meeting on a common file.
 
@@ -61,7 +63,7 @@ Alerts are first cut to a **weekly budget** of `perHundred` alerts per 100 codin
 `eval.ts` reports, for each detector point:
 
 - **Recall curve.** Hits, negative hits, alerts and median lead time at budgets of 1, 5 (the headline budget), 20 and unlimited per 100 sessions.
-- **Precision at the headline budget.** This comes from blind verdicts on the alerts themselves, with a 95% Wilson interval. The incident labels cover only overlaps the forge shows, so they cannot measure precision.
+- **Precision at the headline budget.** This comes from blind verdicts on the alerts themselves, with a 95% Wilson interval. The incident labels cover only overlaps the forge shows, so they cannot measure precision. It is conditional: the rate among the judged alerts, with unclear verdicts excluded. The sample is drawn from each detector's top-ranked alerts, so it estimates precision at the top of the ranking, not across every alert the budget admits. `unjudged` reports how many were not judged.
 - **Ceiling.** Each incident is classed as `no_session` (no session evidence for either line), `one_side` or `both_sides`. A miss in the first two classes is the data's fault, not the detector's.
 
 ```
@@ -75,47 +77,60 @@ bun run src/session-intel/overlap-bench/cli.ts heldout ... --frozen <frozen.json
 
 `sample` writes an adjudication bundle. It takes the top alerts of each frozen point at the headline budget, merges them by pair, skips pairs already judged, and shuffles them by a seeded hash. Detector names are withheld so a verdict cannot lean on them.
 
-`bundle.ts` describes each pair from derived facts and forge metadata only: the PRs each side created, their titles, files and outcomes, branches, and edited files with times. Owners are shown as labels from a private file; anyone else is `member`. With `asOf`, the bundle shows only what a live system would have known when the alert fired:
+`bundle.ts` describes each pair from derived facts and forge metadata only: the PRs each side created, their titles, files and outcomes, branches, and edited files with times. Owners are shown as labels from a private file; anyone else is `member`. This hindsight form is for adjudicating what really happened.
 
-- no PR created later;
-- no merge or close after the alert;
-- comments only from before the alert;
-- the work's activity up to then.
+With `asOf`, the bundle carries dated facts only, as a live system would have known them when the alert fired:
 
-`asOf` bundles add PR descriptions as fetched, so a description edited later leaks a little hindsight.
+- the PRs that existed and that the side owned by then, with their author and creation time;
+- comments made before the alert (each comment is dated);
+- the side's own branches, edits and activity up to then.
+
+A PR's title, description and file list are left out, and so are merges and closes. They are known only as fetched, so a later edit would leak hindsight. A judge that reads intent from as-of bundles therefore reads it from branches, edits and dated comments.
 
 ## Protocol
 
 1. Climb on the dev split only. Labels are split by workstream, 44 dev incidents and 20 held-out.
-2. Freeze the best point per detector with a sha256 of params, sources and labels.
-3. Score held-out once. `heldout` refuses to run if the sources or labels changed since freezing, or if a ledger for these labels already exists (it is written with `wx`).
+2. Freeze the best point per detector (`overlap-bench-frozen/2`). The freeze records each point's hash (detector, params and sources) together with:
+   - the sources hash;
+   - the labels digest;
+   - a digest of every input file (each harvest's directory and facts, and the forge PR files);
+   - the alert budget;
+   - the split scored (`heldout`);
+   - the observed-path policy.
+3. Score held-out once. `heldout` recomputes every term and every point hash and refuses any mismatch. It uses the frozen budget (a different `--per-hundred` is refused), and refuses if a ledger for these labels already exists (the ledger is written with `wx`).
 4. Precision samples use fresh seeds, and a pair is never judged twice.
 
 ## Findings so far (dev split)
 
 These come from a Jul 28 → Nov 5 harvest of one workspace: about 5.2M events, with no read errors.
 
+**Status: provisional, pending a rerun.** The figures below were produced by revision 144b4ab2, before the review round that added the window, path and dated-evidence rules above. That revision had these known problems:
+- D1 used final PR file lists;
+- ownership was taken from full history;
+- as-of bundles carried PR titles, descriptions and file lists as fetched;
+- harvested events outside the window, and some non-path strings, were kept.
+
+The D1, ranker and stage-2 numbers are withdrawn until they are rerun. The other figures are kept as orientation only. Use of the harvested outputs is suspended while their disposition is decided, so the rerun waits on that decision.
+
 **Ceiling.** Of the 44 dev incidents, 19 have no session evidence on either side and 17 have it on one side only. Only 8 have both sides. Most misses are coverage, not detection.
 
-**Recall.** Hits out of 23 linkable incidents, with negative hits in brackets:
+**Recall (orientation only).** Hits out of 23 linkable incidents, with negative hits in brackets. D1 and the ranker are withdrawn, as above.
 
 | Detector | per 100 = 1 | 5 | 20 | unlimited |
 |---|---|---|---|---|
 | `outcome-facts` (shipped) | 0 | 0 | 0 | 0 |
-| D1 `open-pr` | 0 | 1 | 1 (1) | 2 (1) |
 | D2 `shared-trigger` | 0 (1) | 3 (2) | 4 (6) | 4 (6) |
 | D3 `concurrent` | 0 (1) | 1 (1) | 2 (1) | 5 (4) |
-| D4 ranker | 1 (2) | 5 (2) | 5 (5) | 6 (11) |
 
-**Precision.** In 73 blind-judged top alerts, judged in hindsight, 1 was an overlap, 3 were unclear and 69 were planned related work: stacked and follow-up PRs, handoffs, restarts, companion halves of one feature. At the headline budget, every structural detector had 0 confirmed overlaps among its judged alerts, with Wilson upper bounds of 11–20%. Structure finds the right neighbourhood but cannot tell planned work from duplicated work.
+**Precision (orientation only).** In 73 blind-judged top alerts, judged in hindsight, 1 was an overlap, 3 were unclear and 69 were planned related work: stacked and follow-up PRs, handoffs, restarts, companion halves of one feature. Structure finds the right neighbourhood but cannot tell planned work from duplicated work.
 
-**Naming and reference features do not separate them either.** PRs referencing each other, concurrency, a shared relay lead, and title and branch token similarity were each tried. Title and branch similarity of 0.3 or more covered 13 of 69 false alerts and 2 of 8 incidents. This experiment was not kept.
+**Naming and reference features do not separate them either.** PRs referencing each other, concurrency, a shared relay lead, and title and branch token similarity were each tried. None separated the two classes, and the experiment was not kept.
 
-**A judge reading intent as of the alert does separate them.** This was a blind test on 33 `asOf` bundles: 9 positives (8 incident pairs and the one hindsight overlap) and 24 fresh top ranker alerts. It kept 6 of 9 positives and 0 of 24 fresh alerts at p ≥ 0.3, and 4 of 9 and 0 of 24 at p ≥ 0.5. The misses were a handoff-shaped clash (one line ended before the other began) and two lines read as different problems in the same file. n is small, so 0 of 24 bounds the false-alert rate only below about 14%. The positives were dev items, so this is not a held-out result.
+**An as-of intent judge (withdrawn).** A first blind test suggested that a judge reading each pair as of its alert separates duplicated from planned work, where structure cannot. Its bundles included PR titles and descriptions as fetched, which the strict as-of rules now exclude, so its result is withdrawn. It has to be rerun on strict as-of bundles, and on held-out, before it supports any claim.
 
 ## Stage 2 (proposed)
 
-The evidence points to two stages:
+The provisional evidence points to two stages:
 
 1. A cheap structural **recall** stage: the D4 ranker at a loose budget.
 2. An **intent judge** on each candidate's `asOf` bundle.

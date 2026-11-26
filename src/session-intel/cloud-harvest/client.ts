@@ -8,7 +8,11 @@
 export const TOKEN_ENV = "CLOUD_HARVEST_TOKEN";
 const USER_AGENT = "session-intel-harvest/1";
 
-export interface CloudClientOptions { base: string; workspaceId: string; maxRequests: number; fetchImpl?: typeof fetch; sleep?: (ms: number) => Promise<void> }
+export interface CloudClientOptions {
+  base: string; workspaceId: string; maxRequests: number; fetchImpl?: typeof fetch; sleep?: (ms: number) => Promise<void>;
+  /** Called synchronously before each request is sent, so a ledger can record it even if the process dies. */
+  onRequest?: () => void;
+}
 
 export class CloudClient {
   readonly requests = { total: 0, retries: 0, byRoute: { list: 0, events: 0, mcp: 0 } };
@@ -23,6 +27,7 @@ export class CloudClient {
     const url = new URL(opts.base);
     if (url.protocol !== "https:" || url.username || url.password || url.search || url.hash) throw new Error("--cloud-api must be a plain https URL");
     if (!/^[0-9a-f-]{36}$/.test(opts.workspaceId)) throw new Error("--workspace must be a workspace uuid");
+    if (!Number.isSafeInteger(opts.maxRequests) || opts.maxRequests <= 0) throw new Error("--max-requests must be a positive integer");
     this.#token = token;
     const api = `${url.origin}${url.pathname.replace(/\/+$/, "")}`;
     this.#base = `${api}/workspaces/${opts.workspaceId}`;
@@ -42,6 +47,18 @@ export class CloudClient {
     const t = this.#token, h = t.length >> 1;
     return [t, t.slice(0, h), t.slice(h)].reduce((acc, part) => part.length >= 8 ? acc.split(part).join("[token]") : acc, s);
   }
+
+  /**
+   * The shared-sessions list tool takes no workspace: it reads the credential's own. Before any read, the
+   * credential's workspace (`describe_capabilities`) must be the one this harvest was authorized for.
+   */
+  async attestWorkspace(): Promise<void> {
+    const caps = await this.callTool("describe_capabilities", {});
+    const ws = (caps.workspace as { workspace_id?: unknown } | undefined)?.workspace_id;
+    if (ws !== this.opts.workspaceId) throw new Error("the credential is not bound to the requested workspace");
+  }
+
+  get workspaceId(): string { return this.opts.workspaceId; }
 
   get(route: "list" | "events", path: string): Promise<unknown> {
     return this.#send(route, this.#base + path, { method: "GET" }).then((r) => r.json());
@@ -75,6 +92,7 @@ export class CloudClient {
     for (let attempt = 0; ; attempt++) {
       if (this.requests.total >= this.opts.maxRequests) throw new HarvestCap();
       this.requests.total++; this.requests.byRoute[route]++;
+      this.opts.onRequest?.();
       let res: Response;
       try {
         res = await this.#fetch(url, { method: init.method, body: init.body, headers: { accept: "application/json", ...init.headers, authorization: `Bearer ${this.#token}`, "user-agent": USER_AGENT }, redirect: "manual" });
@@ -93,7 +111,7 @@ export class CloudClient {
 }
 
 /** The only MCP tools the harvest calls: both are reads. */
-export type McpReadTool = "list_session_summaries" | "get_shared_session";
+export type McpReadTool = "list_session_summaries" | "get_shared_session" | "describe_capabilities";
 export class McpToolError extends Error {}
 export class HarvestCap extends Error { constructor() { super("request cap reached"); } }
 export class HttpError extends Error { constructor(readonly status: number, route: string) { super(`${route}: HTTP ${status}`); } }

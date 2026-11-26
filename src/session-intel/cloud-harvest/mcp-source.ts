@@ -11,8 +11,8 @@
  * characters. Each harvested session records how many of its events were truncated.
  */
 import { type CloudClient, HarvestCap, HttpError, McpToolError } from "./client.ts";
-import { eventFacts, informative, type RawEvent } from "./features.ts";
-import type { DirectoryRow, Gap, SessionFacts } from "./harvest.ts";
+import { directoryProjection, eventFacts, informative, type RawEvent } from "./features.ts";
+import { type DirectoryRow, type Gap, inWindow, type SessionFacts, type Window } from "./harvest.ts";
 
 const LIST_PAGE = 50;
 const EVENTS_PAGE = 50;
@@ -31,15 +31,12 @@ interface McpEvent {
   project_id?: string | null; content?: string | null; content_truncated?: boolean | null;
 }
 
-/** A Reader directory row in the harvest's directory shape. Fields the MCP does not serve are null or empty. */
-export function directoryRowOf(r: SummaryRow): DirectoryRow {
-  return {
-    sessionId: r.session_id, source: r.source, lastTs: r.last_active ?? "", createdAt: null, projectId: null,
-    project: r.project ? { name: r.project } : null, parentSessionIds: [],
-    userIds: (r.owner ?? []).map((o) => o.user_id).filter((u): u is string => typeof u === "string"),
-    machineIds: [], eventCount: null, pullRequest: null, workState: null, model: null, branch: r.branch ?? null,
-    via: "reader-mcp",
-  };
+/** A Reader directory row through the same closed projection as Cloud's (features.ts `directoryProjection`). */
+export function directoryRowOf(r: SummaryRow): DirectoryRow | null {
+  return directoryProjection({
+    sessionId: r.session_id, source: r.source, lastTs: r.last_active, project: { name: r.project },
+    userIds: (r.owner ?? []).map((o) => o.user_id), branch: r.branch,
+  }, "reader-mcp") as DirectoryRow | null;
 }
 
 export const rawEventOf = (e: McpEvent): RawEvent => ({
@@ -62,7 +59,8 @@ export async function harvestMcpFrame(client: CloudClient, window: { since: stri
     pages++;
     for (const r of (page.sessions ?? []) as SummaryRow[]) {
       if (!r.session_id || !r.source || (r.last_active && r.last_active < window.since)) continue;
-      rows.set(`${r.source}\u0000${r.session_id}`, directoryRowOf(r));
+      const row = directoryRowOf(r);
+      if (row) rows.set(`${row.source}\u0000${row.sessionId}`, row);
     }
     cursor = typeof page.next_cursor === "string" && page.next_cursor ? page.next_cursor : undefined;
     if (pages % 25 === 0) log(`reader directory pages ${pages}, sessions ${rows.size}`);
@@ -70,14 +68,14 @@ export async function harvestMcpFrame(client: CloudClient, window: { since: stri
   return { rows: [...rows.values()], gaps, pages };
 }
 
-export async function harvestMcpSession(client: CloudClient, row: DirectoryRow): Promise<SessionFacts & { truncated: number }> {
-  const out: SessionFacts & { truncated: number } = { source: row.source, sessionId: row.sessionId, eventsRead: 0, censored: false, error: null, events: [], truncated: 0 };
+export async function harvestMcpSession(client: CloudClient, row: DirectoryRow, window: Window): Promise<SessionFacts & { truncated: number; outOfWindow: number }> {
+  const out: SessionFacts & { truncated: number; outOfWindow: number } = { source: row.source, sessionId: row.sessionId, eventsRead: 0, censored: false, error: null, events: [], truncated: 0, outOfWindow: 0 };
   let cursor: string | undefined;
   for (let page = 0; ; page++) {
     if (page >= MAX_MCP_EVENT_PAGES) { out.censored = true; break; }
     let body: Record<string, unknown>;
     try {
-      body = await client.callTool("get_shared_session", { session_id: row.sessionId, source: row.source, limit: EVENTS_PAGE, order: "asc", max_content: MAX_CONTENT, ...(cursor ? { cursor } : {}) });
+      body = await client.callTool("get_shared_session", { session_id: row.sessionId, source: row.source, workspace_id: client.workspaceId, limit: EVENTS_PAGE, order: "asc", max_content: MAX_CONTENT, ...(cursor ? { cursor } : {}) });
     } catch (e) {
       if (e instanceof HarvestCap) throw e;
       // A directory row whose transcript was never published is not a read failure.
@@ -86,14 +84,19 @@ export async function harvestMcpSession(client: CloudClient, row: DirectoryRow):
       throw e;
     }
     const events = (body.events ?? []) as McpEvent[];
+    let past = false;
     for (const e of events) {
       out.eventsRead++;
+      // The window is enforced before an event is reduced: nothing outside it is derived or kept.
+      const w = inWindow(e.timestamp, window);
+      if (w !== 0) { out.outOfWindow++; if (w > 0) past = true; continue; }
       if (e.content_truncated) out.truncated++;
       const f = eventFacts(rawEventOf(e));
       if (informative(f)) out.events.push(f);
     }
     cursor = typeof body.next_cursor === "string" && body.next_cursor ? body.next_cursor : undefined;
-    if (!cursor || !events.length) break;
+    // Events come oldest first, so once one is past the window the rest are too.
+    if (!cursor || !events.length || past) break;
   }
   return out;
 }

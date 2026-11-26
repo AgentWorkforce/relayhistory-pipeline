@@ -4,10 +4,10 @@
  * per pair of lines and their weights summed in time order. The pair alerts when the running total first reaches
  * `threshold`, with that total as its score: only evidence seen by then counts, so lead time stays honest.
  *
- * A D1 alert pairs a root with a pull request; when the PR has an owning root it is also counted against that
- * root, so it can corroborate D2 and D3 evidence about the same two lines.
+ * A D1 alert pairs a root with a pull request; it is also counted against the roots owning that PR at the
+ * alert's time, so it can corroborate D2 and D3 evidence about the same two lines.
  */
-import { type Alert, type Context, concurrentEdits, openPrOverlap, prOwners, rootSide, sharedTrigger } from "./detectors.ts";
+import { type Alert, type Context, concurrentEdits, openPrOverlap, ownersAt, prOwnership, rootSide, sharedTrigger } from "./detectors.ts";
 
 export interface RankerParams {
   /** Weight of a D1 alert (a root editing another line's open PR files). */
@@ -48,12 +48,12 @@ const pairKey = (a: string, b: string) => (a < b ? `${a}\u0001${b}` : `${b}\u000
 interface Evidence { at: string; kind: "openPr" | "trigger" | "concurrent"; value: number; sides: [string, string]; owners: [string | null, string | null] }
 
 export function rank(ctx: Context, c: Components, p: RankerParams): Alert[] {
-  const owners = prOwners(ctx);
+  const own = prOwnership(ctx);
   const byPair = new Map<string, Evidence[]>();
   const add = (e: Evidence) => { const k = pairKey(...e.sides); byPair.set(k, [...(byPair.get(k) ?? []), e]); };
   for (const a of c.openPr) {
     add({ at: a.at, kind: "openPr", value: 1, sides: a.sides, owners: a.owners });
-    for (const r of owners.get(a.sides[1]) ?? []) if (rootSide(r) !== a.sides[0]) add({ at: a.at, kind: "openPr", value: 1, sides: [a.sides[0], rootSide(r)], owners: a.owners });
+    for (const r of ownersAt(own, a.sides[1], a.at)) if (rootSide(r) !== a.sides[0]) add({ at: a.at, kind: "openPr", value: 1, sides: [a.sides[0], rootSide(r)], owners: a.owners });
   }
   for (const a of c.trigger) add({ at: a.at, kind: "trigger", value: 1, sides: a.sides, owners: a.owners });
   for (const a of c.concurrent) add({ at: a.at, kind: "concurrent", value: a.score, sides: a.sides, owners: a.owners });

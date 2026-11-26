@@ -6,18 +6,36 @@
 import { appendFileSync, existsSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { type CloudClient, HarvestCap, HttpError } from "./client.ts";
-import { eventFacts, informative, type EventFacts, type RawEvent } from "./features.ts";
+import { directoryProjection, eventFacts, informative, type EventFacts, type RawEvent } from "./features.ts";
 import { harvestMcpFrame, harvestMcpSession } from "./mcp-source.ts";
 
 /** Harnesses whose events carry tool calls and file edits. Others are kept in the directory only. */
 export const CODING_SOURCES = new Set(["claude", "codex", "cursor", "opencode", "grok", "devin", "muse", "copilot", "gemini", "antigravity", "amp", "capy", "openclaw", "replicas"]);
-const DIRECTORY_FIELDS = ["sessionId", "source", "createdAt", "lastTs", "projectId", "project", "parentSessionIds", "userIds", "machineIds", "eventCount", "pullRequest", "workState", "model"] as const;
 const EVENTS_PAGE = 1000;
 export const MAX_EVENT_PAGES = 300;
 
 export interface DirectoryRow { sessionId: string; source: string; lastTs: string; [k: string]: unknown }
 export interface Gap { from: string; to: string; reason: string }
-export interface SessionFacts { source: string; sessionId: string; eventsRead: number; censored: boolean; error: string | null; events: EventFacts[] }
+/** `outOfWindow` counts events read but dropped, unreduced, for falling outside the approved window. */
+export interface SessionFacts { source: string; sessionId: string; eventsRead: number; censored: boolean; error: string | null; events: EventFacts[]; outOfWindow?: number }
+export interface Window { since: string; until: string }
+
+/**
+ * What each reader can enforce at the read boundary. Neither current reader can bound event times on the server:
+ * Cloud's events route and the shared-sessions MCP page a session's whole history, so out-of-window events are
+ * received and then dropped before derivation. A bulk reader must filter by event time on the server.
+ */
+export const READERS = {
+  cloud: { serverSideEventWindow: false, workspaceInPath: true },
+  "reader-mcp": { serverSideEventWindow: false, workspaceInPath: false },
+} as const;
+
+/** -1 before the window, 0 inside it, 1 after it. An unparseable time is treated as outside (before). */
+export function inWindow(ts: unknown, w: Window): -1 | 0 | 1 {
+  const t = typeof ts === "string" ? Date.parse(ts) : NaN;
+  if (!Number.isFinite(t) || t < Date.parse(w.since)) return -1;
+  return t > Date.parse(w.until) ? 1 : 0;
+}
 
 interface ListPage { items?: Array<Record<string, unknown>>; nextCursor?: string | null; error?: boolean }
 /** A keyset cursor just below `ts`; the backend writes microsecond times (`…07.209000Z`). */
@@ -77,8 +95,8 @@ export async function harvestFrame(client: CloudClient, window: { since: string;
     for (const it of items) {
       const ts = String(it.lastTs ?? "");
       if (ts && ts < window.since) { reachedSince = true; continue; }
-      const row = Object.fromEntries(DIRECTORY_FIELDS.map((k) => [k, it[k] ?? null])) as DirectoryRow;
-      rows.set(`${row.source}\u0000${row.sessionId}`, row);
+      const row = directoryProjection(it, "cloud") as DirectoryRow | null;
+      if (row) rows.set(`${row.source}\u0000${row.sessionId}`, row);
       if (ts) lastTs = ts;
     }
     if (pages % 25 === 0) log(`directory pages ${pages}, sessions ${rows.size}, at ${lastTs}`);
@@ -90,8 +108,8 @@ export async function harvestFrame(client: CloudClient, window: { since: string;
 
 interface EventsPage { events?: RawEvent[]; nextCursor?: string | null }
 
-export async function harvestSession(client: CloudClient, row: DirectoryRow): Promise<SessionFacts> {
-  const out: SessionFacts = { source: row.source, sessionId: row.sessionId, eventsRead: 0, censored: false, error: null, events: [] };
+export async function harvestSession(client: CloudClient, row: DirectoryRow, window: Window): Promise<SessionFacts> {
+  const out: SessionFacts = { source: row.source, sessionId: row.sessionId, eventsRead: 0, censored: false, error: null, events: [], outOfWindow: 0 };
   let cursor: string | null = null;
   for (let page = 0; ; page++) {
     if (page >= MAX_EVENT_PAGES) { out.censored = true; break; }
@@ -104,13 +122,18 @@ export async function harvestSession(client: CloudClient, row: DirectoryRow): Pr
       if (e instanceof HttpError) { out.error = `http_${e.status}`; break; }
       throw e;
     }
+    let past = false;
     for (const raw of body.events ?? []) {
       out.eventsRead++;
+      // The window is enforced before an event is reduced: nothing outside it is derived or kept.
+      const w = inWindow(raw.ts, window);
+      if (w !== 0) { out.outOfWindow!++; if (w > 0) past = true; continue; }
       const f = eventFacts(raw);
       if (informative(f)) out.events.push(f);
     }
     cursor = body.nextCursor ?? null;
-    if (!cursor || !(body.events ?? []).length) break;
+    // Events come oldest first, so once one is past the window the rest are too.
+    if (!cursor || !(body.events ?? []).length || past) break;
   }
   return out;
 }
@@ -143,6 +166,8 @@ const projectNameOf = (r: DirectoryRow) => { const p = r.project as { name?: unk
 export async function runHarvest(client: CloudClient, opts: HarvestOptions) {
   const log = opts.log ?? (() => {});
   const dirFile = join(opts.out, "directory.jsonl"), factsFile = join(opts.out, "facts.jsonl"), frameFile = join(opts.out, "frame.json");
+  // The Reader's list tool reads the credential's own workspace, so the credential is attested first.
+  if (opts.via === "reader-mcp") await client.attestWorkspace();
   let frame: { rows: DirectoryRow[]; gaps: Gap[]; pages: number };
   if (existsSync(frameFile)) frame = JSON.parse(readFileSync(frameFile, "utf8"));
   else {
@@ -167,7 +192,7 @@ export async function runHarvest(client: CloudClient, opts: HarvestOptions) {
   const worker = async () => {
     for (let row = queue.shift(); row && !capped; row = queue.shift()) {
       try {
-        const s = opts.via === "reader-mcp" ? await harvestMcpSession(client, row) : await harvestSession(client, row);
+        const s = opts.via === "reader-mcp" ? await harvestMcpSession(client, row, opts.window) : await harvestSession(client, row, opts.window);
         appendFileSync(factsFile, JSON.stringify(s) + "\n", { mode: 0o600 });
         if (++read % 50 === 0) log(`sessions read ${read}, requests ${client.requests.total}`);
       } catch (e) {
@@ -181,8 +206,8 @@ export async function runHarvest(client: CloudClient, opts: HarvestOptions) {
 }
 
 function writeCoverage(opts: HarvestOptions, frame: { rows: DirectoryRow[]; gaps: Gap[]; pages: number }, factsFile: string, client: CloudClient, capped: boolean) {
-  const bySource: Record<string, { sessions: number; read: number; events: number; informative: number; withFiles: number; censored: number; errors: number; noTranscript: number; truncated: number }> = {};
-  for (const r of frame.rows) { bySource[r.source] ??= { sessions: 0, read: 0, events: 0, informative: 0, withFiles: 0, censored: 0, errors: 0, noTranscript: 0, truncated: 0 }; bySource[r.source]!.sessions++; }
+  const bySource: Record<string, { sessions: number; read: number; events: number; informative: number; withFiles: number; censored: number; errors: number; noTranscript: number; truncated: number; outOfWindow: number }> = {};
+  for (const r of frame.rows) { bySource[r.source] ??= { sessions: 0, read: 0, events: 0, informative: 0, withFiles: 0, censored: 0, errors: 0, noTranscript: 0, truncated: 0, outOfWindow: 0 }; bySource[r.source]!.sessions++; }
   if (existsSync(factsFile)) for (const line of readFileSync(factsFile, "utf8").split("\n")) {
     if (!line.trim()) continue;
     const s = JSON.parse(line) as SessionFacts & { truncated?: number }, b = bySource[s.source];
@@ -194,6 +219,7 @@ function writeCoverage(opts: HarvestOptions, frame: { rows: DirectoryRow[]; gaps
     if (s.error === "no_transcript") b.noTranscript++;
     else if (s.error) b.errors++;
     b.truncated += s.truncated ?? 0;
+    b.outOfWindow += s.outOfWindow ?? 0;
   }
   const coding = Object.entries(bySource).filter(([k]) => CODING_SOURCES.has(k));
   const complete = !capped && frame.gaps.length === 0 && coding.every(([, b]) => b.read === b.sessions && b.censored === 0 && b.errors === 0);
