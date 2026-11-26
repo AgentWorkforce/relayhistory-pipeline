@@ -87,13 +87,13 @@ describe("stage 2", () => {
     const { tmpdir } = await import("node:os");
     const { join } = await import("node:path");
     const sha = (t: string) => createHash("sha256").update(t).digest("hex");
-    const make = () => {
+    const make = (deleteBy?: string) => {
       const d = mkdtempSync(join(tmpdir(), "batch-")), P = { mode: 0o600 };
       mkdirSync(join(d, "judge"), { mode: 0o700 }); mkdirSync(join(d, "key"), { mode: 0o700 });
       const keyText = JSON.stringify(key), part = "{}\n", prompt = "p";
       writeFileSync(join(d, "key", "key.json"), keyText, P); writeFileSync(join(d, "judge", "part-00"), part, P); writeFileSync(join(d, "judge", "prompt-00.txt"), prompt, P);
       writeFileSync(join(d, "judge", "verdicts-00.json"), JSON.stringify(ok), P);
-      const body = { format: "overlap-bench-stage2/2", split: "dev", cutoff: 0.3, promptHash: "x", seed: "s", judge: "j", labelsHash: "l", items: key.length, keyHash: sha(keyText), parts: { "part-00": sha(part) }, prompts: { "prompt-00.txt": sha(prompt) } };
+      const body = { format: "overlap-bench-stage2/3", split: "dev", terms: {}, cutoff: 0.3, promptHash: "x", seed: "s", judge: "j", labelsHash: "l", deleteBy: deleteBy ?? "2099-01-01T00:00:00.000Z", items: key.length, keyHash: sha(keyText), parts: { "part-00": sha(part) }, prompts: { "prompt-00.txt": sha(prompt) } };
       writeFileSync(join(d, "key", "stage2.json"), JSON.stringify({ ...body, manifestHash: sha(JSON.stringify(body)) }), P);
       return d;
     };
@@ -105,25 +105,74 @@ describe("stage 2", () => {
     expect(() => verifiedBatch(m)).toThrow("manifest was changed");
     const pt = make(); writeFileSync(join(pt, "judge", "part-00"), "{\"x\":1}\n", { mode: 0o600 });
     expect(() => verifiedBatch(pt)).toThrow("part-00 was changed");
+    // Past its delete-by, a batch is refused before any part or verdict is opened.
+    expect(() => verifiedBatch(make("2026-01-01T00:00:00.000Z"))).toThrow("past (or has no valid) delete-by");
+    expect(() => verifiedBatch(make("not a time"))).toThrow("delete-by");
   });
 });
 
 describe("once-only held-out", () => {
-  test("one evaluation per labels digest, whatever the paths; an interrupted claim resumes only under the same terms", async () => {
-    const { claimOnce, finishOnce, noteOnce } = await import("../overlap-bench/once.ts");
+  const setup = async () => {
     const { mkdtempSync } = await import("node:fs");
     const { tmpdir } = await import("node:os");
     const { join } = await import("node:path");
-    const reg = join(mkdtempSync(join(tmpdir(), "reg-")), "heldout"), L = "a".repeat(64);
-    const rec = claimOnce("stage2", L, { freezeHash: "f", promptHash: "p" }, reg);
-    // Interrupted before the batch was made: the same terms resume, other terms are refused.
-    expect(claimOnce("stage2", L, { freezeHash: "f", promptHash: "p" }, reg).state).toBe("claimed");
-    expect(() => claimOnce("stage2", L, { freezeHash: "g", promptHash: "p" }, reg)).toThrow("under other terms");
+    return { reg: join(mkdtempSync(join(tmpdir(), "reg-")), "heldout"), L: "a".repeat(64) };
+  };
+  const DEAD = 999_999_99;
+  test("one evaluation per labels digest; an interrupted claim resumes only under the same terms", async () => {
+    const { claimOnce, finishOnce, noteOnce } = await import("../overlap-bench/once.ts");
+    const { reg, L } = await setup();
+    claimOnce("stage2", L, { f: 1 }, reg, DEAD);
+    // The owner died: the same terms resume (ownership moves here), other terms are refused.
+    const rec = claimOnce("stage2", L, { f: 1 }, reg);
+    expect(rec.owner).toBe(process.pid);
+    expect(() => claimOnce("stage2", L, { f: 2 }, reg)).toThrow("under other terms");
     noteOnce(rec, "m1", reg);
     expect(() => noteOnce(rec, "m2", reg)).toThrow("already has a batch");
     finishOnce(rec, { ok: true }, reg);
-    expect(() => claimOnce("stage2", L, { freezeHash: "f", promptHash: "p" }, reg)).toThrow("already evaluated");
+    expect(() => claimOnce("stage2", L, { f: 1 }, reg)).toThrow("already evaluated");
     expect(() => finishOnce(rec, {}, reg)).toThrow("already evaluated");
     expect(() => claimOnce("stage1", "not-a-digest", {}, reg)).toThrow("sha256");
+  });
+  test("an active claim by a live process is never shared, and only its owner can change it", async () => {
+    const { claimOnce, finishOnce } = await import("../overlap-bench/once.ts");
+    const { reg, L } = await setup();
+    const live = process.ppid; // a process that is certainly alive
+    const theirs = claimOnce("stage1", L, { f: 1 }, reg, live);
+    expect(() => claimOnce("stage1", L, { f: 1 }, reg)).toThrow(`being evaluated by process ${live}`);
+    expect(() => finishOnce(theirs, {}, reg)).toThrow(`held by process ${live}`);
+  });
+  test("a transition while another process holds the record lock is refused", async () => {
+    const { claimOnce } = await import("../overlap-bench/once.ts");
+    const { writeFileSync } = await import("node:fs");
+    const { join } = await import("node:path");
+    const { reg, L } = await setup();
+    claimOnce("stage1", L, { f: 1 }, reg, DEAD);
+    writeFileSync(join(reg, `stage1-${L}.json.lock`), "1", { mode: 0o600 });
+    expect(() => claimOnce("stage1", L, { f: 1 }, reg)).toThrow("busy in another process");
+  });
+  test("two processes racing for one claim: exactly one wins", async () => {
+    const { join } = await import("node:path");
+    const { reg, L } = await setup();
+    const script = join(import.meta.dir, "..", "overlap-bench", "once.ts");
+    const child = (n: number) => Bun.spawn([process.execPath, "-e", `const { claimOnce } = await import(${JSON.stringify(script)}); try { claimOnce("stage1", "${L}", { f: 1 }, ${JSON.stringify(reg)}); await Bun.sleep(300); console.log("won"); } catch (e) { console.log("lost"); }`], { stdout: "pipe" });
+    const procs = [child(1), child(2), child(3)];
+    const out = await Promise.all(procs.map(async (p) => (await new Response(p.stdout).text()).trim()));
+    expect(out.filter((x) => x === "won")).toHaveLength(1);
+  });
+  test("labels identity ignores the file name: a renamed copy is the same held-out set", async () => {
+    const { labelsIdentity } = await import("../overlap-bench/cli.ts");
+    const { claimOnce, finishOnce } = await import("../overlap-bench/once.ts");
+    const { mkdtempSync, writeFileSync } = await import("node:fs");
+    const { tmpdir } = await import("node:os");
+    const { join } = await import("node:path");
+    const d = mkdtempSync(join(tmpdir(), "lab-"));
+    writeFileSync(join(d, "labels.json"), '{"incidents":[]}', { mode: 0o600 });
+    writeFileSync(join(d, "copy-with-another-name.json"), '{"incidents":[]}', { mode: 0o600 });
+    const a = labelsIdentity(join(d, "labels.json")), b = labelsIdentity(join(d, "copy-with-another-name.json"));
+    expect(a).toBe(b);
+    const { reg } = await setup();
+    finishOnce(claimOnce("stage1", a, { f: 1 }, reg), {}, reg);
+    expect(() => claimOnce("stage1", b, { f: 1 }, reg)).toThrow("already evaluated");
   });
 });

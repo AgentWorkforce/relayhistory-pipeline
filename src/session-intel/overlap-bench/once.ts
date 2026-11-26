@@ -1,14 +1,15 @@
 /**
  * Once-only held-out evaluations (docs/session-intel-overlap-bench.md, "Protocol"). Each evaluation has a canonical
- * identity: its kind and the digest of the labels' content, so neither copying the labels, the freeze or the
- * inputs, nor a new output directory, opens a second evaluation. Its record lives in one per-user registry that no
- * command-line path chooses.
+ * identity: its kind and the digest of the labels' bytes, so neither copying or renaming the labels, the freeze or
+ * the inputs, nor a new output directory, opens a second evaluation. Its record lives in one per-user registry that
+ * no command-line path chooses.
  *
- * A claim is recoverable: it records exactly what it was claimed for (the freeze identity and the run's terms). An
- * interrupted run may finish under the same terms, since the evaluation is deterministic; any other run is refused.
- * Once a result is recorded, nothing can run again.
+ * Every transition (claim, pinning a batch, finishing) runs under an exclusive lock on the record, across
+ * processes. A claim names its owner process. An active claim (its owner alive) is never shared; a claim whose owner
+ * died is interrupted and may be resumed under identical terms, since the evaluation is deterministic. Callers write
+ * their output receipt before finishing, so an exit between the two only repeats the same deterministic run.
  */
-import { existsSync, openSync, closeSync, writeFileSync } from "node:fs";
+import { closeSync, existsSync, openSync, unlinkSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { privateDir, readPrivate, writePrivate } from "../cloud-harvest/private-fs.ts";
@@ -17,6 +18,8 @@ export const REGISTRY = join(homedir(), ".local", "state", "overlap-bench", "hel
 
 export interface OnceRecord {
   kind: "stage1" | "stage2"; labelsHash: string; terms: Record<string, unknown>; state: "claimed" | "done"; claimedAt: string;
+  /** The process that holds the claim. */
+  owner: number;
   /** Stage 2: the manifest hash of the batch made under the claim; once set, no other batch can be scored. */
   batch?: string;
   result?: unknown;
@@ -27,45 +30,72 @@ const recordPath = (registry: string, kind: OnceRecord["kind"], labelsHash: stri
   return join(privateDir(registry), `${kind}-${labelsHash}.json`);
 };
 
-/**
- * Claims the evaluation, or resumes a claim made under identical terms that never finished. Throws if the evaluation
- * is done, or claimed under other terms.
- */
-export function claimOnce(kind: OnceRecord["kind"], labelsHash: string, terms: Record<string, unknown>, registry = REGISTRY): OnceRecord {
-  const path = recordPath(registry, kind, labelsHash);
-  const rec: OnceRecord = { kind, labelsHash, terms, state: "claimed", claimedAt: new Date().toISOString() };
-  try {
-    const fd = openSync(path, "wx", 0o600);
-    writeFileSync(fd, JSON.stringify(rec, null, 1)); closeSync(fd);
-    return rec;
-  } catch (e) {
-    if ((e as NodeJS.ErrnoException).code !== "EEXIST") throw e;
+const alive = (pid: number) => {
+  if (!Number.isSafeInteger(pid) || pid <= 0) return false;
+  try { process.kill(pid, 0); return true; } catch (e) { return (e as NodeJS.ErrnoException).code === "EPERM"; }
+};
+
+/** Runs `fn` holding the record's lock (exclusive create); a concurrent transition is refused, not waited for. */
+function locked<T>(path: string, fn: () => T): T {
+  const lock = `${path}.lock`;
+  let fd: number;
+  try { fd = openSync(lock, "wx", 0o600); } catch (e) {
+    if ((e as NodeJS.ErrnoException).code === "EEXIST") throw new Error(`the held-out record is busy in another process; if none is running, check and remove ${lock}`);
+    throw e;
   }
-  const prev = JSON.parse(readPrivate(path)) as OnceRecord;
-  if (prev.state === "done") throw new Error(`held-out ${kind} was already evaluated for these labels`);
-  if (JSON.stringify(prev.terms) !== JSON.stringify(terms)) throw new Error(`held-out ${kind} is claimed for these labels under other terms`);
-  return prev;
+  try { writeFileSync(fd, String(process.pid)); closeSync(fd); return fn(); } finally { unlinkSync(lock); }
 }
 
-/** Records the batch made under a stage-2 claim. */
-export function noteOnce(rec: OnceRecord, batch: string, registry = REGISTRY): OnceRecord {
-  const path = recordPath(registry, rec.kind, rec.labelsHash);
-  const cur = JSON.parse(readPrivate(path)) as OnceRecord;
-  if (cur.state === "done" || (cur.batch && cur.batch !== batch)) throw new Error(`held-out ${rec.kind} already has a batch for these labels`);
-  const next = { ...cur, batch };
-  writePrivate(path, JSON.stringify(next, null, 1));
-  return next;
+const read = (path: string) => JSON.parse(readPrivate(path)) as OnceRecord;
+
+/**
+ * Claims the evaluation for this process, or resumes an interrupted claim (its owner gone) made under identical
+ * terms. Throws if the evaluation is done, claimed under other terms, or held by a live process.
+ */
+export function claimOnce(kind: OnceRecord["kind"], labelsHash: string, terms: Record<string, unknown>, registry = REGISTRY, pid = process.pid): OnceRecord {
+  const path = recordPath(registry, kind, labelsHash);
+  return locked(path, () => {
+    if (!existsSync(path)) {
+      const rec: OnceRecord = { kind, labelsHash, terms, state: "claimed", claimedAt: new Date().toISOString(), owner: pid };
+      writePrivate(path, JSON.stringify(rec, null, 1));
+      return rec;
+    }
+    const prev = read(path);
+    if (prev.state === "done") throw new Error(`held-out ${kind} was already evaluated for these labels`);
+    if (JSON.stringify(prev.terms) !== JSON.stringify(terms)) throw new Error(`held-out ${kind} is claimed for these labels under other terms`);
+    if (prev.owner !== pid && alive(prev.owner)) throw new Error(`held-out ${kind} is being evaluated by process ${prev.owner}`);
+    const next = { ...prev, owner: pid };
+    writePrivate(path, JSON.stringify(next, null, 1));
+    return next;
+  });
 }
 
-/** Records the result; the evaluation can never run again. */
-export function finishOnce(rec: OnceRecord, result: unknown, registry = REGISTRY): void {
+function transition(rec: OnceRecord, registry: string, pid: number, change: (cur: OnceRecord) => OnceRecord): OnceRecord {
   const path = recordPath(registry, rec.kind, rec.labelsHash);
-  const cur = JSON.parse(readPrivate(path)) as OnceRecord;
-  if (cur.state === "done") throw new Error(`held-out ${rec.kind} was already evaluated for these labels`);
-  writePrivate(path, JSON.stringify({ ...cur, state: "done", result }, null, 1));
+  return locked(path, () => {
+    const cur = read(path);
+    if (cur.state === "done") throw new Error(`held-out ${rec.kind} was already evaluated for these labels`);
+    if (cur.owner !== pid) throw new Error(`held-out ${rec.kind} is now held by process ${cur.owner}`);
+    const next = change(cur);
+    writePrivate(path, JSON.stringify(next, null, 1));
+    return next;
+  });
+}
+
+/** Pins the batch made under a stage-2 claim; a claim can pin one batch only. */
+export function noteOnce(rec: OnceRecord, batch: string, registry = REGISTRY, pid = process.pid): OnceRecord {
+  return transition(rec, registry, pid, (cur) => {
+    if (cur.batch && cur.batch !== batch) throw new Error(`held-out ${rec.kind} already has a batch for these labels`);
+    return { ...cur, batch };
+  });
+}
+
+/** Records the result; the evaluation can never run again. Write the output receipt before calling this. */
+export function finishOnce(rec: OnceRecord, result: unknown, registry = REGISTRY, pid = process.pid): void {
+  transition(rec, registry, pid, (cur) => ({ ...cur, state: "done", result }));
 }
 
 export function onceState(kind: OnceRecord["kind"], labelsHash: string, registry = REGISTRY): OnceRecord | null {
   const path = recordPath(registry, kind, labelsHash);
-  return existsSync(path) ? JSON.parse(readPrivate(path)) as OnceRecord : null;
+  return existsSync(path) ? read(path) : null;
 }

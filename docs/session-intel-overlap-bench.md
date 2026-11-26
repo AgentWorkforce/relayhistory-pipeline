@@ -113,7 +113,13 @@ The judge's input is therefore more than PR text. It includes session-derived fa
    - the manifest records every part, prompt and the key by hash, and itself by hash.
 
    `stage2-score` verifies all of that, and requires exactly one valid verdict per pair: a known verdict, and a probability in [0, 1]. A partial, duplicated, foreign or out-of-range answer gets no score.
-6. Held-out is evaluated once per labels digest, in a per-user registry (`once.ts`) that no command-line path chooses. Copying labels, freezes or inputs, or choosing a new output directory, opens no second evaluation. A claim records its terms, so an interrupted run may finish under identical terms, and any other run is refused. A stage-2 claim also records the batch made under it, and only that batch can be scored.
+6. Held-out is evaluated once per labels identity, the sha256 of the labels' bytes (not their name or path), in a per-user registry (`once.ts`) that no command-line path chooses. Copying, renaming or moving labels, freezes or inputs, or choosing a new output directory, opens no second evaluation.
+   - Every transition (claim, pin a batch, finish) holds an exclusive lock on the record, across processes.
+   - A claim names its owner process. An active claim is never shared. A claim whose owner died is interrupted, and may be resumed under identical terms.
+   - A stage-2 claim pins the batch made under it, and only that batch can be scored.
+   - Receipts are written before the record is finished, so an exit in between only repeats the same deterministic run.
+   - The labels v2 held-out was spent before this identity existed, and is recorded as done under both its earlier and its byte identity.
+7. A stage-2 batch carries the earliest delete-by of the data it was drawn from. `stage2-score` first checks that the batch directory is a private destination outside the repository and that the batch is within its delete-by, and only then opens any part, prompt or verdict.
 
 ## Findings so far (dev split)
 

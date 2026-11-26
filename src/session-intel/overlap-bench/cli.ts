@@ -164,6 +164,14 @@ function digestFiles(files: string[]): string {
   }
   return h.digest("hex");
 }
+/**
+ * The labels' identity: the sha256 of their bytes alone, so a renamed or moved copy of the same labels is the same
+ * held-out set (the once-only registry is keyed by it).
+ */
+export function labelsIdentity(labels: string): string {
+  assertPrivateInput(labels, "file");
+  return createHash("sha256").update(readFileSync(labels)).digest("hex");
+}
 /** Everything a frozen score depends on besides the points themselves: inputs, sources, labels, budget, split. */
 export interface FreezeTerms { sourceHash: string; labelsHash: string; inputsHash: string; perHundred: number; split: "heldout"; observed: "all" }
 type Frozen = FreezeTerms & { format?: string; freezeHash?: string; frozen: Array<{ detector: string; params: Record<string, unknown>; hash: string }> };
@@ -189,7 +197,7 @@ export function freezeTerms(harvest: string, forge: string, labels: string, perH
     ...readdirSync(join(forge, "prs")).filter((n) => n.endsWith(".json")).sort().map((n) => join(forge, "prs", n)),
     ...(existsSync(join(forge, "history")) ? readdirSync(join(forge, "history")).filter((n) => n.endsWith(".json")).sort().map((n) => join(forge, "history", n)) : []),
   ];
-  return { sourceHash: sourceHash(), labelsHash: digestFiles([labels]), inputsHash: digestFiles(inputs), perHundred, split: "heldout", observed: "all" };
+  return { sourceHash: sourceHash(), labelsHash: labelsIdentity(labels), inputsHash: digestFiles(inputs), perHundred, split: "heldout", observed: "all" };
 }
 const pointHash = (g: { detector: string; params: unknown }) => createHash("sha256").update(JSON.stringify([g.detector, g.params, sourceHash()])).digest("hex").slice(0, 16);
 
@@ -205,17 +213,21 @@ async function main(argv: string[]) {
     split: { type: "string" }, prompt: { type: "string" }, cutoff: { type: "string" }, fresh: { type: "string" }, exclude: { type: "string" }, judge: { type: "string" },
   } });
   if (cmd === "stage2-score") {
-    // Scores a batch at its frozen cutoff, only after verifying the batch is the one that was made (every part,
-    // prompt and the key by hash, the manifest by its own hash) and that the verdicts cover it exactly.
+    // Scores a batch at its frozen cutoff. The batch directory must be a private destination outside the repo and
+    // the batch within its retention deadline before any derived input is opened; then the batch is verified (every
+    // part, prompt and the key by hash, the manifest by its own hash) and the verdicts must cover it exactly.
     if (!values.out) throw new Error("stage2-score needs --out (the batch directory)");
+    assertOutsideRepo(values.out);
     const { manifest, key, verdicts } = verifiedBatch(values.out);
     const result = { ...scoreStage2(key, verdicts, manifest.cutoff), split: manifest.split, promptHash: manifest.promptHash, judge: manifest.judge, manifestHash: manifest.manifestHash };
+    const receipt = join(values.out, "key", "score.json");
     if (manifest.split === "heldout") {
-      const rec = onceState("stage2", manifest.labelsHash);
-      if (!rec || rec.state !== "claimed" || rec.batch !== manifest.manifestHash) throw new Error("this held-out batch is not the one claimed for these labels, or it was already scored");
+      // Ownership is taken over from the batch's (finished) process under the batch's exact terms.
+      const rec = claimOnce("stage2", manifest.labelsHash, manifest.terms);
+      if (rec.batch !== manifest.manifestHash) throw new Error("this held-out batch is not the one claimed for these labels");
+      writePrivate(receipt, JSON.stringify(result, null, 1));
       finishOnce(rec, result);
-    }
-    writePrivate(join(values.out, "key", "score.json"), JSON.stringify(result, null, 1));
+    } else writePrivate(receipt, JSON.stringify(result, null, 1));
     console.log(JSON.stringify(result));
     return;
   }
@@ -254,8 +266,9 @@ async function main(argv: string[]) {
       if (pointHash(g) !== f.hash) throw new Error(`frozen point ${f.hash} does not hash to its parameters and sources`);
       return { hash: f.hash, ...score(g.detector, ctx, g.run(ctx), labels.incidents.filter((i) => i.split === frozen.split), labels.negatives, { sessions: ctx.codingSessions, perHundred: frozen.perHundred }) };
     });
-    finishOnce(rec, { freezeHash: frozen.freezeHash, results });
+    // The receipt first: an exit before finishing leaves an interrupted claim that reruns to the same result.
     writePrivate(join(values.out, "heldout.json"), JSON.stringify({ freezeHash: frozen.freezeHash, results }, null, 1));
+    finishOnce(rec, { freezeHash: frozen.freezeHash, results });
     for (const r of results) console.log(JSON.stringify({ detector: r.detector, hits: r.hits.length, linkable: r.linkable, recall: r.recall, negativeHits: r.negativeHits, medianLeadH: r.medianLeadH }));
   } else if (cmd === "eval" || cmd === "sample") {
     // Both read the frozen points and the dev split only; held-out stays behind `heldout`.
@@ -328,7 +341,9 @@ async function main(argv: string[]) {
     }
     const keyText = JSON.stringify(items.map((x) => ({ pair: pairId(x.sides), truth: x.truth })), null, 1);
     writePrivate(join(keyDir, "key.json"), keyText);
-    const body = { format: "overlap-bench-stage2/2", split, ...terms, labelsHash: frozen.labelsHash, ranker: ranker.hash, perHundred: frozen.perHundred, items: items.length, keyHash: sha(keyText), parts, prompts };
+    // The batch inherits the earliest delete-by of the data it was drawn from; scoring refuses it after that.
+    const deleteBy = ctx.scopes.map((x) => x.deleteBy).sort()[0]!;
+    const body = { format: "overlap-bench-stage2/3", split, terms, ...terms, labelsHash: frozen.labelsHash, ranker: ranker.hash, perHundred: frozen.perHundred, deleteBy, items: items.length, keyHash: sha(keyText), parts, prompts };
     const manifest = { ...body, manifestHash: sha(JSON.stringify(body)) };
     writePrivate(join(keyDir, "stage2.json"), JSON.stringify(manifest, null, 1));
     if (rec) noteOnce(rec, manifest.manifestHash);

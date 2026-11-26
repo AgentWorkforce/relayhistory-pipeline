@@ -342,19 +342,56 @@ describe("read scope limits", () => {
     await expect(harvestMcpFrame(mcp(() => ({ sessions: [] })), w)).rejects.toThrow("different workspace");
     await expect(harvestMcpSession(mcp(() => ({ workspace_id: "x", events: [] })), { sessionId: "s", source: "codex", lastTs: "" }, w)).rejects.toThrow("different workspace");
   });
-  test("directory rows count as received, cumulatively, and the page that passes the ceiling is not projected", async () => {
+  test("rows are reserved before each list request: the page size is the allowance left, and an oversized page is refused", async () => {
     const { harvestMcpFrame } = await import("../cloud-harvest/mcp-source.ts");
     const { RowCeiling } = await import("../cloud-harvest/harvest.ts");
-    const rows = Array.from({ length: 3 }, (_, i) => ({ session_id: `s${i}`, source: "codex", owner: [], last_active: "2026-11-20T00:00:00Z" }));
-    // Duplicates and rows filtered out (before the window) still count: they were received.
-    const client = mcp(() => ({ workspace_id: WS, sessions: [...rows, rows[0], { session_id: "old", source: "codex", owner: [], last_active: "2026-01-01T00:00:00Z" }], next_cursor: null }));
-    let received = 0;
-    const budget = (max: number) => (n: number) => { received += n; if (received > max) throw new RowCeiling("ceiling"); };
-    await expect(harvestMcpFrame(client, { since: "2026-11-01T00:00:00Z", until: "2026-12-01T00:00:00Z" }, () => {}, budget(4))).rejects.toThrow("ceiling");
-    expect(received).toBe(5);
-    received = 0;
-    expect((await harvestMcpFrame(client, { since: "2026-11-01T00:00:00Z", until: "2026-12-01T00:00:00Z" }, () => {}, budget(5))).rows).toHaveLength(3);
+    const limits: number[] = [];
+    // Two rows per page, as many pages as asked for, each honouring the requested limit.
+    const pages = (honour: boolean) => mcp((_n, a) => {
+      limits.push(a.limit as number);
+      const n = honour ? Math.min(2, a.limit as number) : 2;
+      return { workspace_id: WS, sessions: Array.from({ length: n }, (_, i) => ({ session_id: `s${limits.length}-${i}`, source: "codex", owner: [], last_active: "2026-11-20T00:00:00Z" })), next_cursor: limits.length < 4 ? `c${limits.length}` : null };
+    });
+    let spent = 0;
+    const budget = (max: number) => ({
+      reserve: (want: number) => { const g = Math.min(want, max - spent); if (g <= 0) throw new RowCeiling("ceiling"); spent += g; return g; },
+      settle: (g: number, got: number) => { if (got > g) throw new RowCeiling("oversized"); spent -= g - got; },
+    });
+    const w = { since: "2026-11-01T00:00:00Z", until: "2026-12-01T00:00:00Z" };
+    // Cap 3: asks for the 3 left, gets 2; then asks for the 1 left, gets 1; then nothing is left and no request is sent.
+    await expect(harvestMcpFrame(pages(true), w, () => {}, budget(3))).rejects.toThrow("ceiling");
+    expect(limits).toEqual([3, 1]);
+    expect(spent).toBe(3);
+    // A source that ignores the requested size is refused before its page is projected.
+    limits.length = 0; spent = 0;
+    await expect(harvestMcpFrame(pages(false), w, () => {}, budget(1))).rejects.toThrow("oversized");
+    expect(limits).toEqual([1]);
   });
+  test("a reader whose list pages cannot be bounded is refused under a row ceiling", async () => {
+    const { runHarvest } = await import("../cloud-harvest/harvest.ts");
+    const { mkdtempSync } = await import("node:fs");
+    const { tmpdir } = await import("node:os");
+    const { join } = await import("node:path");
+    const c = mcp(() => ({ workspace_id: WS }));
+    await expect(runHarvest(c, { out: mkdtempSync(join(tmpdir(), "h-")), window: { since: "2026-11-01T00:00:00Z", until: "2026-12-01T00:00:00Z" }, concurrency: 1, via: "cloud", rowBudget: { reserve: () => 1, settle: () => {} } })).rejects.toThrow("cannot bound its list pages");
+  });
+  test("the row ledger resumes at the last remaining row and is spent before the request", async () => {
+    const { openLedger } = await import("../cloud-harvest/cli.ts");
+    const { mkdtempSync, readFileSync } = await import("node:fs");
+    const { tmpdir } = await import("node:os");
+    const { join } = await import("node:path");
+    const file = join(mkdtempSync(join(tmpdir(), "rows-")), "manifest.json");
+    const a = openLedger(file, {}, { maxRows: "5" });
+    expect(a.rows.reserve(4)).toBe(4);
+    expect(JSON.parse(readFileSync(file, "utf8")).rowsReceived).toBe(4); // spent before any request is sent
+    a.rows.settle(4, 4);
+    const b = openLedger(file, {}, {});
+    expect(b.rows.reserve(50)).toBe(1);
+    b.rows.settle(1, 1);
+    expect(() => b.rows.reserve(50)).toThrow("ceiling of 5");
+    expect(() => openLedger(file, {}, {}).rows.settle(0, 1)).toThrow("for a grant of 0");
+  });
+
 
 });
 

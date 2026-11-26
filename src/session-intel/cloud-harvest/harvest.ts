@@ -58,8 +58,8 @@ export function readFactsStrict(file: string): SessionFacts[] {
  * received and then dropped before derivation. A bulk reader must filter by event time on the server.
  */
 export const READERS = {
-  cloud: { serverSideEventWindow: false, workspaceInPath: true },
-  "reader-mcp": { serverSideEventWindow: false, workspaceInPath: false },
+  cloud: { serverSideEventWindow: false, workspaceInPath: true, boundedListPages: false },
+  "reader-mcp": { serverSideEventWindow: false, workspaceInPath: false, boundedListPages: true },
 } as const;
 
 /** -1 before the window, 0 inside it, 1 after it. An unparseable time is treated as outside (before). */
@@ -83,19 +83,17 @@ const failed = (p: ListPage) => p.error === true && (p.items ?? []).length === 0
  * a page succeeds, then binary-search down to `resolutionMs`. Rows between that cursor and `t` are unreachable
  * through the list and are returned as the gap.
  */
-export async function stepPastBadRow(client: CloudClient, t: string, floor: string, resolutionMs = 250, takeRows: TakeRows = noTake) {
+export async function stepPastBadRow(client: CloudClient, t: string, floor: string, resolutionMs = 250) {
   let bad = 0, good = 1_000, page: ListPage | null = null;
   for (;;) {
     if (minus(t, good) <= floor) return { gapFrom: floor, page: null, probes: 0 };
     const p = await client.get("list", `/sessions?cursor=${encodeURIComponent(cursorAt(minus(t, good)))}`) as ListPage;
-    takeRows(p.items?.length ?? 0);
     if (!failed(p)) { page = p; break; }
     bad = good; good *= 4;
   }
   while (good - bad > resolutionMs) {
     const mid = Math.floor((bad + good) / 2);
     const p = await client.get("list", `/sessions?cursor=${encodeURIComponent(cursorAt(minus(t, mid)))}`) as ListPage;
-    takeRows(p.items?.length ?? 0);
     if (failed(p)) bad = mid; else { good = mid; page = p; }
   }
   return { gapFrom: minus(t, good), page };
@@ -106,31 +104,34 @@ export async function stepPastBadRow(client: CloudClient, t: string, floor: stri
  * skipped span is recorded as a gap, never silently dropped.
  */
 /** Thrown when a directory listing would exceed the approved row ceiling: nothing beyond it is read. */
-/**
- * Thrown when the directory rows received would pass the approved ceiling. Rows are counted as received, every
- * page (probes, filtered and duplicate rows included), cumulatively across slices and resumes; the page that
- * crosses the ceiling is not projected. The overshoot is that one page, received and dropped.
- */
+/** Thrown when the directory row ceiling is reached, or a page brings more rows than it was granted. */
 export class RowCeiling extends Error {}
-export type TakeRows = (n: number) => void;
-const noTake: TakeRows = () => {};
+/**
+ * The directory row allowance, reserved before each list request. `reserve(max)` grants at most `max` rows from what
+ * is left (throwing RowCeiling when nothing is) and counts them as spent at once; `settle` returns the unused part
+ * and refuses a page that brought more than its grant. A request is therefore never sent for rows beyond the
+ * ceiling, and an interruption between the two can only over-count.
+ */
+export interface RowBudget { reserve(max: number): number; settle(granted: number, received: number): void }
 
-export async function harvestFrame(client: CloudClient, window: { since: string; until: string }, log: (m: string) => void = () => {}, takeRows: TakeRows = noTake) {
+
+/**
+ * The Cloud directory. Its list route takes no page size, so a row ceiling cannot be enforced before a request; a
+ * harvest under a row ceiling refuses this reader (READERS.cloud.boundedListPages).
+ */
+export async function harvestFrame(client: CloudClient, window: { since: string; until: string }, log: (m: string) => void = () => {}) {
   const rows = new Map<string, DirectoryRow>();
   const gaps: Gap[] = [];
   let cursor: string | null = cursorAt(window.until);
   let pages = 0, lastTs = window.until;
   let pending: ListPage | null = null;
   while (cursor || pending) {
-    const fresh = !pending;
     const page: ListPage = pending ?? await client.get("list", `/sessions?cursor=${encodeURIComponent(cursor!)}`) as ListPage;
-    // A page handed over by the bad-row probe was counted when the probe received it.
-    if (fresh) takeRows(page.items?.length ?? 0);
     pending = null;
     pages++;
     const items = page.items ?? [];
     if (failed(page)) {
-      const step = await stepPastBadRow(client, lastTs, window.since, 250, takeRows);
+      const step = await stepPastBadRow(client, lastTs, window.since);
       gaps.push({ from: step.gapFrom, to: lastTs, reason: "directory_page_error" });
       log(`directory error page below ${lastTs}; resumed at ${step.gapFrom}`);
       lastTs = step.gapFrom;
@@ -186,11 +187,11 @@ export async function harvestSession(client: CloudClient, row: DirectoryRow, win
 }
 
 /** Pages `slices` equal sub-windows concurrently and merges them; each slice records its own gaps. */
-export async function harvestFrameSliced(client: CloudClient, window: { since: string; until: string }, slices: number, log: (m: string) => void = () => {}, takeRows: TakeRows = noTake) {
+export async function harvestFrameSliced(client: CloudClient, window: { since: string; until: string }, slices: number, log: (m: string) => void = () => {}) {
   const a = Date.parse(window.since), b = Date.parse(window.until), w = (b - a) / slices;
   const parts = await Promise.all(Array.from({ length: slices }, (_, i) => harvestFrame(client, {
     since: new Date(a + i * w).toISOString(), until: new Date(i === slices - 1 ? b : a + (i + 1) * w).toISOString(),
-  }, (m) => log(`[slice ${i + 1}/${slices}] ${m}`), takeRows)));
+  }, (m) => log(`[slice ${i + 1}/${slices}] ${m}`))));
   const rows = new Map<string, DirectoryRow>();
   for (const p of parts) for (const r of p.rows) rows.set(`${r.source}\u0000${r.sessionId}`, r);
   return { rows: [...rows.values()], gaps: parts.flatMap((p) => p.gaps), pages: parts.reduce((n, p) => n + p.pages, 0) };
@@ -200,8 +201,8 @@ export interface HarvestOptions {
   out: string; window: { since: string; until: string }; concurrency: number; frameSlices?: number; log?: (m: string) => void;
   /** Sessions whose project name is one of these are read first (newest first within each group). */
   priorityProjects?: string[];
-  /** Counts directory rows as received against the approved ceiling (throws RowCeiling); see `RowCeiling`. */
-  takeRows?: TakeRows;
+  /** The approved directory row allowance (see RowBudget). Only a reader with bounded list pages can honour it. */
+  rowBudget?: RowBudget;
   /** Sessions whose project name is one of these are not read at all, and are counted as skipped. */
   skipProjects?: string[];
   /**
@@ -221,13 +222,13 @@ export async function runHarvest(client: CloudClient, opts: HarvestOptions) {
   // Every file the harvest resumes from or writes must be private (private-fs.ts); the caller holds the lock.
   for (const f of [dirFile, factsFile, frameFile, join(opts.out, "coverage.json")]) assertPrivateFile(f);
   recoverTornTail(factsFile);
-  const takeRows = opts.takeRows ?? noTake;
+  if (opts.rowBudget && !READERS[opts.via ?? "cloud"].boundedListPages) throw new RowCeiling(`--via ${opts.via ?? "cloud"} cannot bound its list pages, so the row ceiling cannot be enforced`);
   // A finished listing was counted when it was received; a resume does not list again.
   if (existsSync(frameFile)) frame = JSON.parse(readPrivate(frameFile));
   else {
     frame = opts.via === "reader-mcp"
-      ? await harvestMcpFrame(client, opts.window, log, takeRows)
-      : await harvestFrameSliced(client, opts.window, Math.max(1, opts.frameSlices ?? 1), log, takeRows);
+      ? await harvestMcpFrame(client, opts.window, log, opts.rowBudget)
+      : await harvestFrameSliced(client, opts.window, Math.max(1, opts.frameSlices ?? 1), log);
     writePrivate(dirFile, frame.rows.map((r) => JSON.stringify(r)).join("\n") + "\n");
     writePrivate(frameFile, JSON.stringify(frame));
   }

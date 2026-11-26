@@ -93,6 +93,10 @@ export function scoreStage2(key: Array<{ pair: string; truth: Truth }>, verdicts
 
 export interface BatchManifest {
   format: string; split: "dev" | "heldout"; cutoff: number; promptHash: string; seed: string; judge: string; labelsHash: string;
+  /** The exact terms the batch was made (and, on held-out, claimed) under. */
+  terms: Record<string, unknown>;
+  /** The earliest delete-by of the data the batch was drawn from. */
+  deleteBy: string;
   items: number; keyHash: string; parts: Record<string, string>; prompts: Record<string, string>; manifestHash: string;
 }
 
@@ -100,11 +104,14 @@ export interface BatchManifest {
  * A batch as it was made: the manifest by its own hash, every part, prompt and the key by theirs, the key's length
  * by the manifest's item count, and the verdicts (judge/verdicts-NN.json, one per part) validated against the key.
  */
-export function verifiedBatch(dir: string): { manifest: BatchManifest; key: Array<{ pair: string; truth: Truth }>; verdicts: Stage2Verdict[] } {
+export function verifiedBatch(dir: string, now = Date.now()): { manifest: BatchManifest; key: Array<{ pair: string; truth: Truth }>; verdicts: Stage2Verdict[] } {
   const sha = (t: string) => createHash("sha256").update(t).digest("hex");
   const manifest = JSON.parse(readPrivate(join(dir, "key", "stage2.json"))) as BatchManifest;
   const { manifestHash, ...body } = manifest;
-  if (manifest.format !== "overlap-bench-stage2/2" || manifestHash !== sha(JSON.stringify(body))) throw new Error("the batch manifest was changed after the batch was made");
+  if (manifest.format !== "overlap-bench-stage2/3" || manifestHash !== sha(JSON.stringify(body))) throw new Error("the batch manifest was changed after the batch was made");
+  // Retention before anything derived from the data is opened: an expired batch must be deleted, not scored.
+  const deadline = typeof manifest.deleteBy === "string" && /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,9})?Z$/.test(manifest.deleteBy) ? Date.parse(manifest.deleteBy) : NaN;
+  if (!(deadline > now)) throw new Error("the batch is past (or has no valid) delete-by; it must be deleted, not scored");
   const keyText = readPrivate(join(dir, "key", "key.json"));
   if (sha(keyText) !== manifest.keyHash) throw new Error("the batch key was changed after the batch was made");
   for (const [name, h] of [...Object.entries(manifest.parts), ...Object.entries(manifest.prompts)]) {

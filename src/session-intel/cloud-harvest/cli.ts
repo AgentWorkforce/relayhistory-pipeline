@@ -20,7 +20,7 @@ import { join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { parseArgs } from "node:util";
 import { CloudClient } from "./client.ts";
-import { READERS, RowCeiling, runHarvest } from "./harvest.ts";
+import { READERS, type RowBudget, RowCeiling, runHarvest } from "./harvest.ts";
 import { lockDir, outsideRoot, readPrivate, writePrivate } from "./private-fs.ts";
 
 const REPO_ROOT = realpathSync(resolve(fileURLToPath(new URL("../../..", import.meta.url))));
@@ -68,10 +68,19 @@ export function openLedger(manifest: string, params: unknown, args: { maxRequest
   write();
   return {
     manifest: m, remaining: () => m.limits.maxRequests - m.requestsUsed, record: () => { m.requestsUsed++; write(); },
-    takeRows: (n: number) => {
-      m.rowsReceived += n; write();
-      if (m.rowsReceived > m.limits.maxRows) throw new RowCeiling(`the directory passed the approved ceiling of ${m.limits.maxRows} rows`);
-    },
+    /** Rows reserved before a request are spent at once (persisted), so an interruption over-counts, never under. */
+    rows: {
+      reserve: (max: number) => {
+        const granted = Math.min(max, m.limits.maxRows - m.rowsReceived);
+        if (granted <= 0) throw new RowCeiling(`the approved ceiling of ${m.limits.maxRows} directory rows is reached`);
+        m.rowsReceived += granted; write();
+        return granted;
+      },
+      settle: (granted: number, received: number) => {
+        if (received > granted) throw new RowCeiling(`a directory page brought ${received} rows for a grant of ${granted}`);
+        m.rowsReceived -= granted - received; write();
+      },
+    } satisfies RowBudget,
   };
 }
 
@@ -85,6 +94,8 @@ async function main(argv: string[]) {
   if (via !== "cloud" && via !== "reader-mcp") throw new Error("--via must be cloud or reader-mcp");
   // A reader that cannot bound event times on the server reads whole session histories over the wire, even
   // though out-of-window events are dropped before derivation. It is refused unless that is explicitly accepted.
+  // Every harvest runs under a row ceiling; a reader whose list pages cannot be bounded cannot honour one.
+  if (!READERS[via].boundedListPages) throw new Error(`--via ${via} cannot bound its directory pages, so the approved row ceiling cannot be enforced; it is refused`);
   if (!READERS[via].serverSideEventWindow && !values["accept-client-side-window"]) {
     throw new Error(`--via ${via} cannot enforce the event window on the server: it reads each session's whole history and drops events outside the window before derivation. Pass --accept-client-side-window only if the approved read scope allows that.`);
   }
@@ -107,7 +118,7 @@ async function main(argv: string[]) {
   const concurrency = m.limits.concurrency;
   try {
     const frameSlices = Math.max(1, Math.min(8, Number(values["frame-slices"] ?? 1)));
-    const cov = await runHarvest(client, { out, window: { since, until }, concurrency, frameSlices, via, takeRows: ledger.takeRows,
+    const cov = await runHarvest(client, { out, window: { since, until }, concurrency, frameSlices, via, rowBudget: ledger.rows,
       priorityProjects: values["priority-projects"]?.split(",").filter(Boolean), skipProjects: values["skip-projects"]?.split(",").filter(Boolean),
       log: (m) => console.error(client.redact(m)) });
     console.log(JSON.stringify({ complete: cov.complete, capped: cov.capped, sessions: cov.frame.sessions, gaps: cov.frame.gaps.length, requests: cov.requests.total }));

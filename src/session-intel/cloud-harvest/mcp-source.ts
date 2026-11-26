@@ -12,7 +12,7 @@
  */
 import { type CloudClient, HarvestCap, HttpError, McpToolError } from "./client.ts";
 import { directoryProjection, eventFacts, informative, type RawEvent } from "./features.ts";
-import { type DirectoryRow, type Gap, inWindow, type SessionFacts, type TakeRows, type Window } from "./harvest.ts";
+import { type DirectoryRow, type Gap, inWindow, RowCeiling, type RowBudget, type SessionFacts, type Window } from "./harvest.ts";
 
 const LIST_PAGE = 50;
 const EVENTS_PAGE = 50;
@@ -55,15 +55,19 @@ function sameWorkspace(client: CloudClient, body: Record<string, unknown>) {
   if (body.workspace_id !== client.workspaceId) throw new Error("a shared-sessions response named a different workspace (or none)");
 }
 
-export async function harvestMcpFrame(client: CloudClient, window: { since: string; until: string }, log: (m: string) => void = () => {}, takeRows: TakeRows = () => {}) {
+export async function harvestMcpFrame(client: CloudClient, window: { since: string; until: string }, log: (m: string) => void = () => {}, budget?: RowBudget) {
   const rows = new Map<string, DirectoryRow>();
   const gaps: Gap[] = [];
   let cursor: string | undefined, pages = 0;
   do {
-    const page = await client.callTool("list_session_summaries", { since: window.since, limit: LIST_PAGE, ...(cursor ? { cursor } : {}) });
+    // The page size is the allowance left (reserved before sending), so no request asks for rows beyond the ceiling.
+    const limit = budget ? budget.reserve(LIST_PAGE) : LIST_PAGE;
+    const page = await client.callTool("list_session_summaries", { since: window.since, limit, ...(cursor ? { cursor } : {}) });
     pages++;
     sameWorkspace(client, page);
-    takeRows(Array.isArray(page.sessions) ? page.sessions.length : 0);
+    const received = Array.isArray(page.sessions) ? page.sessions.length : 0;
+    if (budget) budget.settle(limit, received);
+    else if (received > limit) throw new RowCeiling("a directory page brought more rows than it asked for");
     for (const r of (page.sessions ?? []) as SummaryRow[]) {
       if (!r.session_id || !r.source || (r.last_active && r.last_active < window.since)) continue;
       const row = directoryRowOf(r);
