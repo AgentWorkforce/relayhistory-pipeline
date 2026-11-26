@@ -162,6 +162,50 @@ test("claim lock controls: env shapes, and add / change / remove at a held phase
   }
 });
 
+// The bounded buffered lock retry (deliver.ts withLockRetry): a cutover control exactly like claimLockWaitMs, with the
+// Worker's own startup range. Nothing in the tracked profile; the protected environment supplies it.
+test("lock retry budget: env shapes match the Worker's refusal rule, and add / change / remove at a held phase", async () => {
+  const { LOCK_RETRY_BUDGET_MS_MIN, LOCK_RETRY_BUDGET_MS_MAX, lockRetryBudgetRefusal } = await import("../../../src/session-ingest/deliver.ts");
+  const { LOCK_RETRY_BUDGET_RANGE } = await import("../../../src/session-ingest/private-ingest-release.ts");
+  expect(LOCK_RETRY_BUDGET_RANGE).toEqual({ min: LOCK_RETRY_BUDGET_MS_MIN, max: LOCK_RETRY_BUDGET_MS_MAX });
+  expect(PRIVATE_INGEST_CUTOVER_KEYS).toContain("lockRetryBudgetMs");
+  expect(privateIngestCutoverFromEnv({ PRIVATE_INGEST_LOCK_RETRY_BUDGET_MS: "8000" })).toEqual({ lockRetryBudgetMs: 8000 });
+  expect(privateIngestCutoverFromEnv({ PRIVATE_INGEST_LOCK_RETRY_BUDGET_MS: "" })).toEqual({});
+  expect(privateIngestCutoverFromEnv({})).toEqual({});
+  for (const v of ["5050", "10000"]) {
+    expect(privateIngestCutoverFromEnv({ PRIVATE_INGEST_LOCK_RETRY_BUDGET_MS: v })).toEqual({ lockRetryBudgetMs: Number(v) });
+    expect(lockRetryBudgetRefusal(Number(v))).toBeUndefined();
+  }
+  for (const v of ["0", "5049", "10001", "60000", "1e4", "0x2000", "+8000", "-8000", "8000.5", " 8000", "08000", "abc", "on"])
+    expect(code(() => privateIngestCutoverFromEnv({ PRIVATE_INGEST_LOCK_RETRY_BUDGET_MS: v }))).toBe("private_ingest_profile_lock_retry_budget");
+  for (const phase of ["baseline-drain", "step-4-async-on"] as const)
+    expect(privateIngestReleasePhase(at(phase, { lockRetryBudgetMs: 8000 }))).toBe(phase);
+  expect(code(() => privateIngestReleasePhase(at("baseline-drain", { lockRetryBudgetMs: 10001 })))).toBe("private_ingest_profile_lock_retry_budget");
+
+  const plain = at("baseline-drain", { claimTimeoutBusy: "on", claimLockWaitMs: 250 });
+  const retry = at("baseline-drain", { claimTimeoutBusy: "on", claimLockWaitMs: 250, lockRetryBudgetMs: 8000 });
+  const longer = at("baseline-drain", { claimTimeoutBusy: "on", claimLockWaitMs: 250, lockRetryBudgetMs: 10000 });
+  expect(sessionIngestVars(retry.sessionIngest)).toEqual({ ...sessionIngestVars(plain.sessionIngest), INGEST_LOCK_RETRY_BUDGET_MS: "8000" });
+  const pass = { status: "PRIVATE_INGEST_LIVE_TRANSITION_PASS", from: "baseline-drain", to: "baseline-drain" };
+  const fromPlain = live(plain), fromRetry = live(retry);
+  expect(privateIngestTransitionReadback(retry, fromPlain.active, fromPlain.version)).toMatchObject(pass);  // add
+  expect(privateIngestTransitionReadback(longer, fromRetry.active, fromRetry.version)).toMatchObject(pass); // change
+  expect(privateIngestTransitionReadback(plain, fromRetry.active, fromRetry.version)).toMatchObject(pass);  // remove
+  expect(privateIngestVersionReadback(retry, fromRetry.active, fromRetry.version)).toMatchObject({ phase: "baseline-drain" });
+  expect(code(() => privateIngestVersionReadback(longer, fromRetry.active, fromRetry.version))).not.toBeNull();
+  // A live budget the profile does not declare is an unknown flag, never a pass.
+  expect(code(() => privateIngestVersionReadback(plain, fromRetry.active, fromRetry.version))).not.toBeNull();
+  for (const bad of [
+    [{ name: "INGEST_LOCK_RETRY_BUDGET_MS", type: "plain_text", text: "1e4" }],
+    [{ name: "INGEST_LOCK_RETRY_BUDGET_MS", type: "plain_text", text: "20000" }],
+    [{ name: "INGEST_LOCK_RETRY_BUDGET_MS", type: "plain_text", text: "0" }],
+    [{ name: "INGEST_LOCK_RETRY_BUDGET_MS", type: "secret_text" }],
+  ]) {
+    const fixture = live(plain, bad);
+    expect(code(() => privateIngestTransitionReadback(plain, fixture.active, fixture.version))).toBe("private_ingest_live_cutover");
+  }
+});
+
 // Buffer-stage lock controls (deliver.ts BufferLockBusy / bufferLedgerStage): cutover controls exactly like
 // claimTimeoutBusy. Absent renders nothing; "on" is accepted and rendered; anything else refuses.
 test("buffer lock controls: absent renders nothing, on renders, anything else refuses, add / remove at a held phase", () => {

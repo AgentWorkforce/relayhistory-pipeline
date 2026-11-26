@@ -121,6 +121,9 @@ export const ALLOWED_LOG_FIELDS = new Set([
   // live holder the key already had; a bounded integer. `same_origin`: whether at least one of those live holders
   // was taken with this request's origin; a boolean only (BOOLEAN_FIELDS), never the origin id.
   "age_ms", "same_origin",
+  // The ingest bounded lock retry (src/session-ingest/deliver.ts LockRetryFields, INGEST_LOCK_RETRY_BUDGET_MS): retries
+  // issued for one delivery (a bounded integer) and how they ended (LOCK_RETRY_OUTCOME_VALUES).
+  "lock_retry_attempts", "lock_retry_outcome",
 ]);
 
 /**
@@ -145,6 +148,7 @@ export const BOUNDED_COUNT_FIELDS: ReadonlyMap<string, number> = new Map([
   ["skipped_budget", 100_000],
   ["skipped_control", 100_000],
   ["age_ms", 3_600_000],
+  ["lock_retry_attempts", 100],
   ...ADMISSION_PHASE_FIELDS_LIST.map((f): [string, number] => [f, 3_600_000]),
   ...ANALYTICS_COUNTER_FIELDS.map((f): [string, number] => [f, Number.MAX_SAFE_INTEGER]),
   ...SEAL_POOL_LOG_FIELDS.map((f): [string, number] => [f, Number.MAX_SAFE_INTEGER]),
@@ -183,12 +187,15 @@ export const CLIENT_OS_VALUES: ReadonlySet<string> = new Set(["macos", "linux", 
 export const REGEN_REASON_VALUES: ReadonlySet<string> = new Set([
   "turns_gained", "idle_uncovered", "ended_uncovered", "retry_backoff", "config_changed", "operator_requeue", "version_backfill",
 ]);
+/** `lock_retry_outcome` mirrors session-ingest deliver.ts LOCK_RETRY_OUTCOMES (pinned equal in lock-retry-budget.test.ts). */
+export const LOCK_RETRY_OUTCOME_VALUES: ReadonlySet<string> = new Set(["succeeded_after_retry", "exhausted", "not_retryable"]);
 export const REGEN_SYSTEM_VALUES: ReadonlySet<string> = new Set(["bob_costas", "brief"]);
 const ENUM_FIELDS: ReadonlyMap<string, ReadonlySet<string>> = new Map([
   ["store_cause", STORE_CAUSE_VALUES], ["streaming", STREAMING_VALUES],
   ["db_refusal", DB_REFUSAL_VALUES], ["client_kind", CLIENT_KIND_VALUES], ["client_os", CLIENT_OS_VALUES],
   ["regeneration_reason", REGEN_REASON_VALUES], ["system", REGEN_SYSTEM_VALUES],
   ["db_error_detail", DB_ERROR_DETAIL_VALUES], ["db_client_phase", DB_CLIENT_PHASE_VALUES],
+  ["lock_retry_outcome", LOCK_RETRY_OUTCOME_VALUES],
 ]);
 /** Shaped fields: emitted only when the string matches its pattern AND the scrubber leaves it unchanged (else
  * dropped). `client_version` is a release version (client-agent.ts CLIENT_VERSION, pinned equal in

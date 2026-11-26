@@ -207,6 +207,14 @@ export interface SessionIngestInputs {
    */
   claimLockWaitMs?: number;
   /**
+   * INGEST_LOCK_RETRY_BUDGET_MS: the per-delivery budget (ms, 5050..10000) of the bounded buffered lock retry: a
+   * buffered claim / buffer_intent / buffer_receipt that fails 55P03 / 40P01 / server 57014 is re-issued with the
+   * same input after jittered exponential pauses while the budget lasts (src/session-ingest/deliver.ts withLockRetry;
+   * the range is the Worker's own startup refusal, lockRetryBudgetRefusal). Buffered mode only. Present: the var
+   * only. Omit for off (no var rendered, vars byte-identical to before).
+   */
+  lockRetryBudgetMs?: number;
+  /**
    * INGEST_ADVERTISED_MAX_RECORDS: the records-per-batch limit the Worker ADVERTISES (GET /v1/delivery/limits and
    * receipts), an integer from 1 to 500. Acceptance stays 500, so already-persisted batches are never refused.
    * Omit for the default (500 advertised; nothing rendered).
@@ -285,7 +293,7 @@ const AUTHORITY_ENV_KEYS = [
   "INGEST_AUTHORITY_EXPECT_AUTH_EPOCH",
   "INGEST_AUTHORITY_EXPECT_SOURCE_IDENTITY",
 ] as const;
-const KEYS = ["custodySource", "privacyAuthority", "expectedGeneration", "overlapGeneration", "acceptanceMode", "accountId", "hyperdriveId", "secretsStoreId", "kmsKeyArn", "maxPerUser", "maxPerOrg", "inlineMaxSessions", "replicaMode", "neonReplicaQueue", "authority", "asyncAdmission", "syncAdmissionFrozenReceipt", "claimLockBusy", "claimTimeoutBusy", "bufferLockBusy", "bufferLockRetry", "inflightLease", "claimLockWaitMs", "advertisedMaxRecords", "originClaimFence", "turnFenceRegister", "neonExit", "uploadConsent", "s3FenceMirror", "httpAdmissionStoppedOrgs"];
+const KEYS = ["custodySource", "privacyAuthority", "expectedGeneration", "overlapGeneration", "acceptanceMode", "accountId", "hyperdriveId", "secretsStoreId", "kmsKeyArn", "maxPerUser", "maxPerOrg", "inlineMaxSessions", "replicaMode", "neonReplicaQueue", "authority", "asyncAdmission", "syncAdmissionFrozenReceipt", "claimLockBusy", "claimTimeoutBusy", "bufferLockBusy", "bufferLockRetry", "inflightLease", "claimLockWaitMs", "lockRetryBudgetMs", "advertisedMaxRecords", "originClaimFence", "turnFenceRegister", "neonExit", "uploadConsent", "s3FenceMirror", "httpAdmissionStoppedOrgs"];
 
 function validAuthorityKeyRoot(value: unknown): value is string {
   if (typeof value !== "string" || !/^96bulls\/[A-Za-z0-9][A-Za-z0-9_/-]{0,151}$/.test(value) || value.endsWith("/")) return false;
@@ -407,6 +415,8 @@ export function assertSessionIngestInputs(p: unknown, refuse: (why: string) => n
     refuse('sessionIngest.inflightLease must be "observe" or "on" (omit for off)');
   if (v.claimLockWaitMs !== undefined && (typeof v.claimLockWaitMs !== "number" || !Number.isSafeInteger(v.claimLockWaitMs) || v.claimLockWaitMs < 25 || v.claimLockWaitMs > 2000))
     refuse("sessionIngest.claimLockWaitMs must be an integer from 25 to 2000 (omit for the role default)");
+  if (v.lockRetryBudgetMs !== undefined && (typeof v.lockRetryBudgetMs !== "number" || !Number.isSafeInteger(v.lockRetryBudgetMs) || v.lockRetryBudgetMs < 5050 || v.lockRetryBudgetMs > 10000 || v.acceptanceMode !== "buffered"))
+    refuse("sessionIngest.lockRetryBudgetMs must be an integer from 5050 to 10000, in buffered mode only (omit for off)");
   if (v.advertisedMaxRecords !== undefined && (typeof v.advertisedMaxRecords !== "number" || !Number.isSafeInteger(v.advertisedMaxRecords) || v.advertisedMaxRecords < 1 || v.advertisedMaxRecords > 500))
     refuse("sessionIngest.advertisedMaxRecords must be an integer from 1 to 500 (omit for the default 500)");
   if (v.originClaimFence !== undefined && (v.originClaimFence !== "on" || v.acceptanceMode !== "buffered"))
@@ -461,6 +471,7 @@ export function sessionIngestVars(p: SessionIngestInputs) {
     ...(p.bufferLockRetry === "on" ? { INGEST_BUFFER_LOCK_RETRY: "on" } : {}),
     ...(p.inflightLease === "observe" || p.inflightLease === "on" ? { INGEST_INFLIGHT_LEASE: p.inflightLease } : {}),
     ...(p.claimLockWaitMs !== undefined ? { INGEST_CLAIM_LOCK_WAIT_MS: String(p.claimLockWaitMs) } : {}),
+    ...(p.lockRetryBudgetMs !== undefined ? { INGEST_LOCK_RETRY_BUDGET_MS: String(p.lockRetryBudgetMs) } : {}),
     ...(p.advertisedMaxRecords !== undefined ? { INGEST_ADVERTISED_MAX_RECORDS: String(p.advertisedMaxRecords) } : {}),
     ...(p.originClaimFence === "on" ? { INGEST_ORIGIN_CLAIM_FENCE: "on" } : {}),
     ...(p.turnFenceRegister === "on" ? { INGEST_TURN_FENCE_REGISTER: "on" } : {}),
