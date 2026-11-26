@@ -9,7 +9,7 @@
  */
 import { stableId } from "./extract.ts";
 import { DEFAULT_LINK_PARAMS, linkSessions, type LinkParams } from "./link.ts";
-import type { FeatureRecord, FeatureState, ForgeFacts, SessionFacts } from "./types.ts";
+import type { EvidencePointer, FeatureRecord, FeatureState, ForgeFacts, SessionFacts } from "./types.ts";
 import { EMPTY_FORGE, sessionKeyString, textCompare } from "./types.ts";
 
 export const ABANDON_AFTER_MS = 21 * 24 * 3_600_000;
@@ -22,27 +22,43 @@ export interface BuildOptions {
   link?: LinkParams;
 }
 
-const before = (t: string | null, fallback: string, asOf: string) => (t ?? fallback) < asOf;
-
-/** One session's facts cut to what was known before `asOf`; null when the session had not started. */
+/**
+ * One session's facts cut to what was known before `asOf`; null when the session had not started.
+ *
+ * Strict as-of: a timed item (and every evidence pointer and quote inside it) counts only before `asOf`. Anything
+ * without a time of its own (mention-only keys, branch and file keys, outcome statuses, untimed items) counts only
+ * once the session has ended before `asOf` (so does the session's title); a pointer without its own time takes its
+ * item's. A replay at T is therefore invariant to everything observed after T.
+ * The directory's own facts (repository, parent sessions) are known from the session's start.
+ */
 export function factsAsOf(f: SessionFacts, asOf: string): SessionFacts | null {
   if (f.startedAt >= asOf) return null;
-  const keep = <T extends { at: string | null }>(items: T[]) => items.filter((i) => before(i.at, f.endedAt, asOf));
+  const ended = f.endedAt < asOf;
+  const seen = (at: string | null) => (at === null ? ended : at < asOf);
+  // A pointer without its own time takes the time of the item that cites it (which has already passed the cut).
+  const cutEvidence = <T extends { evidence: EvidencePointer[] }>(item: T): T => ({ ...item, evidence: item.evidence.filter((e) => e.at === null || e.at < asOf) });
+  const keep = <T extends { at: string | null; evidence: EvidencePointer[] }>(items: T[]) => items.filter((i) => seen(i.at)).map(cutEvidence);
   const built = keep(f.built);
-  // A key backed by a built item follows that item's time; a key only mentioned (a brief naming a commit under
-  // review) has no time of its own and is known from the session's start, which is before `asOf` here.
-  const allBuilt = new Set(f.built.filter((b) => b.ref).map((b) => `${b.kind}\u0000${b.ref}`));
-  const keptBuilt = new Set(built.filter((b) => b.ref).map((b) => `${b.kind}\u0000${b.ref}`));
-  const known = (kind: "commit" | "pr", ref: string) => !allBuilt.has(`${kind}\u0000${ref}`) || keptBuilt.has(`${kind}\u0000${ref}`);
+  const asked = keep(f.asked).map((a) => ({ ...a, quotes: a.quotes.filter((q) => seen(q.at)) }));
+  const builtRefs = new Set(f.built.filter((b) => b.ref).map((b) => `${b.kind}\u0000${b.ref}`));
+  const keptRefs = new Set(built.filter((b) => b.ref).map((b) => `${b.kind}\u0000${b.ref}`));
+  // A key backed by a built item follows that item's time; a key with no item behind it is known at session end.
+  const known = (kind: "commit" | "pr", ref: string) => (builtRefs.has(`${kind}\u0000${ref}`) ? keptRefs.has(`${kind}\u0000${ref}`) : ended);
   return {
     ...f,
-    endedAt: f.endedAt < asOf ? f.endedAt : asOf,
-    asked: keep(f.asked),
+    endedAt: ended ? f.endedAt : asOf,
+    // The analysis's title summarises the whole session: known only once it ended.
+    title: ended ? f.title : "",
+    asked,
     built,
     gaps: keep(f.gaps),
     rationale: keep(f.rationale),
+    outcomeStatuses: ended ? f.outcomeStatuses : [],
     keys: {
       ...f.keys,
+      branches: ended ? f.keys.branches : [],
+      files: ended ? f.keys.files : [],
+      taskRefs: ended ? f.keys.taskRefs : [],
       commits: f.keys.commits.filter((sha) => known("commit", sha)),
       prs: f.keys.prs.filter((url) => known("pr", url)),
     },
@@ -168,7 +184,7 @@ export function buildFeatures(all: readonly SessionFacts[], options: BuildOption
     const times = sessions.flatMap((s) => [s.startedAt, s.endedAt]).sort(textCompare);
     return {
       id: stableId(["feature", founding.source, founding.sessionId]),
-      title: asked[0]?.text ? asked[0].text.slice(0, 120) : founding.title,
+      title: asked[0]?.text ? asked[0].text.slice(0, 120) : founding.title || "(in progress, untitled)",
       repos: [...new Set(sessions.map((s) => s.keys.repo).filter((r): r is string => !!r))].sort(textCompare),
       state: state.state,
       stateBasis: state.basis,

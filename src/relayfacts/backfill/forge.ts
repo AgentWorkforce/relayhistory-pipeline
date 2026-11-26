@@ -6,11 +6,11 @@
  *   bun run src/relayfacts/backfill/forge.ts --repo <owner/name> --git <mirror dir> --since <iso> --until <iso> --out <forge.json>
  */
 import { execFileSync } from "node:child_process";
-import { writeFileSync } from "node:fs";
 import { parseArgs } from "node:util";
 import type { ForgeFacts } from "../features/types.ts";
 import { parseForge } from "../bench/corpus.ts";
-import { outsideFile } from "../out-path.ts";
+import { writeOutsideFile } from "../out-path.ts";
+import { printable, UsageError } from "../errors.ts";
 
 const git = (dir: string, args: string[]) => execFileSync("git", ["-C", dir, ...args], { encoding: "utf8", maxBuffer: 512 * 1024 * 1024 });
 
@@ -50,7 +50,7 @@ export function forgeFacts(repo: string, mirror: string, since: string, until: s
   const prsRaw = execFileSync("gh", ["pr", "list", "-R", repo, "--state", "all", "--limit", "5000", "--search", `updated:>=${since.slice(0, 10)}`,
     "--json", "url,state,createdAt,mergedAt,closedAt,headRefName"], { encoding: "utf8", maxBuffer: 256 * 1024 * 1024 });
   const listed = JSON.parse(prsRaw) as Array<Record<string, string | null>>;
-  if (listed.length >= 5000) throw new Error("gh pr list hit its 5000 limit: narrow the window");
+  if (listed.length >= 5000) throw new UsageError("gh pr list hit its 5000 limit: narrow the window");
   const prs = listed
     .filter((p) => (p.createdAt ?? "") < until)
     .map((p) => ({
@@ -122,9 +122,14 @@ export function forgeFacts(repo: string, mirror: string, since: string, until: s
 }
 
 if (import.meta.main) {
-  const { values } = parseArgs({ options: { repo: { type: "string" }, git: { type: "string" }, since: { type: "string" }, until: { type: "string" }, out: { type: "string" }, branch: { type: "string" } } });
-  if (!values.repo || !values.git || !values.since || !values.until || !values.out) throw new Error("--repo, --git, --since, --until and --out are required");
-  const facts = forgeFacts(values.repo, values.git, values.since, values.until, values.branch ?? "main");
-  writeFileSync(outsideFile(values.out), JSON.stringify(facts));
-  console.log(JSON.stringify({ prs: facts.prs.length, commits: facts.commits.length, onDefault: facts.commits.filter((c) => c.onDefaultBranch).length, reverted: facts.commits.filter((c) => c.revertedBy).length, flags: facts.flags.length, branches: facts.branches?.length ?? 0, landedBranches: facts.branches?.filter((b) => b.landed).length ?? 0 }));
+  try {
+    const { values } = parseArgs({ options: { repo: { type: "string" }, git: { type: "string" }, since: { type: "string" }, until: { type: "string" }, out: { type: "string" }, branch: { type: "string" } } });
+    if (!values.repo || !values.git || !values.since || !values.until || !values.out) throw new UsageError("--repo, --git, --since, --until and --out are required");
+    const facts = forgeFacts(values.repo, values.git, values.since, values.until, values.branch ?? "main");
+    writeOutsideFile(values.out, JSON.stringify(facts));
+    console.log(JSON.stringify({ prs: facts.prs.length, commits: facts.commits.length, onDefault: facts.commits.filter((c) => c.onDefaultBranch).length, reverted: facts.commits.filter((c) => c.revertedBy).length, flags: facts.flags.length, branches: facts.branches?.length ?? 0, landedBranches: facts.branches?.filter((b) => b.landed).length ?? 0 }));
+  } catch (error) {
+    console.error(printable(error));
+    process.exit(1);
+  }
 }

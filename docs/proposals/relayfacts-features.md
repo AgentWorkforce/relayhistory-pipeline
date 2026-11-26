@@ -126,9 +126,13 @@ must cite evidence ids that the scorer checks.
    session made it (a push, a commit line, its own `gh pr create`); one it only listed or viewed is
    a link key. A branch whose tip predates the feature's first session is not its landing.
 
-   **As-of limits.** Session facts are cut at `asOf`, but the forge facts are the mirror's state when
-   the corpus was sealed: branch commit lists, flag defaults and base commits are not replayed. A key a
-   session only mentions has no time of its own and counts from the session's start.
+   **As-of.** Session facts are cut strictly at `asOf`: a timed item, and every evidence pointer and
+   quote inside it, counts only before `asOf`; anything without a time of its own (a mention-only key,
+   branch, file and task keys, outcome statuses) counts only once its session ended before `asOf`.
+   Only the directory's own facts (repository, parent sessions) are known from the session's start. A
+   replay at T is invariant to everything observed after T (tested). The limit: forge facts are the
+   mirror's state when the corpus was sealed, so branch commit lists, flag defaults and base commits are
+   not replayed.
 4. **Asked against built.** Each asked item is matched to the built items that answer it, or marked
    `unmet`. Contradictions and unverified outcomes carry over as gaps.
 5. **Render and export.** Markdown per feature plus an index page, escaped exactly like the
@@ -148,9 +152,30 @@ must cite evidence ids that the scorer checks.
   pipeline's own `processSessionAnalysis` locally with the pinned versions. Khaliq approved this on
   2026-11-25, read-only and for the benchmark only: the read API role (`bulls96_read_api`, tenant-bound
   `READ ONLY` transactions through its `SECURITY DEFINER` readers, TLS verified against the pinned
-  trust), the transcript store's read key, and a model key for local analyses. Credentials come from
-  the environment and are deleted from it on read; nothing is written back. It is resumable and
-  bounded by `--max`, not by a daily budget. Every output path must be outside the repository.
+  trust), the transcript store's read key, and a model key for local analyses. His words: "OK to use
+  bulls96_read_api and the PIPELINE_RAW_S3 transcript-reader key read-only for the relayfacts
+  benchmark, and the OpenAI key … for local analyses." Credentials come from the environment and are
+  deleted from it on read; nothing is written back. It is resumable and bounded by `--max`, not by a
+  daily budget.
+  - **Data transfer.** "Local" means orchestrated on the operator's machine: `analyse` sends each
+    session's bounded evidence to the model provider (the OpenAI Responses API), exactly as the hosted
+    analysis does. No other command calls a model. Khaliq confirmed on 2026-11-26 that his approval
+    covers that transfer for this benchmark ("confirmed", in reply to the question whether it does).
+    Running it for another workspace needs its own approval covering that transfer.
+  - **Scope before collection.** The first collecting command binds the output directory to one scope
+    (tenant, repositories, window, a delete-by date at most 30 days out; `scope.json`); every later
+    command on it, and `seal`, must name the same scope, and nothing runs past the delete-by date. A
+    `--sessions` list (from `locate`) is cut to the scope: only coding sessions attributed to a scoped
+    repository that the directory itself lists for the tenant inside the window are kept, with the
+    directory's own time; the rest are counted by reason. Built records carry the corpus's delete-by
+    date, and `score` and `packets` refuse them after it.
+  - **Private output.** Every output path is refused inside the repository before anything is created.
+    Directories the tools create are 0700; an existing directory is never re-permissioned and must
+    already be the user's own and closed to group and others. Files are 0600, opened without following
+    links, under opaque names (no harness or session id in a file name). Logs and error output hold fixed
+    error codes; only the tools' own refusals print a message. On a volume mounted with ownership
+    ignored, modes are stored but do not keep other local users out: keep such output on a single-user
+    machine.
 - **Build:** run stages 1 to 5 over the results, oldest first, so the timeline reads in order.
 - **Afterwards:** each newly analysed session goes through the same stages incrementally.
 
@@ -220,6 +245,14 @@ Within a repository, whole features are assigned 60/40 to dev and held-out by a 
 recorded before any scoring. Across repositories, at least one repository is held out completely.
 The generator is tuned on the dev features of the other repositories, frozen by hash, and run once
 on the held-out repository.
+
+Verdicts are per split and never pooled: the held-out verdict is the quality decision, the dev verdict
+is tuning evidence only, and each needs at least ten labelled features of its own (else
+`insufficient`).
+
+Adjudicated label corrections (a blind adjudicator who reads transcripts and git, not generator code)
+may change dev labels only, each recorded with its evidence and a new sha256; held-out labels are never
+edited after they are frozen.
 
 ## Code layout
 

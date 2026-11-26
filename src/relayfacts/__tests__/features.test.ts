@@ -33,7 +33,9 @@ const A = snap("sess-a", [
   human("h1", "2026-11-10T10:00:00Z", "Please add   a retry to the uploader so a flaky network never loses a session. Keep it behind a flag."),
   tool("t1", "2026-11-10T10:05:00Z", "tool-call", "git checkout -b feat/upload-retry"),
   tool("t2", "2026-11-10T11:00:00Z", "tool-result", "git commit", "[feat/upload-retry 1a2b3c4d5e] Add upload retry\n 2 files changed"),
-  tool("t3", "2026-11-10T11:05:00Z", "tool-result", "gh pr create", "https://github.com/acme/widgets/pull/42"),
+  // Shaped like session-evidence.ts: the call reference is keyed by its id, the result names it in toolCallId.
+  { ...tool("c3", "2026-11-10T11:04:00Z", "tool-call", "Bash", "gh pr create --fill"), toolCallId: null },
+  { ...tool("t3", "2026-11-10T11:05:00Z", "tool-result", "pr created", "https://github.com/acme/widgets/pull/42"), toolCallId: "c3", isError: false },
   { id: "a1", kind: "assistant-message", at: "2026-11-10T11:06:00Z", summary: "Done." },
 ], {
   outcomes: [outcome("o1", claim("Add an uploader retry behind a flag", ["h1"]), {
@@ -200,7 +202,8 @@ describe("benchmark scoring", () => {
     expect(r.splits.dev.matched).toBe(1);
     expect(r.splits.heldout.matched).toBe(1);
     // Two labelled features are far below the verdict minimum.
-    expect(r.verdicts.featureRecall).toBe("insufficient");
+    expect(r.verdicts.heldout.featureRecall).toBe("insufficient");
+    expect(r.verdicts.dev.featureRecall).toBe("insufficient");
   });
 
   test("gold naming another corpus is refused", () => {
@@ -214,5 +217,19 @@ describe("textOverlap", () => {
     const gold = "Fix issue #613: with INGEST_LEDGER=s3, ledger admission must honour operator erase. One new default-off flag.";
     expect(textOverlap("Fix issue #613 so S3 upload ledger admission honors operator erase state behind a new default-off INGEST_S3_ERASE_FENCE flag", gold)).toBeGreaterThanOrEqual(0.35);
     expect(textOverlap("Register the worker session on Agent Relay and return READY", gold)).toBeLessThan(0.35);
+  });
+});
+
+describe("grounding of build items", () => {
+  test("a commit or PR item must be carried by its cited evidence", () => {
+    const corpus = { manifest: {} as never, manifestSha256: "x", sessions: [{ source: "claude", sessionId: "sess-a", context: ctx, snapshot: A }], forge: forge() } as unknown as Corpus;
+    const [f] = buildFeatures([factsA], { asOf: "2026-12-01T00:00:00Z", forge: forge() });
+    expect(checkGrounding(corpus, [f!]).violations).toEqual([]);
+    const forged = { ...f!, built: f!.built.map((b) => (b.kind === "commit" ? { ...b, ref: "deadbeef00" } : b)) };
+    expect(checkGrounding(corpus, [forged]).violations.map((v) => v.reason)).toContain("commit deadbeef00 not carried by its cited evidence");
+    // A PR item citing a reference that merely contains the URL (not the paired create result) is not carried.
+    const pr = f!.built.find((b) => b.kind === "pr")!;
+    const listed = { ...f!, built: f!.built.map((b) => (b === pr ? { ...b, evidence: [{ ...b.evidence[0]!, refId: "c3", kind: "tool-call" }] } : b)) };
+    expect(checkGrounding(corpus, [listed]).violations.map((v) => v.reason)).toContain(`pr ${pr.ref!.slice(0, 40)} not carried by its cited evidence`);
   });
 });

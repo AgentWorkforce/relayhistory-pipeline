@@ -10,8 +10,8 @@
  *   push       `To <remote>` followed by `<old>..<new>  <src> -> <dst>` or `* [new branch] <src> -> <dst>`
  *   commit     `[<branch> <sha>] <subject>` (git commit without -q)
  *   pr         a github.com pull URL, kept only for a repository the session pushed to or is attributed to;
- *              `created` when it is the result of the session's own `gh pr create`, else `mention` (a listed or
- *              viewed PR: a link key, never build evidence)
+ *              `created` only when it is in the successful result paired by tool_use_id with the session's own
+ *              `gh pr create` call, else `mention` (a listed or viewed PR: a link key, never build evidence)
  *   task       `Delegated task <id>` in a user or history event (never the generic `startup-*` ids)
  *   files      the events' files_touched, anchored at the repository root
  */
@@ -60,8 +60,24 @@ export function extractArtifacts(rows: ReadonlyArray<{ table: string; row: Recor
     out.branches.push({ ...ev, branch, via });
   };
   const prCandidates: Array<ArtifactEvent & { url: string; repo: string; via: "created" | "mention" }> = [];
-  // The result of a `gh pr create` call is the created PR's URL; any other PR URL is only seen.
-  let creating = false;
+  // A PR is created only by the successful result paired (by tool_use_id) with this session's own `gh pr create`
+  // call; adjacency proves nothing.
+  const createCalls = new Set<string>();
+  const payloadOf = (row: Record<string, unknown>) => ((row.record as { payload?: Record<string, unknown> } | undefined)?.payload ?? {}) as Record<string, unknown>;
+  const toolUseIds = (row: Record<string, unknown>): string[] => {
+    const ids = new Set<string>();
+    const p = payloadOf(row).tool_use_id;
+    if (typeof p === "string" && p) ids.add(p);
+    for (const c of Array.isArray(row.tool_calls) ? row.tool_calls : []) {
+      const id = (c as { toolUseId?: unknown }).toolUseId;
+      if (typeof id === "string" && id) ids.add(id);
+    }
+    return [...ids];
+  };
+  const failed = (row: Record<string, unknown>) => {
+    const p = payloadOf(row);
+    return p.error_signal != null || /^(?:error|failed|failure)$/iu.test(String(p.result_status ?? row.tool_status ?? ""));
+  };
   for (const { table, row } of rows) {
     if (table !== "convergence_events") continue;
     const ev: ArtifactEvent = { eventId: String(row.event_id ?? ""), at: timeOf(row.ts) };
@@ -87,10 +103,10 @@ export function extractArtifacts(rows: ReadonlyArray<{ table: string; row: Recor
         seen.commits.add(sha);
         out.commits.push({ ...ev, sha, branch: DEFAULT_BRANCH.test(m[1]!) ? null : m[1]! });
       }
-      for (const m of body.matchAll(PR_URL)) prCandidates.push({ ...ev, url: `https://github.com/${m[1]}/${m[2]}/pull/${m[3]}`.toLowerCase(), repo: `${m[1]}/${m[2]}`.toLowerCase(), via: creating ? "created" : "mention" });
-      creating = false;
+      const created = !failed(row) && toolUseIds(row).some((id) => createCalls.has(id));
+      for (const m of body.matchAll(PR_URL)) prCandidates.push({ ...ev, url: `https://github.com/${m[1]}/${m[2]}/pull/${m[3]}`.toLowerCase(), repo: `${m[1]}/${m[2]}`.toLowerCase(), via: created ? "created" : "mention" });
     }
-    if (type === "tool_call" || row.kind === "tool_call") creating = PR_CREATE.test(body);
+    if ((type === "tool_call" || row.kind === "tool_call") && PR_CREATE.test(body)) for (const id of toolUseIds(row)) createCalls.add(id);
     if (type === "tool_call" || row.kind === "tool_call") for (const re of BRANCH_COMMANDS) for (const m of body.matchAll(re)) addBranch(ev, m[1]!, "command");
     if (type === "user" || type === "history") for (const m of body.matchAll(BRANCH_MENTION)) addBranch(ev, m[1]!, "mention");
     if (type === "user" || type === "history") for (const m of body.matchAll(TASK)) {

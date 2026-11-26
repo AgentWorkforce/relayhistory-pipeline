@@ -169,6 +169,14 @@ function quotes(ctx: Ctx, evidence: readonly EvidencePointer[], intent: string):
   return out;
 }
 
+/** Ids of the session's own successful `gh pr create` tool calls (tool-call references are keyed by `id`). */
+export function createCallIds(snapshot: SessionAnalysisSnapshot): Set<string> {
+  const ids = new Set<string>();
+  for (const ref of snapshot.evidence?.references ?? [])
+    if (ref.kind === "tool-call" && ref.isError !== true && PR_CREATE.test(`${ref.summary ?? ""}\n${ref.detail ?? ""}`)) ids.add(ref.id);
+  return ids;
+}
+
 /** Commits, PRs, branches and migrations read from the tool evidence (references' summary and detail). */
 function evidenceArtifacts(ctx: Ctx, snapshot: SessionAnalysisSnapshot) {
   const commits = new Map<string, { at: string | null; branch: string | null; p: EvidencePointer }>();
@@ -177,15 +185,14 @@ function evidenceArtifacts(ctx: Ctx, snapshot: SessionAnalysisSnapshot) {
   const seenPrs = new Set<string>();
   const seenCommits = new Set<string>();
   const branches = new Set<string>();
-  let creating = false;
+  // A PR is built by this session only in the successful result paired with its own `gh pr create` call: the
+  // analysis gives a tool-call reference the call's id (its `id`; its own `toolCallId` is null) and the result the
+  // same id as `toolCallId` (session-evidence.ts). Adjacency, or a summary naming the command, proves nothing.
+  const createCalls = createCallIds(snapshot);
   for (const ref of snapshot.evidence?.references ?? []) {
     if (ref.kind !== "tool-result" && ref.kind !== "tool-call") continue;
     const body = `${ref.summary ?? ""}\n${ref.detail ?? ""}`;
-    // A PR is built by this session only as the result of its own `gh pr create`.
-    // (the call's own reference, or a result whose summary names the command).
-    const created = ref.kind === "tool-result" && (creating || PR_CREATE.test(ref.summary ?? ""));
-    if (ref.kind === "tool-call") creating = PR_CREATE.test(body);
-    else creating = false;
+    const created = ref.kind === "tool-result" && ref.isError !== true && !!ref.toolCallId && createCalls.has(ref.toolCallId);
     for (const m of body.matchAll(GITHUB_URL)) {
       const [, owner, repo, tail] = m;
       if (tail!.startsWith("pull/")) {

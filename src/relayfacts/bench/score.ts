@@ -9,6 +9,7 @@
  */
 import type { FeatureRecord, SessionKey } from "../features/types.ts";
 import { sessionKeyString, textCompare } from "../features/types.ts";
+import { createCallIds } from "../features/extract.ts";
 import type { Corpus } from "./corpus.ts";
 import type { Gold, GoldFeature } from "./gold.ts";
 
@@ -56,7 +57,11 @@ export interface ScoreReport {
   grounding: { checkedItems: number; violations: GroundingViolation[]; pass: boolean };
   splits: Record<"dev" | "heldout" | "all", SplitScore>;
   bars: typeof BARS;
-  verdicts: Record<string, "pass" | "fail" | "insufficient">;
+  /**
+   * Bars per split. `heldout` is the quality decision (scored once); `dev` is tuning evidence only. Each split
+   * needs MIN_FEATURES_FOR_VERDICT of its own labelled features; splits are never pooled for a verdict.
+   */
+  verdicts: { heldout: Record<string, Verdict>; dev: Record<string, Verdict> };
   matches: Array<{ gold: string; generated: string; goldState: string; generatedState: string }>;
 }
 
@@ -84,18 +89,46 @@ export function textOverlap(a: string, b: string): number {
 const textMatches = (a: string, b: string) => textOverlap(a, b) >= TEXT_MATCH;
 const ratio = (n: number, d: number) => (d ? n / d : null);
 
-/** Every cited pointer resolves in the corpus, and every quote is verbatim. */
+/**
+ * Every cited pointer resolves in the corpus, every quote is verbatim, and every commit or PR built item is carried
+ * by its own cited evidence (the sha or URL is in the reference; a transcript PR event must be a created PR).
+ * Grounding proves citation, not truth: an analysis `claim` is the model's statement about its cited evidence.
+ */
 export function checkGrounding(corpus: Corpus, features: readonly FeatureRecord[]) {
-  const refs = new Map<string, Map<string, { kind: string; text: string }>>();
+  // Per session: each reference's kind, its collapsed summary (quotes), its raw text (build refs), and for transcript
+  // events the build values they carry (`sha`, `pr` for a created PR only).
+  type Ref = { kind: string; text: string; raw: string; values: Set<string> };
+  const refs = new Map<string, Map<string, Ref>>();
   for (const s of corpus.sessions) {
-    const m = new Map<string, { kind: string; text: string }>();
-    for (const r of s.snapshot.evidence?.references ?? []) if (!m.has(r.id)) m.set(r.id, { kind: r.kind, text: collapse(r.summary ?? "") });
+    const m = new Map<string, Ref>();
+    const creates = createCallIds(s.snapshot);
+    for (const r of s.snapshot.evidence?.references ?? []) {
+      if (m.has(r.id)) continue;
+      const raw = `${r.summary ?? ""}\n${r.detail ?? ""}`.toLowerCase();
+      const values = new Set<string>();
+      // A PR is carried only by the successful result paired with the session's own `gh pr create` call.
+      if (r.kind === "tool-result" && r.isError !== true && r.toolCallId && creates.has(r.toolCallId))
+        for (const u of raw.matchAll(/https:\/\/github\.com\/[a-z0-9_.-]+\/[a-z0-9_.-]+\/pull\/[0-9]{1,10}/gu)) values.add(`pr:${u[0]}`);
+      m.set(r.id, { kind: r.kind, text: collapse(r.summary ?? ""), raw, values });
+    }
     // Transcript build evidence (backfill/artifacts.ts) is cited as `event:<eventId>` with kind "event".
     const a = s.artifacts;
-    for (const e of [...(a?.pushes ?? []), ...(a?.commits ?? []), ...(a?.prs ?? []), ...(a?.taskRefs ?? []), ...(a?.files ?? [])])
-      if (!m.has(`event:${e.eventId}`)) m.set(`event:${e.eventId}`, { kind: "event", text: "" });
+    const ev = (id: string) => {
+      const k = `event:${id}`;
+      if (!m.has(k)) m.set(k, { kind: "event", text: "", raw: "", values: new Set() });
+      return m.get(k)!;
+    };
+    for (const e of a?.pushes ?? []) if (e.sha) ev(e.eventId).values.add(`sha:${e.sha}`); else ev(e.eventId);
+    for (const e of a?.commits ?? []) ev(e.eventId).values.add(`sha:${e.sha}`);
+    for (const e of a?.prs ?? []) { const r = ev(e.eventId); if (e.via === "created") r.values.add(`pr:${e.url}`); }
+    for (const e of [...(a?.taskRefs ?? []), ...(a?.files ?? [])]) ev(e.eventId);
     refs.set(sessionKeyString(s), m);
   }
+  /** A commit or PR built item must be carried by at least one of its cited references, not just point at one. */
+  const carries = (ref: Ref, kind: "commit" | "pr", value: string) =>
+    kind === "pr"
+      ? ref.values.has(`pr:${value.toLowerCase()}`)
+      : ref.kind === "event" ? ref.values.has(`sha:${value}`) : ref.raw.includes(value.toLowerCase());
   const violations: GroundingViolation[] = [];
   let checked = 0;
   for (const f of features) {
@@ -110,6 +143,12 @@ export function checkGrounding(corpus: Corpus, features: readonly FeatureRecord[
         const ref = refs.get(sessionKeyString(item.session))?.get(p.refId);
         if (!ref) violations.push({ feature: f.id, item: item.id, reason: `evidence ${p.refId} not in the session` });
         else if (p.kind !== null && ref.kind !== p.kind) violations.push({ feature: f.id, item: item.id, reason: `evidence ${p.refId} kind differs` });
+      }
+      if ("kind" in item && (item.kind === "commit" || item.kind === "pr") && item.ref) {
+        const session = refs.get(sessionKeyString(item.session));
+        const kind = item.kind;
+        if (!item.evidence.some((p) => { const r = session?.get(p.refId); return r !== undefined && carries(r, kind, item.ref!); }))
+          violations.push({ feature: f.id, item: item.id, reason: `${kind} ${item.ref.slice(0, 40)} not carried by its cited evidence` });
       }
     }
     for (const a of f.asked) for (const q of a.quotes) {
@@ -224,19 +263,15 @@ function scoreSplit(gold: readonly GoldFeature[], generatedAll: readonly Feature
   };
 }
 
-/** Bars need enough labelled features to mean anything. */
+/** Bars need enough labelled features in the split being judged to mean anything. */
 export const MIN_FEATURES_FOR_VERDICT = 10;
+export type Verdict = "pass" | "fail" | "insufficient";
 
-export function scoreRun(corpus: Corpus, gold: Gold, generated: readonly FeatureRecord[]): ScoreReport {
-  const grounding = checkGrounding(corpus, generated);
-  const dev = scoreSplit(gold.features.filter((g) => g.split === "dev"), generated, gold.coverage, gold.features);
-  const heldout = scoreSplit(gold.features.filter((g) => g.split === "heldout"), generated, gold.coverage, gold.features);
-  const all = scoreSplit(gold.features, generated, gold.coverage, gold.features);
-  const s = all.score;
+function splitVerdicts(s: SplitScore, groundingPass: boolean): Record<string, Verdict> {
   const enough = s.goldFeatures >= MIN_FEATURES_FOR_VERDICT;
-  const atLeast = (v: number | null, bar: number) => (v === null || !enough ? "insufficient" : v >= bar ? "pass" : "fail");
-  const verdicts: ScoreReport["verdicts"] = {
-    grounding: grounding.pass ? "pass" : "fail",
+  const atLeast = (v: number | null, bar: number): Verdict => (v === null || !enough ? "insufficient" : v >= bar ? "pass" : "fail");
+  return {
+    grounding: groundingPass ? "pass" : "fail",
     featureRecall: atLeast(s.featureRecall, BARS.featureRecall),
     featurePrecision: atLeast(s.featurePrecision, BARS.featurePrecision),
     linkingF1: atLeast(s.linkingF1, BARS.linkingF1),
@@ -246,6 +281,14 @@ export function scoreRun(corpus: Corpus, gold: Gold, generated: readonly Feature
     gapPrecision: atLeast(s.gapPrecision, BARS.gapPrecision),
     duplication: s.duplication === null || !enough ? "insufficient" : s.duplication <= BARS.duplicationMax ? "pass" : "fail",
   };
+}
+
+export function scoreRun(corpus: Corpus, gold: Gold, generated: readonly FeatureRecord[]): ScoreReport {
+  const grounding = checkGrounding(corpus, generated);
+  const dev = scoreSplit(gold.features.filter((g) => g.split === "dev"), generated, gold.coverage, gold.features);
+  const heldout = scoreSplit(gold.features.filter((g) => g.split === "heldout"), generated, gold.coverage, gold.features);
+  const all = scoreSplit(gold.features, generated, gold.coverage, gold.features);
+  const verdicts: ScoreReport["verdicts"] = { heldout: splitVerdicts(heldout.score, grounding.pass), dev: splitVerdicts(dev.score, grounding.pass) };
   return {
     format: "relayfacts-score/1",
     corpus: corpus.manifestSha256,

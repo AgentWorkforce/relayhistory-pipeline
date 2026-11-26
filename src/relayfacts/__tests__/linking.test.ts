@@ -72,10 +72,11 @@ describe("branchStem", () => {
 
 describe("mentioned commits", () => {
   const ev = { source: "claude", sessionId: "s", refId: "r", kind: "tool", at: null };
-  test("the as-of cut keeps a mentioned commit and drops a built one from after asOf", () => {
+  test("the as-of cut: a built commit follows its time, a mentioned one is known once the session ended", () => {
     const late = { id: "b", kind: "commit" as const, what: "commit", ref: "bbbbbbb", at: "2026-10-01T10:30:00.000Z", session: { source: "claude", sessionId: "s" }, outcomeId: null, evidence: [ev] };
     const f = facts("s", { commits: ["aaaaaaa", "bbbbbbb"] }, "2026-10-01T10:00:00.000Z", [late]);
-    expect(factsAsOf(f, "2026-10-01T10:20:00.000Z")!.keys.commits).toEqual(["aaaaaaa"]);
+    expect(factsAsOf(f, "2026-10-01T10:20:00.000Z")!.keys.commits).toEqual([]);
+    expect(factsAsOf(f, "2026-10-01T10:45:00.000Z")!.keys.commits).toEqual(["bbbbbbb"]);
     expect(factsAsOf(f, "2026-10-02T00:00:00.000Z")!.keys.commits).toEqual(["aaaaaaa", "bbbbbbb"]);
   });
   test("a commit already on the default branch when the session started is its base, not its work", () => {
