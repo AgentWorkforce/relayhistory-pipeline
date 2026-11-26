@@ -134,6 +134,16 @@ The D1, ranker and stage-2 numbers are withdrawn until they are rerun. The other
 
 The earlier separation came from undated intent text. Branches, edited files and dated comments do not carry enough intent on their own.
 
+**With dated intent, the judge separates them (dev only).** The test was then rerun with PR titles and descriptions rebuilt from forge history as they stood at each alert (forge `history`). It used prompt v3, which differs from v2 only in describing that input, and 40 new fresh alerts that neither earlier round had judged. Same 6 positives, fresh blind judges, no lookups:
+
+| Cutoff | Positives kept | Fresh top alerts kept |
+|---|---|---|
+| p ≥ 0.3 | 4 / 6 | 0 / 40 |
+| p ≥ 0.5 | 3 / 6 | 0 / 40 |
+| p ≥ 0.7 | 2 / 6 | 0 / 40 |
+
+At p ≥ 0.3, 0 of 40 bounds the false-alert rate below about 9% (95% Wilson). Fresh alerts scored at most 0.25. The positives are dev items that earlier rounds also used, and the prompt was written on dev, so this is a dev result. The claim needs the held-out score.
+
 ## Stage 2 (proposed)
 
 Structure gives recall but not precision, and an intent judge without dated intent text gives neither. Stage 2 therefore needs **dated intent**: what each line meant to do, as it stood at the alert. Two sources keep that inside the rules here:
@@ -141,7 +151,7 @@ Structure gives recall but not precision, and an intent judge without dated inte
 1. **Forge history.** The forge records a PR's title and description edits with timestamps (title-rename timeline events and content-edit history). The title and description as of any time can be rebuilt from them. Fetching that history is forge metadata, read with the operator's own `gh`, and needs no transcript text.
 2. **The live pipeline.** A judge running in the pipeline reads each session as of now, so its intent text (the brief, the create call's title) is dated by construction. Offline, this benchmark keeps no transcript text, so carrying such text across the privacy boundary would need its own decision.
 
-Option 1 can be built and measured here. The next step is to add dated PR titles and descriptions to as-of bundles, rerun this test, and score held-out once only if dev shows separation.
+Option 1 is built (forge `history`) and shows separation on dev (above). The next step is to freeze stage 1, the prompt and the cutoff together, and score held-out once.
 
 Stage 2 should be the existing conflict model-judge seam ([session-intel-conflicts.md](session-intel-conflicts.md)), not a second judge. That seam provides an injected transport, verdicts that must cite their inputs, and no key read by the module. Enabling it in production needs Khaliq's explicit OK.
 
