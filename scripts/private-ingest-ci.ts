@@ -137,7 +137,23 @@ async function cloudflareGet(path: string, worker: typeof P.worker | typeof P.re
       signal: AbortSignal.timeout(15_000),
     },
   );
-  if (!response.ok) privateIngestRefuse("private_ingest_cloudflare_read");
+  if (!response.ok) {
+    // Name the failure before refusing: status plus Cloudflare's errors[] (codes/messages never carry the token).
+    let errors: unknown = null;
+    try {
+      const body = (await response.text()).slice(0, 4096);
+      try { errors = (JSON.parse(body) as { errors?: unknown }).errors ?? body; } catch { errors = body; }
+    } catch { /* body unreadable; status alone still names the failure */ }
+    console.error(JSON.stringify({
+      refusal: "private_ingest_cloudflare_read",
+      status: response.status,
+      worker,
+      path,
+      cfRay: response.headers.get("cf-ray"),
+      errors,
+    }));
+    privateIngestRefuse("private_ingest_cloudflare_read");
+  }
   const text = await response.text();
   if (text.length > 2 * 1024 * 1024) privateIngestRefuse("private_ingest_cloudflare_read_bound");
   const body = JSON.parse(text) as { success?: unknown; result?: unknown };
