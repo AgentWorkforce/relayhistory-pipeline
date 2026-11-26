@@ -125,3 +125,7 @@ For 5,008 sessions, the harvest took about 108 minutes and roughly 1,600 request
 - **Relay-message evidence in facts,** so `communication` can become observed or not observed.
 - **Reprojecting stored facts** with #485, so Codex edits count.
 - **A larger, multi-person labeled set** before anyone calibrates an alert threshold.
+
+## Benchmark
+
+The overlap benchmark ([session-intel-overlap-bench.md](session-intel-overlap-bench.md)) runs `outcome-facts` v1 unchanged as its baseline, over real harvested sessions and forge-derived incidents. On the dev split it reached 0 of 23 linkable incidents. The benchmark records why, and what found more.
