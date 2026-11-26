@@ -36,6 +36,11 @@ export interface LinkParams {
   maxSessionCommits: number;
   /** The same for pull requests (a `gh pr list` names dozens). */
   maxSessionPrs: number;
+  /** Attach a session no key linked to the group its asks and claims describe (idf-weighted cosine). */
+  intent: boolean;
+  intentMinSimilarity: number;
+  /** The candidate group must be active within this of the session. */
+  intentWindowMs: number;
 }
 
 export const DEFAULT_LINK_PARAMS: LinkParams = {
@@ -47,6 +52,9 @@ export const DEFAULT_LINK_PARAMS: LinkParams = {
   maxSessionBranches: 4,
   maxSessionCommits: 4,
   maxSessionPrs: 4,
+  intent: true,
+  intentMinSimilarity: 0.15,
+  intentWindowMs: 3 * 24 * 3_600_000,
 };
 
 export interface LinkResult {
@@ -139,12 +147,63 @@ export function linkSessions(facts: readonly SessionFacts[], params: LinkParams 
     }
   }
 
-  const groups = new Map<string, SessionFacts[]>();
-  for (const f of sorted) {
-    const root = uf.find(sessionKeyString(keyOf(f)));
-    const list = groups.get(root) ?? [];
-    list.push(f);
-    groups.set(root, list);
+  const grouped = () => {
+    const groups = new Map<string, SessionFacts[]>();
+    for (const f of sorted) {
+      const root = uf.find(sessionKeyString(keyOf(f)));
+      const list = groups.get(root) ?? [];
+      list.push(f);
+      groups.set(root, list);
+    }
+    return groups;
+  };
+
+  if (params.intent) {
+    // Last, and only for a session no evidence key linked: attach it to the group whose work it describes. Every
+    // attachment is decided against the groups as the keys left them, so the order of sessions never matters.
+    const groups = [...grouped()].map(([root, members]) => ({ root, members, text: intentTokens(members), first: members[0]!.startedAt, last: members.map((m) => m.endedAt).sort(textCompare).pop()! }));
+    const df = new Map<string, number>();
+    for (const g of groups) for (const w of g.text) df.set(w, (df.get(w) ?? 0) + 1);
+    const weight = (w: string) => Math.log(groups.length / (df.get(w) ?? 1));
+    const norm = new Map(groups.map((g) => [g.root, Math.sqrt([...g.text].reduce((n, w) => n + weight(w) ** 2, 0))]));
+    const attach: Array<{ a: SessionFacts; b: SessionFacts; sim: number }> = [];
+    for (const g of groups) {
+      if (g.members.length !== 1 || !g.text.size) continue;
+      const near = (o: typeof g) => Date.parse(o.first) - params.intentWindowMs <= Date.parse(g.last) && Date.parse(g.first) <= Date.parse(o.last) + params.intentWindowMs;
+      let best: { o: typeof g; sim: number } | null = null;
+      for (const o of groups) {
+        if (o === g || !near(o) || (g.members[0]!.keys.repo ?? null) !== (o.members[0]!.keys.repo ?? null)) continue;
+        let dot = 0;
+        for (const w of g.text) if (o.text.has(w)) dot += weight(w) ** 2;
+        const d = norm.get(g.root)! * norm.get(o.root)!;
+        const sim = d ? dot / d : 0;
+        if (!best || sim > best.sim || (sim === best.sim && textCompare(o.root, best.o.root) < 0)) best = { o, sim };
+      }
+      if (best && best.sim >= params.intentMinSimilarity) attach.push({ a: g.members[0]!, b: best.o.members[0]!, sim: best.sim });
+    }
+    for (const { a, b, sim } of attach)
+      if (uf.union(sessionKeyString(keyOf(a)), sessionKeyString(keyOf(b))))
+        links.push({ a: keyOf(a), b: keyOf(b), signal: "intent", value: `similarity ${sim.toFixed(2)}` });
   }
-  return { groups: [...groups.values()].sort((a, b) => byStart(a[0]!, b[0]!)), links };
+
+  return { groups: [...grouped().values()].sort((a, b) => byStart(a[0]!, b[0]!)), links };
+}
+
+/**
+ * Words that say what a delegated session does rather than what the work is about: every review, fix and test
+ * brief has them, so they never decide an intent link (nor do commit ids).
+ */
+const ROLE_WORDS = new Set(("review reviews reviewed reviewer adversarial adversarially independent independently report reports reporting " +
+  "findings finding verdict verdicts diff diffs commit commits change changes fix fixes fixed test tests tested testing run ran typecheck " +
+  "check checks checked verify verified verifying inspect inspected read perform deliver produce make specified requested format relevant " +
+  "targeted range branch head main code source files file whether listed pass passes passing fail failed results result command commands " +
+  "repo repository delta round follow followup corrections local create created implement implemented add added update updated exercise assess").split(" "));
+const STOP_WORDS = new Set(("the and for with that this from into are was were has have not but you your our its all any can will should would " +
+  "must been being also than then them they their there here what when which while who why how just only more most less very each other such " +
+  "some same over under about after before between through during without within upon").split(" "));
+
+/** A group's intent words: its asks, title and claimed changes, minus stop words, role words and commit ids. */
+export function intentTokens(members: readonly SessionFacts[]): Set<string> {
+  const text = members.flatMap((m) => [m.title, ...m.asked.map((a) => a.text), ...m.built.filter((b) => b.kind === "claim").map((b) => b.what)]).join(" ").toLowerCase();
+  return new Set((text.match(/[a-z0-9_]{3,}/gu) ?? []).filter((w) => !STOP_WORDS.has(w) && !ROLE_WORDS.has(w) && !/^[0-9a-f]{7,40}$/u.test(w)));
 }

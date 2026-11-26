@@ -110,3 +110,39 @@ describe("mentioned commits", () => {
     expect(() => parseForge({ ...base, branches: [{ ...branch, commits: Array(201).fill(sha("a")) }] })).toThrow();
   });
 });
+
+describe("intent links", () => {
+  const withText = (id: string, ask: string, startedAt = "2026-10-01T10:00:00.000Z", keys: Partial<LinkKeys> = {}) => {
+    const f = facts(id, keys, startedAt);
+    return { ...f, title: "", asked: [{ id: `${id}-a`, text: ask, quotes: [], at: startedAt, session: { source: "claude", sessionId: id }, outcomeId: null, evidence: [] }] };
+  };
+  const feature = [
+    withText("w1", "Add the inflight lease to the ingest claim so a crashed worker releases its session lease", undefined, { branches: ["feat/lease"] }),
+    withText("w2", "Inflight lease follow-up: expire the session lease on worker crash and log the lease release", undefined, { branches: ["feat/lease"] }),
+  ];
+  const other = [
+    withText("o1", "Move the dashboard charts to the new palette and fix the legend colours", undefined, { branches: ["feat/palette"] }),
+    withText("o2", "Palette dashboard follow-up: legend colours and chart contrast", undefined, { branches: ["feat/palette"] }),
+  ];
+  test("a session no key linked attaches to the group its asks describe; role words never decide", () => {
+    const reviewer = withText("r", "Adversarially review the inflight lease release on worker crash and report findings");
+    const { groups, links } = linkSessions([...feature, ...other, reviewer]);
+    expect(groupOf(groups, "r")).toEqual(["r", "w1", "w2"]);
+    expect(links.find((l) => l.signal === "intent")?.value).toMatch(/^similarity /u);
+    // Only role words in common: no attachment.
+    const generic = withText("g", "Adversarially review the commit diff and report findings and verdict");
+    expect(groupOf(linkSessions([...feature, ...other, generic]).groups, "g")).toEqual(["g"]);
+  });
+  test("outside the time window, in another repository, or switched off: no attachment", () => {
+    const late = withText("r", "Review the inflight lease release on worker crash", "2026-10-20T10:00:00.000Z");
+    expect(groupOf(linkSessions([...feature, ...other, late]).groups, "r")).toEqual(["r"]);
+    const elsewhere = { ...withText("r", "Review the inflight lease release on worker crash"), keys: { ...facts("r").keys, repo: "example/other" } };
+    expect(groupOf(linkSessions([...feature, ...other, elsewhere]).groups, "r")).toEqual(["r"]);
+    const off = linkSessions([...feature, ...other, withText("r", "Review the inflight lease release on worker crash")], { ...DEFAULT_LINK_PARAMS, intent: false });
+    expect(groupOf(off.groups, "r")).toEqual(["r"]);
+  });
+  test("a session a key already linked is never moved by intent", () => {
+    const keyed = withText("k", "Inflight lease worker crash session lease release", undefined, { branches: ["feat/palette"] });
+    expect(groupOf(linkSessions([...feature, ...other, keyed]).groups, "k")).toEqual(["k", "o1", "o2"]);
+  });
+});

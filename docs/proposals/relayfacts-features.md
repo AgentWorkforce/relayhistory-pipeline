@@ -97,7 +97,11 @@ must cite evidence ids that the scorer checks.
    - the same PR or branch;
    - commits that reference each other;
    - overlapping file sets in the same repository within a time window;
-   - intent similarity, and only as a tiebreaker (not implemented);
+   - intent similarity, and only as a tiebreaker: a session no key linked attaches to the group active
+     within three days in the same repository whose asks, title and claimed changes are most alike
+     (idf-weighted cosine of content words, at least 0.15), with words that only say what a delegated
+     session does ("review", "report", "findings", "commit") and commit ids left out. On the first
+     corpus's dev split it attached 21 labelled singletons, 20 to the right feature;
    - a small delegation family: a parent session and the sessions it spawned (the directory's
      `parent_session_ids`), while the family has at most 12 members.
 

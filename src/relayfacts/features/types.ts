@@ -146,7 +146,7 @@ export const EMPTY_FORGE: ForgeFacts = { prs: [], commits: [], flags: [] };
 export interface FeatureLink {
   a: SessionKey;
   b: SessionKey;
-  signal: "task" | "pr" | "branch" | "commit" | "family" | "files";
+  signal: "task" | "pr" | "branch" | "commit" | "family" | "files" | "intent";
   value: string;
 }
 
