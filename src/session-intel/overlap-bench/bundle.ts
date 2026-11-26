@@ -5,6 +5,7 @@
  * withheld, so the verdict cannot lean on it.
  */
 import type { Context } from "./detectors.ts";
+import type { Session } from "./model.ts";
 import { ownersAt, prOwners, prOwnership, prSide } from "./detectors.ts";
 import { pairId } from "./eval.ts";
 
@@ -56,7 +57,9 @@ export function describe(ctx: Context, sides: [string, string], at: string, owne
       return { side, kind: "pr", owner: p?.author ?? null, prsCreated: p ? [p] : [] };
     }
     const root = side.slice(5);
-    const members = [...ctx.sessions.values()].filter((s) => s.root === root);
+    // As of the alert, a session is known only once it has dated activity by then: a session that started later
+    // is not counted, and its owner is not shown.
+    const members = [...ctx.sessions.values()].filter((s) => s.root === root && (!asOf || firstSeen(s) <= at));
     const edits = members.flatMap((s) => s.edits).filter((e) => !e.hot && (!asOf || e.ts <= at));
     const counts = new Map<string, number>();
     for (const e of edits) counts.set(e.path, (counts.get(e.path) ?? 0) + 1);
@@ -64,7 +67,7 @@ export function describe(ctx: Context, sides: [string, string], at: string, owne
     files.push(new Set(edited));
     const ownedSides = asOf ? [...own.keys()].filter((k) => ownersAt(own, k, at).includes(root)) : [...owners.entries()].filter(([, r]) => r.has(root)).map(([k]) => k);
     const created = ownedSides.map((k) => prInfo(k)).filter((x): x is PrInfo => !!x);
-    const times = members.flatMap((s) => [...s.edits.map((e) => e.ts), ...s.prs.map((p) => p.ts)]).filter((t) => !asOf || t <= at).sort();
+    const times = members.flatMap((s) => [...s.edits.map((e) => e.ts), ...s.prs.filter((p) => !p.undated).map((p) => p.ts)]).filter((t) => !asOf || t <= at).sort();
     return {
       side: `work:${createHashless(root)}`, kind: "work", owner: ownerLabel(members[0]?.owner ?? null), sessions: members.length,
       active: times.length ? { from: times[0]!, to: times.at(-1)! } : undefined, prsCreated: created,
@@ -81,4 +84,10 @@ function createHashless(root: string): string {
   let h = 0;
   for (const c of root) h = (h * 31 + c.charCodeAt(0)) >>> 0;
   return h.toString(36);
+}
+
+/** When a session is first known to exist: its earliest dated fact, else its directory creation time. */
+function firstSeen(s: Session): string {
+  const ts = [...s.edits.map((e) => e.ts), ...s.prs.filter((p) => !p.undated).map((p) => p.ts), ...s.branches.map((b) => b.ts), ...s.shas.map((x) => x.ts), ...s.received.map((r) => r.ts)];
+  return ts.length ? ts.reduce((a, b) => (a < b ? a : b)) : s.startedAt;
 }

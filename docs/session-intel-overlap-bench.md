@@ -17,7 +17,7 @@ All harvested data, labels, verdicts and bundles stay outside this repository. T
 
 Events stamped before 2025 or with unparseable times are dropped.
 
-**PR ownership.** A root owns a PR only when it created it or created or pushed its head branch, and only from that call's time (`prOwnership`). A `gh pr create` call usually has no number; the first full PR URL within 10 minutes after it claims the number. A root that only names a PR (a view, a review, a merge, a merge train listing it) does not own it. Otherwise one reviewer touching two PRs would make both look like one line of work. Detectors and as-of bundles ask who owned a PR as of the alert (`ownersAt`). Only scoring and hindsight adjudication use every owner a PR ever had.
+**PR ownership.** A root owns a PR only when it created it or created or pushed its head branch, and only from the time that became known (`prOwnership`). A `gh pr create` call usually has no number. Only the call's own result may claim one: the first tool result after the call, within 10 minutes, not failed, that prints a full PR URL. The PR is then owned from that result's time. Any other event ends the wait, so a later, unrelated URL is never claimed. An unresolved call stays an act of opening a PR that owns nothing. A root that only names a PR (a view, a review, a merge, a merge train listing it) does not own it. Otherwise one reviewer touching two PRs would make both look like one line of work. Detectors and as-of bundles ask who owned a PR as of the alert (`ownersAt`). Only scoring and hindsight adjudication use every owner a PR ever had.
 
 **Observed paths.** `git status` and `--stat` output list what is dirty or changed, not what this session wrote. `ObservedPolicy` sets how they count:
 
@@ -44,7 +44,7 @@ A **side** is a work root (`root:<session key>`) or a pull request (`pr:<owner/r
 | D3 `concurrent` | Two roots edit the same uncommon paths in one repository within `windowH` hours. A path that more than `maxRootsPerPath` roots have edited is treated as hot. |
 | `outcome-facts` | The shipped detector, run unchanged over the same evidence mapped onto its `LaneFacts` (`baseline.ts`) |
 
-**Dated evidence only.** Every detector reads only what is dated before its alert. For D1 this means a PR's final file list is never used, because it is known only in hindsight. What a PR is working on at time t is the set of paths its owners (as of t) had edited before t, and `maxPrFiles` applies to that set. A PR with no owning root gives D1 no evidence.
+**Dated evidence only.** Every detector reads only what is dated before its alert. A directory row's PR field is known only as fetched; scoring may link through it, but detectors never read it. For D1 this means a PR's final file list is never used, because it is known only in hindsight. What a PR is working on at time t is the set of paths its owners (as of t) had edited before t, and `maxPrFiles` applies to that set. A PR with no owning root gives D1 no evidence.
 
 D3's score sums each shared path's rarity, which is 1 over the number of roots that had edited the path by then. Lines meeting on files few others touch outrank lines meeting on a common file.
 
@@ -83,9 +83,13 @@ With `asOf`, the bundle carries dated facts only, as a live system would have kn
 
 - the PRs that existed and that the side owned by then, with their author and creation time;
 - comments made before the alert (each comment is dated);
-- the side's own branches, edits and activity up to then.
+- the side's own branches, edits and activity up to then, counting only the sessions with dated activity by then.
 
 A PR's title, description and file list are left out, and so are merges and closes. They are known only as fetched, so a later edit would leak hindsight. A judge that reads intent from as-of bundles therefore reads it from branches, edits and dated comments.
+
+**Prefix invariance.** A test runs every detector, the ranker and as-of bundles over a synthetic world and over the same world cut at several times T. Everything said about T must be identical in both. It fails if bundles count later sessions, or if D1 uses ownership established after its alert.
+
+**Harvest scopes.** `loadContext` reads each harvest's manifest. Merged harvests must be of one workspace, and none may be past its delete-by. Every input (harvest, forge, labels, verdicts, owner labels, frozen file) and every output must pass the same private-destination checks as the harvest.
 
 ## Protocol
 
@@ -102,7 +106,7 @@ A PR's title, description and file list are left out, and so are merges and clos
 
 ## Findings so far (dev split)
 
-These come from a Jul 28 → Nov 5 harvest of one workspace: about 5.2M events, with no read errors.
+These come from a Jul 28 → Nov 5 harvest of one workspace: about 5.2M events, with no read errors. All of it is dev split only; nothing here is a held-out result.
 
 **Status: provisional, pending a rerun.** The figures below were produced by revision 144b4ab2, before the review round that added the window, path and dated-evidence rules above. That revision had these known problems:
 - D1 used final PR file lists;

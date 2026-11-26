@@ -188,7 +188,7 @@ export function sharedTrigger(ctx: Context, p: SharedTriggerParams): Alert[] {
   const actsAfter = new Map<string, Array<{ root: string; at: string; owner: string | null }>>();
   const byRoot = rootsOf(ctx);
   for (const [root, members] of byRoot) {
-    const refs = members.flatMap((s) => s.prs.filter((x) => x.repo && x.number > 0).map((x) => ({ ...x, s })));
+    const refs = members.flatMap((s) => s.prs.filter((x) => x.repo && x.number > 0 && !x.undated).map((x) => ({ ...x, s })));
     for (const ref of refs) {
       const side = prSide(ref.repo!, ref.number);
       if (ref.action === "create" && ownersAt(own, side, ref.ts).includes(root)) continue;

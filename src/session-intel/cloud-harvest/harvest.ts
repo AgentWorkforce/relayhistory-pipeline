@@ -3,7 +3,8 @@
  * session's events reduced to derived facts. Output is append-only so a rerun resumes; nothing is ever rewritten
  * except the coverage receipt.
  */
-import { appendFileSync, existsSync, readFileSync, writeFileSync } from "node:fs";
+import { appendFileSync, existsSync } from "node:fs";
+import { assertPrivateFile, readPrivate, writePrivate } from "./private-fs.ts";
 import { join } from "node:path";
 import { type CloudClient, HarvestCap, HttpError } from "./client.ts";
 import { directoryProjection, eventFacts, informative, type EventFacts, type RawEvent } from "./features.ts";
@@ -71,7 +72,11 @@ export async function stepPastBadRow(client: CloudClient, t: string, floor: stri
  * Pages the directory newest first until `since`. A failing page is stepped over with `stepPastBadRow`, and the
  * skipped span is recorded as a gap, never silently dropped.
  */
-export async function harvestFrame(client: CloudClient, window: { since: string; until: string }, log: (m: string) => void = () => {}) {
+/** Thrown when a directory listing would exceed the approved row ceiling: nothing beyond it is read. */
+export class RowCeiling extends Error {}
+export const checkRows = (n: number, maxRows: number) => { if (n > maxRows) throw new RowCeiling(`the directory exceeds the approved ceiling of ${maxRows} rows`); };
+
+export async function harvestFrame(client: CloudClient, window: { since: string; until: string }, log: (m: string) => void = () => {}, maxRows = Number.MAX_SAFE_INTEGER) {
   const rows = new Map<string, DirectoryRow>();
   const gaps: Gap[] = [];
   let cursor: string | null = cursorAt(window.until);
@@ -96,7 +101,7 @@ export async function harvestFrame(client: CloudClient, window: { since: string;
       const ts = String(it.lastTs ?? "");
       if (ts && ts < window.since) { reachedSince = true; continue; }
       const row = directoryProjection(it, "cloud") as DirectoryRow | null;
-      if (row) rows.set(`${row.source}\u0000${row.sessionId}`, row);
+      if (row) { rows.set(`${row.source}\u0000${row.sessionId}`, row); checkRows(rows.size, maxRows); }
       if (ts) lastTs = ts;
     }
     if (pages % 25 === 0) log(`directory pages ${pages}, sessions ${rows.size}, at ${lastTs}`);
@@ -139,13 +144,14 @@ export async function harvestSession(client: CloudClient, row: DirectoryRow, win
 }
 
 /** Pages `slices` equal sub-windows concurrently and merges them; each slice records its own gaps. */
-export async function harvestFrameSliced(client: CloudClient, window: { since: string; until: string }, slices: number, log: (m: string) => void = () => {}) {
+export async function harvestFrameSliced(client: CloudClient, window: { since: string; until: string }, slices: number, log: (m: string) => void = () => {}, maxRows = Number.MAX_SAFE_INTEGER) {
   const a = Date.parse(window.since), b = Date.parse(window.until), w = (b - a) / slices;
   const parts = await Promise.all(Array.from({ length: slices }, (_, i) => harvestFrame(client, {
     since: new Date(a + i * w).toISOString(), until: new Date(i === slices - 1 ? b : a + (i + 1) * w).toISOString(),
-  }, (m) => log(`[slice ${i + 1}/${slices}] ${m}`))));
+  }, (m) => log(`[slice ${i + 1}/${slices}] ${m}`), maxRows)));
   const rows = new Map<string, DirectoryRow>();
   for (const p of parts) for (const r of p.rows) rows.set(`${r.source}\u0000${r.sessionId}`, r);
+  checkRows(rows.size, maxRows);
   return { rows: [...rows.values()], gaps: parts.flatMap((p) => p.gaps), pages: parts.reduce((n, p) => n + p.pages, 0) };
 }
 
@@ -153,6 +159,8 @@ export interface HarvestOptions {
   out: string; window: { since: string; until: string }; concurrency: number; frameSlices?: number; log?: (m: string) => void;
   /** Sessions whose project name is one of these are read first (newest first within each group). */
   priorityProjects?: string[];
+  /** The approved directory row ceiling: a listing beyond it is refused before any event is read. */
+  maxRows?: number;
   /** Sessions whose project name is one of these are not read at all, and are counted as skipped. */
   skipProjects?: string[];
   /**
@@ -169,16 +177,19 @@ export async function runHarvest(client: CloudClient, opts: HarvestOptions) {
   // The Reader's list tool reads the credential's own workspace, so the credential is attested first.
   if (opts.via === "reader-mcp") await client.attestWorkspace();
   let frame: { rows: DirectoryRow[]; gaps: Gap[]; pages: number };
-  if (existsSync(frameFile)) frame = JSON.parse(readFileSync(frameFile, "utf8"));
+  // Every file the harvest resumes from or writes must be private (private-fs.ts); the caller holds the lock.
+  for (const f of [dirFile, factsFile, frameFile, join(opts.out, "coverage.json")]) assertPrivateFile(f);
+  const maxRows = opts.maxRows ?? Number.MAX_SAFE_INTEGER;
+  if (existsSync(frameFile)) { frame = JSON.parse(readPrivate(frameFile)); checkRows(frame.rows.length, maxRows); }
   else {
     frame = opts.via === "reader-mcp"
-      ? await harvestMcpFrame(client, opts.window, log)
-      : await harvestFrameSliced(client, opts.window, Math.max(1, opts.frameSlices ?? 1), log);
-    writeFileSync(dirFile, frame.rows.map((r) => JSON.stringify(r)).join("\n") + "\n", { mode: 0o600 });
-    writeFileSync(frameFile, JSON.stringify(frame), { mode: 0o600 });
+      ? await harvestMcpFrame(client, opts.window, log, maxRows)
+      : await harvestFrameSliced(client, opts.window, Math.max(1, opts.frameSlices ?? 1), log, maxRows);
+    writePrivate(dirFile, frame.rows.map((r) => JSON.stringify(r)).join("\n") + "\n");
+    writePrivate(frameFile, JSON.stringify(frame));
   }
   const done = new Set<string>();
-  if (existsSync(factsFile)) for (const line of readFileSync(factsFile, "utf8").split("\n")) {
+  if (existsSync(factsFile)) for (const line of readPrivate(factsFile).split("\n")) {
     if (!line.trim()) continue;
     try { const s = JSON.parse(line) as SessionFacts; done.add(`${s.source}\u0000${s.sessionId}`); } catch { /* a torn last line is re-read */ }
   }
@@ -208,7 +219,7 @@ export async function runHarvest(client: CloudClient, opts: HarvestOptions) {
 function writeCoverage(opts: HarvestOptions, frame: { rows: DirectoryRow[]; gaps: Gap[]; pages: number }, factsFile: string, client: CloudClient, capped: boolean) {
   const bySource: Record<string, { sessions: number; read: number; events: number; informative: number; withFiles: number; censored: number; errors: number; noTranscript: number; truncated: number; outOfWindow: number }> = {};
   for (const r of frame.rows) { bySource[r.source] ??= { sessions: 0, read: 0, events: 0, informative: 0, withFiles: 0, censored: 0, errors: 0, noTranscript: 0, truncated: 0, outOfWindow: 0 }; bySource[r.source]!.sessions++; }
-  if (existsSync(factsFile)) for (const line of readFileSync(factsFile, "utf8").split("\n")) {
+  if (existsSync(factsFile)) for (const line of readPrivate(factsFile).split("\n")) {
     if (!line.trim()) continue;
     const s = JSON.parse(line) as SessionFacts & { truncated?: number }, b = bySource[s.source];
     if (!b) continue;
@@ -228,6 +239,6 @@ function writeCoverage(opts: HarvestOptions, frame: { rows: DirectoryRow[]; gaps
     frame: { pages: frame.pages, sessions: frame.rows.length, gaps: frame.gaps }, bySource, requests: client.requests,
     withheld: ["content", "summary", "shortSummary", "title", "taskTitle"],
   };
-  writeFileSync(join(opts.out, "coverage.json"), JSON.stringify(coverage, null, 2), { mode: 0o600 });
+  writePrivate(join(opts.out, "coverage.json"), JSON.stringify(coverage, null, 2));
   return coverage;
 }

@@ -123,13 +123,24 @@ describe("PR ownership", () => {
   test("a create call claims the PR whose URL its result prints; a session that only views a PR does not own it", async () => {
     const { prOwners } = await import("../overlap-bench/detectors.ts");
     const ctx = ctxOf([row("author", "K"), row("reviewer", "K")], [
-      facts("author", [fact("2026-10-01T10:00:00.000Z", { gh: ["pr-create"] }), fact("2026-10-01T10:00:05.000Z", { prRefs: ["agentworkforce/relayhistory#4083"] })]),
+      facts("author", [fact("2026-10-01T10:00:00.000Z", { gh: ["pr-create"] }), fact("2026-10-01T10:00:05.000Z", { type: "tool_result", prRefs: ["agentworkforce/relayhistory#4083"] })]),
       facts("reviewer", [fact("2026-10-01T11:00:00.000Z", { gh: ["pr-view"], prRefs: ["#4083"] }), fact("2026-10-01T11:05:00.000Z", { gh: ["pr-view"], prRefs: ["#4087"] })]),
     ], []);
-    expect(ctx.sessions.get("codex:author")!.prs).toEqual([{ ts: "2026-10-01T10:00:00.000Z", repo: "agentworkforce/relayhistory", number: 4083, action: "create" }]);
+    // Owned from the result's time, when the number became known.
+    expect(ctx.sessions.get("codex:author")!.prs).toEqual([{ ts: "2026-10-01T10:00:05.000Z", repo: "agentworkforce/relayhistory", number: 4083, action: "create" }]);
     const owners = prOwners(ctx);
     expect([...(owners.get("pr:agentworkforce/relayhistory#4083") ?? [])]).toEqual(["codex:author"]);
     expect(owners.get("pr:agentworkforce/relayhistory#4087")).toBeUndefined();
+  });
+  test("only the create call's own successful result claims a number", () => {
+    const prsOf = (events: ReturnType<typeof fact>[]) => ctxOf([row("a", "K")], [facts("a", events)], []).sessions.get("codex:a")!.prs.filter((p) => p.action === "create" && p.number > 0);
+    const call = fact("2026-10-01T10:00:00.000Z", { gh: ["pr-create"] });
+    // A failed result, then a later unrelated URL: nothing is created.
+    expect(prsOf([call, fact("2026-10-01T10:00:05.000Z", { type: "tool_result", toolStatus: "error" }), fact("2026-10-01T10:01:00.000Z", { type: "tool_result", prRefs: ["agentworkforce/relayhistory#5000"] })])).toEqual([]);
+    // Another event intervenes before any result (an assistant message naming a PR): the wait ends.
+    expect(prsOf([call, fact("2026-10-01T10:00:02.000Z", { type: "assistant", prRefs: ["agentworkforce/relayhistory#5001"] })])).toEqual([]);
+    // A result past the window does not claim.
+    expect(prsOf([call, fact("2026-10-01T10:30:00.000Z", { type: "tool_result", prRefs: ["agentworkforce/relayhistory#5002"] })])).toEqual([]);
   });
 });
 
@@ -194,13 +205,92 @@ describe("held-out freeze", () => {
     const { tmpdir } = await import("node:os");
     const { join } = await import("node:path");
     const d = mkdtempSync(join(tmpdir(), "freeze-")), h = join(d, "h"), f = join(d, "forge"), l = join(d, "labels.json");
-    mkdirSync(h); mkdirSync(join(f, "prs"), { recursive: true });
-    writeFileSync(join(h, "directory.jsonl"), "a\n"); writeFileSync(join(h, "facts.jsonl"), "b\n"); writeFileSync(join(f, "prs", "r.json"), "[]"); writeFileSync(l, "{}");
+    mkdirSync(h, { mode: 0o700 }); mkdirSync(join(f, "prs"), { recursive: true, mode: 0o700 });
+    const P = { mode: 0o600 };
+    writeFileSync(join(h, "directory.jsonl"), "a\n", P); writeFileSync(join(h, "facts.jsonl"), "b\n", P); writeFileSync(join(f, "prs", "r.json"), "[]", P); writeFileSync(l, "{}", P);
     const a = freezeTerms(h, f, l, 5);
     expect(a).toMatchObject({ perHundred: 5, split: "heldout", observed: "all" });
     writeFileSync(join(h, "facts.jsonl"), "c\n");
     expect(freezeTerms(h, f, l, 5).inputsHash).not.toBe(a.inputsHash);
     writeFileSync(l, "{ }");
     expect(freezeTerms(h, f, l, 5).labelsHash).not.toBe(a.labelsHash);
+  });
+});
+
+describe("harvest scopes", () => {
+  test("merged harvests must be of one workspace and within their delete-by", async () => {
+    const { harvestScopes } = await import("../overlap-bench/cli.ts");
+    const { mkdtempSync, writeFileSync } = await import("node:fs");
+    const { tmpdir } = await import("node:os");
+    const { join } = await import("node:path");
+    const mk = (workspace: string, deleteBy: string) => {
+      const d = mkdtempSync(join(tmpdir(), "scope-"));
+      writeFileSync(join(d, "manifest.json"), JSON.stringify({ params: { workspace, since: "2026-09-01T00:00:00Z", until: "2026-10-01T00:00:00Z", deleteBy } }), { mode: 0o600 });
+      return d;
+    };
+    const a = mk("w1", "2026-12-09T00:00:00Z"), b = mk("w1", "2026-12-09T00:00:00Z"), c = mk("w2", "2026-12-09T00:00:00Z"), old = mk("w1", "2026-11-01T00:00:00Z");
+    expect(harvestScopes(`${a},${b}`, "2026-11-26T00:00:00Z").map((x) => x.workspace)).toEqual(["w1", "w1"]);
+    expect(() => harvestScopes(`${a},${c}`, "2026-11-26T00:00:00Z")).toThrow("different workspaces");
+    expect(() => harvestScopes(old, "2026-11-26T00:00:00Z")).toThrow("past its delete-by");
+  });
+});
+
+describe("prefix invariance", () => {
+  // Two lines converge on one file around a PR; the world then keeps going. Anything a detector or an as-of bundle
+  // says about time T must be the same whether or not the world after T exists.
+  const world = {
+    rows: [row("a", "K"), row("b", "W"), row("c", "W", { createdAt: "2026-09-02T05:00:00.000Z" }), row("d", "W")],
+    facts: [
+      facts("a", [
+        fact("2026-09-01T10:00:00.000Z", { kind: "tool_call", gh: ["pr-create"] }),
+        fact("2026-09-01T10:00:04.000Z", { type: "tool_result", prRefs: ["agentworkforce/relayhistory#93"] }),
+        fact("2026-09-01T10:30:00.000Z", { touched: [{ path: "src/x.ts", via: "patch" }, { path: "src/y.ts", via: "patch" }] }),
+        fact("2026-09-01T13:00:00.000Z", { touched: [{ path: "src/z.ts", via: "patch" }] }),
+      ]),
+      facts("b", [
+        fact("2026-09-01T11:00:00.000Z", { prRefs: ["agentworkforce/relayhistory#93"] }),
+        fact("2026-09-01T11:30:00.000Z", { touched: [{ path: "src/x.ts", via: "patch" }] }),
+        fact("2026-09-01T12:30:00.000Z", { touched: [{ path: "src/y.ts", via: "patch" }, { path: "src/z.ts", via: "patch" }] }),
+        fact("2026-09-01T12:40:00.000Z", { kind: "tool_call", gh: ["pr-create"] }),
+        fact("2026-09-01T12:40:03.000Z", { type: "tool_result", prRefs: ["agentworkforce/relayhistory#94"] }),
+      ]),
+      facts("c", [fact("2026-09-02T06:00:00.000Z", { prRefs: ["agentworkforce/relayhistory#93"], touched: [{ path: "src/x.ts", via: "patch" }] })]),
+      // d edits a file of PR 93 while it is open, and only later takes the PR over (pushes its head branch).
+      facts("d", [fact("2026-09-01T11:45:00.000Z", { touched: [{ path: "src/x.ts", via: "patch" }] }), fact("2026-09-01T13:00:00.000Z", { kind: "tool_call", branches: ["b93"] })]),
+    ],
+    prs: [
+      pr(93, "a", { createdAt: "2026-09-01T10:00:02.000Z", mergedAt: "2026-09-01T14:00:00.000Z", files: ["src/x.ts", "src/y.ts", "src/z.ts", "src/w.ts"], comments: [{ author: "r", at: "2026-09-01T11:10:00.000Z", body: "early" }, { author: "r", at: "2026-09-01T13:30:00.000Z", body: "late" }] }),
+      pr(94, "b", { createdAt: "2026-09-01T12:40:01.000Z", closedAt: "2026-09-01T15:00:00.000Z", files: ["src/x.ts"] }),
+    ],
+  };
+  const cut = (T: string) => ({
+    rows: world.rows.filter((r) => String(r.createdAt) <= T),
+    facts: world.facts.map((f) => ({ ...f, events: f.events.filter((e) => e.ts <= T) })),
+    prs: world.prs.filter((p) => p.createdAt <= T).map((p) => ({ ...p, mergedAt: p.mergedAt && p.mergedAt <= T ? p.mergedAt : null, closedAt: p.closedAt && p.closedAt <= T ? p.closedAt : null, comments: (p.comments ?? []).filter((c) => c.at <= T) })),
+  });
+  const ctxFrom = (w: { rows: DirectoryRow[]; facts: SessionFacts[]; prs: ForgePr[] }) => ctxOf(w.rows, w.facts, w.prs);
+  const key = (a: { detector: string; sides: string[]; at: string; score: number }) => `${a.detector} ${a.sides.join(",")} ${a.at} ${a.score}`;
+
+  test("every detector's alerts up to T, and every as-of bundle at T, ignore the world after T", async () => {
+    const { components, rank } = await import("../overlap-bench/ranker.ts");
+    const { describe: describePair } = await import("../overlap-bench/bundle.ts");
+    const run = (c: Context) => {
+      const comps = components(c);
+      return [
+        ...openPrOverlap(c, { minShared: 1, maxPrFiles: 30, skipHot: true, suppressCommunicated: true }),
+        ...sharedTrigger(c, { windowMin: 240, requireEdit: false, suppressCommunicated: true }),
+        ...concurrentEdits(c, { windowH: 6, minShared: 1, maxRootsPerPath: 8, skipHot: true, crossOwnerOnly: false, suppressCommunicated: true }),
+        ...rank(c, comps, { wOpenPr: 1, wTrigger: 1, wRarity: 1, rarityCap: 3, wAgree: 0, wCrossOwner: 0, threshold: 0.5 }),
+      ];
+    };
+    const full = run(ctxFrom(world));
+    expect(full.length).toBeGreaterThan(0);
+    for (const T of ["2026-09-01T11:00:00.000Z", "2026-09-01T11:30:00.000Z", "2026-09-01T12:35:00.000Z", "2026-09-01T12:41:00.000Z", "2026-09-01T13:45:00.000Z"]) {
+      const part = run(ctxFrom(cut(T)));
+      expect(part.filter((a) => a.at <= T).map(key).sort()).toEqual(full.filter((a) => a.at <= T).map(key).sort());
+      for (const sides of [["root:codex:a", "root:codex:b"], ["root:codex:b", "pr:agentworkforce/relayhistory#93"], ["root:codex:a", "root:codex:c"]] as Array<[string, string]>) {
+        expect(describePair(ctxFrom(cut(T)), sides, T, () => "member", true)).toEqual(describePair(ctxFrom(world), sides, T, () => "member", true));
+      }
+    }
   });
 });

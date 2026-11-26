@@ -12,7 +12,7 @@
  */
 import { type CloudClient, HarvestCap, HttpError, McpToolError } from "./client.ts";
 import { directoryProjection, eventFacts, informative, type RawEvent } from "./features.ts";
-import { type DirectoryRow, type Gap, inWindow, type SessionFacts, type Window } from "./harvest.ts";
+import { checkRows, type DirectoryRow, type Gap, inWindow, type SessionFacts, type Window } from "./harvest.ts";
 
 const LIST_PAGE = 50;
 const EVENTS_PAGE = 50;
@@ -50,17 +50,23 @@ export const rawEventOf = (e: McpEvent): RawEvent => ({
  * applied: `last_active` is a session's latest activity, so a session that worked in the window and again later
  * would be lost (event times bound the analysis instead). Pages may be short or empty and still continue.
  */
-export async function harvestMcpFrame(client: CloudClient, window: { since: string; until: string }, log: (m: string) => void = () => {}) {
+/** Every response names its workspace; one that names another (a misrouted answer) is refused before projection. */
+function sameWorkspace(client: CloudClient, body: Record<string, unknown>) {
+  if (body.workspace_id !== client.workspaceId) throw new Error("a shared-sessions response named a different workspace (or none)");
+}
+
+export async function harvestMcpFrame(client: CloudClient, window: { since: string; until: string }, log: (m: string) => void = () => {}, maxRows = Number.MAX_SAFE_INTEGER) {
   const rows = new Map<string, DirectoryRow>();
   const gaps: Gap[] = [];
   let cursor: string | undefined, pages = 0;
   do {
     const page = await client.callTool("list_session_summaries", { since: window.since, limit: LIST_PAGE, ...(cursor ? { cursor } : {}) });
     pages++;
+    sameWorkspace(client, page);
     for (const r of (page.sessions ?? []) as SummaryRow[]) {
       if (!r.session_id || !r.source || (r.last_active && r.last_active < window.since)) continue;
       const row = directoryRowOf(r);
-      if (row) rows.set(`${row.source}\u0000${row.sessionId}`, row);
+      if (row) { rows.set(`${row.source}\u0000${row.sessionId}`, row); checkRows(rows.size, maxRows); }
     }
     cursor = typeof page.next_cursor === "string" && page.next_cursor ? page.next_cursor : undefined;
     if (pages % 25 === 0) log(`reader directory pages ${pages}, sessions ${rows.size}`);
@@ -83,6 +89,7 @@ export async function harvestMcpSession(client: CloudClient, row: DirectoryRow, 
       if (e instanceof HttpError) { out.error = `http_${e.status}`; break; }
       throw e;
     }
+    sameWorkspace(client, body);
     const events = (body.events ?? []) as McpEvent[];
     let past = false;
     for (const e of events) {

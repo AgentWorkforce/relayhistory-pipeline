@@ -8,7 +8,8 @@ import { HOT_PATH, repoOf, repoRelative } from "./paths.ts";
 
 /** `repo` is the edit's own repository: taken from an absolute path when it names one, else the session's. */
 export interface Edit { ts: string; repo: string; path: string; via: string; hot: boolean }
-export interface PrRef { ts: string; repo: string | null; number: number; action: "create" | "mention" }
+/** `undated` marks a ref known only as fetched (the directory row's PR); scoring may link through it, detectors never read it. */
+export interface PrRef { ts: string; repo: string | null; number: number; action: "create" | "mention"; undated?: true }
 export interface Message { ts: string; from: string; to: string }
 
 export interface Session {
@@ -55,6 +56,11 @@ export const EARLIEST_TS = "2025-01-01T00:00:00.000Z";
 export type ObservedPolicy = "all" | "fresh" | "none";
 const OBSERVED = new Set(["status", "stat"]);
 
+function pushMention(s: Session, ref: string, ts: string) {
+  const m = PR_KEY.exec(ref);
+  if (m) s.prs.push({ ts, repo: m[1] ? m[1].toLowerCase() : s.repo?.toLowerCase() ?? null, number: Number(m[2]), action: "mention" });
+}
+
 function fromFacts(s: Session, events: EventFacts[], observed: ObservedPolicy) {
   let pendingCreate: { ts: string; index: number } | null = null;
   let baseline: Set<string> | null = null;
@@ -74,22 +80,31 @@ function fromFacts(s: Session, events: EventFacts[], observed: ObservedPolicy) {
     }
     if (first) baseline = new Set(seen);
     const creates = e.gh.includes("pr-create");
-    if (pendingCreate && Date.parse(e.ts) - Date.parse(pendingCreate.ts) > CREATE_RESULT_MS) pendingCreate = null;
-    for (const ref of e.prRefs) {
-      const m = PR_KEY.exec(ref);
-      if (!m) continue;
-      const repo = m[1] ? m[1].toLowerCase() : s.repo?.toLowerCase() ?? null;
-      // The first full PR URL after a create call is the PR it created; it replaces the placeholder.
-      if (!creates && pendingCreate && m[1]) {
-        s.prs[pendingCreate.index] = { ts: s.prs[pendingCreate.index]!.ts, repo, number: Number(m[2]), action: "create" };
-        pendingCreate = null;
-        continue;
+    // A create call usually names no number; its own result does. Only the first tool result after the call,
+    // within CREATE_RESULT_MS and not failed, may claim the number, and the PR is owned from that result's time
+    // (when the number became known). Any other event ends the wait, so a later, unrelated URL is never claimed.
+    // An unresolved call stays as a placeholder (number -1): an act of opening a PR, owning nothing. A failed
+    // result removes it.
+    const isResult = e.type === "tool_result" || e.role === "tool_result";
+    if (pendingCreate && (Date.parse(e.ts) - Date.parse(pendingCreate.ts) > CREATE_RESULT_MS || (!isResult && !creates))) pendingCreate = null;
+    if (pendingCreate && isResult) {
+      const url = e.prRefs.map((r) => PR_KEY.exec(r)).find((m) => m?.[1]);
+      const failed = /error|fail/i.test(e.toolStatus ?? "");
+      if (url && !failed) s.prs[pendingCreate.index] = { ts: e.ts, repo: url[1]!.toLowerCase(), number: Number(url[2]), action: "create" };
+      else if (failed) s.prs.splice(pendingCreate.index, 1);
+      pendingCreate = null;
+      for (const ref of e.prRefs) if (ref !== url?.[0]) pushMention(s, ref, e.ts);
+    } else {
+      for (const ref of e.prRefs) {
+        const m = PR_KEY.exec(ref);
+        if (!m) continue;
+        // A create call that names its PR (rare) owns it from the call.
+        s.prs.push({ ts: e.ts, repo: m[1] ? m[1].toLowerCase() : s.repo?.toLowerCase() ?? null, number: Number(m[2]), action: creates ? "create" : "mention" });
       }
-      s.prs.push({ ts: e.ts, repo, number: Number(m[2]), action: creates ? "create" : "mention" });
-    }
-    if (creates && !e.prRefs.length) {
-      s.prs.push({ ts: e.ts, repo: s.repo?.toLowerCase() ?? null, number: -1, action: "create" });
-      pendingCreate = { ts: e.ts, index: s.prs.length - 1 };
+      if (creates && !e.prRefs.length) {
+        s.prs.push({ ts: e.ts, repo: s.repo?.toLowerCase() ?? null, number: -1, action: "create" });
+        pendingCreate = { ts: e.ts, index: s.prs.length - 1 };
+      }
     }
     for (const b of e.branches) s.branches.push({ ts: e.ts, name: b });
     for (const sha of e.shas) s.shas.push({ ts: e.ts, sha: sha.toLowerCase() });
@@ -109,7 +124,7 @@ export function buildModel(rows: DirectoryRow[], facts: SessionFacts[], observed
       startedAt: String(r.createdAt ?? r.lastTs), lastTs: r.lastTs, edits: [], prs: [], branches: [], shas: [], received: [], names: new Set(),
     });
     const pr = r.pullRequest as { url?: string; number?: string | number } | null;
-    if (pr?.number) sessions.get(key)!.prs.push({ ts: r.lastTs, repo: repoOf(pr.url ?? null)?.toLowerCase() ?? null, number: Number(pr.number), action: "mention" });
+    if (pr?.number) sessions.get(key)!.prs.push({ ts: r.lastTs, repo: repoOf(pr.url ?? null)?.toLowerCase() ?? null, number: Number(pr.number), action: "mention", undated: true });
   }
   for (const f of facts) {
     const s = sessions.get(sessionKey(f.source, f.sessionId));
