@@ -4,6 +4,8 @@
  * command; every later command on the same directory (resumes, other collectors, seal) must name the same scope,
  * and nothing runs past the delete-by date.
  */
+import { createHash } from "node:crypto";
+import { readdirSync } from "node:fs";
 import type { PrivateDir } from "../out-path.ts";
 
 export const SCOPE_FORMAT = "relayfacts-scope/1";
@@ -34,33 +36,39 @@ function check(s: CollectionScope, now: Date): void {
   if (!s.orgId || !s.workspaceId || !s.repos.length) throw new ScopeError("scope: tenant and repositories are required");
 }
 
+/** The scope's id: the sha256 of its stored bytes. Every collected row carries it; seal admits no other row. */
+export const scopeId = (stored: string) => createHash("sha256").update(stored).digest("hex");
+
 /**
- * Bind `dir` to `want`: create scope.json when absent (deleteBy required), else require the same tenant,
- * repositories and window (and the same deleteBy when one is given). Returns the bound scope.
+ * Bind `dir` to `want`. The first bind needs an empty directory and creates scope.json exclusively (a concurrent,
+ * incompatible initialisation fails); later binds must name exactly the same tenant, repositories and window (and
+ * the same deleteBy when one is given). Returns the scope and its id.
  */
-export function bindScope(dir: PrivateDir, want: Omit<CollectionScope, "format" | "deleteBy"> & { deleteBy?: string }, now: Date = new Date()): CollectionScope {
+export function bindScope(dir: PrivateDir, want: Omit<CollectionScope, "format" | "deleteBy"> & { deleteBy?: string }, now: Date = new Date()): CollectionScope & { id: string } {
   const repos = [...new Set(want.repos)].sort();
-  if (dir.has("scope.json")) {
-    const have = JSON.parse(dir.read("scope.json")) as CollectionScope;
-    if (have.format !== SCOPE_FORMAT) throw new ScopeError("scope.json: unknown format");
-    const same = have.orgId === want.orgId && have.workspaceId === want.workspaceId && have.since === want.since && have.until === want.until
-      && JSON.stringify([...have.repos].sort()) === JSON.stringify(repos) && (want.deleteBy === undefined || want.deleteBy === have.deleteBy);
-    if (!same) throw new ScopeError("this directory was collected for another scope (tenant, repositories, window or delete-by)");
-    check(have, now);
-    return have;
+  if (!dir.has("scope.json")) {
+    if (readdirSync(dir.path).length) throw new ScopeError("scope: a new collection needs an empty --out directory");
+    if (!want.deleteBy) throw new ScopeError("--delete-by is required before collecting");
+    const scope: CollectionScope = { format: SCOPE_FORMAT, orgId: want.orgId, workspaceId: want.workspaceId, repos, since: want.since, until: want.until, deleteBy: want.deleteBy };
+    check(scope, now);
+    try { dir.create("scope.json", JSON.stringify(scope, null, 2)); } catch { throw new ScopeError("scope: another collection initialised this directory first"); }
   }
-  if (!want.deleteBy) throw new ScopeError("--delete-by is required before collecting");
-  const scope: CollectionScope = { format: SCOPE_FORMAT, orgId: want.orgId, workspaceId: want.workspaceId, repos, since: want.since, until: want.until, deleteBy: want.deleteBy };
-  check(scope, now);
-  dir.write("scope.json", JSON.stringify(scope, null, 2));
-  return scope;
+  const stored = dir.read("scope.json");
+  const have = JSON.parse(stored) as CollectionScope;
+  if (have.format !== SCOPE_FORMAT) throw new ScopeError("scope.json: unknown format");
+  const same = have.orgId === want.orgId && have.workspaceId === want.workspaceId && have.since === want.since && have.until === want.until
+    && JSON.stringify([...have.repos].sort()) === JSON.stringify(repos) && (want.deleteBy === undefined || want.deleteBy === have.deleteBy);
+  if (!same) throw new ScopeError("this directory was collected for another scope (tenant, repositories, window or delete-by)");
+  check(have, now);
+  return { ...have, id: scopeId(stored) };
 }
 
 /** The bound scope of an existing collection (seal), checked for retention; tenant-free callers use this. */
-export function readScope(dir: PrivateDir, now: Date = new Date()): CollectionScope {
+export function readScope(dir: PrivateDir, now: Date = new Date()): CollectionScope & { id: string } {
   if (!dir.has("scope.json")) throw new ScopeError("no scope.json: collect with a bound scope first");
-  const have = JSON.parse(dir.read("scope.json")) as CollectionScope;
+  const stored = dir.read("scope.json");
+  const have = JSON.parse(stored) as CollectionScope;
   if (have.format !== SCOPE_FORMAT) throw new ScopeError("scope.json: unknown format");
   check(have, now);
-  return have;
+  return { ...have, id: scopeId(stored) };
 }

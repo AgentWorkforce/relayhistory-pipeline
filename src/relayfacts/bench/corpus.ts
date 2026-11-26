@@ -12,7 +12,8 @@
  * unknown field, and anything over its bounds. It never writes.
  */
 import { createHash } from "node:crypto";
-import { lstatSync, readFileSync } from "node:fs";
+import { readPrivateBytes } from "../out-path.ts";
+import { UsageError } from "../errors.ts";
 import { join } from "node:path";
 import type { SessionAnalysisSnapshot } from "../../session-analysis/engine/session-analysis-result.ts";
 import type { ForgeFacts, SessionContext } from "../features/types.ts";
@@ -56,15 +57,12 @@ const iso = (v: unknown) => typeof v === "string" && Number.isFinite(Date.parse(
 
 function readFile(dir: string, name: string): Buffer {
   if (!/^[a-z][a-z0-9_.-]{0,63}$/u.test(name) || name.includes("..")) throw new CorpusError(`bad file name: ${name}`);
-  const path = join(dir, name);
-  const st = lstatSync(path);
-  if (!st.isFile() || st.isSymbolicLink()) throw new CorpusError(`${name}: not a regular file`);
-  if (st.size > CORPUS_BOUNDS.fileBytes) throw new CorpusError(`${name}: over ${CORPUS_BOUNDS.fileBytes} bytes`);
-  return readFileSync(path);
+  // Opened without following a link; the descriptor must be a private regular file (out-path.ts).
+  try { return readPrivateBytes(join(dir, name), CORPUS_BOUNDS.fileBytes); } catch (error) { throw new CorpusError(`${name}: ${error instanceof UsageError ? error.message : "unreadable"}`); }
 }
 
 function only(obj: Record<string, unknown>, allowed: string[], where: string) {
-  for (const k of Object.keys(obj)) if (!allowed.includes(k)) throw new CorpusError(`${where}: unknown field ${k}`);
+  for (const k of Object.keys(obj)) if (!allowed.includes(k)) throw new CorpusError(`${where}: unknown field`);
 }
 
 export function parseForge(raw: unknown): ForgeFacts {
@@ -77,7 +75,9 @@ export function parseForge(raw: unknown): ForgeFacts {
     if (typeof p.ref !== "string" || !["open", "merged", "closed"].includes(p.state as string) || !iso(p.at)) throw new CorpusError("forge.json: bad pr");
   }
   for (const c of f.commits as Record<string, unknown>[]) {
-    only(c, ["sha", "at", "onDefaultBranch", "revertedBy", "revertedAt"], "forge.json commit");
+    only(c, ["sha", "at", "onDefaultBranch", "defaultAt", "defaultAtBasis", "revertedBy", "revertedAt"], "forge.json commit");
+    if (c.defaultAtBasis !== undefined && !["merge", "patch", "committer"].includes(c.defaultAtBasis as string)) throw new CorpusError("forge.json: bad commit");
+    if (c.defaultAt !== undefined && c.defaultAt !== null && !iso(c.defaultAt)) throw new CorpusError("forge.json: bad commit");
     if (typeof c.sha !== "string" || !/^[0-9a-f]{7,40}$/u.test(c.sha) || !iso(c.at) || typeof c.onDefaultBranch !== "boolean") throw new CorpusError("forge.json: bad commit");
   }
   for (const g of f.flags as Record<string, unknown>[]) {

@@ -13,7 +13,8 @@ import { outsideDir, PrivateDir, REPO_ROOT, writeOutsideFile } from "../out-path
 import { bindScope, readScope } from "../backfill/scope.ts";
 import { errorCode, fileName, scopedSessions } from "../backfill/cli.ts";
 import { buildFeatures } from "../features/build.ts";
-import { lstatSync, readFileSync, statSync } from "node:fs";
+import { closeSync, linkSync, lstatSync, openSync, readdirSync, readFileSync, statSync, writeSync } from "node:fs";
+import { DEFAULT_LINK_PARAMS } from "../features/link.ts";
 import type { SessionFacts } from "../features/types.ts";
 
 const tmp = mkdtempSync(join(tmpdir(), "relayfacts-bounds-"));
@@ -59,13 +60,13 @@ describe("corpus refusals", () => {
     mkdirSync(dir, { recursive: true });
     const sessions = `${over.line ?? ""}\n`;
     const forge = JSON.stringify({ prs: [], commits: [], flags: [] });
-    writeFileSync(join(dir, "sessions.jsonl"), sessions);
-    writeFileSync(join(dir, "forge.json"), forge);
+    writeFileSync(join(dir, "sessions.jsonl"), sessions, { mode: 0o600 });
+    writeFileSync(join(dir, "forge.json"), forge, { mode: 0o600 });
     writeFileSync(join(dir, "manifest.json"), JSON.stringify({
       format: CORPUS_FORMAT, repo: "example/widgets", window: { since: "2026-10-01T00:00:00Z", until: "2026-11-01T00:00:00Z" },
       createdAt: "2026-11-01T00:00:00Z", deleteBy: over.deleteBy ?? "2026-11-20T00:00:00Z",
       files: { "sessions.jsonl": over.sessionsSha ?? sha256Hex(sessions), "forge.json": sha256Hex(forge) }, ...(over.extra ? { note: "x" } : {}),
-    }));
+    }), { mode: 0o600 });
     return dir;
   };
   const now = new Date("2026-11-05T00:00:00Z");
@@ -98,28 +99,37 @@ describe("build evidence", () => {
   });
   test("only the successful result paired with the session's own gh pr create is built", () => {
     // Shaped like session-evidence.ts: the call reference's id is the call id; its own toolCallId is null.
-    const call = { ...ref("k1", "tool-call", "Bash", "gh pr create --fill"), toolCallId: null };
+    const call = { ...ref("k1", "tool-call", "Bash", JSON.stringify({ command: "cd repo && gh pr create --fill" })), toolCallId: null };
     const paired = { ...ref("r1", "tool-result", "ok", "https://github.com/example/widgets/pull/9"), toolCallId: "k1", isError: false };
     expect(extractSessionFacts(snap([call, paired])).built.filter((b) => b.kind === "pr").map((b) => b.ref)).toEqual(["https://github.com/example/widgets/pull/9"]);
     // Adjacent but another call's result, a failed result, or a result whose summary only names the command: not built.
-    const otherCall = { ...ref("k2", "tool-call", "Bash", "gh pr list"), toolCallId: null };
-    for (const [c, r] of [[call, { ...paired, toolCallId: "k2" }], [call, { ...paired, isError: true }], [call, { ...paired, toolCallId: null, summary: "gh pr create" }], [{ ...call, isError: true }, paired]] as const) {
+    const otherCall = { ...ref("k2", "tool-call", "Bash", JSON.stringify({ command: "gh pr list" })), toolCallId: null };
+    // Calls that only mention the command: quoted, in a comment, in a non-shell tool, or truncated.
+    const echo = { ...call, detail: JSON.stringify({ command: 'echo "gh pr create" && gh pr list' }) };
+    const comment = { ...call, detail: JSON.stringify({ command: "gh pr list # then gh pr create" }) };
+    const notShell = { ...call, summary: "Read" };
+    const truncated = { ...call, truncated: true };
+    for (const [c, r] of [[call, { ...paired, toolCallId: "k2" }], [call, { ...paired, isError: true }], [call, { ...paired, toolCallId: null, summary: "gh pr create" }], [{ ...call, isError: true }, paired], [echo, paired], [comment, paired], [notShell, paired], [truncated, paired]] as const) {
       const f = extractSessionFacts(snap([c, otherCall, r]));
       expect(f.built.filter((b) => b.kind === "pr")).toEqual([]);
       expect(f.keys.prs).toEqual(["https://github.com/example/widgets/pull/9"]);
     }
   });
   test("transcript artifacts: a created PR versus a listed one; tag pushes are not branches", () => {
-    const ev = (id: string, type: string, content: string, payload: Record<string, unknown> = {}) => ({ table: "convergence_events", row: { event_id: id, ts: "2026-11-10T10:00:00Z", type, content, record: { payload } } });
+    const ev = (id: string, type: string, content: string, payload: Record<string, unknown> = {}, toolCalls?: unknown[]) => ({ table: "convergence_events", row: { event_id: id, ts: "2026-11-10T10:00:00Z", type, content, record: { payload }, ...(toolCalls ? { tool_calls: toolCalls } : {}) } });
+    const call = (id: string, command: string, name = "Bash") => ev(`c-${id}`, "tool_call", command, { tool_use_id: id }, [{ name, args: { command }, toolUseId: id, isError: false }]);
     const art = extractArtifacts([
-      ev("1", "tool_call", "gh pr list", { tool_use_id: "u1" }), ev("2", "tool_result", "https://github.com/example/widgets/pull/1", { tool_use_id: "u1" }),
-      ev("3", "tool_call", "gh pr create --fill", { tool_use_id: "u3" }), ev("4", "tool_result", "https://github.com/example/widgets/pull/2", { tool_use_id: "u3", result_status: "success" }),
+      call("u1", "gh pr list"), ev("2", "tool_result", "https://github.com/example/widgets/pull/1", { tool_use_id: "u1" }),
+      call("u3", "gh pr create --fill"), ev("4", "tool_result", "https://github.com/example/widgets/pull/2", { tool_use_id: "u3", result_status: "success" }),
       // adjacency to a create call proves nothing: another call's result, and a failed paired result
-      ev("5", "tool_call", "gh pr create --fill", { tool_use_id: "u5" }), ev("6", "tool_result", "https://github.com/example/widgets/pull/3", { tool_use_id: "zz" }),
-      ev("7", "tool_call", "gh pr create --fill", { tool_use_id: "u7" }), ev("8", "tool_result", "https://github.com/example/widgets/pull/4", { tool_use_id: "u7", result_status: "error" }),
-      ev("9", "tool_result", "To https://github.com/example/widgets.git\n * [new tag]         v1.2.3 -> v1.2.3\n"),
+      call("u5", "gh pr create --fill"), ev("6", "tool_result", "https://github.com/example/widgets/pull/3", { tool_use_id: "zz" }),
+      call("u7", "gh pr create --fill"), ev("8", "tool_result", "https://github.com/example/widgets/pull/4", { tool_use_id: "u7", result_status: "error" }),
+      // a call that only quotes the command, and a non-shell tool, paired with a PR URL result
+      call("u9", 'echo "gh pr create"'), ev("10", "tool_result", "https://github.com/example/widgets/pull/5", { tool_use_id: "u9" }),
+      call("u11", "gh pr create --fill", "WebFetch"), ev("12", "tool_result", "https://github.com/example/widgets/pull/6", { tool_use_id: "u11" }),
+      ev("13", "tool_result", "To https://github.com/example/widgets.git\n * [new tag]         v1.2.3 -> v1.2.3\n"),
     ], "example/widgets");
-    expect(art.prs.map((p) => [p.url.split("/").pop(), p.via])).toEqual([["1", "mention"], ["2", "created"], ["3", "mention"], ["4", "mention"]]);
+    expect(art.prs.map((p) => [p.url.split("/").pop(), p.via])).toEqual([["1", "mention"], ["2", "created"], ["3", "mention"], ["4", "mention"], ["5", "mention"], ["6", "mention"]]);
     expect(art.branches).toEqual([]);
     expect(art.pushes).toEqual([]);
   });
@@ -210,9 +220,13 @@ describe("collection scope", () => {
     expect(excluded).toEqual({ duplicate: 1, other_repo: 2, not_in_directory_window: 1, not_coding: 1, not_located: 1 });
   });
   test("log lines carry fixed codes, never messages", () => {
-    expect(errorCode(Object.assign(new Error("password=hunter2 at host"), { code: "28P01" }))).toBe("28P01");
+    expect(errorCode(Object.assign(new Error("password=hunter2 at host"), { code: "28P01" }))).toBe("pg_28");
     expect(errorCode(new TypeError("leaked text"))).toBe("TypeError");
     expect(errorCode({ code: "has spaces and secrets" })).toBe("error");
+    // A plausible-looking but unknown value (a private name, a token) is never echoed: the set is closed.
+    expect(errorCode({ reason: "acme_internal_tenant_7" })).toBe("error");
+    expect(errorCode({ code: "ENOENT" })).toBe("ENOENT");
+    expect(errorCode({ reason: "canonical_projection_incomplete" })).toBe("canonical_projection_incomplete");
   });
 });
 
@@ -243,5 +257,171 @@ describe("strict as-of", () => {
     // An item's untimed pointer survives with the item (grounding needs it mid-session).
     const untimed: SessionFacts = { ...base, built: [{ ...base.built[0]!, evidence: [ev(null)] }] };
     expect(buildFeatures([untimed], { asOf: T })[0]!.built[0]!.evidence).toHaveLength(1);
+  });
+});
+
+describe("round-2 controls", () => {
+  const now = new Date("2026-11-26T00:00:00Z");
+  const want = { orgId: "org-a", workspaceId: "ws-a", repos: ["example/widgets", "example/gadgets"], since: "2026-10-01T00:00:00.000Z", until: "2026-11-01T00:00:00.000Z" };
+  const deleteBy = new Date(Date.now() + 10 * 86_400_000).toISOString();
+  test("a first bind needs an empty directory; a concurrent incompatible initialisation fails", () => {
+    const dir = PrivateDir.open(join(tmp, "r2-populated"));
+    dir.child("sessions").write("0".repeat(32) + ".json", "{}");
+    expect(() => bindScope(dir, { ...want, deleteBy }, now)).toThrow(/empty --out/);
+    const fresh = PrivateDir.open(join(tmp, "r2-race"));
+    fresh.create("scope.json", JSON.stringify({ format: "relayfacts-scope/1", ...want, orgId: "org-b", deleteBy }));
+    expect(() => bindScope(fresh, { ...want, deleteBy }, now)).toThrow(/another scope/);
+    expect(() => fresh.create("scope.json", "{}")).toThrow();
+  });
+  test("seal admits only rows stamped with this scope, and only the exact repository set", async () => {
+    const { main } = await import("../backfill/cli.ts");
+    const dir = PrivateDir.open(join(tmp, "r2-seal"));
+    const scope = bindScope(dir, { ...want, deleteBy });
+    const forgePath = join(tmp, "r2-forge.json");
+    writeFileSync(forgePath, JSON.stringify({ prs: [], commits: [], flags: [] }), { mode: 0o600 });
+    const sessions = dir.child("sessions");
+    const row = (scopeIdValue: string) => JSON.stringify({ scope: scopeIdValue, source: "claude", sessionId: "s1", context: {}, snapshot: { source: "claude", sessionId: "s1" } });
+    const args = (repos: string) => ["seal", "--out", dir.path, "--repo", repos, "--since", want.since, "--until", want.until, "--forge", forgePath];
+    sessions.write(fileName({ harness: "claude", sessionId: "s1" }), row("stale-scope"));
+    await expect(main(args("example/widgets,example/gadgets"))).rejects.toThrow(/not collected under this scope/);
+    sessions.write(fileName({ harness: "claude", sessionId: "s1" }), row(scope.id));
+    await expect(main(args("example/widgets"))).rejects.toThrow(/exactly/);
+    // A row whose name is not its own key's is refused too.
+    sessions.write("f".repeat(32) + ".json", row(scope.id));
+    await expect(main(args("example/widgets,example/gadgets"))).rejects.toThrow(/not collected under this scope/);
+  });
+  test("located rows from another collection, or with no scope stamp, are excluded", () => {
+    const scope = { format: "relayfacts-scope/1" as const, ...want, deleteBy, id: "scope-1" };
+    const directory = new Map([["claude\u0000s", "2026-10-10T00:00:00.000Z"]]);
+    const row = { harness: "claude", sessionId: "s", repo: "example/widgets", status: "ok" };
+    expect(scopedSessions([{ ...row, scope: "scope-1" }], scope, directory).rows).toHaveLength(1);
+    expect(scopedSessions([row, { ...row, scope: "scope-2" }], scope, directory).excluded).toEqual({ other_collection: 2 });
+  });
+  test("private reads check the opened file; writes replace atomically", () => {
+    const dir = PrivateDir.open(join(tmp, "r2-io"));
+    writeFileSync(join(dir.path, "open.json"), "{}", { mode: 0o644 });
+    expect(() => dir.read("open.json")).toThrow(/open to group or others/);
+    dir.write("a.json", "one");
+    linkSync(join(dir.path, "a.json"), join(dir.path, "alias.json"));
+    expect(() => dir.read("a.json")).toThrow(/hard links/);
+    // Replacing a file never opens it: the old inode (and its other name) keeps the old content.
+    dir.write("a.json", "two");
+    expect(dir.read("a.json")).toBe("two");
+    expect(readFileSync(join(dir.path, "alias.json"), "utf8")).toBe("one");
+    expect(statSync(join(dir.path, "a.json")).mode & 0o777).toBe(0o600);
+    expect(readdirSync(dir.path).filter((n) => n.startsWith(".tmp-"))).toEqual([]);
+    expect(lstatSync(join(dir.path, "a.json")).nlink).toBe(1);
+  });
+  test("refusal messages never echo a file's own values", () => {
+    const line = JSON.stringify({ source: "claude", sessionId: "s", context: { "private-field-name": "x" }, snapshot: { source: "claude", sessionId: "s" } });
+    const dir = join(tmp, "r2-msg");
+    mkdirSync(dir, { recursive: true, mode: 0o700 });
+    const sessions = `${line}\n`, forge = JSON.stringify({ prs: [], commits: [], flags: [] });
+    writeFileSync(join(dir, "sessions.jsonl"), sessions, { mode: 0o600 });
+    writeFileSync(join(dir, "forge.json"), forge, { mode: 0o600 });
+    writeFileSync(join(dir, "manifest.json"), JSON.stringify({ format: CORPUS_FORMAT, repo: "example/widgets", window: { since: "2026-10-01T00:00:00Z", until: "2026-11-01T00:00:00Z" }, createdAt: "2026-11-01T00:00:00Z", deleteBy: "2026-11-20T00:00:00Z", files: { "sessions.jsonl": sha256Hex(sessions), "forge.json": sha256Hex(forge) } }), { mode: 0o600 });
+    let message = "";
+    try { loadCorpus(dir, new Date("2026-11-05T00:00:00Z")); } catch (error) { message = (error as Error).message; }
+    expect(message).toMatch(/unknown field/);
+    expect(message).not.toContain("private-field-name");
+  });
+  test("a branch the mirror shows only after the cut never links an earlier replay", () => {
+    const sha = "a".repeat(40);
+    const later = { prs: [], flags: [], commits: [], branches: [{ name: "feat/later", landed: true, landedAt: "2099-01-01T00:00:00.000Z", tipAt: "2099-01-01T00:00:00.000Z", commits: [sha] }] };
+    const base = { source: "claude", analyzedAt: "2026-10-01T00:00:00.000Z", title: "t", asked: [], built: [], gaps: [], rationale: [], outcomeStatuses: [], dropped: {} };
+    const s1: SessionFacts = { ...base, sessionId: "s1", startedAt: "2026-10-01T10:00:00.000Z", endedAt: "2026-10-01T11:00:00.000Z", keys: { repo: "example/widgets", branches: ["feat/later"], prs: [], commits: [], files: [], taskRefs: [], parents: [] } };
+    const s2: SessionFacts = { ...base, sessionId: "s2", startedAt: "2026-10-01T12:00:00.000Z", endedAt: "2026-10-01T13:00:00.000Z", keys: { repo: "example/widgets", branches: [], prs: [], commits: ["aaaaaaa"], files: [], taskRefs: [], parents: [] } };
+    const built = buildFeatures([s1, s2], { asOf: "2026-11-01T00:00:00.000Z", forge: later, link: { ...DEFAULT_LINK_PARAMS, intent: false } });
+    expect(built.length).toBe(2);
+    expect(built.every((f) => f.state !== "shipped")).toBe(true);
+  });
+});
+
+describe("round-2 re-review controls", () => {
+  test("PR creation abstains on anything that could print another URL or hide what runs", async () => {
+    const { runsPrCreate, shellCommand } = await import("../features/commands.ts");
+    for (const ok of ["gh pr create --fill", "cd repo && gh pr create --title \"fix (x): y\" --body 'a; b'", "git push -u origin feat/x && gh pr create -f", "GH_TOKEN=x gh pr create -f"])
+      expect(runsPrCreate(ok)).toBe(true);
+    for (const bad of ["cat <<'EOF'\ngh pr create --fill\nhttps://github.com/o/r/pull/5\nEOF", "gh pr create --fill || gh pr view --json url", "echo \"gh pr create\"",
+      "gh pr list # gh pr create", "gh pr create --body \"$(cat b.md)\"", "gh pr create -f | tee x", "git pull && gh pr create -f", "gh pr create -f &", "gh pr create; gh pr view", "gh pr create --title \"open"])
+      expect(runsPrCreate(bad)).toBe(false);
+    expect(shellCommand("shell", { command: ["bash", "-lc", "gh pr create --fill"] })).toBe("gh pr create --fill");
+    expect(shellCommand("exec_command", { cmd: "gh pr create --fill" })).toBe("gh pr create --fill");
+    expect(shellCommand("Read", { command: "gh pr create" })).toBeNull();
+  });
+  test("an interrupted append loses only the torn line on resume", () => {
+    const dir = PrivateDir.open(join(tmp, "r3-append"));
+    dir.append("log.jsonl", `${JSON.stringify({ n: 1 })}\n`);
+    // A torn write: half a line, no newline (an interrupted earlier run).
+    const fd = openSync(join(dir.path, "log.jsonl"), "a");
+    writeSync(fd, "{\"n\":2,\"half");
+    closeSync(fd);
+    dir.append("log.jsonl", `${JSON.stringify({ n: 3 })}\n`);
+    const rows = dir.read("log.jsonl").split("\n").filter(Boolean).flatMap((l) => { try { return [JSON.parse(l)]; } catch { return []; } });
+    expect(rows).toEqual([{ n: 1 }, { n: 3 }]);
+  });
+  test("a write that fails partway keeps the old file and leaves no temporary", () => {
+    const dir = PrivateDir.open(join(tmp, "r3-write"));
+    dir.write("a.json", "old");
+    expect(() => dir.write("a.json", Symbol("not data") as unknown as string)).toThrow();
+    expect(dir.read("a.json")).toBe("old");
+    expect(readdirSync(dir.path).filter((n: string) => n.startsWith(".tmp-"))).toEqual([]);
+  });
+  test("create is exclusive and atomic: a racing initialisation fails cleanly", () => {
+    const dir = PrivateDir.open(join(tmp, "r3-race"));
+    const scope = { orgId: "org-a", workspaceId: "ws-a", repos: ["example/widgets"], since: "2026-10-01T00:00:00.000Z", until: "2026-11-01T00:00:00.000Z", deleteBy: new Date(Date.now() + 86_400_000).toISOString() };
+    // Another process creates scope.json between this bind's emptiness check and its create.
+    const create = dir.create.bind(dir);
+    (dir as unknown as { create: typeof create }).create = (name, data) => { create(name, JSON.stringify({ format: "relayfacts-scope/1", ...scope, orgId: "org-b" })); create(name, data); };
+    expect(() => bindScope(dir, scope)).toThrow(/another collection initialised/);
+    expect(JSON.parse(dir.read("scope.json")).orgId).toBe("org-b");
+  });
+  test("resume never skips an unsafe planted file: has() refuses it", () => {
+    const dir = PrivateDir.open(join(tmp, "r3-has"));
+    writeFileSync(join(dir.path, "x.json"), "{}", { mode: 0o644 });
+    expect(() => dir.has("x.json")).toThrow(/open to group or others/);
+  });
+  test("seal refuses an artifacts row from another scope", async () => {
+    const { main } = await import("../backfill/cli.ts");
+    const dir = PrivateDir.open(join(tmp, "r3-seal"));
+    const want = { orgId: "org-a", workspaceId: "ws-a", repos: ["example/widgets"], since: "2026-10-01T00:00:00.000Z", until: "2026-11-01T00:00:00.000Z" };
+    const scope = bindScope(dir, { ...want, deleteBy: new Date(Date.now() + 86_400_000).toISOString() });
+    const name = fileName({ harness: "claude", sessionId: "s1" });
+    dir.child("sessions").write(name, JSON.stringify({ scope: scope.id, source: "claude", sessionId: "s1", context: {}, snapshot: { source: "claude", sessionId: "s1" } }));
+    dir.child("artifacts").write(name, JSON.stringify({ scope: "another", artifacts: {} }));
+    const forgePath = join(tmp, "r3-forge.json");
+    writeFileSync(forgePath, JSON.stringify({ prs: [], commits: [], flags: [] }), { mode: 0o600 });
+    await expect(main(["seal", "--out", dir.path, "--repo", "example/widgets", "--since", want.since, "--until", want.until, "--forge", forgePath])).rejects.toThrow(/artifacts row was not collected under this scope/);
+  });
+  test("forge: when each commit reached the default branch, and how that is known", async () => {
+    const { execFileSync } = await import("node:child_process");
+    const { forgeFacts } = await import("../backfill/forge.ts");
+    const repo = join(tmp, "r3-git");
+    mkdirSync(repo);
+    const git = (args: string[], date: string) => execFileSync("git", ["-C", repo, ...args], { env: { ...process.env, GIT_AUTHOR_DATE: date, GIT_COMMITTER_DATE: date, GIT_AUTHOR_NAME: "t", GIT_AUTHOR_EMAIL: "t@example.invalid", GIT_COMMITTER_NAME: "t", GIT_COMMITTER_EMAIL: "t@example.invalid" }, encoding: "utf8" }).trim();
+    const commit = (file: string, date: string) => { writeFileSync(join(repo, file), file); git(["add", file], date); git(["commit", "-q", "-m", file], date); return git(["rev-parse", "HEAD"], date); };
+    git(["init", "-q", "-b", "main"], "2026-10-01T00:00:00Z");
+    commit("base.txt", "2026-10-01T00:00:00Z");
+    git(["checkout", "-q", "-b", "feat/merged"], "2026-10-02T00:00:00Z");
+    const merged = commit("merged.txt", "2026-10-02T00:00:00Z");
+    git(["checkout", "-q", "main"], "2026-10-03T00:00:00Z");
+    git(["merge", "-q", "--no-ff", "-m", "merge", "feat/merged"], "2026-10-05T00:00:00Z");
+    git(["checkout", "-q", "-b", "feat/recut"], "2026-10-06T00:00:00Z");
+    const recut = commit("recut.txt", "2026-10-06T00:00:00Z");
+    git(["checkout", "-q", "main"], "2026-10-07T00:00:00Z");
+    git(["cherry-pick", recut], "2026-10-08T00:00:00Z");
+    const direct = commit("direct.txt", "2026-10-09T00:00:00Z");
+    const facts = forgeFacts("example/widgets", repo, "2026-09-30T00:00:00Z", "2026-10-31T00:00:00Z", "main", () => []);
+    const by = (sha: string) => facts.commits.find((c) => c.sha === sha)!;
+    expect([by(merged).defaultAt, by(merged).defaultAtBasis]).toEqual(["2026-10-05T00:00:00Z", "merge"]);
+    expect([by(recut).onDefaultBranch, by(recut).defaultAtBasis]).toEqual([true, "patch"]);
+    expect(Date.parse(by(recut).defaultAt!)).toBe(Date.parse("2026-10-08T00:00:00Z"));
+    expect([by(direct).defaultAt, by(direct).defaultAtBasis]).toEqual(["2026-10-09T00:00:00Z", "committer"]);
+    // As of before the merge, the merged commit is not on the default branch yet (not a base for a session then).
+    const { withoutBaseCommits } = await import("../features/build.ts");
+    const s = { source: "claude", sessionId: "s", analyzedAt: "2026-10-04T00:00:00.000Z", startedAt: "2026-10-04T00:00:00.000Z", endedAt: "2026-10-04T01:00:00.000Z", title: "", asked: [], built: [], gaps: [], rationale: [], outcomeStatuses: [], dropped: {},
+      keys: { repo: "example/widgets", branches: [], prs: [], commits: [merged.slice(0, 7)], files: [], taskRefs: [], parents: [] } } as SessionFacts;
+    expect(withoutBaseCommits(s, facts).keys.commits).toEqual([merged.slice(0, 7)]);
+    expect(withoutBaseCommits({ ...s, startedAt: "2026-10-06T00:00:00.000Z" }, facts).keys.commits).toEqual([]);
   });
 });

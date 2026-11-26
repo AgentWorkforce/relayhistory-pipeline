@@ -34,7 +34,7 @@ const A = snap("sess-a", [
   tool("t1", "2026-11-10T10:05:00Z", "tool-call", "git checkout -b feat/upload-retry"),
   tool("t2", "2026-11-10T11:00:00Z", "tool-result", "git commit", "[feat/upload-retry 1a2b3c4d5e] Add upload retry\n 2 files changed"),
   // Shaped like session-evidence.ts: the call reference is keyed by its id, the result names it in toolCallId.
-  { ...tool("c3", "2026-11-10T11:04:00Z", "tool-call", "Bash", "gh pr create --fill"), toolCallId: null },
+  { ...tool("c3", "2026-11-10T11:04:00Z", "tool-call", "Bash", JSON.stringify({ command: "gh pr create --fill" })), toolCallId: null },
   { ...tool("t3", "2026-11-10T11:05:00Z", "tool-result", "pr created", "https://github.com/acme/widgets/pull/42"), toolCallId: "c3", isError: false },
   { id: "a1", kind: "assistant-message", at: "2026-11-10T11:06:00Z", summary: "Done." },
 ], {

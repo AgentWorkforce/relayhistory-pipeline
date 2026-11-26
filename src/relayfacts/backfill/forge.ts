@@ -46,10 +46,15 @@ export function flagDefaults(markdown: string): Map<string, boolean> {
   return out;
 }
 
-export function forgeFacts(repo: string, mirror: string, since: string, until: string, defaultBranch = "main"): ForgeFacts {
-  const prsRaw = execFileSync("gh", ["pr", "list", "-R", repo, "--state", "all", "--limit", "5000", "--search", `updated:>=${since.slice(0, 10)}`,
+/** The repository's pull requests from `gh` (the network step; tests pass their own). */
+export function ghPullRequests(repo: string, since: string): Array<Record<string, string | null>> {
+  const raw = execFileSync("gh", ["pr", "list", "-R", repo, "--state", "all", "--limit", "5000", "--search", `updated:>=${since.slice(0, 10)}`,
     "--json", "url,state,createdAt,mergedAt,closedAt,headRefName"], { encoding: "utf8", maxBuffer: 256 * 1024 * 1024 });
-  const listed = JSON.parse(prsRaw) as Array<Record<string, string | null>>;
+  return JSON.parse(raw) as Array<Record<string, string | null>>;
+}
+
+export function forgeFacts(repo: string, mirror: string, since: string, until: string, defaultBranch = "main", pullRequests: typeof ghPullRequests = ghPullRequests): ForgeFacts {
+  const listed = pullRequests(repo, since);
   if (listed.length >= 5000) throw new UsageError("gh pr list hit its 5000 limit: narrow the window");
   const prs = listed
     .filter((p) => (p.createdAt ?? "") < until)
@@ -59,12 +64,29 @@ export function forgeFacts(repo: string, mirror: string, since: string, until: s
       at: String(p.createdAt), mergedAt: p.mergedAt ?? null, closedAt: p.closedAt ?? null, branch: p.headRefName ?? null,
     }));
   const onDefault = new Set(git(mirror, ["rev-list", `--since=${since}`, `--until=${until}`, defaultBranch]).split("\n").filter(Boolean));
+  // When each commit reached the default branch, and how that time is known (`defaultAtBasis`):
+  // - `merge`: a commit a first-parent merge brought in, at that merge's committer time;
+  // - `patch`: a branch commit whose patch landed as a default-branch commit, at that copy's time (set below);
+  // - `committer`: a first-parent commit itself (a squash, a direct push, a fast-forward), at its committer time.
+  //   The mirror holds no push times, so a commit made before T and pushed after T reads as on the branch at its
+  //   commit time: an approximation a strict replay can exclude by this basis.
+  const defaultAt = new Map<string, string>();
+  const basis = new Map<string, "merge" | "committer">();
+  const fp = git(mirror, ["log", "--first-parent", "--format=%H %P%x09%cI", `--since=${since}`, defaultBranch]).split("\n").filter(Boolean);
+  for (const l of fp.reverse()) {
+    const [ids, at] = l.split("\t");
+    const [sha, first, ...merged] = ids!.split(" ");
+    if (!sha || !at) continue;
+    defaultAt.set(sha, at);
+    basis.set(sha, "committer");
+    if (first && merged.length) for (const m of merged) for (const c of git(mirror, ["rev-list", `${first}..${m}`]).split("\n").filter(Boolean)) if (!defaultAt.has(c)) { defaultAt.set(c, at); basis.set(c, "merge"); }
+  }
   const commits: ForgeFacts["commits"] = [];
   const reverted = new Map<string, { by: string; at: string }>();
   for (const line of git(mirror, ["log", "--all", `--since=${since}`, `--until=${until}`, "--format=%H%x09%cI%x09%B%x1e"]).split("\x1e")) {
     const [sha, at, ...body] = line.trim().split("\t");
     if (!sha || !at) continue;
-    commits.push({ sha, at, onDefaultBranch: onDefault.has(sha) });
+    commits.push({ sha, at, onDefaultBranch: onDefault.has(sha), ...(defaultAt.has(sha) ? { defaultAt: defaultAt.get(sha)!, defaultAtBasis: basis.get(sha)! } : {}) });
     const m = /This reverts commit ([0-9a-f]{7,40})/u.exec(body.join("\t"));
     if (m && onDefault.has(sha)) reverted.set(m[1]!, { by: sha, at });
   }
@@ -74,13 +96,15 @@ export function forgeFacts(repo: string, mirror: string, since: string, until: s
   const patchIds = execFileSync("sh", ["-c", `git -C "$0" log --all --since="$1" --until="$2" -p --format='commit %H' | git patch-id --stable`, mirror, since, until], { encoding: "utf8", maxBuffer: 512 * 1024 * 1024 });
   for (const line of patchIds.split("\n")) { const [pid, sha] = line.split(" "); if (pid && sha) patchOf.set(sha, pid); }
   const landedByPatch = new Map<string, { sha: string; at: string }>();
-  for (const c of commits) if (c.onDefaultBranch && patchOf.has(c.sha) && !landedByPatch.has(patchOf.get(c.sha)!)) landedByPatch.set(patchOf.get(c.sha)!, { sha: c.sha, at: c.at });
+  for (const c of commits) if (c.onDefaultBranch && patchOf.has(c.sha) && !landedByPatch.has(patchOf.get(c.sha)!)) landedByPatch.set(patchOf.get(c.sha)!, { sha: c.sha, at: c.defaultAt ?? c.at });
   for (const c of commits) {
     const r = reverted.get(c.sha) ?? [...reverted].find(([k]) => c.sha.startsWith(k))?.[1];
     const landed = !c.onDefaultBranch ? landedByPatch.get(patchOf.get(c.sha) ?? "") : undefined;
     if (landed) {
       c.onDefaultBranch = true;
       c.at = landed.at;
+      c.defaultAt = landed.at;
+      c.defaultAtBasis = "patch";
       const lr = reverted.get(landed.sha) ?? [...reverted].find(([k]) => landed.sha.startsWith(k))?.[1];
       if (lr) { c.revertedBy = lr.by; c.revertedAt = lr.at; }
     }

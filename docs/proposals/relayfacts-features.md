@@ -128,15 +128,25 @@ must cite evidence ids that the scorer checks.
 
    The rule that fired is the `stateReason`. A branch, PR or commit counts as built only when the
    session made it (a push, a commit line, its own `gh pr create`); one it only listed or viewed is
-   a link key. A branch whose tip predates the feature's first session is not its landing.
+   a link key. A PR is created only by the successful result paired with a shell tool call whose
+   structured command is nothing but `gh pr create` (after optional `cd` and `git push` steps); a
+   heredoc, pipe, `||`, `;`, substitution, quoted text, comment, non-shell tool or truncated argument
+   abstains. The analysis's references keep only string arguments, so a Codex argv call abstains there;
+   the transcript reader takes the line of a `bash -lc` argv. A commit is on the default branch from the time it became reachable
+   from it: a merged commit from its merge, a re-cut commit from its patch-id landing. A first-parent
+   commit (a squash, a direct push, a fast-forward) has only its committer time, since the mirror holds
+   no push times; that approximation is recorded as `defaultAtBasis: committer`. A branch whose tip predates the feature's first session is not its landing.
 
    **As-of.** Session facts are cut strictly at `asOf`: a timed item, and every evidence pointer and
    quote inside it, counts only before `asOf`; anything without a time of its own (a mention-only key,
    branch, file and task keys, outcome statuses) counts only once its session ended before `asOf`.
    Only the directory's own facts (repository, parent sessions) are known from the session's start. A
-   replay at T is invariant to everything observed after T (tested). The limit: forge facts are the
-   mirror's state when the corpus was sealed, so branch commit lists, flag defaults and base commits are
-   not replayed.
+   replay at T is invariant to everything observed after T (tested). Forge facts are used only with a
+   time before T: a branch counts only when its tip predates T, and a commit is on the default branch only
+   from the time it reached it. The limits: a branch ref's creation time is unknown (a ref created after T
+   at an older tip is indistinguishable); a first-parent commit's landing time is its committer time (a
+   commit made before T and pushed after T reads as landed before T); and flag defaults are the docs as
+   sealed.
 4. **Asked against built.** Each asked item is matched to the built items that answer it, or marked
    `unmet`. Contradictions and unverified outcomes carry over as gaps.
 5. **Render and export.** Markdown per feature plus an index page, escaped exactly like the
@@ -166,18 +176,25 @@ must cite evidence ids that the scorer checks.
     analysis does. No other command calls a model. Khaliq confirmed on 2026-11-26 that his approval
     covers that transfer for this benchmark ("confirmed", in reply to the question whether it does).
     Running it for another workspace needs its own approval covering that transfer.
-  - **Scope before collection.** The first collecting command binds the output directory to one scope
-    (tenant, repositories, window, a delete-by date at most 30 days out; `scope.json`); every later
-    command on it, and `seal`, must name the same scope, and nothing runs past the delete-by date. A
-    `--sessions` list (from `locate`) is cut to the scope: only coding sessions attributed to a scoped
-    repository that the directory itself lists for the tenant inside the window are kept, with the
-    directory's own time; the rest are counted by reason. Built records carry the corpus's delete-by
-    date, and `score` and `packets` refuse them after it.
+  - **Scope before collection.** The first collecting command needs an empty output directory and
+    creates its scope exclusively (tenant, repositories, window, a delete-by date at most 30 days out;
+    `scope.json`); every later command on it, and `seal`, must name exactly the same scope, and nothing
+    runs past the delete-by date. Every row a command writes carries the scope's id (the sha256 of
+    `scope.json`), and `seal` admits no other row and no row under a name not derived from its own key.
+    Session lists come only from the same collection's own `locate.jsonl` (the repository attribution
+    this tool derived from canonical evidence), cut to the scope's repositories and to what the
+    directory itself lists for the tenant inside the window, with the directory's own time; the rest
+    are counted by reason. Built records carry the corpus's delete-by date, and `score` and `packets`
+    refuse them after it.
   - **Private output.** Every output path is refused inside the repository before anything is created.
     Directories the tools create are 0700; an existing directory is never re-permissioned and must
-    already be the user's own and closed to group and others. Files are 0600, opened without following
-    links, under opaque names (no harness or session id in a file name). Logs and error output hold fixed
-    error codes; only the tools' own refusals print a message. On a volume mounted with ownership
+    already be the user's own and closed to group and others. Files are written atomically (a fresh
+    0600 temporary renamed into place), under opaque names (no harness or session id in a file name);
+    every read, of outputs and of inputs (`--features`, `--gold`, `--forge`, the corpus), opens without
+    following links and checks the opened file: regular, the user's own, closed to others, one link.
+    Logs and error output hold codes from a closed set (canonical refusal reasons, known error classes,
+    errno names, PostgreSQL SQLSTATE classes); only the tools' own refusals print a message, and those
+    never quote a value from a file. On a volume mounted with ownership
     ignored, modes are stored but do not keep other local users out: keep such output on a single-user
     machine.
 - **Build:** run stages 1 to 5 over the results, oldest first, so the timeline reads in order.

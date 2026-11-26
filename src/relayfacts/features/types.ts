@@ -131,7 +131,11 @@ export interface SessionFacts {
 export interface ForgeFacts {
   defaultBranch?: string;
   prs: Array<{ ref: string; state: "open" | "merged" | "closed"; at: string; mergedAt?: string | null; closedAt?: string | null; branch?: string | null }>;
-  commits: Array<{ sha: string; at: string; onDefaultBranch: boolean; revertedBy?: string | null; revertedAt?: string | null }>;
+  /**
+   * `defaultAt`: when the commit became reachable from the default branch; `defaultAtBasis` says how that is known
+   * (`merge` and `patch` from the landing commit, `committer` only the commit's own time: see backfill/forge.ts).
+   */
+  commits: Array<{ sha: string; at: string; onDefaultBranch: boolean; defaultAt?: string | null; defaultAtBasis?: "merge" | "patch" | "committer"; revertedBy?: string | null; revertedAt?: string | null }>;
   flags: Array<{ name: string; defaultOn: boolean }>;
   /** Branches of the repository and whether their work reached the default branch (by ancestry or patch id). */
   branches?: Array<{

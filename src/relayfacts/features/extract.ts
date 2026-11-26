@@ -14,6 +14,7 @@
  */
 import { createHash } from "node:crypto";
 import { scrubText } from "../../shared/vendor.ts";
+import { runsPrCreate, shellCommand } from "./commands.ts";
 import type { AnalysisClaim, SessionAnalysisSnapshot, SessionEvidenceReference } from "../../session-analysis/engine/session-analysis-result.ts";
 import type { SessionArtifacts } from "../backfill/artifacts.ts";
 import type { AskedItem, BuiltItem, EvidencePointer, GapItem, LinkKeys, Quote, RationaleItem, SessionContext, SessionFacts, SessionKey } from "./types.ts";
@@ -26,7 +27,6 @@ export const TITLE_MAX = 120;
 
 const DEFAULT_BRANCHES = new Set(["main", "master", "trunk", "develop", "head", "origin", "production", "staging"]);
 const SOURCE_ROOTS = new Set(["src", "packages", "apps", "lib", "libs", "services", "crates", "cmd", "internal", "scripts", "docs", "supabase", "flows", "test", "tests", "e2e", "infra", "stacks", "deploy", "runbooks", "config", "docker", "benchmarks", "agent", "macos", "gtk", "desktop-core", "web"]);
-const PR_CREATE = /\bgh\s+pr\s+create\b/u;
 const GITHUB_URL = /https:\/\/github\.com\/([A-Za-z0-9_.-]+)\/([A-Za-z0-9_.-]+)\/(pull\/[0-9]{1,10}|commit\/[0-9a-f]{7,40})(?![A-Za-z0-9_-])/gu;
 const COMMIT_LINE = /^\[([A-Za-z0-9._/-]+)(?: \(root-commit\))? ([0-9a-f]{7,40})\] /gmu;
 const BRANCH_COMMANDS = [
@@ -169,11 +169,20 @@ function quotes(ctx: Ctx, evidence: readonly EvidencePointer[], intent: string):
   return out;
 }
 
-/** Ids of the session's own successful `gh pr create` tool calls (tool-call references are keyed by `id`). */
+/**
+ * Ids of the session's own successful `gh pr create` tool calls. A tool-call reference is keyed by `id`, its
+ * summary starts with the tool name and its detail is the JSON of the allowed arguments (session-evidence.ts);
+ * a truncated detail, a non-shell tool or a command that only mentions the words abstains (commands.ts).
+ */
 export function createCallIds(snapshot: SessionAnalysisSnapshot): Set<string> {
   const ids = new Set<string>();
-  for (const ref of snapshot.evidence?.references ?? [])
-    if (ref.kind === "tool-call" && ref.isError !== true && PR_CREATE.test(`${ref.summary ?? ""}\n${ref.detail ?? ""}`)) ids.add(ref.id);
+  for (const ref of snapshot.evidence?.references ?? []) {
+    if (ref.kind !== "tool-call" || ref.isError === true || ref.truncated || !ref.detail) continue;
+    let args: unknown;
+    try { args = JSON.parse(ref.detail); } catch { continue; }
+    const command = shellCommand((ref.summary ?? "").split(":")[0]!.trim(), args);
+    if (command !== null && runsPrCreate(command)) ids.add(ref.id);
+  }
   return ids;
 }
 

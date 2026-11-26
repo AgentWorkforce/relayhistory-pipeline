@@ -97,8 +97,8 @@ describe("mentioned commits", () => {
       { name: "review/z", landed: false, landedAt: null, tipAt: "2026-10-01T00:00:00.000Z", commits: [sha("b")] },
       { name: "review/w", landed: false, landedAt: null, tipAt: "2026-10-01T00:00:00.000Z", commits: [sha("b")] },
     ] };
-    expect(withCommitBranches(facts("s", { commits: ["aaaaaaaa"] }), forge).keys.branches).toEqual(["review/x"]);
-    expect(withCommitBranches(facts("s", { commits: ["bbbbbbbb"] }), forge).keys.branches).toEqual([]);
+    expect(withCommitBranches(facts("s", { commits: ["aaaaaaaa"] }), forge, "2026-11-01T00:00:00.000Z").keys.branches).toEqual(["review/x"]);
+    expect(withCommitBranches(facts("s", { commits: ["bbbbbbbb"] }), forge, "2026-11-01T00:00:00.000Z").keys.branches).toEqual([]);
     const built = buildFeatures([facts("pusher", { branches: ["review/x"] }), facts("reviewer", { commits: ["aaaaaaa"] })], { asOf: "2026-11-01T00:00:00.000Z", forge });
     expect(built.length).toBe(1);
   });

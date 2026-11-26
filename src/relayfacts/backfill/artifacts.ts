@@ -17,6 +17,7 @@
  */
 import { repoRelative } from "../features/extract.ts";
 import { slugFromRemote } from "./locate.ts";
+import { runsPrCreate, shellCommand } from "../features/commands.ts";
 
 export interface ArtifactEvent { eventId: string; at: string | null }
 export interface SessionArtifacts {
@@ -43,7 +44,6 @@ const PUSH_BLOCK = /To ((?:https:\/\/|git@)github\.com[:/][A-Za-z0-9_.-]+\/[A-Za
 const PUSH_LINE = /^\s+(?:\+?\s*([0-9a-f]{7,40})\.\.\.?([0-9a-f]{7,40})|\*\s+\[new branch\])\s+([A-Za-z0-9._/-]+)\s+->\s+([A-Za-z0-9._/-]+)/gmu;
 const COMMIT_LINE = /^\[([A-Za-z0-9._/-]+)(?: \(root-commit\))? ([0-9a-f]{7,40})\] /gmu;
 const PR_URL = /https:\/\/github\.com\/([A-Za-z0-9_.-]+)\/([A-Za-z0-9_.-]+)\/pull\/([0-9]{1,10})(?![0-9A-Za-z_-])/gu;
-const PR_CREATE = /\bgh\s+pr\s+create\b/u;
 const TASK = /Delegated task ([A-Za-z0-9][A-Za-z0-9._:-]{2,127})/gu;
 const DEFAULT_BRANCH = /^(?:main|master|trunk|HEAD)$/u;
 
@@ -106,7 +106,12 @@ export function extractArtifacts(rows: ReadonlyArray<{ table: string; row: Recor
       const created = !failed(row) && toolUseIds(row).some((id) => createCalls.has(id));
       for (const m of body.matchAll(PR_URL)) prCandidates.push({ ...ev, url: `https://github.com/${m[1]}/${m[2]}/pull/${m[3]}`.toLowerCase(), repo: `${m[1]}/${m[2]}`.toLowerCase(), via: created ? "created" : "mention" });
     }
-    if ((type === "tool_call" || row.kind === "tool_call") && PR_CREATE.test(body)) for (const id of toolUseIds(row)) createCalls.add(id);
+    // A create call is read from the structured tool call (its name and command argument), never the text body.
+    if (type === "tool_call" || row.kind === "tool_call") for (const c of Array.isArray(row.tool_calls) ? row.tool_calls : []) {
+      const call = c as { name?: unknown; args?: unknown; toolUseId?: unknown; isError?: unknown };
+      const command = shellCommand(typeof call.name === "string" ? call.name : null, call.args);
+      if (command !== null && call.isError !== true && runsPrCreate(command) && typeof call.toolUseId === "string" && call.toolUseId) createCalls.add(call.toolUseId);
+    }
     if (type === "tool_call" || row.kind === "tool_call") for (const re of BRANCH_COMMANDS) for (const m of body.matchAll(re)) addBranch(ev, m[1]!, "command");
     if (type === "user" || type === "history") for (const m of body.matchAll(BRANCH_MENTION)) addBranch(ev, m[1]!, "mention");
     if (type === "user" || type === "history") for (const m of body.matchAll(TASK)) {

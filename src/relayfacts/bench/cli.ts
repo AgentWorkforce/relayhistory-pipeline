@@ -7,14 +7,13 @@
  *   bun run src/relayfacts/bench/cli.ts score   --corpus <dir> --gold <file> --features <file> --out <dir>
  *   bun run src/relayfacts/bench/cli.ts packets --features <file> --out <dir> [--seed <n>] [--limit <n>]
  */
-import { readFileSync } from "node:fs";
 import { parseArgs } from "node:util";
 import { buildFeatures } from "../features/build.ts";
 import { extractSessionFacts } from "../features/extract.ts";
 import { renderFeature, renderIndex } from "../features/render.ts";
 import type { FeatureRecord } from "../features/types.ts";
 import { loadCorpus } from "./corpus.ts";
-import { PrivateDir } from "../out-path.ts";
+import { PrivateDir, readPrivateFile } from "../out-path.ts";
 import { printable, UsageError } from "../errors.ts";
 import { CorpusError } from "./corpus.ts";
 import { parseGold } from "./gold.ts";
@@ -23,7 +22,7 @@ import { adjudicationPackets, scoreRun } from "./score.ts";
 
 /** A built run, refused after its delete-by date (or without one). */
 function readFeatures(path: string, now: Date = new Date()): { corpus: string; asOf: string; deleteBy: string; features: FeatureRecord[] } {
-  const run = JSON.parse(readFileSync(path, "utf8")) as { corpus: string; asOf: string; deleteBy?: string; features: FeatureRecord[] };
+  const run = JSON.parse(readPrivateFile(path)) as { corpus: string; asOf: string; deleteBy?: string; features: FeatureRecord[] };
   if (!run.deleteBy || !(Date.parse(run.deleteBy) > now.getTime())) throw new UsageError("--features is past its delete-by date (or has none): delete it");
   return run as { corpus: string; asOf: string; deleteBy: string; features: FeatureRecord[] };
 }
@@ -56,10 +55,10 @@ export function main(argv: string[]): number {
   if (command === "score") {
     if (!values.corpus || !values.gold || !values.features) throw new UsageError("--corpus, --gold and --features are required");
     const corpus = loadCorpus(values.corpus);
-    const gold = parseGold(JSON.parse(readFileSync(values.gold, "utf8")), corpus.manifestSha256);
+    const gold = parseGold(JSON.parse(readPrivateFile(values.gold)), corpus.manifestSha256);
     const run = readFeatures(values.features);
     if (run.corpus !== corpus.manifestSha256) throw new UsageError("--features was built from a different corpus");
-    if (run.asOf !== gold.asOf) throw new UsageError(`--features is as of ${run.asOf}, the gold labels as of ${gold.asOf}`);
+    if (run.asOf !== gold.asOf) throw new UsageError("--features and the gold labels are as of different times");
     const report = scoreRun(corpus, gold, run.features);
     PrivateDir.open(values.out).write("score.json", JSON.stringify(report, null, 2));
     console.log(JSON.stringify({ grounding: report.grounding.pass, violations: report.grounding.violations.length, verdicts: report.verdicts, all: report.splits.all }));

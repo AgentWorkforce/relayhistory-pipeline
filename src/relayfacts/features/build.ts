@@ -99,7 +99,7 @@ export function deriveState(sessions: readonly SessionFacts[], forge: ForgeFacts
   const branches = (forge.branches ?? []).filter((b) => branchNames.has(b.name) && b.tipAt < asOf && b.tipAt >= new Date(Date.parse(firstStart) - BRANCH_LEAD_MS).toISOString());
   const merges = [
     ...prs.filter((p) => p.state === "merged" && p.mergedAt && p.mergedAt < asOf).map((p) => ({ at: p.mergedAt!, what: `merged ${p.ref.replace("https://github.com/", "")}` })),
-    ...commits.filter((c) => c.onDefaultBranch && c.at < asOf).map((c) => ({ at: c.at, what: `commit ${c.sha.slice(0, 12)} on the default branch` })),
+    ...commits.filter((c) => c.onDefaultBranch && (c.defaultAt ?? c.at) < asOf).map((c) => ({ at: c.defaultAt ?? c.at, what: `commit ${c.sha.slice(0, 12)} on the default branch` })),
     ...branches.filter((b) => b.landed && b.landedAt && b.landedAt < asOf).map((b) => ({ at: b.landedAt!, what: `branch ${b.name} landed` })),
   ].sort((a, b) => textCompare(a.at, b.at));
   const reverts = commits.filter((c) => c.revertedAt && c.revertedAt < asOf).map((c) => ({ at: c.revertedAt!, what: `commit ${c.sha.slice(0, 12)} reverted${c.revertedBy ? ` by ${c.revertedBy.slice(0, 12)}` : ""}` })).sort((a, b) => textCompare(a.at, b.at));
@@ -140,7 +140,8 @@ export function deriveState(sessions: readonly SessionFacts[], forge: ForgeFacts
  */
 export function withoutBaseCommits(f: SessionFacts, forge: ForgeFacts): SessionFacts {
   const builtShas = new Set(f.built.filter((b) => b.kind === "commit").map((b) => b.ref!));
-  const base = (sha: string) => !builtShas.has(sha) && forge.commits.some((c) => c.onDefaultBranch && c.at < f.startedAt && (c.sha.startsWith(sha) || sha.startsWith(c.sha)));
+  // On the default branch by the session's start: the time it became reachable from it (defaultAt), not its commit time.
+  const base = (sha: string) => !builtShas.has(sha) && forge.commits.some((c) => c.onDefaultBranch && (c.defaultAt ?? c.at) < f.startedAt && (c.sha.startsWith(sha) || sha.startsWith(c.sha)));
   const commits = f.keys.commits.filter((sha) => !base(sha));
   return commits.length === f.keys.commits.length ? f : { ...f, keys: { ...f.keys, commits } };
 }
@@ -151,14 +152,16 @@ export const MAX_COMMIT_BRANCHES = 2;
 /**
  * A session that names a commit (a reviewer given "review <sha>") without naming its branch: the forge's branches
  * holding that commit become the session's branch keys, so each review round of one branch links to the others
- * and to the session that pushed it.
+ * and to the session that pushed it. As of `asOf`, only branches whose whole history predates it count (tip before
+ * `asOf`); a branch the mirror shows only later is never used for an earlier replay.
  */
-export function withCommitBranches(f: SessionFacts, forge: ForgeFacts): SessionFacts {
+export function withCommitBranches(f: SessionFacts, forge: ForgeFacts, asOf: string): SessionFacts {
   if (!f.keys.commits.length || !forge.branches?.length) return f;
+  const known = forge.branches.filter((b) => b.tipAt < asOf);
   const added = new Set<string>();
   for (const sha of f.keys.commits) {
     if (sha.length < 7) continue;
-    const holders = forge.branches.filter((b) => (b.commits ?? []).some((c) => c.startsWith(sha) || sha.startsWith(c)));
+    const holders = known.filter((b) => (b.commits ?? []).some((c) => c.startsWith(sha) || sha.startsWith(c)));
     if (holders.length && holders.length <= MAX_COMMIT_BRANCHES) for (const b of holders) added.add(b.name);
   }
   const branches = [...new Set([...f.keys.branches, ...added])].sort(textCompare);
@@ -168,7 +171,7 @@ export function withCommitBranches(f: SessionFacts, forge: ForgeFacts): SessionF
 /** Stages 2 to 4: every feature record as of `asOf`. */
 export function buildFeatures(all: readonly SessionFacts[], options: BuildOptions): FeatureRecord[] {
   const forge = options.forge ?? EMPTY_FORGE;
-  const facts = all.map((f) => factsAsOf(f, options.asOf)).filter((f): f is SessionFacts => f !== null).map((f) => withoutBaseCommits(f, forge)).map((f) => withCommitBranches(f, forge));
+  const facts = all.map((f) => factsAsOf(f, options.asOf)).filter((f): f is SessionFacts => f !== null).map((f) => withoutBaseCommits(f, forge)).map((f) => withCommitBranches(f, forge, options.asOf));
   const { groups, links } = linkSessions(facts, options.link ?? DEFAULT_LINK_PARAMS);
   return groups.map((sessions) => {
     const founding = sessions[0]!;
