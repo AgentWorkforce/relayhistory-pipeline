@@ -21,8 +21,9 @@ export function flagDefaults(markdown: string): Map<string, boolean> {
     const cells = line.split("|").map((c) => c.trim());
     const flag = /^`([A-Z][A-Z0-9_]*_ENABLED)`$/u.exec(cells[1] ?? "")?.[1];
     if (!flag) continue;
-    const verdict = cells.slice(2).map((c) => c.toLowerCase()).find((c) => /^(off|on|default off|default on)\b/u.test(c));
-    if (verdict && !out.has(flag)) out.set(flag, /\bon\b/u.test(verdict) && !/\boff\b/u.test(verdict));
+    // The cell's leading phrase decides ("Default on: ... off with `false`" is on); later words never do.
+    const verdict = cells.slice(2).map((c) => /^(?:default\s+)?(on|off)\b/iu.exec(c)?.[1]?.toLowerCase()).find((v) => v !== undefined);
+    if (verdict && !out.has(flag)) out.set(flag, verdict === "on");
   }
   return out;
 }

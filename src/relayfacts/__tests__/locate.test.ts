@@ -61,3 +61,17 @@ describe("rowInRepo", () => {
     expect(rowInRepo({ gitRepo: null, projectId: null }, repos)).toBe(false);
   });
 });
+
+import { flagDefaults } from "../backfill/forge.ts";
+describe("flagDefaults", () => {
+  test("the leading phrase of the cell decides, not a later word", () => {
+    const md = [
+      "| Flag | Where | Effect |", "|---|---|---|",
+      "| `A_ENABLED` | consumer | Default on: streams; off with `false` |",
+      "| `B_ENABLED` | lambda | Default off: exactly `true` turns it on |",
+      "| `C_ENABLED` | off | ignored row order |",
+      "| `D_ENABLED` | worker | no default stated |",
+    ].join("\n");
+    expect([...flagDefaults(md)]).toEqual([["A_ENABLED", true], ["B_ENABLED", false], ["C_ENABLED", false]]);
+  });
+});
