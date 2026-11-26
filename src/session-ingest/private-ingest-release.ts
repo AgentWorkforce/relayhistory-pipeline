@@ -76,6 +76,28 @@ export function privateIngestRefuse(code: string): never {
   throw Object.assign(new Error(code), { code });
 }
 
+/**
+ * The one diagnostic line for a failed Cloudflare API read (`refusal` is the refusal code that follows it):
+ * `<refusal> http_status=<n> cf_errors=<c1,c2,...>`. Only the numeric HTTP status and Cloudflare's numeric
+ * `errors[].code` values are kept (at most 5, each up to 7 digits): never an error message, a header, the
+ * request URL or the token, so the line is safe for a public Actions log. A body that is not Cloudflare's JSON
+ * envelope, or has no numeric codes, gives `cf_errors=none`; a status outside 100..599 gives `http_status=none`.
+ */
+export function privateIngestCloudflareDiagnostic(refusal: string, status: number, body: string): string {
+  const httpStatus = Number.isInteger(status) && status >= 100 && status <= 599 ? String(status) : "none";
+  let codes: string[] = [];
+  try {
+    const errors = (JSON.parse(body) as { errors?: unknown }).errors;
+    if (Array.isArray(errors))
+      codes = errors
+        .map((e) => (e !== null && typeof e === "object" ? (e as { code?: unknown }).code : undefined))
+        .filter((c): c is number => Number.isInteger(c) && (c as number) >= 0 && (c as number) <= 9_999_999)
+        .slice(0, 5)
+        .map(String);
+  } catch { /* not JSON: no codes */ }
+  return `${refusal} http_status=${httpStatus} cf_errors=${codes.length ? codes.join(",") : "none"}`;
+}
+
 const HEX64 = /^[0-9a-f]{64}$/u;
 
 /**

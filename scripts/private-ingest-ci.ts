@@ -9,6 +9,7 @@ import {
   PRIVATE_INGEST_RELEASE as P,
   PRIVATE_INGEST_CUTOVER_KEYS,
   privateIngestActiveVersion,
+  privateIngestCloudflareDiagnostic,
   privateIngestCutoverFromEnv,
   privateIngestRefuse,
   privateIngestReleasePhase,
@@ -137,12 +138,19 @@ async function cloudflareGet(path: string, worker: typeof P.worker | typeof P.re
       signal: AbortSignal.timeout(15_000),
     },
   );
-  if (!response.ok) privateIngestRefuse("private_ingest_cloudflare_read");
+  if (!response.ok) {
+    // Status and Cloudflare's numeric error codes only (privateIngestCloudflareDiagnostic); the body is bounded.
+    const failed = await response.text().catch(() => "");
+    console.error(privateIngestCloudflareDiagnostic("private_ingest_cloudflare_read", response.status, failed.slice(0, 64 * 1024)));
+    privateIngestRefuse("private_ingest_cloudflare_read");
+  }
   const text = await response.text();
   if (text.length > 2 * 1024 * 1024) privateIngestRefuse("private_ingest_cloudflare_read_bound");
   const body = JSON.parse(text) as { success?: unknown; result?: unknown };
-  if (body.success !== true || body.result === undefined)
+  if (body.success !== true || body.result === undefined) {
+    console.error(privateIngestCloudflareDiagnostic("private_ingest_cloudflare_response", response.status, text));
     privateIngestRefuse("private_ingest_cloudflare_response");
+  }
   return body.result;
 }
 

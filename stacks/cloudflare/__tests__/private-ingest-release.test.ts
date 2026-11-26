@@ -4,6 +4,7 @@ import { sessionIngestVars } from "../session-ingest.ts";
 import {
   PRIVATE_INGEST_RELEASE as P,
   privateIngestActiveVersion,
+  privateIngestCloudflareDiagnostic,
   privateIngestProfileForPhase,
   privateIngestReleaseInputs,
   privateIngestReleasePhase,
@@ -341,4 +342,23 @@ test("workflow is CI-only and binds production credentials only after install", 
   expect(workflow.match(/bun scripts\/private-ingest-ci\.ts preflight/gu)).toHaveLength(2);
   expect(workflow.indexOf("run: rm -- docs/plans/cf-sessions-prod.custody-evidence.json"))
     .toBeLessThan(workflow.indexOf("- name: Download the exact prior plan"));
+});
+
+test("a failed Cloudflare read logs only the HTTP status and Cloudflare's numeric error codes, never messages or the token", () => {
+  const secret = "cf-token-" + "s".repeat(40);
+  const body = JSON.stringify({ success: false, errors: [
+    { code: 10000, message: `Authentication error for ${secret}` },
+    { code: 9109, message: "Invalid access token", documentation_url: "https://example.invalid/docs" },
+  ], messages: [{ code: 1, message: secret }], result: null });
+  const line = privateIngestCloudflareDiagnostic("private_ingest_cloudflare_read", 403, body);
+  expect(line).toBe("private_ingest_cloudflare_read http_status=403 cf_errors=10000,9109");
+  for (const leaked of [secret, "Authentication", "Invalid access token", "example.invalid", "messages"]) expect(line).not.toContain(leaked);
+  // Not Cloudflare's envelope, or no numeric codes: none.
+  expect(privateIngestCloudflareDiagnostic("x", 502, "<html>bad gateway " + secret + "</html>")).toBe("x http_status=502 cf_errors=none");
+  expect(privateIngestCloudflareDiagnostic("x", 404, JSON.stringify({ errors: "nope" }))).toBe("x http_status=404 cf_errors=none");
+  expect(privateIngestCloudflareDiagnostic("x", 404, JSON.stringify({ errors: [{ code: "10000" }, { code: 1.5 }, { code: -1 }, { code: 1e8 }, null, 7] }))).toBe("x http_status=404 cf_errors=none");
+  expect(privateIngestCloudflareDiagnostic("x", 400, "")).toBe("x http_status=400 cf_errors=none");
+  // At most five codes; an impossible status is not echoed.
+  expect(privateIngestCloudflareDiagnostic("x", 429, JSON.stringify({ errors: [1, 2, 3, 4, 5, 6, 7].map((code) => ({ code })) }))).toBe("x http_status=429 cf_errors=1,2,3,4,5");
+  for (const status of [0, 99, 600, 1.5, Number.NaN]) expect(privateIngestCloudflareDiagnostic("x", status, "{}")).toBe("x http_status=none cf_errors=none");
 });
