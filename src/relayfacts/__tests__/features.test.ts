@@ -114,9 +114,15 @@ const forge = (over: Partial<ForgeFacts> = {}): ForgeFacts => ({
 });
 
 describe("deriveState", () => {
-  test("merged with an open item in the latest session is partial; then shipped once nothing is open", () => {
-    expect(deriveState([factsA], forge(), "2026-11-11T12:00:00Z").state).toBe("partial");
-    expect(deriveState([factsA, factsB], forge(), "2026-11-13T00:00:00Z").state).toBe("shipped");
+  test("a named flag with no documented default is off; a documented default-on flag ships; open follow-ups never make it partial", () => {
+    expect(deriveState([factsA], forge(), "2026-11-11T12:00:00Z").state).toBe("shipped_off");
+    const on = forge({ flags: [{ name: "UPLOAD_RETRY_ENABLED", defaultOn: true }] });
+    expect(deriveState([factsA], on, "2026-11-11T12:00:00Z").state).toBe("shipped");
+    expect(deriveState([factsA], forge(), "2026-11-11T12:00:00Z", "on").state).toBe("shipped");
+  });
+  test("an unmet ask in the latest session makes a landed feature partial", () => {
+    const unmet = { ...factsB, gaps: [{ ...factsA.gaps[0]!, kind: "unmet" as const, session: { source: "claude", sessionId: "sess-b" } }] };
+    expect(deriveState([factsA, unmet], forge({ flags: [{ name: "UPLOAD_RETRY_ENABLED", defaultOn: true }] }), "2026-11-13T00:00:00Z").state).toBe("partial");
   });
   test("a flag that defaults off gives shipped_off", () => {
     const r = deriveState([factsA, factsB], forge({ flags: [{ name: "UPLOAD_RETRY_ENABLED", defaultOn: false }] }), "2026-11-13T00:00:00Z");
@@ -181,7 +187,7 @@ describe("benchmark scoring", () => {
     const gold = parseGold({
       format: "relayfacts-gold/1", corpus: corpus.manifestSha256, asOf: "2026-11-30T00:00:00Z", coverage: "complete",
       features: [
-        { id: "g1", title: "Upload retry", split: "dev", state: "shipped", sessions: [{ source: "claude", sessionId: "sess-a" }, { source: "claude", sessionId: "sess-b" }],
+        { id: "g1", title: "Upload retry", split: "dev", state: "shipped_off", sessions: [{ source: "claude", sessionId: "sess-a" }, { source: "claude", sessionId: "sess-b" }],
           asked: [{ source: "claude", sessionId: "sess-a", text: "add a retry to the uploader behind a flag" }],
           gaps: [{ kind: "open", source: "claude", sessionId: "sess-a", text: "retry metrics not exported" }] },
         { id: "g2", title: "Docs typo", split: "heldout", state: "in_progress", sessions: [{ source: "claude", sessionId: "sess-c" }], asked: [], gaps: [] },
@@ -199,5 +205,14 @@ describe("benchmark scoring", () => {
 
   test("gold naming another corpus is refused", () => {
     expect(() => parseGold({ format: "relayfacts-gold/1", corpus: "d".repeat(64), asOf: "2026-11-30T00:00:00Z", coverage: "complete", features: [] }, corpus.manifestSha256)).toThrow("different corpus");
+  });
+});
+
+import { textOverlap } from "../bench/score.ts";
+describe("textOverlap", () => {
+  test("a paraphrase of the same request matches; an unrelated one does not", () => {
+    const gold = "Fix issue #613: with INGEST_LEDGER=s3, ledger admission must honour operator erase. One new default-off flag.";
+    expect(textOverlap("Fix issue #613 so S3 upload ledger admission honors operator erase state behind a new default-off INGEST_S3_ERASE_FENCE flag", gold)).toBeGreaterThanOrEqual(0.35);
+    expect(textOverlap("Register the worker session on Agent Relay and return READY", gold)).toBeLessThan(0.35);
   });
 });

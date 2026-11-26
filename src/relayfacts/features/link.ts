@@ -81,7 +81,8 @@ export function linkSessions(facts: readonly SessionFacts[], params: LinkParams 
   index("task", (f) => f.keys.taskRefs);
   index("pr", (f) => f.keys.prs);
   index("branch", (f) => (f.keys.repo ? scoped(f, f.keys.branches) : []));
-  index("commit", (f) => f.keys.commits);
+  // Commit ids are written at different lengths (push output, briefs, logs): link on the 7-character prefix.
+  index("commit", (f) => [...new Set(f.keys.commits.map((c) => c.slice(0, 7)))]);
 
   if (params.files) {
     const fileFanout = new Map<string, number>();

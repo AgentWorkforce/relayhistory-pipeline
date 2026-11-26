@@ -31,6 +31,9 @@ const BRANCH_COMMANDS = [
   /\bgit push\b[^\n]*?\borigin (?:HEAD:)?([A-Za-z0-9._/-]+)/gu,
 ];
 const FLAG = /\b[A-Z][A-Z0-9]*(?:_[A-Z0-9]+)*_ENABLED\b/gu;
+const BRIEF_BRANCH = /\b[Bb]ranch(?: under review)?[:\s]+`?([A-Za-z0-9._-]+\/[A-Za-z0-9._/-]*[A-Za-z0-9_-])`?/gu;
+/** A commit id in a brief: 7 to 40 hex characters standing alone (both a letter and a digit are required below). */
+const BRIEF_SHA = /(?<![0-9A-Za-z_./-])([0-9a-f]{7,40})(?![0-9A-Za-z_/-])/gu;
 const MIGRATION = /(?:^|\/)(?:migrations?|drizzle|db\/migrate)\/([^/]+\.(?:sql|ts|js))$/iu;
 const USABLE = new Set(["high", "medium"]);
 
@@ -274,6 +277,15 @@ export function extractSessionFacts(snapshot: SessionAnalysisSnapshot, context: 
     built.push({ id: stableId([key, "pr", pr.url]), kind: "pr", what: `pull request ${pr.url.replace("https://github.com/", "")}`, ref: pr.url, at: pr.at, session: key, outcomeId: null, evidence: [eventPointer(pr)] });
   }
   for (const b of artifacts?.branches ?? []) { const fb = featureBranch(b.branch); if (fb) pushedBranches.add(fb); }
+  // A brief names the work it hands over: a branch ("Branch under review: x/y") or commits ("Review a1b2c3d..e4f5a6b",
+  // "landing head 80aea5c4"). Read from the session's human and delegated-instruction references, as link keys only.
+  const mentionedCommits = new Set<string>();
+  for (const ref of snapshot.evidence?.references ?? []) {
+    if (ref.kind !== "human-message" && ref.kind !== "delegated-instruction") continue;
+    const body = `${ref.summary ?? ""}\n${ref.detail ?? ""}`;
+    for (const m of body.matchAll(BRIEF_BRANCH)) { const fb = featureBranch(m[1]!.replace(/[.,:;]+$/u, "")); if (fb && fb.includes("/")) pushedBranches.add(fb); }
+    for (const m of body.matchAll(BRIEF_SHA)) if (/[a-f]/u.test(m[1]!) && /[0-9]/u.test(m[1]!)) mentionedCommits.add(m[1]!.toLowerCase());
+  }
   for (const b of pushedBranches) art.branches.add(b);
   const files = new Set<string>();
   for (const f of artifacts?.files ?? []) files.add(f.path);
@@ -298,7 +310,7 @@ export function extractSessionFacts(snapshot: SessionAnalysisSnapshot, context: 
     repo: normalizeRepo(context.repo),
     branches: [...new Set([...(branch ? [branch] : []), ...art.branches])].sort(textCompare),
     prs: [...art.prs.keys()].sort(textCompare),
-    commits: [...art.commits.keys()].sort(textCompare),
+    commits: [...new Set([...art.commits.keys(), ...mentionedCommits])].sort(textCompare),
     files: [...files].sort(textCompare),
     taskRefs: [...new Set([...(context.taskRef ? [context.taskRef] : []), ...(artifacts?.taskRefs ?? []).map((t) => t.ref)])].sort(textCompare),
   };

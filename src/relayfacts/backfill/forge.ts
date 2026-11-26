@@ -66,13 +66,37 @@ export function forgeFacts(repo: string, mirror: string, since: string, until: s
     }
     if (r) { c.revertedBy = r.by; c.revertedAt = r.at; }
   }
+  // Branch landing: a branch's work reached the default branch when its tip is an ancestor of it, when any of
+  // its own commits has a default-branch copy with the same patch id, or when its combined diff (a squash) does.
+  const mainPatch = new Map<string, string>();
+  for (const c of commits) if (c.onDefaultBranch) { const pid = patchOf.get(c.sha); if (pid && !mainPatch.has(pid)) mainPatch.set(pid, c.at); }
+  const sh = (cmd: string, ...args: string[]) => { try { return execFileSync("sh", ["-c", cmd, ...args], { encoding: "utf8", maxBuffer: 256 * 1024 * 1024 }).trim(); } catch { return ""; } };
+  const branches: NonNullable<ForgeFacts["branches"]> = [];
+  for (const name of git(mirror, ["for-each-ref", "--format=%(refname:short)", "refs/heads"]).split("\n").filter((b) => b && b !== defaultBranch)) {
+    const tipAt = git(mirror, ["log", "-1", "--format=%cI", name]).trim();
+    if (!tipAt || tipAt < since) continue;
+    const ancestor = sh(`git -C "$0" merge-base --is-ancestor "$1" "$2" && echo yes`, mirror, name, defaultBranch) === "yes";
+    let landedAt: string | null = ancestor ? tipAt : null;
+    if (!landedAt) for (const sha of git(mirror, ["rev-list", "--max-count=200", `${defaultBranch}..${name}`]).split("\n").filter(Boolean)) {
+      const at = mainPatch.get(patchOf.get(sha) ?? "");
+      if (at && (!landedAt || at > landedAt)) landedAt = at;
+    }
+    if (!landedAt) {
+      const pid = sh(`git -C "$0" diff "$(git -C "$0" merge-base "$2" "$1")" "$1" | git patch-id --stable | cut -d' ' -f1`, mirror, name, defaultBranch);
+      if (pid) landedAt = mainPatch.get(pid) ?? null;
+    }
+    // Flags the branch introduces: `*_ENABLED` names on added lines of its combined diff.
+    const added = sh(`git -C "$0" diff "$(git -C "$0" merge-base "$2" "$1")" "$1" | grep '^+' | grep -oE '[A-Z][A-Z0-9]*(_[A-Z0-9]+)*_ENABLED' | sort -u`, mirror, name, defaultBranch);
+    const flagsAdded = added.split("\n").filter(Boolean).slice(0, 50);
+    branches.push({ name, landed: landedAt !== null, landedAt, tipAt, ...(flagsAdded.length ? { flagsAdded } : {}) });
+  }
   let docs = "";
   try {
     for (const path of git(mirror, ["ls-tree", "-r", "--name-only", defaultBranch, "--", "docs"]).split("\n").filter((p) => p.endsWith(".md")))
       docs += git(mirror, ["show", `${defaultBranch}:${path}`]) + "\n";
   } catch { /* a repository without docs has no flag table */ }
   const flags = [...flagDefaults(docs)].map(([name, defaultOn]) => ({ name, defaultOn })).sort((a, b) => (a.name < b.name ? -1 : 1));
-  return parseForge({ defaultBranch, prs, commits, flags });
+  return parseForge({ defaultBranch, prs, commits, flags, branches });
 }
 
 if (import.meta.main) {
@@ -80,5 +104,5 @@ if (import.meta.main) {
   if (!values.repo || !values.git || !values.since || !values.until || !values.out) throw new Error("--repo, --git, --since, --until and --out are required");
   const facts = forgeFacts(values.repo, values.git, values.since, values.until, values.branch ?? "main");
   writeFileSync(values.out, JSON.stringify(facts));
-  console.log(JSON.stringify({ prs: facts.prs.length, commits: facts.commits.length, onDefault: facts.commits.filter((c) => c.onDefaultBranch).length, reverted: facts.commits.filter((c) => c.revertedBy).length, flags: facts.flags.length }));
+  console.log(JSON.stringify({ prs: facts.prs.length, commits: facts.commits.length, onDefault: facts.commits.filter((c) => c.onDefaultBranch).length, reverted: facts.commits.filter((c) => c.revertedBy).length, flags: facts.flags.length, branches: facts.branches?.length ?? 0, landedBranches: facts.branches?.filter((b) => b.landed).length ?? 0 }));
 }

@@ -129,6 +129,8 @@ export interface ForgeFacts {
   prs: Array<{ ref: string; state: "open" | "merged" | "closed"; at: string; mergedAt?: string | null; closedAt?: string | null; branch?: string | null }>;
   commits: Array<{ sha: string; at: string; onDefaultBranch: boolean; revertedBy?: string | null; revertedAt?: string | null }>;
   flags: Array<{ name: string; defaultOn: boolean }>;
+  /** Branches of the repository and whether their work reached the default branch (by ancestry or patch id). */
+  branches?: Array<{ name: string; landed: boolean; landedAt: string | null; tipAt: string; flagsAdded?: string[] }>;
 }
 
 export const EMPTY_FORGE: ForgeFacts = { prs: [], commits: [], flags: [] };

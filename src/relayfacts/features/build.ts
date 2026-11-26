@@ -44,31 +44,44 @@ export function factsAsOf(f: SessionFacts, asOf: string): SessionFacts | null {
 
 interface StateResult { state: FeatureState; basis: "forge" | "analysis"; reason: string }
 
-export function deriveState(sessions: readonly SessionFacts[], forge: ForgeFacts, asOf: string): StateResult {
+export function deriveState(sessions: readonly SessionFacts[], forge: ForgeFacts, asOf: string, unknownFlagDefault: "on" | "off" = "off"): StateResult {
   const built = sessions.flatMap((s) => s.built);
   const shas = new Set(built.filter((b) => b.kind === "commit").map((b) => b.ref!));
   const prUrls = new Set(built.filter((b) => b.kind === "pr").map((b) => b.ref!));
+  // A feature's flags: named anywhere in its own text (asks, claims, gaps, decisions, constraints).
+  const FLAG = /\b[A-Z][A-Z0-9]*(?:_[A-Z0-9]+)*_ENABLED\b/gu;
   const flags = new Set(built.filter((b) => b.kind === "flag").map((b) => b.ref!));
+  for (const t of sessions.flatMap((s) => [...s.asked.map((a) => a.text), ...s.built.map((b) => b.what), ...s.gaps.map((g) => g.text), ...s.rationale.map((r) => r.text)]))
+    for (const m of t.matchAll(FLAG)) flags.add(m[0]);
   const lastActivity = sessions.map((s) => s.endedAt).sort(textCompare).pop() ?? asOf;
   const stale = Date.parse(asOf) - Date.parse(lastActivity) > ABANDON_AFTER_MS;
   const latest = [...sessions].sort((a, b) => textCompare(a.endedAt, b.endedAt)).pop();
-  const openGaps = (latest?.gaps ?? []).filter((g) => g.kind === "open" || g.kind === "unmet");
+  // Partial means the request is materially unfinished (an unmet ask), not that follow-ups were listed:
+  // almost every analysis lists "remaining" items, so `open` gaps never make a landed feature partial.
+  const openGaps = (latest?.gaps ?? []).filter((g) => g.kind === "unmet");
 
   const commits = forge.commits.filter((c) => shas.has(c.sha) || [...shas].some((s) => c.sha.startsWith(s) || s.startsWith(c.sha)));
   const prs = forge.prs.filter((p) => prUrls.has(p.ref.toLowerCase()) && p.at < asOf);
+  const branchNames = new Set(sessions.flatMap((s) => s.keys.branches));
+  const branches = (forge.branches ?? []).filter((b) => branchNames.has(b.name) && b.tipAt < asOf);
   const merges = [
     ...prs.filter((p) => p.state === "merged" && p.mergedAt && p.mergedAt < asOf).map((p) => ({ at: p.mergedAt!, what: `merged ${p.ref.replace("https://github.com/", "")}` })),
     ...commits.filter((c) => c.onDefaultBranch && c.at < asOf).map((c) => ({ at: c.at, what: `commit ${c.sha.slice(0, 12)} on the default branch` })),
+    ...branches.filter((b) => b.landed && b.landedAt && b.landedAt < asOf).map((b) => ({ at: b.landedAt!, what: `branch ${b.name} landed` })),
   ].sort((a, b) => textCompare(a.at, b.at));
   const reverts = commits.filter((c) => c.revertedAt && c.revertedAt < asOf).map((c) => ({ at: c.revertedAt!, what: `commit ${c.sha.slice(0, 12)} reverted${c.revertedBy ? ` by ${c.revertedBy.slice(0, 12)}` : ""}` })).sort((a, b) => textCompare(a.at, b.at));
 
-  if (commits.length || prs.length) {
+  if (commits.length || prs.length || branches.length) {
     const lastMerge = merges[merges.length - 1];
     const lastRevert = reverts[reverts.length - 1];
     if (lastRevert && (!lastMerge || lastRevert.at >= lastMerge.at)) return { state: "regressed", basis: "forge", reason: lastRevert.what };
     if (lastMerge) {
-      const off = forge.flags.filter((f) => flags.has(f.name) && !f.defaultOn).map((f) => f.name);
-      if (off.length) return { state: "shipped_off", basis: "forge", reason: `${lastMerge.what}; default off: ${off.sort(textCompare).join(", ")}` };
+      // Flags the feature's own landed branches introduced count as its flags; a flag the docs do not list takes
+      // `unknownFlagDefault` (this repository's rule: new behaviour lands behind a default-off flag).
+      for (const b of branches) if (b.landed) for (const f of b.flagsAdded ?? []) flags.add(f);
+      const known = new Map(forge.flags.map((f) => [f.name, f.defaultOn]));
+      const off = [...flags].filter((f) => (known.get(f) ?? unknownFlagDefault === "on") === false).sort(textCompare);
+      if (off.length) return { state: "shipped_off", basis: "forge", reason: `${lastMerge.what}; default off: ${off.join(", ")}` };
       if (openGaps.length) return { state: "partial", basis: "forge", reason: `${lastMerge.what}; ${openGaps.length} open item(s) in the latest session` };
       return { state: "shipped", basis: "forge", reason: lastMerge.what };
     }

@@ -39,7 +39,7 @@ export function main(argv: string[]): number {
     if (!values.corpus) throw new Error("--corpus is required");
     const corpus = loadCorpus(values.corpus);
     const asOf = values["as-of"] ?? corpus.manifest.window.until;
-    const facts = corpus.sessions.map((s) => extractSessionFacts(s.snapshot, s.context));
+    const facts = corpus.sessions.map((s) => extractSessionFacts(s.snapshot, s.context, s.artifacts));
     const features = buildFeatures(facts, { asOf, forge: corpus.forge });
     const out = outDir(values.out);
     mkdirSync(join(out, "relayfacts"), { recursive: true });

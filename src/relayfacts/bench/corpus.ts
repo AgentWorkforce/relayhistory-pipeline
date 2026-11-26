@@ -70,7 +70,7 @@ function only(obj: Record<string, unknown>, allowed: string[], where: string) {
 export function parseForge(raw: unknown): ForgeFacts {
   if (!raw || typeof raw !== "object") throw new CorpusError("forge.json: not an object");
   const f = raw as Record<string, unknown>;
-  only(f, ["defaultBranch", "prs", "commits", "flags"], "forge.json");
+  only(f, ["defaultBranch", "prs", "commits", "flags", "branches"], "forge.json");
   if (!Array.isArray(f.prs) || !Array.isArray(f.commits) || !Array.isArray(f.flags)) throw new CorpusError("forge.json: prs, commits and flags must be arrays");
   for (const p of f.prs as Record<string, unknown>[]) {
     only(p, ["ref", "state", "at", "mergedAt", "closedAt", "branch"], "forge.json pr");
@@ -83,6 +83,10 @@ export function parseForge(raw: unknown): ForgeFacts {
   for (const g of f.flags as Record<string, unknown>[]) {
     only(g, ["name", "defaultOn"], "forge.json flag");
     if (typeof g.name !== "string" || typeof g.defaultOn !== "boolean") throw new CorpusError("forge.json: bad flag");
+  }
+  for (const b of (f.branches ?? []) as Record<string, unknown>[]) {
+    only(b, ["name", "landed", "landedAt", "tipAt", "flagsAdded"], "forge.json branch");
+    if (typeof b.name !== "string" || typeof b.landed !== "boolean" || !iso(b.tipAt) || (b.landedAt !== null && !iso(b.landedAt))) throw new CorpusError("forge.json: bad branch");
   }
   return f as unknown as ForgeFacts;
 }

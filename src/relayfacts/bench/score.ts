@@ -26,8 +26,8 @@ export const BARS = {
 
 /** A gold and a generated feature match when each holds at least this share of the other's sessions. */
 export const MATCH_SHARE = 0.5;
-/** Token Jaccard above which two texts in the same session count as the same item. */
-export const TEXT_MATCH = 0.3;
+/** Overlap coefficient at or above which two texts in the same session count as the same item. */
+export const TEXT_MATCH = 0.35;
 /** A generated feature holding at least this share of a gold feature's sessions counts as a fragment of it. */
 export const FRAGMENT_SHARE = 0.3;
 
@@ -45,6 +45,7 @@ export interface SplitScore {
   askedRecall: number | null;
   gapRecall: number | null;
   gapPrecision: number | null;
+  gapKindAgreement: number | null;
   duplication: number | null;
 }
 
@@ -68,6 +69,19 @@ export function textSimilarity(a: string, b: string): number {
   const union = ta.size + tb.size - shared;
   return union ? shared / union : 0;
 }
+
+/**
+ * Overlap coefficient: shared content words over the smaller text's words. A labeller's paraphrase and the
+ * analysis's wording of one request differ a lot in length, which Jaccard punishes; this does not.
+ */
+export function textOverlap(a: string, b: string): number {
+  const ta = tokens(a), tb = tokens(b);
+  let shared = 0;
+  for (const w of ta) if (tb.has(w)) shared++;
+  const small = Math.min(ta.size, tb.size);
+  return small ? shared / small : 0;
+}
+const textMatches = (a: string, b: string) => textOverlap(a, b) >= TEXT_MATCH;
 const ratio = (n: number, d: number) => (d ? n / d : null);
 
 /** Every cited pointer resolves in the corpus, and every quote is verbatim. */
@@ -165,20 +179,21 @@ function scoreSplit(gold: readonly GoldFeature[], generatedAll: readonly Feature
     if (g.state === f.state) stateRight++;
   }
 
-  let askedTotal = 0, askedFound = 0, gapTotal = 0, gapFound = 0, genGaps = 0, genGapsReal = 0;
+  let askedTotal = 0, askedFound = 0, gapTotal = 0, gapFound = 0, gapKindAgree = 0, genGaps = 0, genGapsReal = 0;
   for (const { g, f } of pairs) {
     for (const a of g.asked) {
       askedTotal++;
-      if (f.asked.some((x) => sessionKeyString(x.session) === sessionKeyString(a) && (textSimilarity(x.text, a.text) >= TEXT_MATCH || x.quotes.some((q) => textSimilarity(q.text, a.text) >= TEXT_MATCH)))) askedFound++;
+      if (f.asked.some((x) => sessionKeyString(x.session) === sessionKeyString(a) && (textMatches(x.text, a.text) || x.quotes.some((q) => textMatches(q.text, a.text))))) askedFound++;
     }
     for (const gap of g.gaps) {
       gapTotal++;
-      if (f.gaps.some((x) => x.kind === gap.kind && sessionKeyString(x.session) === sessionKeyString(gap) && textSimilarity(x.text, gap.text) >= TEXT_MATCH)) gapFound++;
+      const hit = f.gaps.find((x) => sessionKeyString(x.session) === sessionKeyString(gap) && textMatches(x.text, gap.text));
+      if (hit) { gapFound++; if (hit.kind === gap.kind) gapKindAgree++; }
     }
     for (const x of f.gaps) {
       if (!goldKeys.has(sessionKeyString(x.session))) continue;
       genGaps++;
-      if (g.gaps.some((gap) => gap.kind === x.kind && sessionKeyString(gap) === sessionKeyString(x.session) && textSimilarity(x.text, gap.text) >= TEXT_MATCH)) genGapsReal++;
+      if (g.gaps.some((gap) => sessionKeyString(gap) === sessionKeyString(x.session) && textMatches(x.text, gap.text))) genGapsReal++;
     }
   }
 
@@ -203,6 +218,7 @@ function scoreSplit(gold: readonly GoldFeature[], generatedAll: readonly Feature
       askedRecall: ratio(askedFound, askedTotal),
       gapRecall: ratio(gapFound, gapTotal),
       gapPrecision: ratio(genGapsReal, genGaps),
+      gapKindAgreement: ratio(gapKindAgree, gapFound),
       duplication: ratio(duplicated, gold.length),
     },
   };
