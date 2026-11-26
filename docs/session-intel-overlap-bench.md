@@ -149,6 +149,15 @@ The earlier separation came from undated intent text. Branches, edited files and
 
 At p ≥ 0.3, 0 of 40 bounds the false-alert rate below about 9% (95% Wilson). Fresh alerts scored at most 0.25. The positives are dev items that earlier rounds also used, and the prompt was written on dev, so this is a dev result. The claim needs the held-out score.
 
+## Held-out (scored once)
+
+The freeze covered the sources at `cbc76e21`, the purged Cloud harvest, the forge PRs and histories, labels v2, a budget of 5 per 100 sessions, and the held-out split. It was then scored once:
+
+- **Stage 1.** The ranker caught 1 of 5 linkable held-out incidents at the headline budget, with 2 negative hits and a median lead time of 1.5 h. Every other detector, the shipped `outcome-facts` included, caught 0.
+- **Stage 2.** Prompt v3 (sha256 `a0127f22…`) ran at cutoff 0.3 on a one-time batch. The loose ranker reached only 1 held-out incident pair before its harm, so the batch held that 1 positive and 40 fresh top-ranked alerts no round had judged. The judge kept the positive (p 0.4) and none of the 40 fresh alerts (highest 0.25). That bounds the share of top alerts it would still raise below 8.8% (95% Wilson).
+
+The held-out positives are too few to estimate stage 2's recall. What held-out does support is the false-alert side: stage 2 removes nearly all of stage 1's top alerts without being tuned on them. Recall is limited by coverage first: most incidents lack session evidence on one or both sides.
+
 ## Stage 2 (proposed)
 
 Structure gives recall but not precision, and an intent judge without dated intent text gives neither. Stage 2 therefore needs **dated intent**: what each line meant to do, as it stood at the alert. Two sources keep that inside the rules here:
