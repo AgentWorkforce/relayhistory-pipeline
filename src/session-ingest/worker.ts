@@ -51,6 +51,13 @@
  *                              re-issues the same ledger call once after a 50-250 ms jittered pause; a second
  *                              failure propagates as before (429 with INGEST_BUFFER_LOCK_BUSY, else 503).
  *                              Rendered only from sessionIngest.bufferLockRetry: "on"
+ *   INGEST_LOCK_RETRY_BUDGET_MS unset/empty/0 = off (default) | an integer from LOCK_RETRY_BUDGET_MS_MIN to
+ *                              LOCK_RETRY_BUDGET_MS_MAX (5050..10000; buffered acceptance only, HTTP path only):
+ *                              the per-delivery budget for re-issuing a buffered claim / buffer_intent /
+ *                              buffer_receipt call that failed 55P03 / 40P01 / server 57014, with jittered
+ *                              exponential pauses (deliver.ts withLockRetry); supersedes INGEST_BUFFER_LOCK_RETRY.
+ *                              Anything else refuses (deliver.ts lockRetryBudgetRefusal: a budget the client's
+ *                              timeout or the Worker's deadline cannot hold). Not rendered by the Cloudflare stack.
  *   INGEST_INFLIGHT_LEASE      unset/empty/anything else = off (default) | observe | on (any case, trimmed): a
  *                              per-isolate in-flight lease per signed (org, workspace, user), taken on the HTTP
  *                              sync path before its first ledger call (inflight-lease.ts). observe: nothing is
@@ -124,7 +131,7 @@ import { httpAdmissionStoppedOrgs } from "./http-admission-stop.ts";
 import { CLAIM_LOCK_WAIT_MS_MAX, CLAIM_LOCK_WAIT_MS_MIN, sqlLedger } from "./ledger-sql.ts";
 import type { ReplicaMode, ReplicaSink, NeonReplicaMessage } from "./replica.ts";
 import { fanout, type FanoutMessage } from "./staging.ts";
-import type { StageLatencyFields } from "./deliver.ts";
+import { LOCK_RETRY_BUDGET_MS_MAX, LOCK_RETRY_BUDGET_MS_MIN, lockRetryBudgetRefusal, type StageLatencyFields } from "./deliver.ts";
 import type { WriteTarget } from "./writer.ts";
 import { routingFlag } from "./babysitter-retention.ts";
 import { createInflightLease, inflightLeaseMode, type InflightLease, type InflightLeaseMode } from "./inflight-lease.ts";
@@ -204,6 +211,8 @@ export interface IngestWorkerEnv {
   INGEST_CLAIM_TIMEOUT_BUSY?: string;
   INGEST_BUFFER_LOCK_BUSY?: string;
   INGEST_BUFFER_LOCK_RETRY?: string;
+  /** Unset/""/0 (default off) or 5050..10000 ms: the bounded buffered lock retry budget (deliver.ts withLockRetry). */
+  INGEST_LOCK_RETRY_BUDGET_MS?: string;
   /** observe | on (any case): the per-isolate in-flight lease (inflight-lease.ts). Anything else: off. */
   INGEST_INFLIGHT_LEASE?: string;
   /** 1..500 (strict integer): the maxRecords this Worker ADVERTISES (advertised-limits.ts). Unset or invalid: 500. */
@@ -253,6 +262,21 @@ function claimLockWaitMs(raw: string): number {
   return bounded(raw, CLAIM_LOCK_WAIT_MS_MIN, CLAIM_LOCK_WAIT_MS_MAX, "INGEST_CLAIM_LOCK_WAIT_MS");
 }
 
+/**
+ * INGEST_LOCK_RETRY_BUDGET_MS: unset, empty or "0" is off (undefined). Otherwise decimal digits only, buffered acceptance
+ * only, and a budget lockRetryBudgetRefusal admits; anything else refuses startup. Never echoes the value.
+ */
+export function lockRetryBudgetMs(raw: string | undefined, acceptanceMode: string): number | undefined {
+  const text = raw?.trim() ?? "";
+  if (text === "" || text === "0") return undefined;
+  const range = `an integer from ${LOCK_RETRY_BUDGET_MS_MIN} to ${LOCK_RETRY_BUDGET_MS_MAX}, or 0 for off`;
+  if (!/^\d+$/.test(text)) throw new Error(`session ingest: INGEST_LOCK_RETRY_BUDGET_MS must be ${range}`);
+  if (acceptanceMode !== "buffered") throw new Error("session ingest: INGEST_LOCK_RETRY_BUDGET_MS needs buffered acceptance");
+  const refusal = lockRetryBudgetRefusal(Number(text));
+  if (refusal !== undefined) throw new Error(`session ingest: INGEST_LOCK_RETRY_BUDGET_MS must be ${range} (${refusal})`);
+  return Number(text);
+}
+
 /** A required integer setting within [lo, hi]; never echoes the value. */
 function bounded(raw: string, lo: number, hi: number, name: string): number {
   const n = Number(raw.trim());
@@ -300,6 +324,8 @@ export interface IngestSettings {
   bufferLockBusy?: true;
   /** INGEST_BUFFER_LOCK_RETRY=on: that failure re-issues the same ledger call once after 50-250 ms. Absent (the default): one call. */
   bufferLockRetry?: true;
+  /** INGEST_LOCK_RETRY_BUDGET_MS (LOCK_RETRY_BUDGET_MS_MIN..MAX, buffered only): the bounded lock retry budget, HTTP path only. Absent (the default): off. */
+  lockRetryBudgetMs?: number;
   /** INGEST_INFLIGHT_LEASE=observe|on: the per-isolate in-flight lease on the HTTP sync path. Absent (the default): off. */
   inflightLease?: InflightLeaseMode;
   /** INGEST_ADVERTISED_MAX_RECORDS (1..500): the advertised maxRecords; acceptance stays 500. Absent (the default): 500 published. */
@@ -380,6 +406,8 @@ export async function ingestSettings(env: IngestWorkerEnv): Promise<IngestSettin
   const fenceMirror = s3FenceMirrorFlag(env.INGEST_S3_FENCE_MIRROR);
   // The fence-authority precondition (decision 0005): a malformed stop list is a loud configuration error, never off.
   const stoppedOrgs = httpAdmissionStoppedOrgs(env.INGEST_HTTP_ADMISSION_STOPPED_ORGS);
+  // Bounded buffered lock retry (deliver.ts withLockRetry): a budget the deadlines cannot hold refuses startup.
+  const lockRetryBudget = lockRetryBudgetMs(env.INGEST_LOCK_RETRY_BUDGET_MS, acceptanceMode);
   // Default off; the secrets are read and validated only when the flag is exactly "1". Isolated: the
   // secrets are runtime-mutable Secrets Store values, so an invalid flag or secret must never fail delivery
   // or the queue consumer. The erase route alone fails closed (503 unavailable); the log carries a code only.
@@ -429,6 +457,7 @@ export async function ingestSettings(env: IngestWorkerEnv): Promise<IngestSettin
     ...(routingFlag(env.INGEST_CLAIM_TIMEOUT_BUSY) ? { claimTimeoutBusy: true as const } : {}),
     ...(routingFlag(env.INGEST_BUFFER_LOCK_BUSY) ? { bufferLockBusy: true as const } : {}),
     ...(routingFlag(env.INGEST_BUFFER_LOCK_RETRY) ? { bufferLockRetry: true as const } : {}),
+    ...(lockRetryBudget !== undefined ? { lockRetryBudgetMs: lockRetryBudget } : {}),
     ...(inflightLeaseMode(env.INGEST_INFLIGHT_LEASE) ? { inflightLease: inflightLeaseMode(env.INGEST_INFLIGHT_LEASE)! } : {}),
     ...advertisedSetting(env.INGEST_ADVERTISED_MAX_RECORDS),
     ...(env.INGEST_CLAIM_LOCK_WAIT_MS ? { claimLockWaitMs: claimLockWaitMs(env.INGEST_CLAIM_LOCK_WAIT_MS) } : {}),
@@ -591,6 +620,8 @@ export function ingestApp(env: IngestWorkerEnv, settings: IngestSettings, run: R
     signingKey: settings.signingKey,
     deliver: {
       ...deliverDepsFor(settings, run, target, replica),
+      // HTTP path only: the admission queue consumer keeps one call per stage and its own queue retry.
+      ...(settings.lockRetryBudgetMs !== undefined ? { lockRetryBudgetMs: settings.lockRetryBudgetMs } : {}),
       fanout: (messages) => env.INGEST_FANOUT!.sendBatch(messages.map((body) => ({ body }))),
     },
     onboarding: { run },

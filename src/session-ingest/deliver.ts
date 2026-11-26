@@ -56,6 +56,19 @@ import {validatedCustodyAck} from "./custody-ack.ts";
  * the 5 s statement_timeout (past that it is a 57014, never retried). The retry adds at most 250 ms + 5 s
  * = 5.25 s per stage (a stage worst case of about 10.25 s); a request where both buffer stages retry adds
  * at most about 10.5 s, and holds its Hyperdrive connection for that long.
+ * Bounded lock retry, default off (INGEST_LOCK_RETRY_BUDGET_MS, `DeliverDeps.lockRetryBudgetMs`; buffered only):
+ * the buffered `claim`, `buffer_intent` and `buffer_receipt` ledger calls are re-issued, with the same input,
+ * after a jittered exponential pause (LOCK_RETRY), while one per-delivery budget lasts, when they fail with
+ * 55P03 / 40P01 (`ledger_lock_timeout`) or with a server-reported 57014 (`ledger_timeout`, SQLSTATE by code
+ * only). Each of those calls is one autocommit statement (the claim with INGEST_CLAIM_LOCK_WAIT_MS: one
+ * BEGIN..COMMIT transaction that is rolled back on any error), and an ERROR answer with a SQLSTATE means that
+ * statement's transaction was rolled back whole, so a repeat is a fresh first call (see withLockRetry). A retry
+ * starts only if the time already spent retrying, plus its pause, plus one worst-case attempt (the role's 5 s
+ * statement_timeout) fits the budget, so the delay the retries add never exceeds the budget. A success is never
+ * repeated; no other cause and no other stage (buffer_put, slot, consent, ...) is retried. On exhaustion the
+ * last error answers exactly as today (claimLockBusy / claimTimeoutBusy / bufferLockBusy apply to it). With the
+ * budget set it replaces INGEST_BUFFER_LOCK_RETRY's one-shot retry. Every delivery then carries
+ * `lock_retry_attempts` and, when a covered call failed, `lock_retry_outcome` (lockRetryFieldsOf).
  */
 import { log } from "../shared/log.ts";
 import type { Ledger, LedgerTenant, RevisionConflict, SlotRequest } from "./ledger.ts";
@@ -157,6 +170,16 @@ export interface DeliverDeps {
    */
   bufferLockRetry?: true;
   /**
+   * INGEST_LOCK_RETRY_BUDGET_MS (buffered acceptance): the per-delivery budget, in ms, for re-issuing a buffered
+   * claim / stage-intent / receipt call that failed with 55P03, 40P01 or a server 57014 (withLockRetry). Must
+   * pass lockRetryBudgetRefusal (LOCK_RETRY_BUDGET_MS_MIN..LOCK_RETRY_BUDGET_MS_MAX); an invalid value refuses
+   * the delivery (503 `lock_retry_budget_refused`) before any ledger call. Unset or 0 (the default): one call
+   * per stage, byte-identical. Supersedes `bufferLockRetry` when set.
+   */
+  lockRetryBudgetMs?: number;
+  /** Test seam for the lock retry budget clock (monotonic ms). Default Date.now. */
+  lockRetryClock?: () => number;
+  /**
    * INGEST_ADVERTISED_MAX_RECORDS (advertised-limits.ts): the maxRecords this Worker publishes in receipts and on
    * GET /v1/delivery/limits. Advertising only: acceptance stays MAX_DELIVERY_RECORDS. Unset (the default): 500.
    */
@@ -237,6 +260,8 @@ export interface DeliverResult {
     replica: ReplicaOutcome;
     rearmed: number;
     timing_ms: Record<string, number>;
+    /** Present only with `lockRetryBudgetMs` (buffered): this delivery's lock retry fields. */
+    lock_retry?: LockRetryFields;
   };
 }
 
@@ -417,9 +442,9 @@ function isClaimStatementTimeout(error: IngestUnavailable): boolean {
 
 /** The claim stage; with `claimLockBusy` its lock-wait 503, and with `claimTimeoutBusy` its statement-timeout
  * 503, becomes a 429 ClaimLockBusy (nothing else changes). */
-async function claimStage<T>(deps: Pick<DeliverDeps, "stageLatency" | "claimLockBusy" | "claimTimeoutBusy" | "random">, work: () => Promise<T>): Promise<T> {
+async function claimStage<T>(deps: Pick<DeliverDeps, "stageLatency" | "claimLockBusy" | "claimTimeoutBusy" | "random" | "sleep" | "lockRetryClock">, work: () => Promise<T>, tally?: LockRetryTally): Promise<T> {
   try {
-    return await runStage("claim", work, deps.stageLatency);
+    return tally ? await withLockRetry(deps, tally, "claim", () => runStage("claim", work, deps.stageLatency)) : await runStage("claim", work, deps.stageLatency);
   } catch (error) {
     if (error instanceof IngestUnavailable && error.stage === "claim" &&
       ((deps.claimLockBusy && error.cause_code === "ledger_lock_timeout") || (deps.claimTimeoutBusy && isClaimStatementTimeout(error))))
@@ -449,10 +474,23 @@ const isBufferLockWait = (error: unknown, stage: BufferLockStage): error is Inge
  * failure still standing is a 429 BufferLockBusy. Every other error propagates unchanged.
  */
 async function bufferLedgerStage<T>(
-  deps: Pick<DeliverDeps, "stageLatency" | "bufferLockBusy" | "bufferLockRetry" | "random" | "sleep" | "bufferLockRetryLog">,
+  deps: Pick<DeliverDeps, "stageLatency" | "bufferLockBusy" | "bufferLockRetry" | "random" | "sleep" | "bufferLockRetryLog" | "lockRetryClock">,
   name: BufferLockStage,
   work: () => Promise<T>,
+  tally?: LockRetryTally,
+  beforeRetry?: () => Promise<void>,
 ): Promise<T> {
+  // INGEST_LOCK_RETRY_BUDGET_MS: the bounded retry replaces the one-shot INGEST_BUFFER_LOCK_RETRY; the 429
+  // conversion of a lock wait still standing at the end is unchanged.
+  if (tally) {
+    try {
+      return await withLockRetry(deps, tally, name, () => runStage(name, work, deps.stageLatency), beforeRetry);
+    } catch (error) {
+      if (deps.bufferLockBusy && isBufferLockWait(error, name))
+        throw new BufferLockBusy(name, error.cause_code, error.db, claimLockRetryAfter(deps.random ?? Math.random));
+      throw error;
+    }
+  }
   if (!deps.bufferLockBusy && !deps.bufferLockRetry) return runStage(name, work, deps.stageLatency);
   const random = deps.random ?? Math.random;
   let error: unknown;
@@ -481,6 +519,168 @@ async function bufferLedgerStage<T>(
   throw error;
 }
 
+/**
+ * INGEST_LOCK_RETRY_BUDGET_MS constants (all ms).
+ *   attemptMaxMs       one ledger attempt's worst case: the ingest role's statement_timeout (5 s,
+ *                      supabase/bootstrap/session_ingest_role.sql). lock_timeout (2 s, or INGEST_CLAIM_LOCK_WAIT_MS)
+ *                      applies per lock acquisition, so a 55P03 attempt can also take up to the statement_timeout.
+ *   pauseBaseMs/pauseMaxMs  retry k (1-based, counted per delivery) pauses in [c/2, c], c = min(pauseMaxMs, pauseBaseMs * 2^(k-1)).
+ *   maxRetries         hard cap on retries per delivery, whatever the budget.
+ *   clientTimeoutMs    the uploader's per-request timeout: Relay Desktop's delivery drain (desktop-core
+ *                      history/delivery/worker.rs DrainOptions.request_timeout_ms, 30 s). A response after it is lost.
+ *   workerDeadlineMs   the Worker's own wall-clock assumption for one request: the SQL slot lease TTL
+ *                      (worker.ts deliverDepsFor ttlSeconds 90) and the in-flight lease holder expiry. Cloudflare
+ *                      sets no wall limit on an HTTP request while its client is connected, so the client binds.
+ *   baselineLedgerMs   the request's worst case WITHOUT retries on the covered path: claim, buffer_intent and
+ *                      buffer_receipt each up to attemptMaxMs.
+ *   marginMs           headroom left for S3 (buffer_put), slot, consent and transport.
+ */
+export const LOCK_RETRY = Object.freeze({
+  attemptMaxMs: 5_000,
+  pauseBaseMs: 50,
+  pauseMaxMs: 1_000,
+  maxRetries: 8,
+  clientTimeoutMs: 30_000,
+  workerDeadlineMs: 90_000,
+  baselineLedgerMs: 15_000,
+  marginMs: 5_000,
+});
+/** The smallest budget that admits one retry (first pause ceiling plus one worst-case attempt). */
+export const LOCK_RETRY_BUDGET_MS_MIN = LOCK_RETRY.attemptMaxMs + LOCK_RETRY.pauseBaseMs;
+/** The largest budget the deadlines admit: min(client, Worker) - baseline - margin (10 s with the defaults). */
+export const LOCK_RETRY_BUDGET_MS_MAX = Math.min(LOCK_RETRY.clientTimeoutMs, LOCK_RETRY.workerDeadlineMs) - LOCK_RETRY.baselineLedgerMs - LOCK_RETRY.marginMs;
+
+/**
+ * Why a lock retry budget must be refused, or undefined when it is admissible. `0` is "off" and admissible. A budget
+ * is refused when it is not a safe integer, when it is too small to admit even one retry, or when the request's
+ * worst case with it (baseline + budget + margin) would pass the client's timeout or the Worker's deadline.
+ * `limits` exists so the deadline rule itself can be tested; production uses LOCK_RETRY.
+ */
+export function lockRetryBudgetRefusal(budgetMs: number, limits: { clientTimeoutMs: number; workerDeadlineMs: number } = LOCK_RETRY): string | undefined {
+  if (!Number.isSafeInteger(budgetMs) || budgetMs < 0) return "lock_retry_budget_not_integer";
+  if (budgetMs === 0) return undefined;
+  if (budgetMs < LOCK_RETRY_BUDGET_MS_MIN) return "lock_retry_budget_below_one_attempt";
+  const deadline = Math.min(limits.clientTimeoutMs, limits.workerDeadlineMs);
+  if (LOCK_RETRY.baselineLedgerMs + budgetMs + LOCK_RETRY.marginMs > deadline) return "lock_retry_budget_exceeds_deadline";
+  return undefined;
+}
+
+export type LockRetryOutcome = "succeeded_after_retry" | "exhausted" | "not_retryable";
+export const LOCK_RETRY_OUTCOMES: readonly LockRetryOutcome[] = Object.freeze(["succeeded_after_retry", "exhausted", "not_retryable"]);
+/**
+ * The per-delivery route-line fields (only with the budget set). `lock_retry_attempts`: retries issued (0 = none).
+ * `lock_retry_outcome`, present only when a covered call (claim / buffer_intent / buffer_receipt) failed at least once:
+ * succeeded_after_retry (the last such failure was retried into a success), exhausted (the last one was retryable
+ * but the budget or the retry cap was spent), not_retryable (the last one was outside 55P03 / 40P01 / server 57014).
+ */
+export interface LockRetryFields { lock_retry_attempts: number; lock_retry_outcome?: LockRetryOutcome }
+interface LockRetryTally { readonly budgetMs: number; spentMs: number; attempts: number; outcome?: LockRetryOutcome }
+
+const LOCK_RETRY_OF_ERROR = new WeakMap<object, LockRetryFields>();
+
+/** This delivery's lock retry fields: from a DeliverResult, or from the error a delivery threw. Undefined with the budget off. */
+export function lockRetryFieldsOf(subject: unknown): LockRetryFields | undefined {
+  if (subject === null || typeof subject !== "object") return undefined;
+  const stats = (subject as { stats?: { lock_retry?: LockRetryFields } }).stats;
+  if (stats && typeof stats === "object" && stats.lock_retry) return stats.lock_retry;
+  return LOCK_RETRY_OF_ERROR.get(subject);
+}
+
+const tallyFields = (t: LockRetryTally): LockRetryFields => ({ lock_retry_attempts: t.attempts, ...(t.outcome ? { lock_retry_outcome: t.outcome } : {}) });
+
+/** The pause before retry `k` (1-based, per delivery): an integer in [ceil(c/2), c], c = min(max, base * 2^(k-1)). */
+export function lockRetryPauseMs(k: number, random: () => number): number {
+  const ceiling = Math.min(LOCK_RETRY.pauseMaxMs, LOCK_RETRY.pauseBaseMs * 2 ** Math.max(0, k - 1));
+  const floor = Math.ceil(ceiling / 2);
+  const r = random();
+  return floor + Math.floor((Number.isFinite(r) && r >= 0 && r < 1 ? r : 0) * (ceiling - floor + 1));
+}
+
+type LockRetryStage = "claim" | BufferLockStage;
+/** The lock-wait SQLSTATEs worth waiting out (an ERROR answer with any SQLSTATE proves the statement rolled back). */
+const LOCK_RETRY_SQLSTATES: ReadonlySet<string> = new Set(["55P03", "40P01"]);
+/**
+ * Retryable: a ledger failure of the stage itself (IngestUnavailable) with cause `ledger_lock_timeout` and SQLSTATE
+ * 55P03 / 40P01, or cause `ledger_timeout` with SQLSTATE 57014 read from the error's code (isClaimStatementTimeout),
+ * labelled with this stage (an IngestUnavailable the ledger itself threw for another stage passes through untouched).
+ * A name-only client/pool timeout, a connection error (08xxx), a typed refusal (DeliveryError: 403, 409, 429, ...) and
+ * every other cause are ambiguous or final and never retried.
+ */
+function isRetryableLockFailure(error: unknown, stage: LockRetryStage): boolean {
+  if (!(error instanceof IngestUnavailable) || error.stage !== stage || error.db === undefined) return false;
+  if (error.cause_code === "ledger_lock_timeout") return LOCK_RETRY_SQLSTATES.has(error.db.db_error_code);
+  return isClaimStatementTimeout(error);
+}
+
+/**
+ * One covered ledger stage under the delivery's lock retry budget. `attempt` is ONE plain stage run (runStage: one
+ * ledger call, one statement or one claim transaction); it is re-run unchanged, so each retry is its own new short
+ * transaction with the same input. Idempotency (why a repeat is safe): PostgreSQL answers ERROR with a SQLSTATE only
+ * after aborting the failed statement's transaction, so after 55P03 / 40P01 / 57014 nothing the call did persists:
+ * no claim row or token, no stage-intent row, no outbox / acknowledged receipt (advisory xact locks and the origin
+ * claim mark go with it). The repeat therefore meets exactly the state a client retry would: the claim claims or
+ * resumes (pending batch) or replays; ingest_prepare_buffer_stage returns the existing intent for the same claim and
+ * stage key or inserts it; ingest_commit_buffered_batch commits, answers an acknowledged intent with `committed`, or
+ * answers `intent_invalid` / 55000 (expired), which are final. A success returns at once (never repeated); only the
+ * errors isRetryableLockFailure admits are retried; the S3 put between intent and receipt is outside every attempt.
+ * `beforeRetry` runs after each pause and before the repeat (the receipt re-checks upload consent there).
+ */
+async function withLockRetry<T>(
+  deps: Pick<DeliverDeps, "random" | "sleep" | "lockRetryClock">,
+  tally: LockRetryTally,
+  stage: LockRetryStage,
+  attempt: () => Promise<T>,
+  beforeRetry?: () => Promise<void>,
+): Promise<T> {
+  const random = deps.random ?? Math.random;
+  const sleep = deps.sleep ?? ((ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms)));
+  const clock = deps.lockRetryClock ?? Date.now;
+  // Set while a retry (its pause, beforeRetry and the repeated attempt) is running: all of that is charged to the budget.
+  let retryStarted: number | undefined;
+  const charge = () => {
+    if (retryStarted === undefined) return;
+    tally.spentMs += Math.max(0, clock() - retryStarted);
+    retryStarted = undefined;
+  };
+  for (;;) {
+    let error: unknown;
+    try {
+      const value = await attempt();
+      if (retryStarted !== undefined) { charge(); tally.outcome = "succeeded_after_retry"; }
+      return value;
+    } catch (failed) {
+      error = failed;
+    }
+    charge();
+    if (!isRetryableLockFailure(error, stage)) { tally.outcome = "not_retryable"; throw error; }
+    const next = tally.attempts + 1;
+    const pause = lockRetryPauseMs(next, random);
+    // Start a retry only if its pause and one worst-case attempt still fit what is left of the budget.
+    if (next > LOCK_RETRY.maxRetries || tally.spentMs + pause + LOCK_RETRY.attemptMaxMs > tally.budgetMs) {
+      tally.outcome = "exhausted";
+      throw error;
+    }
+    tally.attempts = next;
+    retryStarted = clock();
+    try {
+      await sleep(pause);
+      if (beforeRetry) await beforeRetry();
+    } catch (refused) {
+      charge();
+      tally.outcome = "not_retryable";
+      throw refused;
+    }
+  }
+}
+
+/** The delivery's tally: only with a budget, in buffered acceptance. A refused budget refuses the delivery, never runs unbounded. */
+function lockRetryTallyFor(deps: Pick<DeliverDeps, "lockRetryBudgetMs" | "acceptanceMode">): LockRetryTally | undefined {
+  if (deps.lockRetryBudgetMs === undefined || deps.lockRetryBudgetMs === 0) return undefined;
+  if (lockRetryBudgetRefusal(deps.lockRetryBudgetMs) !== undefined) throw new IngestUnavailable("precheck", "lock_retry_budget_refused");
+  if (deps.acceptanceMode !== "buffered") return undefined;
+  return { budgetMs: deps.lockRetryBudgetMs, spentMs: 0, attempts: 0 };
+}
+
 export async function deliverBatch(deps: DeliverDeps, tenant: LedgerTenant, batch: HistoryExportBatch): Promise<DeliverResult> {
   const started = Date.now();
   // 403 delivery_account_mismatch, 413 delivery_too_large, exactly as relayhistory.
@@ -502,6 +702,19 @@ export async function deliverPrepared(deps: DeliverDeps, tenant: LedgerTenant, p
 }
 
 async function deliverPreparedCore(deps: DeliverDeps, tenant: LedgerTenant, prepared: PreparedDelivery, started: number, firstTiming: "prepare" | "precheck"): Promise<DeliverResult> {
+  const tally = lockRetryTallyFor(deps);
+  // Budget off (the default): exactly the delivery as before, no tally, no extra field.
+  if (!tally) return deliverPreparedInner(deps, tenant, prepared, started, firstTiming);
+  try {
+    const result = await deliverPreparedInner(deps, tenant, prepared, started, firstTiming, tally);
+    return { ...result, stats: { ...result.stats, lock_retry: tallyFields(tally) } };
+  } catch (error) {
+    if (error !== null && typeof error === "object") LOCK_RETRY_OF_ERROR.set(error, tallyFields(tally));
+    throw error;
+  }
+}
+
+async function deliverPreparedInner(deps: DeliverDeps, tenant: LedgerTenant, prepared: PreparedDelivery, started: number, firstTiming: "prepare" | "precheck", tally?: LockRetryTally): Promise<DeliverResult> {
   const stage = stagesFor(deps);
   const now = deps.now ?? (() => new Date());
   const timing: Record<string, number> = {};
@@ -527,7 +740,7 @@ async function deliverPreparedCore(deps: DeliverDeps, tenant: LedgerTenant, prep
       sessions,
       records: prepared.records.map((r) => ({ source: r.source, sessionId: r.session_id, recordId: r.record_id, revisionId: r.revision_id, revision: r.revision, digest: r.digest })),
     }),
-  );
+  tally);
   mark("claim");
   const base = { records: prepared.records.length, sessions: sessions.length, deleted_sessions: 0, stale: 0, manifests_written: 0, replica: "off" as ReplicaOutcome, rearmed: 0 };
   if (claim.kind === "replay") {
@@ -552,7 +765,7 @@ async function deliverPreparedCore(deps: DeliverDeps, tenant: LedgerTenant, prep
   prepared.records.forEach((r, i) => {
     if (!stale.has(i) && !(r.session_id && deleted.has(pair(r.source, r.session_id)))) keep.push(i);
   });
-  const write = () => writeAndCommit(deps, tenant, prepared, sessions, deleted, keep, claim.resets, claim.claimToken, { ...base, stale: stale.size }, timing, mark, now);
+  const write = () => writeAndCommit(deps, tenant, prepared, sessions, deleted, keep, claim.resets, claim.claimToken, { ...base, stale: stale.size }, timing, mark, now, tally);
   const work = () => deps.withSessionWrites && keep.length
     ? deps.withSessionWrites(tenant, groupRecords(keep.map(i => prepared.records[i]!), now()).groups.map(g => [g.source, g.sessionId] as [string, string]), write)
     : write();
@@ -582,6 +795,7 @@ async function writeAndCommit(
   timing: Record<string, number>,
   mark: (name: string) => void,
   now: () => Date,
+  tally?: LockRetryTally,
 ): Promise<DeliverResult> {
   const stage = stagesFor(deps);
   const machineId = liveMachineId(tenant.workspaceId, prepared.originId, tenant.userId);
@@ -633,12 +847,14 @@ async function writeAndCommit(
     const preparedStage = await stage("buffer_prepare", async () => prepareBufferedStage(deps.target.keyRoot,
       {claim_token:claimToken,batch_digest:prepared.batchDigest,received_at:receivedAt.toISOString(),org_id:tenant.orgId,workspace_id:tenant.workspaceId,origin_id:prepared.originId,user_id:tenant.userId},
       grouped.groups, grouped.index.map(indexes => indexes.map(i => keep[i]!))));
-    const intent = await bufferLedgerStage(deps, "buffer_intent", () => deps.ledger.prepareBufferStage!({...attempt,...preparedStage.spec}));
+    const intent = await bufferLedgerStage(deps, "buffer_intent", () => deps.ledger.prepareBufferStage!({...attempt,...preparedStage.spec}), tally);
     mark("buffer_intent");
     await stage("buffer_put", () => putBufferedStage(deps.target.store,preparedStage));
     mark("buffer_put");
-    if (deps.consentGate) await consentStage(deps, new Set(deleted), "commit");
-    const ack=await bufferLedgerStage(deps, "buffer_receipt", () => deps.ledger.commitBuffered!({...attempt,stageToken:intent.stageToken}));
+    const commitConsent = deps.consentGate ? () => consentStage(deps, new Set(deleted), "commit") : undefined;
+    if (commitConsent) await commitConsent();
+    // A retried receipt re-checks consent after its pause, so a narrowing that landed meanwhile still refuses it.
+    const ack=await bufferLedgerStage(deps, "buffer_receipt", () => deps.ledger.commitBuffered!({...attempt,stageToken:intent.stageToken}), tally, commitConsent);
     let custodyAck:CurrentCustodyAck|undefined;
     if(deps.custody){try{custodyAck=validatedCustodyAck(ack,deps.custody)}catch{throw new IngestUnavailable("buffer_receipt","custody_ack_missing")}}
     mark("buffer_receipt");
