@@ -1190,10 +1190,18 @@ removal (and the deny's line), and until the phase is first applied any deploy t
 `96bulls/.ledger/rearm-sweeper/`, and a fence-authority reader can only treat a receipt there as the sweeper's if no
 other principal can write it. While `rearmSweeperRoleArn` is set, the bucket policy carries, after the five grants,
 `RearmSweeperOnlyItWritesItsState` (`rearmSweeperStateDenyStatement`): Deny `s3:PutObject` and `s3:DeleteObject` on
-`96bulls/.ledger/rearm-sweeper/*` to `Principal: "*"` with `ArnNotEquals` `aws:PrincipalArn` = that role. It does not
-cover `s3:DeleteObjectVersion` (the eraser's version deletes are unchanged; removing a receipt can only make the
-evidence missing, which the reader treats as not live) and it grants nothing. Lifecycle expiration is S3's own action
-and is not evaluated against the bucket policy.
+`96bulls/.ledger/rearm-sweeper/*` to `Principal: "*"` with `ArnNotEquals` `aws:PrincipalArn` = that role. It grants
+nothing. Lifecycle expiration is S3's own action and is not evaluated against the bucket policy.
+- **Exclusive write authority, not protection of the visible state.** The deny proves that whatever is read under the
+  prefix was written by the sweeper role. It does not cover `s3:DeleteObjectVersion` (the requested scope; the
+  eraser's version deletes are unchanged). On this versioned bucket, deleting the current version of a rewritten
+  object exposes its previous version as current: for an org's `latest.json` that is a rollback to an older pointer,
+  and if the receipt it names is retained and still inside the reader's freshness window, the reader accepts that
+  older, genuine pass. Deleting a receipt's only version makes the evidence missing, which the reader treats as not
+  live. Who may delete versions on this prefix is a separate control: `OnlyTheEraserDeletes` limits deletes to the
+  eraser, the GC and the sweeper, and `RearmSweeperNeverDotPrefixes` denies the sweeper. The authority's freshness
+  window bounds how old a rolled-back pass can be, and so does `expire-noncurrent-versions`: a superseded pointer
+  version only exists until that rule removes it.
 - **Precondition:** the deployed sweeper must sign as exactly that role (EKS Pod Identity or the Lambda execution
   role: `aws:PrincipalArn` is the role ARN for its sessions). A sweeper running `INGEST_REARM_CREDENTIALS=keys` as
   any other principal would have its cursor writes denied (`access_denied`, exit 2).
@@ -1206,19 +1214,27 @@ and is not evaluated against the bucket policy.
   revocation removes whichever set is live. Its Sid starts with `RearmSweeper`, so every other phase refuses a plan
   that touches it.
 - **Rollback:** set `rearmSweeperStateDeny: false`, plan (the same phase now accepts removing exactly the statement,
-  and only with the input false) and apply. The grants stay. Re-enable by omitting the input or setting `true`.
+  and only with the input false) and apply. The grants stay. Re-enable by omitting the input or setting `true`. The
+  phase removes the statement only when the live one is byte-for-byte the reviewed rendering for the role (so does a
+  full revocation): a drifted statement with this Sid (a wider resource, another principal condition) is refused and
+  needs a separate, reviewed repair.
+- **Before apply:** bind the exact signing role ARN to the serving sweeper workload with dated evidence (its Pod
+  Identity association and the CronJob's service account), and set `rearmSweeperRoleArn` to exactly that ARN. A
+  report of the mechanism alone is not that binding.
 
 **D5: pass receipts expire.** The receipts are create-only, one per org per pass, and the sweeper may not delete under
 a dot prefix, so `transcriptStore.rearmPassReceiptRetentionDays` (a positive whole number of days; no default, and
-this repo picks no value) adds one lifecycle rule, last: `expire-rearm-sweeper-pass-receipts`, `Filter.Prefix`
+this repo picks no value; 90 days is b1's proposal, pending the named sessions-prod operator's retention decision)
+adds one lifecycle rule, last: `expire-rearm-sweeper-pass-receipts`, `Filter.Prefix`
 `96bulls/.ledger/rearm-sweeper/passes/`, `Expiration.Days` = the input. Current-version expiry only, on `passes/`
 only (never the cursors beside it). Omitted, the lifecycle configuration is exactly as before, and the writer deny is
 unaffected.
 - **On this versioned bucket:** at the due day S3 adds a delete marker (the receipt becomes noncurrent);
   `expire-noncurrent-versions` removes that version `NONCURRENT_VERSION_DAYS` later and
-  `remove-expired-delete-markers` then removes the lone marker. Lifecycle runs asynchronously and S3 rounds due times
-  up to the next 00:00 UTC, so an expired receipt can stay readable for about a day longer: the reader's freshness
-  window, not expiry, bounds what counts. Each org's `latest.json` is rewritten every pass, so while the sweeper runs
+  `remove-expired-delete-markers` then removes the lone marker. Two separate delays apply: eligibility is the
+  object's creation time plus the days, rounded up to the next 00:00 UTC; the expiration action then runs
+  asynchronously some time after eligibility, with no completion bound. Until it has run the receipt stays readable,
+  so the reader's freshness window, never expiry, bounds what counts. Each org's `latest.json` is rewritten every pass, so while the sweeper runs
   its current version stays younger than the pass interval; once the sweeper stops rewriting it, it expires too and
   the reader reports the org as missing (fail closed).
 - **Plan contract:** any plan whose `transcripts` update marks `lifecycleRules` is the "rearm receipt retention" phase,
@@ -1228,23 +1244,33 @@ unaffected.
 - **Rollback:** remove the input, plan (the same phase accepts removing exactly the rule) and apply. Receipts already
   given a delete marker stay recoverable as noncurrent versions until `expire-noncurrent-versions` removes them.
 
-**D5 readback and verification (an authorized operator only; nothing here runs them).** After applying either phase:
+**D5 readback and verification (an authorized operator only; nothing here runs them).**
+0. Before applying either phase, save both pre-change configurations as the rollback reference: the bucket policy
+   (`aws s3api get-bucket-policy`) and the lifecycle configuration (`aws s3api get-bucket-lifecycle-configuration`),
+   with the time read and the bucket's account. Simulate the PROPOSED policy (the rendered plan's policy document)
+   with the cases in step 2, recording each case the same way, before applying.
+
+After applying either phase:
 1. Read the policy back with `aws s3api get-bucket-policy` for the transcripts bucket. Confirm
    `RearmSweeperOnlyItWritesItsState` is present (or, rolled back, absent) and byte-equal to what this repo renders for
    the configured role, with every other statement unchanged from before the apply.
 2. Simulate against THAT policy (the read-back document as the resource policy, never a hand-written copy), with the
    IAM policy simulator. Record, for each case, the principal, the action, one representative resource, the decision
    and the simulator's limitations:
-   - the ingest writer role, `s3:PutObject` on an ordinary transcript key outside the prefix: still allowed (no
-     regression);
-   - a non-sweeper principal (the ingest writer, an operator role), `s3:PutObject` and `s3:DeleteObject` on a key
-     under `96bulls/.ledger/rearm-sweeper/`: denied;
-   - the sweeper role, `s3:PutObject` on a receipt key under `passes/`: allowed.
+   - the backlog-ops write role, `s3:PutObject` and `s3:DeleteObject` on a key under
+     `96bulls/.ledger/rearm-sweeper/`: denied;
+   - any other non-sweeper principal (the ingest writer, an operator role), `s3:PutObject` and `s3:DeleteObject` on a
+     key under that prefix: denied;
+   - the certified sweeper role, `s3:PutObject` on a receipt key under `passes/`: allowed;
+   - the ingest writer role, `s3:PutObject` on an ordinary transcript key outside the prefix: allowed (no
+     regression).
    If the simulator cannot evaluate a combination faithfully (the sweeper's cross-account role together with this
    resource policy, or a condition key such as `aws:PrincipalArn` it does not populate), record that case as
    inconclusive. Never substitute a live write, and never an identity-policy-only simulation.
 3. Lifecycle: read back with `aws s3api get-bucket-lifecycle-configuration` and confirm the rules are exactly
    `transcriptLifecycleRules` for the configured days (the receipt rule last, the three existing rules unchanged).
+4. To roll back outside the stack, restore the configuration saved in step 0; through the stack, use the inputs above
+   (`rearmSweeperStateDeny: false`, or unset `rearmPassReceiptRetentionDays`), each its own phase.
 
 **How a capture stays read-only.** `alchemy plan` against `AWS.state` is not
 read-only: Alchemy takes a lease (PUT then DELETE of `__lease__.json`) and

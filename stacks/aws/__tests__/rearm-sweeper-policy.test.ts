@@ -303,6 +303,26 @@ describe("D5 rearm sweeper writer deny plan phase", () => {
     expect(one(withDeny, grantsOnly, { ...set, rearmSweeperStateDeny: false })).toBe("rearm sweeper writer deny");
     expect(() => one(withDeny, grantsOnly)).toThrow(/removes the state deny but transcriptStore.rearmSweeperStateDeny is not false/);
     expect(() => one(withDeny, grantsOnly, {})).toThrow(/rearmSweeperRoleArn is unset/);
+    // A drifted live deny with this Sid is never removed under D5: a broadened resource, a changed principal
+    // condition, a wider action set or another effect each refuse the rollback (and the full revocation).
+    const off = { ...set, rearmSweeperStateDeny: false };
+    const liveDeny = (patch: (x: any) => any) => withDeny.map((x: any) => x.Sid === REARM_SWEEPER_STATE_DENY_SID ? patch(x) : x);
+    const drifts = [
+      liveDeny((x) => ({ ...x, Resource: `${P.bucketArn}/96bulls/*` })),
+      liveDeny((x) => ({ ...x, Resource: `${P.bucketArn}/*` })),
+      liveDeny((x) => ({ ...x, Condition: { ArnNotEquals: { "aws:PrincipalArn": [roleArn, pEraser] } } })),
+      liveDeny((x) => ({ ...x, Condition: { ArnNotEquals: { "aws:PrincipalArn": `arn:aws:iam::${sweeperAccount}:role/other` } } })),
+      liveDeny((x) => ({ ...x, Action: ["s3:*"] })),
+      liveDeny(({ Condition, ...x }) => x),
+    ];
+    for (const drifted of drifts) {
+      expect(() => one(drifted, grantsOnly, off)).toThrow(/RearmSweeperOnlyItWritesItsState must be exactly the reviewed statement to be removed/);
+      const both = { transcripts: "update", "transcripts-key": "update" };
+      expect(() => check({ transcripts: bucketBlock(drifted, pBucket()), "transcripts-key": keyBlock(pKey(roleArn), pKey()) }, both)).toThrow(/RearmSweeperOnlyItWritesItsState must be exactly the reviewed statement to be removed/);
+    }
+    // The ordinary rollback and revocation stay accepted.
+    expect(one(withDeny, grantsOnly, off)).toBe("rearm sweeper writer deny");
+    expect(check({ transcripts: bucketBlock(withDeny, pBucket()), "transcripts-key": keyBlock(pKey(roleArn), pKey()) }, { transcripts: "update", "transcripts-key": "update" })).toBe("rearm sweeper grants");
   });
 
   it("a fresh grant carries the deny exactly when it is on; a revocation removes whichever set is live", () => {

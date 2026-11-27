@@ -1520,7 +1520,16 @@ function assertRearmSweeperGrantDiff(block: readonly string[], resource: (typeof
         ? `${REARM_DENY_SID} must change by exactly one added line, the rearm sweeper role as the last aws:PrincipalArn item`
         : `${REARM_DENY_SID} must lose exactly one line, the rearm sweeper role as the last aws:PrincipalArn item`);
   }
-  if (!adds) return undefined;
+  if (!adds) {
+    // Revoking: a live state deny is removed only when it is exactly the reviewed one for the grants' role.
+    if (removed.includes(REARM_SWEEPER_STATE_DENY_SID)) {
+      const n = transcriptNames(TRANSCRIPT_STAGE, TRANSCRIPT_ACCOUNT_ID);
+      const want = rearmSweeperStateDenyStatement({ bucketArn: n.bucketArn, roleArn });
+      if (unquoteYaml(live.bySid.get(REARM_SWEEPER_STATE_DENY_SID)!) !== planYaml([want], live.itemIndent).join("\n"))
+        refuse(`${REARM_SWEEPER_STATE_DENY_SID} must be exactly the reviewed statement to be removed`);
+    }
+    return undefined;
+  }
   const addsDeny = added.includes(REARM_SWEEPER_STATE_DENY_SID);
   if (resource === "transcripts" && withDeny !== undefined && addsDeny !== withDeny)
     refuse(withDeny ? `must add ${REARM_SWEEPER_STATE_DENY_SID} with the grants (transcriptStore.rearmSweeperStateDeny is on)` : `adds ${REARM_SWEEPER_STATE_DENY_SID} but transcriptStore.rearmSweeperStateDeny is false`);
@@ -1563,13 +1572,15 @@ function rearmSweeperStateDenyPhase(operations: ReadonlyMap<string, string>, lin
   // The live grants name exactly the input's role.
   const named = new Set(REARM_SWEEPER_BUCKET_SIDS.flatMap((sid) => [...live.bySid.get(sid)!.matchAll(/^\s*AWS:\s*(\S+)\s*$/gm)].map((m) => unquoteYaml(`AWS: ${m[1]!}`).slice(5))));
   if (named.size !== 1 || !named.has(inputRoleArn!)) say("the live rearm grants must name exactly transcriptStore.rearmSweeperRoleArn");
-  if (plannedDeny) {
-    if (!withDeny) say("adds the state deny but transcriptStore.rearmSweeperStateDeny is false");
-    const n = transcriptNames(TRANSCRIPT_STAGE, TRANSCRIPT_ACCOUNT_ID);
-    const want = rearmSweeperStateDenyStatement({ bucketArn: n.bucketArn, roleArn: inputRoleArn! });
-    if (unquoteYaml(planned.bySid.get(REARM_SWEEPER_STATE_DENY_SID)!) !== planYaml([want], planned.itemIndent).join("\n"))
-      say(`${REARM_SWEEPER_STATE_DENY_SID} must be exactly the reviewed statement`);
-  } else if (withDeny) say("removes the state deny but transcriptStore.rearmSweeperStateDeny is not false");
+  if (plannedDeny && !withDeny) say("adds the state deny but transcriptStore.rearmSweeperStateDeny is false");
+  if (!plannedDeny && withDeny) say("removes the state deny but transcriptStore.rearmSweeperStateDeny is not false");
+  // Added or removed, the statement must be exactly the reviewed one for the role: a drifted live deny with this Sid
+  // (a wider resource, another principal condition) is never removed under this phase.
+  const n = transcriptNames(TRANSCRIPT_STAGE, TRANSCRIPT_ACCOUNT_ID);
+  const want = rearmSweeperStateDenyStatement({ bucketArn: n.bucketArn, roleArn: inputRoleArn! });
+  const side = plannedDeny ? planned : live;
+  if (unquoteYaml(side.bySid.get(REARM_SWEEPER_STATE_DENY_SID)!) !== planYaml([want], side.itemIndent).join("\n"))
+    say(`${REARM_SWEEPER_STATE_DENY_SID} must be exactly the reviewed statement${plannedDeny ? "" : " to be removed"}`);
   return "rearm sweeper writer deny";
 }
 
@@ -2238,9 +2249,10 @@ export function rearmSweeperBucketTail(bucketArn: string, store: Pick<Transcript
  * receipt becomes noncurrent), expire-noncurrent-versions removes that version NONCURRENT_VERSION_DAYS later, and
  * remove-expired-delete-markers then removes the lone marker. Each `latest.json` is rewritten every pass, so while the
  * sweeper runs its current version stays younger than the pass interval; a pointer the sweeper stopped rewriting
- * expires too, which the reader treats as missing (fail closed). Lifecycle runs asynchronously (S3 rounds due times
- * to the next 00:00 UTC): an expired receipt may stay readable for up to a day longer; freshness, not expiry, bounds
- * what the reader accepts.
+ * expires too, which the reader treats as missing (fail closed). Two separate delays: ELIGIBILITY is the object's
+ * creation time plus `days`, rounded up to the next 00:00 UTC; the expiration ACTION then runs asynchronously, some
+ * time after eligibility, with no completion bound. Until it has run the receipt stays readable, so the reader's
+ * freshness window, never expiry, bounds what counts.
  */
 export const REARM_PASS_RECEIPT_RULE_ID = "expire-rearm-sweeper-pass-receipts";
 export const REARM_PASS_RECEIPT_PREFIX = `${TENANT_KEY_BASE}/.ledger/rearm-sweeper/passes/`;
