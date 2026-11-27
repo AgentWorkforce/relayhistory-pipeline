@@ -10,7 +10,7 @@
  * batch response); SQS redelivers them after the visibility timeout and moves
  * them to the DLQ after `maxReceiveCount`.
  */
-import { errorFields, log, searchIndexErrorDetail } from "../shared/log.ts";
+import { errorCodeFields, errorFields, log, searchIndexErrorDetail } from "../shared/log.ts";
 import { dbErrorReasonField } from "../shared/db-error-reason.ts";
 import { parseQueueBody, sequencerAfter, type LandedEvent, type QueueOrigin } from "./s3-events.ts";
 import { indexPointer, type PointerDeps, type SessionScope } from "./pointer.ts";
@@ -323,9 +323,10 @@ export async function processBatch(records: readonly QueueRecord[], deps: Consum
         merge(held.covered, covered);
       } else scopes.set(id, { scope: outcome.scope, messageIds: [...messageIds], manifestKey: outcome.manifestKey, covered: { ...covered } });
     } catch (error) {
-      const fields = errorFields(error);
-      // A 40001 / XX000 also logs which known failure it was (a closed slug, never the message; best-effort, never throws).
-      log.error("pointer index failed", { stage: "session-indexed", ...fields, ...dbErrorReasonField(error, fields.error_code), duration_ms: Date.now() - started });
+      const { fields, code } = errorCodeFields(error);
+      // A 40001 / XX000 (the error's own string code, never the name fallback) also logs which known failure it was
+      // (a closed slug, never the message; best-effort, never throws).
+      log.error("pointer index failed", { stage: "session-indexed", ...fields, ...dbErrorReasonField(error, code), duration_ms: Date.now() - started });
       for (const id of messageIds) fail(id, FAST_RETRY_CODES.has(fields.error_code as string));
     }
   }
