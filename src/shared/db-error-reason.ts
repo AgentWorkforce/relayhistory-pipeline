@@ -6,6 +6,8 @@
  * and supabase/bootstrap; db-error-reason.test.ts regenerates that list from the SQL and pins it equal to the keys
  * below, so a new 40001 RAISE without a slug fails the test). Postgres's own serialization failures add three texts.
  * The message is matched EXACTLY; only the slug leaves this module, never the message. Anything unmatched is `other`.
+ * The SQL pin reads every 40001 spelling (ERRCODE='40001', ERRCODE='serialization_failure', RAISE serialization_failure,
+ * RAISE SQLSTATE '40001') and requires each to be the ERRCODE='40001',MESSAGE='...' form this map is keyed by.
  */
 export const DB_SERIALIZATION_REASON_BY_MESSAGE: ReadonlyMap<string, string> = new Map([
   // Postgres's own 40001 texts (heapam / predicate.c).
@@ -173,14 +175,61 @@ export const PG_BUILTIN_SERIALIZATION_MESSAGES: readonly string[] = Object.freez
 /** Every value `db_error_reason` may take (log.ts ENUM_FIELDS uses exactly this set). */
 export const DB_ERROR_REASONS: readonly string[] = Object.freeze([...new Set(DB_SERIALIZATION_REASON_BY_MESSAGE.values()), "other"]);
 
+/** The longest message classified; anything longer (no known text is near it) is `other` without being scanned. */
+export const DB_REASON_MESSAGE_MAX = 512;
+
 /** The slug of a 40001's exact message (`other` when unknown or absent). Never throws, never returns the message. */
 export function dbSerializationReason(message: unknown): string {
   return (typeof message === "string" ? DB_SERIALIZATION_REASON_BY_MESSAGE.get(message) : undefined) ?? "other";
 }
 
-/** `{ db_error_reason }` for an error whose SQLSTATE `code` is 40001; `{}` for anything else. */
-export function dbErrorReasonField(err: unknown): { db_error_reason?: string } {
-  const e = err as { code?: unknown; message?: unknown } | null | undefined;
-  if (e?.code !== "40001") return {};
-  return { db_error_reason: dbSerializationReason(e.message) };
+/**
+ * SQLSTATE XX000 (internal_error) message FAMILIES for the sibling `db_internal_reason` field: Postgres's own
+ * internal texts carry ids/names after a fixed head, so each family is an anchored prefix regex and only the family
+ * slug is ever emitted. First match wins (could_not_open_relation before could_not_find). Unmatched: `other`.
+ */
+export const DB_INTERNAL_REASON_FAMILIES: readonly (readonly [RegExp, string])[] = Object.freeze([
+  [/^cache lookup failed for /, "cache_lookup_failed"],
+  [/^cached plan must not change result type$/, "cached_plan_result_type"],
+  [/^could not open relation /, "could_not_open_relation"],
+  [/^could not read block /, "could_not_read_block"],
+  [/^could not find /, "could_not_find"],
+  [/^tuple concurrently (?:updated|deleted)$/, "tuple_concurrently_modified"],
+  [/^unrecognized node type: /, "unrecognized_node_type"],
+] as const);
+
+/** Every value `db_internal_reason` may take (log.ts ENUM_FIELDS uses exactly this set). */
+export const DB_INTERNAL_REASONS: readonly string[] = Object.freeze([...new Set(DB_INTERNAL_REASON_FAMILIES.map(([, s]) => s)), "other"]);
+
+/** The family of an XX000's message (`other` when unknown, absent or too long). Never throws, never returns text. */
+export function dbInternalReason(message: unknown): string {
+  if (typeof message !== "string" || message.length > DB_REASON_MESSAGE_MAX) return "other";
+  for (const [re, slug] of DB_INTERNAL_REASON_FAMILIES) if (re.test(message)) return slug;
+  return "other";
+}
+
+/** The error's message if it is a readable, bounded string; else undefined. Never throws (a getter may). */
+function readMessage(err: unknown): string | undefined {
+  try {
+    if (err === null || (typeof err !== "object" && typeof err !== "function")) return undefined;
+    const m: unknown = (err as { message?: unknown }).message;
+    return typeof m === "string" && m.length <= DB_REASON_MESSAGE_MAX ? m : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * `{ db_error_reason }` for a 40001 and `{ db_internal_reason }` for an XX000; `{}` for any other code. `errorCode`
+ * is the code the caller already captured (errorFields' error_code), so the error's `code` is not read again. The
+ * message is read best-effort: a throwing getter, a non-string or an over-long message is `other`. Never throws.
+ */
+export function dbErrorReasonField(err: unknown, errorCode: unknown): { db_error_reason?: string; db_internal_reason?: string } {
+  try {
+    if (errorCode === "40001") return { db_error_reason: dbSerializationReason(readMessage(err)) };
+    if (errorCode === "XX000") return { db_internal_reason: dbInternalReason(readMessage(err)) };
+    return {};
+  } catch {
+    return errorCode === "40001" ? { db_error_reason: "other" } : errorCode === "XX000" ? { db_internal_reason: "other" } : {};
+  }
 }
