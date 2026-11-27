@@ -251,8 +251,6 @@ export class Syncer {
     const store = ob ? obligatedStore(this.target.store, this.state, LEASE_HOLDER, acked) : this.target.store;
     try {
       const keys: string[] = [];
-      // Prior copies an ambiguous date pin left as they are (leased, read as ours): kept, never retired here.
-      const held = new Set<string>();
       const truncations: { key: string; strings: number; maxChars: number }[] = [];
       const erase: { key: string; kind: "object" | "prefix"; org_id: string; reason: string }[] = [];
       const units = await sessionUnits(lane.db, work.org_id, work.session_id);
@@ -267,7 +265,6 @@ export class Syncer {
           // Work driven by a change must see a fence written with that change.
           freshFence: work.kind !== "recent" && work.kind !== "history",
           // Keep each stream at its first exported location: an earlier first_ts must not fork the session (datePin).
-          // An ambiguous prior (two dates of one stream) is unpinned and its other copies come back as `held`.
           priorKeys: prior?.keys,
           onLease: (k) => {
             const prefix = k.slice(0, -"manifest.json".length);
@@ -286,7 +283,6 @@ export class Syncer {
           ...(ob ? { onPublish: manifestClaim(this.state, acked, LEASE_HOLDER, gens) } : {}),
         });
         if (r.fenced) this.counters.fenced += 1;
-        for (const k of r.held) held.add(k);
         for (const m of r.manifests) {
           keys.push(m.manifestKey);
           truncations.push({ key: m.manifestKey, strings: m.truncatedStrings, maxChars: m.truncatedMaxChars });
@@ -304,7 +300,7 @@ export class Syncer {
       // Session prefixes this group no longer produces (fenced, emptied, moved
       // to another date or machine): the whole prefix goes to the erasure job,
       // unless the manifest there is no longer this exporter's.
-      const keep = new Set([...keys, ...held]);
+      const keep = new Set(keys);
       for (const key of new Set([...(prior?.keys ?? []), ...touched])) {
         if (keep.has(key)) continue;
         if (await erasableByExporter(this.target, work.org_id, key, work.session_id))
@@ -315,10 +311,9 @@ export class Syncer {
       if (ob) this.state.publishWrites([...acked].filter(([k]) => referenced.has(k) || keep.has(k)).map(([key, versionId]) => ({ key, versionId })), { holder: LEASE_HOLDER, gens });
       this.state.enqueueErasure(erase);
       // Under the lease: nothing this group now references, or writes under, stays queued.
-      // A held copy's queued erasure is cancelled too: a copy the group keeps never stays queued (both stay live).
-      this.state.cancelErasures([...referenced, ...[...keep].map((k) => k.slice(0, -"manifest.json".length))]);
+      this.state.cancelErasures([...referenced, ...keys.map((k) => k.slice(0, -"manifest.json".length))]);
       this.counters.erasuresQueued += erase.length;
-      this.state.markExported(work.org_id, work.session_id, work.revision, [...keep]);
+      this.state.markExported(work.org_id, work.session_id, work.revision, keys);
       this.state.recordTruncations(work.org_id, work.session_id, truncations);
       this.counters.groups += 1;
       this.counters.eventsDone += work.events;
