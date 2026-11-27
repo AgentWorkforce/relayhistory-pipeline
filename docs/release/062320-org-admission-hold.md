@@ -16,6 +16,23 @@ contract: `ingest_generation_overlap_admits` admits G during the transition. The
 4. Rebind G -> H.
 5. Rebuild every consumer at H-only, then close the window.
 
+## Where the approved overlap is recorded
+
+The release owner records the approved overlap durably in two places, both before any marker transition:
+- **The database window.** `sessions.ingest_generation_overlap_windows` (044030) holds one row per window, opened by
+  the overlap operator (`src/hoopdb/ingest-generation-overlap-operator.ts`). The row carries `from_generation` (G),
+  `to_generation` (H), `admit_during_apply`, `approval_sha256` (the hash of the approval text), `opened_by`,
+  `opened_at` and `expires_at`, at most 4 hours after it opens. Its `closed_at` and `closed_reason`
+  (`rebind` | `owner` | `expired`) record the close.
+- **The Worker overlap pair.** `PRIVATE_INGEST_OVERLAP` in `src/session-ingest/private-ingest-release.ts` records the
+  reviewed G and H pair for the private-ingest Worker, through tracked-profile deploys G -> G+H -> H. A rollback is
+  G+H -> G.
+
+Scope and expiry must cover pointer writes, the 778a indexing Lambda's included, for the whole rollout and the
+rollback path. If the rollout can outlast one window, the plan names each re-open before it starts. Hand this to the
+release owner and sfmini together with the release sha, the G observed at release time, and the H derived from that
+sha (`bun src/hoopdb/migrate.ts --generation`).
+
 ## Schema-gated consumer inventory
 
 Every consumer must be rebuilt at H before H-only. The release owner confirms each row against the live deployments.
