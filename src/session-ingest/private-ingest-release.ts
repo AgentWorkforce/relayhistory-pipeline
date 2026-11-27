@@ -171,13 +171,14 @@ const COMMON_PROFILE = {
  * The tracked profile carries overlapGeneration H and expectedGeneration stays G; deploy G+H, then
  * open the window, apply, rebind G -> H. The pair returns to null after the H-only deploy reads back
  * exactly H.
- *
- * For 062300 the policy and readiness marker were observed at 778af686 with no open window.
- * Verify the live Worker profile separately before opening the 062300 overlap.
+ * Done: the G+H deploy, the guarded apply through 062220 and rebind run 45547604573 (2026-11-25
+ * 04:33:35Z) moved the policy and all admission rows to H. This is lifecycle step (2) (step 6 of the
+ * required order): deploy H-only at the same baseline phase while retaining the pair solely to authorize
+ * the G+H -> H transition; step (3) sets it to null after the live Worker reads back exactly H.
  */
 export const PRIVATE_INGEST_OVERLAP: PrivateIngestOverlap | null = {
-  from: "778af6866b9b28b64ff5af46bc59b1d6c7de4b43e24302bf64321b222cdf23df",
-  to: "f31d73e2a286e712175fa8d4417f07895702012f80c1b3ff88a210381418e44a",
+  from: "3eef01d763c3a724d5a8f46f552fe50773e65d5a7a15cce7500f6ddd9d37904c",
+  to: "778af6866b9b28b64ff5af46bc59b1d6c7de4b43e24302bf64321b222cdf23df",
 };
 
 export const PRIVATE_INGEST_GENERATION_CONTRACT: PrivateIngestGenerationContract = {

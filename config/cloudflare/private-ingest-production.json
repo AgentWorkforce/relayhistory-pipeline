@@ -10,7 +10,6 @@
     "inlineMaxSessions": 0,
     "replicaMode": "off",
     "claimLockBusy": "on",
-    "asyncAdmission": "drain",
-    "overlapGeneration": "f31d73e2a286e712175fa8d4417f07895702012f80c1b3ff88a210381418e44a"
+    "asyncAdmission": "drain"
   }
 }
