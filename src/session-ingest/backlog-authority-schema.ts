@@ -11,7 +11,7 @@
  * the backfill's known keys; every other key's count is summed under `other`.
  */
 import { AUTHORITY_REFUSALS } from "./authority-evidence.ts";
-import { ERASURE_SOURCES } from "./erasure-window.ts";
+import { ERASURE_SOURCES, ERASURE_WINDOW_REASONS } from "./erasure-window.ts";
 const ERASURE_SOURCE_NAMES = Object.keys(ERASURE_SOURCES);
 
 type S =
@@ -96,8 +96,7 @@ export const AUTHORITY_DRY_SCHEMA: S = obj({ mode: codes("dry_run"), evidence: E
 /** erasure-window.ts ErasureWindowProof (already receipt keys). */
 const PROOF_SCHEMA: S = obj({
   v: codes("1"), kind: codes("erasure_window_proof"), status: codes("erasure_window_empty", "erasure_window_nonempty", "erasure_window_unproven"),
-  reason: codes("ok", "erasures_in_window", "hold_missing", "hold_epoch_mismatch", "hold_not_sealed", "read_invalid", "read_before_seal",
-    "history_starts_after_cutoff", "history_start_missing"),
+  reason: codes(...ERASURE_WINDOW_REASONS),
   org_hash: HASH, epoch_hash: nul(HASH), cutoff_ms: COUNT, read_at_ms: nul(COUNT), watermark_erasures: nul(COUNT),
   hold_state: nul(codes("held", "sealed", "marker_attempted")), sources: nul(obj(counts(...ERASURE_SOURCE_NAMES))),
   watermark_kind: codes("surviving_two_tables", "erasure_history_all_sources"),

@@ -53,9 +53,10 @@ export const ERASURE_SOURCE_EXCLUSIONS: Record<string, string> = {
 export const ERASURE_TABLE_NAME = /eras|delet|rearm|purge|tombstone|forget|reset/u;
 
 /**
- * One statement: every source's in-window count for the org, the 062320 status (hold and erasure watermark), and, when
- * the status declares a history install time, whether the history covers the cutoff: compared IN SQL at full
- * timestamptz (microsecond) precision, with the cutoff built exactly (epoch + ms intervals, no float division).
+ * One statement: every source's in-window count for the org, the hold status (062320; with slot 062340 also its
+ * erasure history), and, when 062340 has bound a cutoff to the epoch, whether that bound cutoff is exactly this run's
+ * FULL cutoff: compared IN SQL at full timestamptz (microsecond) precision, with the cutoff built exactly (epoch + ms
+ * intervals, no float division).
  */
 export const ERASURE_WINDOW_SQL = `
 WITH c AS (SELECT timestamptz 'epoch' + $2::bigint * interval '1 millisecond' AS cut),
@@ -63,14 +64,16 @@ st AS (SELECT sessions.ingest_org_admission_hold_status($1::text) AS j)
 SELECT ${(Object.entries(ERASURE_SOURCES) as [string, string][]).map(([t, w]) =>
   `(SELECT count(*) FROM sessions.${t} x CROSS JOIN c WHERE x.org_id = $1::text AND (${w.replaceAll("$2", "c.cut").replace(/(^|[ (])([a-z_]+) (>=|<>|IS)/gu, "$1x.$2 $3")}))::bigint AS ${t}`).join(",\n       ")},
        st.j AS status,
-       CASE WHEN st.j->>'history_installed_at' IS NULL THEN NULL
-            ELSE (st.j->>'history_installed_at')::timestamptz <= c.cut END AS history_covers,
+       CASE WHEN st.j->'erasure_history'->>'cutoff' IS NULL THEN NULL
+            ELSE (st.j->'erasure_history'->>'cutoff')::timestamptz = c.cut END AS history_cutoff_matches,
        floor(extract(epoch FROM statement_timestamp()) * 1000)::bigint AS read_at_ms
 FROM st CROSS JOIN c`;
 
 export type ErasureWindowStatus = "erasure_window_empty" | "erasure_window_nonempty" | "erasure_window_unproven";
-export type ErasureWindowReason = "ok" | "erasures_in_window" | "hold_missing" | "hold_epoch_mismatch" | "hold_not_sealed" | "read_invalid" | "read_before_seal"
-  | "history_starts_after_cutoff" | "history_start_missing";
+export type ErasureWindowReason = "ok" | "erasures_in_window" | "erasures_in_history" | "hold_missing" | "hold_epoch_mismatch" | "hold_not_sealed"
+  | "read_invalid" | "read_before_seal" | "history_unbound" | "history_cutoff_mismatch" | "history_not_covering_cutoff" | "history_not_recording";
+export const ERASURE_WINDOW_REASONS: readonly ErasureWindowReason[] = ["ok", "erasures_in_window", "erasures_in_history", "hold_missing", "hold_epoch_mismatch",
+  "hold_not_sealed", "read_invalid", "read_before_seal", "history_unbound", "history_cutoff_mismatch", "history_not_covering_cutoff", "history_not_recording"];
 
 export interface ErasureWindowProof {
   v: 1; kind: "erasure_window_proof"; status: ErasureWindowStatus; reason: ErasureWindowReason;
@@ -78,8 +81,9 @@ export interface ErasureWindowProof {
   org_hash: string; epoch_hash: string | null; cutoff_ms: number; read_at_ms: number | null; watermark_erasures: number | null;
   hold_state: "held" | "sealed" | "marker_attempted" | null; sources: Record<ErasureSource, number> | null;
   /**
-   * What the release-side count covers, as the 062320 status function declares it (its `watermark_kind`; absent, as
-   * today: surviving_two_tables). Read from SQL in the same statement, never asserted by a caller.
+   * What `watermark_erasures` counts, read from SQL in the same statement, never asserted by a caller: with slot 062340's
+   * `erasure_history` present, its history rows for the org since the bound cutoff (erasure_history_all_sources);
+   * without it (062320 alone), surviving rows of two tables (surviving_two_tables, snapshot-only).
    */
   watermark_kind: ReleaseWatermark;
 }
@@ -118,11 +122,16 @@ export function erasureWindowProof(org: string, epoch: string | null, cutoffMs: 
   let st: unknown = r.status;
   if (typeof st === "string") { try { st = JSON.parse(st); } catch { return base; } }
   const s = st as Record<string, unknown> | null;
-  const watermark = s && typeof s === "object" ? count(s.erasures) : null;
-  if (readAt === null || readAt < 1 || watermark === null) return base;
-  // Only an exact declared value upgrades the kind; anything else is today's partial watermark.
-  const declared = (s as Record<string, unknown>).watermark_kind === "erasure_history_all_sources" ? "erasure_history_all_sources" as const : "surviving_two_tables" as const;
-  const out = { ...base, read_at_ms: readAt, watermark_erasures: watermark, sources, watermark_kind: declared };
+  if (!s || typeof s !== "object" || Array.isArray(s) || readAt === null || readAt < 1) return base;
+  // 062340 present: its erasure_history object, and `erasures` = history rows since the bound cutoff (NULL unbound).
+  // 062320 alone: no erasure_history, and `erasures` = surviving rows of two tables.
+  const eh = s.erasure_history as Record<string, unknown> | undefined;
+  const historic = eh !== undefined;
+  if (historic && (eh === null || typeof eh !== "object" || Array.isArray(eh))) return base;
+  const watermark = s.erasures === null && historic ? null : count(s.erasures);
+  if (watermark === null && !(historic && s.erasures === null)) return base;
+  const out = { ...base, read_at_ms: readAt, watermark_erasures: watermark, sources,
+    watermark_kind: historic ? "erasure_history_all_sources" as const : "surviving_two_tables" as const };
   const h = s!.hold as Record<string, unknown> | null | undefined;
   if (h === undefined) return out;
   if (h === null || h.state === "released") return { ...out, reason: "hold_missing" };
@@ -133,19 +142,31 @@ export function erasureWindowProof(org: string, epoch: string | null, cutoffMs: 
   const state = h.state as "sealed" | "marker_attempted";
   if (sealedMs === null || Number.isNaN(sealedMs)) return { ...out, hold_state: state };
   if (!(readAt > sealedMs)) return { ...out, hold_state: state, reason: "read_before_seal" };
-  // The durable history (slot 062340) covers only events since its install. A status that declares the history must
-  // give a valid install time (history_start_missing otherwise); when it gives one, SQL compares it to the cutoff at full
-  // precision (history_covers), and a cutoff before the install is history_starts_after_cutoff. A status declaring
-  // neither (today) is snapshot-only: no coverage claim, no check. All mirror 062340's own SQL refusal.
-  const st2 = s as Record<string, unknown>;
-  const hasInstall = st2.history_installed_at !== undefined && st2.history_installed_at !== null;
-  if (declared === "erasure_history_all_sources" && !hasInstall) return { ...out, hold_state: state, reason: "history_start_missing" };
-  if (hasInstall) {
-    if (typeof r.history_covers !== "boolean") return { ...out, hold_state: state };
-    if (r.history_covers === false) return { ...out, hold_state: state, reason: "history_starts_after_cutoff" };
-  } else if (r.history_covers !== null && r.history_covers !== undefined) return { ...out, hold_state: state };
   const nonzero = Object.values(sources).some((n) => n > 0);
-  return { ...out, hold_state: state, status: nonzero ? "erasure_window_nonempty" : "erasure_window_empty", reason: nonzero ? "erasures_in_window" : "ok" };
+  if (!historic) {
+    // 062320 alone: snapshot-only corroboration (no history claim; a stray cutoff comparison is inconsistent).
+    if (r.history_cutoff_matches !== null && r.history_cutoff_matches !== undefined) return { ...out, hold_state: state };
+    return { ...out, hold_state: state, status: nonzero ? "erasure_window_nonempty" : "erasure_window_empty", reason: nonzero ? "erasures_in_window" : "ok" };
+  }
+  // 062340: the history must be bound to this epoch at exactly this run's FULL cutoff (SQL compares it), cover that
+  // cutoff, be recording, and agree with itself (by_source sums to erasures, only known sources).
+  const held = { ...out, hold_state: state };
+  if (eh!.cutoff === null || watermark === null) return { ...held, reason: "history_unbound" };
+  if (typeof r.history_cutoff_matches !== "boolean") return held;
+  if (r.history_cutoff_matches !== true) return { ...held, reason: "history_cutoff_mismatch" };
+  if (eh!.covered !== true) return { ...held, reason: eh!.covered === false ? "history_not_covering_cutoff" : "read_invalid" };
+  if (eh!.recording !== true) return { ...held, reason: eh!.recording === false ? "history_not_recording" : "read_invalid" };
+  const bs = eh!.by_source as Record<string, unknown> | null;
+  if (!bs || typeof bs !== "object" || Array.isArray(bs)) return held;
+  let sum = 0;
+  for (const [k, v] of Object.entries(bs)) {
+    const n = count(v);
+    if (!Object.hasOwn(ERASURE_SOURCES, k) || n === null || n === 0) return held;
+    sum += n;
+  }
+  if (sum !== watermark) return held;
+  if (watermark > 0) return { ...held, status: "erasure_window_nonempty", reason: "erasures_in_history" };
+  return { ...held, status: nonzero ? "erasure_window_nonempty" : "erasure_window_empty", reason: nonzero ? "erasures_in_window" : "ok" };
 }
 
 /** The closed shape of a proof (exact keys; every source present). */
@@ -158,8 +179,7 @@ export function validErasureWindowProof(v: unknown): v is ErasureWindowProof {
   const srcOk = src === null || (typeof src === "object" && Object.keys(src).length === Object.keys(ERASURE_SOURCES).length
     && Object.keys(ERASURE_SOURCES).every((k) => count(src[k]) !== null));
   return p.v === 1 && p.kind === "erasure_window_proof" && ["erasure_window_empty", "erasure_window_nonempty", "erasure_window_unproven"].includes(p.status as string)
-    && ["ok", "erasures_in_window", "hold_missing", "hold_epoch_mismatch", "hold_not_sealed", "read_invalid", "read_before_seal",
-      "history_starts_after_cutoff", "history_start_missing"].includes(p.reason as string)
+    && (ERASURE_WINDOW_REASONS as readonly unknown[]).includes(p.reason)
     && typeof p.org_hash === "string" && /^h_[0-9a-f]{32}$/u.test(p.org_hash) && (p.epoch_hash === null || (typeof p.epoch_hash === "string" && /^h_[0-9a-f]{32}$/u.test(p.epoch_hash)))
     && count(p.cutoff_ms) !== null && (p.read_at_ms === null || count(p.read_at_ms) !== null)
     && (p.watermark_erasures === null || count(p.watermark_erasures) !== null)

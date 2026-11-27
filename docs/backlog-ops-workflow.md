@@ -464,17 +464,21 @@ needs:
 - serialized writer checks;
 - a comparison of the dry receipt's `full_run` with its selected FULL.
 
-The history covers only events since it was installed (slot 062340). `bridge-dry` already checks
-that coverage, so an operator sees a gap before a wave. The comparison runs in SQL at full timestamptz
-precision. The cutoff is built exactly, as epoch plus millisecond intervals, so microseconds are never
-truncated. The outcomes:
-- An install after the cutoff, even by 1 microsecond, gives `history_starts_after_cutoff`. An install
-  exactly at the cutoff is covered.
-- A status that declares the all-source history must also give a valid `history_installed_at`;
-  otherwise the reason is `history_start_missing`. A malformed timestamp gives `read_invalid`.
-- A status that declares neither, as today, is a snapshot only and is never treated as history-proven.
+With slot 062340 (draft contract on review/org-erasure-history @ 8b8ab09e), the hold status also
+carries `erasure_history`. The fields are `cutoff` (bound per epoch after the seal by
+`ingest_org_erasure_history_bind`), `covered`, `recording`, `coverage_started_at` and `by_source`.
+`erasures` then counts the history rows for the org since the bound cutoff. `bridge-dry` reads that
+history in the same statement as the per-source counts, and:
+- checks in SQL, at microsecond precision, that the bound cutoff equals this run's FULL cutoff
+  exactly;
+- requires `covered` and `recording`;
+- requires `by_source` to agree with `erasures`.
 
-This mirrors 062340's own SQL refusal.
+The closed reasons are `history_unbound`, `history_cutoff_mismatch`, `history_not_covering_cutoff`,
+`history_not_recording` and `erasures_in_history`. An inconsistent history is `read_invalid`.
+
+Without `erasure_history` (062320 alone), the proof is a snapshot only. A test pins `ERASURE_SOURCES`
+to 062340's `ORG_ERASURE_HISTORY_SOURCES` once that file is on the branch.
 
 `bridge-execute` is HELD in code (`BACKLOG_OPS_BRIDGE_EXECUTE_ENABLED`), and its tool refuses
 (`bridge_release_held`) until slot 062320 lands.
