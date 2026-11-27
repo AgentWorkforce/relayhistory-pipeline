@@ -312,14 +312,15 @@ the dry modes' output is diagnostic only.
 
 | Mode | Role | Binds | What it does |
 | --- | --- | --- | --- |
-| `reshard-dry` | dry | nothing | The revision reshard's verify (`revision-reshard.ts`, `verify: true`) per scope org, against the revision home: with `BACKLOG_OPS_LEDGER_*` set, the ledger bucket routed as the edge routes it (fences from the transcripts bucket), after the tool fork guard (`assertToolLedgerHome`). Receipt: `verify_passed` overall and, per org hash, `verify_passed` with the counts. Dry only: `reshard-execute` refuses (`backlog_ops_reshard_dry_only`). |
+| `reshard-dry` | dry | optional `backfill_run`: the completed catch-up execute it verifies after (its receipt records `after_run`) | The revision reshard's verify (`revision-reshard.ts`, `verify: true`) per scope org, against the revision home: with `BACKLOG_OPS_LEDGER_*` set, the ledger bucket routed as the edge routes it (fences from the transcripts bucket), after the tool fork guard (`assertToolLedgerHome`). Receipt: `verify_passed` overall and, per org hash, `verify_passed` with the counts. Dry only: `reshard-execute` refuses (`backlog_ops_reshard_dry_only`). |
 | `authority-dry` | dry | nothing | The unbound live evidence (`authorityEvidence` without a baseline). Exit 0 only for `authority_evidence_unbound`, the state `authorityBaseline` takes. Receipt: the report, snake_case. |
 | `backfill-catchup-dry/-execute` with `authority_run` | as before | `AUTHORITY <authority-dry>` | The catch-up runs `authorityBaseline` inside its input fingerprint's REPEATABLE READ READ ONLY transaction (`--authority-baseline`; the evidence on stdin). This is a SAMPLED fingerprint baseline: the backfill's later pages and slot reads use their own snapshots, so it does not attest the inputs the backfill actually read. Its receipt carries `authority_baseline` and, from the credential step, `authority_run` and `full_run` (the exact FULL). Without `authority_run` it is byte-identical to before. |
 | `authority-execute` | execute | `DRY <authority-dry> BACKFILL <catch-up execute> FULL <backfill-execute> RESHARD <reshard-dry>` | Re-reads the evidence bound to the catch-up's baseline (must be `authority_evidence_corroborated`), then the sweeper (below), then, per org, the enforced writer fence and the marker, written create-only. |
 
 The order is the evidence module's own: stop and drain the org, then `authority-dry`, then the
-catch-up with `authority_run`, then `reshard-dry` (after the catch-up: the gate refuses an earlier
-verify, `backlog_ops_gate_reshard_order`), then `authority-execute`.
+catch-up with `authority_run`, then `reshard-dry` with `backfill_run` set to that catch-up (its gate
+requires the catch-up completed, so the verify runs after it), then `authority-execute`. The
+execute requires its RESHARD to name its BACKFILL (`after_run`, `backlog_ops_reshard_not_after`).
 
 ```
 AUTHORITY-EXECUTE <sha> DRY <authority-dry> BACKFILL <catch-up> FULL <full> RESHARD <reshard-dry>
@@ -334,10 +335,11 @@ Bindings (checked before any credential, the same way every other bound run is):
   after it. A catch-up's AUTHORITY was created before that catch-up's own DRY. The gate computes t from
   FULL as for every catch-up, and the credential step checks that the catch-up recorded it.
 - The credential step: every receipt has exactly this run's scope (never `all`) and the ledger target
-  this environment gives (`backlog_ops_bound_<kind>_ledger`). Every authority receipt (DRY, the catch-up,
-  RESHARD, a catch-up's AUTHORITY) also records the store-home pair `home` (a hash of the Locker bucket and
-  region and the ledger target; never `none`), and it must equal this run's (`backlog_ops_bound_<kind>_home`).
-  FULL, an ordinary backfill-execute, is bound by its ledger id and by its exact run id (below). Then: DRY must be `authority_evidence_unbound`
+  this environment gives (`backlog_ops_bound_<kind>_ledger`). Every receipt of a backfill, drain, reshard or
+  authority run records the store-home pair `home`: a hash of the Locker bucket and region and the ledger
+  target, never `none`. The field is new on backfill and drain receipts, and no earlier binding reads it.
+  Every authority-execute binding, FULL included, must carry this run's `home`
+  (`backlog_ops_bound_<kind>_home`), so a FULL from before this field must be run again. Then: DRY must be `authority_evidence_unbound`
   over exactly the scope's org hashes, each refused for `sql_unbound` alone. The catch-up's
   `authority_run` must equal DRY and its `full_run` must equal FULL's run id exactly (t alone could alias
   two FULL runs created in the same second), and its baseline must be `authority_baseline_ready` over
@@ -361,12 +363,13 @@ pass for every org:
    run fails (`authority_incomplete`). An earlier or delayed write cannot be told from this run's until
    the epoch-bound hold protocol exists, so a rerun after a partial write fails closed.
 
-Authority receipts are the only receipts that may hold lists (countsOnly with lists allowed). Every
-string in them must also come from a closed set (`backlog-authority.ts` `AUTHORITY_RECEIPT_STRINGS`,
-plus `h_<32 hex>` hashes), or the credential step refuses the receipt (`backlog_ops_receipt_string`)
-before it is logged. A code-shaped string is not enough. Tool refusals are a closed list
-(`AUTHORITY_TOOL_REFUSALS`); any other failure is `internal_error` or `reshard_failed`, never a
-message.
+Authority receipts are the only receipts that may hold lists. Each mode has an exact schema
+(`backlog-authority-schema.ts`) covering every key, every list and its bound, every hash and digest
+position, and every code from a closed set. The credential step applies it before the receipt is
+persisted or logged. A summary that does not conform becomes `{"refused": "backlog_ops_receipt_schema"}`
+and the run exits 1. A refusal summary keeps its code only when the mode's closed refusal map lists
+it; otherwise it becomes `internal_error`, or `backfill_refused` for a catch-up. A backfill section's
+`failed_codes` keeps only its known keys and sums the rest under `other`.
 
 ### The sweeper's serving spec (proposal; not built)
 

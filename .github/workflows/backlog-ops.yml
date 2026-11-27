@@ -47,7 +47,7 @@ on:
         type: string
         default: ""
       backfill_run:
-        description: export-execute and drain-execute - a successful backfill-execute run at the same sha (the drain's under 3h old); authority-execute - the backfill-catchup-execute (under 3h old) that recorded the baseline; empty otherwise
+        description: export-execute and drain-execute - a successful backfill-execute run at the same sha (the drain's under 3h old); authority-execute - the backfill-catchup-execute (under 3h old) that recorded the baseline; reshard-dry (optional) - the completed catch-up execute it verifies after; empty otherwise
         type: string
         default: ""
       export_run:
@@ -253,8 +253,8 @@ jobs:
           repository: ${{ github.repository }}
           run-id: ${{ inputs.dry_run }}
           github-token: ${{ github.token }}
-      - name: Download the bound backfill's receipt (export-execute, drain-execute, authority-execute)
-        if: inputs.mode == 'export-execute' || inputs.mode == 'drain-execute' || inputs.mode == 'authority-execute'
+      - name: Download the bound backfill's receipt (export-execute, drain-execute, authority-execute; reshard-dry with backfill_run)
+        if: inputs.mode == 'export-execute' || inputs.mode == 'drain-execute' || inputs.mode == 'authority-execute' || (inputs.mode == 'reshard-dry' && inputs.backfill_run != '')
         uses: actions/download-artifact@v4
         with:
           name: backlog-ops-receipt

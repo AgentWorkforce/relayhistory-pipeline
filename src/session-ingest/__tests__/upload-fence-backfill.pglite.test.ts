@@ -12,6 +12,7 @@ import { TOOL_HOME_RECHECK_MS, toolLedgerBucket } from "../ledger-tool-store.ts"
 import { applySupabaseSchema } from "./pglite-schema.ts";
 import { isLedgerKey, ledgerHomeKey, ledgerRoutedStore } from "../ledger-store.ts";
 import { scratchStore } from "./support.ts";
+import { authorityReceiptSummary } from "../backlog-authority-schema.ts";
 
 setDefaultTimeout(60_000);
 const ROOT = "96bulls";
@@ -1228,6 +1229,10 @@ describe("catch-up (--revisions-since-ms): two-phase cutover", () => {
     expect(summary.revisions_since_ms).toBe(t);
     expect(summary.revisions).toMatchObject({ rows: 2, slot_rows: 1, failed: 0, invalid: 0 });
     expect(summary.sections).toEqual({ fences: "complete", ownership: "complete", revisions: "complete" });
+    // A real catch-up summary fits the authority receipt schema exactly once a baseline sits beside it (the schema
+    // that guards a catch-up bound to an authority-dry: backlog-authority-schema.ts CATCHUP_SCHEMA).
+    const withBaseline = { ...JSON.parse(JSON.stringify(summary)), authority_baseline: { kind: "authority_baseline", v: 1, status: "authority_baseline_refused", org_count: 0, orgs: [] } };
+    expect(authorityReceiptSummary("catchup", withBaseline).ok).toBe(true);
     for (let i = 0; i < 12; i++) {
       const r = `c${String(i).padStart(3, "0")}`;
       expect(await entryOf(store, A, "origin-1", r) !== undefined).toBe(r === "c007" || r === "c011");

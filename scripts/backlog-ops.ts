@@ -75,7 +75,8 @@ import {
   refuseBacklogOps as refuse,
   type BacklogOpsDispatch,
 } from "../src/session-ingest/backlog-ops.ts";
-import { authorityStringsClosed, checkAuthorityDryReceipt, checkBaselineReceipt, checkReshardReceipt } from "../src/session-ingest/backlog-authority.ts";
+import { checkAuthorityDryReceipt, checkBaselineReceipt, checkReshardReceipt } from "../src/session-ingest/backlog-authority.ts";
+import { authorityReceiptSummary, type AuthorityReceiptKind } from "../src/session-ingest/backlog-authority-schema.ts";
 
 const ROOT = fileURLToPath(new URL("..", import.meta.url));
 /** The only parent variables a child inherits (plus the AWS session the parent adds). */
@@ -159,9 +160,9 @@ export function checkBoundReceipts(env: Record<string, string | undefined>, d: B
   // This run's store-home pair (authority bindings only; backlogOpsRun validated the target before this runs).
   const homeId = () => backlogOpsHomeId({ bucket: env.BACKLOG_OPS_BUCKET ?? "", region: env.BACKLOG_OPS_REGION ?? "" },
     backlogOpsLedgerTarget(env, { bucket: env.BACKLOG_OPS_BUCKET ?? "" }));
-  // Which bound receipts carry a home: every authority-execute binding but FULL (an ordinary backfill-execute), and a
-  // catch-up's AUTHORITY.
-  const authorityRun = (b: { kind: string }, dd: BacklogOpsDispatch) => (dd.mode === "authority-execute" && b.kind !== "full") || b.kind === "authority";
+  // Which bound receipts must attest this run's home: every authority-execute binding (FULL included: every backfill
+  // receipt records it), a catch-up's AUTHORITY, and a reshard-dry's catch-up.
+  const authorityRun = (b: { kind: string }, dd: BacklogOpsDispatch) => dd.mode === "authority-execute" || b.kind === "authority" || dd.mode === "reshard-dry";
   const authority: BoundAuthority = {};
   // The per-org bindings need the scope's org list (their receipts carry org hashes, never ids).
   const orgs = scopeFull.orgs;
@@ -177,7 +178,7 @@ export function checkBoundReceipts(env: Record<string, string | undefined>, d: B
     try { raw = read(path); } catch { return refuse(`backlog_ops_bound_${b.kind}_missing`); }
     // The drain's BACKFILL and FULL, and a catch-up's FULL: exactly the run's scope (never an unscoped run standing in).
     const exact = (d.mode === "drain-execute" && (b.kind === "backfill" || b.kind === "full")) || (isCatchup(d.mode) && b.kind === "full") ||
-      d.mode === "authority-execute" || b.kind === "authority";
+      d.mode === "authority-execute" || b.kind === "authority" || d.mode === "reshard-dry";
     // The drain's BACKFILL with FULL: a refresh or a catch-up, whichever the receipt says (the gate checked its run-name).
     let mode = b.mode;
     if (b.altMode !== undefined) {
@@ -187,7 +188,8 @@ export function checkBoundReceipts(env: Record<string, string | undefined>, d: B
     const bindsNhp = (d.mode === "export-execute" && b.kind === "dry") || (d.mode === "drain-execute" && b.kind === "export");
     checkBoundReceipt(raw, { mode, sha: d.sha, run: b.run, scope, kind: b.kind, exact, ...(bindsLedger ? { ledger: ledger() } : {}),
       ...(bindsNhp ? { noHeadParity: nhpId } : {}) });
-    if (isCatchup(mode) && (revisionsSinceMs === null || JSON.parse(raw).summary.revisions_since_ms !== revisionsSinceMs))
+    // (A reshard-dry binds a catch-up without its FULL, so without t: it checks the catch-up's completion, not its t.)
+    if (isCatchup(mode) && d.mode !== "reshard-dry" && (revisionsSinceMs === null || JSON.parse(raw).summary.revisions_since_ms !== revisionsSinceMs))
       refuse(`backlog_ops_bound_${b.kind}_since`);
     raws[b.kind] = raw;
     modes[b.kind] = mode;
@@ -198,7 +200,7 @@ export function checkBoundReceipts(env: Record<string, string | undefined>, d: B
       if (home !== homeId()) refuse(`backlog_ops_bound_${b.kind}_home`);
     }
     // The per-org content of the authority bindings (backlog-authority.ts).
-    if (b.kind === "reshard") checkReshardReceipt(raw, orgs!);
+    if (b.kind === "reshard") checkReshardReceipt(raw, orgs!, d.backfillRun!);
     if (b.kind === "authority") authority.evidence = checkAuthorityDryReceipt(raw, orgs!);
     if (d.mode === "authority-execute" && b.kind === "dry") checkAuthorityDryReceipt(raw, orgs!);
     if (d.mode === "authority-execute" && b.kind === "backfill") authority.baseline = checkBaselineReceipt(raw, orgs!, d.dryRun!, d.fullBackfillRun!);
@@ -288,7 +290,10 @@ export async function backlogOpsRun(
   const ledger = backlogOpsLedgerId(d, backlogOpsLedgerTarget(env, t));
   const bound = checkBoundReceipts(env, d, undefined, since);
   const nhpId = nhp?.id ?? BACKLOG_OPS_NO_HEAD_PARITY_NONE;
-  const home = backlogOpsAuthorityReceipt(d) ? backlogOpsHomeId(t, backlogOpsLedgerTarget(env, t)) : null;
+  // Every ledger-id tool's receipt attests the store-home pair (a FULL backfill-execute included).
+  const home = BACKLOG_OPS_LEDGER_ID_TOOLS.includes(toolOf(d.mode)) ? backlogOpsHomeId(t, backlogOpsLedgerTarget(env, t)) : null;
+  const schemaKind: AuthorityReceiptKind | null = !backlogOpsAuthorityReceipt(d) ? null : toolOf(d.mode) === "reshard" ? "reshard"
+    : d.mode === "authority-dry" ? "authority_dry" : d.mode === "authority-execute" ? "authority_execute" : "catchup";
   const paths = backlogOpsPaths(env);
   if (existsSync(paths.receipt)) refuse("backlog_ops_receipt_exists");
   // Credentials from here on: the database URL (backfill, export, presence) and the role session.
@@ -299,10 +304,12 @@ export async function backlogOpsRun(
   let receipt;
   try {
     receipt = backlogOpsReceipt(d, env.GITHUB_RUN_ID!, code, stdout, scope.id, ledger, nhpId, home);
-    // An authority receipt's strings are a closed set (codes, statuses, hashes), never merely code-shaped: a
-    // code-shaped value from an error message or a store never reaches the log.
-    if (home !== null && !authorityStringsClosed(isCatchup(d.mode) ? (receipt.summary as Record<string, unknown>)?.authority_baseline ?? null : receipt.summary))
-      refuse("backlog_ops_receipt_string");
+    // An authority receipt conforms exactly to its mode's schema (keys, lists, hash positions, closed codes), and a
+    // refusal keeps only a code from the mode's closed map, before the receipt is persisted or logged.
+    if (schemaKind !== null) {
+      const r = authorityReceiptSummary(schemaKind, receipt.summary);
+      receipt = { ...receipt, summary: r.summary, exitCode: r.ok ? receipt.exitCode : receipt.exitCode || 1 };
+    }
   } catch (e) {
     const c = (e as { code?: string }).code;
     receipt = backlogOpsReceipt(d, env.GITHUB_RUN_ID!, code || 1, JSON.stringify({ refused: typeof c === "string" && c.startsWith("backlog_ops_") ? c : "receipt" }),

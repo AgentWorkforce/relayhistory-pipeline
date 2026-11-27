@@ -46,7 +46,6 @@
 import { createHash } from "node:crypto";
 import { isObjectStoreError, objectKey, readAll, type ObjectStore } from "../shared/vendor.ts";
 import {
-  AUTHORITY_REFUSALS,
   authorityEvidence,
   evidenceHash,
   type AuthorityBaseline,
@@ -103,9 +102,15 @@ function parseReceipt(raw: string, code: string): Record<string, any> {
 
 // ---- bound receipt checks (after backlog-ops checkBoundReceipt has authenticated mode, sha, run, scope, exit) ----
 
-/** A reshard-dry receipt: verify_passed for exactly the scope's orgs, each with missing, invalid and failed 0. */
-export function checkReshardReceipt(raw: string, orgs: readonly string[]): void {
-  const s = parseReceipt(raw, "backlog_ops_reshard_not_verified").summary;
+/**
+ * A reshard-dry receipt: bound to the catch-up `afterRun` (so it ran after that catch-up completed), and verify_passed
+ * for exactly the scope's orgs, each with missing, invalid and failed 0.
+ */
+export function checkReshardReceipt(raw: string, orgs: readonly string[], afterRun: string): void {
+  const r = parseReceipt(raw, "backlog_ops_reshard_not_verified");
+  // It verified after the catch-up completed: it bound exactly that catch-up (its gate saw it completed).
+  if (r.after_run !== afterRun) refuse("backlog_ops_reshard_not_after");
+  const s = r.summary;
   const per = s.per_org;
   if (s.mode !== "dry_run" || s.verify_passed !== true || !Array.isArray(per) || s.org_count !== orgs.length ||
       !per.every((o: unknown) => isObj(o) && typeof o.org_hash === "string") ||
@@ -153,6 +158,7 @@ export function checkBaselineReceipt(raw: string, orgs: readonly string[], autho
 export interface ReshardVerifyOrg extends ReshardSummary { org_hash: string; verify_passed: boolean; refused: string | null }
 /** revision-reshard.ts's own refusals; any other failure (a store error, whatever its message) is `reshard_failed`. */
 export const RESHARD_REFUSALS = ["reshard_prefix_refused", "reshard_concurrency_refused", "reshard_mode_refused"] as const;
+export { AUTHORITY_TOOL_REFUSALS } from "./backlog-authority-schema.ts";
 /** One verify per org (each its own prefix), never stopping early: every org gets a verdict. */
 export async function reshardVerifyOrgs(store: ObjectStore, keyRoot: string, orgs: readonly string[], concurrency = 8) {
   const per: ReshardVerifyOrg[] = [];
@@ -362,40 +368,6 @@ export function cloudflareGet(accountId: string, token: string, fetcher: typeof 
     // A non-2xx body still parses (success false); a non-JSON body throws, which the module maps to a code.
     return await res.json();
   };
-}
-
-// ---- the closed strings of an authority receipt -------------------------------------------------------------------
-
-/** scripts/backlog-authority.ts's own refusal codes (its `{"refused": ...}` line); anything else is internal_error. */
-export const AUTHORITY_TOOL_REFUSALS = ["usage", "orgs", "authority_execute_held", "stdin_too_large", "stdin_invalid", "db_url_required",
-  "cloudflare_token_invalid", "cloudflare_config", "cloudflare_path", "aws_credentials_required", "backlog_ops_reshard_org", "internal_error",
-  "ledger_bucket_invalid", "ledger_home_guard_invalid", "ledger_home_mismatch", "ledger_home_missing", "ledger_home_moved",
-  "ledger_home_invalid", "ledger_home_unavailable", "ledger_home_store_error", "access_denied"] as const;
-/**
- * Every string an authority receipt may hold (beyond the hashes `h_<32 hex>` / `h<32 hex>`): the evidence module's
- * statuses, refusals and turns paths, and this module's own codes. countsOnly alone accepts any code-SHAPED string
- * (one from an error message, say); the credential step also requires this closed set before the receipt is logged.
- */
-export const AUTHORITY_RECEIPT_STRINGS: ReadonlySet<string> = new Set<string>([
-  ...AUTHORITY_REFUSALS, ...RESHARD_REFUSALS,
-  "authority_evidence_corroborated", "authority_evidence_unbound", "authority_evidence_refused", "authority_baseline",
-  "authority_baseline_ready", "authority_baseline_refused", "neon", "dual", "forward", "unknown",
-  "dry_run", "execute", "reshard_verify", "reshard_failed", "authority_written", "authority_refused", "authority_incomplete",
-  "ok", "not_run", "written", "conflict", "not_written", "evidence_not_corroborated", "writer_fence_unavailable", "writer_fence_not_held",
-  "marker_handoff_lapsed", "marker_conflict", "marker_org", "marker_access_denied", "marker_unreadable", "marker_write_failed",
-  "marker_readback_mismatch", "sweeper_spec_missing", "sweeper_spec_stale", "sweeper_spec_future", "sweeper_spec_invalid",
-  "sweeper_spec_unreadable", "sweeper_spec_access_denied", "sweeper_suspended", "sweeper_home_mismatch", "sweeper_out_of_scope",
-  "sweeper_invalid_request", "sweeper_missing", "sweeper_malformed", "sweeper_mismatch", "sweeper_stale", "sweeper_future",
-  "sweeper_access_denied", "sweeper_unreadable", ...AUTHORITY_TOOL_REFUSALS,
-]);
-const HASH = /^h_?[0-9a-f]{32}$/u;
-/** True when every string leaf of `v` is a hash or in AUTHORITY_RECEIPT_STRINGS. */
-export function authorityStringsClosed(v: unknown, depth = 0): boolean {
-  if (depth > 8) return false;
-  if (typeof v === "string") return HASH.test(v) || AUTHORITY_RECEIPT_STRINGS.has(v);
-  if (Array.isArray(v)) return v.every((x) => authorityStringsClosed(x, depth + 1));
-  if (isObj(v)) return Object.values(v).every((x) => authorityStringsClosed(x, depth + 1));
-  return true;
 }
 
 /** A stable short id of the receipt this run binds, for logs (never an org). */

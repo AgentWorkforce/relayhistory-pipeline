@@ -270,8 +270,10 @@ export function backlogOpsDispatch(
   if (execute && enabled !== true) refuse("backlog_ops_dormant");
   if (m === "authority-execute" && authorityEnabled !== true) refuse("backlog_ops_authority_held");
   const wantsBackfill = execute && tool !== "backfill", wantsExport = execute && tool === "drain";
+  // reshard-dry may bind the completed catch-up it verifies after (BACKFILL, optional; authority-execute requires it).
+  const mayBackfill = m === "reshard-dry";
   if (execute ? !RUN_ID.test(dryRun) : dryRun !== "") refuse("backlog_ops_dry_run");
-  if (wantsBackfill ? !RUN_ID.test(backfillRun) : backfillRun !== "") refuse("backlog_ops_backfill_run");
+  if (wantsBackfill ? !RUN_ID.test(backfillRun) : backfillRun !== "" && !(mayBackfill && RUN_ID.test(backfillRun))) refuse("backlog_ops_backfill_run");
   if (wantsExport ? !RUN_ID.test(exportRun) : exportRun !== "") refuse("backlog_ops_export_run");
   // FULL: optional on drain-execute (absent = the drain's backfill is a full one, as before), required on a catch-up and
   // on authority-execute, refused everywhere else.
@@ -294,7 +296,7 @@ export function backlogOpsDispatch(
   const slotPaceMs = slotPaceRaw === "" || slotPaceRaw === "0" ? null : Number(slotPaceRaw);
   const runs = [dryRun, backfillRun, exportRun, fullBackfillRun, reshardRun, authorityRun].filter((r) => r !== "");
   if (new Set(runs).size !== runs.length) refuse("backlog_ops_bindings");
-  const d: BacklogOpsDispatch = { mode: m, sha, dryRun: execute ? dryRun : null, backfillRun: wantsBackfill ? backfillRun : null,
+  const d: BacklogOpsDispatch = { mode: m, sha, dryRun: execute ? dryRun : null, backfillRun: wantsBackfill || (mayBackfill && backfillRun !== "") ? backfillRun : null,
     exportRun: wantsExport ? exportRun : null, fullBackfillRun: fullBackfillRun === "" ? null : fullBackfillRun,
     reshardRun: reshardRun === "" ? null : reshardRun, authorityRun: authorityRun === "" ? null : authorityRun, maxObjects: budget, slotsRead, slotPaceMs, confirmation };
   if (execute ? confirmation !== backlogOpsConfirmation(d) : confirmation !== "") refuse("backlog_ops_confirmation");
@@ -621,7 +623,12 @@ export interface BacklogOpsReceipt {
   authority_run?: string;
   /** The same catch-up: the exact FULL run it followed (authority-execute binds FULL by this id). Absent otherwise. */
   full_run?: string;
-  /** An authority receipt (backlogOpsAuthorityReceipt): the store-home pair's id (backlogOpsHomeId). Absent otherwise. */
+  /** A reshard-dry bound to a catch-up: that catch-up's run id (it completed before this run's gate). Absent otherwise. */
+  after_run?: string;
+  /**
+   * The store-home pair's id (backlogOpsHomeId): always on an authority receipt; on every other receipt of a ledger-id
+   * tool (backfill, drain) when the credential step gives it (it always does), so a FULL backfill-execute attests it.
+   */
   home?: string;
   exitCode: number;
   summary: unknown;
@@ -632,7 +639,7 @@ export function backlogOpsReceipt(d: BacklogOpsDispatch, run: string, exitCode: 
   ledger: string = BACKLOG_OPS_LEDGER_NONE, noHeadParity: string = BACKLOG_OPS_NO_HEAD_PARITY_NONE, home: string | null = null): BacklogOpsReceipt {
   if (!SCOPE_ID.test(scope)) refuse("backlog_ops_scope");
   const authority = backlogOpsAuthorityReceipt(d);
-  if (authority !== (home !== null) || (home !== null && !HOME_ID.test(home))) refuse("backlog_ops_home_id");
+  if ((authority && home === null) || (home !== null && (!HOME_ID.test(home) || !BACKLOG_OPS_LEDGER_ID_TOOLS.includes(toolOf(d.mode))))) refuse("backlog_ops_home_id");
   if (!LEDGER_ID.test(ledger)) refuse("backlog_ops_ledger_id");
   if (!NHP_ID.test(noHeadParity)) refuse("backlog_ops_no_head_parity_id");
   const lines = stdout.split("\n").map((l) => l.trim()).filter(Boolean);
@@ -647,6 +654,7 @@ export function backlogOpsReceipt(d: BacklogOpsDispatch, run: string, exitCode: 
   return { contract: BACKLOG_OPS_RECEIPT_CONTRACT, mode: d.mode, sha: d.sha, run, scope, ledger,
     ...(noHeadParity !== BACKLOG_OPS_NO_HEAD_PARITY_NONE ? { no_head_parity: noHeadParity } : {}),
     ...(isCatchup(d.mode) && d.authorityRun ? { authority_run: d.authorityRun, full_run: d.fullBackfillRun! } : {}),
+    ...(d.mode === "reshard-dry" && d.backfillRun ? { after_run: d.backfillRun } : {}),
     ...(home !== null ? { home } : {}), exitCode, summary };
 }
 
@@ -733,7 +741,12 @@ export function checkBoundReceipt(raw: string, expect: { mode: BacklogOpsMode; s
 export interface BacklogOpsBinding { run: string; mode: BacklogOpsMode; kind: BacklogOpsBindingKind; altMode?: BacklogOpsMode }
 export function backlogOpsBindings(d: BacklogOpsDispatch): BacklogOpsBinding[] {
   const tool = toolOf(d.mode), out: BacklogOpsBinding[] = [];
-  if (tool === "presence" || tool === "reshard" || d.mode === "authority-dry") {
+  if (tool === "reshard") {
+    // Its optional BACKFILL: the catch-up execute it verifies after (completed when this run's gate checked it).
+    if (d.dryRun || d.exportRun || d.fullBackfillRun || d.reshardRun || d.authorityRun) refuse("backlog_ops_bindings");
+    return d.backfillRun ? [{ run: d.backfillRun, mode: "backfill-catchup-execute", kind: "backfill" }] : out;
+  }
+  if (tool === "presence" || d.mode === "authority-dry") {
     if (d.dryRun || d.backfillRun || d.exportRun || d.fullBackfillRun || d.reshardRun || d.authorityRun) refuse("backlog_ops_bindings");
     return out;
   }
