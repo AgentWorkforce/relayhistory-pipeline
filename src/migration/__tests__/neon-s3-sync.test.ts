@@ -539,6 +539,47 @@ describe("date pin: an earlier first_ts keeps a session's first exported locatio
     expect(await snapshot(x.store)).toEqual(await snapshot(y.store));
   });
 
+  test("a pinned stream and an unpinned alias of its machine (same component) are refused, in either order", async () => {
+    // `delivery:origina` and `delivery_origina` are two Neon machines with one machine component.
+    const aliasSource = (order: string[]): UnitSource => ({
+      fenced: async () => false,
+      async *lines() {
+        for (const machine of order)
+          for (const r of earlierRecords().filter((x) => x.origin_id === "origin-a"))
+            yield { machine, bytes: buildSessionStream([{ ...r, record_id: `${r.record_id}-${machine}` }]).bytes, feed: { origin: r.origin_id, revision: Number(r.revision) }, userId: "user-1" };
+      },
+    });
+    const moved = unit("org-a", { firstMs: EARLIER });
+    for (const order of [["delivery:origina", "delivery_origina"], ["delivery_origina", "delivery:origina"]]) {
+      const { store } = await countingStore();
+      const manifestPuts: string[] = [];
+      const watched: ObjectStore = {
+        ...store,
+        put: (k, b, o) => {
+          if (String(k).endsWith("/manifest.json")) manifestPuts.push(String(k));
+          return store.put(k, b, o);
+        },
+      };
+      const t = target(watched, { maxChunkBytes: 200 });
+      const first = await exportUnit(t, unit("org-a"), fixedSource(baseRecords().filter((r) => r.origin_id === "origin-a")));
+      manifestPuts.length = 0;
+      const a = first.manifests[0]!.manifestKey;
+      const before = await manifests(store);
+      const aText = await readText(store, a);
+      // With the one prior key `delivery:origina` is pinned at Oct 20 and its alias would go to Oct 11: still refused.
+      expect(await datePin(t, moved, "delivery:origina", [a])).toBeDefined();
+      await expect(exportUnit(t, moved, aliasSource(order), { priorKeys: [a] })).rejects.toMatchObject({ code: "machine_key_collision" });
+      expect(await manifests(store)).toEqual(before);
+      expect(await readText(store, a)).toBe(aText);
+      // No manifest PUT (chunks of the first stream may have been sealed; no manifest references them).
+      expect(manifestPuts).toEqual([]);
+      // Without prior keys: refused as before.
+      await expect(exportUnit(t, moved, aliasSource(order))).rejects.toMatchObject({ code: "machine_key_collision" });
+      expect(manifestPuts).toEqual([]);
+      expect(await manifests(store)).toEqual(before);
+    }
+  });
+
   test("an invalid prior manifest is unpinned (the export goes ahead at the computed date); a read failure propagates", async () => {
     const { store } = await countingStore();
     const t = target(store, { maxChunkBytes: 200 });
