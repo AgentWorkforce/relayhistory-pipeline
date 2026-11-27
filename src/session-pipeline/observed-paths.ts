@@ -50,6 +50,9 @@ function statusPath(line: string): string | typeof SKIP | null {
   if (!m || !STATUS_CODES.has(m[1]!)) return null;
   const renames = /[RC]/.test(m[1]!);
   if (renames !== (m[2] !== undefined)) return null;
+  // git status --short prints names relative to the working directory, even for an absolute pathspec, so an
+  // absolute operand (either side of a rename or copy, quoted or not) means the text is not git's listing.
+  if ([m[2], m[3]].some((x) => x !== undefined && /^"?(?:\/|[A-Za-z]:)/.test(x))) return null;
   return m[3]!.startsWith('"') ? SKIP : m[3]!;
 }
 /** `## branch...upstream` header of `git status -sb`. */

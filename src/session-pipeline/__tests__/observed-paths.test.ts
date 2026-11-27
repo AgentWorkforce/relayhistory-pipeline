@@ -27,6 +27,11 @@ describe("observedPaths", () => {
     expect(observedPaths(" M ok.ts ")).toEqual([]);                    // a trailing space is never trimmed away
     expect(observedPaths(" M a[1]~b.ts\r\n")).toEqual(["a[1]~b.ts"]);
   });
+  test("an absolute operand, on either side of a rename or copy, quoted or not, refuses the listing", () => {
+    for (const t of ["?? /tmp/non-repository-file", " M ok.ts\n?? /etc/x", "R  /a -> b", "R  a -> /b", "C  a -> /b", '?? "/tmp/a b"', "?? C:/x", "R  a -> \"/b c\""])
+      expect(observedPaths(t)).toEqual([]);
+    expect(observedPaths("?? ../sibling/x.ts\n M sub/y.ts")).toEqual(["../sibling/x.ts", "sub/y.ts"]); // relative, from a subdirectory
+  });
   test("status lines with quoted paths are skipped; the rest of the listing still counts", () => {
     expect(observedPaths(' M "a b.txt"\n M ok.ts')).toEqual(["ok.ts"]);
     expect(observedPaths('R  "a b" -> "c d"\n?? x.ts')).toEqual(["x.ts"]);
