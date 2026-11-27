@@ -249,6 +249,11 @@ test("replay until settled: the erasure record count unchanged across a pass tha
   const readSet = async () => { reads++; if (reads === 2) { set = [userErase, sessionErase]; count = 2; } return set; };
   const r = await replayErasures(d, async () => count, readSet);
   expect(r).toMatchObject({ settled: true, erasureCount: 2, replayed: 2, already: 0 });
+  // The count handed to _release is the status TOTAL (every erasure of the org, outside the window too), never the
+  // window-filtered set's size or any target count.
+  const total = await replayErasures(deps(fresh()).d, async () => 10, async () => [userErase]);
+  expect(total).toMatchObject({ settled: true, erasureCount: 10 });
+  expect(holdSql.release(ORG, E, "bridge_complete", SHA, null, total.erasureCount!).params[5]).toBe("10");
   // A set that keeps growing never settles.
   let n = 0;
   const growing = await replayErasures(deps(fresh()).d, async () => n++, async () => [{ ...userErase, requestId: `r${n}` }]);
