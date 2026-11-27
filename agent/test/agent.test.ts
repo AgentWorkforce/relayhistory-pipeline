@@ -124,7 +124,7 @@ test("the A2A card renders within the relay's limits, one skill per kind of work
   assert.equal(card.documentation_url, "https://github.com/AgentWorkforce/relayhistory-pipeline");
   assert.match(card.version, /^[0-9a-f]{12}$/);
   assert.equal(agent.generated[AGENT_CARD_FILE], rendered);
-  assert.deepEqual(agent.files.filter((f) => f.source === "generated"), [{ name: AGENT_CARD_FILE, source: "generated" }, { name: ISSUE_WATCH_FILE, source: "generated" }, { name: STEWARDSHIP_FILE, source: "generated" }]);
+  assert.deepEqual(agent.files.filter((f) => f.source === "generated"), [{ name: AGENT_CARD_FILE, source: "generated" }, { name: ISSUE_WATCH_FILE, source: "generated" }, { name: STEWARDSHIP_FILE, source: "generated" }, { name: "orchestrator.md", source: "generated" }]);
   const script = gunzipSync(Buffer.from(userDataBase64(agent, read), "base64")).toString("utf8");
   assert.ok(!script.includes(`/opt/agent-host/${AGENT_CARD_FILE}`), "the card never rides in user data");
 });
