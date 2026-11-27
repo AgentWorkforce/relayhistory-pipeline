@@ -163,8 +163,12 @@ function closedFailedCodes(v: unknown): unknown {
   const out: Record<string, number> = {};
   for (const [k, n] of Object.entries(v)) {
     const key = (BACKFILL_FAILED_CODES as readonly string[]).includes(k) ? k : "other";
-    if (typeof n !== "number") return v; // the schema refuses it
-    out[key] = (out[key] ?? 0) + n;
+    // Every raw count a non-negative safe integer BEFORE folding: a negative or fractional count must not cancel or
+    // round into a valid-looking total. Otherwise the input is returned as is, and the schema refuses it.
+    if (typeof n !== "number" || !Number.isSafeInteger(n) || n < 0) return v;
+    const total = (out[key] ?? 0) + n;
+    if (!Number.isSafeInteger(total)) return v;
+    out[key] = total;
   }
   return out;
 }

@@ -921,12 +921,16 @@ test("FULL backfill-execute through both sinks: a code-shaped refusal or an off-
     [JSON.stringify({ refused: "ledger_home_moved" }), 1, { refused: "ledger_home_moved" }],
     [JSON.stringify({ ...full, [LEAK]: 1 }), 0, { refused: "backlog_ops_receipt_schema" }],
     [JSON.stringify({ ...full, revisions: { ...full.revisions, failed_codes: { [LEAK]: 1 } } }), 0, null],
+    // Malformed raw counts never fold into a valid-looking total: a cancelling pair, fractions, an unsafe sum.
+    [JSON.stringify({ ...full, revisions: { ...full.revisions, failed_codes: { unknown_a: -1, unknown_b: 1 } } }), 0, { refused: "backlog_ops_receipt_schema" }],
+    [JSON.stringify({ ...full, revisions: { ...full.revisions, failed_codes: { unknown_a: 0.5, unknown_b: 0.5 } } }), 0, { refused: "backlog_ops_receipt_schema" }],
+    [JSON.stringify({ ...full, ownership: { ...full.ownership, failed_codes: { unknown_a: Number.MAX_SAFE_INTEGER, unknown_b: 2 } } }), 0, { refused: "backlog_ops_receipt_schema" }],
   ] as const) {
     const r = await runStep("backfill-execute", stdout, exec, code, { dry: rcpt("backfill-dry", DRY, { ...full, mode: "dry_run" }) });
     if (want) expect(r.receipt.summary).toEqual(want);
     else expect(r.receipt.summary.revisions.failed_codes).toEqual({ other: 1 });
     expect(r.line).not.toContain(LEAK);
     expect(r.file).not.toContain(LEAK);
-    if (want && "refused" in want) expect(r.exit).toBe(1);
+    if (want && "refused" in want) { expect(r.exit).toBe(1); expect(JSON.parse(r.file).summary).toEqual(want); }
   }
 });
