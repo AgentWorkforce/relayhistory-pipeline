@@ -145,7 +145,9 @@ export interface ForgeFacts {
      * against it (neither commit is the other's ancestor).
      * `defaultAt` and `revertedAt` are the first landing and first revert.
      */
-    transitions?: Array<{ at: string; kind: "landed" | "reverted"; by: string; seq?: number; step?: number; unorderedWith?: number[] }>;
+    transitions?: Array<{ at: string; kind: "landed" | "reverted"; by: string; seq?: number; step?: number; unorderedWith?: number[];
+      /** Legacy encoding (forge files from before unorderedWith): unordered against every transition of its step. */
+      unordered?: true }>;
   }>;
   flags: Array<{ name: string; defaultOn: boolean }>;
   /** Branches of the repository and whether their work reached the default branch (by ancestry or patch id). */

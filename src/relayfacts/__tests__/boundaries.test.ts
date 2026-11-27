@@ -950,4 +950,24 @@ describe("round-5 controls", () => {
     expect(deriveState([s], f, "2026-11-13T00:00:00.000Z").state).toBe("shipped");
     expect(deriveState([{ ...s, keys: { ...s.keys, branches: ["right"] } }], f, "2026-11-13T00:00:00.000Z").state).toBe("shipped");
   });
+
+  test("forge history: a seal from the previous encoding (unordered: true) still parses and replays conservatively", async () => {
+    const { parseForge } = await import("../bench/corpus.ts");
+    const topic = "a".repeat(40), l = "b".repeat(40), r = "c".repeat(40), rev = "d".repeat(40);
+    const at = "2026-11-06T00:00:00.000Z";
+    // As 7ccff634 wrote it: two parallel copies in step 1 flagged unordered, with a revert of one between them.
+    const legacy = JSON.parse(JSON.stringify({ prs: [], flags: [], commits: [{ sha: topic, at: "2026-11-02T00:00:00.000Z", onDefaultBranch: true, defaultAt: at, defaultAtBasis: "patch", revertedBy: rev, revertedAt: at,
+      transitions: [{ at, kind: "landed", by: l, seq: 2, step: 1, unordered: true }, { at, kind: "reverted", by: rev, seq: 3, step: 1 }, { at, kind: "landed", by: r, seq: 4, step: 1, unordered: true }] }] }));
+    const f = parseForge(legacy);
+    const s = { source: "claude", sessionId: "s", analyzedAt: "2026-11-02T01:00:00.000Z", startedAt: "2026-11-02T00:00:00.000Z", endedAt: "2026-11-02T01:00:00.000Z", title: "", asked: [],
+      built: [{ kind: "commit", ref: topic.slice(0, 7), what: "c", at: "2026-11-02T00:30:00.000Z", evidence: [] }], gaps: [], rationale: [], outcomeStatuses: [], dropped: {},
+      keys: { repo: "example/widgets", branches: [], prs: [], commits: [], files: [], taskRefs: [], parents: [] } } as unknown as SessionFacts;
+    // The latest landing is unordered within its step, so the same-instant revert reads conservatively: regressed.
+    expect(deriveState([s], f, "2026-11-07T00:00:00.000Z").state).toBe("regressed");
+    // The flag is what makes it conservative: the same positions without it order the re-landing last (shipped).
+    const plain = parseForge(JSON.parse(JSON.stringify(legacy).replaceAll(',"unordered":true', "")));
+    expect(deriveState([s], plain, "2026-11-07T00:00:00.000Z").state).toBe("shipped");
+    // And a flag of another value is still refused.
+    expect(() => parseForge(JSON.parse(JSON.stringify(legacy).replace('"unordered":true', '"unordered":false')))).toThrow(/bad commit/);
+  });
 });

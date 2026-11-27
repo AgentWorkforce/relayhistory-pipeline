@@ -80,7 +80,7 @@ export function parseForge(raw: unknown): ForgeFacts {
     if (c.revertedAt !== undefined && c.revertedAt !== null && !iso(c.revertedAt)) throw new CorpusError("forge.json: bad commit");
     if (c.transitions !== undefined && (!Array.isArray(c.transitions) || c.transitions.length > 200 || c.transitions.some((t: unknown) => {
       const x = t as Record<string, unknown>;
-      return !x || typeof x !== "object" || Object.keys(x).some((k) => !["at", "kind", "by", "seq", "step", "unorderedWith"].includes(k)) || [x.seq, x.step].some((n) => n !== undefined && !(Number.isInteger(n) && (n as number) >= 0)) || !positions(x.unorderedWith) || !iso(x.at) || !["landed", "reverted"].includes(x.kind as string) || typeof x.by !== "string" || !/^[0-9a-f]{7,40}$/u.test(x.by);
+      return !x || typeof x !== "object" || Object.keys(x).some((k) => !["at", "kind", "by", "seq", "step", "unorderedWith", "unordered"].includes(k)) || (x.unordered !== undefined && x.unordered !== true) || [x.seq, x.step].some((n) => n !== undefined && !(Number.isInteger(n) && (n as number) >= 0)) || !positions(x.unorderedWith) || !iso(x.at) || !["landed", "reverted"].includes(x.kind as string) || typeof x.by !== "string" || !/^[0-9a-f]{7,40}$/u.test(x.by);
     }))) throw new CorpusError("forge.json: bad commit");
     if (c.defaultAtBasis !== undefined && !["merge", "patch", "committer"].includes(c.defaultAtBasis as string)) throw new CorpusError("forge.json: bad commit");
     if (c.defaultAt !== undefined && c.defaultAt !== null && !iso(c.defaultAt)) throw new CorpusError("forge.json: bad commit");
