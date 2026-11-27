@@ -259,6 +259,31 @@ describe.skipIf(!url)("062320 two-connection orderings (real PostgreSQL)", () =>
     expect(await checkFn(o)).toBe(false);
   });
 
+  test("7g. with BOTH timestamp defaults dropped before the down, the down refuses and keeps its ledger row and check", async () => {
+    const db = await database();
+    const o = await owner(db);
+    await o.query("ALTER TABLE sessions.ingest_org_admission_holds ALTER COLUMN installed_at DROP DEFAULT");
+    await o.query("ALTER TABLE sessions.ingest_org_admission_hold_events ALTER COLUMN at DROP DEFAULT");
+    await expect(o.query(DOWN)).rejects.toMatchObject({ code: "55000" });
+    await o.query("ROLLBACK").catch(() => {});
+    expect(await applied(o)).toBe(1);
+    expect(await checkFn(o)).toBe(true);
+  });
+
+  test("7h. with BOTH timestamp defaults dropped after the down, the reapply refuses and leaves them absent", async () => {
+    const db = await database();
+    const o = await owner(db);
+    await o.query(DOWN);
+    await o.query("ALTER TABLE sessions.ingest_org_admission_holds ALTER COLUMN installed_at DROP DEFAULT");
+    await o.query("ALTER TABLE sessions.ingest_org_admission_hold_events ALTER COLUMN at DROP DEFAULT");
+    let error: { code?: string; message?: string } | null = null;
+    try { await migrateAsOwner(db.ownerUrl); } catch (e) { error = e as { code?: string; message?: string }; }
+    expect(String(error?.message ?? "") + String(error?.code ?? "")).toMatch(/hold history is not this slot|55000/u);
+    expect(await applied(o)).toBe(0);
+    expect(await checkFn(o)).toBe(false);
+    expect(Number((await o.query("SELECT count(*)::int n FROM pg_attrdef WHERE adrelid IN ('sessions.ingest_org_admission_holds'::regclass,'sessions.ingest_org_admission_hold_events'::regclass)")).rows[0].n)).toBe(0);
+  });
+
   test("8. an install never blocks another org's admission", async () => {
     const db = await database();
     const p = await pair(db);

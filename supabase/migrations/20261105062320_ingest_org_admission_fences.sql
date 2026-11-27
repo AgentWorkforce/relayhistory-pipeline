@@ -109,7 +109,8 @@ END $hold_history_acl$;
 -- A retained history (this slot's down keeps both tables) must be exactly this one, else 55000, nothing applied.
 DO $hold_history_shape$
 BEGIN
- IF NOT (
+ -- IS NOT TRUE, not NOT: an empty aggregate is NULL, and NOT NULL would skip the refusal.
+ IF (
 -- The exact retained history: owner, columns, column defaults, indexes, constraints (NOT NULL is the column check;
 -- PostgreSQL 18 and PGlite also catalogue it as a constraint, so 'n' rows are excluded), the four guard triggers on the
 -- guard function, enabled, and owner-only ACLs on both tables (every grantee, column grants included) and on the guard
@@ -165,7 +166,7 @@ BEGIN
        AND attnum > 0 AND attacl IS NOT NULL)
  AND NOT EXISTS (SELECT 1 FROM pg_proc p, aclexplode(coalesce(p.proacl, acldefault('f', p.proowner))) x
        WHERE p.oid = 'sessions.ingest_org_admission_hold_guard()'::regprocedure AND x.grantee <> p.proowner)
- ) THEN
+ ) IS NOT TRUE THEN
    RAISE EXCEPTION USING ERRCODE = '55000', MESSAGE = 'org admission hold: an existing hold history is not this slot''s; nothing applied';
  END IF;
 END $hold_history_shape$;

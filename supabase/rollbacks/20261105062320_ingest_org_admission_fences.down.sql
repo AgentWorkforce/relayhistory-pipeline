@@ -18,7 +18,7 @@ DO $rollback_guard$ DECLARE v_sha text; BEGIN
  IF EXISTS(SELECT 1 FROM sessions.__96bulls_migrations WHERE name LIKE 'upstream:%' AND name COLLATE "C">'upstream:20261105062320_ingest_org_admission_fences.sql')
  THEN RAISE EXCEPTION USING ERRCODE='55000',MESSAGE='org admission hold: a later migration is applied; roll it back first';END IF;
  SELECT sha256 INTO v_sha FROM sessions.__96bulls_migrations WHERE name='upstream:20261105062320_ingest_org_admission_fences.sql' FOR UPDATE;
- IF NOT FOUND OR v_sha IS DISTINCT FROM 'ad63ed4931ff3d6a7de87cc6114da7d7d8e1536a95aa52a2d5664be5250acd71'
+ IF NOT FOUND OR v_sha IS DISTINCT FROM '5841d57629195f2bad2e821018ac47a377b0d8d5f418440194a440f331ecdc67'
  THEN RAISE EXCEPTION USING ERRCODE='55000',MESSAGE='org admission hold: own applied checksum required';END IF;
  LOCK TABLE sessions.ingest_org_admission_holds IN SHARE ROW EXCLUSIVE MODE;
  IF EXISTS(SELECT 1 FROM sessions.ingest_org_admission_holds WHERE state<>'released')
@@ -1427,7 +1427,8 @@ DROP FUNCTION sessions.ingest_org_admission_hold_key(text);
 -- the catalog, every grantee and column grant included; column defaults), every
 -- dropped hold function and the backstop trigger are gone, and no restored body still carries a 062320 mark.
 DO $rollback_verify$ BEGIN
- IF NOT (
+ -- IS NOT TRUE, not NOT: an empty aggregate is NULL, and NOT NULL would skip the refusal.
+ IF (
 -- The exact retained history: owner, columns, column defaults, indexes, constraints (NOT NULL is the column check;
 -- PostgreSQL 18 and PGlite also catalogue it as a constraint, so 'n' rows are excluded), the four guard triggers on the
 -- guard function, enabled, and owner-only ACLs on both tables (every grantee, column grants included) and on the guard
@@ -1483,12 +1484,12 @@ DO $rollback_verify$ BEGIN
        AND attnum > 0 AND attacl IS NOT NULL)
  AND NOT EXISTS (SELECT 1 FROM pg_proc p, aclexplode(coalesce(p.proacl, acldefault('f', p.proowner))) x
        WHERE p.oid = 'sessions.ingest_org_admission_hold_guard()'::regprocedure AND x.grantee <> p.proowner)
- ) THEN RAISE EXCEPTION USING ERRCODE='55000',MESSAGE='org admission hold: retained history drifted; rolled back';END IF;
+ ) IS NOT TRUE THEN RAISE EXCEPTION USING ERRCODE='55000',MESSAGE='org admission hold: retained history drifted; rolled back';END IF;
  IF EXISTS(SELECT 1 FROM pg_proc p JOIN pg_namespace n ON n.oid=p.pronamespace WHERE n.nspname='sessions'
    AND p.proname LIKE 'ingest\_org\_admission\_hold\_%' AND p.proname<>'ingest_org_admission_hold_guard')
   OR EXISTS(SELECT 1 FROM pg_trigger WHERE tgname='ingest_org_admission_hold_batch_backstop')
   OR EXISTS(SELECT 1 FROM pg_proc p JOIN pg_namespace n ON n.oid=p.pronamespace WHERE n.nspname='sessions' AND p.prosrc LIKE '%-- 062320 org admission hold%')
  THEN RAISE EXCEPTION USING ERRCODE='55000',MESSAGE='org admission hold: enforcement survived the down; rolled back';END IF;
 END $rollback_verify$;
-DELETE FROM sessions.__96bulls_migrations WHERE name='upstream:20261105062320_ingest_org_admission_fences.sql' AND sha256='ad63ed4931ff3d6a7de87cc6114da7d7d8e1536a95aa52a2d5664be5250acd71';
+DELETE FROM sessions.__96bulls_migrations WHERE name='upstream:20261105062320_ingest_org_admission_fences.sql' AND sha256='5841d57629195f2bad2e821018ac47a377b0d8d5f418440194a440f331ecdc67';
 COMMIT;
