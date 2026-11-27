@@ -1,7 +1,7 @@
 /** AUTHORITY_SQL against a real Postgres engine (pglite), over the three ledger tables' released column shapes. */
 import { expect, test } from "bun:test";
 import { PGlite } from "@electric-sql/pglite";
-import { AUTHORITY_SQL } from "../authority-evidence.ts";
+import { AUTHORITY_SQL, AUTHORITY_VISIBILITY_SQL } from "../authority-evidence.ts";
 
 const ORG = "11111111-2222-4333-8444-555555555555", OTHER = "66666666-7777-4888-9999-aaaaaaaaaaaa";
 const STOP = Date.parse("2026-11-26T10:00:00Z");
@@ -76,4 +76,53 @@ test("read-only: runs inside a READ ONLY transaction", async () => {
   await pg.exec("BEGIN TRANSACTION READ ONLY");
   expect(await read(pg)).toHaveLength(1);
   await pg.exec("ROLLBACK");
+});
+
+const visibility = async (pg: PGlite) =>
+  Object.fromEntries((await pg.query<{ table_name: string; visible: boolean }>(AUTHORITY_VISIBILITY_SQL)).rows.map((r) => [r.table_name, r.visible]));
+
+test("review 4: RLS filtering is detected, not read as an empty org", async () => {
+  const pg = await db();
+  await pg.query(`INSERT INTO sessions.ingest_batches VALUES ($1,'w','o','b1','u','pending',now(),NULL)`, [ORG]);
+  await pg.exec(`
+    ALTER TABLE sessions.ingest_batches ENABLE ROW LEVEL SECURITY;
+    CREATE ROLE reader; CREATE ROLE bypass BYPASSRLS; CREATE ROLE noselect;
+    GRANT USAGE ON SCHEMA sessions TO reader, bypass, noselect;
+    GRANT SELECT ON ALL TABLES IN SCHEMA sessions TO reader, bypass;
+    GRANT SELECT ON sessions.ingest_batches, sessions.ingest_record_revisions TO noselect;
+  `);
+  // The owner sees every row; RLS does not apply to it.
+  expect(await visibility(pg)).toEqual({ ingest_batches: true, ingest_record_revisions: true, ingest_session_ownership: true });
+  expect(Number((await read(pg))[0]!.batches_pending)).toBe(1);
+  // The hazard: an RLS-filtered reader gets 0 for the same row...
+  await pg.exec("SET ROLE reader");
+  expect(Number((await read(pg))[0]!.batches_pending)).toBe(0);
+  // ...and the visibility check names exactly that table.
+  expect(await visibility(pg)).toEqual({ ingest_batches: false, ingest_record_revisions: true, ingest_session_ownership: true });
+  await pg.exec("RESET ROLE; SET ROLE bypass");
+  expect(await visibility(pg)).toEqual({ ingest_batches: true, ingest_record_revisions: true, ingest_session_ownership: true });
+  expect(Number((await read(pg))[0]!.batches_pending)).toBe(1);
+  await pg.exec("RESET ROLE; SET ROLE noselect");
+  expect((await visibility(pg)).ingest_session_ownership).toBe(false);
+  // A superuser bypasses RLS even when FORCE'd: visible, and the engine agrees.
+  await pg.exec("RESET ROLE; ALTER TABLE sessions.ingest_batches FORCE ROW LEVEL SECURITY");
+  expect((await visibility(pg)).ingest_batches).toBe(true);
+  expect(Number((await read(pg))[0]!.batches_pending)).toBe(1);
+  // A non-superuser owner: FORCE applies RLS to it (filtered and reported so); without FORCE it sees every row.
+  await pg.exec("CREATE ROLE tabowner; GRANT USAGE ON SCHEMA sessions TO tabowner; GRANT SELECT ON ALL TABLES IN SCHEMA sessions TO tabowner; ALTER TABLE sessions.ingest_batches OWNER TO tabowner; SET ROLE tabowner");
+  expect((await visibility(pg)).ingest_batches).toBe(false);
+  expect(Number((await read(pg))[0]!.batches_pending)).toBe(0);
+  await pg.exec("ALTER TABLE sessions.ingest_batches NO FORCE ROW LEVEL SECURITY");
+  expect((await visibility(pg)).ingest_batches).toBe(true);
+  expect(Number((await read(pg))[0]!.batches_pending)).toBe(1);
+  // A member inheriting the owner's privileges is the owner for RLS (check_enable_rls uses has_privs_of_role).
+  await pg.exec("RESET ROLE; CREATE ROLE member IN ROLE tabowner; SET ROLE member");
+  expect((await visibility(pg)).ingest_batches).toBe(true);
+  expect(Number((await read(pg))[0]!.batches_pending)).toBe(1);
+});
+
+test("visibility answers exactly the three tables (a missing table shows as a missing row)", async () => {
+  const pg = await db();
+  await pg.exec("DROP TABLE sessions.ingest_session_ownership");
+  expect(Object.keys(await visibility(pg))).toEqual(["ingest_batches", "ingest_record_revisions"]);
 });
