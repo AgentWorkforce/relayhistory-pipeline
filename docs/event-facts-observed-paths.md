@@ -19,10 +19,10 @@ Paths seen in status listings are the only evidence that lifted the ranker withi
 
 `src/session-pipeline/observed-paths.ts` defines `observedPaths(content)`. It is pure and bounded: at most 64 paths, each at most 512 characters, from at most 256 KiB of text. A tool result is read only when its whole text has one of two shapes:
 
-- **`git status --short`** (porcelain v1). Every non-empty line is `XY path` or `XY old -> new`, optionally after one `## branch` header. A rename contributes its new path. Quoted paths are not read.
+- **`git status --short`** (porcelain v1). Every non-empty line is `XY path` or `XY old -> new`, optionally after one `## branch` header. `XY` must be a code git prints: `??`, `!!`, or states of which at least one is set (two spaces never occur, so indented text is not a listing). Git quotes any path containing whitespace, and quoted paths are not read, so a path never contains whitespace. A rename contributes its new path.
 - **`git diff --stat`**. Stat lines (`path | N +-` or `path | Bin …`), then exactly one summary line (`N files changed, …`), last.
 
-Anything else yields nothing: prose, a log that merely contains a status-shaped line, stat lines without their summary, or truncated (`…`) paths. The parser reads the result's text alone. It does not match the result to its `git` call, since the staged path sees results and calls in different batches, so the whole-text shape is what keeps it conservative.
+Anything else yields nothing: prose (indented or not), a log that merely contains a status-shaped line, stat lines without their summary, or truncated (`…`) paths. The parser reads the result's text alone. It does not match the result to its `git` call, since the staged path sees results and calls in different batches, so the whole-text shape is what keeps it conservative.
 
 `src/session-pipeline/output-facts.ts` builds `EventFactRow.observed_paths` for `tool_result` events, but only when the builders are given `{ observedPaths: true }`. That option is accepted by `outputFactsFromScope`, `outputFactsBatchStep` and `stageOutputFactsChunk`. No runtime passes it yet.
 

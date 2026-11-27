@@ -20,6 +20,11 @@ describe("observedPaths", () => {
       " src/a.ts | 12 +++\n",                       // stat lines without the summary
       " 1 file changed, 1 insertion(+)",             // a summary alone
       ' M "path with spaces.ts"',                    // quoted paths are not read
+      "   this sentence is indented by three spaces", // two spaces are not a status code
+      "   - first point\n   - second point",           // nor is an indented list
+      " M this line is prose, not a path",          // unquoted paths never hold whitespace
+      "?M src/a.ts", "!  src/a.ts", "XY src/a.ts",    // codes git never prints
+      " M src/a.ts\n   indented prose after it",     // one bad line spoils the listing
       "", "   \n  ", null, undefined,
     ]) expect(observedPaths(text as string)).toEqual([]);
   });

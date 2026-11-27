@@ -12,8 +12,13 @@ export const MAX_OBSERVED_PATHS = 64;
 export const MAX_OBSERVED_PATH_CHARS = 512;
 export const MAX_OBSERVED_CONTENT = 256 * 1024;
 
-/** `XY path` or `XY old -> new` (porcelain v1 short format). Quoted paths (spaces, escapes) are not read. */
-const STATUS_LINE = /^([ MADRCUT?!]{2}) (?:([^\s"][^\n]*?) -> )?([^\s"][^\n]*)$/;
+/**
+ * `XY path` or `XY old -> new` (porcelain v1 short format). XY is a code git can print: `??` (untracked), `!!`
+ * (ignored), or index and worktree states of which at least one is set; two spaces never occur, so indented text is
+ * not a listing. Git quotes any path with whitespace or escapes, and quoted paths are not read, so a path here has no
+ * whitespace: a line of prose cannot pass as one.
+ */
+const STATUS_LINE = /^(\?\?|!!|[MTADRCU][ MTADRCU]| [MTADRCU]) (?:([^\s"]\S*) -> )?([^\s"]\S*)$/;
 /** `## branch...upstream` header of `git status -sb`. */
 const BRANCH_LINE = /^## \S/;
 /** ` path | 12 +++--` or ` path | Bin 10 -> 20 bytes`. */
