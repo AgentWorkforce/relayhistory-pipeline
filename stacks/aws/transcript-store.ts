@@ -1569,9 +1569,12 @@ function rearmSweeperStateDenyPhase(operations: ReadonlyMap<string, string>, lin
   const others = (m: Map<string, string>) => JSON.stringify([...m].filter(([sid]) => sid !== REARM_SWEEPER_STATE_DENY_SID));
   if (others(live.bySid) !== others(planned.bySid)) say("every other statement must stay byte-identical, in order");
   if (inputRoleArn === undefined) say("transcriptStore.rearmSweeperRoleArn is unset");
-  // The live grants name exactly the input's role.
-  const named = new Set(REARM_SWEEPER_BUCKET_SIDS.flatMap((sid) => [...live.bySid.get(sid)!.matchAll(/^\s*AWS:\s*(\S+)\s*$/gm)].map((m) => unquoteYaml(`AWS: ${m[1]!}`).slice(5))));
-  if (named.size !== 1 || !named.has(inputRoleArn!)) say("the live rearm grants must name exactly transcriptStore.rearmSweeperRoleArn");
+  // Each of the five live grants (unchanged on both sides) is exactly its reviewed rendering for the input's role:
+  // never only "some grant names the role" (a write grant re-pointed at another principal would pass that).
+  const nb = transcriptNames(TRANSCRIPT_STAGE, TRANSCRIPT_ACCOUNT_ID);
+  for (const grant of rearmSweeperBucketStatements({ bucketArn: nb.bucketArn, roleArn: inputRoleArn! }))
+    if (unquoteYaml(live.bySid.get(grant.Sid)!) !== planYaml([grant], live.itemIndent).join("\n"))
+      say(`the live ${grant.Sid} must be exactly the reviewed grant for transcriptStore.rearmSweeperRoleArn`);
   if (plannedDeny && !withDeny) say("adds the state deny but transcriptStore.rearmSweeperStateDeny is false");
   if (!plannedDeny && withDeny) say("removes the state deny but transcriptStore.rearmSweeperStateDeny is not false");
   // Added or removed, the statement must be exactly the reviewed one for the role: a drifted live deny with this Sid

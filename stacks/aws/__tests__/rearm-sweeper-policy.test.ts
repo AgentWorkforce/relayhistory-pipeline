@@ -280,7 +280,22 @@ describe("D5 rearm sweeper writer deny plan phase", () => {
     expect(() => one(grantsOnly, withDeny, set, { transcripts: "update", "transcripts-key": "update" }, { "transcripts-key": keyBlock(pKey(roleArn), pKey(roleArn)) })).toThrow(/rearm sweeper writer deny: must deploy alone/);
     expect(() => one(grantsOnly, withDeny, set, { transcripts: "update", "transcript-reader": "update" })).toThrow(/must deploy alone/);
     expect(() => one(grantsOnly, withDeny, {})).toThrow(/rearm sweeper writer deny: transcriptStore.rearmSweeperRoleArn is unset/);
-    expect(() => one(grantsOnly, withDeny, { rearmSweeperRoleArn: `arn:aws:iam::${sweeperAccount}:role/other` })).toThrow(/live rearm grants must name exactly/);
+    expect(() => one(grantsOnly, withDeny, { rearmSweeperRoleArn: `arn:aws:iam::${sweeperAccount}:role/other` })).toThrow(/the live RearmSweeperLists must be exactly the reviewed grant/);
+    // Each grant on its own: one re-pointed principal (a service, a list, another role, none) refuses, though the
+    // other four still name the role. The same change on both sides keeps the grants "unchanged".
+    const grant = (sid: string, patch: (x: any) => any) => (p: unknown[]) => p.map((x: any) => x.Sid === sid ? patch(x) : x);
+    for (const sid of REARM_SWEEPER_BUCKET_SIDS) for (const patch of [
+      (x: any) => ({ ...x, Principal: { Service: "s3.amazonaws.com" } }),
+      (x: any) => ({ ...x, Principal: { AWS: [roleArn, pEraser] } }),
+      (x: any) => ({ ...x, Principal: { AWS: `arn:aws:iam::${sweeperAccount}:role/other` } }),
+      (x: any) => ({ ...x, Principal: "*" }),
+      ({ Principal, ...x }: any) => x,
+      (x: any) => ({ ...x, Resource: `${P.bucketArn}/*` }),
+    ]) {
+      const g = grant(sid, patch);
+      expect(() => one(g(grantsOnly), g(withDeny))).toThrow(new RegExp(`the live ${sid} must be exactly the reviewed grant`));
+      expect(() => one(g(withDeny), g(grantsOnly), { ...set, rearmSweeperStateDeny: false })).toThrow(new RegExp(`the live ${sid} must be exactly the reviewed grant`));
+    }
     expect(() => one(grantsOnly, withDeny, { ...set, rearmSweeperStateDeny: false })).toThrow(/adds the state deny but transcriptStore.rearmSweeperStateDeny is false/);
     expect(() => one(grantsOnly, withDeny, { ...set, rearmSweeperStateDeny: "false" })).toThrow(/rearmSweeperStateDeny must be true or false/);
     const deny = (patch: (x: any) => any) => withDeny.map((x: any) => x.Sid === REARM_SWEEPER_STATE_DENY_SID ? patch(x) : x);
