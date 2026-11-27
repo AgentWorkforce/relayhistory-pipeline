@@ -28,6 +28,12 @@ const FILE = "20261105062330_buffered_search_feed_custom_plans.sql";
 const STEP = `upstream:${FILE}`;
 const UP = read(`supabase/migrations/${FILE}`);
 const DOWN = read("supabase/rollbacks/20261105062330_buffered_search_feed_custom_plans.down.sql");
+// 20261105062350 (the page keyset) sits above 062330 when present: its down runs first.
+const PAGE_KEYSET_DOWN = "supabase/rollbacks/20261105062350_buffered_search_feed_page_keyset.down.sql";
+const laterOff = async (db: PGlite) => {
+  if ((await db.query("SELECT 1 FROM sessions.__96bulls_migrations WHERE name='upstream:20261105062350_buffered_search_feed_page_keyset.sql'")).rows.length)
+    await db.exec(read(PAGE_KEYSET_DOWN));
+};
 const LOCAL: MigrationProfile = { mode: "local", shim: true, bootstrap: true, verify: false, runtimeRole: "postgres" };
 const STAGE_RPC = "sessions.buffered_search_feed_stage(jsonb)";
 const GC_ORDINALS = "sessions.ingest_buffer_gc_ordinals(uuid)";
@@ -74,6 +80,7 @@ describe("20261105062330 buffered search feed custom plans", () => {
   test("the rollback RESETs exactly plan_cache_mode, drops its ledger row, refuses on a rerun and the migrator re-applies it", async () => {
     const db = await migrated();
     const shape = async () => (await db.query("SELECT oid::regprocedure::text sig, prosrc, proacl::text acl, proowner, prosecdef, provolatile FROM pg_proc WHERE oid IN ($1::regprocedure,$2::regprocedure) ORDER BY 1", [STAGE_RPC, GC_ORDINALS])).rows;
+    await laterOff(db);
     const before = await shape();
     await db.exec(DOWN);
     expect(await shape()).toEqual(before);
@@ -91,6 +98,7 @@ describe("20261105062330 buffered search feed custom plans", () => {
 
   test("the rollback refuses while a later migration is applied, and with a different applied checksum", async () => {
     const db = await migrated();
+    await laterOff(db);
     const later = "upstream:20261105099000_later_probe.sql";
     await db.query("INSERT INTO sessions.__96bulls_migrations SELECT (jsonb_populate_record(NULL::sessions.__96bulls_migrations, to_jsonb(m) || jsonb_build_object('name', $2::text))).* FROM sessions.__96bulls_migrations m WHERE m.name = $1", [STEP, later]);
     expect(await failure(db.exec(DOWN))).toMatchObject({ code: "55000", message: expect.stringContaining("a later migration is applied") });
@@ -104,6 +112,7 @@ describe("20261105062330 buffered search feed custom plans", () => {
 
   test("the up refuses (55000) without 045010's stage RPC", async () => {
     const db = await migrated();
+    await laterOff(db);
     await db.exec("ALTER FUNCTION sessions.buffered_search_feed_stage(jsonb) RENAME TO buffered_search_feed_stage_moved");
     expect(await failure(db.exec("BEGIN;" + UP + "COMMIT;"))).toMatchObject({ code: "55000", message: expect.stringContaining("requires 20261105045010") });
     await db.exec("ROLLBACK").catch(() => {});
@@ -177,6 +186,7 @@ describe("20261105062330 behaviour: the executed plans stay custom past the fift
       expect([i, generic(s), generic(g)]).toEqual([i, false, false]);
       expect(s).toContain("ingest_stage_intents_cleanup_idx");
     }
+    await laterOff(db);
     await db.exec(DOWN);
     const reset = await calls(db, token, 8);
     for (const [i, plans] of reset.entries()) {

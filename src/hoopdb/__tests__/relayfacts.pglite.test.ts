@@ -352,7 +352,7 @@ describe("20261105062090 relayfacts operator erase", () => {
     // workspace readers) 20261105062180 (claims scheduler), 20261105062190 (the priority-first
     // advisories reader), 20261105062200 (session list readiness), 20261105062210 (T2 staged ACK) and 20261105062220 (the
     // advisory instance).
-    expect(Object.keys(MIGRATION_SENTINELS).filter((k) => k.startsWith("upstream:") && k > ERASE_STEP)).toEqual([USER_ERASE_STEP, STAGING_STEP, CUTOVER_STEP, CUTOVER_REVISION_STEP, STAGED_FACTS_STEP, CLAIMS_STEP, INTEL_CONTROLS_STEP, INTEL_WORKSPACE_STEP, SCHEDULER_STEP, ADVISORY_PRIORITY_STEP, LIST_READINESS_STEP, T2_STEP, ADVISORY_INSTANCE_STEP, SEARCH_STAGE_STEP, HOLD_STEP, CUSTOM_PLANS_STEP, HISTORY_STEP]);
+    expect(Object.keys(MIGRATION_SENTINELS).filter((k) => k.startsWith("upstream:") && k > ERASE_STEP)).toEqual([USER_ERASE_STEP, STAGING_STEP, CUTOVER_STEP, CUTOVER_REVISION_STEP, STAGED_FACTS_STEP, CLAIMS_STEP, INTEL_CONTROLS_STEP, INTEL_WORKSPACE_STEP, SCHEDULER_STEP, ADVISORY_PRIORITY_STEP, LIST_READINESS_STEP, T2_STEP, ADVISORY_INSTANCE_STEP, SEARCH_STAGE_STEP, HOLD_STEP, CUSTOM_PLANS_STEP, HISTORY_STEP, PAGE_KEYSET_STEP]);
     expect(RUNTIME_APPLICATION_FUNCTIONS.filter((f) => f.startsWith("sessions.relayfacts_evidence_"))).toEqual([]);
     for (const fn of [ERASE, GUARD]) {
       const r = (await db.query<{ secdef: boolean; cfg: string[]; public_exec: boolean }>(
@@ -465,7 +465,10 @@ const HOLD_DOWN = read("supabase/rollbacks/20261105062320_ingest_org_admission_f
 // 20261105062330 (the buffered feed custom plans) sits above 062320: its down runs before 062320's.
 const CUSTOM_PLANS_STEP = "upstream:20261105062330_buffered_search_feed_custom_plans.sql";
 const CUSTOM_PLANS_DOWN = read("supabase/rollbacks/20261105062330_buffered_search_feed_custom_plans.down.sql");
-// 20261105062340 (the per-org erasure history) sits above 062330: its down runs first of all.
+// 20261105062350 (the buffered feed page keyset) sits above 062340: its down runs before everything else.
+const PAGE_KEYSET_STEP = "upstream:20261105062350_buffered_search_feed_page_keyset.sql";
+const PAGE_KEYSET_DOWN = read("supabase/rollbacks/20261105062350_buffered_search_feed_page_keyset.down.sql");
+// 20261105062340 (the per-org erasure history) sits above 062330: its down runs before 062330's.
 const HISTORY_STEP = "upstream:20261105062340_ingest_org_erasure_history.sql";
 const HISTORY_DOWN = read("supabase/rollbacks/20261105062340_ingest_org_erasure_history.down.sql");
 const USER_ERASE = "sessions.relayfacts_user_erase_v1(text,text,text,text)";
@@ -517,7 +520,7 @@ describe("20261105062100 relayfacts user erase", () => {
     expect((await db.query<{ applied: boolean }>(MIGRATION_SENTINELS[USER_ERASE_STEP]!.sql)).rows[0]!.applied).toBe(true);
     // 20261105062110 (search reconcile staging), then 062120 and 062130 (analysis org S3 cutover), then 062140 (staged output
     // facts) 062150 (relayfacts claims), 062160 (session intel controls) 062170 (session intel workspace readers) 062180 (claims scheduler), 062190 (priority-first advisories reader), 062200 (session list readiness), 062210 (T2 staged ACK) and 062220 (the advisory instance), are the upstream steps later than 062100.
-    expect(Object.keys(MIGRATION_SENTINELS).filter((k) => k.startsWith("upstream:") && k > USER_ERASE_STEP)).toEqual([STAGING_STEP, CUTOVER_STEP, CUTOVER_REVISION_STEP, STAGED_FACTS_STEP, CLAIMS_STEP, INTEL_CONTROLS_STEP, INTEL_WORKSPACE_STEP, SCHEDULER_STEP, ADVISORY_PRIORITY_STEP, LIST_READINESS_STEP, T2_STEP, ADVISORY_INSTANCE_STEP, SEARCH_STAGE_STEP, HOLD_STEP, CUSTOM_PLANS_STEP, HISTORY_STEP]);
+    expect(Object.keys(MIGRATION_SENTINELS).filter((k) => k.startsWith("upstream:") && k > USER_ERASE_STEP)).toEqual([STAGING_STEP, CUTOVER_STEP, CUTOVER_REVISION_STEP, STAGED_FACTS_STEP, CLAIMS_STEP, INTEL_CONTROLS_STEP, INTEL_WORKSPACE_STEP, SCHEDULER_STEP, ADVISORY_PRIORITY_STEP, LIST_READINESS_STEP, T2_STEP, ADVISORY_INSTANCE_STEP, SEARCH_STAGE_STEP, HOLD_STEP, CUSTOM_PLANS_STEP, HISTORY_STEP, PAGE_KEYSET_STEP]);
     expect(RUNTIME_APPLICATION_FUNCTIONS.filter((f) => f.startsWith("sessions.relayfacts_user_erase_"))).toEqual([]);
     for (const fn of [USER_ERASE, USER_ERASE_LOCK, USER_ERASE_GUARD]) {
       const r = (await db.query<{ secdef: boolean; cfg: string[]; public_exec: boolean }>(
@@ -636,7 +639,7 @@ describe("20261105062100 relayfacts user erase", () => {
     expect(await message(CUTOVER_REVISION_DOWN)).toContain("a later migration is applied");
     // 062220 comes off first (062210's down refuses while it is applied).
     expect(await message(T2_DOWN)).toContain("a later migration is applied");
-    await db.exec(HISTORY_DOWN);
+    await db.exec(PAGE_KEYSET_DOWN);    await db.exec(HISTORY_DOWN);
     await db.exec(CUSTOM_PLANS_DOWN);
     await db.exec(HOLD_DOWN);
     await db.exec(SEARCH_STAGE_DOWN);

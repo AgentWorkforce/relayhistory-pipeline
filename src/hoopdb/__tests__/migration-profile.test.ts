@@ -2723,7 +2723,22 @@ describe("function boundary: ACL manifest, residual, activation gate", () => {
       const open = src.indexOf(tag, start) + tag.length;
       return src.slice(open, src.indexOf(tag, open));
     };
-    // 20261105062340 (the per-org erasure history) is newest: 062320's down refuses (55000) while it is applied; its
+    // 20261105062350 (the buffered feed page keyset) is newest: 062340's down refuses (55000) while it is applied; its
+    // lane-generated, checksum-pinned down restores 043870's exact page function (body and proconfig), removes its
+    // ledger row, and refuses on a rerun.
+    const BPK = "upstream:20261105062350_buffered_search_feed_page_keyset.sql";
+    const PAGE_RPC = "sessions.buffered_search_feed_page(jsonb)";
+    const pageCfg = async () =>
+      (await db.query<{ c: string[]; s: string; d: boolean }>("SELECT proconfig c, prosrc s, prosecdef d FROM pg_proc WHERE oid=$1::regprocedure", [PAGE_RPC])).rows[0]!;
+    expect(await names()).toContain(BPK);
+    expect((await pageCfg()).c).toEqual(["search_path=pg_catalog, sessions, pg_temp", "lock_timeout=2s", "plan_cache_mode=force_custom_plan"]);
+    expect((await pageCfg()).s).toBe(bodyOf("20261105062350_buffered_search_feed_page_keyset.sql", "buffered_search_feed_page", "$page$"));
+    expect((await failure(rollback("20261105062340_ingest_org_erasure_history.down.sql")))?.code).toBe("55000");
+    await rollback("20261105062350_buffered_search_feed_page_keyset.down.sql");
+    expect(await names()).not.toContain(BPK);
+    expect(await pageCfg()).toEqual({ c: ["search_path=pg_catalog, sessions, pg_temp", "lock_timeout=2s"], s: bodyOf("20261105043870_buffered_search_feed_cursor.sql", "buffered_search_feed_page", "$page$"), d: true });
+    expect((await failure(rollback("20261105062350_buffered_search_feed_page_keyset.down.sql")))?.code).toBe("55000");
+    // 20261105062340 (the per-org erasure history) is then newest: 062320's down refuses (55000) while it is applied; its
     // checksum-pinned down (no unreleased hold) restores 062320's exact release and status, drops the 30 source
     // triggers and its functions, records the end of coverage, keeps the three history tables and their guard, removes
     // its ledger row, and refuses on a rerun.

@@ -255,6 +255,9 @@ describe("G4-only schema: the post-G4 objects are absent", () => {
       // The per-org erasure history for that hold's release: owner-only insert-only history tables and a recorder on
       // each erasure source; it replaces 062320's owner-only release and status, no G4 function.
       "20261105062340_ingest_org_erasure_history.sql",
+      // The buffered feed page keyset: buffered_search_feed_page replaced (sargable keyset, custom plans); no G4
+      // function names it, no ingest path calls it.
+      "20261105062350_buffered_search_feed_page_keyset.sql",
     ]);
     expect(() => migrationFiles(REPO_ROOT, "20261105043800_typo.sql")).toThrow(/names no migration/);
     expect(OBJECTS.newFunctions.length).toBeGreaterThan(30);

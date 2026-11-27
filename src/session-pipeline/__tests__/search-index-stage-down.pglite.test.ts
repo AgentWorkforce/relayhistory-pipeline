@@ -54,8 +54,12 @@ const KEPT = { table: "sessions.search_stage_archive", index: "sessions.search_s
 const HOLD_DOWN = readFileSync(join(import.meta.dir, "../../../supabase/rollbacks/20261105062320_ingest_org_admission_fences.down.sql"), "utf8");
 const HISTORY_DOWN = readFileSync(join(import.meta.dir, "../../../supabase/rollbacks/20261105062340_ingest_org_erasure_history.down.sql"), "utf8");
 const CUSTOM_PLANS_DOWN = readFileSync(join(import.meta.dir, "../../../supabase/rollbacks/20261105062330_buffered_search_feed_custom_plans.down.sql"), "utf8");
+// 20261105062350 (the buffered feed page keyset) sits above 062330: its down runs first.
+const PAGE_KEYSET_DOWN = readFileSync(join(import.meta.dir, "../../../supabase/rollbacks/20261105062350_buffered_search_feed_page_keyset.down.sql"), "utf8");
 const holdOff = async (pg: PGlite) => {
-  // 20261105062340 (the erasure history) sits above 062320 and is rolled back first.
+  // 20261105062350 (the feed page keyset) is rolled back first, then 20261105062340 (the erasure history).
+  const keyset = (await pg.query<{ n: number }>("SELECT count(*)::int AS n FROM sessions.__96bulls_migrations WHERE name = 'upstream:20261105062350_buffered_search_feed_page_keyset.sql'")).rows[0]!.n;
+  if (keyset) await pg.exec(PAGE_KEYSET_DOWN);
   const history = (await pg.query<{ n: number }>("SELECT count(*)::int AS n FROM sessions.__96bulls_migrations WHERE name = 'upstream:20261105062340_ingest_org_erasure_history.sql'")).rows[0]!.n;
   if (history) await pg.exec(HISTORY_DOWN);
   // 20261105062330 (the buffered feed custom plans) sits above 062320 and comes off next.
