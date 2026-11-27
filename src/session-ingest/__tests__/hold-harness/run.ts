@@ -12,7 +12,8 @@
  *   --no-s3   skip MinIO (the S3 suites must then not be in the file list: they are REQUIRED here and would fail)
  *
  * The child runs `bun test --timeout 300000 <files>` with SESSION_INGEST_TEST_PG_URL, SESSION_INGEST_TEST_PG_MAJOR,
- * SESSION_INGEST_TEST_PG_REQUIRED=1 and the SESSION_INGEST_TEST_S3_* variables. A run that skipped any test fails.
+ * SESSION_INGEST_TEST_PG_REQUIRED=1 and the SESSION_INGEST_TEST_S3_* variables. Exit 0 only when at least one suite ran
+ * and every run passed with nothing skipped; 1 on a failed or empty run; 2 on bad arguments (checked before any container).
  */
 import { spawn, spawnSync } from "node:child_process";
 import { randomBytes } from "node:crypto";
@@ -24,19 +25,34 @@ const SELF_TESTS = [
   "src/session-ingest/__tests__/hold-harness/put-gate.minio.test.ts",
 ];
 
+const usage = (why: string): never => { throw Error(`usage: ${why}`); };
+
 function parse(argv: string[]) {
   const o = { majors: ["15", "16", "17"], majorGiven: false, pgUrl: undefined as string | undefined, s3: true, files: [] as string[] };
+  const value = (flag: string, i: number) => {
+    const v = argv[i];
+    if (v === undefined || v === "" || v.startsWith("--")) usage(`${flag} needs a value`);
+    return v!;
+  };
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i]!;
-    if (a === "--pg") { o.majors = argv[++i]!.split(",").map((s) => s.trim()).filter(Boolean); o.majorGiven = true; }
-    else if (a === "--pg-url") o.pgUrl = argv[++i];
+    if (a === "--pg") {
+      if (o.majorGiven) usage("--pg given twice");
+      // Every field must be a major: "", ",", "15,,16" and " , " are refused, never read as an empty matrix.
+      o.majors = value(a, ++i).split(",").map((s) => s.trim());
+      o.majorGiven = true;
+    } else if (a === "--pg-url") { if (o.pgUrl !== undefined) usage("--pg-url given twice"); o.pgUrl = value(a, ++i); }
     else if (a === "--no-s3") o.s3 = false;
     else if (a === "--") { o.files.push(...argv.slice(i + 1)); break; }
+    else if (a.startsWith("-")) usage(`unknown option ${a}`);
     else o.files.push(a);
   }
-  if (o.majors.some((m) => !/^1[5-9]$/.test(m))) throw Error(`--pg: majors 15..19, got ${o.majors.join(",")}`);
-  if (o.pgUrl && o.majorGiven && o.majors.length !== 1) throw Error("--pg-url takes at most one --pg major (the server's, asserted)");
+  if (!o.majors.length || o.majors.some((m) => !/^1[5-9]$/.test(m))) usage(`--pg: a comma-separated list of majors 15..19, got "${o.majors.join(",")}"`);
+  if (new Set(o.majors).size !== o.majors.length) usage(`--pg: duplicate major in "${o.majors.join(",")}"`);
+  if (o.pgUrl && o.majorGiven && o.majors.length !== 1) usage("--pg-url takes at most one --pg major (the server's, asserted)");
+  if (o.files.some((f) => f === "")) usage("empty test file argument");
   if (!o.files.length) o.files = o.s3 ? SELF_TESTS : SELF_TESTS.filter((f) => !f.includes(".minio."));
+  if (!o.files.length) usage("no test files to run");
   return o;
 }
 
@@ -105,20 +121,26 @@ function bunTest(files: string[], env: Record<string, string>, label: string): P
   });
 }
 
-const o = parse(process.argv.slice(2));
+// Arguments are checked before any container starts; a bad invocation exits 2 and touches nothing.
+let o: ReturnType<typeof parse>;
+try { o = parse(process.argv.slice(2)); }
+catch (e) { console.error(e instanceof Error ? e.message : e); process.exit(2); }
 // lane.sh passes its own container prefix, so its stale-container sweep also removes ours after a SIGKILL.
 const PREFIX = process.env.RH_HOLD_CONTAINER_PREFIX || "rh-hold";
 if (!/^[a-z0-9][a-z0-9-]{0,80}$/.test(PREFIX)) throw Error("RH_HOLD_CONTAINER_PREFIX invalid");
 const tag = `${process.pid}-${randomBytes(3).toString("hex")}`;
-let ok = true;
+// Success needs at least one suite run, and every run green: an empty plan is a failure, never a vacuous pass.
+let ok = true, runs = 0;
 try {
   const s3 = o.s3 ? await startMinio(tag) : {};
   if (o.pgUrl) {
     const major = o.majorGiven ? { SESSION_INGEST_TEST_PG_MAJOR: o.majors[0]! } : {};
+    runs++;
     ok = await bunTest(o.files, { ...s3, ...major, SESSION_INGEST_TEST_PG_URL: o.pgUrl, SESSION_INGEST_TEST_PG_REQUIRED: "1" }, `given PostgreSQL${o.majorGiven ? " " + o.majors[0] : ""}`);
   } else {
     for (const major of o.majors) {
       const url = await startPostgres(major, tag);
+      runs++;
       ok = (await bunTest(o.files, { ...s3, SESSION_INGEST_TEST_PG_URL: url, SESSION_INGEST_TEST_PG_MAJOR: major, SESSION_INGEST_TEST_PG_REQUIRED: "1" }, `PostgreSQL ${major}`)) && ok;
       spawnSync("docker", ["rm", "-f", `${PREFIX}-pg-${tag}-${major}`], { stdio: "ignore" });
       containers.delete(`${PREFIX}-pg-${tag}-${major}`);
@@ -130,4 +152,5 @@ try {
 } finally {
   removeAll();
 }
+if (runs === 0) { console.error("# hold-harness: FAILED (no suite ran)"); ok = false; }
 process.exit(ok ? 0 : 1);
