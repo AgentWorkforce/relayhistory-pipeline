@@ -107,8 +107,10 @@ function fromFacts(s: Session, events: EventFacts[], observed: ObservedPolicy) {
       // The result must identify exactly one PR: with two distinct PR URLs it cannot say which one was created.
       const urls = [...new Map(e.prRefs.map((r) => PR_KEY.exec(r)).filter((m): m is RegExpExecArray => !!m?.[1]).map((m) => [`${m[1]!.toLowerCase()}#${m[2]}`, m])).values()];
       const url = urls.length === 1 ? urls[0] : undefined;
-      const failed = /error|fail/i.test(e.toolStatus ?? "");
-      if (url && !failed) s.prs[pendingCreate.index] = { ts: e.ts, repo: url[1]!.toLowerCase(), number: Number(url[2]), action: "create" };
+      // Positive evidence only: the result must say "success". Error, cancellation or an unknown status claims nothing.
+      const succeeded = e.toolStatus === "success";
+      const failed = !succeeded && /error|fail|cancel/i.test(e.toolStatus ?? "");
+      if (url && succeeded) s.prs[pendingCreate.index] = { ts: e.ts, repo: url[1]!.toLowerCase(), number: Number(url[2]), action: "create" };
       else if (failed) s.prs.splice(pendingCreate.index, 1);
       pendingCreate = null;
       for (const ref of e.prRefs) if (ref !== url?.[0]) pushMention(s, ref, e.ts);

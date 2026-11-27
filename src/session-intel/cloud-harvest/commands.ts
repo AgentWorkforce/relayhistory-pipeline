@@ -20,6 +20,10 @@ const MAX_TEXT = 64 * 1024;
 const MAX_DEPTH = 3;
 const INDIRECT = new Set(["sudo", "doas", "env", "command", "builtin", "exec", "eval", "time", "nohup", "nice", "timeout", "xargs", "watch", "source", ".", "su", "script", "ssh"]);
 const SHELLS = new Set(["bash", "sh", "zsh", "dash", "ksh", "fish"]);
+/** `gh pr create` flags under which it creates nothing. */
+const NON_CREATING = /^(?:--dry-run(?:=.*)?|--web|-w|--help|-h)$/;
+/** Tool names whose call text is a shell command (as harvested); any other tool's text is not executed as shell. */
+export const SHELL_TOOLS = new Set(["Bash", "bash", "Shell", "shell", "exec_command", "run_terminal_command"]);
 
 type Sep = ";" | "&&" | "||" | "|";
 /** One segment's words and the connector joining it to the previous segment (null for the first). */
@@ -121,7 +125,8 @@ export function soleCreate(text: string): boolean {
     const prefixOk = segs.slice(0, -1).every((g) => { const w = strip(g.words); return w[0] === "cd" && w.length <= 2; })
       && segs.slice(1).every((g) => g.after === "&&");
     if (!prefixOk) return false;
-    if (prog === "gh") return last[1] === "pr" && last[2] === "create";
+    // A creating invocation: `--dry-run` prints what it would do, `--web` opens a browser, `--help` prints help.
+    if (prog === "gh") return last[1] === "pr" && last[2] === "create" && !last.slice(3).some((a) => NON_CREATING.test(a));
     if (prog && SHELLS.has(prog) && segs.length === 1 && last.length === 3 && (last[1] === "-c" || last[1] === "-lc")) { script = last[2]!; continue; }
     return false;
   }

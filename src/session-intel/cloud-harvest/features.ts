@@ -5,7 +5,7 @@
  */
 import { createHash } from "node:crypto";
 import { canonicalTs } from "./instant.ts";
-import { ghCommands, soleCreate } from "./commands.ts";
+import { ghCommands, SHELL_TOOLS, soleCreate } from "./commands.ts";
 
 export interface RawEvent {
   eventId: string;
@@ -159,7 +159,8 @@ export function eventFacts(e: RawEvent): EventFacts {
     files: cap((e.filesTouched ?? []).filter((f) => typeof f === "string" && looksLikePath(f))),
     touched: touchedPaths(text, isCall, isResult),
     git: cap([...commandText.matchAll(GIT)].map((m) => m[1] as GitOp)),
-    gh: cap([...ghOps(gh), ...(isCall && soleCreate(text) ? ["pr-create-sole" as const] : [])]),
+    // A sole create needs a shell tool: a Read or Write whose text says "gh pr create" runs nothing.
+    gh: cap([...ghOps(gh), ...(isCall && SHELL_TOOLS.has(e.toolName ?? "") && soleCreate(text) ? ["pr-create-sole" as const] : [])]),
     branches: cap(branches), prRefs: cap(prRefs),
     shas: isResult ? cap([...text.matchAll(COMMIT_OUT)].map((m) => m[1]!)) : [],
     relay: relayMatch ? { from: relayMatch[1]!, to: relayMatch[2]!, messageId: relayMatch[3] ?? null } : null,
