@@ -271,7 +271,11 @@ export interface RearmPassExpectation {
   ledgerBucket: string | null;
   /** Its workload: the receipt must name this namespace and CronJob, and carry a Job name of it and a Job UID. */
   writer: { namespace: string; cronJobName: string };
-  /** Trusted builds: the receipt's image digest or git sha must be one of these (at least one list non-empty). */
+  /**
+   * Trusted builds (at least one list non-empty). Each non-empty list must be matched by the receipt: with
+   * `imageDigests` the receipt's digest must be present and listed (a matching git sha never stands in for it); with
+   * both, both must match. `gitShas` alone is the explicit sha-only mode.
+   */
   revisions: { imageDigests?: readonly string[]; gitShas?: readonly string[] };
 }
 
@@ -316,8 +320,10 @@ function validExpectation(e: unknown): e is RearmPassExpectation {
 function matches(r: RearmPassReceipt, keyRoot: string, e: RearmPassExpectation): boolean {
   const scopes = rearmScopes(keyRoot, e.orgs);
   const w = r.workload;
-  const rev = (r.revision.imageDigest !== undefined && (e.revisions.imageDigests ?? []).includes(r.revision.imageDigest))
-    || (r.revision.gitSha !== undefined && (e.revisions.gitShas ?? []).includes(r.revision.gitSha));
+  // Every revision list the caller asserts must be matched (AND): a pinned image is never satisfied by the same source
+  // built differently. Git-sha-only is an explicit mode (no imageDigests given).
+  const pinned = (list: readonly string[] | undefined, got: string | undefined) => list === undefined || list.length === 0 || (got !== undefined && list.includes(got));
+  const rev = pinned(e.revisions.imageDigests, r.revision.imageDigest) && pinned(e.revisions.gitShas, r.revision.gitSha);
   return r.scopeHash === rearmScopeHash(scopes) && r.scopes === scopes.length
     && r.bucketHash === rearmBucketHash(e.bucket)
     && (e.ledgerBucket === null ? r.ledgerBucketHash === undefined : r.ledgerBucketHash === rearmBucketHash(e.ledgerBucket))
@@ -331,7 +337,7 @@ function matches(r: RearmPassReceipt, keyRoot: string, e: RearmPassExpectation):
  * `.all` when `expected.orgs` is null, else the org's own (an org outside `expected.orgs` is `out_of_scope`; a past
  * every-org receipt never counts for a narrowed sweeper). The latest receipt there must be well formed (`malformed`),
  * match `expected` in scope hash and size, transcript and ledger homes, writer namespace / CronJob / Job, and a trusted
- * revision (`mismatch`), and have finished within `maxAgeMs` of `nowMs` (`stale`) and not more than
+ * revision, every asserted revision list matched (`mismatch`), and have finished within `maxAgeMs` of `nowMs` (`stale`) and not more than
  * REARM_RECEIPT_FUTURE_SKEW_MS after it (`future`). Denied access throws RearmSweepRefused("access_denied"); any other
  * store error propagates (fail closed).
  *

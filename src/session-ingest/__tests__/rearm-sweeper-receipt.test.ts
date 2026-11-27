@@ -179,6 +179,32 @@ describe("rearm sweeper pass receipts: the writer", () => {
     expect(await freshSweeperPass(store, ROOT, ORG_A, T0 + 10_000, HOUR, expectFor(null))).toEqual({ ok: false, reason: "malformed" });
   });
 
+  test("review repro 3: a pinned image is never satisfied by a matching git sha of another build", async () => {
+    const OTHER = `sha256:${"c".repeat(64)}`;
+    // A real pass by image OTHER, sha SHA.
+    const store = fresh();
+    expect((await runRearmSweeperPass({ ...ENV, INGEST_REARM_ORGS: ORG_A, INGEST_REARM_IMAGE_DIGEST: OTHER }, [], overridesFor(store))).output).toMatchObject({ receipt: "written" });
+    const at = T0 + 60_000;
+    const exp = (revisions: RearmPassExpectation["revisions"]) => expectFor([ORG_A], { revisions });
+    expect(await freshSweeperPass(store, ROOT, ORG_A, at, HOUR, exp({ imageDigests: [DIGEST], gitShas: [SHA] }))).toEqual({ ok: false, reason: "mismatch" });
+    expect(await freshSweeperPass(store, ROOT, ORG_A, at, HOUR, exp({ imageDigests: [DIGEST] }))).toEqual({ ok: false, reason: "mismatch" });
+    expect(await freshSweeperPass(store, ROOT, ORG_A, at, HOUR, exp({ imageDigests: [OTHER], gitShas: [SHA] }))).toMatchObject({ ok: true });
+    // The other direction: the image matches, the sha contradicts.
+    expect(await freshSweeperPass(store, ROOT, ORG_A, at, HOUR, exp({ imageDigests: [OTHER], gitShas: ["d".repeat(40)] }))).toEqual({ ok: false, reason: "mismatch" });
+    // Sha-only is an explicit mode and still works.
+    expect(await freshSweeperPass(store, ROOT, ORG_A, at, HOUR, exp({ gitShas: [SHA] }))).toMatchObject({ ok: true });
+    // A receipt with no digest (the pod lacked INGEST_REARM_IMAGE_DIGEST) never satisfies a pinned image, even with the sha.
+    const s2 = fresh();
+    expect((await runRearmSweeperPass({ ...ENV, INGEST_REARM_ORGS: ORG_A, INGEST_REARM_IMAGE_DIGEST: undefined }, [], overridesFor(s2))).output).toMatchObject({ receipt: "written" });
+    expect(await freshSweeperPass(s2, ROOT, ORG_A, at, HOUR, exp({ imageDigests: [DIGEST], gitShas: [SHA] }))).toEqual({ ok: false, reason: "mismatch" });
+    expect(await freshSweeperPass(s2, ROOT, ORG_A, at, HOUR, exp({ gitShas: [SHA] }))).toMatchObject({ ok: true });
+    // And no sha with a pinned sha list.
+    const s3 = fresh();
+    expect((await runRearmSweeperPass({ ...ENV, INGEST_REARM_ORGS: ORG_A, GITHUB_SHA: undefined }, [], overridesFor(s3))).output).toMatchObject({ receipt: "written" });
+    expect(await freshSweeperPass(s3, ROOT, ORG_A, at, HOUR, exp({ imageDigests: [DIGEST], gitShas: [SHA] }))).toEqual({ ok: false, reason: "mismatch" });
+    expect(await freshSweeperPass(s3, ROOT, ORG_A, at, HOUR, exp({ imageDigests: [DIGEST] }))).toMatchObject({ ok: true });
+  });
+
   test("every binding is checked against the expectation: homes, writer, Job, revision", async () => {
     const store = fresh();
     await writeRearmPassReceipt(store, receiptFor(ORG_A, T0));
