@@ -142,17 +142,28 @@ TRUNCATE, immutability and runtime-role access.
 
 ## Retention and erase policy
 
-The three tables hold:
-- an org identifier
-- a source table name
-- an operation
-- timestamps and an xid
+The three tables hold exactly these columns:
 
-They hold no workspace, user, session, object key or content. They are kept as inert history with 062320's hold
-history (062320 design, section 6) and are immutable: every UPDATE, DELETE and TRUNCATE is refused. A user or
-session erasure does not need to touch them, because they name no user or session. Removing an org's rows, for
-example on an org deletion, needs a separately reviewed owner procedure. That procedure is an open item for the
-erase-policy owner (hard-delete-owner), not part of this slot.
+| Table | Columns |
+|---|---|
+| `ingest_org_erasure_history` | `erased_org`, `source` (one of the 15 table names), `op` (INSERT, UPDATE or DELETE), `at`, `xid` |
+| `ingest_org_erasure_history_coverage` | `kind` (started, ended or truncated), `at`, `xid` |
+| `ingest_org_erasure_history_bindings` | `epoch`, `bound_org`, `fence_at`, `full_run`, `full_started_ms`, `full_evidence_sha256`, `bound_at` |
+
+They hold no workspace, user, session, object key or content. `full_run` must be an opaque FULL execution id (the
+bridge passes the GitHub run id, digits only). It must never carry a user or session identifier, content or an
+object path. Its regex check limits the characters but is not that semantic guarantee; the bind caller's review is.
+These org, epoch, run, xid and hash links are retained audit metadata, and are not presumed anonymous.
+
+hard-delete-owner's technical disposition at `adc8f8f5`: the tables are compatible with per-user and per-session
+erasure. Those erasures retain this minimal, owner-only org audit and coverage history. They must not delete it,
+and they must not prune counts to produce an empty-window result. The tables are kept as inert history with
+062320's hold history (062320 design, section 6), and they are immutable: every UPDATE, DELETE and TRUNCATE is
+refused.
+
+This disposition does NOT approve indefinite retention, org-deletion behaviour, dropping the immutability guards, or
+a live apply. Org deletion and retention remain a separately reviewed policy and procedure, with no hand deletion and
+no trigger bypass.
 
 ## Rollback
 
