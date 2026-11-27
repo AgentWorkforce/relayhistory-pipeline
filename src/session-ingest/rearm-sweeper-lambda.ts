@@ -26,7 +26,7 @@ export async function handler(_event: unknown = {}, context?: { getRemainingTime
   try {
     const { runRearmSweeperPass } = await import("./rearm-sweeper-main.ts");
     const { output } = await runRearmSweeperPass(process.env, [], {}, null, { deadlineAt });
-    if (output.enabled) metric(output.counts.failed === 0 ? 1 : 0, { ...output.counts, Complete: output.complete ? 1 : 0 });
+    if (output.enabled) metric(output.counts.failed === 0 ? 1 : 0, { ...output.counts, Complete: output.complete ? 1 : 0, Receipt: output.receipt === "written" ? 1 : 0 });
     return output;
   } catch (e) {
     const code = typeof (e as { code?: unknown })?.code === "string" && /^[A-Za-z0-9_]{1,64}$/.test((e as { code: string }).code) ? (e as { code: string }).code : "failed";
