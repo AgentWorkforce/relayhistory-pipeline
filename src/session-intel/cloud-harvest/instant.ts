@@ -58,3 +58,18 @@ export function eventNanos(v: unknown): bigint | null {
   }
   return ns;
 }
+
+/**
+ * An event time as one fixed-width UTC string, `YYYY-MM-DDTHH:MM:SS.nnnnnnnnnZ`, at its full precision, or null
+ * when `eventNanos` rejects it. Every time the bench compares (event facts, directory rows, forge PRs and their
+ * histories) goes through this, so string order is time order: mixing widths (`…00Z`, `…00.000Z`, nine digits)
+ * would sort a later instant first, and normalizing through `Date` would drop sub-millisecond order.
+ */
+export function canonicalTs(v: unknown): string | null {
+  const ns = eventNanos(v);
+  if (ns === null || ns < 0n) return null;
+  const s = ns / 1_000_000_000n, frac = ns % 1_000_000_000n;
+  const iso = new Date(Number(s) * 1000).toISOString();
+  if (!/^\d{4}-/.test(iso)) return null;
+  return `${iso.slice(0, 19)}.${frac.toString().padStart(9, "0")}Z`;
+}

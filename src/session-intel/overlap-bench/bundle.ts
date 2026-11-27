@@ -9,6 +9,7 @@ import type { Session } from "./model.ts";
 import { asOf as asOfEntry } from "../forge/types.ts";
 import { ownersAt, prOwners, prOwnership, prSide } from "./detectors.ts";
 import { pairId } from "./eval.ts";
+import { canonicalTs } from "../cloud-harvest/instant.ts";
 
 const MAX_FILES = 40;
 
@@ -41,7 +42,9 @@ export interface BundleItem { pair: string; at: string; sides: [SideInfo, SideIn
  * closes are left out: comments are fetched in their latest form, so their text is not dated. Without `asOf`
  * the bundle shows titles, files and outcomes, for adjudicating in hindsight what really happened.
  */
-export function describe(ctx: Context, sides: [string, string], at: string, ownerLabel: (u: string | null) => string | null, asOf = false): BundleItem {
+export function describe(ctx: Context, sides: [string, string], atIn: string, ownerLabel: (u: string | null) => string | null, asOf = false): BundleItem {
+  // Compared as strings with the model's times, so it takes their one form (canonicalTs); an invalid time hides all.
+  const at = canonicalTs(atIn) ?? (asOf ? "" : atIn);
   const owners = prOwners(ctx), own = prOwnership(ctx);
   const prs = new Map(ctx.prs.map((p) => [prSide(p.repo, p.number), p]));
   const prInfo = (side: string): PrInfo | null => {

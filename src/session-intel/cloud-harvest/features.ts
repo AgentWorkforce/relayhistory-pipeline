@@ -4,6 +4,7 @@
  * any substring of one longer than an identifier, is ever returned.
  */
 import { createHash } from "node:crypto";
+import { canonicalTs } from "./instant.ts";
 
 export interface RawEvent {
   eventId: string;
@@ -67,7 +68,8 @@ const eventIdOf = (v: unknown) => {
   return idOf(raw) ?? `h:${createHash("sha256").update(raw).digest("hex").slice(0, 24)}`;
 };
 /** An event time as canonical ISO, or "" when it is not one (such events are dropped by the window check). */
-const isoOf = (v: unknown) => (typeof v === "string" && Number.isFinite(Date.parse(v)) ? new Date(v).toISOString() : "");
+/** Event times keep their full precision in one fixed width (instant.ts canonicalTs); an invalid time is "". */
+const isoOf = (v: unknown) => canonicalTs(v) ?? "";
 
 const GIT = /\bgit\s+(?:-C\s+\S+\s+)?(commit|push|checkout|switch|branch|rebase|merge|revert|reset|cherry-pick|worktree|pull|fetch|stash)\b/g;
 const GH = /\bgh\s+(pr|issue|api)\s*(create|merge|close|view|checkout|comment|review|list)?\b/g;

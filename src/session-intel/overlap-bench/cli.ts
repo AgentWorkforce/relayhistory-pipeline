@@ -25,7 +25,7 @@ import { type IncidentLabel, type NegativeLabel, score, type Score } from "./sco
 import { components, type Components, rank, rankerGrid, type RankerParams } from "./ranker.ts";
 import { adjudicationSample, type AlertVerdict, ceiling, evaluate, pairId } from "./eval.ts";
 import { describe as describePair } from "./bundle.ts";
-import { instantOf } from "../cloud-harvest/instant.ts";
+import { canonicalTs, instantOf } from "../cloud-harvest/instant.ts";
 import { LOOSE_RANKER, scoreStage2, stage2Batch, verifiedBatch } from "./stage2.ts";
 import { claimOnce, finishOnce, noteOnce, pinScore } from "./once.ts";
 import { assertPrivateFile, assertPrivateInput, outsideRoot, privateDir, readPrivate, writePrivate } from "../cloud-harvest/private-fs.ts";
@@ -52,14 +52,15 @@ export function mergeHarvests(parts: Array<{ rows: DirectoryRow[]; facts: Sessio
       const o = rows.get(key(r));
       if (!o) { rows.set(key(r), r); continue; }
       const users = [...new Set([...((o.userIds as string[] | null) ?? []), ...((r.userIds as string[] | null) ?? [])])];
-      rows.set(key(r), { ...o, lastTs: r.lastTs > o.lastTs ? r.lastTs : o.lastTs, userIds: users, project: o.project ?? r.project });
+      const [a, b] = [canonicalTs(o.lastTs) ?? o.lastTs, canonicalTs(r.lastTs) ?? r.lastTs];
+      rows.set(key(r), { ...o, lastTs: b > a ? b : a, userIds: users, project: o.project ?? r.project });
     }
     for (const f of p.facts) {
       const o = facts.get(key(f));
       if (!o) { facts.set(key(f), f); continue; }
       const seen = new Set(o.events.map((e) => e.eventId));
       facts.set(key(f), { ...o, eventsRead: o.eventsRead + f.eventsRead, censored: o.censored || f.censored, error: o.error ?? f.error,
-        events: [...o.events, ...f.events.filter((e) => !seen.has(e.eventId))].sort((a, b) => (a.ts < b.ts ? -1 : a.ts > b.ts ? 1 : 0)) });
+        events: [...o.events, ...f.events.filter((e) => !seen.has(e.eventId))].map((e) => ({ ...e, ts: canonicalTs(e.ts) ?? e.ts })).sort((a, b) => (a.ts < b.ts ? -1 : a.ts > b.ts ? 1 : 0)) });
     }
   }
   return { rows: [...rows.values()], facts: [...facts.values()] };
@@ -93,6 +94,14 @@ export function earliestDeleteBy(scopes: Array<{ deleteBy: string }>): string {
   return new Date(Math.min(...scopes.map((x) => instant(x.deleteBy, "deleteBy")))).toISOString();
 }
 
+/** Forge times in the model's one form (canonicalTs), so they order correctly against event times. */
+const canon = <T extends string | null | undefined>(v: T): T => (typeof v === "string" ? (canonicalTs(v) ?? v) : v) as T;
+export function canonicalPr(p: ForgePr): ForgePr {
+  const out: ForgePr = { ...p, createdAt: canon(p.createdAt), mergedAt: canon(p.mergedAt), closedAt: canon(p.closedAt) };
+  if (p.history) out.history = { titles: p.history.titles.map((t) => ({ ...t, at: canon(t.at) })), bodies: p.history.bodies.map((b) => ({ ...b, at: canon(b.at) })) };
+  return out;
+}
+
 export function loadContext(harvest: string, forge: string, observed: ObservedPolicy = "all"): Context & { codingSessions: number; scopes: HarvestScope[] } {
   const scopes = harvestScopes(harvest);
   const { rows, facts } = mergeHarvests(scopes.map(({ dir }) => ({
@@ -108,7 +117,7 @@ export function loadContext(harvest: string, forge: string, observed: ObservedPo
     const byNumber = new Map(existsSync(hist) ? (JSON.parse(readPrivate(hist)) as PrHistory[]).map((h) => [h.number, h]) : []);
     for (const p of JSON.parse(readPrivate(join(forge, "prs", f))) as PullRequest[]) {
       const h = byNumber.get(p.number);
-      prs.push({ ...p, repo, ...(h ? { history: { titles: h.titles, bodies: h.bodies } } : {}) });
+      prs.push(canonicalPr({ ...p, repo, ...(h ? { history: { titles: h.titles, bodies: h.bodies } } : {}) }));
     }
   }
   return { sessions, prs, communicated: communicated(sessions), codingSessions: facts.length, scopes };
@@ -253,7 +262,10 @@ async function main(argv: string[]) {
   if (!values.harvest || !values.forge || !values.labels || !values.out) throw new Error("--harvest, --forge, --labels and --out are required");
   // Every output (logs, scores, bundles) carries real identifiers or PR text.
   assertOutsideRepo(values.out);
-  const labels = JSON.parse(readPrivate(values.labels)) as { incidents: IncidentLabel[]; negatives: NegativeLabel[] };
+  const raw = JSON.parse(readPrivate(values.labels)) as { incidents: IncidentLabel[]; negatives: NegativeLabel[] };
+  // Harm times are compared with alert times as strings, so they take the same form (canonicalTs). The labels'
+  // identity is still their bytes (labelsIdentity); this changes only the in-memory copy.
+  const labels = { ...raw, incidents: raw.incidents.map((i) => ({ ...i, harmAt: canon(i.harmAt) })) };
   const ctx = loadContext(values.harvest, values.forge);
   const perHundred = Number(values["per-hundred"] ?? 5);
   if (!(perHundred > 0) || !Number.isFinite(perHundred)) throw new Error("--per-hundred must be a positive number");

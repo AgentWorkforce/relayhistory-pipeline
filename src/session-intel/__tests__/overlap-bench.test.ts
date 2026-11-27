@@ -6,7 +6,7 @@ import { type Context, concurrentEdits, type ForgePr, openPrOverlap, sharedTrigg
 import { buildModel, communicated } from "../overlap-bench/model.ts";
 import { repoOf, repoRelative } from "../overlap-bench/paths.ts";
 import { score } from "../overlap-bench/score.ts";
-import { mergeHarvests } from "../overlap-bench/cli.ts";
+import { canonicalPr, mergeHarvests } from "../overlap-bench/cli.ts";
 
 const REPO = "AgentWorkforce/relayhistory";
 const row = (id: string, owner: string, extra: Partial<DirectoryRow> = {}): DirectoryRow =>
@@ -23,7 +23,8 @@ const pr = (number: number, author: string, extra: Partial<ForgePr> = {}): Forge
 });
 const ctxOf = (rows: DirectoryRow[], f: SessionFacts[], prs: ForgePr[]): Context => {
   const sessions = buildModel(rows, f);
-  return { sessions, prs, communicated: communicated(sessions) };
+  // As loadContext does: forge times take the model's one form.
+  return { sessions, prs: prs.map(canonicalPr), communicated: communicated(sessions) };
 };
 
 describe("paths", () => {
@@ -50,7 +51,7 @@ describe("open-pr overlap (D1)", () => {
     const alerts = openPrOverlap(ctx, P);
     expect(alerts).toHaveLength(1);
     expect(alerts[0]!.sides).toEqual(["root:codex:bob", "pr:agentworkforce/relayhistory#93"]);
-    expect(alerts[0]!.at).toBe("2026-09-01T21:00:00.000Z");
+    expect(alerts[0]!.at).toBe("2026-09-01T21:00:00.000000000Z");
     const incident = [{ id: "i1", repo: REPO, kind: "intent_conflict", lines: ["pr:93", "commit:d00dfee"], harmAt: "2026-09-09T14:43:00.000Z", split: "dev" as const }];
     // The commit line links through the sha the session printed; this session printed none, so it is unlinkable.
     expect(score("open-pr", ctx, alerts, incident, [], { sessions: 100, perHundred: 5 }).linkable).toBe(0);
@@ -84,7 +85,7 @@ describe("concurrent edits (D3) and relay suppression", () => {
   test("two owners editing the same files within the window alert at the second edit", () => {
     const ctx = ctxOf(rows, [edits("a", "2026-10-01T17:00:00.000Z"), edits("b", "2026-10-01T18:30:00.000Z")], []);
     const alerts = concurrentEdits(ctx, { windowH: 6, minShared: 2, maxRootsPerPath: 8, skipHot: true, crossOwnerOnly: true, suppressCommunicated: true });
-    expect(alerts.map((a) => a.at)).toEqual(["2026-10-01T18:30:00.000Z"]);
+    expect(alerts.map((a) => a.at)).toEqual(["2026-10-01T18:30:00.000000000Z"]);
   });
   test("a relay message between the two sessions before the edit suppresses the alert", () => {
     const ctx = ctxOf(rows, [
@@ -107,7 +108,7 @@ describe("shared trigger (D2)", () => {
     const ctx = ctxOf([row("x", "K", { project: { name: "AgentWorkforce/cloud" } }), row("y", "K", { project: { name: "AgentWorkforce/cloud" } })],
       [react("x", "2026-11-23T07:02:00.000Z", "2026-11-23T07:20:00.000Z"), react("y", "2026-11-23T07:03:00.000Z", "2026-11-23T07:25:00.000Z")], []);
     const alerts = sharedTrigger(ctx, { windowMin: 60, requireEdit: false, suppressCommunicated: true });
-    expect(alerts.map((a) => [a.at, a.artifact])).toEqual([["2026-11-23T07:25:00.000Z", "pr:agentworkforce/cloud#6483"]]);
+    expect(alerts.map((a) => [a.at, a.artifact])).toEqual([["2026-11-23T07:25:00.000000000Z", "pr:agentworkforce/cloud#6483"]]);
   });
 });
 
@@ -128,7 +129,7 @@ describe("PR ownership", () => {
       facts("reviewer", [fact("2026-10-01T11:00:00.000Z", { gh: ["pr-view"], prRefs: ["#4083"] }), fact("2026-10-01T11:05:00.000Z", { gh: ["pr-view"], prRefs: ["#4087"] })]),
     ], []);
     // Owned from the result's time, when the number became known.
-    expect(ctx.sessions.get("codex:author")!.prs).toEqual([{ ts: "2026-10-01T10:00:05.000Z", repo: "agentworkforce/relayhistory", number: 4083, action: "create" }]);
+    expect(ctx.sessions.get("codex:author")!.prs).toEqual([{ ts: "2026-10-01T10:00:05.000000000Z", repo: "agentworkforce/relayhistory", number: 4083, action: "create" }]);
     const owners = prOwners(ctx);
     expect([...(owners.get("pr:agentworkforce/relayhistory#4083") ?? [])]).toEqual(["codex:author"]);
     expect(owners.get("pr:agentworkforce/relayhistory#4087")).toBeUndefined();
@@ -161,8 +162,8 @@ describe("merged harvests", () => {
       { rows: [row("s", "W", { parentSessionIds: [], lastTs: "2026-11-20T00:00:00.000Z" }), row("t", "W")], facts: [facts("s", [fact("2026-11-04T00:00:00.000Z", { gh: ["pr-create"] }), fact("2026-11-20T00:00:00.000Z", { git: ["push"] })])] },
     ]);
     const s = m.rows.find((r) => r.sessionId === "s")!;
-    expect([s.parentSessionIds, s.userIds, s.lastTs, m.rows.length]).toEqual([["lead"], ["K", "W"], "2026-11-20T00:00:00.000Z", 2]);
-    expect(m.facts[0]!.events.map((e) => e.ts)).toEqual(["2026-11-04T00:00:00.000Z", "2026-11-20T00:00:00.000Z"]);
+    expect([s.parentSessionIds, s.userIds, s.lastTs, m.rows.length]).toEqual([["lead"], ["K", "W"], "2026-11-20T00:00:00.000000000Z", 2]);
+    expect(m.facts[0]!.events.map((e) => e.ts)).toEqual(["2026-11-04T00:00:00.000000000Z", "2026-11-20T00:00:00.000000000Z"]);
   });
 });
 
@@ -350,5 +351,49 @@ describe("history gaps", () => {
     expect(asOf(h.bodies, "2026-09-01T13:00:00Z")?.body).toBe("CURRENT-BODY");
     const only = historyOf({ number: 10, createdAt: "2026-09-01T10:00:00Z", title: "t", body: "CURRENT-BODY", userContentEdits: { nodes: [{ editedAt: "2026-09-01T10:00:00Z", diff: null, deletedAt: "2026-09-01T10:30:00Z" }] }, timelineItems: { nodes: [] } });
     expect(only.bodies).toEqual([{ at: "2026-09-01T10:00:00Z", body: null }]);
+  });
+});
+
+describe("time order (canonical full-precision times)", () => {
+  test("canonicalTs is one fixed width at full precision, so string order is time order", async () => {
+    const { canonicalTs } = await import("../cloud-harvest/instant.ts");
+    expect(canonicalTs("2026-11-26T12:00:00Z")).toBe("2026-11-26T12:00:00.000000000Z");
+    expect(canonicalTs("2026-11-26T12:00:00.5Z")).toBe("2026-11-26T12:00:00.500000000Z");
+    expect(canonicalTs("2026-11-26T12:00:00.000900Z")).toBe("2026-11-26T12:00:00.000900000Z");
+    expect(canonicalTs("2026-11-26T13:00:00.000000001+01:00")).toBe("2026-11-26T12:00:00.000000001Z");
+    for (const bad of ["2026-02-30T00:00:00Z", "yesterday", "", null, 5]) expect(canonicalTs(bad)).toBeNull();
+    // Mixed widths sort a later instant first; canonical forms do not.
+    const raw = ["2026-11-26T12:00:00.000900Z", "2026-11-26T12:00:00Z", "2026-11-26T12:00:00.5Z", "2026-11-26T12:00:00.000Z"];
+    expect([...raw].sort()[0]).toBe("2026-11-26T12:00:00.000900Z"); // the raw strings misorder
+    const canon = raw.map((t) => canonicalTs(t)!).sort();
+    expect(canon).toEqual(["2026-11-26T12:00:00.000000000Z", "2026-11-26T12:00:00.000000000Z", "2026-11-26T12:00:00.000900000Z", "2026-11-26T12:00:00.500000000Z"]);
+  });
+  test("an edit 900 microseconds after an alert, in the same millisecond, is hidden from the as-of bundle", async () => {
+    const { eventFacts } = await import("../cloud-harvest/features.ts");
+    const { describe: describePair } = await import("../overlap-bench/bundle.ts");
+    // The production reducer, from raw events.
+    const raw = (id: string, ts: string) => eventFacts({ eventId: id, ts, kind: "tool_call", type: "tool_call", actorRole: "assistant", toolName: "apply_patch",
+      content: "*** Begin Patch\n*** Update File: crates/core/src/lib.rs\n@@\n-a\n+b\n*** End Patch" });
+    const early = raw("e1", "2026-09-01T11:00:00.000Z"), late = raw("e2", "2026-09-01T12:00:00.000900Z");
+    expect(late.ts).toBe("2026-09-01T12:00:00.000900000Z");
+    const ctx = ctxOf([row("a", "K"), row("b", "W")], [facts("a", [early]), facts("b", [{ ...late, touched: late.touched.map((t) => ({ ...t, path: "crates/core/src/other.rs" })) }, raw("e3", "2026-09-01T12:00:00.000800Z")])], []);
+    const edited = (at: string) => describePair(ctx, ["root:codex:a", "root:codex:b"], at, () => "member", true).sides[1]!.editedFiles;
+    expect(edited("2026-09-01T12:00:00.000Z")).toEqual([]);
+    expect(edited("2026-09-01T12:00:00.000800Z")).toEqual(["crates/core/src/lib.rs"]);
+    expect(edited("2026-09-01T12:00:00.000900Z").sort()).toEqual(["crates/core/src/lib.rs", "crates/core/src/other.rs"]);
+  });
+  test("a forge PR created at a whole second is open for an edit later in that second", () => {
+    // GitHub times carry no fraction and event times do; as raw strings "21:00:00Z" sorts after "21:00:00.5Z", which
+    // would make the PR look not yet created. Line C owns PR 93 (created at 17:00 by its facts); bob edits lib.rs.
+    const creator = facts("cee", [
+      fact("2026-09-01T17:00:00.000Z", { gh: ["pr-create"], prRefs: ["agentworkforce/relayhistory#93"] }),
+      fact("2026-09-01T17:30:00.000Z", { touched: [{ path: "crates/core/src/lib.rs", via: "patch" }] }),
+    ]);
+    const edit = facts("bob", [fact("2026-09-01T21:00:00.5Z", { touched: [{ path: "crates/core/src/lib.rs", via: "patch" }] })]);
+    const ctx = ctxOf([row("bob", "W"), row("cee", "C")], [creator, edit], [pr(93, "machine-c", { createdAt: "2026-09-01T21:00:00Z" })]);
+    const P = { minShared: 1, maxPrFiles: 100, skipHot: true, suppressCommunicated: true };
+    expect(openPrOverlap(ctx, P).map((a) => a.at)).toEqual(["2026-09-01T21:00:00.500000000Z"]);
+    // Raw (not canonical) PR times misorder: the same world without canonicalPr raises nothing.
+    expect(openPrOverlap({ ...ctx, prs: [pr(93, "machine-c", { createdAt: "2026-09-01T21:00:00Z" })] }, P)).toEqual([]);
   });
 });

@@ -5,6 +5,7 @@
 import type { EventFacts } from "../cloud-harvest/features.ts";
 import type { DirectoryRow, SessionFacts } from "../cloud-harvest/harvest.ts";
 import { HOT_PATH, repoOf, repoRelative } from "./paths.ts";
+import { canonicalTs } from "../cloud-harvest/instant.ts";
 
 /** `repo` is the edit's own repository: taken from an absolute path when it names one, else the session's. */
 export interface Edit { ts: string; repo: string; path: string; via: string; hot: boolean }
@@ -44,7 +45,8 @@ const PR_KEY = /^([a-z0-9._-]+\/[a-z0-9._-]+)?#(\d+)$/i;
 const CREATE_RESULT_MS = 10 * 60_000;
 
 /** Events stamped before this (epoch zero, clock faults) carry no usable time and are dropped. */
-export const EARLIEST_TS = "2025-01-01T00:00:00.000Z";
+/** In canonicalTs form, like every time the model holds. */
+export const EARLIEST_TS = "2025-01-01T00:00:00.000000000Z";
 
 /**
  * How paths a session only observed are treated. `git status` and `git diff --stat` list what is dirty or changed,
@@ -64,8 +66,11 @@ function pushMention(s: Session, ref: string, ts: string) {
 function fromFacts(s: Session, events: EventFacts[], observed: ObservedPolicy) {
   let pendingCreate: { ts: string; index: number; seq: number | undefined } | null = null;
   let baseline: Set<string> | null = null;
-  for (const e of events) {
-    if (!(e.ts >= EARLIEST_TS) || !Number.isFinite(Date.parse(e.ts))) continue;
+  for (const raw of events) {
+    // Times are held in one fixed width at full precision, so string order is time order (canonicalTs).
+    const ts = canonicalTs(raw.ts);
+    if (ts === null || !(ts >= EARLIEST_TS)) continue;
+    const e = ts === raw.ts ? raw : { ...raw, ts };
     const seen = e.touched.filter((t) => t.via === "status").map((t) => t.path);
     const first = baseline === null && seen.length > 0;
     for (const path of [...new Set([...e.files, ...e.touched.map((t) => t.path)])]) {
@@ -124,10 +129,10 @@ export function buildModel(rows: DirectoryRow[], facts: SessionFacts[], observed
     sessions.set(key, {
       key, source: r.source, sessionId: r.sessionId, owner: users[0] ?? null, repo: projectName(r),
       root: key, parents: ((r.parentSessionIds as string[] | null) ?? []).map((p) => sessionKey(r.source, p)),
-      startedAt: String(r.createdAt ?? r.lastTs), lastTs: r.lastTs, edits: [], prs: [], branches: [], shas: [], received: [], names: new Set(),
+      startedAt: canonicalTs(r.createdAt) ?? canonicalTs(r.lastTs) ?? String(r.createdAt ?? r.lastTs), lastTs: canonicalTs(r.lastTs) ?? r.lastTs, edits: [], prs: [], branches: [], shas: [], received: [], names: new Set(),
     });
     const pr = r.pullRequest as { url?: string; number?: string | number } | null;
-    if (pr?.number) sessions.get(key)!.prs.push({ ts: r.lastTs, repo: repoOf(pr.url ?? null)?.toLowerCase() ?? null, number: Number(pr.number), action: "mention", undated: true });
+    if (pr?.number) sessions.get(key)!.prs.push({ ts: sessions.get(key)!.lastTs, repo: repoOf(pr.url ?? null)?.toLowerCase() ?? null, number: Number(pr.number), action: "mention", undated: true });
   }
   for (const f of facts) {
     const s = sessions.get(sessionKey(f.source, f.sessionId));

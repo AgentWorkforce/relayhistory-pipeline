@@ -170,7 +170,7 @@ describe("reader source (shared-sessions MCP)", () => {
     expect(s.error).toBeNull();
     expect(s.eventsRead).toBe(3);
     expect(s.truncated).toBe(1);
-    expect(s.events.map((e) => [e.ts, e.branches])).toEqual([["2026-11-20T00:00:01.000Z", ["fix/x-1"]], ["2026-11-20T00:00:02.000Z", ["fix/x-2"]]]);
+    expect(s.events.map((e) => [e.ts, e.branches])).toEqual([["2026-11-20T00:00:01.000000000Z", ["fix/x-1"]], ["2026-11-20T00:00:02.000000000Z", ["fix/x-2"]]]);
     expect(calls.map((c) => [c.args.session_id, c.args.source, c.args.workspace_id, c.args.order, c.args.cursor ?? null])).toEqual([["s1", "codex", WS, "asc", null], ["s1", "codex", WS, "asc", "b96e1:next"]]);
     expect(JSON.stringify(s)).not.toContain(MARKER);
   });
@@ -247,7 +247,7 @@ describe("privacy boundary", () => {
       userIds: ["u1", MARKER + " with spaces"], workState: "free text state", model: "gpt-x", eventCount: "12",
     }, "cloud");
     expect(row).toEqual({
-      sessionId: "s1", source: "codex", lastTs: "2026-11-20T00:00:00.123Z", createdAt: null, projectId: null,
+      sessionId: "s1", source: "codex", lastTs: "2026-11-20T00:00:00.123456000Z", createdAt: null, projectId: null,
       project: { name: "AgentWorkforce/cloud", detail: "~/Projects/AgentWorkforce/cloud" }, parentSessionIds: [], userIds: ["u1"], machineIds: [],
       eventCount: 12, pullRequest: { number: 93, url: "https://github.com/AgentWorkforce/cloud/pull/93" }, workState: null, model: "gpt-x", branch: null, via: "cloud",
     });

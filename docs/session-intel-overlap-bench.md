@@ -89,6 +89,8 @@ A PR's title and description appear only from dated history (forge `history`), a
 
 The judge's input is therefore more than PR text. It includes session-derived facts (branches named, files edited, activity span) and owner labels.
 
+**One time form.** The model compares times as strings, so every time it holds takes one fixed width at full precision (`canonicalTs`): event facts (older harvests stored milliseconds and are widened when loaded), directory rows, forge PR times and their title and description histories, label harm times, and the alert time a bundle is described at. Mixed widths would misorder instants within a second (`…12:00:00Z` sorts after `…12:00:00.5Z`), and normalizing through `Date` would drop sub-millisecond order.
+
 **Prefix invariance.** A test runs every detector (the shipped baseline included), the ranker and as-of bundles over a synthetic world and over the same world cut at several times T. Everything said about T must be identical in both. It fails if bundles count later sessions, or if D1 uses ownership established after its alert.
 
 **Harvest scopes.** `loadContext` reads each harvest's manifest. Merged harvests must be of one workspace, and none may be past its delete-by. Every input (harvest, forge, labels, verdicts, owner labels, frozen file) and every output must pass the same private-destination checks as the harvest. Scope times are validated as canonical UTC instants with real calendar dates (`cloud-harvest/instant.ts`, the one parser for every admitted time; February 30 or 24:00 are refused, not rolled over) and compared as instants, failing closed. JSON-lines inputs are read strictly: a malformed line or a partial last record is refused, never skipped.
