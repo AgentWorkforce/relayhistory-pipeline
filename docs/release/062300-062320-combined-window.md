@@ -16,13 +16,15 @@ nothing by itself. Per-slot detail: [062320-org-admission-hold.md](062320-org-ad
 | H (target) | `a9662ebac63a3487e64065d0d99a0fb819a2f5058e2f29df421403c8592e753c` at the integration head `ec9c9448` | re-run `bun src/hoopdb/migrate.ts --generation` at the release sha. H changes if any migration byte changes |
 | Steps G -> H | `upstream:20261105062300_search_index_stage.sql`, then `upstream:20261105062320_ingest_org_admission_fences.sql` | the migrator applies them in ledger order in one apply. 062300 always precedes 062320 |
 
-**Prerequisite P0: the source must agree with the live G.** At the integration head, `PRIVATE_INGEST_OVERLAP` is still
-`{from: 3eef01d7…, to: 778af686…}` and `COMMON_PROFILE.expectedGeneration` is `3eef01d7…`. That is the 062220 release,
-mid-lifecycle in source. Before this window:
-- If the live Worker, policy and marker are all at `778af686…` (the 062220 release finished live), a reviewed source
-  change must first set `expectedGeneration = 778af686…` and the pair to `null` (lifecycle step 3 of that release),
-  deployed and read back H-only at `778af686…`.
-- If they are not, stop: 062220's own release must finish first.
+**Prerequisite P0: the final 062220 step.** b1 reports that the live Worker is already H-only at `778af686…`: step-6
+commit 191c16db, plan run 45938486616 and deploy run 45938773082 at main 8dd6775f, with `READBACK_PASS`
+baseline-drain. `expectedGeneration` is `778af686…` and the tracked `overlapGeneration` was removed, but the reviewed
+pair `{3eef01d7…, 778af686…}` is still retained in source. P0 is therefore only lifecycle step 3 of that release:
+1. A reviewed source change sets `PRIVATE_INGEST_OVERLAP = null`.
+2. A deploy reads back exactly `{778af686…}`.
+
+Re-verify the live Worker, policy and marker at `778af686…` before the window. Step 1 below then starts from a clean
+H-only base and sets the new pair `{778af686…, H}`.
 
 ## 2. Consumer inventory: rebuild at H in the same window
 
@@ -36,21 +38,21 @@ The rule (runbook, "Schema-gated worker images"):
 The pause is silent: NotReady, no crash, no alert. 062010 paused the summary and status workers for about four hours
 this way. Owners must confirm every row today, so the H images are pre-built.
 
-| # | Consumer | Pins the generation via | Rebuild owner (confirm) | Verify after the roll |
+| # | Consumer | Pins the generation via | Rebuild owner (proposed by b1; each confirms on Relay) | Verify after the roll |
 |---|---|---|---|---|
-| 1 | private-ingest Worker (96bulls-session-ingest) | `expectedGeneration` / `INGEST_ACCEPT_GENERATIONS` (`PRIVATE_INGEST_OVERLAP`) | layered-sessions-pipeline (private-ingest release workflow) | the deploy readback accepts exactly {G, H}, then exactly {H} |
+| 1 | private-ingest Worker (96bulls-session-ingest) | `expectedGeneration` / `INGEST_ACCEPT_GENERATIONS` (`PRIVATE_INGEST_OVERLAP`) | b1 | the deploy readback accepts exactly {G, H}, then exactly {H} |
 | 2 | sessions-pipeline indexing Lambda (778a) | `publicationSchema.expected.generation`; `ingest_require_generation` on every pointer write | pipeline-handoff-sfmini | pointer writes succeed after the PASS at H; no 55000 |
 | 3 | sessions-pipeline feed Lambda (if live) | the same runtime | pipeline-handoff-sfmini | as row 2 |
-| 4 | session-pipeline-consumer | schema-gated SERVICE (`docker/entrypoint.sh`) | b1 / infra (manifests) | Ready count restored; no `worker paused` log |
-| 5 | bob-costas (summaries) | schema-gated SERVICE | b1 / infra | Ready restored; summary dead-letter count not grown since step 1 |
-| 6 | session-brief | schema-gated SERVICE | b1 / infra | Ready restored |
-| 7 | referee | schema-gated SERVICE | b1 / infra | Ready restored |
-| 8 | alleyoop-ingest | schema-gated SERVICE | b1 / infra | Ready restored |
-| 9 | hoopdb-indexer | schema-gated SERVICE | b1 / infra | Ready restored |
+| 4 | session-pipeline-consumer | schema-gated SERVICE (`docker/entrypoint.sh`) | layered-sessions-pipeline (image); envs-lead-3 (EKS pin bump) | Ready count restored; no `worker paused` log |
+| 5 | bob-costas (summaries) | schema-gated SERVICE | layered-sessions-pipeline (image); envs-lead-3 (EKS pin bump) | Ready restored; summary dead-letter count not grown since step 1 |
+| 6 | session-brief | schema-gated SERVICE | layered-sessions-pipeline (image); envs-lead-3 (EKS pin bump) | Ready restored |
+| 7 | referee | schema-gated SERVICE | layered-sessions-pipeline (image); envs-lead-3 (EKS pin bump) | Ready restored |
+| 8 | alleyoop-ingest | schema-gated SERVICE | layered-sessions-pipeline (image); envs-lead-3 (EKS pin bump) | Ready restored |
+| 9 | hoopdb-indexer | schema-gated SERVICE | layered-sessions-pipeline (image); envs-lead-3 (EKS pin bump) | Ready restored |
 | 10 | buffered GC job | `INGEST_GC_EXPECT_GENERATION` | layered-sessions-pipeline | next run starts at H with no `validation_pending` |
-| 11 | canonical-project-events relay | `INGEST_EXPECT_GENERATION` | b1 / infra (confirm) | relay claims at H |
+| 11 | canonical-project-events relay | `INGEST_EXPECT_GENERATION` | layered-sessions-pipeline (image); envs-lead-3 (pin bump) | relay claims at H |
 | 12 | publication job | `INGEST_PUBLISH_EXPECT_GENERATION` (`compiled_generation_mismatch` otherwise) | layered-sessions-pipeline | a publish run succeeds at H |
-| 13 | Neon-to-S3 erasure babysitter, retention phase | `INGEST_EXPECT_GENERATION` (only when its mode is not `off`) | hard-delete-owner / b1 (confirm) | the phase runs at H, or is confirmed `off` |
+| 13 | Neon-to-S3 erasure babysitter, retention phase | `INGEST_EXPECT_GENERATION` (only when its mode is not `off`) | layered-sessions-pipeline (image); envs-lead-3 (pin bump) | the phase runs at H, or is confirmed `off` |
 
 Not schema pins (no rebuild needed): the read Worker (`generation` is a client parameter), semantic copy (its own
 counter). The 062280 scoped publication RPC is not landed, so it is not in this window. Re-grep
@@ -61,7 +63,7 @@ Any new hit is added here.
 
 | Step | Action | Readback | Rollback while at this step |
 |---|---|---|---|
-| P0 | source agrees with live G (section 1) | Worker H-only at G | 062220's own release procedure |
+| P0 | the 062220 pair -> `null` (section 1) | the live Worker reads back exactly `{778af686…}` | restore the pair (the reviewed source change reverted) |
 | 1 | Worker G+H. A reviewed source change sets `PRIVATE_INGEST_OVERLAP = {from: G, to: H}` and the tracked `overlapGeneration: H`. It lands, and the private-ingest deploy moves the Worker to accept {G, H} | the live deploy accepts exactly {G, H} | deploy G+H -> G (the reviewed rollback transition) |
 | 2 | Pre-build every H image (section 2) and record the deployments, images and Ready counts | the list is recorded | nothing deployed: none |
 | 3 | Open the overlap window G -> H (`.github/workflows/ingest-generation-overlap.yml` mode `open`). The TTL must cover plan, review, apply, worker rolls and rebind: up to 4 h, at least 15 min left at plan and at apply | the window row shows G -> H, the TTL, `approval_sha256` and `opened_by` | close the window (owner close); Worker back to G |
