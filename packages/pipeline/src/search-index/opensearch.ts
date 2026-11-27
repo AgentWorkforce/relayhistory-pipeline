@@ -185,6 +185,8 @@ export const OPENSEARCH_MAPPINGS = Object.freeze({
 export const OPENSEARCH_SETTINGS = Object.freeze({ index: { gc_deletes: "0s" } });
 /** The spellings of a zero gc_deletes that `ensureSchema` accepts on an existing index. */
 const ZERO_GC_DELETES = new Set(["0", "0s", "0ms"]);
+/** A duration string that is confirmed nonzero (zero spellings are checked first). */
+const NONZERO_GC_DELETES = /^(?=.*[1-9])\d+(?:\.\d+)?(?:nanos|micros|ms|s|m|h|d)?$/;
 
 interface Source {
   org_id: string;
@@ -618,12 +620,12 @@ export function createOpenSearchSearchIndex(config: OpenSearchSearchIndexConfig)
         const type = (created.body as { error?: { type?: unknown } } | undefined)?.error?.type;
         if (type !== "resource_already_exists_exception") throw new SearchIndexError("unavailable", false, "http_400");
         // Existing index: the same mapping must apply cleanly. A 400 is a mapping conflict
-        // only when the reply says so; any other 400 is a rejected update, with the bounded
-        // error type names (never the reason text) as its detail.
+        // only when the reply says so; any other 400 is a rejected update. The detail is
+        // fixed: no upstream type or reason string is copied into it.
         const merged = await request("PUT", `${index}/_mapping`, OPENSEARCH_MAPPINGS, context, { accept: [400] });
         if (merged.status === 400) {
           if (mappingConflictEvidence(merged.body)) throw new SearchIndexError("schema_missing", false, "mapping_conflict");
-          throw new SearchIndexError("schema_missing", false, `mapping_rejected:${httpDetail(400, merged.body)}`);
+          throw new SearchIndexError("schema_missing", false, "mapping_rejected:http_400");
         }
       }
       // Verify (never apply) gc_deletes: an existing or template-created index may
@@ -632,11 +634,12 @@ export function createOpenSearchSearchIndex(config: OpenSearchSearchIndexConfig)
       const entries = Object.values((settings.body ?? {}) as Record<string, { settings?: Record<string, unknown> } | undefined>);
       if (entries.length !== 1) invalidReply();
       const gcDeletes = entries[0]?.settings?.["index.gc_deletes"];
-      // Absent from the reply: the value is not shown, so it cannot be verified as zero.
-      if (gcDeletes === undefined) throw new SearchIndexError("schema_mismatch", false, "gc_deletes_unverified");
-      if (typeof gcDeletes !== "string" || !ZERO_GC_DELETES.has(gcDeletes)) {
+      if (gcDeletes === 0 || (typeof gcDeletes === "string" && ZERO_GC_DELETES.has(gcDeletes))) return;
+      // Nonzero only when confirmed: a positive duration string such as "60s". Absent,
+      // empty or any other representation cannot be verified as zero.
+      if (typeof gcDeletes === "string" && NONZERO_GC_DELETES.test(gcDeletes))
         throw new SearchIndexError("schema_mismatch", false, "gc_deletes");
-      }
+      throw new SearchIndexError("schema_mismatch", false, "gc_deletes_unverified");
     },
 
     async upsert(docs, context) {

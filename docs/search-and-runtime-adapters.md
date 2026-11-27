@@ -150,7 +150,8 @@ dialect.
   fails `ensureSchema` with `mapping_conflict` and has to be recreated. (A 400
   from the mapping update is `mapping_conflict` only when the reply is an
   `illegal_argument_exception` saying a mapper cannot be changed or conflicts;
-  any other 400 is `mapping_rejected:http_400[:<error type>]`.) The doc
+  any other 400 is `mapping_rejected:http_400`, which copies no upstream type
+  or reason.) The doc
   values store the folded windows a second time on disk. Cost: a
   script filter runs once per candidate document that has already passed the
   tenant, session, source, kind, project and time filters (Lucene checks it
@@ -191,9 +192,10 @@ dialect.
   index creation, mapping updates and reading settings for `ensureSchema`.
 - `ensureSchema` reads `index.gc_deletes` back after creating or confirming the
   index. An index that already existed or came from a template may keep the
-  60 s default, which the tombstone handling above does not expect. A value
-  other than `0`, `0s` or `0ms` fails `schema_mismatch` (detail `gc_deletes`);
-  a reply that omits the setting (an index left on the default) fails
+  60 s default, which the tombstone handling above does not expect. `0`, `0s`,
+  `0ms` and a numeric `0` pass. A confirmed nonzero duration string (such as
+  `60s`) fails `schema_mismatch` (detail `gc_deletes`); a reply that omits the
+  setting (an index left on the default) or gives it in any other form fails
   `schema_mismatch` (detail `gc_deletes_unverified`), since zero is not shown.
   The adapter never applies settings. An operator sets
   `index.gc_deletes: 0s` (a dynamic setting) and reruns `ensureSchema`.

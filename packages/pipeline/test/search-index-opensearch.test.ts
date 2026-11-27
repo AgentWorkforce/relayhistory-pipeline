@@ -601,12 +601,20 @@ describe("opensearch adapter schema and dialects", () => {
     mappingBody = { error: { root_cause: [{ type: "illegal_argument_exception", reason: "Mapper for [ts_ms] conflicts with existing mapper" }], type: "illegal_argument_exception", reason: "x" } };
     await rejects(a.ensureSchema(), "schema_missing", "mapping_conflict");
     // ...any other 400 is a rejected update, never called a conflict.
-    mappingBody = {};
-    await rejects(a.ensureSchema(), "schema_missing", "mapping_rejected:http_400");
-    mappingBody = { error: { type: "mapper_parsing_exception", reason: "No handler for type [flattened]" } };
-    await rejects(a.ensureSchema(), "schema_missing", "mapping_rejected:http_400:mapper_parsing_exception");
-    mappingBody = { error: { type: "illegal_argument_exception", reason: "unknown parameter [doc_values]" } };
-    await rejects(a.ensureSchema(), "schema_missing", "mapping_rejected:http_400:illegal_argument_exception");
+    // ...any other 400 is a rejected update with a fixed detail: no upstream type or
+    // reason (known, unknown, primary or nested) is copied into the error.
+    for (const body of [
+      {},
+      { error: { type: "mapper_parsing_exception", reason: "No handler for type [flattened]" } },
+      { error: { type: "illegal_argument_exception", reason: "unknown parameter [doc_values]" } },
+      { error: { type: "synthetic_private_marker", reason: "synthetic_private_reason" } },
+      { error: { type: "illegal_argument_exception", reason: "x", caused_by: { type: "synthetic_nested_marker", reason: "synthetic_nested_reason" } } },
+      { error: { type: "x", root_cause: [{ type: "synthetic_root_marker" }] } },
+    ]) {
+      mappingBody = body;
+      const e = await rejects(a.ensureSchema(), "schema_missing", "mapping_rejected:http_400");
+      expect(`${e.detail} ${e.message}`).not.toMatch(/synthetic_|mapper_parsing|No handler|unknown parameter/);
+    }
   });
 
   it("verifies index.gc_deletes is zero on an existing index and never applies settings", async () => {
@@ -627,10 +635,22 @@ describe("opensearch adapter schema and dialects", () => {
       return result;
     };
     for (const zero of ["0s", "0", "0ms"]) expect(await run(zero), zero).toBe("ok");
-    // Absent from the settings reply: not shown, so it cannot be verified as zero.
-    const unverified = await run(undefined);
-    expect([(unverified as SearchIndexError).code, (unverified as SearchIndexError).detail]).toEqual(["schema_mismatch", "gc_deletes_unverified"]);
-    for (const wrong of ["60s", "1s", ""]) {
+    // Zero in every supported representation, including a numeric JSON 0.
+    expect(await run(undefined, { [INDEX]: { settings: { "index.gc_deletes": 0 } } })).toBe("ok");
+    // Absent, empty or an unsupported representation: cannot be verified as zero.
+    for (const body of [
+      { [INDEX]: { settings: {} } },
+      { [INDEX]: { settings: { "index.gc_deletes": "" } } },
+      { [INDEX]: { settings: { "index.gc_deletes": 60 } } },
+      { [INDEX]: { settings: { "index.gc_deletes": { value: "60s" } } } },
+      { [INDEX]: { settings: { "index.gc_deletes": "garbage" } } },
+      { [INDEX]: { settings: { "index.gc_deletes": null } } },
+    ]) {
+      const e = await run(undefined, body);
+      expect([(e as SearchIndexError).code, (e as SearchIndexError).detail], JSON.stringify(body)).toEqual(["schema_mismatch", "gc_deletes_unverified"]);
+    }
+    // Nonzero only for a confirmed nonzero duration string.
+    for (const wrong of ["60s", "1s", "500ms"]) {
       const e = await run(wrong);
       expect(e, String(wrong)).toBeInstanceOf(SearchIndexError);
       expect((e as SearchIndexError).code).toBe("schema_mismatch");

@@ -94,7 +94,7 @@ describe("search bootstrap: one plain line for an OpenSearch failure", () => {
     });
     const error = await caught(() => index.ensureSchema());
     expect(searchBootstrapFailureLine(error, URL_ENV, "rolled_back")).toBe(
-      `search bootstrap failed: OpenSearch search-relay.us-east-1.es.amazonaws.com refused the request (http_403:security_exception): check the OpenSearch role mapping for the search indexer's Pod Identity role, and the Pod Identity association; ${NOT_APPLIED}`,
+      `search bootstrap failed: OpenSearch search-relay.us-east-1.es.amazonaws.com refused the request (http_403): check the OpenSearch role mapping for the search indexer's Pod Identity role, and the Pod Identity association; ${NOT_APPLIED}`,
     );
     // The backend's reason text never reaches the line.
     expect(searchBootstrapFailureLine(error, URL_ENV, "rolled_back")).not.toContain("no permissions");
@@ -148,30 +148,63 @@ describe("search bootstrap: one plain line for an OpenSearch failure", () => {
     expect(line).not.toMatch(/exists|remove the|delete|recreate|stale/i);
   });
 
-  test("a 400 on PUT _mapping with no conflict evidence: rejected, never 'conflict'", async () => {
-    for (const [body, types] of [[{}, ""], [{ error: { type: "mapper_parsing_exception", reason: "No handler for type [flattened]" } }, ", mapper_parsing_exception"]] as const) {
-      const index = fakeOpenSearch({
-        create: reply(400, { error: { type: "resource_already_exists_exception" } }),
-        mapping: reply(400, body),
-      });
-      const error = (await caught(() => index.ensureSchema())) as SearchIndexError;
+  test("a 400 on PUT _mapping with no conflict evidence: rejected, never 'conflict', no upstream strings", async () => {
+    for (const body of [
+      {},
+      { error: { type: "mapper_parsing_exception", reason: "No handler for type [flattened]" } },
+      { error: { type: "synthetic_private_marker", reason: "synthetic_private_reason" } },
+      { error: { type: "illegal_argument_exception", reason: "x", caused_by: { type: "synthetic_nested_marker", reason: "synthetic_nested_reason" } } },
+    ]) {
+      // A fresh fake per call: a Response body can be read once.
+      const fresh = () =>
+        fakeOpenSearch({
+          create: reply(400, { error: { type: "resource_already_exists_exception" } }),
+          mapping: reply(400, body),
+        });
+      const error = (await caught(() => fresh().ensureSchema())) as SearchIndexError;
       expect(error.code).toBe("schema_missing");
-      expect(error.detail).toStartWith("mapping_rejected:http_400");
-      const line = searchBootstrapFailureLine(error, URL_ENV, "rolled_back")!;
-      expect(line).toContain(`already exists and rejected this release's mapping update (HTTP 400${types};`);
+      expect(error.detail).toBe("mapping_rejected:http_400");
+      // What serve() actually writes to stderr, through the real wrapper.
+      const written: string[] = [];
+      const index = fresh();
+      await caught(() =>
+        withSearchBootstrapDiagnosis(URL_ENV, (openSearch) => openSearch(() => index.ensureSchema()), (l) => written.push(l)),
+      );
+      expect(written).toHaveLength(1);
+      const line = written[0]!;
+      expect(line).toContain("already exists and rejected this release's mapping update (HTTP 400; schema_missing: mapping_rejected:http_400)");
       expect(line).not.toMatch(/conflict/i);
       expect(line).not.toMatch(/remove the|delete|recreate/i);
-      expect(line).not.toContain("No handler");
+      for (const text of [line, error.detail ?? "", error.message])
+        expect(text).not.toMatch(/synthetic_|mapper_parsing|No handler/);
     }
   });
 
-  test("settings without index.gc_deletes: could not be verified, not 'other than 0'", async () => {
-    const index = fakeOpenSearch({ settings: reply(200, { [INDEX]: { settings: {} } }) });
+  test("gc_deletes: zero passes, a confirmed nonzero string is 'other than 0', anything else could not be verified", async () => {
+    const settings = (value: unknown) =>
+      fakeOpenSearch({ settings: reply(200, { [INDEX]: { settings: value === undefined ? {} : { "index.gc_deletes": value } } }) });
+    for (const zero of [0, "0", "0s"]) await settings(zero).ensureSchema();
+    for (const value of [undefined, { value: "60s" }, "garbage", 60]) {
+      const error = (await caught(() => settings(value).ensureSchema())) as SearchIndexError;
+      expect([error.code, error.detail], JSON.stringify(value)).toEqual(["schema_mismatch", "gc_deletes_unverified"]);
+      const line = searchBootstrapFailureLine(error, URL_ENV, "rolled_back")!;
+      expect(line).toContain("index.gc_deletes could not be verified as 0s (absent from the settings response or in an unsupported form");
+      expect(line).not.toContain(SCHEMA_PHRASES.gc);
+    }
+    const nonzero = (await caught(() => settings("60s").ensureSchema())) as SearchIndexError;
+    expect([nonzero.code, nonzero.detail]).toEqual(["schema_mismatch", "gc_deletes"]);
+    expect(searchBootstrapFailureLine(nonzero, URL_ENV, "rolled_back")).toContain(SCHEMA_PHRASES.gc);
+  });
+
+  test("an HTTP failure line shows the status only, never upstream type names", async () => {
+    const index = fakeOpenSearch({
+      create: reply(403, { error: { type: "synthetic_private_marker", caused_by: { type: "synthetic_nested_marker" } } }),
+    });
     const error = (await caught(() => index.ensureSchema())) as SearchIndexError;
-    expect([error.code, error.detail]).toEqual(["schema_mismatch", "gc_deletes_unverified"]);
+    expect(error.code).toBe("unavailable");
     const line = searchBootstrapFailureLine(error, URL_ENV, "rolled_back")!;
-    expect(line).toContain("index.gc_deletes could not be verified as 0s (not in the settings response");
-    expect(line).not.toContain(SCHEMA_PHRASES.gc);
+    expect(line).toContain("refused the request (http_403)");
+    expect(line).not.toContain("synthetic_");
   });
 
   test("bad_response after a valid product check (malformed settings): malformed or unexpected, never 'not OpenSearch'", async () => {

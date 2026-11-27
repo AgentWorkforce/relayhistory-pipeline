@@ -203,6 +203,9 @@ function openSearchCause(error: SearchIndexError, host: string, index: string): 
   const os = `OpenSearch ${host}`;
   const detail = error.detail ?? "";
   const status = /^http_(\d{3})/.exec(detail)?.[1];
+  // An HTTP detail can carry upstream error type names (http_<status>:<type>:<cause>);
+  // the line shows the status only. Every other detail is a fixed adapter token.
+  const shown = status ? `http_${status}` : detail;
   if (error.code === "unavailable") {
     if (detail === "network")
       return `${os} unreachable (network): check search.opensearch.url, the VPC/security group and Pod Identity (the OpenSearch role mapping)`;
@@ -211,28 +214,26 @@ function openSearchCause(error: SearchIndexError, host: string, index: string): 
     if (detail === "credentials")
       return `${os}: no AWS credentials to sign requests (credentials): check the search indexer's Pod Identity association`;
     if (status === "403")
-      return `${os} refused the request (${detail}): check the OpenSearch role mapping for the search indexer's Pod Identity role, and the Pod Identity association`;
+      return `${os} refused the request (${shown}): check the OpenSearch role mapping for the search indexer's Pod Identity role, and the Pod Identity association`;
     if (status === "401")
-      return `${os} rejected the credentials (${detail}): check search.opensearch.auth, the OpenSearch role mapping and Pod Identity`;
+      return `${os} rejected the credentials (${shown}): check search.opensearch.auth, the OpenSearch role mapping and Pod Identity`;
     if (status)
-      return `${os} answered HTTP ${status} (${detail}): check search.opensearch.url and the domain's health`;
+      return `${os} answered HTTP ${status} (${shown}): check search.opensearch.url and the domain's health`;
     // invalidReply: any reply whose shape the adapter could not use (the product check,
     // index settings, mappings, search results). It does not show which, nor that the
     // service is something other than OpenSearch.
     if (detail === "bad_response")
       return `${os} sent a malformed or unexpected reply (bad_response; for example index settings or a mapping the adapter could not read): check search.opensearch.url, the domain's health and the index named here`;
-    return `${os} unavailable (${detail || "unavailable"}): check search.opensearch.url, the VPC/security group and Pod Identity (the OpenSearch role mapping)`;
+    return `${os} unavailable (${shown || "unavailable"}): check search.opensearch.url, the VPC/security group and Pod Identity (the OpenSearch role mapping)`;
   }
   if (error.code === "unsupported" && detail === "dialect_mismatch")
     return `${os} is not the configured product (dialect_mismatch): check search.opensearch.dialect`;
   if (error.code === "invalid_argument" || error.code === "unsupported")
-    return `the OpenSearch settings are invalid (${error.code}${detail ? `: ${detail}` : ""}): check search.opensearch.* in your values file`;
+    return `the OpenSearch settings are invalid (${error.code}${shown ? `: ${shown}` : ""}): check search.opensearch.* in your values file`;
   // An existing index whose mapping update PUT <index>/_mapping answered 400 without
-  // saying it conflicts: only the bounded error type names are kept.
-  if (error.code === "schema_missing" && detail.startsWith("mapping_rejected:")) {
-    const types = detail.slice("mapping_rejected:http_400".length).replace(/^:/, "");
-    return `the OpenSearch index ${index} on ${host} already exists and rejected this release's mapping update (HTTP 400${types ? `, ${types.replaceAll(":", ", ")}` : ""}; schema_missing: ${detail}): see ${ADAPTER_DOC} or contact support with this line`;
-  }
+  // saying it conflicts. The adapter keeps no upstream type or reason.
+  if (error.code === "schema_missing" && detail === "mapping_rejected:http_400")
+    return `the OpenSearch index ${index} on ${host} already exists and rejected this release's mapping update (HTTP 400; schema_missing: mapping_rejected:http_400): see ${ADAPTER_DOC} or contact support with this line`;
   // PUT <index>/_mapping answered 400 and the reply says the mapping conflicts.
   // The adapter keeps no server text, so the field is not known here.
   if (error.code === "schema_missing" && detail === "mapping_conflict")
@@ -242,12 +243,12 @@ function openSearchCause(error: SearchIndexError, host: string, index: string): 
     return `the OpenSearch index ${index} on ${host} was not found (schema_missing): the bootstrap creates it, so it is absent or was removed while this run checked it; rerun the Job, and if this repeats, check search.opensearch.indexPrefix and that the OpenSearch role mapping allows creating indices`;
   // ensureSchema verifies, never applies, index.gc_deletes.
   if (error.code === "schema_mismatch" && detail === "gc_deletes_unverified")
-    return `the OpenSearch index ${index} on ${host}: index.gc_deletes could not be verified as 0s (not in the settings response; schema_mismatch: gc_deletes_unverified): the bootstrap checks but never changes settings; set index.gc_deletes: 0s on that index explicitly (a dynamic setting) and rerun the Job, see ${ADAPTER_DOC}`;
+    return `the OpenSearch index ${index} on ${host}: index.gc_deletes could not be verified as 0s (absent from the settings response or in an unsupported form; schema_mismatch: gc_deletes_unverified): the bootstrap checks but never changes settings; set index.gc_deletes: 0s on that index explicitly (a dynamic setting) and rerun the Job, see ${ADAPTER_DOC}`;
   if (error.code === "schema_mismatch" && detail === "gc_deletes")
     return `the OpenSearch index ${index} on ${host} has index.gc_deletes other than 0 (schema_mismatch: gc_deletes): the bootstrap checks but never changes settings; set index.gc_deletes: 0s on that index (a dynamic setting) and rerun the Job, see ${ADAPTER_DOC}`;
   if (error.code === "schema_missing" || error.code === "schema_mismatch")
-    return `the OpenSearch index ${index} on ${host} failed its schema check (${error.code}${detail ? `: ${detail}` : ""}): see ${ADAPTER_DOC} or contact support with this line`;
-  return `${os} failed (${error.code}${detail ? `: ${detail}` : ""})`;
+    return `the OpenSearch index ${index} on ${host} failed its schema check (${error.code}${shown ? `: ${shown}` : ""}): see ${ADAPTER_DOC} or contact support with this line`;
+  return `${os} failed (${error.code}${shown ? `: ${shown}` : ""})`;
 }
 
 /**
