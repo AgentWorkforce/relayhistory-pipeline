@@ -11,7 +11,7 @@
  * the backfill's known keys; every other key's count is summed under `other`.
  */
 import { AUTHORITY_REFUSALS } from "./authority-evidence.ts";
-import { ERASURE_SOURCES, ERASURE_WINDOW_REASONS, validErasureWindowProof } from "./erasure-window.ts";
+import { ERASURE_SOURCES, ERASURE_WINDOW_REASONS, orgHash, validErasureWindowProof } from "./erasure-window.ts";
 const ERASURE_SOURCE_NAMES = Object.keys(ERASURE_SOURCES);
 
 type S =
@@ -172,12 +172,17 @@ export function conforms(v: unknown, s: S, depth = 0): boolean {
 }
 
 /**
- * A bridge receipt's semantics beyond its shape: every per-org proof valid in itself (validErasureWindowProof: an
- * all-source empty counted 0 history rows, empty iff reason ok, ...), org_count equal to their number, and all_empty
- * exactly "every proof empty". A contradictory receipt is never persisted or logged.
+ * A bridge receipt's semantics beyond its shape: its proofs are for exactly the requested orgs (`ctx.orgs`, the run's
+ * scope), each once; every per-org proof valid in itself (validErasureWindowProof: an all-source empty counted 0 history
+ * rows, empty iff reason ok, an empty one was read); org_count equal to their number; and all_empty exactly "every
+ * proof empty". A contradictory receipt is never persisted or logged.
  */
-function bridgeConsistent(s: unknown): boolean {
+function bridgeConsistent(s: unknown, orgs: readonly string[] | null | undefined): boolean {
   const r = s as { org_count: number; all_empty: boolean; per_org: unknown[] };
+  // The proofs are for exactly the requested orgs, each once: a duplicate proof never stands in for another org.
+  if (!orgs || orgs.length === 0) return false;
+  const want = orgs.map(orgHash).sort(), got = r.per_org.map((p) => (p as { org_hash?: unknown }).org_hash).sort();
+  if (new Set(want).size !== want.length || got.length !== want.length || !got.every((h, i) => h === want[i])) return false;
   return r.per_org.every((p) => validErasureWindowProof(p)) && r.org_count === r.per_org.length
     && r.all_empty === (r.per_org.length > 0 && r.per_org.every((p) => (p as { status: string }).status === "erasure_window_empty"));
 }
@@ -203,7 +208,7 @@ function closedFailedCodes(v: unknown): unknown {
  * schema; a refusal with its code mapped through the kind's closed map; otherwise {"refused": "backlog_ops_receipt_schema"}.
  * The second value says whether the summary was the tool's own success (false: the run must not exit 0).
  */
-export function authorityReceiptSummary(kind: AuthorityReceiptKind, summary: unknown): { summary: unknown; ok: boolean } {
+export function authorityReceiptSummary(kind: AuthorityReceiptKind, summary: unknown, ctx: { orgs?: readonly string[] | null } = {}): { summary: unknown; ok: boolean } {
   if (isObj(summary) && Object.keys(summary).length === 1 && Object.hasOwn(summary, "refused")) {
     const r = REFUSED[kind];
     const c = summary.refused;
@@ -215,6 +220,6 @@ export function authorityReceiptSummary(kind: AuthorityReceiptKind, summary: unk
     const sec = (k: string) => (isObj(s) && isObj((s as Record<string, unknown>)[k]) ? { ...(s as Record<string, any>)[k], [FAILED_CODES]: closedFailedCodes((s as Record<string, any>)[k][FAILED_CODES]) } : (s as Record<string, unknown>)[k]);
     s = { ...s, ownership: sec("ownership"), revisions: sec("revisions") };
   }
-  if (!conforms(s, SUCCESS[kind]) || (kind === "bridge" && !bridgeConsistent(s))) return { summary: { refused: "backlog_ops_receipt_schema" }, ok: false };
+  if (!conforms(s, SUCCESS[kind]) || (kind === "bridge" && !bridgeConsistent(s, ctx.orgs))) return { summary: { refused: "backlog_ops_receipt_schema" }, ok: false };
   return { summary: s, ok: true };
 }

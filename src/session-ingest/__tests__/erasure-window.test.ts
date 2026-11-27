@@ -125,7 +125,7 @@ test("the bound history cutoff is compared in SQL at microsecond precision (real
     let rows: readonly Record<string, unknown>[] = [];
     try { rows = (await d.query<Record<string, unknown>>(ERASURE_WINDOW_SQL, [ORG3, String(cut)])).rows; } catch { rows = []; }
     const p = erasureWindowProof(ORG3, null, cut, rows);
-    expect(authorityReceiptSummary("bridge", JSON.parse(JSON.stringify({ mode: "dry_run", tool: "bridge_window", org_count: 1, all_empty: p.status === "erasure_window_empty", per_org: [p] }))).ok).toBe(true);
+    expect(authorityReceiptSummary("bridge", JSON.parse(JSON.stringify({ mode: "dry_run", tool: "bridge_window", org_count: 1, all_empty: p.status === "erasure_window_empty", per_org: [p] })), { orgs: [ORG3] }).ok).toBe(true);
     return [p.status, p.reason];
   };
   const hold = sealedHold({ sealed_at: "2026-11-27T11:00:00Z" });
@@ -256,13 +256,13 @@ test("bridge-dry's receipt: the tool's own read, an exact schema; a caller canno
   expect(calls).toEqual([[true, [ORG, String(CUT)]], [true, [ORG2, String(CUT)]]]);
   expect(s.all_empty).toBe(false);
   expect(s.per_org.map((p) => p.status)).toEqual(["erasure_window_empty", "erasure_window_nonempty"]);
-  const r = authorityReceiptSummary("bridge", JSON.parse(JSON.stringify(s)));
+  const r = authorityReceiptSummary("bridge", JSON.parse(JSON.stringify(s)), { orgs: [ORG, ORG2] });
   expect(r.ok).toBe(true);
   expect(JSON.stringify(r.summary)).not.toContain(ORG);
   // An off-schema field, or a forged proof shape, refuses the receipt.
   const forged = JSON.parse(JSON.stringify(s));
   forged.per_org[1].status = "erasure_window_empty_please";
-  expect(authorityReceiptSummary("bridge", forged).summary).toEqual({ refused: "backlog_ops_receipt_schema" });
+  expect(authorityReceiptSummary("bridge", forged, { orgs: [ORG, ORG2] }).summary).toEqual({ refused: "backlog_ops_receipt_schema" });
   // A read that fails is unproven for that org, never empty.
   const failed = await bridgeWindow([ORG], CUT, async () => { throw new Error("boom"); });
   expect([failed.all_empty, failed.per_org[0]!.status]).toEqual([false, "erasure_window_unproven"]);
@@ -322,10 +322,22 @@ test("contradictory bridge evidence is refused at validation and at persistence 
   const summary = (per: unknown[], over: Record<string, unknown> = {}) => ({ mode: "dry_run", tool: "bridge_window", org_count: per.length,
     all_empty: per.every((p) => (p as { status: string }).status === "erasure_window_empty"), per_org: per, ...over });
   const empty = erasureWindowProof(ORG2, null, CUT, [row()]);
-  expect(authorityReceiptSummary("bridge", JSON.parse(JSON.stringify(summary([empty])))).ok).toBe(true);
+  expect(authorityReceiptSummary("bridge", JSON.parse(JSON.stringify(summary([empty]))), { orgs: [ORG2] }).ok).toBe(true);
   for (const bad of [summary([relabelled], { all_empty: true }), summary([empty, positive], { all_empty: true }), summary([empty], { org_count: 2 }),
     summary([], { all_empty: true })])
-    expect(authorityReceiptSummary("bridge", JSON.parse(JSON.stringify(bad))).summary).toEqual({ refused: "backlog_ops_receipt_schema" });
+    expect(authorityReceiptSummary("bridge", JSON.parse(JSON.stringify(bad)), { orgs: [ORG, ORG2] }).summary).toEqual({ refused: "backlog_ops_receipt_schema" });
+  // The proofs must be for exactly the requested orgs, each once: a duplicate never substitutes for another org.
+  const a = erasureWindowProof(ORG, null, CUT, [row()]), b = erasureWindowProof(ORG2, null, CUT, [row()]);
+  expect(authorityReceiptSummary("bridge", JSON.parse(JSON.stringify(summary([a, b]))), { orgs: [ORG, ORG2] }).ok).toBe(true);
+  for (const [per, orgs] of [[[a, a], [ORG, ORG2]], [[a], [ORG, ORG2]], [[a, b], [ORG]], [[a, b], [ORG, ORG]], [[a, b], []]] as const)
+    expect(authorityReceiptSummary("bridge", JSON.parse(JSON.stringify(summary([...per]))), { orgs: [...orgs] }).summary).toEqual({ refused: "backlog_ops_receipt_schema" });
+  expect(authorityReceiptSummary("bridge", JSON.parse(JSON.stringify(summary([a, b])))).summary).toEqual({ refused: "backlog_ops_receipt_schema" }); // no scope given
+  // An empty proof must have been read: no read time, or a cutoff after it, is invalid.
+  expect(validErasureWindowProof({ ...a, read_at_ms: null })).toBe(false);
+  expect(validErasureWindowProof({ ...a, read_at_ms: 0 })).toBe(false);
+  expect(validErasureWindowProof({ ...a, cutoff_ms: (a.read_at_ms as number) + 1 })).toBe(false);
+  expect(authorityReceiptSummary("bridge", JSON.parse(JSON.stringify(summary([{ ...a, read_at_ms: null }, b]))), { orgs: [ORG, ORG2] }).summary)
+    .toEqual({ refused: "backlog_ops_receipt_schema" });
   // A legacy two-table snapshot may carry a nonzero historical total and still be empty.
   const legacy = erasureWindowProof(ORG, null, CUT, [row({ status: status(sealedHold(), 5) })]);
   expect([legacy.status, legacy.watermark_kind, legacy.watermark_erasures, validErasureWindowProof(legacy)]).toEqual(["erasure_window_empty", "surviving_two_tables", 5, true]);
@@ -349,8 +361,38 @@ test("contradictory bridge evidence is refused at validation and at persistence 
     const lines: string[] = [];
     const log = console.log;
     console.log = (...a: unknown[]) => { lines.push(a.join(" ")); };
+    const runForged = async (forged: unknown, runId: string) => {
+      lines.length = 0;
+      let code: number;
+      const tempOut = join(temp, "backlog-ops-out");
+      rmSync(tempOut, { recursive: true, force: true });
+      console.log = (...a: unknown[]) => { lines.push(a.join(" ")); };
+      try {
+        code = await backlogOpsRun({ ...target, ...SCOPE, ...env("bridge-dry"), GITHUB_SHA: sha, GITHUB_RUN_ID: runId, RUNNER_TEMP: temp,
+          BACKLOG_OPS_REVISIONS_SINCE_MS: String(CUT), ACTIONS_ID_TOKEN_REQUEST_URL: "https://token.example/x", ACTIONS_ID_TOKEN_REQUEST_TOKEN: "bearer",
+          SUPABASE_MIGRATION_OWNER_URL: `postgresql://${P.owner}.${P.project}:p%40ss@${P.host}:${P.port}/${P.database}?sslmode=verify-full` },
+          { fetcher, runChild: async () => ({ code: 0, stdout: JSON.stringify(forged) }) });
+      } finally { console.log = log; }
+      const lg = JSON.parse(lines.find((l) => l.startsWith("backlog_ops_receipt "))!.slice("backlog_ops_receipt ".length));
+      const sv = JSON.parse(readFileSync(join(tempOut, "backlog-ops-receipt.json"), "utf8"));
+      return { code, lg, sv };
+    };
+    // The reviewer's two: a duplicate proof standing in for the second org, and an empty proof with no read time.
+    const e1 = erasureWindowProof(ORG, null, CUT, [row()]), e2 = erasureWindowProof(ORG2, null, CUT, [row()]);
+    for (const [i, forgedOne] of [summary([e1, e1]), summary([{ ...e1, read_at_ms: null }, e2])].entries()) {
+      const r1 = await runForged(forgedOne, String(910 + i));
+      expect(r1.code).toBe(1);
+      expect(r1.lg.summary).toEqual({ refused: "backlog_ops_receipt_schema" });
+      expect(r1.sv).toEqual(r1.lg);
+    }
+    // And the legitimate pair is accepted in both sinks.
+    const ok = await runForged(summary([e1, e2]), "920");
+    expect([ok.code, ok.lg.summary.all_empty, ok.sv.summary.per_org.length]).toEqual([0, true, 2]);
+    rmSync(join(temp, "backlog-ops-out"), { recursive: true, force: true });
+    lines.length = 0;
     let exit: number;
     const forged = summary([relabelled, empty], { all_empty: true });
+    console.log = (...a: unknown[]) => { lines.push(a.join(" ")); };
     try {
       exit = await backlogOpsRun({ ...target, ...SCOPE, ...env("bridge-dry"), GITHUB_SHA: sha, GITHUB_RUN_ID: "901", RUNNER_TEMP: temp,
         BACKLOG_OPS_REVISIONS_SINCE_MS: String(CUT), ACTIONS_ID_TOKEN_REQUEST_URL: "https://token.example/x", ACTIONS_ID_TOKEN_REQUEST_TOKEN: "bearer",

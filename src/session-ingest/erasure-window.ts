@@ -188,6 +188,8 @@ export function validErasureWindowProof(v: unknown): v is ErasureWindowProof {
     // Empty against the all-source history means the history counted 0 (a legacy two-table snapshot may carry a
     // nonzero historical total); a non-empty status never claims "ok".
     && (p.status !== "erasure_window_empty" || p.watermark_kind !== "erasure_history_all_sources" || p.watermark_erasures === 0)
+    // An empty proof was read: a real read time (positive) and a cutoff no later than it.
+    && (p.status !== "erasure_window_empty" || (typeof p.read_at_ms === "number" && p.read_at_ms > 0 && (p.cutoff_ms as number) <= p.read_at_ms))
     && (p.status === "erasure_window_empty") === (p.reason === "ok")
     && (p.status !== "erasure_window_empty" || (p.reason === "ok" && p.epoch_hash !== null && src !== null && Object.values(src).every((n) => n === 0) && p.watermark_erasures !== null
       && (p.hold_state === "sealed" || p.hold_state === "marker_attempted")));

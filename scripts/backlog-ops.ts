@@ -311,7 +311,7 @@ export async function backlogOpsRun(
     // An authority or backfill receipt conforms exactly to its mode's schema (keys, lists, hash positions, closed codes),
     // and a refusal keeps only a code from the mode's closed map, before the receipt is persisted or logged.
     if (schemaKind !== null) {
-      const r = authorityReceiptSummary(schemaKind, receipt.summary);
+      const r = authorityReceiptSummary(schemaKind, receipt.summary, { orgs: scope.orgs });
       receipt = { ...receipt, summary: r.summary, exitCode: r.ok ? receipt.exitCode : receipt.exitCode || 1 };
     }
   } catch (e) {
