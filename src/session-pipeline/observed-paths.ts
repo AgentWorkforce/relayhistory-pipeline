@@ -58,8 +58,14 @@ function statusPath(line: string): string | typeof SKIP | null {
   // taken on the word of a source this parser cannot read.
   return m[3]!.startsWith('"') || m[2]?.startsWith('"') ? SKIP : m[3]!;
 }
-/** `## branch...upstream` header of `git status -sb`. */
-const BRANCH_LINE = /^## \S/;
+/**
+ * The `## …` header of `git status -sb`, in the forms git prints: `## <branch>[...<upstream>][ [ahead N][, ][behind M] |
+ * [gone]]`, `## No commits yet on <branch>`, `## Initial commit on <branch>`, or `## HEAD (no branch)`. Branch names
+ * are read as common ref characters only (REF); any other header refuses the listing.
+ */
+/** A ref name: parts of `[A-Za-z0-9_@+-]` joined by single `.` or `/` (git refs cannot hold `..` or end in `.`). */
+const REF = "[A-Za-z0-9_@+-]+(?:[./][A-Za-z0-9_@+-]+)*";
+const BRANCH_LINE = new RegExp(`^## (?:HEAD \\(no branch\\)|(?:No commits yet on |Initial commit on )?${REF}(?:\\.\\.\\.${REF})?(?: \\[(?:ahead \\d+(?:, behind \\d+)?|behind \\d+|gone)\\])?)$`);
 function valid(path: string): boolean {
   return path.length > 0 && path.length <= MAX_OBSERVED_PATH_CHARS && path.trim() === path && !path.startsWith("-")
     && !/[\u0000-\u001f\u007f]/.test(path) && !path.includes("...");
@@ -78,6 +84,8 @@ export function observedPaths(content: string | null | undefined): string[] {
   const lines = content.replace(/\r\n/g, "\n").split("\n").filter((l) => l !== "");
   if (!lines.length) return [];
   // git status --short (optionally -b): every line is a status line or the one branch header.
+  // A first line starting "## " must be a header git prints; any other is not a listing.
+  if (lines[0]!.startsWith("## ") && !BRANCH_LINE.test(lines[0]!)) return [];
   const status = lines.filter((l, i) => !(i === 0 && BRANCH_LINE.test(l)));
   const named = status.map(statusPath);
   if (status.length && named.every((p) => p !== null)) return cap(named.filter((p): p is string => p !== SKIP));

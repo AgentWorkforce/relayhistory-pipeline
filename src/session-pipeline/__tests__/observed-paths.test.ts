@@ -5,6 +5,10 @@ describe("observedPaths", () => {
   test("reads a git status --short listing, renames as their new path, with or without a branch header", () => {
     expect(observedPaths(" M src/a.ts\nA  src/b.ts\n?? notes/c.md\nR  old/x.ts -> new/x.ts\n D gone.ts\n")).toEqual(["src/a.ts", "src/b.ts", "notes/c.md", "new/x.ts", "gone.ts"]);
     expect(observedPaths("## main...origin/main [ahead 1]\n M src/a.ts")).toEqual(["src/a.ts"]);
+    for (const h of ["## main", "## feat/x-1...origin/feat/x-1 [ahead 2, behind 3]", "## main...origin/main [behind 1]", "## main...origin/main [gone]",
+      "## HEAD (no branch)", "## No commits yet on main", "## Initial commit on main"]) expect(observedPaths(`${h}\n?? sibling.ts`)).toEqual(["sibling.ts"]);
+    // A header git cannot print refuses the listing.
+    for (const h of ["## main\u0000junk", "## main extra words", "## \u00e9t\u00e9", "## main [ahead x]", "## main...", "## "]) expect(observedPaths(`${h}\n?? sibling.ts`)).toEqual([]);
     expect(observedPaths("MM src/a.ts\r\nUU src/b.ts\r\n")).toEqual(["src/a.ts", "src/b.ts"]);
     expect(observedPaths("RM a.ts -> b.ts\nC  x.ts -> y.ts\n R c.ts -> d.ts\n A e.ts\nAA f.ts\n!! g.log")).toEqual(["b.ts", "y.ts", "d.ts", "e.ts", "f.ts", "g.log"]);
   });
