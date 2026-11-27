@@ -65,7 +65,8 @@ export type ErasureWindowReason = "ok" | "erasures_in_window" | "hold_missing" |
 
 export interface ErasureWindowProof {
   v: 1; kind: "erasure_window_proof"; status: ErasureWindowStatus; reason: ErasureWindowReason;
-  org_hash: string; epoch: string; cutoff_ms: number; read_at_ms: number | null; watermark_erasures: number | null;
+  /** The hold epoch the read bound, as a typed hash (never the raw UUID: receipts carry codes and hashes only), or null. */
+  org_hash: string; epoch_hash: string | null; cutoff_ms: number; read_at_ms: number | null; watermark_erasures: number | null;
   hold_state: "held" | "sealed" | "marker_attempted" | null; sources: Record<ErasureSource, number> | null;
 }
 
@@ -79,6 +80,7 @@ const tsMs = (v: unknown): number | null => {
   const t = typeof v === "string" ? Date.parse(v) : NaN;
   return Number.isFinite(t) && t > 0 ? t : NaN;
 };
+export const epochHash = (epoch: string) => "h_" + createHash("sha256").update(`hold-bridge/v1\nepoch\n${epoch}`).digest("hex").slice(0, 32);
 export const orgHash = (org: string) => "h_" + createHash("sha256").update(`authority-evidence/v1\norg\n${org}`).digest("hex").slice(0, 32);
 
 /**
@@ -86,10 +88,9 @@ export const orgHash = (org: string) => "h_" + createHash("sha256").update(`auth
  * well formed, the hold is live at `epoch` in `sealed` or `marker_attempted`, and the read happened after the seal.
  */
 /** `epoch` null: bind the live hold's own epoch as read (a dry read takes no epoch input); else it must match. */
-export const NO_EPOCH = "00000000-0000-0000-0000-000000000000";
 export function erasureWindowProof(org: string, epoch: string | null, cutoffMs: number, rows: readonly Record<string, unknown>[]): ErasureWindowProof {
   if (!UUID.test(org) || (epoch !== null && !UUID.test(epoch)) || !Number.isSafeInteger(cutoffMs) || cutoffMs < 1) throw Object.assign(new Error("erasure_window_input"), { code: "erasure_window_input" });
-  const base: ErasureWindowProof = { v: 1, kind: "erasure_window_proof", status: "erasure_window_unproven", reason: "read_invalid", org_hash: orgHash(org), epoch: epoch ?? NO_EPOCH,
+  const base: ErasureWindowProof = { v: 1, kind: "erasure_window_proof", status: "erasure_window_unproven", reason: "read_invalid", org_hash: orgHash(org), epoch_hash: epoch === null ? null : epochHash(epoch),
     cutoff_ms: cutoffMs, read_at_ms: null, watermark_erasures: null, hold_state: null, sources: null };
   if (rows.length !== 1) return base;
   const r = rows[0]!;
@@ -110,7 +111,7 @@ export function erasureWindowProof(org: string, epoch: string | null, cutoffMs: 
   if (h === undefined) return out;
   if (h === null || h.state === "released") return { ...out, reason: "hold_missing" };
   if (typeof h.epoch !== "string" || !UUID.test(h.epoch) || (epoch !== null && h.epoch !== epoch)) return { ...out, reason: "hold_epoch_mismatch" };
-  out.epoch = h.epoch;
+  out.epoch_hash = epochHash(h.epoch);
   if (h.state !== "sealed" && h.state !== "marker_attempted") return { ...out, hold_state: h.state === "held" ? "held" : null, reason: "hold_not_sealed" };
   const sealedMs = tsMs(h.sealed_at);
   const state = h.state as "sealed" | "marker_attempted";
@@ -124,33 +125,46 @@ export function erasureWindowProof(org: string, epoch: string | null, cutoffMs: 
 export function validErasureWindowProof(v: unknown): v is ErasureWindowProof {
   if (!v || typeof v !== "object" || Array.isArray(v)) return false;
   const p = v as Record<string, unknown>;
-  const keys = ["v", "kind", "status", "reason", "org_hash", "epoch", "cutoff_ms", "read_at_ms", "watermark_erasures", "hold_state", "sources"];
+  const keys = ["v", "kind", "status", "reason", "org_hash", "epoch_hash", "cutoff_ms", "read_at_ms", "watermark_erasures", "hold_state", "sources"];
   if (Object.keys(p).length !== keys.length || !keys.every((k) => Object.hasOwn(p, k))) return false;
   const src = p.sources as Record<string, unknown> | null;
   const srcOk = src === null || (typeof src === "object" && Object.keys(src).length === Object.keys(ERASURE_SOURCES).length
     && Object.keys(ERASURE_SOURCES).every((k) => count(src[k]) !== null));
   return p.v === 1 && p.kind === "erasure_window_proof" && ["erasure_window_empty", "erasure_window_nonempty", "erasure_window_unproven"].includes(p.status as string)
     && ["ok", "erasures_in_window", "hold_missing", "hold_epoch_mismatch", "hold_not_sealed", "read_invalid", "read_before_seal"].includes(p.reason as string)
-    && typeof p.org_hash === "string" && /^h_[0-9a-f]{32}$/u.test(p.org_hash) && typeof p.epoch === "string" && UUID.test(p.epoch)
+    && typeof p.org_hash === "string" && /^h_[0-9a-f]{32}$/u.test(p.org_hash) && (p.epoch_hash === null || (typeof p.epoch_hash === "string" && /^h_[0-9a-f]{32}$/u.test(p.epoch_hash)))
     && count(p.cutoff_ms) !== null && (p.read_at_ms === null || count(p.read_at_ms) !== null)
     && (p.watermark_erasures === null || count(p.watermark_erasures) !== null)
     && (p.hold_state === null || ["held", "sealed", "marker_attempted"].includes(p.hold_state as string)) && srcOk
-    && (p.status !== "erasure_window_empty" || (p.reason === "ok" && src !== null && Object.values(src).every((n) => n === 0) && p.watermark_erasures !== null
+    && (p.status !== "erasure_window_empty" || (p.reason === "ok" && p.epoch_hash !== null && src !== null && Object.values(src).every((n) => n === 0) && p.watermark_erasures !== null
       && (p.hold_state === "sealed" || p.hold_state === "marker_attempted")));
 }
 
 /** A proof older than this at the release is stale: re-read it immediately before the release. */
 export const ERASURE_PROOF_MAX_AGE_MS = 5 * 60 * 1000;
 /**
- * May bridge_complete release on this proof alone (no manifest)? Only an `erasure_window_empty` proof for this org and
- * epoch, cutoff no later than the FULL cutoff, fresh (read at most ERASURE_PROOF_MAX_AGE_MS before `nowMs`), with the
- * hold now marker_attempted at the same epoch. Returns the watermark to pass to _release, or a refusal code.
+ * What the release-side check (062320 _release, recomputed under the exclusive org key) actually covers. A count of
+ * surviving rows cannot prove that no event happened (a row deleted again, e.g. ingest_apply_selection removing an
+ * upload_deletions row on re-enable, leaves the count unchanged), so a release on an empty window needs a DURABLE,
+ * insert-only erasure history over every source, counted under the key. Today's 062320 counts two tables of surviving
+ * rows: "surviving_two_tables", which never permits a release. The history is pending in the 062320 owner's lane.
  */
-export function releaseOnEmptyWindow(proof: unknown, org: string, epoch: string, fullCutoffMs: number, hold: { epoch: string; state: string } | null, nowMs: number):
-  { ok: true; erasures: number } | { ok: false; code: "proof_invalid" | "proof_not_empty" | "proof_scope_mismatch" | "proof_stale" | "hold_not_attempted" } {
-  if (!validErasureWindowProof(proof) || proof.epoch === NO_EPOCH) return { ok: false, code: "proof_invalid" };
+export type ReleaseWatermark = "surviving_two_tables" | "erasure_history_all_sources";
+export const CURRENT_RELEASE_WATERMARK: ReleaseWatermark = "surviving_two_tables";
+
+/**
+ * May bridge_complete release on this proof alone (no manifest)? Only with a release-side watermark over a durable
+ * erasure history of every source, and an `erasure_window_empty` proof for this org and epoch, cutoff no later than the
+ * FULL cutoff, fresh (read at most ERASURE_PROOF_MAX_AGE_MS before `nowMs`), with the hold now marker_attempted at the
+ * same epoch. Returns the watermark to pass to _release, or a refusal code. Today always release_watermark_partial.
+ */
+export function releaseOnEmptyWindow(proof: unknown, org: string, epoch: string, fullCutoffMs: number, hold: { epoch: string; state: string } | null, nowMs: number,
+  watermark: ReleaseWatermark = CURRENT_RELEASE_WATERMARK):
+  { ok: true; erasures: number } | { ok: false; code: "release_watermark_partial" | "proof_invalid" | "proof_not_empty" | "proof_scope_mismatch" | "proof_stale" | "hold_not_attempted" } {
+  if (watermark !== "erasure_history_all_sources") return { ok: false, code: "release_watermark_partial" };
+  if (!validErasureWindowProof(proof) || proof.epoch_hash === null) return { ok: false, code: "proof_invalid" };
   if (proof.status !== "erasure_window_empty") return { ok: false, code: "proof_not_empty" };
-  if (proof.org_hash !== orgHash(org) || proof.epoch !== epoch || proof.cutoff_ms > fullCutoffMs) return { ok: false, code: "proof_scope_mismatch" };
+  if (proof.org_hash !== orgHash(org) || proof.epoch_hash !== epochHash(epoch) || proof.cutoff_ms > fullCutoffMs) return { ok: false, code: "proof_scope_mismatch" };
   const age = nowMs - proof.read_at_ms!;
   if (!(age >= 0 && age <= ERASURE_PROOF_MAX_AGE_MS)) return { ok: false, code: "proof_stale" };
   if (!hold || hold.epoch !== epoch || hold.state !== "marker_attempted") return { ok: false, code: "hold_not_attempted" };

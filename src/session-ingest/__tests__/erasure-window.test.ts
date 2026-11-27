@@ -12,14 +12,19 @@ import { PGlite } from "@electric-sql/pglite";
 import { btree_gin } from "@electric-sql/pglite/contrib/btree_gin";
 import { pg_trgm } from "@electric-sql/pglite/contrib/pg_trgm";
 import { bridgeWindow } from "../../../scripts/backlog-authority.ts";
+import { backlogOpsRun } from "../../../scripts/backlog-ops.ts";
+import { SCHEMA_RELEASE as P } from "../../hoopdb/schema-release-contract.ts";
+import { BACKLOG_OPS_RECEIPT_CONTRACT, backlogOpsHomeId } from "../backlog-ops.ts";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { authorityReceiptSummary } from "../backlog-authority-schema.ts";
 import {
   BACKLOG_OPS_BRIDGE_EXECUTE_ENABLED, backlogOpsBindings, backlogOpsConfirmation, backlogOpsDispatch, backlogOpsRevisionsSince, backlogOpsScope, backlogOpsTarget,
   backlogOpsToolArgs, type BacklogOpsMode,
 } from "../backlog-ops.ts";
 import {
-  ERASURE_PROOF_MAX_AGE_MS, ERASURE_SOURCES, ERASURE_SOURCE_EXCLUSIONS, ERASURE_TABLE_NAME, ERASURE_WINDOW_SQL, NO_EPOCH, erasureWindowProof, orgHash,
-  releaseOnEmptyWindow, validErasureWindowProof,
+  CURRENT_RELEASE_WATERMARK, ERASURE_PROOF_MAX_AGE_MS, ERASURE_SOURCES, ERASURE_SOURCE_EXCLUSIONS, ERASURE_TABLE_NAME, ERASURE_WINDOW_SQL, epochHash,
+  erasureWindowProof, orgHash, releaseOnEmptyWindow, validErasureWindowProof,
 } from "../erasure-window.ts";
 import { applySupabaseSchema } from "./pglite-schema.ts";
 
@@ -81,7 +86,8 @@ test("the read: one statement over every source plus the status; an org with not
   expect(rows.length).toBe(1);
   for (const t of Object.keys(ERASURE_SOURCES)) expect(Number(rows[0]![t])).toBe(0);
   const p = erasureWindowProof(ORG, null, CUT, rows);
-  expect([p.status, p.reason, p.epoch, p.hold_state, p.watermark_erasures]).toEqual(["erasure_window_empty", "ok", E, "sealed", 0]);
+  expect([p.status, p.reason, p.epoch_hash, p.hold_state, p.watermark_erasures]).toEqual(["erasure_window_empty", "ok", epochHash(E), "sealed", 0]);
+  expect(JSON.stringify(p)).not.toContain(E); // the epoch is a typed hash, never the raw UUID
   expect(validErasureWindowProof(p)).toBe(true);
   expect(JSON.stringify(p)).not.toContain(ORG);
 });
@@ -128,18 +134,25 @@ test("the proof is empty only with every count 0, a live sealed or attempted hol
   // A marker_attempted hold also proves (the release happens from there).
   expect(erasureWindowProof(ORG, null, CUT, [row({ status: status(sealedHold({ state: "marker_attempted", marker_attempted_at: new Date(SEALED + 1).toISOString() })) })]).status)
     .toBe("erasure_window_empty");
-  // An unknown hold / a NO_EPOCH placeholder never validates as empty.
+  // An unbound epoch (an unreadable hold) never validates as empty.
   const unproven = erasureWindowProof(ORG, null, CUT, []);
-  expect(unproven.epoch).toBe(NO_EPOCH);
+  expect(unproven.epoch_hash).toBeNull();
   expect(validErasureWindowProof({ ...unproven, status: "erasure_window_empty", reason: "ok" })).toBe(false);
 });
 
-test("release on an empty window: exact org, epoch and cutoff; fresh; the hold attempted; otherwise HELD", () => {
+test("release on an empty window: never on today's surviving-row watermark; only with a durable all-source history", () => {
   const empty = erasureWindowProof(ORG, null, CUT, [row()]);
   const attempted = { epoch: E, state: "marker_attempted" };
-  expect(releaseOnEmptyWindow(empty, ORG, E, CUT, attempted, NOW + 1000)).toEqual({ ok: true, erasures: 3 });
+  // Today's 062320 counts surviving rows of two tables: never a release (a deleted-again row escapes it).
+  expect(CURRENT_RELEASE_WATERMARK).toBe("surviving_two_tables");
+  expect(releaseOnEmptyWindow(empty, ORG, E, CUT, attempted, NOW + 1000)).toEqual({ ok: false, code: "release_watermark_partial" });
+  // The reviewer's race: an empty proof, then upload_deletions 0 -> 1 a millisecond later. Refused today at any freshness.
+  expect(releaseOnEmptyWindow(empty, ORG, E, CUT, attempted, NOW + 1)).toEqual({ ok: false, code: "release_watermark_partial" });
+  // With the history watermark (pending in the 062320 owner's lane), the remaining binding checks apply.
+  expect(releaseOnEmptyWindow(empty, ORG, E, CUT, attempted, NOW + 1000, "erasure_history_all_sources")).toEqual({ ok: true, erasures: 3 });
   const code = (p: unknown, over: { org?: string; epoch?: string; cut?: number; hold?: { epoch: string; state: string } | null; now?: number } = {}) => {
-    const r = releaseOnEmptyWindow(p, over.org ?? ORG, over.epoch ?? E, over.cut ?? CUT, over.hold === undefined ? attempted : over.hold, over.now ?? NOW + 1000);
+    const r = releaseOnEmptyWindow(p, over.org ?? ORG, over.epoch ?? E, over.cut ?? CUT, over.hold === undefined ? attempted : over.hold, over.now ?? NOW + 1000,
+      "erasure_history_all_sources");
     return r.ok ? "ok" : r.code;
   };
   expect(code(erasureWindowProof(ORG, null, CUT, [row({ upload_deletions: "2" })]))).toBe("proof_not_empty");
@@ -205,4 +218,46 @@ test("bridge-dry's receipt: the tool's own read, an exact schema; a caller canno
   const failed = await bridgeWindow([ORG], CUT, async () => { throw new Error("boom"); });
   expect([failed.all_empty, failed.per_org[0]!.status]).toEqual([false, "erasure_window_unproven"]);
   expect(orgHash(ORG)).toBe(s.per_org[0]!.org_hash);
+});
+
+test("bridge-dry through the normal runner (scripts/backlog-ops.ts): the logged line and the persisted file carry the proof; full_run recorded", async () => {
+  const temp = mkdtempSync(join(tmpdir(), "bo-bridge-"));
+  try {
+    const home = backlogOpsHomeId({ bucket: target.BACKLOG_OPS_BUCKET, region: target.BACKLOG_OPS_REGION }, null);
+    const scopeId = backlogOpsScope(SCOPE).id;
+    const fullSummary = { mode: "execute", users: 0, fences: Object.fromEntries(["deletion_rows", "reset_rows", "created", "updated", "unchanged", "would_create", "would_update",
+      "pairs_added", "resets_added", "deletions_superseded", "deletions_unproven", "cold_resets", "needs_review", "unreadable", "contended", "tenant_invalid", "input_invalid",
+      "failed", "resets_in_flight"].map((k) => [k, 0])), ownership: { rows: 0, registered: 0, would_register: 0, unchanged: 0, skipped_deleted: 0, skipped_no_fence: 0, invalid: 0,
+      failed: 0, failed_codes: {} }, revisions: { rows: 0, seed_rows: 0, slot_rows: 0, slots_empty: 0, merged: 0, would_merge: 0, skipped_deleted: 0, skipped_no_fence: 0,
+      invalid: 0, shards: 0, failed: 0, failed_codes: {} }, sections: { fences: "complete", ownership: "complete", revisions: "complete" },
+      fingerprint: Object.fromEntries(["revisions_count", "revisions_max_updated_ms", "revisions_hash", "ownership_count", "ownership_hash", "slots_owned_count",
+        "slots_revision_sum", "slots_hash"].map((k) => [k, 0])) };
+    mkdirSync(join(temp, "backlog-ops-bound", "full"), { recursive: true });
+    writeFileSync(join(temp, "backlog-ops-bound", "full", "backlog-ops-receipt.json"),
+      JSON.stringify({ contract: BACKLOG_OPS_RECEIPT_CONTRACT, mode: "backfill-execute", sha, run: FULL, scope: scopeId, ledger: "none", home, exitCode: 0, summary: fullSummary }));
+    const s = await bridgeWindow([ORG, ORG2], CUT, async () => [row()]);
+    const xml = `<AssumeRoleWithWebIdentityResponse><Credentials><AccessKeyId>ASIAAAAAAAAAAAAAAAAA</AccessKeyId><SecretAccessKey>s</SecretAccessKey>
+      <SessionToken>t</SessionToken><Expiration>${new Date(Date.now() + 6 * 3600_000).toISOString()}</Expiration></Credentials></AssumeRoleWithWebIdentityResponse>`;
+    const fetcher = (async (url: string) => url.startsWith("https://token.example/") ? new Response(JSON.stringify({ value: "a.b.c" })) : new Response(xml)) as unknown as typeof fetch;
+    const lines: string[] = [];
+    const log = console.log;
+    console.log = (...a: unknown[]) => { lines.push(a.join(" ")); };
+    let exit: number;
+    try {
+      exit = await backlogOpsRun({ ...target, ...SCOPE, ...env("bridge-dry"), GITHUB_SHA: sha, GITHUB_RUN_ID: "900", RUNNER_TEMP: temp,
+        BACKLOG_OPS_REVISIONS_SINCE_MS: String(CUT), ACTIONS_ID_TOKEN_REQUEST_URL: "https://token.example/x", ACTIONS_ID_TOKEN_REQUEST_TOKEN: "bearer",
+        SUPABASE_MIGRATION_OWNER_URL: `postgresql://${P.owner}.${P.project}:p%40ss@${P.host}:${P.port}/${P.database}?sslmode=verify-full` },
+        { fetcher, runChild: async (child) => { expect(child.args.slice(1, 4)).toEqual(["bridge-window", "--cutoff-ms", String(CUT)]); return { code: 0, stdout: JSON.stringify(s) }; } });
+    } finally { console.log = log; }
+    const logged = JSON.parse(lines.find((l) => l.startsWith("backlog_ops_receipt "))!.slice("backlog_ops_receipt ".length));
+    const saved = JSON.parse(readFileSync(join(temp, "backlog-ops-out", "backlog-ops-receipt.json"), "utf8"));
+    expect(exit).toBe(0);
+    expect(saved).toEqual(logged);
+    expect(logged.summary.all_empty).toBe(true);
+    expect(logged.summary.per_org.map((p: { status: string }) => p.status)).toEqual(["erasure_window_empty", "erasure_window_empty"]);
+    expect(logged.full_run).toBe(FULL);
+    expect(logged.home).toBe(home);
+    const text = JSON.stringify(logged);
+    for (const id of [ORG, ORG2, E]) expect(text).not.toContain(id);
+  } finally { rmSync(temp, { recursive: true, force: true }); }
 });

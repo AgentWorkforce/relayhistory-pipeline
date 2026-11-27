@@ -448,14 +448,19 @@ proof, and a session erase needs manifest (062330) evidence.
 
 The receipt has an exact schema (kind `bridge`) and carries org hashes only.
 
-`releaseOnEmptyWindow` binds the proof to the org, the epoch and the FULL cutoff. It requires the proof
-to be fresh (read at most 5 minutes before the release) and the hold to be `marker_attempted`, and it
-returns the watermark to pass to `_release`. An erasure in those two tables committed after the proof
-changes the count, and `_release` refuses.
+The proof binds the hold epoch as a typed hash (`epoch_hash`), never the raw UUID. The receipt also
+records `full_run`, the exact FULL its cutoff came from.
 
-The watermark covers only `operator_user_erasures` and `session_erasure_fences`. A row in any other
-source committed between the proof and the release is caught only by re-reading the proof immediately
-before the release. The controls are S3-mirrored while sealed.
+An empty proof is corroboration only, never permission to release. A count of surviving rows cannot
+prove that no event happened. A row deleted again leaves the count unchanged: `ingest_apply_selection`
+removes an `upload_deletions` row on re-enable, for example. And today's 062320 watermark counts
+surviving rows of only two tables.
+
+So `releaseOnEmptyWindow` refuses (`release_watermark_partial`) until the release-side watermark is a
+durable, insert-only erasure history over every source, counted under the exclusive org key. That
+history is pending in the 062320 owner's lane, as a follow-up slot. With it, the function binds org,
+epoch and FULL cutoff, and requires a fresh proof (read at most 5 minutes before the release) and a
+`marker_attempted` hold.
 
 `bridge-execute` is HELD in code (`BACKLOG_OPS_BRIDGE_EXECUTE_ENABLED`), and its tool refuses
 (`bridge_release_held`) until slot 062320 lands.

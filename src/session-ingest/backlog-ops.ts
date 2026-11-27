@@ -668,6 +668,8 @@ export function backlogOpsReceipt(d: BacklogOpsDispatch, run: string, exitCode: 
   return { contract: BACKLOG_OPS_RECEIPT_CONTRACT, mode: d.mode, sha: d.sha, run, scope, ledger,
     ...(noHeadParity !== BACKLOG_OPS_NO_HEAD_PARITY_NONE ? { no_head_parity: noHeadParity } : {}),
     ...(isCatchup(d.mode) && d.authorityRun ? { authority_run: d.authorityRun, full_run: d.fullBackfillRun! } : {}),
+    // A bridge mode: the exact FULL its cutoff came from (a later binding matches the run, not a derived time).
+    ...(isBridge(d.mode) ? { full_run: d.fullBackfillRun! } : {}),
     ...(d.mode === "reshard-dry" && d.backfillRun ? { after_run: d.backfillRun } : {}),
     ...(home !== null ? { home } : {}), exitCode, summary };
 }

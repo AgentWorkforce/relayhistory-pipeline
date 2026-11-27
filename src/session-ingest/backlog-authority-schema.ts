@@ -15,13 +15,13 @@ import { ERASURE_SOURCES } from "./erasure-window.ts";
 const ERASURE_SOURCE_NAMES = Object.keys(ERASURE_SOURCES);
 
 type S =
-  | "count" | "bool" | "hash" | "digest" | "uuid"
+  | "count" | "bool" | "hash" | "digest"
   | { code: ReadonlySet<string> }
   | { nullable: S }
   | { list: S; max: number }
   | { obj: Record<string, S>; optional?: readonly string[] };
 
-const COUNT = "count" as const, BOOL = "bool" as const, HASH = "hash" as const, DIGEST = "digest" as const, UUID_S = "uuid" as const;
+const COUNT = "count" as const, BOOL = "bool" as const, HASH = "hash" as const, DIGEST = "digest" as const;
 const codes = (...c: readonly string[]): S => ({ code: new Set(c) });
 const nul = (s: S): S => ({ nullable: s });
 const list = (s: S, max = 64): S => ({ list: s, max });
@@ -97,7 +97,7 @@ export const AUTHORITY_DRY_SCHEMA: S = obj({ mode: codes("dry_run"), evidence: E
 const PROOF_SCHEMA: S = obj({
   v: codes("1"), kind: codes("erasure_window_proof"), status: codes("erasure_window_empty", "erasure_window_nonempty", "erasure_window_unproven"),
   reason: codes("ok", "erasures_in_window", "hold_missing", "hold_epoch_mismatch", "hold_not_sealed", "read_invalid", "read_before_seal"),
-  org_hash: HASH, epoch: UUID_S, cutoff_ms: COUNT, read_at_ms: nul(COUNT), watermark_erasures: nul(COUNT),
+  org_hash: HASH, epoch_hash: nul(HASH), cutoff_ms: COUNT, read_at_ms: nul(COUNT), watermark_erasures: nul(COUNT),
   hold_state: nul(codes("held", "sealed", "marker_attempted")), sources: nul(obj(counts(...ERASURE_SOURCE_NAMES))),
 });
 export const BRIDGE_SCHEMA: S = obj({ mode: codes("dry_run"), tool: codes("bridge_window"), org_count: COUNT, all_empty: BOOL, per_org: list(PROOF_SCHEMA) });
@@ -161,7 +161,6 @@ export function conforms(v: unknown, s: S, depth = 0): boolean {
   if (s === BOOL) return typeof v === "boolean";
   if (s === HASH) return typeof v === "string" && HASH_RE.test(v);
   if (s === DIGEST) return typeof v === "string" && DIGEST_RE.test(v);
-  if (s === UUID_S) return typeof v === "string" && /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/u.test(v);
   if ("code" in s) return (typeof v === "string" && s.code.has(v)) || (typeof v === "number" && s.code.has(String(v)));
   if ("nullable" in s) return v === null || conforms(v, s.nullable, depth + 1);
   if ("list" in s) return Array.isArray(v) && v.length <= s.max && v.every((x) => conforms(x, s.list, depth + 1));
