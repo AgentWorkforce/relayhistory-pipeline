@@ -65,8 +65,25 @@ holds only the eraser key ("sessions-prod transcript eraser").
   until the erasure job removed the old prefix, and the indexer retried the
   new key as `pointer_move_pending` in the meantime. Only a date difference is
   pinned. A machine, workspace, harness or session change still moves the
-  session. Duplicates written before the pin (and those still queued as
-  `stale_prefix`) are not changed by it.
+  session. The pin needs exactly one prior manifest key for the stream (any
+  date, from the group's `exported` keys), and that manifest must be readable,
+  this exporter's export of this session, record the same raw Neon machine id,
+  and carry a `session_uuid`. The manifest keeps that `session_uuid`;
+  `catalog.first_activity` is Neon's own earliest time, separate from the pinned
+  `started_at`. Under the session lease the exporter reads the manifest again.
+  If it was erased or rewritten after the first read, the group fails with
+  `date_pin_changed` and writes nothing. The retry resolves the pin again.
+  A missing or invalid prior manifest is unpinned. A store read or access
+  failure fails the group.
+  If two or more prior keys match the stream (a fork made before the pin, or a
+  failed run's keys merged into the row), the stream is unpinned and goes to
+  the computed date, as before the pin. Each other copy is leased and, if it is
+  still this exporter's export of the session, held. A held copy stays in the
+  group's keys, is never queued as `stale_prefix`, and any erasure already
+  queued for its prefix is cancelled. Both copies stay live until an operator
+  resolves them, or the session leaves Neon and the erasure job erases all its
+  keys. A held copy that is gone or invalid is not held and is retired as
+  before.
 - Erasure job, every 10 min:
   - It sweeps the rollups itself, and erases every exported group Neon no
     longer has. A sweep that reads nothing erases nothing.
