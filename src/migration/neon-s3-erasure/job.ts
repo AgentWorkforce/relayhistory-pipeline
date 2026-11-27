@@ -474,6 +474,7 @@ export class ErasureJob {
     // a failure or an early return in the rollup and catalog walks below
     // must not hold it back.
     const live = await this.#eraseLiveFenced(dryRun).catch((error) => {
+      if (isCredentialFault(error)) throw error; // an expiring eraser key stops the job (exit 75), never a zero count
       healthy = false;
       this.counters.liveFenceFailed += 1;
       this.log({ message: "live fence sweep failed", error_code: errorCode(error) });
@@ -490,6 +491,7 @@ export class ErasureJob {
       legacy = { groups: 0, versions: 0 };
     } else {
       legacy = await this.#eraseLegacyFenced(dryRun).catch((error) => {
+        if (isCredentialFault(error)) throw error;
         healthy = false;
         this.#legacyFenceFailure("legacy fence sweep failed", error);
         return { groups: 0, versions: 0 };
@@ -1040,7 +1042,9 @@ export class ErasureJob {
     if (!probe) return undefined;
     try {
       for (const k of siblings) if (await probe.objectLive(k)) return undefined;
-    } catch {
+    } catch (error) {
+      // An expiring eraser key refused before signing is not an ordinary skip: it stops the pass (exit 75).
+      if (isCredentialFault(error)) throw error;
       return "sibling_check_failed";
     }
     return "sibling_manifest_missing";

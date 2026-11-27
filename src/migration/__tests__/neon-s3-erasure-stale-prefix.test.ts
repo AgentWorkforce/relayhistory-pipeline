@@ -759,3 +759,18 @@ test("full job drain: a credential refusal inside a leased item stops the drain 
   expect(erasureRow(f.st, a.oldP)!.attempts).toBe(before.attempts);
   expect(rowsOf(f.path, "leases")).toEqual([]);
 });
+
+test("stale-prefix execute: a refusal from the sibling probe (objectLive) stops the pass with the code, not a sibling_check_failed skip", async () => {
+  const f = await fixture();
+  const a = f.dateMove("sess-1", "g-1", NOW - 60_000);
+  const before = erasureRow(f.st, a.oldP)!;
+  const probe = { objectLive: async () => { throw new ShortLivedCredentialError("short_lived_expired.eraser"); } } as unknown as LiveObjectProbe;
+  let err: unknown;
+  try { await f.job().staleprefixPass({ onlyIdentities: allIds(f.st), execute: true, probe }); } catch (e) { err = e; }
+  expect((err as { code?: string }).code).toBe("short_lived_expired.eraser");
+  expect(exitStatusForError(err)).toBe(75);
+  expect(erasureRow(f.st, a.oldP)!.attempts).toBe(before.attempts);
+  expect(rowsOf(f.path, "leases")).toEqual([]);
+  expect(f.logs.some((l) => l.message === "stale prefix skipped" && l.reason === "sibling_check_failed")).toBe(false);
+  expect(f.s.count(a.oldP)).toBe(3); // nothing erased
+});

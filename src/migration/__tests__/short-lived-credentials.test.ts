@@ -139,7 +139,7 @@ describe("renewal contract (review of c1d5bf61, finding 2)", () => {
   });
   test("v1 refuses a static replacement that does carry an expiration (shape pinned too)", async () => {
     let doc: unknown = v1();
-    const src = fileCredentialSource("/cur", { minMs: 1, read: () => JSON.stringify(doc) });
+    const src = fileCredentialSource("/cur", { minMs: 1, now: () => T0, read: () => JSON.stringify(doc) });
     await src.provider();
     doc = { accessKeyId: "a", secretAccessKey: "s", sessionToken: "t", expiration: "2026-11-27T23:00:00Z" };
     let err: unknown; try { await src.provider(); } catch (e) { err = e; }
@@ -147,7 +147,7 @@ describe("renewal contract (review of c1d5bf61, finding 2)", () => {
   });
   test("v1 -> v1 rotations keep working; an initially static source stays read-once", async () => {
     let doc: unknown = v1(), reads = 0;
-    const src = fileCredentialSource("/cur", { minMs: 1, read: () => (reads++, JSON.stringify(doc)) });
+    const src = fileCredentialSource("/cur", { minMs: 1, now: () => T0, read: () => (reads++, JSON.stringify(doc)) });
     for (const id of ["ASIASYNTHETIC0010", "ASIASYNTHETIC0011", "ASIASYNTHETIC0012"]) { doc = v1({ AccessKeyId: id }); expect((await src.provider()).accessKeyId).toBe(id); }
     let sreads = 0;
     const st = fileCredentialSource("/fifo", { minMs: 1, read: () => (sreads++, JSON.stringify({ accessKeyId: "a", secretAccessKey: "s" })) });
