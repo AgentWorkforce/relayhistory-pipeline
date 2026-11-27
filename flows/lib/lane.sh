@@ -168,6 +168,10 @@ case "$lane" in
         echo "$file refused PostgreSQL 15 with SQLSTATE 0A000"
       done
     fi
+    # The 062320 hold harness self-tests (run.ts starts and removes its own MinIO; it fails on a skip). Before the
+    # proofs: role-proof's last case demotes the postgres superuser (Supabase identity), so nothing can follow it.
+    RH_HOLD_CONTAINER_PREFIX="rh-ci-pg-$run_id-hold" \
+      bun src/session-ingest/__tests__/hold-harness/run.ts --pg-url "postgres://postgres@127.0.0.1:$port/postgres" --pg "$major"
     SEARCH_CONFORMANCE_PG_URL="postgres://postgres@127.0.0.1:$port/postgres" bun run --filter @96bulls/pipeline test test/search-index-postgres-real.test.ts
     PGPROOF_AUTH_UPGRADE_DISPOSABLE=1 PGPROOF_HOST=127.0.0.1 PGPROOF_PORT="$port" PGPROOF_SUPERUSER=postgres PGPROOF_HEAD="$head" PGPROOF_OUT="$out/auth.json" \
       bun scripts/pg-proof/auth-upgrade-proof.ts
