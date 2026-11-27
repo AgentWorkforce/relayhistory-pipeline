@@ -81,7 +81,9 @@ All of these sit under the per-user admission directory that already holds `priv
   and CronJob, trusted image digests or git shas): out of scope, missing, malformed, mismatched,
   stale or future-dated is a refusal, and a past every-org receipt never counts for a narrowed
   sweeper. Receipt fields are self-reported; they attest a sweeper pass only where a bucket-policy
-  deny keeps every other principal from writing under `.ledger/rearm-sweeper/` (not created here). The keys sit beside the sweeper's cursor, so the role's existing
+  deny keeps every other principal from writing under `.ledger/rearm-sweeper/` (D5,
+  `RearmSweeperOnlyItWritesItsState`, docs/aws-stage.md), and only for versions written while that
+  deny was in effect; an earlier version, or one a version delete exposes, needs independent provenance. The keys sit beside the sweeper's cursor, so the role's existing
   `RearmSweeperReads` / `RearmSweeperWritesProgress` grants on `96bulls/.ledger/rearm-sweeper/*` cover
   them; an identity policy narrower than that needs `s3:GetObject` and `s3:PutObject` on
   `96bulls/.ledger/rearm-sweeper/passes/*`. Receipts are never deleted by the sweeper (it may not

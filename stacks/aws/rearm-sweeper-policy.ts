@@ -55,14 +55,17 @@ export function rearmSweeperBucketStatements(i: { bucketArn: string; roleArn: st
 /**
  * D5: the sweeper's own state (`96bulls/.ledger/rearm-sweeper/*`: its cursors and its pass receipts,
  * src/session-ingest/rearm-sweeper-receipt.ts) is written and deleted only by the sweeper role. Every other principal
- * (the account's own roles and users included) is denied PutObject and DeleteObject there, so a receipt read from that
- * prefix was written by the sweeper role: exclusive WRITE authority. It is not protection of the visible state: it
+ * (the account's own roles and users included) is denied PutObject and DeleteObject there: exclusive WRITE authority,
+ * for writes made WHILE the statement is in effect. An object version that already existed when it took effect (or
+ * that was written while it was rolled back) has unknown authorship from the policy alone, including a version a
+ * later delete exposes; such a version counts as evidence only with independent provenance (its LastModified after
+ * the recorded effective time, or another record of who wrote it). It is not protection of the visible state: it
  * does not cover s3:DeleteObjectVersion (the requested scope; the eraser's version deletes stay as they are), and on
  * this versioned bucket a principal allowed DeleteObjectVersion can delete the current version of a rewritten object
  * and so expose its previous version as current. For a per-org `latest.json` that is a ROLLBACK to an older pointer;
  * if the receipt it names is retained and still within the reader's freshness window, the reader accepts that older,
- * genuine pass. Deleting a receipt's only version makes the evidence missing (fail closed). So the deny proves who
- * wrote what is read, not that it is the newest; who holds DeleteObjectVersion on this prefix is a separate control
+ * genuine pass. Deleting a receipt's only version makes the evidence missing (fail closed). So the deny constrains
+ * who writes from its effective time on, not that what is read is the newest; who holds DeleteObjectVersion on this prefix is a separate control
  * (OnlyTheEraserDeletes limits it to the eraser, the GC and the sweeper, and RearmSweeperNeverDotPrefixes denies the
  * sweeper). Lifecycle
  * expiration is performed by S3 itself and is not evaluated against this policy. Rendered last, after the five grants,
