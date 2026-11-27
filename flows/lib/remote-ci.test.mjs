@@ -196,6 +196,14 @@ test("only the exact reviewed agent/.npmrc blob may publish; any other content, 
   git("commit", "-qm", "mode");
   assert.match(await refuseToPublish(git("rev-parse", "HEAD"), base, repo), /secret-like files \(agent\/\.npmrc\)/, "mode 100755");
   execFileSync("chmod", ["644", join(repo, "agent", ".npmrc")]);
+  execFileSync("rm", [join(repo, "agent", ".npmrc")]);
+  writeFileSync(join(repo, "agent", "target"), reviewed);
+  execFileSync("ln", ["-s", "target", join(repo, "agent", ".npmrc")]);
+  git("add", "-A");
+  git("commit", "-qm", "symlink");
+  assert.match(await refuseToPublish(git("rev-parse", "HEAD"), base, repo), /secret-like files \(agent\/\.npmrc\)/, "symlink");
+  execFileSync("rm", [join(repo, "agent", ".npmrc"), join(repo, "agent", "target")]);
+  writeFileSync(join(repo, "agent", ".npmrc"), reviewed);
   execFileSync("mkdir", ["-p", join(repo, "other")]);
   writeFileSync(join(repo, "other", ".npmrc"), reviewed);
   git("add", "-A");
