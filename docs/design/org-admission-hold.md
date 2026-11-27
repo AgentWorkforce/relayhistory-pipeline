@@ -73,6 +73,30 @@ fence row exists, so the missing-row bootstrap serializes on it too. A hash coll
    SERIALIZABLE are refused in step 1, before they could read a stale snapshot. Every admission path already runs
    READ COMMITTED (`ingest_lazy_records` requires it).
 
+**Namespace.** The key string is the single literal `'96bulls:ingest-org-hold-v1:' || org`. Every existing
+`hashtextextended` key uses a different literal prefix: `96bulls:bookkeeping-*`, `-canonical-feature-journal`,
+`-relayfacts-user-erase-v1`, `repo-catalog:`, `session-analysis-request:`/`-scope:`/`-schedule:global`, the per-scope
+completion keys among them. Others use a different encoding: `jsonb_build_array('96bulls:lazy-native-origin-v1', …)`,
+`jsonb_build_array('upload_consent', …)`, and `concat_ws(chr(31), '96bulls:directory-events' | 'operator-write' |
+'publication-pointer', …)`. Two-int keys live in a different lock space (objsubid 2). So the key can coincide with
+another only through a 64-bit hash collision, and that would only over-serialize the two holders. It never affects
+correctness.
+
+**Retryable end to end.** Every hold refusal uses one SQLSTATE, `RH042`, and one fixed message, `session ingest: org
+admission held`. RH042 is not used elsewhere today.
+- **SQL to edge.** `src/session-ingest/ledger-sql.ts`'s `ledgerErrorCodeFrom` gains `RH042 -> ledger_org_admission_held`
+  (a `LedgerUnavailableError`). The HTTP paths answer 503 `delivery_unavailable` with Retry-After
+  (`HTTP_ADMISSION_STOPPED_RETRY_AFTER_SECONDS`, 300 s), as the Worker's HTTP stop does. The desktop keeps the batch
+  and retries; it is never a permanent reject and never client-visible data loss.
+- **Queue consumer.** The admission queue consumer treats RH042 as a deferral (retry with delay). The queue is drained
+  before install (protocol), so receiving RH042 there means the protocol was violated. It also raises an alert, because
+  repeated retries would eventually dead-letter, and a dead-lettered message for a held org must not be replayed.
+- **Tests.**
+  - Each refusing function, at the SQL level.
+  - Through the TypeScript callers: a held org's claim through the hosted upload-admission and buffered path
+    (`deliverBatch` via `sqlLedger`) round-trips as a retryable 503 with Retry-After, and nothing is written.
+  - A matching consumer test for the deferral.
+
 **`_install(org, request_id)`**:
 1. READ COMMITTED; key **exclusive**. This waits for every transaction that holds it shared, i.e. every in-flight
    admission of the org, until it ends.
@@ -196,7 +220,9 @@ the hold is in the state it expects with E.
    - Rollback after an attempt (refused until reconciled).
    - A stale replay of an old epoch.
 9. **Schema down** refuses with an active hold and with a later slot applied, resets readiness to pending, restores
-   the prior bodies exactly, and retains the audit.
+   the prior bodies exactly, and retains the audit (b1 agrees: retain as inert history).
+10. **Retryable end to end** (section 4): the TypeScript-level round trip of a held org's claim as a retryable 503
+    with no write, and the consumer deferral.
 
 ## 9. Resolved items (from revision 1)
 
