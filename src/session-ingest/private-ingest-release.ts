@@ -178,8 +178,17 @@ const COMMON_PROFILE = {
  * Done: the H-only deploy (plan 45938486616, deploy 45938773082 at 8dd6775f, READBACK_PASS baseline-drain)
  * read back exactly 778af686..., so lifecycle step (3) returns the contract to dormant (null). This is P0 of
  * the Nov 27 combined window (docs/release/062300-062320-combined-window.md).
+ *
+ * Planned Nov 27 combined window (062300 -> 062320 -> 062330 -> 062340 -> 062350), step (1) of the
+ * required order: Worker G+H before the window opens. G = 778af686... is the live policy/expected
+ * generation; H = 756520cd... is `bun src/hoopdb/migrate.ts --generation` at the frozen combined head
+ * (review/sessions-authority-evidence-friday-combined @ 0a786be5). Deploy G+H, open the window, apply,
+ * rebind G -> H, then H-only, then null.
  */
-export const PRIVATE_INGEST_OVERLAP: PrivateIngestOverlap | null = null;
+export const PRIVATE_INGEST_OVERLAP: PrivateIngestOverlap | null = {
+  from: "778af6866b9b28b64ff5af46bc59b1d6c7de4b43e24302bf64321b222cdf23df",
+  to: "756520cd96fc321d91ac322d8ea5ba02602f7f25b87e0a5eb8ec6fe000a5ee6a",
+};
 
 export const PRIVATE_INGEST_GENERATION_CONTRACT: PrivateIngestGenerationContract = {
   generation: COMMON_PROFILE.expectedGeneration,
