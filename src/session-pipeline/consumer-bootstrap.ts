@@ -216,15 +216,24 @@ function openSearchCause(error: SearchIndexError, host: string, index: string): 
       return `${os} rejected the credentials (${detail}): check search.opensearch.auth, the OpenSearch role mapping and Pod Identity`;
     if (status)
       return `${os} answered HTTP ${status} (${detail}): check search.opensearch.url and the domain's health`;
+    // invalidReply: any reply whose shape the adapter could not use (the product check,
+    // index settings, mappings, search results). It does not show which, nor that the
+    // service is something other than OpenSearch.
     if (detail === "bad_response")
-      return `${os} sent a reply that is not OpenSearch (bad_response): check search.opensearch.url`;
+      return `${os} sent a malformed or unexpected reply (bad_response; for example index settings or a mapping the adapter could not read): check search.opensearch.url, the domain's health and the index named here`;
     return `${os} unavailable (${detail || "unavailable"}): check search.opensearch.url, the VPC/security group and Pod Identity (the OpenSearch role mapping)`;
   }
   if (error.code === "unsupported" && detail === "dialect_mismatch")
     return `${os} is not the configured product (dialect_mismatch): check search.opensearch.dialect`;
   if (error.code === "invalid_argument" || error.code === "unsupported")
     return `the OpenSearch settings are invalid (${error.code}${detail ? `: ${detail}` : ""}): check search.opensearch.* in your values file`;
-  // An existing index whose mapping does not merge (PUT <index>/_mapping answered 400).
+  // An existing index whose mapping update PUT <index>/_mapping answered 400 without
+  // saying it conflicts: only the bounded error type names are kept.
+  if (error.code === "schema_missing" && detail.startsWith("mapping_rejected:")) {
+    const types = detail.slice("mapping_rejected:http_400".length).replace(/^:/, "");
+    return `the OpenSearch index ${index} on ${host} already exists and rejected this release's mapping update (HTTP 400${types ? `, ${types.replaceAll(":", ", ")}` : ""}; schema_missing: ${detail}): see ${ADAPTER_DOC} or contact support with this line`;
+  }
+  // PUT <index>/_mapping answered 400 and the reply says the mapping conflicts.
   // The adapter keeps no server text, so the field is not known here.
   if (error.code === "schema_missing" && detail === "mapping_conflict")
     return `the OpenSearch index ${index} on ${host} already exists and its mapping conflicts with this release's mapping (schema_missing: mapping_conflict; the conflicting field is not reported): see ${ADAPTER_DOC} or contact support with this line`;
@@ -232,6 +241,8 @@ function openSearchCause(error: SearchIndexError, host: string, index: string): 
   if (error.code === "schema_missing" && !detail)
     return `the OpenSearch index ${index} on ${host} was not found (schema_missing): the bootstrap creates it, so it is absent or was removed while this run checked it; rerun the Job, and if this repeats, check search.opensearch.indexPrefix and that the OpenSearch role mapping allows creating indices`;
   // ensureSchema verifies, never applies, index.gc_deletes.
+  if (error.code === "schema_mismatch" && detail === "gc_deletes_unverified")
+    return `the OpenSearch index ${index} on ${host}: index.gc_deletes could not be verified as 0s (not in the settings response; schema_mismatch: gc_deletes_unverified): the bootstrap checks but never changes settings; set index.gc_deletes: 0s on that index explicitly (a dynamic setting) and rerun the Job, see ${ADAPTER_DOC}`;
   if (error.code === "schema_mismatch" && detail === "gc_deletes")
     return `the OpenSearch index ${index} on ${host} has index.gc_deletes other than 0 (schema_mismatch: gc_deletes): the bootstrap checks but never changes settings; set index.gc_deletes: 0s on that index (a dynamic setting) and rerun the Job, see ${ADAPTER_DOC}`;
   if (error.code === "schema_missing" || error.code === "schema_mismatch")
@@ -240,30 +251,40 @@ function openSearchCause(error: SearchIndexError, host: string, index: string): 
 }
 
 /**
+ * Where this run's Postgres half (state tables, grants for search_consumer_runtime) stood
+ * when the OpenSearch half failed: the owner transaction had not begun (composing the
+ * OpenSearch index throws before BEGIN), had begun and was rolled back (ensureSchema runs
+ * inside it), or had committed.
+ */
+export type PostgresPhase = "not_begun" | "rolled_back" | "committed";
+
+/**
  * The one plain stderr line the bootstrap Job prints before its stack trace when the
- * OpenSearch half fails. `postgresApplied` says whether this run's Postgres half (state
- * tables, grants for search_consumer_runtime) had committed. In this bootstrap it never
- * has: OpenSearch ensureSchema runs inside the single owner transaction, so a failure
- * rolls this run's changes back. The line speaks only for this run: it cannot tell
- * whether an earlier run's grants are in place, so it predicts nothing about the
- * indexer. Names, codes, the URL host and the index name only; never a URL with
- * credentials or a password. Undefined for anything that is not a SearchIndexError.
+ * OpenSearch half fails. The line speaks only for this run: it cannot tell whether an
+ * earlier run's grants are in place, so it predicts nothing about the indexer. Names,
+ * codes, the URL host and the index name only; never a URL with credentials or a
+ * password. Undefined for anything that is not a SearchIndexError.
  */
 export function searchBootstrapFailureLine(
   error: unknown,
   env: NodeJS.ProcessEnv,
-  postgresApplied: boolean,
+  phase: PostgresPhase,
 ): string | undefined {
   if (!(error instanceof SearchIndexError)) return undefined;
-  const postgres = postgresApplied
-    ? "this run's search Postgres changes (state tables and grants for search_consumer_runtime) were committed before this failure"
-    : "this run's search Postgres changes (state tables and grants for search_consumer_runtime) were rolled back with it, so this run applied none of them";
+  const changes = "this run's search Postgres changes (state tables and grants for search_consumer_runtime)";
+  const postgres = phase === "committed"
+    ? `${changes} were committed before this failure`
+    : phase === "rolled_back"
+      ? `${changes} were rolled back with it, so this run applied none of them`
+      : "this run applied no Postgres changes (it failed before its Postgres transaction began)";
   return `search bootstrap failed: ${openSearchCause(error, openSearchHost(env), openSearchIndexName(env))}; ${postgres}`;
 }
 
 /** Runs a piece of the OpenSearch half; a throw from it marks the OpenSearch half failed. */
 export type OpenSearchStep = <T>(work: () => T | Promise<T>) => Promise<T>;
 export interface BootstrapProgress {
+  /** Set by the bootstrap once its owner transaction has begun. */
+  postgresBegun: boolean;
   /** Set by the bootstrap after its owner transaction commits. */
   postgresCommitted: boolean;
 }
@@ -278,7 +299,7 @@ export async function withSearchBootstrapDiagnosis<T>(
   run: (openSearch: OpenSearchStep, progress: BootstrapProgress) => Promise<T>,
   stderr: (line: string) => void = (line) => process.stderr.write(line),
 ): Promise<T> {
-  const progress: BootstrapProgress = { postgresCommitted: false };
+  const progress: BootstrapProgress = { postgresBegun: false, postgresCommitted: false };
   let openSearchFailed = false;
   const openSearch: OpenSearchStep = async (work) => {
     try {
@@ -291,7 +312,11 @@ export async function withSearchBootstrapDiagnosis<T>(
   try {
     return await run(openSearch, progress);
   } catch (error) {
-    const line = openSearchFailed ? searchBootstrapFailureLine(error, env, progress.postgresCommitted) : undefined;
+    const line = openSearchFailed ? searchBootstrapFailureLine(
+          error,
+          env,
+          progress.postgresCommitted ? "committed" : progress.postgresBegun ? "rolled_back" : "not_begun",
+        ) : undefined;
     if (line) stderr(`${line}\n`);
     throw error;
   }
@@ -347,6 +372,7 @@ async function bootstrap(env: NodeJS.ProcessEnv, openSearch: OpenSearchStep, pro
         ).index);
     const state = binding.state as WriterProjectionState;
     await owner.query("BEGIN");
+    progress.postgresBegun = true;
     try {
       await runBootstrap({
         owner,

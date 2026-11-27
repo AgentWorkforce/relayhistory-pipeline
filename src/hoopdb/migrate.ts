@@ -1223,6 +1223,8 @@ export async function rdsOwnerPreflight(client: MigrationClient, layoutDefaulted
       server_version_num: number;
       db_owner: string | null;
       db_owner_dedicated: boolean;
+      db_name: string;
+      sessions_owned_by_db_owner: boolean;
     }>(
       `SELECT me.rolsuper AS owner_super, me.rolcreaterole AS owner_createrole,
               EXISTS (SELECT 1 FROM pg_roles r
@@ -1233,7 +1235,10 @@ export async function rdsOwnerPreflight(client: MigrationClient, layoutDefaulted
               coalesce(NOT o.rolsuper AND NOT o.rolcreaterole AND o.rolname <> 'rdsadmin'
                 AND NOT EXISTS (SELECT 1 FROM pg_catalog.pg_roles s
                                  WHERE s.rolname = 'rds_superuser' AND pg_catalog.pg_has_role(o.oid, s.oid, 'MEMBER')),
-                false) AS db_owner_dedicated
+                false) AS db_owner_dedicated,
+              current_database()::text AS db_name,
+              coalesce((SELECT n.nspowner = d.datdba FROM pg_catalog.pg_namespace n
+                         WHERE n.nspname = 'sessions'), false) AS sessions_owned_by_db_owner
          FROM pg_roles me
          LEFT JOIN pg_catalog.pg_database d ON d.datname = current_database()
          LEFT JOIN pg_catalog.pg_roles o ON o.oid = d.datdba
@@ -1248,19 +1253,29 @@ export async function rdsOwnerPreflight(client: MigrationClient, layoutDefaulted
     !r.rdsadmin_super ||
     r.server_version_num < 160000;
   if (!unproven) return;
-  // HOOPDB_RDS_LAYOUT unset selects this legacy preflight, but a dedicated, non-admin
-  // owner holds the database: the separate-database layout configure-rds.sh set up, whose
-  // values overlay a later plain `helm upgrade` dropped. Same error_code; the message says
-  // which value to restore. A role name only, never a URL or password.
-  // Only when the login is not the master's shape (a CREATEROLE rds_superuser member):
-  // a master-owner install failing on some other proof keeps the generic message.
-  if (layoutDefaulted && r?.db_owner && r.db_owner_dedicated && !(r.owner_createrole && r.owner_rds_superuser)) {
-    const line = `HOOPDB_RDS_LAYOUT is unset but hoopdb is owned by ${JSON.stringify(r.db_owner)} (a dedicated owner): set sessions-pipeline.worker.migrations.rdsLayout: separate-database in your values file (scripts/selfhost/configure-rds.sh writes it) and run helm upgrade again`;
+  // HOOPDB_RDS_LAYOUT unset selects this legacy preflight, but the catalog shows the
+  // separate-database layout configure-rds.sh set up, whose values overlay a later plain
+  // `helm upgrade` dropped. Same error_code; the message says which value to restore.
+  // The advice is given only when the evidence proves that layout: the RDS shape (the
+  // fixed rdsadmin SUPERUSER, PostgreSQL 16+), a dedicated non-admin database owner, the
+  // sessions schema owned by that same owner, and a login that is not the master's shape
+  // (a CREATEROLE rds_superuser member). Anything less keeps the generic refusal.
+  // Names a database and a role only, never a URL or password.
+  if (
+    layoutDefaulted &&
+    r?.db_owner &&
+    r.db_owner_dedicated &&
+    r.rdsadmin_super &&
+    r.sessions_owned_by_db_owner &&
+    r.server_version_num >= 160000 &&
+    !(r.owner_createrole && r.owner_rds_superuser)
+  ) {
+    const line = `HOOPDB_RDS_LAYOUT is unset but database ${JSON.stringify(r.db_name)} and its sessions schema are owned by ${JSON.stringify(r.db_owner)} (a dedicated owner): set sessions-pipeline.worker.migrations.rdsLayout: separate-database in your values file (scripts/selfhost/configure-rds.sh writes it) and run helm upgrade again`;
     throw Object.assign(profileError("rds_profile_unproven", line), { operatorLine: line });
   }
   // The generic refusal is unchanged: it reports exactly the five original proofs.
   const legacy = r
-    ? (({ db_owner: _owner, db_owner_dedicated: _dedicated, ...proofs }) => proofs)(r)
+    ? (({ db_owner: _owner, db_owner_dedicated: _dedicated, db_name: _db, sessions_owned_by_db_owner: _sessions, ...proofs }) => proofs)(r)
     : null;
   throw profileError(
     "rds_profile_unproven",

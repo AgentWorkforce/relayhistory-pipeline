@@ -147,7 +147,10 @@ dialect.
   `content_prefix_folded` and `task_title_folded`, which the mapping now enables,
   and no other index or cluster setting: inline painless is on by default on
   both products. An index created with the earlier `doc_values: false` mapping
-  fails `ensureSchema` with `mapping_conflict` and has to be recreated. The doc
+  fails `ensureSchema` with `mapping_conflict` and has to be recreated. (A 400
+  from the mapping update is `mapping_conflict` only when the reply is an
+  `illegal_argument_exception` saying a mapper cannot be changed or conflicts;
+  any other 400 is `mapping_rejected:http_400[:<error type>]`.) The doc
   values store the folded windows a second time on disk. Cost: a
   script filter runs once per candidate document that has already passed the
   tenant, session, source, kind, project and time filters (Lucene checks it
@@ -188,8 +191,10 @@ dialect.
   index creation, mapping updates and reading settings for `ensureSchema`.
 - `ensureSchema` reads `index.gc_deletes` back after creating or confirming the
   index. An index that already existed or came from a template may keep the
-  60 s default, which the tombstone handling above does not expect. Anything
-  other than `0`, `0s` or `0ms` fails `schema_mismatch` (detail `gc_deletes`).
+  60 s default, which the tombstone handling above does not expect. A value
+  other than `0`, `0s` or `0ms` fails `schema_mismatch` (detail `gc_deletes`);
+  a reply that omits the setting (an index left on the default) fails
+  `schema_mismatch` (detail `gc_deletes_unverified`), since zero is not shown.
   The adapter never applies settings. An operator sets
   `index.gc_deletes: 0s` (a dynamic setting) and reruns `ensureSchema`.
 - `deleteEvents` and `eraseScope` are `_delete_by_query?refresh=true&conflicts=proceed`

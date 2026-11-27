@@ -288,6 +288,26 @@ function httpDetail(status: number, body: unknown): string {
   return [`http_${status}`, type, cause].filter((x) => x !== undefined).join(":");
 }
 
+/**
+ * Whether a 400 from PUT <index>/_mapping says the mapping conflicts: an
+ * illegal_argument_exception (directly or as root_cause/caused_by) whose reason says a
+ * mapper cannot be changed or conflicts. The reason is matched, never kept.
+ */
+function mappingConflictEvidence(body: unknown): boolean {
+  const error = (body as { error?: unknown } | undefined)?.error;
+  if (!error || typeof error !== "object") return false;
+  const e = error as { type?: unknown; reason?: unknown; caused_by?: unknown; root_cause?: unknown };
+  const nodes: unknown[] = [e, e.caused_by, ...(Array.isArray(e.root_cause) ? e.root_cause : [])];
+  return nodes.some((n) => {
+    const { type, reason } = (n ?? {}) as { type?: unknown; reason?: unknown };
+    return (
+      type === "illegal_argument_exception" &&
+      typeof reason === "string" &&
+      /cannot be changed|conflict/i.test(reason)
+    );
+  });
+}
+
 /** The bounded error type names of a bulk item error (never `reason`, which can quote document content). */
 function itemErrorTypes(error: unknown): string[] {
   if (!error || typeof error !== "object") return [];
@@ -597,9 +617,14 @@ export function createOpenSearchSearchIndex(config: OpenSearchSearchIndexConfig)
       if (created.status === 400) {
         const type = (created.body as { error?: { type?: unknown } } | undefined)?.error?.type;
         if (type !== "resource_already_exists_exception") throw new SearchIndexError("unavailable", false, "http_400");
-        // Existing index: the same mapping must apply cleanly (a conflict is a 400).
+        // Existing index: the same mapping must apply cleanly. A 400 is a mapping conflict
+        // only when the reply says so; any other 400 is a rejected update, with the bounded
+        // error type names (never the reason text) as its detail.
         const merged = await request("PUT", `${index}/_mapping`, OPENSEARCH_MAPPINGS, context, { accept: [400] });
-        if (merged.status === 400) throw new SearchIndexError("schema_missing", false, "mapping_conflict");
+        if (merged.status === 400) {
+          if (mappingConflictEvidence(merged.body)) throw new SearchIndexError("schema_missing", false, "mapping_conflict");
+          throw new SearchIndexError("schema_missing", false, `mapping_rejected:${httpDetail(400, merged.body)}`);
+        }
       }
       // Verify (never apply) gc_deletes: an existing or template-created index may
       // keep the 60s default, and the tombstone handling in upsert assumes 0.
@@ -607,6 +632,8 @@ export function createOpenSearchSearchIndex(config: OpenSearchSearchIndexConfig)
       const entries = Object.values((settings.body ?? {}) as Record<string, { settings?: Record<string, unknown> } | undefined>);
       if (entries.length !== 1) invalidReply();
       const gcDeletes = entries[0]?.settings?.["index.gc_deletes"];
+      // Absent from the reply: the value is not shown, so it cannot be verified as zero.
+      if (gcDeletes === undefined) throw new SearchIndexError("schema_mismatch", false, "gc_deletes_unverified");
       if (typeof gcDeletes !== "string" || !ZERO_GC_DELETES.has(gcDeletes)) {
         throw new SearchIndexError("schema_mismatch", false, "gc_deletes");
       }

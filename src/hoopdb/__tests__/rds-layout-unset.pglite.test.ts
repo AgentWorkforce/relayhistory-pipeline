@@ -21,8 +21,10 @@ const client = (db: PGlite): MigrationClient => ({
   },
 });
 
-const LINE =
-  'HOOPDB_RDS_LAYOUT is unset but hoopdb is owned by "hoopdb_owner" (a dedicated owner): set sessions-pipeline.worker.migrations.rdsLayout: separate-database in your values file (scripts/selfhost/configure-rds.sh writes it) and run helm upgrade again';
+/** PGlite's database is not named hoopdb, so the line must name the real one. */
+const lineFor = (dbname: string) =>
+  `HOOPDB_RDS_LAYOUT is unset but database ${JSON.stringify(dbname)} and its sessions schema are owned by "hoopdb_owner" (a dedicated owner): set sessions-pipeline.worker.migrations.rdsLayout: separate-database in your values file (scripts/selfhost/configure-rds.sh writes it) and run helm upgrade again`;
+const dbName = async (db: PGlite) => (await db.query<{ d: string }>("SELECT current_database() AS d")).rows[0]!.d;
 
 /** The separate-database layout configure-rds.sh builds: hoopdb_owner owns the database and sessions. */
 async function separateLayoutDb(mutate = "", login = "hoopdb_owner"): Promise<PGlite> {
@@ -68,6 +70,7 @@ describe("migrator: HOOPDB_RDS_LAYOUT unset with a dedicated database owner", ()
 
   test("runMigrations names the dropped overlay, keeps error_code rds_profile_unproven, writes nothing", async () => {
     const db = await separateLayoutDb();
+    const LINE = lineFor(await dbName(db));
     const r = await refusal(runMigrations(client(db), { profile: migrationProfile(RDS_ENV) }));
     expect(r).toEqual({ code: "rds_profile_unproven", message: `96bulls: ${LINE}`, line: LINE });
     expect(r.message).not.toMatch(/postgres(ql)?:\/\/|password/i);
@@ -75,12 +78,23 @@ describe("migrator: HOOPDB_RDS_LAYOUT unset with a dedicated database owner", ()
   });
 
   test("the preflight alone, logged in as the owner or as another plain login", async () => {
-    expect(await refusal(rdsOwnerPreflight(client(await separateLayoutDb()), true))).toEqual({
+    const owner = await separateLayoutDb();
+    const LINE = lineFor(await dbName(owner));
+    expect(await refusal(rdsOwnerPreflight(client(owner), true))).toEqual({
       code: "rds_profile_unproven", message: `96bulls: ${LINE}`, line: LINE,
     });
     // The URL logs in as some other plain role: the database is still the dedicated owner's.
     const other = await separateLayoutDb("CREATE ROLE some_login LOGIN", "some_login");
     expect((await refusal(rdsOwnerPreflight(client(other), true))).line).toBe(LINE);
+  });
+
+  test("the line names the real database, never a hardcoded hoopdb", async () => {
+    const db = await separateLayoutDb();
+    const name = await dbName(db);
+    expect(name).not.toBe("hoopdb");
+    const r = await refusal(rdsOwnerPreflight(client(db), true));
+    expect(r.line).toContain(`database ${JSON.stringify(name)} and its sessions schema`);
+    expect(r.line).not.toContain("hoopdb is owned");
   });
 
   const LEGACY = /^96bulls: rds mode needs PostgreSQL 16\+, a non-superuser CREATEROLE rds_superuser member as migration owner and the fixed rdsadmin SUPERUSER: \{"owner_super":(true|false),"owner_createrole":(true|false),"owner_rds_superuser":(true|false),"server_version_num":\d+,"rdsadmin_super":(true|false)\}; nothing was written$/;
@@ -90,6 +104,12 @@ describe("migrator: HOOPDB_RDS_LAYOUT unset with a dedicated database owner", ()
     ["the database owned by a CREATEROLE owner", "ALTER ROLE hoopdb_owner CREATEROLE", "hoopdb_owner", true],
     ["the database owned by an rds_superuser member", "GRANT rds_superuser TO hoopdb_owner", "hoopdb_owner", true],
     ["the master login failing another proof (rdsadmin not SUPERUSER)", "ALTER ROLE rdsadmin NOSUPERUSER", "master", true],
+    // Unproven layout evidence: no overlay advice without the RDS shape AND sessions ownership.
+    ["no RDS shape (rdsadmin absent)", "DROP ROLE rdsadmin", "hoopdb_owner", true],
+    ["rdsadmin present but not SUPERUSER", "ALTER ROLE rdsadmin NOSUPERUSER", "hoopdb_owner", true],
+    ["no sessions schema", "DROP SCHEMA sessions", "hoopdb_owner", true],
+    ["sessions owned by someone other than the database owner", "ALTER SCHEMA sessions OWNER TO master", "hoopdb_owner", true],
+    ["neither the RDS shape nor sessions ownership", "DROP ROLE rdsadmin; DROP SCHEMA sessions", "hoopdb_owner", true],
   ];
   for (const [name, mutate, login, defaulted] of cases)
     test(`other rds_profile_unproven cases keep the old message: ${name}`, async () => {
@@ -98,6 +118,16 @@ describe("migrator: HOOPDB_RDS_LAYOUT unset with a dedicated database owner", ()
       expect(r.message).toMatch(LEGACY);
       expect(r.line).toBeUndefined();
     });
+
+  test("runMigrations, default RDS layout, without rdsadmin or sessions: the original refusal, no helm advice", async () => {
+    const db = await separateLayoutDb("DROP ROLE rdsadmin; DROP SCHEMA sessions");
+    const r = await refusal(runMigrations(client(db), { profile: migrationProfile(RDS_ENV) }));
+    expect(r.code).toBe("rds_profile_unproven");
+    expect(r.message).toMatch(LEGACY);
+    expect(r.line).toBeUndefined();
+    expect(r.message).not.toMatch(/separate-database|helm upgrade/);
+    expect((await db.query<{ r: string | null }>("SELECT to_regclass($1)::text AS r", [MIGRATION_LEDGER])).rows[0]!.r).toBeNull();
+  });
 
   test("operatorLine ignores anything but a non-empty string", () => {
     expect(operatorLine(new Error("x"))).toBeUndefined();

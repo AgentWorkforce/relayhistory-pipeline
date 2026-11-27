@@ -21,6 +21,7 @@ import { assertServiceSchema, searchIndexerStartupHint } from "../consumer-servi
 const URL_ENV = { SEARCH_INDEX_OPENSEARCH_URL: "https://search-relay.us-east-1.es.amazonaws.com" };
 const NOT_APPLIED =
   "this run's search Postgres changes (state tables and grants for search_consumer_runtime) were rolled back with it, so this run applied none of them";
+const NOT_BEGUN = "this run applied no Postgres changes (it failed before its Postgres transaction began)";
 const INDEX = "relayhistory-transcript-events";
 const HOST = "search-relay.us-east-1.es.amazonaws.com";
 
@@ -70,13 +71,13 @@ describe("search bootstrap: one plain line for an OpenSearch failure", () => {
     const error = await caught(() => index.ensureSchema());
     expect(error).toBeInstanceOf(SearchIndexError);
     expect((error as Error).message).toBe("search index: unavailable (network)");
-    expect(searchBootstrapFailureLine(error, env, false)).toBe(
+    expect(searchBootstrapFailureLine(error, env, "rolled_back")).toBe(
       `search bootstrap failed: OpenSearch 127.0.0.1:1 unreachable (network): check search.opensearch.url, the VPC/security group and Pod Identity (the OpenSearch role mapping); ${NOT_APPLIED}`,
     );
   });
 
   test("after the Postgres half committed, the line says it succeeded", () => {
-    const line = searchBootstrapFailureLine(new SearchIndexError("unavailable", true, "network"), URL_ENV, true);
+    const line = searchBootstrapFailureLine(new SearchIndexError("unavailable", true, "network"), URL_ENV, "committed");
     expect(line).toBe(
       "search bootstrap failed: OpenSearch search-relay.us-east-1.es.amazonaws.com unreachable (network): check search.opensearch.url, the VPC/security group and Pod Identity (the OpenSearch role mapping); this run's search Postgres changes (state tables and grants for search_consumer_runtime) were committed before this failure",
     );
@@ -92,16 +93,16 @@ describe("search bootstrap: one plain line for an OpenSearch failure", () => {
         }),
     });
     const error = await caught(() => index.ensureSchema());
-    expect(searchBootstrapFailureLine(error, URL_ENV, false)).toBe(
+    expect(searchBootstrapFailureLine(error, URL_ENV, "rolled_back")).toBe(
       `search bootstrap failed: OpenSearch search-relay.us-east-1.es.amazonaws.com refused the request (http_403:security_exception): check the OpenSearch role mapping for the search indexer's Pod Identity role, and the Pod Identity association; ${NOT_APPLIED}`,
     );
     // The backend's reason text never reaches the line.
-    expect(searchBootstrapFailureLine(error, URL_ENV, false)).not.toContain("no permissions");
+    expect(searchBootstrapFailureLine(error, URL_ENV, "rolled_back")).not.toContain("no permissions");
   });
 
   test("every SearchIndexError kind gets its own pointer", () => {
     const cause = (code: ConstructorParameters<typeof SearchIndexError>[0], detail?: string) =>
-      searchBootstrapFailureLine(new SearchIndexError(code, false, detail), URL_ENV, false)!
+      searchBootstrapFailureLine(new SearchIndexError(code, false, detail), URL_ENV, "rolled_back")!
         .replace("search bootstrap failed: ", "")
         .replace(`; ${NOT_APPLIED}`, "");
     const host = "search-relay.us-east-1.es.amazonaws.com";
@@ -118,7 +119,7 @@ describe("search bootstrap: one plain line for an OpenSearch failure", () => {
       `OpenSearch ${host} answered HTTP 503 (http_503): check search.opensearch.url and the domain's health`,
     );
     expect(cause("unavailable", "bad_response")).toBe(
-      `OpenSearch ${host} sent a reply that is not OpenSearch (bad_response): check search.opensearch.url`,
+      `OpenSearch ${host} sent a malformed or unexpected reply (bad_response; for example index settings or a mapping the adapter could not read): check search.opensearch.url, the domain's health and the index named here`,
     );
     expect(cause("unsupported", "dialect_mismatch")).toBe(
       `OpenSearch ${host} is not the configured product (dialect_mismatch): check search.opensearch.dialect`,
@@ -138,13 +139,48 @@ describe("search bootstrap: one plain line for an OpenSearch failure", () => {
     });
     const error = (await caught(() => index.ensureSchema())) as SearchIndexError;
     expect([error.code, error.detail]).toEqual(["schema_missing", undefined]);
-    const line = searchBootstrapFailureLine(error, URL_ENV, false)!;
+    const line = searchBootstrapFailureLine(error, URL_ENV, "rolled_back")!;
     expect(line).toBe(
       `search bootstrap failed: the OpenSearch index ${INDEX} on ${HOST} was not found (schema_missing): the bootstrap creates it, so it is absent or was removed while this run checked it; rerun the Job, and if this repeats, check search.opensearch.indexPrefix and that the OpenSearch role mapping allows creating indices; ${NOT_APPLIED}`,
     );
     expect(line).not.toContain(SCHEMA_PHRASES.conflict);
     expect(line).not.toContain(SCHEMA_PHRASES.gc);
     expect(line).not.toMatch(/exists|remove the|delete|recreate|stale/i);
+  });
+
+  test("a 400 on PUT _mapping with no conflict evidence: rejected, never 'conflict'", async () => {
+    for (const [body, types] of [[{}, ""], [{ error: { type: "mapper_parsing_exception", reason: "No handler for type [flattened]" } }, ", mapper_parsing_exception"]] as const) {
+      const index = fakeOpenSearch({
+        create: reply(400, { error: { type: "resource_already_exists_exception" } }),
+        mapping: reply(400, body),
+      });
+      const error = (await caught(() => index.ensureSchema())) as SearchIndexError;
+      expect(error.code).toBe("schema_missing");
+      expect(error.detail).toStartWith("mapping_rejected:http_400");
+      const line = searchBootstrapFailureLine(error, URL_ENV, "rolled_back")!;
+      expect(line).toContain(`already exists and rejected this release's mapping update (HTTP 400${types};`);
+      expect(line).not.toMatch(/conflict/i);
+      expect(line).not.toMatch(/remove the|delete|recreate/i);
+      expect(line).not.toContain("No handler");
+    }
+  });
+
+  test("settings without index.gc_deletes: could not be verified, not 'other than 0'", async () => {
+    const index = fakeOpenSearch({ settings: reply(200, { [INDEX]: { settings: {} } }) });
+    const error = (await caught(() => index.ensureSchema())) as SearchIndexError;
+    expect([error.code, error.detail]).toEqual(["schema_mismatch", "gc_deletes_unverified"]);
+    const line = searchBootstrapFailureLine(error, URL_ENV, "rolled_back")!;
+    expect(line).toContain("index.gc_deletes could not be verified as 0s (not in the settings response");
+    expect(line).not.toContain(SCHEMA_PHRASES.gc);
+  });
+
+  test("bad_response after a valid product check (malformed settings): malformed or unexpected, never 'not OpenSearch'", async () => {
+    const index = fakeOpenSearch({ settings: reply(200, {}) });
+    const error = (await caught(() => index.ensureSchema())) as SearchIndexError;
+    expect([error.code, error.detail]).toEqual(["unavailable", "bad_response"]);
+    const line = searchBootstrapFailureLine(error, URL_ENV, "rolled_back")!;
+    expect(line).toContain("sent a malformed or unexpected reply (bad_response");
+    expect(line).not.toMatch(/not OpenSearch|is not the configured product/);
   });
 
   test("a real mapping conflict (schema_missing: mapping_conflict): names the index, no field invented, no deletion advice", async () => {
@@ -154,7 +190,7 @@ describe("search bootstrap: one plain line for an OpenSearch failure", () => {
     });
     const error = (await caught(() => index.ensureSchema())) as SearchIndexError;
     expect([error.code, error.detail]).toEqual(["schema_missing", "mapping_conflict"]);
-    const line = searchBootstrapFailureLine(error, URL_ENV, false)!;
+    const line = searchBootstrapFailureLine(error, URL_ENV, "rolled_back")!;
     expect(line).toBe(
       `search bootstrap failed: the OpenSearch index ${INDEX} on ${HOST} already exists and its mapping conflicts with this release's mapping (schema_missing: mapping_conflict; the conflicting field is not reported): see docs/search-and-runtime-adapters.md (OpenSearch implementation) or contact support with this line; ${NOT_APPLIED}`,
     );
@@ -168,7 +204,7 @@ describe("search bootstrap: one plain line for an OpenSearch failure", () => {
     const index = fakeOpenSearch({ settings: reply(200, { [INDEX]: { settings: { "index.gc_deletes": "60s" } } }) });
     const error = (await caught(() => index.ensureSchema())) as SearchIndexError;
     expect([error.code, error.detail]).toEqual(["schema_mismatch", "gc_deletes"]);
-    const line = searchBootstrapFailureLine(error, URL_ENV, false)!;
+    const line = searchBootstrapFailureLine(error, URL_ENV, "rolled_back")!;
     expect(line).toBe(
       `search bootstrap failed: the OpenSearch index ${INDEX} on ${HOST} has index.gc_deletes other than 0 (schema_mismatch: gc_deletes): the bootstrap checks but never changes settings; set index.gc_deletes: 0s on that index (a dynamic setting) and rerun the Job, see docs/search-and-runtime-adapters.md (OpenSearch implementation); ${NOT_APPLIED}`,
     );
@@ -180,18 +216,18 @@ describe("search bootstrap: one plain line for an OpenSearch failure", () => {
 
   test("the index name follows SEARCH_INDEX_OPENSEARCH_INDEX_PREFIX and never echoes an invalid prefix", () => {
     const error = new SearchIndexError("schema_mismatch", false, "gc_deletes");
-    expect(searchBootstrapFailureLine(error, { ...URL_ENV, SEARCH_INDEX_OPENSEARCH_INDEX_PREFIX: "acme" }, false)).toContain(
+    expect(searchBootstrapFailureLine(error, { ...URL_ENV, SEARCH_INDEX_OPENSEARCH_INDEX_PREFIX: "acme" }, "rolled_back")).toContain(
       "index acme-transcript-events on",
     );
-    const bad = searchBootstrapFailureLine(error, { ...URL_ENV, SEARCH_INDEX_OPENSEARCH_INDEX_PREFIX: "Bad Prefix/../x" }, false)!;
+    const bad = searchBootstrapFailureLine(error, { ...URL_ENV, SEARCH_INDEX_OPENSEARCH_INDEX_PREFIX: "Bad Prefix/../x" }, "rolled_back")!;
     expect(bad).toContain("index (the configured index) on");
     expect(bad).not.toContain("Bad Prefix");
   });
 
   test("the grants clause speaks only for this run: no claim about earlier grants, no 42501 prediction", () => {
-    for (const applied of [false, true]) {
+    for (const applied of ["not_begun", "rolled_back", "committed"] as const) {
       const line = searchBootstrapFailureLine(new SearchIndexError("unavailable", true, "network"), URL_ENV, applied)!;
-      expect(line).toContain("this run's search Postgres changes");
+      expect(line).toContain(applied === "not_begun" ? NOT_BEGUN : "this run's search Postgres changes");
       expect(line).not.toMatch(/permission denied|42501|will report|NOT applied|until this Job succeeds/);
     }
   });
@@ -199,15 +235,15 @@ describe("search bootstrap: one plain line for an OpenSearch failure", () => {
   test("never a URL with credentials, a path or a query: the host only", () => {
     const env = { SEARCH_INDEX_OPENSEARCH_URL: " https://admin:hunter2@search-relay.example.com:9200/prefix?token=abc " };
     expect(openSearchHost(env)).toBe("search-relay.example.com:9200");
-    const line = searchBootstrapFailureLine(new SearchIndexError("unavailable", true, "network"), env, false)!;
+    const line = searchBootstrapFailureLine(new SearchIndexError("unavailable", true, "network"), env, "rolled_back")!;
     for (const secret of ["admin", "hunter2", "token", "abc", "prefix", "https://"]) expect(line).not.toContain(secret);
     expect(openSearchHost({})).toBe("(SEARCH_INDEX_OPENSEARCH_URL unset)");
     expect(openSearchHost({ SEARCH_INDEX_OPENSEARCH_URL: "not a url:hunter2" })).toBe("(SEARCH_INDEX_OPENSEARCH_URL is not a URL)");
   });
 
   test("anything that is not a SearchIndexError gets no line", () => {
-    expect(searchBootstrapFailureLine(new Error("search index: unavailable (network)"), URL_ENV, false)).toBeUndefined();
-    expect(searchBootstrapFailureLine(Object.assign(new Error("x"), { code: "unavailable" }), URL_ENV, false)).toBeUndefined();
+    expect(searchBootstrapFailureLine(new Error("search index: unavailable (network)"), URL_ENV, "rolled_back")).toBeUndefined();
+    expect(searchBootstrapFailureLine(Object.assign(new Error("x"), { code: "unavailable" }), URL_ENV, "rolled_back")).toBeUndefined();
   });
 });
 
@@ -218,7 +254,7 @@ describe("search bootstrap: the wrapper serve() runs", () => {
     return { error, written };
   };
 
-  test("an OpenSearch-half failure prints the line once, first, and still rethrows the same error", async () => {
+  test("an OpenSearch-half failure before BEGIN (composing the index) says no Postgres changes, not a rollback", async () => {
     const thrown = new SearchIndexError("unavailable", true, "network");
     const { error, written } = await run(async (openSearch) => {
       await openSearch(async () => {
@@ -228,8 +264,21 @@ describe("search bootstrap: the wrapper serve() runs", () => {
     });
     expect(error).toBe(thrown);
     expect(written).toEqual([
-      `search bootstrap failed: OpenSearch search-relay.us-east-1.es.amazonaws.com unreachable (network): check search.opensearch.url, the VPC/security group and Pod Identity (the OpenSearch role mapping); ${NOT_APPLIED}\n`,
+      `search bootstrap failed: OpenSearch search-relay.us-east-1.es.amazonaws.com unreachable (network): check search.opensearch.url, the VPC/security group and Pod Identity (the OpenSearch role mapping); ${NOT_BEGUN}\n`,
     ]);
+    expect(written[0]).not.toContain("rolled back");
+  });
+
+  test("an OpenSearch-half failure inside the owner transaction says it was rolled back", async () => {
+    const { written } = await run(async (openSearch, progress) => {
+      progress.postgresBegun = true;
+      return openSearch(async () => {
+        throw new SearchIndexError("schema_missing");
+      });
+    });
+    expect(written).toHaveLength(1);
+    expect(written[0]).toEndWith(`; ${NOT_APPLIED}\n`);
+    expect(written[0]).not.toContain("applied no Postgres changes");
   });
 
   test("a failure after the Postgres commit says the Postgres part succeeded", async () => {

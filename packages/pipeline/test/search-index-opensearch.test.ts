@@ -587,14 +587,26 @@ describe("opensearch adapter schema and dialects", () => {
         : call.method === "GET"
           ? root("opensearch")
           : call.url.endsWith("/_mapping")
-            ? json(mappingStatus, {})
+            ? json(mappingStatus, mappingBody)
             : exists.clone(),
     );
+    let mappingBody: unknown = {};
     const a = createOpenSearchSearchIndex({ url: BASE, fetch });
     await a.ensureSchema();
     expect(calls.map((c) => `${c.method} ${c.url}`).slice(-2)).toEqual([`PUT ${BASE}/${INDEX}/_mapping`, `GET ${SETTINGS_URL}`]);
     mappingStatus = 400;
+    // A 400 with evidence of a conflict is a mapping conflict...
+    mappingBody = { error: { type: "illegal_argument_exception", reason: "mapper [content_prefix_folded] cannot be changed from type [keyword] to [text]" } };
     await rejects(a.ensureSchema(), "schema_missing", "mapping_conflict");
+    mappingBody = { error: { root_cause: [{ type: "illegal_argument_exception", reason: "Mapper for [ts_ms] conflicts with existing mapper" }], type: "illegal_argument_exception", reason: "x" } };
+    await rejects(a.ensureSchema(), "schema_missing", "mapping_conflict");
+    // ...any other 400 is a rejected update, never called a conflict.
+    mappingBody = {};
+    await rejects(a.ensureSchema(), "schema_missing", "mapping_rejected:http_400");
+    mappingBody = { error: { type: "mapper_parsing_exception", reason: "No handler for type [flattened]" } };
+    await rejects(a.ensureSchema(), "schema_missing", "mapping_rejected:http_400:mapper_parsing_exception");
+    mappingBody = { error: { type: "illegal_argument_exception", reason: "unknown parameter [doc_values]" } };
+    await rejects(a.ensureSchema(), "schema_missing", "mapping_rejected:http_400:illegal_argument_exception");
   });
 
   it("verifies index.gc_deletes is zero on an existing index and never applies settings", async () => {
@@ -615,7 +627,10 @@ describe("opensearch adapter schema and dialects", () => {
       return result;
     };
     for (const zero of ["0s", "0", "0ms"]) expect(await run(zero), zero).toBe("ok");
-    for (const wrong of ["60s", "1s", "", undefined]) {
+    // Absent from the settings reply: not shown, so it cannot be verified as zero.
+    const unverified = await run(undefined);
+    expect([(unverified as SearchIndexError).code, (unverified as SearchIndexError).detail]).toEqual(["schema_mismatch", "gc_deletes_unverified"]);
+    for (const wrong of ["60s", "1s", ""]) {
       const e = await run(wrong);
       expect(e, String(wrong)).toBeInstanceOf(SearchIndexError);
       expect((e as SearchIndexError).code).toBe("schema_mismatch");
