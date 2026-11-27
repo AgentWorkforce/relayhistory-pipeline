@@ -5,6 +5,7 @@
  * at the only place a service writes a log line.
  */
 import { scrubTextForLog as scrubText } from "@rhc/lib/scrub-engine/index.ts";
+import { DB_ERROR_REASONS } from "./db-error-reason.ts";
 
 /** The analytics sink's operator counters (never analytics events themselves). */
 const ANALYTICS_COUNTER_FIELDS = [
@@ -71,6 +72,9 @@ export const ALLOWED_LOG_FIELDS = new Set([
   // ...and a 55000's closed refusal class (db-refusal-class.ts; DB_REFUSAL_VALUES, anything else dropped;
   // the mirror is pinned in src/session-ingest/__tests__/ingest-refusal-log.test.ts).
   "db_refusal",
+  // ...and a 40001's closed reason (db-error-reason.ts dbErrorReasonField: the exact SQL RAISE MESSAGE or Postgres
+  // serialization text mapped to a slug, else `other`; DB_ERROR_REASON_VALUES, anything else dropped). Never the message.
+  "db_error_reason",
   // The batch route's uploading client (src/session-ingest/client-agent.ts): closed values from the
   // User-Agent, never its text (CLIENT_KIND_VALUES, CLIENT_OS_VALUES, CLIENT_VERSION_SHAPE; mirrors pinned
   // in src/session-ingest/__tests__/ingest-refusal-log.test.ts).
@@ -209,6 +213,8 @@ export const REGEN_REASON_VALUES: ReadonlySet<string> = new Set([
 export const LOCK_RETRY_OUTCOME_VALUES: ReadonlySet<string> = new Set(["succeeded_after_retry", "exhausted", "not_retryable"]);
 /** `feed_query` mirrors buffered-search-feed.ts BUFFERED_FEED_QUERIES (pinned equal in buffered-search-feed.test.ts). */
 export const FEED_QUERY_VALUES: ReadonlySet<string> = new Set(["page", "stage", "advance"]);
+/** `db_error_reason`: exactly db-error-reason.ts DB_ERROR_REASONS (the 40001 slugs plus `other`). */
+export const DB_ERROR_REASON_VALUES: ReadonlySet<string> = new Set(DB_ERROR_REASONS);
 export const REGEN_SYSTEM_VALUES: ReadonlySet<string> = new Set(["bob_costas", "brief"]);
 const ENUM_FIELDS: ReadonlyMap<string, ReadonlySet<string>> = new Map([
   ["queue_origin", new Set(["s3", "requeue", "sweep"])],
@@ -219,6 +225,7 @@ const ENUM_FIELDS: ReadonlyMap<string, ReadonlySet<string>> = new Map([
   ["regeneration_reason", REGEN_REASON_VALUES], ["system", REGEN_SYSTEM_VALUES],
   ["db_error_detail", DB_ERROR_DETAIL_VALUES], ["db_client_phase", DB_CLIENT_PHASE_VALUES],
   ["lock_retry_outcome", LOCK_RETRY_OUTCOME_VALUES], ["feed_query", FEED_QUERY_VALUES],
+  ["db_error_reason", DB_ERROR_REASON_VALUES],
 ]);
 /** Shaped fields: emitted only when the string matches its pattern AND the scrubber leaves it unchanged (else
  * dropped). `client_version` is a release version (client-agent.ts CLIENT_VERSION, pinned equal in
