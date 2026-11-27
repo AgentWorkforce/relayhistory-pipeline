@@ -169,6 +169,18 @@ export interface IngestWorkerEnv {
   INGEST_LEDGER?: string;
   /** INGEST_S3_FENCE_MIRROR: off (default) | on. on: selection / reset also write the S3 upload fence (app.ts s3FenceMirror). */
   INGEST_S3_FENCE_MIRROR?: string;
+  /**
+   * INGEST_CONTROL_MIRROR_ROLE: off (default) | on (controlMirrorRoleFlag). on: selection and reset controls run over
+   * HYPERDRIVE_CONTROL_MIRROR (app.ts controlLedger). Needs INGEST_S3_FENCE_MIRROR=on and the binding.
+   */
+  INGEST_CONTROL_MIRROR_ROLE?: string;
+  /**
+   * Supabase transaction pooler as a login that is a member of the NOLOGIN role bulls96_session_ingest_mirror (and
+   * has bulls96_session_ingest's grants): the only connection a sealed org's controls are admitted on
+   * (docs/design/org-admission-hold.md section 6.3). Provisioning the role, the login and the membership is a gated
+   * operator step. Used only with INGEST_CONTROL_MIRROR_ROLE=on.
+   */
+  HYPERDRIVE_CONTROL_MIRROR?: { connectionString: string };
   /** Comma-separated org ids whose HTTP upload admission is stopped (http-admission-stop.ts). Unset: none. */
   INGEST_HTTP_ADMISSION_STOPPED_ORGS?: string;
   /** off (default) | allowlist | on (upload-admission.ts): the ?uploadKey= admission status only. */
@@ -352,6 +364,8 @@ export interface IngestSettings {
   s3FenceMirror?: true;
   /** INGEST_HTTP_ADMISSION_STOPPED_ORGS (http-admission-stop.ts). Absent (the default): no org is stopped. */
   httpAdmissionStoppedOrgs?: ReadonlySet<string>;
+  /** INGEST_CONTROL_MIRROR_ROLE=on, with s3FenceMirror and HYPERDRIVE_CONTROL_MIRROR. Absent (the default): off. */
+  controlMirrorRole?: true;
 }
 
 /** INGEST_S3_FENCE_MIRROR: unset, "" or "off" is off; "on" is on; anything else throws (a privacy control is never silently off). */
@@ -360,6 +374,22 @@ export function s3FenceMirrorFlag(raw: string | undefined): boolean {
   if (v === "" || v === "off") return false;
   if (v === "on") return true;
   throw new Error("session ingest: INGEST_S3_FENCE_MIRROR must be off or on");
+}
+
+/**
+ * INGEST_CONTROL_MIRROR_ROLE: unset, "" or "off" is off; "on" is on; anything else throws. It is read with the mirror
+ * it vouches for: on without INGEST_S3_FENCE_MIRROR=on, or without the HYPERDRIVE_CONTROL_MIRROR binding, throws too
+ * (every request 503 not_configured), never a silent fallback to the main connection or a mirror-role login that
+ * does not write the S3 fence. The binding alone (flag off) is never used.
+ */
+export function controlMirrorRoleFlag(raw: string | undefined, fenceMirror: boolean, binding: { connectionString: string } | undefined): boolean {
+  const v = (raw ?? "").trim();
+  if (v === "" || v === "off") return false;
+  if (v !== "on") throw new Error("session ingest: INGEST_CONTROL_MIRROR_ROLE must be off or on");
+  if (!fenceMirror) throw new Error("session ingest: INGEST_CONTROL_MIRROR_ROLE=on needs INGEST_S3_FENCE_MIRROR=on");
+  if (!binding || typeof binding.connectionString !== "string" || binding.connectionString === "")
+    throw new Error("session ingest: INGEST_CONTROL_MIRROR_ROLE=on needs the HYPERDRIVE_CONTROL_MIRROR binding");
+  return true;
 }
 
 /** The settings, or null while any required one is missing (every request is then 503 not_configured). */
@@ -404,6 +434,8 @@ export async function ingestSettings(env: IngestWorkerEnv): Promise<IngestSettin
   const uploadConsent = uploadConsentEnforcement(env.INGEST_UPLOAD_CONSENT);
   // A privacy control too: an invalid value is a loud configuration error, never off.
   const fenceMirror = s3FenceMirrorFlag(env.INGEST_S3_FENCE_MIRROR);
+  // The admission hold's mirror gate (app.ts controlLedger): fail closed, never a guess.
+  const controlMirrorRole = controlMirrorRoleFlag(env.INGEST_CONTROL_MIRROR_ROLE, fenceMirror, env.HYPERDRIVE_CONTROL_MIRROR);
   // The fence-authority precondition (decision 0005): a malformed stop list is a loud configuration error, never off.
   const stoppedOrgs = httpAdmissionStoppedOrgs(env.INGEST_HTTP_ADMISSION_STOPPED_ORGS);
   // Bounded buffered lock retry (deliver.ts withLockRetry): a budget the deadlines cannot hold refuses startup.
@@ -470,6 +502,7 @@ export async function ingestSettings(env: IngestWorkerEnv): Promise<IngestSettin
     ...(uploadConsent !== "off" ? { uploadConsent } : {}),
     ...(fenceMirror ? { s3FenceMirror: true as const } : {}),
     ...(stoppedOrgs ? { httpAdmissionStoppedOrgs: stoppedOrgs } : {}),
+    ...(controlMirrorRole ? { controlMirrorRole: true as const } : {}),
   };
 }
 
@@ -524,7 +557,7 @@ function custodyConfig(env: IngestWorkerEnv) {
 /** The deliver deps for one invocation (request or admission consumer): the same ledger, slots and target. */
 export function deliverDepsFor(settings: IngestSettings, run: Run, target: WriteTarget, replica?: ReplicaSink): DeliverDeps {
   return {
-    ledger: sqlLedger(run, {acceptanceMode:settings.acceptanceMode,expectedGeneration:settings.expectedGeneration,...(settings.acceptGenerations?{acceptGenerations:settings.acceptGenerations}:{}),...(settings.claimLockWaitMs!==undefined?{claimLockWaitMs:settings.claimLockWaitMs}:{}),...(settings.originClaimFence?{originClaimFence:true}:{})}),
+    ledger: settingsLedger(settings, run),
     acceptanceMode:settings.acceptanceMode,
     target,
     replica,
@@ -595,7 +628,18 @@ function inflightLeaseForIsolate(): InflightLease {
 /** Tests only: forget this isolate's lease map. */
 export function resetInflightLeaseForTests(): void { isolateInflightLease = undefined; }
 
-export function ingestApp(env: IngestWorkerEnv, settings: IngestSettings, run: Run, target: WriteTarget, analytics?: AnalyticsPort) {
+/**
+ * The SQL ledger for one connection, with the settings' options. `controlRun` (INGEST_CONTROL_MIRROR_ROLE=on): the
+ * mirror-role connection the selection and reset controls run on; required then, refused otherwise.
+ */
+function settingsLedger(settings: IngestSettings, run: Run) {
+  return sqlLedger(run, {acceptanceMode:settings.acceptanceMode,expectedGeneration:settings.expectedGeneration,...(settings.acceptGenerations?{acceptGenerations:settings.acceptGenerations}:{}),...(settings.claimLockWaitMs!==undefined?{claimLockWaitMs:settings.claimLockWaitMs}:{}),...(settings.originClaimFence?{originClaimFence:true}:{})});
+}
+
+export function ingestApp(env: IngestWorkerEnv, settings: IngestSettings, run: Run, target: WriteTarget, analytics?: AnalyticsPort, controlRun?: Run) {
+  // Fail closed: the mirror-role connection only with the mirror, and never the main connection in its place.
+  if (settings.controlMirrorRole && (!settings.s3FenceMirror || !controlRun)) throw new Error("session ingest: the control mirror role needs the S3 fence mirror and its connection");
+  if (!settings.controlMirrorRole && controlRun) throw new Error("session ingest: a control mirror connection without INGEST_CONTROL_MIRROR_ROLE=on");
   const replica: ReplicaSink | undefined = settings.replicaMode !== "off" && env.NEON_REPLICA
     ? {
         mode: settings.replicaMode,
@@ -640,6 +684,8 @@ export function ingestApp(env: IngestWorkerEnv, settings: IngestSettings, run: R
     // A reset is BEGUN only (one fence CAS), so it fits any subrequest budget however many sessions the user has;
     // the next S3-ledger claim for the user (or the reset's own retry elsewhere) finishes it (ledger-s3.ts finishResets).
     ...(settings.s3FenceMirror ? { s3FenceMirror: s3ControlMirror(target.store, target.keyRoot) } : {}),
+    // The admission hold's mirror gate: selection and reset on the mirror-role login, only beside the mirror above.
+    ...(settings.controlMirrorRole && settings.s3FenceMirror && controlRun ? { controlLedger: settingsLedger(settings, controlRun) } : {}),
   });
 }
 
@@ -765,11 +811,21 @@ export default {
       await connected;
       return (await client.query(text, params as unknown[])) as unknown as { rows: Record<string, unknown>[] };
     };
-    const app = ingestApp(env, settings, run, { store: store(settings), keyRoot: settings.keyRoot }, analyticsSelection.sink !== "noop" ? analytics : undefined);
+    // INGEST_CONTROL_MIRROR_ROLE=on: a second connection, as the mirror-role login, opened only by a control call.
+    const control = settings.controlMirrorRole ? new pg.Client({ connectionString: env.HYPERDRIVE_CONTROL_MIRROR!.connectionString }) : undefined;
+    control?.on("error", (err: Error) => log.error("session ingest db error", dbClientErrorFields(err, ending ? "ending" : "active")));
+    let controlConnected: Promise<void> | undefined;
+    const controlRun = control ? async (text: string, params: unknown[]) => {
+      controlConnected ??= control.connect();
+      await controlConnected;
+      return (await control.query(text, params as unknown[])) as unknown as { rows: Record<string, unknown>[] };
+    } : undefined;
+    const app = ingestApp(env, settings, run, { store: store(settings), keyRoot: settings.keyRoot }, analyticsSelection.sink !== "noop" ? analytics : undefined, controlRun);
     try {
       return await app.fetch(request);
     } finally {
       if (connected) { ending = true; ctx.waitUntil(client.end().catch(() => {})); }
+      if (control && controlConnected) { ending = true; ctx.waitUntil(control.end().catch(() => {})); }
       // Bounded and never rejecting; the response is already final.
       if (analyticsSelection.sink !== "noop") ctx.waitUntil(analytics.shutdown());
     }

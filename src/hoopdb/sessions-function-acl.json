@@ -901,6 +901,36 @@
       "<owner>:EXECUTE",
       "bulls96_session_ingest:EXECUTE"
     ],
+    "sessions.ingest_org_admission_hold_batch_backstop()": [
+      "<owner>:EXECUTE"
+    ],
+    "sessions.ingest_org_admission_hold_check(text,text)": [
+      "<owner>:EXECUTE"
+    ],
+    "sessions.ingest_org_admission_hold_guard()": [
+      "<owner>:EXECUTE"
+    ],
+    "sessions.ingest_org_admission_hold_install(text,uuid)": [
+      "<owner>:EXECUTE"
+    ],
+    "sessions.ingest_org_admission_hold_key(text)": [
+      "<owner>:EXECUTE"
+    ],
+    "sessions.ingest_org_admission_hold_lifecycle(text)": [
+      "<owner>:EXECUTE"
+    ],
+    "sessions.ingest_org_admission_hold_marker_attempt(text,uuid,text)": [
+      "<owner>:EXECUTE"
+    ],
+    "sessions.ingest_org_admission_hold_release(text,uuid,text,text,text,bigint)": [
+      "<owner>:EXECUTE"
+    ],
+    "sessions.ingest_org_admission_hold_seal(text,uuid,text)": [
+      "<owner>:EXECUTE"
+    ],
+    "sessions.ingest_org_admission_hold_status(text)": [
+      "<owner>:EXECUTE"
+    ],
     "sessions.ingest_origin_claim_buffered_batch(jsonb)": [
       "<owner>:EXECUTE",
       "bulls96_session_ingest:EXECUTE"

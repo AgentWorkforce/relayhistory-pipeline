@@ -49,7 +49,14 @@ const archiveObjects = async (pg: PGlite) => ({
   triggers: (await pg.query<{ t: string }>("SELECT tgname AS t FROM pg_trigger WHERE tgrelid = to_regclass('sessions.search_stage_archive') AND NOT tgisinternal ORDER BY tgname")).rows.map((r) => r.t),
 });
 const KEPT = { table: "sessions.search_stage_archive", index: "sessions.search_stage_archive_one_manifest", seal: "sessions.search_stage_archive_seal_v1()", triggers: ["search_stage_archive_seal", "search_stage_archive_seal_truncate"] };
-const down = async (pg: PGlite) => pg.exec(DOWN).then(() => null, async (e: { code?: string; message?: string }) => {
+// 20261105062320 (the per-org admission hold) sits above 062300 and its down refuses while it is applied: roll it back
+// first (it has no hold installed here), so 062300 is newest whenever its own down is exercised.
+const HOLD_DOWN = readFileSync(join(import.meta.dir, "../../../supabase/rollbacks/20261105062320_ingest_org_admission_fences.down.sql"), "utf8");
+const holdOff = async (pg: PGlite) => {
+  const applied = (await pg.query<{ n: number }>("SELECT count(*)::int AS n FROM sessions.__96bulls_migrations WHERE name = 'upstream:20261105062320_ingest_org_admission_fences.sql'")).rows[0]!.n;
+  if (applied) await pg.exec(HOLD_DOWN);
+};
+const down = async (pg: PGlite) => holdOff(pg).then(() => pg.exec(DOWN)).then(() => null, async (e: { code?: string; message?: string }) => {
   await pg.exec("ROLLBACK").catch(() => {});
   return { code: e.code, message: String(e.message) };
 });

@@ -179,6 +179,21 @@ export const RETAINED_BY_ROLLBACK: Readonly<Record<string, readonly string[]>> =
     "trigger:search_stage_archive_seal@sessions.search_stage_archive",
     "trigger:search_stage_archive_seal_truncate@sessions.search_stage_archive",
   ],
+  // 20261105062320 (docs/design/org-admission-hold.md section 6): the hold history and its immutability guard are kept
+  // by the down as inert history; its sentinel is the check function and the batch backstop trigger, which it drops.
+  "upstream:20261105062320_ingest_org_admission_fences.sql": [
+    "relation:sessions.ingest_org_admission_holds",
+    "relation:sessions.ingest_org_admission_hold_events",
+    "index:ingest_org_admission_holds_pkey",
+    "index:ingest_org_admission_holds_request_id_key",
+    "index:ingest_org_admission_holds_live",
+    "index:ingest_org_admission_hold_events_pkey",
+    "function:sessions.ingest_org_admission_hold_guard",
+    "trigger:ingest_org_admission_holds_guard@sessions.ingest_org_admission_holds",
+    "trigger:ingest_org_admission_holds_truncate@sessions.ingest_org_admission_holds",
+    "trigger:ingest_org_admission_hold_events_guard@sessions.ingest_org_admission_hold_events",
+    "trigger:ingest_org_admission_hold_events_truncate@sessions.ingest_org_admission_hold_events",
+  ],
 };
 
 /** How an ADOPTABLE_INDEXES step is prebuilt, and what else its CREATE inventory names. */
@@ -667,6 +682,10 @@ export const MIGRATION_SENTINELS: Record<string, Sentinel> = {
   "upstream:20261105062300_search_index_stage.sql": {
     evidence: "table sessions.search_catchup_cursor and function sessions.archive_search_stage_v1() (the search-index stage)",
     sql: "SELECT to_regclass('sessions.search_catchup_cursor') IS NOT NULL AND to_regprocedure('sessions.archive_search_stage_v1()') IS NOT NULL AS applied",
+  },
+  "upstream:20261105062320_ingest_org_admission_fences.sql": {
+    evidence: "function sessions.ingest_org_admission_hold_check(text,text) and the batch backstop trigger on sessions.ingest_batches (the per-org admission hold)",
+    sql: "SELECT to_regprocedure('sessions.ingest_org_admission_hold_check(text,text)') IS NOT NULL AND EXISTS(SELECT 1 FROM pg_trigger WHERE tgrelid=to_regclass('sessions.ingest_batches') AND tgname='ingest_org_admission_hold_batch_backstop' AND NOT tgisinternal) AS applied",
   },
   "upstream:20261105062070_coordination_advisor_readers.sql": {
     evidence: "functions sessions.coordination_advisor_write_facts_v1 and sessions.coordination_advisories_recent_v1",
