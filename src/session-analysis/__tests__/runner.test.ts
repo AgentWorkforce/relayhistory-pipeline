@@ -25,7 +25,7 @@ import {
   type RunnerHealthState,
 } from "../runner.ts";
 import { lambdaAnalysisDeps } from "../../session-pipeline/lambda.ts";
-import { analysisTick } from "../worker.ts";
+import { analysisConfig, analysisTick } from "../worker.ts";
 import type { HoopDb } from "../../shared/db.ts";
 import type { ObjectStore } from "../../../packages/object-store/src/index.ts";
 import type { S3EraserConfig, PagedEraser } from "../../migration/neon-s3-erasure/eraser.ts";
@@ -113,8 +113,13 @@ test("every malformed setting refuses with a code (no silent default)", () => {
   for (const [extra, want] of cases) expect([extra, code(() => analysisRunnerConfig(baseEnv(extra)))]).toEqual([extra, want]);
 });
 
+test("workspace configuration refuses blank, wildcard, lists and padding before a tick", () => {
+  for (const value of ["", " ", "*", "a,b", " 00000000-0000-4000-8000-000000000001"]) {
+    expect(() => analysisRunnerConfig(baseEnv({ SESSION_ANALYSIS_WORKSPACE_ID: value }))).toThrow("analysis_workspace_invalid");
+  }
+});
+
 test("BATCH, TICK_MS and POOL_MAX are trimmed like the port, and BATCH is what analysisConfig runs", async () => {
-  const { analysisConfig } = await import("../worker.ts");
   for (const raw of ["1", " 7 ", "20", "\t12"]) {
     const env = baseEnv({ SESSION_ANALYSIS_BATCH: raw });
     expect(analysisRunnerConfig(env).batch).toBe(analysisConfig(env).batch);
@@ -257,6 +262,20 @@ test("analysisTick claims no job once `stopping` is true; absent (the Lambda), i
   expect(lambda.counts.idle).toBe(1);
 });
 
+test("a normal tick binds its workspace to the sweep, then the job claim", async () => {
+  const workspaceId = "aaaaaaaa-0000-4000-8000-000000000001";
+  const bindings: unknown[][] = [];
+  const db = { async query(_sql: string, params: unknown[] = []) { bindings.push(params); return { rows: [] }; } };
+  const tick = analysisTick({
+    config: analysisConfig(baseEnv({ SESSION_ANALYSIS_WORKSPACE_ID: workspaceId })),
+    db, transact: (work) => work(db), store: {} as ObjectStore,
+    eraser: { eraseStep: async () => { throw new Error("unexpected erase"); }, verifyErased: async () => { throw new Error("unexpected verify"); } },
+    canonical: {} as never, transport: { complete: async () => { throw new Error("unexpected model call"); } },
+  });
+  expect(await tick()).toMatchObject({ swept: 0, idle: 1 });
+  expect(bindings.map((params) => params.at(-1))).toEqual([workspaceId, workspaceId]);
+});
+
 // ---- the service ------------------------------------------------------------------------------
 
 async function get(port: number, path: string) {
@@ -359,7 +378,7 @@ const fakeDb = (): HoopDb => ({ pool: {} as never, query: async () => ({ rows: [
 test("deps parity: the runner and the Lambda build identical analysisTick deps from one builder", async () => {
   const saved = { ...process.env };
   try {
-    for (const flags of [{}, { SUMMARY_DECISION_RECORDS_ENABLED: "true", SESSION_ANALYSIS_BATCH: "5", SESSION_ANALYSIS_ASSUME_NO_LEGACY_TURNS: "true" }]) {
+    for (const flags of [{}, { SESSION_ANALYSIS_WORKSPACE_ID: "AAAAAAAA-0000-4000-8000-000000000001", SUMMARY_DECISION_RECORDS_ENABLED: "true", SESSION_ANALYSIS_BATCH: "5", SESSION_ANALYSIS_ASSUME_NO_LEGACY_TURNS: "true" }]) {
       // The Lambda reads process.env; the runner is handed the same env.
       const env = baseEnv({ ...flags, READER_MAX_RULESET: "9", SESSION_ANALYSIS_S3_CREDENTIALS: "role", AWS_ACCESS_KEY_ID: "AKIDROLE", AWS_SECRET_ACCESS_KEY: AWS_SECRET });
       for (const k of Object.keys(process.env)) if (k.startsWith("SESSION_ANALYSIS_") || k === "SUMMARY_DECISION_RECORDS_ENABLED") delete process.env[k];
@@ -376,6 +395,7 @@ test("deps parity: the runner and the Lambda build identical analysisTick deps f
       const lambda = lambdaAnalysisDeps({ bucket: cfg.bucket, region: cfg.region, keyPrefix: cfg.keyPrefix, readerMaxRuleset: cfg.readerMaxRuleset }, db, store, MODEL_KEY, { eraserFactory: factory("lambda") });
       expect(Object.keys(runner).sort()).toEqual(Object.keys(lambda).sort());
       expect(runner.config).toEqual(lambda.config);
+      expect(runner.config.workspaceId).toBe(flags.SESSION_ANALYSIS_WORKSPACE_ID?.toLowerCase());
       expect(runner.db).toBe(lambda.db);
       expect(runner.store).toBe(lambda.store);
       const { decompress: rd, ...rc } = runner.canonical;

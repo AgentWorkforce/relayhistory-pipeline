@@ -171,13 +171,14 @@ const COMMON_PROFILE = {
  * The tracked profile carries overlapGeneration H and expectedGeneration stays G; deploy G+H, then
  * open the window, apply, rebind G -> H. The pair returns to null after the H-only deploy reads back
  * exactly H.
- *
- * For 062300 the policy and readiness marker were observed at 778af686 with no open window.
- * Verify the live Worker profile separately before opening the 062300 overlap.
+ * Done: the G+H deploy, the guarded apply through 062220 and rebind run 45547604573 (2026-11-25
+ * 04:33:35Z) moved the policy and all admission rows to H. This is lifecycle step (2) (step 6 of the
+ * required order): deploy H-only at the same baseline phase while retaining the pair solely to authorize
+ * the G+H -> H transition; step (3) sets it to null after the live Worker reads back exactly H.
  */
 export const PRIVATE_INGEST_OVERLAP: PrivateIngestOverlap | null = {
-  from: "778af6866b9b28b64ff5af46bc59b1d6c7de4b43e24302bf64321b222cdf23df",
-  to: "f31d73e2a286e712175fa8d4417f07895702012f80c1b3ff88a210381418e44a",
+  from: "3eef01d763c3a724d5a8f46f552fe50773e65d5a7a15cce7500f6ddd9d37904c",
+  to: "778af6866b9b28b64ff5af46bc59b1d6c7de4b43e24302bf64321b222cdf23df",
 };
 
 export const PRIVATE_INGEST_GENERATION_CONTRACT: PrivateIngestGenerationContract = {
@@ -223,6 +224,10 @@ function overlapShape(profile: Record<string, unknown>): string | undefined {
  *                             incident: a deploy may add or change both, like the other cutover controls, so
  *                             they live here and not in COMMON_PROFILE (a COMMON_PROFILE change can never match the
  *                             live version it replaces, private_ingest_live_phase).
+ *   lockRetryBudgetMs         an integer 5050..10000 (omit for off): INGEST_LOCK_RETRY_BUDGET_MS, the per-delivery
+ *                             budget of the bounded buffered lock retry (deliver.ts withLockRetry; the range is
+ *                             deliver.ts LOCK_RETRY_BUDGET_MS_MIN..MAX, the Worker's startup refusal rule). Like
+ *                             claimLockWaitMs it has no operator unbind: removing it refuses native_binding_target.
  *   originClaimFence          "on" only (omit for off): INGEST_ORIGIN_CLAIM_FENCE, buffered claim/stage/commit through
  *                             the 20261105062010 origin-scoped entry points (docs/design/per-origin-claim-fence.md).
  *   turnFenceRegister         "on" only (omit for off): INGEST_TURN_FENCE_REGISTER, exact-session privacy
@@ -237,14 +242,14 @@ function overlapShape(profile: Record<string, unknown>): string | undefined {
  * Removing a rendered cutover var is a binding deletion in the plan, which the operator admits only through its
  * reviewed delete allowlist (scripts/private-ingest-operator.ts). Of these controls that covers bufferLockBusy,
  * advertisedMaxRecords and inflightLease, each under its own conditions; every other one (bufferLockRetry,
- * claimTimeoutBusy and claimLockWaitMs included) refuses native_binding_target when removed.
+ * claimTimeoutBusy, claimLockWaitMs and lockRetryBudgetMs included) refuses native_binding_target when removed.
  * These controls are never tracked in config/cloudflare/private-ingest-production.json (public repository): CI supplies them
  * from the protected environment's variables (privateIngestCutoverFromEnv), as it supplies kmsKeyArn.
  */
-export const PRIVATE_INGEST_CUTOVER_KEYS = ["s3FenceMirror", "httpAdmissionStoppedOrgs", "claimTimeoutBusy", "bufferLockBusy", "bufferLockRetry", "claimLockWaitMs", "originClaimFence", "turnFenceRegister", "advertisedMaxRecords", "inflightLease"] as const;
+export const PRIVATE_INGEST_CUTOVER_KEYS = ["s3FenceMirror", "httpAdmissionStoppedOrgs", "claimTimeoutBusy", "bufferLockBusy", "bufferLockRetry", "claimLockWaitMs", "lockRetryBudgetMs", "originClaimFence", "turnFenceRegister", "advertisedMaxRecords", "inflightLease"] as const;
 export type PrivateIngestCutover = {
   s3FenceMirror?: "on"; httpAdmissionStoppedOrgs?: string[]; claimTimeoutBusy?: "on"; bufferLockBusy?: "on"; bufferLockRetry?: "on";
-  claimLockWaitMs?: number; originClaimFence?: "on"; turnFenceRegister?: "on"; advertisedMaxRecords?: number;
+  claimLockWaitMs?: number; lockRetryBudgetMs?: number; originClaimFence?: "on"; turnFenceRegister?: "on"; advertisedMaxRecords?: number;
   inflightLease?: "observe" | "on";
 };
 const inflightLeaseOk = (v: unknown): v is "observe" | "on" => v === "observe" || v === "on";
@@ -253,12 +258,17 @@ const advertisedOk = (n: unknown): n is number => typeof n === "number" && Numbe
 const CLAIM_LOCK_WAIT_DIGITS = /^[0-9]{2,4}$/u;
 const claimLockWaitOk = (ms: unknown): ms is number =>
   typeof ms === "number" && Number.isSafeInteger(ms) && ms >= 25 && ms <= 2000;
+/** INGEST_LOCK_RETRY_BUDGET_MS: the Worker's admitted range (deliver.ts LOCK_RETRY_BUDGET_MS_MIN / _MAX, pinned equal in tests). */
+export const LOCK_RETRY_BUDGET_RANGE = Object.freeze({ min: 5_050, max: 10_000 });
+const LOCK_RETRY_BUDGET_DIGITS = /^[1-9][0-9]{3,4}$/u;
+const lockRetryBudgetOk = (ms: unknown): ms is number =>
+  typeof ms === "number" && Number.isSafeInteger(ms) && ms >= LOCK_RETRY_BUDGET_RANGE.min && ms <= LOCK_RETRY_BUDGET_RANGE.max;
 const STOPPED_ORG = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/u;
 
 function checkedCutover(profile: Record<string, unknown>, live = false): PrivateIngestCutover {
   const mirror = profile.s3FenceMirror, orgs = profile.httpAdmissionStoppedOrgs;
   const timeoutBusy = profile.claimTimeoutBusy, lockWait = profile.claimLockWaitMs, originFence = profile.originClaimFence;
-  const turnFenceRegister = profile.turnFenceRegister;
+  const turnFenceRegister = profile.turnFenceRegister, retryBudget = profile.lockRetryBudgetMs;
   const bufferBusy = profile.bufferLockBusy, bufferRetry = profile.bufferLockRetry;
   const advertised = profile.advertisedMaxRecords;
   const inflight = profile.inflightLease;
@@ -276,6 +286,8 @@ function checkedCutover(profile: Record<string, unknown>, live = false): Private
     privateIngestRefuse(live ? "private_ingest_live_cutover" : "private_ingest_profile_buffer_lock_retry");
   if (lockWait !== undefined && !claimLockWaitOk(lockWait))
     privateIngestRefuse(live ? "private_ingest_live_cutover" : "private_ingest_profile_claim_lock_wait");
+  if (retryBudget !== undefined && !lockRetryBudgetOk(retryBudget))
+    privateIngestRefuse(live ? "private_ingest_live_cutover" : "private_ingest_profile_lock_retry_budget");
   if (originFence !== undefined && originFence !== "on")
     privateIngestRefuse(live ? "private_ingest_live_cutover" : "private_ingest_profile_origin_claim_fence");
   if (turnFenceRegister !== undefined && turnFenceRegister !== "on")
@@ -290,6 +302,7 @@ function checkedCutover(profile: Record<string, unknown>, live = false): Private
     ...(bufferBusy === "on" ? { bufferLockBusy: "on" as const } : {}),
     ...(bufferRetry === "on" ? { bufferLockRetry: "on" as const } : {}),
     ...(lockWait === undefined ? {} : { claimLockWaitMs: lockWait as number }),
+    ...(retryBudget === undefined ? {} : { lockRetryBudgetMs: retryBudget as number }),
     ...(originFence === "on" ? { originClaimFence: "on" as const } : {}),
     ...(turnFenceRegister === "on" ? { turnFenceRegister: "on" as const } : {}),
     ...(advertised === undefined ? {} : { advertisedMaxRecords: advertised as number }),
@@ -307,6 +320,8 @@ function checkedCutover(profile: Record<string, unknown>, live = false): Private
  *   PRIVATE_INGEST_BUFFER_LOCK_RETRY           "on" or unset/empty; anything else refuses.
  *   PRIVATE_INGEST_CLAIM_LOCK_WAIT_MS          decimal digits, 25..2000, or unset/empty; signs, spaces, exponents,
  *                                              hex and fractions refuse.
+ *   PRIVATE_INGEST_LOCK_RETRY_BUDGET_MS        decimal digits, 5050..10000, or unset/empty (off); "0", signs, spaces,
+ *                                              exponents, hex, leading zeros and fractions refuse.
  *   PRIVATE_INGEST_ORIGIN_CLAIM_FENCE          "on" or unset/empty; anything else refuses.
  *   PRIVATE_INGEST_TURN_FENCE_REGISTER         "on" or unset/empty; anything else refuses.
  *   PRIVATE_INGEST_ADVERTISED_MAX_RECORDS      decimal digits 1..500 (no sign, leading zero, space or fraction), or
@@ -323,6 +338,8 @@ export function privateIngestCutoverFromEnv(env: Record<string, string | undefin
   if (bufferBusy !== "" && bufferBusy !== "on") privateIngestRefuse("private_ingest_profile_buffer_lock_busy");
   if (bufferRetry !== "" && bufferRetry !== "on") privateIngestRefuse("private_ingest_profile_buffer_lock_retry");
   if (lockWait !== "" && !CLAIM_LOCK_WAIT_DIGITS.test(lockWait)) privateIngestRefuse("private_ingest_profile_claim_lock_wait");
+  const retryBudget = env.PRIVATE_INGEST_LOCK_RETRY_BUDGET_MS ?? "";
+  if (retryBudget !== "" && !LOCK_RETRY_BUDGET_DIGITS.test(retryBudget)) privateIngestRefuse("private_ingest_profile_lock_retry_budget");
   const originFence = env.PRIVATE_INGEST_ORIGIN_CLAIM_FENCE ?? "";
   const turnFenceRegister = env.PRIVATE_INGEST_TURN_FENCE_REGISTER ?? "";
   if (originFence !== "" && originFence !== "on") privateIngestRefuse("private_ingest_profile_origin_claim_fence");
@@ -338,6 +355,7 @@ export function privateIngestCutoverFromEnv(env: Record<string, string | undefin
     ...(bufferBusy === "on" ? { bufferLockBusy: "on" } : {}),
     ...(bufferRetry === "on" ? { bufferLockRetry: "on" } : {}),
     ...(lockWait === "" ? {} : { claimLockWaitMs: Number(lockWait) }),
+    ...(retryBudget === "" ? {} : { lockRetryBudgetMs: Number(retryBudget) }),
     ...(originFence === "on" ? { originClaimFence: "on" } : {}),
     ...(turnFenceRegister === "on" ? { turnFenceRegister: "on" } : {}),
     ...(advertised === "" ? {} : { advertisedMaxRecords: Number(advertised) }),
@@ -359,11 +377,13 @@ function liveCutover(version: CloudflareWorkerVersion): PrivateIngestCutover {
   const timeoutBusy = text("INGEST_CLAIM_TIMEOUT_BUSY"), lockWait = text("INGEST_CLAIM_LOCK_WAIT_MS");
   const bufferBusy = text("INGEST_BUFFER_LOCK_BUSY"), bufferRetry = text("INGEST_BUFFER_LOCK_RETRY");
   const originFence = text("INGEST_ORIGIN_CLAIM_FENCE");
+  const retryBudget = text("INGEST_LOCK_RETRY_BUDGET_MS");
   const turnFenceRegister = text("INGEST_TURN_FENCE_REGISTER");
   const advertised = text("INGEST_ADVERTISED_MAX_RECORDS");
   const inflight = text("INGEST_INFLIGHT_LEASE");
   if (lockWait !== undefined && !CLAIM_LOCK_WAIT_DIGITS.test(lockWait)) privateIngestRefuse("private_ingest_live_cutover");
   if (advertised !== undefined && !ADVERTISED_DIGITS.test(advertised)) privateIngestRefuse("private_ingest_live_cutover");
+  if (retryBudget !== undefined && !LOCK_RETRY_BUDGET_DIGITS.test(retryBudget)) privateIngestRefuse("private_ingest_live_cutover");
   return checkedCutover({
     ...(mirror === undefined ? {} : { s3FenceMirror: mirror }),
     ...(orgs === undefined ? {} : { httpAdmissionStoppedOrgs: orgs.split(",") }),
@@ -371,6 +391,7 @@ function liveCutover(version: CloudflareWorkerVersion): PrivateIngestCutover {
     ...(bufferBusy === undefined ? {} : { bufferLockBusy: bufferBusy }),
     ...(bufferRetry === undefined ? {} : { bufferLockRetry: bufferRetry }),
     ...(lockWait === undefined ? {} : { claimLockWaitMs: Number(lockWait) }),
+    ...(retryBudget === undefined ? {} : { lockRetryBudgetMs: Number(retryBudget) }),
     ...(originFence === undefined ? {} : { originClaimFence: originFence }),
     ...(turnFenceRegister === undefined ? {} : { turnFenceRegister }),
     ...(advertised === undefined ? {} : { advertisedMaxRecords: Number(advertised) }),

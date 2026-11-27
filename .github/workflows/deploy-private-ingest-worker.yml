@@ -88,6 +88,8 @@ jobs:
       # 2026-11-16 claim lock controls (deliver.ts / ledger-sql.ts). Unset or empty = off / role default.
       PRIVATE_INGEST_CLAIM_TIMEOUT_BUSY: ${{ vars.PRIVATE_INGEST_CLAIM_TIMEOUT_BUSY }}
       PRIVATE_INGEST_CLAIM_LOCK_WAIT_MS: ${{ vars.PRIVATE_INGEST_CLAIM_LOCK_WAIT_MS }}
+      # Bounded buffered lock retry budget (deliver.ts withLockRetry): 5050..10000 ms. Unset or empty = off.
+      PRIVATE_INGEST_LOCK_RETRY_BUDGET_MS: ${{ vars.PRIVATE_INGEST_LOCK_RETRY_BUDGET_MS }}
       # Buffer-stage lock controls (deliver.ts BufferLockBusy / bufferLedgerStage). Unset or empty = off.
       PRIVATE_INGEST_BUFFER_LOCK_BUSY: ${{ vars.PRIVATE_INGEST_BUFFER_LOCK_BUSY }}
       PRIVATE_INGEST_BUFFER_LOCK_RETRY: ${{ vars.PRIVATE_INGEST_BUFFER_LOCK_RETRY }}
