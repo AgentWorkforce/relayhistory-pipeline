@@ -24,9 +24,11 @@
  *                    proves the reader sees every row of the three tables (SELECT and no RLS filtering, in the same
  *                    role, statement and snapshot as the counts). No ingest_batches row claimed or committed, and no
  *                    ingest_record_revisions row updated, at or after the effective stop minus a clock-skew margin; no
- *                    pending batch; no row of the org in any of the three tables written after the base snapshot
- *                    (xmin not visible in it: round 1's own snapshot for round 2, the bound baseline's for both); counts
- *                    and digests equal across rounds and to the baseline.
+ *                    pending batch; no row of the org in any of the three tables possibly written after the base
+ *                    snapshot (xmin at or above its xmin: round 1's own snapshot for round 2, the bound baseline's for
+ *                    both); counts and digests equal across rounds and to the baseline. And no ingest_batches row
+ *                    deleted since the reference (the table's n_tup_del, read AUTHORITY_STATS_SETTLE_MS after round 2),
+ *                    so an admission inserted and deleted between reads cannot vanish (AUTHORITY_STATS_SQL).
  *   5. turnsNeon     every traffic-serving version of relayhistory-api resolves the org's turns write path to `neon`
  *                    with relayhistory-cloud's resolver (packages/relayhistory/src/lib/turns-forward.ts
  *                    turnsWritePath, mirrored exactly by resolveTurnsWritePath). An absent binding on a verified
@@ -43,6 +45,10 @@
  * (after the stop and the drain) -> backfills with authorityBaseline in their snapshot -> bound run -> marker.
  * Authenticating the baseline's issuer and run, its exact revision and scope, and the backfill's ordering and
  * freshness is the caller's gate, as for every other bound backlog-ops receipt.
+ *
+ * Marker handoff: authorityMarkerAllowed(report, org, now) immediately before each marker write; a pass authorises
+ * for AUTHORITY_MARKER_MAX_AGE_MS only. Every Cloudflare read takes the whole API body (success checked; the queue
+ * list's result_info proves it is one complete page).
  *
  * Nothing here comes from an input except the org list (the caller's BACKLOG_OPS_ORGS scope, validated) and the bound
  * baseline (a receipt the caller's gate binds, as backlog-ops binds every other run). The module is pure: it builds every
@@ -83,6 +89,13 @@ export const AUTHORITY_MIN_OBSERVATION_WINDOW_MS = 30_000;
  * looser: a claim up to this long before the stop also refuses.
  */
 export const AUTHORITY_CLOCK_SKEW_MS = 60_000;
+/**
+ * The wait after round 2 before the deletion counter is read: PostgreSQL (15+) flushes a backend's pending table
+ * statistics at least every PGSTAT_MAX_INTERVAL (60 s), so a delete committed before round 2 is counted by then.
+ */
+export const AUTHORITY_STATS_SETTLE_MS = 61_000;
+/** A pass authorises a marker write for at most this long after the report finished (authorityMarkerAllowed). */
+export const AUTHORITY_MARKER_MAX_AGE_MS = 5 * 60_000;
 /** The most orgs one evidence run evaluates (backlog-ops BACKLOG_OPS_MAX_ORGS). */
 export const AUTHORITY_MAX_ORGS = 64;
 /** Queues listed per page; a full page means the list may be truncated, which refuses. */
@@ -97,7 +110,8 @@ export const AUTHORITY_REFUSALS = [
   "queue_consumer_mismatch", "queue_producer_mismatch", "queue_route_changed", "queue_inventory_incomplete", "queue_metrics_unreadable", "queue_backlog_nonzero",
   "dlq_unreadable", "dlq_consumer_attached", "dlq_backlog_decreased", "observation_window_short",
   // sql
-  "sql_no_stop_anchor", "sql_unreadable", "sql_rows_not_visible", "sql_not_read_only", "sql_rows_rewritten", "baseline_not_snapshot", "sql_batches_claimed_after_stop",
+  "sql_no_stop_anchor", "sql_unreadable", "sql_rows_not_visible", "sql_not_read_only", "sql_rows_rewritten", "baseline_not_snapshot",
+  "sql_stats_unreadable", "sql_stats_reset", "sql_batches_deleted", "sql_batches_claimed_after_stop",
   "sql_batches_committed_after_stop", "sql_batches_pending", "sql_revisions_after_stop", "sql_revisions_changed",
   "sql_ownership_changed", "sql_unbound", "bound_invalid", "bound_not_ready", "bound_stop_mismatch",
   // turns (relayhistory-api)
@@ -110,7 +124,10 @@ export type AuthorityRefusal = (typeof AUTHORITY_REFUSALS)[number];
 export const AUTHORITY_INPUT_REFUSALS = ["authority_orgs", "authority_window"] as const;
 
 export interface AuthorityEvidenceSources {
-  /** GET https://api.cloudflare.com/client/v4/accounts/<AUTHORITY_EVIDENCE.accountId><path>; resolves the body's `result`. */
+  /**
+   * GET https://api.cloudflare.com/client/v4/accounts/<AUTHORITY_EVIDENCE.accountId><path>; resolves the WHOLE parsed
+   * JSON body ({success, result, result_info?, ...}). The module checks success and reads result_info (pagination).
+   */
   cfGet(path: string): Promise<unknown>;
   /** One read-only statement (the caller's READ ONLY transaction, the backlog-ops dry role); resolves its rows. */
   sql(text: string, params: readonly (string | null)[]): Promise<readonly Record<string, unknown>[]>;
@@ -175,6 +192,15 @@ export interface AuthorityEvidenceReport {
 }
 
 // ---------------------------------------------------------------------------------------------------------------
+
+/** The API body's `result` when success is exactly true; otherwise the read refuses with `code`. */
+function resultOf(body: unknown, code: AuthorityRefusal): unknown {
+  if (!isObj(body) || body.success !== true || !("result" in body)) refuse(code);
+  return (body as Record<string, unknown>).result;
+}
+/** cfGet, unwrapped: any transport failure or unsuccessful body becomes `code`. */
+const cfResult = (src: AuthorityEvidenceSources, path: string, code: AuthorityRefusal) =>
+  read(code, async () => resultOf(await src.cfGet(path), code));
 
 class Refused extends Error {
   constructor(readonly code: AuthorityRefusal) { super(code); }
@@ -261,7 +287,7 @@ function versionReader(src: AuthorityEvidenceSources, worker: string, code: Auth
   return (id: string) => {
     let p = cache.get(id);
     if (!p) {
-      p = read(code, async () => verifiedVersion(await src.cfGet(versionPath(worker, id)), id, code));
+      p = read(code, async () => verifiedVersion(await cfResult(src, versionPath(worker, id), code), id, code));
       cache.set(id, p);
     }
     return p;
@@ -390,11 +416,20 @@ interface QueueIds { main: string; dlq: string }
 interface QueueRead { ids: QueueIds; backlog: number; dlqBacklog: number; dlqConsumers: number }
 type QueueRoutingCode = "queue_consumer_mismatch" | "queue_producer_mismatch" | "queue_route_changed" | "queue_inventory_incomplete" | null;
 
-/** A queue object's consumers and producers, complete (arrays equal to their provider totals), or null. */
+/**
+ * A queue object's consumers and producers, complete (arrays equal to their provider totals) and every identity
+ * readable (a Worker consumer names its script_name, an HTTP pull consumer is a pull; a Worker producer names its
+ * script, an R2 producer its bucket_name), or null: an identity that cannot be read can never be excluded.
+ */
 function inventory(q: Record<string, unknown>): { consumers: unknown[]; producers: unknown[] } | null {
   const { consumers, producers } = q;
   if (!Array.isArray(consumers) || !Array.isArray(producers) || count(q.consumers_total_count) !== consumers.length ||
       count(q.producers_total_count) !== producers.length) return null;
+  const consumerOk = (c: unknown) => isObj(c) && ((c.type === "worker" && typeof c.script_name === "string" && c.script_name !== "") ||
+    c.type === "http_pull");
+  const producerOk = (p: unknown) => isObj(p) && ((p.type === "worker" && typeof p.script === "string" && p.script !== "") ||
+    (p.type === "r2_bucket" && typeof p.bucket_name === "string" && p.bucket_name !== ""));
+  if (!consumers.every(consumerOk) || !producers.every(producerOk)) return null;
   return { consumers, producers };
 }
 const isIngestConsumer = (c: unknown): boolean =>
@@ -408,10 +443,15 @@ const isIngestProducer = (p: unknown): boolean =>
  * messages cannot be waiting on a former route (queue_route_changed).
  */
 async function queueList(src: AuthorityEvidenceSources): Promise<{ ids: QueueIds; route: QueueRoutingCode }> {
-  const list = await read("queue_list_unreadable", () => src.cfGet(`/queues?page=1&per_page=${AUTHORITY_QUEUE_PAGE}`));
+  const body = await read("queue_list_unreadable", () => src.cfGet(`/queues?page=1&per_page=${AUTHORITY_QUEUE_PAGE}`));
+  const list = resultOf(body, "queue_list_unreadable");
   if (!Array.isArray(list)) refuse("queue_list_unreadable");
   const rows = list as unknown[];
-  if (rows.length >= AUTHORITY_QUEUE_PAGE) refuse("queue_list_truncated");
+  // Complete only when the provider's own pagination says this one page is everything (result_info).
+  const info = (body as Record<string, unknown>).result_info;
+  if (rows.length >= AUTHORITY_QUEUE_PAGE || !isObj(info) || count(info.total_count) !== rows.length ||
+      (info.total_pages !== undefined && info.total_pages !== 1 && !(rows.length === 0 && info.total_pages === 0)) ||
+      (info.page !== undefined && info.page !== 1)) refuse("queue_list_truncated");
   if (!rows.every((q) => isObj(q) && typeof q.queue_name === "string")) refuse("queue_list_unreadable");
   const find = (name: string) => {
     const hits = rows.filter((q) => (q as Record<string, unknown>).queue_name === name);
@@ -433,14 +473,14 @@ async function queueList(src: AuthorityEvidenceSources): Promise<{ ids: QueueIds
 
 /** GET /queues/<id>/metrics: `backlog_count` must be a non-negative integer. */
 async function backlog(src: AuthorityEvidenceSources, id: string, code: AuthorityRefusal): Promise<number> {
-  const m = await read(code, () => src.cfGet(`/queues/${id}/metrics`));
+  const m = await cfResult(src, `/queues/${id}/metrics`, code);
   const n = isObj(m) ? count(m.backlog_count) : null;
   return n === null ? refuse(code) : n;
 }
 
 /** GET /queues/<main>: exactly one consumer, the ingest Worker dead-lettering to the measured DLQ; producers all the Worker. */
 async function queueRouting(src: AuthorityEvidenceSources, ids: QueueIds): Promise<QueueRoutingCode> {
-  const q = await read("queue_list_unreadable", () => src.cfGet(`/queues/${ids.main}`));
+  const q = await cfResult(src, `/queues/${ids.main}`, "queue_list_unreadable");
   if (!isObj(q) || q.queue_id !== ids.main || q.queue_name !== AUTHORITY_EVIDENCE.admissionQueue) refuse("queue_list_unreadable");
   const inv = inventory(q as Record<string, unknown>);
   if (!inv) return "queue_inventory_incomplete";
@@ -455,7 +495,7 @@ async function queueRead(src: AuthorityEvidenceSources): Promise<{ read: QueueRe
   const routing = route ?? await queueRouting(src, ids);
   const main = await backlog(src, ids.main, "queue_metrics_unreadable");
   const dlqBacklog = await backlog(src, ids.dlq, "dlq_unreadable");
-  const dlq = await read("dlq_unreadable", () => src.cfGet(`/queues/${ids.dlq}`));
+  const dlq = await cfResult(src, `/queues/${ids.dlq}`, "dlq_unreadable");
   if (!isObj(dlq) || dlq.queue_id !== ids.dlq || dlq.queue_name !== AUTHORITY_EVIDENCE.admissionDlq) refuse("dlq_unreadable");
   const inv = inventory(dlq as Record<string, unknown>);
   if (!inv) refuse("dlq_unreadable");
@@ -502,9 +542,14 @@ WHERE n.nspname = 'sessions' AND c.relkind IN ('r', 'p')
 
 /**
  * A row's xmin as a full xid8, from the statement's own snapshot xmax (s.cur): the row's 32-bit xmin is at most 2^31
- * transactions in the past (wraparound protection), so full = cur - ((cur mod 2^32 - xmin) mod 2^32). A row is "old"
- * iff pg_visible_in_snapshot(full, base): every tuple version an insert, update or delete-and-restore writes has a new
- * xmin, so a row that is not visible in the base snapshot was written after it.
+ * transactions in the past (wraparound protection), so full = cur - ((cur mod 2^32 - xmin) mod 2^32). Every tuple
+ * version an insert, update or delete-and-restore writes has a new xmin. A row counts as possibly written after the
+ * base snapshot iff full >= pg_snapshot_xmin(base). Not pg_visible_in_snapshot: a tuple written in a subtransaction
+ * carries the SUBxid, which a pg_snapshot's xip list does not hold, so that test can call a row of a then in-progress
+ * parent visible (PostgreSQL documents subtransaction ids as excluded from it). Below the base's xmin every
+ * transaction had finished when the snapshot was taken, subtransactions included, so this rule never needs the
+ * parent. It is conservative: a row committed before the base by a transaction at or above its xmin also counts
+ * (a false refusal, never a false pass).
  */
 const xid8 = (a: string) => `((s.cur - mod(mod(s.cur, 4294967296) - ${a}.xmin::text::numeric + 4294967296, 4294967296))::text::xid8)`;
 /** sha256 of a typed, unambiguous row encoding (jsonb array: strings escaped, nulls distinct, numbers typed). */
@@ -513,7 +558,7 @@ const rowSha = (row: string) => `encode(sha256(convert_to(jsonb_build_array(${ro
 const digest = (n: string, alias: string) =>
   `'h' || left(encode(sha256(convert_to(${n}::text || ':' || coalesce(${alias}.l1, 0)::text || ':' || coalesce(${alias}.l2, 0)::text, 'UTF8')), 'hex'), 32)`;
 const lanes = `sum(('x' || substr(y.h, 1, 15))::bit(60)::bigint::numeric) AS l1, sum(('x' || substr(y.h, 16, 15))::bit(60)::bigint::numeric) AS l2`;
-const newSince = `count(*) FILTER (WHERE s.base IS NOT NULL AND NOT pg_visible_in_snapshot(y.xid, s.base))`;
+const newSince = `count(*) FILTER (WHERE s.base IS NOT NULL AND y.xid >= pg_snapshot_xmin(s.base))`;
 
 /**
  * One read-only statement per org: the visibility answer, then one org-leading scan of each table (each primary key
@@ -570,6 +615,43 @@ function checkedSnapshot(v: unknown): SqlSnapshot | null {
 }
 const DIGEST = /^h[0-9a-f]{32}$/u;
 
+/**
+ * Durable deletion evidence. Surviving-row counts cannot show an admission that was inserted and then deleted, but
+ * every DELETE (by any role, the owner and a raw statement included) increments pg_stat_all_tables.n_tup_del, which
+ * only grows until a statistics reset or a server restart. The only code path that deletes ingest_batches rows is the
+ * owner-only operator user erase (20261105058010). So: n_tup_del of ingest_batches unchanged from the reference
+ * (the baseline when bound, round 1 when unbound) to a read AUTHORITY_STATS_SETTLE_MS after round 2, with the same
+ * stats_reset and postmaster start, and track_counts on, means no batch row of ANY org was deleted in the interval;
+ * with no surviving claim since the stop, no admission happened in it. Table-wide, so another org's erase in the
+ * interval also refuses (fail-closed). A TRUNCATE is not counted; it needs the owner, and it changes the counts.
+ */
+export const AUTHORITY_STATS_SQL = `
+SELECT (SELECT count(*) FROM pg_catalog.pg_stat_all_tables t WHERE t.schemaname = 'sessions' AND t.relname = 'ingest_batches')::bigint AS tables,
+       (SELECT t.n_tup_del FROM pg_catalog.pg_stat_all_tables t WHERE t.schemaname = 'sessions' AND t.relname = 'ingest_batches')::bigint AS batches_deleted,
+       coalesce((SELECT floor(extract(epoch FROM d.stats_reset) * 1000) FROM pg_catalog.pg_stat_database d WHERE d.datname = current_database()), 0)::bigint AS stats_reset_ms,
+       floor(extract(epoch FROM pg_postmaster_start_time()) * 1000)::bigint AS started_ms,
+       current_setting('track_counts') AS track_counts`;
+
+export interface SqlStats { batchesDeleted: number; statsResetMs: number; startedMs: number }
+async function statsRead(src: AuthorityEvidenceSources): Promise<SqlStats> {
+  const rows = await read("sql_stats_unreadable", () => src.sql(AUTHORITY_STATS_SQL, []));
+  if (!Array.isArray(rows) || rows.length !== 1 || !isObj(rows[0])) refuse("sql_stats_unreadable");
+  const r = rows[0] as Record<string, unknown>;
+  const [n, del, reset, started] = [r.tables, r.batches_deleted, r.stats_reset_ms, r.started_ms].map(count);
+  if (n !== 1 || del === null || reset === null || started === null || r.track_counts !== "on") refuse("sql_stats_unreadable");
+  return { batchesDeleted: del!, statsResetMs: reset!, startedMs: started! };
+}
+const checkedStats = (v: unknown): SqlStats | null => {
+  if (!isObj(v)) return null;
+  const [a, b, c] = [v.batchesDeleted, v.statsResetMs, v.startedMs].map(count);
+  return a === null || b === null || c === null ? null : { batchesDeleted: a, statsResetMs: b, startedMs: c };
+};
+/** The deletion verdict between a reference and a later read. */
+function statsCode(ref: SqlStats, later: SqlStats): AuthorityRefusal | null {
+  if (ref.statsResetMs !== later.statsResetMs || ref.startedMs !== later.startedMs || later.batchesDeleted < ref.batchesDeleted) return "sql_stats_reset";
+  return later.batchesDeleted === ref.batchesDeleted ? null : "sql_batches_deleted";
+}
+
 interface SqlRead extends SqlCounts {
   batchesNewSinceBase: number; revisionsNewSinceBase: number; ownershipNewSinceBase: number;
   revisionsDigest: string; ownershipDigest: string; snapshot: SqlSnapshot; readAtMs: number;
@@ -618,7 +700,7 @@ function sinceStopCode(c: SqlCounts): AuthorityRefusal | null {
 export interface BaselineOrg {
   orgHash: string; ok: boolean; refusals: AuthorityRefusal[];
   stopDeploymentHash: string | null; effectiveStopMs: number | null;
-  readAtMs: number | null; snapshot: SqlSnapshot | null; fingerprint: SqlFingerprint | null;
+  readAtMs: number | null; snapshot: SqlSnapshot | null; fingerprint: SqlFingerprint | null; stats: SqlStats | null;
 }
 export interface AuthorityBaseline {
   kind: "authority_baseline"; v: 1;
@@ -655,38 +737,41 @@ export async function authorityBaseline(
   const out: BaselineOrg[] = [];
   for (const org of orgs) {
     const orgHash = evidenceHash("org", org);
-    const base: BaselineOrg = { orgHash, ok: false, refusals: [], stopDeploymentHash: null, effectiveStopMs: null, readAtMs: null, snapshot: null, fingerprint: null };
+    const base: BaselineOrg = { orgHash, ok: false, refusals: [], stopDeploymentHash: null, effectiveStopMs: null, readAtMs: null, snapshot: null,
+      fingerprint: null, stats: null };
     const stop = unboundStop(evidence, orgHash);
     if (typeof stop === "string") { out.push({ ...base, refusals: [stop] }); continue; }
-    let r: SqlRead;
-    try { r = await sqlRead(src, org, stop.effectiveStopMs, null); }
+    let r: SqlRead, stats: SqlStats;
+    try { r = await sqlRead(src, org, stop.effectiveStopMs, null); stats = await statsRead(src); }
     catch (error) { out.push({ ...base, ...stop, refusals: [codeOf(error, "sql_unreadable")] }); continue; }
     const code = !r.repeatable ? "baseline_not_snapshot" : sinceStopCode(r) ?? (r.readAtMs < stop.effectiveStopMs ? "bound_stop_mismatch" : null);
-    out.push({ ...base, ...stop, ok: code === null, refusals: code ? [code] : [], readAtMs: r.readAtMs, snapshot: r.snapshot, fingerprint: fingerprintOf(r) });
+    out.push({ ...base, ...stop, ok: code === null, refusals: code ? [code] : [], readAtMs: r.readAtMs, snapshot: r.snapshot,
+      fingerprint: fingerprintOf(r), stats });
   }
   return { kind: "authority_baseline", v: 1, status: out.every((o) => o.ok) ? "authority_baseline_ready" : "authority_baseline_refused",
     orgCount: orgs.length, orgs: out };
 }
 
-type BoundOrg = { fingerprint: SqlFingerprint; effectiveStopMs: number; stopDeploymentHash: string; readAtMs: number; snapshot: SqlSnapshot };
+type BoundOrg = { fingerprint: SqlFingerprint; effectiveStopMs: number; stopDeploymentHash: string; readAtMs: number; snapshot: SqlSnapshot; stats: SqlStats };
 function boundOrg(bound: unknown, orgHash: string): BoundOrg | AuthorityRefusal {
   if (!isObj(bound) || bound.kind !== "authority_baseline" || bound.v !== 1 || !Array.isArray(bound.orgs)) return "bound_invalid";
   const hits = (bound.orgs as unknown[]).filter((o) => isObj(o) && o.orgHash === orgHash);
   if (hits.length !== 1) return "bound_invalid";
   const o = hits[0] as Record<string, unknown>;
   if (o.ok !== true || bound.status !== "authority_baseline_ready" || !Array.isArray(o.refusals) || o.refusals.length !== 0) return "bound_not_ready";
-  const fp = isObj(o.fingerprint) ? o.fingerprint : null, snapshot = checkedSnapshot(o.snapshot);
-  if (!fp || count(fp.revisionsCount) === null || count(fp.ownershipCount) === null || typeof fp.revisionsDigest !== "string" ||
+  const fp = isObj(o.fingerprint) ? o.fingerprint : null, snapshot = checkedSnapshot(o.snapshot), stats = checkedStats(o.stats);
+  if (!fp || !stats || count(fp.revisionsCount) === null || count(fp.ownershipCount) === null || typeof fp.revisionsDigest !== "string" ||
       !DIGEST.test(fp.revisionsDigest) || typeof fp.ownershipDigest !== "string" || !DIGEST.test(fp.ownershipDigest) || !snapshot ||
       count(o.effectiveStopMs) === null || count(o.readAtMs) === null || typeof o.stopDeploymentHash !== "string") return "bound_invalid";
   return { fingerprint: { revisionsCount: count(fp.revisionsCount)!, revisionsDigest: fp.revisionsDigest, ownershipCount: count(fp.ownershipCount)!,
       ownershipDigest: fp.ownershipDigest }, effectiveStopMs: count(o.effectiveStopMs)!, stopDeploymentHash: o.stopDeploymentHash,
-    readAtMs: count(o.readAtMs)!, snapshot };
+    readAtMs: count(o.readAtMs)!, snapshot, stats: stats! };
 }
 
 function sqlVerdict(
   reads: SqlRead[], failure: AuthorityRefusal | null, observed: number | null, windowMs: number,
   bound: BoundOrg | AuthorityRefusal | null, stop: StopCheck, startedAtMs: number,
+  stats: { reference: SqlStats | null; settled: SqlStats | null; failure: AuthorityRefusal | null; settleMs: number | null },
 ): SqlCheck {
   const last = reads[reads.length - 1];
   const counts: SqlCounts | null = last ? {
@@ -711,6 +796,13 @@ function sqlVerdict(
   if (reads.some((r) => r.batchesNewSinceBase || r.revisionsNewSinceBase || r.ownershipNewSinceBase)) return { ...out, code: "sql_rows_rewritten" };
   if (revisionsStable !== true) return { ...out, code: "sql_revisions_changed" };
   if (ownershipStable !== true) return { ...out, code: "sql_ownership_changed" };
+  // Deletions since the reference: the baseline's counters when bound, round 1's when unbound.
+  if (stats.failure) return { ...out, code: stats.failure };
+  if (stats.settleMs === null || stats.settleMs < AUTHORITY_STATS_SETTLE_MS) return { ...out, code: "observation_window_short" };
+  const ref = bound && typeof bound !== "string" ? bound.stats : stats.reference;
+  if (!ref || !stats.settled) return { ...out, code: "sql_stats_unreadable" };
+  const deleted = statsCode(ref, stats.settled);
+  if (deleted) return { ...out, code: deleted };
   if (bound === null) return { ...out, code: "sql_unbound" };
   if (typeof bound === "string") return { ...out, code: bound };
   if (bound.effectiveStopMs !== stop.effectiveStopMs || bound.stopDeploymentHash !== stop.stopDeploymentHash ||
@@ -749,7 +841,7 @@ export async function authorityEvidence(
   // 1, 2 (and the queue binding of every version that served since the stop, and of the boundary).
   let ingest: { list: ParsedDeployment[]; complete: boolean } | null = null, ingestFailure: AuthorityRefusal | null = null;
   try {
-    ingest = parseDeployments(await read("stop_deployments_unreadable", () => src.cfGet(deploymentsPath(ingestWorker))),
+    ingest = parseDeployments(await cfResult(src, deploymentsPath(ingestWorker), "stop_deployments_unreadable"),
       AUTHORITY_MAX_DEPLOYMENT_WALK, "stop_deployment_invalid", "stop_deployment_order");
   } catch (error) { ingestFailure = codeOf(error, "stop_deployments_unreadable"); }
   const ingestVersion = versionReader(src, ingestWorker, "stop_version_unreadable");
@@ -764,7 +856,7 @@ export async function authorityEvidence(
   // 5: turns.
   let rh: ParsedDeployment | null = null, rhFailure: AuthorityRefusal | null = null;
   try {
-    rh = parseDeployments(await read("turns_deployments_unreadable", () => src.cfGet(deploymentsPath(relayhistoryWorker))),
+    rh = parseDeployments(await cfResult(src, deploymentsPath(relayhistoryWorker), "turns_deployments_unreadable"),
       1, "turns_deployment_invalid", "turns_deployment_invalid").list[0]!;
   } catch (error) { rhFailure = codeOf(error, "turns_deployments_unreadable"); }
   const rhVersion = versionReader(src, relayhistoryWorker, "turns_version_unreadable");
@@ -796,25 +888,35 @@ export async function authorityEvidence(
       catch (error) { sqlFailure.set(org, codeOf(error, "sql_unreadable")); }
     }
   };
+  let statsFailure: AuthorityRefusal | null = null, statsReference: SqlStats | null = null, statsSettled: SqlStats | null = null;
+  try { statsReference = await statsRead(src); } catch (error) { statsFailure = codeOf(error, "sql_stats_unreadable"); }
   await round(1);
   const round1EndMs = src.nowMs();
   await src.sleep(windowMs);
   const round2StartMs = src.nowMs();
   await round(2);
+  const round2EndMs = src.nowMs();
   const observed = Number.isFinite(round2StartMs - round1EndMs) ? round2StartMs - round1EndMs : null;
+  // The deletion counter, read once every delete committed before round 2 has been flushed to it.
+  await src.sleep(AUTHORITY_STATS_SETTLE_MS);
+  const settleStartMs = src.nowMs();
+  if (statsFailure === null) {
+    try { statsSettled = await statsRead(src); } catch (error) { statsFailure = codeOf(error, "sql_stats_unreadable"); }
+  }
+  const settleMs = Number.isFinite(settleStartMs - round2EndMs) ? settleStartMs - round2EndMs : null;
 
   // Same deployments after the window.
   let ingestChanged = false, rhChanged = false;
   if (ingest) {
     try {
-      const again = parseDeployments(await read("stop_deployments_unreadable", () => src.cfGet(deploymentsPath(ingestWorker))),
+      const again = parseDeployments(await cfResult(src, deploymentsPath(ingestWorker), "stop_deployments_unreadable"),
         1, "stop_deployment_invalid", "stop_deployment_order").list[0]!;
       ingestChanged = again.id !== ingest.list[0]!.id || again.serving.join() !== ingest.list[0]!.serving.join();
     } catch { ingestChanged = true; }
   }
   if (rh) {
     try {
-      const again = parseDeployments(await read("turns_deployments_unreadable", () => src.cfGet(deploymentsPath(relayhistoryWorker))),
+      const again = parseDeployments(await cfResult(src, deploymentsPath(relayhistoryWorker), "turns_deployments_unreadable"),
         1, "turns_deployment_invalid", "turns_deployment_invalid").list[0]!;
       rhChanged = again.id !== rh.id || again.serving.join() !== rh.serving.join();
     } catch { rhChanged = true; }
@@ -834,7 +936,8 @@ export async function authorityEvidence(
       if (!queueBound) queueDrained = { ...queueGlobal, ok: false, code: "queue_binding_mismatch" };
       else if (!routeKept) queueDrained = { ...queueGlobal, ok: false, code: "queue_route_changed" };
     }
-    const sqlQuiet = sqlVerdict(sqlReads.get(org)!, sqlFailure.get(org)!, observed, windowMs, bounds.get(org)!, stop, startedAtMs);
+    const sqlQuiet = sqlVerdict(sqlReads.get(org)!, sqlFailure.get(org)!, observed, windowMs, bounds.get(org)!, stop, startedAtMs,
+      { reference: statsReference, settled: statsSettled, failure: statsFailure, settleMs });
     const checks = [stop, mirror, queueDrained, sqlQuiet, turnsNeon];
     const refusals = [...new Set(checks.map((c) => c.code).filter((c): c is AuthorityRefusal => c !== null))];
     const ok = refusals.length === 0 && checks.every((c) => c.ok);
@@ -853,4 +956,17 @@ export async function authorityEvidence(
     relayhistoryDeploymentHash: rh ? evidenceHash("deployment", rh.id) : null,
     orgs: verdicts,
   };
+}
+
+/**
+ * The marker handoff: true only for an org whose verdict is ok in a report whose status is authority_evidence_pass,
+ * finished at most AUTHORITY_MARKER_MAX_AGE_MS before `nowMs` (and not in the future). Call it immediately before each
+ * marker write; past the limit, run the bound evidence again.
+ */
+export function authorityMarkerAllowed(report: AuthorityEvidenceReport, org: string, nowMs: number): boolean {
+  if (report?.status !== "authority_evidence_pass" || !Array.isArray(report.orgs) || count(report.finishedAtMs) === null) return false;
+  const age = nowMs - report.finishedAtMs;
+  if (!(age >= 0 && age <= AUTHORITY_MARKER_MAX_AGE_MS)) return false;
+  const hits = report.orgs.filter((o) => o.orgHash === evidenceHash("org", org));
+  return hits.length === 1 && hits[0]!.ok === true && hits[0]!.refusals.length === 0;
 }

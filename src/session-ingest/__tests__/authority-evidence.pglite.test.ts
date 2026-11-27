@@ -1,5 +1,7 @@
 /** AUTHORITY_SQL against a real Postgres engine (pglite), over the three ledger tables' released column shapes. */
-import { expect, test } from "bun:test";
+import { expect, setDefaultTimeout, test } from "bun:test";
+
+setDefaultTimeout(30_000);
 import { PGlite } from "@electric-sql/pglite";
 import {
   AUTHORITY_SQL, AUTHORITY_VISIBILITY_SQL, authorityBaseline, authorityEvidence, evidenceHash, type AuthorityEvidenceSources,
@@ -182,8 +184,8 @@ test("end to end on the engine: baseline in a REPEATABLE READ transaction, then 
     producers: [{ type: "worker", script: "96bulls-session-ingest" }], producers_total_count: 1 };
   const dlq = { queue_id: "b".repeat(32), queue_name: "96bulls-session-ingest-admission-dlq", consumers: [], consumers_total_count: 0, producers: [], producers_total_count: 0 };
   let clock = NOWMS;
-  const src: AuthorityEvidenceSources = {
-    async cfGet(path) {
+  const result = async (path: string): Promise<unknown> => {
+    {
       if (path.endsWith("96bulls-session-ingest/deployments")) return { deployments: [
         { id: uuid(101), created_on: new Date(T).toISOString(), versions: [{ version_id: uuid(1), percentage: 100 }] },
         { id: uuid(102), created_on: new Date(T - 3_600_000).toISOString(), versions: [{ version_id: uuid(2), percentage: 100 }] }] };
@@ -196,6 +198,12 @@ test("end to end on the engine: baseline in a REPEATABLE READ transaction, then 
       if (path === `/queues/${main.queue_id}`) return main;
       if (path === `/queues/${dlq.queue_id}`) return dlq;
       throw new Error(path);
+    }
+  };
+  const src: AuthorityEvidenceSources = {
+    async cfGet(path) {
+      const r = await result(path);
+      return { success: true, result: r, ...(path.startsWith("/queues?") ? { result_info: { page: 1, total_count: 2, total_pages: 1 } } : {}) };
     },
     // Each round in its own READ ONLY transaction, as the caller runs it.
     async sql(text, params) {
@@ -203,7 +211,8 @@ test("end to end on the engine: baseline in a REPEATABLE READ transaction, then 
       try { return (await pg.query<Record<string, unknown>>(text, params as unknown[])).rows; } finally { await pg.exec("ROLLBACK"); }
     },
     nowMs: () => clock,
-    async sleep(ms) { clock += ms; },
+    // A sleep stands for real time passing; in it the engine flushes pending statistics, as PostgreSQL does within 60 s.
+    async sleep(ms) { clock += ms; await pg.exec("SELECT pg_stat_force_next_flush()"); await pg.exec("SELECT 1"); },
   };
   const opts = { observationWindowMs: 30_000 };
   const unbound = await authorityEvidence([ORG], src, opts);
@@ -213,6 +222,7 @@ test("end to end on the engine: baseline in a REPEATABLE READ transaction, then 
   const baseline = await authorityBaseline([ORG], unbound, async (t, p) => (await pg.query<Record<string, unknown>>(t, p as unknown[])).rows);
   await pg.exec("COMMIT");
   expect(baseline.status).toBe("authority_baseline_ready");
+  expect(typeof baseline.orgs[0]!.stats?.batchesDeleted).toBe("number");
   expect(baseline.orgs[0]!.orgHash).toBe(evidenceHash("org", ORG));
   // A READ COMMITTED baseline is refused.
   await pg.exec("BEGIN TRANSACTION READ ONLY");
@@ -221,6 +231,7 @@ test("end to end on the engine: baseline in a REPEATABLE READ transaction, then 
   expect(rc.orgs[0]!.refusals).toEqual(["baseline_not_snapshot"]);
   // Nothing written since: the bound run passes on the real engine...
   const passed = await authorityEvidence([ORG], src, { ...opts, bound: baseline });
+  expect(passed.orgs[0]!.refusals).toEqual([]);
   expect(passed.status).toBe("authority_evidence_pass");
   // ...a delete-and-restore since the baseline refuses.
   await pg.query(`DELETE FROM sessions.ingest_session_ownership WHERE org_id = $1`, [ORG]);
@@ -228,7 +239,42 @@ test("end to end on the engine: baseline in a REPEATABLE READ transaction, then 
   const after = await authorityEvidence([ORG], src, { ...opts, bound: baseline });
   expect(after.status).toBe("authority_evidence_refused");
   expect(after.orgs[0]!.refusals).toEqual(["sql_rows_rewritten"]);
+
+  // Review 949a2a62 #1: a fresh baseline, then a pending admission committed and deleted before the bound run. Every
+  // surviving count, digest and row version is unchanged; the deletion counter is not.
+  await pg.exec("BEGIN TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY");
+  const fresh = await authorityBaseline([ORG], unbound, async (t, p) => (await pg.query<Record<string, unknown>>(t, p as unknown[])).rows);
+  await pg.exec("COMMIT");
+  expect(fresh.status).toBe("authority_baseline_ready");
+  expect((await authorityEvidence([ORG], src, { ...opts, bound: fresh })).status).toBe("authority_evidence_pass");
+  await pg.query(`INSERT INTO sessions.ingest_batches VALUES ($1,'w','o','transient','u','pending',now(),NULL)`, [ORG]);
+  await pg.query(`DELETE FROM sessions.ingest_batches WHERE batch_id = 'transient'`);
+  const transient = await authorityEvidence([ORG], src, { ...opts, bound: fresh });
+  expect(transient.status).toBe("authority_evidence_refused");
+  expect(transient.orgs[0]!.refusals).toEqual(["sql_batches_deleted"]);
+  expect(transient.orgs[0]!.sqlQuiet.counts).toMatchObject({ batchesClaimedSince: 0, batchesPending: 0 });
   // And outside a READ ONLY transaction the evidence run refuses.
   const rw = await authorityEvidence([ORG], { ...src, sql: async (t, p) => (await pg.query<Record<string, unknown>>(t, p as unknown[])).rows }, opts);
   expect(rw.orgs[0]!.refusals).toContain("sql_not_read_only");
+});
+
+test("review 949a2a62 #2: a row written in a subtransaction of a then in-progress parent counts as new", async () => {
+  const pg = await db();
+  await pg.exec("BEGIN");
+  const parent = Number((await pg.query<{ x: string }>("SELECT pg_current_xact_id()::text AS x")).rows[0]!.x);
+  await pg.exec("SAVEPOINT a");
+  await pg.query(`INSERT INTO sessions.ingest_session_ownership VALUES ($1,'w','u','o','s','sess')`, [ORG]);
+  await pg.exec("RELEASE a; COMMIT");
+  const rowXmin = Number((await pg.query<{ x: string }>("SELECT xmin::text AS x FROM sessions.ingest_session_ownership")).rows[0]!.x);
+  expect(rowXmin).toBeGreaterThan(parent); // the tuple carries the subxid
+  // A base snapshot taken while the parent was still running: the parent is in xip, xmax beyond both.
+  const base = `${parent}:${rowXmin + 1}:${parent}`;
+  const check = (await pg.query<{ sub: boolean; top: boolean }>(
+    `SELECT pg_visible_in_snapshot($1::text::xid8, $3::pg_snapshot) AS sub, pg_visible_in_snapshot($2::text::xid8, $3::pg_snapshot) AS top`,
+    [String(rowXmin), String(parent), base])).rows[0]!;
+  expect(check).toEqual({ sub: true, top: false }); // the visibility test alone would call the row old
+  expect(Number((await read(pg, ORG, STOP, base))[0]!.ownership_new_since_base)).toBe(1);
+  // A snapshot taken after the parent finished does not count it.
+  const after = (await read(pg))[0]!.snapshot as string;
+  expect(Number((await read(pg, ORG, STOP, after))[0]!.ownership_new_since_base)).toBe(0);
 });

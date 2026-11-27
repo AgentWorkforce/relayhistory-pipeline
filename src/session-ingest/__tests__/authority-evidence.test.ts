@@ -7,6 +7,10 @@ import {
   AUTHORITY_QUEUE_PAGE,
   AUTHORITY_REFUSALS,
   AUTHORITY_SQL,
+  AUTHORITY_STATS_SETTLE_MS,
+  AUTHORITY_STATS_SQL,
+  AUTHORITY_MARKER_MAX_AGE_MS,
+  authorityMarkerAllowed,
   authorityBaseline,
   authorityEvidence,
   evidenceHash,
@@ -77,6 +81,10 @@ function world() {
       revisions_digest: D1, ownership_count: "40", ownership_new_since_base: "0", ownership_digest: D2,
       snapshot: "1000:1005:1001,1003", isolation: "read committed", read_only: "on", read_at_ms: String(NOW),
     } as Record<string, unknown>,
+    /** Deletion-counter reads in order (the last repeats). */
+    stats: [{ tables: "1", batches_deleted: "7", stats_reset_ms: "0", started_ms: "1700000000000", track_counts: "on" }] as Array<Record<string, unknown> | "fail">,
+    /** The queue list's result_info; null = the honest one for the returned page. */
+    listInfo: null as unknown,
     /** The isolation the SQL fake reports for a baseline read (authorityBaseline's own transport). */
     baselineIsolation: "repeatable read",
     ingestAfter: null as Array<Record<string, unknown>> | null,
@@ -89,9 +97,9 @@ function world() {
     slept: [] as number[],
     clock: NOW,
   };
-  let ingestReads = 0, rhReads = 0, metricsReads = 0, dlqMetricsReads = 0, dlqReads = 0, listReads = 0, sqlIdx = 0;
-  const src: AuthorityEvidenceSources = {
-    async cfGet(path) {
+  let ingestReads = 0, rhReads = 0, metricsReads = 0, dlqMetricsReads = 0, dlqReads = 0, listReads = 0, sqlIdx = 0, statsIdx = 0;
+  const raw = async (path: string): Promise<unknown> => {
+    {
       w.calls.push(path);
       if (w.fail.has(path)) throw new Error(`boom with secret ${ORG}`);
       if (path === `/workers/scripts/${E.ingestWorker}/deployments`)
@@ -120,8 +128,24 @@ function world() {
       const main = ids.find((id) => path === `/queues/${id}`);
       if (main) return { queue_id: main, queue_name: E.admissionQueue, ...w.mainQueue };
       throw new Error("unexpected " + path);
+    }
+  };
+  const src: AuthorityEvidenceSources = {
+    // The whole API body, as the real transport resolves it.
+    async cfGet(path) {
+      const result = await raw(path);
+      if (path.startsWith("/queues?")) {
+        const n = Array.isArray(result) ? result.length : 0;
+        return { success: true, errors: [], result, result_info: w.listInfo ?? { page: 1, per_page: AUTHORITY_QUEUE_PAGE, count: n, total_count: n, total_pages: 1 } };
+      }
+      return { success: true, errors: [], result };
     },
     async sql(text, params) {
+      if (text === AUTHORITY_STATS_SQL) {
+        const st = at(w.stats, statsIdx++);
+        if (st === "fail") throw new Error("stats");
+        return [st];
+      }
       expect(text).toBe(AUTHORITY_SQL);
       w.sqlCalls.push(params);
       const row = w.sqlRows[sqlIdx++] ?? w.sqlDefault;
@@ -196,7 +220,7 @@ describe("authorityEvidence baseline and pass", () => {
     // Round 2 counts rows written after round 1's own snapshot.
     const snap = "1000:1005:1001,1003";
     expect(w.sqlCalls).toEqual([[ORG, anchor, null], [ORG2, anchor, null], [ORG, anchor, snap], [ORG2, anchor, snap]]);
-    expect(w.slept).toEqual([WINDOW]);
+    expect(w.slept).toEqual([WINDOW, AUTHORITY_STATS_SETTLE_MS]);
     assertNoLeak(r);
   });
 
@@ -213,7 +237,7 @@ describe("authorityEvidence baseline and pass", () => {
   test("default window is the default", async () => {
     const { w, src } = world();
     await authorityEvidence([ORG], src);
-    expect(w.slept).toEqual([AUTHORITY_OBSERVATION_WINDOW_MS]);
+    expect(w.slept).toEqual([AUTHORITY_OBSERVATION_WINDOW_MS, AUTHORITY_STATS_SETTLE_MS]);
   });
 
   test("gradual deployment: every serving version is checked, a 0% version is not serving", async () => {
@@ -273,12 +297,13 @@ describe("review f84452bc regressions", () => {
       ["queue_consumer_mismatch", (w) => cons(w, [{ ...ING_CONSUMER, script_name: "other" }])],
       ["queue_consumer_mismatch", (w) => cons(w, [{ ...ING_CONSUMER, dead_letter_queue: "other-dlq" }])],
       ["queue_consumer_mismatch", (w) => cons(w, [{ ...ING_CONSUMER, dead_letter_queue: "" }])],
-      // Per the provider schema the consumer's Worker is script_name and its DLQ is top level, nothing else.
-      ["queue_consumer_mismatch", (w) => cons(w, [{ type: "worker", script: E.ingestWorker, dead_letter_queue: E.admissionDlq }])],
+      // Per the provider schema the consumer's Worker is script_name and its DLQ is top level, nothing else: a Worker
+      // consumer without script_name is an unreadable identity.
+      ["queue_inventory_incomplete", (w) => cons(w, [{ type: "worker", script: E.ingestWorker, dead_letter_queue: E.admissionDlq }])],
       ["queue_consumer_mismatch", (w) => cons(w, [{ type: "worker", script_name: E.ingestWorker, settings: { dead_letter_queue: E.admissionDlq } }])],
       ["queue_consumer_mismatch", (w) => cons(w, [ING_CONSUMER, { type: "http_pull", dead_letter_queue: "" }])],
       ["queue_producer_mismatch", (w) => prod(w, [ING_PRODUCER, { type: "worker", script: "intruder" }])],
-      ["queue_producer_mismatch", (w) => prod(w, [{ type: "worker", script_name: E.ingestWorker }])],
+      ["queue_inventory_incomplete", (w) => prod(w, [{ type: "worker", script_name: E.ingestWorker }])],
       ["queue_producer_mismatch", (w) => prod(w, [])],
       ["queue_identity_changed", (w) => { w.queuesAfter = [{ ...w.queues[0]!, queue_id: qid(7) }, ...w.queues.slice(1)]; }],
     ] as Array<[AuthorityRefusal, (w: ReturnType<typeof world>["w"]) => void]>) {
@@ -424,6 +449,93 @@ describe("review 5c067d90 regressions", () => {
   });
 });
 
+describe("review 949a2a62 regressions", () => {
+  test("1. an admission committed and deleted inside the interval refuses: the deletion counter moved", async () => {
+    // Unbound: between round 1's reference and the settled read.
+    const wd = world();
+    wd.w.stats = [{ ...wd.w.stats[0] as Record<string, unknown> }, { ...wd.w.stats[0] as Record<string, unknown>, batches_deleted: "8" }];
+    refusedWith(await baseline(wd.src), "sql_batches_deleted");
+    // Bound: between the baseline's counters and the bound run's settled read, every surviving count unchanged.
+    const r = await bound(world(), [ORG], (w) => { w.stats = [{ ...w.stats[0] as Record<string, unknown>, batches_deleted: "9" }]; });
+    refusedWith(r, "sql_batches_deleted");
+    expect(r.orgs[0]!.sqlQuiet.counts).toMatchObject({ batchesClaimedSince: 0, batchesPending: 0 });
+  });
+
+  test("1b. a statistics reset, a restart, a falling counter, track_counts off or an unreadable read refuses", async () => {
+    const s0 = { tables: "1", batches_deleted: "7", stats_reset_ms: "0", started_ms: "1700000000000", track_counts: "on" };
+    for (const [code, later] of [
+      ["sql_stats_reset", { ...s0, stats_reset_ms: String(NOW) }],
+      ["sql_stats_reset", { ...s0, started_ms: String(NOW) }],
+      ["sql_stats_reset", { ...s0, batches_deleted: "0" }],
+      ["sql_stats_unreadable", { ...s0, track_counts: "off" }],
+      ["sql_stats_unreadable", { ...s0, tables: "0", batches_deleted: null }],
+      ["sql_stats_unreadable", "fail"],
+    ] as Array<[AuthorityRefusal, Record<string, unknown> | "fail"]>) {
+      const wd = world();
+      wd.w.stats = [s0, later];
+      refusedWith(await baseline(wd.src), code);
+    }
+    // The settle wait is measured, like the window: an honest window and a settle sleep that does not advance the clock.
+    const w2 = world();
+    const sleep = w2.src.sleep;
+    w2.src.sleep = async (ms) => (ms === AUTHORITY_STATS_SETTLE_MS ? undefined : sleep(ms));
+    const r = await baseline(w2.src);
+    refusedWith(r, "observation_window_short");
+    expect(r.orgs[0]!.queueDrained.ok).toBe(true); // the window itself was honest
+    expect(r.orgs[0]!.sqlQuiet.code).toBe("observation_window_short");
+  });
+
+  test("1c. the marker handoff needs a fresh pass for that org", async () => {
+    const wd = world();
+    const r = await bound(wd, [ORG, ORG2]);
+    expect(r.status).toBe("authority_evidence_pass");
+    expect(authorityMarkerAllowed(r, ORG, r.finishedAtMs)).toBe(true);
+    expect(authorityMarkerAllowed(r, ORG2, r.finishedAtMs + AUTHORITY_MARKER_MAX_AGE_MS)).toBe(true);
+    expect(authorityMarkerAllowed(r, ORG, r.finishedAtMs + AUTHORITY_MARKER_MAX_AGE_MS + 1)).toBe(false);
+    expect(authorityMarkerAllowed(r, ORG, r.finishedAtMs - 1)).toBe(false);
+    expect(authorityMarkerAllowed(r, "99999999-0000-4000-8000-000000000000", r.finishedAtMs)).toBe(false);
+    expect(authorityMarkerAllowed({ ...r, status: "authority_evidence_unbound" }, ORG, r.finishedAtMs)).toBe(false);
+    expect(authorityMarkerAllowed(await baseline(world().src), ORG, NOW + HOUR)).toBe(false);
+  });
+
+  test("3. a consumer or producer whose identity cannot be read refuses, on any queue", async () => {
+    for (const mutate of [
+      (w: World["w"]) => { w.queues[3]!.consumers = [{ type: "worker" }]; },
+      (w: World["w"]) => { w.queues[3]!.consumers = [{ type: "worker", script_name: "" }]; },
+      (w: World["w"]) => { w.queues[3]!.consumers = [{ type: "mystery", script_name: E.ingestWorker }]; },
+      (w: World["w"]) => { w.queues[3]!.producers = [{ type: "worker" }]; w.queues[3]!.producers_total_count = 1; },
+      (w: World["w"]) => { w.queues[3]!.producers = [{ type: "r2_bucket" }]; w.queues[3]!.producers_total_count = 1; },
+    ]) {
+      const wd = world();
+      mutate(wd.w);
+      refusedWith(await bound(wd), "queue_inventory_incomplete");
+    }
+  });
+
+  test("3b. the list is complete only by the provider's pagination metadata", async () => {
+    const n = 4;
+    for (const info of [undefined, null, {}, { total_count: n + 1, total_pages: 1 }, { total_count: n, total_pages: 2 }, { total_count: n, page: 2 },
+      { count: n, total_pages: 1 }]) {
+      const wd = world();
+      wd.w.listInfo = info === null ? "x" : info ?? { total_count: undefined };
+      refusedWith(await baseline(wd.src), "queue_list_truncated");
+    }
+    const ok = world();
+    ok.w.listInfo = { total_count: n };
+    expect((await baseline(ok.src)).status).toBe("authority_evidence_unbound");
+  });
+
+  test("an unsuccessful API body is never read as a result", async () => {
+    const wd = world();
+    const inner = wd.src.cfGet;
+    wd.src.cfGet = async (path) => {
+      const b = await inner(path) as Record<string, unknown>;
+      return path.endsWith("/metrics") ? { ...b, success: false } : b;
+    };
+    refusedWith(await baseline(wd.src), "queue_metrics_unreadable");
+  });
+});
+
 describe("bound baseline refusals", () => {
   const org0 = (b: AuthorityBaseline) => b.orgs[0]!;
   test.each([
@@ -434,6 +546,7 @@ describe("bound baseline refusals", () => {
     ["bound_invalid", (b: AuthorityBaseline) => ({ ...b, orgs: [{ ...org0(b), snapshot: { xmin: 5, xmax: 3, xip: [] } }] })],
     ["bound_invalid", (b: AuthorityBaseline) => ({ ...b, orgs: [{ ...org0(b), fingerprint: { ...org0(b).fingerprint!, ownershipDigest: "x" } }] })],
     ["bound_invalid", (b: AuthorityBaseline) => ({ ...b, orgs: [org0(b), org0(b)] })],
+    ["bound_invalid", (b: AuthorityBaseline) => ({ ...b, orgs: [{ ...org0(b), stats: null }] })],
     ["bound_not_ready", (b: AuthorityBaseline) => ({ ...b, status: "authority_baseline_refused" })],
     ["bound_not_ready", (b: AuthorityBaseline) => ({ ...b, orgs: [{ ...org0(b), ok: false }] })],
     ["bound_not_ready", (b: AuthorityBaseline) => ({ ...b, orgs: [{ ...org0(b), readAtMs: NOW + 10 * HOUR }] })],
@@ -571,7 +684,8 @@ describe("authorityEvidence refusals", () => {
 
   test("every declared refusal code has a test", () => {
     const tested = new Set<string>(cases.map((c) => c[0]));
-    for (const c of ["bound_invalid", "bound_not_ready", "bound_stop_mismatch", "sql_unbound", "baseline_not_snapshot"]) tested.add(c);
+    for (const c of ["bound_invalid", "bound_not_ready", "bound_stop_mismatch", "sql_unbound", "baseline_not_snapshot", "sql_stats_unreadable",
+      "sql_stats_reset", "sql_batches_deleted"]) tested.add(c);
     expect(AUTHORITY_REFUSALS.filter((c) => !tested.has(c))).toEqual([]);
   });
 
