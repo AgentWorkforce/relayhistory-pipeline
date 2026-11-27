@@ -99,8 +99,10 @@ describe("rdsSeparateOwnerPreflight on real catalogs (PGlite)", () => {
       expect(r).toMatch(/^rds_profile_unproven: /);
       expect(r).toMatch(why);
     });
-  test("the RDS master as migration login (CREATEROLE member of rds_superuser) carries the AR_DB_LOGIN pointer", async () => {
-    const db = await separateLayout("ALTER ROLE hoop CREATEROLE; GRANT rds_superuser TO hoop");
+  test("an RDS-master-shaped login that owns neither the database nor sessions gets the AR_DB_LOGIN pointer", async () => {
+    // A separate master login: CREATEROLE, member of rds_superuser, owns nothing here; hoop stays the owner.
+    const db = await separateLayout("CREATE ROLE rdsmaster LOGIN CREATEROLE; GRANT rds_superuser TO rdsmaster", false);
+    await db.exec("SET SESSION AUTHORIZATION rdsmaster");
     let err: unknown;
     try {
       await rdsSeparateOwnerPreflight(client(db));
@@ -108,17 +110,24 @@ describe("rdsSeparateOwnerPreflight on real catalogs (PGlite)", () => {
       err = e;
     }
     expect((err as { code?: string }).code).toBe("rds_profile_unproven");
-    expect(dbLoginRefusal(err)?.hint).toBe(
-      `the migration login "hoop" is the RDS master, not the HoopDb owner: the database logins haven't been created. Run scripts/selfhost/configure-rds.sh (AgentWorkforce/infra), or see https://agentrelay.com/docs/self-hosting/troubleshooting#database-logins`,
+    expect(dbLoginRefusal(err)?.observed).toBe(
+      `the migration login "rdsmaster" has CREATEROLE, is a member of rds_superuser and owns neither this database nor schema sessions (the RDS master's shape)`,
     );
-    // A plain rds_superuser member without CREATEROLE is refused without the pointer.
-    const member = await separateLayout("GRANT rds_superuser TO hoop");
-    try {
-      await rdsSeparateOwnerPreflight(client(member));
-    } catch (e) {
-      err = e;
+    expect(dbLoginRefusal(err)?.hint).toMatch(/run scripts\/selfhost\/configure-rds\.sh \(AgentWorkforce\/infra\)\. See https:/);
+  });
+  test("the owner hoop with CREATEROLE and rds_superuser is not called the master: plain refusal naming its privileges", async () => {
+    for (const mutate of ["ALTER ROLE hoop CREATEROLE; GRANT rds_superuser TO hoop", "GRANT rds_superuser TO hoop"]) {
+      let err: unknown;
+      try {
+        await rdsSeparateOwnerPreflight(client(await separateLayout(mutate)));
+      } catch (e) {
+        err = e;
+      }
+      expect((err as { code?: string }).code).toBe("rds_profile_unproven");
+      expect(dbLoginRefusal(err)).toBeUndefined();
+      expect((err as Error).message).not.toMatch(/master/);
+      expect((err as Error).message).toMatch(/member of 1 role/);
     }
-    expect(dbLoginRefusal(err)).toBeUndefined();
   });
   test("refuses a SET ROLE session (session_user differs from current_user)", async () => {
     // session_user stays the bootstrap superuser; current_user becomes hoop.

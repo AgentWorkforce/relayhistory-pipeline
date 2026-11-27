@@ -348,32 +348,41 @@ describe("migrator: HOOPDB_RDS_LAYOUT=separate-database", () => {
     }
     expect(await code(undefined)).toMatch(/^rds_profile_unproven: .*owner role not found/);
   });
-  test("the RDS master as migration login (CREATEROLE member of rds_superuser): same error_code, AR_DB_LOGIN pointer first", async () => {
+  test("the RDS master's shape (CREATEROLE, rds_superuser member, owns neither database nor sessions): same error_code, observed attributes, rds pointer", async () => {
     const doc = "https://agentrelay.com/docs/self-hosting/troubleshooting#database-logins";
-    const master = { ...good, owner_name: "postgres", owner_createrole: true, owner_memberships: 1, owner_rds_superuser: true };
+    const master = { ...good, owner_name: "postgres", owner_createrole: true, owner_memberships: 1, owner_rds_superuser: true, owns_database: false, owns_sessions: false };
     let err: unknown;
     try {
       await rdsSeparateOwnerPreflight(fake(master));
     } catch (e) {
       err = e;
     }
-    const hint = `the migration login "postgres" is the RDS master, not the HoopDb owner: the database logins haven't been created. Run scripts/selfhost/configure-rds.sh (AgentWorkforce/infra), or see ${doc}`;
-    expect(dbLoginRefusal(err)).toEqual({ code: "rds_profile_unproven", support_code: "AR_DB_LOGIN", doc, hint });
+    const observed = `the migration login "postgres" has CREATEROLE, is a member of rds_superuser and owns neither this database nor schema sessions (the RDS master's shape)`;
+    const hint = `${observed}. Check that the HoopDb migration URL logs in as the dedicated database owner, not the master; if it is right and the login is missing, run scripts/selfhost/configure-rds.sh (AgentWorkforce/infra). See ${doc}`;
+    expect(dbLoginRefusal(err)).toEqual({ code: "rds_profile_unproven", support_code: "AR_DB_LOGIN", doc, observed, hint });
     expect((err as Error).message).toStartWith(`96bulls: ${hint}; rds separate-database layout needs`);
     expect((err as Error).message).toMatch(/owner has CREATEROLE.*nothing was written/);
-    // The JSON line's message (capped at 200 by log.ts) keeps the whole fix for the default master name.
     const line = JSON.parse(logLine("error", fatalLines(err).message, fatalLines(err).fields));
-    expect(line.message).toBe(`${hint.slice(0, hint.indexOf(", or see "))}, or see the doc link`);
-    expect(line).toMatchObject({ error_code: "rds_profile_unproven", support_code: "AR_DB_LOGIN", doc });
-    // CREATEROLE alone, or rds_superuser membership alone, is not the master: no pointer.
-    for (const patch of [{ owner_createrole: true }, { owner_memberships: 1, owner_rds_superuser: true }]) {
+    expect(line).toMatchObject({ message: observed, error_code: "rds_profile_unproven", support_code: "AR_DB_LOGIN", doc });
+  });
+  test("not the master: the owner with CREATEROLE/rds_superuser, or either attribute alone, gets the plain refusal", async () => {
+    for (const patch of [
+      // The database and sessions owner with extra privileges: its privileges are the problem, not the URL.
+      { owner_createrole: true, owner_memberships: 1, owner_rds_superuser: true },
+      { owner_createrole: true, owner_memberships: 1, owner_rds_superuser: true, owns_sessions: false },
+      { owner_createrole: true, owner_memberships: 1, owner_rds_superuser: true, owns_database: false },
+      { owner_createrole: true, owns_database: false, owns_sessions: false },
+      { owner_memberships: 1, owner_rds_superuser: true, owns_database: false, owns_sessions: false },
+    ]) {
+      let err: unknown;
       try {
         await rdsSeparateOwnerPreflight(fake({ ...good, owner_name: "hoop", ...patch }));
-        throw new Error("expected a refusal");
       } catch (e) {
-        expect((e as { code?: string }).code).toBe("rds_profile_unproven");
-        expect(dbLoginRefusal(e)).toBeUndefined();
+        err = e;
       }
+      expect((err as { code?: string }).code).toBe("rds_profile_unproven");
+      expect(dbLoginRefusal(err)).toBeUndefined();
+      expect((err as Error).message).not.toMatch(/master/);
     }
   });
 });

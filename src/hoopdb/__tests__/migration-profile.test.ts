@@ -48,6 +48,7 @@ import {
 } from "../migration-sentinels.ts";
 import {
   dbLoginRefusal,
+  dbLoginSetupPointer,
   expectedSchema,
   fatalLines,
   inspectMigrations,
@@ -472,22 +473,19 @@ describe("runtime role: required, existing, SELECT only", () => {
     );
     expect(error?.code).toBe("runtime_role_missing");
     expect(await snapshot(empty)).toEqual({ ledger: null, marker: null });
-    // Same error_code, plus the shared support code, doc link and the actionable sentence.
+    // Same error_code, plus the shared support code and doc link. The message states what was
+    // observed and the configuration to check first; local mode has no setup pointer.
     const doc = "https://agentrelay.com/docs/self-hosting/troubleshooting#database-logins";
-    const hint = `role "g6_nope" does not exist: the database logins haven't been created. Run scripts/selfhost/configure-rds.sh (AgentWorkforce/infra), or see ${doc}`;
-    expect(dbLoginRefusal(error)).toEqual({ code: "runtime_role_missing", support_code: "AR_DB_LOGIN", doc, hint });
-    expect((error as Error).message).toBe(`96bulls: ${hint}; HOOPDB_RUNTIME_ROLE names it; nothing was written`);
+    const observed = `role "g6_nope" (HOOPDB_RUNTIME_ROLE) was not found; the migration login is "postgres"; no runtime-like role exists`;
+    const hint = `${observed}. Check that HOOPDB_RUNTIME_ROLE names the role the services log in as, and that the HoopDb migration URL points at the intended database. See ${doc}`;
+    expect(dbLoginRefusal(error)).toEqual({ code: "runtime_role_missing", support_code: "AR_DB_LOGIN", doc, observed, hint });
+    expect((error as Error).message).toBe(`96bulls: ${hint}; nothing was written`);
+    expect((error as Error).message).not.toMatch(/configure-rds|haven't been created|never created/);
     // The migrate Job's fatal output: the plain sentence first, then the JSON line.
     const fatal = fatalLines(error);
     expect(fatal.plain).toBe(hint);
     const line = JSON.parse(logLine("error", fatal.message, fatal.fields));
-    expect(line).toMatchObject({
-      level: "error",
-      message: `role "g6_nope" does not exist: the database logins haven't been created. Run scripts/selfhost/configure-rds.sh (AgentWorkforce/infra), or see the doc link`,
-      error_code: "runtime_role_missing",
-      support_code: "AR_DB_LOGIN",
-      doc,
-    });
+    expect(line).toMatchObject({ level: "error", message: observed, error_code: "runtime_role_missing", support_code: "AR_DB_LOGIN", doc });
     expect(line.message.length).toBeLessThanOrEqual(200);
     expect(
       (
@@ -509,6 +507,37 @@ describe("runtime role: required, existing, SELECT only", () => {
       )?.code,
     ).toBe("runtime_role_missing");
     expect(await snapshot(db)).toEqual(before);
+  });
+
+  test("a misconfigured runtime role name is reported as configuration: the existing runtime-like roles are named", async () => {
+    const db = await fresh();
+    await db.exec("CREATE ROLE g6_app_runtime NOLOGIN");
+    const error = await failure(runMigrations(client(db), { profile: { ...LOCAL, runtimeRole: "g6_app_runtim" } }));
+    expect(error?.code).toBe("runtime_role_missing");
+    const r = dbLoginRefusal(error)!;
+    expect(r.observed).toBe(`role "g6_app_runtim" (HOOPDB_RUNTIME_ROLE) was not found; the migration login is "postgres"; existing runtime-like roles: "g6_app_runtime"`);
+    expect(r.hint).toMatch(/Check that HOOPDB_RUNTIME_ROLE names the role the services log in as/);
+    expect(r.hint).not.toMatch(/haven't been created|never created|configure-rds/);
+  });
+
+  test("the setup pointer is qualified by HOOPDB_DB_MODE: only rds names the RDS script", async () => {
+    expect(dbLoginSetupPointer("rds")).toBe("run scripts/selfhost/configure-rds.sh (AgentWorkforce/infra)");
+    expect(dbLoginSetupPointer("cloudsql")).toBe("run scripts/selfhost/cloud-sql-setup.sh (AgentWorkforce/infra)");
+    expect(dbLoginSetupPointer("selfhosted")).toMatch(/^run supabase\/bootstrap\/hoopdb_runtime_role\.sql /);
+    expect(dbLoginSetupPointer("supabase")).toMatch(/hoopdb_runtime_role_supabase\.sql$/);
+    expect(dbLoginSetupPointer("local")).toBeUndefined();
+    for (const mode of ["cloudsql", "selfhosted", "supabase", "local"] as const)
+      expect(dbLoginSetupPointer(mode) ?? "").not.toMatch(/rds/);
+    // End to end through the migrator in a non-rds, non-local mode (rds is covered by the RDS-shaped tests).
+    const db = await fresh();
+    const error = await failure(
+      runMigrations(client(db), {
+        profile: { mode: "cloudsql", shim: false, bootstrap: false, verify: true, runtimeRole: "g6_nope", runtimeLogin: true, functionBoundary: "global-default-revoke" },
+      }),
+    );
+    expect(error?.code).toBe("runtime_role_missing");
+    expect(dbLoginRefusal(error)!.hint).toMatch(/; if it is right and the login is missing, run scripts\/selfhost\/cloud-sql-setup\.sh \(AgentWorkforce\/infra\)\. See https:/);
+    expect(dbLoginRefusal(error)!.hint).not.toMatch(/configure-rds/);
   });
 
   test("fatal output: any other refusal keeps the old single JSON line, with no support code", () => {

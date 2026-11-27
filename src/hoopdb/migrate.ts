@@ -39,7 +39,7 @@ import {
 import { log } from "../shared/log.ts";
 import { initScrubEngine } from "@rhc/lib/scrub-engine/index.ts";
 import { optional } from "../shared/env.ts";
-import { AR_DB_LOGIN, AR_DB_LOGIN_DOC, AR_DB_LOGIN_FIX } from "../shared/support-codes.ts";
+import { AR_DB_LOGIN, AR_DB_LOGIN_DOC } from "../shared/support-codes.ts";
 import { SESSION_BOOTSTRAP_FILES } from "./session-bootstrap-chain.ts";
 import { markHeldScope, type HeldScope } from "./held-scope.ts";
 
@@ -155,21 +155,51 @@ export interface DbLoginRefusal {
   code: string;
   support_code: typeof AR_DB_LOGIN;
   doc: typeof AR_DB_LOGIN_DOC;
-  /** The one-sentence fix: what happened, then the fix and the doc link. Role names only, never a URL or password. */
+  /** What the catalog showed (role names and attributes only, never a URL or password). */
+  observed: string;
+  /** The observation, then what to check first, the mode's setup pointer if any, and the doc link. */
   hint: string;
 }
 
 /**
- * A refusal whose fix is creating the database logins (AR_DB_LOGIN). `error_code` is
- * unchanged (tests, runbooks and infra's diagnose-install.py key on it); `support_code`
- * and `doc` are added, and the message leads with `hint`, the actionable sentence.
+ * Where the database logins come from, per HOOPDB_DB_MODE, as the runbook's "Who creates
+ * the dedicated role" states it. Only rds points at infra's mutating RDS setup script; local
+ * (the Docker stack) has no setup step to point at.
  */
-export function dbLoginError(code: string, what: string, detail?: string): Error & DbLoginRefusal {
-  const hint = `${what}: the database logins haven't been created. ${AR_DB_LOGIN_FIX}, or see ${AR_DB_LOGIN_DOC}`;
+export function dbLoginSetupPointer(mode: MigrationProfile["mode"]): string | undefined {
+  switch (mode) {
+    case "rds":
+      return "run scripts/selfhost/configure-rds.sh (AgentWorkforce/infra)";
+    case "cloudsql":
+      return "run scripts/selfhost/cloud-sql-setup.sh (AgentWorkforce/infra)";
+    case "selfhosted":
+      return "run supabase/bootstrap/hoopdb_runtime_role.sql as a superuser before migrate (the chart's role bootstrap)";
+    case "supabase":
+      return "provision it with supabase/bootstrap/hoopdb_runtime_role_supabase.sql";
+    case "local":
+      return undefined;
+  }
+}
+
+/**
+ * A refusal about the database logins (AR_DB_LOGIN). `error_code` is unchanged (tests,
+ * runbooks and infra's diagnose-install.py key on it); `support_code` and `doc` are added.
+ * The message states only what was observed, then what configuration to check first,
+ * then (when the mode has one) where the missing login is set up.
+ */
+export function dbLoginError(
+  code: string,
+  observed: string,
+  check: string,
+  setup: string | undefined,
+  detail?: string,
+): Error & DbLoginRefusal {
+  const hint = `${observed}. ${check}${setup ? `; if it is right and the login is missing, ${setup}` : ""}. See ${AR_DB_LOGIN_DOC}`;
   return Object.assign(new Error(`96bulls: ${hint}${detail ? `; ${detail}` : ""}`), {
     code,
     support_code: AR_DB_LOGIN,
     doc: AR_DB_LOGIN_DOC,
+    observed,
     hint,
   } as const);
 }
@@ -177,8 +207,9 @@ export function dbLoginError(code: string, what: string, detail?: string): Error
 /** The support fields of a refusal built by dbLoginError, or undefined for any other error. */
 export function dbLoginRefusal(err: unknown): DbLoginRefusal | undefined {
   const e = err as Partial<DbLoginRefusal> | null;
-  return e && e.support_code === AR_DB_LOGIN && e.doc === AR_DB_LOGIN_DOC && typeof e.code === "string" && typeof e.hint === "string"
-    ? { code: e.code, support_code: AR_DB_LOGIN, doc: AR_DB_LOGIN_DOC, hint: e.hint }
+  return e && e.support_code === AR_DB_LOGIN && e.doc === AR_DB_LOGIN_DOC && typeof e.code === "string" &&
+    typeof e.hint === "string" && typeof e.observed === "string"
+    ? { code: e.code, support_code: AR_DB_LOGIN, doc: AR_DB_LOGIN_DOC, observed: e.observed, hint: e.hint }
     : undefined;
 }
 
@@ -186,7 +217,7 @@ export function dbLoginRefusal(err: unknown): DbLoginRefusal | undefined {
  * The fatal lines the migrate Job writes for a refusal: a plain stderr sentence first
  * (what an operator reads in `kubectl logs`), then the JSON line with error_code,
  * support_code and doc. The JSON message is capped at 200 characters by log.ts, so it
- * names the fix and leaves the link to the `doc` field.
+ * carries the observation and leaves the full advice to the plain line and `doc`.
  */
 export function fatalLines(err: unknown): { plain?: string; message: string; fields: Record<string, unknown> } {
   const code = (err as { code?: string }).code ?? "migrate_failed";
@@ -194,7 +225,7 @@ export function fatalLines(err: unknown): { plain?: string; message: string; fie
   if (!r) return { message: "hoopdb migrate exited", fields: { error_code: code } };
   return {
     plain: r.hint,
-    message: `${r.hint.slice(0, r.hint.indexOf(", or see "))}, or see the doc link`,
+    message: r.observed,
     fields: { error_code: r.code, support_code: r.support_code, doc: r.doc },
   };
 }
@@ -1213,12 +1244,25 @@ async function runtimeRolePreflight(
       [profile.runtimeRole],
     )
   ).rows[0];
-  if (!r)
+  if (!r) {
+    // Observations only: the configured name was not found. Name the migration login and
+    // any runtime-like roles that do exist, so a typo or a wrong URL is seen first.
+    const seen = (
+      await client.query<{ me: string; similar: string[] }>(
+        `SELECT current_user::text AS me,
+                coalesce((SELECT array_agg(rolname::text ORDER BY rolname) FROM
+                  (SELECT rolname FROM pg_catalog.pg_roles WHERE rolname ILIKE '%runtime%' ORDER BY rolname LIMIT 3) x), '{}') AS similar`,
+      )
+    ).rows[0];
+    const similar = seen?.similar?.length ? `; existing runtime-like roles: ${seen.similar.map((n) => JSON.stringify(n)).join(", ")}` : "; no runtime-like role exists";
     throw dbLoginError(
       "runtime_role_missing",
-      `role ${JSON.stringify(profile.runtimeRole)} does not exist`,
-      "HOOPDB_RUNTIME_ROLE names it; nothing was written",
+      `role ${JSON.stringify(profile.runtimeRole)} (HOOPDB_RUNTIME_ROLE) was not found; the migration login is ${JSON.stringify(seen?.me ?? "")}${similar}`,
+      "Check that HOOPDB_RUNTIME_ROLE names the role the services log in as, and that the HoopDb migration URL points at the intended database",
+      dbLoginSetupPointer(profile.mode),
+      "nothing was written",
     );
+  }
   if (r.rolname === r.me) {
     if (profile.mode !== "local")
       throw profileError(
@@ -1368,12 +1412,15 @@ export async function rdsSeparateOwnerPreflight(client: MigrationClient): Promis
         ...(r.executor_present ? ["the activation executor hoopdb_activation_executor still exists"] : []),
       ];
   const detail = `rds separate-database layout needs a plain migration owner (member of no role, no CREATEROLE) that owns this database and sessions on an RDS-shaped server: ${problems.join("; ")}; nothing was written`;
-  // The RDS master's signature (a CREATEROLE member of rds_superuser): the migration URL
-  // logs in as the master because the dedicated owner login was never created.
-  if (problems.length && r?.owner_createrole && r.owner_rds_superuser)
+  // RDS-master shape: a CREATEROLE member of rds_superuser that owns NEITHER this database
+  // NOR schema sessions. The owner itself with extra privileges is a different problem (its
+  // privileges, not the URL), so it gets the plain refusal below. Observations only.
+  if (problems.length && r?.owner_createrole && r.owner_rds_superuser && !r.owns_database && !r.owns_sessions)
     throw dbLoginError(
       "rds_profile_unproven",
-      `the migration login ${JSON.stringify(r.owner_name)} is the RDS master, not the HoopDb owner`,
+      `the migration login ${JSON.stringify(r.owner_name)} has CREATEROLE, is a member of rds_superuser and owns neither this database nor schema sessions (the RDS master's shape)`,
+      "Check that the HoopDb migration URL logs in as the dedicated database owner, not the master",
+      dbLoginSetupPointer("rds"),
       detail,
     );
   if (problems.length) throw profileError("rds_profile_unproven", detail);
