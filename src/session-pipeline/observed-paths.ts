@@ -37,10 +37,39 @@ function statusPath(line: string): string | null {
 }
 /** `## branch...upstream` header of `git status -sb`. */
 const BRANCH_LINE = /^## \S/;
-/** ` path | 12 +++--` or ` path | Bin 10 -> 20 bytes`. */
-const STAT_LINE = /^ (\S[^|]*?)\s+\|\s+(?:\d+(?: [+-]*)?|Bin [^\n]*)$/;
+/**
+ * One `--stat` line: ` path | 12 +++--` (a text change: its count, then the scaled graph) or
+ * ` path | Bin 10 -> 20 bytes` (a binary change). Git aligns the `|` of every line in a block.
+ */
+const STAT_LINE = /^ (\S.*?)( +)\| +(?:(\d+)(?: [+-]+)?|Bin \d+ -> \d+ bytes)$/;
 /** ` 3 files changed, 10 insertions(+), 2 deletions(-)` */
-const STAT_SUMMARY = /^ \d+ files? changed(?:, \d+ insertions?\(\+\))?(?:, \d+ deletions?\(-\))?$/;
+const STAT_SUMMARY = /^ (\d+) files? changed(?:, (\d+) insertions?\(\+\))?(?:, (\d+) deletions?\(-\))?$/;
+/** A `--stat` rename: `old => new`, or a braced common part, `src/{old => new}/a.ts`. */
+const BRACED_RENAME = /^([^{}]*)\{([^{}]*) => ([^{}]*)\}([^{}]*)$/;
+
+/** A stat line's path: a rename's destination, or null when the rename notation is not one git prints. */
+function statPath(name: string): string | null {
+  const arrows = name.split(" => ").length - 1;
+  if (arrows === 0) return /[{}]/.test(name) ? null : name;
+  if (arrows !== 1) return null;
+  const b = BRACED_RENAME.exec(name);
+  if (b) return `${b[1]}${b[3]}${b[4]}`.replace(/\/{2,}/g, "/").replace(/^\//, "");
+  return /[{}]/.test(name) ? null : name.split(" => ")[1]!;
+}
+
+/** A `--stat` block (stat lines, then its summary): the paths, or null when the block is not one git prints. */
+function statBlock(body: string[], summary: string): string[] | null {
+  const sum = STAT_SUMMARY.exec(summary);
+  if (!sum || !body.length || Number(sum[1]) !== body.length) return null;
+  const rows = body.map((l) => STAT_LINE.exec(l));
+  if (rows.some((m) => !m)) return null;
+  // The pipes line up, and the per-file counts add up to the summary's insertions and deletions.
+  const pipe = new Set(body.map((l) => l.indexOf(" | ")));
+  const counted = rows.reduce((n, m) => n + Number(m![3] ?? 0), 0);
+  if (pipe.size !== 1 || counted !== Number(sum[2] ?? 0) + Number(sum[3] ?? 0)) return null;
+  const paths = rows.map((m) => statPath(m![1]!));
+  return paths.every((p) => p !== null) ? paths as string[] : null;
+}
 
 function valid(path: string): boolean {
   return path.length > 0 && path.length <= MAX_OBSERVED_PATH_CHARS && path.trim() === path && !path.startsWith("-")
@@ -62,8 +91,9 @@ export function observedPaths(content: string | null | undefined): string[] {
   const status = lines.filter((l, i) => !(i === 0 && BRANCH_LINE.test(l)));
   const named = status.map(statusPath);
   if (status.length && named.every((p) => p !== null)) return cap(named as string[]);
-  // git diff --stat: stat lines, then exactly one summary line, last.
+  // git diff --stat: stat lines, then exactly one summary line, last, consistent with them.
   const last = lines.at(-1)!, body = lines.slice(0, -1);
-  if (STAT_SUMMARY.test(last) && body.length && body.every((l) => STAT_LINE.test(l))) return cap(body.map((l) => STAT_LINE.exec(l)![1]!));
+  const stat = statBlock(body, last);
+  if (stat) return cap(stat);
   return [];
 }

@@ -9,9 +9,22 @@ describe("observedPaths", () => {
     expect(observedPaths("RM a.ts -> b.ts\nC  x.ts -> y.ts\n R c.ts -> d.ts\n A e.ts\nAA f.ts\n!! g.log")).toEqual(["b.ts", "y.ts", "d.ts", "e.ts", "f.ts", "g.log"]);
   });
   test("reads a git diff --stat block ending in its summary", () => {
-    expect(observedPaths(" src/a.ts       | 12 +++++++-----\n docs/b.md      |  3 +++\n assets/logo.png | Bin 10 -> 20 bytes\n 3 files changed, 10 insertions(+), 5 deletions(-)\n"))
+    expect(observedPaths(" src/a.ts        | 12 +++++++-----\n docs/b.md       |  3 +++\n assets/logo.png | Bin 10 -> 20 bytes\n 3 files changed, 10 insertions(+), 5 deletions(-)\n"))
       .toEqual(["src/a.ts", "docs/b.md", "assets/logo.png"]);
     expect(observedPaths(" src/a.ts | 1 +\n 1 file changed, 1 insertion(+)")).toEqual(["src/a.ts"]);
+  });
+  test("--stat renames yield their destination, plain or braced, as git prints them", () => {
+    const block = [
+      " keep.ts                                      |  2 ++",
+      " old.ts => new.ts                             |  0",
+      " src/{old => new}/a.ts                        |  0",
+      " deep/{x.ts => y.ts}                          |  0",
+      " lib/{ => sub}/b.ts                           |  0",
+      " lib/{sub => }/c.ts                           |  0",
+      " logo.bin                                     | Bin 6 -> 9 bytes",
+      " 7 files changed, 2 insertions(+)",
+    ].join("\n");
+    expect(observedPaths(block)).toEqual(["keep.ts", "new.ts", "src/new/a.ts", "deep/y.ts", "lib/sub/b.ts", "lib/c.ts", "logo.bin"]);
   });
   test("anything that is not exactly such a listing yields nothing", () => {
     for (const text of [
@@ -20,6 +33,12 @@ describe("observedPaths", () => {
       "build log\n M src/a.ts",
       " src/a.ts | 12 +++\n",                       // stat lines without the summary
       " 1 file changed, 1 insertion(+)",             // a summary alone
+      " synthetic confidential prose | Bin arbitrary log text\n 1 file changed", // binary payload must be git's
+      " a.ts | 3 +++\n 2 files changed, 3 insertions(+)",                        // file count must match
+      " a.ts | 3 +++\n 1 file changed, 2 insertions(+)",                         // counts must add up
+      " a.ts | 1 +\n longer.ts | 1 +\n 2 files changed, 2 insertions(+)",       // pipes must line up
+      " a => b => c | 0\n 1 file changed",                                       // one rename per line
+      " src/{a => {b}}/x | 0\n 1 file changed", " src/{a}/x | 0\n 1 file changed", // braces only as a rename
       ' M "path with spaces.ts"',                    // quoted paths are not read
       "   this sentence is indented by three spaces", // two spaces are not a status code
       "   - first point\n   - second point",           // nor is an indented list
