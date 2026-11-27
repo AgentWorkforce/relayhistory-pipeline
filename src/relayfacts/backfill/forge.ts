@@ -16,8 +16,14 @@ import { printable, UsageError } from "../errors.ts";
 const gitTime = (t: string) => requireUtc(t, "a git committer time");
 const git = (dir: string, args: string[]) => execFileSync("git", ["-C", dir, ...args], { encoding: "utf8", maxBuffer: 512 * 1024 * 1024 });
 
-/** At most this many dated landings and reverts are kept per commit. */
-export const MAX_TRANSITIONS = 20;
+/** A commit with more dated landings and reverts than this is refused: a truncated history would replay stale. */
+export const MAX_TRANSITIONS = 200;
+
+/** Time order, then integration order on the default branch for one instant (unordered ties keep input order). */
+function transitionOrder(a: { at: string; seq?: number }, b: { at: string; seq?: number }): number {
+  if (a.at !== b.at) return a.at < b.at ? -1 : 1;
+  return a.seq !== undefined && b.seq !== undefined ? a.seq - b.seq : 0;
+}
 
 const VALUE_SETTING = /_(?:MS|S|SECONDS|TTL|MODE|PROVIDER|ENGINE|KIND|BUCKET|URL|ID|BYTES|SIZE|COUNT|MAX|MIN)$/u;
 
@@ -72,7 +78,7 @@ export function prsUpdatedSince(all: Array<Record<string, string | null>>, since
   return all.filter((p) => { const u = utc(p.updatedAt ?? null); return u !== null && u >= from; });
 }
 
-export function forgeFacts(repo: string, mirror: string, since: string, until: string, defaultBranch = "main", pullRequests: typeof ghPullRequests = ghPullRequests): ForgeFacts {
+export function forgeFacts(repo: string, mirror: string, since: string, until: string, defaultBranch = "main", pullRequests: typeof ghPullRequests = ghPullRequests, maxTransitions = MAX_TRANSITIONS): ForgeFacts {
   const listed = pullRequests(repo, since);
   const prs = listed
     .filter((p) => { const c = utc(p.createdAt ?? null); return c !== null && c < requireUtc(until, "--until"); })
@@ -92,7 +98,11 @@ export function forgeFacts(repo: string, mirror: string, since: string, until: s
   //   commit time: an approximation a strict replay can exclude by this basis.
   const defaultAt = new Map<string, string>();
   const basis = new Map<string, "merge" | "committer">();
+  // Integration order on the default branch: the first-parent position (oldest in the walk first) of the commit
+  // that brought each commit in. It orders transitions that share an instant (git times are whole seconds).
+  const seqOf = new Map<string, number>();
   const fp = git(mirror, ["log", "--first-parent", "--format=%H %P%x09%cI", `--since=${since}`, mainRef]).split("\n").filter(Boolean);
+  let seq = 0;
   for (const l of fp.reverse()) {
     const [ids, rawAt] = l.split("\t");
     const [sha, first, ...merged] = ids!.split(" ");
@@ -100,7 +110,9 @@ export function forgeFacts(repo: string, mirror: string, since: string, until: s
     const at = gitTime(rawAt);
     defaultAt.set(sha, at);
     basis.set(sha, "committer");
-    if (first && merged.length) for (const m of merged) for (const c of git(mirror, ["rev-list", `${first}..${m}`]).split("\n").filter(Boolean)) if (!defaultAt.has(c)) { defaultAt.set(c, at); basis.set(c, "merge"); }
+    seqOf.set(sha, seq);
+    if (first && merged.length) for (const m of merged) for (const c of git(mirror, ["rev-list", `${first}..${m}`]).split("\n").filter(Boolean)) if (!defaultAt.has(c)) { defaultAt.set(c, at); basis.set(c, "merge"); seqOf.set(c, seq); }
+    seq++;
   }
   const commits: ForgeFacts["commits"] = [];
   // Every default-branch revert, by the (possibly abbreviated) sha it names.
@@ -122,36 +134,39 @@ export function forgeFacts(repo: string, mirror: string, since: string, until: s
   const patchIds = execFileSync("sh", ["-c", `git -C "$0" log --all --since="$1" --until="$2" -p --format='commit %H' | git patch-id --stable`, mirror, since, until], { encoding: "utf8", maxBuffer: 512 * 1024 * 1024 });
   for (const line of patchIds.split("\n")) { const [pid, sha] = line.split(" "); if (pid && sha) patchOf.set(sha, pid); }
   // Every default-branch copy of each patch, oldest first (git log lists newest first).
-  const copiesOf = new Map<string, Array<{ sha: string; at: string }>>();
+  const copiesOf = new Map<string, Array<{ sha: string; at: string; seq?: number }>>();
   for (const c of commits) {
     const pid = patchOf.get(c.sha);
     if (!c.onDefaultBranch || !pid) continue;
     const list = copiesOf.get(pid) ?? [];
-    list.push({ sha: c.sha, at: c.defaultAt ?? c.at });
+    list.push({ sha: c.sha, at: c.defaultAt ?? c.at, ...(seqOf.has(c.sha) ? { seq: seqOf.get(c.sha)! } : {}) });
     copiesOf.set(pid, list);
   }
-  for (const list of copiesOf.values()) list.sort((a, b) => (a.at < b.at ? -1 : a.at > b.at ? 1 : 0));
+  for (const list of copiesOf.values()) list.sort(transitionOrder);
   const landedByPatch = new Map([...copiesOf].map(([pid, list]) => [pid, list[0]!]));
-  const revertsOf = (sha: string) => revertsNamed.filter((r) => sha.startsWith(r.target));
+  const revertsOf = (sha: string) => revertsNamed.filter((r) => sha.startsWith(r.target)).map((r) => ({ ...r, ...(seqOf.has(r.by) ? { seq: seqOf.get(r.by)! } : {}) }));
   // A commit's effective history on the default branch, every transition dated by when it reached it: each
   // landing of its patch (the commit itself, a re-cut copy, a re-apply after a revert, a revert of the revert:
   // all share the patch id) and each revert of any of those copies. The state as of T is the last transition
   // before T, so a landing, revert and re-landing replay as shipped, regressed, shipped.
   for (const c of commits) {
     const pid = patchOf.get(c.sha);
-    const copies = (pid ? copiesOf.get(pid) : undefined) ?? (c.onDefaultBranch ? [{ sha: c.sha, at: c.defaultAt ?? c.at }] : []);
+    const copies = (pid ? copiesOf.get(pid) : undefined) ?? (c.onDefaultBranch ? [{ sha: c.sha, at: c.defaultAt ?? c.at, ...(seqOf.has(c.sha) ? { seq: seqOf.get(c.sha)! } : {}) }] : []);
     if (!c.onDefaultBranch && copies.length) {
       c.onDefaultBranch = true;
       c.defaultAt = copies[0]!.at;
       c.defaultAtBasis = "patch";
     }
     const transitions = [
-      ...copies.map((x) => ({ at: x.at, kind: "landed" as const, by: x.sha })),
-      ...copies.flatMap((x) => revertsOf(x.sha)).map((r) => ({ at: r.at, kind: "reverted" as const, by: r.by })),
-    ].sort((a, b) => (a.at < b.at ? -1 : a.at > b.at ? 1 : a.kind < b.kind ? -1 : 1)).slice(0, MAX_TRANSITIONS);
+      ...copies.map((x) => ({ at: x.at, kind: "landed" as const, by: x.sha, ...(x.seq !== undefined ? { seq: x.seq } : {}) })),
+      ...copies.flatMap((x) => revertsOf(x.sha)).map((r) => ({ at: r.at, kind: "reverted" as const, by: r.by, ...(r.seq !== undefined ? { seq: r.seq } : {}) })),
+    ].sort(transitionOrder);
+    if (transitions.length > maxTransitions) throw new UsageError(`a commit has more than ${maxTransitions} landings and reverts: its history cannot be kept whole`);
     const firstRevert = transitions.find((t) => t.kind === "reverted");
     if (firstRevert) { c.revertedBy = firstRevert.by; c.revertedAt = firstRevert.at; }
-    if (transitions.length > 1 || firstRevert) c.transitions = transitions;
+    // Kept whenever the history is more than "this commit landed as itself": a landing by a copy records its copy
+    // from the first seal on, so a later revert never changes how an earlier landing reads.
+    if (transitions.length > 1 || firstRevert || transitions.some((t) => t.by !== c.sha)) c.transitions = transitions;
   }
   // Branch landing: a branch's work reached the default branch when its tip is an ancestor of it, when any of
   // its own commits has a default-branch copy with the same patch id, or when its combined diff (a squash) does.

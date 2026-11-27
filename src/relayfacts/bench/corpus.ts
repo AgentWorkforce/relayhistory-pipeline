@@ -77,9 +77,9 @@ export function parseForge(raw: unknown): ForgeFacts {
   for (const c of f.commits as Record<string, unknown>[]) {
     only(c, ["sha", "at", "onDefaultBranch", "defaultAt", "defaultAtBasis", "revertedBy", "revertedAt", "transitions"], "forge.json commit");
     if (c.revertedAt !== undefined && c.revertedAt !== null && !iso(c.revertedAt)) throw new CorpusError("forge.json: bad commit");
-    if (c.transitions !== undefined && (!Array.isArray(c.transitions) || c.transitions.length > 20 || c.transitions.some((t: unknown) => {
+    if (c.transitions !== undefined && (!Array.isArray(c.transitions) || c.transitions.length > 200 || c.transitions.some((t: unknown) => {
       const x = t as Record<string, unknown>;
-      return !x || typeof x !== "object" || Object.keys(x).some((k) => !["at", "kind", "by"].includes(k)) || !iso(x.at) || !["landed", "reverted"].includes(x.kind as string) || typeof x.by !== "string" || !/^[0-9a-f]{7,40}$/u.test(x.by);
+      return !x || typeof x !== "object" || Object.keys(x).some((k) => !["at", "kind", "by", "seq"].includes(k)) || (x.seq !== undefined && !(Number.isInteger(x.seq) && (x.seq as number) >= 0)) || !iso(x.at) || !["landed", "reverted"].includes(x.kind as string) || typeof x.by !== "string" || !/^[0-9a-f]{7,40}$/u.test(x.by);
     }))) throw new CorpusError("forge.json: bad commit");
     if (c.defaultAtBasis !== undefined && !["merge", "patch", "committer"].includes(c.defaultAtBasis as string)) throw new CorpusError("forge.json: bad commit");
     if (c.defaultAt !== undefined && c.defaultAt !== null && !iso(c.defaultAt)) throw new CorpusError("forge.json: bad commit");

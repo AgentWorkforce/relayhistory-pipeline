@@ -70,14 +70,17 @@ interface StateResult { state: FeatureState; basis: "forge" | "analysis"; reason
 
 type ForgeCommit = ForgeFacts["commits"][number];
 /** A commit's dated landings on the default branch: its transitions when known, else its first landing. */
-function landingsOf(c: ForgeCommit): Array<{ at: string; what: string }> {
-  if (c.transitions) return c.transitions.filter((t) => t.kind === "landed").map((t) => ({ at: t.at, what: t.by === c.sha ? `commit ${c.sha.slice(0, 12)} on the default branch` : `commit ${c.sha.slice(0, 12)} landed as ${t.by.slice(0, 12)}` }));
+interface Transition { at: string; seq?: number; what: string }
+/** Time order, then integration order within one instant when both sides know it. */
+const transitionOrder = (a: Transition, b: Transition) => textCompare(a.at, b.at) || (a.seq !== undefined && b.seq !== undefined ? a.seq - b.seq : 0);
+function landingsOf(c: ForgeCommit): Transition[] {
+  if (c.transitions) return c.transitions.filter((t) => t.kind === "landed").map((t) => ({ at: t.at, ...(t.seq !== undefined ? { seq: t.seq } : {}), what: t.by === c.sha ? `commit ${c.sha.slice(0, 12)} on the default branch` : `commit ${c.sha.slice(0, 12)} landed as ${t.by.slice(0, 12)}` }));
   return c.onDefaultBranch ? [{ at: c.defaultAt ?? c.at, what: `commit ${c.sha.slice(0, 12)} on the default branch` }] : [];
 }
 /** A commit's dated reverts: its transitions when known, else its first revert. */
-function revertsOf(c: ForgeCommit): Array<{ at: string; what: string }> {
+function revertsOf(c: ForgeCommit): Transition[] {
   const what = (by: string | null | undefined) => `commit ${c.sha.slice(0, 12)} reverted${by ? ` by ${by.slice(0, 12)}` : ""}`;
-  if (c.transitions) return c.transitions.filter((t) => t.kind === "reverted").map((t) => ({ at: t.at, what: what(t.by) }));
+  if (c.transitions) return c.transitions.filter((t) => t.kind === "reverted").map((t) => ({ at: t.at, ...(t.seq !== undefined ? { seq: t.seq } : {}), what: what(t.by) }));
   return c.revertedAt ? [{ at: c.revertedAt, what: what(c.revertedBy) }] : [];
 }
 
@@ -114,18 +117,21 @@ export function deriveState(sessions: readonly SessionFacts[], forgeIn: ForgeFac
   // on the first corpus, nearly all of them real landings; seven days keeps 52).
   const firstStart = sessions.map((s) => s.startedAt).sort(textCompare)[0] ?? asOf;
   const branches = (forge.branches ?? []).filter((b) => branchNames.has(b.name) && b.tipAt < asOf && b.tipAt >= new Date(Date.parse(firstStart) - BRANCH_LEAD_MS).toISOString());
-  const merges = [
+  const merges: Transition[] = [
     ...prs.filter((p) => p.state === "merged" && p.mergedAt && p.mergedAt < asOf).map((p) => ({ at: p.mergedAt!, what: `merged ${p.ref.replace("https://github.com/", "")}` })),
     // Every landing of a commit's patch known before the cut (a re-landing after a revert restores it).
     ...commits.flatMap((c) => landingsOf(c)).filter((l) => l.at < asOf),
     ...branches.filter((b) => b.landed && b.landedAt && b.landedAt < asOf).map((b) => ({ at: b.landedAt!, what: `branch ${b.name} landed` })),
-  ].sort((a, b) => textCompare(a.at, b.at));
-  const reverts = commits.flatMap((c) => revertsOf(c)).filter((r) => r.at < asOf).sort((a, b) => textCompare(a.at, b.at));
+  ].sort(transitionOrder);
+  const reverts = commits.flatMap((c) => revertsOf(c)).filter((r) => r.at < asOf).sort(transitionOrder);
 
   if (commits.length || prs.length || branches.length) {
     const lastMerge = merges[merges.length - 1];
     const lastRevert = reverts[reverts.length - 1];
-    if (lastRevert && (!lastMerge || lastRevert.at >= lastMerge.at)) return { state: "regressed", basis: "forge", reason: lastRevert.what };
+    // Regressed when the last revert follows the last landing; at one instant the default branch's integration
+    // order decides, and a tie nothing orders reads as regressed (the conservative call).
+    const revertLast = lastRevert && (!lastMerge || lastRevert.at > lastMerge.at || (lastRevert.at === lastMerge.at && (lastRevert.seq === undefined || lastMerge.seq === undefined || lastRevert.seq > lastMerge.seq)));
+    if (lastRevert && revertLast) return { state: "regressed", basis: "forge", reason: lastRevert.what };
     if (lastMerge) {
       // Flags the feature's own landed branches introduced count as its flags; a flag the docs do not list takes
       // `unknownFlagDefault` (this repository's rule: new behaviour lands behind a default-off flag).

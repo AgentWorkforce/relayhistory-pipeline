@@ -754,4 +754,61 @@ describe("round-5 controls", () => {
     const src = readFileSync(join(import.meta.dir, "../backfill/forge.ts"), "utf8");
     expect(src).not.toMatch(/"--search"/);
   });
+
+  test("forge history: same-second order, a long history kept whole or refused, first-landing provenance fixed at the first seal", async () => {
+    const { execFileSync } = await import("node:child_process");
+    const { forgeFacts } = await import("../backfill/forge.ts");
+    const fixture = (name: string) => {
+      const repo = join(tmp, `r11-${name}`);
+      mkdirSync(repo);
+      const git = (args: string[], date: string) => execFileSync("git", ["-C", repo, ...args], { env: { ...process.env, GIT_AUTHOR_DATE: date, GIT_COMMITTER_DATE: date, GIT_AUTHOR_NAME: "t", GIT_AUTHOR_EMAIL: "t@example.invalid", GIT_COMMITTER_NAME: "t", GIT_COMMITTER_EMAIL: "t@example.invalid" }, encoding: "utf8" }).trim();
+      const commit = (file: string, date: string) => { writeFileSync(join(repo, file), file); git(["add", file], date); git(["commit", "-q", "-m", file], date); return git(["rev-parse", "HEAD"], date); };
+      git(["init", "-q", "-b", "main"], "2026-11-01T00:00:00Z");
+      commit("base.txt", "2026-11-01T00:00:00Z");
+      git(["checkout", "-q", "-b", "topic"], "2026-11-02T00:00:00Z");
+      const topic = commit("topic.txt", "2026-11-02T00:00:00Z");
+      git(["checkout", "-q", "main"], "2026-11-02T00:00:00Z");
+      const seal = (max?: number) => forgeFacts("example/widgets", repo, "2026-10-31T00:00:00Z", "2026-11-30T00:00:00Z", "main", () => [], max);
+      const s = { source: "claude", sessionId: "s", analyzedAt: "2026-11-02T01:00:00.000Z", startedAt: "2026-11-02T00:00:00.000Z", endedAt: "2026-11-02T01:00:00.000Z", title: "", asked: [],
+        built: [{ kind: "commit", ref: topic.slice(0, 7), what: "c", at: "2026-11-02T00:30:00.000Z", evidence: [] }], gaps: [], rationale: [], outcomeStatuses: [], dropped: {},
+        keys: { repo: "example/widgets", branches: [], prs: [], commits: [], files: [], taskRefs: [], parents: [] } } as unknown as SessionFacts;
+      return { git, topic, seal, s, repo };
+    };
+    // 1. Revert and re-pick in the same second: the default branch's order decides, and the file is restored.
+    {
+      const { git, topic, seal, s, repo } = fixture("tie");
+      git(["cherry-pick", topic], "2026-11-06T00:00:00Z");
+      git(["revert", "--no-edit", "HEAD"], "2026-11-08T00:00:00Z");
+      git(["cherry-pick", topic], "2026-11-08T00:00:00Z");
+      expect(existsSync(join(repo, "topic.txt"))).toBe(true);
+      const f = seal();
+      const t = f.commits.find((x) => x.sha === topic)!.transitions!;
+      expect(t.map((x) => [x.kind, x.at])).toEqual([["landed", "2026-11-06T00:00:00.000Z"], ["reverted", "2026-11-08T00:00:00.000Z"], ["landed", "2026-11-08T00:00:00.000Z"]]);
+      expect(t[1]!.seq! < t[2]!.seq!).toBe(true);
+      expect(deriveState([s], f, "2026-11-09T00:00:00.000Z").state).toBe("shipped");
+    }
+    // 2. Twenty-one alternating transitions on distinct days, ending in a landing: kept whole, and over the bound refused.
+    {
+      const { git, topic, seal, s, repo } = fixture("long");
+      for (let i = 0; i < 21; i++) {
+        const day = `2026-11-${String(3 + i).padStart(2, "0")}T00:00:00Z`;
+        if (i % 2 === 0) git(["cherry-pick", topic], day); else git(["revert", "--no-edit", "HEAD"], day);
+      }
+      expect(existsSync(join(repo, "topic.txt"))).toBe(true);
+      const f = seal();
+      expect(f.commits.find((x) => x.sha === topic)!.transitions).toHaveLength(21);
+      expect(deriveState([s], f, "2026-11-25T00:00:00.000Z").state).toBe("shipped");
+      expect(deriveState([s], f, "2026-11-23T00:00:00.000Z").state).toBe("regressed");
+      expect(() => seal(20)).toThrow(/cannot be kept whole/);
+    }
+    // 3. A first landing by a copy reads the same before and after a later revert is sealed.
+    {
+      const { git, topic, seal, s } = fixture("prov");
+      git(["cherry-pick", topic], "2026-11-06T00:00:00Z");
+      const before = deriveState([s], seal(), "2026-11-07T00:00:00.000Z");
+      expect(before.reason).toMatch(/landed as/);
+      git(["revert", "--no-edit", "HEAD"], "2026-11-08T00:00:00Z");
+      expect(deriveState([s], seal(), "2026-11-07T00:00:00.000Z")).toEqual(before);
+    }
+  });
 });

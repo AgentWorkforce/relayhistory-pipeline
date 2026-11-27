@@ -140,9 +140,10 @@ export interface ForgeFacts {
     /**
      * Its whole effective history on the default branch when there is more than one landing or any revert: each
      * landing of its patch and each revert of a copy, dated by when that commit reached the default branch, oldest
-     * first. `defaultAt` and `revertedAt` are the first landing and first revert.
+     * first. `seq` is the first-parent integration position, which orders transitions within one instant.
+     * `defaultAt` and `revertedAt` are the first landing and first revert.
      */
-    transitions?: Array<{ at: string; kind: "landed" | "reverted"; by: string }>;
+    transitions?: Array<{ at: string; kind: "landed" | "reverted"; by: string; seq?: number }>;
   }>;
   flags: Array<{ name: string; defaultOn: boolean }>;
   /** Branches of the repository and whether their work reached the default branch (by ancestry or patch id). */
