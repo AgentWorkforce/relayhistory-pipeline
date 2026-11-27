@@ -37,6 +37,10 @@
  * --slot-pace-ms (0..5000, default 0) and --slot-fetch-rows (100..50000; default 5000, or 2000 when paced), only with
  * --slots-by-org: pause between the org cursor's FETCHes and their size; a paced org read held open past 30 min fails
  * closed for that org (slot_read_too_long, its sections incomplete). backlog-ops passes --slot-pace-ms for slot_pace_ms.
+ * --authority-baseline (backlog-ops: a catch-up bound to an authority-dry; a scoped catch-up only): stdin is then
+ * {"dbUrl": ..., "authorityEvidence": <that run's unbound report>}, and authority-evidence.ts authorityBaseline runs
+ * inside the input fingerprint's transaction (a sampled baseline: later pages read in their own snapshots, so it does not
+ * attest the backfill's actual inputs); the summary carries `authority_baseline`.
  * --revisions-since-ms (a catch-up after a full run; needs the revisions section): only the ingest_record_revisions
  * rows updated at or after that epoch ms are applied; owned lazy slots, fences and ownership are read in full
  * (src/session-ingest/upload-fence-backfill.ts header). The summary records it as `revisions_since_ms`.
@@ -76,10 +80,12 @@ export interface BackfillArgs {
   slotsByOrg?: boolean;
   slotPaceMs?: number;
   slotFetchRows?: number;
+  /** --authority-baseline (a catch-up bound to an authority-dry): the evidence comes on stdin beside the URL. */
+  authorityBaseline?: boolean;
 }
 
 const VALUE_FLAGS = new Set(["--bucket", "--region", "--org", "--section", "--page-size", "--row-page-size", "--concurrency", "--statement-timeout-ms", "--kms-key-arn", "--revisions-since-ms", "--slot-pace-ms", "--slot-fetch-rows"]);
-const BOOL_FLAGS = new Set(["--dry-run", "--execute", "--slots-by-org"]);
+const BOOL_FLAGS = new Set(["--dry-run", "--execute", "--slots-by-org", "--authority-baseline"]);
 
 /** Strict parsing: the mode is never implied, and nothing unvalidated reaches a host. */
 export function parseBackfillArgs(argv: string[]): BackfillArgs {
@@ -132,6 +138,7 @@ export function parseBackfillArgs(argv: string[]): BackfillArgs {
   const slotPaceMs = int("--slot-pace-ms", 0, SLOT_PACE_MAX_MS);
   const slotFetchRows = int("--slot-fetch-rows", SLOT_FETCH_ROWS_MIN, SLOT_FETCH_ROWS_MAX);
   if ((slotPaceMs !== undefined || slotFetchRows !== undefined) && !bools.has("--slots-by-org")) throw new Error("--slot-pace-ms and --slot-fetch-rows need --slots-by-org");
+  if (bools.has("--authority-baseline") && (revisionsSinceMs === undefined || orgs.length === 0)) throw new Error("--authority-baseline needs a scoped catch-up (--org, --revisions-since-ms)");
   return {
     mode, bucket, region, orgs, sections: chosen, pageSize, rowPageSize, concurrency, statementTimeoutMs,
     ...(kmsKeyArn !== undefined ? { kmsKeyArn } : {}),
@@ -139,6 +146,7 @@ export function parseBackfillArgs(argv: string[]): BackfillArgs {
     ...(bools.has("--slots-by-org") ? { slotsByOrg: true } : {}),
     ...(slotPaceMs !== undefined ? { slotPaceMs } : {}),
     ...(slotFetchRows !== undefined ? { slotFetchRows } : {}),
+    ...(bools.has("--authority-baseline") ? { authorityBaseline: true } : {}),
   };
 }
 
@@ -216,7 +224,10 @@ export async function runBackfill(args: BackfillArgs, deps: {
   ledgerBucket: ToolLedgerBucket | null;
   create?: (config: Parameters<typeof createS3Store>[0]) => unknown;
   recheck?: { intervalMs?: number; now?: () => number };
+  /** With --authority-baseline: the bound authority-dry's evidence report (from stdin). */
+  authorityEvidence?: unknown;
 }): Promise<BackfillSummary> {
+  if (args.authorityBaseline === true ? deps.authorityEvidence === undefined : deps.authorityEvidence !== undefined) throw new Error("backfill_authority_baseline_invalid");
   const stores = backfillStores(args, deps.env, deps.credentials, deps.create, deps.ledgerBucket);
   await assertBackfillLedgerHome(stores, args, deps.env);
   const guarded = backfillWritesNoLedger(args.sections) ? null : homeGuardedToolStore(stores, BACKFILL_KEY_ROOT, args.bucket, deps.env, deps.recheck);
@@ -230,6 +241,7 @@ export async function runBackfill(args: BackfillArgs, deps: {
     ...(args.slotsByOrg ? { slotsByOrg: true } : {}),
     ...(args.slotPaceMs !== undefined ? { slotPaceMs: args.slotPaceMs } : {}),
     ...(args.slotFetchRows !== undefined ? { slotFetchRows: args.slotFetchRows } : {}),
+    ...(args.authorityBaseline ? { authorityBaseline: { orgs: args.orgs, evidence: deps.authorityEvidence } } : {}),
   });
   // Belt and braces (the library throws it at its next boundary): never a summary after a refusal.
   const refused = guarded?.homeRefusal();
@@ -242,7 +254,7 @@ if (import.meta.main) {
   try {
     args = parseBackfillArgs(process.argv.slice(2));
   } catch (error) {
-    console.error(`${(error as Error).message}\nusage: (--dry-run | --execute --kms-key-arn <arn>) --bucket <name> [--region r] [--org o ...] [--section s ...] [--page-size n] [--row-page-size n] [--concurrency n] [--statement-timeout-ms n] [--revisions-since-ms ms] [--slots-by-org [--slot-pace-ms n] [--slot-fetch-rows n]]; {"dbUrl": …} on stdin; AWS_* credentials in the environment`);
+    console.error(`${(error as Error).message}\nusage: (--dry-run | --execute --kms-key-arn <arn>) --bucket <name> [--region r] [--org o ...] [--section s ...] [--page-size n] [--row-page-size n] [--concurrency n] [--statement-timeout-ms n] [--revisions-since-ms ms] [--slots-by-org [--slot-pace-ms n] [--slot-fetch-rows n]] [--authority-baseline]; {"dbUrl": …} on stdin; AWS_* credentials in the environment`);
     process.exit(2);
   }
   let client: pg.Client | undefined;
@@ -256,11 +268,15 @@ if (import.meta.main) {
     // stores below are built from this result.
     const ledgerBucket = toolLedgerBucket(process.env, args);
     const line = readFileSync(0, "utf8").split("\n")[0] ?? "";
-    if (line.length > 64 * 1024) throw new Error("stdin_too_large");
+    // With --authority-baseline the line also carries the bound evidence report (counts and hashes, up to 64 orgs).
+    if (line.length > (args.authorityBaseline ? 4 * 1024 * 1024 : 64 * 1024)) throw new Error("stdin_too_large");
     let parsed: unknown;
     try { parsed = JSON.parse(line); } catch { throw new Error("stdin_invalid"); }
     let dbUrl = (parsed as { dbUrl?: unknown } | null)?.dbUrl;
-    if (typeof dbUrl !== "string" || !dbUrl || Object.keys(parsed as object).length !== 1) throw new Error("db_url_required");
+    const keys = args.authorityBaseline ? ["dbUrl", "authorityEvidence"] : ["dbUrl"];
+    if (typeof dbUrl !== "string" || !dbUrl || Object.keys(parsed as object).length !== keys.length || !keys.every((k) => Object.hasOwn(parsed as object, k)))
+      throw new Error("db_url_required");
+    const authorityEvidence = args.authorityBaseline ? (parsed as { authorityEvidence: unknown }).authorityEvidence : undefined;
     // Discrete pinned fields only (verified TLS, no PG* env or .pgpass fallback), and read-only by default.
     // Keep the base options (idle_in_transaction_session_timeout) and add read-only by default.
     const base = ownerClientConfig(dbUrl, "96bulls-upload-fence-backfill");
@@ -275,7 +291,7 @@ if (import.meta.main) {
     const db = client;
     const summary = await runBackfill(args, {
       sql: { query: async (text, params) => ({ rows: (await db.query(text, params)).rows }) },
-      env: process.env, ledgerBucket,
+      env: process.env, ledgerBucket, ...(authorityEvidence !== undefined ? { authorityEvidence } : {}),
       credentials: { accessKeyId, secretAccessKey, ...(process.env.AWS_SESSION_TOKEN ? { sessionToken: process.env.AWS_SESSION_TOKEN } : {}) },
     });
     process.stdout.write(JSON.stringify(summary) + "\n");

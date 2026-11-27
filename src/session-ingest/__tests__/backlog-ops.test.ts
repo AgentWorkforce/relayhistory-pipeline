@@ -52,6 +52,9 @@ import {
   type BacklogOpsMode,
 } from "../backlog-ops.ts";
 
+/** The modes before the authority modes; those have their own tests (backlog-authority.test.ts). */
+const AUTHORITY_MODES: readonly BacklogOpsMode[] = ["reshard-dry", "authority-dry", "authority-execute", "bridge-dry", "bridge-execute"];
+const LEGACY_MODES = BACKLOG_OPS_MODES.filter((m) => !AUTHORITY_MODES.includes(m));
 const sha = "1".repeat(40), DRY = "111", BACKFILL = "222", EXPORT = "333", FULL = "444";
 const code = async (fn: () => unknown) => {
   try { await fn(); return null; } catch (e) { return (e as { code?: string }).code ?? String(e); }
@@ -88,9 +91,10 @@ const dispatchEnv = (mode: BacklogOpsMode, extra: Record<string, string> = {}) =
 
 test("eleven modes (presence dry only; the backfill refresh's and catch-up's own two); executes are enabled, and refuse before anything else while disabled", () => {
   expect([...BACKLOG_OPS_MODES]).toEqual(["backfill-dry", "backfill-execute", "export-dry", "export-execute", "drain-dry", "drain-execute", "presence-dry",
-    "backfill-refresh-dry", "backfill-refresh-execute", "backfill-catchup-dry", "backfill-catchup-execute"]);
+    "backfill-refresh-dry", "backfill-refresh-execute", "backfill-catchup-dry", "backfill-catchup-execute",
+    "reshard-dry", "authority-dry", "authority-execute", "bridge-dry", "bridge-execute"]);
   expect(BACKLOG_OPS_EXECUTE_ENABLED).toBe(true);
-  for (const mode of BACKLOG_OPS_MODES) {
+  for (const mode of LEGACY_MODES) {
     const exec = mode.endsWith("-execute");
     expect(codeSync(() => backlogOpsDispatch(dispatchEnv(mode), false))).toBe(exec ? "backlog_ops_dormant" : null);
     expect(codeSync(() => backlogOpsDispatch(dispatchEnv(mode), true))).toBeNull();
@@ -128,7 +132,7 @@ test("max_objects: drain modes only, a positive bounded integer", () => {
 test("slots_read: backfill modes only, empty or heap (default, unchanged argv) or org (--slots-by-org)", () => {
   const t = backlogOpsTarget(target);
   const on = (mode: BacklogOpsMode, v: string) => codeSync(() => backlogOpsDispatch(dispatchEnv(mode, { BACKLOG_OPS_SLOTS_READ: v }), true));
-  for (const mode of BACKLOG_OPS_MODES.filter((m) => m.startsWith("backfill-"))) {
+  for (const mode of LEGACY_MODES.filter((m) => m.startsWith("backfill-"))) {
     for (const v of ["", "heap", "org"]) expect(on(mode, v)).toBeNull();
     for (const v of ["ORG", "index", " org", "org "]) expect(on(mode, v)).toBe("backlog_ops_slots_read");
     const since = mode.startsWith("backfill-catchup-") ? SINCE : null;
@@ -149,7 +153,7 @@ test("slots_read: backfill modes only, empty or heap (default, unchanged argv) o
 test("slot_pace_ms: backfill modes with slots_read=org only, digits 0..5000; empty or 0 leaves the argv unchanged", () => {
   const t = backlogOpsTarget(target);
   const on = (mode: BacklogOpsMode, extra: Record<string, string>) => codeSync(() => backlogOpsDispatch(dispatchEnv(mode, extra), true));
-  for (const mode of BACKLOG_OPS_MODES.filter((m) => m.startsWith("backfill-"))) {
+  for (const mode of LEGACY_MODES.filter((m) => m.startsWith("backfill-"))) {
     const org = { BACKLOG_OPS_SLOTS_READ: "org" };
     for (const v of ["", "0", "1", "250", "5000"]) expect(on(mode, { ...org, BACKLOG_OPS_SLOT_PACE_MS: v })).toBeNull();
     for (const v of ["5001", "-1", "+5", "05", "1.5", "1e3", " 5", "5 ", "abc", "10000"]) expect(on(mode, { ...org, BACKLOG_OPS_SLOT_PACE_MS: v })).toBe("backlog_ops_slot_pace_ms");
@@ -204,7 +208,7 @@ test("target variables are shape-checked: key in region, roles in the key's acco
 test("argv is fixed: no org unless scoped, never a checkpoint or start key; dry runs omit the key; execute names it; drain gets no database", () => {
   const t = backlogOpsTarget(target);
   // presence-dry's argv has its own test (session-presence.test.ts).
-  for (const mode of BACKLOG_OPS_MODES.filter((m) => !m.startsWith("presence-"))) {
+  for (const mode of LEGACY_MODES.filter((m) => !m.startsWith("presence-"))) {
     const d = backlogOpsDispatch(dispatchEnv(mode, mode.startsWith("drain") ? { BACKLOG_OPS_MAX_OBJECTS: "500" } : {}), true);
     const spec = backlogOpsToolArgs(d, t, undefined, mode.startsWith("backfill-catchup-") ? SINCE : null);
     const exec = mode.endsWith("-execute");
@@ -261,7 +265,7 @@ test("org scope: BACKLOG_OPS_ORGS, lowercase UUIDs only; an id (never an org) fo
     Array.from({ length: 65 }, (_, i) => `${String(i).padStart(8, "0")}-2222-4333-8444-555555555555`).join(",")])
     expect(codeSync(() => backlogOpsScope({ BACKLOG_OPS_ORGS: bad }))).toBe("backlog_ops_scope");
   const t = backlogOpsTarget(target);
-  for (const mode of BACKLOG_OPS_MODES) {
+  for (const mode of LEGACY_MODES) {
     const d = backlogOpsDispatch(dispatchEnv(mode), true);
     const since = mode.startsWith("backfill-catchup-") ? SINCE : null;
     const args = backlogOpsToolArgs(d, t, backlogOpsScope({ BACKLOG_OPS_ORGS: `${ORG2},${ORG1}` }), since).args;
@@ -274,6 +278,10 @@ test("org scope: BACKLOG_OPS_ORGS, lowercase UUIDs only; an id (never an org) fo
 
 test("receipts are counts only: an id, key or URL anywhere refuses", () => {
   expect(countsOnly({ mode: "execute", orgs: { incomplete: 0 }, gated: { authority_off: 3 }, stopped: "complete", ok: true })).toBeTruthy();
+  // Lists only where the caller allows them (an authority receipt): bounded, each element checked alike.
+  expect(countsOnly({ per_org: [{ org_hash: "h_" + "a".repeat(32), refusals: ["sql_unbound"] }], xip: [1, 2] }, 0, true)).toBeTruthy();
+  for (const bad of [{ list: ["Org-Id"] }, { list: [{ org: "11111111-2222-4333-8444-555555555555" }] }, { list: Array.from({ length: 4097 }, () => 0) }])
+    expect(codeSync(() => countsOnly(bad, 0, true))).toMatch(/^backlog_ops_receipt_/);
   for (const bad of [
     { org: "11111111-2222-4333-8444-555555555555" }, { key: "96bulls/x/v1/ws=y" }, { url: "postgresql://u:p@h/d" },
     { message: "Something Failed" }, { list: [1, 2] }, { "Org-Id": 1 }, { n: Number.NaN },
@@ -496,8 +504,8 @@ const gate = (mode: BacklogOpsMode, mutate: (f: Fixture) => void = () => {}, ext
 };
 
 test("gate: every mode passes when enabled; executes refuse before any GitHub read while dormant", async () => {
-  for (const mode of BACKLOG_OPS_MODES) expect(await gate(mode)).toBeNull();
-  for (const mode of BACKLOG_OPS_MODES.filter((m) => m.endsWith("-execute"))) {
+  for (const mode of LEGACY_MODES) expect(await gate(mode)).toBeNull();
+  for (const mode of LEGACY_MODES.filter((m) => m.endsWith("-execute"))) {
     const seen: string[] = [];
     expect(await gate(mode, () => {}, {}, false, seen)).toBe("backlog_ops_dormant");
     expect(seen).toEqual([]);
@@ -614,13 +622,13 @@ test("workflow: the proof job runs the presence tests, and every presence file i
 test("workflow: dispatch inputs, gates, one credential step, OIDC, protected vars, counts-only receipt, one op at a time", () => {
   const yml = readFileSync(fileURLToPath(new URL("../../../" + BACKLOG_OPS_WORKFLOW, import.meta.url)), "utf8");
   const code_ = yml.split("\n").filter((l) => !l.trimStart().startsWith("#")).join("\n");
-  expect(yml).toContain("options: [backfill-dry, backfill-execute, export-dry, export-execute, drain-dry, drain-execute, presence-dry, backfill-refresh-dry, backfill-refresh-execute, backfill-catchup-dry, backfill-catchup-execute]");
+  expect(yml).toContain("options: [backfill-dry, backfill-execute, export-dry, export-execute, drain-dry, drain-execute, presence-dry, backfill-refresh-dry, backfill-refresh-execute, backfill-catchup-dry, backfill-catchup-execute, reshard-dry, authority-dry, authority-execute, bridge-dry, bridge-execute]");
   // The FULL binding: an input, its env, and its receipt downloaded (drain-execute with FULL, a catch-up) before the tool step.
   expect(yml).toContain("BACKLOG_OPS_FULL_BACKFILL_RUN: ${{ inputs.full_backfill_run }}");
   expect(yml).toContain("BACKLOG_OPS_SLOTS_READ: ${{ inputs.slots_read }}");
   expect(yml).toContain("BACKLOG_OPS_SLOT_PACE_MS: ${{ inputs.slot_pace_ms }}");
   expect(yml).toMatch(/\n      slot_pace_ms:\n        description: [^\n]+\n        type: string\n        default: ""\n/u);
-  expect(yml).toContain("if: (inputs.mode == 'drain-execute' || startsWith(inputs.mode, 'backfill-catchup-')) && inputs.full_backfill_run != ''");
+  expect(yml).toContain("if: (inputs.mode == 'drain-execute' || startsWith(inputs.mode, 'backfill-catchup-') || inputs.mode == 'authority-execute' || startsWith(inputs.mode, 'bridge-')) && inputs.full_backfill_run != ''");
   // The catch-up's t: the recheck gate step's output, handed only to the tool step; never a dispatch input.
   expect(yml).toContain("        id: recheck\n");
   expect(yml).toContain("BACKLOG_OPS_REVISIONS_SINCE_MS: ${{ steps.recheck.outputs.revisions_since_ms }}");
@@ -648,10 +656,11 @@ test("workflow: dispatch inputs, gates, one credential step, OIDC, protected var
   // Four secrets, all only in the one credential step: the owner URL (database tools only), the org scope (a
   // secret, never a variable, so this public repository's logs mask the org ids), presence-dry's session id and Path B's
   // allow-list (export and drain modes only).
-  expect(yml.match(/secrets\./g)?.length).toBe(4);
+  // ... and the authority modes' read-only Cloudflare token (authority modes only).
+  expect(yml.match(/secrets\./g)?.length).toBe(5);
   expect(yml).toContain("BACKLOG_OPS_ORGS: ${{ secrets.BACKLOG_OPS_ORGS }}");
   expect(yml).not.toContain("vars.BACKLOG_OPS_ORGS");
-  expect(yml).toContain("SUPABASE_MIGRATION_OWNER_URL: ${{ (startsWith(inputs.mode, 'backfill-') || startsWith(inputs.mode, 'export-') || inputs.mode == 'presence-dry') && secrets.SUPABASE_MIGRATION_OWNER_URL || '' }}");
+  expect(yml).toContain("SUPABASE_MIGRATION_OWNER_URL: ${{ (startsWith(inputs.mode, 'backfill-') || startsWith(inputs.mode, 'export-') || inputs.mode == 'presence-dry' || startsWith(inputs.mode, 'authority-') || startsWith(inputs.mode, 'bridge-')) && secrets.SUPABASE_MIGRATION_OWNER_URL || '' }}");
   expect(yml).toContain("SESSION_PRESENCE_SESSION: ${{ inputs.mode == 'presence-dry' && secrets.SESSION_PRESENCE_SESSION || '' }}");
   for (const v of ["BACKLOG_OPS_BUCKET", "BACKLOG_OPS_REGION", "BACKLOG_OPS_KMS_KEY_ARN", "BACKLOG_OPS_DRY_ROLE_ARN", "BACKLOG_OPS_EXECUTE_ROLE_ARN"])
     expect(yml).toContain(`${v}: \${{ vars.${v} }}`);
@@ -667,11 +676,11 @@ test("workflow: dispatch inputs, gates, one credential step, OIDC, protected var
 });
 
 test("environments: dry modes use the schema environment, every execute its own; the gate checks the mode's", async () => {
-  for (const mode of BACKLOG_OPS_MODES)
+  for (const mode of LEGACY_MODES)
     expect(backlogOpsEnvironment(mode)).toBe(mode.endsWith("-execute") ? BACKLOG_OPS_EXECUTE_ENVIRONMENT : BACKLOG_OPS_DRY_ENVIRONMENT);
   expect(BACKLOG_OPS_DRY_ENVIRONMENT).toBe(P.environment);
   expect(BACKLOG_OPS_EXECUTE_ENVIRONMENT).not.toBe(P.environment);
-  for (const mode of BACKLOG_OPS_MODES) {
+  for (const mode of LEGACY_MODES) {
     const seen: string[] = [];
     expect(await gate(mode, () => {}, {}, true, seen)).toBeNull();
     expect(seen.some((p) => p.endsWith("/environments/" + backlogOpsEnvironment(mode)))).toBe(true);
@@ -732,7 +741,7 @@ test("refresh dispatch: its own modes; FULL only on drain-execute; exact confirm
   expect(ok(dispatchEnv("drain-execute", { BACKLOG_OPS_CONFIRMATION: `DRAIN-EXECUTE ${sha} DRY ${DRY} BACKFILL ${BACKFILL} FULL ${FULL} EXPORT ${EXPORT}` })))
     .toBe("backlog_ops_confirmation");
   // FULL anywhere else, malformed, or the same run as another binding.
-  for (const mode of BACKLOG_OPS_MODES.filter((m) => m !== "drain-execute" && m !== "presence-dry" && !m.startsWith("backfill-catchup-")))
+  for (const mode of LEGACY_MODES.filter((m) => m !== "drain-execute" && m !== "presence-dry" && !m.startsWith("backfill-catchup-")))
     expect(ok(dispatchEnv(mode, { BACKLOG_OPS_FULL_BACKFILL_RUN: FULL }))).toBe("backlog_ops_full_backfill_run");
   for (const bad of ["0", "abc", " 444", "4".repeat(21)]) expect(ok(drainFullEnv({ BACKLOG_OPS_FULL_BACKFILL_RUN: bad }))).toBe("backlog_ops_full_backfill_run");
   expect(ok(drainFullEnv({ BACKLOG_OPS_FULL_BACKFILL_RUN: BACKFILL }))).toBe("backlog_ops_bindings");
@@ -926,7 +935,7 @@ test("catch-up t: BACKLOG_OPS_REVISIONS_SINCE_MS required (a past epoch ms) for 
   }
   expect(since("drain-execute", String(SINCE), drainFullEnv())).toBeNull();
   expect(since("drain-execute", "", drainFullEnv())).toBe("backlog_ops_revisions_since");
-  for (const mode of BACKLOG_OPS_MODES.filter((m) => !m.startsWith("backfill-catchup-"))) {
+  for (const mode of LEGACY_MODES.filter((m) => !m.startsWith("backfill-catchup-"))) {
     expect(backlogOpsRevisionsSince({}, backlogOpsDispatch(dispatchEnv(mode), true), now)).toBeNull();
     expect(since(mode, String(SINCE))).toBe("backlog_ops_revisions_since");
   }
@@ -1064,7 +1073,7 @@ test("gate, catch-up: FULL a backfill-execute under 24 h before the DRY; t = FUL
   expect(BACKLOG_OPS_CATCHUP_MARGIN_MS).toBe(15 * 60_000);
   expect(BACKLOG_OPS_BINDING_MAX_AGE_MS).toBe(24 * 3600_000);
   // Every other mode without FULL: no t.
-  for (const mode of BACKLOG_OPS_MODES.filter((m) => !m.startsWith("backfill-catchup-")))
+  for (const mode of LEGACY_MODES.filter((m) => !m.startsWith("backfill-catchup-")))
     expect((await catchupGate(mode) as { revisionsSinceMs: unknown }).revisionsSinceMs).toBeNull();
 });
 
@@ -1240,7 +1249,7 @@ test("Path B: env only (a secret list inside the scope, a bounded age variable),
     expect(codeSync(() => nhp({ BACKLOG_OPS_NO_HEAD_PARITY_ORGS: ORG1, BACKLOG_OPS_NO_HEAD_PARITY_MAX_AGE_SECONDS: age }))).toBe("backlog_ops_no_head_parity_max_age");
   expect(codeSync(() => nhp({ BACKLOG_OPS_NO_HEAD_PARITY_MAX_AGE_SECONDS: "3600" }))).toBe("backlog_ops_no_head_parity_max_age");
   // Every other tool refuses either variable.
-  for (const mode of BACKLOG_OPS_MODES.filter((m) => !m.startsWith("export-") && !m.startsWith("drain-"))) {
+  for (const mode of LEGACY_MODES.filter((m) => !m.startsWith("export-") && !m.startsWith("drain-"))) {
     expect(codeSync(() => nhp({ BACKLOG_OPS_NO_HEAD_PARITY_ORGS: ORG1 }, mode))).toBe("backlog_ops_no_head_parity_unexpected");
     expect(codeSync(() => nhp({ BACKLOG_OPS_NO_HEAD_PARITY_MAX_AGE_SECONDS: "3600" }, mode))).toBe("backlog_ops_no_head_parity_unexpected");
     expect(nhp({}, mode)).toBeNull();
@@ -1333,5 +1342,6 @@ test("workflow: Path B comes from a secret and a variable for export and drain m
   expect(yml).not.toContain("vars.BACKLOG_OPS_NO_HEAD_PARITY_ORGS");
   expect(yml).not.toMatch(/inputs\.[a-z_]*(parity|head)/u);
   const inputs = yml.slice(yml.indexOf("    inputs:"), yml.indexOf("  pull_request:"));
-  expect(inputs.match(/^      [a-z_]+:$/gmu)?.length).toBe(10);
+  // 12 of GitHub's 25 workflow_dispatch inputs (the authority modes added reshard_run and authority_run).
+  expect(inputs.match(/^      [a-z_]+:$/gmu)?.length).toBe(12);
 });

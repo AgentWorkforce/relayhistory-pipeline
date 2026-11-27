@@ -50,6 +50,8 @@
  * section reports `complete` only when nothing was skipped for want of a fence, needed review, was invalid or failed.
  * Nothing here logs; the summary holds counts only.
  */
+import { authorityBaseline, type AuthorityBaseline } from "./authority-evidence.ts";
+import { toReceiptShape } from "./backlog-authority.ts";
 import type { ObjectStore } from "../shared/vendor.ts";
 import {
   applyFenceChange, checkIndexEntryInput, fenceEpoch, isDeleted, newFence, recordGeneration, s3LedgerObjects, sessionKeyHash,
@@ -122,6 +124,14 @@ export interface BackfillOptions {
    * further write. The fences section runs first and is not checked (it writes no ledger key).
    */
   halt?: () => unknown;
+  /**
+   * A catch-up bound to an authority-dry (backlog-ops authority_run): run authority-evidence.ts authorityBaseline for
+   * these orgs, with that run's unbound evidence report, INSIDE the input fingerprint's REPEATABLE READ READ ONLY
+   * transaction, after the fingerprint reads. It is a SAMPLED fingerprint baseline: the run's later pages and slot reads
+   * use their own snapshots, so it does not attest the inputs the backfill actually read. The summary carries it
+   * (`authority_baseline`, receipt keys). Needs a scoped catch-up whose org list is exactly `orgs`.
+   */
+  authorityBaseline?: { orgs: string[]; evidence: unknown };
 }
 
 export interface BackfillSummary {
@@ -160,6 +170,8 @@ export interface BackfillSummary {
   fingerprint: BackfillFingerprint;
   /** A catch-up's `revisionsSinceMs` (an epoch ms, not identifying); absent on a full run. */
   revisions_since_ms?: number;
+  /** With BackfillOptions.authorityBaseline: the baseline read in the input snapshot, in receipt keys (counts, hashes, xids). */
+  authority_baseline?: unknown;
 }
 
 /**
@@ -573,6 +585,12 @@ export async function backfillUploadFences(opts: BackfillOptions): Promise<Backf
   const since = opts.revisionsSinceMs;
   if (since !== undefined && (!Number.isSafeInteger(since) || since < 1)) throw new Error("backfill_revisions_since_invalid");
   if (since !== undefined && !sections.has("revisions")) throw new Error("backfill_revisions_since_sections");
+  // The authority baseline: a scoped catch-up only, over exactly its orgs.
+  if (opts.authorityBaseline !== undefined) {
+    const ab = opts.authorityBaseline, own = [...new Set(opts.orgs ?? [])].sort();
+    if (since === undefined || own.length === 0 || ab.orgs.length !== own.length || ![...ab.orgs].sort().every((o, i) => o === own[i]))
+      throw new Error("backfill_authority_baseline_invalid");
+  }
   const orgs = opts.orgs && opts.orgs.length ? [...new Set(opts.orgs)] : null;
   /** A scoped run sends its scoped reads as plain `org_id = ANY($1)` (scopedSql) with custom plans. */
   const scopedRun = orgs !== null;
@@ -609,12 +627,12 @@ export async function backfillUploadFences(opts: BackfillOptions): Promise<Backf
   // One transaction at a time on the single connection: concurrent fenceFor reads (mapLimit) must never interleave
   // their BEGIN/ROLLBACK, or a peer's ROLLBACK would leave this one's reads in autocommit, unbounded, mixed snapshots.
   let txTail: Promise<unknown> = Promise.resolve();
-  function readOnlyAll(queries: [string, unknown[]][], heapOnly = false): Promise<Record<string, unknown>[][]> {
-    const run = txTail.then(() => readOnlyTx(queries, heapOnly));
+  function readOnlyAll(queries: [string, unknown[]][], heapOnly = false, after?: () => Promise<void>): Promise<Record<string, unknown>[][]> {
+    const run = txTail.then(() => readOnlyTx(queries, heapOnly, after));
     txTail = run.catch(() => {});
     return run;
   }
-  async function readOnlyTx(queries: [string, unknown[]][], heapOnly: boolean): Promise<Record<string, unknown>[][]> {
+  async function readOnlyTx(queries: [string, unknown[]][], heapOnly: boolean, after?: () => Promise<void>): Promise<Record<string, unknown>[][]> {
     await sql.query("BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY");
     try {
       const ro = (await sql.query("SHOW transaction_read_only")).rows[0]?.transaction_read_only;
@@ -626,6 +644,8 @@ export async function backfillUploadFences(opts: BackfillOptions): Promise<Backf
       if (heapOnly) { await sql.query("SET LOCAL enable_indexscan = off"); await sql.query("SET LOCAL enable_bitmapscan = off"); }
       const out: Record<string, unknown>[][] = [];
       for (const [query, params] of queries) out.push((await sql.query(scopedSql(query, scopedRun), params)).rows);
+      // Still inside the transaction, so in its snapshot (the authority baseline).
+      if (after) await after();
       return out;
     } finally {
       await sql.query("ROLLBACK").catch(() => {});
@@ -755,9 +775,18 @@ export async function backfillUploadFences(opts: BackfillOptions): Promise<Backf
   // so an invalid one refuses (backfill_fingerprint_invalid) before that org's slot rows reach S3 (the fences and
   // ownership sections, and earlier orgs' slots, have run by then). ----
   {
+    const ab = opts.authorityBaseline;
+    let baseline: AuthorityBaseline | undefined;
+    const inSnapshot = ab === undefined ? undefined : async () => {
+      baseline = await authorityBaseline(ab.orgs, ab.evidence, async (text, params) => (await sql.query(text, [...params])).rows);
+    };
     const [revs, owns, slots] = await readOnlyAll([[FINGERPRINT_REVISIONS, [orgs]], [FINGERPRINT_OWNERSHIP, [orgs]],
       // From the slot pass instead (slotsFromCursor): placeholders here, replaced after it.
-      ...(slotsFromCursor ? [] : [[FINGERPRINT_SLOTS, [orgs]] as [string, unknown[]]])]);
+      ...(slotsFromCursor ? [] : [[FINGERPRINT_SLOTS, [orgs]] as [string, unknown[]]])], false, inSnapshot);
+    if (ab !== undefined) {
+      if (baseline === undefined) throw new Error("backfill_authority_baseline_missing");
+      summary.authority_baseline = toReceiptShape(baseline);
+    }
     const values = [int(revs![0]?.n), int(revs![0]?.max_ms), int(revs![0]?.h), int(owns![0]?.n), int(owns![0]?.h), ...(slotsFromCursor ? [0, 0, 0] : [int(slots![0]?.n), int(slots![0]?.rev_sum), int(slots![0]?.h)])];
     if (values.some((v) => v === undefined)) throw new Error("backfill_fingerprint_invalid");
     const [revisionsCount, maxMs, revisionsHash, ownershipCount, ownershipHash, slotsCount, revisionSum, slotsHash] = values as number[];

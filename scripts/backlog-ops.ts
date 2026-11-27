@@ -40,6 +40,7 @@
  * $RUNNER_TEMP/backlog-ops-out and echoed to the log. The step's exit code is the tool's.
  */
 import { spawn } from "node:child_process";
+import { createHash } from "node:crypto";
 import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -49,8 +50,11 @@ import {
   BACKLOG_OPS_SESSION_SECONDS,
   backlogOpsBindings,
   backlogOpsDispatch,
-  BACKLOG_OPS_LEDGER_TOOLS,
+  BACKLOG_OPS_LEDGER_ID_TOOLS,
   BACKLOG_OPS_NO_HEAD_PARITY_NONE,
+  backlogOpsCloudflareToken,
+  backlogOpsAuthorityReceipt,
+  backlogOpsHomeId,
   backlogOpsNoHeadParity,
   backlogOpsLedgerEnv,
   backlogOpsLedgerId,
@@ -66,12 +70,15 @@ import {
   checkBoundReceipt,
   checkRefreshFingerprint,
   checkStsExpiration,
+  isBridge,
   isCatchup,
   parseStsCredentials,
   toolOf,
   refuseBacklogOps as refuse,
   type BacklogOpsDispatch,
 } from "../src/session-ingest/backlog-ops.ts";
+import { checkAuthorityDryReceipt, checkBaselineReceipt, checkReshardReceipt } from "../src/session-ingest/backlog-authority.ts";
+import { authorityReceiptSummary, type AuthorityReceiptKind } from "../src/session-ingest/backlog-authority-schema.ts";
 
 const ROOT = fileURLToPath(new URL("..", import.meta.url));
 /** The only parent variables a child inherits (plus the AWS session the parent adds). */
@@ -100,8 +107,9 @@ export function backlogOpsChildSpawn(
   aws: { accessKeyId: string; secretAccessKey: string; sessionToken: string },
   dbUrl: string | null,
   session: string | null = null,
+  bound: BoundAuthority = {},
 ) {
-  const since = isCatchup(d.mode) ? backlogOpsRevisionsSince(env, d) : null;
+  const since = isCatchup(d.mode) || isBridge(d.mode) ? backlogOpsRevisionsSince(env, d) : null;
   const scope = backlogOpsScope(env);
   // Path B: the export's only (the drain's binding of it is in checkBoundReceipts).
   const nhp = backlogOpsNoHeadParity(env, d, scope), exportNhp = toolOf(d.mode) === "export" ? nhp : null;
@@ -117,12 +125,23 @@ export function backlogOpsChildSpawn(
   childEnv.AWS_ACCESS_KEY_ID = aws.accessKeyId;
   childEnv.AWS_SECRET_ACCESS_KEY = aws.secretAccessKey;
   childEnv.AWS_SESSION_TOKEN = aws.sessionToken;
+  // The authority modes: the Cloudflare token (and, for the execute, the bound baseline and the ledger bucket's name
+  // for the sweeper's home check) on stdin. A catch-up bound to an authority-dry: that run's evidence on stdin.
+  const cfToken = backlogOpsCloudflareToken(env, d);
+  const wantsEvidence = isCatchup(d.mode) && d.authorityRun !== null, wantsBaseline = d.mode === "authority-execute", wantsFull = isBridge(d.mode);
+  if (wantsFull !== (bound.fullEvidence !== undefined) || (wantsFull && !/^[0-9a-f]{64}$/u.test(bound.fullEvidence!))) refuse("backlog_ops_authority_binding");
+  if (wantsEvidence !== (bound.evidence !== undefined) || wantsBaseline !== (bound.baseline !== undefined) || (cfToken !== null && dbUrl === null))
+    refuse("backlog_ops_authority_binding");
+  let payload: Record<string, unknown> = session !== null ? { dbUrl, session } : exportNhp !== null ? { dbUrl, noHeadParityOrgs: exportNhp.orgs } : { dbUrl };
+  if (cfToken !== null) payload = { dbUrl, cloudflareToken: cfToken,
+    ...(wantsBaseline ? { baseline: bound.baseline, ledgerBucket: backlogOpsLedgerTarget(env, t)?.bucket ?? null } : {}) };
+  if (wantsEvidence) payload = { dbUrl, authorityEvidence: bound.evidence };
+  if (wantsFull) payload = { dbUrl, fullEvidence: bound.fullEvidence };
   return {
     command: process.execPath,
     args: [join(ROOT, spec.script), ...spec.args],
     env: childEnv,
-    input: dbUrl === null ? null
-      : JSON.stringify(session !== null ? { dbUrl, session } : exportNhp !== null ? { dbUrl, noHeadParityOrgs: exportNhp.orgs } : { dbUrl }) + "\n",
+    input: dbUrl === null ? null : JSON.stringify(payload) + "\n",
   };
 }
 
@@ -132,14 +151,26 @@ export function backlogOpsChildSpawn(
  * FULL's input fingerprint (checkRefreshFingerprint, backlog_ops_backfill_stale); a catch-up (the drain's BACKFILL, or
  * a catch-up execute's DRY) must have recorded the gate's t (`revisionsSinceMs`), so it bound the same FULL.
  */
+/** What the authority bindings hand the tool: an authority-dry's evidence (a catch-up), a catch-up's baseline (authority-execute). */
+export interface BoundAuthority { evidence?: unknown; baseline?: unknown; /** A bridge mode: sha256 of the bound FULL receipt's exact bytes. */ fullEvidence?: string }
 export function checkBoundReceipts(env: Record<string, string | undefined>, d: BacklogOpsDispatch, read = (p: string) => readFileSync(p, "utf8"),
-  revisionsSinceMs: number | null = backlogOpsRevisionsSince(env, d)) {
+  revisionsSinceMs: number | null = backlogOpsRevisionsSince(env, d), readBytes: (p: string) => Uint8Array = (p: string) => readFileSync(p)): BoundAuthority {
   const paths = backlogOpsPaths(env), scopeFull = backlogOpsScope(env), scope = scopeFull.id;
   // Path B's id from this run's environment: an export-execute's DRY and a drain-execute's EXPORT must have recorded it.
   const nhpId = backlogOpsNoHeadParity(env, d, scopeFull)?.id ?? BACKLOG_OPS_NO_HEAD_PARITY_NONE;
   // The ledger target this run's tool gets (read only when a binding needs it): a backfill or drain must have it equal
   // to the backfill / drain runs it binds (its dry run, the drain's BACKFILL and FULL).
-  const ledgerTool = BACKLOG_OPS_LEDGER_TOOLS.includes(toolOf(d.mode));
+  const ledgerTool = BACKLOG_OPS_LEDGER_ID_TOOLS.includes(toolOf(d.mode));
+  // This run's store-home pair (authority bindings only; backlogOpsRun validated the target before this runs).
+  const homeId = () => backlogOpsHomeId({ bucket: env.BACKLOG_OPS_BUCKET ?? "", region: env.BACKLOG_OPS_REGION ?? "" },
+    backlogOpsLedgerTarget(env, { bucket: env.BACKLOG_OPS_BUCKET ?? "" }));
+  // Which bound receipts must attest this run's home: every authority-execute binding (FULL included: every backfill
+  // receipt records it), a catch-up's AUTHORITY, and a reshard-dry's catch-up.
+  const authorityRun = (b: { kind: string }, dd: BacklogOpsDispatch) => dd.mode === "authority-execute" || b.kind === "authority" || dd.mode === "reshard-dry" || isBridge(dd.mode);
+  const authority: BoundAuthority = {};
+  // The per-org bindings need the scope's org list (their receipts carry org hashes, never ids).
+  const orgs = scopeFull.orgs;
+  if ((d.mode === "authority-execute" || d.authorityRun !== null) && orgs === null) refuse("backlog_ops_scope_required");
   let ledgerId: string | undefined;
   // (Only the Locker bucket's name is needed here; backlogOpsRun validates the whole target before this runs.)
   const ledger = () => (ledgerId ??= backlogOpsLedgerId(d, backlogOpsLedgerTarget(env, { bucket: env.BACKLOG_OPS_BUCKET ?? "" })));
@@ -150,26 +181,48 @@ export function checkBoundReceipts(env: Record<string, string | undefined>, d: B
     let raw: string;
     try { raw = read(path); } catch { return refuse(`backlog_ops_bound_${b.kind}_missing`); }
     // The drain's BACKFILL and FULL, and a catch-up's FULL: exactly the run's scope (never an unscoped run standing in).
-    const exact = (d.mode === "drain-execute" && (b.kind === "backfill" || b.kind === "full")) || (isCatchup(d.mode) && b.kind === "full");
+    const exact = (d.mode === "drain-execute" && (b.kind === "backfill" || b.kind === "full")) || (isCatchup(d.mode) && b.kind === "full") ||
+      d.mode === "authority-execute" || b.kind === "authority" || d.mode === "reshard-dry" || isBridge(d.mode);
     // The drain's BACKFILL with FULL: a refresh or a catch-up, whichever the receipt says (the gate checked its run-name).
     let mode = b.mode;
     if (b.altMode !== undefined) {
       try { if (JSON.parse(raw)?.mode === b.altMode) mode = b.altMode; } catch { /* checkBoundReceipt refuses it */ }
     }
-    const bindsLedger = ledgerTool && BACKLOG_OPS_LEDGER_TOOLS.includes(toolOf(mode));
+    const bindsLedger = ledgerTool && BACKLOG_OPS_LEDGER_ID_TOOLS.includes(toolOf(mode));
     const bindsNhp = (d.mode === "export-execute" && b.kind === "dry") || (d.mode === "drain-execute" && b.kind === "export");
     checkBoundReceipt(raw, { mode, sha: d.sha, run: b.run, scope, kind: b.kind, exact, ...(bindsLedger ? { ledger: ledger() } : {}),
       ...(bindsNhp ? { noHeadParity: nhpId } : {}) });
-    if (isCatchup(mode) && (revisionsSinceMs === null || JSON.parse(raw).summary.revisions_since_ms !== revisionsSinceMs))
+    // (A reshard-dry binds a catch-up without its FULL, so without t: it checks the catch-up's completion, not its t.)
+    if (isCatchup(mode) && d.mode !== "reshard-dry" && (revisionsSinceMs === null || JSON.parse(raw).summary.revisions_since_ms !== revisionsSinceMs))
       refuse(`backlog_ops_bound_${b.kind}_since`);
     raws[b.kind] = raw;
     modes[b.kind] = mode;
+    // The authority bindings were produced against this run's store-home pair (Locker and ledger), exactly.
+    if (authorityRun(b, d)) {
+      let home: unknown;
+      try { home = JSON.parse(raw).home; } catch { home = undefined; }
+      if (home !== homeId()) refuse(`backlog_ops_bound_${b.kind}_home`);
+    }
+    // The per-org content of the authority bindings (backlog-authority.ts).
+    if (b.kind === "reshard") checkReshardReceipt(raw, orgs!, d.backfillRun!);
+    if (b.kind === "authority") authority.evidence = checkAuthorityDryReceipt(raw, orgs!);
+    if (d.mode === "authority-execute" && b.kind === "dry") checkAuthorityDryReceipt(raw, orgs!);
+    if (d.mode === "authority-execute" && b.kind === "backfill") authority.baseline = checkBaselineReceipt(raw, orgs!, d.dryRun!, d.fullBackfillRun!);
+    // A bridge mode: the bound FULL receipt's sha256 (over its exact downloaded bytes), compared by the tool to the
+    // 062340 binding's selected_full.evidence_sha256 (the seal's evidence).
+    if (isBridge(d.mode) && b.kind === "full") {
+      // Over the file's exact bytes (read without decoding), and those bytes must be what was parsed and checked.
+      const bytes = readBytes(path);
+      if (Buffer.compare(Buffer.from(bytes), Buffer.from(raw, "utf8")) !== 0) refuse("backlog_ops_bound_full_receipt");
+      authority.fullEvidence = createHash("sha256").update(bytes).digest("hex");
+    }
   }
   if (d.mode === "drain-execute" && d.fullBackfillRun !== null) {
     if (raws.full === undefined || raws.backfill === undefined) refuse("backlog_ops_bound_full_missing");
     // A catch-up's fingerprint differs from FULL's by design (the org uploaded during FULL); it re-read what changed.
     if (modes.backfill !== "backfill-catchup-execute") checkRefreshFingerprint(raws.full, raws.backfill);
   }
+  return authority;
 }
 
 /** GitHub OIDC token (audience sts.amazonaws.com) for STS: in memory only. */
@@ -242,21 +295,42 @@ export async function backlogOpsRun(
   const nhp = backlogOpsNoHeadParity(env, d, scope);
   for (const org of nhp?.orgs ?? []) console.log(`::add-mask::${org}`);
   const since = backlogOpsRevisionsSince(env, d);
-  const t = backlogOpsTarget(env), spec = backlogOpsToolArgs(d, t, scope, isCatchup(d.mode) ? since : null, toolOf(d.mode) === "export" ? nhp : null);
+  // The authority modes' Cloudflare token (shape; and empty for every other mode), before any credential.
+  backlogOpsCloudflareToken(env, d);
+  const t = backlogOpsTarget(env), spec = backlogOpsToolArgs(d, t, scope, isCatchup(d.mode) || isBridge(d.mode) ? since : null, toolOf(d.mode) === "export" ? nhp : null);
   // The ledger target's shape, before any credential (backlog_ops_target_ledger_bucket / _region), and its receipt id.
   const ledger = backlogOpsLedgerId(d, backlogOpsLedgerTarget(env, t));
-  checkBoundReceipts(env, d, undefined, since);
+  const bound = checkBoundReceipts(env, d, undefined, since);
   const nhpId = nhp?.id ?? BACKLOG_OPS_NO_HEAD_PARITY_NONE;
+  // Every ledger-id tool's receipt attests the store-home pair (a FULL backfill-execute included).
+  const home = BACKLOG_OPS_LEDGER_ID_TOOLS.includes(toolOf(d.mode)) ? backlogOpsHomeId(t, backlogOpsLedgerTarget(env, t)) : null;
+  // Exact schemas: every authority receipt, and every backfill receipt (a FULL backfill-execute is an authority
+  // binding; every backfill mode shares its producer, so all are closed alike).
+  const schemaKind: AuthorityReceiptKind | null = toolOf(d.mode) === "reshard" ? "reshard" : d.mode === "authority-dry" ? "authority_dry"
+    : d.mode === "authority-execute" ? "authority_execute" : isCatchup(d.mode) && d.authorityRun !== null ? "catchup" : toolOf(d.mode) === "backfill" ? "backfill"
+    : toolOf(d.mode) === "bridge" ? "bridge" : null;
   const paths = backlogOpsPaths(env);
   if (existsSync(paths.receipt)) refuse("backlog_ops_receipt_exists");
   // Credentials from here on: the database URL (backfill, export, presence) and the role session.
   const dbUrl = spec.needsDb ? toolDbUrl(env.SUPABASE_MIGRATION_OWNER_URL) : null;
   const aws = await assumeRole(env, backlogOpsRole(d, t), t.region, backlogOpsSessionName(d.mode, env.GITHUB_RUN_ID!), deps.fetcher);
-  const child = backlogOpsChildSpawn(env, d, aws, dbUrl, session);
+  const child = backlogOpsChildSpawn(env, d, aws, dbUrl, session, bound);
   const { code, stdout } = await (deps.runChild ?? runChild)(child);
   let receipt;
-  try { receipt = backlogOpsReceipt(d, env.GITHUB_RUN_ID!, code, stdout, scope.id, ledger, nhpId); }
-  catch (e) { receipt = backlogOpsReceipt(d, env.GITHUB_RUN_ID!, code || 1, JSON.stringify({ refused: (e as { code?: string }).code ?? "receipt" }), scope.id, ledger, nhpId); }
+  try {
+    receipt = backlogOpsReceipt(d, env.GITHUB_RUN_ID!, code, stdout, scope.id, ledger, nhpId, home);
+    // An authority or backfill receipt conforms exactly to its mode's schema (keys, lists, hash positions, closed codes),
+    // and a refusal keeps only a code from the mode's closed map, before the receipt is persisted or logged.
+    if (schemaKind !== null) {
+      // The bridge's proofs must match the run's scope and the exact gate-derived cutoff the child was given.
+      const r = authorityReceiptSummary(schemaKind, receipt.summary, { orgs: scope.orgs, cutoffMs: isBridge(d.mode) ? since : null });
+      receipt = { ...receipt, summary: r.summary, exitCode: r.ok ? receipt.exitCode : receipt.exitCode || 1 };
+    }
+  } catch (e) {
+    const c = (e as { code?: string }).code;
+    receipt = backlogOpsReceipt(d, env.GITHUB_RUN_ID!, code || 1, JSON.stringify({ refused: typeof c === "string" && c.startsWith("backlog_ops_") ? c : "receipt" }),
+      scope.id, ledger, nhpId, home);
+  }
   writePrivate(paths.receipt, receipt);
   console.log("backlog_ops_receipt " + JSON.stringify(receipt));
   return receipt.exitCode === 0 && code === 0 ? 0 : 1;

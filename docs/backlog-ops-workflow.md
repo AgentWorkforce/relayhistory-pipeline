@@ -294,6 +294,276 @@ census and the drain. Search-index removal depends on the S3 ObjectRemoved -> se
 The eraser does not delete search-index rows itself. Until that is confirmed, step 6's search-index check is the
 control.
 
+## Authority (reshard-dry, authority-dry, authority-execute)
+
+The last step of decision 0005's per-org cutover is writing the org's fence-authority marker
+(`96bulls/.ledger/fence-authority/<org>.json`, `ledger-s3.ts` `validOrgFenceAuthority`). Three modes
+cover it (`src/session-ingest/backlog-authority.ts`, run by `scripts/backlog-authority.ts`). All three
+need a scoped run (`BACKLOG_OPS_ORGS`; `backlog_ops_scope_required` otherwise), because their verdicts
+are per org. Their receipts carry only org hashes (`authority-evidence.ts` `evidenceHash("org", ...)`),
+never an org id.
+
+**authority-execute is held.** `BACKLOG_OPS_AUTHORITY_EXECUTE_ENABLED` is `false`, so the dispatch
+refuses it with `backlog_ops_authority_held` before any GitHub, S3, Cloudflare or database read. The
+tool refuses its `execute` again (`authority_execute_held`). It stays off until the evidence it relies on
+passes review: the review of `authority-evidence.ts` found that observation alone cannot rule out a
+transient admission between reads, and an enforced per-org writer hold is being designed. Until then
+the dry modes' output is diagnostic only.
+
+| Mode | Role | Binds | What it does |
+| --- | --- | --- | --- |
+| `reshard-dry` | dry | optional `backfill_run`: the completed catch-up execute it verifies after (its receipt records `after_run`) | The revision reshard's verify (`revision-reshard.ts`, `verify: true`) per scope org, against the revision home: with `BACKLOG_OPS_LEDGER_*` set, the ledger bucket routed as the edge routes it (fences from the transcripts bucket), after the tool fork guard (`assertToolLedgerHome`). Receipt: `verify_passed` overall and, per org hash, `verify_passed` with the counts. Dry only: `reshard-execute` refuses (`backlog_ops_reshard_dry_only`). |
+| `authority-dry` | dry | nothing | The unbound live evidence (`authorityEvidence` without a baseline). Exit 0 only for `authority_evidence_unbound`, the state `authorityBaseline` takes. Receipt: the report, snake_case. |
+| `backfill-catchup-dry/-execute` with `authority_run` | as before | `AUTHORITY <authority-dry>` | The catch-up runs `authorityBaseline` inside its input fingerprint's REPEATABLE READ READ ONLY transaction (`--authority-baseline`; the evidence on stdin). This is a SAMPLED fingerprint baseline: the backfill's later pages and slot reads use their own snapshots, so it does not attest the inputs the backfill actually read. Its receipt carries `authority_baseline` and, from the credential step, `authority_run` and `full_run` (the exact FULL). Without `authority_run` it is byte-identical to before. |
+| `authority-execute` | execute | `DRY <authority-dry> BACKFILL <catch-up execute> FULL <backfill-execute> RESHARD <reshard-dry>` | Re-reads the evidence bound to the catch-up's baseline (must be `authority_evidence_corroborated`), then the sweeper (below), then, per org, the enforced writer fence and the marker, written create-only. |
+
+The order is the evidence module's own: stop and drain the org, then `authority-dry`, then the
+catch-up with `authority_run`, then `reshard-dry` with `backfill_run` set to that catch-up (its gate
+requires the catch-up completed, so the verify runs after it), then `authority-execute`. The
+execute requires its RESHARD to name its BACKFILL (`after_run`, `backlog_ops_reshard_not_after`).
+
+```
+AUTHORITY-EXECUTE <sha> DRY <authority-dry> BACKFILL <catch-up> FULL <full> RESHARD <reshard-dry>
+BACKFILL-CATCHUP-EXECUTE <sha> DRY <catch-up dry> FULL <full> AUTHORITY <authority-dry>
+```
+
+Bindings (checked before any credential, the same way every other bound run is):
+
+- The gate checks every bound run: same sha, success, first attempt, the dispatcher, its mode from its
+  run-name, one receipt. Age limits: the catch-up (BACKFILL) under 3 h (`BACKLOG_OPS_FRESH_BACKFILL_MS`);
+  DRY, FULL and RESHARD under 24 h. Ordering: FULL and DRY were created before the catch-up, and RESHARD
+  after it. A catch-up's AUTHORITY was created before that catch-up's own DRY. The gate computes t from
+  FULL as for every catch-up, and the credential step checks that the catch-up recorded it.
+- The credential step: every receipt has exactly this run's scope (never `all`) and the ledger target
+  this environment gives (`backlog_ops_bound_<kind>_ledger`). Every receipt of a backfill, drain, reshard or
+  authority run records the store-home pair `home`: a hash of the Locker bucket and region and the ledger
+  target, never `none`. The field is new on backfill and drain receipts, and no earlier binding reads it.
+  Every authority-execute binding, FULL included, must carry this run's `home`
+  (`backlog_ops_bound_<kind>_home`), so a FULL from before this field must be run again. Then: DRY must be `authority_evidence_unbound`
+  over exactly the scope's org hashes, each refused for `sql_unbound` alone. The catch-up's
+  `authority_run` must equal DRY and its `full_run` must equal FULL's run id exactly (t alone could alias
+  two FULL runs created in the same second), and its baseline must be `authority_baseline_ready` over
+  exactly the scope. RESHARD must have `verify_passed` for exactly the scope, each org with missing, invalid and
+  failed at 0.
+
+Inside the job, `authority-execute` does these steps in order, and writes nothing unless the first two
+pass for every org:
+
+1. It reads the bound evidence (`authorityEvidence` with `bound` set to the catch-up's baseline).
+2. It reads the sweeper's serving spec and builds `freshSweeperPass`'s expectation from it. Every org
+   needs a pass under 6 h old (`BACKLOG_OPS_SWEEPER_PASS_MAX_AGE_MS`).
+3. Evidence is corroboration only: it cannot rule out an admission between its reads or after the
+   last one, so it never authorises a marker by itself. For each org, immediately before its write, the
+   run re-checks that the report is under 5 minutes old (`BACKLOG_OPS_AUTHORITY_REPORT_MAX_AGE_MS`) and
+   that the org's verdict is ok. It then asks the enforced writer fence (`writerFence`): a durable per-org
+   hold that every admission path honours, bound to this run's baseline. That fence is being designed and
+   is not in this tree, so the tool has none and refuses before any write (`writer_fence_unavailable`).
+   With a fence that holds, the run writes the marker with `If-None-Match` and reads it back.
+   ANY object already there is a `conflict`, never overwritten and never taken as this run's, and the
+   run fails (`authority_incomplete`). An earlier or delayed write cannot be told from this run's until
+   the epoch-bound hold protocol exists, so a rerun after a partial write fails closed.
+
+Authority receipts are the only receipts that may hold lists. Each mode has an exact schema
+(`backlog-authority-schema.ts`) covering every key, every list and its bound, every hash and digest
+position, and every code from a closed set. The credential step applies it before the receipt is
+persisted or logged. A summary that does not conform becomes `{"refused": "backlog_ops_receipt_schema"}`
+and the run exits 1. A refusal summary keeps its code only when the mode's closed refusal map lists
+it; otherwise it becomes `internal_error`, or `backfill_refused` for a catch-up. A backfill section's
+`failed_codes` keeps only its known keys and sums the rest under `other`.
+
+Every backfill receipt (backfill-dry/-execute, refresh, catch-up) is closed the same way. A FULL
+backfill-execute is an authority binding, and every backfill mode shares its producer. The exact
+backfill schema accepts every real summary (tested against PGlite runs). A refusal keeps only a code
+the backfill itself throws (enumerated from its source), a digits-only `sqlstate_<5 digits>`, or
+`db_connection_lost`; anything else becomes `backfill_refused`. Before this, `redactedReason` let any
+code-shaped error message through.
+
+### The sweeper's serving spec (proposal; not built)
+
+The GitHub job has no kubectl. It therefore reads what the CURRENT serving sweeper is from
+`96bulls/.ledger/rearm-sweeper/serving-spec.json` in the transcripts bucket (`BACKLOG_OPS_BUCKET`, next
+to the sweeper's cursor and `passes/`):
+
+```json
+{"v":1,"kind":"rearm-sweeper-serving-spec","observedAtMs":0,"namespace":"<ns>","cronJobName":"<name>",
+ "cronJobUid":"<uuid>","suspended":false,"orgs":["<org>"],"bucket":"<INGEST_REARM_BUCKET>",
+ "ledgerBucket":null,"imageDigests":["sha256:<64 hex>"]}
+```
+
+`orgs` may be `null` (every org), `ledgerBucket` a bucket name, and `gitShas` an optional list.
+
+An in-cluster observer writes it from the live CronJob: its uid, `spec.suspend`, the container's
+`INGEST_REARM_ORGS`, `_BUCKET` and `_LEDGER_BUCKET`, and its image, which must be pinned by digest.
+The observer runs under its own IAM role, which may put only that key. A bucket-policy deny keeps
+every other principal off the key, and keeps the observer off the rest of `.ledger/rearm-sweeper/`.
+The observer, its IAM and that policy are an infrastructure follow-up. Until they exist,
+`authority-execute` refuses with `sweeper_spec_missing`.
+
+The execute refuses when any of these does not hold: the spec is valid; it is under 1 h old and not in
+the future; `suspended` is false; its `bucket` and `ledgerBucket` equal this run's own protected
+variables (`sweeper_home_mismatch`); and its `orgs` cover the scope.
+
+Prerequisites before the hold can be lifted (none is code on this branch):
+
+- A read-only Cloudflare token (Workers Scripts:Read, Queues:Read), set as the environment SECRET
+  `BACKLOG_OPS_CLOUDFLARE_TOKEN` on both backlog-ops environments. The workflow passes it to the tool
+  step for authority modes only, and the tool gets it on stdin only.
+- The execute role needs `s3:GetObject` on `96bulls/.ledger/rearm-sweeper/*` and
+  `96bulls/.ledger/fence-authority/*`, and `s3:PutObject` on `96bulls/.ledger/fence-authority/*`. The
+  dry role needs `ListBucket` and `GetObject` on the revision home's `96bulls/.admission-inbox/*`.
+- The serving-spec observer, described above.
+- The epoch-bound per-org writer hold, replacing the boolean `writerFence` seam. It must be durable and
+  reversible, and the admission paths must take conflicting locks on it. Baseline, catch-up, marker and
+  replay must bind to one fence epoch. The hold must outlive an ambiguous or delayed marker PUT, and must
+  reconcile one by epoch.
+- An independently authenticated serving spec (the observer above, with its bucket-policy deny).
+- A reviewed commit that flips `BACKLOG_OPS_AUTHORITY_EXECUTE_ENABLED`.
+
+### The empty-erasure-window proof and bridge-dry
+
+The gating criterion layered-sessions-pipeline accepts for an org to reach `bridge_complete` without
+the erase manifest is `erasure_window_empty` (`src/session-ingest/erasure-window.ts`). `bridge-dry` is
+a scoped mode that binds `full_backfill_run`; the gate computes its cutoff t from FULL, exactly as it
+does for a catch-up. For each org, the tool itself reads one statement, in a READ ONLY transaction, so
+the caller never supplies the set:
+
+- **Every erasure-lane source in the schema.** The sources are `operator_user_erasures`, the five
+  `session_erasure_*` tables, `upload_deletions`, `upload_resets`, `upload_erasure_rearm`,
+  `relayfacts_erasure_fences`, `session_analysis_purge_fences` and `_authority`, and
+  `ingest_frozen_source_deletions` and `_resets`.
+  - A row counts as in the window when its timestamp is at or after t, or when it is still in
+    flight, whatever its age.
+  - A table with no timestamp counts every row of the org (fail closed).
+  - A test fails the build if an erasure-like table in the migrations is left unclassified. The
+    excluded singletons (an eraser heartbeat and a purge cursor) are listed with their reasons.
+- **The status, in the same snapshot.** The 062320 status (hold, epoch, timestamps) and its erasure
+  watermark come from the same statement.
+
+The proof is `erasure_window_empty` only when every count is 0, the hold is live in `sealed` or
+`marker_attempted`, and the read came after the seal. Anything else is `erasure_window_nonempty` or
+`erasure_window_unproven`, and the org stays HELD for the manifest or for reconciliation.
+
+A positive set never releases. A user erase still needs `bytes_verified` and the writer-generation
+proof, and a session erase needs evidence from the operator-erase replay-target manifest (its own slot,
+still to be assigned by the slot registry; 062330 belongs to the buffered-search-feed fix).
+
+The receipt has an exact schema (kind `bridge`) and carries org hashes only.
+
+The proof binds the hold epoch as a typed hash (`epoch_hash`), never the raw UUID. The receipt also
+records `full_run`, the exact FULL its cutoff came from.
+
+An empty proof is corroboration only, never permission to release. A count of surviving rows cannot
+prove that no event happened. A row deleted again leaves the count unchanged: `ingest_apply_selection`
+removes an `upload_deletions` row on re-enable, for example. And today's 062320 watermark counts
+surviving rows of only two tables.
+
+So on this head `releaseOnEmptyWindow` refuses unconditionally (`release_watermark_partial`),
+whatever the proof or its declared `watermark_kind`, and takes no watermark argument. A future release
+is a separate, reviewed consumer of the follow-up erasure-history slot in the 062320 owner's lane. It
+needs:
+- verified history coverage from the FULL cutoff through the release;
+- serialized writer checks;
+- a comparison of the dry receipt's `full_run` with its selected FULL.
+
+With slot 062340 (review/org-erasure-history @ adc8f8f5), the hold status also carries two things:
+- `erasure_history`, the history fence: `fence_at`, which is always the hold's `installed_at`, plus
+  `covered`, `recording` (a continuity check since the apply), `coverage_started_at` and `by_source`.
+  `erasures` counts the history rows for the org since `fence_at`.
+- `selected_full`, the FULL bound by the post-seal `_bind`: `run`, `started_at`, `started_ms` and
+  `evidence_sha256`. It is null until `_bind` runs.
+
+`bridge-dry` reads both in the same statement as the per-source counts. Each of these checks is
+independent and has its own closed reason:
+- `fence_at` equals the hold's `installed_at` exactly, in SQL, at stored precision
+  (`history_cutoff_mismatch`).
+- The bound FULL is this run's, compared only to `selected_full` and never to the fence
+  (`history_full_mismatch`):
+  - its `run` equals the dispatch's `full_backfill_run`;
+  - its `started_ms` equals the FULL's start as the gate knows it, its created_at, which is the
+    cutoff plus the 15-minute margin;
+  - its `evidence_sha256` equals the sha256 of the bound FULL receipt's exact downloaded bytes. The
+    credential step computes that digest and hands it to the tool on stdin.
+- `installed_at` < start ≤ `sealed_at`, with the start built exactly from `started_ms` in SQL
+  (`history_full_order_invalid`).
+- `covered` and `recording` hold (`history_not_covering_cutoff`, `history_not_recording`), and
+  `by_source` sums to `erasures`, which is 0 for an empty window.
+
+**Contract for the seal and bind callers.** No caller exists at this head. Whoever writes the post-seal
+bridge step (authority-execute, or the cutover runbook) must keep to these values exactly, and that step's
+review must check them. A mismatch fails closed (`history_full_mismatch`).
+- `_seal(org, epoch, evidence)`: `evidence` is the lowercase hex64 sha256 over the exact bytes of the
+  bound FULL backfill-execute's `backlog-ops-receipt.json` artifact, the file as downloaded and not
+  re-encoded. SQL stores it in the `sealed` event and never hashes anything itself.
+- `_bind(org, epoch, full_run, full_started_ms, full_evidence)`:
+  - `full_run` is that FULL's GitHub run id;
+  - `full_started_ms` is that FULL run's GitHub created_at in integer ms, the same value the gate derives
+    (the cutoff plus `BACKLOG_OPS_CATCHUP_MARGIN_MS`);
+  - `full_evidence` is the same digest that was passed to `_seal`, byte for byte.
+
+  SQL requires install < start ≤ seal, so a FULL dispatched before the install committed is refused
+  (55000).
+
+The credential step computes that same digest for `bridge-dry` from the file's raw bytes, read without
+decoding. It refuses if those bytes differ from the text it parsed and checked.
+
+Separately, persistence still requires each proof's snapshot `cutoff_ms` to equal the gate-derived FULL
+cutoff. Without 062340 (062320 alone) the proof is a snapshot only. A test pins `ERASURE_SOURCES` to
+062340's `ORG_ERASURE_HISTORY_SOURCES` once that file is on the branch.
+
+`bridge-execute` is HELD in code (`BACKLOG_OPS_BRIDGE_EXECUTE_ENABLED`), and its tool refuses
+(`bridge_release_held`) until slot 062320 lands.
+
+### The hold bridge (code only)
+
+`src/session-ingest/hold-bridge.ts` covers the bridge side of the per-org admission hold:
+`docs/design/org-admission-hold.md`, sections 6.1 and 6.2, slot `20261105062320`. The replay of a
+positive erasure set is not wired to a mode. Only the empty-window path above is (`bridge-dry`).
+
+- **Lifecycle adapter (`holdSql`).** It holds the slot's owner-only functions in one table, so a
+  rename is one edit. Each runs alone in a READ COMMITTED transaction:
+  - `_status(org)`: read-only. It returns the live (or latest released) hold and the org's erasure
+    record count.
+  - `_install(org, request)`, `_seal(org, epoch, evidence)` and `_marker_attempt(org, epoch, evidence)`.
+  - `_release(org, epoch, reason, evidence, detail, erasures)`. For `bridge_complete`, `erasures` is
+    the count the replay settled on. The function recomputes it under the exclusive key and refuses if
+    an erasure committed since.
+- **Erasure set (`ERASURE_SET_SQL`, read-only).** It reads `operator_user_erasures` and
+  `session_erasure_fences` for the org, since FULL minus the margin.
+- **Replay (`replayErasures`).** It replays until the count is unchanged across a pass that found
+  nothing new:
+  - A user erase maps to that user's S3 fence reset (`resetUploadedSessions`, keyed by the request id),
+    then `eraseLogPayloads`.
+  - A user erase replays only once the SQL erase reached `bytes_verified`. That is the artifact lane's
+    own byte receipt, a separate prerequisite. Until then the replay returns `erasure_bytes_unverified`
+    and writes no receipt.
+  - Even after `bytes_verified`, a user erase also needs a proven generation boundary
+    (`userGenerationBoundary`): a late old write cannot survive the replay, and a replay after release
+    keeps new uploads. No such proof exists yet, so every user erase returns
+    `erasure_generation_unproven`, with no effect and no receipt, and `bridge_complete` stays held.
+  - A session erase maps to the S3 fence deletion (`setSessionUploads`, `enabled: false`) of every
+    target in a complete erase manifest: every alias, for every owner, at every recorded origin, the
+    turns origin included. S3 owner stubs can be partial: the SQL erase unions owners from ownership,
+    index and directory rows over the alias closure. The erase-lane review therefore requires a durable
+    target manifest captured under the erase lock before destructive cleanup.
+  - No such manifest exists yet. Every session erase replays to `session_manifest_missing` (or
+    `session_coverage_partial`) and writes no receipt, so it blocks `bridge_complete`. This fails
+    closed. A cross-lane dependency remains open: the erase lane has to record that manifest. Its design
+    belongs to the erase-lane owner (layered-sessions-pipeline, with the 050000/050010 author). This
+    code only consumes it and refuses on incomplete evidence. Historic erases recorded without a
+    manifest stay blocked unless an independent completeness proof is supplied.
+  - Each replay writes a create-only receipt at
+    `96bulls/.ledger/hold-bridge/<org>/<epoch>/erasures/<hash of the request>.json`. A retry finds it
+    and re-applies nothing.
+- **`bridge_complete` (`bridgeCompleteVerdict`).** Only with the hold `marker_attempted` at this
+  epoch, and every erasure of the re-read set receipted for that epoch. After any marker attempt the
+  only release is `bridge_complete` (`releaseAllowed`).
+- **Waves (`waveOrgs`).** An org whose hold is `marker_attempted` is stuck and never joins a new
+  wave.
+- **Alarms (`holdAlarms`).** A hold sealed for over 60 min, or attempted for over 24 h without
+  `bridge_complete`, pages the owner named by configuration (`BACKLOG_OPS_HOLD_ALARM_OWNER`, an Agent
+  Relay name; for this rollout, claude-cloud-cloud-b1). The 60-minute bound exists because publication
+  for the org is refused while it is sealed. The alarm carries the org's hash only.
+
 ## Gates
 
 Every run passes the same gates as the guarded schema release:

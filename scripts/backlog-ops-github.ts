@@ -37,6 +37,8 @@ import { SCHEMA_RELEASE as S } from "../src/hoopdb/schema-release-contract.ts";
 import {
   BACKLOG_OPS_BINDING_MAX_AGE_MS,
   BACKLOG_OPS_CATCHUP_MARGIN_MS,
+  BACKLOG_OPS_AUTHORITY_EXECUTE_ENABLED,
+  BACKLOG_OPS_BRIDGE_EXECUTE_ENABLED,
   BACKLOG_OPS_EXECUTE_ENABLED,
   BACKLOG_OPS_FRESH_BACKFILL_MS,
   BACKLOG_OPS_RECEIPT_ARTIFACT,
@@ -63,9 +65,10 @@ export async function backlogOpsGithubGate(
   env: Record<string, string | undefined>,
   get: Get,
   approved = false,
-  options: { enabled?: boolean; now?: number } = {},
+  options: { enabled?: boolean; authorityEnabled?: boolean; bridgeEnabled?: boolean; now?: number } = {},
 ) {
-  const input = backlogOpsDispatch(env, options.enabled ?? BACKLOG_OPS_EXECUTE_ENABLED);
+  const input = backlogOpsDispatch(env, options.enabled ?? BACKLOG_OPS_EXECUTE_ENABLED, options.authorityEnabled ?? BACKLOG_OPS_AUTHORITY_EXECUTE_ENABLED,
+    options.bridgeEnabled ?? BACKLOG_OPS_BRIDGE_EXECUTE_ENABLED);
   const now = options.now ?? Date.now();
   if (env.GITHUB_REPOSITORY !== S.repository || env.GITHUB_REPOSITORY_ID !== PRIVATE_INGEST_RELEASE.repositoryId ||
       env.GITHUB_EVENT_NAME !== "workflow_dispatch" || env.GITHUB_REF !== "refs/heads/main" ||
@@ -90,7 +93,8 @@ export async function backlogOpsGithubGate(
   for (const b of backlogOpsBindings(input)) {
     const bound = await get(base + "/actions/runs/" + b.run);
     const at = Date.parse(bound.created_at);
-    const maxAge = b.kind === "backfill" && input.mode === "drain-execute" ? BACKLOG_OPS_FRESH_BACKFILL_MS : BACKLOG_OPS_BINDING_MAX_AGE_MS;
+    // The drain's BACKFILL and authority-execute's catch-up must be fresh (3 h); everything else under 24 h.
+    const maxAge = b.kind === "backfill" && (input.mode === "drain-execute" || input.mode === "authority-execute") ? BACKLOG_OPS_FRESH_BACKFILL_MS : BACKLOG_OPS_BINDING_MAX_AGE_MS;
     if (String(bound.id) !== b.run || String(bound.id) === env.GITHUB_RUN_ID || bound.path !== BACKLOG_OPS_WORKFLOW ||
         bound.head_sha !== input.sha || bound.head_branch !== "main" || bound.event !== "workflow_dispatch" ||
         bound.run_attempt !== 1 || bound.status !== "completed" || bound.conclusion !== "success" ||
@@ -111,6 +115,15 @@ export async function backlogOpsGithubGate(
     refuse("backlog_ops_gate_full_order");
   // A catch-up execute's FULL came before its DRY (which bound the same FULL: the credential step checks its t).
   if (input.mode === "backfill-catchup-execute" && !(created.full! < created.dry!)) refuse("backlog_ops_gate_full_order");
+  // authority-execute: the evidence module's order. Its DRY (the unbound evidence the baseline took its stops from) and
+  // the catch-up's FULL were both created before the catch-up that ran the baseline.
+  if (input.mode === "authority-execute" && !(created.full! < created.backfill!)) refuse("backlog_ops_gate_full_order");
+  if (input.mode === "authority-execute" && !(created.dry! < created.backfill!)) refuse("backlog_ops_gate_order");
+  // The reshard verify ran after the catch-up (it verifies the state the marker would cover).
+  if (input.mode === "authority-execute" && !(created.reshard! > created.backfill!)) refuse("backlog_ops_gate_reshard_order");
+  // A catch-up's AUTHORITY: created before the catch-up's own DRY when it is an execute (the evidence it hands the baseline
+  // existed before either catch-up run started).
+  if (input.mode === "backfill-catchup-execute" && created.authority !== undefined && !(created.authority < created.dry!)) refuse("backlog_ops_gate_order");
   // t: FULL's created_at minus the margin, from this API only. Every run binding FULL gets it (a drain's BACKFILL may be
   // a catch-up; the credential step uses it only then).
   let revisionsSinceMs: number | null = null;

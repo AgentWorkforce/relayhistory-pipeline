@@ -23,13 +23,21 @@ run-name: ${{ github.event_name == 'workflow_dispatch' && format('backlog ops {0
 # default_transaction_read_only=on and a READ ONLY transaction. Its session id is the dry environment's SECRET
 # SESSION_PRESENCE_SESSION, set by the owner before the dispatch and removed after it, passed only to the tool step
 # and only for this mode; it never reaches argv, a log line or the receipt (docs/backlog-ops-workflow.md).
+# reshard-dry (DRY ONLY, scoped runs only) verifies the revision reshard per org against the revision home (the ledger
+# bucket when BACKLOG_OPS_LEDGER_* is set). authority-dry (scoped) reads the unbound live evidence for the per-org
+# fence-authority marker (Cloudflare read-only token: the SECRET BACKLOG_OPS_CLOUDFLARE_TOKEN, authority modes only);
+# a catch-up may bind it (authority_run) to record authorityBaseline in its input snapshot. authority-execute binds
+# its dry, that catch-up, its FULL and a reshard-dry, and writes the markers create-only; it is HELD in code
+# (BACKLOG_OPS_AUTHORITY_EXECUTE_ENABLED) until its evidence passes review (docs/backlog-ops-workflow.md "Authority").
+# bridge-dry (scoped, binds full_backfill_run) reads each org's erasure-window proof for the admission hold's release
+# (src/session-ingest/erasure-window.ts); bridge-execute is HELD in code (BACKLOG_OPS_BRIDGE_EXECUTE_ENABLED).
 # Push and pull_request run only the credential-free tests (no secrets, no environment).
 on:
   workflow_dispatch:
     inputs:
       mode:
         type: choice
-        options: [backfill-dry, backfill-execute, export-dry, export-execute, drain-dry, drain-execute, presence-dry, backfill-refresh-dry, backfill-refresh-execute, backfill-catchup-dry, backfill-catchup-execute]
+        options: [backfill-dry, backfill-execute, export-dry, export-execute, drain-dry, drain-execute, presence-dry, backfill-refresh-dry, backfill-refresh-execute, backfill-catchup-dry, backfill-catchup-execute, reshard-dry, authority-dry, authority-execute, bridge-dry, bridge-execute]
         default: backfill-dry
         required: true
       sha:
@@ -41,7 +49,7 @@ on:
         type: string
         default: ""
       backfill_run:
-        description: export-execute and drain-execute - a successful backfill-execute run at the same sha (the drain's under 3h old); empty otherwise
+        description: export-execute and drain-execute - a successful backfill-execute run at the same sha (the drain's under 3h old); authority-execute - the backfill-catchup-execute (under 3h old) that recorded the baseline; reshard-dry (optional) - the completed catch-up execute it verifies after; empty otherwise
         type: string
         default: ""
       export_run:
@@ -49,7 +57,15 @@ on:
         type: string
         default: ""
       full_backfill_run:
-        description: backfill-catchup-dry/-execute (required) - the full backfill-execute (under 24h old) the catch-up follows; drain-execute (optional) - the one backfill_run, then a refresh or catch-up execute, follows; empty otherwise
+        description: backfill-catchup-dry/-execute and authority-execute (required) - the full backfill-execute (under 24h old) the catch-up follows; drain-execute (optional) - the one backfill_run, then a refresh or catch-up execute, follows; empty otherwise
+        type: string
+        default: ""
+      reshard_run:
+        description: authority-execute only (required) - a successful reshard-dry at the same sha whose verify passed for every org; empty otherwise
+        type: string
+        default: ""
+      authority_run:
+        description: backfill-catchup-dry/-execute only (optional) - a successful authority-dry at the same sha; the catch-up then records the authority baseline; empty otherwise
         type: string
         default: ""
       max_objects:
@@ -65,12 +81,22 @@ on:
         type: string
         default: ""
       confirmation:
-        description: 'Execute: <MODE uppercase> <sha> DRY <dry_run> [BACKFILL <backfill_run>] [FULL <full_backfill_run>] [EXPORT <export_run>] (catch-up: BACKFILL-CATCHUP-EXECUTE <sha> DRY <dry_run> FULL <full_backfill_run>). Dry modes: empty'
+        description: 'Execute: <MODE uppercase> <sha> DRY <dry_run> [BACKFILL <backfill_run>] [FULL <full_backfill_run>] [EXPORT <export_run>] [RESHARD <reshard_run>] [AUTHORITY <authority_run>] (catch-up: BACKFILL-CATCHUP-EXECUTE <sha> DRY <dry_run> FULL <full_backfill_run> [AUTHORITY <authority_run>]; AUTHORITY-EXECUTE <sha> DRY <dry_run> BACKFILL <backfill_run> FULL <full_backfill_run> RESHARD <reshard_run>). Dry modes: empty'
         type: string
         default: ""
   pull_request:
     paths:
       - .github/workflows/backlog-ops.yml
+      - scripts/backlog-authority.ts
+      - src/session-ingest/backlog-authority.ts
+      - src/session-ingest/__tests__/backlog-authority*
+      - src/session-ingest/authority-evidence.ts
+      - src/session-ingest/rearm-sweeper-receipt.ts
+      - src/session-ingest/revision-reshard.ts
+      - src/session-ingest/erasure-window.ts
+      - src/session-ingest/hold-bridge.ts
+      - src/session-ingest/__tests__/erasure-window*
+      - src/session-ingest/__tests__/hold-bridge*
       - scripts/backlog-ops*.ts
       - src/session-ingest/backlog-ops.ts
       - src/session-ingest/__tests__/backlog-ops*
@@ -90,6 +116,16 @@ on:
     branches: [main]
     paths:
       - .github/workflows/backlog-ops.yml
+      - scripts/backlog-authority.ts
+      - src/session-ingest/backlog-authority.ts
+      - src/session-ingest/__tests__/backlog-authority*
+      - src/session-ingest/authority-evidence.ts
+      - src/session-ingest/rearm-sweeper-receipt.ts
+      - src/session-ingest/revision-reshard.ts
+      - src/session-ingest/erasure-window.ts
+      - src/session-ingest/hold-bridge.ts
+      - src/session-ingest/__tests__/erasure-window*
+      - src/session-ingest/__tests__/hold-bridge*
       - scripts/backlog-ops*.ts
       - src/session-ingest/backlog-ops.ts
       - src/session-ingest/__tests__/backlog-ops*
@@ -126,6 +162,8 @@ env:
   BACKLOG_OPS_BACKFILL_RUN: ${{ inputs.backfill_run }}
   BACKLOG_OPS_EXPORT_RUN: ${{ inputs.export_run }}
   BACKLOG_OPS_FULL_BACKFILL_RUN: ${{ inputs.full_backfill_run }}
+  BACKLOG_OPS_RESHARD_RUN: ${{ inputs.reshard_run }}
+  BACKLOG_OPS_AUTHORITY_RUN: ${{ inputs.authority_run }}
   BACKLOG_OPS_MAX_OBJECTS: ${{ inputs.max_objects }}
   BACKLOG_OPS_SLOTS_READ: ${{ inputs.slots_read }}
   BACKLOG_OPS_SLOT_PACE_MS: ${{ inputs.slot_pace_ms }}
@@ -149,6 +187,10 @@ jobs:
         run: bun install --frozen-lockfile
       - name: Contract, gate and workflow tests (no credentials)
         run: bun test --timeout 120000 ./src/session-ingest/__tests__/backlog-ops.test.ts
+      - name: Authority modes, reshard verify and marker tests (in-process fake stores and providers, no credentials)
+        run: |
+          bun test --timeout 120000 ./src/session-ingest/__tests__/backlog-authority.test.ts
+          bun test --timeout 300000 ./src/session-ingest/__tests__/hold-bridge.test.ts ./src/session-ingest/__tests__/erasure-window.test.ts
       - name: Relocated-ledger stores and fork guard of the backfill and the drain (in-process fake buckets, no credentials)
         run: bun test --timeout 120000 ./src/session-ingest/__tests__/ledger-tool-store.test.ts
       - name: The drain and the backfill end to end, routed and single-bucket (scratch stores, in-process PGlite, no credentials)
@@ -223,8 +265,8 @@ jobs:
           repository: ${{ github.repository }}
           run-id: ${{ inputs.dry_run }}
           github-token: ${{ github.token }}
-      - name: Download the bound backfill's receipt (export-execute, drain-execute)
-        if: inputs.mode == 'export-execute' || inputs.mode == 'drain-execute'
+      - name: Download the bound backfill's receipt (export-execute, drain-execute, authority-execute; reshard-dry with backfill_run)
+        if: inputs.mode == 'export-execute' || inputs.mode == 'drain-execute' || inputs.mode == 'authority-execute' || (inputs.mode == 'reshard-dry' && inputs.backfill_run != '')
         uses: actions/download-artifact@v4
         with:
           name: backlog-ops-receipt
@@ -232,8 +274,8 @@ jobs:
           repository: ${{ github.repository }}
           run-id: ${{ inputs.backfill_run }}
           github-token: ${{ github.token }}
-      - name: Download the bound full backfill's receipt (drain-execute with full_backfill_run, backfill-catchup-*)
-        if: (inputs.mode == 'drain-execute' || startsWith(inputs.mode, 'backfill-catchup-')) && inputs.full_backfill_run != ''
+      - name: Download the bound full backfill's receipt (drain-execute with full_backfill_run, backfill-catchup-*, authority-execute)
+        if: (inputs.mode == 'drain-execute' || startsWith(inputs.mode, 'backfill-catchup-') || inputs.mode == 'authority-execute' || startsWith(inputs.mode, 'bridge-')) && inputs.full_backfill_run != ''
         uses: actions/download-artifact@v4
         with:
           name: backlog-ops-receipt
@@ -250,6 +292,24 @@ jobs:
           repository: ${{ github.repository }}
           run-id: ${{ inputs.export_run }}
           github-token: ${{ github.token }}
+      - name: Download the bound reshard verify's receipt (authority-execute)
+        if: inputs.mode == 'authority-execute'
+        uses: actions/download-artifact@v4
+        with:
+          name: backlog-ops-receipt
+          path: ${{ runner.temp }}/backlog-ops-bound/reshard
+          repository: ${{ github.repository }}
+          run-id: ${{ inputs.reshard_run }}
+          github-token: ${{ github.token }}
+      - name: Download the bound authority evidence's receipt (backfill-catchup-* with authority_run)
+        if: startsWith(inputs.mode, 'backfill-catchup-') && inputs.authority_run != ''
+        uses: actions/download-artifact@v4
+        with:
+          name: backlog-ops-receipt
+          path: ${{ runner.temp }}/backlog-ops-bound/authority
+          repository: ${{ github.repository }}
+          run-id: ${{ inputs.authority_run }}
+          github-token: ${{ github.token }}
       # The only step given the owner URL secret, and the only step that requests the OIDC token and exchanges it for
       # the mode's role. GitHub exposes ACTIONS_ID_TOKEN_REQUEST_* to every step of a job with id-token: write, so the
       # job's other steps (checkout, setup-bun, install, gate, download-artifact) could request a token too. That is
@@ -259,7 +319,10 @@ jobs:
       # session id is given to this step only, for presence-dry only, and reaches the tool on the same stdin pipe.
       - name: Run the backlog tool (the only step holding the DB secret or the role session)
         env:
-          SUPABASE_MIGRATION_OWNER_URL: ${{ (startsWith(inputs.mode, 'backfill-') || startsWith(inputs.mode, 'export-') || inputs.mode == 'presence-dry') && secrets.SUPABASE_MIGRATION_OWNER_URL || '' }}
+          SUPABASE_MIGRATION_OWNER_URL: ${{ (startsWith(inputs.mode, 'backfill-') || startsWith(inputs.mode, 'export-') || inputs.mode == 'presence-dry' || startsWith(inputs.mode, 'authority-') || startsWith(inputs.mode, 'bridge-')) && secrets.SUPABASE_MIGRATION_OWNER_URL || '' }}
+          # The authority modes' read-only Cloudflare token (Workers Scripts:Read, Queues:Read): a SECRET on both
+          # environments, given to this step for authority modes only; the tool gets it only on its stdin pipe.
+          BACKLOG_OPS_CLOUDFLARE_TOKEN: ${{ startsWith(inputs.mode, 'authority-') && secrets.BACKLOG_OPS_CLOUDFLARE_TOKEN || '' }}
           SESSION_PRESENCE_SESSION: ${{ inputs.mode == 'presence-dry' && secrets.SESSION_PRESENCE_SESSION || '' }}
           BACKLOG_OPS_BUCKET: ${{ vars.BACKLOG_OPS_BUCKET }}
           BACKLOG_OPS_REGION: ${{ vars.BACKLOG_OPS_REGION }}
