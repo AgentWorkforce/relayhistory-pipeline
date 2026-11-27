@@ -5,9 +5,12 @@
  * bound to an authority-dry. GitHub, STS, Cloudflare and the database are fakes; stores are scratch stores.
  */
 import { afterEach, expect, test } from "bun:test";
+import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { createHash } from "node:crypto";
 import { backlogOpsGithubGate } from "../../../scripts/backlog-ops-github.ts";
-import { backlogOpsChildSpawn, checkBoundReceipts } from "../../../scripts/backlog-ops.ts";
+import { backlogOpsChildSpawn, backlogOpsRun, checkBoundReceipts } from "../../../scripts/backlog-ops.ts";
 import { authorityStdin, main as authorityMain, parseAuthorityArgs, readOnlySql } from "../../../scripts/backlog-authority.ts";
 import { SCHEMA_RELEASE as P } from "../../hoopdb/schema-release-contract.ts";
 import { ObjectStoreError, objectKey, readAll, type ObjectStore } from "../../shared/vendor.ts";
@@ -26,6 +29,7 @@ import {
   rearmServingSpecKey,
   reshardVerifyOrgs,
   sweeperExpectation,
+  authorityStringsClosed,
   toReceiptShape,
   validServingSpec,
   writeOrgMarker,
@@ -39,6 +43,7 @@ import {
   BACKLOG_OPS_WORKFLOW,
   backlogOpsBindings,
   backlogOpsCloudflareToken,
+  backlogOpsHomeId,
   backlogOpsConfirmation,
   backlogOpsDispatch,
   backlogOpsEnvironment,
@@ -164,8 +169,16 @@ test("a catch-up may bind an authority-dry (AUTHORITY, in its confirmation); its
   expect(backlogOpsToolArgs(plain, t, backlogOpsScope(SCOPE), SINCE).args).not.toContain("--authority-baseline");
   expect(backlogOpsToolArgs(d, t, backlogOpsScope(SCOPE), SINCE).args).toContain("--authority-baseline");
   expect(codeSync(() => backlogOpsToolArgs(d, t, backlogOpsScope({}), SINCE))).toBe("backlog_ops_scope_required");
-  expect(backlogOpsReceipt(d, "9", 0, "{}", SCOPE_ID).authority_run).toBe(AUTH);
-  expect("authority_run" in backlogOpsReceipt(plain, "9", 0, "{}", SCOPE_ID)).toBe(false);
+  const r = backlogOpsReceipt(d, "9", 0, "{}", SCOPE_ID, "none", "none", HOME);
+  expect([r.authority_run, r.full_run, r.home]).toEqual([AUTH, FULL, HOME]);
+  const p = backlogOpsReceipt(plain, "9", 0, "{}", SCOPE_ID);
+  for (const k of ["authority_run", "full_run", "home"]) expect(k in p).toBe(false);
+  // The home id: required exactly on an authority receipt.
+  expect(codeSync(() => backlogOpsReceipt(d, "9", 0, "{}", SCOPE_ID))).toBe("backlog_ops_home_id");
+  expect(codeSync(() => backlogOpsReceipt(plain, "9", 0, "{}", SCOPE_ID, "none", "none", HOME))).toBe("backlog_ops_home_id");
+  // Lists only in an authority receipt.
+  expect(codeSync(() => backlogOpsReceipt(plain, "9", 0, JSON.stringify({ l: [1] }), SCOPE_ID))).toBe("backlog_ops_receipt_shape");
+  expect(backlogOpsReceipt(d, "9", 0, JSON.stringify({ l: [1] }), SCOPE_ID, "none", "none", HOME).summary).toEqual({ l: [1] });
 });
 
 test("argv, role, database and t: fixed per mode; the per-org tools need a scoped run", () => {
@@ -228,8 +241,11 @@ function baseline(orgs = ORGS, status: AuthorityBaseline["status"] = "authority_
     fingerprint: { revisionsCount: 120, revisionsDigest: "h" + "ab".repeat(16), ownershipCount: 40, ownershipDigest: "h" + "cd".repeat(16) },
     stats: { batchesDeleted: 7, statsResetMs: 0, startedMs: SINCE - 86_400_000 } })) } as AuthorityBaseline;
 }
+const HOME = backlogOpsHomeId({ bucket: target.BACKLOG_OPS_BUCKET, region: target.BACKLOG_OPS_REGION }, null);
+const AUTHORITY_RECEIPT_MODES: readonly BacklogOpsMode[] = ["reshard-dry", "authority-dry", "authority-execute", "backfill-catchup-execute", "backfill-catchup-dry"];
 const rcpt = (mode: BacklogOpsMode, run: string, summary: unknown, extra: Record<string, unknown> = {}) =>
-  JSON.stringify({ contract: BACKLOG_OPS_RECEIPT_CONTRACT, mode, sha, run, scope: SCOPE_ID, ledger: "none", exitCode: 0, summary, ...extra });
+  JSON.stringify({ contract: BACKLOG_OPS_RECEIPT_CONTRACT, mode, sha, run, scope: SCOPE_ID, ledger: "none", ...(AUTHORITY_RECEIPT_MODES.includes(mode) ? { home: HOME } : {}),
+    exitCode: 0, summary, ...extra });
 const reshardSummary = (over: Record<string, unknown> = {}, orgs = ORGS) => ({ mode: "dry_run", tool: "reshard_verify", org_count: orgs.length, verify_passed: true,
   per_org: orgs.map((o) => ({ org_hash: evidenceHash("org", o), verify_passed: true, listed: 5, legacy_shards: 2, entries: 9, verified: 9, missing: 0, invalid: 0, failed: 0,
     merged: 0, would_merge: 0, shards: 0, refused: null })), ...over });
@@ -240,14 +256,14 @@ const catchupOk = (b: unknown = toReceiptShape(baseline())) => ({ mode: "execute
 test("the receipt shape: the evidence module's output round-trips through countsOnly and back, with no id", () => {
   for (const v of [evidenceReport(), evidenceReport("authority_evidence_corroborated"), baseline()]) {
     const stored = toReceiptShape(v);
-    expect(countsOnly(stored)).toEqual(stored);
+    expect(countsOnly(stored, 0, true)).toEqual(stored);
     expect(fromReceiptShape(JSON.parse(JSON.stringify(stored)))).toEqual(v);
     const text = JSON.stringify(stored);
     for (const o of ORGS) expect(text).not.toContain(o);
   }
-  expect(countsOnly({ mode: "dry_run", evidence: toReceiptShape(evidenceReport()) })).toBeTruthy();
-  expect(countsOnly(reshardSummary())).toBeTruthy();
-  expect(countsOnly(catchupOk())).toBeTruthy();
+  expect(countsOnly({ mode: "dry_run", evidence: toReceiptShape(evidenceReport()) }, 0, true)).toBeTruthy();
+  expect(countsOnly(reshardSummary(), 0, true)).toBeTruthy();
+  expect(countsOnly(catchupOk(), 0, true)).toBeTruthy();
 });
 
 test("reshard receipts: verify_passed for exactly the scope's orgs, each clean", () => {
@@ -286,16 +302,19 @@ test("authority-dry receipts: unbound, exactly the scope's orgs, each refused fo
 });
 
 test("baseline receipts: the catch-up's, bound to exactly this DRY, ready, over exactly the scope", () => {
-  const ok = (summary: unknown, extra: Record<string, unknown> = { authority_run: DRY }, orgs = ORGS) =>
-    codeSync(() => checkBaselineReceipt(rcpt("backfill-catchup-execute", BACKFILL, summary, extra), orgs, DRY));
+  const ok = (summary: unknown, extra: Record<string, unknown> = { authority_run: DRY, full_run: FULL }, orgs = ORGS) =>
+    codeSync(() => checkBaselineReceipt(rcpt("backfill-catchup-execute", BACKFILL, summary, extra), orgs, DRY, FULL));
   expect(ok(catchupOk())).toBeNull();
-  expect(checkBaselineReceipt(rcpt("backfill-catchup-execute", BACKFILL, catchupOk(), { authority_run: DRY }), ORGS, DRY)).toEqual(baseline());
+  expect(checkBaselineReceipt(rcpt("backfill-catchup-execute", BACKFILL, catchupOk(), { authority_run: DRY, full_run: FULL }), ORGS, DRY, FULL)).toEqual(baseline());
   expect(ok(catchupOk(), {})).toBe("backlog_ops_bound_baseline_run");
-  expect(ok(catchupOk(), { authority_run: AUTH })).toBe("backlog_ops_bound_baseline_run");
+  // The exact FULL id (a derived t alone could alias two FULL runs created in the same second).
+  expect(ok(catchupOk(), { authority_run: DRY })).toBe("backlog_ops_bound_baseline_full");
+  expect(ok(catchupOk(), { authority_run: DRY, full_run: "999" })).toBe("backlog_ops_bound_baseline_full");
+  expect(ok(catchupOk(), { authority_run: AUTH, full_run: FULL })).toBe("backlog_ops_bound_baseline_run");
   expect(ok(catchupOk(null))).toBe("backlog_ops_bound_baseline_missing");
   expect(ok(catchupOk(toReceiptShape(baseline(ORGS, "authority_baseline_refused"))))).toBe("backlog_ops_bound_baseline_not_ready");
   expect(ok(catchupOk(toReceiptShape(baseline([ORG1]))))).toBe("backlog_ops_bound_baseline_not_ready");
-  expect(ok(catchupOk(), { authority_run: DRY }, [ORG1])).toBe("backlog_ops_bound_baseline_not_ready");
+  expect(ok(catchupOk(), { authority_run: DRY, full_run: FULL }, [ORG1])).toBe("backlog_ops_bound_baseline_not_ready");
   const b = baseline();
   (b.orgs[1] as { ok: boolean }).ok = false;
   expect(ok(catchupOk(toReceiptShape(b)))).toBe("backlog_ops_bound_baseline_not_ready");
@@ -308,7 +327,7 @@ const path = (kind: string) => `${RT}/backlog-ops-bound/${kind}/backlog-ops-rece
 function executeFiles(over: Partial<Record<string, string>> = {}): Record<string, string> {
   return {
     [path("dry")]: rcpt("authority-dry", DRY, { mode: "dry_run", evidence: toReceiptShape(evidenceReport()) }),
-    [path("backfill")]: rcpt("backfill-catchup-execute", BACKFILL, catchupOk(), { authority_run: DRY }),
+    [path("backfill")]: rcpt("backfill-catchup-execute", BACKFILL, catchupOk(), { authority_run: DRY, full_run: FULL }),
     [path("full")]: rcpt("backfill-execute", FULL, fullOk),
     [path("reshard")]: rcpt("reshard-dry", RESHARD, reshardSummary()),
     ...over,
@@ -330,15 +349,15 @@ test("the credential step, authority-execute: every binding checked before any c
   }
   // Wrong mode in each slot.
   expect(refuses({ [path("dry")]: rcpt("reshard-dry", DRY, reshardSummary()) })).toBe("backlog_ops_bound_authority_receipt");
-  expect(refuses({ [path("backfill")]: rcpt("backfill-refresh-execute", BACKFILL, catchupOk(), { authority_run: DRY }) })).toBe("backlog_ops_bound_backfill_receipt");
+  expect(refuses({ [path("backfill")]: rcpt("backfill-refresh-execute", BACKFILL, catchupOk(), { authority_run: DRY, full_run: FULL }) })).toBe("backlog_ops_bound_backfill_receipt");
   expect(refuses({ [path("full")]: rcpt("backfill-catchup-execute", FULL, catchupOk()) })).toBe("backlog_ops_bound_backfill_receipt");
   expect(refuses({ [path("reshard")]: rcpt("authority-dry", RESHARD, reshardSummary()) })).toBe("backlog_ops_bound_reshard_receipt");
   // Content.
   expect(refuses({ [path("reshard")]: rcpt("reshard-dry", RESHARD, reshardSummary({ verify_passed: false })) })).toBe("backlog_ops_reshard_not_verified");
   expect(refuses({ [path("dry")]: rcpt("authority-dry", DRY, { mode: "dry_run", evidence: toReceiptShape(evidenceReport("authority_evidence_refused")) }) }))
     .toBe("backlog_ops_authority_not_ready");
-  expect(refuses({ [path("backfill")]: rcpt("backfill-catchup-execute", BACKFILL, catchupOk(), { authority_run: AUTH }) })).toBe("backlog_ops_bound_baseline_run");
-  expect(refuses({ [path("backfill")]: rcpt("backfill-catchup-execute", BACKFILL, { ...catchupOk(), revisions_since_ms: SINCE + 1 }, { authority_run: DRY }) }))
+  expect(refuses({ [path("backfill")]: rcpt("backfill-catchup-execute", BACKFILL, catchupOk(), { authority_run: AUTH, full_run: FULL }) })).toBe("backlog_ops_bound_baseline_run");
+  expect(refuses({ [path("backfill")]: rcpt("backfill-catchup-execute", BACKFILL, { ...catchupOk(), revisions_since_ms: SINCE + 1 }, { authority_run: DRY, full_run: FULL }) }))
     .toBe("backlog_ops_bound_backfill_since");
   // Exact scope everywhere: an unscoped FULL or reshard never stands in.
   const unscoped = (raw: string) => JSON.stringify({ ...JSON.parse(raw), scope: "all" });
@@ -346,11 +365,20 @@ test("the credential step, authority-execute: every binding checked before any c
   expect(codeSync(() => checkBoundReceipts({ ...e, BACKLOG_OPS_ORGS: "" }, on({ ...e, BACKLOG_OPS_ORGS: "" }), reader(executeFiles()), SINCE))).toBe("backlog_ops_scope_required");
   // The ledger target: every bound receipt recorded this environment's.
   const le = execEnv(LEDGER), lid = backlogOpsLedgerId({ mode: "reshard-dry" }, backlogOpsLedgerTarget(le, target));
-  const withLedger = (raw: string) => JSON.stringify({ ...JSON.parse(raw), ledger: lid });
+  const lhome = backlogOpsHomeId({ bucket: target.BACKLOG_OPS_BUCKET, region: target.BACKLOG_OPS_REGION }, backlogOpsLedgerTarget(le, target));
+  expect(lhome).not.toBe(HOME);
+  const withLedger = (raw: string) => { const r = JSON.parse(raw); return JSON.stringify({ ...r, ledger: lid, ...(r.home ? { home: lhome } : {}) }); };
   const all = Object.fromEntries(Object.entries(executeFiles()).map(([p, r]) => [p, withLedger(r)]));
   expect(codeSync(() => checkBoundReceipts(le, on(le), reader(all), SINCE))).toBeNull();
   expect(codeSync(() => checkBoundReceipts(le, on(le), reader({ ...all, [path("reshard")]: executeFiles()[path("reshard")]! }), SINCE))).toBe("backlog_ops_bound_reshard_ledger");
   expect(codeSync(() => checkBoundReceipts(e, d, reader(all), SINCE))).toMatch(/_ledger$/u);
+  // The store-home pair, exactly (never `none`): a receipt from another Locker bucket, or without one, refuses.
+  const other = backlogOpsHomeId({ bucket: "other-transcripts-bucket", region: "us-east-1" }, null);
+  for (const k of ["dry", "backfill", "reshard"]) {
+    expect(refuses({ [path(k)]: JSON.stringify({ ...JSON.parse(executeFiles()[path(k)]!), home: other }) })).toBe(`backlog_ops_bound_${k}_home`);
+    const { home: _h, ...rest } = JSON.parse(executeFiles()[path(k)]!);
+    expect(refuses({ [path(k)]: JSON.stringify(rest) })).toBe(`backlog_ops_bound_${k}_home`);
+  }
 });
 
 test("the credential step, catch-up with AUTHORITY: the authority-dry checked, its evidence handed to the backfill", () => {
@@ -408,7 +436,7 @@ function fixture(mode: BacklogOpsMode) {
       display_title: backlogOpsRunName(mode, sha) },
     environment: { id: 7, name: backlogOpsEnvironment(mode), protection_rules: [{ type: "branch_policy" }], deployment_branch_policy: { protected_branches: false, custom_branch_policies: true } },
     bound: { [DRY]: bound(DRY, dryMode, 4), [BACKFILL]: bound(BACKFILL, "backfill-catchup-execute", 2), [FULL]: bound(FULL, "backfill-execute", 10),
-      [RESHARD]: bound(RESHARD, "reshard-dry", 6), [AUTH]: bound(AUTH, "authority-dry", 5) } as Record<string, any>,
+      [RESHARD]: bound(RESHARD, "reshard-dry", 1), [AUTH]: bound(AUTH, "authority-dry", 5) } as Record<string, any>,
   };
 }
 type Fx = ReturnType<typeof fixture>;
@@ -446,6 +474,8 @@ test("gate, authority-execute: DRY an authority-dry and FULL a backfill-execute 
     [(f) => { f.bound[RESHARD].display_title = backlogOpsRunName("authority-dry", sha); }, "backlog_ops_gate_reshard_run"],
     [(f) => { f.bound[RESHARD].conclusion = "failure"; }, "backlog_ops_gate_reshard_run"],
     [(f) => { f.bound[RESHARD].created_at = hoursAgo(25); }, "backlog_ops_gate_reshard_run"],
+    // A verify from before the catch-up never stands in: it must verify the state the marker would cover.
+    [(f) => { f.bound[RESHARD].created_at = hoursAgo(2.5); }, "backlog_ops_gate_reshard_order"],
     [(f) => { f.bound[FULL].created_at = hoursAgo(1); }, "backlog_ops_gate_full_order"],
     [(f) => { f.bound[DRY].created_at = hoursAgo(1); }, "backlog_ops_gate_order"],
     [(f) => { f.bound[FULL].created_at = hoursAgo(24.1); }, "backlog_ops_gate_full_run"],
@@ -483,7 +513,7 @@ test("reshard-dry: one verdict per org (hashed), never stopping early; a legacy 
   expect(by[evidenceHash("org", ORG2)]!.verify_passed).toBe(false);
   expect(by[evidenceHash("org", ORG2)]!.missing).toBe(1);
   expect(JSON.stringify(s)).not.toContain(ORG2);
-  expect(countsOnly(s)).toBeTruthy();
+  expect(countsOnly(s, 0, true)).toBeTruthy();
   expect(codeSync(() => checkReshardReceipt(rcpt("reshard-dry", RESHARD, s), ORGS))).toBe("backlog_ops_reshard_not_verified");
   expect(await code(() => reshardVerifyOrgs(store, ROOT, ["org-a"]))).toBe("backlog_ops_reshard_org");
 });
@@ -515,14 +545,15 @@ test("the serving spec: exact shape; fresh, not suspended, this run's homes, cov
   expect(typeof sweeperExpectation(spec({ orgs: null }), run, NOW)).toBe("object");
 });
 
-test("markers: create-only; a valid one already there is `present`; anything else `conflict`, never overwritten; read back", async () => {
+test("markers: create-only; ANY object already there is a `conflict`, never overwritten; read back", async () => {
   const store = fresh();
   expect(await writeOrgMarker(store, ROOT, ORG1, NOW)).toBe("written");
   const text = async (k: string) => new TextDecoder().decode(await readAll((await store.getObject(objectKey(k))).body));
   const doc = JSON.parse(await text(orgFenceAuthorityKey(ROOT, ORG1)));
   expect(validOrgFenceAuthority(doc)).toBe(true);
   expect(doc).toEqual(orgFenceAuthorityDoc(ORG1, NOW));
-  expect(await writeOrgMarker(store, ROOT, ORG1, NOW + 5)).toBe("present");
+  // Even a valid marker for the same org: an earlier or delayed write is not this run's (no epoch protocol yet).
+  expect(await writeOrgMarker(store, ROOT, ORG1, NOW + 5)).toBe("conflict");
   expect(JSON.parse(await text(orgFenceAuthorityKey(ROOT, ORG1))).writtenAtMs).toBe(NOW); // not overwritten
   await putJson(store, orgFenceAuthorityKey(ROOT, ORG2), { ...orgFenceAuthorityDoc(ORG1, NOW) }); // another org's marker under ORG2's key
   expect(await writeOrgMarker(store, ROOT, ORG2, NOW)).toBe("conflict");
@@ -571,17 +602,16 @@ test("authority-execute: the bound evidence, the sweeper, then every marker; cou
   const w = await world();
   const s = await authorityExecute(w.deps);
   expect(s.status).toBe("authority_written");
-  expect(s.markers).toEqual({ written: 2, present: 0, conflict: 0, not_written: 0 });
+  expect(s.markers).toEqual({ written: 2, conflict: 0, not_written: 0 });
   expect(s.per_org.map((p) => p.sweeper)).toEqual(["ok", "ok"]);
   expect((w.calls[0] as unknown[])[1]).toEqual({ bound: baseline() }); // the evidence is bound to the catch-up's baseline
   expect(await markers(w.store)).toEqual(ORGS);
-  expect(countsOnly(s)).toBeTruthy();
+  expect(countsOnly(s, 0, true)).toBeTruthy();
   for (const o of ORGS) expect(JSON.stringify(s)).not.toContain(o);
-  // A rerun: both present, nothing overwritten, still a success.
-  // (A later clock, as any real rerun has: an identical create is accepted by the store as a no-op.)
+  // A rerun (a later clock, as any real rerun has) finds both markers: conflicts, nothing overwritten, a failure.
   const again = await authorityExecute({ ...w.deps, now: () => NOW + 1000 });
-  expect(again.status).toBe("authority_written");
-  expect(again.markers).toEqual({ written: 0, present: 2, conflict: 0, not_written: 0 });
+  expect([again.status, again.refused_code]).toEqual(["authority_incomplete", "marker_conflict"]);
+  expect(again.markers).toEqual({ written: 0, conflict: 2, not_written: 0 });
 });
 
 test("authority-execute refusals: nothing is written unless the evidence passed and every org's sweeper is live", async () => {
@@ -600,7 +630,7 @@ test("authority-execute refusals: nothing is written unless the evidence passed 
     const w = await world(opts);
     const s = await authorityExecute(w.deps);
     expect([s.status, s.refused_code]).toEqual(["authority_refused", want]);
-    expect(s.markers.written + s.markers.present).toBe(0);
+    expect(s.markers.written).toBe(0);
     expect(await markers(w.store)).toEqual([]);
   }
   // An invalid spec document refuses too.
@@ -645,13 +675,13 @@ test("authority-execute: the report's age is re-checked before EACH write; a lap
   const s = await authorityExecute(w.deps);
   expect([s.status, s.refused_code]).toEqual(["authority_incomplete", "marker_handoff_lapsed"]);
   expect(writes).toBe(1);
-  expect(s.markers).toEqual({ written: 1, present: 0, conflict: 0, not_written: 1 });
+  expect(s.markers).toEqual({ written: 1, conflict: 0, not_written: 1 });
   // A conflict on one org: the other is still written, the run is incomplete.
   const w2 = await world();
   await putJson(w2.store, orgFenceAuthorityKey(ROOT, ORG2), { junk: true });
   const s2 = await authorityExecute(w2.deps);
   expect([s2.status, s2.refused_code]).toEqual(["authority_incomplete", "marker_conflict"]);
-  expect(s2.markers).toEqual({ written: 1, present: 0, conflict: 1, not_written: 0 });
+  expect(s2.markers).toEqual({ written: 1, conflict: 1, not_written: 0 });
 });
 
 // ---- the tool ----
@@ -733,4 +763,60 @@ test("the backfill CLI: --authority-baseline only on a scoped catch-up; the evid
   const deps = { sql: { query: async () => ({ rows: [] }) }, env: {}, credentials: { accessKeyId: "a", secretAccessKey: "b" }, ledgerBucket: null };
   expect((await code(() => runBackfill(parseBackfillArgs([...base, "--authority-baseline"]), deps)))).toMatch(/backfill_authority_baseline_invalid$/u);
   expect((await code(() => runBackfill(parseBackfillArgs(base), { ...deps, authorityEvidence: {} })))).toMatch(/backfill_authority_baseline_invalid$/u);
+});
+
+// ---- no message-shaped string reaches a logged receipt ----
+
+const LEAK = "synthetic_private_value";
+
+test("reshard-dry: a store error's code-shaped message never becomes a refusal code", async () => {
+  const store = fresh();
+  const failing = { ...store, list: async () => { throw new Error(LEAK); }, getObject: store.getObject.bind(store), put: store.put.bind(store) } as unknown as ObjectStore;
+  const s = await reshardVerifyOrgs(failing, ROOT, ORGS);
+  expect(s.per_org.map((p) => p.refused)).toEqual(["reshard_failed", "reshard_failed"]);
+  expect(JSON.stringify(s)).not.toContain(LEAK);
+  expect(authorityStringsClosed(s)).toBe(true);
+  expect(authorityStringsClosed({ ...s, per_org: [{ ...s.per_org[0], refused: LEAK }] })).toBe(false);
+});
+
+/** The credential step end to end, with fake OIDC/STS and a fake tool child; returns the logged receipt line. */
+async function runStep(mode: BacklogOpsMode, stdout: string, extra: Record<string, string> = {}) {
+  const temp = mkdtempSync(join(tmpdir(), "bo-auth-"));
+  cleanups.push(() => rmSync(temp, { recursive: true, force: true }));
+  const xml = `<AssumeRoleWithWebIdentityResponse><Credentials><AccessKeyId>ASIAAAAAAAAAAAAAAAAA</AccessKeyId><SecretAccessKey>s</SecretAccessKey>
+    <SessionToken>t</SessionToken><Expiration>${new Date(Date.now() + 6 * 3600_000).toISOString()}</Expiration></Credentials></AssumeRoleWithWebIdentityResponse>`;
+  const fetcher = (async (url: string) => url.startsWith("https://token.example/") ? new Response(JSON.stringify({ value: "a.b.c" })) : new Response(xml)) as unknown as typeof fetch;
+  const lines: string[] = [];
+  const log = console.log;
+  console.log = (...a: unknown[]) => { lines.push(a.join(" ")); };
+  let exit: number;
+  try {
+    exit = await backlogOpsRun({ ...target, ...SCOPE, ...env(mode), GITHUB_SHA: sha, GITHUB_RUN_ID: "900", RUNNER_TEMP: temp,
+      ACTIONS_ID_TOKEN_REQUEST_URL: "https://token.example/x", ACTIONS_ID_TOKEN_REQUEST_TOKEN: "bearer", ...extra },
+      { fetcher, runChild: async () => ({ code: 0, stdout }) });
+  } finally { console.log = log; }
+  const line = lines.find((l) => l.startsWith("backlog_ops_receipt "))!;
+  return { exit, receipt: JSON.parse(line.slice("backlog_ops_receipt ".length)), file: JSON.parse(readFileSync(join(temp, "backlog-ops-out", "backlog-ops-receipt.json"), "utf8")), line };
+}
+
+test("the logged receipt: an authority receipt with any string outside the closed set is refused, the value never logged", async () => {
+  const ok = await runStep("reshard-dry", JSON.stringify(reshardSummary()));
+  expect(ok.exit).toBe(0);
+  expect(ok.receipt.home).toBe(HOME);
+  expect(ok.receipt.summary.per_org.length).toBe(2);
+  expect(ok.file).toEqual(ok.receipt);
+  // A code-shaped value anywhere in the summary (countsOnly alone would pass it).
+  const leaky = reshardSummary();
+  (leaky.per_org[0] as Record<string, unknown>).refused = LEAK;
+  const bad = await runStep("reshard-dry", JSON.stringify(leaky));
+  expect(bad.exit).toBe(1);
+  expect(bad.receipt.summary).toEqual({ refused: "backlog_ops_receipt_string" });
+  expect(bad.line).not.toContain(LEAK);
+  // The same closed set guards the evidence and baseline receipts (a code-shaped status or refusal anywhere refuses).
+  expect(authorityStringsClosed({ mode: "dry_run", evidence: toReceiptShape(evidenceReport()) })).toBe(true);
+  expect(authorityStringsClosed({ mode: "dry_run", evidence: { ...toReceiptShape(evidenceReport()) as object, status: LEAK } })).toBe(false);
+  expect(authorityStringsClosed(toReceiptShape(baseline()))).toBe(true);
+  const b = toReceiptShape(baseline()) as { orgs: Array<Record<string, unknown>> };
+  b.orgs[0]!.refusals = [LEAK];
+  expect(authorityStringsClosed(b)).toBe(false);
 });

@@ -372,6 +372,22 @@ export function backlogOpsLedgerId(d: Pick<BacklogOpsDispatch, "mode">, ledger: 
   return "ledger_" + createHash("sha256").update(`backlog-ops-ledger/v1\n${ledger.bucket}\n${ledger.region}`).digest("hex").slice(0, 32);
 }
 
+/**
+ * The authority receipts (reshard-dry, authority-*, a catch-up bound to an authority-dry): the only receipts that may
+ * hold lists, and the ones that record the store-home pair (backlogOpsHomeId) and bind it exactly.
+ */
+export const backlogOpsAuthorityReceipt = (d: Pick<BacklogOpsDispatch, "mode" | "authorityRun">) =>
+  BACKLOG_OPS_SCOPED_TOOLS.includes(toolOf(d.mode)) || (isCatchup(d.mode) && d.authorityRun !== null);
+const HOME_ID = /^home_[0-9a-f]{32}$/u;
+/**
+ * The store-home pair an authority receipt was produced against: the Locker (transcripts) bucket and region and the
+ * ledger target (or none), hashed (never a name). Unlike the ledger id it is never `none`: a single-home deployment
+ * still names its Locker bucket, so two environments' runs cannot stand in for each other.
+ */
+export function backlogOpsHomeId(t: Pick<BacklogOpsTarget, "bucket" | "region">, ledger: BacklogOpsLedgerTarget | null): string {
+  return "home_" + createHash("sha256").update(`backlog-ops-home/v1\n${t.bucket}\n${t.region}\n${ledger?.bucket ?? "-"}\n${ledger?.region ?? "-"}`).digest("hex").slice(0, 32);
+}
+
 /** A run's org scope: the orgs (sorted, distinct) or null for every org, and its id for receipts. */
 export interface BacklogOpsScope { orgs: string[] | null; id: string }
 export const BACKLOG_OPS_SCOPE_ALL = "all";
@@ -570,21 +586,22 @@ export function backlogOpsCloudflareToken(env: Record<string, string | undefined
  * code. A string that is not a code (an org id, a key, a URL, a message) refuses the whole receipt.
  */
 export const BACKLOG_OPS_RECEIPT_MAX_ARRAY = 4096;
-export function countsOnly(value: unknown, depth = 0): unknown {
+export function countsOnly(value: unknown, depth = 0, allowArrays = false): unknown {
   if (depth > 6) refuse("backlog_ops_receipt_shape");
   if (value === null || typeof value === "boolean") return value;
   if (typeof value === "number") { if (!Number.isFinite(value)) refuse("backlog_ops_receipt_shape"); return value; }
   if (typeof value === "string") { if (!CODE.test(value)) refuse("backlog_ops_receipt_string"); return value; }
-  // A list (the authority modes' per-org verdicts, refusal codes, snapshot xids): bounded, each element checked alike.
+  // A list: only in an authority receipt (backlogOpsAuthorityReceipt: per-org verdicts, refusal codes, snapshot xids),
+  // bounded, each element checked alike. Every other receipt refuses a list, as before.
   if (Array.isArray(value)) {
-    if (value.length > BACKLOG_OPS_RECEIPT_MAX_ARRAY) refuse("backlog_ops_receipt_shape");
-    return value.map((v) => countsOnly(v, depth + 1));
+    if (!allowArrays || value.length > BACKLOG_OPS_RECEIPT_MAX_ARRAY) refuse("backlog_ops_receipt_shape");
+    return value.map((v) => countsOnly(v, depth + 1, allowArrays));
   }
   if (typeof value !== "object") refuse("backlog_ops_receipt_shape");
   const out: Record<string, unknown> = {};
   for (const [k, v] of Object.entries(value as Record<string, unknown>)) {
     if (!KEY.test(k)) refuse("backlog_ops_receipt_key");
-    out[k] = countsOnly(v, depth + 1);
+    out[k] = countsOnly(v, depth + 1, allowArrays);
   }
   return out;
 }
@@ -602,14 +619,20 @@ export interface BacklogOpsReceipt {
   no_head_parity?: string;
   /** A catch-up bound to an authority-dry: that run's id (its receipt then carries the baseline). Absent otherwise. */
   authority_run?: string;
+  /** The same catch-up: the exact FULL run it followed (authority-execute binds FULL by this id). Absent otherwise. */
+  full_run?: string;
+  /** An authority receipt (backlogOpsAuthorityReceipt): the store-home pair's id (backlogOpsHomeId). Absent otherwise. */
+  home?: string;
   exitCode: number;
   summary: unknown;
 }
 
 /** Parse the tool's last stdout line into a counts-only receipt (or a refused one). */
 export function backlogOpsReceipt(d: BacklogOpsDispatch, run: string, exitCode: number, stdout: string, scope: string = BACKLOG_OPS_SCOPE_ALL,
-  ledger: string = BACKLOG_OPS_LEDGER_NONE, noHeadParity: string = BACKLOG_OPS_NO_HEAD_PARITY_NONE): BacklogOpsReceipt {
+  ledger: string = BACKLOG_OPS_LEDGER_NONE, noHeadParity: string = BACKLOG_OPS_NO_HEAD_PARITY_NONE, home: string | null = null): BacklogOpsReceipt {
   if (!SCOPE_ID.test(scope)) refuse("backlog_ops_scope");
+  const authority = backlogOpsAuthorityReceipt(d);
+  if (authority !== (home !== null) || (home !== null && !HOME_ID.test(home))) refuse("backlog_ops_home_id");
   if (!LEDGER_ID.test(ledger)) refuse("backlog_ops_ledger_id");
   if (!NHP_ID.test(noHeadParity)) refuse("backlog_ops_no_head_parity_id");
   const lines = stdout.split("\n").map((l) => l.trim()).filter(Boolean);
@@ -618,12 +641,13 @@ export function backlogOpsReceipt(d: BacklogOpsDispatch, run: string, exitCode: 
   if (last !== undefined) {
     let parsed: unknown;
     try { parsed = JSON.parse(last); } catch { parsed = undefined; }
-    summary = parsed === undefined ? { refused: "summary_unparsed" } : countsOnly(parsed);
+    summary = parsed === undefined ? { refused: "summary_unparsed" } : countsOnly(parsed, 0, authority);
   }
   // Unset: no field at all, so the receipt is byte-identical to one from before Path B.
   return { contract: BACKLOG_OPS_RECEIPT_CONTRACT, mode: d.mode, sha: d.sha, run, scope, ledger,
     ...(noHeadParity !== BACKLOG_OPS_NO_HEAD_PARITY_NONE ? { no_head_parity: noHeadParity } : {}),
-    ...(isCatchup(d.mode) && d.authorityRun ? { authority_run: d.authorityRun } : {}), exitCode, summary };
+    ...(isCatchup(d.mode) && d.authorityRun ? { authority_run: d.authorityRun, full_run: d.fullBackfillRun! } : {}),
+    ...(home !== null ? { home } : {}), exitCode, summary };
 }
 
 const obj = (v: unknown): Record<string, any> | null => (v && typeof v === "object" && !Array.isArray(v) ? v as Record<string, any> : null);

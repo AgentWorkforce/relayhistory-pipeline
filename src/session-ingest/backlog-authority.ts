@@ -15,9 +15,13 @@
  *                      the live evidence BOUND to the catch-up's baseline (must be authority_evidence_corroborated),
  *                      then the re-arm sweeper's fresh pass for every org against the sweeper's serving spec, then,
  *                      per org and immediately before its write, the ENFORCED WRITER FENCE (writerFence), then writes
- *                      that org's marker CREATE-ONLY (If-None-Match) and reads it back. An object already there is
- *                      never overwritten: a valid marker for the same org counts `present`; anything else is
- *                      `conflict` and the run fails.
+ *                      that org's marker CREATE-ONLY (If-None-Match) and reads it back. ANY object already there is
+ *                      a `conflict`: never overwritten, never taken as this run's (reconciling an earlier or delayed
+ *                      write needs the epoch-bound hold protocol, not built), and the run fails.
+ *
+ * The catch-up's baseline is a SAMPLED fingerprint baseline: one read in the catch-up's input fingerprint transaction.
+ * The backfill's later pages and slot reads run in their own snapshots, so the baseline cannot attest the inputs the
+ * backfill actually read; it is a sample at that instant, compared later (authority-evidence.ts header).
  *
  * The evidence is CORROBORATION ONLY (authority-evidence.ts header): observation cannot exclude an admission between
  * reads or after the last one, so it never authorises a marker by itself. Marker authority comes from an enforced,
@@ -42,6 +46,7 @@
 import { createHash } from "node:crypto";
 import { isObjectStoreError, objectKey, readAll, type ObjectStore } from "../shared/vendor.ts";
 import {
+  AUTHORITY_REFUSALS,
   authorityEvidence,
   evidenceHash,
   type AuthorityBaseline,
@@ -129,9 +134,11 @@ export function checkAuthorityDryReceipt(raw: string, orgs: readonly string[]): 
  * receipt's top-level authority_run, written by the credential step from the dispatch, never by the tool), ready, over
  * exactly the scope's orgs. Returns it in the evidence module's shape (authorityEvidence's `bound`).
  */
-export function checkBaselineReceipt(raw: string, orgs: readonly string[], authorityRun: string): AuthorityBaseline {
+export function checkBaselineReceipt(raw: string, orgs: readonly string[], authorityRun: string, fullRun: string): AuthorityBaseline {
   const r = parseReceipt(raw, "backlog_ops_bound_baseline_missing");
   if (r.authority_run !== authorityRun) refuse("backlog_ops_bound_baseline_run");
+  // The exact FULL the catch-up followed (its t alone could alias two FULL runs created in the same second).
+  if (r.full_run !== fullRun) refuse("backlog_ops_bound_baseline_full");
   const b = fromReceiptShape(r.summary.authority_baseline) as Record<string, any>;
   if (!isObj(b)) refuse("backlog_ops_bound_baseline_missing");
   if (b.kind !== "authority_baseline" || b.v !== 1 || b.status !== "authority_baseline_ready" || b.orgCount !== orgs.length ||
@@ -144,6 +151,8 @@ export function checkBaselineReceipt(raw: string, orgs: readonly string[], autho
 // ---- reshard-dry ------------------------------------------------------------------------------------------------
 
 export interface ReshardVerifyOrg extends ReshardSummary { org_hash: string; verify_passed: boolean; refused: string | null }
+/** revision-reshard.ts's own refusals; any other failure (a store error, whatever its message) is `reshard_failed`. */
+export const RESHARD_REFUSALS = ["reshard_prefix_refused", "reshard_concurrency_refused", "reshard_mode_refused"] as const;
 /** One verify per org (each its own prefix), never stopping early: every org gets a verdict. */
 export async function reshardVerifyOrgs(store: ObjectStore, keyRoot: string, orgs: readonly string[], concurrency = 8) {
   const per: ReshardVerifyOrg[] = [];
@@ -156,7 +165,7 @@ export async function reshardVerifyOrgs(store: ObjectStore, keyRoot: string, org
     } catch (error) {
       const m = (error as Error)?.message;
       per.push({ ...empty, failed: 1, org_hash: evidenceHash("org", org), verify_passed: false,
-        refused: typeof m === "string" && /^[a-z][a-z0-9_]{0,39}$/u.test(m) ? m : "internal_error" });
+        refused: (RESHARD_REFUSALS as readonly string[]).includes(m) ? m : "reshard_failed" });
     }
   }
   return { mode: "dry_run" as const, tool: "reshard_verify", org_count: orgs.length, verify_passed: per.every((p) => p.verify_passed), per_org: per };
@@ -232,11 +241,12 @@ async function readMarker(store: ObjectStore, key: string): Promise<{ doc: unkno
   }
 }
 
-export type MarkerOutcome = "written" | "present" | "conflict";
+export type MarkerOutcome = "written" | "conflict";
 /**
- * One org's marker, CREATE-ONLY. An object already at the key is never overwritten: a valid marker for this org is
- * `present`, anything else `conflict`. A written marker is read back and must equal what was written
- * (marker_readback_mismatch otherwise). Access denied and other store errors refuse with fixed codes.
+ * One org's marker, CREATE-ONLY. ANY object already at the key is a `conflict` and is never overwritten (a valid
+ * marker from an earlier or a delayed write cannot be told from this run's without the epoch-bound hold protocol).
+ * A written marker is read back and must equal what was written (marker_readback_mismatch otherwise). Access denied
+ * and other store errors refuse with fixed codes.
  */
 export async function writeOrgMarker(store: ObjectStore, keyRoot: string, org: string, nowMs: number): Promise<MarkerOutcome> {
   if (!ORG_UUID.test(org)) refuse("marker_org");
@@ -245,8 +255,7 @@ export async function writeOrgMarker(store: ObjectStore, keyRoot: string, org: s
     await store.put(objectKey(key), new TextEncoder().encode(JSON.stringify(doc)), { contentType: "application/json", ifNoneMatch: true });
   } catch (error) {
     if (!conflict(error)) return refuse(isAccessDenied(error) ? "marker_access_denied" : "marker_write_failed");
-    const got = await readMarker(store, key);
-    return got && validOrgFenceAuthority(got.doc) && got.doc.orgId === org ? "present" : "conflict";
+    return "conflict";
   }
   const back = await readMarker(store, key);
   if (!back || !validOrgFenceAuthority(back.doc) || back.doc.orgId !== org || back.doc.writtenAtMs !== nowMs) refuse("marker_readback_mismatch");
@@ -270,9 +279,11 @@ export interface AuthorityExecuteDeps {
   /** Tests only: the evidence run (default authority-evidence.ts authorityEvidence). */
   evidence?: typeof authorityEvidence;
   /**
-   * The enforced per-org writer hold: resolves true only when it proves, at `nowMs`, that the org's admission is
-   * held by an enforced fence every admission path honours, bound to this run's baseline. Called immediately before
-   * each marker write. NOT BUILT: absent, the run refuses before any write (writer_fence_unavailable).
+   * A PLACEHOLDER seam for the enforced per-org writer hold: resolves true only when it proves, at `nowMs`, that the
+   * org's admission is held by an enforced fence every admission path honours. A boolean cannot carry the epoch the
+   * baseline, catch-up, marker and replay must share, nor reconcile a delayed PUT: the real protocol replaces this
+   * seam before enablement (docs/backlog-ops-workflow.md "Authority"). NOT BUILT: absent, the run refuses before
+   * any write (writer_fence_unavailable).
    */
   writerFence?: (org: string, nowMs: number) => Promise<boolean>;
 }
@@ -280,7 +291,7 @@ export interface AuthorityExecuteDeps {
 /**
  * The bound evidence, then the sweeper, then per org the writer fence and the marker; nothing is written unless every
  * org passed the evidence and the sweeper and a writer fence exists. Counts, codes and hashes only. `status`:
- * authority_written (every org written or present), authority_refused (nothing written), authority_incomplete (a
+ * authority_written (every org written), authority_refused (nothing written), authority_incomplete (a
  * marker conflict, a fence refusal or a lapsed report after some writes).
  */
 export async function authorityExecute(d: AuthorityExecuteDeps) {
@@ -291,7 +302,7 @@ export async function authorityExecute(d: AuthorityExecuteDeps) {
     const n = (k: string) => list.filter((p) => p.marker === k).length;
     return { mode: "execute" as const, status, refused_code: refusal, org_count: d.orgs.length,
       evidence: report === null ? null : toReceiptShape(report),
-      markers: { written: n("written"), present: n("present"), conflict: n("conflict"), not_written: n("not_written") }, per_org: list };
+      markers: { written: n("written"), conflict: n("conflict"), not_written: n("not_written") }, per_org: list };
   };
   const report = await (d.evidence ?? authorityEvidence)(d.orgs, d.sources, { bound: d.baseline, ...(d.observationWindowMs ? { observationWindowMs: d.observationWindowMs } : {}) });
   if (report.status !== "authority_evidence_corroborated") return out("authority_refused", report, "evidence_not_corroborated");
@@ -351,6 +362,40 @@ export function cloudflareGet(accountId: string, token: string, fetcher: typeof 
     // A non-2xx body still parses (success false); a non-JSON body throws, which the module maps to a code.
     return await res.json();
   };
+}
+
+// ---- the closed strings of an authority receipt -------------------------------------------------------------------
+
+/** scripts/backlog-authority.ts's own refusal codes (its `{"refused": ...}` line); anything else is internal_error. */
+export const AUTHORITY_TOOL_REFUSALS = ["usage", "orgs", "authority_execute_held", "stdin_too_large", "stdin_invalid", "db_url_required",
+  "cloudflare_token_invalid", "cloudflare_config", "cloudflare_path", "aws_credentials_required", "backlog_ops_reshard_org", "internal_error",
+  "ledger_bucket_invalid", "ledger_home_guard_invalid", "ledger_home_mismatch", "ledger_home_missing", "ledger_home_moved",
+  "ledger_home_invalid", "ledger_home_unavailable", "ledger_home_store_error", "access_denied"] as const;
+/**
+ * Every string an authority receipt may hold (beyond the hashes `h_<32 hex>` / `h<32 hex>`): the evidence module's
+ * statuses, refusals and turns paths, and this module's own codes. countsOnly alone accepts any code-SHAPED string
+ * (one from an error message, say); the credential step also requires this closed set before the receipt is logged.
+ */
+export const AUTHORITY_RECEIPT_STRINGS: ReadonlySet<string> = new Set<string>([
+  ...AUTHORITY_REFUSALS, ...RESHARD_REFUSALS,
+  "authority_evidence_corroborated", "authority_evidence_unbound", "authority_evidence_refused", "authority_baseline",
+  "authority_baseline_ready", "authority_baseline_refused", "neon", "dual", "forward", "unknown",
+  "dry_run", "execute", "reshard_verify", "reshard_failed", "authority_written", "authority_refused", "authority_incomplete",
+  "ok", "not_run", "written", "conflict", "not_written", "evidence_not_corroborated", "writer_fence_unavailable", "writer_fence_not_held",
+  "marker_handoff_lapsed", "marker_conflict", "marker_org", "marker_access_denied", "marker_unreadable", "marker_write_failed",
+  "marker_readback_mismatch", "sweeper_spec_missing", "sweeper_spec_stale", "sweeper_spec_future", "sweeper_spec_invalid",
+  "sweeper_spec_unreadable", "sweeper_spec_access_denied", "sweeper_suspended", "sweeper_home_mismatch", "sweeper_out_of_scope",
+  "sweeper_invalid_request", "sweeper_missing", "sweeper_malformed", "sweeper_mismatch", "sweeper_stale", "sweeper_future",
+  "sweeper_access_denied", "sweeper_unreadable", ...AUTHORITY_TOOL_REFUSALS,
+]);
+const HASH = /^h_?[0-9a-f]{32}$/u;
+/** True when every string leaf of `v` is a hash or in AUTHORITY_RECEIPT_STRINGS. */
+export function authorityStringsClosed(v: unknown, depth = 0): boolean {
+  if (depth > 8) return false;
+  if (typeof v === "string") return HASH.test(v) || AUTHORITY_RECEIPT_STRINGS.has(v);
+  if (Array.isArray(v)) return v.every((x) => authorityStringsClosed(x, depth + 1));
+  if (isObj(v)) return Object.values(v).every((x) => authorityStringsClosed(x, depth + 1));
+  return true;
 }
 
 /** A stable short id of the receipt this run binds, for logs (never an org). */

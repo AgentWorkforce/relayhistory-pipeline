@@ -39,7 +39,8 @@
  * closed for that org (slot_read_too_long, its sections incomplete). backlog-ops passes --slot-pace-ms for slot_pace_ms.
  * --authority-baseline (backlog-ops: a catch-up bound to an authority-dry; a scoped catch-up only): stdin is then
  * {"dbUrl": ..., "authorityEvidence": <that run's unbound report>}, and authority-evidence.ts authorityBaseline runs
- * inside the input fingerprint's transaction (the run's input snapshot); the summary carries `authority_baseline`.
+ * inside the input fingerprint's transaction (a sampled baseline: later pages read in their own snapshots, so it does not
+ * attest the backfill's actual inputs); the summary carries `authority_baseline`.
  * --revisions-since-ms (a catch-up after a full run; needs the revisions section): only the ingest_record_revisions
  * rows updated at or after that epoch ms are applied; owned lazy slots, fences and ownership are read in full
  * (src/session-ingest/upload-fence-backfill.ts header). The summary records it as `revisions_since_ms`.

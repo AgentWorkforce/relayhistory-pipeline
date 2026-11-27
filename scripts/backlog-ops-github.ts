@@ -117,6 +117,8 @@ export async function backlogOpsGithubGate(
   // the catch-up's FULL were both created before the catch-up that ran the baseline.
   if (input.mode === "authority-execute" && !(created.full! < created.backfill!)) refuse("backlog_ops_gate_full_order");
   if (input.mode === "authority-execute" && !(created.dry! < created.backfill!)) refuse("backlog_ops_gate_order");
+  // The reshard verify ran after the catch-up (it verifies the state the marker would cover).
+  if (input.mode === "authority-execute" && !(created.reshard! > created.backfill!)) refuse("backlog_ops_gate_reshard_order");
   // A catch-up's AUTHORITY: created before the catch-up's own DRY when it is an execute (the evidence it hands the baseline
   // existed before either catch-up run started).
   if (input.mode === "backfill-catchup-execute" && created.authority !== undefined && !(created.authority < created.dry!)) refuse("backlog_ops_gate_order");

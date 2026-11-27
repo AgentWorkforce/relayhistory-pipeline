@@ -278,12 +278,13 @@ test("org scope: BACKLOG_OPS_ORGS, lowercase UUIDs only; an id (never an org) fo
 
 test("receipts are counts only: an id, key or URL anywhere refuses", () => {
   expect(countsOnly({ mode: "execute", orgs: { incomplete: 0 }, gated: { authority_off: 3 }, stopped: "complete", ok: true })).toBeTruthy();
-  // Bounded lists of counts, codes and objects of them (the authority modes' per-org verdicts).
-  expect(countsOnly({ per_org: [{ org_hash: "h_" + "a".repeat(32), refusals: ["sql_unbound"] }], xip: [1, 2] })).toBeTruthy();
+  // Lists only where the caller allows them (an authority receipt): bounded, each element checked alike.
+  expect(countsOnly({ per_org: [{ org_hash: "h_" + "a".repeat(32), refusals: ["sql_unbound"] }], xip: [1, 2] }, 0, true)).toBeTruthy();
+  for (const bad of [{ list: ["Org-Id"] }, { list: [{ org: "11111111-2222-4333-8444-555555555555" }] }, { list: Array.from({ length: 4097 }, () => 0) }])
+    expect(codeSync(() => countsOnly(bad, 0, true))).toMatch(/^backlog_ops_receipt_/);
   for (const bad of [
     { org: "11111111-2222-4333-8444-555555555555" }, { key: "96bulls/x/v1/ws=y" }, { url: "postgresql://u:p@h/d" },
-    { message: "Something Failed" }, { list: ["Org-Id"] }, { list: [{ org: "11111111-2222-4333-8444-555555555555" }] },
-    { list: Array.from({ length: 4097 }, () => 0) }, { "Org-Id": 1 }, { n: Number.NaN },
+    { message: "Something Failed" }, { list: [1, 2] }, { "Org-Id": 1 }, { n: Number.NaN },
   ]) expect(codeSync(() => countsOnly(bad))).toMatch(/^backlog_ops_receipt_/);
   const d = backlogOpsDispatch(dispatchEnv("drain-dry"));
   expect(backlogOpsReceipt(d, "9", 0, "progress\n{\"mode\":\"dry_run\",\"listed\":4}\n").summary).toEqual({ mode: "dry_run", listed: 4 });

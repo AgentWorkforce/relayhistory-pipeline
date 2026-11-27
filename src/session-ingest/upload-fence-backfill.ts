@@ -127,8 +127,9 @@ export interface BackfillOptions {
   /**
    * A catch-up bound to an authority-dry (backlog-ops authority_run): run authority-evidence.ts authorityBaseline for
    * these orgs, with that run's unbound evidence report, INSIDE the input fingerprint's REPEATABLE READ READ ONLY
-   * transaction, after the fingerprint reads: the baseline's snapshot is then the run's input snapshot. The summary
-   * carries it (`authority_baseline`, receipt keys). Needs a scoped catch-up whose org list is exactly `orgs`.
+   * transaction, after the fingerprint reads. It is a SAMPLED fingerprint baseline: the run's later pages and slot reads
+   * use their own snapshots, so it does not attest the inputs the backfill actually read. The summary carries it
+   * (`authority_baseline`, receipt keys). Needs a scoped catch-up whose org list is exactly `orgs`.
    */
   authorityBaseline?: { orgs: string[]; evidence: unknown };
 }

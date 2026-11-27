@@ -314,12 +314,12 @@ the dry modes' output is diagnostic only.
 | --- | --- | --- | --- |
 | `reshard-dry` | dry | nothing | The revision reshard's verify (`revision-reshard.ts`, `verify: true`) per scope org, against the revision home: with `BACKLOG_OPS_LEDGER_*` set, the ledger bucket routed as the edge routes it (fences from the transcripts bucket), after the tool fork guard (`assertToolLedgerHome`). Receipt: `verify_passed` overall and, per org hash, `verify_passed` with the counts. Dry only: `reshard-execute` refuses (`backlog_ops_reshard_dry_only`). |
 | `authority-dry` | dry | nothing | The unbound live evidence (`authorityEvidence` without a baseline). Exit 0 only for `authority_evidence_unbound`, the state `authorityBaseline` takes. Receipt: the report, snake_case. |
-| `backfill-catchup-dry/-execute` with `authority_run` | as before | `AUTHORITY <authority-dry>` | The catch-up runs `authorityBaseline` inside its input fingerprint's REPEATABLE READ READ ONLY transaction (`--authority-baseline`; the evidence on stdin). Its receipt carries `authority_baseline` and, from the credential step, `authority_run`. Without `authority_run` it is byte-identical to before. |
+| `backfill-catchup-dry/-execute` with `authority_run` | as before | `AUTHORITY <authority-dry>` | The catch-up runs `authorityBaseline` inside its input fingerprint's REPEATABLE READ READ ONLY transaction (`--authority-baseline`; the evidence on stdin). This is a SAMPLED fingerprint baseline: the backfill's later pages and slot reads use their own snapshots, so it does not attest the inputs the backfill actually read. Its receipt carries `authority_baseline` and, from the credential step, `authority_run` and `full_run` (the exact FULL). Without `authority_run` it is byte-identical to before. |
 | `authority-execute` | execute | `DRY <authority-dry> BACKFILL <catch-up execute> FULL <backfill-execute> RESHARD <reshard-dry>` | Re-reads the evidence bound to the catch-up's baseline (must be `authority_evidence_corroborated`), then the sweeper (below), then, per org, the enforced writer fence and the marker, written create-only. |
 
 The order is the evidence module's own: stop and drain the org, then `authority-dry`, then the
-catch-up with `authority_run`, then `reshard-dry` (any time after the reshard ran), then
-`authority-execute`.
+catch-up with `authority_run`, then `reshard-dry` (after the catch-up: the gate refuses an earlier
+verify, `backlog_ops_gate_reshard_order`), then `authority-execute`.
 
 ```
 AUTHORITY-EXECUTE <sha> DRY <authority-dry> BACKFILL <catch-up> FULL <full> RESHARD <reshard-dry>
@@ -330,14 +330,18 @@ Bindings (checked before any credential, the same way every other bound run is):
 
 - The gate checks every bound run: same sha, success, first attempt, the dispatcher, its mode from its
   run-name, one receipt. Age limits: the catch-up (BACKFILL) under 3 h (`BACKLOG_OPS_FRESH_BACKFILL_MS`);
-  DRY, FULL and RESHARD under 24 h. Ordering: FULL and DRY were created before the catch-up. A catch-up's
-  AUTHORITY was created before that catch-up's own DRY. The gate computes t from FULL as for every
-  catch-up, and the credential step checks that the catch-up recorded it.
+  DRY, FULL and RESHARD under 24 h. Ordering: FULL and DRY were created before the catch-up, and RESHARD
+  after it. A catch-up's AUTHORITY was created before that catch-up's own DRY. The gate computes t from
+  FULL as for every catch-up, and the credential step checks that the catch-up recorded it.
 - The credential step: every receipt has exactly this run's scope (never `all`) and the ledger target
-  this environment gives (`backlog_ops_bound_<kind>_ledger`). Then: DRY must be `authority_evidence_unbound`
+  this environment gives (`backlog_ops_bound_<kind>_ledger`). Every authority receipt (DRY, the catch-up,
+  RESHARD, a catch-up's AUTHORITY) also records the store-home pair `home` (a hash of the Locker bucket and
+  region and the ledger target; never `none`), and it must equal this run's (`backlog_ops_bound_<kind>_home`).
+  FULL, an ordinary backfill-execute, is bound by its ledger id and by its exact run id (below). Then: DRY must be `authority_evidence_unbound`
   over exactly the scope's org hashes, each refused for `sql_unbound` alone. The catch-up's
-  `authority_run` must equal DRY, and its baseline must be `authority_baseline_ready` over exactly the
-  scope. RESHARD must have `verify_passed` for exactly the scope, each org with missing, invalid and
+  `authority_run` must equal DRY and its `full_run` must equal FULL's run id exactly (t alone could alias
+  two FULL runs created in the same second), and its baseline must be `authority_baseline_ready` over
+  exactly the scope. RESHARD must have `verify_passed` for exactly the scope, each org with missing, invalid and
   failed at 0.
 
 Inside the job, `authority-execute` does these steps in order, and writes nothing unless the first two
@@ -353,9 +357,16 @@ pass for every org:
    hold that every admission path honours, bound to this run's baseline. That fence is being designed and
    is not in this tree, so the tool has none and refuses before any write (`writer_fence_unavailable`).
    With a fence that holds, the run writes the marker with `If-None-Match` and reads it back.
-   If an object is already there, it is never overwritten: a valid marker for the same org counts as
-   `present` (a rerun succeeds), anything else is a `conflict` and the run fails
-   (`authority_incomplete`).
+   ANY object already there is a `conflict`, never overwritten and never taken as this run's, and the
+   run fails (`authority_incomplete`). An earlier or delayed write cannot be told from this run's until
+   the epoch-bound hold protocol exists, so a rerun after a partial write fails closed.
+
+Authority receipts are the only receipts that may hold lists (countsOnly with lists allowed). Every
+string in them must also come from a closed set (`backlog-authority.ts` `AUTHORITY_RECEIPT_STRINGS`,
+plus `h_<32 hex>` hashes), or the credential step refuses the receipt (`backlog_ops_receipt_string`)
+before it is logged. A code-shaped string is not enough. Tool refusals are a closed list
+(`AUTHORITY_TOOL_REFUSALS`); any other failure is `internal_error` or `reshard_failed`, never a
+message.
 
 ### The sweeper's serving spec (proposal; not built)
 
@@ -391,8 +402,12 @@ Prerequisites before the hold can be lifted (none is code on this branch):
   `96bulls/.ledger/fence-authority/*`, and `s3:PutObject` on `96bulls/.ledger/fence-authority/*`. The
   dry role needs `ListBucket` and `GetObject` on the revision home's `96bulls/.admission-inbox/*`.
 - The serving-spec observer, described above.
-- The enforced per-org writer fence, wired in as `writerFence`, and a reviewed commit that flips
-  `BACKLOG_OPS_AUTHORITY_EXECUTE_ENABLED`.
+- The epoch-bound per-org writer hold, replacing the boolean `writerFence` seam. It must be durable and
+  reversible, and the admission paths must take conflicting locks on it. Baseline, catch-up, marker and
+  replay must bind to one fence epoch. The hold must outlive an ambiguous or delayed marker PUT, and must
+  reconcile one by epoch.
+- An independently authenticated serving spec (the observer above, with its bucket-policy deny).
+- A reviewed commit that flips `BACKLOG_OPS_AUTHORITY_EXECUTE_ENABLED`.
 
 ## Gates
 

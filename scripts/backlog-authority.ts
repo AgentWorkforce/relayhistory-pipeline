@@ -23,6 +23,7 @@ import { ownerClientConfig } from "../src/shared/owner-pg-config.ts";
 import { AUTHORITY_EVIDENCE, authorityEvidence, authorityOrgs, type AuthorityEvidenceSources } from "../src/session-ingest/authority-evidence.ts";
 import { BACKLOG_OPS_AUTHORITY_EXECUTE_ENABLED } from "../src/session-ingest/backlog-ops.ts";
 import {
+  AUTHORITY_TOOL_REFUSALS,
   BACKLOG_AUTHORITY_KEY_ROOT,
   CLOUDFLARE_TOKEN,
   authorityExecute,
@@ -34,7 +35,6 @@ import { assertToolLedgerHome, toolLedgerBucket, toolStores } from "../src/sessi
 import { assertLedgerHomeGuardValid, LedgerHomeRefused } from "../src/session-ingest/ledger-store.ts";
 
 const STATEMENT_TIMEOUT_MS = 600_000;
-const CODE = /^[a-z][a-z0-9_]{0,39}$/u;
 const fail = (code: string): never => { throw Object.assign(new Error(code), { code }); };
 
 export interface AuthorityArgs { command: "reshard-verify" | "evidence" | "execute"; bucket?: string; region?: string; kmsKeyArn?: string; orgs: string[] }
@@ -137,8 +137,10 @@ if (import.meta.main) {
   main(process.argv.slice(2), process.env)
     .then(({ summary, ok }) => { process.stdout.write(JSON.stringify(summary) + "\n"); process.exitCode = ok ? 0 : 1; })
     .catch((error) => {
+      // A closed set only: never a message (a store, pg or fetch error's text can be code-shaped).
+      // (An exact match of a message against the closed list is safe: e.g. toolLedgerBucket's ledger_bucket_invalid.)
       const c = error instanceof LedgerHomeRefused ? error.code : (error as { code?: unknown })?.code ?? (error as Error)?.message;
-      process.stdout.write(JSON.stringify({ refused: typeof c === "string" && CODE.test(c) ? c : "internal_error" }) + "\n");
+      process.stdout.write(JSON.stringify({ refused: typeof c === "string" && (AUTHORITY_TOOL_REFUSALS as readonly string[]).includes(c) ? c : "internal_error" }) + "\n");
       process.exitCode = 1;
     });
 }
