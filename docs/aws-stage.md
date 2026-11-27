@@ -1296,12 +1296,15 @@ to the signing role and its binding:
   - a complete, trusted policy-change history (change-control or audit records) with no gap; or
   - exclusive, serialized control of all of those writers (no policy or role change can start outside it).
 Serialization only during a rollback is not enough.
-- **Start** after enforcement is established: the policy write that installed `RearmSweeperOnlyItWritesItsState`
-  exactly as rendered for the role, confirmed by a later observation of that exact statement.
+- **Start** at the time enforcement is POSITIVELY established, never backdated to the install request: the
+  observation (step 1) of `RearmSweeperOnlyItWritesItsState` exactly as rendered for the role that follows the
+  recorded installing write, with no other recorded policy write or role change in between. A version written
+  between the install and that observation is unknown. If no such time can be established, no interval starts and
+  every version needs independent writer evidence. The same rule applies to the initial install and to every reopen.
 - **End**, conservatively, before any removal or modification STARTS: the start of the earliest recorded policy write
   or role change after the start (even one that later turned out harmless), the start of any gap in the history or
   in exclusive control, or a rollback (step 4), whichever comes first. Reopen only after enforcement is established
-  again (a new start).
+  again (a new start, under the same rule).
 - A version relies on the deny only when its `LastModified` lies strictly inside one trusted interval. Both exact
   versions must qualify: the `latest.json` version read and the receipt version it names. A version in a gap, at a
   boundary, with a timestamp equal to one, or in any uncertain transition is unknown.
@@ -1316,9 +1319,12 @@ Acceptance examples (times illustrative):
   the last audited start is trusted, and the 10:06 version is unknown.
 - *Removal hidden by a restore.* Present observed at 10:00; removed at 10:05; a non-sweeper writes at 10:06;
   restored at 10:07; present observed again at 10:10. Both observations match, yet the 10:06 version is unknown: the
-  audited writes at 10:05 and 10:07 end the interval at 10:05 and reopen it only after 10:07 once enforcement is
-  established (a new start, confirmed by the 10:10 observation). Without audit evidence the matching observations
-  prove nothing about 10:05 to 10:07, and every version in that span is unknown.
+  recorded writes at 10:05 and 10:07 end the interval at 10:05, and it reopens only at 10:10, when the observation
+  positively establishes enforcement again. Without that history or control the matching observations prove nothing
+  about 10:05 to 10:10, and every version in that span is unknown.
+- *Write between install and confirmation.* Recorded install at 10:07; a version written at 10:08; matching
+  observation at 10:10. The interval starts at 10:10, not 10:07, so the 10:08 version is unknown (the same on the
+  first install and on any reopen); only versions written strictly after 10:10 can rely on the deny.
 
 **How a capture stays read-only.** `alchemy plan` against `AWS.state` is not
 read-only: Alchemy takes a lease (PUT then DELETE of `__lease__.json`) and
