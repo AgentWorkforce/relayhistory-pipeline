@@ -185,6 +185,10 @@ export function validErasureWindowProof(v: unknown): v is ErasureWindowProof {
     && (p.watermark_erasures === null || count(p.watermark_erasures) !== null)
     && (p.hold_state === null || ["held", "sealed", "marker_attempted"].includes(p.hold_state as string)) && srcOk
     && (p.watermark_kind === "surviving_two_tables" || p.watermark_kind === "erasure_history_all_sources")
+    // Empty against the all-source history means the history counted 0 (a legacy two-table snapshot may carry a
+    // nonzero historical total); a non-empty status never claims "ok".
+    && (p.status !== "erasure_window_empty" || p.watermark_kind !== "erasure_history_all_sources" || p.watermark_erasures === 0)
+    && (p.status === "erasure_window_empty") === (p.reason === "ok")
     && (p.status !== "erasure_window_empty" || (p.reason === "ok" && p.epoch_hash !== null && src !== null && Object.values(src).every((n) => n === 0) && p.watermark_erasures !== null
       && (p.hold_state === "sealed" || p.hold_state === "marker_attempted")));
 }

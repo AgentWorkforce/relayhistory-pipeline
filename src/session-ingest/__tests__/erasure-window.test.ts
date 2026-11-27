@@ -310,3 +310,57 @@ test("bridge-dry through the normal runner (scripts/backlog-ops.ts): the logged 
     for (const id of [ORG, ORG2, E]) expect(text).not.toContain(id);
   } finally { rmSync(temp, { recursive: true, force: true }); }
 });
+
+test("contradictory bridge evidence is refused at validation and at persistence (normal runner)", async () => {
+  // The reviewer's negative: a real positive proof (history counted 2) relabelled empty/ok.
+  const positive = erasureWindowProof(ORG, null, CUT, [row({ status: { hold: sealedHold(), erasures: 2, erasure_history: { cutoff: "2026-11-27T06:00:00Z", covered: true,
+    recording: true, by_source: { upload_deletions: 2 }, coverage_started_at: "2026-11-20T00:00:00Z" } }, history_cutoff_matches: true })]);
+  expect([positive.status, positive.reason, positive.watermark_erasures]).toEqual(["erasure_window_nonempty", "erasures_in_history", 2]);
+  const relabelled = { ...positive, status: "erasure_window_empty", reason: "ok" };
+  expect(validErasureWindowProof(relabelled)).toBe(false);
+  expect(validErasureWindowProof({ ...positive, reason: "ok" })).toBe(false); // non-empty never claims ok
+  const summary = (per: unknown[], over: Record<string, unknown> = {}) => ({ mode: "dry_run", tool: "bridge_window", org_count: per.length,
+    all_empty: per.every((p) => (p as { status: string }).status === "erasure_window_empty"), per_org: per, ...over });
+  const empty = erasureWindowProof(ORG2, null, CUT, [row()]);
+  expect(authorityReceiptSummary("bridge", JSON.parse(JSON.stringify(summary([empty])))).ok).toBe(true);
+  for (const bad of [summary([relabelled], { all_empty: true }), summary([empty, positive], { all_empty: true }), summary([empty], { org_count: 2 }),
+    summary([], { all_empty: true })])
+    expect(authorityReceiptSummary("bridge", JSON.parse(JSON.stringify(bad))).summary).toEqual({ refused: "backlog_ops_receipt_schema" });
+  // A legacy two-table snapshot may carry a nonzero historical total and still be empty.
+  const legacy = erasureWindowProof(ORG, null, CUT, [row({ status: status(sealedHold(), 5) })]);
+  expect([legacy.status, legacy.watermark_kind, legacy.watermark_erasures, validErasureWindowProof(legacy)]).toEqual(["erasure_window_empty", "surviving_two_tables", 5, true]);
+  // Through the normal runner: the contradictory receipt is refused in both the logged line and the saved file.
+  const temp = mkdtempSync(join(tmpdir(), "bo-bridge-bad-"));
+  try {
+    const home = backlogOpsHomeId({ bucket: target.BACKLOG_OPS_BUCKET, region: target.BACKLOG_OPS_REGION }, null);
+    mkdirSync(join(temp, "backlog-ops-bound", "full"), { recursive: true });
+    const fullSummary = { mode: "execute", users: 0, fences: Object.fromEntries(["deletion_rows", "reset_rows", "created", "updated", "unchanged", "would_create", "would_update",
+      "pairs_added", "resets_added", "deletions_superseded", "deletions_unproven", "cold_resets", "needs_review", "unreadable", "contended", "tenant_invalid", "input_invalid",
+      "failed", "resets_in_flight"].map((k) => [k, 0])), ownership: { rows: 0, registered: 0, would_register: 0, unchanged: 0, skipped_deleted: 0, skipped_no_fence: 0, invalid: 0,
+      failed: 0, failed_codes: {} }, revisions: { rows: 0, seed_rows: 0, slot_rows: 0, slots_empty: 0, merged: 0, would_merge: 0, skipped_deleted: 0, skipped_no_fence: 0,
+      invalid: 0, shards: 0, failed: 0, failed_codes: {} }, sections: { fences: "complete", ownership: "complete", revisions: "complete" },
+      fingerprint: Object.fromEntries(["revisions_count", "revisions_max_updated_ms", "revisions_hash", "ownership_count", "ownership_hash", "slots_owned_count",
+        "slots_revision_sum", "slots_hash"].map((k) => [k, 0])) };
+    writeFileSync(join(temp, "backlog-ops-bound", "full", "backlog-ops-receipt.json"),
+      JSON.stringify({ contract: BACKLOG_OPS_RECEIPT_CONTRACT, mode: "backfill-execute", sha, run: FULL, scope: backlogOpsScope(SCOPE).id, ledger: "none", home, exitCode: 0, summary: fullSummary }));
+    const xml = `<AssumeRoleWithWebIdentityResponse><Credentials><AccessKeyId>ASIAAAAAAAAAAAAAAAAA</AccessKeyId><SecretAccessKey>s</SecretAccessKey>
+      <SessionToken>t</SessionToken><Expiration>${new Date(Date.now() + 6 * 3600_000).toISOString()}</Expiration></Credentials></AssumeRoleWithWebIdentityResponse>`;
+    const fetcher = (async (url: string) => url.startsWith("https://token.example/") ? new Response(JSON.stringify({ value: "a.b.c" })) : new Response(xml)) as unknown as typeof fetch;
+    const lines: string[] = [];
+    const log = console.log;
+    console.log = (...a: unknown[]) => { lines.push(a.join(" ")); };
+    let exit: number;
+    const forged = summary([relabelled, empty], { all_empty: true });
+    try {
+      exit = await backlogOpsRun({ ...target, ...SCOPE, ...env("bridge-dry"), GITHUB_SHA: sha, GITHUB_RUN_ID: "901", RUNNER_TEMP: temp,
+        BACKLOG_OPS_REVISIONS_SINCE_MS: String(CUT), ACTIONS_ID_TOKEN_REQUEST_URL: "https://token.example/x", ACTIONS_ID_TOKEN_REQUEST_TOKEN: "bearer",
+        SUPABASE_MIGRATION_OWNER_URL: `postgresql://${P.owner}.${P.project}:p%40ss@${P.host}:${P.port}/${P.database}?sslmode=verify-full` },
+        { fetcher, runChild: async () => ({ code: 0, stdout: JSON.stringify(forged) }) });
+    } finally { console.log = log; }
+    const logged = JSON.parse(lines.find((l) => l.startsWith("backlog_ops_receipt "))!.slice("backlog_ops_receipt ".length));
+    const saved = JSON.parse(readFileSync(join(temp, "backlog-ops-out", "backlog-ops-receipt.json"), "utf8"));
+    expect(exit).toBe(1);
+    expect(logged.summary).toEqual({ refused: "backlog_ops_receipt_schema" });
+    expect(saved).toEqual(logged);
+  } finally { rmSync(temp, { recursive: true, force: true }); }
+});
