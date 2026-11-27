@@ -41,8 +41,7 @@ this way. Owners must confirm every row today, so the H images are pre-built.
 | # | Consumer | Pins the generation via | Rebuild owner (proposed by b1; each confirms on Relay) | Verify after the roll |
 |---|---|---|---|---|
 | 1 | private-ingest Worker (96bulls-session-ingest) | `expectedGeneration` / `INGEST_ACCEPT_GENERATIONS` (`PRIVATE_INGEST_OVERLAP`) | b1 | the deploy readback accepts exactly {G, H}, then exactly {H} |
-| 2 | sessions-pipeline indexing Lambda (778a) | `publicationSchema.expected.generation`; `ingest_require_generation` on every pointer write | pipeline-handoff-sfmini | pointer writes succeed after the PASS at H; no 55000 |
-| 3 | sessions-pipeline feed Lambda (if live) | the same runtime | pipeline-handoff-sfmini | as row 2 |
+| 2 | sessions-pipeline indexing Lambda (ONE deployable: the "feed" is its every-minute schedule with input `{"bufferedSearchFeed":true}`, not a second function) | `publicationSchema.expected.generation`; `ingest_require_generation` on every pointer write | pipeline-handoff-sfmini | one H build from the LANDED sha (plus that day's feed changes, re-derived H); the release doc records the zip sha256 and the Lambda CodeSha256; pointer writes and the feed schedule succeed after the PASS at H, no 55000. Counted once in the Ready readback |
 | 4 | session-pipeline-consumer | schema-gated SERVICE (`docker/entrypoint.sh`) | layered-sessions-pipeline (image); envs-lead-3 (EKS pin bump) | Ready count restored; no `worker paused` log |
 | 5 | bob-costas (summaries) | schema-gated SERVICE | layered-sessions-pipeline (image); envs-lead-3 (EKS pin bump) | Ready restored; summary dead-letter count not grown since step 1 |
 | 6 | session-brief | schema-gated SERVICE | layered-sessions-pipeline (image); envs-lead-3 (EKS pin bump) | Ready restored |
