@@ -205,7 +205,11 @@ describe("062340 bind and release refusals", () => {
   test("a covered truncate gap: a cutoff before a permitted truncate is not covered", async () => {
     const f = await fixture();
     const before = (await one(f, "SELECT clock_timestamp()::text t")).t as string;
+    // PGlite's clock_timestamp() has millisecond resolution (native PostgreSQL: microsecond), so without a gap the
+    // cutoff and the truncate's coverage row can carry the same value, and the cutoff then reads as covered.
+    await f.db.query("SELECT pg_sleep(0.002)");
     await f.db.query("TRUNCATE sessions.upload_resets");
+    expect((await one(f, "SELECT max(at) > $1::timestamptz AS later FROM sessions.ingest_org_erasure_history_coverage WHERE kind='truncated'", [before])).later).toBe(true);
     expect((await one(f, "SELECT sessions.ingest_org_erasure_history_covers($1::timestamptz) c", [before])).c).toBe(false);
   });
 
