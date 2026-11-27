@@ -16,7 +16,7 @@
  */
 import { FEATURE_STATES, type FeatureState, type GapKind, type SessionKey } from "../features/types.ts";
 import { CorpusError } from "./corpus.ts";
-import { utc } from "../features/types.ts";
+import { utcCut } from "../features/types.ts";
 
 export const GOLD_FORMAT = "relayfacts-gold/1";
 const GAP_KINDS: readonly GapKind[] = ["unmet", "diverged", "unverified", "open"];
@@ -48,7 +48,7 @@ export function parseGold(raw: unknown, corpusSha256: string): Gold {
   const g = raw as Record<string, unknown>;
   if (!g || g.format !== GOLD_FORMAT) throw new CorpusError(`gold: format must be ${GOLD_FORMAT}`);
   if (g.corpus !== corpusSha256) throw new CorpusError("gold: labels name a different corpus");
-  if (typeof g.asOf !== "string" || utc(g.asOf) === null) throw new CorpusError("gold: bad asOf");
+  if (typeof g.asOf !== "string" || utcCut(g.asOf) === null) throw new CorpusError("gold: bad asOf");
   if (g.coverage !== "complete" && g.coverage !== "partial") throw new CorpusError("gold: coverage must be complete or partial");
   if (!Array.isArray(g.features)) throw new CorpusError("gold: features must be an array");
   const ids = new Set<string>();

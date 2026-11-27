@@ -147,7 +147,11 @@ must cite evidence ids that the scorer checks.
    from the time it reached it. The limits: a branch ref's creation time is unknown (a ref created after T
    at an older tip is indistinguishable); a first-parent commit's landing time is its committer time (a
    commit made before T and pushed after T reads as landed before T); and flag defaults are the docs as
-   sealed.
+   sealed. Times are canonical UTC at millisecond precision: a finer evidence time (PostgreSQL writes
+   microseconds) is floored, and a cut must itself be a whole millisecond (a finer `--as-of` or gold
+   `asOf` is refused), which makes every strict-before comparison exact. An impossible calendar date
+   anywhere (evidence, forge, a run's records or its delete-by date) is invalid, never rolled over;
+   `score` and `packets` refuse such a run before writing anything.
 4. **Asked against built.** Each asked item is matched to the built items that answer it, or marked
    `unmet`. Contradictions and unverified outcomes carry over as gaps.
 5. **Render and export.** Markdown per feature plus an index page, escaped exactly like the

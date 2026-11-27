@@ -177,7 +177,8 @@ export const textCompare = (a: string, b: string) => (a < b ? -1 : a > b ? 1 : 0
 const INSTANT = /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2})(?::(\d{2})(?:\.(\d{1,9}))?)?(Z|[+-](\d{2}):(\d{2}))$/u;
 
 /**
- * One instant as canonical UTC (`YYYY-MM-DDTHH:MM:SS.sssZ`), so that text order is time order everywhere: git
+ * One instant as canonical UTC (`YYYY-MM-DDTHH:MM:SS.sssZ`, a finer fraction floored to the millisecond; see
+ * `utcCut` for why that is exact at every cut), so that text order is time order everywhere: git
  * writes offsets (`+00:00`, `-05:00`), analyses write `Z`. Only a zoned ISO 8601 date-time whose calendar fields
  * are real (no 2026-02-30, no hour 24, offsets within ±14:00) is an instant; anything else is null, never rolled
  * over to a neighbouring day.
@@ -191,8 +192,27 @@ export function utc(t: string | null | undefined): string | null {
   if (day.getUTCFullYear() !== y || day.getUTCMonth() !== mo! - 1 || day.getUTCDate() !== d) return null;
   if (h! > 23 || mi! > 59 || Number(s) > 59) return null;
   if (m[8] !== "Z" && (Number(m[9]) > 14 || Number(m[10]) > 59)) return null;
-  const ms = Date.parse(t);
+  const ms = Date.parse(floored(m));
   return Number.isFinite(ms) ? new Date(ms).toISOString() : null;
+}
+
+/** The instant's text with its fraction cut to milliseconds: flooring, by construction, on every engine. */
+function floored(m: RegExpExecArray): string {
+  const frac = (m[7] ?? "").slice(0, 3).padEnd(3, "0");
+  return `${m[1]}-${m[2]}-${m[3]}T${m[4]}:${m[5]}:${m[6] ?? "00"}.${frac}${m[8]}`;
+}
+
+/**
+ * A cut (an as-of instant, a gold or run cut): canonical like `utc`, but only at the precision `utc` keeps. Evidence
+ * finer than a millisecond (PostgreSQL writes microseconds) is floored, and with a millisecond cut that is exact
+ * for every comparison relayfacts makes: `floor(t) < c` exactly when `t < c`, and `floor(t) >= c` exactly when
+ * `t >= c`. A finer cut would not be, and two cuts within one millisecond would compare equal, so it is refused.
+ */
+export function utcCut(t: string | null | undefined): string | null {
+  if (typeof t !== "string") return null;
+  const m = INSTANT.exec(t);
+  if (!m || /[1-9]/u.test((m[7] ?? "").slice(3))) return null;
+  return utc(t);
 }
 
 /** The instant, or a refusal naming only the role of the value (never the value). */

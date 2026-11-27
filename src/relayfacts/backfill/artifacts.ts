@@ -16,6 +16,7 @@
  *   files      the events' files_touched, anchored at the repository root
  */
 import { repoRelative } from "../features/extract.ts";
+import { utc } from "../features/types.ts";
 import { slugFromRemote } from "./locate.ts";
 import { runsPrCreate, shellCommand } from "../features/commands.ts";
 
@@ -48,7 +49,8 @@ const TASK = /Delegated task ([A-Za-z0-9][A-Za-z0-9._:-]{2,127})/gu;
 const DEFAULT_BRANCH = /^(?:main|master|trunk|HEAD)$/u;
 
 const text = (v: unknown) => (typeof v === "string" ? v : v == null ? "" : JSON.stringify(v));
-const timeOf = (v: unknown) => (typeof v === "string" && Number.isFinite(Date.parse(v)) ? new Date(v).toISOString() : null);
+/** The strict validator sees the original text: an impossible date (2099-02-30) is undated, never rolled over. */
+const timeOf = (v: unknown) => (typeof v === "string" ? utc(v) : null);
 
 export function extractArtifacts(rows: ReadonlyArray<{ table: string; row: Record<string, unknown> }>, attributedRepo: string | null): SessionArtifacts {
   const out: SessionArtifacts = { pushes: [], commits: [], prs: [], taskRefs: [], files: [], branches: [] };

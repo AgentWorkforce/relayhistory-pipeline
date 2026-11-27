@@ -66,4 +66,3 @@ export function attributeRepo(rows: ReadonlyArray<{ table: string; row: Record<s
   if (top) return { repo: top[0], basis: "events", repoName, branch };
   return { repo: null, basis: repoName ? "path" : "none", repoName, branch };
 }
-

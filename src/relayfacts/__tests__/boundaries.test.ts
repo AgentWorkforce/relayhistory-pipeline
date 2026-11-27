@@ -520,3 +520,70 @@ describe("round-4 controls", () => {
     expect(() => parseForge({ prs: [], commits: [{ sha: "a".repeat(40), at: "2099-02-30T00:00:00Z", onDefaultBranch: true }], flags: [] })).toThrow();
   });
 });
+
+describe("round-5 controls", () => {
+  test("a query, fragment or backslash in what looks like userinfo never makes a mirror github.com, at admission too", async () => {
+    const { githubSlug } = await import("../features/repo.ts");
+    const { attributeRepo } = await import("../backfill/locate.ts");
+    const tricks = ["https://mirror.invalid?@github.com/example/widgets", "https://mirror.invalid#@github.com/example/widgets.git", "https://u@mirror.invalid?x@github.com/example/widgets",
+      "https://mirror.invalid\\@github.com/example/widgets", "ssh://git@mirror.invalid?@github.com/example/widgets", "https://github.com/example/widgets#main", "https://git hub@github.com/example/widgets"];
+    for (const bad of tricks) {
+      expect(githubSlug(bad)).toBeNull();
+      // The WHATWG parser really does see another host (or a fragment) in each: the regex alone was not enough.
+      if (!/\s/u.test(bad)) { const u = new URL(bad); expect(u.hostname !== "github.com" || u.hash !== "").toBe(true); }
+    }
+    expect(githubSlug("https://user:tok%40en@github.com/example/widgets.git")).toBe("example/widgets");
+    const scope = { format: "relayfacts-scope/1" as const, orgId: "o", workspaceId: "w", repos: ["example/widgets"], since: "2026-10-01T00:00:00.000Z", until: "2026-11-01T00:00:00.000Z", deleteBy: "2026-12-01T00:00:00.000Z", id: "s1" };
+    const admit = (remote: string) => {
+      const located = { scope: "s1", harness: "claude", sessionId: "x", status: "ok", ...attributeRepo([{ table: "session_catalog", row: { repo_url: remote, cwd: "/work/widgets" } }]) };
+      return scopedSessions([located], scope, new Map([["claude\u0000x", "2026-10-10T00:00:00.000Z"]])).rows.length;
+    };
+    expect(admit("https://github.com/example/widgets.git")).toBe(1);
+    expect(admit("https://mirror.invalid/example/widgets.git")).toBe(0);
+    for (const bad of tricks) expect(admit(bad)).toBe(0);
+  });
+
+  test("an impossible artifact date is undated, not rolled over to the next month", () => {
+    const art = extractArtifacts([
+      { table: "convergence_events", row: { event_id: "e1", ts: "2099-02-30T00:00:00Z", type: "tool_result", content: "[feat/x abcdef1] add widgets\n" } },
+      { table: "convergence_events", row: { event_id: "e2", ts: "2026-10-13T04:59:07.460095Z", type: "tool_result", content: "[feat/x 1234567] more widgets\n" } },
+    ], "example/widgets");
+    expect(art.commits.map((c) => [c.sha, c.at])).toEqual([["abcdef1", null], ["1234567", "2026-10-13T04:59:07.460Z"]]);
+  });
+
+  test("finer-than-millisecond times floor exactly; cuts finer than a millisecond are refused", async () => {
+    const { utcCut } = await import("../features/types.ts");
+    expect(utc("2026-01-01T00:00:00.123999999Z")).toBe("2026-01-01T00:00:00.123Z");
+    expect(utc("2026-01-01T00:00:00.9999Z")).toBe("2026-01-01T00:00:00.999Z");
+    expect(utcCut("2026-01-01T00:00:00.123000Z")).toBe("2026-01-01T00:00:00.123Z");
+    // Two distinct cuts within one millisecond would compare equal: neither is accepted.
+    expect(utcCut("2026-01-01T00:00:00.123000001Z")).toBeNull();
+    expect(utcCut("2026-01-01T00:00:00.123400Z")).toBeNull();
+    // Strict-before with a millisecond cut is exact on floored evidence.
+    const cut = utcCut("2026-01-01T00:00:00.124Z")!;
+    expect(utc("2026-01-01T00:00:00.123999Z")! < cut).toBe(true);
+    expect(utc("2026-01-01T00:00:00.124001Z")! < cut).toBe(false);
+  });
+
+  test("packets and score refuse a run with an impossible delete-by date or cut before writing", async () => {
+    const { main } = await import("../bench/cli.ts");
+    const dir = PrivateDir.open(join(tmp, "r5-run"));
+    const feature = { id: "f1", title: "widgets", repos: ["example/widgets"], state: "in-progress", stateBasis: "analysis", stateReason: "r", rationale: [], links: [], firstAt: "2026-10-01T00:00:00.000Z", updatedAt: "2026-10-02T00:00:00.000Z", sessions: [{ source: "claude", sessionId: "s", role: "founding", startedAt: "2026-10-01T00:00:00.000Z" }], asked: [], built: [], gaps: [] };
+    const run = (over: Record<string, unknown>) => JSON.stringify({ format: "relayfacts-features/1", corpus: "c", asOf: "2026-11-01T00:00:00.000Z", deleteBy: "2099-01-01T00:00:00.000Z", features: [feature], ...over });
+    const cases: Array<[string, Record<string, unknown>, RegExp]> = [
+      ["bad-delete-by.json", { deleteBy: "2099-02-30T00:00:00Z" }, /delete-by/],
+      ["bad-as-of.json", { asOf: "2026-11-01T00:00:00.0000001Z" }, /as-of/],
+      ["bad-record.json", { features: [{ ...feature, built: [{ kind: "commit", what: "x", at: "2099-02-30T00:00:00Z", evidence: [] }] }] }, /invalid time/],
+    ];
+    for (const [name, over, why] of cases) {
+      dir.write(name, run(over));
+      const out = join(tmp, `r5-packets-${name}`);
+      expect(() => main(["packets", "--features", join(dir.path, name), "--out", out])).toThrow(why);
+      expect(existsSync(join(out, "packets.jsonl"))).toBe(false);
+    }
+    dir.write("good.json", run({}));
+    const out = join(tmp, "r5-packets-good");
+    expect(main(["packets", "--features", join(dir.path, "good.json"), "--out", out])).toBe(0);
+    expect(existsSync(join(out, "packets.jsonl"))).toBe(true);
+  });
+});
