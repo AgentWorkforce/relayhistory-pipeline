@@ -58,3 +58,23 @@ plan is approved. Re-grep `expectedGeneration|EXPECT_GENERATION|ingest_require_g
   control of a SEALED org is refused (fail closed); unsealed orgs are unaffected.
 - **Rollback.** The generated down refuses while any hold is not released or a later slot is applied. It resets
   readiness to pending and retains the hold history.
+
+## Install preconditions (per org, checked by the cutover tooling before `_install`)
+
+- No pending batch: `_install` refuses on any (RH042).
+- No canonical fanout outstanding for the org. Buffered production orgs refuse canonical claims, so none should
+  exist. A committed canonical batch whose fanout is still pending would retry RH042 until release
+  (`ingest_fanout_fence` is admission-class).
+- Every lifecycle step carries its bound receipt's sha256:
+  - `_seal`: the FULL backfill-execute receipt.
+  - `_marker_attempt`: the final catch-up receipt.
+  - `_release`: the terminal receipt, plus the erasure count read under the replay.
+
+  NULL evidence is refused.
+
+## Pending reconciliation before landing alongside other work
+
+- `supabase/proposals/continuous-publication/062280-scoped-kernels` (layered-sessions-pipeline) pins the canonical
+  publication bodies that 062320 replaces. It must land after 062320, re-pinned to its bodies so the copied kernels
+  keep the hold check, or give its scoped entry points their own publication-class check. The classification test
+  refuses any runtime-granted function left unclassified.

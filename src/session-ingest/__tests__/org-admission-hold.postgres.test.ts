@@ -57,7 +57,7 @@ describe.skipIf(!url)("062320 two-connection orderings (real PostgreSQL)", () =>
     const admitPending = async (c: any) => { await c.query("SELECT sessions.ingest_org_admission_hold_check($1,'admission')", [ORG]); await c.query(insertBatch("pending", "b-pending")); };
     const r1 = await expectBlocks(p, { holder: p.a, waiter: p.b, hold: admitPending, wait: (c) => install(c) });
     expect(r1.receipt.waiting[0]).toMatchObject({ locktype: "advisory" });
-    expect(r1.waited).toMatchObject({ ok: false, error: { code: "55000" } }); // the committed pending batch refuses install
+    expect(r1.waited).toMatchObject({ ok: false, error: { code: "RH042" } }); // the committed pending batch refuses install
     const o = await owner(db);
     await o.query("UPDATE sessions.ingest_batches SET state='committed', committed_at=clock_timestamp() WHERE batch_id='b-pending'");
     const admitCommitted = async (c: any) => { await c.query("SELECT sessions.ingest_org_admission_hold_check($1,'admission')", [ORG]); await c.query(insertBatch("committed", "b-done")); };
@@ -84,7 +84,7 @@ describe.skipIf(!url)("062320 two-connection orderings (real PostgreSQL)", () =>
     const p = await pair(db);
     const r = await expectBlocks(p, { holder: p.a, waiter: p.b,
       hold: (c) => c.query("SELECT sessions.ingest_org_admission_hold_check($1,'publication')", [ORG]),
-      wait: (c) => c.query("SELECT sessions.ingest_org_admission_hold_seal($1,$2::uuid,NULL)", [ORG, e]) });
+      wait: (c) => c.query("SELECT sessions.ingest_org_admission_hold_seal($1,$2::uuid,'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb')", [ORG, e]) });
     expect(r.waited.ok).toBe(true);
     await expect(o.query("SELECT sessions.ingest_org_admission_hold_check($1,'publication')", [ORG])).rejects.toMatchObject({ code: "RH042" });
   });
@@ -93,15 +93,13 @@ describe.skipIf(!url)("062320 two-connection orderings (real PostgreSQL)", () =>
     const db = await database();
     const o = await owner(db);
     const e = await install(o);
-    await o.query("SELECT sessions.ingest_org_admission_hold_seal($1,$2::uuid,NULL)", [ORG, e]);
-    await o.query("SELECT sessions.ingest_org_admission_hold_marker_attempt($1,$2::uuid,NULL)", [ORG, e]);
+    await o.query("SELECT sessions.ingest_org_admission_hold_seal($1,$2::uuid,'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb')", [ORG, e]);
+    await o.query("SELECT sessions.ingest_org_admission_hold_marker_attempt($1,$2::uuid,'cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc')", [ORG, e]);
     const seen = Number((await o.query("SELECT (sessions.ingest_org_admission_hold_status($1)->>'erasures')::bigint n", [ORG])).rows[0].n);
     const p = await pair(db);
-    // The erase: erasure-class check (shared key) and its durable record, in one transaction.
-    const erase = async (c: any) => {
-      await c.query("SELECT sessions.ingest_org_admission_hold_check($1,'erasure')", [ORG]);
-      await c.query("INSERT INTO sessions.operator_user_erasures(request_id,org_id,workspace_id,user_id,state,origins) VALUES('erase-1',$1,'ws','u','purging','{}')", [ORG]);
-    };
+    // The REAL erase entry (owner-only operator_user_erase_begin): its first statement is the erasure check (shared key),
+    // and it records the durable operator_user_erasures row, in one transaction.
+    const erase = (c: any) => c.query("SELECT sessions.operator_user_erase_begin('erase-1',$1,'ws','u')", [ORG]);
     const r = await expectBlocks(p, { holder: p.a, waiter: p.b, hold: erase,
       wait: (c) => c.query("SELECT sessions.ingest_org_admission_hold_release($1,$2::uuid,'bridge_complete',$3,NULL,$4)", [ORG, e, EVIDENCE, seen]) });
     expect(r.receipt.waiting[0]).toMatchObject({ locktype: "advisory" });
@@ -113,7 +111,7 @@ describe.skipIf(!url)("062320 two-connection orderings (real PostgreSQL)", () =>
     const db = await database();
     const o = await owner(db);
     const e = await install(o);
-    await o.query("SELECT sessions.ingest_org_admission_hold_seal($1,$2::uuid,NULL)", [ORG, e]);
+    await o.query("SELECT sessions.ingest_org_admission_hold_seal($1,$2::uuid,'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb')", [ORG, e]);
     const su = new pg.Client({ connectionString: db.fixtureUrl }); await su.connect(); cleanups.push(() => su.end());
     const tag = db.name.slice(-8);
     const plain = `worker_plain_${tag}`, mirror = `worker_mirror_${tag}`;
@@ -172,6 +170,44 @@ describe.skipIf(!url)("062320 two-connection orderings (real PostgreSQL)", () =>
     expect((await o.query("SELECT count(*)::int n FROM sessions.ingest_org_admission_holds WHERE held_org='org-after-down'")).rows[0].n).toBe(0);
     // The history survived the down (retained, inert).
     expect((await o.query("SELECT to_regclass('sessions.ingest_org_admission_hold_events') IS NOT NULL ok")).rows[0].ok).toBe(true);
+  });
+
+  test("2b. the real origin entry takes the org key FIRST: blocked behind an install it holds no origin lock and writes no mark", async () => {
+    const db = await database();
+    const p = await pair(db);
+    // The waiter is a real login of the ingest role (the origin wrapper requires it; the NOINHERIT owner cannot SET ROLE).
+    const su = new pg.Client({ connectionString: db.fixtureUrl }); await su.connect(); cleanups.push(() => su.end());
+    const worker = `worker_origin_${db.name.slice(-8)}`;
+    await su.query(`CREATE ROLE ${worker} LOGIN IN ROLE bulls96_session_ingest`);
+    cleanups.push(() => su.query(`DROP ROLE IF EXISTS ${worker}`));
+    const w = await openPair({ url: loginUrl(db, worker), observerUrl: db.fixtureUrl });
+    cleanups.push(() => w.close());
+    const payload = JSON.stringify({ tenant: { orgId: ORG, workspaceId: "ws", userId: "u" }, originId: "origin-1" });
+    const originKey = "SELECT ((k>>32)&4294967295)::bigint c,(k&4294967295)::bigint o FROM(SELECT hashtextextended(jsonb_build_array('96bulls:ingest-origin-claim-v1',$1::text,'ws','u','origin-1')::text,0) k)s";
+    const r = await expectBlocks(p, { holder: p.a, waiter: w.a, hold: (c) => install(c),
+      wait: async (c) => { await c.query("SET LOCAL ROLE bulls96_session_ingest"); return c.query("SELECT sessions.ingest_origin_claim_buffered_batch($1::jsonb)", [payload]); },
+      whileBlocked: async () => {
+        const k = (await p.observer.query(originKey, [ORG])).rows[0];
+        const held = await p.observer.query("SELECT count(*)::int n FROM pg_locks WHERE pid=$1 AND locktype='advisory' AND classid=$2::bigint::oid AND objid=$3::bigint::oid AND objsubid=1", [w.a.pid, k.c, k.o]);
+        expect(held.rows[0].n).toBe(0); // the origin advisory is not taken yet
+        const marks = await p.observer.query("SELECT count(*)::int n FROM sessions.ingest_origin_claim_marks");
+        expect(marks.rows[0].n).toBe(0);
+      } });
+    expect(r.receipt.waiting[0]).toMatchObject({ locktype: "advisory" });
+    expect(r.waited).toMatchObject({ ok: false, error: { code: "RH042" } });
+  });
+
+  test("7c. a reapply refuses a retained history that drifted (one constraint removed), nothing applied", async () => {
+    const db = await database();
+    const o = await owner(db);
+    await o.query(DOWN);
+    await o.query("ALTER TABLE sessions.ingest_org_admission_hold_events DROP CONSTRAINT ingest_org_admission_hold_events_epoch_fkey");
+    let error: { code?: string; message?: string } | null = null;
+    try { await migrateAsOwner(db.ownerUrl); } catch (e) { error = e as { code?: string; message?: string }; }
+    expect(error).not.toBeNull();
+    expect(String(error?.message ?? "") + String(error?.code ?? "")).toMatch(/hold history is not this slot|55000/u);
+    expect((await o.query("SELECT count(*)::int n FROM sessions.__96bulls_migrations WHERE name='upstream:20261105062320_ingest_org_admission_fences.sql'")).rows[0].n).toBe(0);
+    expect((await o.query("SELECT to_regprocedure('sessions.ingest_org_admission_hold_check(text,text)') IS NULL gone")).rows[0].gone).toBe(true);
   });
 
   test("8. an install never blocks another org's admission", async () => {

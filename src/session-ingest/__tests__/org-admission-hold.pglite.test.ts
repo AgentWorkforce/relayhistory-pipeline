@@ -5,6 +5,7 @@
  * PostgreSQL suite's; this file proves the refusals, what still proceeds, the state machine and the audit.
  */
 import { afterEach, describe, expect, setDefaultTimeout, test } from "bun:test";
+import { readFileSync } from "node:fs";
 import { deliverBatch } from "../deliver.ts";
 import { sqlLedger } from "../ledger-sql.ts";
 import { deliveryAccount, prepareDelivery } from "../vendor/delivery/prepare.ts";
@@ -99,7 +100,7 @@ describe("062320 admission under a hold", () => {
     const pending = await one(f, "SELECT count(*)::int n FROM sessions.ingest_batches WHERE org_id=$1 AND state='pending'", [TENANT.orgId]);
     if ((pending.n as number) > 0)
       await expect(f.db.query("SELECT sessions.ingest_org_admission_hold_install($1, gen_random_uuid())", [TENANT.orgId]))
-        .rejects.toMatchObject({ code: "55000" });
+        .rejects.toMatchObject({ code: "RH042" });
     const r = "11111111-1111-4111-8111-111111111111";
     const g = OTHER.orgId;
     const a = (await one(f, "SELECT sessions.ingest_org_admission_hold_install($1,$2::uuid)::text e", [g, r])).e;
@@ -135,7 +136,7 @@ describe("062320 controls, publication and erasure classes", () => {
       finally { await f.db.exec("ROLLBACK"); }
     };
     expect(await control()).not.toBe("RH042"); // held: controls proceed (past the check, the empty selection is 22023)
-    await f.db.query("SELECT sessions.ingest_org_admission_hold_seal($1,$2::uuid,NULL)", [TENANT.orgId, e]);
+    await f.db.query("SELECT sessions.ingest_org_admission_hold_seal($1,$2::uuid,'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb')", [TENANT.orgId, e]);
     expect(await control()).toBe("RH042"); // sealed, no mirror role exists: fail closed, even for a superuser session
     expect(await control("SELECT set_config('bulls96.s3_fence_mirror','on',true);")).toBe("RH042"); // a GUC is not the gate
     await f.db.exec("CREATE ROLE bulls96_session_ingest_mirror NOLOGIN");
@@ -155,7 +156,7 @@ describe("062320 controls, publication and erasure classes", () => {
     const ledger = sqlLedger(run(f), { acceptanceMode: "buffered", expectedGeneration: generation });
     const sel = { tenant: TENANT, originId: "machine-a", enabled: false, sessions: [{ source: "claude", session_id: "s-1-s" }] } as never;
     expect(await refusal(ledger.setSessionUploads(sel))).not.toBe("RH042");
-    await f.db.query("SELECT sessions.ingest_org_admission_hold_seal($1,$2::uuid,NULL)", [TENANT.orgId, e]);
+    await f.db.query("SELECT sessions.ingest_org_admission_hold_seal($1,$2::uuid,'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb')", [TENANT.orgId, e]);
     expect(await refusal(ledger.setSessionUploads(sel))).toBe("RH042");
   });
 });
@@ -165,12 +166,15 @@ describe("062320 state machine and audit", () => {
     const f = await fixture();
     const org = TENANT.orgId;
     const e = await install(f, org);
-    await expect(f.db.query("SELECT sessions.ingest_org_admission_hold_marker_attempt($1,$2::uuid,NULL)", [org, e])).rejects.toMatchObject({ code: "55000" });
+    // No transition without its bound receipt hash.
+    for (const fn of ["seal", "marker_attempt"]) for (const ev of [null, "x", "A".repeat(64)])
+      await expect(f.db.query(`SELECT sessions.ingest_org_admission_hold_${fn}($1,$2::uuid,$3)`, [org, e, ev])).rejects.toMatchObject({ code: "22023" });
+    await expect(f.db.query("SELECT sessions.ingest_org_admission_hold_marker_attempt($1,$2::uuid,'cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc')", [org, e])).rejects.toMatchObject({ code: "55000" });
     await expect(release(f, org, e, "bridge_complete", 0)).rejects.toMatchObject({ code: "55000" });
-    await f.db.query("SELECT sessions.ingest_org_admission_hold_seal($1,$2::uuid,NULL)", [org, e]);
-    await f.db.query("SELECT sessions.ingest_org_admission_hold_seal($1,$2::uuid,NULL)", [org, e]); // idempotent
-    await f.db.query("SELECT sessions.ingest_org_admission_hold_marker_attempt($1,$2::uuid,NULL)", [org, e]);
-    await f.db.query("SELECT sessions.ingest_org_admission_hold_marker_attempt($1,$2::uuid,NULL)", [org, e]); // before every PUT
+    await f.db.query("SELECT sessions.ingest_org_admission_hold_seal($1,$2::uuid,'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb')", [org, e]);
+    await f.db.query("SELECT sessions.ingest_org_admission_hold_seal($1,$2::uuid,'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb')", [org, e]); // idempotent
+    await f.db.query("SELECT sessions.ingest_org_admission_hold_marker_attempt($1,$2::uuid,'cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc')", [org, e]);
+    await f.db.query("SELECT sessions.ingest_org_admission_hold_marker_attempt($1,$2::uuid,'cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc')", [org, e]); // before every PUT
     await expect(release(f, org, e, "verified_rollback")).rejects.toMatchObject({ code: "55000" }); // no rollback after an attempt
     const status = (await one(f, "SELECT sessions.ingest_org_admission_hold_status($1) s", [org])).s as { hold: { state: string }; erasures: number };
     expect(status.hold.state).toBe("marker_attempted");
@@ -189,7 +193,7 @@ describe("062320 state machine and audit", () => {
     // A new hold can follow a released one.
     const e2 = await install(f, org);
     expect(e2).not.toBe(e);
-    await expect(f.db.query("SELECT sessions.ingest_org_admission_hold_seal($1,$2::uuid,NULL)", [org, e])).rejects.toMatchObject({ code: "55000" }); // stale epoch
+    await expect(f.db.query("SELECT sessions.ingest_org_admission_hold_seal($1,$2::uuid,'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb')", [org, e])).rejects.toMatchObject({ code: "55000" }); // stale epoch
   });
 
   test("lifecycle refuses when the slot's ledger row is absent (a down ran)", async () => {
@@ -203,5 +207,18 @@ describe("062320 state machine and audit", () => {
     for (const sql of ["SELECT * FROM sessions.ingest_org_admission_holds", "SELECT sessions.ingest_org_admission_hold_install('x', gen_random_uuid())",
       "SELECT sessions.ingest_org_admission_hold_status('x')", "SELECT sessions.ingest_org_admission_hold_check('x','admission')"])
       await expect(f.run(sql)).rejects.toMatchObject({ code: "42501" });
+  });
+});
+
+describe("062320 vs the continuous-publication 062280 proposal", () => {
+  test("the proposal, written against the pre-062320 canonical bodies, refuses on the full chain (canonical body differs)", async () => {
+    // Negative full-chain proof (layered-sessions-pipeline 251996174404665344): the proposal pins the sha256 of the
+    // canonical publication bodies 062320 replaces, so over 062320 it fails closed instead of copying hold-less kernels.
+    const f = await fixture();
+    await f.db.exec("CREATE ROLE bulls96_publication_scoped NOLOGIN; CREATE ROLE bulls96_publication_recovery NOLOGIN; GRANT USAGE ON SCHEMA sessions TO bulls96_publication_scoped");
+    const proposal = readFileSync("supabase/proposals/continuous-publication/062280-scoped-kernels.up.sql", "utf8");
+    await expect(f.db.exec(proposal)).rejects.toThrow(/canonical body differs for (claim|publish)/u);
+    await f.db.exec("ROLLBACK").catch(() => {});
+    expect((await one(f, "SELECT to_regnamespace('publication_private') IS NULL AS absent")).absent).toBe(true);
   });
 });

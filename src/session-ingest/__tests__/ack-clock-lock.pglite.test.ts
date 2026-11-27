@@ -115,10 +115,12 @@ test("a staged commit holds the origin lock plus exactly one shared erase gate",
     expect((await f.db.query(locks)).rows).toEqual([]);
     expect(((await f.db.query<{ r: any }>("SELECT sessions.ingest_commit_buffered_batch($1::jsonb) AS r", [payload])).rows[0]!.r).kind).toBe("committed");
     const held=(await f.db.query(locks)).rows;
-    expect(held).toHaveLength(2);
+    // Since 20261105062320: plus the org admission hold key, taken SHARED once at the commit's entry.
+    expect(held).toHaveLength(3);
     expect(held).toEqual(expect.arrayContaining([
       { ...want, objsubid: 1, mode: "ExclusiveLock", granted: true },
       {classid:"961996",objid:"50000",objsubid:2,mode:"ShareLock",granted:true},
+      { ...(await f.db.query<{ classid: string; objid: string }>("SELECT ((k>>32)&4294967295)::text classid,(k&4294967295)::text objid FROM(SELECT hashtextextended('96bulls:ingest-org-hold-v1:'||$1,0) k)s", [TENANT.orgId])).rows[0]!, objsubid: 1, mode: "ShareLock", granted: true },
     ]));
   } finally { await f.db.exec("ROLLBACK"); }
 });

@@ -43,32 +43,9 @@ CREATE TABLE IF NOT EXISTS sessions.ingest_org_admission_hold_events (
   at timestamptz NOT NULL DEFAULT clock_timestamp(),
   detail text CHECK (detail IS NULL OR detail ~ '^[a-z][a-z0-9_]{0,63}$'),
   evidence_sha256 text CHECK (evidence_sha256 IS NULL OR evidence_sha256 ~ '^[0-9a-f]{64}$'),
-  PRIMARY KEY (epoch, kind)
+  PRIMARY KEY (epoch, kind),
+  CHECK (kind NOT IN ('sealed', 'marker_attempted', 'released') OR evidence_sha256 IS NOT NULL)
 );
-
--- A retained history (this slot's down keeps both tables) must be exactly this one: columns, indexes, owned by the
--- migrating role. Else 55000, nothing applied (as 062300's retained archive).
-DO $hold_history_shape$
-BEGIN
- IF (SELECT pg_get_userbyid(relowner) FROM pg_class WHERE oid = 'sessions.ingest_org_admission_holds'::regclass) <> current_user
-    OR (SELECT pg_get_userbyid(relowner) FROM pg_class WHERE oid = 'sessions.ingest_org_admission_hold_events'::regclass) <> current_user
-    OR (SELECT string_agg(attname || ' ' || format_type(atttypid, atttypmod) || CASE WHEN attnotnull THEN ' not null' ELSE '' END, ', ' ORDER BY attnum)
-          FROM pg_attribute WHERE attrelid = 'sessions.ingest_org_admission_holds'::regclass AND attnum > 0 AND NOT attisdropped)
-       IS DISTINCT FROM 'epoch uuid not null, held_org text not null, request_id uuid not null, state text not null, installed_at timestamp with time zone not null, sealed_at timestamp with time zone, marker_attempted_at timestamp with time zone, released_at timestamp with time zone, release_reason text, release_evidence_sha256 text'
-    OR (SELECT string_agg(attname || ' ' || format_type(atttypid, atttypmod) || CASE WHEN attnotnull THEN ' not null' ELSE '' END, ', ' ORDER BY attnum)
-          FROM pg_attribute WHERE attrelid = 'sessions.ingest_org_admission_hold_events'::regclass AND attnum > 0 AND NOT attisdropped)
-       IS DISTINCT FROM 'epoch uuid not null, kind text not null, at timestamp with time zone not null, detail text, evidence_sha256 text'
-    OR (SELECT array_agg(pg_get_indexdef(indexrelid)::text ORDER BY pg_get_indexdef(indexrelid)::text) FROM pg_index
-         WHERE indrelid IN ('sessions.ingest_org_admission_holds'::regclass, 'sessions.ingest_org_admission_hold_events'::regclass))
-       IS DISTINCT FROM ARRAY[
-         'CREATE UNIQUE INDEX ingest_org_admission_hold_events_pkey ON sessions.ingest_org_admission_hold_events USING btree (epoch, kind)',
-         'CREATE UNIQUE INDEX ingest_org_admission_holds_live ON sessions.ingest_org_admission_holds USING btree (held_org) WHERE (state <> ''released''::text)',
-         'CREATE UNIQUE INDEX ingest_org_admission_holds_pkey ON sessions.ingest_org_admission_holds USING btree (epoch)',
-         'CREATE UNIQUE INDEX ingest_org_admission_holds_request_id_key ON sessions.ingest_org_admission_holds USING btree (request_id)']::text[]
- THEN
-   RAISE EXCEPTION USING ERRCODE = '55000', MESSAGE = 'org admission hold: an existing hold history is not this slot''s; nothing applied';
- END IF;
-END $hold_history_shape$;
 
 ALTER TABLE sessions.ingest_org_admission_holds ENABLE ROW LEVEL SECURITY;
 ALTER TABLE sessions.ingest_org_admission_hold_events ENABLE ROW LEVEL SECURITY;
@@ -107,6 +84,59 @@ CREATE TRIGGER ingest_org_admission_hold_events_guard BEFORE UPDATE OR DELETE ON
   FOR EACH ROW EXECUTE FUNCTION sessions.ingest_org_admission_hold_guard();
 CREATE TRIGGER ingest_org_admission_hold_events_truncate BEFORE TRUNCATE ON sessions.ingest_org_admission_hold_events
   FOR EACH STATEMENT EXECUTE FUNCTION sessions.ingest_org_admission_hold_guard();
+
+-- A retained history (this slot's down keeps both tables) must be exactly this one, else 55000, nothing applied.
+DO $hold_history_shape$
+BEGIN
+ IF NOT (
+-- The exact retained history: owner, columns, indexes, constraints (NOT NULL is the column check; PostgreSQL 18 and
+-- PGlite also catalogue it as a constraint, so 'n' rows are excluded) and the four guard triggers on the guard
+-- function, enabled. Shared verbatim by this slot's up and its generated down (lane ingest-org-admission-hold).
+ (SELECT pg_get_userbyid(relowner) FROM pg_class WHERE oid = 'sessions.ingest_org_admission_holds'::regclass) = current_user
+ AND (SELECT pg_get_userbyid(relowner) FROM pg_class WHERE oid = 'sessions.ingest_org_admission_hold_events'::regclass) = current_user
+ AND (SELECT string_agg(attname || ' ' || format_type(atttypid, atttypmod) || CASE WHEN attnotnull THEN ' not null' ELSE '' END, ', ' ORDER BY attnum)
+        FROM pg_attribute WHERE attrelid = 'sessions.ingest_org_admission_holds'::regclass AND attnum > 0 AND NOT attisdropped)
+     = 'epoch uuid not null, held_org text not null, request_id uuid not null, state text not null, installed_at timestamp with time zone not null, sealed_at timestamp with time zone, marker_attempted_at timestamp with time zone, released_at timestamp with time zone, release_reason text, release_evidence_sha256 text'
+ AND (SELECT string_agg(attname || ' ' || format_type(atttypid, atttypmod) || CASE WHEN attnotnull THEN ' not null' ELSE '' END, ', ' ORDER BY attnum)
+        FROM pg_attribute WHERE attrelid = 'sessions.ingest_org_admission_hold_events'::regclass AND attnum > 0 AND NOT attisdropped)
+     = 'epoch uuid not null, kind text not null, at timestamp with time zone not null, detail text, evidence_sha256 text'
+ AND (SELECT array_agg(pg_get_indexdef(indexrelid)::text ORDER BY pg_get_indexdef(indexrelid)::text COLLATE "C") FROM pg_index
+       WHERE indrelid IN ('sessions.ingest_org_admission_holds'::regclass, 'sessions.ingest_org_admission_hold_events'::regclass))
+     = ARRAY[
+         'CREATE UNIQUE INDEX ingest_org_admission_hold_events_pkey ON sessions.ingest_org_admission_hold_events USING btree (epoch, kind)',
+         'CREATE UNIQUE INDEX ingest_org_admission_holds_live ON sessions.ingest_org_admission_holds USING btree (held_org) WHERE (state <> ''released''::text)',
+         'CREATE UNIQUE INDEX ingest_org_admission_holds_pkey ON sessions.ingest_org_admission_holds USING btree (epoch)',
+         'CREATE UNIQUE INDEX ingest_org_admission_holds_request_id_key ON sessions.ingest_org_admission_holds USING btree (request_id)']::text[]
+ AND (SELECT array_agg(conrelid::regclass::text || ' ' || contype::text || ' ' || pg_get_constraintdef(oid) ORDER BY conrelid::regclass::text COLLATE "C", contype::text COLLATE "C", pg_get_constraintdef(oid) COLLATE "C")
+        FROM pg_constraint WHERE conrelid IN ('sessions.ingest_org_admission_holds'::regclass, 'sessions.ingest_org_admission_hold_events'::regclass) AND contype <> 'n')
+     = ARRAY[
+         'sessions.ingest_org_admission_hold_events c CHECK (((detail IS NULL) OR (detail ~ ''^[a-z][a-z0-9_]{0,63}$''::text)))',
+         'sessions.ingest_org_admission_hold_events c CHECK (((evidence_sha256 IS NULL) OR (evidence_sha256 ~ ''^[0-9a-f]{64}$''::text)))',
+         'sessions.ingest_org_admission_hold_events c CHECK (((kind <> ALL (ARRAY[''sealed''::text, ''marker_attempted''::text, ''released''::text])) OR (evidence_sha256 IS NOT NULL)))',
+         'sessions.ingest_org_admission_hold_events c CHECK ((kind = ANY (ARRAY[''installed''::text, ''sealed''::text, ''marker_attempted''::text, ''released''::text])))',
+         'sessions.ingest_org_admission_hold_events f FOREIGN KEY (epoch) REFERENCES sessions.ingest_org_admission_holds(epoch)',
+         'sessions.ingest_org_admission_hold_events p PRIMARY KEY (epoch, kind)',
+         'sessions.ingest_org_admission_holds c CHECK (((release_reason IS DISTINCT FROM ''bridge_complete''::text) OR (marker_attempted_at IS NOT NULL)))',
+         'sessions.ingest_org_admission_holds c CHECK (((release_reason IS DISTINCT FROM ''verified_rollback''::text) OR (marker_attempted_at IS NULL)))',
+         'sessions.ingest_org_admission_holds c CHECK (((state <> ''marker_attempted''::text) OR (marker_attempted_at IS NOT NULL)))',
+         'sessions.ingest_org_admission_holds c CHECK (((state <> ALL (ARRAY[''sealed''::text, ''marker_attempted''::text])) OR (sealed_at IS NOT NULL)))',
+         'sessions.ingest_org_admission_holds c CHECK (((state = ''released''::text) = ((release_reason IS NOT NULL) AND (release_evidence_sha256 IS NOT NULL))))',
+         'sessions.ingest_org_admission_holds c CHECK (((state = ''released''::text) = (released_at IS NOT NULL)))',
+         'sessions.ingest_org_admission_holds c CHECK ((held_org ~ ''^[A-Za-z0-9_-][A-Za-z0-9._-]{0,127}$''::text))',
+         'sessions.ingest_org_admission_holds c CHECK ((release_evidence_sha256 ~ ''^[0-9a-f]{64}$''::text))',
+         'sessions.ingest_org_admission_holds c CHECK ((release_reason = ANY (ARRAY[''bridge_complete''::text, ''verified_rollback''::text])))',
+         'sessions.ingest_org_admission_holds c CHECK ((state = ANY (ARRAY[''held''::text, ''sealed''::text, ''marker_attempted''::text, ''released''::text])))',
+         'sessions.ingest_org_admission_holds p PRIMARY KEY (epoch)',
+         'sessions.ingest_org_admission_holds u UNIQUE (request_id)']::text[]
+ AND (SELECT array_agg(t.tgname || ' ' || t.tgtype ORDER BY t.tgname COLLATE "C") FROM pg_trigger t
+       WHERE t.tgrelid IN ('sessions.ingest_org_admission_holds'::regclass, 'sessions.ingest_org_admission_hold_events'::regclass) AND NOT t.tgisinternal
+         AND t.tgenabled = 'O' AND t.tgfoid = 'sessions.ingest_org_admission_hold_guard()'::regprocedure)
+     = ARRAY['ingest_org_admission_hold_events_guard 27', 'ingest_org_admission_hold_events_truncate 34', 'ingest_org_admission_holds_guard 27', 'ingest_org_admission_holds_truncate 34']::text[]
+ AND (SELECT count(*) FROM pg_trigger t WHERE t.tgrelid IN ('sessions.ingest_org_admission_holds'::regclass, 'sessions.ingest_org_admission_hold_events'::regclass) AND NOT t.tgisinternal) = 4
+ ) THEN
+   RAISE EXCEPTION USING ERRCODE = '55000', MESSAGE = 'org admission hold: an existing hold history is not this slot''s; nothing applied';
+ END IF;
+END $hold_history_shape$;
 
 -- The stable per-org key. Its namespace literal is used by nothing else (design section 4).
 CREATE FUNCTION sessions.ingest_org_admission_hold_key(p_org text) RETURNS bigint
@@ -195,7 +225,7 @@ BEGIN
     RAISE EXCEPTION USING ERRCODE = '55000', MESSAGE = 'session ingest: org admission hold already live';
   END IF;
   IF EXISTS (SELECT 1 FROM sessions.ingest_batches WHERE org_id = p_org AND state = 'pending') THEN
-    RAISE EXCEPTION USING ERRCODE = '55000', MESSAGE = 'session ingest: org admission hold needs no pending batch';
+    RAISE EXCEPTION USING ERRCODE = 'RH042', MESSAGE = 'session ingest: org admission hold needs no pending batch';
   END IF;
   v_epoch := gen_random_uuid();
   INSERT INTO sessions.ingest_org_admission_holds (epoch, held_org, request_id, state) VALUES (v_epoch, p_org, p_request, 'held');
@@ -210,6 +240,10 @@ CREATE FUNCTION sessions.ingest_org_admission_hold_seal(p_org text, p_epoch uuid
 LANGUAGE plpgsql VOLATILE SET search_path = pg_catalog, pg_temp AS $hold_seal$
 DECLARE h sessions.ingest_org_admission_holds%ROWTYPE;
 BEGIN
+  -- The bound FULL backfill-execute receipt's sha256: no transition without it.
+  IF p_evidence IS NULL OR p_evidence !~ '^[0-9a-f]{64}$' THEN
+    RAISE EXCEPTION USING ERRCODE = '22023', MESSAGE = 'session ingest: org admission hold evidence required';
+  END IF;
   PERFORM sessions.ingest_org_admission_hold_lifecycle(p_org);
   SELECT * INTO h FROM sessions.ingest_org_admission_holds WHERE held_org = p_org AND state <> 'released';
   IF NOT FOUND OR h.epoch IS DISTINCT FROM p_epoch THEN
@@ -230,6 +264,10 @@ CREATE FUNCTION sessions.ingest_org_admission_hold_marker_attempt(p_org text, p_
 LANGUAGE plpgsql VOLATILE SET search_path = pg_catalog, pg_temp AS $hold_marker_attempt$
 DECLARE h sessions.ingest_org_admission_holds%ROWTYPE;
 BEGIN
+  -- The bound final catch-up receipt's sha256: no attempt without it.
+  IF p_evidence IS NULL OR p_evidence !~ '^[0-9a-f]{64}$' THEN
+    RAISE EXCEPTION USING ERRCODE = '22023', MESSAGE = 'session ingest: org admission hold evidence required';
+  END IF;
   PERFORM sessions.ingest_org_admission_hold_lifecycle(p_org);
   SELECT * INTO h FROM sessions.ingest_org_admission_holds WHERE held_org = p_org AND state <> 'released';
   IF NOT FOUND OR h.epoch IS DISTINCT FROM p_epoch THEN
@@ -290,12 +328,15 @@ $hold_release$;
 -- Read-only status for the bridge and the cutover tooling: the org's live hold (or its latest released one) and the
 -- erasure record count _release compares against (design 6.2). Owner-only, like the tables.
 CREATE FUNCTION sessions.ingest_org_admission_hold_status(p_org text) RETURNS jsonb
-LANGUAGE sql STABLE SET search_path = pg_catalog, pg_temp AS $hold_status$
-  SELECT jsonb_build_object(
+LANGUAGE plpgsql STABLE SET search_path = pg_catalog, pg_temp AS $hold_status$
+BEGIN
+  -- plpgsql, not sql: the erasure tables are resolved when called, so a profile without the erase slots still applies.
+  RETURN jsonb_build_object(
     'hold', (SELECT to_jsonb(h) FROM sessions.ingest_org_admission_holds AS h WHERE h.held_org = p_org
               ORDER BY (h.state <> 'released') DESC, h.installed_at DESC LIMIT 1),
     'erasures', (SELECT count(*) FROM sessions.operator_user_erasures WHERE org_id = p_org)
-              + (SELECT count(*) FROM sessions.session_erasure_fences WHERE org_id = p_org))
+              + (SELECT count(*) FROM sessions.session_erasure_fences WHERE org_id = p_org));
+END
 $hold_status$;
 
 -- Backstop: a future inserter of batch rows that bypasses the entry checks is still refused. Not the primary
@@ -323,12 +364,14 @@ REVOKE ALL ON FUNCTION sessions.ingest_org_admission_hold_guard(), sessions.inge
 -- (`-- 062320 org admission hold`): the check right after BEGIN (payload tenant), or right after the stored row that
 -- names the org is read (publication publish/claim, history plan claim, seeding). The generated rollback restores the
 -- prior bodies exactly. Classes:
---   admission    claim_batch_mode (canonical and inner buffered), claim_buffered_batch, commit_batch,
+--   admission    origin_claim_buffered_batch, origin_prepare_buffer_stage, origin_commit_buffered_batch,
+--                claim_batch_mode (canonical and inner buffered), claim_buffered_batch, commit_batch,
 --                commit_buffered_batch, prepare_buffer_stage, commit_revisions, fanout_fence, seed_proven_records
 --   publication  publication_publish, publication_claim, history_plan_claim
 --   control      set_session_uploads, selfhost_set_session_uploads, reset_uploaded_sessions, turn_register
 --   erasure      ingest_operator_runtime_begin, operator_user_erase_begin
--- The origin wrappers (062010) call the checked plain functions, so a refusal there aborts the whole transaction.
+-- The origin wrappers (062010) are checked FIRST, before their origin advisory and transaction mark, so the org key is
+-- the first lock on every admission path; the plain functions they call re-take the same shared key (a no-op re-grant).
 
 -- sessions.ingest_claim_batch_mode: latest body from 20261105050010_operator_session_erase_fence_check.sql, plus the admission check.
 CREATE OR REPLACE FUNCTION sessions.ingest_claim_batch_mode(p jsonb,p_mode text)
@@ -1720,3 +1763,42 @@ BEGIN
  RETURN sessions.operator_user_erase_render(v_request);
 END
 $begin$;
+
+-- sessions.ingest_origin_claim_buffered_batch: latest body from 20261105062010_ingest_origin_claim_fence.sql, plus the admission check FIRST,
+-- before the origin advisory and the transaction mark (design rev 4: the org key is the first lock).
+CREATE OR REPLACE FUNCTION sessions.ingest_origin_claim_buffered_batch(p jsonb) RETURNS jsonb
+LANGUAGE plpgsql VOLATILE SECURITY DEFINER SET search_path=pg_catalog,pg_temp AS $origin_claim$
+DECLARE v_mark xid8;v_result jsonb;
+BEGIN
+ PERFORM sessions.ingest_org_admission_hold_check(sessions.ingest_identifier(p#>'{tenant,orgId}',false),'admission'); -- 062320 org admission hold
+ v_mark:=sessions.ingest_origin_claim_enter(p);
+ v_result:=sessions.ingest_claim_buffered_batch(p);
+ PERFORM sessions.ingest_origin_claim_leave(v_mark);
+ RETURN v_result;
+END $origin_claim$;
+
+-- sessions.ingest_origin_prepare_buffer_stage: latest body from 20261105062010_ingest_origin_claim_fence.sql, plus the admission check FIRST,
+-- before the origin advisory and the transaction mark (design rev 4: the org key is the first lock).
+CREATE OR REPLACE FUNCTION sessions.ingest_origin_prepare_buffer_stage(p jsonb) RETURNS jsonb
+LANGUAGE plpgsql VOLATILE SECURITY DEFINER SET search_path=pg_catalog,pg_temp AS $origin_prepare$
+DECLARE v_mark xid8;v_result jsonb;
+BEGIN
+ PERFORM sessions.ingest_org_admission_hold_check(sessions.ingest_identifier(p#>'{tenant,orgId}',false),'admission'); -- 062320 org admission hold
+ v_mark:=sessions.ingest_origin_claim_enter(p);
+ v_result:=sessions.ingest_prepare_buffer_stage(p);
+ PERFORM sessions.ingest_origin_claim_leave(v_mark);
+ RETURN v_result;
+END $origin_prepare$;
+
+-- sessions.ingest_origin_commit_buffered_batch: latest body from 20261105062010_ingest_origin_claim_fence.sql, plus the admission check FIRST,
+-- before the origin advisory and the transaction mark (design rev 4: the org key is the first lock).
+CREATE OR REPLACE FUNCTION sessions.ingest_origin_commit_buffered_batch(p jsonb) RETURNS jsonb
+LANGUAGE plpgsql VOLATILE SECURITY DEFINER SET search_path=pg_catalog,pg_temp AS $origin_commit$
+DECLARE v_mark xid8;v_result jsonb;
+BEGIN
+ PERFORM sessions.ingest_org_admission_hold_check(sessions.ingest_identifier(p#>'{tenant,orgId}',false),'admission'); -- 062320 org admission hold
+ v_mark:=sessions.ingest_origin_claim_enter(p);
+ v_result:=sessions.ingest_commit_buffered_batch(p);
+ PERFORM sessions.ingest_origin_claim_leave(v_mark);
+ RETURN v_result;
+END $origin_commit$;

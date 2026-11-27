@@ -498,14 +498,14 @@ jobs:
       # pg_locks/pg_stat_activity on this job's PostgreSQL, and create-only and paused PUTs on a MinIO that run.ts
       # starts and removes itself (loopback, random port, tmpfs, throwaway credentials in the child's environment only).
       # run.ts fails a run that skipped any test.
-      - name: Hold harness self-tests (two-connection blocking, create-only and delayed PUTs on MinIO)
+      - name: Hold harness self-tests and the 062320 org admission hold proofs (two-connection, MinIO)
         run: |
           set -o pipefail
           if [ ! -f src/session-ingest/__tests__/hold-harness/run.ts ]; then
             echo "::warning title=pg-proof::hold-harness absent at this head; forward-merge main to run its self-tests"
             exit 0
           fi
-          bun src/session-ingest/__tests__/hold-harness/run.ts --pg-url postgres://postgres@127.0.0.1:5432/postgres --pg ${{ matrix.pg }} 2>&1 | tee hold-harness-pg${{ matrix.pg }}.log
+          bun src/session-ingest/__tests__/hold-harness/run.ts --pg-url postgres://postgres@127.0.0.1:5432/postgres --pg ${{ matrix.pg }} -- src/session-ingest/__tests__/hold-harness/two-conn.postgres.test.ts src/session-ingest/__tests__/hold-harness/put-gate.minio.test.ts src/session-ingest/__tests__/org-admission-hold.postgres.test.ts 2>&1 | tee hold-harness-pg${{ matrix.pg }}.log
           grep -E '^# hold-harness' hold-harness-pg${{ matrix.pg }}.log | sed "s/^/PostgreSQL ${{ matrix.pg }}: /" >> "$GITHUB_STEP_SUMMARY"
       # The session-analysis runner on LOCKER_PROVIDER=azure against Azurite: loopback-only, random host port,
       # in-memory data, two accounts (one with blob versioning, one without) whose throwaway keys live only in

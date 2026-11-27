@@ -2,7 +2,7 @@
  * Lane: ingest-org-admission-hold (slot 062320; docs/design/org-admission-hold.md revision 4, joint APPROVE 892f089e).
  * supabase/migrations/20261105062320_ingest_org_admission_fences.sql owns the owner-only hold functions (key, check,
  * lifecycle, install, seal, marker attempt, release, status, the batch backstop trigger function and the history
- * guard) and replaces 17 entry functions with their latest prior bodies plus one marked check line. ACLs unchanged.
+ * guard) and replaces 20 entry functions with their latest prior bodies plus one marked check line. ACLs unchanged.
  *
  * The generated rollback restores every replaced body exactly from the migration named in `replaces`, drops the
  * backstop trigger and the slot's functions, keeps both hold tables with their immutability guard as inert history
@@ -17,10 +17,13 @@ const ROLLBACK = "supabase/rollbacks/20261105062320_ingest_org_admission_fences.
 const NAME = "upstream:20261105062320_ingest_org_admission_fences.sql";
 const M = (f: string) => `supabase/migrations/${f}`;
 
-/** The 17 replaced entry functions (org-admission-hold-classes.ts), each with the migration holding its prior body. */
+/** The 20 replaced entry functions (org-admission-hold-classes.ts), each with the migration holding its prior body. */
 const REPLACES: Readonly<Record<string, ReplacedFunction>> = {
   "sessions.ingest_claim_batch_mode(jsonb,text)": { secdef: false, original: M("20261105050010_operator_session_erase_fence_check.sql") },
   "sessions.ingest_claim_buffered_batch(jsonb)": { secdef: true, original: M("20261105043850_ingest_acquisition_owner.sql") },
+  "sessions.ingest_origin_claim_buffered_batch(jsonb)": { secdef: true, original: M("20261105062010_ingest_origin_claim_fence.sql") },
+  "sessions.ingest_origin_prepare_buffer_stage(jsonb)": { secdef: true, original: M("20261105062010_ingest_origin_claim_fence.sql") },
+  "sessions.ingest_origin_commit_buffered_batch(jsonb)": { secdef: true, original: M("20261105062010_ingest_origin_claim_fence.sql") },
   "sessions.ingest_commit_batch(jsonb)": { secdef: true, original: M("20261105050010_operator_session_erase_fence_check.sql") },
   "sessions.ingest_commit_buffered_batch(jsonb)": { secdef: true, original: M("20261105050010_operator_session_erase_fence_check.sql") },
   "sessions.ingest_prepare_buffer_stage(jsonb)": { secdef: true, original: M("20261105043850_ingest_acquisition_owner.sql") },
@@ -37,6 +40,56 @@ const REPLACES: Readonly<Record<string, ReplacedFunction>> = {
   "sessions.ingest_operator_runtime_begin(text,text,text,text,text,text,text,text,text,text)": { secdef: true, original: M("20261105050020_operator_session_erase_runtime.sql") },
   "sessions.operator_user_erase_begin(text,text,text,text)": { secdef: false, original: M("20261105058010_operator_user_erase.sql") },
 };
+
+/**
+ * The exact retained history (owner, columns, indexes, constraints, the four guard triggers), as a boolean SQL
+ * predicate. The migration's up embeds it verbatim (a retained history must match before reapply) and the generated
+ * down asserts it last, before removing its ledger row (a test pins both copies to this one).
+ */
+export const HOLD_HISTORY_SHAPE = `-- The exact retained history: owner, columns, indexes, constraints (NOT NULL is the column check; PostgreSQL 18 and
+-- PGlite also catalogue it as a constraint, so 'n' rows are excluded) and the four guard triggers on the guard
+-- function, enabled. Shared verbatim by this slot's up and its generated down (lane ingest-org-admission-hold).
+ (SELECT pg_get_userbyid(relowner) FROM pg_class WHERE oid = 'sessions.ingest_org_admission_holds'::regclass) = current_user
+ AND (SELECT pg_get_userbyid(relowner) FROM pg_class WHERE oid = 'sessions.ingest_org_admission_hold_events'::regclass) = current_user
+ AND (SELECT string_agg(attname || ' ' || format_type(atttypid, atttypmod) || CASE WHEN attnotnull THEN ' not null' ELSE '' END, ', ' ORDER BY attnum)
+        FROM pg_attribute WHERE attrelid = 'sessions.ingest_org_admission_holds'::regclass AND attnum > 0 AND NOT attisdropped)
+     = 'epoch uuid not null, held_org text not null, request_id uuid not null, state text not null, installed_at timestamp with time zone not null, sealed_at timestamp with time zone, marker_attempted_at timestamp with time zone, released_at timestamp with time zone, release_reason text, release_evidence_sha256 text'
+ AND (SELECT string_agg(attname || ' ' || format_type(atttypid, atttypmod) || CASE WHEN attnotnull THEN ' not null' ELSE '' END, ', ' ORDER BY attnum)
+        FROM pg_attribute WHERE attrelid = 'sessions.ingest_org_admission_hold_events'::regclass AND attnum > 0 AND NOT attisdropped)
+     = 'epoch uuid not null, kind text not null, at timestamp with time zone not null, detail text, evidence_sha256 text'
+ AND (SELECT array_agg(pg_get_indexdef(indexrelid)::text ORDER BY pg_get_indexdef(indexrelid)::text COLLATE \"C\") FROM pg_index
+       WHERE indrelid IN ('sessions.ingest_org_admission_holds'::regclass, 'sessions.ingest_org_admission_hold_events'::regclass))
+     = ARRAY[
+         'CREATE UNIQUE INDEX ingest_org_admission_hold_events_pkey ON sessions.ingest_org_admission_hold_events USING btree (epoch, kind)',
+         'CREATE UNIQUE INDEX ingest_org_admission_holds_live ON sessions.ingest_org_admission_holds USING btree (held_org) WHERE (state <> ''released''::text)',
+         'CREATE UNIQUE INDEX ingest_org_admission_holds_pkey ON sessions.ingest_org_admission_holds USING btree (epoch)',
+         'CREATE UNIQUE INDEX ingest_org_admission_holds_request_id_key ON sessions.ingest_org_admission_holds USING btree (request_id)']::text[]
+ AND (SELECT array_agg(conrelid::regclass::text || ' ' || contype::text || ' ' || pg_get_constraintdef(oid) ORDER BY conrelid::regclass::text COLLATE \"C\", contype::text COLLATE \"C\", pg_get_constraintdef(oid) COLLATE \"C\")
+        FROM pg_constraint WHERE conrelid IN ('sessions.ingest_org_admission_holds'::regclass, 'sessions.ingest_org_admission_hold_events'::regclass) AND contype <> 'n')
+     = ARRAY[
+         'sessions.ingest_org_admission_hold_events c CHECK (((detail IS NULL) OR (detail ~ ''^[a-z][a-z0-9_]{0,63}$''::text)))',
+         'sessions.ingest_org_admission_hold_events c CHECK (((evidence_sha256 IS NULL) OR (evidence_sha256 ~ ''^[0-9a-f]{64}$''::text)))',
+         'sessions.ingest_org_admission_hold_events c CHECK (((kind <> ALL (ARRAY[''sealed''::text, ''marker_attempted''::text, ''released''::text])) OR (evidence_sha256 IS NOT NULL)))',
+         'sessions.ingest_org_admission_hold_events c CHECK ((kind = ANY (ARRAY[''installed''::text, ''sealed''::text, ''marker_attempted''::text, ''released''::text])))',
+         'sessions.ingest_org_admission_hold_events f FOREIGN KEY (epoch) REFERENCES sessions.ingest_org_admission_holds(epoch)',
+         'sessions.ingest_org_admission_hold_events p PRIMARY KEY (epoch, kind)',
+         'sessions.ingest_org_admission_holds c CHECK (((release_reason IS DISTINCT FROM ''bridge_complete''::text) OR (marker_attempted_at IS NOT NULL)))',
+         'sessions.ingest_org_admission_holds c CHECK (((release_reason IS DISTINCT FROM ''verified_rollback''::text) OR (marker_attempted_at IS NULL)))',
+         'sessions.ingest_org_admission_holds c CHECK (((state <> ''marker_attempted''::text) OR (marker_attempted_at IS NOT NULL)))',
+         'sessions.ingest_org_admission_holds c CHECK (((state <> ALL (ARRAY[''sealed''::text, ''marker_attempted''::text])) OR (sealed_at IS NOT NULL)))',
+         'sessions.ingest_org_admission_holds c CHECK (((state = ''released''::text) = ((release_reason IS NOT NULL) AND (release_evidence_sha256 IS NOT NULL))))',
+         'sessions.ingest_org_admission_holds c CHECK (((state = ''released''::text) = (released_at IS NOT NULL)))',
+         'sessions.ingest_org_admission_holds c CHECK ((held_org ~ ''^[A-Za-z0-9_-][A-Za-z0-9._-]{0,127}$''::text))',
+         'sessions.ingest_org_admission_holds c CHECK ((release_evidence_sha256 ~ ''^[0-9a-f]{64}$''::text))',
+         'sessions.ingest_org_admission_holds c CHECK ((release_reason = ANY (ARRAY[''bridge_complete''::text, ''verified_rollback''::text])))',
+         'sessions.ingest_org_admission_holds c CHECK ((state = ANY (ARRAY[''held''::text, ''sealed''::text, ''marker_attempted''::text, ''released''::text])))',
+         'sessions.ingest_org_admission_holds p PRIMARY KEY (epoch)',
+         'sessions.ingest_org_admission_holds u UNIQUE (request_id)']::text[]
+ AND (SELECT array_agg(t.tgname || ' ' || t.tgtype ORDER BY t.tgname COLLATE \"C\") FROM pg_trigger t
+       WHERE t.tgrelid IN ('sessions.ingest_org_admission_holds'::regclass, 'sessions.ingest_org_admission_hold_events'::regclass) AND NOT t.tgisinternal
+         AND t.tgenabled = 'O' AND t.tgfoid = 'sessions.ingest_org_admission_hold_guard()'::regprocedure)
+     = ARRAY['ingest_org_admission_hold_events_guard 27', 'ingest_org_admission_hold_events_truncate 34', 'ingest_org_admission_holds_guard 27', 'ingest_org_admission_holds_truncate 34']::text[]
+ AND (SELECT count(*) FROM pg_trigger t WHERE t.tgrelid IN ('sessions.ingest_org_admission_holds'::regclass, 'sessions.ingest_org_admission_hold_events'::regclass) AND NOT t.tgisinternal) = 4`;
 
 /** The slot's own functions dropped by the rollback (the history guard is retained with its tables). */
 const DROPPED = [
@@ -77,7 +130,7 @@ async function rollback(ctx: LaneContext): Promise<Record<string, string>> {
     restored.push(`-- ${fn}: restored from ${r.original}.`, lastBody(await ctx.read(r.original), fn));
   }
   return { [ROLLBACK]: [
-    "-- Generated by the ingest-org-admission-hold lane. Reverse of 20261105062320: restores the 17 replaced entry",
+    "-- Generated by the ingest-org-admission-hold lane. Reverse of 20261105062320: restores the 20 replaced entry",
     "-- functions' exact prior bodies, drops the batch backstop trigger and the slot's hold functions, KEEPS",
     "-- sessions.ingest_org_admission_holds and sessions.ingest_org_admission_hold_events with their immutability guard as",
     "-- inert history (docs/design/org-admission-hold.md section 6, \"Schema down\"), and resets readiness to pending.",
@@ -108,6 +161,24 @@ async function rollback(ctx: LaneContext): Promise<Record<string, string>> {
     ...restored,
     "DROP TRIGGER ingest_org_admission_hold_batch_backstop ON sessions.ingest_batches;",
     ...DROPPED.map((f) => `DROP FUNCTION ${f};`),
+    "-- Final assertion before the ledger row goes: the retained history is exactly the reviewed one and owner-only, every",
+    "-- dropped hold function and the backstop trigger are gone, and no restored body still carries a 062320 mark.",
+    "DO $rollback_verify$ BEGIN",
+    " IF NOT (",
+    HOLD_HISTORY_SHAPE,
+    " ) THEN RAISE EXCEPTION USING ERRCODE='55000',MESSAGE='org admission hold: retained history drifted; rolled back';END IF;",
+    " IF EXISTS(SELECT 1 FROM pg_proc p JOIN pg_namespace n ON n.oid=p.pronamespace WHERE n.nspname='sessions'",
+    "   AND p.proname LIKE 'ingest\\_org\\_admission\\_hold\\_%' AND p.proname<>'ingest_org_admission_hold_guard')",
+    "  OR EXISTS(SELECT 1 FROM pg_trigger WHERE tgname='ingest_org_admission_hold_batch_backstop')",
+    "  OR EXISTS(SELECT 1 FROM pg_proc p JOIN pg_namespace n ON n.oid=p.pronamespace WHERE n.nspname='sessions' AND p.prosrc LIKE '%-- 062320 org admission hold%')",
+    " THEN RAISE EXCEPTION USING ERRCODE='55000',MESSAGE='org admission hold: enforcement survived the down; rolled back';END IF;",
+    " IF EXISTS(SELECT 1 FROM unnest(ARRAY['PUBLIC','anon','authenticated','service_role','bulls96_session_ingest','bulls96_session_ingest_seeder']) r(role)",
+    "   WHERE r.role<>'PUBLIC' AND EXISTS(SELECT 1 FROM pg_roles WHERE rolname=r.role) AND (",
+    "     has_table_privilege(r.role,'sessions.ingest_org_admission_holds','SELECT,INSERT,UPDATE,DELETE,TRUNCATE')",
+    "     OR has_table_privilege(r.role,'sessions.ingest_org_admission_hold_events','SELECT,INSERT,UPDATE,DELETE,TRUNCATE')",
+    "     OR has_function_privilege(r.role,'sessions.ingest_org_admission_hold_guard()','EXECUTE')))",
+    " THEN RAISE EXCEPTION USING ERRCODE='55000',MESSAGE='org admission hold: retained history is not owner-only; rolled back';END IF;",
+    "END $rollback_verify$;",
     "DELETE FROM sessions.__96bulls_migrations WHERE name='" + NAME + "' AND sha256='" + checksum + "';",
     "COMMIT;",
   ].join("\n") + "\n" };
