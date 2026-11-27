@@ -25,6 +25,7 @@ import {
   type CanonicalPointer,
 } from "../session-read-api/canonical.ts";
 import { SESSION_HARNESSES_SQL } from "../session-read-api/session-turns-source.ts";
+import { isUuid } from "../shared/ids.ts";
 import { NEON_FREE_SQL } from "../shared/never-in-neon.ts";
 import { SESSION_POINTERS_SQL } from "../session-read-api/session-timing-source.ts";
 import type { AnalysisModelTransport } from "./engine/model.ts";
@@ -39,6 +40,7 @@ import type { PagedEraser } from "../migration/neon-s3-erasure/eraser.ts";
 export const CUTOVER_FREE_SQL = "SELECT sessions.session_analysis_cutover_free($1, $2, $3, $4, $5::timestamptz) AS free";
 
 export interface AnalysisConfig {
+  workspaceId?: string;
   enabled: boolean;
   batch: number;
   leaseSeconds: number;
@@ -54,9 +56,12 @@ export interface AnalysisConfig {
  * SESSION_ANALYSIS_CUTOVER_PROOF ("on" only; default off).
  */
 export function analysisConfig(env: NodeJS.ProcessEnv = process.env): AnalysisConfig {
+  const workspaceId = env.SESSION_ANALYSIS_WORKSPACE_ID;
+  if (workspaceId !== undefined && !isUuid(workspaceId)) throw new Error("analysis_workspace_invalid");
   const raw = env.SESSION_ANALYSIS_BATCH?.trim() ?? "";
   const batch = /^\d{1,2}$/.test(raw) && Number(raw) >= 1 && Number(raw) <= 20 ? Number(raw) : 2;
   return {
+    ...(workspaceId !== undefined ? { workspaceId: workspaceId.toLowerCase() } : {}),
     enabled: env.SESSION_ANALYSIS_ENABLED === "true",
     batch,
     leaseSeconds: 600,
@@ -198,6 +203,7 @@ export function analysisTick(deps: {
     if (!deps.config.enabled || !deps.transport) return counts;
     const evidence = canonicalEvidenceDeps(deps.db, deps.canonical);
     const store = postgresAnalysisJobStore({
+      workspaceId: deps.config.workspaceId,
       db: deps.db,
       store: deps.store,
       anchorManifestKey: (job, harness) =>
@@ -207,6 +213,7 @@ export function analysisTick(deps: {
     // Only with the every-version eraser: without it, tickets wait (never a plain delete).
     if (deps.transact && deps.eraser)
       counts.swept = await sweepAnalysisTickets(deps.store, {
+        workspaceId: deps.config.workspaceId,
         transact: deps.transact,
         eraser: deps.eraser,
         onError: () => { counts.sweep_failed = (counts.sweep_failed ?? 0) + 1; },

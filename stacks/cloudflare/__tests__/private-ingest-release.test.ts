@@ -19,9 +19,9 @@ const kmsKeyArn = "arn:aws:kms:us-east-1:000000000000:key/00000000-0000-0000-000
 
 test("tracked production config is H-only baseline drain; only the rollout phases and baseline rollback are representable", () => {
   const tracked = JSON.parse(readFileSync("config/cloudflare/private-ingest-production.json", "utf8"));
-  // Planned 062300 release, step (1): the live baseline-drain phase is held while the Worker
-  // temporarily accepts {G, H} (baseline-drain-overlap) before the window opens.
-  const expected = privateIngestProfileForPhase("baseline-drain-overlap", kmsKeyArn);
+  // Nov 27 combined window, step (6): the live baseline-drain phase is held while the Worker returns from
+  // temporary {G, H} acceptance to exactly H.
+  const expected = privateIngestProfileForPhase("baseline-drain", kmsKeyArn);
   const { kmsKeyArn: _target, ...expectedTracked } = expected.sessionIngest;
   expect(tracked).toEqual({ sessionIngest: expectedTracked });
   for (const phase of ["baseline-drain", "step-0-shadow", "step-1-custody", "step-2-frozen-receipt", "step-4-async-on"] as const)
@@ -298,7 +298,7 @@ const githubBase = {
   PRIVATE_INGEST_RELEASE_MODE: "deploy",
   PRIVATE_INGEST_RELEASE_SHA: sha,
   PRIVATE_INGEST_RELEASE_PLAN_RUN: planRun,
-  PRIVATE_INGEST_RELEASE_CONFIRMATION: `DEPLOY ${P.worker} ${sha} PLAN ${planRun} OVERLAP f31d73e2a286e712175fa8d4417f07895702012f80c1b3ff88a210381418e44a`,
+  PRIVATE_INGEST_RELEASE_CONFIRMATION: `DEPLOY ${P.worker} ${sha} PLAN ${planRun}`,
   GITHUB_REPOSITORY: P.repository,
   GITHUB_REPOSITORY_ID: P.repositoryId,
   GITHUB_EVENT_NAME: "workflow_dispatch",

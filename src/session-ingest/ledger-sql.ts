@@ -22,6 +22,8 @@ import type { StagedAttempt, LedgerRecord, SelectionInput } from "./ledger.ts";
 import type { BabysitterRetentionRegistration, BabysitterWriteOutcome } from "./ledger.ts";
 import {
   LedgerUnavailableError,
+  ORG_ADMISSION_HELD_CODE,
+  ORG_ADMISSION_HELD_SQLSTATE,
   type ClaimInput,
   type ClaimResult,
   type CommitInput,
@@ -49,6 +51,7 @@ export function ledgerErrorCodeFrom(s: DbErrorSnapshot): string {
     if (code === "22023") return "ledger_input_refused";
     if (code === "42501") return "ledger_caller_refused";
     if (code === "P0002") return "ledger_no_claim";
+    if (code === ORG_ADMISSION_HELD_SQLSTATE) return ORG_ADMISSION_HELD_CODE;
     if (code === "57014") return "ledger_timeout";
     if (code === "55P03" || code === "40P01") return "ledger_lock_timeout";
     if (code.startsWith("08")) return "ledger_connection";

@@ -30,14 +30,14 @@ const root=join(import.meta.dir,"../../..");
 const read=(p:string)=>readFileSync(join(root,p),"utf8").split("\n").filter(l=>!l.startsWith("\\")).join("\n");
 const clean:Array<()=>Promise<void>>=[];
 afterEach(async()=>{for(const f of clean.splice(0).reverse())await f();},30000);
-async function fixture(frontier=true,initialRecords=[record({record_id:"new-r1"})],guard=false){
+async function fixture(frontier=true,initialRecords=[record({record_id:"new-r1"})],guard=false,without:readonly string[]=[]){
  const admin=new pg.Client({connectionString:url});await admin.connect();const name="publisher_"+crypto.randomUUID().replaceAll("-","");
  await admin.query("CREATE DATABASE "+name);const u=new URL(url!);u.pathname="/"+name;
  const pool=new pg.Pool({connectionString:u.href});const dir=mkdtempSync(join(tmpdir(),"publisher-"));
  clean.push(async()=>{await pool.end();await admin.query("DROP DATABASE "+name);await admin.end();rmSync(dir,{recursive:true,force:true});});
  await pool.query(read("supabase/tests/supabase_shim.sql"));await pool.query("CREATE EXTENSION pg_trgm;CREATE EXTENSION btree_gin");
  for(const f of SESSION_BOOTSTRAP_FILES)await pool.query(read(f));
- for(const f of readdirSync(join(root,"supabase/migrations")).sort())await pool.query(read("supabase/migrations/"+f));
+ for(const f of readdirSync(join(root,"supabase/migrations")).sort())if(!without.includes(f))await pool.query(read("supabase/migrations/"+f));
  for(const f of readdirSync(join(root,"src/hoopdb/migrations")).sort())await pool.query(read("src/hoopdb/migrations/"+f));
  await pool.query("CREATE TABLE IF NOT EXISTS sessions.__96bulls_role_validation(name text PRIMARY KEY,generation text,status text,updated_at timestamptz DEFAULT now())");
  await pool.query("INSERT INTO sessions.__96bulls_role_validation(name,generation,status)VALUES('session_directory_search_worker',$1,'pass')",[GEN]);
@@ -457,8 +457,14 @@ describe.skipIf(!url)("scoped v1 real PostgreSQL qualification", () => {
 describe.skipIf(!url)("post-H scoped kernel proposal", () => {
   const runtime = "bulls96_publication_scoped", recovery = "bulls96_publication_recovery";
   const source = "supabase/proposals/continuous-publication/";
+  // The 062280 proposal pins the sha256 of the pre-062320 canonical publication bodies it copies into its kernels;
+  // 20261105062320 (the org admission hold) replaces publication_claim and publication_publish, so the proposal
+  // (correctly) refuses over it. It is exercised on the schema it was written against, as the PGlite twin
+  // (publication-portable.pglite.test.ts) does: 062320 and 062340 (which builds on it) are left out. Rebasing the
+  // proposal onto 062320's bodies before it is proposed is the open tracking item in docs/release/062320-org-admission-hold.md ("Pending reconciliation").
+  const PRE_HOLD = ["20261105062320_ingest_org_admission_fences.sql", "20261105062340_ingest_org_erasure_history.sql"];
   async function setup() {
-    const d = await fixture();
+    const d = await fixture(true, undefined, false, PRE_HOLD);
     const login = "scope_" + crypto.randomUUID().replaceAll("-", "");
     // The fixture URL is an explicitly disposable cluster. Refuse existing roles.
     await d.pool.query("CREATE ROLE "+runtime+" NOLOGIN; CREATE ROLE "+recovery+" NOLOGIN; CREATE ROLE "+login+" LOGIN NOINHERIT");

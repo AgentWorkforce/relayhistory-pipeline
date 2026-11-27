@@ -947,6 +947,29 @@ describe("session ingest: INGEST_CLAIM_LOCK_WAIT_MS (claimLockWaitMs, default ab
   });
 });
 
+describe("session ingest: INGEST_LOCK_RETRY_BUDGET_MS (lockRetryBudgetMs, default absent)", () => {
+  const buffered: SessionIngestInputs = { ...inputs, acceptanceMode: "buffered", expectedGeneration: "a".repeat(64), inlineMaxSessions: 0, asyncAdmission: "off" };
+  it("omitted: no INGEST_LOCK_RETRY_BUDGET_MS var, props byte-identical to a stack without the input", () => {
+    expect(Object.hasOwn(sessionIngestVars(buffered), "INGEST_LOCK_RETRY_BUDGET_MS")).toBe(false);
+    expect(JSON.stringify(props(buffered))).toBe(JSON.stringify(props({ ...buffered, lockRetryBudgetMs: undefined })));
+  });
+
+  it("set: exactly one more var (the number as text), no new binding", () => {
+    const on: SessionIngestInputs = { ...buffered, lockRetryBudgetMs: 8000 };
+    expect(() => assertSessionIngestInputs(on, refuse)).not.toThrow();
+    expect(sessionIngestVars(on)).toEqual({ ...sessionIngestVars(buffered), INGEST_LOCK_RETRY_BUDGET_MS: "8000" });
+    expect(Object.keys(props(on).env).sort()).toEqual([...Object.keys(props(buffered).env), "INGEST_LOCK_RETRY_BUDGET_MS"].sort());
+  });
+
+  it("is refused outside 5050..10000, when not an integer, or outside buffered mode (the Worker's startup rule)", () => {
+    const why = "sessionIngest.lockRetryBudgetMs must be an integer from 5050 to 10000, in buffered mode only (omit for off)";
+    for (const value of [5049, 10001, 0, -5, 7000.5, "7000", null, true])
+      expect(() => assertSessionIngestInputs({ ...buffered, lockRetryBudgetMs: value } as never, refuse)).toThrow(why);
+    expect(() => assertSessionIngestInputs({ ...inputs, lockRetryBudgetMs: 7000 }, refuse)).toThrow(why);
+    for (const value of [5050, 7000, 10000]) expect(() => assertSessionIngestInputs({ ...buffered, lockRetryBudgetMs: value }, refuse)).not.toThrow();
+  });
+});
+
 describe("session ingest: INGEST_ADVERTISED_MAX_RECORDS (advertisedMaxRecords, default absent)", () => {
   it("omitted: no INGEST_ADVERTISED_MAX_RECORDS var, props byte-identical to a stack without the input", () => {
     expect(Object.hasOwn(sessionIngestVars(inputs), "INGEST_ADVERTISED_MAX_RECORDS")).toBe(false);

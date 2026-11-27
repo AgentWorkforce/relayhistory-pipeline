@@ -26,6 +26,8 @@ export const BUFFERED_SEARCH_FEED_SQL = "supabase/migrations/20261105043870_buff
 export const BUFFERED_SEARCH_GATE_RETIRED_SQL = "supabase/migrations/20261105043890_buffered_search_gate_retired_witness.sql";
 /** 045010 replaces 043870's stage RPC, so its precondition requires 043870 (skipped with it on pending:false). */
 export const BUFFERED_SEARCH_FEED_SAME_SECOND_SQL = "supabase/migrations/20261105045010_buffered_search_feed_same_second.sql";
+export const BUFFERED_SEARCH_FEED_CUSTOM_PLANS_SQL = "supabase/migrations/20261105062330_buffered_search_feed_custom_plans.sql";
+export const BUFFERED_SEARCH_FEED_PAGE_KEYSET_SQL = "supabase/migrations/20261105062350_buffered_search_feed_page_keyset.sql";
 /** 047030 puts 041000's ingest_privacy_authority_guard() trigger on the frozen receipts, so it is skipped with 041000. */
 export const FROZEN_COPY_PROGRESS_SQL = "supabase/migrations/20261105047030_frozen_copy_progress.sql";
 /** 058010 re-creates 041000's two source-control begins (the operator user erase gate), so it is skipped with 041000. */
@@ -36,6 +38,9 @@ export const ORIGIN_CLAIM_FENCE_SQL = "supabase/migrations/20261105062010_ingest
 export const TURNS_FORWARD_GATES_SQL = "supabase/migrations/20261105062020_turns_forward_gates.sql";
 /** 062030 reads the privacy ledgers created by 041000/058010, so it is skipped with them on pending:false. */
 export const LEGACY_EXPORT_SQL = "supabase/migrations/20261105062030_legacy_export_scope_authority.sql";
+const ORG_ADMISSION_HOLD_SQL = "supabase/migrations/20261105062320_ingest_org_admission_fences.sql";
+// 062340 replaces 062320's release and status, so a profile without 062320 skips it too.
+const ORG_ERASURE_HISTORY_SQL = "supabase/migrations/20261105062340_ingest_org_erasure_history.sql";
 /** Independent prerequisite fix (also needed by mirror/frozen-supabase without C3). */
 export const LAZY_SOURCE_SQL = "supabase/migrations/20261105040000_ingest_lazy_source_tables.sql";
 /** C3 post-apply index job (non-transactional in production). */
@@ -52,11 +57,13 @@ export async function authorityFixture(opts: { pending?: boolean; lazyFix?: bool
   // so it is skipped with it (and 043860, which requires 043700's parity table, 043870, which requires 041000, and 043890, which
   // replaces 043860's gate, and 045010, which replaces 043870's stage RPC, and 047030, whose receipts trigger executes
   // 041000's guard function, and 058010, which re-creates 041000's begins, 062010, which replaces 058010's lock,
-  // 062020, whose user-erasure capture trigger reads 058010's operator ledger, and 062030, which reads those ledgers),
+  // 062020, whose user-erasure capture trigger reads 058010's operator ledger, and 062030, which reads those ledgers,
+  // and 062320, which replaces 058010's, 062010's and 062020's entry functions, and 062330, which alters 045010's stage
+  // RPC and refuses when it is absent, and 062350, which replaces 043870's page RPC),
   // while 042000/043000/043500 still apply.
   for (const f of readdirSync(join(ROOT, "supabase/migrations")).filter((f) => f.endsWith(".sql")).sort()) {
     const path = "supabase/migrations/" + f;
-    if (opts.pending === false && (path === PENDING_SQL || path === OWNER_BUFFERED_SQL || path === BUFFERED_SEARCH_GATE_SQL || path === BUFFERED_SEARCH_FEED_SQL || path === BUFFERED_SEARCH_GATE_RETIRED_SQL || path === BUFFERED_SEARCH_FEED_SAME_SECOND_SQL || path === FROZEN_COPY_PROGRESS_SQL || path === OPERATOR_USER_ERASE_SQL || path === ORIGIN_CLAIM_FENCE_SQL || path === TURNS_FORWARD_GATES_SQL || path === LEGACY_EXPORT_SQL)) continue;
+    if (opts.pending === false && (path === PENDING_SQL || path === OWNER_BUFFERED_SQL || path === BUFFERED_SEARCH_GATE_SQL || path === BUFFERED_SEARCH_FEED_SQL || path === BUFFERED_SEARCH_GATE_RETIRED_SQL || path === BUFFERED_SEARCH_FEED_SAME_SECOND_SQL || path === FROZEN_COPY_PROGRESS_SQL || path === OPERATOR_USER_ERASE_SQL || path === ORIGIN_CLAIM_FENCE_SQL || path === TURNS_FORWARD_GATES_SQL || path === LEGACY_EXPORT_SQL || path === ORG_ADMISSION_HOLD_SQL || path === ORG_ERASURE_HISTORY_SQL || path === BUFFERED_SEARCH_FEED_CUSTOM_PLANS_SQL || path === BUFFERED_SEARCH_FEED_PAGE_KEYSET_SQL)) continue;
     if (opts.lazyFix === false && path === LAZY_SOURCE_SQL) continue;
     await db.exec(read(path));
   }

@@ -68,6 +68,7 @@ request made before any refusal. The store, the eraser and the check are built f
 | --- | --- | --- |
 | `SESSION_ANALYSIS_ENABLED` | yes | `true` runs; see above |
 | `SESSION_ANALYSIS_TICK_MS` | no | Wait between ticks, 1000..600000 ms, default 30000 |
+| `SESSION_ANALYSIS_WORKSPACE_ID` | no | One workspace UUID limits expiry, job claims and publication-ticket sweeps in both the runner and the Lambda. Omit for existing queue-wide behavior. Empty and malformed values refuse startup. The runner refuses the global claims scheduler when a workspace is configured. |
 | `SESSION_ANALYSIS_BATCH` | no | Jobs per tick, 1..20, default 2. Refused unless `worker.ts` `analysisConfig`, which the Lambda also reads, runs exactly that value, so `005` is refused rather than logged as 5 and run as 2 |
 | `SESSION_ANALYSIS_OPENAI_API_KEY_FILE` or `SESSION_ANALYSIS_OPENAI_API_KEY` | exactly one | The model key. The file form (absolute path to a mounted k8s Secret key, 1..65536 bytes, one trailing newline dropped) is the intended one. The key is read once at startup, so a rotation needs a rollout. A key ending in `-disabled` means no model: the runner stays up and claims nothing, as `modelKey` does. Never logged |
 | `SESSION_ANALYSIS_DATABASE_URL_FILE` or `SESSION_ANALYSIS_DATABASE_URL` | exactly one | `postgres(ql)://` URL for the worker role (next section). No `ssl*` or `options` query parameters (`postgres-tls.ts`). Never logged |
