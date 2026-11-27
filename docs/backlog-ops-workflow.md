@@ -419,6 +419,42 @@ Prerequisites before the hold can be lifted (none is code on this branch):
 - An independently authenticated serving spec (the observer above, with its bucket-policy deny).
 - A reviewed commit that flips `BACKLOG_OPS_AUTHORITY_EXECUTE_ENABLED`.
 
+### The hold bridge (code only, dormant)
+
+`src/session-ingest/hold-bridge.ts` covers the bridge side of the per-org admission hold:
+`docs/design/org-admission-hold.md`, sections 6.1 and 6.2, slot `20261105062320`. No workflow mode
+calls it yet.
+
+- **Lifecycle adapter (`holdSql`).** It holds the slot's owner-only functions in one table, so a
+  rename is one edit. Each runs alone in a READ COMMITTED transaction:
+  - `_status(org)`: read-only. It returns the live (or latest released) hold and the org's erasure
+    record count.
+  - `_install(org, request)`, `_seal(org, epoch, evidence)` and `_marker_attempt(org, epoch, evidence)`.
+  - `_release(org, epoch, reason, evidence, detail, erasures)`. For `bridge_complete`, `erasures` is
+    the count the replay settled on. The function recomputes it under the exclusive key and refuses if
+    an erasure committed since.
+- **Erasure set (`ERASURE_SET_SQL`, read-only).** It reads `operator_user_erasures` and
+  `session_erasure_fences` for the org, since FULL minus the margin.
+- **Replay (`replayErasures`).** It replays until the count is unchanged across a pass that found
+  nothing new:
+  - A user erase maps to that user's S3 fence reset (`resetUploadedSessions`, keyed by the request id),
+    then `eraseLogPayloads`.
+  - A session erase maps to the session's S3 fence deletion (`setSessionUploads`, `enabled: false`) for
+    every (user, origin) owner resolved from the S3 owner stubs. A session with no owner gets no
+    receipt, so it blocks `bridge_complete` (`session_owner_unresolved`). The erase lane records no
+    (user, origin), so the stubs are the source. The erase-lane owner (layered-sessions-pipeline) must
+    confirm that this is the complete S3 equivalent.
+  - Each replay writes a create-only receipt at
+    `96bulls/.ledger/hold-bridge/<org>/<epoch>/erasures/<hash of the request>.json`. A retry finds it
+    and re-applies nothing.
+- **`bridge_complete` (`bridgeCompleteVerdict`).** Only with the hold `marker_attempted` at this
+  epoch, and every erasure of the re-read set receipted for that epoch. After any marker attempt the
+  only release is `bridge_complete` (`releaseAllowed`).
+- **Waves (`waveOrgs`).** An org whose hold is `marker_attempted` is stuck and never joins a new
+  wave.
+- **Alarms (`holdAlarms`).** A hold sealed for over 6 h, or attempted for over 24 h without
+  `bridge_complete`, pages `HOLD_ALARM_OWNER`. The alarm carries the org's hash only.
+
 ## Gates
 
 Every run passes the same gates as the guarded schema release:
