@@ -30,7 +30,7 @@ import { canonicalManifestIdentity } from "../../shared/manifest-identity.ts";
 import { chunksAreServerSealed } from "../../alleyoop/manifests.ts";
 import { SCRUB_RULESET_VERSION } from "../../shared/vendor.ts";
 import { buildSessionStream, type DeliveryRecord, type Queryable } from "../relayhistory-export.ts";
-import { erasableByExporter, exportUnit, LEGACY_EXPORT_PUT_TIMEOUT_MS, orgPrefix, writeOnly, type ExportTarget } from "../neon-s3-sync/export-session.ts";
+import { datePin, erasableByExporter, exportUnit, LEGACY_EXPORT_PUT_TIMEOUT_MS, orgPrefix, writeOnly, type ExportTarget } from "../neon-s3-sync/export-session.ts";
 import { storeEraser } from "../neon-s3-erasure/eraser.ts";
 import { ErasureJob, DEFAULT_ERASURE_CONFIG } from "../neon-s3-erasure/job.ts";
 import { boundStrings, EXPORT_KINDS, fencedGroups, MAX_STRING_TOKEN, neonUnitSource, readOnly, sessionUnits, type SessionUnit, type StreamLine, type UnitSource } from "../neon-s3-sync/neon-reader.ts";
@@ -400,6 +400,76 @@ describe("idempotency", () => {
     expect(second.manifests[0]!.chunksReused).toBeGreaterThan(0);
     const raw = (await allKeys(store)).filter((k) => k.includes("/raw/"));
     expect(raw.length).toBe(v2.raw.chunk_count);
+  });
+});
+
+describe("date pin: an earlier first_ts keeps a session's first exported location", () => {
+  // Neon's earliest event for the session moves 9 days back after the first export (a later ingest carries an older event).
+  const EARLIER = T0 - 9 * 86_400_000;
+  const earlierRecords = () => [
+    rec("session_event", "origin-a", "e-0", { ts_ms: EARLIER + 1000, role: "user", text: "an older event, ingested later" }, "4", "14"),
+    ...baseRecords(),
+  ];
+  const manifests = async (store: ObjectStore) => (await allKeys(store)).filter((k) => k.endsWith("/manifest.json")).sort();
+
+  test("with the prior keys: same keys, same started_at and trace_id, the earlier line exported, no second manifest", async () => {
+    const { store } = await countingStore();
+    const t = target(store, { maxChunkBytes: 200 });
+    const first = await exportUnit(t, unit("org-a"), fixedSource(baseRecords()));
+    const keys = first.manifests.map((m) => m.manifestKey).sort();
+    expect(keys.length).toBe(2); // one stream per origin (machine)
+    const v1 = new Map(await Promise.all(keys.map(async (k) => [k, await parseManifest(await readText(store, k), k)] as const)));
+    const later = { ...t, now: () => new Date("2026-11-01T00:00:00Z") };
+    const second = await exportUnit(later, unit("org-a", { firstMs: EARLIER }), fixedSource(earlierRecords()), { priorKeys: keys });
+    expect(second.manifests.map((m) => m.manifestKey).sort()).toEqual(keys);
+    for (const k of keys) {
+      // parseManifest validates the key against the manifest, d= against started_at included.
+      const v2 = await parseManifest(await readText(store, k), k);
+      expect(v2.session.started_at).toBe(v1.get(k)!.session.started_at);
+      expect(v2.trace_id).toBe(v1.get(k)!.trace_id);
+      expect(Date.parse(v2.session.ended_at!)).toBeGreaterThanOrEqual(Date.parse(v2.session.started_at));
+    }
+    // The pinned stream did take the new, older line.
+    const a = keys.find((k) => k.includes("/m=delivery_origina/"))!;
+    expect((await parseManifest(await readText(store, a), a)).revision).toBe(v1.get(a)!.revision + 1);
+    expect(await manifests(store)).toEqual(keys);
+    expect((await allKeys(store)).some((k) => k.includes("/d=2026/10/11/"))).toBe(false);
+  });
+
+  test("without prior keys an earlier first_ts still moves the session (unchanged behaviour)", async () => {
+    const { store } = await countingStore();
+    const t = target(store, { maxChunkBytes: 200 });
+    const first = await exportUnit(t, unit("org-a"), fixedSource(baseRecords()));
+    const second = await exportUnit(t, unit("org-a", { firstMs: EARLIER }), fixedSource(earlierRecords()));
+    expect(second.manifests.every((m) => m.manifestKey.includes("/d=2026/10/11/"))).toBe(true);
+    expect(first.manifests.every((m) => m.manifestKey.includes("/d=2026/10/20/"))).toBe(true);
+  });
+
+  test("never pinned: another machine, workspace or session; a missing or foreign manifest; the same date", async () => {
+    const { store } = await countingStore();
+    const t = target(store, { maxChunkBytes: 200 });
+    const first = await exportUnit(t, unit("org-a"), fixedSource(baseRecords()));
+    const a = first.manifests.map((m) => m.manifestKey).find((k) => k.includes("/m=delivery_origina/"))!;
+    const moved = unit("org-a", { firstMs: EARLIER });
+    // The pin for its own machine.
+    expect(await datePin(t, moved, "delivery:origina", [a])).toEqual({
+      startDate: "2026-10-20",
+      startedAt: (await parseManifest(await readText(store, a), a)).session.started_at,
+    });
+    // Another machine's key, or another workspace's, or another session's: no pin.
+    expect(await datePin(t, moved, "delivery:originz", [a])).toBeUndefined();
+    expect(await datePin(t, unit("org-a", { firstMs: EARLIER, workspaceId: "22222222-2222-4222-8222-222222222222" }), "delivery:origina", [a])).toBeUndefined();
+    expect(await datePin(t, unit("org-a", { firstMs: EARLIER, sessionId: "another-session" }), "delivery:origina", [a])).toBeUndefined();
+    // A prior key whose manifest is gone: no pin.
+    expect(await datePin(t, moved, "delivery:origina", [a.replace("/d=2026/10/20/", "/d=2026/10/19/")])).toBeUndefined();
+    // Not a manifest key, or no prior keys: no pin.
+    expect(await datePin(t, moved, "delivery:origina", [a.replace(/manifest\.json$/, "summary/short.json.enc")])).toBeUndefined();
+    expect(await datePin(t, moved, "delivery:origina", [])).toBeUndefined();
+    expect(await datePin(t, moved, "delivery:origina", undefined)).toBeUndefined();
+    // Same computed date: nothing to pin.
+    expect(await datePin(t, unit("org-a"), "delivery:origina", [a])).toBeUndefined();
+    // Another grant's manifest at the key: not this exporter's, never pinned.
+    expect(await datePin({ ...t, grantId: "someone-else" }, moved, "delivery:origina", [a])).toBeUndefined();
   });
 });
 

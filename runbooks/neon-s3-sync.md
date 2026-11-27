@@ -57,6 +57,16 @@ holds only the eraser key ("sessions-prod transcript eraser").
   new manifest no longer references, and session prefixes the group no longer
   produces, go to the `erasures` queue in the shared state file. Anything it
   references again is cancelled under a per-session lease.
+  A session keeps its first exported location (`datePin` in
+  `src/migration/neon-s3-sync/export-session.ts`). When Neon's earliest event
+  moves earlier after the first export, the manifest stays at its `d=` and
+  `started_at` and takes the older lines, instead of forking a second manifest
+  at the earlier date. Before this, every such move left two live manifests
+  until the erasure job removed the old prefix, and the indexer retried the
+  new key as `pointer_move_pending` in the meantime. Only a date difference is
+  pinned. A machine, workspace, harness or session change still moves the
+  session. Duplicates written before the pin (and those still queued as
+  `stale_prefix`) are not changed by it.
 - Erasure job, every 10 min:
   - It sweeps the rollups itself, and erases every exported group Neon no
     longer has. A sweep that reads nothing erases nothing.
