@@ -1192,12 +1192,15 @@ other principal can write it. While `rearmSweeperRoleArn` is set, the bucket pol
 `RearmSweeperOnlyItWritesItsState` (`rearmSweeperStateDenyStatement`): Deny `s3:PutObject` and `s3:DeleteObject` on
 `96bulls/.ledger/rearm-sweeper/*` to `Principal: "*"` with `ArnNotEquals` `aws:PrincipalArn` = that role. It grants
 nothing. Lifecycle expiration is S3's own action and is not evaluated against the bucket policy.
-- **Exclusive write authority from its effective time, not protection of the visible state.** The deny constrains
-  PutObject calls made while it is in effect: a version written after the recorded effective time (step 1 of the
-  readback below) was written by the sweeper role. A version that already existed when it took effect, or was written
-  while it was rolled back, has unknown authorship from the policy alone, including one a later delete exposes; use
-  such a version as evidence only with independent provenance (its LastModified after the effective time, or another
-  record of who wrote it). It does not cover `s3:DeleteObjectVersion` (the requested scope; the
+- **Exclusive write authority during enforcement, not protection of the visible state.** The deny constrains
+  PutObject calls made while it is in effect. A version written outside that, one that already existed when it took
+  effect or was written while it was rolled back (including one a later delete exposes), has unknown authorship from
+  the policy alone. Readback records when the policy was OBSERVED, not when it took effect, so the evidence rule is:
+  for the pointer and for the receipt it names, S3's `LastModified` of the exact version read must lie strictly
+  inside a documented interval of continuous enforcement for that signing role (see "Enforcement intervals" below),
+  or another record must identify the writer. A time merely after the first readback is not enough (it admits writes
+  made while the deny was rolled back); a version at an interval's edge, or with a timestamp equal to one, is
+  unknown. It does not cover `s3:DeleteObjectVersion` (the requested scope; the
   eraser's version deletes are unchanged). On this versioned bucket, deleting the current version of a rewritten
   object exposes its previous version as current: for an org's `latest.json` that is a rollback to an older pointer,
   and if the receipt it names is retained and still inside the reader's freshness window, the reader accepts that
@@ -1255,8 +1258,8 @@ unaffected.
    with the cases in step 2, recording each case the same way, before applying.
 
 After applying either phase:
-1. Read the policy back with `aws s3api get-bucket-policy` for the transcripts bucket and record the time read as the
-   deny's effective boundary (the earliest time evidence written under the prefix may rely on the policy alone). Confirm
+1. Read the policy back with `aws s3api get-bucket-policy` for the transcripts bucket and record the time it was
+   observed (an observation, not the moment the deny took effect). Confirm
    `RearmSweeperOnlyItWritesItsState` is present (or, rolled back, absent) and byte-equal to what this repo renders for
    the configured role, with every other statement unchanged from before the apply.
 2. Simulate against THAT policy (the read-back document as the resource policy, never a hand-written copy), with the
@@ -1276,12 +1279,19 @@ After applying either phase:
    `transcriptLifecycleRules` for the configured days (the receipt rule last, the three existing rules unchanged).
 4. Roll back through the stack with the inputs above (`rearmSweeperStateDeny: false`, or unset
    `rearmPassReceiptRetentionDays`), each its own phase. An authorized rollback outside the stack never restores the
-   saved copy unconditionally, which could overwrite a later, unrelated edit: serialize with every other writer of
-   the bucket's policy and lifecycle configuration, re-read the affected configuration, and restore the step 0 copy
-   only if the current configuration still equals the expected post-change state. If it differs, keep the intervening
-   edits and have the operator review a reversal of the D5 change alone. Afterwards read back both configurations,
-   and record the time the deny stopped being effective: writes from then until it is effective again have unknown
-   authorship (step 1).
+   saved copy unconditionally, which could overwrite a later, unrelated edit. Serialize with EVERY writer of the
+   bucket's policy and lifecycle configuration (the stack, other operators, any automation) for the whole sequence:
+   re-read the affected configuration, compare it with the expected post-change state, restore the step 0 copy only if
+   they are equal, and read back both configurations, all inside the one serialized window. If they differ, keep the
+   intervening edits and have the operator review a reversal of the D5 change alone. Record the rollback's observed
+   time: it closes the current enforcement interval.
+
+**Enforcement intervals.** An interval of continuous enforcement for the signing role starts at an observation
+(step 1) that shows `RearmSweeperOnlyItWritesItsState` exactly as rendered for that role, and ends at the next
+observation that shows it absent or different, or at a rollback (step 4), whichever comes first; it is valid only
+while every observation in between shows the same statement and the role did not change. Record each interval (start
+and end observations, the role ARN, the policy document read) with the readbacks. Only versions whose `LastModified`
+lies strictly inside one interval rely on the deny; everything else needs another record of its writer.
 
 **How a capture stays read-only.** `alchemy plan` against `AWS.state` is not
 read-only: Alchemy takes a lease (PUT then DELETE of `__lease__.json`) and

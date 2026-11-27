@@ -83,7 +83,9 @@ All of these sit under the per-user admission directory that already holds `priv
   sweeper. Receipt fields are self-reported; they attest a sweeper pass only where a bucket-policy
   deny keeps every other principal from writing under `.ledger/rearm-sweeper/` (D5,
   `RearmSweeperOnlyItWritesItsState`, docs/aws-stage.md), and only for versions written while that
-  deny was in effect; an earlier version, or one a version delete exposes, needs independent provenance. The keys sit beside the sweeper's cursor, so the role's existing
+  deny was in effect: the pointer's and the receipt's `LastModified` strictly inside a documented
+  interval of continuous enforcement (docs/aws-stage.md, "Enforcement intervals"); anything else,
+  including a version a delete exposes, needs an independent record of its writer. The keys sit beside the sweeper's cursor, so the role's existing
   `RearmSweeperReads` / `RearmSweeperWritesProgress` grants on `96bulls/.ledger/rearm-sweeper/*` cover
   them; an identity policy narrower than that needs `s3:GetObject` and `s3:PutObject` on
   `96bulls/.ledger/rearm-sweeper/passes/*`. Receipts are never deleted by the sweeper (it may not

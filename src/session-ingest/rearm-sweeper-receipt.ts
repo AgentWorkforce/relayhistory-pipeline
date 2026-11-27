@@ -344,8 +344,10 @@ function matches(r: RearmPassReceipt, keyRoot: string, e: RearmPassExpectation):
  * The receipt's fields are written by whoever can PutObject under `.ledger/rearm-sweeper/`: they are self-reported.
  * They attest the sweeper's pass only where the store admits no other writer there (a bucket-policy deny for every
  * principal but the sweeper role on that prefix: stacks/aws/rearm-sweeper-policy.ts RearmSweeperOnlyItWritesItsState,
- * D5), and only for versions written while that deny was in effect: a version older than its recorded effective
- * time, or one a version delete exposes, needs independent provenance. The caller must establish both.
+ * D5), and only for versions written while that deny was in effect: the pointer's and the receipt's S3 LastModified
+ * (of the exact versions read) strictly inside a documented interval of continuous enforcement for the sweeper role
+ * (docs/aws-stage.md, "Enforcement intervals"). Anything else, including a version a delete exposes or one at an
+ * interval's edge, needs an independent record of its writer. The caller must establish both.
  */
 export async function freshSweeperPass(store: ObjectStore, keyRoot: string, org: string, nowMs: number, maxAgeMs: number,
   expected: RearmPassExpectation): Promise<FreshSweeperPass> {
