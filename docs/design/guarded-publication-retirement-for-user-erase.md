@@ -1,6 +1,6 @@
 # Guarded publication retirement for user erase
 
-Draft 3 — design comparison only. **No clearance path or implementation is
+Draft 4 — design comparison only. **No clearance path or implementation is
 selected.** The combined `RH040` / `RH011` hold remains in force. This work
 covers never-published abandoned claims, not general erasure of published
 buffered sessions. It changes no SQL, grants, storage authority, or runtime.
@@ -431,8 +431,21 @@ empty verification after the proven write boundary is required for every
 target; metadata absence is never byte verification.
 All versions and delete markers, pagination and exact target coverage are
 verified separately for machine and generation targets. Empty registration
-does not permit skipping the latter. A late write or marker restarts bounded
-verification under the same proof/targets; no stable result means no complete.
+does not permit skipping the latter. Discovering a version or marker created
+before the certified cutoff on a later page/listing may restart bounded
+cleanup/verification under the same still-valid proof and targets. Listing
+arrival time alone does not establish when the write committed.
+
+Evidence that a PUT or multipart completion actually committed **beyond the
+certified cutoff** instead invalidates the write-boundary proof. Keep the
+request fenced and refuse complete, even if a later retry lists nothing.
+Require renewed owner/provider-qualified quiescence evidence, rebound under
+the request's phase locks to the **same** accepted closure and targets before
+verification can resume. Preserve the failed proof and its supersession
+history; do not silently replace it or widen the set. Ambiguous chronology
+that cannot be classified with qualified provider/commit evidence also cannot
+reuse the old proof. Finite retry/recovery exhaustion leaves a visible fenced
+request, never a verified receipt based only on an empty retry.
 
 **Complete:** In the ordinary completion transaction, recheck no candidate or
 new publication metadata remains, no upload roots have returned, no outside
@@ -524,6 +537,9 @@ user-erase state machine, plus a versioned synthetic object store for bytes:
 - An unregistered generation object, multiple versions/delete markers,
   delayed PUT/multipart completion, and a stale capability after the last
   listing: no premature completion; unsupported storage proof stays blocked.
+  Distinguish a pre-cutoff version discovered later from a write committed
+  beyond the certified cutoff. The latter, or unprovable chronology, refuses
+  completion even after an empty retry until a renewed bound proof is accepted.
 - Old scoped and ordinary token calls after completion and same-user adoption
   all fail; unrelated user/session data, frontier, admission, and object
   versions remain byte-for-byte unchanged. No extra publisher/recovery grant.
