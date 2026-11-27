@@ -526,8 +526,9 @@ export async function sweepRearmMarkers(deps: { store: ObjectStore; eraser: Page
 // ---- the durable position (successive Lambda invocations and loop passes walk the namespace, then wrap around) ----
 
 /** `<keyRoot>/.ledger/rearm-sweeper/cursor-<h(scopes)>.json`: one position per scope set, so differently scoped sweepers never share one. */
-export const rearmCursorKey = (keyRoot: string, scopes: readonly string[]) =>
-  `${keyRoot}/.ledger/rearm-sweeper/cursor-${createHash("sha256").update(JSON.stringify(scopes)).digest("hex").slice(0, 32)}.json`;
+export const rearmCursorKey = (keyRoot: string, scopes: readonly string[]) => `${keyRoot}/.ledger/rearm-sweeper/cursor-${rearmScopeHash(scopes)}.json`;
+/** The id of a scope set (32 hex): names its cursor and is recorded in its pass receipts (rearm-sweeper-receipt.ts). */
+export const rearmScopeHash = (scopes: readonly string[]) => createHash("sha256").update(JSON.stringify(scopes)).digest("hex").slice(0, 32);
 /** `resume` null: the next pass starts over (the last one finished the namespace). Never logged: it holds a key. */
 export interface RearmCursorDoc { v: 1; resume: RearmSweepResume | null; atMs: number }
 
