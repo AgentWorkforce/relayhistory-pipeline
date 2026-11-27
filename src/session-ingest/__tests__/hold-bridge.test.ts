@@ -232,6 +232,21 @@ test("a pre-seeded receipt never bypasses a missing proof, on the replay path or
   expect((await bridgeCompleteVerdict(store, ROOT, ORG, hold("marker_attempted"), E, [userErase], d)).code).toBe("ok");
 });
 
+test("an INSTALLED resolver with an invalid plan plus a pre-seeded receipt: refused on both paths, zero S3 calls", async () => {
+  const store = fresh();
+  expect(await replayErasure(deps(store).d, sessionErase)).toBe("replayed"); // the pre-seeded receipt
+  for (const bad of [{ complete: false, targets: [{ userId: "u", originId: "o", source: "claude", sessionId: "sess-1" }] }, { complete: true, targets: [] },
+    { complete: true, targets: [{ userId: "", originId: "o", source: "claude", sessionId: "sess-1" }] }, null]) {
+    const { d, calls } = deps(store, { resolveSessionTargets: async () => bad });
+    expect(await replayErasure(d, sessionErase)).toBe("session_coverage_partial");
+    expect(calls).toEqual([]);
+    expect((await bridgeCompleteVerdict(store, ROOT, ORG, hold("marker_attempted"), E, [sessionErase], d)).code).toBe("erasure_unreplayed");
+  }
+  const throwing = deps(store, { resolveSessionTargets: async () => { throw new Error("page 3 invalid"); } });
+  expect(await replayErasure(throwing.d, sessionErase)).toBe("session_coverage_partial");
+  expect(throwing.calls).toEqual([]);
+});
+
 test("replay failures write no receipt (retried later); a corrupt receipt is never taken as done", async () => {
   for (const over of [{ resetUploadedSessions: async () => { throw new Error("s3 503 secret"); } }, { eraseLogPayloads: async () => { throw new Error("unverified"); } }]) {
     const store = fresh();

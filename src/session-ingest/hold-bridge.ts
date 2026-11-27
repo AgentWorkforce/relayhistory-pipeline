@@ -216,9 +216,22 @@ export interface ReplayDeps {
  * The proofs an erasure needs before its replay or its receipt may count (both paths call this): a user erase needs
  * bytes_verified and a proven generation boundary; a session erase needs a manifest source. null when they hold.
  */
-export async function erasureProof(d: Pick<ReplayDeps, "org" | "userGenerationBoundary" | "resolveSessionTargets">, e: Erasure):
-  Promise<"erasure_bytes_unverified" | "erasure_generation_unproven" | "session_manifest_missing" | null> {
-  if (e.kind === "session") return d.resolveSessionTargets ? null : "session_manifest_missing";
+type SessionTarget = { userId: string; originId: string; source: string; sessionId: string };
+export type ProofRefusal = "erasure_bytes_unverified" | "erasure_generation_unproven" | "session_manifest_missing" | "session_coverage_partial";
+/**
+ * A session erase's plan, resolved and validated IN FULL (complete, non-empty, every target well formed) before any
+ * S3 call or receipt lookup; a resolver failure is partial coverage.
+ */
+async function sessionPlan(d: Pick<ReplayDeps, "org" | "resolveSessionTargets">, e: Extract<Erasure, { kind: "session" }>): Promise<SessionTarget[] | ProofRefusal> {
+  if (!d.resolveSessionTargets) return "session_manifest_missing";
+  let m: Awaited<ReturnType<NonNullable<ReplayDeps["resolveSessionTargets"]>>>;
+  try { m = await d.resolveSessionTargets(d.org, e.workspaceId, e.source, e.sessionId); } catch { return "session_coverage_partial"; }
+  if (!m || m.complete !== true || !Array.isArray(m.targets) || m.targets.length === 0 ||
+      !m.targets.every((t) => t && str(t.userId) && str(t.originId) && str(t.source) && str(t.sessionId))) return "session_coverage_partial";
+  return m.targets;
+}
+export async function erasureProof(d: Pick<ReplayDeps, "org" | "userGenerationBoundary" | "resolveSessionTargets">, e: Erasure): Promise<ProofRefusal | null> {
+  if (e.kind === "session") { const p = await sessionPlan(d, e); return typeof p === "string" ? p : null; }
   if (!e.bytesVerified) return "erasure_bytes_unverified";
   let ok = false;
   try { ok = d.userGenerationBoundary ? await d.userGenerationBoundary({ orgId: d.org, workspaceId: e.workspaceId, userId: e.userId }, e.requestId) : false; }
@@ -240,9 +253,11 @@ async function readReceipt(store: ObjectStore, key: string): Promise<unknown | n
  */
 export async function replayErasure(d: ReplayDeps, e: Erasure): Promise<ReplayOutcome> {
   if (!ORG.test(d.org) || !UUID.test(d.epoch)) refuse("hold_input");
-  // Every proof BEFORE any receipt lookup: an old (or pre-seeded) receipt never bypasses a missing proof.
-  const proof = await erasureProof(d, e);
-  if (proof !== null) return proof;
+  // Every proof BEFORE any receipt lookup: an old (or pre-seeded) receipt never bypasses a missing proof. A session
+  // erase's plan is resolved and validated in full here, and that same plan is what gets applied.
+  let plan: SessionTarget[] = [];
+  if (e.kind === "session") { const p = await sessionPlan(d, e); if (typeof p === "string") return p; plan = p; }
+  else { const proof = await erasureProof(d, e); if (proof !== null) return proof; }
   const key = erasureReceiptKey(d.keyRoot, d.org, d.epoch, e.requestId);
   const existing = await readReceipt(d.store, key);
   if (existing !== null) return validErasureReceipt(existing, d.epoch, e.requestId) ? "already" : "replay_failed";
@@ -253,13 +268,10 @@ export async function replayErasure(d: ReplayDeps, e: Erasure): Promise<ReplayOu
       counts.reset = await d.resetUploadedSessions(tenant, e.requestId);
       counts.payloads = await d.eraseLogPayloads(tenant);
     } else {
-      if (!d.resolveSessionTargets) return "session_manifest_missing";
-      const m = await d.resolveSessionTargets(d.org, e.workspaceId, e.source, e.sessionId);
-      if (!m.complete || m.targets.length === 0) return "session_coverage_partial";
       // Every alias of the session for every owner at every recorded origin; only this session's pairs.
-      for (const t of m.targets)
+      for (const t of plan)
         await d.setSessionUploads({ tenant: { orgId: d.org, workspaceId: e.workspaceId, userId: t.userId }, originId: t.originId, sessions: [[t.source, t.sessionId]], enabled: false });
-      counts.owners = m.targets.length;
+      counts.owners = plan.length;
     }
   } catch { return "replay_failed"; }
   const receipt: ErasureReceipt = { v: 1, kind: "hold-bridge-erasure", epoch: d.epoch, request: requestHash(e.requestId), erasure: e.kind, counts, appliedAtMs: d.now() };
