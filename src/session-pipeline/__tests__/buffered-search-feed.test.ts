@@ -40,7 +40,12 @@ import {
   type BufferedFeedSource,
   type StageCandidate,
   type StageState,
+  isBufferedStageKey,
 } from "../buffered-search-feed.ts";
+import { parseStagedKey } from "../../session-ingest/buffered-drain.ts";
+import { bufferedFeedPoolOptions, HOOPDB_CONNECT_TIMEOUT_MS } from "../lambda.ts";
+import pg from "pg";
+import { createServer, type AddressInfo, type Socket } from "node:net";
 
 const NOW = Date.parse("2026-11-07T12:00:00.000Z");
 /** Synthetic B1 ceiling for tests only, independent of the pinned production BUFFERED_VERSION_CEILING. */
@@ -464,6 +469,63 @@ describe("buffered-stage search feed", () => {
     await processBatch([{ messageId: "m3", body }], { pointer: { db: { query: async () => ({ rows: [] }) }, lock: async (_s: unknown, w: () => unknown) => w(), reader: { provider: "s3", read: async () => null }, exists: async () => false, orgs: async () => null, allowPrefix: () => false, fanout: { send: async () => {} } } as never });
     expect(mem.calls).toEqual([]);
   });
+
+  test("only the complete staged-key shape under this root is a buffered stage (same shape as parseStagedKey)", async () => {
+    const store = newStore();
+    const { prepared } = await stageBatch(store);
+    const staged = prepared.spec.key;
+    expect(isBufferedStageKey(staged, "96bulls")).toBe(true);
+    // An ordinary session manifest that merely contains the segment (no org segment before it) is not a stage.
+    const manifest = "96bulls/buffered-batches/v1/ws=ws/m=m/h=claude/d=2026/11/26/s=session/manifest.json";
+    const notStages = [
+      manifest,
+      `96bulls/${ORG}/buffered-batches/v1/ws=${WS}/m=m/h=claude/d=2026/11/26/s=session/manifest.json`,
+      staged.replace(/^96bulls\//, "other-root/"),
+      staged.replace(/\.staged\.ndjson\.zst$/, ".staged.ndjson.zst.drained.json"),
+      staged.replace(/\/m=srv_[0-9a-f]{32}\//, "/m=srv_short/"),
+      staged.replace(/^96bulls\/[^/]+\//, "96bulls/../"),
+    ];
+    for (const key of notStages) expect(isBufferedStageKey(key, "96bulls")).toBe(false);
+    expect(isBufferedStageKey(staged, "other-root")).toBe(false);
+    // Kept in step with session-ingest's own parser of the same keys.
+    for (const key of [staged, ...notStages]) expect(isBufferedStageKey(key, "96bulls")).toBe(parseStagedKey(key)?.keyRoot === "96bulls");
+  });
+
+  test("keep-up routing: an ordinary manifest key with the segment reaches the pointer stage, never the feed", async () => {
+    const store = newStore(), ch = fakeClickHouse();
+    const mem = memorySource([]);
+    const manifest = "96bulls/buffered-batches/v1/ws=ws/m=m/h=claude/d=2026/11/26/s=session/manifest.json";
+    const body = JSON.stringify({ Records: [{ eventSource: "aws:s3", eventName: "ObjectCreated:Put", s3: { object: { key: encodeURIComponent(manifest) } } }] });
+    const pointer = { db: { query: async () => ({ rows: [] }) }, lock: async (_s: unknown, w: () => unknown) => w(),
+      reader: { provider: "s3", read: async () => null }, exists: async () => false, orgs: async () => null,
+      allowPrefix: () => false, fanout: { send: async () => {} } } as never;
+    const result = await processBatch([{ messageId: "m1", body }], { pointer, bufferedFeed: feedDeps(mem.source, store, ch.ch) });
+    expect(mem.calls).toEqual([]); // the feed source was never consulted
+    // The record went to the pointer stage. This stub is not a working pointer, so that stage fails it and SQS
+    // redelivers it: never the silent skip-and-ACK the substring match produced (empty batchItemFailures).
+    expect(result.batchItemFailures).toEqual([{ itemIdentifier: "m1" }]);
+  });
+
+  test("the feeder pool carries the shared 10 s checkout bound: a silent server fails the checkout instead of hanging", async () => {
+    expect(bufferedFeedPoolOptions({}).connectionTimeoutMillis).toBe(HOOPDB_CONNECT_TIMEOUT_MS);
+    expect(HOOPDB_CONNECT_TIMEOUT_MS).toBe(10_000);
+    const sockets: Socket[] = [];
+    const silent = createServer((s) => { sockets.push(s); }); // accepts, never answers the startup packet
+    await new Promise<void>((r) => silent.listen(0, "127.0.0.1", r));
+    const port = (silent.address() as AddressInfo).port;
+    const pool = new pg.Pool(bufferedFeedPoolOptions({ host: "127.0.0.1", port, user: "u", password: "p", database: "d", ssl: false }));
+    const started = Date.now();
+    try {
+      await expect(pool.connect()).rejects.toThrow();
+      const elapsed = Date.now() - started;
+      expect(elapsed).toBeGreaterThanOrEqual(HOOPDB_CONNECT_TIMEOUT_MS - 500);
+      expect(elapsed).toBeLessThan(HOOPDB_CONNECT_TIMEOUT_MS + 3_000);
+    } finally {
+      await pool.end().catch(() => {});
+      for (const s of sockets) s.destroy();
+      await new Promise<void>((r) => silent.close(() => r()));
+    }
+  }, 20_000);
 
   test("keep-up leaves a fenced-authority stage to the cursor instead of requeueing it forever", async () => {
     const store = newStore(), ch = fakeClickHouse();
