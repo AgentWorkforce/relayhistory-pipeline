@@ -464,10 +464,17 @@ needs:
 - serialized writer checks;
 - a comparison of the dry receipt's `full_run` with its selected FULL.
 
-The history covers only events since it was installed (slot 062340). So `bridge-dry` already marks a
-proof `erasure_window_unproven` with reason `history_starts_after_cutoff` when the status declares
-`history_installed_at` later than the FULL cutoff. That shows the operator before a wave. It mirrors
-062340's own SQL refusal, and it has no effect until 062340 exists.
+The history covers only events since it was installed (slot 062340). `bridge-dry` already checks
+that coverage, so an operator sees a gap before a wave. The comparison runs in SQL at full timestamptz
+precision. The cutoff is built exactly, as epoch plus millisecond intervals, so microseconds are never
+truncated. The outcomes:
+- An install after the cutoff, even by 1 microsecond, gives `history_starts_after_cutoff`. An install
+  exactly at the cutoff is covered.
+- A status that declares the all-source history must also give a valid `history_installed_at`;
+  otherwise the reason is `history_start_missing`. A malformed timestamp gives `read_invalid`.
+- A status that declares neither, as today, is a snapshot only and is never treated as history-proven.
+
+This mirrors 062340's own SQL refusal.
 
 `bridge-execute` is HELD in code (`BACKLOG_OPS_BRIDGE_EXECUTE_ENABLED`), and its tool refuses
 (`bridge_release_held`) until slot 062320 lands.

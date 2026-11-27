@@ -115,6 +115,39 @@ test("the read: an upload deletion, an in-flight old user erase, a fence in the 
   expect(erasureWindowProof(ORG, null, CUT, await read(ORG)).status).toBe("erasure_window_empty");
 });
 
+test("history coverage at microsecond precision, compared in SQL (real PGlite): -1 us, equality, +1 us, missing, null, malformed", async () => {
+  const d = await db();
+  const cut = Date.parse("2026-11-27T12:00:00.000Z");
+  const ORG3 = "33333333-2222-4333-8444-555555555555";
+  const set = async (st: Record<string, unknown>) =>
+    d.query("INSERT INTO sessions._stub_hold VALUES ($1, $2::jsonb) ON CONFLICT (org) DO UPDATE SET status = EXCLUDED.status", [ORG3, JSON.stringify(st)]);
+  const proofAt = async () => {
+    let rows: readonly Record<string, unknown>[] = [];
+    try { rows = (await d.query<Record<string, unknown>>(ERASURE_WINDOW_SQL, [ORG3, String(cut)])).rows; } catch { rows = []; }
+    const p = erasureWindowProof(ORG3, null, cut, rows);
+    // Through the receipt schema too: every outcome is a valid, closed receipt.
+    expect(authorityReceiptSummary("bridge", JSON.parse(JSON.stringify({ mode: "dry_run", tool: "bridge_window", org_count: 1, all_empty: p.status === "erasure_window_empty", per_org: [p] }))).ok).toBe(true);
+    return [p.status, p.reason];
+  };
+  const hold = sealedHold({ sealed_at: "2026-11-27T11:00:00Z" });
+  const base = { hold, erasures: 0, watermark_kind: "erasure_history_all_sources" };
+  await set({ ...base, history_installed_at: "2026-11-27T12:00:00.000001Z" });
+  expect(await proofAt()).toEqual(["erasure_window_unproven", "history_starts_after_cutoff"]); // +1 us: not covered
+  await set({ ...base, history_installed_at: "2026-11-27T12:00:00.000000Z" });
+  expect(await proofAt()).toEqual(["erasure_window_empty", "ok"]); // equality: covered
+  await set({ ...base, history_installed_at: "2026-11-27T11:59:59.999999Z" });
+  expect(await proofAt()).toEqual(["erasure_window_empty", "ok"]); // -1 us: covered
+  await set({ ...base });
+  expect(await proofAt()).toEqual(["erasure_window_unproven", "history_start_missing"]);
+  await set({ ...base, history_installed_at: null });
+  expect(await proofAt()).toEqual(["erasure_window_unproven", "history_start_missing"]);
+  await set({ ...base, history_installed_at: "bad" });
+  expect(await proofAt()).toEqual(["erasure_window_unproven", "read_invalid"]);
+  // Legacy: no declaration and no install time -> snapshot-only (no coverage claim, no check).
+  await set({ hold, erasures: 0 });
+  expect(await proofAt()).toEqual(["erasure_window_empty", "ok"]);
+});
+
 // ---- the proof ----
 
 test("the proof is empty only with every count 0, a live sealed or attempted hold, and a read after the seal", () => {
@@ -127,12 +160,18 @@ test("the proof is empty only with every count 0, a live sealed or attempted hol
   expect(reason([row()], E2)).toBe("hold_epoch_mismatch");
   expect(reason([row({ status: status({ ...sealedHold(), state: "held", sealed_at: null }) })])).toBe("hold_not_sealed");
   expect(reason([row({ read_at_ms: String(SEALED - 1) })])).toBe("read_before_seal");
-  // 062340's history installed after the FULL cutoff does not cover it: unproven, with its own closed reason.
-  const hist = (at: unknown) => row({ status: { ...status(sealedHold()), history_installed_at: at } });
-  expect(reason([hist(new Date(CUT + 1).toISOString())])).toBe("history_starts_after_cutoff");
-  expect(erasureWindowProof(ORG, null, CUT, [hist(new Date(CUT + 1).toISOString())]).status).toBe("erasure_window_unproven");
-  expect(reason([hist(new Date(CUT - 1).toISOString())])).toBe("ok");
-  expect(erasureWindowProof(ORG, null, CUT, [hist("not a time")]).status).toBe("erasure_window_unproven");
+  // The coverage decision is SQL's (history_covers); the proof only maps it, and refuses anything inconsistent.
+  const hist = (at: unknown, covers: unknown, extra: Record<string, unknown> = {}) =>
+    row({ status: { ...status(sealedHold()), history_installed_at: at, ...extra }, history_covers: covers });
+  expect(reason([hist("2026-11-27 06:00:00.000001+00", false)])).toBe("history_starts_after_cutoff");
+  expect(reason([hist("2026-11-27 06:00:00+00", true)])).toBe("ok");
+  expect(erasureWindowProof(ORG, null, CUT, [hist("2026-11-27 06:00:00+00", "yes")]).status).toBe("erasure_window_unproven");
+  expect(erasureWindowProof(ORG, null, CUT, [row({ history_covers: true })]).status).toBe("erasure_window_unproven"); // covers without an install
+  // A history declaration needs a valid coverage start; legacy absent metadata stays snapshot-only.
+  const declared = (extra: Record<string, unknown>) => row({ status: { ...status(sealedHold()), watermark_kind: "erasure_history_all_sources", ...extra }, history_covers: null });
+  expect(reason([declared({})])).toBe("history_start_missing");
+  expect(reason([declared({ history_installed_at: null })])).toBe("history_start_missing");
+  expect(reason([row({ history_covers: null })])).toBe("ok");
   for (const bad of [[], [row(), row()], [row({ upload_resets: "-1" })], [row({ upload_resets: undefined })], [row({ status: "{" })], [row({ status: { hold: null } })],
     [row({ read_at_ms: "x" })]])
     expect(erasureWindowProof(ORG, null, CUT, bad).status).toBe("erasure_window_unproven");
