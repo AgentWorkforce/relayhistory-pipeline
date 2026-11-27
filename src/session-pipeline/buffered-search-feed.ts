@@ -189,18 +189,52 @@ export type BufferedFeedQuery = (typeof BUFFERED_FEED_QUERIES)[number];
 
 export class BufferedFeedError extends Error {
   /** `query` names the SQL call that failed (sql_* codes only), so a timeout can be traced to its statement; it is
-   * logged as `feed_query` (bufferedFeedQueryField). */
-  constructor(readonly code: string, readonly retryable = false, readonly query?: BufferedFeedQuery) {
+   * logged as `feed_query` (bufferedFeedQueryField). `elapsedMs` is that failed call's own wall time (logged as
+   * `feed_query_ms`), so a statement timeout is told apart from a run that spent its budget on earlier calls. */
+  constructor(readonly code: string, readonly retryable = false, readonly query?: BufferedFeedQuery, readonly elapsedMs?: number) {
     super(`buffered search feed: ${code}`);
     this.name = "BufferedFeedError";
   }
 }
 
-/** `{ feed_query }` for a BufferedFeedError raised by a feeder SQL call; `{}` for anything else. A fixed name from
- * BUFFERED_FEED_QUERIES only, never SQL text; the log serializer drops any other value (shared/log.ts ENUM_FIELDS). */
-export function bufferedFeedQueryField(error: unknown): { feed_query?: BufferedFeedQuery } {
+/** `{ feed_query, feed_query_ms }` for a BufferedFeedError raised by a feeder SQL call; `{}` for anything else. A fixed
+ * name from BUFFERED_FEED_QUERIES only, never SQL text; the log serializer drops any other value (shared/log.ts
+ * ENUM_FIELDS), and keeps `feed_query_ms` only as a bounded non-negative integer (BOUNDED_COUNT_FIELDS). */
+export function bufferedFeedQueryField(error: unknown): { feed_query?: BufferedFeedQuery; feed_query_ms?: number } {
   if (!(error instanceof BufferedFeedError) || typeof error.query !== "string") return {};
-  return (BUFFERED_FEED_QUERIES as readonly string[]).includes(error.query) ? { feed_query: error.query } : {};
+  if (!(BUFFERED_FEED_QUERIES as readonly string[]).includes(error.query)) return {};
+  return error.elapsedMs === undefined ? { feed_query: error.query } : { feed_query: error.query, feed_query_ms: error.elapsedMs };
+}
+
+/** Per feeder SQL call kind: calls made (failed ones included) and their wall time, total and longest, in whole ms. */
+export interface BufferedFeedCallTiming { calls: number; msTotal: number; msMax: number }
+export type BufferedFeedTimings = Record<BufferedFeedQuery, BufferedFeedCallTiming>;
+export const emptyBufferedFeedTimings = (): BufferedFeedTimings =>
+  ({ page: { calls: 0, msTotal: 0, msMax: 0 }, stage: { calls: 0, msTotal: 0, msMax: 0 }, advance: { calls: 0, msTotal: 0, msMax: 0 } });
+
+/** The timing log fields (shared/log.ts BUFFERED_FEED_TIMING_FIELDS, bounded counts): feed_<query>_calls / _ms_total / _ms_max. */
+export function bufferedFeedTimingFields(t: BufferedFeedTimings): Record<string, number> {
+  const out: Record<string, number> = {};
+  for (const q of BUFFERED_FEED_QUERIES) {
+    out[`feed_${q}_calls`] = t[q].calls;
+    out[`feed_${q}_ms_total`] = t[q].msTotal;
+    out[`feed_${q}_ms_max`] = t[q].msMax;
+  }
+  return out;
+}
+
+/** The source with every call's wall time (by `now`) added to `timings`; results and errors pass through unchanged. */
+function timedFeedSource(source: BufferedFeedSource, now: () => number, timings: BufferedFeedTimings): BufferedFeedSource {
+  const timed = <A extends unknown[], R>(q: BufferedFeedQuery, f: (...a: A) => Promise<R>) => async (...a: A): Promise<R> => {
+    const t0 = now();
+    try { return await f(...a); }
+    finally {
+      const ms = Math.max(0, Math.round(now() - t0));
+      const t = timings[q];
+      t.calls += 1; t.msTotal += ms; t.msMax = Math.max(t.msMax, ms);
+    }
+  };
+  return { page: timed("page", source.page.bind(source)), stage: timed("stage", source.stage.bind(source)), advance: timed("advance", source.advance.bind(source)) };
 }
 
 export interface BufferedFeedConfig {
@@ -404,7 +438,8 @@ export interface TimedSqlExecutor extends SqlExecutor {
   queryWithTimeout<R = Record<string, unknown>>(timeoutMs: number, text: string, params?: unknown[]): Promise<{ rows: R[] }>;
 }
 
-export function sqlBufferedFeedSource(db: SqlExecutor | TimedSqlExecutor, options: { secondVersion?: boolean; statementTimeoutMs?: number } = {}): BufferedFeedSource {
+export function sqlBufferedFeedSource(db: SqlExecutor | TimedSqlExecutor, options: { secondVersion?: boolean; statementTimeoutMs?: number; now?: () => number } = {}): BufferedFeedSource {
+  const clock = options.now ?? Date.now;
   const strict = options.secondVersion === true;
   const timeoutMs = options.statementTimeoutMs;
   // A timeout equal to the login's own changes nothing: the single-statement path, exactly as before.
@@ -414,6 +449,7 @@ export function sqlBufferedFeedSource(db: SqlExecutor | TimedSqlExecutor, option
     timed ? (db as TimedSqlExecutor).queryWithTimeout<R>(timeoutMs!, text, params) : db.query<R>(text, params);
   const call = async (name: BufferedFeedQuery, p: unknown): Promise<Record<string, unknown>> => {
     let value: unknown;
+    const t0 = clock();
     try { value = (await run<{ r: unknown }>(`SELECT sessions.buffered_search_feed_${name}($1::jsonb) AS r`, [JSON.stringify(p)])).rows[0]?.r; }
     catch (error) {
       // A refused feeder login (buffered-feed-login.ts) keeps its own code and is not retried.
@@ -421,7 +457,8 @@ export function sqlBufferedFeedSource(db: SqlExecutor | TimedSqlExecutor, option
       const code = (error as { code?: unknown } | null)?.code;
       // Serialization, lock and statement timeouts are transient: the page or message retries.
       const sqlstate = typeof code === "string" && /^[0-9A-Z]{5}$/.test(code) ? code : "unknown";
-      throw new BufferedFeedError(`sql_${sqlstate}`, ["40001", "40P01", "55P03", "57014", "08006", "08003", "unknown"].includes(sqlstate), name);
+      throw new BufferedFeedError(`sql_${sqlstate}`, ["40001", "40P01", "55P03", "57014", "08006", "08003", "unknown"].includes(sqlstate), name,
+        Math.max(0, Math.round(clock() - t0)));
     }
     if (!obj(value)) bad("sql_result");
     return value as Record<string, unknown>;
@@ -846,6 +883,8 @@ export interface BackfillSummary {
   refusalsOutstanding?: number;
   /** S encoding only: rows not written because a canonical row of the identity exists (guard (c)). */
   canonicalPresent?: number;
+  /** Per SQL call kind: calls, total and longest wall time (bufferedFeedTimingFields). */
+  timings: BufferedFeedTimings;
 }
 
 /**
@@ -853,12 +892,18 @@ export interface BackfillSummary {
  * past stages that were indexed (and re-checked) or are terminally not indexable, and only after
  * the ClickHouse writes, so a crash replays at most one page (idempotent).
  */
-export async function runBufferedFeed(deps: BufferedFeedDeps, config: Pick<BufferedFeedConfig, "pageSize" | "stagesPerSecond" | "since" | "cursor" | "budgetMs"> & { settleMs?: number }): Promise<BackfillSummary> {
+/**
+ * `timings` (optional) is where the per-call timings accumulate: the caller keeps it, so a run that throws still has the
+ * timings of every call up to and including the failed one. Timing never changes what the run does.
+ */
+export async function runBufferedFeed(deps: BufferedFeedDeps, config: Pick<BufferedFeedConfig, "pageSize" | "stagesPerSecond" | "since" | "cursor" | "budgetMs"> & { settleMs?: number },
+  timings: BufferedFeedTimings = emptyBufferedFeedTimings()): Promise<BackfillSummary> {
   const now = deps.now ?? Date.now;
+  deps = { ...deps, source: timedFeedSource(deps.source, now, timings) };
   const sleep = deps.sleep ?? ((ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms)));
   const deadline = now() + config.budgetMs;
   const interval = 1_000 / config.stagesPerSecond;
-  const summary: BackfillSummary = { pages: 0, stages: 0, indexed: 0, skipped: 0, rows: 0, deleted: 0, caughtUp: false, reasons: {} };
+  const summary: BackfillSummary = { pages: 0, stages: 0, indexed: 0, skipped: 0, rows: 0, deleted: 0, caughtUp: false, reasons: {}, timings };
   const s2 = deps.secondVersion;
   if (s2) { summary.refused = 0; summary.canonicalPresent = 0; }
   const count = (reason: string) => (summary.reasons[reason] = (summary.reasons[reason] ?? 0) + 1);
