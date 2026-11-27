@@ -178,7 +178,25 @@ export function authorityUrl(kind: ErasureAuthorityKind, raw: unknown): string {
   return eraserDatabaseUrl(raw, "databaseUrl", kind);
 }
 
-export async function main() {
+/**
+ * The stale-prefix pass's exit status: 0 when it completed, EXIT_CREDENTIALS_RENEW when it stopped because the
+ * eraser key is about to expire (a partial pass to rerun after renewal, never reported as success). Throws the
+ * existing refusals for a held lease, or for a failed erase that was not an expiry stop.
+ */
+export function stalePassStatus(r: { ok: boolean; refused?: string }, credStop: boolean): number {
+  if (r.refused) throw optionRefusal(r.refused, "another eraser holds an unexpired lease: the stale-prefix pass did not start");
+  if (credStop) return EXIT_CREDENTIALS_RENEW;
+  if (!r.ok) throw optionRefusal("stale_prefix_pass_stopped", "the stale-prefix pass stopped at a failed erase");
+  return 0;
+}
+
+/** The process exit status after a run: EXIT_CREDENTIALS_RENEW whenever the run stopped on an expiring key. */
+export function runStatus(status: number, credStop: boolean): number {
+  return credStop ? EXIT_CREDENTIALS_RENEW : status;
+}
+
+/** Runs the job and returns its exit status (0, or EXIT_CREDENTIALS_RENEW); a refusal or failure throws. */
+export async function main(): Promise<number> {
   const execute = flag("execute");
   const stale = staleprefixOptions(process.argv.slice(2));
   refuseCredentialEnv();
@@ -239,33 +257,31 @@ export async function main() {
       // One pass, no sweep, no phase. A dry run's eraser has no existence check: it reports sibling_checked false.
       log({ message: "start", mode: "stale_prefixes_only", execute, authority: kind, obligations, allowlist_size: stale.onlyIdentities.length, ...(stale.max !== undefined ? { max: stale.max } : {}) });
       const r = await job.staleprefixPass({ execute, onlyIdentities: stale.onlyIdentities, ...(stale.max !== undefined ? { max: stale.max } : {}), ...(isLiveObjectProbe(eraser) ? { probe: eraser } : {}) });
-      if (r.refused) throw optionRefusal(r.refused, "another eraser holds an unexpired lease: the stale-prefix pass did not start");
-      // Stopped because the eraser key is about to expire: not a failed erase; exit 75 (below) for a renew and rerun.
-      if (!r.ok && !credStop) throw optionRefusal("stale_prefix_pass_stopped", "the stale-prefix pass stopped at a failed erase");
-      return;
+      // Returned through the finally below, which cleans up first; an expiry stop exits 75, never 0.
+      return stalePassStatus(r, credStop);
     }
     log({ message: "start", execute, authority: kind, recognize_legacy: cfg.recognizeLegacy, obligations });
     // A dry run deletes nothing and marks nothing done: it sweeps and reports what it would erase.
     if (!execute) {
       await job.sweep({ dryRun: true });
       job.progress(true);
-      return;
+      return 0;
     }
     // Babysitter retention phase (additive): runs beside the job until the same stop signal.
     const phaseRun = phase?.loop(() => stop, flag("once"));
     await job.run({ once: flag("once") });
     await phaseRun;
+    return runStatus(0, credStop);
   } finally {
     if (credTimer) clearInterval(credTimer);
     await phase?.close();
     state.close();
     await client.end().catch(() => undefined);
   }
-  if (credStop) process.exit(EXIT_CREDENTIALS_RENEW);
 }
 
 if (import.meta.main)
-  main().catch((error) => {
+  main().then((status) => { if (status !== 0) process.exit(status); }).catch((error) => {
     log({ message: "exit on error", error_code: errorCode(error) });
     process.exit(1);
   });

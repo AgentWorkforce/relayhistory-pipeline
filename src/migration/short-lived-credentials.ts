@@ -46,6 +46,14 @@ export function parseExpiration(v: unknown, name: string): Date {
  * Any other key is refused, so a mistyped field never passes silently. Returns the keys with `expiresAt` when known.
  */
 export function parseCredentialDocument(v: unknown, name: string): AwsCredentials {
+  return parseCredentialDocumentShape(v, name).creds;
+}
+
+/** The two accepted shapes: the broker's v1 (always expiring) and the static one (an expiry is optional). */
+export type CredentialShape = "broker_v1" | "static";
+
+/** parseCredentialDocument plus which shape the document was, so a renewal can be held to the same contract. */
+export function parseCredentialDocumentShape(v: unknown, name: string): { creds: AwsCredentials; shape: CredentialShape } {
   const c = v as Record<string, unknown> | null;
   if (!c || typeof c !== "object" || Array.isArray(c)) throw new ShortLivedCredentialError(`short_lived_shape_invalid.${name}`);
   if ("Version" in c) {
@@ -54,17 +62,20 @@ export function parseCredentialDocument(v: unknown, name: string): AwsCredential
     if (c.Version !== 1) throw new ShortLivedCredentialError(`short_lived_version_unsupported.${name}`);
     if (!nonEmpty(c.AccessKeyId) || !nonEmpty(c.SecretAccessKey) || !nonEmpty(c.SessionToken))
       throw new ShortLivedCredentialError(`short_lived_shape_invalid.${name}`);
-    return { accessKeyId: c.AccessKeyId, secretAccessKey: c.SecretAccessKey, sessionToken: c.SessionToken, expiresAt: parseExpiration(c.Expiration, name) };
+    return { shape: "broker_v1", creds: { accessKeyId: c.AccessKeyId, secretAccessKey: c.SecretAccessKey, sessionToken: c.SessionToken, expiresAt: parseExpiration(c.Expiration, name) } };
   }
   const allowed = ["accessKeyId", "secretAccessKey", "sessionToken", "expiration"];
   for (const k of Object.keys(c)) if (!allowed.includes(k)) throw new ShortLivedCredentialError(`short_lived_shape_invalid.${name}`);
   if (!nonEmpty(c.accessKeyId) || !nonEmpty(c.secretAccessKey)) throw new ShortLivedCredentialError(`short_lived_shape_invalid.${name}`);
   if (c.sessionToken !== undefined && !nonEmpty(c.sessionToken)) throw new ShortLivedCredentialError(`short_lived_shape_invalid.${name}`);
   return {
-    accessKeyId: c.accessKeyId,
-    secretAccessKey: c.secretAccessKey,
-    ...(c.sessionToken ? { sessionToken: c.sessionToken as string } : {}),
-    ...(c.expiration !== undefined ? { expiresAt: parseExpiration(c.expiration, name) } : {}),
+    shape: "static",
+    creds: {
+      accessKeyId: c.accessKeyId,
+      secretAccessKey: c.secretAccessKey,
+      ...(c.sessionToken ? { sessionToken: c.sessionToken as string } : {}),
+      ...(c.expiration !== undefined ? { expiresAt: parseExpiration(c.expiration, name) } : {}),
+    },
   };
 }
 
@@ -98,6 +109,10 @@ export interface FileCredentialSource {
  *
  * A credential WITHOUT an expiry (the static shape, as the existing runbook feeds it through a FIFO) is read
  * exactly once and then frozen: it never expires, and re-reading a FIFO would block.
+ *
+ * The FIRST document fixes the contract for the life of the source: shape and whether it expires. A renewal must
+ * keep both. A source that started as an expiring (broker) credential refuses a replacement in another shape or
+ * without an expiry (`short_lived_downgrade_refused.<name>`), so it can never silently freeze and stop renewing.
  */
 export function fileCredentialSource(
   path: string,
@@ -107,12 +122,17 @@ export function fileCredentialSource(
   const read = opts.read ?? ((p: string) => readFileSync(p, "utf8"));
   const name = opts.name ?? "S3X_CREDS_FILE";
   const cacheMs = opts.cacheMs ?? 30_000;
+  let contract: { shape: CredentialShape; expires: boolean } | undefined;
   const load = (): AwsCredentials => {
     let text: string;
     try { text = read(path); } catch { throw new ShortLivedCredentialError(`short_lived_file_unreadable.${name}`); }
     let doc: unknown;
     try { doc = JSON.parse(text); } catch { throw new ShortLivedCredentialError(`short_lived_shape_invalid.${name}`); }
-    return parseCredentialDocument(doc, name);
+    const { creds, shape } = parseCredentialDocumentShape(doc, name);
+    const expires = creds.expiresAt !== undefined;
+    if (!contract) contract = { shape, expires };
+    else if (contract.shape !== shape || contract.expires !== expires) throw new ShortLivedCredentialError(`short_lived_downgrade_refused.${name}`);
+    return creds;
   };
   let cached: { at: number; c: AwsCredentials } | undefined;
   let frozen: AwsCredentials | undefined;

@@ -121,3 +121,37 @@ describe("s3Credentials (the erasure's stdin eraser key)", () => {
     }
   });
 });
+
+describe("renewal contract (review of c1d5bf61, finding 2)", () => {
+  test("a source that started as broker v1 refuses a static replacement (no expiry) and never freezes", async () => {
+    let doc: unknown = v1(), reads = 0, now = T0;
+    const src = fileCredentialSource("/cur", { minMs: 600_000, now: () => now, cacheMs: 30_000, read: () => (reads++, JSON.stringify(doc)) });
+    expect((await src.provider()).expiresAt).toEqual(new Date("2026-11-27T22:45:00Z"));
+    doc = { accessKeyId: "a", secretAccessKey: "s" }; // a downgrade: same path, static, no expiry
+    let err: unknown; try { await src.provider(); } catch (e) { err = e; }
+    expect((err as ShortLivedCredentialError).code).toBe("short_lived_downgrade_refused.S3X_CREDS_FILE");
+    now += 30_000;
+    expect(code(() => src.expiring())).toBe("short_lived_downgrade_refused.S3X_CREDS_FILE");
+    const before = reads; now += 30_000; code(() => src.expiring());
+    expect(reads).toBeGreaterThan(before); // still re-reading: not frozen
+    doc = v1({ AccessKeyId: "ASIASYNTHETIC0003", Expiration: "2026-11-27T23:40:00Z" }); // a proper renewal recovers
+    expect((await src.provider()).accessKeyId).toBe("ASIASYNTHETIC0003");
+  });
+  test("v1 refuses a static replacement that does carry an expiration (shape pinned too)", async () => {
+    let doc: unknown = v1();
+    const src = fileCredentialSource("/cur", { minMs: 1, read: () => JSON.stringify(doc) });
+    await src.provider();
+    doc = { accessKeyId: "a", secretAccessKey: "s", sessionToken: "t", expiration: "2026-11-27T23:00:00Z" };
+    let err: unknown; try { await src.provider(); } catch (e) { err = e; }
+    expect((err as ShortLivedCredentialError).code).toBe("short_lived_downgrade_refused.S3X_CREDS_FILE");
+  });
+  test("v1 -> v1 rotations keep working; an initially static source stays read-once", async () => {
+    let doc: unknown = v1(), reads = 0;
+    const src = fileCredentialSource("/cur", { minMs: 1, read: () => (reads++, JSON.stringify(doc)) });
+    for (const id of ["ASIASYNTHETIC0010", "ASIASYNTHETIC0011", "ASIASYNTHETIC0012"]) { doc = v1({ AccessKeyId: id }); expect((await src.provider()).accessKeyId).toBe(id); }
+    let sreads = 0;
+    const st = fileCredentialSource("/fifo", { minMs: 1, read: () => (sreads++, JSON.stringify({ accessKeyId: "a", secretAccessKey: "s" })) });
+    await st.provider(); await st.provider(); st.expiring();
+    expect(sreads).toBe(1);
+  });
+});
