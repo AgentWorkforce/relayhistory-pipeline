@@ -522,6 +522,15 @@ export function refuseEnvOptions(env: NodeJS.ProcessEnv = process.env): void {
  */
 export const HOOPDB_CONNECT_TIMEOUT_MS = 10_000;
 
+/**
+ * The buffered search feeder's own pool: one pinned connection, with the same checkout bound as the shared pool, so a
+ * stalled feeder connection fails its checkout in 10 s instead of holding the invocation (and every record in its
+ * batch) until the Lambda timeout.
+ */
+export function bufferedFeedPoolOptions<T extends object>(feedConfig: T) {
+  return { ...feedConfig, max: 1, idleTimeoutMillis: 60_000, connectionTimeoutMillis: HOOPDB_CONNECT_TIMEOUT_MS };
+}
+
 export function supabasePool(url: string, max: number, tls = postgresTlsOptions()): HoopDb {
   refuseEnvOptions();
   const pool = new pg.Pool({
@@ -749,7 +758,7 @@ export function runtimeFromSecret(env: LambdaEnv, secretText: string, schemaGene
     const feedConfig = deps.search?.ch ? bufferedFeedLogin(secret) : undefined;
     if (!deps.search?.ch) log.warn("buffered search feed disarmed", { stage: "buffered-search-feed", reason: "clickhouse_search_required" });
     else if (feedConfig) {
-      const feedPool = new pg.Pool({ ...feedConfig, max: 1, idleTimeoutMillis: 60_000 });
+      const feedPool = new pg.Pool(bufferedFeedPoolOptions(feedConfig));
       feedPool.on("error", (err) => log.error("buffered search feed pool error", { stage: "buffered-search-feed", error_code: (err as { code?: string }).code ?? "pool_error" }));
       const feedExecutor = loginCheckedFeedExecutor(feedPool);
       if (env.bufferedSearchFeed?.enabled) {
