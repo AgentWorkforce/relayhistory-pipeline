@@ -68,6 +68,19 @@ export function factsAsOf(f: SessionFacts, asOfIn: string): SessionFacts | null 
 
 interface StateResult { state: FeatureState; basis: "forge" | "analysis"; reason: string }
 
+type ForgeCommit = ForgeFacts["commits"][number];
+/** A commit's dated landings on the default branch: its transitions when known, else its first landing. */
+function landingsOf(c: ForgeCommit): Array<{ at: string; what: string }> {
+  if (c.transitions) return c.transitions.filter((t) => t.kind === "landed").map((t) => ({ at: t.at, what: t.by === c.sha ? `commit ${c.sha.slice(0, 12)} on the default branch` : `commit ${c.sha.slice(0, 12)} landed as ${t.by.slice(0, 12)}` }));
+  return c.onDefaultBranch ? [{ at: c.defaultAt ?? c.at, what: `commit ${c.sha.slice(0, 12)} on the default branch` }] : [];
+}
+/** A commit's dated reverts: its transitions when known, else its first revert. */
+function revertsOf(c: ForgeCommit): Array<{ at: string; what: string }> {
+  const what = (by: string | null | undefined) => `commit ${c.sha.slice(0, 12)} reverted${by ? ` by ${by.slice(0, 12)}` : ""}`;
+  if (c.transitions) return c.transitions.filter((t) => t.kind === "reverted").map((t) => ({ at: t.at, what: what(t.by) }));
+  return c.revertedAt ? [{ at: c.revertedAt, what: what(c.revertedBy) }] : [];
+}
+
 export function deriveState(sessions: readonly SessionFacts[], forgeIn: ForgeFacts, asOfIn: string, unknownFlagDefault: "on" | "off" = "off"): StateResult {
   const forge = utcForge(forgeIn), asOf = requireCut(asOfIn, "asOf");
   const built = sessions.flatMap((s) => s.built);
@@ -103,10 +116,11 @@ export function deriveState(sessions: readonly SessionFacts[], forgeIn: ForgeFac
   const branches = (forge.branches ?? []).filter((b) => branchNames.has(b.name) && b.tipAt < asOf && b.tipAt >= new Date(Date.parse(firstStart) - BRANCH_LEAD_MS).toISOString());
   const merges = [
     ...prs.filter((p) => p.state === "merged" && p.mergedAt && p.mergedAt < asOf).map((p) => ({ at: p.mergedAt!, what: `merged ${p.ref.replace("https://github.com/", "")}` })),
-    ...commits.filter((c) => c.onDefaultBranch && (c.defaultAt ?? c.at) < asOf).map((c) => ({ at: c.defaultAt ?? c.at, what: `commit ${c.sha.slice(0, 12)} on the default branch` })),
+    // Every landing of a commit's patch known before the cut (a re-landing after a revert restores it).
+    ...commits.flatMap((c) => landingsOf(c)).filter((l) => l.at < asOf),
     ...branches.filter((b) => b.landed && b.landedAt && b.landedAt < asOf).map((b) => ({ at: b.landedAt!, what: `branch ${b.name} landed` })),
   ].sort((a, b) => textCompare(a.at, b.at));
-  const reverts = commits.filter((c) => c.revertedAt && c.revertedAt < asOf).map((c) => ({ at: c.revertedAt!, what: `commit ${c.sha.slice(0, 12)} reverted${c.revertedBy ? ` by ${c.revertedBy.slice(0, 12)}` : ""}` })).sort((a, b) => textCompare(a.at, b.at));
+  const reverts = commits.flatMap((c) => revertsOf(c)).filter((r) => r.at < asOf).sort((a, b) => textCompare(a.at, b.at));
 
   if (commits.length || prs.length || branches.length) {
     const lastMerge = merges[merges.length - 1];

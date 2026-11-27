@@ -708,4 +708,50 @@ describe("round-5 controls", () => {
       expect(deriveState([s], later, after).state).toBe("regressed");
     }
   });
+
+  test("forge: a tag named like a branch is not ambiguous, and a landing, revert and re-landing replay in order", async () => {
+    const { execFileSync } = await import("node:child_process");
+    const { forgeFacts } = await import("../backfill/forge.ts");
+    const repo = join(tmp, "r10-git");
+    mkdirSync(repo);
+    const git = (args: string[], date: string) => execFileSync("git", ["-C", repo, ...args], { env: { ...process.env, GIT_AUTHOR_DATE: date, GIT_COMMITTER_DATE: date, GIT_AUTHOR_NAME: "t", GIT_AUTHOR_EMAIL: "t@example.invalid", GIT_COMMITTER_NAME: "t", GIT_COMMITTER_EMAIL: "t@example.invalid" }, encoding: "utf8" }).trim();
+    const commit = (file: string, date: string) => { writeFileSync(join(repo, file), file); git(["add", file], date); git(["commit", "-q", "-m", file], date); return git(["rev-parse", "HEAD"], date); };
+    const seal = () => forgeFacts("example/widgets", repo, "2026-10-31T00:00:00Z", "2026-11-30T00:00:00Z", "main", () => []);
+    git(["init", "-q", "-b", "main"], "2026-11-01T00:00:00Z");
+    commit("base.txt", "2026-11-01T00:00:00Z");
+    git(["checkout", "-q", "-b", "topic"], "2026-11-02T00:00:00Z");
+    const topic = commit("topic.txt", "2026-11-02T00:00:00Z");
+    git(["tag", "topic"], "2026-11-02T00:00:00Z");
+    git(["checkout", "-q", "main"], "2026-11-06T00:00:00Z");
+    git(["cherry-pick", topic], "2026-11-06T00:00:00Z");
+    const firstCopy = git(["rev-parse", "HEAD"], "2026-11-06T00:00:00Z");
+    git(["revert", "--no-edit", firstCopy], "2026-11-08T00:00:00Z");
+    const s = { source: "claude", sessionId: "s", analyzedAt: "2026-11-02T01:00:00.000Z", startedAt: "2026-11-02T00:00:00.000Z", endedAt: "2026-11-02T01:00:00.000Z", title: "", asked: [],
+      built: [{ kind: "commit", ref: topic.slice(0, 7), what: "c", at: "2026-11-02T00:30:00.000Z", evidence: [] }], gaps: [], rationale: [], outcomeStatuses: [], dropped: {},
+      keys: { repo: "example/widgets", branches: ["topic"], prs: [], commits: [], files: [], taskRefs: [], parents: [] } } as unknown as SessionFacts;
+    // 1. The branch and the tag share a name: the seal does not abort, and the branch is the branch.
+    const mid = seal();
+    expect(mid.branches!.map((b) => b.name)).toEqual(["topic"]);
+    expect(mid.branches![0]).toMatchObject({ landed: true, landedAt: "2026-11-06T00:00:00.000Z", tipAt: "2026-11-02T00:00:00.000Z" });
+    const atMid = ["2026-11-07T00:00:00.000Z", "2026-11-09T00:00:00.000Z"].map((cut) => deriveState([s], mid, cut));
+    expect(atMid.map((r) => r.state)).toEqual(["shipped", "regressed"]);
+    // 2. Re-landed on Nov 12: shipped, regressed, shipped across the three events; earlier cuts unchanged.
+    git(["cherry-pick", topic], "2026-11-12T00:00:00Z");
+    const later = seal();
+    const c = later.commits.find((x) => x.sha === topic)!;
+    expect(c.transitions!.map((t) => [t.kind, t.at])).toEqual([["landed", "2026-11-06T00:00:00.000Z"], ["reverted", "2026-11-08T00:00:00.000Z"], ["landed", "2026-11-12T00:00:00.000Z"]]);
+    expect(["2026-11-07T00:00:00.000Z", "2026-11-09T00:00:00.000Z"].map((cut) => deriveState([s], later, cut))).toEqual(atMid);
+    expect(deriveState([s], later, "2026-11-13T00:00:00.000Z").state).toBe("shipped");
+    expect(deriveState([s], later, "2026-11-12T00:00:00.000Z").state).toBe("regressed");
+  });
+
+  test("forge: pull requests are listed in full and filtered locally, never through the 1,000-result search", async () => {
+    const { prsUpdatedSince } = await import("../backfill/forge.ts");
+    const pr = (n: number, updatedAt: string | null) => ({ url: `https://github.com/example/widgets/pull/${n}`, state: "OPEN", createdAt: "2026-01-01T00:00:00Z", updatedAt, mergedAt: null, closedAt: null, headRefName: null });
+    const many = Array.from({ length: 1500 }, (_, i) => pr(i, "2026-11-0" + (1 + (i % 9)) + "T00:00:00Z"));
+    expect(prsUpdatedSince([...many, pr(9999, "2026-10-01T00:00:00Z"), pr(9998, "bad"), pr(9997, null)], "2026-11-01T00:00:00Z")).toHaveLength(1500);
+    expect(() => prsUpdatedSince(many, "2026-11-01T00:00:00Z", 1500)).toThrow(/partial/);
+    const src = readFileSync(join(import.meta.dir, "../backfill/forge.ts"), "utf8");
+    expect(src).not.toMatch(/"--search"/);
+  });
 });

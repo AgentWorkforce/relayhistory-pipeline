@@ -135,7 +135,15 @@ export interface ForgeFacts {
    * `defaultAt`: when the commit became reachable from the default branch; `defaultAtBasis` says how that is known
    * (`merge` and `patch` from the landing commit, `committer` only the commit's own time: see backfill/forge.ts).
    */
-  commits: Array<{ sha: string; at: string; onDefaultBranch: boolean; defaultAt?: string | null; defaultAtBasis?: "merge" | "patch" | "committer"; revertedBy?: string | null; revertedAt?: string | null }>;
+  commits: Array<{
+    sha: string; at: string; onDefaultBranch: boolean; defaultAt?: string | null; defaultAtBasis?: "merge" | "patch" | "committer"; revertedBy?: string | null; revertedAt?: string | null;
+    /**
+     * Its whole effective history on the default branch when there is more than one landing or any revert: each
+     * landing of its patch and each revert of a copy, dated by when that commit reached the default branch, oldest
+     * first. `defaultAt` and `revertedAt` are the first landing and first revert.
+     */
+    transitions?: Array<{ at: string; kind: "landed" | "reverted"; by: string }>;
+  }>;
   flags: Array<{ name: string; defaultOn: boolean }>;
   /** Branches of the repository and whether their work reached the default branch (by ancestry or patch id). */
   branches?: Array<{
@@ -239,7 +247,7 @@ export function utcForge(forge: ForgeFacts): ForgeFacts {
   const out: ForgeFacts = {
     ...forge,
     prs: forge.prs.map((p) => ({ ...p, at: req(p.at), ...(p.mergedAt !== undefined ? { mergedAt: opt(p.mergedAt) } : {}), ...(p.closedAt !== undefined ? { closedAt: opt(p.closedAt) } : {}) })),
-    commits: forge.commits.map((c) => ({ ...c, at: req(c.at), ...(c.defaultAt !== undefined ? { defaultAt: opt(c.defaultAt) } : {}), ...(c.revertedAt !== undefined ? { revertedAt: opt(c.revertedAt) } : {}) })),
+    commits: forge.commits.map((c) => ({ ...c, at: req(c.at), ...(c.transitions ? { transitions: c.transitions.map((t) => ({ ...t, at: req(t.at) })) } : {}), ...(c.defaultAt !== undefined ? { defaultAt: opt(c.defaultAt) } : {}), ...(c.revertedAt !== undefined ? { revertedAt: opt(c.revertedAt) } : {}) })),
     ...(forge.branches ? { branches: forge.branches.map((b) => ({ ...b, tipAt: req(b.tipAt), landedAt: opt(b.landedAt) })) } : {}),
   };
   normalized.set(forge, out);

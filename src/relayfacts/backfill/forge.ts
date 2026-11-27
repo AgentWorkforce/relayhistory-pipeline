@@ -7,7 +7,7 @@
  */
 import { execFileSync } from "node:child_process";
 import { parseArgs } from "node:util";
-import { requireUtc, utcForge, type ForgeFacts } from "../features/types.ts";
+import { requireUtc, utc, utcForge, type ForgeFacts } from "../features/types.ts";
 import { parseForge } from "../bench/corpus.ts";
 import { writeOutsideFile } from "../out-path.ts";
 import { printable, UsageError } from "../errors.ts";
@@ -15,6 +15,9 @@ import { printable, UsageError } from "../errors.ts";
 /** Git writes committer times with their own offsets: canonical UTC as read, so every comparison below is time order. */
 const gitTime = (t: string) => requireUtc(t, "a git committer time");
 const git = (dir: string, args: string[]) => execFileSync("git", ["-C", dir, ...args], { encoding: "utf8", maxBuffer: 512 * 1024 * 1024 });
+
+/** At most this many dated landings and reverts are kept per commit. */
+export const MAX_TRANSITIONS = 20;
 
 const VALUE_SETTING = /_(?:MS|S|SECONDS|TTL|MODE|PROVIDER|ENGINE|KIND|BUCKET|URL|ID|BYTES|SIZE|COUNT|MAX|MIN)$/u;
 
@@ -48,24 +51,39 @@ export function flagDefaults(markdown: string): Map<string, boolean> {
   return out;
 }
 
-/** The repository's pull requests from `gh` (the network step; tests pass their own). */
+/** At most this many pull requests are listed; a repository with more is refused rather than read partially. */
+export const MAX_LISTED_PRS = 50_000;
+
+/**
+ * The repository's pull requests from `gh` (the network step; tests pass their own), every one updated since
+ * `since`. Listed in full and filtered here: GitHub's search API (`--search updated:>=...`) returns at most
+ * 1,000 results, which silently truncated a busy repository's window.
+ */
 export function ghPullRequests(repo: string, since: string): Array<Record<string, string | null>> {
-  const raw = execFileSync("gh", ["pr", "list", "-R", repo, "--state", "all", "--limit", "5000", "--search", `updated:>=${since.slice(0, 10)}`,
-    "--json", "url,state,createdAt,mergedAt,closedAt,headRefName"], { encoding: "utf8", maxBuffer: 256 * 1024 * 1024 });
-  return JSON.parse(raw) as Array<Record<string, string | null>>;
+  const raw = execFileSync("gh", ["pr", "list", "-R", repo, "--state", "all", "--limit", String(MAX_LISTED_PRS),
+    "--json", "url,state,createdAt,updatedAt,mergedAt,closedAt,headRefName"], { encoding: "utf8", maxBuffer: 1024 * 1024 * 1024 });
+  return prsUpdatedSince(JSON.parse(raw) as Array<Record<string, string | null>>, since);
+}
+
+/** The full listing's pull requests updated since `since`; a listing at the cap is refused as partial. */
+export function prsUpdatedSince(all: Array<Record<string, string | null>>, since: string, cap = MAX_LISTED_PRS): Array<Record<string, string | null>> {
+  if (all.length >= cap) throw new UsageError(`gh pr list hit its ${cap} limit: the listing would be partial`);
+  const from = requireUtc(since, "--since");
+  return all.filter((p) => { const u = utc(p.updatedAt ?? null); return u !== null && u >= from; });
 }
 
 export function forgeFacts(repo: string, mirror: string, since: string, until: string, defaultBranch = "main", pullRequests: typeof ghPullRequests = ghPullRequests): ForgeFacts {
   const listed = pullRequests(repo, since);
-  if (listed.length >= 5000) throw new UsageError("gh pr list hit its 5000 limit: narrow the window");
   const prs = listed
-    .filter((p) => (p.createdAt ?? "") < until)
+    .filter((p) => { const c = utc(p.createdAt ?? null); return c !== null && c < requireUtc(until, "--until"); })
     .map((p) => ({
       ref: String(p.url).toLowerCase(),
       state: p.state === "MERGED" ? "merged" as const : p.state === "CLOSED" ? "closed" as const : "open" as const,
       at: String(p.createdAt), mergedAt: p.mergedAt ?? null, closedAt: p.closedAt ?? null, branch: p.headRefName ?? null,
     }));
-  const onDefault = new Set(git(mirror, ["rev-list", `--since=${since}`, `--until=${until}`, defaultBranch]).split("\n").filter(Boolean));
+  // Git commands take full refs (a tag or path named like a branch is never ambiguous); names are stored short.
+  const mainRef = `refs/heads/${defaultBranch}`;
+  const onDefault = new Set(git(mirror, ["rev-list", `--since=${since}`, `--until=${until}`, mainRef]).split("\n").filter(Boolean));
   // When each commit reached the default branch, and how that time is known (`defaultAtBasis`):
   // - `merge`: a commit a first-parent merge brought in, at that merge's committer time;
   // - `patch`: a branch commit whose patch landed as a default-branch commit, at that copy's time (set below);
@@ -74,7 +92,7 @@ export function forgeFacts(repo: string, mirror: string, since: string, until: s
   //   commit time: an approximation a strict replay can exclude by this basis.
   const defaultAt = new Map<string, string>();
   const basis = new Map<string, "merge" | "committer">();
-  const fp = git(mirror, ["log", "--first-parent", "--format=%H %P%x09%cI", `--since=${since}`, defaultBranch]).split("\n").filter(Boolean);
+  const fp = git(mirror, ["log", "--first-parent", "--format=%H %P%x09%cI", `--since=${since}`, mainRef]).split("\n").filter(Boolean);
   for (const l of fp.reverse()) {
     const [ids, rawAt] = l.split("\t");
     const [sha, first, ...merged] = ids!.split(" ");
@@ -85,7 +103,8 @@ export function forgeFacts(repo: string, mirror: string, since: string, until: s
     if (first && merged.length) for (const m of merged) for (const c of git(mirror, ["rev-list", `${first}..${m}`]).split("\n").filter(Boolean)) if (!defaultAt.has(c)) { defaultAt.set(c, at); basis.set(c, "merge"); }
   }
   const commits: ForgeFacts["commits"] = [];
-  const reverted = new Map<string, { by: string; at: string }>();
+  // Every default-branch revert, by the (possibly abbreviated) sha it names.
+  const revertsNamed: Array<{ target: string; by: string; at: string }> = [];
   for (const line of git(mirror, ["log", "--all", `--since=${since}`, `--until=${until}`, "--format=%H%x09%cI%x09%B%x1e"]).split("\x1e")) {
     const [sha, rawAt, ...body] = line.trim().split("\t");
     if (!sha || !rawAt) continue;
@@ -94,7 +113,7 @@ export function forgeFacts(repo: string, mirror: string, since: string, until: s
     const m = /This reverts commit ([0-9a-f]{7,40})/u.exec(body.join("\t"));
     // A revert takes effect when the reverting commit reached the default branch (a revert made on a side
     // branch and merged later is dated by the merge), not when it was written.
-    if (m && onDefault.has(sha)) reverted.set(m[1]!, { by: sha, at: defaultAt.get(sha) ?? at });
+    if (m && onDefault.has(sha)) revertsNamed.push({ target: m[1]!, by: sha, at: defaultAt.get(sha) ?? at });
   }
   // A branch commit the lander re-cut onto the default branch has a different sha but the same patch: map it
   // by `git patch-id --stable`, and date its landing by the default-branch copy. Its own commit time (`at`) is
@@ -102,24 +121,37 @@ export function forgeFacts(repo: string, mirror: string, since: string, until: s
   const patchOf = new Map<string, string>();
   const patchIds = execFileSync("sh", ["-c", `git -C "$0" log --all --since="$1" --until="$2" -p --format='commit %H' | git patch-id --stable`, mirror, since, until], { encoding: "utf8", maxBuffer: 512 * 1024 * 1024 });
   for (const line of patchIds.split("\n")) { const [pid, sha] = line.split(" "); if (pid && sha) patchOf.set(sha, pid); }
-  const landedByPatch = new Map<string, { sha: string; at: string }>();
-  // The earliest default-branch copy of each patch (git log lists newest first).
+  // Every default-branch copy of each patch, oldest first (git log lists newest first).
+  const copiesOf = new Map<string, Array<{ sha: string; at: string }>>();
   for (const c of commits) {
-    const pid = patchOf.get(c.sha), at = c.defaultAt ?? c.at;
-    const prev = pid ? landedByPatch.get(pid) : undefined;
-    if (c.onDefaultBranch && pid && (!prev || at < prev.at)) landedByPatch.set(pid, { sha: c.sha, at });
+    const pid = patchOf.get(c.sha);
+    if (!c.onDefaultBranch || !pid) continue;
+    const list = copiesOf.get(pid) ?? [];
+    list.push({ sha: c.sha, at: c.defaultAt ?? c.at });
+    copiesOf.set(pid, list);
   }
+  for (const list of copiesOf.values()) list.sort((a, b) => (a.at < b.at ? -1 : a.at > b.at ? 1 : 0));
+  const landedByPatch = new Map([...copiesOf].map(([pid, list]) => [pid, list[0]!]));
+  const revertsOf = (sha: string) => revertsNamed.filter((r) => sha.startsWith(r.target));
+  // A commit's effective history on the default branch, every transition dated by when it reached it: each
+  // landing of its patch (the commit itself, a re-cut copy, a re-apply after a revert, a revert of the revert:
+  // all share the patch id) and each revert of any of those copies. The state as of T is the last transition
+  // before T, so a landing, revert and re-landing replay as shipped, regressed, shipped.
   for (const c of commits) {
-    const r = reverted.get(c.sha) ?? [...reverted].find(([k]) => c.sha.startsWith(k))?.[1];
-    const landed = !c.onDefaultBranch ? landedByPatch.get(patchOf.get(c.sha) ?? "") : undefined;
-    if (landed) {
+    const pid = patchOf.get(c.sha);
+    const copies = (pid ? copiesOf.get(pid) : undefined) ?? (c.onDefaultBranch ? [{ sha: c.sha, at: c.defaultAt ?? c.at }] : []);
+    if (!c.onDefaultBranch && copies.length) {
       c.onDefaultBranch = true;
-      c.defaultAt = landed.at;
+      c.defaultAt = copies[0]!.at;
       c.defaultAtBasis = "patch";
-      const lr = reverted.get(landed.sha) ?? [...reverted].find(([k]) => landed.sha.startsWith(k))?.[1];
-      if (lr) { c.revertedBy = lr.by; c.revertedAt = lr.at; }
     }
-    if (r) { c.revertedBy = r.by; c.revertedAt = r.at; }
+    const transitions = [
+      ...copies.map((x) => ({ at: x.at, kind: "landed" as const, by: x.sha })),
+      ...copies.flatMap((x) => revertsOf(x.sha)).map((r) => ({ at: r.at, kind: "reverted" as const, by: r.by })),
+    ].sort((a, b) => (a.at < b.at ? -1 : a.at > b.at ? 1 : a.kind < b.kind ? -1 : 1)).slice(0, MAX_TRANSITIONS);
+    const firstRevert = transitions.find((t) => t.kind === "reverted");
+    if (firstRevert) { c.revertedBy = firstRevert.by; c.revertedAt = firstRevert.at; }
+    if (transitions.length > 1 || firstRevert) c.transitions = transitions;
   }
   // Branch landing: a branch's work reached the default branch when its tip is an ancestor of it, when any of
   // its own commits has a default-branch copy with the same patch id, or when its combined diff (a squash) does.
@@ -128,34 +160,35 @@ export function forgeFacts(repo: string, mirror: string, since: string, until: s
   const sh = (cmd: string, ...args: string[]) => { try { return execFileSync("sh", ["-c", cmd, ...args], { encoding: "utf8", maxBuffer: 256 * 1024 * 1024 }).trim(); } catch { return ""; } };
   let docs = "";
   try {
-    for (const path of git(mirror, ["ls-tree", "-r", "--name-only", defaultBranch, "--", "docs"]).split("\n").filter((p) => p.endsWith(".md")))
-      docs += git(mirror, ["show", `${defaultBranch}:${path}`]) + "\n";
+    for (const path of git(mirror, ["ls-tree", "-r", "--name-only", mainRef, "--", "docs"]).split("\n").filter((p) => p.endsWith(".md")))
+      docs += git(mirror, ["show", `${mainRef}:${path}`]) + "\n";
   } catch { /* a repository without docs has no flag table */ }
   const known = flagDefaults(docs);
   const flags = [...known].map(([name, defaultOn]) => ({ name, defaultOn })).sort((a, b) => (a.name < b.name ? -1 : 1));
   const branches: NonNullable<ForgeFacts["branches"]> = [];
-  for (const name of git(mirror, ["for-each-ref", "--format=%(refname:short)", "refs/heads"]).split("\n").filter((b) => b && b !== defaultBranch)) {
-    const rawTip = git(mirror, ["log", "-1", "--format=%cI", name]).trim();
+  for (const ref of git(mirror, ["for-each-ref", "--format=%(refname)", "refs/heads"]).split("\n").filter((r) => r.startsWith("refs/heads/") && r !== mainRef)) {
+    const name = ref.slice("refs/heads/".length);
+    const rawTip = git(mirror, ["log", "-1", "--format=%cI", ref]).trim();
     if (!rawTip) continue;
     const tipAt = gitTime(rawTip);
     if (tipAt < requireUtc(since, "--since")) continue;
-    const ancestor = sh(`git -C "$0" merge-base --is-ancestor "$1" "$2" && echo yes`, mirror, name, defaultBranch) === "yes";
+    const ancestor = sh(`git -C "$0" merge-base --is-ancestor "$1" "$2" && echo yes`, mirror, ref, mainRef) === "yes";
     // An ancestral landing is dated by when the tip first became reachable from the default branch (the merge
     // that brought it in, or its own time for a fast-forward), never by the tip's commit time. A tip older than
     // the walk (reachable before `since`) has no known landing time inside the window: its tip time stands.
-    const tip = git(mirror, ["rev-parse", "--verify", `refs/heads/${name}^{commit}`]).trim();
+    const tip = git(mirror, ["rev-parse", "--verify", `${ref}^{commit}`]).trim();
     let landedAt: string | null = ancestor ? (defaultAt.get(tip) ?? tipAt) : null;
-    const own = git(mirror, ["rev-list", "--max-count=200", `${defaultBranch}..${name}`]).split("\n").filter(Boolean);
+    const own = git(mirror, ["rev-list", "--max-count=200", `${mainRef}..${ref}`]).split("\n").filter(Boolean);
     if (!landedAt) for (const sha of own) {
       const at = mainPatch.get(patchOf.get(sha) ?? "");
       if (at && (!landedAt || at > landedAt)) landedAt = at;
     }
     if (!landedAt) {
-      const pid = sh(`git -C "$0" diff "$(git -C "$0" merge-base "$2" "$1")" "$1" | git patch-id --stable | cut -d' ' -f1`, mirror, name, defaultBranch);
+      const pid = sh(`git -C "$0" diff "$(git -C "$0" merge-base "$2" "$1")" "$1" | git patch-id --stable | cut -d' ' -f1`, mirror, ref, mainRef);
       if (pid) landedAt = mainPatch.get(pid) ?? null;
     }
     // Flags the branch introduces: `*_ENABLED` names, and settings the docs give a default, on added lines.
-    const added = sh(`git -C "$0" diff "$(git -C "$0" merge-base "$2" "$1")" "$1" | grep '^+' | grep -oE '[A-Z][A-Z0-9]*(_[A-Z0-9]+)+' | sort -u`, mirror, name, defaultBranch);
+    const added = sh(`git -C "$0" diff "$(git -C "$0" merge-base "$2" "$1")" "$1" | grep '^+' | grep -oE '[A-Z][A-Z0-9]*(_[A-Z0-9]+)+' | sort -u`, mirror, ref, mainRef);
     const flagsAdded = added.split("\n").filter((f) => f && (f.endsWith("_ENABLED") || known.has(f))).slice(0, 50);
     branches.push({ name, landed: landedAt !== null, landedAt, tipAt, ...(flagsAdded.length ? { flagsAdded } : {}), ...(own.length ? { commits: own } : {}) });
   }

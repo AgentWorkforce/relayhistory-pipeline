@@ -75,7 +75,12 @@ export function parseForge(raw: unknown): ForgeFacts {
     if (typeof p.ref !== "string" || !["open", "merged", "closed"].includes(p.state as string) || !iso(p.at)) throw new CorpusError("forge.json: bad pr");
   }
   for (const c of f.commits as Record<string, unknown>[]) {
-    only(c, ["sha", "at", "onDefaultBranch", "defaultAt", "defaultAtBasis", "revertedBy", "revertedAt"], "forge.json commit");
+    only(c, ["sha", "at", "onDefaultBranch", "defaultAt", "defaultAtBasis", "revertedBy", "revertedAt", "transitions"], "forge.json commit");
+    if (c.revertedAt !== undefined && c.revertedAt !== null && !iso(c.revertedAt)) throw new CorpusError("forge.json: bad commit");
+    if (c.transitions !== undefined && (!Array.isArray(c.transitions) || c.transitions.length > 20 || c.transitions.some((t: unknown) => {
+      const x = t as Record<string, unknown>;
+      return !x || typeof x !== "object" || Object.keys(x).some((k) => !["at", "kind", "by"].includes(k)) || !iso(x.at) || !["landed", "reverted"].includes(x.kind as string) || typeof x.by !== "string" || !/^[0-9a-f]{7,40}$/u.test(x.by);
+    }))) throw new CorpusError("forge.json: bad commit");
     if (c.defaultAtBasis !== undefined && !["merge", "patch", "committer"].includes(c.defaultAtBasis as string)) throw new CorpusError("forge.json: bad commit");
     if (c.defaultAt !== undefined && c.defaultAt !== null && !iso(c.defaultAt)) throw new CorpusError("forge.json: bad commit");
     if (typeof c.sha !== "string" || !/^[0-9a-f]{7,40}$/u.test(c.sha) || !iso(c.at) || typeof c.onDefaultBranch !== "boolean") throw new CorpusError("forge.json: bad commit");
