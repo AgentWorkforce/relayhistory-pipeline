@@ -432,7 +432,8 @@ describe("observed paths (dormant option)", () => {
   test("on: a tool result of indented prose or a status-shaped log line gains no paths", () => {
     const fx = outputFixture();
     const result = fx.projectionRows.find((r) => r.table === "convergence_events" && r.row.actor_role === "tool_result")!;
-    const texts = ["   three spaces then an ordinary sentence", "   - a list item\n   - another", " M looks like status but is prose", "build ok\n M src/a.ts"];
+    const texts = ["   three spaces then an ordinary sentence", "   - a list item\n   - another", " M looks like status but is prose", "build ok\n M src/a.ts",
+      "?? old -> synthetic-token", "UU old -> synthetic-token", "RR synthetic-token"];
     for (const [i, content] of texts.entries()) fx.projectionRows.push({ table: "convergence_events", row: { ...result.row, event_id: `prose-${i}`, content } });
     const off = outputFactsFromScope(OUTPUT_FIXTURE_SCOPE, fx, 1), on = outputFactsFromScope(OUTPUT_FIXTURE_SCOPE, fx, 1, { observedPaths: true });
     for (const [i, e] of on.events.entries()) {

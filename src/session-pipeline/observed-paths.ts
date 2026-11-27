@@ -13,12 +13,28 @@ export const MAX_OBSERVED_PATH_CHARS = 512;
 export const MAX_OBSERVED_CONTENT = 256 * 1024;
 
 /**
- * `XY path` or `XY old -> new` (porcelain v1 short format). XY is a code git can print: `??` (untracked), `!!`
- * (ignored), or index and worktree states of which at least one is set; two spaces never occur, so indented text is
- * not a listing. Git quotes any path with whitespace or escapes, and quoted paths are not read, so a path here has no
+ * `XY path` or `XY old -> new` (porcelain v1 short format). XY must be a code git prints (STATUS_CODES): untracked
+ * `??`, ignored `!!`, an unmerged pair, or index and worktree states of which at least one is set. Two spaces never
+ * occur, so indented text is not a listing. The arrow form is a rename or copy and appears exactly when XY holds `R`
+ * or `C`. Git quotes any path containing whitespace or escapes, and quoted paths are not read, so a path here has no
  * whitespace: a line of prose cannot pass as one.
  */
-const STATUS_LINE = /^(\?\?|!!|[MTADRCU][ MTADRCU]| [MTADRCU]) (?:([^\s"]\S*) -> )?([^\s"]\S*)$/;
+const STATUS_LINE = /^(\S\S|\S | \S) (?:([^\s"]\S*) -> )?([^\s"]\S*)$/;
+const UNMERGED = ["DD", "AU", "UD", "UA", "DU", "AA", "UU"];
+const STATUS_CODES = new Set([
+  "??", "!!", ...UNMERGED,
+  // Index updated (X), worktree unchanged or changed again (Y).
+  ...["M", "T", "A", "R", "C"].flatMap((x) => [" ", "M", "T", "D"].map((y) => x + y)), "D ",
+  // Index unchanged, worktree changed; " A" is an intent-to-add, " R"/" C" a worktree rename or copy.
+  ...["M", "T", "D", "A", "R", "C"].map((y) => " " + y),
+]);
+/** The path a status line names (a rename's or copy's destination), or null when it is not a line git can print. */
+function statusPath(line: string): string | null {
+  const m = STATUS_LINE.exec(line);
+  if (!m || !STATUS_CODES.has(m[1]!)) return null;
+  const renames = /[RC]/.test(m[1]!);
+  return renames === (m[2] !== undefined) ? m[3]! : null;
+}
 /** `## branch...upstream` header of `git status -sb`. */
 const BRANCH_LINE = /^## \S/;
 /** ` path | 12 +++--` or ` path | Bin 10 -> 20 bytes`. */
@@ -44,7 +60,8 @@ export function observedPaths(content: string | null | undefined): string[] {
   if (!lines.length) return [];
   // git status --short (optionally -b): every line is a status line or the one branch header.
   const status = lines.filter((l, i) => !(i === 0 && BRANCH_LINE.test(l)));
-  if (status.length && status.every((l) => STATUS_LINE.test(l))) return cap(status.map((l) => STATUS_LINE.exec(l)![3]!));
+  const named = status.map(statusPath);
+  if (status.length && named.every((p) => p !== null)) return cap(named as string[]);
   // git diff --stat: stat lines, then exactly one summary line, last.
   const last = lines.at(-1)!, body = lines.slice(0, -1);
   if (STAT_SUMMARY.test(last) && body.length && body.every((l) => STAT_LINE.test(l))) return cap(body.map((l) => STAT_LINE.exec(l)![1]!));
