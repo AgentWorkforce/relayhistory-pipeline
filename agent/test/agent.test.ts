@@ -103,7 +103,7 @@ test(`user data: under ${USER_DATA_BUDGET} bytes encoded (EC2 caps it at ${EC2_U
   // 0.1.27; ledger.py since 0.1.28; steward.py and stewardship.md since
   // 0.1.29). The kit's OPTIONAL_KIT_FILES, which its own host, fresh-host and
   // userdata tests use, is not exported, so it is rebuilt here from the lists that are.
-  const optional: readonly string[] = ["headless.py", "ledger.py", "delegation.md", "orchestration.md", ...DELEGATION_KIT_FILES, ...WORKER_KIT_FILES, ...RELAY_SESSIONS_KIT_FILES, ...ISSUE_WATCH_KIT_FILES, ...STEWARDSHIP_KIT_FILES];
+  const optional: readonly string[] = ["headless.py", "ledger.py", "delegation.md", "orchestration.md", "disk-sweep.sh", ...DELEGATION_KIT_FILES, ...WORKER_KIT_FILES, ...RELAY_SESSIONS_KIT_FILES, ...ISSUE_WATCH_KIT_FILES, ...STEWARDSHIP_KIT_FILES];
   // The generated card (module 0.1.17), issue-watch (0.1.20) and stewardship (0.1.29) files travel by hot update, never in user data.
   for (const f of agent.files) if (f.source !== "generated" && !optional.includes(f.name)) assert.ok(script.includes(`cat > /opt/agent-host/${f.name} <<'`), f.name);
   for (const f of optional) assert.ok(!script.includes(`/opt/agent-host/${f} <<'`), `${f} is not in user data`);
