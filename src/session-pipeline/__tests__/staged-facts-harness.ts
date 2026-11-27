@@ -10,7 +10,7 @@ import { btree_gin } from "../../../packages/pipeline/node_modules/@electric-sql
 import { pg_trgm } from "../../../packages/pipeline/node_modules/@electric-sql/pglite/dist/contrib/pg_trgm.js";
 import type { SqlExecutor } from "@rhc/lib/pipeline/queue.ts";
 import { runMigrations, type MigrationClient, type MigrationProfile } from "../../hoopdb/migrate.ts";
-import { outputFactsFromScope, type OutputFactsScope } from "../output-facts.ts";
+import { outputFactsFromScope, type OutputFactsOptions, type OutputFactsScope } from "../output-facts.ts";
 import {
   finishStagedOutputFacts,
   postgresOutputFactsStore,
@@ -114,14 +114,14 @@ export async function wantBatch(db: PGlite, run: StagedRunRef, scope: StagedOutp
 }
 
 /** One chunk of the facts pass, in its own transaction (onBatch phase "facts"). */
-export async function factsChunk(db: PGlite, run: StagedRunRef, scope: StagedOutputFactsScope, events: StagedFactsEvents, chunk: StagedFactsChunk, sourceVersion: number) {
-  return as(db, (tx) => stageOutputFactsChunk(tx, run, scope, events, chunk, sourceVersion));
+export async function factsChunk(db: PGlite, run: StagedRunRef, scope: StagedOutputFactsScope, events: StagedFactsEvents, chunk: StagedFactsChunk, sourceVersion: number, facts: OutputFactsOptions = {}) {
+  return as(db, (tx) => stageOutputFactsChunk(tx, run, scope, events, chunk, sourceVersion, undefined, facts));
 }
 
 /** The whole facts pass (chunks `from` onwards; `skip` leaves chunk numbers out, a gap). */
-export async function factsPass(db: PGlite, run: StagedRunRef, scope: StagedOutputFactsScope, chunks: StagedFactsEvents[], sourceVersion: number, opts: { from?: number; skip?: number[] } = {}) {
+export async function factsPass(db: PGlite, run: StagedRunRef, scope: StagedOutputFactsScope, chunks: StagedFactsEvents[], sourceVersion: number, opts: { from?: number; skip?: number[]; facts?: OutputFactsOptions } = {}) {
   for (let i = opts.from ?? 0; i < chunks.length; i++)
-    if (!opts.skip?.includes(i)) await factsChunk(db, run, scope, chunks[i]!, { seq: i, last: i === chunks.length - 1 }, sourceVersion);
+    if (!opts.skip?.includes(i)) await factsChunk(db, run, scope, chunks[i]!, { seq: i, last: i === chunks.length - 1 }, sourceVersion, opts.facts);
 }
 
 /** The want -> have advance, with the seal (onWantDone) when facts are on; then have -> write -> final. */
@@ -148,17 +148,17 @@ export async function finalStep(db: PGlite, run: StagedRunRef, scope: StagedOutp
 }
 
 /** The want batches, then the facts pass, of a fresh or resumed run (from its committed cursor). */
-export async function wantPhase(db: PGlite, run: Claimed, scope: StagedOutputFactsScope, chunks: StagedFactsEvents[] | null, sourceVersion: number) {
+export async function wantPhase(db: PGlite, run: Claimed, scope: StagedOutputFactsScope, chunks: StagedFactsEvents[] | null, sourceVersion: number, facts: OutputFactsOptions = {}) {
   const from = run.cursor === null ? 0 : Number(run.cursor.slice(1)) + 1;
   for (let i = from; i < WANT_KEYS; i++) await wantBatch(db, run, scope, i);
-  if (chunks) await factsPass(db, run, scope, chunks, sourceVersion);
+  if (chunks) await factsPass(db, run, scope, chunks, sourceVersion, { facts });
 }
 
 /** A whole staged run from a fresh claim, facts on throughout. */
-export async function stagedPass(db: PGlite, scope: StagedOutputFactsScope, read: Read, sourceVersion: number, size = 3, recordsFirst = false) {
+export async function stagedPass(db: PGlite, scope: StagedOutputFactsScope, read: Read, sourceVersion: number, size = 3, recordsFirst = false, facts: OutputFactsOptions = {}) {
   const run = await claim(db, scope, `mf-${sourceVersion}`, sourceVersion);
   if (!run) throw new Error("claim busy");
-  await wantPhase(db, run, scope, chunksOf(read, size, recordsFirst), sourceVersion);
+  await wantPhase(db, run, scope, chunksOf(read, size, recordsFirst), sourceVersion, facts);
   await advanceToFinal(db, run, true);
   return finalStep(db, run, scope, { sourceComplete: read.complete, sourceVersion });
 }

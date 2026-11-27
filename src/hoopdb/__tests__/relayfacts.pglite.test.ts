@@ -352,7 +352,7 @@ describe("20261105062090 relayfacts operator erase", () => {
     // workspace readers) 20261105062180 (claims scheduler), 20261105062190 (the priority-first
     // advisories reader), 20261105062200 (session list readiness), 20261105062210 (T2 staged ACK) and 20261105062220 (the
     // advisory instance).
-    expect(Object.keys(MIGRATION_SENTINELS).filter((k) => k.startsWith("upstream:") && k > ERASE_STEP)).toEqual([USER_ERASE_STEP, STAGING_STEP, CUTOVER_STEP, CUTOVER_REVISION_STEP, STAGED_FACTS_STEP, CLAIMS_STEP, INTEL_CONTROLS_STEP, INTEL_WORKSPACE_STEP, SCHEDULER_STEP, ADVISORY_PRIORITY_STEP, LIST_READINESS_STEP, T2_STEP, ADVISORY_INSTANCE_STEP, SEARCH_STAGE_STEP]);
+    expect(Object.keys(MIGRATION_SENTINELS).filter((k) => k.startsWith("upstream:") && k > ERASE_STEP)).toEqual([USER_ERASE_STEP, STAGING_STEP, CUTOVER_STEP, CUTOVER_REVISION_STEP, STAGED_FACTS_STEP, CLAIMS_STEP, INTEL_CONTROLS_STEP, INTEL_WORKSPACE_STEP, SCHEDULER_STEP, ADVISORY_PRIORITY_STEP, LIST_READINESS_STEP, T2_STEP, ADVISORY_INSTANCE_STEP, SEARCH_STAGE_STEP, "upstream:20261105062310_event_facts_observed_paths.sql"]);
     expect(RUNTIME_APPLICATION_FUNCTIONS.filter((f) => f.startsWith("sessions.relayfacts_evidence_"))).toEqual([]);
     for (const fn of [ERASE, GUARD]) {
       const r = (await db.query<{ secdef: boolean; cfg: string[]; public_exec: boolean }>(
@@ -459,6 +459,8 @@ const ADVISORY_INSTANCE_DOWN = read("supabase/rollbacks/20261105062220_coordinat
 // 20261105062300 (the search-index stage) sits above 062220: its down runs before 062220's.
 const SEARCH_STAGE_STEP = "upstream:20261105062300_search_index_stage.sql";
 const SEARCH_STAGE_DOWN = read("supabase/rollbacks/20261105062300_search_index_stage.down.sql");
+// 062310 is newer than 062300: its down comes off first.
+const OBSERVED_PATHS_DOWN = read("supabase/rollbacks/20261105062310_event_facts_observed_paths.down.sql");
 const USER_ERASE = "sessions.relayfacts_user_erase_v1(text,text,text,text)";
 const USER_ERASE_LOCK = "sessions.relayfacts_user_erase_lock_v1()";
 const USER_ERASE_GUARD = "sessions.relayfacts_user_erase_guard_v1()";
@@ -508,7 +510,7 @@ describe("20261105062100 relayfacts user erase", () => {
     expect((await db.query<{ applied: boolean }>(MIGRATION_SENTINELS[USER_ERASE_STEP]!.sql)).rows[0]!.applied).toBe(true);
     // 20261105062110 (search reconcile staging), then 062120 and 062130 (analysis org S3 cutover), then 062140 (staged output
     // facts) 062150 (relayfacts claims), 062160 (session intel controls) 062170 (session intel workspace readers) 062180 (claims scheduler), 062190 (priority-first advisories reader), 062200 (session list readiness), 062210 (T2 staged ACK) and 062220 (the advisory instance), are the upstream steps later than 062100.
-    expect(Object.keys(MIGRATION_SENTINELS).filter((k) => k.startsWith("upstream:") && k > USER_ERASE_STEP)).toEqual([STAGING_STEP, CUTOVER_STEP, CUTOVER_REVISION_STEP, STAGED_FACTS_STEP, CLAIMS_STEP, INTEL_CONTROLS_STEP, INTEL_WORKSPACE_STEP, SCHEDULER_STEP, ADVISORY_PRIORITY_STEP, LIST_READINESS_STEP, T2_STEP, ADVISORY_INSTANCE_STEP, SEARCH_STAGE_STEP]);
+    expect(Object.keys(MIGRATION_SENTINELS).filter((k) => k.startsWith("upstream:") && k > USER_ERASE_STEP)).toEqual([STAGING_STEP, CUTOVER_STEP, CUTOVER_REVISION_STEP, STAGED_FACTS_STEP, CLAIMS_STEP, INTEL_CONTROLS_STEP, INTEL_WORKSPACE_STEP, SCHEDULER_STEP, ADVISORY_PRIORITY_STEP, LIST_READINESS_STEP, T2_STEP, ADVISORY_INSTANCE_STEP, SEARCH_STAGE_STEP, "upstream:20261105062310_event_facts_observed_paths.sql"]);
     expect(RUNTIME_APPLICATION_FUNCTIONS.filter((f) => f.startsWith("sessions.relayfacts_user_erase_"))).toEqual([]);
     for (const fn of [USER_ERASE, USER_ERASE_LOCK, USER_ERASE_GUARD]) {
       const r = (await db.query<{ secdef: boolean; cfg: string[]; public_exec: boolean }>(
@@ -627,6 +629,7 @@ describe("20261105062100 relayfacts user erase", () => {
     expect(await message(CUTOVER_REVISION_DOWN)).toContain("a later migration is applied");
     // 062220 comes off first (062210's down refuses while it is applied).
     expect(await message(T2_DOWN)).toContain("a later migration is applied");
+    await db.exec(OBSERVED_PATHS_DOWN);
     await db.exec(SEARCH_STAGE_DOWN);
     await db.exec(ADVISORY_INSTANCE_DOWN);
     expect((await db.query<{ applied: boolean }>(MIGRATION_SENTINELS[ADVISORY_INSTANCE_STEP]!.sql)).rows[0]!.applied).toBe(false);

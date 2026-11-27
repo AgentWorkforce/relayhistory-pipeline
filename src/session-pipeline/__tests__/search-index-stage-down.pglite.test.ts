@@ -28,9 +28,13 @@ const wake = (epoch: number): StageMessage => ({
   payload: { epoch, clock: { source: "pointer", at: new Date().toISOString() } },
 });
 
+/** Later steps' downs, newest first, so the clone's newest step is this one (each refuses otherwise). */
+const LATER_DOWNS = ["20261105062310_event_facts_observed_paths.down.sql"].map((f) =>
+  readFileSync(join(import.meta.dir, `../../../supabase/rollbacks/${f}`), "utf8"));
 async function db() {
   const { pg } = await clonedReplayDatabase();
   cleanup.push(() => pg.close());
+  for (const later of LATER_DOWNS) await pg.exec(later);
   return pg;
 }
 /** The real migrator over the clone, as replay-fixture.ts runs it. */

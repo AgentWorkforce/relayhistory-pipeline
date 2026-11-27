@@ -26,6 +26,8 @@ const DOWN = read("supabase/rollbacks/20261105062220_coordination_advisories_inc
 // 20261105062300 (the search-index stage) sits above 062220: its down runs first.
 const SEARCH_STAGE_STEP = "upstream:20261105062300_search_index_stage.sql";
 const SEARCH_STAGE_DOWN = read("supabase/rollbacks/20261105062300_search_index_stage.down.sql");
+// 062310 is newer than 062300: its down comes off first.
+const OBSERVED_PATHS_DOWN = read("supabase/rollbacks/20261105062310_event_facts_observed_paths.down.sql");
 const V1_SQL = read("supabase/migrations/20261105062000_coordination_advisories.sql");
 const LOCAL: MigrationProfile = { mode: "local", shim: true, bootstrap: true, verify: false, runtimeRole: "postgres" };
 
@@ -141,6 +143,7 @@ describe("20261105062220 coordination advisories: the advisory instance", () => 
     expect(SQL).not.toMatch(/ADD COLUMN incarnation uuid[^;]*DEFAULT/i);
     // Before: roll 062220 back, write pending, delivered and acked rows through 062000's v1, then re-apply 062220.
     await reset();
+    await db.exec(OBSERVED_PATHS_DOWN);
     await db.exec(SEARCH_STAGE_DOWN);
     await db.exec(DOWN);
     expect((await db.query<{ applied: boolean }>(MIGRATION_SENTINELS[STEP]!.sql)).rows[0]!.applied).toBe(false);
@@ -344,9 +347,10 @@ describe("20261105062220 rollback", () => {
     const h = harness(() => db);
     const message = async (sql: string) => { const m = await db.exec(sql).then(() => null, (e: Error) => e.message); await db.exec("ROLLBACK").catch(() => {}); return m; };
     try {
-      expect((await plan(LOCAL)).filter((s) => s.name.startsWith("upstream:") && s.name > STEP).map((s) => s.name)).toEqual([SEARCH_STAGE_STEP]);
+      expect((await plan(LOCAL)).filter((s) => s.name.startsWith("upstream:") && s.name > STEP).map((s) => s.name)).toEqual([SEARCH_STAGE_STEP, "upstream:20261105062310_event_facts_observed_paths.sql"]);
       expect(await message(DOWN)).toContain("a later migration is applied");
-      await db.exec(SEARCH_STAGE_DOWN);
+      await db.exec(OBSERVED_PATHS_DOWN);
+    await db.exec(SEARCH_STAGE_DOWN);
       expect(await message(read("supabase/rollbacks/20261105062190_coordination_advisories_pending_priority.down.sql"))).toContain("a later migration is applied");
       await h.upsert(2, [h.adv(1, "high")]);
       await h.upsert(1, [h.adv(2, "high")]);

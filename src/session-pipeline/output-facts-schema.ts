@@ -45,7 +45,7 @@ export const OUTPUT_FACTS_STATE_TABLE = "output_facts_workspace_state";
 /** Per-session facts state, written by every producer pass (output-facts.ts). */
 export const OUTPUT_FACTS_SESSION_STATE_TABLE = "output_facts_session_state";
 
-export const OUTPUT_FACTS_SCHEMA_VERSION = 4;
+export const OUTPUT_FACTS_SCHEMA_VERSION = 5;
 
 /** `session_output_facts.fact_kind` values. */
 export const OUTPUT_FACT_KINDS = ["message", "legacy_turn_message", "commit", "outcome"] as const;
@@ -89,6 +89,7 @@ export function outputFactsSchemaStatements(): string[] {
     cost_usd_micros        Nullable(Int64),
     -- jsonb_array_elements_text: a JSON null element is a NULL path, counted as one.
     files_touched          Array(Nullable(String)),
+    observed_paths         Array(String) DEFAULT [],
     retention_days         UInt16 DEFAULT 0,
     -- sha256 of the identity (the ORDER BY key minus tenant): reconcile deletes by it.
     row_id                 String,
@@ -189,6 +190,9 @@ export function outputFactsUpgradeStatements(): string[] {
     `ALTER TABLE ${EVENT_FACTS_TABLE} ADD COLUMN IF NOT EXISTS task_title Nullable(String)`,
     `ALTER TABLE ${EVENT_FACTS_TABLE} ADD COLUMN IF NOT EXISTS user_id Nullable(String)`,
     `ALTER TABLE ${EVENT_FACTS_TABLE} ADD COLUMN IF NOT EXISTS row_id String`,
+    // v5: observed paths (observed-paths.ts). Dormant: no writer emits the column until the builders are given
+    // `observedPaths`; the producer's probe requires it only then.
+    `ALTER TABLE ${EVENT_FACTS_TABLE} ADD COLUMN IF NOT EXISTS observed_paths Array(String) DEFAULT []`,
     `ALTER TABLE ${OUTPUT_FACTS_TABLE} ADD COLUMN IF NOT EXISTS scope_source LowCardinality(String)`,
     `ALTER TABLE ${OUTPUT_FACTS_TABLE} ADD COLUMN IF NOT EXISTS row_id String`,
     `ALTER TABLE ${OUTPUT_FACTS_SESSION_STATE_TABLE} ADD COLUMN IF NOT EXISTS min_ts Nullable(DateTime64(6, 'UTC'))`,

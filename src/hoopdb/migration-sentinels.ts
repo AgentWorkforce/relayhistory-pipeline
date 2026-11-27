@@ -668,6 +668,10 @@ export const MIGRATION_SENTINELS: Record<string, Sentinel> = {
     evidence: "table sessions.search_catchup_cursor and function sessions.archive_search_stage_v1() (the search-index stage)",
     sql: "SELECT to_regclass('sessions.search_catchup_cursor') IS NOT NULL AND to_regprocedure('sessions.archive_search_stage_v1()') IS NOT NULL AS applied",
   },
+  "upstream:20261105062310_event_facts_observed_paths.sql": {
+    evidence: "column sessions.session_event_facts.observed_paths, carried by output_facts_reconcile and staged_facts_reconcile_v1",
+    sql: "SELECT EXISTS (SELECT 1 FROM pg_attribute WHERE attrelid = to_regclass('sessions.session_event_facts') AND attname = 'observed_paths' AND NOT attisdropped) AND coalesce((SELECT prosrc LIKE '%observed_paths = EXCLUDED.observed_paths%' FROM pg_proc WHERE oid = to_regprocedure('sessions.output_facts_reconcile(text,text,text,text[],text,jsonb,jsonb,boolean,bigint)')), false) AND coalesce((SELECT prosrc LIKE '%observed_paths = EXCLUDED.observed_paths%' FROM pg_proc WHERE oid = to_regprocedure('sessions.staged_facts_reconcile_v1(bigint,uuid,text,text,text,text[],text,boolean,bigint)')), false) AS applied",
+  },
   "upstream:20261105062070_coordination_advisor_readers.sql": {
     evidence: "functions sessions.coordination_advisor_write_facts_v1 and sessions.coordination_advisories_recent_v1",
     sql: "SELECT to_regprocedure('sessions.coordination_advisor_write_facts_v1(text,text,timestamptz,timestamptz,text,integer)') IS NOT NULL AND to_regprocedure('sessions.coordination_advisories_recent_v1(text,text,timestamptz)') IS NOT NULL AS applied",
@@ -687,4 +691,5 @@ export const NON_CREATE_STEPS = [
   "96bulls:0004_summary_pointers.sql",
   "upstream:20261105043900_session_consumer_function_grants.sql",
   "upstream:20261105045030_session_consumer_project_text_grant.sql",
+  "upstream:20261105062310_event_facts_observed_paths.sql",
 ] as const;
