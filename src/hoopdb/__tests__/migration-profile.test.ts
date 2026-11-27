@@ -3,6 +3,7 @@
  * guard, on in-process PGlite plus the pure profile resolver.
  */
 import { ingestOrgAdmissionHold, lastBody as holdLastBody } from "../../../scripts/sessions-function-boundary/lanes/ingest-org-admission-hold.ts";
+import { ingestOrgErasureHistory } from "../../../scripts/sessions-function-boundary/lanes/ingest-org-erasure-history.ts";
 import { afterEach, describe, expect, setDefaultTimeout, spyOn, test } from "bun:test";
 import { createHash } from "node:crypto";
 import { existsSync, readFileSync } from "node:fs";
@@ -2722,6 +2723,27 @@ describe("function boundary: ACL manifest, residual, activation gate", () => {
       const open = src.indexOf(tag, start) + tag.length;
       return src.slice(open, src.indexOf(tag, open));
     };
+    // 20261105062340 (the per-org erasure history) is newest: 062320's down refuses (55000) while it is applied; its
+    // checksum-pinned down (no unreleased hold) restores 062320's exact release and status, drops the 30 source
+    // triggers and its functions, records the end of coverage, keeps the three history tables and their guard, removes
+    // its ledger row, and refuses on a rerun.
+    const HISTORY = "upstream:20261105062340_ingest_org_erasure_history.sql";
+    expect(await names()).toContain(HISTORY);
+    expect((await failure(rollback("20261105062320_ingest_org_admission_fences.down.sql")))?.code).toBe("55000");
+    const historyReplaced = Object.entries(ingestOrgErasureHistory.replaces);
+    for (const [sig] of historyReplaced) expect((await procSrc(sig)).s).toContain("-- 062340 org erasure history");
+    await rollback("20261105062340_ingest_org_erasure_history.down.sql");
+    expect(await names()).not.toContain(HISTORY);
+    for (const [sig, r] of historyReplaced) {
+      const prior = holdLastBody(readFileSync(join(root, r.original), "utf8"), sig);
+      const tag = /AS (\$[a-z_]+\$)/u.exec(prior)![1]!;
+      const open = prior.indexOf(tag) + tag.length;
+      expect(await procSrc(sig)).toEqual({ s: prior.slice(open, prior.indexOf(tag, open)), d: r.secdef });
+    }
+    expect((await db.query<{ n: number }>("SELECT count(*)::int n FROM pg_proc p JOIN pg_namespace n ON n.oid=p.pronamespace WHERE n.nspname='sessions' AND p.proname LIKE 'ingest\\_org\\_erasure\\_history\\_%' AND p.proname <> 'ingest_org_erasure_history_guard'")).rows[0]!.n).toBe(0);
+    expect((await db.query<{ n: number }>("SELECT count(*)::int n FROM pg_trigger WHERE tgname IN ('ingest_org_erasure_history_record','ingest_org_erasure_history_refuse_truncate')")).rows[0]!.n).toBe(0);
+    for (const r of ["sessions.ingest_org_erasure_history", "sessions.ingest_org_erasure_history_coverage", "sessions.ingest_org_erasure_history_bindings"]) expect(await relation(r)).toBe(r);
+    expect((await failure(rollback("20261105062340_ingest_org_erasure_history.down.sql")))?.code).toBe("55000");
     // 20261105062320 (the per-org admission hold) is newest: 062300's down refuses (55000) while it is applied; its
     // checksum-pinned down (no unreleased hold) restores the 17 replaced entry functions' exact prior bodies, drops the
     // hold functions and the batch backstop trigger, keeps the hold history and its immutability guard (retained),

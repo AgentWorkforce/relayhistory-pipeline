@@ -931,6 +931,30 @@
     "sessions.ingest_org_admission_hold_status(text)": [
       "<owner>:EXECUTE"
     ],
+    "sessions.ingest_org_erasure_history_applied()": [
+      "<owner>:EXECUTE"
+    ],
+    "sessions.ingest_org_erasure_history_bind(text,uuid,timestamp with time zone)": [
+      "<owner>:EXECUTE"
+    ],
+    "sessions.ingest_org_erasure_history_coverage_start()": [
+      "<owner>:EXECUTE"
+    ],
+    "sessions.ingest_org_erasure_history_covers(timestamp with time zone)": [
+      "<owner>:EXECUTE"
+    ],
+    "sessions.ingest_org_erasure_history_guard()": [
+      "<owner>:EXECUTE"
+    ],
+    "sessions.ingest_org_erasure_history_record()": [
+      "<owner>:EXECUTE"
+    ],
+    "sessions.ingest_org_erasure_history_recording()": [
+      "<owner>:EXECUTE"
+    ],
+    "sessions.ingest_org_erasure_history_refuse_truncate()": [
+      "<owner>:EXECUTE"
+    ],
     "sessions.ingest_origin_claim_buffered_batch(jsonb)": [
       "<owner>:EXECUTE",
       "bulls96_session_ingest:EXECUTE"

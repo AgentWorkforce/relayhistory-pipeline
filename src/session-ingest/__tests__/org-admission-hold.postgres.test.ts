@@ -15,7 +15,7 @@
 import { afterEach, describe, expect, setDefaultTimeout, test } from "bun:test";
 import pg from "pg";
 import { readFileSync } from "node:fs";
-import { fixturePgUrl, migrateAsOwner, scratchDatabase, type ScratchDatabase } from "./hold-harness/pg.ts";
+import { fixturePgUrl, migrateAsOwner, rollBackLaterSlots, scratchDatabase, type ScratchDatabase } from "./hold-harness/pg.ts";
 import { expectBlocks, expectNotBlocked, openPair, type Pair } from "./hold-harness/two-conn.ts";
 
 setDefaultTimeout(300_000);
@@ -30,6 +30,9 @@ async function database(): Promise<ScratchDatabase> {
   const db = await scratchDatabase(url!, { bootstrap: true, prefix: "hold" });
   cleanups.push(() => db.drop());
   await migrateAsOwner(db.ownerUrl);
+  // 062320's own semantics: later slots (062340, the erasure history, replaces its release) are rolled back first;
+  // org-erasure-history.postgres.test.ts proves the release with 062340 applied.
+  await rollBackLaterSlots(db.ownerUrl, "20261105062320_ingest_org_admission_fences");
   return db;
 }
 async function pair(db: ScratchDatabase, ownerSide = true): Promise<Pair> {

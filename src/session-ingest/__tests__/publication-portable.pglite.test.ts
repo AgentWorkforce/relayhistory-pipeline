@@ -72,7 +72,8 @@ beforeAll(async () => {
   // checked bodies, so the proposal (correctly) refuses over it. The proposal is exercised here on the schema it was
   // written against; reconciling it with 062320 (re-pinning, and keeping the hold check in the copied kernels) is a
   // named follow-up before either lands (docs/release/062320-org-admission-hold.md).
-  for (const f of readdirSync(join(root, "supabase/migrations")).filter((f) => f.endsWith(".sql") && f !== "20261105062320_ingest_org_admission_fences.sql").sort()) await db.exec(read("supabase/migrations/" + f));
+  // 20261105062340 replaces 062320's release and status, so it is held back with it.
+  for (const f of readdirSync(join(root, "supabase/migrations")).filter((f) => f.endsWith(".sql") && f !== "20261105062320_ingest_org_admission_fences.sql" && f !== "20261105062340_ingest_org_erasure_history.sql").sort()) await db.exec(read("supabase/migrations/" + f));
   for (const f of readdirSync(join(root, "src/hoopdb/migrations")).filter((f) => f.endsWith(".sql")).sort()) await db.exec(read("src/hoopdb/migrations/" + f));
   // What src/hoopdb/migrate.ts does before its phase 2 verifiers (hardenAndCheck).
   await db.exec("REVOKE EXECUTE ON ALL FUNCTIONS IN SCHEMA sessions FROM PUBLIC");

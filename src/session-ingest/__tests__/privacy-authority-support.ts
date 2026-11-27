@@ -37,6 +37,8 @@ export const TURNS_FORWARD_GATES_SQL = "supabase/migrations/20261105062020_turns
 /** 062030 reads the privacy ledgers created by 041000/058010, so it is skipped with them on pending:false. */
 export const LEGACY_EXPORT_SQL = "supabase/migrations/20261105062030_legacy_export_scope_authority.sql";
 const ORG_ADMISSION_HOLD_SQL = "supabase/migrations/20261105062320_ingest_org_admission_fences.sql";
+// 062340 replaces 062320's release and status, so a profile without 062320 skips it too.
+const ORG_ERASURE_HISTORY_SQL = "supabase/migrations/20261105062340_ingest_org_erasure_history.sql";
 /** Independent prerequisite fix (also needed by mirror/frozen-supabase without C3). */
 export const LAZY_SOURCE_SQL = "supabase/migrations/20261105040000_ingest_lazy_source_tables.sql";
 /** C3 post-apply index job (non-transactional in production). */
@@ -58,7 +60,7 @@ export async function authorityFixture(opts: { pending?: boolean; lazyFix?: bool
   // while 042000/043000/043500 still apply.
   for (const f of readdirSync(join(ROOT, "supabase/migrations")).filter((f) => f.endsWith(".sql")).sort()) {
     const path = "supabase/migrations/" + f;
-    if (opts.pending === false && (path === PENDING_SQL || path === OWNER_BUFFERED_SQL || path === BUFFERED_SEARCH_GATE_SQL || path === BUFFERED_SEARCH_FEED_SQL || path === BUFFERED_SEARCH_GATE_RETIRED_SQL || path === BUFFERED_SEARCH_FEED_SAME_SECOND_SQL || path === FROZEN_COPY_PROGRESS_SQL || path === OPERATOR_USER_ERASE_SQL || path === ORIGIN_CLAIM_FENCE_SQL || path === TURNS_FORWARD_GATES_SQL || path === LEGACY_EXPORT_SQL || path === ORG_ADMISSION_HOLD_SQL)) continue;
+    if (opts.pending === false && (path === PENDING_SQL || path === OWNER_BUFFERED_SQL || path === BUFFERED_SEARCH_GATE_SQL || path === BUFFERED_SEARCH_FEED_SQL || path === BUFFERED_SEARCH_GATE_RETIRED_SQL || path === BUFFERED_SEARCH_FEED_SAME_SECOND_SQL || path === FROZEN_COPY_PROGRESS_SQL || path === OPERATOR_USER_ERASE_SQL || path === ORIGIN_CLAIM_FENCE_SQL || path === TURNS_FORWARD_GATES_SQL || path === LEGACY_EXPORT_SQL || path === ORG_ADMISSION_HOLD_SQL || path === ORG_ERASURE_HISTORY_SQL)) continue;
     if (opts.lazyFix === false && path === LAZY_SOURCE_SQL) continue;
     await db.exec(read(path));
   }

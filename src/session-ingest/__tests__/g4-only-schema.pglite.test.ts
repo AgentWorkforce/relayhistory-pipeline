@@ -249,6 +249,9 @@ describe("G4-only schema: the post-G4 objects are absent", () => {
       // entry functions replaced with their prior bodies plus one check that is a no-op until a hold is installed for
       // the org (none is, by default).
       "20261105062320_ingest_org_admission_fences.sql",
+      // The per-org erasure history for that hold's release: owner-only insert-only history tables and a recorder on
+      // each erasure source; it replaces 062320's owner-only release and status, no G4 function.
+      "20261105062340_ingest_org_erasure_history.sql",
     ]);
     expect(() => migrationFiles(REPO_ROOT, "20261105043800_typo.sql")).toThrow(/names no migration/);
     expect(OBJECTS.newFunctions.length).toBeGreaterThan(30);

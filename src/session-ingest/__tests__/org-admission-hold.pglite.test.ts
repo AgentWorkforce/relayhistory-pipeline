@@ -18,6 +18,7 @@ afterEach(async () => { for (const c of open.splice(0).reverse()) await c(); });
 type Fixture = Awaited<ReturnType<typeof authorityFixture>>;
 type Tenant = typeof TENANT;
 const SLOT = "upstream:20261105062320_ingest_org_admission_fences.sql";
+const HISTORY_SLOT = "upstream:20261105062340_ingest_org_erasure_history.sql";
 const EVIDENCE = "e".repeat(64);
 const OTHER: Tenant = { ...TENANT, orgId: "org-b", userId: "user-b" };
 
@@ -28,6 +29,8 @@ async function fixture() {
   // The lifecycle functions require this slot's ledger row (the fixture applies migrations without the migrator).
   await f.db.exec("CREATE TABLE IF NOT EXISTS sessions.__96bulls_migrations(name text PRIMARY KEY, sha256 text)");
   await f.db.query("INSERT INTO sessions.__96bulls_migrations(name) VALUES($1) ON CONFLICT DO NOTHING", [SLOT]);
+  // 062340 (the erasure history) replaces this slot's release and status; its own checks need its ledger row too.
+  await f.db.query("INSERT INTO sessions.__96bulls_migrations(name) VALUES($1) ON CONFLICT DO NOTHING", [HISTORY_SLOT]);
   return f;
 }
 async function witness(f: Fixture, tenant: Tenant, raw: any) {
@@ -173,6 +176,8 @@ describe("062320 state machine and audit", () => {
     await expect(release(f, org, e, "bridge_complete", 0)).rejects.toMatchObject({ code: "55000" });
     await f.db.query("SELECT sessions.ingest_org_admission_hold_seal($1,$2::uuid,'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb')", [org, e]);
     await f.db.query("SELECT sessions.ingest_org_admission_hold_seal($1,$2::uuid,'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb')", [org, e]); // idempotent
+    // 062340: bridge_complete needs the epoch's trusted FULL cutoff, bound while sealed (here the install time).
+    await f.db.query("SELECT sessions.ingest_org_erasure_history_bind($1,$2::uuid,(SELECT installed_at FROM sessions.ingest_org_admission_holds WHERE epoch=$2::uuid))", [org, e]);
     await f.db.query("SELECT sessions.ingest_org_admission_hold_marker_attempt($1,$2::uuid,'cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc')", [org, e]);
     await f.db.query("SELECT sessions.ingest_org_admission_hold_marker_attempt($1,$2::uuid,'cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc')", [org, e]); // before every PUT
     await expect(release(f, org, e, "verified_rollback")).rejects.toMatchObject({ code: "55000" }); // no rollback after an attempt

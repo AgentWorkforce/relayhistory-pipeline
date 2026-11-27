@@ -194,6 +194,22 @@ export const RETAINED_BY_ROLLBACK: Readonly<Record<string, readonly string[]>> =
     "trigger:ingest_org_admission_hold_events_guard@sessions.ingest_org_admission_hold_events",
     "trigger:ingest_org_admission_hold_events_truncate@sessions.ingest_org_admission_hold_events",
   ],
+  // 20261105062340: the erasure history, its coverage and bindings and their immutability guard are kept by the down as
+  // inert history; its sentinel is the bind function and the recorder on upload_deletions, which it drops.
+  "upstream:20261105062340_ingest_org_erasure_history.sql": [
+    "relation:sessions.ingest_org_erasure_history",
+    "relation:sessions.ingest_org_erasure_history_coverage",
+    "relation:sessions.ingest_org_erasure_history_bindings",
+    "index:ingest_org_erasure_history_org",
+    "index:ingest_org_erasure_history_bindings_pkey",
+    "function:sessions.ingest_org_erasure_history_guard",
+    "trigger:ingest_org_erasure_history_guard@sessions.ingest_org_erasure_history",
+    "trigger:ingest_org_erasure_history_truncate@sessions.ingest_org_erasure_history",
+    "trigger:ingest_org_erasure_history_coverage_guard@sessions.ingest_org_erasure_history_coverage",
+    "trigger:ingest_org_erasure_history_coverage_truncate@sessions.ingest_org_erasure_history_coverage",
+    "trigger:ingest_org_erasure_history_bindings_guard@sessions.ingest_org_erasure_history_bindings",
+    "trigger:ingest_org_erasure_history_bindings_truncate@sessions.ingest_org_erasure_history_bindings",
+  ],
 };
 
 /** How an ADOPTABLE_INDEXES step is prebuilt, and what else its CREATE inventory names. */
@@ -686,6 +702,10 @@ export const MIGRATION_SENTINELS: Record<string, Sentinel> = {
   "upstream:20261105062320_ingest_org_admission_fences.sql": {
     evidence: "function sessions.ingest_org_admission_hold_check(text,text) and the batch backstop trigger on sessions.ingest_batches (the per-org admission hold)",
     sql: "SELECT to_regprocedure('sessions.ingest_org_admission_hold_check(text,text)') IS NOT NULL AND EXISTS(SELECT 1 FROM pg_trigger WHERE tgrelid=to_regclass('sessions.ingest_batches') AND tgname='ingest_org_admission_hold_batch_backstop' AND NOT tgisinternal) AS applied",
+  },
+  "upstream:20261105062340_ingest_org_erasure_history.sql": {
+    evidence: "function sessions.ingest_org_erasure_history_bind(text,uuid,timestamptz) and the recorder trigger on sessions.upload_deletions (the per-org erasure history)",
+    sql: "SELECT to_regprocedure('sessions.ingest_org_erasure_history_bind(text,uuid,timestamptz)') IS NOT NULL AND EXISTS(SELECT 1 FROM pg_trigger WHERE tgrelid=to_regclass('sessions.upload_deletions') AND tgname='ingest_org_erasure_history_record' AND NOT tgisinternal) AS applied",
   },
   "upstream:20261105062070_coordination_advisor_readers.sql": {
     evidence: "functions sessions.coordination_advisor_write_facts_v1 and sessions.coordination_advisories_recent_v1",

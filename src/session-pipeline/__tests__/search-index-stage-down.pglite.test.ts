@@ -52,7 +52,11 @@ const KEPT = { table: "sessions.search_stage_archive", index: "sessions.search_s
 // 20261105062320 (the per-org admission hold) sits above 062300 and its down refuses while it is applied: roll it back
 // first (it has no hold installed here), so 062300 is newest whenever its own down is exercised.
 const HOLD_DOWN = readFileSync(join(import.meta.dir, "../../../supabase/rollbacks/20261105062320_ingest_org_admission_fences.down.sql"), "utf8");
+const HISTORY_DOWN = readFileSync(join(import.meta.dir, "../../../supabase/rollbacks/20261105062340_ingest_org_erasure_history.down.sql"), "utf8");
 const holdOff = async (pg: PGlite) => {
+  // 20261105062340 (the erasure history) sits above 062320 and is rolled back first.
+  const history = (await pg.query<{ n: number }>("SELECT count(*)::int AS n FROM sessions.__96bulls_migrations WHERE name = 'upstream:20261105062340_ingest_org_erasure_history.sql'")).rows[0]!.n;
+  if (history) await pg.exec(HISTORY_DOWN);
   const applied = (await pg.query<{ n: number }>("SELECT count(*)::int AS n FROM sessions.__96bulls_migrations WHERE name = 'upstream:20261105062320_ingest_org_admission_fences.sql'")).rows[0]!.n;
   if (applied) await pg.exec(HOLD_DOWN);
 };
