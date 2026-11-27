@@ -40,6 +40,7 @@
  * $RUNNER_TEMP/backlog-ops-out and echoed to the log. The step's exit code is the tool's.
  */
 import { spawn } from "node:child_process";
+import { createHash } from "node:crypto";
 import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -127,13 +128,15 @@ export function backlogOpsChildSpawn(
   // The authority modes: the Cloudflare token (and, for the execute, the bound baseline and the ledger bucket's name
   // for the sweeper's home check) on stdin. A catch-up bound to an authority-dry: that run's evidence on stdin.
   const cfToken = backlogOpsCloudflareToken(env, d);
-  const wantsEvidence = isCatchup(d.mode) && d.authorityRun !== null, wantsBaseline = d.mode === "authority-execute";
+  const wantsEvidence = isCatchup(d.mode) && d.authorityRun !== null, wantsBaseline = d.mode === "authority-execute", wantsFull = isBridge(d.mode);
+  if (wantsFull !== (bound.fullEvidence !== undefined) || (wantsFull && !/^[0-9a-f]{64}$/u.test(bound.fullEvidence!))) refuse("backlog_ops_authority_binding");
   if (wantsEvidence !== (bound.evidence !== undefined) || wantsBaseline !== (bound.baseline !== undefined) || (cfToken !== null && dbUrl === null))
     refuse("backlog_ops_authority_binding");
   let payload: Record<string, unknown> = session !== null ? { dbUrl, session } : exportNhp !== null ? { dbUrl, noHeadParityOrgs: exportNhp.orgs } : { dbUrl };
   if (cfToken !== null) payload = { dbUrl, cloudflareToken: cfToken,
     ...(wantsBaseline ? { baseline: bound.baseline, ledgerBucket: backlogOpsLedgerTarget(env, t)?.bucket ?? null } : {}) };
   if (wantsEvidence) payload = { dbUrl, authorityEvidence: bound.evidence };
+  if (wantsFull) payload = { dbUrl, fullEvidence: bound.fullEvidence };
   return {
     command: process.execPath,
     args: [join(ROOT, spec.script), ...spec.args],
@@ -149,7 +152,7 @@ export function backlogOpsChildSpawn(
  * a catch-up execute's DRY) must have recorded the gate's t (`revisionsSinceMs`), so it bound the same FULL.
  */
 /** What the authority bindings hand the tool: an authority-dry's evidence (a catch-up), a catch-up's baseline (authority-execute). */
-export interface BoundAuthority { evidence?: unknown; baseline?: unknown }
+export interface BoundAuthority { evidence?: unknown; baseline?: unknown; /** A bridge mode: sha256 of the bound FULL receipt's exact bytes. */ fullEvidence?: string }
 export function checkBoundReceipts(env: Record<string, string | undefined>, d: BacklogOpsDispatch, read = (p: string) => readFileSync(p, "utf8"),
   revisionsSinceMs: number | null = backlogOpsRevisionsSince(env, d)): BoundAuthority {
   const paths = backlogOpsPaths(env), scopeFull = backlogOpsScope(env), scope = scopeFull.id;
@@ -205,6 +208,9 @@ export function checkBoundReceipts(env: Record<string, string | undefined>, d: B
     if (b.kind === "authority") authority.evidence = checkAuthorityDryReceipt(raw, orgs!);
     if (d.mode === "authority-execute" && b.kind === "dry") checkAuthorityDryReceipt(raw, orgs!);
     if (d.mode === "authority-execute" && b.kind === "backfill") authority.baseline = checkBaselineReceipt(raw, orgs!, d.dryRun!, d.fullBackfillRun!);
+    // A bridge mode: the bound FULL receipt's sha256 (over its exact downloaded bytes), compared by the tool to the
+    // 062340 binding's selected_full.evidence_sha256 (the seal's evidence).
+    if (isBridge(d.mode) && b.kind === "full") authority.fullEvidence = createHash("sha256").update(raw, "utf8").digest("hex");
   }
   if (d.mode === "drain-execute" && d.fullBackfillRun !== null) {
     if (raws.full === undefined || raws.backfill === undefined) refuse("backlog_ops_bound_full_missing");

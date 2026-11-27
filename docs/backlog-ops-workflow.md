@@ -465,21 +465,32 @@ needs:
 - serialized writer checks;
 - a comparison of the dry receipt's `full_run` with its selected FULL.
 
-With slot 062340 (draft contract on review/org-erasure-history @ 8b8ab09e), the hold status also
-carries `erasure_history`. The fields are `cutoff` (bound per epoch after the seal by
-`ingest_org_erasure_history_bind`), `covered`, `recording`, `coverage_started_at` and `by_source`.
-`erasures` then counts the history rows for the org since the bound cutoff. `bridge-dry` reads that
-history in the same statement as the per-source counts, and:
-- checks in SQL, at microsecond precision, that the bound cutoff equals this run's FULL cutoff
-  exactly;
-- requires `covered` and `recording`;
-- requires `by_source` to agree with `erasures`.
+With slot 062340 (review/org-erasure-history @ adc8f8f5), the hold status also carries two things:
+- `erasure_history`, the history fence: `fence_at`, which is always the hold's `installed_at`, plus
+  `covered`, `recording` (a continuity check since the apply), `coverage_started_at` and `by_source`.
+  `erasures` counts the history rows for the org since `fence_at`.
+- `selected_full`, the FULL bound by the post-seal `_bind`: `run`, `started_at`, `started_ms` and
+  `evidence_sha256`. It is null until `_bind` runs.
 
-The closed reasons are `history_unbound`, `history_cutoff_mismatch`, `history_not_covering_cutoff`,
-`history_not_recording` and `erasures_in_history`. An inconsistent history is `read_invalid`.
+`bridge-dry` reads both in the same statement as the per-source counts. Each of these checks is
+independent and has its own closed reason:
+- `fence_at` equals the hold's `installed_at` exactly, in SQL, at stored precision
+  (`history_cutoff_mismatch`).
+- The bound FULL is this run's, compared only to `selected_full` and never to the fence
+  (`history_full_mismatch`):
+  - its `run` equals the dispatch's `full_backfill_run`;
+  - its `started_ms` equals the FULL's start as the gate knows it, its created_at, which is the
+    cutoff plus the 15-minute margin;
+  - its `evidence_sha256` equals the sha256 of the bound FULL receipt's exact downloaded bytes. The
+    credential step computes that digest and hands it to the tool on stdin.
+- `installed_at` < start ≤ `sealed_at`, with the start built exactly from `started_ms` in SQL
+  (`history_full_order_invalid`).
+- `covered` and `recording` hold (`history_not_covering_cutoff`, `history_not_recording`), and
+  `by_source` sums to `erasures`, which is 0 for an empty window.
 
-Without `erasure_history` (062320 alone), the proof is a snapshot only. A test pins `ERASURE_SOURCES`
-to 062340's `ORG_ERASURE_HISTORY_SOURCES` once that file is on the branch.
+Separately, persistence still requires each proof's snapshot `cutoff_ms` to equal the gate-derived FULL
+cutoff. Without 062340 (062320 alone) the proof is a snapshot only. A test pins `ERASURE_SOURCES` to
+062340's `ORG_ERASURE_HISTORY_SOURCES` once that file is on the branch.
 
 `bridge-execute` is HELD in code (`BACKLOG_OPS_BRIDGE_EXECUTE_ENABLED`), and its tool refuses
 (`bridge_release_held`) until slot 062320 lands.

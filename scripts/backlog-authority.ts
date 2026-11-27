@@ -21,7 +21,7 @@ import pg from "pg";
 import { createS3Store, type ObjectStore } from "../src/shared/vendor.ts";
 import { ownerClientConfig } from "../src/shared/owner-pg-config.ts";
 import { AUTHORITY_EVIDENCE, authorityEvidence, authorityOrgs, type AuthorityEvidenceSources } from "../src/session-ingest/authority-evidence.ts";
-import { BACKLOG_OPS_AUTHORITY_EXECUTE_ENABLED } from "../src/session-ingest/backlog-ops.ts";
+import { BACKLOG_OPS_AUTHORITY_EXECUTE_ENABLED, BACKLOG_OPS_CATCHUP_MARGIN_MS } from "../src/session-ingest/backlog-ops.ts";
 import {
   AUTHORITY_TOOL_REFUSALS,
   BACKLOG_AUTHORITY_KEY_ROOT,
@@ -38,12 +38,15 @@ import { ERASURE_WINDOW_SQL, erasureWindowProof } from "../src/session-ingest/er
  * bridge-dry: each org's erasure-window proof, READ BY THE TOOL (never a caller-supplied set): one statement per org in
  * its own READ ONLY transaction, the counts and the 062320 status (hold, erasure watermark) in one snapshot.
  */
-export async function bridgeWindow(orgs: readonly string[], cutoffMs: number, sql: AuthorityEvidenceSources["sql"], fullRun: string | null = null) {
+export async function bridgeWindow(orgs: readonly string[], cutoffMs: number, sql: AuthorityEvidenceSources["sql"], fullRun: string | null = null,
+  fullEvidence: string | null = null) {
+  // The FULL's start as the gate knows it: its run's created_at, i.e. the cutoff plus the fixed catch-up margin.
+  const fullStartedMs = cutoffMs + BACKLOG_OPS_CATCHUP_MARGIN_MS;
   const per = [];
   for (const org of orgs) {
     let rows: readonly Record<string, unknown>[] = [];
     try { rows = await sql(ERASURE_WINDOW_SQL, [org, String(cutoffMs)]); } catch { rows = []; }
-    per.push(erasureWindowProof(org, null, cutoffMs, rows, fullRun));
+    per.push(erasureWindowProof(org, null, cutoffMs, rows, fullRun, fullEvidence, fullStartedMs));
   }
   return { mode: "dry_run" as const, tool: "bridge_window", org_count: orgs.length, all_empty: per.every((p) => p.status === "erasure_window_empty"), per_org: per };
 }
@@ -83,13 +86,15 @@ function authorityOrgsOr(orgs: readonly string[]): string[] {
 
 /** The stdin payload: exactly the keys `keys`, each checked. */
 /** bridge-window's stdin: exactly {"dbUrl": ...} (no Cloudflare token: it reads SQL only). */
-export function bridgeStdin(line: string): { dbUrl: string } {
+export function bridgeStdin(line: string): { dbUrl: string; fullEvidence: string } {
   if (line.length > 64 * 1024) fail("stdin_too_large");
   let p: unknown;
   try { p = JSON.parse(line); } catch { return fail("stdin_invalid"); }
-  if (p === null || typeof p !== "object" || Array.isArray(p) || Object.keys(p).length !== 1 || typeof (p as { dbUrl?: unknown }).dbUrl !== "string" ||
-      (p as { dbUrl: string }).dbUrl === "") fail("db_url_required");
-  return p as { dbUrl: string };
+  const o = p as Record<string, unknown>;
+  if (p === null || typeof p !== "object" || Array.isArray(p) || Object.keys(o).length !== 2 || typeof o.dbUrl !== "string" || o.dbUrl === "") fail("db_url_required");
+  // The bound FULL receipt's sha256, computed by the credential step from the receipt it downloaded and checked.
+  if (typeof o.fullEvidence !== "string" || !/^[0-9a-f]{64}$/u.test(o.fullEvidence)) fail("stdin_invalid");
+  return o as { dbUrl: string; fullEvidence: string };
 }
 
 export function authorityStdin(line: string, command: AuthorityArgs["command"]): { dbUrl: string; cloudflareToken: string; baseline?: unknown; ledgerBucket?: string | null } {
@@ -143,13 +148,13 @@ export async function main(argv: readonly string[], env: NodeJS.ProcessEnv): Pro
   }
   if (args.command === "bridge-release") fail("bridge_release_held");
   if (args.command === "bridge-window") {
-    const { dbUrl } = bridgeStdin(readFileSync(0, "utf8").split("\n")[0] ?? "");
+    const { dbUrl, fullEvidence } = bridgeStdin(readFileSync(0, "utf8").split("\n")[0] ?? "");
     const b = ownerClientConfig(dbUrl, "96bulls-backlog-bridge");
     const db = new pg.Client({ ...b, options: `${b.options ?? ""} -c default_transaction_read_only=on`.trim(), keepAlive: true });
     db.on("error", () => {});
     await db.connect();
     try {
-      const summary = await bridgeWindow(args.orgs, args.cutoffMs!, readOnlySql(db), args.fullRun!);
+      const summary = await bridgeWindow(args.orgs, args.cutoffMs!, readOnlySql(db), args.fullRun!, fullEvidence);
       return { summary, ok: summary.all_empty };
     } finally { await db.end().catch(() => {}); }
   }

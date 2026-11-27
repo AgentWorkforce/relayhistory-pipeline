@@ -17,6 +17,7 @@ import { SCHEMA_RELEASE as P } from "../../hoopdb/schema-release-contract.ts";
 import { BACKLOG_OPS_RECEIPT_CONTRACT, backlogOpsHomeId } from "../backlog-ops.ts";
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
+import { createHash } from "node:crypto";
 import { authorityReceiptSummary } from "../backlog-authority-schema.ts";
 import {
   BACKLOG_OPS_BRIDGE_EXECUTE_ENABLED, backlogOpsBindings, backlogOpsConfirmation, backlogOpsDispatch, backlogOpsRevisionsSince, backlogOpsScope, backlogOpsTarget,
@@ -30,7 +31,14 @@ import { applySupabaseSchema } from "./pglite-schema.ts";
 
 setDefaultTimeout(300_000);
 /** Every proof in these tests binds the FULL run FULL (the dry dispatch's full_backfill_run). */
-const proof = (org: string, epoch: string | null, cut: number, rows: readonly Record<string, unknown>[]) => erasureWindowProof(org, epoch, cut, rows, FULL);
+/** The bound FULL receipt's sha256, and the FULL's start as the gate knows it (created_at = cutoff + the 15-min margin). */
+const EV = "e".repeat(64);
+const startedFor = (cut: number) => cut + 15 * 60_000;
+const proof = (org: string, epoch: string | null, cut: number, rows: readonly Record<string, unknown>[]) =>
+  erasureWindowProof(org, epoch, cut, rows, FULL, EV, startedFor(cut));
+/** 062340's final shape (adc8f8f5): the history fence, and the selected FULL bound to the epoch. */
+const selected = (cut: number, over: Record<string, unknown> = {}) => ({ run: FULL, started_at: new Date(startedFor(cut)).toISOString(), started_ms: startedFor(cut),
+  evidence_sha256: EV, ...over });
 const ORG = "11111111-2222-4333-8444-555555555555", ORG2 = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee";
 const E = "0f0e0d0c-0b0a-4908-8706-050403020100", E2 = "1f0e0d0c-0b0a-4908-8706-050403020100";
 const NOW = Date.parse("2026-11-27T12:00:00Z"), CUT = NOW - 6 * 3600_000, SEALED = NOW - 3600_000;
@@ -117,53 +125,55 @@ test("the read: an upload deletion, an in-flight old user erase, a fence in the 
   expect(proof(ORG, null, CUT, await read(ORG)).status).toBe("erasure_window_empty");
 });
 
-test("revised 062340 (real PGlite): cutoff = the hold's installed_at, the bound FULL is this run's and started after install, no later than seal", async () => {
+test("final 062340 (real PGlite): fence_at = the hold's installed_at; the FULL only against selected_full (run, started_ms, evidence); install < start <= seal", async () => {
   const d = await db();
-  const cut = Date.parse("2026-11-27T12:00:00.000Z"); // the gate's FULL cutoff: snapshot counts only
+  const cut = Date.parse("2026-11-27T12:00:00.000Z"); // the gate's FULL cutoff; the FULL started at cut + 15 min
   const ORG3 = "33333333-2222-4333-8444-555555555555";
   const set = async (st: Record<string, unknown>) =>
     d.query("INSERT INTO sessions._stub_hold VALUES ($1, $2::jsonb) ON CONFLICT (org) DO UPDATE SET status = EXCLUDED.status", [ORG3, JSON.stringify(st)]);
-  const proofAt = async (fullRun: string | null = FULL) => {
+  const proofAt = async () => {
     let rows: readonly Record<string, unknown>[] = [];
     try { rows = (await d.query<Record<string, unknown>>(ERASURE_WINDOW_SQL, [ORG3, String(cut)])).rows; } catch { rows = []; }
-    const p = erasureWindowProof(ORG3, null, cut, rows, fullRun);
+    const p = erasureWindowProof(ORG3, null, cut, rows, FULL, EV, startedFor(cut));
     expect(authorityReceiptSummary("bridge", JSON.parse(JSON.stringify({ mode: "dry_run", tool: "bridge_window", org_count: 1, all_empty: p.status === "erasure_window_empty",
       per_org: [p] })), { orgs: [ORG3], cutoffMs: cut }).ok).toBe(true);
     return [p.status, p.reason];
   };
-  // installed 11:00:00.123456, sealed 13:00 (after the read's statement time? no: read happens now, after both).
   const installed = "2026-11-27T11:00:00.123456Z";
   const hold = sealedHold({ installed_at: installed, sealed_at: "2026-11-27T13:00:00Z" });
-  const hist = (h: Record<string, unknown> = {}) => ({ hold, erasures: 0,
-    erasure_history: { cutoff: installed, full_run: FULL, full_started_at: "2026-11-27T11:30:00Z", covered: true, recording: true, by_source: {},
-      coverage_started_at: "2026-11-20T00:00:00Z", ...h } });
-  await set(hist());
-  expect(await proofAt()).toEqual(["erasure_window_empty", "ok"]); // cutoff exactly installed_at, at microseconds
-  await set(hist({ cutoff: "2026-11-27T11:00:00.123457Z" }));
-  expect(await proofAt()).toEqual(["erasure_window_unproven", "history_cutoff_mismatch"]); // +1 us
-  await set(hist({ cutoff: "2026-11-27T11:00:00.123455Z" }));
-  expect(await proofAt()).toEqual(["erasure_window_unproven", "history_cutoff_mismatch"]); // -1 us
-  await set(hist({ cutoff: "2026-11-27T11:00:00.123Z" }));
-  expect(await proofAt()).toEqual(["erasure_window_unproven", "history_cutoff_mismatch"]); // truncated to ms is not equal
-  // The bound FULL: exactly this run's, never inferred from caller input.
-  expect(await (async () => { await set(hist({ full_run: "999" })); return proofAt(); })()).toEqual(["erasure_window_unproven", "history_full_mismatch"]);
-  await set(hist());
-  expect(await proofAt(null)).toEqual(["erasure_window_unproven", "history_full_mismatch"]);
-  // Its start: strictly after the install, no later than the seal.
-  await set(hist({ full_started_at: installed }));
+  const st = (eh: Record<string, unknown> = {}, sf: Record<string, unknown> | null = {}) => ({ hold, erasures: 0,
+    selected_full: sf === null ? null : selected(cut, sf),
+    erasure_history: { fence_at: installed, covered: true, recording: true, by_source: {}, coverage_started_at: "2026-11-20T00:00:00Z", ...eh } });
+  await set(st());
+  expect(await proofAt()).toEqual(["erasure_window_empty", "ok"]);
+  // The fence: exactly installed_at, at microseconds.
+  for (const f of ["2026-11-27T11:00:00.123457Z", "2026-11-27T11:00:00.123455Z", "2026-11-27T11:00:00.123Z"]) {
+    await set(st({ fence_at: f }));
+    expect(await proofAt()).toEqual(["erasure_window_unproven", "history_cutoff_mismatch"]);
+  }
+  // The selected FULL: exactly this run's run id, start and evidence.
+  for (const sf of [{ run: "999" }, { started_ms: startedFor(cut) + 1 }, { evidence_sha256: "0".repeat(64) }]) {
+    await set(st({}, sf));
+    expect(await proofAt()).toEqual(["erasure_window_unproven", "history_full_mismatch"]);
+  }
+  // install < start <= seal, from started_ms (the SQL builds it exactly). Matching start values are needed so the
+  // ordering, not the identity, is what refuses: change the hold instead.
+  const setHold = async (h: Record<string, unknown>) => set({ ...st(), hold: sealedHold({ installed_at: installed, sealed_at: "2026-11-27T13:00:00Z", ...h }) });
+  await setHold({ installed_at: new Date(startedFor(cut)).toISOString() }); // install == start: not strictly after
+  expect(await proofAt()).toEqual(["erasure_window_unproven", "history_cutoff_mismatch"]); // (fence no longer = installed_at)
+  await set({ ...st({ fence_at: new Date(startedFor(cut)).toISOString() }), hold: sealedHold({ installed_at: new Date(startedFor(cut)).toISOString(), sealed_at: "2026-11-27T13:00:00Z" }) });
   expect(await proofAt()).toEqual(["erasure_window_unproven", "history_full_order_invalid"]);
-  await set(hist({ full_started_at: "2026-11-27T13:00:00.000001Z" }));
+  await setHold({ sealed_at: new Date(startedFor(cut) - 1).toISOString() }); // seal before start
   expect(await proofAt()).toEqual(["erasure_window_unproven", "history_full_order_invalid"]);
-  await set(hist({ full_started_at: "2026-11-27T13:00:00Z" }));
-  expect(await proofAt()).toEqual(["erasure_window_empty", "ok"]); // equal to the seal is allowed
-  await set(hist({ cutoff: null, full_run: null, full_started_at: null, covered: null, by_source: null }));
-  await set({ ...hist({ cutoff: null, full_run: null, full_started_at: null, covered: null, by_source: null }), erasures: null });
+  await setHold({ sealed_at: new Date(startedFor(cut)).toISOString() }); // start == seal: allowed
+  expect((await proofAt())[1]).not.toBe("history_full_order_invalid");
+  // Unbound, malformed, not recording; 062320 alone stays snapshot-only.
+  await set({ ...st({ fence_at: null, covered: null, by_source: null }, null), erasures: null });
   expect(await proofAt()).toEqual(["erasure_window_unproven", "history_unbound"]);
-  await set(hist({ cutoff: "bad" }));
+  await set(st({ fence_at: "bad" }));
   expect(await proofAt()).toEqual(["erasure_window_unproven", "read_invalid"]);
-  await set(hist({ recording: false }));
+  await set(st({ recording: false }));
   expect(await proofAt()).toEqual(["erasure_window_unproven", "history_not_recording"]);
-  // 062320 alone: snapshot-only.
   await set({ hold, erasures: 0 });
   expect(await proofAt()).toEqual(["erasure_window_empty", "ok"]);
 });
@@ -191,12 +201,21 @@ test("the proof is empty only with every count 0, a live sealed or attempted hol
   // 062340's erasure history: bound at exactly this cutoff (SQL decides history_cutoff_matches), covered, recording,
   // self-consistent; otherwise held with a closed reason. Without it (062320 alone) the proof is snapshot-only.
   const eh = (h: Record<string, unknown>, erasures: unknown = 0, matches: unknown = true) =>
-    row({ status: { hold: sealedHold(), erasures, erasure_history: { cutoff: "2026-11-27T06:00:00Z", full_run: FULL, full_started_at: "2026-11-27T07:00:00Z", covered: true, recording: true, by_source: {},
+    row({ status: { hold: sealedHold(), erasures, selected_full: selected(CUT), erasure_history: { fence_at: "2026-11-27T06:00:00Z", covered: true, recording: true, by_source: {},
       coverage_started_at: "2026-11-20T00:00:00Z", ...h } }, history_cutoff_matches: matches, history_full_ordered: true });
   expect(proof(ORG, null, CUT, [eh({})]).watermark_kind).toBe("erasure_history_all_sources");
   expect(reason([eh({})])).toBe("ok");
-  expect(reason([eh({ cutoff: null }, null, null)])).toBe("history_unbound");
+  expect(reason([eh({ fence_at: null }, null, null)])).toBe("history_unbound");
   expect(reason([eh({}, 0, false)])).toBe("history_cutoff_mismatch");
+  // The selected FULL is compared exactly (run, started_ms, evidence) and never to the fence; unbound when absent.
+  const withFull = (sf: unknown) => row({ status: { hold: sealedHold(), erasures: 0, selected_full: sf, erasure_history: { fence_at: "2026-11-27T06:00:00Z", covered: true,
+    recording: true, by_source: {}, coverage_started_at: "2026-11-20T00:00:00Z" } }, history_cutoff_matches: true, history_full_ordered: true });
+  expect(reason([withFull(selected(CUT))])).toBe("ok");
+  expect(reason([withFull(null)])).toBe("history_unbound");
+  for (const bad of [{ run: "999" }, { started_ms: startedFor(CUT) + 1 }, { started_ms: startedFor(CUT) - 1 }, { evidence_sha256: "f".repeat(64) }, { run: 444 }])
+    expect(reason([withFull(selected(CUT, bad))])).toBe("history_full_mismatch");
+  expect(erasureWindowProof(ORG, null, CUT, [withFull(selected(CUT))], FULL, null, startedFor(CUT)).reason).toBe("history_full_mismatch"); // no evidence bound
+  expect(erasureWindowProof(ORG, null, CUT, [withFull(selected(CUT))], FULL, EV, null).reason).toBe("history_full_mismatch"); // no start bound
   expect(reason([eh({ covered: false })])).toBe("history_not_covering_cutoff");
   expect(reason([eh({ recording: false })])).toBe("history_not_recording");
   expect(reason([eh({ by_source: { upload_deletions: 2 } }, 2)])).toBe("erasures_in_history");
@@ -226,7 +245,7 @@ test("release on an empty window: refused unconditionally on this head, whatever
   const today = proof(ORG, null, CUT, [row()]);
   expect(today.watermark_kind).toBe("surviving_two_tables");
   // Even a proof that read 062340's history (empty, bound, covered, recording) is refused on this head.
-  const declared = proof(ORG, null, CUT, [row({ status: { hold: sealedHold(), erasures: 0, erasure_history: { cutoff: "2026-11-27T06:00:00Z", full_run: FULL, full_started_at: "2026-11-27T07:00:00Z", covered: true,
+  const declared = proof(ORG, null, CUT, [row({ status: { hold: sealedHold(), erasures: 0, selected_full: selected(CUT), erasure_history: { fence_at: "2026-11-27T06:00:00Z", covered: true,
     recording: true, by_source: {}, coverage_started_at: "2026-11-20T00:00:00Z" } }, history_cutoff_matches: true, history_full_ordered: true })]);
   expect([declared.status, declared.watermark_kind]).toEqual(["erasure_window_empty", "erasure_history_all_sources"]);
   for (const p of [today, declared, { ...declared, watermark_kind: "erasure_history_all_sources" }, null, {}])
@@ -316,7 +335,15 @@ test("bridge-dry through the normal runner (scripts/backlog-ops.ts): the logged 
       exit = await backlogOpsRun({ ...target, ...SCOPE, ...env("bridge-dry"), GITHUB_SHA: sha, GITHUB_RUN_ID: "900", RUNNER_TEMP: temp,
         BACKLOG_OPS_REVISIONS_SINCE_MS: String(CUT), ACTIONS_ID_TOKEN_REQUEST_URL: "https://token.example/x", ACTIONS_ID_TOKEN_REQUEST_TOKEN: "bearer",
         SUPABASE_MIGRATION_OWNER_URL: `postgresql://${P.owner}.${P.project}:p%40ss@${P.host}:${P.port}/${P.database}?sslmode=verify-full` },
-        { fetcher, runChild: async (child) => { expect(child.args.slice(1, 4)).toEqual(["bridge-window", "--cutoff-ms", String(CUT)]); return { code: 0, stdout: JSON.stringify(s) }; } });
+        { fetcher, runChild: async (child) => {
+          expect(child.args.slice(1, 6)).toEqual(["bridge-window", "--cutoff-ms", String(CUT), "--full-run", FULL]);
+          // The bound FULL receipt's sha256 over its exact downloaded bytes, on stdin only (the seal's evidence to match).
+          const raw = readFileSync(join(temp, "backlog-ops-bound", "full", "backlog-ops-receipt.json"), "utf8");
+          const input = JSON.parse(child.input!);
+          expect(Object.keys(input).sort()).toEqual(["dbUrl", "fullEvidence"]);
+          expect(input.fullEvidence).toBe(createHash("sha256").update(raw, "utf8").digest("hex"));
+          expect(child.args.join(" ")).not.toContain(input.fullEvidence);
+          return { code: 0, stdout: JSON.stringify(s) }; } });
     } finally { console.log = log; }
     const logged = JSON.parse(lines.find((l) => l.startsWith("backlog_ops_receipt "))!.slice("backlog_ops_receipt ".length));
     const saved = JSON.parse(readFileSync(join(temp, "backlog-ops-out", "backlog-ops-receipt.json"), "utf8"));
@@ -333,7 +360,7 @@ test("bridge-dry through the normal runner (scripts/backlog-ops.ts): the logged 
 
 test("contradictory bridge evidence is refused at validation and at persistence (normal runner)", async () => {
   // The reviewer's negative: a real positive proof (history counted 2) relabelled empty/ok.
-  const positive = proof(ORG, null, CUT, [row({ status: { hold: sealedHold(), erasures: 2, erasure_history: { cutoff: "2026-11-27T06:00:00Z", full_run: FULL, full_started_at: "2026-11-27T07:00:00Z", covered: true,
+  const positive = proof(ORG, null, CUT, [row({ status: { hold: sealedHold(), erasures: 2, selected_full: selected(CUT), erasure_history: { fence_at: "2026-11-27T06:00:00Z", covered: true,
     recording: true, by_source: { upload_deletions: 2 }, coverage_started_at: "2026-11-20T00:00:00Z" } }, history_cutoff_matches: true, history_full_ordered: true })]);
   expect([positive.status, positive.reason, positive.watermark_erasures]).toEqual(["erasure_window_nonempty", "erasures_in_history", 2]);
   const relabelled = { ...positive, status: "erasure_window_empty", reason: "ok" };

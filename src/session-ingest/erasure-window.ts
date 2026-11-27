@@ -67,11 +67,13 @@ SELECT ${(Object.entries(ERASURE_SOURCES) as [string, string][]).map(([t, w]) =>
        st.j AS status,
        -- 062340 (revised): the bound cutoff IS the hold's installed_at; the bound FULL started strictly after the install
        -- and no later than the seal. Both compared in SQL at full timestamptz precision.
-       CASE WHEN st.j->'erasure_history'->>'cutoff' IS NULL THEN NULL
-            ELSE (st.j->'erasure_history'->>'cutoff')::timestamptz = (st.j->'hold'->>'installed_at')::timestamptz END AS history_cutoff_matches,
-       CASE WHEN st.j->'erasure_history'->>'full_started_at' IS NULL THEN NULL
-            ELSE (st.j->'hold'->>'installed_at')::timestamptz < (st.j->'erasure_history'->>'full_started_at')::timestamptz
-             AND (st.j->'erasure_history'->>'full_started_at')::timestamptz <= (st.j->'hold'->>'sealed_at')::timestamptz END AS history_full_ordered,
+       CASE WHEN st.j->'erasure_history'->>'fence_at' IS NULL THEN NULL
+            ELSE (st.j->'erasure_history'->>'fence_at')::timestamptz = (st.j->'hold'->>'installed_at')::timestamptz END AS history_cutoff_matches,
+       -- installed_at < the FULL's start <= sealed_at, the start built exactly from selected_full.started_ms (integer ms).
+       CASE WHEN st.j->'selected_full'->>'started_ms' IS NULL THEN NULL
+            ELSE (st.j->'hold'->>'installed_at')::timestamptz < timestamptz 'epoch' + (st.j->'selected_full'->>'started_ms')::bigint * interval '1 millisecond'
+             AND timestamptz 'epoch' + (st.j->'selected_full'->>'started_ms')::bigint * interval '1 millisecond' <= (st.j->'hold'->>'sealed_at')::timestamptz
+            END AS history_full_ordered,
        floor(extract(epoch FROM statement_timestamp()) * 1000)::bigint AS read_at_ms
 FROM st CROSS JOIN c`;
 
@@ -119,7 +121,7 @@ export const orgHash = (org: string) => "h_" + createHash("sha256").update(`auth
  * history's bound full_run must equal it exactly (history_full_mismatch otherwise); null when the caller binds none.
  */
 export function erasureWindowProof(org: string, epoch: string | null, cutoffMs: number, rows: readonly Record<string, unknown>[],
-  fullRun: string | null = null): ErasureWindowProof {
+  fullRun: string | null = null, fullEvidence: string | null = null, fullStartedMs: number | null = null): ErasureWindowProof {
   if (!UUID.test(org) || (epoch !== null && !UUID.test(epoch)) || !Number.isSafeInteger(cutoffMs) || cutoffMs < 1) throw Object.assign(new Error("erasure_window_input"), { code: "erasure_window_input" });
   const base: ErasureWindowProof = { v: 1, kind: "erasure_window_proof", status: "erasure_window_unproven", reason: "read_invalid", org_hash: orgHash(org), epoch_hash: epoch === null ? null : epochHash(epoch),
     cutoff_ms: cutoffMs, read_at_ms: null, watermark_erasures: null, hold_state: null, sources: null, watermark_kind: "surviving_two_tables" };
@@ -164,12 +166,21 @@ export function erasureWindowProof(org: string, epoch: string | null, cutoffMs: 
   // 062340: the history must be bound to this epoch at exactly this run's FULL cutoff (SQL compares it), cover that
   // cutoff, be recording, and agree with itself (by_source sums to erasures, only known sources).
   const held = { ...out, hold_state: state };
-  if (eh!.cutoff === null || watermark === null) return { ...held, reason: "history_unbound" };
+  // 062340 (final names, adc8f8f5): erasure_history {fence_at, covered, recording, coverage_started_at, by_source};
+  // selected_full {run, started_at, started_ms, evidence_sha256}, null until _bind.
+  const sf = s.selected_full as Record<string, unknown> | null | undefined;
+  if (eh!.fence_at === null || eh!.fence_at === undefined || watermark === null || sf === null || sf === undefined) return { ...held, reason: "history_unbound" };
+  if (typeof sf !== "object" || Array.isArray(sf)) return held;
   // The cutoff is the hold's install (SQL); the bound FULL is this run's FULL, started after the install and no later
   // than the seal (SQL).
   if (typeof r.history_cutoff_matches !== "boolean") return held;
   if (r.history_cutoff_matches !== true) return { ...held, reason: "history_cutoff_mismatch" };
-  if (fullRun === null || typeof eh!.full_run !== "string" || eh!.full_run !== fullRun) return { ...held, reason: "history_full_mismatch" };
+  // The bound FULL is exactly this run's: its run id, its start (integer ms), and its receipt's sha256 (the seal's
+  // evidence). Compared only to selected_full, never to fence_at.
+  if (fullRun === null || typeof sf.run !== "string" || sf.run !== fullRun) return { ...held, reason: "history_full_mismatch" };
+  const startedMs = count(sf.started_ms);
+  if (fullStartedMs === null || startedMs === null || startedMs !== fullStartedMs) return { ...held, reason: "history_full_mismatch" };
+  if (fullEvidence === null || typeof sf.evidence_sha256 !== "string" || sf.evidence_sha256 !== fullEvidence) return { ...held, reason: "history_full_mismatch" };
   if (typeof r.history_full_ordered !== "boolean") return held;
   if (r.history_full_ordered !== true) return { ...held, reason: "history_full_order_invalid" };
   if (eh!.covered !== true) return { ...held, reason: eh!.covered === false ? "history_not_covering_cutoff" : "read_invalid" };
