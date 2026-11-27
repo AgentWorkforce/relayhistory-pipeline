@@ -52,9 +52,12 @@ const KEPT = { table: "sessions.search_stage_archive", index: "sessions.search_s
 // 20261105062330 (the buffered feed custom plans) sits above 062300 and its down refuses while it is applied: roll it
 // back first (its down only RESETs plan_cache_mode), so 062300 is newest whenever its own down is exercised.
 const CUSTOM_PLANS_DOWN = readFileSync(join(import.meta.dir, "../../../supabase/rollbacks/20261105062330_buffered_search_feed_custom_plans.down.sql"), "utf8");
+// 20261105062350 (the buffered feed page keyset) sits above 062330: its down runs first.
+const PAGE_KEYSET_DOWN = readFileSync(join(import.meta.dir, "../../../supabase/rollbacks/20261105062350_buffered_search_feed_page_keyset.down.sql"), "utf8");
 const customPlansOff = async (pg: PGlite) => {
-  const applied = (await pg.query<{ n: number }>("SELECT count(*)::int AS n FROM sessions.__96bulls_migrations WHERE name = 'upstream:20261105062330_buffered_search_feed_custom_plans.sql'")).rows[0]!.n;
-  if (applied) await pg.exec(CUSTOM_PLANS_DOWN);
+  const has = async (name: string) => (await pg.query<{ n: number }>("SELECT count(*)::int AS n FROM sessions.__96bulls_migrations WHERE name = $1", [name])).rows[0]!.n > 0;
+  if (await has("upstream:20261105062350_buffered_search_feed_page_keyset.sql")) await pg.exec(PAGE_KEYSET_DOWN);
+  if (await has("upstream:20261105062330_buffered_search_feed_custom_plans.sql")) await pg.exec(CUSTOM_PLANS_DOWN);
 };
 const down = async (pg: PGlite) => customPlansOff(pg).then(() => pg.exec(DOWN)).then(() => null, async (e: { code?: string; message?: string }) => {
   await pg.exec("ROLLBACK").catch(() => {});

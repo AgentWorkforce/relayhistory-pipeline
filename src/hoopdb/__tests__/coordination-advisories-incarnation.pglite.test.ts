@@ -29,6 +29,9 @@ const SEARCH_STAGE_DOWN = read("supabase/rollbacks/20261105062300_search_index_s
 // 20261105062330 (the buffered feed custom plans) sits above 062300: its down runs first of all.
 const CUSTOM_PLANS_STEP = "upstream:20261105062330_buffered_search_feed_custom_plans.sql";
 const CUSTOM_PLANS_DOWN = read("supabase/rollbacks/20261105062330_buffered_search_feed_custom_plans.down.sql");
+// 20261105062350 (the buffered feed page keyset) sits above 062330: its down runs before everything else.
+const PAGE_KEYSET_STEP = "upstream:20261105062350_buffered_search_feed_page_keyset.sql";
+const PAGE_KEYSET_DOWN = read("supabase/rollbacks/20261105062350_buffered_search_feed_page_keyset.down.sql");
 const V1_SQL = read("supabase/migrations/20261105062000_coordination_advisories.sql");
 const LOCAL: MigrationProfile = { mode: "local", shim: true, bootstrap: true, verify: false, runtimeRole: "postgres" };
 
@@ -144,6 +147,7 @@ describe("20261105062220 coordination advisories: the advisory instance", () => 
     expect(SQL).not.toMatch(/ADD COLUMN incarnation uuid[^;]*DEFAULT/i);
     // Before: roll 062220 back, write pending, delivered and acked rows through 062000's v1, then re-apply 062220.
     await reset();
+    await db.exec(PAGE_KEYSET_DOWN);
     await db.exec(CUSTOM_PLANS_DOWN);
     await db.exec(SEARCH_STAGE_DOWN);
     await db.exec(DOWN);
@@ -348,8 +352,9 @@ describe("20261105062220 rollback", () => {
     const h = harness(() => db);
     const message = async (sql: string) => { const m = await db.exec(sql).then(() => null, (e: Error) => e.message); await db.exec("ROLLBACK").catch(() => {}); return m; };
     try {
-      expect((await plan(LOCAL)).filter((s) => s.name.startsWith("upstream:") && s.name > STEP).map((s) => s.name)).toEqual([SEARCH_STAGE_STEP, CUSTOM_PLANS_STEP]);
+      expect((await plan(LOCAL)).filter((s) => s.name.startsWith("upstream:") && s.name > STEP).map((s) => s.name)).toEqual([SEARCH_STAGE_STEP, CUSTOM_PLANS_STEP, PAGE_KEYSET_STEP]);
       expect(await message(DOWN)).toContain("a later migration is applied");
+      await db.exec(PAGE_KEYSET_DOWN);
       await db.exec(CUSTOM_PLANS_DOWN);
       await db.exec(SEARCH_STAGE_DOWN);
       expect(await message(read("supabase/rollbacks/20261105062190_coordination_advisories_pending_priority.down.sql"))).toContain("a later migration is applied");
