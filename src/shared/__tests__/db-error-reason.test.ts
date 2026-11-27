@@ -50,7 +50,7 @@ function sqlMessages(): Set<string> {
   }
   // Every 40001 raise, in any spelling, is in the one form the extractor reads, so none can evade the slug check.
   expect(matched).toBe(raises);
-  expect(raises).toBe(290);
+  expect(raises).toBe(332);
   return out;
 }
 
@@ -60,7 +60,7 @@ describe("db_error_reason", () => {
     const keys = new Set([...DB_SERIALIZATION_REASON_BY_MESSAGE.keys()].filter((k) => !PG_BUILTIN_SERIALIZATION_MESSAGES.includes(k)));
     expect([...fromSql].filter((m) => !keys.has(m))).toEqual([]); // a 40001 RAISE with no slug
     expect([...keys].filter((m) => !fromSql.has(m))).toEqual([]); // a slug for a message the SQL no longer raises
-    expect(fromSql.size).toBe(148);
+    expect(fromSql.size).toBe(150);
     for (const m of PG_BUILTIN_SERIALIZATION_MESSAGES) expect(DB_SERIALIZATION_REASON_BY_MESSAGE.has(m)).toBe(true);
   });
 
@@ -88,7 +88,7 @@ describe("db_error_reason", () => {
     expect(slugs).not.toContain("other");
     expect([...DB_ERROR_REASON_VALUES].sort()).toEqual([...new Set([...slugs, "other"])].sort());
     expect([...DB_ERROR_REASONS].sort()).toEqual([...DB_ERROR_REASON_VALUES].sort());
-    expect(DB_ERROR_REASONS.length).toBe(148 + 3 + 1);
+    expect(DB_ERROR_REASONS.length).toBe(150 + 3 + 1);
   });
 
   test("each known message maps to its slug, exactly", () => {
