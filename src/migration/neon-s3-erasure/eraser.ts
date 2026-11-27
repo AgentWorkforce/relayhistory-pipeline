@@ -9,6 +9,7 @@
  */
 import { encodeKeyPath, sha256Hex } from "../../../packages/object-store/src/crypto.ts";
 import { signRequest, type AwsCredentials } from "../../../packages/object-store/src/sigv4.ts";
+import { refuseIfExpired } from "../short-lived-credentials.ts";
 import { xmlElements, xmlText } from "../../../packages/object-store/src/xml.ts";
 import { objectKey, type ObjectStore } from "../../shared/vendor.ts";
 
@@ -383,6 +384,7 @@ export function createS3Eraser(cfg: S3EraserConfig): Eraser & PreservedVersionEr
   };
   const request = async (method: string, u: URL) => {
     const headers = new Headers();
+    refuseIfExpired(cfg.credentials, "eraser", Date.now()); // a short-lived key is never used to sign past expiry
     await signRequest({ method, url: u, headers, payloadSha256: await sha256Hex(new Uint8Array()), region: cfg.region, credentials: cfg.credentials });
     const res = await doFetch(u, { method, headers });
     // Status only: S3 error bodies can echo keys.
