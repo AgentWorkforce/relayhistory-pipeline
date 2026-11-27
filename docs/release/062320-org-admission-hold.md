@@ -16,6 +16,22 @@ contract: `ingest_generation_overlap_admits` admits G during the transition. The
 4. Rebind G -> H.
 5. Rebuild every consumer at H-only, then close the window.
 
+## Generations (candidate, integration head)
+
+Re-derive each value at the release sha before approval. These are the values at the integration head
+`ec9c9448` (main `8840659b` plus 062320).
+
+| | Value | How |
+|---|---|---|
+| H (target) | `a9662ebac63a3487e64065d0d99a0fb819a2f5058e2f29df421403c8592e753c` | `bun src/hoopdb/migrate.ts --generation` at the integration head |
+| main's tree without 062320 | `f31d73e2a286e712175fa8d4417f07895702012f80c1b3ff88a210381418e44a` | the same command at main `8840659b` (includes 062300) |
+| Worker's tracked overlap pair | `3eef01d7…` -> `778af686…` | `PRIVATE_INGEST_OVERLAP` in `private-ingest-release.ts` |
+
+G is the generation the live marker and policy hold at release time, observed by the release owner and not taken from
+the repository. If the live G is `778af686…` (the 062220 release), then 062300 is unapplied, and a release to this H
+carries 062300 and 062320 together. Release 062300 first, or plan both in one reviewed window. The release owner
+decides.
+
 ## Where the approved overlap is recorded
 
 The release owner records the approved overlap durably in two places, both before any marker transition:
@@ -45,6 +61,10 @@ Deployment names per environment live in the infra repository, not here.
 | sessions-pipeline feed Lambda | same runtime (`src/session-pipeline/lambda.ts`) | only if it is live in the environment |
 | buffered GC job | `INGEST_GC_EXPECT_GENERATION` (`src/session-ingest/buffered-gc-job.ts`) | |
 | schema-gated SERVICEs (`docker/entrypoint.sh`) | runbook line 46 | `session-pipeline-consumer`, `bob-costas`, `session-brief`, `referee`, `alleyoop-ingest`, `hoopdb-indexer` |
+| canonical-project-events relay | `INGEST_EXPECT_GENERATION` (`src/canonical-project-events/deployment.ts`) | |
+| publication job | `INGEST_PUBLISH_EXPECT_GENERATION` (`src/session-ingest/publication-runtime.ts`, `compiled_generation_mismatch`) | |
+| Neon-to-S3 erasure babysitter, retention phase | `INGEST_EXPECT_GENERATION` (`src/migration/neon-s3-erasure/babysitter-phase.ts`) | only when its mode is not `off` |
+| scoped publication RPC (proposal 062280, not landed) | `expected.generation` (`src/session-ingest/publication-scoped-rpc.ts`) | lands after 062320 only (see below) |
 
 Any consumer not listed that reads `ingest_require_generation` or the role-validation marker must be added before the
 plan is approved. Re-grep `expectedGeneration|EXPECT_GENERATION|ingest_require_generation` at the release sha.
