@@ -474,11 +474,19 @@ describe("executed gh commands only, and one identifiable created PR", () => {
     expect(verbs("cd repo && GH_TOKEN=x gh pr create --fill; gh pr merge 98")).toEqual(["pr create", "pr merge"]);
     expect(verbs("bash -lc 'git push && gh pr create --fill'")).toEqual(["pr create"]);
     expect(verbs('{"command":"gh pr create --title \\"x\\"","description":"open it"}')).toEqual(["pr create"]);
-    expect(verbs('exec {"input":"text(await tools.exec_command({cmd:`gh pr view 12`}))"}')).toEqual(["pr view"]);
+    expect(verbs('{"cmd":"gh pr view 12","yield_time_ms":1000}')).toEqual(["pr view"]);
     expect(verbs("exec_command gh pr create --fill")).toEqual(["pr create"]);
     expect(verbs("sudo -E gh pr create")).toEqual(["pr create"]);
     for (const t of ['echo "gh pr create https://github.com/example/demo/pull/7"', "printf '%s' 'gh pr create'", "grep -r 'gh pr create' docs",
-      "I will run gh pr create next", 'git commit -m "run gh pr create later"', "echo 'unbalanced"]) expect(verbs(t)).toEqual([]);
+      "I will run gh pr create next", 'git commit -m "run gh pr create later"', "echo 'unbalanced",
+      // JSON anywhere but the envelope is data; heredoc bodies are data; code-mode wrappers are not read.
+      `printf '%s\\n' '{"cmd":"gh pr create"}' https://github.com/example/demo/pull/7`,
+      "cat <<'EOF'\ngh pr create https://github.com/example/demo/pull/7\nEOF",
+      "cat <<EOF > notes.md\ngh pr create\nEOF\ngh pr view 3",
+      "grep x <<< 'gh pr create'",
+      'exec {"input":"text(await tools.exec_command({cmd:`gh pr view 12`}))"}',
+      '{"cmd": 5}', "[1,2]", "{not json",
+    ]) expect(verbs(t)).toEqual([]);
   });
   test("an echoed create command and its echoed output own nothing", async () => {
     const { eventFacts } = await import("../cloud-harvest/features.ts");
@@ -501,5 +509,19 @@ describe("executed gh commands only, and one identifiable created PR", () => {
       fact("2026-10-01T10:00:02Z", { type: "tool_result", prRefs: ["agentworkforce/relayhistory#10", "agentworkforce/relayhistory#10"] }),
     ])]).get("codex:author")!.prs;
     expect(one.filter((p) => p.action === "create").map((p) => p.number)).toEqual([10]);
+  });
+});
+
+describe("command envelopes: printf'd JSON and heredoc bodies own nothing", () => {
+  for (const [name, content] of [
+    ["printf of literal JSON", `printf '%s\\n' '{"cmd":"gh pr create"}' 'https://github.com/example/demo/pull/7'`],
+    ["cat of a quoted heredoc", "cat <<'EOF'\ngh pr create\nhttps://github.com/example/demo/pull/7\nEOF"],
+  ] as const) test(name, async () => {
+    const { eventFacts } = await import("../cloud-harvest/features.ts");
+    const call = eventFacts({ eventId: "c", ts: "2026-10-01T10:00:00Z", kind: "tool_call", type: "tool_call", toolName: "Bash", content });
+    const out = eventFacts({ eventId: "r", ts: "2026-10-01T10:00:01Z", type: "tool_result", actorRole: "tool_result", content: "https://github.com/example/demo/pull/7\n" });
+    expect(call.gh).toEqual([]);
+    const prs = buildModel([row("author", "K")], [facts("author", [call, out])]).get("codex:author")!.prs;
+    expect(prs.filter((p) => p.action === "create")).toEqual([]);
   });
 });

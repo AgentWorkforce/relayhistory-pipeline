@@ -3,18 +3,23 @@
  * split into shell segments at unquoted separators (`;`, `&&`, `||`, `|`, `&`, newlines, `$(`, `(`, backticks), and
  * a segment runs `gh` only when `gh` is its first word, after any `NAME=value` assignments and the wrappers
  * `sudo`, `env`, `command`, `exec`, `time` and `nohup`. The script of `bash|sh|zsh -c '…'` (or `-lc`) is read the
- * same way, and so are the command strings of JSON-shaped calls (`"cmd"`, `"command"`, or code-mode `cmd: \`…\``).
+ * same way.
  *
- * `echo "gh pr create …"`, a quoted mention, or prose is not a `gh` command. When a call's shape is not recognized
- * the result is no command, which is the conservative direction: a missed create owns nothing.
+ * The script comes from the call's own envelope only: when the whole call text is a JSON object, its `cmd` or
+ * `command` string; otherwise the text itself, after an `exec_command` or `Bash` tool-name prefix. JSON found
+ * anywhere else (a `printf` of JSON, a file being written) is data, not an envelope. A script holding an unquoted
+ * `<<` (a heredoc or here-string, whose body is data the parser cannot delimit safely) yields no command at all.
+ *
+ * `echo "gh pr create …"`, a quoted mention, a heredoc body, or prose is not a `gh` command. When a call's shape is
+ * not recognized the result is no command, which is the conservative direction: a missed create owns nothing.
  */
 const MAX_TEXT = 64 * 1024;
 const MAX_DEPTH = 3;
 const WRAPPERS = new Set(["sudo", "env", "command", "exec", "time", "nohup"]);
 const SHELLS = new Set(["bash", "sh", "zsh"]);
 
-/** Splits at unquoted shell separators; quotes are kept in the pieces. */
-function segments(text: string): string[] {
+/** Splits at unquoted shell separators; quotes are kept in the pieces. Null when the script holds an unquoted `<<`. */
+function segments(text: string): string[] | null {
   const out: string[] = [];
   let cur = "", quote: "'" | '"' | null = null;
   for (let i = 0; i < text.length; i++) {
@@ -26,6 +31,7 @@ function segments(text: string): string[] {
     }
     if (c === "\\" && i + 1 < text.length) { cur += c + text[++i]; continue; }
     if (c === "'" || c === '"') { quote = c; cur += c; continue; }
+    if (c === "<" && text[i + 1] === "<") return null;
     if (c === ";" || c === "\n" || c === "|" || c === "&" || c === "(" || c === ")" || c === "`" || (c === "$" && text[i + 1] === "(")) {
       out.push(cur); cur = ""; if (c === "$") i++; continue;
     }
@@ -59,7 +65,9 @@ function words(segment: string): string[] | null {
 /** The executed command lines (as word lists) in `script`, following `sh -c` scripts. */
 function commands(script: string, depth: number, out: string[][]): void {
   if (depth > MAX_DEPTH) return;
-  for (const seg of segments(script)) {
+  const segs = segments(script);
+  if (segs === null) { out.push(["<unsupported>"]); return; }
+  for (const seg of segs) {
     let w = words(seg);
     if (!w) continue;
     while (w.length && /^[A-Za-z_][A-Za-z0-9_]*=/.test(w[0]!)) w = w.slice(1);
@@ -78,21 +86,28 @@ function commands(script: string, depth: number, out: string[][]): void {
   }
 }
 
-const JSON_CMD = /"(?:cmd|command)"\s*:\s*"((?:\\.|[^"\\])*)"/g;
-const CODE_CMD = /\bcmd\s*:\s*`([^`]*)`/g;
+/** The script a call's envelope carries, or null when the envelope is not one this parser reads. */
+function scriptOf(text: string): string | null {
+  const t = text.trim();
+  if (t.startsWith("{")) {
+    let v: unknown;
+    try { v = JSON.parse(t); } catch { return null; }
+    if (!v || typeof v !== "object" || Array.isArray(v)) return null;
+    const o = v as Record<string, unknown>;
+    const cmd = typeof o.cmd === "string" ? o.cmd : typeof o.command === "string" ? o.command : null;
+    return cmd;
+  }
+  return t.replace(/^(?:exec_command|Bash)\s+(?=\S)/, "");
+}
 
-/** Every command a tool call's text executes, each as its words. */
+/** Every command a tool call's text executes, each as its words; none when any part is unsupported. */
 export function executedCommands(text: string): string[][] {
   if (!text || text.length > MAX_TEXT) return [];
-  const scripts: string[] = [];
-  for (const m of text.matchAll(JSON_CMD)) { try { scripts.push(JSON.parse(`"${m[1]}"`) as string); } catch { /* not a JSON string */ } }
-  for (const m of text.matchAll(CODE_CMD)) scripts.push(m[1]!);
-  // A call that is not JSON-shaped is its own script, optionally after the tool's name (`exec_command <cmd>`,
-  // `Bash <cmd>`); a lowercase `bash` is the shell itself and is read as a command.
-  if (!scripts.length) scripts.push(text.replace(/^(?:exec_command|Bash)\s+(?=\S)/, ""));
+  const script = scriptOf(text);
+  if (script === null) return [];
   const out: string[][] = [];
-  for (const s of scripts) commands(s, 0, out);
-  return out;
+  commands(script, 0, out);
+  return out.some((w) => w[0] === "<unsupported>") ? [] : out;
 }
 
 /** The `gh` commands a tool call executes, each as its arguments after `gh`. */
