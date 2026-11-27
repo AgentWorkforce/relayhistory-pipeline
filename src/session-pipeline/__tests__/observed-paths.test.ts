@@ -20,7 +20,12 @@ describe("observedPaths", () => {
   test("an unquoted name never holds what git would quote: a double quote, a backslash, a control character", () => {
     for (const t of ['?? bad"name', "?? a\\b", " M x\u0001y"]) expect(observedPaths(t)).toEqual([]);
     expect(observedPaths(' M ok.ts\n?? "tail "')).toEqual(["ok.ts"]); // git quotes a trailing space; skipped
-    expect(observedPaths(" M \u00e9.ts")).toEqual(["\u00e9.ts"]);         // core.quotePath=false prints UTF-8 raw
+    // core.quotePath=false prints non-ASCII raw, a trailing U+00A0 included; such a listing is refused, never trimmed.
+    expect(observedPaths(" M \u00e9.ts")).toEqual([]);
+    expect(observedPaths("A  tail\u00a0")).toEqual([]);
+    expect(observedPaths(" M ok.ts\nA  tail\u00a0")).toEqual([]);
+    expect(observedPaths(" M ok.ts ")).toEqual([]);                    // a trailing space is never trimmed away
+    expect(observedPaths(" M a[1]~b.ts\r\n")).toEqual(["a[1]~b.ts"]);
   });
   test("status lines with quoted paths are skipped; the rest of the listing still counts", () => {
     expect(observedPaths(' M "a b.txt"\n M ok.ts')).toEqual(["ok.ts"]);

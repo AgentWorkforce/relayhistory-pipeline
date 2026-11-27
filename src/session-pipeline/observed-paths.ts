@@ -23,10 +23,13 @@ export const MAX_OBSERVED_CONTENT = 256 * 1024;
  * occur, so indented text is not a listing. The arrow form is a rename or copy and appears exactly when XY holds `R`
  * or `C`. Git quotes any path containing whitespace, a double quote, a backslash or a control character
  * (`"a b.txt"`); a quoted path is not decoded, so its line is skipped and the rest of the listing still counts. An
- * unquoted path therefore contains none of those, so neither prose nor an unquoted `bad"name` passes as one.
+ * unquoted path is read only when it is printable ASCII without space, `"` or `\`: exactly what default git prints
+ * unquoted. Under `core.quotePath=false` git prints other characters raw (a trailing U+00A0 among them), which no
+ * line-based reading can delimit safely, so a listing with such a name is refused. Lines are never trimmed: the bytes
+ * validated are the bytes stored.
  */
 const QUOTED = '"(?:\\\\.|[^"\\\\])*"';
-const UNQUOTED = '[^\\s"\\\\\\u0000-\\u001f\\u007f]+';
+const UNQUOTED = '[!#-\\[\\]-~]+';
 const STATUS_LINE = new RegExp(`^(\\S\\S|\\S | \\S) (?:(${UNQUOTED}|${QUOTED}) -> )?(${UNQUOTED}|${QUOTED})$`);
 const UNMERGED = ["DD", "AU", "UD", "UA", "DU", "AA", "UU"];
 const STATUS_CODES = new Set([
@@ -65,7 +68,8 @@ function cap(paths: string[]): string[] {
 /** The paths a tool result's text observes as changed, or [] when the text is not exactly such a listing. */
 export function observedPaths(content: string | null | undefined): string[] {
   if (typeof content !== "string" || content.length === 0 || content.length > MAX_OBSERVED_CONTENT) return [];
-  const lines = content.replace(/\r\n/g, "\n").split("\n").filter((l) => l.trimEnd() !== "").map((l) => l.trimEnd());
+  // Only the line terminators are removed (\n, or \r\n); nothing else is trimmed, so no name loses a byte.
+  const lines = content.replace(/\r\n/g, "\n").split("\n").filter((l) => l !== "");
   if (!lines.length) return [];
   // git status --short (optionally -b): every line is a status line or the one branch header.
   const status = lines.filter((l, i) => !(i === 0 && BRANCH_LINE.test(l)));
