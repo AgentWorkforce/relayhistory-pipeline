@@ -24,19 +24,20 @@ const SHELLS = new Set(["bash", "sh", "zsh", "dash", "ksh", "fish"]);
  * `gh pr create` arguments under which it may create nothing: `--dry-run`, `--web` or `--help` in any form (`=value`
  * included), a short-flag cluster holding `-w` or `-h` (`-wf`), or `--` (what follows is not read as options here).
  */
-const NON_CREATING = /^(?:--(?:dry-run|web|help)(?:=.*)?|-[A-Za-z]*[wh][A-Za-z]*|--)$/;
+const NON_CREATING = /^(?:--(?:dry-run|web|help)(?:=.*)?|-[A-Za-z]*[wh][A-Za-z]*(?:=.*)?|--)$/;
 
 /**
  * Whether a script holds syntax whose value is only known when it runs: an expansion (`$`, a backtick) outside single
- * quotes, or, unquoted, a glob, brace or tilde expansion, history expansion, or a redirection. A sole create must be
- * literal throughout, so its arguments are exactly the words read here.
+ * quotes, or, unquoted, a glob, brace or tilde expansion, history expansion, or a redirection; and any backslash
+ * outside single quotes (an escape or line continuation the shell rewrites: `"--dry-\\<newline>run"` is `--dry-run`).
+ * A sole create must be literal throughout, so its arguments are exactly the words read here.
  */
 function unverified(script: string): boolean {
   let quote: "'" | '"' | null = null;
   for (let i = 0; i < script.length; i++) {
     const c = script[i]!;
     if (quote === "'") { if (c === "'") quote = null; continue; }
-    if (c === "\\") { i++; continue; }
+    if (c === "\\") return true;
     if (quote === '"') { if (c === '"') quote = null; else if (c === "$" || c === "`" || c === "!") return true; continue; }
     if (c === "'" || c === '"') { quote = c; continue; }
     if ("$`*?[]{}~!<>".includes(c)) return true;

@@ -586,7 +586,10 @@ describe("a claim needs a shell tool, a creating invocation and a successful res
       "gh pr create --web=true", "gh pr create -wf", "gh pr create -fh", "gh pr create -- --dry-run",
       // Arguments known only when the shell runs: an expansion, a redirection glued to a flag, globs, tildes.
       `MODE=--dry-run bash -c 'gh pr create "$MODE" --body ${URL}'`, `gh pr create --dry-run>out --body ${URL}`, "gh pr create $FLAGS", 'gh pr create "$(cat flags)"',
-      "gh pr create --title x*", "cd ~ && gh pr create --fill", "gh pr create --body-file <(echo x)", "gh pr create > out.txt"])
+      "gh pr create --title x*", "cd ~ && gh pr create --fill", "gh pr create --body-file <(echo x)", "gh pr create > out.txt",
+      // A quoted line continuation or escape the shell rewrites, and boolean shorthand assignments.
+      `gh pr create "--dry-\\\nrun" --body ${URL}`, `gh pr create --dry\\-run`, "gh pr create -w=true", "gh pr create -h=true", "gh pr create -fw=1",
+      `bash -c 'gh pr create -w=true'`, `{"cmd":"gh pr create -h=true"}`, `{"cmd":"bash -lc 'gh pr create \\"--dry-\\\\\\nrun\\"'"}`])
       expect(await run("Bash", c, "success")).toEqual([]);
   });
   test("each shell tool name the harvest records may claim", async () => {
