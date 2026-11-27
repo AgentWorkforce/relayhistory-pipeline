@@ -7,7 +7,7 @@ const code = (f: () => unknown) => { try { return f(); } catch (e) { return (e a
 
 test("stale-prefix pass: completion 0, expiry mid-pass 75 (ok or not), a genuine failed erase refuses", () => {
   expect(stalePassStatus({ ok: true }, false)).toBe(0);
-  expect(stalePassStatus({ ok: false }, true)).toBe(EXIT_CREDENTIALS_RENEW); // stopped part-way on expiry
+  expect(stalePassStatus({ ok: true, stoppedBy: "signal" }, true)).toBe(EXIT_CREDENTIALS_RENEW); // stopped part-way on expiry
   expect(stalePassStatus({ ok: true }, true)).toBe(EXIT_CREDENTIALS_RENEW); // the stop landed after the last item
   expect(code(() => stalePassStatus({ ok: false }, false))).toBe("stale_prefix_pass_stopped");
   expect(code(() => stalePassStatus({ ok: true, refused: "stale_prefix_lease_held" }, true))).toBe("stale_prefix_lease_held");
@@ -16,4 +16,10 @@ test("stale-prefix pass: completion 0, expiry mid-pass 75 (ok or not), a genuine
 test("full job: 75 whenever it stopped on an expiring key, else the job's own status", () => {
   expect(runStatus(0, false)).toBe(0);
   expect(runStatus(0, true)).toBe(EXIT_CREDENTIALS_RENEW);
+});
+
+test("a genuine failed erase stays a failure even when the expiry timer also fired (review finding 3)", () => {
+  expect(code(() => stalePassStatus({ ok: false, stoppedBy: "failed" }, true))).toBe("stale_prefix_pass_stopped");
+  expect(stalePassStatus({ ok: true, stoppedBy: "signal" }, true)).toBe(EXIT_CREDENTIALS_RENEW);
+  expect(stalePassStatus({ ok: true, stoppedBy: "max" }, false)).toBe(0);
 });

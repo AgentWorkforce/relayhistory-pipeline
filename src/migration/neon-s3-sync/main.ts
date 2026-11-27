@@ -318,13 +318,14 @@ export async function main() {
         ...DEFAULT_SYNC_CONFIG,
         recentMs: Number(env("S3X_RECENT_DAYS", "14")) * 86_400_000,
       },
-      () => stop || credentialsLow(),
+      () => stop,
       undefined,
       extra,
     );
     log({ message: "start", execute, backend: store.backend, lanes, rates: throttle.rates(), obligations: state.obligations });
     const maxGroups = arg("max-groups");
-    await syncer.run({ once: flag("once"), ...(maxGroups ? { maxGroups: Number(maxGroups) } : {}) });
+    // Expiry drains (no new group; in-flight groups finish), never interrupts: see Syncer.run's `admit`.
+    await syncer.run({ once: flag("once"), admit: () => !credentialsLow(), ...(maxGroups ? { maxGroups: Number(maxGroups) } : {}) });
   } finally {
     state.close();
     try {
@@ -338,6 +339,8 @@ export async function main() {
 
 if (import.meta.main)
   main().catch((error) => {
-    log({ message: "exit on error", error_code: errorCode(error) });
-    process.exit(1);
+    const code = errorCode(error);
+    log({ message: "exit on error", error_code: code });
+    // A short-lived credential refused (expired before signing, unreadable, downgraded): renew and restart, not a crash.
+    process.exit(code.startsWith("short_lived_") ? EXIT_CREDENTIALS_RENEW : 1);
   });

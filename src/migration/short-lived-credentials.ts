@@ -20,6 +20,13 @@ import type { AwsCredentials } from "../../packages/object-store/src/sigv4.ts";
 export const EXIT_CREDENTIALS_RENEW = 75;
 /** Default minimum lifetime left to start, and to keep taking new work: 10 minutes. */
 export const DEFAULT_MIN_REMAINING_MS = 600_000;
+/** A credential with this little (or less) left is never used to sign: refused as expired (clock-skew margin). */
+export const SIGNING_FLOOR_MS = 60_000;
+
+/** Throws `short_lived_expired.<name>` when `c` has SIGNING_FLOOR_MS or less left at `now`; a no-op without an expiry. */
+export function refuseIfExpired(c: Pick<AwsCredentials, "expiresAt">, name: string, now: number): void {
+  if (c.expiresAt !== undefined && c.expiresAt.getTime() - now <= SIGNING_FLOOR_MS) throw new ShortLivedCredentialError(`short_lived_expired.${name}`);
+}
 
 /** A refusal with a closed code (`short_lived_<reason>[.<name>]`); never a credential value. */
 export class ShortLivedCredentialError extends Error {
@@ -149,7 +156,9 @@ export function fileCredentialSource(
     return cached.c;
   };
   return {
-    provider: async () => fresh(),
+    // The request path: a mint that was not renewed in time is refused before signing, never used (the store
+    // re-calls this on every request in its last 5 minutes, so a stalled group cannot sign past expiry).
+    provider: async () => { const c = fresh(); refuseIfExpired(c, name, now()); return c; },
     current,
     expiring: () => expiringSoon(current(), opts.minMs, now()),
   };

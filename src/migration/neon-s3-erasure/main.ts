@@ -183,10 +183,12 @@ export function authorityUrl(kind: ErasureAuthorityKind, raw: unknown): string {
  * eraser key is about to expire (a partial pass to rerun after renewal, never reported as success). Throws the
  * existing refusals for a held lease, or for a failed erase that was not an expiry stop.
  */
-export function stalePassStatus(r: { ok: boolean; refused?: string }, credStop: boolean): number {
+export function stalePassStatus(r: { ok: boolean; refused?: string; stoppedBy?: string }, credStop: boolean): number {
   if (r.refused) throw optionRefusal(r.refused, "another eraser holds an unexpired lease: the stale-prefix pass did not start");
-  if (credStop) return EXIT_CREDENTIALS_RENEW;
+  // A genuine failed erase (ok=false, stoppedBy=<outcome>) always fails, even if the expiry timer also fired.
   if (!r.ok) throw optionRefusal("stale_prefix_pass_stopped", "the stale-prefix pass stopped at a failed erase");
+  // An expiry stop (the job's stop signal; ok stays true) is a partial pass: renew and rerun, never success.
+  if (credStop) return EXIT_CREDENTIALS_RENEW;
   return 0;
 }
 
@@ -282,6 +284,8 @@ export async function main(): Promise<number> {
 
 if (import.meta.main)
   main().then((status) => { if (status !== 0) process.exit(status); }).catch((error) => {
-    log({ message: "exit on error", error_code: errorCode(error) });
-    process.exit(1);
+    const code = errorCode(error);
+    log({ message: "exit on error", error_code: code });
+    // A short-lived eraser key refused before signing (expired): renew and restart, not a crash.
+    process.exit(code.startsWith("short_lived_") ? EXIT_CREDENTIALS_RENEW : 1);
   });

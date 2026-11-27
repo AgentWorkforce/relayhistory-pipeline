@@ -5,7 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
   DEFAULT_MIN_REMAINING_MS, EXIT_CREDENTIALS_RENEW, ShortLivedCredentialError, expiringSoon, fileCredentialSource,
-  minRemainingMs, parseCredentialDocument,
+  minRemainingMs, parseCredentialDocument, refuseIfExpired, SIGNING_FLOOR_MS,
 } from "../short-lived-credentials.ts";
 import { CredentialRefusal, s3Credentials } from "../stdin-credentials.ts";
 
@@ -153,5 +153,26 @@ describe("renewal contract (review of c1d5bf61, finding 2)", () => {
     const st = fileCredentialSource("/fifo", { minMs: 1, read: () => (sreads++, JSON.stringify({ accessKeyId: "a", secretAccessKey: "s" })) });
     await st.provider(); await st.provider(); st.expiring();
     expect(sreads).toBe(1);
+  });
+});
+
+describe("refused before signing (review finding 2)", () => {
+  test("the provider refuses a mint with SIGNING_FLOOR_MS or less left when the file was not renewed; a renewal passes", async () => {
+    let doc: unknown = v1({ Expiration: "2026-11-27T22:45:00Z" }), now = Date.parse("2026-11-27T22:40:00Z");
+    const src = fileCredentialSource("/cur", { minMs: 600_000, now: () => now, read: () => JSON.stringify(doc) });
+    expect((await src.provider()).accessKeyId).toBe("ASIASYNTHETIC0001"); // 5 min left: still signs
+    now = Date.parse("2026-11-27T22:44:00Z"); // a stalled in-flight group, 60 s left, no renewal
+    let err: unknown; try { await src.provider(); } catch (e) { err = e; }
+    expect((err as ShortLivedCredentialError).code).toBe("short_lived_expired.S3X_CREDS_FILE");
+    now = Date.parse("2026-11-27T22:46:00Z"); // past expiry
+    err = undefined; try { await src.provider(); } catch (e) { err = e; }
+    expect((err as ShortLivedCredentialError).code).toBe("short_lived_expired.S3X_CREDS_FILE");
+    doc = v1({ AccessKeyId: "ASIASYNTHETIC0020", Expiration: "2026-11-27T23:30:00Z" });
+    expect((await src.provider()).accessKeyId).toBe("ASIASYNTHETIC0020");
+  });
+  test("refuseIfExpired: no-op without an expiry; refuses at or under the floor", () => {
+    expect(() => refuseIfExpired({}, "eraser", T0)).not.toThrow();
+    expect(() => refuseIfExpired({ expiresAt: new Date(T0 + SIGNING_FLOOR_MS + 1) }, "eraser", T0)).not.toThrow();
+    expect(code(() => refuseIfExpired({ expiresAt: new Date(T0 + SIGNING_FLOOR_MS) }, "eraser", T0))).toBe("short_lived_expired.eraser");
   });
 });
