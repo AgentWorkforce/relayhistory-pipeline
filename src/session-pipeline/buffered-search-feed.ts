@@ -182,20 +182,25 @@ export const isBufferedStageKey = (key: string, keyRoot: string) => {
   return m !== null && m[1] === keyRoot && !key.split("/").some((s) => s === "." || s === "..");
 };
 
-/** The feeder's SQL calls (sessions.buffered_search_feed_<query>), named on a failed call's error. */
-export type BufferedFeedQuery = "page" | "stage" | "advance";
+/** The feeder's SQL calls (sessions.buffered_search_feed_<query>), named on a failed call's error. The log
+ * serializer's FEED_QUERY_VALUES (shared/log.ts) is the same closed set (pinned equal in buffered-search-feed.test.ts). */
+export const BUFFERED_FEED_QUERIES = Object.freeze(["page", "stage", "advance"] as const);
+export type BufferedFeedQuery = (typeof BUFFERED_FEED_QUERIES)[number];
 
 export class BufferedFeedError extends Error {
-  /** `query` names the SQL call that failed (sql_* codes only), so a timeout can be traced to its statement. */
+  /** `query` names the SQL call that failed (sql_* codes only), so a timeout can be traced to its statement; it is
+   * logged as `feed_query` (bufferedFeedQueryField). */
   constructor(readonly code: string, readonly retryable = false, readonly query?: BufferedFeedQuery) {
     super(`buffered search feed: ${code}`);
     this.name = "BufferedFeedError";
   }
 }
 
-/** `{ query }` for a BufferedFeedError raised by a feeder SQL call; `{}` for anything else. A fixed name, never SQL text. */
-export function bufferedFeedQueryField(error: unknown): { query?: BufferedFeedQuery } {
-  return error instanceof BufferedFeedError && error.query ? { query: error.query } : {};
+/** `{ feed_query }` for a BufferedFeedError raised by a feeder SQL call; `{}` for anything else. A fixed name from
+ * BUFFERED_FEED_QUERIES only, never SQL text; the log serializer drops any other value (shared/log.ts ENUM_FIELDS). */
+export function bufferedFeedQueryField(error: unknown): { feed_query?: BufferedFeedQuery } {
+  if (!(error instanceof BufferedFeedError) || typeof error.query !== "string") return {};
+  return (BUFFERED_FEED_QUERIES as readonly string[]).includes(error.query) ? { feed_query: error.query } : {};
 }
 
 export interface BufferedFeedConfig {
