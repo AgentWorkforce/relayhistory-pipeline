@@ -5,7 +5,7 @@
  * bound to an authority-dry. GitHub, STS, Cloudflare and the database are fakes; stores are scratch stores.
  */
 import { afterEach, expect, test } from "bun:test";
-import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createHash } from "node:crypto";
@@ -859,9 +859,13 @@ test("the receipt schemas: exact keys, lists, hash positions and closed codes pe
 });
 
 /** The credential step end to end, with fake OIDC/STS and a fake tool child; returns the logged receipt line. */
-async function runStep(mode: BacklogOpsMode, stdout: string, extra: Record<string, string> = {}, childCode = 0) {
+async function runStep(mode: BacklogOpsMode, stdout: string, extra: Record<string, string> = {}, childCode = 0, bound: Record<string, string> = {}) {
   const temp = mkdtempSync(join(tmpdir(), "bo-auth-"));
   cleanups.push(() => rmSync(temp, { recursive: true, force: true }));
+  for (const [kind, raw] of Object.entries(bound)) {
+    mkdirSync(join(temp, "backlog-ops-bound", kind), { recursive: true });
+    writeFileSync(join(temp, "backlog-ops-bound", kind, "backlog-ops-receipt.json"), raw);
+  }
   const xml = `<AssumeRoleWithWebIdentityResponse><Credentials><AccessKeyId>ASIAAAAAAAAAAAAAAAAA</AccessKeyId><SecretAccessKey>s</SecretAccessKey>
     <SessionToken>t</SessionToken><Expiration>${new Date(Date.now() + 6 * 3600_000).toISOString()}</Expiration></Credentials></AssumeRoleWithWebIdentityResponse>`;
   const fetcher = (async (url: string) => url.startsWith("https://token.example/") ? new Response(JSON.stringify({ value: "a.b.c" })) : new Response(xml)) as unknown as typeof fetch;
@@ -901,4 +905,28 @@ test("the logged and persisted receipt: an off-schema authority summary is refus
   const refused = await runStep("reshard-dry", JSON.stringify({ refused: LEAK }), {}, 1);
   expect(refused.receipt.summary).toEqual({ refused: "internal_error" });
   expect(refused.line + refused.file).not.toContain(LEAK);
+});
+
+test("FULL backfill-execute through both sinks: a code-shaped refusal or an off-schema summary never reaches the log or the file; legitimate codes survive", async () => {
+  const ownerUrl = `postgresql://${P.owner}.${P.project}:p%40ss@${P.host}:${P.port}/${P.database}?sslmode=verify-full`;
+  const exec = { BACKLOG_OPS_MODE: "backfill-execute", BACKLOG_OPS_DRY_RUN: DRY, BACKLOG_OPS_CONFIRMATION: `BACKFILL-EXECUTE ${sha} DRY ${DRY}`, SUPABASE_MIGRATION_OWNER_URL: ownerUrl };
+  const full = (() => { const v = JSON.parse(JSON.stringify(catchupOk())); delete v.authority_baseline; delete v.revisions_since_ms; return v; })();
+  const ok = await runStep("backfill-execute", JSON.stringify(full), exec, 0, { dry: rcpt("backfill-dry", DRY, { ...full, mode: "dry_run" }) });
+  expect(ok.exit).toBe(0);
+  expect(ok.receipt.summary).toEqual(full);
+  expect(ok.receipt.home).toBe(HOME); // FULL attests its home
+  for (const [stdout, code, want] of [
+    [JSON.stringify({ refused: LEAK }), 1, { refused: "backfill_refused" }],
+    [JSON.stringify({ refused: "sqlstate_57014" }), 1, { refused: "sqlstate_57014" }],
+    [JSON.stringify({ refused: "ledger_home_moved" }), 1, { refused: "ledger_home_moved" }],
+    [JSON.stringify({ ...full, [LEAK]: 1 }), 0, { refused: "backlog_ops_receipt_schema" }],
+    [JSON.stringify({ ...full, revisions: { ...full.revisions, failed_codes: { [LEAK]: 1 } } }), 0, null],
+  ] as const) {
+    const r = await runStep("backfill-execute", stdout, exec, code, { dry: rcpt("backfill-dry", DRY, { ...full, mode: "dry_run" }) });
+    if (want) expect(r.receipt.summary).toEqual(want);
+    else expect(r.receipt.summary.revisions.failed_codes).toEqual({ other: 1 });
+    expect(r.line).not.toContain(LEAK);
+    expect(r.file).not.toContain(LEAK);
+    if (want && "refused" in want) expect(r.exit).toBe(1);
+  }
 });

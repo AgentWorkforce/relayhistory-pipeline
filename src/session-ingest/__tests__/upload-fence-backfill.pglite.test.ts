@@ -1242,6 +1242,11 @@ describe("catch-up (--revisions-since-ms): two-phase cutover", () => {
     const full = await run(scratch(), { rowPageSize: 2 });
     expect("revisions_since_ms" in full).toBe(false);
     expect(full.revisions.rows).toBe(12);
+    // Every backfill receipt is closed by the exact backfill schema: real full, catch-up and refresh summaries pass it.
+    expect(authorityReceiptSummary("backfill", JSON.parse(JSON.stringify(full))).ok).toBe(true);
+    expect(authorityReceiptSummary("backfill", JSON.parse(JSON.stringify(summary))).ok).toBe(true);
+    const refresh = await run(scratch(), { rowPageSize: 2, sections: ["fences", "ownership"] });
+    expect(authorityReceiptSummary("backfill", JSON.parse(JSON.stringify(refresh))).ok).toBe(true);
     // A window size that is not a multiple of the rows, and one larger than all: the same two rows.
     for (const rowPageSize of [5, 100]) expect((await run(scratch(), { revisionsSinceMs: t, rowPageSize })).revisions.rows).toBe(2);
     // Read-only, like every page.

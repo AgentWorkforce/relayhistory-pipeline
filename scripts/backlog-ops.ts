@@ -292,8 +292,10 @@ export async function backlogOpsRun(
   const nhpId = nhp?.id ?? BACKLOG_OPS_NO_HEAD_PARITY_NONE;
   // Every ledger-id tool's receipt attests the store-home pair (a FULL backfill-execute included).
   const home = BACKLOG_OPS_LEDGER_ID_TOOLS.includes(toolOf(d.mode)) ? backlogOpsHomeId(t, backlogOpsLedgerTarget(env, t)) : null;
-  const schemaKind: AuthorityReceiptKind | null = !backlogOpsAuthorityReceipt(d) ? null : toolOf(d.mode) === "reshard" ? "reshard"
-    : d.mode === "authority-dry" ? "authority_dry" : d.mode === "authority-execute" ? "authority_execute" : "catchup";
+  // Exact schemas: every authority receipt, and every backfill receipt (a FULL backfill-execute is an authority
+  // binding; every backfill mode shares its producer, so all are closed alike).
+  const schemaKind: AuthorityReceiptKind | null = toolOf(d.mode) === "reshard" ? "reshard" : d.mode === "authority-dry" ? "authority_dry"
+    : d.mode === "authority-execute" ? "authority_execute" : isCatchup(d.mode) && d.authorityRun !== null ? "catchup" : toolOf(d.mode) === "backfill" ? "backfill" : null;
   const paths = backlogOpsPaths(env);
   if (existsSync(paths.receipt)) refuse("backlog_ops_receipt_exists");
   // Credentials from here on: the database URL (backfill, export, presence) and the role session.
@@ -304,8 +306,8 @@ export async function backlogOpsRun(
   let receipt;
   try {
     receipt = backlogOpsReceipt(d, env.GITHUB_RUN_ID!, code, stdout, scope.id, ledger, nhpId, home);
-    // An authority receipt conforms exactly to its mode's schema (keys, lists, hash positions, closed codes), and a
-    // refusal keeps only a code from the mode's closed map, before the receipt is persisted or logged.
+    // An authority or backfill receipt conforms exactly to its mode's schema (keys, lists, hash positions, closed codes),
+    // and a refusal keeps only a code from the mode's closed map, before the receipt is persisted or logged.
     if (schemaKind !== null) {
       const r = authorityReceiptSummary(schemaKind, receipt.summary);
       receipt = { ...receipt, summary: r.summary, exitCode: r.ok ? receipt.exitCode : receipt.exitCode || 1 };

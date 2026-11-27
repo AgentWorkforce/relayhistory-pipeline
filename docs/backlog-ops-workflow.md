@@ -371,6 +371,13 @@ and the run exits 1. A refusal summary keeps its code only when the mode's close
 it; otherwise it becomes `internal_error`, or `backfill_refused` for a catch-up. A backfill section's
 `failed_codes` keeps only its known keys and sums the rest under `other`.
 
+Every backfill receipt (backfill-dry/-execute, refresh, catch-up) is closed the same way. A FULL
+backfill-execute is an authority binding, and every backfill mode shares its producer. The exact
+backfill schema accepts every real summary (tested against PGlite runs). A refusal keeps only a code
+the backfill itself throws (enumerated from its source), a digits-only `sqlstate_<5 digits>`, or
+`db_connection_lost`; anything else becomes `backfill_refused`. Before this, `redactedReason` let any
+code-shaped error message through.
+
 ### The sweeper's serving spec (proposal; not built)
 
 The GitHub job has no kubectl. It therefore reads what the CURRENT serving sweeper is from

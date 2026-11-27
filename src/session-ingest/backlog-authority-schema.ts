@@ -57,11 +57,14 @@ export const BASELINE_SCHEMA: S = obj({
   })),
 });
 
-/** The backfill's known `failed_codes` keys (anything else is summed under `other`). */
-export const BACKFILL_FAILED_CODES = ["fence_unreadable", "slot_read_too_long", "ledger_revision_contended", "error", "other"] as const;
+/**
+ * The backfill's known `failed_codes` keys (anything else is summed under `other`): its own codes and the object
+ * store's error codes (failureCode lowercases an error's own code).
+ */
+export const BACKFILL_FAILED_CODES = ["fence_unreadable", "slot_read_too_long", "ledger_revision_contended", "error", "other", "not_found", "already_exists",
+  "precondition_failed", "content_mismatch", "invalid_key", "invalid_argument", "unsupported", "unauthorized", "transient", "backend"] as const;
 const FAILED_CODES = "failed_codes";
-/** upload-fence-backfill.ts BackfillSummary (a catch-up: revisions_since_ms; bound: authority_baseline), in receipt keys. */
-export const CATCHUP_SCHEMA: S = obj({
+const BACKFILL_FIELDS: Record<string, S> = {
   mode: codes("dry_run", "execute"), users: COUNT,
   fences: obj(counts("deletion_rows", "reset_rows", "created", "updated", "unchanged", "would_create", "would_update", "pairs_added", "resets_added",
     "deletions_superseded", "deletions_unproven", "cold_resets", "needs_review", "unreadable", "contended", "tenant_invalid", "input_invalid", "failed", "resets_in_flight")),
@@ -73,8 +76,11 @@ export const CATCHUP_SCHEMA: S = obj({
   fingerprint: obj(counts("revisions_count", "revisions_max_updated_ms", "revisions_hash", "ownership_count", "ownership_hash", "slots_owned_count",
     "slots_revision_sum", "slots_hash")),
   revisions_since_ms: COUNT,
-  authority_baseline: BASELINE_SCHEMA,
-});
+};
+/** upload-fence-backfill.ts BackfillSummary of every backfill mode (revisions_since_ms only on a catch-up), receipt keys. */
+export const BACKFILL_SCHEMA: S = obj(BACKFILL_FIELDS, ["revisions_since_ms"]);
+/** A catch-up bound to an authority-dry: the backfill summary with its t and the baseline. */
+export const CATCHUP_SCHEMA: S = obj({ ...BACKFILL_FIELDS, authority_baseline: BASELINE_SCHEMA });
 
 export const RESHARD_REFUSAL_CODES = ["reshard_prefix_refused", "reshard_concurrency_refused", "reshard_mode_refused", "reshard_failed"] as const;
 const RESHARD_COUNTS = counts("listed", "legacy_shards", "entries", "merged", "would_merge", "shards", "invalid", "failed", "verified", "missing");
@@ -106,16 +112,30 @@ const LEDGER_HOME = ["ledger_bucket_invalid", "ledger_home_guard_invalid", "ledg
   "ledger_home_invalid", "ledger_home_unavailable", "ledger_home_store_error", "access_denied"];
 export const AUTHORITY_TOOL_REFUSALS = ["usage", "orgs", "authority_execute_held", "stdin_too_large", "stdin_invalid", "db_url_required",
   "cloudflare_token_invalid", "cloudflare_config", "cloudflare_path", "aws_credentials_required", "backlog_ops_reshard_org", "internal_error", ...LEDGER_HOME] as const;
-const BACKFILL_REFUSALS = ["backfill_authority_baseline_invalid", "backfill_authority_baseline_missing", "backfill_fingerprint_invalid", "backfill_not_read_only",
-  "stdin_too_large", "stdin_invalid", "db_url_required", "aws_credentials_required", ...LEDGER_HOME];
+/**
+ * Every code scripts/upload-fence-backfill.ts redactedReason can produce from the backfill's own throws (the closed
+ * set, enumerated from its source, the library's and the tool store's), plus a digits-only SQLSTATE and the owner URL
+ * codes. A code-shaped message from anywhere else (a pg, S3 or fetch error) is not in it.
+ */
+const BACKFILL_REFUSALS = ["backfill_authority_baseline_invalid", "backfill_authority_baseline_missing", "backfill_concurrency_invalid",
+  "backfill_dry_run_write_refused", "backfill_fingerprint_invalid", "backfill_key_root_invalid", "backfill_merge_buffer_invalid", "backfill_not_read_only",
+  "backfill_org_invalid", "backfill_page_size_invalid", "backfill_revisions_since_invalid", "backfill_revisions_since_sections", "backfill_row_invalid",
+  "backfill_row_page_size_invalid", "backfill_sections_invalid", "backfill_slot_blocks_invalid", "backfill_slot_org_max_invalid", "backfill_slot_pace_invalid",
+  "backfill_slot_window_invalid", "backfill_statement_timeout_invalid", "ledger_store_cursor_invalid", "ledger_store_same", "slot_read_too_long",
+  "stdin_too_large", "stdin_invalid", "db_url_required", "aws_credentials_required", "db_connection_lost", "internal_error", ...LEDGER_HOME,
+  ...["application_name", "database", "fragment", "host", "password", "port", "protocol", "query_params", "url", "user"].map((c) => `db_url_${c}`)];
+const SQLSTATE = /^sqlstate_[0-9]{5}$/u;
 
-export type AuthorityReceiptKind = "reshard" | "authority_dry" | "authority_execute" | "catchup";
-const SUCCESS: Record<AuthorityReceiptKind, S> = { reshard: RESHARD_SCHEMA, authority_dry: AUTHORITY_DRY_SCHEMA, authority_execute: EXECUTE_SCHEMA, catchup: CATCHUP_SCHEMA };
+/** `backfill`: every other backfill mode (a FULL backfill-execute feeds authority-execute; all share its receipt path). */
+export type AuthorityReceiptKind = "reshard" | "authority_dry" | "authority_execute" | "catchup" | "backfill";
+const SUCCESS: Record<AuthorityReceiptKind, S> = { reshard: RESHARD_SCHEMA, authority_dry: AUTHORITY_DRY_SCHEMA, authority_execute: EXECUTE_SCHEMA, catchup: CATCHUP_SCHEMA,
+  backfill: BACKFILL_SCHEMA };
 const REFUSED: Record<AuthorityReceiptKind, { allowed: ReadonlySet<string>; generic: string }> = {
   reshard: { allowed: new Set(AUTHORITY_TOOL_REFUSALS), generic: "internal_error" },
   authority_dry: { allowed: new Set(AUTHORITY_TOOL_REFUSALS), generic: "internal_error" },
   authority_execute: { allowed: new Set(AUTHORITY_TOOL_REFUSALS), generic: "internal_error" },
   catchup: { allowed: new Set(BACKFILL_REFUSALS), generic: "backfill_refused" },
+  backfill: { allowed: new Set(BACKFILL_REFUSALS), generic: "backfill_refused" },
 };
 
 const HASH_RE = /^h_[0-9a-f]{32}$/u, DIGEST_RE = /^h[0-9a-f]{32}$/u;
@@ -157,10 +177,12 @@ function closedFailedCodes(v: unknown): unknown {
 export function authorityReceiptSummary(kind: AuthorityReceiptKind, summary: unknown): { summary: unknown; ok: boolean } {
   if (isObj(summary) && Object.keys(summary).length === 1 && Object.hasOwn(summary, "refused")) {
     const r = REFUSED[kind];
-    return { summary: { refused: typeof summary.refused === "string" && r.allowed.has(summary.refused) ? summary.refused : r.generic }, ok: false };
+    const c = summary.refused;
+    const keep = typeof c === "string" && (r.allowed.has(c) || ((kind === "catchup" || kind === "backfill") && SQLSTATE.test(c)));
+    return { summary: { refused: keep ? c : r.generic }, ok: false };
   }
   let s = summary;
-  if (kind === "catchup" && isObj(s)) {
+  if ((kind === "catchup" || kind === "backfill") && isObj(s)) {
     const sec = (k: string) => (isObj(s) && isObj((s as Record<string, unknown>)[k]) ? { ...(s as Record<string, any>)[k], [FAILED_CODES]: closedFailedCodes((s as Record<string, any>)[k][FAILED_CODES]) } : (s as Record<string, unknown>)[k]);
     s = { ...s, ownership: sec("ownership"), revisions: sec("revisions") };
   }
