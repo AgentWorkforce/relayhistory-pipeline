@@ -15,7 +15,8 @@
 --   grant). Lifecycle functions take it EXCLUSIVE after the migrator's (961996,1) SHARED and a fresh slot check.
 -- Refusals: RH042 'session ingest: org admission held' (retryable); 40001 outside READ COMMITTED.
 
-CREATE TABLE sessions.ingest_org_admission_holds (
+-- IF NOT EXISTS: this slot's down retains both tables (and their guard) as inert history; a reapply reuses them.
+CREATE TABLE IF NOT EXISTS sessions.ingest_org_admission_holds (
   epoch uuid PRIMARY KEY,
   held_org text NOT NULL CHECK (held_org ~ '^[A-Za-z0-9_-][A-Za-z0-9._-]{0,127}$'),
   request_id uuid NOT NULL UNIQUE,
@@ -33,10 +34,10 @@ CREATE TABLE sessions.ingest_org_admission_holds (
   CHECK (release_reason IS DISTINCT FROM 'bridge_complete' OR marker_attempted_at IS NOT NULL),
   CHECK (release_reason IS DISTINCT FROM 'verified_rollback' OR marker_attempted_at IS NULL)
 );
-CREATE UNIQUE INDEX ingest_org_admission_holds_live ON sessions.ingest_org_admission_holds (held_org)
+CREATE UNIQUE INDEX IF NOT EXISTS ingest_org_admission_holds_live ON sessions.ingest_org_admission_holds (held_org)
   WHERE state <> 'released';
 
-CREATE TABLE sessions.ingest_org_admission_hold_events (
+CREATE TABLE IF NOT EXISTS sessions.ingest_org_admission_hold_events (
   epoch uuid NOT NULL REFERENCES sessions.ingest_org_admission_holds (epoch),
   kind text NOT NULL CHECK (kind IN ('installed', 'sealed', 'marker_attempted', 'released')),
   at timestamptz NOT NULL DEFAULT clock_timestamp(),
@@ -45,6 +46,30 @@ CREATE TABLE sessions.ingest_org_admission_hold_events (
   PRIMARY KEY (epoch, kind)
 );
 
+-- A retained history (this slot's down keeps both tables) must be exactly this one: columns, indexes, owned by the
+-- migrating role. Else 55000, nothing applied (as 062300's retained archive).
+DO $hold_history_shape$
+BEGIN
+ IF (SELECT pg_get_userbyid(relowner) FROM pg_class WHERE oid = 'sessions.ingest_org_admission_holds'::regclass) <> current_user
+    OR (SELECT pg_get_userbyid(relowner) FROM pg_class WHERE oid = 'sessions.ingest_org_admission_hold_events'::regclass) <> current_user
+    OR (SELECT string_agg(attname || ' ' || format_type(atttypid, atttypmod) || CASE WHEN attnotnull THEN ' not null' ELSE '' END, ', ' ORDER BY attnum)
+          FROM pg_attribute WHERE attrelid = 'sessions.ingest_org_admission_holds'::regclass AND attnum > 0 AND NOT attisdropped)
+       IS DISTINCT FROM 'epoch uuid not null, held_org text not null, request_id uuid not null, state text not null, installed_at timestamp with time zone not null, sealed_at timestamp with time zone, marker_attempted_at timestamp with time zone, released_at timestamp with time zone, release_reason text, release_evidence_sha256 text'
+    OR (SELECT string_agg(attname || ' ' || format_type(atttypid, atttypmod) || CASE WHEN attnotnull THEN ' not null' ELSE '' END, ', ' ORDER BY attnum)
+          FROM pg_attribute WHERE attrelid = 'sessions.ingest_org_admission_hold_events'::regclass AND attnum > 0 AND NOT attisdropped)
+       IS DISTINCT FROM 'epoch uuid not null, kind text not null, at timestamp with time zone not null, detail text, evidence_sha256 text'
+    OR (SELECT array_agg(pg_get_indexdef(indexrelid)::text ORDER BY pg_get_indexdef(indexrelid)::text) FROM pg_index
+         WHERE indrelid IN ('sessions.ingest_org_admission_holds'::regclass, 'sessions.ingest_org_admission_hold_events'::regclass))
+       IS DISTINCT FROM ARRAY[
+         'CREATE UNIQUE INDEX ingest_org_admission_hold_events_pkey ON sessions.ingest_org_admission_hold_events USING btree (epoch, kind)',
+         'CREATE UNIQUE INDEX ingest_org_admission_holds_live ON sessions.ingest_org_admission_holds USING btree (held_org) WHERE (state <> ''released''::text)',
+         'CREATE UNIQUE INDEX ingest_org_admission_holds_pkey ON sessions.ingest_org_admission_holds USING btree (epoch)',
+         'CREATE UNIQUE INDEX ingest_org_admission_holds_request_id_key ON sessions.ingest_org_admission_holds USING btree (request_id)']::text[]
+ THEN
+   RAISE EXCEPTION USING ERRCODE = '55000', MESSAGE = 'org admission hold: an existing hold history is not this slot''s; nothing applied';
+ END IF;
+END $hold_history_shape$;
+
 ALTER TABLE sessions.ingest_org_admission_holds ENABLE ROW LEVEL SECURITY;
 ALTER TABLE sessions.ingest_org_admission_hold_events ENABLE ROW LEVEL SECURITY;
 REVOKE ALL ON sessions.ingest_org_admission_holds, sessions.ingest_org_admission_hold_events
@@ -52,7 +77,7 @@ REVOKE ALL ON sessions.ingest_org_admission_holds, sessions.ingest_org_admission
 
 -- Immutability: no DELETE or TRUNCATE of either table, no UPDATE of an event, and a hold row changes only along the
 -- state machine with its identity (epoch, org, request, installed_at) and every earlier timestamp unchanged.
-CREATE FUNCTION sessions.ingest_org_admission_hold_guard() RETURNS trigger
+CREATE OR REPLACE FUNCTION sessions.ingest_org_admission_hold_guard() RETURNS trigger
 LANGUAGE plpgsql VOLATILE SET search_path = pg_catalog, pg_temp AS $hold_guard$
 BEGIN
   IF TG_OP IN ('DELETE', 'TRUNCATE') OR TG_TABLE_NAME = 'ingest_org_admission_hold_events' THEN
@@ -70,6 +95,10 @@ BEGIN
   RETURN NEW;
 END
 $hold_guard$;
+DROP TRIGGER IF EXISTS ingest_org_admission_holds_guard ON sessions.ingest_org_admission_holds;
+DROP TRIGGER IF EXISTS ingest_org_admission_holds_truncate ON sessions.ingest_org_admission_holds;
+DROP TRIGGER IF EXISTS ingest_org_admission_hold_events_guard ON sessions.ingest_org_admission_hold_events;
+DROP TRIGGER IF EXISTS ingest_org_admission_hold_events_truncate ON sessions.ingest_org_admission_hold_events;
 CREATE TRIGGER ingest_org_admission_holds_guard BEFORE UPDATE OR DELETE ON sessions.ingest_org_admission_holds
   FOR EACH ROW EXECUTE FUNCTION sessions.ingest_org_admission_hold_guard();
 CREATE TRIGGER ingest_org_admission_holds_truncate BEFORE TRUNCATE ON sessions.ingest_org_admission_holds

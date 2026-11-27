@@ -12,6 +12,7 @@ function checkedBodies(): Map<string, string> {
   const out = new Map<string, string>();
   for (const chunk of MIGRATION.split(/^(?=CREATE OR REPLACE FUNCTION )/mu).slice(1)) {
     const fn = /^CREATE OR REPLACE FUNCTION (sessions\.[a-z_0-9]+)\(/u.exec(chunk)![1]!;
+    if (fn.startsWith("sessions.ingest_org_admission_hold_")) continue; // the slot's own functions, not replaced bodies
     const marks = [...chunk.matchAll(/'([a-z]+)'\);(?: END IF;)? -- 062320 org admission hold$/gmu)];
     expect(marks.length).toBe(1);
     out.set(fn, marks[0]![1]!);
