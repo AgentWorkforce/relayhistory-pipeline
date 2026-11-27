@@ -174,10 +174,11 @@ describe("062320 state machine and audit", () => {
       await expect(f.db.query(`SELECT sessions.ingest_org_admission_hold_${fn}($1,$2::uuid,$3)`, [org, e, ev])).rejects.toMatchObject({ code: "22023" });
     await expect(f.db.query("SELECT sessions.ingest_org_admission_hold_marker_attempt($1,$2::uuid,'cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc')", [org, e])).rejects.toMatchObject({ code: "55000" });
     await expect(release(f, org, e, "bridge_complete", 0)).rejects.toMatchObject({ code: "55000" });
+    await f.db.query("SELECT pg_sleep(0.002)"); // 062340 binds a FULL start strictly between install and seal
     await f.db.query("SELECT sessions.ingest_org_admission_hold_seal($1,$2::uuid,'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb')", [org, e]);
     await f.db.query("SELECT sessions.ingest_org_admission_hold_seal($1,$2::uuid,'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb')", [org, e]); // idempotent
-    // 062340: bridge_complete needs the epoch's trusted FULL cutoff, bound while sealed (here the install time).
-    await f.db.query("SELECT sessions.ingest_org_erasure_history_bind($1,$2::uuid,(SELECT installed_at FROM sessions.ingest_org_admission_holds WHERE epoch=$2::uuid))", [org, e]);
+    // 062340: bridge_complete needs the sealed FULL bound to the epoch (its cutoff is the install).
+    await f.db.query("SELECT sessions.ingest_org_erasure_history_bind($1,$2::uuid,'full-run-1',(SELECT installed_at + (sealed_at - installed_at) / 2 FROM sessions.ingest_org_admission_holds WHERE epoch=$2::uuid),'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb')", [org, e]);
     await f.db.query("SELECT sessions.ingest_org_admission_hold_marker_attempt($1,$2::uuid,'cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc')", [org, e]);
     await f.db.query("SELECT sessions.ingest_org_admission_hold_marker_attempt($1,$2::uuid,'cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc')", [org, e]); // before every PUT
     await expect(release(f, org, e, "verified_rollback")).rejects.toMatchObject({ code: "55000" }); // no rollback after an attempt

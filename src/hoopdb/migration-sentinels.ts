@@ -704,8 +704,8 @@ export const MIGRATION_SENTINELS: Record<string, Sentinel> = {
     sql: "SELECT to_regprocedure('sessions.ingest_org_admission_hold_check(text,text)') IS NOT NULL AND EXISTS(SELECT 1 FROM pg_trigger WHERE tgrelid=to_regclass('sessions.ingest_batches') AND tgname='ingest_org_admission_hold_batch_backstop' AND NOT tgisinternal) AS applied",
   },
   "upstream:20261105062340_ingest_org_erasure_history.sql": {
-    evidence: "function sessions.ingest_org_erasure_history_bind(text,uuid,timestamptz) and the recorder trigger on sessions.upload_deletions (the per-org erasure history)",
-    sql: "SELECT to_regprocedure('sessions.ingest_org_erasure_history_bind(text,uuid,timestamptz)') IS NOT NULL AND EXISTS(SELECT 1 FROM pg_trigger WHERE tgrelid=to_regclass('sessions.upload_deletions') AND tgname='ingest_org_erasure_history_record' AND NOT tgisinternal) AS applied",
+    evidence: "function sessions.ingest_org_erasure_history_bind(text,uuid,text,timestamptz,text) and the recorder trigger on sessions.upload_deletions (the per-org erasure history)",
+    sql: "SELECT to_regprocedure('sessions.ingest_org_erasure_history_bind(text,uuid,text,timestamptz,text)') IS NOT NULL AND EXISTS(SELECT 1 FROM pg_trigger WHERE tgrelid=to_regclass('sessions.upload_deletions') AND tgname='ingest_org_erasure_history_record' AND NOT tgisinternal) AS applied",
   },
   "upstream:20261105062070_coordination_advisor_readers.sql": {
     evidence: "functions sessions.coordination_advisor_write_facts_v1 and sessions.coordination_advisories_recent_v1",

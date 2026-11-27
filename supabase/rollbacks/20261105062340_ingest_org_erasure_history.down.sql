@@ -15,7 +15,7 @@ DO $rollback_guard$ DECLARE v_sha text; BEGIN
  IF EXISTS(SELECT 1 FROM sessions.__96bulls_migrations WHERE name LIKE 'upstream:%' AND name COLLATE "C">'upstream:20261105062340_ingest_org_erasure_history.sql')
  THEN RAISE EXCEPTION USING ERRCODE='55000',MESSAGE='org erasure history: a later migration is applied; roll it back first';END IF;
  SELECT sha256 INTO v_sha FROM sessions.__96bulls_migrations WHERE name='upstream:20261105062340_ingest_org_erasure_history.sql' FOR UPDATE;
- IF NOT FOUND OR v_sha IS DISTINCT FROM 'a8f7f13c9a9d11e142fe40b643385152eaab48a3f58e63cb5ad6ccfb804821e8'
+ IF NOT FOUND OR v_sha IS DISTINCT FROM 'df39b8d2539a440d2950e36a55720e30d0541acd3e84686e08f82df6c60dce85'
  THEN RAISE EXCEPTION USING ERRCODE='55000',MESSAGE='org erasure history: own applied checksum required';END IF;
  LOCK TABLE sessions.ingest_org_admission_holds IN SHARE ROW EXCLUSIVE MODE;
  IF EXISTS(SELECT 1 FROM sessions.ingest_org_admission_holds WHERE state<>'released')
@@ -101,7 +101,7 @@ DROP TRIGGER ingest_org_erasure_history_record ON sessions.ingest_frozen_source_
 DROP TRIGGER ingest_org_erasure_history_refuse_truncate ON sessions.ingest_frozen_source_deletions;
 DROP TRIGGER ingest_org_erasure_history_record ON sessions.ingest_frozen_source_resets;
 DROP TRIGGER ingest_org_erasure_history_refuse_truncate ON sessions.ingest_frozen_source_resets;
-DROP FUNCTION sessions.ingest_org_erasure_history_bind(text,uuid,timestamp with time zone);
+DROP FUNCTION sessions.ingest_org_erasure_history_bind(text,uuid,text,timestamp with time zone,text);
 DROP FUNCTION sessions.ingest_org_erasure_history_recording();
 DROP FUNCTION sessions.ingest_org_erasure_history_refuse_truncate();
 DROP FUNCTION sessions.ingest_org_erasure_history_record();
@@ -129,7 +129,7 @@ DO $rollback_verify$ BEGIN
      = 'kind text not null, at timestamp with time zone not null, xid xid8 not null'
  AND (SELECT string_agg(attname || ' ' || format_type(atttypid, atttypmod) || CASE WHEN attnotnull THEN ' not null' ELSE '' END, ', ' ORDER BY attnum)
         FROM pg_attribute WHERE attrelid = 'sessions.ingest_org_erasure_history_bindings'::regclass AND attnum > 0 AND NOT attisdropped)
-     = 'epoch uuid not null, bound_org text not null, cutoff timestamp with time zone not null, bound_at timestamp with time zone not null'
+     = 'epoch uuid not null, bound_org text not null, cutoff timestamp with time zone not null, full_run text not null, full_started_at timestamp with time zone not null, full_evidence_sha256 text not null, bound_at timestamp with time zone not null'
  AND (SELECT array_agg(pg_get_indexdef(indexrelid)::text ORDER BY pg_get_indexdef(indexrelid)::text COLLATE "C") FROM pg_index WHERE indrelid IN ('sessions.ingest_org_erasure_history'::regclass, 'sessions.ingest_org_erasure_history_coverage'::regclass, 'sessions.ingest_org_erasure_history_bindings'::regclass))
      = ARRAY[
          'CREATE INDEX ingest_org_erasure_history_org ON sessions.ingest_org_erasure_history USING btree (erased_org, at)',
@@ -140,8 +140,10 @@ DO $rollback_verify$ BEGIN
          'sessions.ingest_org_erasure_history c CHECK ((op = ANY (ARRAY[''INSERT''::text, ''UPDATE''::text, ''DELETE''::text])))',
          'sessions.ingest_org_erasure_history c CHECK ((source = ANY (ARRAY[''operator_user_erasures''::text, ''session_erasure_fences''::text, ''session_erasure_receipts''::text, ''session_erasure_events''::text, ''session_erasure_runs''::text, ''session_erasure_scopes''::text, ''session_erasure_writes''::text, ''upload_deletions''::text, ''upload_resets''::text, ''upload_erasure_rearm''::text, ''relayfacts_erasure_fences''::text, ''session_analysis_purge_fences''::text, ''session_analysis_purge_authority''::text, ''ingest_frozen_source_deletions''::text, ''ingest_frozen_source_resets''::text])))',
          'sessions.ingest_org_erasure_history_bindings c CHECK ((bound_org ~ ''^[A-Za-z0-9_-][A-Za-z0-9._-]{0,127}$''::text))',
+         'sessions.ingest_org_erasure_history_bindings c CHECK ((full_evidence_sha256 ~ ''^[0-9a-f]{64}$''::text))',
+         'sessions.ingest_org_erasure_history_bindings c CHECK ((full_run ~ ''^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$''::text))',
          'sessions.ingest_org_erasure_history_bindings p PRIMARY KEY (epoch)',
-         'sessions.ingest_org_erasure_history_coverage c CHECK ((kind = ANY (ARRAY[''started''::text, ''ended''::text])))']::text[]
+         'sessions.ingest_org_erasure_history_coverage c CHECK ((kind = ANY (ARRAY[''started''::text, ''ended''::text, ''truncated''::text])))']::text[]
  AND (SELECT array_agg(t.tgname || ' ' || t.tgtype ORDER BY t.tgname COLLATE "C") FROM pg_trigger t
        WHERE t.tgrelid IN ('sessions.ingest_org_erasure_history'::regclass, 'sessions.ingest_org_erasure_history_coverage'::regclass, 'sessions.ingest_org_erasure_history_bindings'::regclass) AND NOT t.tgisinternal AND t.tgenabled = 'O' AND t.tgfoid = 'sessions.ingest_org_erasure_history_guard()'::regprocedure)
      = ARRAY['ingest_org_erasure_history_bindings_guard 27', 'ingest_org_erasure_history_bindings_truncate 34', 'ingest_org_erasure_history_coverage_guard 27', 'ingest_org_erasure_history_coverage_truncate 34', 'ingest_org_erasure_history_guard 27', 'ingest_org_erasure_history_truncate 34']::text[]
@@ -162,5 +164,5 @@ DO $rollback_verify$ BEGIN
   OR EXISTS(SELECT 1 FROM pg_proc p JOIN pg_namespace n ON n.oid=p.pronamespace WHERE n.nspname='sessions' AND p.prosrc LIKE '%-- 062340 org erasure history%')
  THEN RAISE EXCEPTION USING ERRCODE='55000',MESSAGE='org erasure history: recording survived the down; rolled back';END IF;
 END $rollback_verify$;
-DELETE FROM sessions.__96bulls_migrations WHERE name='upstream:20261105062340_ingest_org_erasure_history.sql' AND sha256='a8f7f13c9a9d11e142fe40b643385152eaab48a3f58e63cb5ad6ccfb804821e8';
+DELETE FROM sessions.__96bulls_migrations WHERE name='upstream:20261105062340_ingest_org_erasure_history.sql' AND sha256='df39b8d2539a440d2950e36a55720e30d0541acd3e84686e08f82df6c60dce85';
 COMMIT;

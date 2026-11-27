@@ -7,7 +7,9 @@
  *     release), and is recorded after the release
  *   3 a writer holding a row lock (an UPDATE of an existing row) blocks the release, never deadlocks; a second writer
  *     queued on that row lock resolves too
- *   4 the down, then a reapply: a new coverage period; a cutoff bound before it is not covered
+ *   4 the down, then a reapply: a new coverage period; an epoch installed before it cannot bind
+ *   5 the cutoff is a fence: a write still uncommitted when the install starts blocks the install, so it commits (and
+ *     is visible to a FULL started after the install) before the cutoff; a write after the install is in the history
  */
 import { afterEach, describe, expect, setDefaultTimeout, test } from "bun:test";
 import pg from "pg";
@@ -41,11 +43,14 @@ async function owner(db: ScratchDatabase) {
 }
 const deletion = (session: string) =>
   `INSERT INTO sessions.upload_deletions(org_id,workspace_id,user_id,origin_id,source,session_id) VALUES('${ORG}','ws','u','o','claude','${session}')`;
-/** install, seal, bind (cutoff = install time), attempt: ready for bridge_complete; returns the epoch. */
+const SEAL = "b".repeat(64);
+const MID = "(SELECT installed_at + (sealed_at - installed_at) / 2 FROM sessions.ingest_org_admission_holds WHERE epoch=$2::uuid)";
+/** install, seal (the FULL receipt), bind that FULL, attempt: ready for bridge_complete; returns the epoch. */
 async function toAttempt(o: pg.Client) {
   const e = (await o.query("SELECT sessions.ingest_org_admission_hold_install($1, gen_random_uuid())::text e", [ORG])).rows[0].e as string;
-  await o.query(`SELECT sessions.ingest_org_admission_hold_seal($1,$2::uuid,'${"b".repeat(64)}')`, [ORG, e]);
-  await o.query("SELECT sessions.ingest_org_erasure_history_bind($1,$2::uuid,(SELECT installed_at FROM sessions.ingest_org_admission_holds WHERE epoch=$2::uuid))", [ORG, e]);
+  await o.query("SELECT pg_sleep(0.002)"); // a FULL start strictly between install and seal
+  await o.query(`SELECT sessions.ingest_org_admission_hold_seal($1,$2::uuid,'${SEAL}')`, [ORG, e]);
+  await o.query(`SELECT sessions.ingest_org_erasure_history_bind($1,$2::uuid,'full-run-1',${MID},$3)`, [ORG, e, SEAL]);
   await o.query(`SELECT sessions.ingest_org_admission_hold_marker_attempt($1,$2::uuid,'${"c".repeat(64)}')`, [ORG, e]);
   return e;
 }
@@ -104,19 +109,45 @@ describe.skipIf(!url)("062340 two-connection orderings (real PostgreSQL)", () =>
     expect(await watermark(o)).toBe(seen + 2);
   });
 
-  test("4. down then reapply: a new coverage period, and a cutoff before it is not covered", async () => {
+  test("4. down then reapply: a new coverage period; an epoch installed before it cannot bind", async () => {
     const db = await database();
     const o = await owner(db);
-    const before = (await o.query("SELECT clock_timestamp() t")).rows[0].t;
+    const e = (await o.query("SELECT sessions.ingest_org_admission_hold_install($1, gen_random_uuid())::text e", [ORG])).rows[0].e as string;
+    await o.query("SELECT sessions.ingest_org_admission_hold_release($1,$2::uuid,'verified_rollback',$3,NULL,NULL)", [ORG, e, EVIDENCE]);
     await o.query(DOWN);
     await o.query(deletion("s-gap")); // written while no recorder exists: never recorded
+    // A hold installed in the gap, then the reapply.
+    const e2 = (await o.query("SELECT sessions.ingest_org_admission_hold_install($1, gen_random_uuid())::text e", [ORG])).rows[0].e as string;
     await migrateAsOwner(db.ownerUrl);
     const cov = (await o.query("SELECT kind FROM sessions.ingest_org_erasure_history_coverage ORDER BY at")).rows.map((x) => x.kind);
     expect(cov).toEqual(["started", "ended", "started"]);
-    expect((await o.query("SELECT sessions.ingest_org_erasure_history_covers($1) c", [before])).rows[0].c).toBe(false);
     expect((await o.query("SELECT count(*)::int n FROM sessions.ingest_org_erasure_history WHERE erased_org=$1", [ORG])).rows[0].n).toBe(0);
-    const e = (await o.query("SELECT sessions.ingest_org_admission_hold_install($1, gen_random_uuid())::text e", [ORG])).rows[0].e as string;
-    await o.query(`SELECT sessions.ingest_org_admission_hold_seal($1,$2::uuid,'${"b".repeat(64)}')`, [ORG, e]);
-    await expect(o.query("SELECT sessions.ingest_org_erasure_history_bind($1,$2::uuid,$3)", [ORG, e, before])).rejects.toMatchObject({ code: "55000" });
+    await o.query("SELECT pg_sleep(0.002)");
+    await o.query(`SELECT sessions.ingest_org_admission_hold_seal($1,$2::uuid,'${SEAL}')`, [ORG, e2]);
+    await expect(o.query(`SELECT sessions.ingest_org_erasure_history_bind($1,$2::uuid,'full-run-1',${MID},$3)`, [ORG, e2, SEAL])).rejects.toMatchObject({ code: "55000" });
+    expect((await o.query("SELECT sessions.ingest_org_erasure_history_recording() r")).rows[0].r).toBe(true); // the reapply re-armed
+  });
+
+  test("5. the cutoff is a fence: an uncommitted write blocks the install and commits before it; a later write is counted", async () => {
+    const db = await database();
+    const o = await owner(db);
+    const p = await pair(db);
+    // The reproduced race: a write recorded, still uncommitted, when the hold is installed.
+    const r = await expectBlocks(p, { holder: p.a, waiter: p.b, hold: (c) => c.query(deletion("s-open")),
+      wait: (c) => c.query("SELECT sessions.ingest_org_admission_hold_install($1, gen_random_uuid())::text e", [ORG]) });
+    expect(r.receipt.waiting[0]).toMatchObject({ locktype: "advisory" });
+    expect(r.waited.ok).toBe(true);
+    const e = (r.waited as { value: pg.QueryResult }).value.rows[0].e as string;
+    // It committed before the install, so its row predates the cutoff and a FULL begun after the install sees it.
+    const t = (await o.query(`SELECT (SELECT max(at) FROM sessions.ingest_org_erasure_history WHERE erased_org=$1) < h.installed_at AS before,
+                                     EXISTS(SELECT 1 FROM sessions.upload_deletions WHERE org_id=$1 AND session_id='s-open') AS visible
+                                FROM sessions.ingest_org_admission_holds h WHERE h.epoch=$2::uuid`, [ORG, e])).rows[0];
+    expect(t).toEqual({ before: true, visible: true });
+    await o.query("SELECT pg_sleep(0.002)"); // a FULL start strictly between install and seal
+  await o.query(`SELECT sessions.ingest_org_admission_hold_seal($1,$2::uuid,'${SEAL}')`, [ORG, e]);
+    await o.query(`SELECT sessions.ingest_org_erasure_history_bind($1,$2::uuid,'full-run-1',${MID},$3)`, [ORG, e, SEAL]);
+    expect(await watermark(o)).toBe(0); // the pre-install write is FULL's, not the window's
+    await o.query(deletion("s-after"));
+    expect(await watermark(o)).toBe(1);
   });
 });

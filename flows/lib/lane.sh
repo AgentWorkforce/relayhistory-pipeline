@@ -173,7 +173,12 @@ case "$lane" in
     RH_HOLD_CONTAINER_PREFIX="rh-ci-pg-$run_id-hold" \
       bun src/session-ingest/__tests__/hold-harness/run.ts --pg-url "postgres://postgres@127.0.0.1:$port/postgres" --pg "$major" -- \
         src/session-ingest/__tests__/hold-harness/two-conn.postgres.test.ts \
-        src/session-ingest/__tests__/hold-harness/put-gate.minio.test.ts \
+        src/session-ingest/__tests__/hold-harness/put-gate.minio.test.ts
+    # The 062320/062340 proofs bootstrap scratch databases, which create cluster-wide roles; the auth and role proofs
+    # below refuse a cluster that already has them. So these run on the harness's own disposable PostgreSQL (same
+    # major), never on this lane's cluster.
+    RH_HOLD_CONTAINER_PREFIX="rh-ci-pg-$run_id-holdpg" \
+      bun src/session-ingest/__tests__/hold-harness/run.ts --pg "$major" -- \
         src/session-ingest/__tests__/org-admission-hold.postgres.test.ts \
         src/session-ingest/__tests__/org-erasure-history.postgres.test.ts
     SEARCH_CONFORMANCE_PG_URL="postgres://postgres@127.0.0.1:$port/postgres" bun run --filter @96bulls/pipeline test test/search-index-postgres-real.test.ts

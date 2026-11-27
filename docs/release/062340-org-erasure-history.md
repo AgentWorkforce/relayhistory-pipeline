@@ -22,17 +22,32 @@ window:
   row to another org is recorded for both orgs.
 - **The recorder**: an AFTER ROW trigger for INSERT, UPDATE and DELETE on every source. It takes 062320's org key
   SHARED, for each org the row names and in key order, and holds it until the writer commits.
-- **TRUNCATE refusal**: a BEFORE TRUNCATE trigger on every source refuses (55000) while any hold is not released.
-  It takes SHARE on the holds table, so it serializes with an install.
+- **TRUNCATE**: a BEFORE TRUNCATE trigger on every source refuses (55000) while any hold is not released. It takes
+  SHARE on the holds table, so it serializes with an install. A permitted truncate (no live hold) writes a
+  `truncated` coverage row, so coverage restarts after it.
 - **`sessions.ingest_org_erasure_history_coverage`**: insert-only. A `started` row is written at apply, after every
-  recorder exists, and an `ended` row at the down. Coverage runs from the last `started` row, only while no `ended`
-  row follows it.
-- **`sessions.ingest_org_erasure_history_bindings`** and **`_bind(org, epoch, cutoff)`**: the trusted FULL cutoff,
-  bound once per epoch while sealed.
-  - Bind takes (961996,1) SHARED, runs the slot checks, then takes the org key EXCLUSIVE, the same lock order as
-    every 062320 lifecycle function.
-  - It refuses (55000) a cutoff that coverage doesn't reach (b1's `history_not_covering_full_cutoff`), a cutoff
-    after the seal, a second, different cutoff, and an epoch that isn't sealed.
+  recorder exists, an `ended` row at the down, and a `truncated` row at a permitted truncate. Coverage runs from the
+  latest `started` or `truncated` row, only while no `ended` row follows the latest `started` one.
+- **Recorder continuity** (`_recording()`): all 30 source triggers must exist, be enabled in origin mode, and point at
+  the right function. Each one's `pg_trigger` row must still carry the `xmin` of the transaction that wrote the
+  current `started` row, which is the apply that created them. `ALTER TABLE ... DISABLE/ENABLE TRIGGER`, a
+  drop-and-recreate or a rename rewrites the row. So a disarm, even one already reverted, makes every later bind
+  and release refuse until a down and reapply start a new period. This was verified to survive `VACUUM FREEZE`.
+  Function rows are not fingerprinted, because a no-op `REVOKE` (the migrator's hardening) rewrites `pg_proc` too.
+- **The cutoff is the hold's `installed_at`, never a caller value.** 062320's install takes the org key EXCLUSIVE.
+  Every recorded write holds that key SHARED until it commits, so the install cannot proceed while any write is
+  uncommitted. Every write recorded before `installed_at` committed before the install, and is visible to a FULL
+  that starts after it. Every later write is recorded at or after `installed_at`. No margin is needed for
+  transaction lifetime.
+- **`sessions.ingest_org_erasure_history_bindings`** and **`_bind(org, epoch, full_run, full_started_at,
+  full_evidence)`**: record the FULL run's provenance against a sealed epoch, once. Bind:
+  - takes (961996,1) SHARED, runs the slot checks, then takes the org key EXCLUSIVE, the same lock order as every
+    062320 lifecycle function
+  - requires `full_evidence` to equal the seal's evidence (the bound FULL receipt)
+  - requires `installed_at < full_started_at <= sealed_at`
+  - requires coverage of the install and an intact recorder
+  - returns the cutoff
+  - refuses a second, different binding
 - **062320's `_release` and `_status`, replaced.** For `bridge_complete`, the release also requires, all under the
   EXCLUSIVE key:
   - this epoch's binding
@@ -40,6 +55,7 @@ window:
   - every one of the 30 source triggers present and enabled
   - `p_erasures` equal to the org's history rows at or after the cutoff
 
+  A release that claims an empty window (`p_detail = 'erasure_window_empty'`) must also pass `p_erasures = 0`.
   Every other line of the release is 062320's. `_status` is STABLE, so it returns the hold, that count,
   `by_source`, `covered`, `recording` and the coverage start from one snapshot.
 
@@ -69,8 +85,11 @@ No runtime role holds a table privilege on any source, so every write runs as th
 functions or an owner session.
 
 **Bypasses.** Only the owner can bypass the recorder: `ALTER TABLE ... DISABLE TRIGGER`, or `session_replication_role`,
-which needs a superuser. The release checks that all 30 triggers are enabled in origin mode and refuses otherwise.
-A superuser session in `replica` mode is outside this model, as it is for every trigger in the schema.
+which needs a superuser. The release checks continuity (the `pg_trigger` fingerprint above), not just the current
+state, so a reverted disarm is still caught. Two things are outside the model, stated:
+- the owner replacing the recorder function itself with `CREATE OR REPLACE` (only a DDL event trigger, which is a
+  privileged boundary change, could catch a transient replacement)
+- a superuser session in `replica` mode
 
 ## Lock orders, proven on real PostgreSQL
 
@@ -80,8 +99,10 @@ A superuser session in `replica` mode is outside this model, as it is for every 
 2. **Release first:** a write waits for the release, resumes after it, and is recorded after `released_at`.
 3. **Row lock:** a writer holding a row lock blocks the release, with no deadlock. A second writer queued on that
    row also resolves.
-4. **Down, then reapply:** a new coverage period starts. A write between them is never recorded, and a cutoff
-   before the reapply is not covered (bind refuses).
+4. **Down, then reapply:** a new coverage period starts. A write between them is never recorded, and an epoch
+   installed before the reapply cannot bind.
+5. **The cutoff is a fence:** a write still uncommitted when the install starts blocks the install, commits before
+   it, and is visible afterwards. A write after the install is counted.
 
 The PGlite suite covers the single-connection semantics: the 0 -> 1 race, a transient row, a same-count
 replacement, an update into the window, reassignment, an unrelated org, the bind refusals, a disarmed recorder,
@@ -89,14 +110,19 @@ TRUNCATE, immutability and runtime-role access.
 
 ## Residuals, stated
 
-- **Timing margin.** `at` is the recorder's clock, not the commit time. A write recorded before the cutoff that
-  commits after the FULL snapshot is invisible to both. The FULL margin (cutoff = FULL start minus margin, 15
-  minutes in the bridge) must exceed the longest writer transaction, as it must for the window proof itself.
-- **No history before apply.** History exists only from the apply, so every wave's FULL must start after the apply
-  plus the margin. Bind enforces that.
+- **The FULL must start after the install.** Bind checks the stated `full_started_at`, and the seal binds the
+  FULL receipt's hash. The start time itself is the bridge's attestation.
+- **No history before apply.** History exists only from the apply. An epoch installed before the current coverage
+  start cannot bind.
+- **Erasures during the hold are counted, not frozen.** An erasure admitted after the install makes the window
+  non-empty, and the bridge must replay it. The per-org erasure freeze (b1, separate branch) would refuse them
+  instead.
 - **The bridge must bind.** `review/backlog-ops-hold-bridge` refuses every release (`release_watermark_partial`)
-  until it binds to this contract: `_bind` after the seal, then the status read (`erasures`, `by_source`, `covered`,
-  `recording`) in the same statement as its window proof, and `p_erasures` from that read.
+  until it binds to this contract:
+  1. `_bind` after the seal
+  2. the status read (`erasures`, and `erasure_history` `{cutoff, full_run, full_started_at, covered, recording,
+     coverage_started_at, by_source}`) in the same statement as its window proof
+  3. a release with `p_erasures` from that read (and `p_detail = 'erasure_window_empty'` for the empty path)
 
 ## Retention and erase policy
 
