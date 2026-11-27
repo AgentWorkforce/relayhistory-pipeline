@@ -264,6 +264,8 @@ export class Syncer {
         const r = await exportUnit(target, unit, lane.source, {
           // Work driven by a change must see a fence written with that change.
           freshFence: work.kind !== "recent" && work.kind !== "history",
+          // Keep each stream at its first exported location: an earlier first_ts must not fork the session (datePin).
+          priorKeys: prior?.keys,
           onLease: (k) => {
             const prefix = k.slice(0, -"manifest.json".length);
             if (!this.state.acquireLease(prefix, LEASE_HOLDER))
