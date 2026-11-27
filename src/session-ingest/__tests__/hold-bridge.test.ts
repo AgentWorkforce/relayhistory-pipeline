@@ -142,6 +142,7 @@ function deps(store: ObjectStore, over: Record<string, unknown> = {}) {
     store, keyRoot: ROOT, org: ORG, epoch: E, now: () => NOW,
     resetUploadedSessions: async (t: LedgerTenant, r: string) => { calls.push(["reset", t, r]); return 3; },
     eraseLogPayloads: async (t: LedgerTenant) => { calls.push(["logs", t]); return 2; },
+    userGenerationBoundary: async () => true,
     setSessionUploads: async (i: SelectionInput) => { calls.push(["fence", i]); },
     resolveSessionTargets: async () => ({ complete: true, targets: [{ userId: "user-a", originId: "origin-a", source: "claude", sessionId: "sess-1" },
       { userId: "user-b", originId: "origin-b", source: "claude", sessionId: "sess-1" }] }),
@@ -200,6 +201,17 @@ test("replay, user erase before the SQL erase reached bytes_verified: no effect,
   const { d, calls } = deps(fresh());
   expect(await replayErasure(d, { ...userErase, bytesVerified: false })).toBe("erasure_bytes_unverified");
   expect(calls).toEqual([]);
+});
+
+test("replay, user erase without a proven generation boundary (today: none exists): held even after bytes_verified", async () => {
+  for (const over of [{ userGenerationBoundary: undefined }, { userGenerationBoundary: async () => false }, { userGenerationBoundary: async () => { throw new Error("x"); } }]) {
+    const store = fresh();
+    const { d, calls } = deps(store, over);
+    const outcome = await replayErasure(d, userErase);
+    expect(["erasure_generation_unproven", "replay_failed"]).toContain(outcome);
+    expect(calls).toEqual([]);
+    expect((await bridgeCompleteVerdict(store, ROOT, ORG, hold("marker_attempted"), E, [userErase])).code).toBe("erasure_unreplayed");
+  }
 });
 
 test("replay failures write no receipt (retried later); a corrupt receipt is never taken as done", async () => {

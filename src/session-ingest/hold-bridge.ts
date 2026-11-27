@@ -19,7 +19,10 @@
  *                       before destructive cleanup. No such manifest exists yet, so every session erase replays to
  *                       session_manifest_missing (no receipt), which blocks bridge_complete. Fail closed.
  *        user erase     only once the SQL erase reached bytes_verified (the artifact lane's own byte receipt, a
- *                       separate prerequisite): erasure_bytes_unverified otherwise, no receipt.
+ *                       separate prerequisite): erasure_bytes_unverified otherwise, no receipt. AND only with a proven
+ *                       generation boundary (userGenerationBoundary: a late old write cannot survive the replay, and a
+ *                       replay after release preserves new uploads). No such proof exists yet, so every user erase
+ *                       replays to erasure_generation_unproven (no effect, no receipt), which holds bridge_complete.
  *   4. bridge_complete gate (bridgeCompleteVerdict): every erasure in the set, re-read just before the release, has a
  *      receipt for this epoch. Otherwise the release is refused. After any marker attempt the only release is
  *      `bridge_complete` (releaseAllowed): there is no rollback after an attempt.
@@ -191,6 +194,12 @@ export interface ReplayDeps {
   resetUploadedSessions(tenant: LedgerTenant, requestId: string): Promise<number>;
   /** ledger-log-erase.ts eraseLogPayloads for the user. */
   eraseLogPayloads(tenant: LedgerTenant): Promise<number>;
+  /**
+   * The user-erase generation boundary: true only when it proves, for this erasure, that no old-generation write can
+   * land after the replay and that the replay cannot remove a post-release upload. NOT BUILT: absent, every user erase
+   * replays to erasure_generation_unproven.
+   */
+  userGenerationBoundary?(tenant: LedgerTenant, requestId: string): Promise<boolean>;
   /** ledger-s3.ts s3Ledger(...).setSessionUploads: the session's S3 fence deletion for one owner. */
   setSessionUploads(input: SelectionInput): Promise<void>;
   /**
@@ -203,7 +212,8 @@ export interface ReplayDeps {
   now(): number;
 }
 
-export type ReplayOutcome = "replayed" | "already" | "session_manifest_missing" | "session_coverage_partial" | "erasure_bytes_unverified" | "replay_failed";
+export type ReplayOutcome = "replayed" | "already" | "session_manifest_missing" | "session_coverage_partial" | "erasure_bytes_unverified"
+  | "erasure_generation_unproven" | "replay_failed";
 async function readReceipt(store: ObjectStore, key: string): Promise<unknown | null> {
   try { return JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(await readAll((await store.getObject(objectKey(key))).body))); }
   catch (error) { if (isObjectStoreError(error, "not_found")) return null; return undefined; }
@@ -224,6 +234,7 @@ export async function replayErasure(d: ReplayDeps, e: Erasure): Promise<ReplayOu
     if (e.kind === "user") {
       if (!e.bytesVerified) return "erasure_bytes_unverified";
       const tenant = { orgId: d.org, workspaceId: e.workspaceId, userId: e.userId };
+      if (!d.userGenerationBoundary || !(await d.userGenerationBoundary(tenant, e.requestId))) return "erasure_generation_unproven";
       counts.reset = await d.resetUploadedSessions(tenant, e.requestId);
       counts.payloads = await d.eraseLogPayloads(tenant);
     } else {
@@ -256,7 +267,8 @@ export const ERASURE_REREAD_LIMIT = 8;
  * the exclusive key; the set is never logged.
  */
 export async function replayErasures(d: ReplayDeps, readCount: () => Promise<number>, readSet: () => Promise<Erasure[]>) {
-  const out: Record<ReplayOutcome, number> = { replayed: 0, already: 0, session_manifest_missing: 0, session_coverage_partial: 0, erasure_bytes_unverified: 0, replay_failed: 0 };
+  const out: Record<ReplayOutcome, number> = { replayed: 0, already: 0, session_manifest_missing: 0, session_coverage_partial: 0, erasure_bytes_unverified: 0,
+    erasure_generation_unproven: 0, replay_failed: 0 };
   const done = new Set<string>();
   for (let i = 0; i < ERASURE_REREAD_LIMIT; i++) {
     const before = await readCount();

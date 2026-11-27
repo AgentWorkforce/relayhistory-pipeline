@@ -442,6 +442,10 @@ calls it yet.
   - A user erase replays only once the SQL erase reached `bytes_verified`. That is the artifact lane's
     own byte receipt, a separate prerequisite. Until then the replay returns `erasure_bytes_unverified`
     and writes no receipt.
+  - Even after `bytes_verified`, a user erase also needs a proven generation boundary
+    (`userGenerationBoundary`): a late old write cannot survive the replay, and a replay after release
+    keeps new uploads. No such proof exists yet, so every user erase returns
+    `erasure_generation_unproven`, with no effect and no receipt, and `bridge_complete` stays held.
   - A session erase maps to the S3 fence deletion (`setSessionUploads`, `enabled: false`) of every
     target in a complete erase manifest: every alias, for every owner, at every recorded origin, the
     turns origin included. S3 owner stubs can be partial: the SQL erase unions owners from ownership,
@@ -449,7 +453,10 @@ calls it yet.
     target manifest captured under the erase lock before destructive cleanup.
   - No such manifest exists yet. Every session erase replays to `session_manifest_missing` (or
     `session_coverage_partial`) and writes no receipt, so it blocks `bridge_complete`. This fails
-    closed. A cross-lane dependency remains open: the erase lane has to record that manifest.
+    closed. A cross-lane dependency remains open: the erase lane has to record that manifest. Its design
+    belongs to the erase-lane owner (layered-sessions-pipeline, with the 050000/050010 author). This
+    code only consumes it and refuses on incomplete evidence. Historic erases recorded without a
+    manifest stay blocked unless an independent completeness proof is supplied.
   - Each replay writes a create-only receipt at
     `96bulls/.ledger/hold-bridge/<org>/<epoch>/erasures/<hash of the request>.json`. A retry finds it
     and re-applies nothing.
