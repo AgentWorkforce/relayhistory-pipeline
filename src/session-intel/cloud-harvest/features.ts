@@ -5,6 +5,7 @@
  */
 import { createHash } from "node:crypto";
 import { canonicalTs } from "./instant.ts";
+import { ghCommands } from "./commands.ts";
 
 export interface RawEvent {
   eventId: string;
@@ -72,11 +73,9 @@ const eventIdOf = (v: unknown) => {
 const isoOf = (v: unknown) => canonicalTs(v) ?? "";
 
 const GIT = /\bgit\s+(?:-C\s+\S+\s+)?(commit|push|checkout|switch|branch|rebase|merge|revert|reset|cherry-pick|worktree|pull|fetch|stash)\b/g;
-const GH = /\bgh\s+(pr|issue|api)\s*(create|merge|close|view|checkout|comment|review|list)?\b/g;
 const NEW_BRANCH = /\bgit\s+(?:-C\s+\S+\s+)?(?:checkout\s+-[bB]|switch\s+-[cC]|worktree\s+add\s+(?:\S+\s+)?-[bB])\s+['"]?([A-Za-z0-9._\/-]+)/g;
 const PUSH_BRANCH = /\bgit\s+(?:-C\s+\S+\s+)?push\s+(?:-\S+\s+)*(?:origin|upstream)\s+(?:HEAD:)?['"]?([A-Za-z0-9._\/-]+)/g;
 const PR_URL = /github\.com\/([A-Za-z0-9._-]+\/[A-Za-z0-9._-]+)\/pull\/(\d{1,7})\b/g;
-const GH_PR_NUM = /\bgh\s+pr\s+(?:view|merge|close|checkout|comment|review|diff|edit|ready)\s+#?(\d{1,7})\b/g;
 const COMMIT_OUT = /^\[[^\]\s]+\s+(?:\(root-commit\)\s+)?([0-9a-f]{7,40})\]/gm;
 /** `[via Agent Relay — from @a (addr) to @b · message 123 · ref …]` as the relay injects it. */
 const RELAY = /\[via Agent Relay\s+[—-]\s+from\s+@([A-Za-z0-9._@:-]{1,200})(?:\s+\([^)]{0,300}\))?\s+to\s+@([A-Za-z0-9._@:-]{1,200})(?:\s+·\s+message\s+([0-9]{1,30}))?/;
@@ -119,14 +118,25 @@ function touchedPaths(text: string, isCall: boolean, isResult: boolean): EventFa
   return out.filter((t) => looksLikePath(t.path) && !seen.has(t.path) && (seen.add(t.path), true)).slice(0, MAX_LIST);
 }
 
-function ghOps(text: string): GhOp[] {
+const GH_GROUPS = new Set(["pr", "issue", "api"]);
+const GH_PR_VERBS = new Set(["create", "merge", "close", "view", "checkout", "comment", "review", "list"]);
+const GH_PR_NUMBERED = new Set(["view", "merge", "close", "checkout", "comment", "review", "diff", "edit", "ready"]);
+
+/** The `gh` operations a call executes (commands.ts): `gh` as a command word, never quoted text or echoed prose. */
+function ghOps(gh: string[][]): GhOp[] {
   const out: GhOp[] = [];
-  for (const m of text.matchAll(GH)) {
-    if (m[1] === "api") out.push("api");
-    else if (m[1] === "issue") { if (m[2] === "create") out.push("issue-create"); }
-    else if (m[2]) out.push(`pr-${m[2]}` as GhOp);
+  for (const [group, verb] of gh) {
+    if (!group || !GH_GROUPS.has(group)) continue;
+    if (group === "api") out.push("api");
+    else if (group === "issue") { if (verb === "create") out.push("issue-create"); }
+    else if (verb && GH_PR_VERBS.has(verb)) out.push(`pr-${verb}` as GhOp);
   }
   return out;
+}
+
+/** `gh pr <verb> [#]N`: the PR number an executed command names. */
+function ghPrNumbers(gh: string[][]): string[] {
+  return gh.filter(([g, v, n]) => g === "pr" && v && GH_PR_NUMBERED.has(v) && n && /^#?\d{1,7}$/.test(n)).map(([, , n]) => `#${n!.replace(/^#/, "")}`);
 }
 
 export function eventFacts(e: RawEvent): EventFacts {
@@ -135,10 +145,11 @@ export function eventFacts(e: RawEvent): EventFacts {
   const isResult = e.type === "tool_result" || e.actorRole === "tool_result";
   // Commands are read from tool calls only, so an assistant explaining `git revert` is not a revert.
   const commandText = isCall ? text : "";
+  const gh = isCall ? ghCommands(text) : [];
   const branches = [...commandText.matchAll(NEW_BRANCH), ...commandText.matchAll(PUSH_BRANCH)].map((m) => m[1]!).filter((b) => SAFE_NAME.test(b) && b !== "HEAD");
   const prRefs = [
     ...[...text.matchAll(PR_URL)].map((m) => `${m[1]!.toLowerCase()}#${m[2]}`),
-    ...[...commandText.matchAll(GH_PR_NUM)].map((m) => `#${m[1]}`),
+    ...ghPrNumbers(gh),
   ];
   const relayMatch = e.actorRole === "user" || e.type === "user" || e.kind === "history" ? RELAY.exec(text) : null;
   return {
@@ -147,7 +158,7 @@ export function eventFacts(e: RawEvent): EventFacts {
     files: cap((e.filesTouched ?? []).filter((f) => typeof f === "string" && looksLikePath(f))),
     touched: touchedPaths(text, isCall, isResult),
     git: cap([...commandText.matchAll(GIT)].map((m) => m[1] as GitOp)),
-    gh: cap(ghOps(commandText)),
+    gh: cap(ghOps(gh)),
     branches: cap(branches), prRefs: cap(prRefs),
     shas: isResult ? cap([...text.matchAll(COMMIT_OUT)].map((m) => m[1]!)) : [],
     relay: relayMatch ? { from: relayMatch[1]!, to: relayMatch[2]!, messageId: relayMatch[3] ?? null } : null,

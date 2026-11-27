@@ -101,7 +101,9 @@ function fromFacts(s: Session, events: EventFacts[], observed: ObservedPolicy) {
     const adjacent = pendingCreate !== null && pendingCreate.seq !== undefined && e.seq === pendingCreate.seq + 1;
     if (pendingCreate && isResult && !adjacent) pendingCreate = null;
     if (pendingCreate && isResult) {
-      const url = e.prRefs.map((r) => PR_KEY.exec(r)).find((m) => m?.[1]);
+      // The result must identify exactly one PR: with two distinct PR URLs it cannot say which one was created.
+      const urls = [...new Map(e.prRefs.map((r) => PR_KEY.exec(r)).filter((m): m is RegExpExecArray => !!m?.[1]).map((m) => [`${m[1]!.toLowerCase()}#${m[2]}`, m])).values()];
+      const url = urls.length === 1 ? urls[0] : undefined;
       const failed = /error|fail/i.test(e.toolStatus ?? "");
       if (url && !failed) s.prs[pendingCreate.index] = { ts: e.ts, repo: url[1]!.toLowerCase(), number: Number(url[2]), action: "create" };
       else if (failed) s.prs.splice(pendingCreate.index, 1);

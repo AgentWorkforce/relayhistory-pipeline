@@ -465,3 +465,41 @@ describe("PR create claims: the result, at or after its call", () => {
     expect(prs.filter((p) => p.action === "create")).toEqual([]);
   });
 });
+
+describe("executed gh commands only, and one identifiable created PR", () => {
+  test("gh counts only as a command word: echoed, quoted or prose gh is not a command", async () => {
+    const { ghCommands } = await import("../cloud-harvest/commands.ts");
+    const verbs = (t: string) => ghCommands(t).map((w) => w.slice(0, 2).join(" "));
+    expect(verbs("gh pr create --title x")).toEqual(["pr create"]);
+    expect(verbs("cd repo && GH_TOKEN=x gh pr create --fill; gh pr merge 98")).toEqual(["pr create", "pr merge"]);
+    expect(verbs("bash -lc 'git push && gh pr create --fill'")).toEqual(["pr create"]);
+    expect(verbs('{"command":"gh pr create --title \\"x\\"","description":"open it"}')).toEqual(["pr create"]);
+    expect(verbs('exec {"input":"text(await tools.exec_command({cmd:`gh pr view 12`}))"}')).toEqual(["pr view"]);
+    expect(verbs("exec_command gh pr create --fill")).toEqual(["pr create"]);
+    expect(verbs("sudo -E gh pr create")).toEqual(["pr create"]);
+    for (const t of ['echo "gh pr create https://github.com/example/demo/pull/7"', "printf '%s' 'gh pr create'", "grep -r 'gh pr create' docs",
+      "I will run gh pr create next", 'git commit -m "run gh pr create later"', "echo 'unbalanced"]) expect(verbs(t)).toEqual([]);
+  });
+  test("an echoed create command and its echoed output own nothing", async () => {
+    const { eventFacts } = await import("../cloud-harvest/features.ts");
+    const call = eventFacts({ eventId: "c", ts: "2026-10-01T10:00:00Z", kind: "tool_call", type: "tool_call", toolName: "Bash", content: 'echo "gh pr create https://github.com/example/demo/pull/7"' });
+    const out = eventFacts({ eventId: "r", ts: "2026-10-01T10:00:01Z", type: "tool_result", actorRole: "tool_result", content: "gh pr create https://github.com/example/demo/pull/7\n" });
+    expect(call.gh).toEqual([]);
+    const prs = buildModel([row("author", "K")], [facts("author", [call, out])]).get("codex:author")!.prs;
+    expect(prs.filter((p) => p.action === "create")).toEqual([]);
+  });
+  test("a create result printing two distinct PR URLs claims neither", () => {
+    const prs = buildModel([row("author", "K")], [facts("author", [
+      fact("2026-10-01T10:00:00Z", { gh: ["pr-create"] }),
+      fact("2026-10-01T10:00:02Z", { type: "tool_result", prRefs: ["agentworkforce/relayhistory#9", "agentworkforce/relayhistory#10"] }),
+    ])]).get("codex:author")!.prs;
+    expect(prs.filter((p) => p.action === "create" && p.number > 0)).toEqual([]);
+    expect(prs.filter((p) => p.action === "mention").map((p) => p.number).sort()).toEqual([10, 9]);
+    // The same URL printed twice still identifies one PR.
+    const one = buildModel([row("author", "K")], [facts("author", [
+      fact("2026-10-01T10:00:00Z", { gh: ["pr-create"] }),
+      fact("2026-10-01T10:00:02Z", { type: "tool_result", prRefs: ["agentworkforce/relayhistory#10", "agentworkforce/relayhistory#10"] }),
+    ])]).get("codex:author")!.prs;
+    expect(one.filter((p) => p.action === "create").map((p) => p.number)).toEqual([10]);
+  });
+});

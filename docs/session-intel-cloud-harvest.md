@@ -36,7 +36,7 @@ Sessions from the harnesses in `CODING_SOURCES` have their events read, at up to
 
 - `files`: the event's `filesTouched`, where the harness records it;
 - `touched`: paths recovered from commands and their output, tagged by how they were seen;
-- git and gh operation codes, branch names, PR refs, commit shas, and the relay envelope's sender and recipient.
+- git and gh operation codes, branch names, PR refs, commit shas, and the relay envelope's sender and recipient. A `gh` operation is one the call executes (`commands.ts`): `gh` as the first word of a shell segment, after assignments and wrappers such as `sudo`, inside `bash -c` scripts, or in a JSON or code-mode `cmd`. Echoed, quoted or prose mentions of `gh` are not operations.
 
 The schema is closed and every kept string is validated: identifiers and codes must be identifier characters (no whitespace, so no prose), times must parse, and a path must be path characters only with a separator or an extension. Free text where a path is expected (a patch header, a redirect target) is dropped, not kept. No content string is ever returned. The receipt lists the withheld fields.
 
