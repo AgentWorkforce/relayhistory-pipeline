@@ -5,7 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 
-import { SECRET_LIKE, WORKFLOWS, latestRuns, parseWorkflows, refuseToPublish, snapshot, staleSnapshots } from "./remote-ci.mjs";
+import { SECRET_LIKE, WORKFLOWS, latestRuns, parseWorkflows, refuseToPublish, snapshot, staleSnapshots, tokenlessNpmrc } from "./remote-ci.mjs";
 
 test("the gate dispatches only ci.yml and pg-proof.yml, and both keep their push triggers", () => {
   assert.deepEqual(parseWorkflows("ci.yml,pg-proof.yml"), ["ci.yml", "pg-proof.yml"]);
@@ -155,4 +155,34 @@ test("a snapshot holding a secret-like file is never pushed, and a clean one is"
   git("add", "-A");
   git("commit", "-qm", "oops");
   assert.match(await refuseToPublish(git("rev-parse", "HEAD"), base, repo), /secret-like files \(\.env\.local\)/);
+});
+
+test("only the allowlisted agent/.npmrc may publish, and only without a credential", async () => {
+  const registry = "@agentworkforce:registry=https://npm.pkg.github.com\n";
+  assert.ok(tokenlessNpmrc("agent/.npmrc", registry));
+  for (const bad of ["//npm.pkg.github.com/:_authToken=abc\n", "_auth=Zm9v\n", "//r/:_password=x\n", "username=u\n", "//r/:_authToken=${NPM_TOKEN}\n", "keyfile=/k\n"])
+    assert.ok(!tokenlessNpmrc("agent/.npmrc", registry + bad), bad);
+  assert.ok(!tokenlessNpmrc(".npmrc", registry), "root .npmrc is not allowlisted");
+  assert.ok(!tokenlessNpmrc("other/.npmrc", registry), "other paths are not allowlisted");
+
+  const repo = mkdtempSync(join(tmpdir(), "publish-npmrc-"));
+  const git = (...args) => execFileSync("git", ["-C", repo, ...args], { encoding: "utf8" }).trim();
+  git("init", "-q", "-b", "main");
+  git("config", "user.email", "t@example.com");
+  git("config", "user.name", "t");
+  execFileSync("mkdir", ["-p", join(repo, "agent")]);
+  writeFileSync(join(repo, "agent", ".npmrc"), registry);
+  git("add", "-A");
+  git("commit", "-qm", "tokenless");
+  const base = git("rev-parse", "HEAD");
+  assert.equal(await refuseToPublish(base, base, repo), "");
+  writeFileSync(join(repo, "agent", ".npmrc"), registry + "//npm.pkg.github.com/:_authToken=abc\n");
+  git("add", "-A");
+  git("commit", "-qm", "token");
+  assert.match(await refuseToPublish(git("rev-parse", "HEAD"), base, repo), /secret-like files \(agent\/\.npmrc\)/);
+  writeFileSync(join(repo, ".npmrc"), registry);
+  writeFileSync(join(repo, "agent", ".npmrc"), registry);
+  git("add", "-A");
+  git("commit", "-qm", "root npmrc");
+  assert.match(await refuseToPublish(git("rev-parse", "HEAD"), base, repo), /secret-like files \(\.npmrc\)/);
 });

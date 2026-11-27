@@ -78,6 +78,15 @@ export function snapshot(include = []) {
 export const SECRET_LIKE = /(^|\/)(\.env(\.[^/]*)?|inputs\.json|[^/]*\.(pem|key|p12|pfx)|id_(rsa|dsa|ecdsa|ed25519)|\.npmrc|\.netrc|\.pypirc|credentials(\.json)?)$/;
 const SECRET_ALLOWED = /(^|\/)\.env\.example$/;
 
+/** Exactly these tracked .npmrc files may publish, and only while they carry no credential (agent/.npmrc is a scope-registry line, #213). */
+const TOKENLESS_NPMRC = new Set(["agent/.npmrc"]);
+/** Any line that could hold an npm credential: _authToken / _auth / _password / username / certfile / keyfile, scoped or not. */
+const NPMRC_CREDENTIAL = /(^|:)(_authToken|_auth|_password|username|certfile|keyfile)\s*=|\$\{[^}]*\}/im;
+/** True when a tracked .npmrc at `sha` is on the allowlist and holds no credential-shaped line. */
+export function tokenlessNpmrc(file, text) {
+  return TOKENLESS_NPMRC.has(file) && !NPMRC_CREDENTIAL.test(text);
+}
+
 /**
  * Why a snapshot must not leave this machine, or "" when it may. The remote
  * is public (and a sandbox upload leaves too): machine-local state and
@@ -90,7 +99,8 @@ export async function refuseToPublish(sha, base, root = ".") {
   const files = git(["-C", root, "ls-tree", "-r", "--name-only", sha]).split("\n");
   const local = files.filter((file) => MACHINE_LOCAL.some((dir) => file === dir || file.startsWith(`${dir}/`) || file.includes(`/${dir}/`)));
   if (local.length) return `the snapshot holds machine-local state (${local.slice(0, 5).join(", ")}); unstage it`;
-  const secret = files.filter((file) => SECRET_LIKE.test(file) && !SECRET_ALLOWED.test(file));
+  const secret = files.filter((file) => SECRET_LIKE.test(file) && !SECRET_ALLOWED.test(file)
+    && !(TOKENLESS_NPMRC.has(file) && tokenlessNpmrc(file, git(["-C", root, "show", `${sha}:${file}`]))));
   if (secret.length) return `the snapshot holds secret-like files (${secret.slice(0, 5).join(", ")}); unstage them`;
   try {
     const { addedHits } = await import("./publish-guard.mjs");
