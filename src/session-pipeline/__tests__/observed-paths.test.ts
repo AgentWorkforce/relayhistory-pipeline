@@ -13,7 +13,7 @@ describe("observedPaths", () => {
       .toEqual(["src/a.ts", "docs/b.md", "assets/logo.png"]);
     expect(observedPaths(" src/a.ts | 1 +\n 1 file changed, 1 insertion(+)")).toEqual(["src/a.ts"]);
   });
-  test("--stat renames yield their destination, plain or braced, as git prints them", () => {
+  test("--stat lines whose name is ambiguous (rename notation, braces) or quoted are skipped; the rest still count", () => {
     const block = [
       " keep.ts                                      |  2 ++",
       " old.ts => new.ts                             |  0",
@@ -24,7 +24,14 @@ describe("observedPaths", () => {
       " logo.bin                                     | Bin 6 -> 9 bytes",
       " 7 files changed, 2 insertions(+)",
     ].join("\n");
-    expect(observedPaths(block)).toEqual(["keep.ts", "new.ts", "src/new/a.ts", "deep/y.ts", "lib/sub/b.ts", "lib/c.ts", "logo.bin"]);
+    // Git prints a file literally named "old.ts => new.ts" the same way, so no rename line names a path.
+    expect(observedPaths(block)).toEqual(["keep.ts", "logo.bin"]);
+    expect(observedPaths(' "q\\"uote.txt" | 1 +\n plain.txt     | 1 +\n 2 files changed, 2 insertions(+)')).toEqual(["plain.txt"]);
+  });
+  test("status lines with quoted paths are skipped; the rest of the listing still counts", () => {
+    expect(observedPaths(' M "a b.txt"\n M ok.ts')).toEqual(["ok.ts"]);
+    expect(observedPaths('R  "a b" -> "c d"\n?? x.ts')).toEqual(["x.ts"]);
+    expect(observedPaths(' M "unterminated\n M ok.ts')).toEqual([]);
   });
   test("anything that is not exactly such a listing yields nothing", () => {
     for (const text of [
@@ -37,8 +44,6 @@ describe("observedPaths", () => {
       " a.ts | 3 +++\n 2 files changed, 3 insertions(+)",                        // file count must match
       " a.ts | 3 +++\n 1 file changed, 2 insertions(+)",                         // counts must add up
       " a.ts | 1 +\n longer.ts | 1 +\n 2 files changed, 2 insertions(+)",       // pipes must line up
-      " a => b => c | 0\n 1 file changed",                                       // one rename per line
-      " src/{a => {b}}/x | 0\n 1 file changed", " src/{a}/x | 0\n 1 file changed", // braces only as a rename
       ' M "path with spaces.ts"',                    // quoted paths are not read
       "   this sentence is indented by three spaces", // two spaces are not a status code
       "   - first point\n   - second point",           // nor is an indented list

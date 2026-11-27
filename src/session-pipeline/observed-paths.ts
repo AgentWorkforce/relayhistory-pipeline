@@ -16,10 +16,12 @@ export const MAX_OBSERVED_CONTENT = 256 * 1024;
  * `XY path` or `XY old -> new` (porcelain v1 short format). XY must be a code git prints (STATUS_CODES): untracked
  * `??`, ignored `!!`, an unmerged pair, or index and worktree states of which at least one is set. Two spaces never
  * occur, so indented text is not a listing. The arrow form is a rename or copy and appears exactly when XY holds `R`
- * or `C`. Git quotes any path containing whitespace or escapes, and quoted paths are not read, so a path here has no
- * whitespace: a line of prose cannot pass as one.
+ * or `C`. Git quotes any path containing whitespace, quotes or escapes (`"a b.txt"`); a quoted path is not decoded, so
+ * its line is skipped and the rest of the listing still counts. An unquoted path has no whitespace, so a line of
+ * prose cannot pass as one.
  */
-const STATUS_LINE = /^(\S\S|\S | \S) (?:([^\s"]\S*) -> )?([^\s"]\S*)$/;
+const QUOTED = '"(?:\\\\.|[^"\\\\])*"';
+const STATUS_LINE = new RegExp(`^(\\S\\S|\\S | \\S) (?:([^\\s"]\\S*|${QUOTED}) -> )?([^\\s"]\\S*|${QUOTED})$`);
 const UNMERGED = ["DD", "AU", "UD", "UA", "DU", "AA", "UU"];
 const STATUS_CODES = new Set([
   "??", "!!", ...UNMERGED,
@@ -28,12 +30,18 @@ const STATUS_CODES = new Set([
   // Index unchanged, worktree changed; " A" is an intent-to-add, " R"/" C" a worktree rename or copy.
   ...["M", "T", "D", "A", "R", "C"].map((y) => " " + y),
 ]);
-/** The path a status line names (a rename's or copy's destination), or null when it is not a line git can print. */
-function statusPath(line: string): string | null {
+/** A line that is well formed but names no path this parser stores (a quoted path, an ambiguous rename). */
+const SKIP = Symbol("skip");
+/**
+ * The path a status line names (a rename's or copy's destination), SKIP for a valid line whose path is quoted, or
+ * null when it is not a line git can print (which refuses the whole listing).
+ */
+function statusPath(line: string): string | typeof SKIP | null {
   const m = STATUS_LINE.exec(line);
   if (!m || !STATUS_CODES.has(m[1]!)) return null;
   const renames = /[RC]/.test(m[1]!);
-  return renames === (m[2] !== undefined) ? m[3]! : null;
+  if (renames !== (m[2] !== undefined)) return null;
+  return m[3]!.startsWith('"') ? SKIP : m[3]!;
 }
 /** `## branch...upstream` header of `git status -sb`. */
 const BRANCH_LINE = /^## \S/;
@@ -44,17 +52,14 @@ const BRANCH_LINE = /^## \S/;
 const STAT_LINE = /^ (\S.*?)( +)\| +(?:(\d+)(?: [+-]+)?|Bin \d+ -> \d+ bytes)$/;
 /** ` 3 files changed, 10 insertions(+), 2 deletions(-)` */
 const STAT_SUMMARY = /^ (\d+) files? changed(?:, (\d+) insertions?\(\+\))?(?:, (\d+) deletions?\(-\))?$/;
-/** A `--stat` rename: `old => new`, or a braced common part, `src/{old => new}/a.ts`. */
-const BRACED_RENAME = /^([^{}]*)\{([^{}]*) => ([^{}]*)\}([^{}]*)$/;
-
-/** A stat line's path: a rename's destination, or null when the rename notation is not one git prints. */
-function statPath(name: string): string | null {
-  const arrows = name.split(" => ").length - 1;
-  if (arrows === 0) return /[{}]/.test(name) ? null : name;
-  if (arrows !== 1) return null;
-  const b = BRACED_RENAME.exec(name);
-  if (b) return `${b[1]}${b[3]}${b[4]}`.replace(/\/{2,}/g, "/").replace(/^\//, "");
-  return /[{}]/.test(name) ? null : name.split(" => ")[1]!;
+/**
+ * A stat line's path, or SKIP when the stat text cannot name it unambiguously. `--stat` prints a name verbatim
+ * (unquoted, even with spaces), so a rename's `old => new` or braced `{old => new}` notation cannot be told from a
+ * file literally named that way, and a quoted name is git's escaped display string, not the file's name. Such lines
+ * are skipped; the block's other lines still count.
+ */
+function statPath(name: string): string | typeof SKIP {
+  return name.includes(" => ") || /[{}]/.test(name) || name.startsWith('"') ? SKIP : name;
 }
 
 /** A `--stat` block (stat lines, then its summary): the paths, or null when the block is not one git prints. */
@@ -67,8 +72,7 @@ function statBlock(body: string[], summary: string): string[] | null {
   const pipe = new Set(body.map((l) => l.indexOf(" | ")));
   const counted = rows.reduce((n, m) => n + Number(m![3] ?? 0), 0);
   if (pipe.size !== 1 || counted !== Number(sum[2] ?? 0) + Number(sum[3] ?? 0)) return null;
-  const paths = rows.map((m) => statPath(m![1]!));
-  return paths.every((p) => p !== null) ? paths as string[] : null;
+  return rows.map((m) => statPath(m![1]!)).filter((p): p is string => p !== SKIP);
 }
 
 function valid(path: string): boolean {
@@ -90,7 +94,7 @@ export function observedPaths(content: string | null | undefined): string[] {
   // git status --short (optionally -b): every line is a status line or the one branch header.
   const status = lines.filter((l, i) => !(i === 0 && BRANCH_LINE.test(l)));
   const named = status.map(statusPath);
-  if (status.length && named.every((p) => p !== null)) return cap(named as string[]);
+  if (status.length && named.every((p) => p !== null)) return cap(named.filter((p): p is string => p !== SKIP));
   // git diff --stat: stat lines, then exactly one summary line, last, consistent with them.
   const last = lines.at(-1)!, body = lines.slice(0, -1);
   const stat = statBlock(body, last);
