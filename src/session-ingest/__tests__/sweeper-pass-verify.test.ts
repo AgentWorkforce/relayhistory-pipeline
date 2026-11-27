@@ -24,7 +24,7 @@ import {
   SWEEPER_PASS_REASONS, sweeperVerifyHash, validSweeperPassSummary, verifySweeperPass, type SweeperPassReadVersions, type SweeperPassSummary,
   type SweeperPassVerifyRequest, type WriterProvenance,
 } from "../sweeper-pass-verify.ts";
-import { exitCodeFor, main as cli } from "../../../scripts/backlog-sweeper-verify.ts";
+import { exitCodeFor, main as cli, readCappedStdin, STDIN_LIMIT_BYTES } from "../../../scripts/backlog-sweeper-verify.ts";
 import { scratchStore } from "./support.ts";
 
 const ROOT = "96bulls";
@@ -338,6 +338,23 @@ describe("sweeper-pass-verify: writer provenance and digest binding", () => {
     expect(asked).toBe(1);
   });
 
+  test("a read without a valid LastModified carries no time, and no provider is asked", async () => {
+    const store = await seeded();
+    let asked = 0;
+    const vouches: WriterProvenance = async () => { asked++; return "verified"; };
+    const f = fakeS3(store);
+    const noTime = (async (input: URL | RequestInfo, init?: RequestInit) => {
+      const res = await f.fetcher(input, init);
+      const h = new Headers(res.headers);
+      h.delete("last-modified");
+      return new Response(res.body, { status: res.status, headers: h });
+    }) as typeof fetch;
+    const ro = s3GetOnly({ bucket: BUCKET, region: REGION, credentials: { accessKeyId: "a", secretAccessKey: "b" }, fetch: noTime });
+    const s = await verifySweeperPass(ro, request(), NOW, vouches, ROOT);
+    expect(s.reason).toBe("writer_unverified");
+    expect(asked).toBe(0);
+  });
+
   test("pointer / receipt digest mismatch is malformed and no evidence is consulted", async () => {
     const edited = await seeded();
     await putRaw(edited, rearmPassReceiptKey(ROOT, ORG_A, T0), receiptFor(ORG_A, { finishedAtMs: FIN + 1 }));
@@ -387,6 +404,37 @@ describe("sweeper-pass-verify: the production CLI", () => {
       expect(s).toMatchObject({ scope_hash: null, expectation_hash: null, latest_sha256: null, receipt_sha256: null, age_ms: null });
     }
   });
+
+  test("stdin is capped in BYTES while it is read: a never-closed pipe is refused at the cap, multibyte input by its bytes", async () => {
+    // A stream that keeps producing and never closes: refused once past the cap, without waiting for EOF.
+    let pulled = 0;
+    const endless = new ReadableStream<Uint8Array>({ pull(c) { pulled++; c.enqueue(new Uint8Array(4096).fill(0x61)); } });
+    await expect(readCappedStdin(endless)).rejects.toMatchObject({ code: "stdin_too_large" });
+    expect(pulled).toBeLessThanOrEqual(STDIN_LIMIT_BYTES / 4096 + 2);
+    const of = (b: Uint8Array) => new ReadableStream<Uint8Array>({ start(c) { c.enqueue(b); c.close(); } });
+    // 40,000 two-byte characters: 40,000 UTF-16 units (under the cap) but 80,000 bytes (over it).
+    const multibyte = new TextEncoder().encode("é".repeat(40_000));
+    await expect(readCappedStdin(of(multibyte))).rejects.toMatchObject({ code: "stdin_too_large" });
+    expect((await cli(ARGS, ENV, () => "é".repeat(40_000))).reason).toBe("stdin_too_large");
+    expect(await readCappedStdin(of(new TextEncoder().encode("é".repeat(30_000))))).toBe("é".repeat(30_000));
+    await expect(readCappedStdin(of(new Uint8Array([0xff, 0xfe])))).rejects.toMatchObject({ code: "stdin_invalid" });
+    expect(await readCappedStdin(of(new Uint8Array(STDIN_LIMIT_BYTES).fill(0x20)))).toHaveLength(STDIN_LIMIT_BYTES);
+  });
+
+  test("the real CLI process refuses an oversized stdin on a pipe left open, and exits 1 without waiting for EOF", async () => {
+    const script = join(dirname(fileURLToPath(import.meta.url)), "../../../scripts/backlog-sweeper-verify.ts");
+    const env: Record<string, string> = { PATH: process.env.PATH ?? "", HOME: process.env.HOME ?? "" };
+    const p = Bun.spawn([process.execPath, script, ...ARGS], { env, stdin: "pipe", stdout: "pipe", stderr: "ignore" });
+    p.stdin.write(new Uint8Array(STDIN_LIMIT_BYTES + 1).fill(0x61));
+    await p.stdin.flush();
+    // The pipe stays open: the process must not wait for EOF.
+    const exited = await Promise.race([p.exited, new Promise<"timeout">((r) => setTimeout(() => r("timeout"), 20_000))]);
+    if (exited === "timeout") p.kill();
+    expect(exited).toBe(1);
+    const out = JSON.parse((await new Response(p.stdout).text()).trim());
+    expect(out).toMatchObject({ mode: "sweeper-pass-verify", verdict: "refused", reason: "stdin_too_large" });
+    expect(validSweeperPassSummary(out)).toBe(true);
+  }, 30_000);
 
   test("403 is access_denied, 500 and network failure are store_error, with no error text in the summary", async () => {
     const store = await seeded();
@@ -485,14 +533,19 @@ describe("sweeper-pass-verify: no writes, ever", () => {
 
   test("write-factory trap: the production CLI, run with every store factory and the authority modules trapped, fires none", () => {
     const harness = join(dirname(fileURLToPath(import.meta.url)), "fixtures/sweeper-verify-trap-harness.ts");
-    const p = Bun.spawnSync([process.execPath, harness], { env: { PATH: process.env.PATH ?? "", HOME: process.env.HOME ?? "", TMPDIR: process.env.TMPDIR ?? "" },
-      timeout: 60_000 });
-    expect(p.exitCode).toBe(0);
+    // TMPDIR only when set (an empty one is not "unset": scratchStore would mkdir("")).
+    // Run from the ordinary unset environment (no TMPDIR at all), and with this run's TMPDIR when it has one.
+    const base: Record<string, string> = { PATH: process.env.PATH ?? "", HOME: process.env.HOME ?? "" };
+    const envs = [base, ...(process.env.TMPDIR ? [{ ...base, TMPDIR: process.env.TMPDIR }] : [])];
+    for (const env of envs) {
+    const p = Bun.spawnSync([process.execPath, harness], { env, timeout: 60_000 });
+    expect({ tmpdir: env.TMPDIR ?? null, exit: p.exitCode }).toEqual({ tmpdir: env.TMPDIR ?? null, exit: 0 });
     const out = JSON.parse(new TextDecoder().decode(p.stdout).trim().split("\n").at(-1)!);
     expect(out).toMatchObject({ seededOk: "written", hitsBeforeCli: [], hitsByCli: [], methods: ["GET", "GET"], armed: [true, true, true, true], authorityArmed: true });
     expect(out.summary).toMatchObject({ mode: "sweeper-pass-verify", verdict: "refused", reason: "writer_unverified" });
     expect(validSweeperPassSummary(out.summary)).toBe(true);
-  });
+    }
+  }, 120_000);
 
   test("access denied from a store throws nothing out of the verifier", async () => {
     const denied: RearmReceiptReadStore = { getObject: async () => { throw new ObjectStoreError("unauthorized", "s3", "denied"); } };

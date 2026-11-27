@@ -292,20 +292,24 @@ export type FreshSweeperPass =
  * What one GET of a pass object returned, from that same response (no extra read): its version attributes as the store
  * reported them and the sha256 of the exact bytes read. Not writer attribution by itself (sweeper-pass-verify.ts).
  */
-export interface RearmReceiptObjectRead { versionId?: string; eTag?: string; lastModifiedMs: number; sha256: string }
+/** `lastModifiedMs` is present only when the response carried a valid time (evidence never carries a non-time). */
+export interface RearmReceiptObjectRead { versionId?: string; eTag?: string; lastModifiedMs?: number; sha256: string }
 export type RearmScopeRead =
   | { ok: true; receipt: RearmPassReceipt; pointer: RearmReceiptObjectRead; object: RearmReceiptObjectRead }
   | { ok: false; reason: "missing" | "malformed" };
 const objectRead = (got: { bytes: Uint8Array; meta: ReadMeta }): RearmReceiptObjectRead => ({
   ...(typeof got.meta.version?.version === "string" && got.meta.version.version !== "" ? { versionId: got.meta.version.version } : {}),
   ...(typeof got.meta.version?.eTag === "string" && got.meta.version.eTag !== "" ? { eTag: got.meta.version.eTag } : {}),
-  lastModifiedMs: got.meta.lastModified instanceof Date ? got.meta.lastModified.getTime() : Number.NaN, sha256: sha256(got.bytes),
+  ...(got.meta.lastModified instanceof Date && Number.isFinite(got.meta.lastModified.getTime()) ? { lastModifiedMs: got.meta.lastModified.getTime() } : {}),
+  sha256: sha256(got.bytes),
 });
 
 /**
  * One scope's latest pointer and the receipt it names, both well formed and bound (the receipt's bytes hash to the
  * pointer's receiptSha256; start and finish agree), with each object's read attributes. Reads only; `malformed`
- * otherwise. freshSweeperPass is this plus the expectation match and the freshness bounds.
+ * otherwise. It is NOT a liveness or authority check: it matches no expectation and applies no freshness bound.
+ * Callers must apply rearmPassMatches and the freshness bounds themselves, or call freshSweeperPass, which is this
+ * plus both.
  */
 export async function readRearmPassScope(store: RearmReceiptReadStore, keyRoot: string, scope: string): Promise<RearmScopeRead> {
   const latest = await fetchObject(store, rearmPassLatestKey(keyRoot, scope));

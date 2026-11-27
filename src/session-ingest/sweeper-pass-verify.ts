@@ -170,7 +170,7 @@ function identityChecks(r: RearmPassReceipt, keyRoot: string, q: SweeperPassVeri
 }
 
 const versionHash = (o: RearmReceiptObjectRead) =>
-  o.versionId === undefined ? null : sweeperVerifyHash("version", JSON.stringify([o.versionId, o.eTag ?? null, o.lastModifiedMs]));
+  o.versionId === undefined ? null : sweeperVerifyHash("version", JSON.stringify([o.versionId, o.eTag ?? null, o.lastModifiedMs ?? null]));
 
 /**
  * Verify the serving sweeper's latest pass over the request's org at `nowMs`. Never throws (store errors become
@@ -223,10 +223,11 @@ export async function verifySweeperPass(store: RearmReceiptReadStore, request: u
   checks.fresh = "ok";
 
   // Who wrote the exact versions read: only a trusted provider can say, and only about these reads.
-  // Evidence binds to versions: without a version id for BOTH objects there is nothing to bind it to, and no provider
-  // is asked.
+  // Evidence binds to versions: without a version id and a LastModified for BOTH objects there is nothing to bind it
+  // to, and no provider is asked.
+  const bindable = (o: RearmReceiptObjectRead) => o.versionId !== undefined && o.lastModifiedMs !== undefined;
   let writer: "verified" | "mismatch" | "unverified" = "unverified";
-  if (writerProvenance !== undefined && read.pointer.versionId !== undefined && read.object.versionId !== undefined) {
+  if (writerProvenance !== undefined && bindable(read.pointer) && bindable(read.object)) {
     try {
       const got = await writerProvenance(Object.freeze({ pointer: Object.freeze({ ...read.pointer }), receipt: Object.freeze({ ...read.object }) }));
       writer = got === "verified" || got === "mismatch" ? got : "unverified";

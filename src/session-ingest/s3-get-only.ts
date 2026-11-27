@@ -73,7 +73,8 @@ export function s3GetOnly(config: S3GetOnlyConfig): RearmReceiptReadStore {
       meta: {
         key,
         size: Number(res.headers.get("content-length") ?? 0),
-        lastModified: new Date(res.headers.get("last-modified") ?? 0),
+        // An absent header is an invalid Date (never the epoch): the reader then reports no time at all.
+        lastModified: new Date(res.headers.get("last-modified") ?? Number.NaN),
         version: { ...(eTag ? { eTag } : {}), ...(versionId && versionId !== "null" ? { version: versionId } : {}) },
         metadata: {},
       },

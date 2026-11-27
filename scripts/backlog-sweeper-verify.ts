@@ -19,7 +19,6 @@
  * Output: one JSON line, the closed summary (validSweeperPassSummary), for success and for every refusal, usage and
  * tool errors included. Exit 0 only when the verdict is `verified`; 1 otherwise.
  */
-import { readFileSync } from "node:fs";
 import { parseArgs } from "node:util";
 import { s3GetOnly } from "../src/session-ingest/s3-get-only.ts";
 import {
@@ -28,7 +27,29 @@ import {
 
 class ToolRefusal extends Error { constructor(readonly code: SweeperPassReason) { super(code); } }
 const fail = (code: SweeperPassReason): never => { throw new ToolRefusal(code); };
-const STDIN_LIMIT = 64 * 1024;
+/** The stdin cap, in BYTES, enforced while reading (an over-long or never-closed pipe is refused at the cap, not at EOF). */
+export const STDIN_LIMIT_BYTES = 64 * 1024;
+
+/**
+ * Read a byte stream to its end as UTF-8, refusing `stdin_too_large` as soon as more than STDIN_LIMIT_BYTES arrive (the
+ * stream is cancelled; no EOF is awaited) and `stdin_invalid` for bytes that are not UTF-8.
+ */
+export async function readCappedStdin(stream: ReadableStream<Uint8Array>, limit = STDIN_LIMIT_BYTES): Promise<string> {
+  const reader = stream.getReader();
+  const chunks: Uint8Array[] = [];
+  let total = 0;
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    total += value.byteLength;
+    if (total > limit) { await reader.cancel().catch(() => {}); return fail("stdin_too_large"); }
+    chunks.push(value);
+  }
+  const bytes = new Uint8Array(total);
+  let at = 0;
+  for (const c of chunks) { bytes.set(c, at); at += c.byteLength; }
+  try { return new TextDecoder("utf-8", { fatal: true }).decode(bytes); } catch { return fail("stdin_invalid"); }
+}
 
 export function parseSweeperVerifyArgs(argv: readonly string[]): { bucket: string; region: string } {
   let values;
@@ -41,7 +62,7 @@ export function parseSweeperVerifyArgs(argv: readonly string[]): { bucket: strin
 }
 
 export function parseSweeperVerifyStdin(raw: string): unknown {
-  if (raw.length > STDIN_LIMIT) fail("stdin_too_large");
+  if (Buffer.byteLength(raw, "utf8") > STDIN_LIMIT_BYTES) fail("stdin_too_large");
   const lines = raw.split("\n").filter((l) => l.trim() !== "");
   if (lines.length !== 1) fail("stdin_invalid");
   try { return JSON.parse(lines[0]!); } catch { return fail("stdin_invalid"); }
@@ -55,11 +76,11 @@ export interface SweeperVerifyDeps {
 }
 
 /** The production entrypoint: never throws, always a closed summary. */
-export async function main(argv: readonly string[], env: NodeJS.ProcessEnv, stdin: () => string, deps: SweeperVerifyDeps = {}): Promise<SweeperPassSummary> {
+export async function main(argv: readonly string[], env: NodeJS.ProcessEnv, stdin: () => string | Promise<string>, deps: SweeperVerifyDeps = {}): Promise<SweeperPassSummary> {
   let summary: SweeperPassSummary;
   try {
     const target = parseSweeperVerifyArgs(argv);
-    const request = parseSweeperVerifyStdin(stdin());
+    const request = parseSweeperVerifyStdin(await stdin());
     // The request is checked before credentials or the network (verifySweeperPass checks it again).
     if (!validSweeperPassRequest(request)) fail("invalid_request");
     const accessKeyId = env.AWS_ACCESS_KEY_ID, secretAccessKey = env.AWS_SECRET_ACCESS_KEY;
@@ -77,7 +98,7 @@ export async function main(argv: readonly string[], env: NodeJS.ProcessEnv, stdi
 export const exitCodeFor = (s: SweeperPassSummary) => (s.verdict === "verified" ? 0 : 1);
 
 if (import.meta.main) {
-  main(process.argv.slice(2), process.env, () => readFileSync(0, "utf8")).then((summary) => {
+  main(process.argv.slice(2), process.env, () => readCappedStdin(Bun.stdin.stream())).then((summary) => {
     process.stdout.write(JSON.stringify(summary) + "\n");
     process.exitCode = exitCodeFor(summary);
   }, () => { process.stdout.write(JSON.stringify(refusedSweeperPassSummary("internal_error")) + "\n"); process.exitCode = 1; });
