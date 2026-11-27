@@ -811,4 +811,53 @@ describe("round-5 controls", () => {
       expect(deriveState([s], seal(), "2026-11-07T00:00:00.000Z")).toEqual(before);
     }
   });
+
+  test("forge history: one merge's transitions keep the side branch's order; branch evidence never masks commit order", async () => {
+    const { execFileSync } = await import("node:child_process");
+    const { forgeFacts } = await import("../backfill/forge.ts");
+    const fixture = (name: string) => {
+      const repo = join(tmp, `r12-${name}`);
+      mkdirSync(repo);
+      const git = (args: string[], date: string) => execFileSync("git", ["-C", repo, ...args], { env: { ...process.env, GIT_AUTHOR_DATE: date, GIT_COMMITTER_DATE: date, GIT_AUTHOR_NAME: "t", GIT_AUTHOR_EMAIL: "t@example.invalid", GIT_COMMITTER_NAME: "t", GIT_COMMITTER_EMAIL: "t@example.invalid" }, encoding: "utf8" }).trim();
+      const commit = (file: string, date: string) => { writeFileSync(join(repo, file), file); git(["add", file], date); git(["commit", "-q", "-m", file], date); return git(["rev-parse", "HEAD"], date); };
+      git(["init", "-q", "-b", "main"], "2026-11-01T00:00:00Z");
+      commit("base.txt", "2026-11-01T00:00:00Z");
+      git(["checkout", "-q", "-b", "topic"], "2026-11-02T00:00:00Z");
+      const topic = commit("topic.txt", "2026-11-02T00:00:00Z");
+      git(["checkout", "-q", "main"], "2026-11-02T00:00:00Z");
+      const seal = () => forgeFacts("example/widgets", repo, "2026-10-31T00:00:00Z", "2026-11-30T00:00:00Z", "main", () => []);
+      const s = (branches: string[] = []) => ({ source: "claude", sessionId: "s", analyzedAt: "2026-11-02T01:00:00.000Z", startedAt: "2026-11-02T00:00:00.000Z", endedAt: "2026-11-02T01:00:00.000Z", title: "", asked: [],
+        built: [{ kind: "commit", ref: topic.slice(0, 7), what: "c", at: "2026-11-02T00:30:00.000Z", evidence: [] }], gaps: [], rationale: [], outcomeStatuses: [], dropped: {},
+        keys: { repo: "example/widgets", branches, prs: [], commits: [], files: [], taskRefs: [], parents: [] } }) as unknown as SessionFacts;
+      return { git, topic, seal, s, repo };
+    };
+    const cut = "2026-11-13T00:00:00.000Z";
+    // 1. Picked and reverted on a side branch, merged --no-ff on Nov 12: the file is absent, and the replay says so.
+    for (const repick of [false, true]) {
+      const { git, topic, seal, s, repo } = fixture(repick ? "side-repick" : "side");
+      git(["checkout", "-q", "-b", "side"], "2026-11-05T00:00:00Z");
+      git(["cherry-pick", topic], "2026-11-06T00:00:00Z");
+      git(["revert", "--no-edit", "HEAD"], "2026-11-07T00:00:00Z");
+      if (repick) git(["cherry-pick", topic], "2026-11-08T00:00:00Z");
+      git(["checkout", "-q", "main"], "2026-11-12T00:00:00Z");
+      git(["merge", "-q", "--no-ff", "-m", "merge side", "side"], "2026-11-12T00:00:00Z");
+      expect(existsSync(join(repo, "topic.txt"))).toBe(repick);
+      const f = seal();
+      const t = f.commits.find((x) => x.sha === topic)!.transitions!;
+      expect(t.every((x) => x.at === "2026-11-12T00:00:00.000Z" && x.seq !== undefined)).toBe(true);
+      expect(deriveState([s()], f, cut).state).toBe(repick ? "shipped" : "regressed");
+    }
+    // 2. Same-second pick, revert and re-pick on main: adding the topic branch as evidence keeps the commit order.
+    {
+      const { git, topic, seal, s, repo } = fixture("mask");
+      git(["cherry-pick", topic], "2026-11-06T00:00:00Z");
+      git(["revert", "--no-edit", "HEAD"], "2026-11-06T00:00:00Z");
+      git(["cherry-pick", topic], "2026-11-06T00:00:00Z");
+      expect(existsSync(join(repo, "topic.txt"))).toBe(true);
+      const f = seal();
+      expect(f.branches!.find((b) => b.name === "topic")!.landedSeq).toBeDefined();
+      expect(deriveState([s()], f, cut).state).toBe("shipped");
+      expect(deriveState([s(["topic"])], f, cut).state).toBe("shipped");
+    }
+  });
 });

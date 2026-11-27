@@ -90,7 +90,8 @@ export function parseForge(raw: unknown): ForgeFacts {
     if (typeof g.name !== "string" || typeof g.defaultOn !== "boolean") throw new CorpusError("forge.json: bad flag");
   }
   for (const b of (f.branches ?? []) as Record<string, unknown>[]) {
-    only(b, ["name", "landed", "landedAt", "tipAt", "flagsAdded", "commits"], "forge.json branch");
+    only(b, ["name", "landed", "landedAt", "landedSeq", "tipAt", "flagsAdded", "commits"], "forge.json branch");
+    if (b.landedSeq !== undefined && !(Number.isInteger(b.landedSeq) && (b.landedSeq as number) >= 0)) throw new CorpusError("forge.json: bad branch");
     if (typeof b.name !== "string" || typeof b.landed !== "boolean" || !iso(b.tipAt) || (b.landedAt !== null && !iso(b.landedAt))) throw new CorpusError("forge.json: bad branch");
     if (b.commits !== undefined && (!Array.isArray(b.commits) || b.commits.length > 200 || b.commits.some((c) => typeof c !== "string" || !/^[0-9a-f]{40}$/u.test(c))))
       throw new CorpusError("forge.json: a branch's commits must be at most 200 full commit ids");

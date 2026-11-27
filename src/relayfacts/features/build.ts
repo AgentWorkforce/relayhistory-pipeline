@@ -72,7 +72,18 @@ type ForgeCommit = ForgeFacts["commits"][number];
 /** A commit's dated landings on the default branch: its transitions when known, else its first landing. */
 interface Transition { at: string; seq?: number; what: string }
 /** Time order, then integration order within one instant when both sides know it. */
-const transitionOrder = (a: Transition, b: Transition) => textCompare(a.at, b.at) || (a.seq !== undefined && b.seq !== undefined ? a.seq - b.seq : 0);
+const byTime = (a: Transition, b: Transition) => textCompare(a.at, b.at);
+/**
+ * The latest transition: the latest instant, and within it the highest integration position when every candidate
+ * has one. Otherwise the instant's order is unknown and the result says so (`seq` absent).
+ */
+function latestTransition(list: readonly Transition[]): Transition | undefined {
+  if (!list.length) return undefined;
+  const at = list.map((t) => t.at).sort(textCompare).pop()!;
+  const tied = list.filter((t) => t.at === at);
+  if (tied.every((t) => t.seq !== undefined)) return tied.reduce((m, t) => (t.seq! > m.seq! ? t : m));
+  return { at, what: tied[0]!.what };
+}
 function landingsOf(c: ForgeCommit): Transition[] {
   if (c.transitions) return c.transitions.filter((t) => t.kind === "landed").map((t) => ({ at: t.at, ...(t.seq !== undefined ? { seq: t.seq } : {}), what: t.by === c.sha ? `commit ${c.sha.slice(0, 12)} on the default branch` : `commit ${c.sha.slice(0, 12)} landed as ${t.by.slice(0, 12)}` }));
   return c.onDefaultBranch ? [{ at: c.defaultAt ?? c.at, what: `commit ${c.sha.slice(0, 12)} on the default branch` }] : [];
@@ -121,13 +132,13 @@ export function deriveState(sessions: readonly SessionFacts[], forgeIn: ForgeFac
     ...prs.filter((p) => p.state === "merged" && p.mergedAt && p.mergedAt < asOf).map((p) => ({ at: p.mergedAt!, what: `merged ${p.ref.replace("https://github.com/", "")}` })),
     // Every landing of a commit's patch known before the cut (a re-landing after a revert restores it).
     ...commits.flatMap((c) => landingsOf(c)).filter((l) => l.at < asOf),
-    ...branches.filter((b) => b.landed && b.landedAt && b.landedAt < asOf).map((b) => ({ at: b.landedAt!, what: `branch ${b.name} landed` })),
-  ].sort(transitionOrder);
-  const reverts = commits.flatMap((c) => revertsOf(c)).filter((r) => r.at < asOf).sort(transitionOrder);
+    ...branches.filter((b) => b.landed && b.landedAt && b.landedAt < asOf).map((b) => ({ at: b.landedAt!, ...(b.landedSeq !== undefined ? { seq: b.landedSeq } : {}), what: `branch ${b.name} landed` })),
+  ].sort(byTime);
+  const reverts = commits.flatMap((c) => revertsOf(c)).filter((r) => r.at < asOf).sort(byTime);
 
   if (commits.length || prs.length || branches.length) {
-    const lastMerge = merges[merges.length - 1];
-    const lastRevert = reverts[reverts.length - 1];
+    const lastMerge = latestTransition(merges);
+    const lastRevert = latestTransition(reverts);
     // Regressed when the last revert follows the last landing; at one instant the default branch's integration
     // order decides, and a tie nothing orders reads as regressed (the conservative call).
     const revertLast = lastRevert && (!lastMerge || lastRevert.at > lastMerge.at || (lastRevert.at === lastMerge.at && (lastRevert.seq === undefined || lastMerge.seq === undefined || lastRevert.seq > lastMerge.seq)));

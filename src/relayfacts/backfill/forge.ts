@@ -87,6 +87,7 @@ export function forgeFacts(repo: string, mirror: string, since: string, until: s
       state: p.state === "MERGED" ? "merged" as const : p.state === "CLOSED" ? "closed" as const : "open" as const,
       at: String(p.createdAt), mergedAt: p.mergedAt ?? null, closedAt: p.closedAt ?? null, branch: p.headRefName ?? null,
     }));
+  const sh = (cmd: string, ...args: string[]) => { try { return execFileSync("sh", ["-c", cmd, ...args], { encoding: "utf8", maxBuffer: 256 * 1024 * 1024 }).trim(); } catch { return ""; } };
   // Git commands take full refs (a tag or path named like a branch is never ambiguous); names are stored short.
   const mainRef = `refs/heads/${defaultBranch}`;
   const onDefault = new Set(git(mirror, ["rev-list", `--since=${since}`, `--until=${until}`, mainRef]).split("\n").filter(Boolean));
@@ -98,11 +99,15 @@ export function forgeFacts(repo: string, mirror: string, since: string, until: s
   //   commit time: an approximation a strict replay can exclude by this basis.
   const defaultAt = new Map<string, string>();
   const basis = new Map<string, "merge" | "committer">();
-  // Integration order on the default branch: the first-parent position (oldest in the walk first) of the commit
-  // that brought each commit in. It orders transitions that share an instant (git times are whole seconds).
+  // Integration order on the default branch, a total order: walking first-parent commits oldest first, the
+  // commits a merge brings in take the next positions in their own topological order (parents before children),
+  // then the merge itself. It orders transitions that share an instant (a merge dates all it brings in at once;
+  // git times are whole seconds). `stepOf` is the first-parent step that integrated each commit: two commits of
+  // one step that are not ancestor and descendant have no order of their own (parallel side branches).
   const seqOf = new Map<string, number>();
+  const stepOf = new Map<string, number>();
   const fp = git(mirror, ["log", "--first-parent", "--format=%H %P%x09%cI", `--since=${since}`, mainRef]).split("\n").filter(Boolean);
-  let seq = 0;
+  let seq = 0, step = 0;
   for (const l of fp.reverse()) {
     const [ids, rawAt] = l.split("\t");
     const [sha, first, ...merged] = ids!.split(" ");
@@ -110,9 +115,9 @@ export function forgeFacts(repo: string, mirror: string, since: string, until: s
     const at = gitTime(rawAt);
     defaultAt.set(sha, at);
     basis.set(sha, "committer");
-    seqOf.set(sha, seq);
-    if (first && merged.length) for (const m of merged) for (const c of git(mirror, ["rev-list", `${first}..${m}`]).split("\n").filter(Boolean)) if (!defaultAt.has(c)) { defaultAt.set(c, at); basis.set(c, "merge"); seqOf.set(c, seq); }
-    seq++;
+    if (first && merged.length) for (const m of merged) for (const c of git(mirror, ["rev-list", "--reverse", "--topo-order", `${first}..${m}`]).split("\n").filter(Boolean)) if (!defaultAt.has(c)) { defaultAt.set(c, at); basis.set(c, "merge"); seqOf.set(c, seq++); stepOf.set(c, step); }
+    seqOf.set(sha, seq++);
+    stepOf.set(sha, step++);
   }
   const commits: ForgeFacts["commits"] = [];
   // Every default-branch revert, by the (possibly abbreviated) sha it names.
@@ -161,6 +166,14 @@ export function forgeFacts(repo: string, mirror: string, since: string, until: s
       ...copies.map((x) => ({ at: x.at, kind: "landed" as const, by: x.sha, ...(x.seq !== undefined ? { seq: x.seq } : {}) })),
       ...copies.flatMap((x) => revertsOf(x.sha)).map((r) => ({ at: r.at, kind: "reverted" as const, by: r.by, ...(r.seq !== undefined ? { seq: r.seq } : {}) })),
     ].sort(transitionOrder);
+    // Within one integration step, an order between commits that are not ancestor and descendant is not known:
+    // those transitions lose their seq, so an unordered tie reads conservatively.
+    for (let i = 0; i < transitions.length; i++) for (let j = i + 1; j < transitions.length; j++) {
+      const a = transitions[i]!, b = transitions[j]!;
+      if (a.seq === undefined || b.seq === undefined || stepOf.get(a.by) !== stepOf.get(b.by) || a.by === b.by) continue;
+      const [lo, hi] = a.seq < b.seq ? [a, b] : [b, a];
+      if (sh(`git -C "$0" merge-base --is-ancestor "$1" "$2" && echo yes`, mirror, lo.by, hi.by) !== "yes") { delete (a as { seq?: number }).seq; delete (b as { seq?: number }).seq; }
+    }
     if (transitions.length > maxTransitions) throw new UsageError(`a commit has more than ${maxTransitions} landings and reverts: its history cannot be kept whole`);
     const firstRevert = transitions.find((t) => t.kind === "reverted");
     if (firstRevert) { c.revertedBy = firstRevert.by; c.revertedAt = firstRevert.at; }
@@ -171,8 +184,7 @@ export function forgeFacts(repo: string, mirror: string, since: string, until: s
   // Branch landing: a branch's work reached the default branch when its tip is an ancestor of it, when any of
   // its own commits has a default-branch copy with the same patch id, or when its combined diff (a squash) does.
   // A patch reached the default branch when its first default-branch copy did (that copy's defaultAt).
-  const mainPatch = new Map([...landedByPatch].map(([pid, l]) => [pid, l.at]));
-  const sh = (cmd: string, ...args: string[]) => { try { return execFileSync("sh", ["-c", cmd, ...args], { encoding: "utf8", maxBuffer: 256 * 1024 * 1024 }).trim(); } catch { return ""; } };
+  const mainPatch = landedByPatch;
   let docs = "";
   try {
     for (const path of git(mirror, ["ls-tree", "-r", "--name-only", mainRef, "--", "docs"]).split("\n").filter((p) => p.endsWith(".md")))
@@ -193,19 +205,22 @@ export function forgeFacts(repo: string, mirror: string, since: string, until: s
     // the walk (reachable before `since`) has no known landing time inside the window: its tip time stands.
     const tip = git(mirror, ["rev-parse", "--verify", `${ref}^{commit}`]).trim();
     let landedAt: string | null = ancestor ? (defaultAt.get(tip) ?? tipAt) : null;
+    // The landing's integration position, so a branch landing orders against commit transitions at one instant.
+    let landedSeq: number | undefined = ancestor ? seqOf.get(tip) : undefined;
     const own = git(mirror, ["rev-list", "--max-count=200", `${mainRef}..${ref}`]).split("\n").filter(Boolean);
     if (!landedAt) for (const sha of own) {
-      const at = mainPatch.get(patchOf.get(sha) ?? "");
-      if (at && (!landedAt || at > landedAt)) landedAt = at;
+      const copy = mainPatch.get(patchOf.get(sha) ?? "");
+      if (copy && (!landedAt || transitionOrder(copy, { at: landedAt, ...(landedSeq !== undefined ? { seq: landedSeq } : {}) }) > 0)) { landedAt = copy.at; landedSeq = copy.seq; }
     }
     if (!landedAt) {
       const pid = sh(`git -C "$0" diff "$(git -C "$0" merge-base "$2" "$1")" "$1" | git patch-id --stable | cut -d' ' -f1`, mirror, ref, mainRef);
-      if (pid) landedAt = mainPatch.get(pid) ?? null;
+      const copy = pid ? mainPatch.get(pid) : undefined;
+      if (copy) { landedAt = copy.at; landedSeq = copy.seq; }
     }
     // Flags the branch introduces: `*_ENABLED` names, and settings the docs give a default, on added lines.
     const added = sh(`git -C "$0" diff "$(git -C "$0" merge-base "$2" "$1")" "$1" | grep '^+' | grep -oE '[A-Z][A-Z0-9]*(_[A-Z0-9]+)+' | sort -u`, mirror, ref, mainRef);
     const flagsAdded = added.split("\n").filter((f) => f && (f.endsWith("_ENABLED") || known.has(f))).slice(0, 50);
-    branches.push({ name, landed: landedAt !== null, landedAt, tipAt, ...(flagsAdded.length ? { flagsAdded } : {}), ...(own.length ? { commits: own } : {}) });
+    branches.push({ name, landed: landedAt !== null, landedAt, ...(landedAt !== null && landedSeq !== undefined ? { landedSeq } : {}), tipAt, ...(flagsAdded.length ? { flagsAdded } : {}), ...(own.length ? { commits: own } : {}) });
   }
   return utcForge(parseForge({ defaultBranch, prs, commits, flags, branches }));
 }

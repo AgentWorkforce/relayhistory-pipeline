@@ -149,6 +149,8 @@ export interface ForgeFacts {
   /** Branches of the repository and whether their work reached the default branch (by ancestry or patch id). */
   branches?: Array<{
     name: string; landed: boolean; landedAt: string | null; tipAt: string; flagsAdded?: string[];
+    /** The landing's integration position on the default branch (see a commit transition's `seq`). */
+    landedSeq?: number;
     /** The branch's own commits (not on the default branch by ancestry), newest first, at most 200. */
     commits?: string[];
   }>;
