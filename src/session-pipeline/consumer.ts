@@ -11,6 +11,7 @@
  * them to the DLQ after `maxReceiveCount`.
  */
 import { errorFields, log, searchIndexErrorDetail } from "../shared/log.ts";
+import { dbErrorReasonField } from "../shared/db-error-reason.ts";
 import { parseQueueBody, sequencerAfter, type LandedEvent, type QueueOrigin } from "./s3-events.ts";
 import { indexPointer, type PointerDeps, type SessionScope } from "./pointer.ts";
 import { indexSearchScope, searchIndexPhaseMetrics, type SearchIndexDeps } from "./search-index.ts";
@@ -323,7 +324,8 @@ export async function processBatch(records: readonly QueueRecord[], deps: Consum
       } else scopes.set(id, { scope: outcome.scope, messageIds: [...messageIds], manifestKey: outcome.manifestKey, covered: { ...covered } });
     } catch (error) {
       const fields = errorFields(error);
-      log.error("pointer index failed", { stage: "session-indexed", ...fields, duration_ms: Date.now() - started });
+      // A 40001 also logs which known serialization failure it was (a closed slug, never the message).
+      log.error("pointer index failed", { stage: "session-indexed", ...fields, ...dbErrorReasonField(error), duration_ms: Date.now() - started });
       for (const id of messageIds) fail(id, FAST_RETRY_CODES.has(fields.error_code as string));
     }
   }

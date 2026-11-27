@@ -1,0 +1,58 @@
+/**
+ * Emitted JSON through the consumer path: a pointer failure with a pg-style 40001 logs "pointer index failed" with the
+ * closed db_error_reason slug, never the message text; other codes carry no db_error_reason. Synthetic ids only.
+ */
+import { expect, test } from "bun:test";
+import { processBatch } from "../consumer.ts";
+
+const KEY = "96bulls/org_synthetic/v1/ws=ws_synthetic/m=machine_a/h=claude/d=2026/11/06/s=session_synthetic/manifest.json";
+const BODY = JSON.stringify({ Records: [{ eventSource: "aws:s3", eventName: "ObjectCreated:Put", s3: { object: { key: encodeURIComponent(KEY) } } }] });
+
+/** The JSON lines written to stderr while `work` runs. */
+async function stderrJson(work: () => Promise<void>): Promise<Record<string, unknown>[]> {
+  const out: string[] = [];
+  const original = process.stderr.write.bind(process.stderr);
+  process.stderr.write = ((chunk: unknown) => { out.push(String(chunk)); return true; }) as typeof process.stderr.write;
+  try { await work(); } finally { process.stderr.write = original; }
+  return out.join("").split("\n").filter(Boolean).flatMap((l) => { try { return [JSON.parse(l) as Record<string, unknown>]; } catch { return []; } });
+}
+
+/** Pointer deps whose scope transaction raises `error` (as the pointer guard trigger would, under the lock). */
+function pointerRaising(error: unknown) {
+  return {
+    db: { query: async () => ({ rows: [] }) }, reader: { provider: "s3" },
+    orgs: { orgFor: async () => "org_synthetic" }, allowPrefix: () => true,
+    lock: async () => { throw error; }, exists: async () => true, fanout: { send: async () => {} },
+  } as never;
+}
+
+async function failedLines(error: unknown) {
+  let result: unknown;
+  const lines = await stderrJson(async () => { result = await processBatch([{ messageId: "m1", body: BODY }], { pointer: pointerRaising(error) }); });
+  expect(result).toEqual({ batchItemFailures: [{ itemIdentifier: "m1" }] });
+  return lines;
+}
+
+test("emitted JSON: a 40001 pointer failure logs db_error_reason=pointer_mutation_busy and no message text", async () => {
+  const lines = await failedLines(Object.assign(new Error("publication: pointer mutation busy"), { code: "40001" }));
+  const failed = lines.filter((l) => l.message === "pointer index failed");
+  expect(failed).toHaveLength(1);
+  expect(failed[0]).toMatchObject({ level: "error", stage: "session-indexed", error_code: "40001", db_error_reason: "pointer_mutation_busy" });
+  expect(JSON.stringify(lines)).not.toContain("pointer mutation busy");
+});
+
+test("emitted JSON: an unknown 40001 message is other, and its text is never logged", async () => {
+  const MARKER = "PRIVATE-MARKER-relation-secret_table";
+  const lines = await failedLines({ code: "40001", message: `${MARKER} could not serialize` });
+  const failed = lines.filter((l) => l.message === "pointer index failed");
+  expect(failed[0]).toMatchObject({ error_code: "40001", db_error_reason: "other" });
+  expect(JSON.stringify(lines)).not.toContain(MARKER);
+});
+
+test("emitted JSON: a non-40001 pointer failure carries no db_error_reason", async () => {
+  const lines = await failedLines({ code: "55P03", message: "publication: pointer mutation busy" });
+  const failed = lines.filter((l) => l.message === "pointer index failed");
+  expect(failed[0]).toMatchObject({ error_code: "55P03" });
+  expect("db_error_reason" in failed[0]!).toBe(false);
+  expect(JSON.stringify(lines)).not.toContain("pointer mutation busy");
+});
