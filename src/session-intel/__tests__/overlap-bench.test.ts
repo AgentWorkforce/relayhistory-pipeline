@@ -476,7 +476,8 @@ describe("executed gh commands only, and one identifiable created PR", () => {
     expect(verbs('{"command":"gh pr create --title \\"x\\"","description":"open it"}')).toEqual(["pr create"]);
     expect(verbs('{"cmd":"gh pr view 12","yield_time_ms":1000}')).toEqual(["pr view"]);
     expect(verbs("exec_command gh pr create --fill")).toEqual(["pr create"]);
-    expect(verbs("sudo -E gh pr create")).toEqual(["pr create"]);
+    expect(verbs("gh pr create > out.txt 2>&1")).toEqual(["pr create"]);
+    expect(verbs('git commit -m "fix #12" && gh pr create --body "a;b # c"')).toEqual(["pr create"]);
     for (const t of ['echo "gh pr create https://github.com/example/demo/pull/7"', "printf '%s' 'gh pr create'", "grep -r 'gh pr create' docs",
       "I will run gh pr create next", 'git commit -m "run gh pr create later"', "echo 'unbalanced",
       // JSON anywhere but the envelope is data; heredoc bodies are data; code-mode wrappers are not read.
@@ -486,6 +487,10 @@ describe("executed gh commands only, and one identifiable created PR", () => {
       "grep x <<< 'gh pr create'",
       'exec {"input":"text(await tools.exec_command({cmd:`gh pr view 12`}))"}',
       '{"cmd": 5}', "[1,2]", "{not json",
+      // Outside the grammar, the whole call yields nothing: comments, wrappers, other shell forms, substitution.
+      "printf ok # ignored; gh pr create", "command -v gh pr create", "env --help gh pr create", "bash helper -c 'gh pr create'",
+      "sudo -E gh pr create", "gh pr create &", 'echo "$(gh pr create)"', "(gh pr create)", "nohup gh pr create",
+      '{"cmd":"bash -lc \'printf ok # x; gh pr create\'"}',
     ]) expect(verbs(t)).toEqual([]);
   });
   test("an echoed create command and its echoed output own nothing", async () => {
@@ -523,5 +528,18 @@ describe("command envelopes: printf'd JSON and heredoc bodies own nothing", () =
     expect(call.gh).toEqual([]);
     const prs = buildModel([row("author", "K")], [facts("author", [call, out])]).get("codex:author")!.prs;
     expect(prs.filter((p) => p.action === "create")).toEqual([]);
+  });
+});
+
+describe("a gh inside a shell comment owns nothing, direct or wrapped", () => {
+  for (const [name, content] of [
+    ["direct", "printf ok # ignored; gh pr create"],
+    ["JSON cmd wrapping bash -c", '{"cmd":"bash -c \'printf ok # ignored; gh pr create\'"}'],
+  ] as const) test(name, async () => {
+    const { eventFacts } = await import("../cloud-harvest/features.ts");
+    const call = eventFacts({ eventId: "c", ts: "2026-10-01T10:00:00Z", kind: "tool_call", type: "tool_call", toolName: "Bash", content });
+    const out = eventFacts({ eventId: "r", ts: "2026-10-01T10:00:01Z", type: "tool_result", actorRole: "tool_result", content: "https://github.com/example/demo/pull/7\n" });
+    expect(call.gh).toEqual([]);
+    expect(buildModel([row("author", "K")], [facts("author", [call, out])]).get("codex:author")!.prs.filter((p) => p.action === "create")).toEqual([]);
   });
 });
