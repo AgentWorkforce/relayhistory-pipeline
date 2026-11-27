@@ -448,7 +448,7 @@ describe("observed paths (dormant option)", () => {
     const result = fx.projectionRows.find((r) => r.table === "convergence_events" && r.row.actor_role === "tool_result")!;
     const texts = ["   three spaces then an ordinary sentence", "   - a list item\n   - another", " M looks like status but is prose", "build ok\n M src/a.ts",
       "?? old -> synthetic-token", "UU old -> synthetic-token", "RR synthetic-token",
-      " synthetic confidential prose | Bin arbitrary log text\n 1 file changed", " old.ts => new.ts | 3 +++\n 1 file changed, 2 insertions(+)", ' "q\\"uote.txt" | 1 +\n 1 file changed, 1 insertion(+)', ' M "a b.txt"', '?? bad"name', "A  tail\u00a0", "A  tail\u00a0\n M ok.ts", "?? /tmp/non-repository-file", "R  a -> /b"];
+      " synthetic confidential prose | Bin arbitrary log text\n 1 file changed", " old.ts => new.ts | 3 +++\n 1 file changed, 2 insertions(+)", ' "q\\"uote.txt" | 1 +\n 1 file changed, 1 insertion(+)', ' M "a b.txt"', '?? bad"name', "A  tail\u00a0", "A  tail\u00a0\n M ok.ts", "?? /tmp/non-repository-file", "R  a -> /b", 'R  "src\u0000name" -> dst', 'R  "\\\\server\\share" -> dst'];
     for (const [i, content] of texts.entries()) fx.projectionRows.push({ table: "convergence_events", row: { ...result.row, event_id: `prose-${i}`, content } });
     const off = outputFactsFromScope(OUTPUT_FIXTURE_SCOPE, fx, 1), on = outputFactsFromScope(OUTPUT_FIXTURE_SCOPE, fx, 1, { observedPaths: true });
     for (const [i, e] of on.events.entries()) {

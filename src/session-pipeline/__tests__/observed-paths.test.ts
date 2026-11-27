@@ -27,6 +27,15 @@ describe("observedPaths", () => {
     expect(observedPaths(" M ok.ts ")).toEqual([]);                    // a trailing space is never trimmed away
     expect(observedPaths(" M a[1]~b.ts\r\n")).toEqual(["a[1]~b.ts"]);
   });
+  test("quoted operands: malformed quoting refuses the listing; a line with any well-formed quoted operand stores nothing", () => {
+    // Malformed: a raw control or non-ASCII character, or an escape git never writes.
+    for (const t of ['R  "src\u0000name" -> dst', ' M "\u00e9"\n M ok.ts', ' M "bad\\q"\n M ok.ts', ' M "tab\there"']) expect(observedPaths(t)).toEqual([]);
+    // Well formed: the line is skipped, its unquoted destination included; siblings count.
+    expect(observedPaths('R  "\\\\\\\\server\\\\share" -> dst\n M ok.ts')).toEqual(["ok.ts"]); // git's quoting of \\\\server\\share
+    expect(observedPaths('R  "\\\\server\\share" -> dst\n M ok.ts')).toEqual([]); // an escape git never writes (\\s)
+    expect(observedPaths('R  "a b" -> dst\n M ok.ts')).toEqual(["ok.ts"]);
+    expect(observedPaths(' M "caf\\303\\251"\n M "a\\tb"\n M ok.ts')).toEqual(["ok.ts"]);
+  });
   test("an absolute operand, on either side of a rename or copy, quoted or not, refuses the listing", () => {
     for (const t of ["?? /tmp/non-repository-file", " M ok.ts\n?? /etc/x", "R  /a -> b", "R  a -> /b", "C  a -> /b", '?? "/tmp/a b"', "?? C:/x", "R  a -> \"/b c\""])
       expect(observedPaths(t)).toEqual([]);

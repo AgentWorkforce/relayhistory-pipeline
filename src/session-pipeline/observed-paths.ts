@@ -28,7 +28,8 @@ export const MAX_OBSERVED_CONTENT = 256 * 1024;
  * line-based reading can delimit safely, so a listing with such a name is refused. Lines are never trimmed: the bytes
  * validated are the bytes stored.
  */
-const QUOTED = '"(?:\\\\.|[^"\\\\])*"';
+/** Git's C-style quoting, exactly: printable ASCII (space included) except `"` and `\\`, or one of git's escapes. */
+const QUOTED = '"(?:\\\\(?:[abfnrtv"\\\\]|[0-3][0-7]{2})|[ !#-\\[\\]-~])*"';
 const UNQUOTED = '[!#-\\[\\]-~]+';
 const STATUS_LINE = new RegExp(`^(\\S\\S|\\S | \\S) (?:(${UNQUOTED}|${QUOTED}) -> )?(${UNQUOTED}|${QUOTED})$`);
 const UNMERGED = ["DD", "AU", "UD", "UA", "DU", "AA", "UU"];
@@ -53,7 +54,9 @@ function statusPath(line: string): string | typeof SKIP | null {
   // git status --short prints names relative to the working directory, even for an absolute pathspec, so an
   // absolute operand (either side of a rename or copy, quoted or not) means the text is not git's listing.
   if ([m[2], m[3]].some((x) => x !== undefined && /^"?(?:\/|[A-Za-z]:)/.test(x))) return null;
-  return m[3]!.startsWith('"') ? SKIP : m[3]!;
+  // A line with any quoted operand stores nothing: its names are not decoded, and a rename's destination is not
+  // taken on the word of a source this parser cannot read.
+  return m[3]!.startsWith('"') || m[2]?.startsWith('"') ? SKIP : m[3]!;
 }
 /** `## branch...upstream` header of `git status -sb`. */
 const BRANCH_LINE = /^## \S/;
