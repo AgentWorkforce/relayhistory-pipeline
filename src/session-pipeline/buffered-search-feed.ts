@@ -182,11 +182,20 @@ export const isBufferedStageKey = (key: string, keyRoot: string) => {
   return m !== null && m[1] === keyRoot && !key.split("/").some((s) => s === "." || s === "..");
 };
 
+/** The feeder's SQL calls (sessions.buffered_search_feed_<query>), named on a failed call's error. */
+export type BufferedFeedQuery = "page" | "stage" | "advance";
+
 export class BufferedFeedError extends Error {
-  constructor(readonly code: string, readonly retryable = false) {
+  /** `query` names the SQL call that failed (sql_* codes only), so a timeout can be traced to its statement. */
+  constructor(readonly code: string, readonly retryable = false, readonly query?: BufferedFeedQuery) {
     super(`buffered search feed: ${code}`);
     this.name = "BufferedFeedError";
   }
+}
+
+/** `{ query }` for a BufferedFeedError raised by a feeder SQL call; `{}` for anything else. A fixed name, never SQL text. */
+export function bufferedFeedQueryField(error: unknown): { query?: BufferedFeedQuery } {
+  return error instanceof BufferedFeedError && error.query ? { query: error.query } : {};
 }
 
 export interface BufferedFeedConfig {
@@ -374,7 +383,7 @@ const keysetBefore = (a: { createdAt: string; stageToken: string }, b: { created
  */
 export function sqlBufferedFeedSource(db: SqlExecutor, options: { secondVersion?: boolean } = {}): BufferedFeedSource {
   const strict = options.secondVersion === true;
-  const call = async (name: "page" | "stage" | "advance", p: unknown): Promise<Record<string, unknown>> => {
+  const call = async (name: BufferedFeedQuery, p: unknown): Promise<Record<string, unknown>> => {
     let value: unknown;
     try { value = (await db.query<{ r: unknown }>(`SELECT sessions.buffered_search_feed_${name}($1::jsonb) AS r`, [JSON.stringify(p)])).rows[0]?.r; }
     catch (error) {
@@ -383,7 +392,7 @@ export function sqlBufferedFeedSource(db: SqlExecutor, options: { secondVersion?
       const code = (error as { code?: unknown } | null)?.code;
       // Serialization, lock and statement timeouts are transient: the page or message retries.
       const sqlstate = typeof code === "string" && /^[0-9A-Z]{5}$/.test(code) ? code : "unknown";
-      throw new BufferedFeedError(`sql_${sqlstate}`, ["40001", "40P01", "55P03", "57014", "08006", "08003", "unknown"].includes(sqlstate));
+      throw new BufferedFeedError(`sql_${sqlstate}`, ["40001", "40P01", "55P03", "57014", "08006", "08003", "unknown"].includes(sqlstate), name);
     }
     if (!obj(value)) bad("sql_result");
     return value as Record<string, unknown>;
