@@ -311,7 +311,8 @@ export async function backlogOpsRun(
     // An authority or backfill receipt conforms exactly to its mode's schema (keys, lists, hash positions, closed codes),
     // and a refusal keeps only a code from the mode's closed map, before the receipt is persisted or logged.
     if (schemaKind !== null) {
-      const r = authorityReceiptSummary(schemaKind, receipt.summary, { orgs: scope.orgs });
+      // The bridge's proofs must match the run's scope and the exact gate-derived cutoff the child was given.
+      const r = authorityReceiptSummary(schemaKind, receipt.summary, { orgs: scope.orgs, cutoffMs: isBridge(d.mode) ? since : null });
       receipt = { ...receipt, summary: r.summary, exitCode: r.ok ? receipt.exitCode : receipt.exitCode || 1 };
     }
   } catch (e) {
