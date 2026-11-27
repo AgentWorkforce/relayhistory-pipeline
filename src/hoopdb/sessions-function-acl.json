@@ -934,7 +934,7 @@
     "sessions.ingest_org_erasure_history_applied()": [
       "<owner>:EXECUTE"
     ],
-    "sessions.ingest_org_erasure_history_bind(text,uuid,text,timestamp with time zone,text)": [
+    "sessions.ingest_org_erasure_history_bind(text,uuid,text,bigint,text)": [
       "<owner>:EXECUTE"
     ],
     "sessions.ingest_org_erasure_history_coverage_start()": [

@@ -10,6 +10,8 @@
  *   4 the down, then a reapply: a new coverage period; an epoch installed before it cannot bind
  *   5 the cutoff is a fence: a write still uncommitted when the install starts blocks the install, so it commits (and
  *     is visible to a FULL started after the install) before the cutoff; a write after the install is in the history
+ *   6 a maintenance TRUNCATE in a REPEATABLE READ or SERIALIZABLE transaction whose snapshot predates a committed
+ *     install is refused 40001
  */
 import { afterEach, describe, expect, setDefaultTimeout, test } from "bun:test";
 import pg from "pg";
@@ -44,13 +46,15 @@ async function owner(db: ScratchDatabase) {
 const deletion = (session: string) =>
   `INSERT INTO sessions.upload_deletions(org_id,workspace_id,user_id,origin_id,source,session_id) VALUES('${ORG}','ws','u','o','claude','${session}')`;
 const SEAL = "b".repeat(64);
-const MID = "(SELECT installed_at + (sealed_at - installed_at) / 2 FROM sessions.ingest_org_admission_holds WHERE epoch=$2::uuid)";
+/** The bridge's selected FULL: started (integer ms) 1 ms after the install (the install-seal gap is >= 2 ms). */
+const MID = "(SELECT floor(extract(epoch FROM installed_at) * 1000)::bigint + 1 FROM sessions.ingest_org_admission_holds WHERE epoch=$2::uuid)";
+const FULL_ARGS = `'full-run-1',${MID}`;
 /** install, seal (the FULL receipt), bind that FULL, attempt: ready for bridge_complete; returns the epoch. */
 async function toAttempt(o: pg.Client) {
   const e = (await o.query("SELECT sessions.ingest_org_admission_hold_install($1, gen_random_uuid())::text e", [ORG])).rows[0].e as string;
   await o.query("SELECT pg_sleep(0.002)"); // a FULL start strictly between install and seal
   await o.query(`SELECT sessions.ingest_org_admission_hold_seal($1,$2::uuid,'${SEAL}')`, [ORG, e]);
-  await o.query(`SELECT sessions.ingest_org_erasure_history_bind($1,$2::uuid,'full-run-1',${MID},$3)`, [ORG, e, SEAL]);
+  await o.query(`SELECT sessions.ingest_org_erasure_history_bind($1,$2::uuid,${FULL_ARGS},$3)`, [ORG, e, SEAL]);
   await o.query(`SELECT sessions.ingest_org_admission_hold_marker_attempt($1,$2::uuid,'${"c".repeat(64)}')`, [ORG, e]);
   return e;
 }
@@ -124,7 +128,7 @@ describe.skipIf(!url)("062340 two-connection orderings (real PostgreSQL)", () =>
     expect((await o.query("SELECT count(*)::int n FROM sessions.ingest_org_erasure_history WHERE erased_org=$1", [ORG])).rows[0].n).toBe(0);
     await o.query("SELECT pg_sleep(0.002)");
     await o.query(`SELECT sessions.ingest_org_admission_hold_seal($1,$2::uuid,'${SEAL}')`, [ORG, e2]);
-    await expect(o.query(`SELECT sessions.ingest_org_erasure_history_bind($1,$2::uuid,'full-run-1',${MID},$3)`, [ORG, e2, SEAL])).rejects.toMatchObject({ code: "55000" });
+    await expect(o.query(`SELECT sessions.ingest_org_erasure_history_bind($1,$2::uuid,${FULL_ARGS},$3)`, [ORG, e2, SEAL])).rejects.toMatchObject({ code: "55000" });
     expect((await o.query("SELECT sessions.ingest_org_erasure_history_recording() r")).rows[0].r).toBe(true); // the reapply re-armed
   });
 
@@ -145,9 +149,22 @@ describe.skipIf(!url)("062340 two-connection orderings (real PostgreSQL)", () =>
     expect(t).toEqual({ before: true, visible: true });
     await o.query("SELECT pg_sleep(0.002)"); // a FULL start strictly between install and seal
   await o.query(`SELECT sessions.ingest_org_admission_hold_seal($1,$2::uuid,'${SEAL}')`, [ORG, e]);
-    await o.query(`SELECT sessions.ingest_org_erasure_history_bind($1,$2::uuid,'full-run-1',${MID},$3)`, [ORG, e, SEAL]);
+    await o.query(`SELECT sessions.ingest_org_erasure_history_bind($1,$2::uuid,${FULL_ARGS},$3)`, [ORG, e, SEAL]);
     expect(await watermark(o)).toBe(0); // the pre-install write is FULL's, not the window's
     await o.query(deletion("s-after"));
     expect(await watermark(o)).toBe(1);
+  });
+  test("6. a REPEATABLE READ or SERIALIZABLE maintenance transaction older than a committed install cannot TRUNCATE a source", async () => {
+    const db = await database();
+    const o = await owner(db);
+    for (const [i, iso] of (["REPEATABLE READ", "SERIALIZABLE"] as const).entries()) {
+      const m = new pg.Client({ connectionString: db.ownerUrl }); await m.connect(); cleanups.push(() => m.end());
+      await m.query(`BEGIN ISOLATION LEVEL ${iso}`);
+      await m.query("SELECT count(*) FROM sessions.ingest_org_admission_holds"); // the snapshot is taken here
+      if (i === 0) await o.query("SELECT sessions.ingest_org_admission_hold_install($1, gen_random_uuid())", [ORG]); // committed after it
+      await expect(m.query("TRUNCATE sessions.upload_resets")).rejects.toMatchObject({ code: "40001" });
+      await m.query("ROLLBACK");
+    }
+    await expect(o.query("TRUNCATE sessions.upload_resets")).rejects.toMatchObject({ code: "55000" }); // READ COMMITTED sees the hold
   });
 });

@@ -2729,6 +2729,9 @@ describe("function boundary: ACL manifest, residual, activation gate", () => {
     // its ledger row, and refuses on a rerun.
     const HISTORY = "upstream:20261105062340_ingest_org_erasure_history.sql";
     expect(await names()).toContain(HISTORY);
+    // Applied by the real migrator (one transaction per migration): the recorders and the 'started' coverage row share
+    // an xid, so the continuity check reads true. A statement-by-statement apply would leave it false (fail closed).
+    expect((await db.query<{ r: boolean }>("SELECT sessions.ingest_org_erasure_history_recording() r")).rows[0]!.r).toBe(true);
     expect((await failure(rollback("20261105062320_ingest_org_admission_fences.down.sql")))?.code).toBe("55000");
     const historyReplaced = Object.entries(ingestOrgErasureHistory.replaces);
     for (const [sig] of historyReplaced) expect((await procSrc(sig)).s).toContain("-- 062340 org erasure history");

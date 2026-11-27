@@ -178,7 +178,7 @@ describe("062320 state machine and audit", () => {
     await f.db.query("SELECT sessions.ingest_org_admission_hold_seal($1,$2::uuid,'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb')", [org, e]);
     await f.db.query("SELECT sessions.ingest_org_admission_hold_seal($1,$2::uuid,'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb')", [org, e]); // idempotent
     // 062340: bridge_complete needs the sealed FULL bound to the epoch (its cutoff is the install).
-    await f.db.query("SELECT sessions.ingest_org_erasure_history_bind($1,$2::uuid,'full-run-1',(SELECT installed_at + (sealed_at - installed_at) / 2 FROM sessions.ingest_org_admission_holds WHERE epoch=$2::uuid),'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb')", [org, e]);
+    await f.db.query("SELECT sessions.ingest_org_erasure_history_bind($1,$2::uuid,'full-run-1',(SELECT floor(extract(epoch FROM installed_at) * 1000)::bigint + 1 FROM sessions.ingest_org_admission_holds WHERE epoch=$2::uuid),'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb')", [org, e]);
     await f.db.query("SELECT sessions.ingest_org_admission_hold_marker_attempt($1,$2::uuid,'cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc')", [org, e]);
     await f.db.query("SELECT sessions.ingest_org_admission_hold_marker_attempt($1,$2::uuid,'cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc')", [org, e]); // before every PUT
     await expect(release(f, org, e, "verified_rollback")).rejects.toMatchObject({ code: "55000" }); // no rollback after an attempt

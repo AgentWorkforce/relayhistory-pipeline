@@ -23,7 +23,9 @@ window:
 - **The recorder**: an AFTER ROW trigger for INSERT, UPDATE and DELETE on every source. It takes 062320's org key
   SHARED, for each org the row names and in key order, and holds it until the writer commits.
 - **TRUNCATE**: a BEFORE TRUNCATE trigger on every source refuses (55000) while any hold is not released. It takes
-  SHARE on the holds table, so it serializes with an install. A permitted truncate (no live hold) writes a
+  SHARE on the holds table, so it serializes with an install. It runs only under READ COMMITTED (40001 otherwise), so
+  its check reads a snapshot taken after the lock. A REPEATABLE READ maintenance transaction older than an install
+  could otherwise miss the hold. A permitted truncate (no live hold) writes a
   `truncated` coverage row, so coverage restarts after it.
 - **`sessions.ingest_org_erasure_history_coverage`**: insert-only. A `started` row is written at apply, after every
   recorder exists, an `ended` row at the down, and a `truncated` row at a permitted truncate. Coverage runs from the
@@ -34,30 +36,36 @@ window:
   drop-and-recreate or a rename rewrites the row. So a disarm, even one already reverted, makes every later bind
   and release refuse until a down and reapply start a new period. This was verified to survive `VACUUM FREEZE`.
   Function rows are not fingerprinted, because a no-op `REVOKE` (the migrator's hardening) rewrites `pg_proc` too.
-- **The cutoff is the hold's `installed_at`, never a caller value.** 062320's install takes the org key EXCLUSIVE.
+- **The history fence is the hold's `installed_at`, never a caller value.** 062320's install takes the org key EXCLUSIVE.
   Every recorded write holds that key SHARED until it commits, so the install cannot proceed while any write is
   uncommitted. Every write recorded before `installed_at` committed before the install, and is visible to a FULL
   that starts after it. Every later write is recorded at or after `installed_at`. No margin is needed for
   transaction lifetime.
-- **`sessions.ingest_org_erasure_history_bindings`** and **`_bind(org, epoch, full_run, full_started_at,
-  full_evidence)`**: record the FULL run's provenance against a sealed epoch, once. Bind:
+- **`sessions.ingest_org_erasure_history_bindings`** and **`_bind(org, epoch, full_run, full_started_ms,
+  full_evidence)`**: record two separate things against a sealed epoch, once: the history fence (`installed_at`)
+  and the bridge's selected FULL (run id, its start in integer milliseconds exactly as given, its receipt). Bind:
   - takes (961996,1) SHARED, runs the slot checks, then takes the org key EXCLUSIVE, the same lock order as every
     062320 lifecycle function
   - requires `full_evidence` to equal the seal's evidence (the bound FULL receipt)
-  - requires `installed_at < full_started_at <= sealed_at`
+  - requires `installed_at < full_started <= sealed_at`
   - requires coverage of the install and an intact recorder
-  - returns the cutoff
+  - returns the fence
   - refuses a second, different binding
 - **062320's `_release` and `_status`, replaced.** For `bridge_complete`, the release also requires, all under the
   EXCLUSIVE key:
   - this epoch's binding
-  - coverage of its cutoff
+  - coverage of its fence
   - every one of the 30 source triggers present and enabled
-  - `p_erasures` equal to the org's history rows at or after the cutoff
+  - `p_erasures` equal to the org's history rows at or after the fence
 
   A release that claims an empty window (`p_detail = 'erasure_window_empty'`) must also pass `p_erasures = 0`.
-  Every other line of the release is 062320's. `_status` is STABLE, so it returns the hold, that count,
-  `by_source`, `covered`, `recording` and the coverage start from one snapshot.
+  Every other line of the release is 062320's. `_status` is STABLE, so it returns everything from one snapshot, in
+  the field contract agreed with the bridge (sessions-backlog-integration):
+  - `erasures`: the history rows since the fence
+  - `erasure_history`: `fence_at`, `covered`, `recording`, `coverage_started_at`, `by_source`
+  - `selected_full`: `run`, `started_at`, `started_ms`, `evidence_sha256`
+
+  The fence and the FULL are never compared with each other, apart from the order check in bind.
 
 ## Writer participation, per source
 
@@ -101,7 +109,7 @@ state, so a reverted disarm is still caught. Two things are outside the model, s
    row also resolves.
 4. **Down, then reapply:** a new coverage period starts. A write between them is never recorded, and an epoch
    installed before the reapply cannot bind.
-5. **The cutoff is a fence:** a write still uncommitted when the install starts blocks the install, commits before
+5. **The install is a fence:** a write still uncommitted when the install starts blocks the install, commits before
    it, and is visible afterwards. A write after the install is counted.
 
 The PGlite suite covers the single-connection semantics: the 0 -> 1 race, a transient row, a same-count
@@ -110,8 +118,14 @@ TRUNCATE, immutability and runtime-role access.
 
 ## Residuals, stated
 
-- **The FULL must start after the install.** Bind checks the stated `full_started_at`, and the seal binds the
+- **The FULL must start after the install.** Bind checks the stated FULL start, and the seal binds the
   FULL receipt's hash. The start time itself is the bridge's attestation.
+- **Clock.** The fence assumes `clock_timestamp()` on the primary does not step backwards between a writer's record
+  and the install. An NTP step backwards could place a post-install write before the fence. This is out of model,
+  like the owner and superuser cases.
+- **Deadlocks.** A writer that touches rows of two orgs in one transaction, while installs for both queue
+  EXCLUSIVE, can form a lock cycle. PostgreSQL then aborts one party with 40P01. Every erasure caller must treat
+  40P01 as retryable, as it already treats 40001.
 - **No history before apply.** History exists only from the apply. An epoch installed before the current coverage
   start cannot bind.
 - **Erasures during the hold are counted, not frozen.** An erasure admitted after the install makes the window
@@ -120,8 +134,10 @@ TRUNCATE, immutability and runtime-role access.
 - **The bridge must bind.** `review/backlog-ops-hold-bridge` refuses every release (`release_watermark_partial`)
   until it binds to this contract:
   1. `_bind` after the seal
-  2. the status read (`erasures`, and `erasure_history` `{cutoff, full_run, full_started_at, covered, recording,
-     coverage_started_at, by_source}`) in the same statement as its window proof
+  2. the status read (`erasures`, `erasure_history`, `selected_full`) in the same statement as its window proof. The
+     reader checks `fence_at = installed_at` exactly, `installed_at < selected_full.started_at <= sealed_at`, that
+     `selected_full.run` is the dispatch's FULL, that the history is covered and recording, and that `by_source`
+     sums to `erasures`
   3. a release with `p_erasures` from that read (and `p_detail = 'erasure_window_empty'` for the empty path)
 
 ## Retention and erase policy

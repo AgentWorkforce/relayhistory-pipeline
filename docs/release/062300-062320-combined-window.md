@@ -15,7 +15,7 @@ round passes and the final combined head has one green exact-head CI, local and 
 | | Value | Source |
 |---|---|---|
 | G (live, to observe) | expected `778af686…`, the 062220 release target | read the live marker and policy at plan time. Never take it from this table |
-| H (target) | NOT FINAL: re-derive at the landed sha. Candidate: `22ae5a883e9b11c5dd6587c4c2cf7351b0a780c5d619054f54d4a8ef76e79dfb` with 062340 (fix round; 0832700d… was 8b8ab09e); `a9662ebac63a3487…` was 062300 + 062320 only | re-run `bun src/hoopdb/migrate.ts --generation` at the release sha. H changes if any migration byte changes |
+| H (target) | NOT FINAL: re-derive at the landed sha. Candidate: `35814e02a69c5b2b5bdbdcf6085b84f1581463b9a3b81863827e7e770e320537` with 062340 at this head, without 062330 (earlier heads: 22ae5a88… at 36cdbc70, 0832700d… at 8b8ab09e); `a9662ebac63a3487…` was 062300 + 062320 only | re-run `bun src/hoopdb/migrate.ts --generation` at the release sha. H changes if any migration byte changes |
 | Steps G -> H | `upstream:20261105062300_search_index_stage.sql`, then `upstream:20261105062320_ingest_org_admission_fences.sql`, then `upstream:20261105062340_ingest_org_erasure_history.sql` | the migrator applies them in ledger order in one apply. 062300, then 062320, then 062340 (it replaces 062320's release and status) |
 
 **Prerequisite P0: the final 062220 step.** b1 reports that the live Worker is already H-only at `778af686…`: step-6
@@ -123,6 +123,17 @@ is). Every later wave's FULL must start after the apply plus the 15-minute margi
 
 **062320 in this window.** It is inert until a hold is installed per org, and none is installed in this window. Its
 mirror role is not provisioned here: until it is, controls of a SEALED org are refused, and no org is sealed.
+
+## Carry-forward rule (d5-gate-owner, adopted by b1)
+
+For every migration in the Friday combined head, this must be EMPTY:
+`git diff <reviewed-head> <final-combined-head> -- <migration> <its down in supabase/rollbacks> src/hoopdb/sessions-function-acl.json supabase/bootstrap/hoopdb_sessions_function_boundary_supabase.sql`.
+- 062320 is compared with `be4381cc`.
+- 062340 is compared with its passing head.
+- The feed fix is compared with its passing head.
+
+Any change, conflict resolutions included, is a new head and needs re-review. 062340 needs a PASS from one reviewer
+(layered-sessions-pipeline or d5-gate-owner) with no open HOLD from the other. Record each diff's result here.
 
 ## 4. What the executor records
 

@@ -26,7 +26,7 @@ const REPLACES: Readonly<Record<string, ReplacedFunction>> = {
 
 /** The slot's own functions dropped by the rollback, dependents first (the guard is retained with its tables). */
 const DROPPED = [
-  "sessions.ingest_org_erasure_history_bind(text,uuid,text,timestamp with time zone,text)",
+  "sessions.ingest_org_erasure_history_bind(text,uuid,text,bigint,text)",
   "sessions.ingest_org_erasure_history_recording()",
   "sessions.ingest_org_erasure_history_refuse_truncate()",
   "sessions.ingest_org_erasure_history_record()",
@@ -112,7 +112,7 @@ export const ingestOrgErasureHistory: LaneManifest = {
     "sessions.ingest_org_erasure_history_record()": { secdef: false, grants: [] },
     "sessions.ingest_org_erasure_history_refuse_truncate()": { secdef: false, grants: [] },
     "sessions.ingest_org_erasure_history_recording()": { secdef: false, grants: [] },
-    "sessions.ingest_org_erasure_history_bind(text,uuid,text,timestamp with time zone,text)": { secdef: false, grants: [] },
+    "sessions.ingest_org_erasure_history_bind(text,uuid,text,bigint,text)": { secdef: false, grants: [] },
   },
   replaces: REPLACES,
   extraOutputs: rollback,

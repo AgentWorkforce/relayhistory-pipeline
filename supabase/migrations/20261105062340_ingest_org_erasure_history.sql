@@ -18,20 +18,22 @@
 --                                                 History covers from the latest started/truncated row only while no
 --                                                 'ended' follows the latest 'started'; a down/reapply gap is never
 --                                                 covered.
---   sessions.ingest_org_erasure_history_bindings  per hold epoch: the cutoff (the hold's installed_at, never a
---                                                 caller value) and the FULL run's provenance (run, start, the seal's
---                                                 evidence), bound once while sealed.
+--   sessions.ingest_org_erasure_history_bindings  per hold epoch: the history fence (the hold's installed_at, never
+--                                                 a caller value) and, separately, the bridge's selected FULL (run,
+--                                                 start in integer ms as given, the seal's evidence), bound once while
+--                                                 sealed.
 --   Org identifiers and timestamps only: no workspace, user, session, key or content (retention below).
 -- Writer participation: the recorder is an AFTER ROW trigger on every source for INSERT, UPDATE and DELETE. It takes
 --   the org key (062320's hold key) SHARED until the writer commits, for each org the row names. 062320's release
 --   takes the key EXCLUSIVE (after (961996,1) SHARED, lifecycle order unchanged), so a write either commits before
 --   the release reads the history (and is counted) or waits until the release has committed. TRUNCATE of a source
---   is refused while any hold is not released, and a permitted one restarts coverage. No runtime role holds a table
+--   is refused while any hold is not released (READ COMMITTED only, 40001 otherwise, so the check sees a committed
+--   install), and a permitted one restarts coverage. No runtime role holds a table
 --   privilege on any source (every write is an owner-run function). An owner DISABLE/ENABLE TRIGGER, DROP/CREATE
 --   TRIGGER or rename rewrites the trigger's pg_trigger row: recording() compares every row's xmin with the apply's
 --   xid, so a disarm, even one already reverted, refuses every later bind and release until a down and reapply.
 --   Out of model, stated: owner CREATE OR REPLACE of the recorder function, and superuser session_replication_role.
--- Cutoff: the hold's installed_at. 062320's install takes the org key EXCLUSIVE, which waits for every write still
+-- Fence: the hold's installed_at. 062320's install takes the org key EXCLUSIVE, which waits for every write still
 --   holding it SHARED (the recorder holds it to commit): a write recorded before installed_at committed before the
 --   install, and is visible to a FULL that starts after it; a write after it is in the history. No margin is needed
 --   for transaction lifetime.
@@ -54,9 +56,9 @@ CREATE TABLE IF NOT EXISTS sessions.ingest_org_erasure_history_coverage (
 CREATE TABLE IF NOT EXISTS sessions.ingest_org_erasure_history_bindings (
   epoch uuid PRIMARY KEY,
   bound_org text NOT NULL CHECK (bound_org ~ '^[A-Za-z0-9_-][A-Za-z0-9._-]{0,127}$'),
-  cutoff timestamptz NOT NULL,
+  fence_at timestamptz NOT NULL,
   full_run text NOT NULL CHECK (full_run ~ '^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$'),
-  full_started_at timestamptz NOT NULL,
+  full_started_ms bigint NOT NULL CHECK (full_started_ms > 0),
   full_evidence_sha256 text NOT NULL CHECK (full_evidence_sha256 ~ '^[0-9a-f]{64}$'),
   bound_at timestamptz NOT NULL DEFAULT clock_timestamp()
 );
@@ -130,7 +132,7 @@ BEGIN
      = 'kind text not null, at timestamp with time zone not null, xid xid8 not null'
  AND (SELECT string_agg(attname || ' ' || format_type(atttypid, atttypmod) || CASE WHEN attnotnull THEN ' not null' ELSE '' END, ', ' ORDER BY attnum)
         FROM pg_attribute WHERE attrelid = 'sessions.ingest_org_erasure_history_bindings'::regclass AND attnum > 0 AND NOT attisdropped)
-     = 'epoch uuid not null, bound_org text not null, cutoff timestamp with time zone not null, full_run text not null, full_started_at timestamp with time zone not null, full_evidence_sha256 text not null, bound_at timestamp with time zone not null'
+     = 'epoch uuid not null, bound_org text not null, fence_at timestamp with time zone not null, full_run text not null, full_started_ms bigint not null, full_evidence_sha256 text not null, bound_at timestamp with time zone not null'
  AND (SELECT array_agg(pg_get_indexdef(indexrelid)::text ORDER BY pg_get_indexdef(indexrelid)::text COLLATE "C") FROM pg_index WHERE indrelid IN ('sessions.ingest_org_erasure_history'::regclass, 'sessions.ingest_org_erasure_history_coverage'::regclass, 'sessions.ingest_org_erasure_history_bindings'::regclass))
      = ARRAY[
          'CREATE INDEX ingest_org_erasure_history_org ON sessions.ingest_org_erasure_history USING btree (erased_org, at)',
@@ -143,6 +145,7 @@ BEGIN
          'sessions.ingest_org_erasure_history_bindings c CHECK ((bound_org ~ ''^[A-Za-z0-9_-][A-Za-z0-9._-]{0,127}$''::text))',
          'sessions.ingest_org_erasure_history_bindings c CHECK ((full_evidence_sha256 ~ ''^[0-9a-f]{64}$''::text))',
          'sessions.ingest_org_erasure_history_bindings c CHECK ((full_run ~ ''^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$''::text))',
+         'sessions.ingest_org_erasure_history_bindings c CHECK ((full_started_ms > 0))',
          'sessions.ingest_org_erasure_history_bindings p PRIMARY KEY (epoch)',
          'sessions.ingest_org_erasure_history_coverage c CHECK ((kind = ANY (ARRAY[''started''::text, ''ended''::text, ''truncated''::text])))']::text[]
  AND (SELECT array_agg(t.tgname || ' ' || t.tgtype ORDER BY t.tgname COLLATE "C") FROM pg_trigger t
@@ -219,6 +222,11 @@ $erasure_history_record$;
 CREATE FUNCTION sessions.ingest_org_erasure_history_refuse_truncate() RETURNS trigger
 LANGUAGE plpgsql VOLATILE SET search_path = pg_catalog, pg_temp AS $erasure_history_truncate$
 BEGIN
+  -- READ COMMITTED only: the hold check below must read after the lock, in a fresh snapshot. A REPEATABLE READ or
+  -- SERIALIZABLE transaction's snapshot predates the lock and could miss a committed install (as the lifecycle helper).
+  IF current_setting('transaction_isolation') <> 'read committed' THEN
+    RAISE EXCEPTION USING ERRCODE = '40001', MESSAGE = 'session ingest: erasure source truncate requires read committed';
+  END IF;
   LOCK TABLE sessions.ingest_org_admission_holds IN SHARE MODE;
   IF EXISTS (SELECT 1 FROM sessions.ingest_org_admission_holds WHERE state <> 'released') THEN
     RAISE EXCEPTION USING ERRCODE = '55000', MESSAGE = 'session ingest: erasure source truncate refused while an org is held';
@@ -312,21 +320,24 @@ LANGUAGE sql STABLE SET search_path = pg_catalog, pg_temp AS $erasure_history_re
           AND t.tgname IN ('ingest_org_erasure_history_record', 'ingest_org_erasure_history_refuse_truncate')) = 30
 $erasure_history_recording$;
 
--- Bind the FULL run to a sealed hold epoch, once. The cutoff is NOT a caller value: it is the hold's installed_at,
--- written by 062320's install after it took the org key EXCLUSIVE. Every erasure write holds that key SHARED until it
--- commits (the recorder), so the install could not proceed while any write was uncommitted: every write recorded
--- before installed_at committed before the install, and every later write is recorded at or after it. A FULL that
--- starts after the install therefore sees every write before the cutoff, and the history holds every write since.
--- Bind refuses unless: the epoch is sealed; p_full_evidence equals the seal's evidence (the bound FULL receipt);
--- the FULL started after the install and not after the seal; coverage reaches the install; the recorders are intact.
--- The same arguments again are a no-op; anything else after a bind refuses. Lock order as every lifecycle function.
+-- Bind the FULL run to a sealed hold epoch, once. Two separate things are recorded:
+--   fence_at   the history fence: the hold's installed_at, written by 062320's install after it took the org key
+--              EXCLUSIVE. Every erasure write holds that key SHARED until it commits (the recorder), so the install
+--              could not proceed while any write was uncommitted: every write recorded before fence_at committed
+--              before the install, and every later write is in the history. Never a caller value.
+--   the FULL   the bridge's selected FULL run, separately: its run id, its start in integer milliseconds kept exactly
+--              as given, and its receipt, which must equal the seal's evidence. It must have started after the fence
+--              and not after the seal. Nothing here is compared with the fence except that order.
+-- Refuses unless the epoch is sealed, coverage reaches the fence and the recorders are intact. The same arguments
+-- again are a no-op; anything else after a bind refuses. Lock order as every lifecycle function.
 CREATE FUNCTION sessions.ingest_org_erasure_history_bind(p_org text, p_epoch uuid, p_full_run text,
-  p_full_started_at timestamptz, p_full_evidence text) RETURNS timestamptz
+  p_full_started_ms bigint, p_full_evidence text) RETURNS timestamptz
 LANGUAGE plpgsql VOLATILE SET search_path = pg_catalog, pg_temp AS $erasure_history_bind$
-DECLARE h sessions.ingest_org_admission_holds%ROWTYPE; b sessions.ingest_org_erasure_history_bindings%ROWTYPE; v_seal text;
+DECLARE h sessions.ingest_org_admission_holds%ROWTYPE; b sessions.ingest_org_erasure_history_bindings%ROWTYPE;
+  v_seal text; v_started timestamptz;
 BEGIN
   IF p_epoch IS NULL OR p_full_run IS NULL OR p_full_run !~ '^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$'
-     OR p_full_started_at IS NULL OR NOT isfinite(p_full_started_at)
+     OR p_full_started_ms IS NULL OR p_full_started_ms <= 0 OR p_full_started_ms > 253402300799999
      OR p_full_evidence IS NULL OR p_full_evidence !~ '^[0-9a-f]{64}$' THEN
     RAISE EXCEPTION USING ERRCODE = '22023', MESSAGE = 'session ingest: org erasure window bind invalid';
   END IF;
@@ -334,8 +345,8 @@ BEGIN
   PERFORM sessions.ingest_org_erasure_history_applied();
   SELECT * INTO b FROM sessions.ingest_org_erasure_history_bindings WHERE epoch = p_epoch;
   IF FOUND THEN
-    IF b.bound_org = p_org AND b.full_run = p_full_run AND b.full_started_at = p_full_started_at
-       AND b.full_evidence_sha256 = p_full_evidence THEN RETURN b.cutoff; END IF;
+    IF b.bound_org = p_org AND b.full_run = p_full_run AND b.full_started_ms = p_full_started_ms
+       AND b.full_evidence_sha256 = p_full_evidence THEN RETURN b.fence_at; END IF;
     RAISE EXCEPTION USING ERRCODE = '55000', MESSAGE = 'session ingest: org erasure window already bound';
   END IF;
   SELECT * INTO h FROM sessions.ingest_org_admission_holds WHERE epoch = p_epoch AND held_org = p_org;
@@ -346,7 +357,8 @@ BEGIN
   IF v_seal IS DISTINCT FROM p_full_evidence THEN
     RAISE EXCEPTION USING ERRCODE = '55000', MESSAGE = 'session ingest: org erasure window bind is not the sealed FULL';
   END IF;
-  IF p_full_started_at <= h.installed_at OR p_full_started_at > h.sealed_at THEN
+  v_started := timestamptz 'epoch' + p_full_started_ms * interval '1 millisecond';
+  IF v_started <= h.installed_at OR v_started > h.sealed_at THEN
     RAISE EXCEPTION USING ERRCODE = '55000', MESSAGE = 'session ingest: org erasure window FULL not between install and seal';
   END IF;
   IF NOT sessions.ingest_org_erasure_history_covers(h.installed_at) THEN
@@ -355,8 +367,9 @@ BEGIN
   IF NOT sessions.ingest_org_erasure_history_recording() THEN
     RAISE EXCEPTION USING ERRCODE = '55000', MESSAGE = 'session ingest: org erasure history recorder not armed';
   END IF;
-  INSERT INTO sessions.ingest_org_erasure_history_bindings (epoch, bound_org, cutoff, full_run, full_started_at, full_evidence_sha256)
-    VALUES (p_epoch, p_org, h.installed_at, p_full_run, p_full_started_at, p_full_evidence);
+  INSERT INTO sessions.ingest_org_erasure_history_bindings
+    (epoch, bound_org, fence_at, full_run, full_started_ms, full_evidence_sha256)
+    VALUES (p_epoch, p_org, h.installed_at, p_full_run, p_full_started_ms, p_full_evidence);
   RETURN h.installed_at;
 END
 $erasure_history_bind$;
@@ -390,14 +403,14 @@ BEGIN
     IF NOT FOUND THEN
       RAISE EXCEPTION USING ERRCODE = '55000', MESSAGE = 'session ingest: org erasure window not bound';
     END IF;
-    IF NOT sessions.ingest_org_erasure_history_covers(b.cutoff) THEN
+    IF NOT sessions.ingest_org_erasure_history_covers(b.fence_at) THEN
       RAISE EXCEPTION USING ERRCODE = '55000', MESSAGE = 'session ingest: org erasure history does not cover the cutoff';
     END IF;
     IF NOT sessions.ingest_org_erasure_history_recording() THEN
       RAISE EXCEPTION USING ERRCODE = '55000', MESSAGE = 'session ingest: org erasure history recorder not armed';
     END IF;
     IF p_erasures IS NULL OR p_erasures <> (SELECT count(*) FROM sessions.ingest_org_erasure_history AS e
-                                             WHERE e.erased_org = p_org AND e.at >= b.cutoff) THEN
+                                             WHERE e.erased_org = p_org AND e.at >= b.fence_at) THEN
       RAISE EXCEPTION USING ERRCODE = '55000', MESSAGE = 'session ingest: org admission hold erasures not replayed';
     END IF;
     -- An empty-window release says so (p_detail) and is checked: zero history since the install, not a matching count.
@@ -420,35 +433,40 @@ $hold_release$;
 
 CREATE OR REPLACE FUNCTION sessions.ingest_org_admission_hold_status(p_org text) RETURNS jsonb
 LANGUAGE plpgsql STABLE SET search_path = pg_catalog, pg_temp AS $hold_status$
-DECLARE v_epoch uuid; v_cutoff timestamptz;
+DECLARE v_epoch uuid; v_fence timestamptz; b sessions.ingest_org_erasure_history_bindings%ROWTYPE;
 BEGIN
   -- 062340 org erasure history: STABLE, so every statement here reads the caller's one snapshot.
   SELECT h.epoch INTO v_epoch FROM sessions.ingest_org_admission_holds AS h WHERE h.held_org = p_org
    ORDER BY (h.state <> 'released') DESC, h.installed_at DESC LIMIT 1;
-  SELECT b.cutoff INTO v_cutoff FROM sessions.ingest_org_erasure_history_bindings AS b
-   WHERE b.epoch = v_epoch AND b.bound_org = p_org;
+  SELECT * INTO b FROM sessions.ingest_org_erasure_history_bindings AS x WHERE x.epoch = v_epoch AND x.bound_org = p_org;
+  v_fence := b.fence_at;
   RETURN jsonb_build_object(
     'hold', (SELECT to_jsonb(h) FROM sessions.ingest_org_admission_holds AS h WHERE h.held_org = p_org
               ORDER BY (h.state <> 'released') DESC, h.installed_at DESC LIMIT 1),
-    'erasures', CASE WHEN v_cutoff IS NULL THEN NULL ELSE (SELECT count(*) FROM sessions.ingest_org_erasure_history AS e
-                  WHERE e.erased_org = p_org AND e.at >= v_cutoff) END,
+    'erasures', CASE WHEN v_fence IS NULL THEN NULL ELSE (SELECT count(*) FROM sessions.ingest_org_erasure_history AS e
+                  WHERE e.erased_org = p_org AND e.at >= v_fence) END,
+    -- The history fence (the install) and the counts since it; separate from the selected FULL below.
     'erasure_history', jsonb_build_object(
-      'cutoff', v_cutoff,
-      'full_run', (SELECT b.full_run FROM sessions.ingest_org_erasure_history_bindings AS b WHERE b.epoch = v_epoch),
-      'full_started_at', (SELECT b.full_started_at FROM sessions.ingest_org_erasure_history_bindings AS b WHERE b.epoch = v_epoch),
-      'covered', CASE WHEN v_cutoff IS NULL THEN NULL ELSE sessions.ingest_org_erasure_history_covers(v_cutoff) END,
+      'fence_at', v_fence,
+      'covered', CASE WHEN v_fence IS NULL THEN NULL ELSE sessions.ingest_org_erasure_history_covers(v_fence) END,
       'coverage_started_at', sessions.ingest_org_erasure_history_coverage_start(),
       'recording', sessions.ingest_org_erasure_history_recording(),
-      'by_source', CASE WHEN v_cutoff IS NULL THEN NULL ELSE COALESCE((SELECT jsonb_object_agg(s.source, s.n ORDER BY s.source)
+      'by_source', CASE WHEN v_fence IS NULL THEN NULL ELSE COALESCE((SELECT jsonb_object_agg(s.source, s.n ORDER BY s.source)
                      FROM (SELECT e.source, count(*) AS n FROM sessions.ingest_org_erasure_history AS e
-                            WHERE e.erased_org = p_org AND e.at >= v_cutoff GROUP BY e.source) AS s), '{}'::jsonb) END));
+                            WHERE e.erased_org = p_org AND e.at >= v_fence GROUP BY e.source) AS s), '{}'::jsonb) END),
+    -- The FULL bound by _bind, as the bridge gave it (its start also in integer ms, exactly).
+    'selected_full', CASE WHEN v_fence IS NULL THEN NULL ELSE jsonb_build_object(
+      'run', b.full_run,
+      'started_at', timestamptz 'epoch' + b.full_started_ms * interval '1 millisecond',
+      'started_ms', b.full_started_ms,
+      'evidence_sha256', b.full_evidence_sha256) END);
 END
 $hold_status$;
 
 REVOKE ALL ON FUNCTION sessions.ingest_org_erasure_history_guard(), sessions.ingest_org_erasure_history_applied(),
   sessions.ingest_org_erasure_history_coverage_start(), sessions.ingest_org_erasure_history_covers(timestamptz),
   sessions.ingest_org_erasure_history_recording(), sessions.ingest_org_erasure_history_record(),
-  sessions.ingest_org_erasure_history_refuse_truncate(), sessions.ingest_org_erasure_history_bind(text, uuid, text, timestamptz, text)
+  sessions.ingest_org_erasure_history_refuse_truncate(), sessions.ingest_org_erasure_history_bind(text, uuid, text, bigint, text)
   FROM PUBLIC, anon, authenticated, service_role, bulls96_session_ingest, bulls96_session_ingest_seeder;
 REVOKE ALL ON sessions.ingest_org_erasure_history, sessions.ingest_org_erasure_history_coverage,
   sessions.ingest_org_erasure_history_bindings
