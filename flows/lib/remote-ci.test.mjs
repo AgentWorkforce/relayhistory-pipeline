@@ -5,7 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 
-import { SECRET_LIKE, WORKFLOWS, latestRuns, parseWorkflows, refuseToPublish, snapshot, staleSnapshots } from "./remote-ci.mjs";
+import { SECRET_LIKE, WORKFLOWS, latestRuns, parseWorkflows, refuseToPublish, snapshot, staleSnapshots, reviewedNpmrc } from "./remote-ci.mjs";
 
 test("the gate dispatches only ci.yml and pg-proof.yml, and both keep their push triggers", () => {
   assert.deepEqual(parseWorkflows("ci.yml,pg-proof.yml"), ["ci.yml", "pg-proof.yml"]);
@@ -155,4 +155,58 @@ test("a snapshot holding a secret-like file is never pushed, and a clean one is"
   git("add", "-A");
   git("commit", "-qm", "oops");
   assert.match(await refuseToPublish(git("rev-parse", "HEAD"), base, repo), /secret-like files \(\.env\.local\)/);
+});
+
+test("only the exact reviewed agent/.npmrc blob may publish; any other content, mode, type or path refuses", async () => {
+  const blob = "5b0a9766e5c5cf8dcf786b235f69fea7d6920187";
+  assert.ok(reviewedNpmrc(`100644 blob ${blob}\tagent/.npmrc`));
+  assert.ok(!reviewedNpmrc(`100755 blob ${blob}\tagent/.npmrc`), "mode change");
+  assert.ok(!reviewedNpmrc(`120000 blob ${blob}\tagent/.npmrc`), "symlink");
+  assert.ok(!reviewedNpmrc(`100644 blob ${"0".repeat(40)}\tagent/.npmrc`), "other content");
+  assert.ok(!reviewedNpmrc(`100644 blob ${blob}\tother/.npmrc`), "other directory");
+  assert.ok(!reviewedNpmrc(""), "absent");
+
+  const repo = mkdtempSync(join(tmpdir(), "publish-npmrc-"));
+  const git = (...args) => execFileSync("git", ["-C", repo, ...args], { encoding: "utf8" }).trim();
+  git("init", "-q", "-b", "main");
+  git("config", "user.email", "t@example.com");
+  git("config", "user.name", "t");
+  execFileSync("mkdir", ["-p", join(repo, "agent")]);
+  const reviewed = readFileSync(new URL("../../agent/.npmrc", import.meta.url));
+  writeFileSync(join(repo, "agent", ".npmrc"), reviewed);
+  git("add", "-A");
+  git("commit", "-qm", "reviewed");
+  const base = git("rev-parse", "HEAD");
+  assert.equal(git("ls-tree", base, "--", "agent/.npmrc").split(" ")[2].slice(0, 40), blob, "fixture is the reviewed blob");
+  assert.equal(await refuseToPublish(base, base, repo), "");
+  // Worktree disagreement does not matter: the snapshot sha is what is checked.
+  writeFileSync(join(repo, "agent", ".npmrc"), "@other:registry=https://example.com\n");
+  assert.equal(await refuseToPublish(base, base, repo), "");
+  for (const [label, content] of [["harmless other registry", "@other:registry=https://example.com\n"], ["token", reviewed + "//npm.pkg.github.com/:_authToken=abc\n"]]) {
+    writeFileSync(join(repo, "agent", ".npmrc"), content);
+    git("add", "-A");
+    git("commit", "-qm", label);
+    assert.match(await refuseToPublish(git("rev-parse", "HEAD"), base, repo), /secret-like files \(agent\/\.npmrc\)/, label);
+  }
+  writeFileSync(join(repo, "agent", ".npmrc"), reviewed);
+  git("add", "-A");
+  git("commit", "-qm", "back");
+  execFileSync("chmod", ["755", join(repo, "agent", ".npmrc")]);
+  git("add", "-A");
+  git("commit", "-qm", "mode");
+  assert.match(await refuseToPublish(git("rev-parse", "HEAD"), base, repo), /secret-like files \(agent\/\.npmrc\)/, "mode 100755");
+  execFileSync("chmod", ["644", join(repo, "agent", ".npmrc")]);
+  execFileSync("rm", [join(repo, "agent", ".npmrc")]);
+  writeFileSync(join(repo, "agent", "target"), reviewed);
+  execFileSync("ln", ["-s", "target", join(repo, "agent", ".npmrc")]);
+  git("add", "-A");
+  git("commit", "-qm", "symlink");
+  assert.match(await refuseToPublish(git("rev-parse", "HEAD"), base, repo), /secret-like files \(agent\/\.npmrc\)/, "symlink");
+  execFileSync("rm", [join(repo, "agent", ".npmrc"), join(repo, "agent", "target")]);
+  writeFileSync(join(repo, "agent", ".npmrc"), reviewed);
+  execFileSync("mkdir", ["-p", join(repo, "other")]);
+  writeFileSync(join(repo, "other", ".npmrc"), reviewed);
+  git("add", "-A");
+  git("commit", "-qm", "other dir");
+  assert.match(await refuseToPublish(git("rev-parse", "HEAD"), base, repo), /secret-like files \(other\/\.npmrc\)/, "other directory");
 });

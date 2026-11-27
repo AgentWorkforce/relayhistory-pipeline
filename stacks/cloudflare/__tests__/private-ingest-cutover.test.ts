@@ -251,7 +251,7 @@ test("buffer lock controls: absent renders nothing, on renders, anything else re
   // as protected-environment variables (like PRIVATE_INGEST_CLAIM_TIMEOUT_BUSY), never as a dispatch input.
   const tracked = JSON.parse(readFileSync("config/cloudflare/private-ingest-production.json", "utf8"));
   const production = { ...tracked, sessionIngest: { ...tracked.sessionIngest, kmsKeyArn, ...privateIngestCutoverFromEnv({}) } };
-  // The tracked profile is at step (6) of the 062220 release (H-only at the baseline-drain phase).
+  // The tracked profile is at step (6) of the Nov 27 combined window (H-only at the baseline-drain phase).
   expect(privateIngestReleasePhase(production)).toBe("baseline-drain");
   for (const name of Object.values(keys)) expect(Object.hasOwn(sessionIngestVars(production.sessionIngest), name)).toBe(false);
   const workflow = readFileSync(".github/workflows/deploy-private-ingest-worker.yml", "utf8");
@@ -307,7 +307,7 @@ test("inflight lease control: absent renders nothing, observe / on render, anyth
   }
   const tracked = JSON.parse(readFileSync("config/cloudflare/private-ingest-production.json", "utf8"));
   const production = { ...tracked, sessionIngest: { ...tracked.sessionIngest, kmsKeyArn, ...privateIngestCutoverFromEnv({}) } };
-  // The tracked profile is at step (6) of the 062220 release (H-only at the baseline-drain phase).
+  // The tracked profile is at step (6) of the Nov 27 combined window (H-only at the baseline-drain phase).
   expect(privateIngestReleasePhase(production)).toBe("baseline-drain");
   expect(Object.hasOwn(sessionIngestVars(production.sessionIngest), name)).toBe(false);
   const workflow = readFileSync(".github/workflows/deploy-private-ingest-worker.yml", "utf8");

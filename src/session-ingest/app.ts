@@ -45,12 +45,12 @@ import { Hono, type Context } from "hono";
 import { log } from "../shared/log.ts";
 import { captureSafely, ingestOutcome, type AnalyticsPort } from "../shared/analytics.ts";
 import { AuthError, type VerifiedIdentity } from "../session-read-api/app.ts";
-import { batchIdConflict, BufferLockBusy, ClaimLockBusy, deliverBatch, deliverPrepared, IngestUnavailable, lockRetryFieldsOf, type DeliverDeps } from "./deliver.ts";
+import { batchIdConflict, BufferLockBusy, ClaimLockBusy, deliverBatch, deliverPrepared, IngestUnavailable, isOrgAdmissionHeld, lockRetryFieldsOf, OrgAdmissionHeld, orgAdmissionHeldFrom, type DeliverDeps } from "./deliver.ts";
 import { prepareForAdmission } from "./admission-core.ts";
 import { clientFields } from "./client-agent.ts";
 import { UPLOAD_DIRECT_OFF, uploadAdmissionStatus, type UploadDirectConfig } from "./upload-admission.ts";
 import { ADMISSION_ACCEPT_VALUE, ADMISSION_HEADER, ADMISSION_LEGACY_REPLAY, ADMISSION_QUEUED, abortPrivacyControl, admissionStatus, beginPrivacyControl, enqueueAdmission, settlePrivacyControl, witnessPrivacyJournal, type AdmissionMessage, type AsyncAdmissionMode, type SyncAdmissionFrozenReceiptMode } from "./async-admission.ts";
-import { LedgerUnavailableError } from "./ledger.ts";
+import { LedgerUnavailableError, ORG_ADMISSION_HELD_CODE } from "./ledger.ts";
 import type { DbErrorDiagnosis } from "./db-error-class.ts";
 import { advertisedDeliveryLimits } from "./advertised-limits.ts";
 import { DeliveryBusyError, DeliveryError, MAX_DELIVERY_BYTES, type HistoryExportBatch } from "./vendor/delivery/delivery-contracts.ts";
@@ -248,6 +248,16 @@ export interface IngestAppDeps {
    */
   s3FenceMirror?: S3FenceMirror;
   /**
+   * INGEST_CONTROL_MIRROR_ROLE=on (docs/design/org-admission-hold.md section 6.3): the ledger the selection and reset
+   * controls (unordered and ordered) run on, over a separate connection that logs in as a member of the NOLOGIN role
+   * `bulls96_session_ingest_mirror`. While an org's admission hold is sealed, SQL admits those controls only from a
+   * member of that role (`pg_has_role(session_user, ..., 'MEMBER')`), because only a caller that also writes the S3
+   * fence (s3FenceMirror) may change a sealed org. So it is accepted only together with s3FenceMirror: the app refuses
+   * to start with one and not the other. Absent (the default): controls run on `deliver.ledger`, and SQL refuses
+   * them (RH042, a retryable 503) while the org is sealed. Every other call stays on `deliver.ledger`.
+   */
+  controlLedger?: Pick<Ledger, "setSessionUploads" | "resetUploadedSessions" | "applyOrderedControl">;
+  /**
    * Operator per-session erase (session-erase.ts, docs/operator-session-erase-contract.md). Absent: the
    * disabled config, so /internal/v1/session-erase/* answers 501 not_implemented and reads nothing.
    */
@@ -403,8 +413,17 @@ function dbFields(db: DbErrorDiagnosis | undefined): Record<string, unknown> {
   return db ? { db_error_class: db.db_error_class, db_error_code: db.db_error_code, db_error_basis: db.db_error_basis, ...(db.db_refusal ? { db_refusal: db.db_refusal } : {}) } : {};
 }
 
+/**
+ * A route's error as the DeliveryError it answers with: a per-org admission hold (RH042, in any form) as
+ * OrgAdmissionHeld (503 with Retry-After), any other DeliveryError unchanged, anything else the route's coded 503.
+ */
+function deliveryErrorOf(error: unknown, stage: string, cause: string): DeliveryError {
+  return orgAdmissionHeldFrom(error, stage) ?? (error instanceof DeliveryError ? error : new IngestUnavailable(stage, cause));
+}
+
 function failure(c: Context<Env>, error: unknown) {
-  const safe = error instanceof DeliveryError ? error : new DeliveryError("delivery_unavailable", 503, "Durable delivery is temporarily unavailable");
+  const held = orgAdmissionHeldFrom(error, "ledger");
+  const safe = held ?? (error instanceof DeliveryError ? error : new DeliveryError("delivery_unavailable", 503, "Durable delivery is temporarily unavailable"));
   // A busy refusal is retryable; tell the client when (relayhistory's header). A slot or claim refusal wrote
   // nothing durable; a BufferLockBusy at buffer_receipt leaves the committed claim, the staged object and the
   // stage-intent row, which the retry resumes or expiry/GC reclaims.
@@ -413,6 +432,8 @@ function failure(c: Context<Env>, error: unknown) {
   if (safe instanceof UploadConsentRequired) c.header("Retry-After", String(safe.retryAfterSeconds));
   // A stopped org (INGEST_HTTP_ADMISSION_STOPPED_ORGS): retry later, by which time the desktop uploads directly.
   if (safe instanceof HttpAdmissionStopped) c.header("Retry-After", String(safe.retryAfterSeconds));
+  // A per-org admission hold (RH042): the same retryable answer as the HTTP stop; the refused call wrote nothing.
+  if (safe instanceof OrgAdmissionHeld) c.header("Retry-After", String(safe.retryAfterSeconds));
   // Acquisition refusal (design §5.6): the refused sessions sit beside `error`, not inside it.
   if (safe instanceof AcquisitionRefusedError)
     return c.json({ ...errorBody(c, safe.code, safe.message), refused: safe.refused.map((r) => ({ source: r.source, sessionId: r.sessionId, code: r.code })) }, 409);
@@ -611,6 +632,9 @@ export function createIngestApp(deps: IngestAppDeps) {
     }
     return result;
   };
+  // The mirror-role connection is trusted to run the S3 mirror; without the mirror it must never be used.
+  if (deps.controlLedger && !deps.s3FenceMirror) throw new Error("session ingest: the control mirror role needs the S3 fence mirror");
+  const controls = deps.controlLedger ?? deps.deliver.ledger;
   /**
    * The S3 fence write of a control (s3FenceMirror). Absent mirror: nothing. An id the S3 fence refuses (it never
    * takes `__proto__` as a map key) is a 400, before SQL. Any other failure is a 503 `s3_fence_unavailable`; the
@@ -1012,7 +1036,7 @@ export function createIngestApp(deps: IngestAppDeps) {
       return c.json({ revision });
     } catch (error) {
       emit({ route: "upload_consent.write", outcome: error instanceof DeliveryError ? error.code : "upload_consent_unavailable", org_id: identity.orgId });
-      return failure(c, error instanceof DeliveryError ? error : new IngestUnavailable("consent", "upload_consent_store"));
+      return failure(c, deliveryErrorOf(error, "consent", "upload_consent_store"));
     }
   });
 
@@ -1042,7 +1066,7 @@ export function createIngestApp(deps: IngestAppDeps) {
       const custody=c.get("custody");if(custody&&!identity.control)throw new IngestUnavailable("fence","control_unavailable");
       // Every cheap refusal before any S3 write.
       const ordered=identity.control;
-      if(ordered&&(ordered.kind!=="selection"||!deps.deliver.ledger.applyOrderedControl))throw new IngestUnavailable("fence","control_unavailable");
+      if(ordered&&(ordered.kind!=="selection"||!controls.applyOrderedControl))throw new IngestUnavailable("fence","control_unavailable");
       const mirror=deps.s3FenceMirror;
       if(ordered){
         const control=ordered;
@@ -1051,7 +1075,7 @@ export function createIngestApp(deps: IngestAppDeps) {
           // SQL decides; S3 follows its verdict (s3FenceMirror). A disable is pending in S3 while SQL decides.
           const hold=input.enabled?undefined:await mirrorFence(identity.orgId,()=>mirror!.beginOrdered(s3Input));
           let r;
-          try{r=orderedControlResult(await deps.deliver.ledger.applyOrderedControl!({...s3Input,...(custody?{custody}:{})}),control);}
+          try{r=orderedControlResult(await controls.applyOrderedControl!({...s3Input,...(custody?{custody}:{})}),control);}
           catch(error){if(!input.enabled&&definitelyNotApplied(error))await mirrorFence(identity.orgId,()=>mirror!.abortOrdered(s3Input,hold));throw error;}
           await mirrorFence(identity.orgId,()=>mirror!.finishOrdered(s3Input,r.control.outcome));
           return r;
@@ -1060,7 +1084,7 @@ export function createIngestApp(deps: IngestAppDeps) {
       }else{
         // Unordered: a deletion lands in the S3 fence before SQL; a lift after it.
         if(!input.enabled)await mirrorFence(identity.orgId,()=>mirror!.setSessionUploads(selection));
-        await journal(async()=>{await deps.deliver.ledger.setSessionUploads(selection);if(input.enabled)await mirrorFence(identity.orgId,()=>mirror!.setSessionUploads(selection));},()=>"applied");
+        await journal(async()=>{await controls.setSessionUploads(selection);if(input.enabled)await mirrorFence(identity.orgId,()=>mirror!.setSessionUploads(selection));},()=>"applied");
       }
       // A "Don't upload" is also the principal's explicit deny (every origin, every mode, kept when the mode
       // becomes "all"). Narrowing only. A re-enable never broadens consent: that needs a confirmed write.
@@ -1077,8 +1101,8 @@ export function createIngestApp(deps: IngestAppDeps) {
       emit({ route: "delivery.sessions.selection", outcome: controlAck?"control_"+controlAck.outcome:input.enabled ? "enabled" : "disabled", org_id: identity.orgId, count: input.sessions.length });
       return c.json({ updated: true,...(controlAck?{control:controlAck}:{}) });
     } catch (error) {
-      emit({ route: "delivery.sessions.selection", outcome: error instanceof DeliveryError ? error.code : "delivery_unavailable", org_id: identity.orgId });
-      return failure(c, error instanceof DeliveryError ? error : new IngestUnavailable("fence", "ledger"));
+      emit({ route: "delivery.sessions.selection", outcome: isOrgAdmissionHeld(error) ? ORG_ADMISSION_HELD_CODE : error instanceof DeliveryError ? error.code : "delivery_unavailable", org_id: identity.orgId });
+      return failure(c, deliveryErrorOf(error, "fence", "ledger"));
     }
   });
   app.post("/v1/delivery/sessions/reset", async (c) => {
@@ -1098,7 +1122,7 @@ export function createIngestApp(deps: IngestAppDeps) {
       const custody=c.get("custody");if(custody&&!identity.control)throw new IngestUnavailable("fence","control_unavailable");
       // Every cheap refusal before any S3 write.
       const ordered=identity.control;
-      if(ordered&&(ordered.kind!=="reset"||!deps.deliver.ledger.applyOrderedControl))throw new IngestUnavailable("fence","control_unavailable");
+      if(ordered&&(ordered.kind!=="reset"||!controls.applyOrderedControl))throw new IngestUnavailable("fence","control_unavailable");
       // 0005: inside the privacy-journal bracket, so a journal refusal changes nothing in S3. An S3 failure leaves
       // the journal mark pending (conservative: TTL, then SQL resolves it on the retry), never settled.
       const mirror=deps.s3FenceMirror;
@@ -1109,18 +1133,18 @@ export function createIngestApp(deps: IngestAppDeps) {
           // SQL decides; S3 follows its verdict. The reset is pending in S3 (every claim refused) while SQL decides.
           const hold=await mirrorFence(identity.orgId,()=>mirror!.beginOrdered(s3Input));
           let r;
-          try{r=orderedControlResult(await deps.deliver.ledger.applyOrderedControl!({...s3Input,...(custody?{custody}:{})}),control);}
+          try{r=orderedControlResult(await controls.applyOrderedControl!({...s3Input,...(custody?{custody}:{})}),control);}
           catch(error){if(definitelyNotApplied(error))await mirrorFence(identity.orgId,()=>mirror!.abortOrdered(s3Input,hold));throw error;}
           await mirrorFence(identity.orgId,()=>mirror!.finishOrdered(s3Input,r.control.outcome));
           return r;
         },(r)=>r.control.outcome);
         deleted=result.deleted!;controlAck=result.control;custodyHeader(c,result.custodyAck);
-      }else deleted=await journal(async()=>{await mirrorFence(identity.orgId,()=>mirror!.resetUploadedSessions(tenant,input.request_id));return deps.deliver.ledger.resetUploadedSessions(tenant,input.request_id);},()=>"applied");
+      }else deleted=await journal(async()=>{await mirrorFence(identity.orgId,()=>mirror!.resetUploadedSessions(tenant,input.request_id));return controls.resetUploadedSessions(tenant,input.request_id);},()=>"applied");
       emit({ route: "delivery.sessions.reset", outcome: controlAck?"control_"+controlAck.outcome:"reset", org_id: identity.orgId, deleted });
       return c.json({ reset: true, deleted,...(controlAck?{control:controlAck}:{}) });
     } catch (error) {
-      emit({ route: "delivery.sessions.reset", outcome: error instanceof DeliveryError ? error.code : "delivery_unavailable", org_id: identity.orgId });
-      return failure(c, error instanceof DeliveryError ? error : new IngestUnavailable("fence", "ledger"));
+      emit({ route: "delivery.sessions.reset", outcome: isOrgAdmissionHeld(error) ? ORG_ADMISSION_HELD_CODE : error instanceof DeliveryError ? error.code : "delivery_unavailable", org_id: identity.orgId });
+      return failure(c, deliveryErrorOf(error, "fence", "ledger"));
     }
   });
 
@@ -1139,7 +1163,7 @@ export function createIngestApp(deps: IngestAppDeps) {
       return c.json({ stored });
     } catch (error) {
       emit({ route: "custody.legacy_receipt", outcome: error instanceof DeliveryError ? error.code : "delivery_unavailable", org_id: identity.orgId });
-      return failure(c, error instanceof DeliveryError ? error : new IngestUnavailable("fence", "ledger"));
+      return failure(c, deliveryErrorOf(error, "fence", "ledger"));
     }
   });
   // 200 {pending:false} when no privacy control is pending for this user, else 503 (fail closed).
@@ -1154,7 +1178,7 @@ export function createIngestApp(deps: IngestAppDeps) {
       return c.json({ pending: false });
     } catch (error) {
       emit({ route: "custody.pending", outcome: error instanceof DeliveryError ? error.code : "delivery_unavailable", org_id: identity.orgId });
-      return failure(c, error instanceof DeliveryError ? error : new IngestUnavailable("fence", "ledger"));
+      return failure(c, deliveryErrorOf(error, "fence", "ledger"));
     }
   });
   app.post("/v1/custody/control/begin", async (c) => {
@@ -1170,7 +1194,7 @@ export function createIngestApp(deps: IngestAppDeps) {
       return c.json(head);
     } catch (error) {
       emit({ route: "custody.control.begin", outcome: error instanceof DeliveryError ? error.code : "delivery_unavailable", org_id: identity.orgId });
-      return failure(c, error instanceof DeliveryError ? error : new IngestUnavailable("fence", "ledger"));
+      return failure(c, deliveryErrorOf(error, "fence", "ledger"));
     }
   });
   app.post("/v1/custody/control/complete", async (c) => {
@@ -1187,7 +1211,7 @@ export function createIngestApp(deps: IngestAppDeps) {
       return c.json(r);
     } catch (error) {
       emit({ route: "custody.control.complete", outcome: error instanceof DeliveryError ? error.code : "delivery_unavailable", org_id: identity.orgId });
-      return failure(c, error instanceof DeliveryError ? error : new IngestUnavailable("fence", "ledger"));
+      return failure(c, deliveryErrorOf(error, "fence", "ledger"));
     }
   });
 
@@ -1207,7 +1231,7 @@ export function createIngestApp(deps: IngestAppDeps) {
       return c.json(head);
     } catch (error) {
       emit({ route: "custody.authority.begin", outcome: error instanceof DeliveryError ? error.code : "delivery_unavailable", org_id: identity.orgId });
-      return failure(c, error instanceof DeliveryError ? error : new IngestUnavailable("fence", "ledger"));
+      return failure(c, deliveryErrorOf(error, "fence", "ledger"));
     }
   });
   app.post("/v1/custody/authority/complete", async (c) => {
@@ -1224,7 +1248,7 @@ export function createIngestApp(deps: IngestAppDeps) {
       return c.json(r);
     } catch (error) {
       emit({ route: "custody.authority.complete", outcome: error instanceof DeliveryError ? error.code : "delivery_unavailable", org_id: identity.orgId });
-      return failure(c, error instanceof DeliveryError ? error : new IngestUnavailable("fence", "ledger"));
+      return failure(c, deliveryErrorOf(error, "fence", "ledger"));
     }
   });
 
@@ -1247,7 +1271,7 @@ export function createIngestApp(deps: IngestAppDeps) {
       return c.json(await admissionStatus(deps.deliver.target.store, deps.deliver.target.keyRoot, { orgId: identity.orgId, workspaceId: identity.workspaceId, userId: identity.userId }, originId, receiptId));
     } catch (error) {
       emit({ route: "delivery.admission", outcome: error instanceof DeliveryError ? error.code : "delivery_unavailable", org_id: identity.orgId });
-      return failure(c, error instanceof DeliveryError ? error : new IngestUnavailable("admission_status", "store"));
+      return failure(c, deliveryErrorOf(error, "admission_status", "store"));
     }
   });
 

@@ -226,9 +226,15 @@ test("migration backfills exact-session deletions that predate the turn trigger"
  const db=new PGlite({extensions:{btree_gin,pg_trgm}});open.push(()=>db.close());const read=(p:string)=>readFileSync(join(root,p),"utf8");
  await db.exec(read("supabase/tests/supabase_shim.sql"));
  for(const f of SESSION_BOOTSTRAP_FILES)await db.exec(read(f));
- for(const f of migrationFiles(root,null).filter((f)=>f!=="20261105062020_turns_forward_gates.sql"))await db.exec(read("supabase/migrations/"+f));
+ // 062320 replaces 062020's ingest_turn_register (org admission hold), so it is held back too and applied after it.
+ const HOLD="20261105062320_ingest_org_admission_fences.sql";
+ // 062340 replaces 062320's release and status, so it follows 062320.
+ const HISTORY="20261105062340_ingest_org_erasure_history.sql";
+ for(const f of migrationFiles(root,null).filter((f)=>f!=="20261105062020_turns_forward_gates.sql"&&f!==HOLD&&f!==HISTORY))await db.exec(read("supabase/migrations/"+f));
  await db.query("INSERT INTO sessions.upload_deletions(org_id,workspace_id,user_id,origin_id,source,session_id) VALUES($1,$2,'older-user','desktop-origin','claude',$3)",[TENANT.orgId,TENANT.workspaceId,SESSION]);
  await db.exec(read("supabase/migrations/20261105062020_turns_forward_gates.sql"));
+ if(migrationFiles(root,null).includes(HOLD))await db.exec(read("supabase/migrations/"+HOLD));
+ if(migrationFiles(root,null).includes(HISTORY))await db.exec(read("supabase/migrations/"+HISTORY));
  expect((await db.query("SELECT fence_basis,registered_writer_seen FROM sessions.turn_session_fences WHERE org_id=$1 AND workspace_id=$2 AND source='claude' AND session_id=$3",[TENANT.orgId,TENANT.workspaceId,SESSION])).rows).toEqual([{fence_basis:"live",registered_writer_seen:false}]);
 });
 

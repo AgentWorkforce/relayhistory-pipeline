@@ -326,7 +326,10 @@ describe("062210 installs the gate row off/main, and keeps the 043800 contract",
     const gone = "ALTER TABLE sessions.lazy_ack_t2_mode DISABLE TRIGGER lazy_ack_t2_mode_keep_row;DELETE FROM sessions.lazy_ack_t2_mode";
     for (const iso of ["READ COMMITTED", "REPEATABLE READ"]) {
       await f.db.exec(`BEGIN ISOLATION LEVEL ${iso};${gone};SET LOCAL ROLE bulls96_session_ingest`);
-      try { await expect(f.db.query(COMMIT, [c.payload])).rejects.toMatchObject({ code: "55000", message: expect.stringContaining("the T2 gate row is missing") }); }
+      // Since 20261105062320 a REPEATABLE READ commit is refused first by the org admission hold check (40001).
+      try { await expect(f.db.query(COMMIT, [c.payload])).rejects.toMatchObject(iso === "READ COMMITTED"
+        ? { code: "55000", message: expect.stringContaining("the T2 gate row is missing") }
+        : { code: "40001", message: expect.stringContaining("org admission hold requires read committed") }); }
       finally { await f.db.exec("ROLLBACK"); }
     }
     for (const [sql, msg] of [["SELECT sessions.lazy_ack_t2_set_gate('fenced')", "gate unchanged"], ["SELECT sessions.lazy_ack_t2_set_mode('main')", "mode unchanged"]] as const) {
@@ -361,11 +364,14 @@ describe("062210 installs the gate row off/main, and keeps the 043800 contract",
           await f.db.exec(`BEGIN ISOLATION LEVEL ${iso};SET LOCAL ROLE bulls96_session_ingest`);
           try {
             const q = f.db.query<any>(COMMIT, [c.payload]);
-            if (refused) await expect(q).rejects.toMatchObject({ code: "55000", message: expect.stringContaining("the fenced staged ACK requires read committed") });
-            else expect((await q).rows[0].r.kind).toBe("committed");
+            // Since 20261105062320 the commit entry's org admission hold check refuses any non-READ COMMITTED caller
+            // first (40001, retryable), in every gate state, before the gate is read: the gate's own isolation branch
+            // is reached only by direct owner calls (the suppressed path below).
+            void refused;
+            await expect(q).rejects.toMatchObject({ code: "40001", message: expect.stringContaining("org admission hold requires read committed") });
           } finally { await f.db.exec("ROLLBACK"); }
           await f.db.exec(`BEGIN ISOLATION LEVEL ${iso};SET LOCAL ROLE bulls96_session_ingest`);
-          try { await expect(f.db.query("SELECT sessions.ingest_claim_buffered_batch($1::jsonb) AS r", [s.payload])).rejects.toMatchObject({ code: "40001", message: expect.stringContaining("lazy records require read committed") }); }
+          try { await expect(f.db.query("SELECT sessions.ingest_claim_buffered_batch($1::jsonb) AS r", [s.payload])).rejects.toMatchObject({ code: "40001", message: expect.stringMatching(/lazy records require read committed|org admission hold requires read committed/u) }); }
           finally { await f.db.exec("ROLLBACK"); }
           await f.db.exec(`BEGIN ISOLATION LEVEL ${iso}`);
           try {

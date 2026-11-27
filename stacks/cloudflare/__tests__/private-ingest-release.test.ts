@@ -19,7 +19,7 @@ const kmsKeyArn = "arn:aws:kms:us-east-1:000000000000:key/00000000-0000-0000-000
 
 test("tracked production config is H-only baseline drain; only the rollout phases and baseline rollback are representable", () => {
   const tracked = JSON.parse(readFileSync("config/cloudflare/private-ingest-production.json", "utf8"));
-  // 062220 release, step (6): the live baseline-drain phase is held while the Worker returns from
+  // Nov 27 combined window, step (6): the live baseline-drain phase is held while the Worker returns from
   // temporary {G, H} acceptance to exactly H.
   const expected = privateIngestProfileForPhase("baseline-drain", kmsKeyArn);
   const { kmsKeyArn: _target, ...expectedTracked } = expected.sessionIngest;

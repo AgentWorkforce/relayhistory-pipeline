@@ -74,7 +74,7 @@ import {validatedCustodyAck} from "./custody-ack.ts";
  */
 import { log } from "../shared/log.ts";
 import type { Ledger, LedgerTenant, RevisionConflict, SlotRequest } from "./ledger.ts";
-import { LedgerUnavailableError } from "./ledger.ts";
+import { LedgerUnavailableError, ORG_ADMISSION_HELD_CODE } from "./ledger.ts";
 import { STORE_TRANSPORT_CAUSES } from "../shared/vendor.ts";
 
 const STORE_CAUSE_SET: ReadonlySet<string> = new Set(STORE_TRANSPORT_CAUSES);
@@ -285,6 +285,39 @@ export class IngestUnavailable extends DeliveryError {
 }
 
 /**
+ * How long a caller refused by a per-org admission hold is asked to wait: the same as the Worker's HTTP stop
+ * (http-admission-stop.ts HTTP_ADMISSION_STOPPED_RETRY_AFTER_SECONDS), because the cutover it guards is operator-paced.
+ */
+export const ORG_ADMISSION_HELD_RETRY_AFTER_SECONDS = 300;
+
+/**
+ * A ledger call refused by the per-org admission hold (SQLSTATE RH042, ledger.ts ORG_ADMISSION_HELD_CODE): the same
+ * retryable 503 `delivery_unavailable` with Retry-After as the HTTP admission stop. The SQL check runs at the entry of
+ * the refused function, before any write, so the refused statement wrote nothing and the desktop keeps the batch.
+ */
+export class OrgAdmissionHeld extends IngestUnavailable {
+  readonly retryAfterSeconds = ORG_ADMISSION_HELD_RETRY_AFTER_SECONDS;
+  constructor(stage: string, db?: DbErrorDiagnosis) {
+    super(stage, ORG_ADMISSION_HELD_CODE, db);
+  }
+}
+
+/** True for a hold refusal in any of its forms: the ledger error, the delivery error, or a wrapped stage error. */
+export function isOrgAdmissionHeld(error: unknown): boolean {
+  if (error instanceof OrgAdmissionHeld) return true;
+  if (error instanceof LedgerUnavailableError) return error.code === ORG_ADMISSION_HELD_CODE;
+  return error instanceof IngestUnavailable && error.cause_code === ORG_ADMISSION_HELD_CODE;
+}
+
+/** The hold refusal as its delivery error (keeping the stage and diagnosis), or undefined for any other error. */
+export function orgAdmissionHeldFrom(error: unknown, stage: string): OrgAdmissionHeld | undefined {
+  if (error instanceof OrgAdmissionHeld) return error;
+  if (!isOrgAdmissionHeld(error)) return undefined;
+  const db = error instanceof LedgerUnavailableError || error instanceof IngestUnavailable ? error.db : undefined;
+  return new OrgAdmissionHeld(error instanceof IngestUnavailable ? error.stage : stage, db);
+}
+
+/**
  * Retry-After for a claim lock-wait refusal, in seconds: inside the 429 contract
  * (DELIVERY_BUSY_RETRY_AFTER, 2-10) but at least the role statement_timeout (5 s,
  * supabase/bootstrap/session_ingest_role.sql), so the retry arrives after the holding
@@ -421,6 +454,8 @@ async function runStage<T>(name: string, work: () => Promise<T>, observe?: Stage
     if (passthrough) throw error;
     const storeStatus = error instanceof LedgerUnavailableError ? error.storeStatus : undefined;
     const storeCause = error instanceof LedgerUnavailableError ? error.storeCause : undefined;
+    // A per-org admission hold (RH042): retryable with the HTTP stop's Retry-After, never a terminal refusal.
+    if (isOrgAdmissionHeld(error)) throw new OrgAdmissionHeld(name, db);
     throw new IngestUnavailable(name, causeCode(error), db, storeStatus, storeCause);
   }
 }

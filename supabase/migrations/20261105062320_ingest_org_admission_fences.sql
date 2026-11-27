@@ -1,0 +1,1837 @@
+-- Slot 20261105062320 (reserved, registry receipt 251934773687459840). Per-org admission hold: an enforced writer fence
+-- for the fence-authority marker. Design: docs/design/org-admission-hold.md (revision 4, joint APPROVE at 892f089e).
+-- Code only: applying it to any real database, installing a hold, or provisioning the mirror role need Khaliq's
+-- explicit OK. Nothing here is reachable by a runtime role except through the entry checks below.
+--
+-- Objects:
+--   sessions.ingest_org_admission_holds        one row per hold epoch; at most one non-released row per org.
+--   sessions.ingest_org_admission_hold_events  insert-only audit, exactly one event per (epoch, kind).
+--   Both tables avoid `org_id`/`workspace_id`/`user_id` columns on purpose: ingest_lazy_begin's bootstrap scan
+--   (041000) and ingest_lazy_user treat any ingest_%/upload_% table with those columns as prior authority.
+-- State machine (design section 6.1): held -> sealed -> marker_attempted -> released('bridge_complete');
+--   held|sealed -> released('verified_rollback') only before any attempt. No other transition (guard trigger).
+-- Key: pg_advisory_xact_lock[_shared](hashtextextended('96bulls:ingest-org-hold-v1:'||org, 0)), stable per org.
+--   _check takes it SHARED, then reads the hold in a later statement (READ COMMITTED: a fresh snapshot after the
+--   grant). Lifecycle functions take it EXCLUSIVE after the migrator's (961996,1) SHARED and a fresh slot check.
+-- Refusals: RH042 'session ingest: org admission held' (retryable); 40001 outside READ COMMITTED.
+
+-- IF NOT EXISTS: this slot's down retains both tables (and their guard) as inert history; a reapply reuses them.
+CREATE TABLE IF NOT EXISTS sessions.ingest_org_admission_holds (
+  epoch uuid PRIMARY KEY,
+  held_org text NOT NULL CHECK (held_org ~ '^[A-Za-z0-9_-][A-Za-z0-9._-]{0,127}$'),
+  request_id uuid NOT NULL UNIQUE,
+  state text NOT NULL CHECK (state IN ('held', 'sealed', 'marker_attempted', 'released')),
+  installed_at timestamptz NOT NULL DEFAULT clock_timestamp(),
+  sealed_at timestamptz,
+  marker_attempted_at timestamptz,
+  released_at timestamptz,
+  release_reason text CHECK (release_reason IN ('bridge_complete', 'verified_rollback')),
+  release_evidence_sha256 text CHECK (release_evidence_sha256 ~ '^[0-9a-f]{64}$'),
+  CHECK ((state = 'released') = (released_at IS NOT NULL)),
+  CHECK ((state = 'released') = (release_reason IS NOT NULL AND release_evidence_sha256 IS NOT NULL)),
+  CHECK (state NOT IN ('sealed', 'marker_attempted') OR sealed_at IS NOT NULL),
+  CHECK (state <> 'marker_attempted' OR marker_attempted_at IS NOT NULL),
+  CHECK (release_reason IS DISTINCT FROM 'bridge_complete' OR marker_attempted_at IS NOT NULL),
+  CHECK (release_reason IS DISTINCT FROM 'verified_rollback' OR marker_attempted_at IS NULL)
+);
+CREATE UNIQUE INDEX IF NOT EXISTS ingest_org_admission_holds_live ON sessions.ingest_org_admission_holds (held_org)
+  WHERE state <> 'released';
+
+CREATE TABLE IF NOT EXISTS sessions.ingest_org_admission_hold_events (
+  epoch uuid NOT NULL REFERENCES sessions.ingest_org_admission_holds (epoch),
+  kind text NOT NULL CHECK (kind IN ('installed', 'sealed', 'marker_attempted', 'released')),
+  at timestamptz NOT NULL DEFAULT clock_timestamp(),
+  detail text CHECK (detail IS NULL OR detail ~ '^[a-z][a-z0-9_]{0,63}$'),
+  evidence_sha256 text CHECK (evidence_sha256 IS NULL OR evidence_sha256 ~ '^[0-9a-f]{64}$'),
+  PRIMARY KEY (epoch, kind),
+  CHECK (kind NOT IN ('sealed', 'marker_attempted', 'released') OR evidence_sha256 IS NOT NULL)
+);
+
+ALTER TABLE sessions.ingest_org_admission_holds ENABLE ROW LEVEL SECURITY;
+ALTER TABLE sessions.ingest_org_admission_hold_events ENABLE ROW LEVEL SECURITY;
+REVOKE ALL ON sessions.ingest_org_admission_holds, sessions.ingest_org_admission_hold_events
+  FROM PUBLIC, anon, authenticated, service_role, bulls96_session_ingest, bulls96_session_ingest_seeder;
+
+-- Immutability: no DELETE or TRUNCATE of either table, no UPDATE of an event, and a hold row changes only along the
+-- state machine with its identity (epoch, org, request, installed_at) and every earlier timestamp unchanged.
+CREATE OR REPLACE FUNCTION sessions.ingest_org_admission_hold_guard() RETURNS trigger
+LANGUAGE plpgsql VOLATILE SET search_path = pg_catalog, pg_temp AS $hold_guard$
+BEGIN
+  IF TG_OP IN ('DELETE', 'TRUNCATE') OR TG_TABLE_NAME = 'ingest_org_admission_hold_events' THEN
+    RAISE EXCEPTION USING ERRCODE = '55000', MESSAGE = 'session ingest: org admission hold history is immutable';
+  END IF;
+  IF NEW.epoch IS DISTINCT FROM OLD.epoch OR NEW.held_org IS DISTINCT FROM OLD.held_org
+     OR NEW.request_id IS DISTINCT FROM OLD.request_id OR NEW.installed_at IS DISTINCT FROM OLD.installed_at
+     OR (OLD.sealed_at IS NOT NULL AND NEW.sealed_at IS DISTINCT FROM OLD.sealed_at)
+     OR (OLD.marker_attempted_at IS NOT NULL AND NEW.marker_attempted_at IS DISTINCT FROM OLD.marker_attempted_at)
+     OR NOT ((OLD.state = 'held' AND NEW.state IN ('sealed', 'released'))
+          OR (OLD.state = 'sealed' AND NEW.state IN ('marker_attempted', 'released'))
+          OR (OLD.state = 'marker_attempted' AND NEW.state = 'released')) THEN
+    RAISE EXCEPTION USING ERRCODE = '55000', MESSAGE = 'session ingest: org admission hold transition refused';
+  END IF;
+  RETURN NEW;
+END
+$hold_guard$;
+DROP TRIGGER IF EXISTS ingest_org_admission_holds_guard ON sessions.ingest_org_admission_holds;
+DROP TRIGGER IF EXISTS ingest_org_admission_holds_truncate ON sessions.ingest_org_admission_holds;
+DROP TRIGGER IF EXISTS ingest_org_admission_hold_events_guard ON sessions.ingest_org_admission_hold_events;
+DROP TRIGGER IF EXISTS ingest_org_admission_hold_events_truncate ON sessions.ingest_org_admission_hold_events;
+CREATE TRIGGER ingest_org_admission_holds_guard BEFORE UPDATE OR DELETE ON sessions.ingest_org_admission_holds
+  FOR EACH ROW EXECUTE FUNCTION sessions.ingest_org_admission_hold_guard();
+CREATE TRIGGER ingest_org_admission_holds_truncate BEFORE TRUNCATE ON sessions.ingest_org_admission_holds
+  FOR EACH STATEMENT EXECUTE FUNCTION sessions.ingest_org_admission_hold_guard();
+CREATE TRIGGER ingest_org_admission_hold_events_guard BEFORE UPDATE OR DELETE ON sessions.ingest_org_admission_hold_events
+  FOR EACH ROW EXECUTE FUNCTION sessions.ingest_org_admission_hold_guard();
+CREATE TRIGGER ingest_org_admission_hold_events_truncate BEFORE TRUNCATE ON sessions.ingest_org_admission_hold_events
+  FOR EACH STATEMENT EXECUTE FUNCTION sessions.ingest_org_admission_hold_guard();
+
+-- Owner-only, from the catalog: revoke every non-owner grantee (any role, PUBLIC, column-level grants) on both history
+-- tables and the guard function, not only a named list, so no grant survives a down and reapply.
+DO $hold_history_acl$
+DECLARE r record;
+BEGIN
+ FOR r IN SELECT c.relname, x.grantee FROM pg_class c, aclexplode(c.relacl) x
+           WHERE c.oid IN ('sessions.ingest_org_admission_holds'::regclass, 'sessions.ingest_org_admission_hold_events'::regclass)
+             AND x.grantee <> c.relowner GROUP BY c.relname, x.grantee LOOP
+   EXECUTE format('REVOKE ALL ON sessions.%I FROM %s', r.relname, CASE WHEN r.grantee = 0 THEN 'PUBLIC' ELSE quote_ident(pg_get_userbyid(r.grantee)) END);
+ END LOOP;
+ FOR r IN SELECT c.relname, a.attname, x.grantee FROM pg_attribute a JOIN pg_class c ON c.oid = a.attrelid, aclexplode(a.attacl) x
+           WHERE a.attrelid IN ('sessions.ingest_org_admission_holds'::regclass, 'sessions.ingest_org_admission_hold_events'::regclass)
+             AND a.attnum > 0 AND x.grantee <> c.relowner GROUP BY c.relname, a.attname, x.grantee LOOP
+   EXECUTE format('REVOKE ALL (%I) ON sessions.%I FROM %s', r.attname, r.relname, CASE WHEN r.grantee = 0 THEN 'PUBLIC' ELSE quote_ident(pg_get_userbyid(r.grantee)) END);
+ END LOOP;
+ FOR r IN SELECT x.grantee FROM pg_proc p, aclexplode(coalesce(p.proacl, acldefault('f', p.proowner))) x
+           WHERE p.oid = 'sessions.ingest_org_admission_hold_guard()'::regprocedure AND x.grantee <> p.proowner GROUP BY x.grantee LOOP
+   EXECUTE format('REVOKE ALL ON FUNCTION sessions.ingest_org_admission_hold_guard() FROM %s', CASE WHEN r.grantee = 0 THEN 'PUBLIC' ELSE quote_ident(pg_get_userbyid(r.grantee)) END);
+ END LOOP;
+END $hold_history_acl$;
+
+-- A retained history (this slot's down keeps both tables) must be exactly this one, else 55000, nothing applied.
+DO $hold_history_shape$
+BEGIN
+ -- IS NOT TRUE, not NOT: an empty aggregate is NULL, and NOT NULL would skip the refusal.
+ IF (
+-- The exact retained history: owner, columns, column defaults, indexes, constraints (NOT NULL is the column check;
+-- PostgreSQL 18 and PGlite also catalogue it as a constraint, so 'n' rows are excluded), the four guard triggers on the
+-- guard function, enabled, and owner-only ACLs on both tables (every grantee, column grants included) and on the guard
+-- function (PUBLIC included). Shared verbatim by this slot's up and its generated down (lane ingest-org-admission-hold).
+ (SELECT pg_get_userbyid(relowner) FROM pg_class WHERE oid = 'sessions.ingest_org_admission_holds'::regclass) = current_user
+ AND (SELECT pg_get_userbyid(relowner) FROM pg_class WHERE oid = 'sessions.ingest_org_admission_hold_events'::regclass) = current_user
+ AND (SELECT string_agg(attname || ' ' || format_type(atttypid, atttypmod) || CASE WHEN attnotnull THEN ' not null' ELSE '' END, ', ' ORDER BY attnum)
+        FROM pg_attribute WHERE attrelid = 'sessions.ingest_org_admission_holds'::regclass AND attnum > 0 AND NOT attisdropped)
+     = 'epoch uuid not null, held_org text not null, request_id uuid not null, state text not null, installed_at timestamp with time zone not null, sealed_at timestamp with time zone, marker_attempted_at timestamp with time zone, released_at timestamp with time zone, release_reason text, release_evidence_sha256 text'
+ AND (SELECT string_agg(attname || ' ' || format_type(atttypid, atttypmod) || CASE WHEN attnotnull THEN ' not null' ELSE '' END, ', ' ORDER BY attnum)
+        FROM pg_attribute WHERE attrelid = 'sessions.ingest_org_admission_hold_events'::regclass AND attnum > 0 AND NOT attisdropped)
+     = 'epoch uuid not null, kind text not null, at timestamp with time zone not null, detail text, evidence_sha256 text'
+ AND (SELECT array_agg(pg_get_indexdef(indexrelid)::text ORDER BY pg_get_indexdef(indexrelid)::text COLLATE "C") FROM pg_index
+       WHERE indrelid IN ('sessions.ingest_org_admission_holds'::regclass, 'sessions.ingest_org_admission_hold_events'::regclass))
+     = ARRAY[
+         'CREATE UNIQUE INDEX ingest_org_admission_hold_events_pkey ON sessions.ingest_org_admission_hold_events USING btree (epoch, kind)',
+         'CREATE UNIQUE INDEX ingest_org_admission_holds_live ON sessions.ingest_org_admission_holds USING btree (held_org) WHERE (state <> ''released''::text)',
+         'CREATE UNIQUE INDEX ingest_org_admission_holds_pkey ON sessions.ingest_org_admission_holds USING btree (epoch)',
+         'CREATE UNIQUE INDEX ingest_org_admission_holds_request_id_key ON sessions.ingest_org_admission_holds USING btree (request_id)']::text[]
+ AND (SELECT array_agg(conrelid::regclass::text || ' ' || contype::text || ' ' || pg_get_constraintdef(oid) ORDER BY conrelid::regclass::text COLLATE "C", contype::text COLLATE "C", pg_get_constraintdef(oid) COLLATE "C")
+        FROM pg_constraint WHERE conrelid IN ('sessions.ingest_org_admission_holds'::regclass, 'sessions.ingest_org_admission_hold_events'::regclass) AND contype <> 'n')
+     = ARRAY[
+         'sessions.ingest_org_admission_hold_events c CHECK (((detail IS NULL) OR (detail ~ ''^[a-z][a-z0-9_]{0,63}$''::text)))',
+         'sessions.ingest_org_admission_hold_events c CHECK (((evidence_sha256 IS NULL) OR (evidence_sha256 ~ ''^[0-9a-f]{64}$''::text)))',
+         'sessions.ingest_org_admission_hold_events c CHECK (((kind <> ALL (ARRAY[''sealed''::text, ''marker_attempted''::text, ''released''::text])) OR (evidence_sha256 IS NOT NULL)))',
+         'sessions.ingest_org_admission_hold_events c CHECK ((kind = ANY (ARRAY[''installed''::text, ''sealed''::text, ''marker_attempted''::text, ''released''::text])))',
+         'sessions.ingest_org_admission_hold_events f FOREIGN KEY (epoch) REFERENCES sessions.ingest_org_admission_holds(epoch)',
+         'sessions.ingest_org_admission_hold_events p PRIMARY KEY (epoch, kind)',
+         'sessions.ingest_org_admission_holds c CHECK (((release_reason IS DISTINCT FROM ''bridge_complete''::text) OR (marker_attempted_at IS NOT NULL)))',
+         'sessions.ingest_org_admission_holds c CHECK (((release_reason IS DISTINCT FROM ''verified_rollback''::text) OR (marker_attempted_at IS NULL)))',
+         'sessions.ingest_org_admission_holds c CHECK (((state <> ''marker_attempted''::text) OR (marker_attempted_at IS NOT NULL)))',
+         'sessions.ingest_org_admission_holds c CHECK (((state <> ALL (ARRAY[''sealed''::text, ''marker_attempted''::text])) OR (sealed_at IS NOT NULL)))',
+         'sessions.ingest_org_admission_holds c CHECK (((state = ''released''::text) = ((release_reason IS NOT NULL) AND (release_evidence_sha256 IS NOT NULL))))',
+         'sessions.ingest_org_admission_holds c CHECK (((state = ''released''::text) = (released_at IS NOT NULL)))',
+         'sessions.ingest_org_admission_holds c CHECK ((held_org ~ ''^[A-Za-z0-9_-][A-Za-z0-9._-]{0,127}$''::text))',
+         'sessions.ingest_org_admission_holds c CHECK ((release_evidence_sha256 ~ ''^[0-9a-f]{64}$''::text))',
+         'sessions.ingest_org_admission_holds c CHECK ((release_reason = ANY (ARRAY[''bridge_complete''::text, ''verified_rollback''::text])))',
+         'sessions.ingest_org_admission_holds c CHECK ((state = ANY (ARRAY[''held''::text, ''sealed''::text, ''marker_attempted''::text, ''released''::text])))',
+         'sessions.ingest_org_admission_holds p PRIMARY KEY (epoch)',
+         'sessions.ingest_org_admission_holds u UNIQUE (request_id)']::text[]
+ AND (SELECT array_agg(t.tgname || ' ' || t.tgtype ORDER BY t.tgname COLLATE "C") FROM pg_trigger t
+       WHERE t.tgrelid IN ('sessions.ingest_org_admission_holds'::regclass, 'sessions.ingest_org_admission_hold_events'::regclass) AND NOT t.tgisinternal
+         AND t.tgenabled = 'O' AND t.tgfoid = 'sessions.ingest_org_admission_hold_guard()'::regprocedure)
+     = ARRAY['ingest_org_admission_hold_events_guard 27', 'ingest_org_admission_hold_events_truncate 34', 'ingest_org_admission_holds_guard 27', 'ingest_org_admission_holds_truncate 34']::text[]
+ AND (SELECT count(*) FROM pg_trigger t WHERE t.tgrelid IN ('sessions.ingest_org_admission_holds'::regclass, 'sessions.ingest_org_admission_hold_events'::regclass) AND NOT t.tgisinternal) = 4
+ AND (SELECT array_agg(c.relname::text || ' ' || a.attname::text || ' ' || pg_get_expr(d.adbin, d.adrelid) ORDER BY c.relname::text COLLATE "C", a.attname::text COLLATE "C")
+        FROM pg_attrdef d JOIN pg_attribute a ON a.attrelid = d.adrelid AND a.attnum = d.adnum JOIN pg_class c ON c.oid = d.adrelid
+       WHERE d.adrelid IN ('sessions.ingest_org_admission_holds'::regclass, 'sessions.ingest_org_admission_hold_events'::regclass))
+     = ARRAY['ingest_org_admission_hold_events at clock_timestamp()', 'ingest_org_admission_holds installed_at clock_timestamp()']::text[]
+ AND NOT EXISTS (SELECT 1 FROM pg_class c, aclexplode(coalesce(c.relacl, acldefault('r', c.relowner))) x
+       WHERE c.oid IN ('sessions.ingest_org_admission_holds'::regclass, 'sessions.ingest_org_admission_hold_events'::regclass) AND x.grantee <> c.relowner)
+ AND NOT EXISTS (SELECT 1 FROM pg_attribute WHERE attrelid IN ('sessions.ingest_org_admission_holds'::regclass, 'sessions.ingest_org_admission_hold_events'::regclass)
+       AND attnum > 0 AND attacl IS NOT NULL)
+ AND NOT EXISTS (SELECT 1 FROM pg_proc p, aclexplode(coalesce(p.proacl, acldefault('f', p.proowner))) x
+       WHERE p.oid = 'sessions.ingest_org_admission_hold_guard()'::regprocedure AND x.grantee <> p.proowner)
+ ) IS NOT TRUE THEN
+   RAISE EXCEPTION USING ERRCODE = '55000', MESSAGE = 'org admission hold: an existing hold history is not this slot''s; nothing applied';
+ END IF;
+END $hold_history_shape$;
+
+-- The stable per-org key. Its namespace literal is used by nothing else (design section 4).
+CREATE FUNCTION sessions.ingest_org_admission_hold_key(p_org text) RETURNS bigint
+LANGUAGE sql IMMUTABLE STRICT SET search_path = pg_catalog, pg_temp AS $hold_key$
+  SELECT hashtextextended('96bulls:ingest-org-hold-v1:' || p_org, 0)
+$hold_key$;
+
+-- The entry check. p_class:
+--   'admission'   refused while the org has any non-released hold;
+--   'publication' refused while it is sealed or marker_attempted;
+--   'control'     refused while sealed or marker_attempted unless session_user is a member of the NOLOGIN role
+--                 bulls96_session_ingest_mirror (the Worker's mirrored control login). If that role does not exist,
+--                 every control is refused in those states (fail closed); this slot creates no role;
+--   'erasure'     never refused: takes the key SHARED only, so a release (EXCLUSIVE) serializes with it.
+CREATE FUNCTION sessions.ingest_org_admission_hold_check(p_org text, p_class text) RETURNS void
+LANGUAGE plpgsql VOLATILE SET search_path = pg_catalog, pg_temp AS $hold_check$
+DECLARE v_state text;
+BEGIN
+  IF p_class IS NULL OR p_class NOT IN ('admission', 'publication', 'control', 'erasure') THEN
+    RAISE EXCEPTION USING ERRCODE = '22023', MESSAGE = 'session ingest: org admission hold class invalid';
+  END IF;
+  IF p_org IS NULL THEN
+    RAISE EXCEPTION USING ERRCODE = '22023', MESSAGE = 'session ingest: org admission hold org missing';
+  END IF;
+  -- Erasure is never refused, at any isolation level: it only takes the key so a release serializes with it.
+  IF p_class = 'erasure' THEN
+    PERFORM pg_advisory_xact_lock_shared(sessions.ingest_org_admission_hold_key(p_org));
+    RETURN;
+  END IF;
+  IF current_setting('transaction_isolation') <> 'read committed' THEN
+    RAISE EXCEPTION USING ERRCODE = '40001', MESSAGE = 'session ingest: org admission hold requires read committed';
+  END IF;
+  PERFORM pg_advisory_xact_lock_shared(sessions.ingest_org_admission_hold_key(p_org));
+  -- A later statement: under READ COMMITTED its snapshot is taken after the shared key was granted.
+  SELECT h.state INTO v_state FROM sessions.ingest_org_admission_holds AS h
+   WHERE h.held_org = p_org AND h.state <> 'released';
+  IF NOT FOUND THEN RETURN; END IF;
+  IF p_class = 'admission'
+     OR (p_class = 'publication' AND v_state IN ('sealed', 'marker_attempted'))
+     OR (p_class = 'control' AND v_state IN ('sealed', 'marker_attempted')
+         AND NOT (EXISTS (SELECT 1 FROM pg_catalog.pg_roles WHERE rolname = 'bulls96_session_ingest_mirror')
+                  AND pg_has_role(session_user, 'bulls96_session_ingest_mirror', 'MEMBER'))) THEN
+    RAISE EXCEPTION USING ERRCODE = 'RH042', MESSAGE = 'session ingest: org admission held';
+  END IF;
+END
+$hold_check$;
+
+-- Lifecycle serialization with this slot's down (design section 6, "Schema down"): the generated down holds
+-- (961996,1) EXCLUSIVE; every lifecycle function takes it SHARED first, then re-checks in a fresh statement that the
+-- slot is still applied, so a call paused before its first write refuses after a down instead of writing unenforced.
+CREATE FUNCTION sessions.ingest_org_admission_hold_lifecycle(p_org text) RETURNS void
+LANGUAGE plpgsql VOLATILE SET search_path = pg_catalog, pg_temp AS $hold_lifecycle$
+BEGIN
+  IF current_setting('transaction_isolation') <> 'read committed' THEN
+    RAISE EXCEPTION USING ERRCODE = '40001', MESSAGE = 'session ingest: org admission hold requires read committed';
+  END IF;
+  IF p_org IS NULL OR p_org !~ '^[A-Za-z0-9_-][A-Za-z0-9._-]{0,127}$' THEN
+    RAISE EXCEPTION USING ERRCODE = '22023', MESSAGE = 'session ingest: org admission hold org invalid';
+  END IF;
+  PERFORM pg_advisory_xact_lock_shared(961996, 1);
+  IF to_regclass('sessions.__96bulls_migrations') IS NULL OR NOT EXISTS (
+       SELECT 1 FROM sessions.__96bulls_migrations
+        WHERE name = 'upstream:20261105062320_ingest_org_admission_fences.sql') THEN
+    RAISE EXCEPTION USING ERRCODE = '55000', MESSAGE = 'session ingest: org admission hold slot not applied';
+  END IF;
+  PERFORM pg_advisory_xact_lock(sessions.ingest_org_admission_hold_key(p_org));
+END
+$hold_lifecycle$;
+
+-- Install: waits for every in-flight transaction holding the org key SHARED, then refuses on any pending batch.
+-- Idempotent by request_id (a lost response returns the same epoch, no second event).
+CREATE FUNCTION sessions.ingest_org_admission_hold_install(p_org text, p_request uuid) RETURNS uuid
+LANGUAGE plpgsql VOLATILE SET search_path = pg_catalog, pg_temp AS $hold_install$
+DECLARE h sessions.ingest_org_admission_holds%ROWTYPE; v_epoch uuid;
+BEGIN
+  IF p_request IS NULL THEN RAISE EXCEPTION USING ERRCODE = '22023', MESSAGE = 'session ingest: org admission hold request missing'; END IF;
+  PERFORM sessions.ingest_org_admission_hold_lifecycle(p_org);
+  SELECT * INTO h FROM sessions.ingest_org_admission_holds WHERE request_id = p_request;
+  IF FOUND THEN
+    IF h.held_org <> p_org OR h.state = 'released' THEN
+      RAISE EXCEPTION USING ERRCODE = '55000', MESSAGE = 'session ingest: org admission hold request reused';
+    END IF;
+    RETURN h.epoch;
+  END IF;
+  IF EXISTS (SELECT 1 FROM sessions.ingest_org_admission_holds WHERE held_org = p_org AND state <> 'released') THEN
+    RAISE EXCEPTION USING ERRCODE = '55000', MESSAGE = 'session ingest: org admission hold already live';
+  END IF;
+  IF EXISTS (SELECT 1 FROM sessions.ingest_batches WHERE org_id = p_org AND state = 'pending') THEN
+    RAISE EXCEPTION USING ERRCODE = 'RH042', MESSAGE = 'session ingest: org admission hold needs no pending batch';
+  END IF;
+  v_epoch := gen_random_uuid();
+  INSERT INTO sessions.ingest_org_admission_holds (epoch, held_org, request_id, state) VALUES (v_epoch, p_org, p_request, 'held');
+  INSERT INTO sessions.ingest_org_admission_hold_events (epoch, kind) VALUES (v_epoch, 'installed');
+  RETURN v_epoch;
+END
+$hold_install$;
+
+-- Seal: waits for every in-flight publication (they hold the key SHARED), then publication is refused.
+-- Idempotent for the same epoch. The caller's gate binds the FULL run that must precede it.
+CREATE FUNCTION sessions.ingest_org_admission_hold_seal(p_org text, p_epoch uuid, p_evidence text) RETURNS void
+LANGUAGE plpgsql VOLATILE SET search_path = pg_catalog, pg_temp AS $hold_seal$
+DECLARE h sessions.ingest_org_admission_holds%ROWTYPE;
+BEGIN
+  -- The bound FULL backfill-execute receipt's sha256: no transition without it.
+  IF p_evidence IS NULL OR p_evidence !~ '^[0-9a-f]{64}$' THEN
+    RAISE EXCEPTION USING ERRCODE = '22023', MESSAGE = 'session ingest: org admission hold evidence required';
+  END IF;
+  PERFORM sessions.ingest_org_admission_hold_lifecycle(p_org);
+  SELECT * INTO h FROM sessions.ingest_org_admission_holds WHERE held_org = p_org AND state <> 'released';
+  IF NOT FOUND OR h.epoch IS DISTINCT FROM p_epoch THEN
+    RAISE EXCEPTION USING ERRCODE = '55000', MESSAGE = 'session ingest: org admission hold epoch stale';
+  END IF;
+  IF h.state = 'sealed' THEN RETURN; END IF;
+  IF h.state <> 'held' THEN
+    RAISE EXCEPTION USING ERRCODE = '55000', MESSAGE = 'session ingest: org admission hold transition refused';
+  END IF;
+  UPDATE sessions.ingest_org_admission_holds SET state = 'sealed', sealed_at = clock_timestamp() WHERE epoch = p_epoch;
+  INSERT INTO sessions.ingest_org_admission_hold_events (epoch, kind, evidence_sha256) VALUES (p_epoch, 'sealed', p_evidence);
+END
+$hold_seal$;
+
+-- Marker attempt: committed before EVERY marker PUT attempt; from sealed (first) or marker_attempted (same epoch, no
+-- event). After it, only bridge_complete releases. The caller's gate binds the final catch-up that must precede it.
+CREATE FUNCTION sessions.ingest_org_admission_hold_marker_attempt(p_org text, p_epoch uuid, p_evidence text) RETURNS void
+LANGUAGE plpgsql VOLATILE SET search_path = pg_catalog, pg_temp AS $hold_marker_attempt$
+DECLARE h sessions.ingest_org_admission_holds%ROWTYPE;
+BEGIN
+  -- The bound final catch-up receipt's sha256: no attempt without it.
+  IF p_evidence IS NULL OR p_evidence !~ '^[0-9a-f]{64}$' THEN
+    RAISE EXCEPTION USING ERRCODE = '22023', MESSAGE = 'session ingest: org admission hold evidence required';
+  END IF;
+  PERFORM sessions.ingest_org_admission_hold_lifecycle(p_org);
+  SELECT * INTO h FROM sessions.ingest_org_admission_holds WHERE held_org = p_org AND state <> 'released';
+  IF NOT FOUND OR h.epoch IS DISTINCT FROM p_epoch THEN
+    RAISE EXCEPTION USING ERRCODE = '55000', MESSAGE = 'session ingest: org admission hold epoch stale';
+  END IF;
+  IF h.state = 'marker_attempted' THEN RETURN; END IF;
+  IF h.state <> 'sealed' THEN
+    RAISE EXCEPTION USING ERRCODE = '55000', MESSAGE = 'session ingest: org admission hold transition refused';
+  END IF;
+  UPDATE sessions.ingest_org_admission_holds SET state = 'marker_attempted', marker_attempted_at = clock_timestamp()
+   WHERE epoch = p_epoch;
+  INSERT INTO sessions.ingest_org_admission_hold_events (epoch, kind, evidence_sha256)
+    VALUES (p_epoch, 'marker_attempted', p_evidence);
+END
+$hold_marker_attempt$;
+
+-- Release: 'verified_rollback' only from held or sealed with no attempt; 'bridge_complete' only from marker_attempted,
+-- and only when p_erasures equals the org's erasure record count (operator user erasures plus session erasure fences)
+-- read here under the EXCLUSIVE key: every erasure takes the key SHARED (erasure class), so none can commit between
+-- this count and the release, and one committed after the bridge's replay read makes the counts differ (design 6.2).
+-- Idempotent for the same (epoch, reason, evidence); any other repeat or a stale epoch refuses.
+CREATE FUNCTION sessions.ingest_org_admission_hold_release(p_org text, p_epoch uuid, p_reason text, p_evidence text,
+  p_detail text, p_erasures bigint) RETURNS void
+LANGUAGE plpgsql VOLATILE SET search_path = pg_catalog, pg_temp AS $hold_release$
+DECLARE h sessions.ingest_org_admission_holds%ROWTYPE;
+BEGIN
+  IF p_reason IS NULL OR p_reason NOT IN ('bridge_complete', 'verified_rollback') OR p_evidence IS NULL
+     OR p_evidence !~ '^[0-9a-f]{64}$' THEN
+    RAISE EXCEPTION USING ERRCODE = '22023', MESSAGE = 'session ingest: org admission hold release invalid';
+  END IF;
+  PERFORM sessions.ingest_org_admission_hold_lifecycle(p_org);
+  SELECT * INTO h FROM sessions.ingest_org_admission_holds WHERE epoch = p_epoch AND held_org = p_org;
+  IF NOT FOUND THEN
+    RAISE EXCEPTION USING ERRCODE = '55000', MESSAGE = 'session ingest: org admission hold epoch stale';
+  END IF;
+  IF h.state = 'released' THEN
+    IF h.release_reason = p_reason AND h.release_evidence_sha256 = p_evidence THEN RETURN; END IF;
+    RAISE EXCEPTION USING ERRCODE = '55000', MESSAGE = 'session ingest: org admission hold already released';
+  END IF;
+  IF p_reason = 'bridge_complete' AND (p_erasures IS NULL OR p_erasures <> (
+       (SELECT count(*) FROM sessions.operator_user_erasures WHERE org_id = p_org)
+     + (SELECT count(*) FROM sessions.session_erasure_fences WHERE org_id = p_org))) THEN
+    RAISE EXCEPTION USING ERRCODE = '55000', MESSAGE = 'session ingest: org admission hold erasures not replayed';
+  END IF;
+  IF (p_reason = 'bridge_complete' AND h.state <> 'marker_attempted')
+     OR (p_reason = 'verified_rollback' AND (h.state NOT IN ('held', 'sealed') OR EXISTS (
+          SELECT 1 FROM sessions.ingest_org_admission_hold_events WHERE epoch = p_epoch AND kind = 'marker_attempted'))) THEN
+    RAISE EXCEPTION USING ERRCODE = '55000', MESSAGE = 'session ingest: org admission hold transition refused';
+  END IF;
+  UPDATE sessions.ingest_org_admission_holds
+     SET state = 'released', released_at = clock_timestamp(), release_reason = p_reason, release_evidence_sha256 = p_evidence
+   WHERE epoch = p_epoch;
+  INSERT INTO sessions.ingest_org_admission_hold_events (epoch, kind, detail, evidence_sha256)
+    VALUES (p_epoch, 'released', p_detail, p_evidence);
+END
+$hold_release$;
+
+-- Read-only status for the bridge and the cutover tooling: the org's live hold (or its latest released one) and the
+-- erasure record count _release compares against (design 6.2). Owner-only, like the tables.
+CREATE FUNCTION sessions.ingest_org_admission_hold_status(p_org text) RETURNS jsonb
+LANGUAGE plpgsql STABLE SET search_path = pg_catalog, pg_temp AS $hold_status$
+BEGIN
+  -- plpgsql, not sql: the erasure tables are resolved when called, so a profile without the erase slots still applies.
+  RETURN jsonb_build_object(
+    'hold', (SELECT to_jsonb(h) FROM sessions.ingest_org_admission_holds AS h WHERE h.held_org = p_org
+              ORDER BY (h.state <> 'released') DESC, h.installed_at DESC LIMIT 1),
+    'erasures', (SELECT count(*) FROM sessions.operator_user_erasures WHERE org_id = p_org)
+              + (SELECT count(*) FROM sessions.session_erasure_fences WHERE org_id = p_org));
+END
+$hold_status$;
+
+-- Backstop: a future inserter of batch rows that bypasses the entry checks is still refused. Not the primary
+-- enforcement (design section 2).
+CREATE FUNCTION sessions.ingest_org_admission_hold_batch_backstop() RETURNS trigger
+LANGUAGE plpgsql VOLATILE SET search_path = pg_catalog, pg_temp AS $hold_batch_backstop$
+BEGIN
+  PERFORM sessions.ingest_org_admission_hold_check(NEW.org_id, 'admission');
+  RETURN NEW;
+END
+$hold_batch_backstop$;
+CREATE TRIGGER ingest_org_admission_hold_batch_backstop BEFORE INSERT ON sessions.ingest_batches
+  FOR EACH ROW EXECUTE FUNCTION sessions.ingest_org_admission_hold_batch_backstop();
+
+REVOKE ALL ON FUNCTION sessions.ingest_org_admission_hold_guard(), sessions.ingest_org_admission_hold_key(text),
+  sessions.ingest_org_admission_hold_check(text, text), sessions.ingest_org_admission_hold_lifecycle(text),
+  sessions.ingest_org_admission_hold_install(text, uuid), sessions.ingest_org_admission_hold_seal(text, uuid, text),
+  sessions.ingest_org_admission_hold_marker_attempt(text, uuid, text),
+  sessions.ingest_org_admission_hold_release(text, uuid, text, text, text, bigint),
+  sessions.ingest_org_admission_hold_batch_backstop(), sessions.ingest_org_admission_hold_status(text)
+  FROM PUBLIC, anon, authenticated, service_role, bulls96_session_ingest, bulls96_session_ingest_seeder;
+
+-- ENTRY CHECKS. Every runtime-granted function was classified (85; the classification and its test live in
+-- src/hoopdb/org-admission-hold-classes.ts). Each body below is its LATEST prior body, verbatim, plus one marked line
+-- (`-- 062320 org admission hold`): the check right after BEGIN (payload tenant), or right after the stored row that
+-- names the org is read (publication publish/claim, history plan claim, seeding). The generated rollback restores the
+-- prior bodies exactly. Classes:
+--   admission    origin_claim_buffered_batch, origin_prepare_buffer_stage, origin_commit_buffered_batch,
+--                claim_batch_mode (canonical and inner buffered), claim_buffered_batch, commit_batch,
+--                commit_buffered_batch, prepare_buffer_stage, commit_revisions, fanout_fence, seed_proven_records
+--   publication  publication_publish, publication_claim, history_plan_claim
+--   control      set_session_uploads, selfhost_set_session_uploads, reset_uploaded_sessions, turn_register
+--   erasure      ingest_operator_runtime_begin, operator_user_erase_begin
+-- The origin wrappers (062010) are checked FIRST, before their origin advisory and transaction mark, so the org key is
+-- the first lock on every admission path; the plain functions they call re-take the same shared key (a no-op re-grant).
+
+-- sessions.ingest_claim_batch_mode: latest body from 20261105050010_operator_session_erase_fence_check.sql, plus the admission check.
+CREATE OR REPLACE FUNCTION sessions.ingest_claim_batch_mode(p jsonb,p_mode text)
+RETURNS jsonb
+LANGUAGE plpgsql
+VOLATILE
+SECURITY INVOKER
+SET search_path = pg_catalog, pg_temp
+AS $claim$
+DECLARE
+  k record;
+  v_receipt text;
+  v_batch sessions.ingest_batches%ROWTYPE;
+  v_state text;
+  v_pairs jsonb;
+  v_items jsonb;
+  v_live jsonb;
+  v_deleted jsonb;
+  v_conflicts jsonb;
+  v_count integer;
+  v_stale jsonb;
+  v_resets integer;
+  v_fast boolean;
+  v_inserted boolean;
+  v_token uuid;
+  v_epochs jsonb;
+  v_acq jsonb;v_acq_pairs jsonb;v_nulls jsonb;
+BEGIN
+ PERFORM sessions.ingest_org_admission_hold_check(sessions.ingest_identifier(p#>'{tenant,orgId}',false),'admission'); -- 062320 org admission hold
+ IF p_mode='canonical' AND EXISTS(SELECT 1 FROM sessions.ingest_lazy_policy WHERE singleton) THEN
+  RAISE EXCEPTION USING ERRCODE='55000',MESSAGE='session ingest: explicit buffered witness required';END IF;
+  PERFORM sessions.ingest_require_role('bulls96_session_ingest');
+  IF p_mode NOT IN ('buffered','canonical') THEN RAISE EXCEPTION USING ERRCODE='22023',MESSAGE='session ingest: invalid publication mode'; END IF;
+  -- Flag off: an `acquisition` key is malformed input, exactly as before this migration.
+  PERFORM sessions.ingest_exact_keys(CASE WHEN sessions.ingest_acquisition_hooks_live() THEN p-'acquisition' ELSE p END,
+    ARRAY['tenant', 'originId', 'batchId', 'batchDigest', 'receiptId', 'sessions', 'records']);
+  k := sessions.ingest_batch_key(p);
+  IF jsonb_typeof(p -> 'receiptId') IS DISTINCT FROM 'string'
+     OR (p ->> 'receiptId') !~ '^rhr_[0-9a-f]{64}$' THEN
+    RAISE EXCEPTION USING ERRCODE = '22023', MESSAGE = 'session ingest: receiptId is malformed';
+  END IF;
+  v_receipt := p ->> 'receiptId';
+  -- Validated and normalized once; every later step reads these values only. No
+  -- temporary table: a definer function must not read objects the caller can create.
+  v_pairs := (SELECT coalesce(jsonb_agg(jsonb_build_array(x.source, x.session_id)), '[]'::jsonb)
+                FROM sessions.ingest_session_pairs(p -> 'sessions') AS x);
+  v_items := sessions.ingest_records(p -> 'records');
+
+  IF p_mode='canonical' AND (
+    EXISTS(SELECT 1 FROM sessions.ingest_buffer_admission WHERE org_id=k.org_id) OR
+    EXISTS(SELECT 1 FROM sessions.ingest_batches WHERE org_id=k.org_id AND publication_state='buffered')) THEN
+   RAISE EXCEPTION USING ERRCODE='55000',MESSAGE='session ingest: explicit buffered publication authority required';
+  END IF;
+  PERFORM sessions.ingest_lock_fences(k.org_id,k.workspace_id,k.user_id);
+
+  -- (a) A known batch id: its receipt, a resume, or a batch-id 409. The primary key
+  -- decides a race between two first claims (the insert below), not a lock.
+  SELECT * INTO v_batch FROM sessions.ingest_batches AS b
+   WHERE b.org_id = k.org_id AND b.workspace_id = k.workspace_id
+     AND b.origin_id = k.origin_id AND b.batch_id = k.batch_id;
+  IF FOUND THEN
+    IF v_batch.user_id<>k.user_id THEN RAISE EXCEPTION USING ERRCODE='42501',MESSAGE='session ingest: batch owner mismatch'; END IF;
+    IF v_batch.digest <> k.digest THEN
+      RETURN jsonb_build_object('kind', 'batch_conflict', 'currentDigest', v_batch.digest);
+    END IF;
+    IF v_batch.state = 'committed' THEN
+      IF v_batch.publication_state='buffered' AND v_batch.buffer_receipt_kind IS DISTINCT FROM 'suppressed'
+        AND NOT EXISTS(SELECT 1 FROM sessions.ingest_buffer_outbox AS o
+          LEFT JOIN sessions.ingest_stage_intents AS t ON t.stage_token=o.active_stage_token
+          WHERE o.org_id=k.org_id AND o.workspace_id=k.workspace_id AND o.origin_id=k.origin_id AND o.batch_id=k.batch_id
+            AND o.user_id=k.user_id AND o.digest=k.digest AND
+            (o.state='erased' OR (t.receipt_state='acknowledged' AND t.cleanup_state='live'))) THEN
+        RAISE EXCEPTION USING ERRCODE='55000',MESSAGE='session ingest: buffered receipt proof missing';
+      END IF;
+      RETURN jsonb_build_object('kind', 'replay', 'receiptId', v_batch.receipt_id);
+    END IF;
+    IF v_batch.publication_state<>p_mode THEN RAISE EXCEPTION USING ERRCODE='55000',MESSAGE='session ingest: explicit publication transition required'; END IF;
+    v_state := 'resume';
+  ELSE
+    v_state := 'claimed';
+  END IF;
+
+  IF p_mode='buffered' THEN PERFORM sessions.ingest_require_buffer_admission(k.org_id); END IF;
+
+  -- 050010: a pair under an operator erase fence is deselected for this user and origin, so (b) drops
+  -- its records exactly as for any deselected session. One PK probe per distinct pair, no lock.
+  PERFORM sessions.ingest_erase_fence_extend(k.org_id,k.workspace_id,k.user_id,k.origin_id,
+    (SELECT coalesce(jsonb_agg(jsonb_build_array(x.source,x.session_id)),'[]'::jsonb)
+       FROM (SELECT q.pair->>0 AS source,q.pair->>1 AS session_id FROM jsonb_array_elements(v_pairs) AS q(pair)
+             UNION SELECT i.item->>'source',i.item->>'session_id' FROM jsonb_array_elements(v_items) AS i(item)
+              WHERE i.item->>'session_id' IS NOT NULL) AS x));
+
+  -- (b) The batch's sessions this user deleted from this origin. As Neon 0038, their
+  -- records are dropped before the revision checks (the receipt still acknowledges
+  -- them), so only the rest is judged below.
+  SELECT coalesce(jsonb_agg(jsonb_build_array(d.source, d.session_id)
+           ORDER BY d.source COLLATE "C", d.session_id COLLATE "C"), '[]'::jsonb)
+    INTO v_deleted
+    FROM sessions.upload_deletions AS d
+    JOIN (SELECT x.pair ->> 0 AS source, x.pair ->> 1 AS session_id FROM jsonb_array_elements(v_pairs) AS x(pair)
+          UNION
+          SELECT i.item ->> 'source', i.item ->> 'session_id' FROM jsonb_array_elements(v_items) AS i(item)
+           WHERE i.item ->> 'session_id' IS NOT NULL) AS s
+      ON s.source = d.source AND s.session_id = d.session_id
+   WHERE d.org_id = k.org_id AND d.workspace_id = k.workspace_id
+     AND d.user_id = k.user_id AND d.origin_id = k.origin_id;
+  v_live := (SELECT coalesce(jsonb_agg(i.item ORDER BY (i.item ->> 'ord')::integer), '[]'::jsonb)
+               FROM jsonb_array_elements(v_items) AS i(item)
+              WHERE i.item ->> 'session_id' IS NULL
+                 OR NOT EXISTS (SELECT 1 FROM jsonb_array_elements(v_deleted) AS d(pair)
+                                 WHERE d.pair ->> 0 = i.item ->> 'source' AND d.pair ->> 1 = i.item ->> 'session_id'));
+
+  -- (c) #250's revision rules over the committed revisions, read without a lock
+  -- (the primary key serves record_id = ANY of the batch's ids). In identity order
+  -- (record_id, revision, revision_id): a record whose stored revision is at or
+  -- above its own is stale (a replay, whatever its digest); a NEW revision (none
+  -- stored, or the stored one lower) must not be reused in the batch, by its first
+  -- peer in identity order, with both another revision id and another digest.
+  WITH sorted AS (
+    SELECT i.*, row_number() OVER (
+             ORDER BY i.record_id COLLATE "C", i.revision, i.revision_id COLLATE "C", i.ord) AS rn
+      FROM jsonb_to_recordset(v_live) AS i(ord integer, source text, session_id text,
+                                            record_id text, revision_id text, revision bigint, digest text)
+  ), stored AS MATERIALIZED (
+    SELECT c.record_id, c.revision
+      FROM sessions.ingest_record_revisions AS c
+     WHERE c.org_id = k.org_id AND c.workspace_id = k.workspace_id AND c.origin_id = k.origin_id
+       AND c.record_id = ANY (ARRAY(SELECT DISTINCT s.record_id FROM sorted AS s))
+       AND NOT(p_mode='buffered' AND EXISTS(SELECT 1 FROM sessions.ingest_lazy_policy WHERE singleton))
+    UNION ALL
+    SELECT n.record_id,n.current_revision AS revision FROM sessions.ingest_lazy_native_slots n
+     WHERE p_mode='buffered' AND EXISTS(SELECT 1 FROM sessions.ingest_lazy_policy WHERE singleton)
+      AND n.org_id=k.org_id AND n.workspace_id=k.workspace_id AND n.origin_id=k.origin_id
+      AND n.current_owner=k.user_id AND n.current_revision IS NOT NULL
+      -- Probe the existing global-native PK for this bounded batch. An owner
+      -- index alone would scan every current record the user has ever uploaded.
+      AND n.key_sha256=ANY(ARRAY(SELECT encode(sha256(convert_to(
+        jsonb_build_array('global-native-custody-v1',k.org_id,k.workspace_id,k.origin_id,s.record_id)::text,'UTF8')),'hex')
+        FROM sorted s))
+      AND n.record_id=ANY(ARRAY(SELECT DISTINCT s.record_id FROM sorted s))
+  ), peers AS (
+    SELECT DISTINCT ON (s.record_id, s.revision) s.record_id, s.revision,
+           s.revision_id AS peer_revision_id, s.digest AS peer_digest
+      FROM sorted AS s ORDER BY s.record_id, s.revision, s.rn
+  ), judged AS (
+    SELECT s.rn, s.ord, s.record_id, s.revision_id, s.revision, s.digest,
+           c.revision IS NOT NULL AND c.revision >= s.revision AS stale,
+           (c.revision IS NULL OR c.revision < s.revision OR
+             (c.revision=s.revision AND p_mode='buffered' AND EXISTS(SELECT 1 FROM sessions.ingest_lazy_policy WHERE singleton)))
+             AND p.peer_revision_id <> s.revision_id AND p.peer_digest <> s.digest AS twin,
+           p.peer_revision_id, p.peer_digest
+      FROM sorted AS s
+      JOIN peers AS p ON p.record_id = s.record_id AND p.revision = s.revision
+      LEFT JOIN stored AS c ON c.record_id = s.record_id
+  ), numbered AS (
+    SELECT j.*, row_number() OVER (PARTITION BY j.twin ORDER BY j.rn) AS twin_rn FROM judged AS j
+  )
+  SELECT count(*) FILTER (WHERE n.twin)::integer,
+         coalesce(jsonb_agg(jsonb_build_object(
+           'recordId', n.record_id,
+           'submittedRevisionId', n.revision_id,
+           'submittedRevision', n.revision,
+           'submittedDigest', n.digest,
+           'currentRevisionId', n.peer_revision_id,
+           'currentRevision', n.revision,
+           'currentDigest', n.peer_digest) ORDER BY n.rn) FILTER (WHERE n.twin AND n.twin_rn <= 100), '[]'::jsonb),
+         coalesce(jsonb_agg(n.ord ORDER BY n.ord) FILTER (WHERE n.stale), '[]'::jsonb),
+         bool_and(n.stale) IS NOT FALSE
+    INTO v_count, v_conflicts, v_stale, v_fast
+    FROM numbered AS n;
+  IF v_count > 0 THEN
+    IF p_mode='buffered' AND NOT EXISTS(SELECT 1 FROM sessions.ingest_lazy_policy WHERE singleton) THEN
+      RETURN jsonb_build_object('kind','baseline_pending'); END IF;
+    RETURN jsonb_build_object('kind', 'revision_conflict', 'conflicts', v_conflicts, 'count', v_count);
+  END IF;
+
+  IF p_mode='buffered' THEN
+    -- Unknown historical maxima cannot suppress accepted bytes. Potential twins
+    -- above were deferred rather than incorrectly409ing a possibly stale batch.
+    v_stale:='[]'::jsonb;
+    v_fast:=jsonb_array_length(v_live)=0;
+  END IF;
+
+  SELECT count(*)::integer INTO v_resets FROM sessions.upload_resets AS r
+   WHERE r.org_id = k.org_id AND r.workspace_id = k.workspace_id AND r.user_id = k.user_id;
+
+  -- (d) The claim. When nothing needs writing (every record stale or deleted), the
+  -- batch is committed here and the caller writes nothing (replay_fast).
+  IF v_state = 'claimed' THEN
+    INSERT INTO sessions.ingest_batches
+           (org_id, workspace_id, origin_id, batch_id, user_id, digest, receipt_id, state, committed_at,publication_state,buffer_receipt_kind)
+    VALUES (k.org_id, k.workspace_id, k.origin_id, k.batch_id, k.user_id, k.digest, v_receipt,
+            CASE WHEN v_fast THEN 'committed' ELSE 'pending' END, CASE WHEN v_fast THEN now() END,p_mode,CASE WHEN p_mode='buffered' AND v_fast THEN 'suppressed' END)
+    ON CONFLICT (org_id, workspace_id, origin_id, batch_id) DO NOTHING
+    RETURNING true INTO v_inserted;
+    IF v_inserted IS NULL THEN
+      -- A concurrent first claim of this batch id won: answer as a retry would.
+      SELECT * INTO v_batch FROM sessions.ingest_batches AS b
+       WHERE b.org_id = k.org_id AND b.workspace_id = k.workspace_id
+         AND b.origin_id = k.origin_id AND b.batch_id = k.batch_id;
+      IF v_batch.user_id<>k.user_id THEN RAISE EXCEPTION USING ERRCODE='42501',MESSAGE='session ingest: batch owner mismatch'; END IF;
+      IF v_batch.digest <> k.digest THEN
+        RETURN jsonb_build_object('kind', 'batch_conflict', 'currentDigest', v_batch.digest);
+      END IF;
+      IF v_batch.state = 'committed' THEN
+        RETURN jsonb_build_object('kind', 'replay', 'receiptId', v_batch.receipt_id);
+      END IF;
+      v_state := 'resume';
+    END IF;
+  END IF;
+  IF v_fast THEN
+    IF v_state = 'resume' THEN
+      UPDATE sessions.ingest_batches AS b
+         SET state = 'committed', committed_at = coalesce(b.committed_at, now()),
+             buffer_receipt_kind=CASE WHEN p_mode='buffered' THEN 'suppressed' ELSE b.buffer_receipt_kind END
+       WHERE b.org_id = k.org_id AND b.workspace_id = k.workspace_id
+         AND b.origin_id = k.origin_id AND b.batch_id = k.batch_id AND b.digest = k.digest;
+    END IF;
+    v_state := 'replay_fast';
+  END IF;
+
+  -- Acquisition admission (factory acquisition owner, design §5.1): LA, then _admit, before the ownership insert.
+  IF v_state IN ('claimed','resume') THEN
+    v_acq_pairs:=sessions.ingest_acquisition_sorted((SELECT coalesce(jsonb_agg(jsonb_build_array(x.source,x.session_id)),'[]'::jsonb)
+      FROM (SELECT q.source,q.session_id FROM sessions.ingest_session_pairs(p -> 'sessions') AS q
+            UNION SELECT i.source,i.session_id FROM jsonb_to_recordset(v_items) AS i(source text,session_id text)
+             WHERE i.session_id IS NOT NULL) AS x));
+    v_nulls:=(SELECT coalesce(jsonb_agg(DISTINCT i.source),'[]'::jsonb) FROM jsonb_to_recordset(v_items) AS i(source text,session_id text)
+      WHERE i.session_id IS NULL);
+    PERFORM sessions.ingest_acquisition_lock(k.org_id,k.workspace_id,v_acq_pairs,false);
+    v_acq:=sessions.ingest_acquisition_admit(k.org_id,k.workspace_id,k.user_id,k.origin_id,v_acq_pairs,v_nulls,p->'acquisition');
+  END IF;
+  INSERT INTO sessions.ingest_session_ownership
+    (org_id,workspace_id,user_id,origin_id,source,session_id)
+  SELECT k.org_id,k.workspace_id,k.user_id,k.origin_id,s.source,s.session_id
+  FROM (SELECT x.source,x.session_id FROM sessions.ingest_session_pairs(p -> 'sessions') AS x
+        UNION SELECT i.source,i.session_id FROM jsonb_to_recordset(v_live) AS i(source text,session_id text)
+          WHERE i.session_id IS NOT NULL) AS s
+  WHERE NOT EXISTS(SELECT 1 FROM sessions.upload_deletions AS d
+    WHERE d.org_id=k.org_id AND d.workspace_id=k.workspace_id AND d.user_id=k.user_id
+      AND d.origin_id=k.origin_id AND d.source=s.source AND d.session_id=s.session_id)
+  ON CONFLICT DO NOTHING;
+  IF v_state IN ('claimed','resume') THEN
+    v_token:=gen_random_uuid();
+    SELECT coalesce(jsonb_agg(jsonb_build_object('source',x.source,'session_id',x.session_id,'epoch',coalesce(f.epoch,0),'reset_epoch',v_resets)
+      ORDER BY x.source COLLATE "C",x.session_id COLLATE "C"),'[]'::jsonb) INTO v_epochs
+    FROM (SELECT q.source,q.session_id FROM sessions.ingest_session_pairs(p -> 'sessions') AS q
+          UNION SELECT i.source,i.session_id FROM jsonb_to_recordset(v_items) AS i(source text,session_id text)
+           WHERE i.session_id IS NOT NULL) AS x
+    LEFT JOIN sessions.ingest_fence_versions AS f ON f.org_id=k.org_id AND f.workspace_id=k.workspace_id
+      AND f.user_id=k.user_id AND f.origin_id=k.origin_id AND f.source=x.source AND f.session_id=x.session_id;
+    INSERT INTO sessions.ingest_claim_attempts(claim_token,org_id,workspace_id,user_id,origin_id,batch_id,digest,epochs,records,reset_epoch,acquisition)
+    VALUES(v_token,k.org_id,k.workspace_id,k.user_id,k.origin_id,k.batch_id,k.digest,v_epochs,v_items,v_resets,coalesce(v_acq,'[]'::jsonb));
+  END IF;
+  RETURN jsonb_build_object('kind', v_state, 'claimToken',v_token, 'deleted', v_deleted, 'stale', v_stale, 'resets', v_resets);
+END
+$claim$;
+
+-- sessions.ingest_claim_buffered_batch: latest body from 20261105043850_ingest_acquisition_owner.sql, plus the admission check.
+CREATE OR REPLACE FUNCTION sessions.ingest_claim_buffered_batch(p jsonb) RETURNS jsonb
+LANGUAGE plpgsql VOLATILE SECURITY DEFINER SET search_path=pg_catalog,pg_temp AS $buffered$
+DECLARE v_generation text;v_result jsonb;v_lazy boolean;v_packet jsonb;v_known sessions.ingest_batches%ROWTYPE;v_acq jsonb;
+BEGIN
+ PERFORM sessions.ingest_org_admission_hold_check(sessions.ingest_identifier(p#>'{tenant,orgId}',false),'admission'); -- 062320 org admission hold
+ PERFORM sessions.ingest_require_role('bulls96_session_ingest');
+ v_acq:=p->'acquisition';p:=p-'acquisition';
+ v_lazy:=EXISTS(SELECT 1 FROM sessions.ingest_lazy_policy WHERE singleton);
+ IF v_lazy THEN
+  PERFORM sessions.ingest_exact_keys(p,ARRAY['tenant','originId','batchId','batchDigest','receiptId','sessions','records','generation','custody']);
+  PERFORM sessions.ingest_lazy_begin(p,'batch');v_packet:=p->'custody';
+  SELECT * INTO v_known FROM sessions.ingest_batches b WHERE b.org_id=p#>>'{tenant,orgId}' AND b.workspace_id=p#>>'{tenant,workspaceId}'
+   AND b.origin_id=p->>'originId' AND b.batch_id=p->>'batchId';
+  IF NOT FOUND THEN PERFORM sessions.ingest_lazy_records(p);
+  ELSIF v_known.user_id=p#>>'{tenant,userId}' AND v_known.digest=p->>'batchDigest' AND v_known.state<>'committed' THEN
+   PERFORM sessions.ingest_lazy_records(p);
+  END IF;
+  p:=p-'custody';
+ ELSE
+  PERFORM sessions.ingest_exact_keys(p,ARRAY['tenant','originId','batchId','batchDigest','receiptId','sessions','records','generation']);
+ END IF;
+ v_generation:=sessions.ingest_digest(p->'generation');
+ PERFORM sessions.ingest_require_generation(v_generation);
+ PERFORM sessions.ingest_require_buffer_admission(p#>>'{tenant,orgId}');
+ v_result:=sessions.ingest_claim_batch_mode((p-'generation')||CASE WHEN v_acq IS NULL THEN '{}'::jsonb ELSE jsonb_build_object('acquisition',v_acq) END,'buffered');
+ IF v_result->>'kind' IN('claimed','resume') THEN
+  UPDATE sessions.ingest_claim_attempts SET schema_generation=v_generation,
+   source_control_version=CASE WHEN v_lazy THEN (v_packet#>>'{witness,sourceControlVersion}')::bigint END,
+   source_identity_sha256=CASE WHEN v_lazy THEN v_packet#>>'{witness,sourceIdentitySha256}' END,
+   source_witness_sha256=CASE WHEN v_lazy THEN v_packet->>'sourceDigest' END,
+   source_processing_ranks=CASE WHEN v_lazy THEN(SELECT coalesce(jsonb_agg(e->'processingRank' ORDER BY(e->>'preparedOrd')::integer),'[]')
+    FROM jsonb_array_elements(v_packet#>'{witness,records}')q(e)) END
+   WHERE claim_token=(v_result->>'claimToken')::uuid AND (schema_generation IS NULL OR schema_generation=v_generation);
+  IF NOT FOUND THEN RAISE EXCEPTION USING ERRCODE='40001',MESSAGE='session ingest: claim generation collision';END IF;
+ END IF;
+ PERFORM sessions.ingest_require_buffer_admission(p#>>'{tenant,orgId}');
+ IF v_lazy THEN v_result:=v_result||jsonb_build_object('custodyAck',
+  sessions.ingest_lazy_ack(p||jsonb_build_object('custody',v_packet),'batch'));END IF;
+ RETURN v_result;
+END
+$buffered$;
+
+-- sessions.ingest_commit_batch: latest body from 20261105050010_operator_session_erase_fence_check.sql, plus the admission check.
+CREATE OR REPLACE FUNCTION sessions.ingest_commit_batch(p jsonb)
+RETURNS jsonb
+LANGUAGE plpgsql
+VOLATILE
+SECURITY DEFINER
+SET search_path = pg_catalog, pg_temp
+AS $commit$
+DECLARE
+  k record;
+  v_machine text;
+  v_items jsonb;
+  v_claimed_at timestamptz;
+  v_rearmed integer;
+  v_epochs jsonb;
+  v_fenced jsonb;
+  v_pairs jsonb;
+  v_invalidated boolean;
+BEGIN
+ PERFORM sessions.ingest_org_admission_hold_check(sessions.ingest_identifier(p#>'{tenant,orgId}',false),'admission'); -- 062320 org admission hold
+  PERFORM sessions.ingest_require_role('bulls96_session_ingest');
+  IF EXISTS(SELECT 1 FROM sessions.ingest_claim_attempts a JOIN sessions.ingest_batches b
+    USING(org_id,workspace_id,origin_id,batch_id)
+    WHERE a.claim_token::text=p->>'claimToken' AND (b.publication_state='buffered' OR b.buffer_receipt_kind='staged')) THEN
+    RAISE EXCEPTION USING ERRCODE='55000',MESSAGE='session ingest: buffered publication refused';
+  END IF;
+
+  PERFORM sessions.ingest_exact_keys(p,
+    ARRAY['tenant', 'originId', 'batchId', 'batchDigest', 'sessions', 'records', 'machineId', 'claimToken']);
+  k := sessions.ingest_batch_key(p);
+  IF jsonb_typeof(p -> 'machineId') IS DISTINCT FROM 'string'
+     OR (p ->> 'machineId') !~ '^srv_[0-9a-f]{32}$' THEN
+    RAISE EXCEPTION USING ERRCODE = '22023', MESSAGE = 'session ingest: machineId is malformed';
+  END IF;
+  v_machine := p ->> 'machineId';
+  v_items := sessions.ingest_records(p -> 'records');
+  PERFORM sessions.ingest_session_pairs(p -> 'sessions');
+
+  PERFORM sessions.ingest_lock_fences(k.org_id,k.workspace_id,k.user_id);
+
+  v_epochs:=sessions.ingest_attempt_epochs(k.org_id,k.workspace_id,k.user_id,k.origin_id,k.batch_id,k.digest,p->>'claimToken');
+  v_pairs:=(SELECT coalesce(jsonb_agg(jsonb_build_array(x.source,x.session_id)),'[]'::jsonb)
+    FROM (SELECT q.source,q.session_id FROM sessions.ingest_session_pairs(p->'sessions') AS q
+          UNION SELECT i.source,i.session_id FROM jsonb_to_recordset(v_items) AS i(source text,session_id text)
+            WHERE i.session_id IS NOT NULL) AS x);
+  -- 050010: an erase fence the claim did not see (the erase committed after it) deselects the pair now;
+  -- the epoch bump makes ingest_attempt_fenced report it, so its records are skipped and its objects rearmed.
+  PERFORM sessions.ingest_erase_fence_extend(k.org_id,k.workspace_id,k.user_id,k.origin_id,v_pairs);
+  v_fenced:=sessions.ingest_attempt_fenced(k.org_id,k.workspace_id,k.user_id,k.origin_id,v_epochs,v_pairs);
+  PERFORM sessions.ingest_acquisition_lock(k.org_id,k.workspace_id,v_pairs,false);
+  PERFORM sessions.ingest_acquisition_refuse(sessions.ingest_acquisition_fenced(k.org_id,k.workspace_id,
+    coalesce((SELECT c.acquisition FROM sessions.ingest_claim_attempts c WHERE c.claim_token=(p->>'claimToken')::uuid),'[]'::jsonb),v_pairs,'admit'));
+  SELECT EXISTS(SELECT 1 FROM jsonb_array_elements(v_fenced) AS x(pair)
+    WHERE NOT EXISTS(SELECT 1 FROM sessions.upload_deletions AS d
+      WHERE d.org_id=k.org_id AND d.workspace_id=k.workspace_id AND d.user_id=k.user_id
+        AND d.origin_id=k.origin_id AND d.source=x.pair->>0 AND d.session_id=x.pair->>1))
+    INTO v_invalidated;
+  SELECT b.claimed_at INTO v_claimed_at FROM sessions.ingest_batches AS b
+   WHERE b.org_id=k.org_id AND b.workspace_id=k.workspace_id AND b.origin_id=k.origin_id
+     AND b.batch_id=k.batch_id AND b.digest=k.digest AND b.user_id=k.user_id FOR UPDATE;
+  IF NOT v_invalidated THEN
+    UPDATE sessions.ingest_batches AS b SET state='committed',committed_at=coalesce(b.committed_at,now())
+     WHERE b.org_id=k.org_id AND b.workspace_id=k.workspace_id AND b.origin_id=k.origin_id
+       AND b.batch_id=k.batch_id AND b.digest=k.digest AND b.user_id=k.user_id;
+  END IF;
+
+  -- The written revisions become stored: per record its highest (first in identity
+  -- order), inserted, or replacing a lower one only (#250: an equal revision keeps
+  -- the stored row). Rows are touched in record_id order, so two commits sharing
+  -- records lock them in the same order. Idempotent.
+  INSERT INTO sessions.ingest_record_revisions AS t
+         (org_id, workspace_id, origin_id, record_id, revision, revision_id, digest, user_id, source, session_id)
+  SELECT DISTINCT ON (i.record_id) k.org_id, k.workspace_id, k.origin_id,
+         i.record_id, i.revision, i.revision_id, i.digest, k.user_id, i.source, i.session_id
+    FROM jsonb_to_recordset(v_items) AS i(ord integer, source text, session_id text, record_id text,
+                                          revision_id text, revision bigint, digest text)
+   WHERE i.session_id IS NULL OR NOT EXISTS(SELECT 1 FROM jsonb_array_elements(v_fenced) AS f(pair)
+     WHERE f.pair->>0=i.source AND f.pair->>1=i.session_id)
+   ORDER BY i.record_id, i.revision DESC, i.revision_id, i.ord
+  ON CONFLICT (org_id, workspace_id, origin_id, record_id) DO UPDATE
+     SET revision = EXCLUDED.revision, revision_id = EXCLUDED.revision_id,
+         digest = EXCLUDED.digest, user_id = EXCLUDED.user_id, source = EXCLUDED.source,
+         session_id = EXCLUDED.session_id, updated_at = now()
+   WHERE EXCLUDED.revision > t.revision;
+
+  -- The fence again: a tombstone, or a reset since the claim, that this batch's
+  -- objects may have outrun. Those sessions are swept again.
+  WITH reached AS (
+    SELECT x.pair->>0 AS source,x.pair->>1 AS session_id FROM jsonb_array_elements(v_fenced) AS x(pair)
+  ), queued AS (
+    INSERT INTO sessions.upload_erasure_rearm
+           (org_id, workspace_id, user_id, origin_id, machine_id, source, session_id)
+    SELECT k.org_id, k.workspace_id, k.user_id, k.origin_id, v_machine, r.source, r.session_id
+      FROM reached AS r
+    ON CONFLICT DO NOTHING
+  )
+  SELECT count(*)::integer INTO v_rearmed FROM reached;
+  RETURN jsonb_build_object('rearmed', v_rearmed,'invalidated',v_invalidated);
+END
+$commit$;
+
+-- sessions.ingest_commit_buffered_batch: latest body from 20261105050010_operator_session_erase_fence_check.sql, plus the admission check.
+CREATE OR REPLACE FUNCTION sessions.ingest_commit_buffered_batch(p jsonb) RETURNS jsonb
+LANGUAGE plpgsql VOLATILE SECURITY DEFINER SET search_path=pg_catalog,pg_temp AS $bcommit$
+DECLARE k record;a sessions.ingest_claim_attempts%ROWTYPE;t sessions.ingest_stage_intents%ROWTYPE;v_generation text;
+ v_pairs jsonb;v_fenced jsonb;v_invalid boolean;v_stage uuid;
+BEGIN
+ PERFORM sessions.ingest_org_admission_hold_check(sessions.ingest_identifier(p#>'{tenant,orgId}',false),'admission'); -- 062320 org admission hold
+ PERFORM sessions.ingest_require_role('bulls96_session_ingest');
+ PERFORM sessions.ingest_exact_keys(p,ARRAY['tenant','originId','batchId','batchDigest','claimToken','stageToken','generation']);
+ v_generation:=sessions.ingest_digest(p->'generation');
+ PERFORM sessions.ingest_require_generation(v_generation);
+ k:=sessions.ingest_batch_key(p);
+ PERFORM sessions.ingest_require_buffer_admission(k.org_id);
+ PERFORM sessions.ingest_lock_fences(k.org_id,k.workspace_id,k.user_id);
+ PERFORM sessions.ingest_lazy_attempt((p->>'claimToken')::uuid);
+ PERFORM sessions.ingest_attempt_epochs(k.org_id,k.workspace_id,k.user_id,k.origin_id,k.batch_id,k.digest,p->>'claimToken');
+ v_stage:=(p->>'stageToken')::uuid;
+ SELECT * INTO a FROM sessions.ingest_claim_attempts WHERE claim_token=(p->>'claimToken')::uuid;
+ IF a.schema_generation IS DISTINCT FROM v_generation
+ THEN RAISE EXCEPTION USING ERRCODE='40001',MESSAGE='session ingest: claim generation changed';END IF;
+ PERFORM 1 FROM sessions.ingest_batches b WHERE b.org_id=k.org_id AND b.workspace_id=k.workspace_id
+  AND b.origin_id=k.origin_id AND b.batch_id=k.batch_id AND b.user_id=k.user_id AND b.digest=k.digest
+  AND b.publication_state='buffered' FOR UPDATE;
+ IF NOT FOUND THEN RAISE EXCEPTION USING ERRCODE='40001',MESSAGE='session ingest: no buffered batch'; END IF;
+ SELECT * INTO t FROM sessions.ingest_stage_intents WHERE stage_token=v_stage AND claim_token=a.claim_token FOR UPDATE;
+ IF NOT FOUND OR t.parent_stage_token IS NOT NULL OR t.cleanup_state<>'live'
+   OR (t.receipt_state='preparing' AND t.expires_at<=clock_timestamp()) THEN
+  RETURN jsonb_build_object('kind','intent_invalid');
+ END IF;
+ SELECT coalesce(jsonb_agg(jsonb_build_array(r.source,r.session_id)),'[]'::jsonb) INTO v_pairs
+ FROM (SELECT DISTINCT r.source,r.session_id FROM jsonb_to_recordset(a.records) r(ord integer,source text,session_id text)
+  WHERE r.session_id IS NOT NULL AND r.ord IN(
+   SELECT (o::text)::int FROM jsonb_array_elements(t.group_ordinals) g CROSS JOIN LATERAL jsonb_array_elements(g) o)) r;
+ -- 050010: an erase fence the claim did not see. This org is ordered, so a hit is refused (RH012).
+ PERFORM sessions.ingest_erase_fence_extend(k.org_id,k.workspace_id,k.user_id,k.origin_id,v_pairs);
+ v_fenced:=sessions.ingest_attempt_fenced(k.org_id,k.workspace_id,k.user_id,k.origin_id,a.epochs,v_pairs);
+ v_invalid:=jsonb_array_length(v_fenced)>0 OR a.reset_epoch IS NULL OR a.reset_epoch<>(SELECT count(*) FROM sessions.upload_resets r
+  WHERE r.org_id=k.org_id AND r.workspace_id=k.workspace_id AND r.user_id=k.user_id);
+ IF v_invalid THEN
+  UPDATE sessions.ingest_stage_intents SET cleanup_state='retired',row_version=row_version+1 WHERE stage_token=v_stage;
+  RETURN jsonb_build_object('kind','intent_invalid');
+ END IF;
+ IF t.receipt_state='acknowledged' THEN
+  IF EXISTS(SELECT 1 FROM sessions.ingest_buffer_outbox o WHERE o.org_id=k.org_id AND o.workspace_id=k.workspace_id
+    AND o.origin_id=k.origin_id AND o.batch_id=k.batch_id AND o.digest=k.digest AND o.active_stage_token=v_stage) THEN
+   PERFORM sessions.ingest_require_buffer_admission(k.org_id);
+   RETURN jsonb_build_object('kind','committed')||CASE WHEN EXISTS(SELECT 1 FROM sessions.ingest_lazy_policy WHERE singleton)
+  THEN jsonb_build_object('custodyAck',sessions.ingest_lazy_attempt_ack((p->>'claimToken')::uuid)) ELSE '{}'::jsonb END;
+  END IF;
+  RETURN jsonb_build_object('kind','intent_invalid');
+ END IF;
+ IF EXISTS(SELECT 1 FROM sessions.ingest_buffer_outbox o WHERE o.org_id=k.org_id AND o.workspace_id=k.workspace_id
+   AND o.origin_id=k.origin_id AND o.batch_id=k.batch_id) THEN RETURN jsonb_build_object('kind','intent_invalid'); END IF;
+ PERFORM sessions.ingest_acquisition_lock(k.org_id,k.workspace_id,v_pairs,false);
+ PERFORM sessions.ingest_acquisition_refuse(sessions.ingest_acquisition_fenced(k.org_id,k.workspace_id,a.acquisition,v_pairs,'admit'));
+ -- Receipt and durable recovery pointer are one transaction; no queue proof.
+ INSERT INTO sessions.ingest_buffer_outbox(org_id,workspace_id,user_id,origin_id,batch_id,digest,active_stage_token)
+ VALUES(k.org_id,k.workspace_id,k.user_id,k.origin_id,k.batch_id,k.digest,v_stage);
+ UPDATE sessions.ingest_stage_intents SET receipt_state='acknowledged',row_version=row_version+1 WHERE stage_token=v_stage;
+ UPDATE sessions.ingest_batches b SET state='committed',committed_at=coalesce(b.committed_at,clock_timestamp()),buffer_receipt_kind='staged'
+ WHERE b.org_id=k.org_id AND b.workspace_id=k.workspace_id AND b.origin_id=k.origin_id AND b.batch_id=k.batch_id
+  AND b.user_id=k.user_id AND b.digest=k.digest AND b.publication_state='buffered';
+ IF clock_timestamp()>=t.expires_at THEN RAISE EXCEPTION USING ERRCODE='55000',MESSAGE='session ingest: buffered intent expired';END IF;
+ PERFORM sessions.ingest_require_buffer_admission(k.org_id);
+ RETURN jsonb_build_object('kind','committed')||CASE WHEN EXISTS(SELECT 1 FROM sessions.ingest_lazy_policy WHERE singleton)
+  THEN jsonb_build_object('custodyAck',sessions.ingest_lazy_attempt_ack((p->>'claimToken')::uuid)) ELSE '{}'::jsonb END;
+END
+$bcommit$;
+
+-- sessions.ingest_prepare_buffer_stage: latest body from 20261105043850_ingest_acquisition_owner.sql, plus the admission check.
+CREATE OR REPLACE FUNCTION sessions.ingest_prepare_buffer_stage(p jsonb) RETURNS jsonb
+LANGUAGE plpgsql VOLATILE SECURITY DEFINER SET search_path=pg_catalog,pg_temp AS $prepare$
+DECLARE k record;a sessions.ingest_claim_attempts%ROWTYPE;t sessions.ingest_stage_intents%ROWTYPE;v_generation text;
+ v_key text;v_sha text;v_bytes bigint;v_groups jsonb;v_count integer;v_distinct integer;v_token uuid;v_pairs jsonb;v_fenced jsonb;
+BEGIN
+ PERFORM sessions.ingest_org_admission_hold_check(sessions.ingest_identifier(p#>'{tenant,orgId}',false),'admission'); -- 062320 org admission hold
+ PERFORM sessions.ingest_require_role('bulls96_session_ingest');
+ PERFORM sessions.ingest_exact_keys(p,ARRAY['tenant','originId','batchId','batchDigest','claimToken','key','sha256','bytes','groupOrdinals','generation']);
+ v_generation:=sessions.ingest_digest(p->'generation');
+ PERFORM sessions.ingest_require_generation(v_generation);
+ k:=sessions.ingest_batch_key(p);
+ PERFORM sessions.ingest_require_buffer_admission(k.org_id);
+ PERFORM sessions.ingest_lock_fences(k.org_id,k.workspace_id,k.user_id);
+ PERFORM sessions.ingest_lazy_attempt((p->>'claimToken')::uuid);
+ PERFORM sessions.ingest_attempt_epochs(k.org_id,k.workspace_id,k.user_id,k.origin_id,k.batch_id,k.digest,p->>'claimToken');
+ SELECT * INTO a FROM sessions.ingest_claim_attempts WHERE claim_token=(p->>'claimToken')::uuid;
+ IF a.schema_generation IS DISTINCT FROM v_generation
+ THEN RAISE EXCEPTION USING ERRCODE='40001',MESSAGE='session ingest: claim generation changed';END IF;
+ IF a.reset_epoch IS NULL OR a.records IS NULL THEN RAISE EXCEPTION USING ERRCODE='40001',MESSAGE='session ingest: attempt lacks buffered proof'; END IF;
+ PERFORM 1 FROM sessions.ingest_batches b WHERE b.org_id=k.org_id AND b.workspace_id=k.workspace_id
+  AND b.origin_id=k.origin_id AND b.batch_id=k.batch_id AND b.user_id=k.user_id AND b.digest=k.digest
+  AND b.publication_state='buffered' AND b.state='pending' FOR UPDATE;
+ IF NOT FOUND THEN RAISE EXCEPTION USING ERRCODE='40001',MESSAGE='session ingest: buffered batch not pending'; END IF;
+ v_key:=p->>'key';v_sha:=sessions.ingest_digest(p->'sha256');
+ IF jsonb_typeof(p->'key') IS DISTINCT FROM 'string' OR octet_length(v_key) NOT BETWEEN 1 AND 2048
+   OR position('/'||k.org_id||'/buffered-batches/v1/' IN v_key)=0
+   OR v_key !~ ('-'||substr(encode(sha256(convert_to(p->>'claimToken','UTF8')),'hex'),1,32)||'\.staged\.ndjson\.zst$')
+   OR v_key ~ '[\x01-\x1f\x7f]' THEN RAISE EXCEPTION USING ERRCODE='22023',MESSAGE='session ingest: invalid buffered key'; END IF;
+ IF jsonb_typeof(p->'bytes') IS DISTINCT FROM 'number' OR (p->>'bytes') !~ '^[1-9][0-9]{0,7}$' THEN
+  RAISE EXCEPTION USING ERRCODE='22023',MESSAGE='session ingest: invalid buffered bytes';
+ END IF;
+ v_bytes:=(p->>'bytes')::bigint;
+ IF v_bytes>16777216 THEN RAISE EXCEPTION USING ERRCODE='22023',MESSAGE='session ingest: buffered bytes exceed limit'; END IF;
+ v_groups:=p->'groupOrdinals';
+ IF jsonb_typeof(v_groups) IS DISTINCT FROM 'array' OR jsonb_array_length(v_groups) NOT BETWEEN 1 AND 500 THEN
+  RAISE EXCEPTION USING ERRCODE='22023',MESSAGE='session ingest: invalid buffered groups';
+ END IF;
+ IF EXISTS(SELECT 1 FROM jsonb_array_elements(v_groups) g
+    WHERE jsonb_typeof(g)<>'array' OR jsonb_array_length(g) NOT BETWEEN 1 AND 500) THEN
+  RAISE EXCEPTION USING ERRCODE='22023',MESSAGE='session ingest: invalid buffered ordinal group';
+ END IF;
+ IF EXISTS(SELECT 1 FROM jsonb_array_elements(v_groups) g CROSS JOIN LATERAL jsonb_array_elements(g) o
+   WHERE jsonb_typeof(o)<>'number' OR o::text !~ '^(0|[1-9][0-9]{0,2})$'
+      OR NOT EXISTS(SELECT 1 FROM jsonb_to_recordset(a.records) r(ord integer) WHERE r.ord=(o::text)::int)) THEN
+  RAISE EXCEPTION USING ERRCODE='22023',MESSAGE='session ingest: ordinal outside original claim';
+ END IF;
+ IF EXISTS(SELECT 1 FROM jsonb_array_elements(v_groups) g
+  CROSS JOIN LATERAL (
+   SELECT count(DISTINCT jsonb_build_array(r.source,r.session_id)) FILTER(WHERE r.session_id IS NOT NULL) cohorts,
+          bool_or(r.session_id IS NULL) has_null,bool_or(r.session_id IS NOT NULL) has_session
+    FROM jsonb_array_elements(g) o JOIN jsonb_to_recordset(a.records) r(ord integer,source text,session_id text)
+      ON r.ord=(o::text)::int
+  ) q WHERE q.cohorts>1 OR (q.has_null AND q.has_session)) THEN
+  RAISE EXCEPTION USING ERRCODE='22023',MESSAGE='session ingest: buffered group mixes session owners';
+ END IF;
+ SELECT count(*)::int,count(DISTINCT o)::int INTO v_count,v_distinct
+  FROM jsonb_array_elements(v_groups) g CROSS JOIN LATERAL jsonb_array_elements(g) o;
+ IF v_count<>v_distinct OR v_count>500 THEN RAISE EXCEPTION USING ERRCODE='22023',MESSAGE='session ingest: repeated buffered ordinal'; END IF;
+ IF a.reset_epoch<>(SELECT count(*) FROM sessions.upload_resets r
+    WHERE r.org_id=k.org_id AND r.workspace_id=k.workspace_id AND r.user_id=k.user_id) THEN
+  RAISE EXCEPTION USING ERRCODE='40001',MESSAGE='session ingest: reset before buffered intent';
+ END IF;
+ -- Cover every currently live original ordinal exactly once; original metadata
+ -- remains in SQL, so scrubbed record/session ids cannot affect this decision.
+ SELECT coalesce(jsonb_agg(jsonb_build_array(r.source,r.session_id)),'[]'::jsonb) INTO v_pairs
+ FROM (SELECT DISTINCT source,session_id FROM jsonb_to_recordset(a.records) r(source text,session_id text)
+       WHERE session_id IS NOT NULL) r;
+ v_fenced:=sessions.ingest_attempt_fenced(k.org_id,k.workspace_id,k.user_id,k.origin_id,a.epochs,v_pairs);
+ PERFORM sessions.ingest_acquisition_lock(k.org_id,k.workspace_id,v_pairs,false);
+ PERFORM sessions.ingest_acquisition_refuse(sessions.ingest_acquisition_fenced(k.org_id,k.workspace_id,a.acquisition,v_pairs,'admit'));
+ IF EXISTS(SELECT 1 FROM jsonb_to_recordset(a.records) r(ord integer,source text,session_id text)
+   WHERE (r.ord IN(SELECT (o::text)::int FROM jsonb_array_elements(v_groups) g CROSS JOIN LATERAL jsonb_array_elements(g) o))
+      IS DISTINCT FROM (r.session_id IS NULL OR NOT EXISTS(SELECT 1 FROM jsonb_array_elements(v_fenced) f
+          WHERE f->>0=r.source AND f->>1=r.session_id))) THEN
+  RAISE EXCEPTION USING ERRCODE='40001',MESSAGE='session ingest: buffered ordinal coverage changed';
+ END IF;
+ SELECT * INTO t FROM sessions.ingest_stage_intents
+  WHERE claim_token=a.claim_token AND stage_key=v_key FOR UPDATE;
+ IF FOUND THEN
+  IF t.stage_sha256<>v_sha OR t.stage_bytes<>v_bytes OR t.group_ordinals<>v_groups
+    OR t.cleanup_state<>'live' OR t.receipt_state<>'preparing' OR t.expires_at<=clock_timestamp()
+    OR t.parent_stage_token IS NOT NULL THEN
+   RAISE EXCEPTION USING ERRCODE='40001',MESSAGE='session ingest: buffered intent refused';
+  END IF;
+  PERFORM sessions.ingest_require_buffer_admission(k.org_id);
+ RETURN jsonb_build_object('stageToken',t.stage_token,'expiresAt',t.expires_at);
+ END IF;
+ v_token:=gen_random_uuid();
+ INSERT INTO sessions.ingest_stage_intents(stage_token,claim_token,org_id,workspace_id,user_id,origin_id,batch_id,digest,
+   stage_key,stage_sha256,stage_bytes,group_ordinals,reset_epoch,expires_at)
+ VALUES(v_token,a.claim_token,k.org_id,k.workspace_id,k.user_id,k.origin_id,k.batch_id,k.digest,
+   v_key,v_sha,v_bytes,v_groups,a.reset_epoch,clock_timestamp()+interval '120 seconds')
+ RETURNING * INTO t;
+ PERFORM sessions.ingest_require_buffer_admission(k.org_id);
+ RETURN jsonb_build_object('stageToken',t.stage_token,'expiresAt',t.expires_at);
+END
+$prepare$;
+
+-- sessions.ingest_commit_revisions: latest body from 20261104060000_ingest_canonical_publication.sql, plus the admission check.
+CREATE OR REPLACE FUNCTION sessions.ingest_commit_revisions(p jsonb)
+RETURNS jsonb
+LANGUAGE plpgsql
+VOLATILE
+SECURITY DEFINER
+SET search_path = pg_catalog, pg_temp
+AS $crev$
+DECLARE
+  t jsonb;
+  v_org text; v_ws text; v_user text; v_origin text; v_machine text;
+  v_items jsonb;
+  v_committed integer;
+  v_rearmed integer;
+  v_epochs jsonb;
+  v_fenced jsonb;
+  v_pairs jsonb;
+BEGIN
+ PERFORM sessions.ingest_org_admission_hold_check(sessions.ingest_identifier(p#>'{tenant,orgId}',false),'admission'); -- 062320 org admission hold
+  PERFORM sessions.ingest_require_role('bulls96_session_ingest');
+  IF EXISTS(SELECT 1 FROM sessions.ingest_claim_attempts a JOIN sessions.ingest_batches b
+    USING(org_id,workspace_id,origin_id,batch_id)
+    WHERE a.claim_token::text=p->>'claimToken' AND (b.publication_state='buffered' OR b.buffer_receipt_kind='staged')) THEN
+    RAISE EXCEPTION USING ERRCODE='55000',MESSAGE='session ingest: buffered publication refused';
+  END IF;
+
+  PERFORM sessions.ingest_exact_keys(p, ARRAY['tenant', 'originId', 'machineId', 'records','batchDigest','claimToken']);
+  t := p -> 'tenant';
+  PERFORM sessions.ingest_exact_keys(t, ARRAY['orgId', 'workspaceId', 'userId']);
+  v_org := sessions.ingest_identifier(t -> 'orgId', false);
+  v_ws := sessions.ingest_identifier(t -> 'workspaceId', true);
+  v_user := sessions.ingest_identifier(t -> 'userId', false);
+  v_origin := sessions.ingest_identifier(p -> 'originId', false);
+  IF jsonb_typeof(p -> 'machineId') IS DISTINCT FROM 'string' OR (p ->> 'machineId') !~ '^srv_[0-9a-f]{32}$' THEN
+    RAISE EXCEPTION USING ERRCODE = '22023', MESSAGE = 'session ingest: machineId is malformed';
+  END IF;
+  v_machine := p ->> 'machineId';
+  v_items := sessions.ingest_records(p -> 'records');
+  PERFORM sessions.ingest_lock_fences(v_org,v_ws,v_user);
+  v_epochs:=sessions.ingest_attempt_epochs(v_org,v_ws,v_user,v_origin,
+    NULL,sessions.ingest_digest(p->'batchDigest'),p->>'claimToken');
+  v_pairs:=(SELECT coalesce(jsonb_agg(jsonb_build_array(x.source,x.session_id)),'[]'::jsonb)
+    FROM (SELECT DISTINCT i.source,i.session_id FROM jsonb_to_recordset(v_items) AS i(source text,session_id text)
+      WHERE i.session_id IS NOT NULL) AS x);
+  v_fenced:=sessions.ingest_attempt_fenced(v_org,v_ws,v_user,v_origin,v_epochs,v_pairs);
+  WITH items AS (
+    SELECT * FROM jsonb_to_recordset(v_items) AS i(ord integer, source text, session_id text, record_id text,
+                                                    revision_id text, revision bigint, digest text)
+  ), fenced AS (
+    SELECT x.pair->>0 AS source,x.pair->>1 AS session_id FROM jsonb_array_elements(v_fenced) AS x(pair)
+  ), rearm AS (
+    INSERT INTO sessions.upload_erasure_rearm (org_id, workspace_id, user_id, origin_id, machine_id, source, session_id)
+    SELECT v_org, v_ws, v_user, v_origin, v_machine, f.source, f.session_id FROM fenced AS f
+    ON CONFLICT DO NOTHING
+  ), upserted AS (
+    INSERT INTO sessions.ingest_record_revisions AS r
+           (org_id, workspace_id, origin_id, record_id, revision, revision_id, digest, user_id, source, session_id)
+    SELECT DISTINCT ON (i.record_id) v_org, v_ws, v_origin, i.record_id, i.revision, i.revision_id, i.digest,
+           v_user, i.source, i.session_id
+      FROM items AS i
+     WHERE NOT EXISTS (SELECT 1 FROM fenced AS f WHERE f.source = i.source AND f.session_id = i.session_id)
+     ORDER BY i.record_id, i.revision DESC, i.revision_id, i.ord
+    ON CONFLICT (org_id, workspace_id, origin_id, record_id) DO UPDATE
+       SET revision = EXCLUDED.revision, revision_id = EXCLUDED.revision_id, digest = EXCLUDED.digest,
+           user_id = EXCLUDED.user_id, source = EXCLUDED.source, session_id = EXCLUDED.session_id,
+           updated_at = now()
+     WHERE EXCLUDED.revision > r.revision
+    RETURNING 1
+  )
+  SELECT (SELECT count(*)::integer FROM upserted), (SELECT count(*)::integer FROM fenced)
+    INTO v_committed, v_rearmed;
+  RETURN jsonb_build_object('committed', v_committed, 'rearmed', v_rearmed);
+END
+$crev$;
+
+-- sessions.ingest_fanout_fence: latest body from 20261104060000_ingest_canonical_publication.sql, plus the admission check.
+CREATE OR REPLACE FUNCTION sessions.ingest_fanout_fence(p jsonb)
+RETURNS jsonb LANGUAGE plpgsql VOLATILE SECURITY DEFINER SET search_path=pg_catalog,pg_temp AS $ffence$
+DECLARE v_org text;v_ws text;v_user text;v_origin text;v_epochs jsonb;
+BEGIN
+ PERFORM sessions.ingest_org_admission_hold_check(sessions.ingest_identifier(p#>'{tenant,orgId}',false),'admission'); -- 062320 org admission hold
+ PERFORM sessions.ingest_require_role('bulls96_session_ingest');
+  IF EXISTS(SELECT 1 FROM sessions.ingest_claim_attempts a JOIN sessions.ingest_batches b
+    USING(org_id,workspace_id,origin_id,batch_id)
+    WHERE a.claim_token::text=p->>'claimToken' AND (b.publication_state='buffered' OR b.buffer_receipt_kind='staged')) THEN
+    RAISE EXCEPTION USING ERRCODE='55000',MESSAGE='session ingest: buffered publication refused';
+  END IF;
+
+ PERFORM sessions.ingest_exact_keys(p,ARRAY['tenant','originId','sessions','batchDigest','claimToken']);
+ PERFORM sessions.ingest_exact_keys(p->'tenant',ARRAY['orgId','workspaceId','userId']);
+ v_org:=sessions.ingest_identifier(p#>'{tenant,orgId}',false);
+ v_ws:=sessions.ingest_identifier(p#>'{tenant,workspaceId}',true);
+ v_user:=sessions.ingest_identifier(p#>'{tenant,userId}',false);
+ v_origin:=sessions.ingest_identifier(p->'originId',false);
+ PERFORM sessions.ingest_lock_fences(v_org,v_ws,v_user);
+ v_epochs:=sessions.ingest_attempt_epochs(v_org,v_ws,v_user,v_origin,
+   NULL,sessions.ingest_digest(p->'batchDigest'),p->>'claimToken');
+ RETURN jsonb_build_object('deleted',sessions.ingest_attempt_fenced(v_org,v_ws,v_user,v_origin,v_epochs,p->'sessions'));
+END
+$ffence$;
+
+-- sessions.ingest_seed_proven_records: latest body from 20261104040000_ingest_s3_proof_seed.sql, plus the admission check.
+CREATE OR REPLACE FUNCTION sessions.ingest_seed_proven_records(p jsonb)
+RETURNS jsonb LANGUAGE plpgsql VOLATILE SECURITY DEFINER SET search_path=pg_catalog,pg_temp AS $proven$
+DECLARE c sessions.ingest_seed_captures%ROWTYPE;v_epoch bigint;v_state jsonb;v_row jsonb;v_pointer jsonb;
+ v_pointer_id text;v_record text;v_origin text;v_user text;v_revision bigint;v_operation text;v_source text;v_session text;
+ v_proof text;v_count int:=0;v_fenced int:=0;v_user_lock text;v_stored sessions.ingest_record_revisions%ROWTYPE;
+BEGIN
+ PERFORM sessions.ingest_require_role('bulls96_session_ingest_seeder');
+ PERFORM sessions.ingest_exact_keys(p,ARRAY['capture_id','fingerprint','source_head','records']);
+ IF jsonb_typeof(p->'source_head') IS DISTINCT FROM 'string' OR (p->>'source_head')!~'^[0-9a-f]{40}$'
+   OR jsonb_typeof(p->'records') IS DISTINCT FROM 'array' OR jsonb_array_length(p->'records')>1000
+   OR octet_length(p::text)>16777216 THEN RAISE EXCEPTION USING ERRCODE='22023',MESSAGE='ingest seed: proof input'; END IF;
+ SELECT * INTO c FROM sessions.ingest_seed_captures WHERE id=(p->>'capture_id')::uuid FOR UPDATE;
+ IF NOT FOUND OR c.fingerprint IS DISTINCT FROM p->>'fingerprint' THEN RAISE EXCEPTION USING ERRCODE='55000',MESSAGE='ingest seed: unknown capture'; END IF;
+ IF clock_timestamp()>=c.expires_at THEN RAISE EXCEPTION USING ERRCODE='55000',MESSAGE='ingest seed: capture expired'; END IF;
+ PERFORM sessions.ingest_org_admission_hold_check(c.org_id,'admission'); -- 062320 org admission hold
+ PERFORM 1 FROM sessions.__96bulls_role_validation WHERE name='session_directory_search_worker' AND status='pass' AND generation=c.generation FOR SHARE;
+ IF NOT FOUND THEN RAISE EXCEPTION USING ERRCODE='55000',MESSAGE='ingest seed: generation not ready'; END IF;
+ FOR v_user_lock IN SELECT DISTINCT x->>'user_id' FROM jsonb_array_elements(c.state->'pointers')x ORDER BY 1 LOOP
+  PERFORM sessions.ingest_lock_fences(c.org_id,c.workspace_id,v_user_lock);
+ END LOOP;
+ SELECT epoch INTO v_epoch FROM sessions.ingest_seed_source_epochs
+ WHERE org_id=c.org_id AND workspace_id=c.workspace_id AND source=c.source AND session_id=c.session_id FOR UPDATE;
+ IF v_epoch IS DISTINCT FROM c.source_epoch THEN RAISE EXCEPTION USING ERRCODE='40001',MESSAGE='ingest seed: source changed'; END IF;
+ IF EXISTS(SELECT 1 FROM jsonb_array_elements(c.state->'pointers') x
+   WHERE NOT EXISTS(SELECT 1 FROM sessions.ingest_seed_fence_baselines b
+     WHERE b.org_id=c.org_id AND b.workspace_id=c.workspace_id AND b.user_id=x->>'user_id' AND b.closed_at IS NULL))
+ THEN RAISE EXCEPTION USING ERRCODE='40001',MESSAGE='ingest seed: baseline no longer idle';END IF;
+ v_state:=sessions.ingest_seed_scope_state(c.org_id,c.workspace_id,c.source,c.session_id);
+ IF encode(sha256(convert_to(v_state::text,'UTF8')),'hex')<>c.fingerprint THEN RAISE EXCEPTION USING ERRCODE='40001',MESSAGE='ingest seed: source or fence changed'; END IF;
+ FOR v_row IN SELECT x FROM jsonb_array_elements(p->'records')x LOOP
+  PERFORM sessions.ingest_exact_keys(v_row,ARRAY['org_id','workspace_id','user_id','source','session_id','origin_id','record_id','kind','revision','operation','received_at','semantic_sha256','pointer_id']||CASE WHEN v_row?'accepted_seq' THEN ARRAY['accepted_seq']::text[] ELSE '{}'::text[] END);
+  v_pointer_id:=sessions.ingest_digest(v_row->'pointer_id');v_pointer:=NULL;
+  SELECT x INTO v_pointer FROM jsonb_array_elements(c.state->'pointers')x
+   WHERE encode(sha256(convert_to(jsonb_build_array(c.fingerprint,x)::text,'UTF8')),'hex')=v_pointer_id;
+  IF v_pointer IS NULL THEN RAISE EXCEPTION USING ERRCODE='22023',MESSAGE='ingest seed: unknown pointer witness'; END IF;
+  v_user:=sessions.ingest_identifier(v_row->'user_id',false);
+  v_origin:=sessions.ingest_identifier(v_row->'origin_id',false);v_record:=sessions.ingest_identifier(v_row->'record_id',false);
+  v_source:=sessions.ingest_identifier(v_row->'source',false);
+  v_session:=CASE WHEN v_row->'session_id'='null'::jsonb THEN NULL ELSE sessions.ingest_identifier(v_row->'session_id',false) END;
+  IF v_row->>'org_id' IS DISTINCT FROM c.org_id OR v_row->>'workspace_id' IS DISTINCT FROM c.workspace_id OR
+     v_user IS DISTINCT FROM v_pointer->>'user_id' OR v_source IS DISTINCT FROM c.source OR
+     (v_session IS DISTINCT FROM c.session_id AND NOT(v_session IS NULL AND c.source='_none' AND c.session_id='_origin'))
+  THEN RAISE EXCEPTION USING ERRCODE='22023',MESSAGE='ingest seed: namespace or owner'; END IF;
+  IF jsonb_typeof(v_row->'revision') IS DISTINCT FROM 'string' OR (v_row->>'revision')!~'^[1-9][0-9]{0,18}$'
+  THEN RAISE EXCEPTION USING ERRCODE='22023',MESSAGE='ingest seed: revision'; END IF;
+  v_revision:=(v_row->>'revision')::bigint;
+  v_operation:=v_row->>'operation';
+  IF v_operation IS NULL OR v_operation NOT IN('upsert','delete') THEN RAISE EXCEPTION USING ERRCODE='22023',MESSAGE='ingest seed: operation'; END IF;
+  PERFORM sessions.ingest_identifier(v_row->'kind',false);
+  IF jsonb_typeof(v_row->'received_at') IS DISTINCT FROM 'string' OR (v_row->>'received_at')::timestamptz IS NULL
+   OR (v_row?'accepted_seq' AND (jsonb_typeof(v_row->'accepted_seq') IS DISTINCT FROM 'string'
+      OR (v_row->>'accepted_seq')!~'^[1-9][0-9]{0,18}$' OR (v_row->>'accepted_seq')::bigint<1))
+  THEN RAISE EXCEPTION USING ERRCODE='22023',MESSAGE='ingest seed: acceptance evidence';END IF;
+  PERFORM sessions.ingest_digest(v_row->'semantic_sha256');
+  IF v_session IS NOT NULL AND EXISTS(SELECT 1 FROM sessions.upload_deletions d WHERE d.org_id=c.org_id AND d.workspace_id=c.workspace_id AND d.user_id=v_user AND d.origin_id=v_origin AND d.source=v_source AND d.session_id=v_session)
+  THEN v_fenced:=v_fenced+1;CONTINUE;END IF;
+  SELECT * INTO v_stored FROM sessions.ingest_record_revisions r WHERE r.org_id=c.org_id AND r.workspace_id=c.workspace_id AND r.origin_id=v_origin AND r.record_id=v_record FOR UPDATE;
+  IF FOUND AND ROW(v_stored.user_id,v_stored.source,v_stored.session_id) IS DISTINCT FROM ROW(v_user,v_source,v_session)
+  THEN RAISE EXCEPTION USING ERRCODE='55000',MESSAGE='ingest seed: record namespace collision'; END IF;
+  v_proof:=encode(sha256(convert_to(jsonb_build_array('s3-record-proof-v1',c.id,c.fingerprint,p->>'source_head',v_row)::text,'UTF8')),'hex');
+  INSERT INTO sessions.ingest_record_revisions AS r
+   (org_id,workspace_id,origin_id,record_id,revision,revision_id,digest,user_id,source,session_id,seed_proof_sha256,seed_snapshot_sha256,seed_proof_revision)
+   VALUES(c.org_id,c.workspace_id,v_origin,v_record,v_revision,NULL,NULL,v_user,v_source,v_session,v_proof,c.fingerprint,v_revision)
+   ON CONFLICT(org_id,workspace_id,origin_id,record_id) DO UPDATE SET
+    revision=excluded.revision,revision_id=NULL,digest=NULL,user_id=excluded.user_id,source=excluded.source,session_id=excluded.session_id,
+    seed_proof_sha256=excluded.seed_proof_sha256,seed_snapshot_sha256=excluded.seed_snapshot_sha256,
+    seed_proof_revision=excluded.seed_proof_revision,updated_at=clock_timestamp()
+   WHERE excluded.revision>r.revision;
+  IF FOUND THEN v_count:=v_count+1; END IF;
+  IF v_session IS NOT NULL THEN INSERT INTO sessions.ingest_session_ownership VALUES(c.org_id,c.workspace_id,v_user,v_origin,v_source,v_session) ON CONFLICT DO NOTHING; END IF;
+ END LOOP;
+ -- A blocked row write may outlive the lease. This exception rolls EVERY write back.
+ IF clock_timestamp()>=c.expires_at THEN RAISE EXCEPTION USING ERRCODE='55000',MESSAGE='ingest seed: capture expired'; END IF;
+ RETURN jsonb_build_object('accepted',true,'upserted',v_count,'fenced',v_fenced);
+END $proven$;
+
+-- sessions.ingest_publication_publish: latest body from 20261105059000_ingest_publication_gcs_provider.sql, plus the publication check.
+CREATE OR REPLACE FUNCTION sessions.ingest_publication_publish(p jsonb) RETURNS jsonb
+LANGUAGE plpgsql VOLATILE SECURITY DEFINER SET search_path=pg_catalog,pg_temp AS $publish$
+DECLARE a sessions.ingest_publication_attempts%ROWTYPE;v jsonb;i sessions.ingest_publication_images%ROWTYPE;message jsonb;
+ v_messages jsonb;v_message_sha text;v_expected int;v_written int;v_actual int;v_notice_count int;v_row jsonb;v_applied boolean;v_result record;
+BEGIN
+ PERFORM sessions.ingest_require_role('bulls96_session_ingest');
+ PERFORM sessions.ingest_exact_keys(p,ARRAY['attemptToken','leaseToken','messages','generation']);
+ PERFORM sessions.ingest_require_generation(p->>'generation');
+ v_messages:=p->'messages';
+ IF jsonb_typeof(v_messages) IS DISTINCT FROM'array' OR jsonb_array_length(v_messages)>500 OR octet_length(p::text)>16777216
+ THEN RAISE EXCEPTION USING ERRCODE='22023',MESSAGE='publication: notification bounds';END IF;
+ v_message_sha:=encode(sha256(convert_to(v_messages::text,'UTF8')),'hex');
+ SELECT*INTO a FROM sessions.ingest_publication_attempts WHERE attempt_token=(p->>'attemptToken')::uuid;
+ IF NOT FOUND OR a.lease_token IS DISTINCT FROM(p->>'leaseToken')::uuid OR a.schema_generation IS DISTINCT FROM p->>'generation'
+ THEN RAISE EXCEPTION USING ERRCODE='40001',MESSAGE='publication: unknown attempt';END IF;
+ IF a.org_id IS NOT NULL THEN PERFORM sessions.ingest_org_admission_hold_check(a.org_id,'publication'); END IF; -- 062320 org admission hold
+ IF a.state='published' THEN
+  IF a.completion_sha256 IS DISTINCT FROM v_message_sha THEN RAISE EXCEPTION USING ERRCODE='40001',MESSAGE='publication: completed request differs';END IF;
+  RETURN jsonb_build_object('published',true,'replay',true,'images',jsonb_array_length(a.head_snapshots),
+    'records',(SELECT count(DISTINCT x->>'record_id') FROM sessions.ingest_stage_intents s JOIN sessions.ingest_claim_attempts c ON c.claim_token=s.claim_token
+      CROSS JOIN LATERAL jsonb_array_elements(c.records)x WHERE s.stage_token=a.stage_token AND a.accepted_ordinals@>to_jsonb((x->>'ord')::int)),
+    'eligibleSessions',(SELECT count(*) FROM jsonb_array_elements(a.head_snapshots)h WHERE NOT(h->>'source'='_none' AND h->>'sessionId'='_origin')));
+ END IF;
+ -- Same lock as the existing complete canonical CH projector. Never wait
+ -- for a remote read while holding a user fence or publication head lock.
+ FOR v IN SELECT value FROM jsonb_array_elements(a.head_snapshots)
+  WHERE NOT(value->>'source'='_none' AND value->>'sessionId'='_origin') ORDER BY value->>'physicalSource' COLLATE"C",value->>'sessionId' COLLATE"C"
+ LOOP
+  IF NOT pg_try_advisory_xact_lock(hashtextextended(concat_ws(chr(31),'96bulls:directory-events',a.org_id,a.workspace_id,v->>'physicalSource',v->>'sessionId'),0))
+  THEN RAISE EXCEPTION USING ERRCODE='40001',MESSAGE='publication: canonical projector busy';END IF;
+ END LOOP;
+ a:=sessions.ingest_publication_locked(a.attempt_token,a.lease_token,p->>'generation');
+ PERFORM sessions.ingest_acquisition_publish_check(a.org_id,a.workspace_id,a.head_snapshots);
+ IF sessions.ingest_publication_revision_snapshot(a.stage_token) IS DISTINCT FROM a.revision_snapshot
+ THEN RAISE EXCEPTION USING ERRCODE='40001',MESSAGE='publication: complete record maxima changed';END IF;
+ SELECT count(*) INTO v_actual FROM sessions.ingest_publication_images WHERE attempt_token=a.attempt_token;
+ IF v_actual<>jsonb_array_length(a.head_snapshots)
+ THEN RAISE EXCEPTION USING ERRCODE='40001',MESSAGE='publication: complete image set not prepared';END IF;
+ SELECT count(*) INTO v_notice_count FROM jsonb_array_elements(a.head_snapshots)h WHERE NOT(h->>'source'='_none' AND h->>'sessionId'='_origin');
+ IF jsonb_array_length(v_messages)<>v_notice_count OR
+  (SELECT count(DISTINCT m#>>'{payload,key}')FROM jsonb_array_elements(v_messages)m)<>v_notice_count
+ THEN RAISE EXCEPTION USING ERRCODE='22023',MESSAGE='publication: notification set differs';END IF;
+ -- All registered manifests must match the immutable prepared byte proof. A
+ -- trusted bounded caller invokes this only after exact immutable PUT ACKs.
+ IF EXISTS(SELECT 1 FROM sessions.ingest_publication_images x
+  LEFT JOIN sessions.ingest_publication_objects o ON o.object_key=x.manifest_key
+  WHERE x.attempt_token=a.attempt_token AND(o.object_key IS NULL OR o.generation<>x.generation OR o.sha256<>x.manifest_sha256
+    OR o.bytes<>x.manifest_bytes OR o.kind<>'manifest' OR o.cleanup_state<>'live'))
+ THEN RAISE EXCEPTION USING ERRCODE='40001',MESSAGE='publication: manifest intent proof missing';END IF;
+ -- A competing record owner/newer revision can win a unique-key wait after the
+ -- preceding snapshot. Require every admitted highest record to actually apply;
+ -- failure rolls back pointers/jobs/authority together.
+ WITH admitted AS(
+  SELECT x FROM sessions.ingest_stage_intents s JOIN sessions.ingest_claim_attempts c ON c.claim_token=s.claim_token
+   CROSS JOIN LATERAL jsonb_array_elements(c.records)x
+  WHERE s.stage_token=a.stage_token AND a.accepted_ordinals@>to_jsonb((x->>'ord')::int)
+ ), highest AS(
+  SELECT DISTINCT ON((x->>'record_id') COLLATE"C")x FROM admitted ORDER BY (x->>'record_id') COLLATE"C",(x->>'revision')::bigint DESC,(x->>'ord')::int
+ )
+ INSERT INTO sessions.ingest_record_revisions AS t(org_id,workspace_id,origin_id,record_id,revision,revision_id,digest,user_id,source,session_id)
+ SELECT a.org_id,a.workspace_id,a.origin_id,x->>'record_id',(x->>'revision')::bigint,x->>'revision_id',x->>'digest',a.user_id,x->>'source',x->>'session_id' FROM highest
+ ON CONFLICT(org_id,workspace_id,origin_id,record_id) DO UPDATE SET revision=excluded.revision,revision_id=excluded.revision_id,digest=excluded.digest,
+  user_id=excluded.user_id,source=excluded.source,session_id=excluded.session_id,updated_at=clock_timestamp()
+ WHERE t.user_id=excluded.user_id AND excluded.revision>t.revision;
+ GET DIAGNOSTICS v_written=ROW_COUNT;
+ SELECT count(DISTINCT x->>'record_id') INTO v_expected
+ FROM sessions.ingest_stage_intents s JOIN sessions.ingest_claim_attempts c ON c.claim_token=s.claim_token
+ CROSS JOIN LATERAL jsonb_array_elements(c.records)x WHERE s.stage_token=a.stage_token AND a.accepted_ordinals@>to_jsonb((x->>'ord')::int);
+ IF v_written<>v_expected THEN RAISE EXCEPTION USING ERRCODE='40001',MESSAGE='publication: admitted record lost its revision race';END IF;
+ FOR v IN SELECT value FROM jsonb_array_elements(a.head_snapshots)ORDER BY value->>'physicalSource' COLLATE"C",value->>'physicalSession' COLLATE"C" LOOP
+  SELECT*INTO STRICT i FROM sessions.ingest_publication_images WHERE attempt_token=a.attempt_token AND group_index=(v->>'groupIndex')::int;
+  IF NOT(v->>'source'='_none' AND v->>'sessionId'='_origin') THEN
+   SELECT value INTO message FROM jsonb_array_elements(v_messages) WHERE value#>>'{payload,key}'=i.manifest_key;
+   IF NOT FOUND OR message->>'v' IS DISTINCT FROM'1' OR message->>'stage' IS DISTINCT FROM'object-landed'
+    OR message#>>'{ctx,orgId}' IS DISTINCT FROM a.org_id OR message#>>'{ctx,workspaceId}' IS DISTINCT FROM v->>'physicalWorkspace'
+    OR message#>>'{ctx,harness}' IS DISTINCT FROM v->>'physicalSource' OR message#>>'{ctx,sessionId}' IS DISTINCT FROM v->>'physicalSession'
+    OR message#>>'{ctx,machineId}' IS DISTINCT FROM v->>'machineId' OR message#>>'{ctx,traceId}' IS DISTINCT FROM lower(i.pointer_row->>'trace_id')
+    OR message->>'revision' IS DISTINCT FROM i.pointer_revision::text OR message#>>'{payload,revision}' IS DISTINCT FROM i.pointer_revision::text
+    OR message#>>'{payload,kind}' IS DISTINCT FROM'manifest' OR message#>>'{payload,deleted}' IS NOT NULL
+    OR (coalesce(message#>>'{payload,provider}','') NOT IN('s3','gcs') OR message#>>'{payload,provider}' IS DISTINCT FROM i.pointer_row->>'storage_provider') OR message#>>'{payload,bucket}' IS DISTINCT FROM a.frontier->>'target_bucket'
+    OR message#>>'{payload,scrubbed}' IS DISTINCT FROM'true'
+    OR coalesce(message#>>'{payload,version}',message#>>'{payload,etag}','')=''
+    OR octet_length(coalesce(message#>>'{payload,version}',message#>>'{payload,etag}'))>4096
+    OR message->>'workKey' IS DISTINCT FROM i.manifest_key||'@'||coalesce(message#>>'{payload,version}',message#>>'{payload,etag}')
+   THEN RAISE EXCEPTION USING ERRCODE='22023',MESSAGE='publication: notification differs from current image';END IF;
+  ELSE message:=NULL;END IF;
+  UPDATE sessions.ingest_publication_generations SET state='live'WHERE generation=i.generation AND state IN('building','live');
+  IF NOT FOUND THEN RAISE EXCEPTION USING ERRCODE='40001',MESSAGE='publication: generation retired';END IF;
+  UPDATE sessions.ingest_publication_heads SET current_key=i.manifest_key,current_raw_sha256=i.raw_sha256,pointer_revision=i.pointer_revision,
+   state='live',base_pointer=NULL,row_version=row_version+1,build_attempt_token=NULL,build_lease_until=NULL
+   WHERE org_id=a.org_id AND workspace_id=a.workspace_id AND user_id=a.user_id AND origin_id=a.origin_id
+    AND source=v->>'source' AND session_id=v->>'sessionId' AND generation=i.generation AND row_version=(v->>'headVersion')::bigint
+    AND acquisition_epoch=coalesce((v->>'acquisitionEpoch')::bigint,0);
+  IF NOT FOUND THEN RAISE EXCEPTION USING ERRCODE='40001',MESSAGE='publication: head CAS lost';END IF;
+  IF message IS NOT NULL THEN
+   v_row:=jsonb_set(i.pointer_row,'{manifest_etag}',to_jsonb(coalesce(message#>>'{payload,etag}',message#>>'{payload,version}')));
+   SELECT*INTO v_result FROM sessions.upsert_session_index(jsonb_build_array(v_row));
+   IF v_result.applied IS NOT TRUE THEN RAISE EXCEPTION USING ERRCODE='40001',MESSAGE='publication: pointer CAS did not apply';END IF;
+   UPDATE sessions.session_index SET canonical_session_id=v->>'sessionId',canonical_machine_id=v->>'machineId'
+    WHERE org_id=a.org_id AND workspace_id=a.workspace_id AND harness=v->>'physicalSource' AND session_id=v->>'physicalSession'
+     AND machine_id=v->>'machineId' AND manifest_key=i.manifest_key AND revision=i.pointer_revision;
+   INSERT INTO sessions.pipeline_jobs(stage,work_key,trace_id,org_id,workspace_id,session_id,machine_id,message)
+   VALUES('object-landed',message->>'workKey',(message#>>'{ctx,traceId}')::uuid,a.org_id,message#>>'{ctx,workspaceId}',
+    message#>>'{ctx,sessionId}',message#>>'{ctx,machineId}',message);
+  END IF;
+ END LOOP;
+ -- "erased" here is the existing buffer-outbox state: no active buffered copy.
+ -- Canonical images already hold all admitted bytes;040510 cleans this retired
+ -- source object via its persistent barrier, including ambiguous old writes.
+ UPDATE sessions.ingest_buffer_outbox SET active_stage_token=NULL,state='erased',row_version=row_version+1
+  WHERE org_id=a.org_id AND workspace_id=a.workspace_id AND origin_id=a.origin_id AND batch_id=a.batch_id
+   AND active_stage_token=a.stage_token AND row_version=a.outbox_version;
+ IF NOT FOUND THEN RAISE EXCEPTION USING ERRCODE='40001',MESSAGE='publication: source outbox CAS lost';END IF;
+ UPDATE sessions.ingest_stage_intents SET cleanup_state='retired',row_version=row_version+1,
+  gc_lease_token=NULL,gc_lease_until=NULL,gc_lease_version=NULL,gc_keep_groups=NULL WHERE stage_token=a.stage_token;
+ UPDATE sessions.ingest_publication_attempts SET state='published',published_at=clock_timestamp(),completion_sha256=v_message_sha WHERE attempt_token=a.attempt_token;
+ PERFORM sessions.ingest_require_buffer_admission(a.org_id);
+ IF a.lease_until<=clock_timestamp() OR (a.frontier->>'valid_until_epoch')::numeric<=extract(epoch FROM clock_timestamp())
+ THEN RAISE EXCEPTION USING ERRCODE='40001',MESSAGE='publication: final acknowledgement expired';END IF;
+ RETURN jsonb_build_object('published',true,'replay',false,'images',jsonb_array_length(a.head_snapshots),'records',v_written,'eligibleSessions',v_notice_count);
+END $publish$;
+
+-- sessions.ingest_publication_claim: latest body from 20261105043850_ingest_acquisition_owner.sql, plus the publication check.
+CREATE OR REPLACE FUNCTION sessions.ingest_publication_claim(p jsonb) RETURNS jsonb
+LANGUAGE plpgsql VOLATILE SECURITY DEFINER SET search_path=pg_catalog,pg_temp AS $claim$
+DECLARE s sessions.ingest_stage_intents%ROWTYPE;a sessions.ingest_claim_attempts%ROWTYPE;o sessions.ingest_buffer_outbox%ROWTYPE;
+ f sessions.ingest_publication_frontiers%ROWTYPE;h sessions.ingest_publication_heads%ROWTYPE;g record;r record;
+ v_org text;v_ws text;v_user text;v_keyroot text;v_snapshot jsonb;v_accepted jsonb;v_seats jsonb;v_heads jsonb:='[]';v_ordinals jsonb;
+ v_attempt uuid:=gen_random_uuid();v_lease uuid:=gen_random_uuid();v_gen uuid;v_source text;v_session text;v_fence bigint;
+ v_physws text;v_physsource text;v_physsession text;v_machine text;v_base jsonb;v_revision bigint;v_prefix text;v_pairs jsonb;v_owner_epoch bigint;
+BEGIN
+ PERFORM sessions.ingest_require_role('bulls96_session_ingest');
+ PERFORM sessions.ingest_exact_keys(p,ARRAY['stageToken','keyRoot','bucket','region','generation']);
+ PERFORM sessions.ingest_require_generation(p->>'generation');
+ v_keyroot:=p->>'keyRoot';
+ IF jsonb_typeof(p->'keyRoot') IS DISTINCT FROM'string' OR v_keyroot!~'^[a-z0-9][a-z0-9-]{0,62}$'
+ THEN RAISE EXCEPTION USING ERRCODE='22023',MESSAGE='publication: invalid key root';END IF;
+ SELECT org_id,workspace_id,user_id INTO v_org,v_ws,v_user FROM sessions.ingest_stage_intents WHERE stage_token=(p->>'stageToken')::uuid;
+ IF v_org IS NOT NULL THEN PERFORM sessions.ingest_org_admission_hold_check(v_org,'publication'); END IF; -- 062320 org admission hold
+ IF NOT FOUND THEN RAISE EXCEPTION USING ERRCODE='40001',MESSAGE='publication: stage absent';END IF;
+ PERFORM sessions.ingest_require_buffer_admission(v_org);
+ PERFORM sessions.ingest_lock_fences(v_org,v_ws,v_user);
+ SELECT * INTO s FROM sessions.ingest_stage_intents WHERE stage_token=(p->>'stageToken')::uuid;
+ PERFORM 1 FROM sessions.ingest_batches b WHERE b.org_id=s.org_id AND b.workspace_id=s.workspace_id
+  AND b.origin_id=s.origin_id AND b.batch_id=s.batch_id AND b.user_id=s.user_id AND b.digest=s.digest
+  AND b.state='committed' AND b.buffer_receipt_kind='staged' FOR UPDATE;
+ IF NOT FOUND THEN RAISE EXCEPTION USING ERRCODE='40001',MESSAGE='publication: no durable buffered receipt';END IF;
+ SELECT * INTO s FROM sessions.ingest_stage_intents WHERE stage_token=s.stage_token FOR UPDATE;
+ SELECT * INTO o FROM sessions.ingest_buffer_outbox b WHERE b.org_id=s.org_id AND b.workspace_id=s.workspace_id
+  AND b.origin_id=s.origin_id AND b.batch_id=s.batch_id FOR UPDATE;
+ IF NOT FOUND OR o.active_stage_token IS DISTINCT FROM s.stage_token OR o.state<>'buffered'
+  OR s.receipt_state<>'acknowledged' OR s.cleanup_state<>'live'
+  OR s.gc_lease_until>clock_timestamp() OR s.gc_replacement_stage_token IS NOT NULL
+ THEN RAISE EXCEPTION USING ERRCODE='40001',MESSAGE='publication: stage busy or changed';END IF;
+ PERFORM sessions.ingest_require_buffer_admission(s.org_id);
+ SELECT * INTO f FROM sessions.ingest_publication_frontiers WHERE org_id=s.org_id AND workspace_id=s.workspace_id
+  AND user_id=s.user_id AND origin_id=s.origin_id AND valid_until>clock_timestamp()
+  AND key_root=v_keyroot AND target_bucket=p->>'bucket' AND target_region=p->>'region' AND schema_generation=p->>'generation' FOR SHARE;
+ IF NOT FOUND THEN RAISE EXCEPTION USING ERRCODE='55000',MESSAGE='publication: complete source frontier required';END IF;
+ IF jsonb_array_length(sessions.ingest_buffer_gc_kept(s.stage_token))<>jsonb_array_length(s.group_ordinals)
+ THEN RAISE EXCEPTION USING ERRCODE='40001',MESSAGE='publication: stage needs privacy GC';END IF;
+ SELECT * INTO STRICT a FROM sessions.ingest_claim_attempts WHERE claim_token=s.claim_token;
+ v_snapshot:=sessions.ingest_publication_revision_snapshot(s.stage_token);
+ -- First durable ACK owns both the canonical order and the body decision.
+ -- Losing equal-revision aliases remain auditable in the seat snapshot but
+ -- can never enter an image, create a head, or poison a publication lease.
+ v_seats:=sessions.ingest_receipt_seats_for_stage(s.stage_token);
+ IF EXISTS(SELECT 1 FROM jsonb_array_elements(a.records)x JOIN jsonb_array_elements(v_snapshot)q ON q->>'recordId'=x->>'record_id'
+  WHERE (x->>'revision')::bigint>coalesce((q#>>'{stored,revision}')::bigint,0) AND q->'stored'<>'null'::jsonb
+   AND (x->>'ord')::int IN(SELECT(y::text)::int FROM jsonb_array_elements(s.group_ordinals)gg CROSS JOIN LATERAL jsonb_array_elements(gg)y)
+   AND (x->>'ord')::int IN(SELECT(z->>'ord')::int FROM jsonb_array_elements(v_seats->'records')z WHERE (z->>'bodyAccepted')::boolean)
+   AND NOT(x->>'session_id' IS NULL AND q#>>'{stored,session_id}' IS NULL)
+   AND ROW(x->>'source',x->>'session_id') IS DISTINCT FROM ROW(q#>>'{stored,source}',q#>>'{stored,session_id}'))
+ THEN RAISE EXCEPTION USING ERRCODE='55000',MESSAGE='publication: cross-scope record move requires reconciliation';END IF;
+ SELECT coalesce(jsonb_agg((x->>'ord')::int ORDER BY (x->>'ord')::int),'[]') INTO v_accepted
+ FROM jsonb_array_elements(a.records)x JOIN jsonb_array_elements(v_snapshot)q ON q->>'recordId'=x->>'record_id'
+ WHERE (x->>'ord')::int IN(SELECT (y::text)::int FROM jsonb_array_elements(s.group_ordinals)gg CROSS JOIN LATERAL jsonb_array_elements(gg)y)
+  AND (x->>'ord')::int IN(SELECT(z->>'ord')::int FROM jsonb_array_elements(v_seats->'records')z WHERE (z->>'bodyAccepted')::boolean)
+  AND (x->>'revision')::bigint>coalesce((q#>>'{stored,revision}')::bigint,0);
+ -- Repeat the legacy in-batch first-peer conflict predicate on the complete
+ -- newly admitted set; no publication can make an invalid subset canonical.
+ IF EXISTS(WITH items AS(
+  SELECT x AS item,row_number()OVER(PARTITION BY x->>'record_id',x->>'revision'
+    ORDER BY (x->>'revision_id') COLLATE"C",(x->>'ord')::int) rn
+  FROM jsonb_array_elements(a.records)x WHERE v_accepted@>to_jsonb((x->>'ord')::int)
+ ), peers AS(SELECT * FROM items WHERE rn=1)
+ SELECT 1 FROM items i JOIN peers q ON i.item->>'record_id'=q.item->>'record_id' AND i.item->>'revision'=q.item->>'revision'
+ WHERE i.item->>'revision_id'<>q.item->>'revision_id' AND i.item->>'digest'<>q.item->>'digest')
+ THEN RAISE EXCEPTION USING ERRCODE='55000',MESSAGE='publication: new revision conflict';END IF;
+ v_physws:=sessions.ingest_publication_component(s.workspace_id);
+ v_machine:='srv_'||left(encode(sha256(convert_to(s.workspace_id||chr(31)||s.origin_id||chr(31)||s.user_id,'UTF8')),'hex'),32);
+ FOR g IN SELECT value,ordinality-1 idx FROM jsonb_array_elements(s.group_ordinals)WITH ORDINALITY LOOP
+  SELECT coalesce(jsonb_agg(y ORDER BY ordinality),'[]') INTO v_ordinals
+   FROM jsonb_array_elements(g.value)WITH ORDINALITY q(y,ordinality) WHERE v_accepted@>y;
+  IF jsonb_array_length(v_ordinals)=0 THEN CONTINUE;END IF;
+  SELECT x->>'source' source,x->>'session_id' session_id INTO r FROM jsonb_array_elements(a.records)x
+   WHERE (x->>'ord')::int=(v_ordinals->>0)::int;
+  v_source:=CASE WHEN r.session_id IS NULL THEN '_none' ELSE r.source END;
+  v_session:=coalesce(r.session_id,'_origin');
+  v_physsource:=sessions.ingest_publication_component(v_source);v_physsession:=sessions.ingest_publication_component(v_session);
+  v_fence:=0;
+  IF r.session_id IS NOT NULL THEN SELECT coalesce(max(epoch),0) INTO v_fence FROM sessions.ingest_fence_versions
+   WHERE org_id=s.org_id AND workspace_id=s.workspace_id AND user_id=s.user_id AND origin_id=s.origin_id
+    AND source=r.source AND session_id=r.session_id;END IF;
+  IF NOT pg_try_advisory_xact_lock(hashtextextended(concat_ws(chr(31),'96bulls:publication-pointer',s.org_id,s.workspace_id,v_physsource,v_physsession,v_machine),0))
+  THEN RAISE EXCEPTION USING ERRCODE='40001',MESSAGE='publication: pointer scope busy';END IF;
+  SELECT * INTO h FROM sessions.ingest_publication_heads WHERE org_id=s.org_id AND workspace_id=s.workspace_id
+   AND user_id=s.user_id AND origin_id=s.origin_id AND source=v_source AND session_id=v_session FOR UPDATE;
+  v_owner_epoch:=sessions.ingest_acquisition_publication_epoch(s.org_id,s.workspace_id,r.source,r.session_id,a.acquisition);
+  IF NOT FOUND THEN
+   SELECT to_jsonb(q),coalesce(q.revision,0) INTO v_base,v_revision FROM sessions.session_index q
+    WHERE q.org_id=s.org_id AND q.workspace_id=s.workspace_id AND q.harness=v_physsource
+     AND q.session_id=v_physsession AND q.machine_id=v_machine FOR UPDATE;
+   v_revision:=coalesce(v_revision,0);
+   IF v_base IS NOT NULL AND v_base->>'deleted_at' IS NULL AND v_base->>'user_id' IS DISTINCT FROM s.user_id
+   THEN RAISE EXCEPTION USING ERRCODE='42501',MESSAGE='publication: legacy pointer owner mismatch';END IF;
+   IF v_base->>'deleted_at' IS NOT NULL THEN v_base:=NULL;END IF;
+   v_gen:=gen_random_uuid();v_prefix:=v_keyroot||'/'||s.org_id||'/upload-generations/g='||v_gen;
+   INSERT INTO sessions.ingest_publication_heads(org_id,workspace_id,user_id,origin_id,source,session_id,
+    physical_workspace,physical_source,physical_session,machine_id,generation,fence_epoch,reset_epoch,pointer_revision,base_pointer,state,acquisition_epoch)
+   VALUES(s.org_id,s.workspace_id,s.user_id,s.origin_id,v_source,v_session,
+    v_physws,v_physsource,v_physsession,v_machine,v_gen,v_fence,s.reset_epoch,v_revision,v_base,'building',v_owner_epoch) RETURNING*INTO h;
+   INSERT INTO sessions.ingest_publication_generations VALUES(v_gen,v_prefix,s.org_id,s.workspace_id,s.user_id,s.origin_id,
+    v_source,v_session,v_fence,s.reset_epoch,'building',clock_timestamp(),NULL,f.target_bucket,f.target_region,f.key_root);
+  ELSIF h.fence_epoch<>v_fence OR h.reset_epoch<>s.reset_epoch OR h.state='retired' OR h.acquisition_epoch<>v_owner_epoch
+   OR NOT EXISTS(SELECT 1 FROM sessions.ingest_publication_generations WHERE generation=h.generation AND state IN('building','live')) THEN
+   UPDATE sessions.ingest_publication_generations SET state='retired',retired_at=coalesce(retired_at,clock_timestamp()) WHERE generation=h.generation;
+   v_gen:=gen_random_uuid();v_prefix:=v_keyroot||'/'||s.org_id||'/upload-generations/g='||v_gen;
+   UPDATE sessions.ingest_publication_heads SET generation=v_gen,fence_epoch=v_fence,reset_epoch=s.reset_epoch,acquisition_epoch=v_owner_epoch,
+    state='building',current_key=NULL,current_raw_sha256=NULL,
+    base_pointer=CASE WHEN h.state='building' AND h.current_key IS NULL AND h.fence_epoch=v_fence AND h.reset_epoch=s.reset_epoch
+     THEN h.base_pointer ELSE NULL END,row_version=row_version+1
+    WHERE org_id=h.org_id AND workspace_id=h.workspace_id AND user_id=h.user_id AND origin_id=h.origin_id
+     AND source=h.source AND session_id=h.session_id RETURNING*INTO h;
+   INSERT INTO sessions.ingest_publication_generations VALUES(v_gen,v_prefix,s.org_id,s.workspace_id,s.user_id,s.origin_id,
+    v_source,v_session,v_fence,s.reset_epoch,'building',clock_timestamp(),NULL,f.target_bucket,f.target_region,f.key_root);
+  END IF;
+  SELECT prefix INTO v_prefix FROM sessions.ingest_publication_generations WHERE generation=h.generation AND state IN('building','live')
+   AND target_bucket=f.target_bucket AND target_region=f.target_region AND key_root=f.key_root;
+  IF NOT FOUND OR v_prefix IS DISTINCT FROM v_keyroot||'/'||s.org_id||'/upload-generations/g='||h.generation
+  THEN RAISE EXCEPTION USING ERRCODE='40001',MESSAGE='publication: generation changed';END IF;
+  IF h.build_attempt_token IS NOT NULL AND h.build_lease_until>clock_timestamp() THEN
+   RAISE EXCEPTION USING ERRCODE='40001',MESSAGE='publication: another batch is building this head';
+  END IF;
+  UPDATE sessions.ingest_publication_heads SET build_attempt_token=v_attempt,build_lease_until=clock_timestamp()+interval'5 minutes'
+   WHERE org_id=h.org_id AND workspace_id=h.workspace_id AND user_id=h.user_id AND origin_id=h.origin_id
+    AND source=h.source AND session_id=h.session_id RETURNING*INTO h;
+  v_heads:=v_heads||jsonb_build_array(jsonb_build_object('groupIndex',g.idx,'ordinals',v_ordinals,'generation',h.generation,'prefix',v_prefix,
+   'headVersion',h.row_version::text,'revision',(h.pointer_revision+1)::text,'previousKey',h.current_key,
+   'previousRawSha256',h.current_raw_sha256,'basePointer',h.base_pointer,'source',h.source,'sessionId',h.session_id,
+   'physicalWorkspace',h.physical_workspace,'physicalSource',h.physical_source,'physicalSession',h.physical_session,'machineId',h.machine_id,
+   'fenceEpoch',h.fence_epoch::text,'resetEpoch',h.reset_epoch::text)
+   ||CASE WHEN h.acquisition_epoch>0 THEN jsonb_build_object('acquisitionEpoch',h.acquisition_epoch::text) ELSE '{}'::jsonb END);
+ END LOOP;
+ -- This closes the strict seed baseline BEFORE any canonical image is written.
+ UPDATE sessions.ingest_batches SET publication_state='canonical' WHERE org_id=s.org_id AND workspace_id=s.workspace_id
+  AND origin_id=s.origin_id AND batch_id=s.batch_id;
+ UPDATE sessions.ingest_stage_intents SET row_version=row_version+1,gc_lease_version=row_version+1,
+  gc_lease_token=v_lease,gc_generation=p->>'generation',gc_lease_until=clock_timestamp()+interval'5 minutes',gc_keep_groups=NULL,gc_outbox_version=o.row_version
+  WHERE stage_token=s.stage_token RETURNING*INTO s;
+ INSERT INTO sessions.ingest_publication_attempts(attempt_token,schema_generation,stage_token,lease_token,lease_until,stage_version,outbox_version,
+  org_id,workspace_id,user_id,origin_id,batch_id,digest,accepted_ordinals,revision_snapshot,head_snapshots,frontier)
+ VALUES(v_attempt,p->>'generation',s.stage_token,v_lease,s.gc_lease_until,s.row_version,o.row_version,s.org_id,s.workspace_id,s.user_id,s.origin_id,
+  s.batch_id,s.digest,v_accepted,v_snapshot,v_heads,to_jsonb(f)-'valid_until'||jsonb_build_object('valid_until_epoch',extract(epoch FROM f.valid_until)));
+ PERFORM sessions.ingest_require_buffer_admission(s.org_id);
+ IF s.gc_lease_until<=clock_timestamp() OR f.valid_until<=clock_timestamp()
+ THEN RAISE EXCEPTION USING ERRCODE='40001',MESSAGE='publication: admission expired';END IF;
+ RETURN jsonb_build_object('schemaGeneration',p->>'generation','attemptToken',v_attempt,'leaseToken',v_lease,'leaseUntil',s.gc_lease_until,
+  'stageToken',s.stage_token,'stageVersion',s.row_version::text,'outboxVersion',o.row_version::text,
+  'tenant',jsonb_build_object('orgId',s.org_id,'workspaceId',s.workspace_id,'userId',s.user_id),
+  'originId',s.origin_id,'batchId',s.batch_id,'batchDigest',s.digest,'claimToken',s.claim_token,
+  'stage',jsonb_build_object('key',s.stage_key,'sha256',s.stage_sha256,'bytes',s.stage_bytes,'groupOrdinals',s.group_ordinals),
+  'records',a.records,'acceptedOrdinals',v_accepted,'receiptSeats',v_seats,'heads',v_heads);
+END $claim$;
+
+-- sessions.ingest_history_plan_claim: latest body from 20261105026000_canonical_history_lineage.sql, plus the publication check.
+CREATE OR REPLACE FUNCTION sessions.ingest_history_plan_claim(p jsonb)RETURNS jsonb
+LANGUAGE plpgsql VOLATILE SECURITY DEFINER SET search_path=pg_catalog,pg_temp AS $claim$
+DECLARE s sessions.ingest_stage_intents%ROWTYPE;a sessions.ingest_claim_attempts%ROWTYPE;o sessions.ingest_buffer_outbox%ROWTYPE;
+ f sessions.ingest_publication_frontiers%ROWTYPE;c sessions.ingest_history_carriers%ROWTYPE;
+ v_plan uuid:=gen_random_uuid();v_lease uuid:=gen_random_uuid();v_until timestamptz;v_org text;v_ws text;v_user text;
+ v_keep jsonb;v_all jsonb;v_native jsonb;v_seats jsonb;v_carriers bigint:=0;v_refs bigint;v_gen uuid;v_root text;
+BEGIN
+ PERFORM sessions.ingest_require_role('bulls96_session_ingest');
+ PERFORM sessions.ingest_exact_keys(p,ARRAY['generation','stageToken','bucket','region','keyRoot']);
+ PERFORM sessions.ingest_require_generation(p->>'generation');
+ IF jsonb_typeof(p->'keyRoot')IS DISTINCT FROM'string' OR p->>'keyRoot'!~'^[a-z0-9][a-z0-9-]{0,62}$' THEN
+  RAISE EXCEPTION USING ERRCODE='22023',MESSAGE='history: invalid key root';END IF;
+ SELECT org_id,workspace_id,user_id INTO v_org,v_ws,v_user FROM sessions.ingest_stage_intents WHERE stage_token=(p->>'stageToken')::uuid;
+ IF v_org IS NOT NULL THEN PERFORM sessions.ingest_org_admission_hold_check(v_org,'publication'); END IF; -- 062320 org admission hold
+ IF NOT FOUND THEN RAISE EXCEPTION USING ERRCODE='40001',MESSAGE='history: stage absent';END IF;
+ PERFORM sessions.ingest_require_buffer_admission(v_org);PERFORM sessions.ingest_lock_fences(v_org,v_ws,v_user);
+ SELECT *INTO s FROM sessions.ingest_stage_intents WHERE stage_token=(p->>'stageToken')::uuid;
+ PERFORM 1 FROM sessions.ingest_batches b WHERE b.org_id=s.org_id AND b.workspace_id=s.workspace_id AND b.user_id=s.user_id
+  AND b.origin_id=s.origin_id AND b.batch_id=s.batch_id AND b.digest=s.digest AND b.state='committed' AND b.buffer_receipt_kind='staged' FOR UPDATE;
+ IF NOT FOUND THEN RAISE EXCEPTION USING ERRCODE='40001',MESSAGE='history: durable staged receipt absent';END IF;
+ SELECT *INTO s FROM sessions.ingest_stage_intents WHERE stage_token=s.stage_token FOR UPDATE;
+ SELECT *INTO o FROM sessions.ingest_buffer_outbox WHERE org_id=s.org_id AND workspace_id=s.workspace_id AND origin_id=s.origin_id AND batch_id=s.batch_id FOR UPDATE;
+ IF NOT FOUND OR o.active_stage_token IS DISTINCT FROM s.stage_token OR o.state<>'buffered' OR o.user_id<>s.user_id OR o.digest<>s.digest
+  OR s.receipt_state<>'acknowledged' OR s.cleanup_state<>'live' OR s.gc_lease_until>clock_timestamp() OR s.gc_replacement_stage_token IS NOT NULL THEN
+  RAISE EXCEPTION USING ERRCODE='40001',MESSAGE='history: stage busy or changed';END IF;
+ SELECT *INTO STRICT a FROM sessions.ingest_claim_attempts WHERE claim_token=s.claim_token;
+ -- Current target custody/lifecycle dominates unqualified historical S3 MAX.
+ -- All chosen records have immutable true ACK decisions and current exact seats.
+ v_keep:=sessions.ingest_buffer_gc_ordinals(s.stage_token);
+ SELECT coalesce(jsonb_agg(x ORDER BY x::text::integer),'[]')INTO v_all FROM jsonb_array_elements(s.group_ordinals)g CROSS JOIN LATERAL jsonb_array_elements(g)x;
+ IF v_keep='[]'OR v_keep IS DISTINCT FROM v_all THEN RAISE EXCEPTION USING ERRCODE='40001',MESSAGE='history: stage requires original-ordinal retention rewrite';END IF;
+ v_seats:=sessions.ingest_receipt_seats_for_stage(s.stage_token);v_native:=sessions.ingest_history_native_snapshot(s.stage_token);
+ SELECT *INTO f FROM sessions.ingest_publication_frontiers WHERE org_id=s.org_id AND workspace_id=s.workspace_id AND user_id=s.user_id AND origin_id=s.origin_id
+  AND schema_generation=p->>'generation' AND target_bucket=p->>'bucket' AND target_region=p->>'region' AND key_root=p->>'keyRoot' AND valid_until>clock_timestamp() FOR SHARE;
+ IF NOT FOUND THEN RAISE EXCEPTION USING ERRCODE='55000',MESSAGE='history: qualified complete source frontier required';END IF;
+ -- Complete coverage is a database predicate, never a limited candidate page.
+ IF EXISTS(SELECT 1 FROM sessions.ingest_history_pointer_refs r JOIN sessions.ingest_history_carriers q USING(carrier_sha256)
+   WHERE r.org_id=s.org_id AND r.workspace_id=s.workspace_id AND(q.storage_provider<>'s3' OR q.bucket<>f.target_bucket OR NOT q.layout_known OR NOT q.scan_complete OR q.scanned_epoch IS DISTINCT FROM q.epoch)) THEN
+  RAISE EXCEPTION USING ERRCODE='55000',MESSAGE='history: complete verified carrier inventory required';END IF;
+ v_until:=clock_timestamp()+interval'5 minutes';
+ UPDATE sessions.ingest_stage_intents SET row_version=row_version+1,gc_lease_version=row_version+1,gc_lease_token=v_lease,
+  gc_generation=p->>'generation',gc_lease_until=v_until,gc_keep_groups=NULL,gc_keep_ordinals=NULL,gc_outbox_version=o.row_version WHERE stage_token=s.stage_token RETURNING*INTO s;
+ INSERT INTO sessions.ingest_history_plans(plan_token,lease_token,schema_generation,lease_until,stage_token,stage_version,outbox_version,
+  org_id,workspace_id,user_id,origin_id,batch_id,digest,target_bucket,target_region,key_root,accepted_ordinals,receipt_seats,native_snapshot,frontier,state)
+ VALUES(v_plan,v_lease,p->>'generation',v_until,s.stage_token,s.row_version,o.row_version,s.org_id,s.workspace_id,s.user_id,s.origin_id,s.batch_id,s.digest,
+  f.target_bucket,f.target_region,f.key_root,v_keep,v_seats,v_native,to_jsonb(f),'admitted');
+ -- All carriers containing any selected native key, plus destination scope
+ -- carriers whose unrelated content must be preserved. The indexed native
+ -- lookup includes older locations, not only the latest numeric revision.
+ FOR c IN SELECT q.*FROM sessions.ingest_history_carriers q WHERE q.carrier_sha256 IN(
+  SELECT n.carrier_sha256 FROM sessions.ingest_history_native_locations n JOIN jsonb_array_elements(a.records)x ON n.record_id=x->>'record_id'
+   WHERE n.org_id=s.org_id AND n.workspace_id=s.workspace_id AND n.origin_id=s.origin_id AND v_keep@>to_jsonb((x->>'ord')::integer)
+  UNION SELECT r.carrier_sha256 FROM sessions.ingest_history_pointer_refs r JOIN jsonb_array_elements(a.records)x
+   ON r.harness=CASE WHEN x->>'session_id'IS NULL THEN '_none'ELSE x->>'source'END
+    AND coalesce(r.pointer->>'canonical_session_id',r.session_id)=coalesce(x->>'session_id','_origin')
+   WHERE r.org_id=s.org_id AND r.workspace_id=s.workspace_id AND v_keep@>to_jsonb((x->>'ord')::integer))
+  ORDER BY q.carrier_sha256 LOOP
+  IF NOT c.scan_complete OR c.scanned_epoch IS DISTINCT FROM c.epoch OR c.storage_provider<>'s3' OR c.bucket<>f.target_bucket OR NOT c.layout_known THEN
+   RAISE EXCEPTION USING ERRCODE='40001',MESSAGE='history: selected carrier inventory changed';END IF;
+  SELECT count(*)INTO v_refs FROM sessions.ingest_history_pointer_refs WHERE carrier_sha256=c.carrier_sha256;
+  IF v_refs=0 THEN CONTINUE;END IF;
+  v_gen:=gen_random_uuid();v_root:=f.key_root||'/'||s.org_id||'/upload-generations/g='||v_gen;
+  INSERT INTO sessions.ingest_history_plan_carriers VALUES(v_plan,c.carrier_sha256,c.epoch,v_refs,v_gen,v_root);
+  INSERT INTO sessions.ingest_history_plan_refs SELECT v_plan,c.carrier_sha256,
+   row_number()OVER(ORDER BY r.org_id COLLATE"C",r.workspace_id COLLATE"C",r.harness COLLATE"C",r.session_id COLLATE"C",r.machine_id COLLATE"C")-1,r.pointer,r.pointer_sha256
+   FROM sessions.ingest_history_pointer_refs r WHERE r.carrier_sha256=c.carrier_sha256;
+  v_carriers:=v_carriers+1;
+ END LOOP;
+ -- Baseline closure is irrevocable BEFORE the first generation PUT.
+ UPDATE sessions.ingest_batches SET publication_state='canonical' WHERE org_id=s.org_id AND workspace_id=s.workspace_id AND origin_id=s.origin_id AND batch_id=s.batch_id;
+ PERFORM sessions.ingest_require_buffer_admission(s.org_id);
+ IF v_until<=clock_timestamp()OR f.valid_until<=clock_timestamp()THEN RAISE EXCEPTION USING ERRCODE='40001',MESSAGE='history: plan expired after capture';END IF;
+ RETURN jsonb_build_object('schemaGeneration',p->>'generation','planToken',v_plan,'leaseToken',v_lease,'leaseUntil',v_until,
+  'stageToken',s.stage_token,'stageVersion',s.row_version::text,'outboxVersion',o.row_version::text,'carrierCount',v_carriers::text,
+  'tenant',jsonb_build_object('orgId',s.org_id,'workspaceId',s.workspace_id,'userId',s.user_id),'originId',s.origin_id,
+  'batchId',s.batch_id,'batchDigest',s.digest,'claimToken',s.claim_token,'records',a.records,'acceptedOrdinals',v_keep,'receiptSeats',v_seats,
+  'stage',jsonb_build_object('key',s.stage_key,'sha256',s.stage_sha256,'bytes',s.stage_bytes,'groupOrdinals',s.group_ordinals));
+END $claim$;
+
+-- sessions.ingest_set_session_uploads: latest body from 20261105062060_turns_selection_origin_guard.sql, plus the control check.
+CREATE OR REPLACE FUNCTION sessions.ingest_set_session_uploads(p jsonb) RETURNS jsonb
+LANGUAGE plpgsql VOLATILE SECURITY DEFINER SET search_path=pg_catalog,pg_temp AS $selection$
+BEGIN
+ PERFORM sessions.ingest_org_admission_hold_check(sessions.ingest_identifier(p#>'{tenant,orgId}',false),'control'); -- 062320 org admission hold
+ PERFORM sessions.ingest_require_role('bulls96_session_ingest');
+ IF p->>'originId'='relayhistory:conversation_turns:v1' THEN
+  RAISE EXCEPTION USING ERRCODE='22023',MESSAGE='session ingest: turns origin is reserved';
+ END IF;
+ RETURN sessions.ingest_set_session_uploads_internal(p);
+END $selection$;
+
+-- sessions.ingest_selfhost_set_session_uploads: latest body from 20261105062060_turns_selection_origin_guard.sql, plus the control check.
+CREATE OR REPLACE FUNCTION sessions.ingest_selfhost_set_session_uploads(p jsonb) RETURNS jsonb
+LANGUAGE plpgsql VOLATILE SECURITY DEFINER SET search_path=pg_catalog,pg_temp AS $selfhost_selection$
+DECLARE
+ v_org text;v_ws text;v_user text;v_named text;v_origin text;v_sessions jsonb;v_machine text;v_pair record;v_canonical text;
+ v_updated bigint:=0;
+ v_member_machine text;v_member_user text;v_dir record;
+ c_erased_revision CONSTANT bigint:=9007199254740991;
+ c_turn_origin CONSTANT text:='relayhistory:conversation_turns:v1';
+BEGIN
+ PERFORM sessions.ingest_org_admission_hold_check(sessions.ingest_identifier(p#>'{tenant,orgId}',false),'control'); -- 062320 org admission hold
+ PERFORM sessions.ingest_require_role('bulls96_session_ingest');
+ PERFORM sessions.ingest_exact_keys(p,ARRAY['tenant','originId','sessions','enabled']);
+ IF p->'enabled' IS DISTINCT FROM 'false'::jsonb THEN
+  RAISE EXCEPTION USING ERRCODE='22023',MESSAGE='session ingest: only enabled:false is served here';
+ END IF;
+ v_org:=sessions.ingest_identifier(p#>'{tenant,orgId}',false);
+ v_ws:=sessions.ingest_identifier(p#>'{tenant,workspaceId}',true);
+ v_user:=sessions.ingest_identifier(p#>'{tenant,userId}',false);
+ v_named:=sessions.ingest_identifier(p->'originId',false);
+ -- The claim's lock (ingest_lock_fences), held before the ownership read below. A claim that holds it
+ -- first finishes, and its ownership row is visible to that read; one that comes later waits for this erase.
+ PERFORM sessions.ingest_lock_fences(v_org,v_ws,v_user);
+ -- Listed before any fence: the selection deletes the ownership rows of the origin it fences.
+ FOR v_origin,v_sessions IN
+  WITH pairs AS (SELECT DISTINCT f.source,f.session_id FROM sessions.ingest_fence_pairs(p->'sessions') AS f),
+  targets AS (
+   SELECT o.origin_id,x.source,x.session_id FROM pairs AS x JOIN sessions.ingest_session_ownership AS o
+    ON o.org_id=v_org AND o.workspace_id=v_ws AND o.user_id=v_user AND o.source=x.source AND o.session_id=x.session_id
+   UNION SELECT v_named,x.source,x.session_id FROM pairs AS x
+   UNION SELECT c_turn_origin,x.source,x.session_id FROM pairs AS x)
+  SELECT t.origin_id,jsonb_agg(jsonb_build_array(t.source,t.session_id)) FROM targets AS t GROUP BY t.origin_id ORDER BY t.origin_id COLLATE "C"
+ LOOP
+  v_updated:=v_updated+(sessions.ingest_set_session_uploads_internal(jsonb_build_object('tenant',p->'tenant','originId',v_origin,'sessions',v_sessions,'enabled',false))->>'updated')::bigint;
+  -- src/session-ingest/writer.ts liveMachineId: the machine this origin's manifests are written under.
+  v_machine:='srv_'||left(encode(sha256(convert_to(v_ws||chr(31)||v_origin||chr(31)||v_user,'UTF8')),'hex'),32);
+  FOR v_pair IN SELECT f.source,f.session_id FROM sessions.ingest_fence_pairs(v_sessions) AS f LOOP
+   v_canonical:=NULL;
+   UPDATE sessions.session_index AS s SET deleted_at=coalesce(s.deleted_at,clock_timestamp()),indexed_at=clock_timestamp(),
+     revision=greatest(s.revision,c_erased_revision)
+    WHERE s.org_id=v_org AND s.workspace_id=v_ws AND s.harness=v_pair.source AND s.session_id=v_pair.session_id AND s.machine_id=v_machine
+    RETURNING coalesce(s.canonical_session_id,s.session_id) INTO v_canonical;
+   -- Only a session this caller actually has a pointer for: a selection naming someone else's session id
+   -- must not touch that session's directory row.
+   IF NOT FOUND THEN CONTINUE;END IF;
+   -- The retire trigger's directory write: clear derived text, tombstone only with no live pointer left.
+   UPDATE sessions.session_directory AS d SET short_summary=NULL,short_summary_scrub_ruleset=NULL,short_summary_scrub_version=NULL,
+     short_summary_source=NULL,short_summary_generated_at=NULL,
+     search_text=sessions.session_directory_search_text(d.title,d.task_title,d.agent_name,d.project_id,d.git_repo,d.git_branch,d.model,NULL),
+     deleted_at=CASE WHEN EXISTS(SELECT 1 FROM sessions.session_index AS q WHERE q.org_id=d.org_id AND q.workspace_id=d.workspace_id
+       AND q.harness=d.harness AND coalesce(q.canonical_session_id,q.session_id)=d.session_id AND q.deleted_at IS NULL)
+      THEN d.deleted_at ELSE coalesce(d.deleted_at,clock_timestamp()) END
+    WHERE d.org_id=v_org AND d.workspace_id=v_ws AND d.harness=v_pair.source AND d.session_id IN(v_pair.session_id,v_canonical);
+   -- 057030 (#566): the erased pointer's directory membership, kept as src/hoopdb/session-directory-projector.ts keeps
+   -- it: machines are coalesce(canonical_machine_id,machine_id) and users are user_id of the LIVE pointers of the logical
+   -- session; a tombstoned row has empty arrays and no membership rows at all.
+   SELECT coalesce(s.canonical_machine_id,s.machine_id),s.user_id INTO v_member_machine,v_member_user FROM sessions.session_index AS s
+    WHERE s.org_id=v_org AND s.workspace_id=v_ws AND s.harness=v_pair.source AND s.session_id=v_pair.session_id AND s.machine_id=v_machine;
+   FOR v_dir IN SELECT d.session_id,d.deleted_at IS NOT NULL AS gone,
+      EXISTS(SELECT 1 FROM sessions.session_index AS q WHERE q.org_id=d.org_id AND q.workspace_id=d.workspace_id AND q.harness=d.harness
+        AND coalesce(q.canonical_session_id,q.session_id)=d.session_id AND q.deleted_at IS NULL
+        AND coalesce(q.canonical_machine_id,q.machine_id)=v_member_machine) AS machine_live,
+      EXISTS(SELECT 1 FROM sessions.session_index AS q WHERE q.org_id=d.org_id AND q.workspace_id=d.workspace_id AND q.harness=d.harness
+        AND coalesce(q.canonical_session_id,q.session_id)=d.session_id AND q.deleted_at IS NULL
+        AND q.user_id=v_member_user) AS user_live
+     FROM sessions.session_directory AS d
+     WHERE d.org_id=v_org AND d.workspace_id=v_ws AND d.harness=v_pair.source AND d.session_id IN(v_pair.session_id,v_canonical)
+     ORDER BY d.session_id COLLATE "C"
+   LOOP
+    DELETE FROM sessions.session_directory_machines AS m WHERE m.org_id=v_org AND m.workspace_id=v_ws AND m.harness=v_pair.source
+      AND m.session_id=v_dir.session_id AND (v_dir.gone OR (m.machine_id=v_member_machine AND NOT v_dir.machine_live));
+    DELETE FROM sessions.session_directory_users AS u WHERE u.org_id=v_org AND u.workspace_id=v_ws AND u.harness=v_pair.source
+      AND u.session_id=v_dir.session_id AND (v_dir.gone OR (u.user_id=v_member_user AND NOT v_dir.user_live));
+    IF v_dir.gone OR NOT v_dir.machine_live OR NOT v_dir.user_live THEN
+     UPDATE sessions.session_directory AS d SET
+       machine_ids=CASE WHEN v_dir.gone THEN '{}'::text[] WHEN v_dir.machine_live THEN d.machine_ids ELSE array_remove(d.machine_ids,v_member_machine) END,
+       user_ids=CASE WHEN v_dir.gone THEN '{}'::text[] WHEN v_dir.user_live THEN d.user_ids ELSE array_remove(d.user_ids,v_member_user) END
+      WHERE d.org_id=v_org AND d.workspace_id=v_ws AND d.harness=v_pair.source AND d.session_id=v_dir.session_id;
+    END IF;
+   END LOOP;
+  END LOOP;
+ END LOOP;
+ RETURN jsonb_build_object('updated',v_updated);
+END $selfhost_selection$;
+
+-- sessions.ingest_reset_uploaded_sessions: latest body from 20261104055000_lazy_current_custody.sql, plus the control check.
+CREATE OR REPLACE FUNCTION sessions.ingest_reset_uploaded_sessions(p jsonb) RETURNS jsonb
+LANGUAGE plpgsql VOLATILE SECURITY DEFINER SET search_path=pg_catalog,pg_temp AS $reset$
+DECLARE t jsonb;v_org text;
+BEGIN
+ PERFORM sessions.ingest_org_admission_hold_check(sessions.ingest_identifier(p#>'{tenant,orgId}',false),'control'); -- 062320 org admission hold
+ PERFORM sessions.ingest_require_role('bulls96_session_ingest');
+ v_org:=p#>>'{tenant,orgId}';
+ IF EXISTS(SELECT 1 FROM sessions.ingest_lazy_policy WHERE singleton) OR p?'control' OR p?'generation'
+  OR EXISTS(SELECT 1 FROM sessions.ingest_buffer_admission WHERE org_id=v_org)
+  OR EXISTS(SELECT 1 FROM sessions.ingest_batches WHERE org_id=v_org AND publication_state='buffered') THEN
+  RETURN sessions.ingest_apply_ordered_control(p,'reset');
+ END IF;
+ PERFORM sessions.ingest_exact_keys(p,ARRAY['tenant','requestId']);
+ t:=p->'tenant';PERFORM sessions.ingest_exact_keys(t,ARRAY['orgId','workspaceId','userId']);
+ RETURN jsonb_build_object('deleted',sessions.ingest_apply_reset(
+  sessions.ingest_identifier(t->'orgId',false),sessions.ingest_identifier(t->'workspaceId',true),
+  sessions.ingest_identifier(t->'userId',false),sessions.ingest_identifier(p->'requestId',false)));
+END $reset$;
+
+-- sessions.ingest_turn_register: latest body from 20261105062020_turns_forward_gates.sql, plus the control check.
+CREATE OR REPLACE FUNCTION sessions.ingest_turn_register(p jsonb) RETURNS jsonb
+LANGUAGE plpgsql VOLATILE SECURITY DEFINER SET search_path=pg_catalog,pg_temp AS $register$
+DECLARE t jsonb;v_org text;v_ws text;v_user text;x record;v_fenced jsonb:='[]'::jsonb;
+BEGIN
+ PERFORM sessions.ingest_org_admission_hold_check(sessions.ingest_identifier(p#>'{tenant,orgId}',false),'control'); -- 062320 org admission hold
+ PERFORM sessions.ingest_require_role('bulls96_session_ingest');
+ PERFORM sessions.ingest_exact_keys(p,ARRAY['tenant','sessions']);
+ t:=p->'tenant';PERFORM sessions.ingest_exact_keys(t,ARRAY['orgId','workspaceId','userId']);
+ v_org:=sessions.ingest_identifier(t->'orgId',false);
+ v_ws:=sessions.ingest_identifier(t->'workspaceId',true);
+ v_user:=sessions.ingest_identifier(t->'userId',false);
+ PERFORM sessions.operator_user_erase_control_gate(v_org,v_ws,v_user);
+ IF jsonb_typeof(p->'sessions') IS DISTINCT FROM'array' OR jsonb_array_length(p->'sessions') NOT BETWEEN 1 AND 500
+ THEN RAISE EXCEPTION USING ERRCODE='22023',MESSAGE='turn register: sessions must contain 1..500 pairs';END IF;
+ FOR x IN SELECT f.source,f.session_id FROM sessions.ingest_fence_pairs(p->'sessions') f
+          ORDER BY f.source COLLATE "C",f.session_id COLLATE "C"
+ LOOP
+  PERFORM pg_advisory_xact_lock(hashtextextended(
+   v_org||chr(31)||v_ws||chr(31)||x.source||chr(31)||x.session_id,0));
+  INSERT INTO sessions.turn_writers(org_id,workspace_id,user_id,source,session_id)
+   VALUES(v_org,v_ws,v_user,x.source,x.session_id) ON CONFLICT DO NOTHING;
+  IF EXISTS(SELECT 1 FROM sessions.turn_session_fences q
+    WHERE q.org_id=v_org AND q.workspace_id=v_ws AND q.source=x.source AND q.session_id=x.session_id) THEN
+   PERFORM sessions.ingest_turn_materialize_fence(v_org,v_ws,x.source,x.session_id);
+   v_fenced:=v_fenced||jsonb_build_array(jsonb_build_array(x.source,x.session_id));
+  END IF;
+ END LOOP;
+ RETURN jsonb_build_object('fenced',v_fenced);
+END $register$;
+
+-- sessions.ingest_operator_runtime_begin: latest body from 20261105050020_operator_session_erase_runtime.sql, plus the erasure check.
+CREATE OR REPLACE FUNCTION sessions.ingest_operator_runtime_begin(p_org text,p_ws text,p_source text,p_session text,p_request text,p_actor_kind text,p_actor_id text,p_bucket text,p_key_root text,p_store_ref text) RETURNS jsonb
+LANGUAGE plpgsql VOLATILE SECURITY DEFINER SET search_path=pg_catalog,pg_temp AS $runtime_begin$
+DECLARE v_ids text[];v_id text;v_receipt jsonb;
+BEGIN
+ PERFORM sessions.ingest_org_admission_hold_check(p_org,'erasure'); -- 062320 org admission hold
+ PERFORM sessions.ingest_require_role('bulls96_session_ingest');
+ PERFORM pg_advisory_xact_lock(961996,50000);
+ -- Resume before consulting metadata already deleted by a prior attempt.
+ v_receipt:=sessions.ingest_operator_erase_receipt(p_org,p_ws,p_source,p_session);
+ IF v_receipt IS NOT NULL AND v_receipt->>'status'<>'failed' THEN RETURN v_receipt;END IF;
+ v_ids:=sessions.ingest_operator_runtime_ids(p_org,p_ws,p_source,p_session);
+ IF cardinality(v_ids)>256 THEN RAISE EXCEPTION USING ERRCODE='RH010',MESSAGE='operator erase: alias cap exceeded';END IF;
+ FOREACH v_id IN ARRAY v_ids LOOP
+  PERFORM pg_advisory_xact_lock(hashtextextended(concat_ws(chr(31),'96bulls:operator-write',p_org,p_ws,p_source,v_id),0));
+ END LOOP;
+ IF v_ids IS DISTINCT FROM sessions.ingest_operator_runtime_ids(p_org,p_ws,p_source,p_session) THEN
+  RAISE EXCEPTION USING ERRCODE='RH010',MESSAGE='operator erase: alias set changed while locking';END IF;
+ IF p_bucket IS NULL OR p_bucket='' OR p_key_root IS NULL OR p_key_root!~'^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$'
+  OR p_store_ref IS NULL OR p_store_ref!~'^[0-9a-f]{64}$'
+  OR EXISTS(SELECT 1 FROM unnest(ARRAY[p_org,p_ws,p_source]||v_ids) AS i WHERE i IS NULL OR i!~'^[A-Za-z0-9_-][A-Za-z0-9._-]{0,127}$')
+  OR EXISTS(SELECT 1 FROM sessions.session_index AS s WHERE s.org_id=p_org AND s.workspace_id=p_ws AND s.harness=p_source
+   AND(s.session_id=ANY(v_ids) OR s.canonical_session_id=ANY(v_ids)) AND(
+    s.storage_provider NOT IN('s3','r2') OR s.bucket IS DISTINCT FROM p_bucket
+    OR NOT sessions.ingest_operator_runtime_location_valid(p_key_root,p_org,p_ws,p_source,s.session_id,s.machine_id,s.manifest_key))) THEN
+  RAISE EXCEPTION USING ERRCODE='RH013',MESSAGE='operator erase: unsupported or ambiguous object location';END IF;
+ -- Source-agnostic analysis/queue tables cannot safely distinguish colliding source ids.
+ -- Refuse before tombstone triggers rather than deleting another source's analysis.
+ IF EXISTS(SELECT 1 FROM sessions.session_index WHERE org_id=p_org AND workspace_id=p_ws AND harness<>p_source
+   AND (session_id=ANY(v_ids) OR canonical_session_id=ANY(v_ids))) THEN
+  RAISE EXCEPTION USING ERRCODE='RH013',MESSAGE='operator erase: source collision requires scoped analysis support';END IF;
+ -- These pipelines have independent writers or mixed-session objects. They need their own drain
+ -- and redaction protocols; absence is verified, never assumed from a runtime flag.
+ IF EXISTS(SELECT 1 FROM sessions.ingest_history_scope_versions WHERE org_id=p_org AND workspace_id=p_ws AND harness=p_source AND session_id=ANY(v_ids))
+ OR EXISTS(SELECT 1 FROM sessions.ingest_publication_heads WHERE org_id=p_org AND workspace_id=p_ws AND source=p_source AND session_id=ANY(v_ids))
+ OR EXISTS(SELECT 1 FROM sessions.babysitter_retention_objects WHERE org_id=p_org AND workspace_id=p_ws AND source=p_source AND session_id=ANY(v_ids))
+ OR EXISTS(SELECT 1 FROM sessions.session_analysis_jobs_v2 WHERE org_id=p_org AND workspace_id=p_ws AND session_id=ANY(v_ids))
+ OR EXISTS(SELECT 1 FROM sessions.session_analysis_requests_v2 WHERE org_id=p_org AND workspace_id=p_ws AND session_id=ANY(v_ids))
+ OR EXISTS(SELECT 1 FROM sessions.session_analysis_result_tickets WHERE org_id=p_org AND workspace_id=p_ws AND session_id=ANY(v_ids))
+ OR EXISTS(SELECT 1 FROM sessions.session_large_read_jobs WHERE org_id=p_org AND workspace_id=p_ws AND harness=p_source AND session_id=ANY(v_ids) AND state='running')
+ OR EXISTS(SELECT 1 FROM sessions.session_analysis_wakeups WHERE org_id=p_org AND workspace_id=p_ws AND harness=p_source AND session_id=ANY(v_ids) AND lease_nonce IS NOT NULL)
+ OR EXISTS(SELECT 1 FROM sessions.daily_digest_narratives WHERE org_id=p_org AND workspace_id=p_ws)
+ OR EXISTS(SELECT 1 FROM pg_roles WHERE rolname='bulls96_digest_narrative' AND rolcanlogin)
+ OR EXISTS(SELECT 1 FROM sessions.session_brief_document_control WHERE live) THEN
+  RAISE EXCEPTION USING ERRCODE='RH013',MESSAGE='operator erase: independent artifact writer requires a drain protocol';END IF;
+ v_receipt:=sessions.ingest_operator_erase_session(p_org,p_ws,p_source,p_session,p_request,p_actor_kind,p_actor_id);
+ INSERT INTO sessions.session_erasure_scopes(org_id,workspace_id,source,session_id,target_session_id)
+ SELECT p_org,p_ws,p_source,p_session,i FROM unnest(v_ids) AS i ON CONFLICT DO NOTHING;
+ INSERT INTO sessions.session_erasure_runs(org_id,workspace_id,source,session_id,bucket,key_root,store_ref)
+ VALUES(p_org,p_ws,p_source,p_session,p_bucket,p_key_root,p_store_ref)
+ ON CONFLICT(org_id,workspace_id,source,session_id) DO UPDATE SET available_at=clock_timestamp();
+ RETURN v_receipt;
+END $runtime_begin$;
+
+-- sessions.operator_user_erase_begin: latest body from 20261105058010_operator_user_erase.sql, plus the erasure check.
+CREATE OR REPLACE FUNCTION sessions.operator_user_erase_begin(p_request text,p_org text,p_ws text,p_user text) RETURNS jsonb
+LANGUAGE plpgsql VOLATILE SET search_path=pg_catalog,pg_temp AS $begin$
+DECLARE v_org text;v_ws text;v_user text;v_request text;e sessions.operator_user_erasures%ROWTYPE;
+ v_origins text[];v_revoked integer;v_frontiers bigint;v_read_tokens bigint;
+BEGIN
+ PERFORM sessions.ingest_org_admission_hold_check(p_org,'erasure'); -- 062320 org admission hold
+ IF current_setting('transaction_isolation')<>'read committed' THEN
+  RAISE EXCEPTION USING ERRCODE='40001',MESSAGE='operator user erase: read-committed transaction required';END IF;
+ v_request:=sessions.ingest_identifier(to_jsonb(p_request),false);
+ v_org:=sessions.ingest_identifier(to_jsonb(p_org),false);
+ v_ws:=sessions.ingest_identifier(to_jsonb(p_ws),true);
+ v_user:=sessions.ingest_identifier(to_jsonb(p_user),false);
+ PERFORM pg_advisory_xact_lock(961996,50000);
+
+ SELECT * INTO e FROM sessions.operator_user_erasures WHERE request_id=v_request FOR UPDATE;
+ IF FOUND THEN
+  IF (e.org_id,e.workspace_id,e.user_id) IS DISTINCT FROM (v_org,v_ws,v_user) THEN
+   RAISE EXCEPTION USING ERRCODE='22023',MESSAGE='operator user erase: request id belongs to another user';END IF;
+  RETURN sessions.operator_user_erase_render(v_request);
+ END IF;
+ IF EXISTS(SELECT 1 FROM sessions.operator_user_erasures WHERE org_id=v_org AND workspace_id=v_ws AND user_id=v_user
+   AND state<>'bytes_verified') THEN
+  RAISE EXCEPTION USING ERRCODE='55000',MESSAGE='operator user erase: another request is active for this user';END IF;
+
+ -- The user's fence row (the buffered GC and publication's pointer guard take it), then the publication fence: a
+ -- publication or history-plan claim needs the user's frontier row FOR SHARE, so this DELETE waits out an
+ -- in-flight claim, and the probe below (a fresh read-committed snapshot) sees whatever it committed.
+ -- The row is created when absent (a user who never uploaded): it is the anchor every later writer waits on.
+ INSERT INTO sessions.ingest_fence_owners VALUES(v_org,v_ws,v_user) ON CONFLICT DO NOTHING;
+ PERFORM 1 FROM sessions.ingest_fence_owners WHERE org_id=v_org AND workspace_id=v_ws AND user_id=v_user FOR UPDATE;
+ DELETE FROM sessions.ingest_publication_frontiers WHERE org_id=v_org AND workspace_id=v_ws AND user_id=v_user;
+ GET DIAGNOSTICS v_frontiers=ROW_COUNT;
+
+ -- Published or canonical state is the per-session erase's (search documents, canonical bytes). Same probe in step.
+ IF EXISTS(SELECT 1 FROM sessions.session_index WHERE org_id=v_org AND workspace_id=v_ws AND user_id=v_user)
+  OR EXISTS(SELECT 1 FROM sessions.ingest_publication_heads WHERE org_id=v_org AND workspace_id=v_ws AND user_id=v_user)
+  OR EXISTS(SELECT 1 FROM sessions.ingest_publication_generations WHERE org_id=v_org AND workspace_id=v_ws AND user_id=v_user)
+  OR EXISTS(SELECT 1 FROM sessions.ingest_custody_records WHERE org_id=v_org AND workspace_id=v_ws AND user_id=v_user)
+  OR EXISTS(SELECT 1 FROM sessions.ingest_frozen_source_owned_sessions WHERE org_id=v_org AND workspace_id=v_ws AND user_id=v_user)
+  OR EXISTS(SELECT 1 FROM sessions.ingest_frozen_source_records WHERE org_id=v_org AND workspace_id=v_ws AND user_id=v_user)
+  OR EXISTS(SELECT 1 FROM sessions.ingest_record_revisions WHERE org_id=v_org AND workspace_id=v_ws AND user_id=v_user)
+  OR EXISTS(SELECT 1 FROM sessions.ingest_history_scope_owners WHERE org_id=v_org AND workspace_id=v_ws AND user_id=v_user)
+  OR EXISTS(SELECT 1 FROM sessions.ingest_history_privacy_outbox WHERE org_id=v_org AND workspace_id=v_ws AND user_id=v_user)
+  OR EXISTS(SELECT 1 FROM sessions.ingest_history_plans WHERE org_id=v_org AND workspace_id=v_ws AND user_id=v_user
+    AND state='published') THEN
+  RAISE EXCEPTION USING ERRCODE='RH040',
+   MESSAGE='operator user erase: the user has published sessions; erase them with the per-session operator erase first';
+ END IF;
+
+ SELECT coalesce(array_agg(DISTINCT o ORDER BY o),'{}') INTO v_origins FROM (
+  SELECT origin_id FROM sessions.ingest_batches WHERE org_id=v_org AND workspace_id=v_ws AND user_id=v_user
+  UNION SELECT origin_id FROM sessions.ingest_claim_attempts WHERE org_id=v_org AND workspace_id=v_ws AND user_id=v_user
+  UNION SELECT origin_id FROM sessions.ingest_stage_intents WHERE org_id=v_org AND workspace_id=v_ws AND user_id=v_user
+  UNION SELECT origin_id FROM sessions.ingest_buffer_outbox WHERE org_id=v_org AND workspace_id=v_ws AND user_id=v_user
+  UNION SELECT origin_id FROM sessions.ingest_session_ownership WHERE org_id=v_org AND workspace_id=v_ws AND user_id=v_user
+  UNION SELECT origin_id FROM sessions.upload_deletions WHERE org_id=v_org AND workspace_id=v_ws AND user_id=v_user
+  UNION SELECT origin_id FROM sessions.ingest_lazy_native_slots WHERE org_id=v_org AND workspace_id=v_ws AND current_owner=v_user
+ ) AS u(o);
+ -- Un-owned slots are erased by origin, so an origin must be this user's alone (a shared device origin would let
+ -- them belong to someone else). Never observed in production; refused rather than guessed.
+ IF EXISTS(SELECT 1 FROM sessions.ingest_batches WHERE org_id=v_org AND workspace_id=v_ws AND origin_id=ANY(v_origins) AND user_id<>v_user)
+  OR EXISTS(SELECT 1 FROM sessions.ingest_lazy_native_slots WHERE org_id=v_org AND workspace_id=v_ws AND origin_id=ANY(v_origins)
+    AND current_owner IS NOT NULL AND current_owner<>v_user) THEN
+  RAISE EXCEPTION USING ERRCODE='55000',MESSAGE='operator user erase: a device origin of this user is shared with another user';
+ END IF;
+
+ -- The ledger row is written in THIS transaction, which holds the fence row: from its commit on, every ingest
+ -- writer of the user that takes the fence row sees it and is refused (RH041).
+ -- Revoke the tokens THIS database holds: auth_sessions (revoked, rows kept: see the header) and the session read
+ -- API's read_api_tokens (deleted: that table has no revocation column and no mirror). relayhistory-cloud's Neon
+ -- auth_sessions is a separate store this function cannot reach; the runbook revokes it BEFORE begin, and until
+ -- then a Neon-held token still works against relayhistory-cloud and its mirror can still add rows here.
+ UPDATE sessions.auth_sessions SET revoked_at=clock_timestamp(),revoked_reason='operator_user_erase',updated_at=clock_timestamp()
+ WHERE org_id=v_org AND workspace_id=v_ws AND user_id=v_user AND revoked_at IS NULL;
+ GET DIAGNOSTICS v_revoked=ROW_COUNT;
+ DELETE FROM sessions.read_api_tokens WHERE org_id=v_org AND workspace_id=v_ws AND user_id=v_user;
+ GET DIAGNOSTICS v_read_tokens=ROW_COUNT;
+
+ INSERT INTO sessions.operator_user_erasures(request_id,org_id,workspace_id,user_id,state,origins,tokens_revoked,deleted)
+ VALUES(v_request,v_org,v_ws,v_user,'purging',v_origins,v_revoked,
+  jsonb_build_object('ingest_publication_frontiers',v_frontiers,'read_api_tokens',v_read_tokens));
+ RETURN sessions.operator_user_erase_render(v_request);
+END
+$begin$;
+
+-- sessions.ingest_origin_claim_buffered_batch: latest body from 20261105062010_ingest_origin_claim_fence.sql, plus the admission check FIRST,
+-- before the origin advisory and the transaction mark (design rev 4: the org key is the first lock).
+CREATE OR REPLACE FUNCTION sessions.ingest_origin_claim_buffered_batch(p jsonb) RETURNS jsonb
+LANGUAGE plpgsql VOLATILE SECURITY DEFINER SET search_path=pg_catalog,pg_temp AS $origin_claim$
+DECLARE v_mark xid8;v_result jsonb;
+BEGIN
+ PERFORM sessions.ingest_org_admission_hold_check(sessions.ingest_identifier(p#>'{tenant,orgId}',false),'admission'); -- 062320 org admission hold
+ v_mark:=sessions.ingest_origin_claim_enter(p);
+ v_result:=sessions.ingest_claim_buffered_batch(p);
+ PERFORM sessions.ingest_origin_claim_leave(v_mark);
+ RETURN v_result;
+END $origin_claim$;
+
+-- sessions.ingest_origin_prepare_buffer_stage: latest body from 20261105062010_ingest_origin_claim_fence.sql, plus the admission check FIRST,
+-- before the origin advisory and the transaction mark (design rev 4: the org key is the first lock).
+CREATE OR REPLACE FUNCTION sessions.ingest_origin_prepare_buffer_stage(p jsonb) RETURNS jsonb
+LANGUAGE plpgsql VOLATILE SECURITY DEFINER SET search_path=pg_catalog,pg_temp AS $origin_prepare$
+DECLARE v_mark xid8;v_result jsonb;
+BEGIN
+ PERFORM sessions.ingest_org_admission_hold_check(sessions.ingest_identifier(p#>'{tenant,orgId}',false),'admission'); -- 062320 org admission hold
+ v_mark:=sessions.ingest_origin_claim_enter(p);
+ v_result:=sessions.ingest_prepare_buffer_stage(p);
+ PERFORM sessions.ingest_origin_claim_leave(v_mark);
+ RETURN v_result;
+END $origin_prepare$;
+
+-- sessions.ingest_origin_commit_buffered_batch: latest body from 20261105062010_ingest_origin_claim_fence.sql, plus the admission check FIRST,
+-- before the origin advisory and the transaction mark (design rev 4: the org key is the first lock).
+CREATE OR REPLACE FUNCTION sessions.ingest_origin_commit_buffered_batch(p jsonb) RETURNS jsonb
+LANGUAGE plpgsql VOLATILE SECURITY DEFINER SET search_path=pg_catalog,pg_temp AS $origin_commit$
+DECLARE v_mark xid8;v_result jsonb;
+BEGIN
+ PERFORM sessions.ingest_org_admission_hold_check(sessions.ingest_identifier(p#>'{tenant,orgId}',false),'admission'); -- 062320 org admission hold
+ v_mark:=sessions.ingest_origin_claim_enter(p);
+ v_result:=sessions.ingest_commit_buffered_batch(p);
+ PERFORM sessions.ingest_origin_claim_leave(v_mark);
+ RETURN v_result;
+END $origin_commit$;
