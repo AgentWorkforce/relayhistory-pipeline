@@ -586,4 +586,24 @@ describe("round-5 controls", () => {
     expect(main(["packets", "--features", join(dir.path, "good.json"), "--out", out])).toBe(0);
     expect(existsSync(join(out, "packets.jsonl"))).toBe(true);
   });
+
+  test("every as-of entry point refuses a cut finer than a millisecond, called directly", () => {
+    const fine = "2026-01-01T00:00:00.000999Z";
+    const s = { source: "claude", sessionId: "s", analyzedAt: "2026-01-01T00:00:00.000Z", startedAt: "2026-01-01T00:00:00.000Z", endedAt: "2026-01-01T00:00:00.000Z", title: "", asked: [], built: [], gaps: [], rationale: [], outcomeStatuses: [], dropped: {}, keys: { repo: "example/widgets", branches: [], prs: [], commits: [], files: [], taskRefs: [], parents: [] } } as SessionFacts;
+    const forge = { prs: [], commits: [], flags: [] };
+    expect(() => factsAt(s, fine)).toThrow(/millisecond/);
+    expect(() => deriveState([s], forge, fine)).toThrow(/millisecond/);
+    expect(() => withCommitBranches(s, forge, fine)).toThrow(/millisecond/);
+    expect(() => buildFeatures([], { asOf: fine })).toThrow(/millisecond/);
+    expect(() => buildFeatures([s], { asOf: fine })).toThrow(/millisecond/);
+    // A whole-millisecond cut still works, and a session strictly before it is kept.
+    expect(factsAt(s, "2026-01-01T00:00:00.001Z")).not.toBeNull();
+  });
+
+  test("offsets stop at ±14:00", () => {
+    expect(utc("2026-01-01T00:00:00+14:00")).toBe("2025-12-31T10:00:00.000Z");
+    expect(utc("2026-01-01T00:00:00-14:00")).toBe("2026-01-01T14:00:00.000Z");
+    for (const bad of ["2026-01-01T00:00:00+14:01", "2026-01-01T00:00:00-14:01", "2026-01-01T00:00:00+14:59", "2026-01-01T00:00:00-14:59"]) expect(utc(bad)).toBeNull();
+    expect(utc("2026-01-01T00:00:00+13:59")).toBe("2025-12-31T10:01:00.000Z");
+  });
 });

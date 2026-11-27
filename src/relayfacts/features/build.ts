@@ -10,7 +10,7 @@
 import { stableId } from "./extract.ts";
 import { DEFAULT_LINK_PARAMS, linkSessions, type LinkParams } from "./link.ts";
 import type { EvidencePointer, FeatureRecord, FeatureState, ForgeFacts, SessionFacts } from "./types.ts";
-import { EMPTY_FORGE, requireUtc, sessionKeyString, textCompare, utcForge } from "./types.ts";
+import { EMPTY_FORGE, requireCut, sessionKeyString, textCompare, utcForge } from "./types.ts";
 
 export const ABANDON_AFTER_MS = 21 * 24 * 3_600_000;
 export const MAX_FEATURE_QUOTES = 20;
@@ -32,7 +32,7 @@ export interface BuildOptions {
  * The directory's own facts (repository, parent sessions) are known from the session's start.
  */
 export function factsAsOf(f: SessionFacts, asOfIn: string): SessionFacts | null {
-  const asOf = requireUtc(asOfIn, "asOf");
+  const asOf = requireCut(asOfIn, "asOf");
   if (f.startedAt >= asOf) return null;
   const ended = f.endedAt < asOf;
   const seen = (at: string | null) => (at === null ? ended : at < asOf);
@@ -69,7 +69,7 @@ export function factsAsOf(f: SessionFacts, asOfIn: string): SessionFacts | null 
 interface StateResult { state: FeatureState; basis: "forge" | "analysis"; reason: string }
 
 export function deriveState(sessions: readonly SessionFacts[], forgeIn: ForgeFacts, asOfIn: string, unknownFlagDefault: "on" | "off" = "off"): StateResult {
-  const forge = utcForge(forgeIn), asOf = requireUtc(asOfIn, "asOf");
+  const forge = utcForge(forgeIn), asOf = requireCut(asOfIn, "asOf");
   const built = sessions.flatMap((s) => s.built);
   const shas = new Set(built.filter((b) => b.kind === "commit").map((b) => b.ref!));
   const prUrls = new Set(built.filter((b) => b.kind === "pr").map((b) => b.ref!));
@@ -159,7 +159,7 @@ export const MAX_COMMIT_BRANCHES = 2;
  * `asOf`); a branch the mirror shows only later is never used for an earlier replay.
  */
 export function withCommitBranches(f: SessionFacts, forgeIn: ForgeFacts, asOfIn: string): SessionFacts {
-  const forge = utcForge(forgeIn), asOf = requireUtc(asOfIn, "asOf");
+  const forge = utcForge(forgeIn), asOf = requireCut(asOfIn, "asOf");
   if (!f.keys.commits.length || !forge.branches?.length) return f;
   const known = forge.branches.filter((b) => b.tipAt < asOf);
   const added = new Set<string>();
@@ -175,7 +175,7 @@ export function withCommitBranches(f: SessionFacts, forgeIn: ForgeFacts, asOfIn:
 /** Stages 2 to 4: every feature record as of `asOf`. */
 export function buildFeatures(all: readonly SessionFacts[], options: BuildOptions): FeatureRecord[] {
   const forge = utcForge(options.forge ?? EMPTY_FORGE);
-  options = { ...options, asOf: requireUtc(options.asOf, "asOf") };
+  options = { ...options, asOf: requireCut(options.asOf, "asOf") };
   const facts = all.map((f) => factsAsOf(f, options.asOf)).filter((f): f is SessionFacts => f !== null).map((f) => withoutBaseCommits(f, forge)).map((f) => withCommitBranches(f, forge, options.asOf));
   const { groups, links } = linkSessions(facts, options.link ?? DEFAULT_LINK_PARAMS);
   return groups.map((sessions) => {

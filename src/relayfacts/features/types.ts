@@ -191,7 +191,7 @@ export function utc(t: string | null | undefined): string | null {
   const day = new Date(Date.UTC(y!, mo! - 1, d!));
   if (day.getUTCFullYear() !== y || day.getUTCMonth() !== mo! - 1 || day.getUTCDate() !== d) return null;
   if (h! > 23 || mi! > 59 || Number(s) > 59) return null;
-  if (m[8] !== "Z" && (Number(m[9]) > 14 || Number(m[10]) > 59)) return null;
+  if (m[8] !== "Z" && (Number(m[9]) > 14 || Number(m[10]) > 59 || (Number(m[9]) === 14 && Number(m[10]) > 0))) return null;
   const ms = Date.parse(floored(m));
   return Number.isFinite(ms) ? new Date(ms).toISOString() : null;
 }
@@ -213,6 +213,13 @@ export function utcCut(t: string | null | undefined): string | null {
   const m = INSTANT.exec(t);
   if (!m || /[1-9]/u.test((m[7] ?? "").slice(3))) return null;
   return utc(t);
+}
+
+/** The cut, or a refusal naming only its role: every as-of entry point takes its cut through this, never `requireUtc`. */
+export function requireCut(t: string | null | undefined, role: string): string {
+  const v = utcCut(t);
+  if (v === null) throw new TypeError(`${role} is not a valid zoned ISO 8601 instant at millisecond precision`);
+  return v;
 }
 
 /** The instant, or a refusal naming only the role of the value (never the value). */
