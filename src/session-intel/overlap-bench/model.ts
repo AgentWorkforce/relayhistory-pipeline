@@ -85,6 +85,9 @@ function fromFacts(s: Session, events: EventFacts[], observed: ObservedPolicy) {
     }
     if (first) baseline = new Set(seen);
     const creates = e.gh.includes("pr-create");
+    // Only a call that is exactly one `gh pr create` may have its result claim a PR; a compound call is an act
+    // of opening a PR that owns nothing (its result could come from another segment).
+    const claimable = e.gh.includes("pr-create-sole");
     // A create call usually names no number; its own result does. Only the call's own result may claim it: the
     // very next raw event (by `seq`, counting events that were not kept), a tool result, within CREATE_RESULT_NS,
     // not failed. Facts carry no tool-use id, so with parallel calls (the next raw event is another call) or without
@@ -113,7 +116,7 @@ function fromFacts(s: Session, events: EventFacts[], observed: ObservedPolicy) {
       for (const ref of e.prRefs) pushMention(s, ref, e.ts);
       if (creates) {
         s.prs.push({ ts: e.ts, repo: s.repo?.toLowerCase() ?? null, number: -1, action: "create" });
-        pendingCreate = { ts: e.ts, index: s.prs.length - 1, seq: e.seq };
+        pendingCreate = claimable ? { ts: e.ts, index: s.prs.length - 1, seq: e.seq } : null;
       }
     }
     for (const b of e.branches) s.branches.push({ ts: e.ts, name: b });

@@ -5,7 +5,7 @@
  */
 import { createHash } from "node:crypto";
 import { canonicalTs } from "./instant.ts";
-import { ghCommands } from "./commands.ts";
+import { ghCommands, soleCreate } from "./commands.ts";
 
 export interface RawEvent {
   eventId: string;
@@ -23,7 +23,8 @@ export interface RawEvent {
 }
 
 export type GitOp = "commit" | "push" | "checkout" | "switch" | "branch" | "rebase" | "merge" | "revert" | "reset" | "cherry-pick" | "worktree" | "pull" | "fetch" | "stash";
-export type GhOp = "pr-create" | "pr-merge" | "pr-close" | "pr-view" | "pr-checkout" | "pr-comment" | "pr-review" | "pr-list" | "issue-create" | "api";
+/** `pr-create-sole`: the call is exactly one `gh pr create` (commands.ts soleCreate), so its result may claim the PR. */
+export type GhOp = "pr-create" | "pr-create-sole" | "pr-merge" | "pr-close" | "pr-view" | "pr-checkout" | "pr-comment" | "pr-review" | "pr-list" | "issue-create" | "api";
 
 export interface RelayEnvelope { from: string; to: string; messageId: string | null }
 
@@ -158,7 +159,7 @@ export function eventFacts(e: RawEvent): EventFacts {
     files: cap((e.filesTouched ?? []).filter((f) => typeof f === "string" && looksLikePath(f))),
     touched: touchedPaths(text, isCall, isResult),
     git: cap([...commandText.matchAll(GIT)].map((m) => m[1] as GitOp)),
-    gh: cap(ghOps(gh)),
+    gh: cap([...ghOps(gh), ...(isCall && soleCreate(text) ? ["pr-create-sole" as const] : [])]),
     branches: cap(branches), prRefs: cap(prRefs),
     shas: isResult ? cap([...text.matchAll(COMMIT_OUT)].map((m) => m[1]!)) : [],
     relay: relayMatch ? { from: relayMatch[1]!, to: relayMatch[2]!, messageId: relayMatch[3] ?? null } : null,

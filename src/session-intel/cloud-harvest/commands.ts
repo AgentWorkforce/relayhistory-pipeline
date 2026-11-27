@@ -21,12 +21,19 @@ const MAX_DEPTH = 3;
 const INDIRECT = new Set(["sudo", "doas", "env", "command", "builtin", "exec", "eval", "time", "nohup", "nice", "timeout", "xargs", "watch", "source", ".", "su", "script", "ssh"]);
 const SHELLS = new Set(["bash", "sh", "zsh", "dash", "ksh", "fish"]);
 
+type Sep = ";" | "&&" | "||" | "|";
+/** One segment's words and the connector joining it to the previous segment (null for the first). */
+interface Segment { words: string[]; after: Sep | null }
 /** Splits at unquoted `;`, `&&`, `||`, `|` and newlines into segments of words. Null on any refused construct. */
-function parse(text: string): string[][] | null {
-  const segs: string[][] = [];
-  let words: string[] = [], cur = "", inWord = false, quote: "'" | '"' | null = null;
+function parse(text: string): Segment[] | null {
+  const segs: Segment[] = [];
+  let words: string[] = [], cur = "", inWord = false, quote: "'" | '"' | null = null, pending: Sep | null = null;
   const endWord = () => { if (inWord) words.push(cur); cur = ""; inWord = false; };
-  const endSeg = () => { endWord(); if (words.length) segs.push(words); words = []; };
+  const endSeg = (sep: Sep) => {
+    endWord();
+    if (words.length) { segs.push({ words, after: segs.length ? pending : null }); words = []; pending = sep; }
+    else if (segs.length && sep !== ";") pending = sep; // `a && \n b`: keep the stronger connector
+  };
   for (let i = 0; i < text.length; i++) {
     const c = text[i]!;
     if (quote === "'") { if (c === "'") quote = null; else cur += c; continue; }
@@ -40,13 +47,14 @@ function parse(text: string): string[][] | null {
     if (c === "\\") { if (i + 1 >= text.length) return null; if (text[i + 1] !== "\n") { cur += text[i + 1]; inWord = true; } i++; continue; }
     if (c === "#" && !inWord) return null;
     if (c === "`" || c === "(" || c === ")" || (c === "$" && text[i + 1] === "(") || (c === "<" && text[i + 1] === "<")) return null;
-    if (c === "&") { if (text[i + 1] === "&") { i++; endSeg(); continue; } if (text[i - 1] === ">" || text[i + 1] === ">") { cur += c; inWord = true; continue; } return null; }
-    if (c === ";" || c === "\n" || c === "|") { if (c === "|" && text[i + 1] === "|") i++; endSeg(); continue; }
+    if (c === "&") { if (text[i + 1] === "&") { i++; endSeg("&&"); continue; } if (text[i - 1] === ">" || text[i + 1] === ">") { cur += c; inWord = true; continue; } return null; }
+    if (c === ";" || c === "\n") { endSeg(";"); continue; }
+    if (c === "|") { if (text[i + 1] === "|") { i++; endSeg("||"); } else endSeg("|"); continue; }
     if (c === " " || c === "\t") { endWord(); continue; }
     cur += c; inWord = true;
   }
   if (quote) return null;
-  endSeg();
+  endSeg(";");
   return segs;
 }
 
@@ -56,7 +64,8 @@ function commands(script: string, depth: number): string[][] | null {
   const segs = parse(script);
   if (!segs) return null;
   const out: string[][] = [];
-  for (let w of segs) {
+  for (const { words } of segs) {
+    let w = words;
     while (w.length && /^[A-Za-z_][A-Za-z0-9_]*=/.test(w[0]!)) w = w.slice(1);
     if (!w.length) continue;
     const prog = w[0]!.split("/").pop()!;
@@ -93,6 +102,30 @@ export function executedCommands(text: string): string[][] {
   const script = scriptOf(text);
   if (script === null) return [];
   return commands(script, 0) ?? [];
+}
+
+/**
+ * Whether the call is exactly one `gh pr create` invocation, so that its result's output can only have come from it:
+ * the whole script (or the one `sh -c` script it runs) is `gh pr create …`, optionally after `cd <dir> &&` steps
+ * (which print nothing and stop the chain on failure), and nothing follows it. A compound call such as
+ * `true || gh pr create; printf <url>` can succeed and print a URL without running gh, so it claims nothing.
+ */
+export function soleCreate(text: string): boolean {
+  if (!text || text.length > MAX_TEXT) return false;
+  let script = scriptOf(text);
+  for (let depth = 0; script !== null && depth <= MAX_DEPTH; depth++) {
+    const segs = parse(script);
+    if (!segs || !segs.length) return false;
+    const strip = (w: string[]) => { let x = w; while (x.length && /^[A-Za-z_][A-Za-z0-9_]*=/.test(x[0]!)) x = x.slice(1); return x; };
+    const last = strip(segs.at(-1)!.words), prog = last[0]?.split("/").pop();
+    const prefixOk = segs.slice(0, -1).every((g) => { const w = strip(g.words); return w[0] === "cd" && w.length <= 2; })
+      && segs.slice(1).every((g) => g.after === "&&");
+    if (!prefixOk) return false;
+    if (prog === "gh") return last[1] === "pr" && last[2] === "create";
+    if (prog && SHELLS.has(prog) && segs.length === 1 && last.length === 3 && (last[1] === "-c" || last[1] === "-lc")) { script = last[2]!; continue; }
+    return false;
+  }
+  return false;
 }
 
 /** The `gh` commands a tool call executes, each as its arguments after `gh`. */
