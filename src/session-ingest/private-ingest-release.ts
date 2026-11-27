@@ -360,7 +360,7 @@ export function privateIngestCutoverFromEnv(env: Record<string, string | undefin
 }
 
 /** The cutover controls a live version carries (its plain-text INGEST_* bindings), shape-checked. */
-function liveCutover(version: CloudflareWorkerVersion): PrivateIngestCutover {
+export function liveCutover(version: CloudflareWorkerVersion): PrivateIngestCutover {
   const bindings = Array.isArray(version.resources?.bindings) ? version.resources.bindings : [];
   const text = (name: string) => {
     const rows = bindings.filter((binding) => binding.name === name);
