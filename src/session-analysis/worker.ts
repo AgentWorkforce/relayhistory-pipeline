@@ -32,6 +32,7 @@ import type { AnalysisModelTransport } from "./engine/model.ts";
 import type { AnalysisEvidenceDeps } from "./evidence.ts";
 import { type ClaimsPort, claimsHook } from "./claims.ts";
 import { type DecisionRecordsSink, decisionRecordsHook } from "./decision-records.ts";
+import { type RelayfactsPluginRuntime, relayfactsPluginHook } from "./pipeline-plugins.ts";
 import { type AnalysisJob, type AnalysisJobOutput, runAnalysisJob } from "./processor.ts";
 import { postgresAnalysisJobStore, sweepAnalysisTickets } from "./store.ts";
 import type { PagedEraser } from "../migration/neon-s3-erasure/eraser.ts";
@@ -184,6 +185,11 @@ export function analysisTick(deps: {
    */
   claims?: ClaimsPort;
   /**
+   * The default-off pipeline-plugin adapter for relayfacts. When present it owns both writer
+   * deliveries; when absent the legacy decisionRecords/claims path above remains unchanged.
+   */
+  relayfactsPlugin?: RelayfactsPluginRuntime;
+  /**
    * The scheduled-job gate (claims-scheduler.ts scheduledJobGate), wired whenever analysis runs (runtime-deps.ts,
    * whatever the claims flags say): a job the claims scheduler enqueued is failed as `claims_control_off` instead of
    * run while its workspace 'claims' control is off (counted `cancelled` and `scheduled_control_off`). Absent =
@@ -228,7 +234,11 @@ export function analysisTick(deps: {
           transport: deps.transport,
           assumeNoLegacyTurns: deps.config.assumeNoLegacyTurns,
           cutoverProof: deps.config.cutoverProof,
-          ...(deps.decisionRecords ? { onCompleted: relayfactsHook(deps.decisionRecords, deps.claims, counts) } : {}),
+          ...(deps.relayfactsPlugin
+            ? { onCompleted: relayfactsPluginHook(deps.relayfactsPlugin, counts) }
+            : deps.decisionRecords
+              ? { onCompleted: relayfactsHook(deps.decisionRecords, deps.claims, counts) }
+              : {}),
           ...(admit ? { admit } : {}),
         },
         { leaseSeconds: deps.config.leaseSeconds },

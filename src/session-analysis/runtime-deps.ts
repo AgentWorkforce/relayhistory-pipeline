@@ -21,6 +21,11 @@ import { sessionIntelControls } from "../shared/session-intel-controls.ts";
 import { postgresClaimsPort, sessionIntelClaimsEnabled } from "./claims.ts";
 import { scheduledJobGate } from "./claims-scheduler.ts";
 import { decisionRecordsEnabled, postgresDecisionRecordsSink } from "./decision-records.ts";
+import {
+  type PipelinePluginPolicy,
+  relayfactsPluginEnabled,
+  relayfactsPluginRuntime,
+} from "./pipeline-plugins.ts";
 import { analysisConfig, type analysisTick } from "./worker.ts";
 
 export type AnalysisTickDeps = Parameters<typeof analysisTick>[0];
@@ -65,6 +70,11 @@ export interface AnalysisRuntimeInputs {
   env?: NodeJS.ProcessEnv;
   /** Test-only port; production always uses createS3Eraser. */
   eraserFactory?: (config: S3EraserConfig) => PagedEraser;
+  /**
+   * Operator-owned per-workspace plugin control and quota hook. The adapter fails closed when its
+   * flag is on without this hook. Numeric quota/model-spend limits are intentionally external.
+   */
+  pluginPolicy?: PipelinePluginPolicy;
 }
 
 export function analysisTickDeps(inputs: AnalysisRuntimeInputs): AnalysisTickDeps {
@@ -96,12 +106,21 @@ export function analysisTickDeps(inputs: AnalysisRuntimeInputs): AnalysisTickDep
     // SUMMARY_DECISION_RECORDS_ENABLED is the outer gate (decisions, unchanged); SESSION_INTEL_CLAIMS_ENABLED
     // inside it adds the claims port (claims.ts) next to it.
     ...(decisionRecordsEnabled(env)
-      ? {
-          decisionRecords: postgresDecisionRecordsSink(inputs.db),
-          ...(sessionIntelClaimsEnabled(env)
-            ? { claims: postgresClaimsPort(inputs.db, sessionIntelControls(inputs.db)) }
-            : {}),
-        }
+      ? (() => {
+          const decisions = postgresDecisionRecordsSink(inputs.db);
+          const claims = sessionIntelClaimsEnabled(env)
+            ? postgresClaimsPort(inputs.db, sessionIntelControls(inputs.db))
+            : undefined;
+          return relayfactsPluginEnabled(env)
+            ? {
+                relayfactsPlugin: relayfactsPluginRuntime({
+                  decisions,
+                  ...(claims ? { claims } : {}),
+                  ...(inputs.pluginPolicy ? { policy: inputs.pluginPolicy } : {}),
+                }),
+              }
+            : { decisionRecords: decisions, ...(claims ? { claims } : {}) };
+        })()
       : {}),
     // The claims kill switch's worker side, whenever analysis runs, whatever the claims flags say: a job the
     // claims scheduler enqueued is failed as claims_control_off while its workspace control is off. Without
