@@ -29,6 +29,8 @@ import {
 import { applySupabaseSchema } from "./pglite-schema.ts";
 
 setDefaultTimeout(300_000);
+/** Every proof in these tests binds the FULL run FULL (the dry dispatch's full_backfill_run). */
+const proof = (org: string, epoch: string | null, cut: number, rows: readonly Record<string, unknown>[]) => erasureWindowProof(org, epoch, cut, rows, FULL);
 const ORG = "11111111-2222-4333-8444-555555555555", ORG2 = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee";
 const E = "0f0e0d0c-0b0a-4908-8706-050403020100", E2 = "1f0e0d0c-0b0a-4908-8706-050403020100";
 const NOW = Date.parse("2026-11-27T12:00:00Z"), CUT = NOW - 6 * 3600_000, SEALED = NOW - 3600_000;
@@ -85,7 +87,7 @@ test("the read: one statement over every source plus the status; an org with not
   const rows = await read();
   expect(rows.length).toBe(1);
   for (const t of Object.keys(ERASURE_SOURCES)) expect(Number(rows[0]![t])).toBe(0);
-  const p = erasureWindowProof(ORG, null, CUT, rows);
+  const p = proof(ORG, null, CUT, rows);
   expect([p.status, p.reason, p.epoch_hash, p.hold_state, p.watermark_erasures]).toEqual(["erasure_window_empty", "ok", epochHash(E), "sealed", 0]);
   expect(JSON.stringify(p)).not.toContain(E); // the epoch is a typed hash, never the raw UUID
   expect(validErasureWindowProof(p)).toBe(true);
@@ -99,50 +101,68 @@ test("the read: an upload deletion, an in-flight old user erase, a fence in the 
   await d.exec(`INSERT INTO sessions.session_erasure_fences (org_id, workspace_id, source, session_id, created_at) VALUES ('${ORG2}', 'w', 'claude', 's-old', ${ts(CUT - 1000)});
     INSERT INTO sessions.operator_user_erasures (request_id, org_id, workspace_id, user_id, state, origins, created_at, updated_at, metadata_purged_at, bytes_verified_at)
       VALUES ('done', '${ORG2}', 'w', 'u-done', 'bytes_verified', ARRAY[]::text[], ${ts(CUT - 9000)}, ${ts(CUT - 8000)}, ${ts(CUT - 8000)}, ${ts(CUT - 8000)});`);
-  expect(erasureWindowProof(ORG2, null, CUT, await read(ORG2)).status).toBe("erasure_window_empty");
+  expect(proof(ORG2, null, CUT, await read(ORG2)).status).toBe("erasure_window_empty");
   // A user deletion (upload_deletions) in the window: not empty.
   await d.exec(`INSERT INTO sessions.upload_deletions (org_id, workspace_id, user_id, origin_id, source, session_id, deleted_at)
     VALUES ('${ORG2}', 'w', 'u', 'o', 'claude', 's-del', ${ts(CUT + 1000)});`);
-  let p = erasureWindowProof(ORG2, null, CUT, await read(ORG2));
+  let p = proof(ORG2, null, CUT, await read(ORG2));
   expect([p.status, p.reason, p.sources?.upload_deletions]).toEqual(["erasure_window_nonempty", "erasures_in_window", 1]);
   await d.exec(`DELETE FROM sessions.upload_deletions WHERE org_id = '${ORG2}';`);
   // An OLD user erase still purging (created before the cutoff, not bytes_verified): in flight, so not empty.
   await d.exec(`INSERT INTO sessions.operator_user_erasures (request_id, org_id, workspace_id, user_id, state, origins, created_at, updated_at)
     VALUES ('open', '${ORG2}', 'w', 'u-open', 'purging', ARRAY['o'], ${ts(CUT - 9000)}, ${ts(CUT - 9000)});`);
-  p = erasureWindowProof(ORG2, null, CUT, await read(ORG2));
+  p = proof(ORG2, null, CUT, await read(ORG2));
   expect([p.status, p.sources?.operator_user_erasures]).toEqual(["erasure_window_nonempty", 1]);
   // Another org's rows never count for ORG.
-  expect(erasureWindowProof(ORG, null, CUT, await read(ORG)).status).toBe("erasure_window_empty");
+  expect(proof(ORG, null, CUT, await read(ORG)).status).toBe("erasure_window_empty");
 });
 
-test("the bound history cutoff is compared in SQL at microsecond precision (real PGlite, 062340 status shape)", async () => {
+test("revised 062340 (real PGlite): cutoff = the hold's installed_at, the bound FULL is this run's and started after install, no later than seal", async () => {
   const d = await db();
-  const cut = Date.parse("2026-11-27T12:00:00.000Z");
+  const cut = Date.parse("2026-11-27T12:00:00.000Z"); // the gate's FULL cutoff: snapshot counts only
   const ORG3 = "33333333-2222-4333-8444-555555555555";
   const set = async (st: Record<string, unknown>) =>
     d.query("INSERT INTO sessions._stub_hold VALUES ($1, $2::jsonb) ON CONFLICT (org) DO UPDATE SET status = EXCLUDED.status", [ORG3, JSON.stringify(st)]);
-  const proofAt = async () => {
+  const proofAt = async (fullRun: string | null = FULL) => {
     let rows: readonly Record<string, unknown>[] = [];
     try { rows = (await d.query<Record<string, unknown>>(ERASURE_WINDOW_SQL, [ORG3, String(cut)])).rows; } catch { rows = []; }
-    const p = erasureWindowProof(ORG3, null, cut, rows);
-    expect(authorityReceiptSummary("bridge", JSON.parse(JSON.stringify({ mode: "dry_run", tool: "bridge_window", org_count: 1, all_empty: p.status === "erasure_window_empty", per_org: [p] })), { orgs: [ORG3], cutoffMs: cut }).ok).toBe(true);
+    const p = erasureWindowProof(ORG3, null, cut, rows, fullRun);
+    expect(authorityReceiptSummary("bridge", JSON.parse(JSON.stringify({ mode: "dry_run", tool: "bridge_window", org_count: 1, all_empty: p.status === "erasure_window_empty",
+      per_org: [p] })), { orgs: [ORG3], cutoffMs: cut }).ok).toBe(true);
     return [p.status, p.reason];
   };
-  const hold = sealedHold({ sealed_at: "2026-11-27T11:00:00Z" });
-  const hist = (cutoff: unknown, h: Record<string, unknown> = {}) => ({ hold, erasures: cutoff === null ? null : 0,
-    erasure_history: { cutoff, covered: cutoff === null ? null : true, recording: true, by_source: cutoff === null ? null : {}, coverage_started_at: "2026-11-20T00:00:00Z", ...h } });
-  await set(hist("2026-11-27T12:00:00.000000Z"));
-  expect(await proofAt()).toEqual(["erasure_window_empty", "ok"]); // exact: bound to this cutoff
-  await set(hist("2026-11-27T12:00:00.000001Z"));
+  // installed 11:00:00.123456, sealed 13:00 (after the read's statement time? no: read happens now, after both).
+  const installed = "2026-11-27T11:00:00.123456Z";
+  const hold = sealedHold({ installed_at: installed, sealed_at: "2026-11-27T13:00:00Z" });
+  const hist = (h: Record<string, unknown> = {}) => ({ hold, erasures: 0,
+    erasure_history: { cutoff: installed, full_run: FULL, full_started_at: "2026-11-27T11:30:00Z", covered: true, recording: true, by_source: {},
+      coverage_started_at: "2026-11-20T00:00:00Z", ...h } });
+  await set(hist());
+  expect(await proofAt()).toEqual(["erasure_window_empty", "ok"]); // cutoff exactly installed_at, at microseconds
+  await set(hist({ cutoff: "2026-11-27T11:00:00.123457Z" }));
   expect(await proofAt()).toEqual(["erasure_window_unproven", "history_cutoff_mismatch"]); // +1 us
-  await set(hist("2026-11-27T11:59:59.999999Z"));
+  await set(hist({ cutoff: "2026-11-27T11:00:00.123455Z" }));
   expect(await proofAt()).toEqual(["erasure_window_unproven", "history_cutoff_mismatch"]); // -1 us
-  await set(hist(null));
+  await set(hist({ cutoff: "2026-11-27T11:00:00.123Z" }));
+  expect(await proofAt()).toEqual(["erasure_window_unproven", "history_cutoff_mismatch"]); // truncated to ms is not equal
+  // The bound FULL: exactly this run's, never inferred from caller input.
+  expect(await (async () => { await set(hist({ full_run: "999" })); return proofAt(); })()).toEqual(["erasure_window_unproven", "history_full_mismatch"]);
+  await set(hist());
+  expect(await proofAt(null)).toEqual(["erasure_window_unproven", "history_full_mismatch"]);
+  // Its start: strictly after the install, no later than the seal.
+  await set(hist({ full_started_at: installed }));
+  expect(await proofAt()).toEqual(["erasure_window_unproven", "history_full_order_invalid"]);
+  await set(hist({ full_started_at: "2026-11-27T13:00:00.000001Z" }));
+  expect(await proofAt()).toEqual(["erasure_window_unproven", "history_full_order_invalid"]);
+  await set(hist({ full_started_at: "2026-11-27T13:00:00Z" }));
+  expect(await proofAt()).toEqual(["erasure_window_empty", "ok"]); // equal to the seal is allowed
+  await set(hist({ cutoff: null, full_run: null, full_started_at: null, covered: null, by_source: null }));
+  await set({ ...hist({ cutoff: null, full_run: null, full_started_at: null, covered: null, by_source: null }), erasures: null });
   expect(await proofAt()).toEqual(["erasure_window_unproven", "history_unbound"]);
-  await set(hist("bad"));
+  await set(hist({ cutoff: "bad" }));
   expect(await proofAt()).toEqual(["erasure_window_unproven", "read_invalid"]);
-  await set(hist("2026-11-27T12:00:00Z", { covered: false }));
-  expect(await proofAt()).toEqual(["erasure_window_unproven", "history_not_covering_cutoff"]);
+  await set(hist({ recording: false }));
+  expect(await proofAt()).toEqual(["erasure_window_unproven", "history_not_recording"]);
   // 062320 alone: snapshot-only.
   await set({ hold, erasures: 0 });
   expect(await proofAt()).toEqual(["erasure_window_empty", "ok"]);
@@ -159,9 +179,9 @@ test("the source list is pinned to 062340's ORG_ERASURE_HISTORY_SOURCES once tha
 // ---- the proof ----
 
 test("the proof is empty only with every count 0, a live sealed or attempted hold, and a read after the seal", () => {
-  expect(erasureWindowProof(ORG, null, CUT, [row()]).status).toBe("erasure_window_empty");
-  expect(erasureWindowProof(ORG, E, CUT, [row()]).status).toBe("erasure_window_empty");
-  const reason = (r: Record<string, unknown>[], epoch: string | null = null) => erasureWindowProof(ORG, epoch, CUT, r).reason;
+  expect(proof(ORG, null, CUT, [row()]).status).toBe("erasure_window_empty");
+  expect(proof(ORG, E, CUT, [row()]).status).toBe("erasure_window_empty");
+  const reason = (r: Record<string, unknown>[], epoch: string | null = null) => proof(ORG, epoch, CUT, r).reason;
   expect(reason([row({ session_erasure_runs: "1" })])).toBe("erasures_in_window");
   expect(reason([row({ status: status(null) })])).toBe("hold_missing");
   expect(reason([row({ status: status({ ...sealedHold(), state: "released" }) })])).toBe("hold_missing");
@@ -171,43 +191,43 @@ test("the proof is empty only with every count 0, a live sealed or attempted hol
   // 062340's erasure history: bound at exactly this cutoff (SQL decides history_cutoff_matches), covered, recording,
   // self-consistent; otherwise held with a closed reason. Without it (062320 alone) the proof is snapshot-only.
   const eh = (h: Record<string, unknown>, erasures: unknown = 0, matches: unknown = true) =>
-    row({ status: { hold: sealedHold(), erasures, erasure_history: { cutoff: "2026-11-27T06:00:00Z", covered: true, recording: true, by_source: {},
-      coverage_started_at: "2026-11-20T00:00:00Z", ...h } }, history_cutoff_matches: matches });
-  expect(erasureWindowProof(ORG, null, CUT, [eh({})]).watermark_kind).toBe("erasure_history_all_sources");
+    row({ status: { hold: sealedHold(), erasures, erasure_history: { cutoff: "2026-11-27T06:00:00Z", full_run: FULL, full_started_at: "2026-11-27T07:00:00Z", covered: true, recording: true, by_source: {},
+      coverage_started_at: "2026-11-20T00:00:00Z", ...h } }, history_cutoff_matches: matches, history_full_ordered: true });
+  expect(proof(ORG, null, CUT, [eh({})]).watermark_kind).toBe("erasure_history_all_sources");
   expect(reason([eh({})])).toBe("ok");
   expect(reason([eh({ cutoff: null }, null, null)])).toBe("history_unbound");
   expect(reason([eh({}, 0, false)])).toBe("history_cutoff_mismatch");
   expect(reason([eh({ covered: false })])).toBe("history_not_covering_cutoff");
   expect(reason([eh({ recording: false })])).toBe("history_not_recording");
   expect(reason([eh({ by_source: { upload_deletions: 2 } }, 2)])).toBe("erasures_in_history");
-  expect(erasureWindowProof(ORG, null, CUT, [eh({ by_source: { upload_deletions: 2 } }, 2)]).status).toBe("erasure_window_nonempty");
+  expect(proof(ORG, null, CUT, [eh({ by_source: { upload_deletions: 2 } }, 2)]).status).toBe("erasure_window_nonempty");
   // Inconsistent or malformed history never proves anything.
   for (const bad of [eh({ by_source: { upload_deletions: 1 } }, 2), eh({ by_source: { not_a_source: 1 } }, 1), eh({ by_source: null }), eh({ covered: "yes" }),
     eh({ recording: null }), eh({}, 0, "yes"), eh({}, -1)])
-    expect(erasureWindowProof(ORG, null, CUT, [bad]).status).toBe("erasure_window_unproven");
+    expect(proof(ORG, null, CUT, [bad]).status).toBe("erasure_window_unproven");
   // 062320 alone (no erasure_history): snapshot-only, and a stray cutoff comparison is inconsistent.
-  expect(erasureWindowProof(ORG, null, CUT, [row()]).watermark_kind).toBe("surviving_two_tables");
-  expect(erasureWindowProof(ORG, null, CUT, [row({ history_cutoff_matches: true })]).status).toBe("erasure_window_unproven");
+  expect(proof(ORG, null, CUT, [row()]).watermark_kind).toBe("surviving_two_tables");
+  expect(proof(ORG, null, CUT, [row({ history_cutoff_matches: true })]).status).toBe("erasure_window_unproven");
   for (const bad of [[], [row(), row()], [row({ upload_resets: "-1" })], [row({ upload_resets: undefined })], [row({ status: "{" })], [row({ status: { hold: null } })],
     [row({ read_at_ms: "x" })]])
-    expect(erasureWindowProof(ORG, null, CUT, bad).status).toBe("erasure_window_unproven");
-  expect(codeSync(() => erasureWindowProof("org-a", null, CUT, [row()]))).toBe("erasure_window_input");
+    expect(proof(ORG, null, CUT, bad).status).toBe("erasure_window_unproven");
+  expect(codeSync(() => proof("org-a", null, CUT, [row()]))).toBe("erasure_window_input");
   // A marker_attempted hold also proves (the release happens from there).
-  expect(erasureWindowProof(ORG, null, CUT, [row({ status: status(sealedHold({ state: "marker_attempted", marker_attempted_at: new Date(SEALED + 1).toISOString() })) })]).status)
+  expect(proof(ORG, null, CUT, [row({ status: status(sealedHold({ state: "marker_attempted", marker_attempted_at: new Date(SEALED + 1).toISOString() })) })]).status)
     .toBe("erasure_window_empty");
   // An unbound epoch (an unreadable hold) never validates as empty.
-  const unproven = erasureWindowProof(ORG, null, CUT, []);
+  const unproven = proof(ORG, null, CUT, []);
   expect(unproven.epoch_hash).toBeNull();
   expect(validErasureWindowProof({ ...unproven, status: "erasure_window_empty", reason: "ok" })).toBe(false);
 });
 
 test("release on an empty window: refused unconditionally on this head, whatever the proof or its declared watermark", () => {
   const attempted = { epoch: E, state: "marker_attempted" };
-  const today = erasureWindowProof(ORG, null, CUT, [row()]);
+  const today = proof(ORG, null, CUT, [row()]);
   expect(today.watermark_kind).toBe("surviving_two_tables");
   // Even a proof that read 062340's history (empty, bound, covered, recording) is refused on this head.
-  const declared = erasureWindowProof(ORG, null, CUT, [row({ status: { hold: sealedHold(), erasures: 0, erasure_history: { cutoff: "2026-11-27T06:00:00Z", covered: true,
-    recording: true, by_source: {}, coverage_started_at: "2026-11-20T00:00:00Z" } }, history_cutoff_matches: true })]);
+  const declared = proof(ORG, null, CUT, [row({ status: { hold: sealedHold(), erasures: 0, erasure_history: { cutoff: "2026-11-27T06:00:00Z", full_run: FULL, full_started_at: "2026-11-27T07:00:00Z", covered: true,
+    recording: true, by_source: {}, coverage_started_at: "2026-11-20T00:00:00Z" } }, history_cutoff_matches: true, history_full_ordered: true })]);
   expect([declared.status, declared.watermark_kind]).toEqual(["erasure_window_empty", "erasure_history_all_sources"]);
   for (const p of [today, declared, { ...declared, watermark_kind: "erasure_history_all_sources" }, null, {}])
     for (const now of [NOW + 1, NOW + 1000])
@@ -236,7 +256,7 @@ test("bridge-dry: binds FULL (its t is the cutoff), scoped, the tool reads the p
   expect(backlogOpsRevisionsSince({ BACKLOG_OPS_REVISIONS_SINCE_MS: String(CUT) }, d, NOW)).toBe(CUT);
   const t = backlogOpsTarget(target);
   expect(backlogOpsToolArgs(d, t, backlogOpsScope(SCOPE), CUT)).toEqual({ script: "scripts/backlog-authority.ts", needsDb: true,
-    args: ["bridge-window", "--cutoff-ms", String(CUT), "--org", ORG, "--org", ORG2] });
+    args: ["bridge-window", "--cutoff-ms", String(CUT), "--full-run", FULL, "--org", ORG, "--org", ORG2] });
   expect(codeSync(() => backlogOpsToolArgs(d, t, backlogOpsScope({}), CUT))).toBe("backlog_ops_scope_required");
   expect(codeSync(() => backlogOpsToolArgs(d, t, backlogOpsScope(SCOPE), null))).toBe("backlog_ops_revisions_since");
   expect(BACKLOG_OPS_BRIDGE_EXECUTE_ENABLED).toBe(false);
@@ -313,21 +333,21 @@ test("bridge-dry through the normal runner (scripts/backlog-ops.ts): the logged 
 
 test("contradictory bridge evidence is refused at validation and at persistence (normal runner)", async () => {
   // The reviewer's negative: a real positive proof (history counted 2) relabelled empty/ok.
-  const positive = erasureWindowProof(ORG, null, CUT, [row({ status: { hold: sealedHold(), erasures: 2, erasure_history: { cutoff: "2026-11-27T06:00:00Z", covered: true,
-    recording: true, by_source: { upload_deletions: 2 }, coverage_started_at: "2026-11-20T00:00:00Z" } }, history_cutoff_matches: true })]);
+  const positive = proof(ORG, null, CUT, [row({ status: { hold: sealedHold(), erasures: 2, erasure_history: { cutoff: "2026-11-27T06:00:00Z", full_run: FULL, full_started_at: "2026-11-27T07:00:00Z", covered: true,
+    recording: true, by_source: { upload_deletions: 2 }, coverage_started_at: "2026-11-20T00:00:00Z" } }, history_cutoff_matches: true, history_full_ordered: true })]);
   expect([positive.status, positive.reason, positive.watermark_erasures]).toEqual(["erasure_window_nonempty", "erasures_in_history", 2]);
   const relabelled = { ...positive, status: "erasure_window_empty", reason: "ok" };
   expect(validErasureWindowProof(relabelled)).toBe(false);
   expect(validErasureWindowProof({ ...positive, reason: "ok" })).toBe(false); // non-empty never claims ok
   const summary = (per: unknown[], over: Record<string, unknown> = {}) => ({ mode: "dry_run", tool: "bridge_window", org_count: per.length,
     all_empty: per.every((p) => (p as { status: string }).status === "erasure_window_empty"), per_org: per, ...over });
-  const empty = erasureWindowProof(ORG2, null, CUT, [row()]);
+  const empty = proof(ORG2, null, CUT, [row()]);
   expect(authorityReceiptSummary("bridge", JSON.parse(JSON.stringify(summary([empty]))), { orgs: [ORG2], cutoffMs: CUT }).ok).toBe(true);
   for (const bad of [summary([relabelled], { all_empty: true }), summary([empty, positive], { all_empty: true }), summary([empty], { org_count: 2 }),
     summary([], { all_empty: true })])
     expect(authorityReceiptSummary("bridge", JSON.parse(JSON.stringify(bad)), { orgs: [ORG, ORG2], cutoffMs: CUT }).summary).toEqual({ refused: "backlog_ops_receipt_schema" });
   // The proofs must be for exactly the requested orgs, each once: a duplicate never substitutes for another org.
-  const a = erasureWindowProof(ORG, null, CUT, [row()]), b = erasureWindowProof(ORG2, null, CUT, [row()]);
+  const a = proof(ORG, null, CUT, [row()]), b = proof(ORG2, null, CUT, [row()]);
   expect(authorityReceiptSummary("bridge", JSON.parse(JSON.stringify(summary([a, b]))), { orgs: [ORG, ORG2], cutoffMs: CUT }).ok).toBe(true);
   for (const [per, orgs] of [[[a, a], [ORG, ORG2]], [[a], [ORG, ORG2]], [[a, b], [ORG]], [[a, b], [ORG, ORG]], [[a, b], []]] as const)
     expect(authorityReceiptSummary("bridge", JSON.parse(JSON.stringify(summary([...per]))), { orgs: [...orgs], cutoffMs: CUT }).summary).toEqual({ refused: "backlog_ops_receipt_schema" });
@@ -346,7 +366,7 @@ test("contradictory bridge evidence is refused at validation and at persistence 
   expect(authorityReceiptSummary("bridge", JSON.parse(JSON.stringify(summary([{ ...a, read_at_ms: null }, b]))), { orgs: [ORG, ORG2], cutoffMs: CUT }).summary)
     .toEqual({ refused: "backlog_ops_receipt_schema" });
   // A legacy two-table snapshot may carry a nonzero historical total and still be empty.
-  const legacy = erasureWindowProof(ORG, null, CUT, [row({ status: status(sealedHold(), 5) })]);
+  const legacy = proof(ORG, null, CUT, [row({ status: status(sealedHold(), 5) })]);
   expect([legacy.status, legacy.watermark_kind, legacy.watermark_erasures, validErasureWindowProof(legacy)]).toEqual(["erasure_window_empty", "surviving_two_tables", 5, true]);
   // Through the normal runner: the contradictory receipt is refused in both the logged line and the saved file.
   const temp = mkdtempSync(join(tmpdir(), "bo-bridge-bad-"));
@@ -385,7 +405,7 @@ test("contradictory bridge evidence is refused at validation and at persistence 
       return { code, lg, sv };
     };
     // The reviewer's two: a duplicate proof standing in for the second org, and an empty proof with no read time.
-    const e1 = erasureWindowProof(ORG, null, CUT, [row()]), e2 = erasureWindowProof(ORG2, null, CUT, [row()]);
+    const e1 = proof(ORG, null, CUT, [row()]), e2 = proof(ORG2, null, CUT, [row()]);
     // ... and the cutoff case: A read at CUT+1 (later) or CUT-1 (earlier) beside a valid B.
     for (const [i, forgedOne] of [summary([e1, e1]), summary([{ ...e1, read_at_ms: null }, e2]),
       summary([{ ...e1, cutoff_ms: CUT + 1, read_at_ms: CUT + 2 }, e2]), summary([{ ...e1, cutoff_ms: CUT - 1 }, e2])].entries()) {

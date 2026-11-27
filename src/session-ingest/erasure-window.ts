@@ -53,10 +53,11 @@ export const ERASURE_SOURCE_EXCLUSIONS: Record<string, string> = {
 export const ERASURE_TABLE_NAME = /eras|delet|rearm|purge|tombstone|forget|reset/u;
 
 /**
- * One statement: every source's in-window count for the org, the hold status (062320; with slot 062340 also its
- * erasure history), and, when 062340 has bound a cutoff to the epoch, whether that bound cutoff is exactly this run's
- * FULL cutoff: compared IN SQL at full timestamptz (microsecond) precision, with the cutoff built exactly (epoch + ms
- * intervals, no float division).
+ * One statement: every source's in-window count for the org (at the gate-derived FULL cutoff: snapshot corroboration),
+ * the hold status (062320; with slot 062340 also its erasure history), and, when 062340 has bound a FULL to the epoch,
+ * whether its cutoff is exactly the hold's installed_at and whether that FULL started after the install and no later
+ * than the seal: all compared IN SQL at full timestamptz (microsecond) precision. The FULL cutoff is built exactly
+ * (epoch + ms intervals, no float division).
  */
 export const ERASURE_WINDOW_SQL = `
 WITH c AS (SELECT timestamptz 'epoch' + $2::bigint * interval '1 millisecond' AS cut),
@@ -64,16 +65,23 @@ st AS (SELECT sessions.ingest_org_admission_hold_status($1::text) AS j)
 SELECT ${(Object.entries(ERASURE_SOURCES) as [string, string][]).map(([t, w]) =>
   `(SELECT count(*) FROM sessions.${t} x CROSS JOIN c WHERE x.org_id = $1::text AND (${w.replaceAll("$2", "c.cut").replace(/(^|[ (])([a-z_]+) (>=|<>|IS)/gu, "$1x.$2 $3")}))::bigint AS ${t}`).join(",\n       ")},
        st.j AS status,
+       -- 062340 (revised): the bound cutoff IS the hold's installed_at; the bound FULL started strictly after the install
+       -- and no later than the seal. Both compared in SQL at full timestamptz precision.
        CASE WHEN st.j->'erasure_history'->>'cutoff' IS NULL THEN NULL
-            ELSE (st.j->'erasure_history'->>'cutoff')::timestamptz = c.cut END AS history_cutoff_matches,
+            ELSE (st.j->'erasure_history'->>'cutoff')::timestamptz = (st.j->'hold'->>'installed_at')::timestamptz END AS history_cutoff_matches,
+       CASE WHEN st.j->'erasure_history'->>'full_started_at' IS NULL THEN NULL
+            ELSE (st.j->'hold'->>'installed_at')::timestamptz < (st.j->'erasure_history'->>'full_started_at')::timestamptz
+             AND (st.j->'erasure_history'->>'full_started_at')::timestamptz <= (st.j->'hold'->>'sealed_at')::timestamptz END AS history_full_ordered,
        floor(extract(epoch FROM statement_timestamp()) * 1000)::bigint AS read_at_ms
 FROM st CROSS JOIN c`;
 
 export type ErasureWindowStatus = "erasure_window_empty" | "erasure_window_nonempty" | "erasure_window_unproven";
 export type ErasureWindowReason = "ok" | "erasures_in_window" | "erasures_in_history" | "hold_missing" | "hold_epoch_mismatch" | "hold_not_sealed"
-  | "read_invalid" | "read_before_seal" | "history_unbound" | "history_cutoff_mismatch" | "history_not_covering_cutoff" | "history_not_recording";
+  | "read_invalid" | "read_before_seal" | "history_unbound" | "history_cutoff_mismatch" | "history_not_covering_cutoff" | "history_not_recording"
+  | "history_full_mismatch" | "history_full_order_invalid";
 export const ERASURE_WINDOW_REASONS: readonly ErasureWindowReason[] = ["ok", "erasures_in_window", "erasures_in_history", "hold_missing", "hold_epoch_mismatch",
-  "hold_not_sealed", "read_invalid", "read_before_seal", "history_unbound", "history_cutoff_mismatch", "history_not_covering_cutoff", "history_not_recording"];
+  "hold_not_sealed", "read_invalid", "read_before_seal", "history_unbound", "history_cutoff_mismatch", "history_not_covering_cutoff", "history_not_recording",
+  "history_full_mismatch", "history_full_order_invalid"];
 
 export interface ErasureWindowProof {
   v: 1; kind: "erasure_window_proof"; status: ErasureWindowStatus; reason: ErasureWindowReason;
@@ -106,7 +114,12 @@ export const orgHash = (org: string) => "h_" + createHash("sha256").update(`auth
  * well formed, the hold is live at `epoch` in `sealed` or `marker_attempted`, and the read happened after the seal.
  */
 /** `epoch` null: bind the live hold's own epoch as read (a dry read takes no epoch input); else it must match. */
-export function erasureWindowProof(org: string, epoch: string | null, cutoffMs: number, rows: readonly Record<string, unknown>[]): ErasureWindowProof {
+/**
+ * `fullRun`: the run id of the FULL this run binds (the dry dispatch's full_backfill_run). With 062340 present, the
+ * history's bound full_run must equal it exactly (history_full_mismatch otherwise); null when the caller binds none.
+ */
+export function erasureWindowProof(org: string, epoch: string | null, cutoffMs: number, rows: readonly Record<string, unknown>[],
+  fullRun: string | null = null): ErasureWindowProof {
   if (!UUID.test(org) || (epoch !== null && !UUID.test(epoch)) || !Number.isSafeInteger(cutoffMs) || cutoffMs < 1) throw Object.assign(new Error("erasure_window_input"), { code: "erasure_window_input" });
   const base: ErasureWindowProof = { v: 1, kind: "erasure_window_proof", status: "erasure_window_unproven", reason: "read_invalid", org_hash: orgHash(org), epoch_hash: epoch === null ? null : epochHash(epoch),
     cutoff_ms: cutoffMs, read_at_ms: null, watermark_erasures: null, hold_state: null, sources: null, watermark_kind: "surviving_two_tables" };
@@ -152,8 +165,13 @@ export function erasureWindowProof(org: string, epoch: string | null, cutoffMs: 
   // cutoff, be recording, and agree with itself (by_source sums to erasures, only known sources).
   const held = { ...out, hold_state: state };
   if (eh!.cutoff === null || watermark === null) return { ...held, reason: "history_unbound" };
+  // The cutoff is the hold's install (SQL); the bound FULL is this run's FULL, started after the install and no later
+  // than the seal (SQL).
   if (typeof r.history_cutoff_matches !== "boolean") return held;
   if (r.history_cutoff_matches !== true) return { ...held, reason: "history_cutoff_mismatch" };
+  if (fullRun === null || typeof eh!.full_run !== "string" || eh!.full_run !== fullRun) return { ...held, reason: "history_full_mismatch" };
+  if (typeof r.history_full_ordered !== "boolean") return held;
+  if (r.history_full_ordered !== true) return { ...held, reason: "history_full_order_invalid" };
   if (eh!.covered !== true) return { ...held, reason: eh!.covered === false ? "history_not_covering_cutoff" : "read_invalid" };
   if (eh!.recording !== true) return { ...held, reason: eh!.recording === false ? "history_not_recording" : "read_invalid" };
   const bs = eh!.by_source as Record<string, unknown> | null;

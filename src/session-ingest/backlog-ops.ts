@@ -524,7 +524,7 @@ export function backlogOpsToolArgs(d: BacklogOpsDispatch, t: BacklogOpsTarget, s
   if (tool === "bridge") {
     // bridge-dry: each org's erasure-window proof at the FULL cutoff t, read by the tool itself; bridge-execute: held.
     return { script: "scripts/backlog-authority.ts", args: [execute ? "bridge-release" : "bridge-window", "--cutoff-ms", String(revisionsSinceMs),
-      ...scope.orgs!.flatMap((o) => ["--org", o])], needsDb: true };
+      "--full-run", d.fullBackfillRun!, ...scope.orgs!.flatMap((o) => ["--org", o])], needsDb: true };
   }
   if (tool === "authority") {
     // authority-dry: the unbound live evidence; authority-execute: the bound evidence, the sweeper, then the markers.
