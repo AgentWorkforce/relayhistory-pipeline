@@ -32,21 +32,44 @@ import {
   toReceiptShape,
 } from "../src/session-ingest/backlog-authority.ts";
 import { assertToolLedgerHome, toolLedgerBucket, toolStores } from "../src/session-ingest/ledger-tool-store.ts";
+import { ERASURE_WINDOW_SQL, erasureWindowProof } from "../src/session-ingest/erasure-window.ts";
+
+/**
+ * bridge-dry: each org's erasure-window proof, READ BY THE TOOL (never a caller-supplied set): one statement per org in
+ * its own READ ONLY transaction, the counts and the 062320 status (hold, erasure watermark) in one snapshot.
+ */
+export async function bridgeWindow(orgs: readonly string[], cutoffMs: number, sql: AuthorityEvidenceSources["sql"]) {
+  const per = [];
+  for (const org of orgs) {
+    let rows: readonly Record<string, unknown>[] = [];
+    try { rows = await sql(ERASURE_WINDOW_SQL, [org, String(cutoffMs)]); } catch { rows = []; }
+    per.push(erasureWindowProof(org, null, cutoffMs, rows));
+  }
+  return { mode: "dry_run" as const, tool: "bridge_window", org_count: orgs.length, all_empty: per.every((p) => p.status === "erasure_window_empty"), per_org: per };
+}
 import { assertLedgerHomeGuardValid, LedgerHomeRefused } from "../src/session-ingest/ledger-store.ts";
 
 const STATEMENT_TIMEOUT_MS = 600_000;
 const fail = (code: string): never => { throw Object.assign(new Error(code), { code }); };
 
-export interface AuthorityArgs { command: "reshard-verify" | "evidence" | "execute"; bucket?: string; region?: string; kmsKeyArn?: string; orgs: string[] }
+export interface AuthorityArgs { command: "reshard-verify" | "evidence" | "execute" | "bridge-window" | "bridge-release"; bucket?: string; region?: string;
+  kmsKeyArn?: string; orgs: string[]; cutoffMs?: number }
 export function parseAuthorityArgs(argv: readonly string[]): AuthorityArgs {
   const [command, ...rest] = argv;
-  if (command !== "reshard-verify" && command !== "evidence" && command !== "execute") fail("usage");
+  if (command !== "reshard-verify" && command !== "evidence" && command !== "execute" && command !== "bridge-window" && command !== "bridge-release") fail("usage");
   let values;
   try {
     ({ values } = parseArgs({ args: [...rest], options: { bucket: { type: "string" }, region: { type: "string" }, "kms-key-arn": { type: "string" },
-      org: { type: "string", multiple: true } }, strict: true, allowPositionals: false }));
+      org: { type: "string", multiple: true }, "cutoff-ms": { type: "string" } }, strict: true, allowPositionals: false }));
   } catch { return fail("usage"); }
   const orgs = authorityOrgsOr(values.org ?? []);
+  if (command === "bridge-window" || command === "bridge-release") {
+    const c = values["cutoff-ms"];
+    if (c === undefined || !/^[1-9][0-9]{0,15}$/u.test(c) || !Number.isSafeInteger(Number(c)) || values.bucket !== undefined || values.region !== undefined ||
+        values["kms-key-arn"] !== undefined) fail("usage");
+    return { command, orgs, cutoffMs: Number(c) };
+  }
+  if (values["cutoff-ms"] !== undefined) fail("usage");
   const s3 = command !== "evidence";
   if (s3 !== (values.bucket !== undefined) || s3 !== (values.region !== undefined) || (command === "execute") !== (values["kms-key-arn"] !== undefined)) fail("usage");
   if (s3 && (!/^[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]$/u.test(values.bucket!) || !/^[a-z]{2}(-gov)?-[a-z]+-[0-9]$/u.test(values.region!))) fail("usage");
@@ -58,6 +81,16 @@ function authorityOrgsOr(orgs: readonly string[]): string[] {
 }
 
 /** The stdin payload: exactly the keys `keys`, each checked. */
+/** bridge-window's stdin: exactly {"dbUrl": ...} (no Cloudflare token: it reads SQL only). */
+export function bridgeStdin(line: string): { dbUrl: string } {
+  if (line.length > 64 * 1024) fail("stdin_too_large");
+  let p: unknown;
+  try { p = JSON.parse(line); } catch { return fail("stdin_invalid"); }
+  if (p === null || typeof p !== "object" || Array.isArray(p) || Object.keys(p).length !== 1 || typeof (p as { dbUrl?: unknown }).dbUrl !== "string" ||
+      (p as { dbUrl: string }).dbUrl === "") fail("db_url_required");
+  return p as { dbUrl: string };
+}
+
 export function authorityStdin(line: string, command: AuthorityArgs["command"]): { dbUrl: string; cloudflareToken: string; baseline?: unknown; ledgerBucket?: string | null } {
   if (line.length > 4 * 1024 * 1024) fail("stdin_too_large");
   let p: unknown;
@@ -106,6 +139,18 @@ export async function main(argv: readonly string[], env: NodeJS.ProcessEnv): Pro
     await assertToolLedgerHome(stores, BACKLOG_AUTHORITY_KEY_ROOT, args.bucket!, env);
     const summary = await reshardVerifyOrgs(stores.store, BACKLOG_AUTHORITY_KEY_ROOT, args.orgs);
     return { summary, ok: summary.verify_passed };
+  }
+  if (args.command === "bridge-release") fail("bridge_release_held");
+  if (args.command === "bridge-window") {
+    const { dbUrl } = bridgeStdin(readFileSync(0, "utf8").split("\n")[0] ?? "");
+    const b = ownerClientConfig(dbUrl, "96bulls-backlog-bridge");
+    const db = new pg.Client({ ...b, options: `${b.options ?? ""} -c default_transaction_read_only=on`.trim(), keepAlive: true });
+    db.on("error", () => {});
+    await db.connect();
+    try {
+      const summary = await bridgeWindow(args.orgs, args.cutoffMs!, readOnlySql(db));
+      return { summary, ok: summary.all_empty };
+    } finally { await db.end().catch(() => {}); }
   }
   const input = authorityStdin(readFileSync(0, "utf8").split("\n")[0] ?? "", args.command);
   const base = ownerClientConfig(input.dbUrl, "96bulls-backlog-authority");

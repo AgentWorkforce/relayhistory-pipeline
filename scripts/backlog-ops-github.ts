@@ -38,6 +38,7 @@ import {
   BACKLOG_OPS_BINDING_MAX_AGE_MS,
   BACKLOG_OPS_CATCHUP_MARGIN_MS,
   BACKLOG_OPS_AUTHORITY_EXECUTE_ENABLED,
+  BACKLOG_OPS_BRIDGE_EXECUTE_ENABLED,
   BACKLOG_OPS_EXECUTE_ENABLED,
   BACKLOG_OPS_FRESH_BACKFILL_MS,
   BACKLOG_OPS_RECEIPT_ARTIFACT,
@@ -64,9 +65,10 @@ export async function backlogOpsGithubGate(
   env: Record<string, string | undefined>,
   get: Get,
   approved = false,
-  options: { enabled?: boolean; authorityEnabled?: boolean; now?: number } = {},
+  options: { enabled?: boolean; authorityEnabled?: boolean; bridgeEnabled?: boolean; now?: number } = {},
 ) {
-  const input = backlogOpsDispatch(env, options.enabled ?? BACKLOG_OPS_EXECUTE_ENABLED, options.authorityEnabled ?? BACKLOG_OPS_AUTHORITY_EXECUTE_ENABLED);
+  const input = backlogOpsDispatch(env, options.enabled ?? BACKLOG_OPS_EXECUTE_ENABLED, options.authorityEnabled ?? BACKLOG_OPS_AUTHORITY_EXECUTE_ENABLED,
+    options.bridgeEnabled ?? BACKLOG_OPS_BRIDGE_EXECUTE_ENABLED);
   const now = options.now ?? Date.now();
   if (env.GITHUB_REPOSITORY !== S.repository || env.GITHUB_REPOSITORY_ID !== PRIVATE_INGEST_RELEASE.repositoryId ||
       env.GITHUB_EVENT_NAME !== "workflow_dispatch" || env.GITHUB_REF !== "refs/heads/main" ||

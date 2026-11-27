@@ -11,15 +11,17 @@
  * the backfill's known keys; every other key's count is summed under `other`.
  */
 import { AUTHORITY_REFUSALS } from "./authority-evidence.ts";
+import { ERASURE_SOURCES } from "./erasure-window.ts";
+const ERASURE_SOURCE_NAMES = Object.keys(ERASURE_SOURCES);
 
 type S =
-  | "count" | "bool" | "hash" | "digest"
+  | "count" | "bool" | "hash" | "digest" | "uuid"
   | { code: ReadonlySet<string> }
   | { nullable: S }
   | { list: S; max: number }
   | { obj: Record<string, S>; optional?: readonly string[] };
 
-const COUNT = "count" as const, BOOL = "bool" as const, HASH = "hash" as const, DIGEST = "digest" as const;
+const COUNT = "count" as const, BOOL = "bool" as const, HASH = "hash" as const, DIGEST = "digest" as const, UUID_S = "uuid" as const;
 const codes = (...c: readonly string[]): S => ({ code: new Set(c) });
 const nul = (s: S): S => ({ nullable: s });
 const list = (s: S, max = 64): S => ({ list: s, max });
@@ -91,6 +93,15 @@ export const RESHARD_SCHEMA: S = obj({
 
 export const AUTHORITY_DRY_SCHEMA: S = obj({ mode: codes("dry_run"), evidence: EVIDENCE_SCHEMA });
 
+/** erasure-window.ts ErasureWindowProof (already receipt keys). */
+const PROOF_SCHEMA: S = obj({
+  v: codes("1"), kind: codes("erasure_window_proof"), status: codes("erasure_window_empty", "erasure_window_nonempty", "erasure_window_unproven"),
+  reason: codes("ok", "erasures_in_window", "hold_missing", "hold_epoch_mismatch", "hold_not_sealed", "read_invalid", "read_before_seal"),
+  org_hash: HASH, epoch: UUID_S, cutoff_ms: COUNT, read_at_ms: nul(COUNT), watermark_erasures: nul(COUNT),
+  hold_state: nul(codes("held", "sealed", "marker_attempted")), sources: nul(obj(counts(...ERASURE_SOURCE_NAMES))),
+});
+export const BRIDGE_SCHEMA: S = obj({ mode: codes("dry_run"), tool: codes("bridge_window"), org_count: COUNT, all_empty: BOOL, per_org: list(PROOF_SCHEMA) });
+
 /** backlog-authority.ts authorityExecute's own codes. */
 export const EXECUTE_CODES = ["evidence_not_corroborated", "writer_fence_unavailable", "writer_fence_not_held", "marker_handoff_lapsed", "marker_conflict",
   "marker_org", "marker_access_denied", "marker_unreadable", "marker_write_failed", "marker_readback_mismatch", "sweeper_spec_missing", "sweeper_spec_stale",
@@ -111,7 +122,8 @@ export const EXECUTE_SCHEMA: S = obj({
 const LEDGER_HOME = ["ledger_bucket_invalid", "ledger_home_guard_invalid", "ledger_home_mismatch", "ledger_home_missing", "ledger_home_moved",
   "ledger_home_invalid", "ledger_home_unavailable", "ledger_home_store_error", "access_denied"];
 export const AUTHORITY_TOOL_REFUSALS = ["usage", "orgs", "authority_execute_held", "stdin_too_large", "stdin_invalid", "db_url_required",
-  "cloudflare_token_invalid", "cloudflare_config", "cloudflare_path", "aws_credentials_required", "backlog_ops_reshard_org", "internal_error", ...LEDGER_HOME] as const;
+  "cloudflare_token_invalid", "cloudflare_config", "cloudflare_path", "aws_credentials_required", "backlog_ops_reshard_org", "internal_error",
+  "bridge_release_held", "erasure_window_input", ...LEDGER_HOME] as const;
 /**
  * Every code scripts/upload-fence-backfill.ts redactedReason can produce from the backfill's own throws (the closed
  * set, enumerated from its source, the library's and the tool store's), plus a digits-only SQLSTATE and the owner URL
@@ -127,15 +139,16 @@ const BACKFILL_REFUSALS = ["backfill_authority_baseline_invalid", "backfill_auth
 const SQLSTATE = /^sqlstate_[0-9]{5}$/u;
 
 /** `backfill`: every other backfill mode (a FULL backfill-execute feeds authority-execute; all share its receipt path). */
-export type AuthorityReceiptKind = "reshard" | "authority_dry" | "authority_execute" | "catchup" | "backfill";
+export type AuthorityReceiptKind = "reshard" | "authority_dry" | "authority_execute" | "catchup" | "backfill" | "bridge";
 const SUCCESS: Record<AuthorityReceiptKind, S> = { reshard: RESHARD_SCHEMA, authority_dry: AUTHORITY_DRY_SCHEMA, authority_execute: EXECUTE_SCHEMA, catchup: CATCHUP_SCHEMA,
-  backfill: BACKFILL_SCHEMA };
+  backfill: BACKFILL_SCHEMA, bridge: BRIDGE_SCHEMA };
 const REFUSED: Record<AuthorityReceiptKind, { allowed: ReadonlySet<string>; generic: string }> = {
   reshard: { allowed: new Set(AUTHORITY_TOOL_REFUSALS), generic: "internal_error" },
   authority_dry: { allowed: new Set(AUTHORITY_TOOL_REFUSALS), generic: "internal_error" },
   authority_execute: { allowed: new Set(AUTHORITY_TOOL_REFUSALS), generic: "internal_error" },
   catchup: { allowed: new Set(BACKFILL_REFUSALS), generic: "backfill_refused" },
   backfill: { allowed: new Set(BACKFILL_REFUSALS), generic: "backfill_refused" },
+  bridge: { allowed: new Set(AUTHORITY_TOOL_REFUSALS), generic: "internal_error" },
 };
 
 const HASH_RE = /^h_[0-9a-f]{32}$/u, DIGEST_RE = /^h[0-9a-f]{32}$/u;
@@ -148,6 +161,7 @@ export function conforms(v: unknown, s: S, depth = 0): boolean {
   if (s === BOOL) return typeof v === "boolean";
   if (s === HASH) return typeof v === "string" && HASH_RE.test(v);
   if (s === DIGEST) return typeof v === "string" && DIGEST_RE.test(v);
+  if (s === UUID_S) return typeof v === "string" && /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/u.test(v);
   if ("code" in s) return (typeof v === "string" && s.code.has(v)) || (typeof v === "number" && s.code.has(String(v)));
   if ("nullable" in s) return v === null || conforms(v, s.nullable, depth + 1);
   if ("list" in s) return Array.isArray(v) && v.length <= s.max && v.every((x) => conforms(x, s.list, depth + 1));

@@ -419,11 +419,52 @@ Prerequisites before the hold can be lifted (none is code on this branch):
 - An independently authenticated serving spec (the observer above, with its bucket-policy deny).
 - A reviewed commit that flips `BACKLOG_OPS_AUTHORITY_EXECUTE_ENABLED`.
 
-### The hold bridge (code only, dormant)
+### The empty-erasure-window proof and bridge-dry
+
+The gating criterion layered-sessions-pipeline accepts for an org to reach `bridge_complete` without
+the erase manifest is `erasure_window_empty` (`src/session-ingest/erasure-window.ts`). `bridge-dry` is
+a scoped mode that binds `full_backfill_run`; the gate computes its cutoff t from FULL, exactly as it
+does for a catch-up. For each org, the tool itself reads one statement, in a READ ONLY transaction, so
+the caller never supplies the set:
+
+- **Every erasure-lane source in the schema.** The sources are `operator_user_erasures`, the five
+  `session_erasure_*` tables, `upload_deletions`, `upload_resets`, `upload_erasure_rearm`,
+  `relayfacts_erasure_fences`, `session_analysis_purge_fences` and `_authority`, and
+  `ingest_frozen_source_deletions` and `_resets`.
+  - A row counts as in the window when its timestamp is at or after t, or when it is still in
+    flight, whatever its age.
+  - A table with no timestamp counts every row of the org (fail closed).
+  - A test fails the build if an erasure-like table in the migrations is left unclassified. The
+    excluded singletons (an eraser heartbeat and a purge cursor) are listed with their reasons.
+- **The status, in the same snapshot.** The 062320 status (hold, epoch, timestamps) and its erasure
+  watermark come from the same statement.
+
+The proof is `erasure_window_empty` only when every count is 0, the hold is live in `sealed` or
+`marker_attempted`, and the read came after the seal. Anything else is `erasure_window_nonempty` or
+`erasure_window_unproven`, and the org stays HELD for the manifest or for reconciliation.
+
+A positive set never releases. A user erase still needs `bytes_verified` and the writer-generation
+proof, and a session erase needs manifest (062330) evidence.
+
+The receipt has an exact schema (kind `bridge`) and carries org hashes only.
+
+`releaseOnEmptyWindow` binds the proof to the org, the epoch and the FULL cutoff. It requires the proof
+to be fresh (read at most 5 minutes before the release) and the hold to be `marker_attempted`, and it
+returns the watermark to pass to `_release`. An erasure in those two tables committed after the proof
+changes the count, and `_release` refuses.
+
+The watermark covers only `operator_user_erasures` and `session_erasure_fences`. A row in any other
+source committed between the proof and the release is caught only by re-reading the proof immediately
+before the release. The controls are S3-mirrored while sealed.
+
+`bridge-execute` is HELD in code (`BACKLOG_OPS_BRIDGE_EXECUTE_ENABLED`), and its tool refuses
+(`bridge_release_held`) until slot 062320 lands.
+
+### The hold bridge (code only)
 
 `src/session-ingest/hold-bridge.ts` covers the bridge side of the per-org admission hold:
-`docs/design/org-admission-hold.md`, sections 6.1 and 6.2, slot `20261105062320`. No workflow mode
-calls it yet.
+`docs/design/org-admission-hold.md`, sections 6.1 and 6.2, slot `20261105062320`. The replay of a
+positive erasure set is not wired to a mode. Only the empty-window path above is (`bridge-dry`).
 
 - **Lifecycle adapter (`holdSql`).** It holds the slot's owner-only functions in one table, so a
   rename is one edit. Each runs alone in a READ COMMITTED transaction:

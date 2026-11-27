@@ -69,6 +69,7 @@ import {
   checkBoundReceipt,
   checkRefreshFingerprint,
   checkStsExpiration,
+  isBridge,
   isCatchup,
   parseStsCredentials,
   toolOf,
@@ -107,7 +108,7 @@ export function backlogOpsChildSpawn(
   session: string | null = null,
   bound: BoundAuthority = {},
 ) {
-  const since = isCatchup(d.mode) ? backlogOpsRevisionsSince(env, d) : null;
+  const since = isCatchup(d.mode) || isBridge(d.mode) ? backlogOpsRevisionsSince(env, d) : null;
   const scope = backlogOpsScope(env);
   // Path B: the export's only (the drain's binding of it is in checkBoundReceipts).
   const nhp = backlogOpsNoHeadParity(env, d, scope), exportNhp = toolOf(d.mode) === "export" ? nhp : null;
@@ -162,7 +163,7 @@ export function checkBoundReceipts(env: Record<string, string | undefined>, d: B
     backlogOpsLedgerTarget(env, { bucket: env.BACKLOG_OPS_BUCKET ?? "" }));
   // Which bound receipts must attest this run's home: every authority-execute binding (FULL included: every backfill
   // receipt records it), a catch-up's AUTHORITY, and a reshard-dry's catch-up.
-  const authorityRun = (b: { kind: string }, dd: BacklogOpsDispatch) => dd.mode === "authority-execute" || b.kind === "authority" || dd.mode === "reshard-dry";
+  const authorityRun = (b: { kind: string }, dd: BacklogOpsDispatch) => dd.mode === "authority-execute" || b.kind === "authority" || dd.mode === "reshard-dry" || isBridge(dd.mode);
   const authority: BoundAuthority = {};
   // The per-org bindings need the scope's org list (their receipts carry org hashes, never ids).
   const orgs = scopeFull.orgs;
@@ -178,7 +179,7 @@ export function checkBoundReceipts(env: Record<string, string | undefined>, d: B
     try { raw = read(path); } catch { return refuse(`backlog_ops_bound_${b.kind}_missing`); }
     // The drain's BACKFILL and FULL, and a catch-up's FULL: exactly the run's scope (never an unscoped run standing in).
     const exact = (d.mode === "drain-execute" && (b.kind === "backfill" || b.kind === "full")) || (isCatchup(d.mode) && b.kind === "full") ||
-      d.mode === "authority-execute" || b.kind === "authority" || d.mode === "reshard-dry";
+      d.mode === "authority-execute" || b.kind === "authority" || d.mode === "reshard-dry" || isBridge(d.mode);
     // The drain's BACKFILL with FULL: a refresh or a catch-up, whichever the receipt says (the gate checked its run-name).
     let mode = b.mode;
     if (b.altMode !== undefined) {
@@ -285,7 +286,7 @@ export async function backlogOpsRun(
   const since = backlogOpsRevisionsSince(env, d);
   // The authority modes' Cloudflare token (shape; and empty for every other mode), before any credential.
   backlogOpsCloudflareToken(env, d);
-  const t = backlogOpsTarget(env), spec = backlogOpsToolArgs(d, t, scope, isCatchup(d.mode) ? since : null, toolOf(d.mode) === "export" ? nhp : null);
+  const t = backlogOpsTarget(env), spec = backlogOpsToolArgs(d, t, scope, isCatchup(d.mode) || isBridge(d.mode) ? since : null, toolOf(d.mode) === "export" ? nhp : null);
   // The ledger target's shape, before any credential (backlog_ops_target_ledger_bucket / _region), and its receipt id.
   const ledger = backlogOpsLedgerId(d, backlogOpsLedgerTarget(env, t));
   const bound = checkBoundReceipts(env, d, undefined, since);
@@ -295,7 +296,8 @@ export async function backlogOpsRun(
   // Exact schemas: every authority receipt, and every backfill receipt (a FULL backfill-execute is an authority
   // binding; every backfill mode shares its producer, so all are closed alike).
   const schemaKind: AuthorityReceiptKind | null = toolOf(d.mode) === "reshard" ? "reshard" : d.mode === "authority-dry" ? "authority_dry"
-    : d.mode === "authority-execute" ? "authority_execute" : isCatchup(d.mode) && d.authorityRun !== null ? "catchup" : toolOf(d.mode) === "backfill" ? "backfill" : null;
+    : d.mode === "authority-execute" ? "authority_execute" : isCatchup(d.mode) && d.authorityRun !== null ? "catchup" : toolOf(d.mode) === "backfill" ? "backfill"
+    : toolOf(d.mode) === "bridge" ? "bridge" : null;
   const paths = backlogOpsPaths(env);
   if (existsSync(paths.receipt)) refuse("backlog_ops_receipt_exists");
   // Credentials from here on: the database URL (backfill, export, presence) and the role session.
