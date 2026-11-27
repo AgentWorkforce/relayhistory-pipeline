@@ -986,3 +986,112 @@ describe("round-5 controls", () => {
     expect(outsideWindow({ snapshot: snap(null, "2026-11-31T00:00:00Z") }, since, until)).toBe("no_event_times");
   });
 });
+
+describe("pull request linking", () => {
+  const T = (d: string) => `2026-11-${d}.000Z`;
+  const sess = (over: Partial<SessionFacts> = {}) => ({ source: "claude", sessionId: "s", analyzedAt: T("02T01:00:00"), startedAt: T("02T00:00:00"), endedAt: T("02T01:00:00"), title: "", asked: [], built: [], gaps: [], rationale: [],
+    outcomeStatuses: [], dropped: {}, keys: { repo: "example/widgets", branches: [], prs: [], commits: [], files: [], taskRefs: [], parents: [] }, ...over }) as SessionFacts;
+  const keys = (over: Partial<SessionFacts["keys"]>) => ({ repo: "example/widgets", branches: [], prs: [], commits: [], files: [], taskRefs: [], parents: [], ...over });
+
+  test("forge: a PR into a trunk lands when the train brings it onto main; one not yet promoted has no landing", async () => {
+    const { execFileSync } = await import("node:child_process");
+    const { forgeFacts } = await import("../backfill/forge.ts");
+    const repo = join(tmp, "prlink-train");
+    mkdirSync(repo);
+    const git = (args: string[], date: string) => execFileSync("git", ["-C", repo, ...args], { env: { ...process.env, GIT_AUTHOR_DATE: date, GIT_COMMITTER_DATE: date, GIT_AUTHOR_NAME: "t", GIT_AUTHOR_EMAIL: "t@example.invalid", GIT_COMMITTER_NAME: "t", GIT_COMMITTER_EMAIL: "t@example.invalid" }, encoding: "utf8" }).trim();
+    const commit = (file: string, date: string) => { writeFileSync(join(repo, file), file); git(["add", file], date); git(["commit", "-q", "-m", file], date); return git(["rev-parse", "HEAD"], date); };
+    git(["init", "-q", "-b", "main"], "2026-11-01T00:00:00Z");
+    commit("base.txt", "2026-11-01T00:00:00Z");
+    git(["branch", "trunk"], "2026-11-01T00:00:00Z");
+    git(["switch", "-q", "-c", "fix/a", "trunk"], "2026-11-02T00:00:00Z");
+    const a = commit("a.txt", "2026-11-02T00:00:00Z");
+    git(["switch", "-q", "trunk"], "2026-11-03T00:00:00Z");
+    git(["merge", "-q", "--no-ff", "-m", "Merge pull request #1", "fix/a"], "2026-11-03T00:00:00Z");
+    const mergeA = git(["rev-parse", "HEAD"], "2026-11-03T00:00:00Z");
+    git(["switch", "-q", "main"], "2026-11-04T00:00:00Z");
+    git(["merge", "-q", "--no-ff", "-m", "Merge train: promote", "trunk"], "2026-11-04T00:00:00Z");
+    git(["switch", "-q", "-c", "fix/b", "trunk"], "2026-11-04T12:00:00Z");
+    const b = commit("b.txt", "2026-11-04T12:00:00Z");
+    git(["switch", "-q", "trunk"], "2026-11-05T00:00:00Z");
+    git(["merge", "-q", "--no-ff", "-m", "Merge pull request #2", "fix/b"], "2026-11-05T00:00:00Z");
+    const mergeB = git(["rev-parse", "HEAD"], "2026-11-05T00:00:00Z");
+    git(["switch", "-q", "-c", "fix/c", "trunk"], "2026-11-06T00:00:00Z");
+    const c = commit("c.txt", "2026-11-06T00:00:00Z");
+    git(["switch", "-q", "main"], "2026-11-06T00:00:00Z");
+    git(["branch", "-q", "-D", "fix/a", "fix/b", "fix/c"], "2026-11-06T00:00:00Z"); // head branches deleted on merge
+    const listed = [
+      { url: "https://github.com/example/widgets/pull/1", state: "MERGED", createdAt: "2026-11-02T01:00:00Z", updatedAt: "2026-11-03T00:00:00Z", mergedAt: "2026-11-03T00:00:00Z", closedAt: "2026-11-03T00:00:00Z", headRefName: "fix/a", baseRefName: "trunk", mergeCommit: { oid: mergeA }, headRefOid: a },
+      { url: "https://github.com/example/widgets/pull/2", state: "MERGED", createdAt: "2026-11-04T13:00:00Z", updatedAt: "2026-11-05T00:00:00Z", mergedAt: "2026-11-05T00:00:00Z", closedAt: "2026-11-05T00:00:00Z", headRefName: "fix/b", baseRefName: "trunk", mergeCommit: { oid: mergeB }, headRefOid: b },
+      { url: "https://github.com/example/widgets/pull/3", state: "OPEN", createdAt: "2026-11-06T01:00:00Z", updatedAt: "2026-11-06T01:00:00Z", mergedAt: null, closedAt: null, headRefName: "fix/c", baseRefName: "trunk", mergeCommit: null, headRefOid: c },
+      // Merged, but the mirror does not hold its merge commit: unknown (no landedAt), never a claimed absence.
+      { url: "https://github.com/example/widgets/pull/4", state: "MERGED", createdAt: "2026-11-06T01:00:00Z", updatedAt: "2026-11-06T02:00:00Z", mergedAt: "2026-11-06T02:00:00Z", closedAt: null, headRefName: "fix/d", baseRefName: "main", mergeCommit: { oid: "f".repeat(40) }, headRefOid: "e".repeat(40) },
+    ];
+    const f = forgeFacts("example/widgets", repo, "2026-10-31T00:00:00Z", "2026-11-30T00:00:00Z", "main", () => listed);
+    const pr = (n: number) => f.prs.find((p) => p.ref.endsWith(`/pull/${n}`))!;
+    expect(pr(1)).toMatchObject({ base: "trunk", mergeCommit: mergeA, landedAt: T("04T00:00:00"), commits: [a] });
+    expect(pr(2)).toMatchObject({ base: "trunk", mergeCommit: mergeB, landedAt: null, commits: [b] });
+    expect(pr(3).commits).toEqual([c]);
+    expect(pr(3).landedAt).toBeUndefined();
+    expect(pr(4).landedAt).toBeUndefined();
+    expect(pr(4).mergeCommit).toBeUndefined();
+
+    // A session on fix/a (its branch only: no PR URL, the branch is gone) is shipped once the train landed it.
+    const onA = sess({ keys: keys({ branches: ["fix/a"] }) });
+    expect(deriveState([onA], f, T("10T00:00:00"))).toMatchObject({ state: "shipped", basis: "forge" });
+    expect(deriveState([onA], f, T("10T00:00:00")).reason).toContain("into trunk, on main");
+    // Merged into trunk on Nov 3, on main only from Nov 4: in progress in between, never shipped early.
+    expect(deriveState([onA], f, T("03T12:00:00"))).toMatchObject({ state: "in_progress", reason: expect.stringContaining("not yet on main") });
+    // fix/b never reached main: in progress, and not abandoned however long the session has been quiet.
+    const onB = sess({ startedAt: T("04T12:00:00"), endedAt: T("04T13:00:00"), keys: keys({ branches: ["fix/b"] }) });
+    expect(deriveState([onB], f, T("29T00:00:00"))).toMatchObject({ state: "in_progress", basis: "forge" });
+    // A session's own commit finds the open PR that holds it, with no URL or branch.
+    const withC = sess({ startedAt: T("06T00:00:00"), endedAt: T("06T01:00:00"), built: [{ id: "x", kind: "commit", what: "commit", ref: c.slice(0, 9), at: T("06T00:30:00"), session: { source: "claude", sessionId: "s" }, outcomeId: null, evidence: [] }] });
+    expect(deriveState([withC], f, T("10T00:00:00"))).toMatchObject({ state: "in_progress", basis: "forge" });
+    // A PR only mentioned (a link key) is never the feature's.
+    const mention = sess({ keys: keys({ prs: ["https://github.com/example/widgets/pull/1"] }), built: [{ id: "y", kind: "claim", what: "reviewed", ref: null, at: T("02T00:30:00"), session: { source: "claude", sessionId: "s" }, outcomeId: null, evidence: [] }] });
+    expect(deriveState([mention], f, T("10T00:00:00")).basis).toBe("analysis");
+  });
+
+  test("a head branch reused long before the feature is not its PR; a forge without landedAt reads mergedAt", () => {
+    const old = { prs: [{ ref: "https://github.com/example/widgets/pull/9", state: "merged" as const, at: "2026-10-01T00:00:00.000Z", mergedAt: "2026-10-02T00:00:00.000Z", branch: "fix/a" }], commits: [], flags: [] };
+    const onA = sess({ keys: keys({ branches: ["fix/a"] }), built: [{ id: "y", kind: "claim", what: "c", ref: null, at: T("02T00:30:00"), session: { source: "claude", sessionId: "s" }, outcomeId: null, evidence: [] }] });
+    expect(deriveState([onA], old, T("10T00:00:00")).basis).toBe("analysis");
+    const recent = { ...old, prs: [{ ...old.prs[0]!, at: T("02T02:00:00"), mergedAt: T("03T00:00:00") }] };
+    expect(deriveState([onA], recent, T("10T00:00:00"))).toMatchObject({ state: "shipped", basis: "forge" });
+    expect(deriveState([onA], recent, T("02T12:00:00")).state).toBe("in_progress");
+  });
+
+  test("forge.json: a PR landing needs its merge commit; PR commits are full ids", async () => {
+    const { parseForge } = await import("../bench/corpus.ts");
+    const pr = (over: Record<string, unknown>) => ({ prs: [{ ref: "https://github.com/example/widgets/pull/1", state: "merged", at: "2026-11-01T00:00:00.000Z", ...over }], commits: [], flags: [] });
+    const sha = "a".repeat(40);
+    expect(() => parseForge(pr({ mergeCommit: sha, landedAt: null, commits: [sha], base: "trunk" }))).not.toThrow();
+    expect(() => parseForge(pr({ landedAt: "2026-11-02T00:00:00.000Z" }))).toThrow(/merge commit/);
+    expect(() => parseForge(pr({ mergeCommit: sha, landedAt: "2026-11-31T00:00:00.000Z" }))).toThrow(/valid time/);
+    expect(() => parseForge(pr({ state: "open", mergeCommit: sha }))).toThrow(/merge commit/);
+    expect(() => parseForge(pr({ commits: ["abc1234"] }))).toThrow(/full commit ids/);
+    expect(() => parseForge(pr({ commits: [] }))).toThrow(/full commit ids/);
+    expect(() => parseForge(pr({ landedSeq: 1 }))).toThrow(/unknown field/);
+  });
+
+  test("approval assessors join features but never found one or make one alone", async () => {
+    const { isApprovalAssessor } = await import("../features/extract.ts");
+    const human = (at: string, text: string) => ({ id: `r-${at}`, kind: "human-message", at, summary: text, detail: text, source: "codex", sessionId: "a", truncated: false, isError: null, toolCallId: null, locator: { eventUid: null, toolUseId: null, fileEditId: null } });
+    const snap = (source: string, ...refs: unknown[]) => ({ source, sessionId: "a", evidence: { references: refs } }) as unknown as SessionAnalysisSnapshot;
+    const PRE = "The following is the Codex agent history whose request action you are assessing.";
+    expect(isApprovalAssessor(snap("codex", human("2026-11-02T00:00:00Z", PRE)))).toBe(true);
+    // The first human message by time decides; another harness, or the words later in a session, never do.
+    expect(isApprovalAssessor(snap("codex", human("2026-11-02T01:00:00Z", PRE), human("2026-11-02T00:00:00Z", "fix the lease bug")))).toBe(false);
+    expect(isApprovalAssessor(snap("claude", human("2026-11-02T00:00:00Z", PRE)))).toBe(false);
+    expect(isApprovalAssessor(snap("codex", human("2026-11-02T00:00:00Z", `please read: ${PRE}`)))).toBe(false);
+
+    const ask = (id: string, text: string) => ({ id, text, quotes: [], at: T("02T00:10:00"), session: { source: "codex", sessionId: id }, outcomeId: null, evidence: [] });
+    const work = sess({ source: "codex", sessionId: "w", startedAt: T("02T00:05:00"), asked: [ask("w", "fix the lease bug")], keys: keys({ branches: ["fix/a"] }) });
+    const assessor = sess({ source: "codex", sessionId: "a", role: "approval_assessor", startedAt: T("02T00:00:00"), asked: [ask("a", "assess whether git push is safe")], keys: keys({ branches: ["fix/a"] }) });
+    const alone = sess({ source: "codex", sessionId: "z", role: "approval_assessor", asked: [ask("z", "assess rm")], keys: keys({ branches: ["fix/z"] }) });
+    const out = buildFeatures([work, assessor, alone], { asOf: T("10T00:00:00") });
+    expect(out).toHaveLength(1);
+    expect(out[0]!.sessions.map((s) => [s.sessionId, s.role])).toEqual([["w", "founding"], ["a", "contributing"]]);
+    expect(out[0]!.asked.map((a) => a.text)).toEqual(["fix the lease bug"]);
+  });
+});

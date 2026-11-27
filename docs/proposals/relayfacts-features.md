@@ -116,6 +116,11 @@ must cite evidence ids that the scorer checks.
      never links. A commit a session only mentions, such as a reviewer's "review <sha>", resolves to the
      forge branch that holds it, when at most two branches do.
    - Review rounds of one branch (`-r2`, `-v3`) share a key. A branch name cut off mid-word never links.
+   - A Codex approval assessor (a session whose first human message, by time, opens "The following is the
+     Codex agent history", the harness handing it another session's pending action) reviews work and
+     never does it. It joins a feature through its keys but never founds one, a group of assessors alone
+     is no feature, and its own asks, claims, gaps and outcomes are left out. On the second `cloud`
+     corpus, 864 of 1,824 sessions were assessors, and 72 features were made of nothing else.
 3. **State.** Rules over the linked evidence, latest evidence first:
    - a revert after a merge gives `regressed` (a linked replacement giving `superseded` is not
      implemented; only analyses whose every outcome is superseded give it today);
@@ -143,6 +148,17 @@ must cite evidence ids that the scorer checks.
    reached the default branch, so a revert written on a side branch and merged later is dated by the merge.
    Sealing the forge again after a later landing leaves every earlier cut's state unchanged (tested with
    real git histories). A branch whose tip predates the feature's first session is not its landing.
+
+   A feature's pull requests are the ones a session created, any whose head branch is one of the
+   feature's branches and that opened no earlier than seven days before its first session (GitHub
+   deletes a head branch on merge, so the live branches rarely hold it: 99 of 2,267 merged `cloud` PRs
+   kept theirs), and any that hold a commit a session made or pushed. A PR only mentioned never counts.
+   A merged PR landed when its merge commit reached the default branch (`landedAt`), not at GitHub's
+   `mergedAt`: a repository that merges PRs into a trunk and promotes the trunk with a merge train
+   (`cloud`) lands a PR at the train's merge. A PR merged into its base and not yet on the default branch
+   is `in_progress`, however quiet. A forge without `landedAt` reads `mergedAt`. A PR's commits are
+   read from the final mirror, so a commit pushed to an open PR after the cut can link that PR at the
+   cut; the PR's landing and closing are still cut strictly.
 
    **As-of.** Session facts are cut strictly at `asOf`: a timed item, and every evidence pointer and
    quote inside it, counts only before `asOf`; anything without a time of its own (a mention-only key,
