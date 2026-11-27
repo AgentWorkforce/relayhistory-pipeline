@@ -59,9 +59,11 @@ is a separate boundary already described in the existing contract.
 
 ## Publisher-reported synthetic PostgreSQL 16 results
 
-The T25 test is in `publication.postgres.test.ts`, named
-“T25 scoped fleet … a paused fleet holds no erase path of its own …”. Its
-reported sequence is:
+The named T25 test in `publication.postgres.test.ts`,
+“T25 scoped fleet … a paused fleet holds no erase path of its own …”, covers
+the pre-abandon `RH040` refusal and frontier revocation. The publisher's
+**separate PG16 probes**, rather than that committed test, report the fuller
+abandon-and-retry sequence below:
 
 1. Issue through `ingest_publication_scoped_issue_v1`, then run the scoped
    fleet through `ingest_publication_scoped_candidates_v1` and
@@ -74,7 +76,8 @@ reported sequence is:
 5. Retry user begin and repeat: `RH040` each time, still zero erase rows.
 6. Try per-session erase for the buffered org: `RH011`.
 
-The ordinary-path probe uses `ingest_publication_claim` followed by
+Ordinary-path parity is builder-reported. That separate probe uses
+`ingest_publication_claim` followed by
 `ingest_publication_abandon`; it likewise reports a remaining `building`
 head and `RH040`. Thus the reported gap is not introduced solely by the
 scoped T25 wrapper. Repeated refusal is evidence of the hold, **not** positive
