@@ -211,7 +211,8 @@ test("end to end on the engine: baseline in a REPEATABLE READ transaction, then 
       try { return (await pg.query<Record<string, unknown>>(text, params as unknown[])).rows; } finally { await pg.exec("ROLLBACK"); }
     },
     nowMs: () => clock,
-    // A sleep stands for real time passing; in it the engine flushes pending statistics, as PostgreSQL does within 60 s.
+    // Test fixture only: the sleep FORCES a statistics flush, so the counter read after it is deterministic here. The
+    // runtime does not force one; it only waits AUTHORITY_STATS_SETTLE_MS, a heuristic (see the module).
     async sleep(ms) { clock += ms; await pg.exec("SELECT pg_stat_force_next_flush()"); await pg.exec("SELECT 1"); },
   };
   const opts = { observationWindowMs: 30_000 };

@@ -47,10 +47,14 @@
  * every count and digest equal. Row versions can: every insert, update or delete-and-restore writes a tuple with a new
  * xmin. authorityBaseline records a snapshot (with counts and digests) taken INSIDE the backfill's input snapshot (a
  * REPEATABLE READ transaction, checked); the bound authorityEvidence run then counts the org's rows NOT visible in
- * that snapshot. Zero such rows and equal counts mean the org's row set AT EACH SAMPLE equals the baseline's set; it
- * says nothing about changes undone between samples or made after the last one. An unbound run is at best authority_evidence_unbound (sole refusal
- * sql_unbound), the input authorityBaseline takes; only a bound run can be authority_evidence_corroborated. Order: unbound run
- * (after the stop and the drain) -> backfills with authorityBaseline in their snapshot -> bound run (corroboration).
+ * that snapshot. For ingest_record_revisions and ingest_session_ownership (the only tables whose counts and digests
+ * are fingerprinted), zero such rows and equal counts mean the org's row set AT EACH SAMPLE equals the baseline's set.
+ * ingest_batches is NOT fingerprinted: for it the samples check only that no row of the org was claimed or committed
+ * at or after the stop anchor, none is pending, and none was written after the base snapshot; a batch row removed
+ * (for example truncated) is not detected by them. Nothing here covers changes undone between samples or made after
+ * the last one. An unbound run is at best authority_evidence_unbound (sole refusal sql_unbound), the input
+ * authorityBaseline takes; only a bound run can be authority_evidence_corroborated. Order: unbound run (after the stop
+ * and the drain) -> backfills with authorityBaseline in their snapshot -> bound run (corroboration).
  * Authenticating the baseline's issuer and run, its exact revision and scope, and the backfill's ordering and
  * freshness is the caller's gate, as for every other bound backlog-ops receipt.
  *
@@ -736,10 +740,11 @@ function unboundStop(report: unknown, orgHash: string): { stopDeploymentHash: st
  * READ (or SERIALIZABLE) READ ONLY transaction the backfill reads in, or one that imported the backfill's snapshot
  * (SET TRANSACTION SNAPSHOT); a READ COMMITTED read refuses (baseline_not_snapshot), because its snapshot is the
  * statement's and the backfill's reads would not be bound to it. `evidence` is an unbound authorityEvidence report
- * (every live check passed) that supplies each org's stop. The bound run then checks that the org's rows are exactly
- * the rows of this snapshot at each sample: none written after it (xmin) and the counts equal, which together leave the
- * same set at that sample. It says nothing about changes undone between samples or made after the last one. The
- * digests are a further cross-check.
+ * (every live check passed) that supplies each org's stop. The bound run then checks, at each sample, that the org's
+ * revision and ownership rows are exactly this snapshot's (none written after it by xmin, counts equal, which together
+ * leave the same set; the digests are a further cross-check). For ingest_batches it checks only the since-stop,
+ * pending and written-after-the-snapshot predicates, not set equality: a removed batch row is not detected. Nothing
+ * covers changes undone between samples or made after the last one.
  */
 export async function authorityBaseline(
   orgsInput: readonly unknown[], evidence: unknown, sql: AuthorityEvidenceSources["sql"],
@@ -908,7 +913,8 @@ export async function authorityEvidence(
   await round(2);
   const round2EndMs = src.nowMs();
   const observed = Number.isFinite(round2StartMs - round1EndMs) ? round2StartMs - round1EndMs : null;
-  // The deletion counter, read once every delete committed before round 2 has been flushed to it.
+  // Wait AUTHORITY_STATS_SETTLE_MS, then read the deletion counter again. A heuristic delay: a delete committed before
+  // round 2 is likely, not certain, to be reflected by then (AUTHORITY_STATS_SETTLE_MS).
   await src.sleep(AUTHORITY_STATS_SETTLE_MS);
   const settleStartMs = src.nowMs();
   if (statsFailure === null) {
