@@ -223,8 +223,10 @@ export async function verifySweeperPass(store: RearmReceiptReadStore, request: u
   checks.fresh = "ok";
 
   // Who wrote the exact versions read: only a trusted provider can say, and only about these reads.
+  // Evidence binds to versions: without a version id for BOTH objects there is nothing to bind it to, and no provider
+  // is asked.
   let writer: "verified" | "mismatch" | "unverified" = "unverified";
-  if (writerProvenance !== undefined) {
+  if (writerProvenance !== undefined && read.pointer.versionId !== undefined && read.object.versionId !== undefined) {
     try {
       const got = await writerProvenance(Object.freeze({ pointer: Object.freeze({ ...read.pointer }), receipt: Object.freeze({ ...read.object }) }));
       writer = got === "verified" || got === "mismatch" ? got : "unverified";
@@ -259,5 +261,5 @@ export function validSweeperPassSummary(v: unknown): v is SweeperPassSummary {
   if (!isObj(c) || !closed(c, CHECKS, CHECKS) || !CHECKS.every((k) => c[k] === "ok" || c[k] === "fail" || c[k] === "unchecked")) return false;
   // A verified summary carries every piece of evidence and every check passed.
   return v.verdict !== "verified" || (CHECKS.every((k) => c[k] === "ok") && [v.scope_hash, v.expectation_hash, v.latest_sha256, v.receipt_sha256,
-    v.started_at_ms, v.finished_at_ms, v.age_ms].every((x) => x !== null));
+    v.latest_version_hash, v.receipt_version_hash, v.started_at_ms, v.finished_at_ms, v.age_ms].every((x) => x !== null));
 }

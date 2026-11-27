@@ -19,7 +19,7 @@ import {
 } from "../rearm-sweeper-receipt.ts";
 import { BACKLOG_OPS_SWEEPER_PASS_MAX_AGE_MS } from "../backlog-sweeper-limits.ts";
 import { BACKLOG_OPS_SWEEPER_PASS_MAX_AGE_MS as AUTHORITY_MAX_AGE } from "../backlog-authority.ts";
-import { s3GetOnly } from "../s3-get-only.ts";
+import { S3_GET_ONLY_MAX_BYTES, s3GetOnly } from "../s3-get-only.ts";
 import {
   SWEEPER_PASS_REASONS, sweeperVerifyHash, validSweeperPassSummary, verifySweeperPass, type SweeperPassReadVersions, type SweeperPassSummary,
   type SweeperPassVerifyRequest, type WriterProvenance,
@@ -320,10 +320,22 @@ describe("sweeper-pass-verify: writer provenance and digest binding", () => {
     const [p, r] = await sweeperRecords(store);
     const g = getOnly(store, { versions: { "latest.json": r!.versionId, [`${T0}.json`]: p!.versionId } });
     expect((await verifySweeperPass(g.store, request(), NOW, prov, ROOT)).reason).toBe("writer_mismatch");
-    // No version id at all: nothing to bind evidence to.
-    const unversioned: RearmReceiptReadStore = { async getObject(k) { const got = await store.getObject(k); return { ...got, meta: { ...got.meta, version: {} } }; } };
-    const s = await verifySweeperPass(unversioned, request(), NOW, prov, ROOT);
-    expect(s).toMatchObject({ reason: "writer_unverified", latest_version_hash: null, receipt_version_hash: null });
+    // No version id on either object: nothing to bind evidence to, so even a provider that vouches for anything is
+    // not asked, and the result is writer_unverified.
+    let asked = 0;
+    const vouches: WriterProvenance = async () => { asked++; return "verified"; };
+    for (const strip of ["latest.json", `${T0}.json`, "both"]) {
+      const unversioned: RearmReceiptReadStore = { async getObject(k) {
+        const got = await store.getObject(k);
+        return strip === "both" || String(k).endsWith(strip) ? { ...got, meta: { ...got.meta, version: { eTag: "e" } } } : got;
+      } };
+      const s = await verifySweeperPass(unversioned, request(), NOW, vouches, ROOT);
+      expect({ strip, reason: s.reason }).toEqual({ strip, reason: "writer_unverified" });
+    }
+    expect(asked).toBe(0);
+    // The same provider over versioned reads does pass (the refusal above is the version binding, not the provider).
+    expect((await verifySweeperPass(getOnly(store).store, request(), NOW, vouches, ROOT)).reason).toBe("ok");
+    expect(asked).toBe(1);
   });
 
   test("pointer / receipt digest mismatch is malformed and no evidence is consulted", async () => {
@@ -396,6 +408,7 @@ describe("sweeper-pass-verify: the production CLI", () => {
     expect(validSweeperPassSummary({ ...ok, reason: "writer_unverified" })).toBe(false);
     expect(validSweeperPassSummary({ ...ok, checks: { ...ok.checks, writer: "unchecked" } })).toBe(false);
     expect(validSweeperPassSummary({ ...ok, max_age_ms: 1 })).toBe(false);
+    expect(validSweeperPassSummary({ ...ok, receipt_version_hash: null })).toBe(false);
     expect(validSweeperPassSummary({ ...ok, verdict: "refused", reason: "error: bucket transcripts" })).toBe(false);
     expect(SWEEPER_PASS_REASONS.every((r) => /^[a-z_]{2,32}$/.test(r))).toBe(true);
   });
@@ -413,6 +426,12 @@ describe("sweeper-pass-verify: no writes, ever", () => {
       await expect((ro.getObject as RearmReceiptReadStore["getObject"])(key as never)).rejects.toMatchObject({ code: "invalid_argument" });
     }
     expect(() => s3GetOnly({ bucket: "evil.com/x", region: REGION, credentials: { accessKeyId: "a", secretAccessKey: "b" } })).toThrow();
+    // A body over the cap is refused, declared or streamed, before it is read into memory.
+    const key = objectKey(rearmPassLatestKey(ROOT, ORG_A));
+    const big = (headers: Record<string, string>) => s3GetOnly({ bucket: BUCKET, region: REGION, credentials: { accessKeyId: "a", secretAccessKey: "b" },
+      fetch: (async () => new Response(new Uint8Array(S3_GET_ONLY_MAX_BYTES + 1), { headers })) as never });
+    await expect(big({ "content-length": String(S3_GET_ONLY_MAX_BYTES + 1) }).getObject(key)).rejects.toMatchObject({ code: "backend" });
+    await expect(big({}).getObject(key).then((g) => readAll(g.body))).rejects.toMatchObject({ code: "backend" });
   });
 
   test("the verifier touches only getObject on the store it is handed", async () => {
