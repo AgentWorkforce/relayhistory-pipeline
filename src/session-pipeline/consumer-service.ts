@@ -1135,17 +1135,19 @@ export const CONSUMER_WORKER: Pick<WorkerOptions, "service" | "searchBackends" |
 /**
  * The one plain stderr line the search indexer prints before its stack trace when it
  * fails at startup on Postgres 42501 for the sessions (or search_index) schema or a
- * table: the login is still missing the privileges the search-indexer-bootstrap Job
- * grants. POD_NAMESPACE names the namespace when set to a valid one; otherwise the line
- * says `<namespace>`. Undefined for any other error.
+ * table. It names what was denied and gives the likely causes, not a certain one: the
+ * search-indexer-bootstrap Job has not completed (it grants this login its privileges),
+ * or the grants changed after it ran. POD_NAMESPACE names the namespace when set to a
+ * valid one; otherwise the line says `<namespace>`. Undefined for any other error.
  */
 export function searchIndexerStartupHint(error: unknown, env: NodeJS.ProcessEnv): string | undefined {
   const e = error as { code?: unknown; message?: unknown } | null;
   if (e?.code !== "42501" || typeof e.message !== "string") return undefined;
-  if (!/^permission denied for (schema (sessions|search_index)|table [a-z_][a-z0-9_$]*)$/.test(e.message)) return undefined;
+  const denied = /^permission denied for (schema (?:sessions|search_index)|table [a-z_][a-z0-9_$]*)$/.exec(e.message)?.[1];
+  if (!denied) return undefined;
   const raw = env.POD_NAMESPACE?.trim() ?? "";
   const namespace = /^[a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?$/.test(raw) ? raw : "<namespace>";
-  return `search indexer: the search bootstrap has not completed (the search-indexer-bootstrap Job grants this login its sessions privileges). Check: kubectl -n ${namespace} get jobs | grep search-indexer-bootstrap; if it failed, read its log, fix the cause (often OpenSearch reachability), delete the Job and run helm upgrade again.`;
+  return `search indexer: this login was denied on ${denied} (42501). Likely the search bootstrap has not completed (the search-indexer-bootstrap Job grants this login its sessions privileges), or those grants changed after it ran. Check: kubectl -n ${namespace} get jobs | grep search-indexer-bootstrap; if it failed, read its log, fix the cause (often OpenSearch reachability), delete the Job and run helm upgrade again; if it succeeded, compare this login's grants with what the Job grants (a successful rerun reapplies them).`;
 }
 
 export async function serve(env: NodeJS.ProcessEnv = process.env): Promise<never> {

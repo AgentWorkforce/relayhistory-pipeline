@@ -31,6 +31,7 @@ import {
 } from "../shared/search-composition.ts";
 import type { SqlExecutor } from "@rhc/lib/pipeline/queue.ts";
 import { SearchIndexError } from "@rhc/search-index/contracts.ts";
+import { DEFAULT_OPENSEARCH_INDEX_PREFIX } from "@rhc/search-index/opensearch.ts";
 import { writerTransactionSql } from "./transaction-sql.ts";
 import { supabasePool } from "./lambda.ts";
 import { writerComposition, writerSearchEnv, type WriterProjectionState } from "./consumer-service.ts";
@@ -180,8 +181,25 @@ export function openSearchHost(env: NodeJS.ProcessEnv): string {
   }
 }
 
-/** What an OpenSearch SearchIndexError means for an operator, and where to look. */
-function openSearchCause(error: SearchIndexError, host: string): string {
+/**
+ * The transcript-events index the adapter names (`<prefix>-transcript-events`), from
+ * SEARCH_INDEX_OPENSEARCH_INDEX_PREFIX or the adapter default. A prefix the adapter would
+ * refuse is not echoed.
+ */
+export function openSearchIndexName(env: NodeJS.ProcessEnv): string {
+  const raw = env.SEARCH_INDEX_OPENSEARCH_INDEX_PREFIX?.trim();
+  const prefix = raw ? raw : DEFAULT_OPENSEARCH_INDEX_PREFIX;
+  return /^[a-z0-9][a-z0-9_-]{0,100}$/.test(prefix) ? `${prefix}-transcript-events` : "(the configured index)";
+}
+
+const ADAPTER_DOC = "docs/search-and-runtime-adapters.md (OpenSearch implementation)";
+
+/**
+ * What an OpenSearch SearchIndexError means for an operator, and where to look. Keyed on
+ * the adapter's exact codes and details (opensearch.ts request/ensureSchema). It gives
+ * no deletion or recreation advice: nothing here establishes the target or a recovery.
+ */
+function openSearchCause(error: SearchIndexError, host: string, index: string): string {
   const os = `OpenSearch ${host}`;
   const detail = error.detail ?? "";
   const status = /^http_(\d{3})/.exec(detail)?.[1];
@@ -206,17 +224,29 @@ function openSearchCause(error: SearchIndexError, host: string): string {
     return `${os} is not the configured product (dialect_mismatch): check search.opensearch.dialect`;
   if (error.code === "invalid_argument" || error.code === "unsupported")
     return `the OpenSearch settings are invalid (${error.code}${detail ? `: ${detail}` : ""}): check search.opensearch.* in your values file`;
+  // An existing index whose mapping does not merge (PUT <index>/_mapping answered 400).
+  // The adapter keeps no server text, so the field is not known here.
+  if (error.code === "schema_missing" && detail === "mapping_conflict")
+    return `the OpenSearch index ${index} on ${host} already exists and its mapping conflicts with this release's mapping (schema_missing: mapping_conflict; the conflicting field is not reported): see ${ADAPTER_DOC} or contact support with this line`;
+  // A real index_not_found_exception (404) carries no detail.
+  if (error.code === "schema_missing" && !detail)
+    return `the OpenSearch index ${index} on ${host} was not found (schema_missing): the bootstrap creates it, so it is absent or was removed while this run checked it; rerun the Job, and if this repeats, check search.opensearch.indexPrefix and that the OpenSearch role mapping allows creating indices`;
+  // ensureSchema verifies, never applies, index.gc_deletes.
+  if (error.code === "schema_mismatch" && detail === "gc_deletes")
+    return `the OpenSearch index ${index} on ${host} has index.gc_deletes other than 0 (schema_mismatch: gc_deletes): the bootstrap checks but never changes settings; set index.gc_deletes: 0s on that index (a dynamic setting) and rerun the Job, see ${ADAPTER_DOC}`;
   if (error.code === "schema_missing" || error.code === "schema_mismatch")
-    return `the OpenSearch index on ${host} exists with a conflicting mapping or settings (${error.code}${detail ? `: ${detail}` : ""}): check search.opensearch.indexPrefix, or remove the stale index`;
+    return `the OpenSearch index ${index} on ${host} failed its schema check (${error.code}${detail ? `: ${detail}` : ""}): see ${ADAPTER_DOC} or contact support with this line`;
   return `${os} failed (${error.code}${detail ? `: ${detail}` : ""})`;
 }
 
 /**
  * The one plain stderr line the bootstrap Job prints before its stack trace when the
- * OpenSearch half fails. `postgresApplied` says whether the Postgres half (state tables,
- * grants for search_consumer_runtime) had already committed. In this bootstrap it never
+ * OpenSearch half fails. `postgresApplied` says whether this run's Postgres half (state
+ * tables, grants for search_consumer_runtime) had committed. In this bootstrap it never
  * has: OpenSearch ensureSchema runs inside the single owner transaction, so a failure
- * rolls the Postgres half back. Names, codes and the URL host only; never a URL with
+ * rolls this run's changes back. The line speaks only for this run: it cannot tell
+ * whether an earlier run's grants are in place, so it predicts nothing about the
+ * indexer. Names, codes, the URL host and the index name only; never a URL with
  * credentials or a password. Undefined for anything that is not a SearchIndexError.
  */
 export function searchBootstrapFailureLine(
@@ -226,9 +256,9 @@ export function searchBootstrapFailureLine(
 ): string | undefined {
   if (!(error instanceof SearchIndexError)) return undefined;
   const postgres = postgresApplied
-    ? "the search Postgres part (state tables and grants for search_consumer_runtime) already succeeded and is kept"
-    : 'the search Postgres grants were NOT applied, so the search indexer will report "permission denied for schema sessions" until this Job succeeds';
-  return `search bootstrap failed: ${openSearchCause(error, openSearchHost(env))}; ${postgres}`;
+    ? "this run's search Postgres changes (state tables and grants for search_consumer_runtime) were committed before this failure"
+    : "this run's search Postgres changes (state tables and grants for search_consumer_runtime) were rolled back with it, so this run applied none of them";
+  return `search bootstrap failed: ${openSearchCause(error, openSearchHost(env), openSearchIndexName(env))}; ${postgres}`;
 }
 
 /** Runs a piece of the OpenSearch half; a throw from it marks the OpenSearch half failed. */

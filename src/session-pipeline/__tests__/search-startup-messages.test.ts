@@ -20,7 +20,38 @@ import { assertServiceSchema, searchIndexerStartupHint } from "../consumer-servi
 
 const URL_ENV = { SEARCH_INDEX_OPENSEARCH_URL: "https://search-relay.us-east-1.es.amazonaws.com" };
 const NOT_APPLIED =
-  'the search Postgres grants were NOT applied, so the search indexer will report "permission denied for schema sessions" until this Job succeeds';
+  "this run's search Postgres changes (state tables and grants for search_consumer_runtime) were rolled back with it, so this run applied none of them";
+const INDEX = "relayhistory-transcript-events";
+const HOST = "search-relay.us-east-1.es.amazonaws.com";
+
+/**
+ * A fake OpenSearch that answers ensureSchema's real request sequence: GET / (product),
+ * PUT <index>, PUT <index>/_mapping when the index exists, GET <index>/_settings.
+ */
+function fakeOpenSearch(answers: { create?: Response; mapping?: Response; settings?: Response }) {
+  const json = (status: number, body: unknown) =>
+    new Response(JSON.stringify(body), { status, headers: { "content-type": "application/json" } });
+  return createOpenSearchSearchIndex({
+    url: URL_ENV.SEARCH_INDEX_OPENSEARCH_URL,
+    fetch: async (input, init) => {
+      const path = new URL(input).pathname;
+      if (path === "/") return json(200, { version: { distribution: "opensearch", number: "2.17.0" } });
+      if (init.method === "PUT" && path === `/${INDEX}`) return answers.create ?? json(200, { acknowledged: true });
+      if (init.method === "PUT" && path === `/${INDEX}/_mapping`) return answers.mapping ?? json(200, { acknowledged: true });
+      if (path.startsWith(`/${INDEX}/_settings`))
+        return answers.settings ?? json(200, { [INDEX]: { settings: { "index.gc_deletes": "0s" } } });
+      throw new Error(`unexpected ${init.method} ${path}`);
+    },
+  });
+}
+const reply = (status: number, body: unknown) =>
+  new Response(JSON.stringify(body), { status, headers: { "content-type": "application/json" } });
+/** Phrases that belong to exactly one schema case each. */
+const SCHEMA_PHRASES = {
+  absent: "was not found (schema_missing)",
+  conflict: "mapping conflicts with this release's mapping",
+  gc: "index.gc_deletes other than 0",
+};
 
 async function caught(work: () => Promise<unknown>): Promise<unknown> {
   try {
@@ -47,7 +78,7 @@ describe("search bootstrap: one plain line for an OpenSearch failure", () => {
   test("after the Postgres half committed, the line says it succeeded", () => {
     const line = searchBootstrapFailureLine(new SearchIndexError("unavailable", true, "network"), URL_ENV, true);
     expect(line).toBe(
-      "search bootstrap failed: OpenSearch search-relay.us-east-1.es.amazonaws.com unreachable (network): check search.opensearch.url, the VPC/security group and Pod Identity (the OpenSearch role mapping); the search Postgres part (state tables and grants for search_consumer_runtime) already succeeded and is kept",
+      "search bootstrap failed: OpenSearch search-relay.us-east-1.es.amazonaws.com unreachable (network): check search.opensearch.url, the VPC/security group and Pod Identity (the OpenSearch role mapping); this run's search Postgres changes (state tables and grants for search_consumer_runtime) were committed before this failure",
     );
   });
 
@@ -95,10 +126,74 @@ describe("search bootstrap: one plain line for an OpenSearch failure", () => {
     expect(cause("invalid_argument", "sigv4_needs_https")).toBe(
       "the OpenSearch settings are invalid (invalid_argument: sigv4_needs_https): check search.opensearch.* in your values file",
     );
-    expect(cause("schema_mismatch", "gc_deletes")).toBe(
-      `the OpenSearch index on ${host} exists with a conflicting mapping or settings (schema_mismatch: gc_deletes): check search.opensearch.indexPrefix, or remove the stale index`,
+    expect(cause("schema_mismatch", "some_future_detail")).toBe(
+      `the OpenSearch index ${INDEX} on ${host} failed its schema check (schema_mismatch: some_future_detail): see docs/search-and-runtime-adapters.md (OpenSearch implementation) or contact support with this line`,
     );
     expect(cause("aborted")).toBe(`OpenSearch ${host} failed (aborted)`);
+  });
+
+  test("a real index_not_found_exception (schema_missing, no detail): absent, created by the bootstrap; never 'exists', never removal", async () => {
+    const index = fakeOpenSearch({
+      settings: reply(404, { error: { type: "index_not_found_exception", reason: "no such index [relayhistory-transcript-events]" } }),
+    });
+    const error = (await caught(() => index.ensureSchema())) as SearchIndexError;
+    expect([error.code, error.detail]).toEqual(["schema_missing", undefined]);
+    const line = searchBootstrapFailureLine(error, URL_ENV, false)!;
+    expect(line).toBe(
+      `search bootstrap failed: the OpenSearch index ${INDEX} on ${HOST} was not found (schema_missing): the bootstrap creates it, so it is absent or was removed while this run checked it; rerun the Job, and if this repeats, check search.opensearch.indexPrefix and that the OpenSearch role mapping allows creating indices; ${NOT_APPLIED}`,
+    );
+    expect(line).not.toContain(SCHEMA_PHRASES.conflict);
+    expect(line).not.toContain(SCHEMA_PHRASES.gc);
+    expect(line).not.toMatch(/exists|remove the|delete|recreate|stale/i);
+  });
+
+  test("a real mapping conflict (schema_missing: mapping_conflict): names the index, no field invented, no deletion advice", async () => {
+    const index = fakeOpenSearch({
+      create: reply(400, { error: { type: "resource_already_exists_exception" } }),
+      mapping: reply(400, { error: { type: "illegal_argument_exception", reason: "mapper [content_prefix_folded] cannot be changed" } }),
+    });
+    const error = (await caught(() => index.ensureSchema())) as SearchIndexError;
+    expect([error.code, error.detail]).toEqual(["schema_missing", "mapping_conflict"]);
+    const line = searchBootstrapFailureLine(error, URL_ENV, false)!;
+    expect(line).toBe(
+      `search bootstrap failed: the OpenSearch index ${INDEX} on ${HOST} already exists and its mapping conflicts with this release's mapping (schema_missing: mapping_conflict; the conflicting field is not reported): see docs/search-and-runtime-adapters.md (OpenSearch implementation) or contact support with this line; ${NOT_APPLIED}`,
+    );
+    expect(line).not.toContain(SCHEMA_PHRASES.absent);
+    expect(line).not.toContain(SCHEMA_PHRASES.gc);
+    expect(line).not.toContain("content_prefix_folded"); // backend reason text never reaches the line
+    expect(line).not.toMatch(/remove|delete|recreate|drop|stale/i);
+  });
+
+  test("a real gc_deletes mismatch (schema_mismatch: gc_deletes): its own line, the documented dynamic setting", async () => {
+    const index = fakeOpenSearch({ settings: reply(200, { [INDEX]: { settings: { "index.gc_deletes": "60s" } } }) });
+    const error = (await caught(() => index.ensureSchema())) as SearchIndexError;
+    expect([error.code, error.detail]).toEqual(["schema_mismatch", "gc_deletes"]);
+    const line = searchBootstrapFailureLine(error, URL_ENV, false)!;
+    expect(line).toBe(
+      `search bootstrap failed: the OpenSearch index ${INDEX} on ${HOST} has index.gc_deletes other than 0 (schema_mismatch: gc_deletes): the bootstrap checks but never changes settings; set index.gc_deletes: 0s on that index (a dynamic setting) and rerun the Job, see docs/search-and-runtime-adapters.md (OpenSearch implementation); ${NOT_APPLIED}`,
+    );
+    expect(line).not.toContain(SCHEMA_PHRASES.absent);
+    expect(line).not.toContain(SCHEMA_PHRASES.conflict);
+    // "gc_deletes" is the setting's own name; no delete/remove/recreate advice.
+    expect(line).not.toMatch(/\b(remove|delete|recreate)\b|stale/i);
+  });
+
+  test("the index name follows SEARCH_INDEX_OPENSEARCH_INDEX_PREFIX and never echoes an invalid prefix", () => {
+    const error = new SearchIndexError("schema_mismatch", false, "gc_deletes");
+    expect(searchBootstrapFailureLine(error, { ...URL_ENV, SEARCH_INDEX_OPENSEARCH_INDEX_PREFIX: "acme" }, false)).toContain(
+      "index acme-transcript-events on",
+    );
+    const bad = searchBootstrapFailureLine(error, { ...URL_ENV, SEARCH_INDEX_OPENSEARCH_INDEX_PREFIX: "Bad Prefix/../x" }, false)!;
+    expect(bad).toContain("index (the configured index) on");
+    expect(bad).not.toContain("Bad Prefix");
+  });
+
+  test("the grants clause speaks only for this run: no claim about earlier grants, no 42501 prediction", () => {
+    for (const applied of [false, true]) {
+      const line = searchBootstrapFailureLine(new SearchIndexError("unavailable", true, "network"), URL_ENV, applied)!;
+      expect(line).toContain("this run's search Postgres changes");
+      expect(line).not.toMatch(/permission denied|42501|will report|NOT applied|until this Job succeeds/);
+    }
   });
 
   test("never a URL with credentials, a path or a query: the host only", () => {
@@ -146,7 +241,7 @@ describe("search bootstrap: the wrapper serve() runs", () => {
     });
     expect(written).toHaveLength(1);
     expect(written[0]).toContain("refused the request (http_403)");
-    expect(written[0]).toContain("already succeeded and is kept");
+    expect(written[0]).toContain("were committed before this failure");
   });
 
   test("a SearchIndexError from the Postgres half (not OpenSearch) prints nothing", async () => {
@@ -174,8 +269,8 @@ describe("search indexer: startup hint for a 42501 on the sessions schema", () =
   afterEach(async () => {
     await Promise.all(open.splice(0).map((d) => d.close().catch(() => undefined)));
   });
-  const HINT = (ns: string) =>
-    `search indexer: the search bootstrap has not completed (the search-indexer-bootstrap Job grants this login its sessions privileges). Check: kubectl -n ${ns} get jobs | grep search-indexer-bootstrap; if it failed, read its log, fix the cause (often OpenSearch reachability), delete the Job and run helm upgrade again.`;
+  const HINT = (ns: string, denied = "schema sessions") =>
+    `search indexer: this login was denied on ${denied} (42501). Likely the search bootstrap has not completed (the search-indexer-bootstrap Job grants this login its sessions privileges), or those grants changed after it ran. Check: kubectl -n ${ns} get jobs | grep search-indexer-bootstrap; if it failed, read its log, fix the cause (often OpenSearch reachability), delete the Job and run helm upgrade again; if it succeeded, compare this login's grants with what the Job grants (a successful rerun reapplies them).`;
 
   /** The runtime login before the bootstrap granted it anything. */
   async function ungranted(grant = ""): Promise<PGlite> {
@@ -202,11 +297,16 @@ describe("search indexer: startup hint for a 42501 on the sessions schema", () =
     expect(searchIndexerStartupHint(error, { POD_NAMESPACE: "agent-relay" })).toBe(HINT("agent-relay"));
   });
 
-  test("a 42501 on a table counts; with schema USAGE but no table grant", async () => {
+  test("a table-level 42501 (privilege drift after a completed bootstrap): names the table, offers both causes", async () => {
     const db = await ungranted("GRANT USAGE ON SCHEMA sessions TO search_consumer_runtime;");
     const error = await caught(() => db.query("SELECT 1 FROM sessions.search_consumer_pending"));
     expect((error as Error).message).toBe("permission denied for table search_consumer_pending");
-    expect(searchIndexerStartupHint(error, {})).toBe(HINT("<namespace>"));
+    const hint = searchIndexerStartupHint(error, {})!;
+    expect(hint).toBe(HINT("<namespace>", "table search_consumer_pending"));
+    // A likely cause, not a certain one: the drift case is named, and the line never says the bootstrap failed.
+    expect(hint).toContain("or those grants changed after it ran");
+    expect(hint).toMatch(/^search indexer: this login was denied on table search_consumer_pending \(42501\)\. Likely /);
+    expect(hint).not.toMatch(/bootstrap failed|denied on schema/);
   });
 
   test("other errors, other schemas and an unsafe POD_NAMESPACE do not get through", () => {
@@ -217,7 +317,7 @@ describe("search indexer: startup hint for a 42501 on the sessions schema", () =
     expect(searchIndexerStartupHint(new Error("pipeline consumer: refusing to run as SUPERUSER"), {})).toBeUndefined();
     expect(searchIndexerStartupHint(undefined, {})).toBeUndefined();
     expect(searchIndexerStartupHint(pg("permission denied for schema search_index"), { POD_NAMESPACE: "ns; rm -rf /" })).toBe(
-      HINT("<namespace>"),
+      HINT("<namespace>", "schema search_index"),
     );
   });
 });
