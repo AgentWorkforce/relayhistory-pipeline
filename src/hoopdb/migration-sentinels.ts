@@ -668,6 +668,10 @@ export const MIGRATION_SENTINELS: Record<string, Sentinel> = {
     evidence: "table sessions.search_catchup_cursor and function sessions.archive_search_stage_v1() (the search-index stage)",
     sql: "SELECT to_regclass('sessions.search_catchup_cursor') IS NOT NULL AND to_regprocedure('sessions.archive_search_stage_v1()') IS NOT NULL AS applied",
   },
+  "upstream:20261105062330_buffered_search_feed_custom_plans.sql": {
+    evidence: "replacement: buffered_search_feed_stage and ingest_buffer_gc_ordinals carry plan_cache_mode=force_custom_plan",
+    sql: "SELECT count(*)=2 AS applied FROM pg_proc WHERE oid IN(to_regprocedure('sessions.buffered_search_feed_stage(jsonb)'),to_regprocedure('sessions.ingest_buffer_gc_ordinals(uuid)')) AND 'plan_cache_mode=force_custom_plan'=ANY(proconfig)",
+  },
   "upstream:20261105062070_coordination_advisor_readers.sql": {
     evidence: "functions sessions.coordination_advisor_write_facts_v1 and sessions.coordination_advisories_recent_v1",
     sql: "SELECT to_regprocedure('sessions.coordination_advisor_write_facts_v1(text,text,timestamptz,timestamptz,text,integer)') IS NOT NULL AND to_regprocedure('sessions.coordination_advisories_recent_v1(text,text,timestamptz)') IS NOT NULL AS applied",
@@ -687,4 +691,5 @@ export const NON_CREATE_STEPS = [
   "96bulls:0004_summary_pointers.sql",
   "upstream:20261105043900_session_consumer_function_grants.sql",
   "upstream:20261105045030_session_consumer_project_text_grant.sql",
+  "upstream:20261105062330_buffered_search_feed_custom_plans.sql",
 ] as const;

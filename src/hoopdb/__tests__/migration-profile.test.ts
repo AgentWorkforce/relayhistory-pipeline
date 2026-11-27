@@ -2721,7 +2721,23 @@ describe("function boundary: ACL manifest, residual, activation gate", () => {
       const open = src.indexOf(tag, start) + tag.length;
       return src.slice(open, src.indexOf(tag, open));
     };
-    // 20261105062300 (the search-index stage) is newest: 062220's down refuses (55000) while it is applied; its
+    // 20261105062330 (the buffered feed custom plans) is newest: 062300's down refuses (55000) while it is applied; its
+    // checksum-pinned down RESETs plan_cache_mode on the stage RPC and gc_ordinals (their prior proconfig exactly),
+    // removes its ledger row, and refuses on a rerun.
+    const BCP = "upstream:20261105062330_buffered_search_feed_custom_plans.sql";
+    const cfg = async (sig: string) =>
+      (await db.query<{ c: string[] }>("SELECT proconfig c FROM pg_proc WHERE oid=$1::regprocedure", [sig])).rows[0]!.c;
+    const STAGE_RPC = "sessions.buffered_search_feed_stage(jsonb)", GC_ORDINALS = "sessions.ingest_buffer_gc_ordinals(uuid)";
+    expect(await names()).toContain(BCP);
+    expect(await cfg(STAGE_RPC)).toEqual(["search_path=pg_catalog, sessions, pg_temp", "lock_timeout=2s", "plan_cache_mode=force_custom_plan"]);
+    expect(await cfg(GC_ORDINALS)).toEqual(["search_path=pg_catalog, pg_temp", "plan_cache_mode=force_custom_plan"]);
+    expect((await failure(rollback("20261105062300_search_index_stage.down.sql")))?.code).toBe("55000");
+    await rollback("20261105062330_buffered_search_feed_custom_plans.down.sql");
+    expect(await names()).not.toContain(BCP);
+    expect(await cfg(STAGE_RPC)).toEqual(["search_path=pg_catalog, sessions, pg_temp", "lock_timeout=2s"]);
+    expect(await cfg(GC_ORDINALS)).toEqual(["search_path=pg_catalog, pg_temp"]);
+    expect((await failure(rollback("20261105062330_buffered_search_feed_custom_plans.down.sql")))?.code).toBe("55000");
+    // 20261105062300 (the search-index stage) is then newest: 062220's down refuses (55000) while it is applied; its
     // checksum-pinned down (no search-index job, event or letter) drops the stage's objects, restores the
     // 20261031000100 stage CHECKs and removes its ledger row, and refuses on a rerun. It never drops the audit
     // archive or its seal (§8), even empty: the table, its manifest index, the seal function and both seal triggers
