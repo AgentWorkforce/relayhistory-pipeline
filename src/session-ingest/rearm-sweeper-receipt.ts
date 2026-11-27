@@ -200,11 +200,15 @@ export function validRearmPassLatest(v: unknown, scope: string): v is RearmPassL
 const json = (b: Uint8Array): unknown => JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(b));
 const PUT = { contentType: "application/json" } as const;
 
-/** The object's bytes and version, or null when absent. Denied access refuses; other store errors propagate. */
-async function fetchObject(store: ObjectStore, key: string): Promise<{ bytes: Uint8Array; version?: ObjectVersion } | null> {
+/** All a receipt reader needs: one GET returning the body and that same response's attributes. */
+export type RearmReceiptReadStore = Pick<ObjectStore, "getObject">;
+type ReadMeta = Awaited<ReturnType<ObjectStore["getObject"]>>["meta"];
+
+/** The object's bytes, version and that response's attributes, or null when absent. Denied access refuses; other store errors propagate. */
+async function fetchObject(store: RearmReceiptReadStore, key: string): Promise<{ bytes: Uint8Array; version?: ObjectVersion; meta: ReadMeta } | null> {
   try {
     const got = await store.getObject(objectKey(key));
-    return { bytes: await readAll(got.body), version: got.meta.version };
+    return { bytes: await readAll(got.body), version: got.meta.version, meta: got.meta };
   } catch (error) {
     if (isObjectStoreError(error, "not_found")) return null;
     if (isAccessDenied(error)) throw new RearmSweepRefused("access_denied");
@@ -284,9 +288,26 @@ export type FreshSweeperPass =
   | { ok: true; ageMs: number; receipt: RearmPassReceipt }
   | { ok: false; reason: FreshSweeperPassRefusal };
 
-type ScopeVerdict = { ok: true; receipt: RearmPassReceipt } | { ok: false; reason: "missing" | "malformed" };
+/**
+ * What one GET of a pass object returned, from that same response (no extra read): its version attributes as the store
+ * reported them and the sha256 of the exact bytes read. Not writer attribution by itself (sweeper-pass-verify.ts).
+ */
+export interface RearmReceiptObjectRead { versionId?: string; eTag?: string; lastModifiedMs: number; sha256: string }
+export type RearmScopeRead =
+  | { ok: true; receipt: RearmPassReceipt; pointer: RearmReceiptObjectRead; object: RearmReceiptObjectRead }
+  | { ok: false; reason: "missing" | "malformed" };
+const objectRead = (got: { bytes: Uint8Array; meta: ReadMeta }): RearmReceiptObjectRead => ({
+  ...(typeof got.meta.version?.version === "string" && got.meta.version.version !== "" ? { versionId: got.meta.version.version } : {}),
+  ...(typeof got.meta.version?.eTag === "string" && got.meta.version.eTag !== "" ? { eTag: got.meta.version.eTag } : {}),
+  lastModifiedMs: got.meta.lastModified instanceof Date ? got.meta.lastModified.getTime() : Number.NaN, sha256: sha256(got.bytes),
+});
 
-async function readScope(store: ObjectStore, keyRoot: string, scope: string): Promise<ScopeVerdict> {
+/**
+ * One scope's latest pointer and the receipt it names, both well formed and bound (the receipt's bytes hash to the
+ * pointer's receiptSha256; start and finish agree), with each object's read attributes. Reads only; `malformed`
+ * otherwise. freshSweeperPass is this plus the expectation match and the freshness bounds.
+ */
+export async function readRearmPassScope(store: RearmReceiptReadStore, keyRoot: string, scope: string): Promise<RearmScopeRead> {
   const latest = await fetchObject(store, rearmPassLatestKey(keyRoot, scope));
   if (!latest) return { ok: false, reason: "missing" };
   let pointer: unknown;
@@ -299,11 +320,11 @@ async function readScope(store: ObjectStore, keyRoot: string, scope: string): Pr
   if (!validRearmPassReceipt(receipt, keyRoot, scope) || receipt.startedAtMs !== pointer.startedAtMs || receipt.finishedAtMs !== pointer.finishedAtMs) {
     return { ok: false, reason: "malformed" };
   }
-  return { ok: true, receipt };
+  return { ok: true, receipt, pointer: objectRead(latest), object: objectRead(got) };
 }
 
 const BUCKET = /^[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]$/;
-function validExpectation(e: unknown): e is RearmPassExpectation {
+export function validRearmPassExpectation(e: unknown): e is RearmPassExpectation {
   if (!isObj(e)) return false;
   const x = e as unknown as RearmPassExpectation;
   const list = (l: unknown, re: RegExp) => l === undefined || (Array.isArray(l) && l.every((v) => typeof v === "string" && re.test(v)));
@@ -317,7 +338,7 @@ function validExpectation(e: unknown): e is RearmPassExpectation {
 }
 
 /** Does a valid receipt describe a pass of exactly the expected sweeper? */
-function matches(r: RearmPassReceipt, keyRoot: string, e: RearmPassExpectation): boolean {
+export function rearmPassMatches(r: RearmPassReceipt, keyRoot: string, e: RearmPassExpectation): boolean {
   const scopes = rearmScopes(keyRoot, e.orgs);
   const w = r.workload;
   // Every revision list the caller asserts must be matched (AND): a pinned image is never satisfied by the same source
@@ -345,16 +366,16 @@ function matches(r: RearmPassReceipt, keyRoot: string, e: RearmPassExpectation):
  * They attest the sweeper's pass only where the store admits no other writer there (a bucket-policy deny for every
  * principal but the sweeper role on that prefix, which this code does not create); the caller must establish that too.
  */
-export async function freshSweeperPass(store: ObjectStore, keyRoot: string, org: string, nowMs: number, maxAgeMs: number,
+export async function freshSweeperPass(store: RearmReceiptReadStore, keyRoot: string, org: string, nowMs: number, maxAgeMs: number,
   expected: RearmPassExpectation): Promise<FreshSweeperPass> {
   if (!KEY_ROOT.test(keyRoot) || !validOrg(org) || !ms(nowMs) || !Number.isSafeInteger(maxAgeMs) || maxAgeMs < 1 || maxAgeMs > REARM_RECEIPT_MAX_AGE_LIMIT_MS
-    || !validExpectation(expected)) {
+    || !validRearmPassExpectation(expected)) {
     return { ok: false, reason: "invalid_request" };
   }
   if (expected.orgs !== null && !expected.orgs.includes(org)) return { ok: false, reason: "out_of_scope" };
-  const got = await readScope(store, keyRoot, expected.orgs === null ? REARM_ALL_ORGS : org);
-  if (!got.ok) return got;
-  if (!matches(got.receipt, keyRoot, expected)) return { ok: false, reason: "mismatch" };
+  const got = await readRearmPassScope(store, keyRoot, expected.orgs === null ? REARM_ALL_ORGS : org);
+  if (!got.ok) return { ok: false, reason: got.reason };
+  if (!rearmPassMatches(got.receipt, keyRoot, expected)) return { ok: false, reason: "mismatch" };
   const ageMs = nowMs - got.receipt.finishedAtMs;
   if (ageMs < -REARM_RECEIPT_FUTURE_SKEW_MS) return { ok: false, reason: "future" };
   if (ageMs > maxAgeMs) return { ok: false, reason: "stale" };
