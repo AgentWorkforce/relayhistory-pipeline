@@ -641,4 +641,71 @@ describe("round-5 controls", () => {
     for (const at of [cut, "2026-11-11T00:00:00.000Z"]) expect(deriveState([s], forge(at), cut)).toEqual(without);
     expect(deriveState([s], forge("2026-11-01T00:30:00.000Z"), cut)).toMatchObject({ state: "in_progress", basis: "forge" });
   });
+
+  test("forge sealed after a later landing never changes an earlier cut (cherry-pick, --no-ff merge, merged revert)", async () => {
+    const { execFileSync } = await import("node:child_process");
+    const { forgeFacts } = await import("../backfill/forge.ts");
+    const cut = "2026-11-10T00:00:00.000Z", after = "2026-11-13T00:00:00.000Z";
+    const fixture = (name: string) => {
+      const repo = join(tmp, `r9-${name}`);
+      mkdirSync(repo);
+      const git = (args: string[], date: string) => execFileSync("git", ["-C", repo, ...args], { env: { ...process.env, GIT_AUTHOR_DATE: date, GIT_COMMITTER_DATE: date, GIT_AUTHOR_NAME: "t", GIT_AUTHOR_EMAIL: "t@example.invalid", GIT_COMMITTER_NAME: "t", GIT_COMMITTER_EMAIL: "t@example.invalid" }, encoding: "utf8" }).trim();
+      const commit = (file: string, date: string) => { writeFileSync(join(repo, file), file); git(["add", file], date); git(["commit", "-q", "-m", file], date); return git(["rev-parse", "HEAD"], date); };
+      git(["init", "-q", "-b", "main"], "2026-11-01T00:00:00Z");
+      commit("base.txt", "2026-11-01T00:00:00Z");
+      const seal = () => forgeFacts("example/widgets", repo, "2026-10-31T00:00:00Z", "2026-11-30T00:00:00Z", "main", () => []);
+      return { git, commit, seal };
+    };
+    const session = (sha: string, branches: string[] = []) => ({ source: "claude", sessionId: "s", analyzedAt: "2026-11-02T01:00:00.000Z", startedAt: "2026-11-02T00:00:00.000Z", endedAt: "2026-11-02T01:00:00.000Z", title: "", asked: [],
+      built: [{ kind: "commit", ref: sha.slice(0, 7), what: `commit ${sha.slice(0, 7)}`, at: "2026-11-02T00:30:00.000Z", evidence: [] }], gaps: [], rationale: [], outcomeStatuses: ["superseded"], dropped: {},
+      keys: { repo: "example/widgets", branches, prs: [], commits: [], files: [], taskRefs: [], parents: [] } }) as unknown as SessionFacts;
+
+    // 1. A Nov 2 topic commit cherry-picked onto main on Nov 12.
+    {
+      const { git, commit, seal } = fixture("pick");
+      git(["checkout", "-q", "-b", "feat/pick"], "2026-11-02T00:00:00Z");
+      const topic = commit("pick.txt", "2026-11-02T00:00:00Z");
+      const s = session(topic);
+      const before = deriveState([s], seal(), cut);
+      expect(before).toMatchObject({ state: "in_progress", basis: "forge" });
+      git(["checkout", "-q", "main"], "2026-11-12T00:00:00Z");
+      git(["cherry-pick", topic], "2026-11-12T00:00:00Z");
+      const later = seal();
+      const c = later.commits.find((x) => x.sha === topic)!;
+      expect([c.at, c.defaultAt, c.defaultAtBasis, c.onDefaultBranch]).toEqual(["2026-11-02T00:00:00.000Z", "2026-11-12T00:00:00.000Z", "patch", true]);
+      expect(deriveState([s], later, cut)).toEqual(before);
+      expect(deriveState([s], later, after).state).toBe("shipped");
+    }
+    // 2. A Nov 2 topic tip merged --no-ff on Nov 12.
+    {
+      const { git, commit, seal } = fixture("noff");
+      git(["checkout", "-q", "-b", "feat/noff"], "2026-11-02T00:00:00Z");
+      const topic = commit("noff.txt", "2026-11-02T00:00:00Z");
+      const s = session(topic, ["feat/noff"]);
+      const before = deriveState([s], seal(), cut);
+      expect(before).toMatchObject({ state: "in_progress", basis: "forge" });
+      git(["checkout", "-q", "main"], "2026-11-12T00:00:00Z");
+      git(["merge", "-q", "--no-ff", "-m", "merge", "feat/noff"], "2026-11-12T00:00:00Z");
+      const later = seal();
+      expect(later.branches!.find((b) => b.name === "feat/noff")).toMatchObject({ landed: true, landedAt: "2026-11-12T00:00:00.000Z", tipAt: "2026-11-02T00:00:00.000Z" });
+      expect(deriveState([s], later, cut)).toEqual(before);
+      expect(deriveState([s], later, after).state).toBe("shipped");
+    }
+    // 3. A Nov 1 main commit reverted on a side branch on Nov 3, the revert merged --no-ff on Nov 12.
+    {
+      const { git, commit, seal } = fixture("revert");
+      const mainWork = commit("work.txt", "2026-11-01T12:00:00Z");
+      git(["checkout", "-q", "-b", "fix/revert"], "2026-11-03T00:00:00Z");
+      git(["revert", "--no-edit", mainWork], "2026-11-03T00:00:00Z");
+      const s = session(mainWork);
+      const before = deriveState([s], seal(), cut);
+      expect(before).toMatchObject({ state: "shipped", basis: "forge" });
+      git(["checkout", "-q", "main"], "2026-11-12T00:00:00Z");
+      git(["merge", "-q", "--no-ff", "-m", "merge revert", "fix/revert"], "2026-11-12T00:00:00Z");
+      const later = seal();
+      expect(later.commits.find((x) => x.sha === mainWork)!.revertedAt).toBe("2026-11-12T00:00:00.000Z");
+      expect(deriveState([s], later, cut)).toEqual(before);
+      expect(deriveState([s], later, after).state).toBe("regressed");
+    }
+  });
 });

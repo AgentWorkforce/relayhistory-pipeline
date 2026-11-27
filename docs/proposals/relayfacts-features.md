@@ -136,7 +136,13 @@ must cite evidence ids that the scorer checks.
    the transcript reader takes the line of a `bash -lc` argv. A commit is on the default branch from the time it became reachable
    from it: a merged commit from its merge, a re-cut commit from its patch-id landing. A first-parent
    commit (a squash, a direct push, a fast-forward) has only its committer time, since the mirror holds
-   no push times; that approximation is recorded as `defaultAtBasis: committer`. A branch whose tip predates the feature's first session is not its landing.
+   no push times; that approximation is recorded as `defaultAtBasis: committer`. A re-cut commit keeps
+   its own commit time; only `defaultAt` moves to the landing. A branch landed when its tip first became
+   reachable from the default branch (the merge that brought it in), or when its patch's first
+   default-branch copy did, never at its tip's own time. A revert takes effect when the reverting commit
+   reached the default branch, so a revert written on a side branch and merged later is dated by the merge.
+   Sealing the forge again after a later landing leaves every earlier cut's state unchanged (tested with
+   real git histories). A branch whose tip predates the feature's first session is not its landing.
 
    **As-of.** Session facts are cut strictly at `asOf`: a timed item, and every evidence pointer and
    quote inside it, counts only before `asOf`; anything without a time of its own (a mention-only key,

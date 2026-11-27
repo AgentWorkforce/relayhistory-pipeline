@@ -7,11 +7,13 @@
  */
 import { execFileSync } from "node:child_process";
 import { parseArgs } from "node:util";
-import { utcForge, type ForgeFacts } from "../features/types.ts";
+import { requireUtc, utcForge, type ForgeFacts } from "../features/types.ts";
 import { parseForge } from "../bench/corpus.ts";
 import { writeOutsideFile } from "../out-path.ts";
 import { printable, UsageError } from "../errors.ts";
 
+/** Git writes committer times with their own offsets: canonical UTC as read, so every comparison below is time order. */
+const gitTime = (t: string) => requireUtc(t, "a git committer time");
 const git = (dir: string, args: string[]) => execFileSync("git", ["-C", dir, ...args], { encoding: "utf8", maxBuffer: 512 * 1024 * 1024 });
 
 const VALUE_SETTING = /_(?:MS|S|SECONDS|TTL|MODE|PROVIDER|ENGINE|KIND|BUCKET|URL|ID|BYTES|SIZE|COUNT|MAX|MIN)$/u;
@@ -74,9 +76,10 @@ export function forgeFacts(repo: string, mirror: string, since: string, until: s
   const basis = new Map<string, "merge" | "committer">();
   const fp = git(mirror, ["log", "--first-parent", "--format=%H %P%x09%cI", `--since=${since}`, defaultBranch]).split("\n").filter(Boolean);
   for (const l of fp.reverse()) {
-    const [ids, at] = l.split("\t");
+    const [ids, rawAt] = l.split("\t");
     const [sha, first, ...merged] = ids!.split(" ");
-    if (!sha || !at) continue;
+    if (!sha || !rawAt) continue;
+    const at = gitTime(rawAt);
     defaultAt.set(sha, at);
     basis.set(sha, "committer");
     if (first && merged.length) for (const m of merged) for (const c of git(mirror, ["rev-list", `${first}..${m}`]).split("\n").filter(Boolean)) if (!defaultAt.has(c)) { defaultAt.set(c, at); basis.set(c, "merge"); }
@@ -84,25 +87,33 @@ export function forgeFacts(repo: string, mirror: string, since: string, until: s
   const commits: ForgeFacts["commits"] = [];
   const reverted = new Map<string, { by: string; at: string }>();
   for (const line of git(mirror, ["log", "--all", `--since=${since}`, `--until=${until}`, "--format=%H%x09%cI%x09%B%x1e"]).split("\x1e")) {
-    const [sha, at, ...body] = line.trim().split("\t");
-    if (!sha || !at) continue;
+    const [sha, rawAt, ...body] = line.trim().split("\t");
+    if (!sha || !rawAt) continue;
+    const at = gitTime(rawAt);
     commits.push({ sha, at, onDefaultBranch: onDefault.has(sha), ...(defaultAt.has(sha) ? { defaultAt: defaultAt.get(sha)!, defaultAtBasis: basis.get(sha)! } : {}) });
     const m = /This reverts commit ([0-9a-f]{7,40})/u.exec(body.join("\t"));
-    if (m && onDefault.has(sha)) reverted.set(m[1]!, { by: sha, at });
+    // A revert takes effect when the reverting commit reached the default branch (a revert made on a side
+    // branch and merged later is dated by the merge), not when it was written.
+    if (m && onDefault.has(sha)) reverted.set(m[1]!, { by: sha, at: defaultAt.get(sha) ?? at });
   }
   // A branch commit the lander re-cut onto the default branch has a different sha but the same patch: map it
-  // by `git patch-id --stable`, and date its landing by the default-branch copy.
+  // by `git patch-id --stable`, and date its landing by the default-branch copy. Its own commit time (`at`) is
+  // kept: it existed from then, off the default branch, and only `defaultAt` says when it reached it.
   const patchOf = new Map<string, string>();
   const patchIds = execFileSync("sh", ["-c", `git -C "$0" log --all --since="$1" --until="$2" -p --format='commit %H' | git patch-id --stable`, mirror, since, until], { encoding: "utf8", maxBuffer: 512 * 1024 * 1024 });
   for (const line of patchIds.split("\n")) { const [pid, sha] = line.split(" "); if (pid && sha) patchOf.set(sha, pid); }
   const landedByPatch = new Map<string, { sha: string; at: string }>();
-  for (const c of commits) if (c.onDefaultBranch && patchOf.has(c.sha) && !landedByPatch.has(patchOf.get(c.sha)!)) landedByPatch.set(patchOf.get(c.sha)!, { sha: c.sha, at: c.defaultAt ?? c.at });
+  // The earliest default-branch copy of each patch (git log lists newest first).
+  for (const c of commits) {
+    const pid = patchOf.get(c.sha), at = c.defaultAt ?? c.at;
+    const prev = pid ? landedByPatch.get(pid) : undefined;
+    if (c.onDefaultBranch && pid && (!prev || at < prev.at)) landedByPatch.set(pid, { sha: c.sha, at });
+  }
   for (const c of commits) {
     const r = reverted.get(c.sha) ?? [...reverted].find(([k]) => c.sha.startsWith(k))?.[1];
     const landed = !c.onDefaultBranch ? landedByPatch.get(patchOf.get(c.sha) ?? "") : undefined;
     if (landed) {
       c.onDefaultBranch = true;
-      c.at = landed.at;
       c.defaultAt = landed.at;
       c.defaultAtBasis = "patch";
       const lr = reverted.get(landed.sha) ?? [...reverted].find(([k]) => landed.sha.startsWith(k))?.[1];
@@ -112,8 +123,8 @@ export function forgeFacts(repo: string, mirror: string, since: string, until: s
   }
   // Branch landing: a branch's work reached the default branch when its tip is an ancestor of it, when any of
   // its own commits has a default-branch copy with the same patch id, or when its combined diff (a squash) does.
-  const mainPatch = new Map<string, string>();
-  for (const c of commits) if (c.onDefaultBranch) { const pid = patchOf.get(c.sha); if (pid && !mainPatch.has(pid)) mainPatch.set(pid, c.at); }
+  // A patch reached the default branch when its first default-branch copy did (that copy's defaultAt).
+  const mainPatch = new Map([...landedByPatch].map(([pid, l]) => [pid, l.at]));
   const sh = (cmd: string, ...args: string[]) => { try { return execFileSync("sh", ["-c", cmd, ...args], { encoding: "utf8", maxBuffer: 256 * 1024 * 1024 }).trim(); } catch { return ""; } };
   let docs = "";
   try {
@@ -124,10 +135,16 @@ export function forgeFacts(repo: string, mirror: string, since: string, until: s
   const flags = [...known].map(([name, defaultOn]) => ({ name, defaultOn })).sort((a, b) => (a.name < b.name ? -1 : 1));
   const branches: NonNullable<ForgeFacts["branches"]> = [];
   for (const name of git(mirror, ["for-each-ref", "--format=%(refname:short)", "refs/heads"]).split("\n").filter((b) => b && b !== defaultBranch)) {
-    const tipAt = git(mirror, ["log", "-1", "--format=%cI", name]).trim();
-    if (!tipAt || tipAt < since) continue;
+    const rawTip = git(mirror, ["log", "-1", "--format=%cI", name]).trim();
+    if (!rawTip) continue;
+    const tipAt = gitTime(rawTip);
+    if (tipAt < requireUtc(since, "--since")) continue;
     const ancestor = sh(`git -C "$0" merge-base --is-ancestor "$1" "$2" && echo yes`, mirror, name, defaultBranch) === "yes";
-    let landedAt: string | null = ancestor ? tipAt : null;
+    // An ancestral landing is dated by when the tip first became reachable from the default branch (the merge
+    // that brought it in, or its own time for a fast-forward), never by the tip's commit time. A tip older than
+    // the walk (reachable before `since`) has no known landing time inside the window: its tip time stands.
+    const tip = git(mirror, ["rev-parse", "--verify", `refs/heads/${name}^{commit}`]).trim();
+    let landedAt: string | null = ancestor ? (defaultAt.get(tip) ?? tipAt) : null;
     const own = git(mirror, ["rev-list", "--max-count=200", `${defaultBranch}..${name}`]).split("\n").filter(Boolean);
     if (!landedAt) for (const sha of own) {
       const at = mainPatch.get(patchOf.get(sha) ?? "");
