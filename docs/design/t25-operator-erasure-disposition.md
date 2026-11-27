@@ -3,7 +3,7 @@
 Status: **HOLD — no supported clearance established.** This is a code-only
 disposition of the combined `RH040` / `RH011` case, not a retirement design,
 implementation assignment, or operator procedure. It is separate from the
-replay-target manifest work reserved as 062330.
+replay-target manifest work reserved as 062360.
 
 ## Ownership and evidence boundary
 
