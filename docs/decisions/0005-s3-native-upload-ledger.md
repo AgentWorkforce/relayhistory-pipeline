@@ -84,8 +84,9 @@ All of these sit under the per-user admission directory that already holds `priv
   deny keeps every other principal from writing under `.ledger/rearm-sweeper/` (D5,
   `RearmSweeperOnlyItWritesItsState`, docs/aws-stage.md), and only for versions written while that
   deny was in effect: the pointer's and the receipt's `LastModified` strictly inside a documented
-  interval of continuous enforcement established by audit evidence, not by readback observations
-  alone (docs/aws-stage.md, "Enforcement intervals"); anything else,
+  interval of continuous enforcement (complete writer history or control, opened only once effective
+  enforcement is independently established; a readback is only a checkpoint; docs/aws-stage.md,
+  "Enforcement intervals"); anything else,
   including a version a delete exposes, needs an independent record of its writer. The keys sit beside the sweeper's cursor, so the role's existing
   `RearmSweeperReads` / `RearmSweeperWritesProgress` grants on `96bulls/.ledger/rearm-sweeper/*` cover
   them; an identity policy narrower than that needs `s3:GetObject` and `s3:PutObject` on

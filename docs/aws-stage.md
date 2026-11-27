@@ -1197,8 +1197,9 @@ nothing. Lifecycle expiration is S3's own action and is not evaluated against th
   effect or was written while it was rolled back (including one a later delete exposes), has unknown authorship from
   the policy alone. Readback records when the policy was OBSERVED, not when it took effect, so the evidence rule is:
   for the pointer and for the receipt it names, S3's `LastModified` of the exact version read must lie strictly
-  inside a documented interval of continuous enforcement for that signing role, established by audit evidence and
-  never by observations alone (see "Enforcement intervals" below),
+  inside a documented interval of continuous enforcement for that signing role (complete writer history or control,
+  opened only once effective enforcement is independently established; never by observations alone; see
+  "Enforcement intervals" below),
   or another record must identify the writer. A time merely after the first readback is not enough (it admits writes
   made while the deny was rolled back); a version at an interval's edge, or with a timestamp equal to one, is
   unknown. It does not cover `s3:DeleteObjectVersion` (the requested scope; the
@@ -1260,7 +1261,8 @@ unaffected.
 
 After applying either phase:
 1. Read the policy back with `aws s3api get-bucket-policy` for the transcripts bucket and record the time it was
-   observed (an observation: neither the moment the deny took effect nor proof that it stayed in effect). Confirm
+   observed (a necessary checkpoint: neither the moment the deny took effect, nor proof that data-plane writes are
+   fenced by it, nor proof that it stayed in effect). Confirm
    `RearmSweeperOnlyItWritesItsState` is present (or, rolled back, absent) and byte-equal to what this repo renders for
    the configured role, with every other statement unchanged from before the apply.
 2. Simulate against THAT policy (the read-back document as the resource policy, never a hand-written copy), with the
@@ -1296,11 +1298,16 @@ to the signing role and its binding:
   - a complete, trusted policy-change history (change-control or audit records) with no gap; or
   - exclusive, serialized control of all of those writers (no policy or role change can start outside it).
 Serialization only during a rollback is not enough.
-- **Start** at the time enforcement is POSITIVELY established, never backdated to the install request: the
-  observation (step 1) of `RearmSweeperOnlyItWritesItsState` exactly as rendered for the role that follows the
-  recorded installing write, with no other recorded policy write or role change in between. A version written
-  between the install and that observation is unknown. If no such time can be established, no interval starts and
-  every version needs independent writer evidence. The same rule applies to the initial install and to every reopen.
+- **Start** at the time EFFECTIVE enforcement is positively established, never backdated to the install request.
+  A readback (step 1) showing `RearmSweeperOnlyItWritesItsState` exactly as rendered for the role, after the recorded
+  installing write and with no other recorded policy write or role change in between, is a NECESSARY checkpoint
+  but not sufficient: `GetBucketPolicy` shows what the control plane returns, and AWS documents no guarantee that it
+  fences the authorization of every later data-plane `PutObject` (S3's consistency model covers objects, not policy
+  propagation). The interval opens only at a time for which effective enforcement is independently established;
+  this repo prescribes no method, and a live write probe is not one. If that cannot be done, the interval stays
+  unopened and every version needs a writer record bound to that exact version (the `latest.json` version read and
+  the receipt version it names). A version written before the established time is unknown. The same rule applies to
+  the initial install and to every reopen.
 - **End**, conservatively, before any removal or modification STARTS: the start of the earliest recorded policy write
   or role change after the start (even one that later turned out harmless), the start of any gap in the history or
   in exclusive control, or a rollback (step 4), whichever comes first. Reopen only after enforcement is established
@@ -1319,12 +1326,16 @@ Acceptance examples (times illustrative):
   the last audited start is trusted, and the 10:06 version is unknown.
 - *Removal hidden by a restore.* Present observed at 10:00; removed at 10:05; a non-sweeper writes at 10:06;
   restored at 10:07; present observed again at 10:10. Both observations match, yet the 10:06 version is unknown: the
-  recorded writes at 10:05 and 10:07 end the interval at 10:05, and it reopens only at 10:10, when the observation
-  positively establishes enforcement again. Without that history or control the matching observations prove nothing
-  about 10:05 to 10:10, and every version in that span is unknown.
+  recorded writes at 10:05 and 10:07 end the interval at 10:05. The 10:10 observation is only the necessary
+  checkpoint: the interval reopens at the time effective enforcement is independently established after it, and
+  stays closed if that cannot be done. Without that history or control the matching observations prove nothing about
+  10:05 to 10:10, and every version in that span is unknown.
 - *Write between install and confirmation.* Recorded install at 10:07; a version written at 10:08; matching
-  observation at 10:10. The interval starts at 10:10, not 10:07, so the 10:08 version is unknown (the same on the
-  first install and on any reopen); only versions written strictly after 10:10 can rely on the deny.
+  observation at 10:10. The interval does not start at 10:07, and the 10:10 readback alone does not start it either:
+  the 10:08 version is unknown, and so is a version written at 10:11, unless effective enforcement is independently
+  established at some time T, in which case only versions written strictly after T can rely on the deny. Otherwise
+  each exact pointer and receipt version needs its own writer record. The same holds on the first install and on any
+  reopen.
 
 **How a capture stays read-only.** `alchemy plan` against `AWS.state` is not
 read-only: Alchemy takes a lease (PUT then DELETE of `__lease__.json`) and
