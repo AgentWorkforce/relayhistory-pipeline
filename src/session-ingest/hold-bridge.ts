@@ -212,6 +212,20 @@ export interface ReplayDeps {
   now(): number;
 }
 
+/**
+ * The proofs an erasure needs before its replay or its receipt may count (both paths call this): a user erase needs
+ * bytes_verified and a proven generation boundary; a session erase needs a manifest source. null when they hold.
+ */
+export async function erasureProof(d: Pick<ReplayDeps, "org" | "userGenerationBoundary" | "resolveSessionTargets">, e: Erasure):
+  Promise<"erasure_bytes_unverified" | "erasure_generation_unproven" | "session_manifest_missing" | null> {
+  if (e.kind === "session") return d.resolveSessionTargets ? null : "session_manifest_missing";
+  if (!e.bytesVerified) return "erasure_bytes_unverified";
+  let ok = false;
+  try { ok = d.userGenerationBoundary ? await d.userGenerationBoundary({ orgId: d.org, workspaceId: e.workspaceId, userId: e.userId }, e.requestId) : false; }
+  catch { ok = false; }
+  return ok ? null : "erasure_generation_unproven";
+}
+
 export type ReplayOutcome = "replayed" | "already" | "session_manifest_missing" | "session_coverage_partial" | "erasure_bytes_unverified"
   | "erasure_generation_unproven" | "replay_failed";
 async function readReceipt(store: ObjectStore, key: string): Promise<unknown | null> {
@@ -226,17 +240,16 @@ async function readReceipt(store: ObjectStore, key: string): Promise<unknown | n
  */
 export async function replayErasure(d: ReplayDeps, e: Erasure): Promise<ReplayOutcome> {
   if (!ORG.test(d.org) || !UUID.test(d.epoch)) refuse("hold_input");
-  // A session erase resolves its manifest BEFORE any receipt lookup: an old receipt never bypasses the proof.
-  if (e.kind === "session" && !d.resolveSessionTargets) return "session_manifest_missing";
+  // Every proof BEFORE any receipt lookup: an old (or pre-seeded) receipt never bypasses a missing proof.
+  const proof = await erasureProof(d, e);
+  if (proof !== null) return proof;
   const key = erasureReceiptKey(d.keyRoot, d.org, d.epoch, e.requestId);
   const existing = await readReceipt(d.store, key);
   if (existing !== null) return validErasureReceipt(existing, d.epoch, e.requestId) ? "already" : "replay_failed";
   const counts = { reset: 0, payloads: 0, owners: 0 };
   try {
     if (e.kind === "user") {
-      if (!e.bytesVerified) return "erasure_bytes_unverified";
       const tenant = { orgId: d.org, workspaceId: e.workspaceId, userId: e.userId };
-      if (!d.userGenerationBoundary || !(await d.userGenerationBoundary(tenant, e.requestId))) return "erasure_generation_unproven";
       counts.reset = await d.resetUploadedSessions(tenant, e.requestId);
       counts.payloads = await d.eraseLogPayloads(tenant);
     } else {
@@ -288,14 +301,18 @@ export async function replayErasures(d: ReplayDeps, readCount: () => Promise<num
  * May bridge_complete be released? Only with the hold marker_attempted at `epoch`, and every erasure in `set` (re-read
  * immediately before the release) receipted for that epoch. Returns a code: ok, or the first reason it may not.
  */
-export async function bridgeCompleteVerdict(store: ObjectStore, keyRoot: string, org: string, hold: Hold | null, epoch: string, set: readonly Erasure[]):
+export async function bridgeCompleteVerdict(store: ObjectStore, keyRoot: string, org: string, hold: Hold | null, epoch: string, set: readonly Erasure[],
+  proofs: Pick<ReplayDeps, "userGenerationBoundary" | "resolveSessionTargets"> = {}):
   Promise<{ code: "ok" | "hold_missing" | "hold_epoch_mismatch" | "hold_not_attempted" | "erasure_unreplayed"; erasures: number; receipted: number }> {
   const base = { erasures: set.length, receipted: 0 };
   if (hold === null) return { code: "hold_missing", ...base };
   if (hold.epoch !== epoch) return { code: "hold_epoch_mismatch", ...base };
   if (hold.state !== "marker_attempted") return { code: "hold_not_attempted", ...base };
   let receipted = 0;
-  for (const e of set) if (validErasureReceipt(await readReceipt(store, erasureReceiptKey(keyRoot, org, epoch, e.requestId)), epoch, e.requestId)) receipted++;
+  // A receipt counts only when the erasure's proofs hold now too (the release counter is independent of the replay).
+  for (const e of set)
+    if ((await erasureProof({ org, ...proofs }, e)) === null && validErasureReceipt(await readReceipt(store, erasureReceiptKey(keyRoot, org, epoch, e.requestId)), epoch, e.requestId))
+      receipted++;
   return { code: receipted === set.length ? "ok" : "erasure_unreplayed", erasures: set.length, receipted };
 }
 

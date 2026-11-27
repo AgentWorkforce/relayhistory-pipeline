@@ -218,6 +218,20 @@ test("replay, user erase without a proven generation boundary (today: none exist
   }
 });
 
+test("a pre-seeded receipt never bypasses a missing proof, on the replay path or the release counter", async () => {
+  const store = fresh();
+  const { d } = deps(store);
+  expect(await replayErasure(d, userErase)).toBe("replayed"); // a receipt now exists (as if pre-seeded)
+  const noGen = { ...d, userGenerationBoundary: undefined };
+  // Replay path: verified bytes but no generation proof -> refused before the receipt is read.
+  expect(await replayErasure(noGen, userErase)).toBe("erasure_generation_unproven");
+  expect(await replayErasure(d, { ...userErase, bytesVerified: false })).toBe("erasure_bytes_unverified");
+  // Release counter: the same receipt does not count without the proofs.
+  expect((await bridgeCompleteVerdict(store, ROOT, ORG, hold("marker_attempted"), E, [userErase], {})).code).toBe("erasure_unreplayed");
+  expect((await bridgeCompleteVerdict(store, ROOT, ORG, hold("marker_attempted"), E, [{ ...userErase, bytesVerified: false }], d)).code).toBe("erasure_unreplayed");
+  expect((await bridgeCompleteVerdict(store, ROOT, ORG, hold("marker_attempted"), E, [userErase], d)).code).toBe("ok");
+});
+
 test("replay failures write no receipt (retried later); a corrupt receipt is never taken as done", async () => {
   for (const over of [{ resetUploadedSessions: async () => { throw new Error("s3 503 secret"); } }, { eraseLogPayloads: async () => { throw new Error("unverified"); } }]) {
     const store = fresh();
@@ -266,16 +280,16 @@ test("bridge_complete: only with the hold marker_attempted at this epoch and eve
   const store = fresh();
   const { d } = deps(store);
   await replayErasure(d, userErase);
-  expect(await bridgeCompleteVerdict(store, ROOT, ORG, hold("marker_attempted"), E, [userErase])).toEqual({ code: "ok", erasures: 1, receipted: 1 });
+  expect(await bridgeCompleteVerdict(store, ROOT, ORG, hold("marker_attempted"), E, [userErase], d)).toEqual({ code: "ok", erasures: 1, receipted: 1 });
   expect(await bridgeCompleteVerdict(store, ROOT, ORG, hold("marker_attempted"), E, [])).toEqual({ code: "ok", erasures: 0, receipted: 0 });
   // An erasure that arrived after the last replay (the re-read at release) refuses.
-  expect((await bridgeCompleteVerdict(store, ROOT, ORG, hold("marker_attempted"), E, [userErase, sessionErase])).code).toBe("erasure_unreplayed");
+  expect((await bridgeCompleteVerdict(store, ROOT, ORG, hold("marker_attempted"), E, [userErase, sessionErase], d)).code).toBe("erasure_unreplayed");
   expect((await bridgeCompleteVerdict(store, ROOT, ORG, null, E, [])).code).toBe("hold_missing");
   expect((await bridgeCompleteVerdict(store, ROOT, ORG, hold("marker_attempted", { epoch: E2 }), E, [])).code).toBe("hold_epoch_mismatch");
   expect((await bridgeCompleteVerdict(store, ROOT, ORG, hold("sealed"), E, [])).code).toBe("hold_not_attempted");
   // A receipt from another epoch never counts.
   await replayErasure({ ...d, epoch: E2 }, sessionErase);
-  expect((await bridgeCompleteVerdict(store, ROOT, ORG, hold("marker_attempted"), E, [userErase, sessionErase])).code).toBe("erasure_unreplayed");
+  expect((await bridgeCompleteVerdict(store, ROOT, ORG, hold("marker_attempted"), E, [userErase, sessionErase], d)).code).toBe("erasure_unreplayed");
 });
 
 // ---- waves and alarms ----
