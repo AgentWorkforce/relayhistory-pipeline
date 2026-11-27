@@ -1,8 +1,9 @@
 /**
  * 062350 deep-page proof on real PostgreSQL (SESSION_INGEST_TEST_PG_URL): sessions.buffered_search_feed_page walks
  * ingest_stage_intents_cleanup_idx in (created_at, stage_token) order from a deep cursor and stops at the limit,
- * probing the outbox per row by its primary key. It never hash-joins the two tables or sorts, including after the
- * 5-execution generic-plan point.
+ * probing the outbox once per visited row through ingest_buffer_outbox_active_stage_token_idx (the planner's choice
+ * for the scalar subquery). It never hash-joins the two tables, sorts or gathers, including after the 5-execution
+ * generic-plan point.
  *
  * Fixture (synthetic ids only): one heavy tenant with FEED_PROOF_ROWS (default 750,000) acknowledged live stage
  * intents, one per second, each with its own batch. Every intent before the cursor has an erased outbox row. After
@@ -11,7 +12,9 @@
  * The claim/batch parent chain is irrelevant to the plan and is not built. Statistics come from ANALYZE.
  *
  * The plan is read with auto_explain (log_nested_statements, analyze, buffers, JSON) at NOTICE on the runtime
- * login. The RPC requires session_user = buffered_search_feed_runtime, which this fixture's trust auth allows.
+ * login. The RPC requires session_user = buffered_search_feed_runtime, which this fixture's trust auth allows. That
+ * role is cluster-global: it is switched to LOGIN only for this proof and switched back in afterAll, and a failed
+ * restore fails the run, so a reused fixture never keeps a changed role silently.
  * The same fixture then runs with 062350 rolled back (its .down.sql) to record the prior body's plan for
  * comparison. That part is evidence only and is not asserted.
  */
@@ -32,7 +35,14 @@ const OUT = process.env.FEED_PROOF_OUT;
 
 let db: ScratchDatabase | undefined;
 let restoreLogin: (() => Promise<void>) | undefined;
-afterAll(async () => { await db?.drop().catch(() => {}); await restoreLogin?.().catch(() => {}); }, 120_000);
+afterAll(async () => {
+  await db?.drop().catch(() => {});
+  if (!restoreLogin) return;
+  await restoreLogin(); // fail-visible: a throw here fails the run
+  const a = await client(url!);
+  try { expect((await a.query("SELECT rolcanlogin FROM pg_roles WHERE rolname=$1", [RUNTIME])).rows[0].rolcanlogin).toBe(false); }
+  finally { await a.end(); }
+}, 120_000);
 
 type PlanNode = { "Node Type": string; "Index Name"?: string; "Relation Name"?: string; "Actual Rows"?: number;
   "Rows Removed by Filter"?: number; "Shared Hit Blocks"?: number; "Shared Read Blocks"?: number; "Actual Loops"?: number;
@@ -67,7 +77,7 @@ async function seed(su: pg.Client) {
 async function pages(d: ScratchDatabase, cursor: string, times: number) {
   const c = await client(runtimeUrl(d));
   await c.query("SET statement_timeout = '5s'"); // the production feed login's startup statement_timeout
-  const plans: { plan: PlanNode; ms: number }[] = []; let last: { stages: { stageToken: string; createdAt: string }[] } | undefined;
+  const plans: { plan: PlanNode; ms: number }[] = []; const results: { stages: { stageToken: string; createdAt: string }[] }[] = [];
   c.on("notice", (m) => {
     const text = String(m.message ?? "");
     const i = text.indexOf("{"); if (i < 0) return;
@@ -78,9 +88,9 @@ async function pages(d: ScratchDatabase, cursor: string, times: number) {
   });
   try {
     for (let k = 0; k < times; k++)
-      last = (await c.query("SELECT sessions.buffered_search_feed_page($1::jsonb) AS r", [JSON.stringify({ cursor, since: "2026-11-01T00:00:00Z", limit: 200 })])).rows[0].r;
+      results.push((await c.query("SELECT sessions.buffered_search_feed_page($1::jsonb) AS r", [JSON.stringify({ cursor, since: "2026-11-01T00:00:00Z", limit: 200 })])).rows[0].r);
   } finally { await c.end(); }
-  return { plans, last: last! };
+  return { plans, results, last: results[results.length - 1]! };
 }
 
 async function armAutoExplain(su: pg.Client) {
@@ -127,12 +137,14 @@ test.skipIf(!url)("062350: a deep page walks the cleanup index in order and stop
     const after = await pages(db, "proof-keyset", 8);
     const wallMs = Date.now() - t0;
 
-    // Correctness: the 200 stages directly after the cursor that have an active outbox, in order.
-    const got = after.last.stages;
-    expect(got).toHaveLength(200);
+    // Correctness on every call (the page never advances the cursor): exactly the 200 active stages after it, in order.
     const firstActive = Math.ceil((CURSOR_AT + 1) / 10) * 10;
-    expect(got[0]!.stageToken).toBe((await su.query("SELECT md5('st'||$1::int)::uuid::text t", [firstActive])).rows[0].t);
-    expect(got.map((s) => s.createdAt)).toEqual([...got.map((s) => s.createdAt)].sort());
+    const want = (await su.query("SELECT array_agg(md5('st'||i)::uuid::text ORDER BY i) t FROM generate_series($1::int, $1::int + 1990, 10) i", [firstActive])).rows[0].t as string[];
+    expect(after.results).toHaveLength(8);
+    for (const r of after.results) {
+      expect(r.stages.map((s) => s.stageToken)).toEqual(want);
+      expect(r.stages.map((s) => s.createdAt)).toEqual([...r.stages.map((s) => s.createdAt)].sort());
+    }
 
     expect(after.plans).toHaveLength(8);
     const summaries = after.plans.map((p) => ({ ...summary(p.plan), ms: p.ms }));
@@ -140,8 +152,13 @@ test.skipIf(!url)("062350: a deep page walks the cleanup index in order and stop
       expect(s.nodes.some((n) => n.startsWith("Hash Join") || n.startsWith("Sort") || n.startsWith("Gather"))).toBe(false);
       expect(s.stageScan?.type).toBe("Index Scan");
       expect(s.stageScan?.index).toBe("ingest_stage_intents_cleanup_idx");
-      // The walk visits only the rows between the cursor and the 200th match, not the table.
-      expect((s.stageScan?.rows ?? 0) + (s.stageScan?.removedByFilter ?? 0)).toBeLessThanOrEqual(2_100);
+      // The walk visits only the rows between the cursor and the 200th match, not the table, and probes each once.
+      const visited = (s.stageScan?.rows ?? 0) + (s.stageScan?.removedByFilter ?? 0);
+      expect(s.stageScan?.rows).toBe(200);
+      expect(visited).toBeLessThanOrEqual(2_100);
+      expect(s.outboxProbe?.type).toBe("Index Scan");
+      expect(s.outboxProbe?.index).toBe("ingest_buffer_outbox_active_stage_token_idx");
+      expect(s.outboxProbe?.loops).toBe(visited);
     }
 
     // Evidence only: the same fixture under the prior page body (062350 rolled back).
