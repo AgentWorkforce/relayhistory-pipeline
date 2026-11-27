@@ -1,6 +1,7 @@
 /**
  * Emitted JSON through the consumer path: a pointer failure with a pg-style 40001 logs "pointer index failed" with the
- * closed db_error_reason slug, never the message text; other codes carry no db_error_reason. Synthetic ids only.
+ * closed db_error_reason slug (an XX000: db_internal_reason), never the message text; other codes carry neither. Reason
+ * extraction is best-effort: an unreadable message never rejects the batch. Synthetic ids only.
  */
 import { expect, test } from "bun:test";
 import { processBatch } from "../consumer.ts";
@@ -53,6 +54,45 @@ test("emitted JSON: a non-40001 pointer failure carries no db_error_reason", asy
   const lines = await failedLines({ code: "55P03", message: "publication: pointer mutation busy" });
   const failed = lines.filter((l) => l.message === "pointer index failed");
   expect(failed[0]).toMatchObject({ error_code: "55P03" });
-  expect("db_error_reason" in failed[0]!).toBe(false);
+  expect("db_error_reason" in failed[0]! || "db_internal_reason" in failed[0]!).toBe(false);
   expect(JSON.stringify(lines)).not.toContain("pointer mutation busy");
+});
+
+/** A pg-style error whose `message` getter throws (a hostile or broken error object). */
+function unreadable(code: string) {
+  return { code, get message(): string { throw new Error("PRIVATE-MARKER-getter-text"); } };
+}
+
+test("processBatch: a 40001 with an unreadable message still fails only its item (partial batch), reason other, no raw text", async () => {
+  // m2 is a non-manifest key under the same session: ignored, so it succeeds; m1's pointer failure is per-item.
+  const other = KEY.replace("manifest.json", "chunk-0001.jsonl.zst");
+  const body2 = JSON.stringify({ Records: [{ eventSource: "aws:s3", eventName: "ObjectCreated:Put", s3: { object: { key: encodeURIComponent(other) } } }] });
+  let result: unknown;
+  const lines = await stderrJson(async () => {
+    result = await processBatch([{ messageId: "m1", body: BODY }, { messageId: "m2", body: body2 }], { pointer: pointerRaising(unreadable("40001")) });
+  });
+  expect(result).toEqual({ batchItemFailures: [{ itemIdentifier: "m1" }] });
+  const failed = lines.filter((l) => l.message === "pointer index failed");
+  expect(failed).toHaveLength(1);
+  expect(failed[0]).toMatchObject({ level: "error", stage: "session-indexed", error_code: "40001", db_error_reason: "other" });
+  expect(JSON.stringify(lines)).not.toContain("PRIVATE-MARKER");
+});
+
+test("processBatch: an XX000 with an unreadable message fails its item with db_internal_reason=other", async () => {
+  const lines = await failedLines(unreadable("XX000"));
+  const failed = lines.filter((l) => l.message === "pointer index failed");
+  expect(failed[0]).toMatchObject({ error_code: "XX000", db_internal_reason: "other" });
+  expect("db_error_reason" in failed[0]!).toBe(false);
+  expect(JSON.stringify(lines)).not.toContain("PRIVATE-MARKER");
+});
+
+test("emitted JSON: an XX000 logs its closed family, never the message text", async () => {
+  const MARKER = "PRIVATE-MARKER-relation-secret_table";
+  const lines = await failedLines(Object.assign(new Error(`cache lookup failed for relation ${MARKER}`), { code: "XX000" }));
+  const failed = lines.filter((l) => l.message === "pointer index failed");
+  expect(failed).toHaveLength(1);
+  expect(failed[0]).toMatchObject({ error_code: "XX000", db_internal_reason: "cache_lookup_failed" });
+  expect("db_error_reason" in failed[0]!).toBe(false);
+  expect(JSON.stringify(lines)).not.toContain(MARKER);
+  expect(JSON.stringify(lines)).not.toContain("cache lookup failed");
 });
