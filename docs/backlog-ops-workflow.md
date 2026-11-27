@@ -378,6 +378,40 @@ the backfill itself throws (enumerated from its source), a digits-only `sqlstate
 `db_connection_lost`; anything else becomes `backfill_refused`. Before this, `redactedReason` let any
 code-shaped error message through.
 
+### Verifying a sweeper pass (sweeper-pass-verify; read only, CLI)
+
+`scripts/backlog-sweeper-verify.ts` (contract: `src/session-ingest/sweeper-pass-verify.ts`) checks one org's
+latest re-arm sweeper pass receipt without writing anything. It is a CLI, not a dispatch mode: the workflow
+never runs it.
+
+    bun scripts/backlog-sweeper-verify.ts --bucket <locker> --region <r> < expectation.json
+
+The expectation (one JSON line on stdin, a closed shape) is the serving sweeper as the operator established it
+independently of the store: the org, the sweeper's org scope (or null), its transcript and ledger homes, its
+namespace and CronJob, the ONE image digest it is pinned to, and optionally its git sha and the Job and Pod names
+and UIDs. Invalid input is refused before any credential is read or request made. Run it with the dry
+(read-only) role.
+
+It reads exactly two objects with signed GETs (`latest.json` and the receipt it names) through `s3GetOnly`, a
+frozen `{ getObject }` that is not an object store. It never loads the authority path. It applies
+`freshSweeperPass`'s validation and match, with authority-execute's window (`BACKLOG_OPS_SWEEPER_PASS_MAX_AGE_MS`,
+6 h, which the caller cannot change) and the future skew, on its own clock. It also requires: the exact digest
+(a git sha never stands in), a Job name of that CronJob with a Job UID, a Pod name of that Job with its own Pod
+UID, and no Lambda name.
+
+A PASS also needs trusted evidence that the sweeper wrote the exact pointer and receipt versions read (see
+`docs/aws-stage.md`, D5: LastModified strictly inside a documented enforcement interval, or a writer record).
+Neither this tree nor the S3 read API has such a source: body fields, user metadata, ETag, version id and the bucket
+policy do not identify the writer. So the production run refuses every pass that meets every other check with
+`writer_unverified`. That is the expected result until a trusted source exists. A provider seam exists, but no
+input can reach it.
+
+Output is one JSON line, the closed summary (`validSweeperPassSummary`), for success and for every refusal. It
+holds the mode, verdict and a fixed reason code. It also holds hashes of the scope and expectation, the sha256 of
+both objects' bytes, a hash of each version read (when S3 reports a version id), the pass times and the checks.
+Unavailable fields are null. It never contains an org, key, bucket, identity, digest, ARN, version id or error
+text. Exit 0 only when the verdict is `verified`.
+
 ### The sweeper's serving spec (proposal; not built)
 
 The GitHub job has no kubectl. It therefore reads what the CURRENT serving sweeper is from
@@ -418,40 +452,6 @@ Prerequisites before the hold can be lifted (none is code on this branch):
   reconcile one by epoch.
 - An independently authenticated serving spec (the observer above, with its bucket-policy deny).
 - A reviewed commit that flips `BACKLOG_OPS_AUTHORITY_EXECUTE_ENABLED`.
-
-### Verifying a sweeper pass (sweeper-pass-verify; read only, CLI)
-
-`scripts/backlog-sweeper-verify.ts` (contract: `src/session-ingest/sweeper-pass-verify.ts`) checks one org's
-latest re-arm sweeper pass receipt without writing anything. It is a CLI, not a dispatch mode: the workflow
-never runs it.
-
-    bun scripts/backlog-sweeper-verify.ts --bucket <locker> --region <r> < expectation.json
-
-The expectation (one JSON line on stdin, a closed shape) is the serving sweeper as the operator established it
-independently of the store: the org, the sweeper's org scope (or null), its transcript and ledger homes, its
-namespace and CronJob, the ONE image digest it is pinned to, and optionally its git sha and the Job and Pod names
-and UIDs. Invalid input is refused before any credential is read or request made. Run it with the dry
-(read-only) role.
-
-It reads exactly two objects with signed GETs (`latest.json` and the receipt it names) through `s3GetOnly`, a
-frozen `{ getObject }` that is not an object store. It never loads the authority path. It applies
-`freshSweeperPass`'s validation and match, with authority-execute's window (`BACKLOG_OPS_SWEEPER_PASS_MAX_AGE_MS`,
-6 h, which the caller cannot change) and the future skew, on its own clock. It also requires: the exact digest
-(a git sha never stands in), a Job name of that CronJob with a Job UID, a Pod name of that Job with its own Pod
-UID, and no Lambda name.
-
-A PASS also needs trusted evidence that the sweeper wrote the exact pointer and receipt versions read (see
-`docs/aws-stage.md`, D5: LastModified strictly inside a documented enforcement interval, or a writer record).
-Neither this tree nor the S3 read API has such a source: body fields, user metadata, ETag, version id and the bucket
-policy do not identify the writer. So the production run refuses every pass that meets every other check with
-`writer_unverified`. That is the expected result until a trusted source exists. A provider seam exists, but no
-input can reach it.
-
-Output is one JSON line, the closed summary (`validSweeperPassSummary`), for success and for every refusal. It
-holds the mode, verdict and a fixed reason code. It also holds hashes of the scope and expectation, the sha256 of
-both objects' bytes, a hash of each version read (when S3 reports a version id), the pass times and the checks.
-Unavailable fields are null. It never contains an org, key, bucket, identity, digest, ARN, version id or error
-text. Exit 0 only when the verdict is `verified`.
 
 ## Gates
 
