@@ -113,19 +113,33 @@ The only existing per-org advisory key is `'repo-catalog:'||org` (025000100:235)
 per-org row every buffered admission takes FOR SHARE is the org's `ingest_buffer_admission` row, but publication and
 controls take it too.
 
-## Risks the design addresses
+## Risks and how revision 3 addresses them
 
-1. **Renewal and rebind are all-or-nothing bulk statements.** A hold that touches admission rows, or that raises for
-   one org inside them, aborts them for every org. The hold never touches admission rows.
-2. **RBA and LG are shared with publication, history plans and ordered controls.** The hold has its own check, run from
-   the `ingest_batches` triggers.
-3. **Canonical claim and commit paths have no admission guard.** The INSERT trigger covers the claim; the commits are
-   open item 1.
+1. **Renewal and rebind are all-or-nothing bulk statements.** A hold that touches admission rows, or raises for one
+   org inside them, would abort them for every org. The hold never reads or writes admission rows.
+2. **RBA and LG are shared with publication, history plans and ordered controls.** The hold has its own `_check`,
+   called at the entry of each admission function. Publication's entry points also call it, and they are refused only
+   once the hold is `sealed`.
+3. **The canonical claim and commit paths have no admission guard.** All are entry-checked: `ingest_claim_batch`,
+   `claim_mode`, and `ingest_commit_batch` / `ingest_commit_revisions` (the latter two accept committed rows and NULL
+   batch ids).
 4. **A new `ingest_%` table with `org_id` would enter the `lazy_begin` and `lazy_user` scans and the repair scan
-   hash.** The hold table uses `held_org` and has no `workspace_id` or `user_id`.
-5. **Committing an existing claim admits content without a new batch row.** Install requires zero pending, and the
-   pending -> committed transition is refused under a hold.
-6. **`ingest_lazy_records` locks before the claim's RBA.** The trigger takes the org key last, and install holds
-   nothing a claim needs, so there is no cycle.
-7. **Seeding has no admission check.** Open item 2.
+   hash.** The hold tables use `held_org` and have no `workspace_id` or `user_id`.
+5. **Committing an existing claim admits content without a new batch row.** Every commit, stage and ack entry is
+   checked at entry. Install also requires zero pending batches.
+6. **`ingest_lazy_records` locks before the claim's RBA, and the buffered wrappers write a bootstrap row and slots
+   before `claim_mode` sees a replay.** The `_check` runs first, at the outermost entry, before any lock or write.
+   Inner calls re-take the same shared key, which is a no-op re-grant. Install, seal, attempt and release take only
+   key X.
+7. **Seeding has no admission check, and it spans one capture's org across several users.** It is refused under a
+   hold. The org comes from the trusted capture row, then the key S is taken, then the capture is re-read under the
+   lock.
 8. **Isolation.** `_check` requires read committed (40001 otherwise), as every admission path already runs.
+9. **Publication commits after the catch-up cursor.** It is waited out by the seal. The final catch-up also selects by
+   xmin against FULL's first snapshot.
+
+## G (addendum): the new key
+
+`hashtextextended('96bulls:ingest-org-hold-v1:' || org, 0)` is a single literal prefix that no existing key uses (see
+the list above). Two-int keys live in another lock space. It can coincide with another key only through a 64-bit hash
+collision, and that would only over-serialize.

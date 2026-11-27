@@ -1,7 +1,7 @@
 # Per-org admission hold: an enforced writer fence for the fence-authority marker
 
-Status: revision 2, for joint review by b1 and layered-sessions-pipeline. Revision 1 (8e0463d9) was held; its four
-dispositions and the joint disposition are folded in (section 7). No migration code until both agree. Slot
+Status: revision 3, for joint review by b1 and layered-sessions-pipeline. Revisions 1 (8e0463d9) and 2 (6d7e1b06,
+dacfc1d9) were held; every disposition is folded in (section 9). No migration code until both agree. Slot
 `20261105062320_ingest_org_admission_fences` is reserved for this design (registry receipt 251934773687459840).
 This track is code-only. Applying the migration to a real database is a separate, gated action. backlog-ops
 authority-execute stays dormant until the slot lands, is applied, and the marker step binds to it.
@@ -30,9 +30,9 @@ runtime-granted function, so a new function is unclassified and fails the build.
 
 | Class | Functions (latest body) | Under a hold |
 |---|---|---|
-| **Admission entry**: checks the hold first | `ingest_origin_claim_buffered_batch` 062010:105; `ingest_claim_buffered_batch` 043850:1130; `ingest_claim_batch` 050000:306; `ingest_claim_batch_mode` 050010:117 (inner; checked again, harmlessly re-entrant); `ingest_origin_commit_buffered_batch` 062010:125; `ingest_commit_buffered_batch` 050010:373; the origin and plain `ingest_prepare_buffer_stage` 043850:1172; **`ingest_commit_batch` 050010:441** (accepts committed rows and can reach revision writes; disposition 1); **`ingest_commit_revisions` 060000:907** (`ingest_attempt_epochs`, 030000:60, validates a token and digest with a NULL batch id and never requires pending; disposition 1); `ingest_lazy_attempt` / `ingest_lazy_ack` / `ingest_lazy_ack_batch` / `ingest_lazy_stage_seats` where runtime-reachable; **`ingest_seed_proven_records` 040000:280** (refused; disposition 2) | **refused**, RH042, before any write. Replays, resumes and fast paths of `claim_mode` (050010:117ff) are refused too, uniformly. A committed-batch replay would be side-effect free, but the buffered wrappers run `ingest_lazy_begin` and `ingest_lazy_records` (a bootstrap admission row, slots) before `claim_mode` decides it is a replay, so the check has to come before them. Replays sit behind the Worker's HTTP stop anyway, and a refusal is retryable. |
+| **Admission entry**: checks the hold first | `ingest_origin_claim_buffered_batch` 062010:105; `ingest_claim_buffered_batch` 043850:1130; `ingest_claim_batch` 050000:306; `ingest_claim_batch_mode` 050010:117 (inner; checked again, harmlessly re-entrant); `ingest_origin_commit_buffered_batch` 062010:125; `ingest_commit_buffered_batch` 050010:373; the origin and plain `ingest_prepare_buffer_stage` 043850:1172; **`ingest_commit_batch` 050010:441** (accepts committed rows and can reach revision writes; disposition 1); **`ingest_commit_revisions` 060000:907** (`ingest_attempt_epochs`, 030000:60, validates a token and digest with a NULL batch id and never requires pending; disposition 1); `ingest_lazy_attempt` / `ingest_lazy_ack` / `ingest_lazy_ack_batch` / `ingest_lazy_stage_seats` where runtime-reachable; **`ingest_seed_proven_records` 040000:280** (refused; disposition 2. It seeds ONE capture's org across several users and accepts a `capture_id` even with zero records. The check therefore resolves the org from the trusted capture row, not from the payload, takes that org's key S, re-reads and validates the capture under the lock, and only then refuses or proceeds.) | **refused**, RH042, before any write. Replays, resumes and fast paths of `claim_mode` (050010:117ff) are refused too, uniformly. A committed-batch replay would be side-effect free, but the buffered wrappers run `ingest_lazy_begin` and `ingest_lazy_records` (a bootstrap admission row, slots) before `claim_mode` decides it is a replay, so the check has to come before them. Replays sit behind the Worker's HTTP stop anyway, and a refusal is retryable. |
 | **Control**: proceeds | selection and reset (incl. their `ingest_lazy_begin` and `ingest_lazy_clear` use), self-host erase, consent, privacy authority, source control, custody, operator session and user erase, buffered GC | **proceed**. Removal and consent state only. A control's `ingest_lazy_begin` bootstrap of an admission row admits nothing by itself. |
-| **Catch-up / bridge**: proceeds | publication claim, publish and heartbeat; history plans; `buffered-drain.ts` (no SQL); the fence backfill and accepted-stage export (read-only SQL) | **proceed**. Publication writes revisions of previously accepted content (section 5). |
+| **Catch-up / bridge**: proceeds until the seal | publication claim, publish and heartbeat; history plans; `buffered-drain.ts` (no SQL); the fence backfill and accepted-stage export (read-only SQL) | **proceed while `held`**. Publication writes revisions of previously accepted content, so its entry points take the org key shared and are **refused once `sealed`** (section 5). History plans write no revisions or ownership; the read-only and S3-only paths are unaffected. |
 | **Admission-row operators**: untouched | `ingest_lazy_begin` bootstrap (inside a claim it rolls back with the refused claim), renewal, repair, rebind, cutover ceremony | **untouched**. Renewal and rebind are all-or-nothing bulk statements. The hold never reads or writes admission rows. |
 
 Backstop: a `BEFORE INSERT FOR EACH ROW` trigger on `sessions.ingest_batches` runs the same check. It catches a future
@@ -129,59 +129,98 @@ new admissions, never another org's. No cycle exists.
   the hold and the admission raises RH042 before any write. Because the check runs at entry, nothing (no bootstrap
   row, slot or stage) is written even transiently.
 
-## 5. Backfill and the snapshot contract
+## 5. Backfill, the seal and the snapshot contract
 
 The fence backfill opens a separate REPEATABLE READ transaction per page (`src/session-ingest/upload-fence-backfill.ts`,
-:34, :618, :647). A single baseline snapshot therefore cannot attest every page. What can change for a held org during
-the backfill:
-- **Controls and erase:** they delete revisions and ownership, and the S3 fences carry them.
-- **Publication of previously accepted content:** it writes revisions with `updated_at`.
-- **GC:** stage and outbox only.
+:34, :618, :647), so no single snapshot covers it. A publication allowed under the hold can also commit after the
+final catch-up page. 060000 stamps `updated_at = now()`, the transaction's start, so a long transaction can land
+behind any time cursor. Start and end checks of E bind nothing about such rows. Revision 3 adds a terminal handoff.
 
-The contract reuses backlog-ops' existing FULL + catch-up reconciliation (docs/backlog-ops-workflow.md):
-1. The FULL backfill-execute starts after `_install` returned E.
-2. The catch-up runs after FULL with `revisions_since_ms` = FULL's created_at minus the catch-up margin. It re-applies
-   every revision changed since then, and it re-runs fences and ownership in full.
-3. Both receipts carry the hash of E. The gate refuses them unless E is still non-released when each run starts and
-   when it ends.
+**Seal.** `_seal(org, E)` takes the org key **exclusive**. That waits for every in-flight transaction holding it
+shared: admissions, which are refused anyway, and publications, whose entry points now take it shared. It then
+commits `held -> sealed` and its event. After the seal, no revision or ownership writer of the org can run except the
+classes in the safety table below.
 
-Admission content cannot change after E (section 4). The only remaining changes are the controls, publication and GC
-above, and the catch-up re-reads exactly what they can change. The bound evidence run stays corroboration on top.
+**Order.** install(E) -> FULL backfill-execute -> `_seal(E)` -> final catch-up -> marker attempt. The catch-up must
+start after the seal committed.
 
+**Catch-up predicate.** FULL's receipt records `full_snapshot_xmin`, the `pg_snapshot_xmin` of its first page's
+snapshot. The final catch-up re-applies every revision row of the org with
+`updated_at >= FULL.created_at - margin` **or** a full xid (computed as in authority-evidence's `xid8`) `>=
+full_snapshot_xmin`. The second clause catches an old-start transaction regardless of its `updated_at`, because
+its xid was in progress, or later, when FULL took its first snapshot. Fences and ownership are re-run in full, as the
+refresh does. Its receipt carries the hash of E. The gate refuses it unless the hold was `sealed` with E when it
+started and when it ended.
+
+**Per-class safety table** (after the seal):
+
+| Class | Can it still change the org's SQL state? | Why the S3 state stays correct |
+|---|---|---|
+| admission entries | no (RH042) | nothing is written |
+| publication | no (RH042 once sealed) | waited out by the seal's X |
+| controls: selection, reset | yes: deletes revisions and ownership | controls write the S3 fence first (`INGEST_S3_FENCE_MIRROR=on`, a stop precondition). The S3 claim honours the fence's deleted epochs over any index entry or owner stub. **Proof obligation:** a test that an S3 claim for a session deleted after the final catch-up is refused despite its stale stub and index entry. |
+| operator session and user erase | yes: deletes SQL rows; the user erase also S3 bytes | **refused while `sealed`** (retryable; the operator re-runs it after release). The window is short: seal to bridge. Allowing it would need a proof that the S3 ledger's index and stubs are reconciled for the erased user, which this design does not claim. |
+| buffered GC | stage intents and outbox only | does not touch revisions or ownership |
+| renewal, rebind, repair | admission rows only | the hold never reads them |
 ## 6. Marker writes, release, rollback
 
-**Point of no return: the first marker PUT attempt** (joint disposition). A timeout or an absent HEAD can coexist
-with a delayed write.
-- **Before any PUT:** the marker writer calls `_marker_attempt(org, E)` (key X, idempotent for the same E). It
-  succeeds only while the hold is `held` or already `marker_attempted` with E. It commits the
-  `held -> marker_attempted` transition and its event **before** the first PUT attempt. Every retry of the PUT calls
-  it again first.
-- **`verified_rollback` from `held`:** allowed only while no attempt has been recorded. `_release` takes key X, so it
-  serializes with `_marker_attempt`. A writer that never recorded an attempt never PUT. After the release, every
-  `_marker_attempt` for E refuses, so no retried writer can start one. The durable, epoch-bound evidence is the absence
-  of any `marker_attempted` event for E, read under the lock. The audit `detail` records `abandoned_before_marker`.
-- **After an attempt (`marker_attempted`):** no automatic release. E is retained, and an operator reconciles:
-  - outstanding writes, i.e. no writer lease is live;
-  - the actual object versions of the org's marker key and of the deployment-wide marker;
-  - the effective authority, including the global fallback (`buffered-drain.ts`: a missing per-org marker falls back
-    to the deployment-wide one).
+**States.** `held -> sealed -> marker_attempted -> released`. A release from `held` or `sealed` is possible only
+before any attempt.
 
-  Release then needs either `bridge_complete` or `verified_rollback` with evidence of a verified safe restoration.
+**Point of no return: the first marker PUT attempt.** A timeout or an absent HEAD can coexist with a delayed write,
+and no lease, version listing or terminal receipt excludes a paused PUT.
+- **`_marker_attempt(org, E)`:** key X, idempotent for E, allowed only from `sealed`. It commits
+  `sealed -> marker_attempted` and its event **before** every PUT attempt. The marker PUT is always create-only
+  (`If-None-Match: *`, as `ledger-s3.ts`:555 writes new documents), and nothing ever deletes a marker "to make it
+  absent".
+- **Rollback before any attempt** (from `held` or `sealed`): `_release(E, 'verified_rollback', …)` under key X. A writer
+  that never recorded an attempt never PUT. Every later `_marker_attempt` for E refuses, so no retried writer can start
+  one. The evidence is the absence of any `marker_attempted` event for E, read under the lock. The audit detail is
+  `abandoned_before_marker`.
+- **After an attempt: no rollback unless a durable barrier holds at the effective-authority reader.** The barrier:
+
+  1. **Create it.** Create-only PUT (`If-None-Match: *`) of a barrier document at the org's own marker key
+     (`orgFenceAuthorityKey`), `{"v":1,"barrier":"rollback","epochSha256":<hash of E>}`. The reader
+     (`requireFenceAuthority`, ledger-s3.ts:961) treats a present-but-invalid per-org marker as an outright refusal and
+     never falls back to the deployment-wide marker for that org. So the barrier also defeats the global fallback, and
+     the reader needs no code change.
+  2. **Decide at the object.** If the barrier create succeeds, no valid per-org marker can ever be created afterwards,
+     because a delayed marker PUT fails its precondition. If it fails because an object exists, read it: a valid
+     marker means authority was taken, so there is no rollback, the bridge path continues, and only `bridge_complete`
+     can release. A barrier (an earlier rollback attempt) means continue at step 3.
+  3. **Wait out the reader cache.** The reader returns on a positive per-org cache hit before it reads even the global
+     stop (ledger-s3.ts:964). The TTL is the deployment's configured `authorityTtl` (default 60 s, :951; the
+     configured value is read from the serving deployment and recorded, never assumed). Already-claimed batches still
+     commit (:312). So the barrier is effective only after `configured TTL + the longest in-flight claim` has passed
+     since the barrier create. The final readback waits that out, re-reads the org key (the barrier itself), the
+     global stop and the deployment-wide marker, and records the effective authority source.
+  4. **Release.** `_release(E, 'verified_rollback', evidence)`, where the evidence hash covers the barrier object's
+     version, the readback and the wait.
+
+  **Consequence:** the barrier is permanent, so the org can never take per-org S3 authority again. A later cutover of
+  that org needs a separately reviewed barrier-removal procedure (out of scope). b1's alternative is a separate
+  per-org stop key checked before the marker. It needs a reader change and has the same permanence, so revision 3
+  prefers the org key itself. Reviewer's call.
+- **Effective authority source.** An accepted upload alone cannot show whether the per-org marker or the global
+  fallback admitted it. Every bound evidence step and the bridge's terminal receipt record the authority source the
+  reader resolves (`per_org` | `deployment` | `barrier` | `stopped` | `missing`), read after the cache bound.
 - **`_release(org, E, reason, evidence_sha256)`:**
-  - **Reasons:** `bridge_complete` or `verified_rollback`, nothing else.
-  - **Evidence:** the hash is of a terminal receipt that the gated job authenticates (issuer, run, sha, scope, org and
-    E), as backlog-ops binds every other receipt. SQL records it but cannot authenticate it.
-  - **Idempotency:** a repeat with the same E, reason and evidence after a lost response returns ok and writes no event.
-  - **Refusals:** a stale or other epoch refuses, and so does any other repeat.
+  - **Reasons:** `bridge_complete` or `verified_rollback`.
+  - **Evidence:** a hash of an authenticated terminal receipt (issuer, run, sha, scope, org, E); SQL records it.
+  - **Idempotency:** a repeat with the same E, reason and evidence after a lost response returns ok with no event.
+  - **Refusals:** a stale epoch or any other repeat.
 
-**Schema down** (generated by the lane):
+**Schema down** (generated by the lane), serialized with install: it takes `LOCK TABLE sessions.ingest_org_admission_holds
+IN SHARE ROW EXCLUSIVE MODE`, which conflicts with install's INSERT, before checking for live holds:
 - **Refuses** (fail closed) while any hold is not `released`, and while a later slot is applied.
 - **Locks and resets** role validation to `pending`, as 062210 does, so readiness has to be re-proven after the
   restored generation and privileges are verified.
 - **Removes the enforcement:** the `_check` calls (by restoring the prior bodies exactly), the backstop trigger and the
   functions.
-- **Retains** `ingest_org_admission_holds` and `_events` as inert history, so the audit is preserved. A reapply reuses
-  them. This is the reviewer's choice between "preserve" and "verified export before drop". I recommend preserve,
+- **Retains** `ingest_org_admission_holds` and `_events` as inert history, so the audit is preserved. Their
+  immutability triggers and trigger function are retained too, so immutability persists. A reapply reuses them. The
+  down ends by verifying the exact post-down schema and ACL: that exact retained set and nothing else, compared with the
+  ACL manifest. This is the reviewer's choice between "preserve" and "verified export before drop". I recommend preserve,
   because it needs no external artifact. The cost is that the post-down schema differs from pre-062320 by two inert
   tables, which the release target must account for.
 
@@ -221,10 +260,27 @@ the hold is in the state it expects with E.
    - A stale replay of an old epoch.
 9. **Schema down** refuses with an active hold and with a later slot applied, resets readiness to pending, restores
    the prior bodies exactly, and retains the audit (b1 agrees: retain as inert history).
+11. **Seal and catch-up** (section 5):
+    - A late publication committing after the final catch-up page is impossible once sealed.
+    - An old-start publication transaction begun before FULL and committed after it is caught by the xmin clause.
+    - A control or erase behind the final cursor.
+    - Each case asserts the effective S3 target state (claims refused or admitted as they should be), not receipt
+      chronology.
+12. **Barrier** (section 6), DB + MinIO with a warm reader cache:
+    - Pause a marker PUT after its SQL attempt record, create the barrier, wait the configured TTL plus in-flight
+      claims, deliver the old PUT after the final read, and assert the effective authority is unchanged.
+    - The marker-wins race takes the bridge path only.
+    - A reinstall after a barrier is refused for that org.
+13. **Stale snapshots and wrappers:**
+    - Stale snapshots for installer, sealer and writer.
+    - Every runtime-granted wrapper and every nested call.
+    - No bootstrap write on a refused claim.
+    - Refusal and retry through the actual Worker mapping.
+    - Down/install serialization, the post-down exact schema and ACL check, persisted immutability, and a reapply.
 10. **Retryable end to end** (section 4): the TypeScript-level round trip of a held org's claim as a retryable 503
     with no write, and the consumer deferral.
 
-## 9. Resolved items (from revision 1)
+## 9. Resolved items (from revisions 1 and 2)
 
 1. **Canonical commits** (`ingest_commit_batch`, `ingest_commit_revisions`) are guarded at entry. Disposition 1.
 2. **Seeding** is refused under the hold. A seed under a hold would need a separately designed epoch-bound operation.
@@ -234,3 +290,10 @@ the hold is in the state it expects with E.
 4. **Release:** only `bridge_complete` and `verified_rollback`, with authenticated terminal evidence, idempotent install
    and release, and the marker-attempt point of no return. Disposition 4 and the joint disposition;
    `abandoned_before_marker` is an audit detail, not a release path.
+5. **Revision 2, gap 1:** after a marker attempt, rollback only through the create-only barrier at the org key,
+   effective after the configured reader-cache TTL plus in-flight claims; the effective authority source is recorded.
+6. **Revision 2, gap 2:** a seal under key X waits out in-flight publications, then the final catch-up takes rows by
+   xmin against FULL's first snapshot as well as by `updated_at`; a per-class safety table covers what may still
+   change.
+7. **Matrix:** seeding resolves the trusted capture org, takes S, re-reads the capture; matrix G and the risks are
+   updated.
