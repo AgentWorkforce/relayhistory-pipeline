@@ -9,7 +9,9 @@ import { storeEraser, type PagedEraser } from "../../migration/neon-s3-erasure/e
 import type { ClaimInput, LedgerRecord, LedgerTenant } from "../ledger.ts";
 import { s3Ledger, s3LedgerKeys } from "../ledger-s3.ts";
 import { rearmScopeHash, rearmScopes, type RearmSweepCounts } from "../rearm-sweeper.ts";
-import { exitCodeForPass, runRearmSweeperPass } from "../rearm-sweeper-main.ts";
+import { exitCodeForError, exitCodeForPass, rearmFailure, runRearmSweeperLoop, runRearmSweeperPass } from "../rearm-sweeper-main.ts";
+import { ObjectStoreError } from "../../shared/vendor.ts";
+import { LedgerUnavailableError } from "../ledger.ts";
 import {
   freshSweeperPass, rearmBucketHash, REARM_ALL_ORGS, REARM_RECEIPT_FUTURE_SKEW_MS, rearmPassLatestKey, rearmPassReceiptEligibility, rearmPassReceiptKey,
   rearmPassesPrefix, rearmPassRevision, rearmPassWorkload, validRearmPassReceipt, writeRearmPassReceipt, type RearmPassReceipt,
@@ -271,5 +273,59 @@ describe("rearm sweeper pass receipts: freshSweeperPass", () => {
     expect(rearmPassRevision({ GITHUB_SHA: "A".repeat(40) })).toEqual({ gitSha: "a".repeat(40) });
     expect(rearmPassWorkload({ INGEST_REARM_JOB_NAME: "Bad_Name", INGEST_REARM_POD_NAMESPACE: "ingest", AWS_LAMBDA_FUNCTION_NAME: "fn-1" }))
       .toEqual({ namespace: "ingest", lambdaFunction: "fn-1" });
+  });
+});
+
+describe("rearm sweeper: a failed pass logs an allow-listed reason, and writes no receipt", () => {
+  /** The store's methods, bound (its private fields need the real receiver), with `op` replaced. */
+  const wrap = (store: ObjectStore, op: string, fn: (real: (...a: unknown[]) => unknown) => (...a: unknown[]) => unknown): ObjectStore =>
+    new Proxy(store, { get: (t, k) => {
+      const v = Reflect.get(t, k, t);
+      const bound = typeof v === "function" ? v.bind(t) : v;
+      return k === op ? fn(bound) : bound;
+    } }) as ObjectStore;
+  /** A store whose `op` always fails with `error`. */
+  const failing = (store: ObjectStore, op: "getObject" | "list" | "put", error: unknown) => wrap(store, op, () => () => Promise.reject(error));
+  const SECRETISH = "96bulls/.ledger/rearm-sweeper/cursor-x.json org-a transcripts";
+
+  test("classes: s3 (status), timeout (transport cause), kms, fence, credentials, unknown; never the message", () => {
+    expect(rearmFailure(new ObjectStoreError("transient", "s3", `${SECRETISH}: HTTP 503`, { status: 503 }))).toEqual({ reason: "s3", status: 503 });
+    expect(rearmFailure(new ObjectStoreError("transient", "s3", SECRETISH, { transportCause: "etimedout" }))).toEqual({ reason: "timeout", cause: "etimedout" });
+    expect(rearmFailure(new ObjectStoreError("backend", "s3", `${SECRETISH}: HTTP 400: <Code>KMS.DisabledException</Code>`, { status: 400 }))).toEqual({ reason: "kms", status: 400 });
+    expect(rearmFailure(Object.assign(new Error("S3 DELETE failed"), { code: "s3_500" }))).toEqual({ reason: "s3", status: 500 });
+    expect(rearmFailure(new LedgerUnavailableError("ledger_fence_conflict"))).toMatchObject({ reason: "fence" });
+    const ledgerStore = Object.assign(new LedgerUnavailableError("ledger_store_transient"), { storeStatus: 500 });
+    expect(rearmFailure(ledgerStore)).toEqual({ reason: "s3", status: 500 });
+    expect(rearmFailure(Object.assign(new Error("pod identity: http 500"), { code: "credentials_unavailable" }))).toEqual({ reason: "credentials" });
+    expect(rearmFailure(Object.assign(new Error("x"), { name: "AbortError" }))).toEqual({ reason: "timeout" });
+    expect(rearmFailure(new Error(SECRETISH))).toEqual({ reason: "unknown" });
+    expect(rearmFailure("boom")).toEqual({ reason: "unknown" });
+    // Untrusted fields are dropped, not echoed.
+    expect(rearmFailure(Object.assign(new LedgerUnavailableError("ledger_store_backend"), { storeStatus: 99999, storeCause: SECRETISH }))).toEqual({ reason: "s3" });
+  });
+
+  test("a pass that throws carries its phase; the loop's line is codes only; no receipt is written", async () => {
+    const store = fresh();
+    const cursorDown = failing(store, "getObject", new ObjectStoreError("transient", "s3", `${SECRETISH}: HTTP 503`, { status: 503 }));
+    const err = await runRearmSweeperPass(SCOPED, [], { ...overridesFor(store), store: () => cursorDown }).catch((e) => e);
+    expect(exitCodeForError(err)).toBe(4);
+    expect(rearmFailure(err)).toEqual({ reason: "s3", phase: "cursor", status: 503 });
+    const listDown = failing(store, "list", new ObjectStoreError("transient", "s3", SECRETISH, { transportCause: "timeout" }));
+    const lines: unknown[] = [];
+    let n = 0;
+    await runRearmSweeperLoop(SCOPED, [], (l) => lines.push(l), () => n >= 1, async () => { n++; }, { ...overridesFor(store), store: () => listDown });
+    expect(lines).toEqual([{ event: "rearm_sweep", error: "rearm_sweep_failed", reason: "timeout", phase: "sweep", cause: "timeout" }]);
+    for (const id of [ORG_A, ORG_B, ROOT, "transcripts"]) expect(JSON.stringify(lines)).not.toContain(id);
+    expect(await passes(store)).toEqual([]);
+  });
+
+  test("a receipt write that fails is reported as a code and does not fail the pass", async () => {
+    const store = fresh();
+    const putDown = wrap(store, "put", (real) => (key, ...rest) =>
+      String(key).includes("/passes/") ? Promise.reject(new ObjectStoreError("transient", "s3", SECRETISH, { status: 500 })) : real(key, ...rest));
+    const { output } = await runRearmSweeperPass(SCOPED, [], { ...overridesFor(store), store: () => putDown });
+    expect(output).toMatchObject({ enabled: true, complete: true, receipt: "failed", receiptError: "store_error" });
+    expect(exitCodeForPass(output)).toBe(0);
+    expect(JSON.stringify(output)).not.toContain(SECRETISH);
   });
 });
