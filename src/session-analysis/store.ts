@@ -59,10 +59,12 @@ WITH expired AS (
      SET status = 'failed', lease_token = NULL, lease_expires_at = NULL,
          last_error = COALESCE(last_error, 'analysis_lease_expired'), updated_at = now()
    WHERE origin = 'native' AND status = 'running' AND lease_expires_at <= now() AND attempts >= $3
+     AND ($4::text IS NULL OR workspace_id = $4)
   RETURNING id
 ), next AS (
   SELECT id FROM sessions.session_analysis_jobs_v2
    WHERE origin = 'native' AND attempts < $3
+     AND ($4::text IS NULL OR workspace_id = $4)
      AND ($1::uuid IS NULL OR id = $1::uuid)
      AND ((status = 'queued' AND available_at <= now())
           OR (status = 'running' AND lease_expires_at <= now()))
@@ -171,7 +173,8 @@ const SWEEP_SQL = `
 SELECT t.result_key, t.reason, t.org_id, t.workspace_id, t.session_id, t.job_id::text AS job_id, t.generation,
        t.writer_token::text AS writer_token
   FROM sessions.session_analysis_result_tickets AS t
- WHERE t.created_at < now() - make_interval(secs => $1::integer)
+ WHERE ($3::text IS NULL OR t.workspace_id = $3)
+   AND t.created_at < now() - make_interval(secs => $1::integer)
    AND (t.lease_expires_at IS NULL OR t.lease_expires_at <= now())
    AND (t.next_sweep_at IS NULL OR t.next_sweep_at <= now())
  ORDER BY t.created_at
@@ -180,6 +183,7 @@ SELECT t.result_key, t.reason, t.org_id, t.workspace_id, t.session_id, t.job_id:
 const ERROR_CODE = /^[a-z][a-z0-9_]{0,63}$/u;
 
 export interface AnalysisJobStoreDeps {
+  workspaceId?: string;
   db: SqlExecutor;
   store: ObjectStore;
   /** The anchor manifest key of the job's session (its first live pointer). */
@@ -194,7 +198,7 @@ export function postgresAnalysisJobStore(deps: AnalysisJobStoreDeps): AnalysisJo
   return {
     async claim(options) {
       const lease = Math.min(MAX_LEASE_SECONDS, Math.max(1, Math.floor(options.leaseSeconds)));
-      const { rows } = await deps.db.query<JobRow>(CLAIM_SQL, [options.jobId ?? null, lease, SESSION_ANALYSIS_MAX_ATTEMPTS]);
+      const { rows } = await deps.db.query<JobRow>(CLAIM_SQL, [options.jobId ?? null, lease, SESSION_ANALYSIS_MAX_ATTEMPTS, deps.workspaceId ?? null]);
       const row = rows[0];
       if (!row) return null;
       return {
@@ -338,18 +342,19 @@ SELECT t.rev::text AS rev, t.org_id, t.workspace_id, t.session_id, t.job_id::tex
               ORDER BY 1) AS owned,
        (SELECT count(*) FROM sessions.session_analysis_jobs_v2 AS j
          WHERE j.result_s3_key = t.result_key AND j.status = 'completed' AND j.result_version_id IS NULL)::int AS without_version
-  FROM sessions.session_analysis_result_tickets AS t WHERE t.result_key = $1`;
+  FROM sessions.session_analysis_result_tickets AS t WHERE t.result_key = $1 AND ($2::text IS NULL OR t.workspace_id = $2)`;
 
 /** One ticket CAS: lock the row, require the loaded rev, apply `work`, bump the rev; commits on its own. */
 async function casTicket(
   transact: <T>(work: (tx: SqlExecutor) => Promise<T>) => Promise<T>,
   key: string,
+  workspaceId: string | undefined,
   rev: number,
   work: (tx: SqlExecutor) => Promise<boolean>,
   deleteRow = false,
 ): Promise<Cas> {
   return transact(async (tx) => {
-    const cur = (await tx.query<{ rev: string }>("SELECT rev::text AS rev FROM sessions.session_analysis_result_tickets WHERE result_key = $1 FOR UPDATE", [key])).rows[0];
+    const cur = (await tx.query<{ rev: string }>("SELECT rev::text AS rev FROM sessions.session_analysis_result_tickets WHERE result_key = $1 AND ($2::text IS NULL OR workspace_id = $2) FOR UPDATE", [key, workspaceId ?? null])).rows[0];
     if (!cur || Number(cur.rev) !== rev) return { ok: false } as const;
     if (!(await work(tx))) return { ok: false } as const;
     if (deleteRow) {
@@ -371,7 +376,7 @@ async function casTicket(
  * (COMPLETE_SQL, the backfill's job insert, analysisObligationWriterFor().publish) and refuses if
  * any version is owned now; reservations are permanent.
  */
-export function ticketObligationStore(transact: <T>(work: (tx: SqlExecutor) => Promise<T>) => Promise<T>, key: string): ObligationStore {
+export function ticketObligationStore(transact: <T>(work: (tx: SqlExecutor) => Promise<T>) => Promise<T>, key: string, workspaceId?: string): ObligationStore {
   return {
     async load(): Promise<ObligationState | null> {
       const row = await transact(async (tx) =>
@@ -379,7 +384,7 @@ export function ticketObligationStore(transact: <T>(work: (tx: SqlExecutor) => P
           rev: string; org_id: string; workspace_id: string; session_id: string; job_id: string; generation: string | null;
           writer_token: string | null; erase_checkpoint: EraseCheckpoint | null; invocations: { id: string; outcome: InvocationOutcome; versionId: string | null }[] | null;
           owned: string[] | null; without_version: number;
-        }>(TICKET_STATE_SQL, [key])).rows[0]);
+        }>(TICKET_STATE_SQL, [key, workspaceId ?? null])).rows[0]);
       if (!row) return null;
       return {
         key,
@@ -392,7 +397,7 @@ export function ticketObligationStore(transact: <T>(work: (tx: SqlExecutor) => P
       };
     },
     reserve: (rev, versionIds) =>
-      casTicket(transact, key, rev, async (tx) => {
+      casTicket(transact, key, workspaceId, rev, async (tx) => {
         const owned = (await tx.query("SELECT 1 FROM sessions.session_analysis_jobs_v2 WHERE result_s3_key = $1 AND status = 'completed' AND result_version_id = ANY($2::text[]) LIMIT 1", [key, [...versionIds]])).rows;
         if (owned.length) return false;
         await tx.query(
@@ -407,17 +412,17 @@ export function ticketObligationStore(transact: <T>(work: (tx: SqlExecutor) => P
         return true;
       }),
     saveCheckpoint: (rev, checkpoint) =>
-      casTicket(transact, key, rev, async (tx) => {
+      casTicket(transact, key, workspaceId, rev, async (tx) => {
         await tx.query("UPDATE sessions.session_analysis_result_tickets SET erase_checkpoint = $2::jsonb WHERE result_key = $1", [key, JSON.stringify(checkpoint)]);
         return true;
       }),
     resolve: (rev, ids) =>
-      casTicket(transact, key, rev, async (tx) => {
+      casTicket(transact, key, workspaceId, rev, async (tx) => {
         await tx.query("DELETE FROM sessions.session_analysis_ticket_invocations WHERE result_key = $1 AND invocation_id::text = ANY($2::text[])", [key, [...ids]]);
         return true;
       }),
     reschedule: (rev) =>
-      casTicket(transact, key, rev, async (tx) => {
+      casTicket(transact, key, workspaceId, rev, async (tx) => {
         await tx.query(
           `UPDATE sessions.session_analysis_result_tickets
               SET erase_checkpoint = NULL, next_sweep_at = now() + $2::double precision * interval '1 millisecond', sweeps = sweeps + 1
@@ -426,7 +431,7 @@ export function ticketObligationStore(transact: <T>(work: (tx: SqlExecutor) => P
         );
         return true;
       }),
-    retire: (rev) => casTicket(transact, key, rev, async () => true, true),
+    retire: (rev) => casTicket(transact, key, workspaceId, rev, async () => true, true),
   };
 }
 
@@ -442,6 +447,7 @@ export function ticketObligationStore(transact: <T>(work: (tx: SqlExecutor) => P
 export async function sweepAnalysisTickets(
   store: ObjectStore,
   options: {
+    workspaceId?: string;
     graceSeconds?: number;
     limit?: number;
     transact: <T>(work: (tx: SqlExecutor) => Promise<T>) => Promise<T>;
@@ -457,11 +463,11 @@ export async function sweepAnalysisTickets(
     throw new Error("analysis_sweep_eraser_required");
   void store;
   const { rows } = await options.transact((tx) =>
-    tx.query<{ result_key: string }>(SWEEP_SQL, [options.graceSeconds ?? TICKET_GRACE_SECONDS, options.limit ?? 50]));
+    tx.query<{ result_key: string }>(SWEEP_SQL, [options.graceSeconds ?? TICKET_GRACE_SECONDS, options.limit ?? 50, options.workspaceId ?? null]));
   let retired = 0;
   for (const { result_key } of rows) {
     try {
-      const outcome = await reconcileObligation(options.eraser, ticketObligationStore(options.transact, result_key), options.budget ? { budget: options.budget } : {});
+      const outcome = await reconcileObligation(options.eraser, ticketObligationStore(options.transact, result_key, options.workspaceId), options.budget ? { budget: options.budget } : {});
       if (outcome === "retired") retired += 1;
       else if (outcome === "refused") options.onError?.(result_key, new Error("analysis_sweep_cas_refused"));
     } catch (error) {

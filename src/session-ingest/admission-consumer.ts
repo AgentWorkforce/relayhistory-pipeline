@@ -13,8 +13,9 @@
 import { checkUploadConsent, UploadConsentRequired, type UploadConsentConfig } from "./upload-consent.ts";
 import { isObjectStoreError, objectKey } from "../shared/vendor.ts";
 import type { DeliverDeps } from "./deliver.ts";
-import { ClaimLockBusy, deliverPrepared, IngestUnavailable } from "./deliver.ts";
-import { LedgerUnavailableError, type FrozenWitnessInput, type LedgerTenant } from "./ledger.ts";
+import { ClaimLockBusy, deliverPrepared, IngestUnavailable, isOrgAdmissionHeld, ORG_ADMISSION_HELD_RETRY_AFTER_SECONDS } from "./deliver.ts";
+import { log } from "../shared/log.ts";
+import { LedgerUnavailableError, ORG_ADMISSION_HELD_CODE, type FrozenWitnessInput, type LedgerTenant } from "./ledger.ts";
 import type { LogStreams } from "./ledger-log-admit.ts";
 import type { LogMaterializer } from "./ledger-log-materialize.ts";
 import { DeliveryBusyError, DeliveryError } from "./vendor/delivery/delivery-contracts.ts";
@@ -59,11 +60,30 @@ export interface AdmissionConsumerDeps {
   logStreams?: LogStreams;
   /** With logStreams: applies a stream's entries to the read-side state after each append. */
   logMaterializer?: LogMaterializer;
+  /**
+   * The per-org admission hold alert (OrgAdmissionHoldAlertFields): one line per held message, every attempt.
+   * Absent: `log.error`. A throw is ignored, so it can never change the deferral.
+   */
+  alert?: (fields: OrgAdmissionHoldAlertFields) => void;
+}
+
+/**
+ * A queued admission refused by a per-org admission hold (RH042). The admission queue is drained before a hold is
+ * installed (docs/design/org-admission-hold.md section 4), so a held message here means that protocol was broken:
+ * an operator must look before the queue's retries run out, because a dead-lettered message of a held org must not
+ * be replayed. Closed values only (codes, the stage, the delivery attempt, and the org id every route line carries).
+ */
+export interface OrgAdmissionHoldAlertFields {
+  route: "ingest.admission_hold_alert";
+  error_code: typeof ORG_ADMISSION_HELD_CODE;
+  stage?: string;
+  org_id: string;
+  attempt: number;
 }
 
 export type AdmissionAction =
   | { action: "ack"; outcome: "admitted" | "refused" | "already_terminal"; code: string; lagMs?: number; timingMs?: Record<string, number> }
-  | { action: "retry"; delaySeconds: number; code: string; stage?: string; error?: unknown };
+  | { action: "retry"; delaySeconds: number; code: string; stage?: string; error?: unknown; alert?: "org_admission_held" };
 
 /** Exponential, 15 s .. 5 min, by the queue's delivery attempt (1-based). */
 export function backoffSeconds(attempts: number): number {
@@ -77,6 +97,10 @@ function witnessInput(tenant: LedgerTenant, p: PreparedDelivery): FrozenWitnessI
 }
 
 function classify(error: unknown, attempts: number): AdmissionAction | { terminal: string } {
+  // A per-org admission hold (RH042): a deferral at the hold's fixed pace, never a terminal refusal (a refusal would
+  // write an outcome and retire the acknowledged bytes). Raised before any write, so the retry starts clean.
+  if (isOrgAdmissionHeld(error)) return { action: "retry", delaySeconds: ORG_ADMISSION_HELD_RETRY_AFTER_SECONDS, code: ORG_ADMISSION_HELD_CODE,
+    ...(error instanceof IngestUnavailable ? { stage: error.stage } : {}), error, alert: "org_admission_held" };
   // A reset / re-enable is in flight for this user: wait for it (never admit across it).
   if (error instanceof IngestUnavailable && error.cause_code === new PrivacyControlPending().code) return { action: "retry", delaySeconds: 15, code: "privacy_control_pending", stage: error.stage, error };
   // INGEST_CLAIM_LOCK_BUSY / INGEST_CLAIM_TIMEOUT_BUSY turn a claim lock wait / statement timeout into a
@@ -91,6 +115,11 @@ function classify(error: unknown, attempts: number): AdmissionAction | { termina
   if (error instanceof DeliveryError && error.status !== 503 && error.status !== 429) return { terminal: error.code };
   if (error instanceof LedgerUnavailableError) return { action: "retry", delaySeconds: backoffSeconds(attempts), code: error.code, error };
   return { action: "retry", delaySeconds: backoffSeconds(attempts), code: (error as { code?: unknown })?.code && typeof (error as { code?: unknown }).code === "string" && /^[A-Za-z0-9_]{1,64}$/.test((error as { code: string }).code) ? (error as { code: string }).code : "admission_failed", error };
+}
+
+/** The alert never changes the deferral: a throwing sink is ignored. */
+function holdAlert(deps: Pick<AdmissionConsumerDeps, "alert">, fields: OrgAdmissionHoldAlertFields): void {
+  try { (deps.alert ?? ((f: OrgAdmissionHoldAlertFields) => log.error("session ingest admission alert", { ...f })))(fields); } catch { /* alert only */ }
 }
 
 export async function admitMessage(deps: AdmissionConsumerDeps, body: unknown, attempts: number): Promise<AdmissionAction> {
@@ -200,6 +229,8 @@ export async function admitMessage(deps: AdmissionConsumerDeps, body: unknown, a
   } catch (error) {
     const c = classify(error, attempts);
     if ("terminal" in c) return finish("refused", c.terminal);
+    if (c.action === "retry" && c.alert === "org_admission_held") holdAlert(deps, { route: "ingest.admission_hold_alert", error_code: ORG_ADMISSION_HELD_CODE,
+      ...(c.stage ? { stage: c.stage } : {}), org_id: tenant.orgId, attempt: Number.isSafeInteger(attempts) && attempts > 0 ? attempts : 1 });
     return c;
   }
 }

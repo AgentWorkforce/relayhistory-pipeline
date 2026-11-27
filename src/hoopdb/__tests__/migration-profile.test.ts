@@ -2,6 +2,8 @@
  * The migrator's database-mode contract, its runtime-role grant and its single-authority
  * guard, on in-process PGlite plus the pure profile resolver.
  */
+import { ingestOrgAdmissionHold, lastBody as holdLastBody } from "../../../scripts/sessions-function-boundary/lanes/ingest-org-admission-hold.ts";
+import { ingestOrgErasureHistory } from "../../../scripts/sessions-function-boundary/lanes/ingest-org-erasure-history.ts";
 import { afterEach, describe, expect, setDefaultTimeout, spyOn, test } from "bun:test";
 import { createHash } from "node:crypto";
 import { existsSync, readFileSync } from "node:fs";
@@ -2721,6 +2723,82 @@ describe("function boundary: ACL manifest, residual, activation gate", () => {
       const open = src.indexOf(tag, start) + tag.length;
       return src.slice(open, src.indexOf(tag, open));
     };
+    // 20261105062350 (the buffered feed page keyset) is newest: 062340's down refuses (55000) while it is applied; its
+    // lane-generated, checksum-pinned down restores 043870's exact page function (body and proconfig), removes its
+    // ledger row, and refuses on a rerun.
+    const BPK = "upstream:20261105062350_buffered_search_feed_page_keyset.sql";
+    const PAGE_RPC = "sessions.buffered_search_feed_page(jsonb)";
+    const pageCfg = async () =>
+      (await db.query<{ c: string[]; s: string; d: boolean }>("SELECT proconfig c, prosrc s, prosecdef d FROM pg_proc WHERE oid=$1::regprocedure", [PAGE_RPC])).rows[0]!;
+    expect(await names()).toContain(BPK);
+    expect((await pageCfg()).c).toEqual(["search_path=pg_catalog, sessions, pg_temp", "lock_timeout=2s", "plan_cache_mode=force_custom_plan"]);
+    expect((await pageCfg()).s).toBe(bodyOf("20261105062350_buffered_search_feed_page_keyset.sql", "buffered_search_feed_page", "$page$"));
+    expect((await failure(rollback("20261105062340_ingest_org_erasure_history.down.sql")))?.code).toBe("55000");
+    await rollback("20261105062350_buffered_search_feed_page_keyset.down.sql");
+    expect(await names()).not.toContain(BPK);
+    expect(await pageCfg()).toEqual({ c: ["search_path=pg_catalog, sessions, pg_temp", "lock_timeout=2s"], s: bodyOf("20261105043870_buffered_search_feed_cursor.sql", "buffered_search_feed_page", "$page$"), d: true });
+    expect((await failure(rollback("20261105062350_buffered_search_feed_page_keyset.down.sql")))?.code).toBe("55000");
+    // 20261105062340 (the per-org erasure history) is then newest: 062320's down refuses (55000) while it is applied; its
+    // checksum-pinned down (no unreleased hold) restores 062320's exact release and status, drops the 30 source
+    // triggers and its functions, records the end of coverage, keeps the three history tables and their guard, removes
+    // its ledger row, and refuses on a rerun.
+    const HISTORY = "upstream:20261105062340_ingest_org_erasure_history.sql";
+    expect(await names()).toContain(HISTORY);
+    // Applied by the real migrator (one transaction per migration): the recorders and the 'started' coverage row share
+    // an xid, so the continuity check reads true. A statement-by-statement apply would leave it false (fail closed).
+    expect((await db.query<{ r: boolean }>("SELECT sessions.ingest_org_erasure_history_recording() r")).rows[0]!.r).toBe(true);
+    expect((await failure(rollback("20261105062320_ingest_org_admission_fences.down.sql")))?.code).toBe("55000");
+    const historyReplaced = Object.entries(ingestOrgErasureHistory.replaces);
+    for (const [sig] of historyReplaced) expect((await procSrc(sig)).s).toContain("-- 062340 org erasure history");
+    await rollback("20261105062340_ingest_org_erasure_history.down.sql");
+    expect(await names()).not.toContain(HISTORY);
+    for (const [sig, r] of historyReplaced) {
+      const prior = holdLastBody(readFileSync(join(root, r.original), "utf8"), sig);
+      const tag = /AS (\$[a-z_]+\$)/u.exec(prior)![1]!;
+      const open = prior.indexOf(tag) + tag.length;
+      expect(await procSrc(sig)).toEqual({ s: prior.slice(open, prior.indexOf(tag, open)), d: r.secdef });
+    }
+    expect((await db.query<{ n: number }>("SELECT count(*)::int n FROM pg_proc p JOIN pg_namespace n ON n.oid=p.pronamespace WHERE n.nspname='sessions' AND p.proname LIKE 'ingest\\_org\\_erasure\\_history\\_%' AND p.proname <> 'ingest_org_erasure_history_guard'")).rows[0]!.n).toBe(0);
+    expect((await db.query<{ n: number }>("SELECT count(*)::int n FROM pg_trigger WHERE tgname IN ('ingest_org_erasure_history_record','ingest_org_erasure_history_refuse_truncate')")).rows[0]!.n).toBe(0);
+    for (const r of ["sessions.ingest_org_erasure_history", "sessions.ingest_org_erasure_history_coverage", "sessions.ingest_org_erasure_history_bindings"]) expect(await relation(r)).toBe(r);
+    expect((await failure(rollback("20261105062340_ingest_org_erasure_history.down.sql")))?.code).toBe("55000");
+    // 20261105062330 (the buffered feed custom plans) is then newest: 062320's down refuses (55000) while it is applied; its
+    // checksum-pinned down RESETs plan_cache_mode on the stage RPC and gc_ordinals (their prior proconfig exactly),
+    // removes its ledger row, and refuses on a rerun.
+    const BCP = "upstream:20261105062330_buffered_search_feed_custom_plans.sql";
+    const cfg = async (sig: string) =>
+      (await db.query<{ c: string[] }>("SELECT proconfig c FROM pg_proc WHERE oid=$1::regprocedure", [sig])).rows[0]!.c;
+    const STAGE_RPC = "sessions.buffered_search_feed_stage(jsonb)", GC_ORDINALS = "sessions.ingest_buffer_gc_ordinals(uuid)";
+    expect(await names()).toContain(BCP);
+    expect(await cfg(STAGE_RPC)).toEqual(["search_path=pg_catalog, sessions, pg_temp", "lock_timeout=2s", "plan_cache_mode=force_custom_plan"]);
+    expect(await cfg(GC_ORDINALS)).toEqual(["search_path=pg_catalog, pg_temp", "plan_cache_mode=force_custom_plan"]);
+    expect((await failure(rollback("20261105062320_ingest_org_admission_fences.down.sql")))?.code).toBe("55000");
+    await rollback("20261105062330_buffered_search_feed_custom_plans.down.sql");
+    expect(await names()).not.toContain(BCP);
+    expect(await cfg(STAGE_RPC)).toEqual(["search_path=pg_catalog, sessions, pg_temp", "lock_timeout=2s"]);
+    expect(await cfg(GC_ORDINALS)).toEqual(["search_path=pg_catalog, pg_temp"]);
+    expect((await failure(rollback("20261105062330_buffered_search_feed_custom_plans.down.sql")))?.code).toBe("55000");
+    // 20261105062320 (the per-org admission hold) is then newest: 062300's down refuses (55000) while it is applied; its
+    // checksum-pinned down (no unreleased hold) restores the 17 replaced entry functions' exact prior bodies, drops the
+    // hold functions and the batch backstop trigger, keeps the hold history and its immutability guard (retained),
+    // removes its ledger row, and refuses on a rerun.
+    const HOLD = "upstream:20261105062320_ingest_org_admission_fences.sql";
+    expect(await names()).toContain(HOLD);
+    expect((await failure(rollback("20261105062300_search_index_stage.down.sql")))?.code).toBe("55000");
+    const holdReplaced = Object.entries(ingestOrgAdmissionHold.replaces);
+    for (const [sig] of holdReplaced) expect((await procSrc(sig)).s).toContain("-- 062320 org admission hold");
+    await rollback("20261105062320_ingest_org_admission_fences.down.sql");
+    expect(await names()).not.toContain(HOLD);
+    for (const [sig, r] of holdReplaced) {
+      const prior = holdLastBody(readFileSync(join(root, r.original), "utf8"), sig);
+      const tag = /AS (\$[a-z_]+\$)/u.exec(prior)![1]!;
+      const open = prior.indexOf(tag) + tag.length;
+      expect(await procSrc(sig)).toEqual({ s: prior.slice(open, prior.indexOf(tag, open)), d: r.secdef });
+    }
+    expect((await db.query<{ n: number }>("SELECT count(*)::int n FROM pg_proc p JOIN pg_namespace n ON n.oid=p.pronamespace WHERE n.nspname='sessions' AND p.proname LIKE 'ingest\\_org\\_admission\\_hold\\_%' AND p.proname <> 'ingest_org_admission_hold_guard'")).rows[0]!.n).toBe(0);
+    expect((await db.query<{ n: number }>("SELECT count(*)::int n FROM pg_trigger WHERE tgname='ingest_org_admission_hold_batch_backstop'")).rows[0]!.n).toBe(0);
+    for (const r of ["sessions.ingest_org_admission_holds", "sessions.ingest_org_admission_hold_events"]) expect(await relation(r)).toBe(r);
+    expect((await failure(rollback("20261105062320_ingest_org_admission_fences.down.sql")))?.code).toBe("55000");
     // 20261105062300 (the search-index stage) is newest: 062220's down refuses (55000) while it is applied; its
     // checksum-pinned down (no search-index job, event or letter) drops the stage's objects, restores the
     // 20261031000100 stage CHECKs and removes its ledger row, and refuses on a rerun. It never drops the audit

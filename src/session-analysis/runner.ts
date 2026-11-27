@@ -272,7 +272,10 @@ function runnerProcessSettings(env: NodeJS.ProcessEnv) {
   // Strict here, and it must be exactly what worker.ts analysisConfig runs (1-20, default 2): the
   // stall window and the startup line are sized from it.
   const batch = int(env.SESSION_ANALYSIS_BATCH, 2, 1, 20, "batch_invalid");
-  if (analysisConfig(env).batch !== batch) refuse("batch_invalid");
+  let config: ReturnType<typeof analysisConfig>;
+  try { config = analysisConfig(env); } catch { return refuse("analysis_workspace_invalid"); }
+  if (config.batch !== batch) refuse("batch_invalid");
+  if (config.workspaceId && claimsSchedulerEnabled(env)) refuse("workspace_global_scheduler_conflict");
   let maximum: number | undefined;
   try { maximum = readerMaxRuleset(env); } catch { refuse("reader_max_ruleset_invalid"); }
   // TLS is validated now (a bad profile or CA is a startup refusal, not a failed first tick).
@@ -704,6 +707,7 @@ export async function analysisRunnerService(env: NodeJS.ProcessEnv = process.env
  */
 export function runnerTick(env: NodeJS.ProcessEnv, tick: AnalysisTickFn, db: HoopDb, model: boolean, now: () => number = Date.now): AnalysisTickFn {
   if (!model || !claimsSchedulerEnabled(env)) return tick;
+  if (analysisConfig(env).workspaceId) refuse("workspace_global_scheduler_conflict");
   const settings = claimsSchedulerSettings(env);
   const controls = sessionIntelControls(db);
   return withClaimsScheduler(tick, {

@@ -6,7 +6,7 @@
 import { afterEach, beforeEach, describe, expect, setDefaultTimeout, setSystemTime, test } from "bun:test";
 import type { PGlite } from "@electric-sql/pglite";
 import { database, hoopDb, pointer, KEY } from "../../session-brief/__tests__/harness.ts";
-import { postgresAnalysisJobStore, sweepAnalysisTickets } from "../store.ts";
+import { postgresAnalysisJobStore, sweepAnalysisTickets, ticketObligationStore } from "../store.ts";
 import { createFsStore } from "../../../packages/object-store/src/fs.ts";
 import { objectKey, type ObjectStore } from "../../../packages/object-store/src/index.ts";
 import { createHash } from "node:crypto";
@@ -450,6 +450,47 @@ describe("worker lease (relayhistory repository.ts)", () => {
     row = (await pg.query<Json>("SELECT status, last_error FROM sessions.session_analysis_jobs_v2")).rows[0]!;
     // relayhistory keeps the last recorded error over the expiry code (COALESCE).
     expect(row).toEqual({ status: "failed", last_error: "analysis_processing_failed" });
+  });
+
+  test("workspace-bound claims, expiry and ticket sweeps advance only the selected workspace", async () => {
+    const objects = results();
+    const workspaceId = KEY.workspaceId;
+    const foreign = "ws-foreign";
+    const store = postgresAnalysisJobStore({ db: hoopDb(pg), store: objects, workspaceId, anchorManifestKey: async () => ANCHOR });
+    async function admit(ws: string, session: string) {
+      await pointer(pg, { key: { ...KEY, workspaceId: ws, sessionId: session } });
+      return (await request(session, ws)).request.analysisId as string;
+    }
+    const foreignQueued = await admit(foreign, "foreign-queued");
+    const foreignExpired = await admit(foreign, "foreign-expired");
+    const foreignRunning = await admit(foreign, "foreign-running");
+    const localExpired = await admit(workspaceId, "local-expired");
+    const localQueued = await admit(workspaceId, "local-queued");
+    await pg.query(`UPDATE sessions.session_analysis_jobs_v2
+      SET status = 'running', attempts = 3, lease_token = gen_random_uuid(), lease_expires_at = now() - interval '1 minute'
+      WHERE id IN ($1, $2, $3)`, [foreignExpired, foreignRunning, localExpired]);
+    await pg.query("UPDATE sessions.session_analysis_jobs_v2 SET attempts = 1 WHERE id = $1", [foreignRunning]);
+    for (const ws of [foreign, workspaceId]) {
+      await pg.query(`INSERT INTO sessions.session_analysis_result_tickets
+        (result_key, job_id, org_id, workspace_id, session_id, reason, created_at)
+        VALUES ($1, gen_random_uuid(), $2, $3, 's', 'publishing', now() - interval '1 day')`, [`k/${ws}`, KEY.orgId, ws]);
+    }
+    const foreignState = async () => (await pg.query(`SELECT
+      (SELECT jsonb_agg(j ORDER BY j.id) FROM sessions.session_analysis_jobs_v2 j WHERE workspace_id = $1) AS jobs,
+      (SELECT to_jsonb(t) FROM sessions.session_analysis_result_tickets t WHERE workspace_id = $1) AS ticket`, [foreign])).rows;
+    const before = await foreignState();
+    expect(await store.claim({ jobId: foreignQueued, leaseSeconds: 600 })).toBeNull();
+    expect((await store.claim({ leaseSeconds: 600 }))?.id).toBe(localQueued);
+    expect(await store.claim({ leaseSeconds: 600 })).toBeNull();
+    expect((await pg.query("SELECT status FROM sessions.session_analysis_jobs_v2 WHERE id = $1", [localExpired])).rows).toEqual([{ status: "failed" }]);
+
+    const foreignTicket = ticketObligationStore(tx, `k/${foreign}`, workspaceId);
+    const rev = (await ticketObligationStore(tx, `k/${foreign}`, foreign).load())!.rev;
+    expect(await foreignTicket.load()).toBeNull();
+    expect(await foreignTicket.retire(rev)).toEqual({ ok: false });
+    expect(await sweepAnalysisTickets(objects, { workspaceId, graceSeconds: 0, limit: 1, transact: tx, eraser: storeEraser(objects) })).toBe(1);
+    expect((await pg.query("SELECT workspace_id FROM sessions.session_analysis_result_tickets")).rows).toEqual([{ workspace_id: foreign }]);
+    expect(await foreignState()).toEqual(before);
   });
 
   test("P2: fail() is fenced by the lease expiry, not only the token", async () => {

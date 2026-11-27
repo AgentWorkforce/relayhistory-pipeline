@@ -245,10 +245,23 @@ describe("G4-only schema: the post-G4 objects are absent", () => {
       // dead-letter resolution column and the sealed archive; no G4 function names them, and the managed wake writer
       // calls its enqueue only with SEARCH_WAKE_ENQUEUE / PIPELINE_MANAGED_SEARCH_WAKE_ENABLED on (default off).
       "20261105062300_search_index_stage.sql",
+      // The per-org admission hold (docs/design/org-admission-hold.md): owner-only hold tables and functions, and 17
+      // entry functions replaced with their prior bodies plus one check that is a no-op until a hold is installed for
+      // the org (none is, by default).
+      "20261105062320_ingest_org_admission_fences.sql",
+      // The buffered feed custom plans: ALTER FUNCTION ... SET plan_cache_mode on the stage RPC and gc_ordinals; no
+      // body changes, no new object.
+      "20261105062330_buffered_search_feed_custom_plans.sql",
+      // The per-org erasure history for that hold's release: owner-only insert-only history tables and a recorder on
+      // each erasure source; it replaces 062320's owner-only release and status, no G4 function.
+      "20261105062340_ingest_org_erasure_history.sql",
+      // The buffered feed page keyset: buffered_search_feed_page replaced (sargable keyset, custom plans); no G4
+      // function names it, no ingest path calls it.
+      "20261105062350_buffered_search_feed_page_keyset.sql",
     ]);
     expect(() => migrationFiles(REPO_ROOT, "20261105043800_typo.sql")).toThrow(/names no migration/);
     expect(OBJECTS.newFunctions.length).toBeGreaterThan(30);
-    expect(OBJECTS.replacedFunctions).toEqual(["buffered_session_stages_for", "buffered_sessions_for", "ingest_babysitter_retention_register", "ingest_buffer_gc_claim", "ingest_claim_batch_mode", "ingest_claim_buffered_batch", "ingest_commit_batch", "ingest_commit_buffered_batch", "ingest_lazy_ack_batch", "ingest_lazy_guard", "ingest_lock_fences", "ingest_prepare_buffer_stage", "ingest_privacy_authority_begin", "ingest_publication_claim", "ingest_publication_guard_pointer", "ingest_publication_prepare", "ingest_publication_publish", "ingest_publication_retire_fence", "ingest_publication_scope", "ingest_require_generation", "ingest_set_session_uploads", "ingest_source_control_begin"]);
+    expect(OBJECTS.replacedFunctions).toEqual(["buffered_session_stages_for", "buffered_sessions_for", "ingest_babysitter_retention_register", "ingest_buffer_gc_claim", "ingest_claim_batch_mode", "ingest_claim_buffered_batch", "ingest_commit_batch", "ingest_commit_buffered_batch", "ingest_commit_revisions", "ingest_fanout_fence", "ingest_history_plan_claim", "ingest_lazy_ack_batch", "ingest_lazy_guard", "ingest_lock_fences", "ingest_prepare_buffer_stage", "ingest_privacy_authority_begin", "ingest_publication_claim", "ingest_publication_guard_pointer", "ingest_publication_prepare", "ingest_publication_publish", "ingest_publication_retire_fence", "ingest_publication_scope", "ingest_require_generation", "ingest_reset_uploaded_sessions", "ingest_seed_proven_records", "ingest_set_session_uploads", "ingest_source_control_begin"]);
   });
 
   test("no new table, function or column exists; the replaced RPCs exist in their prior form; no G4 body names a post-G4 object", async () => {

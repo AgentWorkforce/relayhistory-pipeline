@@ -182,7 +182,7 @@ describe("the hosted default is unchanged", () => {
 
 describe("azure deps", () => {
   test("store, sweeper eraser and canonical read are built from one target: account, container, endpoint, Shared Key", async () => {
-    const env = azureEnv({ SESSION_ANALYSIS_AZURE_ENDPOINT: "http://127.0.0.1:10000/fxacct" });
+    const env = azureEnv({ SESSION_ANALYSIS_AZURE_ENDPOINT: "http://127.0.0.1:10000/fxacct", SESSION_ANALYSIS_WORKSPACE_ID: "aaaaaaaa-0000-4000-8000-000000000001" });
     const cfg = analysisRunnerConfig(env);
     const secrets = runnerSecrets(env);
     const stores: AzureBlobConfig[] = [];
@@ -195,6 +195,7 @@ describe("azure deps", () => {
       eraserFactory: () => { throw new Error("no S3 eraser on azure"); },
     };
     const { deps, target } = runnerAzureAnalysisDeps(env, cfg, secrets, ports);
+    expect(deps.config.workspaceId).toBe(env.SESSION_ANALYSIS_WORKSPACE_ID);
     expect(target).toMatchObject({ provider: "azure", account: "fxacct", container: "fx-container", endpoint: "http://127.0.0.1:10000/fxacct" });
     expect(Object.isFrozen(target)).toBe(true);
     expect(stores).toHaveLength(1);

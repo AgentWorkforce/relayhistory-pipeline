@@ -79,6 +79,17 @@ export const SECRET_LIKE = /(^|\/)(\.env(\.[^/]*)?|inputs\.json|[^/]*\.(pem|key|
 const SECRET_ALLOWED = /(^|\/)\.env\.example$/;
 
 /**
+ * The one reviewed tracked .npmrc that may publish (#213's scope-registry line, no credential): bound to its exact
+ * path, regular-file mode and blob, so any other content, mode, object type or path fails closed.
+ */
+const REVIEWED_NPMRC = Object.freeze({ path: "agent/.npmrc", mode: "100644", type: "blob", object: "5b0a9766e5c5cf8dcf786b235f69fea7d6920187" });
+/** True only when `entry` (one `git ls-tree` line for the snapshot) is exactly the reviewed agent/.npmrc. */
+export function reviewedNpmrc(entry) {
+  const m = /^(\d{6}) (\w+) ([0-9a-f]{40})\t(.+)$/.exec(entry);
+  return !!m && m[1] === REVIEWED_NPMRC.mode && m[2] === REVIEWED_NPMRC.type && m[3] === REVIEWED_NPMRC.object && m[4] === REVIEWED_NPMRC.path;
+}
+
+/**
  * Why a snapshot must not leave this machine, or "" when it may. The remote
  * is public (and a sandbox upload leaves too): machine-local state and
  * secret-like files never go; the engine roots must pass the production
@@ -90,7 +101,8 @@ export async function refuseToPublish(sha, base, root = ".") {
   const files = git(["-C", root, "ls-tree", "-r", "--name-only", sha]).split("\n");
   const local = files.filter((file) => MACHINE_LOCAL.some((dir) => file === dir || file.startsWith(`${dir}/`) || file.includes(`/${dir}/`)));
   if (local.length) return `the snapshot holds machine-local state (${local.slice(0, 5).join(", ")}); unstage it`;
-  const secret = files.filter((file) => SECRET_LIKE.test(file) && !SECRET_ALLOWED.test(file));
+  const secret = files.filter((file) => SECRET_LIKE.test(file) && !SECRET_ALLOWED.test(file)
+    && !(file === REVIEWED_NPMRC.path && reviewedNpmrc(git(["-C", root, "ls-tree", sha, "--", file]))));
   if (secret.length) return `the snapshot holds secret-like files (${secret.slice(0, 5).join(", ")}); unstage them`;
   try {
     const { addedHits } = await import("./publish-guard.mjs");

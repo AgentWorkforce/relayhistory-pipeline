@@ -92,7 +92,9 @@ test("lazy_records fails closed (40001) outside READ COMMITTED; the same claim s
     const e = await f.db.query("SELECT sessions.ingest_claim_buffered_batch($1::jsonb)", [payload]).then(() => null, (x: any) => x);
     await f.db.exec("ROLLBACK");
     expect(e?.code).toBe("40001");
-    expect(String(e?.message)).toContain("lazy records require read committed");
+    // Since 062320 the org admission hold check is the first statement and refuses with the same 40001 before
+    // lazy_records is reached; either refusal keeps the claim out (the hold check's message names the hold).
+    expect(String(e?.message)).toMatch(/lazy records require read committed|org admission hold requires read committed/u);
   }
   expect((await f.run("SELECT sessions.ingest_claim_buffered_batch($1::jsonb) AS r", [payload]) as any).rows[0].r.kind).toBeDefined();
 });
@@ -117,10 +119,14 @@ test("lock footprint: a 500-record claim holds exactly one origin lock and one f
     expect((await f.db.query(locks)).rows).toEqual([]);
     expect(((await f.db.query<{ r: any }>("SELECT sessions.ingest_claim_buffered_batch($1::jsonb) AS r", [payload])).rows[0]!.r).kind).toBe("claimed");
     const held = (await f.db.query(locks)).rows;
-    expect(held).toHaveLength(2); // constant per transaction, never per record
+    // Since 062320: plus the org admission hold key, taken SHARED once at the claim's entry (and re-granted, not
+    // re-taken, by the inner claim_mode check).
+    const hold = (await f.db.query<{ classid: string; objid: string }>("SELECT ((k>>32)&4294967295)::text classid,(k&4294967295)::text objid FROM(SELECT hashtextextended('96bulls:ingest-org-hold-v1:'||$1,0) k)s", [X.orgId])).rows[0]!;
+    expect(held).toHaveLength(3); // constant per transaction, never per record
     expect(held).toEqual(expect.arrayContaining([
       { ...want, objsubid: 1, mode: "ExclusiveLock", granted: true },
       { classid:"961996",objid:"50000",objsubid:2,mode:"ShareLock",granted:true },
+      { ...hold, objsubid: 1, mode: "ShareLock", granted: true },
     ]));
   } finally { await f.db.exec("ROLLBACK"); }
 });
