@@ -10,7 +10,7 @@ import {
   DB_ERROR_REASONS, DB_INTERNAL_REASONS, DB_REASON_MESSAGE_MAX, DB_SERIALIZATION_REASON_BY_MESSAGE, PG_BUILTIN_SERIALIZATION_MESSAGES,
   dbErrorReasonField, dbInternalReason, dbSerializationReason,
 } from "../db-error-reason.ts";
-import { DB_ERROR_REASON_VALUES, DB_INTERNAL_REASON_VALUES, errorFields, logLine, sanitizeLogField } from "../log.ts";
+import { DB_ERROR_REASON_VALUES, DB_INTERNAL_REASON_VALUES, errorCodeFields, errorFields, logLine, sanitizeLogField } from "../log.ts";
 
 const ROOT = join(import.meta.dir, "../../../supabase");
 const SQL = ["migrations", "bootstrap"].flatMap((d) => readdirSync(join(ROOT, d)).filter((f) => f.endsWith(".sql")).sort()
@@ -112,12 +112,17 @@ describe("db_error_reason", () => {
 
   test("only a 40001 carries the field; never the raw message", () => {
     const MARKER = "PRIVATE-MARKER-session_secret";
-    const f = (e: unknown) => dbErrorReasonField(e, errorFields(e).error_code);
+    const f = (e: unknown) => dbErrorReasonField(e, errorCodeFields(e).code);
     expect(f({ code: "40001", message: "publication: pointer mutation busy" })).toEqual({ db_error_reason: "pointer_mutation_busy" });
     expect(f({ code: "40001", message: `${MARKER} could not serialize` })).toEqual({ db_error_reason: "other" });
     expect(f({ code: "40001" })).toEqual({ db_error_reason: "other" });
     for (const e of [{ code: "55P03", message: "publication: pointer mutation busy" }, { code: "40P01" }, { code: 40001, message: "publication: pointer mutation busy" },
-      new Error("publication: pointer mutation busy"), undefined, null, "40001"]) expect(f(e)).toEqual({});
+      new Error("publication: pointer mutation busy"), undefined, null, "40001",
+      Object.assign(new Error("publication: pointer mutation busy"), { name: "40001" }), Object.assign(new Error("x"), { name: "XX000" })]) expect(f(e)).toEqual({});
+    // errorFields' display/retry fallback to the name is unchanged; only the diagnostic code ignores it.
+    expect(errorFields(Object.assign(new Error("x"), { name: "40001" }))).toEqual({ error_code: "40001" });
+    expect(errorCodeFields(Object.assign(new Error("x"), { name: "40001" }))).toEqual({ fields: { error_code: "40001" }, code: undefined });
+    expect(errorCodeFields({ code: "40001", retryable: true })).toEqual({ fields: { error_code: "40001", retryable: true }, code: "40001" });
     // The caller's captured code decides, not a second read of `code`.
     expect(dbErrorReasonField({ message: "publication: pointer mutation busy" }, "40001")).toEqual({ db_error_reason: "pointer_mutation_busy" });
     expect(dbErrorReasonField({ code: "40001", message: "publication: pointer mutation busy" }, "55P03")).toEqual({});

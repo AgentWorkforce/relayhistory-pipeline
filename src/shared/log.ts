@@ -304,13 +304,25 @@ export const log = {
   error: (m: string, f: Record<string, unknown> = {}) => emit("error", m, f),
 };
 
-/** The code and retryable flag of an error, never its message. */
-export function errorFields(err: unknown): Record<string, unknown> {
+/**
+ * errorFields plus the error's own `code` when it is a string (read once), else undefined. `fields.error_code` falls
+ * back to the name for display and retry; `code` never does, so a diagnostic keyed on a real database code (for
+ * example dbErrorReasonField) is not fooled by an error whose name merely looks like one.
+ */
+export function errorCodeFields(err: unknown): { fields: Record<string, unknown>; code: string | undefined } {
   const e = err as { code?: unknown; retryable?: unknown; name?: unknown };
-  return {
-    error_code: typeof e?.code === "string" ? e.code : typeof e?.name === "string" ? e.name : "unknown",
+  const raw = e?.code;
+  const code = typeof raw === "string" ? raw : undefined;
+  const fields = {
+    error_code: code ?? (typeof e?.name === "string" ? e.name : "unknown"),
     ...(typeof e?.retryable === "boolean" ? { retryable: e.retryable } : {}),
   };
+  return { fields, code };
+}
+
+/** The code and retryable flag of an error, never its message. */
+export function errorFields(err: unknown): Record<string, unknown> {
+  return errorCodeFields(err).fields;
 }
 
 /** A SearchIndexError detail code: identifier tokens joined by `:`, never free text (emitted truncated to 256). */

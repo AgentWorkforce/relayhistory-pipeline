@@ -221,7 +221,8 @@ function readMessage(err: unknown): string | undefined {
 
 /**
  * `{ db_error_reason }` for a 40001 and `{ db_internal_reason }` for an XX000; `{}` for any other code. `errorCode`
- * is the code the caller already captured (errorFields' error_code), so the error's `code` is not read again. The
+ * is the error's own string `code` the caller already captured (errorCodeFields' `code`, never the error_code name
+ * fallback), so the error's `code` is not read again and a name-only "40001" / "XX000" gets no reason. The
  * message is read best-effort: a throwing getter, a non-string or an over-long message is `other`. Never throws.
  */
 export function dbErrorReasonField(err: unknown, errorCode: unknown): { db_error_reason?: string; db_internal_reason?: string } {

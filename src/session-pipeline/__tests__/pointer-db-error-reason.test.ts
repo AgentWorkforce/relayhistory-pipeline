@@ -96,3 +96,45 @@ test("emitted JSON: an XX000 logs its closed family, never the message text", as
   expect(JSON.stringify(lines)).not.toContain(MARKER);
   expect(JSON.stringify(lines)).not.toContain("cache lookup failed");
 });
+
+/** An Error with no `code` whose name merely looks like a database code (errorFields' display fallback). */
+function nameOnly(name: string, message: string) {
+  return Object.assign(new Error(message), { name });
+}
+
+test("emitted JSON: a name-only 40001 (no code) keeps error_code=40001 for display but logs no db_error_reason", async () => {
+  const lines = await failedLines(nameOnly("40001", "publication: pointer mutation busy"));
+  const failed = lines.filter((l) => l.message === "pointer index failed");
+  expect(failed).toHaveLength(1);
+  expect(failed[0]).toMatchObject({ level: "error", stage: "session-indexed", error_code: "40001" });
+  expect("db_error_reason" in failed[0]!).toBe(false);
+  expect("db_internal_reason" in failed[0]!).toBe(false);
+  expect(JSON.stringify(lines)).not.toContain("pointer mutation busy");
+});
+
+test("emitted JSON: a name-only XX000 (no code) keeps error_code=XX000 for display but logs no db_internal_reason", async () => {
+  const lines = await failedLines(nameOnly("XX000", "could not open relation with OID 1"));
+  const failed = lines.filter((l) => l.message === "pointer index failed");
+  expect(failed).toHaveLength(1);
+  expect(failed[0]).toMatchObject({ error_code: "XX000" });
+  expect("db_error_reason" in failed[0]!).toBe(false);
+  expect("db_internal_reason" in failed[0]!).toBe(false);
+  expect(JSON.stringify(lines)).not.toContain("could not open relation");
+});
+
+test("emitted JSON: a non-string code with a 40001 name gets no reason (only a real string code counts)", async () => {
+  const lines = await failedLines(Object.assign(new Error("publication: pointer mutation busy"), { name: "40001", code: 40001 }));
+  const failed = lines.filter((l) => l.message === "pointer index failed");
+  expect(failed[0]).toMatchObject({ error_code: "40001" });
+  expect("db_error_reason" in failed[0]!).toBe(false);
+});
+
+test("emitted JSON: a code read once — a getter that changes value cannot desync error_code and the reason", async () => {
+  let reads = 0;
+  const err = { get code(): string { reads += 1; return reads === 1 ? "55P03" : "40001"; }, message: "publication: pointer mutation busy" };
+  const lines = await failedLines(err);
+  const failed = lines.filter((l) => l.message === "pointer index failed");
+  expect(failed[0]).toMatchObject({ error_code: "55P03" });
+  expect("db_error_reason" in failed[0]!).toBe(false);
+  expect(reads).toBe(1);
+});
