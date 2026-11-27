@@ -87,7 +87,7 @@ import { processBatch, RETRY_VISIBILITY_TIMEOUT_MS, type BatchResponse, type Con
 import { droppedFanout, scopeLockKey, type ScopeLock } from "./pointer.ts";
 import { STREAM_MIN_START_MS, searchIndexLimits, searchIndexStreamChFromEnv, type SearchIndexDeps, type SearchIndexStreamCh } from "./search-index.ts";
 import { claimSearchJobs, claimSearchProbe, runSearchJob, searchJobLogFields, searchSettlementFor, settleSearchJob, SEARCH_JOBS_DEFAULT_CLAIM, type ClaimedSearchJob, type SearchSql } from "./search-jobs.ts";
-import { BufferedFeedError, bufferedFeedConfig, bufferedFeedQueryField, bufferedFeedGateRefusal, bufferedFeedVersionRefusal, clickhouseTieLedger, runBufferedFeed, sqlBufferedFeedSource, type BufferedFeedConfig, type BufferedFeedDeps, type TimedSqlExecutor } from "./buffered-search-feed.ts";
+import { BufferedFeedError, bufferedFeedConfig, bufferedFeedQueryField, bufferedFeedTimingFields, emptyBufferedFeedTimings, bufferedFeedGateRefusal, bufferedFeedVersionRefusal, clickhouseTieLedger, runBufferedFeed, sqlBufferedFeedSource, type BufferedFeedConfig, type BufferedFeedDeps, type TimedSqlExecutor } from "./buffered-search-feed.ts";
 import { bufferedErasureConfig, runBufferedErasureDelete, type BufferedErasureConfig, type BufferedErasureDeps } from "./buffered-erasure-delete.ts";
 import { RECONCILE_BODY_KEY, requeueBody } from "./s3-events.ts";
 import { BUFFERED_FEED_CA_FIELD, BUFFERED_FEED_URL_FIELD, bufferedFeedClientConfig, loginCheckedFeedExecutor } from "./buffered-feed-login.ts";
@@ -1226,10 +1226,12 @@ async function dispatchLambdaEvent(event: PipelineLambdaEvent, ready: () => Prom
       return { ok: false };
     }
     const started = Date.now();
+    // Per SQL call kind (page / stage / advance): calls, total and longest ms, on the run line and on its failure line.
+    const timings = emptyBufferedFeedTimings();
     try {
       const rt = await ready();
       if (!rt.deps.bufferedFeed || !rt.env.bufferedSearchFeed) throw new Error("buffered search feed unavailable");
-      const s = await runBufferedFeed(rt.scheduledFeed ?? rt.deps.bufferedFeed, rt.env.bufferedSearchFeed);
+      const s = await runBufferedFeed(rt.scheduledFeed ?? rt.deps.bufferedFeed, rt.env.bufferedSearchFeed, timings);
       // A same-second refusal is never coverage: the run is not ok while any is recorded or outstanding.
       const refusals = (s.refused ?? 0) + (s.refusalsOutstanding ?? 0);
       if (refusals) log.warn("buffered search feed refusals", { stage: "buffered-search-feed", count: s.refused,
@@ -1237,10 +1239,12 @@ async function dispatchLambdaEvent(event: PipelineLambdaEvent, ready: () => Prom
       log.info("buffered search feed run", { stage: "buffered-search-feed", listed: s.stages, inserted: s.indexed, skipped: s.skipped,
         count: s.rows, deleted: s.deleted, ok: !s.blocked && !refusals,
         state: s.caughtUp ? (refusals ? "caught_up_with_refusals" : "caught_up") : s.blocked ? "blocked" : "continuation",
-        reason: s.blocked ?? (Object.entries(s.reasons).map(([k, n]) => `${k}:${n}`).join(",") || undefined), duration_ms: Date.now() - started });
+        reason: s.blocked ?? (Object.entries(s.reasons).map(([k, n]) => `${k}:${n}`).join(",") || undefined), ...bufferedFeedTimingFields(s.timings),
+        duration_ms: Date.now() - started });
       return { ok: true };
     } catch (error) {
-      log.error("buffered search feed failed", { stage: "buffered-search-feed", ...errorFields(error), ...bufferedFeedQueryField(error), duration_ms: Date.now() - started });
+      log.error("buffered search feed failed", { stage: "buffered-search-feed", ...errorFields(error), ...bufferedFeedQueryField(error),
+        ...bufferedFeedTimingFields(timings), duration_ms: Date.now() - started });
       return { ok: false };
     }
   }

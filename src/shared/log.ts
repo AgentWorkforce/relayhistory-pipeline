@@ -37,6 +37,10 @@ const SUMMARY_INPUT_FIELDS = [
 ];
 
 /** The streaming reconcile read budgets serve() logs at startup (searchIndexStreamBudgetWarning). */
+/** The buffered search feed run's per-call timing fields (buffered-search-feed.ts bufferedFeedTimingFields, pinned equal
+ * in buffered-search-feed.test.ts): calls, total ms and longest ms per SQL call kind. */
+export const BUFFERED_FEED_TIMING_FIELDS: readonly string[] = Object.freeze(["page", "stage", "advance"]
+  .flatMap((q) => [`feed_${q}_calls`, `feed_${q}_ms_total`, `feed_${q}_ms_max`]));
 const STREAM_BUDGET_FIELDS = ["max_read_bytes", "max_read_events", "largest_streamed_scope_bytes", "largest_streamed_scope_events"];
 
 /** The search pass's phase timers and write counters (session-pipeline/consumer.ts). */
@@ -129,8 +133,11 @@ export const ALLOWED_LOG_FIELDS = new Set([
   // The ingest bounded lock retry (src/session-ingest/deliver.ts LockRetryFields, INGEST_LOCK_RETRY_BUDGET_MS): retries
   // issued for one delivery (a bounded integer) and how they ended (LOCK_RETRY_OUTCOME_VALUES).
   "lock_retry_attempts", "lock_retry_outcome",
-  // The buffered search feed's failing SQL call: one of page / stage / advance (FEED_QUERY_VALUES), never SQL text.
-  "feed_query",
+  // The buffered search feed's failing SQL call: one of page / stage / advance (FEED_QUERY_VALUES), never SQL text,
+  // and that call's own wall time in ms (a bounded integer).
+  "feed_query", "feed_query_ms",
+  // ...and the scheduled run's per-call timings (buffered-search-feed.ts bufferedFeedTimingFields): bounded counts only.
+  ...BUFFERED_FEED_TIMING_FIELDS,
 ]);
 
 /**
@@ -158,6 +165,8 @@ export const BOUNDED_COUNT_FIELDS: ReadonlyMap<string, number> = new Map([
   ["skipped_control", 100_000],
   ["age_ms", 3_600_000],
   ["lock_retry_attempts", 100],
+  ["feed_query_ms", 3_600_000],
+  ...BUFFERED_FEED_TIMING_FIELDS.map((f): [string, number] => [f, f.endsWith("_calls") ? 1_000_000 : 3_600_000]),
   ...ADMISSION_PHASE_FIELDS_LIST.map((f): [string, number] => [f, 3_600_000]),
   ...ANALYTICS_COUNTER_FIELDS.map((f): [string, number] => [f, Number.MAX_SAFE_INTEGER]),
   ...SEAL_POOL_LOG_FIELDS.map((f): [string, number] => [f, Number.MAX_SAFE_INTEGER]),
