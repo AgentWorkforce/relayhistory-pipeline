@@ -1,5 +1,5 @@
 -- Observed paths on event facts (registry slot 062310). A tool result that is exactly a `git status --short` listing
--- or a `git diff --stat` block names the paths its session SAW as changed: observations, not writes, kept apart
+-- names the paths its session SAW as changed: observations, not writes, kept apart
 -- from files_touched (docs/event-facts-observed-paths.md). Two lines listing the same dirty paths can suggest a
 -- shared checkout, or one line picking up another's uncommitted work; this field lets that be measured.
 --

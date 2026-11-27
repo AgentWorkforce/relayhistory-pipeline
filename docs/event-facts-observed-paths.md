@@ -1,6 +1,6 @@
 # Observed paths on event facts
 
-A tool result that is exactly a `git status --short` listing or a `git diff --stat` block names the paths its session **saw** as changed in its checkout. Those are observations, not writes, so they are kept in their own field, `observed_paths`, never mixed into `files_touched`.
+A tool result that is exactly a `git status --short` listing names the paths its session **saw** as changed in its checkout. Those are observations, not writes, so they are kept in their own field, `observed_paths`, never mixed into `files_touched`.
 
 This field is **dormant**. The schema is ready, but no runtime derives it yet, and no reader or detector reads it. Turning it on, and applying the migration to any real database, each need Khaliq's separate, explicit OK.
 
@@ -15,14 +15,17 @@ The overlap benchmark (branch `review/claude-overlap-benchmark`, `docs/session-i
 
 Paths seen in status listings are the only evidence that lifted the ranker within its alert budget. Two lines of work listing the same dirty paths **suggests** a shared checkout, or one line picking up another's uncommitted work. It does not establish either without independent checkout or lineage evidence. The 5 hits are exploratory: this field exists so the signal can be measured on live data before anything uses it.
 
+The benchmark counted `--stat` listings too, and this field does not (see below), so it carries a subset of that evidence. The 5 hits are an upper bound for what it can show until measured.
+
 ## Derivation
 
-`src/session-pipeline/observed-paths.ts` defines `observedPaths(content)`. It is pure and bounded: at most 64 paths, each at most 512 characters, from at most 256 KiB of text. A tool result is read only when its whole text has one of two shapes:
+`src/session-pipeline/observed-paths.ts` defines `observedPaths(content)`. It is pure and bounded: at most 64 paths, each at most 512 characters, from at most 256 KiB of text. A tool result is read only when its whole text is a `git status --short` listing:
 
-- **`git status --short`** (porcelain v1). Every non-empty line is `XY path` or `XY old -> new`, optionally after one `## branch` header. `XY` must be a code git prints: `??`, `!!`, an unmerged pair, or index and worktree states of which at least one is set (two spaces never occur, so indented text is not a listing). The `old -> new` form appears exactly when `XY` holds `R` or `C`. Git quotes any path containing whitespace, quotes or escapes. A quoted path is not decoded: its line is skipped and the rest of the listing still counts. An unquoted path never contains whitespace. A rename contributes its new path.
-- **`git diff --stat`** (also `git show --stat`). Stat lines, then exactly one summary line (`N files changed, …`), last. A stat line is a text change, `path | N +-`, or a binary one, `path | Bin A -> B bytes`. The block must agree with itself: its `|` separators line up, its file count equals the number of lines, and its counts add up to the summary's insertions and deletions. `--stat` prints names verbatim, so rename notation (`old => new`, braced `src/{old => new}/a.ts`) cannot be told from a file literally named that way, and a quoted name (`"q\"uote.txt"`) is git's escaped display string. Such lines, and lines with braces, are skipped, and the block's other lines still count. A path git shortened with `...` is dropped. Renames are still seen through `git status`, which marks them unambiguously.
+- **`git status --short`** (porcelain v1). Every non-empty line is `XY path` or `XY old -> new`, optionally after one `## branch` header. `XY` must be a code git prints: `??`, `!!`, an unmerged pair, or index and worktree states of which at least one is set (two spaces never occur, so indented text is not a listing). The `old -> new` form appears exactly when `XY` holds `R` or `C`. Git quotes any path containing whitespace, a double quote, a backslash or a control character. A quoted path is not decoded: its line is skipped and the rest of the listing still counts. An unquoted path therefore holds none of those, so it is exactly the file's name. A rename contributes its new path.
 
-Anything else yields nothing: prose (indented or not), a log that merely contains a status-shaped line, stat lines without their summary or inconsistent with it, or malformed binary or rename lines. The parser reads the result's text alone. It does not match the result to its `git` call, since the staged path sees results and calls in different batches, so the whole-text shape is what keeps it conservative.
+`git diff --stat` (and `git show --stat`) is not read. It prints names verbatim and pads them with spaces, so a name cannot be recovered from it: trees holding `tail` and `tail ` print byte-identical blocks, and `a => b` may be a rename or a file so named.
+
+Anything else yields nothing: prose (indented or not), a log that merely contains a status-shaped line, or a `--stat` block. The parser reads the result's text alone. It does not match the result to its `git` call, since the staged path sees results and calls in different batches, so the whole-text shape is what keeps it conservative.
 
 `src/session-pipeline/output-facts.ts` builds `EventFactRow.observed_paths` for `tool_result` events, but only when the builders are given `{ observedPaths: true }`. That option is accepted by `outputFactsFromScope`, `outputFactsBatchStep` and `stageOutputFactsChunk`. No runtime passes it yet.
 

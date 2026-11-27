@@ -8,25 +8,19 @@ describe("observedPaths", () => {
     expect(observedPaths("MM src/a.ts\r\nUU src/b.ts\r\n")).toEqual(["src/a.ts", "src/b.ts"]);
     expect(observedPaths("RM a.ts -> b.ts\nC  x.ts -> y.ts\n R c.ts -> d.ts\n A e.ts\nAA f.ts\n!! g.log")).toEqual(["b.ts", "y.ts", "d.ts", "e.ts", "f.ts", "g.log"]);
   });
-  test("reads a git diff --stat block ending in its summary", () => {
-    expect(observedPaths(" src/a.ts        | 12 +++++++-----\n docs/b.md       |  3 +++\n assets/logo.png | Bin 10 -> 20 bytes\n 3 files changed, 10 insertions(+), 5 deletions(-)\n"))
-      .toEqual(["src/a.ts", "docs/b.md", "assets/logo.png"]);
-    expect(observedPaths(" src/a.ts | 1 +\n 1 file changed, 1 insertion(+)")).toEqual(["src/a.ts"]);
+  test("git diff --stat is never read: its names are padded and verbatim, so they cannot be recovered", () => {
+    // Real git: these two trees print byte-identical --stat blocks (one names "tail", the other "tail ").
+    const real = " long-sibling.ts | 1 +\n tail            | 1 +\n 2 files changed, 2 insertions(+)\n";
+    for (const text of [
+      real,
+      " src/a.ts        | 12 +++++++-----\n docs/b.md       |  3 +++\n assets/logo.png | Bin 10 -> 20 bytes\n 3 files changed, 10 insertions(+), 5 deletions(-)\n",
+      " draft => final.txt | 1 +\n 1 file changed, 1 insertion(+)",
+    ]) expect(observedPaths(text)).toEqual([]);
   });
-  test("--stat lines whose name is ambiguous (rename notation, braces) or quoted are skipped; the rest still count", () => {
-    const block = [
-      " keep.ts                                      |  2 ++",
-      " old.ts => new.ts                             |  0",
-      " src/{old => new}/a.ts                        |  0",
-      " deep/{x.ts => y.ts}                          |  0",
-      " lib/{ => sub}/b.ts                           |  0",
-      " lib/{sub => }/c.ts                           |  0",
-      " logo.bin                                     | Bin 6 -> 9 bytes",
-      " 7 files changed, 2 insertions(+)",
-    ].join("\n");
-    // Git prints a file literally named "old.ts => new.ts" the same way, so no rename line names a path.
-    expect(observedPaths(block)).toEqual(["keep.ts", "logo.bin"]);
-    expect(observedPaths(' "q\\"uote.txt" | 1 +\n plain.txt     | 1 +\n 2 files changed, 2 insertions(+)')).toEqual(["plain.txt"]);
+  test("an unquoted name never holds what git would quote: a double quote, a backslash, a control character", () => {
+    for (const t of ['?? bad"name', "?? a\\b", " M x\u0001y"]) expect(observedPaths(t)).toEqual([]);
+    expect(observedPaths(' M ok.ts\n?? "tail "')).toEqual(["ok.ts"]); // git quotes a trailing space; skipped
+    expect(observedPaths(" M \u00e9.ts")).toEqual(["\u00e9.ts"]);         // core.quotePath=false prints UTF-8 raw
   });
   test("status lines with quoted paths are skipped; the rest of the listing still counts", () => {
     expect(observedPaths(' M "a b.txt"\n M ok.ts')).toEqual(["ok.ts"]);

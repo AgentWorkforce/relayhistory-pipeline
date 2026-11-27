@@ -1,11 +1,16 @@
 /**
- * Observed paths (docs/event-facts-observed-paths.md): the paths a tool result shows as changed in
- * the session's checkout, from `git status --short` or `git diff --stat` output. They are observations, not writes,
- * and are kept apart from files_touched. Two lines of work listing the same dirty paths can suggest a shared
- * checkout, or one picking up the other's uncommitted work; it does not establish either.
+ * Observed paths (docs/event-facts-observed-paths.md): the paths a tool result shows as changed in the session's
+ * checkout, from `git status --short` output. They are observations, not writes, and are kept apart from
+ * files_touched. Two lines of work listing the same dirty paths can suggest a shared checkout, or one picking up the
+ * other's uncommitted work; it does not establish either.
  *
- * A result is read only when its whole text has one of the two shapes; anything else (prose, mixed output, a log
- * that merely contains a line like ` M x`) yields nothing. Pure and bounded: at most MAX_OBSERVED_PATHS paths of at
+ * Only `git status --short` is read, because only it names paths unambiguously: git quotes any path containing
+ * whitespace, quotes, backslashes or control characters, so an unquoted path is exactly the file's name. `--stat`
+ * is not read: it prints names verbatim and pads them with spaces, so a name cannot be recovered from it (`tail`
+ * and `tail ` print the same; `a => b` may be a rename or a file so named).
+ *
+ * A result is read only when its whole text is such a listing; anything else (prose, mixed output, a log that
+ * merely contains a line like ` M x`) yields nothing. Pure and bounded: at most MAX_OBSERVED_PATHS paths of at
  * most MAX_OBSERVED_PATH_CHARS each, from at most MAX_OBSERVED_CONTENT characters.
  */
 export const MAX_OBSERVED_PATHS = 64;
@@ -16,12 +21,13 @@ export const MAX_OBSERVED_CONTENT = 256 * 1024;
  * `XY path` or `XY old -> new` (porcelain v1 short format). XY must be a code git prints (STATUS_CODES): untracked
  * `??`, ignored `!!`, an unmerged pair, or index and worktree states of which at least one is set. Two spaces never
  * occur, so indented text is not a listing. The arrow form is a rename or copy and appears exactly when XY holds `R`
- * or `C`. Git quotes any path containing whitespace, quotes or escapes (`"a b.txt"`); a quoted path is not decoded, so
- * its line is skipped and the rest of the listing still counts. An unquoted path has no whitespace, so a line of
- * prose cannot pass as one.
+ * or `C`. Git quotes any path containing whitespace, a double quote, a backslash or a control character
+ * (`"a b.txt"`); a quoted path is not decoded, so its line is skipped and the rest of the listing still counts. An
+ * unquoted path therefore contains none of those, so neither prose nor an unquoted `bad"name` passes as one.
  */
 const QUOTED = '"(?:\\\\.|[^"\\\\])*"';
-const STATUS_LINE = new RegExp(`^(\\S\\S|\\S | \\S) (?:([^\\s"]\\S*|${QUOTED}) -> )?([^\\s"]\\S*|${QUOTED})$`);
+const UNQUOTED = '[^\\s"\\\\\\u0000-\\u001f\\u007f]+';
+const STATUS_LINE = new RegExp(`^(\\S\\S|\\S | \\S) (?:(${UNQUOTED}|${QUOTED}) -> )?(${UNQUOTED}|${QUOTED})$`);
 const UNMERGED = ["DD", "AU", "UD", "UA", "DU", "AA", "UU"];
 const STATUS_CODES = new Set([
   "??", "!!", ...UNMERGED,
@@ -45,36 +51,6 @@ function statusPath(line: string): string | typeof SKIP | null {
 }
 /** `## branch...upstream` header of `git status -sb`. */
 const BRANCH_LINE = /^## \S/;
-/**
- * One `--stat` line: ` path | 12 +++--` (a text change: its count, then the scaled graph) or
- * ` path | Bin 10 -> 20 bytes` (a binary change). Git aligns the `|` of every line in a block.
- */
-const STAT_LINE = /^ (\S.*?)( +)\| +(?:(\d+)(?: [+-]+)?|Bin \d+ -> \d+ bytes)$/;
-/** ` 3 files changed, 10 insertions(+), 2 deletions(-)` */
-const STAT_SUMMARY = /^ (\d+) files? changed(?:, (\d+) insertions?\(\+\))?(?:, (\d+) deletions?\(-\))?$/;
-/**
- * A stat line's path, or SKIP when the stat text cannot name it unambiguously. `--stat` prints a name verbatim
- * (unquoted, even with spaces), so a rename's `old => new` or braced `{old => new}` notation cannot be told from a
- * file literally named that way, and a quoted name is git's escaped display string, not the file's name. Such lines
- * are skipped; the block's other lines still count.
- */
-function statPath(name: string): string | typeof SKIP {
-  return name.includes(" => ") || /[{}]/.test(name) || name.startsWith('"') ? SKIP : name;
-}
-
-/** A `--stat` block (stat lines, then its summary): the paths, or null when the block is not one git prints. */
-function statBlock(body: string[], summary: string): string[] | null {
-  const sum = STAT_SUMMARY.exec(summary);
-  if (!sum || !body.length || Number(sum[1]) !== body.length) return null;
-  const rows = body.map((l) => STAT_LINE.exec(l));
-  if (rows.some((m) => !m)) return null;
-  // The pipes line up, and the per-file counts add up to the summary's insertions and deletions.
-  const pipe = new Set(body.map((l) => l.indexOf(" | ")));
-  const counted = rows.reduce((n, m) => n + Number(m![3] ?? 0), 0);
-  if (pipe.size !== 1 || counted !== Number(sum[2] ?? 0) + Number(sum[3] ?? 0)) return null;
-  return rows.map((m) => statPath(m![1]!)).filter((p): p is string => p !== SKIP);
-}
-
 function valid(path: string): boolean {
   return path.length > 0 && path.length <= MAX_OBSERVED_PATH_CHARS && path.trim() === path && !path.startsWith("-")
     && !/[\u0000-\u001f\u007f]/.test(path) && !path.includes("...");
@@ -95,9 +71,5 @@ export function observedPaths(content: string | null | undefined): string[] {
   const status = lines.filter((l, i) => !(i === 0 && BRANCH_LINE.test(l)));
   const named = status.map(statusPath);
   if (status.length && named.every((p) => p !== null)) return cap(named.filter((p): p is string => p !== SKIP));
-  // git diff --stat: stat lines, then exactly one summary line, last, consistent with them.
-  const last = lines.at(-1)!, body = lines.slice(0, -1);
-  const stat = statBlock(body, last);
-  if (stat) return cap(stat);
   return [];
 }
