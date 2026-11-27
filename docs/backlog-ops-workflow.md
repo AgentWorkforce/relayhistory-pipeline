@@ -458,8 +458,10 @@ calls it yet.
   only release is `bridge_complete` (`releaseAllowed`).
 - **Waves (`waveOrgs`).** An org whose hold is `marker_attempted` is stuck and never joins a new
   wave.
-- **Alarms (`holdAlarms`).** A hold sealed for over 6 h, or attempted for over 24 h without
-  `bridge_complete`, pages `HOLD_ALARM_OWNER`. The alarm carries the org's hash only.
+- **Alarms (`holdAlarms`).** A hold sealed for over 60 min, or attempted for over 24 h without
+  `bridge_complete`, pages the owner named by configuration (`BACKLOG_OPS_HOLD_ALARM_OWNER`, an Agent
+  Relay name; for this rollout, claude-cloud-cloud-b1). The 60-minute bound exists because publication
+  for the org is refused while it is sealed. The alarm carries the org's hash only.
 
 ## Gates
 

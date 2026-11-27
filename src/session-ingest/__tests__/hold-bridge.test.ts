@@ -13,7 +13,8 @@ import type { LedgerTenant, SelectionInput } from "../ledger.ts";
 import {
   ERASURE_REREAD_LIMIT,
   ERASURE_SET_SQL,
-  HOLD_ALARM_OWNER,
+  HOLD_ALARM_OWNER_VAR,
+  holdAlarmOwner,
   HOLD_ATTEMPT_MAX_MS,
   HOLD_FUNCTIONS,
   HOLD_SEAL_MAX_MS,
@@ -266,14 +267,26 @@ test("waves: an org stuck in marker_attempted never joins a new wave; a missing 
   expect(codeSync(() => waveOrgs([ORG, "33333333-2222-4333-8444-555555555555"], holds))).toBe("hold_state_missing");
 });
 
+const OWNER = "claude-cloud-cloud-b1";
+test("alarm owner: configuration (BACKLOG_OPS_HOLD_ALARM_OWNER), required and shape-checked; the seal bound is 60 min", () => {
+  expect(holdAlarmOwner({ [HOLD_ALARM_OWNER_VAR]: OWNER })).toBe(OWNER);
+  for (const bad of [{}, { [HOLD_ALARM_OWNER_VAR]: "" }, { [HOLD_ALARM_OWNER_VAR]: "Has Spaces" }, { [HOLD_ALARM_OWNER_VAR]: "x".repeat(80) }])
+    expect(codeSync(() => holdAlarmOwner(bad))).toBe("hold_alarm_owner");
+  expect(HOLD_SEAL_MAX_MS).toBe(60 * 60_000);
+  expect(HOLD_ATTEMPT_MAX_MS).toBe(24 * 3600_000);
+  expect(codeSync(() => holdAlarms(new Map(), NOW, "bad owner"))).toBe("hold_alarm_owner");
+});
+
 test("alarms: a seal or an attempt held too long pages the named owner; hashes only", () => {
   const sealedLong = hold("sealed", { sealedMs: NOW - HOLD_SEAL_MAX_MS - 1 });
   const attemptedLong = hold("marker_attempted", { attemptedMs: NOW - HOLD_ATTEMPT_MAX_MS - 1 });
-  const a = holdAlarms(new Map([[ORG, sealedLong], [ORG2, attemptedLong]]), NOW);
-  expect(a.map((x) => [x.alarm, x.owner])).toEqual([["hold_seal_overdue", HOLD_ALARM_OWNER], ["hold_attempt_overdue", HOLD_ALARM_OWNER]]);
+  const a = holdAlarms(new Map([[ORG, sealedLong], [ORG2, attemptedLong]]), NOW, OWNER);
+  expect(a.map((x) => [x.alarm, x.owner])).toEqual([["hold_seal_overdue", OWNER], ["hold_attempt_overdue", OWNER]]);
   expect(JSON.stringify(a)).not.toContain(ORG);
   expect(a[0]!.org).toMatch(/^h_[0-9a-f]{32}$/u);
-  expect(holdAlarms(new Map([[ORG, hold("sealed", { sealedMs: NOW - 60_000 })], [ORG2, null]]), NOW)).toEqual([]);
+  expect(holdAlarms(new Map([[ORG, hold("sealed", { sealedMs: NOW - 60_000 })], [ORG2, null]]), NOW, OWNER)).toEqual([]);
+  // 61 minutes sealed already alarms.
+  expect(holdAlarms(new Map([[ORG, hold("sealed", { sealedMs: NOW - 61 * 60_000 })]]), NOW, OWNER).length).toBe(1);
 });
 
 void code;

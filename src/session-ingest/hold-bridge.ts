@@ -24,8 +24,10 @@
  *      receipt for this epoch. Otherwise the release is refused. After any marker attempt the only release is
  *      `bridge_complete` (releaseAllowed): there is no rollback after an attempt.
  *   5. Waves (waveOrgs): an org whose hold is marker_attempted and not released is stuck and never joins a new wave.
- *   6. Monitoring (holdAlarms): a hold sealed for longer than HOLD_SEAL_MAX_MS, or marker_attempted for longer than
- *      HOLD_ATTEMPT_MAX_MS, raises an alarm naming its owner (HOLD_ALARM_OWNER). Counts, codes and hashes only.
+ *   6. Monitoring (holdAlarms): a hold sealed for longer than HOLD_SEAL_MAX_MS (60 min: publication for the org is
+ *      refused while sealed, so a long seal stalls its search), or marker_attempted for longer than HOLD_ATTEMPT_MAX_MS,
+ *      raises an alarm naming its owner, which is configuration (holdAlarmOwner: the environment variable
+ *      BACKLOG_OPS_HOLD_ALARM_OWNER, an Agent Relay name), never a code constant. Counts, codes and hashes only.
  */
 import { createHash } from "node:crypto";
 import { isObjectStoreError, objectKey, readAll, type ObjectStore } from "../shared/vendor.ts";
@@ -299,18 +301,26 @@ export function waveOrgs(orgs: readonly string[], holds: ReadonlyMap<string, Hol
 }
 
 /** A hold sealed this long without an attempt, or attempted this long without bridge_complete, alarms. */
-export const HOLD_SEAL_MAX_MS = 6 * 60 * 60 * 1000;
+export const HOLD_SEAL_MAX_MS = 60 * 60 * 1000;
 export const HOLD_ATTEMPT_MAX_MS = 24 * 60 * 60 * 1000;
-/** Who an alarm pages (to be confirmed by b1): the owner of the bridge job. */
-export const HOLD_ALARM_OWNER = "sessions-backlog-integration";
-export type HoldAlarm = { alarm: "hold_seal_overdue" | "hold_attempt_overdue"; owner: typeof HOLD_ALARM_OWNER; ageMs: number; org: string };
-export function holdAlarms(holds: ReadonlyMap<string, Hold | null>, nowMs: number): HoldAlarm[] {
+/** The configuration variable naming who an alarm pages (an Agent Relay agent name; for this rollout, b1). */
+export const HOLD_ALARM_OWNER_VAR = "BACKLOG_OPS_HOLD_ALARM_OWNER";
+const OWNER_NAME = /^[a-z0-9][a-z0-9-]{1,62}[a-z0-9]$/u;
+/** The alarm owner from configuration: required, an Agent Relay name; missing or malformed refuses. */
+export function holdAlarmOwner(env: Record<string, string | undefined>): string {
+  const v = (env[HOLD_ALARM_OWNER_VAR] ?? "").trim();
+  if (!OWNER_NAME.test(v)) refuse("hold_alarm_owner");
+  return v;
+}
+export type HoldAlarm = { alarm: "hold_seal_overdue" | "hold_attempt_overdue"; owner: string; ageMs: number; org: string };
+export function holdAlarms(holds: ReadonlyMap<string, Hold | null>, nowMs: number, owner: string): HoldAlarm[] {
+  if (!OWNER_NAME.test(owner)) refuse("hold_alarm_owner");
   const out: HoldAlarm[] = [];
   for (const [org, h] of holds) {
     if (!h) continue;
-    if (h.state === "sealed" && nowMs - h.sealedMs! > HOLD_SEAL_MAX_MS) out.push({ alarm: "hold_seal_overdue", owner: HOLD_ALARM_OWNER, ageMs: nowMs - h.sealedMs!, org: orgHash(org) });
+    if (h.state === "sealed" && nowMs - h.sealedMs! > HOLD_SEAL_MAX_MS) out.push({ alarm: "hold_seal_overdue", owner, ageMs: nowMs - h.sealedMs!, org: orgHash(org) });
     if (h.state === "marker_attempted" && nowMs - h.attemptedMs! > HOLD_ATTEMPT_MAX_MS)
-      out.push({ alarm: "hold_attempt_overdue", owner: HOLD_ALARM_OWNER, ageMs: nowMs - h.attemptedMs!, org: orgHash(org) });
+      out.push({ alarm: "hold_attempt_overdue", owner, ageMs: nowMs - h.attemptedMs!, org: orgHash(org) });
   }
   return out;
 }
