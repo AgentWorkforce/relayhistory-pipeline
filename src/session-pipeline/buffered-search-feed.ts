@@ -218,6 +218,12 @@ export interface BufferedFeedConfig {
   secondVersion: boolean;
   /** Only stages created at least this long before the run's clock are processed (late-ack guard). 180-3600 s, default 300. */
   settleMs: number;
+  /**
+   * INGEST_BUFFERED_SEARCH_FEED_STATEMENT_TIMEOUT_MS: the statement timeout of each feeder RPC, 1000-60000 ms, default
+   * 5000 (the login's own, BUFFERED_FEED_TIMEOUTS). Any other value runs each RPC in its own transaction under
+   * SET LOCAL (set_config(..., true)): the login, its role setting and the schema verifier stay at 5s.
+   */
+  statementTimeoutMs: number;
 }
 
 const ISO = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d{1,6})?Z$/;
@@ -330,6 +336,7 @@ export function bufferedFeedConfig(env: NodeJS.ProcessEnv, versionCeiling: numbe
     budgetMs: int("INGEST_BUFFERED_SEARCH_FEED_BUDGET_MS", 50_000, 5_000, 240_000),
     secondVersion: second === "on",
     settleMs: int("INGEST_BUFFERED_SEARCH_FEED_SETTLE_S", 300, 180, 3_600) * 1_000,
+    statementTimeoutMs: int("INGEST_BUFFERED_SEARCH_FEED_STATEMENT_TIMEOUT_MS", BUFFERED_FEED_LOGIN_STATEMENT_TIMEOUT_MS, 1_000, 60_000),
   };
 }
 
@@ -386,11 +393,28 @@ const keysetBefore = (a: { createdAt: string; stageToken: string }, b: { created
  * `secondVersion` (INGEST_BUFFERED_SEARCH_FEED_SECOND_VERSION=on) every createdAt has the exact grammar,
  * a page is a strict keyset after its cursor, and a found stage must carry 045010's `sameSecond`.
  */
-export function sqlBufferedFeedSource(db: SqlExecutor, options: { secondVersion?: boolean } = {}): BufferedFeedSource {
+/** The feed login's own statement timeout (buffered-feed-login.ts BUFFERED_FEED_TIMEOUTS, "5s"), in ms. */
+export const BUFFERED_FEED_LOGIN_STATEMENT_TIMEOUT_MS = 5_000;
+
+/**
+ * A feeder executor that can run one statement under its own statement timeout: BEGIN; set_config(statement_timeout,
+ * <ms>, true); the statement; COMMIT, on one held backend (buffered-feed-login.ts loginCheckedFeedExecutor).
+ */
+export interface TimedSqlExecutor extends SqlExecutor {
+  queryWithTimeout<R = Record<string, unknown>>(timeoutMs: number, text: string, params?: unknown[]): Promise<{ rows: R[] }>;
+}
+
+export function sqlBufferedFeedSource(db: SqlExecutor | TimedSqlExecutor, options: { secondVersion?: boolean; statementTimeoutMs?: number } = {}): BufferedFeedSource {
   const strict = options.secondVersion === true;
+  const timeoutMs = options.statementTimeoutMs;
+  // A timeout equal to the login's own changes nothing: the single-statement path, exactly as before.
+  const timed = timeoutMs !== undefined && timeoutMs !== BUFFERED_FEED_LOGIN_STATEMENT_TIMEOUT_MS;
+  if (timed && !("queryWithTimeout" in db)) throw new BufferedFeedError("config_statement_timeout_unsupported");
+  const run = <R>(text: string, params: unknown[]) =>
+    timed ? (db as TimedSqlExecutor).queryWithTimeout<R>(timeoutMs!, text, params) : db.query<R>(text, params);
   const call = async (name: BufferedFeedQuery, p: unknown): Promise<Record<string, unknown>> => {
     let value: unknown;
-    try { value = (await db.query<{ r: unknown }>(`SELECT sessions.buffered_search_feed_${name}($1::jsonb) AS r`, [JSON.stringify(p)])).rows[0]?.r; }
+    try { value = (await run<{ r: unknown }>(`SELECT sessions.buffered_search_feed_${name}($1::jsonb) AS r`, [JSON.stringify(p)])).rows[0]?.r; }
     catch (error) {
       // A refused feeder login (buffered-feed-login.ts) keeps its own code and is not retried.
       if (error instanceof BufferedFeedError) throw error;

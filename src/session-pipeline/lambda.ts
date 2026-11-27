@@ -763,7 +763,9 @@ export function runtimeFromSecret(env: LambdaEnv, secretText: string, schemaGene
       const feedExecutor = loginCheckedFeedExecutor(feedPool);
       if (env.bufferedSearchFeed?.enabled) {
         const secondVersion = env.bufferedSearchFeed.secondVersion;
-        deps.bufferedFeed = { source: sqlBufferedFeedSource(feedExecutor, secondVersion ? { secondVersion } : {}), store, ch: deps.search.ch, keyRoot: env.keyPrefix,
+        // INGEST_BUFFERED_SEARCH_FEED_STATEMENT_TIMEOUT_MS: each feed RPC under its own SET LOCAL timeout (default: the login's 5s).
+        const statementTimeoutMs = env.bufferedSearchFeed.statementTimeoutMs;
+        deps.bufferedFeed = { source: sqlBufferedFeedSource(feedExecutor, { ...(secondVersion ? { secondVersion } : {}), statementTimeoutMs }), store, ch: deps.search.ch, keyRoot: env.keyPrefix,
           ...(secondVersion ? { secondVersion: { ledger: clickhouseTieLedger(deps.search.ch) } } : {}),
           // Same labels as the canonical indexer, so buffered and canonical rows of one event agree.
           ...(env.originLabelsEnabled ? { originLabels: true as const } : {}) };
