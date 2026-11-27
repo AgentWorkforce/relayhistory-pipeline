@@ -141,10 +141,11 @@ export interface ForgeFacts {
      * Its whole effective history on the default branch when there is more than one landing or any revert: each
      * landing of its patch and each revert of a copy, dated by when that commit reached the default branch, oldest
      * first. `seq` is the total integration position on the default branch and `step` the first-parent step that
-     * integrated it; `unordered` says its order against another transition of the same step is unknown.
+     * integrated it; `unorderedWith` lists the positions of the transitions of its step that git does not order
+     * against it (neither commit is the other's ancestor).
      * `defaultAt` and `revertedAt` are the first landing and first revert.
      */
-    transitions?: Array<{ at: string; kind: "landed" | "reverted"; by: string; seq?: number; step?: number; unordered?: true }>;
+    transitions?: Array<{ at: string; kind: "landed" | "reverted"; by: string; seq?: number; step?: number; unorderedWith?: number[] }>;
   }>;
   flags: Array<{ name: string; defaultOn: boolean }>;
   /** Branches of the repository and whether their work reached the default branch (by ancestry or patch id). */
@@ -153,6 +154,7 @@ export interface ForgeFacts {
     /** The landing's integration position on the default branch (see a commit transition's `seq`). */
     landedSeq?: number;
     landedStep?: number;
+    landedUnorderedWith?: number[];
     /** The branch's own commits (not on the default branch by ancestry), newest first, at most 200. */
     commits?: string[];
   }>;

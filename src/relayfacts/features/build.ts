@@ -70,14 +70,14 @@ interface StateResult { state: FeatureState; basis: "forge" | "analysis"; reason
 
 type ForgeCommit = ForgeFacts["commits"][number];
 /** A commit's dated landings on the default branch: its transitions when known, else its first landing. */
-interface Transition { at: string; seq?: number; step?: number; unordered?: true; what: string }
+interface Transition { at: string; seq?: number; step?: number; unorderedWith?: readonly number[]; what: string }
 const byTime = (a: Transition, b: Transition) => textCompare(a.at, b.at);
 /**
- * Whether git orders two transitions of one instant: both have an integration position, and they are in different
- * first-parent steps or neither is marked unordered within its step. (A legacy position without a step orders.)
+ * Whether git orders two transitions of one instant: both have an integration position and neither lists the
+ * other as unordered (a pairwise relation: commits of one step that are not ancestor and descendant).
  */
 const ordered = (a: Transition, b: Transition) =>
-  a.seq !== undefined && b.seq !== undefined && (a.step === undefined || b.step === undefined || a.step !== b.step || (!a.unordered && !b.unordered));
+  a.seq !== undefined && b.seq !== undefined && !(a.unorderedWith ?? []).includes(b.seq) && !(b.unorderedWith ?? []).includes(a.seq);
 /**
  * The latest transition: the latest instant, and within it the highest integration position when git orders it
  * against every other candidate. Otherwise the instant's order is unknown and the result says so (`seq` absent).
@@ -91,7 +91,7 @@ function latestTransition(list: readonly Transition[]): Transition | undefined {
   return tied.every((t) => t === top || ordered(t, top)) ? top : { at, what: top.what };
 }
 /** A commit transition's position fields, for the replay. */
-const positionOf = (t: { seq?: number; step?: number; unordered?: true }) => ({ ...(t.seq !== undefined ? { seq: t.seq } : {}), ...(t.step !== undefined ? { step: t.step } : {}), ...(t.unordered ? { unordered: true as const } : {}) });
+const positionOf = (t: { seq?: number; step?: number; unorderedWith?: number[] }) => ({ ...(t.seq !== undefined ? { seq: t.seq } : {}), ...(t.step !== undefined ? { step: t.step } : {}), ...(t.unorderedWith?.length ? { unorderedWith: t.unorderedWith } : {}) });
 function landingsOf(c: ForgeCommit): Transition[] {
   if (c.transitions) return c.transitions.filter((t) => t.kind === "landed").map((t) => ({ at: t.at, ...positionOf(t), what: t.by === c.sha ? `commit ${c.sha.slice(0, 12)} on the default branch` : `commit ${c.sha.slice(0, 12)} landed as ${t.by.slice(0, 12)}` }));
   return c.onDefaultBranch ? [{ at: c.defaultAt ?? c.at, what: `commit ${c.sha.slice(0, 12)} on the default branch` }] : [];
@@ -140,7 +140,7 @@ export function deriveState(sessions: readonly SessionFacts[], forgeIn: ForgeFac
     ...prs.filter((p) => p.state === "merged" && p.mergedAt && p.mergedAt < asOf).map((p) => ({ at: p.mergedAt!, what: `merged ${p.ref.replace("https://github.com/", "")}` })),
     // Every landing of a commit's patch known before the cut (a re-landing after a revert restores it).
     ...commits.flatMap((c) => landingsOf(c)).filter((l) => l.at < asOf),
-    ...branches.filter((b) => b.landed && b.landedAt && b.landedAt < asOf).map((b) => ({ at: b.landedAt!, ...(b.landedSeq !== undefined ? { seq: b.landedSeq } : {}), ...(b.landedStep !== undefined ? { step: b.landedStep } : {}), what: `branch ${b.name} landed` })),
+    ...branches.filter((b) => b.landed && b.landedAt && b.landedAt < asOf).map((b) => ({ at: b.landedAt!, ...(b.landedSeq !== undefined ? { seq: b.landedSeq } : {}), ...(b.landedStep !== undefined ? { step: b.landedStep } : {}), ...(b.landedUnorderedWith?.length ? { unorderedWith: b.landedUnorderedWith } : {}), what: `branch ${b.name} landed` })),
   ].sort(byTime);
   const reverts = commits.flatMap((c) => revertsOf(c)).filter((r) => r.at < asOf).sort(byTime);
 

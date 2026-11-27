@@ -149,6 +149,13 @@ export function forgeFacts(repo: string, mirror: string, since: string, until: s
   }
   for (const list of copiesOf.values()) list.sort(transitionOrder);
   const landedByPatch = new Map([...copiesOf].map(([pid, list]) => [pid, list[0]!]));
+  // Two commits of one integration step that git does not order (neither is the other's ancestor).
+  const incomparable = (x: string, y: string) => {
+    if (x === y || !stepOf.has(x) || stepOf.get(x) !== stepOf.get(y)) return false;
+    const [lo, hi] = seqOf.get(x)! < seqOf.get(y)! ? [x, y] : [y, x];
+    return sh(`git -C "$0" merge-base --is-ancestor "$1" "$2" && echo yes`, mirror, lo, hi) !== "yes";
+  };
+  const positioned: Array<{ by: string; seq?: number }> = [];
   const position = (sha: string) => (seqOf.has(sha) ? { seq: seqOf.get(sha)!, step: stepOf.get(sha)! } : {});
   const revertsOf = (sha: string) => revertsNamed.filter((r) => sha.startsWith(r.target)).map((r) => ({ ...r, ...(seqOf.has(r.by) ? { seq: seqOf.get(r.by)! } : {}) }));
   // A commit's effective history on the default branch, every transition dated by when it reached it: each
@@ -167,15 +174,16 @@ export function forgeFacts(repo: string, mirror: string, since: string, until: s
       ...copies.map((x) => ({ at: x.at, kind: "landed" as const, by: x.sha, ...position(x.sha) })),
       ...copies.flatMap((x) => revertsOf(x.sha)).map((r) => ({ at: r.at, kind: "reverted" as const, by: r.by, ...position(r.by) })),
     ].sort(transitionOrder);
-    // Within one integration step, an order between commits that are not ancestor and descendant is not known:
-    // those transitions are marked unordered (within their step only: their step still orders them against every
-    // other step), so a tie between them reads conservatively.
+    // Within one integration step, two commits that are not ancestor and descendant have no order of their own:
+    // each records the other's position in `unorderedWith`. The relation is pairwise, so a transition both of
+    // them precede (a later re-pick descending from both) still orders against each.
     for (let i = 0; i < transitions.length; i++) for (let j = i + 1; j < transitions.length; j++) {
       const a = transitions[i]!, b = transitions[j]!;
-      if (a.seq === undefined || b.seq === undefined || stepOf.get(a.by) !== stepOf.get(b.by) || a.by === b.by) continue;
-      const [lo, hi] = a.seq < b.seq ? [a, b] : [b, a];
-      if (sh(`git -C "$0" merge-base --is-ancestor "$1" "$2" && echo yes`, mirror, lo.by, hi.by) !== "yes") { (a as { unordered?: true }).unordered = true; (b as { unordered?: true }).unordered = true; }
+      if (a.seq === undefined || b.seq === undefined || !incomparable(a.by, b.by)) continue;
+      (a as { unorderedWith?: number[] }).unorderedWith = [...((a as { unorderedWith?: number[] }).unorderedWith ?? []), b.seq];
+      (b as { unorderedWith?: number[] }).unorderedWith = [...((b as { unorderedWith?: number[] }).unorderedWith ?? []), a.seq];
     }
+    for (const t of transitions) positioned.push({ by: t.by, seq: t.seq });
     if (transitions.length > maxTransitions) throw new UsageError(`a commit has more than ${maxTransitions} landings and reverts: its history cannot be kept whole`);
     const firstRevert = transitions.find((t) => t.kind === "reverted");
     if (firstRevert) { c.revertedBy = firstRevert.by; c.revertedAt = firstRevert.at; }
@@ -210,20 +218,23 @@ export function forgeFacts(repo: string, mirror: string, since: string, until: s
     // The landing's integration position, so a branch landing orders against commit transitions at one instant.
     let landedSeq: number | undefined = ancestor ? seqOf.get(tip) : undefined;
     let landedStep: number | undefined = ancestor ? stepOf.get(tip) : undefined;
+    let landedBy: string | undefined = ancestor ? tip : undefined;
     const own = git(mirror, ["rev-list", "--max-count=200", `${mainRef}..${ref}`]).split("\n").filter(Boolean);
     if (!landedAt) for (const sha of own) {
       const copy = mainPatch.get(patchOf.get(sha) ?? "");
-      if (copy && (!landedAt || transitionOrder(copy, { at: landedAt, ...(landedSeq !== undefined ? { seq: landedSeq } : {}) }) > 0)) { landedAt = copy.at; landedSeq = copy.seq; landedStep = stepOf.get(copy.sha); }
+      if (copy && (!landedAt || transitionOrder(copy, { at: landedAt, ...(landedSeq !== undefined ? { seq: landedSeq } : {}) }) > 0)) { landedAt = copy.at; landedSeq = copy.seq; landedStep = stepOf.get(copy.sha); landedBy = copy.sha; }
     }
     if (!landedAt) {
       const pid = sh(`git -C "$0" diff "$(git -C "$0" merge-base "$2" "$1")" "$1" | git patch-id --stable | cut -d' ' -f1`, mirror, ref, mainRef);
       const copy = pid ? mainPatch.get(pid) : undefined;
-      if (copy) { landedAt = copy.at; landedSeq = copy.seq; landedStep = stepOf.get(copy.sha); }
+      if (copy) { landedAt = copy.at; landedSeq = copy.seq; landedStep = stepOf.get(copy.sha); landedBy = copy.sha; }
     }
     // Flags the branch introduces: `*_ENABLED` names, and settings the docs give a default, on added lines.
     const added = sh(`git -C "$0" diff "$(git -C "$0" merge-base "$2" "$1")" "$1" | grep '^+' | grep -oE '[A-Z][A-Z0-9]*(_[A-Z0-9]+)+' | sort -u`, mirror, ref, mainRef);
     const flagsAdded = added.split("\n").filter((f) => f && (f.endsWith("_ENABLED") || known.has(f))).slice(0, 50);
-    branches.push({ name, landed: landedAt !== null, landedAt, ...(landedAt !== null && landedSeq !== undefined ? { landedSeq, ...(landedStep !== undefined ? { landedStep } : {}) } : {}), tipAt, ...(flagsAdded.length ? { flagsAdded } : {}), ...(own.length ? { commits: own } : {}) });
+    // The landing commit against the commit transitions of its own step: the same pairwise relation.
+    const landedUnorderedWith = landedBy && landedSeq !== undefined ? [...new Set(positioned.filter((t) => t.seq !== undefined && incomparable(landedBy!, t.by)).map((t) => t.seq!))].sort((a, b) => a - b) : [];
+    branches.push({ name, landed: landedAt !== null, landedAt, ...(landedAt !== null && landedUnorderedWith.length ? { landedUnorderedWith } : {}), ...(landedAt !== null && landedSeq !== undefined ? { landedSeq, ...(landedStep !== undefined ? { landedStep } : {}) } : {}), tipAt, ...(flagsAdded.length ? { flagsAdded } : {}), ...(own.length ? { commits: own } : {}) });
   }
   return utcForge(parseForge({ defaultBranch, prs, commits, flags, branches }));
 }

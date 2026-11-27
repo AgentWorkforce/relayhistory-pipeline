@@ -68,6 +68,7 @@ function only(obj: Record<string, unknown>, allowed: string[], where: string) {
 export function parseForge(raw: unknown): ForgeFacts {
   if (!raw || typeof raw !== "object") throw new CorpusError("forge.json: not an object");
   const f = raw as Record<string, unknown>;
+  const positions = (v: unknown) => v === undefined || (Array.isArray(v) && v.length <= 200 && v.every((n) => Number.isInteger(n) && (n as number) >= 0));
   only(f, ["defaultBranch", "prs", "commits", "flags", "branches"], "forge.json");
   if (!Array.isArray(f.prs) || !Array.isArray(f.commits) || !Array.isArray(f.flags)) throw new CorpusError("forge.json: prs, commits and flags must be arrays");
   for (const p of f.prs as Record<string, unknown>[]) {
@@ -79,7 +80,7 @@ export function parseForge(raw: unknown): ForgeFacts {
     if (c.revertedAt !== undefined && c.revertedAt !== null && !iso(c.revertedAt)) throw new CorpusError("forge.json: bad commit");
     if (c.transitions !== undefined && (!Array.isArray(c.transitions) || c.transitions.length > 200 || c.transitions.some((t: unknown) => {
       const x = t as Record<string, unknown>;
-      return !x || typeof x !== "object" || Object.keys(x).some((k) => !["at", "kind", "by", "seq", "step", "unordered"].includes(k)) || [x.seq, x.step].some((n) => n !== undefined && !(Number.isInteger(n) && (n as number) >= 0)) || (x.unordered !== undefined && x.unordered !== true) || !iso(x.at) || !["landed", "reverted"].includes(x.kind as string) || typeof x.by !== "string" || !/^[0-9a-f]{7,40}$/u.test(x.by);
+      return !x || typeof x !== "object" || Object.keys(x).some((k) => !["at", "kind", "by", "seq", "step", "unorderedWith"].includes(k)) || [x.seq, x.step].some((n) => n !== undefined && !(Number.isInteger(n) && (n as number) >= 0)) || !positions(x.unorderedWith) || !iso(x.at) || !["landed", "reverted"].includes(x.kind as string) || typeof x.by !== "string" || !/^[0-9a-f]{7,40}$/u.test(x.by);
     }))) throw new CorpusError("forge.json: bad commit");
     if (c.defaultAtBasis !== undefined && !["merge", "patch", "committer"].includes(c.defaultAtBasis as string)) throw new CorpusError("forge.json: bad commit");
     if (c.defaultAt !== undefined && c.defaultAt !== null && !iso(c.defaultAt)) throw new CorpusError("forge.json: bad commit");
@@ -90,8 +91,8 @@ export function parseForge(raw: unknown): ForgeFacts {
     if (typeof g.name !== "string" || typeof g.defaultOn !== "boolean") throw new CorpusError("forge.json: bad flag");
   }
   for (const b of (f.branches ?? []) as Record<string, unknown>[]) {
-    only(b, ["name", "landed", "landedAt", "landedSeq", "landedStep", "tipAt", "flagsAdded", "commits"], "forge.json branch");
-    if ([b.landedSeq, b.landedStep].some((n) => n !== undefined && !(Number.isInteger(n) && (n as number) >= 0))) throw new CorpusError("forge.json: bad branch");
+    only(b, ["name", "landed", "landedAt", "landedSeq", "landedStep", "landedUnorderedWith", "tipAt", "flagsAdded", "commits"], "forge.json branch");
+    if ([b.landedSeq, b.landedStep].some((n) => n !== undefined && !(Number.isInteger(n) && (n as number) >= 0)) || !positions(b.landedUnorderedWith)) throw new CorpusError("forge.json: bad branch");
     if (typeof b.name !== "string" || typeof b.landed !== "boolean" || !iso(b.tipAt) || (b.landedAt !== null && !iso(b.landedAt))) throw new CorpusError("forge.json: bad branch");
     if (b.commits !== undefined && (!Array.isArray(b.commits) || b.commits.length > 200 || b.commits.some((c) => typeof c !== "string" || !/^[0-9a-f]{40}$/u.test(c))))
       throw new CorpusError("forge.json: a branch's commits must be at most 200 full commit ids");

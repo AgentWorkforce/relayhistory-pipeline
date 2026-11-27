@@ -911,8 +911,43 @@ describe("round-5 controls", () => {
       expect(existsSync(join(repo, "topic.txt"))).toBe(true);
       const f = seal();
       const t = f.commits.find((x) => x.sha === topic)!.transitions!;
-      expect(t.filter((x) => x.unordered).length).toBe(2);
+      expect(t.filter((x) => x.unorderedWith?.length).length).toBe(2);
       expect(deriveState([s()], f, cut).state).toBe("shipped");
     }
+  });
+
+  test("forge history: unordered is pairwise, so a re-pick both parallel copies precede still decides", async () => {
+    const { execFileSync } = await import("node:child_process");
+    const { forgeFacts } = await import("../backfill/forge.ts");
+    const repo = join(tmp, "r14-git");
+    mkdirSync(repo);
+    const T = "2026-11-06T00:00:00Z";
+    const git = (args: string[], date = T) => execFileSync("git", ["-C", repo, ...args], { env: { ...process.env, GIT_AUTHOR_DATE: date, GIT_COMMITTER_DATE: date, GIT_AUTHOR_NAME: "t", GIT_AUTHOR_EMAIL: "t@example.invalid", GIT_COMMITTER_NAME: "t", GIT_COMMITTER_EMAIL: "t@example.invalid" }, encoding: "utf8" }).trim();
+    const commit = (file: string, date: string) => { writeFileSync(join(repo, file), file); git(["add", file], date); git(["commit", "-q", "-m", file], date); return git(["rev-parse", "HEAD"], date); };
+    git(["init", "-q", "-b", "main"], "2026-11-01T00:00:00Z");
+    commit("base.txt", "2026-11-01T00:00:00Z");
+    git(["checkout", "-q", "-b", "topic"], "2026-11-02T00:00:00Z");
+    const topic = commit("topic.txt", "2026-11-02T00:00:00Z");
+    git(["checkout", "-q", "main"]);
+    git(["checkout", "-q", "-b", "left"]); git(["cherry-pick", topic]); const left = git(["rev-parse", "HEAD"]);
+    git(["checkout", "-q", "main"]); git(["checkout", "-q", "-b", "right"]);
+    commit("right.txt", T);
+    git(["cherry-pick", topic]);
+    // On right: merge left, revert left's copy, re-pick topic; then merge right into main in one step.
+    git(["merge", "-q", "--no-ff", "-m", "merge left", "left"]);
+    git(["revert", "--no-edit", left]);
+    git(["cherry-pick", topic]);
+    git(["checkout", "-q", "main"]);
+    git(["merge", "-q", "--no-ff", "-m", "merge right", "right"], "2026-11-12T00:00:00Z");
+    expect(existsSync(join(repo, "topic.txt"))).toBe(true);
+    const f = forgeFacts("example/widgets", repo, "2026-10-31T00:00:00Z", "2026-11-30T00:00:00Z", "main", () => []);
+    const t = f.commits.find((x) => x.sha === topic)!.transitions!;
+    expect(t.map((x) => x.kind)).toEqual(["landed", "landed", "reverted", "landed"]);
+    expect(t.filter((x) => x.unorderedWith?.length).length).toBe(2);
+    const s = { source: "claude", sessionId: "s", analyzedAt: "2026-11-02T01:00:00.000Z", startedAt: "2026-11-02T00:00:00.000Z", endedAt: "2026-11-02T01:00:00.000Z", title: "", asked: [],
+      built: [{ kind: "commit", ref: topic.slice(0, 7), what: "c", at: "2026-11-02T00:30:00.000Z", evidence: [] }], gaps: [], rationale: [], outcomeStatuses: [], dropped: {},
+      keys: { repo: "example/widgets", branches: [], prs: [], commits: [], files: [], taskRefs: [], parents: [] } } as unknown as SessionFacts;
+    expect(deriveState([s], f, "2026-11-13T00:00:00.000Z").state).toBe("shipped");
+    expect(deriveState([{ ...s, keys: { ...s.keys, branches: ["right"] } }], f, "2026-11-13T00:00:00.000Z").state).toBe("shipped");
   });
 });
