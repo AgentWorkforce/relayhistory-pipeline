@@ -606,4 +606,29 @@ describe("round-5 controls", () => {
     for (const bad of ["2026-01-01T00:00:00+14:01", "2026-01-01T00:00:00-14:01", "2026-01-01T00:00:00+14:59", "2026-01-01T00:00:00-14:59"]) expect(utc(bad)).toBeNull();
     expect(utc("2026-01-01T00:00:00+13:59")).toBe("2025-12-31T10:01:00.000Z");
   });
+
+  test("state is prefix-invariant: a PR close or branch landing on or after the cut never changes it", () => {
+    const sess = (over: Partial<SessionFacts> = {}) => ({ source: "claude", sessionId: "s", analyzedAt: "2026-11-01T00:00:00.000Z", startedAt: "2026-11-01T00:00:00.000Z", endedAt: "2026-11-01T01:00:00.000Z", title: "", asked: [], built: [], gaps: [], rationale: [], outcomeStatuses: [], dropped: {}, keys: { repo: "example/widgets", branches: [], prs: [], commits: [], files: [], taskRefs: [], parents: [] }, ...over }) as SessionFacts;
+    const cut = "2026-11-10T00:00:00.000Z";
+    const pr = "https://github.com/example/widgets/pull/1";
+    const s1 = sess({ built: [{ kind: "pr", ref: pr, what: "opened #1", at: "2026-11-01T00:30:00.000Z", evidence: [] }] as SessionFacts["built"] });
+    const closedAt = (t: string | undefined) => ({ prs: [{ ref: pr, at: "2026-11-01T00:30:00.000Z", state: "closed" as const, ...(t ? { closedAt: t } : {}) }], commits: [], flags: [] });
+    expect(deriveState([s1], { prs: [{ ref: pr, at: "2026-11-01T00:30:00.000Z", state: "open" as const }], commits: [], flags: [] }, cut).state).toBe("in_progress");
+    expect(deriveState([s1], closedAt("2026-11-09T23:59:59.999Z"), cut).state).toBe("abandoned");
+    expect(deriveState([s1], closedAt(cut), cut).state).toBe("in_progress");
+    expect(deriveState([s1], closedAt("2026-11-11T00:00:00.000Z"), cut).state).toBe("in_progress");
+    expect(deriveState([s1], closedAt(undefined), cut).state).toBe("in_progress");
+
+    // A PR merged Nov 2, and a second branch of the feature (tipped Nov 3) that adds a default-off flag when it lands.
+    const s2 = sess({ built: [{ kind: "pr", ref: pr, what: "opened #1", at: "2026-11-01T00:30:00.000Z", evidence: [] }] as SessionFacts["built"], keys: { repo: "example/widgets", branches: ["feat/flagged"], prs: [], commits: [], files: [], taskRefs: [], parents: [] } });
+    const landing = (landedAt: string | null) => ({
+      prs: [{ ref: pr, at: "2026-11-01T00:30:00.000Z", state: "merged" as const, mergedAt: "2026-11-02T00:00:00.000Z" }], commits: [], flags: [],
+      branches: [{ name: "feat/flagged", tipAt: "2026-11-03T00:00:00.000Z", landed: landedAt !== null, landedAt, flagsAdded: ["WIDGETS_NEW_ENABLED"] }],
+    });
+    const landedUnknown = { ...landing(null), branches: [{ ...landing(null).branches[0]!, landed: true }] };
+    expect(deriveState([s2], landing("2026-11-09T00:00:00.000Z"), cut).state).toBe("shipped_off");
+    expect(deriveState([s2], landing(cut), cut).state).toBe("shipped");
+    expect(deriveState([s2], landing("2026-11-11T00:00:00.000Z"), cut).state).toBe("shipped");
+    expect(deriveState([s2], landedUnknown, cut).state).toBe("shipped");
+  });
 });

@@ -113,14 +113,16 @@ export function deriveState(sessions: readonly SessionFacts[], forgeIn: ForgeFac
     if (lastMerge) {
       // Flags the feature's own landed branches introduced count as its flags; a flag the docs do not list takes
       // `unknownFlagDefault` (this repository's rule: new behaviour lands behind a default-off flag).
-      for (const b of branches) if (b.landed) for (const f of b.flagsAdded ?? []) flags.add(f);
+      // Only a landing known to precede the cut: a branch that lands later (or at an unknown time) adds nothing yet.
+      for (const b of branches) if (b.landed && b.landedAt && b.landedAt < asOf) for (const f of b.flagsAdded ?? []) flags.add(f);
       const known = new Map(forge.flags.map((f) => [f.name, f.defaultOn]));
       const off = [...flags].filter((f) => (known.get(f) ?? unknownFlagDefault === "on") === false).sort(textCompare);
       if (off.length) return { state: "shipped_off", basis: "forge", reason: `${lastMerge.what}; default off: ${off.join(", ")}` };
       if (openGaps.length) return { state: "partial", basis: "forge", reason: `${lastMerge.what}; ${openGaps.length} open item(s) in the latest session` };
       return { state: "shipped", basis: "forge", reason: lastMerge.what };
     }
-    if (prs.length && prs.every((p) => p.state === "closed")) return { state: "abandoned", basis: "forge", reason: "every pull request closed without merging" };
+    // Closed as of the cut: a close known to precede it. A PR closed later, or at an unknown time, was still open.
+    if (prs.length && prs.every((p) => p.state === "closed" && p.closedAt && p.closedAt < asOf)) return { state: "abandoned", basis: "forge", reason: "every pull request closed without merging" };
     if (stale) return { state: "abandoned", basis: "forge", reason: `no merge and no activity since ${lastActivity}` };
     return { state: "in_progress", basis: "forge", reason: "commits or an open pull request, not merged" };
   }
