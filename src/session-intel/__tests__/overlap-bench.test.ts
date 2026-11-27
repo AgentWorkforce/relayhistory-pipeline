@@ -42,7 +42,7 @@ describe("paths", () => {
 describe("open-pr overlap (D1)", () => {
   // Line C creates PR 93 at 17:00 and edits lib.rs at 17:30; bob, another line, edits lib.rs at 21:00.
   const creator = facts("cee", [
-    fact("2026-09-01T17:00:00.000Z", { gh: ["pr-create"], prRefs: ["agentworkforce/relayhistory#93"] }),
+    fact("2026-09-01T17:00:00.000Z", { gh: ["pr-create"] }), fact("2026-09-01T17:00:05.000Z", { type: "tool_result", prRefs: ["agentworkforce/relayhistory#93"] }),
     fact("2026-09-01T17:30:00.000Z", { touched: [{ path: "crates/core/src/lib.rs", via: "patch" }] }),
   ]);
   const P = { minShared: 1, maxPrFiles: 100, skipHot: true, suppressCommunicated: true };
@@ -65,14 +65,14 @@ describe("open-pr overlap (D1)", () => {
     // No owning line: the forge file list alone is known only in hindsight.
     expect(openPrOverlap(ctxOf([row("bob", "W")], [bob], [pr(93, "machine-c")]), P)).toEqual([]);
     // The owner edits lib.rs only after bob does.
-    const late = facts("cee", [fact("2026-09-01T17:00:00.000Z", { gh: ["pr-create"], prRefs: ["agentworkforce/relayhistory#93"] }), fact("2026-09-01T22:00:00.000Z", { touched: [{ path: "crates/core/src/lib.rs", via: "patch" }] })]);
+    const late = facts("cee", [fact("2026-09-01T17:00:00.000Z", { gh: ["pr-create"] }), fact("2026-09-01T17:00:05.000Z", { type: "tool_result", prRefs: ["agentworkforce/relayhistory#93"] }), fact("2026-09-01T22:00:00.000Z", { touched: [{ path: "crates/core/src/lib.rs", via: "patch" }] })]);
     expect(openPrOverlap(ctxOf([row("bob", "W"), row("cee", "C")], [bob, late], [pr(93, "machine-c")]), P)).toEqual([]);
     // The line edits lib.rs early but takes the PR (pushes its branch) only after bob's edit.
     const later = facts("cee", [fact("2026-09-01T17:30:00.000Z", { touched: [{ path: "crates/core/src/lib.rs", via: "patch" }] }), fact("2026-09-01T23:00:00.000Z", { branches: ["b93"] })]);
     expect(openPrOverlap(ctxOf([row("bob", "W"), row("cee", "C")], [bob, later], [pr(93, "machine-c")]), P)).toEqual([]);
   });
   test("a PR the session itself created, or one already merged, never alerts", () => {
-    const own = ctxOf([row("k", "K")], [facts("k", [fact("2026-09-01T17:00:00.000Z", { gh: ["pr-create"], prRefs: ["agentworkforce/relayhistory#93"] }), fact("2026-09-01T18:00:00.000Z", { touched: [{ path: "crates/core/src/lib.rs", via: "add" }] })])], [pr(93, "k")]);
+    const own = ctxOf([row("k", "K")], [facts("k", [fact("2026-09-01T17:00:00.000Z", { gh: ["pr-create"] }), fact("2026-09-01T17:00:05.000Z", { type: "tool_result", prRefs: ["agentworkforce/relayhistory#93"] }), fact("2026-09-01T18:00:00.000Z", { touched: [{ path: "crates/core/src/lib.rs", via: "add" }] })])], [pr(93, "k")]);
     expect(openPrOverlap(own, P)).toEqual([]);
     const merged = ctxOf([row("w", "W"), row("cee", "C")], [creator, facts("w", [fact("2026-09-03T00:00:00.000Z", { touched: [{ path: "crates/core/src/lib.rs", via: "add" }] })])], [pr(93, "x", { mergedAt: "2026-09-02T00:00:00.000Z" })]);
     expect(openPrOverlap(merged, P)).toEqual([]);
@@ -195,7 +195,7 @@ describe("as-of bundles", () => {
   test("carry dated facts only: no title, description, file list or outcome, and ownership as of the alert", async () => {
     const { describe: describePair } = await import("../overlap-bench/bundle.ts");
     const ctx = ctxOf([row("cee", "C"), row("bob", "W")], [
-      facts("cee", [fact("2026-09-01T17:00:00.000Z", { gh: ["pr-create"], prRefs: ["agentworkforce/relayhistory#93"] }), fact("2026-09-01T23:00:00.000Z", { gh: ["pr-create"], prRefs: ["agentworkforce/relayhistory#94"] })]),
+      facts("cee", [fact("2026-09-01T17:00:00.000Z", { gh: ["pr-create"] }), fact("2026-09-01T17:00:05.000Z", { type: "tool_result", prRefs: ["agentworkforce/relayhistory#93"] }), fact("2026-09-01T23:00:00.000Z", { gh: ["pr-create"] }), fact("2026-09-01T23:00:05.000Z", { type: "tool_result", prRefs: ["agentworkforce/relayhistory#94"] })]),
       facts("bob", [fact("2026-09-01T21:00:00.000Z", { touched: [{ path: "src/a.ts", via: "patch" }] })]),
     ], [
       pr(93, "c", { title: "HINDSIGHT-TITLE", body: "HINDSIGHT-BODY", mergedAt: "2026-09-02T00:00:00.000Z", comments: [{ author: "x", at: "2026-09-01T18:00:00.000Z", body: "before" }, { author: "x", at: "2026-09-01T22:00:00.000Z", body: "after" }] }),
@@ -386,7 +386,7 @@ describe("time order (canonical full-precision times)", () => {
     // GitHub times carry no fraction and event times do; as raw strings "21:00:00Z" sorts after "21:00:00.5Z", which
     // would make the PR look not yet created. Line C owns PR 93 (created at 17:00 by its facts); bob edits lib.rs.
     const creator = facts("cee", [
-      fact("2026-09-01T17:00:00.000Z", { gh: ["pr-create"], prRefs: ["agentworkforce/relayhistory#93"] }),
+      fact("2026-09-01T17:00:00.000Z", { gh: ["pr-create"] }), fact("2026-09-01T17:00:05.000Z", { type: "tool_result", prRefs: ["agentworkforce/relayhistory#93"] }),
       fact("2026-09-01T17:30:00.000Z", { touched: [{ path: "crates/core/src/lib.rs", via: "patch" }] }),
     ]);
     const edit = facts("bob", [fact("2026-09-01T21:00:00.5Z", { touched: [{ path: "crates/core/src/lib.rs", via: "patch" }] })]);
@@ -439,5 +439,29 @@ describe("as-of membership with no valid time", () => {
     const ctx = ctxOf([row("a", "K"), row("ghost", "W", { createdAt: "", lastTs: "" })], [facts("a", [fact("2026-09-01T10:00:00Z", { touched: [{ path: "crates/core/src/lib.rs", via: "patch" }] })])], []);
     const side = describePair(ctx, ["root:codex:a", "root:codex:ghost"], "2026-09-01T12:00:00Z", () => "member", true).sides[1]!;
     expect(side.kind === "work" && side.sessions).toBe(0);
+  });
+});
+
+describe("PR create claims: the result, at or after its call", () => {
+  const created = (events: EventFacts[]) => buildModel([row("author", "K")], [facts("author", events)]).get("codex:author")!.prs;
+  test("an adjacent result timestamped before its call (by 1 ns) claims nothing", () => {
+    const prs = created([fact("2026-10-01T10:00:00.000000001Z", { gh: ["pr-create"] }), fact("2026-10-01T10:00:00.000000000Z", { type: "tool_result", prRefs: ["agentworkforce/relayhistory#10"] })]);
+    expect(prs.filter((p) => p.action === "create" && p.number === 10)).toEqual([]);
+    const ok = created([fact("2026-10-01T10:00:00.000000001Z", { gh: ["pr-create"] }), fact("2026-10-01T10:00:00.000000001Z", { type: "tool_result", prRefs: ["agentworkforce/relayhistory#10"] })]);
+    expect(ok.filter((p) => p.action === "create").map((p) => p.number)).toEqual([10]);
+  });
+  test("a PR a create call cites in its body is a mention; the result's new PR is the one created", async () => {
+    const { eventFacts } = await import("../cloud-harvest/features.ts");
+    const call = eventFacts({ eventId: "c", ts: "2026-10-01T10:00:00Z", kind: "tool_call", type: "tool_call", toolName: "Bash",
+      content: 'gh pr create --title "Follow up" --body "Follows #7 and https://github.com/AgentWorkforce/relayhistory/pull/7"' });
+    const result = eventFacts({ eventId: "r", ts: "2026-10-01T10:00:04Z", type: "tool_result", actorRole: "tool_result", content: "https://github.com/AgentWorkforce/relayhistory/pull/10\n" });
+    const prs = created([call, result]);
+    expect(prs.filter((p) => p.action === "create").map((p) => p.number)).toEqual([10]);
+    expect(prs.filter((p) => p.number === 7).every((p) => p.action === "mention")).toBe(true);
+    expect(prs.some((p) => p.number === 7)).toBe(true);
+  });
+  test("a failed adjacent result removes the placeholder and claims nothing, even if it prints a URL", () => {
+    const prs = created([fact("2026-10-01T10:00:00Z", { gh: ["pr-create"] }), fact("2026-10-01T10:00:03Z", { type: "tool_result", toolStatus: "error", prRefs: ["agentworkforce/relayhistory#10"] })]);
+    expect(prs.filter((p) => p.action === "create")).toEqual([]);
   });
 });

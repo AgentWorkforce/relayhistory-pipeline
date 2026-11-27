@@ -89,10 +89,15 @@ function fromFacts(s: Session, events: EventFacts[], observed: ObservedPolicy) {
     // very next raw event (by `seq`, counting events that were not kept), a tool result, within CREATE_RESULT_NS,
     // not failed. Facts carry no tool-use id, so with parallel calls (the next raw event is another call) or without
     // `seq` (facts harvested before it) the claim abstains. The PR is owned from the result's time.
+    // The result must come at or after its call: elapsed time is bounded below by 0 and above by CREATE_RESULT_NS.
     // An unresolved call stays as a placeholder (number -1): an act of opening a PR, owning nothing. A failed
-    // result removes it.
+    // result removes it. PR numbers a create call itself names (a --body or --title citing another PR) are
+    // mentions, never the PR being created: only the result knows that one.
     const isResult = e.type === "tool_result" || e.role === "tool_result";
-    if (pendingCreate && (elapsedNs(pendingCreate.ts, e.ts) > CREATE_RESULT_NS || (!isResult && !creates))) pendingCreate = null;
+    if (pendingCreate) {
+      const el = elapsedNs(pendingCreate.ts, e.ts);
+      if (el < 0n || el > CREATE_RESULT_NS || (!isResult && !creates)) pendingCreate = null;
+    }
     const adjacent = pendingCreate !== null && pendingCreate.seq !== undefined && e.seq === pendingCreate.seq + 1;
     if (pendingCreate && isResult && !adjacent) pendingCreate = null;
     if (pendingCreate && isResult) {
@@ -103,13 +108,8 @@ function fromFacts(s: Session, events: EventFacts[], observed: ObservedPolicy) {
       pendingCreate = null;
       for (const ref of e.prRefs) if (ref !== url?.[0]) pushMention(s, ref, e.ts);
     } else {
-      for (const ref of e.prRefs) {
-        const m = PR_KEY.exec(ref);
-        if (!m) continue;
-        // A create call that names its PR (rare) owns it from the call.
-        s.prs.push({ ts: e.ts, repo: m[1] ? m[1].toLowerCase() : s.repo?.toLowerCase() ?? null, number: Number(m[2]), action: creates ? "create" : "mention" });
-      }
-      if (creates && !e.prRefs.length) {
+      for (const ref of e.prRefs) pushMention(s, ref, e.ts);
+      if (creates) {
         s.prs.push({ ts: e.ts, repo: s.repo?.toLowerCase() ?? null, number: -1, action: "create" });
         pendingCreate = { ts: e.ts, index: s.prs.length - 1, seq: e.seq };
       }
