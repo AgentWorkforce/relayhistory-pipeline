@@ -350,7 +350,7 @@ describe("migrator: HOOPDB_RDS_LAYOUT=separate-database", () => {
   });
   test("the RDS master's shape (CREATEROLE, rds_superuser member, owns neither database nor sessions): same error_code, observed attributes, rds pointer", async () => {
     const doc = "https://agentrelay.com/docs/self-hosting/troubleshooting#database-logins";
-    const master = { ...good, owner_name: "postgres", owner_createrole: true, owner_memberships: 1, owner_rds_superuser: true, owns_database: false, owns_sessions: false };
+    const master = { ...good, owner_name: "postgres", session_name: "postgres", owner_createrole: true, owner_memberships: 1, owner_rds_superuser: true, owns_database: false, owns_sessions: false };
     let err: unknown;
     try {
       await rdsSeparateOwnerPreflight(fake(master));

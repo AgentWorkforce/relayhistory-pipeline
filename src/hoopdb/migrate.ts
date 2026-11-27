@@ -182,6 +182,16 @@ export function dbLoginSetupPointer(mode: MigrationProfile["mode"]): string | un
 }
 
 /**
+ * How a refusal names the connection's own identity: "the migration login" only when
+ * session_user = current_user; under SET ROLE, the effective role and the session login.
+ */
+export function migrationIdentity(effective: string, session: string): string {
+  return effective === session
+    ? `the migration login is ${JSON.stringify(effective)}`
+    : `the effective role is ${JSON.stringify(effective)} (session login ${JSON.stringify(session)})`;
+}
+
+/**
  * A refusal about the database logins (AR_DB_LOGIN). `error_code` is unchanged (tests,
  * runbooks and infra's diagnose-install.py key on it); `support_code` and `doc` are added.
  * The message states only what was observed, then what configuration to check first,
@@ -1245,19 +1255,17 @@ async function runtimeRolePreflight(
     )
   ).rows[0];
   if (!r) {
-    // Observations only: the configured name was not found. Name the migration login and
-    // any runtime-like roles that do exist, so a typo or a wrong URL is seen first.
+    // Observations only: the configured name was not found. No other role name is read or
+    // printed (on a shared server those belong to other tenants); only the connection's own
+    // identity, attributed as the login only when no SET ROLE is in effect.
     const seen = (
-      await client.query<{ me: string; similar: string[] }>(
-        `SELECT current_user::text AS me,
-                coalesce((SELECT array_agg(rolname::text ORDER BY rolname) FROM
-                  (SELECT rolname FROM pg_catalog.pg_roles WHERE rolname ILIKE '%runtime%' ORDER BY rolname LIMIT 3) x), '{}') AS similar`,
+      await client.query<{ me: string; session: string }>(
+        "SELECT current_user::text AS me, session_user::text AS session",
       )
     ).rows[0];
-    const similar = seen?.similar?.length ? `; existing runtime-like roles: ${seen.similar.map((n) => JSON.stringify(n)).join(", ")}` : "; no runtime-like role exists";
     throw dbLoginError(
       "runtime_role_missing",
-      `role ${JSON.stringify(profile.runtimeRole)} (HOOPDB_RUNTIME_ROLE) was not found; the migration login is ${JSON.stringify(seen?.me ?? "")}${similar}`,
+      `role ${JSON.stringify(profile.runtimeRole)} (HOOPDB_RUNTIME_ROLE) was not found; ${migrationIdentity(seen?.me ?? "", seen?.session ?? "")}`,
       "Check that HOOPDB_RUNTIME_ROLE names the role the services log in as, and that the HoopDb migration URL points at the intended database",
       dbLoginSetupPointer(profile.mode),
       "nothing was written",
@@ -1374,6 +1382,7 @@ export async function rdsSeparateOwnerPreflight(client: MigrationClient): Promis
       owns_sessions: boolean;
       executor_present: boolean;
       owner_name: string;
+      session_name: string;
       owner_rds_superuser: boolean;
     }>(
       `SELECT current_setting('server_version_num')::int AS server_version_num,
@@ -1387,7 +1396,7 @@ export async function rdsSeparateOwnerPreflight(client: MigrationClient): Promis
               EXISTS (SELECT 1 FROM pg_catalog.pg_database d WHERE d.datname = current_database() AND d.datdba = me.oid) AS owns_database,
               EXISTS (SELECT 1 FROM pg_catalog.pg_namespace n WHERE n.nspname = 'sessions' AND n.nspowner = me.oid) AS owns_sessions,
               EXISTS (SELECT 1 FROM pg_catalog.pg_roles WHERE rolname = 'hoopdb_activation_executor') AS executor_present,
-              me.rolname::text AS owner_name,
+              me.rolname::text AS owner_name, session_user::text AS session_name,
               EXISTS (SELECT 1 FROM pg_catalog.pg_auth_members m JOIN pg_catalog.pg_roles s ON s.oid = m.roleid
                        WHERE m.member = me.oid AND s.rolname = 'rds_superuser') AS owner_rds_superuser
          FROM pg_catalog.pg_roles me WHERE me.rolname = current_user`,
@@ -1418,7 +1427,7 @@ export async function rdsSeparateOwnerPreflight(client: MigrationClient): Promis
   if (problems.length && r?.owner_createrole && r.owner_rds_superuser && !r.owns_database && !r.owns_sessions)
     throw dbLoginError(
       "rds_profile_unproven",
-      `the migration login ${JSON.stringify(r.owner_name)} has CREATEROLE, is a member of rds_superuser and owns neither this database nor schema sessions (the RDS master's shape)`,
+      `${r.same_session ? `the migration login ${JSON.stringify(r.owner_name)}` : `the effective role ${JSON.stringify(r.owner_name)} (session login ${JSON.stringify(r.session_name ?? "")})`} has CREATEROLE, is a member of rds_superuser and owns neither this database nor schema sessions (the RDS master's shape)`,
       "Check that the HoopDb migration URL logs in as the dedicated database owner, not the master",
       dbLoginSetupPointer("rds"),
       detail,

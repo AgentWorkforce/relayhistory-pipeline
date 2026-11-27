@@ -50,6 +50,7 @@ import {
   dbLoginRefusal,
   dbLoginSetupPointer,
   expectedSchema,
+  migrationIdentity,
   fatalLines,
   inspectMigrations,
   generation,
@@ -476,7 +477,7 @@ describe("runtime role: required, existing, SELECT only", () => {
     // Same error_code, plus the shared support code and doc link. The message states what was
     // observed and the configuration to check first; local mode has no setup pointer.
     const doc = "https://agentrelay.com/docs/self-hosting/troubleshooting#database-logins";
-    const observed = `role "g6_nope" (HOOPDB_RUNTIME_ROLE) was not found; the migration login is "postgres"; no runtime-like role exists`;
+    const observed = `role "g6_nope" (HOOPDB_RUNTIME_ROLE) was not found; the migration login is "postgres"`;
     const hint = `${observed}. Check that HOOPDB_RUNTIME_ROLE names the role the services log in as, and that the HoopDb migration URL points at the intended database. See ${doc}`;
     expect(dbLoginRefusal(error)).toEqual({ code: "runtime_role_missing", support_code: "AR_DB_LOGIN", doc, observed, hint });
     expect((error as Error).message).toBe(`96bulls: ${hint}; nothing was written`);
@@ -509,15 +510,39 @@ describe("runtime role: required, existing, SELECT only", () => {
     expect(await snapshot(db)).toEqual(before);
   });
 
-  test("a misconfigured runtime role name is reported as configuration: the existing runtime-like roles are named", async () => {
+  test("a misconfigured runtime role name is reported as configuration, and no other role's name is disclosed", async () => {
     const db = await fresh();
-    await db.exec("CREATE ROLE g6_app_runtime NOLOGIN");
-    const error = await failure(runMigrations(client(db), { profile: { ...LOCAL, runtimeRole: "g6_app_runtim" } }));
-    expect(error?.code).toBe("runtime_role_missing");
+    // Another tenant's role on a shared server, with a name close to the configured one.
+    await db.exec("CREATE ROLE other_tenant_runtime_synthetic NOLOGIN; CREATE ROLE g6_app_runtime NOLOGIN");
+    const writes: string[] = [];
+    const out = spyOn(process.stdout, "write").mockImplementation((c: unknown) => (writes.push(String(c)), true));
+    const err = spyOn(process.stderr, "write").mockImplementation((c: unknown) => (writes.push(String(c)), true));
+    let error: unknown;
+    try {
+      error = await failure(runMigrations(client(db), { profile: { ...LOCAL, runtimeRole: "g6_app_runtim" } }));
+    } finally {
+      out.mockRestore();
+      err.mockRestore();
+    }
+    expect((error as { code?: string }).code).toBe("runtime_role_missing");
     const r = dbLoginRefusal(error)!;
-    expect(r.observed).toBe(`role "g6_app_runtim" (HOOPDB_RUNTIME_ROLE) was not found; the migration login is "postgres"; existing runtime-like roles: "g6_app_runtime"`);
+    expect(r.observed).toBe(`role "g6_app_runtim" (HOOPDB_RUNTIME_ROLE) was not found; the migration login is "postgres"`);
     expect(r.hint).toMatch(/Check that HOOPDB_RUNTIME_ROLE names the role the services log in as/);
     expect(r.hint).not.toMatch(/haven't been created|never created|configure-rds/);
+    const fatal = fatalLines(error);
+    const everything = [fatal.plain, fatal.message, JSON.stringify(fatal.fields), logLine("error", fatal.message, fatal.fields), (error as Error).message, ...writes].join("\n");
+    for (const other of ["other_tenant_runtime_synthetic", "g6_app_runtime\""]) expect(everything).not.toContain(other);
+  });
+
+  test("SET ROLE: the missing-role message names the effective role and the session login, never the effective role as the login", async () => {
+    const db = await fresh();
+    await db.exec("CREATE ROLE g6_effective NOLOGIN; SET ROLE g6_effective");
+    const error = await failure(runMigrations(client(db), { profile: { ...LOCAL, runtimeRole: "g6_nope" } }));
+    expect((error as { code?: string }).code).toBe("runtime_role_missing");
+    const r = dbLoginRefusal(error)!;
+    expect(r.observed).toBe(`role "g6_nope" (HOOPDB_RUNTIME_ROLE) was not found; the effective role is "g6_effective" (session login "postgres")`);
+    expect(r.observed).not.toMatch(/login is "g6_effective"/);
+    expect(migrationIdentity("a", "a")).toBe(`the migration login is "a"`);
   });
 
   test("the setup pointer is qualified by HOOPDB_DB_MODE: only rds names the RDS script", async () => {

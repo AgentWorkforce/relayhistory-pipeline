@@ -115,6 +115,21 @@ describe("rdsSeparateOwnerPreflight on real catalogs (PGlite)", () => {
     );
     expect(dbLoginRefusal(err)?.hint).toMatch(/run scripts\/selfhost\/configure-rds\.sh \(AgentWorkforce\/infra\)\. See https:/);
   });
+  test("SET ROLE to a master-shaped role: attributed to the effective role and the session login, not called the login", async () => {
+    const db = await separateLayout("CREATE ROLE rdsmaster NOLOGIN CREATEROLE; GRANT rds_superuser TO rdsmaster", false);
+    const session = (await db.query<{ s: string }>("SELECT session_user::text AS s")).rows[0]!.s;
+    await db.exec("SET ROLE rdsmaster");
+    let err: unknown;
+    try {
+      await rdsSeparateOwnerPreflight(client(db));
+    } catch (e) {
+      err = e;
+    }
+    const observed = dbLoginRefusal(err)?.observed ?? "";
+    expect(observed).toStartWith(`the effective role "rdsmaster" (session login ${JSON.stringify(session)}) has CREATEROLE`);
+    expect(observed).not.toMatch(/migration login/);
+    expect((err as Error).message).toMatch(/SET ROLE/);
+  });
   test("the owner hoop with CREATEROLE and rds_superuser is not called the master: plain refusal naming its privileges", async () => {
     for (const mutate of ["ALTER ROLE hoop CREATEROLE; GRANT rds_superuser TO hoop", "GRANT rds_superuser TO hoop"]) {
       let err: unknown;

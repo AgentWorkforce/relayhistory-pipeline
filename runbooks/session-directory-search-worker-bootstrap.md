@@ -190,8 +190,10 @@ the pending marker upsert, before any step), and again after the last migration,
 phase 2 can mark PASS.
 
 - **Missing role:** `runtime_role_missing`, with the shared support code `AR_DB_LOGIN`.
-  The message states only what was observed (the configured name was not found, the
-  migration login, and any runtime-like roles that do exist), then what to check first
+  The message states only what was observed (the configured name was not found, and the
+  connection's own identity: "the migration login" only when `session_user = current_user`,
+  else the effective role and the session login; no other role's name is read or printed),
+  then what to check first
   (`HOOPDB_RUNTIME_ROLE` and the migration URL), then the setup step for the
   `HOOPDB_DB_MODE`: `rds` infra's `scripts/selfhost/configure-rds.sh`, `cloudsql` infra's
   `scripts/selfhost/cloud-sql-setup.sh`, `selfhosted` `supabase/bootstrap/hoopdb_runtime_role.sql`,
@@ -200,8 +202,8 @@ phase 2 can mark PASS.
   printed). In `rds` mode:
 
   ```
-  role "sessions_pipeline_runtime" (HOOPDB_RUNTIME_ROLE) was not found; the migration login is "postgres"; no runtime-like role exists. Check that HOOPDB_RUNTIME_ROLE names the role the services log in as, and that the HoopDb migration URL points at the intended database; if it is right and the login is missing, run scripts/selfhost/configure-rds.sh (AgentWorkforce/infra). See https://agentrelay.com/docs/self-hosting/troubleshooting#database-logins
-  {"ts":"...","level":"error",...,"message":"role \"sessions_pipeline_runtime\" (HOOPDB_RUNTIME_ROLE) was not found; the migration login is \"postgres\"; no runtime-like role exists","error_code":"runtime_role_missing","support_code":"AR_DB_LOGIN","doc":"https://agentrelay.com/docs/self-hosting/troubleshooting#database-logins"}
+  role "sessions_pipeline_runtime" (HOOPDB_RUNTIME_ROLE) was not found; the migration login is "postgres". Check that HOOPDB_RUNTIME_ROLE names the role the services log in as, and that the HoopDb migration URL points at the intended database; if it is right and the login is missing, run scripts/selfhost/configure-rds.sh (AgentWorkforce/infra). See https://agentrelay.com/docs/self-hosting/troubleshooting#database-logins
+  {"ts":"...","level":"error",...,"message":"role \"sessions_pipeline_runtime\" (HOOPDB_RUNTIME_ROLE) was not found; the migration login is \"postgres\"","error_code":"runtime_role_missing","support_code":"AR_DB_LOGIN","doc":"https://agentrelay.com/docs/self-hosting/troubleshooting#database-logins"}
   ```
 
   `rds_profile_unproven` in the `separate-database` layout carries the same pointer only
