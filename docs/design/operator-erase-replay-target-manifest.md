@@ -3,7 +3,8 @@
 ## Status and ownership
 
 Design for review, not implementation or rollout approval. The registry owner
-has reserved forward slot 062330 for a later implementation, after 062320.
+has reserved forward slot 062360 for a later implementation, after 062320.
+This reservation is outside the Friday release window.
 That reservation is not design acceptance or erase-equivalence sign-off;
 published migration bytes are not rewritten. Nothing here authorizes a real
 database apply, replay, hold release, credential change, deployment or feature
@@ -492,9 +493,9 @@ A future down should retain the manifest records, immutability guards and a
 safe owner read path (or a fail-closed unsupported-version result). It must not
 silently drop the only replay witness. Its exact retained schema, ACL manifest,
 bootstrap verifier and reapply behavior require tests and registry review.
-062330's down runs first and restores the **062320** replaced bodies, with the
+062360's down runs first and restores the **062320** replaced bodies, with the
 marked first erasure check. The 062320 later-migration guard refuses its down
-while 062330 remains applied; only after 062330 is down does 062320 restore its
+while 062360 remains applied; only after 062360 is down does 062320 restore its
 own pre-062320 bodies. Test that full sequence and the restored live prosrc.
 Do not add a lifecycle lock to capture or invent a reverse order for the down.
 
@@ -587,7 +588,7 @@ Neither the session manifest nor 062320's shared org lock can stand in for it.
   refusal; stale/concurrent mutation attempts; retained down/reapply guards.
 - After full migrate, assert the marked erasure check is first in the live
   latest replaced bodies, not merely present in 062320's source file. Test
-  062330 down restores 062320 bodies and only then 062320 down restores theirs.
+  062360 down restores 062320 bodies and only then 062320 down restores theirs.
 
 ## 11. Decisions before implementation
 
@@ -601,7 +602,7 @@ Neither the session manifest nor 062320's shared org lock can stand in for it.
    global admission and user-generation proofs.
 3. 062320 owner has confirmed compatibility and successor `e13f8541`; preserve
    its latest-body, first-statement, live-prosrc and down requirements above.
-   Slot 062330 is reserved by the registry owner, not implementation approval.
+   Slot 062360 is reserved by the registry owner, not implementation approval.
 4. The owner explicitly decides raw-target identifier retention. Indefinite
    retention remains a proposal, separate from ACL/lock compatibility approval.
 
