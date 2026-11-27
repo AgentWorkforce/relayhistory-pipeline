@@ -1197,7 +1197,8 @@ nothing. Lifecycle expiration is S3's own action and is not evaluated against th
   effect or was written while it was rolled back (including one a later delete exposes), has unknown authorship from
   the policy alone. Readback records when the policy was OBSERVED, not when it took effect, so the evidence rule is:
   for the pointer and for the receipt it names, S3's `LastModified` of the exact version read must lie strictly
-  inside a documented interval of continuous enforcement for that signing role (see "Enforcement intervals" below),
+  inside a documented interval of continuous enforcement for that signing role, established by audit evidence and
+  never by observations alone (see "Enforcement intervals" below),
   or another record must identify the writer. A time merely after the first readback is not enough (it admits writes
   made while the deny was rolled back); a version at an interval's edge, or with a timestamp equal to one, is
   unknown. It does not cover `s3:DeleteObjectVersion` (the requested scope; the
@@ -1259,7 +1260,7 @@ unaffected.
 
 After applying either phase:
 1. Read the policy back with `aws s3api get-bucket-policy` for the transcripts bucket and record the time it was
-   observed (an observation, not the moment the deny took effect). Confirm
+   observed (an observation: neither the moment the deny took effect nor proof that it stayed in effect). Confirm
    `RearmSweeperOnlyItWritesItsState` is present (or, rolled back, absent) and byte-equal to what this repo renders for
    the configured role, with every other statement unchanged from before the apply.
 2. Simulate against THAT policy (the read-back document as the resource policy, never a hand-written copy), with the
@@ -1284,14 +1285,36 @@ After applying either phase:
    re-read the affected configuration, compare it with the expected post-change state, restore the step 0 copy only if
    they are equal, and read back both configurations, all inside the one serialized window. If they differ, keep the
    intervening edits and have the operator review a reversal of the D5 change alone. Record the rollback's observed
-   time: it closes the current enforcement interval.
+   time; the interval itself ends earlier, at the rollback's first audited policy write (see below).
 
-**Enforcement intervals.** An interval of continuous enforcement for the signing role starts at an observation
-(step 1) that shows `RearmSweeperOnlyItWritesItsState` exactly as rendered for that role, and ends at the next
-observation that shows it absent or different, or at a rollback (step 4), whichever comes first; it is valid only
-while every observation in between shows the same statement and the role did not change. Record each interval (start
-and end observations, the role ARN, the policy document read) with the readbacks. Only versions whose `LastModified`
-lies strictly inside one interval rely on the deny; everything else needs another record of its writer.
+**Enforcement intervals.** Observations (step 1 readbacks) cannot establish continuous enforcement on their own: a
+removal between two observations, or a removal and a restore between two matching observations, leaves a gap in
+which any principal could write under the prefix. A trusted interval therefore needs independent, continuous
+change-control or audit evidence covering EVERY writer of the bucket policy (the stack, operators, automation:
+`PutBucketPolicy` and `DeleteBucketPolicy` on the transcripts bucket) and every change to the signing role and its
+binding, with no gap in that evidence across the interval.
+- **Start** after enforcement is established: the policy write that installed `RearmSweeperOnlyItWritesItsState`
+  exactly as rendered for the role, confirmed by a later observation of that exact statement.
+- **End**, conservatively, before the earliest POSSIBLE weakening: the earliest audited policy write or role change
+  after the start (even one that later turned out harmless), the start of any gap in the audit evidence, or a
+  rollback (step 4), whichever comes first. Reopen only after enforcement is established again (a new start).
+- A version relies on the deny only when its `LastModified` lies strictly inside one trusted interval. Both exact
+  versions must qualify: the `latest.json` version read and the receipt version it names. A version in a gap, at a
+  boundary, with a timestamp equal to one, or in any uncertain transition is unknown.
+- Without that audit evidence, no interval is trusted: every version needs independent writer provenance (another
+  record that identifies who wrote it).
+- Record each interval with its start and end events, the audit evidence used, the role ARN and the policy document.
+
+Acceptance examples (times illustrative):
+- *Removal seen late.* Statement observed present at 10:00; removed at 10:05; a non-sweeper writes a receipt at
+  10:06; absence observed at 10:10. Observations alone would accept 10:06. With audit evidence the interval ends at
+  10:05 (the earliest possible weakening), so the 10:06 version is unknown. Without audit evidence nothing after
+  the last audited start is trusted, and the 10:06 version is unknown.
+- *Removal hidden by a restore.* Present observed at 10:00; removed at 10:05; a non-sweeper writes at 10:06;
+  restored at 10:07; present observed again at 10:10. Both observations match, yet the 10:06 version is unknown: the
+  audited writes at 10:05 and 10:07 end the interval at 10:05 and reopen it only after 10:07 once enforcement is
+  established (a new start, confirmed by the 10:10 observation). Without audit evidence the matching observations
+  prove nothing about 10:05 to 10:07, and every version in that span is unknown.
 
 **How a capture stays read-only.** `alchemy plan` against `AWS.state` is not
 read-only: Alchemy takes a lease (PUT then DELETE of `__lease__.json`) and

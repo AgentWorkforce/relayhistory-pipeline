@@ -346,7 +346,8 @@ function matches(r: RearmPassReceipt, keyRoot: string, e: RearmPassExpectation):
  * principal but the sweeper role on that prefix: stacks/aws/rearm-sweeper-policy.ts RearmSweeperOnlyItWritesItsState,
  * D5), and only for versions written while that deny was in effect: the pointer's and the receipt's S3 LastModified
  * (of the exact versions read) strictly inside a documented interval of continuous enforcement for the sweeper role
- * (docs/aws-stage.md, "Enforcement intervals"). Anything else, including a version a delete exposes or one at an
+ * (docs/aws-stage.md, "Enforcement intervals": established by continuous audit evidence, never by readback
+ * observations alone). Anything else, including a version a delete exposes or one at an
  * interval's edge, needs an independent record of its writer. The caller must establish both.
  */
 export async function freshSweeperPass(store: ObjectStore, keyRoot: string, org: string, nowMs: number, maxAgeMs: number,

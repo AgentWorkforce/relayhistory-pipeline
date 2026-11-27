@@ -60,7 +60,8 @@ export function rearmSweeperBucketStatements(i: { bucketArn: string; roleArn: st
  * effect, or while it was rolled back), including one a later delete exposes, has unknown authorship from the policy
  * alone. So a version read from the prefix counts as the sweeper's only when S3's LastModified of that EXACT version
  * (for the pointer and for the receipt it names) lies strictly inside a documented interval of continuous enforcement
- * for that signing role (docs/aws-stage.md, "Enforcement intervals"), or another record identifies its writer. A time
+ * for that signing role, established by continuous audit evidence of every policy writer and role change, never by
+ * readback observations alone (docs/aws-stage.md, "Enforcement intervals"), or another record identifies its writer. A time
  * merely after the first readback is not enough (it admits writes made while the deny was rolled back), and a version
  * at an interval's edge or with an equal timestamp is unknown. It is not protection of the visible state: it
  * does not cover s3:DeleteObjectVersion (the requested scope; the eraser's version deletes stay as they are), and on
