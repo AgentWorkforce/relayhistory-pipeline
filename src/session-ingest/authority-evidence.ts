@@ -1,6 +1,10 @@
 /**
- * Live evidence for the per-org fence-authority marker (ledger-s3.ts validOrgFenceAuthority): what must hold, read
- * from production at the moment of the decision, before a backlog-ops authority mode may write an org's marker.
+ * CORROBORATING EVIDENCE ONLY, NEVER MARKER AUTHORITY (layered-sessions-pipeline's decision, message
+ * 251933101733961728). Read-only observation cannot establish that no admission lands between its last read and a
+ * marker write, so nothing here authorises writing a per-org fence-authority marker (ledger-s3.ts
+ * validOrgFenceAuthority), and backlog-ops authority-execute stays dormant. Marker authority will bind to the enforced
+ * per-org admission hold, a separate migration track, not to this report. What this module reports is live
+ * corroboration of decision 0005's cutover preconditions for an org:
  * Decision 0005's cutover order (docs/selfhost-composition.md, "Stopping the Worker's HTTP admission for an org"):
  *
  *   1. stop          every traffic-serving version of 96bulls-session-ingest lists the org in
@@ -39,16 +43,16 @@
  * every count and digest equal. Row versions can: every insert, update or delete-and-restore writes a tuple with a new
  * xmin. authorityBaseline records a snapshot (with counts and digests) taken INSIDE the backfill's input snapshot (a
  * REPEATABLE READ transaction, checked); the bound authorityEvidence run then counts the org's rows NOT visible in
- * that snapshot. Zero such rows and equal counts mean the org's row set now is exactly the set the backfill read, so
- * the marker covers what the backfill wrote. An unbound run is at best authority_evidence_unbound (sole refusal
- * sql_unbound), the input authorityBaseline takes; only a bound run can be authority_evidence_pass. Order: unbound run
- * (after the stop and the drain) -> backfills with authorityBaseline in their snapshot -> bound run -> marker.
+ * that snapshot. Zero such rows and equal counts mean the org's row set now is exactly the set the backfill read (as
+ * observed; an admission between the last read and any later action is not excluded). An unbound run is at best authority_evidence_unbound (sole refusal
+ * sql_unbound), the input authorityBaseline takes; only a bound run can be authority_evidence_corroborated. Order: unbound run
+ * (after the stop and the drain) -> backfills with authorityBaseline in their snapshot -> bound run (corroboration).
  * Authenticating the baseline's issuer and run, its exact revision and scope, and the backfill's ordering and
  * freshness is the caller's gate, as for every other bound backlog-ops receipt.
  *
- * Marker handoff: authorityMarkerAllowed(report, org, now) immediately before each marker write; a pass authorises
- * for AUTHORITY_MARKER_MAX_AGE_MS only. Every Cloudflare read takes the whole API body (success checked; the queue
- * list's result_info proves it is one complete page).
+ * No marker handoff: the module exports nothing that authorises a marker, and its best status,
+ * authority_evidence_corroborated, is deliberately not named "pass". Every Cloudflare read takes the whole API body
+ * (success checked; the queue list's result_info proves it is one complete page).
  *
  * Nothing here comes from an input except the org list (the caller's BACKLOG_OPS_ORGS scope, validated) and the bound
  * baseline (a receipt the caller's gate binds, as backlog-ops binds every other run). The module is pure: it builds every
@@ -94,8 +98,6 @@ export const AUTHORITY_CLOCK_SKEW_MS = 60_000;
  * statistics at least every PGSTAT_MAX_INTERVAL (60 s), so a delete committed before round 2 is counted by then.
  */
 export const AUTHORITY_STATS_SETTLE_MS = 61_000;
-/** A pass authorises a marker write for at most this long after the report finished (authorityMarkerAllowed). */
-export const AUTHORITY_MARKER_MAX_AGE_MS = 5 * 60_000;
 /** The most orgs one evidence run evaluates (backlog-ops BACKLOG_OPS_MAX_ORGS). */
 export const AUTHORITY_MAX_ORGS = 64;
 /** Queues listed per page; a full page means the list may be truncated, which refuses. */
@@ -178,9 +180,9 @@ export interface OrgAuthorityVerdict {
   turnsNeon: TurnsCheck;
 }
 
-export type AuthorityEvidenceStatus = "authority_evidence_pass" | "authority_evidence_unbound" | "authority_evidence_refused";
+export type AuthorityEvidenceStatus = "authority_evidence_corroborated" | "authority_evidence_unbound" | "authority_evidence_refused";
 export interface AuthorityEvidenceReport {
-  /** pass: bound and every check ok (the only status a marker may be written on). unbound: every live check ok, no baseline. */
+  /** corroborated: bound and every check ok (still never marker authority). unbound: every live check ok, no baseline. */
   status: AuthorityEvidenceStatus;
   orgCount: number;
   observationWindowMs: number;
@@ -449,9 +451,8 @@ async function queueList(src: AuthorityEvidenceSources): Promise<{ ids: QueueIds
   const rows = list as unknown[];
   // Complete only when the provider's own pagination says this one page is everything (result_info).
   const info = (body as Record<string, unknown>).result_info;
-  if (rows.length >= AUTHORITY_QUEUE_PAGE || !isObj(info) || count(info.total_count) !== rows.length ||
-      (info.total_pages !== undefined && info.total_pages !== 1 && !(rows.length === 0 && info.total_pages === 0)) ||
-      (info.page !== undefined && info.page !== 1)) refuse("queue_list_truncated");
+  if (rows.length >= AUTHORITY_QUEUE_PAGE || !isObj(info) || count(info.total_count) !== rows.length || info.page !== 1 ||
+      !(info.total_pages === 1 || (rows.length === 0 && info.total_pages === 0))) refuse("queue_list_truncated");
   if (!rows.every((q) => isObj(q) && typeof q.queue_name === "string")) refuse("queue_list_unreadable");
   const find = (name: string) => {
     const hits = rows.filter((q) => (q as Record<string, unknown>).queue_name === name);
@@ -727,7 +728,7 @@ function unboundStop(report: unknown, orgHash: string): { stopDeploymentHash: st
  * statement's and the backfill's reads would not be bound to it. `evidence` is an unbound authorityEvidence report
  * (every live check passed) that supplies each org's stop. The bound run then proves the org's rows now are exactly
  * the rows of this snapshot: none written after it (xmin) and the counts equal, which together leave the same set,
- * so the backfill read the state the marker is written over. The digests are a further cross-check, not the proof.
+ * so, as observed, the backfill read the current state. The digests are a further cross-check, not the proof.
  */
 export async function authorityBaseline(
   orgsInput: readonly unknown[], evidence: unknown, sql: AuthorityEvidenceSources["sql"],
@@ -818,10 +819,9 @@ function sqlVerdict(
 
 /**
  * Read every piece of evidence for `orgs` and return one verdict per org (input order). Never throws for evidence;
- * throws only `authority_orgs` / `authority_window` for bad arguments. A marker may be written for an org only when the
- * report's status is authority_evidence_pass (bound to a ready authorityBaseline, every org ok).
- * authority_evidence_unbound (every live check passed, no baseline bound) is what authorityBaseline takes, never
- * authority.
+ * throws only `authority_orgs` / `authority_window` for bad arguments. The best status, authority_evidence_corroborated
+ * (bound to a ready authorityBaseline, every org ok), is corroboration only and never authorises a marker (header).
+ * authority_evidence_unbound (every live check passed, no baseline bound) is what authorityBaseline takes.
  *
  * Order: ingest deployments (stop, mirror, queue binding) -> relayhistory deployments (turns) -> round 1 (queue list,
  * routing and backlog; SQL per org) -> wait -> round 2 -> both deployments re-read (the current one must be
@@ -943,7 +943,7 @@ export async function authorityEvidence(
     const ok = refusals.length === 0 && checks.every((c) => c.ok);
     return { orgHash, ok, refusals, stop, mirror, queueDrained, sqlQuiet, turnsNeon };
   });
-  const status: AuthorityEvidenceStatus = verdicts.every((v) => v.ok) ? "authority_evidence_pass"
+  const status: AuthorityEvidenceStatus = verdicts.every((v) => v.ok) ? "authority_evidence_corroborated"
     : options.bound === undefined && verdicts.every((v) => v.refusals.length === 1 && v.refusals[0] === "sql_unbound")
       ? "authority_evidence_unbound" : "authority_evidence_refused";
   return {
@@ -956,17 +956,4 @@ export async function authorityEvidence(
     relayhistoryDeploymentHash: rh ? evidenceHash("deployment", rh.id) : null,
     orgs: verdicts,
   };
-}
-
-/**
- * The marker handoff: true only for an org whose verdict is ok in a report whose status is authority_evidence_pass,
- * finished at most AUTHORITY_MARKER_MAX_AGE_MS before `nowMs` (and not in the future). Call it immediately before each
- * marker write; past the limit, run the bound evidence again.
- */
-export function authorityMarkerAllowed(report: AuthorityEvidenceReport, org: string, nowMs: number): boolean {
-  if (report?.status !== "authority_evidence_pass" || !Array.isArray(report.orgs) || count(report.finishedAtMs) === null) return false;
-  const age = nowMs - report.finishedAtMs;
-  if (!(age >= 0 && age <= AUTHORITY_MARKER_MAX_AGE_MS)) return false;
-  const hits = report.orgs.filter((o) => o.orgHash === evidenceHash("org", org));
-  return hits.length === 1 && hits[0]!.ok === true && hits[0]!.refusals.length === 0;
 }

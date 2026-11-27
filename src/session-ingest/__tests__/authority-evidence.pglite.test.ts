@@ -232,7 +232,7 @@ test("end to end on the engine: baseline in a REPEATABLE READ transaction, then 
   // Nothing written since: the bound run passes on the real engine...
   const passed = await authorityEvidence([ORG], src, { ...opts, bound: baseline });
   expect(passed.orgs[0]!.refusals).toEqual([]);
-  expect(passed.status).toBe("authority_evidence_pass");
+  expect(passed.status).toBe("authority_evidence_corroborated");
   // ...a delete-and-restore since the baseline refuses.
   await pg.query(`DELETE FROM sessions.ingest_session_ownership WHERE org_id = $1`, [ORG]);
   await pg.query(`INSERT INTO sessions.ingest_session_ownership VALUES ($1,'w','u','o','s','sess')`, [ORG]);
@@ -246,7 +246,7 @@ test("end to end on the engine: baseline in a REPEATABLE READ transaction, then 
   const fresh = await authorityBaseline([ORG], unbound, async (t, p) => (await pg.query<Record<string, unknown>>(t, p as unknown[])).rows);
   await pg.exec("COMMIT");
   expect(fresh.status).toBe("authority_baseline_ready");
-  expect((await authorityEvidence([ORG], src, { ...opts, bound: fresh })).status).toBe("authority_evidence_pass");
+  expect((await authorityEvidence([ORG], src, { ...opts, bound: fresh })).status).toBe("authority_evidence_corroborated");
   await pg.query(`INSERT INTO sessions.ingest_batches VALUES ($1,'w','o','transient','u','pending',now(),NULL)`, [ORG]);
   await pg.query(`DELETE FROM sessions.ingest_batches WHERE batch_id = 'transient'`);
   const transient = await authorityEvidence([ORG], src, { ...opts, bound: fresh });

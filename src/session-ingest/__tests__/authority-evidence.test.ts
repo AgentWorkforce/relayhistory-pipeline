@@ -9,8 +9,6 @@ import {
   AUTHORITY_SQL,
   AUTHORITY_STATS_SETTLE_MS,
   AUTHORITY_STATS_SQL,
-  AUTHORITY_MARKER_MAX_AGE_MS,
-  authorityMarkerAllowed,
   authorityBaseline,
   authorityEvidence,
   evidenceHash,
@@ -227,7 +225,7 @@ describe("authorityEvidence baseline and pass", () => {
   test("a run bound to a clean baseline with nothing changed passes", async () => {
     const wd = world();
     const r = await bound(wd, [ORG, ORG2]);
-    expect(r.status).toBe("authority_evidence_pass");
+    expect(r.status).toBe("authority_evidence_corroborated");
     for (const v of r.orgs) { expect(v.ok).toBe(true); expect(v.refusals).toEqual([]); expect(v.sqlQuiet.bound).toBe(true); }
     expect(r.orgs[0]!.orgHash).toBe(evidenceHash("org", ORG));
     expect(r.orgs[0]!.orgHash).not.toBe(r.orgs[1]!.orgHash);
@@ -485,17 +483,12 @@ describe("review 949a2a62 regressions", () => {
     expect(r.orgs[0]!.sqlQuiet.code).toBe("observation_window_short");
   });
 
-  test("1c. the marker handoff needs a fresh pass for that org", async () => {
-    const wd = world();
-    const r = await bound(wd, [ORG, ORG2]);
-    expect(r.status).toBe("authority_evidence_pass");
-    expect(authorityMarkerAllowed(r, ORG, r.finishedAtMs)).toBe(true);
-    expect(authorityMarkerAllowed(r, ORG2, r.finishedAtMs + AUTHORITY_MARKER_MAX_AGE_MS)).toBe(true);
-    expect(authorityMarkerAllowed(r, ORG, r.finishedAtMs + AUTHORITY_MARKER_MAX_AGE_MS + 1)).toBe(false);
-    expect(authorityMarkerAllowed(r, ORG, r.finishedAtMs - 1)).toBe(false);
-    expect(authorityMarkerAllowed(r, "99999999-0000-4000-8000-000000000000", r.finishedAtMs)).toBe(false);
-    expect(authorityMarkerAllowed({ ...r, status: "authority_evidence_unbound" }, ORG, r.finishedAtMs)).toBe(false);
-    expect(authorityMarkerAllowed(await baseline(world().src), ORG, NOW + HOUR)).toBe(false);
+  test("option 2: the module authorises no marker; its best status is corroboration, never a pass", async () => {
+    const mod = await import("../authority-evidence.ts");
+    expect(Object.keys(mod).filter((k) => /marker/iu.test(k))).toEqual([]);
+    const r = await bound(world(), [ORG]);
+    expect(r.status).toBe("authority_evidence_corroborated");
+    expect(JSON.stringify(r)).not.toContain("pass");
   });
 
   test("3. a consumer or producer whose identity cannot be read refuses, on any queue", async () => {
@@ -515,13 +508,13 @@ describe("review 949a2a62 regressions", () => {
   test("3b. the list is complete only by the provider's pagination metadata", async () => {
     const n = 4;
     for (const info of [undefined, null, {}, { total_count: n + 1, total_pages: 1 }, { total_count: n, total_pages: 2 }, { total_count: n, page: 2 },
-      { count: n, total_pages: 1 }]) {
+      { count: n, total_pages: 1 }, { total_count: n, total_pages: 1 }, { total_count: n, page: 1 }]) {
       const wd = world();
       wd.w.listInfo = info === null ? "x" : info ?? { total_count: undefined };
       refusedWith(await baseline(wd.src), "queue_list_truncated");
     }
     const ok = world();
-    ok.w.listInfo = { total_count: n };
+    ok.w.listInfo = { total_count: n, page: 1, total_pages: 1 };
     expect((await baseline(ok.src)).status).toBe("authority_evidence_unbound");
   });
 
