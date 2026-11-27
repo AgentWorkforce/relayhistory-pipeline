@@ -69,7 +69,7 @@ export function describe(ctx: Context, sides: [string, string], atIn: string, ow
     const root = side.slice(5);
     // As of the alert, a session is known only once it has dated activity by then: a session that started later
     // is not counted, and its owner is not shown.
-    const members = [...ctx.sessions.values()].filter((s) => s.root === root && (!asOf || firstSeen(s) <= at));
+    const members = [...ctx.sessions.values()].filter((s) => s.root === root && (!asOf || (firstSeen(s) ?? "\uffff") <= at));
     const edits = members.flatMap((s) => s.edits).filter((e) => !e.hot && (!asOf || e.ts <= at));
     const counts = new Map<string, number>();
     for (const e of edits) counts.set(e.path, (counts.get(e.path) ?? 0) + 1);
@@ -96,8 +96,12 @@ function createHashless(root: string): string {
   return h.toString(36);
 }
 
-/** When a session is first known to exist: its earliest dated fact, else its directory creation time. */
-function firstSeen(s: Session): string {
+/**
+ * When a session is first known to exist: its earliest dated fact, else its directory creation time, else null (no
+ * valid time: never known as of any alert). Only canonical times are compared.
+ */
+function firstSeen(s: Session): string | null {
   const ts = [...s.edits.map((e) => e.ts), ...s.prs.filter((p) => !p.undated).map((p) => p.ts), ...s.branches.map((b) => b.ts), ...s.shas.map((x) => x.ts), ...s.received.map((r) => r.ts)];
-  return ts.length ? ts.reduce((a, b) => (a < b ? a : b)) : s.startedAt;
+  const t = ts.length ? ts.reduce((a, b) => (a < b ? a : b)) : s.startedAt;
+  return canonicalTs(t) === t ? t : null;
 }

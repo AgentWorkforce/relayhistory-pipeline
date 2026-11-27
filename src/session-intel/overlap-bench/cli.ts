@@ -25,7 +25,7 @@ import { type IncidentLabel, type NegativeLabel, score, type Score } from "./sco
 import { components, type Components, rank, rankerGrid, type RankerParams } from "./ranker.ts";
 import { adjudicationSample, type AlertVerdict, ceiling, evaluate, pairId } from "./eval.ts";
 import { describe as describePair } from "./bundle.ts";
-import { canonicalTs, instantOf } from "../cloud-harvest/instant.ts";
+import { canonicalTs, instantOf, optionalTs, requiredTs } from "../cloud-harvest/instant.ts";
 import { LOOSE_RANKER, scoreStage2, stage2Batch, verifiedBatch } from "./stage2.ts";
 import { claimOnce, finishOnce, noteOnce, pinScore } from "./once.ts";
 import { assertPrivateFile, assertPrivateInput, outsideRoot, privateDir, readPrivate, writePrivate } from "../cloud-harvest/private-fs.ts";
@@ -94,11 +94,19 @@ export function earliestDeleteBy(scopes: Array<{ deleteBy: string }>): string {
   return new Date(Math.min(...scopes.map((x) => instant(x.deleteBy, "deleteBy")))).toISOString();
 }
 
-/** Forge times in the model's one form (canonicalTs), so they order correctly against event times. */
-const canon = <T extends string | null | undefined>(v: T): T => (typeof v === "string" ? (canonicalTs(v) ?? v) : v) as T;
+/**
+ * Forge times in the model's one form (canonicalTs), so they order correctly against event times. They are
+ * validated on load: a PR's creation is required, its merge and close times and every history entry's time must be
+ * valid when present. An invalid time would otherwise compare as a string (an empty `at` sorts before every
+ * alert and would show as dated evidence), so loading refuses it.
+ */
 export function canonicalPr(p: ForgePr): ForgePr {
-  const out: ForgePr = { ...p, createdAt: canon(p.createdAt), mergedAt: canon(p.mergedAt), closedAt: canon(p.closedAt) };
-  if (p.history) out.history = { titles: p.history.titles.map((t) => ({ ...t, at: canon(t.at) })), bodies: p.history.bodies.map((b) => ({ ...b, at: canon(b.at) })) };
+  const what = `forge ${p.repo}#${p.number}`;
+  const out: ForgePr = { ...p, createdAt: requiredTs(p.createdAt, `${what} createdAt`), mergedAt: optionalTs(p.mergedAt, `${what} mergedAt`), closedAt: optionalTs(p.closedAt, `${what} closedAt`) };
+  if (p.history) out.history = {
+    titles: p.history.titles.map((t, i) => ({ ...t, at: requiredTs(t.at, `${what} title history[${i}]`) })),
+    bodies: p.history.bodies.map((b, i) => ({ ...b, at: requiredTs(b.at, `${what} body history[${i}]`) })),
+  };
   return out;
 }
 
@@ -265,7 +273,7 @@ async function main(argv: string[]) {
   const raw = JSON.parse(readPrivate(values.labels)) as { incidents: IncidentLabel[]; negatives: NegativeLabel[] };
   // Harm times are compared with alert times as strings, so they take the same form (canonicalTs). The labels'
   // identity is still their bytes (labelsIdentity); this changes only the in-memory copy.
-  const labels = { ...raw, incidents: raw.incidents.map((i) => ({ ...i, harmAt: canon(i.harmAt) })) };
+  const labels = { ...raw, incidents: raw.incidents.map((i) => ({ ...i, harmAt: requiredTs(i.harmAt, `label ${i.id} harmAt`) })) };
   const ctx = loadContext(values.harvest, values.forge);
   const perHundred = Number(values["per-hundred"] ?? 5);
   if (!(perHundred > 0) || !Number.isFinite(perHundred)) throw new Error("--per-hundred must be a positive number");

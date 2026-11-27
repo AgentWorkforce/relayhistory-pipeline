@@ -5,7 +5,7 @@
 import type { EventFacts } from "../cloud-harvest/features.ts";
 import type { DirectoryRow, SessionFacts } from "../cloud-harvest/harvest.ts";
 import { HOT_PATH, repoOf, repoRelative } from "./paths.ts";
-import { canonicalTs } from "../cloud-harvest/instant.ts";
+import { canonicalTs, elapsedNs, NS_PER_MINUTE } from "../cloud-harvest/instant.ts";
 
 /** `repo` is the edit's own repository: taken from an absolute path when it names one, else the session's. */
 export interface Edit { ts: string; repo: string; path: string; via: string; hot: boolean }
@@ -42,7 +42,7 @@ function projectName(row: DirectoryRow): string | null {
 const PR_KEY = /^([a-z0-9._-]+\/[a-z0-9._-]+)?#(\d+)$/i;
 
 /** A `gh pr create` call's PR URL arrives in the tool result after it; a result this soon after claims the number. */
-const CREATE_RESULT_MS = 10 * 60_000;
+const CREATE_RESULT_NS = 10n * NS_PER_MINUTE;
 
 /** Events stamped before this (epoch zero, clock faults) carry no usable time and are dropped. */
 /** In canonicalTs form, like every time the model holds. */
@@ -86,13 +86,13 @@ function fromFacts(s: Session, events: EventFacts[], observed: ObservedPolicy) {
     if (first) baseline = new Set(seen);
     const creates = e.gh.includes("pr-create");
     // A create call usually names no number; its own result does. Only the call's own result may claim it: the
-    // very next raw event (by `seq`, counting events that were not kept), a tool result, within CREATE_RESULT_MS,
+    // very next raw event (by `seq`, counting events that were not kept), a tool result, within CREATE_RESULT_NS,
     // not failed. Facts carry no tool-use id, so with parallel calls (the next raw event is another call) or without
     // `seq` (facts harvested before it) the claim abstains. The PR is owned from the result's time.
     // An unresolved call stays as a placeholder (number -1): an act of opening a PR, owning nothing. A failed
     // result removes it.
     const isResult = e.type === "tool_result" || e.role === "tool_result";
-    if (pendingCreate && (Date.parse(e.ts) - Date.parse(pendingCreate.ts) > CREATE_RESULT_MS || (!isResult && !creates))) pendingCreate = null;
+    if (pendingCreate && (elapsedNs(pendingCreate.ts, e.ts) > CREATE_RESULT_NS || (!isResult && !creates))) pendingCreate = null;
     const adjacent = pendingCreate !== null && pendingCreate.seq !== undefined && e.seq === pendingCreate.seq + 1;
     if (pendingCreate && isResult && !adjacent) pendingCreate = null;
     if (pendingCreate && isResult) {

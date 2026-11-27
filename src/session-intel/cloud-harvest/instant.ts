@@ -73,3 +73,25 @@ export function canonicalTs(v: unknown): string | null {
   if (!/^\d{4}-/.test(iso)) return null;
   return `${iso.slice(0, 19)}.${frac.toString().padStart(9, "0")}Z`;
 }
+
+/**
+ * Elapsed time from `from` to `to` in nanoseconds, at full precision. Both must be event times (`eventNanos`); a
+ * window check through `Date.parse` floors each to its millisecond, so 1 h + 1 µs would pass as 1 h.
+ */
+export function elapsedNs(from: string, to: string): bigint {
+  const a = eventNanos(from), b = eventNanos(to);
+  if (a === null || b === null) throw new Error("elapsedNs needs two event times");
+  return b - a;
+}
+export const NS_PER_MINUTE = 60_000_000_000n;
+
+/** A required time in canonicalTs form; throws naming `what` when it is missing or invalid. */
+export function requiredTs(v: unknown, what: string): string {
+  const t = canonicalTs(v);
+  if (t === null) throw new Error(`${what} is not a valid time`);
+  return t;
+}
+/** An optional time (null or absent stays null) in canonicalTs form; throws when it is present but invalid. */
+export function optionalTs(v: unknown, what: string): string | null {
+  return v === null || v === undefined ? null : requiredTs(v, what);
+}

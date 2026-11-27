@@ -5,6 +5,7 @@
  */
 import type { PrHistory, PullRequest } from "../forge/types.ts";
 import type { Session } from "./model.ts";
+import { elapsedNs, NS_PER_MINUTE } from "../cloud-harvest/instant.ts";
 
 export interface Alert { detector: string; sides: [string, string]; at: string; artifact: string; score: number; owners: [string | null, string | null] }
 /** Detectors read only the PR's shape; the description and comments are carried for adjudication bundles. */
@@ -24,7 +25,8 @@ export interface Context {
 export const rootSide = (root: string) => `root:${root}`;
 export const prSide = (repo: string, n: number) => `pr:${repo.toLowerCase()}#${n}`;
 const pairKey = (a: string, b: string) => (a < b ? `${a}\u0001${b}` : `${b}\u0001${a}`);
-const H = 3_600_000;
+/** Windows are checked at full precision (instant.ts elapsedNs). */
+const H_NS = 60n * NS_PER_MINUTE;
 
 /**
  * Which roots a PR belongs to, and since when: a root that created it (from the create call's time), or created or
@@ -162,7 +164,7 @@ export function concurrentEdits(ctx: Context, p: ConcurrentParams): Alert[] {
       lastByRoot.set(r.root, { ts: r.ts, owner: r.owner });
       if (lastByRoot.size > p.maxRootsPerPath) continue;
       for (const [other, o] of lastByRoot) {
-        if (other === r.root || Date.parse(r.ts) - Date.parse(o.ts) > p.windowH * H) continue;
+        if (other === r.root || elapsedNs(o.ts, r.ts) > BigInt(p.windowH) * H_NS) continue;
         if (p.crossOwnerOnly && (r.owner === null || r.owner === o.owner)) continue;
         events.push({ ts: r.ts, a: r.root, b: other, path: k.split("\u0000")[1]!, rarity: 1 / lastByRoot.size, owners: [r.owner, o.owner] });
       }
@@ -196,11 +198,11 @@ export function sharedTrigger(ctx: Context, p: SharedTriggerParams): Alert[] {
     for (const ref of refs) {
       const side = prSide(ref.repo!, ref.number);
       if (ref.action === "create" && ownersAt(own, side, ref.ts).includes(root)) continue;
-      const limit = Date.parse(ref.ts) + p.windowMin * 60_000;
+      const limit = BigInt(p.windowMin) * NS_PER_MINUTE;
       const act = members.flatMap((s) => [
         ...s.prs.filter((x) => x.action === "create").map((x) => x.ts),
         ...(p.requireEdit ? s.edits.map((e) => e.ts) : []),
-      ]).filter((t) => t >= ref.ts && Date.parse(t) <= limit).sort()[0];
+      ]).filter((t) => t >= ref.ts && elapsedNs(ref.ts, t) <= limit).sort()[0];
       if (!act) continue;
       const list = actsAfter.get(side) ?? [];
       if (!list.some((x) => x.root === root)) list.push({ root, at: act, owner: ref.s.owner });

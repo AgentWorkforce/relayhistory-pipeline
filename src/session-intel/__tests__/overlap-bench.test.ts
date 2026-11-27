@@ -397,3 +397,47 @@ describe("time order (canonical full-precision times)", () => {
     expect(openPrOverlap({ ...ctx, prs: [pr(93, "machine-c", { createdAt: "2026-09-01T21:00:00Z" })] }, P)).toEqual([]);
   });
 });
+
+describe("windows at full precision, and validated forge and label times", () => {
+  const edit = (id: string, ts: string) => facts(id, [fact(ts, { touched: [{ path: "crates/core/src/lib.rs", via: "patch" }, { path: "crates/core/src/main.rs", via: "patch" }] })]);
+  const D3 = { windowH: 1, minShared: 1, maxRootsPerPath: 8, skipHot: true, crossOwnerOnly: true, suppressCommunicated: true };
+  test("D3: edits exactly 1 h apart alert at windowH 1; 1 h + 1 µs apart do not", () => {
+    const at = (t: string) => concurrentEdits(ctxOf([row("a", "K"), row("b", "W")], [edit("a", "2026-10-01T17:00:00.000000Z"), edit("b", t)], []), D3).length;
+    expect(at("2026-10-01T18:00:00.000000Z")).toBe(1);
+    expect(at("2026-10-01T18:00:00.000001Z")).toBe(0);
+  });
+  test("D2: an act exactly windowMin after the reference counts; 1 µs later does not", () => {
+    const react = (id: string, t1: string, t2: string) => facts(id, [fact(t1, { prRefs: ["agentworkforce/cloud#6483"] }), fact(t2, { gh: ["pr-create"] })]);
+    const rows = [row("x", "K", { project: { name: "AgentWorkforce/cloud" } }), row("y", "K", { project: { name: "AgentWorkforce/cloud" } })];
+    const n = (late: string) => sharedTrigger(ctxOf(rows, [react("x", "2026-11-23T07:02:00Z", "2026-11-23T07:10:00Z"), react("y", "2026-11-23T07:03:00Z", late)], []),
+      { windowMin: 15, requireEdit: false, suppressCommunicated: true }).length;
+    expect(n("2026-11-23T07:18:00.000000Z")).toBe(1);
+    expect(n("2026-11-23T07:18:00.000001Z")).toBe(0);
+  });
+  test("a create call's result claims its PR within 10 minutes at full precision", () => {
+    const owned = (resultAt: string) => buildModel([row("author", "K")], [facts("author", [
+      fact("2026-10-01T10:00:00.000000Z", { gh: ["pr-create"] }),
+      fact(resultAt, { type: "tool_result", prRefs: ["agentworkforce/relayhistory#4083"] }),
+    ])]).get("codex:author")!.prs.filter((x) => x.action === "create" && x.number === 4083).length;
+    expect(owned("2026-10-01T10:10:00.000000Z")).toBe(1);
+    expect(owned("2026-10-01T10:10:00.000001Z")).toBe(0);
+  });
+  test("forge and label times are validated on load: an invalid one is refused, never compared as a string", () => {
+    const bad = [
+      pr(1, "u", { createdAt: "" }), pr(2, "u", { mergedAt: "soon" }), pr(3, "u", { closedAt: "2026-02-30T00:00:00Z" }),
+      pr(4, "u", { history: { titles: [{ at: "", title: "x" }], bodies: [] } }), pr(5, "u", { history: { titles: [], bodies: [{ at: "nope", body: "x" }] } }),
+    ];
+    for (const p of bad) expect(() => canonicalPr(p)).toThrow(/is not a valid time/);
+    const ok = canonicalPr(pr(6, "u", { createdAt: "2026-09-01T16:00:00Z", mergedAt: null, history: { titles: [{ at: "2026-09-01T16:00:00Z", title: "t" }], bodies: [] } }));
+    expect([ok.createdAt, ok.mergedAt, ok.history!.titles[0]!.at]).toEqual(["2026-09-01T16:00:00.000000000Z", null, "2026-09-01T16:00:00.000000000Z"]);
+  });
+});
+
+describe("as-of membership with no valid time", () => {
+  test("a session whose directory row has no valid time and no dated facts is never known as of an alert", async () => {
+    const { describe: describePair } = await import("../overlap-bench/bundle.ts");
+    const ctx = ctxOf([row("a", "K"), row("ghost", "W", { createdAt: "", lastTs: "" })], [facts("a", [fact("2026-09-01T10:00:00Z", { touched: [{ path: "crates/core/src/lib.rs", via: "patch" }] })])], []);
+    const side = describePair(ctx, ["root:codex:a", "root:codex:ghost"], "2026-09-01T12:00:00Z", () => "member", true).sides[1]!;
+    expect(side.kind === "work" && side.sessions).toBe(0);
+  });
+});
