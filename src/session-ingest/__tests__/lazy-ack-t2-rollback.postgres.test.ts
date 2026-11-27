@@ -87,8 +87,13 @@ describe.skipIf(!url)("062210 lifecycle and rollback under a non-superuser owner
     expect(later.length).toBeGreaterThan(0);
     for (const n of later) expect(fullLedger).toContain(n);
     if (!opts.keepLater) {
+      // 062320's and 062340's downs reset readiness to pending (as 062210's own down does). This suite exercises 062210
+      // alone on the schema below it, so the fixture restores the marker the full migrate wrote; 062210's own down
+      // resetting it is still asserted below.
+      const marker = (await fx.query("SELECT generation,status FROM sessions.__96bulls_role_validation WHERE name='session_directory_search_worker'")).rows[0];
       expect(await rollBackLaterSlots(db.ownerUrl, T2_SLOT)).toEqual(later);
       expect((await ledgerNames()).filter((n) => n > "upstream:" + T2_SLOT + ".sql")).toEqual([]);
+      await fx.query("UPDATE sessions.__96bulls_role_validation SET generation=$1,status=$2,updated_at=clock_timestamp() WHERE name='session_directory_search_worker'", [marker.generation, marker.status]);
     }
     const generation = (await derivedSchemaAssets()).expected.generation;
     await pool.query("SELECT sessions.ingest_lazy_policy_set($1::jsonb)", [JSON.stringify({ baselineMode: "lazy-current", generation, sourceIdentitySha256: identity, controlEpoch: epoch,

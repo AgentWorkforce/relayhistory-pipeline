@@ -88,7 +88,9 @@ async function database(prefix:string,withAcquisition=true):Promise<Db>{
  await pool.query(read("supabase/tests/supabase_shim.sql"));await pool.query("CREATE EXTENSION pg_trgm;CREATE EXTENSION btree_gin");
  // Single-sourced bootstrap chain: the grant migration FAILs closed without the bare consumer grantee.
  for(const f of SESSION_BOOTSTRAP_FILES)await pool.query(read(f));
- for(const f of readdirSync(join(root,"supabase/migrations")).sort())if(withAcquisition||(f!==MIGRATION&&!ON_ACQUISITION.includes(f)))await pool.query(read("supabase/migrations/"+f));
+ // 062340 replaces 062320's release and status, so it cannot apply without 062320 (which the baseline omits, below).
+ const ON_ACQUISITION_DEPENDENTS=["20261105062340_ingest_org_erasure_history.sql"];
+ for(const f of readdirSync(join(root,"supabase/migrations")).sort())if(withAcquisition||(f!==MIGRATION&&!ON_ACQUISITION.includes(f)&&!ON_ACQUISITION_DEPENDENTS.includes(f)))await pool.query(read("supabase/migrations/"+f));
  for(const f of readdirSync(join(root,"src/hoopdb/migrations")).sort())await pool.query(read("src/hoopdb/migrations/"+f));
  return d;
 }
@@ -657,8 +659,10 @@ describe.skipIf(!url)("flag off, and flag on with unenrolled sources, are byte-i
   // Drift alarm: a new migration built on 043850 is reviewed here before the baseline silently drops it.
   // 059000 re-replaces ingest_publication_publish with 043850's body (which calls ingest_acquisition_publish_check), only
   // widening the provider predicate to admit gcs; it cannot apply without 043850, so the baseline omits it too.
+  // 062320 (the org admission hold) re-replaces 043850's claim, stage and publication-claim bodies verbatim plus one
+  // hold check, inert with no hold installed; the baseline omits it (and 062340, which builds on it) for the same reason.
   expect(ON_ACQUISITION).toEqual(["20261105050010_operator_session_erase_fence_check.sql",
-   "20261105059000_ingest_publication_gcs_provider.sql"]);
+   "20261105059000_ingest_publication_gcs_provider.sql","20261105062320_ingest_org_admission_fences.sql"]);
   const withMigration=await workload(await ingest("acq_identity_a",true));
   const armed=await ingest("acq_identity_c",true);await armed.pool.query("SELECT sessions.ingest_acquisition_set_hooks(true)");
   const withFlag=await workload(armed);

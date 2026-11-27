@@ -147,10 +147,15 @@ describe.skipIf(!url)("043500 lazy claim seat-clock narrowing (owned PostgreSQL)
   const eraseGate = (pid: number) => ({pid,classid:"961996",objid:"50000",objsubid:2,mode:"ShareLock",granted:true});
   // Preserve the exact origin-lock proof while explicitly accounting for the one shared
   // 050010 writer gate. No unexpected, exclusive or waiting gate is filtered away.
+  // Since 062320: every claim and ACK entry also takes the org admission hold key SHARED once (re-granted, never
+  // re-taken, by nested checks), the same +1 the PGlite twin (claim-clock-lock.pglite.test.ts) accounts for.
+  const holdKey = async (pid: number) => ({ pid, ...(await pool.query(
+    "SELECT ((k>>32)&4294967295)::text classid,(k&4294967295)::text objid FROM(SELECT hashtextextended('96bulls:ingest-org-hold-v1:'||$1,0) k)s",
+    [TENANT.orgId])).rows[0], objsubid: 1, mode: "ShareLock", granted: true });
   const expectAdvisory = async (pid: number, origins: Record<string,unknown>[]) => {
     const locks = await advisory([pid]);
-    expect(locks).toHaveLength(origins.length + 1);
-    expect(locks).toEqual(expect.arrayContaining([...origins,eraseGate(pid)]));
+    expect(locks).toHaveLength(origins.length + 2);
+    expect(locks).toEqual(expect.arrayContaining([...origins,eraseGate(pid),await holdKey(pid)]));
   };
   const ids500 = (label: string) => Array.from({ length: 500 }, (_, i) => `${label}-${serial}-${i}`);
   const prosrc = async (sig: string) => (await pool.query("SELECT prosrc FROM pg_proc WHERE oid=$1::regprocedure", [sig])).rows[0].prosrc as string;
@@ -342,7 +347,7 @@ describe.skipIf(!url)("043500 lazy claim seat-clock narrowing (owned PostgreSQL)
     // All K claims hold their transactions (and locks) open here, simultaneously.
     const locks = await advisory(hs.map((h) => h.pid));
     expect(results.map((r) => (r.ok ? "ok" : r.code))).toEqual(Array(k).fill("ok"));
-    expect(locks.length).toBeLessThanOrEqual(2*k);
+    expect(locks.length).toBeLessThanOrEqual(3*k); // per claim: origin, erase gate and (since 062320) the org hold key
     expect(new Set(locks.map((l) => l.pid)).size).toBe(k);
     if(constrained) expect(2*k).toBeLessThan(capacity);
     for(const [i,h] of hs.entries()){

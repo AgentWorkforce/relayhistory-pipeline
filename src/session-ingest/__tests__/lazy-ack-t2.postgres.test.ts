@@ -45,7 +45,7 @@ import { deliverBatch } from "../deliver.ts";
 import { sqlLedger } from "../ledger-sql.ts";
 import { deliveryAccount, prepareDelivery } from "../vendor/delivery/prepare.ts";
 import { batch, record, scratchStore, TENANT } from "./support.ts";
-import { migrateAsOwner, ownedLoopbackUrl, ownerDatabase, roleReceipt, OWNER_ROLE, type OwnerDatabase } from "./owner-role-harness.ts";
+import { migrateAsOwner, ownedLoopbackUrl, ownerDatabase, roleReceipt, OWNER_ROLE, type OwnerDatabase, rollBackLaterSlots } from "./owner-role-harness.ts";
 import { derivedSchemaAssets } from "../../session-pipeline/derived-schema.ts";
 import { FLIP_STATEMENT, lazyAckT2FlipOutcome as flipLazyAckT2Mode, type FlipMode, type FlipOptions } from "../lazy-ack-t2-flip.ts";
 
@@ -187,6 +187,13 @@ describe.skipIf(!url)("062210 T2 staged ACK: fence and upgrade schedules (owned 
     expect(who).toMatchObject({ current_user: OWNER_ROLE, rolsuper: false, rolbypassrls: false, rolcreaterole: true, rolinherit: false });
     console.log(JSON.stringify({ case: "owner", ...who }));
     await migrateAsOwner(db.ownerUrl);
+    // 062210's isolation semantics are proven on the schema below 20261105062320: the org admission hold's entry check
+    // refuses every non-READ COMMITTED commit with 40001 before 062210's code runs (proven in
+    // org-admission-hold.postgres.test.ts case 6). So 062320 and every later slot are rolled back here, and the
+    // readiness marker their downs reset to pending is restored to what the full migrate wrote.
+    const marker = (await fx.query("SELECT generation,status FROM sessions.__96bulls_role_validation WHERE name='session_directory_search_worker'")).rows[0];
+    await rollBackLaterSlots(db.ownerUrl, "20261105062300_search_index_stage");
+    await fx.query("UPDATE sessions.__96bulls_role_validation SET generation=$1,status=$2,updated_at=clock_timestamp() WHERE name='session_directory_search_worker'", [marker.generation, marker.status]);
     generation = (await derivedSchemaAssets()).expected.generation;
     await pool.query("SELECT sessions.ingest_lazy_policy_set($1::jsonb)", [JSON.stringify({ baselineMode: "lazy-current", generation, sourceIdentitySha256: identity, controlEpoch: epoch,
       privacyBaselineSha256: "a".repeat(64), retentionContractSha256: "b".repeat(64), sourceProofSha256: "d".repeat(64), validUntil: new Date(Date.now() + 3600000).toISOString(), issuer: "relayhistory-cloud" })]);

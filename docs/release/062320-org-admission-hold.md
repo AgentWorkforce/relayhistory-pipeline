@@ -98,3 +98,8 @@ plan is approved. Re-grep `expectedGeneration|EXPECT_GENERATION|ingest_require_g
   publication bodies that 062320 replaces. It must land after 062320, re-pinned to its bodies so the copied kernels
   keep the hold check, or give its scoped entry points their own publication-class check. The classification test
   refuses any runtime-granted function left unclassified.
+  **Tracking item (062280-after-062320 rebase, open):** the proposal is NOT shippable after 062320 as written, and
+  it must be rebased onto 062320's bodies before it is proposed. Its owner is layered-sessions-pipeline. Until then
+  both of its test suites apply it on the pre-062320 schema: `publication-portable.pglite.test.ts`, and
+  `publication.postgres.test.ts` ('post-H scoped kernel proposal', which leaves out 062320 and 062340). Those suites
+  prove the proposal only on that schema, not alongside 062320. 062280 is not in the 062300-062350 window.
