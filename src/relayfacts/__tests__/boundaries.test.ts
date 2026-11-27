@@ -631,4 +631,14 @@ describe("round-5 controls", () => {
     expect(deriveState([s2], landing("2026-11-11T00:00:00.000Z"), cut).state).toBe("shipped");
     expect(deriveState([s2], landedUnknown, cut).state).toBe("shipped");
   });
+
+  test("a forge commit matching a built sha counts only when made strictly before the cut", () => {
+    const cut = "2026-11-10T00:00:00.000Z";
+    const s = { source: "claude", sessionId: "s", analyzedAt: "2026-11-01T00:00:00.000Z", startedAt: "2026-11-01T00:00:00.000Z", endedAt: "2026-11-01T01:00:00.000Z", title: "", asked: [], built: [{ kind: "commit", ref: "abc1234", what: "commit abc1234", at: "2026-11-01T00:30:00.000Z", evidence: [] }], gaps: [], rationale: [], outcomeStatuses: ["superseded"], dropped: {}, keys: { repo: "example/widgets", branches: [], prs: [], commits: [], files: [], taskRefs: [], parents: [] } } as unknown as SessionFacts;
+    const forge = (at: string) => ({ prs: [], flags: [], commits: [{ sha: "abc1234" + "0".repeat(33), at, onDefaultBranch: false }] });
+    const without = deriveState([s], { prs: [], commits: [], flags: [] }, cut);
+    expect(without).toMatchObject({ state: "superseded", basis: "analysis" });
+    for (const at of [cut, "2026-11-11T00:00:00.000Z"]) expect(deriveState([s], forge(at), cut)).toEqual(without);
+    expect(deriveState([s], forge("2026-11-01T00:30:00.000Z"), cut)).toMatchObject({ state: "in_progress", basis: "forge" });
+  });
 });

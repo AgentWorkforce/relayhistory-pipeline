@@ -90,7 +90,9 @@ export function deriveState(sessions: readonly SessionFacts[], forgeIn: ForgeFac
   // almost every analysis lists "remaining" items, so `open` gaps never make a landed feature partial.
   const openGaps = (latest?.gaps ?? []).filter((g) => g.kind === "unmet");
 
-  const commits = forge.commits.filter((c) => shas.has(c.sha) || [...shas].some((s) => c.sha.startsWith(s) || s.startsWith(c.sha)));
+  // Every forge fact counts only with a time strictly before the cut: a commit the mirror holds from later never
+  // makes a feature a forge decision, even off the default branch.
+  const commits = forge.commits.filter((c) => c.at < asOf && (shas.has(c.sha) || [...shas].some((s) => c.sha.startsWith(s) || s.startsWith(c.sha))));
   const prs = forge.prs.filter((p) => prUrls.has(p.ref.toLowerCase()) && p.at < asOf);
   const branchNames = new Set(sessions.flatMap((s) => s.keys.branches));
   // A branch counts only for work near or after the feature's first session: a branch cut from main and pushed
