@@ -456,11 +456,18 @@ prove that no event happened. A row deleted again leaves the count unchanged: `i
 removes an `upload_deletions` row on re-enable, for example. And today's 062320 watermark counts
 surviving rows of only two tables.
 
-So `releaseOnEmptyWindow` refuses (`release_watermark_partial`) until the release-side watermark is a
-durable, insert-only erasure history over every source, counted under the exclusive org key. That
-history is pending in the 062320 owner's lane, as a follow-up slot. With it, the function binds org,
-epoch and FULL cutoff, and requires a fresh proof (read at most 5 minutes before the release) and a
-`marker_attempted` hold.
+So on this head `releaseOnEmptyWindow` refuses unconditionally (`release_watermark_partial`),
+whatever the proof or its declared `watermark_kind`, and takes no watermark argument. A future release
+is a separate, reviewed consumer of the follow-up erasure-history slot in the 062320 owner's lane. It
+needs:
+- verified history coverage from the FULL cutoff through the release;
+- serialized writer checks;
+- a comparison of the dry receipt's `full_run` with its selected FULL.
+
+The history covers only events since it was installed (slot 062340). So `bridge-dry` already marks a
+proof `erasure_window_unproven` with reason `history_starts_after_cutoff` when the status declares
+`history_installed_at` later than the FULL cutoff. That shows the operator before a wave. It mirrors
+062340's own SQL refusal, and it has no effect until 062340 exists.
 
 `bridge-execute` is HELD in code (`BACKLOG_OPS_BRIDGE_EXECUTE_ENABLED`), and its tool refuses
 (`bridge_release_held`) until slot 062320 lands.

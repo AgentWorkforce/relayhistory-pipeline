@@ -23,7 +23,7 @@ import {
   backlogOpsToolArgs, type BacklogOpsMode,
 } from "../backlog-ops.ts";
 import {
-  CURRENT_RELEASE_WATERMARK, ERASURE_PROOF_MAX_AGE_MS, ERASURE_SOURCES, ERASURE_SOURCE_EXCLUSIONS, ERASURE_TABLE_NAME, ERASURE_WINDOW_SQL, epochHash,
+  ERASURE_PROOF_MAX_AGE_MS, ERASURE_SOURCES, ERASURE_SOURCE_EXCLUSIONS, ERASURE_TABLE_NAME, ERASURE_WINDOW_SQL, epochHash,
   erasureWindowProof, orgHash, releaseOnEmptyWindow, validErasureWindowProof,
 } from "../erasure-window.ts";
 import { applySupabaseSchema } from "./pglite-schema.ts";
@@ -127,6 +127,12 @@ test("the proof is empty only with every count 0, a live sealed or attempted hol
   expect(reason([row()], E2)).toBe("hold_epoch_mismatch");
   expect(reason([row({ status: status({ ...sealedHold(), state: "held", sealed_at: null }) })])).toBe("hold_not_sealed");
   expect(reason([row({ read_at_ms: String(SEALED - 1) })])).toBe("read_before_seal");
+  // 062340's history installed after the FULL cutoff does not cover it: unproven, with its own closed reason.
+  const hist = (at: unknown) => row({ status: { ...status(sealedHold()), history_installed_at: at } });
+  expect(reason([hist(new Date(CUT + 1).toISOString())])).toBe("history_starts_after_cutoff");
+  expect(erasureWindowProof(ORG, null, CUT, [hist(new Date(CUT + 1).toISOString())]).status).toBe("erasure_window_unproven");
+  expect(reason([hist(new Date(CUT - 1).toISOString())])).toBe("ok");
+  expect(erasureWindowProof(ORG, null, CUT, [hist("not a time")]).status).toBe("erasure_window_unproven");
   for (const bad of [[], [row(), row()], [row({ upload_resets: "-1" })], [row({ upload_resets: undefined })], [row({ status: "{" })], [row({ status: { hold: null } })],
     [row({ read_at_ms: "x" })]])
     expect(erasureWindowProof(ORG, null, CUT, bad).status).toBe("erasure_window_unproven");
@@ -140,31 +146,19 @@ test("the proof is empty only with every count 0, a live sealed or attempted hol
   expect(validErasureWindowProof({ ...unproven, status: "erasure_window_empty", reason: "ok" })).toBe(false);
 });
 
-test("release on an empty window: never on today's surviving-row watermark; only with a durable all-source history", () => {
-  const empty = erasureWindowProof(ORG, null, CUT, [row()]);
+test("release on an empty window: refused unconditionally on this head, whatever the proof or its declared watermark", () => {
   const attempted = { epoch: E, state: "marker_attempted" };
-  // Today's 062320 counts surviving rows of two tables: never a release (a deleted-again row escapes it).
-  expect(CURRENT_RELEASE_WATERMARK).toBe("surviving_two_tables");
-  expect(releaseOnEmptyWindow(empty, ORG, E, CUT, attempted, NOW + 1000)).toEqual({ ok: false, code: "release_watermark_partial" });
-  // The reviewer's race: an empty proof, then upload_deletions 0 -> 1 a millisecond later. Refused today at any freshness.
-  expect(releaseOnEmptyWindow(empty, ORG, E, CUT, attempted, NOW + 1)).toEqual({ ok: false, code: "release_watermark_partial" });
-  // With the history watermark (pending in the 062320 owner's lane), the remaining binding checks apply.
-  expect(releaseOnEmptyWindow(empty, ORG, E, CUT, attempted, NOW + 1000, "erasure_history_all_sources")).toEqual({ ok: true, erasures: 3 });
-  const code = (p: unknown, over: { org?: string; epoch?: string; cut?: number; hold?: { epoch: string; state: string } | null; now?: number } = {}) => {
-    const r = releaseOnEmptyWindow(p, over.org ?? ORG, over.epoch ?? E, over.cut ?? CUT, over.hold === undefined ? attempted : over.hold, over.now ?? NOW + 1000,
-      "erasure_history_all_sources");
-    return r.ok ? "ok" : r.code;
-  };
-  expect(code(erasureWindowProof(ORG, null, CUT, [row({ upload_deletions: "2" })]))).toBe("proof_not_empty");
-  expect(code(erasureWindowProof(ORG, null, CUT, []))).toBe("proof_invalid");
-  expect(code({ ...empty, extra: 1 })).toBe("proof_invalid");
-  expect(code(empty, { org: ORG2 })).toBe("proof_scope_mismatch");
-  expect(code(empty, { epoch: E2 })).toBe("proof_scope_mismatch");
-  expect(code(empty, { cut: CUT - 1 })).toBe("proof_scope_mismatch"); // the proof must start at or before the FULL cutoff
-  expect(code(empty, { now: NOW + ERASURE_PROOF_MAX_AGE_MS + 1 })).toBe("proof_stale");
-  expect(code(empty, { now: NOW - 1 })).toBe("proof_stale");
-  expect(code(empty, { hold: { epoch: E, state: "sealed" } })).toBe("hold_not_attempted");
-  expect(code(empty, { hold: null })).toBe("hold_not_attempted");
+  const today = erasureWindowProof(ORG, null, CUT, [row()]);
+  expect(today.watermark_kind).toBe("surviving_two_tables");
+  const declared = erasureWindowProof(ORG, null, CUT, [row({ status: { ...status(sealedHold()), watermark_kind: "erasure_history_all_sources" } })]);
+  expect(declared.watermark_kind).toBe("erasure_history_all_sources"); // recorded for information only
+  for (const kind of ["erasure_history", "ERASURE_HISTORY_ALL_SOURCES", true, 1])
+    expect(erasureWindowProof(ORG, null, CUT, [row({ status: { ...status(sealedHold()), watermark_kind: kind } })]).watermark_kind).toBe("surviving_two_tables");
+  for (const p of [today, declared, { ...declared, watermark_kind: "erasure_history_all_sources" }, null, {}])
+    for (const now of [NOW + 1, NOW + 1000])
+      expect(releaseOnEmptyWindow(p, ORG, E, CUT, attempted, now)).toEqual({ ok: false, code: "release_watermark_partial" });
+  // No seventh argument exists to assert history.
+  expect(releaseOnEmptyWindow.length).toBe(6);
 });
 
 // ---- the mode ----
