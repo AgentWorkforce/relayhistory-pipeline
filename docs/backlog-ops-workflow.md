@@ -26,6 +26,8 @@ See [decision 0005](decisions/0005-s3-native-upload-ledger.md), "The buffered ba
 | `drain-dry` | nothing | none |
 | `drain-execute` | canonical layout, index, re-arm and drained markers | `DRY <drain-dry run> BACKFILL <backfill-execute run> EXPORT <export-execute run>`, or with a refresh `DRY <drain-dry run> BACKFILL <backfill-refresh-execute run> FULL <backfill-execute run> EXPORT <export-execute run>` |
 | `presence-dry` | nothing (dry only; there is no `presence-execute`) | none |
+| `marker-dry` | nothing (per org: the 062320 hold, attestations, sweeper, bound evidence; the wave id) | `AUTHORITY`, `BACKFILL`, `FULL`, `RESHARD` (no confirmation) |
+| `marker-execute` (held) | the per-org fence-authority markers, under each org's enforced hold | `DRY <marker-dry> BACKFILL .. FULL .. RESHARD .. AUTHORITY .. WAVE <wave_id>` |
 
 The confirmation is exactly `<MODE uppercase> <sha> DRY <id> [BACKFILL <id>] [FULL <id>] [EXPORT <id>]`, for example
 `DRAIN-EXECUTE <sha> DRY 111 BACKFILL 222 FULL 444 EXPORT 333`, `BACKFILL-REFRESH-EXECUTE <sha> DRY 555` or
@@ -597,6 +599,93 @@ positive erasure set is not wired to a mode. Only the empty-window path above is
   `bridge_complete`, pages the owner named by configuration (`BACKLOG_OPS_HOLD_ALARM_OWNER`, an Agent
   Relay name; for this rollout, claude-cloud-cloud-b1). The 60-minute bound exists because publication
   for the org is refused while it is sealed. The alarm carries the org's hash only.
+
+## Marker publication (marker-dry, marker-execute) and org waves
+
+`marker-execute` is **held in code** (`BACKLOG_OPS_MARKER_EXECUTE_ENABLED`, refused `backlog_ops_marker_held` before
+any GitHub read). It writes nothing until a reviewed commit flips it, and that flip, installing and sealing a hold, and
+every dispatch against production each need Khaliq's explicit OK. Contract: `src/session-ingest/marker-publication.ts`;
+tool: `scripts/backlog-marker.ts`.
+
+**Authority is the 062320 hold, not the evidence.** While an org's hold is `sealed` or `marker_attempted`, slot 062320
+refuses every admission (RH042) and publication for it, and the state machine only moves forward (a released hold
+never comes back). The bound live evidence (authority-evidence.ts) stays corroboration. Per org, `marker-execute`:
+
+1. reads the hold: a live hold at the epoch `marker-dry` recorded, `sealed` (or `marker_attempted` on a retry). Else
+   that org is refused before any write (`hold_absent`, `hold_released`, `hold_not_sealed`, `hold_epoch_changed`).
+2. checks every marker field's attestation and that no marker this epoch cannot own is already there;
+3. commits `_marker_attempt(org, epoch, sha256(final catch-up receipt bytes))`. **This is the point of no return:**
+   after it only `bridge_complete` releases, so any later failure leaves the org held, and a rerun retries it;
+4. opens a READ COMMITTED READ ONLY transaction and takes the org key SHARED (`_check(org, 'erasure')`, never refused;
+   erasures still proceed). It re-reads the hold, which must be `marker_attempted` at the same epoch. While this
+   transaction is open, no `_release` (EXCLUSIVE) can commit: a concurrent release waits for the publication. A
+   release that committed before the lock refuses the org (`hold_released_before_put`) with nothing written;
+5. GETs the marker. If absent, it PUTs create-only (`If-None-Match`) and reads it back. If present, it adopts it only
+   when this epoch wrote it (below); otherwise `marker_conflict`, never overwritten. Each S3 call is bounded at 60 s
+   (a timeout is `marker_put_unknown`: the org stays held and a retry adopts or writes);
+6. re-reads the hold in the same transaction after the PUT. Still `marker_attempted` at the epoch proves the hold was
+   live from before the PUT to after it. If the transaction was lost, a fresh read that still shows the hold live
+   is the same proof. A released hold is `marker_hold_lapsed` and needs the hold owner.
+
+**Attestations** (every field of `validOrgFenceAuthority`; any missing refuses `attestation_missing`):
+
+| Field | Attested by |
+| --- | --- |
+| `fenceBackfill`, `ownershipBackfill`, `revisionBackfill` | the section complete with failed 0 in BOTH the FULL and the final catch-up |
+| `controlMirror: on` | the bound evidence: every serving Worker version has `INGEST_S3_FENCE_MIRROR=on` |
+| `rearmSweeper: live` | `freshSweeperPass` for the org against the serving sweeper's spec |
+| `revisionLayout: 4096` | the bound reshard-dry verified that org (missing, invalid and failed 0) |
+| `workerHttpAdmission: off` | the bound evidence (stop, queue drained, SQL quiet, turns on Neon) AND the hold enforcing it |
+
+**Retry and adoption.** A rerun binds the same `marker-dry` and wave. `_marker_attempt` is idempotent at the same
+epoch. An existing marker is adopted only when all of these hold:
+- it is valid for this org;
+- the hold is `marker_attempted` at the approved epoch;
+- its `writtenAtMs` lies between the epoch's first attempt minus 2 min (runner versus database clock) and now plus 2 min;
+- no other epoch of the org ever recorded a marker attempt.
+
+Anything else is a conflict.
+
+**Bindings and order** (scoped runs only, all at one commit, every scope exact):
+
+| Mode | Binds | Confirmation |
+| --- | --- | --- |
+| `marker-dry` | `AUTHORITY` the authority-dry, `BACKFILL` the catch-up that took the baseline (under 3 h), `FULL` its FULL, `RESHARD` a reshard-dry after the catch-up | none |
+| `marker-execute` | the same four, plus `DRY` the marker-dry (created after the reshard-dry) and the input `wave_id` | `MARKER-EXECUTE <sha> DRY <dry> BACKFILL <catch-up> FULL <full> RESHARD <reshard> AUTHORITY <authority-dry> WAVE <wave_id>` |
+
+The marker-execute's DRY must have recorded exactly the same four runs (`backlog_ops_bound_marker_runs`), and its
+`wave_id` must equal the input (`backlog_ops_bound_marker_wave`).
+
+### Org waves
+
+A wave is one scoped sequence over up to 64 orgs (`BACKLOG_OPS_ORGS`): FULL, catch-up, reshard verify, marker, drain.
+It is unchanged for one org. The per-org tools give each org its own verdict, at most `--concurrency` orgs at once
+(`src/session-ingest/org-wave.ts`). The marker defaults to 8 and the reshard verify to 4; at most 16. One org's
+refusal or error never stops or changes another's. FULL, the catch-up and the drain already take the whole scope in
+one run, as before; their receipts stay wave-level.
+
+**The approval is pinned to the wave.** `marker-dry` records `wave_id`, a hash over the commit, the scope id, the four
+bound runs and each READY org's hold epoch hash. `marker-execute` names it in its confirmation, so the environment
+approval covers exactly those orgs at exactly those epochs. The execute recomputes it (`marker_wave_mismatch`), acts on
+those orgs only (any other scope org is `not_in_wave`), and refuses an org whose epoch moved. `marker-dry` succeeds
+when at least one org is ready (`marker_wave_partial` names how many); `marker-execute` succeeds only when every wave
+org is published or adopted. Otherwise `marker_wave_incomplete`, and a rerun retries.
+
+The wave-level prerequisites stay wave-level: the authority-dry and the catch-up's baseline must pass for every
+scope org (the evidence module's own rule). Drop an org that fails them and rerun the sequence for the smaller scope.
+
+**Logs.** No org id is a dispatch input, part of a run-name, or in a log line or receipt. `wave_id` is a hash, the
+scope reaches the tools only from the secret, every scope org is masked (`::add-mask::`) before any tool runs, no
+`run:` script expands an expression (`${{ }}`), and the marker tool prints only its counts-only line. Refusals carry
+fixed codes, never messages.
+
+**reshard-verify** (read only): the workflow's `reshard-dry` now verifies the orgs in a bounded parallel wave
+(`reshard-wave.ts`; same verify, same receipt). For an operator check outside the workflow:
+`bun scripts/backlog-reshard-verify.ts --bucket <locker> --region <r> < {"orgs": [...]}`. Run it with the read-only
+role; the orgs come on stdin, never argv. It binds nothing.
+
+**Not built here:** installing and sealing a hold (`_install`, `_seal`, and 062340's `_bind`) as a mode, and the
+bridge release (`bridge-execute`, held). A marker needs the org's hold already sealed.
 
 ## Gates
 

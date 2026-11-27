@@ -28,9 +28,9 @@ import {
   CLOUDFLARE_TOKEN,
   authorityExecute,
   cloudflareGet,
-  reshardVerifyOrgs,
   toReceiptShape,
 } from "../src/session-ingest/backlog-authority.ts";
+import { reshardVerifyWave } from "../src/session-ingest/reshard-wave.ts";
 import { assertToolLedgerHome, toolLedgerBucket, toolStores } from "../src/session-ingest/ledger-tool-store.ts";
 import { ERASURE_WINDOW_SQL, erasureWindowProof } from "../src/session-ingest/erasure-window.ts";
 
@@ -143,7 +143,8 @@ export async function main(argv: readonly string[], env: NodeJS.ProcessEnv): Pro
     const ledgerBucket = toolLedgerBucket(env, { bucket: args.bucket!, region: args.region! });
     const stores = toolStores({ env, bucket: args.bucket!, region: args.region!, keyRoot: BACKLOG_AUTHORITY_KEY_ROOT, credentials: awsCredentials(env), ledgerBucket });
     await assertToolLedgerHome(stores, BACKLOG_AUTHORITY_KEY_ROOT, args.bucket!, env);
-    const summary = await reshardVerifyOrgs(stores.store, BACKLOG_AUTHORITY_KEY_ROOT, args.orgs);
+    // Bounded parallel per org (org-wave.ts), each org's verify unchanged (reshardVerifyOrgs) and its verdict its own.
+    const summary = await reshardVerifyWave(stores.store, BACKLOG_AUTHORITY_KEY_ROOT, args.orgs);
     return { summary, ok: summary.verify_passed };
   }
   if (args.command === "bridge-release") fail("bridge_release_held");

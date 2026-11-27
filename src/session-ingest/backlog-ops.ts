@@ -105,6 +105,14 @@
  *                      HELD (BACKLOG_OPS_AUTHORITY_EXECUTE_ENABLED, refused backlog_ops_authority_held before any read).
  *   backfill-catchup-* may add AUTHORITY <authority-dry>: the catch-up then runs authorityBaseline in its input snapshot.
  * Every authority receipt records the ledger target (BACKLOG_OPS_LEDGER_ID_TOOLS) and binds the same, exact scope.
+ *
+ * Marker (src/session-ingest/marker-publication.ts; docs/backlog-ops-workflow.md "Marker publication"), scoped runs only:
+ *   marker-dry      AUTHORITY <authority-dry> BACKFILL <backfill-catchup-execute> FULL <backfill-execute> RESHARD <reshard-dry>
+ *                   (no confirmation): per org, the 062320 hold, the attestations and the bound evidence, read-only;
+ *                   records each ready org's hold epoch hash and the wave id over them.
+ *   marker-execute  DRY <marker-dry> BACKFILL .. FULL .. RESHARD .. AUTHORITY .. WAVE <wave id>, binding exactly the runs
+ *                   its marker-dry bound; publishes each wave org's marker under its enforced hold. HELD
+ *                   (BACKLOG_OPS_MARKER_EXECUTE_ENABLED, refused backlog_ops_marker_held before any read).
  */
 import { createHash } from "node:crypto";
 
@@ -115,7 +123,7 @@ export const BACKLOG_OPS_WORKFLOW = ".github/workflows/backlog-ops.yml";
 export const BACKLOG_OPS_MODES = [
   "backfill-dry", "backfill-execute", "export-dry", "export-execute", "drain-dry", "drain-execute", "presence-dry",
   "backfill-refresh-dry", "backfill-refresh-execute", "backfill-catchup-dry", "backfill-catchup-execute",
-  "reshard-dry", "authority-dry", "authority-execute", "bridge-dry", "bridge-execute",
+  "reshard-dry", "authority-dry", "authority-execute", "bridge-dry", "bridge-execute", "marker-dry", "marker-execute",
 ] as const;
 export type BacklogOpsMode = (typeof BACKLOG_OPS_MODES)[number];
 /** The backfill's fences+ownership refresh (its tool is `backfill`; see the header). */
@@ -133,7 +141,7 @@ export const BACKLOG_OPS_FINGERPRINT_FIELDS = [
   "revisions_count", "revisions_max_updated_ms", "revisions_hash", "ownership_count", "ownership_hash",
   "slots_owned_count", "slots_revision_sum", "slots_hash",
 ] as const;
-export type BacklogOpsTool = "backfill" | "export" | "drain" | "presence" | "reshard" | "authority" | "bridge";
+export type BacklogOpsTool = "backfill" | "export" | "drain" | "presence" | "reshard" | "authority" | "bridge" | "marker";
 /** Tools with a dry mode only: no `<tool>-execute` exists, is accepted or can be enabled (refused `backlog_ops_<tool>_dry_only`). */
 export const BACKLOG_OPS_DRY_ONLY_TOOLS: readonly BacklogOpsTool[] = ["presence", "reshard"];
 /**
@@ -143,7 +151,7 @@ export const BACKLOG_OPS_DRY_ONLY_TOOLS: readonly BacklogOpsTool[] = ["presence"
  */
 export const BACKLOG_OPS_AUTHORITY_EXECUTE_ENABLED: boolean = false;
 /** The tools that only run on a scoped run (BACKLOG_OPS_ORGS set): their verdicts are per org. */
-export const BACKLOG_OPS_SCOPED_TOOLS: readonly BacklogOpsTool[] = ["reshard", "authority", "bridge"];
+export const BACKLOG_OPS_SCOPED_TOOLS: readonly BacklogOpsTool[] = ["reshard", "authority", "bridge", "marker"];
 /**
  * bridge-execute (the admission hold's bridge_complete release, hold-bridge.ts / erasure-window.ts) has its own hold:
  * refused `backlog_ops_bridge_held` before any GitHub read until a reviewed commit flips it, after slot 062320 lands.
@@ -151,6 +159,16 @@ export const BACKLOG_OPS_SCOPED_TOOLS: readonly BacklogOpsTool[] = ["reshard", "
 export const BACKLOG_OPS_BRIDGE_EXECUTE_ENABLED: boolean = false;
 /** The bridge modes: bridge-dry reads each org's erasure-window proof; bridge-execute (held) would release on it. */
 export const isBridge = (mode: BacklogOpsMode) => mode.startsWith("bridge-");
+/**
+ * marker-execute (the per-org fence-authority marker under the org's enforced 062320 admission hold,
+ * marker-publication.ts) has its own hold: refused `backlog_ops_marker_held` before any GitHub read until a reviewed
+ * commit flips it (after the hold is installed and sealed for a wave under Khaliq's explicit OK).
+ */
+export const BACKLOG_OPS_MARKER_EXECUTE_ENABLED: boolean = false;
+/** The marker modes (marker-publication.ts): marker-dry reads readiness and pins the wave; marker-execute (held) publishes. */
+export const isMarker = (mode: BacklogOpsMode) => mode.startsWith("marker-");
+/** A wave id (org-wave.ts waveId): the marker-execute confirmation's `WAVE` token. */
+const WAVE_ID = /^h_[0-9a-f]{32}$/u;
 /** The receipt artifact of every run (retention 30 days) and its single file. */
 export const BACKLOG_OPS_RECEIPT_ARTIFACT = "backlog-ops-receipt";
 export const BACKLOG_OPS_RECEIPT_FILE = "backlog-ops-receipt.json";
@@ -246,16 +264,22 @@ export interface BacklogOpsDispatch {
    * passes no flag, so the argv is byte-identical to before.
    */
   slotPaceMs: number | null;
+  /**
+   * marker-execute only (required, BACKLOG_OPS_WAVE_ID, input wave_id): the wave id its marker-dry recorded
+   * (org-wave.ts waveId over the commit, scope, bound runs and each ready org's hold epoch). The confirmation names it
+   * (`WAVE <id>`), so the environment approval covers exactly that wave.
+   */
+  waveId?: string | null;
   confirmation: string;
 }
 
 /** The typed binding an execute must carry, exactly. */
 export function backlogOpsConfirmation(d: Pick<BacklogOpsDispatch, "mode" | "sha" | "dryRun" | "backfillRun" | "exportRun"> &
-  Partial<Pick<BacklogOpsDispatch, "fullBackfillRun" | "reshardRun" | "authorityRun">>): string {
+  Partial<Pick<BacklogOpsDispatch, "fullBackfillRun" | "reshardRun" | "authorityRun" | "waveId">>): string {
   return [d.mode.toUpperCase(), d.sha, "DRY", d.dryRun,
     ...(d.backfillRun ? ["BACKFILL", d.backfillRun] : []), ...(d.fullBackfillRun ? ["FULL", d.fullBackfillRun] : []),
     ...(d.exportRun ? ["EXPORT", d.exportRun] : []), ...(d.reshardRun ? ["RESHARD", d.reshardRun] : []),
-    ...(d.authorityRun ? ["AUTHORITY", d.authorityRun] : [])].join(" ");
+    ...(d.authorityRun ? ["AUTHORITY", d.authorityRun] : []), ...(d.waveId ? ["WAVE", d.waveId] : [])].join(" ");
 }
 
 /** The dispatch inputs, checked before any GitHub read or credential. */
@@ -264,6 +288,7 @@ export function backlogOpsDispatch(
   enabled: boolean = BACKLOG_OPS_EXECUTE_ENABLED,
   authorityEnabled: boolean = BACKLOG_OPS_AUTHORITY_EXECUTE_ENABLED,
   bridgeEnabled: boolean = BACKLOG_OPS_BRIDGE_EXECUTE_ENABLED,
+  markerEnabled: boolean = BACKLOG_OPS_MARKER_EXECUTE_ENABLED,
 ): BacklogOpsDispatch {
   const mode = env.BACKLOG_OPS_MODE ?? "", sha = env.BACKLOG_OPS_SHA ?? "";
   // A dry-only tool's execute is not a mode: refused with its own code, before the dormant switch is even read.
@@ -272,13 +297,15 @@ export function backlogOpsDispatch(
     exportRun = env.BACKLOG_OPS_EXPORT_RUN ?? "", maxObjects = env.BACKLOG_OPS_MAX_OBJECTS ?? "",
     fullBackfillRun = env.BACKLOG_OPS_FULL_BACKFILL_RUN ?? "", confirmation = env.BACKLOG_OPS_CONFIRMATION ?? "",
     slotsReadRaw = env.BACKLOG_OPS_SLOTS_READ ?? "", slotPaceRaw = env.BACKLOG_OPS_SLOT_PACE_MS ?? "",
-    reshardRun = env.BACKLOG_OPS_RESHARD_RUN ?? "", authorityRun = env.BACKLOG_OPS_AUTHORITY_RUN ?? "";
+    reshardRun = env.BACKLOG_OPS_RESHARD_RUN ?? "", authorityRun = env.BACKLOG_OPS_AUTHORITY_RUN ?? "", waveId = env.BACKLOG_OPS_WAVE_ID ?? "";
   if (!(BACKLOG_OPS_MODES as readonly string[]).includes(mode) || !SHA40.test(sha)) refuse("backlog_ops_inputs");
   const m = mode as BacklogOpsMode, tool = toolOf(m), execute = isExecute(m);
   if (execute && enabled !== true) refuse("backlog_ops_dormant");
   if (m === "authority-execute" && authorityEnabled !== true) refuse("backlog_ops_authority_held");
   if (m === "bridge-execute" && bridgeEnabled !== true) refuse("backlog_ops_bridge_held");
-  const wantsBackfill = execute && tool !== "backfill" && tool !== "bridge", wantsExport = execute && tool === "drain";
+  if (m === "marker-execute" && markerEnabled !== true) refuse("backlog_ops_marker_held");
+  // A marker mode binds the catch-up (BACKFILL) whose baseline the evidence is bound to, dry or execute.
+  const wantsBackfill = (execute && tool !== "backfill" && tool !== "bridge") || isMarker(m), wantsExport = execute && tool === "drain";
   // reshard-dry may bind the completed catch-up it verifies after (BACKFILL, optional; authority-execute requires it).
   const mayBackfill = m === "reshard-dry";
   if (execute ? !RUN_ID.test(dryRun) : dryRun !== "") refuse("backlog_ops_dry_run");
@@ -286,11 +313,14 @@ export function backlogOpsDispatch(
   if (wantsExport ? !RUN_ID.test(exportRun) : exportRun !== "") refuse("backlog_ops_export_run");
   // FULL: optional on drain-execute (absent = the drain's backfill is a full one, as before), required on a catch-up and
   // on authority-execute, refused everywhere else.
-  if (isCatchup(m) || m === "authority-execute" || isBridge(m) ? !RUN_ID.test(fullBackfillRun) : fullBackfillRun !== "" && (m !== "drain-execute" || !RUN_ID.test(fullBackfillRun)))
+  if (isCatchup(m) || m === "authority-execute" || isBridge(m) || isMarker(m) ? !RUN_ID.test(fullBackfillRun) : fullBackfillRun !== "" && (m !== "drain-execute" || !RUN_ID.test(fullBackfillRun)))
     refuse("backlog_ops_full_backfill_run");
   // RESHARD: authority-execute only, required. AUTHORITY: a catch-up only, optional.
-  if (m === "authority-execute" ? !RUN_ID.test(reshardRun) : reshardRun !== "") refuse("backlog_ops_reshard_run");
-  if (authorityRun !== "" && (!isCatchup(m) || !RUN_ID.test(authorityRun))) refuse("backlog_ops_authority_run");
+  if (m === "authority-execute" || isMarker(m) ? !RUN_ID.test(reshardRun) : reshardRun !== "") refuse("backlog_ops_reshard_run");
+  // AUTHORITY: a catch-up (optional) or a marker mode (required: the authority-dry the catch-up's baseline names).
+  if (isMarker(m) ? !RUN_ID.test(authorityRun) : authorityRun !== "" && (!isCatchup(m) || !RUN_ID.test(authorityRun))) refuse("backlog_ops_authority_run");
+  // WAVE: marker-execute only, required.
+  if (m === "marker-execute" ? !WAVE_ID.test(waveId) : waveId !== "") refuse("backlog_ops_wave_id");
   let budget: number | null = null;
   if (maxObjects !== "") {
     if (tool !== "drain" || !/^[1-9][0-9]{0,6}$/u.test(maxObjects) || Number(maxObjects) > BACKLOG_OPS_MAX_OBJECTS_CEILING)
@@ -307,7 +337,8 @@ export function backlogOpsDispatch(
   if (new Set(runs).size !== runs.length) refuse("backlog_ops_bindings");
   const d: BacklogOpsDispatch = { mode: m, sha, dryRun: execute ? dryRun : null, backfillRun: wantsBackfill || (mayBackfill && backfillRun !== "") ? backfillRun : null,
     exportRun: wantsExport ? exportRun : null, fullBackfillRun: fullBackfillRun === "" ? null : fullBackfillRun,
-    reshardRun: reshardRun === "" ? null : reshardRun, authorityRun: authorityRun === "" ? null : authorityRun, maxObjects: budget, slotsRead, slotPaceMs, confirmation };
+    reshardRun: reshardRun === "" ? null : reshardRun, authorityRun: authorityRun === "" ? null : authorityRun, maxObjects: budget, slotsRead, slotPaceMs,
+    ...(m === "marker-execute" ? { waveId } : {}), confirmation };
   if (execute ? confirmation !== backlogOpsConfirmation(d) : confirmation !== "") refuse("backlog_ops_confirmation");
   return d;
 }
@@ -350,7 +381,7 @@ export const BACKLOG_OPS_LEDGER_TOOLS: readonly BacklogOpsTool[] = ["backfill", 
  * and the authority modes (which take no ledger bucket themselves but bind the backfills and the reshard verify that
  * ran against it: the marker is written over exactly that ledger).
  */
-export const BACKLOG_OPS_LEDGER_ID_TOOLS: readonly BacklogOpsTool[] = [...BACKLOG_OPS_LEDGER_TOOLS, "authority", "bridge"];
+export const BACKLOG_OPS_LEDGER_ID_TOOLS: readonly BacklogOpsTool[] = [...BACKLOG_OPS_LEDGER_TOOLS, "authority", "bridge", "marker"];
 
 /**
  * The ledger variables every S3 tool child gets (the backfill, the export and the drain; never presence-dry, which
@@ -491,7 +522,7 @@ export const BACKLOG_OPS_PRESENCE_TIMEOUT = ["--statement-timeout-ms", "60000", 
  */
 export function backlogOpsRevisionsSince(env: Record<string, string | undefined>, d: Pick<BacklogOpsDispatch, "mode" | "fullBackfillRun">, now = Date.now()): number | null {
   const raw = env.BACKLOG_OPS_REVISIONS_SINCE_MS ?? "";
-  const wanted = isCatchup(d.mode) || isBridge(d.mode) || ((d.mode === "drain-execute" || d.mode === "authority-execute") && d.fullBackfillRun !== null);
+  const wanted = isCatchup(d.mode) || isBridge(d.mode) || isMarker(d.mode) || ((d.mode === "drain-execute" || d.mode === "authority-execute") && d.fullBackfillRun !== null);
   if (!wanted) {
     if (raw !== "") refuse("backlog_ops_revisions_since");
     return null;
@@ -525,6 +556,12 @@ export function backlogOpsToolArgs(d: BacklogOpsDispatch, t: BacklogOpsTarget, s
     // bridge-dry: each org's erasure-window proof at the FULL cutoff t, read by the tool itself; bridge-execute: held.
     return { script: "scripts/backlog-authority.ts", args: [execute ? "bridge-release" : "bridge-window", "--cutoff-ms", String(revisionsSinceMs),
       "--full-run", d.fullBackfillRun!, ...scope.orgs!.flatMap((o) => ["--org", o])], needsDb: true };
+  }
+  if (tool === "marker") {
+    // marker-dry: readiness and the wave id; marker-execute (held): the markers under the 062320 hold (scripts/backlog-marker.ts).
+    return { script: "scripts/backlog-marker.ts", args: [execute ? "execute" : "dry", "--bucket", t.bucket, "--region", t.region,
+      ...(execute ? ["--kms-key-arn", t.kmsKeyArn] : []), "--sha", d.sha, "--authority-run", d.authorityRun!, "--backfill-run", d.backfillRun!,
+      "--full-run", d.fullBackfillRun!, "--reshard-run", d.reshardRun!, ...scope.orgs!.flatMap((o) => ["--org", o])], needsDb: true };
   }
   if (tool === "authority") {
     // authority-dry: the unbound live evidence; authority-execute: the bound evidence, the sweeper, then the markers.
@@ -588,7 +625,7 @@ export function backlogOpsPresenceSession(env: Record<string, string | undefined
  */
 export function backlogOpsCloudflareToken(env: Record<string, string | undefined>, d: Pick<BacklogOpsDispatch, "mode">): string | null {
   const raw = (env.BACKLOG_OPS_CLOUDFLARE_TOKEN ?? "").trim();
-  if (toolOf(d.mode) !== "authority") {
+  if (toolOf(d.mode) !== "authority" && toolOf(d.mode) !== "marker") {
     if (raw !== "") refuse("backlog_ops_cloudflare_token_unexpected");
     return null;
   }
@@ -639,6 +676,8 @@ export interface BacklogOpsReceipt {
   full_run?: string;
   /** A reshard-dry bound to a catch-up: that catch-up's run id (it completed before this run's gate). Absent otherwise. */
   after_run?: string;
+  /** A marker mode: the reshard-dry it bound (with authority_run, full_run and after_run, its catch-up). Absent otherwise. */
+  reshard_run?: string;
   /**
    * The store-home pair's id (backlogOpsHomeId): always on an authority receipt; on every other receipt of a ledger-id
    * tool (backfill, drain) when the credential step gives it (it always does), so a FULL backfill-execute attests it.
@@ -671,6 +710,8 @@ export function backlogOpsReceipt(d: BacklogOpsDispatch, run: string, exitCode: 
     // A bridge mode: the exact FULL its cutoff came from (a later binding matches the run, not a derived time).
     ...(isBridge(d.mode) ? { full_run: d.fullBackfillRun! } : {}),
     ...(d.mode === "reshard-dry" && d.backfillRun ? { after_run: d.backfillRun } : {}),
+    // A marker mode: every run its wave id covers (a marker-execute checks its marker-dry recorded exactly its own).
+    ...(isMarker(d.mode) ? { authority_run: d.authorityRun!, full_run: d.fullBackfillRun!, after_run: d.backfillRun!, reshard_run: d.reshardRun! } : {}),
     ...(home !== null ? { home } : {}), exitCode, summary };
 }
 
@@ -771,6 +812,15 @@ export function backlogOpsBindings(d: BacklogOpsDispatch): BacklogOpsBinding[] {
     if (!d.fullBackfillRun || d.backfillRun || d.exportRun || d.reshardRun || d.authorityRun || (d.mode === "bridge-dry") !== (d.dryRun === null)) refuse("backlog_ops_bindings");
     return [...(d.dryRun ? [{ run: d.dryRun, mode: "bridge-dry" as BacklogOpsMode, kind: "dry" as const }] : []),
       { run: d.fullBackfillRun, mode: "backfill-execute", kind: "full" }];
+  }
+  if (isMarker(d.mode)) {
+    // AUTHORITY the authority-dry the catch-up's baseline names, BACKFILL that catch-up, FULL its FULL, RESHARD the
+    // reshard verify after it; marker-execute also its marker-dry (DRY).
+    if (!d.authorityRun || !d.backfillRun || !d.fullBackfillRun || !d.reshardRun || d.exportRun || (d.mode === "marker-dry") !== (d.dryRun === null))
+      refuse("backlog_ops_bindings");
+    return [...(d.dryRun ? [{ run: d.dryRun, mode: "marker-dry" as BacklogOpsMode, kind: "dry" as const }] : []),
+      { run: d.authorityRun, mode: "authority-dry", kind: "authority" }, { run: d.backfillRun, mode: "backfill-catchup-execute", kind: "backfill" },
+      { run: d.fullBackfillRun, mode: "backfill-execute", kind: "full" }, { run: d.reshardRun, mode: "reshard-dry", kind: "reshard" }];
   }
   if (d.mode === "authority-execute") {
     // DRY the authority-dry (unbound evidence), BACKFILL the catch-up that ran the baseline, FULL the catch-up's FULL,

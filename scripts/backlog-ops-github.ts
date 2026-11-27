@@ -40,6 +40,7 @@ import {
   BACKLOG_OPS_AUTHORITY_EXECUTE_ENABLED,
   BACKLOG_OPS_BRIDGE_EXECUTE_ENABLED,
   BACKLOG_OPS_EXECUTE_ENABLED,
+  BACKLOG_OPS_MARKER_EXECUTE_ENABLED,
   BACKLOG_OPS_FRESH_BACKFILL_MS,
   BACKLOG_OPS_RECEIPT_ARTIFACT,
   BACKLOG_OPS_WORKFLOW,
@@ -48,6 +49,7 @@ import {
   backlogOpsEnvironment,
   backlogOpsRunName,
   isCatchup,
+  isMarker,
   refuseBacklogOps as refuse,
 } from "../src/session-ingest/backlog-ops.ts";
 import {
@@ -65,10 +67,10 @@ export async function backlogOpsGithubGate(
   env: Record<string, string | undefined>,
   get: Get,
   approved = false,
-  options: { enabled?: boolean; authorityEnabled?: boolean; bridgeEnabled?: boolean; now?: number } = {},
+  options: { enabled?: boolean; authorityEnabled?: boolean; bridgeEnabled?: boolean; markerEnabled?: boolean; now?: number } = {},
 ) {
   const input = backlogOpsDispatch(env, options.enabled ?? BACKLOG_OPS_EXECUTE_ENABLED, options.authorityEnabled ?? BACKLOG_OPS_AUTHORITY_EXECUTE_ENABLED,
-    options.bridgeEnabled ?? BACKLOG_OPS_BRIDGE_EXECUTE_ENABLED);
+    options.bridgeEnabled ?? BACKLOG_OPS_BRIDGE_EXECUTE_ENABLED, options.markerEnabled ?? BACKLOG_OPS_MARKER_EXECUTE_ENABLED);
   const now = options.now ?? Date.now();
   if (env.GITHUB_REPOSITORY !== S.repository || env.GITHUB_REPOSITORY_ID !== PRIVATE_INGEST_RELEASE.repositoryId ||
       env.GITHUB_EVENT_NAME !== "workflow_dispatch" || env.GITHUB_REF !== "refs/heads/main" ||
@@ -94,7 +96,8 @@ export async function backlogOpsGithubGate(
     const bound = await get(base + "/actions/runs/" + b.run);
     const at = Date.parse(bound.created_at);
     // The drain's BACKFILL and authority-execute's catch-up must be fresh (3 h); everything else under 24 h.
-    const maxAge = b.kind === "backfill" && (input.mode === "drain-execute" || input.mode === "authority-execute") ? BACKLOG_OPS_FRESH_BACKFILL_MS : BACKLOG_OPS_BINDING_MAX_AGE_MS;
+    const maxAge = b.kind === "backfill" && (input.mode === "drain-execute" || input.mode === "authority-execute" || isMarker(input.mode))
+      ? BACKLOG_OPS_FRESH_BACKFILL_MS : BACKLOG_OPS_BINDING_MAX_AGE_MS;
     if (String(bound.id) !== b.run || String(bound.id) === env.GITHUB_RUN_ID || bound.path !== BACKLOG_OPS_WORKFLOW ||
         bound.head_sha !== input.sha || bound.head_branch !== "main" || bound.event !== "workflow_dispatch" ||
         bound.run_attempt !== 1 || bound.status !== "completed" || bound.conclusion !== "success" ||
@@ -121,6 +124,13 @@ export async function backlogOpsGithubGate(
   if (input.mode === "authority-execute" && !(created.dry! < created.backfill!)) refuse("backlog_ops_gate_order");
   // The reshard verify ran after the catch-up (it verifies the state the marker would cover).
   if (input.mode === "authority-execute" && !(created.reshard! > created.backfill!)) refuse("backlog_ops_gate_reshard_order");
+  // A marker mode: the evidence module's order (authority-dry and FULL before the catch-up that ran the baseline), the
+  // reshard verify after that catch-up, and marker-execute's marker-dry after the reshard verify (it read the state the
+  // markers cover, last).
+  if (isMarker(input.mode) && !(created.full! < created.backfill!)) refuse("backlog_ops_gate_full_order");
+  if (isMarker(input.mode) && !(created.authority! < created.backfill!)) refuse("backlog_ops_gate_order");
+  if (isMarker(input.mode) && !(created.reshard! > created.backfill!)) refuse("backlog_ops_gate_reshard_order");
+  if (input.mode === "marker-execute" && !(created.dry! > created.reshard!)) refuse("backlog_ops_gate_order");
   // A catch-up's AUTHORITY: created before the catch-up's own DRY when it is an execute (the evidence it hands the baseline
   // existed before either catch-up run started).
   if (input.mode === "backfill-catchup-execute" && created.authority !== undefined && !(created.authority < created.dry!)) refuse("backlog_ops_gate_order");

@@ -20,6 +20,8 @@ type S =
   | { nullable: S }
   | { list: S; max: number }
   | { obj: Record<string, S>; optional?: readonly string[] };
+/** The schema language, for other receipt kinds built on these leaves (marker-publication.ts). */
+export type ReceiptSchema = S;
 
 const COUNT = "count" as const, BOOL = "bool" as const, HASH = "hash" as const, DIGEST = "digest" as const;
 const codes = (...c: readonly string[]): S => ({ code: new Set(c) });
