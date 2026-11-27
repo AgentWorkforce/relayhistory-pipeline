@@ -154,7 +154,7 @@ export function backlogOpsChildSpawn(
 /** What the authority bindings hand the tool: an authority-dry's evidence (a catch-up), a catch-up's baseline (authority-execute). */
 export interface BoundAuthority { evidence?: unknown; baseline?: unknown; /** A bridge mode: sha256 of the bound FULL receipt's exact bytes. */ fullEvidence?: string }
 export function checkBoundReceipts(env: Record<string, string | undefined>, d: BacklogOpsDispatch, read = (p: string) => readFileSync(p, "utf8"),
-  revisionsSinceMs: number | null = backlogOpsRevisionsSince(env, d)): BoundAuthority {
+  revisionsSinceMs: number | null = backlogOpsRevisionsSince(env, d), readBytes: (p: string) => Uint8Array = (p: string) => readFileSync(p)): BoundAuthority {
   const paths = backlogOpsPaths(env), scopeFull = backlogOpsScope(env), scope = scopeFull.id;
   // Path B's id from this run's environment: an export-execute's DRY and a drain-execute's EXPORT must have recorded it.
   const nhpId = backlogOpsNoHeadParity(env, d, scopeFull)?.id ?? BACKLOG_OPS_NO_HEAD_PARITY_NONE;
@@ -210,7 +210,12 @@ export function checkBoundReceipts(env: Record<string, string | undefined>, d: B
     if (d.mode === "authority-execute" && b.kind === "backfill") authority.baseline = checkBaselineReceipt(raw, orgs!, d.dryRun!, d.fullBackfillRun!);
     // A bridge mode: the bound FULL receipt's sha256 (over its exact downloaded bytes), compared by the tool to the
     // 062340 binding's selected_full.evidence_sha256 (the seal's evidence).
-    if (isBridge(d.mode) && b.kind === "full") authority.fullEvidence = createHash("sha256").update(raw, "utf8").digest("hex");
+    if (isBridge(d.mode) && b.kind === "full") {
+      // Over the file's exact bytes (read without decoding), and those bytes must be what was parsed and checked.
+      const bytes = readBytes(path);
+      if (Buffer.compare(Buffer.from(bytes), Buffer.from(raw, "utf8")) !== 0) refuse("backlog_ops_bound_full_receipt");
+      authority.fullEvidence = createHash("sha256").update(bytes).digest("hex");
+    }
   }
   if (d.mode === "drain-execute" && d.fullBackfillRun !== null) {
     if (raws.full === undefined || raws.backfill === undefined) refuse("backlog_ops_bound_full_missing");

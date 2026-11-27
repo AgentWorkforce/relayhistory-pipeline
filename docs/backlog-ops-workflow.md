@@ -488,6 +488,24 @@ independent and has its own closed reason:
 - `covered` and `recording` hold (`history_not_covering_cutoff`, `history_not_recording`), and
   `by_source` sums to `erasures`, which is 0 for an empty window.
 
+**Contract for the seal and bind callers.** No caller exists at this head. Whoever writes the post-seal
+bridge step (authority-execute, or the cutover runbook) must keep to these values exactly, and that step's
+review must check them. A mismatch fails closed (`history_full_mismatch`).
+- `_seal(org, epoch, evidence)`: `evidence` is the lowercase hex64 sha256 over the exact bytes of the
+  bound FULL backfill-execute's `backlog-ops-receipt.json` artifact, the file as downloaded and not
+  re-encoded. SQL stores it in the `sealed` event and never hashes anything itself.
+- `_bind(org, epoch, full_run, full_started_ms, full_evidence)`:
+  - `full_run` is that FULL's GitHub run id;
+  - `full_started_ms` is that FULL run's GitHub created_at in integer ms, the same value the gate derives
+    (the cutoff plus `BACKLOG_OPS_CATCHUP_MARGIN_MS`);
+  - `full_evidence` is the same digest that was passed to `_seal`, byte for byte.
+
+  SQL requires install < start ≤ seal, so a FULL dispatched before the install committed is refused
+  (55000).
+
+The credential step computes that same digest for `bridge-dry` from the file's raw bytes, read without
+decoding. It refuses if those bytes differ from the text it parsed and checked.
+
 Separately, persistence still requires each proof's snapshot `cutoff_ms` to equal the gate-derived FULL
 cutoff. Without 062340 (062320 alone) the proof is a snapshot only. A test pins `ERASURE_SOURCES` to
 062340's `ORG_ERASURE_HISTORY_SOURCES` once that file is on the branch.

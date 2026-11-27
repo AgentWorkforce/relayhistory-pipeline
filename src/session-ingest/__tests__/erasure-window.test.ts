@@ -338,10 +338,10 @@ test("bridge-dry through the normal runner (scripts/backlog-ops.ts): the logged 
         { fetcher, runChild: async (child) => {
           expect(child.args.slice(1, 6)).toEqual(["bridge-window", "--cutoff-ms", String(CUT), "--full-run", FULL]);
           // The bound FULL receipt's sha256 over its exact downloaded bytes, on stdin only (the seal's evidence to match).
-          const raw = readFileSync(join(temp, "backlog-ops-bound", "full", "backlog-ops-receipt.json"), "utf8");
+          const raw = readFileSync(join(temp, "backlog-ops-bound", "full", "backlog-ops-receipt.json")); // exact bytes, no decoding
           const input = JSON.parse(child.input!);
           expect(Object.keys(input).sort()).toEqual(["dbUrl", "fullEvidence"]);
-          expect(input.fullEvidence).toBe(createHash("sha256").update(raw, "utf8").digest("hex"));
+          expect(input.fullEvidence).toBe(createHash("sha256").update(raw).digest("hex"));
           expect(child.args.join(" ")).not.toContain(input.fullEvidence);
           return { code: 0, stdout: JSON.stringify(s) }; } });
     } finally { console.log = log; }
@@ -461,4 +461,20 @@ test("contradictory bridge evidence is refused at validation and at persistence 
     expect(logged.summary).toEqual({ refused: "backlog_ops_receipt_schema" });
     expect(saved).toEqual(logged);
   } finally { rmSync(temp, { recursive: true, force: true }); }
+});
+
+test("the bound FULL receipt is hashed over its exact bytes; bytes that do not round-trip the checked text refuse", async () => {
+  const { checkBoundReceipts } = await import("../../../scripts/backlog-ops.ts");
+  const { backlogOpsDispatch, BACKLOG_OPS_RECEIPT_CONTRACT: C } = await import("../backlog-ops.ts");
+  const home = backlogOpsHomeId({ bucket: target.BACKLOG_OPS_BUCKET, region: target.BACKLOG_OPS_REGION }, null);
+  const full = JSON.stringify({ contract: C, mode: "backfill-execute", sha, run: FULL, scope: backlogOpsScope(SCOPE).id, ledger: "none", home, exitCode: 0,
+    summary: { mode: "execute", sections: { fences: "complete", ownership: "complete", revisions: "complete" } } });
+  const e = { ...target, ...SCOPE, ...env("bridge-dry"), RUNNER_TEMP: "/tmp/rt-bh" };
+  const d = backlogOpsDispatch(e);
+  const read = () => full;
+  const exact = new TextEncoder().encode(full);
+  expect(checkBoundReceipts(e, d, read, CUT, () => exact).fullEvidence).toBe(createHash("sha256").update(exact).digest("hex"));
+  // An invalid UTF-8 byte decodes to U+FFFD in the text, so the raw bytes no longer equal the checked text: refused.
+  const bad = new Uint8Array([...exact.slice(0, -1), 0xff, 0x7d]);
+  expect(() => checkBoundReceipts(e, d, read, CUT, () => bad)).toThrow("backlog_ops_bound_full_receipt");
 });
