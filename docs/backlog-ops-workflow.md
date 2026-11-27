@@ -444,7 +444,8 @@ The proof is `erasure_window_empty` only when every count is 0, the hold is live
 `erasure_window_unproven`, and the org stays HELD for the manifest or for reconciliation.
 
 A positive set never releases. A user erase still needs `bytes_verified` and the writer-generation
-proof, and a session erase needs manifest (062330) evidence.
+proof, and a session erase needs evidence from the operator-erase replay-target manifest (its own slot,
+still to be assigned by the slot registry; 062330 belongs to the buffered-search-feed fix).
 
 The receipt has an exact schema (kind `bridge`) and carries org hashes only.
 
