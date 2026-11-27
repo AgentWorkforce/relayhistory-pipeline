@@ -1,6 +1,6 @@
 # Guarded publication retirement for user erase
 
-Draft 2 — design comparison only. **No clearance path or implementation is
+Draft 3 — design comparison only. **No clearance path or implementation is
 selected.** The combined `RH040` / `RH011` hold remains in force. This work
 covers never-published abandoned claims, not general erasure of published
 buffered sessions. It changes no SQL, grants, storage authority, or runtime.
@@ -44,16 +44,24 @@ and its `supabase/proposals/continuous-publication/062280-scoped-kernels.up.sql`
 and `062290-scoped-recover.up.sql` review components. Their bodies and grants
 must be rechecked against the actual integration heads before implementation.
 
-The kernel review's source map supplies the additional **held 062285**
-issuance/cohort interface: issuance lines 49–59 declare an admission UUID
-primary key referencing `publication_private.admission`; lines 62–68 attach
-`keep_issuance` before UPDATE, DELETE, or TRUNCATE, at statement level. Issue
-lines 175–196 and gate lines 97–129 establish the cohort-first lock order
-described below. These excerpts were supplied by the kernel co-reviewer;
-the full 062285 file/local T25 object is not available in this checkout.
-They are an explicit design input, not independently executed source evidence.
-The exact installation head, file digest, columns and trigger bodies must be
-pinned and reviewed before an implementation can pass the inventory gate.
+The kernel co-reviewer supplied the complete additional **held 062285** file
+`supabase/proposals/continuous-publication/062285-scoped-issuer.up.sql` from
+local head `4eb7dc0bee1a4755f0c432ea59d25bf920178331`, tree
+`b1d443596f696790e93f1f0a98c9f2c8ac59e8da`. Inspection-only decompression
+verified its 18,522 bytes against SHA-256
+`6cbef1d1858da63b54b1974b1126f62c5b53c838275a3caf31a2fdbbf4fce21c`.
+The author read the resulting 259-line SQL without applying it. The whole
+git object and T25 tests remain unavailable here; file inspection is not
+execution or verification of the complete tree. The co-reviewer reports
+identical issuer SQL at `26b65a58`; that second head was not independently
+checked. Qualification must still pin the actual integrated installation.
+
+This file declares the issuance admission PK/FK at lines 49–59 and the
+`keep_issuance` statement trigger before UPDATE, DELETE, or TRUNCATE at
+62–68. Issue lines 175–196 and gate lines 97–129 confirm the cohort-first
+order below. The file requires both 062280 and the 062290 fleet registry,
+despite its numeric slot sorting before the latter; never infer installation
+dependency order from the filename alone.
 
 ## 2. Why a state-only exception is insufficient
 
@@ -148,7 +156,7 @@ The minimum reference inventory is closed across SQL and embedded data:
 | Images and objects | Images reference both attempt and generation; objects reference generation. Reject any candidate image/registration and any outside JSON/key reference into the candidate namespace. |
 | Head `base_pointer`, index and derived carriers | Interpret stored JSON references and canonical/physical aliases, not just declared FKs. Reject old current/base keys, sibling/shared immutable keys, shared physical tuples, and unresolved external references. |
 | 062280 admission | Bind the original `binding`, `frontier_image`, `admission_image`, stage, attempt and lease. `enabled=false` invalidates use; it does not erase these identifiers or images. |
-| 062285 issuance | Its admission PK/FK requires the referenced admission to remain. Preserve `keep_issuance` and the original issuance evidence: no UPDATE, DELETE, TRUNCATE, cascade, reparenting to a dummy admission, or trigger bypass. |
+| 062285 issuance | `publication_private.issuance.admission` is the PK/FK to admission. It retains cohort/scope/stage and image digests, issuer OID/name, and issuance time. Preserve `keep_issuance` and the original evidence: no UPDATE, DELETE, TRUNCATE, cascade, reparenting to a dummy admission, or trigger bypass. |
 | 062290 recovery | `expired_tickets` references both admission and attempt. Explicitly account for the child before deleting an attempt, and preserve the intended recovery/audit semantics. |
 
 At terminal cleanup a scoped admission must remain disabled permanently; it
@@ -164,6 +172,11 @@ cannot be retained under the approved policy, the case remains refused.
 No issuance evidence is deleted to make erasure appear complete, and the
 receipt must truthfully distinguish permitted retained evidence from deleted
 user data. The separate 062330 retention request grants no policy here.
+Issuer names/OIDs, admission UUIDs and linkable digests are not presumed
+anonymous or exempt from that policy gate merely because issuance has no
+direct tenant/user text column. Current admission has a non-null unique stage
+UUID and binding constraints: terminal redaction must address these exact
+constraints and readers, not assume nullable fields already exist.
 
 ## 4. Lock and authority order
 
@@ -208,6 +221,9 @@ gate calls `caller_cohort()` (authenticated login `FOR SHARE OF l`) before
 `gate_unfenced` and `lock_scope_binding`. The underlying 062280 order is
 GLOBAL S via owner INSERT → USER → admission FOR UPDATE → stage/frontier/
 buffer FOR SHARE. Recovery uses that gate too.
+`ingest_publication_scoped_position_v1` also calls `caller_cohort`; although
+it returns scheduling information rather than publication authority, it is
+not a lock-free evidence reader and cannot be used inside the erase path.
 
 This draft's erase-side constraint is **no cohort/fleet/scope registry lock
 or mutation while holding GLOBAL X or USER**. Cleanup does not reauthorize
@@ -312,6 +328,10 @@ only its slash-terminated descendant prefix. A different root, owner,
 provider or generation is a refusal, not a repaired input. Include every
 generation in the accepted logical-head closure, not only `head.generation`,
 and reject shared references before treating a whole prefix as deletable.
+The inspected 062285 issuer accepts only `provider='s3'`; ordinary provider
+publication has different supported-provider checks. The target validator
+must honor the actual path's qualified provider, never expand storage support
+by accepting a generic provider string from the job.
 Use the existing exact `userErasePrefixes` machine-target construction for
 the captured user origins and legacy-export origin as the other target class.
 No bucket-wide, org-wide or bare `upload-generations/` target is executable.
@@ -435,6 +455,14 @@ including after adoption of the same user identity. This requires durable
 revocation/absence semantics in addition to lifting the temporary user fence.
 No generation-boundary proof for the hold bridge is implied by this proposal;
 that consumer stays fail-closed until separately accepted evidence exists.
+In the inspected 062285 contract, both issue and runtime gate additionally
+reject **any** `operator_user_erasures` row for the user, without a state
+filter. Consequently a recorded erase permanently blocks subsequent scoped
+issuance under that contract, including after `bytes_verified`; ordinary
+same-user adoption does not imply scoped reauthorization. Preserve that
+denial. A new-footprint acceptance test must distinguish supported ordinary
+adoption from this expected scoped refusal. Lifting it would be a separate
+kernel authorization design, not a repeat-erase fix.
 
 ## 7. Access, integration, and rollback
 
@@ -499,6 +527,8 @@ user-erase state machine, plus a versioned synthetic object store for bytes:
 - Old scoped and ordinary token calls after completion and same-user adoption
   all fail; unrelated user/session data, frontier, admission, and object
   versions remain byte-for-byte unchanged. No extra publisher/recovery grant.
+  Fresh scoped issuance after any recorded erase also refuses under 062285;
+  do not treat that permanent guard as an ordinary-adoption regression.
 - 062285 issuance/admission FK and `keep_issuance` remain intact, terminal
   admission stays disabled, and approved binding/image retention or projection
   is enforced. Unapproved retention, missing storage boundary and finite-budget
