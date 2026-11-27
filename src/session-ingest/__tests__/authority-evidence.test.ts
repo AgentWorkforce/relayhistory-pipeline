@@ -7,9 +7,11 @@ import {
   AUTHORITY_QUEUE_PAGE,
   AUTHORITY_REFUSALS,
   AUTHORITY_SQL,
+  authorityBaseline,
   authorityEvidence,
   evidenceHash,
   resolveTurnsWritePath,
+  type AuthorityBaseline,
   type AuthorityEvidenceReport,
   type AuthorityEvidenceSources,
   type AuthorityRefusal,
@@ -27,6 +29,9 @@ type Binding = Record<string, unknown>;
 const plain = (name: string, text: string): Binding => ({ name, type: "plain_text", text });
 
 const Q = { name: "INGEST_ADMISSION", type: "queue", queue_name: E.admissionQueue };
+const ING_CONSUMER = { type: "worker", script_name: E.ingestWorker, dead_letter_queue: E.admissionDlq, queue_name: E.admissionQueue, consumer_id: "c", settings: {} };
+const ING_PRODUCER = { type: "worker", script: E.ingestWorker };
+const D1 = "h" + "ab".repeat(16), D2 = "h" + "cd".repeat(16);
 const STOPPED = (orgs = `${ORG},${ORG2}`) => [plain("INGEST_HTTP_ADMISSION_STOPPED_ORGS", orgs), plain("INGEST_S3_FENCE_MIRROR", "on"), Q];
 const at = <T>(arr: T[], i: number): T => arr[Math.min(i, arr.length - 1)]!;
 
@@ -51,29 +56,29 @@ function world() {
     ]),
     rhDeployments: [{ id: uuid(201), created_on: iso(NOW - 2 * HOUR), versions: [{ version_id: uuid(51), percentage: 100 }] }] as Array<Record<string, unknown>>,
     queues: [
-      { queue_id: qid(1), queue_name: E.admissionQueue },
-      { queue_id: qid(2), queue_name: E.admissionDlq },
-      { queue_id: qid(3), queue_name: "something-else" },
+      { queue_id: qid(1), queue_name: E.admissionQueue, consumers: [ING_CONSUMER], consumers_total_count: 1, producers: [ING_PRODUCER], producers_total_count: 1 },
+      { queue_id: qid(2), queue_name: E.admissionDlq, consumers: [], consumers_total_count: 0, producers: [], producers_total_count: 0 },
+      { queue_id: qid(3), queue_name: E.fanoutQueue, consumers: [{ ...ING_CONSUMER, dead_letter_queue: "fanout-dlq" }], consumers_total_count: 1, producers: [ING_PRODUCER], producers_total_count: 1 },
+      { queue_id: qid(4), queue_name: "something-else", consumers: [{ type: "worker", script_name: "other" }], consumers_total_count: 1, producers: [], producers_total_count: 0 },
     ] as Array<Record<string, unknown>>,
     /** Replaces the queue list from the second listing on. */
     queuesAfter: null as Array<Record<string, unknown>> | null,
     mainQueue: {
-      consumers: [{ type: "worker", script: E.ingestWorker, dead_letter_queue: E.admissionDlq }],
-      producers: [{ type: "worker", script: E.ingestWorker }],
+      consumers: [ING_CONSUMER], consumers_total_count: 1, producers: [ING_PRODUCER], producers_total_count: 1,
     } as Record<string, unknown>,
+    dlqTotal: null as unknown,
     backlog: [0] as unknown[],
     dlqBacklog: [3] as unknown[],
     dlqConsumers: [[]] as unknown[][],
-    visibility: [
-      { table_name: "ingest_batches", visible: true },
-      { table_name: "ingest_record_revisions", visible: true },
-      { table_name: "ingest_session_ownership", visible: true },
-    ] as unknown,
     sqlRows: [] as Array<Record<string, unknown> | "fail" | "bad">,
     sqlDefault: {
-      batches_claimed_since: "0", batches_committed_since: "0", batches_pending: "0", revisions_updated_since: "0",
-      revisions_count: "120", revisions_hash: "987654321", ownership_count: "40", ownership_hash: "123456789",
+      visible_tables: "3", tables: "3", batches_claimed_since: "0", batches_committed_since: "0", batches_pending: "0",
+      batches_new_since_base: "0", revisions_updated_since: "0", revisions_count: "120", revisions_new_since_base: "0",
+      revisions_digest: D1, ownership_count: "40", ownership_new_since_base: "0", ownership_digest: D2,
+      snapshot: "1000:1005:1001,1003", isolation: "read committed", read_only: "on", read_at_ms: String(NOW),
     } as Record<string, unknown>,
+    /** The isolation the SQL fake reports for a baseline read (authorityBaseline's own transport). */
+    baselineIsolation: "repeatable read",
     ingestAfter: null as Array<Record<string, unknown>> | null,
     rhAfter: null as Array<Record<string, unknown>> | "fail" | null,
     fail: new Set<string>(),
@@ -107,13 +112,17 @@ function world() {
       if (path.endsWith("/metrics") && ids.some((id) => path === `/queues/${id}/metrics`))
         return { backlog_count: at(w.backlog, metricsReads++), backlog_bytes: 0 };
       if (path === `/queues/${qid(2)}/metrics`) return { backlog_count: at(w.dlqBacklog, dlqMetricsReads++) };
-      if (path === `/queues/${qid(2)}`) return { queue_id: qid(2), queue_name: E.admissionDlq, consumers: at(w.dlqConsumers, dlqReads++) };
+      if (path === `/queues/${qid(2)}`) {
+        const consumers = at(w.dlqConsumers, dlqReads++);
+        return { queue_id: qid(2), queue_name: E.admissionDlq, consumers, consumers_total_count: w.dlqTotal ?? (Array.isArray(consumers) ? consumers.length : 0),
+          producers: [], producers_total_count: 0 };
+      }
       const main = ids.find((id) => path === `/queues/${id}`);
       if (main) return { queue_id: main, queue_name: E.admissionQueue, ...w.mainQueue };
       throw new Error("unexpected " + path);
     },
     async sql(text, params) {
-      if (text !== AUTHORITY_SQL) return w.visibility as Record<string, unknown>[];
+      expect(text).toBe(AUTHORITY_SQL);
       w.sqlCalls.push(params);
       const row = w.sqlRows[sqlIdx++] ?? w.sqlDefault;
       if (row === "fail") throw new Error(`pg error for ${params[0]}`);
@@ -128,13 +137,23 @@ function world() {
 
 const WINDOW = AUTHORITY_MIN_OBSERVATION_WINDOW_MS;
 const baseline = (src: AuthorityEvidenceSources, orgs: unknown[] = [ORG]) => authorityEvidence(orgs, src, { observationWindowMs: WINDOW });
-/** A baseline, then a run bound to it (the only path to a pass). `between` mutates the world after the baseline. */
-async function bound(world: ReturnType<typeof world>, orgs: unknown[] = [ORG], between?: (w: ReturnType<typeof world>["w"]) => void,
-  boundOverride?: (b: AuthorityEvidenceReport) => unknown) {
-  const b = await baseline(world.src, orgs);
-  world.w.clock += 60_000;
-  between?.(world.w);
-  return authorityEvidence(orgs, world.src, { observationWindowMs: WINDOW, bound: boundOverride ? boundOverride(b) : JSON.parse(JSON.stringify(b)) });
+type World = ReturnType<typeof world>;
+/** authorityBaseline over the world's SQL, reporting the world's baseline isolation (the backfill's snapshot transaction). */
+const takeBaseline = (wd: World, orgs: unknown[], unbound: unknown) =>
+  authorityBaseline(orgs, unbound, async (text, params) => {
+    const rows = await wd.src.sql(text, params);
+    return rows.map((r) => ({ ...r, isolation: wd.w.baselineIsolation }));
+  });
+/**
+ * The only path to a pass: an unbound run, a baseline in the backfill's snapshot, then a run bound to it. `between`
+ * mutates the world after the baseline; `edit` edits the baseline document.
+ */
+async function bound(wd: World, orgs: unknown[] = [ORG], between?: (w: World["w"]) => void, edit?: (b: AuthorityBaseline) => unknown) {
+  const unbound = await baseline(wd.src, orgs);
+  const b = await takeBaseline(wd, orgs, JSON.parse(JSON.stringify(unbound)));
+  wd.w.clock += 60_000;
+  between?.(wd.w);
+  return authorityEvidence(orgs, wd.src, { observationWindowMs: WINDOW, bound: edit ? edit(b) : JSON.parse(JSON.stringify(b)) });
 }
 
 function refusedWith(report: AuthorityEvidenceReport, code: AuthorityRefusal, org = 0) {
@@ -158,10 +177,10 @@ function assertNoLeak(report: AuthorityEvidenceReport) {
 }
 
 describe("authorityEvidence baseline and pass", () => {
-  test("an unbound run is a baseline, never a pass", async () => {
+  test("an unbound run is never a pass", async () => {
     const { w, src } = world();
     const r = await baseline(src, [ORG, ORG2]);
-    expect(r.status).toBe("authority_evidence_baseline");
+    expect(r.status).toBe("authority_evidence_unbound");
     for (const v of r.orgs) {
       expect(v.ok).toBe(false);
       expect(v.refusals).toEqual(["sql_unbound"]);
@@ -170,11 +189,13 @@ describe("authorityEvidence baseline and pass", () => {
       expect(v.mirror.ok).toBe(true);
       expect(v.queueDrained).toMatchObject({ ok: true, backlogReads: [0, 0], dlqBacklogReads: [3, 3], dlqConsumers: 0, observedWindowMs: WINDOW });
       expect(v.sqlQuiet).toMatchObject({ ok: false, code: "sql_unbound", reads: 2, revisionsStable: true, ownershipStable: true,
-        fingerprint: { revisionsCount: 120, revisionsHash: 987654321, ownershipCount: 40, ownershipHash: 123456789 } });
+        fingerprint: { revisionsCount: 120, revisionsDigest: D1, ownershipCount: 40, ownershipDigest: D2 } });
       expect(v.turnsNeon).toMatchObject({ ok: true, path: "neon", servingVersions: 1 });
     }
     const anchor = String(NOW - 5 * HOUR - AUTHORITY_CLOCK_SKEW_MS);
-    expect(w.sqlCalls).toEqual([[ORG, anchor], [ORG2, anchor], [ORG, anchor], [ORG2, anchor]]);
+    // Round 2 counts rows written after round 1's own snapshot.
+    const snap = "1000:1005:1001,1003";
+    expect(w.sqlCalls).toEqual([[ORG, anchor, null], [ORG2, anchor, null], [ORG, anchor, snap], [ORG2, anchor, snap]]);
     expect(w.slept).toEqual([WINDOW]);
     assertNoLeak(r);
   });
@@ -199,7 +220,7 @@ describe("authorityEvidence baseline and pass", () => {
     const wd = world();
     wd.w.ingestDeployments[0]!.versions = [{ version_id: uuid(1), percentage: 60 }, { version_id: uuid(2), percentage: 40 }, { version_id: uuid(3), percentage: 0 }];
     const r = await baseline(wd.src);
-    expect(r.status).toBe("authority_evidence_baseline");
+    expect(r.status).toBe("authority_evidence_unbound");
     expect(r.orgs[0]!.stop.servingVersions).toBe(2);
   });
 
@@ -226,11 +247,11 @@ describe("authorityEvidence baseline and pass", () => {
     expect((await baseline(b.src)).orgs[0]!.turnsNeon.ok).toBe(true);
   });
 
-  test("consumer and producer script may be named by script_name; the DLQ by settings.dead_letter_queue", async () => {
+  test("the bound run's SQL counts rows written after the BASELINE snapshot in both rounds", async () => {
     const wd = world();
-    wd.w.mainQueue = { consumers: [{ type: "worker", script_name: E.ingestWorker, settings: { dead_letter_queue: E.admissionDlq } }],
-      producers: [{ type: "worker", script_name: E.ingestWorker }] };
-    expect((await baseline(wd.src)).status).toBe("authority_evidence_baseline");
+    wd.w.sqlDefault = { ...wd.w.sqlDefault, snapshot: "2000:2002:" };
+    await bound(wd);
+    expect(wd.w.sqlCalls.slice(-2).map((p) => p[2])).toEqual(["2000:2002:", "2000:2002:"]);
   });
 });
 
@@ -246,15 +267,20 @@ describe("review f84452bc regressions", () => {
   });
 
   test("1b. routing: consumer, its DLQ, producers, and queue identity across the window", async () => {
+    const cons = (w: World["w"], c: unknown[]) => { w.mainQueue.consumers = c; w.mainQueue.consumers_total_count = c.length; };
+    const prod = (w: World["w"], p: unknown[]) => { w.mainQueue.producers = p; w.mainQueue.producers_total_count = p.length; };
     for (const [code, mutate] of [
-      ["queue_consumer_mismatch", (w) => { w.mainQueue.consumers = [{ type: "worker", script: "other", dead_letter_queue: E.admissionDlq }]; }],
-      ["queue_consumer_mismatch", (w) => { w.mainQueue.consumers = [{ type: "worker", script: E.ingestWorker, dead_letter_queue: "other-dlq" }]; }],
-      ["queue_consumer_mismatch", (w) => { w.mainQueue.consumers = [{ type: "worker", script: E.ingestWorker }]; }],
-      ["queue_consumer_mismatch", (w) => { w.mainQueue.consumers = [...(w.mainQueue.consumers as unknown[]), { type: "http_pull" }]; }],
-      ["queue_consumer_mismatch", (w) => { w.mainQueue.consumers = [{ type: "worker", script: E.ingestWorker, script_name: "other", dead_letter_queue: E.admissionDlq }]; }],
-      ["queue_producer_mismatch", (w) => { w.mainQueue.producers = [{ type: "worker", script: E.ingestWorker }, { type: "worker", script: "intruder" }]; }],
-      ["queue_producer_mismatch", (w) => { w.mainQueue.producers = []; }],
-      ["queue_identity_changed", (w) => { w.queuesAfter = [{ queue_id: qid(7), queue_name: E.admissionQueue }, w.queues[1]!]; }],
+      ["queue_consumer_mismatch", (w) => cons(w, [{ ...ING_CONSUMER, script_name: "other" }])],
+      ["queue_consumer_mismatch", (w) => cons(w, [{ ...ING_CONSUMER, dead_letter_queue: "other-dlq" }])],
+      ["queue_consumer_mismatch", (w) => cons(w, [{ ...ING_CONSUMER, dead_letter_queue: "" }])],
+      // Per the provider schema the consumer's Worker is script_name and its DLQ is top level, nothing else.
+      ["queue_consumer_mismatch", (w) => cons(w, [{ type: "worker", script: E.ingestWorker, dead_letter_queue: E.admissionDlq }])],
+      ["queue_consumer_mismatch", (w) => cons(w, [{ type: "worker", script_name: E.ingestWorker, settings: { dead_letter_queue: E.admissionDlq } }])],
+      ["queue_consumer_mismatch", (w) => cons(w, [ING_CONSUMER, { type: "http_pull", dead_letter_queue: "" }])],
+      ["queue_producer_mismatch", (w) => prod(w, [ING_PRODUCER, { type: "worker", script: "intruder" }])],
+      ["queue_producer_mismatch", (w) => prod(w, [{ type: "worker", script_name: E.ingestWorker }])],
+      ["queue_producer_mismatch", (w) => prod(w, [])],
+      ["queue_identity_changed", (w) => { w.queuesAfter = [{ ...w.queues[0]!, queue_id: qid(7) }, ...w.queues.slice(1)]; }],
     ] as Array<[AuthorityRefusal, (w: ReturnType<typeof world>["w"]) => void]>) {
       const wd = world();
       mutate(wd.w);
@@ -302,48 +328,128 @@ describe("review f84452bc regressions", () => {
     refusedWith(await baseline(w2.src), "observation_window_short");
   });
 
-  test("4. rows hidden from the reader by RLS or privileges refuse; a malformed visibility answer refuses", async () => {
+  test("4. rows hidden from the reader by RLS or privileges refuse (answered in the same statement); not READ ONLY refuses", async () => {
     const wd = world();
-    wd.w.visibility = [{ table_name: "ingest_batches", visible: false }, { table_name: "ingest_record_revisions", visible: true },
-      { table_name: "ingest_session_ownership", visible: true }];
+    wd.w.sqlDefault = { ...wd.w.sqlDefault, visible_tables: "2" };
     const r = await bound(wd);
     refusedWith(r, "sql_rows_not_visible");
     expect(r.orgs[0]!.sqlQuiet.reads).toBe(0);
-    for (const vis of [[], [{ table_name: "ingest_batches", visible: true }], null,
-      [{ table_name: "ingest_batches", visible: true }, { table_name: "ingest_batches", visible: true }, { table_name: "ingest_session_ownership", visible: true }]]) {
+    for (const tables of ["2", "4", null]) {
       const w2 = world();
-      w2.w.visibility = vis;
+      w2.w.sqlDefault = { ...w2.w.sqlDefault, tables };
       refusedWith(await baseline(w2.src), "sql_unreadable");
+    }
+    const w3 = world();
+    w3.w.sqlDefault = { ...w3.w.sqlDefault, read_only: "off" };
+    refusedWith(await baseline(w3.src), "sql_not_read_only");
+  });
+});
+
+describe("review 5c067d90 regressions", () => {
+  test("1. the last pre-stop deployment produced to a different queue: route change refuses", async () => {
+    const wd = world();
+    wd.w.versions.set(uuid(3), [plain("INGEST_S3_FENCE_MIRROR", "on"), { name: "INGEST_ADMISSION", type: "queue", queue_name: "former-queue" }]);
+    refusedWith(await bound(wd), "queue_route_changed");
+    // A boundary with no admission binding at all is an unproven route too.
+    const w2 = world();
+    w2.w.versions.set(uuid(3), [plain("INGEST_S3_FENCE_MIRROR", "on")]);
+    refusedWith(await bound(w2), "queue_route_changed");
+    // Another queue still consumed by the ingest Worker is a former route that may hold messages.
+    const w3 = world();
+    w3.w.queues.push({ queue_id: qid(5), queue_name: "former-queue", consumers: [ING_CONSUMER], consumers_total_count: 1, producers: [], producers_total_count: 0 });
+    refusedWith(await bound(w3), "queue_route_changed");
+  });
+
+  test("2. an inventory disagreeing with the provider totals refuses", async () => {
+    for (const mutate of [
+      (w: World["w"]) => { w.dlqTotal = 1; },
+      (w: World["w"]) => { w.mainQueue.consumers_total_count = 2; },
+      (w: World["w"]) => { w.mainQueue.producers_total_count = 2; },
+      (w: World["w"]) => { delete w.mainQueue.producers_total_count; },
+      (w: World["w"]) => { w.queues[3]!.consumers_total_count = 2; },
+      (w: World["w"]) => { delete w.queues[3]!.consumers; },
+    ]) {
+      const wd = world();
+      mutate(wd.w);
+      const r = await bound(wd);
+      expect(r.status).toBe("authority_evidence_refused");
+      expect(r.orgs[0]!.refusals.some((c) => c === "dlq_unreadable" || c === "queue_inventory_incomplete")).toBe(true);
     }
   });
 
-  test("4b. ownership continuity needs a bound baseline; a change since it refuses", async () => {
-    refusedWith(await bound(world(), [ORG], (w) => { w.sqlDefault = { ...w.sqlDefault, ownership_hash: "5" }; }), "sql_ownership_changed");
+  test("3. a row rewritten after the baseline snapshot refuses even with every count and digest equal", async () => {
+    const r = await bound(world(), [ORG], (w) => { w.sqlDefault = { ...w.sqlDefault, ownership_new_since_base: "1" }; });
+    refusedWith(r, "sql_rows_rewritten");
+    for (const k of ["revisions_new_since_base", "batches_new_since_base"]) {
+      refusedWith(await bound(world(), [ORG], (w) => { w.sqlDefault = { ...w.sqlDefault, [k]: "1" }; }), "sql_rows_rewritten");
+    }
+    // Inside the window too (unbound): round 2 against round 1's snapshot.
+    const wd = world();
+    wd.w.sqlRows = [{}, { revisions_new_since_base: "2" }];
+    refusedWith(await baseline(wd.src), "sql_rows_rewritten");
+  });
+
+  test("3b. the baseline must be read in a snapshot transaction (the backfill's), after the stop, and clean", async () => {
+    const wd = world();
+    wd.w.baselineIsolation = "read committed";
+    const b = await takeBaseline(wd, [ORG], await baseline(wd.src));
+    expect(b.status).toBe("authority_baseline_refused");
+    expect(b.orgs[0]!.refusals).toEqual(["baseline_not_snapshot"]);
+    refusedWith(await authorityEvidence([ORG], wd.src, { observationWindowMs: WINDOW, bound: b }), "bound_not_ready");
+    const w2 = world();
+    const u2 = await baseline(w2.src);
+    w2.w.sqlDefault = { ...w2.w.sqlDefault, batches_pending: "1" };
+    expect((await takeBaseline(w2, [ORG], u2)).orgs[0]!.refusals).toEqual(["sql_batches_pending"]);
+    const w3 = world();
+    const u3 = await baseline(w3.src);
+    w3.w.sqlDefault = { ...w3.w.sqlDefault, read_at_ms: String(NOW - 6 * HOUR) };
+    expect((await takeBaseline(w3, [ORG], u3)).orgs[0]!.refusals).toEqual(["bound_stop_mismatch"]);
+    // It takes only an unbound report whose every live check passed.
+    const w4 = world();
+    w4.w.backlog = [1];
+    expect((await takeBaseline(w4, [ORG], await baseline(w4.src))).orgs[0]!.refusals).toEqual(["bound_invalid"]);
+    const w5 = world();
+    const u5 = await baseline(w5.src);
+    expect((await takeBaseline(w5, [ORG], { ...u5, orgs: [{ ...u5.orgs[0]!, refusals: ["sql_unbound", "mirror_off"] }] })).orgs[0]!.refusals)
+      .toEqual(["bound_not_ready"]);
+    const b6 = await takeBaseline(w5, [ORG], u5);
+    expect(b6.status).toBe("authority_baseline_ready");
+    assertNoLeak(b6 as unknown as AuthorityEvidenceReport);
+  });
+
+  test("4. a changed digest or count since the baseline refuses", async () => {
+    refusedWith(await bound(world(), [ORG], (w) => { w.sqlDefault = { ...w.sqlDefault, ownership_digest: "h" + "9".repeat(32) }; }), "sql_ownership_changed");
     refusedWith(await bound(world(), [ORG], (w) => { w.sqlDefault = { ...w.sqlDefault, ownership_count: "39" }; }), "sql_ownership_changed");
-    refusedWith(await bound(world(), [ORG], (w) => { w.sqlDefault = { ...w.sqlDefault, revisions_hash: "5" }; }), "sql_revisions_changed");
+    refusedWith(await bound(world(), [ORG], (w) => { w.sqlDefault = { ...w.sqlDefault, revisions_digest: "h" + "9".repeat(32) }; }), "sql_revisions_changed");
   });
 });
 
 describe("bound baseline refusals", () => {
+  const org0 = (b: AuthorityBaseline) => b.orgs[0]!;
   test.each([
     ["bound_invalid", () => ({})],
-    ["bound_invalid", (b: AuthorityEvidenceReport) => ({ ...b, status: "authority_evidence_refused" })],
-    ["bound_invalid", (b: AuthorityEvidenceReport) => ({ ...b, orgs: [] })],
-    ["bound_invalid", (b: AuthorityEvidenceReport) => ({ ...b, orgs: [{ ...b.orgs[0]!, sqlQuiet: { ...b.orgs[0]!.sqlQuiet, fingerprint: null } }] })],
-    ["bound_invalid", (b: AuthorityEvidenceReport) => ({ ...b, orgs: [b.orgs[0], b.orgs[0]] })],
-    ["bound_not_ready", (b: AuthorityEvidenceReport) => ({ ...b, orgs: [{ ...b.orgs[0]!, refusals: ["sql_unbound", "mirror_off"] }] })],
-    ["bound_not_ready", (b: AuthorityEvidenceReport) => ({ ...b, finishedAtMs: NOW + 10 * HOUR })],
-    ["bound_stop_mismatch", (b: AuthorityEvidenceReport) => ({ ...b, orgs: [{ ...b.orgs[0]!, stop: { ...b.orgs[0]!.stop, stopDeploymentHash: "h_" + "0".repeat(32) } }] })],
-    ["bound_stop_mismatch", (b: AuthorityEvidenceReport) => ({ ...b, orgs: [{ ...b.orgs[0]!, stop: { ...b.orgs[0]!.stop, effectiveStopMs: NOW - 6 * HOUR } }] })],
-    ["bound_stop_mismatch", (b: AuthorityEvidenceReport) => ({ ...b, startedAtMs: NOW - 6 * HOUR })],
-  ] as Array<[AuthorityRefusal, (b: AuthorityEvidenceReport) => unknown]>)("%s %#", async (code, edit) => {
+    ["bound_invalid", (b: AuthorityBaseline) => ({ ...b, kind: "authority_evidence" })],
+    ["bound_invalid", (b: AuthorityBaseline) => ({ ...b, orgs: [] })],
+    ["bound_invalid", (b: AuthorityBaseline) => ({ ...b, orgs: [{ ...org0(b), fingerprint: null }] })],
+    ["bound_invalid", (b: AuthorityBaseline) => ({ ...b, orgs: [{ ...org0(b), snapshot: { xmin: 5, xmax: 3, xip: [] } }] })],
+    ["bound_invalid", (b: AuthorityBaseline) => ({ ...b, orgs: [{ ...org0(b), fingerprint: { ...org0(b).fingerprint!, ownershipDigest: "x" } }] })],
+    ["bound_invalid", (b: AuthorityBaseline) => ({ ...b, orgs: [org0(b), org0(b)] })],
+    ["bound_not_ready", (b: AuthorityBaseline) => ({ ...b, status: "authority_baseline_refused" })],
+    ["bound_not_ready", (b: AuthorityBaseline) => ({ ...b, orgs: [{ ...org0(b), ok: false }] })],
+    ["bound_not_ready", (b: AuthorityBaseline) => ({ ...b, orgs: [{ ...org0(b), readAtMs: NOW + 10 * HOUR }] })],
+    ["bound_stop_mismatch", (b: AuthorityBaseline) => ({ ...b, orgs: [{ ...org0(b), stopDeploymentHash: "h_" + "0".repeat(32) }] })],
+    ["bound_stop_mismatch", (b: AuthorityBaseline) => ({ ...b, orgs: [{ ...org0(b), effectiveStopMs: NOW - 6 * HOUR }] })],
+    ["bound_stop_mismatch", (b: AuthorityBaseline) => ({ ...b, orgs: [{ ...org0(b), readAtMs: NOW - 6 * HOUR }] })],
+  ] as Array<[AuthorityRefusal, (b: AuthorityBaseline) => unknown]>)("%s %#", async (code, edit) => {
     refusedWith(await bound(world(), [ORG], undefined, edit), code);
   });
 
-  test("a baseline for another org does not bind", async () => {
+  test("an unbound evidence report is not a baseline; a baseline for another org does not bind", async () => {
     const wd = world();
-    const b = await baseline(wd.src, [ORG2]);
-    refusedWith(await authorityEvidence([ORG], wd.src, { observationWindowMs: WINDOW, bound: b }), "bound_invalid");
+    refusedWith(await authorityEvidence([ORG], wd.src, { observationWindowMs: WINDOW, bound: await baseline(wd.src) }), "bound_invalid");
+    const w2 = world();
+    const b = await takeBaseline(w2, [ORG2], await baseline(w2.src, [ORG2]));
+    refusedWith(await authorityEvidence([ORG], w2.src, { observationWindowMs: WINDOW, bound: b }), "bound_invalid");
   });
 
   test("a stop re-established after the baseline (new boundary) does not bind", async () => {
@@ -393,14 +499,16 @@ describe("authorityEvidence refusals", () => {
     ["queue_list_unreadable", (w) => { w.queues = { queues: [] } as unknown as Array<Record<string, unknown>>; }],
     ["queue_list_unreadable", (w) => { w.queues[0]!.queue_id = "x"; }],
     ["queue_list_unreadable", (w) => w.fail.add(`/queues/${qid(1)}`)],
-    ["queue_list_truncated", (w) => { w.queues = [...w.queues, ...Array.from({ length: AUTHORITY_QUEUE_PAGE }, (_, i) => ({ queue_id: qid(4), queue_name: `q${i}` }))]; }],
+    ["queue_list_truncated", (w) => { w.queues = [...w.queues, ...Array.from({ length: AUTHORITY_QUEUE_PAGE }, (_, i) => ({ queue_id: qid(6), queue_name: `q${i}`, consumers: [], consumers_total_count: 0, producers: [], producers_total_count: 0 }))]; }],
     ["queue_missing", (w) => { w.queues.splice(0, 1); }],
     ["queue_missing", (w) => { w.queues.splice(1, 1); }],
-    ["queue_missing", (w) => { w.queues.push({ queue_id: qid(5), queue_name: E.admissionQueue }); }],
-    ["queue_identity_changed", (w) => { w.queuesAfter = [{ queue_id: qid(7), queue_name: E.admissionQueue }, w.queues[1]!]; }],
+    ["queue_missing", (w) => { w.queues.push({ ...w.queues[0]!, queue_id: qid(5) }); }],
+    ["queue_identity_changed", (w) => { w.queuesAfter = [{ ...w.queues[0]!, queue_id: qid(7) }, ...w.queues.slice(1)]; }],
     ["queue_binding_mismatch", (w) => w.versions.set(uuid(1), STOPPED().slice(0, 2))],
-    ["queue_consumer_mismatch", (w) => { w.mainQueue.consumers = []; }],
-    ["queue_producer_mismatch", (w) => { delete w.mainQueue.producers; }],
+    ["queue_consumer_mismatch", (w) => { w.mainQueue.consumers = []; w.mainQueue.consumers_total_count = 0; }],
+    ["queue_route_changed", (w) => w.versions.set(uuid(3), [plain("INGEST_S3_FENCE_MIRROR", "on")])],
+    ["queue_inventory_incomplete", (w) => { w.mainQueue.consumers_total_count = 3; }],
+    ["queue_producer_mismatch", (w) => { w.mainQueue.producers = [ING_PRODUCER, { type: "r2_bucket", bucket_name: "b" }]; w.mainQueue.producers_total_count = 2; }],
     ["queue_metrics_unreadable", (w) => w.fail.add(`/queues/${qid(1)}/metrics`)],
     ["queue_metrics_unreadable", (w) => { w.backlog = [undefined, 0]; }],
     ["queue_metrics_unreadable", (w) => { w.backlog = [0, -1]; }],
@@ -416,16 +524,20 @@ describe("authorityEvidence refusals", () => {
     // sql
     ["sql_unreadable", (w) => { w.sqlRows = ["fail"]; }],
     ["sql_unreadable", (w) => { w.sqlRows = [{}, "bad"]; }],
-    ["sql_unreadable", (w) => { w.sqlRows = [{ revisions_hash: null }]; }],
-    ["sql_rows_not_visible", (w) => { w.visibility = (w.visibility as Array<Record<string, unknown>>).map((r) => ({ ...r, visible: r.table_name !== "ingest_session_ownership" })); }],
+    ["sql_unreadable", (w) => { w.sqlRows = [{ revisions_digest: null }]; }],
+    ["sql_unreadable", (w) => { w.sqlRows = [{ snapshot: "5:3:" }]; }],
+    ["sql_unreadable", (w) => { w.sqlRows = [{ snapshot: "1:9:4,4" }]; }],
+    ["sql_rows_not_visible", (w) => { w.sqlRows = [{ visible_tables: "2" }]; }],
+    ["sql_not_read_only", (w) => { w.sqlRows = [{}, { read_only: "off" }]; }],
+    ["sql_rows_rewritten", (w) => { w.sqlRows = [{}, { ownership_new_since_base: "1" }]; }],
     ["sql_batches_claimed_after_stop", (w) => { w.sqlRows = [{}, { batches_claimed_since: "1" }]; }],
     ["sql_batches_committed_after_stop", (w) => { w.sqlRows = [{ batches_committed_since: 2 }]; }],
     ["sql_batches_pending", (w) => { w.sqlRows = [{ batches_pending: "1" }]; }],
     ["sql_revisions_after_stop", (w) => { w.sqlRows = [{ revisions_updated_since: "4" }]; }],
-    ["sql_revisions_changed", (w) => { w.sqlRows = [{}, { revisions_hash: "1" }]; }],
+    ["sql_revisions_changed", (w) => { w.sqlRows = [{}, { revisions_digest: D2 }]; }],
     ["sql_revisions_changed", (w) => { w.sqlRows = [{}, { revisions_count: "121" }]; }],
     ["sql_ownership_changed", (w) => { w.sqlRows = [{}, { ownership_count: "41" }]; }],
-    ["sql_ownership_changed", (w) => { w.sqlRows = [{}, { ownership_hash: "5" }]; }],
+    ["sql_ownership_changed", (w) => { w.sqlRows = [{}, { ownership_digest: D1 }]; }],
     ["sql_no_stop_anchor", (w) => w.versions.set(uuid(1), [plain("INGEST_S3_FENCE_MIRROR", "on"), Q])],
     // turns
     ["turns_deployments_unreadable", (w) => w.fail.add(`/workers/scripts/${E.relayhistoryWorker}/deployments`)],
@@ -451,7 +563,7 @@ describe("authorityEvidence refusals", () => {
     mutate(wd.w);
     const r = await authorityEvidence([ORG], wd.src, { observationWindowMs: WINDOW, bound: await (async () => {
       const ok = world();
-      return JSON.parse(JSON.stringify(await baseline(ok.src)));
+      return JSON.parse(JSON.stringify(await takeBaseline(ok, [ORG], await baseline(ok.src))));
     })() });
     refusedWith(r, code);
     assertNoLeak(r);
@@ -459,7 +571,7 @@ describe("authorityEvidence refusals", () => {
 
   test("every declared refusal code has a test", () => {
     const tested = new Set<string>(cases.map((c) => c[0]));
-    for (const c of ["bound_invalid", "bound_not_ready", "bound_stop_mismatch", "sql_unbound", "queue_consumer_mismatch", "queue_producer_mismatch"]) tested.add(c);
+    for (const c of ["bound_invalid", "bound_not_ready", "bound_stop_mismatch", "sql_unbound", "baseline_not_snapshot"]) tested.add(c);
     expect(AUTHORITY_REFUSALS.filter((c) => !tested.has(c))).toEqual([]);
   });
 
@@ -503,7 +615,10 @@ describe("authorityEvidence inputs", () => {
 describe("AUTHORITY_SQL", () => {
   test("is read-only, org-leading and takes no other value", () => {
     expect(AUTHORITY_SQL).not.toMatch(/\b(INSERT|UPDATE|DELETE|TRUNCATE|ALTER|CREATE|DROP|GRANT|COPY|LOCK|nextval|setval)\b/iu);
-    expect(AUTHORITY_SQL.match(/\$\d/gu)!.every((p) => p === "$1" || p === "$2")).toBe(true);
+    expect(new Set(AUTHORITY_SQL.match(/\$\d/gu))).toEqual(new Set(["$1", "$2", "$3"]));
+    // Visibility is a CTE of the same statement, never a separate query.
+    expect(AUTHORITY_SQL).toContain("v AS (");
+    expect(AUTHORITY_SQL).toContain("pg_has_role(current_user, c.relowner, 'USAGE')");
     const scans = [...AUTHORITY_SQL.matchAll(/FROM (sessions\.\w+) x(?: CROSS JOIN s)? WHERE x\.org_id = \$1::text/gu)].map((m) => m[1]);
     expect(scans).toEqual(["sessions.ingest_batches", "sessions.ingest_record_revisions", "sessions.ingest_session_ownership"]);
     expect((AUTHORITY_SQL.match(/FROM sessions\./gu) ?? []).length).toBe(3);
