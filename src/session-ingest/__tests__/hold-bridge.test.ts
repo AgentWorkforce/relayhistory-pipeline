@@ -107,10 +107,11 @@ test("erasure set: operator_user_erasures and session_erasure_fences of the org 
   const pg = await schemaDb();
   const since = NOW - 3600_000;
   await pg.exec(`
-    INSERT INTO sessions.operator_user_erasures (request_id, org_id, workspace_id, user_id, state, origins, created_at, updated_at)
-      VALUES ('req-old', '${ORG}', 'ws-1', 'user-old', 'purging', ARRAY['o1'], ${at(since - 1)}, ${at(since - 1)}),
-             ('req-new', '${ORG}', 'ws-1', 'user-new', 'purging', ARRAY['o1'], ${at(since + 10)}, ${at(since + 10)}),
-             ('req-other', '${ORG2}', 'ws-1', 'user-x', 'purging', ARRAY['o1'], ${at(since + 10)}, ${at(since + 10)});
+    INSERT INTO sessions.operator_user_erasures (request_id, org_id, workspace_id, user_id, state, origins, created_at, updated_at, metadata_purged_at, bytes_verified_at)
+      VALUES ('req-old', '${ORG}', 'ws-1', 'user-old', 'purging', ARRAY['o1'], ${at(since - 1)}, ${at(since - 1)}, NULL, NULL),
+             ('req-new', '${ORG}', 'ws-1', 'user-new', 'purging', ARRAY['o1'], ${at(since + 10)}, ${at(since + 10)}, NULL, NULL),
+             ('req-done', '${ORG}', 'ws-3', 'user-done', 'bytes_verified', ARRAY[]::text[], ${at(since + 20)}, ${at(since + 20)}, ${at(since + 20)}, ${at(since + 20)}),
+             ('req-other', '${ORG2}', 'ws-1', 'user-x', 'purging', ARRAY['o1'], ${at(since + 10)}, ${at(since + 10)}, NULL, NULL);
     INSERT INTO sessions.session_erasure_fences (org_id, workspace_id, source, session_id, created_at)
       VALUES ('${ORG}', 'ws-1', 'claude', 'sess-old', ${at(since - 5)}),
              ('${ORG}', 'ws-2', 'claude', 'sess-new', ${at(since + 5)}),
@@ -118,20 +119,21 @@ test("erasure set: operator_user_erasures and session_erasure_fences of the org 
   `);
   const rows = (await pg.query<Record<string, unknown>>(ERASURE_SET_SQL, [ORG, String(since)])).rows;
   const set = parseErasures(rows);
-  expect(set.map((e) => [e.kind, e.kind === "user" ? e.userId : e.sessionId])).toEqual([["session", "sess-new"], ["user", "user-new"]]);
+  expect(set.map((e) => [e.kind, e.kind === "user" ? e.userId : e.sessionId])).toEqual([["session", "sess-new"], ["user", "user-new"], ["user", "user-done"]]);
+  expect(set.filter((e) => e.kind === "user").map((e) => (e as { bytesVerified: boolean }).bytesVerified)).toEqual([false, true]);
   expect(set[0]).toEqual({ kind: "session", requestId: "session\nws-2\nclaude\nsess-new", workspaceId: "ws-2", source: "claude", sessionId: "sess-new", atMs: since + 5 });
   await pg.close();
 });
 
 test("erasure set rows are shape-checked", () => {
-  for (const bad of [[{ kind: "user", request_id: "r", workspace_id: "w", user_id: null, at_ms: "1" }], [{ kind: "session", request_id: "r", workspace_id: "w", source: "c", session_id: "s", at_ms: "1" }],
-    [{ kind: "other", request_id: "r", workspace_id: "w", at_ms: "1" }], [{ kind: "user", request_id: "r", workspace_id: "w", user_id: "u", at_ms: "x" }]])
+  for (const bad of [[{ kind: "user", request_id: "r", workspace_id: "w", user_id: null, at_ms: "1", bytes_verified: true }], [{ kind: "user", request_id: "r", workspace_id: "w", user_id: "u", at_ms: "1" }], [{ kind: "session", request_id: "r", workspace_id: "w", source: "c", session_id: "s", at_ms: "1" }],
+    [{ kind: "other", request_id: "r", workspace_id: "w", at_ms: "1" }], [{ kind: "user", request_id: "r", workspace_id: "w", user_id: "u", at_ms: "x", bytes_verified: true }]])
     expect(codeSync(() => parseErasures(bad))).toBe("erasure_set_invalid");
 });
 
 // ---- the replay ----
 
-const userErase: Erasure = { kind: "user", requestId: "req-1", workspaceId: "ws-1", userId: "user-1", atMs: NOW };
+const userErase: Erasure = { kind: "user", requestId: "req-1", workspaceId: "ws-1", userId: "user-1", atMs: NOW, bytesVerified: true };
 const sessionErase: Erasure = { kind: "session", requestId: "session\nws-2\nclaude\nsess-1", workspaceId: "ws-2", source: "claude", sessionId: "sess-1", atMs: NOW };
 function deps(store: ObjectStore, over: Record<string, unknown> = {}) {
   const calls: unknown[][] = [];
@@ -140,7 +142,8 @@ function deps(store: ObjectStore, over: Record<string, unknown> = {}) {
     resetUploadedSessions: async (t: LedgerTenant, r: string) => { calls.push(["reset", t, r]); return 3; },
     eraseLogPayloads: async (t: LedgerTenant) => { calls.push(["logs", t]); return 2; },
     setSessionUploads: async (i: SelectionInput) => { calls.push(["fence", i]); },
-    resolveSessionOwners: async () => [{ userId: "user-a", originId: "origin-a" }, { userId: "user-b", originId: "origin-b" }],
+    resolveSessionTargets: async () => ({ complete: true, targets: [{ userId: "user-a", originId: "origin-a", source: "claude", sessionId: "sess-1" },
+      { userId: "user-b", originId: "origin-b", source: "claude", sessionId: "sess-1" }] }),
     ...over,
   } };
 }
@@ -163,7 +166,7 @@ test("replay, user erase -> the user's S3 fence reset (keyed by the request) and
   expect(erasureReceiptKey(ROOT, ORG, E, "req-1")).not.toContain("req-1");
 });
 
-test("replay, session erase -> the session's S3 fence deletion for every owner from the stubs; none resolved blocks", async () => {
+test("replay, session erase -> the fence deletion for every target of a COMPLETE manifest; no manifest or partial coverage blocks", async () => {
   const store = fresh();
   const { d, calls } = deps(store);
   expect(await replayErasure(d, sessionErase)).toBe("replayed");
@@ -171,10 +174,31 @@ test("replay, session erase -> the session's S3 fence deletion for every owner f
     ["fence", { tenant: { orgId: ORG, workspaceId: "ws-2", userId: "user-a" }, originId: "origin-a", sessions: [["claude", "sess-1"]], enabled: false }],
     ["fence", { tenant: { orgId: ORG, workspaceId: "ws-2", userId: "user-b" }, originId: "origin-b", sessions: [["claude", "sess-1"]], enabled: false }],
   ]);
-  const none = deps(fresh(), { resolveSessionOwners: async () => [] });
-  expect(await replayErasure(none.d, sessionErase)).toBe("session_owner_unresolved");
+  // No manifest source at all (today's state): fail closed, nothing fenced, no receipt, bridge_complete refused.
+  const none = deps(fresh(), { resolveSessionTargets: undefined });
+  expect(await replayErasure(none.d, sessionErase)).toBe("session_manifest_missing");
   expect(none.calls).toEqual([]);
   expect(await bridgeCompleteVerdict(none.d.store, ROOT, ORG, hold("marker_attempted"), E, [sessionErase])).toEqual({ code: "erasure_unreplayed", erasures: 1, receipted: 0 });
+  // Stubs that resolve some owners but cannot prove the set complete (a missing second owner): partial, blocked.
+  for (const m of [{ complete: false, targets: [{ userId: "user-a", originId: "origin-a", source: "claude", sessionId: "sess-1" }] }, { complete: true, targets: [] }]) {
+    const p = deps(fresh(), { resolveSessionTargets: async () => m });
+    expect(await replayErasure(p.d, sessionErase)).toBe("session_coverage_partial");
+    expect(p.calls).toEqual([]);
+  }
+  // A complete manifest's alias and turns-origin targets are each fenced, and nothing else.
+  const alias = deps(fresh(), { resolveSessionTargets: async () => ({ complete: true, targets: [
+    { userId: "user-a", originId: "origin-a", source: "claude", sessionId: "sess-1" },
+    { userId: "user-a", originId: "origin-a", source: "claude", sessionId: "sess-1-alias" },
+    { userId: "user-a", originId: "relayhistory:conversation_turns:v1", source: "claude", sessionId: "sess-1" }] }) });
+  expect(await replayErasure(alias.d, sessionErase)).toBe("replayed");
+  expect(alias.calls.map((c) => [(c[1] as SelectionInput).originId, (c[1] as SelectionInput).sessions])).toEqual([
+    ["origin-a", [["claude", "sess-1"]]], ["origin-a", [["claude", "sess-1-alias"]]], ["relayhistory:conversation_turns:v1", [["claude", "sess-1"]]]]);
+});
+
+test("replay, user erase before the SQL erase reached bytes_verified: no effect, no receipt (the artifact lane's receipt is a prerequisite)", async () => {
+  const { d, calls } = deps(fresh());
+  expect(await replayErasure(d, { ...userErase, bytesVerified: false })).toBe("erasure_bytes_unverified");
+  expect(calls).toEqual([]);
 });
 
 test("replay failures write no receipt (retried later); a corrupt receipt is never taken as done", async () => {

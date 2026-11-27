@@ -11,11 +11,15 @@
  *   3. Replay (replayErasures): each erasure's S3-ledger equivalent, idempotent, with a create-only receipt keyed by
  *      the erasure's request id (hashed) under the hold's epoch:
  *        user erase     resetUploadedSessions(tenant, request id), then eraseLogPayloads(tenant)
- *        session erase  for every (user, origin) owner of the session resolved from the S3 owner stubs, the fence
- *                       deletion setSessionUploads({tenant, originId, sessions: [[source, session]], enabled: false}).
- *                       A session that resolves to no owner gets no receipt (session_owner_unresolved) and so blocks
- *                       bridge_complete. Whether this is the complete S3 equivalent of the SQL erase is the erase
- *                       lane owner's sign-off, a named dependency.
+ *        session erase  for every target of the session's COMPLETE erase manifest (every alias x owner x origin, the
+ *                       turns origin included), the fence deletion setSessionUploads({..., enabled: false}). Coverage
+ *                       must be proven complete: S3 owner stubs alone can be partial (the SQL erase unions owners
+ *                       from ownership, index and directory rows over the alias closure), so the erase-lane review
+ *                       (layered-sessions-pipeline) requires a durable target manifest captured under the erase lock
+ *                       before destructive cleanup. No such manifest exists yet, so every session erase replays to
+ *                       session_manifest_missing (no receipt), which blocks bridge_complete. Fail closed.
+ *        user erase     only once the SQL erase reached bytes_verified (the artifact lane's own byte receipt, a
+ *                       separate prerequisite): erasure_bytes_unverified otherwise, no receipt.
  *   4. bridge_complete gate (bridgeCompleteVerdict): every erasure in the set, re-read just before the release, has a
  *      receipt for this epoch. Otherwise the release is refused. After any marker attempt the only release is
  *      `bridge_complete` (releaseAllowed): there is no rollback after an attempt.
@@ -131,23 +135,23 @@ export function releaseAllowed(hold: Hold, reason: HoldReleaseReason): boolean {
  */
 export const ERASURE_SET_SQL = `
 SELECT 'user' AS kind, u.request_id, u.workspace_id, u.user_id, NULL::text AS source, NULL::text AS session_id,
-       floor(extract(epoch FROM u.created_at) * 1000)::bigint AS at_ms
+       floor(extract(epoch FROM u.created_at) * 1000)::bigint AS at_ms, u.state = 'bytes_verified' AS bytes_verified
 FROM sessions.operator_user_erasures u WHERE u.org_id = $1::text AND u.created_at >= to_timestamp($2::bigint / 1000.0)
 UNION ALL
-SELECT 'session', NULL, f.workspace_id, NULL, f.source, f.session_id, floor(extract(epoch FROM f.created_at) * 1000)::bigint
+SELECT 'session', NULL, f.workspace_id, NULL, f.source, f.session_id, floor(extract(epoch FROM f.created_at) * 1000)::bigint, NULL::boolean
 FROM sessions.session_erasure_fences f WHERE f.org_id = $1::text AND f.created_at >= to_timestamp($2::bigint / 1000.0)
 ORDER BY at_ms, request_id`;
 
 export type Erasure =
-  | { kind: "user"; requestId: string; workspaceId: string; userId: string; atMs: number }
+  | { kind: "user"; requestId: string; workspaceId: string; userId: string; atMs: number; bytesVerified: boolean }
   | { kind: "session"; requestId: string; workspaceId: string; source: string; sessionId: string; atMs: number };
 const str = (v: unknown): v is string => typeof v === "string" && v.length > 0 && v.length <= 512;
 export function parseErasures(rows: readonly Record<string, unknown>[]): Erasure[] {
   return rows.map((r) => {
     const atMs = tsMs(typeof r.at_ms === "string" && /^[0-9]{1,16}$/u.test(r.at_ms) ? Number(r.at_ms) : r.at_ms);
     if (!str(r.workspace_id) || atMs === null || Number.isNaN(atMs)) refuse("erasure_set_invalid");
-    if (r.kind === "user" && str(r.request_id) && str(r.user_id))
-      return { kind: "user", requestId: r.request_id, workspaceId: r.workspace_id as string, userId: r.user_id, atMs: atMs! };
+    if (r.kind === "user" && str(r.request_id) && str(r.user_id) && typeof r.bytes_verified === "boolean")
+      return { kind: "user", requestId: r.request_id, workspaceId: r.workspace_id as string, userId: r.user_id, atMs: atMs!, bytesVerified: r.bytes_verified };
     if (r.kind === "session" && r.request_id === null && str(r.source) && str(r.session_id))
       return { kind: "session", requestId: `session\n${r.workspace_id}\n${r.source}\n${r.session_id}`, workspaceId: r.workspace_id as string,
         source: r.source, sessionId: r.session_id, atMs: atMs! };
@@ -187,12 +191,17 @@ export interface ReplayDeps {
   eraseLogPayloads(tenant: LedgerTenant): Promise<number>;
   /** ledger-s3.ts s3Ledger(...).setSessionUploads: the session's S3 fence deletion for one owner. */
   setSessionUploads(input: SelectionInput): Promise<void>;
-  /** The session's owners (user, origin) from the S3 owner stubs (erase-lane sign-off pending). */
-  resolveSessionOwners(org: string, workspaceId: string, source: string, sessionId: string): Promise<{ userId: string; originId: string }[]>;
+  /**
+   * The session's erase targets from a COMPLETE manifest: `complete` true only when the source proves full coverage
+   * (a durable manifest captured under the erase lock). Absent: no source can prove it yet, and every session erase
+   * replays to session_manifest_missing.
+   */
+  resolveSessionTargets?(org: string, workspaceId: string, source: string, sessionId: string):
+    Promise<{ complete: boolean; targets: { userId: string; originId: string; source: string; sessionId: string }[] }>;
   now(): number;
 }
 
-export type ReplayOutcome = "replayed" | "already" | "session_owner_unresolved" | "replay_failed";
+export type ReplayOutcome = "replayed" | "already" | "session_manifest_missing" | "session_coverage_partial" | "erasure_bytes_unverified" | "replay_failed";
 async function readReceipt(store: ObjectStore, key: string): Promise<unknown | null> {
   try { return JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(await readAll((await store.getObject(objectKey(key))).body))); }
   catch (error) { if (isObjectStoreError(error, "not_found")) return null; return undefined; }
@@ -211,15 +220,18 @@ export async function replayErasure(d: ReplayDeps, e: Erasure): Promise<ReplayOu
   const counts = { reset: 0, payloads: 0, owners: 0 };
   try {
     if (e.kind === "user") {
+      if (!e.bytesVerified) return "erasure_bytes_unverified";
       const tenant = { orgId: d.org, workspaceId: e.workspaceId, userId: e.userId };
       counts.reset = await d.resetUploadedSessions(tenant, e.requestId);
       counts.payloads = await d.eraseLogPayloads(tenant);
     } else {
-      const owners = await d.resolveSessionOwners(d.org, e.workspaceId, e.source, e.sessionId);
-      if (owners.length === 0) return "session_owner_unresolved";
-      for (const o of owners)
-        await d.setSessionUploads({ tenant: { orgId: d.org, workspaceId: e.workspaceId, userId: o.userId }, originId: o.originId, sessions: [[e.source, e.sessionId]], enabled: false });
-      counts.owners = owners.length;
+      if (!d.resolveSessionTargets) return "session_manifest_missing";
+      const m = await d.resolveSessionTargets(d.org, e.workspaceId, e.source, e.sessionId);
+      if (!m.complete || m.targets.length === 0) return "session_coverage_partial";
+      // Every alias of the session for every owner at every recorded origin; only this session's pairs.
+      for (const t of m.targets)
+        await d.setSessionUploads({ tenant: { orgId: d.org, workspaceId: e.workspaceId, userId: t.userId }, originId: t.originId, sessions: [[t.source, t.sessionId]], enabled: false });
+      counts.owners = m.targets.length;
     }
   } catch { return "replay_failed"; }
   const receipt: ErasureReceipt = { v: 1, kind: "hold-bridge-erasure", epoch: d.epoch, request: requestHash(e.requestId), erasure: e.kind, counts, appliedAtMs: d.now() };
@@ -242,7 +254,7 @@ export const ERASURE_REREAD_LIMIT = 8;
  * the exclusive key; the set is never logged.
  */
 export async function replayErasures(d: ReplayDeps, readCount: () => Promise<number>, readSet: () => Promise<Erasure[]>) {
-  const out: Record<ReplayOutcome, number> = { replayed: 0, already: 0, session_owner_unresolved: 0, replay_failed: 0 };
+  const out: Record<ReplayOutcome, number> = { replayed: 0, already: 0, session_manifest_missing: 0, session_coverage_partial: 0, erasure_bytes_unverified: 0, replay_failed: 0 };
   const done = new Set<string>();
   for (let i = 0; i < ERASURE_REREAD_LIMIT; i++) {
     const before = await readCount();
