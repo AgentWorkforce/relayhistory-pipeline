@@ -1289,20 +1289,24 @@ After applying either phase:
 
 **Enforcement intervals.** Observations (step 1 readbacks) cannot establish continuous enforcement on their own: a
 removal between two observations, or a removal and a restore between two matching observations, leaves a gap in
-which any principal could write under the prefix. A trusted interval therefore needs independent, continuous
-change-control or audit evidence covering EVERY writer of the bucket policy (the stack, operators, automation:
-`PutBucketPolicy` and `DeleteBucketPolicy` on the transcripts bucket) and every change to the signing role and its
-binding, with no gap in that evidence across the interval.
+which any principal could write under the prefix; the first observed absence can be later than the actual loss.
+A trusted interval therefore needs one of these for its whole length, covering EVERY writer of the bucket policy (the
+stack, operators, automation: `PutBucketPolicy` and `DeleteBucketPolicy` on the transcripts bucket) and every change
+to the signing role and its binding:
+  - a complete, trusted policy-change history (change-control or audit records) with no gap; or
+  - exclusive, serialized control of all of those writers (no policy or role change can start outside it).
+Serialization only during a rollback is not enough.
 - **Start** after enforcement is established: the policy write that installed `RearmSweeperOnlyItWritesItsState`
   exactly as rendered for the role, confirmed by a later observation of that exact statement.
-- **End**, conservatively, before the earliest POSSIBLE weakening: the earliest audited policy write or role change
-  after the start (even one that later turned out harmless), the start of any gap in the audit evidence, or a
-  rollback (step 4), whichever comes first. Reopen only after enforcement is established again (a new start).
+- **End**, conservatively, before any removal or modification STARTS: the start of the earliest recorded policy write
+  or role change after the start (even one that later turned out harmless), the start of any gap in the history or
+  in exclusive control, or a rollback (step 4), whichever comes first. Reopen only after enforcement is established
+  again (a new start).
 - A version relies on the deny only when its `LastModified` lies strictly inside one trusted interval. Both exact
   versions must qualify: the `latest.json` version read and the receipt version it names. A version in a gap, at a
   boundary, with a timestamp equal to one, or in any uncertain transition is unknown.
-- Without that audit evidence, no interval is trusted: every version needs independent writer provenance (another
-  record that identifies who wrote it).
+- Without that history or that control, no interval is trusted: every version needs independent writer evidence
+  (another record that identifies who wrote it). Unaccounted gaps are unknown for both exact versions.
 - Record each interval with its start and end events, the audit evidence used, the role ARN and the policy document.
 
 Acceptance examples (times illustrative):
