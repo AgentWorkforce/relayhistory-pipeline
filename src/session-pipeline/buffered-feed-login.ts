@@ -30,7 +30,7 @@ import type { ClientConfig } from "pg";
 import type { SqlExecutor } from "@rhc/lib/pipeline/queue.ts";
 import { LOGIN_SQL, MEMBERS_SQL, SYSTEM_USER_SQL, type LoginQuery } from "../acquisition/db-login.ts";
 import { ownerClientConfig, OwnerUrlError } from "../shared/owner-pg-config.ts";
-import { BufferedFeedError } from "./buffered-search-feed.ts";
+import { BufferedFeedError, type TimedSqlExecutor } from "./buffered-search-feed.ts";
 import { BUFFERED_SEARCH_FEED_RUNTIME_ROLE } from "./buffered-feed-role.ts";
 
 export { BUFFERED_SEARCH_FEED_RUNTIME_ROLE };
@@ -149,27 +149,57 @@ export interface FeedPool { connect(): Promise<FeedPoolClient> }
  * replaced connection is checked again; a refusal destroys the backend, is never cached, and
  * surfaces as a non-retryable BufferedFeedError(`login_<code>`) before any feed RPC runs.
  */
-export function loginCheckedFeedExecutor(pool: FeedPool, assert: (sql: LoginQuery) => Promise<void> = assertBufferedFeedLogin): SqlExecutor {
+export function loginCheckedFeedExecutor(pool: FeedPool, assert: (sql: LoginQuery) => Promise<void> = assertBufferedFeedLogin): TimedSqlExecutor {
   const verified = new WeakSet<object>();
+  /** A backend that has passed the login check (with the login's own 5s timeouts, before any SET) on itself. */
+  const checkedClient = async () => {
+    const client = await pool.connect();
+    if (!verified.has(client)) {
+      try {
+        await assert(client);
+      } catch (error) {
+        const code = error instanceof BufferedFeedLoginError ? error.code : "login_unreadable";
+        client.release(new Error("buffered search feed login refused"));
+        throw new BufferedFeedError(`login_${code}`, false);
+      }
+      verified.add(client);
+    }
+    return client;
+  };
   return {
     async query<R = Record<string, unknown>>(text: string, params?: unknown[]) {
-      const client = await pool.connect();
-      if (!verified.has(client)) {
-        try {
-          await assert(client);
-        } catch (error) {
-          const code = error instanceof BufferedFeedLoginError ? error.code : "login_unreadable";
-          client.release(new Error("buffered search feed login refused"));
-          throw new BufferedFeedError(`login_${code}`, false);
-        }
-        verified.add(client);
-      }
+      const client = await checkedClient();
       try {
         const r = await client.query<R>(text, params);
         client.release();
         return { rows: r.rows };
       } catch (error) {
         client.release();
+        throw error;
+      }
+    },
+    /**
+     * One statement under its own statement timeout, on one held backend: BEGIN; set_config('statement_timeout', <ms>,
+     * true) (SET LOCAL, so it ends with the transaction and the backend's next checkout is back at the login's 5s);
+     * the statement; COMMIT. Any failure rolls back; a backend whose ROLLBACK also fails is destroyed, never reused.
+     */
+    async queryWithTimeout<R = Record<string, unknown>>(timeoutMs: number, text: string, params?: unknown[]) {
+      if (!Number.isSafeInteger(timeoutMs) || timeoutMs < 1_000 || timeoutMs > 60_000) throw new BufferedFeedError("config_statement_timeout_invalid", false);
+      const client = await checkedClient();
+      try {
+        await client.query("BEGIN");
+        await client.query("SELECT set_config('statement_timeout', $1, true)", [`${timeoutMs}ms`]);
+        const r = await client.query<R>(text, params);
+        await client.query("COMMIT");
+        client.release();
+        return { rows: r.rows };
+      } catch (error) {
+        try {
+          await client.query("ROLLBACK");
+          client.release();
+        } catch {
+          client.release(new Error("buffered search feed rollback failed"));
+        }
         throw error;
       }
     },
