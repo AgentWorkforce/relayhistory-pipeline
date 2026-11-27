@@ -18,7 +18,8 @@ import { objectKey } from "../../shared/vendor.ts";
 import type { ErasureAuthority } from "../neon-s3-erasure/authority.ts";
 import { storeEraser, type LiveObjectProbe } from "../neon-s3-erasure/eraser.ts";
 import { DEFAULT_ERASURE_CONFIG, ErasureJob, sessionPrefixParts, staleprefixIdentityHash } from "../neon-s3-erasure/job.ts";
-import { staleprefixOptions } from "../neon-s3-erasure/main.ts";
+import { exitStatusForError, staleprefixOptions, stalePassStatus } from "../neon-s3-erasure/main.ts";
+import { ShortLivedCredentialError } from "../short-lived-credentials.ts";
 import { LEASE_TTL_MS, SyncState } from "../neon-s3-sync/state.ts";
 import { FORBIDDEN_CREDENTIAL_ENV } from "../stdin-credentials.ts";
 import { FakeS3Versions } from "./fake-s3-versions.ts";
@@ -706,4 +707,55 @@ describe("CLI options", () => {
       expect(existsSync(r.state)).toBe(false);
     }
   });
+});
+
+describe("short-lived eraser key expiring inside an admitted item (T56 review)", () => {
+  test("refused before signing: the pass throws the code (CLI 75), the item stays queued with no attempt, its lease is released; after renewal it erases", async () => {
+    const f = await fixture();
+    const a = f.dateMove("sess-1", "g-1", NOW - 60_000);
+    const before = erasureRow(f.st, a.oldP)!;
+    let expired = true; let refusals = 0;
+    // The key expires mid-erase: the eraser's request path refuses before signing (eraser.ts refuseIfExpired).
+    f.s.onDelete = (k) => { if (expired && k.startsWith(a.oldP)) { refusals++; throw new ShortLivedCredentialError("short_lived_expired.eraser"); } };
+    let err: unknown;
+    try { await f.job().staleprefixPass({ onlyIdentities: allIds(f.st), execute: true, probe: f.s.eraser() }); } catch (e) { err = e; }
+    expect((err as { code?: string }).code).toBe("short_lived_expired.eraser");
+    expect(exitStatusForError(err)).toBe(75);
+    expect(refusals).toBeGreaterThan(0);
+    const row = erasureRow(f.st, a.oldP)!;
+    expect(row.attempts).toBe(before.attempts); // not the item's failure: no backoff, attempts kept
+    expect(row.error ?? null).toBe(before.error ?? null);
+    expect(rowsOf(f.path, "leases")).toEqual([]); // lease released by the finally
+    expect(f.logs.some((l) => l.message === "erasure failed")).toBe(false);
+    expect(f.logs.some((l) => l.message === "erasure stopped: credential")).toBe(true);
+    // Renewal: a fresh key, a rerun of the pass resumes and erases the same item.
+    expired = false;
+    const r = await f.job().staleprefixPass({ onlyIdentities: allIds(f.st), execute: true, probe: f.s.eraser() });
+    expect(r).toMatchObject({ ok: true, erased: 1 });
+    expect(f.s.count(a.oldP)).toBe(0);
+    expect(f.st.staleprefixErasures().map((e) => e.key)).toEqual([]);
+  });
+
+  test("control: a genuine failed erase is still recorded as the item's failure and exits 1, not 75", async () => {
+    const f = await fixture();
+    const a = f.dateMove("sess-1", "g-1", NOW - 60_000);
+    f.s.onDelete = (k) => (k.startsWith(a.oldP) ? "lose" : undefined);
+    const r = await f.job().staleprefixPass({ onlyIdentities: allIds(f.st), execute: true, probe: f.s.eraser() });
+    expect(r).toMatchObject({ ok: false, stoppedBy: "failed" });
+    expect(erasureRow(f.st, a.oldP)!.attempts).toBe(1);
+    let err: unknown; try { stalePassStatus(r, true); } catch (e) { err = e; } // even with the expiry timer fired
+    expect((err as { code?: string }).code).toBe("stale_prefix_pass_stopped");
+    expect(exitStatusForError(err)).toBe(1);
+  });
+});
+
+test("full job drain: a credential refusal inside a leased item stops the drain (no erasureFailed, lease released)", async () => {
+  const f = await fixture();
+  const a = f.dateMove("sess-1", "g-1", NOW - 60_000);
+  const before = erasureRow(f.st, a.oldP)!;
+  f.s.onDelete = (k) => { if (k.startsWith(a.oldP)) throw new ShortLivedCredentialError("short_lived_expired.eraser"); };
+  let err: unknown; try { await f.job().drain(); } catch (e) { err = e; }
+  expect((err as { code?: string }).code).toBe("short_lived_expired.eraser");
+  expect(erasureRow(f.st, a.oldP)!.attempts).toBe(before.attempts);
+  expect(rowsOf(f.path, "leases")).toEqual([]);
 });

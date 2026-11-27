@@ -192,6 +192,11 @@ export function stalePassStatus(r: { ok: boolean; refused?: string; stoppedBy?: 
   return 0;
 }
 
+/** The exit status for an error that escaped main(): 75 for a short-lived credential refusal (renew), else 1. */
+export function exitStatusForError(error: unknown): number {
+  return errorCode(error).startsWith("short_lived_") ? EXIT_CREDENTIALS_RENEW : 1;
+}
+
 /** The process exit status after a run: EXIT_CREDENTIALS_RENEW whenever the run stopped on an expiring key. */
 export function runStatus(status: number, credStop: boolean): number {
   return credStop ? EXIT_CREDENTIALS_RENEW : status;
@@ -287,5 +292,5 @@ if (import.meta.main)
     const code = errorCode(error);
     log({ message: "exit on error", error_code: code });
     // A short-lived eraser key refused before signing (expired): renew and restart, not a crash.
-    process.exit(code.startsWith("short_lived_") ? EXIT_CREDENTIALS_RENEW : 1);
+    process.exit(exitStatusForError(error));
   });
