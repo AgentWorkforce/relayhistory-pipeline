@@ -81,6 +81,11 @@ export interface SessionPipelineInputs {
     secondVersion?: boolean;
     /** Settle window in seconds (INGEST_BUFFERED_SEARCH_FEED_SETTLE_S, 180-3600). Absent: not set, so the feeder's default (300) applies. */
     settleSeconds?: number;
+    /**
+     * Statement timeout of each scheduled-run feeder RPC in ms (INGEST_BUFFERED_SEARCH_FEED_STATEMENT_TIMEOUT_MS,
+     * 1000-60000), applied per RPC with SET LOCAL. Absent: not set, so the feed login's own 5000 applies.
+     */
+    statementTimeoutMs?: number;
   };
   /**
    * The buffered-row later-erasure delete lane (src/session-pipeline/buffered-erasure-delete.ts). Default off:
@@ -371,7 +376,7 @@ export function assertSessionPipelineInputs(p: unknown, refuse: (why: string) =>
     if (f === null || typeof f !== "object" || Array.isArray(f) || Object.getPrototypeOf(f) !== Object.prototype)
       refuse("transcriptStore.sessionPipeline.bufferedSearchFeed must be a plain object");
     for (const k of Object.keys(f))
-      if (k !== "enabled" && k !== "gateDeclared" && k !== "pageSize" && k !== "stagesPerSecond" && k !== "budgetMs" && k !== "secondVersion" && k !== "settleSeconds") refuse(`transcriptStore.sessionPipeline.bufferedSearchFeed.${k} is not a known setting`);
+      if (k !== "enabled" && k !== "gateDeclared" && k !== "pageSize" && k !== "stagesPerSecond" && k !== "budgetMs" && k !== "secondVersion" && k !== "settleSeconds" && k !== "statementTimeoutMs") refuse(`transcriptStore.sessionPipeline.bufferedSearchFeed.${k} is not a known setting`);
     if (typeof f.enabled !== "boolean") refuse("transcriptStore.sessionPipeline.bufferedSearchFeed.enabled must be a boolean");
     if (f.gateDeclared !== undefined && f.gateDeclared !== BUFFERED_SEARCH_FEED_GATE_CONTRACT)
       refuse(`transcriptStore.sessionPipeline.bufferedSearchFeed.gateDeclared must be exactly ${BUFFERED_SEARCH_FEED_GATE_CONTRACT}`);
@@ -389,6 +394,8 @@ export function assertSessionPipelineInputs(p: unknown, refuse: (why: string) =>
     if (f.secondVersion !== undefined && typeof f.secondVersion !== "boolean") refuse("transcriptStore.sessionPipeline.bufferedSearchFeed.secondVersion must be a boolean");
     if (f.settleSeconds !== undefined && !(Number.isInteger(f.settleSeconds) && (f.settleSeconds as number) >= 180 && (f.settleSeconds as number) <= 3_600))
       refuse("transcriptStore.sessionPipeline.bufferedSearchFeed.settleSeconds must be an integer from 180 to 3600");
+    if (f.statementTimeoutMs !== undefined && !(Number.isInteger(f.statementTimeoutMs) && (f.statementTimeoutMs as number) >= 1_000 && (f.statementTimeoutMs as number) <= 60_000))
+      refuse("transcriptStore.sessionPipeline.bufferedSearchFeed.statementTimeoutMs must be an integer from 1000 to 60000");
   }
   if (v.bufferedErasureDelete !== undefined) {
     const e = v.bufferedErasureDelete as Record<string, unknown> | null;
@@ -703,6 +710,7 @@ export function sessionPipelineEnv(i: { stage: string; bucket: string; names: Se
     ...(i.p.bufferedSearchFeed?.budgetMs !== undefined ? { INGEST_BUFFERED_SEARCH_FEED_BUDGET_MS: String(i.p.bufferedSearchFeed.budgetMs) } : {}),
     ...(i.p.bufferedSearchFeed?.secondVersion === true ? { INGEST_BUFFERED_SEARCH_FEED_SECOND_VERSION: "on" } : {}),
     ...(i.p.bufferedSearchFeed?.settleSeconds !== undefined ? { INGEST_BUFFERED_SEARCH_FEED_SETTLE_S: String(i.p.bufferedSearchFeed.settleSeconds) } : {}),
+    ...(i.p.bufferedSearchFeed?.statementTimeoutMs !== undefined ? { INGEST_BUFFERED_SEARCH_FEED_STATEMENT_TIMEOUT_MS: String(i.p.bufferedSearchFeed.statementTimeoutMs) } : {}),
     ...(i.p.bufferedErasureDelete?.enabled === true ? { INGEST_BUFFERED_ERASURE_DELETE: "on" } : {}),
     ...(i.p.bufferedErasureDelete?.pageSize !== undefined ? { INGEST_BUFFERED_ERASURE_PAGE: String(i.p.bufferedErasureDelete.pageSize) } : {}),
     ...(i.p.bufferedErasureDelete?.stagesPerSecond !== undefined ? { INGEST_BUFFERED_ERASURE_RATE: String(i.p.bufferedErasureDelete.stagesPerSecond) } : {}),
