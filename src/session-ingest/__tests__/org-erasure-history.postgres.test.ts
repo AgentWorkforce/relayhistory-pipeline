@@ -16,7 +16,7 @@
 import { afterEach, describe, expect, setDefaultTimeout, test } from "bun:test";
 import pg from "pg";
 import { readFileSync } from "node:fs";
-import { fixturePgUrl, migrateAsOwner, scratchDatabase, type ScratchDatabase } from "./hold-harness/pg.ts";
+import { fixturePgUrl, migrateAsOwner, rollBackLaterSlots, scratchDatabase, type ScratchDatabase } from "./hold-harness/pg.ts";
 import { expectBlocks, openPair, type Pair } from "./hold-harness/two-conn.ts";
 
 setDefaultTimeout(300_000);
@@ -118,6 +118,8 @@ describe.skipIf(!url)("062340 two-connection orderings (real PostgreSQL)", () =>
     const o = await owner(db);
     const e = (await o.query("SELECT sessions.ingest_org_admission_hold_install($1, gen_random_uuid())::text e", [ORG])).rows[0].e as string;
     await o.query("SELECT sessions.ingest_org_admission_hold_release($1,$2::uuid,'verified_rollback',$3,NULL,NULL)", [ORG, e, EVIDENCE]);
+    // Slots above 062340 (062350 on the combined head) come off first: 062340's down refuses while one is applied.
+    await rollBackLaterSlots(db.ownerUrl, "20261105062340_ingest_org_erasure_history");
     await o.query(DOWN);
     await o.query(deletion("s-gap")); // written while no recorder exists: never recorded
     // A hold installed in the gap, then the reapply.
