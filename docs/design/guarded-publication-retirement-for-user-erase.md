@@ -6,7 +6,7 @@ covers never-published abandoned claims, not general erasure of published
 buffered sessions. It changes no SQL, grants, storage authority, or runtime.
 The erase lead is `hard-delete-owner`; `layered-sessions-pipeline` is the
 publication-kernel co-reviewer and erase-equivalence owner. The T25 builder's
-scope is unchanged. This is separate from replay-manifest slot 062330; no
+scope is unchanged. This is separate from replay-manifest slot 062360; no
 migration slot is claimed here.
 
 ## 1. Source and evidence boundary
@@ -171,7 +171,7 @@ not a design. If immutable issuance itself contains raw identifiers that
 cannot be retained under the approved policy, the case remains refused.
 No issuance evidence is deleted to make erasure appear complete, and the
 receipt must truthfully distinguish permitted retained evidence from deleted
-user data. The separate 062330 retention request grants no policy here.
+user data. The separate 062360 retention request grants no policy here.
 Issuer names/OIDs, admission UUIDs and linkable digests are not presumed
 anonymous or exempt from that policy gate merely because issuance has no
 direct tenant/user text column. Current admission has a non-null unique stage
