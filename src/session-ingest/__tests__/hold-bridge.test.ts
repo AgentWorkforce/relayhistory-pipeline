@@ -23,6 +23,8 @@ import {
   holdAlarms,
   holdSql,
   parseErasures,
+  parseTargetCount,
+  PG_BIGINT_MAX,
   parseHoldStatus,
   releaseAllowed,
   replayErasure,
@@ -340,3 +342,10 @@ test("alarms: a seal or an attempt held too long pages the named owner; hashes o
 });
 
 void code;
+
+test("manifest target_count: canonical positive bigint text within PostgreSQL bigint", () => {
+  expect(parseTargetCount("1")).toBe(1n);
+  expect(parseTargetCount("9223372036854775807")).toBe(PG_BIGINT_MAX);
+  for (const bad of ["9223372036854775808", "9999999999999999999", "0", "-1", "01", "1.0", " 1", "", 1, null, "12345678901234567890"])
+    expect(codeSync(() => parseTargetCount(bad))).toBe("manifest_target_count");
+});

@@ -230,6 +230,18 @@ async function sessionPlan(d: Pick<ReplayDeps, "org" | "resolveSessionTargets">,
       !m.targets.every((t) => t && str(t.userId) && str(t.originId) && str(t.source) && str(t.sessionId))) return "session_coverage_partial";
   return m.targets;
 }
+/**
+ * The manifest reader's `target_count` (hard-delete-owner design sec6.1, e1c37fd8): canonical positive bigint text,
+ * 1..9223372036854775807 (PostgreSQL bigint max); anything else refuses. For the future draining adapter.
+ */
+export const PG_BIGINT_MAX = 9223372036854775807n;
+export function parseTargetCount(v: unknown): bigint {
+  if (typeof v !== "string" || !/^[1-9][0-9]{0,18}$/u.test(v)) return refuse("manifest_target_count");
+  const n = BigInt(v);
+  if (n <= 0n || n > PG_BIGINT_MAX) refuse("manifest_target_count");
+  return n;
+}
+
 export async function erasureProof(d: Pick<ReplayDeps, "org" | "userGenerationBoundary" | "resolveSessionTargets">, e: Erasure): Promise<ProofRefusal | null> {
   if (e.kind === "session") { const p = await sessionPlan(d, e); return typeof p === "string" ? p : null; }
   if (!e.bytesVerified) return "erasure_bytes_unverified";
