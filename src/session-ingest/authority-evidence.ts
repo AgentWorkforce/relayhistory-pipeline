@@ -23,16 +23,20 @@
  *                    consumers_total_count / producers_total_count). Then backlog_count is 0 (global: a message is
  *                    opaque, never per org) at two reads at least the observation window apart, MEASURED on the injected
  *                    clock, with the same queue ids. The DLQ backlog not falling is auxiliary only (a replay offset by
- *                    arrivals hides in it); what excludes an admitted replay is (4): every admission claims a batch row.
+ *                    arrivals hides in it). A replay that was admitted claims a batch row, which (4) can show only if
+ *                    the row still exists when a SQL sample is taken; nothing here excludes one between samples.
  *   4. sqlQuiet      one read-only statement per org (READ ONLY is checked: transaction_read_only), whose first CTE
  *                    proves the reader sees every row of the three tables (SELECT and no RLS filtering, in the same
  *                    role, statement and snapshot as the counts). No ingest_batches row claimed or committed, and no
  *                    ingest_record_revisions row updated, at or after the effective stop minus a clock-skew margin; no
  *                    pending batch; no row of the org in any of the three tables possibly written after the base
  *                    snapshot (xmin at or above its xmin: round 1's own snapshot for round 2, the bound baseline's for
- *                    both); counts and digests equal across rounds and to the baseline. And no ingest_batches row
- *                    deleted since the reference (the table's n_tup_del, read AUTHORITY_STATS_SETTLE_MS after round 2),
- *                    so an admission inserted and deleted between reads cannot vanish (AUTHORITY_STATS_SQL).
+ *                    both); counts and digests equal across rounds and to the baseline. All of this is as of the two
+ *                    SQL samples (round 1 and round 2, one statement each), not between or after them: a row
+ *                    inserted, deleted or truncated away between samples, or written after round 2, is not seen.
+ *                    Separately, ingest_batches' n_tup_del (AUTHORITY_STATS_SQL) is read before round 1 (or taken
+ *                    from the baseline) and again AUTHORITY_STATS_SETTLE_MS after round 2, and any change refuses;
+ *                    its limits are stated at AUTHORITY_STATS_SQL.
  *   5. turnsNeon     every traffic-serving version of relayhistory-api resolves the org's turns write path to `neon`
  *                    with relayhistory-cloud's resolver (packages/relayhistory/src/lib/turns-forward.ts
  *                    turnsWritePath, mirrored exactly by resolveTurnsWritePath). An absent binding on a verified
@@ -43,8 +47,8 @@
  * every count and digest equal. Row versions can: every insert, update or delete-and-restore writes a tuple with a new
  * xmin. authorityBaseline records a snapshot (with counts and digests) taken INSIDE the backfill's input snapshot (a
  * REPEATABLE READ transaction, checked); the bound authorityEvidence run then counts the org's rows NOT visible in
- * that snapshot. Zero such rows and equal counts mean the org's row set now is exactly the set the backfill read (as
- * observed; an admission between the last read and any later action is not excluded). An unbound run is at best authority_evidence_unbound (sole refusal
+ * that snapshot. Zero such rows and equal counts mean the org's row set AT EACH SAMPLE equals the baseline's set; it
+ * says nothing about changes undone between samples or made after the last one. An unbound run is at best authority_evidence_unbound (sole refusal
  * sql_unbound), the input authorityBaseline takes; only a bound run can be authority_evidence_corroborated. Order: unbound run
  * (after the stop and the drain) -> backfills with authorityBaseline in their snapshot -> bound run (corroboration).
  * Authenticating the baseline's issuer and run, its exact revision and scope, and the backfill's ordering and
@@ -94,8 +98,10 @@ export const AUTHORITY_MIN_OBSERVATION_WINDOW_MS = 30_000;
  */
 export const AUTHORITY_CLOCK_SKEW_MS = 60_000;
 /**
- * The wait after round 2 before the deletion counter is read: PostgreSQL (15+) flushes a backend's pending table
- * statistics at least every PGSTAT_MAX_INTERVAL (60 s), so a delete committed before round 2 is counted by then.
+ * The wait after round 2 before the deletion counter is read again. PostgreSQL (15+) backends flush pending table
+ * statistics on a timer (PGSTAT_MAX_INTERVAL, 60 s) when they get to report, so waiting past it makes it more likely,
+ * not certain, that a delete committed before round 2 is reflected: a backend that is busy or never idle can report
+ * later. A heuristic delay, not a flush guarantee.
  */
 export const AUTHORITY_STATS_SETTLE_MS = 61_000;
 /** The most orgs one evidence run evaluates (backlog-ops BACKLOG_OPS_MAX_ORGS). */
@@ -617,14 +623,18 @@ function checkedSnapshot(v: unknown): SqlSnapshot | null {
 const DIGEST = /^h[0-9a-f]{32}$/u;
 
 /**
- * Durable deletion evidence. Surviving-row counts cannot show an admission that was inserted and then deleted, but
- * every DELETE (by any role, the owner and a raw statement included) increments pg_stat_all_tables.n_tup_del, which
- * only grows until a statistics reset or a server restart. The only code path that deletes ingest_batches rows is the
- * owner-only operator user erase (20261105058010). So: n_tup_del of ingest_batches unchanged from the reference
- * (the baseline when bound, round 1 when unbound) to a read AUTHORITY_STATS_SETTLE_MS after round 2, with the same
- * stats_reset and postmaster start, and track_counts on, means no batch row of ANY org was deleted in the interval;
- * with no surviving claim since the stop, no admission happened in it. Table-wide, so another org's erase in the
- * interval also refuses (fail-closed). A TRUNCATE is not counted; it needs the owner, and it changes the counts.
+ * Deletion counter, a corroborating signal. Surviving-row samples cannot show a batch row that was inserted and then
+ * deleted between them. pg_stat_all_tables.n_tup_del for ingest_batches counts DELETEd rows (by any role) as the
+ * statistics system has received them. What the run does: it reads the counter before round 1 (unbound) or takes it
+ * from the baseline (bound), reads it again AUTHORITY_STATS_SETTLE_MS after round 2, and refuses on any difference
+ * (sql_batches_deleted), on a different stats_reset or postmaster start, on a lower value (sql_stats_reset), or with
+ * track_counts off. The counter covers the whole table, so another org's erase in the interval also refuses.
+ * Limits, so it is not read as more: an unchanged counter does NOT establish that no admission happened. A delete
+ * whose statistics have not been flushed by the second read is not counted (the settle is a heuristic delay, not a
+ * guarantee); TRUNCATE is not counted at all, and a TRUNCATE between samples can leave the sampled counts unchanged;
+ * a row inserted and still present after round 2 (for example a pending claim committed during the settle) is not
+ * sampled; and a per-table statistics reset back to the same value would go unseen. The only code path that deletes
+ * ingest_batches rows is the owner-only operator user erase (20261105058010).
  */
 export const AUTHORITY_STATS_SQL = `
 SELECT (SELECT count(*) FROM pg_catalog.pg_stat_all_tables t WHERE t.schemaname = 'sessions' AND t.relname = 'ingest_batches')::bigint AS tables,
@@ -726,9 +736,10 @@ function unboundStop(report: unknown, orgHash: string): { stopDeploymentHash: st
  * READ (or SERIALIZABLE) READ ONLY transaction the backfill reads in, or one that imported the backfill's snapshot
  * (SET TRANSACTION SNAPSHOT); a READ COMMITTED read refuses (baseline_not_snapshot), because its snapshot is the
  * statement's and the backfill's reads would not be bound to it. `evidence` is an unbound authorityEvidence report
- * (every live check passed) that supplies each org's stop. The bound run then proves the org's rows now are exactly
- * the rows of this snapshot: none written after it (xmin) and the counts equal, which together leave the same set,
- * so, as observed, the backfill read the current state. The digests are a further cross-check, not the proof.
+ * (every live check passed) that supplies each org's stop. The bound run then checks that the org's rows are exactly
+ * the rows of this snapshot at each sample: none written after it (xmin) and the counts equal, which together leave the
+ * same set at that sample. It says nothing about changes undone between samples or made after the last one. The
+ * digests are a further cross-check.
  */
 export async function authorityBaseline(
   orgsInput: readonly unknown[], evidence: unknown, sql: AuthorityEvidenceSources["sql"],
