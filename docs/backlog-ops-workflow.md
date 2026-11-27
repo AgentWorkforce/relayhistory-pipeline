@@ -294,6 +294,106 @@ census and the drain. Search-index removal depends on the S3 ObjectRemoved -> se
 The eraser does not delete search-index rows itself. Until that is confirmed, step 6's search-index check is the
 control.
 
+## Authority (reshard-dry, authority-dry, authority-execute)
+
+The last step of decision 0005's per-org cutover is writing the org's fence-authority marker
+(`96bulls/.ledger/fence-authority/<org>.json`, `ledger-s3.ts` `validOrgFenceAuthority`). Three modes
+cover it (`src/session-ingest/backlog-authority.ts`, run by `scripts/backlog-authority.ts`). All three
+need a scoped run (`BACKLOG_OPS_ORGS`; `backlog_ops_scope_required` otherwise), because their verdicts
+are per org. Their receipts carry only org hashes (`authority-evidence.ts` `evidenceHash("org", ...)`),
+never an org id.
+
+**authority-execute is held.** `BACKLOG_OPS_AUTHORITY_EXECUTE_ENABLED` is `false`, so the dispatch
+refuses it with `backlog_ops_authority_held` before any GitHub, S3, Cloudflare or database read. The
+tool refuses its `execute` again (`authority_execute_held`). It stays off until the evidence it relies on
+passes review: the review of `authority-evidence.ts` found that observation alone cannot rule out a
+transient admission between reads, and an enforced per-org writer hold is being designed. Until then
+the dry modes' output is diagnostic only.
+
+| Mode | Role | Binds | What it does |
+| --- | --- | --- | --- |
+| `reshard-dry` | dry | nothing | The revision reshard's verify (`revision-reshard.ts`, `verify: true`) per scope org, against the revision home: with `BACKLOG_OPS_LEDGER_*` set, the ledger bucket routed as the edge routes it (fences from the transcripts bucket), after the tool fork guard (`assertToolLedgerHome`). Receipt: `verify_passed` overall and, per org hash, `verify_passed` with the counts. Dry only: `reshard-execute` refuses (`backlog_ops_reshard_dry_only`). |
+| `authority-dry` | dry | nothing | The unbound live evidence (`authorityEvidence` without a baseline). Exit 0 only for `authority_evidence_unbound`, the state `authorityBaseline` takes. Receipt: the report, snake_case. |
+| `backfill-catchup-dry/-execute` with `authority_run` | as before | `AUTHORITY <authority-dry>` | The catch-up runs `authorityBaseline` inside its input fingerprint's REPEATABLE READ READ ONLY transaction (`--authority-baseline`; the evidence on stdin). Its receipt carries `authority_baseline` and, from the credential step, `authority_run`. Without `authority_run` it is byte-identical to before. |
+| `authority-execute` | execute | `DRY <authority-dry> BACKFILL <catch-up execute> FULL <backfill-execute> RESHARD <reshard-dry>` | Re-reads the evidence bound to the catch-up's baseline (must be `authority_evidence_corroborated`), then the sweeper (below), then, per org, the enforced writer fence and the marker, written create-only. |
+
+The order is the evidence module's own: stop and drain the org, then `authority-dry`, then the
+catch-up with `authority_run`, then `reshard-dry` (any time after the reshard ran), then
+`authority-execute`.
+
+```
+AUTHORITY-EXECUTE <sha> DRY <authority-dry> BACKFILL <catch-up> FULL <full> RESHARD <reshard-dry>
+BACKFILL-CATCHUP-EXECUTE <sha> DRY <catch-up dry> FULL <full> AUTHORITY <authority-dry>
+```
+
+Bindings (checked before any credential, the same way every other bound run is):
+
+- The gate checks every bound run: same sha, success, first attempt, the dispatcher, its mode from its
+  run-name, one receipt. Age limits: the catch-up (BACKFILL) under 3 h (`BACKLOG_OPS_FRESH_BACKFILL_MS`);
+  DRY, FULL and RESHARD under 24 h. Ordering: FULL and DRY were created before the catch-up. A catch-up's
+  AUTHORITY was created before that catch-up's own DRY. The gate computes t from FULL as for every
+  catch-up, and the credential step checks that the catch-up recorded it.
+- The credential step: every receipt has exactly this run's scope (never `all`) and the ledger target
+  this environment gives (`backlog_ops_bound_<kind>_ledger`). Then: DRY must be `authority_evidence_unbound`
+  over exactly the scope's org hashes, each refused for `sql_unbound` alone. The catch-up's
+  `authority_run` must equal DRY, and its baseline must be `authority_baseline_ready` over exactly the
+  scope. RESHARD must have `verify_passed` for exactly the scope, each org with missing, invalid and
+  failed at 0.
+
+Inside the job, `authority-execute` does these steps in order, and writes nothing unless the first two
+pass for every org:
+
+1. It reads the bound evidence (`authorityEvidence` with `bound` set to the catch-up's baseline).
+2. It reads the sweeper's serving spec and builds `freshSweeperPass`'s expectation from it. Every org
+   needs a pass under 6 h old (`BACKLOG_OPS_SWEEPER_PASS_MAX_AGE_MS`).
+3. Evidence is corroboration only: it cannot rule out an admission between its reads or after the
+   last one, so it never authorises a marker by itself. For each org, immediately before its write, the
+   run re-checks that the report is under 5 minutes old (`BACKLOG_OPS_AUTHORITY_REPORT_MAX_AGE_MS`) and
+   that the org's verdict is ok. It then asks the enforced writer fence (`writerFence`): a durable per-org
+   hold that every admission path honours, bound to this run's baseline. That fence is being designed and
+   is not in this tree, so the tool has none and refuses before any write (`writer_fence_unavailable`).
+   With a fence that holds, the run writes the marker with `If-None-Match` and reads it back.
+   If an object is already there, it is never overwritten: a valid marker for the same org counts as
+   `present` (a rerun succeeds), anything else is a `conflict` and the run fails
+   (`authority_incomplete`).
+
+### The sweeper's serving spec (proposal; not built)
+
+The GitHub job has no kubectl. It therefore reads what the CURRENT serving sweeper is from
+`96bulls/.ledger/rearm-sweeper/serving-spec.json` in the transcripts bucket (`BACKLOG_OPS_BUCKET`, next
+to the sweeper's cursor and `passes/`):
+
+```json
+{"v":1,"kind":"rearm-sweeper-serving-spec","observedAtMs":0,"namespace":"<ns>","cronJobName":"<name>",
+ "cronJobUid":"<uuid>","suspended":false,"orgs":["<org>"],"bucket":"<INGEST_REARM_BUCKET>",
+ "ledgerBucket":null,"imageDigests":["sha256:<64 hex>"]}
+```
+
+`orgs` may be `null` (every org), `ledgerBucket` a bucket name, and `gitShas` an optional list.
+
+An in-cluster observer writes it from the live CronJob: its uid, `spec.suspend`, the container's
+`INGEST_REARM_ORGS`, `_BUCKET` and `_LEDGER_BUCKET`, and its image, which must be pinned by digest.
+The observer runs under its own IAM role, which may put only that key. A bucket-policy deny keeps
+every other principal off the key, and keeps the observer off the rest of `.ledger/rearm-sweeper/`.
+The observer, its IAM and that policy are an infrastructure follow-up. Until they exist,
+`authority-execute` refuses with `sweeper_spec_missing`.
+
+The execute refuses when any of these does not hold: the spec is valid; it is under 1 h old and not in
+the future; `suspended` is false; its `bucket` and `ledgerBucket` equal this run's own protected
+variables (`sweeper_home_mismatch`); and its `orgs` cover the scope.
+
+Prerequisites before the hold can be lifted (none is code on this branch):
+
+- A read-only Cloudflare token (Workers Scripts:Read, Queues:Read), set as the environment SECRET
+  `BACKLOG_OPS_CLOUDFLARE_TOKEN` on both backlog-ops environments. The workflow passes it to the tool
+  step for authority modes only, and the tool gets it on stdin only.
+- The execute role needs `s3:GetObject` on `96bulls/.ledger/rearm-sweeper/*` and
+  `96bulls/.ledger/fence-authority/*`, and `s3:PutObject` on `96bulls/.ledger/fence-authority/*`. The
+  dry role needs `ListBucket` and `GetObject` on the revision home's `96bulls/.admission-inbox/*`.
+- The serving-spec observer, described above.
+- The enforced per-org writer fence, wired in as `writerFence`, and a reviewed commit that flips
+  `BACKLOG_OPS_AUTHORITY_EXECUTE_ENABLED`.
+
 ## Gates
 
 Every run passes the same gates as the guarded schema release:
