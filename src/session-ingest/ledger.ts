@@ -267,6 +267,16 @@ export interface BabysitterWriteOutcome {
   objects: ({ ref: string; object: string; outcome: "acked"; versionId: string } | { ref: string; object: string; outcome: "refused"; versionId: null })[];
 }
 
+/**
+ * The per-org admission hold (migration 20261105062320, docs/design/org-admission-hold.md section 4): every hold
+ * refusal is SQLSTATE RH042 with exactly this message, raised before any write. A held admission, a publication
+ * once sealed, and a non-mirrored selection or reset control while sealed (section 6.3) all refuse with it. The
+ * ledger code is mapped from the SQLSTATE alone, never from the message, which is not carried or logged.
+ */
+export const ORG_ADMISSION_HELD_SQLSTATE = "RH042";
+export const ORG_ADMISSION_HELD_MESSAGE = "session ingest: org admission held";
+export const ORG_ADMISSION_HELD_CODE = "ledger_org_admission_held";
+
 /** The ledger is unreachable or refused: the batch answers 503 (retryable), never a fallback. */
 export class LedgerUnavailableError extends Error {
   /** `ledger_store_*` only: the object store's HTTP status (100..599), diagnostic only, never a key or message. */
