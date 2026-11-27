@@ -582,7 +582,11 @@ describe("a claim needs a shell tool, a creating invocation and a successful res
     expect((await run("Bash", "gh pr create --fill", "success")).map((p) => p.number)).toEqual([7]);
   });
   test("a non-creating invocation (--dry-run, --web, --help) claims nothing, even when its result prints a PR URL", async () => {
-    for (const c of [`gh pr create --dry-run --body ${URL}`, "gh pr create --dry-run=true", "gh pr create --web", "gh pr create -w", "gh pr create --help", "gh pr create -h"])
+    for (const c of [`gh pr create --dry-run --body ${URL}`, "gh pr create --dry-run=true", "gh pr create --web", "gh pr create -w", "gh pr create --help", "gh pr create -h",
+      "gh pr create --web=true", "gh pr create -wf", "gh pr create -fh", "gh pr create -- --dry-run",
+      // Arguments known only when the shell runs: an expansion, a redirection glued to a flag, globs, tildes.
+      `MODE=--dry-run bash -c 'gh pr create "$MODE" --body ${URL}'`, `gh pr create --dry-run>out --body ${URL}`, "gh pr create $FLAGS", 'gh pr create "$(cat flags)"',
+      "gh pr create --title x*", "cd ~ && gh pr create --fill", "gh pr create --body-file <(echo x)", "gh pr create > out.txt"])
       expect(await run("Bash", c, "success")).toEqual([]);
   });
   test("each shell tool name the harvest records may claim", async () => {

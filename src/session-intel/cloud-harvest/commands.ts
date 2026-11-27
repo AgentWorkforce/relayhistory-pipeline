@@ -20,8 +20,29 @@ const MAX_TEXT = 64 * 1024;
 const MAX_DEPTH = 3;
 const INDIRECT = new Set(["sudo", "doas", "env", "command", "builtin", "exec", "eval", "time", "nohup", "nice", "timeout", "xargs", "watch", "source", ".", "su", "script", "ssh"]);
 const SHELLS = new Set(["bash", "sh", "zsh", "dash", "ksh", "fish"]);
-/** `gh pr create` flags under which it creates nothing. */
-const NON_CREATING = /^(?:--dry-run(?:=.*)?|--web|-w|--help|-h)$/;
+/**
+ * `gh pr create` arguments under which it may create nothing: `--dry-run`, `--web` or `--help` in any form (`=value`
+ * included), a short-flag cluster holding `-w` or `-h` (`-wf`), or `--` (what follows is not read as options here).
+ */
+const NON_CREATING = /^(?:--(?:dry-run|web|help)(?:=.*)?|-[A-Za-z]*[wh][A-Za-z]*|--)$/;
+
+/**
+ * Whether a script holds syntax whose value is only known when it runs: an expansion (`$`, a backtick) outside single
+ * quotes, or, unquoted, a glob, brace or tilde expansion, history expansion, or a redirection. A sole create must be
+ * literal throughout, so its arguments are exactly the words read here.
+ */
+function unverified(script: string): boolean {
+  let quote: "'" | '"' | null = null;
+  for (let i = 0; i < script.length; i++) {
+    const c = script[i]!;
+    if (quote === "'") { if (c === "'") quote = null; continue; }
+    if (c === "\\") { i++; continue; }
+    if (quote === '"') { if (c === '"') quote = null; else if (c === "$" || c === "`" || c === "!") return true; continue; }
+    if (c === "'" || c === '"') { quote = c; continue; }
+    if ("$`*?[]{}~!<>".includes(c)) return true;
+  }
+  return false;
+}
 /** Tool names whose call text is a shell command (as harvested); any other tool's text is not executed as shell. */
 export const SHELL_TOOLS = new Set(["Bash", "bash", "Shell", "shell", "exec_command", "run_terminal_command"]);
 
@@ -112,12 +133,14 @@ export function executedCommands(text: string): string[][] {
  * Whether the call is exactly one `gh pr create` invocation, so that its result's output can only have come from it:
  * the whole script (or the one `sh -c` script it runs) is `gh pr create …`, optionally after `cd <dir> &&` steps
  * (which print nothing and stop the chain on failure), and nothing follows it. A compound call such as
- * `true || gh pr create; printf <url>` can succeed and print a URL without running gh, so it claims nothing.
+ * `true || gh pr create; printf <url>` can succeed and print a URL without running gh, so it claims nothing. Every
+ * word must be literal (no expansion, glob or redirection: `unverified`), and no argument may make it non-creating.
  */
 export function soleCreate(text: string): boolean {
   if (!text || text.length > MAX_TEXT) return false;
   let script = scriptOf(text);
   for (let depth = 0; script !== null && depth <= MAX_DEPTH; depth++) {
+    if (unverified(script)) return false;
     const segs = parse(script);
     if (!segs || !segs.length) return false;
     const strip = (w: string[]) => { let x = w; while (x.length && /^[A-Za-z_][A-Za-z0-9_]*=/.test(x[0]!)) x = x.slice(1); return x; };
