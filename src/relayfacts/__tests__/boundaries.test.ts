@@ -860,4 +860,59 @@ describe("round-5 controls", () => {
       expect(deriveState([s(["topic"])], f, cut).state).toBe("shipped");
     }
   });
+
+  test("forge history: a branch whose tip is the revert is the revert; an earlier unordered step never discards later step order", async () => {
+    const { execFileSync } = await import("node:child_process");
+    const { forgeFacts } = await import("../backfill/forge.ts");
+    const fixture = (name: string) => {
+      const repo = join(tmp, `r13-${name}`);
+      mkdirSync(repo);
+      const git = (args: string[], date: string) => execFileSync("git", ["-C", repo, ...args], { env: { ...process.env, GIT_AUTHOR_DATE: date, GIT_COMMITTER_DATE: date, GIT_AUTHOR_NAME: "t", GIT_AUTHOR_EMAIL: "t@example.invalid", GIT_COMMITTER_NAME: "t", GIT_COMMITTER_EMAIL: "t@example.invalid" }, encoding: "utf8" }).trim();
+      const commit = (file: string, date: string) => { writeFileSync(join(repo, file), file); git(["add", file], date); git(["commit", "-q", "-m", file], date); return git(["rev-parse", "HEAD"], date); };
+      git(["init", "-q", "-b", "main"], "2026-11-01T00:00:00Z");
+      commit("base.txt", "2026-11-01T00:00:00Z");
+      git(["checkout", "-q", "-b", "topic"], "2026-11-02T00:00:00Z");
+      const topic = commit("topic.txt", "2026-11-02T00:00:00Z");
+      git(["checkout", "-q", "main"], "2026-11-02T00:00:00Z");
+      const seal = () => forgeFacts("example/widgets", repo, "2026-10-31T00:00:00Z", "2026-11-30T00:00:00Z", "main", () => []);
+      const s = (branches: string[] = []) => ({ source: "claude", sessionId: "s", analyzedAt: "2026-11-02T01:00:00.000Z", startedAt: "2026-11-02T00:00:00.000Z", endedAt: "2026-11-02T01:00:00.000Z", title: "", asked: [],
+        built: [{ kind: "commit", ref: topic.slice(0, 7), what: "c", at: "2026-11-02T00:30:00.000Z", evidence: [] }], gaps: [], rationale: [], outcomeStatuses: [], dropped: {},
+        keys: { repo: "example/widgets", branches, prs: [], commits: [], files: [], taskRefs: [], parents: [] } }) as unknown as SessionFacts;
+      return { git, topic, seal, s, repo };
+    };
+    const cut = "2026-11-13T00:00:00.000Z";
+    // 1. Picked onto side, reverted at side's tip, merged --no-ff: with or without side as evidence, regressed.
+    {
+      const { git, topic, seal, s, repo } = fixture("tip-revert");
+      git(["checkout", "-q", "-b", "side"], "2026-11-05T00:00:00Z");
+      git(["cherry-pick", topic], "2026-11-06T00:00:00Z");
+      git(["revert", "--no-edit", "HEAD"], "2026-11-07T00:00:00Z");
+      git(["checkout", "-q", "main"], "2026-11-12T00:00:00Z");
+      git(["merge", "-q", "--no-ff", "-m", "merge side", "side"], "2026-11-12T00:00:00Z");
+      expect(existsSync(join(repo, "topic.txt"))).toBe(false);
+      const f = seal();
+      expect(deriveState([s()], f, cut).state).toBe("regressed");
+      expect(deriveState([s(["side"])], f, cut).state).toBe("regressed");
+    }
+    // 2. Parallel left/right picks merged together then to main, then revert left and re-pick, all in one second.
+    {
+      const { git, topic, seal, s, repo } = fixture("parallel");
+      const T = "2026-11-06T00:00:00Z";
+      git(["checkout", "-q", "-b", "left"], T); git(["cherry-pick", topic], T); const left = git(["rev-parse", "HEAD"], T);
+      git(["checkout", "-q", "main"], T); git(["checkout", "-q", "-b", "right"], T);
+      writeFileSync(join(repo, "right.txt"), "r"); git(["add", "right.txt"], T); git(["commit", "-q", "-m", "right"], T);
+      git(["cherry-pick", topic], T);
+      expect(git(["rev-parse", "HEAD"], T)).not.toBe(left);
+      git(["merge", "-q", "--no-ff", "-m", "merge left", "left"], T);
+      git(["checkout", "-q", "main"], T);
+      git(["merge", "-q", "--no-ff", "-m", "merge right", "right"], T);
+      git(["revert", "--no-edit", left], T);
+      git(["cherry-pick", topic], T);
+      expect(existsSync(join(repo, "topic.txt"))).toBe(true);
+      const f = seal();
+      const t = f.commits.find((x) => x.sha === topic)!.transitions!;
+      expect(t.filter((x) => x.unordered).length).toBe(2);
+      expect(deriveState([s()], f, cut).state).toBe("shipped");
+    }
+  });
 });

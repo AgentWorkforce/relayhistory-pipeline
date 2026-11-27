@@ -70,28 +70,36 @@ interface StateResult { state: FeatureState; basis: "forge" | "analysis"; reason
 
 type ForgeCommit = ForgeFacts["commits"][number];
 /** A commit's dated landings on the default branch: its transitions when known, else its first landing. */
-interface Transition { at: string; seq?: number; what: string }
-/** Time order, then integration order within one instant when both sides know it. */
+interface Transition { at: string; seq?: number; step?: number; unordered?: true; what: string }
 const byTime = (a: Transition, b: Transition) => textCompare(a.at, b.at);
 /**
- * The latest transition: the latest instant, and within it the highest integration position when every candidate
- * has one. Otherwise the instant's order is unknown and the result says so (`seq` absent).
+ * Whether git orders two transitions of one instant: both have an integration position, and they are in different
+ * first-parent steps or neither is marked unordered within its step. (A legacy position without a step orders.)
+ */
+const ordered = (a: Transition, b: Transition) =>
+  a.seq !== undefined && b.seq !== undefined && (a.step === undefined || b.step === undefined || a.step !== b.step || (!a.unordered && !b.unordered));
+/**
+ * The latest transition: the latest instant, and within it the highest integration position when git orders it
+ * against every other candidate. Otherwise the instant's order is unknown and the result says so (`seq` absent).
  */
 function latestTransition(list: readonly Transition[]): Transition | undefined {
   if (!list.length) return undefined;
   const at = list.map((t) => t.at).sort(textCompare).pop()!;
   const tied = list.filter((t) => t.at === at);
-  if (tied.every((t) => t.seq !== undefined)) return tied.reduce((m, t) => (t.seq! > m.seq! ? t : m));
-  return { at, what: tied[0]!.what };
+  if (tied.some((t) => t.seq === undefined)) return { at, what: tied[0]!.what };
+  const top = tied.reduce((m, t) => (t.seq! > m.seq! ? t : m));
+  return tied.every((t) => t === top || ordered(t, top)) ? top : { at, what: top.what };
 }
+/** A commit transition's position fields, for the replay. */
+const positionOf = (t: { seq?: number; step?: number; unordered?: true }) => ({ ...(t.seq !== undefined ? { seq: t.seq } : {}), ...(t.step !== undefined ? { step: t.step } : {}), ...(t.unordered ? { unordered: true as const } : {}) });
 function landingsOf(c: ForgeCommit): Transition[] {
-  if (c.transitions) return c.transitions.filter((t) => t.kind === "landed").map((t) => ({ at: t.at, ...(t.seq !== undefined ? { seq: t.seq } : {}), what: t.by === c.sha ? `commit ${c.sha.slice(0, 12)} on the default branch` : `commit ${c.sha.slice(0, 12)} landed as ${t.by.slice(0, 12)}` }));
+  if (c.transitions) return c.transitions.filter((t) => t.kind === "landed").map((t) => ({ at: t.at, ...positionOf(t), what: t.by === c.sha ? `commit ${c.sha.slice(0, 12)} on the default branch` : `commit ${c.sha.slice(0, 12)} landed as ${t.by.slice(0, 12)}` }));
   return c.onDefaultBranch ? [{ at: c.defaultAt ?? c.at, what: `commit ${c.sha.slice(0, 12)} on the default branch` }] : [];
 }
 /** A commit's dated reverts: its transitions when known, else its first revert. */
 function revertsOf(c: ForgeCommit): Transition[] {
   const what = (by: string | null | undefined) => `commit ${c.sha.slice(0, 12)} reverted${by ? ` by ${by.slice(0, 12)}` : ""}`;
-  if (c.transitions) return c.transitions.filter((t) => t.kind === "reverted").map((t) => ({ at: t.at, ...(t.seq !== undefined ? { seq: t.seq } : {}), what: what(t.by) }));
+  if (c.transitions) return c.transitions.filter((t) => t.kind === "reverted").map((t) => ({ at: t.at, ...positionOf(t), what: what(t.by) }));
   return c.revertedAt ? [{ at: c.revertedAt, what: what(c.revertedBy) }] : [];
 }
 
@@ -132,16 +140,17 @@ export function deriveState(sessions: readonly SessionFacts[], forgeIn: ForgeFac
     ...prs.filter((p) => p.state === "merged" && p.mergedAt && p.mergedAt < asOf).map((p) => ({ at: p.mergedAt!, what: `merged ${p.ref.replace("https://github.com/", "")}` })),
     // Every landing of a commit's patch known before the cut (a re-landing after a revert restores it).
     ...commits.flatMap((c) => landingsOf(c)).filter((l) => l.at < asOf),
-    ...branches.filter((b) => b.landed && b.landedAt && b.landedAt < asOf).map((b) => ({ at: b.landedAt!, ...(b.landedSeq !== undefined ? { seq: b.landedSeq } : {}), what: `branch ${b.name} landed` })),
+    ...branches.filter((b) => b.landed && b.landedAt && b.landedAt < asOf).map((b) => ({ at: b.landedAt!, ...(b.landedSeq !== undefined ? { seq: b.landedSeq } : {}), ...(b.landedStep !== undefined ? { step: b.landedStep } : {}), what: `branch ${b.name} landed` })),
   ].sort(byTime);
   const reverts = commits.flatMap((c) => revertsOf(c)).filter((r) => r.at < asOf).sort(byTime);
 
   if (commits.length || prs.length || branches.length) {
     const lastMerge = latestTransition(merges);
     const lastRevert = latestTransition(reverts);
-    // Regressed when the last revert follows the last landing; at one instant the default branch's integration
-    // order decides, and a tie nothing orders reads as regressed (the conservative call).
-    const revertLast = lastRevert && (!lastMerge || lastRevert.at > lastMerge.at || (lastRevert.at === lastMerge.at && (lastRevert.seq === undefined || lastMerge.seq === undefined || lastRevert.seq > lastMerge.seq)));
+    // Regressed when the last revert follows the last landing. At one instant the default branch's integration
+    // order decides; the same position (a branch whose tip is the revert) is the revert, never a re-landing; and a
+    // tie git does not order reads as regressed (the conservative call).
+    const revertLast = lastRevert && (!lastMerge || lastRevert.at > lastMerge.at || (lastRevert.at === lastMerge.at && (!ordered(lastRevert, lastMerge) || lastRevert.seq! >= lastMerge.seq!)));
     if (lastRevert && revertLast) return { state: "regressed", basis: "forge", reason: lastRevert.what };
     if (lastMerge) {
       // Flags the feature's own landed branches introduced count as its flags; a flag the docs do not list takes

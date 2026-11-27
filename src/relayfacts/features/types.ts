@@ -140,10 +140,11 @@ export interface ForgeFacts {
     /**
      * Its whole effective history on the default branch when there is more than one landing or any revert: each
      * landing of its patch and each revert of a copy, dated by when that commit reached the default branch, oldest
-     * first. `seq` is the first-parent integration position, which orders transitions within one instant.
+     * first. `seq` is the total integration position on the default branch and `step` the first-parent step that
+     * integrated it; `unordered` says its order against another transition of the same step is unknown.
      * `defaultAt` and `revertedAt` are the first landing and first revert.
      */
-    transitions?: Array<{ at: string; kind: "landed" | "reverted"; by: string; seq?: number }>;
+    transitions?: Array<{ at: string; kind: "landed" | "reverted"; by: string; seq?: number; step?: number; unordered?: true }>;
   }>;
   flags: Array<{ name: string; defaultOn: boolean }>;
   /** Branches of the repository and whether their work reached the default branch (by ancestry or patch id). */
@@ -151,6 +152,7 @@ export interface ForgeFacts {
     name: string; landed: boolean; landedAt: string | null; tipAt: string; flagsAdded?: string[];
     /** The landing's integration position on the default branch (see a commit transition's `seq`). */
     landedSeq?: number;
+    landedStep?: number;
     /** The branch's own commits (not on the default branch by ancestry), newest first, at most 200. */
     commits?: string[];
   }>;
