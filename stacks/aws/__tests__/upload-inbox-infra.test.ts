@@ -306,7 +306,9 @@ describe("flag off renders the stack byte-identical", () => {
     const bridgeArn = `arn:aws:iam::${accountId}:user/96bulls-${stage}-inbox-bridge`;
     const rearmScript = script.replace(/const res=\{\};[\s\S]*$/, `const rearm=${JSON.stringify(rearmRole)}, bridge=${JSON.stringify(bridgeArn)}; const res={};
       for(const [k,store] of Object.entries(scenarios)){
-        res[k]={off:await render({...base,transcriptStore:store}),undef:await render({...base,transcriptStore:{...store,rearmSweeperRoleArn:undefined}}),on:await render({...base,transcriptStore:{...store,rearmSweeperRoleArn:rearm}})};
+        res[k]={off:await render({...base,transcriptStore:store}),undef:await render({...base,transcriptStore:{...store,rearmSweeperRoleArn:undefined}}),on:await render({...base,transcriptStore:{...store,rearmSweeperRoleArn:rearm}}),
+          denyOn:await render({...base,transcriptStore:{...store,rearmSweeperRoleArn:rearm,rearmSweeperStateDeny:true}}),denyOff:await render({...base,transcriptStore:{...store,rearmSweeperRoleArn:rearm,rearmSweeperStateDeny:false}}),
+          retOff:await render({...base,transcriptStore:{...store,rearmPassReceiptRetentionDays:11}}),retOn:await render({...base,transcriptStore:{...store,rearmSweeperRoleArn:rearm,rearmPassReceiptRetentionDays:11}}),retUndef:await render({...base,transcriptStore:{...store,rearmSweeperRoleArn:rearm,rearmPassReceiptRetentionDays:undefined}})};
         if(store.sessionPipeline){
           const up={...store,uploadControlRoleArn:'${controlRoleArn}',uploadInboxSse:'aws:kms',uploadAdmission:ua,uploadPresignIssuer:true};
           res[k].inboxOff=await render({...base,historyUploadDirectInfra:true,transcriptStore:up});
@@ -319,7 +321,7 @@ describe("flag off renders the stack byte-identical", () => {
     const r = spawnSync(process.execPath, ["--eval", rearmScript], { encoding: "utf8", env: { PATH: process.env.PATH }, timeout: 120_000, maxBuffer: 64 * 1024 * 1024 });
     if (r.status !== 0) throw new Error(r.stderr);
     type Pair = { off: string; on: string };
-    const rr = JSON.parse(r.stdout) as Record<string, Pair & { undef: string; inboxOff?: string; inboxOn?: string; bridgeOff?: string; bridgeOn?: string }>;
+    const rr = JSON.parse(r.stdout) as Record<string, Pair & { undef: string; denyOn: string; denyOff: string; retOff: string; retOn: string; retUndef: string; inboxOff?: string; inboxOn?: string; bridgeOff?: string; bridgeOn?: string }>;
     const pairs = Object.entries(rr).flatMap(([k, v]) => [
       [k, { off: v.off, on: v.on }],
       ...(v.inboxOff ? [[`${k} inbox`, { off: v.inboxOff, on: v.inboxOn! }], [`${k} inbox+bridge`, { off: v.bridgeOff!, on: v.bridgeOn! }]] : []),
@@ -335,6 +337,8 @@ describe("flag off renders the stack byte-identical", () => {
           { Sid: "RearmSweeperWritesProgress", Effect: "Allow", Principal: P, Action: "s3:PutObject", Resource: [`${t}/.admission-inbox/*/ledger/rearm/*.done/*`, `${t}/.admission-inbox/*/ledger/rearm/*.corrupt/*`, `${t}/.ledger/rearm-sweeper/*`] },
           { Sid: "RearmSweeperDeletesCanonicalVersions", Effect: "Allow", Principal: P, Action: "s3:DeleteObjectVersion", Resource: [`${t}/*/v1/ws=*`, `${t}/*/live-sessions/v1/ws=*`] },
           { Sid: "RearmSweeperNeverDotPrefixes", Effect: "Deny", Principal: P, Action: ["s3:DeleteObject", "s3:DeleteObjectVersion"], Resource: `${t}/.*` },
+          // D5: only the sweeper role writes or deletes its own state.
+          { Sid: "RearmSweeperOnlyItWritesItsState", Effect: "Deny", Principal: "*", Action: ["s3:DeleteObject", "s3:PutObject"], Resource: `${t}/.ledger/rearm-sweeper/*`, Condition: { ArnNotEquals: { "aws:PrincipalArn": rearmRole } } },
         ],
         key: {
           Sid: "RearmSweeperReadsViaS3", Effect: "Allow", Principal: P, Action: ["kms:Decrypt", "kms:GenerateDataKey"], Resource: "*",
@@ -343,7 +347,7 @@ describe("flag off renders the stack byte-identical", () => {
       };
     };
 
-    it("off (absent or undefined) renders no rearm statement, and is byte-identical to on minus exactly the six statements and the deny's last principal", () => {
+    it("off (absent or undefined) renders no rearm statement, and is byte-identical to on minus exactly the seven statements and the deny's last principal", () => {
       for (const v of Object.values(rr)) expect(v.undef).toBe(v.off);
       for (const [name, { off, on }] of pairs) {
         expect(off, name).not.toContain("RearmSweeper");
@@ -358,7 +362,7 @@ describe("flag off renders the stack byte-identical", () => {
         expect(list, name).toEqual([...[denyOff.Condition.ArnNotEquals["aws:PrincipalArn"]].flat(), rearmRole]);
         expect(list.length, name).toBe(3);
         expect(list.filter((x: string) => x === rearmRole).length, name).toBe(1);
-        expect(on.split(rearmRole).length - 1, name).toBe(7);
+        expect(on.split(rearmRole).length - 1, name).toBe(8);
         const rest = list.slice(0, -1);
         denyOn.Condition.ArnNotEquals["aws:PrincipalArn"] = rest.length === 1 ? rest[0] : rest;
         props(stripped, "transcripts-key").policy.Statement = props(stripped, "transcripts-key").policy.Statement.filter((st: any) => !isRearm(st));
@@ -366,15 +370,40 @@ describe("flag off renders the stack byte-identical", () => {
       }
     });
 
-    it("on: exactly the six statements, the bucket's five last and in order", () => {
+    it("on: exactly the seven statements, the bucket's six last and in order (the D5 state deny after the grants)", () => {
       for (const [name, { on }] of pairs) {
         const o = JSON.parse(on);
         const want = expected(props(o, "transcripts").bucketName);
         const bucket = props(o, "transcripts").policy;
         expect(bucket.filter(isRearm), name).toEqual(want.bucket);
-        expect(bucket.slice(-5), name).toEqual(want.bucket);
+        expect(bucket.slice(-6), name).toEqual(want.bucket);
         expect(props(o, "transcripts-key").policy.Statement.filter(isRearm), name).toEqual([want.key]);
-        expect(on.match(/RearmSweeper[A-Za-z]*/g)?.length, name).toBe(6);
+        expect(on.match(/RearmSweeper[A-Za-z]*/g)?.length, name).toBe(7);
+      }
+    });
+
+    it("D5: rearmSweeperStateDeny true is the default; false renders exactly on minus the state deny", () => {
+      for (const [k, v] of Object.entries(rr)) {
+        expect(v.denyOn, k).toBe(v.on);
+        const on = JSON.parse(v.on);
+        props(on, "transcripts").policy = props(on, "transcripts").policy.filter((st: any) => st.Sid !== "RearmSweeperOnlyItWritesItsState");
+        expect(v.denyOff, k).toBe(JSON.stringify(on));
+        expect(v.denyOff, k).not.toContain("RearmSweeperOnlyItWritesItsState");
+      }
+    });
+
+    it("D5: retention omitted (absent or undefined) renders byte-identical; set, it adds exactly the one lifecycle rule and nothing else", () => {
+      const rule = { ID: "expire-rearm-sweeper-pass-receipts", Status: "Enabled", Filter: { Prefix: "96bulls/.ledger/rearm-sweeper/passes/" }, Expiration: { Days: 11 } };
+      for (const [k, v] of Object.entries(rr)) {
+        expect(v.retUndef, k).toBe(v.on);
+        for (const [ret, without] of [[v.retOff, v.off], [v.retOn, v.on]] as const) {
+          const a = JSON.parse(ret), b = JSON.parse(without);
+          expect(props(a, "transcripts").lifecycleRules, k).toEqual([...props(b, "transcripts").lifecycleRules, rule]);
+          props(a, "transcripts").lifecycleRules = props(b, "transcripts").lifecycleRules;
+          expect(JSON.stringify(a), k).toBe(without);
+        }
+        // The rule is only ever on the transcripts bucket.
+        expect(v.retOn.split("expire-rearm-sweeper-pass-receipts").length - 1, k).toBe(1);
       }
     });
 

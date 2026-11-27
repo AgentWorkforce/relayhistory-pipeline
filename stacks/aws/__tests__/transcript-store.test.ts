@@ -871,6 +871,31 @@ describe("transcript store: inputs", () => {
       expect(() => validateAwsInputs(STAGE, set(bad))).toThrow(/rearmSweeperRoleArn must be an exact named IAM role/);
   });
 
+  it("D5: rearmSweeperStateDeny is a boolean only with the role; rearmPassReceiptRetentionDays is a positive whole number, no default", () => {
+    const store = (patch: Record<string, unknown>) => filled((i) => Object.assign(i.transcriptStore as Record<string, unknown>, patch));
+    const role = "arn:aws:iam::444455556666:role/test-rearm-sweeper";
+    expect((filled().transcriptStore as Record<string, unknown>).rearmSweeperStateDeny).toBeUndefined();
+    expect((filled().transcriptStore as Record<string, unknown>).rearmPassReceiptRetentionDays).toBeUndefined();
+    for (const v of [true, false]) expect(() => validateAwsInputs(STAGE, store({ rearmSweeperRoleArn: role, rearmSweeperStateDeny: v }))).not.toThrow();
+    for (const v of ["false", 0, null, "off"])
+      expect(() => validateAwsInputs(STAGE, store({ rearmSweeperRoleArn: role, rearmSweeperStateDeny: v }))).toThrow(/rearmSweeperStateDeny must be true or false/);
+    expect(() => validateAwsInputs(STAGE, store({ rearmSweeperStateDeny: false }))).toThrow(/only meaningful with rearmSweeperRoleArn/);
+    for (const days of [1, 400, 2_147_483_647]) {
+      expect(() => validateAwsInputs(STAGE, store({ rearmPassReceiptRetentionDays: days }))).not.toThrow();
+      expect(() => validateAwsInputs(STAGE, store({ rearmSweeperRoleArn: role, rearmPassReceiptRetentionDays: days }))).not.toThrow();
+    }
+    for (const bad of [0, -1, 1.5, Number.NaN, Number.POSITIVE_INFINITY, 2 ** 31, "30", null, true, [30]])
+      expect(() => validateAwsInputs(STAGE, store({ rearmPassReceiptRetentionDays: bad }))).toThrow(/rearmPassReceiptRetentionDays must be a positive whole number of days/);
+  });
+
+  it("D5: refuses invalid state-deny or retention inputs before a direct stage caller can request a provider", async () => {
+    const base = { stage: STAGE, accountId: ACCOUNT, region: REGION, budgetUsd: 1, budgetEmail: "test@example.invalid", tags: () => ({}) };
+    const gc = `arn:aws:iam::${ACCOUNT}:role/test-buffered-gc`;
+    await expect(Effect.runPromise(transcriptStoreStage({ ...base, transcriptStore: { bufferedGcRoleArn: gc, rearmPassReceiptRetentionDays: 0 } }))).rejects.toThrow(/rearmPassReceiptRetentionDays/);
+    await expect(Effect.runPromise(transcriptStoreStage({ ...base, transcriptStore: { bufferedGcRoleArn: gc, rearmSweeperStateDeny: false } }))).rejects.toThrow(/rearmSweeperStateDeny/);
+    await expect(Effect.runPromise(transcriptStoreStage({ ...base, transcriptStore: { bufferedGcRoleArn: gc, rearmSweeperRoleArn: "arn:aws:iam::444455556666:role/test-rearm-sweeper", rearmSweeperStateDeny: "no" as never } }))).rejects.toThrow(/rearmSweeperStateDeny/);
+  });
+
   it("refuses an invalid rearm sweeper role before a direct stage caller can request a provider", async () => {
     await expect(Effect.runPromise(transcriptStoreStage({
       stage: STAGE,

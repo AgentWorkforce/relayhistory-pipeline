@@ -1,12 +1,13 @@
 import { describe, expect, it } from "bun:test";
 import { createHash } from "node:crypto";
 import {
-  REARM_SWEEPER_BUCKET_SIDS, REARM_SWEEPER_KEY_SIDS, REARM_SWEEPER_SIDS, assertRearmSweeperRoleArn, rearmSweeperBucketStatements, rearmSweeperKeyStatement,
+  REARM_SWEEPER_BUCKET_SIDS, REARM_SWEEPER_KEY_SIDS, REARM_SWEEPER_SIDS, REARM_SWEEPER_STATE_DENY_SID, assertRearmSweeperRoleArn, rearmSweeperBucketStatements, rearmSweeperKeyStatement,
+  rearmSweeperStateDenyStatement,
 } from "../rearm-sweeper-policy.ts";
 import { crossAccountWorkerBucketStatements } from "../cross-account-worker-policy.ts";
 import {
-  assertTranscriptStorePlanContract, transcriptBucketPolicy, transcriptKeyPolicy, transcriptNames,
-  TRANSCRIPT_ACCOUNT_ID, TRANSCRIPT_REGION, TRANSCRIPT_STAGE,
+  assertTranscriptStorePlanContract, rearmSweeperBucketTail, REARM_PASS_RECEIPT_PREFIX, REARM_PASS_RECEIPT_RULE_ID, transcriptBucketPolicy, transcriptKeyPolicy,
+  transcriptLifecycleRules, transcriptNames, TRANSCRIPT_ACCOUNT_ID, TRANSCRIPT_REGION, TRANSCRIPT_STAGE,
 } from "../transcript-store.ts";
 
 // Synthetic placeholders only (public repo): the bucket account and the sweeper's (other) account.
@@ -82,11 +83,15 @@ const P = transcriptNames(TRANSCRIPT_STAGE, TRANSCRIPT_ACCOUNT_ID);
 const pKeyArn = `arn:aws:kms:${region}:${TRANSCRIPT_ACCOUNT_ID}:key/synthetic`, pEraser = `arn:aws:iam::${TRANSCRIPT_ACCOUNT_ID}:user/synthetic-eraser`;
 // The production stage always has the buffered GC, so the deny's principal value is a list.
 const pGc = `arn:aws:iam::${TRANSCRIPT_ACCOUNT_ID}:role/synthetic-buffered-gc`;
-// As the stage renders it: the deny exempts the sweeper (last), and the rearm statements come last in the policy.
-const pBucket = (rearm?: string, worker?: string, gc: string | null = pGc) => [
+// As the stage renders it: the deny exempts the sweeper (last), and the rearm statements come last in the policy, the
+// D5 state deny after the five grants (stateDeny false: without it, the rollback shape).
+const pBucket = (rearm?: string, worker?: string, gc: string | null = pGc, stateDeny = true) => [
   ...transcriptBucketPolicy({ accountId: TRANSCRIPT_ACCOUNT_ID, bucketArn: P.bucketArn, keyArn: pKeyArn, eraserArn: pEraser, ...(gc ? { bufferedGcRoleArn: gc } : {}), ...(rearm ? { rearmSweeperRoleArn: rearm } : {}), ...(worker ? { crossAccountWorkerRoleArn: worker } : {}) }),
   ...(rearm ? rearmSweeperBucketStatements({ bucketArn: P.bucketArn, roleArn: rearm }) : []),
+  ...(rearm && stateDeny ? [rearmSweeperStateDenyStatement({ bucketArn: P.bucketArn, roleArn: rearm })] : []),
 ];
+/** The rearm statements as the stage adds them with the state deny on: the five grants, then the deny. */
+const rearmAll = (role: string) => [...rearmSweeperBucketStatements({ bucketArn: P.bucketArn, roleArn: role }), rearmSweeperStateDenyStatement({ bucketArn: P.bucketArn, roleArn: role })];
 /** The policy with OnlyTheEraserDeletes patched. */
 const patchDeny = (policy: unknown[], patch: (s: any) => any) => policy.map((s: any) => s.Sid === "OnlyTheEraserDeletes" ? patch(s) : s);
 const denyPrincipals = (policy: unknown[], list: unknown) => patchDeny(policy, (s) => ({ ...s, Condition: { ArnNotEquals: { "aws:PrincipalArn": list } } }));
@@ -179,7 +184,7 @@ describe("rearm sweeper grants plan phase", () => {
     const one = (planned: unknown[]) => check({ transcripts: bucketBlock(liveBucket, planned) }, { transcripts: "update" }, set);
     const gains = /OnlyTheEraserDeletes must change by exactly one added line, the rearm sweeper role as the last aws:PrincipalArn item/;
     // The statements added without the deny change.
-    expect(() => one([...liveBucket, ...rearmSweeperBucketStatements({ bucketArn: P.bucketArn, roleArn })])).toThrow(gains);
+    expect(() => one([...liveBucket, ...rearmAll(roleArn)])).toThrow(gains);
     // The role elsewhere in the list, twice, another role, or the right line plus any other change to the deny.
     expect(() => one(denyPrincipals(plannedBucket, [pEraser, roleArn, pGc]))).toThrow(gains);
     expect(() => one(denyPrincipals(plannedBucket, [roleArn, pEraser, pGc]))).toThrow(gains);
@@ -205,7 +210,7 @@ describe("rearm sweeper grants plan phase", () => {
       expect(message).not.toMatch(/rearm sweeper grants/);
     }
     // With the statements already in place on both sides: still refused.
-    const statementsOnly = [...liveBucket, ...rearmSweeperBucketStatements({ bucketArn: P.bucketArn, roleArn })];
+    const statementsOnly = [...liveBucket, ...rearmAll(roleArn)];
     expect(() => check({ transcripts: bucketBlock(statementsOnly, plannedBucket) }, { transcripts: "update" }, set)).toThrow(/plan contract refused/);
   });
 
@@ -229,5 +234,175 @@ describe("rearm sweeper grants plan phase", () => {
     expect(() => check({ "transcripts-key": keyBlock(plannedKey, extra) }, { "transcripts-key": "update" }, set)).not.toThrow(/rearm sweeper grants/);
     // Unchanged plans with the statements in place stay outside the phase.
     expect(check({}, {}, set)).toBe("post-apply");
+  });
+});
+
+// ---- D5: only the sweeper role writes or deletes its own state; pass receipts expire ----
+describe("D5 rearm sweeper state deny", () => {
+  it("is exactly one Deny of PutObject and DeleteObject on the sweeper's state prefix, for everyone but the role", () => {
+    expect(rearmSweeperStateDenyStatement({ bucketArn, roleArn })).toEqual({
+      Sid: REARM_SWEEPER_STATE_DENY_SID, Effect: "Deny", Principal: "*", Action: ["s3:DeleteObject", "s3:PutObject"],
+      Resource: `${bucketArn}/96bulls/.ledger/rearm-sweeper/*`, Condition: { ArnNotEquals: { "aws:PrincipalArn": roleArn } },
+    });
+    expect(Object.keys(rearmSweeperStateDenyStatement({ bucketArn, roleArn }))).toEqual(["Sid", "Effect", "Principal", "Action", "Resource", "Condition"]);
+    // Its prefix is exactly the one the sweeper's grants read and write, and it covers the receipts' passes/.
+    const writes = rearmSweeperBucketStatements({ bucketArn, roleArn }).find((x) => x.Sid === "RearmSweeperWritesProgress")!.Resource as string[];
+    expect(writes).toContain(rearmSweeperStateDenyStatement({ bucketArn, roleArn }).Resource);
+    expect(`${bucketArn}/${REARM_PASS_RECEIPT_PREFIX}x.json`.startsWith(rearmSweeperStateDenyStatement({ bucketArn, roleArn }).Resource.slice(0, -1))).toBe(true);
+    for (const bad of ["*", "", `arn:aws:iam::${sweeperAccount}:user/x`]) expect(() => rearmSweeperStateDenyStatement({ bucketArn, roleArn: bad })).toThrow();
+    expect(REARM_SWEEPER_STATE_DENY_SID.startsWith("RearmSweeper")).toBe(true); // guarded by every other phase like the grants
+  });
+
+  it("renders after the five grants while the role is set; false is the rollback; unset renders nothing", () => {
+    const five = rearmSweeperBucketStatements({ bucketArn, roleArn });
+    expect(rearmSweeperBucketTail(bucketArn, {})).toEqual([]);
+    expect(rearmSweeperBucketTail(bucketArn, { rearmSweeperRoleArn: roleArn })).toEqual([...five, rearmSweeperStateDenyStatement({ bucketArn, roleArn })]);
+    expect(rearmSweeperBucketTail(bucketArn, { rearmSweeperRoleArn: roleArn, rearmSweeperStateDeny: true })).toEqual([...five, rearmSweeperStateDenyStatement({ bucketArn, roleArn })]);
+    expect(rearmSweeperBucketTail(bucketArn, { rearmSweeperRoleArn: roleArn, rearmSweeperStateDeny: false })).toEqual(five);
+    // The retention input never affects the policy.
+    expect(rearmSweeperBucketTail(bucketArn, { rearmSweeperRoleArn: roleArn, ...({ rearmPassReceiptRetentionDays: undefined } as object) })).toHaveLength(6);
+  });
+});
+
+describe("D5 rearm sweeper writer deny plan phase", () => {
+  const grantsOnly = pBucket(roleArn, undefined, pGc, false), withDeny = pBucket(roleArn);
+  const set = { rearmSweeperRoleArn: roleArn };
+  const one = (live: unknown[], planned: unknown[], inputs: Record<string, unknown> | undefined = set, actions: Record<string, string> = { transcripts: "update" }, blocks: Record<string, string[]> = {}) =>
+    check({ transcripts: bucketBlock(live, planned), ...blocks }, actions, inputs);
+
+  it("accepts adding exactly the deny, alone, behind the live grants, for the input's role", () => {
+    expect(withDeny.at(-1)).toEqual(rearmSweeperStateDenyStatement({ bucketArn: P.bucketArn, roleArn }));
+    expect(one(grantsOnly, withDeny)).toBe("rearm sweeper writer deny");
+    expect(one(grantsOnly, withDeny, { ...set, rearmSweeperStateDeny: true })).toBe("rearm sweeper writer deny");
+  });
+
+  it("refuses it with any other change, input or statement", () => {
+    expect(() => one(grantsOnly, withDeny, set, { transcripts: "update", "transcripts-key": "update" }, { "transcripts-key": keyBlock(pKey(roleArn), pKey(roleArn)) })).toThrow(/rearm sweeper writer deny: must deploy alone/);
+    expect(() => one(grantsOnly, withDeny, set, { transcripts: "update", "transcript-reader": "update" })).toThrow(/must deploy alone/);
+    expect(() => one(grantsOnly, withDeny, {})).toThrow(/rearm sweeper writer deny: transcriptStore.rearmSweeperRoleArn is unset/);
+    expect(() => one(grantsOnly, withDeny, { rearmSweeperRoleArn: `arn:aws:iam::${sweeperAccount}:role/other` })).toThrow(/live rearm grants must name exactly/);
+    expect(() => one(grantsOnly, withDeny, { ...set, rearmSweeperStateDeny: false })).toThrow(/adds the state deny but transcriptStore.rearmSweeperStateDeny is false/);
+    expect(() => one(grantsOnly, withDeny, { ...set, rearmSweeperStateDeny: "false" })).toThrow(/rearmSweeperStateDeny must be true or false/);
+    const deny = (patch: (x: any) => any) => withDeny.map((x: any) => x.Sid === REARM_SWEEPER_STATE_DENY_SID ? patch(x) : x);
+    for (const tampered of [
+      deny((x) => ({ ...x, Action: ["s3:DeleteObject"] })),
+      deny((x) => ({ ...x, Action: ["s3:*"] })),
+      deny((x) => ({ ...x, Resource: `${P.bucketArn}/96bulls/*` })),
+      deny((x) => ({ ...x, Effect: "Allow" })),
+      deny((x) => ({ ...x, Condition: { ArnNotEquals: { "aws:PrincipalArn": [roleArn, pEraser] } } })),
+      deny((x) => ({ ...x, Condition: { ArnNotEquals: { "aws:PrincipalArn": `arn:aws:iam::${sweeperAccount}:role/other` } } })),
+    ]) expect(() => one(grantsOnly, tampered)).toThrow(/RearmSweeperOnlyItWritesItsState must be exactly the reviewed statement/);
+    const other = withDeny.map((x: any) => x.Sid === "DenyTlsBelow12" ? { ...x, Effect: "Allow" } : x);
+    expect(() => one(grantsOnly, other)).toThrow(/every other statement must stay byte-identical/);
+    const grantChanged = withDeny.map((x: any) => x.Sid === "RearmSweeperReads" ? { ...x, Resource: `${P.bucketArn}/*` } : x);
+    expect(() => one(grantsOnly, grantChanged)).toThrow(/plan contract refused/);
+    expect(() => check({ transcripts: bucketBlock(grantsOnly, withDeny, "a", "b") }, { transcripts: "update" }, set)).toThrow(/only policy statements may change/);
+  });
+
+  it("rolls back (removes only the deny) only with rearmSweeperStateDeny false", () => {
+    expect(one(withDeny, grantsOnly, { ...set, rearmSweeperStateDeny: false })).toBe("rearm sweeper writer deny");
+    expect(() => one(withDeny, grantsOnly)).toThrow(/removes the state deny but transcriptStore.rearmSweeperStateDeny is not false/);
+    expect(() => one(withDeny, grantsOnly, {})).toThrow(/rearmSweeperRoleArn is unset/);
+  });
+
+  it("a fresh grant carries the deny exactly when it is on; a revocation removes whichever set is live", () => {
+    const both = { transcripts: "update", "transcripts-key": "update" };
+    const fresh = (planned: unknown[]) => ({ transcripts: bucketBlock(pBucket(), planned), "transcripts-key": keyBlock(pKey(), pKey(roleArn)) });
+    expect(check(fresh(withDeny), both, set)).toBe("rearm sweeper grants");
+    expect(check(fresh(grantsOnly), both, { ...set, rearmSweeperStateDeny: false })).toBe("rearm sweeper grants");
+    expect(() => check(fresh(grantsOnly), both, set)).toThrow(/must add RearmSweeperOnlyItWritesItsState with the grants/);
+    expect(() => check(fresh(withDeny), both, { ...set, rearmSweeperStateDeny: false })).toThrow(/adds RearmSweeperOnlyItWritesItsState but transcriptStore.rearmSweeperStateDeny is false/);
+    expect(() => check(fresh(withDeny), both)).toThrow(/rearmSweeperRoleArn is unset/);
+    const revoke = (live: unknown[]) => ({ transcripts: bucketBlock(live, pBucket()), "transcripts-key": keyBlock(pKey(roleArn), pKey()) });
+    expect(check(revoke(withDeny), both)).toBe("rearm sweeper grants");
+    expect(check(revoke(grantsOnly), both)).toBe("rearm sweeper grants");
+    expect(() => check(revoke(withDeny), both, set)).toThrow(/removes the rearm statements while transcriptStore.rearmSweeperRoleArn is set/);
+    // Never the grants alone with the state deny left behind.
+    const strand = { transcripts: bucketBlock(withDeny, [...pBucket(), rearmSweeperStateDenyStatement({ bucketArn: P.bucketArn, roleArn })]), "transcripts-key": keyBlock(pKey(roleArn), pKey()) };
+    expect(() => check(strand, both)).toThrow(/must add \(or, to revoke, remove\) exactly/);
+  });
+
+  it("no other phase may carry it: with the cross-account worker grants it is refused there", () => {
+    const worker = `arn:aws:iam::${sweeperAccount}:role/synthetic-sessions-worker`;
+    expect(() => one(grantsOnly, [...withDeny, ...crossAccountWorkerBucketStatements({ bucketAccountId: TRANSCRIPT_ACCOUNT_ID, bucketArn: P.bucketArn, roleArn: worker })])).toThrow(/plan contract refused/);
+    expect(check({}, {}, set)).toBe("post-apply");
+  });
+});
+
+describe("D5 pass-receipt lifecycle rule", () => {
+  const base = [
+    { ID: "expire-noncurrent-versions", Status: "Enabled", Filter: { Prefix: "" }, NoncurrentVersionExpiration: { NoncurrentDays: 1 } },
+    { ID: "remove-expired-delete-markers", Status: "Enabled", Filter: { Prefix: "" }, Expiration: { ExpiredObjectDeleteMarker: true } },
+    { ID: "abort-incomplete-uploads", Status: "Enabled", Filter: { Prefix: "" }, AbortIncompleteMultipartUpload: { DaysAfterInitiation: 1 } },
+  ];
+  // Synthetic day counts for the tests only: the stage has no default and no chosen value.
+  const D1 = 11, D2 = 13;
+
+  it("omitted: the lifecycle rules are exactly as before; set: one current-expiry rule on passes/ only, last", () => {
+    expect(transcriptLifecycleRules()).toEqual(base);
+    expect(transcriptLifecycleRules({})).toEqual(base);
+    expect(transcriptLifecycleRules({ rearmPassReceiptRetentionDays: D1 })).toEqual([...base,
+      { ID: REARM_PASS_RECEIPT_RULE_ID, Status: "Enabled", Filter: { Prefix: "96bulls/.ledger/rearm-sweeper/passes/" }, Expiration: { Days: D1 } }]);
+    // Never the cursors beside the receipts, never noncurrent-only, never a delete-marker rule.
+    const rule = transcriptLifecycleRules({ rearmPassReceiptRetentionDays: D1 }).at(-1)!;
+    expect(Object.keys(rule.Expiration!)).toEqual(["Days"]);
+    expect("96bulls/.ledger/rearm-sweeper/cursor-0123.json".startsWith(rule.Filter.Prefix)).toBe(false);
+    for (const bad of [0, -1, 1.5, Number.NaN, Number.POSITIVE_INFINITY, 2 ** 31, "7", null, true] as unknown[])
+      expect(() => transcriptLifecycleRules({ rearmPassReceiptRetentionDays: bad as number })).toThrow(/rearmPassReceiptRetentionDays must be a positive whole number of days/);
+  });
+
+  const lifeBlock = (liveDays: number | undefined, plannedDays: number | undefined, extra: string[] = []) => [
+    "  [transcripts] update", "  properties:", `    bucketName: ${P.bucket}`,
+    ...mark("-", ["    lifecycleRules:", ...yaml(transcriptLifecycleRules(liveDays === undefined ? {} : { rearmPassReceiptRetentionDays: liveDays }), 6)]),
+    ...mark("+", ["    lifecycleRules:", ...yaml(transcriptLifecycleRules(plannedDays === undefined ? {} : { rearmPassReceiptRetentionDays: plannedDays }), 6)]),
+    ...extra,
+  ];
+  const life = (block: string[], inputs: Record<string, unknown> = {}, actions: Record<string, string> = { transcripts: "update" }) => check({ transcripts: block }, actions, inputs);
+  /** The phase, or the refusal's message (so a wrong outcome is an assertion, not a throw). */
+  const outcome = (block: string[], inputs: Record<string, unknown> = {}) => { try { return life(block, inputs); } catch (e) { return String((e as Error).message); } };
+
+  it("accepts adding, changing and (input unset) removing exactly the rule, alone", () => {
+    expect(outcome(lifeBlock(undefined, D1), { rearmPassReceiptRetentionDays: D1 })).toBe("rearm receipt retention");
+    expect(outcome(lifeBlock(D1, D2), { rearmPassReceiptRetentionDays: D2 })).toBe("rearm receipt retention");
+    expect(outcome(lifeBlock(D1, undefined))).toBe("rearm receipt retention");
+    // Independent of the sweeper role and the deny.
+    expect(life(lifeBlock(undefined, D1), { rearmPassReceiptRetentionDays: D1, rearmSweeperRoleArn: roleArn })).toBe("rearm receipt retention");
+    // The quoted prefix in the plan YAML is compared unquoted.
+    expect(lifeBlock(undefined, D1).join("\n")).toContain('Prefix: "96bulls/.ledger/rearm-sweeper/passes/"');
+  });
+
+  it("refuses a mismatched, missing or invalid input", () => {
+    expect(() => life(lifeBlock(undefined, D1), { rearmPassReceiptRetentionDays: D2 })).toThrow(/rearm receipt retention: the planned lifecycle rules must be exactly the stack's with the pass-receipt rule/);
+    expect(() => life(lifeBlock(undefined, D1))).toThrow(/rearmPassReceiptRetentionDays is unset/);
+    expect(() => life(lifeBlock(D1, undefined), { rearmPassReceiptRetentionDays: D1 })).toThrow(/with the pass-receipt rule/);
+    for (const bad of [0, -3, 1.5, "11", null, true, Number.NaN])
+      expect(() => life(lifeBlock(undefined, D1), { rearmPassReceiptRetentionDays: bad })).toThrow(/is not a positive whole number of days/);
+  });
+
+  it("refuses any other lifecycle change, any other property, or any other resource with it", () => {
+    const tweak = (rules: unknown[]) => [
+      "  [transcripts] update", "  properties:", `    bucketName: ${P.bucket}`,
+      ...mark("-", ["    lifecycleRules:", ...yaml(transcriptLifecycleRules(), 6)]),
+      ...mark("+", ["    lifecycleRules:", ...yaml(rules, 6)]),
+    ];
+    const withRule = transcriptLifecycleRules({ rearmPassReceiptRetentionDays: D1 });
+    const inputs = { rearmPassReceiptRetentionDays: D1 };
+    expect(() => life(tweak(withRule.map((r: any) => r.ID === "expire-noncurrent-versions" ? { ...r, NoncurrentVersionExpiration: { NoncurrentDays: 9 } } : r)), inputs)).toThrow(/planned lifecycle rules must be exactly/);
+    expect(() => life(tweak(withRule.map((r: any) => r.ID === REARM_PASS_RECEIPT_RULE_ID ? { ...r, Filter: { Prefix: "96bulls/.ledger/" } } : r)), inputs)).toThrow(/planned lifecycle rules must be exactly/);
+    expect(() => life(tweak(withRule.map((r: any) => r.ID === REARM_PASS_RECEIPT_RULE_ID ? { ...r, NoncurrentVersionExpiration: { NoncurrentDays: D1 } } : r)), inputs)).toThrow(/planned lifecycle rules must be exactly/);
+    expect(() => life(tweak(withRule.filter((r: any) => r.ID !== "abort-incomplete-uploads")), inputs)).toThrow(/planned lifecycle rules must be exactly/);
+    // A live side that is not the stack's.
+    expect(() => life(["  [transcripts] update", "  properties:", ...mark("-", ["    lifecycleRules:", ...yaml(base.slice(1), 6)]), ...mark("+", ["    lifecycleRules:", ...yaml(withRule, 6)])], inputs)).toThrow(/live lifecycle rules must be exactly/);
+    // Mixed with a policy change, or any other marked property.
+    expect(() => life(lifeBlock(undefined, D1, [...mark("-", ["    tags: a"]), ...mark("+", ["    tags: b"])]), inputs)).toThrow(/only lifecycleRules may change/);
+    const policyToo = [...lifeBlock(undefined, D1), ...mark("-", ["    policy:", ...yaml(pBucket(), 6)]), ...mark("+", ["    policy:", ...yaml(pBucket(roleArn), 6)])];
+    expect(() => life(policyToo, { ...inputs, rearmSweeperRoleArn: roleArn })).toThrow(/only lifecycleRules may change/);
+    expect(() => life(lifeBlock(undefined, D1), inputs, { transcripts: "update", "transcript-reader": "update" })).toThrow(/rearm receipt retention: must deploy alone/);
+    expect(() => life(lifeBlock(D1, D1), inputs)).toThrow(/the lifecycle rules do not change/);
+  });
+
+  it("omitted retention leaves a plan without lifecycle changes outside this phase", () => {
+    expect(check({}, {}, {})).toBe("post-apply");
+    expect(check({}, {}, { rearmSweeperRoleArn: roleArn })).toBe("post-apply");
   });
 });

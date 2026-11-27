@@ -77,6 +77,13 @@
  *                              (last), OnlyTheEraserDeletes exempts it too (last in its principal list), and the
  *                              key policy carries its via-S3 statement. The plan contract accepts the change
  *                              only alone, as its own "rearm sweeper grants" phase (docs/aws-stage.md).
+ *   transcriptStore.rearmSweeperStateDeny  D5, default on with the role: the bucket also carries
+ *                              RearmSweeperOnlyItWritesItsState (only the role writes or deletes
+ *                              `96bulls/.ledger/rearm-sweeper/*`); `false` removes it (the rollback). Added or
+ *                              removed alone as the "rearm sweeper writer deny" phase.
+ *   transcriptStore.rearmPassReceiptRetentionDays  D5, no default: one current-expiry lifecycle rule on
+ *                              `96bulls/.ledger/rearm-sweeper/passes/`. Omitted: lifecycle unchanged. Changed
+ *                              alone as the "rearm receipt retention" phase.
  *
  * Backlog-ops workflow roles (decision 0005; stacks/aws/backlog-ops-key-policy.ts), default OFF:
  *
@@ -117,7 +124,7 @@ import { assertBufferedGcRoleArn, bufferedGcBucketStatements, bufferedGcKeyState
 import { ADOPTED_IDENTITY_GROUPS, ADOPTED_IDENTITY_RESOURCES, adoptedIdentities, assertAdoptIdentitiesInputs, declareAdoptedIdentities, inboxBridgeUserName, type AdoptIdentitiesInputs } from "./adopt-identities.ts";
 import { BACKLOG_OPS_KEY_SIDS, assertBacklogOpsRoles, backlogOpsKeyStatements, backlogOpsRoleArns, type BacklogOpsRoles } from "./backlog-ops-key-policy.ts";
 import { CROSS_ACCOUNT_WORKER_BUCKET_SIDS, CROSS_ACCOUNT_WORKER_KEY_SIDS, assertCrossAccountWorkerRoleArn, crossAccountWorkerBucketStatements, crossAccountWorkerKeyStatements } from "./cross-account-worker-policy.ts";
-import { REARM_SWEEPER_BUCKET_SIDS, REARM_SWEEPER_KEY_SIDS, assertRearmSweeperRoleArn, rearmSweeperBucketStatements, rearmSweeperKeyStatement } from "./rearm-sweeper-policy.ts";
+import { REARM_SWEEPER_BUCKET_SIDS, REARM_SWEEPER_KEY_SIDS, REARM_SWEEPER_STATE_DENY_SID, assertRearmSweeperRoleArn, rearmSweeperBucketStatements, rearmSweeperKeyStatement, rearmSweeperStateDenyStatement } from "./rearm-sweeper-policy.ts";
 import {
   SESSION_ANALYSIS_RUNNER_BUCKET_SIDS,
   SESSION_ANALYSIS_RUNNER_KEY_SIDS,
@@ -217,8 +224,22 @@ export interface TranscriptStoreInputs {
    * carries exactly its five statements, last, OnlyTheEraserDeletes exempts the role too (listed last), and the key
    * policy carries its via-S3 statement (rearm-sweeper-policy.ts).
    * Omit: both policies are byte-for-byte as without it. Once the statements are live, omitting it drops them.
+   * Set, the bucket policy also carries RearmSweeperOnlyItWritesItsState (D5), last, unless rearmSweeperStateDeny is false.
    */
   rearmSweeperRoleArn?: string;
+  /**
+   * D5. Default (omitted) or true: while rearmSweeperRoleArn is set, the bucket policy denies PutObject and DeleteObject
+   * on `96bulls/.ledger/rearm-sweeper/*` to every principal but that role (rearmSweeperStateDenyStatement). `false` is
+   * the rollback: the statement is removed and the sweeper's grants stay. Only with rearmSweeperRoleArn.
+   */
+  rearmSweeperStateDeny?: boolean;
+  /**
+   * D5. Default off, NO default value: whole days after which a current object under
+   * `96bulls/.ledger/rearm-sweeper/passes/` expires (the rearm sweeper's pass receipts and per-org latest pointers).
+   * Omitted: the lifecycle configuration is exactly as without it. Set (a positive whole number of days): one more
+   * lifecycle rule, `expire-rearm-sweeper-pass-receipts`, last. The value is an operator decision; nothing here picks it.
+   */
+  rearmPassReceiptRetentionDays?: number;
   /**
    * Default off. Exact dedicated EKS session-analysis runner role in agentrelay-prod.
    * Present: add its canonical-read/result-write bucket and via-S3 KMS grants,
@@ -381,10 +402,15 @@ export function assertTranscriptStoreInputs(
   if (inputs.region !== TRANSCRIPT_REGION) refuse(`transcript content must stay in ${TRANSCRIPT_REGION} (migration plan, regional boundaries), got ${inputs.region}`);
   if (inputs.partition !== TRANSCRIPT_PARTITION) refuse(`partition must be exactly ${TRANSCRIPT_PARTITION}, got ${JSON.stringify(inputs.partition)}`);
   for (const k of Object.keys(store))
-    if (k !== "managementEvents" && k !== "auditPrincipalArn" && k !== "inboxAuthorityKeyRoot" && k !== "uploadControlRoleArn" && k !== "uploadInboxSse" && k !== "uploadAdmission" && k !== "uploadPresignIssuer" && k !== "sessionPipeline" && k !== "sessionReadApi" && k !== "bufferedGcRoleArn" && k !== "crossAccountWorkerRoleArn" && k !== "rearmSweeperRoleArn" && k !== "sessionAnalysisRunnerRoleArn" && k !== "backlogOpsRoles" && k !== "inboxBridgeUserArn" && k !== "adoptIdentities") refuse(`transcriptStore.${k} is not a known setting`);
+    if (k !== "managementEvents" && k !== "auditPrincipalArn" && k !== "inboxAuthorityKeyRoot" && k !== "uploadControlRoleArn" && k !== "uploadInboxSse" && k !== "uploadAdmission" && k !== "uploadPresignIssuer" && k !== "sessionPipeline" && k !== "sessionReadApi" && k !== "bufferedGcRoleArn" && k !== "crossAccountWorkerRoleArn" && k !== "rearmSweeperRoleArn" && k !== "rearmSweeperStateDeny" && k !== "rearmPassReceiptRetentionDays" && k !== "sessionAnalysisRunnerRoleArn" && k !== "backlogOpsRoles" && k !== "inboxBridgeUserArn" && k !== "adoptIdentities") refuse(`transcriptStore.${k} is not a known setting`);
   assertBufferedGcRoleArn(store.bufferedGcRoleArn, inputs.accountId);
   if (store.crossAccountWorkerRoleArn !== undefined) assertCrossAccountWorkerRoleArn(store.crossAccountWorkerRoleArn, inputs.accountId);
   if (store.rearmSweeperRoleArn !== undefined) assertRearmSweeperRoleArn(store.rearmSweeperRoleArn);
+  if (store.rearmSweeperStateDeny !== undefined) {
+    if (typeof store.rearmSweeperStateDeny !== "boolean") refuse("transcriptStore.rearmSweeperStateDeny must be true or false (omit for the default, on)");
+    if (store.rearmSweeperRoleArn === undefined) refuse("transcriptStore.rearmSweeperStateDeny is only meaningful with rearmSweeperRoleArn");
+  }
+  if (store.rearmPassReceiptRetentionDays !== undefined) assertRearmPassReceiptRetentionDays(store.rearmPassReceiptRetentionDays);
   if (store.sessionAnalysisRunnerRoleArn !== undefined) assertSessionAnalysisRunnerRoleArn(store.sessionAnalysisRunnerRoleArn);
   if (store.backlogOpsRoles !== undefined) assertBacklogOpsRoles(store.backlogOpsRoles, inputs.accountId, stage);
   if (store.inboxBridgeUserArn !== undefined) {
@@ -457,6 +483,8 @@ export type TranscriptStorePlanPhase =
   | "cross-account worker grants"
   | "session analysis runner grants"
   | "rearm sweeper grants"
+  | "rearm sweeper writer deny"
+  | "rearm receipt retention"
   | "backlog ops key grants"
   | "inbox bridge grants"
   | "adopt identities";
@@ -738,7 +766,7 @@ export interface TranscriptStorePlanCapture {
    * accepted only when these say it should be: uploadPresignIssuer true and uploadControlRoleArn unset. The rearm
    * sweeper grants are accepted only for the rearmSweeperRoleArn set here (and removed only while it is unset).
    */
-  uploadInputs?: { uploadControlRoleArn?: unknown; uploadPresignIssuer?: unknown; rearmSweeperRoleArn?: unknown; sessionAnalysisRunnerRoleArn?: unknown };
+  uploadInputs?: { uploadControlRoleArn?: unknown; uploadPresignIssuer?: unknown; rearmSweeperRoleArn?: unknown; rearmSweeperStateDeny?: unknown; rearmPassReceiptRetentionDays?: unknown; sessionAnalysisRunnerRoleArn?: unknown };
 }
 
 /**
@@ -943,6 +971,9 @@ export function assertTranscriptStorePlanContract(planText: string, capture: Tra
     assertRepoTagRenameDiff(compact.operations, capture.detailedPlanText, capture.stateSnapshotText, refuse);
     return "repo tag rename";
   }
+  // D5: a change to the transcripts bucket's lifecycle rules is only ever the pass-receipt expiry rule, alone.
+  const retentionPhase = rearmReceiptRetentionPhase(compact.operations, capture.detailedPlanText, capture.uploadInputs?.rearmPassReceiptRetentionDays, refuse);
+  if (retentionPhase) return retentionPhase;
   const analysisRunnerPhase = sessionAnalysisRunnerGrantsPhase(
     compact.operations,
     capture.detailedPlanText,
@@ -955,7 +986,7 @@ export function assertTranscriptStorePlanContract(planText: string, capture: Tra
   const workerGrantPhase = crossAccountWorkerGrantsPhase(compact.operations, capture.detailedPlanText, refuse);
   if (workerGrantPhase) return workerGrantPhase;
   // The rearm sweeper's grants (rearmSweeperRoleArn) are added alone too, and only for the role the inputs name.
-  const rearmPhase = rearmSweeperGrantsPhase(compact.operations, capture.detailedPlanText, capture.uploadInputs?.rearmSweeperRoleArn, refuse);
+  const rearmPhase = rearmSweeperGrantsPhase(compact.operations, capture.detailedPlanText, capture.uploadInputs, refuse);
   if (rearmPhase) return rearmPhase;
   // The backlog-ops roles' key statements (backlogOpsRoles) are added alone too: only the key policy updates.
   const backlogOpsPhase = backlogOpsKeyGrantsPhase(compact.operations, capture.detailedPlanText, refuse);
@@ -1394,7 +1425,8 @@ function assertWorkerGrantDiff(block: readonly string[], resource: (typeof WORKE
  * builds them; removals (the revocation path) only while it is unset. Guards every other phase like the worker grants: a plan that touches a rearm statement is refused unless it
  * is exactly this phase. Undefined when the plan does not touch the rearm statements at all.
  */
-function rearmSweeperGrantsPhase(operations: ReadonlyMap<string, string>, detailedPlanText: string, inputRoleArn: unknown, refuse: (why: string) => never): TranscriptStorePlanPhase | undefined {
+function rearmSweeperGrantsPhase(operations: ReadonlyMap<string, string>, detailedPlanText: string, inputs: TranscriptStorePlanCapture["uploadInputs"], refuse: (why: string) => never): TranscriptStorePlanPhase | undefined {
+  const inputRoleArn = inputs?.rearmSweeperRoleArn, stateDeny = inputs?.rearmSweeperStateDeny;
   const lines = detailedPlanText.split(/\r?\n/);
   const say = (r: string) => (why: string): never => refuse(`rearm sweeper grants: ${r}: ${why}`);
   const updated = WORKER_POLICY_RESOURCES.filter((r) => operations.get(r) === "update");
@@ -1413,8 +1445,13 @@ function rearmSweeperGrantsPhase(operations: ReadonlyMap<string, string>, detail
   if (inputRoleArn !== undefined) {
     try { assertRearmSweeperRoleArn(inputRoleArn); } catch { return refuse("rearm sweeper grants: the inputs' rearmSweeperRoleArn is not an exact role ARN"); }
   }
+  if (stateDeny !== undefined && typeof stateDeny !== "boolean") return refuse("rearm sweeper grants: the inputs' rearmSweeperStateDeny must be true or false");
+  // D5: with the role set, the state deny goes with the grants unless rearmSweeperStateDeny is false.
+  const withDeny = inputRoleArn !== undefined && stateDeny !== false;
+  const denyPhase = rearmSweeperStateDenyPhase(operations, lines, inputRoleArn as string | undefined, withDeny, refuse);
+  if (denyPhase) return denyPhase;
   for (const r of updated) {
-    const role = assertRearmSweeperGrantDiff(planResourceBlock(lines, r), r, say(r));
+    const role = assertRearmSweeperGrantDiff(planResourceBlock(lines, r), r, say(r), inputRoleArn === undefined ? undefined : withDeny);
     if (role === undefined) {
       if (inputRoleArn !== undefined) say(r)("removes the rearm statements while transcriptStore.rearmSweeperRoleArn is set");
     } else if (inputRoleArn === undefined) say(r)("adds the rearm statements but transcriptStore.rearmSweeperRoleArn is unset");
@@ -1446,8 +1483,11 @@ function denyGainsExactlyTheSweeper(before: string, after: string, roleArn: stri
 const REARM_SID_LINE = /^ {2}[+-]\s+(?:- )?Sid:\s*RearmSweeper/;
 
 /** Returns the role an added rearm grant names (undefined for a revocation, whose deny line is checked too). */
-function assertRearmSweeperGrantDiff(block: readonly string[], resource: (typeof WORKER_POLICY_RESOURCES)[number], refuse: (why: string) => never): string | undefined {
-  const expected: readonly string[] = resource === "transcripts" ? REARM_SWEEPER_BUCKET_SIDS : REARM_SWEEPER_KEY_SIDS;
+function assertRearmSweeperGrantDiff(block: readonly string[], resource: (typeof WORKER_POLICY_RESOURCES)[number], refuse: (why: string) => never, withDeny: boolean | undefined): string | undefined {
+  // Adding: the five grants, plus the D5 state deny exactly when it is on (`withDeny`; undefined: the role input is
+  // unset and the caller refuses any add). Revoking: whichever of the two sets is live.
+  const grants: readonly string[] = resource === "transcripts" ? REARM_SWEEPER_BUCKET_SIDS : REARM_SWEEPER_KEY_SIDS;
+  const withState: readonly string[] = resource === "transcripts" ? [...REARM_SWEEPER_BUCKET_SIDS, REARM_SWEEPER_STATE_DENY_SID] : grants;
   const { live, planned } = policyDiffSides(block, refuse);
   if (live.header !== planned.header) refuse("only policy statements may change");
   const added = [...planned.bySid.keys()].filter((sid) => !live.bySid.has(sid)).sort();
@@ -1456,11 +1496,14 @@ function assertRearmSweeperGrantDiff(block: readonly string[], resource: (typeof
   const deny = resource === "transcripts" && live.bySid.has(REARM_DENY_SID) && planned.bySid.has(REARM_DENY_SID) ? REARM_DENY_SID : undefined;
   for (const [sid, text] of live.bySid) {
     if (sid === deny) continue;
-    if (planned.bySid.has(sid) ? planned.bySid.get(sid) !== text : !expected.includes(sid)) refuse(`existing statement ${sid} must stay byte-identical`);
+    if (planned.bySid.has(sid) ? planned.bySid.get(sid) !== text : !withState.includes(sid)) refuse(`existing statement ${sid} must stay byte-identical`);
   }
-  const exact = JSON.stringify([...expected].sort());
-  const adds = removed.length === 0 && JSON.stringify(added) === exact;
-  const removes = added.length === 0 && JSON.stringify(removed) === exact;
+  const expected = withDeny === false ? grants : withState;
+  const either = (sids: string[]) => JSON.stringify(sids) === JSON.stringify([...grants].sort()) || JSON.stringify(sids) === JSON.stringify([...withState].sort());
+  const adds = removed.length === 0 && either(added);
+  // A revocation removes every rearm statement that is live: never the grants while leaving the state deny behind.
+  const liveRearm = withState.filter((sid) => live.bySid.has(sid)).sort();
+  const removes = added.length === 0 && either(removed) && JSON.stringify(removed) === JSON.stringify(liveRearm);
   if (!adds && !removes) refuse(`must add (or, to revoke, remove) exactly ${expected.join(", ")}; adds ${added.join(", ") || "(none)"}, removes ${removed.join(", ") || "(none)"}`);
   // The one role the added (or, revoking, removed) statements name.
   const side = adds ? planned : live;
@@ -1478,9 +1521,12 @@ function assertRearmSweeperGrantDiff(block: readonly string[], resource: (typeof
         : `${REARM_DENY_SID} must lose exactly one line, the rearm sweeper role as the last aws:PrincipalArn item`);
   }
   if (!adds) return undefined;
+  const addsDeny = added.includes(REARM_SWEEPER_STATE_DENY_SID);
+  if (resource === "transcripts" && withDeny !== undefined && addsDeny !== withDeny)
+    refuse(withDeny ? `must add ${REARM_SWEEPER_STATE_DENY_SID} with the grants (transcriptStore.rearmSweeperStateDeny is on)` : `adds ${REARM_SWEEPER_STATE_DENY_SID} but transcriptStore.rearmSweeperStateDeny is false`);
   const n = transcriptNames(TRANSCRIPT_STAGE, TRANSCRIPT_ACCOUNT_ID);
   const want = resource === "transcripts"
-    ? rearmSweeperBucketStatements({ bucketArn: n.bucketArn, roleArn })
+    ? [...rearmSweeperBucketStatements({ bucketArn: n.bucketArn, roleArn }), ...(addsDeny ? [rearmSweeperStateDenyStatement({ bucketArn: n.bucketArn, roleArn })] : [])]
     : [rearmSweeperKeyStatement({ region: TRANSCRIPT_REGION, bucketName: n.bucket, roleArn })];
   for (const statement of want) {
     const got = planned.bySid.get(statement.Sid)!;
@@ -1488,6 +1534,87 @@ function assertRearmSweeperGrantDiff(block: readonly string[], resource: (typeof
   }
   return roleArn;
 }
+
+/**
+ * D5, the "rearm sweeper writer deny" phase: the sweeper's grants are live and stay byte-identical, and the only change
+ * anywhere is RearmSweeperOnlyItWritesItsState added to (or, rolling back with rearmSweeperStateDeny false, removed
+ * from) the bucket policy. Only `transcripts` updates; every other statement, OnlyTheEraserDeletes included, is
+ * unchanged. Adding requires rearmSweeperRoleArn set with the deny on, the statement byte-for-byte as
+ * rearmSweeperStateDenyStatement builds it for that role, and the live grants naming the same role; removing requires
+ * the role set and rearmSweeperStateDeny false. Undefined when the plan is not this shape (the grants phase decides).
+ */
+function rearmSweeperStateDenyPhase(operations: ReadonlyMap<string, string>, lines: readonly string[], inputRoleArn: string | undefined, withDeny: boolean, refuse: (why: string) => never): TranscriptStorePlanPhase | undefined {
+  if (operations.get("transcripts") !== "update") return undefined;
+  const say = (why: string): never => refuse(`rearm sweeper writer deny: ${why}`);
+  const { live, planned } = policyDiffSides(planResourceBlock(lines, "transcripts"), say);
+  const grants = (m: Map<string, string>) => REARM_SWEEPER_BUCKET_SIDS.map((sid) => m.get(sid));
+  const liveGrants = grants(live.bySid), plannedGrants = grants(planned.bySid);
+  // Only this shape: every grant present and unchanged on both sides, and the deny on exactly one side.
+  if (liveGrants.some((t) => t === undefined) || JSON.stringify(liveGrants) !== JSON.stringify(plannedGrants)) return undefined;
+  const liveDeny = live.bySid.has(REARM_SWEEPER_STATE_DENY_SID), plannedDeny = planned.bySid.has(REARM_SWEEPER_STATE_DENY_SID);
+  if (liveDeny === plannedDeny) return undefined;
+  const changed = [...operations].filter(([, a]) => a !== "noop");
+  if (!(changed.length === 1 && changed[0]![0] === "transcripts"))
+    say(`must deploy alone (only transcripts may update): ${changed.map(([r, a]) => `${r}:${a}`).join(", ")}`);
+  if (live.header !== planned.header) say("only policy statements may change");
+  const others = (m: Map<string, string>) => JSON.stringify([...m].filter(([sid]) => sid !== REARM_SWEEPER_STATE_DENY_SID));
+  if (others(live.bySid) !== others(planned.bySid)) say("every other statement must stay byte-identical, in order");
+  if (inputRoleArn === undefined) say("transcriptStore.rearmSweeperRoleArn is unset");
+  // The live grants name exactly the input's role.
+  const named = new Set(REARM_SWEEPER_BUCKET_SIDS.flatMap((sid) => [...live.bySid.get(sid)!.matchAll(/^\s*AWS:\s*(\S+)\s*$/gm)].map((m) => unquoteYaml(`AWS: ${m[1]!}`).slice(5))));
+  if (named.size !== 1 || !named.has(inputRoleArn!)) say("the live rearm grants must name exactly transcriptStore.rearmSweeperRoleArn");
+  if (plannedDeny) {
+    if (!withDeny) say("adds the state deny but transcriptStore.rearmSweeperStateDeny is false");
+    const n = transcriptNames(TRANSCRIPT_STAGE, TRANSCRIPT_ACCOUNT_ID);
+    const want = rearmSweeperStateDenyStatement({ bucketArn: n.bucketArn, roleArn: inputRoleArn! });
+    if (unquoteYaml(planned.bySid.get(REARM_SWEEPER_STATE_DENY_SID)!) !== planYaml([want], planned.itemIndent).join("\n"))
+      say(`${REARM_SWEEPER_STATE_DENY_SID} must be exactly the reviewed statement`);
+  } else if (withDeny) say("removes the state deny but transcriptStore.rearmSweeperStateDeny is not false");
+  return "rearm sweeper writer deny";
+}
+
+const LIFECYCLE_MARKED = /^ {2}[+-]\s+lifecycleRules:\s*$/;
+
+/**
+ * D5, the "rearm receipt retention" phase: any plan whose `transcripts` update marks its lifecycleRules is judged here,
+ * first, and only this shape passes: only `transcripts` updates, every marked line is the lifecycleRules value (no
+ * other property, no policy statement), the live rules are exactly transcriptLifecycleRules with or without the
+ * receipt rule, the planned ones exactly transcriptLifecycleRules for the inputs' rearmPassReceiptRetentionDays
+ * (adding it, changing its days, or, unset, removing it), and the two differ.
+ */
+function rearmReceiptRetentionPhase(operations: ReadonlyMap<string, string>, detailedPlanText: string, inputDays: unknown, refuse: (why: string) => never): TranscriptStorePlanPhase | undefined {
+  if (operations.get("transcripts") !== "update") return undefined;
+  const block = planResourceBlock(detailedPlanText.split(/\r?\n/), "transcripts");
+  if (!block.some((l) => LIFECYCLE_MARKED.test(l))) return undefined;
+  const say = (why: string): never => refuse(`rearm receipt retention: ${why}`);
+  const changed = [...operations].filter(([, a]) => a !== "noop");
+  if (!(changed.length === 1 && changed[0]![0] === "transcripts"))
+    say(`must deploy alone (only transcripts may update): ${changed.map(([r, a]) => `${r}:${a}`).join(", ")}`);
+  if (inputDays !== undefined) {
+    try { assertRearmPassReceiptRetentionDays(inputDays); } catch { say("the inputs' rearmPassReceiptRetentionDays is not a positive whole number of days"); }
+  }
+  const marked = block.filter((l) => /^ {2}[+-] /.test(l));
+  const side = (m: "+" | "-") => {
+    const got = marked.filter((l) => l[2] === m).map((l) => l.slice(3));
+    const head = got[0] === undefined ? null : /^( *)lifecycleRules:\s*$/.exec(got[0]);
+    if (!head) return say("only lifecycleRules may change");
+    const indent = head[1]!.length, items = got.slice(1);
+    if (items.length === 0 || items.some((l) => /^ */.exec(l)![0].length <= indent)) say("only lifecycleRules may change");
+    return { text: unquoteYaml(items.join("\n")), itemIndent: /^ */.exec(items[0]!)![0].length };
+  };
+  const live = side("-"), planned = side("+");
+  const render = (days: number | undefined, at: number) => planYaml(transcriptLifecycleRules(days === undefined ? {} : { rearmPassReceiptRetentionDays: days }), at).join("\n");
+  const liveDays = [...live.text.matchAll(/^\s*Days:\s*(\d+)\s*$/gm)].map((m) => Number(m[1]));
+  if (liveDays.length > 1 || live.text !== render(liveDays[0], live.itemIndent))
+    say("the live lifecycle rules must be exactly the stack's, with or without the pass-receipt rule");
+  if (planned.text !== render(inputDays as number | undefined, planned.itemIndent))
+    say(inputDays === undefined
+      ? "the planned lifecycle rules must be exactly the stack's without the pass-receipt rule (rearmPassReceiptRetentionDays is unset)"
+      : "the planned lifecycle rules must be exactly the stack's with the pass-receipt rule for rearmPassReceiptRetentionDays");
+  if (live.text === planned.text) say("the lifecycle rules do not change");
+  return "rearm receipt retention";
+}
+
 
 /**
  * The backlog-ops key grants phase: everything noop except `transcripts-key`, whose detailed diff is the live
@@ -2081,12 +2208,50 @@ function assertPendingSrvWriterKeyUpdate(stateSnapshotText: string, refuse: (why
  * asynchronous, so it is the backstop: the erasure job deletes every version
  * explicitly (DeleteObjectVersion), which is immediate.
  */
-export function transcriptLifecycleRules() {
+export function transcriptLifecycleRules(o: { rearmPassReceiptRetentionDays?: number } = {}) {
+  if (o.rearmPassReceiptRetentionDays !== undefined) assertRearmPassReceiptRetentionDays(o.rearmPassReceiptRetentionDays);
   return [
     { ID: "expire-noncurrent-versions", Status: "Enabled", Filter: { Prefix: "" }, NoncurrentVersionExpiration: { NoncurrentDays: NONCURRENT_VERSION_DAYS } },
     { ID: "remove-expired-delete-markers", Status: "Enabled", Filter: { Prefix: "" }, Expiration: { ExpiredObjectDeleteMarker: true } },
     { ID: "abort-incomplete-uploads", Status: "Enabled", Filter: { Prefix: "" }, AbortIncompleteMultipartUpload: { DaysAfterInitiation: ABORT_INCOMPLETE_UPLOAD_DAYS } },
+    ...(o.rearmPassReceiptRetentionDays !== undefined ? [rearmPassReceiptLifecycleRule(o.rearmPassReceiptRetentionDays)] : []),
   ];
+}
+
+/**
+ * The rearm sweeper's statements, last in the transcripts bucket policy, as the stage renders them: nothing while
+ * rearmSweeperRoleArn is unset; otherwise its five grants, then (D5) RearmSweeperOnlyItWritesItsState unless
+ * rearmSweeperStateDeny is false.
+ */
+export function rearmSweeperBucketTail(bucketArn: string, store: Pick<TranscriptStoreInputs, "rearmSweeperRoleArn" | "rearmSweeperStateDeny">) {
+  if (store.rearmSweeperRoleArn === undefined) return [];
+  return [
+    ...rearmSweeperBucketStatements({ bucketArn, roleArn: store.rearmSweeperRoleArn }),
+    ...(store.rearmSweeperStateDeny !== false ? [rearmSweeperStateDenyStatement({ bucketArn, roleArn: store.rearmSweeperRoleArn })] : []),
+  ];
+}
+
+/**
+ * D5: the rearm sweeper's pass receipts (src/session-ingest/rearm-sweeper-receipt.ts) are create-only, one per org per
+ * pass, and the sweeper may not delete under a dot prefix, so they expire here. CURRENT-version expiration only, on
+ * `passes/` only (never the cursors beside it). The bucket is versioned: at `days` S3 adds a delete marker (the
+ * receipt becomes noncurrent), expire-noncurrent-versions removes that version NONCURRENT_VERSION_DAYS later, and
+ * remove-expired-delete-markers then removes the lone marker. Each `latest.json` is rewritten every pass, so while the
+ * sweeper runs its current version stays younger than the pass interval; a pointer the sweeper stopped rewriting
+ * expires too, which the reader treats as missing (fail closed). Lifecycle runs asynchronously (S3 rounds due times
+ * to the next 00:00 UTC): an expired receipt may stay readable for up to a day longer; freshness, not expiry, bounds
+ * what the reader accepts.
+ */
+export const REARM_PASS_RECEIPT_RULE_ID = "expire-rearm-sweeper-pass-receipts";
+export const REARM_PASS_RECEIPT_PREFIX = `${TENANT_KEY_BASE}/.ledger/rearm-sweeper/passes/`;
+/** S3 lifecycle `Days` is a positive integer (at most 2^31 - 1). No default: the operator chooses it. */
+export function assertRearmPassReceiptRetentionDays(v: unknown): asserts v is number {
+  if (typeof v !== "number" || !Number.isSafeInteger(v) || v < 1 || v > 2_147_483_647)
+    throw new Error("96bulls: transcriptStore.rearmPassReceiptRetentionDays must be a positive whole number of days (omit for no expiry rule)");
+}
+export function rearmPassReceiptLifecycleRule(days: number) {
+  assertRearmPassReceiptRetentionDays(days);
+  return { ID: REARM_PASS_RECEIPT_RULE_ID, Status: "Enabled", Filter: { Prefix: REARM_PASS_RECEIPT_PREFIX }, Expiration: { Days: days } };
 }
 
 export function accessLogLifecycleRules() {
@@ -2450,6 +2615,9 @@ export const transcriptStoreStage = (i: TranscriptStageInputs) =>
       assertBufferedGcRoleArn(i.transcriptStore.bufferedGcRoleArn, i.accountId);
     if (i.transcriptStore.crossAccountWorkerRoleArn !== undefined) assertCrossAccountWorkerRoleArn(i.transcriptStore.crossAccountWorkerRoleArn, i.accountId);
     if (i.transcriptStore.rearmSweeperRoleArn !== undefined) assertRearmSweeperRoleArn(i.transcriptStore.rearmSweeperRoleArn);
+    if (i.transcriptStore.rearmSweeperStateDeny !== undefined && (typeof i.transcriptStore.rearmSweeperStateDeny !== "boolean" || i.transcriptStore.rearmSweeperRoleArn === undefined))
+      throw new Error("96bulls: transcriptStore.rearmSweeperStateDeny must be true or false, and only with rearmSweeperRoleArn");
+    if (i.transcriptStore.rearmPassReceiptRetentionDays !== undefined) assertRearmPassReceiptRetentionDays(i.transcriptStore.rearmPassReceiptRetentionDays);
     if (i.transcriptStore.sessionAnalysisRunnerRoleArn !== undefined) assertSessionAnalysisRunnerRoleArn(i.transcriptStore.sessionAnalysisRunnerRoleArn);
     if (i.transcriptStore.backlogOpsRoles !== undefined) assertBacklogOpsRoles(i.transcriptStore.backlogOpsRoles, i.accountId, i.stage);
     assertInboxAuthorityKeyRoot(i.transcriptStore.inboxAuthorityKeyRoot, (why) => { throw new Error(why); });
@@ -2656,9 +2824,10 @@ export const transcriptStoreStage = (i: TranscriptStageInputs) =>
         ...(readApiRoleArn ? [readApiAnalysisBucketStatement({ bucketArn: n.bucketArn, roleArn: readApiRoleArn, glob: ANALYSIS_RESULT_OBJECT_GLOB })] : []),
         ...(uploadInboxRoles ? uploadAdmissionBucketStatements({ bucketArn: n.bucketArn, consumerRoleArn: uploadInboxRoles.consumerRoleArn, promotionObjects: srvWriterObjects(n.bucketArn, i.transcriptStore.inboxAuthorityKeyRoot), ledgerLogCommit: i.transcriptStore.uploadAdmission?.ledgerLogCommit === "on" }) : []),
         // Last, as live: the rearm sweeper's five statements (unset, the policy is byte-identical).
-        ...(i.transcriptStore.rearmSweeperRoleArn !== undefined ? rearmSweeperBucketStatements({ bucketArn: n.bucketArn, roleArn: i.transcriptStore.rearmSweeperRoleArn }) : []),
+        // D5, after them: only the sweeper role writes or deletes its own state (rearmSweeperStateDeny false: removed).
+        ...rearmSweeperBucketTail(n.bucketArn, i.transcriptStore),
       ] as never,
-      lifecycleRules: transcriptLifecycleRules() as never,
+      lifecycleRules: transcriptLifecycleRules(i.transcriptStore.rearmPassReceiptRetentionDays !== undefined ? { rearmPassReceiptRetentionDays: i.transcriptStore.rearmPassReceiptRetentionDays } : {}) as never,
       logging: { targetBucket: accessLogs.bucketName as unknown as string, targetPrefix: ACCESS_LOG_PREFIX, targetObjectKeyFormat: { PartitionedPrefix: { PartitionDateSource: "EventTime" } } as never },
       tags: i.tags("transcripts"),
     });

@@ -52,6 +52,26 @@ export function rearmSweeperBucketStatements(i: { bucketArn: string; roleArn: st
   ];
 }
 
+/**
+ * D5: the sweeper's own state (`96bulls/.ledger/rearm-sweeper/*`: its cursors and its pass receipts,
+ * src/session-ingest/rearm-sweeper-receipt.ts) is written and deleted only by the sweeper role. Every other principal
+ * (the account's own roles and users included) is denied PutObject and DeleteObject there, so a receipt read from that
+ * prefix was written by the sweeper role. Not DeleteObjectVersion: removing a receipt can only make the evidence
+ * missing (the reader fails closed), never forge it, and the eraser's version deletes stay as they are. Lifecycle
+ * expiration is performed by S3 itself and is not evaluated against this policy. Rendered last, after the five grants,
+ * only while transcriptStore.rearmSweeperRoleArn is set (and transcriptStore.rearmSweeperStateDeny is not false).
+ */
+export const REARM_SWEEPER_STATE_DENY_SID = "RearmSweeperOnlyItWritesItsState";
+export const REARM_SWEEPER_STATE_PREFIX = `${TENANT_KEY_BASE}/.ledger/rearm-sweeper/`;
+export function rearmSweeperStateDenyStatement(i: { bucketArn: string; roleArn: string }) {
+  assertRearmSweeperRoleArn(i.roleArn);
+  return {
+    Sid: REARM_SWEEPER_STATE_DENY_SID, Effect: "Deny" as const, Principal: "*", Action: ["s3:DeleteObject", "s3:PutObject"],
+    Resource: `${i.bucketArn}/${REARM_SWEEPER_STATE_PREFIX}*`,
+    Condition: { ArnNotEquals: { "aws:PrincipalArn": i.roleArn } },
+  };
+}
+
 /** Decrypt and data keys through S3 in the bucket's region, for objects under `96bulls/`, from the role's own account. */
 export function rearmSweeperKeyStatement(i: { region: string; bucketName: string; roleArn: string }) {
   const callerAccount = assertRearmSweeperRoleArn(i.roleArn);
