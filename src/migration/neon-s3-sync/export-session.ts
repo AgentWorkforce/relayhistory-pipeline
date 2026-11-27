@@ -142,6 +142,10 @@ function sameRawMachine(manifest: ManifestV1, sourceMachineId: string): boolean 
   return bulls?.canonical_machine_id === sourceMachineId && catalog?.neon_machine_id === sourceMachineId;
 }
 
+/** A session location without its date: two streams of one unit must never share it. */
+const undatedLocation = (loc: SessionLocation) =>
+  JSON.stringify([loc.prefix ?? "", loc.workspaceId, loc.machineId, loc.harness, loc.sessionId]);
+
 const sameVersion = (a: ObjectVersion, b: ObjectVersion) => a.eTag === b.eTag && a.version === b.version;
 
 /**
@@ -587,9 +591,10 @@ export async function exportUnit(
     let stream = streams.get(line.machine);
     if (!stream) {
       stream = new MachineStream(target, unit, line.machine, await datePin(target, unit, line.machine, opts.priorKeys));
-      // Two Neon machines that sanitize to one key would interleave: refuse.
+      // Two Neon machines that sanitize to one key would interleave: refuse. Compared without the date, so a pinned
+      // stream and an unpinned alias of it (same machine component, another d=) are refused too.
       for (const other of streams.values())
-        if (other.key === stream.key)
+        if (undatedLocation(other.loc) === undatedLocation(stream.loc))
           throw Object.assign(new Error("two machines map to one key"), { code: "machine_key_collision" });
       // Ownership first: a foreign or colliding manifest throws here and its key
       // is never recorded (the eraser cannot read manifests, so only owned keys
