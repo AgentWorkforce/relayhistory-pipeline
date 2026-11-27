@@ -2747,7 +2747,23 @@ describe("function boundary: ACL manifest, residual, activation gate", () => {
     expect((await db.query<{ n: number }>("SELECT count(*)::int n FROM pg_trigger WHERE tgname IN ('ingest_org_erasure_history_record','ingest_org_erasure_history_refuse_truncate')")).rows[0]!.n).toBe(0);
     for (const r of ["sessions.ingest_org_erasure_history", "sessions.ingest_org_erasure_history_coverage", "sessions.ingest_org_erasure_history_bindings"]) expect(await relation(r)).toBe(r);
     expect((await failure(rollback("20261105062340_ingest_org_erasure_history.down.sql")))?.code).toBe("55000");
-    // 20261105062320 (the per-org admission hold) is newest: 062300's down refuses (55000) while it is applied; its
+    // 20261105062330 (the buffered feed custom plans) is then newest: 062320's down refuses (55000) while it is applied; its
+    // checksum-pinned down RESETs plan_cache_mode on the stage RPC and gc_ordinals (their prior proconfig exactly),
+    // removes its ledger row, and refuses on a rerun.
+    const BCP = "upstream:20261105062330_buffered_search_feed_custom_plans.sql";
+    const cfg = async (sig: string) =>
+      (await db.query<{ c: string[] }>("SELECT proconfig c FROM pg_proc WHERE oid=$1::regprocedure", [sig])).rows[0]!.c;
+    const STAGE_RPC = "sessions.buffered_search_feed_stage(jsonb)", GC_ORDINALS = "sessions.ingest_buffer_gc_ordinals(uuid)";
+    expect(await names()).toContain(BCP);
+    expect(await cfg(STAGE_RPC)).toEqual(["search_path=pg_catalog, sessions, pg_temp", "lock_timeout=2s", "plan_cache_mode=force_custom_plan"]);
+    expect(await cfg(GC_ORDINALS)).toEqual(["search_path=pg_catalog, pg_temp", "plan_cache_mode=force_custom_plan"]);
+    expect((await failure(rollback("20261105062320_ingest_org_admission_fences.down.sql")))?.code).toBe("55000");
+    await rollback("20261105062330_buffered_search_feed_custom_plans.down.sql");
+    expect(await names()).not.toContain(BCP);
+    expect(await cfg(STAGE_RPC)).toEqual(["search_path=pg_catalog, sessions, pg_temp", "lock_timeout=2s"]);
+    expect(await cfg(GC_ORDINALS)).toEqual(["search_path=pg_catalog, pg_temp"]);
+    expect((await failure(rollback("20261105062330_buffered_search_feed_custom_plans.down.sql")))?.code).toBe("55000");
+    // 20261105062320 (the per-org admission hold) is then newest: 062300's down refuses (55000) while it is applied; its
     // checksum-pinned down (no unreleased hold) restores the 17 replaced entry functions' exact prior bodies, drops the
     // hold functions and the batch backstop trigger, keeps the hold history and its immutability guard (retained),
     // removes its ledger row, and refuses on a rerun.

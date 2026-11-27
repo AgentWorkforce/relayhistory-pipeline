@@ -542,10 +542,11 @@ describe("062180 rollback", () => {
     try {
       await runMigrations(client, { profile: LOCAL });
       const later = (await plan(LOCAL)).filter((x) => x.name.startsWith("upstream:") && x.name > STEP).map((x) => x.name);
-      expect(later).toEqual(["upstream:20261105062190_coordination_advisories_pending_priority.sql", "upstream:20261105062200_session_directory_list_readiness.sql", "upstream:20261105062210_lazy_ack_t2.sql", "upstream:20261105062220_coordination_advisories_incarnation.sql", "upstream:20261105062300_search_index_stage.sql", "upstream:20261105062320_ingest_org_admission_fences.sql", "upstream:20261105062340_ingest_org_erasure_history.sql"]);
+      expect(later).toEqual(["upstream:20261105062190_coordination_advisories_pending_priority.sql", "upstream:20261105062200_session_directory_list_readiness.sql", "upstream:20261105062210_lazy_ack_t2.sql", "upstream:20261105062220_coordination_advisories_incarnation.sql", "upstream:20261105062300_search_index_stage.sql", "upstream:20261105062320_ingest_org_admission_fences.sql", "upstream:20261105062330_buffered_search_feed_custom_plans.sql", "upstream:20261105062340_ingest_org_erasure_history.sql"]);
       expect((await refusal(DOWN))?.message).toContain("a later migration is applied");
-      // 062300 comes off first, then 062220, 062210, 062200 and 062190.
+      // 062340, 062330 and 062320 come off first, then 062300, 062220, 062210, 062200 and 062190.
       await db.exec(read("supabase/rollbacks/20261105062340_ingest_org_erasure_history.down.sql"));
+      await db.exec(read("supabase/rollbacks/20261105062330_buffered_search_feed_custom_plans.down.sql"));
       await db.exec(read("supabase/rollbacks/20261105062320_ingest_org_admission_fences.down.sql"));
       await db.exec(read("supabase/rollbacks/20261105062300_search_index_stage.down.sql"));
       await db.exec(read("supabase/rollbacks/20261105062220_coordination_advisories_incarnation.down.sql"));

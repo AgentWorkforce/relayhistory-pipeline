@@ -703,6 +703,10 @@ export const MIGRATION_SENTINELS: Record<string, Sentinel> = {
     evidence: "function sessions.ingest_org_admission_hold_check(text,text) and the batch backstop trigger on sessions.ingest_batches (the per-org admission hold)",
     sql: "SELECT to_regprocedure('sessions.ingest_org_admission_hold_check(text,text)') IS NOT NULL AND EXISTS(SELECT 1 FROM pg_trigger WHERE tgrelid=to_regclass('sessions.ingest_batches') AND tgname='ingest_org_admission_hold_batch_backstop' AND NOT tgisinternal) AS applied",
   },
+  "upstream:20261105062330_buffered_search_feed_custom_plans.sql": {
+    evidence: "replacement: buffered_search_feed_stage and ingest_buffer_gc_ordinals carry plan_cache_mode=force_custom_plan",
+    sql: "SELECT count(*)=2 AS applied FROM pg_proc WHERE oid IN(to_regprocedure('sessions.buffered_search_feed_stage(jsonb)'),to_regprocedure('sessions.ingest_buffer_gc_ordinals(uuid)')) AND 'plan_cache_mode=force_custom_plan'=ANY(proconfig)",
+  },
   "upstream:20261105062340_ingest_org_erasure_history.sql": {
     evidence: "function sessions.ingest_org_erasure_history_bind(text,uuid,text,bigint,text) and the recorder trigger on sessions.upload_deletions (the per-org erasure history)",
     sql: "SELECT to_regprocedure('sessions.ingest_org_erasure_history_bind(text,uuid,text,bigint,text)') IS NOT NULL AND EXISTS(SELECT 1 FROM pg_trigger WHERE tgrelid=to_regclass('sessions.upload_deletions') AND tgname='ingest_org_erasure_history_record' AND NOT tgisinternal) AS applied",
@@ -726,4 +730,5 @@ export const NON_CREATE_STEPS = [
   "96bulls:0004_summary_pointers.sql",
   "upstream:20261105043900_session_consumer_function_grants.sql",
   "upstream:20261105045030_session_consumer_project_text_grant.sql",
+  "upstream:20261105062330_buffered_search_feed_custom_plans.sql",
 ] as const;

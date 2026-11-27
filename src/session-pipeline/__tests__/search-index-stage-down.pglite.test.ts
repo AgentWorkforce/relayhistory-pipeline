@@ -53,10 +53,14 @@ const KEPT = { table: "sessions.search_stage_archive", index: "sessions.search_s
 // first (it has no hold installed here), so 062300 is newest whenever its own down is exercised.
 const HOLD_DOWN = readFileSync(join(import.meta.dir, "../../../supabase/rollbacks/20261105062320_ingest_org_admission_fences.down.sql"), "utf8");
 const HISTORY_DOWN = readFileSync(join(import.meta.dir, "../../../supabase/rollbacks/20261105062340_ingest_org_erasure_history.down.sql"), "utf8");
+const CUSTOM_PLANS_DOWN = readFileSync(join(import.meta.dir, "../../../supabase/rollbacks/20261105062330_buffered_search_feed_custom_plans.down.sql"), "utf8");
 const holdOff = async (pg: PGlite) => {
   // 20261105062340 (the erasure history) sits above 062320 and is rolled back first.
   const history = (await pg.query<{ n: number }>("SELECT count(*)::int AS n FROM sessions.__96bulls_migrations WHERE name = 'upstream:20261105062340_ingest_org_erasure_history.sql'")).rows[0]!.n;
   if (history) await pg.exec(HISTORY_DOWN);
+  // 20261105062330 (the buffered feed custom plans) sits above 062320 and comes off next.
+  const plans = (await pg.query<{ n: number }>("SELECT count(*)::int AS n FROM sessions.__96bulls_migrations WHERE name = 'upstream:20261105062330_buffered_search_feed_custom_plans.sql'")).rows[0]!.n;
+  if (plans) await pg.exec(CUSTOM_PLANS_DOWN);
   const applied = (await pg.query<{ n: number }>("SELECT count(*)::int AS n FROM sessions.__96bulls_migrations WHERE name = 'upstream:20261105062320_ingest_org_admission_fences.sql'")).rows[0]!.n;
   if (applied) await pg.exec(HOLD_DOWN);
 };

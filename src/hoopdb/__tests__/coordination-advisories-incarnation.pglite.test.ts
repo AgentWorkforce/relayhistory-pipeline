@@ -29,7 +29,10 @@ const SEARCH_STAGE_DOWN = read("supabase/rollbacks/20261105062300_search_index_s
 // 20261105062320 (the per-org admission hold) sits above 062300: its down runs first of all.
 const HOLD_STEP = "upstream:20261105062320_ingest_org_admission_fences.sql";
 const HOLD_DOWN = read("supabase/rollbacks/20261105062320_ingest_org_admission_fences.down.sql");
-// 20261105062340 (the per-org erasure history) sits above 062320: its down runs before 062320's.
+// 20261105062330 (the buffered feed custom plans) sits above 062320: its down runs before 062320's.
+const CUSTOM_PLANS_STEP = "upstream:20261105062330_buffered_search_feed_custom_plans.sql";
+const CUSTOM_PLANS_DOWN = read("supabase/rollbacks/20261105062330_buffered_search_feed_custom_plans.down.sql");
+// 20261105062340 (the per-org erasure history) sits above 062330: its down runs first of all.
 const HISTORY_STEP = "upstream:20261105062340_ingest_org_erasure_history.sql";
 const HISTORY_DOWN = read("supabase/rollbacks/20261105062340_ingest_org_erasure_history.down.sql");
 const V1_SQL = read("supabase/migrations/20261105062000_coordination_advisories.sql");
@@ -148,6 +151,7 @@ describe("20261105062220 coordination advisories: the advisory instance", () => 
     // Before: roll 062220 back, write pending, delivered and acked rows through 062000's v1, then re-apply 062220.
     await reset();
     await db.exec(HISTORY_DOWN);
+    await db.exec(CUSTOM_PLANS_DOWN);
     await db.exec(HOLD_DOWN);
     await db.exec(SEARCH_STAGE_DOWN);
     await db.exec(DOWN);
@@ -352,9 +356,10 @@ describe("20261105062220 rollback", () => {
     const h = harness(() => db);
     const message = async (sql: string) => { const m = await db.exec(sql).then(() => null, (e: Error) => e.message); await db.exec("ROLLBACK").catch(() => {}); return m; };
     try {
-      expect((await plan(LOCAL)).filter((s) => s.name.startsWith("upstream:") && s.name > STEP).map((s) => s.name)).toEqual([SEARCH_STAGE_STEP, HOLD_STEP, HISTORY_STEP]);
+      expect((await plan(LOCAL)).filter((s) => s.name.startsWith("upstream:") && s.name > STEP).map((s) => s.name)).toEqual([SEARCH_STAGE_STEP, HOLD_STEP, CUSTOM_PLANS_STEP, HISTORY_STEP]);
       expect(await message(DOWN)).toContain("a later migration is applied");
       await db.exec(HISTORY_DOWN);
+      await db.exec(CUSTOM_PLANS_DOWN);
       await db.exec(HOLD_DOWN);
     await db.exec(SEARCH_STAGE_DOWN);
       expect(await message(read("supabase/rollbacks/20261105062190_coordination_advisories_pending_priority.down.sql"))).toContain("a later migration is applied");
