@@ -46,9 +46,10 @@ const REPLACES: Readonly<Record<string, ReplacedFunction>> = {
  * predicate. The migration's up embeds it verbatim (a retained history must match before reapply) and the generated
  * down asserts it last, before removing its ledger row (a test pins both copies to this one).
  */
-export const HOLD_HISTORY_SHAPE = `-- The exact retained history: owner, columns, indexes, constraints (NOT NULL is the column check; PostgreSQL 18 and
--- PGlite also catalogue it as a constraint, so 'n' rows are excluded) and the four guard triggers on the guard
--- function, enabled. Shared verbatim by this slot's up and its generated down (lane ingest-org-admission-hold).
+export const HOLD_HISTORY_SHAPE = `-- The exact retained history: owner, columns, column defaults, indexes, constraints (NOT NULL is the column check;
+-- PostgreSQL 18 and PGlite also catalogue it as a constraint, so 'n' rows are excluded), the four guard triggers on the
+-- guard function, enabled, and owner-only ACLs on both tables (every grantee, column grants included) and on the guard
+-- function (PUBLIC included). Shared verbatim by this slot's up and its generated down (lane ingest-org-admission-hold).
  (SELECT pg_get_userbyid(relowner) FROM pg_class WHERE oid = 'sessions.ingest_org_admission_holds'::regclass) = current_user
  AND (SELECT pg_get_userbyid(relowner) FROM pg_class WHERE oid = 'sessions.ingest_org_admission_hold_events'::regclass) = current_user
  AND (SELECT string_agg(attname || ' ' || format_type(atttypid, atttypmod) || CASE WHEN attnotnull THEN ' not null' ELSE '' END, ', ' ORDER BY attnum)
@@ -89,7 +90,17 @@ export const HOLD_HISTORY_SHAPE = `-- The exact retained history: owner, columns
        WHERE t.tgrelid IN ('sessions.ingest_org_admission_holds'::regclass, 'sessions.ingest_org_admission_hold_events'::regclass) AND NOT t.tgisinternal
          AND t.tgenabled = 'O' AND t.tgfoid = 'sessions.ingest_org_admission_hold_guard()'::regprocedure)
      = ARRAY['ingest_org_admission_hold_events_guard 27', 'ingest_org_admission_hold_events_truncate 34', 'ingest_org_admission_holds_guard 27', 'ingest_org_admission_holds_truncate 34']::text[]
- AND (SELECT count(*) FROM pg_trigger t WHERE t.tgrelid IN ('sessions.ingest_org_admission_holds'::regclass, 'sessions.ingest_org_admission_hold_events'::regclass) AND NOT t.tgisinternal) = 4`;
+ AND (SELECT count(*) FROM pg_trigger t WHERE t.tgrelid IN ('sessions.ingest_org_admission_holds'::regclass, 'sessions.ingest_org_admission_hold_events'::regclass) AND NOT t.tgisinternal) = 4
+ AND (SELECT array_agg(c.relname::text || ' ' || a.attname::text || ' ' || pg_get_expr(d.adbin, d.adrelid) ORDER BY c.relname::text COLLATE "C", a.attname::text COLLATE "C")
+        FROM pg_attrdef d JOIN pg_attribute a ON a.attrelid = d.adrelid AND a.attnum = d.adnum JOIN pg_class c ON c.oid = d.adrelid
+       WHERE d.adrelid IN ('sessions.ingest_org_admission_holds'::regclass, 'sessions.ingest_org_admission_hold_events'::regclass))
+     = ARRAY['ingest_org_admission_hold_events at clock_timestamp()', 'ingest_org_admission_holds installed_at clock_timestamp()']::text[]
+ AND NOT EXISTS (SELECT 1 FROM pg_class c, aclexplode(coalesce(c.relacl, acldefault('r', c.relowner))) x
+       WHERE c.oid IN ('sessions.ingest_org_admission_holds'::regclass, 'sessions.ingest_org_admission_hold_events'::regclass) AND x.grantee <> c.relowner)
+ AND NOT EXISTS (SELECT 1 FROM pg_attribute WHERE attrelid IN ('sessions.ingest_org_admission_holds'::regclass, 'sessions.ingest_org_admission_hold_events'::regclass)
+       AND attnum > 0 AND attacl IS NOT NULL)
+ AND NOT EXISTS (SELECT 1 FROM pg_proc p, aclexplode(coalesce(p.proacl, acldefault('f', p.proowner))) x
+       WHERE p.oid = 'sessions.ingest_org_admission_hold_guard()'::regprocedure AND x.grantee <> p.proowner)`;
 
 /** The slot's own functions dropped by the rollback (the history guard is retained with its tables). */
 const DROPPED = [
@@ -161,7 +172,8 @@ async function rollback(ctx: LaneContext): Promise<Record<string, string>> {
     ...restored,
     "DROP TRIGGER ingest_org_admission_hold_batch_backstop ON sessions.ingest_batches;",
     ...DROPPED.map((f) => `DROP FUNCTION ${f};`),
-    "-- Final assertion before the ledger row goes: the retained history is exactly the reviewed one and owner-only, every",
+    "-- Final assertion before the ledger row goes: the retained history is exactly the reviewed one (owner-only ACLs from",
+    "-- the catalog, every grantee and column grant included; column defaults), every",
     "-- dropped hold function and the backstop trigger are gone, and no restored body still carries a 062320 mark.",
     "DO $rollback_verify$ BEGIN",
     " IF NOT (",
@@ -172,12 +184,6 @@ async function rollback(ctx: LaneContext): Promise<Record<string, string>> {
     "  OR EXISTS(SELECT 1 FROM pg_trigger WHERE tgname='ingest_org_admission_hold_batch_backstop')",
     "  OR EXISTS(SELECT 1 FROM pg_proc p JOIN pg_namespace n ON n.oid=p.pronamespace WHERE n.nspname='sessions' AND p.prosrc LIKE '%-- 062320 org admission hold%')",
     " THEN RAISE EXCEPTION USING ERRCODE='55000',MESSAGE='org admission hold: enforcement survived the down; rolled back';END IF;",
-    " IF EXISTS(SELECT 1 FROM unnest(ARRAY['PUBLIC','anon','authenticated','service_role','bulls96_session_ingest','bulls96_session_ingest_seeder']) r(role)",
-    "   WHERE r.role<>'PUBLIC' AND EXISTS(SELECT 1 FROM pg_roles WHERE rolname=r.role) AND (",
-    "     has_table_privilege(r.role,'sessions.ingest_org_admission_holds','SELECT,INSERT,UPDATE,DELETE,TRUNCATE')",
-    "     OR has_table_privilege(r.role,'sessions.ingest_org_admission_hold_events','SELECT,INSERT,UPDATE,DELETE,TRUNCATE')",
-    "     OR has_function_privilege(r.role,'sessions.ingest_org_admission_hold_guard()','EXECUTE')))",
-    " THEN RAISE EXCEPTION USING ERRCODE='55000',MESSAGE='org admission hold: retained history is not owner-only; rolled back';END IF;",
     "END $rollback_verify$;",
     "DELETE FROM sessions.__96bulls_migrations WHERE name='" + NAME + "' AND sha256='" + checksum + "';",
     "COMMIT;",

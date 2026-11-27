@@ -85,13 +85,35 @@ CREATE TRIGGER ingest_org_admission_hold_events_guard BEFORE UPDATE OR DELETE ON
 CREATE TRIGGER ingest_org_admission_hold_events_truncate BEFORE TRUNCATE ON sessions.ingest_org_admission_hold_events
   FOR EACH STATEMENT EXECUTE FUNCTION sessions.ingest_org_admission_hold_guard();
 
+-- Owner-only, from the catalog: revoke every non-owner grantee (any role, PUBLIC, column-level grants) on both history
+-- tables and the guard function, not only a named list, so no grant survives a down and reapply.
+DO $hold_history_acl$
+DECLARE r record;
+BEGIN
+ FOR r IN SELECT c.relname, x.grantee FROM pg_class c, aclexplode(c.relacl) x
+           WHERE c.oid IN ('sessions.ingest_org_admission_holds'::regclass, 'sessions.ingest_org_admission_hold_events'::regclass)
+             AND x.grantee <> c.relowner GROUP BY c.relname, x.grantee LOOP
+   EXECUTE format('REVOKE ALL ON sessions.%I FROM %s', r.relname, CASE WHEN r.grantee = 0 THEN 'PUBLIC' ELSE quote_ident(pg_get_userbyid(r.grantee)) END);
+ END LOOP;
+ FOR r IN SELECT c.relname, a.attname, x.grantee FROM pg_attribute a JOIN pg_class c ON c.oid = a.attrelid, aclexplode(a.attacl) x
+           WHERE a.attrelid IN ('sessions.ingest_org_admission_holds'::regclass, 'sessions.ingest_org_admission_hold_events'::regclass)
+             AND a.attnum > 0 AND x.grantee <> c.relowner GROUP BY c.relname, a.attname, x.grantee LOOP
+   EXECUTE format('REVOKE ALL (%I) ON sessions.%I FROM %s', r.attname, r.relname, CASE WHEN r.grantee = 0 THEN 'PUBLIC' ELSE quote_ident(pg_get_userbyid(r.grantee)) END);
+ END LOOP;
+ FOR r IN SELECT x.grantee FROM pg_proc p, aclexplode(coalesce(p.proacl, acldefault('f', p.proowner))) x
+           WHERE p.oid = 'sessions.ingest_org_admission_hold_guard()'::regprocedure AND x.grantee <> p.proowner GROUP BY x.grantee LOOP
+   EXECUTE format('REVOKE ALL ON FUNCTION sessions.ingest_org_admission_hold_guard() FROM %s', CASE WHEN r.grantee = 0 THEN 'PUBLIC' ELSE quote_ident(pg_get_userbyid(r.grantee)) END);
+ END LOOP;
+END $hold_history_acl$;
+
 -- A retained history (this slot's down keeps both tables) must be exactly this one, else 55000, nothing applied.
 DO $hold_history_shape$
 BEGIN
  IF NOT (
--- The exact retained history: owner, columns, indexes, constraints (NOT NULL is the column check; PostgreSQL 18 and
--- PGlite also catalogue it as a constraint, so 'n' rows are excluded) and the four guard triggers on the guard
--- function, enabled. Shared verbatim by this slot's up and its generated down (lane ingest-org-admission-hold).
+-- The exact retained history: owner, columns, column defaults, indexes, constraints (NOT NULL is the column check;
+-- PostgreSQL 18 and PGlite also catalogue it as a constraint, so 'n' rows are excluded), the four guard triggers on the
+-- guard function, enabled, and owner-only ACLs on both tables (every grantee, column grants included) and on the guard
+-- function (PUBLIC included). Shared verbatim by this slot's up and its generated down (lane ingest-org-admission-hold).
  (SELECT pg_get_userbyid(relowner) FROM pg_class WHERE oid = 'sessions.ingest_org_admission_holds'::regclass) = current_user
  AND (SELECT pg_get_userbyid(relowner) FROM pg_class WHERE oid = 'sessions.ingest_org_admission_hold_events'::regclass) = current_user
  AND (SELECT string_agg(attname || ' ' || format_type(atttypid, atttypmod) || CASE WHEN attnotnull THEN ' not null' ELSE '' END, ', ' ORDER BY attnum)
@@ -133,6 +155,16 @@ BEGIN
          AND t.tgenabled = 'O' AND t.tgfoid = 'sessions.ingest_org_admission_hold_guard()'::regprocedure)
      = ARRAY['ingest_org_admission_hold_events_guard 27', 'ingest_org_admission_hold_events_truncate 34', 'ingest_org_admission_holds_guard 27', 'ingest_org_admission_holds_truncate 34']::text[]
  AND (SELECT count(*) FROM pg_trigger t WHERE t.tgrelid IN ('sessions.ingest_org_admission_holds'::regclass, 'sessions.ingest_org_admission_hold_events'::regclass) AND NOT t.tgisinternal) = 4
+ AND (SELECT array_agg(c.relname::text || ' ' || a.attname::text || ' ' || pg_get_expr(d.adbin, d.adrelid) ORDER BY c.relname::text COLLATE "C", a.attname::text COLLATE "C")
+        FROM pg_attrdef d JOIN pg_attribute a ON a.attrelid = d.adrelid AND a.attnum = d.adnum JOIN pg_class c ON c.oid = d.adrelid
+       WHERE d.adrelid IN ('sessions.ingest_org_admission_holds'::regclass, 'sessions.ingest_org_admission_hold_events'::regclass))
+     = ARRAY['ingest_org_admission_hold_events at clock_timestamp()', 'ingest_org_admission_holds installed_at clock_timestamp()']::text[]
+ AND NOT EXISTS (SELECT 1 FROM pg_class c, aclexplode(coalesce(c.relacl, acldefault('r', c.relowner))) x
+       WHERE c.oid IN ('sessions.ingest_org_admission_holds'::regclass, 'sessions.ingest_org_admission_hold_events'::regclass) AND x.grantee <> c.relowner)
+ AND NOT EXISTS (SELECT 1 FROM pg_attribute WHERE attrelid IN ('sessions.ingest_org_admission_holds'::regclass, 'sessions.ingest_org_admission_hold_events'::regclass)
+       AND attnum > 0 AND attacl IS NOT NULL)
+ AND NOT EXISTS (SELECT 1 FROM pg_proc p, aclexplode(coalesce(p.proacl, acldefault('f', p.proowner))) x
+       WHERE p.oid = 'sessions.ingest_org_admission_hold_guard()'::regprocedure AND x.grantee <> p.proowner)
  ) THEN
    RAISE EXCEPTION USING ERRCODE = '55000', MESSAGE = 'org admission hold: an existing hold history is not this slot''s; nothing applied';
  END IF;

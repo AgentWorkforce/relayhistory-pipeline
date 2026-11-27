@@ -18,7 +18,7 @@ DO $rollback_guard$ DECLARE v_sha text; BEGIN
  IF EXISTS(SELECT 1 FROM sessions.__96bulls_migrations WHERE name LIKE 'upstream:%' AND name COLLATE "C">'upstream:20261105062320_ingest_org_admission_fences.sql')
  THEN RAISE EXCEPTION USING ERRCODE='55000',MESSAGE='org admission hold: a later migration is applied; roll it back first';END IF;
  SELECT sha256 INTO v_sha FROM sessions.__96bulls_migrations WHERE name='upstream:20261105062320_ingest_org_admission_fences.sql' FOR UPDATE;
- IF NOT FOUND OR v_sha IS DISTINCT FROM 'b07cd2369fd6adbf8eea57e047ea23aca88fcf4a8617746d096578d0f240554e'
+ IF NOT FOUND OR v_sha IS DISTINCT FROM 'ad63ed4931ff3d6a7de87cc6114da7d7d8e1536a95aa52a2d5664be5250acd71'
  THEN RAISE EXCEPTION USING ERRCODE='55000',MESSAGE='org admission hold: own applied checksum required';END IF;
  LOCK TABLE sessions.ingest_org_admission_holds IN SHARE ROW EXCLUSIVE MODE;
  IF EXISTS(SELECT 1 FROM sessions.ingest_org_admission_holds WHERE state<>'released')
@@ -1423,13 +1423,15 @@ DROP FUNCTION sessions.ingest_org_admission_hold_install(text,uuid);
 DROP FUNCTION sessions.ingest_org_admission_hold_lifecycle(text);
 DROP FUNCTION sessions.ingest_org_admission_hold_check(text,text);
 DROP FUNCTION sessions.ingest_org_admission_hold_key(text);
--- Final assertion before the ledger row goes: the retained history is exactly the reviewed one and owner-only, every
+-- Final assertion before the ledger row goes: the retained history is exactly the reviewed one (owner-only ACLs from
+-- the catalog, every grantee and column grant included; column defaults), every
 -- dropped hold function and the backstop trigger are gone, and no restored body still carries a 062320 mark.
 DO $rollback_verify$ BEGIN
  IF NOT (
--- The exact retained history: owner, columns, indexes, constraints (NOT NULL is the column check; PostgreSQL 18 and
--- PGlite also catalogue it as a constraint, so 'n' rows are excluded) and the four guard triggers on the guard
--- function, enabled. Shared verbatim by this slot's up and its generated down (lane ingest-org-admission-hold).
+-- The exact retained history: owner, columns, column defaults, indexes, constraints (NOT NULL is the column check;
+-- PostgreSQL 18 and PGlite also catalogue it as a constraint, so 'n' rows are excluded), the four guard triggers on the
+-- guard function, enabled, and owner-only ACLs on both tables (every grantee, column grants included) and on the guard
+-- function (PUBLIC included). Shared verbatim by this slot's up and its generated down (lane ingest-org-admission-hold).
  (SELECT pg_get_userbyid(relowner) FROM pg_class WHERE oid = 'sessions.ingest_org_admission_holds'::regclass) = current_user
  AND (SELECT pg_get_userbyid(relowner) FROM pg_class WHERE oid = 'sessions.ingest_org_admission_hold_events'::regclass) = current_user
  AND (SELECT string_agg(attname || ' ' || format_type(atttypid, atttypmod) || CASE WHEN attnotnull THEN ' not null' ELSE '' END, ', ' ORDER BY attnum)
@@ -1471,18 +1473,22 @@ DO $rollback_verify$ BEGIN
          AND t.tgenabled = 'O' AND t.tgfoid = 'sessions.ingest_org_admission_hold_guard()'::regprocedure)
      = ARRAY['ingest_org_admission_hold_events_guard 27', 'ingest_org_admission_hold_events_truncate 34', 'ingest_org_admission_holds_guard 27', 'ingest_org_admission_holds_truncate 34']::text[]
  AND (SELECT count(*) FROM pg_trigger t WHERE t.tgrelid IN ('sessions.ingest_org_admission_holds'::regclass, 'sessions.ingest_org_admission_hold_events'::regclass) AND NOT t.tgisinternal) = 4
+ AND (SELECT array_agg(c.relname::text || ' ' || a.attname::text || ' ' || pg_get_expr(d.adbin, d.adrelid) ORDER BY c.relname::text COLLATE "C", a.attname::text COLLATE "C")
+        FROM pg_attrdef d JOIN pg_attribute a ON a.attrelid = d.adrelid AND a.attnum = d.adnum JOIN pg_class c ON c.oid = d.adrelid
+       WHERE d.adrelid IN ('sessions.ingest_org_admission_holds'::regclass, 'sessions.ingest_org_admission_hold_events'::regclass))
+     = ARRAY['ingest_org_admission_hold_events at clock_timestamp()', 'ingest_org_admission_holds installed_at clock_timestamp()']::text[]
+ AND NOT EXISTS (SELECT 1 FROM pg_class c, aclexplode(coalesce(c.relacl, acldefault('r', c.relowner))) x
+       WHERE c.oid IN ('sessions.ingest_org_admission_holds'::regclass, 'sessions.ingest_org_admission_hold_events'::regclass) AND x.grantee <> c.relowner)
+ AND NOT EXISTS (SELECT 1 FROM pg_attribute WHERE attrelid IN ('sessions.ingest_org_admission_holds'::regclass, 'sessions.ingest_org_admission_hold_events'::regclass)
+       AND attnum > 0 AND attacl IS NOT NULL)
+ AND NOT EXISTS (SELECT 1 FROM pg_proc p, aclexplode(coalesce(p.proacl, acldefault('f', p.proowner))) x
+       WHERE p.oid = 'sessions.ingest_org_admission_hold_guard()'::regprocedure AND x.grantee <> p.proowner)
  ) THEN RAISE EXCEPTION USING ERRCODE='55000',MESSAGE='org admission hold: retained history drifted; rolled back';END IF;
  IF EXISTS(SELECT 1 FROM pg_proc p JOIN pg_namespace n ON n.oid=p.pronamespace WHERE n.nspname='sessions'
    AND p.proname LIKE 'ingest\_org\_admission\_hold\_%' AND p.proname<>'ingest_org_admission_hold_guard')
   OR EXISTS(SELECT 1 FROM pg_trigger WHERE tgname='ingest_org_admission_hold_batch_backstop')
   OR EXISTS(SELECT 1 FROM pg_proc p JOIN pg_namespace n ON n.oid=p.pronamespace WHERE n.nspname='sessions' AND p.prosrc LIKE '%-- 062320 org admission hold%')
  THEN RAISE EXCEPTION USING ERRCODE='55000',MESSAGE='org admission hold: enforcement survived the down; rolled back';END IF;
- IF EXISTS(SELECT 1 FROM unnest(ARRAY['PUBLIC','anon','authenticated','service_role','bulls96_session_ingest','bulls96_session_ingest_seeder']) r(role)
-   WHERE r.role<>'PUBLIC' AND EXISTS(SELECT 1 FROM pg_roles WHERE rolname=r.role) AND (
-     has_table_privilege(r.role,'sessions.ingest_org_admission_holds','SELECT,INSERT,UPDATE,DELETE,TRUNCATE')
-     OR has_table_privilege(r.role,'sessions.ingest_org_admission_hold_events','SELECT,INSERT,UPDATE,DELETE,TRUNCATE')
-     OR has_function_privilege(r.role,'sessions.ingest_org_admission_hold_guard()','EXECUTE')))
- THEN RAISE EXCEPTION USING ERRCODE='55000',MESSAGE='org admission hold: retained history is not owner-only; rolled back';END IF;
 END $rollback_verify$;
-DELETE FROM sessions.__96bulls_migrations WHERE name='upstream:20261105062320_ingest_org_admission_fences.sql' AND sha256='b07cd2369fd6adbf8eea57e047ea23aca88fcf4a8617746d096578d0f240554e';
+DELETE FROM sessions.__96bulls_migrations WHERE name='upstream:20261105062320_ingest_org_admission_fences.sql' AND sha256='ad63ed4931ff3d6a7de87cc6114da7d7d8e1536a95aa52a2d5664be5250acd71';
 COMMIT;

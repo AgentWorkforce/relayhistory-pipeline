@@ -210,6 +210,55 @@ describe.skipIf(!url)("062320 two-connection orderings (real PostgreSQL)", () =>
     expect((await o.query("SELECT to_regprocedure('sessions.ingest_org_admission_hold_check(text,text)') IS NULL gone")).rows[0].gone).toBe(true);
   });
 
+  async function probeRole(db: ScratchDatabase) {
+    const su = new pg.Client({ connectionString: db.fixtureUrl }); await su.connect(); cleanups.push(() => su.end());
+    const role = `hold_probe_${db.name.slice(-8)}`;
+    await su.query(`CREATE ROLE ${role} NOLOGIN`);
+    cleanups.push(() => su.query(`DROP OWNED BY ${role}; DROP ROLE IF EXISTS ${role}`));
+    return { su, role };
+  }
+  const applied = async (o: pg.Client) => Number((await o.query("SELECT count(*)::int n FROM sessions.__96bulls_migrations WHERE name='upstream:20261105062320_ingest_org_admission_fences.sql'")).rows[0].n);
+  const checkFn = async (o: pg.Client) => (await o.query("SELECT to_regprocedure('sessions.ingest_org_admission_hold_check(text,text)') IS NOT NULL ok")).rows[0].ok as boolean;
+
+  test("7d. the down refuses (nothing changed) while any non-owner grant exists on the retained history", async () => {
+    const db = await database();
+    const o = await owner(db);
+    const { su, role } = await probeRole(db);
+    await su.query(`GRANT SELECT ON sessions.ingest_org_admission_hold_events TO ${role}`);
+    await expect(o.query(DOWN)).rejects.toMatchObject({ code: "55000" });
+    await o.query("ROLLBACK").catch(() => {});
+    expect(await applied(o)).toBe(1);
+    expect(await checkFn(o)).toBe(true);
+  });
+
+  test("7e. a grant added after the down (table and column level) does not survive a reapply", async () => {
+    const db = await database();
+    const o = await owner(db);
+    const { su, role } = await probeRole(db);
+    await o.query(DOWN);
+    await su.query(`GRANT SELECT ON sessions.ingest_org_admission_hold_events TO ${role}`);
+    await su.query(`GRANT SELECT (held_org) ON sessions.ingest_org_admission_holds TO ${role}`);
+    await su.query(`GRANT EXECUTE ON FUNCTION sessions.ingest_org_admission_hold_guard() TO ${role}`);
+    await migrateAsOwner(db.ownerUrl);
+    expect(await applied(o)).toBe(1);
+    const priv = (await su.query(`SELECT has_table_privilege($1,'sessions.ingest_org_admission_hold_events','SELECT') t,
+      has_column_privilege($1,'sessions.ingest_org_admission_holds','held_org','SELECT') c,
+      has_function_privilege($1,'sessions.ingest_org_admission_hold_guard()','EXECUTE') f`, [role])).rows[0];
+    expect(priv).toEqual({ t: false, c: false, f: false });
+  });
+
+  test("7f. a reapply refuses a retained history whose column default drifted, nothing applied", async () => {
+    const db = await database();
+    const o = await owner(db);
+    await o.query(DOWN);
+    await o.query("ALTER TABLE sessions.ingest_org_admission_hold_events ALTER COLUMN at DROP DEFAULT");
+    let error: { code?: string; message?: string } | null = null;
+    try { await migrateAsOwner(db.ownerUrl); } catch (e) { error = e as { code?: string; message?: string }; }
+    expect(String(error?.message ?? "") + String(error?.code ?? "")).toMatch(/hold history is not this slot|55000/u);
+    expect(await applied(o)).toBe(0);
+    expect(await checkFn(o)).toBe(false);
+  });
+
   test("8. an install never blocks another org's admission", async () => {
     const db = await database();
     const p = await pair(db);
