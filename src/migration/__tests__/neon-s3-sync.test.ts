@@ -516,6 +516,28 @@ describe("date pin: an earlier first_ts keeps a session's first exported locatio
     expect((await datePin(t, moved, "delivery:origina", [a, other]))?.key).toBe(a);
   });
 
+  test("ambiguous prior keys export byte-for-byte as without prior keys (the pre-pin behaviour)", async () => {
+    const build = async () => {
+      const { store } = await countingStore();
+      const t = target(store, { maxChunkBytes: 200 });
+      const first = await exportUnit(t, unit("org-a"), fixedSource(baseRecords()));
+      const forked = await exportUnit(t, unit("org-a", { firstMs: EARLIER }), fixedSource(earlierRecords()));
+      return { store, t, prior: [...first.manifests, ...forked.manifests].map((m) => m.manifestKey).sort() };
+    };
+    const snapshot = async (store: ObjectStore) =>
+      Promise.all((await allKeys(store)).map(async (k) => [k, Buffer.from(await readAll(await store.get(objectKey(k)))).toString("base64")]));
+    const x = await build();
+    const y = await build();
+    expect(await snapshot(x.store)).toEqual(await snapshot(y.store));
+    const later = (t: ExportTarget) => ({ ...t, now: () => new Date("2026-11-01T00:00:00Z") });
+    const moved = unit("org-a", { firstMs: EARLIER - 86_400_000 });
+    const rx = await exportUnit(later(x.t), moved, fixedSource(earlierRecords()), { priorKeys: x.prior });
+    const ry = await exportUnit(later(y.t), moved, fixedSource(earlierRecords()));
+    expect(rx).toEqual(ry);
+    expect(rx.manifests.every((m) => m.manifestKey.includes("/d=2026/10/10/"))).toBe(true);
+    expect(await snapshot(x.store)).toEqual(await snapshot(y.store));
+  });
+
   test("an invalid prior manifest is unpinned (the export goes ahead at the computed date); a read failure propagates", async () => {
     const { store } = await countingStore();
     const t = target(store, { maxChunkBytes: 200 });
@@ -576,13 +598,34 @@ describe("date pin: an earlier first_ts keeps a session's first exported locatio
     }
   });
 
+  test("date_pin_changed takes the contention retry: 2 minutes, no attempt counted, never stuck_with_keys", async () => {
+    const state = attestedState(join(await tempDir(), "s.sqlite"));
+    const now = Date.now();
+    state.seeRevisions(1, [{ org_id: "o", session_id: "s", revision: "3" }]);
+    state.seeActivity(1, [{ org_id: "o", session_id: "s", last_ms: String(now), events: "1" }]);
+    for (let i = 0; i < 8; i++) state.markFailed("o", "s", "date_pin_changed", ["96bulls/o/v1/k/manifest.json"], 3, now);
+    expect(state.exported("o", "s")!.attempts).toBe(0);
+    expect(state.stuckWithKeys()).toBe(0);
+    expect(state.nextWork(now + 60_000, 86_400_000, 10)).toEqual([]);
+    expect(state.nextWork(now + 2 * 60_000 + 1, 86_400_000, 10).map((w) => `${w.kind}:${w.session_id}`)).toEqual(["retry:s"]);
+    // A real failure still counts and backs off for an hour.
+    state.markFailed("o", "s", "57014", [], 3, now);
+    expect(state.exported("o", "s")!.attempts).toBe(1);
+    expect(state.nextWork(now + 2 * 60_000 + 1, 86_400_000, 10)).toEqual([]);
+    state.close();
+  });
+
   describe("through Syncer.processGroup", () => {
     const SESSION = "sess:with:colons-1";
     const setup = async (store: ObjectStore, wrap: (s: ObjectStore) => ObjectStore = (s) => s) => {
       const state = attestedState(join(await tempDir(), "s.sqlite"));
       const db = fakeDb([unit("org-a")]);
       const io = { records: baseRecords() };
-      const syncer = new Syncer(db, state, target(wrap(store), { maxChunkBytes: 200 }), fastThrottle(), () => {}, DEFAULT_SYNC_CONFIG, () => false, () => fixedSource(io.records));
+      const syncer = new Syncer(db, state, target(wrap(store), { maxChunkBytes: 200 }), fastThrottle(), () => {}, DEFAULT_SYNC_CONFIG, () => false, () => ({
+        // Each export reads io.records as they are then (the Syncer builds its source once).
+        fenced: async () => false,
+        lines: (u: SessionUnit) => fixedSource(io.records).lines(u),
+      }));
       state.seeRevisions(1, [{ org_id: "org-a", session_id: SESSION, revision: "1" }]);
       expect(await syncer.processGroup({ org_id: "org-a", session_id: SESSION, revision: 1, kind: "recent", events: 4 })).toBe(true);
       const keys = state.exported("org-a", SESSION)!.keys;
@@ -591,7 +634,7 @@ describe("date pin: an earlier first_ts keeps a session's first exported locatio
       db.units = [unit("org-a", { firstMs: EARLIER })];
       io.records = earlierRecords();
       state.seeRevisions(2, [{ org_id: "org-a", session_id: SESSION, revision: "2" }]);
-      return { state, syncer, keys };
+      return { state, syncer, keys, db, io };
     };
     const prefix = (k: string) => k.slice(0, -"manifest.json".length);
 
@@ -602,74 +645,36 @@ describe("date pin: an earlier first_ts keeps a session's first exported locatio
       expect(state.exported("org-a", SESSION)!.keys).toEqual(keys);
       expect(state.staleprefixErasures()).toEqual([]);
       expect((await manifests(store))).toEqual(keys);
+      // The pinned stream took the older line.
+      const a = keys.find((k) => k.includes("/m=delivery_origina/"))!;
+      const m = JSON.parse(await readText(store, a));
+      expect(m.revision).toBe(2);
+      expect(m.extensions["client.relayhistory_export"].catalog.first_activity).toBe(new Date(EARLIER).toISOString());
       state.close();
     });
 
-    /** The state a fork made before the pin leaves: origin-a's computed-date copy written, its key merged by markFailed. */
-    const fork = async (store: ObjectStore, state: SyncState, keys: string[]) => {
-      const forked = await exportUnit(target(store), unit("org-a", { firstMs: EARLIER }), fixedSource(earlierRecords().filter((r) => r.origin_id === "origin-a")));
-      const b = forked.manifests[0]!.manifestKey;
-      expect(b).toContain("/d=2026/10/11/");
-      state.markFailed("org-a", SESSION, "57014", [b], 2);
-      expect(state.exported("org-a", SESSION)!.keys).toEqual([...keys, b].sort());
-      return b;
-    };
-
-    test("ambiguous prior (two dates of one stream): unpinned, both copies kept and never queued, over two passes", async () => {
+    test("ambiguous prior (two dates of each stream): the pre-pin behaviour, stale prefixes queued, deletes propagate", async () => {
       const { store } = await countingStore();
-      const { state, syncer, keys } = await setup(store);
-      const a = keys.find((k) => k.includes("/m=delivery_origina/"))!;
-      const other = keys.find((k) => k.includes("/m=delivery_originb/"))!;
-      const b = await fork(store, state, keys);
-      // An erasure of the first copy was already queued (by the unpinned run that forked it, say).
-      state.enqueueErasure([{ key: prefix(a), kind: "prefix", org_id: "org-a", reason: "stale_prefix" }]);
-      expect(state.staleprefixErasures().map((e) => e.key)).toEqual([prefix(a)]);
-      const aBefore = await readText(store, a);
-      for (const [revision, kind] of [[2, "retry"], [3, "changed"]] as const) {
-        state.seeRevisions(revision, [{ org_id: "org-a", session_id: SESSION, revision: String(revision) }]);
-        expect(await syncer.processGroup({ org_id: "org-a", session_id: SESSION, revision, kind, events: 5 })).toBe(true);
-        // origin-a: ambiguous, so it goes to the computed date (as before the pin) and the other copy is held.
-        // origin-b: one prior, pinned at its first date. markExported records all three.
-        const row = state.exported("org-a", SESSION)!;
-        expect(row.error).toBeNull();
-        expect(row.keys).toEqual([a, b, other].sort());
-        // Nothing of the group is queued: the earlier entry for the held copy was cancelled under its lease.
-        expect(state.staleprefixErasures()).toEqual([]);
-        expect(state.nextErasures(Date.now() + 86_400_000, 100).filter((e) => e.kind === "prefix")).toEqual([]);
-        await drainErasures(state, store);
-        expect(await readText(store, a)).toBe(aBefore); // held: never rewritten, never erased
-        expect(await manifests(store)).toEqual([a, b, other].sort());
-      }
-      expect(JSON.parse(await readText(store, b)).revision).toBe(2); // rewritten once, then unchanged
-      state.close();
-    });
-
-    test("ambiguous prior: a held copy that is gone is not held; an access failure on it fails the group, nothing retired", async () => {
-      const { store } = await countingStore();
-      let deny: string | undefined;
-      const wrap = (inner: ObjectStore): ObjectStore => ({
-        ...inner,
-        getObject: async (k, r) => {
-          if (deny && k === objectKey(deny)) throw Object.assign(new Error("denied"), { code: "access_denied" });
-          return inner.getObject(k, r);
-        },
-      });
-      const { state, syncer, keys } = await setup(store, wrap);
-      const a = keys.find((k) => k.includes("/m=delivery_origina/"))!;
-      const other = keys.find((k) => k.includes("/m=delivery_originb/"))!;
-      const b = await fork(store, state, keys);
-      // A store access failure is not missing or malformed metadata: the group fails and keeps every key.
-      deny = a;
-      expect(await syncer.processGroup({ org_id: "org-a", session_id: SESSION, revision: 2, kind: "retry", events: 5 })).toBe(false);
-      expect(state.exported("org-a", SESSION)!.error).toBe("access_denied");
-      expect(state.exported("org-a", SESSION)!.keys).toEqual([a, b, other].sort());
-      expect(state.staleprefixErasures()).toEqual([]);
-      deny = undefined;
-      // The first copy is then gone (erased by an earlier entry, say): nothing to hold; its key is retired as before.
-      await store.delete(objectKey(a));
+      const { state, syncer, keys, io } = await setup(store);
+      // A fork made before the pin: both streams' computed-date copies written, their keys merged by markFailed.
+      const forked = (await exportUnit(target(store), unit("org-a", { firstMs: EARLIER }), fixedSource(earlierRecords()))).manifests.map((m) => m.manifestKey).sort();
+      expect(forked.every((k) => k.includes("/d=2026/10/11/"))).toBe(true);
+      state.markFailed("org-a", SESSION, "57014", forked, 2);
       expect(await syncer.processGroup({ org_id: "org-a", session_id: SESSION, revision: 2, kind: "retry", events: 5 })).toBe(true);
-      expect(state.exported("org-a", SESSION)!.keys).toEqual([b, other].sort());
-      expect(state.staleprefixErasures().map((e) => e.key)).toEqual([prefix(a)]);
+      // Unpinned: the computed date is written and kept, the first copies go to the stale_prefix path, as before the pin.
+      expect(state.exported("org-a", SESSION)!.keys).toEqual(forked);
+      expect(state.staleprefixErasures().map((e) => e.key)).toEqual(keys.map(prefix).sort());
+      // A record deleted in Neon is gone from every stored object after the next export and the erasure drain.
+      io.records = earlierRecords().filter((r) => r.record_id !== "e-1");
+      state.seeRevisions(3, [{ org_id: "org-a", session_id: SESSION, revision: "3" }]);
+      expect(await syncer.processGroup({ org_id: "org-a", session_id: SESSION, revision: 3, kind: "changed", events: 4 })).toBe(true);
+      await drainErasures(state, store);
+      expect(await manifests(store)).toEqual(forked);
+      for (const key of await allKeys(store)) {
+        const bytes = await readAll(await store.get(objectKey(key)));
+        const text = key.endsWith(".zst") ? new TextDecoder().decode(zstdDecompressSync(bytes)) : new TextDecoder().decode(bytes);
+        expect(text.includes("SECRET_MARKER_ALPHA")).toBe(false);
+      }
       state.close();
     });
 
@@ -692,6 +697,8 @@ describe("date pin: an earlier first_ts keeps a session's first exported locatio
       const row = state.exported("org-a", SESSION)!;
       expect(row.error).toBe("date_pin_changed");
       expect(row.keys).toEqual(keys);
+      // A race, not a failing export: the short contention retry, no attempt counted (never stuck_with_keys).
+      expect(row.attempts).toBe(0);
       expect((await allKeys(store)).includes(a)).toBe(false); // not re-created at revision 1
       expect(state.staleprefixErasures()).toEqual([]);
       race = undefined;

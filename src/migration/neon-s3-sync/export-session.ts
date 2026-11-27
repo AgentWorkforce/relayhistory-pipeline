@@ -107,12 +107,6 @@ export interface UnitResult {
   fenced: boolean;
   manifests: MachineResult[];
   lines: number;
-  /**
-   * Prior manifest keys kept as they are, unwritten: the other dates of a stream whose prior location was ambiguous
-   * (datePin). Leased, and read as this exporter's export of this session, before they are reported. The caller keeps
-   * them in the group's keys and never retires them as stale prefixes.
-   */
-  held: string[];
 }
 
 /**
@@ -159,7 +153,7 @@ const sameVersion = (a: ObjectVersion, b: ObjectVersion) => a.eTag === b.eTag &&
  * pointer_move_pending meanwhile. Like the live writer's location pointer (session-ingest/writer.ts resolveLocation),
  * the first exported location is kept instead.
  *
- * Only an unambiguous prior is pinned; anything else is unpinned (the behaviour before the pin):
+ * Only an unambiguous prior is pinned; anything else is unpinned (exactly the behaviour before the pin):
  * - exactly one of `priorKeys` is a manifest key of this stream's location (prefix, workspace, machine, harness,
  *   session) at any date, and that date is not the computed one. Two or more (a fork made before the pin, or a failed
  *   run's keys merged into the row by markFailed) or one at the computed date: unpinned.
@@ -173,22 +167,7 @@ export async function datePin(
   sourceMachineId: string,
   priorKeys: readonly string[] | undefined,
 ): Promise<DatePin | undefined> {
-  return (await resolveDatePin(target, unit, sourceMachineId, priorKeys)).pin;
-}
-
-/**
- * datePin, and on ambiguity the copies to hold: when two or more prior keys are this stream's location, the stream is
- * unpinned (it goes to the computed date, as before the pin) and every candidate at another date is `ambiguous`. None
- * of them is retired for it: the exporter cannot tell which copy is the authoritative one.
- */
-export async function resolveDatePin(
-  target: ExportTarget,
-  unit: SessionUnit,
-  sourceMachineId: string,
-  priorKeys: readonly string[] | undefined,
-): Promise<{ pin?: DatePin; ambiguous: string[] }> {
-  const none = { ambiguous: [] as string[] };
-  if (!priorKeys?.length) return none;
+  if (!priorKeys?.length) return undefined;
   const want = unpinnedLocation(target, unit, sourceMachineId);
   const computed = new Date(unit.firstMs).toISOString().slice(0, 10);
   const candidates = [...new Set(priorKeys)].filter((key) => {
@@ -196,41 +175,27 @@ export async function resolveDatePin(
     return !!loc && loc.rest === "manifest.json" && (loc.prefix ?? "") === (want.prefix ?? "") && loc.workspaceId === want.workspaceId &&
       loc.machineId === want.machineId && loc.harness === want.harness && loc.sessionId === want.sessionId;
   });
-  if (candidates.length > 1) return { ambiguous: candidates.filter((k) => parseSessionKey(k)!.startDate !== computed) };
-  if (candidates.length !== 1) return none;
+  // Two or more: ambiguous (a fork made before the pin, or a failed run's keys merged by markFailed). Unpinned, so the
+  // stream goes to the computed date and the other keys take the stale_prefix path, exactly as before the pin.
+  if (candidates.length !== 1) return undefined;
   const key = candidates[0]!;
   const loc = parseSessionKey(key)!;
-  if (loc.startDate === computed) return none;
+  if (loc.startDate === computed) return undefined;
   let found: Awaited<ReturnType<typeof readManifest>>;
   try {
     found = await readManifest(target.store, key);
   } catch (error) {
-    if ((error as { code?: unknown }).code === "foreign_manifest_invalid") return none;
+    if ((error as { code?: unknown }).code === "foreign_manifest_invalid") return undefined;
     throw error;
   }
-  if (!found || ownershipIssue(found.manifest, target.grantId, unitIdentity(unit))) return none;
-  if (!sameRawMachine(found.manifest, sourceMachineId)) return none;
-  if (found.version.eTag === undefined && found.version.version === undefined) return none;
+  if (!found || ownershipIssue(found.manifest, target.grantId, unitIdentity(unit))) return undefined;
+  if (!sameRawMachine(found.manifest, sourceMachineId)) return undefined;
+  if (found.version.eTag === undefined && found.version.version === undefined) return undefined;
   const startedAt = found.manifest.session.started_at;
-  if (!Number.isFinite(Date.parse(startedAt)) || new Date(startedAt).toISOString().slice(0, 10) !== loc.startDate) return none;
+  if (!Number.isFinite(Date.parse(startedAt)) || new Date(startedAt).toISOString().slice(0, 10) !== loc.startDate) return undefined;
   const sessionUuid = (found.manifest.extensions?.[SESSION_EXT] as { session_uuid?: unknown } | undefined)?.session_uuid;
-  if (typeof sessionUuid !== "string" || sessionUuid === "") return none;
-  return { pin: { startDate: loc.startDate, startedAt: new Date(startedAt).toISOString(), key, version: found.version, sessionUuid }, ambiguous: [] };
-}
-
-/**
- * Whether an ambiguous prior copy (resolveDatePin) is held: read under its lease, it is this exporter's export of this
- * session. Missing, invalid or foreign: not held (the stale-prefix path decides, as before). A read failure propagates.
- */
-async function holdable(target: ExportTarget, unit: SessionUnit, key: string): Promise<boolean> {
-  let found: Awaited<ReturnType<typeof readManifest>>;
-  try {
-    found = await readManifest(target.store, key);
-  } catch (error) {
-    if ((error as { code?: unknown }).code === "foreign_manifest_invalid") return false;
-    throw error;
-  }
-  return !!found && !ownershipIssue(found.manifest, target.grantId, unitIdentity(unit));
+  if (typeof sessionUuid !== "string" || sessionUuid === "") return undefined;
+  return { startDate: loc.startDate, startedAt: new Date(startedAt).toISOString(), key, version: found.version, sessionUuid };
 }
 
 class MachineStream {
@@ -614,16 +579,14 @@ export async function exportUnit(
     priorKeys?: readonly string[];
   } = {},
 ): Promise<UnitResult> {
-  if (await source.fenced(unit, opts.freshFence)) return { fenced: true, manifests: [], lines: 0, held: [] };
+  if (await source.fenced(unit, opts.freshFence)) return { fenced: true, manifests: [], lines: 0 };
   const streams = new Map<string, MachineStream>();
-  const held: string[] = [];
   let lines = 0;
   for await (const line of source.lines(unit)) {
     lines += 1;
     let stream = streams.get(line.machine);
     if (!stream) {
-      const resolved = await resolveDatePin(target, unit, line.machine, opts.priorKeys);
-      stream = new MachineStream(target, unit, line.machine, resolved.pin);
+      stream = new MachineStream(target, unit, line.machine, await datePin(target, unit, line.machine, opts.priorKeys));
       // Two Neon machines that sanitize to one key would interleave: refuse.
       for (const other of streams.values())
         if (other.key === stream.key)
@@ -637,12 +600,6 @@ export async function exportUnit(
       await stream.checkPin();
       opts.onKey?.(stream.key);
       streams.set(line.machine, stream);
-      // Ambiguous prior copies: leased (so the erasure job is not erasing one meanwhile), then held if still ours.
-      for (const key of resolved.ambiguous) {
-        if (held.includes(key)) continue;
-        opts.onLease?.(key);
-        if (await holdable(target, unit, key)) held.push(key);
-      }
     }
     await stream.push(line);
   }
@@ -698,10 +655,7 @@ export async function exportUnit(
       truncatedMaxChars: stream.truncatedMaxChars,
     });
   }
-  // The held copies' leases must still be ours when the caller keeps them (and cancels their queued erasures).
-  for (const key of held)
-    if (target.renew && !target.renew(key)) throw coded("lease_lost", "the session lease was taken over");
-  return { fenced: false, manifests, lines, held: held.sort() };
+  return { fenced: false, manifests, lines };
 }
 
 /**

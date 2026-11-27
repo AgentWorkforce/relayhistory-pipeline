@@ -387,7 +387,9 @@ export class SyncState {
     // Waiting for the other process's lease, or an interrupted run, is not the group's failure.
     // publish_reserved (S3X_OBLIGATIONS on): the erasure job holds a reservation on something this group references; it
     // is released or retired when that erasure run proves, so the group simply retries (never stuck_with_keys).
-    const transientWait = code === "prefix_busy" || code === "interrupted" || code === "publish_reserved";
+    // date_pin_changed: the pinned manifest changed between the exporter's advisory read and its leased read (a race
+    // with the erasure job or another writer); the retry resolves the pin again.
+    const transientWait = code === "prefix_busy" || code === "interrupted" || code === "publish_reserved" || code === "date_pin_changed";
     const attempts = (prior?.attempts ?? 0) + (transientWait ? 0 : 1);
     const nextTry = at + (transientWait ? 2 * 60 * 1000 : Math.min(4, 2 ** Math.max(0, attempts - 1)) * 60 * 60 * 1000);
     const all = JSON.stringify([...new Set([...(prior?.keys ?? []), ...keys])].sort());
