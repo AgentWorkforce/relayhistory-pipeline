@@ -267,7 +267,7 @@ export async function processBatch(records: readonly QueueRecord[], deps: Consum
     const started = Date.now();
     // The carried time is telemetry only: no stage sees it.
     const { oldestEventTime: _carried, ...event } = carriedEvent;
-    if (deps.bufferedFeed && isBufferedStageKey(event.key)) {
+    if (deps.bufferedFeed && isBufferedStageKey(event.key, deps.bufferedFeed.keyRoot)) {
       // KEEP-UP. A delete event is a GC removal: index-row deletes are their own lane, so it is a no-op here.
       if (event.deleted) continue;
       try {

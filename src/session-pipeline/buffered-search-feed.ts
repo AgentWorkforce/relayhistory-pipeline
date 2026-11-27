@@ -168,7 +168,19 @@ export function parseBufferedFingerprint(fingerprint: string): { stageToken: str
 /** ClickHouse (re2) expressions over `fingerprint`: the bound stage token ('' when legacy) and ordinal strings. */
 export const FINGERPRINT_STAGE_SQL = "extract(fingerprint, '^bf[0-9a-f]+:([0-9a-f-]{36}):')";
 export const FINGERPRINT_ORDINALS_SQL = "arrayFilter(x -> x != '', splitByChar(',', extract(fingerprint, '^bf[0-9a-f]+:[0-9a-f-]{36}:([0-9,]*)$')))";
-export const isBufferedStageKey = (key: string) => key.includes("/buffered-batches/v1/");
+/**
+ * A buffered stage object, by its COMPLETE key shape (the same shape as session-ingest/buffered-drain.ts
+ * parseStagedKey, kept in step by a test) under this deployment's key root:
+ * `<keyRoot>/<org>/buffered-batches/v1/ws=<ws>/m=srv_<32>/b=<batch32>-<content16>-<claim32>.staged.ndjson.zst`.
+ * A substring match is not enough: an ordinary session key such as `<root>/buffered-batches/v1/ws=.../manifest.json`
+ * contains the segment too, and routing it here would skip and ACK it without indexing its pointer.
+ */
+const BUFFERED_STAGE_KEY =
+  /^([a-z0-9][a-z0-9-]{0,62})\/((?!\.)[A-Za-z0-9._-]{1,128})\/buffered-batches\/v1\/ws=((?!\.)[A-Za-z0-9._-]{1,128})\/m=(srv_[0-9a-f]{32})\/b=([0-9a-f]{32})-([0-9a-f]{16})-([0-9a-f]{32})\.staged\.ndjson\.zst$/;
+export const isBufferedStageKey = (key: string, keyRoot: string) => {
+  const m = BUFFERED_STAGE_KEY.exec(key);
+  return m !== null && m[1] === keyRoot && !key.split("/").some((s) => s === "." || s === "..");
+};
 
 export class BufferedFeedError extends Error {
   constructor(readonly code: string, readonly retryable = false) {
@@ -754,7 +766,7 @@ export type KeepUpOutcome =
 
 /** KEEP-UP: one stage named by its object key (an S3 event on the pipeline queue, or a requeue). */
 export async function feedBufferedStageByKey(key: string, deps: BufferedFeedDeps): Promise<KeepUpOutcome> {
-  if (!isBufferedStageKey(key)) return { outcome: "skipped", reason: "not_a_buffered_stage" };
+  if (!isBufferedStageKey(key, deps.keyRoot)) return { outcome: "skipped", reason: "not_a_buffered_stage" };
   const state = await deps.source.stage({ stageKey: key });
   // A preparing stage (bounded by its intent expiry) or a GC lease (minutes) resolves soon: look
   // again. A fenced privacy authority can last: the stage is left to the backfill/tail cursor,
