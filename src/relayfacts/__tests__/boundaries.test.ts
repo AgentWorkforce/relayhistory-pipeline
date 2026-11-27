@@ -970,4 +970,19 @@ describe("round-5 controls", () => {
     // And a flag of another value is still refused.
     expect(() => parseForge(JSON.parse(JSON.stringify(legacy).replace('"unordered":true', '"unordered":false')))).toThrow(/bad commit/);
   });
+
+  test("seal: the window is the session's own events, never the directory's last activity", async () => {
+    const { outsideWindow } = await import("../backfill/cli.ts");
+    const since = "2026-11-01T00:00:00Z", until = "2026-11-26T00:00:00Z";
+    const snap = (...at: Array<string | null>) => ({ evidence: { references: at.map((t) => ({ at: t })) } });
+    // Re-delivered in November, events from October: outside.
+    expect(outsideWindow({ snapshot: snap("2026-10-11T18:31:43Z", "2026-10-11T20:14:55Z") }, since, until)).toBe("events_outside_window");
+    // A long session that reaches into the window: inside (any event in [since, until)).
+    expect(outsideWindow({ snapshot: snap("2026-10-20T00:00:00Z", "2026-11-02T00:00:00Z") }, since, until)).toBeNull();
+    // Build-evidence events count too; an event exactly at until is outside, exactly at since inside.
+    expect(outsideWindow({ snapshot: snap("2026-10-01T00:00:00Z"), artifacts: { pushes: [{ at: "2026-11-01T00:00:00.000Z" }] } }, since, until)).toBeNull();
+    expect(outsideWindow({ snapshot: snap("2026-11-26T00:00:00Z") }, since, until)).toBe("events_outside_window");
+    // No usable time at all (null, impossible dates): not admitted, and said why.
+    expect(outsideWindow({ snapshot: snap(null, "2026-11-31T00:00:00Z") }, since, until)).toBe("no_event_times");
+  });
 });
