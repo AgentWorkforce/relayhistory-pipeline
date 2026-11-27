@@ -16,6 +16,7 @@ import { createPipelineLambdaHandler, lambdaEnv, runtimeFromSecret } from "../la
 import { SUPABASE_PROD_CA_2021 } from "../supabase-ca.ts";
 import { BUFFERED_SEARCH_FEED_RUNTIME_ROLE } from "../buffered-feed-role.ts";
 import { BUFFERED_SEARCH_GATE_CONTRACT } from "../../session-read-api/buffered-search-gate.ts";
+import { FEED_QUERY_VALUES, logLine, sanitizeLogField } from "../../shared/log.ts";
 import type { SessionScope } from "../pointer.ts";
 import {
   assertOriginColumns,
@@ -29,6 +30,8 @@ import {
   runBufferedFeed,
   sqlBufferedFeedSource,
   bufferedFeedQueryField,
+  BUFFERED_FEED_QUERIES,
+  BufferedFeedError,
   BUFFERED_VERSION_CEILING,
   bufferedFeedVersionRefusal,
   canonicalPresent,
@@ -722,21 +725,82 @@ describe("buffered-stage search feed", () => {
     await expect(sqlBufferedFeedSource(failing("42501")).stage({ stageToken: randomUUID() })).rejects.toMatchObject({ code: "sql_42501", retryable: false });
   });
 
-  test("a failed feeder SQL call names its query, so a statement timeout traces to page, stage or advance", async () => {
+  test("a failed feeder SQL call names its query on the error: page, stage or advance", async () => {
     const failing = (code: string): SqlExecutor => ({ query: async () => { throw Object.assign(new Error("x"), { code }); } });
     const src = sqlBufferedFeedSource(failing("57014"));
     const caught = async (p: Promise<unknown>) => p.then(() => null, (e: unknown) => e);
-    const page = await caught(src.page("c", BUFFERED_FEED_DEFAULT_SINCE, 5));
-    expect(page).toMatchObject({ code: "sql_57014", retryable: true, query: "page" });
-    expect(bufferedFeedQueryField(page)).toEqual({ query: "page" });
+    expect(await caught(src.page("c", BUFFERED_FEED_DEFAULT_SINCE, 5))).toMatchObject({ code: "sql_57014", retryable: true, query: "page" });
     expect(await caught(src.stage({ stageToken: randomUUID() }))).toMatchObject({ code: "sql_57014", query: "stage" });
     expect(await caught(src.advance("c", { createdAt: "2026-11-27T00:00:00.000000Z", stageToken: randomUUID() }, { indexed: 0, skipped: 0 }))).toMatchObject({ code: "sql_57014", query: "advance" });
-    // Result-shape refusals and anything that is not a feeder SQL error carry no query field.
+    // Result-shape refusals and anything that is not a feeder SQL error carry no feed_query.
     const answer = (r: unknown): SqlExecutor => ({ query: async <R>() => ({ rows: [{ r }] as R[] }) });
-    const shape = await caught(sqlBufferedFeedSource(answer({ found: true, status: "weird", reason: null, retained: [] })).stage({ stageToken: randomUUID() }));
-    expect(bufferedFeedQueryField(shape)).toEqual({});
+    expect(bufferedFeedQueryField(await caught(sqlBufferedFeedSource(answer({ found: true, status: "weird", reason: null, retained: [] })).stage({ stageToken: randomUUID() })))).toEqual({});
     expect(bufferedFeedQueryField(Object.assign(new Error("x"), { query: "page" }))).toEqual({});
+    expect(bufferedFeedQueryField(new BufferedFeedError("sql_57014", true, "drop table" as never))).toEqual({});
     expect(bufferedFeedQueryField(undefined)).toEqual({});
+  });
+
+  test("feed_query is a closed enum in the log serializer, pinned to the feeder's calls", () => {
+    expect([...FEED_QUERY_VALUES].sort()).toEqual([...BUFFERED_FEED_QUERIES].sort());
+    for (const q of BUFFERED_FEED_QUERIES) expect(sanitizeLogField("feed_query", q)).toBe(q);
+    for (const v of ["PAGE", " page", "page ", "pages", "select 1", "sessions.buffered_search_feed_page", "", 1, true, null, {}, ["page"]])
+      expect(sanitizeLogField("feed_query", v)).toBeUndefined();
+    // The old ad-hoc key is not on the allowlist: nothing but feed_query can carry the call name.
+    expect(sanitizeLogField("query", "page")).toBeUndefined();
+    const line = JSON.parse(logLine("error", "buffered search feed failed", { feed_query: "select * from secret_table" }));
+    expect("feed_query" in line).toBe(false);
+  });
+
+  /** The JSON lines written to stderr (error/warn) while `work` runs. */
+  async function stderrJson(work: () => Promise<unknown>): Promise<Record<string, unknown>[]> {
+    const original = process.stderr.write;
+    const out: string[] = [];
+    process.stderr.write = ((chunk: unknown) => { out.push(String(chunk)); return true; }) as typeof process.stderr.write;
+    try { await work(); } finally { process.stderr.write = original; }
+    return out.join("").split("\n").filter(Boolean).flatMap((l) => { try { return [JSON.parse(l) as Record<string, unknown>]; } catch { return []; } });
+  }
+  const MARKER = "PRIVATE-MARKER-relation-secret_table";
+  /** A feeder login whose every call fails with SQLSTATE `code` and foreign error text that must never be logged. */
+  const timingOut = (code = "57014"): SqlExecutor => ({ query: async () => { throw Object.assign(new Error(`${MARKER} canceling statement`), { code, detail: MARKER }); } });
+
+  test("emitted JSON, scheduled run: a statement timeout logs feed_query=page with the code, never the error text", async () => {
+    const keys = ["INGEST_BUFFERED_SEARCH_FEED", "BUFFERED_SEARCH_FEED_GATE_DECLARED", "INGEST_BUFFERED_SEARCH_FEED_SECOND_VERSION"] as const;
+    const saved = keys.map((k) => process.env[k]);
+    const store = newStore(), ch = fakeClickHouse();
+    const runtime = { deps: { bufferedFeed: feedDeps(sqlBufferedFeedSource(timingOut()), store, ch.ch) },
+      env: { bufferedSearchFeed: { pageSize: 10, stagesPerSecond: 50, since: BUFFERED_FEED_DEFAULT_SINCE, cursor: "tail", budgetMs: 60_000 } } };
+    const handler = createPipelineLambdaHandler({ loadRuntime: async () => runtime as never });
+    try {
+      process.env.INGEST_BUFFERED_SEARCH_FEED = "on";
+      process.env.BUFFERED_SEARCH_FEED_GATE_DECLARED = BUFFERED_SEARCH_GATE_CONTRACT;
+      process.env.INGEST_BUFFERED_SEARCH_FEED_SECOND_VERSION = "on";
+      let result: unknown;
+      const lines = await stderrJson(async () => { result = await handler({ bufferedSearchFeed: true }); });
+      expect(result).toEqual({ ok: false });
+      const failed = lines.filter((l) => l.message === "buffered search feed failed");
+      expect(failed).toHaveLength(1);
+      expect(failed[0]).toMatchObject({ level: "error", stage: "buffered-search-feed", error_code: "sql_57014", retryable: true, feed_query: "page" });
+      expect(JSON.stringify(lines)).not.toContain(MARKER);
+    } finally {
+      keys.forEach((k, i) => { if (saved[i] === undefined) delete process.env[k]; else process.env[k] = saved[i]; });
+    }
+  });
+
+  test("emitted JSON, keep-up: a statement timeout on the stage call logs feed_query=stage, and the message retries", async () => {
+    const store = newStore(), ch = fakeClickHouse();
+    const { prepared } = await stageBatch(store);
+    const body = JSON.stringify({ Records: [{ eventSource: "aws:s3", eventName: "ObjectCreated:Put", s3: { object: { key: encodeURIComponent(prepared.spec.key) } } }] });
+    const pointer = { db: { query: async () => ({ rows: [] }) }, reader: { provider: "s3" } } as never;
+    let result: unknown;
+    const lines = await stderrJson(async () => {
+      result = await processBatch([{ messageId: "m1", body }], { pointer, bufferedFeed: feedDeps(sqlBufferedFeedSource(timingOut()), store, ch.ch), requeue: async () => {} });
+    });
+    // The retry behaviour is unchanged: the message is failed back to its queue.
+    expect(result).toEqual({ batchItemFailures: [{ itemIdentifier: "m1" }] });
+    const failed = lines.filter((l) => l.message === "buffered stage search feed failed");
+    expect(failed).toHaveLength(1);
+    expect(failed[0]).toMatchObject({ level: "error", stage: "buffered-search-feed", error_code: "sql_57014", retryable: true, feed_query: "stage" });
+    expect(JSON.stringify(lines)).not.toContain(MARKER);
   });
 
   /** Stages at fixed offsets (ms) before NOW; `listed` decides which the page RPC returns (acknowledged). */

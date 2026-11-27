@@ -129,6 +129,8 @@ export const ALLOWED_LOG_FIELDS = new Set([
   // The ingest bounded lock retry (src/session-ingest/deliver.ts LockRetryFields, INGEST_LOCK_RETRY_BUDGET_MS): retries
   // issued for one delivery (a bounded integer) and how they ended (LOCK_RETRY_OUTCOME_VALUES).
   "lock_retry_attempts", "lock_retry_outcome",
+  // The buffered search feed's failing SQL call: one of page / stage / advance (FEED_QUERY_VALUES), never SQL text.
+  "feed_query",
 ]);
 
 /**
@@ -196,6 +198,8 @@ export const REGEN_REASON_VALUES: ReadonlySet<string> = new Set([
 ]);
 /** `lock_retry_outcome` mirrors session-ingest deliver.ts LOCK_RETRY_OUTCOMES (pinned equal in lock-retry-budget.test.ts). */
 export const LOCK_RETRY_OUTCOME_VALUES: ReadonlySet<string> = new Set(["succeeded_after_retry", "exhausted", "not_retryable"]);
+/** `feed_query` mirrors buffered-search-feed.ts BUFFERED_FEED_QUERIES (pinned equal in buffered-search-feed.test.ts). */
+export const FEED_QUERY_VALUES: ReadonlySet<string> = new Set(["page", "stage", "advance"]);
 export const REGEN_SYSTEM_VALUES: ReadonlySet<string> = new Set(["bob_costas", "brief"]);
 const ENUM_FIELDS: ReadonlyMap<string, ReadonlySet<string>> = new Map([
   ["queue_origin", new Set(["s3", "requeue", "sweep"])],
@@ -205,7 +209,7 @@ const ENUM_FIELDS: ReadonlyMap<string, ReadonlySet<string>> = new Map([
   ["db_refusal", DB_REFUSAL_VALUES], ["client_kind", CLIENT_KIND_VALUES], ["client_os", CLIENT_OS_VALUES],
   ["regeneration_reason", REGEN_REASON_VALUES], ["system", REGEN_SYSTEM_VALUES],
   ["db_error_detail", DB_ERROR_DETAIL_VALUES], ["db_client_phase", DB_CLIENT_PHASE_VALUES],
-  ["lock_retry_outcome", LOCK_RETRY_OUTCOME_VALUES],
+  ["lock_retry_outcome", LOCK_RETRY_OUTCOME_VALUES], ["feed_query", FEED_QUERY_VALUES],
 ]);
 /** Shaped fields: emitted only when the string matches its pattern AND the scrubber leaves it unchanged (else
  * dropped). `client_version` is a release version (client-agent.ts CLIENT_VERSION, pinned equal in
