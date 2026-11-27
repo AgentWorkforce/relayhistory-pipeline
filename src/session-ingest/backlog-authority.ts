@@ -56,10 +56,10 @@ import { orgFenceAuthorityKey, validOrgFenceAuthority, type OrgFenceAuthorityDoc
 import { freshSweeperPass, type RearmPassExpectation } from "./rearm-sweeper-receipt.ts";
 import { reshardRevisions, type ReshardSummary } from "./revision-reshard.ts";
 import { isAccessDenied } from "./rearm-sweeper.ts";
+import { BACKLOG_OPS_SWEEPER_PASS_MAX_AGE_MS } from "./backlog-sweeper-limits.ts";
 
 export const BACKLOG_AUTHORITY_KEY_ROOT = "96bulls";
-/** A sweeper pass older than this is not "live". */
-export const BACKLOG_OPS_SWEEPER_PASS_MAX_AGE_MS = 6 * 60 * 60 * 1000;
+export { BACKLOG_OPS_SWEEPER_PASS_MAX_AGE_MS };
 /** The bound evidence must have finished this recently when a marker is written (re-checked before each write). */
 export const BACKLOG_OPS_AUTHORITY_REPORT_MAX_AGE_MS = 5 * 60 * 1000;
 /** The serving spec must have been observed this recently (the observer refreshes it every 10-15 min). */
