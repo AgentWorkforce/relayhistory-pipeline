@@ -181,6 +181,10 @@ test("replay, session erase -> the fence deletion for every target of a COMPLETE
   expect(await replayErasure(none.d, sessionErase)).toBe("session_manifest_missing");
   expect(none.calls).toEqual([]);
   expect(await bridgeCompleteVerdict(none.d.store, ROOT, ORG, hold("marker_attempted"), E, [sessionErase])).toEqual({ code: "erasure_unreplayed", erasures: 1, receipted: 0 });
+  // An existing receipt for the session never bypasses a missing manifest.
+  const old = deps(fresh());
+  expect(await replayErasure(old.d, sessionErase)).toBe("replayed");
+  expect(await replayErasure({ ...old.d, resolveSessionTargets: undefined }, sessionErase)).toBe("session_manifest_missing");
   // Stubs that resolve some owners but cannot prove the set complete (a missing second owner): partial, blocked.
   for (const m of [{ complete: false, targets: [{ userId: "user-a", originId: "origin-a", source: "claude", sessionId: "sess-1" }] }, { complete: true, targets: [] }]) {
     const p = deps(fresh(), { resolveSessionTargets: async () => m });

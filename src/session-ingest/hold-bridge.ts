@@ -226,6 +226,8 @@ async function readReceipt(store: ObjectStore, key: string): Promise<unknown | n
  */
 export async function replayErasure(d: ReplayDeps, e: Erasure): Promise<ReplayOutcome> {
   if (!ORG.test(d.org) || !UUID.test(d.epoch)) refuse("hold_input");
+  // A session erase resolves its manifest BEFORE any receipt lookup: an old receipt never bypasses the proof.
+  if (e.kind === "session" && !d.resolveSessionTargets) return "session_manifest_missing";
   const key = erasureReceiptKey(d.keyRoot, d.org, d.epoch, e.requestId);
   const existing = await readReceipt(d.store, key);
   if (existing !== null) return validErasureReceipt(existing, d.epoch, e.requestId) ? "already" : "replay_failed";
