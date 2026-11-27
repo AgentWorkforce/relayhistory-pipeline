@@ -1,4 +1,4 @@
-# Operator erase replay target manifest — draft 2
+# Operator erase replay target manifest — draft 3
 
 ## Status and ownership
 
@@ -252,7 +252,8 @@ provenance; present-day owner stubs, receipts or surviving rows alone cannot.
 
 ## 6. Owner read interface for the bridge
 
-Proposed reader (name/signature to be agreed with the consumer before SQL):
+Reader name, signature and bounded transport accepted by the consumer; the
+response contract below is specified for its parser before SQL implementation:
 
 ```text
 sessions.session_erasure_replay_read(
@@ -264,8 +265,8 @@ sessions.session_erasure_replay_read(
 It is an owner-only, SECURITY INVOKER, STABLE read with a fixed search path,
 fully qualified objects and no writes, locks, sequences, clock-based leases or
 side effects. It must run in a READ ONLY transaction. One parameterized SELECT
-per page is the proposed bounded transport; the consumer must confirm this
-extension of its current single-result array seam.
+per page is the accepted bounded transport; the consumer will replace its
+single-array seam with a complete draining/preparation adapter.
 Require `1 <= page_size <= 512`; a page boundary is never a coverage boundary.
 
 Every page carries the same manifest identity, accepted `request_id`, full
@@ -323,6 +324,99 @@ match. Never count a partial application as complete.
 
 The same owner reader is used at replay time and before `bridge_complete`.
 There is no new app endpoint, runtime grant, end-user reader or bearer token.
+
+### 6.1 Exact JSONB response and cursor keys
+
+The following defines JSON property names and types, not executable code or
+proof that a producer exists. Every listed key is required; reject unknown
+keys, an unsupported wire/capture version, or a malformed response. Reader
+wire version `v: 1` is independent of the bridge's proposed v2 receipt format.
+
+```ts
+type Target = {
+  user_id: string;
+  origin_id: string;
+  source: string;
+  session_id: string;
+};
+type Cursor = {
+  v: 1;
+  manifest_id: string;
+  manifest_sha256: string;
+  after: Target;
+};
+type ProvenPage = {
+  v: 1;
+  complete: true;
+  reason: "complete";
+  manifest_id: string;
+  request_id: string;
+  scope: {
+    org_id: string;
+    workspace_id: string;
+    source: string;
+    requested_session_id: string;
+  };
+  capture_version: 1;
+  alias_ids: string[];
+  target_count: string;
+  manifest_sha256: string;
+  targets: Target[];
+  next_cursor: Cursor | null;
+};
+type UnprovenPage = {
+  v: 1;
+  complete: false;
+  reason:
+    | "manifest_missing"
+    | "manifest_unsealed"
+    | "manifest_binding_invalid"
+    | "manifest_format_unsupported"
+    | "manifest_integrity_invalid"
+    | "manifest_empty_unproven"
+    | "manifest_cursor_invalid"
+    | "reader_input_invalid";
+  manifest_id: null;
+  request_id: null;
+  scope: null;
+  capture_version: null;
+  alias_ids: [];
+  target_count: null;
+  manifest_sha256: null;
+  targets: [];
+  next_cursor: null;
+};
+type ReaderResponse = ProvenPage | UnprovenPage;
+```
+
+`manifest_id` is the persisted UUID; `request_id` is the accepted originating
+receipt ID. `scope` must match the query's org/workspace/source.
+`scope.requested_session_id` names the original request, not necessarily the
+queried fence alias: that queried `fence_session` must occur in `alias_ids`.
+The alias declaration is sorted, unique, nonempty and at most 256 IDs.
+
+`target_count` is a positive, canonical base-10 integer string
+(`^[1-9][0-9]*$`), at most PostgreSQL bigint's positive maximum and parsed
+without floating-point coercion. Zero is unproven, not a proven empty plan.
+`manifest_sha256` is exactly 64 lowercase hexadecimal
+characters for the complete binding/target digest, not just this page's digest.
+All proven pages repeat identical metadata; only `targets` and `next_cursor`
+change. An unsealed intent includes retries with unproven continuity or changed
+aliases; `manifest_unsealed` does not invent a more specific historical cause.
+
+Targets use bytewise `COLLATE "C"` order on
+`(user_id, origin_id, source, session_id)`, with no duplicates. Each target's
+source equals `scope.source` and its session occurs in `alias_ids`. A proven
+page has between one and `page_size` targets. `next_cursor` is null only on
+the nonempty terminal page; otherwise it repeats the manifest UUID/digest
+and `after` equals that page's last target. Do not emit an extra empty terminal
+page. Validate a cursor against the same sealed set; it cannot select another
+scope, skip preparation, or stand in for the total count/digest check.
+
+Unproven responses expose no partial targets or reusable descriptor. SQL errors
+or no JSON response also fail closed. IDs and cursors stay in SQL/the bridge
+process; logs and receipts must not serialize this response. A proven page
+still grants no effects by itself: both passes in section 6 remain mandatory.
 
 ## 7. Replay receipt and release coupling
 
@@ -497,10 +591,11 @@ Neither the session manifest nor 062320's shared org lock can stand in for it.
 
 ## 11. Decisions before implementation
 
-1. Consumer accepts manifest UUID plus persisted receipt request ID and full
-   scope/digest as identity, validates the complete plan before receipt reuse
-   **and before any mutation**, and agrees the two-phase paged read contract.
-   No identity-only or pre-proof old receipt fallback in replay or release.
+1. Consumer has accepted the reader signature, bounded keyset transport and
+   manifest UUID/accepted-request/scope/digest receipt identity. Confirm the
+   exact response keys above and the complete preparation before receipt reuse
+   **and before any mutation**, including both user-proof paths. No identity-only
+   or pre-proof old receipt fallback in replay or release.
 2. Erase-equivalence owner accepts the exact target derivation, failure and
    alias-repeat rules, empty/historical refusals, and the distinction from
    global admission and user-generation proofs.
