@@ -786,6 +786,28 @@ describe("buffered-stage search feed", () => {
     }
   });
 
+  test("the scheduled run uses Runtime.scheduledFeed (the timed source) when present, never the keep-up deps", async () => {
+    const keys = ["INGEST_BUFFERED_SEARCH_FEED", "BUFFERED_SEARCH_FEED_GATE_DECLARED", "INGEST_BUFFERED_SEARCH_FEED_SECOND_VERSION"] as const;
+    const saved = keys.map((k) => process.env[k]);
+    const store = newStore(), ch = fakeClickHouse();
+    const cfg = { pageSize: 10, stagesPerSecond: 50, since: BUFFERED_FEED_DEFAULT_SINCE, cursor: "tail", budgetMs: 60_000 };
+    const keepUp = feedDeps(sqlBufferedFeedSource(timingOut()), store, ch.ch); // would fail 57014 if used
+    const scheduled = feedDeps(memorySource([]).source, store, ch.ch); // an empty, healthy feed
+    try {
+      process.env.INGEST_BUFFERED_SEARCH_FEED = "on";
+      process.env.BUFFERED_SEARCH_FEED_GATE_DECLARED = BUFFERED_SEARCH_GATE_CONTRACT;
+      process.env.INGEST_BUFFERED_SEARCH_FEED_SECOND_VERSION = "on";
+      const withScheduled = createPipelineLambdaHandler({ loadRuntime: async () => ({ deps: { bufferedFeed: keepUp }, scheduledFeed: scheduled, env: { bufferedSearchFeed: cfg } }) as never });
+      expect(await withScheduled({ bufferedSearchFeed: true })).toEqual({ ok: true });
+      // Without it (an older runtime shape), the run falls back to deps.bufferedFeed, as before.
+      const fallback = createPipelineLambdaHandler({ loadRuntime: async () => ({ deps: { bufferedFeed: keepUp }, env: { bufferedSearchFeed: cfg } }) as never });
+      const lines = await stderrJson(async () => { expect(await fallback({ bufferedSearchFeed: true })).toEqual({ ok: false }); });
+      expect(lines.some((l) => l.message === "buffered search feed failed" && l.error_code === "sql_57014")).toBe(true);
+    } finally {
+      keys.forEach((k, i) => { if (saved[i] === undefined) delete process.env[k]; else process.env[k] = saved[i]; });
+    }
+  });
+
   test("emitted JSON, keep-up: a statement timeout on the stage call logs feed_query=stage, and the message retries", async () => {
     const store = newStore(), ch = fakeClickHouse();
     const { prepared } = await stageBatch(store);

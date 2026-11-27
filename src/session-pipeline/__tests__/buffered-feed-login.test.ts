@@ -352,3 +352,16 @@ test("real Postgres semantics (PGlite): set_config(statement_timeout, ..., true)
     await pg.close();
   }
 });
+
+test("scope: only the scheduled run's source is timed; the SQS keep-up source and the default config keep the login's 5s", async () => {
+  const { bufferedFeedSources } = await import("../lambda.ts");
+  for (const [cfg, scheduledTimed] of [[{ secondVersion: false, statementTimeoutMs: 30_000 }, true], [{ secondVersion: true, statementTimeoutMs: 30_000 }, true], [{ secondVersion: false, statementTimeoutMs: 5_000 }, false]] as const) {
+    const t = timedPool();
+    const s = bufferedFeedSources(loginCheckedFeedExecutor(t.pool), cfg);
+    expect(await s.keepUp.advance(...ADVANCE)).toBe(true);
+    expect(t.log.some((l) => l.includes(":begin") || l.includes(":set_local"))).toBe(false); // keep-up: single statement at 5s
+    expect(await s.scheduled.advance(...ADVANCE)).toBe(true);
+    expect(t.log.some((l) => l.includes(":set_local:30000ms"))).toBe(scheduledTimed);
+    expect(t.seen.filter((x) => x.startsWith("rpc:"))).toEqual(scheduledTimed ? ["rpc:5s", "rpc:30000ms"] : ["rpc:5s", "rpc:5s"]);
+  }
+});

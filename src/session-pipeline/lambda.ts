@@ -87,7 +87,7 @@ import { processBatch, RETRY_VISIBILITY_TIMEOUT_MS, type BatchResponse, type Con
 import { droppedFanout, scopeLockKey, type ScopeLock } from "./pointer.ts";
 import { STREAM_MIN_START_MS, searchIndexLimits, searchIndexStreamChFromEnv, type SearchIndexDeps, type SearchIndexStreamCh } from "./search-index.ts";
 import { claimSearchJobs, claimSearchProbe, runSearchJob, searchJobLogFields, searchSettlementFor, settleSearchJob, SEARCH_JOBS_DEFAULT_CLAIM, type ClaimedSearchJob, type SearchSql } from "./search-jobs.ts";
-import { BufferedFeedError, bufferedFeedConfig, bufferedFeedQueryField, bufferedFeedGateRefusal, bufferedFeedVersionRefusal, clickhouseTieLedger, runBufferedFeed, sqlBufferedFeedSource, type BufferedFeedConfig } from "./buffered-search-feed.ts";
+import { BufferedFeedError, bufferedFeedConfig, bufferedFeedQueryField, bufferedFeedGateRefusal, bufferedFeedVersionRefusal, clickhouseTieLedger, runBufferedFeed, sqlBufferedFeedSource, type BufferedFeedConfig, type BufferedFeedDeps, type TimedSqlExecutor } from "./buffered-search-feed.ts";
 import { bufferedErasureConfig, runBufferedErasureDelete, type BufferedErasureConfig, type BufferedErasureDeps } from "./buffered-erasure-delete.ts";
 import { RECONCILE_BODY_KEY, requeueBody } from "./s3-events.ts";
 import { BUFFERED_FEED_CA_FIELD, BUFFERED_FEED_URL_FIELD, bufferedFeedClientConfig, loginCheckedFeedExecutor } from "./buffered-feed-login.ts";
@@ -527,6 +527,19 @@ export const HOOPDB_CONNECT_TIMEOUT_MS = 10_000;
  * stalled feeder connection fails its checkout in 10 s instead of holding the invocation (and every record in its
  * batch) until the Lambda timeout.
  */
+/**
+ * The feed's two SQL sources over one login-checked executor. `keepUp` (deps.bufferedFeed: the SQS staged-object
+ * keep-up path in consumer.ts) always runs at the login's own statement timeout; `scheduled` (Runtime.scheduledFeed:
+ * the {"bufferedSearchFeed":true} run only) runs each RPC under cfg.statementTimeoutMs when that differs from it.
+ */
+export function bufferedFeedSources(executor: TimedSqlExecutor, cfg: Pick<BufferedFeedConfig, "secondVersion" | "statementTimeoutMs">) {
+  const base = cfg.secondVersion ? { secondVersion: true } : {};
+  return {
+    keepUp: sqlBufferedFeedSource(executor, base),
+    scheduled: sqlBufferedFeedSource(executor, { ...base, statementTimeoutMs: cfg.statementTimeoutMs }),
+  };
+}
+
 export function bufferedFeedPoolOptions<T extends object>(feedConfig: T) {
   return { ...feedConfig, max: 1, idleTimeoutMillis: 60_000, connectionTimeoutMillis: HOOPDB_CONNECT_TIMEOUT_MS };
 }
@@ -633,6 +646,12 @@ export interface Runtime {
   semanticCopy?: () => Promise<SemanticCopyStats>;
   /** INGEST_BUFFERED_ERASURE_DELETE=on only: the later-erasure lane over the feeder login's pool. */
   bufferedErasure?: BufferedErasureDeps;
+  /**
+   * The scheduled feed run's deps: deps.bufferedFeed with a source that runs each RPC under
+   * INGEST_BUFFERED_SEARCH_FEED_STATEMENT_TIMEOUT_MS. Only the {"bufferedSearchFeed":true} schedule uses it; the SQS
+   * keep-up path (consumer.ts, deps.bufferedFeed) and the erasure lane keep the login's own 5s.
+   */
+  scheduledFeed?: BufferedFeedDeps;
 }
 
 type SemanticCopyStats = Awaited<ReturnType<typeof runSemanticCopyTick>>;
@@ -748,6 +767,7 @@ export function runtimeFromSecret(env: LambdaEnv, secretText: string, schemaGene
     };
   }
   let bufferedErasure: BufferedErasureDeps | undefined;
+  let scheduledFeed: BufferedFeedDeps | undefined;
   if (env.bufferedSearchFeed?.enabled || env.bufferedErasureDelete?.enabled) {
     // Writes the legacy transcript_events table only; a portable search backend has no buffered feed.
     // Missing prerequisites disarm only this feed, never the shared runtime.
@@ -763,12 +783,13 @@ export function runtimeFromSecret(env: LambdaEnv, secretText: string, schemaGene
       const feedExecutor = loginCheckedFeedExecutor(feedPool);
       if (env.bufferedSearchFeed?.enabled) {
         const secondVersion = env.bufferedSearchFeed.secondVersion;
-        // INGEST_BUFFERED_SEARCH_FEED_STATEMENT_TIMEOUT_MS: each feed RPC under its own SET LOCAL timeout (default: the login's 5s).
-        const statementTimeoutMs = env.bufferedSearchFeed.statementTimeoutMs;
-        deps.bufferedFeed = { source: sqlBufferedFeedSource(feedExecutor, { ...(secondVersion ? { secondVersion } : {}), statementTimeoutMs }), store, ch: deps.search.ch, keyRoot: env.keyPrefix,
+        const sources = bufferedFeedSources(feedExecutor, env.bufferedSearchFeed);
+        deps.bufferedFeed = { source: sources.keepUp, store, ch: deps.search.ch, keyRoot: env.keyPrefix,
           ...(secondVersion ? { secondVersion: { ledger: clickhouseTieLedger(deps.search.ch) } } : {}),
           // Same labels as the canonical indexer, so buffered and canonical rows of one event agree.
           ...(env.originLabelsEnabled ? { originLabels: true as const } : {}) };
+        // The scheduled run alone gets INGEST_BUFFERED_SEARCH_FEED_STATEMENT_TIMEOUT_MS (SET LOCAL per RPC); default: the login's 5s.
+        scheduledFeed = { ...deps.bufferedFeed, source: sources.scheduled };
       }
       // The erasure lane reads only `stage` status and retention, never sameSecond or createdAt, so it keeps the
       // legacy (non-strict) source: its deletes do not depend on 045010 or the version flag.
@@ -799,7 +820,7 @@ export function runtimeFromSecret(env: LambdaEnv, secretText: string, schemaGene
   // Semantic copier fields are carried raw and validated only in semanticCopyDeps().
   const semanticSecret = env.semanticCopyEnabled ? { hoopdbUrl: secret.hoopdb_url, clickhouse: secret.clickhouse, sourceUrl: secret.analysis_source_readonly_url } : undefined;
   // Under Neon exit, carry the source only when the explicit frozen-Supabase selector passed startup.
-  return { env, deps, brief, sessionAnalysis, store, analysisSourceUrl: env.neonExit && env.legacyReadSource !== "frozen-supabase" ? undefined : secret.analysis_source_readonly_url, semanticSecret, ...(bufferedErasure ? { bufferedErasure } : {}) };
+  return { env, deps, brief, sessionAnalysis, store, analysisSourceUrl: env.neonExit && env.legacyReadSource !== "frozen-supabase" ? undefined : secret.analysis_source_readonly_url, semanticSecret, ...(bufferedErasure ? { bufferedErasure } : {}), ...(scheduledFeed ? { scheduledFeed } : {}) };
 }
 
 /**
@@ -1208,7 +1229,7 @@ async function dispatchLambdaEvent(event: PipelineLambdaEvent, ready: () => Prom
     try {
       const rt = await ready();
       if (!rt.deps.bufferedFeed || !rt.env.bufferedSearchFeed) throw new Error("buffered search feed unavailable");
-      const s = await runBufferedFeed(rt.deps.bufferedFeed, rt.env.bufferedSearchFeed);
+      const s = await runBufferedFeed(rt.scheduledFeed ?? rt.deps.bufferedFeed, rt.env.bufferedSearchFeed);
       // A same-second refusal is never coverage: the run is not ok while any is recorded or outstanding.
       const refusals = (s.refused ?? 0) + (s.refusalsOutstanding ?? 0);
       if (refusals) log.warn("buffered search feed refusals", { stage: "buffered-search-feed", count: s.refused,
