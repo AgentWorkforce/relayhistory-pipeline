@@ -69,6 +69,20 @@ All of these sit under the per-user admission directory that already holds `priv
   the same session rewrites it (`If-Match`, with a strictly later `atMs`), so its content changes. The
   re-arm sweeper (`rearm-sweeper.ts`) erases the session again. It then records completion in a
   create-only `<marker>.done/<sha256(marker bytes)[0:32]>.json`. A marker is never deleted.
+- `<root>/.ledger/rearm-sweeper/passes/<org | .all>/<startedAtMs>.json` and `…/latest.json`
+  (`rearm-sweeper-receipt.ts`): the sweeper's per-org liveness evidence for the fence-authority
+  marker's `rearmSweeper: "live"`. A real pass that started at the beginning of its scope, listed it
+  to the end with no failure and kept its own cursor writes one create-only receipt per org (counts,
+  start and finish times, scope hash, hashed buckets, code revision, workload identity) and moves the
+  org's `latest.json` to it with `If-Match`, only ever forward. A disabled, dry, resumed, incomplete,
+  failed or contended pass writes nothing. `freshSweeperPass(store, keyRoot, org, nowMs, maxAgeMs)`
+  reads it for a later authority mode: missing, malformed (at the org's or the `.all` scope), stale or
+  future-dated is a refusal. The keys sit beside the sweeper's cursor, so the role's existing
+  `RearmSweeperReads` / `RearmSweeperWritesProgress` grants on `96bulls/.ledger/rearm-sweeper/*` cover
+  them; an identity policy narrower than that needs `s3:GetObject` and `s3:PutObject` on
+  `96bulls/.ledger/rearm-sweeper/passes/*`. Receipts are never deleted by the sweeper (it may not
+  delete under a dot prefix): one per org per pass accumulates until a lifecycle expiration on that
+  prefix (an infrastructure follow-up) removes old ones.
 
 ### What the S3 ledger refuses
 

@@ -39,6 +39,15 @@
  *                                    refreshes them; the eraser takes them per pass, and a pass ends 5 min before they
  *                                    expire. IRSA (web identity) is not supported: the shared helper has no such mode.
  *
+ * Pass receipts (rearm-sweeper-receipt.ts): a real pass that started at the beginning of its scope, listed it to the end
+ * with no failure and kept its own cursor writes one create-only receipt per org (or `.all`) under
+ * `<root>/.ledger/rearm-sweeper/passes/` and moves that org's `latest.json` to it (CAS). Nothing else writes one: not
+ * a disabled run, a dry run, a resumed, incomplete, failed or contended pass. The pass line carries `receipt`:
+ * "written", "skipped" (with `receiptSkip`, a code) or "failed" (with `receiptError`, a code); a failed receipt write
+ * does not change the exit code (the authority reads the absence as "not live"). Provenance env: see that file
+ * (GITHUB_SHA, INGEST_REARM_IMAGE_DIGEST, INGEST_REARM_CRONJOB_NAME, INGEST_REARM_JOB_NAME / _JOB_UID / _POD_NAME /
+ * _POD_UID / _POD_NAMESPACE from the downward API).
+ *
  * `--loop` runs a pass every interval until SIGTERM / SIGINT (the current pass finishes first); an incomplete pass's
  * next one continues where it stopped (the durable cursor in the bucket; a dry run keeps it in memory). Without it: one pass, exit 0 when complete (or dry run / disabled), 3 when
  * incomplete or any marker failed (rerun), 2 refused / misconfigured, 4 any other failure. One JSON line per pass, counts
@@ -55,7 +64,8 @@ import { podIdentityCredentials, trustedCredentialsUri } from "../shared/locker.
 import type { AwsCredentials } from "../../packages/object-store/src/sigv4.ts";
 import { isRoutedCursor, ledgerHomeGuard, ledgerHomeVerdict, ledgerRoutedStore, readLedgerHome } from "./ledger-store.ts";
 import { isObjectStoreError } from "../shared/vendor.ts";
-import { readRearmCursor, rearmCursorKey, rearmScopes, RearmSweepRefused, REARM_MAX_CONCURRENCY, sweepRearmMarkers, writeRearmCursor, type RearmSweepOptions, type RearmSweepResult, type RearmSweepResume } from "./rearm-sweeper.ts";
+import { rearmBucketHash, REARM_ALL_ORGS, rearmPassReceiptEligibility, rearmPassRevision, rearmPassWorkload, writeRearmPassReceipt, type RearmPassReceipt, type RearmReceiptSkip } from "./rearm-sweeper-receipt.ts";
+import { readRearmCursor, rearmCursorKey, rearmScopeHash, rearmScopes, RearmSweepRefused, REARM_MAX_CONCURRENCY, sweepRearmMarkers, writeRearmCursor, type RearmSweepOptions, type RearmSweepResult, type RearmSweepResume } from "./rearm-sweeper.ts";
 
 export const REARM_ENABLE_FLAG = "INGEST_REARM_SWEEPER_ENABLED";
 const refuse = (code: string): never => { throw new RearmSweepRefused(code); };
@@ -189,7 +199,11 @@ export interface RearmSweeperOverrides {
 }
 
 /** `cursor`: "saved" (the position is in the bucket), "contended" (another sweeper saved first) or "memory" (dry run: never written). */
-export type RearmPassOutput = { enabled: false } | ({ enabled: true; cursor: "saved" | "contended" | "memory" } & Omit<RearmSweepResult, "resume">);
+export type RearmReceiptOutcome =
+  | { receipt: "written" }
+  | { receipt: "skipped"; receiptSkip: RearmReceiptSkip }
+  | { receipt: "failed"; receiptError: "access_denied" | "contended" | "store_error" };
+export type RearmPassOutput = { enabled: false } | ({ enabled: true; cursor: "saved" | "contended" | "memory" } & Omit<RearmSweepResult, "resume"> & RearmReceiptOutcome);
 
 /**
  * One pass with fresh credentials. With the flag off nothing else is read and no client is built. A real pass starts
@@ -200,6 +214,8 @@ export async function runRearmSweeperPass(env: NodeJS.ProcessEnv, argv: readonly
   resume: RearmSweepResume | null = null, extra: Pick<RearmSweepOptions, "deadlineAt"> = {}): Promise<{ output: RearmPassOutput; resume: RearmSweepResume | null }> {
   if (!rearmSweeperEnabled(env)) return { output: { enabled: false }, resume: null };
   const cfg = rearmSweeperConfig(env, argv);
+  const now = overrides.now ?? Date.now;
+  const startedAtMs = now();
   const { snapshot, provider } = await rearmSweeperCredentials(env, cfg, overrides.fetcher);
   const s3 = { bucket: cfg.bucket, region: cfg.region, ...(cfg.endpoint ? { endpoint: cfg.endpoint } : {}), credentials: snapshot };
   const main = (overrides.store ?? createS3Store)({ ...s3, credentials: provider }) as unknown as ObjectStore;
@@ -221,15 +237,17 @@ export async function runRearmSweeperPass(env: NodeJS.ProcessEnv, argv: readonly
     if (verdict !== "ok") refuse(verdict);
   }
   const eraser = (overrides.eraser ?? createS3Eraser)(s3);
-  const now = overrides.now ?? Date.now;
   // Expiring credentials (Pod Identity): the eraser's snapshot must outlive the pass.
   if (snapshot.expiresAt !== undefined) {
     const until = snapshot.expiresAt.getTime() - REARM_CREDENTIAL_MARGIN_MS;
     if (!(until > now())) refuse("credentials_expiring");
     extra = { ...extra, deadlineAt: Math.min(extra.deadlineAt ?? Infinity, until) };
   }
-  const cursorKey = rearmCursorKey(cfg.keyRoot, rearmScopes(cfg.keyRoot, cfg.orgs ?? null));
+  const scopes = rearmScopes(cfg.keyRoot, cfg.orgs ?? null);
+  const cursorKey = rearmCursorKey(cfg.keyRoot, scopes);
   let saved = cfg.dryRun ? null : await readRearmCursor(store, cursorKey);
+  // Only a pass that starts at the beginning of its scope can earn a receipt (it alone covers the whole scope).
+  const fromStart = saved !== null && saved.resume === null;
   // A position saved before INGEST_REARM_LEDGER_BUCKET was set holds a plain listing cursor, which the routed store's
   // merged listing cannot continue: restart that scope (completion records make re-reading a marker a no-op).
   if (saved?.resume?.cursor !== undefined && cfg.ledger && !isRoutedCursor(saved.resume.cursor)) {
@@ -251,7 +269,29 @@ export async function runRearmSweeperPass(env: NodeJS.ProcessEnv, argv: readonly
   const { resume: next, ...output } = r;
   if (saved) await persist(next);
   const cursor = saved === null ? "memory" as const : contended ? "contended" as const : "saved" as const;
-  return { output: { enabled: true, cursor, ...output }, resume: next };
+  const finishedAtMs = now();
+  const skip = rearmPassReceiptEligibility({ ...output, dryRun: cfg.dryRun || output.dryRun, fromStart, cursor });
+  let receipt: RearmReceiptOutcome;
+  if (skip !== null) receipt = { receipt: "skipped", receiptSkip: skip };
+  else {
+    const base: Omit<RearmPassReceipt, "org"> = {
+      v: 1, kind: "rearm-sweeper-pass", enabled: true, dryRun: false, complete: true, fromStart: true, failures: 0,
+      startedAtMs, finishedAtMs: Math.max(finishedAtMs, startedAtMs), scopeHash: rearmScopeHash(scopes),
+      scopes: scopes.length, keyRoot: cfg.keyRoot, bucketHash: rearmBucketHash(cfg.bucket),
+      ...(cfg.ledger ? { ledgerBucketHash: rearmBucketHash(cfg.ledger.bucket) } : {}),
+      revision: rearmPassRevision(env), workload: rearmPassWorkload(env), counts: output.counts,
+    };
+    receipt = { receipt: "written" };
+    for (const org of cfg.orgs ? [...new Set(cfg.orgs)].sort() : [REARM_ALL_ORGS]) {
+      try {
+        if (await writeRearmPassReceipt(store, { ...base, org }) === "contended") receipt = { receipt: "failed", receiptError: "contended" };
+      } catch (error) {
+        receipt = { receipt: "failed", receiptError: error instanceof RearmSweepRefused && error.code === "access_denied" ? "access_denied" : "store_error" };
+        break;
+      }
+    }
+  }
+  return { output: { enabled: true, cursor, ...output, ...receipt }, resume: next };
 }
 
 /** 0: complete (or disabled, or dry run) with no failed marker; 3: rerun (incomplete, or a marker failed). */
