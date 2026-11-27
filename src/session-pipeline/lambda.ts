@@ -87,7 +87,7 @@ import { processBatch, RETRY_VISIBILITY_TIMEOUT_MS, type BatchResponse, type Con
 import { droppedFanout, scopeLockKey, type ScopeLock } from "./pointer.ts";
 import { STREAM_MIN_START_MS, searchIndexLimits, searchIndexStreamChFromEnv, type SearchIndexDeps, type SearchIndexStreamCh } from "./search-index.ts";
 import { claimSearchJobs, claimSearchProbe, runSearchJob, searchJobLogFields, searchSettlementFor, settleSearchJob, SEARCH_JOBS_DEFAULT_CLAIM, type ClaimedSearchJob, type SearchSql } from "./search-jobs.ts";
-import { BufferedFeedError, bufferedFeedConfig, bufferedFeedGateRefusal, bufferedFeedVersionRefusal, clickhouseTieLedger, runBufferedFeed, sqlBufferedFeedSource, type BufferedFeedConfig } from "./buffered-search-feed.ts";
+import { BufferedFeedError, bufferedFeedConfig, bufferedFeedQueryField, bufferedFeedGateRefusal, bufferedFeedVersionRefusal, clickhouseTieLedger, runBufferedFeed, sqlBufferedFeedSource, type BufferedFeedConfig } from "./buffered-search-feed.ts";
 import { bufferedErasureConfig, runBufferedErasureDelete, type BufferedErasureConfig, type BufferedErasureDeps } from "./buffered-erasure-delete.ts";
 import { RECONCILE_BODY_KEY, requeueBody } from "./s3-events.ts";
 import { BUFFERED_FEED_CA_FIELD, BUFFERED_FEED_URL_FIELD, bufferedFeedClientConfig, loginCheckedFeedExecutor } from "./buffered-feed-login.ts";
@@ -1217,7 +1217,7 @@ async function dispatchLambdaEvent(event: PipelineLambdaEvent, ready: () => Prom
         reason: s.blocked ?? (Object.entries(s.reasons).map(([k, n]) => `${k}:${n}`).join(",") || undefined), duration_ms: Date.now() - started });
       return { ok: true };
     } catch (error) {
-      log.error("buffered search feed failed", { stage: "buffered-search-feed", ...errorFields(error), duration_ms: Date.now() - started });
+      log.error("buffered search feed failed", { stage: "buffered-search-feed", ...errorFields(error), ...bufferedFeedQueryField(error), duration_ms: Date.now() - started });
       return { ok: false };
     }
   }

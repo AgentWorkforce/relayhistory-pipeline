@@ -18,7 +18,7 @@ import { LEGACY_PROVENANCE_INVALID } from "../session-read-api/legacy-provenance
 import { streamDeadlinePassed } from "../session-read-api/canonical-stream-projection.ts";
 import { captureRefusal, classifyReplayFailure, produceCanonicalReplay, type ReplayProducerDeps } from "./replay-publication.ts";
 import type { LargeJobState, LargeRoute } from "./large-read-worker.ts";
-import { feedBufferedStageByKey, isBufferedStageKey, type BufferedFeedDeps } from "./buffered-search-feed.ts";
+import { bufferedFeedQueryField, feedBufferedStageByKey, isBufferedStageKey, type BufferedFeedDeps } from "./buffered-search-feed.ts";
 
 export interface QueueRecord {
   messageId: string;
@@ -283,7 +283,7 @@ export async function processBatch(records: readonly QueueRecord[], deps: Consum
         log.info("buffered stage search feed", { stage: "buffered-search-feed", outcome: fed.outcome,
           ...(fed.outcome === "indexed" ? { count: fed.rows, deleted: fed.deleted } : { reason: fed.reason }), duration_ms: Date.now() - started });
       } catch (error) {
-        log.error("buffered stage search feed failed", { stage: "buffered-search-feed", ...errorFields(error), duration_ms: Date.now() - started });
+        log.error("buffered stage search feed failed", { stage: "buffered-search-feed", ...errorFields(error), ...bufferedFeedQueryField(error), duration_ms: Date.now() - started });
         for (const id of messageIds) fail(id);
       }
       continue;

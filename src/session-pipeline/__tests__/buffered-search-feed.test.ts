@@ -28,6 +28,7 @@ import {
   projectBufferedStage,
   runBufferedFeed,
   sqlBufferedFeedSource,
+  bufferedFeedQueryField,
   BUFFERED_VERSION_CEILING,
   bufferedFeedVersionRefusal,
   canonicalPresent,
@@ -719,6 +720,23 @@ describe("buffered-stage search feed", () => {
     const failing = (code: string): SqlExecutor => ({ query: async () => { throw Object.assign(new Error("x"), { code }); } });
     await expect(sqlBufferedFeedSource(failing("40001")).stage({ stageToken: randomUUID() })).rejects.toMatchObject({ code: "sql_40001", retryable: true });
     await expect(sqlBufferedFeedSource(failing("42501")).stage({ stageToken: randomUUID() })).rejects.toMatchObject({ code: "sql_42501", retryable: false });
+  });
+
+  test("a failed feeder SQL call names its query, so a statement timeout traces to page, stage or advance", async () => {
+    const failing = (code: string): SqlExecutor => ({ query: async () => { throw Object.assign(new Error("x"), { code }); } });
+    const src = sqlBufferedFeedSource(failing("57014"));
+    const caught = async (p: Promise<unknown>) => p.then(() => null, (e: unknown) => e);
+    const page = await caught(src.page("c", BUFFERED_FEED_DEFAULT_SINCE, 5));
+    expect(page).toMatchObject({ code: "sql_57014", retryable: true, query: "page" });
+    expect(bufferedFeedQueryField(page)).toEqual({ query: "page" });
+    expect(await caught(src.stage({ stageToken: randomUUID() }))).toMatchObject({ code: "sql_57014", query: "stage" });
+    expect(await caught(src.advance("c", { createdAt: "2026-11-27T00:00:00.000000Z", stageToken: randomUUID() }, { indexed: 0, skipped: 0 }))).toMatchObject({ code: "sql_57014", query: "advance" });
+    // Result-shape refusals and anything that is not a feeder SQL error carry no query field.
+    const answer = (r: unknown): SqlExecutor => ({ query: async <R>() => ({ rows: [{ r }] as R[] }) });
+    const shape = await caught(sqlBufferedFeedSource(answer({ found: true, status: "weird", reason: null, retained: [] })).stage({ stageToken: randomUUID() }));
+    expect(bufferedFeedQueryField(shape)).toEqual({});
+    expect(bufferedFeedQueryField(Object.assign(new Error("x"), { query: "page" }))).toEqual({});
+    expect(bufferedFeedQueryField(undefined)).toEqual({});
   });
 
   /** Stages at fixed offsets (ms) before NOW; `listed` decides which the page RPC returns (acknowledged). */
