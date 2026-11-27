@@ -38,7 +38,7 @@
  */
 import { createHash } from "node:crypto";
 import { isObjectStoreError, objectKey, readAll, type ObjectStore, type ObjectVersion } from "../shared/vendor.ts";
-import { isAccessDenied, RearmSweepRefused, type RearmSweepCounts, type RearmSweepResult } from "./rearm-sweeper.ts";
+import { isAccessDenied, RearmSweepRefused, rearmScopeHash, rearmScopes, type RearmSweepCounts, type RearmSweepResult } from "./rearm-sweeper.ts";
 
 /** The scope segment of a sweeper that covers every org (INGEST_REARM_ORGS unset). */
 export const REARM_ALL_ORGS = ".all";
@@ -182,6 +182,7 @@ export function validRearmPassReceipt(v: unknown, keyRoot: string, scope: string
     && v.enabled === true && v.dryRun === false && v.complete === true && v.fromStart === true && v.failures === 0
     && ms(v.startedAtMs) && ms(v.finishedAtMs) && (v.finishedAtMs as number) >= (v.startedAtMs as number)
     && typeof v.scopeHash === "string" && HEX32.test(v.scopeHash) && Number.isSafeInteger(v.scopes) && (v.scopes as number) >= 1
+    && (scope !== REARM_ALL_ORGS || (v.scopes === 1 && v.scopeHash === rearmScopeHash(rearmScopes(keyRoot, null))))
     && v.keyRoot === keyRoot && typeof v.bucketHash === "string" && HEX32.test(v.bucketHash)
     && (v.ledgerBucketHash === undefined || (typeof v.ledgerBucketHash === "string" && HEX32.test(v.ledgerBucketHash)))
     && validRevision(v.revision) && validWorkload(v.workload) && validCounts(v.counts);
@@ -257,9 +258,26 @@ export async function writeRearmPassReceipt(store: ObjectStore, receipt: RearmPa
 
 // ---- the reader (for the backlog-ops fence-authority mode) ----
 
-export type FreshSweeperPassRefusal = "invalid_request" | "missing" | "malformed" | "stale" | "future";
+/**
+ * What the CURRENT serving sweeper is, obtained by the caller independently of the store (the deployed manifest / the
+ * CronJob's live spec), never from a receipt. A receipt is evidence only when it matches all of it.
+ */
+export interface RearmPassExpectation {
+  /** The serving sweeper's effective INGEST_REARM_ORGS, or null when it is scoped to every org. */
+  orgs: readonly string[] | null;
+  /** Its INGEST_REARM_BUCKET (the transcripts home). */
+  bucket: string;
+  /** Its INGEST_REARM_LEDGER_BUCKET, or null when the ledger is in `bucket`. */
+  ledgerBucket: string | null;
+  /** Its workload: the receipt must name this namespace and CronJob, and carry a Job name of it and a Job UID. */
+  writer: { namespace: string; cronJobName: string };
+  /** Trusted builds: the receipt's image digest or git sha must be one of these (at least one list non-empty). */
+  revisions: { imageDigests?: readonly string[]; gitShas?: readonly string[] };
+}
+
+export type FreshSweeperPassRefusal = "invalid_request" | "out_of_scope" | "missing" | "malformed" | "mismatch" | "stale" | "future";
 export type FreshSweeperPass =
-  | { ok: true; scope: "org" | "all"; ageMs: number; receipt: RearmPassReceipt }
+  | { ok: true; ageMs: number; receipt: RearmPassReceipt }
   | { ok: false; reason: FreshSweeperPassRefusal };
 
 type ScopeVerdict = { ok: true; receipt: RearmPassReceipt } | { ok: false; reason: "missing" | "malformed" };
@@ -280,26 +298,59 @@ async function readScope(store: ObjectStore, keyRoot: string, scope: string): Pr
   return { ok: true, receipt };
 }
 
+const BUCKET = /^[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]$/;
+function validExpectation(e: unknown): e is RearmPassExpectation {
+  if (!isObj(e)) return false;
+  const x = e as unknown as RearmPassExpectation;
+  const list = (l: unknown, re: RegExp) => l === undefined || (Array.isArray(l) && l.every((v) => typeof v === "string" && re.test(v)));
+  return (x.orgs === null || (Array.isArray(x.orgs) && x.orgs.length > 0 && x.orgs.every(validOrg)))
+    && typeof x.bucket === "string" && BUCKET.test(x.bucket)
+    && (x.ledgerBucket === null || (typeof x.ledgerBucket === "string" && BUCKET.test(x.ledgerBucket) && x.ledgerBucket !== x.bucket))
+    && isObj(x.writer) && typeof x.writer.namespace === "string" && DNS_NAME.test(x.writer.namespace)
+    && typeof x.writer.cronJobName === "string" && DNS_NAME.test(x.writer.cronJobName)
+    && isObj(x.revisions) && list(x.revisions.imageDigests, /^sha256:[0-9a-f]{64}$/) && list(x.revisions.gitShas, /^[0-9a-f]{40}$/)
+    && ((x.revisions.imageDigests?.length ?? 0) + (x.revisions.gitShas?.length ?? 0)) > 0;
+}
+
+/** Does a valid receipt describe a pass of exactly the expected sweeper? */
+function matches(r: RearmPassReceipt, keyRoot: string, e: RearmPassExpectation): boolean {
+  const scopes = rearmScopes(keyRoot, e.orgs);
+  const w = r.workload;
+  const rev = (r.revision.imageDigest !== undefined && (e.revisions.imageDigests ?? []).includes(r.revision.imageDigest))
+    || (r.revision.gitSha !== undefined && (e.revisions.gitShas ?? []).includes(r.revision.gitSha));
+  return r.scopeHash === rearmScopeHash(scopes) && r.scopes === scopes.length
+    && r.bucketHash === rearmBucketHash(e.bucket)
+    && (e.ledgerBucket === null ? r.ledgerBucketHash === undefined : r.ledgerBucketHash === rearmBucketHash(e.ledgerBucket))
+    && w.namespace === e.writer.namespace && w.cronJobName === e.writer.cronJobName
+    && w.jobName !== undefined && w.jobName.startsWith(`${e.writer.cronJobName}-`) && w.jobUid !== undefined
+    && rev;
+}
+
 /**
- * Is there a fresh, clean, full sweeper pass for `org`? Reads (never writes) the org's latest pointer and receipt,
- * and the every-org (`.all`) ones. A malformed pointer or receipt at EITHER scope refuses (`malformed`): corruption is
- * never outvoted. Otherwise the most recent valid pass counts; it must have finished within `maxAgeMs` of `nowMs`
- * (`stale`) and not more than REARM_RECEIPT_FUTURE_SKEW_MS after it (`future`). No receipt anywhere: `missing`.
- * Denied access throws RearmSweepRefused("access_denied"); any other store error propagates (fail closed).
+ * Is there a fresh, clean, full pass of the CURRENT serving sweeper over `org`? Reads (never writes) exactly one scope:
+ * `.all` when `expected.orgs` is null, else the org's own (an org outside `expected.orgs` is `out_of_scope`; a past
+ * every-org receipt never counts for a narrowed sweeper). The latest receipt there must be well formed (`malformed`),
+ * match `expected` in scope hash and size, transcript and ledger homes, writer namespace / CronJob / Job, and a trusted
+ * revision (`mismatch`), and have finished within `maxAgeMs` of `nowMs` (`stale`) and not more than
+ * REARM_RECEIPT_FUTURE_SKEW_MS after it (`future`). Denied access throws RearmSweepRefused("access_denied"); any other
+ * store error propagates (fail closed).
+ *
+ * The receipt's fields are written by whoever can PutObject under `.ledger/rearm-sweeper/`: they are self-reported.
+ * They attest the sweeper's pass only where the store admits no other writer there (a bucket-policy deny for every
+ * principal but the sweeper role on that prefix, which this code does not create); the caller must establish that too.
  */
-export async function freshSweeperPass(store: ObjectStore, keyRoot: string, org: string, nowMs: number, maxAgeMs: number): Promise<FreshSweeperPass> {
-  if (!KEY_ROOT.test(keyRoot) || !validOrg(org) || !ms(nowMs) || !Number.isSafeInteger(maxAgeMs) || maxAgeMs < 1 || maxAgeMs > REARM_RECEIPT_MAX_AGE_LIMIT_MS) {
+export async function freshSweeperPass(store: ObjectStore, keyRoot: string, org: string, nowMs: number, maxAgeMs: number,
+  expected: RearmPassExpectation): Promise<FreshSweeperPass> {
+  if (!KEY_ROOT.test(keyRoot) || !validOrg(org) || !ms(nowMs) || !Number.isSafeInteger(maxAgeMs) || maxAgeMs < 1 || maxAgeMs > REARM_RECEIPT_MAX_AGE_LIMIT_MS
+    || !validExpectation(expected)) {
     return { ok: false, reason: "invalid_request" };
   }
-  const [own, all] = await Promise.all([readScope(store, keyRoot, org), readScope(store, keyRoot, REARM_ALL_ORGS)]);
-  if ((!own.ok && own.reason === "malformed") || (!all.ok && all.reason === "malformed")) return { ok: false, reason: "malformed" };
-  const candidates = ([[own, "org"], [all, "all"]] as const)
-    .flatMap(([v, scope]) => (v.ok ? [{ receipt: v.receipt, scope }] : []))
-    .sort((a, b) => b.receipt.finishedAtMs - a.receipt.finishedAtMs);
-  const best = candidates[0];
-  if (!best) return { ok: false, reason: "missing" };
-  const ageMs = nowMs - best.receipt.finishedAtMs;
+  if (expected.orgs !== null && !expected.orgs.includes(org)) return { ok: false, reason: "out_of_scope" };
+  const got = await readScope(store, keyRoot, expected.orgs === null ? REARM_ALL_ORGS : org);
+  if (!got.ok) return got;
+  if (!matches(got.receipt, keyRoot, expected)) return { ok: false, reason: "mismatch" };
+  const ageMs = nowMs - got.receipt.finishedAtMs;
   if (ageMs < -REARM_RECEIPT_FUTURE_SKEW_MS) return { ok: false, reason: "future" };
   if (ageMs > maxAgeMs) return { ok: false, reason: "stale" };
-  return { ok: true, scope: best.scope, ageMs: Math.max(0, ageMs), receipt: best.receipt };
+  return { ok: true, ageMs: Math.max(0, ageMs), receipt: got.receipt };
 }

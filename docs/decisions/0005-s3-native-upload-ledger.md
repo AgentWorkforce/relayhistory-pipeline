@@ -75,9 +75,13 @@ All of these sit under the per-user admission directory that already holds `priv
   to the end with no failure and kept its own cursor writes one create-only receipt per org (counts,
   start and finish times, scope hash, hashed buckets, code revision, workload identity) and moves the
   org's `latest.json` to it with `If-Match`, only ever forward. A disabled, dry, resumed, incomplete,
-  failed or contended pass writes nothing. `freshSweeperPass(store, keyRoot, org, nowMs, maxAgeMs)`
-  reads it for a later authority mode: missing, malformed (at the org's or the `.all` scope), stale or
-  future-dated is a refusal. The keys sit beside the sweeper's cursor, so the role's existing
+  failed or contended pass writes nothing. `freshSweeperPass(store, keyRoot, org, nowMs, maxAgeMs,
+  expected)` reads it for a later authority mode, against the CURRENT serving sweeper's configuration
+  that the caller obtains independently (effective org scope, transcript and ledger homes, namespace
+  and CronJob, trusted image digests or git shas): out of scope, missing, malformed, mismatched,
+  stale or future-dated is a refusal, and a past every-org receipt never counts for a narrowed
+  sweeper. Receipt fields are self-reported; they attest a sweeper pass only where a bucket-policy
+  deny keeps every other principal from writing under `.ledger/rearm-sweeper/` (not created here). The keys sit beside the sweeper's cursor, so the role's existing
   `RearmSweeperReads` / `RearmSweeperWritesProgress` grants on `96bulls/.ledger/rearm-sweeper/*` cover
   them; an identity policy narrower than that needs `s3:GetObject` and `s3:PutObject` on
   `96bulls/.ledger/rearm-sweeper/passes/*`. Receipts are never deleted by the sweeper (it may not

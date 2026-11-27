@@ -14,7 +14,7 @@ import { ObjectStoreError } from "../../shared/vendor.ts";
 import { LedgerUnavailableError } from "../ledger.ts";
 import {
   freshSweeperPass, rearmBucketHash, REARM_ALL_ORGS, REARM_RECEIPT_FUTURE_SKEW_MS, rearmPassLatestKey, rearmPassReceiptEligibility, rearmPassReceiptKey,
-  rearmPassesPrefix, rearmPassRevision, rearmPassWorkload, validRearmPassReceipt, writeRearmPassReceipt, type RearmPassReceipt,
+  rearmPassesPrefix, rearmPassRevision, rearmPassWorkload, validRearmPassReceipt, writeRearmPassReceipt, type RearmPassExpectation, type RearmPassReceipt,
 } from "../rearm-sweeper-receipt.ts";
 import { liveMachineId } from "../writer.ts";
 import { ledgerRoutedStore } from "../ledger-store.ts";
@@ -62,10 +62,19 @@ const text = async (store: ObjectStore, key: string) => new TextDecoder().decode
 const putJson = (store: ObjectStore, key: string, body: unknown) =>
   store.put(objectKey(key), new TextEncoder().encode(typeof body === "string" ? body : JSON.stringify(body)), { contentType: "application/json" });
 
+const DIGEST = `sha256:${"b".repeat(64)}`, SHA = "a".repeat(40), JOB_UID = "0f0e0d0c-0b0a-4908-8706-050403020100";
+/** The workload and build a serving CronJob pod carries (downward API + image build). */
+const PROV = { GITHUB_SHA: SHA, INGEST_REARM_IMAGE_DIGEST: DIGEST, INGEST_REARM_CRONJOB_NAME: "rearm-sweeper", INGEST_REARM_JOB_NAME: "rearm-sweeper-29000000",
+  INGEST_REARM_JOB_UID: JOB_UID, INGEST_REARM_POD_NAMESPACE: "ingest" };
 const ENV = { INGEST_REARM_SWEEPER_ENABLED: "true", INGEST_REARM_BUCKET: "transcripts", INGEST_REARM_REGION: "us-east-1", INGEST_REARM_CREDENTIALS: "keys",
-  INGEST_REARM_S3_ACCESS_KEY_ID: "test-access-key-id", INGEST_REARM_S3_SECRET_ACCESS_KEY: "test-only-secret" } as NodeJS.ProcessEnv;
+  INGEST_REARM_S3_ACCESS_KEY_ID: "test-access-key-id", INGEST_REARM_S3_SECRET_ACCESS_KEY: "test-only-secret", ...PROV } as NodeJS.ProcessEnv;
 const ORG_A = "org-a", ORG_B = "org-b";
 const SCOPED = { ...ENV, INGEST_REARM_ORGS: `${ORG_B},${ORG_A}` };
+/** The current serving sweeper, as the authority obtains it independently of the store. */
+const expectFor = (orgs: string[] | null, over: Partial<RearmPassExpectation> = {}): RearmPassExpectation => ({
+  orgs, bucket: "transcripts", ledgerBucket: null, writer: { namespace: "ingest", cronJobName: "rearm-sweeper" }, revisions: { imageDigests: [DIGEST] }, ...over });
+const EXP_AB = expectFor([ORG_A, ORG_B]);
+const EXP_A = expectFor([ORG_A]);
 const clock = (start = T0) => { let t = start; return () => (t += 1000); };
 const overridesFor = (store: ObjectStore, eraser: PagedEraser = storeEraser(store), now = clock()) => ({ store: () => store, eraser: () => eraser, now });
 const passes = (store: ObjectStore) => allKeys(store, rearmPassesPrefix(ROOT));
@@ -78,7 +87,8 @@ const zeroCounts = (): RearmSweepCounts => ({ listed: 0, erased: 0, superseded: 
   emptyUnbound: 0, deferred: 0, gone: 0, failed: 0, wouldErase: 0, wouldSupersede: 0, versions: 0 });
 const receiptFor = (org: string, startedAtMs: number, over: Partial<RearmPassReceipt> = {}): RearmPassReceipt => ({
   v: 1, kind: "rearm-sweeper-pass", org, enabled: true, dryRun: false, complete: true, fromStart: true, failures: 0, startedAtMs, finishedAtMs: startedAtMs + 5000,
-  scopeHash: rearmScopeHash(rearmScopes(ROOT, [org])), scopes: 1, keyRoot: ROOT, bucketHash: rearmBucketHash("transcripts"), revision: {}, workload: {},
+  scopeHash: rearmScopeHash(rearmScopes(ROOT, org === REARM_ALL_ORGS ? null : [org])), scopes: 1, keyRoot: ROOT, bucketHash: rearmBucketHash("transcripts"),
+  revision: { gitSha: SHA, imageDigest: DIGEST }, workload: { namespace: "ingest", cronJobName: "rearm-sweeper", jobName: "rearm-sweeper-29000000", jobUid: JOB_UID },
   counts: zeroCounts(), ...over,
 });
 
@@ -90,7 +100,7 @@ describe("rearm sweeper pass receipts: the writer", () => {
       expect(output).toEqual({ enabled: false });
     }
     expect(await allKeys(store, ROOT)).toEqual([]);
-    expect(await freshSweeperPass(store, ROOT, ORG_A, T0, HOUR)).toEqual({ ok: false, reason: "missing" });
+    expect(await freshSweeperPass(store, ROOT, ORG_A, T0, HOUR, EXP_AB)).toEqual({ ok: false, reason: "missing" });
   });
 
   test("a dry run writes nothing, by env or by flag", async () => {
@@ -108,24 +118,23 @@ describe("rearm sweeper pass receipts: the writer", () => {
   test("a full clean pass writes one receipt per org and moves each latest pointer; the reader accepts it", async () => {
     const store = fresh();
     await rearmed(store, { ...TENANT, orgId: ORG_A }, "b1");
-    const env = { ...SCOPED, GITHUB_SHA: "a".repeat(40), INGEST_REARM_IMAGE_DIGEST: `sha256:${"b".repeat(64)}`, INGEST_REARM_CRONJOB_NAME: "rearm-sweeper",
-      INGEST_REARM_JOB_NAME: "rearm-sweeper-29000000", INGEST_REARM_JOB_UID: "0f0e0d0c-0b0a-4908-8706-050403020100", INGEST_REARM_POD_UID: "not-a-uid" };
+    const env = { ...SCOPED, INGEST_REARM_POD_UID: "not-a-uid" };
     const { output } = await runRearmSweeperPass(env, [], overridesFor(store));
     expect(output).toMatchObject({ enabled: true, complete: true, counts: { erased: 1, failed: 0 }, receipt: "written" });
     expect(exitCodeForPass(output)).toBe(0);
     const keys = await passes(store);
     expect(keys).toHaveLength(4);
     for (const org of [ORG_A, ORG_B]) expect(keys).toContain(rearmPassLatestKey(ROOT, org));
-    const got = await freshSweeperPass(store, ROOT, ORG_A, T0 + 60_000, HOUR);
+    const got = await freshSweeperPass(store, ROOT, ORG_A, T0 + 60_000, HOUR, EXP_AB);
     if (!got.ok) throw new Error(got.reason);
-    expect(got.scope).toBe("org");
     expect(got.receipt).toMatchObject({ org: ORG_A, keyRoot: ROOT, scopes: 2, scopeHash: rearmScopeHash(rearmScopes(ROOT, [ORG_A, ORG_B])),
-      bucketHash: rearmBucketHash("transcripts"), revision: { gitSha: "a".repeat(40), imageDigest: `sha256:${"b".repeat(64)}` },
-      workload: { cronJobName: "rearm-sweeper", jobName: "rearm-sweeper-29000000", jobUid: "0f0e0d0c-0b0a-4908-8706-050403020100" }, counts: { erased: 1 } });
+      bucketHash: rearmBucketHash("transcripts"), revision: { gitSha: SHA, imageDigest: DIGEST },
+      workload: { namespace: "ingest", cronJobName: "rearm-sweeper", jobName: "rearm-sweeper-29000000", jobUid: JOB_UID }, counts: { erased: 1 } });
     expect(got.receipt.workload).not.toHaveProperty("podUid"); // malformed provenance is dropped, never fatal
     expect(got.receipt.finishedAtMs).toBeGreaterThanOrEqual(got.receipt.startedAtMs);
-    expect((await freshSweeperPass(store, ROOT, ORG_B, T0 + 60_000, HOUR)).ok).toBe(true);
-    expect(await freshSweeperPass(store, ROOT, "org-c", T0 + 60_000, HOUR)).toEqual({ ok: false, reason: "missing" });
+    expect((await freshSweeperPass(store, ROOT, ORG_B, T0 + 60_000, HOUR, EXP_AB)).ok).toBe(true);
+    expect(await freshSweeperPass(store, ROOT, "org-c", T0 + 60_000, HOUR, EXP_AB)).toEqual({ ok: false, reason: "out_of_scope" });
+    expect(await freshSweeperPass(store, ROOT, "org-c", T0 + 60_000, HOUR, expectFor(["org-c"]))).toEqual({ ok: false, reason: "missing" });
     // Counts and codes only: the line and the receipt carry no id, key or bucket name.
     const line = JSON.stringify(output);
     for (const id of [ORG_A, ORG_B, TENANT.workspaceId, TENANT.userId, "sess-1", ORIGIN, ROOT, "transcripts"]) expect(line).not.toContain(id);
@@ -133,12 +142,67 @@ describe("rearm sweeper pass receipts: the writer", () => {
     for (const id of [TENANT.workspaceId, TENANT.userId, "sess-1", ORIGIN, "transcripts"]) expect(body).not.toContain(id);
   }, SLOW);
 
-  test("an every-org sweeper writes the `.all` receipt, which covers any org", async () => {
+  test("an every-org sweeper writes the `.all` receipt; it counts only while the serving sweeper is every-org", async () => {
     const store = fresh();
     const { output } = await runRearmSweeperPass(ENV, [], overridesFor(store));
     expect(output).toMatchObject({ receipt: "written" });
     expect(await passes(store)).toContain(rearmPassLatestKey(ROOT, REARM_ALL_ORGS));
-    expect(await freshSweeperPass(store, ROOT, "any-org", T0 + 60_000, HOUR)).toMatchObject({ ok: true, scope: "all" });
+    expect(await freshSweeperPass(store, ROOT, "any-org", T0 + 60_000, HOUR, expectFor(null))).toMatchObject({ ok: true });
+    expect(await freshSweeperPass(store, ROOT, "any-org", T0 + 60_000, HOUR, expectFor(["any-org"]))).toEqual({ ok: false, reason: "missing" });
+  });
+
+  test("review repro 1: an every-org pass, then narrowed to B: A is out of scope and the old .all receipt never counts", async () => {
+    const store = fresh();
+    const now = clock();
+    expect((await runRearmSweeperPass(ENV, [], overridesFor(store, storeEraser(store), now))).output).toMatchObject({ receipt: "written" });
+    expect((await runRearmSweeperPass({ ...ENV, INGEST_REARM_ORGS: ORG_B }, [], overridesFor(store, storeEraser(store), now))).output).toMatchObject({ receipt: "written" });
+    const at = now();
+    const expB = expectFor([ORG_B]);
+    expect(await freshSweeperPass(store, ROOT, ORG_A, at, HOUR, expB)).toEqual({ ok: false, reason: "out_of_scope" });
+    expect(await freshSweeperPass(store, ROOT, ORG_B, at, HOUR, expB)).toMatchObject({ ok: true });
+    // A B receipt from the earlier, wider A+B scope does not satisfy the B-only sweeper either.
+    const s2 = fresh();
+    expect((await runRearmSweeperPass(SCOPED, [], overridesFor(s2))).output).toMatchObject({ receipt: "written" });
+    expect(await freshSweeperPass(s2, ROOT, ORG_B, T0 + 60_000, HOUR, expB)).toEqual({ ok: false, reason: "mismatch" });
+  });
+
+  test("review repro 2: a .all receipt with another scope's hash or size is refused by the writer and the reader", async () => {
+    const store = fresh();
+    const forged = receiptFor(REARM_ALL_ORGS, T0, { scopeHash: rearmScopeHash(rearmScopes(ROOT, [ORG_B])) });
+    await expect(writeRearmPassReceipt(store, forged)).rejects.toMatchObject({ code: "receipt_invalid" });
+    await expect(writeRearmPassReceipt(store, receiptFor(REARM_ALL_ORGS, T0, { scopes: 2 }))).rejects.toMatchObject({ code: "receipt_invalid" });
+    // Planted directly with a consistent pointer: malformed.
+    const bytes = new TextEncoder().encode(JSON.stringify(forged));
+    await store.put(objectKey(rearmPassReceiptKey(ROOT, REARM_ALL_ORGS, T0)), bytes, { contentType: "application/json" });
+    await putJson(store, rearmPassLatestKey(ROOT, REARM_ALL_ORGS), { v: 1, kind: "rearm-sweeper-latest", org: REARM_ALL_ORGS, startedAtMs: T0, finishedAtMs: T0 + 5000,
+      receiptSha256: createHash("sha256").update(bytes).digest("hex") });
+    expect(await freshSweeperPass(store, ROOT, ORG_A, T0 + 10_000, HOUR, expectFor(null))).toEqual({ ok: false, reason: "malformed" });
+  });
+
+  test("every binding is checked against the expectation: homes, writer, Job, revision", async () => {
+    const store = fresh();
+    await writeRearmPassReceipt(store, receiptFor(ORG_A, T0));
+    const at = T0 + 10_000;
+    expect(await freshSweeperPass(store, ROOT, ORG_A, at, HOUR, EXP_A)).toMatchObject({ ok: true });
+    const mismatches: Partial<RearmPassExpectation>[] = [
+      { bucket: "unrelated-home" }, { ledgerBucket: "ledger-home" }, { writer: { namespace: "other", cronJobName: "rearm-sweeper" } },
+      { writer: { namespace: "ingest", cronJobName: "impostor" } }, { revisions: { imageDigests: [`sha256:${"c".repeat(64)}`] } },
+      { revisions: { gitShas: ["d".repeat(40)] } },
+    ];
+    for (const over of mismatches) expect({ over, got: await freshSweeperPass(store, ROOT, ORG_A, at, HOUR, expectFor([ORG_A], over)) }).toEqual({ over, got: { ok: false, reason: "mismatch" } });
+    expect(await freshSweeperPass(store, ROOT, ORG_A, at, HOUR, expectFor([ORG_A], { revisions: { gitShas: [SHA] } }))).toMatchObject({ ok: true });
+    // A receipt missing the Job identity, or naming another CronJob's Job, is a mismatch.
+    for (const [i, workload] of [{ namespace: "ingest", cronJobName: "rearm-sweeper", jobName: "rearm-sweeper-1" },
+      { namespace: "ingest", cronJobName: "rearm-sweeper", jobName: "other-1", jobUid: JOB_UID }, {}].entries()) {
+      const s2 = fresh();
+      await writeRearmPassReceipt(s2, receiptFor(ORG_A, T0, { workload }));
+      expect({ i, got: await freshSweeperPass(s2, ROOT, ORG_A, at, HOUR, EXP_A) }).toEqual({ i, got: { ok: false, reason: "mismatch" } });
+    }
+    // A separate ledger home must be expected exactly.
+    const s3 = fresh();
+    await writeRearmPassReceipt(s3, receiptFor(ORG_A, T0, { ledgerBucketHash: rearmBucketHash("ledger-home") }));
+    expect(await freshSweeperPass(s3, ROOT, ORG_A, at, HOUR, EXP_A)).toEqual({ ok: false, reason: "mismatch" });
+    expect(await freshSweeperPass(s3, ROOT, ORG_A, at, HOUR, expectFor([ORG_A], { ledgerBucket: "ledger-home" }))).toMatchObject({ ok: true });
   });
 
   test("a pass with a failed marker writes nothing (for any org) and exits 3", async () => {
@@ -168,7 +232,7 @@ describe("rearm sweeper pass receipts: the writer", () => {
     expect(await passes(store)).toEqual([]);
     const third = await runRearmSweeperPass(env, [], overridesFor(store, storeEraser(store), now));
     expect(third.output).toMatchObject({ complete: true, receipt: "written", counts: { alreadyDone: 2 } });
-    expect((await freshSweeperPass(store, ROOT, ORG_A, now(), HOUR)).ok).toBe(true);
+    expect((await freshSweeperPass(store, ROOT, ORG_A, now(), HOUR, EXP_AB)).ok).toBe(true);
   }, SLOW);
 
   test("eligibility: every gate, codes only", () => {
@@ -209,36 +273,36 @@ describe("rearm sweeper pass receipts: freshSweeperPass", () => {
     const store = fresh();
     await writeRearmPassReceipt(store, receiptFor(ORG_A, T0));
     const fin = T0 + 5000;
-    expect(await freshSweeperPass(store, ROOT, ORG_A, fin + HOUR, HOUR)).toMatchObject({ ok: true, ageMs: HOUR });
-    expect(await freshSweeperPass(store, ROOT, ORG_A, fin + HOUR + 1, HOUR)).toEqual({ ok: false, reason: "stale" });
-    expect(await freshSweeperPass(store, ROOT, ORG_A, fin - 1000, HOUR)).toMatchObject({ ok: true, ageMs: 0 });
-    expect(await freshSweeperPass(store, ROOT, ORG_A, fin - REARM_RECEIPT_FUTURE_SKEW_MS - 1, HOUR)).toEqual({ ok: false, reason: "future" });
+    expect(await freshSweeperPass(store, ROOT, ORG_A, fin + HOUR, HOUR, EXP_A)).toMatchObject({ ok: true, ageMs: HOUR });
+    expect(await freshSweeperPass(store, ROOT, ORG_A, fin + HOUR + 1, HOUR, EXP_A)).toEqual({ ok: false, reason: "stale" });
+    expect(await freshSweeperPass(store, ROOT, ORG_A, fin - 1000, HOUR, EXP_A)).toMatchObject({ ok: true, ageMs: 0 });
+    expect(await freshSweeperPass(store, ROOT, ORG_A, fin - REARM_RECEIPT_FUTURE_SKEW_MS - 1, HOUR, EXP_A)).toEqual({ ok: false, reason: "future" });
     // A newer pass makes it fresh again.
     await writeRearmPassReceipt(store, receiptFor(ORG_A, T0 + 2 * HOUR));
-    expect(await freshSweeperPass(store, ROOT, ORG_A, fin + 2 * HOUR + 1, HOUR)).toMatchObject({ ok: true });
+    expect(await freshSweeperPass(store, ROOT, ORG_A, fin + 2 * HOUR + 1, HOUR, EXP_A)).toMatchObject({ ok: true });
   });
 
-  test("the fresher of the org's and the every-org receipt counts", async () => {
+  test("only the expected scope is read: a fresh .all receipt never rescues a scoped sweeper's stale org", async () => {
     const store = fresh();
     await writeRearmPassReceipt(store, receiptFor(ORG_A, T0));
-    await writeRearmPassReceipt(store, receiptFor(REARM_ALL_ORGS, T0 + 2 * HOUR, { scopeHash: rearmScopeHash(rearmScopes(ROOT, null)) }));
-    expect(await freshSweeperPass(store, ROOT, ORG_A, T0 + 2 * HOUR + 10_000, HOUR)).toMatchObject({ ok: true, scope: "all" });
+    await writeRearmPassReceipt(store, receiptFor(REARM_ALL_ORGS, T0 + 2 * HOUR));
+    expect(await freshSweeperPass(store, ROOT, ORG_A, T0 + 2 * HOUR + 10_000, HOUR, EXP_A)).toEqual({ ok: false, reason: "stale" });
+    expect(await freshSweeperPass(store, ROOT, ORG_A, T0 + 2 * HOUR + 10_000, HOUR, expectFor(null))).toMatchObject({ ok: true });
   });
 
-  test("a malformed receipt or pointer is refused, at either scope", async () => {
+  test("a malformed receipt or pointer is refused", async () => {
     const cases: [string, (s: ObjectStore) => Promise<unknown>][] = [
       ["pointer not json", (s) => putJson(s, rearmPassLatestKey(ROOT, ORG_A), "{nope")],
       ["pointer wrong org", async (s) => putJson(s, rearmPassLatestKey(ROOT, ORG_A), { ...JSON.parse(await text(s, rearmPassLatestKey(ROOT, ORG_A))), org: ORG_B })],
       ["pointer extra field", async (s) => putJson(s, rearmPassLatestKey(ROOT, ORG_A), { ...JSON.parse(await text(s, rearmPassLatestKey(ROOT, ORG_A))), live: true })],
       ["receipt edited (hash mismatch)", (s) => putJson(s, rearmPassReceiptKey(ROOT, ORG_A, T0), receiptFor(ORG_A, T0, { finishedAtMs: T0 + 9_000_000 }))],
       ["receipt missing behind pointer", async (s) => s.delete?.(objectKey(rearmPassReceiptKey(ROOT, ORG_A, T0)))],
-      ["the every-org pointer is garbage", (s) => putJson(s, rearmPassLatestKey(ROOT, REARM_ALL_ORGS), "[]")],
     ];
     for (const [name, corrupt] of cases) {
       const store = fresh();
       await writeRearmPassReceipt(store, receiptFor(ORG_A, T0));
       await corrupt(store);
-      expect({ name, got: await freshSweeperPass(store, ROOT, ORG_A, T0 + 10_000, HOUR) }).toEqual({ name, got: { ok: false, reason: "malformed" } });
+      expect({ name, got: await freshSweeperPass(store, ROOT, ORG_A, T0 + 10_000, HOUR, EXP_A) }).toEqual({ name, got: { ok: false, reason: "malformed" } });
     }
   });
 
@@ -257,15 +321,20 @@ describe("rearm sweeper pass receipts: freshSweeperPass", () => {
     await store.put(objectKey(rearmPassReceiptKey(ROOT, ORG_A, T0)), planted, { contentType: "application/json" });
     await putJson(store, rearmPassLatestKey(ROOT, ORG_A), { v: 1, kind: "rearm-sweeper-latest", org: ORG_A, startedAtMs: T0, finishedAtMs: T0 + 5000,
       receiptSha256: createHash("sha256").update(planted).digest("hex") });
-    expect(await freshSweeperPass(store, ROOT, ORG_A, T0 + 10_000, HOUR)).toEqual({ ok: false, reason: "malformed" });
+    expect(await freshSweeperPass(store, ROOT, ORG_A, T0 + 10_000, HOUR, EXP_A)).toEqual({ ok: false, reason: "malformed" });
   });
 
   test("bad requests are refused without reading", async () => {
     const store = fresh();
     for (const [root, org, now, max] of [["Bad", ORG_A, T0, HOUR], [ROOT, ".all", T0, HOUR], [ROOT, "../x", T0, HOUR], [ROOT, ORG_A, 0, HOUR],
       [ROOT, ORG_A, T0, 0], [ROOT, ORG_A, T0, 8 * 24 * HOUR], [ROOT, ORG_A, T0, 1.5]] as const) {
-      expect(await freshSweeperPass(store, root, org, now, max)).toEqual({ ok: false, reason: "invalid_request" });
+      expect(await freshSweeperPass(store, root, org, now, max, EXP_A)).toEqual({ ok: false, reason: "invalid_request" });
     }
+    for (const bad of [{ orgs: [] }, { orgs: [".all"] }, { bucket: "X" }, { ledgerBucket: "transcripts" }, { revisions: {} }, { revisions: { gitShas: [] } },
+      { revisions: { imageDigests: ["latest"] } }, { writer: { namespace: "", cronJobName: "rearm-sweeper" } }] as Partial<RearmPassExpectation>[]) {
+      expect({ bad, got: await freshSweeperPass(store, ROOT, ORG_A, T0, HOUR, expectFor([ORG_A], bad)) }).toEqual({ bad, got: { ok: false, reason: "invalid_request" } });
+    }
+    expect(await freshSweeperPass(store, ROOT, ORG_A, T0, HOUR, undefined as never)).toEqual({ ok: false, reason: "invalid_request" });
   });
 
   test("provenance readers drop malformed values", () => {
