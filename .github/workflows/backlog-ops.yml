@@ -77,6 +77,10 @@ on:
         description: marker-execute only (required) - the wave id its marker-dry recorded (h_ and 32 hex; a hash, never an org); empty otherwise
         type: string
         default: ""
+      per_org:
+        description: 'Backfill, catch-up, refresh, export and drain modes, scoped runs only - "true" runs the tool once per scope org (bounded; export and drain executes one at a time) and records one verdict per org; empty (default) = one run over the scope, as before'
+        type: string
+        default: ""
       max_objects:
         description: Drain modes only - per-run object budget (empty = unbounded)
         type: string
@@ -111,6 +115,8 @@ on:
       - src/session-ingest/marker-publication.ts
       - src/session-ingest/org-wave.ts
       - src/session-ingest/reshard-wave.ts
+      - src/session-ingest/backlog-wave.ts
+      - src/session-ingest/__tests__/backlog-wave*
       - src/session-ingest/__tests__/marker-publication*
       - src/session-ingest/__tests__/org-wave*
       - scripts/backlog-ops*.ts
@@ -147,6 +153,8 @@ on:
       - src/session-ingest/marker-publication.ts
       - src/session-ingest/org-wave.ts
       - src/session-ingest/reshard-wave.ts
+      - src/session-ingest/backlog-wave.ts
+      - src/session-ingest/__tests__/backlog-wave*
       - src/session-ingest/__tests__/marker-publication*
       - src/session-ingest/__tests__/org-wave*
       - scripts/backlog-ops*.ts
@@ -188,6 +196,7 @@ env:
   BACKLOG_OPS_RESHARD_RUN: ${{ inputs.reshard_run }}
   BACKLOG_OPS_AUTHORITY_RUN: ${{ inputs.authority_run }}
   BACKLOG_OPS_WAVE_ID: ${{ inputs.wave_id }}
+  BACKLOG_OPS_PER_ORG: ${{ inputs.per_org }}
   BACKLOG_OPS_MAX_OBJECTS: ${{ inputs.max_objects }}
   BACKLOG_OPS_SLOTS_READ: ${{ inputs.slots_read }}
   BACKLOG_OPS_SLOT_PACE_MS: ${{ inputs.slot_pace_ms }}
@@ -217,7 +226,7 @@ jobs:
           bun test --timeout 300000 ./src/session-ingest/__tests__/hold-bridge.test.ts ./src/session-ingest/__tests__/erasure-window.test.ts
       - name: Marker publication under the 062320 hold and org waves (in-process fakes and PGlite, no credentials)
         run: |
-          bun test --timeout 120000 ./src/session-ingest/__tests__/org-wave.test.ts ./src/session-ingest/__tests__/marker-publication.test.ts
+          bun test --timeout 120000 ./src/session-ingest/__tests__/org-wave.test.ts ./src/session-ingest/__tests__/marker-publication.test.ts ./src/session-ingest/__tests__/backlog-wave.test.ts
           bun test --timeout 300000 ./src/session-ingest/__tests__/marker-publication.pglite.test.ts
       - name: Relocated-ledger stores and fork guard of the backfill and the drain (in-process fake buckets, no credentials)
         run: bun test --timeout 120000 ./src/session-ingest/__tests__/ledger-tool-store.test.ts

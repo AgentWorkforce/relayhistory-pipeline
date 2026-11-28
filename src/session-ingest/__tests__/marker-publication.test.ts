@@ -604,7 +604,7 @@ test("workflow: the marker inputs, downloads and secrets; no expression in a run
   for (const b of blockRuns) expect(b).not.toContain("${{");
   expect(yml).not.toMatch(/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/u);
   expect(yml.match(/BACKLOG_OPS_ORGS: \$\{\{ (.*) \}\}/u)![1]).toBe("secrets.BACKLOG_OPS_ORGS");
-  expect(yml).not.toMatch(/inputs\.[a-z_]*org/u);
+  expect(yml).not.toMatch(/inputs\.(?!per_org\b)[a-z_]*org/u); // per_org is a flag, never an org
   // Every input with its dispatch check: wave_id is refused on every mode but marker-execute.
   for (const mode of ["backfill-dry", "drain-execute", "authority-execute", "marker-dry"] as BacklogOpsMode[])
     expect(code(() => backlogOpsDispatch({ BACKLOG_OPS_MODE: mode, BACKLOG_OPS_SHA: SHA, BACKLOG_OPS_WAVE_ID: WAVE }, true, true, true, true))).not.toBeNull();
@@ -782,4 +782,18 @@ test("publication identity: an epoch whose durable attempt recorded another publ
   const e = await w.execute(w.wave(d));
   expect(e.per_org[0]).toMatchObject({ refused: "hold_attempt_evidence_mismatch", attempted: true, marker: "absent" });
   expect(await marker(w.store, A)).toBeNull();
+});
+
+test("per-org binding refusals (a wave FULL or catch-up): those orgs are refused before any read; the evidence runs over the rest", async () => {
+  const [A, B, C] = ORGS as [string, string, string];
+  const w = await world();
+  let evidenceOrgs: readonly string[] = [];
+  const s = await w.dry({ bound: bound({ refusedOrgs: [H(B)] }), evidence: (async (orgs: readonly string[]) => { evidenceOrgs = orgs; return evidenceReport(orgs); }) as never });
+  expect(by(s)[H(B)]).toMatchObject({ verdict: "refused", refused: "binding_refused", hold: "not_read", attempted: false });
+  expect([by(s)[H(A)]!.verdict, by(s)[H(C)]!.verdict]).toEqual(["ready", "ready"]);
+  expect([...evidenceOrgs].sort()).toEqual([A, C].sort());
+  expect(w.holds.log.some((l) => l.endsWith(B))).toBe(false);
+  expect(markerReceiptSummary(s, { mode: "dry_run", orgs: ORGS, waveId: null }).ok).toBe(true);
+  expect(await acode(() => w.dry({ bound: bound({ refusedOrgs: ORGS.map(H) }) }))).toBe("marker_bound_invalid");
+  expect(await acode(() => w.dry({ bound: bound({ refusedOrgs: [H("dddddddd-0000-4000-8000-000000000000")] }) }))).toBe("marker_bound_invalid");
 });

@@ -637,9 +637,18 @@ never comes back). The bound live evidence (authority-evidence.ts) stays corrobo
 | `revisionLayout: 4096` | the bound reshard-dry verified that org (missing, invalid and failed 0) |
 | `workerHttpAdmission: off` | the bound evidence (stop, queue drained, SQL quiet, turns on Neon) AND the hold enforcing it |
 
+**Publication identity.** Every PUT stamps the object's metadata `marker-publication` with
+`sha256(org, epoch, attempt evidence)`. The attempt evidence is the sha256 of the final catch-up receipt's bytes. Its
+durable side is the epoch's one `marker_attempted` event. `_marker_attempt` returns early on a repeat without checking
+evidence, so after the attempt the tool re-reads that event and refuses (`hold_attempt_evidence_mismatch`) unless it
+carries this run's bound evidence.
+
 **Retry and adoption.** A rerun binds the same `marker-dry` and wave. `_marker_attempt` is idempotent at the same
-epoch. An existing marker is adopted only when all of these hold:
+epoch. An existing marker, on the first GET or on the If-None-Match conflict path, is adopted only when all of these
+hold:
 - it is valid for this org;
+- its stored identity equals the one recomputed from the live epoch and that epoch's durable attempt evidence, which
+  equals this run's;
 - the hold is `marker_attempted` at the approved epoch;
 - its `writtenAtMs` lies between the epoch's first attempt minus 2 min (runner versus database clock) and now plus 2 min;
 - no other epoch of the org ever recorded a marker attempt.
@@ -661,8 +670,27 @@ The marker-execute's DRY must have recorded exactly the same four runs (`backlog
 A wave is one scoped sequence over up to 64 orgs (`BACKLOG_OPS_ORGS`): FULL, catch-up, reshard verify, marker, drain.
 It is unchanged for one org. The per-org tools give each org its own verdict, at most `--concurrency` orgs at once
 (`src/session-ingest/org-wave.ts`). The marker defaults to 8 and the reshard verify to 4; at most 16. One org's
-refusal or error never stops or changes another's. FULL, the catch-up and the drain already take the whole scope in
-one run, as before; their receipts stay wave-level.
+refusal or error never stops or changes another's.
+
+**Per-org runs (`per_org`).** With the dispatch input `per_org` set to `true` (scoped runs only), the credential step
+runs the unchanged tool once per scope org as a single-org scoped run. This applies to the backfill modes (FULL,
+refresh, catch-up), export and drain.
+- Each child's summary goes through its mode's own checks: countsOnly, and the exact backfill or catch-up schema.
+- The receipt summary is `{kind: "wave", org_count, ok_count, per_org: [{org_hash, exit_code, summary}]}`. Its hashes
+  must be exactly the scope's, each once, and `ok_count` is derived. The run exits 0 when at least one org succeeded.
+- A run that binds a wave receipt checks it per org, on that org's view: the slice as a single-org receipt, or a
+  non-wave receipt of exactly the wave's scope re-scoped to the org with its per-org lists sliced. The unchanged
+  per-receipt checks run on each view: home, ledger, since, fingerprint, baseline. The run's 3 h / 24 h freshness and
+  order checks still apply.
+- An org whose bindings fail is refused alone (its slice records the code) and no child runs for it.
+- A catch-up child with `AUTHORITY` gets only its org's evidence and records its org's baseline. A marker merges the
+  passing orgs' baselines and refuses the others `binding_refused`. A reshard-dry needs one org of a wave catch-up to bind.
+- Evidence hashes (the marker attempt's, the bridge's) stay sha256 over the bound file's exact bytes, never a view.
+- The export and drain executes hold a one-at-a-time lease, so their children run sequentially. Other modes run 2
+  at a time, so size the job's 355-minute timeout for the sum.
+- Path B is refused in a per-org run.
+- Without `per_org`, every receipt is byte-identical to before. A consumer that does not check per org (bridge,
+  authority-execute) refuses a wave receipt.
 
 **The approval is pinned to the wave.** `marker-dry` records `wave_id`, a hash over the commit, the scope id, the four
 bound runs and each READY org's hold epoch hash. `marker-execute` names it in its confirmation, so the environment

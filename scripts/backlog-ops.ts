@@ -68,6 +68,7 @@ import {
   backlogOpsTarget,
   backlogOpsToolArgs,
   checkBoundReceipt,
+  countsOnly,
   checkRefreshFingerprint,
   checkStsExpiration,
   isBridge,
@@ -82,6 +83,9 @@ import {
 import { checkAuthorityDryReceipt, checkBaselineReceipt, checkReshardReceipt } from "../src/session-ingest/backlog-authority.ts";
 import { authorityReceiptSummary, type AuthorityReceiptKind } from "../src/session-ingest/backlog-authority-schema.ts";
 import { checkMarkerDryReceipt, markerBoundFrom, markerReceiptSummary, receiptSha256, type MarkerBound } from "../src/session-ingest/marker-publication.ts";
+import { isWaveReceipt, mergeBaselines, orgScopeId, waveConcurrencyFor, waveReceiptSummary, waveSummary, waveView } from "../src/session-ingest/backlog-wave.ts";
+import { runWave } from "../src/session-ingest/org-wave.ts";
+import { evidenceHash } from "../src/session-ingest/authority-evidence.ts";
 
 const ROOT = fileURLToPath(new URL("..", import.meta.url));
 /** The only parent variables a child inherits (plus the AWS session the parent adds). */
@@ -328,44 +332,176 @@ export async function backlogOpsRun(
   const t = backlogOpsTarget(env), spec = backlogOpsToolArgs(d, t, scope, isCatchup(d.mode) || isBridge(d.mode) ? since : null, toolOf(d.mode) === "export" ? nhp : null);
   // The ledger target's shape, before any credential (backlog_ops_target_ledger_bucket / _region), and its receipt id.
   const ledger = backlogOpsLedgerId(d, backlogOpsLedgerTarget(env, t));
-  const bound = checkBoundReceipts(env, d, undefined, since);
+  const paths = backlogOpsPaths(env);
+  // A per-org wave run (backlog-wave.ts): every org's bindings on their own views; a marker or a reshard-dry that binds a
+  // wave receipt checks it per org too. Everything else: the bindings as before.
+  const waveRun = d.perOrg === true;
+  if (waveRun && scope.orgs === null) refuse("backlog_ops_scope_required");
+  if (waveRun && nhp !== null) refuse("backlog_ops_wave_no_head_parity");
+  const readText = (p: string) => readFileSync(p, "utf8");
+  const boundIsWave = (kind: string) => { try { return isWaveReceipt(readText(paths.bound(kind))); } catch { return false; } };
+  let bound: BoundAuthority = {};
+  let perOrgBound: Map<string, BoundAuthority | string> | null = null;
+  if (waveRun) {
+    perOrgBound = new Map(scope.orgs!.map((o): [string, BoundAuthority | string] => {
+      try { return [o, checkOrgBindings(env, d, o, since)]; } catch (e) { return [o, refusalCode(e)]; }
+    }));
+  } else if (isMarker(d.mode) && (boundIsWave("backfill") || boundIsWave("full"))) {
+    bound = markerWaveBound(env, d, since);
+  } else if (d.mode === "reshard-dry" && d.backfillRun !== null && boundIsWave("backfill")) {
+    // The catch-up it verifies after is a wave: it must be this wave's, and at least one org's slice must bind (each
+    // org's own completion is checked again by whatever binds this reshard-dry).
+    let ok = 0;
+    for (const o of scope.orgs ?? []) { try { checkOrgBindings(env, d, o, since); ok++; } catch { /* that org only */ } }
+    if (ok === 0) refuse("backlog_ops_wave_no_org");
+  } else {
+    bound = checkBoundReceipts(env, d, undefined, since);
+  }
   const nhpId = nhp?.id ?? BACKLOG_OPS_NO_HEAD_PARITY_NONE;
   // Every ledger-id tool's receipt attests the store-home pair (a FULL backfill-execute included).
   const home = BACKLOG_OPS_LEDGER_ID_TOOLS.includes(toolOf(d.mode)) ? backlogOpsHomeId(t, backlogOpsLedgerTarget(env, t)) : null;
-  // Exact schemas: every authority receipt, and every backfill receipt (a FULL backfill-execute is an authority
-  // binding; every backfill mode shares its producer, so all are closed alike).
-  const schemaKind: AuthorityReceiptKind | null = toolOf(d.mode) === "reshard" ? "reshard" : d.mode === "authority-dry" ? "authority_dry"
-    : d.mode === "authority-execute" ? "authority_execute" : isCatchup(d.mode) && d.authorityRun !== null ? "catchup" : toolOf(d.mode) === "backfill" ? "backfill"
-    : toolOf(d.mode) === "bridge" ? "bridge" : null;
-  const paths = backlogOpsPaths(env);
   if (existsSync(paths.receipt)) refuse("backlog_ops_receipt_exists");
   // Credentials from here on: the database URL (backfill, export, presence) and the role session.
   const dbUrl = spec.needsDb ? toolDbUrl(env.SUPABASE_MIGRATION_OWNER_URL) : null;
   const aws = await assumeRole(env, backlogOpsRole(d, t), t.region, backlogOpsSessionName(d.mode, env.GITHUB_RUN_ID!), deps.fetcher);
-  const child = backlogOpsChildSpawn(env, d, aws, dbUrl, session, bound);
-  const { code, stdout } = await (deps.runChild ?? runChild)(child);
+  const run = deps.runChild ?? runChild;
+  let receipt;
+  let exit: number;
+  if (waveRun) {
+    const orgs = scope.orgs!;
+    const settled = await runWave(orgs, waveConcurrencyFor(d.mode), async (org) => {
+      const b = perOrgBound!.get(org)!;
+      // A binding refused for this org: its slice records the code, and no child runs for it.
+      if (typeof b === "string") return { org, exitCode: 1, summary: { refused: b } };
+      const envOrg = { ...env, BACKLOG_OPS_ORGS: org };
+      const r = await run(backlogOpsChildSpawn(envOrg, d, aws, dbUrl, null, b));
+      const one = finalReceipt(d, env.GITHUB_RUN_ID!, r.code, r.stdout, orgScopeId(org), [org], ledger, nhpId, home, since);
+      return { org, exitCode: one.exitCode === 0 && r.code === 0 ? 0 : one.exitCode || r.code || 1, summary: one.summary };
+    }, { fallback: "backlog_ops_wave_org_failed" });
+    const slices = settled.map((x) => x.ok ? x.value : { org: x.org, exitCode: 1, summary: { refused: x.code } });
+    const checked = waveReceiptSummary(waveSummary(orgs, slices), orgs, (sl) => waveSliceCheck(d, sl));
+    receipt = { ...backlogOpsReceipt(d, env.GITHUB_RUN_ID!, 0, "{}", scope.id, ledger, nhpId, home), summary: checked.summary, exitCode: checked.ok ? 0 : 1 };
+    exit = receipt.exitCode;
+  } else {
+    const { code, stdout } = await run(backlogOpsChildSpawn(env, d, aws, dbUrl, session, bound));
+    receipt = finalReceipt(d, env.GITHUB_RUN_ID!, code, stdout, scope.id, scope.orgs, ledger, nhpId, home, since);
+    exit = receipt.exitCode === 0 && code === 0 ? 0 : 1;
+  }
+  writePrivate(paths.receipt, receipt);
+  console.log("backlog_ops_receipt " + JSON.stringify(receipt));
+  return exit;
+}
+
+const refusalCode = (e: unknown) => { const c = (e as { code?: unknown })?.code; return typeof c === "string" && /^backlog_ops_[a-z0-9_]{1,52}$/u.test(c) ? c : "backlog_ops_wave_binding"; };
+
+/** Exact schemas: every authority receipt, and every backfill receipt (all backfill modes share its producer). */
+function schemaKindOf(d: BacklogOpsDispatch): AuthorityReceiptKind | null {
+  return toolOf(d.mode) === "reshard" ? "reshard" : d.mode === "authority-dry" ? "authority_dry"
+    : d.mode === "authority-execute" ? "authority_execute" : isCatchup(d.mode) && d.authorityRun !== null ? "catchup" : toolOf(d.mode) === "backfill" ? "backfill"
+    : toolOf(d.mode) === "bridge" ? "bridge" : null;
+}
+
+/**
+ * The tool's stdout as this run's receipt: counts only, then the mode's exact schema (marker, authority, backfill)
+ * before it is persisted or logged; a refusal keeps only a code from the mode's closed map.
+ */
+export function finalReceipt(d: BacklogOpsDispatch, run: string, code: number, stdout: string, scopeId: string, orgs: string[] | null, ledger: string,
+  nhpId: string, home: string | null, since: number | null) {
+  const schemaKind = schemaKindOf(d);
   let receipt;
   try {
-    receipt = backlogOpsReceipt(d, env.GITHUB_RUN_ID!, code, stdout, scope.id, ledger, nhpId, home);
-    // An authority or backfill receipt conforms exactly to its mode's schema (keys, lists, hash positions, closed codes),
-    // and a refusal keeps only a code from the mode's closed map, before the receipt is persisted or logged.
+    receipt = backlogOpsReceipt(d, run, code, stdout, scopeId, ledger, nhpId, home);
     if (isMarker(d.mode)) {
       // Exact marker schema, self-consistent for this scope (and, for marker-execute, the approved wave id).
-      const r = markerReceiptSummary(receipt.summary, { mode: isExecute(d.mode) ? "execute" : "dry_run", orgs: scope.orgs, waveId: d.waveId ?? null });
+      const r = markerReceiptSummary(receipt.summary, { mode: isExecute(d.mode) ? "execute" : "dry_run", orgs, waveId: d.waveId ?? null });
       receipt = { ...receipt, summary: r.summary, exitCode: r.ok ? receipt.exitCode : receipt.exitCode || 1 };
     } else if (schemaKind !== null) {
       // The bridge's proofs must match the run's scope and the exact gate-derived cutoff the child was given.
-      const r = authorityReceiptSummary(schemaKind, receipt.summary, { orgs: scope.orgs, cutoffMs: isBridge(d.mode) ? since : null });
+      const r = authorityReceiptSummary(schemaKind, receipt.summary, { orgs, cutoffMs: isBridge(d.mode) ? since : null });
       receipt = { ...receipt, summary: r.summary, exitCode: r.ok ? receipt.exitCode : receipt.exitCode || 1 };
     }
   } catch (e) {
     const c = (e as { code?: string }).code;
-    receipt = backlogOpsReceipt(d, env.GITHUB_RUN_ID!, code || 1, JSON.stringify({ refused: typeof c === "string" && c.startsWith("backlog_ops_") ? c : "receipt" }),
-      scope.id, ledger, nhpId, home);
+    receipt = backlogOpsReceipt(d, run, code || 1, JSON.stringify({ refused: typeof c === "string" && c.startsWith("backlog_ops_") ? c : "receipt" }),
+      scopeId, ledger, nhpId, home);
   }
-  writePrivate(paths.receipt, receipt);
-  console.log("backlog_ops_receipt " + JSON.stringify(receipt));
-  return receipt.exitCode === 0 && code === 0 ? 0 : 1;
+  return receipt;
+}
+
+/**
+ * A wave slice's summary, re-checked by the wave receipt's validator: counts only under the mode's own rules (lists
+ * only where that mode's receipt allows them), then the exact schema where the mode has one; it must come back
+ * unchanged. A refusal slice keeps only a backlog_ops_* code or one the schema's closed map keeps.
+ */
+export function waveSliceCheck(d: BacklogOpsDispatch, s: unknown): unknown {
+  const c = countsOnly(s, 0, backlogOpsAuthorityReceipt(d));
+  const kind = schemaKindOf(d);
+  if (c && typeof c === "object" && Object.keys(c).length === 1 && "refused" in (c as object)) {
+    const code = (c as { refused: unknown }).refused;
+    if (typeof code === "string" && code.startsWith("backlog_ops_")) return c;
+    if (kind !== null && JSON.stringify(authorityReceiptSummary(kind, c).summary) === JSON.stringify(c)) return c;
+    if (kind === null) return c;
+    return refuse("backlog_ops_receipt_wave");
+  }
+  if (kind !== null) {
+    const r = authorityReceiptSummary(kind, c);
+    if (!r.ok || JSON.stringify(r.summary) !== JSON.stringify(c)) refuse("backlog_ops_receipt_wave");
+  }
+  return c;
+}
+
+/**
+ * One org's bindings, checked by the unchanged checkBoundReceipts on that org's VIEWS of the bound receipts
+ * (backlog-wave.ts waveView: the org's slice of a wave receipt, or a non-wave receipt of exactly the wave's scope
+ * re-scoped to the org), as a single-org run of the same dispatch. Any failure refuses that org only.
+ */
+export function checkOrgBindings(env: Record<string, string | undefined>, d: BacklogOpsDispatch, org: string, since: number | null,
+  read: (p: string) => string = (p) => readFileSync(p, "utf8")): BoundAuthority {
+  const waveScope = backlogOpsScope(env).id;
+  const envOrg = { ...env, BACKLOG_OPS_ORGS: org };
+  const views = new Map<string, string>();
+  const view = (p: string) => { let v = views.get(p); if (v === undefined) { v = waveView(read(p), org, waveScope); views.set(p, v); } return v; };
+  return checkBoundReceipts(envOrg, d, view, since, (p) => Buffer.from(view(p), "utf8"));
+}
+
+/**
+ * A marker mode whose FULL or catch-up is a per-org wave receipt: the four shared bindings (authority-dry, catch-up,
+ * FULL, reshard-dry) per org, as marker-dry binds them; the orgs that pass give one merged baseline and bound record,
+ * the others are refused `binding_refused` by the tool. The marker attempt's evidence stays sha256 over the bound
+ * catch-up file's EXACT bytes (never a view). marker-execute's DRY is checked once over the whole scope.
+ */
+export function markerWaveBound(env: Record<string, string | undefined>, d: BacklogOpsDispatch, since: number | null,
+  read: (p: string) => string = (p) => readFileSync(p, "utf8"), readBytes: (p: string) => Uint8Array = (p) => readFileSync(p)): BoundAuthority {
+  const scope = backlogOpsScope(env), orgs = scope.orgs;
+  if (orgs === null) refuse("backlog_ops_scope_required");
+  const paths = backlogOpsPaths(env);
+  const asDry: BacklogOpsDispatch = { ...d, mode: "marker-dry", dryRun: null, waveId: null };
+  const ok: { org: string; b: BoundAuthority }[] = [], refused: string[] = [];
+  for (const org of orgs!) {
+    try { ok.push({ org, b: checkOrgBindings(env, asDry, org, since, read) }); } catch { refused.push(evidenceHash("org", org)); }
+  }
+  if (ok.length === 0) refuse("backlog_ops_wave_no_org");
+  const rawCatchup = read(paths.bound("backfill")), bytes = readBytes(paths.bound("backfill"));
+  if (Buffer.compare(Buffer.from(bytes), Buffer.from(rawCatchup, "utf8")) !== 0) refuse("backlog_ops_bound_backfill_receipt");
+  const marker: MarkerBound = {
+    sections: { fences: ok.every((x) => x.b.marker!.sections.fences), ownership: ok.every((x) => x.b.marker!.sections.ownership),
+      revisions: ok.every((x) => x.b.marker!.sections.revisions) },
+    reshardVerified: [...new Set(ok.flatMap((x) => x.b.marker!.reshardVerified))],
+    catchupEvidence: receiptSha256(bytes),
+    ...(refused.length > 0 ? { refusedOrgs: refused } : {}),
+  };
+  const out: BoundAuthority = { baseline: mergeBaselines(ok.map((x) => x.b.baseline)), marker };
+  if (d.mode === "marker-execute") {
+    let raw: string;
+    try { raw = read(paths.bound("dry")); } catch { return refuse("backlog_ops_bound_dry_missing"); }
+    checkBoundReceipt(raw, { mode: "marker-dry", sha: d.sha, run: d.dryRun!, scope: scope.id, kind: "dry", exact: true });
+    let home: unknown;
+    try { home = JSON.parse(raw).home; } catch { home = undefined; }
+    if (home !== backlogOpsHomeId({ bucket: env.BACKLOG_OPS_BUCKET ?? "", region: env.BACKLOG_OPS_REGION ?? "" },
+      backlogOpsLedgerTarget(env, { bucket: env.BACKLOG_OPS_BUCKET ?? "" }))) refuse("backlog_ops_bound_dry_home");
+    out.wave = checkMarkerDryReceipt(raw, orgs!, { authority: d.authorityRun!, backfill: d.backfillRun!, full: d.fullBackfillRun!, reshard: d.reshardRun! }, d.waveId!);
+  }
+  return out;
 }
 
 if (import.meta.main)

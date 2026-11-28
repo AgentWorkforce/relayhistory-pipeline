@@ -191,6 +191,11 @@ export interface MarkerBound {
   reshardVerified: readonly string[];
   /** sha256 of the final catch-up receipt's exact bytes: `_marker_attempt`'s evidence. */
   catchupEvidence: string;
+  /**
+   * Orgs whose own bindings failed when the bound FULL / catch-up are per-org wave receipts (backlog-wave.ts): each is
+   * refused `binding_refused` before any read, and the bound evidence runs over the others only.
+   */
+  refusedOrgs?: readonly string[];
 }
 export function validMarkerBound(v: unknown): v is MarkerBound {
   const o = v as MarkerBound;
@@ -198,7 +203,9 @@ export function validMarkerBound(v: unknown): v is MarkerBound {
     ["fences", "ownership", "revisions"].every((k) => typeof (o.sections as Record<string, unknown>)[k] === "boolean") &&
     Object.keys(o.sections).length === 3 && Array.isArray(o.reshardVerified) && o.reshardVerified.length <= 64 &&
     o.reshardVerified.every((h) => typeof h === "string" && HASH.test(h)) && typeof o.catchupEvidence === "string" && HEX64.test(o.catchupEvidence) &&
-    Object.keys(o).length === 3;
+    (o.refusedOrgs === undefined || (Array.isArray(o.refusedOrgs) && o.refusedOrgs.length <= 64 && o.refusedOrgs.every((h) => typeof h === "string" && HASH.test(h)) &&
+      new Set(o.refusedOrgs).size === o.refusedOrgs.length)) &&
+    Object.keys(o).length === (o.refusedOrgs === undefined ? 3 : 4);
 }
 
 // ---- the marker object ----------------------------------------------------------------------------------------------
@@ -313,6 +320,7 @@ export const MARKER_ORG_REFUSALS = [
   "sweeper_spec_missing", "sweeper_spec_stale", "sweeper_spec_future", "sweeper_spec_invalid", "sweeper_spec_unreadable", "sweeper_spec_access_denied",
   "sweeper_suspended", "sweeper_home_mismatch", "sweeper_out_of_scope", "sweeper_invalid_request", "sweeper_missing", "sweeper_malformed",
   "sweeper_mismatch", "sweeper_stale", "sweeper_future", "sweeper_access_denied", "sweeper_unreadable", "not_in_wave", "marker_org_failed",
+  "binding_refused",
 ] as const;
 const ORG_REFUSALS = new Set<string>(MARKER_ORG_REFUSALS);
 export const MARKER_SWEEPER_CODES = ["ok", "not_run", ...MARKER_ORG_REFUSALS.filter((c) => c.startsWith("sweeper_"))] as const;
@@ -372,9 +380,13 @@ export async function markerRun(d: MarkerRunDeps) {
   if (d.wave && waveId({ sha: d.sha, scope: d.scopeId, runs: d.runs, orgs: d.wave.orgs }) !== d.wave.id) refuse("marker_wave_mismatch");
   const approved = new Map((d.wave?.orgs ?? []).map((o) => [o.orgHash, o.epochHash]));
   const reshard = new Set(d.bound.reshardVerified);
+  const bindingRefused = new Set(d.bound.refusedOrgs ?? []);
+  if (![...bindingRefused].every((h) => [...hashOf.values()].includes(h))) refuse("marker_bound_invalid");
+  const evidenceOrgs = orgs.filter((o) => !bindingRefused.has(hashOf.get(o)!));
+  if (evidenceOrgs.length === 0) refuse("marker_bound_invalid");
 
-  // The bound evidence (corroboration) over the whole scope, as the baseline was taken.
-  const report: AuthorityEvidenceReport = await (d.evidence ?? authorityEvidence)(orgs, d.sources,
+  // The bound evidence (corroboration) over the scope's orgs whose bindings passed, as their baselines were taken.
+  const report: AuthorityEvidenceReport = await (d.evidence ?? authorityEvidence)(evidenceOrgs, d.sources,
     { bound: d.baseline, ...(d.observationWindowMs ? { observationWindowMs: d.observationWindowMs } : {}) });
   const verdictOf = new Map(report.orgs.map((o) => [o.orgHash, o]));
 
@@ -390,6 +402,7 @@ export async function markerRun(d: MarkerRunDeps) {
       attempted: false, verdict: "refused", refused: null };
     const stop = (code: string, verdict: MarkerOrgVerdict = r.attempted ? "incomplete" : "refused") => { r.refused = code; r.verdict = verdict; return r; };
     if (execute && !approved.has(orgHash)) return stop("not_in_wave", "not_in_wave");
+    if (bindingRefused.has(orgHash)) return stop("binding_refused");
 
     // Attestations that do not need the hold.
     const v = verdictOf.get(orgHash);

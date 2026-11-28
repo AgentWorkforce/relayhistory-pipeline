@@ -167,6 +167,12 @@ export const isBridge = (mode: BacklogOpsMode) => mode.startsWith("bridge-");
 export const BACKLOG_OPS_MARKER_EXECUTE_ENABLED: boolean = false;
 /** The marker modes (marker-publication.ts): marker-dry reads readiness and pins the wave; marker-execute (held) publishes. */
 export const isMarker = (mode: BacklogOpsMode) => mode.startsWith("marker-");
+/**
+ * The modes a per-org wave run may take (backlog-wave.ts; input per_org, BACKLOG_OPS_PER_ORG=true, a scoped run): the
+ * credential step runs the unchanged tool once per scope org and writes a wave receipt with one verdict per org.
+ */
+export const BACKLOG_OPS_PER_ORG_MODES: readonly BacklogOpsMode[] = ["backfill-dry", "backfill-execute", "backfill-refresh-dry", "backfill-refresh-execute",
+  "backfill-catchup-dry", "backfill-catchup-execute", "export-dry", "export-execute", "drain-dry", "drain-execute"];
 /** A wave id (org-wave.ts waveId): the marker-execute confirmation's `WAVE` token. */
 const WAVE_ID = /^h_[0-9a-f]{32}$/u;
 /** The receipt artifact of every run (retention 30 days) and its single file. */
@@ -270,6 +276,8 @@ export interface BacklogOpsDispatch {
    * (`WAVE <id>`), so the environment approval covers exactly that wave.
    */
   waveId?: string | null;
+  /** BACKLOG_OPS_PER_ORG_MODES only (input per_org = "true"): one child run and one verdict per scope org. */
+  perOrg?: boolean;
   confirmation: string;
 }
 
@@ -297,7 +305,8 @@ export function backlogOpsDispatch(
     exportRun = env.BACKLOG_OPS_EXPORT_RUN ?? "", maxObjects = env.BACKLOG_OPS_MAX_OBJECTS ?? "",
     fullBackfillRun = env.BACKLOG_OPS_FULL_BACKFILL_RUN ?? "", confirmation = env.BACKLOG_OPS_CONFIRMATION ?? "",
     slotsReadRaw = env.BACKLOG_OPS_SLOTS_READ ?? "", slotPaceRaw = env.BACKLOG_OPS_SLOT_PACE_MS ?? "",
-    reshardRun = env.BACKLOG_OPS_RESHARD_RUN ?? "", authorityRun = env.BACKLOG_OPS_AUTHORITY_RUN ?? "", waveId = env.BACKLOG_OPS_WAVE_ID ?? "";
+    reshardRun = env.BACKLOG_OPS_RESHARD_RUN ?? "", authorityRun = env.BACKLOG_OPS_AUTHORITY_RUN ?? "", waveId = env.BACKLOG_OPS_WAVE_ID ?? "",
+    perOrgRaw = env.BACKLOG_OPS_PER_ORG ?? "";
   if (!(BACKLOG_OPS_MODES as readonly string[]).includes(mode) || !SHA40.test(sha)) refuse("backlog_ops_inputs");
   const m = mode as BacklogOpsMode, tool = toolOf(m), execute = isExecute(m);
   if (execute && enabled !== true) refuse("backlog_ops_dormant");
@@ -321,6 +330,8 @@ export function backlogOpsDispatch(
   if (isMarker(m) ? !RUN_ID.test(authorityRun) : authorityRun !== "" && (!isCatchup(m) || !RUN_ID.test(authorityRun))) refuse("backlog_ops_authority_run");
   // WAVE: marker-execute only, required.
   if (m === "marker-execute" ? !WAVE_ID.test(waveId) : waveId !== "") refuse("backlog_ops_wave_id");
+  // PER_ORG: "true" on a per-org-capable mode, else empty.
+  if (!(perOrgRaw === "" || (perOrgRaw === "true" && BACKLOG_OPS_PER_ORG_MODES.includes(m)))) refuse("backlog_ops_per_org");
   let budget: number | null = null;
   if (maxObjects !== "") {
     if (tool !== "drain" || !/^[1-9][0-9]{0,6}$/u.test(maxObjects) || Number(maxObjects) > BACKLOG_OPS_MAX_OBJECTS_CEILING)
@@ -338,7 +349,7 @@ export function backlogOpsDispatch(
   const d: BacklogOpsDispatch = { mode: m, sha, dryRun: execute ? dryRun : null, backfillRun: wantsBackfill || (mayBackfill && backfillRun !== "") ? backfillRun : null,
     exportRun: wantsExport ? exportRun : null, fullBackfillRun: fullBackfillRun === "" ? null : fullBackfillRun,
     reshardRun: reshardRun === "" ? null : reshardRun, authorityRun: authorityRun === "" ? null : authorityRun, maxObjects: budget, slotsRead, slotPaceMs,
-    ...(m === "marker-execute" ? { waveId } : {}), confirmation };
+    ...(m === "marker-execute" ? { waveId } : {}), ...(perOrgRaw === "true" ? { perOrg: true } : {}), confirmation };
   if (execute ? confirmation !== backlogOpsConfirmation(d) : confirmation !== "") refuse("backlog_ops_confirmation");
   return d;
 }
