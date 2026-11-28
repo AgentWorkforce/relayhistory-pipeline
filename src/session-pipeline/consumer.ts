@@ -241,7 +241,7 @@ const scopeId = (s: SessionScope) => JSON.stringify([s.orgId, s.workspaceId, s.h
  *   been held LARGE_READ_HOLD_MAX_MS while running with a live lease: ack;
  * - "held": the message was requeued as a new SQS message (`requeue`, before this one is acked) to look again later.
  * Errors propagate (enqueue, requeue): the caller fails the scope's messages, so no delivery is acked without a successor.
- * A failed read of the job row holds (requeue), never acks.
+ * A failed read of the job row is unknown progress: held within LARGE_READ_UNCLAIMED_MS, then inline (never released).
  */
 async function routeDeadlineScope(
   isolation: DeadlineIsolationDeps,
@@ -276,13 +276,15 @@ async function routeDeadlineScope(
     return "done";
   }
   const age = Math.max(0, (isolation.now ?? Date.now)() - anchorMs);
-  let decision: HoldDecision;
+  // A failed read of the job row is unknown progress: held only within LARGE_READ_UNCLAIMED_MS, then inline (decideHold).
+  let row: Awaited<ReturnType<NonNullable<DeadlineIsolationDeps["progress"]>>> | undefined;
   try {
-    decision = decideHold(await isolation.progress(identity ?? scope), source, age);
+    row = await isolation.progress(identity ?? scope);
   } catch (error) {
     log.warn("large scope job state unavailable", { stage: "large-read", ...ids, ...errorFields(error) });
-    decision = { kind: "hold", why: "queued" };
+    row = undefined;
   }
+  const decision: HoldDecision = decideHold(row, source, age);
   if (decision.kind === "inline") {
     log.warn("large-read job unclaimed", { stage: "large-read", ...ids, reason: `large_job_${decision.why}`, age_ms: age, route: "inline" });
     return "inline";
@@ -294,7 +296,7 @@ async function routeDeadlineScope(
   }
   if (!requeue) throw new Error("large-read hold and no requeue");
   await requeue();
-  routedLine(decision.why === "running" ? "held_running" : "held_queued");
+  routedLine(decision.why === "running" ? "held_running" : decision.why === "unknown" ? "held_unknown" : "held_queued");
   return "held";
 }
 

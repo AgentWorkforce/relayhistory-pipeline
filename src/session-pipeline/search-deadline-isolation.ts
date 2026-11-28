@@ -57,27 +57,31 @@ export interface LargeReadSource { epoch: string; fingerprint: string }
 export interface LargeReadProgress { state: string; leaseLive: boolean; source: LargeReadSource }
 export type HoldDecision =
   | { kind: "done" }
-  | { kind: "hold"; why: "queued" | "running" }
-  | { kind: "inline"; why: "unclaimed" | "failed" | "missing" }
+  | { kind: "hold"; why: "queued" | "running" | "unknown" }
+  | { kind: "inline"; why: "unclaimed" | "failed" | "missing" | "unknown" }
   | { kind: "release" };
 
 /**
- * What a routed delivery does once its job's row is read, for the incarnation `target` the enqueue captured:
+ * What a routed delivery does once its job's row is read, for the incarnation `target` the enqueue captured. Only a
+ * row for `target` (same source epoch and fingerprint) counts as this upload's job; fail closed otherwise:
  * - complete for `target`: done (the large read indexed this source; ack);
- * - running with a live lease (the worker heartbeats it): hold, until LARGE_READ_HOLD_MAX_MS from `anchorMs`, then
- *   release (ack, the live worker finishes alone);
+ * - running for `target` with a live lease (the worker heartbeats it): hold, until LARGE_READ_HOLD_MAX_MS from
+ *   `anchorMs`, then release (ack; the live worker finishes alone);
  * - failed: inline at once (never claimed again until the source changes);
  * - no row: inline;
- * - anything else (queued, superseded, complete for another incarnation, running with an expired lease): hold until
- *   LARGE_READ_UNCLAIMED_MS from `anchorMs`, then inline.
+ * - `p` undefined (the row could not be read): hold until LARGE_READ_UNCLAIMED_MS, then inline (unknown progress never
+ *   holds past the unclaimed bound);
+ * - anything else (queued, superseded, any state for another incarnation including a live lease, an expired lease, or
+ *   no captured `target`): hold until LARGE_READ_UNCLAIMED_MS from `anchorMs`, then inline.
  * Only this job's row decides; no other job's progress enters.
  */
-export function decideHold(p: LargeReadProgress | null, target: LargeReadSource | undefined, ageMs: number): HoldDecision {
+export function decideHold(p: LargeReadProgress | null | undefined, target: LargeReadSource | undefined, ageMs: number): HoldDecision {
+  if (p === undefined) return ageMs > LARGE_READ_UNCLAIMED_MS ? { kind: "inline", why: "unknown" } : { kind: "hold", why: "unknown" };
   if (!p) return { kind: "inline", why: "missing" };
   const current = target !== undefined && p.source.epoch === target.epoch && p.source.fingerprint === target.fingerprint;
-  if (p.state === "complete" && current) return { kind: "done" };
   if (p.state === "failed") return { kind: "inline", why: "failed" };
-  if (p.state === "running" && p.leaseLive) return ageMs > LARGE_READ_HOLD_MAX_MS ? { kind: "release" } : { kind: "hold", why: "running" };
+  if (current && p.state === "complete") return { kind: "done" };
+  if (current && p.state === "running" && p.leaseLive) return ageMs > LARGE_READ_HOLD_MAX_MS ? { kind: "release" } : { kind: "hold", why: "running" };
   return ageMs > LARGE_READ_UNCLAIMED_MS ? { kind: "inline", why: "unclaimed" } : { kind: "hold", why: "queued" };
 }
 

@@ -445,6 +445,73 @@ describe("hold until this scope's own job completes (progress armed)", () => {
     expect(passes).toBe(1);
   }, 60_000);
 
+  test("progress read keeps failing: held (unknown) within 5 min, inline past 5 min and still inline past 30 min, never released", async () => {
+    const f = await fixture();
+    const s = stateTable();
+    const clock = { t: Date.now() };
+    f.deps.deadlineIsolation = { ch: s.ch, enqueue: (scope) => enqueueLargeRead(f.x.db, scope), progress: async () => { throw new Error("read ECONNRESET"); }, now: () => clock.t };
+    const first = await capture(f);
+    expect(first.failures).toEqual([]);
+    expect(routed(first.lines)).toEqual([expect.objectContaining({ outcome: "first_hit", state: "held_unknown" })]);
+    clock.t += 4 * MIN;
+    const within = await capture(f);
+    expect(routed(within.lines)).toEqual([expect.objectContaining({ outcome: "marked", state: "held_unknown" })]);
+    expect(f.requeued).toHaveLength(2);
+    expect(passes).toBe(1);
+    clock.t += 2 * MIN;
+    const past5 = await capture(f);
+    expect(past5.large.filter((l) => l.message === "large-read job unclaimed")[0]).toMatchObject({ reason: "large_job_unknown", route: "inline" });
+    expect(passes).toBe(2);
+    clock.t += 30 * MIN;
+    const requeuedBefore = f.requeued.length;
+    const past30 = await capture(f);
+    expect(past30.large.some((l) => l.message === "large-read hold released")).toBe(false);
+    expect(past30.large.filter((l) => l.message === "large-read job unclaimed")[0]).toMatchObject({ reason: "large_job_unknown" });
+    expect(passes).toBe(3);
+    expect(f.requeued).toHaveLength(requeuedBefore); // no further hold message past the bound
+  }, 60_000);
+
+  test("live running row for ANOTHER incarnation: held within 5 min, inline past 5 min and past 30 min; matching running control holds and releases", async () => {
+    const f = await fixture();
+    const s = stateTable();
+    const clock = { t: Date.now() };
+    const otherRunning = () => f.x.db.query("UPDATE sessions.session_large_read_jobs SET state='running',source_fingerprint=$1,lease_nonce=gen_random_uuid(),lease_expires_at=now()+interval '1 hour',updated_at=now()", ["d".repeat(64)]);
+    f.deps.deadlineIsolation = {
+      ch: s.ch, now: () => clock.t, progress: (scope) => largeReadProgress(f.x.db, scope),
+      // The enqueue captures the live source; the row is then left running for a different incarnation.
+      enqueue: async (scope) => { const r = await enqueueLargeRead(f.x.db, scope); await otherRunning(); return r; },
+    };
+    const first = await capture(f);
+    expect(routed(first.lines)).toEqual([expect.objectContaining({ outcome: "first_hit", state: "held_queued" })]);
+    clock.t += 6 * MIN;
+    const past5 = await capture(f);
+    expect(past5.large.filter((l) => l.message === "large-read job unclaimed")[0]).toMatchObject({ reason: "large_job_unclaimed", route: "inline" });
+    expect(passes).toBe(2);
+    clock.t += 30 * MIN;
+    const past30 = await capture(f);
+    expect(past30.large.some((l) => l.message === "large-read hold released")).toBe(false);
+    expect(past30.large.filter((l) => l.message === "large-read job unclaimed")[0]).toMatchObject({ reason: "large_job_unclaimed" });
+    expect(passes).toBe(3);
+
+    // Control: a running row for the captured incarnation is this upload's job.
+    const g = await fixture();
+    const gs = stateTable();
+    const gclock = { t: Date.now() };
+    g.deps.deadlineIsolation = {
+      ch: gs.ch, now: () => gclock.t, progress: (scope) => largeReadProgress(g.x.db, scope),
+      enqueue: async (scope) => { const r = await enqueueLargeRead(g.x.db, scope); await g.x.db.query("UPDATE sessions.session_large_read_jobs SET state='running',lease_nonce=gen_random_uuid(),lease_expires_at=now()+interval '1 hour',updated_at=now()"); return r; },
+    };
+    const before = passes;
+    await g.deliver();
+    gclock.t += 6 * MIN;
+    const held = await capture(g);
+    expect(routed(held.lines)).toEqual([expect.objectContaining({ state: "held_running" })]);
+    gclock.t += 30 * MIN;
+    const released = await capture(g);
+    expect(released.large).toEqual([expect.objectContaining({ message: "large-read hold released" })]);
+    expect(passes - before).toBe(1); // only the control's first hit ran inline
+  }, 90_000);
+
   test("decideHold: only this job's row and the captured incarnation decide", () => {
     const src = { epoch: "7", fingerprint: "c".repeat(64) };
     const row = (state: string, leaseLive = false, source = src) => ({ state, leaseLive, source });
@@ -458,6 +525,14 @@ describe("hold until this scope's own job completes (progress armed)", () => {
     expect(decideHold(row("running", false), src, LARGE_READ_UNCLAIMED_MS + 1)).toEqual({ kind: "inline", why: "unclaimed" });
     expect(decideHold(row("queued"), src, LARGE_READ_UNCLAIMED_MS)).toEqual({ kind: "hold", why: "queued" });
     expect(decideHold(row("superseded"), src, LARGE_READ_UNCLAIMED_MS + 1)).toEqual({ kind: "inline", why: "unclaimed" });
+    const other = { ...src, fingerprint: "e".repeat(64) };
+    expect(decideHold(row("running", true, other), src, LARGE_READ_UNCLAIMED_MS)).toEqual({ kind: "hold", why: "queued" });
+    expect(decideHold(row("running", true, other), src, LARGE_READ_UNCLAIMED_MS + 1)).toEqual({ kind: "inline", why: "unclaimed" });
+    expect(decideHold(row("running", true, other), src, LARGE_READ_HOLD_MAX_MS + 1)).toEqual({ kind: "inline", why: "unclaimed" });
+    expect(decideHold(row("running", true), undefined, LARGE_READ_UNCLAIMED_MS + 1)).toEqual({ kind: "inline", why: "unclaimed" });
+    expect(decideHold(undefined, src, LARGE_READ_UNCLAIMED_MS)).toEqual({ kind: "hold", why: "unknown" });
+    expect(decideHold(undefined, src, LARGE_READ_UNCLAIMED_MS + 1)).toEqual({ kind: "inline", why: "unknown" });
+    expect(decideHold(undefined, src, LARGE_READ_HOLD_MAX_MS + 1)).toEqual({ kind: "inline", why: "unknown" });
   });
 });
 
