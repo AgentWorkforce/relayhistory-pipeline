@@ -658,3 +658,23 @@ Each one needs a serve-time gate, or must be shown unreachable for an enrolled o
 - the hosted (non-self-host) operator-erase wiring;
 - brief-document outbox retirement;
 - whether semantic-copy reads v1 bytes.
+
+### Narrow wave 1: raw-key readers and copying producers (sessions-buffered-drain-materialization, static at 6d60dc4f; enrolled-org reachability not traced)
+
+| Reader | SQL access | Last point to withhold bytes | Streams? | Revocation of what it derives |
+|---|---|---|---|---|
+| Bob Costas (`session-input.ts:227`) | HoopDb (handler.ts:56) | before `summarizer.summarize` (handler.ts:241, an **external model call**) | buffered | rows through the purge catalog, objects through prefix erasure; **a prompt already sent cannot be revoked** |
+| session-brief input (`input.ts:231`) | HoopDb | before `summarizeSessionInput` (worker.ts:229, external) and publish | buffered | the purge catalog (briefs, briefDocuments); **the model prompt and the analytics event cannot be revoked** |
+| relayhistory-transform `readRelayhistoryExport` (:514) | none | before its return, or per chunk | buffered | normalize output only through prefix erasure; it has no production constructor |
+| **publication-image baseCopies** (:147-173) | PublicationRpc (prepare and register before the copy) | before the copy loop (:163) | no | **none found per session**: the self-host eraser refuses generation locations, and publication-gc removes only whole retired generations. It needs the effect identity carried to the new key, or a refusal before :163 |
+| alleyoop manifests (:670) | HoopDb | HEAD-only sealing check; the status and base routes return manifest JSON, never chunk bytes | whole bodies | session prefix and queue rows; parked copies have a 30-day TTL |
+| parked `deleteParkedSession` (:66) | none | cleanup only, never served | n/a | it deletes only parked-manifest chunks that are not in the live manifest (a set difference) |
+| pointer `findMovedSibling` (:258) | HoopDb plus an advisory lock | HEAD probes of manifests only | n/a | it writes the pointer selection every consumer trusts; the purge catalog covers it, and a manifest delete tombstones it |
+| migration: legacy-export --verify | Neon read-only plus the privacy role; fenced scopes are skipped before the read | stdout report only | buffered | n/a |
+| migration: neon-s3-sync and neon-s3-erasure | sync reads manifests only and rebuilds chunks from Neon; erasure only lists and deletes | n/a | n/a | n/a |
+
+None of these sends chunk bytes progressively to a client. **For external sends (model providers, analytics) the
+verdict must precede the send**, because nothing can revoke them afterwards. With no revocation found:
+- publication-generation copies;
+- normalize output;
+- anything already sent to an external model or to analytics.
