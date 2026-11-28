@@ -1,8 +1,8 @@
 /**
  * The empty-erasure-window proof (src/session-ingest/erasure-window.ts) and its backlog-ops mode (bridge-dry): every
- * erasure-lane source classified from the schema, the one-statement read against the real schema in PGlite (with a stub
- * of slot 062320's status function, which main does not have yet), the closed proof, the release gate on it, and the
- * dispatch, argv and receipt schema of the mode.
+ * erasure-lane source classified from the schema, the one-statement read against the real schema in PGlite (against the
+ * real 062320/062340 lifecycle, and with the status function replaced by a stub for synthetic status shapes), the closed
+ * proof, the release gate on it, and the dispatch, argv and receipt schema of the mode.
  */
 import { afterAll, expect, setDefaultTimeout, test } from "bun:test";
 import { readFileSync, readdirSync } from "node:fs";
@@ -24,7 +24,7 @@ import {
   backlogOpsToolArgs, type BacklogOpsMode,
 } from "../backlog-ops.ts";
 import {
-  ERASURE_PROOF_MAX_AGE_MS, ERASURE_SOURCES, ERASURE_SOURCE_EXCLUSIONS, ERASURE_TABLE_NAME, ERASURE_WINDOW_SQL, epochHash,
+  ERASURE_HISTORY_TABLES, ERASURE_PROOF_MAX_AGE_MS, ERASURE_SOURCES, ERASURE_SOURCE_EXCLUSIONS, ERASURE_TABLE_NAME, ERASURE_WINDOW_SQL, epochHash,
   erasureWindowProof, orgHash, releaseOnEmptyWindow, validErasureWindowProof,
 } from "../erasure-window.ts";
 import { applySupabaseSchema } from "./pglite-schema.ts";
@@ -51,7 +51,7 @@ const row = (over: Record<string, unknown> = {}) => ({ ...zeros(), status: statu
 
 // ---- classification ----
 
-test("every erasure-like per-org table in the schema is a source (or a documented singleton exclusion)", () => {
+test("every erasure-like per-org table in the schema is a source (or a documented singleton exclusion, or 062340's own history)", () => {
   const dir = fileURLToPath(new URL("../../../supabase/migrations/", import.meta.url));
   const tables = new Map<string, string>();
   for (const f of readdirSync(dir).filter((x) => x.endsWith(".sql"))) {
@@ -61,12 +61,15 @@ test("every erasure-like per-org table in the schema is a source (or a documente
   const erasureLike = [...tables.keys()].filter((t) => ERASURE_TABLE_NAME.test(t)).sort();
   expect(erasureLike.length).toBeGreaterThan(10);
   for (const t of erasureLike) {
-    const classified = Object.hasOwn(ERASURE_SOURCES, t) || Object.hasOwn(ERASURE_SOURCE_EXCLUSIONS, t);
+    const classified = Object.hasOwn(ERASURE_SOURCES, t) || Object.hasOwn(ERASURE_SOURCE_EXCLUSIONS, t) || Object.hasOwn(ERASURE_HISTORY_TABLES, t);
     expect([t, classified]).toEqual([t, true]);
     // A source has an org_id; an exclusion has none.
     expect([t, /\borg_id\b/u.test(tables.get(t)!)]).toEqual([t, Object.hasOwn(ERASURE_SOURCES, t)]);
   }
-  for (const t of [...Object.keys(ERASURE_SOURCES), ...Object.keys(ERASURE_SOURCE_EXCLUSIONS)]) expect([t, tables.has(t)]).toEqual([t, true]);
+  for (const t of [...Object.keys(ERASURE_SOURCES), ...Object.keys(ERASURE_SOURCE_EXCLUSIONS), ...Object.keys(ERASURE_HISTORY_TABLES)])
+    expect([t, tables.has(t)]).toEqual([t, true]);
+  // The three classes are disjoint.
+  for (const t of Object.keys(ERASURE_HISTORY_TABLES)) expect([t, Object.hasOwn(ERASURE_SOURCES, t) || Object.hasOwn(ERASURE_SOURCE_EXCLUSIONS, t)]).toEqual([t, false]);
   // The ones the reviewer named.
   for (const t of ["operator_user_erasures", "session_erasure_scopes", "session_erasure_runs", "session_erasure_receipts", "upload_deletions", "upload_erasure_rearm"])
     expect(Object.hasOwn(ERASURE_SOURCES, t)).toBe(true);
@@ -74,17 +77,27 @@ test("every erasure-like per-org table in the schema is a source (or a documente
 
 // ---- the read, against the real schema ----
 
-let pg: PGlite | null = null;
-afterAll(async () => { await pg?.close(); });
+let pg: PGlite | null = null, realPg: PGlite | null = null;
+afterAll(async () => { await pg?.close(); await realPg?.close(); });
+/** The real schema with 062320's status function replaced by a stub over a table, for synthetic status shapes. */
 async function db() {
   if (pg) return pg;
   pg = new PGlite({ extensions: { btree_gin, pg_trgm } });
   await applySupabaseSchema(pg, { until: null });
-  // Slot 062320's read-only status function, stubbed from a table (main does not have the slot yet).
   await pg.exec(`CREATE TABLE sessions._stub_hold (org text PRIMARY KEY, status jsonb NOT NULL);
-    CREATE FUNCTION sessions.ingest_org_admission_hold_status(p_org text) RETURNS jsonb LANGUAGE sql STABLE AS
+    CREATE OR REPLACE FUNCTION sessions.ingest_org_admission_hold_status(p_org text) RETURNS jsonb LANGUAGE sql STABLE AS
       $$ SELECT coalesce((SELECT status FROM sessions._stub_hold WHERE org = p_org), '{"hold":null,"erasures":0}'::jsonb) $$;`);
   return pg;
+}
+/** The real schema, untouched: 062320's lifecycle and 062340's history, status and bind. */
+async function realDb() {
+  if (realPg) return realPg;
+  realPg = new PGlite({ extensions: { btree_gin, pg_trgm } });
+  await applySupabaseSchema(realPg, { until: null });
+  await realPg.exec("CREATE TABLE IF NOT EXISTS sessions.__96bulls_migrations(name text PRIMARY KEY, sha256 text)");
+  for (const n of ["upstream:20261105062320_ingest_org_admission_fences.sql", "upstream:20261105062340_ingest_org_erasure_history.sql"])
+    await realPg.query("INSERT INTO sessions.__96bulls_migrations(name) VALUES($1) ON CONFLICT DO NOTHING", [n]);
+  return realPg;
 }
 const ts = (ms: number) => `to_timestamp(${ms} / 1000.0)`;
 const read = async (org = ORG) => (await (await db()).query<Record<string, unknown>>(ERASURE_WINDOW_SQL, [org, String(CUT)])).rows;
@@ -125,7 +138,7 @@ test("the read: an upload deletion, an in-flight old user erase, a fence in the 
   expect(proof(ORG, null, CUT, await read(ORG)).status).toBe("erasure_window_empty");
 });
 
-test("final 062340 (real PGlite): fence_at = the hold's installed_at; the FULL only against selected_full (run, started_ms, evidence); install < start <= seal", async () => {
+test("final 062340 (synthetic status over the real read): fence_at = the hold's installed_at; the FULL only against selected_full (run, started_ms, evidence); install < start <= seal", async () => {
   const d = await db();
   const cut = Date.parse("2026-11-27T12:00:00.000Z"); // the gate's FULL cutoff; the FULL started at cut + 15 min
   const ORG3 = "33333333-2222-4333-8444-555555555555";
@@ -178,10 +191,47 @@ test("final 062340 (real PGlite): fence_at = the hold's installed_at; the FULL o
   expect(await proofAt()).toEqual(["erasure_window_empty", "ok"]);
 });
 
-test("the source list is pinned to 062340's ORG_ERASURE_HISTORY_SOURCES once that slot is on this branch", async () => {
+test("real 062320/062340 lifecycle: install, seal, bind; the read is unbound until _bind, empty after, non-empty on a write after the fence", async () => {
+  const d = await realDb();
+  const ORG4 = "44444444-2222-4333-8444-555555555555";
+  const one = async (sql: string, p: unknown[] = []) => (await d.query<Record<string, unknown>>(sql, p)).rows[0]!;
+  const e = (await one("SELECT sessions.ingest_org_admission_hold_install($1, gen_random_uuid())::text e", [ORG4])).e as string;
+  await d.query("SELECT pg_sleep(0.003)"); // a FULL start strictly between install and seal
+  await d.query("SELECT sessions.ingest_org_admission_hold_seal($1, $2::uuid, $3)", [ORG4, e, EV]);
+  // The bridge's FULL started 1 ms after the install (integer ms); the gate's cutoff is that start minus the margin.
+  const started = Number((await one("SELECT floor(extract(epoch FROM installed_at) * 1000)::bigint + 1 AS ms FROM sessions.ingest_org_admission_holds WHERE epoch = $1::uuid", [e])).ms);
+  const cut = started - 15 * 60_000;
+  const proofNow = async (fullRun = FULL, fullStarted = started) => {
+    await d.query("SELECT pg_sleep(0.003)"); // the read is after the seal
+    const rows = (await d.query<Record<string, unknown>>(ERASURE_WINDOW_SQL, [ORG4, String(cut)])).rows;
+    const p = erasureWindowProof(ORG4, e, cut, rows, fullRun, EV, fullStarted);
+    expect(validErasureWindowProof(p)).toBe(true);
+    expect(authorityReceiptSummary("bridge", JSON.parse(JSON.stringify({ mode: "dry_run", tool: "bridge_window", org_count: 1, all_empty: p.status === "erasure_window_empty",
+      per_org: [p] })), { orgs: [ORG4], cutoffMs: cut }).ok).toBe(true);
+    return p;
+  };
+  // Sealed but not bound: the history is not claimed.
+  let p = await proofNow();
+  expect([p.status, p.reason, p.watermark_kind, p.hold_state]).toEqual(["erasure_window_unproven", "history_unbound", "erasure_history_all_sources", "sealed"]);
+  await d.query("SELECT sessions.ingest_org_erasure_history_bind($1, $2::uuid, $3, $4::bigint, $5)", [ORG4, e, FULL, String(started), EV]);
+  // Bound to exactly this FULL, covered, recording, nothing since the fence: empty.
+  p = await proofNow();
+  expect([p.status, p.reason, p.watermark_erasures, p.epoch_hash]).toEqual(["erasure_window_empty", "ok", 0, epochHash(e)]);
+  // Another run, or another start, is not the bound FULL.
+  expect((await proofNow("445")).reason).toBe("history_full_mismatch");
+  expect((await proofNow(FULL, started + 1)).reason).toBe("history_full_mismatch");
+  // A write to a source after the fence is in the history (and in the snapshot): not empty.
+  await d.query("INSERT INTO sessions.upload_deletions (org_id, workspace_id, user_id, origin_id, source, session_id) VALUES ($1, 'w', 'u', 'o', 'claude', 's-real')", [ORG4]);
+  p = await proofNow();
+  expect([p.status, p.reason, p.watermark_erasures, p.sources?.upload_deletions]).toEqual(["erasure_window_nonempty", "erasures_in_history", 1, 1]);
+  // Removing the row does not hide it: the history keeps the INSERT and the DELETE.
+  await d.query("DELETE FROM sessions.upload_deletions WHERE org_id = $1", [ORG4]);
+  p = await proofNow();
+  expect([p.status, p.reason, p.watermark_erasures, p.sources?.upload_deletions]).toEqual(["erasure_window_nonempty", "erasures_in_history", 2, 0]);
+});
+
+test("the source list is pinned to 062340's ORG_ERASURE_HISTORY_SOURCES", async () => {
   const path = fileURLToPath(new URL("../../hoopdb/org-erasure-history-sources.ts", import.meta.url));
-  const { existsSync } = await import("node:fs");
-  if (!existsSync(path)) { expect(Object.keys(ERASURE_SOURCES).length).toBe(15); return; }
   const { ORG_ERASURE_HISTORY_SOURCES } = await import(path);
   expect([...ORG_ERASURE_HISTORY_SOURCES].sort()).toEqual(Object.keys(ERASURE_SOURCES).sort());
 });

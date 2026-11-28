@@ -50,6 +50,16 @@ export const ERASURE_SOURCE_EXCLUSIONS: Record<string, string> = {
   legacy_export_privacy_eraser_readiness: "singleton eraser heartbeat, no org",
   babysitter_purge_cursor: "singleton purge keyset cursor, no org",
 };
+/**
+ * Slot 062340's own tables: the record of writes to the sources above, not a source. They have no org_id and the proof
+ * never reads them directly; it reads them only through ingest_org_admission_hold_status (erasure_history,
+ * selected_full).
+ */
+export const ERASURE_HISTORY_TABLES: Record<string, string> = {
+  ingest_org_erasure_history: "062340 history of source writes (erased_org), read via hold_status",
+  ingest_org_erasure_history_coverage: "062340 coverage periods, no org, read via hold_status",
+  ingest_org_erasure_history_bindings: "062340 per-epoch fence and selected FULL (bound_org), read via hold_status",
+};
 export const ERASURE_TABLE_NAME = /eras|delet|rearm|purge|tombstone|forget|reset/u;
 
 /**
