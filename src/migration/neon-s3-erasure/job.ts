@@ -1354,11 +1354,12 @@ export class ErasureJob {
           try {
             await fence.deleteVersion(v.key, v.versionId, { beforeFetch });
           } catch (error) {
-            // Refused before fetch (this gate, or the eraser's own no-time-left refusal): nothing was sent.
+            // Refused or failed BEFORE fetch (this gate, the eraser's no-time-left refusal, hashing, signing, ...):
+            // nothing was sent. The version stays not_attempted: no diagnostic relist, no backoff, the batch stops.
             if (gateRefused) { stop = gateRefused; break; }
-            if ((error as { notSent?: boolean }).notSent === true) { stop = errorCode(error); break; }
-            // A short-lived key refused BEFORE signing: nothing was sent, the version stays not_attempted.
+            // A short-lived key refused before signing: not sent either, and it stops the job for renewal (exit 75).
             if (isCredentialFault(error)) { credential = error; stop = errorCode(error); break; }
+            if ((error as { notSent?: boolean }).notSent === true) { stop = errorCode(error); break; }
             // Anything else may still have applied: never not_attempted. Resolve by an exact relist (through the same
             // request gate and page budget), record, stop. A relist the gate refuses, or that fails, leaves unknown.
             out.outcome = "unknown";

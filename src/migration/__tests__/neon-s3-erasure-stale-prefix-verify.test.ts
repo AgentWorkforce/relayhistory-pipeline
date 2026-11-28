@@ -19,6 +19,7 @@ import {
   attestationProblem, chunkRecords, compareMultisets, evaluateLifecycle, parseReceipt, type AttestedActor, type ProtectionAttestation, type VerificationReceipt,
 } from "../neon-s3-erasure/stale-prefix-verify.ts";
 import { SyncState } from "../neon-s3-sync/state.ts";
+import { ShortLivedCredentialError } from "../short-lived-credentials.ts";
 import { signRequest } from "../../../packages/object-store/src/sigv4.ts";
 import { FakeS3Versions } from "./fake-s3-versions.ts";
 import { approvedFor, attestation, BUCKET_SHA, buildCopy, line, seedBodies, TARGET } from "./stale-prefix-fixture.ts";
@@ -1014,5 +1015,60 @@ describe("in-path gate judged at a fresh time (after the lease queries)", () => 
     expect(f.s.deletes).toHaveLength(1);
     expect(rep).toMatchObject({ outcome: "partial", reason: "stale_prefix_deadline", deleted: 1 });
     expect(rep.versions.map((v) => v.outcome)).toEqual(["deleted", "not_attempted", "not_attempted"]);
+  });
+});
+
+describe("pre-dispatch failures are not sent (real adapter, mock fetch)", () => {
+  test("the signer throws on the first DELETE: zero fetch calls, not_attempted, no relist, no backoff or attempt increment, zero deletes", async () => {
+    const f = await fixture();
+    const m = f.dateMove();
+    const receipt = await f.verify();
+    let listsAtThrow = -1;
+    const fence = f.s.eraser({
+      signer: async (args) => {
+        if (args.method === "DELETE") { listsAtThrow = f.s.lists; throw Object.assign(new Error("signer broke"), { code: "signer_failed" }); }
+        await signRequest(args);
+      },
+    });
+    const before = f.row(m.oldP);
+    const r = await f.execute(receipt, { fence });
+    expect(f.s.deletes).toEqual([]);
+    expect(f.s.lists).toBe(listsAtThrow); // no diagnostic relist, nothing after
+    expect(r).toMatchObject({ ok: false, refused: "signer_failed", erased: 0, versionsDeleted: 0 });
+    expect(r.fenced![0]).toMatchObject({ outcome: "refused_before_delete", reason: "signer_failed", deleted: 0 });
+    expect(r.fenced![0]!.versions.every((v) => v.outcome === "not_attempted")).toBe(true);
+    expect(f.row(m.oldP)).toEqual(before); // no backoff, no attempt
+    expect(f.logs.some((l) => l.message === "erasure failed")).toBe(false);
+    expect(f.s.count(m.oldP)).toBe(3);
+  });
+
+  test("the signer throws a short_lived_* refusal: the credential stop (exit 75, item kept) and not_attempted", async () => {
+    const f = await fixture();
+    const m = f.dateMove();
+    const receipt = await f.verify();
+    const fence = f.s.eraser({ signer: async (args) => { if (args.method === "DELETE") throw new ShortLivedCredentialError("short_lived_expired.eraser"); await signRequest(args); } });
+    const before = f.row(m.oldP);
+    let err: unknown;
+    try { await f.execute(receipt, { fence }); } catch (e) { err = e; }
+    expect((err as { code?: string }).code).toBe("short_lived_expired.eraser");
+    expect(exitStatusForError(err)).toBe(75);
+    expect(f.s.deletes).toEqual([]);
+    expect(f.row(m.oldP)).toEqual(before);
+    const fenceLog = f.logs.find((l) => l.message === "stale prefix fence")!;
+    expect(fenceLog).toMatchObject({ outcome: "refused_before_delete", deleted: 0, not_attempted: 3, unknown: 0 });
+    expect(f.leases()).toEqual([]);
+  });
+
+  test("control: a transport error AFTER fetch is dispatched stays ambiguous and is relisted", async () => {
+    const f = await fixture();
+    f.dateMove();
+    const receipt = await f.verify();
+    let listsAtDelete = -1;
+    f.s.onDelete = () => { listsAtDelete = f.s.lists; return "transport"; };
+    const rep = (await f.execute(receipt)).fenced![0]!;
+    expect(f.s.deletes).toHaveLength(1);
+    expect(f.s.lists).toBe(listsAtDelete + 1); // the diagnostic relist ran
+    expect(rep).toMatchObject({ outcome: "partial", reason: "stale_prefix_delete_ambiguous" });
+    expect(rep.versions[0]!.outcome).toBe("absent_observed");
   });
 });

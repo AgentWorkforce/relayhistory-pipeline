@@ -404,18 +404,21 @@ function s3Core(cfg: S3EraserConfig, label: string) {
   };
   const sign = cfg.signer ?? signRequest;
   const request = async (method: string, u: URL, passStatuses: readonly number[] = [], beforeFetch?: BeforeFetch) => {
+    // EVERY local preparation step before dispatch (expiry refusal, hashing, signing, headers, the caller's gate, the
+    // timeout) is inside this block: any failure here is tagged notSent (fetch was never called), so the caller records
+    // not_attempted. A short-lived credential refusal keeps its own code (the credential stop) and is notSent too.
+    // Only fetch itself and what follows can be ambiguous.
     const headers = new Headers();
-    refuseIfExpired(cfg.credentials, label, Date.now()); // a short-lived key is never used to sign past expiry
-    await sign({ method, url: u, headers, payloadSha256: await sha256Hex(new Uint8Array()), region: cfg.region, credentials: cfg.credentials });
-    // The caller's final gate AFTER signing (signing and hashing can be slow) and synchronously before fetch.
-    // Any refusal here happens BEFORE fetch: it is marked notSent, so the caller records not_attempted, never ambiguous.
     let timeout: number;
     try {
+      refuseIfExpired(cfg.credentials, label, Date.now()); // a short-lived key is never used to sign past expiry
+      await sign({ method, url: u, headers, payloadSha256: await sha256Hex(new Uint8Array()), region: cfg.region, credentials: cfg.credentials });
+      // The caller's final gate AFTER signing (signing and hashing can be slow) and synchronously before fetch.
       const left = beforeFetch ? beforeFetch() : Number.POSITIVE_INFINITY;
       timeout = Math.min(deadlineMs, left);
       if (!(timeout > 0)) throw coded("stale_prefix_deadline", "no protected time left for this request");
     } catch (error) {
-      throw Object.assign(error instanceof Error ? error : coded("stale_prefix_deadline", "pre-fetch refusal"), { notSent: true });
+      throw Object.assign(error instanceof Error ? error : coded("request_prepare_failed", "request preparation failed"), { notSent: true });
     }
     const res = await doFetch(u, { method, headers, signal: AbortSignal.timeout(timeout) });
     // Status only: S3 error bodies can echo keys.
