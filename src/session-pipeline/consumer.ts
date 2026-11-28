@@ -244,8 +244,8 @@ const scopeId = (s: SessionScope) => JSON.stringify([s.orgId, s.workspaceId, s.h
 /**
  * A hold-only delivery whose expected incarnation has no job to act on (expected enqueue: obsolete or no_job), or whose
  * incarnation is no longer current. It never enqueues, marks or holds for another incarnation:
- * - "done" (ack) only when the CURRENT incarnation's job row exists and is not failed: that incarnation's own work is
- *   durably held (covered);
+ * - "done" (ack) only when the CURRENT incarnation's job row is queued, running or complete for exactly that
+ *   incarnation: its own work is durably held or done (covered); a superseded or failed row is not;
  * - "held": within LARGE_READ_UNCLAIMED_MS of the carried upload time, requeued once more for the SAME expectation
  *   (seq + 1), never for the newer one;
  * - "inline": past that bound (or without a requeue), the normal inline pass runs, with no enqueue, mark or hold.
@@ -267,7 +267,9 @@ async function settleUnmatchedHold(
     if (now) {
       canonical = now.identity;
       const row = isolation.progress ? await isolation.progress(now.identity) : null;
-      covers = !!row && row.state !== "failed" && sameSource(row.source, now.source);
+      // Covered only by a row the worker runs or ran for that exact incarnation: claim_session_large_read takes 'queued'
+      // (and 'running' once its lease expires); 'complete' is done. 'superseded' and 'failed' are never claimed again.
+      covers = !!row && (row.state === "queued" || row.state === "running" || row.state === "complete") && sameSource(row.source, now.source);
     }
   } catch (error) {
     log.warn("large scope job state unavailable", { stage: "large-read", ...ids, ...errorFields(error) });

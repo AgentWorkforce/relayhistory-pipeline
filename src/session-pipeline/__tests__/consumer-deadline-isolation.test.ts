@@ -897,4 +897,25 @@ describe("obsolete holds: a hold for incarnation A never enqueues, marks or hold
     expect((await f.jobs())[0]).toMatchObject({ state: "queued" });
     expect(await claimNow(f)).not.toBeNull();
   }, 60_000);
+
+  test("wired, B current with an exact SUPERSEDED B row, B's delivery lost, no later append, no wake: A is NOT acked; held for A within 5 min, then the inline pass; nothing claims B meanwhile", async () => {
+    const f = await fixture();
+    const s = stateTable(); const clock = { t: Date.now() };
+    wired(f, s, clock); markNow(s, clock.t);
+    await enqueueLargeRead(f.x.db, own);
+    await f.x.db.query("UPDATE sessions.session_large_read_jobs SET state='superseded'"); // B's exact row, never claimed again
+    const upload = new Date(clock.t).toISOString();
+    const r = await run(f, requeueBody(f.key, upload, holdA(3)));
+    expect(r.failures).toEqual([]);
+    expect(obsolete(r.all)).toEqual([expect.objectContaining({ outcome: "awaiting_newer" })]); // not "covered"
+    expect(f.holds).toEqual([{ ...A, seq: 4, id: holdId({ ...own, sessionId: "large:replay" }, A, 4) }]); // still A's hold
+    expect(await claimNow(f)).toBeNull(); // nothing claims B: its row is superseded
+    expect((await f.jobs())[0]).toMatchObject({ state: "superseded" });
+    clock.t += 6 * 60_000;
+    nextResult = () => ({ manifests: 1, rows: 3, inserted: 3, deleted: 0, complete: true, reasons: [] });
+    const later = await run(f, requeueBody(f.key, upload, f.holds[0]!));
+    expect(obsolete(later.all)).toEqual([expect.objectContaining({ level: "warn", outcome: "inline" })]);
+    expect(passes).toBe(1); // the bounded recovery: the normal inline pass indexes the current source
+    expect(later.all.some((l) => l.message === "search index reconciled" && l.ok === true)).toBe(true);
+  }, 60_000);
 });
