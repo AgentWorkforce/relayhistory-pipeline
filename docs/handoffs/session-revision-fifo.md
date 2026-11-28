@@ -77,6 +77,18 @@ scheduled reconcile ──────────────┘
 | `revision retry scheduled` | `reason`, `delay_seconds`, `count` |
 | `revision events forwarded` | `count`, `failed`, `skipped` |
 
+Readout labels (use these exactly):
+
+| field | label | start clock |
+|---|---|---|
+| `commit_to_pickup_ms` | manifest commit to consumer pickup (worker start, before pointer work) | `event_source=writer`: writer clock at the CAS ack; `forward`: S3 eventTime; `reconcile`: none (field absent) |
+| `pickup_wait_ms` | SQS enqueue to consumer pickup | SQS SentTimestamp |
+| `pointer_ms` | this key's pointer work | consumer clock |
+| `commit_to_start_ms` / `start_wait_ms` | manifest commit / SQS enqueue to covering search pass start | as above |
+| `commit_to_searchable_ms` | manifest commit to covering-pass completion | as above |
+| `queue_wait_ms` | SQS enqueue to covering-pass completion (includes processing) | SQS SentTimestamp |
+
+The 7s pickup budget is `commit_to_pickup_ms` (worker start, `picked_up_at_ms`).
 `commit_*` uses the writer's commit time, or the S3 eventTime for forwarded events. These are
 pipeline-leg diagnostics, not the end-to-end score: they start at the manifest commit, not at
 Desktop's first HTTP attempt, and end at the pass, not at an authorized read. Count superseded
