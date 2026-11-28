@@ -1,19 +1,15 @@
--- T139: a re-created session that reuses a revision number becomes visible.
---
--- sessions.upsert_session_index applied a row only when excluded.revision > s.revision. A plain
--- delete tombstones the row in place (deleted_at set, revision and manifest_etag kept;
--- src/hoopdb/index.ts), so a re-create of the same session that restarts at revision <= N, or that
--- rewrites revision N with new content, was 'unchanged' and stayed invisible until revision N+1.
---
--- The function body is unchanged except one OR branch of the ON CONFLICT predicate (marked T139).
--- The branch is opt-in per row (reincarnation_verified in the jsonb input, which
--- session_index_batch's jsonb_populate_recordset ignores). The SQL publication callers
--- (ingest_canonical_publication and successors, ingest_operator_runtime_upsert) never set it, so
--- their behaviour is byte-for-byte the same. Operator erasure stays denied by the unchanged
--- ingest_erase_fence_index_guard trigger.
---
--- CREATE OR REPLACE keeps the function's owner and ACL, including the EXECUTE grant to
--- search_consumer_runtime (20261105043900).
+-- T139 OFFLINE PROTOTYPE (design f959bd92 / fb6c7fd4), NOT a migration; slot 20261105062360 stays reserved for
+-- erasure. Applied inline by t139-reincarnation.pglite.test.ts after every migration and after
+-- t139-incarnation.prototype.sql. sessions.upsert_session_index is the current body except ONE OR branch of the ON
+-- CONFLICT predicate (marked T139): an incarnation-verified row replaces at any revision.
+
+-- The incarnation each pointer row was published at (missing: 0). Written by the caller in the publication
+-- transaction when a verified newer incarnation applied.
+CREATE TABLE sessions.t139_pointer_incarnations (
+  org_id text NOT NULL, workspace_id text NOT NULL, harness text NOT NULL, session_id text NOT NULL, machine_id text NOT NULL,
+  incarnation bigint NOT NULL,
+  PRIMARY KEY (org_id, workspace_id, harness, session_id, machine_id)
+);
 
 CREATE OR REPLACE FUNCTION sessions.upsert_session_index(p_rows jsonb)
 RETURNS TABLE (
@@ -108,15 +104,16 @@ BEGIN
        -- be live, its manifest ETag must differ from the stored one, and the stored row must be a
        -- tombstone or hold the same revision number. An operator erasure is still refused by the
        -- BEFORE INSERT/UPDATE guard ingest_erase_fence_index_guard, which this statement does not bypass.
+       -- T139 prototype: a NEWER INCARNATION replaces the row at ANY revision, including a reused revision 1 over a
+       -- tombstone, identical bytes included (no ETag condition). Set only by the caller (src/hoopdb/index.ts) after
+       -- t139_publish_check returned ok under k SHARED in this same transaction and the manifest's incarnation is
+       -- above the row's stored one (t139_pointer_incarnations). Operator erasure stays refused by the unchanged
+       -- ingest_erase_fence_index_guard.
        OR (excluded.deleted_at IS NULL
-           AND excluded.manifest_etag IS NOT NULL
-           AND excluded.manifest_etag IS DISTINCT FROM s.manifest_etag
-           AND (s.deleted_at IS NOT NULL OR excluded.revision = s.revision)
            AND EXISTS (SELECT 1 FROM jsonb_array_elements(p_rows) AS v
                         WHERE v->>'org_id' = excluded.org_id AND v->>'workspace_id' = excluded.workspace_id
                           AND v->>'harness' = excluded.harness AND v->>'session_id' = excluded.session_id
                           AND v->>'machine_id' = excluded.machine_id
-                          AND v->>'manifest_etag' = excluded.manifest_etag
                           AND v->>'reincarnation_verified' = 'true'))
     RETURNING s.org_id, s.workspace_id, s.harness, s.session_id, s.machine_id, s.revision)
   -- Keys as named objects: array containment would ignore element order and match

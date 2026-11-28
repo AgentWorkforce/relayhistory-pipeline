@@ -76,6 +76,11 @@ export function sameObject(read: { etag?: string; version?: string }, live: { et
   const a = unquote(read.etag), b = unquote(live.etag);
   return a !== undefined && a === b;
 }
+/** T139 prototype: the manifest's incarnation (extensions["96bulls"].incarnation; absent or invalid: 0). */
+function manifestIncarnation(m: { extensions?: Record<string, unknown> }): number {
+  const v = (m.extensions?.["96bulls"] as { incarnation?: unknown } | undefined)?.incarnation;
+  return typeof v === "number" && Number.isSafeInteger(v) && v >= 0 ? v : 0;
+}
 /** The physical write's digest (the same value as T126's revision dedup ID for a PUT): a log join key only. */
 const incarnationDigest = (key: string, read: { etag?: string; version?: string }) =>
   createHash("sha256").update(JSON.stringify(["96bulls:revision-dedup", key, "put", read.version ?? "", unquote(read.etag) ?? "", ""])).digest("hex");
@@ -232,6 +237,23 @@ function sessionIndex(deps:IndexDeps,authorized:boolean,managedSearch?:ManagedSe
         ectx.user_id && ectx.user_id !== "unknown" ? ectx.user_id : undefined;
       const realUserId = requestUser ?? recordedUser ?? manifestUserId(m);
       const userId = realUserId ?? "unknown";
+      // T139 OFFLINE PROTOTYPE (tests only; fixtures/t139-*.prototype.sql): active authority under k SHARED, in THIS
+      // transaction, before the upsert. Owner = (user, machine) here; the production owner mapping is open (design rev 3 Q4).
+      let verified = false;
+      let manifestInc = 0;
+      if (verify) {
+        manifestInc = manifestIncarnation(m);
+        const authority = (await deps.db.query<{ v: string }>("SELECT sessions.t139_publish_check($1,$2,$3,$4,$5,$6,$7) v",
+          [pk.org_id, pk.workspace_id, pk.harness, pk.session_id, userId, pk.machine_id, manifestInc])).rows[0]?.v;
+        if (authority !== "ok") {
+          log.info("pointer write refused by incarnation authority", { stage: "session-indexed", reason: authority ?? "unknown", revision: Number(m.revision) });
+          return { status: "skipped", reason: `incarnation_${authority ?? "unknown"}` };
+        }
+        const stored = (await deps.db.query<{ incarnation: string }>(
+          "SELECT incarnation::text FROM sessions.t139_pointer_incarnations WHERE org_id=$1 AND workspace_id=$2 AND harness=$3 AND session_id=$4 AND machine_id=$5",
+          [pk.org_id, pk.workspace_id, pk.harness, pk.session_id, pk.machine_id])).rows[0];
+        verified = manifestInc > Number(stored?.incarnation ?? 0);
+      }
       const row = {
         ...pk,
         user_id: userId,
@@ -263,8 +285,8 @@ function sessionIndex(deps:IndexDeps,authorized:boolean,managedSearch?:ManagedSe
         revision: f.manifestRevision,
         trace_id: f.traceId,
         deleted_at: null,
-        // Read by migration 20261105062360's predicate only (jsonb_populate_recordset ignores it).
-        ...(verify ? { reincarnation_verified: true } : {}),
+        // Read by the T139 prototype upsert's predicate only (jsonb_populate_recordset ignores it): a NEWER incarnation.
+        ...(verified ? { reincarnation_verified: true } : {}),
       };
       if (opts.rekeyFrom) {
         // The move's delete, in this upsert's transaction; the new row keeps the older first-seen.
@@ -297,6 +319,17 @@ function sessionIndex(deps:IndexDeps,authorized:boolean,managedSearch?:ManagedSe
         return { status: "skipped", reason: "operator_erased" };
       }
       const applied = rows[0]?.applied ?? false;
+      if (verify && applied && verified) {
+        // The row now publishes the newer incarnation: record it, and lower this machine's directory resurrection fence
+        // (decision 0002 amended: the fence holds per incarnation; a new incarnation is a new upload).
+        await deps.db.query(`INSERT INTO sessions.t139_pointer_incarnations (org_id, workspace_id, harness, session_id, machine_id, incarnation)
+          VALUES ($1,$2,$3,$4,$5,$6) ON CONFLICT (org_id, workspace_id, harness, session_id, machine_id) DO UPDATE SET incarnation = excluded.incarnation`,
+          [pk.org_id, pk.workspace_id, pk.harness, pk.session_id, pk.machine_id, manifestInc]);
+        await deps.db.query("DELETE FROM sessions.session_directory_resurrection_fences WHERE org_id=$1 AND workspace_id=$2 AND harness=$3 AND session_id=$4 AND machine_id=$5",
+          [pk.org_id, pk.workspace_id, pk.harness, pk.session_id, pk.machine_id]);
+      }
+      // HEAD of the CURRENT key (not a version-specific HEAD), compared with the captured version: an observation before
+      // commit. A PUT after it and before COMMIT is the residual same-incarnation window (design rev 3 Q2).
       if (verify && applied && !sameObject(read, await deps.reincarnation!.stamp(pointer.manifestKey))) {
         // The manifest changed (or went) after this pass read it: nothing this transaction wrote may commit. The
         // newer write's own event re-reads under the scope lock.

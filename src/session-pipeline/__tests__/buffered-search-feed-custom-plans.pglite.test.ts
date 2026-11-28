@@ -33,9 +33,6 @@ const PAGE_KEYSET_DOWN = "supabase/rollbacks/20261105062350_buffered_search_feed
 // 20261105062340 (the per-org erasure history) also sits above 062330 when present: its down runs next.
 const HISTORY_DOWN = "supabase/rollbacks/20261105062340_ingest_org_erasure_history.down.sql";
 const laterOff = async (db: PGlite) => {
-  // 20261105062360 (T139 pointer reincarnation) sits above 062350 when present: its down runs first.
-  if ((await db.query("SELECT 1 FROM sessions.__96bulls_migrations WHERE name='upstream:20261105062360_pointer_reincarnation.sql'")).rows.length)
-    await db.exec(read("supabase/rollbacks/20261105062360_pointer_reincarnation.down.sql"));
   if ((await db.query("SELECT 1 FROM sessions.__96bulls_migrations WHERE name='upstream:20261105062350_buffered_search_feed_page_keyset.sql'")).rows.length)
     await db.exec(read(PAGE_KEYSET_DOWN));
   if ((await db.query("SELECT 1 FROM sessions.__96bulls_migrations WHERE name='upstream:20261105062340_ingest_org_erasure_history.sql'")).rows.length)

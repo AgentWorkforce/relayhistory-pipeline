@@ -52,7 +52,14 @@ export async function pointerRig() {
     ...reader0,
     read: async (key) => {
       calls.push({ at: at(), kind: "s3.read", detail: key });
-      return reader0.read(key);
+      const got = await reader0.read(key);
+      // T139: pause a pass AFTER its manifest read and BEFORE any transaction (so before the shared k), once.
+      if (hooks.afterRead) {
+        const h = hooks.afterRead;
+        hooks.afterRead = undefined;
+        await h();
+      }
+      return got;
     },
   };
   const exists = async (key: string) => {
@@ -60,7 +67,7 @@ export async function pointerRig() {
     return (await store.head(objectKey(key))) !== undefined;
   };
   /** Hooks a test sets: runs right before the first pool statement inside the lock, once. */
-  const hooks: { beforeLock?: () => Promise<void>; atLock?: () => Promise<void>; beforeUpsert?: () => Promise<void> } = {};
+  const hooks: { beforeLock?: () => Promise<void>; atLock?: () => Promise<void>; beforeUpsert?: () => Promise<void>; afterRead?: () => Promise<void> } = {};
   const db = {
     pool: undefined,
     end: async () => {},
@@ -118,7 +125,7 @@ export async function pointerRig() {
    * `marker` (default none): the record id and the searchable text, so two incarnations with one revision number
    * differ in content. Without it the manifest is byte-identical to the golden's.
    */
-  async function writeManifest(revision: number, l: Loc = loc, marker?: string) {
+  async function writeManifest(revision: number, l: Loc = loc, marker?: string, incarnation?: number) {
     const source = new TextEncoder().encode(JSON.stringify({ kind: "session_event", origin_id: "o", record_id: marker ?? `r${revision}`, revision: "1", operation: "upsert", received_at: AT, payload: { ts_ms: 1, text: marker ?? "x" } }) + "\n");
     const stored = new Uint8Array(zstdCompressSync(source));
     const sha = await sha256Hex(source);
@@ -128,7 +135,7 @@ export async function pointerRig() {
       session: { workspace_id: "ws_1", machine_id: "srv_bb", harness: "claude", session_id: "sess_1", started_at: `${l.startDate}T10:00:00.000Z` },
       writer: { delivery_instance_id: "srv_bb", plugin_version: "t" },
       raw: { owner: "srv_bb", state: "open", updated_at: AT, format: "ndjson", compression: "zstd", chunk_count: 1, raw_bytes: chunk.bytes, stored_bytes: chunk.stored_bytes, content_sha256: await computeContentSha256([chunk]), epoch: 0, epochs: [{ epoch: 0, opened_at: AT, reason: "initial", first_seq: chunk.seq, opened_by: "srv_bb" }], next_offset: source.byteLength, chunks: [chunk], scrub: { ruleset: "relayhistory-scrub", version: 1 } },
-      extensions: { "96bulls": { user_id: "user_1", session_uuid: "0193a1f3-8e2b-7c41-9d3a-5b6f0e2a7c18" } } } as unknown as ManifestV1;
+      extensions: { "96bulls": { user_id: "user_1", session_uuid: "0193a1f3-8e2b-7c41-9d3a-5b6f0e2a7c18", ...(incarnation !== undefined ? { incarnation } : {}) } } } as unknown as ManifestV1;
     const key = manifestKey(l);
     await store.put(objectKey(key), new TextEncoder().encode(JSON.stringify(manifest)), { contentType: "application/json" });
     return key;

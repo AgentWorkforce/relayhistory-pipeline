@@ -2723,19 +2723,6 @@ describe("function boundary: ACL manifest, residual, activation gate", () => {
       const open = src.indexOf(tag, start) + tag.length;
       return src.slice(open, src.indexOf(tag, open));
     };
-    // 20261105062360 (T139 pointer reincarnation) is newest: 062350's down refuses (55000) while it is applied; its
-    // lane-generated, checksum-pinned down restores 000300's exact upsert_session_index (SECURITY INVOKER, same
-    // search_path), removes its ledger row, and refuses on a rerun.
-    const PRI = "upstream:20261105062360_pointer_reincarnation.sql";
-    const upsertCfg = async () =>
-      (await db.query<{ c: string[]; s: string; d: boolean }>("SELECT proconfig c, prosrc s, prosecdef d FROM pg_proc WHERE oid='sessions.upsert_session_index(jsonb)'::regprocedure")).rows[0]!;
-    expect(await names()).toContain(PRI);
-    expect((await upsertCfg()).s).toBe(bodyOf("20261105062360_pointer_reincarnation.sql", "upsert_session_index", "$upsert$"));
-    expect((await failure(rollback("20261105062350_buffered_search_feed_page_keyset.down.sql")))?.code).toBe("55000");
-    await rollback("20261105062360_pointer_reincarnation.down.sql");
-    expect(await names()).not.toContain(PRI);
-    expect(await upsertCfg()).toEqual({ c: ["search_path=pg_catalog, sessions, pg_temp"], s: bodyOf("20261025000300_upsert_keep_on_null.sql", "upsert_session_index", "$upsert$"), d: false });
-    expect((await failure(rollback("20261105062360_pointer_reincarnation.down.sql")))?.code).toBe("55000");
     // 20261105062350 (the buffered feed page keyset) is newest: 062340's down refuses (55000) while it is applied; its
     // lane-generated, checksum-pinned down restores 043870's exact page function (body and proconfig), removes its
     // ledger row, and refuses on a rerun.
