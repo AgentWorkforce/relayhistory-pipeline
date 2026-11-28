@@ -15,7 +15,7 @@ import type { ManifestV1 } from "../../shared/vendor.ts";
 import { SessionAnalysisProviderError } from "../engine/transport.ts";
 import { armWakeup, sweepUnbriefed } from "../store.ts";
 import { briefTick } from "../worker.ts";
-import { FakeModel, KEY, database, dueNow, hoopDb, mapReader, pointer, tempStore, testConfig, transcript } from "./harness.ts";
+import { FakeModel, KEY, database, dueNow, hoopDb, mapReader, pointer, tempStore, testConfig, transcript, indexedFrom } from "./harness.ts";
 import { captureLogs, expectGolden, normalize, recording } from "../../shared/__tests__/golden.ts";
 
 setDefaultTimeout(120_000);
@@ -48,7 +48,7 @@ async function run(flags: Record<string, string>) {
   const upload = async (lines: unknown[], revision: number, key = KEY) => {
     const manifestKey = `manifest/${key.sessionId}/m-1/r${revision}`;
     manifests.set(manifestKey, await transcript(store, lines, { key, revision }));
-    await pointer(pg, { key, revision, manifestKey, contentSha256: manifests.get(manifestKey)!.raw.content_sha256 });
+    await pointer(pg, { key, revision, manifestKey, ...indexedFrom(manifests.get(manifestKey)!) });
     await armWakeup(hoopDb(pg), key, { idleSeconds: 600, maxWaitSeconds: 3600 });
   };
   const { db, log: queries } = recording(hoopDb(pg));

@@ -182,15 +182,15 @@ export async function rescheduleWakeup(
 
 /** The session's live pointers (at most 64, as session_directory_pointers). */
 export async function livePointers(db: SqlExecutor, key: SessionDirectoryKey): Promise<BriefPointer[]> {
-  const { rows } = await db.query<{ machine_id: string; manifest_key: string | null; revision: string; content_sha256: string | null }>(
-    `SELECT machine_id, manifest_key, revision::text AS revision, encode(content_sha256, 'hex') AS content_sha256
+  const { rows } = await db.query<{ machine_id: string; manifest_key: string | null; revision: string; content_sha256: string | null; manifest_etag: string | null }>(
+    `SELECT machine_id, manifest_key, revision::text AS revision, encode(content_sha256, 'hex') AS content_sha256, manifest_etag
        FROM sessions.session_index
       WHERE ${KEY} AND deleted_at IS NULL ORDER BY machine_id LIMIT 64`,
     keyParams(key),
   );
   return rows
     .filter((r) => r.manifest_key)
-    .map((r) => ({ machineId: r.machine_id, manifestKey: r.manifest_key!, revision: Number(r.revision), contentSha256: r.content_sha256 ?? null }));
+    .map((r) => ({ machineId: r.machine_id, manifestKey: r.manifest_key!, revision: Number(r.revision), contentSha256: r.content_sha256 ?? null, manifestEtag: r.manifest_etag ?? null }));
 }
 
 export interface StoredBrief {
@@ -404,8 +404,8 @@ export async function recordBrief(
     // machines at the same maximum revision) out of a newer brief.
     // Exactly livePointers' read (64 by machine_id, then rows with a manifest), so a
     // session past 64 machines still compares equal to the set the input was built from.
-    const live = await client.query<{ machine_id: string; manifest_key: string | null; revision: string; content_sha256: string | null }>(
-      `SELECT machine_id, manifest_key, revision::text AS revision, encode(content_sha256, 'hex') AS content_sha256
+    const live = await client.query<{ machine_id: string; manifest_key: string | null; revision: string; content_sha256: string | null; manifest_etag: string | null }>(
+      `SELECT machine_id, manifest_key, revision::text AS revision, encode(content_sha256, 'hex') AS content_sha256, manifest_etag
          FROM sessions.session_index
         WHERE ${KEY} AND deleted_at IS NULL ORDER BY machine_id LIMIT 64 FOR SHARE`,
       keyParams(key),
@@ -634,22 +634,27 @@ export async function briefSessionQuiet(
 }
 
 /** Per machine: the manifest key and digest of the exact incarnation a brief input was built from. */
-export type BriefSourceBinding = Record<string, { manifestKey: string; contentSha256: string | null }>;
+export type BriefSourceBinding = Record<string, { manifestKey: string; contentSha256: string | null; manifestEtag: string | null }>;
 
 /** The binding for a pointer set, as read for the input (livePointers). */
-export function briefSourceBinding(pointers: readonly { machineId: string; manifestKey: string; contentSha256?: string | null }[]): BriefSourceBinding {
-  return Object.fromEntries(pointers.map((p) => [p.machineId, { manifestKey: p.manifestKey, contentSha256: p.contentSha256 ?? null }]));
+export function briefSourceBinding(pointers: readonly { machineId: string; manifestKey: string; contentSha256?: string | null; manifestEtag?: string | null }[]): BriefSourceBinding {
+  return Object.fromEntries(pointers.map((p) => [p.machineId, { manifestKey: p.manifestKey, contentSha256: p.contentSha256 ?? null, manifestEtag: p.manifestEtag ?? null }]));
 }
 
 function sameSourceIncarnation(
-  rows: Array<{ machine_id: string; manifest_key: string | null; content_sha256: string | null }>,
+  rows: Array<{ machine_id: string; manifest_key: string | null; content_sha256: string | null; manifest_etag: string | null }>,
   binding: BriefSourceBinding,
 ): boolean {
   if (rows.length !== Object.keys(binding).length) return false;
   return rows.every((r) => {
     const b = Object.prototype.hasOwnProperty.call(binding, r.machine_id) ? binding[r.machine_id] : undefined;
     // Positive evidence only: a row without a digest cannot prove its content is unchanged.
-    return b !== undefined && b.manifestKey === r.manifest_key && b.contentSha256 != null && b.contentSha256 === r.content_sha256;
+    // The manifest ETag distinguishes two manifest objects with the same key, revision and raw digest
+    // whose input-affecting metadata differs (export extension, epoch reasons): it must be unchanged.
+    // Positive ETag evidence is required where the input is read from the manifest (buildBriefInput
+    // refuses a pointer with none); the canonical-object input path carries no manifest ETag.
+    return b !== undefined && b.manifestKey === r.manifest_key && b.contentSha256 != null && b.contentSha256 === r.content_sha256
+      && (b.manifestEtag ?? null) === (r.manifest_etag ?? null);
   });
 }
 

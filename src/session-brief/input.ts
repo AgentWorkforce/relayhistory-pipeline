@@ -55,6 +55,12 @@ export interface BriefPointer {
    * incarnation a brief was built from: a re-create can reuse a revision number, never this digest.
    */
   contentSha256?: string | null;
+  /**
+   * session_index.manifest_etag: the ETag (or object version) of the manifest object the pointer was
+   * indexed from. The raw digest does not cover manifest metadata that changes the input (the export
+   * extension, epoch reasons); a rewritten manifest object always has a new ETag/version.
+   */
+  manifestEtag?: string | null;
 }
 
 export type BriefInput = (
@@ -330,6 +336,10 @@ export async function buildBriefInput(
     // A manifest replaced between the pointer read and this fetch is retried, never briefed.
     if (p.contentSha256 !== undefined && read.manifest.raw.content_sha256 !== p.contentSha256)
       throw new PipelineError("manifest_replaced", "a live pointer's manifest is not the incarnation it names", true);
+    // The same for the manifest object itself (metadata included): the object read must be the one
+    // the pointer was indexed from. No recorded ETag is no evidence, and is refused the same way.
+    if (p.manifestEtag !== undefined && (p.manifestEtag === null || (read.etag !== p.manifestEtag && read.version !== p.manifestEtag)))
+      throw new PipelineError("manifest_replaced", "a live pointer's manifest object is not the one it was indexed from", true);
     if (!read.manifest.raw.scrub)
       return { kind: "quarantined", error: "session_quarantined", sourceRevisions };
     assertReaderScrubMarker(read.manifest.raw.scrub, deps.readerMaxRuleset);

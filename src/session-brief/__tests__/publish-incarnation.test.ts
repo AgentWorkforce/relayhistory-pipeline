@@ -8,7 +8,7 @@ import type { PGlite } from "@electric-sql/pglite";
 import type { ManifestV1 } from "../../shared/vendor.ts";
 import { armWakeup, briefSourceBinding, livePointers, recordBrief } from "../store.ts";
 import { briefTick } from "../worker.ts";
-import { FakeModel, KEY, database, dueNow, hoopDb, mapReader, pointer, tempStore, testConfig, transcript } from "./harness.ts";
+import { FakeModel, KEY, database, dueNow, hoopDb, mapReader, pointer, tempStore, testConfig, transcript, indexedFrom } from "./harness.ts";
 
 setDefaultTimeout(60_000);
 const open: PGlite[] = [];
@@ -42,7 +42,7 @@ describe("recordBrief binds the source incarnation", () => {
     open.push(pg);
     await pointer(pg, { revision: 3, manifestKey: "manifest/s-1/m-1/r3" });
     expect(await livePointers(hoopDb(pg), KEY)).toEqual([
-      { machineId: "m-1", manifestKey: "manifest/s-1/m-1/r3", revision: 3, contentSha256: DIGEST_A },
+      { machineId: "m-1", manifestKey: "manifest/s-1/m-1/r3", revision: 3, contentSha256: DIGEST_A, manifestEtag: null },
     ]);
   });
 
@@ -96,6 +96,31 @@ describe("recordBrief binds the source incarnation", () => {
     expect(await briefRows(pg)).toEqual([]);
   });
 
+  test("a stale failed or rate_limited outcome is refused too and cannot overwrite the current result", async () => {
+    const pg = await database();
+    open.push(pg);
+    await pointer(pg, { revision: 3, manifestKey: "manifest/s-1/m-1/r3" });
+    const stale = briefSourceBinding(await livePointers(hoopDb(pg), KEY));
+    await recreate(pg, DIGEST_B);
+    const current = briefSourceBinding(await livePointers(hoopDb(pg), KEY));
+    expect(await recordBrief(hoopDb(pg), KEY, { "m-1": 3 }, ready, { sourceBinding: current })).toEqual({ written: true });
+    for (const outcome of [{ status: "failed" as const, error: "model_failed" }, { status: "rate_limited" as const, error: "org_daily_pool" }])
+      expect(await recordBrief(hoopDb(pg), KEY, { "m-1": 3 }, outcome, { sourceBinding: stale })).toEqual({ written: false });
+    expect(await briefRows(pg)).toEqual([{ status: "ready" }]);
+  });
+
+  test("same key, revision and raw digest, different manifest object (input-affecting metadata): refused", async () => {
+    const pg = await database();
+    open.push(pg);
+    await pointer(pg, { revision: 3, manifestKey: "manifest/s-1/m-1/r3", manifestEtag: "etag-a" });
+    const binding = briefSourceBinding(await livePointers(hoopDb(pg), KEY));
+    expect(binding["m-1"]!.manifestEtag).toBe("etag-a");
+    // Re-indexed from a rewritten manifest: same key, revision and raw digest; only the object changed.
+    await pg.exec("UPDATE sessions.session_index SET manifest_etag = 'etag-b'");
+    expect(await recordBrief(hoopDb(pg), KEY, { "m-1": 3 }, ready, { sourceBinding: binding })).toEqual({ written: false });
+    expect(await briefRows(pg)).toEqual([]);
+  });
+
   test("without a binding the existing machine+revision check is unchanged", async () => {
     const pg = await database();
     open.push(pg);
@@ -106,7 +131,7 @@ describe("recordBrief binds the source incarnation", () => {
 });
 
 describe("the worker refuses a re-create between pointer read and publish", () => {
-  async function run(recreateDuringGeneration: boolean, pointerDigest?: string) {
+  async function run(recreateDuringGeneration: boolean, pointerDigest?: string, pointerEtag?: string, duringGeneration?: (pg: PGlite) => Promise<void>) {
     const pg = await database();
     open.push(pg);
     const store = tempStore();
@@ -119,7 +144,7 @@ describe("the worker refuses a re-create between pointer read and publish", () =
         revision: 1,
       }),
     );
-    await pointer(pg, { revision: 1, manifestKey, contentSha256: pointerDigest ?? manifests.get(manifestKey)!.raw.content_sha256 });
+    await pointer(pg, { revision: 1, manifestKey, ...indexedFrom(manifests.get(manifestKey)!), ...(pointerDigest ? { contentSha256: pointerDigest } : {}), ...(pointerEtag ? { manifestEtag: pointerEtag } : {}) });
     await armWakeup(hoopDb(pg), KEY, { idleSeconds: 600, maxWaitSeconds: 3600 });
     await dueNow(pg);
     const model = new FakeModel();
@@ -127,10 +152,12 @@ describe("the worker refuses a re-create between pointer read and publish", () =
     model.complete = async (req) => {
       // The pointer row is re-created at the SAME revision while the model runs.
       if (recreateDuringGeneration) await recreate(pg, DIGEST_B);
+      if (duringGeneration) await duringGeneration(pg);
       return complete(req);
     };
     const counts = await briefTick({ reader: mapReader(manifests), store, transport: model, config: testConfig() })(hoopDb(pg), new Date());
-    return { counts, rows: await briefRows(pg), modelCalls: model.requests.length };
+    const served = (await pg.query<{ description: string | null }>("SELECT description FROM sessions.session_briefs")).rows;
+    return { counts, rows: await briefRows(pg), modelCalls: model.requests.length, served };
   }
 
   test("control: no re-create, the brief is generated", async () => {
@@ -150,5 +177,24 @@ describe("the worker refuses a re-create between pointer read and publish", () =
     expect(counts?.generated ?? 0).toBe(0);
     expect(modelCalls).toBe(0);
     expect(rows.filter((r) => r.status === "ready")).toEqual([]);
+  });
+
+  test("the manifest object read is not the one the pointer was indexed from (ETag): retried, no model call", async () => {
+    const { counts, rows, modelCalls } = await run(false, undefined, "some-other-object-etag");
+    expect(counts?.generated ?? 0).toBe(0);
+    expect(modelCalls).toBe(0);
+    expect(rows.filter((r) => r.status === "ready")).toEqual([]);
+  });
+
+  test("park A, serve B (same key, revision and raw digest; new manifest object), resume A: A is refused, B stays served", async () => {
+    const { counts, served } = await run(false, undefined, undefined, async (pg) => {
+      // While A is with the model, the pointer is re-indexed from a rewritten manifest object and B publishes.
+      await pg.exec("UPDATE sessions.session_index SET manifest_etag = 'etag-of-b'");
+      const bindingB = briefSourceBinding(await livePointers(hoopDb(pg), KEY));
+      expect(await recordBrief(hoopDb(pg), KEY, { "m-1": 1 }, { ...ready, text: { ...ready.text, description: "Brief B." } }, { sourceBinding: bindingB }))
+        .toEqual({ written: true });
+    });
+    expect(counts).toEqual({ stale: 1 });
+    expect(served).toEqual([{ description: "Brief B." }]);
   });
 });

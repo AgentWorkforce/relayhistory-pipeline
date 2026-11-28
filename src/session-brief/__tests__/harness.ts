@@ -108,18 +108,18 @@ export const code = async (p: Promise<unknown>) =>
 /** A session_index pointer, then the directory projection, as the indexer does. */
 export async function pointer(
   pg: PGlite,
-  opts: { key?: typeof KEY; machine?: string; revision?: number; title?: string | null; manifestKey?: string; contentSha256?: string } = {},
+  opts: { key?: typeof KEY; machine?: string; revision?: number; title?: string | null; manifestKey?: string; contentSha256?: string; manifestEtag?: string | null } = {},
 ) {
   const key = opts.key ?? KEY;
   const machine = opts.machine ?? "m-1";
   await pg.query(
     `INSERT INTO sessions.session_index
        (org_id, workspace_id, harness, session_id, machine_id, user_id, created_at, last_activity_at,
-        storage_provider, bucket, manifest_key, content_sha256, raw_format, trace_id, revision, title)
+        storage_provider, bucket, manifest_key, content_sha256, raw_format, trace_id, revision, title, manifest_etag)
      VALUES ($1, $2, $3, $4, $5, 'u-1', now(), now(), 'fs', 'bucket', $6,
-             decode(coalesce($10, repeat('ab', 32)), 'hex'), 'jsonl', $7, $8, $9)
+             decode(coalesce($10, repeat('ab', 32)), 'hex'), 'jsonl', $7, $8, $9, $11)
      ON CONFLICT (org_id, workspace_id, harness, session_id, machine_id) DO UPDATE SET
-       revision = excluded.revision, manifest_key = excluded.manifest_key, content_sha256 = excluded.content_sha256,
+       revision = excluded.revision, manifest_key = excluded.manifest_key, content_sha256 = excluded.content_sha256, manifest_etag = excluded.manifest_etag,
        title = excluded.title, last_activity_at = now(), deleted_at = NULL`,
     [
       key.orgId,
@@ -133,6 +133,8 @@ export async function pointer(
       opts.title === undefined ? "pointer title" : opts.title,
       // As hoopdb writes it: the manifest's raw.content_sha256 (default: a fixed digest).
       opts.contentSha256 ?? null,
+      // As hoopdb writes it: the manifest object's ETag (the harness reader's is manifestEtag(manifest)).
+      opts.manifestEtag ?? null,
     ],
   );
   await projectSessionDirectory(hoopDb(pg), key);
@@ -284,12 +286,20 @@ export async function recordStream(
 }
 
 /** A manifest reader over an in-memory map (the pointer's manifest_key -> manifest). */
+/** The harness object store's ETag for a manifest: changes whenever any manifest byte does. */
+export function manifestEtag(manifest: ManifestV1): string {
+  return createHash("sha256").update(JSON.stringify(manifest)).digest("hex").slice(0, 32);
+}
+
+/** The pointer fields hoopdb derives from a manifest read: its raw digest and object ETag. */
+export const indexedFrom = (manifest: ManifestV1) => ({ contentSha256: manifest.raw.content_sha256, manifestEtag: manifestEtag(manifest) });
+
 export function mapReader(manifests: Map<string, ManifestV1>) {
   return {
     provider: "fs",
     read: async (k: string) => {
       const manifest = manifests.get(k);
-      return manifest ? { manifest } : null;
+      return manifest ? { manifest, etag: manifestEtag(manifest) } : null;
     },
   } as never;
 }

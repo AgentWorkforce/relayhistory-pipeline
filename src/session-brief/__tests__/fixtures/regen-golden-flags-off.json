@@ -29,7 +29,7 @@
           ]
         },
         {
-          "text": "SELECT machine_id, manifest_key, revision::text AS revision, encode(content_sha256, 'hex') AS content_sha256\n       FROM sessions.session_index\n      WHERE org_id = $1 AND workspace_id = $2 AND harness = $3 AND session_id = $4 AND deleted_at IS NULL ORDER BY machine_id LIMIT 64",
+          "text": "SELECT machine_id, manifest_key, revision::text AS revision, encode(content_sha256, 'hex') AS content_sha256, manifest_etag\n       FROM sessions.session_index\n      WHERE org_id = $1 AND workspace_id = $2 AND harness = $3 AND session_id = $4 AND deleted_at IS NULL ORDER BY machine_id LIMIT 64",
           "params": [
             "org-a",
             "ws-a",
@@ -84,7 +84,7 @@
           ]
         },
         {
-          "text": "SELECT machine_id, manifest_key, revision::text AS revision, encode(content_sha256, 'hex') AS content_sha256\n         FROM sessions.session_index\n        WHERE org_id = $1 AND workspace_id = $2 AND harness = $3 AND session_id = $4 AND deleted_at IS NULL ORDER BY machine_id LIMIT 64 FOR SHARE",
+          "text": "SELECT machine_id, manifest_key, revision::text AS revision, encode(content_sha256, 'hex') AS content_sha256, manifest_etag\n         FROM sessions.session_index\n        WHERE org_id = $1 AND workspace_id = $2 AND harness = $3 AND session_id = $4 AND deleted_at IS NULL ORDER BY machine_id LIMIT 64 FOR SHARE",
           "params": [
             "org-a",
             "ws-a",
@@ -220,7 +220,7 @@
           ]
         },
         {
-          "text": "SELECT machine_id, manifest_key, revision::text AS revision, encode(content_sha256, 'hex') AS content_sha256\n       FROM sessions.session_index\n      WHERE org_id = $1 AND workspace_id = $2 AND harness = $3 AND session_id = $4 AND deleted_at IS NULL ORDER BY machine_id LIMIT 64",
+          "text": "SELECT machine_id, manifest_key, revision::text AS revision, encode(content_sha256, 'hex') AS content_sha256, manifest_etag\n       FROM sessions.session_index\n      WHERE org_id = $1 AND workspace_id = $2 AND harness = $3 AND session_id = $4 AND deleted_at IS NULL ORDER BY machine_id LIMIT 64",
           "params": [
             "org-a",
             "ws-a",
@@ -325,7 +325,7 @@
           ]
         },
         {
-          "text": "SELECT machine_id, manifest_key, revision::text AS revision, encode(content_sha256, 'hex') AS content_sha256\n       FROM sessions.session_index\n      WHERE org_id = $1 AND workspace_id = $2 AND harness = $3 AND session_id = $4 AND deleted_at IS NULL ORDER BY machine_id LIMIT 64",
+          "text": "SELECT machine_id, manifest_key, revision::text AS revision, encode(content_sha256, 'hex') AS content_sha256, manifest_etag\n       FROM sessions.session_index\n      WHERE org_id = $1 AND workspace_id = $2 AND harness = $3 AND session_id = $4 AND deleted_at IS NULL ORDER BY machine_id LIMIT 64",
           "params": [
             "org-a",
             "ws-a",
@@ -380,7 +380,7 @@
           ]
         },
         {
-          "text": "SELECT machine_id, manifest_key, revision::text AS revision, encode(content_sha256, 'hex') AS content_sha256\n         FROM sessions.session_index\n        WHERE org_id = $1 AND workspace_id = $2 AND harness = $3 AND session_id = $4 AND deleted_at IS NULL ORDER BY machine_id LIMIT 64 FOR SHARE",
+          "text": "SELECT machine_id, manifest_key, revision::text AS revision, encode(content_sha256, 'hex') AS content_sha256, manifest_etag\n         FROM sessions.session_index\n        WHERE org_id = $1 AND workspace_id = $2 AND harness = $3 AND session_id = $4 AND deleted_at IS NULL ORDER BY machine_id LIMIT 64 FOR SHARE",
           "params": [
             "org-a",
             "ws-a",
@@ -472,7 +472,7 @@
           ]
         },
         {
-          "text": "SELECT machine_id, manifest_key, revision::text AS revision, encode(content_sha256, 'hex') AS content_sha256\n       FROM sessions.session_index\n      WHERE org_id = $1 AND workspace_id = $2 AND harness = $3 AND session_id = $4 AND deleted_at IS NULL ORDER BY machine_id LIMIT 64",
+          "text": "SELECT machine_id, manifest_key, revision::text AS revision, encode(content_sha256, 'hex') AS content_sha256, manifest_etag\n       FROM sessions.session_index\n      WHERE org_id = $1 AND workspace_id = $2 AND harness = $3 AND session_id = $4 AND deleted_at IS NULL ORDER BY machine_id LIMIT 64",
           "params": [
             "org-a",
             "ws-a",
@@ -527,7 +527,7 @@
           ]
         },
         {
-          "text": "SELECT machine_id, manifest_key, revision::text AS revision, encode(content_sha256, 'hex') AS content_sha256\n         FROM sessions.session_index\n        WHERE org_id = $1 AND workspace_id = $2 AND harness = $3 AND session_id = $4 AND deleted_at IS NULL ORDER BY machine_id LIMIT 64 FOR SHARE",
+          "text": "SELECT machine_id, manifest_key, revision::text AS revision, encode(content_sha256, 'hex') AS content_sha256, manifest_etag\n         FROM sessions.session_index\n        WHERE org_id = $1 AND workspace_id = $2 AND harness = $3 AND session_id = $4 AND deleted_at IS NULL ORDER BY machine_id LIMIT 64 FOR SHARE",
           "params": [
             "org-a",
             "ws-a",
@@ -671,7 +671,7 @@
           ]
         },
         {
-          "text": "SELECT machine_id, manifest_key, revision::text AS revision, encode(content_sha256, 'hex') AS content_sha256\n       FROM sessions.session_index\n      WHERE org_id = $1 AND workspace_id = $2 AND harness = $3 AND session_id = $4 AND deleted_at IS NULL ORDER BY machine_id LIMIT 64",
+          "text": "SELECT machine_id, manifest_key, revision::text AS revision, encode(content_sha256, 'hex') AS content_sha256, manifest_etag\n       FROM sessions.session_index\n      WHERE org_id = $1 AND workspace_id = $2 AND harness = $3 AND session_id = $4 AND deleted_at IS NULL ORDER BY machine_id LIMIT 64",
           "params": [
             "org-a",
             "ws-a",

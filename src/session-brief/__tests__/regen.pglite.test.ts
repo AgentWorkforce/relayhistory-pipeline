@@ -18,7 +18,7 @@ import { briefConfigHash, briefRegenFromEnv, type BriefRegen } from "../regen.ts
 import { armWakeup, recordBrief } from "../store.ts";
 import { SESSION_BRIEF_ENGINE_VERSION, SESSION_BRIEF_PROMPT_VERSION } from "../versions.ts";
 import { briefTick } from "../worker.ts";
-import { FakeModel, KEY, database, dueNow, hoopDb, mapReader, pointer, tempStore, testConfig, transcript } from "./harness.ts";
+import { FakeModel, KEY, database, dueNow, hoopDb, mapReader, pointer, tempStore, testConfig, transcript, indexedFrom } from "./harness.ts";
 
 setDefaultTimeout(120_000);
 
@@ -51,7 +51,7 @@ async function setup() {
     revision += 1;
     const manifestKey = `manifest/${KEY.sessionId}/m-1/r${revision}`;
     manifests.set(manifestKey, await transcript(store, conversation(turns), { machine: "m-1", revision }));
-    await pointer(pg, { machine: "m-1", revision, manifestKey, contentSha256: manifests.get(manifestKey)!.raw.content_sha256 });
+    await pointer(pg, { machine: "m-1", revision, manifestKey, ...indexedFrom(manifests.get(manifestKey)!) });
     await armWakeup(hoopDb(pg), KEY, { idleSeconds: 600, maxWaitSeconds: 3600 });
   };
   const tick = (r: BriefRegen | null, opts: { sweep?: boolean; now?: Date; via?: (db: HoopDb) => HoopDb } = {}) =>
