@@ -271,6 +271,28 @@ describe("partialCanonicalDeps: the Lambda source over canonicalSnapshot", () =>
     expect(outside).toEqual([]);
   });
 
+  test("session and machine: a row for another session is refused before any GET; a row naming another session's or machine's manifest is refused after one manifest GET, with no chunk read", async () => {
+    // Another real session in the same org, workspace and harness (its own manifest object).
+    const other = { ...location, sessionId: "sess_2" };
+    const otherManifest = { ...manifest, session: { ...manifest.session, session_id: "sess_2" }, extensions: { "96bulls": { user_id: "user_1", canonical_session_id: "sess:2" } } };
+    await store.put(objectKey(manifestKey(other)), new TextEncoder().encode(JSON.stringify(otherManifest)), {});
+    const keys: string[] = [];
+    const spy = new Proxy(store, { get(t, k) { const v = Reflect.get(t, k); return k === "getObject" ? (key: unknown, ...a: unknown[]) => { keys.push(String(key)); return (v as (...x: unknown[]) => unknown).call(t, key, ...a); } : v; } });
+    const run = async (row: Record<string, unknown>) => { keys.length = 0; const got = await refusal(lambdaSource({ store: spy, rows: () => [row] }).read()); return { got, keys: [...keys] }; };
+
+    // (1) The row itself is for another session (session_id is the canonical id the read role returns): refused pre-GET.
+    expect(await run({ ...pointerRow, session_id: "sess:2", manifest_key: manifestKey(other) })).toEqual({ got: { class: "forbidden", codes: ["tenant_mismatch"] }, keys: [] });
+    // (2) The row claims this session but names the other session's manifest: one manifest GET, then refused.
+    expect(await run({ ...pointerRow, manifest_key: manifestKey(other) })).toEqual({ got: { class: "forbidden", codes: ["manifest_mismatch"] }, keys: [manifestKey(other)] });
+    // (3) The row's machine differs from the manifest's: one manifest GET, then refused.
+    expect(await run({ ...pointerRow, machine_id: "srv_cc" })).toEqual({ got: { class: "forbidden", codes: ["manifest_mismatch"] }, keys: [manifestKey(location)] });
+    // (4) The row names this session's manifest under another machine's key (m=), absent here: one GET, nothing served.
+    const otherMachineKey = String(pointerRow.manifest_key).replace("/m=srv_bb/", "/m=srv_cc/");
+    expect(await run({ ...pointerRow, manifest_key: otherMachineKey })).toEqual({ got: { class: "missing", codes: ["object_missing"] }, keys: [otherMachineKey] });
+    // No chunk key was ever requested in any case.
+    expect(keys.some((k) => k.includes("/raw/"))).toBe(false);
+  });
+
   test("key scope admits the caller's upload-generation publication manifests", async () => {
     const { parseSessionKey } = await import("../../../packages/object-store/src/index.ts");
     const at = parseSessionKey(String(pointerRow.manifest_key))!;
