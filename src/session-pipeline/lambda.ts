@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import {createSemanticClickHouseClient} from "../search-features/semantic-copy-ch.ts";
 import {SemanticPostgresExecutor} from "../search-features/semantic-copy-postgres.ts";
 import { largeReadJobState, routeLargeRead } from "./large-read-worker.ts";
@@ -921,17 +922,25 @@ export interface ReconcileDeps {
    * every live scope whose search projection is missing, incomplete or stale for its CURRENT source, even when its
    * pointer ETag matches. `cursor` resumes a chain; `pageSize` bounds one query (default 500 scopes).
    */
-  projection?: { cursor?: string; pageSize?: number };
+  /** `seed` (32 hex): where a FRESH chain starts in md5 order; default md5(since), so it rotates per schedule. */
+  projection?: { cursor?: string; pageSize?: number; seed?: string };
   /** A chain link that only continues leg 3 (no listing cursor left): legs 1 and 2 already completed this chain. */
   projectionOnly?: boolean;
 }
 
-/** Leg 3's keyset cursor: the last examined scope (org, workspace, harness, canonical session), JSON. */
-type ProjectionCursor = [string, string, string, string];
-function projectionCursor(raw: string | undefined): ProjectionCursor {
-  if (!raw) return ["", "", "", ""];
-  const v = JSON.parse(raw) as unknown;
-  if (!Array.isArray(v) || v.length !== 4 || v.some((x) => typeof x !== "string")) throw new Error("reconcile: invalid projection cursor");
+/**
+ * Leg 3's cursor (JSON): the rotation seed, the phase, and the last scope actually PROCESSED (its hint sent).
+ * Scopes are scanned in md5 order of their key, starting just after `seed` (phase 0: h > seed) and wrapping
+ * (phase 1: h <= seed), so each fresh schedule starts at a different point of the keyspace: a chain cut off by
+ * MAX_RECONCILE_LINKS never starves the same tail. `last` = [h, org, workspace, harness, canonical session].
+ */
+interface ProjectionCursor { seed: string; phase: 0 | 1; last?: [string, string, string, string, string] }
+function projectionCursor(raw: string | undefined, seed: string): ProjectionCursor {
+  if (!raw) return { seed, phase: 0 };
+  const v = JSON.parse(raw) as Partial<ProjectionCursor>;
+  const okLast = v.last === undefined || (Array.isArray(v.last) && v.last.length === 5 && v.last.every((x) => typeof x === "string"));
+  if (typeof v.seed !== "string" || !/^[0-9a-f]{32}$/.test(v.seed) || (v.phase !== 0 && v.phase !== 1) || !okLast)
+    throw new Error("reconcile: invalid projection cursor");
   return v as ProjectionCursor;
 }
 
@@ -1031,42 +1040,61 @@ export async function reconcileRecent(deps: ReconcileDeps): Promise<ReconcileSum
   return summary;
 }
 
-/** Leg 3 (see reconcileRecent): bounded by pageSize per query and by the link's deadline; resumable by cursor. */
+/**
+ * Leg 3 (see reconcileRecent). Bounded: pageSize per query, and the link deadline checked BEFORE EVERY hint; on expiry
+ * the cursor names the last scope whose hint was sent, so the next link resumes with exactly the remainder.
+ */
 async function reconcileProjections(deps: ReconcileDeps, summary: ReconcileSummary, deadline: number, now: () => number): Promise<void> {
   const pageSize = deps.projection!.pageSize ?? 500;
-  let cursor: ProjectionCursor = projectionCursor(deps.projection!.cursor);
+  const seed = deps.projection!.seed ?? createHash("md5").update(deps.since.toISOString()).digest("hex");
+  const c = projectionCursor(deps.projection!.cursor, seed);
   summary.projectionScanned = 0;
   summary.projectionStale = 0;
+  const stop = () => { summary.nextProjectionCursor = JSON.stringify(c); summary.projectionComplete = false; };
   for (;;) {
-    if (now() > deadline) { summary.nextProjectionCursor = JSON.stringify(cursor); summary.projectionComplete = false; return; }
-    const { rows } = await deps.db.query<{ org_id: string; workspace_id: string; harness: string; sid: string; key: string; stale: boolean }>(
+    if (now() > deadline) return stop();
+    const last = c.last ?? ["", "", "", "", ""];
+    const { rows } = await deps.db.query<{ h: string; org_id: string; workspace_id: string; harness: string; sid: string; key: string; stale: boolean }>(
       `WITH live AS (
          SELECT p.org_id, p.workspace_id, p.harness, coalesce(p.canonical_session_id, p.session_id) AS sid,
                 min(p.manifest_key) AS key, jsonb_object_agg(p.manifest_key, p.revision::text) AS sources
            FROM sessions.session_index p
-          WHERE p.deleted_at IS NULL AND p.manifest_key LIKE $5
-            AND (p.org_id, p.workspace_id, p.harness, coalesce(p.canonical_session_id, p.session_id)) > ($1, $2, $3, $4)
-          GROUP BY 1, 2, 3, 4
-          ORDER BY 1, 2, 3, 4
-          LIMIT $6)
-       SELECT l.org_id, l.workspace_id, l.harness, l.sid, l.key,
+          WHERE p.deleted_at IS NULL AND p.manifest_key LIKE $1
+          GROUP BY 1, 2, 3, 4),
+       hashed AS (
+         SELECT l.*, md5(l.org_id || chr(31) || l.workspace_id || chr(31) || l.harness || chr(31) || l.sid) AS h FROM live l),
+       page AS (
+         SELECT * FROM hashed
+          WHERE (CASE WHEN $2::int = 0 THEN h > $3 ELSE h <= $3 END)
+            AND (h, org_id, workspace_id, harness, sid) > ($4, $5, $6, $7, $8)
+          ORDER BY h, org_id, workspace_id, harness, sid
+          LIMIT $9)
+       SELECT g.h, g.org_id, g.workspace_id, g.harness, g.sid, g.key,
               NOT EXISTS (SELECT 1 FROM sessions.session_directory d
-                           WHERE d.org_id = l.org_id AND d.workspace_id = l.workspace_id AND d.harness = l.harness AND d.session_id = l.sid
+                           WHERE d.org_id = g.org_id AND d.workspace_id = g.workspace_id AND d.harness = g.harness AND d.session_id = g.sid
                              AND d.deleted_at IS NULL AND d.event_projection_ready AND d.event_projection_version = 1
-                             AND d.event_projection_sources = l.sources) AS stale
-         FROM live l
-        ORDER BY 1, 2, 3, 4`,
-      [...cursor, `${deps.keyPrefix}/%`, pageSize],
+                             AND d.event_projection_sources = g.sources) AS stale
+         FROM page g
+        ORDER BY g.h, g.org_id, g.workspace_id, g.harness, g.sid`,
+      [`${deps.keyPrefix}/%`, c.phase, c.seed, ...last, pageSize],
     );
     for (const r of rows) {
+      // The deadline is checked before every hint, so a slow page never runs the link past its timeout.
+      if (r.stale && now() > deadline) return stop();
       summary.projectionScanned += 1;
-      cursor = [r.org_id, r.workspace_id, r.harness, r.sid];
-      if (!r.stale) continue;
-      summary.projectionStale += 1;
-      await deps.send(JSON.stringify({ [RECONCILE_BODY_KEY]: { key: r.key } }));
-      summary.enqueued += 1;
+      if (r.stale) {
+        summary.projectionStale += 1;
+        await deps.send(JSON.stringify({ [RECONCILE_BODY_KEY]: { key: r.key } }));
+        summary.enqueued += 1;
+      }
+      // Advanced only after this row is fully processed (its hint sent, or nothing to send).
+      c.last = [r.h, r.org_id, r.workspace_id, r.harness, r.sid];
     }
-    if (rows.length < pageSize) { summary.projectionComplete = true; return; }
+    if (rows.length < pageSize) {
+      if (c.phase === 0) { c.phase = 1; c.last = undefined; continue; }
+      summary.projectionComplete = true;
+      return;
+    }
   }
 }
 

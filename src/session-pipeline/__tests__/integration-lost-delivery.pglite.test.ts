@@ -111,10 +111,10 @@ async function rig() {
    * `legacy`: the two pre-fix legs only (the red baseline). Default: search enabled, so leg 3 (projection recovery) runs,
    * as runReconcile does when rt.deps.search is set.
    */
-  const reconcile = async (path: "standard" | "fifo", skipCurrent = false, opts: { legacy?: boolean; projection?: { cursor?: string; pageSize?: number }; projectionOnly?: boolean; now?: () => number; deadlineMs?: number } = {}) => {
+  const reconcile = async (path: "standard" | "fifo", skipCurrent = false, opts: { legacy?: boolean; projection?: { cursor?: string; pageSize?: number; seed?: string }; projectionOnly?: boolean; now?: () => number; deadlineMs?: number; onSend?: (body: string) => void } = {}) => {
     const bodies: string[] = [];
     const summary = await reconcileRecent({ store: r.store, db: { query: (t: string, p?: unknown[]) => r.pg.query(t, p as unknown[]) } as never,
-      keyPrefix: "96bulls", since: new Date("2026-01-01T00:00:00.000Z"), send: async (b) => { bodies.push(b); },
+      keyPrefix: "96bulls", since: new Date("2026-01-01T00:00:00.000Z"), send: async (b) => { bodies.push(b); opts.onSend?.(b); },
       ...(opts.legacy ? {} : { projection: opts.projection ?? {} }), ...(opts.projectionOnly ? { projectionOnly: true } : {}),
       ...(opts.now ? { now: opts.now } : {}), ...(opts.deadlineMs !== undefined ? { deadlineMs: opts.deadlineMs } : {}) });
     lastSummary = summary;
@@ -224,29 +224,49 @@ for (const path of ["standard", "fifo"] as const) {
       expect(await t.hits("markerb")).toEqual(["markerb"]);
     }, 60_000);
 
-    test("leg 3 is BOUNDED and RESUMABLE: three stale scopes, pageSize 1, the deadline after the first page hands off a cursor; the next link (projection-only: legs 1 and 2 not repeated) resumes and covers the rest, in key order", async () => {
+    test("leg 3 deadline is checked PER HINT: 3 stale scopes in ONE page, each send costs 6 ms against a 5 ms deadline; the link stops mid-page after its first hint and the next link sends EXACTLY the remaining two (no duplicate, no gap); all recovered; quiet", async () => {
       const t = await rig();
       const keys: string[] = [];
       for (const sess of ["sess_1", "sess_2", "sess_3"]) keys.push(await t.r.writeManifest(1, { ...loc, sessionId: sess }, `marker${sess.slice(-1)}`, `marker${sess.slice(-1)}x`));
-      // Pointers current, projections missing: search crashed for all three, messages lost.
       t.failSearch.on = true;
       for (const k of keys) await (path === "standard" ? t.standard(k, await t.etag(k), false) : t.fifo(k, await t.etag(k), 1, false));
       t.failSearch.on = false;
-      // Link 1 (leg 3 only, so the clock below counts its pages): the deadline passes after the first page.
       let clock = 0;
-      const first = await t.reconcile(path, false, { projection: { pageSize: 1 }, projectionOnly: true, deadlineMs: 5, now: () => (clock += 3) });
+      const sent: string[] = [];
+      const onSend = (b: string) => { clock += 6; sent.push((JSON.parse(b) as { reconcile: { key: string } }).reconcile.key); };
+      const first = await t.reconcile(path, false, { projection: { pageSize: 500 }, projectionOnly: true, deadlineMs: 5, now: () => clock, onSend });
       const s1 = t.summary();
       expect(first.hints).toBe(1);
-      expect(s1.projectionComplete).toBe(false);
+      expect(s1).toMatchObject({ projectionComplete: false });
       expect(s1.nextProjectionCursor).toBeDefined();
-      // Link 2: projection-only, from the cursor; no listing (legs 1 and 2 skipped).
-      const second = await t.reconcile(path, false, { projection: { pageSize: 1, cursor: s1.nextProjectionCursor! }, projectionOnly: true });
-      const s2 = t.summary();
-      expect(s2).toMatchObject({ projectionComplete: true, pages: 0, listed: 0, pointersChecked: 0 });
-      expect(first.hints + second.hints).toBe(3);
+      const second = await t.reconcile(path, false, { projection: { pageSize: 500, cursor: s1.nextProjectionCursor! }, projectionOnly: true, deadlineMs: 1_000, now: () => clock, onSend });
+      expect(second.hints).toBe(2);
+      expect(t.summary()).toMatchObject({ projectionComplete: true, pages: 0, listed: 0, pointersChecked: 0 });
+      expect(new Set(sent).size).toBe(3);
+      expect(sent.length).toBe(3);
       for (const n of ["1", "2", "3"]) expect(await t.hits(`marker${n}x`)).toEqual([`marker${n}x`]);
-      // Quiet afterwards.
       expect((await t.reconcile(path)).hints).toBe(0);
+    }, 60_000);
+
+    test("leg 3 ROTATES its start with the seed (no fixed tail): for each scope, a seed just below its key hash makes it the FIRST scope a fresh chain visits; the wrap phase still covers the rest", async () => {
+      const t = await rig();
+      const sessions = ["sess_1", "sess_2", "sess_3"];
+      const keys: string[] = [];
+      for (const sess of sessions) keys.push(await t.r.writeManifest(1, { ...loc, sessionId: sess }, `marker${sess.slice(-1)}`, `marker${sess.slice(-1)}x`));
+      t.failSearch.on = true;
+      for (const k of keys) await (path === "standard" ? t.standard(k, await t.etag(k), false) : t.fifo(k, await t.etag(k), 1, false));
+      t.failSearch.on = false;
+      const { createHash } = await import("node:crypto");
+      const h = (sid: string) => createHash("md5").update(["org_1", "ws_1", "claude", sid].join(String.fromCharCode(31))).digest("hex");
+      const below = (hex: string) => (BigInt(`0x${hex}`) - 1n).toString(16).padStart(32, "0");
+      for (const sid of sessions) {
+        const order: string[] = [];
+        await reconcileRecent({ store: t.r.store, db: { query: (q: string, p?: unknown[]) => t.r.pg.query(q, p as unknown[]) } as never, keyPrefix: "96bulls",
+          since: new Date("2026-01-01T00:00:00.000Z"), projectionOnly: true, projection: { seed: below(h(sid)) },
+          send: async (b) => { order.push((JSON.parse(b) as { reconcile: { key: string } }).reconcile.key); } });
+        expect(order.length).toBe(3);
+        expect(order[0]).toContain(`s=${sid}`);
+      }
     }, 60_000);
 
     test("FENCES at pickup: a scope hinted as stale is DELETED before pickup (erase path, nothing revived), and another is REPLACED before pickup (the pickup indexes the current source)", async () => {
