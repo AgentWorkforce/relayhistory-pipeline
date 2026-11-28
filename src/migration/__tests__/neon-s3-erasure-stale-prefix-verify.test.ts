@@ -19,6 +19,7 @@ import {
   attestationProblem, chunkRecords, compareMultisets, evaluateLifecycle, parseReceipt, type AttestedActor, type ProtectionAttestation, type VerificationReceipt,
 } from "../neon-s3-erasure/stale-prefix-verify.ts";
 import { SyncState } from "../neon-s3-sync/state.ts";
+import { signRequest } from "../../../packages/object-store/src/sigv4.ts";
 import { FakeS3Versions } from "./fake-s3-versions.ts";
 import { approvedFor, attestation, BUCKET_SHA, buildCopy, line, seedBodies, TARGET } from "./stale-prefix-fixture.ts";
 
@@ -884,5 +885,74 @@ describe("hard deadline", () => {
         expect(rep.versions.map((v) => v.outcome)).toEqual(["deleted", "not_attempted", "not_attempted"]);
       }
     }
+  });
+});
+
+describe("issuance after signing (eraser request path)", () => {
+  test("adapter: a slow signing step that crosses the caller's gate means ZERO fetch calls for that DELETE; fast signing passes", async () => {
+    for (const slowMs of [2_100, 0]) {
+      const s = new FakeS3Versions();
+      const key = `${pfx("2026/11/01")}raw/x.ndjson.zst`;
+      const id = s.put(key, OLD, undefined, new Uint8Array([1]));
+      const clock = { now: NOW };
+      const eraser = s.eraser({ signer: async (args) => { clock.now += slowMs; await signRequest(args); } });
+      const checkedAt = clock.now;
+      // The caller's gate: at most 2 s since its check; it returns the time left to an absolute deadline.
+      const beforeFetch = () => { if (clock.now - checkedAt > 2_000) throw Object.assign(new Error("late"), { code: "stale_prefix_deadline" }); return 60_000; };
+      const run = eraser.deleteVersion(key, id, { beforeFetch });
+      if (slowMs) {
+        await expect(run).rejects.toMatchObject({ code: "stale_prefix_deadline" });
+        expect(s.deletes).toEqual([]);
+        expect(s.count(key)).toBe(1);
+      } else {
+        await run;
+        expect(s.deletes).toEqual([`${key}@${id}`]);
+      }
+    }
+  });
+
+  test("adapter: no time left to the absolute deadline after signing: fetch is never called", async () => {
+    const s = new FakeS3Versions();
+    const key = `${pfx("2026/11/01")}raw/x.ndjson.zst`;
+    const id = s.put(key, OLD, undefined, new Uint8Array([1]));
+    await expect(s.eraser().deleteVersion(key, id, { beforeFetch: () => 0 })).rejects.toMatchObject({ code: "stale_prefix_deadline" });
+    expect(s.deletes).toEqual([]);
+  });
+
+  test("job: slow signing of delete 2 (2.1 s after its check) is refused after signing: that DELETE is never fetched, not_attempted, partial", async () => {
+    for (const slow of [true, false]) {
+      const f = await fixture();
+      const m = f.dateMove();
+      const receipt = await f.verify();
+      let deletesSigned = 0;
+      const fence = f.s.eraser({ signer: async (args) => { if (args.method === "DELETE" && ++deletesSigned === 2 && slow) f.clock.now += 2_100; await signRequest(args); } });
+      const r = await f.execute(receipt, { fence });
+      const rep = r.fenced![0]!;
+      if (slow) {
+        expect(deletesSigned).toBe(2);
+        expect(f.s.deletes).toHaveLength(1); // the second DELETE was signed but never fetched
+        expect(rep).toMatchObject({ outcome: "partial", reason: "stale_prefix_deadline", deleted: 1 });
+        expect(rep.versions.map((v) => v.outcome)).toEqual(["deleted", "not_attempted", "not_attempted"]);
+        expect(f.s.count(m.oldP)).toBe(2);
+      } else {
+        expect(r).toMatchObject({ ok: true, erased: 1 });
+        expect(f.s.deletes).toHaveLength(3);
+      }
+    }
+  });
+
+  test("ambiguous DELETE: the diagnostic relist goes through the same gate; gated past the deadline it records unknown and issues no further request", async () => {
+    const f = await fixture();
+    const m = f.dateMove();
+    const receipt = await f.verify();
+    let listsAtDelete = -1;
+    f.s.onDelete = () => { listsAtDelete = f.s.lists; f.clock.now = NOW + 2 * 3_600_000; return "transport"; };
+    const r = await f.execute(receipt);
+    const rep = r.fenced![0]!;
+    expect(rep).toMatchObject({ outcome: "partial", reason: "stale_prefix_delete_ambiguous", deleted: 0 });
+    expect(rep.versions.map((v) => v.outcome)).toEqual(["unknown", "not_attempted", "not_attempted"]);
+    expect(f.s.lists).toBe(listsAtDelete); // the relist was refused before fetch; nothing after it
+    expect(f.s.deletes).toHaveLength(1);
+    expect(f.s.count(m.oldP)).toBe(2);
   });
 });

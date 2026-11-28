@@ -5,7 +5,7 @@
  * documents them, and 400 for a version marker that no longer exists. Fault hooks let a test
  * corrupt a later page, repeat markers, inject foreign keys, or lose a DELETE acknowledgement.
  */
-import { createS3Eraser, createS3VersionReader } from "../neon-s3-erasure/eraser.ts";
+import { createS3Eraser, createS3VersionReader, type S3EraserConfig } from "../neon-s3-erasure/eraser.ts";
 
 export interface FakeVersion { id: string; at: number; marker?: boolean; etag?: string; body?: Uint8Array }
 
@@ -110,7 +110,7 @@ export class FakeS3Versions {
     return createS3VersionReader({ bucket: "b", region: "us-east-1", endpoint: "http://fake-s3.local", credentials: { accessKeyId: "a", secretAccessKey: "s" }, fetch: this.fetch });
   }
 
-  eraser(opts: { requestDeadlineMs?: number } = {}) {
+  eraser(opts: { requestDeadlineMs?: number; signer?: S3EraserConfig["signer"] } = {}) {
     return createS3Eraser({ bucket: "b", region: "us-east-1", endpoint: "http://fake-s3.local", credentials: { accessKeyId: "a", secretAccessKey: "s" }, fetch: this.fetch, ...opts });
   }
 }
