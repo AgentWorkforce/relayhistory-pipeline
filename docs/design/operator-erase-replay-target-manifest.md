@@ -1,4 +1,4 @@
-# Operator erase replay target manifest — draft 5
+# Operator erase replay target manifest — draft 6
 
 ## Status and ownership
 
@@ -507,18 +507,24 @@ window comparisons. The agreed outer field structure is `v:1`,
 `kind:"session_replay_qualification"`, `page`, `window`, `window_checks`,
 and `effect`. `page` is the section 6.1 response verbatim; `window` is status
 verbatim. `window_checks` contains boolean `epoch_matches`,
-`history_cutoff_matches`, and `history_full_ordered` computed in SQL; missing
-or unknown comparisons cannot become true. There are no caller-supplied FULL
+`history_cutoff_matches`, and `history_full_ordered` computed in SQL; NULL or
+unknown comparisons become false. The bridge distinguishes `history_unbound`
+from mismatch using null `window.erasure_history.fence_at` or `selected_full`,
+not a nullable boolean. There are no caller-supplied FULL
 values in the producer reader: the bridge compares selected FULL values with
 its own dispatch.
 
 `effect` contains `v:1`, a closed `status`, boolean `request_id_matches`,
 canonical nonnegative bigint-text `alias_fence_count`, and `binding_sha256`.
-The initial missing-mapping verdict has false/`"0"`/null proof fields and
-`status:"effect_mapping_missing"`. A positive verdict requires a real complete
-effect association, the exact declared/covered alias count, and a lowercase
-64-hex binding digest from the reviewed effect encoding. It is not a hash of
-booleans or counts. The exact refusal enumeration, provenance-read schema and
+`binding_sha256` is null **exactly when** status is not `effect_proven`;
+`alias_fence_count` is `"0"` for every unproven verdict. The initial missing
+verdict also has a false request-match field and `status:"effect_mapping_missing"`.
+A positive verdict requires a real complete effect association, the exact
+declared/covered alias count and a lowercase 64-hex binding digest computed
+**in the SQL co-read** over the specified versioned, length-framed actual effect
+proof. The bridge also checks the count against `page.alias_ids.length` without
+lossy conversion. It is not a hash of booleans or counts. The v2 receipt binds
+that digest. The exact refusal enumeration, provenance-read schema and
 effect bytes must be reviewed before any positive verdict is implemented.
 A source lacking a proved request-to-effect join stays unproven. No raw
 plural `effects` object or xid/count summary substitutes for this verdict.
@@ -651,9 +657,10 @@ or expand it to all runtime writers without an explicit reviewed scope change.
 Future covering proofs can extend this matrix only with versioned evidence,
 qualified request attribution and the same bidirectional reconciliation.
 
-The consumer may compute `binding_sha256` only over the concrete evidence it
-actually validated, using the producer/consumer's agreed byte-exact encoding
-and version. It must bind the accepted manifest/request/scope and attributed
+The consumer-owned co-read computes `binding_sha256` **in SQL**, only over the
+concrete evidence actually validated, using the producer/consumer's agreed
+byte-exact versioned, length-framed encoding and shared test vector. It must
+bind the accepted manifest/request/scope and attributed
 effect facts, not a guessed complete set or a hash of the expected counts.
 Until the physical provenance/read contract and vectors exist, keep it null
 and qualification unproven. Missing required coverage also leaves the runtime
@@ -890,6 +897,12 @@ Neither the session manifest nor 062320's shared org lock can stand in for it.
   refuse unless uniquely attributed and reconciled in both directions. Cover
   each of the 15 source rows in the matrix, including required-zero failures.
   Preseeded receipts never bypass these negatives or allow any object I/O.
+- Wrapper negatives: non-null effect digest for unproven status; null/non-hex
+  digest for proven status; alias-count mismatch or malformed/overflow text;
+  and unknown SQL comparisons. Unproven counts are `"0"`, strict booleans
+  remain false, and unbound is diagnosed from structured window nulls. Prove
+  the effect-digest vector against the actual SQL encoding before enabling
+  a positive verdict, not a hash reconstructed from a client summary.
 - A racing source write between proof and release, transient/deleted source
   rows, history-event versus alias/group cardinality, and an erase predating
   the replay window. The final exclusive-key check uses authoritative 062340
@@ -984,3 +997,8 @@ bridge behavior, release gate or live state.
   unknown future matching tables must still fail classification. The consumer
   owns draining, preparation, v2 receipts and release; no frozen reader change
   or producer-owned migration qualifier is required.
+  The classification edit touches the consumer landing unit's
+  `src/session-ingest/erasure-window.ts` and its test. Stack it on the
+  `f98d54af` landing unit, or on main after that unit lands; do not rewrite
+  the frozen head or copy an older incompatible file over it. Coordinate
+  ancestry and review with the consumer before the producer push.
