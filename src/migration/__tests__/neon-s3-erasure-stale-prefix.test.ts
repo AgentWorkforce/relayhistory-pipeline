@@ -17,12 +17,13 @@ import { createFsStore } from "../../../packages/object-store/src/fs.ts";
 import { objectKey } from "../../shared/vendor.ts";
 import type { ErasureAuthority } from "../neon-s3-erasure/authority.ts";
 import { storeEraser, type LiveObjectProbe } from "../neon-s3-erasure/eraser.ts";
-import { DEFAULT_ERASURE_CONFIG, ErasureJob, sessionPrefixParts, staleprefixIdentityHash } from "../neon-s3-erasure/job.ts";
+import { DEFAULT_ERASURE_CONFIG, ErasureJob, sessionPrefixParts, STALE_RUN_LEASE, staleprefixIdentityHash, type StalePrefixPassOptions } from "../neon-s3-erasure/job.ts";
 import { exitStatusForError, staleprefixOptions, stalePassStatus } from "../neon-s3-erasure/main.ts";
 import { ShortLivedCredentialError } from "../short-lived-credentials.ts";
 import { LEASE_TTL_MS, SyncState } from "../neon-s3-sync/state.ts";
 import { FORBIDDEN_CREDENTIAL_ENV } from "../stdin-credentials.ts";
 import { FakeS3Versions } from "./fake-s3-versions.ts";
+import { attestation, BUCKET_SHA, buildCopy, seedBodies } from "./stale-prefix-fixture.ts";
 
 // The mode runs only with S3X_OBLIGATIONS off: pinned per module, re-applied before every test, restored after.
 const OBLIGATIONS_MODE = "off";
@@ -69,11 +70,9 @@ function dump(path: string): Record<string, string[]> {
 const rowsOf = (path: string, table: string) => dump(path)[table]!;
 const erasureRow = (st: SyncState, key: string) => st.db.prepare("SELECT * FROM erasures WHERE key = ?").get(key) as Record<string, unknown> | undefined;
 
-/** A session copy in the bucket: manifest plus two chunks. */
+/** A session copy in the bucket: a real manifest plus two raw chunks (stale-prefix-fixture.ts), identical records per session. */
 function seedCopy(s: FakeS3Versions, prefix: string) {
-  s.put(`${prefix}manifest.json`, OLD);
-  s.put(`${prefix}raw/c-0001.ndjson.zst`, OLD);
-  s.put(`${prefix}raw/c-0002.ndjson.zst`, OLD);
+  seedBodies(s, prefix, OLD);
 }
 
 async function fixture() {
@@ -83,6 +82,19 @@ async function fixture() {
   const logs: Logged[] = [];
   const calls: string[] = [];
   const job = (now = NOW) => new ErasureJob(authority(calls), st, s.eraser(), (f) => void logs.push(f as Logged), DEFAULT_ERASURE_CONFIG, () => now, async () => {});
+  /**
+   * The pass as the CLI runs it. Dry: unchanged. Execute: the read-only verifier first (its reads and log lines are
+   * then reset, so assertions see only the execute), then the receipt-fenced execute with a fresh attestation.
+   */
+  const exec = async (opts: StalePrefixPassOptions, j = job()) => {
+    if (!opts.execute) return j.staleprefixPass(opts);
+    const logged = logs.length;
+    const receipt = opts.receipt ?? await j.staleprefixVerify({ onlyIdentities: opts.onlyIdentities, reader: s.reader(), bucketSha256: BUCKET_SHA });
+    logs.length = logged;
+    s.lists = 0;
+    s.gets = [];
+    return j.staleprefixPass({ receipt, fence: s.eraser(), bucketSha256: BUCKET_SHA, attestation: attestation(NOW), ...opts });
+  };
   /** The canonical date move: the group now exports NEW_P; OLD_P is queued stale; both copies are in the bucket. */
   const dateMove = (session = "sess-1", group = `g-${session}`, at = NOW - 60_000) => {
     const oldP = pfx("2026/11/01", session), newP = pfx("2026/11/02", session);
@@ -92,7 +104,7 @@ async function fixture() {
     st.enqueueErasure([{ key: oldP, kind: "prefix", org_id: ORG, reason: "stale_prefix" }], at);
     return { oldP, newP };
   };
-  return { path, st, s, logs, calls, job, dateMove };
+  return { path, st, s, logs, calls, job, exec, dateMove };
 }
 /** An identity no fixture session has: keeps an allowlist non-empty. */
 const NO_ID = "0".repeat(64);
@@ -121,7 +133,7 @@ describe("stale-prefixes-only mode", () => {
     const others = () => rowsOf(f.path, "erasures").filter((r) => !r.includes(JSON.stringify(oldP)));
     const before = others();
     const objectsBefore = f.s.count() - f.s.count(oldP);
-    const r = await f.job().staleprefixPass({ onlyIdentities: allIds(f.st), execute: true, probe: f.s.eraser() });
+    const r = await f.exec({ onlyIdentities: allIds(f.st), execute: true, probe: f.s.eraser() });
     expect(r).toMatchObject({ ok: true, selected: 1, due: 1, erased: 1, otherEntries: 4, skipped: {} });
     expect(others()).toEqual(before);
     expect(before.length).toBe(4);
@@ -135,8 +147,8 @@ describe("stale-prefixes-only mode", () => {
   test("happy path: only the old prefix is erased (every version), the row is done, the live copy and its pointer stay", async () => {
     const f = await fixture();
     const { oldP, newP } = f.dateMove();
-    f.s.put(`${oldP}manifest.json`, OLD + 1000); // two versions of the old manifest: both go
-    const r = await f.job().staleprefixPass({ onlyIdentities: allIds(f.st), execute: true, probe: f.s.eraser() });
+    f.s.put(`${oldP}manifest.json`, OLD + 1000, undefined, buildCopy(oldP).manifest); // two versions of the old manifest: both go
+    const r = await f.exec({ onlyIdentities: allIds(f.st), execute: true, probe: f.s.eraser() });
     expect(r).toMatchObject({ ok: true, eligible: 1, erased: 1, versionsDeleted: 4, siblingChecked: true });
     expect(f.s.count(oldP)).toBe(0);
     expect(f.s.count(newP)).toBe(3);
@@ -159,7 +171,7 @@ describe("stale-prefixes-only mode", () => {
     // release it; the mode never does.
     f.st.acquireLease(pfx("2026/10/01", "sess-9"), "eraser:424242", undefined, NOW - LEASE_TTL_MS);
     const metaBefore = rowsOf(f.path, "meta");
-    const r = await f.job().staleprefixPass({ onlyIdentities: allIds(f.st), execute: true, probe: f.s.eraser() });
+    const r = await f.exec({ onlyIdentities: allIds(f.st), execute: true, probe: f.s.eraser() });
     expect(r.erased).toBe(1);
     expect(f.calls.filter((c) => c !== "ready")).toEqual([]);
     expect(f.calls.length).toBeGreaterThan(0); // the per-page authority readiness gate still ran
@@ -175,7 +187,7 @@ describe("stale-prefixes-only mode", () => {
       if (where === "exported") f.st.markExported(ORG, "g-other", 1, [`${oldP}manifest.json`], NOW - 1000);
       else f.st.recordPendingKey(ORG, "g-other", `${oldP}raw/c-0003.ndjson.zst`);
       const before = dump(f.path);
-      const r = await f.job().staleprefixPass({ onlyIdentities: allIds(f.st), execute: true, probe: f.s.eraser() });
+      const r = await f.exec({ onlyIdentities: allIds(f.st), execute: true, probe: f.s.eraser() });
       expect(r).toMatchObject({ ok: true, erased: 0, skipped: { current_key: 1 } });
       expect(f.s.deletes).toEqual([]);
       expect(dump(f.path)).toEqual(before);
@@ -200,7 +212,7 @@ describe("stale-prefixes-only mode", () => {
       const probe = arrange(f, oldP, newP) ?? f.s.eraser();
       const before = dump(f.path);
       const oldCount = f.s.count(oldP);
-      const r = await f.job().staleprefixPass({ onlyIdentities: allIds(f.st), execute: true, probe });
+      const r = await f.exec({ onlyIdentities: allIds(f.st), execute: true, probe });
       expect(r).toMatchObject({ ok: true, erased: 0, skipped: { [reason]: 1 } });
       expect(f.s.deletes).toEqual([]);
       expect(f.s.count(oldP)).toBe(oldCount);
@@ -225,7 +237,7 @@ describe("stale-prefixes-only mode", () => {
         const before = dump(f.path);
         let probed = 0;
         const probe: LiveObjectProbe = { objectLive: async () => { probed += 1; return true; } };
-        const r = await f.job().staleprefixPass({ onlyIdentities: allIds(f.st), execute, ...(execute ? { probe } : {}) });
+        const r = await f.exec({ onlyIdentities: allIds(f.st), execute, ...(execute ? { probe } : {}) });
         expect(r).toMatchObject({ ok: true, eligible: 0, erased: 0, skipped: { no_live_sibling: 1 } });
         expect([f.s.lists, f.s.deletes.length, probed]).toEqual([0, 0, 0]);
         expect(f.s.count(OLD_P)).toBe(3);
@@ -243,7 +255,7 @@ describe("stale-prefixes-only mode", () => {
       { key: `${base()}/d=2026/11/01/`, kind: "prefix", org_id: ORG, reason: "stale_prefix" },
     ], NOW - 1000);
     const before = dump(f.path);
-    const r = await f.job().staleprefixPass({ onlyIdentities: allIds(f.st), execute: true, probe: f.s.eraser() });
+    const r = await f.exec({ onlyIdentities: allIds(f.st), execute: true, probe: f.s.eraser() });
     // The allowlist check runs first; an entry whose identity cannot be derived is exactly one shape_invalid would catch.
     expect(r).toMatchObject({ ok: true, erased: 0, skipped: { identity_unresolved: 2 } });
     expect(f.s.deletes).toEqual([]);
@@ -256,12 +268,12 @@ describe("stale-prefixes-only mode", () => {
   test("--max n: stops after n successful erases; the rest stay queued and in the bucket", async () => {
     const f = await fixture();
     const copies = ["sess-1", "sess-2", "sess-3"].map((s, i) => f.dateMove(s, `g-${s}`, NOW - 60_000 + i));
-    const r = await f.job().staleprefixPass({ onlyIdentities: allIds(f.st), execute: true, max: 2, probe: f.s.eraser() });
+    const r = await f.exec({ onlyIdentities: allIds(f.st), execute: true, max: 2, probe: f.s.eraser() });
     expect(r).toMatchObject({ ok: true, erased: 2, stoppedBy: "max" });
     expect(copies.map((c) => f.s.count(c.oldP))).toEqual([0, 0, 3]);
     expect(f.st.staleprefixErasures().map((e) => e.key)).toEqual([copies[2]!.oldP]);
     expect(erasureRow(f.st, copies[2]!.oldP)).toMatchObject({ attempts: 0, error: null, next_try: 0 });
-    await expect(f.job().staleprefixPass({ onlyIdentities: allIds(f.st), execute: true, max: 0, probe: f.s.eraser() })).rejects.toMatchObject({ code: "stale_prefix_mode_max_invalid" });
+    await expect(f.exec({ onlyIdentities: allIds(f.st), execute: true, max: 0, probe: f.s.eraser() })).rejects.toMatchObject({ code: "stale_prefix_mode_max_invalid" });
   });
 
   test("stops at the first failed erase: recorded as drain records it, later entries untouched, not ok", async () => {
@@ -270,7 +282,7 @@ describe("stale-prefixes-only mode", () => {
     const b = f.dateMove("sess-2", "g-2", NOW - 50_000);
     f.s.onDelete = (k) => (k.startsWith(a.oldP) ? "lose" : undefined);
     const bRow = JSON.stringify(erasureRow(f.st, b.oldP));
-    const r = await f.job().staleprefixPass({ onlyIdentities: allIds(f.st), execute: true, probe: f.s.eraser() });
+    const r = await f.exec({ onlyIdentities: allIds(f.st), execute: true, probe: f.s.eraser() });
     expect(r.ok).toBe(false);
     expect(r.erased).toBe(0);
     expect(r.stoppedBy).toBe("failed");
@@ -295,7 +307,7 @@ describe("stale-prefixes-only mode", () => {
     f.st.enqueueErasure([{ key: pfx("2026/10/20", "sess-8"), kind: "prefix", org_id: ORG, reason: "stale_prefix" }], NOW - 1000);
     f.st.erasureFailed(pfx("2026/10/20", "sess-8"), "x", NOW); // backing off
     const before = dump(f.path);
-    const r = await f.job().staleprefixPass({ onlyIdentities: allIds(f.st), execute: false });
+    const r = await f.exec({ onlyIdentities: allIds(f.st), execute: false });
     expect(f.s.deletes).toEqual([]);
     expect(f.s.lists).toBe(0);
     expect(dump(f.path)).toEqual(before);
@@ -312,7 +324,7 @@ describe("stale-prefixes-only mode", () => {
     const seen: string[] = [];
     f.s.onDelete = () => void seen.push(...(f.st.db.prepare("SELECT prefix, holder FROM leases WHERE prefix = ?").all(a.oldP) as { holder: string }[]).map((l) => l.holder));
     const bRow = JSON.stringify(erasureRow(f.st, b.oldP));
-    const r = await f.job().staleprefixPass({ onlyIdentities: allIds(f.st), execute: true, probe: f.s.eraser() });
+    const r = await f.exec({ onlyIdentities: allIds(f.st), execute: true, probe: f.s.eraser() });
     expect(r).toMatchObject({ ok: true, erased: 1, skipped: { lease_busy: 1 }, otherEraserLeases: 0 });
     expect(r.refused).toBeUndefined();
     expect(new Set(seen)).toEqual(new Set([`eraser:${process.pid}`]));
@@ -327,7 +339,7 @@ describe("stale-prefixes-only mode", () => {
     // Live by one millisecond under acquireLease's own expiry rule, on an unrelated prefix.
     f.st.acquireLease(pfx("2026/10/01", "sess-9"), "eraser:424242", undefined, NOW - LEASE_TTL_MS + 1);
     const before = dump(f.path);
-    const r = await f.job().staleprefixPass({ onlyIdentities: allIds(f.st), execute: true, probe: f.s.eraser() });
+    const r = await f.exec({ onlyIdentities: allIds(f.st), execute: true, probe: f.s.eraser() });
     expect(r).toMatchObject({ ok: false, refused: "stale_prefix_mode_other_eraser_lease", otherEraserLeases: 1, erased: 0, eligible: 0, versionsDeleted: 0, skipped: {} });
     expect(f.s.deletes).toEqual([]);
     expect(f.s.lists).toBe(0);
@@ -335,7 +347,7 @@ describe("stale-prefixes-only mode", () => {
     expect(f.s.count(a.oldP)).toBe(3);
     expect(f.logs.find((l) => l.message === "stale prefix pass refused")).toMatchObject({ error_code: "stale_prefix_mode_other_eraser_lease", other_eraser_leases: 1 });
     // The dry run does not refuse: it reports the count and writes nothing.
-    const dry = await f.job().staleprefixPass({ onlyIdentities: allIds(f.st), execute: false });
+    const dry = await f.exec({ onlyIdentities: allIds(f.st), execute: false });
     expect(dry).toMatchObject({ ok: true, otherEraserLeases: 1, eligible: 1 });
     expect(dry.refused).toBeUndefined();
     expect(passLine(f.logs)).toMatchObject({ execute: false, other_eraser_leases: 1 });
@@ -348,7 +360,7 @@ describe("stale-prefixes-only mode", () => {
       const a = f.dateMove("sess-1", "g-1", NOW - 60_000);
       const other = pfx("2026/10/01", "sess-9");
       f.st.acquireLease(other, holder, undefined, at);
-      const r = await f.job().staleprefixPass({ onlyIdentities: allIds(f.st), execute: true, probe: f.s.eraser() });
+      const r = await f.exec({ onlyIdentities: allIds(f.st), execute: true, probe: f.s.eraser() });
       expect(r).toMatchObject({ ok: true, erased: 1, otherEraserLeases: 0 });
       expect(r.refused).toBeUndefined();
       expect(f.s.count(a.oldP)).toBe(0);
@@ -361,8 +373,9 @@ describe("stale-prefixes-only mode", () => {
     const a = f.dateMove("sess-1", "g-1", NOW - 60_000);
     const b = f.dateMove("sess-2", "g-2", NOW - 50_000);
     const bRow = JSON.stringify(erasureRow(f.st, b.oldP));
+    const receipt = await f.job().staleprefixVerify({ onlyIdentities: allIds(f.st), reader: f.s.reader(), bucketSha256: BUCKET_SHA });
     f.st.exportedKeysOf = () => { throw Object.assign(new Error("state read"), { code: "state_read_failed" }); };
-    const r = await f.job().staleprefixPass({ onlyIdentities: allIds(f.st), execute: true, probe: f.s.eraser() });
+    const r = await f.exec({ onlyIdentities: allIds(f.st), execute: true, probe: f.s.eraser(), receipt });
     expect(r).toMatchObject({ ok: false, stoppedBy: "failed", erased: 0 });
     const aRow = erasureRow(f.st, a.oldP)!;
     expect(aRow).toMatchObject({ error: "state_read_failed", attempts: 1 });
@@ -370,12 +383,12 @@ describe("stale-prefixes-only mode", () => {
     expect(JSON.stringify(erasureRow(f.st, b.oldP))).toBe(bRow);
     expect(f.s.deletes).toEqual([]);
     expect(rowsOf(f.path, "leases")).toEqual([]);
-    await expect(f.job().staleprefixPass({ onlyIdentities: allIds(f.st), execute: false })).rejects.toMatchObject({ code: "state_read_failed" });
+    await expect(f.exec({ onlyIdentities: allIds(f.st), execute: false })).rejects.toMatchObject({ code: "state_read_failed" });
   });
 
   test("refusals in the job: S3X_OBLIGATIONS on, and --execute without an existence check", async () => {
     const f = await fixture();
-    await expect(f.job().staleprefixPass({ onlyIdentities: allIds(f.st), execute: true })).rejects.toMatchObject({ code: "stale_prefix_mode_requires_existence_check" });
+    await expect(f.exec({ onlyIdentities: allIds(f.st), execute: true })).rejects.toMatchObject({ code: "stale_prefix_mode_requires_existence_check" });
     const path = join(await mkdtemp(join(process.env.TMPDIR ?? tmpdir(), "e3-stale-on-")), "s.sqlite");
     const on = new SyncState(path, { obligations: true });
     const job = new ErasureJob(authority(), on, f.s.eraser(), () => {}, DEFAULT_ERASURE_CONFIG, () => NOW, async () => {});
@@ -423,13 +436,14 @@ describe("identity allowlist (--only-identity)", () => {
       const rows = () => [b.oldP, c.oldP].map((k) => JSON.stringify(erasureRow(f.st, k)));
       const before = rows();
       const dumpBefore = dump(f.path);
-      const r = await f.job().staleprefixPass({ execute, onlyIdentities: [ID_A], ...(execute ? { probe: f.s.eraser() } : {}) });
+      const r = await f.exec({ execute, onlyIdentities: [ID_A], ...(execute ? { probe: f.s.eraser() } : {}) });
       expect(r).toMatchObject({ ok: true, selected: 3, due: 3, eligible: 1, erased: execute ? 1 : 0, skipped: { not_in_identity_allowlist: 2 } });
       expect(rows()).toEqual(before);
       expect([f.s.count(b.oldP), f.s.count(c.oldP)]).toEqual([3, 3]);
       expect(f.s.count(a.oldP)).toBe(execute ? 0 : 3);
       expect(f.s.deletes.every((d) => d.startsWith(a.oldP))).toBe(true);
-      expect(leased).toEqual(execute ? [a.oldP] : []);
+      // Execute: the eraser-wide run lease, the old prefix, then the survivor prefix (kept from the exporter).
+      expect(leased).toEqual(execute ? [STALE_RUN_LEASE, a.oldP, a.newP] : []);
       if (!execute) expect(dump(f.path)).toEqual(dumpBefore);
       const skips = f.logs.filter((l) => l.message === "stale prefix skipped");
       expect(skips.map((l) => l.reason)).toEqual(["not_in_identity_allowlist", "not_in_identity_allowlist"]);
@@ -443,9 +457,9 @@ describe("identity allowlist (--only-identity)", () => {
     const b = f.dateMove("sess-2", "g-2", NOW - 50_000);
     f.st.acquireLease(b.oldP, "exporter:31337", undefined, NOW - 1000);
     const leased = leaseSpy(f.st);
-    const r = await f.job().staleprefixPass({ execute: true, onlyIdentities: [ID_A], probe: f.s.eraser() });
+    const r = await f.exec({ execute: true, onlyIdentities: [ID_A], probe: f.s.eraser() });
     expect(r).toMatchObject({ ok: true, erased: 0, skipped: { not_in_identity_allowlist: 1 } });
-    expect(leased).toEqual([]);
+    expect(leased).toEqual([STALE_RUN_LEASE]); // only the run lease: the unlisted entry is never leased
   });
 
   test("one identity with several queued prefixes: every due prefix of it is eligible and erased", async () => {
@@ -455,9 +469,9 @@ describe("identity allowlist (--only-identity)", () => {
     seedCopy(f.s, older);
     f.st.enqueueErasure([{ key: older, kind: "prefix", org_id: ORG, reason: "stale_prefix" }], NOW - 30_000);
     f.dateMove("sess-2", "g-2", NOW - 20_000);
-    const dry = await f.job().staleprefixPass({ execute: false, onlyIdentities: [ID_A] });
+    const dry = await f.exec({ execute: false, onlyIdentities: [ID_A] });
     expect(dry).toMatchObject({ eligible: 2, skipped: { not_in_identity_allowlist: 1 }, allowlistMatchedIdentities: 1 });
-    const r = await f.job().staleprefixPass({ execute: true, onlyIdentities: [ID_A], probe: f.s.eraser() });
+    const r = await f.exec({ execute: true, onlyIdentities: [ID_A], probe: f.s.eraser() });
     expect(r).toMatchObject({ ok: true, eligible: 2, erased: 2, skipped: { not_in_identity_allowlist: 1 }, allowlistSize: 1, allowlistMatchedIdentities: 1, allowlistUnmatched: 0 });
     expect([f.s.count(oldP), f.s.count(older), f.s.count(newP)]).toEqual([0, 0, 3]);
     expect(f.st.staleprefixErasures().map((e) => e.key)).toEqual([pfx("2026/11/01", "sess-2")]);
@@ -470,7 +484,7 @@ describe("identity allowlist (--only-identity)", () => {
     const older = pfx("2026/10/31", "sess-1");
     seedCopy(f.s, older);
     f.st.enqueueErasure([{ key: older, kind: "prefix", org_id: ORG, reason: "stale_prefix" }], NOW - 30_000);
-    const r = await f.job().staleprefixPass({ execute: true, max: 1, onlyIdentities: [ID_A], probe: f.s.eraser() });
+    const r = await f.exec({ execute: true, max: 1, onlyIdentities: [ID_A], probe: f.s.eraser() });
     expect(r).toMatchObject({ ok: true, erased: 1, stoppedBy: "max", skipped: { not_in_identity_allowlist: 1 } });
     expect([f.s.count(a.oldP), f.s.count(older)]).toEqual([0, 3]);
   });
@@ -480,7 +494,7 @@ describe("identity allowlist (--only-identity)", () => {
     f.dateMove("sess-1", "g-1", NOW - 60_000);
     f.dateMove("sess-2", "g-2", NOW - 50_000);
     f.st.erasureFailed(pfx("2026/11/01", "sess-2"), "x", NOW); // backing off: matched, not processed
-    const r = await f.job().staleprefixPass({ execute: true, onlyIdentities: [ID_A, ID_B, NO_ID], probe: f.s.eraser() });
+    const r = await f.exec({ execute: true, onlyIdentities: [ID_A, ID_B, NO_ID], probe: f.s.eraser() });
     expect(r).toMatchObject({ ok: true, selected: 2, due: 1, erased: 1, allowlistSize: 3, allowlistMatchedIdentities: 2, allowlistUnmatched: 1 });
     expect(passLine(f.logs)).toMatchObject({ allowlist_size: 3, allowlist_matched_identities: 2, allowlist_unmatched: 1 });
   });
@@ -494,19 +508,19 @@ describe("identity allowlist (--only-identity)", () => {
     const b = f.dateMove("sess-2", "g-2", NOW - 50_000);
     f.st.erasureFailed(b.oldP, "x", NOW); // B's only entry backs off
     const before = dump(f.path);
-    const dry = await f.job().staleprefixPass({ execute: false, onlyIdentities: [ID_A, ID_B] });
+    const dry = await f.exec({ execute: false, onlyIdentities: [ID_A, ID_B] });
     expect(dry).toMatchObject({ ok: true, eligible: 2, allowlistSize: 2, allowlistMatchedIdentities: 2, allowlistUnmatched: 0, allowlistEligibleIdentities: 1 });
     expect(passLine(f.logs)).toMatchObject({ eligible: 2, allowlist_size: 2, allowlist_matched_identities: 2, allowlist_unmatched: 0, allowlist_eligible_identities: 1 });
     expect(dump(f.path)).toEqual(before);
     // Execute: eligible identities are those with an erase.
-    const r = await f.job().staleprefixPass({ execute: true, onlyIdentities: [ID_A, ID_B], probe: f.s.eraser() });
+    const r = await f.exec({ execute: true, onlyIdentities: [ID_A, ID_B], probe: f.s.eraser() });
     expect(r).toMatchObject({ ok: true, erased: 2, allowlistEligibleIdentities: 1 });
     expect([f.s.count(a.oldP), f.s.count(older), f.s.count(b.oldP)]).toEqual([0, 0, 3]);
     // Both identities eligible: the gate equality holds.
     const g = await fixture();
     g.dateMove("sess-1", "g-1", NOW - 60_000);
     g.dateMove("sess-2", "g-2", NOW - 50_000);
-    expect(await g.job().staleprefixPass({ execute: false, onlyIdentities: [ID_A, ID_B] })).toMatchObject({ eligible: 2, allowlistSize: 2, allowlistEligibleIdentities: 2 });
+    expect(await g.exec({ execute: false, onlyIdentities: [ID_A, ID_B] })).toMatchObject({ eligible: 2, allowlistSize: 2, allowlistEligibleIdentities: 2 });
   });
 
   test("a sparse allowlist ([<hole>, A]) is refused at the job boundary: no queue read, no lease, no write, no erase", async () => {
@@ -524,7 +538,7 @@ describe("identity allowlist (--only-identity)", () => {
     expect(sparse.length).toBe(2);
     expect(sparse.every((h) => /^[0-9a-f]{64}$/.test(h))).toBe(true); // what the old check relied on
     for (const ids of [sparse, [ID_A, , ID_B] as string[]])
-      await expect(f.job().staleprefixPass({ execute: true, onlyIdentities: ids, probe: f.s.eraser() })).rejects.toMatchObject({ code: "stale_prefix_mode_allowlist_invalid" });
+      await expect(f.exec({ execute: true, onlyIdentities: ids, probe: f.s.eraser() })).rejects.toMatchObject({ code: "stale_prefix_mode_allowlist_invalid" });
     expect(reads).toEqual([]);
     expect(leased).toEqual([]);
     expect(f.s.deletes).toEqual([]);
@@ -540,7 +554,7 @@ describe("identity allowlist (--only-identity)", () => {
     const before = dump(f.path);
     const many = Array.from({ length: 101 }, (_, i) => i.toString(16).padStart(64, "0"));
     for (const ids of [undefined, [], [ID_A.toUpperCase()], ["sess-1"], [ID_A, ID_A], many])
-      await expect(f.job().staleprefixPass({ execute: false, onlyIdentities: ids as string[] })).rejects.toMatchObject({ code: "stale_prefix_mode_allowlist_invalid" });
+      await expect(f.exec({ execute: false, onlyIdentities: ids as string[] })).rejects.toMatchObject({ code: "stale_prefix_mode_allowlist_invalid" });
     expect(f.logs).toEqual([]);
     expect(dump(f.path)).toEqual(before);
   });
@@ -613,9 +627,10 @@ describe("CLI options", () => {
   });
 
   test("accepted forms", () => {
-    expect(staleprefixOptions(["--stale-prefixes-only", "--only-identity", ID_A], env())).toEqual({ execute: false, onlyIdentities: [ID_A] });
-    expect(staleprefixOptions(["--stale-prefixes-only", "--execute", "--once", "--max", "25", "--only-identity", ID_A, "--only-identity", ID_B], env({ BABYSITTER_RETENTION_SWEEP: " OFF " })))
-      .toEqual({ execute: true, max: 25, onlyIdentities: [ID_A, ID_B] });
+    expect(staleprefixOptions(["--stale-prefixes-only", "--only-identity", ID_A], env())).toEqual({ execute: false, verifyOnly: false, onlyIdentities: [ID_A] });
+    expect(staleprefixOptions(["--stale-prefixes-only", "--execute", "--once", "--max", "25", "--only-identity", ID_A, "--only-identity", ID_B,
+      "--verified-receipt", "r.json", "--protection-attestation", "a.json"], env({ BABYSITTER_RETENTION_SWEEP: " OFF " })))
+      .toEqual({ execute: true, verifyOnly: false, max: 25, onlyIdentities: [ID_A, ID_B], verifiedReceipt: "r.json", protectionAttestation: "a.json" });
     const hundred = Array.from({ length: 100 }, (_, i) => ["--only-identity", i.toString(16).padStart(64, "0")]).flat();
     expect(staleprefixOptions(["--stale-prefixes-only", ...hundred], env())?.onlyIdentities).toHaveLength(100);
   });
@@ -659,7 +674,7 @@ describe("CLI options", () => {
   test("retention phase and obligations refused", () => {
     for (const v of ["on", "dry_run", "bogus"])
       expect(code(() => staleprefixOptions(["--stale-prefixes-only", "--only-identity", ID_A], env({ BABYSITTER_RETENTION_SWEEP: v })))).toBe("stale_prefix_mode_retention_refused");
-    expect(staleprefixOptions(["--stale-prefixes-only", "--only-identity", ID_A], env({ BABYSITTER_RETENTION_SWEEP: "off" }))).toEqual({ execute: false, onlyIdentities: [ID_A] });
+    expect(staleprefixOptions(["--stale-prefixes-only", "--only-identity", ID_A], env({ BABYSITTER_RETENTION_SWEEP: "off" }))).toEqual({ execute: false, verifyOnly: false, onlyIdentities: [ID_A] });
     expect(code(() => staleprefixOptions(["--stale-prefixes-only", "--only-identity", ID_A], env({ S3X_OBLIGATIONS: "on" })))).toBe("stale_prefix_mode_requires_obligations_off");
   });
 
@@ -718,7 +733,7 @@ describe("short-lived eraser key expiring inside an admitted item (T56 review)",
     // The key expires mid-erase: the eraser's request path refuses before signing (eraser.ts refuseIfExpired).
     f.s.onDelete = (k) => { if (expired && k.startsWith(a.oldP)) { refusals++; throw new ShortLivedCredentialError("short_lived_expired.eraser"); } };
     let err: unknown;
-    try { await f.job().staleprefixPass({ onlyIdentities: allIds(f.st), execute: true, probe: f.s.eraser() }); } catch (e) { err = e; }
+    try { await f.exec({ onlyIdentities: allIds(f.st), execute: true, probe: f.s.eraser() }); } catch (e) { err = e; }
     expect((err as { code?: string }).code).toBe("short_lived_expired.eraser");
     expect(exitStatusForError(err)).toBe(75);
     expect(refusals).toBeGreaterThan(0);
@@ -730,7 +745,7 @@ describe("short-lived eraser key expiring inside an admitted item (T56 review)",
     expect(f.logs.some((l) => l.message === "erasure stopped: credential")).toBe(true);
     // Renewal: a fresh key, a rerun of the pass resumes and erases the same item.
     expired = false;
-    const r = await f.job().staleprefixPass({ onlyIdentities: allIds(f.st), execute: true, probe: f.s.eraser() });
+    const r = await f.exec({ onlyIdentities: allIds(f.st), execute: true, probe: f.s.eraser() });
     expect(r).toMatchObject({ ok: true, erased: 1 });
     expect(f.s.count(a.oldP)).toBe(0);
     expect(f.st.staleprefixErasures().map((e) => e.key)).toEqual([]);
@@ -740,7 +755,7 @@ describe("short-lived eraser key expiring inside an admitted item (T56 review)",
     const f = await fixture();
     const a = f.dateMove("sess-1", "g-1", NOW - 60_000);
     f.s.onDelete = (k) => (k.startsWith(a.oldP) ? "lose" : undefined);
-    const r = await f.job().staleprefixPass({ onlyIdentities: allIds(f.st), execute: true, probe: f.s.eraser() });
+    const r = await f.exec({ onlyIdentities: allIds(f.st), execute: true, probe: f.s.eraser() });
     expect(r).toMatchObject({ ok: false, stoppedBy: "failed" });
     expect(erasureRow(f.st, a.oldP)!.attempts).toBe(1);
     let err: unknown; try { stalePassStatus(r, true); } catch (e) { err = e; } // even with the expiry timer fired
@@ -766,7 +781,7 @@ test("stale-prefix execute: a refusal from the sibling probe (objectLive) stops 
   const before = erasureRow(f.st, a.oldP)!;
   const probe = { objectLive: async () => { throw new ShortLivedCredentialError("short_lived_expired.eraser"); } } as unknown as LiveObjectProbe;
   let err: unknown;
-  try { await f.job().staleprefixPass({ onlyIdentities: allIds(f.st), execute: true, probe }); } catch (e) { err = e; }
+  try { await f.exec({ onlyIdentities: allIds(f.st), execute: true, probe }); } catch (e) { err = e; }
   expect((err as { code?: string }).code).toBe("short_lived_expired.eraser");
   expect(exitStatusForError(err)).toBe(75);
   expect(erasureRow(f.st, a.oldP)!.attempts).toBe(before.attempts);

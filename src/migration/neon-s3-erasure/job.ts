@@ -40,7 +40,11 @@ export const STAGED_ERASE_AFTER_MS = 48 * 60 * 60 * 1000;
 const DOT_SEGMENT = /(^|\/)\.{1,2}(\/|$)/;
 import type { SyncState } from "../neon-s3-sync/state.ts";
 import { errorCode, type Log } from "../neon-s3-sync/sync.ts";
-import { inSessionAnyDate, type EraseCheckpoint, type Eraser, type ListedVersion, type LiveObjectProbe, type PagedEraser } from "./eraser.ts";
+import { inSessionAnyDate, type EraseCheckpoint, type Eraser, type ListedVersion, type LiveObjectProbe, type PagedEraser, type ReceiptFence, type VersionReader } from "./eraser.ts";
+import {
+  attestationFresh, attestationProblem, protectionFacts, RECEIPT_KIND, sameVersionSet, sealReceipt, sha256Hex as verifySha256, survivorPinsHold,
+  verifyStalePrefix, versionSet, type IdentityReceipt, type ItemReceipt, type ProtectionAttestation, type VerificationReceipt, type VerifyReason,
+} from "./stale-prefix-verify.ts";
 import { terminalInvocations } from "./write-obligation.ts";
 import { createHash } from "node:crypto";
 
@@ -134,7 +138,9 @@ const keyHash = (key: string) => createHash("sha256").update(key).digest("hex");
 
 type QueuedItem = { key: string; kind: "object" | "prefix"; org_id: string; reason: string; enqueued_at: number };
 type LeasedItemResult = {
-  outcome: "deferred" | "busy" | "cancelled" | "skipped" | "erased" | "unresolved" | "not_erased" | "done_refused" | "failed";
+  outcome: "deferred" | "busy" | "cancelled" | "skipped" | "erased" | "unresolved" | "not_erased" | "done_refused" | "failed" | "refused";
+  /** The receipt fence's report (stale-prefix execute only). */
+  fence?: FenceReport;
   /** Added to `drain`'s return value (an erase was attempted, or a failure recorded). */
   handled: number;
   deleted: number;
@@ -178,9 +184,64 @@ export interface StalePrefixResult {
    */
   allowlistEligibleIdentities: number;
   /** Set when execute refused to start (nothing erased, nothing written). */
-  refused?: "stale_prefix_mode_other_eraser_lease";
+  refused?: "stale_prefix_mode_other_eraser_lease" | "stale_prefix_protection_unproven";
+  /** Execute: the receipt fence's report for every item that reached it (hashes only). */
+  fenced?: FenceReport[];
   stoppedBy?: string;
 }
+
+export interface StalePrefixPassOptions {
+  execute: boolean;
+  max?: number;
+  probe?: LiveObjectProbe;
+  onlyIdentities: readonly string[];
+  /** Execute: the verified receipt (stale-prefix-verify.ts parseReceipt), its store fence and the bucket binding. */
+  receipt?: VerificationReceipt;
+  fence?: ReceiptFence;
+  bucketSha256?: string;
+  /** Execute: the operator's protection attestation (required; stale-prefix-verify.ts ProtectionAttestation). */
+  attestation?: ProtectionAttestation;
+}
+
+/**
+ * One item's receipt-fence outcome. `refused_before_delete`: zero deletes issued, the item untouched (no state write).
+ * `partial`: some receipt versions deleted, then stopped (`reason`), with exactly which versions were deleted, which
+ * failed (a DELETE whose outcome is unknown) and which were not attempted. `completed`: every receipt version deleted,
+ * the survivor re-verified and the old prefix proven empty. Keys appear only as sha256.
+ */
+export interface FenceReport {
+  identity_hash: string;
+  old_prefix_sha256: string;
+  outcome: "refused_before_delete" | "partial" | "completed";
+  reason?: string;
+  deleted: number;
+  versions: { key_sha256: string; version_id: string; outcome: "deleted" | "not_attempted" | "failed" }[];
+}
+
+/**
+ * The stale-prefix receipt fence's run context. What each protection rests on:
+ *  PROVEN BY CODE (checked before the first delete, and before EVERY delete):
+ *   - the old prefix's exact version set equals the receipt's (strict relist; drift refuses, zero deletes);
+ *   - each survivor pin (manifest + every referenced chunk) is the CURRENT version with its pinned versionId, not a
+ *     delete marker (a pin made NONCURRENT by an overwrite counts as drift: the bucket's lifecycle expires
+ *     noncurrent versions after about a day, so only a current pin is protected by the lifecycle facts below);
+ *   - this process holds the old-prefix lease, the survivor-prefix lease (the exporter takes the same per-prefix
+ *     lease before it writes a session, so it cannot rewrite the survivor while it is held) and the eraser-wide run
+ *     lease, each renewed; no other eraser holds an unexpired lease; the OFF-mode interlock and authority readiness;
+ *   - the lifecycle configuration and versioning status, whenever the key can read them (GetBucketLifecycle /
+ *     GetBucketVersioning), must show no current-version Expiration/Transition and versioning Enabled.
+ *  RESTS ON EXTERNAL FACTS (the operator attestation, refused when missing, malformed, stale or contradicted):
+ *   - who else can PutObject / DeleteObject / DeleteObjectVersion under the key root (IAM; the exporter is
+ *     write-only and never loads the eraser key, and lifecycle actions take no lease), so a per-delete check only
+ *     narrows the window between check and delete, it does not exclude a write in it;
+ *   - that no principal outside an explicit break-glass set can change lifecycle during the interval, PREVENTED
+ *     (not merely alarmed);
+ *   - the lifecycle facts themselves when the configuration cannot be read.
+ */
+interface FenceContext { receipt: VerificationReceipt; fence: ReceiptFence; attestation: ProtectionAttestation; probe: LiveObjectProbe }
+
+/** The eraser-wide stale-prefix run lease: a leases row no session prefix can equal (object keys never start with ':'). */
+export const STALE_RUN_LEASE = ":eraser-run:stale-prefixes-only";
 
 /** The session prefix a queued key belongs to, if the key has this layout under the org's prefix. */
 export function sessionPrefixOf(keyRoot: string, orgId: string, key: string): string | undefined {
@@ -1013,18 +1074,174 @@ export class ErasureJob {
   }
 
   /**
-   * Stale-prefix guard, evaluated inside the item's lease right before its erase (or read-only in a dry pass):
-   *  (a) the queued prefix holds none of the org's current exported or pending keys (`current_key`);
-   *  (b) a current exported manifest of the same session identity (org, ws, m, h, s), differing ONLY in the date,
-   *      exists in a group whose last export succeeded, and that manifest is live in the object store right now.
-   * Without a probe (a dry run has no store credentials) (b)'s store check is not made; the caller reports it.
+   * The execute preflight's protection facts (see FenceContext): the attestation (required, strict, fresh) and the
+   * code-readable bucket facts, which must agree with it. Any problem refuses the whole pass before any delete.
    */
-  async #staleGuard(item: { key: string; org_id: string }, probe: LiveObjectProbe | undefined): Promise<StalePrefixSkip | undefined> {
+  async #protectionPreflight(opts: StalePrefixPassOptions): Promise<{ problems: string[]; notes: string[]; attestationUsed: boolean }> {
+    const problems: string[] = [];
+    if (opts.attestation) {
+      const p = attestationProblem(opts.attestation, { bucketSha256: opts.bucketSha256!, keyRoot: this.cfg.keyRoot });
+      if (p) problems.push(p);
+      else if (!attestationFresh(opts.attestation, this.now())) problems.push("attestation_stale");
+    }
+    const read = async <T>(f: () => Promise<T>, fallback: (code: string) => T): Promise<T> => {
+      try { return await f(); } catch (error) { if (isCredentialFault(error)) throw error; return fallback(errorCode(error)); }
+    };
+    const fence = opts.fence!;
+    const lifecycle = await read(() => fence.bucketLifecycle(), (code) => ({ status: "unreadable" as const, code }));
+    const versioning = await read(() => fence.bucketVersioning(), (code) => ({ status: "unreadable" as const, code }));
+    const facts = protectionFacts(lifecycle, versioning, this.cfg.keyRoot, opts.attestation);
+    return { problems: [...new Set([...problems, ...facts.problems])], notes: facts.notes, attestationUsed: facts.attestationUsed };
+  }
+
+  /**
+   * One stale prefix through the receipt fence, inside its lease (FenceContext lists what is proven here and what
+   * rests on the attestation). Order: old-prefix lease, still queued, the stale guard (its skips unchanged), the
+   * receipt entry (FAIL or absent: refused, never erased), the survivor-prefix lease, attestation freshness, then the
+   * per-delete checks before EVERY exact-version delete of exactly the receipt's set (manifests first). Refused before
+   * the first delete: no state write. After any delete: `partial` (recorded as a failed erase, backoff) unless every
+   * receipt version is deleted, the survivor pins still hold and a strict relist shows the old prefix empty.
+   */
+  async #receiptItem(item: QueuedItem, identity: string, ctx: FenceContext): Promise<LeasedItemResult> {
+    const prefix = item.key;
+    const oldHash = verifySha256(prefix);
+    try {
+      if (!this.state.acquireLease(prefix, LEASE_HOLDER, undefined, this.now())) {
+        this.counters.deferred += 1;
+        return { outcome: "deferred", handled: 0, deleted: 0 };
+      }
+    } catch (error) {
+      this.log({ message: "erasure state busy", error_code: errorCode(error) });
+      return { outcome: "busy", handled: 0, deleted: 0 };
+    }
+    const leased = [prefix];
+    const report: FenceReport = { identity_hash: identity, old_prefix_sha256: oldHash, outcome: "refused_before_delete", deleted: 0, versions: [] };
+    const refuse = (code: string): LeasedItemResult => {
+      report.reason = code;
+      this.log({ message: "stale prefix fence", ...this.#fenceLog(report) });
+      return { outcome: "refused", handled: 0, deleted: 0, error: code, fence: report };
+    };
+    try {
+      if (!this.state.erasureQueued(item.key, item.enqueued_at)) return { outcome: "cancelled", handled: 0, deleted: 0 };
+      const skip = await this.#staleGuard(item, ctx.probe);
+      if (skip !== undefined) return { outcome: "skipped", handled: 0, deleted: 0, skip };
+      const id = ctx.receipt.identities.find((i) => i.identity_hash === identity);
+      const entry = id?.items.find((i) => i.old_prefix_sha256 === oldHash && i.enqueued_at === item.enqueued_at);
+      if (!id || !entry) return refuse("stale_prefix_receipt_missing");
+      if (id.status !== "PASS" || entry.status !== "PASS" || !entry.survivor) return refuse("stale_prefix_receipt_failed");
+      const survivor = entry.survivor;
+      const survivorKey = this.#staleSiblings(item).siblings.find((k) => verifySha256(k) === survivor.manifest.key_sha256);
+      if (!survivorKey) return refuse("stale_prefix_survivor_drift");
+      const survivorPrefix = survivorKey.slice(0, -"manifest.json".length);
+      if (verifySha256(survivorPrefix) !== survivor.prefix_sha256) return refuse("stale_prefix_survivor_drift");
+      // The exporter leases a session prefix before it writes there: holding it keeps the exporter off the survivor.
+      if (!this.state.acquireLease(survivorPrefix, LEASE_HOLDER, undefined, this.now())) return refuse("stale_prefix_survivor_lease_busy");
+      leased.push(survivorPrefix);
+      if (!attestationFresh(ctx.attestation, this.now())) return refuse("stale_prefix_protection_unproven");
+      /** Every per-delete precondition; returns the coded stop reason, or undefined when all hold. */
+      const check = async (): Promise<string | undefined> => {
+        if (!this.state.erasureQueued(item.key, item.enqueued_at)) return "erasure_item_cancelled";
+        const now = this.now();
+        if (!this.state.renewLease(prefix, LEASE_HOLDER, now) || !this.state.renewLease(survivorPrefix, LEASE_HOLDER, now)
+            || !this.state.renewLease(STALE_RUN_LEASE, LEASE_HOLDER, now)) return "erasure_lease_lost";
+        if (this.state.otherEraserLeases(LEASE_HOLDER, now) > 0) return "stale_prefix_mode_other_eraser_lease";
+        this.state.assertModeAllowed();
+        await this.authority.ready();
+        // Receipt membership: a fresh strict relist of the old prefix must be EXACTLY the receipt's set minus what this
+        // run has deleted. A version not in the receipt (newly written, never verified) or one gone without our delete
+        // stops before any further delete (receipt drift), so only receipt versions are ever deleted.
+        const expected = entry.old_versions.filter((v) => !report.versions.some((r) => r.outcome === "deleted" && r.key_sha256 === v.key_sha256 && r.version_id === v.version_id));
+        if (!sameVersionSet(versionSet(await ctx.fence.listVersions(prefix)), expected)) return "stale_prefix_receipt_drift";
+        // The pinned survivor (not mere existence): manifest and every referenced chunk still CURRENT at its pinned
+        // versionId and not a delete marker, re-read under the leases immediately before this delete.
+        if (!survivorPinsHold(await ctx.fence.listVersions(survivorPrefix), survivor)) return "stale_prefix_survivor_drift";
+        this.state.assertModeAllowed();
+        return undefined;
+      };
+      // The exact old set, relisted inside the lease: any added, missing or changed version refuses, zero deletes.
+      const listing = await ctx.fence.listVersions(prefix);
+      if (!sameVersionSet(versionSet(listing), entry.old_versions)) return refuse("stale_prefix_receipt_drift");
+      const doomed = [...listing].sort((a, b) =>
+        Number(b.key.endsWith("/manifest.json")) - Number(a.key.endsWith("/manifest.json")) || (a.key < b.key ? -1 : a.key > b.key ? 1 : a.versionId < b.versionId ? -1 : 1));
+      report.versions = doomed.map((v) => ({ key_sha256: verifySha256(v.key), version_id: v.versionId, outcome: "not_attempted" as const }));
+      let stop: string | undefined = doomed.length ? undefined : await check();
+      for (let i = 0; i < doomed.length; i++) {
+        stop = await check();
+        if (stop) break;
+        const v = doomed[i]!;
+        // Belt and braces: the version about to be deleted is a member of the receipt's exact set.
+        if (!entry.old_versions.some((e) => e.key_sha256 === report.versions[i]!.key_sha256 && e.version_id === v.versionId)) { stop = "stale_prefix_receipt_drift"; break; }
+        try {
+          await ctx.fence.deleteVersion(v.key, v.versionId);
+        } catch (error) {
+          report.versions[i]!.outcome = "failed";
+          if (isCredentialFault(error)) throw error;
+          stop = errorCode(error);
+          break;
+        }
+        report.versions[i]!.outcome = "deleted";
+        report.deleted += 1;
+      }
+      if (!stop) {
+        // After the erase: the survivor again, and a strict proof that nothing is left under the old prefix.
+        if (!survivorPinsHold(await ctx.fence.listVersions(survivorPrefix), survivor)) stop = "stale_prefix_survivor_drift_after_erase";
+        else if ((await ctx.fence.listVersions(prefix)).length) stop = "stale_prefix_post_residue";
+      }
+      this.counters.versionsDeleted += report.deleted;
+      if (report.deleted === 0 && !report.versions.some((v) => v.outcome === "failed") && stop) return refuse(stop);
+      if (stop) return this.#fencePartial(item, report, stop);
+      report.outcome = "completed";
+      this.state.erasureDone(item.key, item.enqueued_at);
+      this.counters.prefixesErased += 1;
+      this.log({ message: "stale prefix fence", ...this.#fenceLog(report) });
+      return { outcome: "erased", handled: 1, deleted: report.deleted, fence: report };
+    } catch (error) {
+      const issued = report.versions.some((v) => v.outcome !== "not_attempted");
+      if (isCredentialFault(error)) {
+        if (issued) { report.outcome = "partial"; report.reason = errorCode(error); this.log({ message: "stale prefix fence", ...this.#fenceLog(report) }); }
+        this.log({ message: "erasure stopped: credential", error_code: errorCode(error), kind: item.kind });
+        throw error;
+      }
+      if (issued) return this.#fencePartial(item, report, errorCode(error));
+      // Before any delete (a state or store read failure): recorded as drain records a failed erase.
+      this.counters.failed += 1;
+      this.state.erasureFailed(item.key, errorCode(error), this.now());
+      this.log({ message: "erasure failed", error_code: errorCode(error), kind: item.kind });
+      return { outcome: "failed", handled: 1, deleted: 0, error: errorCode(error) };
+    } finally {
+      try {
+        this.state.releaseLeases(LEASE_HOLDER, leased);
+      } catch {}
+    }
+  }
+
+  /** Deletes were issued, then the fence stopped: never reported as untouched; the item backs off as a failed erase. */
+  #fencePartial(item: QueuedItem, report: FenceReport, reason: string): LeasedItemResult {
+    report.outcome = "partial";
+    report.reason = reason;
+    this.counters.failed += 1;
+    try { this.state.erasureFailed(item.key, reason, this.now()); } catch {}
+    this.log({ message: "erasure failed", error_code: reason, kind: item.kind });
+    this.log({ message: "stale prefix fence", ...this.#fenceLog(report) });
+    return { outcome: "failed", handled: 1, deleted: report.deleted, error: reason, fence: report };
+  }
+
+  #fenceLog(r: FenceReport) {
+    const n = (o: string) => r.versions.filter((v) => v.outcome === o).length;
+    return { identity_hash: r.identity_hash, old_prefix_sha256: r.old_prefix_sha256, outcome: r.outcome, ...(r.reason ? { error_code: r.reason } : {}),
+      deleted: n("deleted"), failed: n("failed"), not_attempted: n("not_attempted"), versions: r.versions };
+  }
+
+  /**
+   * The state half of the stale-prefix guard: (a) and the exporter's date-moved sibling manifests of the same session
+   * identity whose group's last export succeeded (the candidates the verifier pins a survivor from).
+   */
+  #staleSiblings(item: { key: string; org_id: string }): { skip?: StalePrefixSkip; siblings: string[] } {
     const q = sessionPrefixParts(this.cfg.keyRoot, item.org_id, item.key);
-    if (!q) return "shape_invalid";
+    if (!q) return { skip: "shape_invalid", siblings: [] };
     const rows = this.state.exportedKeysOf(item.org_id);
     if (rows.some((r) => r.keys.some((k) => k.startsWith(item.key))) || this.state.pendingKeysOf(item.org_id).some((k) => k.startsWith(item.key)))
-      return "current_key";
+      return { skip: "current_key", siblings: [] };
     const siblings: string[] = [];
     let unsettled = false, otherMove = false;
     for (const r of rows)
@@ -1038,7 +1255,20 @@ export class ErasureJob {
           else unsettled = true;
         }
       }
-    if (!siblings.length) return otherMove ? "not_date_move" : unsettled ? "sibling_export_failed" : "no_live_sibling";
+    if (!siblings.length) return { skip: otherMove ? "not_date_move" : unsettled ? "sibling_export_failed" : "no_live_sibling", siblings };
+    return { siblings };
+  }
+
+  /**
+   * Stale-prefix guard, evaluated inside the item's lease right before its erase (or read-only in a dry pass):
+   *  (a) the queued prefix holds none of the org's current exported or pending keys (`current_key`);
+   *  (b) a current exported manifest of the same session identity (org, ws, m, h, s), differing ONLY in the date,
+   *      exists in a group whose last export succeeded, and that manifest is live in the object store right now.
+   * Without a probe (a dry run has no store credentials) (b)'s store check is not made; the caller reports it.
+   */
+  async #staleGuard(item: { key: string; org_id: string }, probe: LiveObjectProbe | undefined): Promise<StalePrefixSkip | undefined> {
+    const { skip: stateSkip, siblings } = this.#staleSiblings(item);
+    if (stateSkip) return stateSkip;
     if (!probe) return undefined;
     try {
       for (const k of siblings) if (await probe.objectLive(k)) return undefined;
@@ -1048,6 +1278,56 @@ export class ErasureJob {
       return "sibling_check_failed";
     }
     return "sibling_manifest_missing";
+  }
+
+  /** The allowlist as one dense snapshot, read index by index (Array#every skips holes, so a sparse array would pass it). */
+  #allowlist(raw: unknown): string[] {
+    if (!Array.isArray(raw)) throw refusal("stale_prefix_mode_allowlist_invalid");
+    const len = raw.length;
+    if (!Number.isSafeInteger(len) || len === 0 || len > STALE_PREFIX_ALLOWLIST_MAX) throw refusal("stale_prefix_mode_allowlist_invalid");
+    const ids: string[] = [];
+    for (let i = 0; i < len; i++) {
+      if (!Object.prototype.hasOwnProperty.call(raw, i)) throw refusal("stale_prefix_mode_allowlist_invalid");
+      const h: unknown = raw[i];
+      if (typeof h !== "string" || !IDENTITY_HASH.test(h)) throw refusal("stale_prefix_mode_allowlist_invalid");
+      ids.push(h);
+    }
+    if (new Set(ids).size !== ids.length) throw refusal("stale_prefix_mode_allowlist_invalid");
+    return ids;
+  }
+
+  /**
+   * `--stale-prefixes-only --verify-only`: READ-ONLY verification (stale-prefix-verify.ts) of every queued stale
+   * prefix of every allowlisted identity (backing-off entries included) against its date-moved survivor. No lease, no
+   * queue or state write, no delete: `reader` has no delete method. The receipt reports against the ORIGINAL
+   * allowlist (an identity with no queued entry is FAIL `no_stale_prefix_entry`); logs carry counts and hashes only.
+   */
+  async staleprefixVerify(opts: { onlyIdentities: readonly string[]; reader: VersionReader; bucketSha256: string }): Promise<VerificationReceipt> {
+    const ids = this.#allowlist(opts.onlyIdentities);
+    if (!IDENTITY_HASH.test(opts.bucketSha256)) throw refusal("stale_prefix_verify_bucket_invalid");
+    const selected = this.state.staleprefixErasures();
+    const identities: IdentityReceipt[] = [];
+    for (const id of ids) {
+      const entries = selected
+        .filter((i) => staleprefixIdentityHash(this.cfg.keyRoot, i.org_id, i.key) === id)
+        .sort((a, b) => (a.key < b.key ? -1 : a.key > b.key ? 1 : a.enqueued_at - b.enqueued_at));
+      const items: ItemReceipt[] = [];
+      for (const e of entries) {
+        const { siblings } = this.#staleSiblings(e);
+        const it = await verifyStalePrefix(opts.reader, { identityHash: id, oldPrefix: e.key, enqueuedAt: e.enqueued_at, survivorManifestKeys: siblings });
+        items.push(it);
+        this.log({ message: "stale prefix verified", identity_hash: id, old_prefix_sha256: it.old_prefix_sha256, status: it.status, reasons: it.reasons, ...it.counts,
+          old_versions_sha256: it.old_versions_sha256, ...(it.survivor ? { survivor_pin_sha256: it.survivor.pin_sha256 } : {}) });
+      }
+      const reasons: Partial<Record<VerifyReason, number>> = {};
+      if (!items.length) reasons.no_stale_prefix_entry = 1;
+      identities.push({ identity_hash: id, status: items.length && items.every((i) => i.status === "PASS") ? "PASS" : "FAIL", reasons, items });
+    }
+    const receipt = sealReceipt({ v: 1, kind: RECEIPT_KIND, bucket_sha256: opts.bucketSha256, key_root_sha256: verifySha256(this.cfg.keyRoot), allowlist: ids, identities });
+    this.log({ message: "stale prefix verification", status: receipt.status, receipt_sha256: receipt.receipt_sha256, allowlist_size: ids.length,
+      identities_pass: identities.filter((i) => i.status === "PASS").length, identities_fail: identities.filter((i) => i.status === "FAIL").length,
+      items: identities.reduce((n, i) => n + i.items.length, 0) });
+    return receipt;
   }
 
   /**
@@ -1062,25 +1342,18 @@ export class ErasureJob {
    * identity is not listed is skipped `not_in_identity_allowlist` (never leased, never erased, never written), one whose
    * identity cannot be derived `identity_unresolved`; listed entries meet every guard above unchanged.
    */
-  async staleprefixPass(opts: { execute: boolean; max?: number; probe?: LiveObjectProbe; onlyIdentities: readonly string[] }): Promise<StalePrefixResult> {
+  async staleprefixPass(opts: StalePrefixPassOptions): Promise<StalePrefixResult> {
     if (this.state.obligations) throw refusal("stale_prefix_mode_requires_obligations_off");
     if (opts.max !== undefined && !(Number.isSafeInteger(opts.max) && opts.max > 0)) throw refusal("stale_prefix_mode_max_invalid");
     if (opts.execute && !opts.probe) throw refusal("stale_prefix_mode_requires_existence_check");
-    // One dense snapshot, read index by index (Array#every skips holes, so a sparse array would pass it); every check
-    // and the Set below use that SAME snapshot, never the caller's array again.
-    const raw: unknown = opts.onlyIdentities;
-    if (!Array.isArray(raw)) throw refusal("stale_prefix_mode_allowlist_invalid");
-    const len = raw.length;
-    if (!Number.isSafeInteger(len) || len === 0 || len > STALE_PREFIX_ALLOWLIST_MAX) throw refusal("stale_prefix_mode_allowlist_invalid");
-    const ids: string[] = [];
-    for (let i = 0; i < len; i++) {
-      if (!Object.prototype.hasOwnProperty.call(raw, i)) throw refusal("stale_prefix_mode_allowlist_invalid");
-      const h: unknown = raw[i];
-      if (typeof h !== "string" || !IDENTITY_HASH.test(h)) throw refusal("stale_prefix_mode_allowlist_invalid");
-      ids.push(h);
-    }
+    // Execute erases ONLY through the receipt fence (#receiptItem): a verified receipt, the store fence and the
+    // bucket binding are required; there is no unfenced stale-prefix execute path.
+    if (opts.execute && (!opts.receipt || !opts.fence || !opts.bucketSha256)) throw refusal("stale_prefix_mode_requires_verified_receipt");
+    if (opts.execute && (opts.receipt!.bucket_sha256 !== opts.bucketSha256 || opts.receipt!.key_root_sha256 !== verifySha256(this.cfg.keyRoot)))
+      throw refusal("stale_prefix_receipt_invalid");
+    const ids = this.#allowlist(opts.onlyIdentities);
+    // One dense snapshot (#allowlist); every check and the Set use that SAME snapshot, never the caller's array again.
     const allow = new Set(ids);
-    if (allow.size !== ids.length) throw refusal("stale_prefix_mode_allowlist_invalid");
     const now = this.now();
     const selected = this.state.staleprefixErasures();
     const due = selected.filter((i) => i.next_try <= now);
@@ -1108,10 +1381,33 @@ export class ErasureJob {
       this.log({ message: "stale prefix pass refused", error_code: res.refused, other_eraser_leases: res.otherEraserLeases });
       return res;
     }
+    let ctx: FenceContext | undefined;
+    if (opts.execute) {
+      // Protection preflight, once, before any lease or delete (see FenceContext). Unproven: refuse, zero deletes.
+      const pre = await this.#protectionPreflight(opts);
+      if (pre.problems.length) {
+        res.ok = false;
+        res.refused = "stale_prefix_protection_unproven";
+        this.log({ message: "stale prefix pass refused", error_code: res.refused, problems: pre.problems, notes: pre.notes, attestation_used: pre.attestationUsed });
+        return res;
+      }
+      this.log({ message: "stale prefix protection preflight", proven: true, notes: pre.notes, attestation_used: pre.attestationUsed });
+      // The eraser-wide run lease: held (and renewed before every delete) for the whole interval, so a second
+      // stale-prefix run counts it as another eraser's live lease and refuses to start.
+      if (!this.state.acquireLease(STALE_RUN_LEASE, LEASE_HOLDER, undefined, this.now())) {
+        res.ok = false;
+        res.refused = "stale_prefix_mode_other_eraser_lease";
+        this.log({ message: "stale prefix pass refused", error_code: res.refused });
+        return res;
+      }
+      ctx = { receipt: opts.receipt!, fence: opts.fence!, attestation: opts.attestation!, probe: opts.probe! };
+      res.fenced = [];
+    }
     const skip = (reason: StalePrefixSkip, key: string) => {
       skipped[reason] = (skipped[reason] ?? 0) + 1;
       this.log({ message: "stale prefix skipped", reason, key_sha256: keyHash(key), execute: opts.execute });
     };
+    try {
     for (const item of due) {
       if (this.stopped()) { res.stoppedBy = "signal"; break; }
       if (opts.execute && opts.max !== undefined && res.erased >= opts.max) { res.stoppedBy = "max"; break; }
@@ -1129,7 +1425,8 @@ export class ErasureJob {
         }
         continue;
       }
-      const r = await this.#leasedItem(item, item.key, () => this.#staleGuard(item, opts.probe));
+      const r = await this.#receiptItem(item, identity, ctx!);
+      if (r.fence) res.fenced!.push(r.fence);
       res.versionsDeleted += r.deleted;
       if (r.outcome === "erased") {
         res.eligible += 1;
@@ -1142,12 +1439,21 @@ export class ErasureJob {
       if (r.outcome === "deferred") { skip("lease_busy", item.key); continue; }
       if (r.outcome === "busy") { skip("state_busy", item.key); continue; }
       if (r.outcome === "cancelled") { skip("cancelled", item.key); continue; }
+      // A receipt that is FAIL, or names no such entry: this item is never erased (untouched); later items may be.
+      if (r.outcome === "refused" && (r.error === "stale_prefix_receipt_failed" || r.error === "stale_prefix_receipt_missing")) {
+        res.ok = false;
+        this.log({ message: "stale prefix refused", error_code: r.error, key_sha256: keyHash(item.key) });
+        continue;
+      }
       // failed, unresolved, done_refused or not erased (incomplete / unverified / refused): the entry is recorded as
       // drain records it; the pass stops here and the remaining entries are not touched.
       res.ok = false;
       res.stoppedBy = r.outcome;
       this.log({ message: "stale prefix pass stopped", outcome: r.outcome, ...(r.status ? { status: r.status } : {}), ...(r.error ? { error_code: r.error } : {}), key_sha256: keyHash(item.key) });
       break;
+    }
+    } finally {
+      if (ctx) try { this.state.releaseLeases(LEASE_HOLDER, [STALE_RUN_LEASE]); } catch {}
     }
     res.allowlistEligibleIdentities = eligibleIds.size;
     this.log({

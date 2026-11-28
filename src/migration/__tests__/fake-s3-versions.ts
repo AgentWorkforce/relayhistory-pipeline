@@ -5,9 +5,11 @@
  * documents them, and 400 for a version marker that no longer exists. Fault hooks let a test
  * corrupt a later page, repeat markers, inject foreign keys, or lose a DELETE acknowledgement.
  */
-import { createS3Eraser } from "../neon-s3-erasure/eraser.ts";
+import { createS3Eraser, createS3VersionReader } from "../neon-s3-erasure/eraser.ts";
 
-export interface FakeVersion { id: string; at: number; marker?: boolean; etag?: string }
+export interface FakeVersion { id: string; at: number; marker?: boolean; etag?: string; body?: Uint8Array }
+
+const NO_LIFECYCLE = { status: 404, body: "<Error><Code>NoSuchLifecycleConfiguration</Code></Error>" };
 
 export class FakeS3Versions {
   readonly keys = new Map<string, FakeVersion[]>();
@@ -19,10 +21,22 @@ export class FakeS3Versions {
   rewrite?: (call: number, xml: string) => string;
   /** Called for every DELETE; return "lose" to apply it but answer 500. */
   onDelete?: (key: string, id: string) => "lose" | void;
+  /** GET ?lifecycle answer (default: S3's NoSuchLifecycleConfiguration 404). */
+  lifecycle: { status: number; body: string } = NO_LIFECYCLE;
+  /** GET ?versioning answer (default Enabled). */
+  versioning: { status: number; body: string } = { status: 200, body: `<?xml version="1.0" encoding="UTF-8"?><VersioningConfiguration><Status>Enabled</Status></VersioningConfiguration>` };
+  /** Object GETs by version id. */
+  gets: string[] = [];
 
-  put(key: string, at = Date.now(), etag?: string): string {
+  put(key: string, at = Date.now(), etag?: string, body?: Uint8Array): string {
     const id = `v${String(++this.#n).padStart(8, "0")}`;
-    this.keys.set(key, [{ id, at, ...(etag ? { etag } : {}) }, ...(this.keys.get(key) ?? [])]);
+    this.keys.set(key, [{ id, at, ...(etag ? { etag } : {}), ...(body ? { body } : {}) }, ...(this.keys.get(key) ?? [])]);
+    return id;
+  }
+  /** A delete marker as the new current version of `key`. */
+  mark(key: string, at = Date.now()): string {
+    const id = `v${String(++this.#n).padStart(8, "0")}`;
+    this.keys.set(key, [{ id, at, marker: true }, ...(this.keys.get(key) ?? [])]);
     return id;
   }
   count(prefix = ""): number {
@@ -65,6 +79,18 @@ export class FakeS3Versions {
 
   fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
     const u = new URL(String(input));
+    if ((init?.method ?? "GET") === "GET") {
+      if (u.searchParams.has("lifecycle")) return new Response(this.lifecycle.body, { status: this.lifecycle.status });
+      if (u.searchParams.has("versioning")) return new Response(this.versioning.body, { status: this.versioning.status });
+      const key = decodeURIComponent(u.pathname.replace(/^\/b\/?/, ""));
+      if (key && !u.searchParams.has("versions")) {
+        const id = u.searchParams.get("versionId") ?? "";
+        this.gets.push(`${key}@${id}`);
+        const v = (this.keys.get(key) ?? []).find((x) => x.id === id);
+        if (!v || v.marker || !v.body) return new Response(null, { status: v?.marker ? 405 : 404 });
+        return new Response(v.body.slice(), { status: 200, headers: { "x-amz-version-id": id } });
+      }
+    }
     if (init?.method === "DELETE") {
       const key = decodeURIComponent(u.pathname.replace(/^\/b\//, "")), id = u.searchParams.get("versionId")!;
       this.deletes.push(`${key}@${id}`);
@@ -74,6 +100,10 @@ export class FakeS3Versions {
     }
     return this.#list(u);
   }) as typeof fetch;
+
+  reader() {
+    return createS3VersionReader({ bucket: "b", region: "us-east-1", endpoint: "http://fake-s3.local", credentials: { accessKeyId: "a", secretAccessKey: "s" }, fetch: this.fetch });
+  }
 
   eraser() {
     return createS3Eraser({ bucket: "b", region: "us-east-1", endpoint: "http://fake-s3.local", credentials: { accessKeyId: "a", secretAccessKey: "s" }, fetch: this.fetch });
