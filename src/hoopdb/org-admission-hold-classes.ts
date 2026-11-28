@@ -95,7 +95,7 @@ export const ORG_ADMISSION_HOLD_CLASSES: Readonly<Record<string, HoldClassificat
   "sessions.ingest_reset_uploaded_sessions(jsonb)": C("reset (S3 mirror in the Worker)"),
   "sessions.ingest_seed_fence_baseline(jsonb)": U("seeds removal state (fences, resets, deletions) only"),
   "sessions.ingest_seed_proven_records(jsonb)": A("seeder import of revisions and ownership"),
-  "sessions.ingest_seed_scope_capture(jsonb)": U("seed lease only; its import is checked"),
+  "sessions.ingest_seed_scope_capture(jsonb)": A("seed lease issuance (lease mode; preview issues nothing); checked since 062390"),
   "sessions.ingest_seed_scope_page(jsonb)": U("STABLE read-only"),
   "sessions.ingest_selfhost_set_session_uploads(jsonb)": C("self-host selection (disable only)"),
   "sessions.ingest_set_session_uploads(jsonb)": C("selection (S3 mirror in the Worker)"),

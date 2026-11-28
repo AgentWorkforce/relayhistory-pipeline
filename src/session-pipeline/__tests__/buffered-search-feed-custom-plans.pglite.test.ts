@@ -32,7 +32,11 @@ const DOWN = read("supabase/rollbacks/20261105062330_buffered_search_feed_custom
 const PAGE_KEYSET_DOWN = "supabase/rollbacks/20261105062350_buffered_search_feed_page_keyset.down.sql";
 // 20261105062340 (the per-org erasure history) also sits above 062330 when present: its down runs next.
 const HISTORY_DOWN = "supabase/rollbacks/20261105062340_ingest_org_erasure_history.down.sql";
+// 20261105062390 (seed capture admission) sits above 062350 when present: its down runs first of all.
+const SEED_CAPTURE_DOWN = "supabase/rollbacks/20261105062390_ingest_seed_capture_admission.down.sql";
 const laterOff = async (db: PGlite) => {
+  if ((await db.query("SELECT 1 FROM sessions.__96bulls_migrations WHERE name='upstream:20261105062390_ingest_seed_capture_admission.sql'")).rows.length)
+    await db.exec(read(SEED_CAPTURE_DOWN));
   if ((await db.query("SELECT 1 FROM sessions.__96bulls_migrations WHERE name='upstream:20261105062350_buffered_search_feed_page_keyset.sql'")).rows.length)
     await db.exec(read(PAGE_KEYSET_DOWN));
   if ((await db.query("SELECT 1 FROM sessions.__96bulls_migrations WHERE name='upstream:20261105062340_ingest_org_erasure_history.sql'")).rows.length)

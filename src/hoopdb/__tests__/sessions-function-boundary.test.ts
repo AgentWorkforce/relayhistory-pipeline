@@ -102,6 +102,7 @@ describe("unified sessions function-boundary generator", () => {
       "supabase/rollbacks/20261105062320_ingest_org_admission_fences.down.sql",
       "supabase/rollbacks/20261105062340_ingest_org_erasure_history.down.sql",
       "supabase/rollbacks/20261105062350_buffered_search_feed_page_keyset.down.sql",
+      "supabase/rollbacks/20261105062390_ingest_seed_capture_admission.down.sql",
     ]);
   });
 

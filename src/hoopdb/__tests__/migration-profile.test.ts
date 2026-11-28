@@ -2723,7 +2723,23 @@ describe("function boundary: ACL manifest, residual, activation gate", () => {
       const open = src.indexOf(tag, start) + tag.length;
       return src.slice(open, src.indexOf(tag, open));
     };
-    // 20261105062350 (the buffered feed page keyset) is newest: 062340's down refuses (55000) while it is applied; its
+    // 20261105062390 (seed capture admission) is newest: 062350's down refuses (55000) while it is applied; its
+    // checksum-pinned down (no unreleased hold) restores 20261104040000's exact ingest_seed_scope_capture body, removes
+    // its ledger row, and refuses on a rerun.
+    const SEED = "upstream:20261105062390_ingest_seed_capture_admission.sql";
+    expect(await names()).toContain(SEED);
+    expect((await procSrc("sessions.ingest_seed_scope_capture(jsonb)")).s).toContain("-- 062390 org admission hold");
+    expect((await failure(rollback("20261105062350_buffered_search_feed_page_keyset.down.sql")))?.code).toBe("55000");
+    await rollback("20261105062390_ingest_seed_capture_admission.down.sql");
+    expect(await names()).not.toContain(SEED);
+    {
+      const prior = holdLastBody(readFileSync(join(root, "supabase/migrations/20261104040000_ingest_s3_proof_seed.sql"), "utf8"), "sessions.ingest_seed_scope_capture(jsonb)");
+      const tag = /AS (\$[a-z_]+\$)/u.exec(prior)![1]!;
+      const open = prior.indexOf(tag) + tag.length;
+      expect(await procSrc("sessions.ingest_seed_scope_capture(jsonb)")).toEqual({ s: prior.slice(open, prior.indexOf(tag, open)), d: true });
+    }
+    expect((await failure(rollback("20261105062390_ingest_seed_capture_admission.down.sql")))?.code).toBe("55000");
+    // 20261105062350 (the buffered feed page keyset) is then newest: 062340's down refuses (55000) while it is applied; its
     // lane-generated, checksum-pinned down restores 043870's exact page function (body and proconfig), removes its
     // ledger row, and refuses on a rerun.
     const BPK = "upstream:20261105062350_buffered_search_feed_page_keyset.sql";
