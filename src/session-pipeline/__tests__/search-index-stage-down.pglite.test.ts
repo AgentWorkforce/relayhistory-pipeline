@@ -56,7 +56,11 @@ const HISTORY_DOWN = readFileSync(join(import.meta.dir, "../../../supabase/rollb
 const CUSTOM_PLANS_DOWN = readFileSync(join(import.meta.dir, "../../../supabase/rollbacks/20261105062330_buffered_search_feed_custom_plans.down.sql"), "utf8");
 // 20261105062350 (the buffered feed page keyset) sits above 062330: its down runs first.
 const PAGE_KEYSET_DOWN = readFileSync(join(import.meta.dir, "../../../supabase/rollbacks/20261105062350_buffered_search_feed_page_keyset.down.sql"), "utf8");
+const SEED_CAPTURE_DOWN = readFileSync(join(import.meta.dir, "../../../supabase/rollbacks/20261105062390_ingest_seed_capture_admission.down.sql"), "utf8");
 const holdOff = async (pg: PGlite) => {
+  // 20261105062390 (seed capture admission) sits above every other slot here: rolled back first of all.
+  const seed = (await pg.query<{ n: number }>("SELECT count(*)::int AS n FROM sessions.__96bulls_migrations WHERE name = 'upstream:20261105062390_ingest_seed_capture_admission.sql'")).rows[0]!.n;
+  if (seed) await pg.exec(SEED_CAPTURE_DOWN);
   // 20261105062350 (the feed page keyset) is rolled back first, then 20261105062340 (the erasure history).
   const keyset = (await pg.query<{ n: number }>("SELECT count(*)::int AS n FROM sessions.__96bulls_migrations WHERE name = 'upstream:20261105062350_buffered_search_feed_page_keyset.sql'")).rows[0]!.n;
   if (keyset) await pg.exec(PAGE_KEYSET_DOWN);

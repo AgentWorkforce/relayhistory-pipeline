@@ -32,9 +32,12 @@ const HOLD_DOWN = read("supabase/rollbacks/20261105062320_ingest_org_admission_f
 // 20261105062330 (the buffered feed custom plans) sits above 062320: its down runs before 062320's.
 const CUSTOM_PLANS_STEP = "upstream:20261105062330_buffered_search_feed_custom_plans.sql";
 const CUSTOM_PLANS_DOWN = read("supabase/rollbacks/20261105062330_buffered_search_feed_custom_plans.down.sql");
-// 20261105062350 (the buffered feed page keyset) sits above 062340: its down runs before everything else.
+// 20261105062350 (the buffered feed page keyset) sits above 062340: its down runs before 062340's.
 const PAGE_KEYSET_STEP = "upstream:20261105062350_buffered_search_feed_page_keyset.sql";
 const PAGE_KEYSET_DOWN = read("supabase/rollbacks/20261105062350_buffered_search_feed_page_keyset.down.sql");
+// 20261105062390 (seed capture admission) sits above 062350: its down runs before everything else.
+const SEED_CAPTURE_STEP = "upstream:20261105062390_ingest_seed_capture_admission.sql";
+const SEED_CAPTURE_DOWN = read("supabase/rollbacks/20261105062390_ingest_seed_capture_admission.down.sql");
 // 20261105062340 (the per-org erasure history) sits above 062330: its down runs before 062330's.
 const HISTORY_STEP = "upstream:20261105062340_ingest_org_erasure_history.sql";
 const HISTORY_DOWN = read("supabase/rollbacks/20261105062340_ingest_org_erasure_history.down.sql");
@@ -153,6 +156,7 @@ describe("20261105062220 coordination advisories: the advisory instance", () => 
     expect(SQL).not.toMatch(/ADD COLUMN incarnation uuid[^;]*DEFAULT/i);
     // Before: roll 062220 back, write pending, delivered and acked rows through 062000's v1, then re-apply 062220.
     await reset();
+    await db.exec(SEED_CAPTURE_DOWN);
     await db.exec(PAGE_KEYSET_DOWN);    await db.exec(HISTORY_DOWN);
     await db.exec(CUSTOM_PLANS_DOWN);
     await db.exec(HOLD_DOWN);
@@ -359,8 +363,9 @@ describe("20261105062220 rollback", () => {
     const h = harness(() => db);
     const message = async (sql: string) => { const m = await db.exec(sql).then(() => null, (e: Error) => e.message); await db.exec("ROLLBACK").catch(() => {}); return m; };
     try {
-      expect((await plan(LOCAL)).filter((s) => s.name.startsWith("upstream:") && s.name > STEP).map((s) => s.name)).toEqual([SEARCH_STAGE_STEP, HOLD_STEP, CUSTOM_PLANS_STEP, HISTORY_STEP, PAGE_KEYSET_STEP]);
+      expect((await plan(LOCAL)).filter((s) => s.name.startsWith("upstream:") && s.name > STEP).map((s) => s.name)).toEqual([SEARCH_STAGE_STEP, HOLD_STEP, CUSTOM_PLANS_STEP, HISTORY_STEP, PAGE_KEYSET_STEP, SEED_CAPTURE_STEP]);
       expect(await message(DOWN)).toContain("a later migration is applied");
+      await db.exec(SEED_CAPTURE_DOWN);
       await db.exec(PAGE_KEYSET_DOWN);
       await db.exec(HISTORY_DOWN);
       await db.exec(CUSTOM_PLANS_DOWN);

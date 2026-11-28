@@ -28,6 +28,8 @@ export const BUFFERED_SEARCH_GATE_RETIRED_SQL = "supabase/migrations/20261105043
 export const BUFFERED_SEARCH_FEED_SAME_SECOND_SQL = "supabase/migrations/20261105045010_buffered_search_feed_same_second.sql";
 export const BUFFERED_SEARCH_FEED_CUSTOM_PLANS_SQL = "supabase/migrations/20261105062330_buffered_search_feed_custom_plans.sql";
 export const BUFFERED_SEARCH_FEED_PAGE_KEYSET_SQL = "supabase/migrations/20261105062350_buffered_search_feed_page_keyset.sql";
+// 062390 adds 062320's admission check to the seed capture; it is skipped with 062320.
+const SEED_CAPTURE_ADMISSION_SQL = "supabase/migrations/20261105062390_ingest_seed_capture_admission.sql";
 /** 047030 puts 041000's ingest_privacy_authority_guard() trigger on the frozen receipts, so it is skipped with 041000. */
 export const FROZEN_COPY_PROGRESS_SQL = "supabase/migrations/20261105047030_frozen_copy_progress.sql";
 /** 058010 re-creates 041000's two source-control begins (the operator user erase gate), so it is skipped with 041000. */
@@ -63,7 +65,7 @@ export async function authorityFixture(opts: { pending?: boolean; lazyFix?: bool
   // while 042000/043000/043500 still apply.
   for (const f of readdirSync(join(ROOT, "supabase/migrations")).filter((f) => f.endsWith(".sql")).sort()) {
     const path = "supabase/migrations/" + f;
-    if (opts.pending === false && (path === PENDING_SQL || path === OWNER_BUFFERED_SQL || path === BUFFERED_SEARCH_GATE_SQL || path === BUFFERED_SEARCH_FEED_SQL || path === BUFFERED_SEARCH_GATE_RETIRED_SQL || path === BUFFERED_SEARCH_FEED_SAME_SECOND_SQL || path === FROZEN_COPY_PROGRESS_SQL || path === OPERATOR_USER_ERASE_SQL || path === ORIGIN_CLAIM_FENCE_SQL || path === TURNS_FORWARD_GATES_SQL || path === LEGACY_EXPORT_SQL || path === ORG_ADMISSION_HOLD_SQL || path === ORG_ERASURE_HISTORY_SQL || path === BUFFERED_SEARCH_FEED_CUSTOM_PLANS_SQL || path === BUFFERED_SEARCH_FEED_PAGE_KEYSET_SQL)) continue;
+    if (opts.pending === false && (path === PENDING_SQL || path === OWNER_BUFFERED_SQL || path === BUFFERED_SEARCH_GATE_SQL || path === BUFFERED_SEARCH_FEED_SQL || path === BUFFERED_SEARCH_GATE_RETIRED_SQL || path === BUFFERED_SEARCH_FEED_SAME_SECOND_SQL || path === FROZEN_COPY_PROGRESS_SQL || path === OPERATOR_USER_ERASE_SQL || path === ORIGIN_CLAIM_FENCE_SQL || path === TURNS_FORWARD_GATES_SQL || path === LEGACY_EXPORT_SQL || path === ORG_ADMISSION_HOLD_SQL || path === ORG_ERASURE_HISTORY_SQL || path === BUFFERED_SEARCH_FEED_CUSTOM_PLANS_SQL || path === BUFFERED_SEARCH_FEED_PAGE_KEYSET_SQL || path === SEED_CAPTURE_ADMISSION_SQL)) continue;
     if (opts.lazyFix === false && path === LAZY_SOURCE_SQL) continue;
     await db.exec(read(path));
   }

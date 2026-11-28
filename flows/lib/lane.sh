@@ -181,7 +181,8 @@ case "$lane" in
       bun src/session-ingest/__tests__/hold-harness/run.ts --pg "$major" -- \
         src/session-ingest/__tests__/org-admission-hold.postgres.test.ts \
         src/session-ingest/__tests__/hold-lifecycle.postgres.test.ts \
-        src/session-ingest/__tests__/org-erasure-history.postgres.test.ts
+        src/session-ingest/__tests__/org-erasure-history.postgres.test.ts \
+        src/session-ingest/__tests__/seed-capture-admission.postgres.test.ts
     SEARCH_CONFORMANCE_PG_URL="postgres://postgres@127.0.0.1:$port/postgres" bun run --filter @96bulls/pipeline test test/search-index-postgres-real.test.ts
     PGPROOF_AUTH_UPGRADE_DISPOSABLE=1 PGPROOF_HOST=127.0.0.1 PGPROOF_PORT="$port" PGPROOF_SUPERUSER=postgres PGPROOF_HEAD="$head" PGPROOF_OUT="$out/auth.json" \
       bun scripts/pg-proof/auth-upgrade-proof.ts

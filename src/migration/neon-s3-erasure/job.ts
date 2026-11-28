@@ -44,6 +44,11 @@ import { inSessionAnyDate, type EraseCheckpoint, type Eraser, type ListedVersion
 import { terminalInvocations } from "./write-obligation.ts";
 import { createHash } from "node:crypto";
 
+/** A short-lived credential refused before signing (../short-lived-credentials.ts): stop the job for a renewal. */
+function isCredentialFault(error: unknown): boolean {
+  return errorCode(error).startsWith("short_lived_");
+}
+
 /** Per-item budget for one bounded erase step (the shared primitive also caps versions at 10k and pages at 100). */
 export const ERASE_STEP_DEADLINE_MS = 60_000;
 /** A durable scope for the shared paged eraser's checkpoint: operation + authority + tenant/session (or queued item). */
@@ -469,6 +474,7 @@ export class ErasureJob {
     // a failure or an early return in the rollup and catalog walks below
     // must not hold it back.
     const live = await this.#eraseLiveFenced(dryRun).catch((error) => {
+      if (isCredentialFault(error)) throw error; // an expiring eraser key stops the job (exit 75), never a zero count
       healthy = false;
       this.counters.liveFenceFailed += 1;
       this.log({ message: "live fence sweep failed", error_code: errorCode(error) });
@@ -485,6 +491,7 @@ export class ErasureJob {
       legacy = { groups: 0, versions: 0 };
     } else {
       legacy = await this.#eraseLegacyFenced(dryRun).catch((error) => {
+        if (isCredentialFault(error)) throw error;
         healthy = false;
         this.#legacyFenceFailure("legacy fence sweep failed", error);
         return { groups: 0, versions: 0 };
@@ -510,6 +517,7 @@ export class ErasureJob {
         }
       }
     } catch (error) {
+      if (isCredentialFault(error)) throw error;
       healthy = false;
       this.counters.fenceSweepFailed += 1;
       this.log({ message: "fence sweep failed", error_code: errorCode(error) });
@@ -687,6 +695,7 @@ export class ErasureJob {
             listed.set(objects, seen);
           }
         } catch (error) {
+          if (isCredentialFault(error)) throw error;
           listed.set(objects, null);
           this.counters.liveFenceFailed += 1;
           this.log({ message: "live listing failed", error_code: errorCode(error) });
@@ -766,6 +775,7 @@ export class ErasureJob {
         } catch (error) {
           // A re-enable during the run stops before any further delete; nothing to retry for it.
           if (errorCode(error) === "erasure_reenabled") continue;
+          if (isCredentialFault(error)) throw error;
           this.counters.liveFenceFailed += 1;
           this.log({ message: "live erasure failed", error_code: errorCode(error) });
         }
@@ -861,6 +871,7 @@ export class ErasureJob {
           this.counters.legacyVersionsDeleted += pointer.deleted;
         } catch (error) {
           if (errorCode(error) === "erasure_reenabled") continue;
+          if (isCredentialFault(error)) throw error;
           this.#legacyFenceFailure("legacy erasure failed", error);
         }
       }
@@ -982,6 +993,13 @@ export class ErasureJob {
       this.counters.prefixesErased += 1;
       return { outcome: "erased", handled, deleted };
     } catch (error) {
+      // An expiring short-lived eraser key refused before signing is the credential's fault, not this item's: no
+      // erasureFailed (the item stays queued with its attempts, and a paged erase keeps its durable checkpoint), the
+      // lease is released below, and the refusal stops the whole job for a renewal (the CLI exits 75).
+      if (isCredentialFault(error)) {
+        this.log({ message: "erasure stopped: credential", error_code: errorCode(error), kind: item.kind });
+        throw error;
+      }
       this.counters.failed += 1;
       this.state.erasureFailed(item.key, errorCode(error), this.now());
       this.log({ message: "erasure failed", error_code: errorCode(error), kind: item.kind });
@@ -1024,7 +1042,9 @@ export class ErasureJob {
     if (!probe) return undefined;
     try {
       for (const k of siblings) if (await probe.objectLive(k)) return undefined;
-    } catch {
+    } catch (error) {
+      // An expiring eraser key refused before signing is not an ordinary skip: it stops the pass (exit 75).
+      if (isCredentialFault(error)) throw error;
       return "sibling_check_failed";
     }
     return "sibling_manifest_missing";

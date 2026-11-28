@@ -8,6 +8,10 @@ const ACL = JSON.parse(readFileSync("src/hoopdb/sessions-function-acl.json", "ut
 // a future grant to any of them must be classified here, layered-sessions-pipeline 251996174404665344).
 const RUNTIME = ["bulls96_session_ingest", "bulls96_session_ingest_seeder", "bulls96_publication_scoped", "bulls96_publication_recovery"];
 const MIGRATION = readFileSync("supabase/migrations/20261105062320_ingest_org_admission_fences.sql", "utf8");
+// Later slots that add the same marked check to further entries (each one function, one mark).
+const LATER: Readonly<Record<string, string>> = {
+  "062390": readFileSync("supabase/migrations/20261105062390_ingest_seed_capture_admission.sql", "utf8"),
+};
 const name = (sig: string) => sig.slice(0, sig.indexOf("("));
 
 /** The class each replaced body in the migration checks, from its marked line. */
@@ -19,6 +23,15 @@ function checkedBodies(): Map<string, string> {
     const marks = [...chunk.matchAll(/'([a-z]+)'\);(?: END IF;)? -- 062320 org admission hold$/gmu)];
     expect(marks.length).toBe(1);
     out.set(fn, marks[0]![1]!);
+  }
+  for (const [slot, sql] of Object.entries(LATER)) {
+    for (const chunk of sql.split(/^(?=CREATE OR REPLACE FUNCTION )/mu).slice(1)) {
+      const fn = /^CREATE OR REPLACE FUNCTION (sessions\.[a-z_0-9]+)\(/u.exec(chunk)![1]!;
+      const marks = [...chunk.matchAll(new RegExp(`'([a-z]+)'\\);(?: END IF;)? -- ${slot} org admission hold$`, "gmu"))];
+      expect(marks.length).toBe(1);
+      expect(out.has(fn)).toBe(false); // a function is checked by exactly one slot
+      out.set(fn, marks[0]![1]!);
+    }
   }
   return out;
 }
@@ -38,7 +51,8 @@ test("every checked class carries exactly its check in the migration, once", () 
   }
   for (const [fn, c] of Object.entries(ORG_ADMISSION_HOLD_OWNER_CHECKED)) want.set(fn, c);
   expect(Object.fromEntries([...bodies].sort())).toEqual(Object.fromEntries([...want].sort()));
-  expect((MIGRATION.match(/-- 062320 org admission hold\n/gu) ?? []).length).toBe(bodies.size);
+  const later = Object.entries(LATER).reduce((n, [slot, sql]) => n + (sql.match(new RegExp(`-- ${slot} org admission hold\\n`, "gu")) ?? []).length, 0);
+  expect((MIGRATION.match(/-- 062320 org admission hold\n/gu) ?? []).length + later).toBe(bodies.size);
 });
 
 test("a delegating entry's checked body is itself classified or owner-checked", () => {
