@@ -6,7 +6,9 @@
 -- Additive and dormant. sessions.session_event_facts gains observed_paths text[] (empty by default, at most 64
 -- entries), appended as its last column. output_facts_reconcile (045040) and staged_facts_reconcile_v1 (062140) are
 -- replaced with identical signatures, ACLs and behaviour except that they carry observed_paths through (a row
--- without the key stores '{}'). No writer emits the key until the facts builders are given observedPaths, which no
+-- without the key stores '{}'), and an event row whose stored paths differ is rewritten even at an unchanged
+-- fingerprint: the rollback drops the column but keeps the fingerprints computed with it, so after a down and a
+-- re-apply the next pass repairs the paths instead of skipping them. No writer emits the key until the facts builders are given observedPaths, which no
 -- runtime does yet; no reader or detector reads it. Applying this to any real database needs Khaliq's separate,
 -- explicit go. The rollback (supabase/rollbacks/20261105062400_event_facts_observed_paths.down.sql) restores the
 -- exact 045040 and 062140 bodies and drops the column (its values are derived and can be rebuilt).
@@ -86,7 +88,7 @@ BEGIN
     cost_usd_micros = EXCLUDED.cost_usd_micros, files_touched = EXCLUDED.files_touched, observed_paths = EXCLUDED.observed_paths,
     retention_days = EXCLUDED.retention_days, fingerprint = EXCLUDED.fingerprint,
     source_version = EXCLUDED.source_version
-  WHERE t.fingerprint IS DISTINCT FROM EXCLUDED.fingerprint
+  WHERE (t.fingerprint IS DISTINCT FROM EXCLUDED.fingerprint OR t.observed_paths IS DISTINCT FROM EXCLUDED.observed_paths)
     AND t.source = p_harness AND t.session_id = ANY (p_session_ids);
   GET DIAGNOSTICS v_n = ROW_COUNT;
   v_inserted := v_inserted + v_n;
@@ -215,7 +217,7 @@ BEGIN
     cost_usd_micros = EXCLUDED.cost_usd_micros, files_touched = EXCLUDED.files_touched, observed_paths = EXCLUDED.observed_paths,
     retention_days = EXCLUDED.retention_days, fingerprint = EXCLUDED.fingerprint,
     source_version = EXCLUDED.source_version
-  WHERE t.fingerprint IS DISTINCT FROM EXCLUDED.fingerprint
+  WHERE (t.fingerprint IS DISTINCT FROM EXCLUDED.fingerprint OR t.observed_paths IS DISTINCT FROM EXCLUDED.observed_paths)
     AND t.source = p_harness AND t.session_id = ANY (p_session_ids);
   GET DIAGNOSTICS v_n = ROW_COUNT;
   v_inserted := v_inserted + v_n;

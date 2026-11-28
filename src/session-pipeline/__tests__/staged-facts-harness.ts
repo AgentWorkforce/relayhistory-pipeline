@@ -46,6 +46,11 @@ export async function stagedFactsDatabase(): Promise<PGlite> {
   return db;
 }
 
+/** Re-runs the migrator on an existing database (pending steps only, e.g. one a test rolled back). */
+export async function remigrate(db: PGlite): Promise<void> {
+  await runMigrations(client(db), { profile: LOCAL });
+}
+
 export const code = async (p: Promise<unknown>) => ((await p.then(() => null, (e: unknown) => e)) as { code?: string } | null)?.code ?? null;
 
 /** One transaction as `role` (the consumer runtime by default). */

@@ -12,7 +12,7 @@ DO $rollback_guard$ DECLARE v_sha text; BEGIN
  IF EXISTS(SELECT 1 FROM sessions.__96bulls_migrations WHERE name LIKE 'upstream:%' AND name COLLATE "C">'upstream:20261105062400_event_facts_observed_paths.sql')
  THEN RAISE EXCEPTION USING ERRCODE='55000',MESSAGE='event facts observed paths: a later migration is applied; roll it back first';END IF;
  SELECT sha256 INTO v_sha FROM sessions.__96bulls_migrations WHERE name='upstream:20261105062400_event_facts_observed_paths.sql' FOR UPDATE;
- IF NOT FOUND OR v_sha IS DISTINCT FROM '8ae7b500ca610337a7b453c55f6c96ca9c53d3f982149bf3a56eb99c3568f03e'
+ IF NOT FOUND OR v_sha IS DISTINCT FROM '8d07e7cfe74360c7748e14abea71ec7a24104aa1a179d98b900816462e22dd21'
  THEN RAISE EXCEPTION USING ERRCODE='55000',MESSAGE='event facts observed paths: own applied checksum required';END IF;
 END $rollback_guard$;
 CREATE OR REPLACE FUNCTION sessions.output_facts_reconcile(
@@ -257,5 +257,5 @@ BEGIN
 END
 $reconcile$;
 ALTER TABLE sessions.session_event_facts DROP COLUMN observed_paths;
-DELETE FROM sessions.__96bulls_migrations WHERE name='upstream:20261105062400_event_facts_observed_paths.sql' AND sha256='8ae7b500ca610337a7b453c55f6c96ca9c53d3f982149bf3a56eb99c3568f03e';
+DELETE FROM sessions.__96bulls_migrations WHERE name='upstream:20261105062400_event_facts_observed_paths.sql' AND sha256='8d07e7cfe74360c7748e14abea71ec7a24104aa1a179d98b900816462e22dd21';
 COMMIT;

@@ -207,6 +207,18 @@ describe("20261105045040 self-host output facts", () => {
     const tooMany = { ...withPaths, observed_paths: Array.from({ length: 65 }, (_, i) => `p${i}.ts`), fingerprint: "d".repeat(64) };
     expect(await code(run([tooMany, ...rest], 7))).toBe("23514");
     expect(await paths(first!.row_id)).toEqual(["src/c.ts"]);
+    // Down then up: the down drops the column but keeps every row's fingerprint (computed with its paths), and the
+    // re-added column holds '{}'. Replaying the same event (same fingerprint) at a newer version repairs the paths;
+    // only that row is rewritten, and a further replay with nothing different rewrites none.
+    const changed = { ...withPaths, observed_paths: ["src/c.ts"], fingerprint: "e".repeat(64) };
+    await db.exec("ALTER TABLE sessions.session_event_facts DROP COLUMN observed_paths");
+    await db.exec(step.slice(0, step.indexOf("CREATE OR REPLACE FUNCTION sessions.staged_facts_reconcile_v1(")));
+    expect(await paths(first!.row_id)).toEqual([]);
+    expect(await run([changed, ...rest], 8)).toMatchObject({ applied: true, inserted: 1 });
+    expect(await paths(first!.row_id)).toEqual(["src/c.ts"]);
+    for (const e of rest) expect(await paths(e.row_id)).toEqual([]);
+    expect(await run([changed, ...rest], 9)).toMatchObject({ applied: true, inserted: 0 });
+    expect(await paths(first!.row_id)).toEqual(["src/c.ts"]);
   }, 180_000);
 
   test("a pass older than the stored source version is a no-op (reconcile and state)", async () => {

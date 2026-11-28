@@ -22,6 +22,7 @@ import { outputFixture, OUTPUT_FIXTURE_SCOPE } from "./output-facts-fixture.ts";
 import {
   advanceToFinal, as, chain, chunksOf, claim, clearFacts, code, factsChunk, factsPass, factsSnapshot, finalStep, keyOf, RUNTIME,
   stagedFactsDatabase, stagedPass, stagedRows, wantPhase, WANT_KEYS, wholePass, type Claimed,
+  remigrate,
 } from "./staged-facts-harness.ts";
 
 setDefaultTimeout(300_000);
@@ -358,6 +359,22 @@ describe("20261105062140 staged output facts", () => {
     const rows = (await db.query<{ event_id: string; p: string[] }>("SELECT event_id, observed_paths p FROM sessions.session_event_facts ORDER BY event_id")).rows;
     expect(rows.find((r) => r.event_id === "status-1")!.p).toEqual(["src/a.ts", "docs/b.md"]);
     for (const r of rows) if (r.event_id !== "status-1") expect(r.p).toEqual([]);
+    // The real down then up (062400 is the newest step): the down drops the column but keeps every fingerprint, so
+    // the re-applied column holds '{}' under an unchanged fingerprint. The same events at a newer version repair the
+    // paths, rewriting only that row; a further pass with nothing different rewrites none.
+    const pathsOf = async () => (await db.query<{ event_id: string; p: string[] }>("SELECT event_id, observed_paths p FROM sessions.session_event_facts ORDER BY event_id")).rows;
+    const fingerprints = async () => (await db.query<{ f: string }>("SELECT string_agg(row_id || ':' || fingerprint, ',' ORDER BY row_id) f FROM sessions.session_event_facts")).rows[0]!.f;
+    const before = await fingerprints();
+    await db.exec(readFileSync(join(root, "supabase/rollbacks/20261105062400_event_facts_observed_paths.down.sql"), "utf8"));
+    await remigrate(db);
+    expect(await fingerprints()).toBe(before);
+    for (const r of await pathsOf()) expect(r.p).toEqual([]);
+    expect(await stagedPass(db, SCOPE, read, 8, 3, false, { observedPaths: true })).toMatchObject({ applied: true, inserted: 1 });
+    const repaired = await pathsOf();
+    expect(repaired.find((r) => r.event_id === "status-1")!.p).toEqual(["src/a.ts", "docs/b.md"]);
+    for (const r of repaired) if (r.event_id !== "status-1") expect(r.p).toEqual([]);
+    expect(await stagedPass(db, SCOPE, read, 9, 3, false, { observedPaths: true })).toMatchObject({ applied: true, inserted: 0 });
+    expect(await fingerprints()).toBe(before);
   });
 
   test("a size failure in the final step (its own staging over the send limit) is the named non-retryable error, nothing reconciled", async () => {
