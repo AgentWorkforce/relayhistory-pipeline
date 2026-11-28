@@ -299,7 +299,15 @@ export interface S3EraserConfig {
   fetch?: typeof fetch;
   /** Per-request deadline (ms, default S3_REQUEST_DEADLINE_MS): every signed request is aborted at it. */
   requestDeadlineMs?: number;
+  /** TEST SEAM: the signer (default sigv4 signRequest); a test can make signing slow. */
+  signer?: typeof signRequest;
 }
+/**
+ * The last gate of ONE request: runs AFTER signing and IMMEDIATELY before fetch (nothing awaits between). Throwing
+ * means fetch is never called. Returns the milliseconds left to the caller's ABSOLUTE protected deadline; the request
+ * is aborted at the earlier of that and the per-request deadline.
+ */
+export type BeforeFetch = () => number;
 /** Default per-request deadline. Requests are never retried here (attempts = 1). */
 export const S3_REQUEST_DEADLINE_MS = 30_000;
 export const S3_REQUEST_ATTEMPTS = 1;
@@ -394,25 +402,30 @@ function s3Core(cfg: S3EraserConfig, label: string) {
     }
     return new URL(`https://${cfg.bucket}.s3.${cfg.region}.amazonaws.com/${key ? encodeKeyPath(key) : ""}`);
   };
-  const request = async (method: string, u: URL, passStatuses: readonly number[] = []) => {
+  const sign = cfg.signer ?? signRequest;
+  const request = async (method: string, u: URL, passStatuses: readonly number[] = [], beforeFetch?: BeforeFetch) => {
     const headers = new Headers();
     refuseIfExpired(cfg.credentials, label, Date.now()); // a short-lived key is never used to sign past expiry
-    await signRequest({ method, url: u, headers, payloadSha256: await sha256Hex(new Uint8Array()), region: cfg.region, credentials: cfg.credentials });
-    const res = await doFetch(u, { method, headers, signal: AbortSignal.timeout(deadlineMs) });
+    await sign({ method, url: u, headers, payloadSha256: await sha256Hex(new Uint8Array()), region: cfg.region, credentials: cfg.credentials });
+    // The caller's final gate AFTER signing (signing and hashing can be slow) and synchronously before fetch.
+    const left = beforeFetch ? beforeFetch() : Number.POSITIVE_INFINITY;
+    const timeout = Math.min(deadlineMs, left);
+    if (!(timeout > 0)) throw coded("stale_prefix_deadline", "no protected time left for this request");
+    const res = await doFetch(u, { method, headers, signal: AbortSignal.timeout(timeout) });
     // Status only: S3 error bodies can echo keys.
     if (!res.ok && !(method === "DELETE" && res.status === 404) && !passStatuses.includes(res.status)) throw coded(`s3_${res.status}`, `S3 ${method} failed`);
     return res;
   };
 
   /** One ListObjectVersions page (strict: assertInventoryXml, complete entries, recognized pagination). */
-  async function fetchPage(prefix: string, keyMarker?: string, versionMarker?: string, strict = true): Promise<StrictPage> {
+  async function fetchPage(prefix: string, keyMarker?: string, versionMarker?: string, strict = true, beforeFetch?: BeforeFetch): Promise<StrictPage> {
     const u = url();
     u.searchParams.set("versions", "");
     u.searchParams.set("prefix", prefix);
     u.searchParams.set("max-keys", "1000");
     if (keyMarker !== undefined) u.searchParams.set("key-marker", keyMarker);
     if (versionMarker !== undefined) u.searchParams.set("version-id-marker", versionMarker);
-    const response = await request("GET", u);
+    const response = await request("GET", u, [], beforeFetch);
     let xml: string;
     if (!strict) xml = await response.text();
     else {
@@ -481,11 +494,12 @@ function s3Core(cfg: S3EraserConfig, label: string) {
     }
   }
 
-  return { url, request, fetchPage, versions, deadlineMs };
+  const strictPage: GatedPageFetcher = (prefix, k, v, beforeFetch) => fetchPage(prefix, k, v, true, beforeFetch);
+  return { url, request, fetchPage, strictPage, versions, deadlineMs };
 }
 
 export function createS3Eraser(cfg: S3EraserConfig): Eraser & PreservedVersionEraser & PagedEraser & LiveObjectProbe & ReceiptFence {
-  const { url, request, fetchPage, versions, deadlineMs } = s3Core(cfg, "eraser");
+  const { url, request, fetchPage, strictPage, versions, deadlineMs } = s3Core(cfg, "eraser");
   async function remove(list: Version[]): Promise<number> {
     if (list.some((v) => v.key.split("/").some((seg) => seg === "." || seg === "..")))
       throw coded("erasure_key_shape", "a key with a dot segment would be normalized away");
@@ -545,16 +559,16 @@ export function createS3Eraser(cfg: S3EraserConfig): Eraser & PreservedVersionEr
       if (!prefix.endsWith("/")) throw coded("erasure_prefix_shape", "a prefix ends in /");
       return [...new Set((await versions(prefix)).map((v) => v.key))];
     },
-    listVersions: (prefix, opts) => strictInventory(fetchPage, prefix, opts?.beforeRequest),
+    listVersions: (prefix, opts) => strictInventory(strictPage, prefix, opts?.beforeRequest),
     requestDeadlineMs: deadlineMs,
     requestAttempts: S3_REQUEST_ATTEMPTS,
     // Exactly one version by id: never a plain DELETE (that would only add a delete marker on a versioned bucket).
-    deleteVersion: async (key, versionId) => {
+    deleteVersion: async (key, versionId, opts) => {
       assertUnderPrefix(key.slice(0, key.lastIndexOf("/") + 1), [{ key, versionId }]);
       if (!versionId || /[\x00-\x1f\x7f]/u.test(versionId)) throw coded("erasure_key_shape", "an exact version id is required");
       const u = url(key);
       u.searchParams.set("versionId", versionId);
-      await request("DELETE", u);
+      await request("DELETE", u, [], opts?.beforeFetch);
     },
     bucketLifecycle: () => readLifecycle(url, request),
     bucketVersioning: () => readVersioning(url, request),
@@ -575,12 +589,15 @@ export function createS3Eraser(cfg: S3EraserConfig): Eraser & PreservedVersionEr
 
 /** A strict, complete, bounded version inventory of one directory prefix (every version and delete marker). */
 export interface VersionLister {
-  /** `beforeRequest` runs before EVERY page request (the fence's hard deadline); throwing stops the listing. */
-  listVersions(prefix: string, opts?: { beforeRequest?: () => void }): Promise<ListedVersion[]>;
+  /**
+   * `beforeRequest` runs for EVERY page request after it is signed and immediately before it is sent (the fence's
+   * hard deadline and page budget); throwing stops the listing with that page unsent.
+   */
+  listVersions(prefix: string, opts?: { beforeRequest?: BeforeFetch }): Promise<ListedVersion[]>;
 }
 /** Read-only: the lister plus GET of one exact object version (bounded bytes). Needs s3:GetObjectVersion. */
 export interface VersionReader extends VersionLister {
-  getVersion(key: string, versionId: string, maxBytes: number): Promise<Uint8Array>;
+  getVersion(key: string, versionId: string, maxBytes: number, opts?: { beforeFetch?: BeforeFetch }): Promise<Uint8Array>;
 }
 /** The bucket's lifecycle configuration as read (raw XML only when rules exist); never guessed. */
 export type LifecycleRead = { status: "none" } | { status: "rules"; xml: string } | { status: "unreadable"; code: string };
@@ -595,7 +612,8 @@ export interface BucketProtectionReader {
  * and the read-only bucket protection facts for the preflight.
  */
 export interface ReceiptFence extends VersionLister, BucketProtectionReader {
-  deleteVersion(key: string, versionId: string): Promise<void>;
+  /** `beforeFetch` runs after signing, immediately before the DELETE is sent; throwing means it is never sent. */
+  deleteVersion(key: string, versionId: string, opts?: { beforeFetch?: BeforeFetch }): Promise<void>;
   /** Worst-case time of one request (its abort deadline) and attempts per request: the lease-TTL bound uses both. */
   readonly requestDeadlineMs: number;
   readonly requestAttempts: number;
@@ -611,7 +629,9 @@ export function isReceiptFence(e: unknown): e is ReceiptFence {
  * last entry), no duplicate across pages, no cursor cycle, and the same hard bounds (10,000 versions, 100 pages); any
  * breach throws, never a short list.
  */
-export async function strictInventory(fetchPage: PageFetcher, prefix: string, beforeRequest?: () => void): Promise<ListedVersion[]> {
+/** A strict page fetcher that runs `beforeFetch` after signing, immediately before sending (S3); others call it first. */
+export type GatedPageFetcher = (prefix: string, keyMarker?: string, versionMarker?: string, beforeFetch?: BeforeFetch) => Promise<StrictPage>;
+export async function strictInventory(fetchPage: GatedPageFetcher, prefix: string, beforeRequest?: BeforeFetch): Promise<ListedVersion[]> {
   if (!prefix.endsWith("/") || prefix.split("/").some((seg) => seg === "." || seg === ".."))
     throw coded("erasure_prefix_shape", "a prefix ends in / and has no dot segment");
   const out: ListedVersion[] = [];
@@ -619,8 +639,7 @@ export async function strictInventory(fetchPage: PageFetcher, prefix: string, be
   let keyMarker: string | undefined, versionMarker: string | undefined, pages = 0;
   for (;;) {
     if (pages >= ERASE_RUN_MAX_PAGES) throw coded("erasure_inventory", "version pagination is unbounded");
-    beforeRequest?.();
-    const page = await fetchPage(prefix, keyMarker, versionMarker);
+    const page = await fetchPage(prefix, keyMarker, versionMarker, beforeRequest);
     pages++;
     checkPage(prefix, page, keyMarker, versionMarker);
     for (const v of page.entries) {
@@ -689,15 +708,15 @@ async function readVersioning(url: (k?: string) => URL, request: Requester): Pro
  * strict inventory as the eraser, plus GET of one exact version. It has no delete method at all.
  */
 export function createS3VersionReader(cfg: S3EraserConfig): VersionReader & BucketProtectionReader {
-  const { url, request, fetchPage } = s3Core(cfg, "reader");
+  const { url, request, strictPage } = s3Core(cfg, "reader");
   return {
-    listVersions: (prefix, opts) => strictInventory(fetchPage, prefix, opts?.beforeRequest),
-    async getVersion(key, versionId, maxBytes) {
+    listVersions: (prefix, opts) => strictInventory(strictPage, prefix, opts?.beforeRequest),
+    async getVersion(key, versionId, maxBytes, opts) {
       if (!key || key.endsWith("/") || key.split("/").some((seg) => seg === "." || seg === "..")) throw coded("erasure_key_shape", "a GET names one object");
       if (!versionId || /[\x00-\x1f\x7f]/u.test(versionId)) throw coded("erasure_key_shape", "an exact version id is required");
       const u = url(key);
       u.searchParams.set("versionId", versionId);
-      const res = await request("GET", u);
+      const res = await request("GET", u, [], opts?.beforeFetch);
       // The provider must answer with the very version asked for.
       const got = res.headers.get("x-amz-version-id");
       if (got !== versionId) { await res.body?.cancel().catch(() => {}); throw coded("reader_version_mismatch", "the response is not the requested version"); }

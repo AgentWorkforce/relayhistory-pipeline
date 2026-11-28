@@ -1262,20 +1262,26 @@ export class ErasureJob {
     };
     let current: Work | undefined;
     const fs: FenceClock = { protectedUntil: Number.NEGATIVE_INFINITY, pages: new Map(), remaining: [], maxLatencyMs: 0 };
-    /** Every S3 request after the leases goes through the request gate; a listing also counts its ACTUAL pages. */
+    /**
+     * Every S3 request after the leases goes through the request gate, run by the eraser AFTER signing and
+     * immediately before fetch; it returns the time left to the ABSOLUTE deadline, which caps the request's abort
+     * timeout. A listing also counts its ACTUAL pages against the page budget.
+     */
     const hook = (prefix?: string) => {
       let n = 0;
       return () => {
         this.#requestGate(fence, fs, held);
-        if (prefix === undefined) return;
-        if (++n > FENCE_LIST_MAX_PAGES) throw refusal("stale_prefix_listing_budget");
-        fs.pages.set(prefix, Math.max(fs.pages.get(prefix) ?? 0, n));
+        if (prefix !== undefined) {
+          if (++n > FENCE_LIST_MAX_PAGES) { fs.failure ??= "stale_prefix_listing_budget"; throw refusal("stale_prefix_listing_budget"); }
+          fs.pages.set(prefix, Math.max(fs.pages.get(prefix) ?? 0, n));
+        }
+        return fs.protectedUntil - this.now();
       };
     };
     const list = (prefix: string) => fence.listVersions(prefix, { beforeRequest: hook(prefix) });
     const reader: VersionReader = {
       listVersions: (prefix) => opts.reader!.listVersions(prefix, { beforeRequest: hook(prefix) }),
-      getVersion: (key, versionId, maxBytes) => { hook()(); return opts.reader!.getVersion(key, versionId, maxBytes); },
+      getVersion: (key, versionId, maxBytes) => opts.reader!.getVersion(key, versionId, maxBytes, { beforeFetch: hook() }),
     };
     try {
       if (!take(STALE_RUN_LEASE)) return refuseBatch("stale_prefix_mode_other_eraser_lease");
@@ -1336,15 +1342,26 @@ export class ErasureJob {
           stop = this.#issueCheck(fence, fs, held, attestation, checkDoneAt);
           if (stop) break;
           const t1 = this.now();
+          // The same issuance check again, AFTER signing and immediately before the DELETE is sent (eraser.ts
+          // request): slow hashing or signing can never carry a delete past the deadline. Refused there, nothing
+          // is sent and the version stays not_attempted.
+          let gateRefused: string | undefined;
+          const beforeFetch = () => {
+            const code = this.#issueCheck(fence, fs, held, attestation, checkDoneAt);
+            if (code) { gateRefused = code; throw refusal(code); }
+            return fs.protectedUntil - this.now();
+          };
           try {
-            await fence.deleteVersion(v.key, v.versionId);
+            await fence.deleteVersion(v.key, v.versionId, { beforeFetch });
           } catch (error) {
+            if (gateRefused) { stop = gateRefused; break; }
             // A short-lived key refused BEFORE signing: nothing was sent, the version stays not_attempted.
             if (isCredentialFault(error)) { credential = error; stop = errorCode(error); break; }
-            // Anything else may still have applied: never not_attempted. Resolve by an exact relist, record, stop.
+            // Anything else may still have applied: never not_attempted. Resolve by an exact relist (through the same
+            // request gate and page budget), record, stop. A relist the gate refuses, or that fails, leaves unknown.
             out.outcome = "unknown";
             try {
-              const after = await fence.listVersions(w.item.key);
+              const after = await list(w.item.key);
               out.outcome = after.some((x) => x.key === v.key && x.versionId === v.versionId) ? "present_after_error" : "absent_observed";
             } catch {}
             out.error_code = errorCode(error);
@@ -1398,6 +1415,7 @@ export class ErasureJob {
    * page counts observed so far). Throws `stale_prefix_deadline` / `stale_prefix_lease_ttl_insufficient`.
    */
   #requestGate(fence: ReceiptFence, fs: FenceClock, held: readonly string[]): void {
+    // Runs inside the eraser's request path after signing, immediately before fetch.
     const now = this.now();
     const fail = (code: string) => { fs.failure ??= code; throw refusal(code); };
     if (now + fence.requestDeadlineMs * fence.requestAttempts > fs.protectedUntil) fail("stale_prefix_deadline");
