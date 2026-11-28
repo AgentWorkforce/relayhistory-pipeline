@@ -2723,6 +2723,19 @@ describe("function boundary: ACL manifest, residual, activation gate", () => {
       const open = src.indexOf(tag, start) + tag.length;
       return src.slice(open, src.indexOf(tag, open));
     };
+    // 20261105062500 (T130 summary read v2, provisional slot) is newest: 062350's down refuses (55000) while it is
+    // applied; its checksum-pinned down drops only the v2 read function and its ledger row (v1 stays), and refuses on a rerun.
+    const SV2 = "upstream:20261105062500_session_brief_summary_v2_read.sql";
+    const SV2_RPC = "sessions.session_brief_summary_v2_for(text,text,text)";
+    const fnExists = async (sig: string) => (await db.query<{ e: boolean }>("SELECT to_regprocedure($1) IS NOT NULL AS e", [sig])).rows[0]!.e;
+    expect(await names()).toContain(SV2);
+    expect(await fnExists(SV2_RPC)).toBe(true);
+    expect((await failure(rollback("20261105062350_buffered_search_feed_page_keyset.down.sql")))?.code).toBe("55000");
+    await rollback("20261105062500_session_brief_summary_v2_read.down.sql");
+    expect(await names()).not.toContain(SV2);
+    expect(await fnExists(SV2_RPC)).toBe(false);
+    expect(await fnExists("sessions.session_brief_summary_for(text,text,text)")).toBe(true);
+    expect((await failure(rollback("20261105062500_session_brief_summary_v2_read.down.sql")))?.code).toBe("55000");
     // 20261105062350 (the buffered feed page keyset) is newest: 062340's down refuses (55000) while it is applied; its
     // lane-generated, checksum-pinned down restores 043870's exact page function (body and proconfig), removes its
     // ledger row, and refuses on a rerun.

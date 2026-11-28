@@ -257,6 +257,22 @@ describe("GET /v1/sessions/:id/summary with the fallback", () => {
     expect(a.order).toEqual(["brief"]);
   });
 
+  test("T130: a v2 row carries the served revision into provenance; the inner summary keys are unchanged", async () => {
+    const v2 = { ...brief, brief_revision: "7", source_revisions: { "m-1": 7 } };
+    const body = await (await api({ fallback: ready, rows: [v2] }).get()).json();
+    expect(body).toEqual({
+      summary: { status: "ready", kind: "short", summary: brief.description, model: brief.model, builtAt: "2026-11-09T00:00:00.000Z", state: null },
+      provenance: { source: "session_brief", kind: "short", generatedAt: "2026-11-09T00:00:00.000Z", revision: 7, truncated: false },
+    });
+    // Flag off: byte-identical to v1, the revision is never exposed there.
+    expect(await (await api({ fallback: false, rows: [v2] }).get()).text()).toBe(JSON.stringify({ summary: { status: "ready", kind: "short", summary: brief.description, model: brief.model, builtAt: "2026-11-09T00:00:00.000Z", state: null } }));
+  });
+
+  test("T130: a malformed v2 revision is a backend failure (503), never a fabricated or null revision", async () => {
+    for (const bad of ["-1", "1.5", "x", -1, 2 ** 60])
+      expect((await api({ fallback: ready, rows: [{ ...brief, brief_revision: bad as never }] }).get()).status).toBe(503);
+  });
+
   test("flag on, no brief: the Bob Costas short summary in today's ready shape plus provenance", async () => {
     const a = api({ rows: [], fallback: ready });
     const body = await (await a.get()).json();

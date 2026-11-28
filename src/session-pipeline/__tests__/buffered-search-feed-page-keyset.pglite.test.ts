@@ -30,6 +30,8 @@ const FILE = "20261105062350_buffered_search_feed_page_keyset.sql";
 const STEP = `upstream:${FILE}`;
 const UP = read(`supabase/migrations/${FILE}`);
 const DOWN = read("supabase/rollbacks/20261105062350_buffered_search_feed_page_keyset.down.sql");
+// 20261105062500 (the brief summary v2 read) sits above 062350: its down runs first.
+const BRIEF_SUMMARY_V2_DOWN = read("supabase/rollbacks/20261105062500_session_brief_summary_v2_read.down.sql");
 const ORIGINAL = read("supabase/migrations/20261105043870_buffered_search_feed_cursor.sql");
 const LOCAL: MigrationProfile = { mode: "local", shim: true, bootstrap: true, verify: false, runtimeRole: "postgres" };
 const PAGE = "sessions.buffered_search_feed_page(jsonb)";
@@ -231,6 +233,7 @@ describe("20261105062350 buffered search feed page keyset", () => {
   });
 
   test("rollback: 043870's exact page function and proconfig come back, the ledger row goes, a rerun refuses; re-migrate re-applies", async () => {
+    await db.exec(BRIEF_SUMMARY_V2_DOWN);
     await db.exec(DOWN);
     const live = (await db.query<{ s: string; c: string[]; d: boolean }>("SELECT prosrc s, proconfig c, prosecdef d FROM pg_proc WHERE oid=$1::regprocedure", [PAGE])).rows[0]!;
     expect(live).toEqual({ s: bodyOf(ORIGINAL).body, c: PRIOR_CONFIG, d: true });

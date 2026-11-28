@@ -38,9 +38,12 @@ const HOLD_DOWN = read("supabase/rollbacks/20261105062320_ingest_org_admission_f
 // 20261105062330 (the buffered feed custom plans) sits above 062320: its down runs before 062320's.
 const CUSTOM_PLANS_STEP = "upstream:20261105062330_buffered_search_feed_custom_plans.sql";
 const CUSTOM_PLANS_DOWN = read("supabase/rollbacks/20261105062330_buffered_search_feed_custom_plans.down.sql");
-// 20261105062350 (the buffered feed page keyset) sits above 062340: its down runs before everything else.
+// 20261105062350 (the buffered feed page keyset) sits above 062340: its down runs right after 062500's.
 const PAGE_KEYSET_STEP = "upstream:20261105062350_buffered_search_feed_page_keyset.sql";
 const PAGE_KEYSET_DOWN = read("supabase/rollbacks/20261105062350_buffered_search_feed_page_keyset.down.sql");
+// 20261105062500 (the brief summary v2 read) is newest: its down now runs before everything else.
+const BRIEF_SUMMARY_V2_STEP = "upstream:20261105062500_session_brief_summary_v2_read.sql";
+const BRIEF_SUMMARY_V2_DOWN = read("supabase/rollbacks/20261105062500_session_brief_summary_v2_read.down.sql");
 // 20261105062340 (the per-org erasure history) sits above 062330: its down runs before 062330's.
 const HISTORY_STEP = "upstream:20261105062340_ingest_org_erasure_history.sql";
 const HISTORY_DOWN = read("supabase/rollbacks/20261105062340_ingest_org_erasure_history.down.sql");
@@ -188,6 +191,7 @@ describe("20261105062190 coordination_advisories_pending_for_v2", () => {
     expect(warns).toEqual([]);
     // 20261105062200 (session list readiness), 062210 (T2 staged ACK) and 062220 (the advisory instance) sit above
     // 062190: their downs run first, newest first.
+    await db.exec(BRIEF_SUMMARY_V2_DOWN);
     await db.exec(PAGE_KEYSET_DOWN);    await db.exec(HISTORY_DOWN);
     await db.exec(CUSTOM_PLANS_DOWN);
     await db.exec(HOLD_DOWN);
@@ -211,8 +215,9 @@ describe("20261105062190 rollback", () => {
     try {
       // 20261105062200 (session list readiness), 20261105062210 (T2 staged ACK) and 20261105062220 (the advisory
       // instance) are the later steps: this down refuses under them; they come off first, newest first.
-      expect((await plan(LOCAL)).filter((s) => s.name.startsWith("upstream:") && s.name > STEP).map((s) => s.name)).toEqual(["upstream:20261105062200_session_directory_list_readiness.sql", "upstream:20261105062210_lazy_ack_t2.sql", INSTANCE_STEP, SEARCH_STAGE_STEP, HOLD_STEP, CUSTOM_PLANS_STEP, HISTORY_STEP, PAGE_KEYSET_STEP]);
+      expect((await plan(LOCAL)).filter((s) => s.name.startsWith("upstream:") && s.name > STEP).map((s) => s.name)).toEqual(["upstream:20261105062200_session_directory_list_readiness.sql", "upstream:20261105062210_lazy_ack_t2.sql", INSTANCE_STEP, SEARCH_STAGE_STEP, HOLD_STEP, CUSTOM_PLANS_STEP, HISTORY_STEP, PAGE_KEYSET_STEP, BRIEF_SUMMARY_V2_STEP]);
       expect(await message(DOWN)).toContain("a later migration is applied");
+      await db.exec(BRIEF_SUMMARY_V2_DOWN);
       await db.exec(PAGE_KEYSET_DOWN);
       await db.exec(HISTORY_DOWN);
       await db.exec(CUSTOM_PLANS_DOWN);

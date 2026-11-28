@@ -1668,6 +1668,10 @@
       "<owner>:EXECUTE",
       "bulls96_read_api:EXECUTE"
     ],
+    "sessions.session_brief_summary_v2_for(text,text,text)": [
+      "<owner>:EXECUTE",
+      "bulls96_read_api:EXECUTE"
+    ],
     "sessions.session_brief_titles_for(text,text[],text[])": [
       "<owner>:EXECUTE",
       "bulls96_read_api:EXECUTE"

@@ -3,6 +3,8 @@ import type { TenantRunner } from "./liveness.ts";
 export interface BriefSummaryRow {
  org_id:string; workspace_id:string; harness:string; session_id:string;
  description:string; model:string; generated_at:Date|string;
+ /** v2 (T130) only: the served brief's revision and per-machine source revisions. Absent from v1. */
+ brief_revision?:number|string|bigint|null; source_revisions?:Record<string,number>|null;
 }
 export interface BriefSummary {
  read(orgId:string, workspaceId:string, source:string, sessionId:string):Promise<BriefSummaryRow[]|null>;
@@ -14,6 +16,8 @@ export class BriefSummaryError extends Error {
  constructor(readonly reason:"invalid_argument"|"refused"|"unqualified"|"tenant_mismatch"|"parse") { super(`brief summary: ${reason}`); }
 }
 export const BRIEF_SUMMARY_SIGNATURE="sessions.session_brief_summary_for(text,text,text)";
+/** T130 Reader provenance: v1 plus the served revision. Used when installed; v1 otherwise. */
+export const BRIEF_SUMMARY_V2_SIGNATURE="sessions.session_brief_summary_v2_for(text,text,text)";
 export const SUMMARY_ACTIVITY_SIGNATURE="sessions.session_summary_activity_for(text,timestamptz,timestamptz)";
 function mapSummaryError(e:unknown):never {
  const code=(e as {code?:string})?.code;
@@ -25,9 +29,10 @@ function mapSummaryError(e:unknown):never {
 export function sqlBriefSummary(run:TenantRunner):BriefSummary {
  return {async read(orgId,workspaceId,source,sessionId) {
   return run(orgId,workspaceId,async q=>{
-   const installed=await q.query<{installed:boolean}>("SELECT to_regprocedure($1) IS NOT NULL AS installed",[BRIEF_SUMMARY_SIGNATURE]);
-   if(!installed.rows[0]?.installed)return null;
-   try { return (await q.query<BriefSummaryRow>("SELECT * FROM sessions.session_brief_summary_for($1,$2,$3)",[workspaceId,source,sessionId])).rows; }
+   const installed=await q.query<{v1:boolean;v2:boolean}>("SELECT to_regprocedure($1) IS NOT NULL AS v1, to_regprocedure($2) IS NOT NULL AS v2",[BRIEF_SUMMARY_SIGNATURE,BRIEF_SUMMARY_V2_SIGNATURE]);
+   const v2=installed.rows[0]?.v2===true;
+   if(!v2&&!installed.rows[0]?.v1)return null;
+   try { return (await q.query<BriefSummaryRow>(v2?"SELECT * FROM sessions.session_brief_summary_v2_for($1,$2,$3)":"SELECT * FROM sessions.session_brief_summary_for($1,$2,$3)",[workspaceId,source,sessionId])).rows; }
    catch(e) {mapSummaryError(e);}
   });
  },
@@ -60,4 +65,16 @@ export function briefSummaryResponse(rows:readonly BriefSummaryRow[], scope:{org
  const builtAt=row.generated_at instanceof Date?row.generated_at:new Date(row.generated_at);
  if(typeof row.description!=="string"||!row.description.trim()||[...row.description].length>320||typeof row.model!=="string"||!row.model.trim()||row.model.length>128||!Number.isFinite(builtAt.getTime()))throw new BriefSummaryError("parse");
  return {status:"ready" as const,kind:"short" as const,summary:row.description,model:row.model,builtAt:builtAt.toISOString(),state:null};
+}
+/**
+ * The served brief's revision for provenance: a non-negative safe integer from the v2 read, or
+ * null when the row came from v1 (no column). A present but malformed value is a parse failure.
+ */
+export function briefSummaryRevision(rows:readonly BriefSummaryRow[]):number|null {
+ if(rows.length!==1)return null;
+ const raw=rows[0]!.brief_revision;
+ if(raw===undefined||raw===null)return null;
+ const n=typeof raw==="bigint"?Number(raw):typeof raw==="string"&&/^\d+$/.test(raw)?Number(raw):raw;
+ if(typeof n!=="number"||!Number.isSafeInteger(n)||n<0)throw new BriefSummaryError("parse");
+ return n;
 }

@@ -150,6 +150,7 @@ BEGIN
          'sessions.relayfacts_list_v1(text,text,text,timestamp with time zone,uuid,integer)',
          'sessions.relayfacts_topics_v1(text,text)',
          'sessions.session_brief_summary_for(text,text,text)',
+         'sessions.session_brief_summary_v2_for(text,text,text)',
          'sessions.session_brief_titles_for(text,text[],text[])',
          'sessions.session_directory_activity_for(text,timestamp with time zone,timestamp with time zone)',
          'sessions.session_directory_users_for(text,timestamp with time zone,timestamp with time zone,integer)',

@@ -1,4 +1,4 @@
-import { BriefSummaryError, briefSummaryResponse, summaryActivityDays, type BriefSummary } from "./brief-summary.ts";
+import { BriefSummaryError, briefSummaryResponse, briefSummaryRevision, summaryActivityDays, type BriefSummary } from "./brief-summary.ts";
 import { SummaryFallbackError, sessionSummaryBody, type SummaryFallback } from "./summary-fallback.ts";
 /**
  * The session read API: an API-compatible subset of relayhistory's /v1 read
@@ -1948,7 +1948,8 @@ export function createReadApi(deps: ReadApiDeps) {
       // Flag on: the inner `summary` keeps exactly today's keys; provenance is beside it.
       if(kind==="short"&&rows.length>0) {
         const brief=briefSummaryResponse(rows,{...identity,source,sessionId});
-        return c.json({summary:brief,provenance:{source:"session_brief",kind:"short",generatedAt:brief.status==="ready"?brief.builtAt:null,revision:null,truncated:false}});
+        // revision: the served brief's (v2 read, T130); null under v1, exactly as before.
+        return c.json({summary:brief,provenance:{source:"session_brief",kind:"short",generatedAt:brief.status==="ready"?brief.builtAt:null,revision:brief.status==="ready"?briefSummaryRevision(rows):null,truncated:false}});
       }
       const ready=await fallback.read({orgId:identity.orgId,workspaceId:identity.workspaceId,source,sessionId},kind as "short"|"long");
       return c.json(ready?sessionSummaryBody(ready):{summary:{status:"empty",kind,state:null},provenance:null});
