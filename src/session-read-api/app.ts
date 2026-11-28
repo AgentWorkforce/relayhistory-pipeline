@@ -1171,6 +1171,10 @@ export function createReadApi(deps: ReadApiDeps) {
       page = await canonicalEventPage({ ...pc.events, deadlineMs: left }, deps.liveness,
         { orgId: identity.orgId, workspaceId: identity.workspaceId, sessionId: q.sessionId, source: served, order: q.order, limit: q.limit, maxContent: q.maxContent }, rawObjectCursor);
     } catch (error) {
+      // The authoritative post-IO fence verdict precedes every answer to a failed read, as it does a
+      // successful one: a fence that committed during the read is the 404, and an outage the terminal
+      // 503, never a fallback-eligible refusal (501/409/503 events_canonical_transient).
+      if (await fenced()) throw sessionFenced(c, continuing);
       if (error instanceof CanonicalReadError && error.status === 400) throw bad("canonical cursor is not valid");
       if (error instanceof HttpError || error instanceof TenantMismatchError) throw error;
       const { class: cls, codes } = classifyPartialCanonical(error);

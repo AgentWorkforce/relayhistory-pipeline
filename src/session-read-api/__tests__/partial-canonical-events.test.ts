@@ -80,6 +80,8 @@ function fixture(o: Options = {}) {
     fail: undefined as unknown,
     hang: false,
     afterRead: undefined as undefined | (() => void),
+    /** Runs inside the object read just before `fail` is thrown (a fence committing during a failing read). */
+    beforeFail: undefined as undefined | (() => void),
     /** Operator-fenced `${source}/${id}` keys (the authoritative fence, apart from tombstones). */
     fenced: new Set<string>(),
     fenceFails: false,
@@ -99,7 +101,7 @@ function fixture(o: Options = {}) {
           reads++;
           identities.push(identity);
           if (state.hang) await new Promise((_, reject) => signal.addEventListener("abort", () => reject(Object.assign(new Error("aborted"), { name: "AbortError" }))));
-          if (state.fail) throw state.fail;
+          if (state.fail) { state.beforeFail?.(); throw state.fail; }
           state.afterRead?.();
           return { rows: state.rows, legacyCoverage: null, exists: true, generation: state.generation };
         },
@@ -483,6 +485,50 @@ describe("authoritative operator fence (pc.operatorFence), apart from tombstones
     late.state.afterRead = () => { late.state.fenceFails = true; };
     const r = await late.get("&source=codex");
     expect([r.status, (await r.text()).includes("synthetic-canonical")]).toEqual([503, false]);
+  });
+
+  test("F7 a fence that commits during a FAILING read wins over every refusal: 404 session_fenced, first and cursor pages", async () => {
+    const errors = [new CanonicalReadError("object_missing"), new CanonicalReadError("deadline"), new CanonicalReadError("tenant_mismatch"),
+      new CanonicalReadError("canonical_projection_incomplete", 503, ["scope_too_large"]), new CanonicalReadError("source_generation_changed"),
+      new ObjectStoreError("transient", "s3", "synthetic", { status: 503 }), new TypeError("fetch failed")];
+    for (const error of errors) for (const query of ["&source=codex", "", `&source=codex&cursor=${objectCursor()}`]) {
+      const f = fixture({ pc: { workspaces: "*" } });
+      f.state.fail = error;
+      f.state.beforeFail = () => f.state.fenced.add("codex/sess");
+      expect([String(error), query, await snapshot(await f.get(query))]).toEqual([String(error), query, FENCED_404]);
+      // Asked before the read and again after the failed IO.
+      expect(f.state.fenceAsked).toEqual(["org-a/ws-a/codex/sess", "org-a/ws-a/codex/sess"]);
+      expect(refused(f)).toEqual([]);
+    }
+  });
+
+  test("F8 a fence outage after a FAILING read is the terminal 503, never the 501/409 fallback answers", async () => {
+    for (const error of [new CanonicalReadError("object_missing"), new CanonicalReadError("deadline"), new CanonicalReadError("pointer_bound")])
+      for (const query of ["&source=codex", `&source=codex&cursor=${objectCursor()}`]) {
+        const f = fixture({ pc: { workspaces: "*" } });
+        f.state.fail = error;
+        f.state.beforeFail = () => { f.state.fenceFails = true; };
+        expect([String(error), query, await snapshot(await f.get(query))]).toEqual([String(error), query, UNAVAILABLE_503]);
+      }
+  });
+
+  test("F9 unfenced failing read: the original refusal, after the post-IO fence said no", async () => {
+    // First page: always the 501. Cursor page: missing 409, transient 503, forbidden 501.
+    const want: Array<[unknown, number]> = [
+      [new CanonicalReadError("object_missing"), 409],
+      [new CanonicalReadError("deadline"), 503],
+      [new CanonicalReadError("tenant_mismatch"), 501],
+    ];
+    for (const [error, cursor] of want) {
+      const a = fixture({ pc: { workspaces: "*" } });
+      a.state.fail = error;
+      expect([String(error), await snapshot(await a.get("&source=codex"))]).toEqual([String(error), PARTIAL_501]);
+      expect(a.state.fenceAsked).toHaveLength(2);
+      const b = fixture({ pc: { workspaces: "*" } });
+      b.state.fail = error;
+      expect([String(error), (await b.get(`&source=codex&cursor=${objectCursor()}`)).status]).toEqual([String(error), cursor]);
+      expect(b.state.fenceAsked).toHaveLength(2);
+    }
   });
 
   test("F5 workspace attestation mismatch fails closed before the fence or any read (403)", async () => {
