@@ -239,6 +239,14 @@ jobs:
         env:
           SESSION_INGEST_TEST_PG_URL: postgres://postgres@127.0.0.1:5432/postgres
         run: bun test --timeout 300000 src/session-ingest/__tests__/claim-clock-lock.postgres.test.ts
+      - name: Prove the buffered GC claim skips a seat clock held by a staged ACK instead of stalling commits into 57014 (062370)
+        env:
+          SESSION_INGEST_TEST_PG_URL: postgres://postgres@127.0.0.1:5432/postgres
+        run: |
+          set -o pipefail
+          bun test --timeout 300000 src/session-ingest/__tests__/buffered-gc-claim-contention.postgres.test.ts 2>&1 | tee gc-claim-contention-pg.log
+          if grep -Eq '^ *[1-9][0-9]* skip' gc-claim-contention-pg.log; then echo "::error title=pg-proof::062370 GC claim contention tests skipped"; exit 1; fi
+          grep -Eq '^ *5 pass' gc-claim-contention-pg.log || { echo "::error title=pg-proof::062370 GC claim contention pass count is not 5"; exit 1; }
       - name: Prove one user's machines claim concurrently while one origin, controls and the user erase still serialize (062010)
         env:
           SESSION_INGEST_TEST_PG_URL: postgres://postgres@127.0.0.1:5432/postgres

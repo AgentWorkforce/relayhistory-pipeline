@@ -2723,7 +2723,26 @@ describe("function boundary: ACL manifest, residual, activation gate", () => {
       const open = src.indexOf(tag, start) + tag.length;
       return src.slice(open, src.indexOf(tag, open));
     };
-    // 20261105062350 (the buffered feed page keyset) is newest: 062340's down refuses (55000) while it is applied; its
+    // 20261105062370 (the buffered GC claim clock NOWAIT) is newest: 062350's down refuses (55000) while it is applied;
+    // its lane-generated, checksum-pinned down restores 058010's exact claim, removes its ledger row, and refuses on a
+    // rerun.
+    const GCC = "upstream:20261105062370_buffered_gc_claim_clock_nowait.sql";
+    const gcClaimSrc = async () =>
+      (await db.query<{ s: string; d: boolean }>("SELECT prosrc s, prosecdef d FROM pg_proc WHERE oid='sessions.ingest_buffer_gc_claim(jsonb)'::regprocedure")).rows[0]!;
+    const gcClaimOf = (file: string) => {
+      const src = readFileSync(join(root, `supabase/migrations/${file}`), "utf8");
+      const start = src.search(/CREATE OR REPLACE FUNCTION sessions\.ingest_buffer_gc_claim\(/);
+      const open = src.indexOf("$claim$", start) + "$claim$".length;
+      return src.slice(open, src.indexOf("$claim$", open));
+    };
+    expect(await names()).toContain(GCC);
+    expect(await gcClaimSrc()).toEqual({ s: gcClaimOf("20261105062370_buffered_gc_claim_clock_nowait.sql"), d: true });
+    expect((await failure(rollback("20261105062350_buffered_search_feed_page_keyset.down.sql")))?.code).toBe("55000");
+    await rollback("20261105062370_buffered_gc_claim_clock_nowait.down.sql");
+    expect(await names()).not.toContain(GCC);
+    expect(await gcClaimSrc()).toEqual({ s: gcClaimOf("20261105058010_operator_user_erase.sql"), d: true });
+    expect((await failure(rollback("20261105062370_buffered_gc_claim_clock_nowait.down.sql")))?.code).toBe("55000");
+    // 20261105062350 (the buffered feed page keyset) is then newest: 062340's down refuses (55000) while it is applied; its
     // lane-generated, checksum-pinned down restores 043870's exact page function (body and proconfig), removes its
     // ledger row, and refuses on a rerun.
     const BPK = "upstream:20261105062350_buffered_search_feed_page_keyset.sql";

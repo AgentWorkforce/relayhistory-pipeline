@@ -258,6 +258,9 @@ describe("G4-only schema: the post-G4 objects are absent", () => {
       // The buffered feed page keyset: buffered_search_feed_page replaced (sargable keyset, custom plans); no G4
       // function names it, no ingest path calls it.
       "20261105062350_buffered_search_feed_page_keyset.sql",
+      // The buffered GC claim takes the seat clock FOR SHARE NOWAIT in its acquisition subtransaction; the claim was
+      // already replaced (ingest_buffer_gc_claim is in the list below), no new object.
+      "20261105062370_buffered_gc_claim_clock_nowait.sql",
     ]);
     expect(() => migrationFiles(REPO_ROOT, "20261105043800_typo.sql")).toThrow(/names no migration/);
     expect(OBJECTS.newFunctions.length).toBeGreaterThan(30);

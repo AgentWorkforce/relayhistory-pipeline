@@ -231,6 +231,8 @@ describe("20261105062350 buffered search feed page keyset", () => {
   });
 
   test("rollback: 043870's exact page function and proconfig come back, the ledger row goes, a rerun refuses; re-migrate re-applies", async () => {
+    // 20261105062370 (the buffered GC claim clock NOWAIT) sits above 062350: its down runs first.
+    await db.exec(read("supabase/rollbacks/20261105062370_buffered_gc_claim_clock_nowait.down.sql"));
     await db.exec(DOWN);
     const live = (await db.query<{ s: string; c: string[]; d: boolean }>("SELECT prosrc s, proconfig c, prosecdef d FROM pg_proc WHERE oid=$1::regprocedure", [PAGE])).rows[0]!;
     expect(live).toEqual({ s: bodyOf(ORIGINAL).body, c: PRIOR_CONFIG, d: true });

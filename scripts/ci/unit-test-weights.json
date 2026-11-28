@@ -217,6 +217,7 @@
     "src/session-ingest/__tests__/bookkeeping-cleanup.test.ts": 1,
     "src/session-ingest/__tests__/buffer-gc.pglite.test.ts": 38,
     "src/session-ingest/__tests__/buffered-gc-claim-budget.postgres.test.ts": 1,
+    "src/session-ingest/__tests__/buffered-gc-claim-contention.postgres.test.ts": 1,
     "src/session-ingest/__tests__/buffered-gc-diagnostics.test.ts": 1,
     "src/session-ingest/__tests__/buffered-gc-job.test.ts": 1,
     "src/session-ingest/__tests__/buffered-gc-single-candidate.postgres.test.ts": 1,
