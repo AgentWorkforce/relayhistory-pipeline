@@ -112,11 +112,9 @@ describe("ordered consumer, real search stage, skip-current on", () => {
     expect(r.reads.count - reads).toBeLessThanOrEqual(1);
   }, 120_000);
 
-  // KNOWN GAP, pre-existing and NOT fixed here (reported to Pipeline): the physical pointer-row currency check runs only
-  // in ordered (FIFO) mode. On the standard queue, with SEARCH_INDEX_SKIP_CURRENT_ENABLED on (off in prod today), the
-  // search stage's alreadyCurrent credits the stale pointer row (key + revision) and B is never indexed. Pinned so a
-  // fix flips this deliberately.
-  test("standard path (no FIFO), the same lost-B / delayed-A sequence with skip-current on: B is NOT indexed (known gap, pinned)", async () => {
+  // Standard-path parity (Skip 252405604327505920): the physical pointer-row currency check now runs on the standard
+  // queue too whenever skip-current is on, from each key's pointer-stage live ETag.
+  test("standard path (no FIFO), the same lost-B / delayed-A sequence with skip-current on: the pass runs with skip-current OFF and indexes B", async () => {
     const r = await hostedRig(x, cleanup);
     const key = x.keys[1]!;
     await r.tick({});
@@ -129,6 +127,30 @@ describe("ordered consumer, real search stage, skip-current on", () => {
     // A delayed S3 notification for A, through processBatch (the standard queue), skip-current ON.
     const res = await r.tick({ skipCurrent: true });
     expect(res.batchItemFailures).toEqual([]);
-    expect(r.fake.dump()).not.toEqual(indexedB);
+    expect(r.fake.dump()).toEqual(indexedB);
+  }, 120_000);
+
+  test("standard path, flag-off control: skip-current off, the same sequence runs the normal pass and indexes B (no currency read needed)", async () => {
+    const r = await hostedRig(x, cleanup);
+    await r.tick({});
+    expect((await indexSearchScope(SCOPE, r.search())).complete).toBe(true);
+    await replaceSameRevision(x.keys[2] ?? x.keys[0]!);
+    const fresh = await hostedRig(x, cleanup);
+    await fresh.tick({});
+    expect((await indexSearchScope(SCOPE, fresh.search())).complete).toBe(true);
+    expect((await r.tick({})).batchItemFailures).toEqual([]);
+    expect(r.fake.dump()).toEqual(fresh.fake.dump());
+  }, 120_000);
+
+  test("standard path, matching-current control: skip-current on and A still live, the pass is skipped as before", async () => {
+    const r = await hostedRig(x, cleanup);
+    await r.tick({});
+    expect((await indexSearchScope(SCOPE, r.search())).complete).toBe(true);
+    const reads = r.reads.count;
+    r.fake.calls.length = 0;
+    expect((await r.tick({ skipCurrent: true })).batchItemFailures).toEqual([]);
+    expect(r.fake.calls.length).toBe(0);
+    // The pointer stage read each manifest; the search stage read nothing.
+    expect(r.reads.count - reads).toBeLessThanOrEqual(x.keys.length);
   }, 120_000);
 });

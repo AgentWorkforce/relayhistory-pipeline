@@ -26,8 +26,8 @@ import { processBatch, type ConsumerDeps } from "../consumer.ts";
 import { droppedFanout } from "../pointer.ts";
 import { dispatchSqsBatch, type RevisionWiring, type SqsRecord } from "../revision-dispatch.ts";
 import { revisionMessage, type RevisionEvent } from "../revision-events.ts";
-import { DEADLINE_MARK_PREFIX, captureLargeReadSource, deadlineMarkName, enqueueLargeRead, largeReadProgress } from "../search-deadline-isolation.ts";
-import { parseQueueBody, type LargeReadHoldBody } from "../s3-events.ts";
+import { DEADLINE_MARK_PREFIX, captureLargeReadSource, deadlineMarkName, enqueueLargeRead, holdId, largeReadProgress } from "../search-deadline-isolation.ts";
+import { parseQueueBody, requeueBody, type LargeReadHoldBody } from "../s3-events.ts";
 import { clonedReplayDatabase, closeReplayTemplate, createFsStore, exportReplayFixture } from "./replay-fixture.ts";
 import { recordingReplayClickHouse } from "./replay-clickhouse-fixture.ts";
 
@@ -261,5 +261,47 @@ describe("(c) delayed and duplicate A against B: B's queue work stays intact", (
       expect({ epoch: hold.epoch, fingerprint: hold.fingerprint }).toEqual({ epoch: b.epoch, fingerprint: b.fingerprint });
     }
     expect(passes).toBe(0);
+  }, 60_000);
+
+  // A hold-only delivery bound to A (a standard-queue message carrying A's expected incarnation), as opposed to the
+  // ordinary manifest hints above. On the FIFO deployment holds always travel the standard queue (the out-of-group
+  // handoff), so this is the path a delayed or duplicate A hold takes on both deployments.
+  const A = { epoch: "1", fingerprint: "f".repeat(64) };
+  const holdA = (seq: number) => ({ ...A, seq, id: holdId({ ...own, sessionId: "large:replay" }, A, seq) });
+  const byIncarnation = (f: F) => f.standard.map((m) => (m.hold ? `${m.hold.epoch}:${m.hold.fingerprint.slice(0, 4)}#${m.hold.seq}` : "plain"));
+
+  test("hold-only A, B already enqueued: delayed then duplicate A hold acks as covered; NO send at all (B's hold neither created nor extended)", async () => {
+    const f = await fixture();
+    f.deps.deadlineIsolation = { ...f.deps.deadlineIsolation!, current: (scope) => captureLargeReadSource(f.x.db, scope) };
+    await enqueueLargeRead(f.x.db, own);
+    markNow(f);
+    const before = await jobRow(f);
+    for (const body of [requeueBody(f.key, undefined, holdA(3)), requeueBody(f.key, undefined, holdA(3))]) {
+      f.clock.t += 1_000;
+      expect(await f.plain(body)).toEqual([]);
+    }
+    expect(f.standard).toEqual([]);
+    expect(await jobRow(f)).toEqual(before);
+    expect(passes).toBe(0);
+  }, 60_000);
+
+  test("hold-only A, B not yet enqueued: each A hold re-holds for A only (A's incarnation, next seq); no send for B's incarnation; then B's own hint creates B's single hold", async () => {
+    const f = await fixture();
+    f.deps.deadlineIsolation = { ...f.deps.deadlineIsolation!, current: (scope) => captureLargeReadSource(f.x.db, scope) };
+    markNow(f);
+    const b = (await captureLargeReadSource(f.x.db, own))!.source;
+    f.clock.t += 1_000;
+    expect(await f.plain(requeueBody(f.key, new Date(f.clock.t).toISOString(), holdA(3)))).toEqual([]);
+    // The duplicate of the SAME A hold (seq 3) mints the same successor id, and still only for A.
+    expect(await f.plain(requeueBody(f.key, new Date(f.clock.t).toISOString(), holdA(3)))).toEqual([]);
+    expect(byIncarnation(f)).toEqual(["1:ffff#4", "1:ffff#4"]);
+    expect(f.standard.every((m) => m.hold!.id === holdA(4).id)).toBe(true);
+    expect(f.standard.some((m) => m.hold!.fingerprint === b.fingerprint)).toBe(false);
+    expect(await f.jobs()).toEqual([]);
+    // B's own ordinary hint (FIFO) routes and creates exactly one hold, for B's incarnation.
+    f.clock.t += 1_000;
+    expect(await f.fifo([await f.fifoRecord(1)])).toEqual([]);
+    expect(f.standard.slice(2).map((m) => m.hold && { epoch: m.hold.epoch, fingerprint: m.hold.fingerprint })).toEqual([{ epoch: b.epoch, fingerprint: b.fingerprint }]);
+    expect(await f.jobs()).toEqual([expect.objectContaining({ state: "queued" })]);
   }, 60_000);
 });

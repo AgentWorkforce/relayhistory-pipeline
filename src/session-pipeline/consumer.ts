@@ -416,7 +416,7 @@ export async function processBatch(records: readonly QueueRecord[], deps: Consum
     }
   }
 
-  const scopes = new Map<string, { scope: SessionScope; messageIds: string[]; manifestKey: string; covered: Covered; revisions: Revised[] }>();
+  const scopes = new Map<string, { scope: SessionScope; messageIds: string[]; manifestKey: string; covered: Covered; revisions: Revised[]; live: LiveKey[] }>();
   for (const { event: carriedEvent, messageIds, covered } of byKey.values()) {
     const started = Date.now();
     /** This key's pointer work starts (consumer clock). */
@@ -472,11 +472,14 @@ export async function processBatch(records: readonly QueueRecord[], deps: Consum
       const revisions = checkRevisions(revisionsByKey.get(event.key) ?? [], outcome, recordOf, now, { startedAt: pointerStartedAt, doneAt: now() });
       const id = scopeId(outcome.scope);
       const held = scopes.get(id);
+      // Every key the pointer stage just read, with the live ETag it read (absent for a delete): the physical-currency check.
+      const liveKey: LiveKey = { key: event.key, ...(outcome.status !== "deleted" && outcome.live?.etag ? { etag: outcome.live.etag } : {}), deleted: outcome.status === "deleted" };
       if (held) {
         held.messageIds.push(...messageIds);
         held.revisions.push(...revisions);
+        held.live.push(liveKey);
         merge(held.covered, covered);
-      } else scopes.set(id, { scope: outcome.scope, messageIds: [...messageIds], manifestKey: outcome.manifestKey, revisions, covered: { ...covered, ...(covered.holds ? { holds: [...covered.holds] } : {}) } });
+      } else scopes.set(id, { scope: outcome.scope, messageIds: [...messageIds], manifestKey: outcome.manifestKey, revisions, live: [liveKey], covered: { ...covered, ...(covered.holds ? { holds: [...covered.holds] } : {}) } });
     } catch (error) {
       const { fields, code } = errorCodeFields(error);
       // A 40001 / XX000 (the error's own string code, never the name fallback) also logs which known failure it was
@@ -516,7 +519,7 @@ export async function processBatch(records: readonly QueueRecord[], deps: Consum
     }catch(error){log.warn("large scope job state unavailable",{stage:"large-read",...ids,...errorFields(error)})}
   }
   if (deps.search) {
-    for (const { scope, messageIds, manifestKey, covered, revisions } of scopes.values()) {
+    for (const { scope, messageIds, manifestKey, covered, revisions, live } of scopes.values()) {
       if (delegated.has(scopeId(scope)) || messageIds.every((id) => failed.has(id))) continue;
       const started = Date.now();
       // The covering search pass's start on the consumer clock (ordered.now in tests). NOT the pickup endpoint:
@@ -534,8 +537,10 @@ export async function processBatch(records: readonly QueueRecord[], deps: Consum
       // 1cb42716). alreadyCurrent compares keys and revision numbers only, so after a same-key, same-revision
       // replacement (B's notification lost, the pointer row still at A) it would credit a delayed A as current and
       // skip before reading B. Without physical currency the pass runs with skip-current OFF and reads the live object.
-      const physicallyCurrent = ordered && revisions.length > 0
-        ? await pointerRowsAreLive(deps.pointer.db, scope, revisions).catch(() => false)
+      // Both queue paths whenever skip-current is on (standard-path parity, Skip 252405604327505920); ordered mode also
+      // for its own superseded-only skip. Flag off on the standard path: not computed, no extra statement.
+      const physicallyCurrent = (ordered && revisions.length > 0) || deps.search.skipCurrent
+        ? await pointerRowsAreLive(deps.pointer.db, scope, live).catch(() => false)
         : undefined;
       if (ordered && supersededOnly(messageIds, revisions) && physicallyCurrent === true &&
           await (deps.searchCoverage ?? ((s: SessionScope) => coverageProven(s, deps.search!)))(scope).catch(() => false)) {
@@ -778,9 +783,14 @@ const unquoteEtag = (v: string | null | undefined) => (v ? v.replace(/^"|"$/g, "
  * names the SAME object (ETag) that the pointer pass just read as live. A key without a live stamp, or a row that
  * names another object, is no proof.
  */
-async function pointerRowsAreLive(db: PointerDeps["db"], scope: SessionScope, revisions: readonly Revised[]): Promise<boolean> {
+/** A key the pointer stage read in this batch: its live ETag (absent when unknown) or a delete. */
+interface LiveKey { key: string; etag?: string; deleted: boolean }
+
+async function pointerRowsAreLive(db: PointerDeps["db"], scope: SessionScope, keys: readonly LiveKey[]): Promise<boolean> {
   const liveByKey = new Map<string, string | undefined>();
-  for (const r of revisions) liveByKey.set(r.event.key, unquoteEtag(r.liveStamp?.etag));
+  // A delete in the batch: the pass must run (erase); no physical proof.
+  if (keys.some((k) => k.deleted)) return false;
+  for (const k of keys) liveByKey.set(k.key, unquoteEtag(k.etag));
   if (liveByKey.size === 0 || [...liveByKey.values()].some((e) => e === undefined)) return false;
   const { rows } = await db.query<{ manifest_key: string; manifest_etag: string | null }>(
     `SELECT manifest_key, manifest_etag FROM sessions.session_index
