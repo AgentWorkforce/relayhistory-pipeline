@@ -39,6 +39,7 @@
     "migration:neon-s3-erasure": "bun run src/migration/neon-s3-erasure/main.ts",
     "e2e:selfhost": "bun run e2e/selfhost/run.ts",
     "e2e:pipeline": "bun run e2e/pipeline/run.ts",
+    "e2e:cutover": "bun run e2e/cutover/run.ts",
     "migration:legacy-export": "bun run src/migration/legacy-export/main.ts"
   },
   "dependencies": {
