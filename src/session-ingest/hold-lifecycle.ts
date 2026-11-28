@@ -65,8 +65,9 @@ export const PENDING_BATCHES_SQL = `SELECT count(*)::int AS n FROM sessions.inge
  * Unexpired seed captures of the org (20261104040000 ingest_seed_scope_capture; ingest_seed_proven_records refuses an
  * expired one, so expiry is schema-terminal). Read in the install transaction after _install took the org key, it
  * catches a COMMITTED capture only: capture issuance is classified unaffected and takes no org key, so a racing
- * capture is not excluded (gap C, the 062320 owner's). The seeder (scripts/session-ingest-seed.ts) is operator-run;
- * a run refused during the hold writes nothing, and its next run re-captures every scope.
+ * capture is not excluded (gap C; slot 062390, sessions-authority-evidence). The seeder (scripts/session-ingest-seed.ts)
+ * is operator-run only: a run refused during the hold writes nothing, and a later operator-run pass would re-capture,
+ * but nothing schedules one.
  */
 export const SEED_CAPTURES_ACTIVE_SQL = `SELECT count(*)::int AS n FROM sessions.ingest_seed_captures WHERE org_id = $1::text AND expires_at > clock_timestamp()`;
 export const HOLD_BIND_FUNCTION = "sessions.ingest_org_erasure_history_bind";
@@ -316,7 +317,8 @@ export const HOLD_TOOL_REFUSALS = ["usage", "orgs", "hold_execute_held", "stdin_
   "wave_orgs_empty", "wave_orgs_oversized", "wave_org_invalid", "wave_org_duplicate", "wave_concurrency_invalid", "internal_error"] as const;
 
 /** The summary a hold receipt may carry: exact, the scope's org hashes each once, counts derived, step = the mode's. */
-export function holdReceiptSummary(summary: unknown, ctx: { step: HoldStep; orgs: readonly string[] | null; approved?: readonly string[] }): { summary: unknown; ok: boolean } {
+export function holdReceiptSummary(summary: unknown, ctx: { step: HoldStep; orgs: readonly string[] | null;
+  approved?: readonly { orgHash: string; epochHash: string | null }[] }): { summary: unknown; ok: boolean } {
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   const o = summary as any;
   if (o && typeof o === "object" && !Array.isArray(o) && Object.keys(o).length === 1 && Object.hasOwn(o, "refused"))
@@ -336,14 +338,53 @@ export function holdReceiptSummary(summary: unknown, ctx: { step: HoldStep; orgs
   // An execute's in-wave rows are EXACTLY the bound hold-dry's approved org hashes (set and count), each once.
   if (ctx.step !== "dry") {
     if (!ctx.approved || ctx.approved.length === 0) return bad;
-    const want = [...ctx.approved].sort(), have = inWave.map((p) => p.org_hash).sort();
+    const want = ctx.approved.map((a) => a.orgHash).sort(), have = inWave.map((p) => p.org_hash).sort();
     if (new Set(want).size !== want.length || have.length !== want.length || !have.every((h, i) => h === want[i])) return bad;
   }
   if (per.some((p) => (p.verdict === done) !== (p.refused === null) && p.verdict !== "not_in_wave")) return bad;
   if (per.some((p) => p.verdict !== done && p.verdict !== "refused" && p.verdict !== "not_in_wave")) return bad;
   if (per.some((p) => p.verdict === "not_in_wave" && p.refused !== "not_in_wave")) return bad;
+  // Every SUCCESS row must agree with its own fields: the verdict is never trusted alone (Pipeline 97fcda3af1ad).
+  if (!per.filter((p) => p.verdict === done).every((p) => successRowConsistent(ctx.step, p, ctx.approved))) return bad;
+  // A dry's refused row carries a code its own fields support (d5 cac350e4353c).
+  if (ctx.step === "dry" && !per.filter((p) => p.verdict === "refused").every(dryRefusalConsistent)) return bad;
   // A dry succeeds with one ready org; an execute only when EVERY in-wave org completed (a refused in-wave row fails it).
   return { summary, ok: ctx.step === "dry" ? n > 0 : o.complete === true && inWave.every((p) => p.verdict === done) };
+}
+
+/**
+ * A success row is consistent with the fields it reports:
+ *   dry `ready`, no live hold (absent, released): fan-out proven, pending, canonical and seed counts all present and 0,
+ *     no epoch (the dry's own readiness rule);
+ *   dry `ready`, a live hold (held, sealed): an epoch hash and every count present; never marker_attempted or unread;
+ *   `installed`: held, with an epoch hash, approved without one (an install has none to approve);
+ *   `sealed`: sealed, `rolled_back`: released, each at exactly the epoch hash the dry approved for that org.
+ */
+export function successRowConsistent(step: HoldStep, p: HoldOrgResult, approved?: readonly { orgHash: string; epochHash: string | null }[]): boolean {
+  const counted = [p.pending_batches, p.canonical_committed, p.seed_captures].every((c) => typeof c === "number");
+  const a = approved?.find((x) => x.orgHash === p.org_hash);
+  if (step === "dry") {
+    if (!counted || (p.fanout !== "proven" && p.fanout !== "unproven")) return false;
+    if (p.hold === "absent" || p.hold === "released")
+      return p.fanout === "proven" && p.pending_batches === 0 && p.canonical_committed === 0 && p.seed_captures === 0 && p.epoch_hash === null;
+    return (p.hold === "held" || p.hold === "sealed") && typeof p.epoch_hash === "string";
+  }
+  if (!a) return false;
+  if (step === "install") return p.hold === "held" && typeof p.epoch_hash === "string" && a.epochHash === null;
+  if (step === "seal") return p.hold === "sealed" && typeof a.epochHash === "string" && p.epoch_hash === a.epochHash;
+  return p.hold === "released" && typeof a.epochHash === "string" && p.epoch_hash === a.epochHash;
+}
+
+/** A dry refusal whose code is about a field must report that field accordingly; other codes (a read error) stand alone. */
+export function dryRefusalConsistent(p: HoldOrgResult): boolean {
+  switch (p.refused) {
+    case "hold_pending_batch": return typeof p.pending_batches === "number" && p.pending_batches > 0;
+    case "hold_canonical_history": return typeof p.canonical_committed === "number" && p.canonical_committed > 0;
+    case "hold_seed_capture_active": return typeof p.seed_captures === "number" && p.seed_captures > 0;
+    case "hold_fanout_unproven": return p.fanout === "unproven";
+    case "hold_marker_attempted": return p.hold === "marker_attempted";
+    default: return p.refused !== null;
+  }
 }
 
 /**

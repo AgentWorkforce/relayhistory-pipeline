@@ -36,7 +36,10 @@ const target = {
 };
 const on = (env: Record<string, string>) => backlogOpsDispatch(env, true, false, false, false, true);
 const dryRow = (o: string, hold: string, epoch: string | null, verdict = "ready") =>
-  ({ org_hash: H(o), epoch_hash: epoch, hold, pending_batches: 0, canonical_committed: 0, seed_captures: 0, fanout: "unproven", verdict,
+  // A consistent row: an absent/released ready row has its fan-out proven (synthetic); a refused one carries the pending
+  // batch its code names.
+  ({ org_hash: H(o), epoch_hash: epoch, hold, pending_batches: verdict === "ready" ? 0 : 1, canonical_committed: 0, seed_captures: 0,
+    fanout: (hold === "absent" || hold === "released") && verdict === "ready" ? "proven" : "unproven", verdict,
     refused: verdict === "ready" ? null : "hold_pending_batch" });
 const drySummary = (rows: ReturnType<typeof dryRow>[]) => ({ mode: "dry_run", tool: "hold_lifecycle", step: "dry", org_count: rows.length, wave_org_count: rows.length,
   done_count: rows.filter((r) => r.verdict === "ready").length, complete: rows.every((r) => r.verdict === "ready"), per_org: rows });
@@ -155,7 +158,8 @@ test("an execute receipt is complete only when EVERY approved org reached the st
   const summary = (rows: unknown[], over: Record<string, unknown> = {}) => JSON.stringify({ mode: "execute", tool: "hold_lifecycle", step: "seal", org_count: 2,
     wave_org_count: 2, done_count: 2, complete: true, per_org: rows, ...over });
   const t = backlogOpsTarget(target), home = backlogOpsHomeId({ bucket: t.bucket, region: t.region }, null);
-  const fin = (stdout: string, approved: string[] | null = [H(A), H(B)]) => finalReceipt(d, "9", 0, stdout, SCOPE_ID, ORGS, "none", "none", home, null, approved);
+  const AP = [{ orgHash: H(A), epochHash: E("a") }, { orgHash: H(B), epochHash: E("b") }];
+  const fin = (stdout: string, approved: { orgHash: string; epochHash: string | null }[] | null = AP) => finalReceipt(d, "9", 0, stdout, SCOPE_ID, ORGS, "none", "none", home, null, approved);
   const ok = fin(summary([row(A, "sealed", null), row(B, "sealed", null)]));
   expect([ok.exitCode, (ok.summary as any).complete]).toEqual([0, true]);
   // The lander's case: [sealed, refused] claiming wave_org_count 1, done 1, complete true, no not_in_wave row.
@@ -171,6 +175,37 @@ test("an execute receipt is complete only when EVERY approved org reached the st
   // And without the bound approval an execute receipt never validates.
   expect(fin(summary([row(A, "sealed", null), row(B, "sealed", null)]), null).summary).toEqual({ refused: "backlog_ops_receipt_schema" });
   // A not_in_wave row the dry did NOT approve is fine.
-  const one = fin(summary([row(A, "sealed", null), row(B, "not_in_wave", "not_in_wave")], { wave_org_count: 1, done_count: 1, complete: true }), [H(A)]);
+  const one = fin(summary([row(A, "sealed", null), row(B, "not_in_wave", "not_in_wave")], { wave_org_count: 1, done_count: 1, complete: true }), [AP[0]!]);
   expect([one.exitCode, (one.summary as any).complete]).toEqual([0, true]);
+});
+
+test("every success row must agree with its own fields: a contradictory ready or done row never approves (each field, nulls included)", () => {
+  // A dry: A is an absent org claimed ready; B a held org claimed ready.
+  const ready = { ...dryRow(A, "absent", null), fanout: "proven" };
+  const heldReady = dryRow(B, "held", E("b"));
+  const dry = (a: Record<string, unknown>, b: Record<string, unknown> = heldReady) => JSON.stringify({ summary: drySummary([a as never, b as never]) });
+  expect(checkHoldDryReceipt(dry(ready), ORGS, "install")).toEqual([{ orgHash: H(A), epochHash: null }]);
+  for (const bad of [{ fanout: "unproven" }, { fanout: "not_read" }, { pending_batches: 1 }, { pending_batches: null }, { canonical_committed: 1 },
+    { canonical_committed: null }, { seed_captures: 1 }, { seed_captures: null }, { epoch_hash: E("9") }, { hold: "marker_attempted" }, { hold: "not_read" }])
+    expect([bad, code(() => checkHoldDryReceipt(dry({ ...ready, ...bad }), ORGS, "install"))]).toEqual([bad, "backlog_ops_bound_hold_dry"]);
+  // A held org claimed ready without an epoch.
+  expect(code(() => checkHoldDryReceipt(dry(ready, { ...heldReady, epoch_hash: null }), ORGS, "seal"))).toBe("backlog_ops_bound_hold_dry");
+  // A refused row's code must match its fields.
+  const refusedRow = (over: Record<string, unknown>) => ({ ...dryRow(B, "absent", null, "refused"), ...over });
+  expect(checkHoldDryReceipt(dry(ready, refusedRow({ refused: "hold_pending_batch", pending_batches: 2 })), ORGS, "install")).toHaveLength(1);
+  for (const [r, over] of [["hold_pending_batch", { pending_batches: 0 }], ["hold_canonical_history", { canonical_committed: 0 }], ["hold_seed_capture_active", { seed_captures: null }],
+    ["hold_fanout_unproven", { fanout: "proven" }], ["hold_marker_attempted", { hold: "held" }]] as const)
+    expect([r, code(() => checkHoldDryReceipt(dry(ready, refusedRow({ refused: r, ...over })), ORGS, "install"))]).toEqual([r, "backlog_ops_bound_hold_dry"]);
+  // Execute rows, through finalReceipt: a done row must report the step's state at the approved epoch.
+  const W = E("7");
+  const seal = on({ BACKLOG_OPS_MODE: "hold-seal-execute", BACKLOG_OPS_SHA: SHA, BACKLOG_OPS_DRY_RUN: "803", BACKLOG_OPS_FULL_BACKFILL_RUN: "802", BACKLOG_OPS_WAVE_ID: W,
+    BACKLOG_OPS_CONFIRMATION: `HOLD-SEAL-EXECUTE ${SHA} DRY 803 FULL 802 WAVE ${W}` });
+  const t = backlogOpsTarget(target), home = backlogOpsHomeId({ bucket: t.bucket, region: t.region }, null);
+  const AP = [{ orgHash: H(A), epochHash: E("a") }, { orgHash: H(B), epochHash: E("b") }];
+  const execRow = (o: string, over: Record<string, unknown> = {}) => ({ org_hash: H(o), epoch_hash: E(o === A ? "a" : "b"), hold: "sealed", pending_batches: null,
+    canonical_committed: null, seed_captures: null, fanout: "not_read", verdict: "sealed", refused: null, ...over });
+  const out = (rows: unknown[]) => JSON.stringify({ mode: "execute", tool: "hold_lifecycle", step: "seal", org_count: 2, wave_org_count: 2, done_count: 2, complete: true, per_org: rows });
+  expect(finalReceipt(seal, "9", 0, out([execRow(A), execRow(B)]), SCOPE_ID, ORGS, "none", "none", home, null, AP).exitCode).toBe(0);
+  for (const bad of [{ hold: "held" }, { hold: "released" }, { epoch_hash: null }, { epoch_hash: E("9") }])
+    expect([bad, finalReceipt(seal, "9", 0, out([execRow(A, bad), execRow(B)]), SCOPE_ID, ORGS, "none", "none", home, null, AP).summary]).toEqual([bad, { refused: "backlog_ops_receipt_schema" }]);
 });

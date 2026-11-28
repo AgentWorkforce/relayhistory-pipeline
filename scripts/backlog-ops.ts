@@ -436,7 +436,7 @@ export async function backlogOpsRun(
   } else {
     const { code, stdout } = await run(backlogOpsChildSpawn(env, d, aws, dbUrl, session, bound));
     receipt = finalReceipt(d, env.GITHUB_RUN_ID!, code, stdout, scope.id, scope.orgs, ledger, nhpId, home, since,
-      bound.hold ? bound.hold.approved.map((a) => a.orgHash) : null);
+      bound.hold ? bound.hold.approved : null);
     exit = receipt.exitCode === 0 && code === 0 ? 0 : 1;
   }
   writePrivate(paths.receipt, receipt);
@@ -507,7 +507,7 @@ function schemaKindOf(d: BacklogOpsDispatch): AuthorityReceiptKind | null {
  * before it is persisted or logged; a refusal keeps only a code from the mode's closed map.
  */
 export function finalReceipt(d: BacklogOpsDispatch, run: string, code: number, stdout: string, scopeId: string, orgs: string[] | null, ledger: string,
-  nhpId: string, home: string | null, since: number | null, holdApproved: readonly string[] | null = null) {
+  nhpId: string, home: string | null, since: number | null, holdApproved: readonly { orgHash: string; epochHash: string | null }[] | null = null) {
   const schemaKind = schemaKindOf(d);
   let receipt;
   try {
