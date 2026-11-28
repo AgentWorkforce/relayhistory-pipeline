@@ -293,3 +293,112 @@ before and after IO, and the S3 drained marker is only a projection of it.
   - a crash after the intent, after the bytes and after the row;
   - a lost ACK on each put, then a retry.
   Driven by an in-memory verdict function until the visibility-row stand-in exists.
+
+### Inventory: the mutation entry points behind the 15 history sources (source read at 6d60dc4f)
+
+There are about 25 SQL writer entry points, all owner-run functions. No runtime role has DML on any of the 15
+tables. The only direct TypeScript DML is in scripts/frozen-source-copy.ts and the owner-buffered-parity CI fixtures.
+
+| Family | Entry points (latest body) | 062320 class | S3 effect and order |
+|---|---|---|---|
+| Selection | `ingest_set_session_uploads` (via `_internal`, `ingest_apply_ordered_control`, `ingest_apply_selection`) | control | Disable: S3 first. Enable: SQL first, then S3. Ordered: S3 begin, then SQL, then S3 finish (app.ts:1075-1087) |
+| Selection | `ingest_selfhost_set_session_uploads` | control | **None** |
+| Reset | `ingest_reset_uploaded_sessions` (via `ingest_apply_reset`) | control | S3 first; `withSqlControlMirror` reconciles (ledger-s3) |
+| Turns | `ingest_turn_register` (via `ingest_turn_materialize_fence`) | control | **None** (SQL-only fence deletions) |
+| Admission side effects | `ingest_commit_batch` (rearm, `ingest_erase_fence_extend`), `ingest_commit_buffered_batch`, `ingest_claim_batch_mode`, `ingest_commit_revisions`, `ingest_claim_buffered_batch` (lazy begin, user, records) | admission | S3 objects before the commit, or SQL first at the claim |
+| Seeding | `ingest_seed_fence_baseline` | unaffected | **None** |
+| Session erase | `ingest_operator_runtime_begin` (scopes, runs, receipts, events, fences, deletions); `_step` and `_purge`; `_write_begin`, `_write_finish` and `_write_failed` (writes); `_next`, `_authorize` and `_release` (runs, lease only) | erasure / unaffected | SQL begin first. Bytes are erased later by the worker, S3 first and then the step (runtime.ts:156-177). Self-host s3 writes a tombstone after the begin |
+| User erase | `operator_user_erase_begin`, `_step` (purges deletions, resets, rearm), `_complete`; `relayfacts_user_erase_v1` (relayfacts fences, before the begin) | erasure (begin) / owner | SQL first, then the S3 byte erase, then complete. Relayfacts: **none** |
+| Privacy authority | `ingest_privacy_authority_begin` and `ingest_privacy_authority_activate` (frozen-source deletions and resets; `session_analysis_purge_grant` / `purge_session_analysis_for_owned` through dynamic EXECUTE: purge authority and fences) | unaffected / owner | **None** on these paths |
+
+**Capture.** 062340 puts AFTER INSERT/UPDATE/DELETE row triggers (`ingest_org_erasure_history_record`) on all 15
+tables. Each one inserts a row into the insert-only `sessions.ingest_org_erasure_history` and **takes the org hold key
+SHARED until commit**. BEFORE TRUNCATE triggers refuse a truncate, and `recording()` detects disarmed triggers. This
+is the one serialization point every one of the ~25 writers passes through, the SQL-only ones included: no eraser
+mirror is needed.
+
+### (1) Revocation authority, its ordering with the SQL commit, and in-flight reads
+
+- **Authority.** SQL, for an enrolled org during and after its hold: a visibility row per effect (unit and keys
+  from section 3) and the erasure history. Proposed table (needs a future slot): `cutover_effects`. It has no
+  `org_id` column and no `ingest_`/`upload_` prefix, so lazy-begin bootstrap scans ignore it.
+- **Publish.** One READ COMMITTED transaction per effect, or per stage's effects:
+  1. `pg_advisory_xact_lock` on the org hold key, **EXCLUSIVE**. It waits for every in-flight write to any of the 15
+     tables, because their capture triggers hold the key SHARED until commit.
+  2. In a later statement (a fresh snapshot after the grant):
+     - the hold is the enrolled request's epoch and not released;
+     - the writer's fencing token equals the org's current SQL drain token (see 2);
+     - no erasure-history row covers the effect's scope (org, workspace, user, session) after the bound export
+       snapshot position;
+     - the generation (epoch, resets) still matches.
+  3. Insert the row as visible, and commit.
+- **Revocation.** It is the erasure itself. The history row commits atomically with the erase's own SQL write, in
+  the same transaction. The verdict for an effect is visible when its row exists AND no history row covering its
+  scope is positioned after the row's publish position. A publish holds the key EXCLUSIVE and every history insert
+  holds it SHARED, so each history row is strictly before (seen by the publish check, which then refuses) or after
+  (it revokes) a publish. Read exclusion is immediate at the erase commit, with no replay. Byte deletion follows
+  later (replay, re-arm sweeper) and does not affect visibility.
+  - Open check: "position" must be a history ordering assigned after the trigger's lock, such as an identity taken in
+    the trigger's INSERT. Verify it against 062340's columns before the slot.
+- **Reads in progress.** The reader calls one batched, tenant-bound verdict function per scope (`bulls96_read_api`:
+  a grant, migration and role-verify dependency) before IO and again after IO, on success and on failure, inside
+  the operator-fence bracket. An erase that commits during the IO fails the post-IO verdict, which is answered as the
+  operator fence answers. 404 `session_fenced` and the terminal 503 `operator_fence_unavailable` take precedence, and
+  a refusal is never fallback-eligible. A response completed before the erase commit is linearized before it.
+- **S3 outage.** An erase never needs S3 for its SQL commit, and revocation is that commit. Reads stay excluded, and
+  byte deletion resumes with S3.
+- **After bridge_complete.** New publishes refuse (the hold is released). Rows and history remain, so a later erase
+  still revokes every SQL-tracked effect at its commit, until its bytes are gone.
+
+### (2) Registration and exclusion of late stages and direct claims, without enumeration
+
+A prefix listing cannot close the writer set, so exclusion is not by enumeration. For an enrolled org, a canonical
+manifest entry is served only when one of three things holds:
+- (a) it is within the enrollment baseline;
+- (b) it maps to a visible effect row;
+- (c) it is a direct entry whose batch record was committed under bridge stamp G.
+
+The baseline is the per-session manifest version captured BEFORE the enrollment PUT and stored beside the
+enrollment. Every entry appended after the capture, legitimate or stale, needs (b) or (c).
+- **Late or retried drain stage.** It can be read only through a publish, which checks the SQL drain token. The
+  bridge step bumps that token under the key, so a drain that lost its lease, or a delayed retry, is refused
+  atomically at the decision. Bytes it already wrote are never served and get re-armed.
+- **Direct claims.** Claims after enrollment are refused by `enrolledGate` until the bridge record exists. A claim
+  then stamps its batch record with G. A commit of an enrolled org's batch requires the stamp. A claim made before
+  enrollment that commits later, even after P, finds no stamp and is refused (`ledger_attempt_superseded`). The
+  client's retry re-claims, and the claim CAS-replaces the unstamped pending record with a stamped one and a new
+  token, so the old writer can never commit. That decision is made at the batch record, the authoritative object, with
+  no listing.
+- **Direct batches committed before enrollment but appended after the baseline capture.** They are legitimate
+  content and are adopted. The bridge tool, and any rerun, publishes their effect rows through the same EXCLUSIVE and
+  history-checked publish. A commit that raced the enrollment and missed one adoption pass is invisible (fail closed)
+  until a later idempotent adoption pass publishes it, never without the history check.
+- **Already-issued writes.** Bytes landing at any time after losing authority never satisfy (a), (b) or (c), so they
+  are never readable.
+
+### Stand-in interface for the synthetic proofs (sessions-buffered-drain-materialization)
+
+```ts
+interface CutoverVisibility {
+  /** The EXCLUSIVE-key publish. A refusal is a terminal code; the effect stays unserved. */
+  publish(e: { org: string; kind: "drain" | "direct"; digest: string; sessionKey: string; generation: [epoch: number, resets: number]; token?: number }):
+    Promise<"visible" | "refused_erased" | "refused_released" | "refused_token" | "refused_generation">;
+  /** Batched verdict for one read scope (called before and after IO). */
+  verdict(org: string, effects: { kind: "drain" | "direct"; digest: string; sessionKey: string }[]): Promise<Map<string, "visible" | "revoked" | "absent">>;
+  /** Test hook: one erasure-history row for a scope (stands in for any of the ~25 writers through the capture trigger). */
+  erase(org: string, scope: { workspaceId?: string; userId?: string; sessionKey?: string }): Promise<void>;
+  /** The bridge step's token bump (drain fencing). */
+  bumpToken(org: string): Promise<number>;
+}
+```
+
+### Serving paths (inventory owed with sessions-partial-canonical)
+
+Candidates that read canonical manifests or chunks, found by grep and still to be confirmed per path:
+- the session read API (`canonical-projection.ts`, `canonical-stream-projection.ts`);
+- `packages/session-read-worker`;
+- the pipeline package (`relayhistory-transform`, `reconcile`, `adapter`, `manifest-readiness`);
+- the HoopDb search indexer (`src/hoopdb/indexer.ts`);
+- the session-analysis runner;
+- the neon-s3 sync and erasure tools.
+Every confirmed path must enforce the verdict, or be shown never to read an enrolled org's manifests.
