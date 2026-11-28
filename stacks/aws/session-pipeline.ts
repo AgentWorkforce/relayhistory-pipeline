@@ -282,9 +282,12 @@ export const BUFFERED_SEARCH_FEED_GATE_CONTRACT = "buffered-search-gate/v1";
 export const BRIEF_SCHEDULE_MINUTES = 1;
 export const SESSION_ANALYSIS_CACHE_RESOURCES=["session-analysis-cache-schedule","session-analysis-cache-permission","session-analysis-reconcile-schedule","session-analysis-reconcile-permission"] as const;
 
-/** Function timeout; the queue's visibility timeout is six times this (AWS guidance for SQS sources). */
+/** Indexing Lambda timeout. */
 export const FUNCTION_TIMEOUT_SECONDS = 300;
-export const VISIBILITY_TIMEOUT_SECONDS = 6 * FUNCTION_TIMEOUT_SECONDS;
+export const VISIBILITY_TIMEOUT_SECONDS = 330;
+export function sessionEventsVisibilitySeconds(stage: string): number {
+  return stage === "aws-sessions-prod" ? VISIBILITY_TIMEOUT_SECONDS : 6 * FUNCTION_TIMEOUT_SECONDS;
+}
 /** Receives before a message moves to the DLQ. */
 export const MAX_RECEIVE_COUNT = 8;
 /** S3 events wait this long before the first delivery, so a burst of manifest writes coalesces. */
@@ -896,7 +899,7 @@ export const sessionPipelineWiring = (
     const queue = yield* AWS.SQS.Queue("session-events", {
       queueName: names.queue,
       delay: `${DELIVERY_DELAY_SECONDS} seconds`,
-      visibilityTimeout: `${VISIBILITY_TIMEOUT_SECONDS} seconds`,
+      visibilityTimeout: `${sessionEventsVisibilitySeconds(i.stage)} seconds`,
       messageRetentionPeriod: "4 days",
       receiveMessageWaitTime: "20 seconds",
       sqsManagedSseEnabled: true,

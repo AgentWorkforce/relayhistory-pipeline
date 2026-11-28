@@ -22,7 +22,7 @@ import {
   bufferedErasureDeleteScheduleProps,
   assertSessionPipelineInputs,
   SESSION_PIPELINE_RESOURCES,
-  VISIBILITY_TIMEOUT_SECONDS,
+  sessionEventsVisibilitySeconds,
   briefScheduleProps,
   bucketNotificationConfiguration,
   pipelineBucketStatements,
@@ -107,7 +107,8 @@ describe("session pipeline: wiring", () => {
   });
 
   it("visibility outlasts six function timeouts; delivery waits for a write burst", () => {
-    expect(VISIBILITY_TIMEOUT_SECONDS).toBe(6 * FUNCTION_TIMEOUT_SECONDS);
+    expect(sessionEventsVisibilitySeconds(STAGE)).toBe(330);
+    expect(sessionEventsVisibilitySeconds("aws-sessions-dev")).toBe(6 * FUNCTION_TIMEOUT_SECONDS);
     expect(DELIVERY_DELAY_SECONDS).toBeGreaterThan(0);
     expect(DELIVERY_DELAY_SECONDS).toBeLessThanOrEqual(900);
   });
