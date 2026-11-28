@@ -76,13 +76,19 @@ describe.skipIf(!url)("W2 visibility stand-in: two-connection orderings (real Po
     // b takes its xid first (no lock yet: its trigger takes the key only at the source write).
     await p.b.query("BEGIN");
     const early = (await p.b.query("SELECT pg_current_xact_id()::text x")).rows[0].x as string;
-    // a publishes and commits in between (no conflict: b holds no key).
+    // a publishes and commits in between (no conflict: b holds no key). Its own xid is taken AFTER b's.
+    await p.a.query("BEGIN");
+    const late = (await p.a.query("SELECT pg_current_xact_id()::text x")).rows[0].x as string;
     expect((await p.a.query(publishSql, [ORG, "stage-3", "s-3", bound])).rows[0].r).toBe("visible");
+    await p.a.query("COMMIT");
     // b now writes an erasure source and commits after the publish.
     await p.b.query(deletion(ORG, "s-3"));
     await p.b.query("COMMIT");
-    const probe = (await o.query(`SELECT $1::xid8 < pg_snapshot_xmax(published_snapshot) AS numerically_before,
-      pg_visible_in_snapshot($1::xid8, published_snapshot) AS visible FROM cutover_proof.effects WHERE digest = 'stage-3'`, [early])).rows[0];
+    // Numeric xid order says b came first (its xid is below the publisher's), yet b committed after the publish.
+    // (Not pg_snapshot_xmax: PostgreSQL sets it to latestCompletedXid + 1, so an in-progress xid may exceed it.
+    // The 8b7fc40e run failed on exactly that auxiliary claim, window linuyc-cvis-8b7fc40e-20261128T123823Z.)
+    const probe = (await o.query(`SELECT $1::xid8 < $2::xid8 AS numerically_before,
+      pg_visible_in_snapshot($1::xid8, published_snapshot) AS visible FROM cutover_proof.effects WHERE digest = 'stage-3'`, [early, late])).rows[0];
     expect(probe).toEqual({ numerically_before: true, visible: false });
     expect(await verdict(o, "stage-3", "s-3")).toBe("revoked");
   });
