@@ -61,7 +61,10 @@ async function rig() {
     r.pg.transaction(async (tx) => work({ query: async (t: string, p?: unknown[]) => ({ rows: (await tx.query(t, p as unknown[])).rows }) } as SqlExecutor));
   const reader = r.pointer().reader;
   const search = (skipCurrent: boolean): SearchIndexDeps => ({ transact, reader, store: r.store, adapter, prefixFor: (org) => `96bulls/${org}`, now: () => NOW, ...(skipCurrent ? { skipCurrent: true } : {}) });
-  const deps = (skipCurrent = true): ConsumerDeps => ({ pointer: r.pointer(), search: search(skipCurrent), requeue: async (k) => { r.requeued.push(k); } });
+  const failSearch = { on: false };
+  const deps = (skipCurrent = true): ConsumerDeps => ({ pointer: r.pointer(), search: search(skipCurrent), requeue: async (k) => { r.requeued.push(k); },
+    // Test seam: the search pass crashes AFTER the pointer committed (e.g. a Lambda timeout mid-pass).
+    ...(failSearch.on ? { searchPass: (async () => { throw Object.assign(new Error("synthetic search crash"), { code: "synthetic_crash" }); }) as never } : {}) });
   let n = 0;
   const etag = async (key: string) => (await r.store.head(objectKey(key)))!.version.eTag!.replace(/^"|"$/g, "");
   /** Standard queue: an S3 ObjectCreated notification for `eTag`. */
@@ -122,7 +125,7 @@ async function rig() {
     return { hints: bodies.length, failures };
   };
   const status = async (q: string) => (await app.request(`/v1/events?workspace=${scope.workspaceId}&q=${encodeURIComponent(q)}&limit=50`, { headers: { authorization: "Bearer fixture" } })).status;
-  return { r, standard, fifo, hits, etag, unauthorized, reconcile, status };
+  return { r, standard, fifo, hits, etag, unauthorized, reconcile, status, failSearch };
 }
 
 
@@ -153,6 +156,24 @@ for (const path of ["standard", "fifo"] as const) {
       expect(await t.reconcile(path)).toEqual({ hints: 1, failures: [] });
       expect(await t.hits("markerb")).toEqual(["markerb"]);
       expect(await t.hits("markera")).toEqual([]);
+    }, 60_000);
+
+    test("STRANDED under defaults: B's delivery reaches the pointer stage, its search pass crashes, and the message is then LOST (retries exhausted, no later append): the reconcile sends nothing (pointer matches the manifest) and B stays unserved", async () => {
+      const t = await rig();
+      const key = await t.r.writeManifest(1, loc, "markerb", "markerb");
+      t.failSearch.on = true;
+      const failed = path === "standard" ? await t.standard(key, await t.etag(key), false) : await t.fifo(key, await t.etag(key), 1, false);
+      expect(failed).toHaveLength(1);
+      t.failSearch.on = false;
+      // The message is never redelivered (DLQ after retries, or lost). The pointer row exists and matches the manifest.
+      expect((await t.r.pg.query<{ etag: string }>("SELECT manifest_etag etag FROM sessions.session_index WHERE deleted_at IS NULL")).rows.map((r) => r.etag?.replace(/^"|"$/g, ""))).toEqual([await t.etag(key)]);
+      expect(await t.status("markerb")).toBe(501);
+      // Two reconcile links: neither finds anything to send.
+      expect(await t.reconcile(path)).toEqual({ hints: 0, failures: [] });
+      expect(await t.reconcile(path)).toEqual({ hints: 0, failures: [] });
+      expect(await t.status("markerb")).toBe(501);
+      // Pending work: no requeue was sent; nothing else exists in this defaults tree that would run B's search.
+      expect(t.r.requeued).toEqual([]);
     }, 60_000);
   });
 }
