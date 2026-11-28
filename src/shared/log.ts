@@ -129,6 +129,9 @@ export const ALLOWED_LOG_FIELDS = new Set([
   "acceptance_hold", "delta_chunks",
   // ...and, on a same-pointer skip with that flag on, whether the stamp carried a watermark: plain or watermark.
   "acceptance_stamp",
+  // ...and, on a full read with that flag on, that its stamp row was inserted with a watermark (a boolean), with the
+  // highest manifest revision and the directory epoch it covers (bounded integers).
+  "watermark_written", "watermark_revision", "watermark_epoch",
   // The ingest origin claim fence fallback (src/session-ingest/ledger-sql.ts originScoped): epoch ms until which the
   // isolate uses the per-user functions; a bounded integer.
   "fallback_until_ms",
@@ -160,6 +163,8 @@ export const ALLOWED_LOG_FIELDS = new Set([
 export const BOUNDED_COUNT_FIELDS: ReadonlyMap<string, number> = new Map([
   ["event_age_ms", Number.MAX_SAFE_INTEGER],
   ["delta_chunks", 100_000],
+  ["watermark_revision", Number.MAX_SAFE_INTEGER],
+  ["watermark_epoch", Number.MAX_SAFE_INTEGER],
   ["s3_event_age_ms", Number.MAX_SAFE_INTEGER],
   ["buffered_checked", 100_000],
   ["buffered_dropped", 100_000],
@@ -249,7 +254,7 @@ export const LOG_TAG_SHAPE = /^[0-9a-f]{8}$/;
 /** `error_frame`: a function name only (db-error-class.ts FRAME_NAME, pinned equal); never a path, line or text. */
 export const FRAME_NAME_SHAPE = /^(?=.{1,64}$)[A-Za-z_$][A-Za-z0-9_$]*(?:\.[A-Za-z_$][A-Za-z0-9_$]*){0,3}$/;
 /** Boolean fields: emitted only when the value is `true` or `false` (else dropped), so they can never carry text or an id. */
-export const BOOLEAN_FIELDS: ReadonlySet<string> = new Set(["same_origin"]);
+export const BOOLEAN_FIELDS: ReadonlySet<string> = new Set(["same_origin", "watermark_written"]);
 const SHAPED_FIELDS: ReadonlyMap<string, RegExp> = new Map([["client_version", CLIENT_VERSION_SHAPE], ["receipt_tag", LOG_TAG_SHAPE], ["attempt_tag", LOG_TAG_SHAPE], ["error_frame", FRAME_NAME_SHAPE]]);
 
 /**

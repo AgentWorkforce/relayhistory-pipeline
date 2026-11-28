@@ -575,6 +575,50 @@ describe("rollout: stamps written before the flag", () => {
   }, 120_000);
 });
 
+describe("rollout: watermark_written on the full-read refusal line", () => {
+  test("logged exactly when this full read's stamp row was inserted with a watermark, with the revision and epoch it covers; never on a skip, a hold, a failed write or without the flag", async () => {
+    const { x, r, state, latest, clock } = await rig();
+    const lastLine = async (flags: Partial<SearchIndexDeps>) => {
+      clock.ms += 1_000;
+      const send = realHandler(r.consumer({ ch: state.ch, now: () => new Date(clock.ms), ...flags }));
+      return (await captureLogs(() => send(r.messages))).lines.filter((l) => l.message === "search index reconciled").at(-1)!;
+    };
+    const epoch = async () => Number((await r.db.pg.query<{ e: string }>("SELECT coalesce(max(event_projection_epoch), 0)::text AS e FROM sessions.session_directory")).rows[0]!.e);
+    const maxRevision = async () => Math.max(...(await Promise.all(x.keys.map(async (k) => (await x.reader.read(k))!.manifest.revision))));
+    // Without the watermark flag: a plain stamp is written, nothing is reported.
+    const plain = await lastLine(SKIP);
+    expect(plain).toMatchObject({ ok: false, reason: ACCEPTANCE_MISSING });
+    expect(plain.watermark_written).toBeUndefined();
+    // Flag on, same pointer set: the plain skip. No write, nothing reported.
+    expect((await lastLine(ON)).watermark_written).toBeUndefined();
+    // A new revision, but the stamp insert is refused: a full read, NOT reported (and no watermark exists).
+    await publish(x, [...generate(8), ...appended(12), ...contenders()]);
+    state.switches.failIngestInsert = true;
+    const failed = await lastLine(ON);
+    expect(failed).toMatchObject({ ok: false, reason: ACCEPTANCE_MISSING });
+    expect(failed.watermark_written).toBeUndefined();
+    expect(latest().w).toBeUndefined();
+    state.switches.failIngestInsert = false;
+    // The next delivery: a full read whose stamp is inserted with a watermark. Reported, with what it covers.
+    const written = await lastLine(ON);
+    expect(written).toMatchObject({ ok: false, reason: ACCEPTANCE_MISSING, watermark_written: true, watermark_revision: await maxRevision(), watermark_epoch: await epoch() });
+    expect(latest().w).toBeDefined();
+    // From then on, a verified same-pointer skip and a hold report their own fields, never a write.
+    const skipped = await lastLine(ON);
+    expect(skipped).toMatchObject({ acceptance_stamp: "watermark" });
+    expect(skipped.watermark_written).toBeUndefined();
+    await publish(x, [...generate(8), ...appended(18), ...contenders()]);
+    const held = await lastLine(ON);
+    expect(held).toMatchObject({ acceptance_hold: "watermark" });
+    expect(held.watermark_written).toBeUndefined();
+    // Acceptance arrives: a complete pass clears the stamp and reports no write.
+    await publish(x, [...generate(8), ...appended(18), ...contenders(true)]);
+    const indexed = await lastLine(ON);
+    expect(indexed).toMatchObject({ ok: true });
+    expect(indexed.watermark_written).toBeUndefined();
+  }, 240_000);
+});
+
 describe("what wakes a held scope", () => {
   test("the seat's own manifest event: ONE delivery through the real handler moves the pointers and indexes the scope, no sweep needed", async () => {
     const { x, r, state, stamps } = await rig();

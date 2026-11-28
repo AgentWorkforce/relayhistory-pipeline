@@ -475,6 +475,13 @@ export interface SearchIndexResult {
    */
   acceptanceStamp?: "plain" | "watermark";
   /**
+   * `acceptanceWatermark` only, on a full read that ended with the acceptance refusal: the stamp row this pass
+   * inserted carries a watermark (the insert was accepted). `revision` is the highest manifest revision the read
+   * covered, `epoch` the directory epoch it ran at. Absent when no watermark was written (a failed write, a
+   * catalog-key refusal, too wide a scope). Telemetry only: the point a session becomes able to hold.
+   */
+  watermarkWritten?: { revision: number; epoch: string };
+  /**
    * Only on a whole-read pass that read and ended with `relayhistory_acceptance_missing` (never on a skipped pass):
    * how the refused contender groups looked (session-read-api/contender-seats.ts). Telemetry only.
    */
@@ -983,15 +990,14 @@ async function indexSearchScopeBase(scope: SessionScope, deps: SearchIndexDeps, 
     const settle = async (result: SearchIndexResult): Promise<SearchIndexResult> => {
       if (acceptance && siblingFacts) {
         const stampable = acceptanceOnly(result) && readAsListed(siblingFacts, acceptance.observed);
-        await settleAcceptanceStamp(
-          deps.ch!, scope, stampName, acceptance.stamp,
-          stampable ? acceptance.digest : null,
-          at,
-          // The watermark of a full read: what a later pass over another pointer set may hold on.
-          stampable && deps.acceptanceWatermark === true
+        // The watermark of a full read: what a later pass over another pointer set may hold on.
+        const watermark = stampable && deps.acceptanceWatermark === true
             ? await acceptanceWatermarkOf(scope, pointerSnapshot.canonicalId, acceptance.windowMarker, limits, deps.stream, deps.readerMaxRuleset, s3.refusedRecordIds, siblingFacts, acceptance.observed, at)
-            : null,
-        );
+            : null;
+        const written = await settleAcceptanceStamp(deps.ch!, scope, stampName, acceptance.stamp, stampable ? acceptance.digest : null, at, watermark);
+        // Rollout uptake: this full read's stamp row was inserted AND carries a watermark. Never set on a failed
+        // write, a stamp without a watermark (catalog-key refusal, too wide a scope) or a cleared stamp.
+        if (written && watermark) return { ...result, watermarkWritten: { revision: s3.revision, epoch: pointerSnapshot.epoch } };
       }
       return result;
     };
@@ -2015,15 +2021,17 @@ async function settleAcceptanceStamp(
   stampDigest: string | null,
   at: Date,
   watermark: AcceptanceWatermark | null = null,
-): Promise<void> {
+): Promise<boolean> {
   try {
-    if (stampDigest !== null)
+    if (stampDigest !== null) {
       await ch.insert(
         INGEST_STATE_TABLE,
         [{ name, value: JSON.stringify({ v: 1, reason: ACCEPTANCE_MISSING, digest: stampDigest, ...(watermark ? { w: watermark } : {}) }), updated_at: chNow(at) }],
         { timeoutMs: 5_000 },
       );
-    else if (stamp.state !== "none") {
+      // The insert was accepted: a stamp row (with `watermark`, if one was given) now exists for this pass.
+      return true;
+    } else if (stamp.state !== "none") {
       // The read takes the newest updated_at, so the tombstone must sort above the stamp it clears even
       // when the clock that wrote the stamp ran ahead of this one (equal times never tie either).
       const clearAt = stamp.state === "live" && Number.isFinite(stamp.atMs) ? new Date(Math.max(at.getTime(), stamp.atMs + 1)) : at;
@@ -2038,6 +2046,7 @@ async function settleAcceptanceStamp(
       ...errorFields(error),
     });
   }
+  return false;
 }
 
 /** The digest's window marker: a stored window_start, or the rolling default's own marker. */

@@ -220,13 +220,19 @@ A stamp written before the flag was on has no watermark. Turning the flag on doe
 - Six hours bounds how long a stamp is valid. Expiry does not schedule a read: a session that gets no delivery
   is never converted, and costs nothing.
 
-To measure uptake, count three things separately on the `search index reconciled` line:
+To measure uptake, count these separately on the `search index reconciled` line:
 
 | What | How it logs |
 | --- | --- |
 | Full-read refusal | `reason: relayhistory_acceptance_missing`, no `skipped_before_read` |
+| Watermark written (the session can hold from now on) | on that full-read line: `watermark_written: true`, with `watermark_revision` and `watermark_epoch` |
 | Same-pointer skip | reason ends `skipped_before_read`, with `acceptance_stamp: plain` or `acceptance_stamp: watermark` |
 | Hold across a new revision | `acceptance_hold: watermark`, with `delta_chunks` |
+
+`watermark_written` is logged only when the stamp row was actually inserted and carries a watermark: not on a
+failed write, and not for a refusal with no record id group or a scope with more than 64 sibling manifests. It
+is the direct count of sessions that converted, including ones that then go quiet. `watermark_revision` is the
+highest manifest revision the read covered; `watermark_epoch` is the directory epoch it ran at.
 
 `acceptance_stamp` is logged only with the watermark flag on. `watermark` means this pass verified every sibling
 manifest against the exact stamp row it skipped on. It is set from that verification, never from the stamp's

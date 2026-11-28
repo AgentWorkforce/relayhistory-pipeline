@@ -438,6 +438,8 @@ export async function processBatch(records: readonly QueueRecord[], deps: Consum
           ...(result.acceptanceHold ? { acceptance_hold: "watermark", delta_chunks: result.acceptanceHold.deltaChunks } : {}),
           // ...or a same-pointer skip, and whether its stamp carried a watermark (plain: the acceptance skip's own stamp).
           ...(result.acceptanceStamp ? { acceptance_stamp: result.acceptanceStamp } : {}),
+          // ...or this full read wrote a stamp that carries a watermark, and what it covers.
+          ...(result.watermarkWritten ? { watermark_written: true, watermark_revision: result.watermarkWritten.revision, watermark_epoch: Number(result.watermarkWritten.epoch) } : {}),
           ...phaseFields(),
           duration_ms: Date.now() - started,
           ...lag,
