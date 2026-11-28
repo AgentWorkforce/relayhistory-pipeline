@@ -152,13 +152,17 @@ must cite evidence ids that the scorer checks.
    A feature's pull requests are the ones a session created, any whose head branch is one of the
    feature's branches and that opened no earlier than seven days before its first session (GitHub
    deletes a head branch on merge, so the live branches rarely hold it: 99 of 2,267 merged `cloud` PRs
-   kept theirs), and any that hold a commit a session made or pushed. A PR only mentioned never counts.
+   kept theirs), and any merged before the cut that holds a commit a session made or pushed. A PR only
+   mentioned never counts. A PR's commit list is fixed when it merges, so the forge records one only for
+   a merged PR and a commit links it only once that merge precedes the cut; an open PR's final list is
+   undated (commits can be pushed to it after any cut) and links nothing.
    A merged PR landed when its merge commit reached the default branch (`landedAt`), not at GitHub's
    `mergedAt`: a repository that merges PRs into a trunk and promotes the trunk with a merge train
-   (`cloud`) lands a PR at the train's merge. A PR merged into its base and not yet on the default branch
-   is `in_progress`, however quiet. A forge without `landedAt` reads `mergedAt`. A PR's commits are
-   read from the final mirror, so a commit pushed to an open PR after the cut can link that PR at the
-   cut; the PR's landing and closing are still cut strictly.
+   (`cloud`) lands a PR at the train's merge. `landedAt` is only dated evidence: the walk's time, or for
+   a PR based on the default branch its `mergedAt`. A PR into another base whose promotion is undated
+   (its merge commit missing from the mirror, or reached by the default branch only before the walk's
+   window) has no known landing, never its trunk merge. A PR merged into its base and not landed before
+   the cut is `in_progress`, however quiet. A forge that records no base (older files) reads `mergedAt`.
 
    **As-of.** Session facts are cut strictly at `asOf`: a timed item, and every evidence pointer and
    quote inside it, counts only before `asOf`; anything without a time of its own (a mention-only key,

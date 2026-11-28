@@ -193,13 +193,15 @@ export function forgeFacts(repo: string, mirror: string, since: string, until: s
   }
   // Pull requests. A PR reached the default branch when its merge commit did (`landedAt`): directly for a PR
   // based on it, or later, when a merge train or a release merge brings in the base it merged into. GitHub's
-  // `mergedAt` is only when it merged into its base. A merge commit the walk did not date (merged before
-  // `since`) but that is an ancestor of the default branch is dated by `mergedAt`; one that is not on it has no
-  // landing (`landedAt: null`). A merged PR whose merge commit the mirror does not hold has no `landedAt`
-  // (unknown: readers fall back to `mergedAt`), never a claimed absence. Its own commits (`commits`) are what
-  // the merge brought into its base (the second parent's side of a merge commit; for a squash or rebase, its
-  // head against the merge's parent) or, for a PR not merged, its head against its base; a PR with more than
-  // MAX_PR_COMMITS records none.
+  // `mergedAt` is only when it merged into its base. Every `landedAt` is dated evidence, never a guess: the walk's
+  // time; for a PR based on the default branch whose merge the walk did not date (merged before `since`), its
+  // `mergedAt` (merging into the default branch is the landing); `null` when the merge commit is not on the
+  // default branch. Absent is unknown: a PR into another base reached by the default branch before `since` (its
+  // promotion is undated), or a merged PR whose merge commit the mirror does not hold. Its own commits (`commits`)
+  // are what the merge brought into its base (the second parent's side of a merge commit; for a squash or rebase,
+  // its final head against the merge's parent), fixed at `mergedAt`. A PR not merged records none: its final
+  // commit list is not dated, so it cannot say what the PR held at a cut. A PR with more than MAX_PR_COMMITS
+  // records none.
   const until_ = requireUtc(until, "--until");
   const isCommit = (sha: string | null) => !!sha && FULL_SHA.test(sha) && sh(`git -C "$0" cat-file -e "$1^{commit}" 2>/dev/null && echo yes`, mirror, sha) === "yes";
   const ownCommits = (range: string[]) => {
@@ -222,13 +224,12 @@ export function forgeFacts(repo: string, mirror: string, since: string, until: s
       pr.mergeCommit = mergeCommit;
       const walked = defaultAt.get(mergeCommit);
       const onMain = walked !== undefined || sh(`git -C "$0" merge-base --is-ancestor "$1" "$2" && echo yes`, mirror, mergeCommit, mainRef) === "yes";
-      pr.landedAt = walked ?? (onMain ? pr.mergedAt ?? null : null);
+      const intoDefault = !base || base === defaultBranch;
+      if (walked !== undefined) pr.landedAt = walked;
+      else if (!onMain) pr.landedAt = null;
+      else if (intoDefault) pr.landedAt = pr.mergedAt ?? null;
       const parents = sh(`git -C "$0" rev-list --parents -n 1 "$1"`, mirror, mergeCommit).split(" ").slice(1);
       const own = parents.length === 2 ? ownCommits([`${parents[0]}..${parents[1]}`]) : head && isCommit(head) ? ownCommits([head, `^${parents[0] ?? mergeCommit}`]) : null;
-      if (own) pr.commits = own;
-    } else if (state !== "merged" && head && isCommit(head)) {
-      const baseRef = base ? `refs/heads/${base}` : mainRef;
-      const own = sh(`git -C "$0" rev-parse --verify -q "$1"`, mirror, baseRef) ? ownCommits([head, "--not", baseRef]) : null;
       if (own) pr.commits = own;
     }
     prs.push(pr);

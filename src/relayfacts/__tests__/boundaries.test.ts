@@ -1025,12 +1025,15 @@ describe("pull request linking", () => {
       { url: "https://github.com/example/widgets/pull/3", state: "OPEN", createdAt: "2026-11-06T01:00:00Z", updatedAt: "2026-11-06T01:00:00Z", mergedAt: null, closedAt: null, headRefName: "fix/c", baseRefName: "trunk", mergeCommit: null, headRefOid: c },
       // Merged, but the mirror does not hold its merge commit: unknown (no landedAt), never a claimed absence.
       { url: "https://github.com/example/widgets/pull/4", state: "MERGED", createdAt: "2026-11-06T01:00:00Z", updatedAt: "2026-11-06T02:00:00Z", mergedAt: "2026-11-06T02:00:00Z", closedAt: null, headRefName: "fix/d", baseRefName: "main", mergeCommit: { oid: "f".repeat(40) }, headRefOid: "e".repeat(40) },
+      // The same into trunk: its promotion to main is not known at all.
+      { url: "https://github.com/example/widgets/pull/5", state: "MERGED", createdAt: "2026-11-06T01:00:00Z", updatedAt: "2026-11-06T02:00:00Z", mergedAt: "2026-11-06T02:00:00Z", closedAt: null, headRefName: "fix/e", baseRefName: "trunk", mergeCommit: { oid: "d".repeat(40) }, headRefOid: "e".repeat(40) },
     ];
     const f = forgeFacts("example/widgets", repo, "2026-10-31T00:00:00Z", "2026-11-30T00:00:00Z", "main", () => listed);
     const pr = (n: number) => f.prs.find((p) => p.ref.endsWith(`/pull/${n}`))!;
     expect(pr(1)).toMatchObject({ base: "trunk", mergeCommit: mergeA, landedAt: T("04T00:00:00"), commits: [a] });
     expect(pr(2)).toMatchObject({ base: "trunk", mergeCommit: mergeB, landedAt: null, commits: [b] });
-    expect(pr(3).commits).toEqual([c]);
+    // An unmerged PR's final commit list is not dated: none is recorded.
+    expect(pr(3).commits).toBeUndefined();
     expect(pr(3).landedAt).toBeUndefined();
     expect(pr(4).landedAt).toBeUndefined();
     expect(pr(4).mergeCommit).toBeUndefined();
@@ -1044,12 +1047,39 @@ describe("pull request linking", () => {
     // fix/b never reached main: in progress, and not abandoned however long the session has been quiet.
     const onB = sess({ startedAt: T("04T12:00:00"), endedAt: T("04T13:00:00"), keys: keys({ branches: ["fix/b"] }) });
     expect(deriveState([onB], f, T("29T00:00:00"))).toMatchObject({ state: "in_progress", basis: "forge" });
-    // A session's own commit finds the open PR that holds it, with no URL or branch.
-    const withC = sess({ startedAt: T("06T00:00:00"), endedAt: T("06T01:00:00"), built: [{ id: "x", kind: "commit", what: "commit", ref: c.slice(0, 9), at: T("06T00:30:00"), session: { source: "claude", sessionId: "s" }, outcomeId: null, evidence: [] }] });
-    expect(deriveState([withC], f, T("10T00:00:00"))).toMatchObject({ state: "in_progress", basis: "forge" });
+    // A session's own commit finds a PR only through a merge known before the cut (its list is fixed then). The open
+    // PR holding c can gain or lose commits after any cut: it never links the session.
+    const built = (sha: string, at: string) => [{ id: "x", kind: "commit" as const, what: "commit", ref: sha.slice(0, 9), at, session: { source: "claude", sessionId: "s" }, outcomeId: null, evidence: [] }];
+    const withC = sess({ startedAt: T("06T00:00:00"), endedAt: T("06T01:00:00"), built: built(c, T("06T00:30:00")) });
+    expect(deriveState([withC], f, T("10T00:00:00")).basis).toBe("analysis");
+    // b is in PR #2, opened Nov 4 13:00 and merged Nov 5: at a cut between, the merge is not yet known, so no link;
+    // after it, the PR links (merged into trunk, never promoted: in progress).
+    const withB = sess({ startedAt: T("04T12:00:00"), endedAt: T("04T12:30:00"), built: built(b, T("04T12:10:00")) });
+    // (b itself is a forge commit, so the basis is the forge either way; the PR's merge is what the cut withholds.)
+    expect(deriveState([withB], f, T("04T18:00:00"))).toMatchObject({ state: "in_progress", reason: "commits or an open pull request, not merged" });
+    expect(deriveState([withB], f, T("10T00:00:00"))).toMatchObject({ state: "in_progress", basis: "forge", reason: expect.stringContaining("not yet on main") });
     // A PR only mentioned (a link key) is never the feature's.
     const mention = sess({ keys: keys({ prs: ["https://github.com/example/widgets/pull/1"] }), built: [{ id: "y", kind: "claim", what: "reviewed", ref: null, at: T("02T00:30:00"), session: { source: "claude", sessionId: "s" }, outcomeId: null, evidence: [] }] });
     expect(deriveState([mention], f, T("10T00:00:00")).basis).toBe("analysis");
+
+    // Merged into main with no merge commit in the mirror: merging into main is the landing, at mergedAt.
+    const onD = sess({ startedAt: T("06T00:00:00"), endedAt: T("06T01:00:00"), keys: keys({ branches: ["fix/d"] }) });
+    expect(deriveState([onD], f, T("10T00:00:00"))).toMatchObject({ state: "shipped", basis: "forge" });
+    // Merged into trunk with no merge commit in the mirror: the trunk merge is not a shipment, at any later cut.
+    expect(pr(5).landedAt).toBeUndefined();
+    const onE = sess({ startedAt: T("06T00:00:00"), endedAt: T("06T01:00:00"), keys: keys({ branches: ["fix/e"] }) });
+    expect(deriveState([onE], f, T("29T00:00:00"))).toMatchObject({ state: "in_progress", basis: "forge", reason: expect.stringContaining("no dated landing on main") });
+
+    // Reached main before the walk's window (the train merged Nov 4 00:00, the window opens 06:00): present-day
+    // ancestry says it is on main, not when. For a trunk PR that is no landing time: in progress, never shipped.
+    const late = [{ ...listed[0]!, updatedAt: "2026-11-20T00:00:00Z" }];
+    const g = forgeFacts("example/widgets", repo, "2026-11-04T06:00:00Z", "2026-11-30T00:00:00Z", "main", () => late);
+    expect(g.prs[0]).toMatchObject({ base: "trunk", mergeCommit: mergeA });
+    expect(g.prs[0]!.landedAt).toBeUndefined();
+    expect(deriveState([onA], g, T("10T00:00:00"))).toMatchObject({ state: "in_progress", reason: expect.stringContaining("no dated landing on main") });
+    // The same PR based on main is dated by its merge into main.
+    const direct = forgeFacts("example/widgets", repo, "2026-11-04T06:00:00Z", "2026-11-30T00:00:00Z", "main", () => [{ ...late[0]!, baseRefName: "main" }]);
+    expect(direct.prs[0]!.landedAt).toBe(T("03T00:00:00"));
   });
 
   test("a head branch reused long before the feature is not its PR; a forge without landedAt reads mergedAt", () => {
@@ -1061,16 +1091,31 @@ describe("pull request linking", () => {
     expect(deriveState([onA], recent, T("02T12:00:00")).state).toBe("in_progress");
   });
 
+  test("a PR links by a session's commit only through a merge known before the cut", () => {
+    const X = "1234567".padEnd(40, "0");
+    const at = (n: number) => T(`0${n}T00:00:00`);
+    const forge = (over: Record<string, unknown>) => ({ prs: [{ ref: "https://github.com/example/widgets/pull/7", state: "merged" as const, at: at(1), mergedAt: at(5), base: "main", mergeCommit: "f".repeat(40), landedAt: at(5), commits: [X], ...over }], commits: [], flags: [] });
+    const s = sess({ startedAt: at(2), endedAt: T("02T01:00:00"), built: [{ id: "x", kind: "commit", what: "commit", ref: X.slice(0, 9), at: T("02T00:30:00"), session: { source: "claude", sessionId: "s" }, outcomeId: null, evidence: [] }] });
+    // Merged Nov 5: before it, the PR's list is not yet fixed, so the commit does not link it.
+    expect(deriveState([s], forge({}), at(4)).basis).toBe("analysis");
+    expect(deriveState([s], forge({}), at(6))).toMatchObject({ state: "shipped", basis: "forge" });
+    // An open PR's (final) list never links, at any cut.
+    expect(deriveState([s], forge({ state: "open", mergedAt: null, mergeCommit: undefined, landedAt: undefined }), at(9)).basis).toBe("analysis");
+  });
+
   test("forge.json: a PR landing needs its merge commit; PR commits are full ids", async () => {
     const { parseForge } = await import("../bench/corpus.ts");
     const pr = (over: Record<string, unknown>) => ({ prs: [{ ref: "https://github.com/example/widgets/pull/1", state: "merged", at: "2026-11-01T00:00:00.000Z", ...over }], commits: [], flags: [] });
     const sha = "a".repeat(40);
-    expect(() => parseForge(pr({ mergeCommit: sha, landedAt: null, commits: [sha], base: "trunk" }))).not.toThrow();
+    expect(() => parseForge(pr({ mergeCommit: sha, landedAt: null, mergedAt: "2026-11-02T00:00:00.000Z", commits: [sha], base: "trunk" }))).not.toThrow();
     expect(() => parseForge(pr({ landedAt: "2026-11-02T00:00:00.000Z" }))).toThrow(/merge commit/);
     expect(() => parseForge(pr({ mergeCommit: sha, landedAt: "2026-11-31T00:00:00.000Z" }))).toThrow(/valid time/);
     expect(() => parseForge(pr({ state: "open", mergeCommit: sha }))).toThrow(/merge commit/);
     expect(() => parseForge(pr({ commits: ["abc1234"] }))).toThrow(/full commit ids/);
     expect(() => parseForge(pr({ commits: [] }))).toThrow(/full commit ids/);
+    expect(() => parseForge(pr({ state: "open", commits: [sha] }))).toThrow(/merged at a valid time/);
+    expect(() => parseForge(pr({ commits: [sha] }))).toThrow(/merged at a valid time/);
+    expect(() => parseForge(pr({ mergedAt: "2026-11-02T00:00:00.000Z", commits: [sha] }))).not.toThrow();
     expect(() => parseForge(pr({ landedSeq: 1 }))).toThrow(/unknown field/);
   });
 

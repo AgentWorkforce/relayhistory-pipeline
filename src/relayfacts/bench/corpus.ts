@@ -80,6 +80,8 @@ export function parseForge(raw: unknown): ForgeFacts {
     if (p.landedAt !== undefined && (p.mergeCommit === undefined || (p.landedAt !== null && !iso(p.landedAt)))) throw new CorpusError("forge.json: a pr landing needs its merge commit and a valid time");
     if (p.commits !== undefined && (!Array.isArray(p.commits) || p.commits.length === 0 || p.commits.length > 200 || p.commits.some((c) => typeof c !== "string" || !/^[0-9a-f]{40}$/u.test(c))))
       throw new CorpusError("forge.json: a pr's commits must be 1 to 200 full commit ids");
+    // A PR's commit list is dated only by its merge; an unmerged PR's final list says nothing about a cut.
+    if (p.commits !== undefined && (p.state !== "merged" || !iso(p.mergedAt))) throw new CorpusError("forge.json: only a pr merged at a valid time records commits");
   }
   for (const c of f.commits as Record<string, unknown>[]) {
     only(c, ["sha", "at", "onDefaultBranch", "defaultAt", "defaultAtBasis", "revertedBy", "revertedAt", "transitions"], "forge.json commit");
