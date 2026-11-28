@@ -1812,6 +1812,9 @@
     "sessions.session_erasure_replay_framed_bytes(uuid)": [
       "<owner>:EXECUTE"
     ],
+    "sessions.session_erasure_replay_framed_header(uuid)": [
+      "<owner>:EXECUTE"
+    ],
     "sessions.session_erasure_replay_guard()": [
       "<owner>:EXECUTE"
     ],

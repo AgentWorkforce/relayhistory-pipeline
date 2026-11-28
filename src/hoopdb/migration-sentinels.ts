@@ -233,6 +233,7 @@ export const RETAINED_BY_ROLLBACK: Readonly<Record<string, readonly string[]>> =
     "function:sessions.session_erasure_replay_digest",
     "function:sessions.session_erasure_replay_digest_cap",
     "function:sessions.session_erasure_replay_framed_bytes",
+    "function:sessions.session_erasure_replay_framed_header",
     "function:sessions.session_erasure_replay_child_guard",
     "function:sessions.session_erasure_replay_seal_guard",
     "function:sessions.session_erasure_replay_shape",

@@ -6,9 +6,14 @@ Design: `docs/design/operator-erase-replay-target-manifest.md` on `review/hard-d
 (hard-delete-owner). Applying it to any real database needs Khaliq's explicit OK. Raw-identifier retention is an open
 owner decision (design section 8): this slot adds no TTL, GC or cleanup and claims no retention policy.
 
-**This is a partial increment.** It proves the targets a session erase selected, not the erase's effects. It ships no
-effect provenance, so the bridge co-read stays `effect_mapping_missing` with a null `binding_sha256`. Nothing here
-makes `bridge_complete` possible for an org with session erasures in its window.
+**This is a partial increment, and it never produces a production `complete: true` page.** The erase records the target
+set it derives, but it never seals it. The alias closure comes from `session_index` alone, so a physical session whose
+index link is missing (its ownership committed before its pointer, or the link removed) is outside it. No authoritative
+alias-coverage proof exists yet. hard-delete-owner's F1 ruling (option (c)) is therefore: no seal without that proof.
+That proof needs a separately reviewed retained-mapping design; a flag, an empty scan or a fixture can never stand in
+for it. The completion mutation fails closed too: the seal trigger validates a seal against its rows and then refuses
+it in every case, so no production path can create a `complete: true` page. The slot also ships no effect provenance, so the bridge co-read stays `effect_mapping_missing` with a null
+`binding_sha256`. Nothing here makes `bridge_complete` possible for an org with session erasures in its window.
 
 ## Why
 
@@ -31,12 +36,21 @@ every session erasure.
     seal trigger recomputes both from the rows under the parent row's lock, so a forged or partial seal is refused. A
     child insert into a sealed manifest is refused. The child takes the parent FOR SHARE, which conflicts with the
     seal's FOR UPDATE.
+    Both guards refuse any isolation but READ COMMITTED (40001), so a stale REPEATABLE READ snapshot can neither add a
+    child after a seal nor seal from an old count.
+  - Size bound, 64 MiB of framed digest message (`session_erasure_replay_digest_cap()`), well under PostgreSQL's 1 GiB
+    value ceiling. The capture derives the (owner, origin) pairs once, preflights the exact framed size from them
+    (numeric, overflow-safe) BEFORE writing or aggregating any target row, and over the cap records no targets and
+    takes the legacy derivation. The digest function checks the bound in its own first statement and returns NULL
+    over it; the seal trigger checks it in its own statement before any digest. No evaluation order can build an
+    over-cap message.
 - One added constraint on `session_erasure_receipts`: `UNIQUE (org_id, workspace_id, source, session_id,
   request_id)`. It is a superset of the primary key and writes no rows.
 - The fence body moves into `session_erasure_replay_fence(..., p_manifest uuid)`. With `NULL` it runs the legacy
   derivation, statement for statement. 050000's `ingest_operator_erase_fence` becomes that NULL-manifest wrapper.
-  With a manifest, T is materialized once, after owner-lock convergence and under the owner locks. It is sealed
-  before the first `ingest_apply_selection`, and the sealed rows then drive the selection loop, in the legacy order.
+  With a manifest, T is materialized once, after owner-lock convergence and under the owner locks, before the first
+  `ingest_apply_selection`, and those rows then drive the selection loop, in the legacy order. The erase never seals
+  it (above).
 - `ingest_operator_erase_session` (050000 body) changes in three ways:
   - 062320's marked erasure check is its first statement. The direct-owner `_session` path gains 062320's
     erasure-class check here (new in 062360; before this slot only `ingest_operator_runtime_begin` had it). Through
@@ -57,9 +71,10 @@ every session erasure.
   not erasure sources. They carry no 062340 recorder, so a manifest write never changes the release watermark. An
   erase's own source writes are recorded exactly as before.
 
-## What never seals
+## What the reader reports
 
-The reader reports each of these as `manifest_missing` or `manifest_unsealed`, and the erase's own behaviour is
+Every prospective erase reads `manifest_unsealed`, because the erase never seals. These cases do not even record
+targets; the reader reports each as `manifest_missing` or `manifest_unsealed`, and the erase's own behaviour is
 unchanged in every case:
 - a retried (failed) receipt;
 - an erase whose RH010 unwound the capture together with the cleanup;
@@ -103,15 +118,22 @@ table without CASCADE fails with 2BP01.
 - PGlite: `session-erasure-replay-manifest.pglite.test.ts`. Among other things it checks that:
   - T equals the `upload_deletions` effect set;
   - effects, fences, ownership, index, receipt, events and 062340 history are identical to the pre-062360 erase;
-  - the retry, overlap, pre-fence and empty cases never seal;
-  - the immutability guards hold and a forged seal is refused;
+  - the erase never seals, and the F1 reproduction (a physical session whose index link is gone) reads
+    `complete: false` on both ids, with its ownership surviving exactly as in the legacy erase;
+  - the retry, overlap, pre-fence and empty cases record no targets;
+  - the immutability guards hold and a forged seal is refused (seals in these tests are built by the test owner
+    from the rows, standing in for a future proof-gated seal);
+  - an oversize seal is refused (an injected small cap), and the erase is the legacy one;
   - the reader's cursors are validated;
   - the tables and reader are owner-only;
   - the digest vectors match in SQL, in TS and byte by byte;
   - empty and populated down and reapply work.
 - Native PostgreSQL 15, 16 and 17: `session-erasure-replay-manifest.postgres.test.ts`, run through the hold harness.
   It covers:
-  - the seal is visible only at commit, and a rollback leaves nothing behind;
+  - the capture is visible only at commit, and a rollback leaves nothing behind;
+  - the child and seal guards refuse any isolation but READ COMMITTED: a stale REPEATABLE READ child after a seal,
+    and a stale sealer after a child, are both refused, and every persisted seal equals its rows. The reader still
+    works under REPEATABLE READ and SERIALIZABLE READ ONLY;
   - a first-call race;
   - RH010 retries;
   - org SHARED before the global gate on both entry paths, in both blocking directions, proved from `pg_locks`;
@@ -122,5 +144,6 @@ table without CASCADE fails with 2BP01.
 - The raw-ID retention decision is with Khaliq (through b1).
 - The kernel has not yet specified the effect-provenance association. Until it does, the co-read returns
   `effect_mapping_missing`.
-- The equivalence review with layered-sessions-pipeline, and the second review with d5-gate-owner.
+- A production seal: it needs a reviewed authoritative alias-coverage (retained physical-identity mapping) design.
+- Re-review of the successor by layered-sessions-pipeline, d5-gate-owner and hard-delete-owner (with the kernel).
 - Any apply to a real database.

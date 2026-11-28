@@ -124,6 +124,22 @@ const effectSet = async (d: Db) => (await rows<ReplayTarget>(d,
   `SELECT user_id,origin_id,source,session_id FROM sessions.upload_deletions WHERE org_id=$1 AND workspace_id=$2`, [ORG, WS]))
   .sort(compareTargets);
 
+/**
+ * The erase never seals (F1 ruling, option (c): no authoritative alias-coverage proof yet). To exercise the seal, its
+ * guards and the reader, the TEST OWNER seals every captured, unsealed manifest from its own rows: a stand-in for a
+ * future proof-gated seal, never a production path. The reader still recomputes and verifies everything per page.
+ */
+const ownerSeal = async (d: Db) => {
+  // The seal trigger refuses EVERY seal in this slot (no alias-coverage proof), so the test owner disables it for this
+  // one statement and re-enables it: test-only, never a production path.
+  await d.db.exec('ALTER TABLE sessions.session_erasure_replay_completions DISABLE TRIGGER session_erasure_replay_seal');
+  try { await d.db.query(`INSERT INTO sessions.session_erasure_replay_completions(manifest_id,org_id,workspace_id,source,derivation_version,alias_count,owner_count,pair_count,target_count,manifest_sha256)
+  SELECT r.manifest_id,r.org_id,r.workspace_id,r.source,1,(SELECT count(*) FROM sessions.session_erasure_replay_aliases a WHERE a.manifest_id=r.manifest_id),
+    count(DISTINCT t.user_id),count(DISTINCT (t.user_id,t.origin_id)),count(*),sessions.session_erasure_replay_digest(r.manifest_id)
+  FROM sessions.session_erasure_replay_requests r JOIN sessions.session_erasure_replay_targets t ON t.manifest_id=r.manifest_id
+  WHERE NOT EXISTS(SELECT 1 FROM sessions.session_erasure_replay_completions c WHERE c.manifest_id=r.manifest_id)
+  GROUP BY r.manifest_id,r.org_id,r.workspace_id,r.source`); } finally { await d.db.exec('ALTER TABLE sessions.session_erasure_replay_completions ENABLE TRIGGER session_erasure_replay_seal'); }
+};
 /** The scenario every equivalence test uses: owners from all three sources, owner-specific origins, two aliases. */
 async function scenario(d: Db) {
   await land(d, "u-b", "origin-1", [[SRC, SID], [SRC, "s-other"]], "b1");
@@ -135,11 +151,15 @@ async function scenario(d: Db) {
 }
 
 describe("062360 session erasure replay manifest", () => {
-  test("a first erase captures T in its own transaction, seals it, and T equals the SQL selection effects exactly", async () => {
+  test("a first erase captures T in its own transaction (never sealed), and T equals the SQL selection effects exactly", async () => {
     const d = await database();
     await scenario(d);
     const r = await erase(d);
     expect(r).toMatchObject({ status: "in_progress", uploadsFenced: true, failure: null });
+    // F1 ruling (c): the erase records T but never seals it; every alias reads unsealed, with no targets.
+    for (const a of [SID, "s-alias"]) expect(await page(d, a)).toMatchObject({ complete: false, reason: "manifest_unsealed", targets: [] });
+    expect(await rows(d, "SELECT count(*)::int n FROM sessions.session_erasure_replay_completions")).toEqual([{ n: 0 }]);
+    await ownerSeal(d);
     const aliases = [SID, "s-alias"];
     const expected: ReplayTarget[] = [];
     for (const [u, origins] of [["U-a", ["origin-2", TURN_ORIGIN_ID]], ["u-b", ["origin-1", TURN_ORIGIN_ID]], ["u-c", [TURN_ORIGIN_ID]], ["u-d", [TURN_ORIGIN_ID]]] as const)
@@ -181,10 +201,11 @@ describe("062360 session erasure replay manifest", () => {
     expect(await snapshot(captured)).toEqual(await snapshot(legacy));
   });
 
-  test("a sealed repeat reuses its immutable witness after cleanup removed the metadata; another request id does not rebind it", async () => {
+  test("a (test-owner) sealed manifest is reused unchanged by repeats after cleanup removed the metadata; another request id does not rebind it", async () => {
     const d = await database();
     await scenario(d);
     await erase(d, "req-1");
+    await ownerSeal(d);
     const sealed = await drain(d, SID, 512);
     expect(await rows(d, "SELECT 1 FROM sessions.ingest_session_ownership WHERE session_id=$1", [SID])).toEqual([]);
     await erase(d, "req-2");
@@ -221,6 +242,64 @@ describe("062360 session erasure replay manifest", () => {
     }
   });
 
+  test("F1 (missing index link): a physical session committed under an origin whose index link is gone stays out of A, so the erase never claims completeness", async () => {
+    const d = await database();
+    // The layered reproduction: a physical session under an origin, its pointer linked to the logical id, a directory
+    // owner for the logical id, then only the index row removed before the real erase.
+    await land(d, "u-p", "origin-p", [[SRC, "s-phys"]], "bp");
+    await pointer(d, "u-p", "s-phys", "m-p", SID);
+    await directoryUser(d, SID, "u-d");
+    await d.db.exec("ALTER TABLE sessions.session_index DISABLE TRIGGER USER");
+    await d.db.query("DELETE FROM sessions.session_index WHERE session_id='s-phys'");
+    await d.db.exec("ALTER TABLE sessions.session_index ENABLE TRIGGER USER");
+    const r = await erase(d);
+    expect(r).toMatchObject({ uploadsFenced: true, failure: null });
+    // The closure is the logical id only (session_index has no link left), exactly as the legacy erase derives it.
+    expect(await rows(d, "SELECT alias_session_id a FROM sessions.session_erasure_replay_aliases")).toEqual([{ a: SID }]);
+    // The physical session's ownership survives the erase, as it does in the legacy erase: no inferred alias.
+    expect(await rows(d, "SELECT user_id,origin_id FROM sessions.ingest_session_ownership WHERE session_id='s-phys'"))
+      .toEqual([{ user_id: "u-p", origin_id: "origin-p" }]);
+    // Neither id reads complete: the logical one is unsealed, the physical one has no manifest.
+    expect(await page(d, SID)).toMatchObject({ complete: false, reason: "manifest_unsealed", targets: [] });
+    expect(await page(d, "s-phys")).toMatchObject({ complete: false, reason: "manifest_missing", targets: [] });
+    expect(await rows(d, "SELECT count(*)::int n FROM sessions.session_erasure_replay_completions")).toEqual([{ n: 0 }]);
+  });
+
+  test("F1, the kernel's three closure cases: none can read complete (an ownership veto, empty ownership with a surviving directory row, a removed link)", async () => {
+    const cases: Record<string, (d: Db) => Promise<void>> = {
+      // An unmatched ownership row: the physical session's ownership survives without any index row.
+      "ownership-without-index": async (d) => { await land(d, "u-p", "origin-p", [[SRC, "s-phys"]], "bp"); await directoryUser(d, SID, "u-d"); },
+      // Ownership empty, a directory-only row for the physical id survives: an ownership scan would pass, no proof.
+      "directory-only-physical": async (d) => {
+        await directoryUser(d, SID, "u-d");
+        await d.db.query(`INSERT INTO sessions.session_directory(org_id,workspace_id,harness,session_id,created_at,last_activity_at)
+          VALUES($1,$2,$3,'s-phys',now(),now())`, [ORG, WS, SRC]);
+        await d.db.query(`INSERT INTO sessions.session_directory_users(org_id,workspace_id,harness,session_id,user_id,last_activity_at)
+          VALUES($1,$2,$3,'s-phys','u-q',now())`, [ORG, WS, SRC]);
+      },
+      // The physical/canonical edge was removed: the current rows look like a session that never had the alias.
+      "removed-link": async (d) => {
+        await pointer(d, "u-p", "s-phys", "m-p", SID);
+        await pointer(d, "u-b", SID, "m-1");
+        await d.db.exec("ALTER TABLE sessions.session_index DISABLE TRIGGER USER");
+        await d.db.query("DELETE FROM sessions.session_index WHERE session_id='s-phys'");
+        await d.db.exec("ALTER TABLE sessions.session_index ENABLE TRIGGER USER");
+      },
+    };
+    for (const [name, setup] of Object.entries(cases)) {
+      const legacy = await database(before());
+      await setup(legacy);
+      await erase(legacy);
+      const d = await database();
+      await setup(d);
+      await erase(d);
+      for (const id of [SID, "s-phys"]) expect([name, id, (await page(d, id)).complete]).toEqual([name, id, false]);
+      expect([name, (await rows<{ n: number }>(d, "SELECT count(*)::int n FROM sessions.session_erasure_replay_completions"))[0]!.n]).toEqual([name, 0]);
+      // The legacy erase's effects are preserved exactly: nothing is inferred into the closure.
+      expect([name, await effectSet(d)]).toEqual([name, await effectSet(legacy)]);
+    }
+  });
+
   test("RH011 (a lazy, buffered or ordered org) refuses the erase before any write: no receipt, fence, intent or seal", async () => {
     const d = await database();
     await scenario(d);
@@ -234,7 +313,7 @@ describe("062360 session erasure replay manifest", () => {
     expect((await page(d, SID)).reason).toBe("manifest_missing");
   });
 
-  test("over the size bound (an injected small cap) the witness stays unsealed and the erase is exactly the legacy one", async () => {
+  test("the size bound: over an injected small cap no target is captured and the erase (effects, receipt, events, history) is exactly the legacy one", async () => {
     const legacy = await database(before());
     await scenario(legacy);
     await erase(legacy);
@@ -249,14 +328,90 @@ describe("062360 session erasure replay manifest", () => {
     expect((await page(d, SID)).reason).toBe("manifest_unsealed");
     expect(await rows(d, "SELECT count(*)::int n FROM sessions.session_erasure_replay_completions")).toEqual([{ n: 0 }]);
     expect(await effectSet(d)).toEqual(await effectSet(legacy));
-    // An oversize seal is refused even by the owner, with correct counts and digest.
-    const m = (await rows<{ m: string }>(d, "SELECT manifest_id::text m FROM sessions.session_erasure_replay_requests"))[0]!.m;
-    const c = (await rows<{ a: number; o: number; p: number; t: number; h: string }>(d, `SELECT (SELECT count(*) FROM sessions.session_erasure_replay_aliases WHERE manifest_id=$1)::int a,
-      count(DISTINCT user_id)::int o,count(DISTINCT (user_id,origin_id))::int p,count(*)::int t,sessions.session_erasure_replay_digest($1) h
-      FROM sessions.session_erasure_replay_targets WHERE manifest_id=$1`, [m]))[0]!;
-    expect(c.t).toBeGreaterThan(0);
-    expect(await code(d.db.query("INSERT INTO sessions.session_erasure_replay_completions VALUES($1,$2,$3,$4,1,$5,$6,$7,$8,$9)",
-      [m, ORG, WS, SRC, c.a, c.o, c.p, c.t, c.h]))).toBe("55000");
+    // The preflight ran before any target row: nothing over the cap is written or aggregated.
+    expect(await rows(d, "SELECT count(*)::int n FROM sessions.session_erasure_replay_targets")).toEqual([{ n: 0 }]);
+    // The whole legacy record is unchanged: receipt, events and 062340 history, not only the selection effects.
+    const record = async (x: Db) => ({
+      receipt: await rows(x, "SELECT status,artifacts,uploads_fenced,unreadable,attempts FROM sessions.session_erasure_receipts"),
+      events: await rows(x, "SELECT kind,count FROM sessions.session_erasure_events ORDER BY event_id"),
+      history: await rows(x, "SELECT source,op,count(*)::int n FROM sessions.ingest_org_erasure_history GROUP BY 1,2 ORDER BY 1,2"),
+    });
+    expect(await record(d)).toEqual(await record(legacy));
+  });
+
+  test("completion is fail-closed: even a seal that exactly matches its rows is refused (no alias-coverage proof)", async () => {
+    const d = await database();
+    await scenario(d);
+    await erase(d);
+    let refused: { code?: string; message?: string } | undefined;
+    try {
+      await d.db.query(`INSERT INTO sessions.session_erasure_replay_completions(manifest_id,org_id,workspace_id,source,derivation_version,alias_count,owner_count,pair_count,target_count,manifest_sha256)
+  SELECT r.manifest_id,r.org_id,r.workspace_id,r.source,1,(SELECT count(*) FROM sessions.session_erasure_replay_aliases a WHERE a.manifest_id=r.manifest_id),
+    count(DISTINCT t.user_id),count(DISTINCT (t.user_id,t.origin_id)),count(*),sessions.session_erasure_replay_digest(r.manifest_id)
+  FROM sessions.session_erasure_replay_requests r JOIN sessions.session_erasure_replay_targets t ON t.manifest_id=r.manifest_id
+  WHERE NOT EXISTS(SELECT 1 FROM sessions.session_erasure_replay_completions c WHERE c.manifest_id=r.manifest_id)
+  GROUP BY r.manifest_id,r.org_id,r.workspace_id,r.source`);
+    } catch (e) { refused = e as { code?: string; message?: string }; }
+    expect(refused).toMatchObject({ code: "55000", message: "session erasure replay manifest: sealing requires an authoritative alias-coverage proof" });
+    expect(await rows(d, "SELECT count(*)::int n FROM sessions.session_erasure_replay_completions")).toEqual([{ n: 0 }]);
+    expect((await page(d, SID)).reason).toBe("manifest_unsealed");
+  });
+
+  test("the size bound at the boundary: at the cap the targets are captured, one octet under it none are; effects stay legacy", async () => {
+    const legacy = await database(before());
+    await scenario(legacy);
+    await erase(legacy);
+    const measure = await database();
+    await scenario(measure);
+    await erase(measure);
+    const m = (await rows<{ m: string }>(measure, "SELECT manifest_id::text m FROM sessions.session_erasure_replay_requests"))[0]!.m;
+    const size = Number((await rows<{ n: string }>(measure, "SELECT sessions.session_erasure_replay_framed_bytes($1)::text n", [m]))[0]!.n);
+    expect(size).toBeGreaterThan(100);
+    const cost: Record<string, number> = {};
+    const capped = async (cap: number) => {
+      const d = await database();
+      await scenario(d);
+      await d.db.exec(`CREATE OR REPLACE FUNCTION sessions.session_erasure_replay_digest_cap() RETURNS bigint LANGUAGE sql IMMUTABLE SET search_path=pg_catalog,pg_temp AS $c$ SELECT ${cap}::bigint $c$`);
+      const t0 = performance.now();
+      await erase(d);
+      cost[`cap${cap - size >= 0 ? "+" : ""}${cap - size}`] = Math.round(performance.now() - t0);
+      return { d, targets: (await rows<{ n: number }>(d, "SELECT count(*)::int n FROM sessions.session_erasure_replay_targets"))[0]!.n };
+    };
+    const lt0 = performance.now();
+    { const l2 = await database(before()); await scenario(l2); const t0 = performance.now(); await erase(l2); cost.legacy = Math.round(performance.now() - t0); }
+    void lt0;
+    for (const [cap, captured] of [[size + 1, true], [size, true], [size - 1, false]] as const) {
+      const { d, targets } = await capped(cap);
+      expect([cap - size, targets > 0]).toEqual([cap - size, captured]);
+      expect(await effectSet(d)).toEqual(await effectSet(legacy));
+      // The full legacy record at every cap: receipt, events and 062340 history, not only the selection effects.
+      const record = async (x: Db) => ({
+        receipt: await rows(x, "SELECT status,artifacts,uploads_fenced,unreadable,attempts FROM sessions.session_erasure_receipts"),
+        events: await rows(x, "SELECT kind,count FROM sessions.session_erasure_events ORDER BY event_id"),
+        history: await rows(x, "SELECT source,op,count(*)::int n FROM sessions.ingest_org_erasure_history GROUP BY 1,2 ORDER BY 1,2"),
+        fences: await rows(x, "SELECT user_id,origin_id,source,session_id FROM sessions.ingest_fence_versions ORDER BY 1,2,3,4"),
+      });
+      expect([cap - size, await record(d)]).toEqual([cap - size, await record(legacy)]);
+      expect((await page(d, SID)).reason).toBe("manifest_unsealed");
+      // The digest never builds an over-cap message: NULL at size - 1 for the measured rows' shape.
+      if (captured) {
+        const dm = (await rows<{ m: string }>(d, "SELECT manifest_id::text m FROM sessions.session_erasure_replay_requests"))[0]!.m;
+        expect((await rows<{ h: string | null }>(d, "SELECT sessions.session_erasure_replay_digest($1) h", [dm]))[0]!.h).toMatch(/^[0-9a-f]{64}$/u);
+        await d.db.exec("CREATE OR REPLACE FUNCTION sessions.session_erasure_replay_digest_cap() RETURNS bigint LANGUAGE sql IMMUTABLE SET search_path=pg_catalog,pg_temp AS $c$ SELECT " + (size - 1) + "::bigint $c$");
+        expect((await rows<{ h: string | null }>(d, "SELECT sessions.session_erasure_replay_digest($1) h", [dm]))[0]!.h).toBeNull();
+        // The seal trigger checks the bound in its own statement, before any digest: an over-cap seal is refused as such.
+        let why: string | undefined;
+        try {
+          await d.db.query(`INSERT INTO sessions.session_erasure_replay_completions SELECT r.manifest_id,r.org_id,r.workspace_id,r.source,1,
+            (SELECT count(*) FROM sessions.session_erasure_replay_aliases a WHERE a.manifest_id=r.manifest_id),count(DISTINCT t.user_id),
+            count(DISTINCT (t.user_id,t.origin_id)),count(*),repeat('0',64) FROM sessions.session_erasure_replay_requests r
+            JOIN sessions.session_erasure_replay_targets t USING(manifest_id) GROUP BY r.manifest_id,r.org_id,r.workspace_id,r.source`);
+        } catch (e) { why = (e as { message?: string }).message; }
+        expect(why).toBe("session erasure replay manifest: over the size bound");
+      }
+    }
+    // Capture cost at the boundary (informational, not asserted: single-connection PGlite timing): erase ms per cap.
+    console.log(`062360 capture cost at the size boundary (framed ${size} octets): ${JSON.stringify(cost)}`);
   });
 
   test("an erase with no owners is never sealed (empty coverage is unproven)", async () => {
@@ -300,6 +455,7 @@ describe("062360 session erasure replay manifest", () => {
     const d = await database();
     await scenario(d);
     await erase(d);
+    await ownerSeal(d);
     const m = (await rows<{ m: string }>(d, "SELECT manifest_id::text m FROM sessions.session_erasure_replay_requests"))[0]!.m;
     for (const t of ["requests", "aliases", "targets", "completions"]) {
       expect(await code(d.db.query(`UPDATE sessions.session_erasure_replay_${t} SET manifest_id=manifest_id`))).toBe("55000");
@@ -323,6 +479,7 @@ describe("062360 session erasure replay manifest", () => {
     const d = await database();
     await scenario(d);
     await erase(d);
+    await ownerSeal(d);
     // A plain STABLE SELECT: the same page in a READ ONLY and a read-write transaction.
     expect(await page(d, SID, null, 512, false)).toEqual(await page(d, SID, null, 512, true));
     for (const size of [0, 513]) expect((await page(d, SID, null, size)).reason).toBe("reader_input_invalid");
@@ -353,6 +510,7 @@ describe("062360 session erasure replay manifest", () => {
     await d.db.query(`INSERT INTO sessions.session_directory_users(org_id,workspace_id,harness,session_id,user_id,last_activity_at)
       VALUES($1,'',$2,'sé ss','ü-1',now())`, [ORG, SRC]);
     await erase(d, "req-é", [ORG, "", SRC, "sé ss"]);
+    await ownerSeal(d);
     await d.db.exec("BEGIN READ ONLY");
     const p = (await d.db.query<{ p: Page }>("SELECT sessions.session_erasure_replay_read($1,'',$2,'sé ss') p", [ORG, SRC])).rows[0]!.p;
     const bad = (await d.db.query<{ p: Page }>("SELECT sessions.session_erasure_replay_read($1,$2,$3,E'a\\x01') p", [ORG, WS, SRC])).rows[0]!.p;
@@ -488,6 +646,7 @@ describe("062360 down and reapply", () => {
     const d = await database();
     await scenario(d);
     await erase(d);
+    await ownerSeal(d);
     const sealed = await drain(d, SID, 4);
     await ledgered(d);
     await down(d);

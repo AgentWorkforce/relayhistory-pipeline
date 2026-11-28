@@ -5,8 +5,12 @@
 --
 -- Why: the SQL erase discovers aliases, owners and origins before it removes them. The 062320 hold release cannot
 -- rebuild that set afterwards, so the bridge answers session_manifest_missing for every session erasure. This slot
--- persists the exact finite target set inside the erase transaction, under the erase's own locks, and seals it before
--- the first destructive selection. The seal commits with the SQL effects or not at all. Prospective only: no backfill.
+-- persists the target set the erase derives, inside the erase transaction and under its own locks, before the first
+-- destructive selection; it commits with the SQL effects or not at all. Prospective only: no backfill.
+-- The erase NEVER SEALS it (F1 ruling, hard-delete-owner, option (c)): the alias closure comes from session_index
+-- alone, so a physical session without its index link can be missing, and no authoritative alias-coverage proof exists
+-- yet. Every prospective manifest therefore reads manifest_unsealed; this increment cannot produce a production
+-- complete=true page. The seal, its guards and the reader are the reviewed shape a future proof-gated slot would use.
 --
 -- Objects (all owner-only, RLS on, immutable; this slot's down KEEPS the four tables as the replay witness):
 --   sessions.session_erasure_replay_requests     intent: manifest UUID, the accepted receipt's request_id, the tenant,
@@ -18,9 +22,9 @@
 --   sessions.session_erasure_replay_read(...)    the owner reader (design section 6.1, wire v1), READ ONLY.
 --
 -- Eligibility (design section 3, default "a retry cannot seal"): an intent is written only by the call that inserted the
--- receipt (the first attempt), and only when no alias of its closure is already bound to another manifest. That same
--- uninterrupted call may seal it. A retried (failed) receipt never creates or seals an intent; a caught RH010 rolls the
--- capture back with the cleanup and leaves the intent unsealed. The existing erase behaviour is unchanged on every path.
+-- receipt (the first attempt), and only when no alias of its closure was fenced before the call. Only that same
+-- uninterrupted call records targets. A retried (failed) receipt never creates an intent or records targets; a caught
+-- RH010 rolls the targets back with the cleanup and keeps the bare intent. The existing erase behaviour is unchanged on every path.
 --
 -- Lock order is unchanged: 062320's org check (SHARED, in ingest_operator_runtime_begin) first, then the global erase
 -- gate (961996,50000), alias writer locks, the receipt row, the sorted owner fence locks. Capture takes no new lock but
@@ -116,35 +120,6 @@ BEGIN
  RAISE EXCEPTION USING ERRCODE='55000',MESSAGE='session erasure replay manifest: records are immutable';
 END $replay_guard$;
 
--- The canonical digest (design section 4): SHA-256 over the raw ASCII domain tag, then every field framed as its
--- 4-byte big-endian UTF-8 octet length then its bytes; each list is its count (framed canonical decimal text, bigint
--- range) then its members in bytewise ("C") order. Fields after the tag: capture_version (decimal), manifest_id
--- (canonical lowercase), request_id, org, workspace, source, requested session, the aliases, then each target as
--- (user_id, origin_id, source, session_id). The same encoding is src/hoopdb/session-erasure-replay-digest.ts (test vectors pinned there and checked against this function).
-CREATE OR REPLACE FUNCTION sessions.session_erasure_replay_digest(p_manifest uuid) RETURNS text
-LANGUAGE sql STABLE SET search_path=pg_catalog,pg_temp AS $replay_digest$
- WITH r AS (SELECT * FROM sessions.session_erasure_replay_requests WHERE manifest_id=p_manifest),
- a AS (SELECT coalesce(string_agg(int4send(octet_length(convert_to(x.alias_session_id,'UTF8')))||convert_to(x.alias_session_id,'UTF8'),
-        ''::bytea ORDER BY x.alias_session_id COLLATE "C"),''::bytea) AS b, count(*) AS n
-       FROM sessions.session_erasure_replay_aliases AS x WHERE x.manifest_id=p_manifest),
- t AS (SELECT coalesce(string_agg(
-          int4send(octet_length(convert_to(x.user_id,'UTF8')))||convert_to(x.user_id,'UTF8')
-        ||int4send(octet_length(convert_to(x.origin_id,'UTF8')))||convert_to(x.origin_id,'UTF8')
-        ||int4send(octet_length(convert_to(x.source,'UTF8')))||convert_to(x.source,'UTF8')
-        ||int4send(octet_length(convert_to(x.session_id,'UTF8')))||convert_to(x.session_id,'UTF8'),
-        ''::bytea ORDER BY x.user_id COLLATE "C",x.origin_id COLLATE "C",x.source COLLATE "C",x.session_id COLLATE "C"),''::bytea) AS b,
-        count(*) AS n
-       FROM sessions.session_erasure_replay_targets AS x WHERE x.manifest_id=p_manifest)
- SELECT encode(sha256(
-    convert_to('rh-erase-replay-manifest/v1','UTF8')
-  ||(SELECT string_agg(int4send(octet_length(convert_to(v,'UTF8')))||convert_to(v,'UTF8'),''::bytea ORDER BY o)
-      FROM r, LATERAL (VALUES (0,r.capture_version::text),(1,r.manifest_id::text),(2,r.request_id),(3,r.org_id),(4,r.workspace_id),
-                              (5,r.source),(6,r.requested_session_id)) AS v(o,v))
-  ||int4send(octet_length(a.n::text))||convert_to(a.n::text,'UTF8')||a.b
-  ||int4send(octet_length(t.n::text))||convert_to(t.n::text,'UTF8')||t.b),'hex')
- FROM a, t WHERE EXISTS(SELECT 1 FROM r)
-$replay_digest$;
-
 -- The size bound (equivalence review, finding 2). PostgreSQL caps one value at 1 GiB, and the digest hashes the whole
 -- framed message as one bytea; origins per owner are not capped by 050000. So a manifest whose framed message would
 -- exceed this source cap is never sealed: the witness stays unsealed (unproven) and the erase proceeds exactly as
@@ -154,21 +129,66 @@ LANGUAGE sql IMMUTABLE SET search_path=pg_catalog,pg_temp AS $replay_cap$
  SELECT 67108864::bigint -- 64 MiB of framed message
 $replay_cap$;
 
--- The exact octet length of the digest's framed message, summed without building it (one value never materializes).
-CREATE OR REPLACE FUNCTION sessions.session_erasure_replay_framed_bytes(p_manifest uuid) RETURNS bigint
-LANGUAGE sql STABLE SET search_path=pg_catalog,pg_temp AS $replay_bytes$
+-- The exact octet length of the digest message's fixed part: the tag, the seven binding fields and the alias list
+-- (count and members). numeric throughout: no sum can overflow.
+CREATE OR REPLACE FUNCTION sessions.session_erasure_replay_framed_header(p_manifest uuid) RETURNS numeric
+LANGUAGE sql STABLE SET search_path=pg_catalog,pg_temp AS $replay_header$
  WITH r AS (SELECT * FROM sessions.session_erasure_replay_requests WHERE manifest_id=p_manifest),
- a AS (SELECT count(*) AS n,coalesce(sum(4+octet_length(convert_to(x.alias_session_id,'UTF8'))),0) AS b
-       FROM sessions.session_erasure_replay_aliases AS x WHERE x.manifest_id=p_manifest),
- t AS (SELECT count(*) AS n,coalesce(sum(16+octet_length(convert_to(x.user_id,'UTF8'))+octet_length(convert_to(x.origin_id,'UTF8'))
-         +octet_length(convert_to(x.source,'UTF8'))+octet_length(convert_to(x.session_id,'UTF8'))),0) AS b
-       FROM sessions.session_erasure_replay_targets AS x WHERE x.manifest_id=p_manifest)
- SELECT (octet_length(convert_to('rh-erase-replay-manifest/v1','UTF8'))
-   +(SELECT sum(4+octet_length(convert_to(v,'UTF8'))) FROM r, LATERAL (VALUES (r.capture_version::text),(r.manifest_id::text),(r.request_id),
-       (r.org_id),(r.workspace_id),(r.source),(r.requested_session_id)) AS v(v))
-   +4+octet_length(a.n::text)+a.b+4+octet_length(t.n::text)+t.b)::bigint
- FROM a, t WHERE EXISTS(SELECT 1 FROM r)
+ a AS (SELECT count(*) AS n,coalesce(sum(4+octet_length(convert_to(x.alias_session_id,'UTF8'))::numeric),0) AS b
+       FROM sessions.session_erasure_replay_aliases AS x WHERE x.manifest_id=p_manifest)
+ SELECT octet_length(convert_to('rh-erase-replay-manifest/v1','UTF8'))::numeric
+   +(SELECT sum(4+octet_length(convert_to(v,'UTF8'))::numeric) FROM r, LATERAL (VALUES (r.capture_version::text),(r.manifest_id::text),
+       (r.request_id),(r.org_id),(r.workspace_id),(r.source),(r.requested_session_id)) AS v(v))
+   +4+octet_length(a.n::text)+a.b
+ FROM a WHERE EXISTS(SELECT 1 FROM r)
+$replay_header$;
+
+-- The exact octet length of the whole digest message, summed from the stored rows without building it.
+CREATE OR REPLACE FUNCTION sessions.session_erasure_replay_framed_bytes(p_manifest uuid) RETURNS numeric
+LANGUAGE sql STABLE SET search_path=pg_catalog,pg_temp AS $replay_bytes$
+ SELECT sessions.session_erasure_replay_framed_header(p_manifest)+4+octet_length(t.n::text)+t.b
+ FROM (SELECT count(*) AS n,coalesce(sum(16+octet_length(convert_to(x.user_id,'UTF8'))+octet_length(convert_to(x.origin_id,'UTF8'))
+         +octet_length(convert_to(x.source,'UTF8'))+octet_length(convert_to(x.session_id,'UTF8'))::numeric),0) AS b
+       FROM sessions.session_erasure_replay_targets AS x WHERE x.manifest_id=p_manifest) AS t
+ WHERE EXISTS(SELECT 1 FROM sessions.session_erasure_replay_requests WHERE manifest_id=p_manifest)
 $replay_bytes$;
+
+-- The canonical digest (design section 4): SHA-256 over the raw ASCII domain tag, then every field framed as its
+-- 4-byte big-endian UTF-8 octet length then its bytes; each list is its count (framed canonical decimal text, bigint
+-- range) then its members in bytewise ("C") order. Fields after the tag: capture_version (decimal), manifest_id
+-- (canonical lowercase), request_id, org, workspace, source, requested session, the aliases, then each target as
+-- (user_id, origin_id, source, session_id). The same encoding is src/hoopdb/session-erasure-replay-digest.ts (test vectors pinned there and checked against this function).
+CREATE OR REPLACE FUNCTION sessions.session_erasure_replay_digest(p_manifest uuid) RETURNS text
+LANGUAGE plpgsql STABLE SET search_path=pg_catalog,pg_temp AS $replay_digest$
+DECLARE v_hex text;
+BEGIN
+ -- Independently of every caller, and FIRST (its own statement, so no evaluation order can reach the aggregation):
+ -- never build a message over the size bound. NULL, which no seal or page accepts.
+ IF sessions.session_erasure_replay_framed_bytes(p_manifest) IS NULL
+  OR sessions.session_erasure_replay_framed_bytes(p_manifest)>sessions.session_erasure_replay_digest_cap() THEN RETURN NULL;END IF;
+  WITH r AS (SELECT * FROM sessions.session_erasure_replay_requests WHERE manifest_id=p_manifest),
+  a AS (SELECT coalesce(string_agg(int4send(octet_length(convert_to(x.alias_session_id,'UTF8')))||convert_to(x.alias_session_id,'UTF8'),
+         ''::bytea ORDER BY x.alias_session_id COLLATE "C"),''::bytea) AS b, count(*) AS n
+        FROM sessions.session_erasure_replay_aliases AS x WHERE x.manifest_id=p_manifest),
+  t AS (SELECT coalesce(string_agg(
+           int4send(octet_length(convert_to(x.user_id,'UTF8')))||convert_to(x.user_id,'UTF8')
+         ||int4send(octet_length(convert_to(x.origin_id,'UTF8')))||convert_to(x.origin_id,'UTF8')
+         ||int4send(octet_length(convert_to(x.source,'UTF8')))||convert_to(x.source,'UTF8')
+         ||int4send(octet_length(convert_to(x.session_id,'UTF8')))||convert_to(x.session_id,'UTF8'),
+         ''::bytea ORDER BY x.user_id COLLATE "C",x.origin_id COLLATE "C",x.source COLLATE "C",x.session_id COLLATE "C"),''::bytea) AS b,
+         count(*) AS n
+        FROM sessions.session_erasure_replay_targets AS x WHERE x.manifest_id=p_manifest)
+  SELECT encode(sha256(
+     convert_to('rh-erase-replay-manifest/v1','UTF8')
+   ||(SELECT string_agg(int4send(octet_length(convert_to(v,'UTF8')))||convert_to(v,'UTF8'),''::bytea ORDER BY o)
+       FROM r, LATERAL (VALUES (0,r.capture_version::text),(1,r.manifest_id::text),(2,r.request_id),(3,r.org_id),(4,r.workspace_id),
+                               (5,r.source),(6,r.requested_session_id)) AS v(o,v))
+   ||int4send(octet_length(a.n::text))||convert_to(a.n::text,'UTF8')||a.b
+   ||int4send(octet_length(t.n::text))||convert_to(t.n::text,'UTF8')||t.b),'hex') INTO v_hex
+  FROM a, t WHERE EXISTS(SELECT 1 FROM r);
+ RETURN v_hex;
+END $replay_digest$;
+
 
 -- A child row (alias or target) may not join a sealed manifest. FOR SHARE on the parent conflicts with the seal's
 -- FOR UPDATE, so a child insert racing a seal either commits first (and the seal's recount sees it) or waits and sees
@@ -187,7 +207,8 @@ BEGIN
 END $replay_child$;
 
 -- The seal recomputes everything it claims from the rows under the parent's FOR UPDATE lock: a nonempty, exactly
--- (owner, origin) x alias target set, the requested session among the aliases, and the digest.
+-- (owner, origin) x alias target set, the requested session among the aliases, and the digest. In this slot it then
+-- refuses every seal (below).
 CREATE OR REPLACE FUNCTION sessions.session_erasure_replay_seal_guard() RETURNS trigger
 LANGUAGE plpgsql VOLATILE SET search_path=pg_catalog,pg_temp AS $replay_seal$
 DECLARE r sessions.session_erasure_replay_requests%ROWTYPE;v_aliases bigint;v_owners bigint;v_pairs bigint;v_targets bigint;
@@ -208,10 +229,17 @@ BEGIN
   OR v_targets<>v_pairs*v_aliases
   OR (NEW.alias_count,NEW.owner_count,NEW.pair_count,NEW.target_count)IS DISTINCT FROM(v_aliases,v_owners,v_pairs,v_targets)
   OR NEW.derivation_version IS DISTINCT FROM r.capture_version
-  OR sessions.session_erasure_replay_framed_bytes(NEW.manifest_id)>sessions.session_erasure_replay_digest_cap()
-  OR NEW.manifest_sha256 IS DISTINCT FROM sessions.session_erasure_replay_digest(NEW.manifest_id) THEN
+  THEN
   RAISE EXCEPTION USING ERRCODE='55000',MESSAGE='session erasure replay manifest: seal does not match its rows';END IF;
- RETURN NEW;
+ -- The size bound in its own statement, before any digest is built (no evaluation order can reach it).
+ IF sessions.session_erasure_replay_framed_bytes(NEW.manifest_id)>sessions.session_erasure_replay_digest_cap() THEN
+  RAISE EXCEPTION USING ERRCODE='55000',MESSAGE='session erasure replay manifest: over the size bound';END IF;
+ IF NEW.manifest_sha256 IS DISTINCT FROM sessions.session_erasure_replay_digest(NEW.manifest_id) THEN
+  RAISE EXCEPTION USING ERRCODE='55000',MESSAGE='session erasure replay manifest: seal does not match its rows';END IF;
+ -- Fail closed (F1 ruling, option (c), design draft 8 section 2.1): no seal without an authoritative alias-coverage
+ -- proof, and none exists in this slot. Even a seal that matches its rows is refused, so no production path can make a
+ -- complete=true page. A future slot replaces this guard only behind a reviewed proof; never a flag or a fixture.
+ RAISE EXCEPTION USING ERRCODE='55000',MESSAGE='session erasure replay manifest: sealing requires an authoritative alias-coverage proof';
 END $replay_seal$;
 
 DO $replay_triggers$
@@ -234,13 +262,13 @@ BEGIN
 END $replay_triggers$;
 
 -- The 050000 fence body, with one addition: given an eligible manifest, the target set T is materialized ONCE after
--- owner-lock convergence, sealed, and then drives the destructive selection loop. With p_manifest NULL the body is the
--- legacy derivation, statement for statement. Both paths select the same (owner, origin) pairs in the same order.
+-- owner-lock convergence and then drives the destructive selection loop (never sealed here: see the header). With
+-- p_manifest NULL the body is the legacy derivation, statement for statement. Both paths select the same (owner, origin) pairs in the same order.
 CREATE FUNCTION sessions.session_erasure_replay_fence(p_org text,p_ws text,p_source text,p_session text,p_ids text[],p_manifest uuid) RETURNS void
 LANGUAGE plpgsql VOLATILE SET search_path=pg_catalog,pg_temp AS $replay_fence$
 DECLARE v_locked text[]:='{}';v_users text[];v_user text;v_origin text;v_pairs jsonb;v_round integer:=0;
  v_ledger bigint:=0;v_pointers bigint:=0;v_dirs bigint:=0;v_n bigint;v_live boolean;v_artifacts jsonb;
- v_manifest uuid:=p_manifest;v_targets bigint;v_owner_origins bigint;
+ v_manifest uuid:=p_manifest;v_pair_users text[];v_pair_origins text[];v_bytes numeric;
  c_erased_revision CONSTANT bigint:=9007199254740991;
  c_turn_origin CONSTANT text:='relayhistory:conversation_turns:v1';
  c_max_owners CONSTANT integer:=64;
@@ -267,33 +295,47 @@ BEGIN
   END LOOP;
  END LOOP;
  -- Capture (062360): only when the intent's original alias declaration is exactly this call's closure, and the
- -- converged owner set is nonempty (an empty set is never sealed: design section 2).
+ -- converged owner set is nonempty (an empty owner set has no target set to record: design section 2).
  IF v_manifest IS NOT NULL AND (cardinality(v_users)=0 OR ARRAY(SELECT x.alias_session_id FROM sessions.session_erasure_replay_aliases AS x
     WHERE x.manifest_id=v_manifest ORDER BY x.alias_session_id COLLATE "C") IS DISTINCT FROM
     ARRAY(SELECT i FROM unnest(p_ids) AS i ORDER BY i COLLATE "C")) THEN
   v_manifest:=NULL;
  END IF;
  IF v_manifest IS NOT NULL THEN
-  INSERT INTO sessions.session_erasure_replay_targets(manifest_id,org_id,workspace_id,user_id,origin_id,source,session_id)
-  SELECT v_manifest,p_org,p_ws,u.user_id,o.origin_id,p_source,i
+  -- The (owner, origin) pairs, derived ONCE under the owner locks: the size preflight and the target rows both use them.
+  SELECT coalesce(array_agg(u.user_id ORDER BY u.user_id COLLATE "C",o.origin_id COLLATE "C"),'{}'),
+         coalesce(array_agg(o.origin_id ORDER BY u.user_id COLLATE "C",o.origin_id COLLATE "C"),'{}')
+   INTO v_pair_users,v_pair_origins
    FROM unnest(v_users) AS u(user_id)
    CROSS JOIN LATERAL (SELECT q.origin_id FROM sessions.ingest_session_ownership AS q
      WHERE q.org_id=p_org AND q.workspace_id=p_ws AND q.user_id=u.user_id AND q.source=p_source AND q.session_id=ANY(p_ids)
-    UNION SELECT c_turn_origin) AS o
-   CROSS JOIN unnest(p_ids) AS i;
-  GET DIAGNOSTICS v_targets=ROW_COUNT;
-  v_owner_origins:=v_targets/cardinality(p_ids);
- END IF;
- -- Over the size bound: no seal (unproven), and the legacy derivation below, exactly as before.
- IF v_manifest IS NOT NULL AND sessions.session_erasure_replay_framed_bytes(v_manifest)>sessions.session_erasure_replay_digest_cap() THEN
-  v_manifest:=NULL;
+    UNION SELECT c_turn_origin) AS o;
+  -- Size preflight (exact framed octets of the digest message, numeric so it cannot overflow), BEFORE any target row
+  -- is written or aggregated: over the cap, no targets are recorded and the erase takes the legacy derivation below.
+  SELECT sessions.session_erasure_replay_framed_header(v_manifest)
+    +4+octet_length((cardinality(v_pair_users)::numeric*cardinality(p_ids))::text)
+    +coalesce(sum(cardinality(p_ids)::numeric*(16+octet_length(convert_to(x.u,'UTF8'))+octet_length(convert_to(x.o,'UTF8'))
+       +octet_length(convert_to(p_source,'UTF8')))),0)
+    +cardinality(v_pair_users)::numeric*(SELECT coalesce(sum(octet_length(convert_to(i,'UTF8'))),0) FROM unnest(p_ids) AS i)
+   INTO v_bytes
+   FROM unnest(v_pair_users,v_pair_origins) AS x(u,o);
+  IF v_bytes IS NULL OR v_bytes>sessions.session_erasure_replay_digest_cap() THEN
+   v_manifest:=NULL;
+  END IF;
  END IF;
  IF v_manifest IS NOT NULL THEN
-  INSERT INTO sessions.session_erasure_replay_completions(manifest_id,org_id,workspace_id,source,derivation_version,
-    alias_count,owner_count,pair_count,target_count,manifest_sha256)
-  VALUES(v_manifest,p_org,p_ws,p_source,1,cardinality(p_ids),cardinality(v_users),v_owner_origins,v_targets,
-    sessions.session_erasure_replay_digest(v_manifest));
-  -- The selection is driven by the sealed set itself, in the legacy order (owner, then origin, bytewise).
+  INSERT INTO sessions.session_erasure_replay_targets(manifest_id,org_id,workspace_id,user_id,origin_id,source,session_id)
+  SELECT v_manifest,p_org,p_ws,x.u,x.o,p_source,i
+   FROM unnest(v_pair_users,v_pair_origins) AS x(u,o) CROSS JOIN unnest(p_ids) AS i;
+ END IF;
+ -- NO SEAL (design F1 ruling, hard-delete-owner, option (c)): the alias closure comes from session_index alone, and a
+ -- physical session whose index link is missing (its ownership committed before its pointer, or the link removed) is
+ -- outside it. Without an authoritative alias-coverage proof, which does not exist yet, a seal would claim a
+ -- completeness the erase cannot show. The capture stays as the derivation's witness; the reader answers
+ -- manifest_unsealed; this increment cannot produce a production complete=true page. A future slot may seal only
+ -- behind a separately reviewed retained-mapping proof, never a flag, an empty scan or a fixture.
+ IF v_manifest IS NOT NULL THEN
+  -- The selection is driven by the captured set itself, in the legacy order (owner, then origin, bytewise).
   FOR v_user,v_origin IN
    SELECT t.user_id,t.origin_id FROM sessions.session_erasure_replay_targets AS t WHERE t.manifest_id=v_manifest
    GROUP BY t.user_id,t.origin_id ORDER BY t.user_id COLLATE "C",t.origin_id COLLATE "C"

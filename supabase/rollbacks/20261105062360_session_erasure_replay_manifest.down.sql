@@ -16,7 +16,7 @@ DO $rollback_guard$ DECLARE v_sha text; BEGIN
  IF EXISTS(SELECT 1 FROM sessions.__96bulls_migrations WHERE name LIKE 'upstream:%' AND name COLLATE "C">'upstream:20261105062360_session_erasure_replay_manifest.sql')
  THEN RAISE EXCEPTION USING ERRCODE='55000',MESSAGE='session erasure replay manifest: a later migration is applied; roll it back first';END IF;
  SELECT sha256 INTO v_sha FROM sessions.__96bulls_migrations WHERE name='upstream:20261105062360_session_erasure_replay_manifest.sql' FOR UPDATE;
- IF NOT FOUND OR v_sha IS DISTINCT FROM '4b3fe0967888571ae1870e89357752c6c69df81b038ef87f1c1849f7bb0ea3d7'
+ IF NOT FOUND OR v_sha IS DISTINCT FROM '0e0a42acbebad36faf9244d223e2724ee5a231850f6d4bfccc46d5356417d361'
  THEN RAISE EXCEPTION USING ERRCODE='55000',MESSAGE='session erasure replay manifest: own applied checksum required';END IF;
 END $rollback_guard$;
 -- sessions.ingest_operator_erase_fence(text,text,text,text,text[]): restored from supabase/migrations/20261105050000_operator_session_erase.sql.
@@ -186,6 +186,7 @@ DO $rollback_witness$ BEGIN
   EXECUTE 'DROP FUNCTION sessions.session_erasure_replay_child_guard()';
   EXECUTE 'DROP FUNCTION sessions.session_erasure_replay_digest(uuid)';
   EXECUTE 'DROP FUNCTION sessions.session_erasure_replay_framed_bytes(uuid)';
+  EXECUTE 'DROP FUNCTION sessions.session_erasure_replay_framed_header(uuid)';
   EXECUTE 'DROP FUNCTION sessions.session_erasure_replay_digest_cap()';
   EXECUTE 'DROP FUNCTION sessions.session_erasure_replay_guard()';
   ALTER TABLE sessions.session_erasure_receipts DROP CONSTRAINT session_erasure_receipts_request_binding;
@@ -225,5 +226,5 @@ DO $rollback_verify$ BEGIN
    AND p.prosrc LIKE '%-- 062360 session erasure replay manifest%')
  THEN RAISE EXCEPTION USING ERRCODE='55000',MESSAGE='session erasure replay manifest: capture survived the down; rolled back';END IF;
 END $rollback_verify$;
-DELETE FROM sessions.__96bulls_migrations WHERE name='upstream:20261105062360_session_erasure_replay_manifest.sql' AND sha256='4b3fe0967888571ae1870e89357752c6c69df81b038ef87f1c1849f7bb0ea3d7';
+DELETE FROM sessions.__96bulls_migrations WHERE name='upstream:20261105062360_session_erasure_replay_manifest.sql' AND sha256='0e0a42acbebad36faf9244d223e2724ee5a231850f6d4bfccc46d5356417d361';
 COMMIT;

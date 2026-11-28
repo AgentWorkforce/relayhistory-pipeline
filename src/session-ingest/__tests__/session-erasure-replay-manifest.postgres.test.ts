@@ -90,6 +90,16 @@ async function drain(c: Q, fence: string, size: number) {
   expect(d.hex()).toBe(first.manifest_sha256 as string);
   return { first, all };
 }
+/** The erase never seals (F1 ruling (c)); the TEST OWNER seals captured manifests to exercise seal, guards and reader. */
+const ownerSeal = async (c: Q) => {
+  await c.query('ALTER TABLE sessions.session_erasure_replay_completions DISABLE TRIGGER session_erasure_replay_seal');
+  try { await c.query(`INSERT INTO sessions.session_erasure_replay_completions(manifest_id,org_id,workspace_id,source,derivation_version,alias_count,owner_count,pair_count,target_count,manifest_sha256)
+  SELECT r.manifest_id,r.org_id,r.workspace_id,r.source,1,(SELECT count(*) FROM sessions.session_erasure_replay_aliases a WHERE a.manifest_id=r.manifest_id),
+    count(DISTINCT t.user_id),count(DISTINCT (t.user_id,t.origin_id)),count(*),sessions.session_erasure_replay_digest(r.manifest_id)
+  FROM sessions.session_erasure_replay_requests r JOIN sessions.session_erasure_replay_targets t ON t.manifest_id=r.manifest_id
+  WHERE NOT EXISTS(SELECT 1 FROM sessions.session_erasure_replay_completions c WHERE c.manifest_id=r.manifest_id)
+  GROUP BY r.manifest_id,r.org_id,r.workspace_id,r.source`); } finally { await c.query('ALTER TABLE sessions.session_erasure_replay_completions ENABLE TRIGGER session_erasure_replay_seal'); }
+};
 const n = async (c: Q, sql: string) => Number((await c.query(sql)).rows[0].n);
 /** The retained witness stays owner-only and immutable: no runtime role reads or writes it, no row is mutable. */
 async function retainedSafe(c: Q) {
@@ -116,7 +126,9 @@ describe.skipIf(!url)("062360 replay manifest on real PostgreSQL", () => {
     const r = await expectNotBlocked(p, { holder: p.a, waiter: p.b, hold: (c) => erase(c), wait: (c) => c.query(
       "SELECT sessions.session_erasure_replay_read($1,$2,$3,$4) p", [ORG, WS, SRC, SID]) });
     expect((r.waited as { ok: true; value: pg.QueryResult }).value.rows[0].p.reason).toBe("manifest_missing");
-    // The holder committed after the read: the sealed set, equal to the SQL selection effects.
+    // The holder committed after the read: captured, never sealed by the erase (F1 ruling (c)).
+    expect((await read(o, "s-alias")).reason).toBe("manifest_unsealed");
+    await ownerSeal(o);
     const { first, all } = await drain(o, "s-alias", 2);
     const effects = (await o.query(`SELECT user_id,origin_id,source,session_id FROM sessions.upload_deletions WHERE org_id=$1
       ORDER BY user_id COLLATE "C",origin_id COLLATE "C",source COLLATE "C",session_id COLLATE "C"`, [ORG])).rows;
@@ -132,9 +144,10 @@ describe.skipIf(!url)("062360 replay manifest on real PostgreSQL", () => {
     expect(await n(o, "SELECT count(*)::int n FROM sessions.session_erasure_receipts WHERE session_id='s-rb'")).toBe(0);
     expect(await n(o, "SELECT count(*)::int n FROM sessions.session_erasure_replay_aliases WHERE alias_session_id='s-rb'")).toBe(0);
     expect(await n(o, "SELECT count(*)::int n FROM sessions.upload_deletions WHERE session_id='s-rb'")).toBe(0);
-    // Rolled back entirely, so a new call is a genuinely fresh first attempt and may seal.
+    // Rolled back entirely, so a new call is a genuinely fresh first attempt and records its targets (unsealed).
     await erase(o, "req-rb", "s-rb");
-    expect((await read(o, "s-rb")).complete).toBe(true);
+    expect((await read(o, "s-rb")).reason).toBe("manifest_unsealed");
+    expect(await n(o, "SELECT count(*)::int n FROM sessions.session_erasure_replay_targets t JOIN sessions.session_erasure_replay_requests r USING(manifest_id) WHERE r.requested_session_id='s-rb'")).toBeGreaterThan(0);
   });
 
   test("2. two first calls for one key: the second waits on the erase gate, then repeats; one manifest, the first request", async () => {
@@ -146,7 +159,7 @@ describe.skipIf(!url)("062360 replay manifest on real PostgreSQL", () => {
     expect(r.receipt.waiting[0]).toMatchObject({ locktype: "advisory" });
     expect(r.waited.ok).toBe(true);
     expect(await n(o, "SELECT count(*)::int n FROM sessions.session_erasure_replay_requests")).toBe(1);
-    expect((await read(o, SID)).request_id).toBe("req-first");
+    expect((await o.query("SELECT request_id FROM sessions.session_erasure_replay_requests")).rows[0].request_id).toBe("req-first");
   });
 
   test("3. a caught RH010 keeps fences and intent unsealed; same, larger and smaller retries never seal", async () => {
@@ -224,9 +237,9 @@ describe.skipIf(!url)("062360 replay manifest on real PostgreSQL", () => {
       expect(await locks(path.waiter.pid)).toEqual([]);
       expect(await locks(p.a.pid)).toEqual([]);
     }
-    // A sealed capture through both paths after the gates are free: a seeded session, the direct path.
+    // A capture after the gates are free: a seeded session, the direct path; captured, never sealed by the erase.
     await erase(o, "req-seeded");
-    expect((await read(o, SID)).complete).toBe(true);
+    expect((await read(o, SID)).reason).toBe("manifest_unsealed");
   });
 
   test("6. the guards hold under any isolation: stale REPEATABLE READ inserts and seals are refused; READ COMMITTED races serialize", async () => {
@@ -258,7 +271,9 @@ describe.skipIf(!url)("062360 replay manifest on real PostgreSQL", () => {
     // (a) A target inserted from an old REPEATABLE READ snapshot after another transaction sealed: refused 40001.
     await p.a.query("BEGIN ISOLATION LEVEL REPEATABLE READ");
     await p.a.query("SELECT count(*) FROM sessions.session_erasure_replay_completions"); // the snapshot, before the seal
-    await seal(o);
+    await o.query('ALTER TABLE sessions.session_erasure_replay_completions DISABLE TRIGGER session_erasure_replay_seal');
+    await seal(o); // a matching seal, made by the test owner (the trigger refuses every seal in this slot)
+    await o.query('ALTER TABLE sessions.session_erasure_replay_completions ENABLE TRIGGER session_erasure_replay_seal');
     await expect(p.a.query(...target("u-3"))).rejects.toMatchObject({ code: "40001" });
     await p.a.query("ROLLBACK");
     for (const iso of ["SERIALIZABLE", "REPEATABLE READ"]) {
@@ -288,9 +303,28 @@ describe.skipIf(!url)("062360 replay manifest on real PostgreSQL", () => {
     const seal2 = (c: Q) => c.query(`INSERT INTO sessions.session_erasure_replay_completions
       SELECT $1,$2,$3,$4,1,1,1,1,1,sessions.session_erasure_replay_digest($1)`, [M2, ORG, WS, SRC]);
     const child2 = (u: string) => (c: Q) => c.query("INSERT INTO sessions.session_erasure_replay_targets VALUES($1,$2,$3,$4,'o',$5,'s-n')", [M2, ORG, WS, u, SRC]);
-    const r1 = await expectBlocks(p, { holder: p.a, waiter: p.b, hold: (c) => child2("u-9")(c), wait: seal2, holderEnd: "rollback" });
-    expect(r1.receipt.waiting[0]).toMatchObject({ locktype: "transactionid" }); // the seal waits for the child's parent lock
-    expect(r1.waited.ok).toBe(true); // the child rolled back: the recount is the one target, and the seal commits
+    // The seal waits for an in-flight child's parent lock, whether the child then rolls back or commits, and is refused
+    // either way (fail-closed): no seal ever commits against a moving set.
+    // The guard validates BEFORE its fail-closed refusal, so the refusal message shows what the waiting recount saw:
+    //   child rolled back: the 1-target seal still matches its rows -> refused only for want of an alias proof;
+    //   child COMMITTED:   the waiter recounts the committed second target -> the stale 1-target seal does not match.
+    const PROOF = "session erasure replay manifest: sealing requires an authoritative alias-coverage proof";
+    const STALE = "session erasure replay manifest: seal does not match its rows";
+    for (const [end, u, why] of [["rollback", "u-9", PROOF], ["commit", "u-8", STALE]] as const) {
+      const r = await expectBlocks(p, { holder: p.a, waiter: p.b, hold: (c) => child2(u)(c), wait: seal2, holderEnd: end });
+      expect([end, r.receipt.waiting[0]?.locktype]).toEqual([end, "transactionid"]);
+      expect([end, r.holderEnded.ok]).toEqual([end, true]);
+      expect([end, r.waited]).toMatchObject([end, { ok: false, error: { code: "55000", message: why } }]);
+    }
+    // A fresh seal over the two committed targets validates (counts and digest match), and is then refused only for
+    // want of an alias proof.
+    await expect(o.query(`INSERT INTO sessions.session_erasure_replay_completions
+      SELECT $1,$2,$3,$4,1,1,2,2,2,sessions.session_erasure_replay_digest($1)`, [M2, ORG, WS, SRC])).rejects.toMatchObject({ code: "55000", message: PROOF });
+    expect(await n(o, "SELECT count(*)::int n FROM sessions.session_erasure_replay_targets WHERE manifest_id='" + M2 + "'")).toBe(2); // u-1 and the committed u-8
+    await o.query('ALTER TABLE sessions.session_erasure_replay_completions DISABLE TRIGGER session_erasure_replay_seal');
+    await o.query(`INSERT INTO sessions.session_erasure_replay_completions
+      SELECT $1,$2,$3,$4,1,1,2,2,2,sessions.session_erasure_replay_digest($1)`, [M2, ORG, WS, SRC]);
+    await o.query('ALTER TABLE sessions.session_erasure_replay_completions ENABLE TRIGGER session_erasure_replay_seal');
     // Now sealed: a later READ COMMITTED child sees the seal and is refused.
     await expect(o.query("INSERT INTO sessions.session_erasure_replay_targets VALUES($1,$2,$3,'u-7','o',$4,'s-n')", [M2, ORG, WS, SRC])).rejects.toMatchObject({ code: "55000" });
     // After every transaction above: each persisted seal equals its rows (counts and digest recomputed).
@@ -307,6 +341,7 @@ describe.skipIf(!url)("062360 replay manifest on real PostgreSQL", () => {
     const o = await owner(db);
     await seed(o);
     await erase(o);
+    await ownerSeal(o);
     const sealed = await drain(o, SID, 512);
     await rollBackLaterSlots(db.ownerUrl, "20261105062360_session_erasure_replay_manifest");
     await o.query(DOWN);
