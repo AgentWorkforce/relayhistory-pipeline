@@ -237,6 +237,23 @@ describe("partialCanonicalDeps: the Lambda source over canonicalSnapshot", () =>
     expect(await refusal(lambdaSource({ rows }).read())).toEqual({ class: "transient", codes: ["source_generation_changed"] });
   });
 
+  test("IAM dependency: a served read calls only getObject on the store (no list, head or presign)", async () => {
+    const calls: string[] = [];
+    const audited = new Proxy(store, { get(t, k) { const v = Reflect.get(t, k); return typeof v === "function" ? (...a: unknown[]) => { calls.push(String(k)); return (v as (...x: unknown[]) => unknown).apply(t, a); } : v; } });
+    const got = await lambdaSource({ store: audited }).read();
+    expect(got.exists).toBe(true);
+    expect([...new Set(calls)]).toEqual(["getObject"]);
+    // Manifest then chunk: exactly one GET each.
+    expect(calls).toEqual(["getObject", "getObject"]);
+  });
+
+  test("IAM dependency: without ListBucket S3 answers 403 for a missing key; that is a refusal, never a read of anything else", async () => {
+    const calls: string[] = [];
+    const noList = new Proxy(store, { get(t, k) { if (typeof Reflect.get(t, k) !== "function") return Reflect.get(t, k); return async (...a: unknown[]) => { calls.push(String(k)); if (k === "getObject") throw new ObjectStoreError("unauthorized", "s3", "synthetic", { status: 403 }); return (Reflect.get(t, k) as (...x: unknown[]) => unknown).apply(t, a); }; } });
+    expect(await refusal(lambdaSource({ store: noList }).read())).toEqual({ class: "forbidden", codes: ["store_unauthorized"] });
+    expect(calls).toEqual(["getObject"]);
+  });
+
   test("every object request carries the route's abort signal", async () => {
     const seen: Array<AbortSignal | undefined> = [];
     const deps = partialCanonicalDeps(ON, "lambda", runner(() => [pointerRow]), {

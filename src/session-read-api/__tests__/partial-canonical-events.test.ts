@@ -13,7 +13,7 @@ import { CanonicalReadError } from "../canonical.ts";
 import { CANONICAL_CURSOR_PREFIX } from "../canonical-events.ts";
 import { encodeCursor } from "../cursor.ts";
 import { CONTENT_TRUNCATION_NOTE } from "../page.ts";
-import { readApiDepsFromSecret, READER_LOGIN_SQL } from "../lambda.ts";
+import { handleUrlEvent, readApiDepsFromSecret, READER_LOGIN_SQL, type FunctionUrlEvent } from "../lambda.ts";
 import type { PartialCanonicalDeps } from "../partial-canonical.ts";
 import type { SessionSourceRow } from "../session-sources.ts";
 import { selfhostSearchComposition } from "../server.ts";
@@ -340,6 +340,76 @@ describe("deadline", () => {
     const page = fixture({ pc: { workspaces: "*", deadlineMs: 600 } });
     page.state.hang = true;
     expect((await page.get(`&source=codex&cursor=${objectCursor()}`)).status).toBe(503);
+  });
+});
+
+/**
+ * Through the public Function URL handler (lambda.ts handleUrlEvent: URL event -> Request -> app),
+ * the Lambda's production request path past init. Pinned cases for the lander.
+ */
+describe("public handler (handleUrlEvent)", () => {
+  const event = (query: string, auth = "Bearer synthetic"): FunctionUrlEvent => ({
+    rawPath: "/v1/sessions/sess/events", rawQueryString: `workspace=ws-a${query}`,
+    headers: { authorization: auth, "x-correlation-id": "corr-1" }, requestContext: { http: { method: "GET" } },
+  });
+  const call = async (f: ReturnType<typeof fixture>, query: string, auth?: string) => {
+    const r = await handleUrlEvent(createReadApi(f.deps), event(query, auth));
+    return { status: r.statusCode, body: JSON.parse(r.body) as Record<string, any> };
+  };
+  const noContent = (body: unknown) => !JSON.stringify(body).includes("synthetic-canonical");
+
+  test("PH1 eligible direct session: 200 with the expected canonical events", async () => {
+    const f = fixture({ pc: { workspaces: new Set(["ws-a"]) } });
+    const r = await call(f, "&source=codex");
+    expect(r.status).toBe(200);
+    expect(Object.keys(r.body)).toEqual(["sessionId", "events", "nextCursor", "correlationId"]);
+    expect(r.body.events.map((e: any) => [e.eventId, e.source, e.kind, e.content])).toEqual([
+      ["canon-1", "codex", "history", "synthetic-canonical-1-long-content"],
+      ["canon-2", "codex", "history", "synthetic-canonical-2-long-content"],
+    ]);
+    expect(r.body.nextCursor).toBeNull();
+    expect(f.counts()).toEqual({ reads: 1, sourceCalls: 0, indexQueries: 0 });
+  });
+
+  test("PH2 unauthenticated: 401, no read, no events", async () => {
+    const f = fixture({ pc: { workspaces: "*" } });
+    f.deps.verify = async () => { throw new Error("synthetic bad token"); };
+    const r = await call(f, "&source=codex", "Bearer bad");
+    expect([r.status, "events" in r.body, f.counts().reads]).toEqual([401, false, 0]);
+  });
+
+  test("PH3 forbidden object (tenant, bucket, prefix, store 403): the contracted 501 session_partial, no events", async () => {
+    for (const error of [new CanonicalReadError("tenant_mismatch"), new CanonicalReadError("pointer_invalid"), new CanonicalReadError("prefix_mismatch"), new ObjectStoreError("unauthorized", "s3", "synthetic", { status: 403 })]) {
+      const f = fixture({ pc: { workspaces: "*" } });
+      f.state.fail = error;
+      const r = await call(f, "&source=codex");
+      expect([r.status, r.body.error, "events" in r.body]).toEqual([501, { code: "unsupported_by_backend", message: "not served by this backend: session_partial", reason: "session_partial" }, false]);
+    }
+  });
+
+  test("PH4 erased: the route's existing erased contract (200, empty events), never content", async () => {
+    // Before the read (tombstone): no object IO.
+    const before = fixture({ pc: { workspaces: "*" }, created: {}, erased: [{ source: "codex", sessionId: "sess" }] });
+    const a = await call(before, "&source=codex");
+    expect([a.status, a.body.events, a.body.nextCursor, before.counts().reads]).toEqual([200, [], null, 0]);
+    // During the read: the post-IO erasure recheck drops every row.
+    const during = fixture({ pc: { workspaces: "*" } });
+    during.state.afterRead = () => during.mem.erase({ ...tenant, source: "codex", sessionId: "sess" });
+    const b = await call(during, "&source=codex");
+    expect([b.status, b.body.events, b.body.nextCursor, noContent(b.body)]).toEqual([200, [], null, true]);
+    // Flag off gives the same erased answer.
+    const off = fixture({ pc: false, created: {}, erased: [{ source: "codex", sessionId: "sess" }] });
+    expect((await call(off, "&source=codex")).body).toEqual(a.body);
+  });
+
+  test("PH5 oversized (scope or pointer bound): the contracted 501 session_partial, no events", async () => {
+    for (const error of [new CanonicalReadError("canonical_projection_incomplete", 503, ["scope_too_large"]), new CanonicalReadError("pointer_bound"), new ObjectStoreError("invalid_argument", "manifest", "manifest is larger than the reader accepts")]) {
+      const f = fixture({ pc: { workspaces: "*" } });
+      f.state.fail = error;
+      const r = await call(f, "&source=codex");
+      expect([r.status, r.body.error?.reason, "events" in r.body]).toEqual([501, "session_partial", false]);
+      expect(refused(f)[0]).toMatch(/^canonical_oversize,/);
+    }
   });
 });
 
