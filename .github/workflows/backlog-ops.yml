@@ -283,6 +283,8 @@ jobs:
           BACKLOG_OPS_NO_HEAD_PARITY_ORGS: ${{ (startsWith(inputs.mode, 'export-') || startsWith(inputs.mode, 'drain-')) && secrets.BACKLOG_OPS_NO_HEAD_PARITY_ORGS || '' }}
           BACKLOG_OPS_NO_HEAD_PARITY_MAX_AGE_SECONDS: ${{ (startsWith(inputs.mode, 'export-') || startsWith(inputs.mode, 'drain-')) && vars.BACKLOG_OPS_NO_HEAD_PARITY_MAX_AGE_SECONDS || '' }}
           BACKLOG_OPS_REVISIONS_SINCE_MS: ${{ steps.recheck.outputs.revisions_since_ms }}
+          # Each bound run's gate-verified commit (an older one only when it is a tooling-identical ancestor).
+          BACKLOG_OPS_BOUND_SHAS: ${{ steps.recheck.outputs.bound_shas }}
         run: bun scripts/backlog-ops.ts
       - name: Publish the counts-only receipt
         if: always()

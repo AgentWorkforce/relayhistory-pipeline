@@ -57,6 +57,7 @@ import {
   backlogOpsLedgerTarget,
   backlogOpsPresenceSession,
   backlogOpsReceipt,
+  backlogOpsBoundShas,
   backlogOpsRevisionsSince,
   backlogOpsRole,
   backlogOpsScope,
@@ -133,7 +134,7 @@ export function backlogOpsChildSpawn(
  * a catch-up execute's DRY) must have recorded the gate's t (`revisionsSinceMs`), so it bound the same FULL.
  */
 export function checkBoundReceipts(env: Record<string, string | undefined>, d: BacklogOpsDispatch, read = (p: string) => readFileSync(p, "utf8"),
-  revisionsSinceMs: number | null = backlogOpsRevisionsSince(env, d)) {
+  revisionsSinceMs: number | null = backlogOpsRevisionsSince(env, d), boundShas: Record<string, string> = backlogOpsBoundShas(env, d)) {
   const paths = backlogOpsPaths(env), scopeFull = backlogOpsScope(env), scope = scopeFull.id;
   // Path B's id from this run's environment: an export-execute's DRY and a drain-execute's EXPORT must have recorded it.
   const nhpId = backlogOpsNoHeadParity(env, d, scopeFull)?.id ?? BACKLOG_OPS_NO_HEAD_PARITY_NONE;
@@ -158,7 +159,7 @@ export function checkBoundReceipts(env: Record<string, string | undefined>, d: B
     }
     const bindsLedger = ledgerTool && BACKLOG_OPS_LEDGER_TOOLS.includes(toolOf(mode));
     const bindsNhp = (d.mode === "export-execute" && b.kind === "dry") || (d.mode === "drain-execute" && b.kind === "export");
-    checkBoundReceipt(raw, { mode, sha: d.sha, run: b.run, scope, kind: b.kind, exact, ...(bindsLedger ? { ledger: ledger() } : {}),
+    checkBoundReceipt(raw, { mode, sha: boundShas[b.kind]!, run: b.run, scope, kind: b.kind, exact, ...(bindsLedger ? { ledger: ledger() } : {}),
       ...(bindsNhp ? { noHeadParity: nhpId } : {}) });
     if (isCatchup(mode) && (revisionsSinceMs === null || JSON.parse(raw).summary.revisions_since_ms !== revisionsSinceMs))
       refuse(`backlog_ops_bound_${b.kind}_since`);

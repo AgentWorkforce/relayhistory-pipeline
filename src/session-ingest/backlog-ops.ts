@@ -431,6 +431,25 @@ export function backlogOpsRevisionsSince(env: Record<string, string | undefined>
   return Number(raw);
 }
 
+/**
+ * Each bound run's commit, as the gate verified it (scripts/backlog-ops-github.ts writes `bound_shas`; the workflow
+ * passes it as BACKLOG_OPS_BOUND_SHAS). Unset or empty: every binding at this run's sha (the strict rule). Otherwise
+ * exactly this dispatch's binding kinds, each once, each a full sha; anything else refuses.
+ */
+export function backlogOpsBoundShas(env: Record<string, string | undefined>, d: BacklogOpsDispatch): Record<string, string> {
+  const kinds = backlogOpsBindings(d).map((b) => b.kind as string);
+  const raw = env.BACKLOG_OPS_BOUND_SHAS ?? "";
+  if (raw === "") return Object.fromEntries(kinds.map((k) => [k, d.sha]));
+  const out: Record<string, string> = {};
+  for (const part of raw.split(",")) {
+    const m = /^([a-z]+)=([0-9a-f]{40})$/u.exec(part);
+    if (!m || !kinds.includes(m[1]!) || m[1]! in out) refuse("backlog_ops_bound_shas");
+    out[m![1]!] = m![2]!;
+  }
+  if (Object.keys(out).length !== kinds.length) refuse("backlog_ops_bound_shas");
+  return out;
+}
+
 /** Fixed argv for the tool: the scope's validated orgs only, never a checkpoint, a start key or an unvalidated value. */
 export function backlogOpsToolArgs(d: BacklogOpsDispatch, t: BacklogOpsTarget, scope: BacklogOpsScope = { orgs: null, id: BACKLOG_OPS_SCOPE_ALL },
   revisionsSinceMs: number | null = null, noHeadParity: BacklogOpsNoHeadParity | null = null): { script: string; args: string[]; needsDb: boolean } {

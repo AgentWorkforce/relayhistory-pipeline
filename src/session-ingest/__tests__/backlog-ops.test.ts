@@ -8,6 +8,7 @@ import { expect, test } from "bun:test";
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { backlogOpsGithubGate } from "../../../scripts/backlog-ops-github.ts";
+import { BACKLOG_OPS_ENTRY_POINTS, BACKLOG_OPS_FIXED_FILES, backlogOpsToolingFiles, touchesTooling } from "../../../scripts/backlog-ops-tooling.ts";
 import {
   BACKLOG_OPS_CHILD_ENV,
   assumeRole,
@@ -30,6 +31,7 @@ import {
   BACKLOG_OPS_RECEIPT_CONTRACT,
   BACKLOG_OPS_WORKFLOW,
   backlogOpsBindings,
+  backlogOpsBoundShas,
   backlogOpsConfirmation,
   backlogOpsDispatch,
   backlogOpsEnvironment,
@@ -465,6 +467,7 @@ function githubFixture(mode: BacklogOpsMode) {
     artifacts: { [DRY]: 1, [BACKFILL]: 1, [EXPORT]: 1, [FULL]: 1 } as Record<string, number>,
     expired: false,
     artifactsTotalDelta: 0,
+    compare: undefined as any,
   };
 }
 type Fixture = ReturnType<typeof githubFixture>;
@@ -483,6 +486,7 @@ const githubGet = (f: Fixture, seen: string[] = []) => async (path: string): Pro
   if (path.includes("deployment-branch-policies")) return f.branches;
   if (path.includes("/actions/workflows/")) return f.runs;
   if (path.includes("/runs/10/")) return f.jobs;
+  if (path.includes("/compare/") && f.compare !== undefined) return typeof f.compare === "function" ? f.compare(path) : f.compare;
   throw new Error("unexpected " + path);
 };
 const context = {
@@ -1335,3 +1339,88 @@ test("workflow: Path B comes from a secret and a variable for export and drain m
   const inputs = yml.slice(yml.indexOf("    inputs:"), yml.indexOf("  pull_request:"));
   expect(inputs.match(/^      [a-z_]+:$/gmu)?.length).toBe(10);
 });
+
+// ---- Tooling-identical ancestors (scripts/backlog-ops-tooling.ts, sameTooling) ----
+
+const OLD = "2".repeat(40);
+const TOOLING = ["scripts/backlog-ops.ts", "src/session-ingest/buffered-drain.ts", ".github/workflows/backlog-ops.yml"];
+const ahead = (files: Array<Record<string, string>>, n = 3) => ({
+  status: "ahead", ahead_by: n, behind_by: 0, merge_base_commit: { sha: OLD },
+  commits: Array.from({ length: n }, (_, i) => ({ sha: String(i).repeat(40) })), files,
+});
+/** The drain at `sha` binding a DRY (and, for an export, a BACKFILL) at OLD. */
+const ancestorGate = (mode: BacklogOpsMode, compare: unknown, mutate: (f: Fixture) => void = () => {}) => {
+  const f = githubFixture(mode);
+  for (const id of [DRY, BACKFILL]) {
+    f.bound[id].head_sha = OLD;
+    f.bound[id].display_title = f.bound[id].display_title.replace(sha, OLD);
+  }
+  f.compare = compare;
+  mutate(f);
+  return backlogOpsGithubGate({ ...context, ...dispatchEnv(mode) }, githubGet(f), true, { enabled: true, tooling: () => TOOLING });
+};
+
+test("tooling: the closure holds every entry point, the gate's own module, the fixed files and resolves the aliases", () => {
+  const files = backlogOpsToolingFiles();
+  for (const f of [...BACKLOG_OPS_ENTRY_POINTS, ...BACKLOG_OPS_FIXED_FILES, "scripts/backlog-ops-tooling.ts", "scripts/schema-release-github.ts",
+    "src/session-ingest/backlog-ops.ts", "src/session-ingest/buffered-drain.ts", "src/session-ingest/upload-fence-backfill.ts",
+    "src/session-ingest/accepted-stage-export.ts", "packages/object-store/src/sigv4.ts"])
+    expect(files).toContain(f);
+  expect(files.some((f) => f.startsWith("packages/pipeline/src/"))).toBe(true);
+  expect(files).toEqual([...files].sort());
+  // The alias table mirrors tsconfig.json "paths" exactly.
+  const paths = JSON.parse(readFileSync(new URL("../../../tsconfig.json", import.meta.url), "utf8")).compilerOptions.paths;
+  expect(paths).toEqual({ "@rhc/*": ["./packages/pipeline/src/*"], "@rhc-object-store": ["./packages/object-store/src/index.ts"] });
+  // Any package manifest or tsconfig counts, wherever it is; an unrelated file does not.
+  const set = new Set(files);
+  expect(touchesTooling(set, "packages/anything/package.json")).toBe(true);
+  expect(touchesTooling(set, "packages/anything/tsconfig.json")).toBe(true);
+  expect(touchesTooling(set, "docs/backlog-ops-workflow.md")).toBe(false);
+});
+
+test("gate: an execute binds runs at a tooling-identical ancestor and reports their commits", async () => {
+  const r = await ancestorGate("backfill-execute", ahead([{ filename: "docs/x.md" }, { filename: "src/session-read-api/y.ts" }]));
+  expect(r.boundShas).toEqual({ dry: OLD });
+  const e = await ancestorGate("export-execute", ahead([{ filename: "docs/x.md" }]));
+  expect(e.boundShas).toEqual({ dry: OLD, backfill: OLD });
+  // Same-sha bindings never call compare.
+  expect((await backlogOpsGithubGate({ ...context, ...dispatchEnv("backfill-execute") }, githubGet(githubFixture("backfill-execute")), true,
+    { enabled: true, tooling: () => { throw new Error("not needed"); } })).boundShas).toEqual({ dry: sha });
+});
+
+test("gate: an older bound run refuses unless it is a strict ancestor with a complete, tooling-free diff", async () => {
+  const cases: Array<[unknown, string, (f: Fixture) => void]> = [
+    [ahead([{ filename: "scripts/backlog-ops.ts" }]), "backlog_ops_gate_dry_tooling", () => {}],
+    [ahead([{ filename: "src/session-ingest/moved.ts", previous_filename: "src/session-ingest/buffered-drain.ts" }]), "backlog_ops_gate_dry_tooling", () => {}],
+    [ahead([{ filename: "packages/pipeline/package.json" }]), "backlog_ops_gate_dry_tooling", () => {}],
+    [ahead([{ filename: ".github/workflows/backlog-ops.yml" }]), "backlog_ops_gate_dry_tooling", () => {}],
+    [{ ...ahead([]), status: "diverged", behind_by: 1 }, "backlog_ops_gate_dry_compare", () => {}],
+    [{ ...ahead([]), status: "behind" }, "backlog_ops_gate_dry_compare", () => {}],
+    [{ ...ahead([]), status: "identical", ahead_by: 0, commits: [] }, "backlog_ops_gate_dry_compare", () => {}],
+    [ahead(Array.from({ length: 300 }, (_, i) => ({ filename: `docs/${i}.md` }))), "backlog_ops_gate_dry_compare", () => {}],
+    [ahead([], 250), "backlog_ops_gate_dry_compare", () => {}],
+    [{ ...ahead([]), commits: [] }, "backlog_ops_gate_dry_compare", () => {}],
+    [{ ...ahead([]), files: undefined }, "backlog_ops_gate_dry_compare", () => {}],
+    [{ ...ahead([]), merge_base_commit: { sha: "3".repeat(40) } }, "backlog_ops_gate_dry_compare", () => {}],
+    [ahead([{ filename: 7 } as any]), "backlog_ops_gate_dry_compare", () => {}],
+    [() => { throw new Error("404"); }, "backlog_ops_gate_dry_compare", () => {}],
+    // The bound run's title must name its own commit.
+    [ahead([]), "backlog_ops_gate_dry_run", (f) => { f.bound[DRY].display_title = backlogOpsRunName("backfill-dry", sha); }],
+    [ahead([]), "backlog_ops_gate_dry_run", (f) => { f.bound[DRY].head_sha = "not-a-sha"; }],
+  ];
+  for (const [compare, want, mutate] of cases) expect(await code(() => ancestorGate("backfill-execute", compare, mutate))).toBe(want);
+});
+
+test("credential step: bound shas are this dispatch's binding kinds exactly, or unset for the strict rule", () => {
+  const env = { ...dispatchEnv("export-execute") };
+  const d = backlogOpsDispatch(env, true);
+  expect(backlogOpsBoundShas(env, d)).toEqual({ dry: sha, backfill: sha });
+  expect(backlogOpsBoundShas({ ...env, BACKLOG_OPS_BOUND_SHAS: `dry=${OLD},backfill=${sha}` }, d)).toEqual({ dry: OLD, backfill: sha });
+  for (const bad of [`dry=${OLD}`, `dry=${OLD},dry=${OLD}`, `dry=${OLD},backfill=${sha},export=${sha}`, `dry=${OLD},backfill=xyz`, `full=${OLD},backfill=${sha}`, " "])
+    expect(codeSync(() => backlogOpsBoundShas({ ...env, BACKLOG_OPS_BOUND_SHAS: bad }, d))).toBe("backlog_ops_bound_shas");
+  // A dry mode binds nothing: any value refuses.
+  const dry = { ...dispatchEnv("drain-dry") };
+  expect(backlogOpsBoundShas(dry, backlogOpsDispatch(dry, true))).toEqual({});
+  expect(codeSync(() => backlogOpsBoundShas({ ...dry, BACKLOG_OPS_BOUND_SHAS: `dry=${OLD}` }, backlogOpsDispatch(dry, true)))).toBe("backlog_ops_bound_shas");
+});
+

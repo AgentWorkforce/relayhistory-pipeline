@@ -48,6 +48,7 @@ import {
   isCatchup,
   refuseBacklogOps as refuse,
 } from "../src/session-ingest/backlog-ops.ts";
+import { backlogOpsToolingFiles, touchesTooling } from "./backlog-ops-tooling.ts";
 import {
   githubGet,
   isPinnedDispatcher,
@@ -63,7 +64,7 @@ export async function backlogOpsGithubGate(
   env: Record<string, string | undefined>,
   get: Get,
   approved = false,
-  options: { enabled?: boolean; now?: number } = {},
+  options: { enabled?: boolean; now?: number; tooling?: () => string[] } = {},
 ) {
   const input = backlogOpsDispatch(env, options.enabled ?? BACKLOG_OPS_EXECUTE_ENABLED);
   const now = options.now ?? Date.now();
@@ -87,17 +88,25 @@ export async function backlogOpsGithubGate(
   });
   await requireGreenPushRuns(get, base, input.sha, { runs: "backlog_ops_gate_ci", jobs: "backlog_ops_gate_ci_jobs" });
   const created: Record<string, number> = {};
+  const boundShas: Record<string, string> = {};
+  let tooling: ReadonlySet<string> | undefined;
   for (const b of backlogOpsBindings(input)) {
     const bound = await get(base + "/actions/runs/" + b.run);
     const at = Date.parse(bound.created_at);
     const maxAge = b.kind === "backfill" && input.mode === "drain-execute" ? BACKLOG_OPS_FRESH_BACKFILL_MS : BACKLOG_OPS_BINDING_MAX_AGE_MS;
+    const boundSha = typeof bound.head_sha === "string" && SHA40.test(bound.head_sha) ? bound.head_sha : "";
     if (String(bound.id) !== b.run || String(bound.id) === env.GITHUB_RUN_ID || bound.path !== BACKLOG_OPS_WORKFLOW ||
-        bound.head_sha !== input.sha || bound.head_branch !== "main" || bound.event !== "workflow_dispatch" ||
+        boundSha === "" || bound.head_branch !== "main" || bound.event !== "workflow_dispatch" ||
         bound.run_attempt !== 1 || bound.status !== "completed" || bound.conclusion !== "success" ||
         !isPinnedDispatcher(bound) ||
-        (bound.display_title !== backlogOpsRunName(b.mode, input.sha) && (b.altMode === undefined || bound.display_title !== backlogOpsRunName(b.altMode, input.sha))) ||
+        (bound.display_title !== backlogOpsRunName(b.mode, boundSha) && (b.altMode === undefined || bound.display_title !== backlogOpsRunName(b.altMode, boundSha))) ||
         !Number.isFinite(at) || at > now || now - at >= maxAge)
       refuse(`backlog_ops_gate_${b.kind}_run`);
+    // An older commit binds only when it is an ancestor of this run's commit and nothing between them touched the
+    // backlog-ops tooling (scripts/backlog-ops-tooling.ts); anything else, including a truncated diff, refuses.
+    if (boundSha !== input.sha)
+      await sameTooling(get, base, boundSha, input.sha, (tooling ??= new Set((options.tooling ?? backlogOpsToolingFiles)())), b.kind);
+    boundShas[b.kind] = boundSha;
     const artifacts = await get(base + "/actions/runs/" + b.run + "/artifacts?per_page=100");
     const named = (artifacts.artifacts ?? []).filter((a: Obj) => a.name === BACKLOG_OPS_RECEIPT_ARTIFACT);
     if (artifacts.total_count !== artifacts.artifacts?.length || named.length !== 1 || named[0].expired !== false)
@@ -124,7 +133,31 @@ export async function backlogOpsGithubGate(
       rejected: "backlog_ops_gate_human_rejected",
       dispatch: "backlog_ops_gate_human_dispatch",
     });
-  return { ...input, environment, revisionsSinceMs };
+  return { ...input, environment, revisionsSinceMs, boundShas };
+}
+
+const SHA40 = /^[0-9a-f]{40}$/u;
+/** GitHub's compare caps: 300 files and 250 commits. At or past either, the diff may be incomplete. */
+const COMPARE_MAX_FILES = 300, COMPARE_MAX_COMMITS = 250;
+
+/**
+ * `older` is a strict ancestor of `head` (compare older...head is "ahead" with no commits behind) and no changed file,
+ * by its filename or its previous_filename (a rename out of the set), is tooling. Fixed codes only.
+ */
+export async function sameTooling(get: Get, base: string, older: string, head: string, tooling: ReadonlySet<string>, kind: string) {
+  let c: Obj;
+  try { c = await get(`${base}/compare/${older}...${head}`); } catch { return refuse(`backlog_ops_gate_${kind}_compare`); }
+  const files: Obj[] | undefined = Array.isArray(c?.files) ? c.files : undefined;
+  if (c?.status !== "ahead" || c.behind_by !== 0 || !Number.isSafeInteger(c.ahead_by) || c.ahead_by < 1 ||
+      c.ahead_by >= COMPARE_MAX_COMMITS || !Array.isArray(c.commits) || c.commits.length !== c.ahead_by ||
+      files === undefined || files.length >= COMPARE_MAX_FILES || c.merge_base_commit?.sha !== older)
+    refuse(`backlog_ops_gate_${kind}_compare`);
+  for (const f of files!) {
+    if (typeof f?.filename !== "string" || (f.previous_filename !== undefined && typeof f.previous_filename !== "string"))
+      refuse(`backlog_ops_gate_${kind}_compare`);
+    if (touchesTooling(tooling, f.filename) || (f.previous_filename !== undefined && touchesTooling(tooling, f.previous_filename)))
+      refuse(`backlog_ops_gate_${kind}_tooling`);
+  }
 }
 
 if (import.meta.main)
@@ -134,7 +167,9 @@ if (import.meta.main)
       // The protected environment the operate job must run in, derived from the mode (never an input).
       if (process.env.GITHUB_OUTPUT) appendFileSync(process.env.GITHUB_OUTPUT, `environment=${r.environment}\n` +
         // The catch-up's t (an epoch ms computed from FULL's created_at), for the credential step; never an input.
-        (r.revisionsSinceMs !== null ? `revisions_since_ms=${r.revisionsSinceMs}\n` : ""));
+        (r.revisionsSinceMs !== null ? `revisions_since_ms=${r.revisionsSinceMs}\n` : "") +
+        // Each bound run's verified commit (kind=sha,...), for the credential step's receipt checks; never an input.
+        `bound_shas=${Object.entries(r.boundShas).map(([k, v]) => `${k}=${v}`).join(",")}\n`);
     })
     .catch((error) => {
       const code = (error as { code?: unknown })?.code;
