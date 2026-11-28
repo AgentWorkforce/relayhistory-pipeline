@@ -753,8 +753,8 @@ plan, the outage and the release gate are in `docs/design/wave-1-two-org-plan.md
 
 | Mode | Binds | Confirmation | Does, per org, in one transaction |
 | --- | --- | --- | --- |
-| `hold-dry` | nothing | none | reads (read only): hold state and epoch hash, pending batches, open canonical claims |
-| `hold-install-execute` | `DRY` a hold-dry | `HOLD-INSTALL-EXECUTE <sha> DRY <id>` | `_install` (request id from sha, DRY and org: a retry gets the same epoch), then refuses and rolls back on any open canonical claim |
+| `hold-dry` | nothing | none | reads (read only): hold state and epoch hash, pending batches, committed canonical batches (diagnostic), unexpired seed captures, fan-out state (`unproven` until a proof is accepted) |
+| `hold-install-execute` | `DRY` a hold-dry | `HOLD-INSTALL-EXECUTE <sha> DRY <id>` | `_install` (request id from sha, DRY and org: a retry gets the same epoch), refused before it while fan-out is unproven; after it, under the key, the live hold must be `held` at that epoch (else `hold_epoch_advanced`), and canonical history or an unexpired seed capture rolls it back |
 | `hold-seal-execute` | `DRY` a hold-dry created after `FULL`, `FULL` the FULL backfill-execute | `... DRY <id> FULL <id> WAVE <id>` | `_seal` and 062340's `_bind` with the sha256 of the FULL receipt's exact bytes and the FULL's start (the gate's t plus the margin); refuses unless installed_at < start |
 | `hold-rollback-execute` | `DRY` a hold-dry | `... DRY <id> WAVE <id>` | `_release(verified_rollback)`, only before any marker attempt |
 

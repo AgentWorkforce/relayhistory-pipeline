@@ -435,7 +435,8 @@ export async function backlogOpsRun(
       ((sum.ok_count ?? 0) < orgs.length ? " incomplete" : " complete"));
   } else {
     const { code, stdout } = await run(backlogOpsChildSpawn(env, d, aws, dbUrl, session, bound));
-    receipt = finalReceipt(d, env.GITHUB_RUN_ID!, code, stdout, scope.id, scope.orgs, ledger, nhpId, home, since);
+    receipt = finalReceipt(d, env.GITHUB_RUN_ID!, code, stdout, scope.id, scope.orgs, ledger, nhpId, home, since,
+      bound.hold ? bound.hold.approved.map((a) => a.orgHash) : null);
     exit = receipt.exitCode === 0 && code === 0 ? 0 : 1;
   }
   writePrivate(paths.receipt, receipt);
@@ -506,7 +507,7 @@ function schemaKindOf(d: BacklogOpsDispatch): AuthorityReceiptKind | null {
  * before it is persisted or logged; a refusal keeps only a code from the mode's closed map.
  */
 export function finalReceipt(d: BacklogOpsDispatch, run: string, code: number, stdout: string, scopeId: string, orgs: string[] | null, ledger: string,
-  nhpId: string, home: string | null, since: number | null) {
+  nhpId: string, home: string | null, since: number | null, holdApproved: readonly string[] | null = null) {
   const schemaKind = schemaKindOf(d);
   let receipt;
   try {
@@ -517,7 +518,7 @@ export function finalReceipt(d: BacklogOpsDispatch, run: string, code: number, s
       receipt = { ...receipt, summary: r.summary, exitCode: r.ok ? receipt.exitCode : receipt.exitCode || 1 };
     } else if (isHold(d.mode)) {
       const step: HoldStep = d.mode === "hold-dry" ? "dry" : d.mode === "hold-install-execute" ? "install" : d.mode === "hold-seal-execute" ? "seal" : "rollback";
-      const r = holdReceiptSummary(receipt.summary, { step, orgs });
+      const r = holdReceiptSummary(receipt.summary, { step, orgs, ...(holdApproved ? { approved: holdApproved } : {}) });
       receipt = { ...receipt, summary: r.summary, exitCode: r.ok ? receipt.exitCode : receipt.exitCode || 1 };
     } else if (schemaKind !== null) {
       // The bridge's proofs must match the run's scope and the exact gate-derived cutoff the child was given.

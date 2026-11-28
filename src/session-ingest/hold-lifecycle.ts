@@ -8,8 +8,8 @@
  *                          and whether an install would be accepted now.
  *   hold-install-execute   per DRY-ready org, in ONE READ COMMITTED transaction: `_install(org, request)` (it takes the
  *                          org key EXCLUSIVE and refuses a pending batch itself, RH042), then, in the same transaction
- *                          and under that key, the open-canonical-claim precondition (CANONICAL_OPEN_SQL). Any open
- *                          claim rolls the install back (`hold_canonical_open`). The request id is derived from the
+ *                          and under that key, the open-canonical-claim precondition (CANONICAL_COMMITTED_SQL). Any open
+ *                          claim rolls the install back (`hold_canonical_committed`). The request id is derived from the
  *                          commit, the DRY run and the org (installRequestId), so a retry gets the same epoch.
  *   hold-seal-execute      per approved org, in ONE transaction: the live hold at the approved epoch, `held` (or
  *                          already `sealed` by this FULL: a retry), installed_at < FULL start <= now; then `_seal(org,
@@ -51,15 +51,24 @@ const refuse = (code: string): never => { throw new HoldLifecycleRefusal(code); 
 // ---- SQL ------------------------------------------------------------------------------------------------------
 
 /**
- * Open canonical claims of the org: a claim attempt whose batch is NOT buffered (not publication_state 'buffered' and
- * not a 'staged' receipt). Buffered production orgs refuse canonical claims, so none should exist; a canonical batch
- * whose fanout is still pending would retry RH042 until release (ingest_fanout_fence is admission-class), so an install
- * refuses while any is open (docs/release/062320-org-admission-hold.md "Install preconditions").
+ * DIAGNOSTIC ONLY: the org's committed canonical batches, EVER (the 062320 owner's pinned predicate for gap B,
+ * 7f8caf3f2170). A staged canonical batch is indistinguishable in SQL from an inline one, so this is a superset of the
+ * batches whose fan-out could still be queued; zero would mean no canonical fan-out can exist for the org anywhere.
+ * Pipeline has NOT accepted it as a fan-out proof (0a862bdc0160 / d39e24a34e0d: keep fanout unproven, install held),
+ * so it is reported, never used to admit an install. ingest_claim_attempts is history (rows leave only through user
+ * erase or the batch cascade) and is not used.
  */
-export const CANONICAL_OPEN_SQL = `SELECT count(*)::int AS n FROM sessions.ingest_claim_attempts a
-  JOIN sessions.ingest_batches b USING (org_id, workspace_id, origin_id, batch_id)
-  WHERE a.org_id = $1::text AND b.publication_state IS DISTINCT FROM 'buffered' AND b.buffer_receipt_kind IS DISTINCT FROM 'staged'`;
+export const CANONICAL_COMMITTED_SQL = `SELECT count(*)::int AS n FROM sessions.ingest_batches
+  WHERE org_id = $1::text AND publication_state = 'canonical' AND state = 'committed'`;
 export const PENDING_BATCHES_SQL = `SELECT count(*)::int AS n FROM sessions.ingest_batches WHERE org_id = $1::text AND state = 'pending'`;
+/**
+ * Unexpired seed captures of the org (20261104040000 ingest_seed_scope_capture; ingest_seed_proven_records refuses an
+ * expired one, so expiry is schema-terminal). Read in the install transaction after _install took the org key, it
+ * catches a COMMITTED capture only: capture issuance is classified unaffected and takes no org key, so a racing
+ * capture is not excluded (gap C, the 062320 owner's). The seeder (scripts/session-ingest-seed.ts) is operator-run;
+ * a run refused during the hold writes nothing, and its next run re-captures every scope.
+ */
+export const SEED_CAPTURES_ACTIVE_SQL = `SELECT count(*)::int AS n FROM sessions.ingest_seed_captures WHERE org_id = $1::text AND expires_at > clock_timestamp()`;
 export const HOLD_BIND_FUNCTION = "sessions.ingest_org_erasure_history_bind";
 export const holdBindSql = (org: string, epoch: string, fullRun: string, fullStartedMs: number, evidence: string) => {
   if (!ORG_UUID.test(org) || !ORG_UUID.test(epoch) || !RUN_ID.test(fullRun) || !Number.isSafeInteger(fullStartedMs) || fullStartedMs < 1 || !HEX64.test(evidence))
@@ -131,7 +140,14 @@ export interface HoldOrgResult {
   epoch_hash: string | null;
   hold: HoldState | "not_read";
   pending_batches: number | null;
-  canonical_open: number | null;
+  canonical_committed: number | null;
+  /** Unexpired seed captures (null when not read). */
+  seed_captures: number | null;
+  /**
+   * Canonical fan-out quiescence for the org: `unproven` until a reconciliation or drain barrier exists (gap B,
+   * Pipeline a518c23033a8). An install is refused while unproven.
+   */
+  fanout: "unproven" | "proven" | "not_read";
   verdict: "ready" | "installed" | "sealed" | "rolled_back" | "refused" | "not_in_wave";
   refused: string | null;
 }
@@ -155,6 +171,11 @@ export interface HoldRunDeps {
   withSession<T>(fn: (s: HoldSqlSession) => Promise<T>): Promise<T>;
   now(): number;
   concurrency?: number;
+  /**
+   * A SEAM for a future proof that the org's canonical fan-out is quiescent (gap B). Production has no provider and no
+   * input can supply one, so every install is refused `hold_fanout_unproven`. Synthetic fixtures only.
+   */
+  fanoutProof?: (org: string, q: Q) => Promise<boolean>;
 }
 
 /** One step over the wave; every org gets its own verdict. Throws (a fixed code) only on wave-level input errors. */
@@ -175,7 +196,9 @@ export async function holdRun(d: HoldRunDeps) {
   const approved = new Map((d.approved ?? []).map((a) => [a.orgHash, a.epochHash]));
 
   const settled = await runWave(orgs, d.concurrency ?? HOLD_LIFECYCLE_CONCURRENCY, async (org): Promise<HoldOrgResult> => {
-    const r: HoldOrgResult = { org_hash: hashOf.get(org)!, epoch_hash: null, hold: "not_read", pending_batches: null, canonical_open: null, verdict: "refused", refused: null };
+    const r: HoldOrgResult = { org_hash: hashOf.get(org)!, epoch_hash: null, hold: "not_read", pending_batches: null, canonical_committed: null, seed_captures: null,
+      fanout: "not_read", verdict: "refused", refused: null };
+    const fanoutState = async (q: Q) => (d.fanoutProof !== undefined && (await d.fanoutProof(org, q)) === true ? "proven" : "unproven") as HoldOrgResult["fanout"];
     const stop = (code: string) => { r.refused = code; r.verdict = "refused"; return r; };
     if (execute && !approved.has(r.org_hash)) { r.verdict = "not_in_wave"; r.refused = "not_in_wave"; return r; }
     return d.withSession(async (s) => {
@@ -185,13 +208,19 @@ export async function holdRun(d: HoldRunDeps) {
           r.hold = stateOf(live);
           r.epoch_hash = live.hold ? epochHash(live.hold.epoch) : null;
           r.pending_batches = await countOf(s.read, PENDING_BATCHES_SQL, org);
-          r.canonical_open = await countOf(s.read, CANONICAL_OPEN_SQL, org);
+          r.canonical_committed = await countOf(s.read, CANONICAL_COMMITTED_SQL, org);
+          r.seed_captures = await countOf(s.read, SEED_CAPTURES_ACTIVE_SQL, org);
+          r.fanout = await fanoutState(s.read);
         } catch (error) { return stop(error instanceof HoldLifecycleRefusal ? error.code : holdSqlCode(error, "read")); }
         // Ready means: ready for the NEXT step from this state (install from none/released; seal from held; rollback
         // from held/sealed without an attempt). The execute re-checks everything in its own transaction.
         if (r.hold === "marker_attempted") return stop("hold_marker_attempted");
-        if ((r.hold === "absent" || r.hold === "released") && (r.pending_batches! > 0 || r.canonical_open! > 0))
-          return stop(r.pending_batches! > 0 ? "hold_pending_batch" : "hold_canonical_open");
+        if (r.hold === "absent" || r.hold === "released") {
+          if (r.pending_batches! > 0) return stop("hold_pending_batch");
+          if (r.canonical_committed! > 0) return stop("hold_canonical_history");
+          if (r.seed_captures! > 0) return stop("hold_seed_capture_active");
+          if (r.fanout !== "proven") return stop("hold_fanout_unproven");
+        }
         r.verdict = "ready";
         return r;
       }
@@ -200,14 +229,25 @@ export async function holdRun(d: HoldRunDeps) {
           const live = parseLiveHold(await statusRows(q, org));
           r.hold = stateOf(live);
           if (d.step === "install") {
+            // Fan-out quiescence first: unproven refuses before _install (nothing is written).
+            r.fanout = await fanoutState(q);
+            if (r.fanout !== "proven") refuse("hold_fanout_unproven");
             const req = installRequestId(d.sha, d.dryRun!, org);
             const epoch = (await q(holdSql.install(org, req).text, holdSql.install(org, req).params))[0]?.epoch;
             if (typeof epoch !== "string" || !ORG_UUID.test(epoch)) refuse("hold_install_failed");
-            // Under the key _install took: no open canonical claim (rolls the install back otherwise).
-            r.canonical_open = await countOf(q, CANONICAL_OPEN_SQL, org);
-            if (r.canonical_open > 0) refuse("hold_canonical_open");
-            r.epoch_hash = epochHash(epoch as string);
-            r.hold = "held";
+            // Under the key _install took: the live hold must be exactly the one this request installed, `held` (a retry
+            // of an old request returns the same epoch whatever state it has advanced to: never report that as held).
+            const after = parseLiveHold(await statusRows(q, org));
+            r.hold = stateOf(after);
+            if (after.hold) r.epoch_hash = epochHash(after.hold.epoch);
+            if (!after.hold || after.hold.epoch !== epoch || after.hold.state !== "held") refuse("hold_epoch_advanced");
+            // Canonical history refuses (rolls back) under the key: its fan-out cannot be shown complete. The count only ever
+            // refuses; it never admits (the fan-out check above is what must pass).
+            r.canonical_committed = await countOf(q, CANONICAL_COMMITTED_SQL, org);
+            if (r.canonical_committed > 0) refuse("hold_canonical_history");
+            // And no committed, unexpired seed capture (see SEED_CAPTURES_ACTIVE_SQL for what this does not exclude).
+            r.seed_captures = await countOf(q, SEED_CAPTURES_ACTIVE_SQL, org);
+            if (r.seed_captures > 0) refuse("hold_seed_capture_active");
             r.verdict = "installed";
             return r;
           }
@@ -237,14 +277,15 @@ export async function holdRun(d: HoldRunDeps) {
         });
       } catch (error) {
         r.verdict = "refused";
-        if (d.step === "install") { r.epoch_hash = null; }
+        // An install that rolled back left no hold of its own; an advanced one keeps what it found.
+        if (d.step === "install" && holdSqlCode(error, "install") !== "hold_epoch_advanced") { r.epoch_hash = null; r.hold = "not_read"; }
         return stop(holdSqlCode(error, d.step === "install" ? "install" : d.step === "seal" ? "seal" : "release"));
       }
     });
   }, { fallback: "hold_org_failed" });
 
   const per: HoldOrgResult[] = settled.map((x) => x.ok ? x.value : { org_hash: hashOf.get(x.org)!, epoch_hash: null, hold: "not_read", pending_batches: null,
-    canonical_open: null, verdict: "refused", refused: x.code });
+    canonical_committed: null, seed_captures: null, fanout: "not_read", verdict: "refused", refused: x.code });
   const done = d.step === "dry" ? "ready" : d.step === "install" ? "installed" : d.step === "seal" ? "sealed" : "rolled_back";
   const n = per.filter((p) => p.verdict === done).length, inWave = execute ? d.approved!.length : orgs.length;
   return { mode: execute ? "execute" as const : "dry_run" as const, tool: "hold_lifecycle" as const, step: d.step, org_count: orgs.length,
@@ -254,11 +295,12 @@ export type HoldSummary = Awaited<ReturnType<typeof holdRun>>;
 
 // ---- receipt schema ------------------------------------------------------------------------------------------
 
-export const HOLD_ORG_REFUSALS = ["hold_input", "hold_unreadable", "hold_marker_attempted", "hold_pending_batch", "hold_canonical_open", "hold_absent",
+export const HOLD_ORG_REFUSALS = ["hold_input", "hold_unreadable", "hold_marker_attempted", "hold_pending_batch", "hold_absent",
   "hold_released", "hold_epoch_changed", "hold_transition_refused", "hold_full_order", "hold_refused", "hold_isolation", "hold_lock_timeout",
   "hold_slot_not_applied", "hold_already_live", "hold_request_reused", "hold_epoch_stale", "hold_already_bound", "hold_bind_evidence", "hold_bind_not_sealed",
   "hold_history_not_covering", "hold_history_not_recording", "hold_already_released", "hold_install_failed", "hold_seal_failed", "hold_release_failed",
-  "hold_read_failed", "hold_org_failed", "not_in_wave", "hold_state_invalid"] as const;
+  "hold_read_failed", "hold_org_failed", "not_in_wave", "hold_state_invalid", "hold_fanout_unproven", "hold_seed_capture_active", "hold_epoch_advanced",
+  "hold_canonical_history"] as const;
 const codes = (...c: readonly string[]): ReceiptSchema => ({ code: new Set(c) });
 const nul = (s: ReceiptSchema): ReceiptSchema => ({ nullable: s });
 export const HOLD_SUMMARY_SCHEMA: ReceiptSchema = { obj: {
@@ -266,7 +308,7 @@ export const HOLD_SUMMARY_SCHEMA: ReceiptSchema = { obj: {
   org_count: "count", wave_org_count: "count", done_count: "count", complete: "bool",
   per_org: { list: { obj: {
     org_hash: "hash", epoch_hash: nul("hash"), hold: codes("absent", "released", "held", "sealed", "marker_attempted", "not_read"),
-    pending_batches: nul("count"), canonical_open: nul("count"),
+    pending_batches: nul("count"), canonical_committed: nul("count"), seed_captures: nul("count"), fanout: codes("unproven", "proven", "not_read"),
     verdict: codes("ready", "installed", "sealed", "rolled_back", "refused", "not_in_wave"), refused: nul(codes(...HOLD_ORG_REFUSALS)),
   } }, max: 64 },
 } };
@@ -274,7 +316,7 @@ export const HOLD_TOOL_REFUSALS = ["usage", "orgs", "hold_execute_held", "stdin_
   "wave_orgs_empty", "wave_orgs_oversized", "wave_org_invalid", "wave_org_duplicate", "wave_concurrency_invalid", "internal_error"] as const;
 
 /** The summary a hold receipt may carry: exact, the scope's org hashes each once, counts derived, step = the mode's. */
-export function holdReceiptSummary(summary: unknown, ctx: { step: HoldStep; orgs: readonly string[] | null }): { summary: unknown; ok: boolean } {
+export function holdReceiptSummary(summary: unknown, ctx: { step: HoldStep; orgs: readonly string[] | null; approved?: readonly string[] }): { summary: unknown; ok: boolean } {
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   const o = summary as any;
   if (o && typeof o === "object" && !Array.isArray(o) && Object.keys(o).length === 1 && Object.hasOwn(o, "refused"))
@@ -285,13 +327,23 @@ export function holdReceiptSummary(summary: unknown, ctx: { step: HoldStep; orgs
   if (got.length !== want.length || !got.every((h, i) => h === want[i]) || o.org_count !== want.length) return bad;
   const per = o.per_org as HoldOrgResult[];
   const done = ctx.step === "dry" ? "ready" : ctx.step === "install" ? "installed" : ctx.step === "seal" ? "sealed" : "rolled_back";
-  const n = per.filter((p) => p.verdict === done).length;
-  if (o.done_count !== n || o.complete !== (n === o.wave_org_count) || per.some((p) => (p.verdict === done) !== (p.refused === null) && p.verdict !== "not_in_wave") ||
-      per.some((p) => p.verdict !== done && p.verdict !== "refused" && p.verdict !== "not_in_wave") ||
-      (ctx.step === "dry" ? o.wave_org_count !== want.length : per.some((p) => p.verdict === "not_in_wave") && o.wave_org_count + per.filter((p) => p.verdict === "not_in_wave").length !== want.length))
-    return bad;
-  // A dry succeeds when at least one org is ready (the execute acts on those); an execute only when all its orgs completed.
-  return { summary, ok: ctx.step === "dry" ? n > 0 : o.complete === true };
+  // The in-wave partition is DERIVED, never taken from the receipt: a dry's wave is the scope; an execute's is every row
+  // that is not not_in_wave. Its count, the done count and `complete` must equal what the rows say.
+  const inWave = ctx.step === "dry" ? per : per.filter((p) => p.verdict !== "not_in_wave");
+  const n = inWave.filter((p) => p.verdict === done).length;
+  if (ctx.step === "dry" && per.some((p) => p.verdict === "not_in_wave")) return bad;
+  if (o.wave_org_count !== inWave.length || o.done_count !== n || o.complete !== (inWave.length > 0 && n === inWave.length)) return bad;
+  // An execute's in-wave rows are EXACTLY the bound hold-dry's approved org hashes (set and count), each once.
+  if (ctx.step !== "dry") {
+    if (!ctx.approved || ctx.approved.length === 0) return bad;
+    const want = [...ctx.approved].sort(), have = inWave.map((p) => p.org_hash).sort();
+    if (new Set(want).size !== want.length || have.length !== want.length || !have.every((h, i) => h === want[i])) return bad;
+  }
+  if (per.some((p) => (p.verdict === done) !== (p.refused === null) && p.verdict !== "not_in_wave")) return bad;
+  if (per.some((p) => p.verdict !== done && p.verdict !== "refused" && p.verdict !== "not_in_wave")) return bad;
+  if (per.some((p) => p.verdict === "not_in_wave" && p.refused !== "not_in_wave")) return bad;
+  // A dry succeeds with one ready org; an execute only when EVERY in-wave org completed (a refused in-wave row fails it).
+  return { summary, ok: ctx.step === "dry" ? n > 0 : o.complete === true && inWave.every((p) => p.verdict === done) };
 }
 
 /**

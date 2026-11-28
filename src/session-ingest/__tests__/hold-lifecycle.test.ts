@@ -16,7 +16,7 @@ import { BACKLOG_OPS_CATCHUP_MARGIN_MS, BACKLOG_OPS_HOLD_EXECUTE_ENABLED, BACKLO
   backlogOpsScope, backlogOpsTarget, backlogOpsToolArgs, type BacklogOpsMode } from "../backlog-ops.ts";
 import { checkHoldDryReceipt, holdReceiptSummary, holdRun, holdSqlCode, installRequestId } from "../hold-lifecycle.ts";
 import { waveId } from "../org-wave.ts";
-import { backlogOpsChildSpawn, checkBoundReceipts } from "../../../scripts/backlog-ops.ts";
+import { backlogOpsChildSpawn, checkBoundReceipts, finalReceipt } from "../../../scripts/backlog-ops.ts";
 
 const cleanups: (() => void)[] = [];
 afterEach(() => { for (const c of cleanups.splice(0)) c(); });
@@ -36,7 +36,8 @@ const target = {
 };
 const on = (env: Record<string, string>) => backlogOpsDispatch(env, true, false, false, false, true);
 const dryRow = (o: string, hold: string, epoch: string | null, verdict = "ready") =>
-  ({ org_hash: H(o), epoch_hash: epoch, hold, pending_batches: 0, canonical_open: 0, verdict, refused: verdict === "ready" ? null : "hold_pending_batch" });
+  ({ org_hash: H(o), epoch_hash: epoch, hold, pending_batches: 0, canonical_committed: 0, seed_captures: 0, fanout: "unproven", verdict,
+    refused: verdict === "ready" ? null : "hold_pending_batch" });
 const drySummary = (rows: ReturnType<typeof dryRow>[]) => ({ mode: "dry_run", tool: "hold_lifecycle", step: "dry", org_count: rows.length, wave_org_count: rows.length,
   done_count: rows.filter((r) => r.verdict === "ready").length, complete: rows.every((r) => r.verdict === "ready"), per_org: rows });
 
@@ -142,4 +143,34 @@ test("the receipt schema is exact and self-consistent; the tool's executes are h
     expect(r.stdout.trim()).toBe(JSON.stringify({ refused: "hold_execute_held" }));
     expect(r.stdout + r.stderr).not.toContain(A);
   }
+});
+
+test("an execute receipt is complete only when EVERY approved org reached the step's verdict; the in-wave rows are exactly the approved set (through finalReceipt)", () => {
+  const W = E("7");
+  const d = on({ BACKLOG_OPS_MODE: "hold-seal-execute", BACKLOG_OPS_SHA: SHA, BACKLOG_OPS_DRY_RUN: "803", BACKLOG_OPS_FULL_BACKFILL_RUN: "802", BACKLOG_OPS_WAVE_ID: W,
+    BACKLOG_OPS_CONFIRMATION: `HOLD-SEAL-EXECUTE ${SHA} DRY 803 FULL 802 WAVE ${W}` });
+  const row = (o: string, verdict: string, refused: string | null) =>
+    ({ org_hash: H(o), epoch_hash: E(o === A ? "a" : "b"), hold: verdict === "sealed" ? "sealed" : "held", pending_batches: null, canonical_committed: null,
+      seed_captures: null, fanout: "not_read", verdict, refused });
+  const summary = (rows: unknown[], over: Record<string, unknown> = {}) => JSON.stringify({ mode: "execute", tool: "hold_lifecycle", step: "seal", org_count: 2,
+    wave_org_count: 2, done_count: 2, complete: true, per_org: rows, ...over });
+  const t = backlogOpsTarget(target), home = backlogOpsHomeId({ bucket: t.bucket, region: t.region }, null);
+  const fin = (stdout: string, approved: string[] | null = [H(A), H(B)]) => finalReceipt(d, "9", 0, stdout, SCOPE_ID, ORGS, "none", "none", home, null, approved);
+  const ok = fin(summary([row(A, "sealed", null), row(B, "sealed", null)]));
+  expect([ok.exitCode, (ok.summary as any).complete]).toEqual([0, true]);
+  // The lander's case: [sealed, refused] claiming wave_org_count 1, done 1, complete true, no not_in_wave row.
+  const mixed = fin(summary([row(A, "sealed", null), row(B, "refused", "hold_epoch_changed")], { wave_org_count: 1, done_count: 1, complete: true }));
+  expect(mixed.summary).toEqual({ refused: "backlog_ops_receipt_schema" });
+  expect(mixed.exitCode).toBe(1);
+  // Honest counts, but an approved org refused: valid receipt, not a success.
+  const partial = fin(summary([row(A, "sealed", null), row(B, "refused", "hold_epoch_changed")], { done_count: 1, complete: false }));
+  expect([(partial.summary as any).complete, partial.exitCode]).toEqual([false, 1]);
+  // B marked not_in_wave although the dry approved it: refused (the in-wave set must equal the approved set).
+  const dropped = fin(summary([row(A, "sealed", null), { ...row(B, "not_in_wave", "not_in_wave") }], { wave_org_count: 1, done_count: 1, complete: true }));
+  expect(dropped.summary).toEqual({ refused: "backlog_ops_receipt_schema" });
+  // And without the bound approval an execute receipt never validates.
+  expect(fin(summary([row(A, "sealed", null), row(B, "sealed", null)]), null).summary).toEqual({ refused: "backlog_ops_receipt_schema" });
+  // A not_in_wave row the dry did NOT approve is fine.
+  const one = fin(summary([row(A, "sealed", null), row(B, "not_in_wave", "not_in_wave")], { wave_org_count: 1, done_count: 1, complete: true }), [H(A)]);
+  expect([one.exitCode, (one.summary as any).complete]).toEqual([0, true]);
 });

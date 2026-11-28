@@ -10,9 +10,11 @@ Branch: `review/0005-hold-lifecycle`, stacked on `1bce290b` (the frozen minors h
 
 ## Sequence per org
 
-1. `hold-dry` (read only). It shows that no hold is live, nothing is pending and no canonical claim is open.
+1. `hold-dry` (read only). It shows that no hold is live and nothing is pending, plus the fan-out state (unproven),
+   the canonical history and the active seed captures.
 2. `hold-install-execute` (binds that dry). `_install` and the open-canonical-claim check run in one transaction
-   under the org key; an open claim rolls the install back. **From here the org's admission is refused (RH042).**
+   under the org key. Unproven fan-out, canonical history or an active seed capture refuses or rolls it back. **From
+   here the org's admission is refused (RH042).**
 3. The FULL `backfill-execute`, dispatched **after** the install committed.
 4. `hold-dry` again (after the FULL), then `hold-seal-execute` (binds that dry, the FULL and the WAVE id over the
    held epochs). `_seal` and 062340's `_bind` commit together, with the digest over the FULL receipt's exact bytes and
@@ -54,19 +56,47 @@ catch-up, the marker chain and the bridge. This needs owner disposition before a
 
 ## Release gate (a hard precondition before any live marker attempt)
 
-After a marker attempt the only release is `bridge_complete`, and an empty initial erase set does not guarantee it
-later: an erase arriving during the hold makes the empty-set release refuse (proven in
-`hold-lifecycle.pglite.test.ts`). Releasing with a non-empty set needs both of these:
+**Wave 1 (two orgs), as Pipeline relays owner decision 252297350480269312 (A′).** Approval provenance is clarified in
+252300211022802944. Wave 1 may qualify through the **empty-erasure-window** release only:
+- the 15-source `erasure_window_empty` proof bound to the org, the epoch and the `_bind` FULL;
+- the in-flight pre-install erase check;
+- the final proof read and `_release` in one READ COMMITTED transaction, with the org key taken EXCLUSIVE first;
+- the release-versus-erase races in both commit orders.
 
-| Dependency | Owner | State |
-| --- | --- | --- |
-| Durable, request-bound session erase manifest (slot 20261105062360) | hard-delete-owner (design) | not built; every session erase replays to `session_manifest_missing` |
-| User-erase generation boundary proof (`bytes_verified` alone does not close it) | no confirmed producer (artifact lane) | open; every user erase replays to `erasure_generation_unproven` |
-| The bridge consumer (`bridge-execute`) | sessions-backlog-integration | held in code |
+That release transaction and its race tests belong to **sessions-backlog-integration**. They are not built here.
+Wave 1 also needs three more things: a reviewed two-org scope (an allow-list of two org HASHES, inside the run's
+secret scope, never raw ids) before any mutation; a timed representative FULL; and real reads of old and new events
+plus search resumption. This lane authors no enable without Khaliq's words reaching it directly or delegate-marked
+(AGENTS.md "Relayed approvals").
 
-So without those, a live marker attempt can leave an org held, with admission and publication stopped,
-indefinitely. layered-sessions-pipeline does not accept that as an implicit outcome. Wave 1 runs end to end only
-after a demonstrated release for both non-empty erase cases.
+**Wave 2 needs the full path.** After a marker attempt the only release is `bridge_complete`, and an empty initial
+erase set does not guarantee it later: an erase arriving during the hold makes the empty-set release refuse (proven in
+`hold-lifecycle.pglite.test.ts`). A non-empty release needs:
+
+| Dependency | Owner |
+| --- | --- |
+| Durable, request-bound session erase manifest (slot 20261105062360) | sessions-erase-manifest-062360 (design: hard-delete-owner) |
+| User-erase generation boundary proof (`bytes_verified` alone does not close it) | sessions-erase-generation-proof |
+| The bridge's release transaction | sessions-backlog-integration |
+
+## Install preconditions still open (the install stays held)
+
+- **B: canonical fan-out.** There is no SQL record of outstanding fan-out. A staged canonical batch commits with
+  records `[]`, and its fan-out runs from FANOUT_QUEUE messages. Pipeline accepts neither queue depth alone, nor
+  buffered-only-since-a-cutoff, nor leaving work outstanding. `hold-dry` reports `fanout: unproven`, and every install
+  refuses `hold_fanout_unproven` before `_install`.
+  - As a read-only diagnostic, `hold-dry` reports the 062320 owner's superset: committed canonical batches, ever. A
+    non-zero count also refuses the install, under the key. The count never admits an install.
+  - A proof needs either a reconciliation of every accepted staged batch to its revision effects (the only
+    distinguishing artifact is the `live-batches/v1` objects, whose retention infra must prove), or a fan-out
+    obligation ledger (a new slot) plus a historical proof.
+  - Owners: the 062320 owner (sessions-authority-evidence) and Pipeline.
+- **C: seed-capture issuance.** `ingest_seed_scope_capture` takes no org key, so the install cannot exclude a racing
+  capture (characterized in `hold-lifecycle.postgres.test.ts` case 3).
+  - The seeder is operator-run only. Nothing schedules a retry, and a refused run records nothing.
+  - The install still refuses on any committed, unexpired capture, under the key.
+  - The fix proposed by the 062320 owner is a new slot that puts the admission check on capture issuance. Pipeline
+    assigns the slot.
 
 ## Rollback criteria (before any marker attempt)
 
@@ -81,15 +111,22 @@ The rollback refuses after a marker attempt, in the same transaction that reads 
 ## Proven in code (synthetic, no production)
 
 - **PGlite with every migration** (`hold-lifecycle.pglite.test.ts`):
-  - two orgs with independent outcomes: A is rolled back, and B goes through attempt then `bridge_complete` on an
-    empty set;
-  - measured downtime; uploads and publication resumed; old and new records present;
+  - two orgs with independent outcomes: A is rolled back, and B goes through attempt then a DIRECT `bridge_complete`
+    on an empty set (a fixture, not the A′ release transaction);
+  - measured downtime; uploads and publication resumed; stage intents from before and after present. The real
+    readbacks of old and new events are PENDING;
+  - these fixtures inject a SYNTHETIC fan-out proof; the production path, with no proof, refuses before `_install`;
   - lost-response retries of the install (same epoch) and of seal+bind (same binding);
   - a seal+bind interrupted at the bind rolls back whole and its retry succeeds;
   - a FULL started before the install is refused;
   - an erase during the hold refuses the empty-set release;
-  - an open canonical claim or a pending batch refuses the install.
+  - canonical history or an active seed capture refuses the install (rolled back), and an expired capture does not
+    count;
+  - an install retry after the hold has advanced (sealed, marker_attempted) reports the actual state and refuses
+    `hold_epoch_advanced`.
 - **Real PostgreSQL, two connections** (`hold-lifecycle.postgres.test.ts`, in pg-proof and the CI flow's pg-proof
   lane):
-  - an install and an open canonical claim serialize on the org key, in both orders;
-  - a rollback racing a marker attempt: whichever commits first wins and the other refuses.
+  - an install and a canonical commit serialize on the org key, both orders;
+  - a rollback and a marker attempt, both orders: whichever commits first wins and the other refuses;
+  - gap C characterized: a seed capture is not blocked by the install's key.
+  - Each ordering has its own migrated database.

@@ -39,8 +39,11 @@ async function fixture() {
   for (const slot of ["upstream:20261105062320_ingest_org_admission_fences.sql", "upstream:20261105062340_ingest_org_erasure_history.sql"])
     await f.db.query("INSERT INTO sessions.__96bulls_migrations(name) VALUES($1) ON CONFLICT DO NOTHING", [slot]);
   const session = pgHoldSession(f.db as never);
+  // SYNTHETIC ONLY: these fixtures inject a fan-out proof so the install path can be exercised. Production has no
+  // provider (fan-out stays unproven and every install refuses before _install: see "the production path" below).
+  const SYNTHETIC_FANOUT_PROOF = async () => true;
   const run = (step: HoldRunDeps["step"], over: Partial<HoldRunDeps> = {}, s: HoldSqlSession = session) =>
-    holdRun({ step, orgs: [A, B], sha: SHA, withSession: (fn) => fn(s), now: () => Date.now(), concurrency: 1, ...over });
+    holdRun({ step, orgs: [A, B], sha: SHA, withSession: (fn) => fn(s), now: () => Date.now(), concurrency: 1, fanoutProof: SYNTHETIC_FANOUT_PROOF, ...over });
   const one = async (sql: string, p: unknown[] = []) => (await f.db.query<Record<string, any>>(sql, p)).rows[0]!;
   const status = async (org: string) => (await one("SELECT sessions.ingest_org_admission_hold_status($1) s", [org])).s as any;
   // Real uploads through the TS ledger as the ingest role; "accepted" or the SQLSTATE behind the refusal.
@@ -82,7 +85,8 @@ test("synthetic wave 1: two orgs, measured admission downtime, independent outco
   const before = { A: await x.batches(A), B: await x.batches(B) };
   // hold-dry: both ready to install (no hold, nothing pending, no open canonical claim).
   const d = await x.run("dry");
-  expect(d.per_org.every((p: any) => p.verdict === "ready" && p.hold === "absent" && p.pending_batches === 0 && p.canonical_open === 0)).toBe(true);
+  expect(d.per_org.every((p: any) => p.verdict === "ready" && p.hold === "absent" && p.pending_batches === 0 && p.canonical_committed === 0 &&
+    p.seed_captures === 0 && p.fanout === "proven")).toBe(true);
   // Install (and a lost-response retry: the same request id gives the same epoch, one event).
   const approved = d.per_org.map((p: any) => ({ orgHash: p.org_hash, epochHash: null }));
   const i1 = await x.run("install", { dryRun: DRY, approved });
@@ -130,7 +134,9 @@ test("synthetic wave 1: two orgs, measured admission downtime, independent outco
   expect(await x.publicationOpen(A)).toBe(true);
   expect(await x.upload(B)).toBe("RH042");
   refused++;
-  // B: bridge_complete with an EMPTY erase set (the only release this tree can prove), then B is open again.
+  // B: a DIRECT bridge_complete (NULL detail) with an EMPTY erase set, to show resumption after a release. This is not
+  // the A' release transaction (sessions-backlog-integration's, with the 15-source proof and the exclusive key) and does
+  // not qualify it.
   const stB = await x.status(B);
   expect(stB.erasures).toBe(0);
   await x.f.db.query("SELECT sessions.ingest_org_admission_hold_release($1,$2::uuid,'bridge_complete',$3,NULL,$4)", [B, epochB, "e".repeat(64), stB.erasures]);
@@ -143,7 +149,8 @@ test("synthetic wave 1: two orgs, measured admission downtime, independent outco
   expect(msA).toBeGreaterThan(0);
   expect(msB).toBeGreaterThan(msA); // B was held through its attempt to the bridge
   expect(refused).toBe(4);
-  // Old and new records are both there and readable.
+  // Stage intents from before the hold and after the release are both present. NOTE: presence is not a readback; the
+  // real reads of old and new events (and search) are PENDING (Pipeline 610982ce82c1), so this does not qualify A'.
   expect(await x.batches(A)).toBe(before.A + 1);
   expect(await x.batches(B)).toBe(before.B + 1);
   // Buffered uploads: each accepted batch left its stage intent (the record before the hold and the one after).
@@ -203,21 +210,49 @@ test("an erase arriving during the hold after an empty initial read makes the em
   expect((await x.status(A)).hold.state).toBe("marker_attempted"); // still held (fail safe)
 });
 
-test("an open canonical claim: hold-dry is not ready, and the install rolls back whole (no hold row); a pending batch refuses too", async () => {
+test("canonical history and an active seed capture refuse: hold-dry not ready, and the install rolls back under the key (no hold row)", async () => {
   const x = await fixture();
-  await x.f.db.query(`INSERT INTO sessions.ingest_batches(org_id,workspace_id,origin_id,batch_id,user_id,digest,receipt_id,state,committed_at)
-    VALUES($1,'ws','o','b-canon','u',$2,$3,'committed',clock_timestamp())`, [A, "d".repeat(64), "rhr_" + "f".repeat(64)]);
-  await x.f.db.query(`INSERT INTO sessions.ingest_claim_attempts(claim_token,org_id,workspace_id,user_id,origin_id,batch_id,digest,epochs)
-    VALUES(gen_random_uuid(),$1,'ws','u','o','b-canon',$2,'[]'::jsonb)`, [A, "d".repeat(64)]);
-  await x.f.db.query(`INSERT INTO sessions.ingest_batches(org_id,workspace_id,origin_id,batch_id,user_id,digest,receipt_id,state)
-    VALUES($1,'ws','o','b-pend','u',$2,$3,'pending')`, [B, "d".repeat(64), "rhr_" + "e".repeat(64)]);
+  await x.f.db.query(`INSERT INTO sessions.ingest_batches(org_id,workspace_id,origin_id,batch_id,user_id,digest,receipt_id,state,committed_at,publication_state)
+    VALUES($1,'ws','o','b-canon','u',$2,$3,'committed',clock_timestamp(),'canonical')`, [A, "d".repeat(64), "rhr_" + "f".repeat(64)]);
+  const gen = (await x.one("SELECT generation FROM sessions.__96bulls_role_validation LIMIT 1")).generation;
+  await x.f.db.query(`INSERT INTO sessions.ingest_seed_captures(org_id,workspace_id,source,session_id,generation,source_epoch,fingerprint,state)
+    VALUES($1,'ws','claude','s1',$2,0,$3,'{}'::jsonb)`, [B, gen, "a".repeat(64)]);
   const d = await x.run("dry");
-  expect(by(d)[H(A)]).toMatchObject({ verdict: "refused", refused: "hold_canonical_open", canonical_open: 1 });
-  expect(by(d)[H(B)]).toMatchObject({ verdict: "refused", refused: "hold_pending_batch", pending_batches: 1 });
-  // Even approved anyway, the execute re-checks in its own transaction: A rolls back after _install, B is refused by it.
+  expect(by(d)[H(A)]).toMatchObject({ verdict: "refused", refused: "hold_canonical_history", canonical_committed: 1 });
+  expect(by(d)[H(B)]).toMatchObject({ verdict: "refused", refused: "hold_seed_capture_active", seed_captures: 1 });
   const i = await x.run("install", { dryRun: DRY, approved: [A, B].map((o) => ({ orgHash: H(o), epochHash: null })) });
-  expect(by(i)[H(A)]).toMatchObject({ verdict: "refused", refused: "hold_canonical_open" });
-  expect(by(i)[H(B)]).toMatchObject({ verdict: "refused", refused: "hold_pending_batch" });
+  expect(by(i)[H(A)]).toMatchObject({ verdict: "refused", refused: "hold_canonical_history", hold: "not_read", epoch_hash: null });
+  expect(by(i)[H(B)]).toMatchObject({ verdict: "refused", refused: "hold_seed_capture_active" });
   expect((await x.status(A)).hold).toBeNull();
   expect((await x.status(B)).hold).toBeNull();
+  // An EXPIRED capture no longer counts (expiry is schema-terminal).
+  await x.f.db.query("UPDATE sessions.ingest_seed_captures SET expires_at = clock_timestamp() - interval '1 minute' WHERE org_id = $1", [B]);
+  expect(by(await x.run("dry"))[H(B)]).toMatchObject({ verdict: "ready", seed_captures: 0 });
+});
+
+test("the production path: no fan-out proof means hold-dry is not ready and the install refuses BEFORE _install", async () => {
+  const x = await fixture();
+  const d = await x.run("dry", { fanoutProof: undefined });
+  expect(d.per_org.every((p: any) => p.verdict === "refused" && p.refused === "hold_fanout_unproven" && p.fanout === "unproven")).toBe(true);
+  const i = await x.run("install", { dryRun: DRY, approved: [A, B].map((o) => ({ orgHash: H(o), epochHash: null })), fanoutProof: undefined });
+  expect(i.per_org.every((p: any) => p.refused === "hold_fanout_unproven")).toBe(true);
+  for (const o of [A, B]) expect((await x.status(o)).hold).toBeNull();
+  expect((await x.one("SELECT count(*)::int n FROM sessions.ingest_org_admission_hold_events")).n).toBe(0);
+});
+
+test("an install retry after the epoch advanced (sealed, marker_attempted) reports the actual state and refuses", async () => {
+  const x = await fixture();
+  const d = await x.run("dry");
+  const approved = d.per_org.map((p: any) => ({ orgHash: p.org_hash, epochHash: null }));
+  const i = await x.run("install", { dryRun: DRY, approved });
+  await x.f.db.query("SELECT pg_sleep(0.01)");
+  const full = { run: "802", startedMs: Date.now(), evidence: FULL_EVIDENCE };
+  await x.f.db.query("SELECT pg_sleep(0.01)");
+  await x.run("seal", { dryRun: "803", approved: i.per_org.map((p: any) => ({ orgHash: p.org_hash, epochHash: p.epoch_hash })), full });
+  await x.f.db.query("SELECT sessions.ingest_org_admission_hold_marker_attempt($1,$2::uuid,$3)", [B, (await x.status(B)).hold.epoch, MARKER_EVIDENCE]);
+  const retry = await x.run("install", { dryRun: DRY, approved });
+  expect(by(retry)[H(A)]).toMatchObject({ verdict: "refused", refused: "hold_epoch_advanced", hold: "sealed", epoch_hash: by(i)[H(A)].epoch_hash });
+  expect(by(retry)[H(B)]).toMatchObject({ verdict: "refused", refused: "hold_epoch_advanced", hold: "marker_attempted", epoch_hash: by(i)[H(B)].epoch_hash });
+  expect(retry.complete).toBe(false);
+  expect((await x.status(A)).hold.state).toBe("sealed"); // nothing changed
 });
