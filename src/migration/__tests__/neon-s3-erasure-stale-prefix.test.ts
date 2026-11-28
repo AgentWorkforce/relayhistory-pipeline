@@ -22,6 +22,7 @@ import { exitStatusForError, staleprefixOptions, stalePassStatus } from "../neon
 import { ShortLivedCredentialError } from "../short-lived-credentials.ts";
 import { LEASE_TTL_MS, SyncState } from "../neon-s3-sync/state.ts";
 import { FORBIDDEN_CREDENTIAL_ENV } from "../stdin-credentials.ts";
+import { signRequest } from "../../../packages/object-store/src/sigv4.ts";
 import { FakeS3Versions } from "./fake-s3-versions.ts";
 import { approvedFor, attestation, BUCKET_SHA, buildCopy, seedBodies, TARGET } from "./stale-prefix-fixture.ts";
 
@@ -774,10 +775,17 @@ describe("short-lived eraser key expiring inside an admitted item (T56 review)",
     const a = f.dateMove("sess-1", "g-1", NOW - 60_000);
     const before = erasureRow(f.st, a.oldP)!;
     let expired = true; let refusals = 0;
-    // The key expires mid-erase: the eraser's request path refuses before signing (eraser.ts refuseIfExpired).
-    f.s.onDelete = (k) => { if (expired && k.startsWith(a.oldP)) { refusals++; throw new ShortLivedCredentialError("short_lived_expired.eraser"); } };
+    // The key expires mid-erase: the eraser's request path refuses at signing, BEFORE dispatch (the signer is the
+    // pre-dispatch seam; a refusal thrown from inside fetch would be post-dispatch and correctly ambiguous).
+    const signer = async (args: Parameters<typeof signRequest>[0]) => {
+      if (expired && args.method === "DELETE" && decodeURIComponent(args.url.pathname.replace(/^\/b\//, "")).startsWith(a.oldP)) {
+        refusals++; throw new ShortLivedCredentialError("short_lived_expired.eraser");
+      }
+      await signRequest(args);
+    };
     let err: unknown;
-    try { await f.exec({ onlyIdentities: allIds(f.st), execute: true, probe: f.s.eraser() }); } catch (e) { err = e; }
+    const fence = f.s.eraser({ signer });
+    try { await f.exec({ onlyIdentities: allIds(f.st), execute: true, probe: fence, fence }); } catch (e) { err = e; }
     expect((err as { code?: string }).code).toBe("short_lived_expired.eraser");
     expect(exitStatusForError(err)).toBe(75);
     expect(refusals).toBeGreaterThan(0);

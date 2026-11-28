@@ -40,7 +40,7 @@ export const STAGED_ERASE_AFTER_MS = 48 * 60 * 60 * 1000;
 const DOT_SEGMENT = /(^|\/)\.{1,2}(\/|$)/;
 import type { SyncState } from "../neon-s3-sync/state.ts";
 import { errorCode, type Log } from "../neon-s3-sync/sync.ts";
-import { inSessionAnyDate, type EraseCheckpoint, type Eraser, type ListedVersion, type LiveObjectProbe, type PagedEraser, type ReceiptFence, type VersionReader } from "./eraser.ts";
+import { inSessionAnyDate, type DispatchRecord, type EraseCheckpoint, type Eraser, type ListedVersion, type LiveObjectProbe, type PagedEraser, type ReceiptFence, type VersionReader } from "./eraser.ts";
 import {
   allowlistDigest, ATTESTATION_MAX_AGE_MS, attestationFresh, attestationProblem, protectionFacts, RECEIPT_KIND, RECEIPT_MAX_AGE_MS, sameItem, sameVersionSet, sealReceipt, sha256Hex as verifySha256, survivorPinsHold,
   verifyStalePrefix, versionSet, type IdentityReceipt, type ItemReceipt, type ProtectionAttestation, type VerificationReceipt, type VerifyReason,
@@ -1351,16 +1351,23 @@ export class ErasureJob {
             if (code) { gateRefused = code; throw refusal(code); }
             return fs.protectedUntil - now;
           };
+          // Adapter-owned: the fence writes "preparing" on entry and "dispatched" immediately before fetch. Only a
+          // record still reading "preparing" proves nothing was sent; error fields (notSent, short_lived_*) never do.
+          const dispatch: DispatchRecord = {};
           try {
-            await fence.deleteVersion(v.key, v.versionId, { beforeFetch });
+            await fence.deleteVersion(v.key, v.versionId, { beforeFetch, dispatch });
           } catch (error) {
-            // Refused or failed BEFORE fetch (this gate, the eraser's no-time-left refusal, hashing, signing, ...):
-            // nothing was sent. The version stays not_attempted: no diagnostic relist, no backoff, the batch stops.
-            if (gateRefused) { stop = gateRefused; break; }
-            // A short-lived key refused before signing: not sent either, and it stops the job for renewal (exit 75).
-            if (isCredentialFault(error)) { credential = error; stop = errorCode(error); break; }
-            if ((error as { notSent?: boolean }).notSent === true) { stop = errorCode(error); break; }
-            // Anything else may still have applied: never not_attempted. Resolve by an exact relist (through the same
+            if (dispatch.phase === "preparing") {
+              // Refused or failed BEFORE fetch (this gate, validation, the URL, hashing, signing, the timeout, ...):
+              // the version stays not_attempted: no diagnostic relist, no backoff, the batch stops.
+              if (gateRefused) { stop = gateRefused; break; }
+              // A short-lived key refused before signing: it stops the job for renewal (exit 75).
+              if (isCredentialFault(error)) { credential = error; stop = errorCode(error); break; }
+              stop = errorCode(error);
+              break;
+            }
+            // Dispatched (or not provably undispatched): it may have applied, whatever the error says (a
+            // credential-shaped or notSent-tagged error after fetch included). Never not_attempted. Resolve by an exact relist (through the same
             // request gate and page budget), record, stop. A relist the gate refuses, or that fails, leaves unknown.
             out.outcome = "unknown";
             try {

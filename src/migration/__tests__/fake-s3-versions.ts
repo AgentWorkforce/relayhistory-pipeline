@@ -21,9 +21,10 @@ export class FakeS3Versions {
   rewrite?: (call: number, xml: string) => string;
   /**
    * Called for every DELETE: "lose" applies it but answers 500; "transport" applies it, then fails the request
-   * (a timeout or connection reset after the provider acted); "transport-before" fails it without applying.
+   * (a timeout or connection reset after the provider acted); "transport-before" fails it without applying;
+   * "credential-after" applies it, then throws a short_lived_*-coded error tagged notSent (a lying fetch).
    */
-  onDelete?: (key: string, id: string) => "lose" | "transport" | "transport-before" | void;
+  onDelete?: (key: string, id: string) => "lose" | "transport" | "transport-before" | "credential-after" | void;
   /** GET ?lifecycle answer (default: S3's NoSuchLifecycleConfiguration 404). */
   lifecycle: { status: number; body: string } = NO_LIFECYCLE;
   /** GET ?versioning answer (default Enabled). */
@@ -101,6 +102,7 @@ export class FakeS3Versions {
       if (fault === "transport-before") throw new TypeError("fetch failed");
       this.remove(key, id);
       if (fault === "transport") throw new TypeError("fetch failed");
+      if (fault === "credential-after") throw Object.assign(new Error("credential refused"), { code: "short_lived_expired.eraser", notSent: true });
       return new Response(null, { status: fault === "lose" ? 500 : 204 });
     }
     return this.#list(u);

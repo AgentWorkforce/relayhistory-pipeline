@@ -1010,7 +1010,7 @@ describe("in-path gate judged at a fresh time (after the lease queries)", () => 
     const real = fence.deleteVersion;
     let n = 0;
     // The job's gate passes; the time left handed to the eraser is then 0 on delete 2.
-    fence.deleteVersion = (k, v, o) => real(k, v, { beforeFetch: () => { const left = o!.beforeFetch!(); return ++n === 2 ? 0 : left; } });
+    fence.deleteVersion = (k, v, o) => real(k, v, { ...o, beforeFetch: () => { const left = o!.beforeFetch!(); return ++n === 2 ? 0 : left; } });
     const rep = (await f.execute(receipt, { fence })).fenced![0]!;
     expect(f.s.deletes).toHaveLength(1);
     expect(rep).toMatchObject({ outcome: "partial", reason: "stale_prefix_deadline", deleted: 1 });
@@ -1040,6 +1040,79 @@ describe("pre-dispatch failures are not sent (real adapter, mock fetch)", () => 
     expect(f.row(m.oldP)).toEqual(before); // no backoff, no attempt
     expect(f.logs.some((l) => l.message === "erasure failed")).toBe(false);
     expect(f.s.count(m.oldP)).toBe(3);
+  });
+
+  test("building the abort signal fails before fetch (local preparation): zero fetch calls, not_attempted, no relist, no backoff", async () => {
+    const f = await fixture();
+    const m = f.dateMove();
+    const receipt = await f.verify();
+    const real = AbortSignal.timeout;
+    let armed = false, listsAtThrow = -1;
+    const fence = f.s.eraser({ signer: async (args) => { await signRequest(args); if (args.method === "DELETE") { armed = true; listsAtThrow = f.s.lists; } } });
+    // Only the DELETE's signal construction fails; every list/GET before it builds its signal normally.
+    AbortSignal.timeout = ((ms: number) => { if (armed) { armed = false; throw Object.assign(new RangeError("signal broke"), { code: "signal_failed" }); } return real.call(AbortSignal, ms); }) as typeof AbortSignal.timeout;
+    const before = f.row(m.oldP);
+    let r: Awaited<ReturnType<typeof f.execute>>;
+    try { r = await f.execute(receipt, { fence }); } finally { AbortSignal.timeout = real; }
+    expect(f.s.deletes).toEqual([]);
+    expect(f.s.lists).toBe(listsAtThrow); // no diagnostic relist
+    expect(r).toMatchObject({ ok: false, refused: "signal_failed", erased: 0, versionsDeleted: 0 });
+    expect(r.fenced![0]!.versions.every((v) => v.outcome === "not_attempted")).toBe(true);
+    expect(f.row(m.oldP)).toEqual(before); // no backoff, no attempt
+    expect(f.s.count(m.oldP)).toBe(3);
+  });
+
+  test("building the DELETE URL fails (local preparation): zero fetch calls, not_attempted, no relist, unchanged row", async () => {
+    const f = await fixture();
+    const m = f.dateMove();
+    const receipt = await f.verify();
+    const realSet = URLSearchParams.prototype.set;
+    let armed = false, listsAtThrow = -1;
+    // Armed only inside the fence's deleteVersion (the inline re-verification GETs set versionId too).
+    const fence = f.s.eraser();
+    const real = fence.deleteVersion;
+    fence.deleteVersion = (k, v, o) => { armed = true; return real(k, v, o).finally(() => { armed = false; }); };
+    URLSearchParams.prototype.set = function (name: string, value: string) {
+      if (armed && name === "versionId") { listsAtThrow = f.s.lists; throw Object.assign(new TypeError("url broke"), { code: "url_failed" }); }
+      return realSet.call(this, name, value);
+    };
+    const before = f.row(m.oldP);
+    let r: Awaited<ReturnType<typeof f.execute>>;
+    try { r = await f.execute(receipt, { fence }); } finally { URLSearchParams.prototype.set = realSet; }
+    expect(listsAtThrow).toBeGreaterThan(0);
+    expect(f.s.deletes).toEqual([]);
+    expect(f.s.lists).toBe(listsAtThrow); // no diagnostic relist
+    expect(r).toMatchObject({ ok: false, refused: "url_failed", erased: 0, versionsDeleted: 0 });
+    expect(r.fenced![0]!.versions.every((v) => v.outcome === "not_attempted")).toBe(true);
+    expect(f.row(m.oldP)).toEqual(before);
+    expect(f.s.count(m.oldP)).toBe(3);
+  });
+
+  test("a credential-shaped, notSent-tagged error AFTER dispatch stays ambiguous: relisted, no exit-75 stop, never not_attempted", async () => {
+    const f = await fixture();
+    f.dateMove();
+    const receipt = await f.verify();
+    let listsAtDelete = -1;
+    f.s.onDelete = () => { listsAtDelete = f.s.lists; return "credential-after"; };
+    const r = await f.execute(receipt); // returns: no credential throw (exit 75) for a dispatched request
+    const rep = r.fenced![0]!;
+    expect(f.s.deletes).toHaveLength(1);
+    expect(f.s.lists).toBe(listsAtDelete + 1); // the diagnostic relist ran
+    expect(rep).toMatchObject({ outcome: "partial", reason: "stale_prefix_delete_ambiguous" });
+    expect(rep.versions[0]).toMatchObject({ outcome: "absent_observed", error_code: "short_lived_expired.eraser" });
+  });
+
+  test("a fence that never writes the dispatch record is not trusted: a notSent-tagged pre-fetch failure is still ambiguous", async () => {
+    const f = await fixture();
+    f.dateMove();
+    const receipt = await f.verify();
+    const fence = f.s.eraser({ signer: async (args) => { if (args.method === "DELETE") throw Object.assign(new Error("signer broke"), { code: "signer_failed" }); await signRequest(args); } });
+    const real = fence.deleteVersion;
+    fence.deleteVersion = (k, v, o) => real(k, v, { beforeFetch: o?.beforeFetch }); // drops the record
+    const rep = (await f.execute(receipt, { fence })).fenced![0]!;
+    expect(f.s.deletes).toEqual([]);
+    expect(rep).toMatchObject({ reason: "stale_prefix_delete_ambiguous" });
+    expect(rep.versions[0]).toMatchObject({ outcome: "present_after_error", error_code: "signer_failed" });
   });
 
   test("the signer throws a short_lived_* refusal: the credential stop (exit 75, item kept) and not_attempted", async () => {
