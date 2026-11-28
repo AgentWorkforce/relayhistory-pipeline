@@ -606,3 +606,55 @@ grant found is to `bulls96_read_api` only (050020:361), not to the PostgREST ser
 no fence after IO. It must either be made unreachable for enrolled orgs (refused before any read) or get a fence
 before and after IO. The other routes depend on configuration, so their reachability has to be proven from the live
 values, which are not in this repo.
+
+### Narrow wave 1: derived producers (static trace at 6d60dc4f) and the first visible byte
+
+**Finding: no producer checks an org-level erase.** Every guard keys on the `sessions.session_index` pointer rows
+(`deleted_at`, revision, epoch) or on the operator erase fence. A W2 revocation that commits in SQL without
+tombstoning or deleting pointers is invisible to all of them.
+
+| Producer | Trigger | Output, and who serves it | Erase today | Read-time fence | Replay guard |
+|---|---|---|---|---|---|
+| P1 search index | SQS S3 events, committed wake/catch-up, large job | ClickHouse/PG/OpenSearch rows, served by `/v1/events` and session events | erased only by the next pass with no live keys (later); synchronous under the operator erase | `liveness.erased` = every pointer tombstoned; a hard-deleted pointer counts as **not erased** | scope advisory lock plus live snapshot; the large job re-checks epoch and fingerprint |
+| P2 output/digest facts | inside the P1 pass | facts tables, served by `/v1/sessions/output` and `/v1/digest/daily` | only by P1's erased branch or the operator purge | **none** | as P1 |
+| P3 relayfacts backfill | manual CLI | local files, not served | never | n/a | a rerun sees live pointers only |
+| P4 session analysis | schedule/tick, POST `/analysis` | analysis objects plus a job row, served by GET `/analysis` | **synchronous**: a pointer tombstone trigger deletes jobs and tickets the objects | live pointer required | lease plus pointer-set revision |
+| P5 replay publication | P1 consumer, large job | read-projection objects plus a publication row, served by Worker pages mode | **synchronous** epoch bump on a pointer change; objects stay until the byte erase | live pointer plus matching epoch and fingerprint | re-capture plus publish CAS; objects from a failed CAS are orphaned |
+| P6 session brief | indexer/sweep wakeups | `session_briefs` row, served by `/summary` | **synchronous** forget trigger | live pointer plus exact revision | FOR SHARE live-set equality |
+| P7 search features | no non-test wiring found | feature tables, no read consumer found | retire only | n/a | page CAS |
+| Bob Costas | summary stages | encrypted summary objects plus a `session_summaries` pointer | **no forget trigger**; only the operator purge | stale-revision check only | none found |
+| publication-image `baseCopies` | publication prepare | **copies base chunks into a new canonical prefix**, then enqueues object-landed | checks `deleted_at` at prepare only, with no re-check before the copy | n/a | **none**: queued work can rebuild canonical bytes after an erase |
+| Migration tools | operator | neon-s3-sync writes canonical bytes; legacy-export reads manifests; neon-s3-erasure deletes bytes | n/a | n/a | n/a |
+
+**First externally visible byte** (sessions-partial-canonical, traced at 11c1c655):
+- Every read-API canonical serving path buffers the whole verified scope before sending its first byte, so a C3
+  verdict after the scope loop protects them all.
+- Pages mode exposes its bytes at P5 (publication), not at the request.
+- Durable writes before the scope ends:
+  - staged-reconcile commits index rows per write batch, BEFORE its final stamp re-read, so a verdict must precede
+    each write-page commit, or those rows must stay invisible until the final stage;
+  - Bob Costas and the brief input stream chunks into model requests;
+  - publication-image's first durable write is the copy itself.
+
+**Design consequence: express W2 revocation as pointer tombstones as well.** The synchronous paths (P4, P5, P6, the
+tombstone checks on the read routes) already revoke at a pointer tombstone, in the same transaction. So the W2
+revocation should, for each session an erase covers, tombstone that session's `session_index` pointers in the
+erase's own SQL commit. Concretely, the 062340 capture path, extended with scope (option ii), would set
+`deleted_at`, under the same key. That gives immediate revocation wherever a pointer check exists. The paths that
+stay open need their own gates:
+- P1 search treats a hard-deleted pointer as not erased, and a SQL-only change enqueues no wake;
+- P2 has no read fence;
+- Bob Costas has no forget trigger;
+- publication-image baseCopies does not re-check before its copy.
+Each one needs a serve-time gate, or must be shown unreachable for an enrolled org. Until then, the narrow option is
+**not closed**.
+
+**UNKNOWN:**
+- whether publication-image's prepare and register refuse on an erase fence between prepare and copy;
+- where Bob Costas summaries are served;
+- whether the byte eraser's listing covers `normalized/read-projection-v1`, `normalized/session-analysis-v2` and
+  `summary/*.enc`;
+- what enqueues a P1/P2 pass after a SQL-only change;
+- the hosted (non-self-host) operator-erase wiring;
+- brief-document outbox retirement;
+- whether semantic-copy reads v1 bytes.
