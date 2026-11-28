@@ -172,6 +172,30 @@ export const orgFenceAuthorityKey = (keyRoot: string, orgId: string) => `${keyRo
 export const fenceAuthorityStopKey = (keyRoot: string) => `${keyRoot}/.ledger/fence-authority/.stop.json`;
 /** The stop marker: `{"v":1,"stop":"all","writtenAtMs":<ms>}`. A present but invalid one refuses too (fail closed). */
 export interface FenceAuthorityStopDoc { v: 1; stop: "all"; writtenAtMs: number }
+/**
+ * One org's BRIDGE-COMPLETE record (OrgBridgeDoc; org-bridge-gate.ts completeOrgBridge writes it, create-only):
+ * the S3 projection of the org's 062320 hold released with `bridge_complete`. With `orgBridge: "required"` a
+ * per-org marker admits only beside this record bound to that marker's exact bytes; without it every claim of the
+ * org is a retry (`ledger_fence_authority_bridge_pending`), so S3 admission stays fenced from hold install through
+ * the committed bridge_complete, not only until the marker PUT. The buffered drain (the fallback writer) refuses
+ * the org from the moment it exists. Under a dot directory: no tenant segment starts with a dot
+ * (assertTenantSegment), so it can never be read as an org's marker. Covered by the consumer's read grant on
+ * `fence-authority/*`.
+ */
+export const orgBridgeKey = (keyRoot: string, orgId: string) => `${keyRoot}/.ledger/fence-authority/.bridge/${orgId}.json`;
+/**
+ * `holdEpochSha256`: orgBridgeEpochHash(epoch) of the released hold; `markerSha256`: sha256 of the per-org marker's
+ * stored bytes; `releaseEvidenceSha256`: the hold's release_evidence_sha256. Hashes only, never an id but the org's.
+ */
+export interface OrgBridgeDoc { v: 1; kind: "org-bridge-complete"; orgId: string; holdEpochSha256: string; markerSha256: string; releaseEvidenceSha256: string; writtenAtMs: number }
+const BRIDGE_FIELDS = ["v", "kind", "orgId", "holdEpochSha256", "markerSha256", "releaseEvidenceSha256", "writtenAtMs"];
+export function validOrgBridge(v: unknown): v is OrgBridgeDoc {
+  return isObject(v) && exactKeys(v, BRIDGE_FIELDS) && v.v === 1 && v.kind === "org-bridge-complete" && str(v.orgId)
+    && typeof v.holdEpochSha256 === "string" && HEX64.test(v.holdEpochSha256) && typeof v.markerSha256 === "string" && HEX64.test(v.markerSha256)
+    && typeof v.releaseEvidenceSha256 === "string" && HEX64.test(v.releaseEvidenceSha256) && count(v.writtenAtMs) && v.writtenAtMs > 0;
+}
+/** Domain-separated hash of a hold epoch, so the record never names it. */
+export const orgBridgeEpochHash = (epoch: string) => createHash("sha256").update(`96bulls:org-bridge-epoch-v1:${epoch}`).digest("hex");
 
 // ---- object shapes ----
 
@@ -549,6 +573,21 @@ async function readDoc<T>(store: ObjectStore, key: string, valid: (v: unknown) =
   return { doc: value, version };
 }
 
+/** readDoc plus the sha256 of the stored bytes (the bridge record binds the marker by them). */
+async function readDocHashed<T>(store: ObjectStore, key: string, valid: (v: unknown) => v is T, invalidCode: string): Promise<{ doc: T; sha256: string } | null> {
+  let raw: Uint8Array;
+  try {
+    raw = await readAll((await store.getObject(objectKey(key))).body);
+  } catch (error) {
+    if (isObjectStoreError(error, "not_found")) return null;
+    throw storeFailure(error);
+  }
+  let value: unknown;
+  try { value = JSON.parse(decoder.decode(raw)); } catch { throw new LedgerUnavailableError(invalidCode); }
+  if (!valid(value)) throw new LedgerUnavailableError(invalidCode);
+  return { doc: value, sha256: createHash("sha256").update(raw).digest("hex") };
+}
+
 /** Create-only (no version) or compare-and-swap. false: lost the race (re-read and retry). */
 async function casPut(store: ObjectStore, key: string, doc: unknown, version: ObjectVersion | undefined): Promise<boolean> {
   try {
@@ -646,6 +685,14 @@ export interface S3LedgerOptions {
   fenceAuthority?: "required";
   /** How long a VALID marker read is trusted (default 60 s). A missing or invalid one is never cached. */
   fenceAuthorityTtlMs?: number;
+  /**
+   * "required" (needs `fenceAuthority: "required"`; the hosted consumer sets it): an org admitted through its PER-ORG
+   * marker also needs its bridge-complete record (orgBridgeKey, validOrgBridge) naming that org and the sha256 of the
+   * marker's stored bytes. Absent: `ledger_fence_authority_bridge_pending` (retry); present but invalid, another org
+   * or another marker: `ledger_fence_authority_bridge_invalid`. Nothing is cached until both pass. The
+   * deployment-wide marker is unaffected (it follows every org's own cutover). Unset: no extra read (self-host).
+   */
+  orgBridge?: "required";
   /**
    * The fork guard of a ledger relocation (ledger-store.ts LedgerHomeDoc, docs/ledger-relocation.md), checked with the
    * fence-authority marker and cached with it (needs `fenceAuthority: "required"`): the marker
@@ -951,6 +998,7 @@ export function s3Ledger(store: ObjectStore, keyRoot: string, opts: S3LedgerOpti
   const authorityTtl = opts.fenceAuthorityTtlMs ?? 60_000;
   if (!count(authorityTtl)) throw new LedgerUnavailableError("ledger_s3_options_refused");
   if (opts.ledgerHome && (opts.fenceAuthority !== "required" || !str(opts.ledgerHome.expect))) throw new LedgerUnavailableError("ledger_s3_options_refused");
+  if (opts.orgBridge !== undefined && (opts.orgBridge !== "required" || opts.fenceAuthority !== "required")) throw new LedgerUnavailableError("ledger_s3_options_refused");
   /** Per org: until when a valid marker read is trusted. Bounded (cleared when full): only a cache. */
   const authorityUntil = new Map<string, number>();
 
@@ -965,9 +1013,15 @@ export function s3Ledger(store: ObjectStore, keyRoot: string, opts: S3LedgerOpti
     // The deployment-wide stop first: present (valid or not) refuses every org.
     if (await readDoc(store, fenceAuthorityStopKey(keyRoot), validFenceAuthorityStop, "ledger_fence_authority_stopped"))
       throw new LedgerUnavailableError("ledger_fence_authority_stopped");
-    const org = await readDoc(store, orgFenceAuthorityKey(keyRoot, orgId), validOrgFenceAuthority, "ledger_fence_authority_invalid");
+    const org = await readDocHashed(store, orgFenceAuthorityKey(keyRoot, orgId), validOrgFenceAuthority, "ledger_fence_authority_invalid");
     if (org) {
       if (org.doc.orgId !== orgId) throw new LedgerUnavailableError("ledger_fence_authority_org_mismatch");
+      // The marker alone no longer reopens the org: only its committed bridge_complete, bound to these marker bytes.
+      if (opts.orgBridge === "required") {
+        const bridge = await readDoc(store, orgBridgeKey(keyRoot, orgId), validOrgBridge, "ledger_fence_authority_bridge_invalid");
+        if (!bridge) throw new LedgerUnavailableError("ledger_fence_authority_bridge_pending");
+        if (bridge.doc.orgId !== orgId || bridge.doc.markerSha256 !== org.sha256) throw new LedgerUnavailableError("ledger_fence_authority_bridge_invalid");
+      }
     } else if (!(await readDoc(store, fenceAuthorityKey(keyRoot), validFenceAuthority, "ledger_fence_authority_invalid"))) {
       throw new LedgerUnavailableError("ledger_fence_authority_missing");
     }

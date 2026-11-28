@@ -164,7 +164,9 @@ export function hostedUploadAdmissionRuntime(overrides: HostedRuntimeOverrides =
     const deliver: DeliverDeps = {
       // Fail closed: no admission until an operator has written the fence-authority marker (ledger-s3.ts
       // FenceAuthorityDoc: fence backfill complete, control mirror on, re-arm sweeper live). Every record retries.
-      ledger: s3Ledger(store, config.keyRoot, { acceptanceMode: "canonical", fenceAuthority: "required", parallel: config.ledgerParallel,
+      // orgBridge: an org cut over by its per-org marker stays fenced until its bridge_complete record (ledger-s3
+      // orgBridgeKey) is written: the marker alone never reopens S3 admission (org-bridge-gate.ts).
+      ledger: s3Ledger(store, config.keyRoot, { acceptanceMode: "canonical", fenceAuthority: "required", orgBridge: "required", parallel: config.ledgerParallel,
         ...(config.ledgerHomeGuard ? { ledgerHome: { expect: config.bucket, required: false } } : {}) }),
       acceptanceMode: "canonical",
       // SCRUB_ENGINE is refused above unless ts, so this is {} today; it stays wired if that ever widens.

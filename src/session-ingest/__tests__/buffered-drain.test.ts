@@ -27,7 +27,7 @@ import { mkdtempSync, readFileSync as readFileSyncFs, rmSync, writeFileSync as w
 import { join } from "node:path";
 import { scratchStore } from "./support.ts";
 import { journalKey as journalKeyFor } from "../async-admission.ts";
-import { applyFenceChange, fenceAuthorityKey, fenceAuthorityStopKey, fenceEpoch, orgFenceAuthorityKey, s3ControlMirror, s3LedgerKeys, s3LedgerObjects, sessionKeyHash, type FenceChange, type IndexEntryInput } from "../ledger-s3.ts";
+import { applyFenceChange, fenceAuthorityKey, fenceAuthorityStopKey, fenceEpoch, orgBridgeKey, orgFenceAuthorityKey, s3ControlMirror, s3LedgerKeys, s3LedgerObjects, sessionKeyHash, type FenceChange, type IndexEntryInput } from "../ledger-s3.ts";
 import type { OrderedControlInput } from "../ledger.ts";
 
 const ROOT = "96bulls";
@@ -1365,5 +1365,74 @@ describe("buffered backlog drain (0005)", () => {
     expect(parseDrainCheckpoint(JSON.stringify({ ...saved!, exports: { x: 0 } }))).toBeNull();
     expect(parseDrainCheckpoint(JSON.stringify({ ...saved!, key: "96bulls/../x" }))).toBeNull();
     expect(parseDrainCheckpoint(JSON.stringify(saved!))).toEqual(saved!);
+  });
+});
+
+// ---- the writer switch of a per-org cutover (org-bridge-gate.ts): the drain is the fallback writer ----
+describe("buffered drain: refuses an org once its bridge-complete record exists (direct/fallback writer exclusion)", () => {
+  const bridged = (store: ObjectStore) => store.put(objectKey(orgBridgeKey(ROOT, TENANT.orgId)), enc.encode(JSON.stringify({ v: 1, kind: "org-bridge-complete",
+    orgId: TENANT.orgId, holdEpochSha256: "a".repeat(64), markerSha256: "b".repeat(64), releaseEvidenceSha256: "c".repeat(64), writtenAtMs: 1 })));
+  /** The store, with `hook` run (once) right after the first put whose key matches. */
+  const after = (store: ObjectStore, match: (key: string) => boolean, hook: () => Promise<unknown>) => {
+    let fired = false;
+    return new Proxy(store, {
+      get(target, prop) {
+        if (prop === "put") return async (...a: Parameters<ObjectStore["put"]>) => {
+          const r = await target.put(...a);
+          if (!fired && match(String(a[0]))) { fired = true; await hook(); }
+          return r;
+        };
+        const v = (target as unknown as Record<PropertyKey, unknown>)[prop];
+        return typeof v === "function" ? (v as (...x: unknown[]) => unknown).bind(target) : v;
+      },
+    });
+  };
+
+  test("a record present before the run: nothing written, nothing merged, not marked; any object there counts", async () => {
+    for (const body of ["valid", "garbage"]) {
+      const store = await scratch();
+      const key = await stage(store, [group("claude", "sess-1", [{ id: "r1", rev: 1 }])]);
+      if (body === "valid") await bridged(store);
+      else await store.put(objectKey(orgBridgeKey(ROOT, TENANT.orgId)), enc.encode("not json"));
+      const summary = await run(store);
+      expect(summary.objects).toMatchObject({ bridge_complete_drain_refused: 1, drained: 0 });
+      expect([...(await canonical(store)).keys()]).toEqual([]);
+      expect(await storedEntry(store, "r1")).toBeUndefined();
+      expect(await exists(store, key + DRAINED_SUFFIX)).toBe(false);
+    }
+  });
+
+  test("bridge_complete committed after the run's cached authority read, before the first canonical byte: refused, zero canonical bytes", async () => {
+    const base = await scratch();
+    const key = await stage(base, [group("claude", "sess-1", [{ id: "r1", rev: 1 }])]);
+    // The ownership stubs are the last write before the canonical bytes (step 4b): the switch lands right after them.
+    const store = after(base, (k) => k.includes("/ledger/owners/"), () => bridged(base));
+    const summary = await run(store);
+    expect(summary.objects).toMatchObject({ bridge_complete_drain_refused: 1, drained: 0 });
+    expect([...(await canonical(base)).keys()]).toEqual([]);
+    expect(await storedEntry(base, "r1")).toBeUndefined();
+    expect(await exists(base, key + DRAINED_SUFFIX)).toBe(false);
+  });
+
+  test("a drain paused across bridge_complete (canonical bytes landed while open) merges no index entry and is not marked", async () => {
+    const base = await scratch();
+    const key = await stage(base, [group("claude", "sess-1", [{ id: "r1", rev: 1 }])]);
+    const store = after(base, (k) => k.startsWith(`${ROOT}/${TENANT.orgId}/v1/`) && k.includes("/raw/"), () => bridged(base));
+    const summary = await run(store);
+    expect(summary.objects).toMatchObject({ bridge_complete_drain_refused: 1, drained: 0 });
+    // The bytes are there (they landed before the switch), but the fallback writer never makes them stored:
+    // the direct writer's claims judge r1 as never indexed, and a rerun refuses at once.
+    expect([...(await canonical(base)).keys()]).toHaveLength(1);
+    expect(await storedEntry(base, "r1")).toBeUndefined();
+    expect(await exists(base, key + DRAINED_SUFFIX)).toBe(false);
+    expect((await run(base)).objects).toMatchObject({ bridge_complete_drain_refused: 1, drained: 0 });
+  });
+
+  test("without a record (the bridge still open) the same batch drains: the switch is the only difference", async () => {
+    const store = await scratch();
+    const key = await stage(store, [group("claude", "sess-1", [{ id: "r1", rev: 1 }])]);
+    expect((await run(store)).objects.drained).toBe(1);
+    expect(await storedEntry(store, "r1")).toBeDefined();
+    expect(await exists(store, key + DRAINED_SUFFIX)).toBe(true);
   });
 });

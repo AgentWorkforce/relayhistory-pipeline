@@ -79,7 +79,7 @@ import { layoutComponent } from "../shared/layout-component.ts";
 import { journalKey } from "./async-admission.ts";
 import type { LedgerTenant } from "./ledger.ts";
 import {
-  entryForgotten, fenceAuthorityKey, fenceAuthorityStopKey, fenceEpoch, hasPendingReset, isDeletedForAdmission, newFence, orgFenceAuthorityKey, recordGeneration, s3LedgerObjects,
+  entryForgotten, fenceAuthorityKey, fenceAuthorityStopKey, orgBridgeKey, fenceEpoch, hasPendingReset, isDeletedForAdmission, newFence, orgFenceAuthorityKey, recordGeneration, s3LedgerObjects,
   sessionKeyHash, validFenceAuthority, validOrgFenceAuthority, type FenceDoc, type FenceRead, type IndexEntry, type IndexEntryInput,
 } from "./ledger-s3.ts";
 import { fitLine } from "./oversize.ts";
@@ -345,6 +345,8 @@ export type ObjectOutcome =
   | "fence_authority_missing"
   | "fence_authority_invalid"
   | "fence_authority_stopped"
+  | "bridge_complete_drain_refused"
+  | "bridge_state_unreadable"
   | "user_hold"
   | "user_stopped"
   | "hold_failed"
@@ -365,7 +367,7 @@ export type ObjectOutcome =
 
 const OUTCOMES: ObjectOutcome[] = [
   "drained", "would_drain", "already_drained", "pre_reset", "redacted", "vanished", "corrupt", "key_mismatch",
-  "ambiguous_replacement", "fence_absent", "fence_unreadable", "journal_unreadable", "privacy_control_open", "reset_undeterminable", "reset_margin", "reset_in_flight", "control_pending", "fence_authority_missing", "fence_authority_invalid", "fence_authority_stopped", "user_hold", "user_stopped", "hold_failed", "lock_lost", "index_unreadable", "write_failed",
+  "ambiguous_replacement", "fence_absent", "fence_unreadable", "journal_unreadable", "privacy_control_open", "reset_undeterminable", "reset_margin", "reset_in_flight", "control_pending", "fence_authority_missing", "fence_authority_invalid", "fence_authority_stopped", "bridge_complete_drain_refused", "bridge_state_unreadable", "user_hold", "user_stopped", "hold_failed", "lock_lost", "index_unreadable", "write_failed",
   "index_merge_failed", "fence_recheck_failed", "fence_moved", "stage_unacknowledged", "stage_export_missing", "accepted_mismatch", "stage_not_live", "stage_superseded", "fence_moved_since_export", "marker_failed", "internal_error",
 ];
 
@@ -533,7 +535,7 @@ interface BatchGroup {
  * Listed keys grouped by `…/m=…/b=<batch32>`. Every object of one batch digest (retries with other
  * claim tokens, a GC replacement, their markers) sorts contiguously, so the group is complete.
  */
-type Authority = "ok" | "missing" | "invalid" | "stopped";
+type Authority = "ok" | "missing" | "invalid" | "stopped" | "bridged";
 
 /**
  * Exactly admission's rule (ledger-s3 requireFenceAuthority): the deployment-wide stop first (present, valid or not:
@@ -555,6 +557,8 @@ async function orgAuthority(store: ObjectStore, keyRoot: string, orgId: string):
   try {
     if (await read(fenceAuthorityStopKey(keyRoot))) return "stopped";
     const org = await read(orgFenceAuthorityKey(keyRoot, orgId));
+    // The org's bridge-complete record: from then on S3 admission is the writer and the drain writes nothing more.
+    if (org && (await assertBridgeOpen(store, keyRoot, orgId)) !== "open") return "bridged";
     if (org) return validOrgFenceAuthority(org.v) && (org.v as { orgId: string }).orgId === orgId ? "ok" : "invalid";
     const all = await read(fenceAuthorityKey(keyRoot));
     if (!all) return "missing";
@@ -566,8 +570,23 @@ async function orgAuthority(store: ObjectStore, keyRoot: string, orgId: string):
 
 /** The refusal for a non-"ok" authority. */
 function authorityOutcome(a: Exclude<Authority, "ok">): ObjectOutcome {
-  return a === "missing" ? "fence_authority_missing" : a === "stopped" ? "fence_authority_stopped" : "fence_authority_invalid";
+  return a === "missing" ? "fence_authority_missing" : a === "stopped" ? "fence_authority_stopped" : a === "bridged" ? "bridge_complete_drain_refused" : "fence_authority_invalid";
 }
+
+/**
+ * The writer switch of a per-org cutover (org-bridge-gate.ts): "open" while the org has no bridge-complete record
+ * (ledger-s3 orgBridgeKey), "closed" once ANY object is stored there (valid or not: the direct writer may be live),
+ * "unreadable" on a store error (fail closed: nothing written). Never cached. Called before a batch's first
+ * canonical byte and again before its index merge, so a drain paused across bridge_complete stops there.
+ */
+export async function assertBridgeOpen(store: ObjectStore, keyRoot: string, orgId: string): Promise<"open" | "closed" | "unreadable"> {
+  try {
+    return (await store.head(objectKey(orgBridgeKey(keyRoot, orgId)))) === undefined ? "open" : "closed";
+  } catch (error) {
+    return isObjectStoreError(error, "not_found") ? "open" : "unreadable";
+  }
+}
+const bridgeOutcome = (b: "closed" | "unreadable"): ObjectOutcome => (b === "closed" ? "bridge_complete_drain_refused" : "bridge_state_unreadable");
 
 async function* batchGroups(store: ObjectStore, prefix: string, startAfter: string | undefined, summary: DrainSummary, exportComplete: boolean, authority: Authority): AsyncGenerator<BatchGroup> {
   let current: (BatchGroup & { id: string }) | null = null;
@@ -1458,6 +1477,8 @@ export async function drainBufferedBatches(opts: DrainOptions): Promise<DrainSum
       {
         const authority = await currentAuthority(header.org_id);
         if (authority !== "ok") return authorityOutcome(authority);
+        const bridge = await assertBridgeOpen(opts.store, opts.keyRoot, header.org_id);
+        if (bridge !== "open") return bridgeOutcome(bridge);
       }
       if (!leaseOk()) return "lock_lost";
       if (toWrite.length) {
@@ -1517,6 +1538,12 @@ export async function drainBufferedBatches(opts: DrainOptions): Promise<DrainSum
         return partial(error instanceof DrainLockError ? "lock_lost" : "fence_recheck_failed");
       }
       if (!leaseOk()) return partial("lock_lost");
+      // The writer switch once more, uncached, right before the merge: a batch whose canonical bytes landed while the
+      // org was still open but which reaches this point after bridge_complete merges nothing (its hold intent stays).
+      {
+        const bridge = await assertBridgeOpen(opts.store, opts.keyRoot, header.org_id);
+        if (bridge !== "open") return partial(bridgeOutcome(bridge));
+      }
       try {
         for (const [sk, list] of entries) {
           const keep = list.filter((e) => e.sessionKey === null || ![...fencedNow].some((pk) => { const [s, id] = JSON.parse(pk) as [string, string]; return sessionKeyHash(s, id) === e.sessionKey; }));

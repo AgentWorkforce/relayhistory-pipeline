@@ -232,6 +232,18 @@ export interface SelfhostRuntimeOptions {
  * (withSqlControlMirror), while the read API and the eraser still read upload_deletions; claims and commits never
  * do. The SQL ledger is built lazily, so only a control reaches SQL.
  */
+/**
+ * INGEST_ORG_BRIDGE: unset or `off` (self-host default: a per-org marker alone admits, as before) or `required` (the
+ * hosted ingest edge, a per-org 0005 cutover under the 062320 hold: admission waits for the org's bridge-complete
+ * record, ledger-s3 orgBridgeKey). Anything else refuses to start.
+ */
+export function selfhostOrgBridge(env: Record<string, string | undefined>): "off" | "required" {
+  const v = env.INGEST_ORG_BRIDGE;
+  if (v === undefined || v === "" || v === "off") return "off";
+  if (v === "required") return "required";
+  throw new Error("96bulls: INGEST_ORG_BRIDGE must be off or required");
+}
+
 export function selfhostS3Ledger(keyRoot: string, parts: Pick<RuntimeParts, "run" | "store" | "ledgerHome">, limiter?: TenantLimiter,
   opts: { logModeGuard?: boolean; logErase?: boolean; logger?: Pick<typeof log, "error"> } = {}): Ledger {
   // A failed reset erase is an error line (route ingest.ledger_log_erase, outcome ledger_log_erase_failed): the reset
@@ -247,6 +259,8 @@ export function selfhostS3Ledger(keyRoot: string, parts: Pick<RuntimeParts, "run
     // INGEST_LEDGER_LOG_COMMIT=on: legacy claims and commits refuse a stream in log mode (its log is the only writer).
     s3Ledger(parts.store, keyRoot, { acceptanceMode: "canonical", fenceAuthority: "required", claimCompletesResets: false, parallel: serverLedgerParallel(process.env), ...(limiter ? { tenantLimiter: limiter } : {}),
       ...(guard ? { logModeGuard: true } : {}), ...(parts.ledgerHome ? { ledgerHome: parts.ledgerHome } : {}),
+      // INGEST_ORG_BRIDGE=required (the hosted ingest edge): a per-org marker admits only beside its bridge-complete record.
+      ...(selfhostOrgBridge(process.env) === "required" ? { orgBridge: "required" as const } : {}),
       // INGEST_LEDGER_LOG_ERASE=on: a reset deletes the log payloads it superseded before it completes or answers
       // (ledger-log-erase.ts). The log lives in this ledger's (routed) store, as LogStreams writes it.
       ...(opts.logErase ? { resetLogErase: (tenant: LedgerTenant, resets: number) => eraseSupersededLogPayloads(parts.store, keyRoot, tenant, resets, { log: eraseLog }) } : {}) }),
