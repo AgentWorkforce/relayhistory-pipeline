@@ -89,6 +89,23 @@ describe("T126 erase/re-create inside one dedup window", () => {
   });
 });
 
+describe("one committed physical manifest: writer, forwarder and reconcile derive the same identity independently", () => {
+  test("same ID from the PUT ack, the S3 notification record and the S3 listing; a re-create gets a distinct one", async () => {
+    // One physical write: versionId v7, ETag e7. Each producer sees it in its own form.
+    const writerQ = fifo(), forwardQ = fifo(), reconcileQ = fifo();
+    await writerRevisionHook(writerQ.sender)([{ key: KEY, revision: 1, version: "v7", etag: "e7", committedAt: "2026-11-01T10:00:00.000Z" }]);
+    await forwardManifestEvents([{ messageId: "n7", body: s3Body(KEY, { eTag: "\"e7\"", versionId: "v7", sequencer: "07" }) }], forwardQ.sender);
+    await sendReconcileRevision(reconcileQ.sender, JSON.stringify({ reconcile: { key: KEY, etag: "e7", version: "v7" } }));
+    const ids = [writerQ, forwardQ, reconcileQ].map((q) => q.accepted[0]!.MessageDeduplicationId);
+    expect(new Set(ids).size).toBe(1);
+    expect(new Set([writerQ, forwardQ, reconcileQ].map((q) => q.accepted[0]!.MessageGroupId)).size).toBe(1);
+    // Erase and re-create at the same revision number: a new versionId and ETag, a new ID, same group.
+    const recreated = revisionMessage({ key: KEY, revision: 1, version: "v8", etag: "e8", source: "writer" })!;
+    expect(recreated.MessageDeduplicationId).not.toBe(ids[0]);
+    expect(recreated.MessageGroupId).toBe(writerQ.accepted[0]!.MessageGroupId);
+  });
+});
+
 describe("the writer hook", () => {
   test("emits revision, versionId, ETag, commit time and initial/append", async () => {
     const q = fifo();

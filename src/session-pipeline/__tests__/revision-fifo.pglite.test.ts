@@ -47,6 +47,8 @@ async function rig() {
   const r = await pointerRig();
   cleanup.push(r.close);
   const index = new Map<string, string[]>();
+  /** The raw.content_sha256 of each manifest the last pass indexed, per scope. */
+  const digests = new Map<string, string[]>();
   const passes: string[] = [];
   let busy = 0;
   /** Set by a test: runs inside the next search pass, before it reads, once (park a pass). */
@@ -61,16 +63,19 @@ async function rig() {
       "SELECT manifest_key FROM sessions.session_index WHERE org_id=$1 AND workspace_id=$2 AND harness=$3 AND session_id=$4 AND deleted_at IS NULL",
       [scope.orgId, scope.workspaceId, scope.harness, scope.sessionId]);
     const markers: string[] = [];
+    const seen: string[] = [];
     for (const { manifest_key } of live.rows) {
       const l = parseSessionKey(manifest_key)!;
       let manifest: ManifestV1;
       try { manifest = JSON.parse(new TextDecoder().decode(await readAll(await r.store.get(objectKey(manifest_key))))) as ManifestV1; } catch { continue; }
+      seen.push(manifest.raw.content_sha256);
       for (const c of manifest.raw.chunks) {
         const raw = zstdDecompressSync(await readAll(await r.store.get(rawChunkKey(l, c.seq, 0, c.sha256, "ndjson"))));
         for (const line of new TextDecoder().decode(raw).split("\n")) if (line) markers.push((JSON.parse(line) as { record_id: string }).record_id);
       }
     }
     index.set(sid(scope), markers.sort());
+    digests.set(sid(scope), seen.sort());
     return { manifests: live.rows.length, rows: markers.length, inserted: markers.length, deleted: 0, complete: true, reasons: [] };
   };
   const visibility: { handles: string[]; seconds: number }[] = [];
@@ -96,7 +101,9 @@ async function rig() {
     return { key, revision, etag: await etagOf(key), committedAt, initial: revision === 1, source: "writer" };
   };
   const run = (records: SqsRecord[]) => logged(() => dispatchSqsBatch(records, deps(), wiring));
-  return { r, index, passes, visibility, record, writer, run, hold, makeBusy: (k: number) => { busy = k; }, sid: sid({ orgId: "org_1", workspaceId: "ws_1", harness: "claude", sessionId: "sess_1" }) };
+  const liveDigest = async (key: string) =>
+    (JSON.parse(new TextDecoder().decode(await readAll(await r.store.get(objectKey(key))))) as ManifestV1).raw.content_sha256;
+  return { r, index, digests, liveDigest, passes, visibility, record, writer, run, hold, makeBusy: (k: number) => { busy = k; }, sid: sid({ orgId: "org_1", workspaceId: "ws_1", harness: "claude", sessionId: "sess_1" }) };
 }
 
 const named = (lines: Record<string, unknown>[], msg: string) => lines.filter((l) => l.msg === msg || l.message === msg);
@@ -277,6 +284,41 @@ describe("in-flight pass: park it, commit a newer revision, then crash or lose t
   });
 });
 
+describe("old work paused AFTER its live read, manifest replaced, then resumed", () => {
+  /**
+   * What this design guarantees here is CONVERGENCE, not a commit-time refusal. The pointer upsert commits
+   * what the old pass read (it is revision-fenced, not stamp-fenced). The replacement's own event is the
+   * next message of the same FIFO group, so its pass re-reads and publishes the replacement. Any stale
+   * window lasts at most that one pass. A commit-time stamp refusal would belong in the search
+   * transaction (SEARCH_INDEX_PREREAD_ENABLED revalidates the source stamp under its locks); it is not
+   * part of this diff.
+   */
+  test("the replacement's own event, next in the group, makes the searchable result match the replacement's content digest; the paused event is superseded", async () => {
+    const t = await rig();
+    const a = await t.writer(1, "a1");
+    let b!: RevisionEvent;
+    // Pause A's pass inside the pointer lock after its manifest read, just before its upsert commits; replace the manifest (revision 2).
+    t.r.hooks.beforeUpsert = async () => { b = await t.writer(2, "b2"); };
+    const old = await t.run([t.record(a)]);
+    expect(old.result).toEqual({ batchItemFailures: [] });
+    // The pointer row committed what A's read saw: revision 1 (not refused).
+    expect(await t.r.row()).toEqual([expect.objectContaining({ revision: "1" })]);
+    // B's event is next in the group: the result converges on B.
+    const next = await t.run([t.record(b)]);
+    expect(next.result).toEqual({ batchItemFailures: [] });
+    expect(await t.r.row()).toEqual([expect.objectContaining({ revision: "2", deleted_at: null })]);
+    expect(t.index.get(t.sid)).toEqual(["b2"]);
+    expect(t.digests.get(t.sid)).toEqual([await t.liveDigest(b.key)]);
+    expect(named(next.lines, "revision searchable")).toEqual([expect.objectContaining({ revision: 2 })]);
+    // A delayed redelivery of A afterwards: superseded, no pass, digest unchanged.
+    const passes = t.passes.length;
+    const late = await t.run([t.record(a, T0, 2)]);
+    expect(named(late.lines, "revision superseded")).toEqual([expect.objectContaining({ revision: 1, superseded_by_revision: 2 })]);
+    expect(t.passes.length).toBe(passes);
+    expect(t.digests.get(t.sid)).toEqual([await t.liveDigest(b.key)]);
+  });
+});
+
 describe("T126 erase, then re-create with the same session and revision number", () => {
   /**
    * Finding (pre-existing on main, not this change): sessions.upsert_session_index applies a row only when
@@ -330,6 +372,8 @@ describe("T126 erase, then re-create with the same session and revision number",
     expect(t.index.get(t.sid)).toEqual(["new"]);
     expect(named(nb2.lines, "revision superseded")).toEqual([expect.objectContaining({ revision: 1, superseded_by_revision: 2 })]);
     expect(named(nb2.lines, "revision searchable")).toEqual([expect.objectContaining({ revision: 2, upload_kind: "append" })]);
+    // The searchable result matches the re-created manifest's content digest, not incarnation A's.
+    expect(t.digests.get(t.sid)).toEqual([await t.liveDigest(b2.key)]);
     expect(await t.r.row()).toEqual([expect.objectContaining({ revision: "2", deleted_at: null })]);
   });
 });
