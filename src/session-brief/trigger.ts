@@ -182,9 +182,10 @@ export interface BriefHintContext {
   /** A ready brief exists (a refresh); false: the first brief. */
   hasBrief: boolean;
   /**
-   * The commit references (trigger_ids) armed on this row and not yet consumed, resolved from the durable arm record
-   * (sessions.session_brief_arms). A hint's eligibility rules apply only when its reference is one of them: then the
-   * hint provably concerns uncovered work on this row. Otherwise (a consumed commit, an unknown reference, or any v1
+   * The commit references (trigger_ids) of the CURRENT armed, unconsumed identity of each machine on this row,
+   * resolved from the durable arm record (sessions.session_brief_arms, one identity per machine: a replacement at the
+   * same revision retires the identity it replaces). A hint's eligibility rules apply only when its reference is one
+   * of them: then it provably concerns current uncovered work (a delayed end for a replaced incarnation does not). Otherwise (a consumed commit, an unknown reference, or any v1
    * hint, which cannot name its scope) the hint is WAKE-ONLY: the consumer re-evaluates the row (its own due time,
    * retry floor and the armed uncovered evidence) and nothing is suppressed or advanced on the hint's word. Never
    * the max brief_revision alone (Pipeline item 8).

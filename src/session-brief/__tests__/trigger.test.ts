@@ -11,7 +11,7 @@ import { describe, expect, test } from "bun:test";
 import {
   armIdentity, BRIEF_TRIGGER_CONTRACT, briefTriggerConfig, briefTriggerId, briefWakeHint, claimAt, claimPlan, finishPlan, handoffPlan,
   briefMiss, hintCovers, parseBriefWakeHint, planArm, planHint, SQS_MAX_DELAY_SECONDS, type BriefPhysicalIncarnation,
-  type BriefWakeHint, type BriefWakeKind, type BriefWakeState,
+  type BriefCommitIdentity, type BriefWakeHint, type BriefWakeKind, type BriefWakeState,
 } from "../trigger.ts";
 
 const T0 = Date.UTC(2026, 10, 28, 12, 0, 0);
@@ -34,8 +34,14 @@ interface Run { harness: string; claimableAt: number; claimedAt: number; generat
 
 class Sim {
   now = T0;
-  /** By harness (one org/workspace/session here). armed: commit refs armed and not consumed (sessions.session_brief_arms). */
-  rows = new Map<string, { state: BriefWakeState; armed: Set<string>; claimed?: Set<string> }>();
+  /**
+   * By harness (one org/workspace/session here). armed: the CURRENT armed identity per machine (the arm record's PK is
+   * per machine, so a replacement retires the identity it replaces), with its commit reference.
+   */
+  rows = new Map<string, { state: BriefWakeState; armed: Map<string, { ref: string; id: BriefCommitIdentity }>; claimed?: Map<string, { ref: string; id: BriefCommitIdentity }> }>();
+  /** The consumed identity per harness:machine (it survives completion). */
+  consumedIds = new Map<string, BriefCommitIdentity>();
+  armedRefs(harness: string): Set<string> { return new Set([...(this.rows.get(harness)?.armed.values() ?? [])].map((x) => x.ref)); }
   briefs = new Map<string, Brief>();
   /** The highest committed revision per harness (what a run reads from the authoritative pointers). */
   committed = new Map<string, number>();
@@ -66,9 +72,12 @@ class Sim {
     this.committed.set(harness, Math.max(this.committed.get(harness) ?? -1, revision));
     const prevRow = this.rows.get(harness);
     const h = hint(opts.kind ?? "append", revision, prevRow?.state.pendingSince ?? this.now, harness, opts);
-    if (!opts.loseArm) {
-      const armed = new Set(prevRow?.armed ?? []);
-      armed.add(h.trigger_id);
+    const machine = opts.machine ?? M1;
+    const incoming: BriefCommitIdentity = { generation: opts.generation ?? "1", revision, sha256: opts.digest ?? DIGEST, ended: opts.kind === "end" };
+    const next = armIdentity(prevRow?.armed.get(machine)?.id ?? null, this.consumedIds.get(`${harness}:${machine}`) ?? null, incoming);
+    if (!opts.loseArm && next) { // only genuinely changed committed evidence arms (a duplicate producer commit does not)
+      const armed = new Map(prevRow?.armed ?? []);
+      armed.set(machine, { ref: h.trigger_id, id: next });
       this.rows.set(harness, { state: planArm(prevRow?.state ?? null, this.now, this.brief(harness).ready, TIMING), armed, ...(prevRow?.claimed ? { claimed: prevRow.claimed } : {}) });
     }
     if (!opts.lose) this.send(h);
@@ -89,7 +98,7 @@ class Sim {
     for (const [harness, row] of [...this.rows]) {
       if (!hintCovers(h, { org: "org-1", workspace: "ws-1", harness, session: "sess-1" })) continue;
       const b = this.brief(harness);
-      const next = planHint(row.state, h, { nowMs: this.now, hasBrief: b.ready, timing: TIMING, armedRefs: row.armed });
+      const next = planHint(row.state, h, { nowMs: this.now, hasBrief: b.ready, timing: TIMING, armedRefs: this.armedRefs(harness) });
       if (next) row.state = next;
       if (row.state.leased) continue; // in flight: the generation decides the trailing work
       const at = this.claimable(harness, row.state);
@@ -108,7 +117,7 @@ class Sim {
     const row = this.rows.get(harness)!;
     this.runs.push({ harness, claimableAt: this.claimable(harness, row.state), claimedAt: this.now, generation: row.state.generation, dueAt: row.state.dueAt });
     row.state = claimPlan(row.state);
-    row.claimed = new Set(row.armed); // the arm record's claimed snapshot
+    row.claimed = new Map(row.armed); // the arm record's claimed snapshot
     this.inFlight.set(harness, { generation: row.state.generation });
     if (!hold) this.finish(harness);
   }
@@ -125,7 +134,11 @@ class Sim {
     }
     // The run read the authoritative pointers: it covers every revision committed so far.
     this.briefs.set(harness, { revision: this.committed.get(harness)!, ready: true, lastAttempt: this.now });
-    for (const r of row.claimed ?? []) { row.armed.delete(r); this.consumed.add(r); } // consumed := claimed
+    for (const [m, c] of row.claimed ?? []) { // consumed := claimed; the armed identity retires unless re-armed since
+      this.consumedIds.set(`${harness}:${m}`, c.id);
+      this.consumed.add(c.ref);
+      if (row.armed.get(m)?.ref === c.ref) row.armed.delete(m);
+    }
     delete row.claimed;
     const next = finishPlan(row.state, g, this.now, TIMING);
     if (next) row.state = next; else this.rows.delete(harness);
@@ -149,7 +162,8 @@ class Sim {
           this.lastSweep = this.now;
           for (const [harness, rev] of this.committed) // a lost arm: committed, uncovered, no wakeup
             if (!this.rows.has(harness) && rev > this.brief(harness).revision) {
-              this.rows.set(harness, { state: planArm(null, this.now, this.brief(harness).ready, TIMING), armed: new Set([hint("append", rev, T0, harness).trigger_id]) });
+              this.rows.set(harness, { state: planArm(null, this.now, this.brief(harness).ready, TIMING),
+                armed: new Map([[M1, { ref: hint("append", rev, T0, harness).trigger_id, id: { generation: "1", revision: rev, sha256: DIGEST, ended: false } }]]) });
               this.sweptAt.push(this.now);
             }
         }
@@ -368,6 +382,53 @@ describe("session-brief trigger: offline fixtures", () => {
     expect(sim.runs[1]!.claimedAt).toBe(sim.now);
   });
 
+  test("HOLD case: a delayed end for A after a live replacement B (same machine, revision 2) is wake-only; B's own end accelerates", () => {
+    const sim = new Sim();
+    sim.briefs.set("claude", { revision: 1, ready: true, lastAttempt: T0 - 600_000 }); // served revision 1
+    const A = sim.commit("claude", 2, { lose: true, digest: "a".repeat(64) }); // A: revision 2, digest A (not consumed)
+    sim.now += 30_000;
+    const B = sim.commit("claude", 2, { lose: true, generation: "2", digest: "b".repeat(64) }); // replaces A, same rev
+    const armed = { ...sim.rows.get("claude")!.state };
+    expect(sim.armedRefs("claude").has(A.trigger_id)).toBe(false); // A's identity was retired by the replacement
+    sim.now += 10_000;
+    sim.consume({ ...A, kind: "end" }); // the delayed end for the dead incarnation: ordinary wake only
+    expect(sim.rows.get("claude")!.state.dueAt).toBe(armed.dueAt); // B's refresh is NOT pulled from +600 s to now
+    expect(sim.runs).toHaveLength(0);
+    sim.consume({ ...B, kind: "end" }); // control: B's own (current) end accelerates
+    expect(sim.runs).toHaveLength(1);
+    expect(sim.runs[0]!.claimedAt).toBe(sim.now);
+  });
+
+  test("a confirmed current end accelerates even when another machine shares its numeric revision", () => {
+    const sim = new Sim();
+    sim.briefs.set("claude", { revision: 1, ready: true, lastAttempt: T0 - 600_000 });
+    sim.commit("claude", 2, { lose: true, machine: M2, digest: "c".repeat(64) }); // M2 also at revision 2
+    const m1 = sim.commit("claude", 2, { lose: true, machine: M1 });
+    sim.now += 10_000;
+    sim.consume({ ...m1, kind: "end" }); // M1's current end
+    expect(sim.runs).toHaveLength(1);
+  });
+
+  test("a duplicate producer commit cannot clear a backoff; genuinely new committed evidence re-arms (throttle still applies)", () => {
+    const sim = new Sim();
+    sim.briefs.set("claude", { revision: 0, ready: true, lastAttempt: T0 - 600_000 });
+    const A = sim.commit("claude", 1, { lose: true });
+    sim.failRuns = 1;
+    sim.now = sim.rows.get("claude")!.state.dueAt;
+    sim.claim("claude"); // fails: backoff
+    const backedOff = { ...sim.rows.get("claude")!.state };
+    expect(backedOff.backoff).toBe(true);
+    sim.now += 5_000;
+    sim.commit("claude", 1, { lose: true }); // the SAME commit again (a producer retry): no arm, backoff kept
+    expect(sim.rows.get("claude")!.state).toEqual(backedOff);
+    sim.consume(A);
+    expect(sim.rows.get("claude")!.state).toEqual(backedOff);
+    sim.commit("claude", 2, { lose: true }); // new committed evidence: re-arms
+    expect(sim.rows.get("claude")!.state.backoff).toBeUndefined();
+    // The refresh throttle still applies to its claim (the failed attempt counts as the last attempt).
+    expect(sim.claimable("claude", sim.rows.get("claude")!.state)).toBeGreaterThanOrEqual(sim.brief("claude").lastAttempt! + THROTTLE_S * 1_000);
+  });
+
   test("two machines with overlapping revisions: each machine's commit is its own reference; neither covers the other", () => {
     const sim = new Sim();
     sim.briefs.set("claude", { revision: 4, ready: true, lastAttempt: T0 - 600_000 });
@@ -377,7 +438,7 @@ describe("session-brief trigger: offline fixtures", () => {
     sim.now += 300_000;
     const m2 = sim.commit("claude", 5, { lose: true, machine: M2 }); // M2's revision 5 (different content, same number)
     expect(m2.trigger_id).not.toBe(m1.trigger_id);
-    expect(sim.rows.get("claude")!.armed.has(m2.trigger_id)).toBe(true);
+    expect(sim.armedRefs("claude").has(m2.trigger_id)).toBe(true);
     // The max brief_revision (5) would wrongly call M2 covered; the reference does not: M2's end advances.
     sim.consume({ ...m2, kind: "end" });
     expect(sim.runs).toHaveLength(2);
