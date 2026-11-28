@@ -93,6 +93,11 @@ no canonical object of its session. The probes run:
 - before the replays;
 - for one upload already in flight when the release commits.
 
+**The in-flight probe is ordered by a barrier, not by clocks.** The request's view of the store parks it at its first
+object-store call. That call is inside admission and comes before any claim or write. The harness waits until the
+request is parked, commits the release, then lets the request continue. Its outcome and its durable state are checked
+after it settles. The receipt records the barrier in `inflight_barrier`.
+
 There is no S3-side hold yet, so the named code set is empty and any S3 refusal also fails. Each failure has its own
 code:
 
@@ -111,8 +116,12 @@ this case with `unreplayedErasure`.
 **Exact reads.** Each session's single manifest is found under its exact prefix: org, workspace, the live machine of
 (origin, user), harness and `s=<session>`. Its records are read with the read API's canonical reader
 (`readManifestRecords`), which fetches every chunk and verifies its digest. They are then compared with what was
-uploaded: the same record ids, the expected revision and the exact payload text. HTTP reads through
-session-read-api are not covered yet.
+uploaded: the same record ids, the operation, the expected revision and the exact payload text. Erased content must
+be absent in two ways:
+- no manifest under the org names an erased session or a session of an erased user;
+- no surviving manifest holds an erased session's record ids.
+
+Otherwise the step fails with `erased_records_present`. HTTP reads through session-read-api are not covered yet.
 
 **Timeline.** Each boundary is recorded on its own:
 - the install commit and the release commit, both `installed_at` / `released_at` on the database clock;
@@ -120,9 +129,14 @@ session-read-api are not covered yet.
 - the first admission after the release.
 
 Two durations come from these:
-- `observed_bound_ms`, from the install commit to the first S3 admission's answer. It bounds the observed downtime.
+- `observed_upper_bound_ms`, from the install commit to the first successful S3 answer. It is an observed upper bound
+  on the downtime, not a measurement of when admission reopened.
 - `through_release_ms`, from the install commit to the release commit. A blocked release has no release commit and
   no resumption.
+
+**Receipts** also carry:
+- `first_failure`: the first step that did not pass, with its first failing assertion;
+- `uncovered`: every pending adapter and every check not built yet, such as HTTP serving reads and search rows.
 
 **Verdict.** The run is QUALIFIED only when all of these hold:
 - every step passes;

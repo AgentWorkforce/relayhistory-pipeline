@@ -28,12 +28,14 @@ describe("synthetic per-org cutover qualification (PGlite)", () => {
     const r = await runCutoverQualification({ size: SIZE_CI });
     expect(statuses(r)).toEqual({ ...THROUGH_MARKER, release: "BLOCKED erasure_generation_unproven", admission: "SKIP", publication: "SKIP", reads: "SKIP" });
     expect(r.verdict).toBe("NOT_QUALIFIED");
+    expect(r.first_failure).toMatchObject({ step: "marker.verify", code: "s3_admits_before_bridge_complete" });
+    expect(r.uncovered.some((u) => u.includes("HTTP serving"))).toBe(true);
     expect(r.reasons).toContain(`backend: pglite+fs is not the qualification backend (${QUALIFICATION_BACKEND})`);
     // A blocked release has no release commit and no resumption; the S3 admission bounds the observed downtime.
     expect(r.timeline.release_committed_ms).toBeNull();
     expect(r.timeline.first_admit_after_release_started_ms).toBeNull();
     expect(r.downtime.through_release_ms).toBeNull();
-    expect(r.downtime.observed_bound_ms).toBeGreaterThan(0);
+    expect(r.downtime.observed_upper_bound_ms).toBeGreaterThan(0);
     expect(r.timeline.first_s3_admit_started_ms!).toBeGreaterThan(r.timeline.install_committed_ms!);
     // Every SQL upload during the hold refused RH042; every S3 probe after the marker accepted (today).
     expect(r.uploads.filter((u) => u.path === "sql" && u.step !== "seed").every((u) => u.outcome === "RH042")).toBe(true);
@@ -50,11 +52,12 @@ describe("synthetic per-org cutover qualification (PGlite)", () => {
     const r = await runCutoverQualification({ size: SIZE_CI, erasures: "empty" });
     expect(statuses(r)).toEqual({ ...THROUGH_MARKER, release: S3_OPEN, admission: "PASS", publication: "FAIL publication_not_exercised", reads: "FAIL old_events_not_canonical" });
     expect(r.erasures.history_since_install).toEqual({});
-    const inflight = r.uploads.find((u) => u.step === "release.inflight")!;
-    expect(inflight.startedMs).toBeLessThan(r.timeline.release_committed_ms!);
-    expect(inflight.outcome).toBe("accepted");
+    // Deterministic ordering: the in-flight writer was parked inside admission before the release committed.
+    expect(r.inflight_barrier!.reached_ms).not.toBeNull();
+    expect(r.inflight_barrier!.reached_ms!).toBeLessThanOrEqual(r.inflight_barrier!.release_committed_ms!);
+    expect(r.uploads.find((u) => u.step === "release.inflight")!.outcome).toBe("accepted");
     expect(r.timeline.first_s3_admit_accepted_ms!).toBeLessThan(r.timeline.release_committed_ms!);
-    expect(r.downtime.observed_bound_ms!).toBeLessThan(r.downtime.through_release_ms!);
+    expect(r.downtime.observed_upper_bound_ms!).toBeLessThan(r.downtime.through_release_ms!);
     expect(r.verdict).toBe("NOT_QUALIFIED");
   });
 

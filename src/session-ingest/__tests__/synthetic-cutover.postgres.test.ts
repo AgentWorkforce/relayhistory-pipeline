@@ -52,18 +52,22 @@ describe.skipIf(!pgUrl || !s3)("synthetic per-org cutover on PostgreSQL + MinIO"
     expect(r.backend).toMatch(/^pg1[5-9]\+minio$/);
     expect(statuses(r)).toEqual({ ...THROUGH_MARKER, release: "BLOCKED erasure_generation_unproven", admission: "SKIP", publication: "SKIP", reads: "SKIP" });
     expect(r.verdict).toBe("NOT_QUALIFIED");
+    expect(r.first_failure).toMatchObject({ step: "marker.verify", code: "s3_admits_before_bridge_complete" });
+    expect(r.uncovered.some((u) => u.includes("HTTP serving"))).toBe(true);
     expect(r.timeline.release_committed_ms).toBeNull();
     expect(r.timeline.first_admit_after_release_started_ms).toBeNull();
-    expect(r.downtime.observed_bound_ms).toBeGreaterThan(0);
+    expect(r.downtime.observed_upper_bound_ms).toBeGreaterThan(0);
   });
 
   test("empty window: release commits through the stand-in bridge with an upload in flight still admitted", async () => {
     const r = await run({ erasures: "empty" });
     expect(statuses(r)).toEqual({ ...THROUGH_MARKER, release: S3_OPEN, admission: "PASS", publication: "FAIL publication_not_exercised", reads: "FAIL old_events_not_canonical" });
     expect(r.erasures.history_since_install).toEqual({});
-    const inflight = r.uploads.find((u) => u.step === "release.inflight")!;
-    expect(inflight.startedMs).toBeLessThan(r.timeline.release_committed_ms!);
-    expect(r.downtime.observed_bound_ms!).toBeLessThan(r.downtime.through_release_ms!);
+    // Deterministic ordering: the in-flight writer was parked inside admission before the release committed.
+    expect(r.inflight_barrier!.reached_ms).not.toBeNull();
+    expect(r.inflight_barrier!.reached_ms!).toBeLessThanOrEqual(r.inflight_barrier!.release_committed_ms!);
+    expect(r.uploads.find((u) => u.step === "release.inflight")!.outcome).toBe("accepted");
+    expect(r.downtime.observed_upper_bound_ms!).toBeLessThan(r.downtime.through_release_ms!);
     expect(r.verdict).toBe("NOT_QUALIFIED");
   });
 

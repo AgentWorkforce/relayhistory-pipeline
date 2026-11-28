@@ -77,11 +77,17 @@ export interface CutoverReport {
   timeline: { install_committed_ms: number | null; first_s3_admit_started_ms: number | null; first_s3_admit_accepted_ms: number | null;
     release_committed_ms: number | null; first_admit_after_release_started_ms: number | null };
   /**
-   * observed_bound_ms: install commit -> the first S3 admission's answer: the org's admission was closed for at most
-   * this long (the observed downtime's bound). through_release_ms: install commit -> release commit (the stated
-   * order's window; null when the release never committed, e.g. blocked).
+   * observed_upper_bound_ms: install commit -> the first successful S3 admission's answer. An OBSERVED UPPER BOUND on
+   * the org's admission downtime (it reopened no later than that answer), not a measurement of when it reopened.
+   * through_release_ms: install commit -> release commit (the stated order's window; null when it never committed).
    */
-  downtime: { observed_bound_ms: number | null; through_release_ms: number | null };
+  downtime: { observed_upper_bound_ms: number | null; through_release_ms: number | null };
+  /** The in-flight probe's barrier: parked at its first store call (reached) before the release committed. */
+  inflight_barrier: { reached_ms: number | null; release_committed_ms: number | null; store_ops_after_release: number } | null;
+  /** The first non-PASS step and its first failing assertion (for the implementation owners). */
+  first_failure: { step: string; status: StepStatus; code: string | null; assertion: string | null } | null;
+  /** What this run does not cover, stated in every receipt (pending adapters and unbuilt checks). */
+  uncovered: string[];
   uploads: UploadEvent[];
   erasures: { before_hold: Record<string, number>; during_hold: Record<string, number>; history_since_install: Record<string, number> | null };
   integration: Record<string, { head: string; integration: string; todo: string | null }>;
@@ -162,12 +168,13 @@ export async function runCutoverQualification(opts: RunOptions = {}): Promise<Cu
   let liveSeq = 0;
 
   /** One upload on a path; refused ones are queued for the retry after release. */
-  async function upload(stepId: string, path: "sql" | "s3", spec: Omit<UploadSpec, "raw"> & { raw?: unknown }): Promise<UploadEvent> {
+  async function upload(stepId: string, path: "sql" | "s3", spec: Omit<UploadSpec, "raw"> & { raw?: unknown; via?: ObjectStore }): Promise<UploadEvent> {
     const raw = spec.raw ?? await fx.rawBatch(spec.u, spec.session, spec.origin, spec.batchId, spec.revision, spec.records, spec.payloadBytes);
-    const full: UploadSpec = { ...spec, raw };
+    const { via, ...rest } = spec;
+    const full: UploadSpec = { ...rest, raw };
     specs.set(spec.session, full);
     const startedMs = Date.now();
-    const r = await fx.attempt(() => (path === "sql" ? fx.deliverSql(spec.u, raw) : fx.deliverS3(spec.u, raw)));
+    const r = await fx.attempt(() => (path === "sql" ? fx.deliverSql(spec.u, raw) : fx.deliverS3(spec.u, raw, via)));
     const endedMs = Date.now();
     const outcome = r.ok ? String(r.result.outcome) : r.code;
     if (!r.ok) queued.push(full);
@@ -185,6 +192,28 @@ export async function runCutoverQualification(opts: RunOptions = {}): Promise<Cu
       out.push(await upload(stepId, path, { u, origin: originsOf(u)[0]!, batchId: `live-b-${n}`, session: `live-${String(u).padStart(3, "0")}-${String(n).padStart(4, "0")}`, records: 3, revision: 2, payloadBytes: 128 }));
     }
     return out;
+  }
+  /**
+   * A deterministic barrier for one request: a view of the store whose FIRST call (any operation: the request's first
+   * object-store step of admission, before any claim or write) signals `reached` and then waits for `open()`. The
+   * harness commits the release while the request is parked inside admission, then lets it go: the ordering
+   * "writer in the admission path before the release committed" is established by the barrier, not by clocks.
+   */
+  function barrierStore(): { store: ObjectStore; reached: Promise<number>; open: () => void; ops: () => number } {
+    let reach!: (ms: number) => void, release!: () => void, n = 0;
+    const reached = new Promise<number>((r) => { reach = r; });
+    const gate = new Promise<void>((r) => { release = r; });
+    const store = new Proxy(fx.store, {
+      get(target, prop, recv) {
+        const v = Reflect.get(target, prop, recv);
+        if (typeof v !== "function") return v;
+        return async (...args: unknown[]) => {
+          if (n++ === 0) { reach(Date.now()); await gate; }
+          return (v as (...a: unknown[]) => unknown).apply(target, args);
+        };
+      },
+    }) as ObjectStore;
+    return { store, reached, open: release, ops: () => n };
   }
   const exists = async (key: string) => {
     try { await readAll(await fx.store.get(objectKey(key))); return true; }
@@ -273,6 +302,7 @@ export async function runCutoverQualification(opts: RunOptions = {}): Promise<Cu
   let epoch = "", fullStartedMs = 0, fullReceipt = "", catchupCreatedMs = 0, catchupReceipt = "";
   let full: BackfillSummary | null = null;
   let drainAlreadyStored = 0, drainWritten = 0;
+  let inflightBarrier: { reached_ms: number | null; release_committed_ms: number | null; store_ops_after_release: number } | null = null;
   const sizeOut = { ...size, batches: 0, records: 0, sessions: 0, staged_bytes: 0, buffered_stages: 0 };
 
   try {
@@ -476,19 +506,28 @@ export async function runCutoverQualification(opts: RunOptions = {}): Promise<Cu
       }
       must(receipts.length === replay.length, "erasure_unreceipted");
       const again = (await fx.one<{ s: any }>("SELECT sessions.ingest_org_admission_hold_status($1) s", [ORG])).s;
-      // A direct upload already in flight when the release commits: it started before the commit, so it must be refused.
+      // A direct upload already in flight when the release commits. Deterministic ordering: the request is parked at a
+      // barrier on its first object-store call (inside admission, before any claim or write); the release commits
+      // while it waits; then it is let go. It must end in the named hold refusal with no durable write, inspected
+      // after it settles.
       const n = liveSeq++, u = PLAN.live[0], session = `live-${String(u).padStart(3, "0")}-${String(n).padStart(4, "0")}`;
-      const raw = await fx.rawBatch(u, session, originsOf(u)[0]!, `live-b-${n}`, 2, 3, 128); // prepared first: sent before the release starts
-      const inflight = upload("release.inflight", "s3", { u, origin: originsOf(u)[0]!, batchId: `live-b-${n}`, session, records: 3, revision: 2, payloadBytes: 128, raw });
+      const raw = await fx.rawBatch(u, session, originsOf(u)[0]!, `live-b-${n}`, 2, 3, 128);
+      const bar = barrierStore();
+      const inflight = upload("release.inflight", "s3", { u, origin: originsOf(u)[0]!, batchId: `live-b-${n}`, session, records: 3, revision: 2, payloadBytes: 128, raw, via: bar.store });
+      let reachedMs: number | null = null;
       try {
+        reachedMs = await Promise.race([bar.reached, new Promise<null>((r) => setTimeout(() => r(null), 30_000))]);
+        must(reachedMs !== null, "inflight_barrier_not_reached", "the in-flight upload never reached the store within 30 s");
         await heads.bridgeRelease.run(ctx, epoch, { erasures: Number(again.erasures), receipts, evidenceSha256: sha(JSON.stringify(receipts.map((r) => r.hash))),
           detail: scenario === "empty" ? "erasure_window_empty" : null });
+        const committed = (await fx.one<{ s: any }>("SELECT sessions.ingest_org_admission_hold_status($1) s", [ORG])).s;
+        if (committed.hold?.state === "released") releaseCommittedMs = Date.parse(committed.hold.released_at);
       } finally {
+        bar.open();
         const ev = await inflight;
-        const after = (await fx.one<{ s: any }>("SELECT sessions.ingest_org_admission_hold_status($1) s", [ORG])).s;
-        if (after.hold?.state === "released") releaseCommittedMs = Date.parse(after.hold.released_at);
-        obs.push(`in-flight upload: started ${releaseCommittedMs === null ? "?" : ev.startedMs - releaseCommittedMs} ms vs release commit, ${ev.outcome}`);
-        if (releaseCommittedMs === null || ev.startedMs < releaseCommittedMs) await checkS3Closed([ev], fail, obs);
+        inflightBarrier = { reached_ms: reachedMs, release_committed_ms: releaseCommittedMs, store_ops_after_release: bar.ops() - (reachedMs === null ? 0 : 1) };
+        obs.push(`in-flight upload: parked at the barrier before the release (${reachedMs === null ? "not reached" : "reached"}), release ${releaseCommittedMs === null ? "not committed" : "committed while parked"}, then ${ev.outcome}`);
+        await checkS3Closed([ev], fail, obs);
       }
       const after = (await fx.one<{ s: any }>("SELECT sessions.ingest_org_admission_hold_status($1) s", [ORG])).s;
       must(after.hold.state === "released" && after.hold.release_reason === "bridge_complete", "not_released");
@@ -538,7 +577,7 @@ export async function runCutoverQualification(opts: RunOptions = {}): Promise<Cu
         if (got.size !== records || rows.length !== records) return "mismatch";
         for (let k = 0; k < records; k++) {
           const r: any = got.get(`${session}-r${String(k).padStart(4, "0")}`);
-          if (!r || String(r.revision) !== String(revision) || r.payload?.text !== text(payloadBytes, `${session}/${k}/${revision}`)) return "mismatch";
+          if (!r || r.operation !== "upsert" || String(r.revision) !== String(revision) || r.payload?.text !== text(payloadBytes, `${session}/${k}/${revision}`)) return "mismatch";
         }
         return "exact";
       };
@@ -555,6 +594,23 @@ export async function runCutoverQualification(opts: RunOptions = {}): Promise<Cu
       if (old.missing + old.mismatch > 0) obs.push(`the drain wrote no canonical line for backlog whose owned lazy slots the FULL put in the S3 index with their digest (drain lines already_stored ${drainAlreadyStored}, written ${drainWritten})`);
       const late = specs.get(`late-${String(PLAN.sealedUserErase).padStart(3, "0")}`);
       if (late) obs.push(`the erased user's upload accepted before its replay, after the release: ${await exact(late.u, late.origin, late.session, late.records, late.revision, late.payloadBytes)} (generation boundary: the head decides)`);
+      // Erased content absent: no manifest anywhere under the org names an erased session or a session of an erased user,
+      // and no surviving manifest carries an erased session's record ids.
+      const erasedUsers = [PLAN.preUserErase, ...(scenario === "injected" ? [PLAN.sealedUserErase] : [])];
+      const erasedSess = [sessionOf(...PLAN.preSelection), sessionOf(...PLAN.preSessionFence),
+        ...(scenario === "injected" ? [sessionOf(...PLAN.heldSelection), sessionOf(...PLAN.sealedSessionFence)] : []),
+        ...erasedUsers.flatMap((u) => Array.from({ length: size.sessionsPerUser }, (_, s2) => sessionOf(u, s2)))];
+      const allManifests = (await listAll(fx.store, `${KEY_ROOT}/${ORG}`)).filter((k) => k.endsWith("/manifest.json"));
+      const named = allManifests.filter((k) => erasedSess.some((x) => k.includes(`/s=${x}/`)));
+      let leaked = 0;
+      for (const mk of allManifests) {
+        if (named.includes(mk)) continue;
+        const manifest = JSON.parse(new TextDecoder().decode(await readAll(await fx.store.get(objectKey(mk)))));
+        const rows = await readManifestRecords(manifest, fx.store, mk.slice(0, mk.indexOf("/v1/")), decompress);
+        leaked += rows.filter((r: any) => erasedSess.some((x) => String(r.record_id).startsWith(`${x}-r`))).length;
+      }
+      obs.push(`erased sessions with a manifest: ${named.length}; erased records inside surviving manifests: ${leaked}`);
+      if (named.length > 0 || leaked > 0) fail("erased_records_present", `${named.length} erased session manifest(s), ${leaked} erased record(s) in surviving sessions`);
       must(admitted.length > 0 && fresh.exact === admitted.length, "new_events_not_exact");
       if (old.exact === 0 || old.missing + old.mismatch > 0) fail("old_events_not_canonical", `old sessions not readable exactly: ${old.missing} missing, ${old.mismatch} mismatched`);
       // TODO(read API): the same reads over HTTP (/v1/sessions/:id/events) on the compose stack.
@@ -574,8 +630,15 @@ export async function runCutoverQualification(opts: RunOptions = {}): Promise<Cu
     simulated: opts.simulatePending === true, backend: fx.kind, scenario, size: sizeOut, steps,
     timeline: { install_committed_ms: installMs, first_s3_admit_started_ms: fs3?.startedMs ?? null, first_s3_admit_accepted_ms: fs3?.endedMs ?? null,
       release_committed_ms: releaseCommittedMs, first_admit_after_release_started_ms: firstAfterRelease },
+    inflight_barrier: inflightBarrier,
+    first_failure: ((f) => f ? { step: f.id, status: f.status, code: f.code ?? null, assertion: f.observed.find((o) => /^[a-z0-9_]+: /.test(o) || o.startsWith("head pending")) ?? f.observed.at(-1) ?? null } : null)(steps.find((x) => x.status !== "PASS")),
+    uncovered: [
+      ...Object.entries(heads).filter(([, a]) => a.integration === "pending").map(([k, a]) => `adapter ${k} pending (${a.head})`),
+      "HTTP serving reads (session-read-api /v1/sessions/:id/events) not exercised; reads use the read API's canonical reader in process",
+      "search_index rows after publication not checked (publication adapter pending)",
+    ],
     downtime: {
-      observed_bound_ms: installMs !== null && fs3 ? fs3.endedMs - installMs : null,
+      observed_upper_bound_ms: installMs !== null && fs3 ? fs3.endedMs - installMs : null,
       through_release_ms: installMs !== null && releaseCommittedMs !== null ? releaseCommittedMs - installMs : null,
     },
     uploads, erasures: { before_hold: before, during_hold: during, history_since_install: historySinceInstall },
@@ -595,7 +658,10 @@ export function reportMarkdown(r: CutoverReport): string {
     `Timeline (ms after the install commit): first S3 admission ${r.timeline.first_s3_admit_accepted_ms === null ? "none" : r.timeline.first_s3_admit_accepted_ms - r.timeline.install_committed_ms!}` +
       `; release committed ${r.timeline.release_committed_ms === null ? "never" : r.timeline.release_committed_ms - r.timeline.install_committed_ms!}` +
       `; first admission after release ${r.timeline.first_admit_after_release_started_ms === null ? "none" : r.timeline.first_admit_after_release_started_ms - r.timeline.install_committed_ms!}.`,
-    `Observed downtime bound (install commit -> first S3 admission): ${r.downtime.observed_bound_ms ?? "n/a"} ms. Install -> release commit: ${r.downtime.through_release_ms ?? "n/a (not released)"} ms.`,
+    `Observed UPPER BOUND on admission downtime (install commit -> first successful S3 answer): ${r.downtime.observed_upper_bound_ms ?? "n/a"} ms. Install -> release commit: ${r.downtime.through_release_ms ?? "n/a (not released)"} ms.`,
+    `First failure: ${r.first_failure ? `${r.first_failure.step} ${r.first_failure.status} ${r.first_failure.code ?? ""}: ${r.first_failure.assertion ?? ""}` : "none"}.`,
+    `In-flight barrier: ${JSON.stringify(r.inflight_barrier)}.`,
+    `Not covered: ${r.uncovered.join("; ")}.`,
     `Wall clock: ${r.wall_ms} ms.`, ``,
     `Uploads: ${r.uploads.length} (${r.uploads.filter((u) => u.queued).length} refused and queued).`,
     `Erasures before the hold ${JSON.stringify(r.erasures.before_hold)}, during ${JSON.stringify(r.erasures.during_hold)}, history since install ${JSON.stringify(r.erasures.history_since_install)}.`, ``,

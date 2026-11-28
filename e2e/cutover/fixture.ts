@@ -23,6 +23,7 @@ import { batch, record } from "../../src/session-ingest/__tests__/support.ts";
 import { epoch, generation, identity } from "../../src/session-ingest/__tests__/privacy-authority-support.ts";
 import { pgliteBackend, type Backend } from "./backend.ts";
 import type { LedgerTenant } from "../../src/session-ingest/ledger.ts";
+import type { ObjectStore } from "../../src/shared/vendor.ts";
 
 export const KEY_ROOT = "96bulls";
 export const ORG = "org-synth-cutover";
@@ -100,8 +101,10 @@ export async function openFixture(backend?: Backend) {
     return deliverBatch({ ...sqlDeps, ledger: sqlLed, custody: await witness(t, raw) } as never, t, raw);
   }
   /** Through the S3 ledger with the per-org fence authority required (the 0005 consumer after the marker). */
-  async function deliverS3(u: number, raw: any): Promise<DeliverResult> {
-    return deliverBatch({ ledger: s3Led, acceptanceMode: "canonical", target: { store, keyRoot: KEY_ROOT } } as never, tenantOf(u), raw);
+  async function deliverS3(u: number, raw: any, via?: ObjectStore): Promise<DeliverResult> {
+    // `via`: this one request's view of the store (the harness's barrier store); the ledger and the writer both use it.
+    const led = via ? s3Ledger(via, KEY_ROOT, { acceptanceMode: "canonical", fenceAuthority: "required" }) : s3Led;
+    return deliverBatch({ ledger: led, acceptanceMode: "canonical", target: { store: via ?? store, keyRoot: KEY_ROOT } } as never, tenantOf(u), raw);
   }
 
   const one = async <T = Record<string, any>>(q: string, p: unknown[] = []) => (await db.query<T>(q, p)).rows[0]!;
