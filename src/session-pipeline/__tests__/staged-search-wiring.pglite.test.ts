@@ -117,11 +117,11 @@ async function rig(x: ExportedScope) {
     (await adapter.index.scanFingerprints({ ...tenantOf, source: SCOPE.harness, sessionIds: [SCOPE.sessionId, x.canonicalId] }, { fromMs: 0, limit: 100_000 })).rows
       .map((r) => JSON.stringify([r.sessionId, r.machineId, r.kind, r.eventId, r.tsMs, r.fingerprint]))
       .sort();
-  /** The directory row of the scope, without its clock columns. */
+  /** The directory row of the scope, without its clock columns or its per-database session binding (062380). */
   const directory = async () =>
     (await hoop.pg.query<{ d: Record<string, unknown> }>(
       "SELECT to_jsonb(d) AS d FROM sessions.session_directory d WHERE org_id=$1 AND workspace_id=$2 AND harness=$3", [SCOPE.orgId, SCOPE.workspaceId, SCOPE.harness])).rows
-      .map((r) => Object.fromEntries(Object.entries(r.d).filter(([k]) => !/(_at|_epoch)$/.test(k))));
+      .map((r) => Object.fromEntries(Object.entries(r.d).filter(([k]) => !/(_at|_epoch)$|^session_binding_/.test(k))));
   const runs = async () => (await hoop.pg.query<{ n: number }>("SELECT count(*)::int n FROM sessions.search_reconcile_runs_v1")).rows[0]!.n;
   const staged = async () => (await hoop.pg.query<{ n: number }>("SELECT count(*)::int n FROM sessions.search_reconcile_stage_v1")).rows[0]!.n;
   const expire = () => hoop.pg.exec("UPDATE sessions.search_reconcile_runs_v1 SET lease_expires_at = clock_timestamp() - interval '1 second'");

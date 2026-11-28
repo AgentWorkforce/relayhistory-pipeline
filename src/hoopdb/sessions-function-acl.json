@@ -1702,6 +1702,13 @@
       "<owner>:EXECUTE",
       "session_directory_search_worker:EXECUTE"
     ],
+    "sessions.session_directory_binding()": [
+      "<owner>:EXECUTE"
+    ],
+    "sessions.session_directory_bindings_for(text,text[],text[])": [
+      "<owner>:EXECUTE",
+      "bulls96_read_api:EXECUTE"
+    ],
     "sessions.session_directory_companions_follow()": [
       "<owner>:EXECUTE"
     ],

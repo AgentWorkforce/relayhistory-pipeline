@@ -35,6 +35,9 @@ const CUSTOM_PLANS_DOWN = read("supabase/rollbacks/20261105062330_buffered_searc
 // 20261105062350 (the buffered feed page keyset) sits above 062340: its down runs before everything else.
 const PAGE_KEYSET_STEP = "upstream:20261105062350_buffered_search_feed_page_keyset.sql";
 const PAGE_KEYSET_DOWN = read("supabase/rollbacks/20261105062350_buffered_search_feed_page_keyset.down.sql");
+// 20261105062380 (the session binding) sits above 062350: its down runs before everything else.
+const BINDING_STEP = "upstream:20261105062380_session_directory_binding.sql";
+const BINDING_DOWN = read("supabase/rollbacks/20261105062380_session_directory_binding.down.sql");
 // 20261105062340 (the per-org erasure history) sits above 062330: its down runs before 062330's.
 const HISTORY_STEP = "upstream:20261105062340_ingest_org_erasure_history.sql";
 const HISTORY_DOWN = read("supabase/rollbacks/20261105062340_ingest_org_erasure_history.down.sql");
@@ -153,7 +156,7 @@ describe("20261105062220 coordination advisories: the advisory instance", () => 
     expect(SQL).not.toMatch(/ADD COLUMN incarnation uuid[^;]*DEFAULT/i);
     // Before: roll 062220 back, write pending, delivered and acked rows through 062000's v1, then re-apply 062220.
     await reset();
-    await db.exec(PAGE_KEYSET_DOWN);    await db.exec(HISTORY_DOWN);
+    await db.exec(BINDING_DOWN); await db.exec(PAGE_KEYSET_DOWN);    await db.exec(HISTORY_DOWN);
     await db.exec(CUSTOM_PLANS_DOWN);
     await db.exec(HOLD_DOWN);
     await db.exec(SEARCH_STAGE_DOWN);
@@ -359,9 +362,9 @@ describe("20261105062220 rollback", () => {
     const h = harness(() => db);
     const message = async (sql: string) => { const m = await db.exec(sql).then(() => null, (e: Error) => e.message); await db.exec("ROLLBACK").catch(() => {}); return m; };
     try {
-      expect((await plan(LOCAL)).filter((s) => s.name.startsWith("upstream:") && s.name > STEP).map((s) => s.name)).toEqual([SEARCH_STAGE_STEP, HOLD_STEP, CUSTOM_PLANS_STEP, HISTORY_STEP, PAGE_KEYSET_STEP]);
+      expect((await plan(LOCAL)).filter((s) => s.name.startsWith("upstream:") && s.name > STEP).map((s) => s.name)).toEqual([SEARCH_STAGE_STEP, HOLD_STEP, CUSTOM_PLANS_STEP, HISTORY_STEP, PAGE_KEYSET_STEP, BINDING_STEP]);
       expect(await message(DOWN)).toContain("a later migration is applied");
-      await db.exec(PAGE_KEYSET_DOWN);
+      await db.exec(BINDING_DOWN); await db.exec(PAGE_KEYSET_DOWN);
       await db.exec(HISTORY_DOWN);
       await db.exec(CUSTOM_PLANS_DOWN);
       await db.exec(HOLD_DOWN);

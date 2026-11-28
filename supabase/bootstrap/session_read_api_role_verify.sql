@@ -152,6 +152,7 @@ BEGIN
          'sessions.session_brief_summary_for(text,text,text)',
          'sessions.session_brief_titles_for(text,text[],text[])',
          'sessions.session_directory_activity_for(text,timestamp with time zone,timestamp with time zone)',
+         'sessions.session_directory_bindings_for(text,text[],text[])',
          'sessions.session_directory_users_for(text,timestamp with time zone,timestamp with time zone,integer)',
          'sessions.session_intel_workspace_alerts_v1(text,text,integer)',
          'sessions.session_intel_workspace_claims_v1(text,text,text[],integer)',

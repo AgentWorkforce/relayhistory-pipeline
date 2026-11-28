@@ -605,6 +605,64 @@ adds `--var READ_API_LIST_READINESS_ENABLED:true`; off (the default) renders no 
 Hosted Lambda: `transcriptStore.sessionReadApi.listReadiness: true` renders the variable; absent, the env is
 unchanged.
 
+### Session bindings (`GET /v1/session-bindings`, `READ_API_SESSION_BINDINGS_ENABLED`, default off)
+
+A logical session is keyed `(org, workspace, source, sessionId)`, and that key is not an incarnation: a session that
+is tombstoned and later comes back as a genuinely new upload, or whose directory row is re-created, reuses the key
+for different content. A consumer that attaches anything to a session (Cloud's project assignment for the Skip Mac
+app is the first) needs an id that names exactly one incarnation. Migration
+`20261105062380_session_directory_binding.sql` issues one.
+
+**What the pipeline issues.** Three columns on `sessions.session_directory`, written only by the trigger
+`zz_session_directory_binding` (BEFORE INSERT OR UPDATE, named to run after every other BEFORE trigger so it sees the
+final `deleted_at`; any value a caller writes is overwritten):
+
+- `session_binding_id` (uuid): the incarnation's id, never reused;
+- `session_binding_revision` (bigint): drawn from one owner-only sequence at every mint, so a later binding of the
+  same session always has a strictly greater revision, even after a hard delete and re-creation of the row;
+- `session_binding_created_at`: when it was issued. Informational, never an order.
+
+**When a binding changes.** The existing directory lifecycle decides, nothing client-supplied:
+
+| Event | Binding |
+| --- | --- |
+| First projection of a session (a new directory row) | minted |
+| Retry, re-sent or new pointer revision, reprojection, catalog or summary write | kept, exactly |
+| Tombstone (no live pointer left) | retired: kept on the row, never served |
+| Hidden as turn-only (only a turns-origin pointer live, 20261105062020) | retired, as a tombstone |
+| Any tombstone or hidden row becoming live again (including turn-only -> visible) | new id, greater revision: deliberate, so a consumer re-confirms rather than carries anything across the gap |
+| Re-sent revision at or below the machine's resurrection fence | stays retired (the projector does not revive the row) |
+| Genuinely new revision above the fence, or a machine with no fence (decision 0002) | new id, greater revision |
+| Hard delete (operator tooling only: `eraseSessionDirectory`, the legacy re-projection) then re-creation | new id, greater revision |
+| Operator erasure (`session_erasure_fences`, 20261105050000) | retired for good: the 050010 guards drop every later pointer and directory write |
+| Concurrent first projections | one id: the loser of the primary-key insert takes ON CONFLICT DO UPDATE, whose BEFORE UPDATE keeps the winner's id |
+| A live row written before 062380 | no binding until its next directory write mints one; absent from the reader until then, which a consumer treats as "not bound" (fail closed) |
+
+What this does **not** decide: whether a first-seen record arriving after a tombstone is old work or a new upload.
+That is the projector's existing rule; this migration adds no ingest evidence. It guarantees only that nothing keyed
+on a binding crosses an incarnation boundary as the directory draws it: such a record lands under a new binding,
+never the retired one.
+
+**The route.** `GET /v1/session-bindings?workspace=<ws>&session=<source>:<sessionId>` (repeated, 1 to 200; split at
+the first `:`; duplicates answered once) answers `{"bindings": [{source, sessionId, sessionBindingId,
+bindingRevision, bindingCreatedAt}]}`, ordered by source then session id, through
+`sessions.session_directory_bindings_for` (SECURITY DEFINER, the directory list's read-role tenant scope, EXECUTE for
+`bulls96_read_api` only). A session that is tombstoned, erased, unknown, outside the caller's workspace or not yet
+bound is absent. `bindingRevision` is a decimal string. Off unless the flag is exactly `true` (Lambda, self-host
+service and Worker alike): otherwise 501 `session_bindings_not_enabled`. Not migrated: 501
+`session_bindings_not_migrated`. Any other parameter: 501 `param_<name>`; a malformed `session`: 400.
+
+**The consumer's rule.** Store `(workspaceId, sessionBindingId, bindingRevision)`, never the session key alone. On
+every read, load what you stored, then ask this route for the session and compare the exact id and revision. Fail
+closed on absence, a difference, a timeout or any error. Each call is one read-only transaction, so that comparison
+is the read's linearization point: a read that starts after a tombstone commits never sees the retired binding; one
+that overlapped it may complete with the snapshot it took. Accepting a write (for example a conditional assignment
+in the consumer's own store) never proves that a binding is live; only this read does.
+
+**Who owns what.** The pipeline issues and retires bindings (this section). Assignment, revocation and caller
+filtering belong to the consumer (Cloud's T60 design). Project hints in the session list (`projectId`,
+`catalog.projectKey`, `project_name`) are client-reported evidence, never an identity.
+
 ## 9. Session analysis on the Worker (lane F1, `READ_API_ANALYSIS_ENABLED`, default off)
 
 The analysis contract (`GET` / `POST /v1/sessions/:sessionId/analysis`, `src/session-read-api/app.ts`, migration `20261105046000`) was wired only on the hosted Lambda (`lambda.ts`, `sqlAnalysisSource`). The Worker now wires the same `AnalysisDeps` (`packages/session-read-worker/src/index.ts` `analysisDeps`), behind one flag. This is a different lane from `/v1/canonical/analyses/` (`analysis-cache.ts`), which is unchanged.

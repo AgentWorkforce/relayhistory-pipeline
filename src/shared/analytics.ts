@@ -69,6 +69,7 @@ export const READ_ROUTES: ReadonlySet<string> = new Set([
   "/v1/sessions/output",
   "/v1/sessions/titles",
   "/v1/sessions/users",
+  "/v1/session-bindings",
   "/v1/sessions/:sessionId/events",
   "/v1/sessions/:sessionId/timing",
   "/v1/sessions/:sessionId/turns",

@@ -131,6 +131,20 @@ export interface Directory {
    * limit + 1 rows ordered by sessions desc, user id. Absent: this backend cannot answer.
    */
   users?(orgId: string, workspaceId: string, lastTsAfter: Date, lastTsBefore: Date, limit: number): Promise<DirectoryUserRow[] | null>;
+  /**
+   * The live binding (062380) of each key that has one, 1..DIRECTORY_BINDINGS_MAX keys; a tombstoned, unknown or
+   * not yet minted key is absent. Absent method: this backend cannot answer.
+   */
+  bindings?(orgId: string, workspaceId: string, keys: ReadonlyArray<{ harness: string; sessionId: string }>): Promise<DirectoryBindingRow[] | null>;
+}
+
+/** One sessions.session_directory_bindings_for row (bigint revision as text, as pg returns it). */
+export interface DirectoryBindingRow {
+  harness: string;
+  session_id: string;
+  session_binding_id: string;
+  session_binding_revision: string | number;
+  session_binding_created_at: Date | string;
 }
 
 /** A q list read: the list filters plus the parsed terms (their dates already intersected into lastTs*). */
@@ -229,6 +243,13 @@ export const DIRECTORY_USERS_MAX = 1000;
 export const DIRECTORY_USERS_SQL = `SELECT user_id, sessions, last_session_at, top_projects
   FROM sessions.session_directory_users_for($1, $2, $3, $4)`;
 
+export const BINDINGS_FOR_SIGNATURE = "sessions.session_directory_bindings_for(text, text[], text[])";
+/** The most keys GET /v1/session-bindings accepts (the function's 1..200). */
+export const DIRECTORY_BINDINGS_MAX = 200;
+export const DIRECTORY_BINDINGS_SQL = `SELECT harness, session_id, session_binding_id::text AS session_binding_id,
+       session_binding_revision::text AS session_binding_revision, session_binding_created_at
+  FROM sessions.session_directory_bindings_for($1, $2::text[], $3::text[])`;
+
 export const DIRECTORY_INSTALLED_SQL = `SELECT to_regprocedure($1) IS NOT NULL AS installed`;
 
 function mapPgError(error: unknown): never {
@@ -323,6 +344,16 @@ export function sqlDirectory(run: TenantRunner): Directory {
         if (!installed.rows[0]?.installed) return null;
         const r = await q
           .query<DirectoryUserRow>(DIRECTORY_USERS_SQL, [workspaceId, lastTsAfter.toISOString(), lastTsBefore.toISOString(), limit])
+          .catch(mapPgError);
+        return r.rows;
+      });
+    },
+    async bindings(orgId, workspaceId, keys) {
+      return run(orgId, workspaceId, async (q) => {
+        const installed = await q.query<{ installed: boolean }>(DIRECTORY_INSTALLED_SQL, [BINDINGS_FOR_SIGNATURE]);
+        if (!installed.rows[0]?.installed) return null;
+        const r = await q
+          .query<DirectoryBindingRow>(DIRECTORY_BINDINGS_SQL, [workspaceId, keys.map((k) => k.harness), keys.map((k) => k.sessionId)])
           .catch(mapPgError);
         return r.rows;
       });
@@ -723,4 +754,37 @@ export function sessionUsersPage(rows: DirectoryUserRow[], limit: number): { use
     return { userId: row.user_id, sessions: count(row.sessions), lastSessionAt: last.toISOString(), topProjects };
   });
   return { users, truncated: rows.length > limit };
+}
+
+export interface SessionBinding {
+  source: string;
+  sessionId: string;
+  /** The incarnation's id: compare it, with bindingRevision, to what you hold. */
+  sessionBindingId: string;
+  /** Strictly greater for every later binding of the same session; a decimal string (a PostgreSQL bigint). */
+  bindingRevision: string;
+  /** When this binding was issued. Informational: never an order. */
+  bindingCreatedAt: string;
+}
+
+const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/u;
+
+/**
+ * session_directory_bindings_for rows -> GET /v1/session-bindings `bindings`. Each row must answer a requested key,
+ * at most once, with a well-formed id and revision; anything else is a parse error (never a partial answer).
+ */
+export function sessionBindings(rows: DirectoryBindingRow[], keys: ReadonlyArray<{ harness: string; sessionId: string }>): SessionBinding[] {
+  const wanted = new Set(keys.map((k) => `${k.harness}\u0000${k.sessionId}`));
+  const seen = new Set<string>();
+  return rows.map((row) => {
+    const key = `${row.harness}\u0000${row.session_id}`;
+    if (!wanted.has(key) || seen.has(key)) throw new DirectoryError("parse");
+    seen.add(key);
+    const revision = String(row.session_binding_revision);
+    if (typeof row.session_binding_id !== "string" || !UUID.test(row.session_binding_id) || !/^[1-9]\d{0,18}$/u.test(revision))
+      throw new DirectoryError("parse");
+    const created = row.session_binding_created_at instanceof Date ? row.session_binding_created_at : new Date(String(row.session_binding_created_at));
+    if (Number.isNaN(created.getTime())) throw new DirectoryError("parse");
+    return { source: row.harness, sessionId: row.session_id, sessionBindingId: row.session_binding_id, bindingRevision: revision, bindingCreatedAt: created.toISOString() };
+  });
 }

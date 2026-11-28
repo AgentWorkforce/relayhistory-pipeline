@@ -107,7 +107,7 @@ import {
   READ_API_BRIEF_SUMMARY_ENABLED, READ_API_COORDINATION_ADVISORIES_ENABLED, READ_API_COORDINATION_OVERLAPS_BACKEND, READ_API_COORDINATION_OVERLAPS_ENABLED,
   READ_API_LIST_READINESS_ENABLED, READ_API_LIST_SHORT_SUMMARY_ENABLED, READ_API_RELAYFACTS_ENABLED, READ_API_SESSION_INTEL_ENABLED, READ_API_SESSION_SOURCES_ENABLED, READ_API_SUMMARY_SEARCH_ENABLED,
   READ_API_DIGEST_BACKEND, READ_API_OUTPUT_BACKEND, READ_API_ADVISORY_PRIORITY_ENABLED, READ_API_ADVISORY_INSTANCE_ENABLED,
-  READ_API_SESSION_PARTIAL_RETRYABLE, sessionPartialRetryableFlag,
+  READ_API_SESSION_PARTIAL_RETRYABLE, sessionPartialRetryableFlag, READ_API_SESSION_BINDINGS_ENABLED,
 } from "./config.ts";
 import { sqlSessionIntel } from "./session-intel-workspace.ts";
 import { parseAdvisoryNotifyRows, READ_API_ADVISORY_NOTIFY_ROWS } from "./advisory-priority.ts";
@@ -677,6 +677,8 @@ export async function readApiDepsFromSecret(secretText: string, env: NodeJS.Proc
   const briefSummaryWired = entry === "service" || exactTrueFlag(env[READ_API_BRIEF_SUMMARY_ENABLED]);
   const listShortSummary = exactTrueFlag(env[READ_API_LIST_SHORT_SUMMARY_ENABLED]);
   const listReadiness = exactTrueFlag(env[READ_API_LIST_READINESS_ENABLED]);
+  // 062380 session bindings (GET /v1/session-bindings): off unless exactly "true".
+  const sessionBindings = exactTrueFlag(env[READ_API_SESSION_BINDINGS_ENABLED]);
   const summarySearch = exactTrueFlag(env[READ_API_SUMMARY_SEARCH_ENABLED]);
   const summarySearchPg = summarySearchBackend(env, entry) === "postgres";
   const messageOrigin = messageOriginLabelsEnabled(env[MESSAGE_ORIGIN_LABELS_VAR]);
@@ -786,6 +788,7 @@ export async function readApiDepsFromSecret(secretText: string, env: NodeJS.Proc
     ...(exactTrueFlag(env[READ_API_RELAYFACTS_ENABLED]) ? { relayfacts: sqlRelayfacts(poolTenantRunner(pool as never)) } : {}),
     ...(listShortSummary ? { listShortSummary: true } : {}),
     ...(listReadiness ? { listReadiness: true } : {}),
+    ...(sessionBindings ? { sessionBindings: true } : {}),
     ...(summarySearch ? { summarySearch: true } : {}),
     ...(summarySearchPg ? { summarySearchBackend: "postgres" as const } : {}),
     ...(exactTrueFlag(env[READ_API_SESSION_SOURCES_ENABLED]) ? { sessionSources: sqlSessionSources(poolTenantRunner(pool as never)) } : {}),

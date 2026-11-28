@@ -2723,6 +2723,20 @@ describe("function boundary: ACL manifest, residual, activation gate", () => {
       const open = src.indexOf(tag, start) + tag.length;
       return src.slice(open, src.indexOf(tag, open));
     };
+    // 20261105062380 (the session binding) is newest: 062350's down refuses (55000) while it is applied; its
+    // lane-generated, checksum-pinned down drops the reader, the trigger and its function, the pair constraint, the
+    // three columns and the revision sequence, removes its ledger row, and refuses on a rerun.
+    const SB = "upstream:20261105062380_session_directory_binding.sql";
+    const bindingCols = async () =>
+      (await db.query<{ n: number }>("SELECT count(*)::int n FROM pg_attribute WHERE attrelid='sessions.session_directory'::regclass AND attname LIKE 'session\\_binding\\_%' AND NOT attisdropped")).rows[0]!.n;
+    expect(await names()).toContain(SB);
+    expect(await bindingCols()).toBe(3);
+    expect((await failure(rollback("20261105062350_buffered_search_feed_page_keyset.down.sql")))?.code).toBe("55000");
+    await rollback("20261105062380_session_directory_binding.down.sql");
+    expect(await names()).not.toContain(SB);
+    expect(await bindingCols()).toBe(0);
+    expect((await db.query<{ f: string | null; s: string | null }>("SELECT to_regprocedure('sessions.session_directory_bindings_for(text,text[],text[])')::text f, to_regclass('sessions.session_binding_revision')::text s")).rows[0]).toEqual({ f: null, s: null });
+    expect((await failure(rollback("20261105062380_session_directory_binding.down.sql")))?.code).toBe("55000");
     // 20261105062350 (the buffered feed page keyset) is newest: 062340's down refuses (55000) while it is applied; its
     // lane-generated, checksum-pinned down restores 043870's exact page function (body and proconfig), removes its
     // ledger row, and refuses on a rerun.

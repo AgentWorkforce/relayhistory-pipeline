@@ -76,6 +76,12 @@ export const READ_API_LIST_SHORT_SUMMARY_ENABLED = "READ_API_LIST_SHORT_SUMMARY_
  * "true" (exactTrueFlag); anything else = either param is 501 param_includeReadiness / param_readyOnly. Default off.
  */
 export const READ_API_LIST_READINESS_ENABLED = "READ_API_LIST_READINESS_ENABLED";
+/**
+ * GET /v1/session-bindings: serve each listed session's live binding (migration 062380's
+ * sessions.session_directory_bindings_for). Exactly "true" (exactTrueFlag); anything else = the route is 501
+ * session_bindings_not_enabled. Default off.
+ */
+export const READ_API_SESSION_BINDINGS_ENABLED = "READ_API_SESSION_BINDINGS_ENABLED";
 /** GET /v1/sessions/summaries/search: ClickHouse summary search (clickhouse/summary-search-query.ts). Default off. */
 export const READ_API_SUMMARY_SEARCH_ENABLED = "READ_API_SUMMARY_SEARCH_ENABLED";
 /**

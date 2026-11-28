@@ -287,6 +287,16 @@ jobs:
             exit 0
           fi
           bun test --timeout 120000 src/hoopdb/__tests__/lock-hold-observer.postgres.test.ts
+      # Two genuinely concurrent first projections issue one binding; a read after a committed tombstone refuses.
+      - name: Prove the 062380 session binding on real PostgreSQL
+        env:
+          SESSION_INGEST_TEST_PG_URL: postgres://postgres@127.0.0.1:5432/postgres
+        run: |
+          if [ ! -f src/hoopdb/__tests__/session-directory-binding.postgres.test.ts ]; then
+            echo "::warning title=pg-proof::session-directory-binding.postgres.test.ts absent at this head; forward-merge main to run the binding proof"
+            exit 0
+          fi
+          bun test --timeout 300000 src/hoopdb/__tests__/session-directory-binding.postgres.test.ts
       - name: Prove one session's buffered stages answer under 1 s on a 167k-batch backlog via the records GIN (044040)
         env:
           SESSION_INGEST_TEST_PG_URL: postgres://postgres@127.0.0.1:5432/postgres

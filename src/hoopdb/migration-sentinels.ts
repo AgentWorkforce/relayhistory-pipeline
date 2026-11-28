@@ -715,6 +715,10 @@ export const MIGRATION_SENTINELS: Record<string, Sentinel> = {
     evidence: "replacement: buffered_search_feed_page's keyset is one row comparison, with plan_cache_mode=force_custom_plan",
     sql: "SELECT EXISTS(SELECT 1 FROM pg_proc WHERE oid=to_regprocedure('sessions.buffered_search_feed_page(jsonb)') AND prosecdef AND prosrc LIKE '%coalesce(c.after_created_at,c.since-interval%' AND 'plan_cache_mode=force_custom_plan'=ANY(proconfig)) AS applied",
   },
+  "upstream:20261105062380_session_directory_binding.sql": {
+    evidence: "columns sessions.session_directory.session_binding_id/_created_at, trigger zz_session_directory_binding and function sessions.session_directory_bindings_for (the session binding)",
+    sql: "SELECT EXISTS(SELECT 1 FROM pg_attribute WHERE attrelid=to_regclass('sessions.session_directory') AND attname='session_binding_id' AND NOT attisdropped) AND EXISTS(SELECT 1 FROM pg_trigger WHERE tgrelid=to_regclass('sessions.session_directory') AND tgname='zz_session_directory_binding' AND NOT tgisinternal) AND to_regprocedure('sessions.session_directory_bindings_for(text,text[],text[])') IS NOT NULL AS applied",
+  },
   "upstream:20261105062070_coordination_advisor_readers.sql": {
     evidence: "functions sessions.coordination_advisor_write_facts_v1 and sessions.coordination_advisories_recent_v1",
     sql: "SELECT to_regprocedure('sessions.coordination_advisor_write_facts_v1(text,text,timestamptz,timestamptz,text,integer)') IS NOT NULL AND to_regprocedure('sessions.coordination_advisories_recent_v1(text,text,timestamptz)') IS NOT NULL AS applied",

@@ -44,6 +44,9 @@ import { SummaryFallbackError, sessionSummaryBody, type SummaryFallback } from "
  *                                   directory (READ_API_SUMMARY_SEARCH_ENABLED=true; otherwise 501), or
  *                                   the directory query alone (READ_API_SUMMARY_SEARCH_BACKEND=postgres)
  *   GET /v1/sessions/users          per-user session counts (one aggregate, migration 20261105057000)
+ *   GET /v1/session-bindings        each listed session's live binding (id, revision, issued at; migration
+ *                                   20261105062380), READ_API_SESSION_BINDINGS_ENABLED=true (deps.sessionBindings;
+ *                                   otherwise 501 session_bindings_not_enabled)
  * Both answer 501 `directory_workspace_not_enabled` unless the token's workspace is on
  * READ_API_DIRECTORY_WORKSPACES (the canary allowlist; unset = none), and 501
  * `directory_not_migrated` until migration 20261105034000 is applied. Never Neon.
@@ -140,6 +143,8 @@ import {
   QUERY_CURSOR_PREFIX,
   sessionFromDirectoryRow,
   sessionUsersPage,
+  sessionBindings,
+  DIRECTORY_BINDINGS_MAX,
   type BufferedListCursor,
   type DirectoryCursor,
   type Directory,
@@ -275,6 +280,11 @@ export interface ReadApiDeps {
    * functions, SQL, rows and cursors).
    */
   listReadiness?: boolean;
+  /**
+   * READ_API_SESSION_BINDINGS_ENABLED=true (exactly "true"): GET /v1/session-bindings serves each listed session's
+   * live binding through the 062380 reader. Not true = the route is a 501 `session_bindings_not_enabled`.
+   */
+  sessionBindings?: boolean;
   /**
    * READ_API_SUMMARY_SEARCH_ENABLED=true (exactly "true"): GET /v1/sessions/summaries/search finds
    * sessions whose title or scrubbed short summary contains `q`, with ClickHouse
@@ -498,6 +508,10 @@ const HARNESS_NAME = /^[a-z0-9][a-z0-9._-]{0,63}$/u;
 /** Session-list parameters the directory cannot answer: event or text questions. */
 /** The only parameters GET /v1/sessions/users reads; any other is not silently ignored (501). */
 const SESSION_USERS_PARAMS: ReadonlySet<string> = new Set(["workspace", "lastTsAfter", "lastTsBefore"]);
+/** The only parameters GET /v1/session-bindings reads. */
+const SESSION_BINDINGS_PARAMS: ReadonlySet<string> = new Set(["workspace", "session"]);
+/** A session id as the directory stores it (1..255 characters, no control characters). */
+const BINDING_SESSION_ID = /^[^\u0000-\u001f\u007f]{1,255}$/u;
 /**
  * GET /v1/sessions with READ_API_LIST_READINESS_ENABLED=true and readyOnly=true: `applied` on every 200 whose rows
  * the readiness predicate filtered. The positive signal a client must check: a reader built before list readiness
@@ -1776,6 +1790,41 @@ export function createReadApi(deps: ReadApiDeps) {
       if (rows === null) throw unsupported("directory_not_migrated");
       const page = sessionUsersPage(rows, DIRECTORY_USERS_MAX);
       return c.json({ lastTsAfter: after.toISOString(), lastTsBefore: before.toISOString(), users: page.users, truncated: page.truncated });
+    } catch (error) {
+      return directoryFail(c, error);
+    }
+  });
+
+  /**
+   * GET /v1/session-bindings?workspace=&session=<source>:<sessionId> (repeated, 1..200): the live binding of each
+   * listed session (migration 062380). A session that is tombstoned, erased, unknown, outside the caller's workspace
+   * or not yet bound is absent from `bindings`: a caller holding a binding treats absence, or any other id or
+   * revision, as "no longer this incarnation" and fails closed. The source is split at the first ':' (a source name
+   * never contains one); duplicates are answered once. Each call is one read-only transaction, so it is the read's
+   * linearization point: a call that starts after a tombstone commits never returns the retired binding.
+   */
+  app.get("/v1/session-bindings", async (c) => {
+    try {
+      const identity = c.get("identity");
+      attestWorkspace(c, identity);
+      if (deps.sessionBindings !== true) throw unsupported("session_bindings_not_enabled");
+      const directory = directoryFor(identity);
+      for (const name of Object.keys(c.req.queries()))
+        if (!SESSION_BINDINGS_PARAMS.has(name)) throw unsupported(`param_${name}`);
+      const raw = repeated(c, "session");
+      if (raw.length === 0) throw bad("session is required: <source>:<sessionId>, repeated");
+      if (raw.length > DIRECTORY_BINDINGS_MAX) throw bad(`session accepts at most ${DIRECTORY_BINDINGS_MAX} values`);
+      const keys = raw.map((value) => {
+        const at = value.indexOf(":");
+        const harness = at < 0 ? "" : value.slice(0, at);
+        const sessionId = at < 0 ? "" : value.slice(at + 1);
+        if (!HARNESS_NAME.test(harness) || !BINDING_SESSION_ID.test(sessionId)) throw bad("session must be <source>:<sessionId>");
+        return { harness, sessionId };
+      });
+      if (!directory.bindings) throw unsupported("session_bindings_not_supported");
+      const rows = await directory.bindings(identity.orgId, identity.workspaceId, keys);
+      if (rows === null) throw unsupported("session_bindings_not_migrated");
+      return c.json({ bindings: sessionBindings(rows, keys) });
     } catch (error) {
       return directoryFail(c, error);
     }

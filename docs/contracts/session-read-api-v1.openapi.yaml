@@ -186,6 +186,42 @@ paths:
                         bySource: {type: object, additionalProperties: {type: integer}}
                   correlationId: {type: string}
         default: {$ref: "#/components/responses/Error"}
+  /v1/session-bindings:
+    get:
+      tags: [read]
+      operationId: sessionBindings
+      summary: Each listed session's live binding (one id per incarnation of the session).
+      description: >-
+        Migration 20261105062380; served only with READ_API_SESSION_BINDINGS_ENABLED=true (exactly "true"),
+        otherwise 501 `session_bindings_not_enabled`. A binding names one incarnation of a logical session: it is
+        issued by the pipeline when the session's directory row is first written, kept across retries, new
+        revisions and reprojection, retired by a tombstone, and replaced (new id, strictly greater revision) when
+        the session comes back as a genuinely new upload or its row is re-created. An operator-erased session never
+        comes back. A session that is tombstoned, erased, unknown, outside the caller's workspace or not yet bound
+        is absent from `bindings`. A consumer that keys anything on a binding (for example a project assignment)
+        must compare the exact `sessionBindingId` and `bindingRevision` it holds with this answer on every read and
+        fail closed on absence, a difference or any error. Each call is one read-only transaction: a call that
+        starts after a tombstone commits never returns the retired binding.
+      parameters:
+        - $ref: "#/components/parameters/workspace"
+        - name: session
+          in: query
+          required: true
+          description: "`<source>:<sessionId>`, split at the first ':'; repeated, 1 to 200 values (duplicates answered once)."
+          schema: {type: array, items: {type: string}, minItems: 1, maxItems: 200}
+          style: form
+          explode: true
+      responses:
+        "200":
+          description: The live bindings of the listed sessions that have one, ordered by source then session id.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [bindings]
+                properties:
+                  bindings: {type: array, items: {$ref: "#/components/schemas/SessionBinding"}}
+        default: {$ref: "#/components/responses/Error"}
   /v1/sessions/{sessionId}/turns:
     get:
       tags: [read]
@@ -698,6 +734,15 @@ components:
         catalog: {type: object, description: Present once the session's catalog is projected.}
         eventsReady: {type: boolean, description: "Only with `includeReadiness=true`: the session's search (event) projection is complete (event_projection_ready and projection version 1). False for an owner-buffered session. Not a readability claim."}
         eventsProjectedAt: {type: [string, "null"], format: date-time, description: "Only with `includeReadiness=true`: when the event projection last completed, as stored; it can be set while `eventsReady` is false (a later upload made the session not ready again). Null for an owner-buffered session or one never projected."}
+    SessionBinding:
+      type: object
+      required: [source, sessionId, sessionBindingId, bindingRevision, bindingCreatedAt]
+      properties:
+        source: {type: string, description: The harness.}
+        sessionId: {type: string}
+        sessionBindingId: {type: string, format: uuid, description: The incarnation's id; never reused.}
+        bindingRevision: {type: string, pattern: "^[1-9][0-9]{0,18}$", description: "Strictly greater for every later binding of the same session (a PostgreSQL bigint as a decimal string)."}
+        bindingCreatedAt: {type: string, format: date-time, description: When the binding was issued. Informational, never an order.}
     Turn:
       type: object
       required: [id, sessionId, sessionOwner, turnIndex, role, content, actorName, actorRole, metadata, ts]
