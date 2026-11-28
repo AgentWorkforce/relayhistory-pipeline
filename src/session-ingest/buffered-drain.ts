@@ -360,6 +360,8 @@ export type ObjectOutcome =
   | "lock_lost"
   | "index_unreadable"
   | "canonical_unreadable"
+  | "materialization_unverified"
+  | "marker_foreign"
   | "write_failed"
   | "index_merge_failed"
   | "fence_recheck_failed"
@@ -375,7 +377,7 @@ export type ObjectOutcome =
 
 const OUTCOMES: ObjectOutcome[] = [
   "drained", "would_drain", "already_drained", "pre_reset", "redacted", "vanished", "corrupt", "key_mismatch",
-  "ambiguous_replacement", "fence_absent", "fence_unreadable", "journal_unreadable", "privacy_control_open", "reset_undeterminable", "reset_margin", "reset_in_flight", "control_pending", "fence_authority_missing", "fence_authority_invalid", "fence_authority_stopped", "user_hold", "user_stopped", "hold_failed", "lock_lost", "index_unreadable", "canonical_unreadable", "write_failed",
+  "ambiguous_replacement", "fence_absent", "fence_unreadable", "journal_unreadable", "privacy_control_open", "reset_undeterminable", "reset_margin", "reset_in_flight", "control_pending", "fence_authority_missing", "fence_authority_invalid", "fence_authority_stopped", "user_hold", "user_stopped", "hold_failed", "lock_lost", "index_unreadable", "canonical_unreadable", "materialization_unverified", "marker_foreign", "write_failed",
   "index_merge_failed", "fence_recheck_failed", "fence_moved", "stage_unacknowledged", "stage_export_missing", "accepted_mismatch", "stage_not_live", "stage_superseded", "fence_moved_since_export", "marker_failed", "internal_error",
 ];
 
@@ -387,6 +389,8 @@ const OUTCOMES: ObjectOutcome[] = [
  */
 export const TERMINAL_OUTCOMES: ReadonlySet<ObjectOutcome> = new Set<ObjectOutcome>([
   "drained", "already_drained", "pre_reset", "redacted", "vanished", "corrupt", "key_mismatch", "ambiguous_replacement",
+  // The stage's create-only marker holds another outcome (an erase's, another digest): final, never this run's.
+  "marker_foreign",
   // 0005 step 0b: SQL never acknowledged it, or its verdict refuses it. Final only within one export generation: a
   // re-export can write or replace a sidecar (by CAS) with another verdict, so a checkpoint records each org's generation
   // and is not trusted under another (DrainCheckpoint). (`stage_export_missing` and `fence_moved_since_export` are left
@@ -1181,10 +1185,12 @@ export async function drainBufferedBatches(opts: DrainOptions): Promise<DrainSum
         try {
           const got = await readText(store, key + DRAINED_SUFFIX, 64 * 1024);
           const m = got ? (JSON.parse(got.text) as Record<string, unknown>) : null;
-          legacy = isObject(m) && m.outcome !== "pre_reset" && m.materialization !== MATERIALIZATION_VERSION;
+          // Only a `drained` outcome can hide unwritten lines; any other outcome (pre_reset, or a marker another writer
+          // owns, e.g. an erase's) is final and never revisited.
+          legacy = isObject(m) && m.outcome === "drained" && m.materialization !== MATERIALIZATION_VERSION;
         } catch {
-          // Unreadable: drained again (every step is idempotent), never trusted as materialized.
-          legacy = true;
+          // Unreadable: left as it is (already_drained), never revisited on a guess; the verifier reports the stage.
+          legacy = false;
         }
         if (legacy) {
           group.markers.delete(key);
@@ -1381,7 +1387,10 @@ export async function drainBufferedBatches(opts: DrainOptions): Promise<DrainSum
         // The reset supersedes the batch, including anything an earlier partial run wrote of it (its sessions
         // were registered as owned first, so the reset reaches them). Release its hold entry, THEN mark it.
         if (!opts.dryRun && !(await releaseHeld(tenant, key))) return "hold_failed";
-        if (!opts.dryRun && !(await putMarker(key, sha256, "pre_reset", counts, 0))) return "marker_failed";
+        if (!opts.dryRun) {
+          const marked = await putMarker(key, sha256, "pre_reset", counts, 0);
+          if (marked !== "ok") return marked === "foreign" ? "marker_foreign" : "marker_failed";
+        }
         return "pre_reset";
       }
       // Too close to the reset to order across two clocks: never written, never marked, reported.
@@ -1461,6 +1470,7 @@ export async function drainBufferedBatches(opts: DrainOptions): Promise<DrainSum
       const materializedIn = new Map<Group, number>();
       const writtenFrom = new Map<Group, Group>();
       const matKeys = new Map<Group, string[]>();
+      const matLines = new Map<Group, string[]>();
       const entries = new Map<string, IndexEntryInput[]>();
       const inBatch = new Map<string, [number, string]>();
       const writtenSessions = new Map<string, [string, string]>();
@@ -1491,6 +1501,7 @@ export async function drainBufferedBatches(opts: DrainOptions): Promise<DrainSum
             counts.materialized++;
             materializedIn.set(k.group, (materializedIn.get(k.group) ?? 0) + 1);
             matKeys.set(k.group, [...(matKeys.get(k.group) ?? []), JSON.stringify([sk, r.record_id, revision, m[1]])]);
+            matLines.set(k.group, [...(matLines.get(k.group) ?? []), line]);
             inBatch.set(r.record_id, [revision, m[1]]);
             if (m[3] !== null) writtenSessions.set(JSON.stringify([m[2], m[3]]), [m[2], m[3]]);
             lines.push(fitLine(line));
@@ -1582,10 +1593,27 @@ export async function drainBufferedBatches(opts: DrainOptions): Promise<DrainSum
             if (!leaseOk()) return partial("lock_lost");
             const res = await writeGroups(target, batch, [g], new Date(receivedMs));
             machineId = res.machineId;
-            // The session already held this batch (manifest replay dedupe): its materialized lines were stored.
-            const replayed = materializedIn.get(writtenFrom.get(g)!) ?? 0;
-            for (const mk of matKeys.get(writtenFrom.get(g)!) ?? []) materializedThisRun.add(mk);
-            if (res.manifests[0] && !res.manifests[0].written && replayed > 0) {
+            const from = writtenFrom.get(g)!;
+            const replayed = materializedIn.get(from) ?? 0;
+            const deduped = !!res.manifests[0] && !res.manifests[0].written;
+            // A replay (the manifest already names this batch digest) proves nothing about the bytes: a dedupe entry can
+            // outlive its chunk. So does a recovery run. Read the materialized lines back through the canonical reader
+            // before anything records success; any line not held, or an unreadable session, leaves the batch unmarked.
+            if (replayed > 0 && (deduped || opts.rematerialize)) {
+              let held = false;
+              try {
+                const back = await readCanonicalSession(store, {
+                  keyRoot: opts.keyRoot, orgId: header.org_id, workspaceId: header.workspace_id, machineId: res.machineId, source: g.source, sessionId: g.sessionId,
+                }, opts.decompress);
+                held = (matLines.get(from) ?? []).every((l) => canonicalHolds(back, l));
+              } catch {
+                held = false;
+              }
+              if (!held) return partial("materialization_unverified");
+            }
+            for (const mk of matKeys.get(from) ?? []) materializedThisRun.add(mk);
+            // The session already held this batch (manifest replay dedupe) and its bytes read back: already stored.
+            if (deduped && replayed > 0) {
               counts.materialized -= replayed;
               counts.already_stored += replayed;
               counts.written -= replayed;
@@ -1654,7 +1682,21 @@ export async function drainBufferedBatches(opts: DrainOptions): Promise<DrainSum
         }
         intents.delete(key);
       }
-      if (!(await putMarker(key, sha256, "drained", counts, toWrite.length, lease?.token))) return "marker_failed";
+      const marked = await putMarker(key, sha256, "drained", counts, toWrite.length, lease?.token);
+      if (marked === "failed") return "marker_failed";
+      if (marked === "foreign") {
+        // Another writer finalized this stage first (e.g. an erase pre-created its marker): it is NOT drained. What this
+        // run wrote is re-armed for the eraser; under W2 readers never serve it without this run's own marker.
+        try {
+          for (const [s, id] of writtenSessions.values()) {
+            await ledger.writeRearm(keys.rearm(origin, s, id), { originId: origin, source: s, sessionId: id, machineId, workspaceId: header.workspace_id });
+            summary.rearmed++;
+          }
+        } catch {
+          return "marker_failed"; // left for a rerun, which reads the foreign marker again and re-arms
+        }
+        return "marker_foreign";
+      }
       addCounts(counts, toWrite.length);
       return "drained";
     } finally {
@@ -1667,15 +1709,32 @@ export async function drainBufferedBatches(opts: DrainOptions): Promise<DrainSum
     summary.sessions_written += sessions;
   }
 
-  async function putMarker(key: string, sha256: string, outcome: "drained" | "pre_reset", counts: DrainSummary["lines"], sessions: number, token?: number): Promise<boolean> {
+  /**
+   * The create-only marker. "ok" only when the stored marker is this outcome for these exact bytes (written now, or by
+   * an earlier run of the same stage whose ACK was lost); "foreign" when it holds anything else (another outcome, such
+   * as an erase's, another digest, or an unreadable body); "failed" when neither could be established.
+   */
+  async function putMarker(key: string, sha256: string, outcome: "drained" | "pre_reset", counts: DrainSummary["lines"], sessions: number, token?: number): Promise<"ok" | "foreign" | "failed"> {
     const at = (opts.now ?? (() => new Date()))().toISOString();
     const body = encoder.encode(JSON.stringify({ v: 1, kind: "buffered-drained", outcome, at, staged_sha256: sha256, sessions_written: sessions, lines: counts, materialization: MATERIALIZATION_VERSION, ...(token !== undefined ? { lease_token: token } : {}) }));
     try {
       await store.put(objectKey(key + DRAINED_SUFFIX), body, { ifNoneMatch: true, contentType: "application/json" });
-      return true;
+      return "ok";
     } catch (error) {
-      // A concurrent or earlier run marked it: the object is drained either way.
-      return isObjectStoreError(error, "already_exists") || isObjectStoreError(error, "precondition_failed");
+      if (!isObjectStoreError(error, "already_exists") && !isObjectStoreError(error, "precondition_failed")) return "failed";
+    }
+    try {
+      const got = await readText(store, key + DRAINED_SUFFIX, 64 * 1024);
+      if (!got) return "failed";
+      let m: unknown;
+      try {
+        m = JSON.parse(got.text);
+      } catch {
+        return "foreign";
+      }
+      return isObject(m) && m.kind === "buffered-drained" && m.outcome === outcome && m.staged_sha256 === sha256 ? "ok" : "foreign";
+    } catch {
+      return "failed";
     }
   }
 }

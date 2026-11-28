@@ -1633,7 +1633,7 @@ describe("buffered drain materialization (FULL-seeded index)", () => {
     const key = await stage(store, [group("claude", "sess-1", [{ id: "a1", rev: 1 }, { id: "a2", rev: 1 }]), group("claude", "sess-2", [{ id: "e1", rev: 1 }])]);
     await refreshVerdicts(store);
     // main's drain at this point: every line already_stored, no canonical byte, the object marked drained (no materialization).
-    const legacy = { v: 1, kind: "buffered-drained", outcome: "drained", at: RECEIVED, staged_sha256: "0".repeat(64), sessions_written: 0,
+    const legacy = { v: 1, kind: "buffered-drained", outcome: "drained", at: RECEIVED, staged_sha256: sha(await readAll(await store.get(objectKey(key)))), sessions_written: 0,
       lines: { candidate: 3, written: 0, fenced: 0, stale: 0, already_stored: 3, revision_conflict: 0, not_kept: 0 } };
     await store.put(objectKey(key + DRAINED_SUFFIX), enc.encode(JSON.stringify(legacy)));
     // An erasure after the false success: sess-2 must not come back through the recovery.
@@ -1660,6 +1660,98 @@ describe("buffered drain materialization (FULL-seeded index)", () => {
     expect(await verify(store)).toMatchObject({ ok: true, exact: 2 });
   });
 
+  test("legacy repair over a batch-digest dedupe entry whose chunk is gone: verified before success, refused, idempotent", async () => {
+    const store = await scratch();
+    await fullSlots(store, [{ id: "a1", rev: 1 }]);
+    const key = await stage(store, [group("claude", "sess-1", [{ id: "a1", rev: 1 }])]);
+    await run(store);
+    // The manifest names this batch digest (dedupe entry) but its chunk object is missing; the marker is a legacy one.
+    const chunk = (await allKeys(store, `${ROOT}/${TENANT.orgId}/v1`)).find((k) => k.includes("/raw/"))!;
+    await store.delete(objectKey(chunk));
+    await store.delete(objectKey(key + DRAINED_SUFFIX));
+    await store.put(objectKey(key + DRAINED_SUFFIX), enc.encode(JSON.stringify({ v: 1, kind: "buffered-drained", outcome: "drained", staged_sha256: sha(await readAll(await store.get(objectKey(key)))) })));
+    const manifests = await manifestRevisions(store);
+    const first = await run(store, { rematerialize: true });
+    expect(first.objects).toMatchObject({ materialization_unverified: 1, drained: 0 });
+    expect(await verify(store)).toMatchObject({ ok: false });
+    expect((await verify(store)).counts.unreadable).toBeGreaterThan(0);
+    // Idempotent: a rerun refuses the same way and writes no manifest revision (the user stays held: fail closed).
+    const keys = await allKeys(store, `${ROOT}/${TENANT.orgId}/v1`);
+    const second = await run(store, { rematerialize: true });
+    expect(second.objects.drained).toBe(0);
+    expect(await manifestRevisions(store)).toEqual(manifests);
+    expect(await allKeys(store, `${ROOT}/${TENANT.orgId}/v1`)).toEqual(keys);
+  });
+
+  test("baseline: a preexisting line later erased is erased_present; a lost or altered baseline line is baseline_lost", async () => {
+    const store = await scratch();
+    const target = { store, keyRoot: ROOT };
+    const batch = { ...TENANT, originId: ORIGIN };
+    await writeGroups(target, { ...batch, batchDigest: sha("legacy-1") }, [group("claude", "sess-1", [{ id: "old", rev: 1 }])], new Date(RECEIVED));
+    await writeGroups(target, { ...batch, batchDigest: sha("legacy-2") }, [group("claude", "sess-2", [{ id: "old2", rev: 1 }])], new Date(RECEIVED));
+    await fullSlots(store, [{ id: "a1", rev: 1 }, { id: "b1", rev: 1, session: "sess-2" }]);
+    await stage(store, [group("claude", "sess-1", [{ id: "a1", rev: 1 }]), group("claude", "sess-2", [{ id: "b1", rev: 1 }])]);
+    await refreshVerdicts(store);
+    const baseline = await snapshotCanonical({ store, keyRoot: ROOT, orgId: TENANT.orgId, decompress }, deps(store));
+    await run(store);
+    const withBaseline = () => verifyDrainMaterialization({ store, keyRoot: ROOT, orgId: TENANT.orgId, decompress, baseline }, deps(store));
+    expect(await withBaseline()).toMatchObject({ ok: true, exact: 2, baseline_preserved: 2 });
+    // sess-2 is erased after the drain: every readable line of it is erased_present, the baseline line included.
+    await putFence(store, { deletions: [{ originId: ORIGIN, sessions: [["claude", "sess-2"]] }] });
+    expect((await withBaseline()).counts.erased_present).toBe(2);
+    // A baseline line of a live session that is no longer readable as it was (lost, or altered into other bytes).
+    const [sk1, lines1] = [...baseline.sessions].find(([k]) => k.includes('"sess-1"'))!;
+    const altered = { sessions: new Map(baseline.sessions).set(sk1, [...lines1, lines1[0]!.replace('"old"', '"was-here"')]) };
+    const lost = await verifyDrainMaterialization({ store, keyRoot: ROOT, orgId: TENANT.orgId, decompress, baseline: altered }, deps(store));
+    expect(lost.counts.baseline_lost).toBe(1);
+  });
+
+  test("a marker another writer created first (an erase's) is never counted drained: what was written is re-armed", async () => {
+    const store = await scratch();
+    await fullSlots(store, [{ id: "a1", rev: 1 }]);
+    const key = await stage(store, [group("claude", "sess-1", [{ id: "a1", rev: 1 }])]);
+    // The erase pre-creates the stage's marker while this run's write is in flight (after its last check).
+    const racing: ObjectStore = new Proxy(store, {
+      get(target, prop) {
+        const v = (target as unknown as Record<PropertyKey, unknown>)[prop];
+        if (prop !== "put") return typeof v === "function" ? (v as (...a: unknown[]) => unknown).bind(target) : v;
+        return async (k: unknown, ...rest: unknown[]) => {
+          if (String(k) === key + DRAINED_SUFFIX && !(await exists(target, key + DRAINED_SUFFIX)))
+            await target.put(objectKey(key + DRAINED_SUFFIX), enc.encode(JSON.stringify({ v: 1, kind: "buffered-drained", outcome: "erased" })));
+          return (v as (...a: unknown[]) => unknown).apply(target, [k, ...rest]);
+        };
+      },
+    });
+    const summary = await run(racing);
+    expect(summary.objects).toMatchObject({ drained: 0, marker_foreign: 1 });
+    expect(summary.rearmed).toBe(1);
+    expect(await exists(store, rearmKey("claude", "sess-1"))).toBe(true);
+    expect((await readJson(store, key + DRAINED_SUFFIX)).outcome).toBe("erased");
+    expect(await verify(store)).toMatchObject({ ok: false, counts: { erased_present: 1 } });
+    // A later run never drains it.
+    expect((await run(store)).objects).toMatchObject({ already_drained: 1, drained: 0 });
+  });
+
+  test("a lost marker ACK is settled by read-back: this run's own marker (same digest) counts drained", async () => {
+    const store = await scratch();
+    await fullSlots(store, [{ id: "a1", rev: 1 }]);
+    const key = await stage(store, [group("claude", "sess-1", [{ id: "a1", rev: 1 }])]);
+    let lost = false;
+    const lossy: ObjectStore = new Proxy(store, {
+      get(target, prop) {
+        const v = (target as unknown as Record<PropertyKey, unknown>)[prop];
+        if (prop !== "put") return typeof v === "function" ? (v as (...a: unknown[]) => unknown).bind(target) : v;
+        return async (k: unknown, ...rest: unknown[]) => {
+          const out = await (v as (...a: unknown[]) => Promise<unknown>).apply(target, [k, ...rest]);
+          if (String(k) === key + DRAINED_SUFFIX && !lost) { lost = true; throw new ObjectStoreError("precondition_failed", "fs", "lost ack"); }
+          return out;
+        };
+      },
+    });
+    const summary = await run(lossy);
+    expect(summary.objects).toMatchObject({ drained: 1, marker_foreign: 0 });
+  });
+
   test("rematerialize never revisits a current marker or a pre_reset one", async () => {
     const store = await scratch();
     await fullSlots(store, [{ id: "a1", rev: 1 }]);
@@ -1668,8 +1760,13 @@ describe("buffered drain materialization (FULL-seeded index)", () => {
     expect((await readJson(store, key + DRAINED_SUFFIX)).materialization).toBe(1);
     const pre = await stage(store, [group("claude", "sess-1", [{ id: "a2", rev: 1 }])]);
     await store.put(objectKey(pre + DRAINED_SUFFIX), enc.encode(JSON.stringify({ v: 1, kind: "buffered-drained", outcome: "pre_reset" })));
+    // A marker another writer owns (an erase pre-creating one, sessions-s3-admission-fence's proposal): final too.
+    const erased = await stage(store, [group("claude", "sess-1", [{ id: "a3", rev: 1 }])]);
+    await store.put(objectKey(erased + DRAINED_SUFFIX), enc.encode(JSON.stringify({ v: 1, kind: "buffered-drained", outcome: "erased" })));
     const r = await run(store, { rematerialize: true });
-    expect(r).toMatchObject({ rematerialize_revisited: 0, objects: { already_drained: 2 } });
+    expect(r).toMatchObject({ rematerialize_revisited: 0, objects: { already_drained: 3 } });
+    expect((await canonical(store)).get("sess-1")).toEqual(["a1@1"]);
+    expect(await verify(store)).toMatchObject({ ok: true, exact: 1, excluded_absent: 2 });
   });
 
   test("a drain over an unreadable canonical session leaves the object for a rerun (canonical_unreadable), never marked", async () => {

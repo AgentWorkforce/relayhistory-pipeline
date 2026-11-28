@@ -169,7 +169,7 @@ export function canonicalHolds(canonical: readonly CanonicalLine[] | null, stage
 // ---- verification ----
 
 export type VerifyFailure =
-  | "export_missing" | "missing" | "mismatch" | "index_missing" | "unrecoverable" | "unexpected" | "erased_present" | "undrained" | "unreadable";
+  | "export_missing" | "missing" | "mismatch" | "index_missing" | "unrecoverable" | "unexpected" | "erased_present" | "baseline_lost" | "undrained" | "unreadable";
 
 export interface VerifyResult {
   ok: boolean;
@@ -236,6 +236,8 @@ interface Backlog {
   fences: Map<string, FenceDoc | null>;
   undrained: string[];
   exportComplete: boolean;
+  /** Sessions (sessionKey) the user's CURRENT S3 fence deletes, or whose user has no fence (erased). */
+  deleted: Set<string>;
 }
 
 async function collectBacklog(opts: VerifyOptions, deps: VerifyDeps): Promise<Backlog> {
@@ -245,7 +247,7 @@ async function collectBacklog(opts: VerifyOptions, deps: VerifyDeps): Promise<Ba
   const keys = await deps.list(`${keyRoot}/${orgId}/buffered-batches/v1`);
   const all = new Set(keys);
   const staged = keys.filter((k) => k.endsWith(".staged.ndjson.zst") && deps.parseStagedKey(k)?.orgId === orgId);
-  const b: Backlog = { allowed: [], excluded: [], sessions: new Map(), origins: new Map(), fences: new Map(), undrained: [], exportComplete: complete !== null && parseAcceptedComplete(complete) !== null };
+  const b: Backlog = { allowed: [], excluded: [], sessions: new Map(), origins: new Map(), fences: new Map(), undrained: [], exportComplete: complete !== null && parseAcceptedComplete(complete) !== null, deleted: new Set() };
   const fenceOf = async (t: LedgerTenant): Promise<FenceDoc | null> => {
     const k = userKey(t);
     if (!b.fences.has(k)) {
@@ -262,6 +264,10 @@ async function collectBacklog(opts: VerifyOptions, deps: VerifyDeps): Promise<Ba
       return null;
     }
   };
+  const markDeleted = async (t: LedgerTenant, origin: string, source: string, sessionId: string) => {
+    const fence = await fenceOf(t);
+    if (fence === null || (sessionId !== NO_SESSION_ID && isDeletedForAdmission(fence, origin, source, sessionId))) b.deleted.add(sessionKey(t, origin, source, sessionId));
+  };
   for (const key of staged) {
     const s = await deps.readStaged(key);
     if (!s) continue; // not live: nothing of it can be canonical through the drain
@@ -272,20 +278,26 @@ async function collectBacklog(opts: VerifyOptions, deps: VerifyDeps): Promise<Ba
       const r = JSON.parse(line) as { record_id: string; revision: string };
       return { tenant, origin, source: g.source, sessionId: g.sessionId, line, recordId: r.record_id, revision: Number(r.revision) } satisfies Line;
     }));
-    for (const g of s.groups) b.sessions.set(sessionKey(tenant, origin, g.source, g.sessionId), { tenant, origin, source: g.source, sessionId: g.sessionId });
+    for (const g of s.groups) {
+      b.sessions.set(sessionKey(tenant, origin, g.source, g.sessionId), { tenant, origin, source: g.source, sessionId: g.sessionId });
+      await markDeleted(tenant, origin, g.source, g.sessionId);
+    }
     const marker = await json(key + ".accepted.json");
     const live = !!marker && marker.live === true && marker.stage_sha256 === s.sha256 && Array.isArray(marker.kept) && !all.has(key + ".superseded.json");
     if (!live) {
       b.excluded.push(...items.flat());
       continue;
     }
-    const outcome = (await json(key + ".drained.json"))?.outcome;
-    if (outcome === "pre_reset") {
-      b.excluded.push(...items.flat());
+    const markerDoc = await json(key + ".drained.json");
+    const outcome = markerDoc?.outcome;
+    // No marker, or one that does not parse: not proven drained.
+    if (outcome === undefined || typeof outcome !== "string") {
+      b.undrained.push(key);
       continue;
     }
+    // Any final outcome other than drained (pre_reset, or an erase's marker): nothing of the stage may be canonical.
     if (outcome !== "drained") {
-      b.undrained.push(key);
+      b.excluded.push(...items.flat());
       continue;
     }
     const fence = await fenceOf(tenant);
@@ -375,7 +387,7 @@ export async function snapshotCanonical(opts: Omit<VerifyOptions, "baseline">, d
 export async function verifyDrainMaterialization(opts: VerifyOptions, deps: VerifyDeps): Promise<VerifyResult> {
   const result: VerifyResult = {
     ok: false, exact: 0, superseded_later: 0, index_winners_canonical: 0, excluded_absent: 0, baseline_preserved: 0,
-    counts: { export_missing: 0, missing: 0, mismatch: 0, index_missing: 0, unrecoverable: 0, unexpected: 0, erased_present: 0, undrained: 0, unreadable: 0 },
+    counts: { export_missing: 0, missing: 0, mismatch: 0, index_missing: 0, unrecoverable: 0, unexpected: 0, erased_present: 0, baseline_lost: 0, undrained: 0, unreadable: 0 },
     failures: [],
   };
   const fail = (kind: VerifyFailure, r: string) => {
@@ -409,6 +421,10 @@ export async function verifyDrainMaterialization(opts: VerifyOptions, deps: Veri
   }
   const sessions = new Map(b.sessions);
   for (const i of idx) if (i.session) sessions.set(sessionKey(i.session.tenant, i.session.origin, i.session.source, i.session.sessionId), i.session);
+  for (const sk of opts.baseline?.sessions.keys() ?? []) if (!sessions.has(sk)) {
+    const [orgId, workspaceId, userId, origin, source, sessionId] = JSON.parse(sk) as string[];
+    sessions.set(sk, { tenant: { orgId: orgId!, workspaceId: workspaceId!, userId: userId! }, origin: origin!, source: source!, sessionId: sessionId! });
+  }
   const canonical = await readSessions(opts, sessions, (sk) => fail("unreadable", ref(sk)));
   const winners = new Map(idx.map((i) => [recordKey(i.tenant, i.origin, i.recordId), i]));
 
@@ -455,17 +471,31 @@ export async function verifyDrainMaterialization(opts: VerifyOptions, deps: Veri
     const ok = allowedForms.get(sk) ?? new Set<string>();
     const bad = excludedForms.get(sk) ?? new Set<string>();
     const before = new Set(opts.baseline?.sessions.get(sk) ?? []);
+    // An erased session: every readable line is erased_present, whoever wrote it and whenever (baseline included).
+    if (b.deleted.has(sk)) {
+      for (const c of lines ?? []) fail("erased_present", ref(JSON.stringify([sk, c.recordId, c.revision])));
+      for (const form of bad) if (!(lines ?? []).some((c) => c.text === form)) result.excluded_absent++;
+      continue;
+    }
+    // Canonical is append-only outside an erase: every baseline line of a live session must still be readable as is.
+    const now = new Set((lines ?? []).map((c) => c.text));
+    for (const t of before) if (!now.has(t)) fail("baseline_lost", ref(JSON.stringify([sk, sha256Hex(t)])));
     for (const c of lines ?? []) {
       if (ok.has(c.text)) continue;
+      // An excluded line is erased_present while readable, even if it was there before the drain.
+      if (bad.has(c.text)) {
+        fail("erased_present", ref(JSON.stringify([sk, c.recordId, c.revision])));
+        continue;
+      }
       const rk = recordKey(s.tenant, c.originId, c.recordId);
       const w = winners.get(rk);
       // The index's winner beyond the backlog (a later admission). At an expected revision only the expected bytes count.
-      if (w && w.entry[0] === c.revision && (expected.get(rk)?.revision ?? -1) < c.revision && !bad.has(c.text)) continue;
+      if (w && w.entry[0] === c.revision && (expected.get(rk)?.revision ?? -1) < c.revision) continue;
       if (before.has(c.text)) {
         result.baseline_preserved++;
         continue;
       }
-      fail(bad.has(c.text) ? "erased_present" : "unexpected", ref(JSON.stringify([sk, c.recordId, c.revision])));
+      fail("unexpected", ref(JSON.stringify([sk, c.recordId, c.revision])));
     }
     for (const form of bad) if (!ok.has(form) && !(lines ?? []).some((c) => c.text === form)) result.excluded_absent++;
   }
