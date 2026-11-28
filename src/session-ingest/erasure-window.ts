@@ -245,14 +245,97 @@ export const ERASURE_PROOF_MAX_AGE_MS = 5 * 60 * 1000;
  */
 export type ReleaseWatermark = "surviving_two_tables" | "erasure_history_all_sources";
 
+/** The closed refusals of an empty-window release (codes only; never an identifier). */
+export const EMPTY_RELEASE_REFUSALS = ["release_org_not_in_wave", "release_proof_invalid", "release_watermark_partial", "release_binding_mismatch", "release_proof_stale",
+  "release_hold_not_attempted", "release_window_nonempty", "release_window_unproven", "release_sql_refused"] as const;
+export type EmptyReleaseRefusal = (typeof EMPTY_RELEASE_REFUSALS)[number];
+/** The release's evidence: sha256 over a domain string and the exact proof the release acted on. */
+export const emptyReleaseEvidence = (proof: ErasureWindowProof) =>
+  createHash("sha256").update(`erasure-window-release/v1\n${JSON.stringify(proof)}`).digest("hex");
+
 /**
- * May bridge_complete release on this proof alone (no manifest)? NOT ON THIS HEAD: it refuses unconditionally
- * (release_watermark_partial). No durable erasure history from the FULL cutoff through release exists, nor serialized
- * writer checks, so no proof here can authorise a release, whatever the proof or its declared watermark_kind says. The
- * future release is a separate, reviewed consumer of the follow-up history slot; it must also compare the dry receipt's
- * full_run to its selected FULL. The signature takes no watermark: a caller cannot assert complete history.
+ * May bridge_complete release on this proof alone (no manifest)? Only on a proof that is valid, empty with reason ok,
+ * read from 062340's durable all-source history (watermark 0) at exactly this org, epoch and FULL cutoff, read no
+ * longer ago than ERASURE_PROOF_MAX_AGE_MS, with the hold marker_attempted (062340 _release refuses bridge_complete
+ * from any other state). The FULL itself (run, integer start, receipt digest) is bound inside the proof:
+ * erasureWindowProof is "ok" only when 062340's selected_full is exactly the caller's FULL. A 062320-only snapshot
+ * (surviving_two_tables) never releases. The signature takes no watermark: a caller cannot assert complete history.
+ * This is the decision only; releaseEmptyWindowIn makes the read it decides on, under the org key.
  */
-export function releaseOnEmptyWindow(_proof: unknown, _org: string, _epoch: string, _fullCutoffMs: number, _hold: { epoch: string; state: string } | null,
-  _nowMs: number): { ok: false; code: "release_watermark_partial" } {
-  return { ok: false, code: "release_watermark_partial" };
+export function releaseOnEmptyWindow(proof: unknown, org: string, epoch: string, fullCutoffMs: number, nowMs: number):
+  { ok: true; evidence: string } | { ok: false; code: EmptyReleaseRefusal } {
+  if (!validErasureWindowProof(proof)) return { ok: false, code: "release_proof_invalid" };
+  const p = proof as ErasureWindowProof;
+  if (p.watermark_kind !== "erasure_history_all_sources") return { ok: false, code: "release_watermark_partial" };
+  if (!UUID.test(org) || !UUID.test(epoch) || p.org_hash !== orgHash(org) || p.epoch_hash !== epochHash(epoch) || p.cutoff_ms !== fullCutoffMs)
+    return { ok: false, code: "release_binding_mismatch" };
+  if (p.read_at_ms === null || !Number.isSafeInteger(nowMs) || nowMs - p.read_at_ms > ERASURE_PROOF_MAX_AGE_MS || p.read_at_ms > nowMs + 60_000)
+    return { ok: false, code: "release_proof_stale" };
+  if (p.status === "erasure_window_nonempty") return { ok: false, code: "release_window_nonempty" };
+  if (p.status !== "erasure_window_empty" || p.reason !== "ok" || p.watermark_erasures !== 0) return { ok: false, code: "release_window_unproven" };
+  if (p.hold_state !== "marker_attempted") return { ok: false, code: "release_hold_not_attempted" };
+  return { ok: true, evidence: emptyReleaseEvidence(p) };
+}
+
+/**
+ * The org key, EXCLUSIVE, taken first in the release transaction (062320 _lifecycle: (961996,1) SHARED, then the org
+ * key EXCLUSIVE). Every erasure write holds that key SHARED until it commits (062340's recorder, 062320's 'erasure'
+ * check), so this waits for every in-flight erasure, and every later one waits for this transaction.
+ */
+export const EMPTY_RELEASE_LOCK_SQL = "SELECT sessions.ingest_org_admission_hold_lifecycle($1::text)";
+/**
+ * 062340 _release with bridge_complete on an empty window, p_erasures from the final proof read (0 on a release): it
+ * recounts the history under the same key and refuses unless that count, and refuses erasure_window_empty unless 0.
+ */
+export const EMPTY_RELEASE_SQL =
+  "SELECT sessions.ingest_org_admission_hold_release($1::text, $2::uuid, 'bridge_complete', $3::text, 'erasure_window_empty', $4::bigint)";
+/**
+ * The orgs (orgHash, never an id: the repository is public) for which an empty window alone may release: the wave-1
+ * exception, and no other. EMPTY on this head, so every release refuses release_org_not_in_wave before any read; a
+ * separately reviewed commit fills in exactly wave 1's two hashes. Every other org needs the manifest path (062360).
+ */
+export const EMPTY_RELEASE_WAVE_ORG_HASHES: readonly string[] = Object.freeze([]);
+export interface EmptyReleaseInput { org: string; epoch: string; cutoffMs: number; fullRun: string; fullEvidence: string; fullStartedMs: number }
+export type EmptyReleaseResult = { status: "released"; evidence: string; proof: ErasureWindowProof }
+  | { status: "refused"; code: EmptyReleaseRefusal; sqlstate?: string; proof: ErasureWindowProof | null };
+type Tx = { query(text: string, params?: unknown[]): Promise<{ rows: Record<string, unknown>[] }> };
+
+/**
+ * The release's body, inside the caller's READ COMMITTED transaction (062320's lifecycle refuses any other level):
+ *   1. EMPTY_RELEASE_LOCK_SQL: the org key EXCLUSIVE (waits for every in-flight erasure write);
+ *   2. ERASURE_WINDOW_SQL: the final proof read, a new statement snapshot taken after the key was granted, so it sees
+ *      every erasure that committed before the key and none can commit until this transaction ends;
+ *   3. releaseOnEmptyWindow on that proof; on ok, EMPTY_RELEASE_SQL in the same transaction (062340 recounts under the
+ *      key and refuses unless the history since the fence is 0).
+ * A refusal writes nothing (the caller rolls back). A SQL refusal of the release keeps only its SQLSTATE digits. `wave`
+ * is EMPTY_RELEASE_WAVE_ORG_HASHES; only tests pass their own synthetic orgs' hashes. A production caller (the tool's
+ * bridge-release, when wired) must never pass it, and must never take it from an input.
+ */
+export async function releaseEmptyWindowIn(tx: Tx, a: EmptyReleaseInput, now: () => number = Date.now,
+  wave: readonly string[] = EMPTY_RELEASE_WAVE_ORG_HASHES): Promise<EmptyReleaseResult> {
+  // The wave-1 exception only: an org outside it is refused before the lock or any read.
+  if (!UUID.test(a.org) || !wave.includes(orgHash(a.org))) return { status: "refused", code: "release_org_not_in_wave", proof: null };
+  const sqlRefusal = (e: unknown, proof: ErasureWindowProof | null): EmptyReleaseResult => {
+    const c = (e as { code?: unknown }).code;
+    return { status: "refused", code: "release_sql_refused", ...(typeof c === "string" && /^[0-9A-Z]{5}$/u.test(c) ? { sqlstate: c } : {}), proof };
+  };
+  try { await tx.query(EMPTY_RELEASE_LOCK_SQL, [a.org]); } catch (e) { return sqlRefusal(e, null); }
+  let rows: readonly Record<string, unknown>[] = [];
+  try { rows = (await tx.query(ERASURE_WINDOW_SQL, [a.org, String(a.cutoffMs)])).rows; } catch { return { status: "refused", code: "release_proof_invalid", proof: null }; }
+  const proof = erasureWindowProof(a.org, a.epoch, a.cutoffMs, rows, a.fullRun, a.fullEvidence, a.fullStartedMs);
+  const d = releaseOnEmptyWindow(proof, a.org, a.epoch, a.cutoffMs, now());
+  if (!d.ok) return { status: "refused", code: d.code, proof };
+  try { await tx.query(EMPTY_RELEASE_SQL, [a.org, a.epoch, d.evidence, String(proof.watermark_erasures)]); } catch (e) { return sqlRefusal(e, proof); }
+  return { status: "released", evidence: d.evidence, proof };
+}
+
+/** releaseEmptyWindowIn in its own READ COMMITTED transaction: COMMIT only on a release, ROLLBACK otherwise. */
+export async function releaseEmptyWindow(client: Tx, a: EmptyReleaseInput, now: () => number = Date.now,
+  wave: readonly string[] = EMPTY_RELEASE_WAVE_ORG_HASHES): Promise<EmptyReleaseResult> {
+  await client.query("BEGIN ISOLATION LEVEL READ COMMITTED");
+  let r: EmptyReleaseResult;
+  try { r = await releaseEmptyWindowIn(client, a, now, wave); }
+  catch (e) { await client.query("ROLLBACK").catch(() => {}); throw e; }
+  await client.query(r.status === "released" ? "COMMIT" : "ROLLBACK");
+  return r;
 }

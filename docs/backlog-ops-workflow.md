@@ -457,13 +457,36 @@ prove that no event happened. A row deleted again leaves the count unchanged: `i
 removes an `upload_deletions` row on re-enable, for example. And today's 062320 watermark counts
 surviving rows of only two tables.
 
-So on this head `releaseOnEmptyWindow` refuses unconditionally (`release_watermark_partial`),
-whatever the proof or its declared `watermark_kind`, and takes no watermark argument. A future release
-is a separate, reviewed consumer of the follow-up erasure-history slot in the 062320 owner's lane. It
-needs:
-- verified history coverage from the FULL cutoff through the release;
-- serialized writer checks;
-- a comparison of the dry receipt's `full_run` with its selected FULL.
+A 062320-only snapshot (`surviving_two_tables`) therefore never releases. With 062340's durable
+all-source history, the **empty-window release** (`src/session-ingest/erasure-window.ts`, wave 1 only,
+code only and held) releases `bridge_complete` without a manifest, in one READ COMMITTED transaction
+(`releaseEmptyWindowIn`):
+1. **Wave scope first.** The org's hash must be in `EMPTY_RELEASE_WAVE_ORG_HASHES` (hashes, never ids). That
+   list is EMPTY on this head, so every org is refused `release_org_not_in_wave` before any lock or read; a
+   separately reviewed commit adds exactly wave 1's two hashes. Every other org needs the 062360 manifest path.
+2. **The org key, EXCLUSIVE** (`EMPTY_RELEASE_LOCK_SQL`, 062320 `_lifecycle`). Every erasure write holds that
+   key SHARED until it commits (062340's recorder, 062320's `erasure` check), so the release waits for every
+   in-flight erasure, and every later one waits for the release's commit.
+3. **The final proof read** (`ERASURE_WINDOW_SQL`), a later statement of the same transaction, so its snapshot
+   is taken after the key was granted.
+4. **The decision** (`releaseOnEmptyWindow(proof, org, epoch, cutoffMs, now)`, closed refusals
+   `EMPTY_RELEASE_REFUSALS`): a valid proof; `erasure_history_all_sources` with watermark 0; status
+   `erasure_window_empty` with reason `ok` (so the history is bound at `fence_at = installed_at`, covered and
+   recording; `selected_full` is exactly this FULL's run, integer start and receipt digest; every one of the 15
+   sources, including an in-flight user erase created before the install, reads 0 in the window); this org,
+   epoch and FULL cutoff; read within `ERASURE_PROOF_MAX_AGE_MS`; and the hold `marker_attempted`. It takes
+   no watermark argument.
+5. **`_release`** (`EMPTY_RELEASE_SQL`): `bridge_complete`, detail `erasure_window_empty`, `p_erasures` from
+   that read (0), and evidence `emptyReleaseEvidence(proof)` (sha256 over the proof it acted on). 062340
+   recounts the history under the same key and refuses unless 0. The key is held through COMMIT.
+
+A refusal writes nothing and the org stays held. Proven on two real PostgreSQL connections (15, 16, 17;
+`empty-window-release.postgres.test.ts`, in the pg-proof lane): an erase that commits first makes the
+release wait at its lock statement and then refuse `release_window_nonempty`; an erase that follows a
+release waits for it and takes effect under post-release authority. The tool's `bridge-release` still
+refuses (`bridge_release_held`), and `bridge-execute` stays held (`BACKLOG_OPS_BRIDGE_EXECUTE_ENABLED=false`).
+Wiring it (binding the bridge-dry's per-org epoch hash through the credential step) is a separate round;
+enablement and any live run need Khaliq's explicit OK.
 
 With slot 062340 (review/org-erasure-history @ adc8f8f5), the hold status also carries two things:
 - `erasure_history`, the history fence: `fence_at`, which is always the hold's `installed_at`, plus

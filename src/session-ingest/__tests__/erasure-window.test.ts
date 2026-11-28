@@ -25,7 +25,7 @@ import {
 } from "../backlog-ops.ts";
 import {
   ERASURE_HISTORY_TABLES, ERASURE_PROOF_MAX_AGE_MS, ERASURE_SOURCES, ERASURE_SOURCE_EXCLUSIONS, ERASURE_TABLE_NAME, ERASURE_WINDOW_SQL, epochHash,
-  erasureWindowProof, orgHash, releaseOnEmptyWindow, validErasureWindowProof,
+  EMPTY_RELEASE_REFUSALS, EMPTY_RELEASE_WAVE_ORG_HASHES, emptyReleaseEvidence, erasureWindowProof, orgHash, releaseEmptyWindow, releaseOnEmptyWindow, validErasureWindowProof,
 } from "../erasure-window.ts";
 import { applySupabaseSchema } from "./pglite-schema.ts";
 
@@ -290,19 +290,105 @@ test("the proof is empty only with every count 0, a live sealed or attempted hol
   expect(validErasureWindowProof({ ...unproven, status: "erasure_window_empty", reason: "ok" })).toBe(false);
 });
 
-test("release on an empty window: refused unconditionally on this head, whatever the proof or its declared watermark", () => {
-  const attempted = { epoch: E, state: "marker_attempted" };
-  const today = proof(ORG, null, CUT, [row()]);
-  expect(today.watermark_kind).toBe("surviving_two_tables");
-  // Even a proof that read 062340's history (empty, bound, covered, recording) is refused on this head.
-  const declared = proof(ORG, null, CUT, [row({ status: { hold: sealedHold(), erasures: 0, selected_full: selected(CUT), erasure_history: { fence_at: "2026-11-27T06:00:00Z", covered: true,
-    recording: true, by_source: {}, coverage_started_at: "2026-11-20T00:00:00Z" } }, history_cutoff_matches: true, history_full_ordered: true })]);
-  expect([declared.status, declared.watermark_kind]).toEqual(["erasure_window_empty", "erasure_history_all_sources"]);
-  for (const p of [today, declared, { ...declared, watermark_kind: "erasure_history_all_sources" }, null, {}])
-    for (const now of [NOW + 1, NOW + 1000])
-      expect(releaseOnEmptyWindow(p, ORG, E, CUT, attempted, now)).toEqual({ ok: false, code: "release_watermark_partial" });
-  // No seventh argument exists to assert history.
-  expect(releaseOnEmptyWindow.length).toBe(6);
+test("release on an empty window: only a valid, empty, all-source-history proof at this org, epoch and cutoff, fresh, with the hold marker_attempted", () => {
+  const attemptedHold = sealedHold({ state: "marker_attempted", marker_attempted_at: new Date(SEALED + 1).toISOString() });
+  const hist = (over: Record<string, unknown> = {}) => ({ fence_at: "2026-11-27T06:00:00Z", covered: true, recording: true, by_source: {},
+    coverage_started_at: "2026-11-20T00:00:00Z", ...over });
+  const at = (hold: Record<string, unknown>, eh: Record<string, unknown> = {}, erasures = 0, extra: Record<string, unknown> = {}) =>
+    erasureWindowProof(ORG, E, CUT, [row({ status: { hold, erasures, selected_full: selected(CUT), erasure_history: hist(eh) }, history_cutoff_matches: true,
+      history_full_ordered: true, ...extra })], FULL, EV, startedFor(CUT));
+  const good = at(attemptedHold);
+  expect([good.status, good.reason, good.watermark_kind, good.hold_state]).toEqual(["erasure_window_empty", "ok", "erasure_history_all_sources", "marker_attempted"]);
+  expect(releaseOnEmptyWindow(good, ORG, E, CUT, NOW + 1)).toEqual({ ok: true, evidence: emptyReleaseEvidence(good) });
+  expect(emptyReleaseEvidence(good)).toMatch(/^[0-9a-f]{64}$/u);
+  const code = (p: unknown, org = ORG, epoch = E, cut = CUT, now = NOW + 1) => {
+    const r = releaseOnEmptyWindow(p, org, epoch, cut, now);
+    return r.ok ? "ok" : r.code;
+  };
+  // Not a proof, or a tampered one.
+  for (const p of [null, {}, "x", { ...good, watermark_erasures: 1 }, { ...good, status: "erasure_window_empty", reason: "erasures_in_history" }])
+    expect(code(p)).toBe("release_proof_invalid");
+  // 062320 alone (a snapshot of surviving rows) never releases, even empty.
+  const snapshot = proof(ORG, E, CUT, [row({ status: status(attemptedHold, 0) })]);
+  expect([snapshot.status, snapshot.watermark_kind]).toEqual(["erasure_window_empty", "surviving_two_tables"]);
+  expect(code(snapshot)).toBe("release_watermark_partial");
+  // Bound to exactly this org, epoch and FULL cutoff.
+  expect(code(good, ORG2)).toBe("release_binding_mismatch");
+  expect(code(good, ORG, E2)).toBe("release_binding_mismatch");
+  expect(code(good, ORG, E, CUT + 1)).toBe("release_binding_mismatch");
+  expect(code(good, "not-a-uuid")).toBe("release_binding_mismatch");
+  // Fresh: read no longer ago than ERASURE_PROOF_MAX_AGE_MS (and not from the future).
+  expect(code(good, ORG, E, CUT, NOW + ERASURE_PROOF_MAX_AGE_MS)).toBe("ok");
+  expect(code(good, ORG, E, CUT, NOW + ERASURE_PROOF_MAX_AGE_MS + 1)).toBe("release_proof_stale");
+  expect(code(good, ORG, E, CUT, NOW - 61_000)).toBe("release_proof_stale");
+  // Anything in the window, in the history or in the snapshot: not empty.
+  expect(code(at(attemptedHold, { by_source: { upload_deletions: 1 } }, 1))).toBe("release_window_nonempty");
+  expect(code(at(attemptedHold, {}, 0, { upload_deletions: "1" }))).toBe("release_window_nonempty");
+  // Unproven history (not recording, not covering, another FULL) never releases.
+  expect(code(at(attemptedHold, { recording: false }))).toBe("release_window_unproven");
+  expect(code(at(attemptedHold, { covered: false }))).toBe("release_window_unproven");
+  expect(code(erasureWindowProof(ORG, E, CUT, [row({ status: { hold: attemptedHold, erasures: 0, selected_full: selected(CUT, { run: "999" }), erasure_history: hist() },
+    history_cutoff_matches: true, history_full_ordered: true })], FULL, EV, startedFor(CUT)))).toBe("release_window_unproven");
+  // Sealed but no marker attempted: 062340 _release refuses bridge_complete from it, so this does first.
+  expect(code(at(sealedHold()))).toBe("release_hold_not_attempted");
+  // No argument exists to assert history or a watermark.
+  expect(releaseOnEmptyWindow.length).toBe(5);
+  expect([...EMPTY_RELEASE_REFUSALS].sort()).toEqual(["release_binding_mismatch", "release_hold_not_attempted", "release_org_not_in_wave", "release_proof_invalid", "release_proof_stale",
+    "release_sql_refused", "release_watermark_partial", "release_window_nonempty", "release_window_unproven"]);
+});
+
+test("real 062320/062340: the empty-window release takes the org key, re-reads the proof, and releases only an attempted, empty, bound epoch", async () => {
+  const d = await realDb();
+  const ORG5 = "55555555-2222-4333-8444-555555555555";
+  const one = async (sql: string, p: unknown[] = []) => (await d.query<Record<string, unknown>>(sql, p)).rows[0]!;
+  const e = (await one("SELECT sessions.ingest_org_admission_hold_install($1, gen_random_uuid())::text e", [ORG5])).e as string;
+  await d.query("SELECT pg_sleep(0.003)");
+  await d.query("SELECT sessions.ingest_org_admission_hold_seal($1, $2::uuid, $3)", [ORG5, e, EV]);
+  const started = Number((await one("SELECT floor(extract(epoch FROM installed_at) * 1000)::bigint + 1 AS ms FROM sessions.ingest_org_admission_holds WHERE epoch = $1::uuid", [e])).ms);
+  const input = { org: ORG5, epoch: e, cutoffMs: started - 15 * 60_000, fullRun: FULL, fullEvidence: EV, fullStartedMs: started };
+  const state = async () => (await one("SELECT state FROM sessions.ingest_org_admission_holds WHERE epoch = $1::uuid", [e])).state;
+  const go = async (over: Partial<typeof input> = {}) => { await d.query("SELECT pg_sleep(0.003)"); return releaseEmptyWindow(d, { ...input, ...over }, Date.now, [orgHash(ORG5)]); };
+  const codeOf = (r: Awaited<ReturnType<typeof go>>) => (r.status === "released" ? "released" : r.code);
+  // On this head no org is in the wave: refused before the lock or any read, whatever the window.
+  expect(EMPTY_RELEASE_WAVE_ORG_HASHES).toEqual([]);
+  expect(codeOf(await releaseEmptyWindow(d, input))).toBe("release_org_not_in_wave");
+  // Sealed, unbound: the proof is unproven.
+  expect(codeOf(await go())).toBe("release_window_unproven");
+  await d.query("SELECT sessions.ingest_org_erasure_history_bind($1, $2::uuid, $3, $4::bigint, $5)", [ORG5, e, FULL, String(started), EV]);
+  // Bound but only sealed: 062340 releases bridge_complete only from marker_attempted.
+  expect(codeOf(await go())).toBe("release_hold_not_attempted");
+  await d.query(`SELECT sessions.ingest_org_admission_hold_marker_attempt($1, $2::uuid, '${"c".repeat(64)}')`, [ORG5, e]);
+  // Another FULL, another epoch: refused, and nothing written.
+  expect(codeOf(await go({ fullRun: "445" }))).toBe("release_window_unproven");
+  expect(codeOf(await go({ epoch: E2 }))).toBe("release_window_unproven");
+  expect(await state()).toBe("marker_attempted");
+  // An erasure after the fence: not empty, the org stays held.
+  await d.query("INSERT INTO sessions.upload_deletions (org_id, workspace_id, user_id, origin_id, source, session_id) VALUES ($1, 'w', 'u', 'o', 'claude', 's-rel')", [ORG5]);
+  expect(codeOf(await go())).toBe("release_window_nonempty");
+  expect(await state()).toBe("marker_attempted");
+});
+
+test("real 062320/062340: an empty window on an attempted, bound epoch releases with bridge_complete / erasure_window_empty and the proof's evidence", async () => {
+  const d = await realDb();
+  const ORG6 = "66666666-2222-4333-8444-555555555555";
+  const one = async (sql: string, p: unknown[] = []) => (await d.query<Record<string, unknown>>(sql, p)).rows[0]!;
+  const e = (await one("SELECT sessions.ingest_org_admission_hold_install($1, gen_random_uuid())::text e", [ORG6])).e as string;
+  await d.query("SELECT pg_sleep(0.003)");
+  await d.query("SELECT sessions.ingest_org_admission_hold_seal($1, $2::uuid, $3)", [ORG6, e, EV]);
+  const started = Number((await one("SELECT floor(extract(epoch FROM installed_at) * 1000)::bigint + 1 AS ms FROM sessions.ingest_org_admission_holds WHERE epoch = $1::uuid", [e])).ms);
+  await d.query("SELECT sessions.ingest_org_erasure_history_bind($1, $2::uuid, $3, $4::bigint, $5)", [ORG6, e, FULL, String(started), EV]);
+  await d.query(`SELECT sessions.ingest_org_admission_hold_marker_attempt($1, $2::uuid, '${"c".repeat(64)}')`, [ORG6, e]);
+  await d.query("SELECT pg_sleep(0.003)");
+  const r = await releaseEmptyWindow(d, { org: ORG6, epoch: e, cutoffMs: started - 15 * 60_000, fullRun: FULL, fullEvidence: EV, fullStartedMs: started }, Date.now, [orgHash(ORG6)]);
+  expect(r.status).toBe("released");
+  if (r.status !== "released") return;
+  expect(r.evidence).toBe(emptyReleaseEvidence(r.proof));
+  const h = await one("SELECT state, release_reason, release_evidence_sha256 FROM sessions.ingest_org_admission_holds WHERE epoch = $1::uuid", [e]);
+  expect([h.state, h.release_reason, h.release_evidence_sha256]).toEqual(["released", "bridge_complete", r.evidence]);
+  expect((await one("SELECT detail FROM sessions.ingest_org_admission_hold_events WHERE epoch = $1::uuid AND kind = 'released'", [e])).detail).toBe("erasure_window_empty");
+  // A second release of the released epoch: the hold is released, so the proof reads hold_missing; nothing changes.
+  const again = await releaseEmptyWindow(d, { org: ORG6, epoch: e, cutoffMs: started - 15 * 60_000, fullRun: FULL, fullEvidence: EV, fullStartedMs: started }, Date.now, [orgHash(ORG6)]);
+  expect(again.status).toBe("refused");
 });
 
 // ---- the mode ----
