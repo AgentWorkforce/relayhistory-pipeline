@@ -589,10 +589,20 @@ positive erasure set is not wired to a mode. Only the empty-window path above is
     - **One store.** The bridge builds the user erase's effects itself from its own store and key root
       (the S3 ledger's reset, the scoped payload erase); nothing is injected, and the proof functions
       take that same store, so the reset, the erase, both receipts and every re-verification hit one
-      store. The store and its bucket come from one config (`bridgeStore`, which builds the store and
-      records its bucket; there is no other setter): a store not built by it has no bucket and every
-      user erase on it refuses. The binding and the receipt carry that bucket, and it must equal the
-      SQL erase's bucket and key root (`eraseDestination`) before any effect.
+      store. The store and its destination come from one config (`bridgeStore`: the Locker bucket and,
+      when the ledger is relocated, the ledger bucket, each with region and endpoint, and the key root;
+      it builds the store, routed when there are two buckets, and records that destination; there is no
+      other setter). A store not built by it has no destination, and every user erase on it refuses.
+    - **Physical destination evidence**, before any effect, read from the store itself and never from
+      a declaration: the SQL byte phase's own receipt
+      (`src/session-erase/user-erase-byte-receipt.ts`, `<keyRoot>/.ledger/operator-user-erase/`),
+      written by the erase job into the store it erased, must be present for this request and tenant and
+      must name this Locker bucket, region, endpoint, key root and the exact prefixes it verified. With a
+      relocated ledger, the ledger-home marker must name the ledger bucket; without one, a home marker
+      naming another bucket refuses. A bridge misconfigured onto another physical store does not find the
+      receipt there and refuses (`generation_byte_receipt_missing`). **The erase job does not write the
+      receipt yet**: that needs PutObject for the eraser principal on that prefix (a bucket-policy or IAM
+      change, which needs Khaliq's OK), so every user erase still refuses.
     - **Post-effect**, after the reset and the scoped payload erase: a create-only receipt at
       `96bulls/.ledger/hold-bridge/<org>/<epoch>/generations/<hash of the request>.json` (hashes, counts,
       the key root and epoch only) once every byte class of the user is empty below the generation:
@@ -605,7 +615,9 @@ positive erasure set is not wired to a mode. Only the empty-window path above is
       machines the known origins derive: a machine of the user must hold nothing, another user's must be
       attributed by the `machineOwners` port, and an unattributed machine refuses
       (`generation_machine_unattributed`). In every class a key that does not parse refuses
-      (`generation_unreadable`); nothing is skipped. A retry re-derives the receipt and must match it; so does
+      (`generation_unreadable`), and nothing is skipped. Under the user's own admission directory, every
+      object must be one the ledger writes, matched by exact name; a payload in a malformed stream root
+      refuses. A retry re-derives the receipt and must match it; so does
       `bridgeCompleteVerdict`. The erasure receipt is written only after it.
     - Open, stated: the `admissionFencedBefore` evidence source and the `machineOwners` attribution
       source (absent, any other user's machine in the workspace refuses); the publication-generation

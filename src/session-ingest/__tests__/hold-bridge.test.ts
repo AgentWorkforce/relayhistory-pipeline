@@ -37,6 +37,8 @@ import {
 } from "../hold-bridge.ts";
 import { applySupabaseSchema } from "./pglite-schema.ts";
 import { s3LedgerKeys } from "../ledger-s3.ts";
+import { userEraseByteReceipt, userEraseByteReceiptKey, writeUserEraseByteReceipt, type StoreDestination } from "../../session-erase/user-erase-byte-receipt.ts";
+import { userErasePrefixes } from "../../session-erase/user-erase.ts";
 const exists = async (store: ObjectStore, key: string) => (await store.head(objectKey(key))) !== undefined;
 const readJson = async (store: ObjectStore, key: string) => JSON.parse(new TextDecoder().decode(await readAll((await store.getObject(objectKey(key))).body)));
 import type { GenerationPorts } from "../user-erase-generation.ts";
@@ -146,13 +148,27 @@ const userErase: Erasure = { kind: "user", requestId: "req-1", workspaceId: "ws-
 const sessionErase: Erasure = { kind: "session", requestId: "session\nws-2\nclaude\nsess-1", workspaceId: "ws-2", source: "claude", sessionId: "sess-1", atMs: NOW };
 /** The user-erase generation proof's ports over `store` (user-erase-generation.ts): a sealed hold, a bound FULL. */
 export const BUCKET = "bucket-under-test";
-/** A store registered as the bridge's, built for BUCKET (bridgeStore, with the store factory replaced by `inner`). */
-export const asBridge = (inner: ObjectStore, bucket = BUCKET) =>
-  bridgeStore({ bucket, region: "us-east-1", credentials: { accessKeyId: "test", secretAccessKey: "test" } as never }, () => inner);
+const DEST: StoreDestination = { keyRoot: ROOT, main: { bucket: BUCKET, region: "us-east-1", endpoint: null }, ledger: null };
+/**
+ * A store registered as the bridge's (bridgeStore, factory replaced by `inner`), playing the store the SQL erase ran on:
+ * a user erase's byte receipt (user-erase-byte-receipt.ts) is written on first read, as the erase job would.
+ */
+export const asBridge = (inner: ObjectStore, bucket = BUCKET) => {
+  const dest = { ...DEST, main: { ...DEST.main, bucket } };
+  const erased: ObjectStore = { ...inner, backend: inner.backend, head: (k) => inner.head(k), get: (k, r) => inner.get(k, r), list: (p, c) => inner.list(p, c),
+    presignGet: (k, t) => inner.presignGet(k, t), delete: (k) => inner.delete(k), put: (k, b, o) => inner.put(k, b, o),
+    getObject: async (k, r) => {
+      const req = { requestId: "req-1", orgId: ORG, workspaceId: "ws-1", userId: "user-1" };
+      if (String(k) === userEraseByteReceiptKey(ROOT, "req-1") && (await inner.head(k)) === undefined)
+        await writeUserEraseByteReceipt(inner, userEraseByteReceipt(req, { ...dest.main, keyRoot: ROOT }, userErasePrefixes(ROOT, req, []), NOW), "req-1");
+      return inner.getObject(k, r);
+    } };
+  return bridgeStore({ ...dest, credentials: { accessKeyId: "test", secretAccessKey: "test" } as never }, () => erased);
+};
 export function generationDeps(_store: ObjectStore, over: Partial<GenerationPorts> = {}, epoch = E): UserGeneration {
   return {
-    ports: { eraseDestination: { bucket: BUCKET, keyRoot: ROOT }, now: () => NOW, userOrigins: async () => [], admissionFencedBefore: async () => ({ sql: true, direct: true, fallback: true }), ...over },
-    binding: (tenant, e) => ({ bucket: BUCKET, keyRoot: ROOT, tenant, requestId: e.requestId, epoch,
+    ports: { now: () => NOW, userOrigins: async () => [], admissionFencedBefore: async () => ({ sql: true, direct: true, fallback: true }), ...over },
+    binding: (tenant, e) => ({ destination: DEST, keyRoot: ROOT, tenant, requestId: e.requestId, epoch,
       hold: { state: "marker_attempted", installedMs: NOW - 3_600_000, sealedMs: NOW - 1_800_000 },
       full: { run: "full-run-1", startedMs: NOW - 2_700_000, evidenceSha256: SHA }, erasure: { atMs: e.atMs, bytesVerified: e.bytesVerified } }),
   };

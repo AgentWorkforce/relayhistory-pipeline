@@ -40,6 +40,8 @@
 import { createHash } from "node:crypto";
 import { createS3Store, isObjectStoreError, objectKey, readAll, type ObjectStore } from "../shared/vendor.ts";
 import type { S3Config } from "../../packages/object-store/src/index.ts";
+import { ledgerRoutedStore } from "./ledger-store.ts";
+import { sameDestination, validStoreDestination, type StoreBucket, type StoreDestination } from "../session-erase/user-erase-byte-receipt.ts";
 import type { LedgerTenant, SelectionInput } from "./ledger.ts";
 import { s3Ledger, type S3LedgerOptions } from "./ledger-s3.ts";
 import { eraseGenerationLogPayloads } from "./ledger-log-erase.ts";
@@ -226,17 +228,29 @@ export interface ReplayDeps {
  * (store -> bucket) here, module-private, so the bucket a user erase is bound to is always the one its store was built
  * for. There is no other setter; a store not made by bridgeStore has no bucket, and every user erase on it refuses.
  */
-const BRIDGE_BUCKETS = new WeakMap<ObjectStore, string>();
-export interface BridgeStoreConfig { bucket: string; region: string; endpoint?: string; credentials: S3Config["credentials"] }
+const BRIDGE_DESTINATIONS = new WeakMap<ObjectStore, StoreDestination>();
+/**
+ * The bridge store's config: the Locker bucket, and the separate ledger bucket when the ledger is relocated
+ * (INGEST_LEDGER_BUCKET: the store is then ledgerRoutedStore over both), each with its region and endpoint. Routing is
+ * part of the identity.
+ */
+export interface BridgeStoreConfig {
+  keyRoot: string;
+  main: StoreBucket;
+  ledger: StoreBucket | null;
+  credentials: S3Config["credentials"];
+}
 export function bridgeStore(config: BridgeStoreConfig, make: (c: S3Config) => ObjectStore = (c) => createS3Store(c) as unknown as ObjectStore): ObjectStore {
-  if (!config || typeof config.bucket !== "string" || !/^[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]$/u.test(config.bucket)) refuse("bridge_store_config");
-  const cfg: S3Config = { bucket: config.bucket, region: config.region, ...(config.endpoint ? { endpoint: config.endpoint } : {}), credentials: config.credentials };
-  const store = make(cfg);
-  BRIDGE_BUCKETS.set(store, cfg.bucket);
+  const destination: StoreDestination = { keyRoot: config?.keyRoot, main: config?.main && { ...config.main }, ledger: config?.ledger ? { ...config.ledger } : null };
+  if (!validStoreDestination(destination) || (destination.ledger && destination.ledger.bucket === destination.main.bucket)) refuse("bridge_store_config");
+  const s3 = (b: StoreBucket): S3Config => ({ bucket: b.bucket, region: b.region, ...(b.endpoint ? { endpoint: b.endpoint } : {}), credentials: config.credentials });
+  const main = make(s3(destination.main));
+  const store = destination.ledger ? ledgerRoutedStore(main, make(s3(destination.ledger)), destination.keyRoot) : main;
+  BRIDGE_DESTINATIONS.set(store, Object.freeze({ ...destination, main: Object.freeze(destination.main), ledger: destination.ledger && Object.freeze(destination.ledger) }));
   return store;
 }
-/** The bucket `store` was built for by bridgeStore, or undefined. */
-export const bridgeBucket = (store: ObjectStore): string | undefined => BRIDGE_BUCKETS.get(store);
+/** The destination `store` was built for by bridgeStore, or undefined. */
+export const bridgeDestination = (store: ObjectStore): StoreDestination | undefined => BRIDGE_DESTINATIONS.get(store);
 
 export interface UserGeneration {
   ports: GenerationPorts;
@@ -282,7 +296,7 @@ export async function erasureProof(d: Pick<ReplayDeps, "store" | "org" | "keyRoo
   if (!e.bytesVerified) return "erasure_bytes_unverified";
   if (!d.generation) return "erasure_generation_unproven";
   try {
-    return (await verifyGeneration(d.store, d.generation.ports, boundFor(d.generation, bridgeBucket(d.store), d.keyRoot, d.org, d.epoch, e))) === null ? null : "erasure_generation_unproven";
+    return (await verifyGeneration(d.store, d.generation.ports, boundFor(d.generation, bridgeDestination(d.store), d.keyRoot, d.org, d.epoch, e))) === null ? null : "erasure_generation_unproven";
   } catch { return "erasure_generation_unproven"; }
 }
 
@@ -290,10 +304,10 @@ export async function erasureProof(d: Pick<ReplayDeps, "store" | "org" | "keyRoo
  * The caller's binding for a user erasure, checked against THIS replay or gate: the same key root, epoch, tenant,
  * request and erase state. A binding naming anything else would prove (or write a receipt for) another erase.
  */
-function boundFor(g: UserGeneration, bucket: string | undefined, keyRoot: string, org: string, epoch: string, e: Extract<Erasure, { kind: "user" }>): GenerationBinding {
+function boundFor(g: UserGeneration, destination: StoreDestination | undefined, keyRoot: string, org: string, epoch: string, e: Extract<Erasure, { kind: "user" }>): GenerationBinding {
   const tenant = { orgId: org, workspaceId: e.workspaceId, userId: e.userId };
   const b = g.binding(tenant, e);
-  if (!b || bucket === undefined || b.bucket !== bucket || b.keyRoot !== keyRoot || b.epoch !== epoch || b.requestId !== e.requestId || b.tenant?.orgId !== org || b.tenant.workspaceId !== e.workspaceId
+  if (!b || destination === undefined || destination.keyRoot !== keyRoot || !validStoreDestination(b.destination) || !sameDestination(b.destination, destination) || b.keyRoot !== keyRoot || b.epoch !== epoch || b.requestId !== e.requestId || b.tenant?.orgId !== org || b.tenant.workspaceId !== e.workspaceId
       || b.tenant.userId !== e.userId || b.erasure?.atMs !== e.atMs || b.erasure.bytesVerified !== e.bytesVerified) refuse("generation_binding_mismatch");
   return b;
 }
@@ -303,7 +317,7 @@ async function userPreEffect(d: ReplayDeps, e: Extract<Erasure, { kind: "user" }
   if (!e.bytesVerified) return "erasure_bytes_unverified";
   if (!d.generation) return "erasure_generation_unproven";
   try {
-    return await generationPreEffect(d.store, d.generation.ports, boundFor(d.generation, bridgeBucket(d.store), d.keyRoot, d.org, d.epoch, e));
+    return await generationPreEffect(d.store, d.generation.ports, boundFor(d.generation, bridgeDestination(d.store), d.keyRoot, d.org, d.epoch, e));
   } catch (err) {
     return err instanceof GenerationRefused && err.code === "erasure_bytes_unverified" ? "erasure_bytes_unverified" : "erasure_generation_unproven";
   }
@@ -342,7 +356,7 @@ export async function replayErasure(d: ReplayDeps, e: Erasure): Promise<ReplayOu
     if (e.kind === "user") {
       const tenant = { orgId: d.org, workspaceId: e.workspaceId, userId: e.userId };
       let binding: GenerationBinding;
-      try { binding = boundFor(d.generation!, bridgeBucket(d.store), d.keyRoot, d.org, d.epoch, e); } catch { return "erasure_generation_unproven"; }
+      try { binding = boundFor(d.generation!, bridgeDestination(d.store), d.keyRoot, d.org, d.epoch, e); } catch { return "erasure_generation_unproven"; }
       counts.reset = await s3Ledger(d.store, d.keyRoot, { ...d.ledgerOptions, acceptanceMode: "canonical" }).resetUploadedSessions(tenant, e.requestId);
       // The ordinal the reset's begin CAS bound (or the one a retry already had): must be there now, and unchanged.
       let after: { generation: number | null };

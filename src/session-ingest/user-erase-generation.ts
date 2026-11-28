@@ -32,9 +32,10 @@
  *                `admissionFencedBefore`, an evidence port. NOT BUILT: absent, every user erase stays
  *                `generation_admission_unproven`.
  *
- *   Bytes.       SQL `bytes_verified` is required (the SQL byte phase verified userErasePrefixes at its own bucket and
- *                key root, which must be this store's: `eraseDestination`; the receipt binds them). Every read and
- *                write here takes the bridge's one store, never a second one. Every other byte class of the user is checked here,
+ *   Bytes.       SQL `bytes_verified` is required, AND the byte phase's own receipt (user-erase-byte-receipt.ts),
+ *                written by the erase job into the store it erased, must be found in the bridge's store, naming this
+ *                destination and the exact prefixes; with a routed ledger bucket the ledger-home marker must name it.
+ *                A declaration never stands in for that. Every read and write here takes the bridge's one store. Every other byte class of the user is checked here,
  *                generation-bound, read-only (BYTE_CLASSES below). A class that cannot be shown empty below G(R)
  *                refuses; a generic sweeper pass or a bare zero listing never stands in.
  *
@@ -57,12 +58,26 @@ import { INBOX_NAMESPACE } from "./async-admission.ts";
 import { rearmDoneKey } from "./rearm-sweeper.ts";
 import { liveMachineId } from "./writer.ts";
 import { userErasePrefixes } from "../session-erase/user-erase.ts";
+import { byteRequestHash, byteTenantHash, destinationText, prefixesDigest, readUserEraseByteReceipt, sameBucket, validStoreDestination, type StoreDestination,
+  type UserEraseByteReceipt } from "../session-erase/user-erase-byte-receipt.ts";
+import { ledgerHomeKey, validLedgerHome } from "./ledger-store.ts";
 
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/u;
 const HEX64 = /^[0-9a-f]{64}$/u;
 const str = (v: unknown): v is string => typeof v === "string" && v.length > 0 && v.length <= 512;
 const sha = (...parts: string[]) => createHash("sha256").update(JSON.stringify(["user-erase-generation/v1", ...parts])).digest("hex");
 const h32 = (...parts: string[]) => "h_" + sha(...parts).slice(0, 32);
+
+/**
+ * Every object name the ledger writes under a user's admission directory (ledger-s3.ts s3LedgerKeys, ledger-log.ts
+ * logKeysAt and logUserIndex, async-admission.ts journalKey), exactly. Anything else there is unaccounted for.
+ */
+const H32 = "[0-9a-f]{32}";
+export const OWN_ADMIN_OBJECTS = new RegExp("^(?:upload-fences\\.json|privacy-journal\\.json"
+  + `|ledger/batches/o=${H32}/b=${H32}\\.json|ledger/revisions/o=${H32}/r=[0-9a-f]{2,3}\\.json|ledger/owners/o=${H32}/s=${H32}\\.json`
+  + `|ledger/rearm/o=${H32}/${H32}(?:\\.(?:done|corrupt)/${H32})?\\.json|ledger/log-index/o=${H32}\\.json`
+  + `|ledger/log/o=${H32}/(?:e/[0-9]{17}/[0-9]{20}\\.json|c/[0-9]{20}\\.json|m/[0-9]{20}\\.json|s/${H32}\\.json|p/[0-9a-f]{64}\\.json\\.zst`
+  + "|head\\.json|closed\\.json|stream\\.json))$", "u");
 
 /** An erase recorded within this of the hold's install is ambiguous (clock and commit order are not proof). */
 export const ERASE_ORDER_MARGIN_MS = 5_000;
@@ -71,7 +86,7 @@ export type GenerationRefusal =
   | "erasure_bytes_unverified" | "generation_hold_invalid" | "generation_full_unbound" | "generation_pre_install" | "generation_ambiguous"
   | "generation_admission_unproven" | "generation_destination_mismatch" | "generation_fence_unreadable" | "generation_reset_pending"
   | "generation_ordinal_missing" | "generation_reset_unfinished" | "generation_owner_live" | "generation_payloads_remain"
-  | "generation_rearm_pending" | "generation_bytes_remain" | "generation_machine_unattributed" | "generation_receipt_mismatch" | "generation_unreadable";
+  | "generation_rearm_pending" | "generation_bytes_remain" | "generation_machine_unattributed" | "generation_byte_receipt_missing" | "generation_receipt_mismatch" | "generation_unreadable";
 
 export class GenerationRefused extends Error {
   constructor(readonly code: GenerationRefusal) { super(code); this.name = "GenerationRefused"; }
@@ -79,8 +94,12 @@ export class GenerationRefused extends Error {
 
 /** What the erase is bound to. `full`: the FULL 062340 bound to this epoch (run, start ms, the seal's evidence). */
 export interface GenerationBinding {
-  /** The bridge store's bucket (declared with the store; the receipt binds it). */
-  bucket: string;
+  /**
+   * The bridge store's full destination (hold-bridge.ts bridgeStore: the Locker bucket, the routed ledger bucket or
+   * null, the key root), from the store's own construction config. Proven physically before any effect
+   * (destinationProof): the ledger-home marker and the SQL byte phase's receipt, both read from the store itself.
+   */
+  destination: StoreDestination;
   keyRoot: string;
   tenant: LedgerTenant;
   requestId: string;
@@ -105,11 +124,6 @@ export interface GenerationPorts {
    */
   admissionFencedBefore?(b: GenerationBinding): Promise<AdmissionFencing>;
   /**
-   * Where the SQL erase's byte phase ran (its eraser config: SESSION_ERASE_S3_BUCKET and _KEY_ROOT). Must equal the
-   * binding's destination, which the bridge pins to its own store's bucket and key root.
-   */
-  eraseDestination: { bucket: string; keyRoot: string };
-  /**
    * Attribution of upload machines under this workspace: `self` (this user's, beyond the derived ones) or `other`
    * (provably another user's). Every machine found under ws=<ws> in the publication-generation and inbox roots must
    * be this user's (then empty) or attributed `other`. Absent: an empty map, so any other machine refuses.
@@ -127,7 +141,7 @@ export const generationReceiptKey = (keyRoot: string, org: string, epoch: string
   `${keyRoot}/.ledger/hold-bridge/${org}/${epoch}/generations/${h32("request", requestId)}.json`;
 
 function checkBinding(b: GenerationBinding): void {
-  if (!str(b.bucket) || !str(b.keyRoot) || !str(b.tenant?.orgId) || !str(b.tenant.workspaceId) || !str(b.tenant.userId) || !str(b.requestId) || !UUID.test(b.epoch))
+  if (!validStoreDestination(b.destination) || !str(b.keyRoot) || b.destination.keyRoot !== b.keyRoot || !str(b.tenant?.orgId) || !str(b.tenant.workspaceId) || !str(b.tenant.userId) || !str(b.requestId) || !UUID.test(b.epoch))
     refuse("generation_hold_invalid");
   const { hold, erasure } = b;
   if (!hold || !Number.isSafeInteger(hold.installedMs) || hold.installedMs <= 0) refuse("generation_hold_invalid");
@@ -157,7 +171,7 @@ export async function generationPreEffect(store: ObjectStore, p: GenerationPorts
   if (!b.erasure.bytesVerified) refuse("erasure_bytes_unverified");
   if (b.erasure.atMs < b.hold.installedMs) refuse("generation_pre_install");
   if (b.erasure.atMs - b.hold.installedMs < ERASE_ORDER_MARGIN_MS) refuse("generation_ambiguous");
-  if (p.eraseDestination?.bucket !== b.bucket || p.eraseDestination.keyRoot !== b.keyRoot) refuse("generation_destination_mismatch");
+  await destinationProof(store, b);
   let fenced: AdmissionFencing | undefined;
   try { fenced = p.admissionFencedBefore ? await p.admissionFencedBefore(b) : undefined; } catch { fenced = undefined; }
   if (!fenced || fenced.sql !== true || fenced.direct !== true || fenced.fallback !== true) refuse("generation_admission_unproven");
@@ -171,6 +185,30 @@ export async function generationPreEffect(store: ObjectStore, p: GenerationPorts
   return { generation: g };
 }
 
+/**
+ * The destination, proven from the store itself, never from a declaration:
+ *   - the ledger-home marker (ledger-store.ts): with a routed ledger bucket it must exist and name that bucket; without
+ *     one, a marker present must name the Locker bucket (a ledger relocated away refuses);
+ *   - the SQL byte phase's receipt (session-erase/user-erase-byte-receipt.ts), written by the erase job into the store
+ *     it erased: present HERE, for this request and tenant, naming this Locker bucket, region, endpoint and key root.
+ * Returns the byte receipt.
+ */
+async function destinationProof(store: ObjectStore, b: GenerationBinding): Promise<UserEraseByteReceipt> {
+  const d = b.destination;
+  const home = await readJson(store, ledgerHomeKey(b.keyRoot));
+  if (home !== null && !validLedgerHome(home)) refuse("generation_unreadable");
+  if (d.ledger ? !(home && (home as { home: string }).home === d.ledger.bucket) : (home !== null && (home as { home: string }).home !== d.main.bucket))
+    refuse("generation_destination_mismatch");
+  let r: UserEraseByteReceipt | null;
+  try { r = await readUserEraseByteReceipt(store, b.keyRoot, b.requestId); } catch { return refuse("generation_unreadable"); }
+  if (r === null) return refuse("generation_byte_receipt_missing");
+  const t = b.tenant;
+  if (r.request !== byteRequestHash(b.requestId) || r.tenant !== byteTenantHash(t.orgId, t.workspaceId, t.userId)) refuse("generation_destination_mismatch");
+  if (r.destination.keyRoot !== b.keyRoot || !sameBucket({ bucket: r.destination.bucket, region: r.destination.region, endpoint: r.destination.endpoint }, d.main))
+    refuse("generation_destination_mismatch");
+  return r;
+}
+
 const ordinalOf = (f: FenceDoc, requestId: string): number | null =>
   f.resetOrdinals && Object.hasOwn(f.resetOrdinals, requestId) ? f.resetOrdinals[requestId]! : null;
 
@@ -180,7 +218,7 @@ const ordinalOf = (f: FenceDoc, requestId: string): number | null =>
  * The byte classes of one user, beyond SQL's byte phase. Each is read for this (org, workspace, user) and its origins
  * only, and must hold nothing at a generation below G(R):
  *   sql_byte_phase      userErasePrefixes (live objects, pointers, staged and buffered batches, the legacy export
- *                       machine): covered by SQL bytes_verified at `eraseDestination`; recorded here as a digest.
+ *                       machine): covered by SQL bytes_verified; its byte receipt's prefix digest must match.
  *   upload_generations  {org}/upload-generations/g=* /v1/ws=<ws>/m=*: publication generations, which the SQL byte
  *                       phase does not cover. EVERY machine under the workspace is judged (machineOwners): this
  *                       user's must hold nothing (admission is held, so anything is pre-R); another user's must be
@@ -204,7 +242,7 @@ export interface GenerationEvidence {
   request: string;
   tenant: string;
   keyRoot: string;
-  /** sha of (bucket, key root): the store the bridge used, equal to the SQL erase's (eraseDestination). */
+  /** sha of the full destination (Locker and ledger buckets with region and endpoint, key root), proven by destinationProof. */
   destination: string;
   full: string;
   fence: { instance: string; generation: number; resetsCompleted: number };
@@ -233,7 +271,7 @@ async function readJson(store: ObjectStore, key: string): Promise<unknown | null
 export async function generationEvidence(store: ObjectStore, p: GenerationPorts, b: GenerationBinding): Promise<GenerationEvidence> {
   checkBinding(b);
   if (!b.erasure.bytesVerified) refuse("erasure_bytes_unverified");
-  if (p.eraseDestination?.bucket !== b.bucket || p.eraseDestination.keyRoot !== b.keyRoot) refuse("generation_destination_mismatch");
+  const byteReceipt = await destinationProof(store, b);
   const read = await readFenceOf(store, b);
   if (read.state === "absent") refuse("generation_ordinal_missing");
   const f = (read as Extract<FenceRead, { state: "present" }>).fence;
@@ -323,16 +361,23 @@ export async function generationEvidence(store: ObjectStore, p: GenerationPorts,
     if (m) { if (!k.endsWith(".json")) judge(m[1]!); continue; }
     const a = adminRe.exec(rest);
     if (!a) refuse("generation_unreadable");
-    if (`m=${a![1]}` === ownAdmin) continue;
+    if (`m=${a![1]}` === ownAdmin) {
+      // This user's own admission directory: EVERY object must be one the ledger writes, by exact name. A payload in a
+      // malformed stream root (which the log-stream discovery would skip) or any other unknown object refuses.
+      if (!OWN_ADMIN_OBJECTS.test(rest.slice(ownAdmin.length + 1))) refuse("generation_unreadable");
+      continue;
+    }
     if (mine.has(a![1]!)) refuse("generation_bytes_remain");
   }
 
   const prefixes = userErasePrefixes(b.keyRoot, { requestId: b.requestId, orgId: t.orgId, workspaceId: t.workspaceId, userId: t.userId }, sqlOrigins);
+  // The byte phase verified exactly these prefixes (its receipt's digest), at this destination.
+  if (byteReceipt.prefixes !== prefixesDigest(prefixes)) refuse("generation_destination_mismatch");
   return {
     v: 1, kind: "user-erase-generation", epoch: b.epoch, request: h32("request", b.requestId), tenant: h32("tenant", t.orgId, t.workspaceId, t.userId),
-    keyRoot: b.keyRoot, destination: sha("destination", b.bucket, b.keyRoot), full: sha("full", b.full!.run, String(b.full!.startedMs), b.full!.evidenceSha256),
+    keyRoot: b.keyRoot, destination: sha("destination", destinationText(b.destination)), full: sha("full", b.full!.run, String(b.full!.startedMs), b.full!.evidenceSha256),
     fence: { instance: h32("fence", f.instance), generation: G, resetsCompleted: f.resetsCompleted },
-    bytes: { sqlPrefixes: sha("prefixes", ...[...prefixes].sort()), origins: sorted.length, uploadGenerations: 0, inbox: 0, payloads: 0, ownersOld: 0, rearmMarkers },
+    bytes: { sqlPrefixes: byteReceipt.prefixes, origins: sorted.length, uploadGenerations: 0, inbox: 0, payloads: 0, ownersOld: 0, rearmMarkers },
   };
 }
 

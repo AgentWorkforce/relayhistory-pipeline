@@ -15,20 +15,24 @@
  *   - byte classes and bindings: publication generations, the admission inbox, old live owner stubs, old payloads,
  *     the erase's key root, a pending reset, a tampered receipt.
  */
-import { afterEach, describe, expect, test } from "bun:test";
+import { afterEach, describe, expect, setDefaultTimeout, test } from "bun:test";
 import { objectKey, readAll, type ObjectStore } from "../../shared/vendor.ts";
 import type { ClaimInput, CommitInput, LedgerRecord, LedgerTenant } from "../ledger.ts";
 import { appendBatches, enableLogMode, logKeys, putPayload, type LogBatch, type LogKeys, type LogState } from "../ledger-log.ts";
 import { eraseGenerationLogPayloads, eraseLogPayloads } from "../ledger-log-erase.ts";
 import { applyFenceChange, newFence, s3Ledger, s3LedgerKeys, sessionKeyHash, validFence, type FenceDoc } from "../ledger-s3.ts";
-import { bridgeCompleteVerdict, bridgeStore, erasureReceiptKey, replayErasure, requestHash, replayErasures, type Erasure, type Hold, type ReplayDeps, type UserGeneration } from "../hold-bridge.ts";
+import { bridgeCompleteVerdict, bridgeDestination, bridgeStore, erasureReceiptKey, replayErasure, requestHash, replayErasures, type Erasure, type Hold, type ReplayDeps, type UserGeneration } from "../hold-bridge.ts";
 import { ERASE_ORDER_MARGIN_MS, generationEvidence, generationPreEffect, generationReceiptKey, produceGenerationReceipt, verifyGeneration, type GenerationBinding, type GenerationPorts } from "../user-erase-generation.ts";
 import { rearmDoneKey } from "../rearm-sweeper.ts";
 import { originInboxDir } from "../async-admission.ts";
 import { liveMachineId } from "../writer.ts";
 import { scratchStore } from "./support.ts";
+import { userEraseByteReceipt, userEraseByteReceiptKey, writeUserEraseByteReceipt, type StoreBucket, type StoreDestination } from "../../session-erase/user-erase-byte-receipt.ts";
+import { userErasePrefixes } from "../../session-erase/user-erase.ts";
+import { ledgerHomeKey } from "../ledger-store.ts";
 import { createHash } from "node:crypto";
 
+setDefaultTimeout(60_000);
 const ROOT = "96bulls";
 const ORG = "11111111-2222-4333-8444-555555555555";
 const E = "0f0e0d0c-0b0a-4908-8706-050403020100";
@@ -43,11 +47,30 @@ const hex = (v: string) => createHash("sha256").update(v).digest("hex");
 const enc = (v: unknown) => new TextEncoder().encode(JSON.stringify(v));
 
 const cleanups: (() => void)[] = [];
-afterEach(() => cleanups.splice(0).forEach((f) => f()));
+afterEach(() => { cleanups.splice(0).forEach((f) => f()); ERASED.clear(); });
 const BUCKET = "bucket-under-test";
-const asBridge = (inner: ObjectStore, bucket = BUCKET) =>
-  bridgeStore({ bucket, region: "us-east-1", credentials: { accessKeyId: "test", secretAccessKey: "test" } as never }, () => inner);
-const fresh = () => { const s = scratchStore(); cleanups.push(s.done); return asBridge(s.store); };
+const MAIN: StoreBucket = { bucket: BUCKET, region: "us-east-1", endpoint: null };
+const DEST: StoreDestination = { keyRoot: ROOT, main: MAIN, ledger: null };
+/** Requests the tests' SQL erase ran for: request id -> tenant (the stand-in for operator_user_erasures). */
+const ERASED = new Map<string, LedgerTenant>();
+/**
+ * `inner` playing the store the SQL erase's byte phase ran on (`erasedHere`): on first read of a registered request's
+ * byte receipt it writes the real receipt (user-erase-byte-receipt.ts), as the erase job would at bytes_verified, with
+ * the destination it erased and its exact prefixes. A store that is not that one never has it.
+ */
+function erasedOn(inner: ObjectStore, at: StoreBucket & { keyRoot: string } = { ...MAIN, keyRoot: ROOT }): ObjectStore {
+  const wrapped: ObjectStore = { ...inner, backend: inner.backend, head: (k) => inner.head(k), get: (k, r) => inner.get(k, r), list: (p, c) => inner.list(p, c),
+    presignGet: (k, t) => inner.presignGet(k, t), delete: (k) => inner.delete(k), put: (k, b, o) => inner.put(k, b, o),
+    getObject: async (k, r) => {
+      for (const [id, t] of ERASED) if (String(k) === userEraseByteReceiptKey(ROOT, id) && (await inner.head(k)) === undefined)
+        await writeUserEraseByteReceipt(inner, userEraseByteReceipt({ requestId: id, ...t }, at, userErasePrefixes(ROOT, { requestId: id, ...t }, [ORIGIN]), NOW), id);
+      return inner.getObject(k, r);
+    } };
+  return wrapped;
+}
+const asBridge = (inner: ObjectStore, dest: Partial<StoreDestination> = {}, erasedHere = true) =>
+  bridgeStore({ ...DEST, ...dest, credentials: { accessKeyId: "test", secretAccessKey: "test" } as never }, () => (erasedHere ? erasedOn(inner) : inner));
+const fresh = (erasedHere = true) => { const s = scratchStore(); cleanups.push(s.done); return asBridge(s.store, {}, erasedHere); };
 const exists = async (store: ObjectStore, key: string) => (await store.head(objectKey(key))) !== undefined;
 const json = async (store: ObjectStore, key: string) => JSON.parse(new TextDecoder().decode(await readAll((await store.getObject(objectKey(key))).body)));
 const fenceOf = (store: ObjectStore, t: LedgerTenant): Promise<FenceDoc> => json(store, s3LedgerKeys(ROOT, t).fence);
@@ -57,7 +80,7 @@ const fenced = { sql: true, direct: true, fallback: true };
 /** The ports plus, for these tests only, the store the proof functions are called with (the bridge passes its own). */
 type P = GenerationPorts & { store: ObjectStore };
 function ports(store: ObjectStore, over: Partial<GenerationPorts> = {}): P {
-  return { store, eraseDestination: { bucket: BUCKET, keyRoot: ROOT }, now: () => NOW, userOrigins: async () => [ORIGIN], admissionFencedBefore: async () => fenced, ...over };
+  return { store, now: () => NOW, userOrigins: async () => [ORIGIN], admissionFencedBefore: async () => fenced, ...over };
 }
 const evidenceOf = (p: P, b: GenerationBinding) => generationEvidence(p.store, p, b);
 const preOf = (p: P, b: GenerationBinding) => generationPreEffect(p.store, p, b);
@@ -66,7 +89,8 @@ const verifyOf = (p: P, b: GenerationBinding) => verifyGeneration(p.store, p, b)
 const holdView: GenerationBinding["hold"] = { state: "marker_attempted", installedMs: INSTALLED, sealedMs: SEALED };
 const full: GenerationBinding["full"] = { run: "full-run-1", startedMs: FULL_START, evidenceSha256: SHA };
 function binding(t: LedgerTenant, requestId: string, atMs: number, over: Partial<GenerationBinding> = {}): GenerationBinding {
-  return { bucket: BUCKET, keyRoot: ROOT, tenant: t, requestId, epoch: E, hold: holdView, full, erasure: { atMs, bytesVerified: true }, ...over };
+  ERASED.set(requestId, t);
+  return { destination: DEST, keyRoot: ROOT, tenant: t, requestId, epoch: E, hold: holdView, full, erasure: { atMs, bytesVerified: true }, ...over };
 }
 const generation = (store: ObjectStore, over: Partial<GenerationPorts> = {}): UserGeneration => ({
   ports: ports(store, over),
@@ -83,7 +107,7 @@ function observed(base: ObjectStore, calls: string[]): ObjectStore {
   return asBridge({ ...base, backend: base.backend, head: (k) => base.head(k), get: (k, r) => base.get(k, r), getObject: (k, r) => base.getObject(k, r),
     presignGet: (k, t) => base.presignGet(k, t), list: (p, c) => base.list(p, c),
     delete: async (k) => { if (/\/ledger\/log\/o=[0-9a-f]{32}\/p\//u.test(String(k))) note(`payloads:${who(String(k))}`); return base.delete(k); },
-    put: async (k, b, o) => { if (String(k).endsWith("/upload-fences.json")) note(`reset:${who(String(k))}`); return base.put(k, b, o); } });
+    put: async (k, b, o) => { if (String(k).endsWith("/upload-fences.json")) note(`reset:${who(String(k))}`); return base.put(k, b, o); } }, bridgeDestination(base) ?? {}, false);
 }
 function bridgeDeps(base: ObjectStore, calls: string[] = [], over: Partial<ReplayDeps> = {}): ReplayDeps {
   const store = observed(base, calls);
@@ -95,7 +119,7 @@ function bridgeDeps(base: ObjectStore, calls: string[] = [], over: Partial<Repla
   };
 }
 const hold: Hold = { epoch: E, state: "marker_attempted", installedMs: INSTALLED, sealedMs: SEALED, attemptedMs: NOW - 600_000, attemptEvent: true };
-const user = (t: LedgerTenant, requestId: string, atMs: number): Erasure => ({ kind: "user", requestId, workspaceId: t.workspaceId, userId: t.userId, atMs, bytesVerified: true });
+const user = (t: LedgerTenant, requestId: string, atMs: number): Erasure => (ERASED.set(requestId, t), { kind: "user", requestId, workspaceId: t.workspaceId, userId: t.userId, atMs, bytesVerified: true });
 
 // ---- the S3-ledger side: claims, commits, log batches ----
 
@@ -206,7 +230,7 @@ describe("a nonempty erase history through the bridge replay", () => {
         bytes: { uploadGenerations: 0, inbox: 0, payloads: 0, ownersOld: 0, rearmMarkers: 0 }, producedAtMs: NOW });
       for (const id of [t.userId, t.workspaceId, ORG, e.requestId, "sess-old"]) expect(JSON.stringify(r)).not.toContain(id);
     }
-    const proofs = { bucket: BUCKET, generation: d.generation };
+    const proofs = { generation: d.generation };
     expect(await bridgeCompleteVerdict(store, ROOT, ORG, hold, E, [racingSeal, duringHold], proofs)).toEqual({ code: "ok", erasures: 2, receipted: 2 });
     expect(await bridgeCompleteVerdict(store, ROOT, ORG, hold, E, [preInstall, racingSeal, duringHold], proofs)).toEqual({ code: "erasure_unreplayed", erasures: 3, receipted: 2 });
     expect(await bridgeCompleteVerdict(store, ROOT, ORG, hold, E, [racingSeal, duringHold], {})).toMatchObject({ code: "erasure_unreplayed", receipted: 0 });
@@ -226,7 +250,7 @@ describe("a nonempty erase history through the bridge replay", () => {
     expect(r).toMatchObject({ settled: true, erasureCount: 2, replayed: 2, erasure_generation_unproven: 0 });
     expect((await fenceOf(store, A)).resetOrdinals).toEqual({ "req-1": 1, "req-2": 2 });
     expect(calls).toEqual(["reset:user-a"]); // two resets of one user, no payloads
-    expect((await bridgeCompleteVerdict(store, ROOT, ORG, hold, E, [first, late], { bucket: BUCKET, generation: d.generation })).code).toBe("ok");
+    expect((await bridgeCompleteVerdict(store, ROOT, ORG, hold, E, [first, late], { generation: d.generation })).code).toBe("ok");
   });
 });
 
@@ -245,7 +269,7 @@ describe("old-generation writes and new uploads around the boundary", () => {
     expect(await ledgerOn(store).claim(claimInput(A, "again", [rec("r-paused")]))).toMatchObject({ deleted: [["claude", "sess-1"]] });
     // The proof no longer holds until the sweeper erased that exact marker's bytes.
     expect(await verifyGeneration(d.store, d.generation!.ports, binding(A, "req-1", e.atMs))).toBe("generation_rearm_pending");
-    expect((await bridgeCompleteVerdict(store, ROOT, ORG, hold, E, [e], { bucket: BUCKET, generation: d.generation })).code).toBe("erasure_unreplayed");
+    expect((await bridgeCompleteVerdict(store, ROOT, ORG, hold, E, [e], { generation: d.generation })).code).toBe("erasure_unreplayed");
     expect(await replayErasure(d, e)).toBe("erasure_generation_unproven");
     // A done record for OTHER bytes does not count; the one for these bytes does.
     const raw = await readAll((await store.getObject(objectKey(marker))).body);
@@ -254,7 +278,7 @@ describe("old-generation writes and new uploads around the boundary", () => {
     const digest = createHash("sha256").update(raw).digest("hex").slice(0, 32);
     await store.put(objectKey(rearmDoneKey(marker, digest)), enc({ v: 1, outcome: "erased", marker: digest, atMs: NOW }));
     expect(await verifyGeneration(d.store, d.generation!.ports, binding(A, "req-1", e.atMs))).toBeNull();
-    expect((await bridgeCompleteVerdict(store, ROOT, ORG, hold, E, [e], { bucket: BUCKET, generation: d.generation })).code).toBe("ok");
+    expect((await bridgeCompleteVerdict(store, ROOT, ORG, hold, E, [e], { generation: d.generation })).code).toBe("ok");
   });
 
   test("a retry after release: the known reset no-ops and the scoped payload erase keeps the post-release upload (unconditional erase would not)", async () => {
@@ -295,8 +319,8 @@ test("a caller binding naming another epoch, request, tenant or key root never p
   const d = bridgeDeps(store, calls);
   expect(await replayErasure(d, e)).toBe("replayed");
   const swapped: UserGeneration = { ports: good.ports, binding: (t, x) => ({ ...good.binding(t, x), epoch: "1f0e0d0c-0b0a-4908-8706-050403020100" }) };
-  expect((await bridgeCompleteVerdict(store, ROOT, ORG, hold, E, [e], { bucket: BUCKET, generation: swapped })).code).toBe("erasure_unreplayed");
-  expect((await bridgeCompleteVerdict(store, ROOT, ORG, hold, E, [e], { bucket: BUCKET, generation: good })).code).toBe("ok");
+  expect((await bridgeCompleteVerdict(store, ROOT, ORG, hold, E, [e], { generation: swapped })).code).toBe("erasure_unreplayed");
+  expect((await bridgeCompleteVerdict(store, ROOT, ORG, hold, E, [e], { generation: good })).code).toBe("ok");
 });
 
 describe("negative controls (layered-sessions-pipeline counterexamples at 48175448)", () => {
@@ -307,11 +331,11 @@ describe("negative controls (layered-sessions-pipeline counterexamples at 481754
     expect(await replayErasure(d, e)).toBe("erasure_generation_unproven");
     expect(await exists(store, orphan.key)).toBe(true); // the scoped erase never deletes what it cannot attribute
     expect(await exists(store, erasureReceiptKey(ROOT, ORG, E, "req-1"))).toBe(false);
-    expect((await bridgeCompleteVerdict(store, ROOT, ORG, hold, E, [e], { bucket: BUCKET, generation: d.generation })).code).toBe("erasure_unreplayed");
+    expect((await bridgeCompleteVerdict(store, ROOT, ORG, hold, E, [e], { generation: d.generation })).code).toBe("erasure_unreplayed");
     // Orphan collection takes it; the retry then proves.
     await store.delete(objectKey(orphan.key));
     expect(await replayErasure(d, e)).toBe("replayed");
-    expect((await bridgeCompleteVerdict(store, ROOT, ORG, hold, E, [e], { bucket: BUCKET, generation: d.generation })).code).toBe("ok");
+    expect((await bridgeCompleteVerdict(store, ROOT, ORG, hold, E, [e], { generation: d.generation })).code).toBe("ok");
   });
 
   test("(1b) applied residue and an unsnapshotted batch's payload refuse; a payload positively bound at >= G is kept and passes", async () => {
@@ -337,47 +361,75 @@ describe("negative controls (layered-sessions-pipeline counterexamples at 481754
     const a = fresh(), bStore = fresh();
     const old = await logged(a, await stream(a, A), "old", 0);
     const e = user(A, "req-1", SEALED + 1_000);
-    // B: the same key root, request and ordinal, its own fence and generation receipt.
     await ledgerOn(bStore).resetUploadedSessions(A, "req-1");
     await produceOf(ports(bStore), binding(A, "req-1", e.atMs));
-    // A: the fence reset and an erasure receipt only (as a split bridge would leave it), the payload kept.
     await ledgerOn(a).resetUploadedSessions(A, "req-1");
     await a.put(objectKey(erasureReceiptKey(ROOT, ORG, E, "req-1")), enc({ v: 1, kind: "hold-bridge-erasure", epoch: E, request: requestHash("req-1"), erasure: "user",
       counts: { reset: 0, payloads: 0, owners: 0 }, appliedAtMs: NOW }));
     expect(await exists(a, old)).toBe(true);
-    // The gate reads the ONE store it is given: no generation receipt in A, and A's old payload refuses anyway.
     const g = generation(a);
-    expect((await bridgeCompleteVerdict(a, ROOT, ORG, hold, E, [e], { bucket: BUCKET, generation: g })).code).toBe("erasure_unreplayed");
+    expect((await bridgeCompleteVerdict(a, ROOT, ORG, hold, E, [e], { generation: g })).code).toBe("erasure_unreplayed");
     expect(await verifyGeneration(a, g.ports, binding(A, "req-1", e.atMs))).toBe("generation_ordinal_missing");
-    // Copying B's receipt into A does not help: A's evidence (its fence instance, its payload) does not match.
     await a.put(objectKey(generationReceiptKey(ROOT, ORG, E, "req-1")), await readAll((await bStore.getObject(objectKey(generationReceiptKey(ROOT, ORG, E, "req-1")))).body));
     expect(await verifyGeneration(a, g.ports, binding(A, "req-1", e.atMs))).toBe("generation_payloads_remain");
-    expect((await bridgeCompleteVerdict(a, ROOT, ORG, hold, E, [e], { bucket: BUCKET, generation: g })).code).toBe("erasure_unreplayed");
+    expect((await bridgeCompleteVerdict(a, ROOT, ORG, hold, E, [e], { generation: g })).code).toBe("erasure_unreplayed");
   });
 
-  test("(2b) a destination that differs from the SQL erase's refuses before any effect; the bucket comes only from the store's own config", async () => {
-    // A store built (bridgeStore) for bucket A, the SQL erase bound to bucket B: refused, nothing written.
-    const scratch = scratchStore(); cleanups.push(scratch.done);
-    const calls0: string[] = [];
-    const storeA = asBridge(observed(scratch.store, calls0), "bucket-a");
-    const onB = generation(storeA, { eraseDestination: { bucket: "bucket-b", keyRoot: ROOT } });
-    expect(await replayErasure({ ...bridgeDeps(storeA), store: storeA, generation: onB }, user(A, "req-1", SEALED + 1_000))).toBe("erasure_generation_unproven");
-    expect(calls0).toEqual([]);
-    // A store not made by bridgeStore has no bucket at all; a `bucket` field beside it is ignored.
-    const raw = scratchStore(); cleanups.push(raw.done);
-    const loose = { ...bridgeDeps(fresh()), store: raw.store, bucket: BUCKET } as ReplayDeps;
-    expect(await replayErasure(loose, user(A, "req-1", SEALED + 1_000))).toBe("erasure_generation_unproven");
-    expect(await exists(raw.store, s3LedgerKeys(ROOT, A).fence)).toBe(false);
-    for (const over of [{ keyRoot: "other-root" }] as Partial<ReplayDeps>[]) {
-      const store = fresh(), calls: string[] = [];
-      expect(await replayErasure(bridgeDeps(store, calls, over), user(A, "req-1", SEALED + 1_000))).toBe("erasure_generation_unproven");
-      expect(calls).toEqual([]);
-    }
-    // The ports naming another bucket than the bridge's store: also before any effect.
-    const store = fresh(), calls: string[] = [];
-    const g = generation(store, { eraseDestination: { bucket: "sql-erase-bucket", keyRoot: ROOT } });
-    expect(await replayErasure(bridgeDeps(store, calls, { generation: g }), user(A, "req-1", SEALED + 1_000))).toBe("erasure_generation_unproven");
+  test("(2c) physical store B configured with bucket label A throughout: no byte receipt there, refused before any effect; A keeps its old payload", async () => {
+    // The SQL erase ran on physical A (its byte receipt is there); the bridge was misconfigured onto physical B, every
+    // label saying A.
+    const physA = fresh(true), physB = fresh(false);
+    const old = await logged(physA, await stream(physA, A), "old", 0);
+    const e = user(A, "req-1", SEALED + 1_000), calls: string[] = [];
+    const d = bridgeDeps(physB, calls);
+    expect(await replayErasure(d, e)).toBe("erasure_generation_unproven");
     expect(calls).toEqual([]);
+    expect(await exists(physB, s3LedgerKeys(ROOT, A).fence)).toBe(false);
+    expect((await bridgeCompleteVerdict(physB, ROOT, ORG, hold, E, [e], { generation: d.generation })).code).toBe("erasure_unreplayed");
+    await expect(preOf(ports(physB), binding(A, "req-1", e.atMs))).rejects.toMatchObject({ code: "generation_byte_receipt_missing" });
+    expect(await exists(physA, old)).toBe(true);
+    // The same bridge on physical A proves.
+    expect(await replayErasure(bridgeDeps(physA), e)).toBe("replayed");
+    expect(await exists(physA, old)).toBe(false);
+  });
+
+  test("(2b) the destination comes from the store's construction config and is proven in the store: region, endpoint, key root, routing", async () => {
+    const e = user(A, "req-1", SEALED + 1_000);
+    // A store not built by bridgeStore has no destination; a `bucket` field beside it is ignored.
+    const raw = scratchStore(); cleanups.push(raw.done);
+    const loose = { ...bridgeDeps(fresh()), store: raw.store, bucket: BUCKET } as unknown as ReplayDeps;
+    expect(await replayErasure(loose, e)).toBe("erasure_generation_unproven");
+    expect(await exists(raw.store, s3LedgerKeys(ROOT, A).fence)).toBe(false);
+    // The byte phase ran at another region or endpoint than this store's config: its receipt names it, refused.
+    for (const at of [{ ...MAIN, region: "eu-west-1" }, { ...MAIN, endpoint: "https://other.example" }]) {
+      const s1 = scratchStore(); cleanups.push(s1.done);
+      const store = bridgeStore({ ...DEST, credentials: {} as never }, () => erasedOn(s1.store, { ...at, keyRoot: ROOT }));
+      const calls: string[] = [];
+      expect(await replayErasure(bridgeDeps(store, calls), e)).toBe("erasure_generation_unproven");
+      expect(calls).toEqual([]);
+      await expect(preOf(ports(store), binding(A, "req-1", e.atMs))).rejects.toMatchObject({ code: "generation_destination_mismatch" });
+    }
+    // A caller binding naming another destination than the store's own: refused before any effect.
+    const store = fresh(), calls: string[] = [];
+    const g = generation(store);
+    const other: UserGeneration = { ports: g.ports, binding: (t, x) => ({ ...g.binding(t, x), destination: { ...DEST, main: { ...MAIN, bucket: "other-bucket" } } }) };
+    expect(await replayErasure(bridgeDeps(store, calls, { generation: other }), e)).toBe("erasure_generation_unproven");
+    expect(calls).toEqual([]);
+    expect(await replayErasure(bridgeDeps(fresh(), [], { keyRoot: "other-root" }), e)).toBe("erasure_generation_unproven");
+    // Routing: a relocated ledger bucket must be named by the ledger-home marker IN the store; without it, refused.
+    const m = scratchStore(), l = scratchStore(); cleanups.push(m.done, l.done);
+    const LEDGER: StoreBucket = { bucket: "ledger-bucket", region: "us-east-1", endpoint: null };
+    const routed = bridgeStore({ ...DEST, ledger: LEDGER, credentials: {} as never }, (c) => (c.bucket === BUCKET ? erasedOn(m.store) : l.store));
+    expect(bridgeDestination(routed)).toEqual({ ...DEST, ledger: LEDGER });
+    const rb = binding(A, "req-1", e.atMs, { destination: { ...DEST, ledger: LEDGER } });
+    await expect(preOf(ports(routed), rb)).rejects.toMatchObject({ code: "generation_destination_mismatch" });
+    await routed.put(objectKey(ledgerHomeKey(ROOT)), enc({ v: 1, home: "ledger-bucket", writtenAtMs: NOW }));
+    expect(await preOf(ports(routed), rb)).toEqual({ generation: null });
+    // Without routing, a home marker naming another bucket (the ledger moved away) refuses.
+    const moved = fresh();
+    await moved.put(objectKey(ledgerHomeKey(ROOT)), enc({ v: 1, home: "ledger-bucket", writtenAtMs: NOW }));
+    await expect(preOf(ports(moved), binding(A, "req-1", e.atMs))).rejects.toMatchObject({ code: "generation_destination_mismatch" });
+    expect(() => bridgeStore({ ...DEST, ledger: MAIN, credentials: {} as never }, () => raw.store)).toThrow();
   });
 });
 
@@ -449,13 +501,26 @@ describe("byte classes, bindings and receipts", () => {
       `${inbox}/m=${liveMachineId(A.workspaceId, ORIGIN, A.userId)}/r=${"c".repeat(64)}/a=1-2.ndjson`,
       `${inbox}/m=someone/stray.bin`,
       `${keys.dir}/stray.json`,
+      `${keys.dir}/ledger/log/o=unexpected/p/body`,
+      `${keys.dir}/ledger/log/o=${"a".repeat(32)}/p/not-a-payload`,
+      `${keys.dir}/ledger/unknown-class/x.json`,
       `${keys.dir}/ledger/rearm/o=${"a".repeat(32)}/${"b".repeat(32)}.tmp`,
       `${keys.dir}/ledger/rearm/stray.json`,
       `${keys.ownersRoot}/o=${"a".repeat(32)}/stray.json`,
     ]) {
       const store = fresh(), b = await proven(store);
       await store.put(objectKey(odd), enc({}));
-      await expect(evidenceOf(ports(store), b)).rejects.toMatchObject({ code: "generation_unreadable" });
+      // Refused either way (a payload-shaped key inside a real stream root is also counted by the payload class).
+      const code = await evidenceOf(ports(store), b).then(() => null, (e) => e.code);
+      expect(odd.includes("/p/not-a-payload") ? ["generation_unreadable", "generation_payloads_remain"] : ["generation_unreadable"]).toContain(code);
+    }
+    // The lead's reproduction, through the release gate: a payload in a malformed stream root of the user's own
+    // admission directory survives the replay and must hold bridge_complete.
+    {
+      const st = fresh(), e = user(A, "req-1", SEALED + 1_000), d = bridgeDeps(st);
+      await st.put(objectKey(`${keys.dir}/ledger/log/o=unexpected/p/body`), enc({ bytes: "old" }));
+      expect(await replayErasure(d, e)).toBe("erasure_generation_unproven");
+      expect((await bridgeCompleteVerdict(st, ROOT, ORG, hold, E, [e], { generation: d.generation })).code).toBe("erasure_unreplayed");
     }
     // A ledger-shaped object under one of this user's UPLOAD machines is not the ledger's: judged as bytes.
     for (const name of ["ledger/log/o=x/p/y", "upload-fences.json", "privacy-journal.json"]) {
@@ -474,9 +539,14 @@ describe("byte classes, bindings and receipts", () => {
     const pre = (bb: GenerationBinding, p: P = ports(store)) => preOf(p, bb).then(() => null, (e) => e.code);
     expect(await pre(b)).toBeNull();
     expect(await pre({ ...b, erasure: { ...b.erasure, bytesVerified: false } })).toBe("erasure_bytes_unverified");
-    expect(await pre(b, ports(store, { eraseDestination: { bucket: BUCKET, keyRoot: "other-root" } }))).toBe("generation_destination_mismatch");
-    expect(await pre(b, ports(store, { eraseDestination: { bucket: "other-bucket", keyRoot: ROOT } }))).toBe("generation_destination_mismatch");
-    expect(await pre({ ...b, bucket: "" })).toBe("generation_hold_invalid");
+    expect(await pre({ ...b, destination: { ...DEST, keyRoot: "other-root" } })).toBe("generation_hold_invalid");
+    expect(await pre({ ...b, destination: { ...DEST, main: { ...MAIN, bucket: "other-bucket" } } })).toBe("generation_destination_mismatch");
+    expect(await pre({ ...b, destination: { ...DEST, main: { ...MAIN, bucket: "" } } })).toBe("generation_hold_invalid");
+    // A byte receipt for another request or tenant at this key: refused.
+    const st2 = fresh(false);
+    await ledgerOn(st2).resetUploadedSessions(A, "req-1");
+    await writeUserEraseByteReceipt(st2, userEraseByteReceipt({ requestId: "req-1", ...B }, { ...MAIN, keyRoot: ROOT }, [], NOW), "req-1");
+    expect(await pre(b, ports(st2))).toBe("generation_destination_mismatch");
     expect(await pre({ ...b, full: null })).toBe("generation_full_unbound");
     expect(await pre({ ...b, full: { ...full!, startedMs: INSTALLED } })).toBe("generation_full_unbound");
     expect(await pre({ ...b, full: { ...full!, startedMs: SEALED + 1 } })).toBe("generation_full_unbound");
