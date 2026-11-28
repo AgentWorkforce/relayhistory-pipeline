@@ -203,4 +203,26 @@ describe.skipIf(!url)("capture-bound large-read enqueue prototype (real PostgreS
     await o.query("UPDATE sessions.session_index SET deleted_at=now() WHERE org_id=$1", [S.org]);
     expect(await enqueueLargeReadExpected(db, scope, A)).toEqual({ kind: "unavailable" });
   });
+
+  test("9. previously leased A row, B now current (authoritative mismatch): obsolete, zero mutation; A's row and lease byte-identical", async () => {
+    const { o } = await rig();
+    const A = await capture(o);
+    await ordinary(o);
+    expect(await claim(o)).not.toBeNull(); // A's job is running with a live lease
+    await moveEpoch(o); // B commits; nothing re-routes it in this case
+    const before = await job(o);
+    expect(await expected(o, A)).toMatchObject({ enqueued: false, obsolete: true, reason: "incarnation_moved" });
+    expect(await job(o)).toEqual(before);
+    expect(await jobRow(o)).toMatchObject({ state: "running", epoch: A.epoch, leased: true });
+  });
+
+  test("10. previously leased A row, A still current: enqueued, changed false, state running; row and lease byte-identical", async () => {
+    const { o } = await rig();
+    const A = await capture(o);
+    await ordinary(o);
+    expect(await claim(o)).not.toBeNull();
+    const before = await job(o);
+    expect(await expected(o, A)).toMatchObject({ enqueued: true, changed: false, state: "running" });
+    expect(await job(o)).toEqual(before);
+  });
 });
