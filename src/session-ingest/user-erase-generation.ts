@@ -124,8 +124,8 @@ export interface GenerationPorts {
    */
   admissionFencedBefore?(b: GenerationBinding): Promise<AdmissionFencing>;
   /**
-   * Attribution of upload machines under this workspace: `self` (this user's, beyond the derived ones) or `other`
-   * (provably another user's). Every machine found under ws=<ws> in the publication-generation and inbox roots must
+   * Attribution of machines under this workspace: `self` (this user's, beyond the derived ones) or `other` (provably
+   * another user's; this includes other users' admission pseudo-machines, async-admission.ts admissionUserDir). Every machine found under ws=<ws> in the publication-generation and inbox roots must
    * be this user's (then empty) or attributed `other`. Absent: an empty map, so any other machine refuses.
    */
   machineOwners?(b: GenerationBinding): Promise<ReadonlyMap<string, "self" | "other">>;
@@ -171,7 +171,15 @@ export async function generationPreEffect(store: ObjectStore, p: GenerationPorts
   if (!b.erasure.bytesVerified) refuse("erasure_bytes_unverified");
   if (b.erasure.atMs < b.hold.installedMs) refuse("generation_pre_install");
   if (b.erasure.atMs - b.hold.installedMs < ERASE_ORDER_MARGIN_MS) refuse("generation_ambiguous");
-  await destinationProof(store, b);
+  const receipt = await destinationProof(store, b);
+  // The byte phase verified exactly the prefixes this erase's SQL origins give, checked BEFORE any write (and again in
+  // the post-effect evidence): a receipt for another origin set never lets a replay start.
+  let sqlOrigins: readonly string[];
+  try { sqlOrigins = await p.userOrigins(b); } catch { return refuse("generation_unreadable"); }
+  if (!Array.isArray(sqlOrigins) || !sqlOrigins.every(str)) refuse("generation_unreadable");
+  const t = b.tenant;
+  if (receipt.prefixes !== prefixesDigest(userErasePrefixes(b.keyRoot, { requestId: b.requestId, orgId: t.orgId, workspaceId: t.workspaceId, userId: t.userId }, sqlOrigins)))
+    refuse("generation_destination_mismatch");
   let fenced: AdmissionFencing | undefined;
   try { fenced = p.admissionFencedBefore ? await p.admissionFencedBefore(b) : undefined; } catch { fenced = undefined; }
   if (!fenced || fenced.sql !== true || fenced.direct !== true || fenced.fallback !== true) refuse("generation_admission_unproven");
@@ -367,7 +375,10 @@ export async function generationEvidence(store: ObjectStore, p: GenerationPorts,
       if (!OWN_ADMIN_OBJECTS.test(rest.slice(ownAdmin.length + 1))) refuse("generation_unreadable");
       continue;
     }
-    if (mine.has(a![1]!)) refuse("generation_bytes_remain");
+    // Not this user's admission directory: one of this user's upload machines holds bytes; any other machine must be
+    // authoritatively attributed to another user (machineOwners, which covers admission pseudo-machines too). An
+    // admission-shaped name under an unattributed machine is never taken as someone else's directory.
+    judge(a![1]!);
   }
 
   const prefixes = userErasePrefixes(b.keyRoot, { requestId: b.requestId, orgId: t.orgId, workspaceId: t.workspaceId, userId: t.userId }, sqlOrigins);

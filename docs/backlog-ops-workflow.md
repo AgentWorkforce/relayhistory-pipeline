@@ -597,11 +597,14 @@ positive erasure set is not wired to a mode. Only the empty-window path above is
       a declaration: the SQL byte phase's own receipt
       (`src/session-erase/user-erase-byte-receipt.ts`, `<keyRoot>/.ledger/operator-user-erase/`),
       written by the erase job into the store it erased, must be present for this request and tenant and
-      must name this Locker bucket, region, endpoint, key root and the exact prefixes it verified. With a
+      must name this Locker bucket, region, endpoint, key root and the exact prefixes it verified. The
+      prefixes are recomputed from the erase's SQL origins and compared before any write, and again
+      after the effects. With a
       relocated ledger, the ledger-home marker must name the ledger bucket; without one, a home marker
       naming another bucket refuses. A bridge misconfigured onto another physical store does not find the
       receipt there and refuses (`generation_byte_receipt_missing`). **The erase job does not write the
-      receipt yet**: that needs PutObject for the eraser principal on that prefix (a bucket-policy or IAM
+      receipt yet**: that needs PutObject and GetObject (a retry reads back an existing receipt) for the
+      eraser principal, and no other principal, on exactly that prefix (a bucket-policy or IAM
       change, which needs Khaliq's OK), so every user erase still refuses.
     - **Post-effect**, after the reset and the scoped payload erase: a create-only receipt at
       `96bulls/.ledger/hold-bridge/<org>/<epoch>/generations/<hash of the request>.json` (hashes, counts,
@@ -617,7 +620,9 @@ positive erasure set is not wired to a mode. Only the empty-window path above is
       (`generation_machine_unattributed`). In every class a key that does not parse refuses
       (`generation_unreadable`), and nothing is skipped. Under the user's own admission directory, every
       object must be one the ledger writes, matched by exact name; a payload in a malformed stream root
-      refuses. A retry re-derives the receipt and must match it; so does
+      refuses. An admission-shaped name under any other machine counts as another user's directory only
+      when `machineOwners` attributes that machine to another user (which covers other users' admission
+      pseudo-machines); unattributed, it refuses. A retry re-derives the receipt and must match it; so does
       `bridgeCompleteVerdict`. The erasure receipt is written only after it.
     - Open, stated: the `admissionFencedBefore` evidence source and the `machineOwners` attribution
       source (absent, any other user's machine in the workspace refuses); the publication-generation

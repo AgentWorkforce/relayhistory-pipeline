@@ -92,6 +92,11 @@ function binding(t: LedgerTenant, requestId: string, atMs: number, over: Partial
   ERASED.set(requestId, t);
   return { destination: DEST, keyRoot: ROOT, tenant: t, requestId, epoch: E, hold: holdView, full, erasure: { atMs, bytesVerified: true }, ...over };
 }
+/** A tenant's admission pseudo-machine id (async-admission.ts admissionUserDir's last segment). */
+const adminMachine = (t: LedgerTenant) => s3LedgerKeys(ROOT, t).dir.split("/m=").pop()!;
+/** An attribution port naming other tenants' admission pseudo-machines as theirs (stand-in for the authoritative source). */
+const othersAdmin = (...ts: LedgerTenant[]) => async (b: GenerationBinding) =>
+  new Map(ts.filter((t) => t.userId !== b.tenant.userId).map((t) => [adminMachine(t), "other" as const]));
 const generation = (store: ObjectStore, over: Partial<GenerationPorts> = {}): UserGeneration => ({
   ports: ports(store, over),
   binding: (tenant, e) => binding(tenant, e.requestId, e.atMs, { erasure: { atMs: e.atMs, bytesVerified: e.bytesVerified } }),
@@ -211,7 +216,8 @@ describe("a nonempty erase history through the bridge replay", () => {
     const racingInstall = user(D, "req-install", INSTALLED + ERASE_ORDER_MARGIN_MS - 1);
     const racingSeal = user(A, "req-seal", SEALED - 1);
     const duringHold = user(B, "req-hold", SEALED + 60_000);
-    const d = bridgeDeps(store, calls);
+    // Both users' admission directories share the workspace: each is attributed to its own user for the other's proof.
+    const d = bridgeDeps(store, calls, { generation: generation(store, { machineOwners: othersAdmin(A, B) }) });
     const outcomes: Record<string, string> = {};
     for (const e of [preInstall, racingInstall, racingSeal, duringHold]) outcomes[e.requestId] = await replayErasure(d, e);
     expect(outcomes).toEqual({ "req-pre": "erasure_generation_unproven", "req-install": "erasure_generation_unproven", "req-seal": "replayed", "req-hold": "replayed" });
@@ -430,6 +436,46 @@ describe("negative controls (layered-sessions-pipeline counterexamples at 481754
     await moved.put(objectKey(ledgerHomeKey(ROOT)), enc({ v: 1, home: "ledger-bucket", writtenAtMs: NOW }));
     await expect(preOf(ports(moved), binding(A, "req-1", e.atMs))).rejects.toMatchObject({ code: "generation_destination_mismatch" });
     expect(() => bridgeStore({ ...DEST, ledger: MAIN, credentials: {} as never }, () => raw.store)).toThrow();
+  });
+});
+
+describe("negative controls (layered-sessions-pipeline counterexamples at 24b1b97a)", () => {
+  test("(3) an admission-shaped name under an UNATTRIBUTED machine (an origin missing from SQL and stubs) refuses, through replay and the gate", async () => {
+    const store = fresh(), e = user(A, "req-1", SEALED + 1_000), calls: string[] = [];
+    const body = `${originInboxDir(ROOT, A, "origin-missing-everywhere")}/ledger/log/o=unexpected/p/body`;
+    await store.put(objectKey(body), enc({ bytes: "old" }));
+    const d = bridgeDeps(store, calls);
+    expect(await replayErasure(d, e)).toBe("erasure_generation_unproven");
+    expect(await exists(store, erasureReceiptKey(ROOT, ORG, E, "req-1"))).toBe(false);
+    expect((await bridgeCompleteVerdict(store, ROOT, ORG, hold, E, [e], { generation: d.generation })).code).toBe("erasure_unreplayed");
+    expect(await exists(store, body)).toBe(true);
+    await expect(evidenceOf(ports(store), binding(A, "req-1", e.atMs))).rejects.toMatchObject({ code: "generation_machine_unattributed" });
+    // Another tenant's real admission directory, attributed: passes; unattributed: refuses.
+    const st = fresh(), b = binding(A, "req-1", e.atMs);
+    await ledgerOn(st).resetUploadedSessions(A, "req-1");
+    await ledgerOn(st).resetUploadedSessions(B, "req-b");
+    await expect(evidenceOf(ports(st), b)).rejects.toMatchObject({ code: "generation_machine_unattributed" });
+    expect((await evidenceOf(ports(st, { machineOwners: othersAdmin(A, B) }), b)).fence.generation).toBe(1);
+  });
+
+  test("(4) a byte receipt for another SQL origin set refuses BEFORE any write (no reset, no delete), and again after", async () => {
+    const store = fresh(), s = await stream(store, A);
+    const old = await logged(store, s, "old", 0);
+    const e = user(A, "req-1", SEALED + 1_000), calls: string[] = [];
+    // The receipt (erasedOn) covers [ORIGIN]; this erase's SQL view names a second origin.
+    const g = generation(store, { userOrigins: async () => [ORIGIN, "origin-2"] });
+    expect(await replayErasure(bridgeDeps(store, calls, { generation: g }), e)).toBe("erasure_generation_unproven");
+    expect(calls).toEqual([]);
+    expect(await exists(store, s3LedgerKeys(ROOT, A).fence)).toBe(false);
+    expect(await exists(store, old)).toBe(true);
+    await expect(preOf(ports(store, { userOrigins: async () => [ORIGIN, "origin-2"] }), binding(A, "req-1", e.atMs))).rejects.toMatchObject({ code: "generation_destination_mismatch" });
+    // A port that throws is refused before any write too.
+    const calls2: string[] = [];
+    expect(await replayErasure(bridgeDeps(store, calls2, { generation: generation(store, { userOrigins: async () => { throw new Error("x"); } }) }), e)).toBe("erasure_generation_unproven");
+    expect(calls2).toEqual([]);
+    // After the effects, the post-effect evidence re-checks it: matching origins prove, a changed set refuses.
+    expect(await replayErasure(bridgeDeps(store), e)).toBe("replayed");
+    await expect(evidenceOf(ports(store, { userOrigins: async () => [ORIGIN, "origin-2"] }), binding(A, "req-1", e.atMs))).rejects.toMatchObject({ code: "generation_destination_mismatch" });
   });
 });
 

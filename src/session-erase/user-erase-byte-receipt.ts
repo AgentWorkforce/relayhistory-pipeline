@@ -10,6 +10,10 @@
  * user erase stays refused by the bridge (generation_byte_receipt_missing). Hashes, counts and the destination only:
  * no org, workspace, user or request id.
  *
+ * The grant, stated: the eraser principal (and no other) gets PutObject AND GetObject on exactly that prefix. GET is
+ * needed because a retry that finds its receipt already written reads it back to confirm it is the same (create-only
+ * adoption); a strict PutObject-only grant would fail that retry closed.
+ *
  * Threat model, stated: this binds against MISCONFIGURATION (wrong bucket, region, endpoint, key root, routing). A
  * principal that can write this prefix in store B could forge it; the prefix's write grant is the trust boundary.
  */
