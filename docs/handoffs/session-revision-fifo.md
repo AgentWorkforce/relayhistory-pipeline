@@ -46,16 +46,15 @@ scheduled reconcile ──────────────┘
   instead: 5 s, then doubling per receive up to 300 s. Any failure in a group also fails every
   later message of that group in the batch (FIFO partial-batch rule). Followers get the short
   visibility; a message that failed on its own keeps the normal visibility and DLQ path.
-- **Superseded-only batches** (for example the trailing ceil(n/10) batches of a backlog over 10):
-  when every message behind a scope is a stamped revision whose write is no longer live, and none
-  is a delete, the search pass is skipped (`search index skipped`, reason `superseded_in_group`).
-  The newer live write has its own message in the group: already processed (FIFO holds later
-  messages until earlier ones are deleted), in this batch, or still to come. No search state is
-  read, so this does not depend on `SEARCH_INDEX_SKIP_CURRENT_ENABLED`. Unstamped events and
-  deletes always run their pass. Trade-off: if the live write's own pass ended incomplete
-  (`complete: false`, acked as today), a later superseded-only batch no longer reruns it; the next
-  live write or an unstamped event does. A lost live message, with both the writer enqueue and the S3
-  notification lost, falls to the scheduled reconcile, as on the standard path.
+- **Superseded-only batches** (for example the trailing ceil(n/10) batches of a backlog over 10): the
+  search pass is skipped (`search index skipped`, reason `superseded_in_group`) only when coverage is
+  PROVEN. Every message behind the scope must be a stamped revision whose write is no longer live, none
+  may be a delete, and every key's pointer outcome must be `unchanged`, meaning an earlier pass
+  already advanced the pointer to the live write. FIFO deletes that earlier message only after its batch,
+  search pass included, succeeded. If THIS pass advanced the pointer, it runs the search pass itself:
+  the live write's own message may be lost, and reconcile would then see the pointer matching S3 and send
+  nothing (Pipeline review of 51a8721b). No search state is read, so this does not depend on
+  `SEARCH_INDEX_SKIP_CURRENT_ENABLED`.
 - **Enqueue-failure recovery** (commit succeeded, enqueue lost):
   1. the writer hook never fails a write (`WriteTarget.onManifestCommitted`);
   2. the write's own S3 notification is the durable outbox. With `SESSION_EVENTS_MODE=forward`
@@ -63,7 +62,10 @@ scheduled reconcile ──────────────┘
      database or manifest read. A failed forward fails exactly that notification, which the
      standard queue retries and dead-letters as today;
   3. the scheduled reconcile, in forward mode, sends to the FIFO queue too: the net under a lost
-     S3 notification.
+     S3 notification. A reconcile message is a recovery HINT, not the write's identity. The S3
+     listing carries an ETag but no versionId, so it cannot reproduce the writer's ID. It is deduped
+     in its own namespace, one hint per key per reconcile chain link, so it never collides with a
+     write or an earlier hint (an identical-byte re-create has the same ETag).
 - **Erase fences** are unchanged. Deletes arrive through the forwarder in the session's group,
   in order. Operator-erase fences live in the pointer upsert and are not bypassed.
 

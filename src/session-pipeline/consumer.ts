@@ -396,6 +396,12 @@ function supersededOnly(messageIds: readonly string[], revisions: readonly Revis
   const stale = new Set<string>();
   for (const r of revisions) {
     if (r.live || r.event.deleted || (!r.event.version && !r.event.etag)) return false;
+    // Coverage must be PROVEN, not assumed from a message that may be lost (Pipeline review, T126). Only an
+    // `unchanged` pointer proves an earlier pass already advanced this key to the live write. FIFO deletes that
+    // earlier message only after its batch (search pass included) succeeded, so that pass covered it. If THIS
+    // pass advanced the pointer, it is the first to see the live write and must run the search pass itself:
+    // the live write's own event may never come, and reconcile sees the pointer matching S3 and sends nothing.
+    if (r.pointerStatus !== "unchanged") return false;
     stale.add(r.messageId);
   }
   return messageIds.every((id) => stale.has(id));
@@ -415,6 +421,8 @@ interface Revised {
   receiveCount?: number;
   /** This key's pointer work: start and completion on the consumer clock. */
   pointer: { startedAt: number; doneAt: number };
+  /** The pointer pass's outcome for this key: `unchanged` means an EARLIER pass already advanced it to the live write. */
+  pointerStatus: string;
 }
 
 /**
@@ -440,7 +448,7 @@ function checkRevisions(revs: readonly { event: LandedEvent; messageId: string }
         ...(record?.sentAt !== undefined ? { group_lag_ms: Math.max(0, now() - record.sentAt) } : {}),
       });
     }
-    out.push({ event, messageId, live: same, pointer, ...(record?.sentAt !== undefined ? { sentAt: record.sentAt } : {}), ...(record?.receiveCount !== undefined ? { receiveCount: record.receiveCount } : {}) });
+    out.push({ event, messageId, live: same, pointer, pointerStatus: outcome.status, ...(record?.sentAt !== undefined ? { sentAt: record.sentAt } : {}), ...(record?.receiveCount !== undefined ? { receiveCount: record.receiveCount } : {}) });
   }
   return out;
 }

@@ -820,11 +820,11 @@ export function revisionWiring(env: Pick<LambdaEnv, "revisionEvents" | "region">
  * so a manifest whose commit succeeded but whose notification or enqueue was lost re-enters its
  * session's group in order. A send that fails throws, so the reconcile run reports it.
  */
-export async function sendReconcileRevision(sender: RevisionSender, body: string): Promise<void> {
+export async function sendReconcileRevision(sender: RevisionSender, body: string, nonce: string): Promise<void> {
   const parsed = parseQueueBody(body);
   if (parsed.kind !== "events") throw new Error("reconcile body unreadable");
   const { failed } = await sendRevisions(sender, parsed.events.map((e) => ({ key: e.key, ...(e.etag ? { etag: e.etag } : {}),
-    ...(e.version ? { version: e.version } : {}), source: "reconcile" as const })));
+    ...(e.version ? { version: e.version } : {}), nonce, source: "reconcile" as const })));
   if (failed.length) throw new Error("reconcile revision enqueue failed");
 }
 
@@ -840,7 +840,8 @@ async function runReconcile(rt: Runtime, event: ReconcileEvent) {
     ...(event.cursor ? { cursor: event.cursor } : {}),
     send: async (body) => {
       const wiring = revisionWiring(env);
-      if (wiring?.config.mode === "forward") return sendReconcileRevision(wiring.sender, body);
+      // One recovery hint per key per chain link (revision-events.ts RevisionEvent.nonce).
+      if (wiring?.config.mode === "forward") return sendReconcileRevision(wiring.sender, body, `${since.toISOString()}#${event.link ?? 0}`);
       await awsJsonCall({
         service: "sqs",
         target: "AmazonSQS.SendMessage",

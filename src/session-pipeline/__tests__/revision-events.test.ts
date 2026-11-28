@@ -98,20 +98,35 @@ describe("T126 erase/re-create inside one dedup window", () => {
   });
 });
 
-describe("one committed physical manifest: writer, forwarder and reconcile derive the same identity independently", () => {
-  test("same ID from the PUT ack, the S3 notification record and the S3 listing; a re-create gets a distinct one", async () => {
-    // One physical write: versionId v7, ETag e7. Each producer sees it in its own form.
+describe("one committed physical manifest: writer and forwarder share its identity; reconcile is a distinct recovery hint", () => {
+  test("writer (PUT ack) and forwarder (S3 record) derive the same ID; the real S3 listing shape (ETag only) gives reconcile its own hint ID", async () => {
+    // One physical write: versionId v7, ETag e7. The PUT ack and the notification both carry the versionId
+    // (packages/object-store/src/s3.ts put/head); the bucket listing carries only the ETag (s3.ts list).
     const writerQ = fifo(), forwardQ = fifo(), reconcileQ = fifo();
     await writerRevisionHook(writerQ.sender)([{ key: KEY, revision: 1, version: "v7", etag: "e7", committedAt: "2026-11-01T10:00:00.000Z" }]);
     await forwardManifestEvents([{ messageId: "n7", body: s3Body(KEY, { eTag: "\"e7\"", versionId: "v7", sequencer: "07" }) }], forwardQ.sender);
-    await sendReconcileRevision(reconcileQ.sender, JSON.stringify({ reconcile: { key: KEY, etag: "e7", version: "v7" } }));
-    const ids = [writerQ, forwardQ, reconcileQ].map((q) => q.accepted[0]!.MessageDeduplicationId);
-    expect(new Set(ids).size).toBe(1);
+    await sendReconcileRevision(reconcileQ.sender, JSON.stringify({ reconcile: { key: KEY, etag: "e7" } }), "2026-11-01T09:30:00.000Z#0");
+    const [w, f, r] = [writerQ, forwardQ, reconcileQ].map((q) => q.accepted[0]!.MessageDeduplicationId);
+    expect(w).toBe(f);
+    expect(r).not.toBe(w);
     expect(new Set([writerQ, forwardQ, reconcileQ].map((q) => q.accepted[0]!.MessageGroupId)).size).toBe(1);
     // Erase and re-create at the same revision number: a new versionId and ETag, a new ID, same group.
     const recreated = revisionMessage({ key: KEY, revision: 1, version: "v8", etag: "e8", source: "writer" })!;
-    expect(recreated.MessageDeduplicationId).not.toBe(ids[0]);
+    expect(recreated.MessageDeduplicationId).not.toBe(w);
     expect(recreated.MessageGroupId).toBe(writerQ.accepted[0]!.MessageGroupId);
+  });
+
+  test("identical-byte re-create (same ETag, new versionId): writer and forwarder IDs differ from the erased write's; reconcile hints never collide across runs", async () => {
+    const q = fifo();
+    // Incarnation A and its byte-identical re-create B: same ETag, distinct versionIds.
+    await forwardManifestEvents([{ messageId: "a", body: s3Body(KEY, { eTag: "e7", versionId: "vA", sequencer: "01" }) },
+      { messageId: "b", body: s3Body(KEY, { eTag: "e7", versionId: "vB", sequencer: "03" }) }], q.sender);
+    expect(q.accepted.length).toBe(2);
+    // Reconcile hints from the listing (ETag only): one per key per link; a later run is admitted again.
+    await sendReconcileRevision(q.sender, JSON.stringify({ reconcile: { key: KEY, etag: "e7" } }), "2026-11-01T09:30:00.000Z#0");
+    await sendReconcileRevision(q.sender, JSON.stringify({ reconcile: { key: KEY, etag: "e7" } }), "2026-11-01T09:30:00.000Z#0");
+    await sendReconcileRevision(q.sender, JSON.stringify({ reconcile: { key: KEY, etag: "e7" } }), "2026-11-01T10:00:00.000Z#0");
+    expect(q.accepted.length).toBe(4);
   });
 });
 
@@ -184,13 +199,14 @@ describe("enqueue-failure recovery: the forwarder is the outbox", () => {
   });
   test("reconcile re-sends a committed manifest into the group (the net under a lost notification) and throws when SQS refuses", async () => {
     const q = fifo();
-    await sendReconcileRevision(q.sender, JSON.stringify({ reconcile: { key: KEY, etag: "e9", version: "v9" } }));
-    expect(JSON.parse(q.accepted[0]!.MessageBody).revision).toEqual({ key: KEY, source: "reconcile", etag: "e9", version: "v9" });
-    // The same write already sent by the writer dedupes.
+    await sendReconcileRevision(q.sender, JSON.stringify({ reconcile: { key: KEY, etag: "e9" } }), "2026-11-01T09:30:00.000Z#0");
+    expect(JSON.parse(q.accepted[0]!.MessageBody).revision).toEqual({ key: KEY, source: "reconcile", etag: "e9" });
+    // A recovery hint is not the write's identity: the writer's copy of the same write is admitted too (the
+    // consumer coalesces both into one pass).
     await writerRevisionHook(q.sender)([{ key: KEY, revision: 9, version: "v9", etag: "e9", committedAt: "2026-11-01T10:00:00.000Z" }]);
-    expect(q.accepted.length).toBe(1);
+    expect(q.accepted.length).toBe(2);
     const refusing = fifo({ failIds: () => true });
-    await expect(sendReconcileRevision(refusing.sender, JSON.stringify({ reconcile: { key: KEY } }))).rejects.toThrow("reconcile revision enqueue failed");
+    await expect(sendReconcileRevision(refusing.sender, JSON.stringify({ reconcile: { key: KEY } }), "2026-11-01T09:30:00.000Z#0")).rejects.toThrow("reconcile revision enqueue failed");
   });
 });
 

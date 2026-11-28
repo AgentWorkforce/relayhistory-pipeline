@@ -18,10 +18,12 @@
  *
  * The incarnation comes from the S3 versionId. The transcript bucket is versioned, so every PUT,
  * including a re-create after erase that reuses a revision number, gets a new versionId. The
- * writer reads it from the PUT ack, and the forwarder and reconcile read it from the S3 record or
- * listing, so the copies of one write share one ID and SQS keeps a single copy for its 5-minute
- * window. A different write never shares an ID. The revision number is not part of the ID
- * because it can repeat (erase, then re-upload).
+ * writer reads it from the PUT ack and the forwarder from the S3 notification record, so those two
+ * copies of one write share one ID and SQS keeps a single copy for its 5-minute window. A different
+ * write never shares an ID. The revision number is not part of the ID because it can repeat (erase,
+ * then re-upload). Reconcile is a recovery HINT, not a write identity: the S3 listing carries an
+ * ETag but no versionId, so it gets its own namespace, one hint per key per reconcile chain link
+ * (RevisionEvent.nonce), and never collides with a write or an earlier hint.
  *
  * Producers, in order of latency:
  *   1. the writer (writer.ts `onManifestCommitted`), right after its manifest CAS commits;
@@ -55,6 +57,13 @@ export interface RevisionEvent {
   deleted?: boolean;
   /** S3's per-key sequencer, when the producer saw the notification (forwarder). Part of a delete's identity only. */
   sequencer?: string;
+  /**
+   * Reconcile only: the run that sent this recovery hint (its since and chain link). A hint is not a physical-write
+   * identity: the S3 listing carries an ETag but no versionId, so it cannot reproduce the writer's ID. It gets its
+   * own namespace instead: one hint per key per reconcile link, never colliding with a write or an earlier hint
+   * (an identical-byte re-create has the same ETag).
+   */
+  nonce?: string;
   source: RevisionMeta["source"];
 }
 
@@ -85,7 +94,8 @@ export function revisionGroupId(key: string): string | undefined {
  * to its event time. Erase, re-create, erase again inside one dedup window therefore yields two
  * distinct delete IDs, and a delete is never mistaken for the PUT it removes.
  */
-export function revisionDedupId(event: Pick<RevisionEvent, "key" | "version" | "etag" | "deleted" | "sequencer" | "committedAt">): string {
+export function revisionDedupId(event: Pick<RevisionEvent, "key" | "version" | "etag" | "deleted" | "sequencer" | "committedAt"> & { source?: RevisionEvent["source"]; nonce?: string }): string {
+  if (event.source === "reconcile") return sha(["96bulls:revision-recovery", event.key, event.etag ?? "", event.version ?? "", event.nonce ?? ""]);
   if (event.deleted) return sha(["96bulls:revision-dedup", event.key, "delete", event.sequencer ?? "", event.sequencer ? "" : event.committedAt ?? ""]);
   // Neither stamp (a store that returns none): the commit time keeps two writes apart.
   const unstamped = !event.version && !event.etag ? event.committedAt ?? "" : "";
