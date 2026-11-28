@@ -336,6 +336,30 @@ describe.skipIf(!url)("062360 replay manifest on real PostgreSQL", () => {
     expect(await n(o, "SELECT count(*)::int n FROM sessions.session_erasure_replay_completions")).toBe(2);
   });
 
+  test("7. an ownership writer for a target user waits on the erase gate for the whole erase transaction (preflight to commit)", async () => {
+    const db = await database();
+    const o = await owner(db);
+    await seed(o);
+    const p = await pair(db);
+    // The writer's prerequisite, ingest_lock_fences, as every ownership INSERT path calls it first.
+    const r = await expectBlocks(p, { holder: p.a, waiter: p.b, hold: (c) => erase(c),
+      wait: (c) => c.query("SELECT sessions.ingest_lock_fences($1,$2,'u-b')", [ORG, WS]),
+      whileBlocked: async (rc) => {
+        const w = rc.waiting[0] as { locktype?: string; classid?: number; objid?: number; objsubid?: number } | undefined;
+        expect(w).toMatchObject({ locktype: "advisory" });
+        // The capture already ran (targets written, uncommitted); the writer is still waiting on the gate.
+        const seen = (await p.observer.query("SELECT count(*)::int n FROM pg_locks WHERE pid=$1 AND locktype='advisory' AND classid=961996 AND objid=50000 AND objsubid=2 AND NOT granted", [p.b.pid])).rows[0].n;
+        expect(seen).toBe(1);
+      } });
+    expect(r.waited.ok).toBe(true); // proceeds after the erase committed
+    // The recorded targets equal the selection effects: nothing slipped between the preflight and the INSERT.
+    const t = (await o.query(`SELECT user_id,origin_id,source,session_id FROM sessions.session_erasure_replay_targets
+      ORDER BY user_id COLLATE "C",origin_id COLLATE "C",source COLLATE "C",session_id COLLATE "C"`)).rows;
+    const e = (await o.query(`SELECT user_id,origin_id,source,session_id FROM sessions.upload_deletions WHERE org_id=$1
+      ORDER BY user_id COLLATE "C",origin_id COLLATE "C",source COLLATE "C",session_id COLLATE "C"`, [ORG])).rows;
+    expect(t).toEqual(e);
+  });
+
   test("5. down: a populated witness is kept in the reviewed shape and reused by a reapply; an empty one is dropped", async () => {
     const db = await database();
     const o = await owner(db);

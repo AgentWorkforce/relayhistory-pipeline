@@ -376,6 +376,27 @@ describe("062360 session erasure replay manifest", () => {
       { user_id: "u-c", origin_id: TURN_ORIGIN_ID }, { user_id: "u-d", origin_id: TURN_ORIGIN_ID }]);
   });
 
+  test("no ownership row can commit between the preflight and the target INSERT: every live ownership writer takes the erase gate first", async () => {
+    const d = await database();
+    // Every live sessions function that writes ingest_session_ownership calls ingest_lock_fences before that INSERT ...
+    const writers = await rows<{ f: string; s: string }>(d, `SELECT p.oid::regprocedure::text f,p.prosrc s FROM pg_proc p JOIN pg_namespace n ON n.oid=p.pronamespace
+      WHERE n.nspname='sessions' AND p.prosrc ~* 'INSERT\\s+INTO\\s+sessions\\.ingest_session_ownership'`);
+    expect(writers.length).toBeGreaterThan(0);
+    for (const w of writers) {
+      const ins = w.s.search(/INSERT\s+INTO\s+sessions\.ingest_session_ownership/iu);
+      const lock = w.s.search(/ingest_lock_fences\(/u);
+      expect([w.f, lock >= 0 && lock < ins]).toEqual([w.f, true]);
+    }
+    // ... whose first statement INSERTs ingest_fence_owners, firing 050010's statement trigger, which takes the global
+    // erase gate (961996,50000) SHARED. The erase holds it EXCLUSIVE from _session's start to commit.
+    const lockFn = (await rows<{ s: string }>(d, "SELECT prosrc s FROM pg_proc WHERE oid='sessions.ingest_lock_fences(text,text,text)'::regprocedure"))[0]!.s;
+    expect(lockFn).toMatch(/INSERT INTO sessions\.ingest_fence_owners/u);
+    const trg = (await rows<{ f: string; s: string }>(d, `SELECT p.proname f,p.prosrc s FROM pg_trigger t JOIN pg_proc p ON p.oid=t.tgfoid
+      WHERE t.tgrelid='sessions.ingest_fence_owners'::regclass AND t.tgname='ingest_erase_fence_owner_lock' AND t.tgenabled='O'`));
+    expect(trg).toHaveLength(1);
+    expect(trg[0]!.s).toContain("pg_advisory_xact_lock_shared(961996,50000)");
+  });
+
   test("the size bound at the boundary: at the cap the targets are captured, one octet under it none are; effects stay legacy", async () => {
     const legacy = await database(before());
     await scenario(legacy);
