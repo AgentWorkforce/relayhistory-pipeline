@@ -1,6 +1,7 @@
 import {createSemanticClickHouseClient} from "../search-features/semantic-copy-ch.ts";
 import {SemanticPostgresExecutor} from "../search-features/semantic-copy-postgres.ts";
 import { largeReadJobState, routeLargeRead } from "./large-read-worker.ts";
+import { enqueueLargeRead } from "./search-deadline-isolation.ts";
 /**
  * AWS Lambda entry for the sessions-prod session pipeline
  * (stacks/aws/session-pipeline.ts, sessions-pipeline-cloud:hosted-ops/preserved/runbooks/sessions-prod-session-pipeline.md).
@@ -170,6 +171,12 @@ export interface LambdaEnv {
    * before.
    */
   searchSkipOverBound?: true;
+  /**
+   * SEARCH_INDEX_DEADLINE_ISOLATION_ENABLED=true (default off; needs SEARCH_INDEX_ENABLED=1, SEARCH_INDEX_STREAMING_CH=1 and
+   * SESSION_LARGE_READ_HANDOFF_ENABLED=1): a scope whose S3-event pass hit the stream deadline is marked and sent to the
+   * large-read job instead of streaming inline again (search-deadline-isolation.ts). Absent: as before.
+   */
+  searchDeadlineIsolation?: true;
   /** SEARCH_INDEX_PREREAD_ENABLED=true: read a legacy ClickHouse whole scope before its search lock. Default off. */
   searchPreReadEnabled?: boolean;
   /** SESSION_POINTER_PREREAD_ENABLED=true: the pointer stage reads before its scope lock (pointer.ts indexPreRead). Default off. */
@@ -286,6 +293,10 @@ export function lambdaEnv(env: NodeJS.ProcessEnv = process.env, composition?: Se
   const skipOverBound = searchIndexSkipOverBoundFromEnv(env);
   if (skipOverBound && env.SEARCH_INDEX_ENABLED !== "1")
     throw new Error("session pipeline: SEARCH_INDEX_SKIP_OVER_BOUND_ENABLED=true needs SEARCH_INDEX_ENABLED=1");
+  // SEARCH_INDEX_DEADLINE_ISOLATION_ENABLED: strict grammar, default off; on needs streaming on ClickHouse and the large handoff.
+  const deadlineIsolation = searchIndexDeadlineIsolationFromEnv(env);
+  if (deadlineIsolation && (env.SEARCH_INDEX_ENABLED !== "1" || !searchStreamCh || env.SESSION_LARGE_READ_HANDOFF_ENABLED !== "1"))
+    throw new Error("session pipeline: SEARCH_INDEX_DEADLINE_ISOLATION_ENABLED=true needs SEARCH_INDEX_ENABLED=1, SEARCH_INDEX_STREAMING_CH=1 and SESSION_LARGE_READ_HANDOFF_ENABLED=1");
   // SESSION_POINTER_PREREAD_ENABLED: strict grammar, default off.
   const pointerPreRead = pointerPreReadFromEnv(env);
   // SESSION_POINTER_SKIP_ORIGIN_BUCKET_ENABLED: strict grammar, default off.
@@ -320,6 +331,7 @@ export function lambdaEnv(env: NodeJS.ProcessEnv = process.env, composition?: Se
     ...(searchPreRead ? { searchPreReadEnabled: true } : {}),
     ...(skipAcceptanceMissing ? { searchSkipAcceptanceMissing: true as const } : {}),
     ...(skipOverBound ? { searchSkipOverBound: true as const } : {}),
+    ...(deadlineIsolation ? { searchDeadlineIsolation: true as const } : {}),
     ...(pointerPreRead ? { pointerPreReadEnabled: true } : {}),
     ...(pointerSkipOriginBucket ? { pointerSkipOriginBucketEnabled: true } : {}),
     ...(searchStreamCh ? { searchStreamCh } : {}),
@@ -802,6 +814,9 @@ export function runtimeFromSecret(env: LambdaEnv, secretText: string, schemaGene
     deps.replay = { db, store, provider: "s3", bucket: env.bucket, prefix: bindings, readerMaxRuleset: env.readerMaxRuleset };
   }
   if(env.largeScopeHandoffEnabled&&(env.searchEnabled||env.replayPagesEnabled))deps.large={route:scope=>routeLargeRead(db,scope),jobState:scope=>largeReadJobState(db,scope)};
+  // Default off (SEARCH_INDEX_DEADLINE_ISOLATION_ENABLED=true); the env check above guarantees streaming and the handoff.
+  if (env.searchDeadlineIsolation && deps.search?.ch && deps.search.stream && deps.large)
+    deps.deadlineIsolation = { ch: deps.search.ch, enqueue: (scope) => enqueueLargeRead(db, scope), jobState: (scope) => largeReadJobState(db, scope) };
   // The key comes from the secret only; "-disabled" or blank means no model, as in config.ts.
   const key = modelKey({ OPENAI_API_KEY: secret.openai_api_key });
   const briefSettings = briefConfig();
@@ -1409,6 +1424,17 @@ export function searchIndexSkipOverBoundFromEnv(env: Record<string, string | und
   if (value === undefined || value === "" || value === "false") return false;
   if (value === "true") return true;
   throw new Error("session pipeline: SEARCH_INDEX_SKIP_OVER_BOUND_ENABLED must be true or false");
+}
+
+/**
+ * SEARCH_INDEX_DEADLINE_ISOLATION_ENABLED for the hosted Lambda: unset, "" and "false" are off; "true" is on;
+ * anything else fails init naming the variable, never the value.
+ */
+export function searchIndexDeadlineIsolationFromEnv(env: Record<string, string | undefined>): boolean {
+  const value = env.SEARCH_INDEX_DEADLINE_ISOLATION_ENABLED;
+  if (value === undefined || value === "" || value === "false") return false;
+  if (value === "true") return true;
+  throw new Error("session pipeline: SEARCH_INDEX_DEADLINE_ISOLATION_ENABLED must be true or false");
 }
 
 /**

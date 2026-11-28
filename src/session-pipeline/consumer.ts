@@ -19,6 +19,7 @@ import { LEGACY_PROVENANCE_INVALID } from "../session-read-api/legacy-provenance
 import { streamDeadlinePassed } from "../session-read-api/canonical-stream-projection.ts";
 import { captureRefusal, classifyReplayFailure, produceCanonicalReplay, type ReplayProducerDeps } from "./replay-publication.ts";
 import type { LargeJobState, LargeRoute } from "./large-read-worker.ts";
+import { DEADLINE_OVER_BOUND, DEADLINE_ROUTE, deadlineMarked, hitStreamDeadline, markDeadline, type DeadlineIsolationDeps } from "./search-deadline-isolation.ts";
 import { bufferedFeedQueryField, feedBufferedStageByKey, isBufferedStageKey, type BufferedFeedDeps } from "./buffered-search-feed.ts";
 
 export interface QueueRecord {
@@ -61,6 +62,12 @@ export interface ConsumerDeps {
    * canonical-epoch handoff; `jobState` reads the job behind a delegated route, once per routed scope.
    */
   large?: { route: (scope: SessionScope) => Promise<LargeRoute>; jobState?: (scope: SessionScope) => Promise<LargeJobState | null> };
+  /**
+   * Absent by default (SEARCH_INDEX_DEADLINE_ISOLATION_ENABLED=true; search-deadline-isolation.ts): a scope whose
+   * S3-event pass hit the stream deadline is marked and sent to the large-read job, and while its mark lives
+   * its later passes go there too instead of streaming inline again. Absent: exactly the previous behavior.
+   */
+  deadlineIsolation?: DeadlineIsolationDeps;
   /**
    * Put a manifest back on the queue after a delay (SQS DelaySeconds): used when
    * another pass holds the session, so the event is neither lost nor failed.
@@ -223,6 +230,40 @@ function carriedTime(c: Covered): string | undefined {
 
 const scopeId = (s: SessionScope) => JSON.stringify([s.orgId, s.workspaceId, s.harness, s.sessionId]);
 
+/**
+ * Enqueue a deadline-isolated scope's large-read job and log the route. True: the job holds the scope (the inline
+ * pass is not needed). False: the source is unavailable to the job (erased, blocked, no live pointer), so the caller
+ * runs (or has run) the normal pass. An enqueue error propagates: the caller fails the scope's messages for retry.
+ */
+async function routeDeadlineScope(
+  isolation: DeadlineIsolationDeps,
+  scope: SessionScope,
+  trigger: "first_hit" | "marked",
+  phase: Record<string, unknown>,
+  started: number,
+): Promise<boolean> {
+  const ids = { org_id: scope.orgId, workspace_id: scope.workspaceId, harness: scope.harness, session_id: scope.sessionId };
+  const { enqueued, identity } = await isolation.enqueue(scope);
+  if (!enqueued) {
+    log.info("search index over-bound, large-read unavailable", { stage: "search-index", ...ids, reason: DEADLINE_OVER_BOUND, outcome: trigger, route: "inline" });
+    return false;
+  }
+  log.info("search index over-bound, routed to large-read", {
+    stage: "search-index", ...ids, reason: DEADLINE_OVER_BOUND, outcome: trigger, route: DEADLINE_ROUTE,
+    ...(trigger === "marked" ? { ...phase, duration_ms: Date.now() - started } : {}),
+  });
+  if (isolation.jobState) {
+    try {
+      const job = await isolation.jobState(identity ?? scope);
+      if (!job || job.state === "failed")
+        log.warn("large scope job will not be processed", { stage: "large-read", ...ids, state: job?.state ?? "missing", attempt: job?.attempts, reason: job ? "large_job_failed" : "large_job_missing" });
+    } catch (error) {
+      log.warn("large scope job state unavailable", { stage: "large-read", ...ids, ...errorFields(error) });
+    }
+  }
+  return true;
+}
+
 export async function processBatch(records: readonly QueueRecord[], deps: ConsumerDeps): Promise<BatchResponse> {
   const failed = new Set<string>();
   // retryVisibility only: messages with a fast-retry pointer failure, and messages with any other failure.
@@ -373,6 +414,12 @@ export async function processBatch(records: readonly QueueRecord[], deps: Consum
         write_batches: phase.writeBatches,
       });
       try {
+        // SEARCH_INDEX_DEADLINE_ISOLATION_ENABLED=true only: a scope marked by an earlier stream_deadline pass goes to
+        // the large-read job before any read or lock (one bounded ClickHouse read, one autocommit enqueue). A source
+        // the enqueue reports unavailable (erased, blocked, no live pointer) runs the normal pass below.
+        if (deps.deadlineIsolation && (await deadlineMarked(deps.deadlineIsolation, scope))) {
+          if (await routeDeadlineScope(deps.deadlineIsolation, scope, "marked", phaseFields(), started)) continue;
+        }
         // SEARCH_INDEX_STREAMING_CH=1 only (the backport lineage's 6264d119 / 51f876b6): past the invocation's
         // stream deadline no scope of the batch is started (whole read or streamed); the rest are requeued. A
         // requeue that fails fails that scope's messages for redelivery (the catch below), never silently.
@@ -410,6 +457,12 @@ export async function processBatch(records: readonly QueueRecord[], deps: Consum
             stage: "search-index",
             reason: LEGACY_PROVENANCE_INVALID,
           });
+        // SEARCH_INDEX_DEADLINE_ISOLATION_ENABLED=true only: the first deadline hit marks the scope and hands it to the
+        // large-read job, after the pass returned (its transaction and scope lock are released).
+        if (deps.deadlineIsolation && hitStreamDeadline(result)) {
+          await markDeadline(deps.deadlineIsolation, scope);
+          await routeDeadlineScope(deps.deadlineIsolation, scope, "first_hit", phaseFields(), started);
+        }
         const lag = lagFields(covered, messageIds, messages, now());
         if (result.partial)
           log.warn("search index partial", {
