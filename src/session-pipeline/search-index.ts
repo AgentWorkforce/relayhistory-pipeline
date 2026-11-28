@@ -765,7 +765,7 @@ export async function indexSearchScope(scope: SessionScope, deps: SearchIndexDep
     const hold = await acceptanceWatermarkProbe(scope, deps);
     const result = await indexSearchScopeBase(scope, deps, undefined, hold ?? undefined);
     // After COMMIT, outside the locks: the held pass advances the stamp to the pointer set it held on.
-    if (hold && result !== SEARCH_SCOPE_CHANGED && result.acceptanceHold) await advanceAcceptanceStamp(deps.ch!, scope, hold);
+    if (hold && !("unlisted" in hold) && result !== SEARCH_SCOPE_CHANGED && result.acceptanceHold) await advanceAcceptanceStamp(deps.ch!, scope, hold);
     return result as SearchIndexResult;
   }
   // These paths need their existing transaction-bound service/facts/stream contracts. The flag is
@@ -791,8 +791,11 @@ export async function indexSearchScope(scope: SessionScope, deps: SearchIndexDep
 }
 
 function indexSearchScopeBase(scope: SessionScope, deps: SearchIndexDeps): Promise<SearchIndexResult>;
-function indexSearchScopeBase(scope: SessionScope, deps: SearchIndexDeps, prepared: SearchPreRead | undefined, hold?: AcceptanceHold): Promise<SearchIndexResult | typeof SEARCH_SCOPE_CHANGED>;
-async function indexSearchScopeBase(scope: SessionScope, deps: SearchIndexDeps, prepared?: SearchPreRead, hold?: AcceptanceHold): Promise<SearchIndexResult | typeof SEARCH_SCOPE_CHANGED> {
+function indexSearchScopeBase(scope: SessionScope, deps: SearchIndexDeps, prepared: SearchPreRead | undefined, probed?: AcceptanceHold | AcceptanceUnlisted): Promise<SearchIndexResult | typeof SEARCH_SCOPE_CHANGED>;
+async function indexSearchScopeBase(scope: SessionScope, deps: SearchIndexDeps, prepared?: SearchPreRead, probed?: AcceptanceHold | AcceptanceUnlisted): Promise<SearchIndexResult | typeof SEARCH_SCOPE_CHANGED> {
+  const hold = probed && !("unlisted" in probed) ? probed : undefined;
+  // The probe found a manifest that is no longer what its (unchanged) pointer row lists: no skip from a stamp.
+  const unlisted = probed !== undefined && "unlisted" in probed;
   if (Boolean(deps.ch) === Boolean(deps.adapter)) throw new Error("search requires exactly one service binding");
   // The Output/digest facts are ClickHouse tables: a portable adapter has no home for them.
   if (deps.outputFacts && !deps.ch) throw new Error("output facts require the ClickHouse search binding");
@@ -937,7 +940,7 @@ async function indexSearchScopeBase(scope: SessionScope, deps: SearchIndexDeps, 
       const stamp = await readAcceptanceStamp(deps.ch!, stampName);
       // The last pass over this exact pointer set, epoch, window and limits ended incomplete for the
       // acceptance refusal alone, recently: the same outcome, without a read or a write.
-      if (acceptanceStampMatches(stamp, digest, at))
+      if (!unlisted && acceptanceStampMatches(stamp, digest, at))
         return { manifests: 0, rows: 0, inserted: 0, deleted: 0, complete: false, skippedBeforeRead: true, reasons: [ACCEPTANCE_MISSING, SKIPPED_BEFORE_READ] };
       acceptance = { stamp, digest, windowMarker, observed: new Map() };
     } else fromMs = prepared?.fromMs ?? await io.fromMs(at);
@@ -2057,6 +2060,13 @@ export interface AcceptanceWatermark {
   manifests: Array<{ k: string; n: number; c: string; p: string }>;
 }
 
+/**
+ * The probe's other answer. The pointer rows are the stamped ones, but a sibling manifest is no longer what its row
+ * lists (its content was replaced without the row moving: the pointer upsert only takes a HIGHER revision). The
+ * locked pass must not repeat the stamped outcome: it reads in full.
+ */
+interface AcceptanceUnlisted { unlisted: true }
+
 /** What the probe hands the locked pass: the pointer set it proved the refusal for, and the stamp to write after. */
 interface AcceptanceHold {
   digest: string;
@@ -2142,12 +2152,13 @@ function parseAcceptanceWatermark(value: string): { digest: string; watermark: A
  * the stamped acceptance refusal still stands for the scope's CURRENT pointer set (see AcceptanceWatermark for why
  * that is sound). Reads the stamp (one bounded ClickHouse read), the live pointer rows (one short read-only
  * transaction, no lock), the stored window, each sibling manifest and only the chunks added since the watermark.
- * Returns the hold, or null to run the normal pass: no stamp or watermark, too old, a matching digest (the plain
- * skip takes it without any object read), other settings, another sibling set, a manifest not read as listed or
+ * Returns the hold; or `unlisted` when the pointer rows are the stamped ones but a manifest is not (the locked
+ * pass then reads in full, never the plain skip); or null to run the normal pass: no stamp or watermark, too old, a
+ * matching digest whose manifests are all still the stamped ones (the plain skip takes it), other settings, another sibling set, a manifest not read as listed or
  * not scrubbed, an earlier chunk changed or gone, a scope now past the whole-read bounds (the streamed path may
  * take it), a delta past the probe's bounds, every kept id touched, or any error (fail open).
  */
-async function acceptanceWatermarkProbe(scope: SessionScope, deps: SearchIndexDeps): Promise<AcceptanceHold | null> {
+async function acceptanceWatermarkProbe(scope: SessionScope, deps: SearchIndexDeps): Promise<AcceptanceHold | AcceptanceUnlisted | null> {
   try {
     const ch = deps.ch!;
     const limits = { ...SEARCH_INDEX_DEFAULT_LIMITS, ...deps.limits };
@@ -2171,7 +2182,18 @@ async function acceptanceWatermarkProbe(scope: SessionScope, deps: SearchIndexDe
     const { snapshot, facts } = listed;
     const windowMarker = acceptanceWindowMarker(await readState(ch, STATE_WINDOW_START));
     const digest = acceptanceDigest(scope, snapshot, facts, windowMarker, limits, deps.stream, deps.readerMaxRuleset);
-    if (digest === held.digest) return null;
+    if (digest === held.digest) {
+      // The plain skip would repeat the outcome on pointer rows alone. With a watermark, first prove each
+      // manifest still is the one stamped (content chain and chunk count; one manifest read per sibling, no
+      // chunk): a manifest replaced under an unmoved pointer row sends the pass to a full read instead.
+      const stamped = new Map(mark.manifests.map((m) => [m.k, m]));
+      for (const f of facts) {
+        const was = stamped.get(watermarkId(f.manifest_key));
+        const read = await deps.reader.read(f.manifest_key);
+        if (!was || !read || read.manifest.raw.chunks.length !== was.n || String(read.manifest.raw.content_sha256).toLowerCase() !== was.c) return { unlisted: true };
+      }
+      return null;
+    }
     if (acceptanceWatermarkBase(scope, snapshot.canonicalId, windowMarker, limits, deps.stream, deps.readerMaxRuleset) !== mark.base) return null;
     // (1) The same sibling manifest set: a manifest added or gone is another fold input.
     const byKey = new Map(mark.manifests.map((m) => [m.k, m]));

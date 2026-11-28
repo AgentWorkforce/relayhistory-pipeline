@@ -148,6 +148,22 @@ was added after it.
 Anything else runs the normal pass: no watermark, an error of any kind (fail open), or any condition above
 not met.
 
+### A manifest replaced under an unmoved pointer row
+
+The pointer upsert takes only a higher revision. A manifest whose content is replaced at the same revision
+leaves its pointer row as it was, so the pointer set, and with it the stamp's digest, still match.
+
+- **The acceptance skip alone (unchanged, and what the backport does):** it returns before any manifest read.
+  The new content is not indexed until a pointer row moves or the stamp is six hours old. This is the
+  "writers must raise the revision" condition above. It is a known gap of that flag.
+- **With the watermark flag on:** when the digest matches a stamp that carries a watermark, the probe first
+  reads each sibling manifest (no chunk) and compares its chunk count and content chain with the stamped ones.
+  If any differs, the stamp licenses nothing for that pass and it reads in full. A stamp without a watermark
+  (a catalog-key refusal, or more than 64 siblings) keeps the acceptance skip's behaviour.
+
+The test "a manifest replaced with accepted content at the SAME revision, pointer rows unmoved" runs the three
+configurations from the same state and compares each index with a fresh evaluation.
+
 ### Why a hold is correct
 
 The pass indexes nothing while the cross-origin fold refuses one record id group, and a group is built only
@@ -169,6 +185,7 @@ stamp and window reads stay where they were.
 
 - Every pass: one more stamp read, outside the lock. When the stamp carries a watermark: one short read-only
   transaction and one window read as well.
+- A pass the plain skip takes (same pointer set): one manifest read per sibling as well, no chunk.
 - A held pass: one manifest read per sibling, the added chunks, one stamp insert.
 - A probe that does not hold costs what it read, and the normal pass follows.
 

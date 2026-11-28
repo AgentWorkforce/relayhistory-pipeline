@@ -27,6 +27,7 @@ import { exportUnit } from "../../migration/neon-s3-sync/export-session.ts";
 import { closeReplayTemplate, warmReplayTemplate } from "./replay-fixture.ts";
 import { HOSTED_NOW, hostedRig } from "./search-index-hosted-harness.ts";
 import { captureLogs, realHandler, statefulClickHouse } from "./search-index-skip-flags-harness.ts";
+import { objectKey } from "../../../packages/object-store/src/index.ts";
 
 const SKIP: Partial<SearchIndexDeps> = { skipAcceptanceMissing: true };
 const ON: Partial<SearchIndexDeps> = { skipAcceptanceMissing: true, acceptanceWatermark: true };
@@ -507,6 +508,68 @@ describe("what wakes a held scope", () => {
     expect(reconciled.some((l) => l.acceptance_hold !== undefined)).toBe(false);
     expect(stamps().at(-1)!.value).toBe("");
   }, 120_000);
+});
+
+describe("a manifest replaced with accepted content at the SAME revision, pointer rows unmoved", () => {
+  /**
+   * Warm a refusal with `flags`, then replace the contenders' manifests with the accepted content WITHOUT raising
+   * their revision (the pointer upsert only takes a higher revision, so the rows cannot move), deliver the
+   * manifests' events through the real handler, and report what the search stage did.
+   */
+  async function scenario(flags: Partial<SearchIndexDeps>) {
+    const { x, r, state, stamps } = await rig();
+    const send = realHandler(r.consumer({ ch: state.ch, ...flags }));
+    await send(r.messages);
+    const rows = async () => (await r.db.pg.query<{ manifest_key: string; revision: string; sha: string | null; manifest_etag: string | null }>(
+      "SELECT manifest_key, revision::text AS revision, encode(content_sha256, 'hex') AS sha, manifest_etag FROM sessions.session_index ORDER BY manifest_key")).rows;
+    const pointersBefore = await rows();
+    const prior = new Map<string, number>();
+    for (const k of x.keys) prior.set(k, (await x.reader.read(k))!.manifest.revision);
+    await publish(x, [...generate(8), ...appended(4), ...contenders(true)]);
+    let replaced = 0;
+    for (const k of x.keys) {
+      const now = (await x.reader.read(k))!.manifest;
+      if (now.revision === prior.get(k)) continue;
+      await x.store.put(objectKey(k as never), new TextEncoder().encode(JSON.stringify({ ...now, revision: prior.get(k) })), { contentType: "application/json" });
+      replaced += 1;
+    }
+    const reads = r.reads.count;
+    const { result, lines } = await captureLogs(() => send(r.messages));
+    const reconciled = lines.filter((l) => l.message === "search index reconciled").at(-1)!;
+    return {
+      replaced, result, reconciled, pointersMoved: JSON.stringify(await rows()) !== JSON.stringify(pointersBefore),
+      chunkReads: r.reads.count - reads, index: r.fake.dump(), stamp: stamps().at(-1)?.value,
+    };
+  }
+
+  test("both flags off (fresh evaluation), the acceptance skip alone, and the watermark: full pass or not, and whether the index agrees", async () => {
+    const fresh = await scenario({});
+    const skipAlone = await scenario(SKIP);
+    const watermark = await scenario(ON);
+    for (const run of [fresh, skipAlone, watermark]) {
+      expect(run.replaced).toBe(2);
+      expect(run.result).toEqual({ batchItemFailures: [] });
+      // The fixture's premise: the delivery leaves every pointer row exactly as it was.
+      expect(run.pointersMoved).toBe(false);
+    }
+    // Fresh: a full pass reads the accepted content and indexes it.
+    expect(fresh.reconciled).toMatchObject({ ok: true });
+    expect(fresh.chunkReads).toBeGreaterThan(0);
+    expect(fresh.index.length).toBeGreaterThan(0);
+    // The watermark: the probe finds the manifests are not the stamped ones, the stamp licenses nothing, a full
+    // pass runs and the index is the fresh one, row for row. The stamp is cleared.
+    expect(watermark.reconciled).toMatchObject({ ok: true });
+    expect(watermark.reconciled.acceptance_hold).toBeUndefined();
+    expect(watermark.chunkReads).toBeGreaterThan(0);
+    expect(watermark.index).toEqual(fresh.index);
+    expect(watermark.stamp).toBe("");
+    // KNOWN GAP, the acceptance skip alone (unchanged here; the flag prod runs today): its stamp matches the
+    // unmoved pointer rows and it returns before any manifest read, so the accepted content is not indexed until
+    // a pointer row moves or the stamp is SKIP_STATE_MAX_AGE_MS (six hours) old.
+    expect(skipAlone.reconciled).toMatchObject({ ok: false, reason: HELD_REASONS.join(",") });
+    expect(skipAlone.chunkReads).toBe(0);
+    expect(skipAlone.index).not.toEqual(fresh.index);
+  }, 240_000);
 });
 
 describe("SEARCH_INDEX_ACCEPTANCE_WATERMARK_ENABLED in the Lambda", () => {
