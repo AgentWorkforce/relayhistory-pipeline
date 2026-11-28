@@ -55,9 +55,13 @@ const HOLD_DOWN = readFileSync(join(import.meta.dir, "../../../supabase/rollback
 const HISTORY_DOWN = readFileSync(join(import.meta.dir, "../../../supabase/rollbacks/20261105062340_ingest_org_erasure_history.down.sql"), "utf8");
 const CUSTOM_PLANS_DOWN = readFileSync(join(import.meta.dir, "../../../supabase/rollbacks/20261105062330_buffered_search_feed_custom_plans.down.sql"), "utf8");
 // 20261105062350 (the buffered feed page keyset) sits above 062330: its down runs first.
+// 20261105062360 (T139 pointer reincarnation) sits above 062350: its down runs before it.
+const REINCARNATION_DOWN = readFileSync(join(import.meta.dir, "../../../supabase/rollbacks/20261105062360_pointer_reincarnation.down.sql"), "utf8");
 const PAGE_KEYSET_DOWN = readFileSync(join(import.meta.dir, "../../../supabase/rollbacks/20261105062350_buffered_search_feed_page_keyset.down.sql"), "utf8");
 const holdOff = async (pg: PGlite) => {
   // 20261105062350 (the feed page keyset) is rolled back first, then 20261105062340 (the erasure history).
+  const reincarnation = (await pg.query<{ n: number }>("SELECT count(*)::int AS n FROM sessions.__96bulls_migrations WHERE name = 'upstream:20261105062360_pointer_reincarnation.sql'")).rows[0]!.n;
+  if (reincarnation) await pg.exec(REINCARNATION_DOWN);
   const keyset = (await pg.query<{ n: number }>("SELECT count(*)::int AS n FROM sessions.__96bulls_migrations WHERE name = 'upstream:20261105062350_buffered_search_feed_page_keyset.sql'")).rows[0]!.n;
   if (keyset) await pg.exec(PAGE_KEYSET_DOWN);
   const history = (await pg.query<{ n: number }>("SELECT count(*)::int AS n FROM sessions.__96bulls_migrations WHERE name = 'upstream:20261105062340_ingest_org_erasure_history.sql'")).rows[0]!.n;
