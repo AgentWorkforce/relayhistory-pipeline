@@ -225,6 +225,17 @@ export async function processBatch(records: readonly QueueRecord[], deps: Consum
     for (const { scope, messageIds, manifestKey, revisions } of scopes.values()) {
       if (delegated.has(scopeId(scope)) || messageIds.every((id) => failed.has(id))) continue;
       const started = Date.now();
+      if (ordered && supersededOnly(messageIds, revisions)) {
+        // Every message is a stamped revision whose write is no longer live. The newer live write has its
+        // own message in this group: already processed (FIFO holds later messages until earlier ones are
+        // deleted), in this batch, or still to come. So this pass would only repeat it. Independent of
+        // SEARCH_INDEX_SKIP_CURRENT_ENABLED: no search state is read.
+        log.info("search index skipped", {
+          stage: "search-index", org_id: scope.orgId, workspace_id: scope.workspaceId, harness: scope.harness, session_id: scope.sessionId,
+          reason: "superseded_in_group", ...passFields(messageIds, recordOf, now), duration_ms: Date.now() - started,
+        });
+        continue;
+      }
       const phase = searchIndexPhaseMetrics();
       const phaseFields = () => ({
         source_read_ms: phase.sourceReadMs,
@@ -367,6 +378,21 @@ export async function processBatch(records: readonly QueueRecord[], deps: Consum
     }
   }
   return { batchItemFailures: [...failed].map((itemIdentifier) => ({ itemIdentifier })) };
+}
+
+/**
+ * True when every message behind a scope is a stamped revision event (a versionId or ETag) whose write the
+ * pointer pass found not live, and none is a delete. Unstamped events (S3 or reconcile bodies that lack
+ * both) and deletes always run their pass.
+ */
+function supersededOnly(messageIds: readonly string[], revisions: readonly Revised[]): boolean {
+  if (revisions.length === 0) return false;
+  const stale = new Set<string>();
+  for (const r of revisions) {
+    if (r.live || r.event.deleted || (!r.event.version && !r.event.etag)) return false;
+    stale.add(r.messageId);
+  }
+  return messageIds.every((id) => stale.has(id));
 }
 
 /** The event's physical-write digest: the same value as its FIFO MessageDeduplicationId. */

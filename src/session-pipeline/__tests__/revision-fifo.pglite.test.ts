@@ -192,13 +192,42 @@ describe("concurrent revisions of one session: no requeue, no reorder", () => {
     const e2 = await t.writer(2, "r2");
     await t.run([t.record(e2)]);
     expect(t.index.get(t.sid)).toEqual(["r2"]);
+    const passesBefore = t.passes.length;
     const late = await t.run([t.record(e1, T0, 4)]);
     expect(late.result).toEqual({ batchItemFailures: [] });
     expect(t.index.get(t.sid)).toEqual(["r2"]);
+    // A batch of superseded revisions only: no search pass (it would repeat revision 2's), whatever skip-current says.
+    expect(t.passes.length).toBe(passesBefore);
+    expect(named(late.lines, "search index skipped")).toEqual([expect.objectContaining({ reason: "superseded_in_group", coalesced: 1 })]);
     expect(named(late.lines, "revision superseded")).toEqual([expect.objectContaining({ revision: 1, superseded_by_revision: 2 })]);
     expect(named(late.lines, "revision searchable")).toEqual([]);
     const row = await t.r.row();
     expect(row).toEqual([expect.objectContaining({ revision: "2", deleted_at: null })]);
+  });
+});
+
+describe("trailing superseded batches (ceil(n/10) passes) skip the search pass", () => {
+  test("a backlog over 10: batches of only superseded stamped revisions run no search pass; the live write's own batch does; unstamped events always run", async () => {
+    const t = await rig();
+    const events: RevisionEvent[] = [];
+    for (let rev = 1; rev <= 12; rev++) events.push(await t.writer(rev, `r${rev}`));
+    // 12 queued for the group: the ESM delivers 10, then 2. The live write (revision 12) is in the second batch.
+    const first = await t.run(events.slice(0, 10).map((e) => t.record(e)));
+    expect(first.result).toEqual({ batchItemFailures: [] });
+    // Every message is superseded and revision 12's own message is still to come: no pass yet.
+    expect(t.passes.length).toBe(0);
+    expect(named(first.lines, "search index skipped")).toEqual([expect.objectContaining({ reason: "superseded_in_group", coalesced: 10 })]);
+    // The second batch carries revision 11 (superseded) and 12 (live): one pass, the live content.
+    const second = await t.run(events.slice(10).map((e) => t.record(e)));
+    expect(t.passes.length).toBe(1);
+    expect(t.index.get(t.sid)).toEqual(["r12"]);
+    expect(named(second.lines, "revision searchable")).toEqual([expect.objectContaining({ revision: 12 })]);
+    // A late redelivery of superseded-only stamped events: skipped.
+    await t.run([t.record(events[2]!), t.record(events[5]!)]);
+    expect(t.passes.length).toBe(1);
+    // An unstamped event (a reconcile body without stamps) always runs.
+    await t.run([t.record({ key: events[0]!.key, source: "reconcile" })]);
+    expect(t.passes.length).toBe(2);
   });
 });
 

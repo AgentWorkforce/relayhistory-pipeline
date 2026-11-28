@@ -46,6 +46,16 @@ scheduled reconcile ──────────────┘
   instead: 5 s, then doubling per receive up to 300 s. Any failure in a group also fails every
   later message of that group in the batch (FIFO partial-batch rule). Followers get the short
   visibility; a message that failed on its own keeps the normal visibility and DLQ path.
+- **Superseded-only batches** (for example the trailing ceil(n/10) batches of a backlog over 10):
+  when every message behind a scope is a stamped revision whose write is no longer live, and none
+  is a delete, the search pass is skipped (`search index skipped`, reason `superseded_in_group`).
+  The newer live write has its own message in the group: already processed (FIFO holds later
+  messages until earlier ones are deleted), in this batch, or still to come. No search state is
+  read, so this does not depend on `SEARCH_INDEX_SKIP_CURRENT_ENABLED`. Unstamped events and
+  deletes always run their pass. Trade-off: if the live write's own pass ended incomplete
+  (`complete: false`, acked as today), a later superseded-only batch no longer reruns it; the next
+  live write or an unstamped event does. A lost live message, with both the writer enqueue and the S3
+  notification lost, falls to the scheduled reconcile, as on the standard path.
 - **Enqueue-failure recovery** (commit succeeded, enqueue lost):
   1. the writer hook never fails a write (`WriteTarget.onManifestCommitted`);
   2. the write's own S3 notification is the durable outbox. With `SESSION_EVENTS_MODE=forward`
