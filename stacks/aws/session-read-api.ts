@@ -24,6 +24,7 @@
  * `sessionPipeline.analysisJobs` (transcript-store.ts sessionAnalysisJobPhase).
  */
 import * as AWS from "@alchemy.run/aws";
+import * as Output from "alchemy/Output";
 import * as Effect from "effect/Effect";
 
 export interface SessionReadApiInputs {
@@ -71,13 +72,33 @@ export interface SessionReadApiInputs {
    * 062090 applied, and each workspace still needs the `relayfacts` canary.
    */
   relayfacts?: boolean;
+  /**
+   * The outcome alarm (`session-read-api-outcome-alarm`): the share of /v1 reads answered 501 or 503 over one window.
+   * Every field optional; defaults in {@link OUTCOME_ALARM_DEFAULTS}. The function never fails these requests, so the
+   * Errors alarm stays quiet while Cloud falls back on every read; this alarm is the one that notices.
+   */
+  outcomeAlarm?: SessionReadApiOutcomeAlarmInputs;
 }
+
+export interface SessionReadApiOutcomeAlarmInputs {
+  /** Alarm when more than this percent of reads in the window answered 501/503 (1-99). Default 50. */
+  thresholdPercent?: number;
+  /** The window, in minutes (an integer 5-360). Default 30. */
+  windowMinutes?: number;
+  /** Fewer reads than this in the window never alarm (an integer >= 1). Default 20. */
+  minRequests?: number;
+}
+
+export const OUTCOME_ALARM_DEFAULTS = { thresholdPercent: 50, windowMinutes: 30, minRequests: 20 } as const;
 
 export const SESSION_READ_API_RESOURCES = [
   "session-read-api",
   "session-read-api-secret",
   "session-read-api-errors-alarm",
   "session-read-api-throttles-alarm",
+  "session-read-api-requests-metric",
+  "session-read-api-unavailable-metric",
+  "session-read-api-outcome-alarm",
 ] as const;
 
 export const READ_API_TIMEOUT_SECONDS = 10;
@@ -99,7 +120,7 @@ export function assertSessionReadApiInputs(p: unknown, refuse: (why: string) => 
     refuse("transcriptStore.sessionReadApi must be a plain object");
   const v = p as Record<string, unknown>;
   for (const k of Object.keys(v))
-    if (k !== "completeSince" && k !== "origin" && k !== "reservedConcurrency" && k !== "analysisBucket" && k !== "briefSummary" && k !== "listShortSummary" && k !== "listReadiness" && k !== "relayfacts")
+    if (k !== "completeSince" && k !== "origin" && k !== "reservedConcurrency" && k !== "analysisBucket" && k !== "briefSummary" && k !== "listShortSummary" && k !== "listReadiness" && k !== "relayfacts" && k !== "outcomeAlarm")
       refuse(`transcriptStore.sessionReadApi.${k} is not a known setting`);
   if (typeof v.completeSince !== "string" || (v.completeSince !== "epoch" && !/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d+)?Z$/.test(v.completeSince)))
     refuse('transcriptStore.sessionReadApi.completeSince must be an ISO UTC timestamp or "epoch"');
@@ -111,6 +132,21 @@ export function assertSessionReadApiInputs(p: unknown, refuse: (why: string) => 
     if (v[k] !== undefined && typeof v[k] !== "boolean") refuse(`transcriptStore.sessionReadApi.${k} must be a boolean`);
   if (v.reservedConcurrency !== undefined && v.reservedConcurrency !== "none" && !(Number.isInteger(v.reservedConcurrency) && (v.reservedConcurrency as number) >= 2 && (v.reservedConcurrency as number) <= 50))
     refuse('transcriptStore.sessionReadApi.reservedConcurrency must be an integer from 2 to 50, or "none" (only below the default account quota)');
+  if (v.outcomeAlarm !== undefined) {
+    const a = v.outcomeAlarm;
+    if (a === null || typeof a !== "object" || Array.isArray(a) || Object.getPrototypeOf(a) !== Object.prototype)
+      refuse("transcriptStore.sessionReadApi.outcomeAlarm must be a plain object");
+    const o = a as Record<string, unknown>;
+    for (const k of Object.keys(o))
+      if (k !== "thresholdPercent" && k !== "windowMinutes" && k !== "minRequests") refuse(`transcriptStore.sessionReadApi.outcomeAlarm.${k} is not a known setting`);
+    const int = (x: unknown, lo: number, hi: number) => Number.isInteger(x) && (x as number) >= lo && (x as number) <= hi;
+    if (o.thresholdPercent !== undefined && !(typeof o.thresholdPercent === "number" && Number.isFinite(o.thresholdPercent) && o.thresholdPercent >= 1 && o.thresholdPercent <= 99))
+      refuse("transcriptStore.sessionReadApi.outcomeAlarm.thresholdPercent must be a number from 1 to 99");
+    if (o.windowMinutes !== undefined && !int(o.windowMinutes, 5, 360))
+      refuse("transcriptStore.sessionReadApi.outcomeAlarm.windowMinutes must be an integer from 5 to 360");
+    if (o.minRequests !== undefined && !int(o.minRequests, 1, 1_000_000))
+      refuse("transcriptStore.sessionReadApi.outcomeAlarm.minRequests must be an integer from 1 to 1000000");
+  }
 }
 
 /** Only the read API's role reads its secret. */
@@ -232,6 +268,73 @@ export function sessionReadApiAlarms(names: SessionReadApiNames) {
   ] as const;
 }
 
+/** Where the outcome metrics land: one namespace per stage (metric filters cannot set a static dimension). */
+export function sessionReadApiMetricNamespace(stage: string): string {
+  return `96bulls/${stage}/session-read-api`;
+}
+
+/**
+ * The request line the app writes once per request, after the handler (src/session-read-api/app.ts, the "*"
+ * middleware: route, status, duration_ms). The handler's own reason lines ("session read" with a reason and no
+ * duration_ms) are excluded by `duration_ms >= 0`, so a request counts once; `route = "/v1/*"` leaves out /health.
+ */
+const READ_REQUEST_LINE = '$.message = "session read" && $.route = "/v1/*" && $.duration_ms >= 0';
+export const READ_REQUESTS_FILTER_PATTERN = `{ ${READ_REQUEST_LINE} }`;
+/** 501 (session_partial and other not-served reads) and 503 (retryable session_partial, ClickHouse, unavailable). */
+export const READ_UNAVAILABLE_FILTER_PATTERN = `{ ${READ_REQUEST_LINE} && ($.status = 501 || $.status = 503) }`;
+
+/** Two counters from the function's log group: every /v1 read, and the ones answered 501/503. */
+export function sessionReadApiOutcomeMetricFilters(i: { stage: string; names: SessionReadApiNames; logGroupName: string }) {
+  const metricNamespace = sessionReadApiMetricNamespace(i.stage);
+  const counter = (metricName: string) => [{ metricName, metricNamespace, metricValue: "1", defaultValue: 0, unit: "Count" as const }];
+  return [
+    ["session-read-api-requests-metric", {
+      logGroupName: i.logGroupName,
+      filterName: `${i.names.function}-read-requests`,
+      filterPattern: READ_REQUESTS_FILTER_PATTERN,
+      metricTransformations: counter("ReadRequests"),
+    }],
+    ["session-read-api-unavailable-metric", {
+      logGroupName: i.logGroupName,
+      filterName: `${i.names.function}-read-unavailable`,
+      filterPattern: READ_UNAVAILABLE_FILTER_PATTERN,
+      metricTransformations: counter("ReadUnavailable"),
+    }],
+  ] as const;
+}
+
+/**
+ * The outcome alarm: more than `thresholdPercent` of /v1 reads in one `windowMinutes` window answered 501/503, with at
+ * least `minRequests` reads in it (a quiet window never alarms). Same action wiring as the other read API alarms
+ * (actions disabled until the stage routes alarms anywhere).
+ */
+export function sessionReadApiOutcomeAlarm(i: { stage: string; names: SessionReadApiNames; p: SessionReadApiInputs }) {
+  const { thresholdPercent, windowMinutes, minRequests } = { ...OUTCOME_ALARM_DEFAULTS, ...i.p.outcomeAlarm };
+  const Namespace = sessionReadApiMetricNamespace(i.stage);
+  const Period = windowMinutes * 60;
+  const sum = (Id: string, MetricName: string) => ({ Id, MetricStat: { Metric: { Namespace, MetricName }, Period, Stat: "Sum" }, ReturnData: false });
+  return ["session-read-api-outcome-alarm", {
+    ActionsEnabled: false,
+    TreatMissingData: "notBreaching",
+    name: `${i.names.function}-outcome`,
+    AlarmDescription: `Session read API: more than ${thresholdPercent}% of /v1 reads answered 501/503 over ${windowMinutes} minutes (at least ${minRequests} reads); the function is not failing, but Cloud falls back to relayhistory on those reads. Check the "session read" log lines' reason.`,
+    Metrics: [
+      sum("requests", "ReadRequests"),
+      sum("unavailable", "ReadUnavailable"),
+      {
+        Id: "unavailable_pct",
+        Expression: `IF(FILL(requests, 0) >= ${minRequests}, 100 * FILL(unavailable, 0) / requests, 0)`,
+        Label: "501/503 share of /v1 reads (%)",
+        ReturnData: true,
+      },
+    ],
+    Threshold: thresholdPercent,
+    ComparisonOperator: "GreaterThanThreshold",
+    EvaluationPeriods: 1,
+    DatapointsToAlarm: 1,
+  }] as const;
+}
+
 export interface SessionReadApiStageInputs {
   stage: string;
   p: SessionReadApiInputs;
@@ -254,6 +357,12 @@ export const sessionReadApi = (i: SessionReadApiStageInputs) =>
       tags: i.tags("session-read-api"),
     } as never);
     for (const [id, props] of sessionReadApiAlarms(names)) yield* AWS.CloudWatch.Alarm(id, { ...props, tags: i.tags("session-read-api") } as never);
+    // The function's own log group (Alchemy creates it with the function); mapped from the function's output so the
+    // filters wait for it.
+    const logGroupName = Output.map(fn as never, (f: { functionName: string }) => `/aws/lambda/${f.functionName}`) as unknown as string;
+    for (const [id, props] of sessionReadApiOutcomeMetricFilters({ stage: i.stage, names, logGroupName })) yield* AWS.Logs.MetricFilter(id, props as never);
+    const [outcomeId, outcomeProps] = sessionReadApiOutcomeAlarm({ stage: i.stage, names, p: i.p });
+    yield* AWS.CloudWatch.Alarm(outcomeId, { ...outcomeProps, tags: i.tags("session-read-api") } as never);
     return {
       roleArn,
       functionName: names.function,
