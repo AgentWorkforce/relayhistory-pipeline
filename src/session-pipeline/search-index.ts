@@ -114,6 +114,12 @@ export interface SearchIndexDeps {
   prefixFor(orgId: string): string;
   /** Per-pass observability sink. The consumer creates a fresh one for each scope. */
   metrics?: SearchIndexPhaseMetrics;
+  /**
+   * Measurement only (consumer 'revision covered' / 'revision searchable'): called at the start of every attempt that
+   * reads the source (each pre-read capture, and each base pass), so a caller recording reads can drop evidence from a
+   * discarded SEARCH_SCOPE_CHANGED attempt. Never affects the pass.
+   */
+  onAttempt?: () => void;
   decompress?: (stored: Uint8Array, maxOutputLength: number) => Uint8Array;
   now?: () => Date;
   limits?: Partial<SearchIndexLimits>;
@@ -619,13 +625,16 @@ async function captureSearchPreRead(scope: SessionScope, deps: SearchIndexDeps, 
 export async function indexSearchScope(scope: SessionScope, deps: SearchIndexDeps): Promise<SearchIndexResult> {
   // These paths need their existing transaction-bound service/facts/stream contracts. The flag is
   // accepted but deliberately leaves them on the byte-identical base path.
-  if (!deps.preRead || !deps.ch || deps.adapter || deps.staged || deps.stream || deps.outputFacts || deps.outputFactsStore)
+  if (!deps.preRead || !deps.ch || deps.adapter || deps.staged || deps.stream || deps.outputFacts || deps.outputFactsStore) {
+    deps.onAttempt?.();
     return indexSearchScopeBase(scope, deps);
+  }
   const limits = { ...SEARCH_INDEX_DEFAULT_LIMITS, ...deps.limits };
   for (let attempt = 0; attempt < 2; attempt++) {
+    deps.onAttempt?.();
     const captured = await captureSearchPreRead(scope, deps, limits);
     // Empty, erased, malformed-canonical and alias-only scopes keep the unmodified locked path.
-    if (!captured) return indexSearchScopeBase(scope, deps);
+    if (!captured) { deps.onAttempt?.(); return indexSearchScopeBase(scope, deps); }
     // Busy and already-current are complete results from the SQL-only capture transaction.
     if (!isSearchPreRead(captured)) return captured;
     const prepared = captured;
@@ -633,6 +642,7 @@ export async function indexSearchScope(scope: SessionScope, deps: SearchIndexDep
     if (applied !== SEARCH_SCOPE_CHANGED) return applied;
   }
   // Sustained churn is an optimization miss, not a new queue failure/DLQ route.
+  deps.onAttempt?.();
   return indexSearchScopeBase(scope, deps);
 }
 

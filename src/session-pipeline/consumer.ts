@@ -275,8 +275,11 @@ export async function processBatch(records: readonly QueueRecord[], deps: Consum
         // 'revision covered' must name the bytes THIS pass indexed, not the pointer stage's earlier read: the object can be
         // replaced between the two (Pipeline review of 4970d56f). Record the chunk list of every manifest the search
         // stage itself reads (the last read of a key wins). Measurement only; the pass is unchanged.
-        const searchRead = new Map<string, readonly string[]>();
+        const searchRead = new Map<string, SearchReadEvidence>();
+        const priorAttempt = deps.search.onAttempt;
         const searchDeps = { ...deps.search, metrics: phase, ...(deps.search.reader ? { reader: recordingReader(deps.search.reader, searchRead) } : {}),
+          // Evidence is scoped to the APPLIED attempt: a discarded SEARCH_SCOPE_CHANGED attempt's reads are dropped.
+          onAttempt: () => { searchRead.clear(); priorAttempt?.(); },
           ...(physicallyCurrent === false && deps.search.skipCurrent ? { skipCurrent: false } : {}) };
         const result = await (deps.searchScope ?? indexSearchScope)(scope, searchDeps);
         if (result.busy) {
@@ -291,7 +294,9 @@ export async function processBatch(records: readonly QueueRecord[], deps: Consum
             stage: "search-index", org_id: scope.orgId, workspace_id: scope.workspaceId, harness: scope.harness, session_id: scope.sessionId,
             reason: result.reasons.join(","), ...phaseFields(), ...passFields(messageIds, recordOf, now), duration_ms: Date.now() - started,
           });
-          logSearchable(scope, revisions, now, pickedUpAt, passStartedAt, true);
+          // Skipped: the pass read nothing. The live upload is credited only on PHYSICAL proof that the indexed pointer
+          // rows are this very object (the stored manifest_etag equals the live ETag); otherwise coverage_unproven.
+          logSearchable(scope, revisions, now, pickedUpAt, passStartedAt, true, () => physicallyCurrent === true);
           // Skipped: this pass read nothing, so it proves no input; superseded uploads are unobserved (coverage_unproven).
           logCovered(scope, revisions, now, pickedUpAt, passStartedAt, searchRead);
           continue;
@@ -331,7 +336,8 @@ export async function processBatch(records: readonly QueueRecord[], deps: Consum
           duration_ms: Date.now() - started,
         });
         if (result.complete) {
-          logSearchable(scope, revisions, now, pickedUpAt, passStartedAt, false);
+          // Credited only when the completed pass itself read THIS upload's object (versionId, else ETag).
+          logSearchable(scope, revisions, now, pickedUpAt, passStartedAt, false, (r) => readThisObject(searchRead, r));
           logCovered(scope, revisions, now, pickedUpAt, passStartedAt, searchRead);
         }
       } catch (error) {
@@ -553,18 +559,33 @@ function logUnobserved(scope: SessionScope, r: Revised, reason: string) {
  * Index pass completion, NOT an authorized caller read.
  */
 /** Measurement only: a manifest reader that records `<seq>:<sha256>` of each manifest's chunks as the search stage reads it. */
-function recordingReader(reader: NonNullable<SearchIndexDeps["reader"]>, into: Map<string, readonly string[]>): NonNullable<SearchIndexDeps["reader"]> {
+/** What the search stage read for one key in the applied attempt: the object's stamps and its chunk list. */
+interface SearchReadEvidence { etag?: string; version?: string; chunks: readonly string[] }
+
+function recordingReader(reader: NonNullable<SearchIndexDeps["reader"]>, into: Map<string, SearchReadEvidence>): NonNullable<SearchIndexDeps["reader"]> {
   return Object.assign(Object.create(Object.getPrototypeOf(reader)), reader, {
     read: async (key: string) => {
       const read = await reader.read(key);
-      const chunks = (read?.manifest as { raw?: { chunks?: readonly { seq?: unknown; sha256?: unknown }[] } } | undefined)?.raw?.chunks;
-      if (read) into.set(key, (chunks ?? []).flatMap((c) => (typeof c.seq === "number" && typeof c.sha256 === "string" ? [`${c.seq}:${c.sha256}`] : [])));
+      if (read) {
+        const r = read as { manifest?: { raw?: { chunks?: readonly { seq?: unknown; sha256?: unknown }[] } }; etag?: string; version?: string };
+        const chunks = (r.manifest?.raw?.chunks ?? []).flatMap((c) => (typeof c.seq === "number" && typeof c.sha256 === "string" ? [`${c.seq}:${c.sha256}`] : []));
+        into.set(key, { ...(r.etag ? { etag: unquoteEtag(r.etag) } : {}), ...(r.version ? { version: r.version } : {}), chunks });
+      }
       return read;
     },
   });
 }
 
-function logCovered(scope: SessionScope, revisions: readonly Revised[], now: () => number, pickedUpAt: number, passStartedAt: number, searchRead: ReadonlyMap<string, readonly string[]>) {
+/** The completed pass read THIS upload's object: the same versionId, else the same ETag. */
+function readThisObject(searchRead: ReadonlyMap<string, SearchReadEvidence>, r: Revised): boolean {
+  const seen = searchRead.get(r.event.key);
+  if (!seen) return false;
+  if (r.event.version && seen.version) return r.event.version === seen.version;
+  const etag = unquoteEtag(r.event.etag);
+  return !!etag && etag === seen.etag;
+}
+
+function logCovered(scope: SessionScope, revisions: readonly Revised[], now: () => number, pickedUpAt: number, passStartedAt: number, searchRead: ReadonlyMap<string, SearchReadEvidence>) {
   const seen = new Set<string>();
   for (const r of revisions) {
     if (r.live || r.event.deleted) continue;
@@ -577,7 +598,7 @@ function logCovered(scope: SessionScope, revisions: readonly Revised[], now: () 
     if (rev >= r.liveRevision) { logUnobserved(scope, r, "recreate_between"); continue; }
     const chunk = r.event.revision?.chunk;
     // The chunk must be listed by the manifest the completed search pass itself read for this key.
-    if (!chunk || !searchRead.get(r.event.key)?.includes(chunk)) { logUnobserved(scope, r, "coverage_unproven"); continue; }
+    if (!chunk || !searchRead.get(r.event.key)?.chunks.includes(chunk)) { logUnobserved(scope, r, "coverage_unproven"); continue; }
     const committed = r.event.revision?.committedAt ? Date.parse(r.event.revision.committedAt) : NaN;
     log.info("revision covered", {
       stage: "revision-events", org_id: scope.orgId, workspace_id: scope.workspaceId, harness: scope.harness, session_id: scope.sessionId,
@@ -590,13 +611,16 @@ function logCovered(scope: SessionScope, revisions: readonly Revised[], now: () 
   }
 }
 
-function logSearchable(scope: SessionScope, revisions: readonly Revised[], now: () => number, pickedUpAt: number, passStartedAt: number, alreadyCurrent: boolean) {
+function logSearchable(scope: SessionScope, revisions: readonly Revised[], now: () => number, pickedUpAt: number, passStartedAt: number, alreadyCurrent: boolean, evidence: (r: Revised) => boolean) {
   const seen = new Set<string>();
   for (const r of revisions) {
     if (!r.live) continue;
     const id = `${r.event.key}\u001f${r.event.version ?? r.event.etag ?? ""}`;
     if (seen.has(id)) continue;
     seen.add(id);
+    // No evidence that this pass covered THIS object (replaced between the pointer read and the search read, or a skip
+    // without physical currency): unobserved, never searchable (Pipeline review of 8201d4e3).
+    if (!evidence(r)) { logUnobserved(scope, r, "coverage_unproven"); continue; }
     const committed = r.event.revision?.committedAt ? Date.parse(r.event.revision.committedAt) : NaN;
     const kind = r.event.revision?.initial === true ? "initial" : r.event.revision?.initial === false ? "append" : r.event.revision?.revision === 1 ? "initial" : r.event.revision?.revision ? "append" : "unknown";
     log.info("revision searchable", {

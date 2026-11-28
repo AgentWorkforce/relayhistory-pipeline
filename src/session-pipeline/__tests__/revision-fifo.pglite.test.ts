@@ -443,9 +443,10 @@ describe("first indexed appearance of superseded uploads ('revision covered' / '
     t.hold.inPass = async () => { await t.r.writeManifest(3, loc, "replacement"); };
     const { lines } = await t.run([t.record(e1), t.record(e2), t.record(e3)]);
     expect(named(lines, "revision covered")).toEqual([]);
-    expect(named(lines, "revision unobserved").map((l) => [l.revision, l.reason])).toEqual([[1, "coverage_unproven"], [2, "coverage_unproven"]]);
-    // All three arrivals stay in the denominator: two unobserved, one searchable.
-    expect(named(lines, "revision searchable").map((l) => l.revision)).toEqual([3]);
+    // The search read the REPLACEMENT, not revision 3's own object: all three original arrivals are unobserved
+    // (Pipeline review of 8201d4e3); none is credited searchable.
+    expect(named(lines, "revision searchable")).toEqual([]);
+    expect(named(lines, "revision unobserved").map((l) => [l.revision, l.reason]).sort()).toEqual([[1, "coverage_unproven"], [2, "coverage_unproven"], [3, "coverage_unproven"]]);
   });
 
   test("matching-input control: the same batch with no replacement gives both superseded uploads a covered line", async () => {
@@ -456,6 +457,8 @@ describe("first indexed appearance of superseded uploads ('revision covered' / '
     const { lines } = await t.run([t.record(e1), t.record(e2), t.record(e3)]);
     expect(named(lines, "revision covered").map((l) => l.revision)).toEqual([1, 2]);
     expect(named(lines, "revision unobserved")).toEqual([]);
+    // Live control: the pass read revision 3's own object, so it is searchable.
+    expect(named(lines, "revision searchable").map((l) => l.revision)).toEqual([3]);
   });
 
   test("a skip-current skip (the pass read nothing) gives superseded uploads coverage_unproven, never covered", async () => {

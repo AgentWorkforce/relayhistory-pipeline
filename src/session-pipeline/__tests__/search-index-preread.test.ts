@@ -158,3 +158,21 @@ test("two stamp changes exhaust the retry and fall back to the unmodified locked
   expect(raced.transactions()).toBe(5);
   expect(r.reads.count).toBeGreaterThan(readsAfterSecondPreRead);
 });
+
+test("onAttempt (measurement hook) marks every attempt: reads after the LAST call are exactly the applied attempt's, so a key removed before the retry leaves no evidence", async () => {
+  const { source, r } = await rig(33);
+  const removed = source.keys[1]!;
+  const events: string[] = [];
+  const base = r.search();
+  const reader = { ...base.reader, read: async (k: string) => { events.push(`read:${k}`); return base.reader.read(k); } } as SearchIndexDeps["reader"];
+  const raced = between({ ...base, reader, onAttempt: () => events.push("attempt") }, new Map([[2, async () => {
+    await r.db.pg.query("DELETE FROM sessions.session_index WHERE manifest_key=$1", [removed]);
+  }]]));
+  expect(await indexSearchScope(SCOPE, raced.deps)).toMatchObject({ complete: true });
+  const last = events.lastIndexOf("attempt");
+  expect(events.filter((e) => e === "attempt").length).toBeGreaterThan(1);
+  // The discarded attempt read the removed key; the applied attempt did not.
+  expect(events.slice(0, last)).toContain(`read:${removed}`);
+  expect(events.slice(last + 1)).not.toContain(`read:${removed}`);
+  expect(events.slice(last + 1).some((e) => e.startsWith("read:"))).toBe(true);
+});
