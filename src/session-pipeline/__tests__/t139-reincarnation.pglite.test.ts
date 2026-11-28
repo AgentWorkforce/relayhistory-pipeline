@@ -31,6 +31,7 @@ import type { SearchIndexDeps } from "../search-index.ts";
 import { processBatch, type ConsumerDeps } from "../consumer.ts";
 import { dispatchSqsBatch, type RevisionWiring, type SqsRecord } from "../revision-dispatch.ts";
 import { revisionMessage } from "../revision-events.ts";
+import { reconcileRecent } from "../lambda.ts";
 import type { PointerDeps } from "../pointer.ts";
 import { pointerRig, loc } from "./pointer-lock-harness.ts";
 
@@ -153,7 +154,28 @@ async function rig(path: Path = "standard") {
   const authorityDelete = () => r.pg.query("SELECT sessions.t139_delete($1,$2,$3,$4,$5,$6)", [scope.orgId, scope.workspaceId, OWNER.user, OWNER.origin, scope.harness, scope.sessionId]);
   const reissue = async () => (await r.pg.query<{ n: string | null }>("SELECT sessions.t139_reissue($1,$2,$3,$4,$5,$6)::text n", [scope.orgId, scope.workspaceId, OWNER.user, OWNER.origin, scope.harness, scope.sessionId])).rows[0]!.n;
   const erase = () => r.pg.query("SELECT sessions.t139_erase($1,$2,$3,$4)", [scope.orgId, scope.workspaceId, scope.harness, scope.sessionId]);
-  return { r, run, put, del, hits, read, etag, head, authorityDelete, reissue, erase, snapshotReader };
+  /**
+   * The ACTUAL recovery path: one link of the scheduled reconcile (lambda.ts reconcileRecent, both legs) over the real
+   * store and pointer rows, its hints delivered on this path (standard: the reconcile body; FIFO: a reconcile revision
+   * hint in its own dedup namespace, as forward mode sends it).
+   */
+  let link = 0;
+  const reconcile = async () => {
+    const bodies: string[] = [];
+    const summary = await reconcileRecent({ store: r.store, db: { query: (t: string, p?: unknown[]) => r.pg.query(t, p as unknown[]) } as never,
+      keyPrefix: "96bulls", since: new Date("2026-01-01T00:00:00.000Z"), send: async (body) => { bodies.push(body); } });
+    link += 1;
+    const records = bodies.map((body) => {
+      const hint = (JSON.parse(body) as { reconcile: { key: string; etag?: string; version?: string } }).reconcile;
+      return path === "fifo"
+        ? fifoRecord({ key: hint.key, ...(hint.etag ? { etag: hint.etag } : {}), ...(hint.version ? { version: hint.version } : {}), nonce: `since#${link}`, source: "reconcile" })
+        : { messageId: `m${++n}`, body };
+    });
+    return { summary, hints: bodies.length, delivered: records.length ? await run(records) : undefined };
+  };
+  const pointerRow = async () => (await r.pg.query<{ revision: string; manifest_etag: string | null; deleted: boolean }>(
+    "SELECT revision::text, manifest_etag, deleted_at IS NOT NULL AS deleted FROM sessions.session_index ORDER BY machine_id")).rows;
+  return { r, run, put, del, hits, read, etag, head, authorityDelete, reissue, erase, snapshotReader, reconcile, pointerRow };
 }
 type Rig = Awaited<ReturnType<typeof rig>>;
 
@@ -239,6 +261,66 @@ describe(`T139 ${path} path: parsed authorized reads`, () => {
     // B read again, with no second append in between.
     expect(await t.read("markernew")).toEqual({ status: 200, ids: ["markernew"] });
     expect(await t.read("markerold")).toEqual({ status: 200, ids: [] });
+  }, 60_000);
+
+  test("two owners (machines srv_bb and srv_cc of one session): deleting X hides only X; Y stays authorized-visible; X's reissue is refused as ambiguous", async () => {
+    const t = await rig(path);
+    const locY = { ...loc, machineId: "srv_cc" };
+    const keyX = await t.r.writeManifest(1, loc, "markerx");
+    const keyY = await t.r.writeManifest(1, locY, "markery");
+    await t.run([t.put(keyX, await t.etag(keyX)), t.put(keyY, await t.etag(keyY))]);
+    expect([await t.hits("markerx"), await t.hits("markery")]).toEqual([["markerx"], ["markery"]]);
+    await t.r.store.delete(objectKey(keyX));
+    await t.run([t.del(keyX)]);
+    await t.authorityDelete();
+    expect([await t.hits("markerx"), await t.hits("markery")]).toEqual([[], ["markery"]]);
+    expect(await t.reissue()).toBeNull();
+    // Y keeps appending and stays visible.
+    await t.r.writeManifest(2, locY, "markery2");
+    await t.run([t.put(keyY, await t.etag(keyY))]);
+    expect(await t.hits("markery2")).toEqual(["markery2"]);
+  }, 60_000);
+
+  test("RECOVERY PATH, higher revision (same incarnation): revision 3 PUT after the HEAD, its notification withheld; the scheduled reconcile finds it and converges", async () => {
+    const t = await rig(path);
+    const key = await t.r.writeManifest(1, loc, "markerone");
+    await t.run([t.put(key, await t.etag(key))]);
+    await t.r.writeManifest(2, loc, "markertwo");
+    t.head.afterHead = async () => { await t.r.writeManifest(3, loc, "markerthree"); };
+    await t.run([t.put(key, await t.etag(key))]);
+    const before = { row: await t.pointerRow(), read: await t.read("markerthree") };
+    const rec = await t.reconcile();
+    const after = { row: await t.pointerRow(), read: await t.read("markerthree"), stale: await t.read("markertwo") };
+    const again = await t.reconcile();
+    expect(before.row.map((r) => r.revision)).toEqual(["2"]);
+    expect(rec.hints).toBeGreaterThan(0);
+    expect(after.row.map((r) => r.revision)).toEqual(["3"]);
+    expect(after.read).toEqual({ status: 200, ids: ["markerthree"] });
+    expect(after.stale).toEqual({ status: 200, ids: [] });
+    expect(again.hints).toBe(0);
+  }, 60_000);
+
+  test("RECOVERY PATH, SAME revision (same incarnation): replacement with its notification withheld: stale A served until reconcile; reconcile makes callers see B; the pointer row does NOT converge (re-hinted every link)", async () => {
+    const t = await rig(path);
+    const key = await t.r.writeManifest(1, loc, "markera");
+    await t.run([t.put(key, await t.etag(key))]);
+    await t.r.writeManifest(1, loc, "markerb");
+    const before = { row: await t.pointerRow(), a: await t.read("markera"), b: await t.read("markerb") };
+    const rec = await t.reconcile();
+    const after = { row: await t.pointerRow(), a: await t.read("markera"), b: await t.read("markerb") };
+    const again = await t.reconcile();
+    // PINNED (observed on both paths; convergence of the pointer row is NOT proven):
+    // - before recovery, the authorized read SERVES THE DISPLACED A (stale) and not B;
+    // - the reconcile finds the replacement (stored manifest_etag differs from the listing) and its hint makes the search
+    //   pass read the live B: the read then serves B, never A;
+    // - but the revision fence keeps the pointer row at A's ETag (an equal revision is not applied), so every later
+    //   reconcile link re-sends the hint: callers converge, the pointer row does not. ETag here is validator agreement,
+    //   not upload identity.
+    const etagA = before.row[0]!.manifest_etag;
+    expect(before).toEqual({ row: [{ revision: "1", manifest_etag: etagA, deleted: false }], a: { status: 200, ids: ["markera"] }, b: { status: 200, ids: [] } });
+    expect(rec.hints).toBe(1);
+    expect(after).toEqual({ row: [{ revision: "1", manifest_etag: etagA, deleted: false }], a: { status: 200, ids: [] }, b: { status: 200, ids: ["markerb"] } });
+    expect(again.hints).toBe(1);
   }, 60_000);
 
   test("permanent erase: reissue is refused; a re-created B (incarnation 0 or 1) is refused (erased); the marker stays absent", async () => {
