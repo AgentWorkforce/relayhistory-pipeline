@@ -3,7 +3,8 @@
  * The session binding (one server-issued id per incarnation of a logical session): the trigger function that is the
  * columns' only writer (no grants), and the SECURITY DEFINER reader for GET /v1/session-bindings, the directory list's
  * read-role tenant scope, EXECUTE to bulls96_read_api only. The rollback is derived here: it drops the reader, the
- * trigger and its function, the pair constraint, the three columns and the revision sequence, behind the usual guards.
+ * trigger and its function, the pair constraint and the three columns (keeping the revision sequence), behind the usual
+ * guards.
  */
 import { createHash } from "node:crypto";
 import type { LaneContext, LaneManifest } from "../types.ts";
@@ -17,7 +18,8 @@ async function rollback(ctx: LaneContext): Promise<Record<string, string>> {
   return {
     [ROLLBACK]: [
       "-- Generated session directory binding rollback (scripts/sessions-function-boundary/lanes/session-directory-binding.ts).",
-      "-- Drops the 062380 bindings reader, the binding trigger and its function, the pair constraint, the three columns and the revision sequence:",
+      "-- Drops the 062380 bindings reader, the binding trigger and its function, the pair constraint and the three columns;",
+      "-- it keeps the revision sequence, so a re-apply never reissues or restarts a revision.",
       "-- every issued binding id is forgotten, so a consumer holding one fails closed. Turn",
       "-- READ_API_SESSION_BINDINGS_ENABLED off first.",
       "-- Code only: hosted execution needs Khaliq's separate explicit approval. On refusal the caller must ROLLBACK or disconnect.",
@@ -39,7 +41,7 @@ async function rollback(ctx: LaneContext): Promise<Record<string, string>> {
       "DROP FUNCTION sessions.session_directory_binding();",
       "ALTER TABLE sessions.session_directory DROP CONSTRAINT session_directory_binding_pair,",
       "  DROP COLUMN session_binding_created_at, DROP COLUMN session_binding_revision, DROP COLUMN session_binding_id;",
-      "DROP SEQUENCE sessions.session_binding_revision;",
+      "-- sessions.session_binding_revision is kept (RETAINED_BY_ROLLBACK): a re-apply continues the revision order.",
       "DELETE FROM sessions.__96bulls_migrations WHERE name='" + NAME + "' AND sha256='" + checksum + "';",
       "COMMIT;",
     ].join("\n") + "\n",

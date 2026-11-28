@@ -171,6 +171,10 @@ export const ADOPTABLE_INDEXES: Readonly<Record<string, readonly AdoptableIndex[
  * the down drops.
  */
 export const RETAINED_BY_ROLLBACK: Readonly<Record<string, readonly string[]>> = {
+  // 20261105062380 (the session binding): the revision sequence outlives the down so a re-apply continues the order;
+  // the step creates it IF NOT EXISTS and refuses (55000) a retained one of another shape or owner, or with any
+  // non-owner grant left after it revokes them. Its sentinel names the trigger and reader, which the down drops.
+  "upstream:20261105062380_session_directory_binding.sql": ["relation:sessions.session_binding_revision"],
   "upstream:20261105062300_search_index_stage.sql": [
     "relation:sessions.search_stage_archive",
     "index:search_stage_archive_pkey",

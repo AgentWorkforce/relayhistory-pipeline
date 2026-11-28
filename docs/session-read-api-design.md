@@ -652,6 +652,16 @@ bound is absent. `bindingRevision` is a decimal string. Off unless the flag is e
 service and Worker alike): otherwise 501 `session_bindings_not_enabled`. Not migrated: 501
 `session_bindings_not_migrated`. Any other parameter: 501 `param_<name>`; a malformed `session`: 400.
 
+**Rollback and re-apply.** The 062380 down drops the reader, the trigger and the three columns, so every issued
+binding is forgotten: the route answers 501 until the migration is re-applied, and after it every live session gets
+a new id on its next directory write (absent until then). It keeps `sessions.session_binding_revision` (bound to
+nothing, owner-only), so a re-apply continues the order: no revision is ever reissued, and a new binding's revision
+is above every revision issued before. The sequence is owner-only however it was found: the migration revokes every
+other grantee (CASCADE) and refuses (55000) a non-owner grant it cannot remove, or a retained sequence of another
+shape or owner. Restoring to a different, fresh database is the one case the order does not survive. So a consumer
+treats only exact equality with the live answer as authoritative, and never refuses a live binding because its
+revision is below one it remembers.
+
 **The consumer's rule.** Store `(workspaceId, sessionBindingId, bindingRevision)`, never the session key alone. On
 every read, load what you stored, then ask this route for the session and compare the exact id and revision. Fail
 closed on absence, a difference, a timeout or any error. Each call is one read-only transaction, so that comparison

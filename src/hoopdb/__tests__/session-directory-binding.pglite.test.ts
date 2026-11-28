@@ -37,15 +37,27 @@ afterEach(async () => {
   await Promise.all(open.splice(0).map((db) => db.close()));
 });
 
-async function database(): Promise<PGlite> {
+const BINDING_FILE = "20261105062380_session_directory_binding.sql";
+/** Every migration; `beforeBinding` runs just before 062380 (a pre-existing default grant, a retained sequence). */
+async function database(beforeBinding?: (db: PGlite) => Promise<unknown>): Promise<PGlite> {
   const db = new PGlite({ extensions: { btree_gin, pg_trgm } });
   open.push(db);
   await db.exec(read("supabase/tests/supabase_shim.sql"));
   for (const f of SESSION_BOOTSTRAP_FILES) await db.exec(read(f));
-  for (const file of readdirSync(join(root, "supabase/migrations")).sort()) await db.exec(read(`supabase/migrations/${file}`));
+  for (const file of readdirSync(join(root, "supabase/migrations")).sort()) {
+    if (file === BINDING_FILE && beforeBinding) await beforeBinding(db);
+    await db.exec(read(`supabase/migrations/${file}`));
+  }
   await db.exec(sqlFile("supabase/bootstrap/session_read_api_role.sql"));
   return db;
 }
+/** Non-owner ACL entries on the revision sequence (PUBLIC included). */
+const sequenceGrantees = async (db: PGlite) =>
+  (await db.query<{ g: string }>(
+    `SELECT coalesce(r.rolname, 'PUBLIC') AS g FROM pg_class c
+      CROSS JOIN LATERAL aclexplode(coalesce(c.relacl, acldefault('S', c.relowner))) a
+      LEFT JOIN pg_roles r ON r.oid = a.grantee
+     WHERE c.oid = 'sessions.session_binding_revision'::regclass AND a.grantee <> c.relowner`)).rows.map((r) => r.g);
 
 type Pointer = { machine: string; session?: string; last: string; revision?: number; canonicalSession?: string };
 async function upsertPointer(db: PGlite, p: Pointer) {
@@ -351,5 +363,42 @@ describe("062380 session binding: sqlDirectory.bindings through the read API's t
     expect(sessionBindings(rows!, keys)).toEqual([
       { source: "codex", sessionId: "s", sessionBindingId: live.id!, bindingRevision: live.revision!, bindingCreatedAt: live.createdAt!.toISOString() },
     ]);
+  });
+});
+
+describe("062380 session binding: the revision sequence stays owner-only and its order survives a re-apply", () => {
+  test("a default sequence grant present before the migration is revoked; no non-owner can setval or nextval", async () => {
+    const db = await database((d) =>
+      d.exec("ALTER DEFAULT PRIVILEGES IN SCHEMA sessions GRANT ALL ON SEQUENCES TO service_role, bulls96_read_api, PUBLIC"));
+    expect(await sequenceGrantees(db)).toEqual([]);
+    for (const role of ["service_role", "bulls96_read_api", "anon", "authenticated"])
+      for (const priv of ["USAGE", "SELECT", "UPDATE"]) {
+        const can = (await db.query<{ c: boolean }>("SELECT has_sequence_privilege($1, 'sessions.session_binding_revision', $2) AS c", [role, priv])).rows[0]!.c;
+        expect([role, priv, can]).toEqual([role, priv, false]);
+      }
+    // The trigger (SECURITY DEFINER, owner) still mints.
+    await upsertPointer(db, { machine: "m1", last: "2026-10-01T12:00:00Z" });
+    await projectSessionDirectory(db, KEY);
+    expect((await binding(db))?.revision).toMatch(/^\d+$/);
+  });
+
+  test("a retained sequence (a rolled-back earlier install) is re-adopted and continues the order", async () => {
+    const db = await database(async (d) => {
+      await d.exec("CREATE SEQUENCE sessions.session_binding_revision AS bigint");
+      await d.query("SELECT setval('sessions.session_binding_revision', 500)");
+      await d.exec("GRANT UPDATE ON SEQUENCE sessions.session_binding_revision TO service_role");
+    });
+    expect(await sequenceGrantees(db)).toEqual([]);
+    await upsertPointer(db, { machine: "m1", last: "2026-10-01T12:00:00Z" });
+    await projectSessionDirectory(db, KEY);
+    expect((await binding(db))?.revision).toBe("501");
+  });
+
+  test("a retained sequence of another shape refuses the migration (55000)", async () => {
+    for (const shape of ["AS integer", "AS bigint INCREMENT BY 2", "AS bigint CYCLE", "AS bigint MINVALUE 0"]) {
+      const refused = await database((d) => d.exec(`CREATE SEQUENCE sessions.session_binding_revision ${shape}`)).then(
+        () => null, (e: { code?: string }) => e.code ?? "no_code");
+      expect([shape, refused]).toEqual([shape, "55000"]);
+    }
   });
 });

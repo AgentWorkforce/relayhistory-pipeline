@@ -62,9 +62,36 @@ ALTER TABLE sessions.session_directory ADD CONSTRAINT session_directory_binding_
   CHECK ((session_binding_id IS NULL) = (session_binding_created_at IS NULL)
      AND (session_binding_id IS NULL) = (session_binding_revision IS NULL)) NOT VALID;
 
--- The binding order. Only the trigger function (its owner) draws from it.
-CREATE SEQUENCE sessions.session_binding_revision AS bigint;
+-- The binding order. Only the trigger function (its owner) draws from it. The rollback KEEPS it as inert history
+-- (RETAINED_BY_ROLLBACK), so a re-apply continues the order instead of restarting it: a revision is never reissued,
+-- and a consumer's remembered revision is never above a legitimate new binding's. A retained sequence must be
+-- exactly this one (bigint, increment 1, min 1, max 2^63-1, no cycle, owned by the migrating role), else 55000.
+CREATE SEQUENCE IF NOT EXISTS sessions.session_binding_revision AS bigint;
 REVOKE ALL ON SEQUENCE sessions.session_binding_revision FROM PUBLIC, anon, authenticated, service_role;
+-- Owner-only, whatever default privileges or an earlier install granted: every other grantee is revoked (CASCADE, so
+-- grants made under a grant option go too), and any grant still present refuses the migration (55000). A retained
+-- UPDATE would allow setval and break the order.
+DO $binding_sequence$
+DECLARE v_seq regclass := 'sessions.session_binding_revision'; v_role text;
+BEGIN
+ IF (SELECT pg_get_userbyid(c.relowner) FROM pg_class c WHERE c.oid = v_seq) IS DISTINCT FROM current_user::text
+    OR NOT EXISTS(SELECT 1 FROM pg_sequence q WHERE q.seqrelid = v_seq AND q.seqtypid = 'bigint'::regtype
+      AND q.seqincrement = 1 AND q.seqmin = 1 AND q.seqmax = 9223372036854775807 AND NOT q.seqcycle) THEN
+  RAISE EXCEPTION USING ERRCODE = '55000',
+   MESSAGE = 'session binding: an existing sessions.session_binding_revision is not the binding sequence; nothing applied';
+ END IF;
+ FOR v_role IN SELECT DISTINCT r.rolname FROM pg_class c
+   CROSS JOIN LATERAL aclexplode(coalesce(c.relacl, acldefault('S', c.relowner))) a
+   JOIN pg_roles r ON r.oid = a.grantee
+  WHERE c.oid = v_seq AND a.grantee <> c.relowner
+ LOOP EXECUTE format('REVOKE ALL ON SEQUENCE sessions.session_binding_revision FROM %I CASCADE', v_role); END LOOP;
+ IF EXISTS(SELECT 1 FROM pg_class c CROSS JOIN LATERAL aclexplode(coalesce(c.relacl, acldefault('S', c.relowner))) a
+            WHERE c.oid = v_seq AND a.grantee <> c.relowner) THEN
+  RAISE EXCEPTION USING ERRCODE = '55000',
+   MESSAGE = 'session binding: sessions.session_binding_revision keeps a non-owner grant; nothing applied';
+ END IF;
+END
+$binding_sequence$;
 
 COMMENT ON COLUMN sessions.session_directory.session_binding_id IS
   'Server-issued id of this logical session''s current incarnation; written only by zz_session_directory_binding.';

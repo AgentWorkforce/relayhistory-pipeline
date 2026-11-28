@@ -1,5 +1,6 @@
 -- Generated session directory binding rollback (scripts/sessions-function-boundary/lanes/session-directory-binding.ts).
--- Drops the 062380 bindings reader, the binding trigger and its function, the pair constraint, the three columns and the revision sequence:
+-- Drops the 062380 bindings reader, the binding trigger and its function, the pair constraint and the three columns;
+-- it keeps the revision sequence, so a re-apply never reissues or restarts a revision.
 -- every issued binding id is forgotten, so a consumer holding one fails closed. Turn
 -- READ_API_SESSION_BINDINGS_ENABLED off first.
 -- Code only: hosted execution needs Khaliq's separate explicit approval. On refusal the caller must ROLLBACK or disconnect.
@@ -13,7 +14,7 @@ DO $rollback_guard$ DECLARE v_sha text; BEGIN
  IF EXISTS(SELECT 1 FROM sessions.__96bulls_migrations WHERE name LIKE 'upstream:%' AND name COLLATE "C">'upstream:20261105062380_session_directory_binding.sql')
  THEN RAISE EXCEPTION USING ERRCODE='55000',MESSAGE='session directory binding: a later migration is applied; roll it back first';END IF;
  SELECT sha256 INTO v_sha FROM sessions.__96bulls_migrations WHERE name='upstream:20261105062380_session_directory_binding.sql' FOR UPDATE;
- IF NOT FOUND OR v_sha IS DISTINCT FROM 'e63656faab6242626ca9272adaf439c7ad65b3725b628d2f9a5d423bb2ee8408'
+ IF NOT FOUND OR v_sha IS DISTINCT FROM '5b62c4112ef8c7bd76c42b72efd1d2231f76b09eeac72a146e37086a75df2add'
  THEN RAISE EXCEPTION USING ERRCODE='55000',MESSAGE='session directory binding: own applied checksum required';END IF;
 END $rollback_guard$;
 DROP FUNCTION sessions.session_directory_bindings_for(text,text[],text[]);
@@ -21,6 +22,6 @@ DROP TRIGGER zz_session_directory_binding ON sessions.session_directory;
 DROP FUNCTION sessions.session_directory_binding();
 ALTER TABLE sessions.session_directory DROP CONSTRAINT session_directory_binding_pair,
   DROP COLUMN session_binding_created_at, DROP COLUMN session_binding_revision, DROP COLUMN session_binding_id;
-DROP SEQUENCE sessions.session_binding_revision;
-DELETE FROM sessions.__96bulls_migrations WHERE name='upstream:20261105062380_session_directory_binding.sql' AND sha256='e63656faab6242626ca9272adaf439c7ad65b3725b628d2f9a5d423bb2ee8408';
+-- sessions.session_binding_revision is kept (RETAINED_BY_ROLLBACK): a re-apply continues the revision order.
+DELETE FROM sessions.__96bulls_migrations WHERE name='upstream:20261105062380_session_directory_binding.sql' AND sha256='5b62c4112ef8c7bd76c42b72efd1d2231f76b09eeac72a146e37086a75df2add';
 COMMIT;

@@ -4,6 +4,7 @@
  *   primary-key insert) issue exactly one binding;
  * - the projector lifecycle (mint, keep across retries, tombstone retires, fenced re-send stays retired, a new revision
  *   mints a new id with a greater revision) as on PGlite;
+ * - the revision sequence stays owner-only despite a pre-existing default sequence grant (no setval by another role);
  * - the reader under the real bulls96_read_api role: a read that starts after a tombstone commits returns nothing,
  *   while a transaction that read before keeps its snapshot (the read's linearization point is its own statement).
  *
@@ -48,8 +49,12 @@ beforeAll(async () => {
   const c = await connect();
   await c.query(read("supabase/tests/supabase_shim.sql"));
   for (const f of SESSION_BOOTSTRAP_FILES) await c.query(read(f));
-  for (const f of readdirSync(join(root, "supabase/migrations")).filter((f) => f.endsWith(".sql")).sort())
+  for (const f of readdirSync(join(root, "supabase/migrations")).filter((f) => f.endsWith(".sql")).sort()) {
+    // A synthetic pre-existing default sequence grant: 062380 must still leave its sequence owner-only.
+    if (f === "20261105062380_session_directory_binding.sql")
+      await c.query("ALTER DEFAULT PRIVILEGES IN SCHEMA sessions GRANT ALL ON SEQUENCES TO service_role, PUBLIC");
     await c.query(read("supabase/migrations/" + f));
+  }
   await c.query(sqlFile("supabase/bootstrap/session_read_api_role.sql"));
 });
 afterAll(async () => {
@@ -153,4 +158,18 @@ maybe("the reader under bulls96_read_api: a read that starts after a tombstone c
   await writer.query("SET LOCAL ROLE service_role");
   await expect(writer.query(readerSql, ["lin"])).rejects.toMatchObject({ code: "42501" });
   await writer.query("ROLLBACK");
+});
+
+maybe("the revision sequence is owner-only despite a default sequence grant present before the migration", async () => {
+  const c = await connect();
+  const grantees = (await c.query<{ g: string }>(
+    `SELECT coalesce(r.rolname, 'PUBLIC') AS g FROM pg_class k
+      CROSS JOIN LATERAL aclexplode(coalesce(k.relacl, acldefault('S', k.relowner))) a
+      LEFT JOIN pg_roles r ON r.oid = a.grantee
+     WHERE k.oid = 'sessions.session_binding_revision'::regclass AND a.grantee <> k.relowner`)).rows;
+  expect(grantees).toEqual([]);
+  await c.query("BEGIN");
+  await c.query("SET LOCAL ROLE service_role");
+  await expect(c.query("SELECT setval('sessions.session_binding_revision', 1)")).rejects.toMatchObject({ code: "42501" });
+  await c.query("ROLLBACK");
 });
