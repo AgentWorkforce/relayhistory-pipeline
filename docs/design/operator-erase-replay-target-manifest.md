@@ -1,4 +1,4 @@
-# Operator erase replay target manifest — draft 7
+# Operator erase replay target manifest — draft 8
 
 ## Status and ownership
 
@@ -112,6 +112,33 @@ An empty SQL owner set does not prove that no replay effect is needed in S3.
 The present bridge rejects empty target sets; preserve that behavior. Such an
 erase needs a separately approved empty-coverage proof before release. This
 draft supplies no such proof and does not turn an empty array into success.
+
+### 2.1 Missing-link qualification hold
+
+The review of producer `3d78e4aa` found that removing the only index link from
+a physical ID to the requested logical ID leaves physical ownership outside
+`A`, while a surviving logical directory owner can still produce a nonempty
+manifest. Equality with the legacy SQL selection effects does not prove full
+physical replay coverage in that case. The index resolver is not a retained
+alias authority.
+
+The current disposition is **no production seal without proved authoritative
+alias coverage**. A workspace/source scan for ownership rows without an index
+match is a useful negative disqualifier, not an accepted positive proof.
+Neither adding directory rows to that scan nor finding no orphans establishes
+that already-removed links or evidence never existed. Do not infer aliases
+from a shared owner. No authoritative registry or closed-world capture
+precondition has yet been accepted for this increment; its absence keeps the
+production capture unsealed. A retained mapping or another sufficient proof
+needs a separate reviewed design before enabling completion.
+
+The production capture must continue the legacy erase without attempting a
+seal that would abort it. The completion mutation path must also fail closed
+when coverage authority is absent: an empty scan, caller flag or guessed
+physical identity cannot authorize a seal. Keep the v1 reader shape for future
+qualified captures; an intent is still `manifest_unsealed`, never a weaker
+meaning of `complete:true`. Synthetic sealed fixtures may test the reader and
+digest, but cannot demonstrate production alias-coverage qualification.
 
 ## 3. Transaction and failure boundary
 
@@ -269,12 +296,34 @@ consumer/kernel before v1 data is created. A later incompatible encoding
 requires explicit format versioning. Effect-binding bytes have their own
 separate versioned contract; a target digest is not an effect proof.
 
+The first implementation's fixed 64 MiB encoding cap is a **proof resource
+bound**, not an erase cardinality limit. Origins per owner remain unbounded.
+Preflight the exact framed octet size without constructing the bytea, including
+the raw tag, every four-byte prefix, UTF-8 field and decimal count. Arithmetic
+must not overflow; prefer preflight before materializing the target product.
+An oversized capture remains unsealed and uses the unchanged legacy erase
+loop, receipts, events and 062340 recording. Do not compute the digest first
+or introduce a runtime/caller-adjustable cap. The digest helper must enforce
+the bound before aggregation too, so a seal argument or direct helper call
+cannot allocate the oversized value before a trigger checks it. This does not
+change the encoding or any digest below the cap. Test an injected small bound
+below, at and above the exact size, multibyte fields and decimal digit changes,
+direct oversize seal refusal, and full legacy-effect/history equality.
+
 UPDATE, DELETE and TRUNCATE are refused on all four tables. Also reject new
 alias/target INSERTs into a sealed manifest: immutable existing rows alone do
 not prevent later extension of a previously hashed set. Completion insertion
 must verify the exact counts/digest, and constraints/guards must prevent partial
 commits or post-seal extension, including concurrent insert attempts. The
 producer's existing lock and isolation discipline is part of that proof.
+The child and completion mutation guards must reject non-READ COMMITTED
+transactions (`40001`): a lock on an unchanged parent does not refresh an old
+repeatable-read snapshot. This restriction applies to mutations, not the pure
+reader, which retains REPEATABLE READ and SERIALIZABLE READ ONLY support.
+Native controls must cover both stale-snapshot orders and a sealer waiting on
+a child that commits, as well as rollback. After both transactions finish,
+every persisted seal must match the actual rows, counts and digest; a refused
+seal must leave no completion record.
 
 ## 5. Repeats, aliases and old fences
 
