@@ -103,6 +103,11 @@ export interface DeadlineIsolationDeps {
    */
   progress?: (scope: SessionScope) => Promise<LargeReadProgress | null>;
   /**
+   * The exact-incarnation enqueue (enqueueLargeReadExpected, migration 20261105062410) for hold-only deliveries. Absent:
+   * hold-only deliveries use `enqueue` as before.
+   */
+  enqueueExpected?: (scope: SessionScope, expected: LargeReadSource) => Promise<ExpectedEnqueue>;
+  /**
    * The scope's current source incarnation and canonical identity (captureLargeReadSource: one STABLE read, no write),
    * or null when the source is unavailable (erased, blocked, no live pointer). With it, a delivery made only of holds
    * whose expected incarnation is no longer current is obsolete: it never enqueues, writes a mark or holds for the
@@ -217,4 +222,38 @@ export function sameSource(a: LargeReadSource | undefined, b: LargeReadSource | 
  */
 export function holdId(scope: SessionScope, source: LargeReadSource, seq: number): string {
   return createHash("sha256").update(JSON.stringify(["large-read-hold/v1", [scope.orgId, scope.workspaceId, scope.harness, scope.sessionId], [source.epoch, source.fingerprint], seq])).digest("hex");
+}
+
+/** What the capture-bound enqueue answered; `unavailable` keeps a retry (never an obsolete ack). */
+export type ExpectedEnqueue =
+  | { kind: "enqueued"; changed: boolean; state: string; identity: SessionScope; source: LargeReadSource }
+  | { kind: "obsolete"; reason: "incarnation_moved" | "newer_job" | "canonical_moved" | "other" }
+  /** No job for exactly the expected incarnation (none, or an older one's): no authority to create or advance it. */
+  | { kind: "no_job"; reason: "no_job" | "no_exact_job" }
+  | { kind: "unavailable" };
+
+/**
+ * sessions.enqueue_session_large_read_expected (migration 20261105062410) for the expected incarnation; the consumer's
+ * hold-only deliveries call it (DeadlineIsolationDeps.enqueueExpected, lambda.ts).
+ * `enqueued` with state 'failed' is not durable recovery: the caller treats it as decideHold does (inline).
+ */
+export async function enqueueLargeReadExpected(db: SqlExecutor, s: SessionScope, expected: LargeReadSource): Promise<ExpectedEnqueue> {
+  const r = (await db.query<{ r: Record<string, unknown> }>(
+    "SELECT sessions.enqueue_session_large_read_expected($1,$2,$3,$4,$5::bigint,$6) r",
+    [s.orgId, s.workspaceId, s.harness, s.sessionId, expected.epoch, expected.fingerprint])).rows[0]?.r;
+  if (!r || typeof r.enqueued !== "boolean") throw new Error("large_enqueue_invalid");
+  if (!r.enqueued) {
+    if (r.obsolete === true) {
+      const reason = r.reason === "incarnation_moved" || r.reason === "newer_job" || r.reason === "canonical_moved" ? r.reason : "other";
+      return { kind: "obsolete", reason };
+    }
+    if (r.reason === "no_job" || r.reason === "no_exact_job") return { kind: "no_job", reason: r.reason };
+    return { kind: "unavailable" };
+  }
+  const i = r.identity as { sessionId?: unknown; orgId?: unknown; workspaceId?: unknown; source?: unknown } | undefined;
+  const src = r.source as { epoch?: unknown; fingerprint?: unknown } | undefined;
+  if (typeof i?.sessionId !== "string" || i.orgId !== s.orgId || i.workspaceId !== s.workspaceId || i.source !== s.harness
+    || typeof src?.fingerprint !== "string" || (typeof src.epoch !== "string" && typeof src.epoch !== "number") || typeof r.state !== "string")
+    throw new Error("large_enqueue_invalid");
+  return { kind: "enqueued", changed: r.changed === true, state: r.state, identity: { ...s, sessionId: i.sessionId }, source: { epoch: String(src.epoch), fingerprint: src.fingerprint } };
 }

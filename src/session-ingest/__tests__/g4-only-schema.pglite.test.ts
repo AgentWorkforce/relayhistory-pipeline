@@ -258,6 +258,9 @@ describe("G4-only schema: the post-G4 objects are absent", () => {
       // The buffered feed page keyset: buffered_search_feed_page replaced (sargable keyset, custom plans); no G4
       // function names it, no ingest path calls it.
       "20261105062350_buffered_search_feed_page_keyset.sql",
+      // The large-read expected enqueue: one new service_role function for deadline-isolation holds; no G4 function
+      // names it, no ingest path calls it.
+      "20261105062410_session_large_read_expected_enqueue.sql",
     ]);
     expect(() => migrationFiles(REPO_ROOT, "20261105043800_typo.sql")).toThrow(/names no migration/);
     expect(OBJECTS.newFunctions.length).toBeGreaterThan(30);

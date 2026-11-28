@@ -2723,6 +2723,18 @@ describe("function boundary: ACL manifest, residual, activation gate", () => {
       const open = src.indexOf(tag, start) + tag.length;
       return src.slice(open, src.indexOf(tag, open));
     };
+    // 20261105062410 (the large-read expected enqueue) is newest: 062350's down refuses (55000) while it is applied; its
+    // lane-generated, checksum-pinned down drops enqueue_session_large_read_expected, removes its ledger row, and
+    // refuses on a rerun.
+    const LRE = "upstream:20261105062410_session_large_read_expected_enqueue.sql";
+    const lreFn = async () => (await db.query<{ r: string | null }>("SELECT to_regprocedure('sessions.enqueue_session_large_read_expected(text,text,text,text,bigint,text)')::text r")).rows[0]!.r;
+    expect(await names()).toContain(LRE);
+    expect(await lreFn()).not.toBeNull();
+    expect((await failure(rollback("20261105062350_buffered_search_feed_page_keyset.down.sql")))?.code).toBe("55000");
+    await rollback("20261105062410_session_large_read_expected_enqueue.down.sql");
+    expect(await names()).not.toContain(LRE);
+    expect(await lreFn()).toBeNull();
+    expect((await failure(rollback("20261105062410_session_large_read_expected_enqueue.down.sql")))?.code).toBe("55000");
     // 20261105062350 (the buffered feed page keyset) is newest: 062340's down refuses (55000) while it is applied; its
     // lane-generated, checksum-pinned down restores 043870's exact page function (body and proconfig), removes its
     // ledger row, and refuses on a rerun.

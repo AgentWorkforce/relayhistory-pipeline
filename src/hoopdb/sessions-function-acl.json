@@ -291,6 +291,10 @@
       "<owner>:EXECUTE",
       "service_role:EXECUTE"
     ],
+    "sessions.enqueue_session_large_read_expected(text,text,text,text,bigint,text)": [
+      "<owner>:EXECUTE",
+      "service_role:EXECUTE"
+    ],
     "sessions.finish_canonical_copy(bigint,jsonb,text,text,text,text)": [
       "<owner>:EXECUTE",
       "bulls96_canonical_feature_producer:EXECUTE"

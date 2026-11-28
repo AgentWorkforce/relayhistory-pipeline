@@ -1,7 +1,7 @@
 import {createSemanticClickHouseClient} from "../search-features/semantic-copy-ch.ts";
 import {SemanticPostgresExecutor} from "../search-features/semantic-copy-postgres.ts";
 import { largeReadJobState, routeLargeRead } from "./large-read-worker.ts";
-import { captureLargeReadSource, enqueueLargeRead, largeReadProgress } from "./search-deadline-isolation.ts";
+import { captureLargeReadSource, enqueueLargeRead, enqueueLargeReadExpected, largeReadProgress } from "./search-deadline-isolation.ts";
 /**
  * AWS Lambda entry for the sessions-prod session pipeline
  * (stacks/aws/session-pipeline.ts, sessions-pipeline-cloud:hosted-ops/preserved/runbooks/sessions-prod-session-pipeline.md).
@@ -823,7 +823,9 @@ export function runtimeFromSecret(env: LambdaEnv, secretText: string, schemaGene
   // Default off (SEARCH_INDEX_DEADLINE_ISOLATION_ENABLED=true); the env check above guarantees streaming and the handoff.
   if (env.searchDeadlineIsolation && deps.search?.ch && deps.search.stream && deps.large)
     deps.deadlineIsolation = { ch: deps.search.ch, enqueue: (scope) => enqueueLargeRead(db, scope), jobState: (scope) => largeReadJobState(db, scope),
-      progress: (scope) => largeReadProgress(db, scope), current: (scope) => captureLargeReadSource(db, scope) };
+      progress: (scope) => largeReadProgress(db, scope), current: (scope) => captureLargeReadSource(db, scope),
+      // Hold-only deliveries act only on their exact existing job (migration 20261105062410).
+      enqueueExpected: (scope, expected) => enqueueLargeReadExpected(db, scope, expected) };
   // The key comes from the secret only; "-disabled" or blank means no model, as in config.ts.
   const key = modelKey({ OPENAI_API_KEY: secret.openai_api_key });
   const briefSettings = briefConfig();

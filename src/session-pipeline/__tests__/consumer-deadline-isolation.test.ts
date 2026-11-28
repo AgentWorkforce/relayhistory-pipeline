@@ -15,9 +15,10 @@ import { processBatch, type ConsumerDeps } from "../consumer.ts";
 import { droppedFanout } from "../pointer.ts";
 import { runLargeReadOnce } from "../large-read-worker.ts";
 import {
-  DEADLINE_MARK_PREFIX, DEADLINE_OVER_BOUND, LARGE_READ_HOLD_MAX_MS, LARGE_READ_UNCLAIMED_MS, captureLargeReadSource, decideHold, deadlineMarkName, enqueueLargeRead, holdId, largeReadProgress,
+  DEADLINE_MARK_PREFIX, DEADLINE_OVER_BOUND, LARGE_READ_HOLD_MAX_MS, LARGE_READ_UNCLAIMED_MS, captureLargeReadSource, decideHold, deadlineMarkName, enqueueLargeRead, enqueueLargeReadExpected, holdId, largeReadProgress,
 } from "../search-deadline-isolation.ts";
 import { parseQueueBody, requeueBody, type LargeReadHoldBody } from "../s3-events.ts";
+import { exportStreamScope, generate } from "../../session-read-api/__tests__/stream-fixture.ts";
 import { clonedReplayDatabase, closeReplayTemplate, createFsStore, exportReplayFixture } from "./replay-fixture.ts";
 import { recordingReplayClickHouse } from "./replay-clickhouse-fixture.ts";
 
@@ -696,5 +697,225 @@ describe("obsolete holds: a hold for incarnation A never enqueues, marks or hold
     expect(f.holds[2]).toEqual(second);
     expect(await jobRow(f)).toEqual(row);
     expect(passes).toBe(1);
+  }, 60_000);
+
+  test("missing source (unknown identity): a hold-only delivery whose source is unavailable falls back to the inline pass; a failed source read with a failing enqueue fails the message for SQS retry", async () => {
+    const f = await fixture();
+    const s = stateTable();
+    const clock = { t: Date.now() };
+    markNow(s, clock.t);
+    // capture says unavailable (erased, blocked, no live pointer) and the enqueue agrees: no obsolete ack, no hold.
+    f.deps.deadlineIsolation = { ch: s.ch, now: () => clock.t, current: async () => null, enqueue: async () => ({ enqueued: false }), progress: (scope) => largeReadProgress(f.x.db, scope) };
+    nextResult = () => ({ manifests: 1, rows: 3, inserted: 3, deleted: 0, complete: true, reasons: [] });
+    const r = await run(f, requeueBody(f.key, undefined, holdA()));
+    expect(r.failures).toEqual([]);
+    expect(obsolete(r.all)).toEqual([]);
+    expect(r.all.some((l) => l.message === "search index over-bound, large-read unavailable")).toBe(true);
+    expect(passes).toBe(1); // the bounded fallback: the normal pass (which handles erasure) runs now
+    expect(f.holds).toEqual([]);
+    // The source read itself fails and the enqueue errors: the delivery fails, so SQS redelivers it (bounded by the
+    // queue's maxReceiveCount, then the DLQ); nothing is acked as obsolete.
+    f.deps.deadlineIsolation = { ch: s.ch, now: () => clock.t, current: async () => { throw new Error("read ECONNRESET"); }, enqueue: async () => { throw Object.assign(new Error("read ECONNRESET"), { code: "ECONNRESET" }); } };
+    const failed = await run(f, requeueBody(f.key, undefined, holdA()));
+    expect(failed.failures).toHaveLength(1);
+    expect(obsolete(failed.all)).toEqual([]);
+    expect(passes).toBe(1);
+  }, 60_000);
+
+  test("mixed batch: a healthy scope completes its own pass while the deadline-marked scope in the same batch holds (bounded path)", async () => {
+    const x = await clonedReplayDatabase();
+    cleanup.push(() => x.pg.close());
+    // Two scopes in one object store: the healthy stream scope, then the replay scope written into the same store.
+    const exported = await exportStreamScope(generate(5));
+    cleanup.push(exported.dispose);
+    const replay = await exportReplayFixture(exported.store, x.db, 3);
+    const reader = objectStoreManifestReader(exported.store, { provider: "s3", bucket: "replay-fixture" });
+    const s = stateTable();
+    const clock = { t: Date.now() };
+    s.rows.push({ name: deadlineMarkName(own), value: JSON.stringify({ v: 1, reason: STREAM_DEADLINE }), updated_at: new Date(clock.t).toISOString().replace("T", " ").replace("Z", "") });
+    const seen: string[] = [];
+    const holdsSent: (LargeReadHoldBody | undefined)[] = [];
+    const deps: ConsumerDeps = {
+      pointer: { db: { ...x.db, pool: undefined, end: async () => {} } as any, lock: async (_s: any, work: any) => work(), reader,
+        exists: async (k: any) => (await exported.store.head(objectKey(k))) !== undefined, orgs: prefixOrgResolver,
+        allowPrefix: (p: any, o: any) => prefixAllowed(bindings, p, o), fanout: droppedFanout },
+      search: { transact: (() => { throw new Error("mocked pass"); }) as any, reader, store: exported.store, ch: recordingReplayClickHouse().ch,
+        prefixFor: (org: string) => `96bulls/${org}`, stream: { maxReadBytes: 1 << 30, maxReadEvents: 1 << 24 } },
+      requeue: async (_k, _o, hold) => { holdsSent.push(hold); },
+      searchPass: async (scope) => {
+        seen.push(scope.sessionId);
+        return scope.sessionId === own.sessionId
+          ? { manifests: 1, rows: 0, inserted: 0, deleted: 0, complete: false, partial: true, reasons: ["scope_too_large", STREAM_DEADLINE] }
+          : { manifests: 1, rows: 5, inserted: 5, deleted: 0, complete: true, reasons: [] };
+      },
+      deadlineIsolation: { ch: s.ch, now: () => clock.t, enqueue: (scope) => enqueueLargeRead(x.db, scope), progress: (scope) => largeReadProgress(x.db, scope),
+        current: (scope) => captureLargeReadSource(x.db, scope) },
+    };
+    const lines: any[] = [], out = process.stdout.write, err = process.stderr.write;
+    const tap = (w: any, st: NodeJS.WriteStream) => (c: any, ...r: any[]) => { for (const l of String(c).split("\n")) if (l.startsWith("{")) try { lines.push(JSON.parse(l)); } catch {} return w.call(st, c, ...r); };
+    process.stdout.write = tap(out, process.stdout) as any; process.stderr.write = tap(err, process.stderr) as any;
+    let r;
+    try {
+      r = await processBatch([
+        { messageId: "marked", body: JSON.stringify({ reconcile: { key: replay.manifests[0]!.manifestKey } }) },
+        { messageId: "healthy", body: JSON.stringify({ reconcile: { key: exported.keys[0]! } }) },
+      ], deps);
+    } finally { process.stdout.write = out; process.stderr.write = err; }
+    expect(r.batchItemFailures).toEqual([]);
+    expect(seen).toEqual(["stream_parity"]); // only the healthy scope ran a pass; the marked one never streamed
+    expect(lines.some((l) => l.message === "search index reconciled" && l.session_id === "stream_parity" && l.ok === true)).toBe(true);
+    expect(lines.filter((l) => l.message === "search index over-bound, routed to large-read")).toEqual([
+      expect.objectContaining({ session_id: own.sessionId, outcome: "marked", state: "held_queued" }),
+    ]);
+    expect(holdsSent).toHaveLength(1); // the marked scope's bounded hold; the healthy scope sent nothing
+    expect(holdsSent[0]).toMatchObject({ seq: 1 });
+  }, 60_000);
+
+  test("F1: hold-only delivery, enqueue returns {enqueued:true} with NO source (and so no job row): never acked obsolete; the inline pass runs at once (large_job_missing)", async () => {
+    const f = await fixture();
+    const s = stateTable();
+    const clock = { t: Date.now() };
+    markNow(s, clock.t);
+    const upload = new Date(clock.t).toISOString();
+    f.deps.deadlineIsolation = {
+      ch: s.ch, now: () => clock.t, current: (scope) => captureLargeReadSource(f.x.db, scope),
+      enqueue: async () => ({ enqueued: true }), // identity and source omitted; no job row written
+      progress: (scope) => largeReadProgress(f.x.db, scope),
+    };
+    const b = (await captureLargeReadSource(f.x.db, own))!;
+    nextResult = () => ({ manifests: 1, rows: 3, inserted: 3, deleted: 0, complete: true, reasons: [] });
+    const r = await run(f, requeueBody(f.key, upload, { ...b.source, seq: 2, id: holdId(b.identity, b.source, 2) }));
+    expect(r.failures).toEqual([]);
+    expect(obsolete(r.all)).toEqual([]);
+    expect(r.all.filter((l) => l.message === "large-read job unclaimed")[0]).toMatchObject({ reason: "large_job_missing", route: "inline" });
+    expect(passes).toBe(1); // the bounded fallback runs now
+    expect(f.holds).toEqual([]);
+    expect(r.all.some((l) => l.message === "search index reconciled" && l.ok === true)).toBe(true);
+  }, 60_000);
+
+  // ---- hold-only deliveries wired to enqueue_session_large_read_expected (migration 20261105062410, real SQL) ----
+  const wired = (f: Awaited<ReturnType<typeof fixture>>, s: ReturnType<typeof stateTable>, clock: { t: number }, current?: any) => {
+    f.deps.deadlineIsolation = {
+      ch: s.ch, now: () => clock.t, enqueue: (scope) => enqueueLargeRead(f.x.db, scope), progress: (scope) => largeReadProgress(f.x.db, scope),
+      current: current ?? ((scope) => captureLargeReadSource(f.x.db, scope)), enqueueExpected: (scope, e) => enqueueLargeReadExpected(f.x.db, scope, e),
+    };
+  };
+  const claimNow = (f: Awaited<ReturnType<typeof fixture>>) => f.x.db.query<{ j: unknown }>("SELECT sessions.claim_session_large_read(gen_random_uuid(),120) j").then((r) => r.rows[0]!.j);
+  const holdFor = (src: { epoch: string; fingerprint: string }, seq: number) => ({ ...src, seq, id: holdId({ ...own, sessionId: "large:replay" }, src, seq) });
+
+  test("wired, own exact job queued: the expected enqueue changes nothing; the hold continues for the SAME incarnation (seq + 1)", async () => {
+    const f = await fixture();
+    const s = stateTable(); const clock = { t: Date.now() };
+    wired(f, s, clock); markNow(s, clock.t);
+    await enqueueLargeRead(f.x.db, own); // the originating route created it
+    const cur = (await captureLargeReadSource(f.x.db, own))!.source;
+    const before = await jobRow(f);
+    const r = await run(f, requeueBody(f.key, new Date(clock.t).toISOString(), holdFor(cur, 3)));
+    expect(r.failures).toEqual([]);
+    expect(routed(r.all)).toEqual([expect.objectContaining({ state: "held_queued" })]);
+    expect(f.holds).toEqual([holdFor(cur, 4)]);
+    expect(await jobRow(f)).toEqual(before);
+    expect(passes).toBe(0);
+  }, 60_000);
+
+  test("wired, delayed A while B is current and LEASED: acked covered; B's row and lease byte-identical; no hold, no mark, no pass", async () => {
+    const f = await fixture();
+    const s = stateTable(); const clock = { t: Date.now() };
+    wired(f, s, clock); markNow(s, clock.t);
+    await enqueueLargeRead(f.x.db, own);
+    expect(await claimNow(f)).not.toBeNull(); // B's job running with a live lease
+    const before = await jobRow(f); const marks = s.rows.length;
+    const r = await run(f, requeueBody(f.key, new Date(clock.t).toISOString(), holdA(3)));
+    expect(r.failures).toEqual([]);
+    expect(obsolete(r.all)).toEqual([expect.objectContaining({ outcome: "covered" })]);
+    expect(await jobRow(f)).toEqual(before);
+    expect(f.requeued).toEqual([]); expect(s.rows).toHaveLength(marks); expect(passes).toBe(0);
+  }, 60_000);
+
+  test("wired, the pre-check is stale (still sees A) while B is current and leased: the expected enqueue refuses (incarnation_moved); acked covered; B byte-identical; nothing sent", async () => {
+    const f = await fixture();
+    const s = stateTable(); const clock = { t: Date.now() };
+    let calls = 0;
+    const real = (scope: any) => captureLargeReadSource(f.x.db, scope);
+    // First call (the pre-check) is stale; later calls (coverage) are authoritative.
+    wired(f, s, clock, async (scope: any) => (++calls === 1 ? { source: A, identity: { ...scope, sessionId: "large:replay" } } : real(scope)));
+    markNow(s, clock.t);
+    await enqueueLargeRead(f.x.db, own);
+    expect(await claimNow(f)).not.toBeNull();
+    const before = await jobRow(f);
+    const r = await run(f, requeueBody(f.key, new Date(clock.t).toISOString(), holdA(3)));
+    expect(r.failures).toEqual([]);
+    expect(obsolete(r.all)).toEqual([expect.objectContaining({ outcome: "covered", state: "expected_incarnation_moved" })]);
+    expect(await jobRow(f)).toEqual(before);
+    expect(f.requeued).toEqual([]); expect(passes).toBe(0);
+  }, 60_000);
+
+  test("wired, own incarnation current but NO job (empty slot): never inserts; held for the same incarnation within 5 min, then the inline pass; the slot stays empty", async () => {
+    const f = await fixture();
+    const s = stateTable(); const clock = { t: Date.now() };
+    wired(f, s, clock); markNow(s, clock.t);
+    const cur = (await captureLargeReadSource(f.x.db, own))!.source;
+    const upload = new Date(clock.t).toISOString();
+    const r = await run(f, requeueBody(f.key, upload, holdFor(cur, 2)));
+    expect(r.failures).toEqual([]);
+    expect(obsolete(r.all)).toEqual([expect.objectContaining({ outcome: "awaiting_newer", state: "expected_no_job" })]);
+    expect(f.holds).toEqual([holdFor(cur, 3)]);
+    expect(await f.jobs()).toEqual([]);
+    clock.t += 6 * 60_000;
+    nextResult = () => ({ manifests: 1, rows: 3, inserted: 3, deleted: 0, complete: true, reasons: [] });
+    const later = await run(f, requeueBody(f.key, upload, f.holds[0]!));
+    expect(obsolete(later.all)).toEqual([expect.objectContaining({ level: "warn", outcome: "inline", state: "expected_no_job" })]);
+    expect(passes).toBe(1);
+    expect(await f.jobs()).toEqual([]);
+  }, 60_000);
+
+  test("wired, the expected enqueue reports unavailable: the inline pass; a failing expected enqueue fails the delivery (retry); neither acks obsolete", async () => {
+    const f = await fixture();
+    const s = stateTable(); const clock = { t: Date.now() };
+    markNow(s, clock.t);
+    const cur = (await captureLargeReadSource(f.x.db, own))!.source;
+    f.deps.deadlineIsolation = { ch: s.ch, now: () => clock.t, enqueue: async () => { throw new Error("ordinary enqueue must not run for a hold"); },
+      progress: (scope) => largeReadProgress(f.x.db, scope), current: (scope) => captureLargeReadSource(f.x.db, scope), enqueueExpected: async () => ({ kind: "unavailable" }) };
+    nextResult = () => ({ manifests: 1, rows: 3, inserted: 3, deleted: 0, complete: true, reasons: [] });
+    const r = await run(f, requeueBody(f.key, undefined, holdFor(cur, 2)));
+    expect(r.failures).toEqual([]); expect(obsolete(r.all)).toEqual([]); expect(passes).toBe(1);
+    f.deps.deadlineIsolation = { ...f.deps.deadlineIsolation, enqueueExpected: async () => { throw Object.assign(new Error("read ECONNRESET"), { code: "ECONNRESET" }); } };
+    const failed = await run(f, requeueBody(f.key, undefined, holdFor(cur, 2)));
+    expect(failed.failures).toHaveLength(1); expect(obsolete(failed.all)).toEqual([]); expect(passes).toBe(1);
+  }, 60_000);
+
+  test("wired, own exact job superseded: re-queued (the only write a hold makes), then held; claim runs it", async () => {
+    const f = await fixture();
+    const s = stateTable(); const clock = { t: Date.now() };
+    wired(f, s, clock); markNow(s, clock.t);
+    await enqueueLargeRead(f.x.db, own);
+    await f.x.db.query("UPDATE sessions.session_large_read_jobs SET state='superseded'");
+    const cur = (await captureLargeReadSource(f.x.db, own))!.source;
+    const r = await run(f, requeueBody(f.key, new Date(clock.t).toISOString(), holdFor(cur, 2)));
+    expect(r.failures).toEqual([]);
+    expect(routed(r.all)).toEqual([expect.objectContaining({ state: "held_queued" })]);
+    expect((await f.jobs())[0]).toMatchObject({ state: "queued" });
+    expect(await claimNow(f)).not.toBeNull();
+  }, 60_000);
+
+  test("wired, B current with an exact SUPERSEDED B row, B's delivery lost, no later append, no wake: A is NOT acked; held for A within 5 min, then the inline pass; nothing claims B meanwhile", async () => {
+    const f = await fixture();
+    const s = stateTable(); const clock = { t: Date.now() };
+    wired(f, s, clock); markNow(s, clock.t);
+    await enqueueLargeRead(f.x.db, own);
+    await f.x.db.query("UPDATE sessions.session_large_read_jobs SET state='superseded'"); // B's exact row, never claimed again
+    const upload = new Date(clock.t).toISOString();
+    const r = await run(f, requeueBody(f.key, upload, holdA(3)));
+    expect(r.failures).toEqual([]);
+    expect(obsolete(r.all)).toEqual([expect.objectContaining({ outcome: "awaiting_newer" })]); // not "covered"
+    expect(f.holds).toEqual([{ ...A, seq: 4, id: holdId({ ...own, sessionId: "large:replay" }, A, 4) }]); // still A's hold
+    expect(await claimNow(f)).toBeNull(); // nothing claims B: its row is superseded
+    expect((await f.jobs())[0]).toMatchObject({ state: "superseded" });
+    clock.t += 6 * 60_000;
+    nextResult = () => ({ manifests: 1, rows: 3, inserted: 3, deleted: 0, complete: true, reasons: [] });
+    const later = await run(f, requeueBody(f.key, upload, f.holds[0]!));
+    expect(obsolete(later.all)).toEqual([expect.objectContaining({ level: "warn", outcome: "inline" })]);
+    expect(passes).toBe(1); // the bounded recovery: the normal inline pass indexes the current source
+    expect(later.all.some((l) => l.message === "search index reconciled" && l.ok === true)).toBe(true);
   }, 60_000);
 });
