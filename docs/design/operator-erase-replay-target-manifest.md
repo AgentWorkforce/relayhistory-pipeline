@@ -250,10 +250,24 @@ be saved as provenance only; absence of an active epoch is valid, not an erase
 refusal. Neither a non-null capture epoch nor a guessed future FULL is part
 of the target seal's authority. This metadata does not change reader v1 keys.
 
-Define the digest over a versioned, length-framed encoding of the complete
-binding and unique targets in bytewise `COLLATE "C"` order. Do not use delimiter
-concatenation, unordered JSON aggregation, or consumer locale collation.
-Publish exact encoding test vectors with the implementation.
+The proposed target-digest encoding is SHA-256 over the ASCII domain tag
+`rh-erase-replay-manifest/v1`, followed by length-framed fields in this order:
+capture version, canonical manifest UUID, accepted request ID, org, workspace,
+source, requested session, alias count and each sorted alias, then target count
+and each sorted target's user/origin/source/session fields. Each frame is a
+four-byte unsigned big-endian **octet length** followed by the exact UTF-8
+bytes. Counts and capture version are canonical decimal text in those frames,
+not 32-bit binary counts. Target count remains a positive PostgreSQL bigint;
+the tag/version and original bytes must not be silently normalized.
+
+Aliases and targets use bytewise `COLLATE "C"` order. Do not use delimiter
+concatenation, unordered JSON aggregation, Unicode normalization, JavaScript
+UTF-16 sort assumptions, or consumer locale collation. No capture-time epoch
+or future FULL enters this digest. Publish fixed non-ASCII/ordering and
+boundary vectors with the implementation and freeze the encoding with the
+consumer/kernel before v1 data is created. A later incompatible encoding
+requires explicit format versioning. Effect-binding bytes have their own
+separate versioned contract; a target digest is not an effect proof.
 
 UPDATE, DELETE and TRUNCATE are refused on all four tables. Also reject new
 alias/target INSERTs into a sealed manifest: immutable existing rows alone do
@@ -479,12 +493,36 @@ FULL exists. Do not stamp later context into an already sealed target manifest.
 
 Preserve the exact section 6.1 page keys, nested shapes, cursor binding and
 canonical target-count text. The epoch/FULL proof is a **separate** owner-only
-wrapper or co-read, not extra fields silently added to a v1 page. One SQL
-statement must read the manifest page, authoritative window/status and the
-request/effect coverage needed to qualify the member. Its logical result has
-separate manifest-page and window/effect-proof components; agree and version
-that wrapper's exact transport with the consumer before wiring it. No new
-runtime grant or mutating reader is proposed.
+co-read owned by the **bridge consumer**, not extra fields silently added to
+a v1 page and not a new 062360 qualifier migration function. The consumer owns
+that one-statement SQL and its versioned wrapper, v2 receipts, and final release
+transaction. The producer owns immutable target/effect provenance and the
+owner-only v1 reader. It must expose documented owner-readable provenance keys
+or a pure STABLE read helper, and byte-exact effect encoding, for that statement.
+The consumer implements the co-read in TypeScript like `ERASURE_WINDOW_SQL`.
+
+One SQL statement reads `session_erasure_replay_read`, authoritative
+`ingest_org_admission_hold_status`, the effect provenance and full-precision
+window comparisons. The agreed outer field structure is `v:1`,
+`kind:"session_replay_qualification"`, `page`, `window`, `window_checks`,
+and `effect`. `page` is the section 6.1 response verbatim; `window` is status
+verbatim. `window_checks` contains boolean `epoch_matches`,
+`history_cutoff_matches`, and `history_full_ordered` computed in SQL; missing
+or unknown comparisons cannot become true. There are no caller-supplied FULL
+values in the producer reader: the bridge compares selected FULL values with
+its own dispatch.
+
+`effect` contains `v:1`, a closed `status`, boolean `request_id_matches`,
+canonical nonnegative bigint-text `alias_fence_count`, and `binding_sha256`.
+The initial missing-mapping verdict has false/`"0"`/null proof fields and
+`status:"effect_mapping_missing"`. A positive verdict requires a real complete
+effect association, the exact declared/covered alias count, and a lowercase
+64-hex binding digest from the reviewed effect encoding. It is not a hash of
+booleans or counts. The exact refusal enumeration, provenance-read schema and
+effect bytes must be reviewed before any positive verdict is implemented.
+A source lacking a proved request-to-effect join stays unproven. No raw
+plural `effects` object or xid/count summary substitutes for this verdict.
+No new runtime grant or mutating reader is proposed.
 
 At replay, bind the expected org and epoch to the caller's selected FULL
 dispatch and verify all of the following from the qualified co-read:
@@ -540,12 +578,14 @@ prior successful replay. No warm-cache or receipt-only exemption exists.
 
 The consumer must prepare the complete validated plan from section 6 **before**
 this erasure replay's first S3 call, including its receipt lookup. Only afterward
-may a receipt authorize `already` or a plan authorize mutations. At review
-input `476975bd`, it checks only that `resolveSessionTargets` exists before an
-identity-derived receipt lookup; the actual target resolution still happens
-later. Callback presence is not proof, and an old receipt cannot bypass plan
-preparation. Release readiness must independently validate the same plan and
-receipt binding; a previously cached replay outcome is not sufficient.
+may a receipt authorize `already` or a plan authorize mutations. Current
+hold-bridge (`8818b764` and the `f98d54af` landing unit) already resolves and
+validates the complete session target array before receipt lookup. Preserve
+that placement when replacing the legacy array seam with the paged wrapper;
+the earlier callback-presence-only review input is superseded. An old receipt
+cannot bypass plan preparation. Release readiness must independently validate
+the same plan and receipt binding; a previously cached replay outcome is not
+sufficient.
 
 Propose a new receipt version/key domain binding hold epoch and its installed
 fence/selected-FULL context, manifest UUID, accepted request ID, complete scope,
@@ -776,3 +816,56 @@ Neither the session manifest nor 062320's shared org lock can stand in for it.
 
 Until these are agreed, this remains a review draft. It changes no SQL body,
 bridge behavior, release gate or live state.
+
+## 12. Producer implementation handoff clarifications
+
+- **Eligibility:** without a separate continuity proof, only the uninterrupted
+  call that created both receipt and intent may seal. Failed-receipt retries
+  keep an existing intent unsealed and never invent capture for a pre-install
+  receipt. A full transaction rollback leaves no committed receipt/effects;
+  a later genuinely fresh attempt is distinct from a committed failed intent.
+- **Org lock:** the replaced `_session` records an erasure and therefore takes
+  section 3's marked erasure check first too. Owner-only ACL does not enforce
+  runtime-wrapper-only invocation. A same-key SHARED reacquisition is reentrant;
+  a direct owner call must not take GLOBAL X before needing org S. Do not
+  blanket-add new erasure gates to read/step helpers. Verify the live body and
+  direct-owner/lifecycle ordering in native PostgreSQL.
+- **Overlap/empty:** a fresh closure overlapping another request's alias group
+  gets no partial intent/A0 or silent union. An older seal is not proof of the
+  new request's effects; only a genuinely fully covered repeat can reuse it.
+  An empty owner set or unwind with no seal may return `manifest_unsealed`;
+  no extra marker table or false empty completion is needed just for diagnosis.
+- **Compound keys/down:** full request/scope FKs may be added only in the new
+  migration, never by changing 050000 bytes. A retained FK to receipts can
+  prevent 050000's DROP TABLE even with empty histories. Its populated and
+  empty down/reapply behavior needs a reviewed explicit plan; preserving all
+  FKs is not automatically equivalent to restoring older rollback behavior.
+  Never cascade away proof or bypass the older guards to make a down pass.
+- **Reader:** read-only behavior and support inside a READ ONLY transaction
+  are required; this does not add an undocumented `transaction_read_only`
+  mode precondition that rejects a valid pure SELECT in a read-write transaction.
+  Cursors must identify an existing non-final target of the same manifest and
+  digest, while the consumer starts at null and validates the complete chain.
+  Origins have no declared fixed bound: 64 owners and 256 aliases do not make
+  full-set work per page constant. Budgets fail closed without truncating proof
+  or inventing a new erase cardinality refusal.
+- **Shared fence body:** a six-argument owner-only implementation and retained
+  five-argument NULL-manifest wrapper can share one effect path. No ambiguous
+  DEFAULT overload. The manifest path uses T freshly materialized after owner
+  convergence under this call's locks, seals before selection, and unwinds with
+  failed effects. A saved seal is replay evidence, not a way to narrow new SQL
+  effects. The NULL path preserves legacy convergence/refusals and mutations.
+- **Partial phase:** a first code-only increment may implement prospective
+  targets/reader while effect qualification remains missing. It does not
+  satisfy positive-window release. In particular, grouping history by org and
+  current xid/source/op is not request attribution: the transaction can contain
+  multiple erases, unrelated writes, and outer runtime work after `_session`
+  returns. Later runtime effects require an independently reviewed association
+  or remain unmapped. Do not silently broaden the scope to every runtime entry.
+- **Classification/ownership:** the producer branch adds a closed explicit
+  `ERASURE_PROOF_TABLES` classification and causal inventory tests with consumer
+  review, atomically with its new relations. Org IDs are allowed in that proof
+  class, but it never becomes an erasure source. No blanket prefix exemption:
+  unknown future matching tables must still fail classification. The consumer
+  owns draining, preparation, v2 receipts and release; no frozen reader change
+  or producer-owned migration qualifier is required.
