@@ -127,7 +127,8 @@ export interface ItemReceipt {
   survivor: { prefix_sha256: string; manifest: PinEntry; chunks: PinEntry[]; pin_sha256: string } | null;
   counts: { versions: number; delete_markers: number; manifest_versions: number; chunk_versions: number; other_versions: number; records_old: number; records_survivor: number };
 }
-export interface IdentityReceipt { identity_hash: string; status: "PASS" | "FAIL"; reasons: Partial<Record<VerifyReason, number>>; items: ItemReceipt[] }
+/** `item_count`: the identity's queued old prefixes (the unit --max counts), stored so execute reconciles both units. */
+export interface IdentityReceipt { identity_hash: string; status: "PASS" | "FAIL"; reasons: Partial<Record<VerifyReason, number>>; item_count: number; items: ItemReceipt[] }
 /**
  * What a receipt was produced against. Execute recomputes every field from its own configuration and refuses on any
  * mismatch (job.ts, stale_prefix_receipt_target_mismatch / stale_prefix_receipt_stale).
@@ -198,7 +199,7 @@ export function parseReceipt(text: string): VerificationReceipt {
   const { receipt_sha256, ...unsealed } = r;
   if (digest(unsealed) !== receipt_sha256) throw invalid("receipt digest");
   for (const id of r.identities) {
-    if (!id || !HEX64.test(id.identity_hash) || !Array.isArray(id.items) || (id.status !== "PASS" && id.status !== "FAIL")) throw invalid("identity shape");
+    if (!id || !HEX64.test(id.identity_hash) || !Array.isArray(id.items) || (id.status !== "PASS" && id.status !== "FAIL") || id.item_count !== id.items.length) throw invalid("identity shape");
     if (id.status === "PASS" && (Object.keys(id.reasons ?? {}).length || !id.items.length || id.items.some((i) => i.status !== "PASS"))) throw invalid("identity status");
     for (const it of id.items) {
       if (!it || it.identity_hash !== id.identity_hash || !HEX64.test(it.old_prefix_sha256) || !Number.isSafeInteger(it.enqueued_at) || !Array.isArray(it.old_versions))

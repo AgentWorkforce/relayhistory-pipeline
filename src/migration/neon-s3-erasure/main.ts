@@ -118,6 +118,9 @@ export interface StalePrefixOptions {
   attestationSha256?: string;
   approvedAllowlistSha256?: string;
   approvedMax?: number;
+  approvedIdentityCount?: number;
+  /** Multi-prefix mode only: requires its OWN owner approval (planned prefixes > identities). */
+  approvedPrefixCount?: number;
 }
 
 /**
@@ -142,6 +145,13 @@ export function staleprefixOptions(args: readonly string[], e: (k: string) => st
   let execute = false, max: number | undefined, seen = 0, verifyOnly = false;
   let receiptOut: string | undefined, verifiedReceipt: string | undefined, protectionAttestation: string | undefined;
   let receiptSha256: string | undefined, attestationSha256: string | undefined, approvedAllowlistSha256: string | undefined, approvedMax: number | undefined;
+  let approvedIdentityCount: number | undefined, approvedPrefixCount: number | undefined;
+  const countArg = (i: number, name: string, prior: number | undefined): number => {
+    if (prior !== undefined) throw optionRefusal("stale_prefix_max_invalid", `${name} given more than once`);
+    const v = args[i];
+    if (v === undefined || !/^[1-9][0-9]*$/.test(v) || !Number.isSafeInteger(Number(v))) throw optionRefusal("stale_prefix_max_invalid", `${name} takes a positive decimal integer`);
+    return Number(v);
+  };
   const hexArg = (i: number, name: string, prior: string | undefined): string => {
     if (prior !== undefined) throw optionRefusal("stale_prefix_sha256_invalid", `${name} given more than once`);
     const v = args[i];
@@ -181,12 +191,10 @@ export function staleprefixOptions(args: readonly string[], e: (k: string) => st
     else if (a === "--receipt-sha256") receiptSha256 = hexArg(++i, "--receipt-sha256", receiptSha256);
     else if (a === "--attestation-sha256") attestationSha256 = hexArg(++i, "--attestation-sha256", attestationSha256);
     else if (a === "--approved-allowlist-sha256") approvedAllowlistSha256 = hexArg(++i, "--approved-allowlist-sha256", approvedAllowlistSha256);
-    else if (a === "--approved-max") {
-      if (approvedMax !== undefined) throw optionRefusal("stale_prefix_max_invalid", "--approved-max given more than once");
-      const v = args[++i];
-      if (v === undefined || !/^[1-9][0-9]*$/.test(v) || !Number.isSafeInteger(Number(v))) throw optionRefusal("stale_prefix_max_invalid", "--approved-max takes a positive decimal integer");
-      approvedMax = Number(v);
-    } else throw optionRefusal("stale_prefix_mode_flag_refused", "--stale-prefixes-only accepts only --execute, --once, --max <n>, --only-identity <sha256>, --verify-only, --receipt-out <path>, --verified-receipt <path>, --protection-attestation <path>, --receipt-sha256 <hex>, --attestation-sha256 <hex>, --approved-allowlist-sha256 <hex> and --approved-max <n>");
+    else if (a === "--approved-max") approvedMax = countArg(++i, "--approved-max", approvedMax);
+    else if (a === "--approved-identity-count") approvedIdentityCount = countArg(++i, "--approved-identity-count", approvedIdentityCount);
+    else if (a === "--approved-prefix-count") approvedPrefixCount = countArg(++i, "--approved-prefix-count", approvedPrefixCount);
+    else throw optionRefusal("stale_prefix_mode_flag_refused", "--stale-prefixes-only accepts only --execute, --once, --max <n>, --only-identity <sha256>, --verify-only, --receipt-out <path>, --verified-receipt <path>, --protection-attestation <path>, --receipt-sha256 <hex>, --attestation-sha256 <hex>, --approved-allowlist-sha256 <hex>, --approved-max <n>, --approved-identity-count <n> and --approved-prefix-count <n>");
   }
   if (seen !== 1) throw optionRefusal("stale_prefix_mode_flag_refused", "--stale-prefixes-only given more than once");
   if (onlyIdentities.length === 0)
@@ -204,19 +212,21 @@ export function staleprefixOptions(args: readonly string[], e: (k: string) => st
   if (verifyOnly && (execute || max !== undefined || verifiedReceipt !== undefined || protectionAttestation !== undefined))
     throw optionRefusal("stale_prefix_verify_only_flag_refused", "--verify-only is read-only: it takes no --execute, --max, --verified-receipt or --protection-attestation");
   if (receiptOut !== undefined && !verifyOnly) throw optionRefusal("stale_prefix_receipt_out_without_verify", "--receipt-out applies only with --verify-only");
-  const executeOnly = [verifiedReceipt, protectionAttestation, receiptSha256, attestationSha256, approvedAllowlistSha256, approvedMax];
+  const executeOnly = [verifiedReceipt, protectionAttestation, receiptSha256, attestationSha256, approvedAllowlistSha256, approvedMax, approvedIdentityCount, approvedPrefixCount];
   if (!execute && executeOnly.some((x) => x !== undefined))
     throw optionRefusal("stale_prefix_receipt_without_execute", "--verified-receipt, --protection-attestation, their --*-sha256 and the --approved-* values apply only with --execute");
   if (execute && verifiedReceipt === undefined) throw optionRefusal("stale_prefix_execute_requires_verified_receipt", "--execute requires --verified-receipt <path>");
   if (execute && protectionAttestation === undefined) throw optionRefusal("stale_prefix_execute_requires_attestation", "--execute requires --protection-attestation <path>");
   // The owner-approved decision entry pins the exact files and the batch: all four are required, and --max with them.
-  if (execute && (receiptSha256 === undefined || attestationSha256 === undefined || approvedAllowlistSha256 === undefined || approvedMax === undefined || max === undefined))
-    throw optionRefusal("stale_prefix_execute_requires_approval", "--execute requires --receipt-sha256, --attestation-sha256, --approved-allowlist-sha256, --approved-max and --max");
+  if (execute && (receiptSha256 === undefined || attestationSha256 === undefined || approvedAllowlistSha256 === undefined || approvedMax === undefined
+      || approvedIdentityCount === undefined || max === undefined))
+    throw optionRefusal("stale_prefix_execute_requires_approval", "--execute requires --receipt-sha256, --attestation-sha256, --approved-allowlist-sha256, --approved-max, --approved-identity-count and --max");
   return {
     execute, onlyIdentities, verifyOnly, ...(max !== undefined ? { max } : {}), ...(receiptOut !== undefined ? { receiptOut } : {}),
     ...(verifiedReceipt !== undefined ? { verifiedReceipt } : {}), ...(protectionAttestation !== undefined ? { protectionAttestation } : {}),
     ...(receiptSha256 !== undefined ? { receiptSha256 } : {}), ...(attestationSha256 !== undefined ? { attestationSha256 } : {}),
     ...(approvedAllowlistSha256 !== undefined ? { approvedAllowlistSha256 } : {}), ...(approvedMax !== undefined ? { approvedMax } : {}),
+    ...(approvedIdentityCount !== undefined ? { approvedIdentityCount } : {}), ...(approvedPrefixCount !== undefined ? { approvedPrefixCount } : {}),
   };
 }
 
@@ -460,6 +470,8 @@ export async function main(): Promise<number> {
             target: { stateIdentity: stateIdentity(statePath), verifierCommit: verifierCommit() },
             approvedAllowlistSha256: stale.approvedAllowlistSha256!,
             approvedMax: stale.approvedMax!,
+            approvedIdentityCount: stale.approvedIdentityCount!,
+            ...(stale.approvedPrefixCount !== undefined ? { approvedPrefixCount: stale.approvedPrefixCount } : {}),
             ...(isReceiptFence(eraser) ? { fence: eraser } : {}),
           }
         : {};

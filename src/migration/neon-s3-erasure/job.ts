@@ -42,7 +42,7 @@ import type { SyncState } from "../neon-s3-sync/state.ts";
 import { errorCode, type Log } from "../neon-s3-sync/sync.ts";
 import { inSessionAnyDate, type EraseCheckpoint, type Eraser, type ListedVersion, type LiveObjectProbe, type PagedEraser, type ReceiptFence, type VersionReader } from "./eraser.ts";
 import {
-  allowlistDigest, attestationFresh, attestationProblem, protectionFacts, RECEIPT_KIND, RECEIPT_MAX_AGE_MS, sameItem, sameVersionSet, sealReceipt, sha256Hex as verifySha256, survivorPinsHold,
+  allowlistDigest, ATTESTATION_MAX_AGE_MS, attestationFresh, attestationProblem, protectionFacts, RECEIPT_KIND, RECEIPT_MAX_AGE_MS, sameItem, sameVersionSet, sealReceipt, sha256Hex as verifySha256, survivorPinsHold,
   verifyStalePrefix, versionSet, type IdentityReceipt, type ItemReceipt, type ProtectionAttestation, type VerificationReceipt, type VerifyReason,
 } from "./stale-prefix-verify.ts";
 import { terminalInvocations } from "./write-obligation.ts";
@@ -207,7 +207,12 @@ export interface StalePrefixPassOptions {
   target?: { stateIdentity: string; verifierCommit: string };
   /** Execute: the owner-approved allowlist digest (allowlistDigest) and planned item count, from the decision entry. */
   approvedAllowlistSha256?: string;
+  /** Planned old PREFIXES (the dry run's eligible count, the unit --max counts). */
   approvedMax?: number;
+  /** IDENTITIES: the allowlist size. */
+  approvedIdentityCount?: number;
+  /** Multi-prefix mode ONLY (its own owner approval): planned prefixes when they exceed the identity count. */
+  approvedPrefixCount?: number;
 }
 
 export type VersionOutcome = "deleted" | "not_attempted" | "absent_observed" | "present_after_error" | "unknown";
@@ -259,6 +264,21 @@ export interface FenceReport {
  *   - the lifecycle facts themselves when the configuration cannot be read.
  */
 interface FenceContext { receipt: VerificationReceipt; fence: ReceiptFence; attestation: ProtectionAttestation; probe: LiveObjectProbe }
+
+/** The fence's clock: the hard deadline, the ACTUAL listing pages per prefix, the remaining work, the first gate refusal. */
+interface FenceClock {
+  protectedUntil: number;
+  pages: Map<string, number>;
+  remaining: { entry: ItemReceipt; oldPrefix: string; survivorPrefix: string; deletesLeft: number; first: boolean }[];
+  maxLatencyMs: number;
+  failure?: string;
+}
+/** Most pages one fence listing may take (strictInventory's own ceiling is 100); beyond it the listing aborts. */
+export const FENCE_LIST_MAX_PAGES = 20;
+/** Most milliseconds between a completed fence check and issuing its delete. */
+export const CHECK_TO_DELETE_MAX_MS = 2_000;
+/** Lease time kept beyond one delete's worst case at issuance. */
+export const ISSUE_MARGIN_MS = 5_000;
 
 /** The eraser-wide stale-prefix run lease: a leases row no session prefix can equal (object keys never start with ':'). */
 export const STALE_RUN_LEASE = ":eraser-run:stale-prefixes-only";
@@ -1121,8 +1141,10 @@ export class ErasureJob {
    *  - the run's allowlist, the receipt's allowlist and the receipt's identity set are EXACTLY equal, and their digest
    *    equals the owner-approved `approvedAllowlistSha256`;
    *  - every identity and every item is PASS;
-   *  - `max` (counted in ITEMS, i.e. old prefixes) equals the receipt's planned item count and the approved max, so a
-   *    cap can never end a partly completed batch.
+   *  - units (stale_prefix_cap_units_mismatch): identities = allowlist size = `approvedIdentityCount`; planned
+   *    prefixes = `max` = `approvedMax` (never derived from the receipt); planned prefixes = identities unless the
+   *    separately owner-approved multi-prefix mode names them (`approvedPrefixCount`); each identity's item_count
+   *    equals its items. So a cap can never end a partly completed batch.
    */
   #receiptGate(opts: StalePrefixPassOptions, ids: readonly string[]): void {
     const r = opts.receipt!;
@@ -1140,8 +1162,17 @@ export class ErasureJob {
       throw refusal("stale_prefix_receipt_target_mismatch");
     const at = Date.parse(t.produced_at), now = this.now();
     if (!Number.isFinite(at) || at > now + 60_000 || now - at > RECEIPT_MAX_AGE_MS) throw refusal("stale_prefix_receipt_stale");
+    // Two units, reconciled and never raised: IDENTITIES (the allowlist) and old PREFIXES (items; the dry run's
+    // eligible count, which --max counts). Each identity's item_count must equal its items.
+    if (r.identities.some((i) => i.item_count !== i.items.length)) throw refusal("stale_prefix_cap_units_mismatch");
     const planned = r.identities.reduce((n, i) => n + i.items.length, 0);
-    if (opts.max !== planned || opts.approvedMax !== planned) throw refusal("stale_prefix_max_mismatch");
+    if (r.identities.length !== ids.length || opts.approvedIdentityCount !== ids.length) throw refusal("stale_prefix_cap_units_mismatch");
+    if (opts.max !== planned || opts.approvedMax !== planned) throw refusal("stale_prefix_cap_units_mismatch");
+    // The owner decision's DEFAULT rule: planned prefixes equal the allowlist's identity count (one prefix each).
+    // More prefixes than identities only under the separately owner-approved multi-prefix mode, whose
+    // --approved-prefix-count must equal the planned prefixes.
+    if (planned !== ids.length && opts.approvedPrefixCount !== planned) throw refusal("stale_prefix_cap_units_mismatch");
+    if (opts.approvedPrefixCount !== undefined && opts.approvedPrefixCount !== planned) throw refusal("stale_prefix_cap_units_mismatch");
   }
 
   /**
@@ -1190,6 +1221,9 @@ export class ErasureJob {
       work.push({ item, identity, entry: entries[at]!, report: reports[at]! });
     }
     if (work.length !== entries.length) return refuseBatch("stale_prefix_receipt_missing");
+    // Per identity, the queued (due, in-scope) prefixes equal the receipt's item_count.
+    for (const id of receipt.identities)
+      if (work.filter((w) => w.identity === id.identity_hash).length !== id.item_count) return refuseBatch("stale_prefix_cap_units_mismatch");
     // Process in the receipt's order (deterministic, and the order the owner approved).
     work.sort((a, b) => entries.indexOf(a.entry) - entries.indexOf(b.entry));
     const guardAll = async (): Promise<string | undefined> => {
@@ -1227,6 +1261,22 @@ export class ErasureJob {
       return true;
     };
     let current: Work | undefined;
+    const fs: FenceClock = { protectedUntil: Number.NEGATIVE_INFINITY, pages: new Map(), remaining: [], maxLatencyMs: 0 };
+    /** Every S3 request after the leases goes through the request gate; a listing also counts its ACTUAL pages. */
+    const hook = (prefix?: string) => {
+      let n = 0;
+      return () => {
+        this.#requestGate(fence, fs, held);
+        if (prefix === undefined) return;
+        if (++n > FENCE_LIST_MAX_PAGES) throw refusal("stale_prefix_listing_budget");
+        fs.pages.set(prefix, Math.max(fs.pages.get(prefix) ?? 0, n));
+      };
+    };
+    const list = (prefix: string) => fence.listVersions(prefix, { beforeRequest: hook(prefix) });
+    const reader: VersionReader = {
+      listVersions: (prefix) => opts.reader!.listVersions(prefix, { beforeRequest: hook(prefix) }),
+      getVersion: (key, versionId, maxBytes) => { hook()(); return opts.reader!.getVersion(key, versionId, maxBytes); },
+    };
     try {
       if (!take(STALE_RUN_LEASE)) return refuseBatch("stale_prefix_mode_other_eraser_lease");
       for (const w of work) {
@@ -1238,6 +1288,17 @@ export class ErasureJob {
         if (!take(sp)) return refuseBatch("stale_prefix_survivor_lease_busy");
         w.survivorPrefix = sp;
       }
+      // The HARD batch deadline, fixed now: the earliest lease expiry or attestation expiry, minus a margin of two
+      // worst-case requests. Every later S3 request (each list page, each GET, each delete) is gated on it; the
+      // remaining-work TTL bound is only an estimate, this deadline is not.
+      const perRequest = fence.requestDeadlineMs * fence.requestAttempts;
+      const t0 = this.now();
+      const leaseUntil = Math.min(...held.map((p) => t0 + this.state.leaseRemainingMs(p, LEASE_HOLDER, t0)));
+      fs.protectedUntil = Math.min(leaseUntil, Date.parse(attestation.verified_at) + ATTESTATION_MAX_AGE_MS) - 2 * perRequest;
+      const remainingFrom = (wi: number, deletesLeftInFirst?: number) => work.slice(wi).map((x, i) => ({
+        entry: x.entry, oldPrefix: x.item.key, survivorPrefix: x.survivorPrefix!, deletesLeft: i === 0 && deletesLeftInFirst !== undefined ? deletesLeftInFirst : x.entry.old_versions.length, first: i === 0 && deletesLeftInFirst !== undefined,
+      }));
+      fs.remaining = remainingFrom(0);
       // ---- C. under all leases: queued, guard, mandatory inline re-verification
       for (const w of work) if (!this.state.erasureQueued(w.item.key, w.item.enqueued_at)) { skip("cancelled", w.item.key); return refuseBatch("stale_prefix_batch_cancelled"); }
       const g2 = await guardAll();
@@ -1245,31 +1306,36 @@ export class ErasureJob {
       if (g2) return refuseBatch("stale_prefix_batch_guard_skip", { reason: g2 });
       for (const w of work) {
         // The exact old set and the survivor pins first (precise codes), then the full re-verification.
-        if (!sameVersionSet(versionSet(await fence.listVersions(w.item.key)), w.entry.old_versions)) return refuseBatch("stale_prefix_receipt_drift", { old_prefix_sha256: w.entry.old_prefix_sha256 });
-        if (!survivorPinsHold(await fence.listVersions(w.survivorPrefix!), w.entry.survivor!)) return refuseBatch("stale_prefix_survivor_drift", { old_prefix_sha256: w.entry.old_prefix_sha256 });
-        const again = await verifyStalePrefix(opts.reader!, { identityHash: w.identity, oldPrefix: w.item.key, enqueuedAt: w.item.enqueued_at, survivorManifestKeys: this.#staleSiblings(w.item).siblings });
+        if (!sameVersionSet(versionSet(await list(w.item.key)), w.entry.old_versions)) return refuseBatch("stale_prefix_receipt_drift", { old_prefix_sha256: w.entry.old_prefix_sha256 });
+        if (!survivorPinsHold(await list(w.survivorPrefix!), w.entry.survivor!)) return refuseBatch("stale_prefix_survivor_drift", { old_prefix_sha256: w.entry.old_prefix_sha256 });
+        const again = await verifyStalePrefix(reader, { identityHash: w.identity, oldPrefix: w.item.key, enqueuedAt: w.item.enqueued_at, survivorManifestKeys: this.#staleSiblings(w.item).siblings });
+        if (fs.failure) throw refusal(fs.failure); // a gate refusal swallowed as "unreadable" inside the verifier
         if (!sameItem(again, w.entry)) return refuseBatch("stale_prefix_reverify_mismatch", { old_prefix_sha256: w.entry.old_prefix_sha256 });
       }
       // ---- D. deletes
-      const timing = { maxLatencyMs: 0 };
       for (let wi = 0; wi < work.length; wi++) {
         const w = (current = work[wi]!);
         if (this.stopped()) { res.ok = false; res.stoppedBy = "signal"; break; }
-        const listing = await fence.listVersions(w.item.key);
+        fs.remaining = remainingFrom(wi);
+        const listing = await list(w.item.key);
         if (!sameVersionSet(versionSet(listing), w.entry.old_versions)) { this.#stopBatch(res, w, "stale_prefix_receipt_drift"); break; }
         const doomed = [...listing].sort((a, b) =>
           Number(b.key.endsWith("/manifest.json")) - Number(a.key.endsWith("/manifest.json")) || (a.key < b.key ? -1 : a.key > b.key ? 1 : a.versionId < b.versionId ? -1 : 1));
         w.report.versions = doomed.map((v) => ({ key_sha256: verifySha256(v.key), version_id: v.versionId, outcome: "not_attempted" as VersionOutcome }));
         let stop: string | undefined;
         let credential: unknown;
-        const rest = work.slice(wi + 1).map((x) => x.entry);
         for (let i = 0; i < doomed.length && !stop; i++) {
-          stop = await this.#fenceCheck(w, held, fence, attestation, timing, doomed.length - i, rest);
+          fs.remaining = remainingFrom(wi, doomed.length - i);
+          stop = await this.#fenceCheck(w, held, list);
+          const checkDoneAt = this.now();
           if (stop) break;
           const v = doomed[i]!, out = w.report.versions[i]!;
           // Receipt membership of the very version about to be deleted.
           if (!w.entry.old_versions.some((e) => e.key_sha256 === out.key_sha256 && e.version_id === v.versionId)) { stop = "stale_prefix_receipt_drift"; break; }
-          const t0 = this.now();
+          // IMMEDIATELY before issuing: attestation, check-to-delete interval, hard deadline, every lease's TTL.
+          stop = this.#issueCheck(fence, fs, held, attestation, checkDoneAt);
+          if (stop) break;
+          const t1 = this.now();
           try {
             await fence.deleteVersion(v.key, v.versionId);
           } catch (error) {
@@ -1285,14 +1351,20 @@ export class ErasureJob {
             stop = "stale_prefix_delete_ambiguous";
             break;
           }
-          timing.maxLatencyMs = Math.max(timing.maxLatencyMs, this.now() - t0);
+          fs.maxLatencyMs = Math.max(fs.maxLatencyMs, this.now() - t1);
           out.outcome = "deleted";
           w.report.deleted += 1;
         }
         if (!stop) {
           // After the item: the survivor again, and a strict proof that nothing is left under the old prefix.
-          if (!survivorPinsHold(await fence.listVersions(w.survivorPrefix!), w.entry.survivor!)) stop = "stale_prefix_survivor_drift_after_erase";
-          else if ((await fence.listVersions(w.item.key)).length) stop = "stale_prefix_post_residue";
+          fs.remaining = remainingFrom(wi, 0);
+          try {
+            if (!survivorPinsHold(await list(w.survivorPrefix!), w.entry.survivor!)) stop = "stale_prefix_survivor_drift_after_erase";
+            else if ((await list(w.item.key)).length) stop = "stale_prefix_post_residue";
+          } catch (error) {
+            if (isCredentialFault(error)) throw error;
+            stop = errorCode(error);
+          }
         }
         res.versionsDeleted += w.report.deleted;
         this.counters.versionsDeleted += w.report.deleted;
@@ -1312,8 +1384,7 @@ export class ErasureJob {
       }
     } catch (error) {
       if (isCredentialFault(error)) throw error;
-      if (current && current.report.versions.some((v) => v.outcome !== "not_attempted")) this.#stopBatch(res, current, errorCode(error));
-      else if (current) { this.#stopBatch(res, current, errorCode(error)); }
+      if (current) this.#stopBatch(res, current, errorCode(error));
       else return refuseBatch(errorCode(error));
     } finally {
       try { this.state.releaseLeases(LEASE_HOLDER, held); } catch {}
@@ -1322,46 +1393,75 @@ export class ErasureJob {
   }
 
   /**
-   * Every per-delete precondition, immediately before ONE delete; returns the coded stop reason, or undefined:
-   * the item still queued; every held lease renewed AND with remaining TTL at least the worst case to finish the
-   * WHOLE batch (#ttlBound); no other eraser lease; the OFF interlock; authority ready; the attestation fresh; a
-   * strict relist of the old prefix EXACTLY equal to the receipt's set minus what was deleted (a version not in the
-   * receipt, or one gone without our delete, is drift); and every survivor pin CURRENT at its pinned versionId and
-   * not a delete marker (a pin made NONCURRENT is drift: the bucket expires noncurrent versions after about a day).
+   * The gate before EVERY S3 request once the leases are held: the request's own worst case (deadline x attempts)
+   * must end by the hard deadline, and every lease must still cover the remaining work (#ttlBound, with the ACTUAL
+   * page counts observed so far). Throws `stale_prefix_deadline` / `stale_prefix_lease_ttl_insufficient`.
    */
-  async #fenceCheck(w: { item: QueuedItem; entry: ItemReceipt; report: FenceReport; survivorPrefix?: string }, held: readonly string[], fence: ReceiptFence,
-    attestation: ProtectionAttestation, timing: { maxLatencyMs: number }, deletesLeftInItem: number, laterItems: readonly ItemReceipt[]): Promise<string | undefined> {
+  #requestGate(fence: ReceiptFence, fs: FenceClock, held: readonly string[]): void {
+    const now = this.now();
+    const fail = (code: string) => { fs.failure ??= code; throw refusal(code); };
+    if (now + fence.requestDeadlineMs * fence.requestAttempts > fs.protectedUntil) fail("stale_prefix_deadline");
+    const bound = this.#ttlBound(fence, fs);
+    for (const p of held) if (this.state.leaseRemainingMs(p, LEASE_HOLDER, now) < bound) fail("stale_prefix_lease_ttl_insufficient");
+  }
+
+  /**
+   * Every per-delete precondition that needs I/O, immediately before ONE delete; returns the coded stop reason, or
+   * undefined: the item still queued; every held lease renewed; no other eraser lease; the OFF interlock; authority
+   * ready; a strict relist of the old prefix EXACTLY equal to the receipt's set minus what was deleted (a version not
+   * in the receipt, or one gone without our delete, is drift); and every survivor pin CURRENT at its pinned versionId
+   * and not a delete marker (a pin made NONCURRENT is drift: the bucket expires noncurrent versions after about a
+   * day). The time-based checks run AFTER this, at issuance (#issueCheck).
+   */
+  async #fenceCheck(w: { item: QueuedItem; entry: ItemReceipt; report: FenceReport; survivorPrefix?: string }, held: readonly string[],
+    list: (prefix: string) => Promise<ListedVersion[]>): Promise<string | undefined> {
     if (!this.state.erasureQueued(w.item.key, w.item.enqueued_at)) return "erasure_item_cancelled";
-    const bound = this.#ttlBound(fence, timing, w.entry, deletesLeftInItem, laterItems);
-    for (const p of held) {
-      if (!this.state.renewLease(p, LEASE_HOLDER, this.now())) return "erasure_lease_lost";
-      if (this.state.leaseRemainingMs(p, LEASE_HOLDER, this.now()) < bound) return "stale_prefix_lease_ttl_insufficient";
-    }
+    for (const p of held) if (!this.state.renewLease(p, LEASE_HOLDER, this.now())) return "erasure_lease_lost";
     if (this.state.otherEraserLeases(LEASE_HOLDER, this.now()) > 0) return "stale_prefix_mode_other_eraser_lease";
     this.state.assertModeAllowed();
     await this.authority.ready();
-    if (!attestationFresh(attestation, this.now())) return "stale_prefix_protection_unproven";
     const expected = w.entry.old_versions.filter((v) => !w.report.versions.some((r) => r.outcome === "deleted" && r.key_sha256 === v.key_sha256 && r.version_id === v.version_id));
-    if (!sameVersionSet(versionSet(await fence.listVersions(w.item.key)), expected)) return "stale_prefix_receipt_drift";
-    if (!survivorPinsHold(await fence.listVersions(w.survivorPrefix!), w.entry.survivor!)) return "stale_prefix_survivor_drift";
+    if (!sameVersionSet(versionSet(await list(w.item.key)), expected)) return "stale_prefix_receipt_drift";
+    if (!survivorPinsHold(await list(w.survivorPrefix!), w.entry.survivor!)) return "stale_prefix_survivor_drift";
     this.state.assertModeAllowed();
     return undefined;
   }
 
   /**
-   * Worst-case milliseconds from now through the LAST delete of the batch, from the fence's per-request deadline and
-   * attempts (no fixed allowance): every remaining delete of this item costs its check's two listings (old prefix and
-   * survivor, pages = floor(versions / 1000) + 1 at S3's 1,000 per page) plus the delete; each later item adds its
-   * initial relist, its deletes with their checks, and the two post-checks; this item adds its two post-checks. The
-   * slowest observed delete is a floor for one request.
+   * At the instant of issuing ONE delete (after the authority check and both listings): the attestation still fresh;
+   * at most CHECK_TO_DELETE_MAX_MS since the fence check completed; the delete's own worst case (deadline x attempts)
+   * ends by the hard deadline; and every lease's remaining TTL covers that request plus ISSUE_MARGIN_MS and the
+   * remaining-work bound. Otherwise the delete is NOT issued.
    */
-  #ttlBound(fence: ReceiptFence, timing: { maxLatencyMs: number }, entry: ItemReceipt, deletesLeft: number, later: readonly ItemReceipt[]): number {
-    const perRequest = Math.max(fence.requestDeadlineMs, timing.maxLatencyMs) * fence.requestAttempts;
-    const pages = (n: number) => Math.floor(n / 1000) + 1;
-    const survPages = (e: ItemReceipt) => pages(1 + e.survivor!.chunks.length) + 1; // one extra page of margin for other survivor versions
-    const itemRequests = (e: ItemReceipt, deletes: number) => deletes * (pages(e.old_versions.length) + survPages(e) + 1);
-    let requests = itemRequests(entry, deletesLeft) + pages(entry.old_versions.length) + survPages(entry);
-    for (const e of later) requests += pages(e.old_versions.length) + itemRequests(e, e.old_versions.length) + pages(e.old_versions.length) + survPages(e);
+  #issueCheck(fence: ReceiptFence, fs: FenceClock, held: readonly string[], attestation: ProtectionAttestation, checkDoneAt: number): string | undefined {
+    const now = this.now(), perRequest = fence.requestDeadlineMs * fence.requestAttempts;
+    if (!attestationFresh(attestation, now)) return "stale_prefix_protection_unproven";
+    if (now - checkDoneAt > CHECK_TO_DELETE_MAX_MS) return "stale_prefix_deadline";
+    if (now + perRequest > fs.protectedUntil) return "stale_prefix_deadline";
+    const bound = this.#ttlBound(fence, fs);
+    for (const p of held) {
+      const left = this.state.leaseRemainingMs(p, LEASE_HOLDER, now);
+      if (left < perRequest + ISSUE_MARGIN_MS) return "stale_prefix_deadline";
+      if (left < bound) return "stale_prefix_lease_ttl_insufficient";
+    }
+    return undefined;
+  }
+
+  /**
+   * Worst-case milliseconds from now through the LAST delete of the batch (an estimate; the hard deadline is the
+   * guarantee): per remaining delete its check's two listings plus the delete, per item an initial relist (not for
+   * the item in progress) and two post-checks. Listing pages are the larger of the S3 estimate (floor(n / 1000) + 1)
+   * and the ACTUAL pages observed for that prefix; one request costs the fence's deadline x attempts (or the slowest
+   * observed delete).
+   */
+  #ttlBound(fence: ReceiptFence, fs: FenceClock): number {
+    const perRequest = Math.max(fence.requestDeadlineMs, fs.maxLatencyMs) * fence.requestAttempts;
+    const pages = (prefix: string, est: number) => Math.max(Math.floor(est / 1000) + 1, fs.pages.get(prefix) ?? 0);
+    let requests = 0;
+    for (const r of fs.remaining) {
+      const oldP = pages(r.oldPrefix, r.entry.old_versions.length), survP = pages(r.survivorPrefix, 2 + r.entry.survivor!.chunks.length);
+      requests += (r.first ? 0 : oldP) + r.deletesLeft * (oldP + survP + 1) + oldP + survP;
+    }
     return requests * perRequest;
   }
 
@@ -1480,7 +1580,7 @@ export class ErasureJob {
       }
       const reasons: Partial<Record<VerifyReason, number>> = {};
       if (!items.length) reasons.no_stale_prefix_entry = 1;
-      identities.push({ identity_hash: id, status: items.length && items.every((i) => i.status === "PASS") ? "PASS" : "FAIL", reasons, items });
+      identities.push({ identity_hash: id, status: items.length && items.every((i) => i.status === "PASS") ? "PASS" : "FAIL", reasons, item_count: items.length, items });
     }
     const target = {
       bucket_sha256: opts.bucketSha256, key_root: this.cfg.keyRoot, allowlist_sha256: allowlistDigest(ids), state_identity: opts.target.stateIdentity,
@@ -1512,7 +1612,8 @@ export class ErasureJob {
     // Execute erases ONLY through the receipt fence (#fencedBatch): a verified receipt, the store fence, the reader
     // for the mandatory inline re-verification, the bucket and target binding and the owner-approved values.
     if (opts.execute && (!opts.receipt || !opts.fence || !opts.reader || !opts.bucketSha256 || !opts.target)) throw refusal("stale_prefix_mode_requires_verified_receipt");
-    if (opts.execute && (opts.approvedAllowlistSha256 === undefined || opts.approvedMax === undefined || opts.max === undefined)) throw refusal("stale_prefix_mode_requires_approval");
+    if (opts.execute && (opts.approvedAllowlistSha256 === undefined || opts.approvedMax === undefined || opts.approvedIdentityCount === undefined || opts.max === undefined))
+      throw refusal("stale_prefix_mode_requires_approval");
     const ids = this.#allowlist(opts.onlyIdentities);
     if (opts.execute) this.#receiptGate(opts, ids);
     // One dense snapshot (#allowlist); every check and the Set use that SAME snapshot, never the caller's array again.

@@ -286,7 +286,7 @@ describe("stale-prefixes-only mode", () => {
   test("--max must equal the receipt's planned item count: a cap that would end the batch early refuses before delete 1; the exact count erases all", async () => {
     const f = await fixture();
     const copies = ["sess-1", "sess-2", "sess-3"].map((s, i) => f.dateMove(s, `g-${s}`, NOW - 60_000 + i));
-    await expect(f.exec({ onlyIdentities: allIds(f.st), execute: true, max: 2, probe: f.s.eraser() })).rejects.toMatchObject({ code: "stale_prefix_max_mismatch" });
+    await expect(f.exec({ onlyIdentities: allIds(f.st), execute: true, max: 2, probe: f.s.eraser() })).rejects.toMatchObject({ code: "stale_prefix_cap_units_mismatch" });
     expect(f.s.deletes).toEqual([]);
     expect(copies.map((c) => f.s.count(c.oldP))).toEqual([3, 3, 3]);
     expect(erasureRow(f.st, copies[2]!.oldP)).toMatchObject({ attempts: 0, error: null, next_try: 0 });
@@ -499,7 +499,11 @@ describe("identity allowlist (--only-identity)", () => {
     f.dateMove("sess-2", "g-2", NOW - 20_000);
     const dry = await f.exec({ execute: false, onlyIdentities: [ID_A] });
     expect(dry).toMatchObject({ eligible: 2, skipped: { not_in_identity_allowlist: 1 }, allowlistMatchedIdentities: 1 });
-    const r = await f.exec({ execute: true, onlyIdentities: [ID_A], probe: f.s.eraser() });
+    // Without the separate multi-prefix approval, 2 prefixes for 1 identity refuse (the owner decision's default rule).
+    await expect(f.exec({ execute: true, onlyIdentities: [ID_A], probe: f.s.eraser() })).rejects.toMatchObject({ code: "stale_prefix_cap_units_mismatch" });
+    expect(f.s.deletes).toEqual([]);
+    // SYNTHETIC: the multi-prefix mode under its own (test-supplied) approval.
+    const r = await f.exec({ execute: true, onlyIdentities: [ID_A], probe: f.s.eraser(), approvedPrefixCount: 2 });
     expect(r).toMatchObject({ ok: true, eligible: 2, erased: 2, skipped: { not_in_identity_allowlist: 1 }, allowlistSize: 1, allowlistMatchedIdentities: 1, allowlistUnmatched: 0 });
     expect([f.s.count(oldP), f.s.count(older), f.s.count(newP)]).toEqual([0, 0, 3]);
     expect(f.st.staleprefixErasures().map((e) => e.key)).toEqual([pfx("2026/11/01", "sess-2")]);
@@ -514,10 +518,11 @@ describe("identity allowlist (--only-identity)", () => {
     f.st.enqueueErasure([{ key: older, kind: "prefix", org_id: ORG, reason: "stale_prefix" }], NOW - 30_000);
     const receipt = await f.verify([ID_A]);
     expect(receipt.identities[0]!.items).toHaveLength(2);
-    await expect(f.exec({ execute: true, max: 1, approvedMax: 1, onlyIdentities: [ID_A], probe: f.s.eraser(), receipt })).rejects.toMatchObject({ code: "stale_prefix_max_mismatch" });
+    await expect(f.exec({ execute: true, max: 1, approvedMax: 1, onlyIdentities: [ID_A], probe: f.s.eraser(), receipt })).rejects.toMatchObject({ code: "stale_prefix_cap_units_mismatch" });
     expect(f.s.deletes).toEqual([]);
     expect([f.s.count(a.oldP), f.s.count(older)]).toEqual([3, 3]);
-    const r = await f.exec({ execute: true, onlyIdentities: [ID_A], probe: f.s.eraser(), receipt });
+    // SYNTHETIC: the multi-prefix mode under its own (test-supplied) approval.
+    const r = await f.exec({ execute: true, onlyIdentities: [ID_A], probe: f.s.eraser(), receipt, approvedPrefixCount: 2 });
     expect(r).toMatchObject({ ok: true, erased: 2, skipped: { not_in_identity_allowlist: 1 } });
     expect([f.s.count(a.oldP), f.s.count(older)]).toEqual([0, 0]);
   });
@@ -549,7 +554,7 @@ describe("identity allowlist (--only-identity)", () => {
     expect(passLine(f.logs)).toMatchObject({ eligible: 2, allowlist_size: 2, allowlist_matched_identities: 2, allowlist_unmatched: 0, allowlist_eligible_identities: 1 });
     expect(dump(f.path)).toEqual(before);
     // Execute: B's only entry is backing off (not due), so the WHOLE batch refuses before any delete.
-    const r = await f.exec({ execute: true, onlyIdentities: [ID_A, ID_B], probe: f.s.eraser() });
+    const r = await f.exec({ execute: true, onlyIdentities: [ID_A, ID_B], probe: f.s.eraser(), approvedPrefixCount: 3 });
     expect(r).toMatchObject({ ok: false, refused: "stale_prefix_batch_not_due", erased: 0, allowlistEligibleIdentities: 0 });
     expect(f.s.deletes).toEqual([]);
     expect([f.s.count(a.oldP), f.s.count(older), f.s.count(b.oldP)]).toEqual([3, 3, 3]);
@@ -667,9 +672,9 @@ describe("CLI options", () => {
     expect(staleprefixOptions(["--stale-prefixes-only", "--only-identity", ID_A], env())).toEqual({ execute: false, verifyOnly: false, onlyIdentities: [ID_A] });
     expect(staleprefixOptions(["--stale-prefixes-only", "--execute", "--once", "--max", "25", "--only-identity", ID_A, "--only-identity", ID_B,
       "--verified-receipt", "r.json", "--protection-attestation", "a.json", "--receipt-sha256", ID_A, "--attestation-sha256", ID_B,
-      "--approved-allowlist-sha256", NO_ID, "--approved-max", "25"], env({ BABYSITTER_RETENTION_SWEEP: " OFF " })))
+      "--approved-allowlist-sha256", NO_ID, "--approved-max", "25", "--approved-identity-count", "2", "--approved-prefix-count", "25"], env({ BABYSITTER_RETENTION_SWEEP: " OFF " })))
       .toEqual({ execute: true, verifyOnly: false, max: 25, onlyIdentities: [ID_A, ID_B], verifiedReceipt: "r.json", protectionAttestation: "a.json",
-        receiptSha256: ID_A, attestationSha256: ID_B, approvedAllowlistSha256: NO_ID, approvedMax: 25 });
+        receiptSha256: ID_A, attestationSha256: ID_B, approvedAllowlistSha256: NO_ID, approvedMax: 25, approvedIdentityCount: 2, approvedPrefixCount: 25 });
     const hundred = Array.from({ length: 100 }, (_, i) => ["--only-identity", i.toString(16).padStart(64, "0")]).flat();
     expect(staleprefixOptions(["--stale-prefixes-only", ...hundred], env())?.onlyIdentities).toHaveLength(100);
   });
