@@ -234,3 +234,12 @@ SQL step and its S3 CAS.
    ledger read, failed reads included. An uncommitted-entry refusal must never become a fallback-eligible 501 for a
    fenced session.
 6. Unenrolled orgs: add a fixture proving the reader is byte-identical (compatible with the dormant flag).
+
+**W2 and erasure (agreed with sessions-buffered-drain-materialization; B3 list-then-CAS guard withdrawn).** For
+enrolled orgs the drain's create-only `drained` marker is the visibility point, and the drain writes it strictly
+last, after verified materialization. An erase of an enrolled org pre-creates create-only markers with outcome
+`erased` for the undrained stages in its scope, before its SQL commit. When a drain's marker put fails with
+already_exists, or its ACK was lost, the drain re-reads the stored marker. It counts the stage drained only when that
+marker is its own: outcome `drained` with the same `staged_sha256`. An `erased` marker, or any other outcome or
+digest, means the stage is not drained, and the drain reports the erase's outcome. Its bytes are re-armed, never
+served. B1 and B2 (the binding and the witness) are diagnosable refusals only.
