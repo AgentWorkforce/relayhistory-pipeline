@@ -315,9 +315,21 @@ const sameObject = (a: BriefCommitIdentity, b: BriefCommitIdentity) =>
  *   equal, a different object: not authoritative (the session_index fence admits one object per revision within a
  *     row's lifetime): no-op;
  *   above: new evidence: arm.
+ * FIRST, revalidation [Pipeline a565a24d44bb]: revision alone cannot order across a delete and recreate, so a commit
+ * arms only when it IS the authoritative current session_index row (`current`, read under the same serialization as
+ * the pointer upsert: inside the canonical publish transaction, or by the legacy indexer under a row lock before it
+ * updates the arm record). Delayed old work, even with a reused revision and identical bytes, has another
+ * manifest_key than the recreated row and is a no-op.
  * Returns the identity to record as armed, or null.
+ *
+ * STANDALONE END (no revision change): retained in the contract, but UNWIRED: no producer in this repo commits an end
+ * without a new manifest revision (manifests are immutable; the publish path never writes ends). When one exists, it
+ * must commit the transition on the arm record against the current incarnation; the same-object `ended` rule below
+ * is ready for it.
  */
-export function armIdentity(armed: BriefCommitIdentity | null, consumed: BriefCommitIdentity | null, incoming: BriefCommitIdentity): BriefCommitIdentity | null {
+export function armIdentity(armed: BriefCommitIdentity | null, consumed: BriefCommitIdentity | null, incoming: BriefCommitIdentity,
+  current: BriefCommitIdentity | null): BriefCommitIdentity | null {
+  if (!current || !sameObject(current, incoming)) return null; // not the authoritative current commit
   const floor = Math.max(armed?.revision ?? -1, consumed?.revision ?? -1);
   if (incoming.revision < floor) return null;
   if (incoming.revision > floor) return incoming;

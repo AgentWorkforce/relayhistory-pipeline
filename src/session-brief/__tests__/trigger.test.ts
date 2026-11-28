@@ -50,6 +50,7 @@ class Sim {
   deleteRow(harness: string, machine = M1) {
     this.rows.get(harness)?.armed.delete(machine);
     this.consumedIds.delete(`${harness}:${machine}`);
+    this.index.delete(`${harness}:${machine}`);
   }
   briefs = new Map<string, Brief>();
   /** The highest committed revision per harness (what a run reads from the authoritative pointers). */
@@ -78,13 +79,21 @@ class Sim {
   brief(h: string): Brief { return this.briefs.get(h) ?? { revision: -1, ready: false }; }
 
   /** The producer, right after the authoritative CAS: arm the durable row, then send the hint (which may be lost). */
-  commit(harness: string, revision: number, opts: { kind?: "append" | "end"; lose?: boolean; loseArm?: boolean } & CommitOpts = {}) {
+  /** session_index's current row per harness:machine (the authoritative commit a writer is revalidated against). */
+  index = new Map<string, BriefCommitIdentity>();
+  /** delayed: an old writer arriving late (its upsert is refused by the fence: it is not the current row). */
+  commit(harness: string, revision: number, opts: { kind?: "append" | "end"; lose?: boolean; loseArm?: boolean; delayed?: boolean } & CommitOpts = {}) {
     this.committed.set(harness, Math.max(this.committed.get(harness) ?? -1, revision));
     const prevRow = this.rows.get(harness);
     const h = hint(opts.kind ?? "append", revision, prevRow?.state.pendingSince ?? this.now, harness, opts);
     const machine = opts.machine ?? M1;
     const incoming: BriefCommitIdentity = { revision, manifestKey: keyOf(revision, opts), contentSha256: opts.digest ?? DIGEST, ended: opts.kind === "end" };
-    const next = armIdentity(prevRow?.armed.get(machine)?.id ?? null, this.consumedIds.get(`${harness}:${machine}`) ?? null, incoming);
+    // The authoritative session_index row for this machine: the fence admits a strictly higher revision, or any
+    // first revision after the rekey DELETE; a delayed writer below it (or for a deleted incarnation) is refused.
+    const k = `${harness}:${machine}`;
+    const stored = this.index.get(k);
+    if (!opts.delayed && (!stored || incoming.revision > stored.revision)) this.index.set(k, incoming);
+    const next = armIdentity(prevRow?.armed.get(machine)?.id ?? null, this.consumedIds.get(k) ?? null, incoming, this.index.get(k) ?? null);
     if (!opts.loseArm && next) { // only genuinely changed committed evidence arms (a duplicate producer commit does not)
       const armed = new Map(prevRow?.armed ?? []);
       armed.set(machine, { ref: h.trigger_id, id: next });
@@ -478,6 +487,21 @@ describe("session-brief trigger: offline fixtures", () => {
     expect(sim.runs[0]!.claimedAt).toBe(sim.now);
   });
 
+  test("delayed old work after a delete/recreate, reused revision and identical bytes: the fence refuses it; nothing arms", () => {
+    const sim = new Sim();
+    sim.briefs.set("claude", { revision: 0, ready: true, lastAttempt: T0 - 600_000 });
+    sim.commit("claude", 5, { lose: true }); // old incarnation at revision 5
+    sim.now = sim.rows.get("claude")!.state.dueAt;
+    sim.claim("claude");
+    sim.deleteRow("claude"); // the rekey DELETE
+    sim.now += 60_000;
+    sim.commit("claude", 1, { lose: true, manifestKey: "recreated" }); // the recreate restarts at revision 1
+    const armed = { ...sim.rows.get("claude")!.state };
+    sim.commit("claude", 5, { lose: true, delayed: true }); // delayed old work, higher revision, identical bytes
+    sim.commit("claude", 1, { lose: true, delayed: true, manifestKey: `${M1}/r1` }); // reused revision 1, identical bytes, old key
+    expect(sim.rows.get("claude")!.state).toEqual(armed);
+  });
+
   test("A/B/late-A after B completes, and A paused across B's commit: no generation bump, deadline move or coverage change", () => {
     const sim = new Sim();
     sim.briefs.set("claude", { revision: 0, ready: true, lastAttempt: T0 - 600_000 });
@@ -491,7 +515,7 @@ describe("session-brief trigger: offline fixtures", () => {
     expect(sim.rows.size).toBe(0);
     const consumedBefore = sim.consumedIds.get(`claude:${M1}`);
     sim.now += 10_000;
-    sim.commit("claude", 1, { lose: true }); // late A (a delayed indexer or redelivered commit)
+    sim.commit("claude", 1, { lose: true, delayed: true }); // late A (a delayed indexer or redelivered commit)
     expect(sim.rows.size).toBe(0); // no wakeup, no generation, no deadline
     expect(sim.consumedIds.get(`claude:${M1}`)).toEqual(consumedBefore); // coverage unchanged
     sim.consume(A);
@@ -499,7 +523,7 @@ describe("session-brief trigger: offline fixtures", () => {
     // Paused A: A's writer prepared revision 3, B' commits 4 first, then A resumes at 3.
     sim.commit("claude", 4, { lose: true });
     const armed = { ...sim.rows.get("claude")!.state };
-    sim.commit("claude", 3, { lose: true }); // the paused writer resumes below the floor
+    sim.commit("claude", 3, { lose: true, delayed: true }); // the paused writer resumes below the floor
     expect(sim.rows.get("claude")!.state).toEqual(armed);
   });
 
@@ -733,27 +757,34 @@ describe("session-brief trigger: durable commit identity (design r2)", () => {
 
   test("ordered by the shared revision token: replays, the other path, older commits and fenced objects are no-ops", () => {
     const a = id(5);
-    expect(armIdentity(null, null, a)).toEqual(a); // first commit: arms
-    expect(armIdentity(a, null, id(5))).toBeNull(); // exact replay, or the other hook path seeing the same commit
-    expect(armIdentity(a, null, id(5, { key: "other", sha: "b".repeat(64) }))).toBeNull(); // fenced: one object per revision
-    expect(armIdentity(a, null, id(6))).toEqual(id(6)); // B: new evidence
-    expect(armIdentity(id(6), null, a)).toBeNull(); // A after B (armed): older
-    expect(armIdentity(null, id(6), a)).toBeNull(); // A after B COMPLETED (consumed): older, cannot revive obsolete work
-    expect(armIdentity(null, a, id(5))).toBeNull(); // dual-path replay after completion
-    expect(armIdentity(null, null, id(1, { key: "recreated" }))).toEqual(id(1, { key: "recreated" })); // revision-1 recreate (record erased)
+    const cur = (x: ReturnType<typeof id>) => x; // the authoritative current row equals the incoming commit
+    expect(armIdentity(null, null, a, cur(a))).toEqual(a); // first commit: arms
+    expect(armIdentity(a, null, id(5), cur(id(5)))).toBeNull(); // exact replay, or the other hook path seeing the same commit
+    const other = id(5, { key: "other", sha: "b".repeat(64) });
+    expect(armIdentity(a, null, other, a)).toBeNull(); // fenced: the current row is still a
+    expect(armIdentity(a, null, id(6), id(6))).toEqual(id(6)); // B: new evidence
+    expect(armIdentity(id(6), null, a, id(6))).toBeNull(); // A after B (armed): not current
+    expect(armIdentity(null, id(6), a, id(6))).toBeNull(); // A after B COMPLETED: cannot revive obsolete work
+    expect(armIdentity(null, a, id(5), a)).toBeNull(); // dual-path replay after completion
+    const recreated = id(1, { key: "recreated" });
+    expect(armIdentity(null, null, recreated, recreated)).toEqual(recreated); // revision-1 recreate (record erased)
+    // Delayed old work after the recreate, a higher (reused) revision and IDENTICAL bytes: not the current row.
+    expect(armIdentity(null, null, id(5), recreated)).toBeNull();
+    expect(armIdentity(null, null, id(1, { key: "k1" }), recreated)).toBeNull(); // same revision, identical bytes, old key
+    expect(armIdentity(null, null, a, null)).toBeNull(); // no current row (deleted): nothing to arm
   });
 
   test("ends: an end is a new revision (manifests are immutable); a duplicate end and a pre-end replay are no-ops", () => {
     const append = id(5), end = id(6, { ended: true });
-    expect(armIdentity(append, null, end)).toEqual(end); // the end commit arms
-    expect(armIdentity(end, null, end)).toBeNull(); // a duplicate explicit end
-    expect(armIdentity(end, null, append)).toBeNull(); // the pre-end append replayed after the end
-    expect(armIdentity(null, end, append)).toBeNull();
-    expect(armIdentity(null, end, end)).toBeNull();
-    // A same-object end flag (an end recorded on the armed object itself) is monotone: a non-end replay cannot clear it.
+    expect(armIdentity(append, null, end, end)).toEqual(end); // the end commit arms
+    expect(armIdentity(end, null, end, end)).toBeNull(); // a duplicate explicit end
+    expect(armIdentity(end, null, append, end)).toBeNull(); // the pre-end append replayed after the end
+    expect(armIdentity(null, end, append, end)).toBeNull();
+    expect(armIdentity(null, end, end, end)).toBeNull();
+    // A same-object end flag (UNWIRED standalone end: no producer yet) is monotone: a non-end replay cannot clear it.
     const endedSame = id(5, { ended: true });
-    expect(armIdentity(append, null, endedSame)).toEqual(endedSame);
-    expect(armIdentity(endedSame, null, append)).toBeNull();
+    expect(armIdentity(append, null, endedSame, endedSame)).toEqual(endedSame);
+    expect(armIdentity(endedSame, null, append, endedSame)).toBeNull();
   });
 
   test("standalone end eligibility: a confirmed first end is due now; with a brief, coalescing is skipped and the throttle applies", () => {
