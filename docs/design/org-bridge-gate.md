@@ -493,3 +493,29 @@ triggers (fan-out or queue), which is not yet traced.
 
 **Owed, needing reader stand-ins (C1/C3):**
 - the readable-byte boundary for the late-install race and the T97 parked direct writer.
+
+### Drain-side synthetic proof and its two findings (sessions-buffered-drain-materialization, 585770d2)
+
+`cutover-visibility.synthetic.test.ts` on review/buffered-drain-materialization (8 pass, test-only) runs the stand-in
+at the drain's marker PUT, with a test reader that checks the verdict before and after IO. Each read happens right
+after resumption and before any repair. The cases:
+- erase first, with a mixed stage (s1 served, s2 never served);
+- publish first, revoked at once;
+- a read in flight across the erase commit fails post-IO;
+- a user-scope erase;
+- a crash before the publish;
+- a lost publish ACK;
+- a late drain after the token bump;
+- a pre-export erase.
+
+- **F1, agreed: a terminal per-session outcome.** A stage with one refused effect never ends today, because
+  marker_failed is not terminal. Fix: the stage's create-only marker carries per-session results, for example
+  `{s1: visible, s2: refused_erased}`. A stage whose every effect is decided (visible or refused) is terminal, the
+  checkpoint passes it, and the refused sessions' orphan bytes are re-armed. The marker remains a projection: the SQL
+  rows stay authoritative, and the marker is written only after every effect's publish has returned a terminal
+  answer.
+- **F2, agreed: derive the effect from the chunk, not from the bounded manifest index.** The `relayhistory_live`
+  batch index keeps only the last 64 batches (writer.ts REMEMBERED_BATCHES), so an older chunk has no mapping. That
+  fails closed but loses availability on long sessions. Fix: the effect row records the chunk key (its embedded
+  source sha256) at publish, and the reader's batched verdict is keyed by the chunk keys it is about to GET. That
+  needs no manifest index and survives lost ACKs, because the chunk key is deterministic.
