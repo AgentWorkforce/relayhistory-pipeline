@@ -73,6 +73,10 @@ import { sqlRelayfacts } from "./relayfacts.ts";
  * fails startup on this entry, see searchSkipsPartialSessions).
  * READ_API_SESSION_PARTIAL_RETRYABLE (self-host service only; unset/""/"false" here, "true"
  * fails startup on this entry, see sessionPartialRetryable).
+ * READ_API_PARTIAL_CANONICAL_EVENTS (this entry only, default off; exactly "true" with
+ * READ_API_PARTIAL_CANONICAL_BUCKET, PIPELINE_ORG_FROM_PREFIX=true and PIPELINE_KEY_PREFIX): a
+ * partial session's exact-session events read from its canonical objects instead of the 501
+ * `session_partial`, for READ_API_PARTIAL_CANONICAL_WORKSPACES (partial-canonical.ts).
  *
  * Owner-only buffered reads (RELAYHISTORY_READ_OWNER_BUFFERED, owner-buffered.ts) are
  * Worker-only: they need the HISTORY_CONTROL_HEAD service binding. This entry never wires
@@ -125,6 +129,7 @@ import { postgresCoordinationBackend } from "./postgres/coordination-query.ts";
 import { pendingV2Cache, poolTenantWriter, sqlCoordinationAdvisories } from "./coordination-advisories.ts";
 import { ANALYTICS_OFF, ANALYTICS_SINK_VAR, analyticsConfig, analyticsCounterFields, createAnalyticsSink } from "../shared/analytics-config.ts";
 import { serviceCanonicalDeps } from "./service-canonical.ts";
+import { partialCanonicalConfig, partialCanonicalDeps } from "./partial-canonical.ts";
 import { digestEnabled, digestNarrativeModel, selfhostNarrativeFromEnv } from "./digest-narrative-selfhost.ts";
 import {
   ACCESS_TTL_SECONDS_DEFAULT,
@@ -609,6 +614,7 @@ async function buildApp(env: NodeJS.ProcessEnv = process.env, composition?: Sear
   summarySearchBackend(env, "lambda");
   searchSkipsPartialSessions(env, "lambda");
   sessionPartialRetryable(env, "lambda");
+  partialCanonicalConfig(env, "lambda"); // refuse a bad partial-canonical selection before secret lookup
   postgresTlsOptions(env);
   searchBackend(env, composition); // reject unsupported selections before secret lookup
   const { SecretString } = await awsJsonCall<{ SecretString?: string }>({
@@ -663,6 +669,8 @@ export async function readApiDepsFromSecret(secretText: string, env: NodeJS.Proc
   const sessionQuery = sessionQueryEnabled(env);
   const searchSkipPartial = searchSkipsPartialSessions(env, entry);
   const partialRetryable = sessionPartialRetryable(env, entry);
+  // Env only, before the pool opens: off (the default) reads nothing else; the service refuses it.
+  partialCanonicalConfig(env, entry);
   const loginSync = parseSelfhostLoginSync(env);
   const facts = factsBackends(env, entry);
   const coordinationEnabled = coordinationOverlapsEnabled(env[READ_API_COORDINATION_OVERLAPS_ENABLED]);
@@ -746,6 +754,8 @@ export async function readApiDepsFromSecret(secretText: string, env: NodeJS.Proc
   // their 501 `*_not_configured` there).
   const canonical = entry === "service" ? await serviceCanonicalDeps(env, poolTenantRunner(pool as never)) : undefined;
   const liveness = sqlLiveness(poolTenantRunner(pool as never));
+  // The hosted Lambda only, default off (partial-canonical.ts): pointers and sources on this read-role pool.
+  const canonicalEventsPartial = entry === "lambda" ? partialCanonicalDeps(env, entry, poolTenantRunner(pool as never)) : undefined;
   const operatorErased = entry === "service" && eraseRuntimeFlag(env, ERASE_FENCE_FLAG)
     ? sqlOperatorErased(poolTenantRunner(pool as never)) : undefined;
   // The self-host service only, READ_API_DIGEST_ENABLED=1 (digest-narrative-selfhost.ts): the
@@ -798,6 +808,7 @@ export async function readApiDepsFromSecret(secretText: string, env: NodeJS.Proc
     ...(sessionQuery ? { sessionQuery: true } : {}),
     ...(searchSkipPartial ? { searchSkipsPartialSessions: true } : {}),
     ...(partialRetryable ? { sessionPartialRetryable: true } : {}),
+    ...(canonicalEventsPartial ? { canonicalEventsPartial } : {}),
     ...outputDeps,
     ...digestDeps,
     ...coordinationDeps,

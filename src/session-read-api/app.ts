@@ -95,6 +95,7 @@ import { CursorError, decodeBackendCursor, decodeCursor } from "./cursor.ts";
 import { TenantMismatchError, partialSessions, partialSessionsInWorkspace, readBufferedEventPage, readEventPage, type Liveness } from "./page.ts";
 import type { EventQuery } from "./queries.ts";
 import { CanonicalReadError, canonicalReasonCodeFields, type CanonicalIdentity } from "./canonical.ts";
+import { classifyPartialCanonical, PARTIAL_CANONICAL_MIN_READ_MS, type PartialCanonicalDeps } from "./partial-canonical-policy.ts";
 import { CANONICAL_CURSOR_PREFIX, canonicalEventPage, type CanonicalEventsDeps } from "./canonical-events.ts";
 import { AnalysisReadError, admitResponse, assembleAnalyses, type AdmitRpc, type ReadRpc } from "../session-analysis/read.ts";
 import type { StoredAnalysisResult } from "../session-analysis/processor.ts";
@@ -372,6 +373,18 @@ export interface ReadApiDeps {
    * Absent: the route answers exactly as before (docs/session-read-api-design.md).
    */
   canonicalEventsHosted?: { workspaces: ReadonlySet<string> | "*"; sources: SessionSources };
+  /**
+   * READ_API_PARTIAL_CANONICAL_EVENTS=true (the hosted Lambda only, partial-canonical.ts): for a
+   * workspace on `workspaces`, the FIRST page of GET /v1/sessions/:sessionId/events whose session is
+   * partial (`needs_full = 1`) is served from the session's verified canonical objects instead of the
+   * 501 `session_partial`, and the canonical cursor pages it issues continue there. The history floor,
+   * a tombstone's empty page, the response body and the filters are the route's own. Every refusal on a
+   * first page is that same 501 (class and codes logged as `reason_codes`); on a cursor page a transient
+   * refusal is a 503 and a missing object or moved generation a 409 `cursor_backend_transition`.
+   * Ignored with `selfhost`, with `canonicalEventsHosted` (their own canonical paths) and with
+   * `includeMessageId=true`. Absent: the route answers exactly as before.
+   */
+  canonicalEventsPartial?: PartialCanonicalDeps;
   /** Babysitter evidence reader (babysitter-evidence.ts); absent = 501 `delivery_records_not_configured`. */
   babysitter?: EvidenceDeps;
   /**
@@ -894,14 +907,19 @@ export function createReadApi(deps: ReadApiDeps) {
     identity: VerifiedIdentity, sessionId: string, source: string | undefined, continuing: boolean,
     /** The same sessionStart answer when the owner-buffered events branch already asked it (one call per request). */
     known?: Awaited<ReturnType<Liveness["sessionStart"]>>,
-  ): Promise<"empty" | "ok"> {
+    /** "report" (ReadApiDeps.canonicalEventsPartial only): a partial session is "partial" instead of the 501. */
+    partialMode: "refuse" | "report" = "refuse",
+  ): Promise<"empty" | "ok" | "partial"> {
     const start = known ?? (await deps.liveness.sessionStart(identity.orgId, identity.workspaceId, sessionId, source));
     if (start.pointers > 0 && start.live === 0) return "empty";
     if (deps.completeSinceMs > 0) {
       if (start.createdAtMs === null) throw unsupported("history_floor_unknown_session");
       if (start.createdAtMs < deps.completeSinceMs) throw unsupported("history_floor");
     }
-    if (!continuing && (await partialSessions(pageDeps(), identity.orgId, sessionId, identity.workspaceId)).length > 0) throw unsupported("session_partial");
+    if (!continuing && (await partialSessions(pageDeps(), identity.orgId, sessionId, identity.workspaceId)).length > 0) {
+      if (partialMode === "report") return "partial";
+      throw unsupported("session_partial");
+    }
     return "ok";
   }
 
@@ -1085,6 +1103,81 @@ export function createReadApi(deps: ReadApiDeps) {
     return { source, forms: [...ids.get(source)!] };
   }
 
+  /** The partial-session fallback's deps for this request, or undefined (the route as without it). */
+  function partialCanonicalFor(identity: VerifiedIdentity, includeMessageId: boolean): PartialCanonicalDeps | undefined {
+    const pc = deps.canonicalEventsPartial;
+    if (!pc || deps.selfhost || deps.canonicalEventsHosted || includeMessageId) return undefined;
+    return pc.workspaces === "*" || pc.workspaces.has(identity.workspaceId) ? pc : undefined;
+  }
+
+  /**
+   * One page of a partial session from its canonical objects (ReadApiDeps.canonicalEventsPartial).
+   * Reached only after sessionGate: not tombstoned, inside the history floor, and either partial
+   * (first page) or continuing a canonical cursor. Order: source resolution (without `source`: the
+   * one live source, fenced sources dropped, as hostedSource does), that source's tombstone, the
+   * request budget, the generation-fenced object read (canonicalEventPage: tenant/bucket/prefix/hash/
+   * revision checks, pointers re-read after the IO, erasure rechecked after the IO), then the
+   * operator fence again. Every refusal is classified (classifyPartialCanonical) and answered by
+   * refusePartial; nothing partial is ever served.
+   */
+  async function partialCanonicalPage(
+    c: Context, identity: VerifiedIdentity, pc: PartialCanonicalDeps,
+    q: { sessionId: string; source: string | undefined; order: "asc" | "desc"; limit: number; maxContent: number | undefined },
+    start: Awaited<ReturnType<Liveness["sessionStart"]>>, rawObjectCursor: string | undefined,
+  ): Promise<Response> {
+    const continuing = rawObjectCursor !== undefined;
+    const empty = () => c.json({ sessionId: q.sessionId, events: [], nextCursor: null, correlationId: c.get("correlationId") });
+    let served = q.source;
+    let forms: string[] | undefined;
+    if (served === undefined) {
+      let resolved: Awaited<ReturnType<typeof hostedSource>>;
+      try { resolved = await hostedSource(identity, q.sessionId, pc.sources); }
+      catch (error) {
+        if (error instanceof HttpError && error.reason === "events_canonical_source_ambiguous") throw refusePartial(c, continuing, "invalid", ["source_ambiguous"]);
+        throw error;
+      }
+      if (resolved === undefined) throw refusePartial(c, continuing, "missing", ["source_unresolved"]);
+      served = resolved.source;
+      forms = resolved.forms;
+      start = await deps.liveness.sessionStart(identity.orgId, identity.workspaceId, q.sessionId, served);
+      if (start.pointers > 0 && start.live === 0) return empty();
+    }
+    // No live pointer for this source: nothing canonical to read (never a guess at another source).
+    if (start.live === 0) throw refusePartial(c, continuing, "missing", ["pointer_missing"]);
+    const left = pc.deadlineMs - (Date.now() - (c.get("requestStarted") as number));
+    if (left < PARTIAL_CANONICAL_MIN_READ_MS) throw refusePartial(c, continuing, "transient", ["deadline"]);
+    let page;
+    try {
+      page = await canonicalEventPage({ ...pc.events, deadlineMs: left }, deps.liveness,
+        { orgId: identity.orgId, workspaceId: identity.workspaceId, sessionId: q.sessionId, source: served, order: q.order, limit: q.limit, maxContent: q.maxContent }, rawObjectCursor);
+    } catch (error) {
+      if (error instanceof CanonicalReadError && error.status === 400) throw bad("canonical cursor is not valid");
+      if (error instanceof HttpError || error instanceof TenantMismatchError) throw error;
+      const { class: cls, codes } = classifyPartialCanonical(error);
+      // A generation that moved under a cursor is a restart, whatever moved it.
+      if (continuing && error instanceof CanonicalReadError && error.reason === "source_generation_changed") throw refusePartial(c, true, "missing", codes);
+      throw refusePartial(c, continuing, cls, codes);
+    }
+    // A fence that committed during the object read wins before any content leaves.
+    if (forms && await hostedFenced(identity, served, forms)) throw new HttpError(404, "not_found", "Session not found");
+    log({ route: c.req.routePath, reason: "partial_canonical_served", count: page.events.length, kind: continuing ? "cursor_page" : "first_page", correlation_id: c.get("correlationId") });
+    return c.json({ sessionId: q.sessionId, events: page.events, nextCursor: page.nextCursor, correlationId: c.get("correlationId") });
+  }
+
+  /**
+   * A partial-canonical refusal. First page: the exact 501 session_partial of the route without the
+   * fallback (Cloud reads relayhistory, unchanged); the class leads the log-only reason codes. Cursor
+   * page: transient = 503 (retry the same cursor), missing = 409 cursor_backend_transition (restart),
+   * forbidden / oversize / invalid = the 501.
+   */
+  function refusePartial(c: Context, continuing: boolean, cls: string, codes: readonly string[]): HttpError {
+    const details = [`canonical_${cls}`, ...codes];
+    log({ route: c.req.routePath, reason: "partial_canonical_refused", kind: continuing ? "cursor_page" : "first_page", ...canonicalReasonCodeFields(details), correlation_id: c.get("correlationId") });
+    if (continuing && cls === "transient") return new HttpError(503, "backend_unavailable", "read backend unavailable", "events_canonical_transient", details);
+    if (continuing && cls === "missing") return cursorTransition();
+    return unsupported("session_partial", details);
+  }
+
   app.get("/v1/sessions/:sessionId/events", async (c) => {
     let stopAbortLog: (() => void) | undefined;
     let partialRetryable = false;
@@ -1212,9 +1305,16 @@ export function createReadApi(deps: ReadApiDeps) {
         }
         if (objectCursor) throw cursorTransition();
       }
-      if (objectCursor) throw unsupported("canonical_cursor_scope");
-      if ((await sessionGate(identity, sessionId, source, cursor !== undefined, start)) === "empty")
+      // The hosted Lambda's partial-session fallback (READ_API_PARTIAL_CANONICAL_EVENTS): only where
+      // the route would answer 501 session_partial, or on the canonical cursor pages it issued.
+      const partial = partialCanonicalFor(identity, includeMessageId);
+      if (objectCursor && !partial) throw unsupported("canonical_cursor_scope");
+      if (partial) start ??= await deps.liveness.sessionStart(identity.orgId, identity.workspaceId, sessionId, source);
+      const gate = await sessionGate(identity, sessionId, source, cursor !== undefined || objectCursor, start, partial ? "report" : "refuse");
+      if (gate === "empty")
         return c.json({ sessionId, events: [], nextCursor: null, correlationId: c.get("correlationId") });
+      if (partial && (gate === "partial" || objectCursor))
+        return await partialCanonicalPage(c, identity, partial, { sessionId, source, order, limit, maxContent }, start!, objectCursor ? rawCursor : undefined);
       const page = await gatedPage(
         c,
         { orgId: identity.orgId, workspaceId: identity.workspaceId, sessionId, source, order, limit, maxContent, cursor },
