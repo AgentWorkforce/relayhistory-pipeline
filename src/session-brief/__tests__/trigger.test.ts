@@ -41,18 +41,24 @@ class Sim {
   failSends = 0;
   failRuns = 0;
   inFlight = new Map<string, { generation: number }>();
+  sweptAt: number[] = [];
   private lastSweep = T0;
-  private lastPoll = T0;
-  /** sweepSeconds: the hosted recovery tick (0 = off); poll: the self-host native worker's minute poll. */
-  constructor(public opts: { sweepSeconds?: number; poll?: boolean } = {}) {}
+  private lastTick = T0;
+  /**
+   * tickSeconds: the worker tick that claims rows already due (hosted: the one-minute EventBridge {brief:true} tick;
+   * self-host: the native worker's poll); 0/undefined = no tick (hints only).
+   * sweepSeconds: SESSION_BRIEF_SWEEP_SECONDS, how often the tick also sweeps: it re-arms committed revisions that no
+   * brief covers and that have no wakeup (a lost arm) and, hosted, enqueues a sweep hint for them; 0 = off.
+   */
+  constructor(public opts: { sweepSeconds?: number; tickSeconds?: number } = {}) {}
 
   brief(h: string): Brief { return this.briefs.get(h) ?? { revision: -1, ready: false }; }
 
   /** The producer, right after the authoritative CAS: arm the durable row, then send the hint (which may be lost). */
-  commit(harness: string, revision: number, opts: { kind?: "append" | "end"; lose?: boolean } = {}) {
+  commit(harness: string, revision: number, opts: { kind?: "append" | "end"; lose?: boolean; loseArm?: boolean } = {}) {
     this.committed.set(harness, Math.max(this.committed.get(harness) ?? -1, revision));
     const prev = this.rows.get(harness)?.state ?? null;
-    this.rows.set(harness, { state: planArm(prev, this.now, this.brief(harness).ready, TIMING) });
+    if (!opts.loseArm) this.rows.set(harness, { state: planArm(prev, this.now, this.brief(harness).ready, TIMING) });
     const h = hint(opts.kind ?? "append", revision, prev?.pendingSince ?? this.now, harness);
     if (!opts.lose) this.send(h);
     return h;
@@ -119,13 +125,19 @@ class Sim {
         if (this.consume(m.hint)) this.queue.splice(this.queue.indexOf(m), 1);
         else m.visibleAt = this.now + VISIBILITY_MS;
       }
-      const sweep = this.opts.sweepSeconds ?? 0;
-      if (sweep > 0 && this.now - this.lastSweep >= sweep * 1_000) {
-        this.lastSweep = this.now;
-        for (const harness of this.rows.keys()) this.send(hint("sweep", this.committed.get(harness) ?? 0, T0, harness));
-      }
-      if (this.opts.poll && this.now - this.lastPoll >= 60_000) {
-        this.lastPoll = this.now;
+      const tick = this.opts.tickSeconds ?? 0;
+      if (tick > 0 && this.now - this.lastTick >= tick * 1_000) {
+        this.lastTick = this.now;
+        const sweep = this.opts.sweepSeconds ?? 0;
+        if (sweep > 0 && this.now - this.lastSweep >= sweep * 1_000) {
+          this.lastSweep = this.now;
+          for (const [harness, rev] of this.committed) // a lost arm: committed, uncovered, no wakeup
+            if (!this.rows.has(harness) && rev > this.brief(harness).revision) {
+              this.rows.set(harness, { state: planArm(null, this.now, this.brief(harness).ready, TIMING) });
+              this.sweptAt.push(this.now);
+            }
+        }
+        // Due-time gating: the tick claims only rows that are claimable now.
         for (const [harness, row] of [...this.rows]) if (!row.state.leased && this.claimable(harness, row.state) <= this.now) this.claim(harness);
       }
     }
@@ -277,6 +289,12 @@ describe("session-brief trigger: offline fixtures", () => {
     sim.advance(20 * 60_000);
     expect(sim.runs).toHaveLength(1); // hint B was lost and the tick is off: the trailing row waits for recovery
     expect(sim.rows.size).toBe(1);
+    // With the one-minute tick the trailing work is claimed; its delay is SCORED from B's commit (a lower bound for
+    // B's first upload attempt), never reported as a pass: the restarted window makes it a miss.
+    sim.opts.tickSeconds = 60;
+    sim.advance(5 * 60_000);
+    expect(sim.runs).toHaveLength(2);
+    expect(briefMiss(bCommittedAt, sim.runs[1]!.claimedAt)).toBe(true);
   });
 
   test.todo("KNOWN GAP: B committed during A's lease keeps B's original uncovered time through finish and retry (needs trailing_since: a migration in a separate Pipeline registry slot)", () => {});
@@ -318,7 +336,7 @@ describe("session-brief trigger: offline fixtures", () => {
   });
 
   test("a retry after a failed run: the row stays, a replayed hint neither delays nor duplicates it", () => {
-    const sim = new Sim({ poll: true });
+    const sim = new Sim({ tickSeconds: 60 });
     const A = sim.commit("claude", 1, { lose: true });
     sim.failRuns = 1;
     sim.advance(70_000); // the minute poll claims the first brief; the run fails and reschedules 60 s out
@@ -333,27 +351,45 @@ describe("session-brief trigger: offline fixtures", () => {
     expect(sim.rows.size).toBe(0);
   });
 
-  test("lost-trigger recovery: hosted sweep hints every 300 s (a late refresh is scored a miss); self-host minute poll", () => {
-    const hosted = new Sim({ sweepSeconds: 300 });
-    hosted.briefs.set("claude", { revision: 0, ready: true, lastAttempt: T0 - 600_000 });
-    hosted.commit("claude", 1, { lose: true }); // armed, the hint lost: due 600 s later
-    hosted.advance(20 * 60_000);
-    expect(hosted.runs).toHaveLength(1);
-    const r = hosted.runs[0]!;
-    expect(r.claimedAt - r.claimableAt).toBeLessThanOrEqual(300_000);
-    // Scored from the upload (committed at T0 here, a lower bound for its first HTTP attempt): a lost hint
-    // recovered by the 300 s sweep after a 600 s refresh window is a miss, recorded, not hidden.
-    expect(briefMiss(T0, r.claimedAt)).toBe(true);
-    const selfHost = new Sim({ poll: true });
-    selfHost.briefs.set("claude", { revision: 0, ready: true, lastAttempt: T0 - 600_000 });
-    selfHost.commit("claude", 1, { lose: true });
-    selfHost.advance(20 * 60_000);
-    expect(selfHost.runs).toHaveLength(1);
-    expect(selfHost.runs[0]!.claimedAt - selfHost.runs[0]!.claimableAt).toBeLessThanOrEqual(60_000);
-    const off = new Sim(); // hosted sweep unset or 0: a lost hint is not recovered on the queue path
-    off.commit("claude", 1, { lose: true });
-    off.advance(20 * 60_000);
-    expect(off.runs).toHaveLength(0);
+  test("sweep fixture 1, hosted: explicit 300 s with one-minute ticks and due-time gating", () => {
+    const sim = new Sim({ tickSeconds: 60, sweepSeconds: briefTriggerConfig({ SESSION_BRIEF_SWEEP_SECONDS: "300" }).sweepSeconds });
+    sim.briefs.set("claude", { revision: 0, ready: true, lastAttempt: T0 - 600_000 });
+    sim.commit("claude", 1, { lose: true }); // armed, the hint lost: the one-minute tick claims it once due (gated)
+    sim.advance(9 * 60_000);
+    expect(sim.runs).toHaveLength(0); // not due yet: the tick never claims early
+    sim.advance(3 * 60_000);
+    expect(sim.runs).toHaveLength(1);
+    expect(sim.runs[0]!.claimedAt - sim.runs[0]!.claimableAt).toBeLessThanOrEqual(60_000); // diagnostic: due to claim
+    expect(briefMiss(T0, sim.runs[0]!.claimedAt)).toBe(true); // scored from the upload: a 600 s refresh window misses
+    // A lost ARM (no wakeup row at all) is recovered only by the sweep, at its 300 s cadence.
+    sim.now += 1;
+    sim.commit("claude", 2, { lose: true, loseArm: true });
+    const lostAt = sim.now;
+    sim.advance(20 * 60_000);
+    expect(sim.sweptAt.length).toBeGreaterThanOrEqual(1);
+    expect(sim.sweptAt[0]! - lostAt).toBeLessThanOrEqual(300_000 + 60_000);
+    expect(sim.runs).toHaveLength(2);
+  });
+
+  test("sweep fixture 2, native Helm default 60 s: the poll sweeps every minute", () => {
+    const sim = new Sim({ tickSeconds: 60, sweepSeconds: briefTriggerConfig({ SESSION_BRIEF_SWEEP_SECONDS: "60" }).sweepSeconds });
+    sim.commit("claude", 1, { lose: true, loseArm: true }); // a first brief whose arm was lost
+    sim.advance(3 * 60_000);
+    expect(sim.sweptAt).toHaveLength(1);
+    expect(sim.sweptAt[0]! - T0).toBeLessThanOrEqual(60_000);
+    expect(sim.runs).toHaveLength(1);
+    expect(sim.runs[0]!.claimedAt - sim.sweptAt[0]!).toBeLessThanOrEqual(60_000 + 8_000);
+  });
+
+  for (const env of [{}, { SESSION_BRIEF_SWEEP_SECONDS: "0" }] as const) test(`sweep fixture 3, direct worker ${"SESSION_BRIEF_SWEEP_SECONDS" in env ? "explicit 0" : "unset"}: no sweep; armed rows still claimed by the poll`, () => {
+    const sweepSeconds = briefTriggerConfig({ SESSION_BRIEF_ENABLED: "true", ...env }).sweepSeconds;
+    expect(sweepSeconds).toBe(0);
+    const sim = new Sim({ tickSeconds: 60, sweepSeconds });
+    sim.commit("claude", 1, { lose: true }); // armed, hint lost: the poll still claims it
+    sim.commit("codex", 1, { lose: true, loseArm: true }); // arm lost: never recovered without the sweep
+    sim.advance(20 * 60_000);
+    expect(sim.runs.map((r) => r.harness)).toEqual(["claude"]);
+    expect(sim.sweptAt).toHaveLength(0);
   });
 
   test("the same session id in two harnesses: v2 wakes only its own; v1 wakes both; coverage is per harness", () => {
