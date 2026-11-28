@@ -85,7 +85,8 @@ BEGIN
   RETURN;
  END IF;
  -- The caller holds a different brief than the one served now: no definitive answer for it.
- IF p_binding IS NOT NULL AND p_binding <> v_served.brief_binding THEN
+ -- IS DISTINCT FROM: a served legacy brief without a fingerprint has a NULL binding, which no token matches.
+ IF p_binding IS NOT NULL AND p_binding IS DISTINCT FROM v_served.brief_binding THEN
   RETURN QUERY SELECT v_served.org_id, p_workspace_id, p_harness, p_session_id, 'changed'::text,
    v_served.brief_revision, v_served.source_revisions, v_served.brief_binding;
   RETURN;

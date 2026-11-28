@@ -230,3 +230,17 @@ test("caller correlation: a caller holding brief A asks after B published at the
   // An invalid binding is refused like an invalid key.
   await expect(sqlBriefSummary(s.runner).membership!(KEY.orgId, KEY.workspaceId, KEY.harness, KEY.sessionId, "b1", "nothex")).rejects.toMatchObject({ reason: "invalid_argument" });
 });
+
+test("a served brief always has a binding: the text-provenance constraint forbids a fingerprint-less brief with text (IS DISTINCT FROM is defence in depth)", async () => {
+  const s = await setup(false);
+  await s.upload([U1, A1], 1);
+  expect(await s.tick()).toEqual({ generated: 1 });
+  // v2 serves only rows with a description; session_briefs_text_provenance ties brief_fingerprint to the
+  // text being present, through the whole chain to 062510. So a served NULL binding cannot occur.
+  await expect(s.pg.exec("UPDATE sessions.session_briefs SET brief_fingerprint = NULL")).rejects.toMatchObject({ code: "23514" });
+  const rows = (await sqlBriefSummary(s.runner).read(KEY.orgId, KEY.workspaceId, KEY.harness, KEY.sessionId))!;
+  expect(rows[0]!.brief_binding).toMatch(/^[0-9a-f]{64}$/);
+  // A stale token against the served brief is changed; unbound answers for the served brief.
+  expect(await s.ask("u1", undefined, "e".repeat(64))).toMatchObject({ status: "changed", binding: rows[0]!.brief_binding });
+  expect(await s.ask("u1")).toMatchObject({ status: "unknown", binding: rows[0]!.brief_binding });
+});
