@@ -1,6 +1,6 @@
 # T139: authority-issued incarnation binding (amendment proposal to decision 0002)
 
-Status: PROPOSAL, revision 2 (answers Pipeline's design HOLD at 8aba8f82; see "Revision 2" below, which supersedes sections 1 and 3 where they differ). For review by layered-sessions-pipeline. Code only, offline. No migration is applied and no slot
+Status: PROPOSAL, revision 3 (revision 2 answers Pipeline's design HOLD at 8aba8f82; revision 3 answers Skip's HEAD-to-commit and key-mapping questions. Later revisions supersede earlier sections where they differ). For review by layered-sessions-pipeline. Code only, offline. No migration is applied and no slot
 is reserved (`20261105062360` belongs to erasure). Decision 0002 stays enforced in the existing code until this
 amendment is accepted.
 
@@ -178,6 +178,59 @@ Open for review in revision 2:
   receipt records the deleting user and origin.
 - Reset (`ingest_apply_reset`) deletes many sessions in one statement. Sorted lock acquisition keeps it
   deadlock-free; the cost is one advisory lock per session.
+
+## Revision 3: the HEAD-to-commit window, the full writer list, and the key mapping (Skip, after f959bd92)
+
+### Q1. What prevents a permanent erase between HEAD and SQL commit?
+
+In f959bd92 the operator erase did not take `k`. The `ingest_erase_fence_index_guard` trigger checks fences when
+the pointer row is written, so a fence committed after that statement and before the publication commits was not
+excluded. Fix: **operator erase takes `pg_advisory_xact_lock(k)` EXCLUSIVE** before inserting
+`session_erasure_fences`. Publication holds `k` SHARED from before its currency check until commit, so:
+- either the fence commits first, and the publication's check 3 (no erasure fence, read under `k`) refuses;
+- or the publication commits first, and the erase then tombstones the row as today.
+Fixture 10 gains this interleaving (erase blocked on `k` while a publication is between HEAD and commit).
+
+### Q2. What prevents a same-incarnation object replacement between HEAD and commit?
+
+No database lock can: the replacement is an S3 PUT by the ingest writer (a CAS with ifMatch / ifNoneMatch), not a
+SQL statement. The design does not try to exclude it. It makes the window harmless:
+- **Same incarnation means the same upload.** Publishing the just-superseded object of the SAME incarnation does not
+  violate decision 0002: it is not deleted content. The newer object has its own event (writer or forwarder, plus
+  the reconcile backstop). Its pointer work is serialized after this publication by the pointer scope lock, and it
+  republishes the newer revision.
+- **Identity is the S3 versionId on hosted** (the bucket is versioned). Check 4 compares versionIds, so equal ETags
+  on distinct uploads cannot be confused there. The ETag is only the fallback where no versionId exists (fs or
+  self-host stores). There, an equal single-part ETag means equal bytes, so publishing either object yields the same
+  content. Multipart ETags are not content hashes, so a store without versionIds and with multipart manifests is
+  OUT OF SCOPE for check 4 and must be stated as a deployment constraint. Manifests are small single-part PUTs
+  today.
+- **Across incarnations** the window is closed by `k`: reissue takes `k` EXCLUSIVE, and check 1 runs under `k` SHARED.
+
+### Q3. Which writers take `k`
+
+| writer | lock on k | what it writes |
+|---|---|---|
+| ordinary deletion: `ingest_apply_selection` (disable), `ingest_apply_reset` | EXCLUSIVE, sorted by key | upload_deletions, session_deletion_receipts |
+| reissue: the ingest claim admitting the first re-created batch | EXCLUSIVE | receipts.consumed_by, session_incarnations |
+| operator permanent erase (new in revision 3) | EXCLUSIVE | session_erasure_fences |
+| publication: upsert_session_index, the move path, the operator runtime upsert | SHARED | session_index |
+| re-enable: `ingest_apply_selection` (enable) | none needed | deletes upload_deletions only; issues nothing |
+| ingest manifest PUT (S3) | none (not SQL) | the object; see Q2 |
+
+### Q4. How the key maps to user- and origin-scoped deletes
+
+`upload_deletions` is keyed (org, workspace, user, origin, source, session), and `k` and the incarnation are keyed
+(org, workspace, source, session). Mapping:
+- A user- or origin-scoped deletion locks the LOGICAL session's `k`. That is coarser, never finer, so it can only
+  over-serialize.
+- The receipt records the deleting (user_id, origin_id). Reissue consumes it only for a claim from the SAME
+  (user, origin), so one user's delete can never let another user's upload start a new incarnation.
+- When two (user, origin) pairs upload under one logical session id (not expected: session ids are per-harness
+  UUIDs), a deletion by one pair does not make the other pair's live pointer rows inactive. Active authority (check 2)
+  is evaluated per (session, incarnation, user, origin) receipt. OPEN for Pipeline: confirm the pointer row carries
+  enough identity (session_index has machine_id; the user and origin are reachable through the ingest ledger) or
+  restrict incarnation to single-owner sessions.
 
 ## Measurement (T139 sizing)
 
