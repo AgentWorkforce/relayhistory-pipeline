@@ -1,6 +1,6 @@
 /**
  * bun run e2e/cutover/run.ts [--size ci|representative] [--users N --sessions N --batches N --records N --payload N]
- *                            [--erasures injected|empty] [--simulate-pending] [--out DIR]
+ *                            [--erasures injected|empty|direct] [--simulate-pending] [--out DIR]
  *
  * PostgreSQL + MinIO: src/session-ingest/__tests__/synthetic-cutover.postgres.test.ts under the hold-harness runner
  * (bun src/session-ingest/__tests__/hold-harness/run.ts --pg 17 -- <that file>); CUTOVER_SIZE and CUTOVER_REPORT_DIR.
@@ -26,8 +26,8 @@ const size: FixtureSize = { users: int("--users", base.users), sessionsPerUser: 
   recordsPerBatch: int("--records", base.recordsPerBatch), payloadBytes: int("--payload", base.payloadBytes) };
 if ((process.env.TMPDIR ?? "/tmp").startsWith("/tmp")) throw new Error("set TMPDIR to a disk path (the fixture's object store lives there)");
 
-const erasures = (val("--erasures") ?? "injected") as "injected" | "empty";
-if (erasures !== "injected" && erasures !== "empty") throw new Error("--erasures is injected or empty");
+const erasures = (val("--erasures") ?? "injected") as "injected" | "empty" | "direct";
+if (!["injected", "empty", "direct"].includes(erasures)) throw new Error("--erasures is injected, empty or direct");
 const report = await runCutoverQualification({ size, erasures, simulatePending: flag("--simulate-pending"), log: (l) => console.error(l) });
 const out = val("--out") ?? join(process.env.RELAYFLOW_STATE_DIR ?? ".relayflow", "synthetic-cutover");
 mkdirSync(out, { recursive: true });

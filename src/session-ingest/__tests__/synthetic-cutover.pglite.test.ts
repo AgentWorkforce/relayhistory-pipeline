@@ -9,7 +9,10 @@
  *   - injected erasures: release BLOCKED on the generation proof, no release commit, no resumption;
  *   - empty window: release commits through the stand-in bridge; publication is not exercised; old sessions are not
  *     readable exactly;
- *   - an erasure the replay never saw refuses the release (erasure_unaccounted), whatever its kind.
+ *   - an erasure the replay never saw refuses the release (erasure_unaccounted), whatever its kind;
+ *   - direct org (already accepting direct uploads, layered 252344394069577728): the existing marker conflicts (kept);
+ *     a writer authorized before the install completes during the hold; the mirrored and S3-only resets leave no
+ *     062340 row, so the empty-window release would commit: refused (direct_erasure_unrecorded).
  * Never QUALIFIED here: the qualification backend is PG17 + MinIO (synthetic-cutover.postgres.test.ts).
  */
 import { describe, expect, setDefaultTimeout, test } from "bun:test";
@@ -80,6 +83,26 @@ describe("synthetic per-org cutover qualification (PGlite)", () => {
     expect(statuses(r)).toMatchObject({ release: "FAIL erasure_unaccounted", admission: "SKIP" });
     expect(r.timeline.release_committed_ms).toBeNull();
     expect(r.inflight_barrier).toBeNull(); // the coverage check refuses before any in-flight probe
+  });
+
+  test("direct org: pre-install direct upload, writer parked before install completes in the hold, unrecorded direct controls", async () => {
+    const r = await runCutoverQualification({ size: SIZE_CI, erasures: "direct" });
+    expect(statuses(r)).toEqual({ seed: "PASS", "direct.enroll": "PASS", "rearm.list": "PASS", "hold.install": S3_OPEN, full: "PASS", "seal.bind": "PASS",
+      catchup: "PASS", "reshard.verify": "PASS", marker: "FAIL marker_conflict", "marker.verify": S3_OPEN,
+      drain: "FAIL drain_reset_margin_pending+drain_not_materialized+s3_admits_before_bridge_complete",
+      release: "FAIL direct_erasure_unrecorded", admission: "SKIP", publication: "SKIP", reads: "SKIP" });
+    expect(r.direct).toMatchObject({
+      preinstall_upload: "accepted",
+      // Parked after its authority read before the install; let go after the cutover: it wrote while the org was held.
+      parked_writer: { parked_before_install: true, authority_read_before_park: true, outcome: "accepted", readable: "manifest_present" },
+      // The real mirrored control applies the S3 reset and its SQL half is refused: no 062340 row. Same for S3-only.
+      mirrored_reset: { s3_applied: true, history_rows: 0 }, s3_only_reset: { s3_applied: true, history_rows: 0 },
+      // So the empty-window release would commit (proved inside a rolled-back transaction); the harness refuses.
+      empty_window_release_would_commit: true,
+    });
+    expect(r.direct!.parked_writer.effects).toEqual(["batch_record", "owner_stub", "canonical"]);
+    expect(r.timeline.release_committed_ms).toBeNull();
+    expect(r.verdict).toBe("NOT_QUALIFIED");
   });
 
   test("QUALIFIED needs every adapter landed: the defaults are stand-ins and pending heads", () => {

@@ -37,8 +37,10 @@ import { exportAcceptedStages } from "../../src/session-ingest/accepted-stage-ex
 import { drainBufferedBatches } from "../../src/session-ingest/buffered-drain.ts";
 import { reshardRevisions } from "../../src/session-ingest/revision-reshard.ts";
 import { sweepRearmMarkers, rearmScopes } from "../../src/session-ingest/rearm-sweeper.ts";
-import { orgFenceAuthorityKey, s3LedgerKeys, validOrgFenceAuthority } from "../../src/session-ingest/ledger-s3.ts";
-import { HeadPending, allLanded, defaultHeads, integrationSummary, type CutoverContext, type CutoverHeads, type ReplayItem, type ReplayReceipt } from "./heads.ts";
+import { orgFenceAuthorityKey, s3Ledger, s3LedgerKeys, s3LedgerObjects, validOrgFenceAuthority, withSqlControlMirror } from "../../src/session-ingest/ledger-s3.ts";
+import { sqlLedger } from "../../src/session-ingest/ledger-sql.ts";
+import { generation } from "../../src/session-ingest/__tests__/privacy-authority-support.ts";
+import { HeadPending, MarkerConflict, allLanded, defaultHeads, integrationSummary, type CutoverContext, type CutoverHeads, type ReplayItem, type ReplayReceipt } from "./heads.ts";
 import type { Backend } from "./backend.ts";
 import { KEY_ROOT, MIN_USERS, ORG, SIZE_CI, SOURCE, WORKSPACE, originOfSession, originsOf, openFixture, sessionOf, tenantOf, text, userId, type FixtureSize, type Fx } from "./fixture.ts";
 
@@ -48,6 +50,13 @@ export const QUALIFICATION_BACKEND = "pg17+minio";
 /** BACKLOG_OPS_FRESH_BACKFILL_MS: the drain binds a catch-up under 3 h old. */
 export const DRAIN_WINDOW_MS = 3 * 3600_000;
 
+/**
+ * injected: erasures through the SQL entry points during the hold. empty: none (the empty-window control). direct: the
+ * org already accepts direct uploads (S3 ledger, a valid per-org marker) before the install; a direct writer is parked
+ * post-authority before the install and carried through the cutover; the user reset goes through the real mirrored
+ * control (withSqlControlMirror: S3 first, then SQL), and an S3-only reset is the negative control.
+ */
+export type Scenario = "injected" | "empty" | "direct";
 export type StepStatus = "PASS" | "FAIL" | "BLOCKED" | "SKIP";
 export interface StepReport { id: string; status: StepStatus; ms: number; startedMs: number | null; observed: string[]; code?: string; integration?: string }
 export interface UploadEvent {
@@ -66,7 +75,7 @@ export interface CutoverReport {
   reasons: string[];
   simulated: boolean;
   backend: string;
-  scenario: "injected" | "empty";
+  scenario: Scenario;
   size: FixtureSize & { batches: number; records: number; sessions: number; staged_bytes: number; buffered_stages: number };
   steps: StepReport[];
   /**
@@ -95,6 +104,14 @@ export interface CutoverReport {
   first_failure: { step: string; status: StepStatus; code: string | null; assertion: string | null } | null;
   /** What this run does not cover, stated in every receipt (pending adapters and unbuilt checks). */
   uncovered: string[];
+  /** direct scenario only: the pre-existing marker, the pre-install upload, the parked writer and the direct controls. */
+  direct: null | {
+    preinstall_upload: string | null;
+    parked_writer: { parked_before_install: boolean; authority_read_before_park: boolean; parked_on: string | null; outcome: string | null; effects: string[]; readable: string | null };
+    mirrored_reset: { s3_applied: boolean; sql_outcome: string; history_rows: number };
+    s3_only_reset: { s3_applied: boolean; history_rows: number };
+    empty_window_release_would_commit: boolean | null;
+  };
   uploads: UploadEvent[];
   erasures: { before_hold: Record<string, number>; during_hold: Record<string, number>; history_since_install: Record<string, number> | null };
   integration: Record<string, { head: string; integration: string; todo: string | null }>;
@@ -129,7 +146,7 @@ export interface RunOptions {
    * injected (default): erasures land during the hold (a held user deletion; a sealed operator user erase and session
    * fence), so bridge_complete needs their replay. empty: none during the hold, the empty-window release.
    */
-  erasures?: "injected" | "empty";
+  erasures?: Scenario;
   /**
    * Test only: plant one more session erasure fence during the hold with NO replay item, to prove the release refuses
    * an erasure the replay never saw (erasure_unaccounted).
@@ -144,6 +161,8 @@ const PLAN = {
   preUserErase: 0, preSelection: [1, 0] as const, preSessionFence: [2, 0] as const,
   heldSelection: [3, 0] as const, sealedUserErase: 4, sealedSessionFence: [5, 0] as const,
   live: [6, 7] as const,
+  /** direct scenario: the user with the pre-install direct upload and the parked writer; the reset users. */
+  directUser: 7, mirroredResetUser: 3, s3OnlyResetUser: 5,
 };
 
 export async function runCutoverQualification(opts: RunOptions = {}): Promise<CutoverReport> {
@@ -323,6 +342,8 @@ export async function runCutoverQualification(opts: RunOptions = {}): Promise<Cu
   let full: BackfillSummary | null = null;
   let drainAlreadyStored = 0, drainWritten = 0;
   let inflightBarrier: CutoverReport["inflight_barrier"] = null;
+  let direct: CutoverReport["direct"] = null;
+  let parkedDirect: { done: Promise<UploadEvent>; bar: ReturnType<typeof barrierStore>; spec: UploadSpec } | null = null;
   const sizeOut = { ...size, batches: 0, records: 0, sessions: 0, staged_bytes: 0, buffered_stages: 0 };
 
   try {
@@ -349,6 +370,31 @@ export async function runCutoverQualification(opts: RunOptions = {}): Promise<Cu
       await liveUploads("seed", "sql");
     });
 
+    // ---- direct scenario: the org already accepts direct uploads before the install --------------------------------
+    if (scenario === "direct") await step("direct.enroll", async (obs) => {
+      // A valid per-org marker before the install (the already-direct org, layered Q1 (a)); the customer's real marker
+      // is not modelled. It is preserved by everything after this: the cutover's marker step may only adopt or conflict.
+      const doc = { v: 1, fenceBackfill: "complete", revisionBackfill: "complete", ownershipBackfill: "complete", controlMirror: "on",
+        rearmSweeper: "live", revisionLayout: "4096", workerHttpAdmission: "off", writtenAtMs: Date.now(), orgId: ORG };
+      await fx.store.put(objectKey(orgFenceAuthorityKey(KEY_ROOT, ORG)), enc.encode(JSON.stringify(doc)), { contentType: "application/json", ifNoneMatch: true });
+      const u = PLAN.directUser;
+      const pre = await upload("direct.preinstall", "s3", { u, origin: originsOf(u)[1]!, batchId: "direct-pre-0", session: `direct-${String(u).padStart(3, "0")}-pre`, records: 3, revision: 2, payloadBytes: 128 });
+      must(pre.outcome === "accepted", "direct_preinstall_not_admitted", `pre-install direct upload ${pre.outcome}`);
+      // A second direct writer, parked after its authority reads at its first durable write, BEFORE the install.
+      const bar = barrierStore("first-write");
+      const spec = { u, origin: originsOf(u)[1]!, batchId: "direct-parked-0", session: `direct-${String(u).padStart(3, "0")}-parked`, records: 3, revision: 2, payloadBytes: 128 };
+      const raw = await fx.rawBatch(spec.u, spec.session, spec.origin, spec.batchId, spec.revision, spec.records, spec.payloadBytes);
+      const done = upload("direct.parked", "s3", { ...spec, raw, via: bar.store });
+      const reached = await Promise.race([bar.reached, done.then(() => null), new Promise<null>((r) => setTimeout(() => r(null), 30_000))]);
+      parkedDirect = { done, bar, spec: { ...spec, raw } };
+      must(reached !== null, "direct_writer_not_parked", "the direct writer settled or timed out before its first durable write");
+      direct = { preinstall_upload: pre.outcome,
+        parked_writer: { parked_before_install: true, authority_read_before_park: bar.authorityRead(), parked_on: bar.parkedOn(), outcome: null, effects: [], readable: null },
+        mirrored_reset: { s3_applied: false, sql_outcome: "not_run", history_rows: 0 }, s3_only_reset: { s3_applied: false, history_rows: 0 },
+        empty_window_release_would_commit: null };
+      obs.push(`valid per-org marker before the install; pre-install direct upload ${pre.outcome}; a direct writer parked at its first write (${bar.parkedOn()}) after the authority read=${bar.authorityRead()}`);
+    });
+
     // ---- rearm list ------------------------------------------------------------------------------------------------
     await step("rearm.list", async (obs) => {
       const scopes = rearmScopes(KEY_ROOT, [ORG]);
@@ -362,14 +408,15 @@ export async function runCutoverQualification(opts: RunOptions = {}): Promise<Cu
     });
 
     // ---- hold install ----------------------------------------------------------------------------------------------
-    await step("hold.install", async (obs) => {
+    await step("hold.install", async (obs, fail) => {
       const r = await heads.holdInstall.run(ctx, randomUUID());
       epoch = r.epoch;
       const st = (await fx.one<{ s: any }>("SELECT sessions.ingest_org_admission_hold_status($1) s", [ORG])).s;
       must(st.hold?.state === "held" && st.hold?.epoch === epoch, "hold_not_held");
       installMs = Date.parse(st.hold.installed_at); // the install's commit, on the database clock
+      if (scenario === "direct") await checkS3Closed(await liveUploads("hold.install", "s3"), fail, obs);
       await liveUploads("hold.install", "sql");
-      const refused = uploads.filter((x) => x.step === "hold.install");
+      const refused = uploads.filter((x) => x.step === "hold.install" && x.path === "sql");
       must(refused.every((x) => x.outcome === "RH042"), "admission_not_refused", `live uploads under the hold: ${refused.map((x) => x.outcome).join(",")}`);
       obs.push(`hold held; ${refused.length} live SQL upload(s) refused RH042`);
       // Held (not sealed): the user's own controls still proceed, and they are erasures the bridge must account for.
@@ -415,6 +462,27 @@ export async function runCutoverQualification(opts: RunOptions = {}): Promise<Cu
         bump(during, "session_erasure_fence");
         obs.push(`erasures while sealed proceeded: ${JSON.stringify(during)} (the session fence is a table insert: recorder coverage only, not the 062360 producer)`);
       }
+      if (scenario === "direct") {
+        const resets = (u: number) => s3LedgerObjects(fx.store, KEY_ROOT).readFence(s3LedgerKeys(KEY_ROOT, tenantOf(u)).fence)
+          .then((r) => (r.state === "present" ? Number((r.fence as { resets?: number }).resets ?? 0) : 0));
+        // The real mirrored control (the Worker's adapter): S3 reset first, then SQL's, then the reconcile.
+        const sqlStates: string[] = [];
+        const sqlLed = sqlLedger((async (q: string, p: unknown) => { try { return await fx.ingest(q, p as unknown[]); } catch (e) { sqlStates.push(String((e as { code?: unknown }).code)); throw e; } }) as never,
+          { acceptanceMode: "buffered", expectedGeneration: generation });
+        const mirrored = withSqlControlMirror(s3Ledger(fx.store, KEY_ROOT, { acceptanceMode: "canonical" }), sqlLed, fx.store, KEY_ROOT);
+        const before1 = await resets(PLAN.mirroredResetUser), h1 = await historyKeys();
+        let sqlOutcome = "ok";
+        try { await mirrored.resetUploadedSessions(tenantOf(PLAN.mirroredResetUser), randomUUID()); } catch (e) { sqlOutcome = sqlStates.at(-1) ?? String((e as { code?: unknown }).code ?? "error"); }
+        const rows1 = [...(await historyKeys())].filter((k) => !h1.has(k)).length;
+        direct!.mirrored_reset = { s3_applied: (await resets(PLAN.mirroredResetUser)) > before1, sql_outcome: sqlOutcome, history_rows: rows1 };
+        bump(during, "mirrored_reset");
+        // Negative control: an S3-only reset (no SQL side at all).
+        const before2 = await resets(PLAN.s3OnlyResetUser), h2 = await historyKeys();
+        await s3Ledger(fx.store, KEY_ROOT, { acceptanceMode: "canonical" }).resetUploadedSessions(tenantOf(PLAN.s3OnlyResetUser), randomUUID());
+        direct!.s3_only_reset = { s3_applied: (await resets(PLAN.s3OnlyResetUser)) > before2, history_rows: [...(await historyKeys())].filter((k) => !h2.has(k)).length };
+        bump(during, "s3_only_reset");
+        obs.push(`mirrored reset: S3 applied ${direct!.mirrored_reset.s3_applied}, SQL ${sqlOutcome}${sqlOutcome === "RH042" ? " (control class refused while sealed: the fixture has no bulls96_session_ingest_mirror member; with one, a lazy-policy SQL reset still needs an ordered control with Neon custody, 22023)" : ""}, 062340 rows ${rows1}; S3-only reset: S3 applied ${direct!.s3_only_reset.s3_applied}, 062340 rows ${direct!.s3_only_reset.history_rows}`);
+      }
       if (opts.unreplayedErasure) { await planted(null, () => fx.sessionErasureFence(PLAN.sealedSessionFence[0], 1)); bump(during, "session_erasure_fence_unreplayed"); }
       await liveUploads("seal.bind", "sql");
     }, heads.holdSealBind.integration);
@@ -439,9 +507,15 @@ export async function runCutoverQualification(opts: RunOptions = {}): Promise<Cu
     });
 
     // ---- marker ----------------------------------------------------------------------------------------------------
-    await step("marker", async (obs) => {
-      await heads.markerExecute.run(ctx, epoch, { catchupReceiptSha256: sha(enc.encode(catchupReceipt)), writtenAtMs: Date.now() });
-      obs.push("marker_attempted committed before the PUT; marker written create-only and read back");
+    await step("marker", async (obs, fail) => {
+      try {
+        await heads.markerExecute.run(ctx, epoch, { catchupReceiptSha256: sha(enc.encode(catchupReceipt)), writtenAtMs: Date.now() });
+        obs.push("marker_attempted committed before the PUT; marker written create-only and read back");
+      } catch (e) {
+        if (!(e instanceof MarkerConflict)) throw e;
+        // The attempt is committed (the point of no return), the existing marker is preserved: the org stays held.
+        fail(e.code, "a marker this epoch cannot own is present (no publication identity binds it to this cutover); preserved, not overwritten");
+      }
     }, heads.markerExecute.integration);
 
     // ---- post-marker verify ----------------------------------------------------------------------------------------
@@ -476,9 +550,14 @@ export async function runCutoverQualification(opts: RunOptions = {}): Promise<Cu
       // them no sidecar and the drain refuses them (stage_unacknowledged, never written). Exactly those, no other.
       const erasedStages = (scenario === "injected" ? 2 : 1) * size.sessionsPerUser * size.batchesPerSession;
       must(dr.objects.stage_unacknowledged === erasedStages, "drain_unacknowledged_unexpected", `stage_unacknowledged ${dr.objects.stage_unacknowledged}, expected ${erasedStages} (the operator-erased users)`);
-      const bad = Object.entries(dr.objects).filter(([k, v]) => v > 0 && !["drained", "already_drained", "stage_not_live", "stage_superseded", "pre_reset", "redacted", "vanished", "stage_unacknowledged"].includes(k));
+      // direct: the resets made during the hold put their users' stages inside the drain's reset margin (5 min around
+      // the reset): skipped, never written, left for a rerun after the margin. Counted and failed (not hidden).
+      const marginOk = scenario === "direct" ? ["reset_margin", "pre_reset"] : [];
+      const bad = Object.entries(dr.objects).filter(([k, v]) => v > 0 && !["drained", "already_drained", "stage_not_live", "stage_superseded", "pre_reset", "redacted", "vanished", "stage_unacknowledged", ...marginOk].includes(k));
       must(dr.stopped === "complete" && bad.length === 0, "drain_incomplete", JSON.stringify(Object.fromEntries(bad)));
-      must(dr.objects.drained + dr.objects.already_drained === ex.live, "drain_count_mismatch", `drained ${dr.objects.drained} + already ${dr.objects.already_drained} vs export live ${ex.live}`);
+      const skipped = scenario === "direct" ? dr.objects.reset_margin + dr.objects.pre_reset : 0;
+      must(dr.objects.drained + dr.objects.already_drained + skipped === ex.live, "drain_count_mismatch", `drained ${dr.objects.drained} + already ${dr.objects.already_drained} + reset-skipped ${skipped} vs export live ${ex.live}`);
+      if (dr.objects.reset_margin > 0) fail("drain_reset_margin_pending", `${dr.objects.reset_margin} stage(s) inside the reset margin: undrained until a rerun after the margin, within the 3 h window`);
       drainAlreadyStored = dr.lines.already_stored; drainWritten = dr.lines.written;
       obs.push(`catch-up age at drain ${age} ms (< 3 h); export rows ${ex.rows} live ${ex.live} written ${ex.written}; drain listed ${dr.listed} drained ${dr.objects.drained} unacknowledged (erased users) ${dr.objects.stage_unacknowledged} not-live ${dr.objects.stage_not_live} lines written ${dr.lines.written} already stored ${dr.lines.already_stored}`);
       // Materialization (layered): an index revision or digest is not proof of canonical bytes. Every backlog session
@@ -507,6 +586,21 @@ export async function runCutoverQualification(opts: RunOptions = {}): Promise<Cu
       obs.push(`erasure history since install: ${JSON.stringify(historySinceInstall)} (${st.erasures} row(s))`);
       if (scenario === "injected") must(Number(st.erasures) > 0, "erasure_window_empty_unexpected", "the fixture plants erasures during the hold");
       else must(Number(st.erasures) === 0, "erasure_window_nonempty", "the empty scenario plants no erasure during the hold");
+      if (scenario === "direct") {
+        // The direct controls applied in S3 during the hold must be in the window the release decision reads. Prove
+        // what the empty-window release would do (inside a transaction that is rolled back), then refuse fail closed.
+        await fx.db.query("BEGIN");
+        let would = "ok";
+        try { await fx.db.query("SELECT sessions.ingest_org_admission_hold_release($1,$2::uuid,'bridge_complete',$3,'erasure_window_empty',0)", [ORG, epoch, "d".repeat(64)]); }
+        catch (e) { would = String((e as { code?: unknown }).code ?? "error"); }
+        finally { await fx.db.query("ROLLBACK"); }
+        direct!.empty_window_release_would_commit = would === "ok";
+        const st2 = (await fx.one<{ s: any }>("SELECT sessions.ingest_org_admission_hold_status($1) s", [ORG])).s;
+        must(st2.hold?.state !== "released", "dry_release_leaked");
+        obs.push(`direct controls applied in S3 during the hold: ${Number(direct!.mirrored_reset.s3_applied) + Number(direct!.s3_only_reset.s3_applied)}; 062340 rows for them: ${direct!.mirrored_reset.history_rows + direct!.s3_only_reset.history_rows}; empty-window release would ${would === "ok" ? "COMMIT" : `refuse (${would})`} (rolled back)`);
+        must(direct!.mirrored_reset.history_rows > 0 && would !== "ok", "direct_erasure_unrecorded",
+          "a direct control applied in S3 has no 062340 history row, so the empty-window release would clear it; no authoritative history source for the direct path");
+      }
       // Coverage by request and effect, not by kind: every history row since the fence must be one a planted erasure
       // produced (attributed when it was written), and that erasure must be replayed. The stand-in release passes the
       // count it reads, so _release's own count check cannot catch an erasure the replay never saw.
@@ -647,6 +741,16 @@ export async function runCutoverQualification(opts: RunOptions = {}): Promise<Cu
       // TODO(read API): the same reads over HTTP (/v1/sessions/:id/events) on the compose stack.
     });
   } finally {
+    if (parkedDirect) {
+      const pd = parkedDirect as { done: Promise<UploadEvent>; bar: ReturnType<typeof barrierStore>; spec: UploadSpec };
+      pd.bar.open();
+      const ev = await Promise.race([pd.done, new Promise<null>((r) => setTimeout(() => r(null), 60_000))]);
+      if (direct && ev) {
+        ev.effects = await s3Effects(pd.spec);
+        const mk = await manifestOf(pd.spec.u, pd.spec.origin, pd.spec.session).catch(() => null);
+        direct.parked_writer = { ...direct.parked_writer, outcome: ev.outcome, effects: ev.effects, readable: mk ? "manifest_present" : "no_manifest" };
+      } else if (direct) direct.parked_writer = { ...direct.parked_writer, outcome: "did_not_settle" };
+    }
     await fx.close();
   }
 
@@ -661,7 +765,7 @@ export async function runCutoverQualification(opts: RunOptions = {}): Promise<Cu
     simulated: opts.simulatePending === true, backend: fx.kind, scenario, size: sizeOut, steps,
     timeline: { install_committed_ms: installMs, first_s3_admit_started_ms: fs3?.startedMs ?? null, first_s3_admit_accepted_ms: fs3?.endedMs ?? null,
       release_committed_ms: releaseCommittedMs, first_admit_after_release_started_ms: firstAfterRelease },
-    inflight_barrier: inflightBarrier,
+    inflight_barrier: inflightBarrier, direct,
     first_failure: ((f) => f ? { step: f.id, status: f.status, code: f.code ?? null, assertion: f.observed.find((o) => /^[a-z0-9_]+: /.test(o) || o.startsWith("head pending")) ?? f.observed.at(-1) ?? null } : null)(steps.find((x) => x.status !== "PASS")),
     uncovered: [
       ...Object.entries(heads).filter(([, a]) => a.integration === "pending").map(([k, a]) => `adapter ${k} pending (${a.head})`),
@@ -693,6 +797,7 @@ export function reportMarkdown(r: CutoverReport): string {
     `Observed UPPER BOUND on admission downtime (install commit -> first successful S3 answer): ${r.downtime.observed_upper_bound_ms ?? "n/a"} ms. Install -> release commit: ${r.downtime.through_release_ms ?? "n/a (not released)"} ms.`,
     `First failure: ${r.first_failure ? `${r.first_failure.step} ${r.first_failure.status} ${r.first_failure.code ?? ""}: ${r.first_failure.assertion ?? ""}` : "none"}.`,
     `In-flight barrier: ${JSON.stringify(r.inflight_barrier)}.`,
+    ...(r.direct ? [`Direct scenario: ${JSON.stringify(r.direct)}.`] : []),
     `Not covered: ${r.uncovered.join("; ")}.`,
     `Wall clock: ${r.wall_ms} ms.`, ``,
     `Uploads: ${r.uploads.length} (${r.uploads.filter((u) => u.queued).length} refused and queued).`,

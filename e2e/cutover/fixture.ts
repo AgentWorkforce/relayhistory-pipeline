@@ -160,6 +160,6 @@ export async function openFixture(backend?: Backend) {
     }
   }
 
-  return { kind: b.kind, db, attempt, store, one, rawBatch, deliverSql, deliverS3, proveOwnerParity, operatorUserErase, selectionDeletion, sessionErasureFence, close: b.close };
+  return { kind: b.kind, db, ingest: b.ingest, attempt, store, one, rawBatch, deliverSql, deliverS3, proveOwnerParity, operatorUserErase, selectionDeletion, sessionErasureFence, close: b.close };
 }
 

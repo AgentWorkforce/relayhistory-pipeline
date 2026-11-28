@@ -51,6 +51,11 @@ export type ReplayItem =
 
 export interface ReplayReceipt { kind: ReplayItem["kind"]; outcome: "replayed" | "mirrored" | "simulated"; hash: string }
 
+/** marker-execute found a marker this epoch cannot own (no publication identity bound to it): never overwritten. */
+export class MarkerConflict extends Error {
+  constructor(readonly code = "marker_conflict") { super(code); this.name = "MarkerConflict"; }
+}
+
 export interface Adapter<A extends unknown[], R> { head: string; integration: Integration; todo: string; run: (...a: A) => Promise<R> }
 
 export interface CutoverHeads {
@@ -112,6 +117,11 @@ export function defaultHeads(opts: { simulatePending?: boolean } = {}): CutoverH
         const doc: OrgFenceAuthorityDoc = { v: 1, fenceBackfill: "complete", revisionBackfill: "complete", ownershipBackfill: "complete", controlMirror: "on",
           rearmSweeper: "live", revisionLayout: "4096", workerHttpAdmission: "off", writtenAtMs: m.writtenAtMs, orgId: c.org };
         const key = orgFenceAuthorityKey(c.keyRoot, c.org);
+        // A marker already there is adopted only when its publication identity binds it to this epoch's attempt
+        // (marker-publication markerAdoptable). The stand-in writes no identity, so ANY existing marker conflicts: it
+        // is preserved, never overwritten (layered 252344394069577728).
+        try { await readAll(await c.store.get(objectKey(key))); throw new MarkerConflict(); }
+        catch (e) { if (e instanceof MarkerConflict) throw e; if (!(isObjectStoreError(e) && e.code === "not_found")) throw e; }
         await c.store.put(objectKey(key), new TextEncoder().encode(JSON.stringify(doc)), { contentType: "application/json", ifNoneMatch: true });
         const back = JSON.parse(new TextDecoder().decode(await readAll(await c.store.get(objectKey(key)))));
         if (!validOrgFenceAuthority(back) || back.orgId !== c.org) throw new HeadPending("marker_readback_invalid", WAVE);

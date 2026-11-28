@@ -30,8 +30,10 @@ there.
     and a versioned MinIO scratch bucket. The hold-harness runner starts both as disposable containers.
 - **Connections on PostgreSQL.** The lifecycle and erase entry points and the backlog tools' reads run as the
   owner. The SQL ledger runs as `bulls96_session_ingest`. The superuser is used only for the seeding listed below.
-- **Erasure scenarios** (`--erasures`): `injected`, the default, plants the erasures below during the hold.
-  `empty` plants none, so the release is the empty-window path.
+- **Erasure scenarios** (`--erasures`):
+  - `injected`, the default, plants the erasures below during the hold.
+  - `empty` plants none, so the release is the empty-window path. It is the genuinely empty control.
+  - `direct` models an org that already accepts direct uploads before the install. See below.
 - **One org on the buffered SQL ledger.** Its backlog is admitted through the real buffered path: `deliverBatch`
   over `sqlLedger` with a custody witness, under the lazy-current policy.
 - **Fixture sizes:**
@@ -149,6 +151,39 @@ Two durations come from these:
 - every adapter in `e2e/cutover/heads.ts` is `landed`;
 - the backend is `pg17+minio`;
 - the run is not simulated.
+
+## The direct-upload scenario (`--erasures direct`)
+
+This is the already-direct org from layered-sessions-pipeline's approved workspace routing. It admits through the S3
+ledger with a valid per-org marker in place before the install. Every check of the other scenarios also runs.
+
+- `direct.enroll` writes a valid per-org marker before the install, proves one direct upload is admitted, and parks
+  a second direct writer.
+  - The writer is parked at its first durable write, after its authority reads, before the install.
+  - It is carried through the whole cutover and let go at the end. Its outcome, its durable writes and its manifest
+    are then inspected (`direct.parked_writer`).
+- At `seal.bind`, the user reset goes through the real mirrored control (`withSqlControlMirror`, S3 first, then
+  SQL). An S3-only reset is the negative control. For each, the harness records whether S3 applied it and how many
+  062340 history rows it produced.
+- `marker` preserves the existing marker. The stand-in writes no publication identity, so the marker cannot be
+  adopted and the step fails with `marker_conflict`. It never overwrites the marker.
+- `release` tries the empty-window release (`_release ... 'erasure_window_empty', 0`) inside a transaction that is
+  rolled back. It then refuses fail-closed with `direct_erasure_unrecorded` when a direct control applied in S3 has
+  no history row.
+
+On main (pinned by both suites):
+- The pre-install upload is admitted. The writer parked before the install completes during the hold: its batch
+  record, owner stub and canonical manifest are written.
+- **The mirrored reset:**
+  - S3 applies it.
+  - Its SQL half is refused with RH042 while the hold is sealed, because the fixture has no mirror-role member.
+  - Outside the seal, the same call is refused with 22023: a lazy-policy SQL reset needs an ordered control with
+    Neon custody.
+  - It produces no 062340 row, and neither does the S3-only reset.
+- The empty-window release would therefore commit, so `release` fails with `direct_erasure_unrecorded`. No
+  authoritative history source records the direct path's controls.
+- The drain leaves the reset users' stages inside the 5-minute reset margin. They stay undrained until a rerun, and
+  the step fails with `drain_reset_margin_pending`.
 
 ## Integration points (`e2e/cutover/heads.ts`)
 

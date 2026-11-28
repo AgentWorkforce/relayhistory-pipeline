@@ -36,7 +36,7 @@ afterAll(() => {
     writeFileSync(join(dir, `${name}.md`), reportMarkdown(r));
   }
 });
-const run = async (o: { erasures: "injected" | "empty"; simulatePending?: boolean }) => {
+const run = async (o: { erasures: "injected" | "empty" | "direct"; simulatePending?: boolean }) => {
   const r = await runCutoverQualification({ size, ...o, backend: () => postgresBackend({ pgUrl: pgUrl!, s3: s3!, ...(major ? { expectMajor: major } : {}) }) });
   reports.push(r);
   return r;
@@ -68,6 +68,14 @@ describe.skipIf(!pgUrl || !s3)("synthetic per-org cutover on PostgreSQL + MinIO"
     expect(r.inflight_barrier!.reached_ms!).toBeLessThanOrEqual(r.inflight_barrier!.release_committed_ms!);
     expect(r.uploads.find((u) => u.step === "release.inflight")!.outcome).toBe("accepted");
     expect(r.downtime.observed_upper_bound_ms!).toBeLessThan(r.downtime.through_release_ms!);
+    expect(r.verdict).toBe("NOT_QUALIFIED");
+  });
+
+  test("direct org: pre-install upload, parked writer, unrecorded direct controls refuse the release", async () => {
+    const r = await run({ erasures: "direct" });
+    expect(statuses(r)).toMatchObject({ "direct.enroll": "PASS", "hold.install": S3_OPEN, marker: "FAIL marker_conflict", release: "FAIL direct_erasure_unrecorded" });
+    expect(r.direct).toMatchObject({ preinstall_upload: "accepted", parked_writer: { authority_read_before_park: true, outcome: "accepted" },
+      mirrored_reset: { s3_applied: true, history_rows: 0 }, empty_window_release_would_commit: true });
     expect(r.verdict).toBe("NOT_QUALIFIED");
   });
 
