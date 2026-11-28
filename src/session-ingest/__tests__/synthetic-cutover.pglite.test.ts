@@ -35,6 +35,7 @@ describe("synthetic per-org cutover qualification (PGlite)", () => {
     expect(r.timeline.release_committed_ms).toBeNull();
     expect(r.timeline.first_admit_after_release_started_ms).toBeNull();
     expect(r.downtime.through_release_ms).toBeNull();
+    expect(r.uncovered.some((u) => u.includes("last authority check"))).toBe(true);
     expect(r.downtime.observed_upper_bound_ms).toBeGreaterThan(0);
     expect(r.timeline.first_s3_admit_started_ms!).toBeGreaterThan(r.timeline.install_committed_ms!);
     // Every SQL upload during the hold refused RH042; every S3 probe after the marker accepted (today).
@@ -56,6 +57,7 @@ describe("synthetic per-org cutover qualification (PGlite)", () => {
     expect(r.inflight_barrier!.reached_ms).not.toBeNull();
     expect(r.inflight_barrier!.reached_ms!).toBeLessThanOrEqual(r.inflight_barrier!.release_committed_ms!);
     expect(r.uploads.find((u) => u.step === "release.inflight")!.outcome).toBe("accepted");
+    expect(r.inflight_barrier!.store_ops_after_barrier_open).toBeGreaterThan(0);
     expect(r.timeline.first_s3_admit_accepted_ms!).toBeLessThan(r.timeline.release_committed_ms!);
     expect(r.downtime.observed_upper_bound_ms!).toBeLessThan(r.downtime.through_release_ms!);
     expect(r.verdict).toBe("NOT_QUALIFIED");
@@ -73,6 +75,7 @@ describe("synthetic per-org cutover qualification (PGlite)", () => {
     const r = await runCutoverQualification({ size: SIZE_CI, simulatePending: true, unreplayedErasure: true });
     expect(statuses(r)).toMatchObject({ release: "FAIL erasure_unaccounted", admission: "SKIP" });
     expect(r.timeline.release_committed_ms).toBeNull();
+    expect(r.inflight_barrier).toBeNull(); // the coverage check refuses before any in-flight probe
   });
 
   test("QUALIFIED needs every adapter landed: the defaults are stand-ins and pending heads", () => {

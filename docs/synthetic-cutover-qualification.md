@@ -96,7 +96,13 @@ no canonical object of its session. The probes run:
 **The in-flight probe is ordered by a barrier, not by clocks.** The request's view of the store parks it at its first
 object-store call. That call is inside admission and comes before any claim or write. The harness waits until the
 request is parked, commits the release, then lets the request continue. Its outcome and its durable state are checked
-after it settles. The receipt records the barrier in `inflight_barrier`.
+after it settles. The receipt records the barrier in `inflight_barrier`. Its `store_ops_after_barrier_open` is null
+when the release never committed.
+
+This proves request-start ordering only. A request parked at its first store call has not yet claimed or passed its
+last authority check. The other interleaving is listed in `uncovered` until the real S3-hold adapter exercises it:
+after the last authority check and before the durable PUT of the claim, a chunk or the manifest, with readable chunks
+and manifests inspected.
 
 There is no S3-side hold yet, so the named code set is empty and any S3 refusal also fails. Each failure has its own
 code:

@@ -83,7 +83,12 @@ export interface CutoverReport {
    */
   downtime: { observed_upper_bound_ms: number | null; through_release_ms: number | null };
   /** The in-flight probe's barrier: parked at its first store call (reached) before the release committed. */
-  inflight_barrier: { reached_ms: number | null; release_committed_ms: number | null; store_ops_after_release: number } | null;
+  /**
+   * reached_ms: the in-flight request's first store call (request start inside admission: before any claim and before
+   * its last authority check). store_ops_after_barrier_open: the request's store calls after the gate opened; null
+   * when the release never committed (the count would not describe calls after a release).
+   */
+  inflight_barrier: { reached_ms: number | null; release_committed_ms: number | null; store_ops_after_barrier_open: number | null } | null;
   /** The first non-PASS step and its first failing assertion (for the implementation owners). */
   first_failure: { step: string; status: StepStatus; code: string | null; assertion: string | null } | null;
   /** What this run does not cover, stated in every receipt (pending adapters and unbuilt checks). */
@@ -302,7 +307,7 @@ export async function runCutoverQualification(opts: RunOptions = {}): Promise<Cu
   let epoch = "", fullStartedMs = 0, fullReceipt = "", catchupCreatedMs = 0, catchupReceipt = "";
   let full: BackfillSummary | null = null;
   let drainAlreadyStored = 0, drainWritten = 0;
-  let inflightBarrier: { reached_ms: number | null; release_committed_ms: number | null; store_ops_after_release: number } | null = null;
+  let inflightBarrier: CutoverReport["inflight_barrier"] = null;
   const sizeOut = { ...size, batches: 0, records: 0, sessions: 0, staged_bytes: 0, buffered_stages: 0 };
 
   try {
@@ -525,7 +530,8 @@ export async function runCutoverQualification(opts: RunOptions = {}): Promise<Cu
       } finally {
         bar.open();
         const ev = await inflight;
-        inflightBarrier = { reached_ms: reachedMs, release_committed_ms: releaseCommittedMs, store_ops_after_release: bar.ops() - (reachedMs === null ? 0 : 1) };
+        inflightBarrier = { reached_ms: reachedMs, release_committed_ms: releaseCommittedMs,
+          store_ops_after_barrier_open: releaseCommittedMs === null || reachedMs === null ? null : bar.ops() - 1 };
         obs.push(`in-flight upload: parked at the barrier before the release (${reachedMs === null ? "not reached" : "reached"}), release ${releaseCommittedMs === null ? "not committed" : "committed while parked"}, then ${ev.outcome}`);
         await checkS3Closed([ev], fail, obs);
       }
@@ -636,6 +642,7 @@ export async function runCutoverQualification(opts: RunOptions = {}): Promise<Cu
       ...Object.entries(heads).filter(([, a]) => a.integration === "pending").map(([k, a]) => `adapter ${k} pending (${a.head})`),
       "HTTP serving reads (session-read-api /v1/sessions/:id/events) not exercised; reads use the read API's canonical reader in process",
       "search_index rows after publication not checked (publication adapter pending)",
+      "in-flight interleaving after the writer's last authority check and before its durable PUT (claim, chunk or manifest write) not exercised: the barrier parks the request at its FIRST store call (request start only); needs the real S3-hold adapter, with readable chunks and manifests inspected",
     ],
     downtime: {
       observed_upper_bound_ms: installMs !== null && fs3 ? fs3.endedMs - installMs : null,
