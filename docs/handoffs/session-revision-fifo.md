@@ -80,6 +80,8 @@ scheduled reconcile ──────────────┘
 | line | fields |
 |---|---|
 | `revision searchable` (one per live upload) | `upload_kind` initial/append, `revision`, legs on the consumer clock: `picked_up_at_ms`, `commit_to_pickup_ms` and `pickup_wait_ms` (to consumer PICKUP: the batch arrived, before any pointer work; the 7s budget), `pointer_started_at_ms` and `pointer_ms` (this key's pointer work; the 2s budget), `pass_started_at_ms`, `commit_to_start_ms` and `start_wait_ms` (to the covering search pass's start), `commit_to_searchable_ms` and `queue_wait_ms` (to its completion), `enqueued_at_ms`, `receive_count`, `event_source`, `already_current`, `incarnation_sha256` |
+| `revision covered` (one per superseded APPEND of the same key, at the covering pass) | `revision`, `covered_by_revision`, `upload_kind`, `picked_up_at_ms`, `pass_started_at_ms`, `commit_to_pickup_ms` / `commit_to_start_ms` / `commit_to_searchable_ms` from ITS OWN commit, `incarnation_sha256`. Index pass completion, NOT an authorized caller read. Fail-closed: only a lower revision of the same key with no delete after it in the group |
+| `revision unobserved` (a superseded upload with no covered line) | `revision`, `reason`: `erase_between`, `recreate_between` (revision >= live), `revision_unknown`, `covered_by_earlier_pass` (a skipped superseded-only batch) |
 | `revision superseded` (one per coalesced or stale event) | `revision`, `superseded_by_revision` or `superseded_by_delete`, `group_lag_ms`, `event_source` |
 | `search index reconciled` / `skipped` | adds `enqueued_at_ms`, `queue_wait_ms`, `receive_count`, `coalesced` |
 | `revision retry scheduled` | `reason`, `delay_seconds`, `count` |
