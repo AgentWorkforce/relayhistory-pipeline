@@ -28,11 +28,15 @@ const FILE = "20261105062330_buffered_search_feed_custom_plans.sql";
 const STEP = `upstream:${FILE}`;
 const UP = read(`supabase/migrations/${FILE}`);
 const DOWN = read("supabase/rollbacks/20261105062330_buffered_search_feed_custom_plans.down.sql");
-// 20261105062350 (the page keyset) sits above 062330 when present: its down runs first.
+// 20261105062360 (the replay manifest) sits above 062350 when present: its down runs first of all.
+const MANIFEST_DOWN = "supabase/rollbacks/20261105062360_session_erasure_replay_manifest.down.sql";
+// 20261105062350 (the page keyset) sits above 062330 when present: its down runs next.
 const PAGE_KEYSET_DOWN = "supabase/rollbacks/20261105062350_buffered_search_feed_page_keyset.down.sql";
 // 20261105062340 (the per-org erasure history) also sits above 062330 when present: its down runs next.
 const HISTORY_DOWN = "supabase/rollbacks/20261105062340_ingest_org_erasure_history.down.sql";
 const laterOff = async (db: PGlite) => {
+  if ((await db.query("SELECT 1 FROM sessions.__96bulls_migrations WHERE name='upstream:20261105062360_session_erasure_replay_manifest.sql'")).rows.length)
+    await db.exec(read(MANIFEST_DOWN));
   if ((await db.query("SELECT 1 FROM sessions.__96bulls_migrations WHERE name='upstream:20261105062350_buffered_search_feed_page_keyset.sql'")).rows.length)
     await db.exec(read(PAGE_KEYSET_DOWN));
   if ((await db.query("SELECT 1 FROM sessions.__96bulls_migrations WHERE name='upstream:20261105062340_ingest_org_erasure_history.sql'")).rows.length)

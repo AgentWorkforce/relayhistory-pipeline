@@ -2251,7 +2251,9 @@ function splitTopLevel(s: string): string[] {
 
 /** One signature argument in regprocedure spelling: no mode, no name, canonical type name. */
 function normalizeSignatureArg(raw: string): string {
-  let a = raw.trim().replace(/\s+/g, " ");
+  // A parameter default (`name type DEFAULT expr` or `name type = expr`) is not part of the signature: the argument is
+  // already split at top-level commas, so everything from the DEFAULT keyword or the `=` on is the default expression.
+  let a = raw.trim().replace(/\s+/g, " ").replace(/\s+default\s[\s\S]*$/i, "").replace(/\s*=[\s\S]*$/, "");
   let array = "";
   while (a.endsWith("[]")) {
     array += "[]";
@@ -2284,9 +2286,10 @@ function normalizeGrantTarget(raw: string): string | null {
 /**
  * The manifest keys ("sessions.fn(type,...)") of the sessions functions the given SQL
  * creates with a literal `CREATE [OR REPLACE] FUNCTION sessions.fn(args)`. Argument
- * lists are matched with balanced parentheses and normalized like pendingExecuteGrants;
- * an argument list it cannot normalize (DEFAULT, OUT, dynamic SQL) yields a key that
- * matches no manifest entry, so the caller under-credits: the safe direction.
+ * lists are matched with balanced parentheses and normalized like pendingExecuteGrants
+ * (a parameter DEFAULT is dropped: it is not part of the signature); an argument list it
+ * cannot normalize (OUT, dynamic SQL) yields a key that matches no manifest entry, so the
+ * caller under-credits: the safe direction.
  */
 export function createdSessionsFunctions(sql: readonly string[]): Set<string> {
   const created = new Set<string>();
