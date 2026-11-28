@@ -160,3 +160,28 @@ is pinned in `revision-fifo.pglite.test.ts` (T126) so a fence fix flips it delib
 Mocked boundaries: SQS (records built as the ESM delivers them; visibility recorded), the search
 stage (a model index over live pointer rows), and the fs store's ETag standing in for the S3
 versionId.
+
+## T124 + T126 integration: required fixtures (not built yet)
+
+Rule (option 1(b), confirmed by Skip and Pipeline): ACK the FIFO head only after durable recovery outside its group
+is committed for the exact job incarnation. A failed or ambiguous handoff keeps the head, even past 30 minutes.
+Hold body fields expected_epoch, expected_fingerprint (never logged), oldest_event_time, hold_seq and hold_id are
+anchored on the FIFO head in delivery order. The forwarder passes them through unchanged.
+
+Run each fixture on BOTH queue paths, on the exact combined SHA, with its queue and worker assumptions stated:
+
+1. Failed handoff: the head is retained, its receive count grows, and later messages of the same group stay blocked.
+2. Successful handoff: a later append gets pickup without waiting for the old job.
+3. A stalled worker with no later append: recovery still wakes.
+4. A backdated append with the old job finishing last; overlap of the two.
+5. A lost forwarder ACK; a retry of an expanded batch; an obsolete hold.
+6. The race where B becomes current between A's applicability check and the enqueue upsert. Duplicate and delayed
+   deliveries of A leave B's queue work and B's authorized marker intact, including after A finishes.
+7. Exact-job recovery for a single-shot upload, and the newer marker still visible to an authorized caller after
+   old work finishes (repeat the read after the old job completes).
+8. Pipeline's queue assertions: the same message's receive count on FIFO retry; a later same-group append and
+   progress of a second group; completion ACK before retry; a fresh standard send before ACK.
+
+Report separately: fallback start, the first authorized marker hit, and timing of co-delivery and the pointer.
+The 30m15s receive-12 schedule is a fixture control (an age-zero start with prompt redelivery), not a release
+guarantee. The load readout counts standard sends and FIFO receives separately and includes carry-in holds.
