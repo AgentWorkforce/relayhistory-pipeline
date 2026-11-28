@@ -19,7 +19,7 @@ import { LEGACY_PROVENANCE_INVALID } from "../session-read-api/legacy-provenance
 import { streamDeadlinePassed } from "../session-read-api/canonical-stream-projection.ts";
 import { captureRefusal, classifyReplayFailure, produceCanonicalReplay, type ReplayProducerDeps } from "./replay-publication.ts";
 import type { LargeJobState, LargeRoute } from "./large-read-worker.ts";
-import { DEADLINE_OVER_BOUND, DEADLINE_ROUTE, LARGE_READ_UNCLAIMED_MS, deadlineMarked, hitStreamDeadline, markDeadline, type DeadlineIsolationDeps } from "./search-deadline-isolation.ts";
+import { DEADLINE_OVER_BOUND, DEADLINE_ROUTE, decideHold, deadlineMarked, hitStreamDeadline, markDeadline, type DeadlineIsolationDeps, type HoldDecision } from "./search-deadline-isolation.ts";
 import { bufferedFeedQueryField, feedBufferedStageByKey, isBufferedStageKey, type BufferedFeedDeps } from "./buffered-search-feed.ts";
 
 export interface QueueRecord {
@@ -68,6 +68,8 @@ export interface ConsumerDeps {
    * its later passes go there too instead of streaming inline again. Absent: exactly the previous behavior.
    */
   deadlineIsolation?: DeadlineIsolationDeps;
+  /** Tests only: the S3-event search pass (default indexSearchScope). */
+  searchPass?: typeof indexSearchScope;
   /**
    * Put a manifest back on the queue after a delay (SQS DelaySeconds): used when
    * another pass holds the session, so the event is neither lost nor failed.
@@ -231,9 +233,15 @@ function carriedTime(c: Covered): string | undefined {
 const scopeId = (s: SessionScope) => JSON.stringify([s.orgId, s.workspaceId, s.harness, s.sessionId]);
 
 /**
- * Enqueue a deadline-isolated scope's large-read job and log the route. True: the job holds the scope (the inline
- * pass is not needed). False: the source is unavailable to the job (erased, blocked, no live pointer), so the caller
- * runs (or has run) the normal pass. An enqueue error propagates: the caller fails the scope's messages for retry.
+ * Enqueue a deadline-isolated scope's large-read job and decide what this delivery does:
+ * - "inline": the source is unavailable to the job (erased, blocked, no live pointer), or (with `progress`) its own job
+ *   failed, is missing, or was not claimed within LARGE_READ_UNCLAIMED_MS of the oldest upload the message carries:
+ *   the caller runs (or has run) the normal pass;
+ * - "done": the job holds the scope (no `progress`), or is complete for the incarnation the enqueue captured, or has
+ *   been held LARGE_READ_HOLD_MAX_MS while running with a live lease: ack;
+ * - "held": the message was requeued as a new SQS message (`requeue`, before this one is acked) to look again later.
+ * Errors propagate (enqueue, requeue): the caller fails the scope's messages, so no delivery is acked without a successor.
+ * A failed read of the job row holds (requeue), never acks.
  */
 async function routeDeadlineScope(
   isolation: DeadlineIsolationDeps,
@@ -241,45 +249,53 @@ async function routeDeadlineScope(
   trigger: "first_hit" | "marked",
   phase: Record<string, unknown>,
   started: number,
-  markedAtMs?: number,
-): Promise<boolean> {
+  anchorMs: number,
+  requeue: (() => Promise<void>) | undefined,
+): Promise<"inline" | "done" | "held"> {
   const ids = { org_id: scope.orgId, workspace_id: scope.workspaceId, harness: scope.harness, session_id: scope.sessionId };
-  const { enqueued, identity } = await isolation.enqueue(scope);
+  const { enqueued, identity, source } = await isolation.enqueue(scope);
   if (!enqueued) {
     log.info("search index over-bound, large-read unavailable", { stage: "search-index", ...ids, reason: DEADLINE_OVER_BOUND, outcome: trigger, route: "inline" });
-    return false;
+    return "inline";
   }
-  // A marked scope whose job nobody claims (no worker, or a stalled one) gets the inline pass again, not up to
-  // SKIP_STATE_MAX_AGE_MS without search. Only past LARGE_READ_UNCLAIMED_MS from the mark, with the job still
-  // queued and no worker progress on any job in that window. A failed read of that state routes as before.
-  if (trigger === "marked" && isolation.progress && markedAtMs !== undefined) {
-    const age = Math.max(0, (isolation.now ?? Date.now)() - markedAtMs);
-    if (age > LARGE_READ_UNCLAIMED_MS) {
+  const routedLine = (state: string) => log.info("search index over-bound, routed to large-read", {
+    stage: "search-index", ...ids, reason: DEADLINE_OVER_BOUND, outcome: trigger, route: DEADLINE_ROUTE, state,
+    ...(trigger === "marked" ? { ...phase, duration_ms: Date.now() - started } : {}),
+  });
+  if (!isolation.progress) {
+    routedLine("routed");
+    if (isolation.jobState) {
       try {
-        const p = await isolation.progress(identity ?? scope, LARGE_READ_UNCLAIMED_MS);
-        if (p && p.state === "queued" && !p.workerSeen) {
-          log.warn("large-read job unclaimed", { stage: "large-read", ...ids, reason: "large_job_unclaimed", state: p.state, age_ms: age, route: "inline" });
-          return false;
-        }
+        const job = await isolation.jobState(identity ?? scope);
+        if (!job || job.state === "failed")
+          log.warn("large scope job will not be processed", { stage: "large-read", ...ids, state: job?.state ?? "missing", attempt: job?.attempts, reason: job ? "large_job_failed" : "large_job_missing" });
       } catch (error) {
         log.warn("large scope job state unavailable", { stage: "large-read", ...ids, ...errorFields(error) });
       }
     }
+    return "done";
   }
-  log.info("search index over-bound, routed to large-read", {
-    stage: "search-index", ...ids, reason: DEADLINE_OVER_BOUND, outcome: trigger, route: DEADLINE_ROUTE,
-    ...(trigger === "marked" ? { ...phase, duration_ms: Date.now() - started } : {}),
-  });
-  if (isolation.jobState) {
-    try {
-      const job = await isolation.jobState(identity ?? scope);
-      if (!job || job.state === "failed")
-        log.warn("large scope job will not be processed", { stage: "large-read", ...ids, state: job?.state ?? "missing", attempt: job?.attempts, reason: job ? "large_job_failed" : "large_job_missing" });
-    } catch (error) {
-      log.warn("large scope job state unavailable", { stage: "large-read", ...ids, ...errorFields(error) });
-    }
+  const age = Math.max(0, (isolation.now ?? Date.now)() - anchorMs);
+  let decision: HoldDecision;
+  try {
+    decision = decideHold(await isolation.progress(identity ?? scope), source, age);
+  } catch (error) {
+    log.warn("large scope job state unavailable", { stage: "large-read", ...ids, ...errorFields(error) });
+    decision = { kind: "hold", why: "queued" };
   }
-  return true;
+  if (decision.kind === "inline") {
+    log.warn("large-read job unclaimed", { stage: "large-read", ...ids, reason: `large_job_${decision.why}`, age_ms: age, route: "inline" });
+    return "inline";
+  }
+  if (decision.kind === "done") { routedLine("complete"); return "done"; }
+  if (decision.kind === "release") {
+    log.warn("large-read hold released", { stage: "large-read", ...ids, reason: "large_hold_max", state: "running", age_ms: age });
+    return "done";
+  }
+  if (!requeue) throw new Error("large-read hold and no requeue");
+  await requeue();
+  routedLine(decision.why === "running" ? "held_running" : "held_queued");
+  return "held";
 }
 
 export async function processBatch(records: readonly QueueRecord[], deps: ConsumerDeps): Promise<BatchResponse> {
@@ -435,9 +451,12 @@ export async function processBatch(records: readonly QueueRecord[], deps: Consum
         // SEARCH_INDEX_DEADLINE_ISOLATION_ENABLED=true only: a scope marked by an earlier stream_deadline pass goes to
         // the large-read job before any read or lock (one bounded ClickHouse read, one autocommit enqueue). A source
         // the enqueue reports unavailable (erased, blocked, no live pointer) runs the normal pass below.
+        // The hold's clock starts at the oldest upload the message carries (kept across requeues), else the mark.
+        const holdRequeue = deps.requeue ? () => deps.requeue!(manifestKey, carriedTime(covered)) : undefined;
         const mark = deps.deadlineIsolation ? await deadlineMarked(deps.deadlineIsolation, scope) : null;
         if (deps.deadlineIsolation && mark) {
-          if (await routeDeadlineScope(deps.deadlineIsolation, scope, "marked", phaseFields(), started, mark.atMs)) continue;
+          const routed = await routeDeadlineScope(deps.deadlineIsolation, scope, "marked", phaseFields(), started, knownOldest(covered) ?? mark.atMs, holdRequeue);
+          if (routed !== "inline") continue;
         }
         // SEARCH_INDEX_STREAMING_CH=1 only (the backport lineage's 6264d119 / 51f876b6): past the invocation's
         // stream deadline no scope of the batch is started (whole read or streamed); the rest are requeued. A
@@ -448,7 +467,7 @@ export async function processBatch(records: readonly QueueRecord[], deps: Consum
           log.info("search index past the batch deadline, requeued", { stage: "search-index", org_id: scope.orgId, session_id: scope.sessionId, reason: "stream_batch_deadline" });
           continue;
         }
-        const result = await indexSearchScope(scope, { ...deps.search, metrics: phase });
+        const result = await (deps.searchPass ?? indexSearchScope)(scope, { ...deps.search, metrics: phase });
         if (result.busy) {
           // The running pass may have read S3 before this event's write: run again later.
           if (!deps.requeue) throw new Error("scope busy and no requeue");
@@ -480,7 +499,7 @@ export async function processBatch(records: readonly QueueRecord[], deps: Consum
         // large-read job, after the pass returned (its transaction and scope lock are released).
         if (deps.deadlineIsolation && hitStreamDeadline(result)) {
           await markDeadline(deps.deadlineIsolation, scope);
-          await routeDeadlineScope(deps.deadlineIsolation, scope, "first_hit", phaseFields(), started);
+          await routeDeadlineScope(deps.deadlineIsolation, scope, "first_hit", phaseFields(), started, knownOldest(covered) ?? started, holdRequeue);
         }
         const lag = lagFields(covered, messageIds, messages, now());
         if (result.partial)

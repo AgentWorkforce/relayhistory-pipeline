@@ -46,13 +46,45 @@ export const DEADLINE_MARK_PREFIX = "deadline_over_bound/";
 export const DEADLINE_OVER_BOUND = "stream_deadline_over_bound";
 export const DEADLINE_ROUTE = "large-read";
 const MARK_TIMEOUT_MS = 5_000;
-/** A marked scope's job may sit unclaimed this long, with no worker progress anywhere, before the inline pass is used again. */
+/** A routed scope's own job may stay unclaimed this long after the oldest upload its message carries; then the inline pass runs. */
 export const LARGE_READ_UNCLAIMED_MS = 5 * 60 * 1000;
+/** A routed delivery is held at most this long while its job runs with a live lease; then it is acked (the worker finishes alone). */
+export const LARGE_READ_HOLD_MAX_MS = 30 * 60 * 1000;
+
+/** The source incarnation a job was enqueued for (capture_session_replay_pages source). */
+export interface LargeReadSource { epoch: string; fingerprint: string }
+/** One scope's job row as the hold reads it. */
+export interface LargeReadProgress { state: string; leaseLive: boolean; source: LargeReadSource }
+export type HoldDecision =
+  | { kind: "done" }
+  | { kind: "hold"; why: "queued" | "running" }
+  | { kind: "inline"; why: "unclaimed" | "failed" | "missing" }
+  | { kind: "release" };
+
+/**
+ * What a routed delivery does once its job's row is read, for the incarnation `target` the enqueue captured:
+ * - complete for `target`: done (the large read indexed this source; ack);
+ * - running with a live lease (the worker heartbeats it): hold, until LARGE_READ_HOLD_MAX_MS from `anchorMs`, then
+ *   release (ack, the live worker finishes alone);
+ * - failed: inline at once (never claimed again until the source changes);
+ * - no row: inline;
+ * - anything else (queued, superseded, complete for another incarnation, running with an expired lease): hold until
+ *   LARGE_READ_UNCLAIMED_MS from `anchorMs`, then inline.
+ * Only this job's row decides; no other job's progress enters.
+ */
+export function decideHold(p: LargeReadProgress | null, target: LargeReadSource | undefined, ageMs: number): HoldDecision {
+  if (!p) return { kind: "inline", why: "missing" };
+  const current = target !== undefined && p.source.epoch === target.epoch && p.source.fingerprint === target.fingerprint;
+  if (p.state === "complete" && current) return { kind: "done" };
+  if (p.state === "failed") return { kind: "inline", why: "failed" };
+  if (p.state === "running" && p.leaseLive) return ageMs > LARGE_READ_HOLD_MAX_MS ? { kind: "release" } : { kind: "hold", why: "running" };
+  return ageMs > LARGE_READ_UNCLAIMED_MS ? { kind: "inline", why: "unclaimed" } : { kind: "hold", why: "queued" };
+}
 
 export interface DeadlineIsolationDeps {
   ch: ClickHouseClient;
   /** sessions.enqueue_session_large_read for the scope (enqueueLargeRead). */
-  enqueue: (scope: SessionScope) => Promise<{ enqueued: boolean; identity?: SessionScope }>;
+  enqueue: (scope: SessionScope) => Promise<{ enqueued: boolean; identity?: SessionScope; source?: LargeReadSource }>;
   /**
    * The routed scope's job row (large-read-worker.ts largeReadJobState): a `failed` job is logged as a warn, since
    * it is not claimed again until the source changes and the mark keeps the inline pass off for up to
@@ -60,13 +92,12 @@ export interface DeadlineIsolationDeps {
    */
   jobState?: (scope: SessionScope) => Promise<{ state: string; attempts: number } | null>;
   /**
-   * The routed job's queue state and whether any large-read worker made progress on any job within `withinMs`
-   * (largeReadProgress). With it, a marked delivery whose mark is older than LARGE_READ_UNCLAIMED_MS, whose job is
-   * still `queued`, and with no worker progress anywhere in that window falls back to the inline pass (warn
-   * "large-read job unclaimed"): a missing or stalled worker degrades to today's behaviour, not to an unsearchable
-   * scope for the mark's lifetime. Absent: no check, always routed.
+   * This scope's job row (largeReadProgress), read after each enqueue. With it, a routed delivery is held (requeued as a
+   * NEW message, never acked without a successor) until its own job is complete for the incarnation the enqueue
+   * captured; a job not claimed within LARGE_READ_UNCLAIMED_MS of the oldest upload the message carries gets the
+   * inline pass instead (decideHold). Absent: routed and acked at once, as before.
    */
-  progress?: (scope: SessionScope, withinMs: number) => Promise<{ state: string; workerSeen: boolean } | null>;
+  progress?: (scope: SessionScope) => Promise<LargeReadProgress | null>;
   /** Clock for the mark's age (default Date.now). */
   now?: () => number;
 }
@@ -129,29 +160,27 @@ export async function markDeadline(deps: DeadlineIsolationDeps, scope: SessionSc
  * `identity` is the job's canonical scope (jobs are keyed by canonical session id), only when it names the same
  * org, workspace and harness.
  */
-export async function enqueueLargeRead(db: SqlExecutor, s: SessionScope): Promise<{ enqueued: boolean; identity?: SessionScope }> {
-  const r = (await db.query<{ r: { enqueued?: unknown; identity?: { orgId?: unknown; workspaceId?: unknown; source?: unknown; sessionId?: unknown } } }>(
+export async function enqueueLargeRead(db: SqlExecutor, s: SessionScope): Promise<{ enqueued: boolean; identity?: SessionScope; source?: LargeReadSource }> {
+  const r = (await db.query<{ r: { enqueued?: unknown; identity?: { orgId?: unknown; workspaceId?: unknown; source?: unknown; sessionId?: unknown }; source?: { epoch?: unknown; fingerprint?: unknown } } }>(
     "SELECT sessions.enqueue_session_large_read($1,$2,$3,$4) r", [s.orgId, s.workspaceId, s.harness, s.sessionId])).rows[0]?.r;
   if (!r || typeof r.enqueued !== "boolean") throw new Error("large_enqueue_invalid");
   const i = r.identity;
   if (!r.enqueued || typeof i?.sessionId !== "string" || !i.sessionId || i.orgId !== s.orgId || i.workspaceId !== s.workspaceId || i.source !== s.harness)
     return { enqueued: r.enqueued };
-  return { enqueued: true, identity: { ...s, sessionId: i.sessionId } };
+  const src = r.source;
+  const source = src && (typeof src.epoch === "string" || typeof src.epoch === "number") && typeof src.fingerprint === "string"
+    ? { epoch: String(src.epoch), fingerprint: src.fingerprint } : undefined;
+  return { enqueued: true, identity: { ...s, sessionId: i.sessionId }, ...(source ? { source } : {}) };
 }
 
-/**
- * The job row's state for `s` (its canonical identity) and, in the same statement, whether a worker made progress on
- * any job within `withinMs`: a job updated in that window that is not a fresh enqueue (claimed, finished, retried or
- * failed). Enqueue alone (state queued, attempts 0, no error) never counts as progress.
- */
-export async function largeReadProgress(db: SqlExecutor, s: SessionScope, withinMs: number): Promise<{ state: string; workerSeen: boolean } | null> {
-  const row = (await db.query<{ state: string; worker_seen: boolean }>(
-    `SELECT j.state, EXISTS(SELECT 1 FROM sessions.session_large_read_jobs w
-                             WHERE w.updated_at > clock_timestamp() - make_interval(secs => $5::double precision / 1000)
-                               AND (w.state <> 'queued' OR w.attempts > 0 OR w.last_error IS NOT NULL)) AS worker_seen
-       FROM sessions.session_large_read_jobs j
-      WHERE j.org_id=$1 AND j.workspace_id=$2 AND j.harness=$3 AND j.session_id=$4`,
-    [s.orgId, s.workspaceId, s.harness, s.sessionId, withinMs],
+/** One scope's job row (its canonical identity): state, whether a running lease is still live, and its source incarnation. */
+export async function largeReadProgress(db: SqlExecutor, s: SessionScope): Promise<LargeReadProgress | null> {
+  const row = (await db.query<{ state: string; lease_live: boolean; source_epoch: string; source_fingerprint: string }>(
+    `SELECT state, (state = 'running' AND lease_expires_at > clock_timestamp()) AS lease_live,
+            source_epoch::text AS source_epoch, source_fingerprint
+       FROM sessions.session_large_read_jobs
+      WHERE org_id=$1 AND workspace_id=$2 AND harness=$3 AND session_id=$4`,
+    [s.orgId, s.workspaceId, s.harness, s.sessionId],
   )).rows[0];
-  return row ? { state: String(row.state), workerSeen: row.worker_seen === true } : null;
+  return row ? { state: String(row.state), leaseLive: row.lease_live === true, source: { epoch: String(row.source_epoch), fingerprint: String(row.source_fingerprint) } } : null;
 }
