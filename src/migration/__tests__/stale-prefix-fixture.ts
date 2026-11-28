@@ -96,8 +96,12 @@ export function attestation(now: number, over: Partial<ProtectionAttestation> = 
 export const BUCKET_SHA = sha("b");
 /** The synthetic target both the verifier and the execute run under (state-file identity, verifier commit). */
 export const TARGET = { stateIdentity: "state-synthetic", verifierCommit: "0123456789abcdef0123456789abcdef01234567" };
-/** The approved values an owner entry would quote for a receipt: its allowlist digest and planned item count. */
+/**
+ * The approved values an owner entry would quote for a receipt (SYNTHETIC: tests stand in for the owner): the
+ * allowlist digest, the identity count and the planned prefix count. The multi-prefix approval is never implied:
+ * a test that needs it passes `approvedPrefixCount` itself.
+ */
 export function approvedFor(r: VerificationReceipt) {
   const planned = r.identities.reduce((n, i) => n + i.items.length, 0);
-  return { approvedAllowlistSha256: allowlistDigest(r.allowlist), approvedMax: planned, max: planned };
+  return { approvedAllowlistSha256: allowlistDigest(r.allowlist), approvedIdentityCount: r.allowlist.length, approvedMax: planned, max: planned };
 }

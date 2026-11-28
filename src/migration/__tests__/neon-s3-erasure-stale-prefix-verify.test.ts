@@ -300,8 +300,8 @@ describe("receipt fence on execute", () => {
     await expect(f.execute(one, { onlyIdentities: [ID("sess-1"), ID("sess-2")] })).rejects.toMatchObject({ code: "stale_prefix_receipt_not_all_pass" });
     await expect(f.execute(both, { approvedAllowlistSha256: NO_ID })).rejects.toMatchObject({ code: "stale_prefix_approved_allowlist_mismatch" });
     await expect(f.execute(both, { approvedMax: undefined })).rejects.toMatchObject({ code: "stale_prefix_mode_requires_approval" });
-    await expect(f.execute(both, { max: 1, approvedMax: 1 })).rejects.toMatchObject({ code: "stale_prefix_max_mismatch" });
-    await expect(f.execute(both, { approvedMax: 3 })).rejects.toMatchObject({ code: "stale_prefix_max_mismatch" });
+    await expect(f.execute(both, { max: 1, approvedMax: 1 })).rejects.toMatchObject({ code: "stale_prefix_cap_units_mismatch" });
+    await expect(f.execute(both, { approvedMax: 3 })).rejects.toMatchObject({ code: "stale_prefix_cap_units_mismatch" });
     expect(f.s.deletes).toEqual([]);
   });
 
@@ -313,9 +313,10 @@ describe("receipt fence on execute", () => {
     f.st.enqueueErasure([{ key: older, kind: "prefix", org_id: ORG, reason: "stale_prefix" }], NOW - 30_000);
     const receipt = await f.verify();
     expect(receipt.identities[0]!.items.map((i) => i.old_prefix_sha256)).toEqual([sha(older), sha(m.oldP)]);
-    await expect(f.execute(receipt, { max: 1, approvedMax: 1 })).rejects.toMatchObject({ code: "stale_prefix_max_mismatch" });
+    await expect(f.execute(receipt, { max: 1, approvedMax: 1 })).rejects.toMatchObject({ code: "stale_prefix_cap_units_mismatch" });
     expect(f.s.deletes).toEqual([]);
-    const r = await f.execute(receipt);
+    // SYNTHETIC: the multi-prefix mode under its own (test-supplied) approval.
+    const r = await f.execute(receipt, { approvedPrefixCount: 2 });
     expect(r).toMatchObject({ ok: true, erased: 2, versionsDeleted: 6 });
     expect(r.fenced!.map((x) => x.outcome)).toEqual(["completed", "completed"]);
   });
@@ -513,10 +514,12 @@ describe("receipt fence on execute", () => {
     expect(code([...mode, "--execute", "--verified-receipt", "r.json"])).toBe("stale_prefix_execute_requires_attestation");
     const files = [...mode, "--execute", "--verified-receipt", "r.json", "--protection-attestation", "a.json"];
     expect(code(files)).toBe("stale_prefix_execute_requires_approval");
-    const approved = [...files, "--receipt-sha256", NO_ID, "--attestation-sha256", NO_ID, "--approved-allowlist-sha256", NO_ID, "--approved-max", "1"];
+    const approved = [...files, "--receipt-sha256", NO_ID, "--attestation-sha256", NO_ID, "--approved-allowlist-sha256", NO_ID, "--approved-max", "1", "--approved-identity-count", "1"];
     expect(code(approved)).toBe("stale_prefix_execute_requires_approval"); // --max too
     expect(code([...approved, "--max", "1"])).toBeNull();
     expect(code([...approved.slice(0, -2), "--max", "1"])).toBe("stale_prefix_execute_requires_approval");
+    expect(code([...approved.slice(0, -4), "--approved-identity-count", "1", "--max", "1"])).toBe("stale_prefix_execute_requires_approval");
+    expect(code([...approved, "--max", "1", "--approved-prefix-count", "0"])).toBe("stale_prefix_max_invalid");
     expect(code([...files, "--receipt-sha256", "ABC"])).toBe("stale_prefix_sha256_invalid");
     expect(code([...mode, "--receipt-sha256", NO_ID])).toBe("stale_prefix_receipt_without_execute");
     expect(code([...mode, "--verified-receipt", "r.json"])).toBe("stale_prefix_receipt_without_execute");
@@ -677,24 +680,26 @@ describe("provenance and target binding", () => {
     expect(f.row(m.oldP)).toMatchObject({ attempts: 0 });
   });
 
-  test("attestation freshness is re-checked before EVERY delete: it expiring after delete 1 stops with partial", async () => {
+  test("attestation validity bounds the hard deadline: once consumed after delete 1, the next delete is not issued (partial, stale_prefix_deadline)", async () => {
     const f = await fixture();
     f.dateMove();
     const receipt = await f.verify();
     let n = 0;
-    // Verified 59 min before the run; delete 1 takes 2 min, so the attestation is 61 min old at delete 2.
-    f.s.onDelete = () => { if (++n === 1) f.clock.now = NOW + 2 * 60_000; };
-    const rep = (await f.execute(receipt, { attestation: attestation(NOW - 59 * 60_000) })).fenced![0]!;
-    expect(rep).toMatchObject({ outcome: "partial", reason: "stale_prefix_protection_unproven", deleted: 1 });
+    // Verified 50 min before the run: protected until NOW + 10 min - 2 x 30 s. Delete 1 takes 9 min.
+    f.s.onDelete = () => { if (++n === 1) f.clock.now = NOW + 9 * 60_000; };
+    const rep = (await f.execute(receipt, { attestation: attestation(NOW - 50 * 60_000) })).fenced![0]!;
+    expect(rep).toMatchObject({ outcome: "partial", reason: "stale_prefix_deadline", deleted: 1 });
     expect(rep.versions.map((v) => v.outcome)).toEqual(["deleted", "not_attempted", "not_attempted"]);
+    expect(f.s.deletes).toHaveLength(1);
   });
 
   test("lease TTL bound from the request deadline x attempts through the LAST delete: below it, the batch stops before that delete", async () => {
-    // 3 deletes x (old page + 2 survivor pages + delete) + post-checks, at a 10-minute deadline, exceeds the 2 h lease TTL.
+    // Initial relist + 3 deletes x (old page + survivor page + delete) + 2 post-checks = 12 requests; at an 11-minute
+    // request deadline that is 132 min, beyond the 2 h lease TTL.
     const f = await fixture();
     const m = f.dateMove();
     const receipt = await f.verify();
-    const slow = f.s.eraser({ requestDeadlineMs: 10 * 60_000 });
+    const slow = f.s.eraser({ requestDeadlineMs: 11 * 60_000 });
     const r = await f.execute(receipt, { fence: slow });
     expect(r).toMatchObject({ ok: false, refused: "stale_prefix_lease_ttl_insufficient", erased: 0 });
     expect(r.fenced![0]!.versions.every((v) => v.outcome === "not_attempted")).toBe(true);
@@ -725,5 +730,159 @@ describe("provenance and target binding", () => {
     const rg = (await g.execute(rec)).fenced![0]!;
     expect(rg).toMatchObject({ outcome: "partial", reason: "stale_prefix_lease_ttl_insufficient", deleted: 1 });
     expect(rg.versions.map((v) => v.outcome)).toEqual(["deleted", "not_attempted", "not_attempted"]);
+  });
+});
+
+describe("cap units (identities vs prefixes)", () => {
+  const twoPrefixes = async () => {
+    const f = await fixture();
+    f.dateMove();
+    const older = pfx("2026/10/31");
+    seedBodies(f.s, older, OLD - 1000);
+    f.st.enqueueErasure([{ key: older, kind: "prefix", org_id: ORG, reason: "stale_prefix" }], NOW - 30_000);
+    return { f, receipt: await f.verify() };
+  };
+
+  test("DEFAULT rule: 1 identity with 2 prefixes, every CLI value matching the receipt, no separate multi-prefix approval: refused, zero deletes", async () => {
+    const { f, receipt } = await twoPrefixes();
+    expect(receipt.identities[0]!.item_count).toBe(2);
+    await expect(f.execute(receipt, { max: 2, approvedMax: 2, approvedIdentityCount: 1 })).rejects.toMatchObject({ code: "stale_prefix_cap_units_mismatch" });
+    expect(f.s.deletes).toEqual([]);
+  });
+
+  test("approved max equal to the IDENTITY count (1, not 2) for 2 prefixes: refused, zero deletes (never raised from the receipt)", async () => {
+    const { f, receipt } = await twoPrefixes();
+    await expect(f.execute(receipt, { max: 1, approvedMax: 1, approvedIdentityCount: 1 })).rejects.toMatchObject({ code: "stale_prefix_cap_units_mismatch" });
+    await expect(f.execute(receipt, { max: 1, approvedMax: 1, approvedIdentityCount: 1, approvedPrefixCount: 2 })).rejects.toMatchObject({ code: "stale_prefix_cap_units_mismatch" });
+    expect(f.s.deletes).toEqual([]);
+  });
+
+  test("SYNTHETIC multi-prefix case under its own separate approval: approved max 2, identity count 1, --approved-prefix-count 2 passes the gate and erases both", async () => {
+    const { f, receipt } = await twoPrefixes();
+    expect(await f.execute(receipt, { max: 2, approvedMax: 2, approvedIdentityCount: 1, approvedPrefixCount: 2 })).toMatchObject({ ok: true, erased: 2 });
+  });
+
+  test("identity-count and per-identity item-count drift refuse with zero deletes", async () => {
+    const f = await fixture();
+    f.dateMove();
+    const receipt = await f.verify();
+    await expect(f.execute(receipt, { approvedIdentityCount: 2 })).rejects.toMatchObject({ code: "stale_prefix_cap_units_mismatch" });
+    const drifted = JSON.parse(JSON.stringify(receipt)) as VerificationReceipt;
+    drifted.identities[0]!.item_count = 2;
+    await expect(f.execute(drifted)).rejects.toMatchObject({ code: "stale_prefix_cap_units_mismatch" });
+    expect(() => parseReceipt(JSON.stringify(drifted))).toThrow();
+    expect(f.s.deletes).toEqual([]);
+  });
+});
+
+describe("two identities: ordering and isolation", () => {
+  const spy = (f: Awaited<ReturnType<typeof fixture>>) => {
+    const fence = f.s.eraser();
+    const calls: string[] = [];
+    const del = fence.deleteVersion;
+    fence.deleteVersion = (k, v) => (calls.push(k), del(k, v));
+    return { fence, calls };
+  };
+  for (const missing of ["first", "last"] as const)
+    test(`a missing receipt entry for the ${missing} identity refuses the whole batch: zero deleteVersion calls`, async () => {
+      const f = await fixture();
+      const a = f.dateMove(undefined, undefined, "sess-1", NOW - 60_000);
+      const b = f.dateMove(undefined, undefined, "sess-2", NOW - 50_000);
+      const receipt = await f.verify([ID("sess-1"), ID("sess-2")]);
+      const gone = missing === "first" ? a.oldP : b.oldP;
+      f.st.db.prepare("UPDATE erasures SET enqueued_at = enqueued_at + 1 WHERE key = ?").run(gone);
+      const { fence, calls } = spy(f);
+      const r = await f.execute(receipt, { fence });
+      expect(r).toMatchObject({ ok: false, refused: "stale_prefix_receipt_missing", erased: 0 });
+      expect(calls).toEqual([]);
+      expect([f.s.count(a.oldP), f.s.count(b.oldP)]).toEqual([3, 3]);
+    });
+
+  test("the FIRST identity loses its survivor mid-run: the batch stops; the SECOND identity gets zero deleteVersion calls and an unchanged queue row", async () => {
+    const f = await fixture();
+    const a = f.dateMove(undefined, undefined, "sess-1", NOW - 60_000);
+    const b = f.dateMove(undefined, undefined, "sess-2", NOW - 50_000);
+    const receipt = await f.verify([ID("sess-1"), ID("sess-2")]);
+    const bRow = JSON.stringify(f.row(b.oldP));
+    const { fence, calls } = spy(f);
+    let n = 0;
+    f.s.onDelete = () => { if (++n === 1) f.s.mark(a.newCopy.chunks[0]!.key, NOW - 1); };
+    const r = await f.execute(receipt, { fence });
+    expect(r).toMatchObject({ ok: false, erased: 0, stoppedBy: "failed" });
+    expect(r.fenced!.map((x) => [x.outcome, x.deleted])).toEqual([["partial", 1], ["refused_before_delete", 0]]);
+    expect(calls.filter((k) => k.startsWith(b.oldP))).toEqual([]);
+    expect(calls).toHaveLength(1);
+    expect(JSON.stringify(f.row(b.oldP))).toBe(bRow);
+    expect(f.s.count(b.oldP)).toBe(3);
+    expect(() => stalePassStatus(r, false)).toThrow();
+  });
+});
+
+describe("hard deadline", () => {
+  test("short pages after delete 1 (1 entry per page) on a fake clock push past the deadline: stops before the next delete, partial, rest not_attempted", async () => {
+    const f = await fixture();
+    f.dateMove();
+    const receipt = await f.verify();
+    let n = 0, slow = false;
+    f.s.rewrite = (_c, xml) => { if (slow) f.clock.now += 20 * 60_000; return xml; };
+    f.s.onDelete = () => { if (++n === 1) { slow = true; f.s.pageSize = 1; } };
+    const rep = (await f.execute(receipt)).fenced![0]!;
+    expect(rep).toMatchObject({ outcome: "partial", reason: "stale_prefix_deadline", deleted: 1 });
+    expect(rep.versions.map((v) => v.outcome)).toEqual(["deleted", "not_attempted", "not_attempted"]);
+    expect(f.s.deletes).toHaveLength(1);
+  });
+
+  test("a slow multipage NONCURRENT survivor history consumes the protected time before delete 1: refused, zero deletes", async () => {
+    const f = await fixture();
+    const m = f.dateMove();
+    const k = m.newCopy.chunks[0]!.key, body = m.newCopy.chunks[0]!.body;
+    // Ten older (noncurrent) versions under the current pin.
+    f.s.keys.set(k, [...f.s.keys.get(k)!, ...Array.from({ length: 10 }, (_, i) => ({ id: `v-old-${i}`, at: OLD - 1000 * (i + 1), body }))]);
+    const receipt = await f.verify();
+    expect(receipt.status).toBe("PASS");
+    f.s.pageSize = 1;
+    f.s.rewrite = (_c, xml) => { f.clock.now += 8 * 60_000; return xml; };
+    const r = await f.execute(receipt);
+    expect(r).toMatchObject({ ok: false, refused: "stale_prefix_deadline", erased: 0 });
+    expect(r.fenced![0]!.versions.every((v) => v.outcome === "not_attempted")).toBe(true);
+    expect(f.s.deletes).toEqual([]);
+    expect(f.s.count(m.oldP)).toBe(3);
+  });
+
+  test("a fence listing beyond its page budget aborts and refuses, zero deletes", async () => {
+    const f = await fixture();
+    const m = f.dateMove();
+    const k = m.newCopy.chunks[0]!.key, body = m.newCopy.chunks[0]!.body;
+    f.s.keys.set(k, [...f.s.keys.get(k)!, ...Array.from({ length: 25 }, (_, i) => ({ id: `v-old-${i}`, at: OLD - 1000 * (i + 1), body }))]);
+    const receipt = await f.verify();
+    f.s.pageSize = 1;
+    const r = await f.execute(receipt);
+    expect(r).toMatchObject({ ok: false, refused: "stale_prefix_listing_budget", erased: 0 });
+    expect(f.s.deletes).toEqual([]);
+  });
+
+  test("issuance boundary on a fake clock: a delete whose timeout just fits is issued; one ms later it is NOT issued (stale_prefix_deadline, exact accounting)", async () => {
+    // Protected until NOW + 1 h (attestation) - 2 x 30 s; one delete's worst case is 30 s.
+    const cutoff = NOW + 60 * 60_000 - 60_000;
+    for (const [at, issued] of [[cutoff - 30_000, true], [cutoff - 30_000 + 1, false]] as const) {
+      const f = await fixture();
+      const m = f.dateMove();
+      const receipt = await f.verify();
+      let armed = false;
+      // The clock reaches `at` during the LAST listing of delete 2's fence check (the survivor listing).
+      f.s.rewrite = (_c, xml) => { if (armed && xml.includes(`<Prefix>${m.newP}</Prefix>`)) { armed = false; f.clock.now = at; } return xml; };
+      let n = 0;
+      f.s.onDelete = () => { if (++n === 1) armed = true; };
+      const r = await f.execute(receipt);
+      const rep = r.fenced![0]!;
+      if (issued) {
+        expect(f.s.deletes.length).toBeGreaterThanOrEqual(2);
+        expect(rep.versions[1]!.outcome).toBe("deleted");
+      } else {
+        expect(f.s.deletes).toHaveLength(1);
+        expect(rep).toMatchObject({ outcome: "partial", reason: "stale_prefix_deadline", deleted: 1 });
+        expect(rep.versions.map((v) => v.outcome)).toEqual(["deleted", "not_attempted", "not_attempted"]);
+      }
+    }
   });
 });

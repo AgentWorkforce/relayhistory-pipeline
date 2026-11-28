@@ -545,7 +545,7 @@ export function createS3Eraser(cfg: S3EraserConfig): Eraser & PreservedVersionEr
       if (!prefix.endsWith("/")) throw coded("erasure_prefix_shape", "a prefix ends in /");
       return [...new Set((await versions(prefix)).map((v) => v.key))];
     },
-    listVersions: (prefix) => strictInventory(fetchPage, prefix),
+    listVersions: (prefix, opts) => strictInventory(fetchPage, prefix, opts?.beforeRequest),
     requestDeadlineMs: deadlineMs,
     requestAttempts: S3_REQUEST_ATTEMPTS,
     // Exactly one version by id: never a plain DELETE (that would only add a delete marker on a versioned bucket).
@@ -575,7 +575,8 @@ export function createS3Eraser(cfg: S3EraserConfig): Eraser & PreservedVersionEr
 
 /** A strict, complete, bounded version inventory of one directory prefix (every version and delete marker). */
 export interface VersionLister {
-  listVersions(prefix: string): Promise<ListedVersion[]>;
+  /** `beforeRequest` runs before EVERY page request (the fence's hard deadline); throwing stops the listing. */
+  listVersions(prefix: string, opts?: { beforeRequest?: () => void }): Promise<ListedVersion[]>;
 }
 /** Read-only: the lister plus GET of one exact object version (bounded bytes). Needs s3:GetObjectVersion. */
 export interface VersionReader extends VersionLister {
@@ -610,7 +611,7 @@ export function isReceiptFence(e: unknown): e is ReceiptFence {
  * last entry), no duplicate across pages, no cursor cycle, and the same hard bounds (10,000 versions, 100 pages); any
  * breach throws, never a short list.
  */
-export async function strictInventory(fetchPage: PageFetcher, prefix: string): Promise<ListedVersion[]> {
+export async function strictInventory(fetchPage: PageFetcher, prefix: string, beforeRequest?: () => void): Promise<ListedVersion[]> {
   if (!prefix.endsWith("/") || prefix.split("/").some((seg) => seg === "." || seg === ".."))
     throw coded("erasure_prefix_shape", "a prefix ends in / and has no dot segment");
   const out: ListedVersion[] = [];
@@ -618,6 +619,7 @@ export async function strictInventory(fetchPage: PageFetcher, prefix: string): P
   let keyMarker: string | undefined, versionMarker: string | undefined, pages = 0;
   for (;;) {
     if (pages >= ERASE_RUN_MAX_PAGES) throw coded("erasure_inventory", "version pagination is unbounded");
+    beforeRequest?.();
     const page = await fetchPage(prefix, keyMarker, versionMarker);
     pages++;
     checkPage(prefix, page, keyMarker, versionMarker);
@@ -689,7 +691,7 @@ async function readVersioning(url: (k?: string) => URL, request: Requester): Pro
 export function createS3VersionReader(cfg: S3EraserConfig): VersionReader & BucketProtectionReader {
   const { url, request, fetchPage } = s3Core(cfg, "reader");
   return {
-    listVersions: (prefix) => strictInventory(fetchPage, prefix),
+    listVersions: (prefix, opts) => strictInventory(fetchPage, prefix, opts?.beforeRequest),
     async getVersion(key, versionId, maxBytes) {
       if (!key || key.endsWith("/") || key.split("/").some((seg) => seg === "." || seg === "..")) throw coded("erasure_key_shape", "a GET names one object");
       if (!versionId || /[\x00-\x1f\x7f]/u.test(versionId)) throw coded("erasure_key_shape", "an exact version id is required");
