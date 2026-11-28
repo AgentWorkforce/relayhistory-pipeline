@@ -223,6 +223,8 @@ export function holdId(scope: SessionScope, source: LargeReadSource, seq: number
 export type ExpectedEnqueue =
   | { kind: "enqueued"; changed: boolean; state: string; identity: SessionScope; source: LargeReadSource }
   | { kind: "obsolete"; reason: "incarnation_moved" | "newer_job" | "canonical_moved" | "other" }
+  /** No job for exactly the expected incarnation (none, or an older one's): no authority to create or advance it. */
+  | { kind: "no_job"; reason: "no_job" | "no_exact_job" }
   | { kind: "unavailable" };
 
 /**
@@ -240,6 +242,7 @@ export async function enqueueLargeReadExpected(db: SqlExecutor, s: SessionScope,
       const reason = r.reason === "incarnation_moved" || r.reason === "newer_job" || r.reason === "canonical_moved" ? r.reason : "other";
       return { kind: "obsolete", reason };
     }
+    if (r.reason === "no_job" || r.reason === "no_exact_job") return { kind: "no_job", reason: r.reason };
     return { kind: "unavailable" };
   }
   const i = r.identity as { sessionId?: unknown; orgId?: unknown; workspaceId?: unknown; source?: unknown } | undefined;

@@ -8,8 +8,9 @@
  * Recorded separately in each case: the job row's mutation (row_to_json before/after), its lease state, and the
  * committed effect (what claim_session_large_read then does).
  *
- *   1  A captured, then B commits (epoch moves), slot empty: A inserts a STALE A job; claim refuses it (superseded);
- *      B's ordinary enqueue then sets B. (Stale A work is possible: the contract decision is Pipeline's.)
+ *   1  parked A, empty slot, B commits: A creates nothing (no_job, Pipeline ae37e77b3809: only an existing exact
+ *      job may be acted on); B's originating route creates B. 1b: A's own superseded job is only re-queued (claim
+ *      supersedes it again); 1c: an older incarnation's job is never advanced (no_exact_job).
  *   2  A captured, then B commits AND B's job is claimed (leased): A writes nothing; B's row and lease byte-identical.
  *   3  same epoch, different fingerprint (a pending-row move): A captured, then A' commits and A' is enqueued: A
  *      writes nothing (newer_job); the A' row byte-identical.
@@ -75,7 +76,7 @@ const gateOn = (c: Conn) => c.query("SELECT set_config('rh.large_read_test_gate'
 const holdGate = (c: Conn) => c.query("SELECT pg_advisory_xact_lock($1)", [GATE]);
 
 describe.skipIf(!url)("capture-bound large-read enqueue prototype (real PostgreSQL, two backends)", () => {
-  test("1. A captured, then B commits, slot empty: stale A job inserted; claim refuses it; B's ordinary enqueue sets B", async () => {
+  test("1. parked A, empty slot, B commits: A creates NOTHING (no_job); zero lease change; B's originating route then creates B", async () => {
     const { o, pair } = await rig();
     const A = await capture(o);
     await gateOn(pair.b);
@@ -84,15 +85,39 @@ describe.skipIf(!url)("capture-bound large-read enqueue prototype (real PostgreS
       holder: pair.a, waiter: pair.b, hold: holdGate, wait: (c) => expected(c, A),
       whileBlocked: async () => { await moveEpoch(o); B = await capture(o); },
     });
-    expect(r.receipt.waiting.some((l) => l.locktype === "advisory" && !l.granted)).toBe(true);
-    expect(r.receipt.holderPid).toBe(pair.a.pid);
+    expect(r.receipt.waiting.some((l) => l.locktype === "advisory" && !l.granted) && r.receipt.holderPid === pair.a.pid).toBe(true);
     expect(B!.epoch).not.toBe(A.epoch);
-    expect(r.waited).toMatchObject({ ok: true, value: { enqueued: true, changed: true, state: "queued" } });
-    expect(await jobRow(o)).toEqual({ state: "queued", epoch: A.epoch, fp: A.fingerprint, leased: false }); // the stale A job
-    expect(await claim(o)).toBeNull(); // committed effect: claim never runs stale A
-    expect(await jobRow(o)).toMatchObject({ state: "superseded", epoch: A.epoch });
-    expect(await ordinary(o)).toMatchObject({ enqueued: true, changed: true });
+    expect(r.waited).toMatchObject({ ok: true, value: { enqueued: false, reason: "no_job" } });
+    expect(await job(o)).toEqual([]); // zero insertion into the empty slot, so no lease either
+    expect(await claim(o)).toBeNull();
+    expect(await ordinary(o)).toMatchObject({ enqueued: true, changed: true }); // B's own originating route
     expect(await jobRow(o)).toEqual({ state: "queued", epoch: B!.epoch, fp: B!.fingerprint, leased: false });
+  });
+
+  test("1b. parked A, its own exact job superseded, B commits: A only re-queues its own superseded job (which claim supersedes again); never writes B", async () => {
+    const { o, pair } = await rig();
+    const A = await capture(o);
+    await ordinary(o);
+    await o.query("UPDATE sessions.session_large_read_jobs SET state='superseded'");
+    await gateOn(pair.b);
+    const r = await expectBlocks(pair, {
+      holder: pair.a, waiter: pair.b, hold: holdGate, wait: (c) => expected(c, A),
+      whileBlocked: async () => { await moveEpoch(o); },
+    });
+    expect(r.waited).toMatchObject({ ok: true, value: { enqueued: true, changed: true, state: "queued" } });
+    expect(await jobRow(o)).toEqual({ state: "queued", epoch: A.epoch, fp: A.fingerprint, leased: false });
+    expect(await claim(o)).toBeNull();
+    expect(await jobRow(o)).toMatchObject({ state: "superseded", epoch: A.epoch });
+  });
+
+  test("1c. an older incarnation's job, A current: no_exact_job, row byte-identical (no authority to advance it)", async () => {
+    const { o } = await rig();
+    await ordinary(o); // Z's job
+    await moveEpoch(o);
+    const A = await capture(o);
+    const before = await job(o);
+    expect(await expected(o, A)).toMatchObject({ enqueued: false, reason: "no_exact_job" });
+    expect(await job(o)).toEqual(before);
   });
 
   test("2. A captured, then B commits and B's job is claimed (leased): A writes nothing; B's row and lease byte-identical", async () => {
@@ -181,7 +206,7 @@ describe.skipIf(!url)("capture-bound large-read enqueue prototype (real PostgreS
     const { o } = await rig();
     await o.query("UPDATE sessions.session_index SET raw_bytes=67108865 WHERE org_id=$1", [S.org]);
     const A = await capture(o);
-    expect(await expected(o, A)).toMatchObject({ enqueued: true, changed: true });
+    expect(await ordinary(o)).toMatchObject({ enqueued: true, changed: true }); // A's originating route
     await moveEpoch(o);
     const B = await capture(o);
     expect(await claim(o)).toBeNull();
@@ -195,7 +220,9 @@ describe.skipIf(!url)("capture-bound large-read enqueue prototype (real PostgreS
     const db = { query: (q: string, p?: unknown[]) => o.query(q, p as unknown[]) } as never;
     const scope = { orgId: S.org, workspaceId: S.ws, harness: S.harness, sessionId: S.session };
     const A = await capture(o);
-    expect(await enqueueLargeReadExpected(db, scope, A)).toMatchObject({ kind: "enqueued", changed: true, state: "queued", identity: { sessionId: "large:replay" }, source: A });
+    expect(await enqueueLargeReadExpected(db, scope, A)).toEqual({ kind: "no_job", reason: "no_job" });
+    await ordinary(o);
+    expect(await enqueueLargeReadExpected(db, scope, A)).toMatchObject({ kind: "enqueued", changed: false, state: "queued", identity: { sessionId: "large:replay" }, source: A });
     await o.query("UPDATE sessions.session_large_read_jobs SET state='failed'");
     expect(await enqueueLargeReadExpected(db, scope, A)).toMatchObject({ kind: "enqueued", changed: false, state: "failed" });
     await moveEpoch(o);
@@ -229,7 +256,7 @@ describe.skipIf(!url)("capture-bound large-read enqueue prototype (real PostgreS
   test("11. source change after claim: the worker's heartbeat refuses (lease lost, no publication path); the row is not rewritten", async () => {
     const { o } = await rig();
     const A = await capture(o);
-    expect(await expected(o, A)).toMatchObject({ enqueued: true, changed: true });
+    expect(await ordinary(o)).toMatchObject({ enqueued: true, changed: true });
     const claimed = await claim(o);
     expect(claimed).toMatchObject({ source: A });
     const nonce = claimed.leaseNonce as string;

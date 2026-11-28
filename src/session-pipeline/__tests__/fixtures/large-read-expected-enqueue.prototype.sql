@@ -10,17 +10,15 @@
 --  1. c := capture_session_replay_pages(...). Unavailable (no live pointer) or blocked: {enqueued:false,
 --     reason:'source_unavailable'}. (epoch, fingerprint) other than the expected: {enqueued:false, obsolete:true}.
 --     Neither mutates anything.
---  2. One statement writes the job for the VALIDATED incarnation, taken from c (never captured again):
---     INSERT ... ON CONFLICT DO UPDATE (the same columns enqueue_session_large_read sets) WHERE the stored job is
---     for an older epoch, or is the same incarnation superseded. Epochs are nextval(session_replay_epoch_seq), so a
---     larger epoch is a newer incarnation of the scope.
---  3. No row written: the stored row decides. Same incarnation: {enqueued:true, changed:false} (the job, running or
---     leased, untouched). Newer epoch, or same epoch with another fingerprint: {enqueued:false, obsolete:true}.
--- So the only job this function can write is the expected incarnation's, a newer job is never regressed and its
--- lease never cleared. Source currency is NOT asserted: if the source moves after step 1, the job written is the
--- (now stale) expected incarnation's; claim_session_large_read re-captures and marks it superseded on mismatch, and
--- the newer incarnation's own routing (enqueue_session_large_read: a fingerprint change or 'superseded' re-queues)
--- sets the newer job. No lock beyond the job row's ON CONFLICT row lock; no lock across I/O.
+--  2. Acts only on an EXISTING job for exactly that incarnation (Pipeline ae37e77b3809; initial creation stays on the
+--     originating route): one UPDATE re-queues it when it is 'superseded'. Never an INSERT.
+--  3. Otherwise the stored row decides: none -> {enqueued:false, reason:'no_job'}; same incarnation ->
+--     {enqueued:true, changed:false, state} (untouched; 'failed' is not recovery); newer epoch, or same epoch with
+--     another fingerprint -> {obsolete, newer_job}; an older incarnation's job -> {enqueued:false, 'no_exact_job'}.
+-- So this function never creates a job, never writes another incarnation's job and never clears another
+-- incarnation's lease. Epochs are nextval(session_replay_epoch_seq). Source currency is NOT asserted: if the source
+-- moves after step 1, step 2 can at most re-queue the expected incarnation's own superseded job, which claim marks
+-- superseded again. Only the exact row's UPDATE row lock; no lock across I/O.
 -- Grants as 20261105021000's enqueue: REVOKE ALL from PUBLIC, anon, authenticated, service_role; EXECUTE to
 -- service_role. Metadata only. Dormant: nothing calls it unless SEARCH_INDEX_DEADLINE_ISOLATION_ENABLED=true.
 -- Code only: applying it to any hosted database needs Khaliq's separate explicit approval.
@@ -46,23 +44,26 @@ BEGIN
   PERFORM pg_advisory_xact_lock_shared(current_setting('rh.large_read_test_gate')::bigint);
  END IF;
  canonical_id:=c->'identity'->>'sessionId';e:=p_expected_epoch;f:=p_expected_fingerprint;
- INSERT INTO sessions.session_large_read_jobs AS x(org_id,workspace_id,harness,session_id,source_epoch,source_fingerprint)
- VALUES(p_org,p_workspace,p_harness,canonical_id,e,f)
- ON CONFLICT(org_id,workspace_id,harness,session_id) DO UPDATE SET
-  source_epoch=excluded.source_epoch,source_fingerprint=excluded.source_fingerprint,state='queued',
-  available_at=clock_timestamp(),lease_nonce=NULL,lease_expires_at=NULL,attempts=0,last_error=NULL,updated_at=now()
-  WHERE x.source_epoch<excluded.source_epoch
-   OR (x.state='superseded' AND x.source_epoch=excluded.source_epoch AND x.source_fingerprint=excluded.source_fingerprint);
+ -- Pipeline ae37e77b3809: a delayed hold may act only on an EXISTING job for exactly the expected incarnation; initial
+ -- creation stays on the originating route (enqueue_session_large_read). An empty slot or another incarnation's job
+ -- gives this call no authority: no insert, no rewrite.
+ UPDATE sessions.session_large_read_jobs SET state='queued',available_at=clock_timestamp(),lease_nonce=NULL,lease_expires_at=NULL,
+   attempts=0,last_error=NULL,updated_at=now()
+  WHERE org_id=p_org AND workspace_id=p_workspace AND harness=p_harness AND session_id=canonical_id
+   AND source_epoch=e AND source_fingerprint=f AND state='superseded';
  IF FOUND THEN
   RETURN jsonb_build_object('enqueued',true,'changed',true,'state','queued','identity',c->'identity','source',c->'source');
  END IF;
  SELECT * INTO j FROM sessions.session_large_read_jobs WHERE org_id=p_org AND workspace_id=p_workspace AND harness=p_harness AND session_id=canonical_id;
- IF FOUND AND j.source_epoch=e AND j.source_fingerprint=f THEN
-  -- Same incarnation, not rewritten: the stored state is returned; 'failed' (or 'superseded' of another incarnation)
-  -- is not durable recovery, and the caller must not treat it as such.
+ IF NOT FOUND THEN RETURN jsonb_build_object('enqueued',false,'reason','no_job'); END IF;
+ IF j.source_epoch=e AND j.source_fingerprint=f THEN
+  -- Same incarnation, not rewritten: the stored state is returned; 'failed' is not durable recovery.
   RETURN jsonb_build_object('enqueued',true,'changed',false,'state',j.state,'identity',c->'identity','source',c->'source');
  END IF;
- RETURN jsonb_build_object('enqueued',false,'obsolete',true,'reason','newer_job');
+ IF j.source_epoch>e OR (j.source_epoch=e AND j.source_fingerprint<>f) THEN
+  RETURN jsonb_build_object('enqueued',false,'obsolete',true,'reason','newer_job');
+ END IF;
+ RETURN jsonb_build_object('enqueued',false,'reason','no_exact_job');
 END $expected$;
 
 REVOKE ALL ON FUNCTION sessions.enqueue_session_large_read_expected(text,text,text,text,bigint,text) FROM PUBLIC,anon,authenticated,service_role;
