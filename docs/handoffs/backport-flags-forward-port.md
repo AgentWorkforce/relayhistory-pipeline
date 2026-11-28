@@ -230,9 +230,18 @@ To measure uptake, count these separately on the `search index reconciled` line:
 | Hold across a new revision | `acceptance_hold: watermark`, with `delta_chunks` |
 
 `watermark_written` is logged only when the stamp row was actually inserted and carries a watermark: not on a
-failed write, and not for a refusal with no record id group or a scope with more than 64 sibling manifests. It
-is the direct count of sessions that converted, including ones that then go quiet. `watermark_revision` is the
-highest manifest revision the read covered; `watermark_epoch` is the directory epoch it ran at.
+failed write, and not for a refusal with no record id group or a scope with more than 64 sibling manifests.
+It counts successful writes, not sessions. One scope can write more than once: after a hold ends, after the
+six-hour bound, or whenever its probe does not hold. `watermark_revision` is the highest manifest revision the
+read covered; `watermark_epoch` is the directory epoch it ran at.
+
+Report uptake over a stated window as two separate figures:
+
+- **Observed uptake:** distinct scopes (`org_id`, `workspace_id`, `harness`, `session_id`) with a verified
+  watermark skip (`acceptance_stamp: watermark`) or a hold (`acceptance_hold: watermark`), divided by all
+  distinct scopes observed in the same window.
+- **Scopes writing a watermark:** distinct scopes with `watermark_written: true` in that window. This includes
+  scopes that wrote one and then went quiet, which the first figure cannot see.
 
 `acceptance_stamp` is logged only with the watermark flag on. `watermark` means this pass verified every sibling
 manifest against the exact stamp row it skipped on. It is set from that verification, never from the stamp's

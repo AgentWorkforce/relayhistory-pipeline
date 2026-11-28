@@ -478,7 +478,8 @@ export interface SearchIndexResult {
    * `acceptanceWatermark` only, on a full read that ended with the acceptance refusal: the stamp row this pass
    * inserted carries a watermark (the insert was accepted). `revision` is the highest manifest revision the read
    * covered, `epoch` the directory epoch it ran at. Absent when no watermark was written (a failed write, a
-   * catalog-key refusal, too wide a scope). Telemetry only: the point a session becomes able to hold.
+   * catalog-key refusal, too wide a scope). Telemetry only. It counts a successful write, not a session: one
+   * scope can write more than once.
    */
   watermarkWritten?: { revision: number; epoch: string };
   /**
