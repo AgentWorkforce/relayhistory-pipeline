@@ -589,6 +589,10 @@ export async function runCutoverQualification(opts: RunOptions = {}): Promise<Cu
       if (scenario === "direct") {
         // The direct controls applied in S3 during the hold must be in the window the release decision reads. Prove
         // what the empty-window release would do (inside a transaction that is rolled back), then refuse fail closed.
+        // VALID ONLY WHILE _release HAS NO EFFECT OUTSIDE THE DATABASE TRANSACTION: today its advisory locks are
+        // transaction-scoped and the hold functions write nothing to S3 or any other system. Any future side effect
+        // outside the database (an S3 write, a notify consumed elsewhere, a non-transactional lock) breaks this probe:
+        // replace it with a read-only decision function before then (d5-gate-owner review of 2204f01e, note 1).
         await fx.db.query("BEGIN");
         let would = "ok";
         try { await fx.db.query("SELECT sessions.ingest_org_admission_hold_release($1,$2::uuid,'bridge_complete',$3,'erasure_window_empty',0)", [ORG, epoch, "d".repeat(64)]); }
