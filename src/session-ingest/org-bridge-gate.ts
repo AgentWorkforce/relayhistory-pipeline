@@ -21,9 +21,10 @@
  *   The drain refuses O from the moment it exists.
  *
  * Recovery (withdrawEnrollment, CAS to `withdrawn`, the markers decide again):
- *   install_failed     the install of G's request never committed (status shows no hold of that request). The next
- *                      attempt enrolls G+1 with a NEW request id; a late commit of the old install is then a hold no
- *                      enrollment covers, which completeOrgBridge refuses, and its only exit is verified_rollback.
+ *   install_failed     the withdrawal first CONSUMES the request in SQL: _install(org, request) (idempotent), then
+ *                      _release(verified_rollback), then the S3 CAS. A paused installer can then never commit that
+ *                      request (062320 refuses reuse of a released request). The next attempt enrolls G+1 with a NEW
+ *                      request id.
  *   verified_rollback  the hold of G's request released with `verified_rollback` (so no marker was ever attempted).
  * A later cutover of O enrolls G+1 (from withdrawn, or once G's bridge record exists): old bytes of G never satisfy it.
  *
@@ -62,7 +63,8 @@ export type OrgBridgeRefusalCode =
   | "enrollment_after_install"
   | "enrollment_contended"
   | "enrollment_hold_present"
-  | "enrollment_rollback_unverified";
+  | "enrollment_rollback_unverified"
+  | "enrollment_consume_failed";
 
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/u;
 const HEX64 = /^[0-9a-f]{64}$/u;
@@ -198,10 +200,27 @@ export async function withdrawEnrollment(input: EnrollmentInput & { reason: OrgE
     if (!cur) return refuse("bridge_not_enrolled");
     if (cur.doc.requestSha256 !== requestSha256) return refuse("bridge_request_mismatch");
     if (cur.doc.state === "withdrawn") return cur.doc.withdrawn === reason ? { outcome: "adopted" } : refuse("enrollment_invalid");
-    const hold = await latestHold(sql, orgId);
+    let hold = await latestHold(sql, orgId);
     if (reason === "install_failed") {
-      if (hold && hold.request_id === requestId) return refuse("enrollment_hold_present");
-      if (hold && hold.state !== "released") return refuse("enrollment_hold_present");
+      // Consume the request in SQL BEFORE the S3 CAS, so an installer paused after enrollmentFor can never commit it:
+      // _install is idempotent by request (it returns the epoch if the paused install already committed, else creates
+      // the hold), then verified_rollback releases it, and 062320 refuses any later _install of a released request.
+      // A crash between the two leaves the org held in SQL AND enrolled in S3 (both writers fenced); a rerun resumes.
+      if (hold && hold.request_id !== requestId && hold.state !== "released") return refuse("enrollment_hold_present");
+      if (!(hold && hold.request_id === requestId && hold.state === "released")) {
+        try {
+          const epoch = hold && hold.request_id === requestId ? hold.epoch as string
+            : String((await sql.query("SELECT sessions.ingest_org_admission_hold_install($1::text, $2::uuid)::text AS epoch", [orgId, requestId])).rows[0]?.epoch);
+          if (!UUID.test(epoch)) return refuse("enrollment_consume_failed");
+          await sql.query("SELECT sessions.ingest_org_admission_hold_release($1::text, $2::uuid, 'verified_rollback', $3::text, 'enrollment_withdrawal', NULL)",
+            [orgId, epoch, createHash("sha256").update(`96bulls:enrollment-withdrawal-v1:${requestSha256}`).digest("hex")]);
+        } catch {
+          // RH042 (a pending batch), a marker attempt (no rollback after it: 55000), or the database: nothing withdrawn.
+          return refuse("enrollment_consume_failed");
+        }
+        hold = await latestHold(sql, orgId);
+      }
+      if (!hold || hold.request_id !== requestId || hold.state !== "released" || hold.release_reason !== "verified_rollback") return refuse("enrollment_consume_failed");
     } else if (!hold || hold.request_id !== requestId || hold.state !== "released" || hold.release_reason !== "verified_rollback") {
       return refuse("enrollment_rollback_unverified");
     }

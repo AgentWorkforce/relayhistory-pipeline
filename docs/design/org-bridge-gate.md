@@ -519,3 +519,19 @@ after resumption and before any repair. The cases:
   fails closed but loses availability on long sessions. Fix: the effect row records the chunk key (its embedded
   source sha256) at publish, and the reader's batched verdict is keyed by the chunk keys it is about to GET. That
   needs no manifest index and survives lost ACKs, because the chunk key is deterministic.
+
+### Installer withdrawal and paused direct writer: synthetic proof (lander: synthetic proof only)
+
+`withdrawEnrollment(install_failed)` now consumes the request in SQL before its S3 CAS: `_install` (idempotent),
+then `_release(verified_rollback, detail 'enrollment_withdrawal')`, then the CAS. Any failure is
+`enrollment_consume_failed` and withdraws nothing, so the org stays fenced. The proof is
+`cutover-withdrawal.pglite.test.ts` (3 tests), on real 062320/062340 SQL, a real ledger-s3 with `orgBridge`, and a toy
+layout with two labelled toy readers:
+- **The paused installer resumes after the withdrawal.** Its `_install` refuses (55000), no hold is opened, readers
+  see only the pre-cutover bytes, and the org is back to its single pre-cutover writer.
+- **A crash between the withdrawal's `_install` and its rollback.** The org is held in SQL and enrolled in S3, so
+  both writers are fenced and nothing new is readable. The rerun finds the live hold of the request, releases it and
+  withdraws.
+- **A paused direct writer** that claimed before enrollment and whose bytes land after the baseline capture. Its
+  commit is refused while held. **Today's reader serves its bytes (the gap); the W2 rule (2) does not.** An entry
+  that landed before the baseline capture is pre-cutover state: it is erased through its owner stub like any other.

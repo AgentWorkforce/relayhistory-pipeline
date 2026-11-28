@@ -224,20 +224,14 @@ describe("enrollOrg / enrollmentFor / withdrawEnrollment: bound to the install r
     expect(await exists(store, orgEnrollmentKey(ROOT, ORG))).toBe(false);
   });
 
-  test("enrollment succeeded, SQL install failed: withdraw (install_failed) only while no hold of that request exists; the next attempt is generation 2", async () => {
+  // install_failed now consumes the request in SQL (_install + verified_rollback) before its S3 CAS: proven against the
+  // real 062320 functions in cutover-withdrawal.pglite.test.ts. Here, only what needs no SQL write:
+  test("install_failed refuses while another request's hold is live, and when consuming the request fails", async () => {
     const store = fresh();
-    await putMarker(store);
     await enroll(store, sqlWith(null));
-    expect(await direct(store)).toBe("ledger_fence_authority_bridge_pending"); // fail closed meanwhile
-    // A hold of this request committed after all: install_failed is refused.
-    expect(await refusal(withdrawEnrollment({ sql: sqlWith(held("held")), store, keyRoot: ROOT, orgId: ORG, requestId: REQ, reason: "install_failed" }))).toBe("enrollment_hold_present");
-    expect(await withdrawEnrollment({ sql: sqlWith(null), store, keyRoot: ROOT, orgId: ORG, requestId: REQ, reason: "install_failed", now: () => 8 })).toEqual({ outcome: "withdrawn" });
-    expect(await withdrawEnrollment({ sql: sqlWith(null), store, keyRoot: ROOT, orgId: ORG, requestId: REQ, reason: "install_failed" })).toEqual({ outcome: "adopted" });
-    expect(await direct(store)).toBe("claimed"); // the per-org marker decides again, as before
-    expect(await enroll(store, sqlWith(null), REQ2)).toEqual({ outcome: "enrolled", generation: 2 });
-    expect(await direct(store)).toBe("ledger_fence_authority_bridge_pending");
-    // A late commit of the OLD install: a hold no enrollment covers; completeOrgBridge refuses it.
-    expect(await refusal(complete(store, sqlWith(released())))).toBe("bridge_request_mismatch");
+    expect(await refusal(withdrawEnrollment({ sql: sqlWith(held("held", { request_id: REQ2 })), store, keyRoot: ROOT, orgId: ORG, requestId: REQ, reason: "install_failed" }))).toBe("enrollment_hold_present");
+    expect(await refusal(withdrawEnrollment({ sql: sqlWith(null), store, keyRoot: ROOT, orgId: ORG, requestId: REQ, reason: "install_failed" }))).toBe("enrollment_consume_failed");
+    expect((await readJson(store, orgEnrollmentKey(ROOT, ORG))).state).toBe("enrolled"); // nothing withdrawn: fenced
   });
 
   test("verified rollback: withdraw only when the latest hold is that request's, released with verified_rollback", async () => {
