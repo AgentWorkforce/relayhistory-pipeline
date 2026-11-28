@@ -44,7 +44,14 @@ const SEARCH_PHASE_FIELDS = ["source_read_ms", "index_scan_ms", "locked_apply_ms
   // The committed search wake's clocks (session-pipeline/search-jobs.ts, design §0): publish and pointer series.
   "commit_to_searchable_ms", "pointer_to_searchable_ms"];
 
+/** T139 pointer fence refusal line (hoopdb/index.ts): the stored row's revision, a bounded count. */
+const POINTER_FENCE_COUNT_FIELDS = ["stored_revision"];
+
 export const ALLOWED_LOG_FIELDS = new Set([
+  ...POINTER_FENCE_COUNT_FIELDS,
+  // ...whether the stored row is a tombstone (BOOLEAN_FIELDS), and the physical write's digest (INCARNATION_SHAPE, the
+  // same value as T126's revision dedup ID; a join key, never a metric dimension).
+  "stored_deleted", "incarnation_sha256",
   // The staged run summary line: the pass was answered from a cached size refusal (search-index.ts StagedRefusals).
   "cached_refusal",
   "service", "deployment", "deployment_id", "stage", "status", "outcome", "attempt",
@@ -155,6 +162,7 @@ export const BOUNDED_COUNT_FIELDS: ReadonlyMap<string, number> = new Map([
   ...STREAM_BUDGET_FIELDS.map((f): [string, number] => [f, Number.MAX_SAFE_INTEGER]),
   ...SEARCH_PHASE_FIELDS.map((f): [string, number] => [f, Number.MAX_SAFE_INTEGER]),
   ...SUMMARY_INPUT_FIELDS.map((f): [string, number] => [f, Number.MAX_SAFE_INTEGER]),
+  ...POINTER_FENCE_COUNT_FIELDS.map((f): [string, number] => [f, Number.MAX_SAFE_INTEGER]),
 ]);
 
 function boundedCount(v: unknown, max: number): number | undefined {
@@ -202,11 +210,12 @@ const ENUM_FIELDS: ReadonlyMap<string, ReadonlySet<string>> = new Map([
  * ingest-refusal-log.test.ts): never a token, hostname or hex id. */
 export const CLIENT_VERSION_SHAPE = /^[0-9]{1,5}(?:\.[0-9]{1,5}){1,3}(?:-[0-9A-Za-z.]{1,16})?$/;
 export const LOG_TAG_SHAPE = /^[0-9a-f]{8}$/;
+export const INCARNATION_SHAPE = /^[0-9a-f]{64}$/;
 /** `error_frame`: a function name only (db-error-class.ts FRAME_NAME, pinned equal); never a path, line or text. */
 export const FRAME_NAME_SHAPE = /^(?=.{1,64}$)[A-Za-z_$][A-Za-z0-9_$]*(?:\.[A-Za-z_$][A-Za-z0-9_$]*){0,3}$/;
 /** Boolean fields: emitted only when the value is `true` or `false` (else dropped), so they can never carry text or an id. */
-export const BOOLEAN_FIELDS: ReadonlySet<string> = new Set(["same_origin"]);
-const SHAPED_FIELDS: ReadonlyMap<string, RegExp> = new Map([["client_version", CLIENT_VERSION_SHAPE], ["receipt_tag", LOG_TAG_SHAPE], ["attempt_tag", LOG_TAG_SHAPE], ["error_frame", FRAME_NAME_SHAPE]]);
+export const BOOLEAN_FIELDS: ReadonlySet<string> = new Set(["same_origin", "stored_deleted"]);
+const SHAPED_FIELDS: ReadonlyMap<string, RegExp> = new Map([["client_version", CLIENT_VERSION_SHAPE], ["receipt_tag", LOG_TAG_SHAPE], ["attempt_tag", LOG_TAG_SHAPE], ["error_frame", FRAME_NAME_SHAPE], ["incarnation_sha256", INCARNATION_SHAPE]]);
 
 /**
  * The one field rule shared by log lines (logLine/emit) and span attributes (telemetry.ts

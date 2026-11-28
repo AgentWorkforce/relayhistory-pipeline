@@ -57,7 +57,28 @@ export interface IndexDeps {
    * Defaults to SESSION_BRIEF_ENABLED and its timings from env.
    */
   brief?: { idleSeconds: number; maxWaitSeconds: number } | null;
+  /**
+   * Absent by default (SESSION_POINTER_REINCARNATION_ENABLED, T139): a re-created session that reuses a revision
+   * number may replace its tombstone or its equal-revision row (migration 20261105062360's opt-in branch). Only
+   * inside a transaction this code can roll back (the publication transaction, a move, or its own pooled one). After
+   * the upsert statement and before commit, `stamp` HEADs the manifest: if it is no longer the object that was
+   * read, the upsert throws `pointer_not_current` (retryable) and the transaction rolls back, so a stale read
+   * never publishes. Absent: exactly the previous revision-only fence.
+   */
+  reincarnation?: { stamp(key: string): Promise<{ etag?: string; version?: string } | null> };
 }
+
+const unquote = (v: string | undefined) => (v ? v.replace(/^"|"$/g, "") : undefined);
+/** Is `live` the same physical object as `read`? versionId when both carry one, else ETag. */
+export function sameObject(read: { etag?: string; version?: string }, live: { etag?: string; version?: string } | null): boolean {
+  if (!live) return false;
+  if (read.version && live.version) return read.version === live.version;
+  const a = unquote(read.etag), b = unquote(live.etag);
+  return a !== undefined && a === b;
+}
+/** The physical write's digest (the same value as T126's revision dedup ID for a PUT): a log join key only. */
+const incarnationDigest = (key: string, read: { etag?: string; version?: string }) =>
+  createHash("sha256").update(JSON.stringify(["96bulls:revision-dedup", key, "put", read.version ?? "", unquote(read.etag) ?? "", ""])).digest("hex");
 
 /**
  * A pointer move (src/session-pipeline/pointer.ts): the row still names `rekeyFrom`, an older key of
@@ -172,6 +193,10 @@ function sessionIndex(deps:IndexDeps,authorized:boolean,managedSearch?:ManagedSe
       // re-insert still commit together. (A test double without a pool runs them in sequence.)
       if(!authorized&&opts.rekeyFrom&&deps.db.pool)
         return moveTransaction(deps.db,tx=>sessionIndex({...deps,db:{...deps.db,query:tx.query}as HoopDb},true).upsertRawPointer(pointer,ctx,opts));
+      // T139: the opt-in reincarnation branch needs a transaction to roll back; the plain path gets its own.
+      if (!authorized && deps.reincarnation && deps.db.pool)
+        return moveTransaction(deps.db, tx => sessionIndex({ ...deps, db: { ...deps.db, query: tx.query } as HoopDb }, true).upsertRawPointer(pointer, ctx, opts));
+      const verify = authorized && deps.reincarnation !== undefined;
       const f = pointerFields(m);
       const ext = sessionExt(m);
       const canonical = canonicalManifestIdentity(m);
@@ -238,6 +263,8 @@ function sessionIndex(deps:IndexDeps,authorized:boolean,managedSearch?:ManagedSe
         revision: f.manifestRevision,
         trace_id: f.traceId,
         deleted_at: null,
+        // Read by migration 20261105062360's predicate only (jsonb_populate_recordset ignores it).
+        ...(verify ? { reincarnation_verified: true } : {}),
       };
       if (opts.rekeyFrom) {
         // The move's delete, in this upsert's transaction; the new row keeps the older first-seen.
@@ -270,6 +297,23 @@ function sessionIndex(deps:IndexDeps,authorized:boolean,managedSearch?:ManagedSe
         return { status: "skipped", reason: "operator_erased" };
       }
       const applied = rows[0]?.applied ?? false;
+      if (verify && applied && !sameObject(read, await deps.reincarnation!.stamp(pointer.manifestKey))) {
+        // The manifest changed (or went) after this pass read it: nothing this transaction wrote may commit. The
+        // newer write's own event re-reads under the scope lock.
+        log.info("pointer write not current, rolled back", { stage: "session-indexed", reason: "pointer_not_current", revision: Number(m.revision) });
+        throw Object.assign(new Error("pointer write not current; retry"), { code: "pointer_not_current", retryable: true });
+      }
+      if (verify && !applied) {
+        // Refused even with the opt-in branch: count it (T139 sizing). Distinct candidates join on incarnation_sha256.
+        const stored = (await deps.db.query<{ revision: string; manifest_etag: string | null; deleted: boolean }>(
+          `SELECT revision::text, manifest_etag, deleted_at IS NOT NULL AS deleted FROM sessions.session_index
+            WHERE org_id = $1 AND workspace_id = $2 AND harness = $3 AND session_id = $4 AND machine_id = $5`,
+          [pk.org_id, pk.workspace_id, pk.harness, pk.session_id, pk.machine_id])).rows[0];
+        if (stored && unquote(stored.manifest_etag ?? undefined) !== unquote((row.manifest_etag as string | null) ?? undefined))
+          log.info("pointer fence refused live write", { stage: "session-indexed", reason: "revision_fence",
+            revision: Number(m.revision), stored_revision: Number(stored.revision), stored_deleted: stored.deleted,
+            incarnation_sha256: incarnationDigest(pointer.manifestKey, read) });
+      }
       if (opts.rekeyFrom && !applied) {
         // The old row is gone, so nothing could fence the insert by revision: a missing row means a
         // BEFORE INSERT guard suppressed it (20261105050010's erase-fence guard with the fence flag off,

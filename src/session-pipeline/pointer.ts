@@ -88,6 +88,11 @@ export interface PointerDeps {
    * Absent: such a key is indexed as a session, as before.
    */
   skipOriginBucket?: boolean;
+  /**
+   * SESSION_POINTER_REINCARNATION_ENABLED=true only (T139; default off): a re-created session reusing a revision
+   * number replaces its tombstone, with the in-transaction live-manifest check (hoopdb/index.ts IndexDeps.reincarnation).
+   */
+  reincarnation?: { stamp(key: string): Promise<{ etag?: string; version?: string } | null> };
 }
 
 /** A fan-out queue that drops messages: no summary or state consumer runs in production yet. */
@@ -305,7 +310,7 @@ async function indexLocked(landed: ObjectLanded, orgId: string, scope: SessionSc
   if (!indexed) return { status: "ignored", reason: "no_pointer" };
   const message = await enrichMessage(indexed, deps.reader);
 
-  const index = hoopDbSessionIndex({ db: deps.db, reader: deps.reader, queue: deps.fanout, current: () => message,publication:deps.publication });
+  const index = hoopDbSessionIndex({ db: deps.db, reader: deps.reader, queue: deps.fanout, current: () => message,publication:deps.publication, ...(deps.reincarnation ? { reincarnation: deps.reincarnation } : {}) });
   const upsert = () => index.upsertRawPointer(message.payload as Parameters<typeof index.upsertRawPointer>[0], message.ctx);
   const result = await upsert();
   if(result?.status==="skipped"&&result.reason==="publication_retired")return{status:"ignored",reason:"managed_publication_hint"};

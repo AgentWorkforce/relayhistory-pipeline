@@ -114,8 +114,12 @@ export async function pointerRig() {
     requeue: async (key) => { requeued.push(key); },
   });
 
-  async function writeManifest(revision: number, l: Loc = loc) {
-    const source = new TextEncoder().encode(JSON.stringify({ kind: "session_event", origin_id: "o", record_id: `r${revision}`, revision: "1", operation: "upsert", received_at: AT, payload: { ts_ms: 1, text: "x" } }) + "\n");
+  /**
+   * `marker` (default none): the record id and the searchable text, so two incarnations with one revision number
+   * differ in content. Without it the manifest is byte-identical to the golden's.
+   */
+  async function writeManifest(revision: number, l: Loc = loc, marker?: string) {
+    const source = new TextEncoder().encode(JSON.stringify({ kind: "session_event", origin_id: "o", record_id: marker ?? `r${revision}`, revision: "1", operation: "upsert", received_at: AT, payload: { ts_ms: 1, text: marker ?? "x" } }) + "\n");
     const stored = new Uint8Array(zstdCompressSync(source));
     const sha = await sha256Hex(source);
     const chunk: ChunkEntry = { seq: 0, epoch: 0, start_offset: 0, bytes: source.byteLength, stored_bytes: stored.byteLength, sha256: sha, sha256_8: sha.slice(0, 8), stored_sha256: await sha256Hex(stored), stored_raw_bytes: source.byteLength, raw_sha256: sha, compression: "zstd", records: 1 };
@@ -139,5 +143,7 @@ export async function pointerRig() {
     await pg.close();
     await rm(root, { recursive: true, force: true });
   };
-  return { pg, store, calls, requeued, hooks, pointer, deps, run, writeManifest, body, row, close };
+  /** A pool on the single PGlite connection, so a code path that opens its own transaction (BEGIN/COMMIT) can run. */
+  const pool = { connect: async () => ({ query: (text: string, params?: unknown[]) => db.query(text, params), release() {} }) };
+  return { pg, store, reader, pool, calls, requeued, hooks, pointer, deps, run, writeManifest, body, row, close };
 }

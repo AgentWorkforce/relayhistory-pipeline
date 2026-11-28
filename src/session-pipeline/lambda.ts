@@ -162,6 +162,8 @@ export interface LambdaEnv {
   pointerPreReadEnabled?: boolean;
   /** SESSION_POINTER_SKIP_ORIGIN_BUCKET_ENABLED=true: the pointer stage ignores h=_none/s=_origin keys (pointer.ts). Default off. */
   pointerSkipOriginBucketEnabled?: boolean;
+  /** SESSION_POINTER_REINCARNATION_ENABLED=true: a re-created session reusing a revision replaces its tombstone, with the in-transaction live-manifest check (T139; migration 20261105062360 first). Default off. */
+  pointerReincarnationEnabled?: boolean;
   /**
    * SEARCH_INDEX_STREAMING_CH=1 (default off): a scope past the whole-read bound is reconciled by the
    * streaming reader on the ClickHouse binding within these budgets, stopping at the invocation's
@@ -256,6 +258,8 @@ export function lambdaEnv(env: NodeJS.ProcessEnv = process.env, composition?: Se
   const pointerPreRead = pointerPreReadFromEnv(env);
   // SESSION_POINTER_SKIP_ORIGIN_BUCKET_ENABLED: strict grammar, default off.
   const pointerSkipOriginBucket = pointerSkipOriginBucketFromEnv(env);
+  // SESSION_POINTER_REINCARNATION_ENABLED: strict grammar, default off.
+  const pointerReincarnation = pointerReincarnationFromEnv(env);
   // Unset is undefined (legacy reads, no field); a malformed value refuses init, as briefConfig() already does.
   const maximum = readerMaxRuleset(env);
   // SEARCH_JOBS_ENABLED / SEARCH_WAKE_ENQUEUE: default off; on, the consumer needs the search stage.
@@ -285,6 +289,7 @@ export function lambdaEnv(env: NodeJS.ProcessEnv = process.env, composition?: Se
     ...(searchPreRead ? { searchPreReadEnabled: true } : {}),
     ...(pointerPreRead ? { pointerPreReadEnabled: true } : {}),
     ...(pointerSkipOriginBucket ? { pointerSkipOriginBucketEnabled: true } : {}),
+    ...(pointerReincarnation ? { pointerReincarnationEnabled: true } : {}),
     ...(searchStreamCh ? { searchStreamCh } : {}),
     semanticCopyEnabled: env.SESSION_SEMANTIC_COPY_ENABLED === "1",
     semanticSourceId: env.SESSION_SEARCH_FEATURE_SOURCE_ID,
@@ -541,6 +546,11 @@ export function runtimeFromSecret(env: LambdaEnv, secretText: string, schemaGene
       ...(env.pointerPreReadEnabled ? { preRead: true as const } : {}),
       // Default off; on, a sessionless per-origin bucket key (h=_none/s=_origin) is ignored before any lookup.
       ...(env.pointerSkipOriginBucketEnabled ? { skipOriginBucket: true as const } : {}),
+      // Default off; on, a re-created session reusing a revision replaces its tombstone after a fresh HEAD (T139).
+      ...(env.pointerReincarnationEnabled ? { reincarnation: { stamp: async (key: string) => {
+        const meta = await store.head(objectKey(key));
+        return meta ? { ...(meta.version.eTag ? { etag: meta.version.eTag } : {}), ...(meta.version.version ? { version: meta.version.version } : {}) } : null;
+      } } } : {}),
     },
     requeue: async (manifestKey) => {
       await awsJsonCall({
@@ -1198,6 +1208,14 @@ export function pointerPreReadFromEnv(env: Record<string, string | undefined>): 
  * SESSION_POINTER_SKIP_ORIGIN_BUCKET_ENABLED for the hosted Lambda: unset, "" and "false" are off; "true" is on;
  * anything else fails init naming the variable, never the value.
  */
+/** SESSION_POINTER_REINCARNATION_ENABLED: unset/empty/"false" off, "true" on; anything else refuses init. */
+export function pointerReincarnationFromEnv(env: Record<string, string | undefined>): boolean {
+  const value = env.SESSION_POINTER_REINCARNATION_ENABLED;
+  if (value === undefined || value === "" || value === "false") return false;
+  if (value === "true") return true;
+  throw new Error("session pipeline: SESSION_POINTER_REINCARNATION_ENABLED must be true or false");
+}
+
 export function pointerSkipOriginBucketFromEnv(env: Record<string, string | undefined>): boolean {
   const value = env.SESSION_POINTER_SKIP_ORIGIN_BUCKET_ENABLED;
   if (value === undefined || value === "" || value === "false") return false;
