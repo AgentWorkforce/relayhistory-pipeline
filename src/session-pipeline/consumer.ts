@@ -13,7 +13,7 @@
 import { errorFields, log, searchIndexErrorDetail } from "../shared/log.ts";
 import { parseQueueBody, sequencerAfter, type LandedEvent } from "./s3-events.ts";
 import { indexPointer, type PointerDeps, type SessionScope } from "./pointer.ts";
-import { indexSearchScope, searchIndexPhaseMetrics, type SearchIndexDeps } from "./search-index.ts";
+import { indexSearchScope, searchIndexPhaseMetrics, skipCheck, type SearchIndexDeps } from "./search-index.ts";
 import { LEGACY_PROVENANCE_INVALID } from "../session-read-api/legacy-provenance.ts";
 import { captureRefusal, classifyReplayFailure, produceCanonicalReplay, type ReplayProducerDeps } from "./replay-publication.ts";
 import type { LargeJobState, LargeRoute } from "./large-read-worker.ts";
@@ -228,6 +228,7 @@ export async function processBatch(records: readonly QueueRecord[], deps: Consum
             reason: result.reasons.join(",") || "scope_too_large",
             ...(result.stream ? { stream: result.stream } : {}),
           });
+        const check = skipCheck(result);
         log.info("search index reconciled", {
           stage: "search-index",
           org_id: scope.orgId,
@@ -241,15 +242,21 @@ export async function processBatch(records: readonly QueueRecord[], deps: Consum
           ok: result.complete,
           reason: result.reasons.join(",") || undefined,
           // SEARCH_INDEX_SKIP_CURRENT_SHADOW_ENABLED: what the skip-current check answers for this pass, which ran anyway.
-          ...(result.skipProbe ? { would_skip: result.skipProbe.current, skip_miss: result.skipProbe.miss } : {}),
+          ...(result.skipProbe ? { would_skip: result.skipProbe.current, skip_miss: result.skipProbe.miss, skip_check: check } : {}),
           ...phaseFields(),
           duration_ms: Date.now() - started,
         });
-        // The directory said current and the pass still changed the index: the skip would have left it stale.
-        if (result.skipProbe?.current && (result.inserted > 0 || result.deleted > 0))
+        // The directory said current and the pass still changed the index (or only its facts): the skip would have left it stale.
+        if (check === "divergent" || check === "facts_divergent")
           log.warn("search index skip would have missed changes", {
             stage: "search-index", org_id: scope.orgId, workspace_id: scope.workspaceId, harness: scope.harness, session_id: scope.sessionId,
-            reason: "skip_probe_divergence", inserted: result.inserted, deleted: result.deleted,
+            reason: check === "divergent" ? "skip_probe_divergence" : "skip_probe_facts_divergence", skip_check: check, inserted: result.inserted, deleted: result.deleted,
+          });
+        // The directory said current, nothing was written, but the pass did not complete: no no-op was verified.
+        if (check === "inconclusive")
+          log.warn("search index skip check inconclusive", {
+            stage: "search-index", org_id: scope.orgId, workspace_id: scope.workspaceId, harness: scope.harness, session_id: scope.sessionId,
+            reason: "skip_probe_inconclusive", skip_check: check, ok: result.complete,
           });
       } catch (error) {
         log.error("search index failed", {

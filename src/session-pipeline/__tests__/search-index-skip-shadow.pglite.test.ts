@@ -6,7 +6,7 @@
  */
 import { afterAll, afterEach, beforeAll, describe, expect, test } from "bun:test";
 import type { SqlExecutor } from "@rhc/lib/pipeline/queue.ts";
-import { alreadyCurrent, indexSearchScope, searchIndexPhaseMetrics, skipCurrentProbe, skipProbeFactsError, type SearchIndexDeps } from "../search-index.ts";
+import { alreadyCurrent, indexSearchScope, searchIndexPhaseMetrics, skipCheck, skipCurrentProbe, skipProbeFactsError, type SearchIndexDeps, type SearchIndexResult } from "../search-index.ts";
 import { runSearchJob, searchWorkKey, type SearchWakeMessage } from "../search-jobs.ts";
 import { sanitizeLogField } from "../../shared/log.ts";
 import { lambdaEnv, runtimeFromSecret, searchIndexSkipCurrentShadowFromEnv } from "../lambda.ts";
@@ -428,6 +428,83 @@ describe("skip-current shadow on (hosted ClickHouse binding)", () => {
     expect(off.length).toBe(1);
     expect(Object.keys(off[0]!).filter((k) => k.startsWith("skip_") || k === "would_skip")).toEqual([]);
   }, 120_000);
+
+  test("through the consumer, one skip_check per probed pass: verified no-op, inconclusive, divergent, miss, probe failed", async () => {
+    const r = await indexed();
+    const check = async (extra: Partial<SearchIndexDeps>) => {
+      const t = await tickLogged(r, { ...SHADOW, ...extra });
+      const line = t.named("search index reconciled");
+      expect(line.length).toBe(1);
+      return { line: line[0]!, divergent: t.named("search index skip would have missed changes"), inconclusive: t.named("search index skip check inconclusive"), failures: t.response.batchItemFailures };
+    };
+    // 1. Called current, the full pass completed and wrote nothing: the only outcome that counts for the skip.
+    const verified = await check({});
+    expect(verified.line).toMatchObject({ ok: true, inserted: 0, deleted: 0, would_skip: true, skip_check: "verified_noop" });
+    expect([verified.divergent, verified.inconclusive]).toEqual([[], []]);
+
+    // 2. Called current, zero writes, but the pass did not complete (here: too large to read): nothing was
+    //    verified, and it must not pass silently as a no-op.
+    const unverified = await check({ limits: TINY });
+    expect(unverified.line).toMatchObject({ ok: false, inserted: 0, deleted: 0, would_skip: true, skip_check: "inconclusive" });
+    expect(unverified.divergent).toEqual([]);
+    expect(unverified.inconclusive.length).toBe(1);
+    expect(unverified.inconclusive[0]).toMatchObject({ stage: "search-index", reason: "skip_probe_inconclusive", skip_check: "inconclusive", ok: false, org_id: SCOPE.orgId, session_id: SCOPE.sessionId });
+    expect(unverified.failures).toEqual([]);
+
+    // 3. The incomplete pass reset readiness: the next probe is an ordinary miss, then current again.
+    const miss = await check({});
+    expect(miss.line).toMatchObject({ ok: true, would_skip: false, skip_miss: "not_ready", skip_check: "miss" });
+    expect([miss.divergent, miss.inconclusive]).toEqual([[], []]);
+    expect((await check({})).line.skip_check).toBe("verified_noop");
+
+    // 4. Called current, and the pass wrote: divergent.
+    const victim = r.fake.rows[0]!.event_id;
+    r.fake.rows.splice(0, r.fake.rows.length, ...r.fake.rows.filter((row) => row.event_id !== victim));
+    const divergent = await check({});
+    expect(divergent.line).toMatchObject({ ok: true, would_skip: true, skip_check: "divergent" });
+    expect(Number(divergent.line.inserted)).toBeGreaterThan(0);
+    expect(divergent.divergent.length).toBe(1);
+    expect(divergent.divergent[0]).toMatchObject({ reason: "skip_probe_divergence", skip_check: "divergent", inserted: divergent.line.inserted });
+    expect(divergent.inconclusive).toEqual([]);
+
+    // 5. No verdict: the probe failed.
+    const broken = <T,>(work: (tx: SqlExecutor) => Promise<T>) =>
+      r.transact((tx) => work({
+        query: (sql: string, params?: unknown[]) =>
+          tx.query(sql.includes(PROBE_SQL) ? sql.replace("FROM sessions.session_directory d", "FROM sessions.no_such_probe_table d") : sql, params),
+      }));
+    const failed = await check({ transact: broken });
+    expect(failed.line).toMatchObject({ would_skip: false, skip_miss: "probe_failed", skip_check: "probe_failed" });
+    expect([failed.divergent, failed.inconclusive]).toEqual([[], []]);
+
+    // Flag off: no skip_check.
+    expect("skip_check" in (await tickLogged(r, {})).named("search index reconciled")[0]!).toBe(false);
+  }, 120_000);
+
+  test("skipCheck: every result maps to exactly one outcome, and only a completed zero-write pass is verified", () => {
+    const base: SearchIndexResult = { manifests: 1, rows: 5, inserted: 0, deleted: 0, complete: true, reasons: [] };
+    const current = { skipProbe: { current: true } };
+    const facts = (over: Partial<NonNullable<SearchIndexResult["outputFacts"]>>) => ({ outputFacts: { inserted: 0, deleted: 0, complete: true, reasons: [], ...over } });
+    expect(skipCheck(base)).toBeUndefined();
+    expect(skipCheck({ ...base, ...current })).toBe("verified_noop");
+    expect(skipCheck({ ...base, ...current, ...facts({}) })).toBe("verified_noop");
+    expect(skipCheck({ ...base, ...current, inserted: 1 })).toBe("divergent");
+    expect(skipCheck({ ...base, ...current, deleted: 1 })).toBe("divergent");
+    // A write outranks an incomplete pass: it is evidence against, not a missing comparison.
+    expect(skipCheck({ ...base, ...current, complete: false, inserted: 1 })).toBe("divergent");
+    expect(skipCheck({ ...base, ...current, ...facts({ inserted: 1 }) })).toBe("facts_divergent");
+    expect(skipCheck({ ...base, ...current, ...facts({ deleted: 1 }) })).toBe("facts_divergent");
+    expect(skipCheck({ ...base, ...current, complete: false })).toBe("inconclusive");
+    expect(skipCheck({ ...base, ...current, complete: false, partial: true, reasons: ["scope_too_large"] })).toBe("inconclusive");
+    expect(skipCheck({ ...base, ...current, ...facts({ complete: false }) })).toBe("inconclusive");
+    for (const miss of ["no_directory", "directory_deleted", "projection_version", "sources_changed", "not_ready", "facts_incomplete"] as const)
+      expect(skipCheck({ ...base, skipProbe: { current: false, miss } })).toBe("miss");
+    // No verdict, whatever the pass then did.
+    expect(skipCheck({ ...base, inserted: 3, skipProbe: { current: false, miss: "probe_failed" } })).toBe("probe_failed");
+    expect(skipCheck({ ...base, skipProbe: { current: false, miss: "facts_unreadable", factsRead: true } })).toBe("probe_failed");
+    for (const value of ["verified_noop", "divergent", "facts_divergent", "inconclusive", "probe_failed", "miss"]) expect(sanitizeLogField("skip_check", value)).toBe(value);
+    expect(sanitizeLogField("skip_check", "ok")).toBeUndefined();
+  });
 
   test("index rows lost while the directory says current: the pass repairs them and the consumer warns", async () => {
     const r = await indexed();

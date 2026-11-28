@@ -859,12 +859,29 @@ A pass with `would_skip: true` that still inserts or deletes index rows also log
 directory said current while the index was not, which is the drift listed under "Not detected" above. Busy,
 deferred and erased passes, and a canonical mismatch, return before the check and carry neither field.
 
+Every probed pass also carries `skip_check`, exactly one of six outcomes, so each can be counted on its own:
+
+| `skip_check` | Meaning | Counts as |
+| --- | --- | --- |
+| `verified_noop` | Called current; the full pass completed (its facts too, when on) and inserted and deleted nothing. | A verified no-op: the only evidence for the skip. |
+| `divergent` | Called current; the pass inserted or deleted index rows. Also warns (`skip_probe_divergence`). | A pass the skip would have got wrong. |
+| `facts_divergent` | Called current; index rows untouched, output facts inserted or deleted. Also warns (`skip_probe_facts_divergence`). | The same, for the facts. |
+| `inconclusive` | Called current; nothing written, but the pass or its facts did not complete. Also warns `search index skip check inconclusive` (`skip_probe_inconclusive`). | Not verified: neither for nor against. |
+| `probe_failed` | The probe's statement failed (`skip_miss: probe_failed`) or its facts read failed or timed out (`facts_unreadable`). | No comparison was made. |
+| `miss` | The proof says not current; `skip_miss` says why. | An ordinary predicate miss: the skip would not have fired. |
+
+`would_skip: true` is the eligible prediction: `verified_noop`, `divergent`, `facts_divergent` and `inconclusive`
+together. Only `verified_noop` lines count toward what the skip saves. A window qualifies the skip flag only on
+its verified no-ops and with no `divergent` or `facts_divergent` line; an `inconclusive` or `probe_failed` line is
+a comparison that was not made and cannot stand in for one.
+
 Use it before turning the skip on. Over a window with only the shadow flag on:
 
-- the share of `search index reconciled` lines with `would_skip: true`, and the sum of their `duration_ms`, is what
-  the skip flag saves (each such pass becomes the pointer stage and one Postgres check);
-- any `skip_probe_divergence` warning is a pass the skip would have got wrong; with none, the skip changes no
-  index content for that traffic;
+- the `skip_check: verified_noop` lines, and the sum of their `duration_ms`, are what the skip flag saves (each
+  such pass becomes the pointer stage and one Postgres check);
+- any `divergent` or `facts_divergent` line is a pass the skip would have got wrong; with none, the skip changes
+  no index content for the passes that were verified;
+- `inconclusive` and `probe_failed` lines are counted and reported apart, never added to the verified ones;
 - `skip_probe_ms` (and the count and sum of `skip_probe_facts_ms`) is what the flag itself cost, and any
   `skip_probe_error` is a probe failure, by code;
 - `would_skip: false` lines split by `skip_miss` and `ok`: `sources_changed` is real new source data,

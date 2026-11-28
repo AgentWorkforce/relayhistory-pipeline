@@ -1491,6 +1491,37 @@ export function skipProbeFactsError(error: unknown): SkipProbeFactsError {
   return name === "ClickHouseError" ? "clickhouse_error" : "error";
 }
 
+/**
+ * What a probed pass proved about the skip, one per pass (the consumer's `skip_check`). Only `verified_noop`
+ * is evidence for the skip; `divergent`, `facts_divergent` and `inconclusive` are passes the probe called
+ * current that did not confirm it; `probe_failed` has no verdict; `miss` is the proof answering not current.
+ */
+export type SkipCheck =
+  /** Called current, and the full pass completed (facts too, when on) having inserted and deleted nothing. */
+  | "verified_noop"
+  /** Called current, and the pass inserted or deleted index rows: the skip would have left the index stale. */
+  | "divergent"
+  /** Called current, index rows untouched, and the pass inserted or deleted output facts. */
+  | "facts_divergent"
+  /** Called current, nothing written, but the pass (or its facts) did not complete: the no-op was not verified. */
+  | "inconclusive"
+  /** The probe's statement failed, or its facts read failed or timed out: nothing was compared. */
+  | "probe_failed"
+  /** The proof says not current (skip_miss says why): the skip would not have fired. */
+  | "miss";
+/** The skip check of a result that carries a probe; undefined without one (flag off, or the pass never reached it). */
+export function skipCheck(result: SearchIndexResult): SkipCheck | undefined {
+  const probe = result.skipProbe;
+  if (!probe) return undefined;
+  if (probe.miss === "probe_failed" || probe.miss === "facts_unreadable") return "probe_failed";
+  if (!probe.current) return "miss";
+  if (result.inserted > 0 || result.deleted > 0) return "divergent";
+  const facts = result.outputFacts;
+  if (facts && (facts.inserted > 0 || facts.deleted > 0)) return "facts_divergent";
+  if (!result.complete || (facts && !facts.complete)) return "inconclusive";
+  return "verified_noop";
+}
+
 const SKIP_PROBE_SAVEPOINT = "search_skip_probe";
 /** A SQLSTATE or an error class name, and nothing else: anything longer or of another shape is `unknown`. */
 const PROBE_ERROR_CODE = /^[A-Za-z0-9_]{1,40}$/;
