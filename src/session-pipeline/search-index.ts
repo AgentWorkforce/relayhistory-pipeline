@@ -466,6 +466,15 @@ export interface SearchIndexResult {
    */
   acceptanceHold?: { deltaChunks: number };
   /**
+   * `acceptanceWatermark` only, on a same-pointer skip (`skippedBeforeRead` without `acceptanceHold`): the stamp
+   * that licensed it. `watermark`: this pass's probe read every sibling manifest and matched it against this
+   * exact stamp row (set from that verification, never from the stamp's stored format). `plain`: a stamp without
+   * a watermark (written before the flag, a catalog-key refusal, or too wide a scope); the acceptance skip's own
+   * behaviour, nothing checked. A watermark stamp that was not verified never skips, so it has no value here.
+   * Telemetry only.
+   */
+  acceptanceStamp?: "plain" | "watermark";
+  /**
    * Only on a whole-read pass that read and ended with `relayhistory_acceptance_missing` (never on a skipped pass):
    * how the refused contender groups looked (session-read-api/contender-seats.ts). Telemetry only.
    */
@@ -944,10 +953,15 @@ async function indexSearchScopeBase(scope: SessionScope, deps: SearchIndexDeps, 
       // when the probe verified the manifests against THIS stamp row (same value, same time). No probe result,
       // a failed or interrupted verification, a manifest that differs, another stamp row: the pass reads in
       // full (fail closed). A stamp without a watermark is the acceptance skip's own, as without the flag.
-      const unverifiedWatermark = deps.acceptanceWatermark === true && stamp.state === "live" && parseAcceptanceWatermark(stamp.value) !== null &&
-        !(verified !== undefined && verified.value === stamp.value && verified.atMs === stamp.atMs);
+      const stampVerified = stamp.state === "live" && verified !== undefined && verified.value === stamp.value && verified.atMs === stamp.atMs;
+      const unverifiedWatermark = deps.acceptanceWatermark === true && stamp.state === "live" && parseAcceptanceWatermark(stamp.value) !== null && !stampVerified;
       if (!unverifiedWatermark && acceptanceStampMatches(stamp, digest, at))
-        return { manifests: 0, rows: 0, inserted: 0, deleted: 0, complete: false, skippedBeforeRead: true, reasons: [ACCEPTANCE_MISSING, SKIPPED_BEFORE_READ] };
+        return {
+          manifests: 0, rows: 0, inserted: 0, deleted: 0, complete: false, skippedBeforeRead: true, reasons: [ACCEPTANCE_MISSING, SKIPPED_BEFORE_READ],
+          // Watermark flag on only (rollout uptake): `watermark` exactly when the probe verified THIS stamp row for
+          // this pass, never from the stamp's stored format alone; `plain` for a stamp that carries no watermark.
+          ...(deps.acceptanceWatermark === true ? { acceptanceStamp: stampVerified ? "watermark" as const : "plain" as const } : {}),
+        };
       acceptance = { stamp, digest, windowMarker, observed: new Map() };
     } else fromMs = prepared?.fromMs ?? await io.fromMs(at);
     if (hostedState) {

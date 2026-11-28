@@ -436,6 +436,8 @@ export async function processBatch(records: readonly QueueRecord[], deps: Consum
           contender_seats: result.contenderSeats,
           // SEARCH_INDEX_ACCEPTANCE_WATERMARK_ENABLED: the refusal was held across a new revision; chunks its probe read.
           ...(result.acceptanceHold ? { acceptance_hold: "watermark", delta_chunks: result.acceptanceHold.deltaChunks } : {}),
+          // ...or a same-pointer skip, and whether its stamp carried a watermark (plain: the acceptance skip's own stamp).
+          ...(result.acceptanceStamp ? { acceptance_stamp: result.acceptanceStamp } : {}),
           ...phaseFields(),
           duration_ms: Date.now() - started,
           ...lag,

@@ -127,6 +127,8 @@ export const ALLOWED_LOG_FIELDS = new Set([
   // SEARCH_INDEX_ACCEPTANCE_WATERMARK_ENABLED (session-pipeline/search-index.ts acceptanceWatermarkProbe): the
   // acceptance refusal was held across a new revision (one word), and how many added chunks its probe read.
   "acceptance_hold", "delta_chunks",
+  // ...and, on a same-pointer skip with that flag on, whether the stamp carried a watermark: plain or watermark.
+  "acceptance_stamp",
   // The ingest origin claim fence fallback (src/session-ingest/ledger-sql.ts originScoped): epoch ms until which the
   // isolate uses the per-user functions; a bounded integer.
   "fallback_until_ms",
@@ -230,6 +232,7 @@ const ENUM_FIELDS: ReadonlyMap<string, ReadonlySet<string>> = new Map([
   // "unknown": a streamed pass's acceptance refusal, which main's streamed reader does not classify.
   ["contender_seats", new Set(["all_unseated", "seated_unseated", "both", "catalog_key", "unknown"])],
   ["acceptance_hold", new Set(["watermark"])],
+  ["acceptance_stamp", new Set(["plain", "watermark"])],
   ["store_cause", STORE_CAUSE_VALUES], ["streaming", STREAMING_VALUES],
   ["db_refusal", DB_REFUSAL_VALUES], ["client_kind", CLIENT_KIND_VALUES], ["client_os", CLIENT_OS_VALUES],
   ["regeneration_reason", REGEN_REASON_VALUES], ["system", REGEN_SYSTEM_VALUES],
