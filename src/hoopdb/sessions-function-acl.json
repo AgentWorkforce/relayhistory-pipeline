@@ -1818,6 +1818,9 @@
     "sessions.session_erasure_replay_guard()": [
       "<owner>:EXECUTE"
     ],
+    "sessions.session_erasure_replay_pairs(text,text,text,text[],text[])": [
+      "<owner>:EXECUTE"
+    ],
     "sessions.session_erasure_replay_read(text,text,text,text,jsonb,integer)": [
       "<owner>:EXECUTE"
     ],

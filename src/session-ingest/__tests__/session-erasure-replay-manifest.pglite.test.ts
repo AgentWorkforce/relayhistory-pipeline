@@ -357,6 +357,25 @@ describe("062360 session erasure replay manifest", () => {
     expect((await page(d, SID)).reason).toBe("manifest_unsealed");
   });
 
+  test("the size preflight materializes nothing: it streams aggregates over the one pair derivation, before any target row", async () => {
+    const d = await database();
+    const fence = (await rows<{ s: string }>(d, "SELECT prosrc s FROM pg_proc WHERE oid='sessions.session_erasure_replay_fence(text,text,text,text,text[],uuid)'::regprocedure"))[0]!.s;
+    expect(fence).not.toMatch(/array_agg/iu);
+    const pre = fence.indexOf("FROM sessions.session_erasure_replay_pairs(p_org,p_ws,p_source,v_users,p_ids) AS x;");
+    const ins = fence.indexOf("INSERT INTO sessions.session_erasure_replay_targets");
+    expect(pre).toBeGreaterThan(0);
+    expect(ins).toBeGreaterThan(pre);
+    expect(fence.slice(ins).indexOf("FROM sessions.session_erasure_replay_pairs(p_org,p_ws,p_source,v_users,p_ids) AS x")).toBeGreaterThan(0);
+    // The derivation is the legacy per-owner origin set: owner-specific origins plus the turns origin.
+    await scenario(d);
+    const pairs = await rows(d, `SELECT user_id,origin_id FROM sessions.session_erasure_replay_pairs($1,$2,$3,ARRAY['U-a','u-b','u-c','u-d'],ARRAY[$4,'s-alias'])
+      ORDER BY user_id COLLATE "C",origin_id COLLATE "C"`, [ORG, WS, SRC, SID]);
+    expect(pairs).toEqual([
+      { user_id: "U-a", origin_id: "origin-2" }, { user_id: "U-a", origin_id: TURN_ORIGIN_ID },
+      { user_id: "u-b", origin_id: "origin-1" }, { user_id: "u-b", origin_id: TURN_ORIGIN_ID },
+      { user_id: "u-c", origin_id: TURN_ORIGIN_ID }, { user_id: "u-d", origin_id: TURN_ORIGIN_ID }]);
+  });
+
   test("the size bound at the boundary: at the cap the targets are captured, one octet under it none are; effects stay legacy", async () => {
     const legacy = await database(before());
     await scenario(legacy);
@@ -372,17 +391,25 @@ describe("062360 session erasure replay manifest", () => {
       const d = await database();
       await scenario(d);
       await d.db.exec(`CREATE OR REPLACE FUNCTION sessions.session_erasure_replay_digest_cap() RETURNS bigint LANGUAGE sql IMMUTABLE SET search_path=pg_catalog,pg_temp AS $c$ SELECT ${cap}::bigint $c$`);
+      // A test-only counter: every INSERT statement on the targets table (rows or not) is logged, so the over-cap path
+      // is shown never to reach the target materialization at all.
+      await d.db.exec(`CREATE TABLE public.target_insert_log(at timestamptz DEFAULT clock_timestamp());
+        CREATE FUNCTION public.log_target_insert() RETURNS trigger LANGUAGE plpgsql AS $l$ BEGIN INSERT INTO public.target_insert_log DEFAULT VALUES; RETURN NULL; END $l$;
+        CREATE TRIGGER zz_target_insert_log BEFORE INSERT ON sessions.session_erasure_replay_targets FOR EACH STATEMENT EXECUTE FUNCTION public.log_target_insert();`);
       const t0 = performance.now();
       await erase(d);
       cost[`cap${cap - size >= 0 ? "+" : ""}${cap - size}`] = Math.round(performance.now() - t0);
-      return { d, targets: (await rows<{ n: number }>(d, "SELECT count(*)::int n FROM sessions.session_erasure_replay_targets"))[0]!.n };
+      return { d, targets: (await rows<{ n: number }>(d, "SELECT count(*)::int n FROM sessions.session_erasure_replay_targets"))[0]!.n,
+        inserts: (await rows<{ n: number }>(d, "SELECT count(*)::int n FROM public.target_insert_log"))[0]!.n };
     };
     const lt0 = performance.now();
     { const l2 = await database(before()); await scenario(l2); const t0 = performance.now(); await erase(l2); cost.legacy = Math.round(performance.now() - t0); }
     void lt0;
     for (const [cap, captured] of [[size + 1, true], [size, true], [size - 1, false]] as const) {
-      const { d, targets } = await capped(cap);
+      const { d, targets, inserts } = await capped(cap);
       expect([cap - size, targets > 0]).toEqual([cap - size, captured]);
+      // Over the cap the target INSERT statement never executes (zero statements, not just zero rows).
+      expect([cap - size, inserts]).toEqual([cap - size, captured ? 1 : 0]);
       expect(await effectSet(d)).toEqual(await effectSet(legacy));
       // The full legacy record at every cap: receipt, events and 062340 history, not only the selection effects.
       const record = async (x: Db) => ({

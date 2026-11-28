@@ -16,7 +16,7 @@ DO $rollback_guard$ DECLARE v_sha text; BEGIN
  IF EXISTS(SELECT 1 FROM sessions.__96bulls_migrations WHERE name LIKE 'upstream:%' AND name COLLATE "C">'upstream:20261105062360_session_erasure_replay_manifest.sql')
  THEN RAISE EXCEPTION USING ERRCODE='55000',MESSAGE='session erasure replay manifest: a later migration is applied; roll it back first';END IF;
  SELECT sha256 INTO v_sha FROM sessions.__96bulls_migrations WHERE name='upstream:20261105062360_session_erasure_replay_manifest.sql' FOR UPDATE;
- IF NOT FOUND OR v_sha IS DISTINCT FROM '0e0a42acbebad36faf9244d223e2724ee5a231850f6d4bfccc46d5356417d361'
+ IF NOT FOUND OR v_sha IS DISTINCT FROM '74dd10ad1b0963bee8b7391a72dc3817a39760255a6815cd4536a2f499cbb15e'
  THEN RAISE EXCEPTION USING ERRCODE='55000',MESSAGE='session erasure replay manifest: own applied checksum required';END IF;
 END $rollback_guard$;
 -- sessions.ingest_operator_erase_fence(text,text,text,text,text[]): restored from supabase/migrations/20261105050000_operator_session_erase.sql.
@@ -175,6 +175,7 @@ BEGIN
  RETURN sessions.ingest_operator_erase_render(v_org,v_ws,v_source,v_session);
 END $operator_erase$;
 DROP FUNCTION sessions.session_erasure_replay_fence(text,text,text,text,text[],uuid);
+DROP FUNCTION sessions.session_erasure_replay_pairs(text,text,text,text[],text[]);
 DO $rollback_witness$ BEGIN
  LOCK TABLE sessions.session_erasure_replay_completions,sessions.session_erasure_replay_targets,sessions.session_erasure_replay_aliases,sessions.session_erasure_replay_requests IN SHARE MODE;
  IF NOT EXISTS(SELECT 1 FROM sessions.session_erasure_replay_completions) AND NOT EXISTS(SELECT 1 FROM sessions.session_erasure_replay_targets) AND NOT EXISTS(SELECT 1 FROM sessions.session_erasure_replay_aliases) AND NOT EXISTS(SELECT 1 FROM sessions.session_erasure_replay_requests) THEN
@@ -222,9 +223,10 @@ END $rollback_witness$;
 -- Final assertion before the ledger row goes: no body carries a 062360 mark and the captured fence is gone.
 DO $rollback_verify$ BEGIN
  IF to_regprocedure('sessions.session_erasure_replay_fence(text,text,text,text,text[],uuid)') IS NOT NULL
+  OR to_regprocedure('sessions.session_erasure_replay_pairs(text,text,text,text[],text[])') IS NOT NULL
   OR EXISTS(SELECT 1 FROM pg_proc p JOIN pg_namespace n ON n.oid=p.pronamespace WHERE n.nspname='sessions'
    AND p.prosrc LIKE '%-- 062360 session erasure replay manifest%')
  THEN RAISE EXCEPTION USING ERRCODE='55000',MESSAGE='session erasure replay manifest: capture survived the down; rolled back';END IF;
 END $rollback_verify$;
-DELETE FROM sessions.__96bulls_migrations WHERE name='upstream:20261105062360_session_erasure_replay_manifest.sql' AND sha256='0e0a42acbebad36faf9244d223e2724ee5a231850f6d4bfccc46d5356417d361';
+DELETE FROM sessions.__96bulls_migrations WHERE name='upstream:20261105062360_session_erasure_replay_manifest.sql' AND sha256='74dd10ad1b0963bee8b7391a72dc3817a39760255a6815cd4536a2f499cbb15e';
 COMMIT;

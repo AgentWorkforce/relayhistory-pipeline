@@ -261,6 +261,19 @@ BEGIN
   FOR EACH ROW EXECUTE FUNCTION sessions.session_erasure_replay_seal_guard();
 END $replay_triggers$;
 
+-- The one (owner, origin) derivation of the capture: for each converged owner, the distinct ownership origins over the
+-- alias set, plus the turns origin (the legacy fence's per-owner origin loop, design section 2). A set-returning read,
+-- streamed: the size preflight aggregates over it and the target rows are inserted from it, under the same owner
+-- locks in the same transaction, so both see the same pairs.
+CREATE FUNCTION sessions.session_erasure_replay_pairs(p_org text,p_ws text,p_source text,p_users text[],p_ids text[])
+ RETURNS TABLE(user_id text,origin_id text)
+LANGUAGE sql STABLE SET search_path=pg_catalog,pg_temp AS $replay_pairs$
+ SELECT u.user_id,o.origin_id FROM unnest(p_users) AS u(user_id)
+  CROSS JOIN LATERAL (SELECT q.origin_id FROM sessions.ingest_session_ownership AS q
+    WHERE q.org_id=p_org AND q.workspace_id=p_ws AND q.user_id=u.user_id AND q.source=p_source AND q.session_id=ANY(p_ids)
+   UNION SELECT 'relayhistory:conversation_turns:v1') AS o
+$replay_pairs$;
+
 -- The 050000 fence body, with one addition: given an eligible manifest, the target set T is materialized ONCE after
 -- owner-lock convergence and then drives the destructive selection loop (never sealed here: see the header). With
 -- p_manifest NULL the body is the legacy derivation, statement for statement. Both paths select the same (owner, origin) pairs in the same order.
@@ -268,7 +281,7 @@ CREATE FUNCTION sessions.session_erasure_replay_fence(p_org text,p_ws text,p_sou
 LANGUAGE plpgsql VOLATILE SET search_path=pg_catalog,pg_temp AS $replay_fence$
 DECLARE v_locked text[]:='{}';v_users text[];v_user text;v_origin text;v_pairs jsonb;v_round integer:=0;
  v_ledger bigint:=0;v_pointers bigint:=0;v_dirs bigint:=0;v_n bigint;v_live boolean;v_artifacts jsonb;
- v_manifest uuid:=p_manifest;v_pair_users text[];v_pair_origins text[];v_bytes numeric;
+ v_manifest uuid:=p_manifest;v_bytes numeric;
  c_erased_revision CONSTANT bigint:=9007199254740991;
  c_turn_origin CONSTANT text:='relayhistory:conversation_turns:v1';
  c_max_owners CONSTANT integer:=64;
@@ -302,31 +315,25 @@ BEGIN
   v_manifest:=NULL;
  END IF;
  IF v_manifest IS NOT NULL THEN
-  -- The (owner, origin) pairs, derived ONCE under the owner locks: the size preflight and the target rows both use them.
-  SELECT coalesce(array_agg(u.user_id ORDER BY u.user_id COLLATE "C",o.origin_id COLLATE "C"),'{}'),
-         coalesce(array_agg(o.origin_id ORDER BY u.user_id COLLATE "C",o.origin_id COLLATE "C"),'{}')
-   INTO v_pair_users,v_pair_origins
-   FROM unnest(v_users) AS u(user_id)
-   CROSS JOIN LATERAL (SELECT q.origin_id FROM sessions.ingest_session_ownership AS q
-     WHERE q.org_id=p_org AND q.workspace_id=p_ws AND q.user_id=u.user_id AND q.source=p_source AND q.session_id=ANY(p_ids)
-    UNION SELECT c_turn_origin) AS o;
-  -- Size preflight (exact framed octets of the digest message, numeric so it cannot overflow), BEFORE any target row
-  -- is written or aggregated: over the cap, no targets are recorded and the erase takes the legacy derivation below.
+  -- Size preflight (exact framed octets of the digest message, numeric so it cannot overflow), streamed as aggregates
+  -- over the one (owner, origin) derivation, session_erasure_replay_pairs, under the owner locks: nothing is
+  -- materialized (no array, no target row) before the bound is known. Over the cap no targets are recorded and the
+  -- erase takes the legacy derivation below.
   SELECT sessions.session_erasure_replay_framed_header(v_manifest)
-    +4+octet_length((cardinality(v_pair_users)::numeric*cardinality(p_ids))::text)
-    +coalesce(sum(cardinality(p_ids)::numeric*(16+octet_length(convert_to(x.u,'UTF8'))+octet_length(convert_to(x.o,'UTF8'))
+    +4+octet_length((count(*)::numeric*cardinality(p_ids))::text)
+    +coalesce(sum(cardinality(p_ids)::numeric*(16+octet_length(convert_to(x.user_id,'UTF8'))+octet_length(convert_to(x.origin_id,'UTF8'))
        +octet_length(convert_to(p_source,'UTF8')))),0)
-    +cardinality(v_pair_users)::numeric*(SELECT coalesce(sum(octet_length(convert_to(i,'UTF8'))),0) FROM unnest(p_ids) AS i)
+    +count(*)::numeric*(SELECT coalesce(sum(octet_length(convert_to(i,'UTF8'))),0) FROM unnest(p_ids) AS i)
    INTO v_bytes
-   FROM unnest(v_pair_users,v_pair_origins) AS x(u,o);
+   FROM sessions.session_erasure_replay_pairs(p_org,p_ws,p_source,v_users,p_ids) AS x;
   IF v_bytes IS NULL OR v_bytes>sessions.session_erasure_replay_digest_cap() THEN
    v_manifest:=NULL;
   END IF;
  END IF;
  IF v_manifest IS NOT NULL THEN
   INSERT INTO sessions.session_erasure_replay_targets(manifest_id,org_id,workspace_id,user_id,origin_id,source,session_id)
-  SELECT v_manifest,p_org,p_ws,x.u,x.o,p_source,i
-   FROM unnest(v_pair_users,v_pair_origins) AS x(u,o) CROSS JOIN unnest(p_ids) AS i;
+  SELECT v_manifest,p_org,p_ws,x.user_id,x.origin_id,p_source,i
+   FROM sessions.session_erasure_replay_pairs(p_org,p_ws,p_source,v_users,p_ids) AS x CROSS JOIN unnest(p_ids) AS i;
  END IF;
  -- NO SEAL (design F1 ruling, hard-delete-owner, option (c)): the alias closure comes from session_index alone, and a
  -- physical session whose index link is missing (its ownership committed before its pointer, or the link removed) is

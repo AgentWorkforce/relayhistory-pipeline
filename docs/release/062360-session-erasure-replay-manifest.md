@@ -39,8 +39,10 @@ every session erasure.
     Both guards refuse any isolation but READ COMMITTED (40001), so a stale REPEATABLE READ snapshot can neither add a
     child after a seal nor seal from an old count.
   - Size bound, 64 MiB of framed digest message (`session_erasure_replay_digest_cap()`), well under PostgreSQL's 1 GiB
-    value ceiling. The capture derives the (owner, origin) pairs once, preflights the exact framed size from them
-    (numeric, overflow-safe) BEFORE writing or aggregating any target row, and over the cap records no targets and
+    value ceiling. The capture has one (owner, origin) derivation, the set-returning
+    `session_erasure_replay_pairs`. The preflight streams scalar aggregates (count, octet sums; numeric,
+    overflow-safe) over it, materializing nothing: no array, no target row. Only under the cap are the target rows
+    inserted from the same derivation, under the same owner locks. Over the cap no targets are recorded and the erase
     takes the legacy derivation. The digest function checks the bound in its own first statement and returns NULL
     over it; the seal trigger checks it in its own statement before any digest. No evaluation order can build an
     over-cap message.
