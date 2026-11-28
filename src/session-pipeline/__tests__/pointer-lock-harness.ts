@@ -120,8 +120,8 @@ export async function pointerRig() {
   });
 
   /** `marker`: the record id (default `r<revision>`), so two incarnations with one revision number differ in content. */
-  async function writeManifest(revision: number, l: Loc = loc, marker = `r${revision}`) {
-    const source = new TextEncoder().encode(JSON.stringify({ kind: "session_event", origin_id: "o", record_id: marker, revision: "1", operation: "upsert", received_at: AT, payload: { ts_ms: 1, text: "x" } }) + "\n");
+  async function writeManifest(revision: number, l: Loc = loc, marker = `r${revision}`, text = "x") {
+    const source = new TextEncoder().encode(JSON.stringify({ kind: "session_event", origin_id: "o", record_id: marker, revision: "1", operation: "upsert", received_at: AT, payload: { ts_ms: 1, text } }) + "\n");
     const stored = new Uint8Array(zstdCompressSync(source));
     const sha = await sha256Hex(source);
     const chunk: ChunkEntry = { seq: 0, epoch: 0, start_offset: 0, bytes: source.byteLength, stored_bytes: stored.byteLength, sha256: sha, sha256_8: sha.slice(0, 8), stored_sha256: await sha256Hex(stored), stored_raw_bytes: source.byteLength, raw_sha256: sha, compression: "zstd", records: 1 };
