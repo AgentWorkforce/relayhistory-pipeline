@@ -610,7 +610,15 @@ components:
         owner-buffered read's `buffered_fenced` and the token check's 503s
         (such as `token_store_unavailable` and `relaycontrol_unavailable`) with
         `Retry-After: 1`, and a service that is not enabled (`not_configured`)
-        with `Retry-After: 60`. That list is not complete.
+        with `Retry-After: 60`. On the hosted Lambda with
+        `READ_API_PARTIAL_CANONICAL_EVENTS=true` (default off), a canonical
+        cursor page (`cursor` from that read's previous page) of
+        `/v1/sessions/{sessionId}/events` answers 503 `backend_unavailable`
+        with `reason: events_canonical_transient` and no `Retry-After` when the
+        object read failed transiently; retry the same cursor a bounded number
+        of times, then restart without a cursor. Its first page never answers
+        this 503: every refusal there is the unchanged 501 `session_partial`.
+        That list is not complete.
       headers:
         Retry-After:
           description: Seconds to wait before retrying, when present. 60 with `reason` `session_partial`; other 503s set their own value or none (see the description).
@@ -633,7 +641,10 @@ components:
       description: >-
         401 missing_authorization or invalid_token; 403 forbidden (wrong
         workspace or no rth:read) or audience_mismatch; 400 bad_request; 501
-        unsupported_by_backend with a reason; 503 backend_unavailable or
+        unsupported_by_backend with a reason; 409 cursor_backend_transition
+        on `/v1/sessions/{sessionId}/events` when a cursor was issued by
+        another backend or a canonical cursor's source generation moved
+        (restart without a cursor); 503 backend_unavailable or
         token_store_unavailable (retryable).
       content:
         application/json:

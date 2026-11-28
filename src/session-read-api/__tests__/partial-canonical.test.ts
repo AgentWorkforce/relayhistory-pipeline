@@ -225,7 +225,7 @@ describe("partialCanonicalDeps: the Lambda source over canonicalSnapshot", () =>
   test("the hosted pointer bound (64) is oversize, before any object read", async () => {
     let touched = false;
     const spy = new Proxy(store, { get(t, k) { if (k === "getObject") touched = true; return Reflect.get(t, k); } });
-    const rows = () => Array.from({ length: 64 }, (_, i) => ({ ...pointerRow, manifest_key: `${pointerRow.manifest_key}-${i}` }));
+    const rows = () => Array.from({ length: 64 }, (_, i) => ({ ...pointerRow, manifest_key: String(pointerRow.manifest_key).replace("/m=srv_bb/", `/m=srv_${i}/`) }));
     expect(await refusal(lambdaSource({ rows, store: spy }).read())).toEqual({ class: "oversize", codes: ["pointer_bound"] });
     expect(touched).toBe(false);
   });
@@ -233,7 +233,7 @@ describe("partialCanonicalDeps: the Lambda source over canonicalSnapshot", () =>
   test("a pointer generation that moves during the read is refused (transient)", async () => {
     let call = 0;
     // A second live pointer appears between the pre-read and the post-read pointer query.
-    const rows = () => ++call === 1 ? [pointerRow] : [pointerRow, { ...pointerRow, manifest_key: `${pointerRow.manifest_key}-new` }];
+    const rows = () => ++call === 1 ? [pointerRow] : [pointerRow, { ...pointerRow, manifest_key: String(pointerRow.manifest_key).replace("/m=srv_bb/", "/m=srv_new/") }];
     expect(await refusal(lambdaSource({ rows }).read())).toEqual({ class: "transient", codes: ["source_generation_changed"] });
   });
 
@@ -245,6 +245,42 @@ describe("partialCanonicalDeps: the Lambda source over canonicalSnapshot", () =>
     expect([...new Set(calls)]).toEqual(["getObject"]);
     // Manifest then chunk: exactly one GET each.
     expect(calls).toEqual(["getObject", "getObject"]);
+  });
+
+  test("IAM dependency: every object key read matches the class (a) pattern 96bulls/*/v1/*", async () => {
+    const keys: string[] = [];
+    const audited = new Proxy(store, { get(t, k) { const v = Reflect.get(t, k); return k === "getObject" ? (key: unknown, ...a: unknown[]) => { keys.push(String(key)); return (v as (...x: unknown[]) => unknown).call(t, key, ...a); } : v; } });
+    await lambdaSource({ store: audited }).read();
+    expect(keys).toHaveLength(2);
+    for (const key of keys) expect(key).toMatch(/^96bulls\/[^/]+\/v1\//);
+    // A pointer row naming a key outside the caller's scope is refused before any GET.
+    const outside: string[] = [];
+    const spy = new Proxy(store, { get(t, k) { const v = Reflect.get(t, k); return k === "getObject" ? (key: unknown, ...a: unknown[]) => { outside.push(String(key)); return (v as (...x: unknown[]) => unknown).call(t, key, ...a); } : v; } });
+    const key = String(pointerRow.manifest_key);
+    for (const bad of [
+      key.replace("/v1/", "/v2/"),                       // another layout
+      key.replace("96bulls/org_1/", "96bulls/org_2/"),   // another org
+      key.replace("96bulls/", "other/"),                 // another base
+      key.replace("/ws=ws_1/", "/ws=ws_2/"),             // another workspace
+      key.replace("/h=claude/", "/h=codex/"),            // another harness
+      key.replace("/manifest.json", "/raw/0000000000-0-aaaaaaaa.ndjson.zst"), // not a manifest
+      key.replace("96bulls/org_1/", "96bulls/org_1/../org_2/"), // traversal
+    ]) {
+      expect([bad, await refusal(lambdaSource({ store: spy, rows: () => [{ ...pointerRow, manifest_key: bad }] }).read())]).toEqual([bad, { class: "forbidden", codes: ["prefix_mismatch"] }]);
+    }
+    expect(outside).toEqual([]);
+  });
+
+  test("key scope admits the caller's upload-generation publication manifests", async () => {
+    const { parseSessionKey } = await import("../../../packages/object-store/src/index.ts");
+    const at = parseSessionKey(String(pointerRow.manifest_key))!;
+    const pub = `96bulls/org_1/upload-generations/g=0190a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a5b/v1/ws=${at.workspaceId}/m=${at.machineId}/h=${at.harness}/d=2026/11/01/s=${at.sessionId}/publications/0190a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a5c/manifest.json`;
+    // Admitted by the scope check: the read proceeds to the GET (absent here, so object_missing).
+    const keys: string[] = [];
+    const spy = new Proxy(store, { get(t, k) { const v = Reflect.get(t, k); return k === "getObject" ? (key: unknown, ...a: unknown[]) => { keys.push(String(key)); return (v as (...x: unknown[]) => unknown).call(t, key, ...a); } : v; } });
+    const got = await refusal(lambdaSource({ store: spy, rows: () => [{ ...pointerRow, manifest_key: pub }] }).read());
+    expect(got.codes).not.toContain("prefix_mismatch");
+    expect(keys).toEqual([pub]);
   });
 
   test("IAM dependency: without ListBucket S3 answers 403 for a missing key; that is a refusal, never a read of anything else", async () => {

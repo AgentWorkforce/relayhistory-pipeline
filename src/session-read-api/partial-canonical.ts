@@ -49,7 +49,8 @@ import { MESSAGE_ORIGIN_LABELS_VAR, messageOriginLabelsEnabled } from "../../pac
 import { readerMaxRuleset } from "../../packages/pipeline/src/lib/scrub-engine/reader-policy.ts";
 import { lambdaCredentials } from "../session-pipeline/aws-json.ts";
 import { createS3Store } from "../shared/vendor.ts";
-import { canonicalSnapshot, type CanonicalDeps, type CanonicalIdentity } from "./canonical.ts";
+import { isManifestRest, parseSessionKey, parseUploadGenerationPrefix } from "../../packages/object-store/src/index.ts";
+import { CanonicalReadError, canonicalSnapshot, type CanonicalDeps, type CanonicalIdentity, type CanonicalPointer } from "./canonical.ts";
 import { parseDirectoryWorkspaces } from "./config.ts";
 import type { TenantRunner } from "./liveness.ts";
 import { sqlCanonicalPointers } from "./session-timing-source.ts";
@@ -144,7 +145,27 @@ export function partialCanonicalDeps(env: NodeJS.ProcessEnv, entry: "lambda" | "
   const fetcher = ports.fetch ?? ((input, init) => fetch(input, init));
   const credentials = ports.credentials ?? (async () => lambdaCredentials());
   const makeStore = ports.makeStore ?? createS3Store;
-  const pointers = sqlCanonicalPointers(run);
+  const sql = sqlCanonicalPointers(run);
+  /**
+   * Key scope before any object IO. canonicalSnapshot checks the org prefix only on the manifest it
+   * has already fetched, so a pointer row naming a key elsewhere would still be requested. Here every
+   * pointer's manifest key must be a manifest under the caller's `<PIPELINE_KEY_PREFIX>/<org>` base
+   * (directly, or under that base's upload-generation prefix), in the caller's workspace and harness,
+   * in the v1 layout; otherwise the whole read is refused (prefix_mismatch, forbidden) with no GET. Keys
+   * that pass sit inside the IAM object pattern "<PIPELINE_KEY_PREFIX>/ * /v1/ *" (spaces added here only).
+   */
+  const pointers = async (identity: CanonicalIdentity): Promise<CanonicalPointer[]> => {
+    const rows = await sql.pointers(identity);
+    const base = `${config.keyPrefix}/${identity.orgId}`;
+    for (const p of Array.isArray(rows) ? rows : []) {
+      const key = typeof p?.manifest_key === "string" ? p.manifest_key : "";
+      const at = key.split("/").some((x) => x === "" || x === "." || x === "..") ? undefined : parseSessionKey(key);
+      if (!at || !isManifestRest(at.rest) || at.workspaceId !== identity.workspaceId || at.harness !== identity.source ||
+          !(at.prefix === base || parseUploadGenerationPrefix(at.prefix)?.base === base))
+        throw new CanonicalReadError("prefix_mismatch");
+    }
+    return rows;
+  };
   const prefix = { PIPELINE_KEY_PREFIX: config.keyPrefix, PIPELINE_ORG_FROM_PREFIX: "true" };
   function deps(signal: AbortSignal): CanonicalDeps {
     // Every object read of this request is aborted at the route's deadline.
@@ -152,7 +173,7 @@ export function partialCanonicalDeps(env: NodeJS.ProcessEnv, entry: "lambda" | "
     const store = makeStore({ bucket: config.bucket, region: config.region, credentials, fetch: bounded });
     return {
       ...(config.readerMaxRuleset !== undefined ? { readerMaxRuleset: config.readerMaxRuleset } : {}),
-      store, provider: "s3", bucket: config.bucket, prefix, pointers: pointers.pointers, decompress,
+      store, provider: "s3", bucket: config.bucket, prefix, pointers, decompress,
     };
   }
   return {

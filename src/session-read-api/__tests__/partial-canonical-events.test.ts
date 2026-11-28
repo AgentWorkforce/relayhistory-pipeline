@@ -387,6 +387,18 @@ describe("public handler (handleUrlEvent)", () => {
     }
   });
 
+  test("PH3a caller authorization refusals answer before any canonical lookup (401/403, never the 501 Cloud falls back on)", async () => {
+    const bad = fixture({ pc: { workspaces: "*" } });
+    bad.deps.verify = async () => { throw new Error("synthetic bad token"); };
+    const scope = fixture({ pc: { workspaces: "*" } });
+    scope.deps.verify = async () => ({ ...tenant, userId: "u", scopes: [] });
+    const other = fixture({ pc: { workspaces: "*" } });
+    other.deps.verify = async () => ({ orgId: "org-a", workspaceId: "ws-b", userId: "u", scopes: ["rth:read"] });
+    const got = [await call(bad, "&source=codex", "Bearer bad"), await call(scope, "&source=codex"), await call(other, "&source=codex")];
+    expect(got.map((r) => [r.status, r.body.error?.code, "events" in r.body])).toEqual([[401, "invalid_token", false], [403, "forbidden", false], [403, "forbidden", false]]);
+    for (const f of [bad, scope, other]) expect([f.counts(), f.mem.calls.erased.length]).toEqual([{ reads: 0, sourceCalls: 0, indexQueries: 0 }, 0]);
+  });
+
   test("PH4 erased: the route's existing erased contract (200, empty events), never content", async () => {
     // Before the read (tombstone): no object IO.
     const before = fixture({ pc: { workspaces: "*" }, created: {}, erased: [{ source: "codex", sessionId: "sess" }] });
@@ -410,6 +422,47 @@ describe("public handler (handleUrlEvent)", () => {
       expect([r.status, r.body.error?.reason, "events" in r.body]).toEqual([501, "session_partial", false]);
       expect(refused(f)[0]).toMatch(/^canonical_oversize,/);
     }
+  });
+});
+
+describe("no content on any refused or erased answer", () => {
+  const FAILS: unknown[] = [
+    new CanonicalReadError("tenant_mismatch"), new CanonicalReadError("pointer_invalid"), new CanonicalReadError("prefix_mismatch"),
+    new CanonicalReadError("manifest_mismatch"), new CanonicalReadError("object_missing"), new CanonicalReadError("pointer_bound"),
+    new CanonicalReadError("canonical_projection_incomplete", 503, ["scope_too_large"]), new CanonicalReadError("deadline"),
+    new ObjectStoreError("unauthorized", "s3", "synthetic", { status: 403 }), new ObjectStoreError("transient", "s3", "synthetic", { status: 503 }),
+    new TypeError("fetch failed"),
+  ];
+  test("PH6 every refusal class, first and cursor page: no event content in the body or in any log line", async () => {
+    for (const error of FAILS) for (const query of ["&source=codex", "", `&source=codex&cursor=${objectCursor()}`]) {
+      const f = fixture({ pc: { workspaces: "*" } });
+      f.state.fail = error;
+      const r = await f.get(query);
+      const body = await r.text();
+      expect([String(error), query, r.status >= 400, body.includes("synthetic-canonical"), JSON.parse(body).events]).toEqual([String(error), query, true, false, undefined]);
+      expect(JSON.stringify(f.logs).includes("synthetic-canonical")).toBe(false);
+    }
+  });
+
+  test("PH6 erased before, during, or fenced after the read: no event content in the body or in any log line", async () => {
+    const runs: Array<ReturnType<typeof fixture>> = [];
+    const before = fixture({ pc: { workspaces: "*" }, created: {}, erased: [{ source: "codex", sessionId: "sess" }] });
+    runs.push(before);
+    for (const query of ["&source=codex", `&source=codex&cursor=${objectCursor()}`]) {
+      const during = fixture({ pc: { workspaces: "*" } });
+      during.state.afterRead = () => during.mem.erase({ ...tenant, source: "codex", sessionId: "sess" });
+      runs.push(during);
+      const r = await during.get(query);
+      expect((await r.text()).includes("synthetic-canonical")).toBe(false);
+    }
+    const fenced = fixture({ pc: { workspaces: "*" } });
+    const keys = new Set<string>();
+    fenced.deps.operatorErased = async (k) => keys.has(`${k.source}/${k.sessionId}`);
+    fenced.state.afterRead = () => keys.add("codex/sess");
+    runs.push(fenced);
+    expect((await (await before.get("&source=codex")).text()).includes("synthetic-canonical")).toBe(false);
+    expect((await (await fenced.get("")).text()).includes("synthetic-canonical")).toBe(false);
+    for (const f of runs) expect(JSON.stringify(f.logs).includes("synthetic-canonical")).toBe(false);
   });
 });
 
