@@ -1,305 +1,355 @@
 /**
- * T144 offline fixtures for the session-brief trigger (trigger.ts): a deterministic simulation of the hosted path
- * (a standard queue with delays, visibility timeout and redelivery; a consumer that applies the debounce plan,
- * hands off durably and acknowledges only after the handoff or the run) on a fake clock. No network, no database.
+ * T144 offline fixtures for the session-brief trigger (trigger.ts): a deterministic simulation on a fake clock of
+ *   - the durable wakeup rows (one per (org, workspace, harness, session)), armed only by committed evidence;
+ *   - the hosted path: a standard queue (delay, visibility timeout, redelivery), a consumer that wakes the rows a
+ *     hint addresses, hands off durably and acknowledges only after a run or a successful handoff, and a recovery
+ *     tick that enqueues sweep hints every SESSION_BRIEF_SWEEP_SECONDS;
+ *   - the self-host path: the native worker polling the rows every minute.
+ * No network, no database. Every run records when it became claimable and when it was claimed.
  */
 import { describe, expect, test } from "bun:test";
 import {
-  BRIEF_TRIGGER_CONTRACT, briefTriggerConfig, briefTriggerId, briefWakeHint, claimPlan, finishPlan, handoffPlan,
-  parseBriefWakeHint, planWakeup, SQS_MAX_DELAY_SECONDS, type BriefPhysicalIncarnation, type BriefWakeHint,
-  type BriefWakeKind, type BriefWakeState,
+  BRIEF_TRIGGER_CONTRACT, briefTriggerConfig, briefTriggerId, briefWakeHint, claimAt, claimPlan, finishPlan, handoffPlan,
+  hintCovers, parseBriefWakeHint, planArm, planHint, refreshMiss, SQS_MAX_DELAY_SECONDS, type BriefPhysicalIncarnation,
+  type BriefWakeHint, type BriefWakeKind, type BriefWakeState,
 } from "../trigger.ts";
 
 const T0 = Date.UTC(2026, 10, 28, 12, 0, 0);
 const TIMING = { maxDelaySeconds: 8, idleSeconds: 600, maxWaitSeconds: 3_600 };
-const THROTTLE_MS = 120_000;
+const THROTTLE_S = 120;
 const VISIBILITY_MS = 30_000;
-const INC: BriefPhysicalIncarnation = { source: "claude", session: "phys-1", machine: "srv_00000000000000000000000000000001", generation: "1" };
 const DIGEST = "a".repeat(64);
+const inc = (harness: string): BriefPhysicalIncarnation => ({ source: harness, session: "phys-1", machine: "srv_00000000000000000000000000000001", generation: "1" });
+const hint = (kind: BriefWakeKind, revision: number, at: number, harness = "claude"): BriefWakeHint =>
+  briefWakeHint(kind, { org: "org-1", workspace: "ws-1", harness, session: "sess-1", revision, digest: DIGEST, first_uncovered_at: at }, inc(harness));
+const v1 = (h: BriefWakeHint): BriefWakeHint => {
+  const { harness: _h, ...rest } = h as BriefWakeHint & { harness?: string };
+  return { ...rest, v: 1 } as BriefWakeHint;
+};
 
-const hint = (kind: BriefWakeKind, revision: number, firstUncoveredAt: number, inc: BriefPhysicalIncarnation = INC): BriefWakeHint =>
-  briefWakeHint(kind, { org: "org-1", workspace: "ws-1", session: "sess-1", revision, digest: DIGEST, first_uncovered_at: firstUncoveredAt }, inc);
+interface Brief { revision: number; lastAttempt?: number; ready: boolean }
+interface Run { harness: string; claimableAt: number; claimedAt: number; generation: number; dueAt: number }
 
-/** The hosted path on a fake clock: queue + durable state + consumer + worker run. */
 class Sim {
   now = T0;
-  state: BriefWakeState | null = null;
-  hasBrief: boolean;
-  lastAttempt: number | null = null;
+  rows = new Map<string, { state: BriefWakeState }>(); // by harness (one org/workspace/session in these fixtures)
+  briefs = new Map<string, Brief>();
+  /** The highest committed revision per harness (what a run reads from the authoritative pointers). */
+  committed = new Map<string, number>();
   queue: { hint: BriefWakeHint; visibleAt: number; receives: number }[] = [];
-  /** Each run: when it was claimed, the due time it was claimed for, whether the throttle let it through. */
-  runs: { claimedAt: number; dueAt: number; generation: number }[] = [];
-  throttled = 0;
+  runs: Run[] = [];
   failSends = 0;
-  inFlight: { generation: number } | null = null;
-  /** The highest revision a run has covered (the stored brief's brief_revision). */
-  covered: number | undefined;
-  constructor(opts: { hasBrief?: boolean } = {}) { this.hasBrief = opts.hasBrief ?? false; }
+  failRuns = 0;
+  inFlight = new Map<string, { generation: number }>();
+  private lastSweep = T0;
+  private lastPoll = T0;
+  /** sweepSeconds: the hosted recovery tick (0 = off); poll: the self-host native worker's minute poll. */
+  constructor(public opts: { sweepSeconds?: number; poll?: boolean } = {}) {}
 
+  brief(h: string): Brief { return this.briefs.get(h) ?? { revision: -1, ready: false }; }
+
+  /** The producer, right after the authoritative CAS: arm the durable row, then send the hint (which may be lost). */
+  commit(harness: string, revision: number, opts: { kind?: "append" | "end"; lose?: boolean } = {}) {
+    this.committed.set(harness, Math.max(this.committed.get(harness) ?? -1, revision));
+    const prev = this.rows.get(harness)?.state ?? null;
+    this.rows.set(harness, { state: planArm(prev, this.now, this.brief(harness).ready, TIMING) });
+    const h = hint(opts.kind ?? "append", revision, prev?.pendingSince ?? this.now, harness);
+    if (!opts.lose) this.send(h);
+    return h;
+  }
   send(h: BriefWakeHint, delaySeconds = 0) {
     if (this.failSends > 0) { this.failSends--; throw new Error("sqs_unavailable"); }
     this.queue.push({ hint: h, visibleAt: this.now + delaySeconds * 1_000, receives: 0 });
   }
-  /** The producer, right after the authoritative manifest CAS. */
-  produce(h: BriefWakeHint) { this.send(h); }
-
-  /** The event source mapping delivers every visible message once; the consumer acks or reports a failure. */
-  deliver() {
-    const due = this.queue.filter((m) => m.visibleAt <= this.now);
-    for (const m of due) {
-      m.receives++;
-      const ok = this.consume(m.hint);
-      if (ok) this.queue.splice(this.queue.indexOf(m), 1);
-      else m.visibleAt = this.now + VISIBILITY_MS; // batch item failure: redelivered after the visibility timeout
-    }
+  claimable(h: string, s: BriefWakeState) {
+    const b = this.brief(h);
+    return claimAt(s, { hasBrief: b.ready, throttleSeconds: THROTTLE_S, ...(b.lastAttempt !== undefined ? { lastAttemptMs: b.lastAttempt } : {}) });
   }
 
-  /** The hosted consumer: apply the plan, then run or hand off; true = acknowledge the message. */
+  /** The hosted consumer for one message; true = acknowledge. */
   consume(h: BriefWakeHint): boolean {
-    const next = planWakeup(this.state, h, { nowMs: this.now, hasBrief: this.hasBrief, timing: TIMING, ...(this.covered !== undefined ? { coveredRevision: this.covered } : {}) }) ?? this.state;
-    if (!next) return true; // nothing to do (a sweep for no work it could add)
-    this.state = next;
-    if (next.leased) return true; // a run is in flight: the generation bump keeps the trailing work
-    const plan = handoffPlan(next, this.now);
-    if (plan.action === "defer") {
-      try { this.send(h, plan.delaySeconds); } catch { return false; } // failed handoff: keep the original
-      return true;
+    let earliest = Infinity;
+    for (const [harness, row] of [...this.rows]) {
+      if (!hintCovers(h, { org: "org-1", workspace: "ws-1", harness, session: "sess-1" })) continue;
+      const b = this.brief(harness);
+      const next = planHint(row.state, h, { nowMs: this.now, hasBrief: b.ready, timing: TIMING, ...(b.ready ? { coveredRevision: b.revision } : {}) });
+      if (next) row.state = next;
+      if (row.state.leased) continue; // in flight: the generation decides the trailing work
+      const at = this.claimable(harness, row.state);
+      if (at <= this.now) this.claim(harness);
+      else earliest = Math.min(earliest, at);
     }
-    this.claim();
+    if (earliest === Infinity) return true;
+    const plan = handoffPlan(earliest, this.now);
+    try { this.send(h, plan.action === "defer" ? plan.delaySeconds : 0); } catch { return false; } // failed handoff: keep the original
     return true;
   }
 
-  /** Claim and (synchronously, unless `hold`) run; the throttle applies to a refresh only. */
-  claim(hold = false) {
-    const s = this.state!;
-    if (this.hasBrief && this.lastAttempt !== null && this.now - this.lastAttempt < THROTTLE_MS) {
-      this.throttled++;
-      this.state = { ...s, dueAt: this.lastAttempt + THROTTLE_MS };
-      this.send(this.continuation(), Math.ceil((this.state.dueAt - this.now) / 1_000));
+  claim(harness: string, hold = false) {
+    const row = this.rows.get(harness)!;
+    this.runs.push({ harness, claimableAt: this.claimable(harness, row.state), claimedAt: this.now, generation: row.state.generation, dueAt: row.state.dueAt });
+    row.state = claimPlan(row.state);
+    this.inFlight.set(harness, { generation: row.state.generation });
+    if (!hold) this.finish(harness);
+  }
+  finish(harness: string) {
+    const row = this.rows.get(harness)!;
+    const g = this.inFlight.get(harness)!.generation;
+    this.inFlight.delete(harness);
+    const b = this.brief(harness);
+    if (this.failRuns > 0) { // a retryable failure: the attempt counts, the row is rescheduled 60 s out (existing backoff)
+      this.failRuns--;
+      this.briefs.set(harness, { ...b, lastAttempt: this.now });
+      row.state = { ...row.state, leased: false, dueAt: this.now + 60_000, backoff: true };
       return;
     }
-    this.runs.push({ claimedAt: this.now, dueAt: s.dueAt, generation: s.generation });
-    // The run reads the authoritative pointers: it covers every revision committed so far.
-    this.covered = Math.max(this.covered ?? 0, s.revision);
-    this.state = claimPlan(s);
-    this.inFlight = { generation: s.generation };
-    if (!hold) this.finish();
+    // The run read the authoritative pointers: it covers every revision committed so far.
+    this.briefs.set(harness, { revision: this.committed.get(harness)!, ready: true, lastAttempt: this.now });
+    const next = finishPlan(row.state, g, this.now, TIMING);
+    if (next) row.state = next; else this.rows.delete(harness);
   }
-  finish() {
-    const g = this.inFlight!.generation;
-    this.inFlight = null;
-    this.lastAttempt = this.now;
-    this.hasBrief = true;
-    this.state = finishPlan(this.state!, g, { nowMs: this.now, timing: TIMING });
-    if (this.state) this.send(this.continuation(), handoffPlan(this.state, this.now).action === "run" ? 0 : (handoffPlan(this.state, this.now) as { delaySeconds: number }).delaySeconds);
-  }
-  /** A continuation re-presents the latest hint (same trigger id and revision): it re-evaluates, never re-arms. */
-  continuation(): BriefWakeHint { return { ...hint("append", this.state!.revision, T0), trigger_id: this.state!.lastTriggerId! }; }
 
-  advance(ms: number, step = 1_000) {
+  /** Each second: deliver visible messages; the hosted sweep tick; the self-host poll. */
+  advance(ms: number) {
     const end = this.now + ms;
-    while (this.now < end) { this.now = Math.min(end, this.now + step); this.deliver(); }
+    while (this.now < end) {
+      this.now += 1_000;
+      for (const m of this.queue.filter((x) => x.visibleAt <= this.now)) {
+        m.receives++;
+        if (this.consume(m.hint)) this.queue.splice(this.queue.indexOf(m), 1);
+        else m.visibleAt = this.now + VISIBILITY_MS;
+      }
+      const sweep = this.opts.sweepSeconds ?? 0;
+      if (sweep > 0 && this.now - this.lastSweep >= sweep * 1_000) {
+        this.lastSweep = this.now;
+        for (const harness of this.rows.keys()) this.send(hint("sweep", this.committed.get(harness) ?? 0, T0, harness));
+      }
+      if (this.opts.poll && this.now - this.lastPoll >= 60_000) {
+        this.lastPoll = this.now;
+        for (const [harness, row] of [...this.rows]) if (!row.state.leased && this.claimable(harness, row.state) <= this.now) this.claim(harness);
+      }
+    }
   }
 }
 
-describe("session-brief trigger: hint contract v1", () => {
-  test("the contract digest and exact shape", () => {
+describe("session-brief trigger: hint contract", () => {
+  test("the contract digest; v1 and v2 exact shapes", () => {
     expect(BRIEF_TRIGGER_CONTRACT).toBe("f01914a6cdc3db01353cb3a67f3e2cf1631b78da6a019d4582a532c6e7437d37");
     const h = hint("append", 3, T0);
-    expect(Object.keys(h).sort()).toEqual(["digest", "first_uncovered_at", "kind", "org", "revision", "session", "trigger_id", "v", "workspace"]);
+    expect(h.v).toBe(2);
+    expect(Object.keys(h).sort()).toEqual(["digest", "first_uncovered_at", "harness", "kind", "org", "revision", "session", "trigger_id", "v", "workspace"]);
     expect(parseBriefWakeHint(JSON.parse(JSON.stringify(h)))).toEqual(h);
-    for (const bad of [{ ...h, v: 2 }, { ...h, kind: "start" }, { ...h, extra: 1 }, { ...h, org: "../x" }, { ...h, revision: -1 }, { ...h, revision: 1.5 },
-      { ...h, digest: "A".repeat(64) }, { ...h, first_uncovered_at: 1_700_000 }, { ...h, trigger_id: "x" }, null, [], "hint"])
+    const one = v1(h);
+    expect(parseBriefWakeHint(one)).toEqual(one);
+    for (const bad of [{ ...h, v: 3 }, { ...one, harness: "claude" }, { ...h, harness: "Claude" }, { ...h, kind: "start" }, { ...h, extra: 1 },
+      { ...h, org: "../x" }, { ...h, revision: -1 }, { ...h, revision: 1.5 }, { ...h, digest: "A".repeat(64) }, { ...h, first_uncovered_at: 1_700_000 },
+      { ...h, trigger_id: "x" }, null, [], "hint"])
       expect(parseBriefWakeHint(bad)).toBeNull();
-    const { trigger_id: _t, ...missing } = h;
-    expect(parseBriefWakeHint(missing)).toBeNull();
+    const { harness: _h, ...noHarness } = h as BriefWakeHint & { harness: string };
+    expect(parseBriefWakeHint(noHarness)).toBeNull(); // v2 without its harness
   });
 
-  test("the retry identity is stable for the same commit and differs for any other incarnation, kind or revision", () => {
-    const f = { org: "org-1", workspace: "ws-1", session: "sess-1", revision: 3, digest: DIGEST };
-    expect(briefTriggerId("append", f, INC)).toBe(briefTriggerId("append", f, { ...INC }));
-    for (const other of [{ ...INC, generation: "2" }, { ...INC, machine: "srv_00000000000000000000000000000002" }, { ...INC, session: "phys-2" }, { ...INC, source: "codex" }])
-      expect(briefTriggerId("append", f, other)).not.toBe(briefTriggerId("append", f, INC));
-    expect(briefTriggerId("end", f, INC)).not.toBe(briefTriggerId("append", f, INC));
-    expect(briefTriggerId("append", { ...f, revision: 4 }, INC)).not.toBe(briefTriggerId("append", f, INC));
-    expect(briefTriggerId("append", { ...f, digest: "b".repeat(64) }, INC)).not.toBe(briefTriggerId("append", f, INC));
+  test("the tracing id is stable for one commit and differs for any other incarnation, kind, revision or harness", () => {
+    const f = { org: "org-1", workspace: "ws-1", harness: "claude", session: "sess-1", revision: 3, digest: DIGEST };
+    expect(briefTriggerId("append", f, inc("claude"))).toBe(briefTriggerId("append", f, { ...inc("claude") }));
+    for (const other of [{ ...inc("claude"), generation: "2" }, { ...inc("claude"), machine: "srv_00000000000000000000000000000002" }, { ...inc("claude"), session: "phys-2" }])
+      expect(briefTriggerId("append", f, other)).not.toBe(briefTriggerId("append", f, inc("claude")));
+    expect(briefTriggerId("end", f, inc("claude"))).not.toBe(briefTriggerId("append", f, inc("claude")));
+    expect(briefTriggerId("append", { ...f, revision: 4 }, inc("claude"))).not.toBe(briefTriggerId("append", f, inc("claude")));
+    expect(briefTriggerId("append", { ...f, harness: "codex" }, inc("claude"))).not.toBe(briefTriggerId("append", f, inc("claude")));
   });
 
-  test("settings: off by default, contract defaults, and a queue URL that is not SQS refuses", () => {
-    expect(briefTriggerConfig({})).toEqual({ enabled: false, timing: { maxDelaySeconds: 8, idleSeconds: 600, maxWaitSeconds: 3_600 }, sweepSeconds: 300 });
+  test("settings: off by default; the existing sweep default 0 kept (direct worker unset/0), native chart 60, hosted 300", () => {
+    expect(briefTriggerConfig({})).toEqual({ enabled: false, timing: TIMING, sweepSeconds: 0 });
     expect(briefTriggerConfig({ SESSION_BRIEF_ENABLED: "1" }).enabled).toBe(false);
     expect(briefTriggerConfig({ SESSION_BRIEF_ENABLED: "true" }).enabled).toBe(true);
-    // The existing worker sweep setting is untouched: the trigger path has its own.
-    expect(briefTriggerConfig({ SESSION_BRIEF_SWEEP_SECONDS: "0" }).sweepSeconds).toBe(300);
-    expect(briefTriggerConfig({ SESSION_BRIEF_TRIGGER_SWEEP_SECONDS: "0" }).sweepSeconds).toBe(0);
+    expect(briefTriggerConfig({ SESSION_BRIEF_ENABLED: "true" }).sweepSeconds).toBe(0); // direct worker, unset
+    expect(briefTriggerConfig({ SESSION_BRIEF_SWEEP_SECONDS: "0" }).sweepSeconds).toBe(0); // direct worker, explicit 0
+    expect(briefTriggerConfig({ SESSION_BRIEF_SWEEP_SECONDS: "60" }).sweepSeconds).toBe(60); // native chart default
+    expect(briefTriggerConfig({ SESSION_BRIEF_SWEEP_SECONDS: "300" }).sweepSeconds).toBe(300); // hosted, explicit
     expect(briefTriggerConfig({ SESSION_BRIEF_QUEUE_URL: "https://sqs.us-east-1.amazonaws.com/111122223333/brief" }).queueUrl).toContain("sqs.");
     expect(() => briefTriggerConfig({ SESSION_BRIEF_QUEUE_URL: "https://example.com/q" })).toThrow(/SQS queue URL/);
+  });
+});
+
+describe("session-brief trigger: due and claim eligibility", () => {
+  test("a hint is monotone: never later, never pending_since or the generation, never creates a row", () => {
+    const ctx = { nowMs: T0 + 30_000, hasBrief: true, timing: TIMING };
+    expect(planHint(null, hint("append", 1, T0), ctx)).toBeNull();
+    const armed = planArm(null, T0, true, TIMING);
+    expect(armed.dueAt).toBe(T0 + 600_000);
+    const ended = planHint(armed, hint("end", 1, T0), ctx)!;
+    expect(ended.dueAt).toBe(T0 + 30_000); // refresh end: due now
+    expect([ended.pendingSince, ended.generation, ended.evidenceAt]).toEqual([armed.pendingSince, armed.generation, armed.evidenceAt]);
+    expect(planHint(ended, hint("append", 1, T0), { ...ctx, nowMs: T0 + 90_000 })).toBeNull(); // never later
+    expect(planHint(armed, hint("sweep", 1, T0), ctx)).toBeNull();
+    expect(planHint(armed, hint("end", 1, T0), { ...ctx, coveredRevision: 1 })).toBeNull(); // covered
+  });
+
+  test("first brief: due within N, an end makes it due now, later evidence never pushes it back, never throttled", () => {
+    const armed = planArm(null, T0, false, TIMING);
+    expect(armed.dueAt).toBe(T0 + 8_000);
+    expect(planHint(armed, hint("end", 1, T0), { nowMs: T0 + 2_000, hasBrief: false, timing: TIMING })!.dueAt).toBe(T0 + 2_000);
+    expect(planArm(armed, T0 + 5_000, false, TIMING).dueAt).toBe(T0 + 8_000);
+    expect(claimAt(armed, { hasBrief: false, lastAttemptMs: T0 - 1_000, throttleSeconds: THROTTLE_S })).toBe(T0 + 8_000);
+  });
+
+  test("refresh where the throttle ends after max-wait: the throttle wins; the claim is scored, a >60 s serve is a miss", () => {
+    // Pending since T0-3550 s, so max-wait is due at T0+50 s; the last attempt at T0, so the throttle ends at T0+120 s.
+    const state: BriefWakeState = { pendingSince: T0 - 3_550_000, evidenceAt: T0, dueAt: T0 + 50_000, generation: 3, leased: false };
+    const at = claimAt(state, { hasBrief: true, lastAttemptMs: T0, throttleSeconds: THROTTLE_S });
+    expect(at).toBe(T0 + 120_000);
+    expect(refreshMiss(at, at + 60_000)).toBe(false);
+    expect(refreshMiss(at, at + 60_001)).toBe(true);
+    // Against the raw max-wait due time, the throttle gap alone (70 s) is already a miss.
+    expect(refreshMiss(state.dueAt, at)).toBe(true);
   });
 });
 
 describe("session-brief trigger: offline fixtures", () => {
   test("a single early hint with the recovery tick off is handed off durably and claimed at its due time", () => {
     const sim = new Sim();
-    sim.produce(hint("append", 1, T0));
+    sim.commit("claude", 1);
     sim.advance(60_000);
     expect(sim.runs).toHaveLength(1);
-    const [run] = sim.runs;
-    expect(run!.dueAt).toBe(T0 + 8_000); // first brief: max delay 8 s
-    expect(run!.claimedAt - run!.dueAt).toBeGreaterThanOrEqual(0);
-    expect(run!.claimedAt - run!.dueAt).toBeLessThanOrEqual(1_000); // the measured claim vs due
+    expect(sim.runs[0]!.dueAt).toBe(T0 + 8_000);
+    expect(sim.runs[0]!.claimedAt - sim.runs[0]!.claimableAt).toBeLessThanOrEqual(1_000);
     expect(sim.queue).toHaveLength(0);
   });
 
-  test("a failed handoff keeps the original, and the work is claimed at its due time once the handoff succeeds", () => {
-    const sim = new Sim({ hasBrief: true });
-    sim.lastAttempt = T0 - 10 * 60_000;
-    sim.produce(hint("append", 1, T0)); // a refresh: due after the 600 s idle window
-    sim.failSends = 2; // the first two handoff sends fail
+  test("a failed handoff keeps the original; the work is claimed at its due time once a handoff succeeds", () => {
+    const sim = new Sim();
+    sim.briefs.set("claude", { revision: 0, ready: true, lastAttempt: T0 - 600_000 });
+    sim.commit("claude", 1); // a refresh: due after the idle window
+    sim.failSends = 2;
     sim.advance(90_000);
-    // The original is still queued (retained, redelivered): two failed handoffs, then the third succeeded.
     expect(sim.failSends).toBe(0);
     expect(sim.runs).toHaveLength(0);
-    expect(sim.queue).toHaveLength(1);
-    expect(sim.queue[0]!.receives).toBe(0); // the handed-off copy, delayed to the due time
+    expect(sim.queue).toHaveLength(1); // the delayed handoff copy; the original was acknowledged only after it
     sim.advance(15 * 60_000);
     expect(sim.runs).toHaveLength(1);
-    expect(sim.runs[0]!.dueAt).toBe(T0 + 1_000 + 600_000);
-    expect(sim.runs[0]!.claimedAt - sim.runs[0]!.dueAt).toBeLessThanOrEqual(1_000);
-    expect(sim.queue).toHaveLength(0);
+    expect(sim.runs[0]!.claimableAt).toBe(T0 + 600_000);
+    expect(sim.runs[0]!.claimedAt - sim.runs[0]!.claimableAt).toBeLessThanOrEqual(1_000);
   });
 
-  test("duplicates (a producer retry, a redelivery) change nothing and run once", () => {
+  for (const order of [["A", "B", "A"], ["B", "A", "B"]] as const) test(`${order.join("/")} redelivery converges: final row and claims as expected`, () => {
     const sim = new Sim();
-    const h = hint("append", 1, T0);
-    sim.produce(h);
-    sim.produce(h);
-    sim.produce({ ...h });
-    sim.advance(60_000);
-    expect(sim.runs).toHaveLength(1);
-    expect(sim.state).toBeNull();
-    // A late redelivery after the work finished re-arms nothing (its revision is covered).
-    sim.produce(h);
-    sim.advance(20 * 60_000);
-    expect(sim.runs).toHaveLength(1);
-    expect(sim.state).toBeNull();
-    // The plan itself: the same trigger id twice is a no-op.
-    const s = planWakeup(null, h, { nowMs: T0, hasBrief: false, timing: TIMING })!;
-    expect(planWakeup(s, h, { nowMs: T0 + 1_000, hasBrief: false, timing: TIMING })).toBeNull();
-  });
-
-  test("continuous arrivals on a briefed session: refreshes are bounded by max-wait, then the idle window", () => {
-    const sim = new Sim({ hasBrief: true });
-    sim.lastAttempt = T0 - 10 * 60_000;
-    // An append every minute for two hours, each a new revision.
-    for (let i = 0; i < 120; i++) { sim.produce(hint("append", i + 1, sim.now)); sim.advance(60_000); }
-    sim.advance(15 * 60_000);
-    expect(sim.runs.length).toBeGreaterThanOrEqual(2);
-    // Never more often than the max-wait window while evidence keeps coming.
-    for (let i = 1; i < sim.runs.length - 1; i++)
-      expect(sim.runs[i]!.claimedAt - sim.runs[i - 1]!.claimedAt).toBeGreaterThanOrEqual(3_600_000 - 60_000);
-    // The first refresh is due at the oldest pending evidence plus max-wait (never pushed back by later arrivals).
-    expect(sim.runs[0]!.dueAt).toBe(T0 + 3_600_000);
-    // After the arrivals stop, the last refresh comes one idle window after the newest evidence.
-    const last = sim.runs.at(-1)!;
-    expect(last.dueAt).toBeLessThanOrEqual(T0 + 120 * 60_000 + 600_000);
-  });
-
-  test("an append while a run is in flight keeps the trailing work and its own oldest time", () => {
-    const sim = new Sim({ hasBrief: true });
-    sim.lastAttempt = T0 - 10 * 60_000;
-    sim.produce(hint("end", 1, T0));
-    sim.now += 1;
-    // Claim without finishing: the run is in flight.
-    sim.state = planWakeup(null, hint("end", 1, T0), { nowMs: sim.now, hasBrief: true, timing: TIMING });
-    sim.queue = [];
-    sim.claim(true);
-    expect(sim.state!.leased).toBe(true);
-    const claimedGeneration = sim.inFlight!.generation;
+    sim.briefs.set("claude", { revision: 0, ready: true, lastAttempt: T0 - 600_000 });
+    const A = sim.commit("claude", 1, { lose: true });
     sim.now += 30_000;
-    const trailingAt = sim.now;
-    sim.consume(hint("append", 2, trailingAt));
-    expect(sim.state!.generation).toBe(claimedGeneration + 1);
-    expect(sim.state!.trailingSince).toBe(trailingAt);
-    sim.now += 10_000;
-    sim.finish(); // the run's finish sees a newer generation: the trailing work stays
-    expect(sim.state).not.toBeNull();
-    expect(sim.state!.pendingSince).toBe(trailingAt); // from the trailing evidence, not the finish time
-    expect(sim.state!.dueAt).toBe(Math.min(sim.state!.evidenceAt + 600_000, trailingAt + 3_600_000));
-    sim.advance(20 * 60_000);
-    expect(sim.runs).toHaveLength(2);
-    expect(sim.state).toBeNull();
-  });
-
-  test("a lost trigger is recovered by a sweep hint", () => {
-    const sim = new Sim();
-    // The producer's hint was lost (never sent). The recovery tick enqueues a sweep for the uncovered revision.
-    sim.advance(10 * 60_000);
-    expect(sim.runs).toHaveLength(0);
-    sim.produce(hint("sweep", 1, T0));
-    sim.advance(5_000);
+    const B = sim.commit("claude", 2, { lose: true });
+    const armed = { ...sim.rows.get("claude")!.state };
+    const byName = { A, B };
+    for (const n of order) { sim.send(byName[n]); sim.advance(5_000); }
+    const row = sim.rows.get("claude")!.state;
+    expect([row.dueAt, row.pendingSince, row.generation]).toEqual([armed.dueAt, armed.pendingSince, armed.generation]);
+    sim.advance(15 * 60_000);
     expect(sim.runs).toHaveLength(1);
-    expect(sim.runs[0]!.claimedAt).toBe(sim.runs[0]!.dueAt);
+    expect(sim.runs[0]!.claimableAt).toBe(armed.dueAt);
+    for (const n of ["A", "B", "A"] as const) sim.send(byName[n]); // after completion: every replay is covered
+    sim.advance(30 * 60_000);
+    expect(sim.runs).toHaveLength(1);
+    expect(sim.rows.size).toBe(0);
   });
 
-  test("a hint at or below the covered revision is stale: it arms nothing", () => {
-    const ctx = { nowMs: T0, hasBrief: true, timing: TIMING, coveredRevision: 7 };
-    for (const k of ["append", "end", "sweep"] as const) {
-      expect(planWakeup(null, hint(k, 7, T0), ctx)).toBeNull();
-      expect(planWakeup(null, hint(k, 6, T0), ctx)).toBeNull();
-    }
-    expect(planWakeup(null, hint("append", 8, T0), ctx)!.revision).toBe(8);
+  test("a duplicate during the lease creates no trailing work; B committed during A's lease does", () => {
+    const sim = new Sim();
+    sim.briefs.set("claude", { revision: 0, ready: true, lastAttempt: T0 - 600_000 });
+    const A = sim.commit("claude", 1, { kind: "end", lose: true });
+    sim.claim("claude", true); // A's run in flight
+    const g = sim.inFlight.get("claude")!.generation;
+    sim.now += 2_000;
+    sim.consume(A); // a duplicate during the lease
+    expect(sim.rows.get("claude")!.state.generation).toBe(g);
+    sim.now += 5_000;
+    sim.commit("claude", 2, { lose: true }); // B: new committed evidence during the lease
+    expect(sim.rows.get("claude")!.state.generation).toBe(g + 1);
+    const bCommittedAt = sim.now;
+    sim.now += 20_000;
+    const finishedAt = sim.now;
+    sim.finish("claude");
+    const trailing = sim.rows.get("claude")!.state;
+    expect(trailing.leased).toBe(false);
+    // The trailing window restarts at the finish: late by the run's length (bounded by the lease), recorded here.
+    expect(trailing.pendingSince).toBe(finishedAt);
+    expect(finishedAt - bCommittedAt).toBe(20_000);
+    sim.advance(20 * 60_000);
+    expect(sim.runs).toHaveLength(1); // hint B was lost and the tick is off: the trailing row waits for recovery
+    expect(sim.rows.size).toBe(1);
   });
 
-  test("a late, older sweep neither delays a due wakeup nor duplicates work; it only lowers pending_since", () => {
-    const ctx = { nowMs: T0 + 60_000, hasBrief: true, timing: TIMING };
-    const armed = planWakeup(null, hint("append", 5, T0 + 50_000), ctx)!;
-    const older = hint("sweep", 3, T0 + 10_000);
-    const after = planWakeup(armed, older, { ...ctx, nowMs: T0 + 70_000 })!;
-    expect(after.dueAt).toBe(armed.dueAt);
-    expect(after.generation).toBe(armed.generation);
-    expect(after.pendingSince).toBe(T0 + 10_000);
-    // A sweep with no older evidence changes nothing at all.
-    expect(planWakeup(armed, hint("sweep", 4, T0 + 55_000), { ...ctx, nowMs: T0 + 70_000 })).toBeNull();
+  test("a retry after a failed run: the row stays, a replayed hint neither delays nor duplicates it", () => {
+    const sim = new Sim({ poll: true });
+    const A = sim.commit("claude", 1, { lose: true });
+    sim.failRuns = 1;
+    sim.advance(70_000); // the minute poll claims the first brief; the run fails and reschedules 60 s out
+    expect(sim.runs).toHaveLength(1);
+    const rescheduled = sim.rows.get("claude")!.state.dueAt;
+    sim.consume(A); // a replay during the backoff: it must not pull the retry forward
+    expect(sim.runs).toHaveLength(1);
+    expect(sim.rows.get("claude")!.state.dueAt).toBe(rescheduled);
+    expect(planHint(sim.rows.get("claude")!.state, hint("end", 1, T0), { nowMs: sim.now, hasBrief: false, timing: TIMING })).toBeNull();
+    sim.advance(3 * 60_000);
+    expect(sim.runs).toHaveLength(2);
+    expect(sim.rows.size).toBe(0);
   });
 
-  test("the oldest pending_since wins across reordering; evidence_at never moves backwards", () => {
-    const ctx = { nowMs: T0 + 100_000, hasBrief: true, timing: TIMING };
-    const a = planWakeup(null, hint("append", 2, T0 + 90_000), ctx)!;
-    const b = planWakeup(a, hint("append", 1, T0 + 20_000), { ...ctx, nowMs: T0 + 110_000 })!; // an older one, late
-    expect(b.pendingSince).toBe(T0 + 20_000);
-    expect(b.evidenceAt).toBe(T0 + 110_000);
-    expect(b.dueAt).toBe(Math.min(T0 + 110_000 + 600_000, T0 + 20_000 + 3_600_000));
-    // A first_uncovered_at in the future of the consumer's clock is clamped to now.
-    expect(planWakeup(null, hint("append", 3, T0 + 999_000), ctx)!.pendingSince).toBe(T0 + 100_000);
+  test("lost-trigger recovery: hosted sweep hints every 300 s (a late refresh is scored a miss); self-host minute poll", () => {
+    const hosted = new Sim({ sweepSeconds: 300 });
+    hosted.briefs.set("claude", { revision: 0, ready: true, lastAttempt: T0 - 600_000 });
+    hosted.commit("claude", 1, { lose: true }); // armed, the hint lost: due 600 s later
+    hosted.advance(20 * 60_000);
+    expect(hosted.runs).toHaveLength(1);
+    const r = hosted.runs[0]!;
+    expect(r.claimedAt - r.claimableAt).toBeLessThanOrEqual(300_000);
+    expect(refreshMiss(r.claimableAt, r.claimedAt)).toBe(r.claimedAt - r.claimableAt > 60_000); // recorded, not hidden
+    const selfHost = new Sim({ poll: true });
+    selfHost.briefs.set("claude", { revision: 0, ready: true, lastAttempt: T0 - 600_000 });
+    selfHost.commit("claude", 1, { lose: true });
+    selfHost.advance(20 * 60_000);
+    expect(selfHost.runs).toHaveLength(1);
+    expect(selfHost.runs[0]!.claimedAt - selfHost.runs[0]!.claimableAt).toBeLessThanOrEqual(60_000);
+    const off = new Sim(); // hosted sweep unset or 0: a lost hint is not recovered on the queue path
+    off.commit("claude", 1, { lose: true });
+    off.advance(20 * 60_000);
+    expect(off.runs).toHaveLength(0);
   });
 
-  test("first brief bypasses the throttle; a refresh is throttled", () => {
-    const first = new Sim();
-    first.lastAttempt = T0 - 1_000; // a recent attempt that produced no brief
-    first.produce(hint("append", 1, T0));
-    first.advance(30_000);
-    expect(first.runs).toHaveLength(1);
-    expect(first.throttled).toBe(0);
-    const refresh = new Sim({ hasBrief: true });
-    refresh.lastAttempt = T0 - 1_000;
-    refresh.produce(hint("end", 2, T0));
-    refresh.advance(5 * 60_000);
-    expect(refresh.throttled).toBe(1);
-    expect(refresh.runs).toHaveLength(1);
-    expect(refresh.runs[0]!.claimedAt).toBeGreaterThanOrEqual(T0 - 1_000 + THROTTLE_MS);
+  test("the same session id in two harnesses: v2 wakes only its own; v1 wakes both; coverage is per harness", () => {
+    const sim = new Sim();
+    for (const h of ["claude", "codex"]) sim.briefs.set(h, { revision: 0, ready: true, lastAttempt: T0 - 600_000 });
+    sim.commit("claude", 1, { lose: true });
+    sim.commit("codex", 1, { lose: true });
+    sim.now += 10_000;
+    sim.consume(hint("end", 1, T0, "claude")); // v2: claude only
+    expect(sim.runs.map((r) => r.harness)).toEqual(["claude"]);
+    expect(sim.rows.has("codex")).toBe(true);
+    sim.now += 10_000;
+    sim.consume(v1(hint("end", 1, T0, "codex"))); // v1: every harness of the session (claude is gone, covered)
+    expect(sim.runs.map((r) => r.harness)).toEqual(["claude", "codex"]);
+    sim.commit("codex", 2, { lose: true });
+    sim.now += 10_000;
+    sim.consume(v1(hint("end", 1, T0, "claude"))); // a revision-1 hint is covered for codex too
+    expect(sim.runs).toHaveLength(2);
+    sim.consume(v1(hint("end", 2, T0, "codex")));
+    expect(sim.runs).toHaveLength(2); // codex's last attempt was 10 s ago: the refresh throttle holds it
+    sim.advance(130_000); // the handed-off copy arrives once the throttle releases
+    expect(sim.runs.map((r) => r.harness)).toEqual(["claude", "codex", "codex"]);
+    expect(sim.runs[2]!.claimableAt).toBe(sim.runs[1]!.claimedAt + THROTTLE_S * 1_000);
+  });
+
+  test("continuous arrivals on a briefed session: refreshes bounded by max-wait", () => {
+    const sim = new Sim();
+    sim.briefs.set("claude", { revision: 0, ready: true, lastAttempt: T0 - 600_000 });
+    for (let i = 0; i < 120; i++) { sim.commit("claude", i + 1); sim.advance(60_000); }
+    sim.advance(15 * 60_000);
+    expect(sim.runs[0]!.claimableAt).toBe(T0 + 3_600_000);
+    for (let i = 1; i < sim.runs.length - 1; i++) expect(sim.runs[i]!.claimedAt - sim.runs[i - 1]!.claimedAt).toBeGreaterThanOrEqual(3_600_000 - 60_000);
   });
 
   test("handoff never exceeds SQS's 15-minute delay; a long wait chains hops", () => {
-    const s: BriefWakeState = { pendingSince: T0, evidenceAt: T0, dueAt: T0 + 3_600_000, generation: 1, leased: false, admission: "background", revision: 1 };
-    expect(handoffPlan(s, T0)).toEqual({ action: "defer", delaySeconds: SQS_MAX_DELAY_SECONDS });
-    expect(handoffPlan(s, T0 + 3_599_500)).toEqual({ action: "defer", delaySeconds: 1 });
-    expect(handoffPlan(s, T0 + 3_600_000)).toEqual({ action: "run" });
-    const sim = new Sim({ hasBrief: true });
-    sim.lastAttempt = T0 - 3_600_000;
-    sim.state = { ...s, lastTriggerId: hint("append", 1, T0).trigger_id };
-    sim.send(sim.continuation());
-    sim.advance(3_700_000, 5_000);
-    expect(sim.runs).toHaveLength(1);
-    expect(sim.runs[0]!.claimedAt - sim.runs[0]!.dueAt).toBeLessThanOrEqual(5_000);
+    expect(handoffPlan(T0 + 3_600_000, T0)).toEqual({ action: "defer", delaySeconds: SQS_MAX_DELAY_SECONDS });
+    expect(handoffPlan(T0 + 3_600_000, T0 + 3_599_500)).toEqual({ action: "defer", delaySeconds: 1 });
+    expect(handoffPlan(T0 + 3_600_000, T0 + 3_600_000)).toEqual({ action: "run" });
   });
 });
