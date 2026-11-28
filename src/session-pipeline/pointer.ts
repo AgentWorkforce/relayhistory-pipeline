@@ -51,7 +51,7 @@ export type PointerOutcome =
   | { status: "ignored"; reason: string }
   | { status: "indexed" | "unchanged" | "deleted" | "moved"; scope: SessionScope; manifestKey: string; revision?: number;
       /** The live manifest's S3 stamps as read under the lock (absent for a delete): what a revision event is checked against. */
-      live?: { etag?: string; version?: string } };
+      live?: { etag?: string; version?: string; chunks?: readonly string[] } };
 
 /**
  * The per-session lock keys. The pointer stage and the search stage each
@@ -265,8 +265,14 @@ export async function findMovedSibling(key: string, exists: (key: string) => Pro
   return undefined;
 }
 
-const liveStamp = (read: { etag?: string; version?: string }) =>
-  read.etag || read.version ? { live: { ...(read.etag ? { etag: read.etag } : {}), ...(read.version ? { version: read.version } : {}) } } : {};
+// chunks: `<seq>:<sha256>` of every chunk the live manifest lists. Measurement only: a superseded upload is
+// 'revision covered' only when its own chunk is among them (the covering manifest includes it).
+const liveStamp = (read: { etag?: string; version?: string; manifest?: { raw?: { chunks?: readonly { seq?: unknown; sha256?: unknown }[] } } }) => {
+  const chunks = (read.manifest?.raw?.chunks ?? []).flatMap((c) => (typeof c.seq === "number" && typeof c.sha256 === "string" ? [`${c.seq}:${c.sha256}`] : []));
+  return read.etag || read.version
+    ? { live: { ...(read.etag ? { etag: read.etag } : {}), ...(read.version ? { version: read.version } : {}), ...(chunks.length ? { chunks } : {}) } }
+    : {};
+};
 
 async function indexLocked(landed: ObjectLanded, orgId: string, scope: SessionScope, deps: PointerDeps, followed = false): Promise<PointerOutcome> {
   // Canonical state, not the event: re-read the manifest, under the lock.

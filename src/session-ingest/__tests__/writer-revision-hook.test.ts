@@ -6,7 +6,7 @@
 import { afterEach, expect, test } from "bun:test";
 import { objectKey } from "../../shared/vendor.ts";
 import { prepareDelivery } from "../vendor/delivery/prepare.ts";
-import { writeBatchObjects, type WriteTarget } from "../writer.ts";
+import { lastChunkProof, writeBatchObjects, type WriteTarget } from "../writer.ts";
 import { TENANT, batch, record, scratchStore } from "./support.ts";
 
 const cleanup: Array<() => void> = [];
@@ -30,10 +30,16 @@ test("fires once per committed manifest with revision, ack stamps and commit tim
   const key = first.manifests[0]!.key;
   const etag = (await fs.store.head(objectKey(key)))!.version.eTag!.replace(/^"|"$/g, "");
   expect(seen).toEqual([
-    { key, revision: 1, committedAt: "2026-11-01T10:00:00.000Z", etag: expect.any(String) },
-    { key, revision: 2, committedAt: "2026-11-01T10:00:00.000Z", etag },
+    { key, revision: 1, committedAt: "2026-11-01T10:00:00.000Z", etag: expect.any(String), chunk: lastChunkProof(first.manifests[0]!.manifest) },
+    { key, revision: 2, committedAt: "2026-11-01T10:00:00.000Z", etag, chunk: lastChunkProof(second.manifests[0]!.manifest) },
   ]);
   expect(second.manifests[0]!.manifest.revision).toBe(2);
+  // The real writer is cumulative: revision 2 still lists the chunk revision 1 appended, and appends its own. This is
+  // the premise of the consumer's 'revision covered' proof.
+  const [c1, c2] = seen as { chunk: string }[];
+  expect(c1!.chunk).toMatch(/^0:[0-9a-f]{64}$/);
+  expect(c2!.chunk).toMatch(/^1:[0-9a-f]{64}$/);
+  expect(second.manifests[0]!.manifest.raw.chunks.map((c) => `${c.seq}:${c.sha256}`)).toEqual([c1!.chunk, c2!.chunk]);
 });
 
 test("a throwing hook never fails the write", async () => {

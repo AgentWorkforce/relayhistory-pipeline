@@ -23,11 +23,13 @@ import { dispatchSqsBatch, type RevisionWiring, type SqsRecord } from "../revisi
 import { revisionMessage, type RevisionEvent } from "../revision-events.ts";
 import { orderedRetrySeconds, type ConsumerDeps } from "../consumer.ts";
 import { loc, pointerRig } from "./pointer-lock-harness.ts";
+import { lastChunkProof } from "../../session-ingest/writer.ts";
+import { manifestKey as manifestKeyOf } from "../../shared/vendor.ts";
 
 const cleanup: Array<() => Promise<unknown>> = [];
 afterEach(async () => { for (const c of cleanup.splice(0).reverse()) await c(); });
 
-const T0 = Date.parse("2026-11-02T00:00:00.000Z");
+const T0 = Date.parse("2026-11-01T09:00:00.000Z");
 const ARN = "arn:aws:sqs:us-east-1:000000000000:synthetic-revisions.fifo";
 
 /** Capture the JSON log lines one act writes. */
@@ -115,9 +117,14 @@ async function rig() {
     return { messageId: `m${n}`, receiptHandle: `rh${n}`, body: m.MessageBody, eventSourceARN: ARN,
       attributes: { MessageGroupId: m.MessageGroupId, MessageDeduplicationId: m.MessageDeduplicationId, SentTimestamp: String(sentAt), ApproximateReceiveCount: String(receives) } };
   };
-  const writer = async (revision: number, marker?: string, l = loc, committedAt = new Date(T0).toISOString()): Promise<RevisionEvent> => {
-    const key = await r.writeManifest(revision, l, marker);
-    return { key, revision, etag: await etagOf(key), committedAt, initial: revision === 1, source: "writer" };
+  // `cumulative`: like the real writer, the revision carries the live manifest's chunks and appends one (after a
+  // delete, no live manifest, it starts fresh). Off by default: the model index then holds only the newest marker.
+  const writer = async (revision: number, marker?: string, l = loc, committedAt = new Date(T0).toISOString(), createdAt?: string, cumulative = false): Promise<RevisionEvent> => {
+    const k = manifestKeyOf(l);
+    const prev = cumulative ? await r.store.get(objectKey(k)).then(async (o) => JSON.parse(new TextDecoder().decode(await readAll(o))) as ManifestV1, () => undefined) : undefined;
+    const key = await r.writeManifest(revision, l, marker, createdAt, prev?.raw.chunks ?? []);
+    const chunk = lastChunkProof(JSON.parse(new TextDecoder().decode(await readAll(await r.store.get(objectKey(key))))) as ManifestV1);
+    return { key, revision, etag: await etagOf(key), committedAt, initial: revision === 1, ...(chunk ? { chunk } : {}), source: "writer" };
   };
   // Each batch starts at T0 + 1,500 on the consumer clock.
   const run = (records: SqsRecord[]) => { tick = 0; return logged(() => dispatchSqsBatch(records, deps(), wiring)); };
@@ -348,7 +355,7 @@ describe("first indexed appearance of superseded uploads ('revision covered' / '
   test("a burst of 5: the 4 superseded appends each get their OWN covered line from the covering pass (all 5 in the denominator)", async () => {
     const t = await rig();
     const events: RevisionEvent[] = [];
-    for (let rev = 1; rev <= 5; rev++) events.push(await t.writer(rev, `r${rev}`, loc, new Date(T0 + rev * 100).toISOString()));
+    for (let rev = 1; rev <= 5; rev++) events.push(await t.writer(rev, `r${rev}`, loc, new Date(T0 + rev * 100).toISOString(), undefined, true));
     const { lines } = await t.run(events.map((e, i) => t.record(e, T0 + i * 100)));
     const covered = named(lines, "revision covered");
     expect(covered.map((l) => l.revision)).toEqual([1, 2, 3, 4]);
@@ -384,6 +391,31 @@ describe("first indexed appearance of superseded uploads ('revision covered' / '
     const { lines } = await t.run([t.record(stale), t.record(b)]);
     expect(named(lines, "revision covered")).toEqual([]);
     expect(named(lines, "revision unobserved")).toEqual([expect.objectContaining({ revision: 2, reason: "recreate_between" })]);
+  });
+
+  test("Pipeline review of 1cb42716: a delete + re-create MISSING from the group gives coverage_unproven, not covered", async () => {
+    const t = await rig();
+    // Lineage A: revision 2 commits. Then a delete and a re-create (lineage B) up to revision 3, whose delete and
+    // re-create events are NOT in this group (lost, or consumed by an earlier batch).
+    const a2 = await t.writer(2, "a2", loc, new Date(T0).toISOString(), "2026-11-01T08:00:00.000Z");
+    await t.r.store.delete(objectKey(a2.key));
+    const b3 = await t.writer(3, "b3", loc, new Date(T0 + 50).toISOString(), "2026-11-01T09:00:00.000Z");
+    const { lines } = await t.run([t.record(a2), t.record(b3)]);
+    // Same key, lower revision, no delete in the group: the old rule said covered. B does not contain A's append.
+    expect(named(lines, "revision covered")).toEqual([]);
+    expect(named(lines, "revision unobserved")).toEqual([expect.objectContaining({ revision: 2, reason: "coverage_unproven" })]);
+    expect(named(lines, "revision searchable")).toEqual([expect.objectContaining({ revision: 3 })]);
+  });
+
+  test("a superseded event with NO chunk proof (a forwarded copy) gives coverage_unproven; a listed chunk gives covered", async () => {
+    const t = await rig();
+    const e1 = await t.writer(1, "r1", loc, undefined, undefined, true);
+    const e2 = await t.writer(2, "r2", loc, undefined, undefined, true);
+    const e3 = await t.writer(3, "r3", loc, undefined, undefined, true);
+    const { chunk: _drop, ...forwarded } = e1;
+    const { lines } = await t.run([t.record({ ...forwarded, source: "forward" }), t.record(e2), t.record(e3)]);
+    expect(named(lines, "revision unobserved")).toEqual([expect.objectContaining({ revision: 1, reason: "coverage_unproven" })]);
+    expect(named(lines, "revision covered")).toEqual([expect.objectContaining({ revision: 2, covered_by_revision: 3 })]);
   });
 
   test("a superseded-only batch (skipped) reports its events as unobserved: covered_by_earlier_pass", async () => {
@@ -441,7 +473,7 @@ describe("FIFO redelivery shapes (head-only, beyond ten)", () => {
   test("burst of 12 across two receives: all 12 stay in the denominator, each with exactly one outcome line", async () => {
     const t = await rig();
     const events: RevisionEvent[] = [];
-    for (let rev = 1; rev <= 12; rev++) events.push(await t.writer(rev, `r${rev}`, loc, new Date(T0 + rev * 10).toISOString()));
+    for (let rev = 1; rev <= 12; rev++) events.push(await t.writer(rev, `r${rev}`, loc, new Date(T0 + rev * 10).toISOString(), undefined, true));
     const recs = events.map((e, i) => t.record(e, T0 + i * 10));
     const first = await t.run(recs.slice(0, 10));
     const second = await t.run(recs.slice(10));
