@@ -248,6 +248,40 @@ describe.skipIf(!url)("capture-bound large-read enqueue prototype (real PostgreS
     expect(await jobRow(o)).toEqual({ state: "queued", epoch: C!.epoch, fp: C!.fingerprint, leased: false });
   });
 
+  for (const leased of [false, true]) {
+    test(`6${leased ? "d" : "c"}. FINDING: the ordinary enqueue, paused after capturing A0, REPLACES a same-epoch newer A1 ${leased ? "leased" : "queued"} job (equal-epoch ordering unresolved)`, async () => {
+      const { o, pair } = await rig();
+      const pending = (await o.query("SELECT count(*)::int n FROM sessions.session_directory_event_pending WHERE org_id=$1", [S.org])).rows[0].n;
+      if (pending === 0) await o.query("INSERT INTO sessions.session_directory_event_pending(org_id,workspace_id,harness,source_session_id) VALUES($1,$2,$3,$4)", ARGS);
+      const A0 = await capture(o);
+      await gateOn(pair.b);
+      let A1: Src | undefined;
+      let before: string[] = [];
+      const r = await expectBlocks(pair, {
+        holder: pair.a, waiter: pair.b, hold: holdGate, wait: (c) => ordinary(c, true),
+        whileBlocked: async () => {
+          // A same-epoch writer (the directory event projection's pending rows) moves the fingerprint; A1 is routed.
+          await o.query("UPDATE sessions.session_directory_event_pending SET epoch=epoch+1 WHERE org_id=$1", [S.org]);
+          A1 = await capture(o);
+          await ordinary(o);
+          if (leased) expect(await claim(o)).not.toBeNull();
+          before = await job(o);
+        },
+      });
+      expect(r.receipt.waiting.some((l) => l.locktype === "advisory" && !l.granted) && r.receipt.holderPid === pair.a.pid).toBe(true);
+      expect(A1!.epoch).toBe(A0.epoch);
+      expect(A1!.fingerprint).not.toBe(A0.fingerprint);
+      expect(before.length).toBe(1);
+      expect(r.waited).toMatchObject({ ok: true, value: { enqueued: true, changed: true } });
+      // Recorded behaviour (021000 rule kept within one epoch): the stale A0 upsert replaces A1's row${leased ? " and clears its lease" : ""}.
+      expect(await jobRow(o)).toEqual({ state: "queued", epoch: A0.epoch, fp: A0.fingerprint, leased: false });
+      // Claim then refuses the stale A0 (superseded), and A1's own enqueue restores A1.
+      expect(await claim(o)).toBeNull();
+      expect(await ordinary(o)).toMatchObject({ enqueued: true, changed: true, source: A1 });
+      expect(await jobRow(o)).toEqual({ state: "queued", epoch: A1!.epoch, fp: A1!.fingerprint, leased: false });
+    });
+  }
+
   test("7. B's durable wakeup without its delivery (measured-large scope): discovery enqueues B after stale A is superseded", async () => {
     const { o } = await rig();
     await o.query("UPDATE sessions.session_index SET raw_bytes=67108865 WHERE org_id=$1", [S.org]);
