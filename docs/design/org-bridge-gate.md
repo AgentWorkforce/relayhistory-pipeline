@@ -147,14 +147,74 @@ S3 consumer.
 Either way the refusal must be read under the org key in `_check`'s second statement, as the hold is today. Then a
 release (EXCLUSIVE) serializes with every in-flight admission, and no admission that read "no hold" can commit after R.
 
-## C. Exclusion at the authoritative write (held by the lander)
+## C. Exclusion at the authoritative write (PROPOSAL; held by the lander, nothing built)
 
 The SigV4 time-window proposal is withdrawn. A fresh signature bounds only when a request may start, not when its
 body or effect lands, and presigned-URL expiry gives no commit-time guarantee for a header-signed PUT.
 
-What C needs is a protocol that does one of two things:
-- atomically excludes stale publication at the authoritative write;
-- durably registers admitted writers and refuses a takeover or switch while any effect is unresolved, including after
-  a crash or a lost ACK, and reconciles ambiguous in-flight effects. It must state which bytes are readable.
+**Where readability is decided today.** The read API (`src/session-read-api/canonical-projection.ts`) serves session
+manifests (`<org>/v1/.../s=…/manifest.json`, writer.ts) and the chunks they list. It never consults the ledger's
+batch state, the revision index or a drained marker. So the authoritative write is each writer's manifest CAS
+(create-only for a new session or date, If-Match otherwise). A stale writer's chunk becomes readable the moment its
+manifest append lands, whatever happens to its index merge or commit afterwards. Milestones 1 and 2A withhold only
+the index merge, the committed state and the drained marker: **those bytes stay readable**.
 
-Not designed yet. The lander has not approved the 17-minute extension, and it is out of the plan.
+No per-org object is CASed by every write. A manifest key is per session and date, and the location pointer is per
+session, so a stale writer creating a never-seen session or date cannot be stopped by stamping the objects that
+exist. Two protocols satisfy the requirement:
+
+**W2 (recommended): readers serve only committed effects; the switch supersedes atomically.**
+1. Every manifest entry already names its batch digest (`relayhistory_live.batches`). Readers of an ENROLLED org
+   serve an entry only when its batch is committed: for direct writes the ledger batch record is `committed`, and for
+   drain writes the staged object's `drained` marker exists. Unenrolled orgs read as today. The authoritative write
+   is then one single-object CAS per effect: pending -> committed on the batch record, or the create-only drained
+   marker.
+2. The switch (enrollment effective, or the bridge record) proceeds only after it has resolved every unresolved
+   effect of O, durably:
+   - each `pending` batch record of O is CASed to `superseded_by_switch`, so the stale writer's If-Match
+     pending -> committed fails atomically (`ledger_attempt_superseded`);
+   - each undrained staged object of O gets a create-only `drained` marker with outcome `switch_abandoned`, so the
+     stale drain's create-only marker fails.
+   A lost ACK is reconciled by re-reading the object: committed means it counts, superseded or abandoned means it
+   never counts. A crash leaves the switch unwritten, so it fails closed and a rerun resumes the sweep.
+3. Superseded and abandoned bytes are unreadable by rule 1, and the re-arm sweeper erases them (a re-arm marker is
+   written for each one).
+   - Cost: a reader change in canonical-projection, owned by the read-API lane, plus one batch-record or marker read
+     per entry for enrolled orgs (cacheable once committed, since committed is terminal).
+   - The sweep lists O's batch records and staged objects. That is bounded per org and fine for wave 1.
+
+**W1 (alternative): a durable writer registry with a switch barrier.** Each writer registers a create-only intent
+under `.ledger/writers/<org>/<id>.json` BEFORE its first canonical byte, re-reads the switch after registering, and
+deletes the intent only after its final durable effect. The switch writes itself first, then waits until every
+intent of O is resolved. A crashed writer's intent never resolves by itself, so an operator or the sweeper must
+supersede it. Without reader gating, that means retracting its manifest entries, and a manifest retraction races
+the next appender. That is why W1 still needs W2's rule 1 to be correct, and why W2 is recommended.
+
+**The installer (lander finding on a0308776).** An installer can pass `enrollmentFor`, pause, and commit `_install`
+after an `install_failed` withdrawal has restored global-marker admission. Fix: the withdrawal consumes the request
+id in SQL before touching S3.
+- It calls `_install(org, request)` itself, which is idempotent: it returns the epoch if the paused installer already
+  committed, and creates the hold otherwise.
+- It then calls `_release(verified_rollback)` for that epoch, and only then CASes the enrollment to `withdrawn`.
+- 062320 refuses any later `_install` of a released request ("request reused"), and request_id is UNIQUE. So the
+  paused installer has irrevocably lost the ability to commit before admission can reopen, and `install_failed`
+  collapses into `verified_rollback`.
+Notes from sessions-wave-tooling:
+- The flow leaves an installed -> released epoch with no seal, which hold-dry reads as installable.
+- It takes the org key EXCLUSIVE briefly, so the org's concurrent admissions get RH042 meanwhile.
+- Its `_install` skips the tool's post-key checks (pending batches, canonical history, active seed captures). If the
+  flow stops between the two calls, the org is left held with no seal; a retried withdrawal or rollback-execute
+  recovers it.
+To prove: on a warm global marker, an installer paused between `enrollmentFor` and `_install` against a concurrent
+withdrawal, asserting the readable bytes (W2 rule 1) and that no direct write of O lands between the withdrawal's
+SQL step and its S3 CAS.
+
+**B additions the lander asked for (inventory, no slot).**
+- The 062390 lease versus preview: the seed scope capture is unaffected-class, and 062390 adds the admission check
+  under the key. Its lease (a write) must close after `bridge_complete`, while its preview (read-only) stays open.
+- Seed import (`seed_proven_records`): closes, as the table says.
+- `verified_rollback` after an earlier `bridge_complete`: the closing rule keys on "any hold of O ever released with
+  `bridge_complete`", so a later epoch's rollback reopens nothing in SQL. On S3, that epoch's enrollment G+1 is
+  withdrawn and the consumer falls back to O's create-only per-org marker from G, so S3 stays the writer.
+- Plan a new forward migration after the applied chain and slots are reconciled.
+- R-to-P exclusion stays conditional on W2's sweep accounting for every outstanding effect.
