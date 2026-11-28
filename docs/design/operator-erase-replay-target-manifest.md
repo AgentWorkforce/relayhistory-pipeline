@@ -1,4 +1,4 @@
-# Operator erase replay target manifest — draft 3
+# Operator erase replay target manifest — draft 4
 
 ## Status and ownership
 
@@ -30,6 +30,24 @@ Inputs checked for this draft:
   on authority modes `bab783784fda8eea202a9534613d600b035edcf2`.
 
 The pending branches are interface inputs, not claims that they have landed.
+
+Refreshed 062340 handoff inputs, inspected without applying SQL:
+
+- `6d60dc4fcd92957354e86c59600f82002b7c2751`,
+  `supabase/migrations/20261105062340_ingest_org_erasure_history.sql`:
+  `_bind` at 331–375 and `_release` at 389–425. The history fence is the
+  hold's install, and the selected FULL is a separate sealed binding.
+- `f98d54af681f06a7030492168461b83b246b7b1f`,
+  `src/session-ingest/erasure-window.ts`: the same-statement status/source
+  read and the executable history/FULL/coverage checks. Its legacy introductory
+  two-table comments are not the authoritative 062340 field contract.
+- `eaa5e2f01cfce16da1b73d202edb33f6e62b0ae3`,
+  `src/session-ingest/hold-bridge.ts`: the manifest-missing refusal and existing
+  resolver seam. This is not an implemented paged reader or v2 receipt adapter.
+
+Section 7 replaces this draft's old surviving-two-table watermark guidance.
+The closed section 6.1 reader v1 remains unchanged. The separate replay proof
+wrapper below needs consumer/kernel co-review before it is wired into code.
 
 ## 1. Problem and limit of this proof
 
@@ -211,6 +229,26 @@ The stored `manifest_id` is the proposed immutable replay-group identity. Its
 accepted `request_id` remains available to correlate the original erase.
 The UUID does not replace tenant validation or the target digest. All three
 must be bound together by the reader and replay receipt.
+
+Associate effect provenance with that **same accepted request**, in the locked
+capture/effect transaction. It must identify the actual SQL effect scope and
+source-record identities/operations needed to correlate the capture to an
+authoritative replay-set member; a caller-provided request string alone is
+not proof that those effects occurred. Capture, seal and effect evidence
+must commit or unwind together under section 3's existing failure rules.
+The physical provenance columns or append-only sidecar, exact encoding and
+per-source coverage relation must be reviewed with the implementer. They
+must have the same compound scope/request binding and post-seal immutability
+as the manifest. A transaction ID or timestamp is supporting provenance,
+not a unique effect identity or completeness certificate by itself.
+Keep provenance to the minimal identity/proof metadata allowed by section 8;
+it must not introduce lease credentials, object paths or copied payloads.
+
+Capture is independent of hold lifecycle: it must work before seal/FULL
+selection and outside any hold. An active epoch observed during capture may
+be saved as provenance only; absence of an active epoch is valid, not an erase
+refusal. Neither a non-null capture epoch nor a guessed future FULL is part
+of the target seal's authority. This metadata does not change reader v1 keys.
 
 Define the digest over a versioned, length-framed encoding of the complete
 binding and unique targets in bytewise `COLLATE "C"` order. Do not use delimiter
@@ -421,6 +459,85 @@ still grants no effects by itself: both passes in section 6 remain mandatory.
 
 ## 7. Replay receipt and release coupling
 
+### 7.1 Separate capture evidence from epoch/FULL qualification
+
+The producer captures request-bound targets and associated effects before
+cleanup, without requiring a hold or a selected FULL. A later replay must
+independently qualify that immutable capture for its **current** epoch and
+selected FULL. A capture-time epoch cannot substitute for that qualification,
+and an outside-hold capture is neither automatically excluded nor automatically
+admitted. Membership comes from the current authoritative erasure set and
+complete request/effect coverage, not from a capture timestamp filter.
+
+062340 `_bind` is allowed only after the epoch is sealed. It binds the history
+fence to `hold.installed_at` and records the selected FULL's run, integer
+`started_ms` and receipt digest. It is therefore incorrect to require a
+pre-seal producer to bind a future FULL or to block a normal erase until that
+FULL exists. Do not stamp later context into an already sealed target manifest.
+
+### 7.2 Owner-only proof wrapper/co-read, outside reader v1
+
+Preserve the exact section 6.1 page keys, nested shapes, cursor binding and
+canonical target-count text. The epoch/FULL proof is a **separate** owner-only
+wrapper or co-read, not extra fields silently added to a v1 page. One SQL
+statement must read the manifest page, authoritative window/status and the
+request/effect coverage needed to qualify the member. Its logical result has
+separate manifest-page and window/effect-proof components; agree and version
+that wrapper's exact transport with the consumer before wiring it. No new
+runtime grant or mutating reader is proposed.
+
+At replay, bind the expected org and epoch to the caller's selected FULL
+dispatch and verify all of the following from the qualified co-read:
+
+- The live hold is the same epoch in the required sealed/marker-attempted
+  state. Compare the installed history fence with `hold.installed_at` at
+  full SQL timestamptz precision, not rounded client milliseconds.
+- `selected_full.run`, `selected_full.started_ms` and
+  `selected_full.evidence_sha256` equal that exact dispatch's FULL run,
+  integer start and verified receipt digest. Require the SQL comparison
+  `installed_at < FULL start <= sealed_at`. The fence and FULL start are
+  different concepts; neither substitutes for the other.
+- History is bound, covers the installed fence and is recording. Every
+  `by_source` key is from the shared authoritative source inventory, all
+  counts are valid and their sum equals status `erasures`. Validate the
+  supported count range losslessly; an unsupported range refuses rather
+  than rounding. Any corroborating all-source snapshot checks still apply.
+- Match each authoritative session-erasure member to the original accepted
+  request, complete manifest UUID/scope/aliases/digest and its committed
+  effect provenance. Do not infer membership or full coverage from an equal
+  request string, current survivors, generic event count, timestamp or xid.
+- Any source/operation, missing identity, overwritten/transient evidence or
+  overlap that cannot be reconciled with a complete request-bound effect
+  proof keeps the positive window blocked. This session manifest does not
+  establish replay coverage for every other erasure type in the inventory.
+
+062340 history deliberately stores coarse org/source/op/time/xid events,
+not target identities. Its scalar count cannot supply the missing effect
+mapping. The implementation must supply a reviewed per-source association
+from actual erase effects; without it the wrapper remains unproven. A
+matching count or an array containing only the surviving fence rows is not
+a completeness proof for the whole window.
+
+Drain every manifest page in the SQL-only preparation phase and pin its
+identity, accepted request, full scope, capture version, aliases, count and
+digest. Pin the wrapper's epoch, installed fence, selected FULL triple and
+authoritative history watermark across that preparation too. Refuse mixed
+snapshots/bindings, missing pages, incomplete effect mapping or changed
+coverage. A mismatch on a final page still means **zero S3 calls**, including
+receipt reads. A new history watermark requires a fresh complete preparation,
+not acceptance of a mixed prefix. Read-only isolation alone is not a claim
+that authority remains current forever.
+
+The application pass rereads the same sealed manifest and qualifies the same
+epoch/FULL and effect binding. If authority, coverage or watermark changes,
+stop and refresh the qualified plan; do not create a success receipt from a
+stale wrapper. Effects already applied from a completely prevalidated set
+retain section 6's idempotent partial-application semantics. Release readiness
+must freshly qualify all current members and receipts again, even after a
+prior successful replay. No warm-cache or receipt-only exemption exists.
+
+### 7.3 Receipts are group evidence, not the history watermark
+
 The consumer must prepare the complete validated plan from section 6 **before**
 this erasure replay's first S3 call, including its receipt lookup. Only afterward
 may a receipt authorize `already` or a plan authorize mutations. At review
@@ -430,8 +547,9 @@ later. Callback presence is not proof, and an old receipt cannot bypass plan
 preparation. Release readiness must independently validate the same plan and
 receipt binding; a previously cached replay outcome is not sufficient.
 
-Propose a new receipt version/key domain binding hold epoch, manifest UUID,
-accepted request ID, complete scope, capture version and full target digest.
+Propose a new receipt version/key domain binding hold epoch and its installed
+fence/selected-FULL context, manifest UUID, accepted request ID, complete scope,
+capture version, full target digest and the validated effect-proof binding.
 Only hashes and aggregate counts leave SQL/the bridge process. A v1 receipt
 keyed only by the synthesized `(workspace, source, session)` identity is not
 valid evidence for this new group. Receipt validation rejects another scope,
@@ -440,25 +558,50 @@ erasure kind. Create-only writes remain idempotent and collisions fail closed.
 The user-erase prerequisites in section 9 apply before receipt reuse too; a
 structurally valid cached user receipt is not itself generation or byte proof.
 
-Several counted alias fences may share that one validated group receipt. The
-bridge must still account for each fence row in the release watermark. Do not
-count manifest headers, target rows, distinct requests or replay API calls.
-Keep the 062320 release count exactly:
+Several aliases or source events may resolve to one validated group receipt.
+That coalescing never changes the authoritative history watermark or proves
+that unrelated events are covered. Do not count manifest headers, target rows,
+distinct requests, fence aliases, receipts or replay API calls as that watermark.
+With 062340, pass the co-read status `erasures`, whose meaning is:
 
 ```text
-count(operator_user_erasures for org) + count(session_erasure_fences for org)
+count(ingest_org_erasure_history rows for org at or after bound fence_at)
 ```
 
-It is the total org count recomputed under the exclusive hold key, not the
-number of records inside a FULL-time replay window. Use the settled status
-`erasureCount`, not a window's `set.length` or a receipt-group count, for the
-release watermark. Adding this manifest must not hide a mismatch. A new erase
-takes the shared org key, so an erase racing
-release is either in its recomputed count or occurs after release. No marker
-or count row is deleted, and all manifest tables are excluded from that count.
+The baseline 062320 surviving-two-table count is **not** sufficient authority
+for this 062340 handoff. No fallback to that count, a caller FULL cutoff,
+`set.length`, or a group count may authorize release. Manifest/provenance tables
+are proof storage, not new erasure sources: explicitly classify them in the
+shared inventory/exclusions so their own inserts do not recursively count as
+erase effects. Preserve the 062340 recorder and source semantics.
+
+The final release, through the org lifecycle lock, rechecks epoch/state,
+bound history coverage/recording and the fresh authoritative count under the
+exclusive org key. A racing source write is counted before release or waits
+until after it. A count match is necessary but not a replacement for the
+wrapper's independent effect/manifest/receipt checks. No marker or history
+row is deleted to hide a mismatch. An observed watermark stored with a group
+receipt is not valid evidence for later unseen events without fresh coverage.
 
 `complete` does not approve `bridge_complete`; all replay receipts, the current
 hold epoch/state and the existing final count check are still required.
+
+### 7.4 Required lifecycle cases
+
+- **Pre-seal erase:** capture and SQL cleanup succeed together before a FULL
+  is selected. No future FULL is fabricated. Once sealed/bound, replay obtains
+  fresh epoch/FULL qualification against the original manifest and effects.
+- **Outside-hold erase:** capture succeeds with no active epoch. A later hold
+  admits it only when its authoritative set and effect evidence require and
+  prove that request; absence of capture-time epoch is not itself missing proof.
+- **Already-cleaned historical request without capture:** refuse with
+  `session_manifest_missing`, even if bytes are gone or an unrelated current
+  hold/FULL/count looks valid. No automatic historical backfill is introduced.
+- **Epoch/FULL mismatch or coverage gap:** no S3 preparation effects or receipt
+  lookup, no success receipt, and no release. A partial capture stays partial.
+- **Qualified empty window:** it may use the independently reviewed empty-window
+  path without a manifest when all-source history/snapshot and final release
+  checks qualify. This producer neither establishes nor overrides that proof.
 
 ## 8. ACL, retention and down
 
@@ -493,10 +636,16 @@ A future down should retain the manifest records, immutability guards and a
 safe owner read path (or a fail-closed unsupported-version result). It must not
 silently drop the only replay witness. Its exact retained schema, ACL manifest,
 bootstrap verifier and reapply behavior require tests and registry review.
-062360's down runs first and restores the **062320** replaced bodies, with the
-marked first erasure check. The 062320 later-migration guard refuses its down
-while 062360 remains applied; only after 062360 is down does 062320 restore its
-own pre-062320 bodies. Test that full sequence and the restored live prosrc.
+062360's down restores its recorded pre-062360 erase-entry bodies, preserving
+the **062320** marked first erasure check. In the pinned 062340 integration,
+062340 replaces hold status/release, not those erase-entry bodies: leave its
+status/release, history, coverage, bindings and guards intact. If a later
+integration changes an erase body, record that latest original in the lane
+instead of blindly restoring an older 062320 copy. The 062320 later-migration
+guard still applies: roll back all later applied slots in the proper order
+before 062320 restores its own pre-062320 bodies. Do not skip intervening
+062340/other slots merely because this manifest has been rolled back. Test
+that full sequence and the restored live prosrc.
 Do not add a lifecycle lock to capture or invent a reverse order for the down.
 
 ## 9. User erases: proof gates cache reuse and release too
@@ -581,20 +730,36 @@ Neither the session manifest nor 062320's shared org lock can stand in for it.
   receipt or SQL release occurs. Also cover unverified bytes, false/stale or
   wrong-scope generation proof and the separate receipt counter; no warm-cache
   or previously-replayed exemption.
-- A racing new erase, alias-fence versus manifest-group cardinality, an erase
-  predating the replay window, and unchanged 062320 count under its exclusive
-  key. Missing historical and empty coverage keep the bridge blocked.
+- Capture before seal/FULL selection and outside a hold: no future FULL or
+  mandatory capture-time epoch. Later qualification must use the selected
+  epoch/FULL and actual effect membership. A capture-time epoch alone cannot
+  approve replay or exclude a valid outside-hold capture.
+- Cross-page changes to epoch, installed fence, selected FULL run/start/digest,
+  history watermark or coverage refuse before any S3 call. Test a complete
+  valid v1 manifest with incomplete/mismatched effect provenance, ambiguous
+  xid/time matches and an unresolved non-session source: none can authorize
+  receipt lookup, mutation or release. No silent reader-v1 field additions.
+- A racing source write between proof and release, transient/deleted source
+  rows, history-event versus alias/group cardinality, and an erase predating
+  the replay window. The final exclusive-key check uses authoritative 062340
+  history, never the old two-table count or replay-group count. Unrecorded
+  historical capture remains `session_manifest_missing`; a qualified empty
+  window remains a separate path. Missing/empty target proof does not become
+  an empty-window proof.
 - RLS/default-ACL/role negatives; UPDATE/DELETE/TRUNCATE and post-seal INSERT
   refusal; stale/concurrent mutation attempts; retained down/reapply guards.
 - After full migrate, assert the marked erasure check is first in the live
   latest replaced bodies, not merely present in 062320's source file. Test
-  062360 down restores 062320 bodies and only then 062320 down restores theirs.
+  062360 down restores its recorded latest erase bodies with the 062320 check,
+  while retaining the installed 062340 history contract. Only the subsequent
+  proper rollback of later slots permits 062320 down to restore its originals.
 
 ## 11. Decisions before implementation
 
 1. Consumer has accepted the reader signature, bounded keyset transport and
-   manifest UUID/accepted-request/scope/digest receipt identity. Confirm the
-   exact response keys above and the complete preparation before receipt reuse
+   closed section 6.1 v1 pages. Separately qualify/version the section 7
+   window/effect wrapper and the epoch/FULL-bound v2 receipt domain with the
+   consumer and kernel reviewers. Confirm complete preparation before receipt reuse
    **and before any mutation**, including both user-proof paths. No identity-only
    or pre-proof old receipt fallback in replay or release.
 2. Erase-equivalence owner accepts the exact target derivation, failure and
@@ -603,6 +768,9 @@ Neither the session manifest nor 062320's shared org lock can stand in for it.
 3. 062320 owner has confirmed compatibility and successor `e13f8541`; preserve
    its latest-body, first-statement, live-prosrc and down requirements above.
    Slot 062360 is reserved by the registry owner, not implementation approval.
+   This refreshed handoff also requires 062340 history/selected-FULL binding,
+   the current per-source effect coverage relation, and pinned integration
+   originals. Old baseline two-table watermark guidance is superseded.
 4. The owner explicitly decides raw-target identifier retention. Indefinite
    retention remains a proposal, separate from ACL/lock compatibility approval.
 
