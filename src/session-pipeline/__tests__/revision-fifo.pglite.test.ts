@@ -151,6 +151,22 @@ describe("burst coalescing", () => {
     expect(pass).toMatchObject({ coalesced: 5, enqueued_at_ms: T0, queue_wait_ms: 1_500 + pointerMs + 400, receive_count: 1 });
   });
 
+  test("injected sibling pointer delay is attributed to the sibling, not to this key's pickup or queue wait", async () => {
+    const t = await rig();
+    // Two sessions in one batch: the first key's pointer work runs before the second key's.
+    const a = await t.writer(1, "a1", { ...loc, sessionId: "sess_a" });
+    const b = await t.writer(1, "b1", { ...loc, sessionId: "sess_b" });
+    const { lines } = await t.run([t.record(a, T0), t.record(b, T0)]);
+    const [la, lb] = ["sess_a", "sess_b"].map((sid) => named(lines, "revision searchable").find((l) => l.session_id === sid)!);
+    // Same pickup for both (the batch arrived once); identical enqueue-to-pickup.
+    expect(la!.picked_up_at_ms).toBe(T0 + 1_500);
+    expect(lb!.picked_up_at_ms).toBe(T0 + 1_500);
+    expect(la!.pickup_wait_ms).toBe(lb!.pickup_wait_ms);
+    // b's pointer work starts after a's completes: the sibling delay shows up in b's pointer start, not its pickup.
+    expect(lb!.pointer_started_at_ms as number).toBe((la!.pointer_started_at_ms as number) + (la!.pointer_ms as number));
+    expect(la!.pointer_ms as number).toBeGreaterThan(0);
+  });
+
   test("first upload and an append are measured separately", async () => {
     const t = await rig();
     const first = await t.writer(1, "r1", loc, new Date(T0).toISOString());
