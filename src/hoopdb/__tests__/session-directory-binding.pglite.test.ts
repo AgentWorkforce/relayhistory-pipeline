@@ -14,7 +14,7 @@
  * - a live row from before 062380 (no binding) gets one on its next write, and the reader omits it until then;
  * - the reader: read-role and tenant scope (42501), argument bounds (22023), live keys only, deduplicated, ordered.
  */
-import { afterEach, describe, expect, test } from "bun:test";
+import { afterEach, describe, expect, setDefaultTimeout, test } from "bun:test";
 import { readdirSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { PGlite } from "@electric-sql/pglite";
@@ -30,6 +30,9 @@ const root = join(import.meta.dir, "../../..");
 const read = (path: string) => readFileSync(join(root, path), "utf8");
 const sqlFile = (path: string) => read(path).split("\n").filter((l) => !l.startsWith("\\")).join("\n");
 const KEY = { orgId: "o", workspaceId: "w", harness: "codex", sessionId: "s" };
+/** Every case builds at least one fully migrated PGlite database (several seconds each): bounded, not bun's 5 s default. */
+const PER_DATABASE_TIMEOUT_MS = 60_000;
+setDefaultTimeout(PER_DATABASE_TIMEOUT_MS);
 const READER = "sessions.session_directory_bindings_for(text,text[],text[])";
 
 const open: PGlite[] = [];
@@ -401,11 +404,11 @@ describe("062380 session binding: the revision sequence stays owner-only and its
     expect((await binding(db))?.revision).toBe("501");
   });
 
-  test("a retained sequence of another shape refuses the migration (55000)", async () => {
-    for (const shape of ["AS integer", "AS bigint INCREMENT BY 2", "AS bigint CYCLE", "AS bigint MINVALUE 0", "AS bigint CACHE 16"]) {
+  // One database per case, each with its own bounded timeout (a full migration run on PGlite takes a few seconds).
+  test.each(["AS integer", "AS bigint INCREMENT BY 2", "AS bigint CYCLE", "AS bigint MINVALUE 0", "AS bigint CACHE 16"])(
+    "a retained sequence %s refuses the migration (55000)", async (shape) => {
       const refused = await database((d) => d.exec(`CREATE SEQUENCE sessions.session_binding_revision ${shape}`)).then(
         () => null, (e: { code?: string }) => e.code ?? "no_code");
-      expect([shape, refused]).toEqual([shape, "55000"]);
-    }
-  });
+      expect(refused).toBe("55000");
+    }, PER_DATABASE_TIMEOUT_MS);
 });
