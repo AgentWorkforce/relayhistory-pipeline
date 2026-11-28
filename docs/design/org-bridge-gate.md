@@ -338,8 +338,21 @@ mirror is needed.
   holds it SHARED, so each history row is strictly before (seen by the publish check, which then refuses) or after
   (it revokes) a publish. Read exclusion is immediate at the erase commit, with no replay. Byte deletion follows
   later (replay, re-arm sweeper) and does not affect visibility.
-  - Open check: "position" must be a history ordering assigned after the trigger's lock, such as an identity taken in
-    the trigger's INSERT. Verify it against 062340's columns before the slot.
+  - **Correction after reading 062340 (columns: erased_org, source, op, at, xid).** There is no ordering column
+    taken after the lock: `xid` is assigned at the erase transaction's first write, before its trigger takes the
+    key, and `at` is a clock. Position is therefore defined by snapshot. The publish captures `pg_current_snapshot()`
+    in the statement after its EXCLUSIVE grant, and stores it on the row. Every erase that held the key SHARED
+    earlier has committed and is visible in that snapshot. A history row revokes the effect exactly when
+    `NOT pg_visible_in_snapshot(xid, published_snapshot)`, that is, when it committed after the publish.
+  - **Scope.** The history row has no workspace, user or session, so on its own it can revoke only org-wide. Two
+    options:
+    - (i) Coarse plus a reconciler. Any post-publish history row for the org marks the org's effects revoked pending
+      reconciliation, and readers see an incomplete scope and fall back. A SQL reconciler reads the post-snapshot
+      rows of the 15 source tables, which carry scope, and re-publishes the unaffected effects with a new snapshot.
+      It is correct and fail-closed, at an availability cost while erasures are active.
+    - (ii) Recommended, in B's forward migration: the capture trigger also records the row's scope (workspace,
+      user, session key where the source has them), so the verdict revokes exactly the covered effects. Sources
+      without a session (user erase, reset, privacy authority) revoke at the user or org scope they name.
 - **Reads in progress.** The reader calls one batched, tenant-bound verdict function per scope (`bulls96_read_api`:
   a grant, migration and role-verify dependency) before IO and again after IO, on success and on failure, inside
   the operator-fence bracket. An erase that commits during the IO fails the post-IO verdict, which is answered as the
@@ -428,6 +441,15 @@ interface CutoverVisibility {
 - P9: the ingest, seed and courier tails (writer side).
 - Not canonical: buffered-search-feed and owner-buffered.
 
+**Readers that build chunk keys themselves** (sessions-buffered-drain-materialization, grep at 6d60dc4f). Each needs
+a verdict, or an argument that it cannot serve an enrolled org's drain effect:
+- the Bob Costas session input (src/bob-costas/session-input.ts:227);
+- the session-brief input (src/session-brief/input.ts:231);
+- alleyoop manifests (:670);
+- the pipeline relayhistory-transform (:514) and parked (:66);
+- publication-image (:147), which copies base chunks forward;
+- session-pipeline pointer (:258).
+
 **Not traced:** raw `getObject` readers over `raw/` outside these helpers, and src/migration (legacy-export,
 neon-s3-sync, neon-s3-erasure). A targeted grep is owed before W2 is ruled.
 
@@ -436,3 +458,18 @@ and 7 derived producers. A narrower option for wave 1 would apply that contract 
 enrolled org during the hold, and keep every derived producer from consuming an enrolled org's canonical entries
 beyond its baseline until the bridge sweep has settled visibility. Whether that is sound depends on the producers'
 triggers (fan-out or queue), which is not yet traced.
+
+### Evidence and ruling state
+
+- **SQL-only erase finding, pinned** (review/buffered-drain-materialization @ f6cfa827, "race with a SQL-only
+  erase"). A drain manifest PUT is parked after the last check, a SQL-only erasure source commits, and the PUT
+  resumes. Nothing on S3 moves, and the stage is marked drained with no re-arm. The bytes are readable at once, and
+  the S3-only verifier passes. No S3-side check can exclude a SQL-only erase, so the SQL visibility decision is
+  necessary.
+- **Lander ruling 8c1c6f7eb8f4.**
+  - W2 is cleared for a revised design and an isolated synthetic proof only.
+  - B goes in a new forward migration, slot unassigned (062400 is T51's). It must close admission AND publication,
+    and distinguish verified_rollback from a completed cutover.
+  - R is only a candidate safe point until pending direct and drain effects are accounted for.
+  - A's late-install versus withdrawal race still needs proof at the readable-byte boundary.
+  - Wave 1 stays held.
