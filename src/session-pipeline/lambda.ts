@@ -89,7 +89,9 @@ import { searchIndexLimits, searchIndexStreamChFromEnv, type SearchIndexDeps, ty
 import { claimSearchJobs, claimSearchProbe, runSearchJob, searchJobLogFields, searchSettlementFor, settleSearchJob, SEARCH_JOBS_DEFAULT_CLAIM, type ClaimedSearchJob, type SearchSql } from "./search-jobs.ts";
 import { BufferedFeedError, bufferedFeedConfig, bufferedFeedGateRefusal, bufferedFeedVersionRefusal, clickhouseTieLedger, runBufferedFeed, sqlBufferedFeedSource, type BufferedFeedConfig } from "./buffered-search-feed.ts";
 import { bufferedErasureConfig, runBufferedErasureDelete, type BufferedErasureConfig, type BufferedErasureDeps } from "./buffered-erasure-delete.ts";
-import { RECONCILE_BODY_KEY } from "./s3-events.ts";
+import { parseQueueBody, RECONCILE_BODY_KEY } from "./s3-events.ts";
+import { revisionEventsFromEnv, sendRevisions, sqsRevisionSender, type RevisionEventsConfig, type RevisionSender } from "./revision-events.ts";
+import { dispatchSqsBatch, type RevisionWiring, type SqsRecord } from "./revision-dispatch.ts";
 import { BUFFERED_FEED_CA_FIELD, BUFFERED_FEED_URL_FIELD, bufferedFeedClientConfig, loginCheckedFeedExecutor } from "./buffered-feed-login.ts";
 import { postgresConnectionString, postgresTlsOptions } from "../shared/postgres-tls.ts";
 import { composeSearchService, searchSecret, type SearchComposition } from "../shared/search-composition.ts";
@@ -187,6 +189,8 @@ export interface LambdaEnv {
   searchJobs?: { claim: number };
   /** SEARCH_WAKE_ENQUEUE=1: the authority transaction writes the managed search-index wake. Absent (default): off. */
   searchWakeEnqueue?: true;
+  /** SESSION_REVISION_QUEUE_URL (+ SESSION_EVENTS_MODE): the per-session FIFO revision queue (revision-events.ts). Absent (default): off. */
+  revisionEvents?: RevisionEventsConfig;
 }
 
 /**
@@ -263,6 +267,7 @@ export function lambdaEnv(env: NodeJS.ProcessEnv = process.env, composition?: Se
   if (searchJobs && env.SEARCH_INDEX_ENABLED !== "1")
     throw new Error("session pipeline: SEARCH_JOBS_ENABLED=1 needs SEARCH_INDEX_ENABLED=1");
   const searchWakeEnqueue = flagOne(env, "SEARCH_WAKE_ENQUEUE");
+  const revisionEvents = revisionEventsFromEnv(env);
   return {
     searchBackend: selected.search,
     adapterEnv: Object.freeze(Object.fromEntries(Object.entries(env).filter(([key]) => key.startsWith("SEARCH_INDEX_") || ["PIPELINE_RUNTIME", "AWS_REGION", "READ_API_COMPLETE_SINCE"].includes(key)))),
@@ -296,6 +301,7 @@ export function lambdaEnv(env: NodeJS.ProcessEnv = process.env, composition?: Se
     ...(maximum === undefined ? {} : { readerMaxRuleset: maximum }),
     ...(searchJobs ? { searchJobs } : {}),
     ...(searchWakeEnqueue ? { searchWakeEnqueue: true as const } : {}),
+    ...(revisionEvents ? { revisionEvents } : {}),
   };
 }
 
@@ -793,6 +799,35 @@ interface ReconcileEvent {
 /** A chain never outlives two cadences of listing: a runaway is cut off, the next schedule starts over. */
 export const MAX_RECONCILE_LINKS = 24;
 
+/** The FIFO wiring for this env, or undefined (SESSION_REVISION_QUEUE_URL unset: the previous behaviour). */
+export function revisionWiring(env: Pick<LambdaEnv, "revisionEvents" | "region">, call = (target: string, body: Record<string, unknown>) =>
+  awsJsonCall({ service: "sqs", target, region: env.region, body, credentials: lambdaCredentials() })): RevisionWiring | undefined {
+  const config = env.revisionEvents;
+  if (!config) return undefined;
+  return {
+    config,
+    sender: sqsRevisionSender(config.queueUrl, call),
+    changeVisibility: async (handles, seconds) => {
+      for (let i = 0; i < handles.length; i += 10)
+        await call("AmazonSQS.ChangeMessageVisibilityBatch", { QueueUrl: config.queueUrl,
+          Entries: handles.slice(i, i + 10).map((ReceiptHandle, n) => ({ Id: String(i + n), ReceiptHandle, VisibilityTimeout: seconds })) });
+    },
+  };
+}
+
+/**
+ * In forward mode the reconcile net sends to the FIFO queue too (same group, versionId/ETag dedup),
+ * so a manifest whose commit succeeded but whose notification or enqueue was lost re-enters its
+ * session's group in order. A send that fails throws, so the reconcile run reports it.
+ */
+export async function sendReconcileRevision(sender: RevisionSender, body: string): Promise<void> {
+  const parsed = parseQueueBody(body);
+  if (parsed.kind !== "events") throw new Error("reconcile body unreadable");
+  const { failed } = await sendRevisions(sender, parsed.events.map((e) => ({ key: e.key, ...(e.etag ? { etag: e.etag } : {}),
+    ...(e.version ? { version: e.version } : {}), source: "reconcile" as const })));
+  if (failed.length) throw new Error("reconcile revision enqueue failed");
+}
+
 async function runReconcile(rt: Runtime, event: ReconcileEvent) {
   const { env } = rt;
   const since = event.since ? new Date(event.since) : new Date(Date.now() - env.reconcileLookbackMinutes * 60_000);
@@ -804,6 +839,8 @@ async function runReconcile(rt: Runtime, event: ReconcileEvent) {
     since,
     ...(event.cursor ? { cursor: event.cursor } : {}),
     send: async (body) => {
+      const wiring = revisionWiring(env);
+      if (wiring?.config.mode === "forward") return sendReconcileRevision(wiring.sender, body);
       await awsJsonCall({
         service: "sqs",
         target: "AmazonSQS.SendMessage",
@@ -960,8 +997,13 @@ async function dispatchLambdaEvent(event: PipelineLambdaEvent, ready: () => Prom
       // Nothing was processed: every message goes back to the queue.
       return { batchItemFailures: event.Records.map((r) => ({ itemIdentifier: r.messageId })) };
     }
-    const records: QueueRecord[] = event.Records.map((r) => ({ messageId: r.messageId, body: r.body }));
-    return processBatch(records, invocationDeps(rt, context));
+    const deps = invocationDeps(rt, context);
+    const wiring = revisionWiring(rt.env);
+    if (!wiring) {
+      const records: QueueRecord[] = event.Records.map((r) => ({ messageId: r.messageId, body: r.body }));
+      return processBatch(records, deps);
+    }
+    return dispatchSqsBatch(event.Records as SqsRecord[], deps, wiring);
   }
   if (event?.searchJobs === true) {
     // Default off before secret lookup, connection pools or any search-index SQL.

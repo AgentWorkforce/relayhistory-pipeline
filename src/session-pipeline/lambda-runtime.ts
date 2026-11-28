@@ -5,7 +5,7 @@ import type { PipelineRuntimeAdapter, PipelineWork, WorkItem, WorkOutcome } from
 import type { BatchResponse } from "./consumer.ts";
 
 export interface PipelineLambdaEvent {
-  Records?: { messageId: string; body: string; eventSource?: string; attributes?: Record<string, string> }[];
+  Records?: { messageId: string; body: string; eventSource?: string; eventSourceARN?: string; receiptHandle?: string; attributes?: Record<string, string> }[];
   reconcile?: unknown; brief?: unknown; sessionAnalysis?: unknown; analysisCache?: unknown; analysisCacheReconcile?: unknown; semanticCopy?: unknown; bufferedSearchFeed?: unknown; bufferedErasureDelete?: unknown; briefDocuments?: unknown; searchJobs?: unknown;
   schedule?: string; analysisCursor?: unknown; cursor?: string; since?: string; link?: number;
 }

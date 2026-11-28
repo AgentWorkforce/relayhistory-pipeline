@@ -49,7 +49,9 @@ export interface SessionScope {
 
 export type PointerOutcome =
   | { status: "ignored"; reason: string }
-  | { status: "indexed" | "unchanged" | "deleted" | "moved"; scope: SessionScope; manifestKey: string; revision?: number };
+  | { status: "indexed" | "unchanged" | "deleted" | "moved"; scope: SessionScope; manifestKey: string; revision?: number;
+      /** The live manifest's S3 stamps as read under the lock (absent for a delete): what a revision event is checked against. */
+      live?: { etag?: string; version?: string } };
 
 /**
  * The per-session lock keys. The pointer stage and the search stage each
@@ -263,6 +265,9 @@ export async function findMovedSibling(key: string, exists: (key: string) => Pro
   return undefined;
 }
 
+const liveStamp = (read: { etag?: string; version?: string }) =>
+  read.etag || read.version ? { live: { ...(read.etag ? { etag: read.etag } : {}), ...(read.version ? { version: read.version } : {}) } } : {};
+
 async function indexLocked(landed: ObjectLanded, orgId: string, scope: SessionScope, deps: PointerDeps, followed = false): Promise<PointerOutcome> {
   // Canonical state, not the event: re-read the manifest, under the lock.
   const read = await deps.reader.read(landed.key);
@@ -354,12 +359,13 @@ async function indexLocked(landed: ObjectLanded, orgId: string, scope: SessionSc
       if (moved.reason === "publication_retired") return { status: "ignored", reason: "managed_publication_hint" };
       throw new PipelineError("pointer_move_skipped", `the session's move was not applied (${moved.reason}); retry`, true);
     }
-    return { status: "moved", scope, manifestKey: landed.key, ...(revision !== undefined ? { revision } : {}) };
+    return { status: "moved", scope, manifestKey: landed.key, ...(revision !== undefined ? { revision } : {}), ...liveStamp(read) };
   }
   return {
     status: result && result.status === "skipped" ? "unchanged" : "indexed",
     scope,
     manifestKey: landed.key,
     ...(revision !== undefined ? { revision } : {}),
+    ...liveStamp(read),
   };
 }

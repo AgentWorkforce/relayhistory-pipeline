@@ -12,16 +12,23 @@
  */
 import { errorFields, log, searchIndexErrorDetail } from "../shared/log.ts";
 import { parseQueueBody, sequencerAfter, type LandedEvent } from "./s3-events.ts";
-import { indexPointer, type PointerDeps, type SessionScope } from "./pointer.ts";
+import { indexPointer, type PointerDeps, type PointerOutcome, type SessionScope } from "./pointer.ts";
 import { indexSearchScope, searchIndexPhaseMetrics, type SearchIndexDeps } from "./search-index.ts";
 import { LEGACY_PROVENANCE_INVALID } from "../session-read-api/legacy-provenance.ts";
 import { captureRefusal, classifyReplayFailure, produceCanonicalReplay, type ReplayProducerDeps } from "./replay-publication.ts";
 import type { LargeJobState, LargeRoute } from "./large-read-worker.ts";
+import { revisionDedupId } from "./revision-events.ts";
 import { feedBufferedStageByKey, isBufferedStageKey, type BufferedFeedDeps } from "./buffered-search-feed.ts";
 
 export interface QueueRecord {
   messageId: string;
   body: string;
+  /** FIFO only: the record's MessageGroupId (revision-events.ts revisionGroupId). */
+  groupId?: string;
+  /** SQS SentTimestamp (ms since epoch): when the message was enqueued. */
+  sentAt?: number;
+  /** SQS ApproximateReceiveCount. */
+  receiveCount?: number;
 }
 
 export interface BatchResponse {
@@ -56,13 +63,47 @@ export interface ConsumerDeps {
    * never fail a message of the batch. Absent: exactly the previous behavior.
    */
   searchJobs?: { drain(): Promise<unknown> };
+  /**
+   * Absent by default (SESSION_REVISION_QUEUE_URL): the batch came from the per-session FIFO queue
+   * (revision-events.ts). A FIFO queue has no per-message delay and must not reorder a group, so
+   * work that would be requeued (busy, stream deferred, pointer liveness) instead fails the
+   * group's messages after `retryLater` shortens their visibility. SQS then redelivers them, in
+   * order and ahead of the group's later arrivals, with which they coalesce. Any failure in a group
+   * also fails every later message of that group in the batch (FIFO partial-batch rule).
+   */
+  ordered?: { retryLater(messageIds: readonly string[], seconds: number): Promise<void>; busyRetrySeconds: number; now?: () => number };
+  /** Test seam only: replaces indexSearchScope for the search stage. Absent (always, in the runtimes): indexSearchScope. */
+  searchScope?: typeof indexSearchScope;
 }
+
+/** FIFO busy retry default: short, because the group is blocked meanwhile and nothing else can run it. */
+export const ORDERED_BUSY_RETRY_SECONDS = 5;
+export const ORDERED_RETRY_CAP_SECONDS = 300;
+export const orderedRetrySeconds = (base: number, receiveCount = 1) =>
+  Math.min(ORDERED_RETRY_CAP_SECONDS, base * 2 ** Math.min(16, Math.max(0, receiveCount - 1)));
 
 const scopeId = (s: SessionScope) => JSON.stringify([s.orgId, s.workspaceId, s.harness, s.sessionId]);
 
 export async function processBatch(records: readonly QueueRecord[], deps: ConsumerDeps): Promise<BatchResponse> {
   const failed = new Set<string>();
   const byKey = new Map<string, { event: LandedEvent; messageIds: string[] }>();
+  const ordered = deps.ordered;
+  const now = ordered?.now ?? Date.now;
+  const recordOf = new Map(records.map((r) => [r.messageId, r]));
+  /** Every revision event behind a key, in arrival order, for the per-upload latency lines. */
+  const revisionsByKey = new Map<string, { event: LandedEvent; messageId: string }[]>();
+  /** Messages whose work is handed back to the FIFO queue with a short visibility (ordered mode). */
+  const retry = new Set<string>();
+  const later = async (manifestKey: string, messageIds: readonly string[], why: string) => {
+    if (ordered) {
+      for (const id of messageIds) { retry.add(id); failed.add(id); }
+      log.info("revision retry scheduled", { stage: "revision-events", reason: why, count: messageIds.length,
+        delay_seconds: orderedRetrySeconds(ordered.busyRetrySeconds, Math.max(...messageIds.map((id) => recordOf.get(id)?.receiveCount ?? 1))) });
+      return;
+    }
+    if (!deps.requeue) throw new Error(`${why} and no requeue`);
+    await deps.requeue(manifestKey);
+  };
   for (const record of records) {
     // Events carry the provider of the Locker the pointer stage reads from (s3 on the
     // Lambda, LOCKER_PROVIDER on self-host), which is what the row's storage_provider records.
@@ -75,16 +116,24 @@ export async function processBatch(records: readonly QueueRecord[], deps: Consum
       continue;
     }
     for (const event of parsed.events) {
+      if (event.revision) {
+        const list = revisionsByKey.get(event.key) ?? [];
+        list.push({ event, messageId: record.messageId });
+        revisionsByKey.set(event.key, list);
+      }
       const held = byKey.get(event.key);
       if (!held) byKey.set(event.key, { event, messageIds: [record.messageId] });
       else {
         held.messageIds.push(record.messageId);
-        if (sequencerAfter(event.sequencer, held.event.sequencer)) held.event = event;
+        // FIFO: arrival order is commit order within the group, so the later event wins (both are
+        // hints; the live manifest is re-read either way).
+        const newer = ordered && event.revision && !event.sequencer ? true : sequencerAfter(event.sequencer, held.event.sequencer);
+        if (newer) held.event = event;
       }
     }
   }
 
-  const scopes = new Map<string, { scope: SessionScope; messageIds: string[]; manifestKey: string }>();
+  const scopes = new Map<string, { scope: SessionScope; messageIds: string[]; manifestKey: string; revisions: Revised[] }>();
   for (const { event, messageIds } of byKey.values()) {
     const started = Date.now();
     if (deps.bufferedFeed && isBufferedStageKey(event.key)) {
@@ -94,8 +143,7 @@ export async function processBatch(records: readonly QueueRecord[], deps: Consum
         const fed = await feedBufferedStageByKey(event.key, deps.bufferedFeed);
         if (fed.outcome === "requeue") {
           // The PUT lands before the receipt commits (or a GC lease is in flight): look again later.
-          if (!deps.requeue) throw new Error("buffered stage pending and no requeue");
-          await deps.requeue(event.key);
+          await later(event.key, messageIds, "buffered stage pending");
         }
         // A same-second refusal is not coverage: warn (keep-up never writes the refusal ledger; the backfill does).
         if (fed.outcome === "skipped" && fed.reason === "same_second_tie")
@@ -119,8 +167,7 @@ export async function processBatch(records: readonly QueueRecord[], deps: Consum
       // successful inserts/rekeys after their lock is released. A missing key is reconciled through the
       // normal queue path; without a requeue binding, fail this message so its source queue retries it.
       if (deps.pointer.preRead && (outcome.status === "indexed" || outcome.status === "moved") && !(await deps.pointer.exists(outcome.manifestKey))) {
-        if (!deps.requeue) throw new Error("pointer changed after pre-read and no requeue");
-        await deps.requeue(outcome.manifestKey);
+        await later(outcome.manifestKey, messageIds, "pointer changed after pre-read");
         log.info("pointer liveness changed, requeued", { stage: "session-indexed", outcome: outcome.status, org_id: outcome.scope.orgId,
           workspace_id: outcome.scope.workspaceId, harness: outcome.scope.harness, session_id: outcome.scope.sessionId });
       }
@@ -134,10 +181,11 @@ export async function processBatch(records: readonly QueueRecord[], deps: Consum
         revision: outcome.revision,
         duration_ms: Date.now() - started,
       });
+      const revisions = checkRevisions(revisionsByKey.get(event.key) ?? [], outcome, recordOf, now);
       const id = scopeId(outcome.scope);
       const held = scopes.get(id);
-      if (held) held.messageIds.push(...messageIds);
-      else scopes.set(id, { scope: outcome.scope, messageIds: [...messageIds], manifestKey: outcome.manifestKey });
+      if (held) { held.messageIds.push(...messageIds); held.revisions.push(...revisions); }
+      else scopes.set(id, { scope: outcome.scope, messageIds: [...messageIds], manifestKey: outcome.manifestKey, revisions });
     } catch (error) {
       log.error("pointer index failed", { stage: "session-indexed", ...errorFields(error), duration_ms: Date.now() - started });
       for (const id of messageIds) failed.add(id);
@@ -174,7 +222,7 @@ export async function processBatch(records: readonly QueueRecord[], deps: Consum
     }catch(error){log.warn("large scope job state unavailable",{stage:"large-read",...ids,...errorFields(error)})}
   }
   if (deps.search) {
-    for (const { scope, messageIds, manifestKey } of scopes.values()) {
+    for (const { scope, messageIds, manifestKey, revisions } of scopes.values()) {
       if (delegated.has(scopeId(scope)) || messageIds.every((id) => failed.has(id))) continue;
       const started = Date.now();
       const phase = searchIndexPhaseMetrics();
@@ -186,11 +234,10 @@ export async function processBatch(records: readonly QueueRecord[], deps: Consum
         write_batches: phase.writeBatches,
       });
       try {
-        const result = await indexSearchScope(scope, { ...deps.search, metrics: phase });
+        const result = await (deps.searchScope ?? indexSearchScope)(scope, { ...deps.search, metrics: phase });
         if (result.busy) {
           // The running pass may have read S3 before this event's write: run again later.
-          if (!deps.requeue) throw new Error("scope busy and no requeue");
-          await deps.requeue(manifestKey);
+          await later(manifestKey, messageIds, "scope busy");
           log.info("search index busy, requeued", { stage: "search-index", org_id: scope.orgId, session_id: scope.sessionId, reason: "scope_busy" });
           continue;
         }
@@ -198,14 +245,14 @@ export async function processBatch(records: readonly QueueRecord[], deps: Consum
           // SEARCH_INDEX_SKIP_CURRENT_ENABLED: a complete pass already covers the live source set; done, not retried.
           log.info("search index skipped", {
             stage: "search-index", org_id: scope.orgId, workspace_id: scope.workspaceId, harness: scope.harness, session_id: scope.sessionId,
-            reason: result.reasons.join(","), ...phaseFields(), duration_ms: Date.now() - started,
+            reason: result.reasons.join(","), ...phaseFields(), ...passFields(messageIds, recordOf, now), duration_ms: Date.now() - started,
           });
+          logSearchable(scope, revisions, now, true);
           continue;
         }
         if (result.deferred) {
           // This invocation already streamed a scope (streamSlot): stream this one in a later invocation.
-          if (!deps.requeue) throw new Error("stream deferred and no requeue");
-          await deps.requeue(manifestKey);
+          await later(manifestKey, messageIds, "stream deferred");
           log.info("search index stream deferred, requeued", { stage: "search-index", org_id: scope.orgId, session_id: scope.sessionId, reason: "stream_deferred" });
           continue;
         }
@@ -234,8 +281,10 @@ export async function processBatch(records: readonly QueueRecord[], deps: Consum
           ok: result.complete,
           reason: result.reasons.join(",") || undefined,
           ...phaseFields(),
+          ...passFields(messageIds, recordOf, now),
           duration_ms: Date.now() - started,
         });
+        if (result.complete) logSearchable(scope, revisions, now, false);
       } catch (error) {
         log.error("search index failed", {
           stage: "search-index",
@@ -283,6 +332,33 @@ export async function processBatch(records: readonly QueueRecord[], deps: Consum
       }
     }
   }
+  if (ordered) {
+    // FIFO partial-batch rule: once a message of a group fails, every later message of that group in
+    // this batch fails too, so SQS never deletes a later revision while an earlier one is redelivered.
+    // Followers only wait behind the failure, so they come back quickly. A message that failed on its own
+    // (unreadable, a pointer error) keeps the queue's normal visibility and retry count toward the DLQ.
+    const tripped = new Set<string>();
+    const followers = new Set<string>();
+    for (const record of records) {
+      if (record.groupId === undefined) continue;
+      if (tripped.has(record.groupId)) { if (!failed.has(record.messageId)) followers.add(record.messageId); failed.add(record.messageId); }
+      else if (failed.has(record.messageId)) tripped.add(record.groupId);
+    }
+    const shorten = [...failed].filter((id) => retry.has(id) || followers.has(id));
+    // Every busy round counts toward the queue's maxReceiveCount, so the delay doubles per receive
+    // (base, 2x, 4x ... capped at ORDERED_RETRY_CAP_SECONDS): a long-held lock backs off instead of
+    // walking the message into the DLQ.
+    const bySeconds = new Map<number, string[]>();
+    for (const id of shorten) {
+      const seconds = orderedRetrySeconds(ordered.busyRetrySeconds, recordOf.get(id)?.receiveCount);
+      bySeconds.set(seconds, [...(bySeconds.get(seconds) ?? []), id]);
+    }
+    for (const [seconds, ids] of bySeconds) {
+      try { await ordered.retryLater(ids, seconds); }
+      // Visibility is an optimization: without it the messages come back after the queue's full timeout.
+      catch (error) { log.warn("revision retry visibility failed", { stage: "revision-events", count: ids.length, ...errorFields(error) }); }
+    }
+  }
   if (deps.searchJobs) {
     try {
       await deps.searchJobs.drain();
@@ -291,4 +367,84 @@ export async function processBatch(records: readonly QueueRecord[], deps: Consum
     }
   }
   return { batchItemFailures: [...failed].map((itemIdentifier) => ({ itemIdentifier })) };
+}
+
+/** The event's physical-write digest: the same value as its FIFO MessageDeduplicationId. */
+const incarnation = (e: LandedEvent) => revisionDedupId({ key: e.key, ...(e.version ? { version: e.version } : {}), ...(e.etag ? { etag: e.etag } : {}),
+  ...(e.deleted ? { deleted: true } : {}), ...(e.revision?.committedAt ? { committedAt: e.revision.committedAt } : {}) });
+
+/** One revision event that reached a completed pointer pass: kept for its first-appearance line. */
+interface Revised {
+  event: LandedEvent;
+  messageId: string;
+  /** The live manifest carries this event's write (not superseded). */
+  live: boolean;
+  sentAt?: number;
+  receiveCount?: number;
+}
+
+/**
+ * The commit check for revision events. The pointer pass read the live manifest under the lock;
+ * an event names one physical write (S3 versionId, else ETag). An event whose write is not the
+ * live one is superseded. It is logged (coalescing is countable) and never published. It costs
+ * nothing extra: the pass already indexed whatever is live, which for an erased incarnation is
+ * the new incarnation or nothing.
+ */
+function checkRevisions(revs: readonly { event: LandedEvent; messageId: string }[], outcome: Extract<PointerOutcome, { scope: SessionScope }>,
+  recordOf: ReadonlyMap<string, QueueRecord>, now: () => number): Revised[] {
+  const out: Revised[] = [];
+  const live = outcome.live;
+  for (const { event, messageId } of revs) {
+    const record = recordOf.get(messageId);
+    const same = !event.deleted && live !== undefined && outcome.status !== "deleted" &&
+      (event.version && live.version ? event.version === live.version : event.etag !== undefined && event.etag === live.etag);
+    if (!same && !event.deleted) {
+      log.info("revision superseded", {
+        stage: "revision-events", org_id: outcome.scope.orgId, workspace_id: outcome.scope.workspaceId, harness: outcome.scope.harness, session_id: outcome.scope.sessionId,
+        revision: event.revision?.revision, event_source: event.revision?.source, incarnation_sha256: incarnation(event),
+        ...(outcome.status === "deleted" ? { superseded_by_delete: true } : outcome.revision !== undefined ? { superseded_by_revision: outcome.revision } : {}),
+        ...(record?.sentAt !== undefined ? { group_lag_ms: Math.max(0, now() - record.sentAt) } : {}),
+      });
+    }
+    out.push({ event, messageId, live: same, ...(record?.sentAt !== undefined ? { sentAt: record.sentAt } : {}), ...(record?.receiveCount !== undefined ? { receiveCount: record.receiveCount } : {}) });
+  }
+  return out;
+}
+
+/** Queue timing for a pass line: the oldest enqueue among its messages, and the highest receive count. */
+function passFields(messageIds: readonly string[], recordOf: ReadonlyMap<string, QueueRecord>, now: () => number) {
+  let sentAt: number | undefined;
+  let receives: number | undefined;
+  for (const id of messageIds) {
+    const r = recordOf.get(id);
+    if (r?.sentAt !== undefined && (sentAt === undefined || r.sentAt < sentAt)) sentAt = r.sentAt;
+    if (r?.receiveCount !== undefined) receives = Math.max(receives ?? 0, r.receiveCount);
+  }
+  if (sentAt === undefined) return {};
+  return { enqueued_at_ms: sentAt, queue_wait_ms: Math.max(0, now() - sentAt), ...(receives !== undefined ? { receive_count: receives } : {}), coalesced: messageIds.length };
+}
+
+/**
+ * First appearance, one line per live upload (initial vs append measured separately): the
+ * upload's own commit time to the end of the pass that made it searchable. A superseded event
+ * has no line of its own; the upload that superseded it reports.
+ */
+function logSearchable(scope: SessionScope, revisions: readonly Revised[], now: () => number, alreadyCurrent: boolean) {
+  const seen = new Set<string>();
+  for (const r of revisions) {
+    if (!r.live) continue;
+    const id = `${r.event.key}\u001f${r.event.version ?? r.event.etag ?? ""}`;
+    if (seen.has(id)) continue;
+    seen.add(id);
+    const committed = r.event.revision?.committedAt ? Date.parse(r.event.revision.committedAt) : NaN;
+    const kind = r.event.revision?.initial === true ? "initial" : r.event.revision?.initial === false ? "append" : r.event.revision?.revision === 1 ? "initial" : r.event.revision?.revision ? "append" : "unknown";
+    log.info("revision searchable", {
+      stage: "revision-events", org_id: scope.orgId, workspace_id: scope.workspaceId, harness: scope.harness, session_id: scope.sessionId,
+      revision: r.event.revision?.revision, upload_kind: kind, event_source: r.event.revision?.source, already_current: alreadyCurrent,
+      incarnation_sha256: incarnation(r.event),
+      ...(Number.isFinite(committed) ? { commit_to_searchable_ms: Math.max(0, now() - committed) } : {}),
+      ...(r.sentAt !== undefined ? { enqueued_at_ms: r.sentAt, queue_wait_ms: Math.max(0, now() - r.sentAt) } : {}),
+      ...(r.receiveCount !== undefined ? { receive_count: r.receiveCount } : {}),
+    });
+  }
 }
