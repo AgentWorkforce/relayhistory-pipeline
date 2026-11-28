@@ -329,6 +329,58 @@ describe("superseded-only skip needs DURABLE proof of a covering search (Pipelin
   });
 });
 
+describe("first indexed appearance of superseded uploads ('revision covered' / 'revision unobserved')", () => {
+  test("a burst of 5: the 4 superseded appends each get their OWN covered line from the covering pass (all 5 in the denominator)", async () => {
+    const t = await rig();
+    const events: RevisionEvent[] = [];
+    for (let rev = 1; rev <= 5; rev++) events.push(await t.writer(rev, `r${rev}`, loc, new Date(T0 + rev * 100).toISOString()));
+    const { lines } = await t.run(events.map((e, i) => t.record(e, T0 + i * 100)));
+    const covered = named(lines, "revision covered");
+    expect(covered.map((l) => l.revision)).toEqual([1, 2, 3, 4]);
+    const pass = named(lines, "revision searchable")[0]!;
+    for (const [i, l] of covered.entries()) {
+      expect(l).toMatchObject({ covered_by_revision: 5, picked_up_at_ms: pass.picked_up_at_ms, pass_started_at_ms: pass.pass_started_at_ms });
+      // Each from ITS OWN commit time: revision i+1 committed at T0 + (i+1)*100.
+      expect(l.commit_to_searchable_ms).toBe((pass.commit_to_searchable_ms as number) + (5 - (i + 1)) * 100);
+      expect(l.incarnation_sha256).toBe(revisionMessage(events[i]!)!.MessageDeduplicationId);
+    }
+    expect(named(lines, "revision unobserved")).toEqual([]);
+  });
+
+  test("fail-closed: an erase between a superseded upload and the live write gives 'revision unobserved' reason=erase_between, not covered", async () => {
+    const t = await rig();
+    const e1 = await t.writer(1, "old");
+    await t.r.store.delete(objectKey(e1.key));
+    const del: RevisionEvent = { key: e1.key, deleted: true, sequencer: "0B", committedAt: new Date(T0 + 10).toISOString(), source: "forward" };
+    const e2 = await t.writer(2, "new");
+    const { lines } = await t.run([t.record(e1), t.record(del), t.record(e2)]);
+    expect(named(lines, "revision covered")).toEqual([]);
+    expect(named(lines, "revision unobserved")).toEqual([expect.objectContaining({ revision: 1, reason: "erase_between" })]);
+  });
+
+  test("fail-closed: a superseded event at a revision >= the live one (a re-create) gives reason=recreate_between", async () => {
+    const t = await rig();
+    const a = await t.writer(1, "old");
+    await t.run([t.record(a)]);
+    await t.r.store.delete(objectKey(a.key));
+    const b = await t.writer(2, "new");
+    // The old incarnation's revision-2-or-higher event can't be an append of the live write: model it with revision 2 >= live 2.
+    const stale: RevisionEvent = { ...a, revision: 2, version: "stale-v", etag: "stale-e" };
+    const { lines } = await t.run([t.record(stale), t.record(b)]);
+    expect(named(lines, "revision covered")).toEqual([]);
+    expect(named(lines, "revision unobserved")).toEqual([expect.objectContaining({ revision: 2, reason: "recreate_between" })]);
+  });
+
+  test("a superseded-only batch (skipped) reports its events as unobserved: covered_by_earlier_pass", async () => {
+    const t = await rig();
+    const e1 = await t.writer(1, "r1");
+    const e2 = await t.writer(2, "r2");
+    await t.run([t.record(e2)]);
+    const { lines } = await t.run([t.record(e1)]);
+    expect(named(lines, "revision unobserved")).toEqual([expect.objectContaining({ revision: 1, reason: "covered_by_earlier_pass" })]);
+  });
+});
+
 describe("in-flight pass: park it, commit a newer revision, then crash or lose the ack", () => {
   test("crash: the parked pass fails, SQS redelivers in order with the newer arrival, the newest live state becomes searchable", async () => {
     const t = await rig();
