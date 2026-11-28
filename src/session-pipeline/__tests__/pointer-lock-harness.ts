@@ -57,7 +57,14 @@ export async function pointerRig() {
     ...reader0,
     read: async (key) => {
       calls.push({ at: at(), kind: "s3.read", detail: key });
-      return reader0.read(key);
+      const got = await reader0.read(key);
+      // T139: pause a pass AFTER its manifest read and BEFORE any transaction (so before the shared k), once.
+      if (hooks.afterRead) {
+        const h = hooks.afterRead;
+        hooks.afterRead = undefined;
+        await h();
+      }
+      return got;
     },
   };
   const exists = async (key: string) => {
@@ -65,7 +72,7 @@ export async function pointerRig() {
     return (await store.head(objectKey(key))) !== undefined;
   };
   /** Hooks a test sets: runs right before the first pool statement inside the lock, once. */
-  const hooks: { beforeLock?: () => Promise<void>; atLock?: () => Promise<void>; beforeUpsert?: () => Promise<void> } = {};
+  const hooks: { beforeLock?: () => Promise<void>; atLock?: () => Promise<void>; beforeUpsert?: () => Promise<void>; afterRead?: () => Promise<void> } = {};
   const db = {
     pool: undefined,
     end: async () => {},
@@ -119,9 +126,12 @@ export async function pointerRig() {
     requeue: async (key) => { requeued.push(key); },
   });
 
-  /** `marker`: the record id (default `r<revision>`), so two incarnations with one revision number differ in content. */
-  async function writeManifest(revision: number, l: Loc = loc, marker = `r${revision}`) {
-    const source = new TextEncoder().encode(JSON.stringify({ kind: "session_event", origin_id: "o", record_id: marker, revision: "1", operation: "upsert", received_at: AT, payload: { ts_ms: 1, text: "x" } }) + "\n");
+  /**
+   * `marker` (default none): the record id and the searchable text, so two incarnations with one revision number
+   * differ in content. Without it the manifest is byte-identical to the golden's.
+   */
+  async function writeManifest(revision: number, l: Loc = loc, marker?: string, incarnation?: number) {
+    const source = new TextEncoder().encode(JSON.stringify({ kind: "session_event", origin_id: "o", record_id: marker ?? `r${revision}`, revision: "1", operation: "upsert", received_at: AT, payload: { ts_ms: 1, text: marker ?? "x" } }) + "\n");
     const stored = new Uint8Array(zstdCompressSync(source));
     const sha = await sha256Hex(source);
     const chunk: ChunkEntry = { seq: 0, epoch: 0, start_offset: 0, bytes: source.byteLength, stored_bytes: stored.byteLength, sha256: sha, sha256_8: sha.slice(0, 8), stored_sha256: await sha256Hex(stored), stored_raw_bytes: source.byteLength, raw_sha256: sha, compression: "zstd", records: 1 };
@@ -130,7 +140,7 @@ export async function pointerRig() {
       session: { workspace_id: l.workspaceId, machine_id: l.machineId, harness: l.harness, session_id: l.sessionId, started_at: `${l.startDate}T10:00:00.000Z` },
       writer: { delivery_instance_id: l.machineId, plugin_version: "t" },
       raw: { owner: l.machineId, state: "open", updated_at: AT, format: "ndjson", compression: "zstd", chunk_count: 1, raw_bytes: chunk.bytes, stored_bytes: chunk.stored_bytes, content_sha256: await computeContentSha256([chunk]), epoch: 0, epochs: [{ epoch: 0, opened_at: AT, reason: "initial", first_seq: chunk.seq, opened_by: l.machineId }], next_offset: source.byteLength, chunks: [chunk], scrub: { ruleset: "relayhistory-scrub", version: 1 } },
-      extensions: { "96bulls": { user_id: "user_1", session_uuid: sessionUuid(l) } } } as unknown as ManifestV1;
+      extensions: { "96bulls": { user_id: "user_1", session_uuid: sessionUuid(l), ...(incarnation !== undefined ? { incarnation } : {}) } } } as unknown as ManifestV1;
     const key = manifestKey(l);
     await store.put(objectKey(key), new TextEncoder().encode(JSON.stringify(manifest)), { contentType: "application/json" });
     return key;
@@ -145,5 +155,7 @@ export async function pointerRig() {
     await pg.close();
     await rm(root, { recursive: true, force: true });
   };
-  return { pg, store, calls, requeued, hooks, pointer, deps, run, writeManifest, body, row, close };
+  /** A pool on the single PGlite connection, so a code path that opens its own transaction (BEGIN/COMMIT) can run. */
+  const pool = { connect: async () => ({ query: (text: string, params?: unknown[]) => db.query(text, params), release() {} }) };
+  return { pg, store, reader, pool, calls, requeued, hooks, pointer, deps, run, writeManifest, body, row, close };
 }

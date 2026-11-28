@@ -51,8 +51,14 @@ const SEARCH_PHASE_FIELDS = ["source_read_ms", "index_scan_ms", "locked_apply_ms
  */
 const REVISION_EVENT_COUNT_FIELDS = ["picked_up_at_ms", "pickup_wait_ms", "commit_to_pickup_ms", "pointer_started_at_ms", "pointer_ms", "queue_wait_ms", "start_wait_ms", "commit_to_start_ms", "pass_started_at_ms", "group_lag_ms", "receive_count", "coalesced", "delay_seconds", "superseded_by_revision", "enqueued_at_ms"];
 
+/** T139 pointer fence refusal line (hoopdb/index.ts): the stored row's revision, a bounded count. */
+const POINTER_FENCE_COUNT_FIELDS = ["stored_revision"];
+
 export const ALLOWED_LOG_FIELDS = new Set([
   ...REVISION_EVENT_COUNT_FIELDS,
+  ...POINTER_FENCE_COUNT_FIELDS,
+  // T139: whether the stored row is a tombstone (BOOLEAN_FIELDS).
+  "stored_deleted",
   // ...and their closed values (UPLOAD_KIND_VALUES, EVENT_SOURCE_VALUES) and booleans (BOOLEAN_FIELDS).
   "upload_kind", "event_source", "already_current", "superseded_by_delete",
   // ...and the physical write's identity digest (revision-events.ts revisionDedupId: sha256 over key, versionId, ETag),
@@ -169,6 +175,7 @@ export const BOUNDED_COUNT_FIELDS: ReadonlyMap<string, number> = new Map([
   ...SEARCH_PHASE_FIELDS.map((f): [string, number] => [f, Number.MAX_SAFE_INTEGER]),
   ...SUMMARY_INPUT_FIELDS.map((f): [string, number] => [f, Number.MAX_SAFE_INTEGER]),
   ...REVISION_EVENT_COUNT_FIELDS.map((f): [string, number] => [f, Number.MAX_SAFE_INTEGER]),
+  ...POINTER_FENCE_COUNT_FIELDS.map((f): [string, number] => [f, Number.MAX_SAFE_INTEGER]),
 ]);
 
 function boundedCount(v: unknown, max: number): number | undefined {
@@ -224,7 +231,7 @@ export const INCARNATION_SHAPE = /^[0-9a-f]{64}$/;
 /** `error_frame`: a function name only (db-error-class.ts FRAME_NAME, pinned equal); never a path, line or text. */
 export const FRAME_NAME_SHAPE = /^(?=.{1,64}$)[A-Za-z_$][A-Za-z0-9_$]*(?:\.[A-Za-z_$][A-Za-z0-9_$]*){0,3}$/;
 /** Boolean fields: emitted only when the value is `true` or `false` (else dropped), so they can never carry text or an id. */
-export const BOOLEAN_FIELDS: ReadonlySet<string> = new Set(["same_origin", "already_current", "superseded_by_delete"]);
+export const BOOLEAN_FIELDS: ReadonlySet<string> = new Set(["same_origin", "already_current", "superseded_by_delete", "stored_deleted"]);
 const SHAPED_FIELDS: ReadonlyMap<string, RegExp> = new Map([["client_version", CLIENT_VERSION_SHAPE], ["receipt_tag", LOG_TAG_SHAPE], ["attempt_tag", LOG_TAG_SHAPE], ["error_frame", FRAME_NAME_SHAPE], ["incarnation_sha256", INCARNATION_SHAPE]]);
 
 /**
