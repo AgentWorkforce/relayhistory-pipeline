@@ -104,6 +104,8 @@ import {
 } from "./writer.ts";
 
 export const DRAINED_SUFFIX = ".drained.json";
+/** Written into every `drained` marker since materialization (step 4): a marker without it may hide unwritten lines. */
+export const MATERIALIZATION_VERSION = 1;
 /**
  * 0005 step 0b: the accepted-stage export (accepted-stage-export.ts) writes one create-only sidecar per stage
  * whose receipt SQL acknowledged, and one completion object per org once that org's export is whole. The drain
@@ -420,6 +422,8 @@ export interface DrainSummary {
     /** Lines SQL does not keep (the export's verdict: GC-dropped, not body-accepted, or not live). */
     not_kept: number;
   };
+  /** `rematerialize` only: stages with a pre-materialization `drained` marker drained again. */
+  rematerialize_revisited: number;
   /** Session groups written (execute) or that would be (dry run). */
   sessions_written: number;
   rearmed: number;
@@ -452,6 +456,7 @@ function emptySummary(mode: DrainSummary["mode"]): DrainSummary {
     mode, orgs: 0, listed: 0, foreign_keys: 0,
     objects: Object.fromEntries(OUTCOMES.map((o) => [o, 0])) as Record<ObjectOutcome, number>,
     lines: { candidate: 0, written: 0, fenced: 0, stale: 0, already_stored: 0, materialized: 0, revision_conflict: 0, not_kept: 0 },
+    rematerialize_revisited: 0,
     sessions_written: 0, rearmed: 0, hold_failures: 0, holds_pruned: 0, orgs_without_authority: 0, fence_assumed_empty: 0, write_failures: {}, stopped: "complete", resume: "none",
   };
 }
@@ -846,6 +851,15 @@ export interface DrainOptions {
    * a summary.
    */
   halt?: () => unknown;
+  /**
+   * Recovery of a pre-materialization drain: a stage whose `drained` marker predates materialization (no
+   * `materialization: 1`; main's drain counted FULL-indexed lines `already_stored` and wrote none of them) is drained
+   * again instead of skipped as `already_drained`. Every check of a first drain applies (export verdict, fence,
+   * authority, holds); lines the canonical session holds stay `already_stored`, so the rerun writes only the missing
+   * bytes. The legacy marker is create-only and stays as it is, so each run in this mode revisits it (idempotent).
+   * `pre_reset` markers are never revisited.
+   */
+  rematerialize?: boolean;
   now?: () => Date;
   sleep?: (ms: number) => Promise<void>;
   random?: () => number;
@@ -900,6 +914,11 @@ export async function drainBufferedBatches(opts: DrainOptions): Promise<DrainSum
     }, Math.max(500, Math.floor(lockTtlMs / 3)));
   }
   const locks = new KeyedLocks();
+  /**
+   * Slot-entry lines this run wrote, by (shard, record, revision, digest): a later stage of the run carrying the same
+   * line (a duplicate stage) counts it already_stored instead of appending it again. Updated under the shard lock.
+   */
+  const materializedThisRun = new Set<string>();
   const orgs = orgOrder(opts.orgs);
   /**
    * Each org's accepted-stage export generation for this run (`completedAtMs`, or null: no valid completion, so nothing of
@@ -1156,6 +1175,23 @@ export async function drainBufferedBatches(opts: DrainOptions): Promise<DrainSum
       summary.objects[outcome]++;
       if (!isTerminal) terminal = false;
     };
+    if (opts.rematerialize) {
+      for (const key of [...group.markers]) {
+        let legacy: boolean;
+        try {
+          const got = await readText(store, key + DRAINED_SUFFIX, 64 * 1024);
+          const m = got ? (JSON.parse(got.text) as Record<string, unknown>) : null;
+          legacy = isObject(m) && m.outcome !== "pre_reset" && m.materialization !== MATERIALIZATION_VERSION;
+        } catch {
+          // Unreadable: drained again (every step is idempotent), never trusted as materialized.
+          legacy = true;
+        }
+        if (legacy) {
+          group.markers.delete(key);
+          summary.rematerialize_revisited++;
+        }
+      }
+    }
     // Only stages SQL acknowledged (0005 step 0b) are candidates; nothing else is even read.
     // Read every candidate, then decide per claim token (GC replacement detection).
     const reads = new Map<string, Read>();
@@ -1397,9 +1433,12 @@ export async function drainBufferedBatches(opts: DrainOptions): Promise<DrainSum
       } catch {
         return "index_unreadable";
       }
-      // Materialization: an equal stored revision with this line's digest is NOT proof of canonical bytes (the FULL
-      // indexes owned lazy slots with their digest, and their lines exist only in this backlog). Read the canonical
-      // session of every group with such a line; the line is materialized unless the canonical session holds it.
+      // Materialization: an equal stored revision with this line's digest is NOT proof of canonical bytes. The FULL
+      // indexes every owned lazy slot as [revision, null revision id, digest] (upload-fence-backfill.ts: SQL's buffered
+      // acceptance), and for a buffered org its line exists only in this backlog: such a line is always written (a
+      // replay is a no-op under the manifest's batch-digest dedupe, counted already_stored below), with no canonical
+      // read on this hot path. A full entry (revision id set: an admission's commit, or ingest_record_revisions) is
+      // trusted only when the session's canonical manifest holds the exact line, so only those groups are read.
       const canonical = new Map<Kept, CanonicalLine[] | null>();
       try {
         for (const k of kept) {
@@ -1407,7 +1446,7 @@ export async function drainBufferedBatches(opts: DrainOptions): Promise<DrainSum
             const r = recordOf(line);
             const shard = shards.get(keys.revisions(origin, r.record_id))!;
             const e = Object.hasOwn(shard, r.record_id) ? shard[r.record_id] : undefined;
-            return !!e && !entryForgotten(fence, origin, e) && Number(r.revision) === e[0] && e[2] === k.meta[i]![1];
+            return !!e && e[1] !== null && !entryForgotten(fence, origin, e) && Number(r.revision) === e[0] && e[2] === k.meta[i]![1];
           });
           if (indexEqual) canonical.set(k, await readCanonicalSession(store, {
             keyRoot: opts.keyRoot, orgId: header.org_id, workspaceId: header.workspace_id,
@@ -1418,6 +1457,10 @@ export async function drainBufferedBatches(opts: DrainOptions): Promise<DrainSum
         return "canonical_unreadable";
       }
       const toWrite: Group[] = [];
+      /** Materialized lines per staged group, so a replayed group's lines count as already_stored. */
+      const materializedIn = new Map<Group, number>();
+      const writtenFrom = new Map<Group, Group>();
+      const matKeys = new Map<Group, string[]>();
       const entries = new Map<string, IndexEntryInput[]>();
       const inBatch = new Map<string, [number, string]>();
       const writtenSessions = new Map<string, [string, string]>();
@@ -1439,10 +1482,15 @@ export async function drainBufferedBatches(opts: DrainOptions): Promise<DrainSum
           // A revision-only stored entry (#587: SQL's seeded records and lazy slots) has no digest to compare: stale.
           else if (stored && revision === stored[0] && stored[2] === null) counts.stale++;
           else if (stored && revision === stored[0] && stored[2] !== m[1]) counts.revision_conflict++;
-          else if (stored && revision === stored[0] && (canonicalHolds(canonical.get(k) ?? null, line) || (seen && revision === seen[0]))) counts.already_stored++;
+          // An in-batch repeat of a line already taken (same digest: stored[2] === m[1] here), or a full entry whose exact
+          // line the canonical session holds.
+          else if (stored && revision === stored[0] && ((seen && revision === seen[0]) || materializedThisRun.has(JSON.stringify([sk, r.record_id, revision, m[1]])) ||
+              (stored[1] !== null && canonicalHolds(canonical.get(k) ?? null, line)))) counts.already_stored++;
           else if (stored && revision === stored[0]) {
             // Index-equal, not canonical: write the line. The index already holds this entry (a merge would keep it).
             counts.materialized++;
+            materializedIn.set(k.group, (materializedIn.get(k.group) ?? 0) + 1);
+            matKeys.set(k.group, [...(matKeys.get(k.group) ?? []), JSON.stringify([sk, r.record_id, revision, m[1]])]);
             inBatch.set(r.record_id, [revision, m[1]]);
             if (m[3] !== null) writtenSessions.set(JSON.stringify([m[2], m[3]]), [m[2], m[3]]);
             lines.push(fitLine(line));
@@ -1458,7 +1506,11 @@ export async function drainBufferedBatches(opts: DrainOptions): Promise<DrainSum
             meta.push(m);
           }
         });
-        if (lines.length) toWrite.push({ source: k.group.source, sessionId: k.group.sessionId, lines, meta });
+        if (lines.length) {
+          const out = { source: k.group.source, sessionId: k.group.sessionId, lines, meta };
+          writtenFrom.set(out, k.group);
+          toWrite.push(out);
+        }
       }
       counts.written = toWrite.reduce((n, g) => n + g.lines.length, 0);
 
@@ -1528,7 +1580,16 @@ export async function drainBufferedBatches(opts: DrainOptions): Promise<DrainSum
           // One session group at a time, the lease re-checked between them (and before every put, by `store`).
           for (const g of toWrite) {
             if (!leaseOk()) return partial("lock_lost");
-            machineId = (await writeGroups(target, batch, [g], new Date(receivedMs))).machineId;
+            const res = await writeGroups(target, batch, [g], new Date(receivedMs));
+            machineId = res.machineId;
+            // The session already held this batch (manifest replay dedupe): its materialized lines were stored.
+            const replayed = materializedIn.get(writtenFrom.get(g)!) ?? 0;
+            for (const mk of matKeys.get(writtenFrom.get(g)!) ?? []) materializedThisRun.add(mk);
+            if (res.manifests[0] && !res.manifests[0].written && replayed > 0) {
+              counts.materialized -= replayed;
+              counts.already_stored += replayed;
+              counts.written -= replayed;
+            }
           }
         } catch (error) {
           if (error instanceof DrainLockError) return partial("lock_lost");
@@ -1608,7 +1669,7 @@ export async function drainBufferedBatches(opts: DrainOptions): Promise<DrainSum
 
   async function putMarker(key: string, sha256: string, outcome: "drained" | "pre_reset", counts: DrainSummary["lines"], sessions: number, token?: number): Promise<boolean> {
     const at = (opts.now ?? (() => new Date()))().toISOString();
-    const body = encoder.encode(JSON.stringify({ v: 1, kind: "buffered-drained", outcome, at, staged_sha256: sha256, sessions_written: sessions, lines: counts, ...(token !== undefined ? { lease_token: token } : {}) }));
+    const body = encoder.encode(JSON.stringify({ v: 1, kind: "buffered-drained", outcome, at, staged_sha256: sha256, sessions_written: sessions, lines: counts, materialization: MATERIALIZATION_VERSION, ...(token !== undefined ? { lease_token: token } : {}) }));
     try {
       await store.put(objectKey(key + DRAINED_SUFFIX), body, { ifNoneMatch: true, contentType: "application/json" });
       return true;

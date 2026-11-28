@@ -2,10 +2,11 @@
  * FULL-to-drain materialization (decision 0005, "The buffered backlog"; wave-1 blocker).
  *
  * The FULL's revisions section (upload-fence-backfill.ts) puts every owned lazy native slot into the S3 revision index
- * with the slot's `current_digest`. For a buffered org those slots name lines that exist only in the staged backlog:
- * the publisher that would have written them never ran. An index entry is therefore NOT proof of canonical bytes, and
- * the drain (buffered-drain.ts step 4) materializes an equal-revision, equal-digest line unless the session's canonical
- * manifest already holds that exact record (`canonicalHolds`).
+ * as [revision, null revision id, current_digest]. For a buffered org those slots name lines that exist only in the
+ * staged backlog: the publisher that would have written them never ran. An index entry is therefore NOT proof of
+ * canonical bytes. The drain (buffered-drain.ts step 4) always writes a slot-entry line (a replay is a no-op under the
+ * manifest's batch-digest dedupe), and trusts a full entry (revision id set) only when the session's canonical
+ * manifest holds that exact line (`canonicalHolds`).
  *
  * `verifyDrainMaterialization` proves the result, record by record, from S3 alone (no aggregate check):
  *
@@ -13,14 +14,18 @@
  *              superseded) of a stage marked `drained`, in a session the user's CURRENT S3 fence does not delete.
  *   expected   per (origin, record id), the highest allowed revision (supersession: a newer revision wins).
  *   excluded   every other line of the org's staged backlog (not kept, not live, superseded, unacknowledged, pre-reset,
- *              or in a deleted session): erased or never published. None may be canonical unless the same
- *              (record, revision) is also allowed.
+ *              or in a deleted session): erased or never published.
+ *   winners    every digest-bearing index entry of the backlog's users the fence has not forgotten, located by the
+ *              owner stubs (revision-only seeded entries are not judged).
  *
- * For each expected record: the revision index must hold it (or a higher revision a later admission wrote), and the
- * session's canonical fold must be exactly the expected line (the stored, scrubbed chunk line, byte-equal), unless the
- * index names a higher revision. Every canonical line of a backlog session must be allowed or the index's current
- * revision (a later live admission); an excluded line found canonical is `erased_present`. Any stage of the org that
- * is accepted and live but not marked is `undrained`. The run passes only when every list is empty.
+ * Judged per record: an expected record at the winner's revision must be canonical as exactly the expected line (the
+ * stored, scrubbed chunk line, byte-equal), else `missing` / `mismatch`; an index below it is `index_missing`. Any
+ * other winner (a higher revision than the backlog holds, or a record the backlog never staged) must have a canonical
+ * line AT that revision: the index is never trusted on its own word; without one it is `unrecoverable` (no staged
+ * bytes, no canonical bytes). Every canonical line of a touched session must be allowed, the winner beyond the backlog,
+ * or in the pre-drain `baseline` (preserved); else `unexpected`, or `erased_present` for an excluded line. An accepted,
+ * live stage without its marker is `undrained`; an org without its export completion is `export_missing`. `ok` only
+ * when every list is empty.
  *
  * Nothing here logs. Records in the result are named by sha256 of their identity tuple, never by id or content.
  */
@@ -31,9 +36,9 @@ import {
 import { layoutComponent } from "../shared/layout-component.ts";
 import { scrubRecords } from "../../packages/pipeline/src/lib/scrub-engine/index.ts";
 import { fitLine } from "./oversize.ts";
-import { isDeletedForAdmission, s3LedgerObjects, type FenceDoc } from "./ledger-s3.ts";
+import { entryForgotten, isDeletedForAdmission, s3LedgerObjects, sessionKeyHash, type FenceDoc, type IndexEntry } from "./ledger-s3.ts";
 import type { LedgerTenant } from "./ledger.ts";
-import { liveMachineId } from "./writer.ts";
+import { NO_SESSION_HARNESS, NO_SESSION_ID, liveMachineId } from "./writer.ts";
 // A cycle with buffered-drain.ts (which imports canonicalHolds): only called at run time, never at module init.
 import { acceptedCompleteKey, parseAcceptedComplete } from "./buffered-drain.ts";
 
@@ -163,18 +168,23 @@ export function canonicalHolds(canonical: readonly CanonicalLine[] | null, stage
 
 // ---- verification ----
 
-export type VerifyFailure = "export_missing" | "missing" | "mismatch" | "index_missing" | "unexpected" | "erased_present" | "undrained" | "unreadable";
+export type VerifyFailure =
+  | "export_missing" | "missing" | "mismatch" | "index_missing" | "unrecoverable" | "unexpected" | "erased_present" | "undrained" | "unreadable";
 
 export interface VerifyResult {
   ok: boolean;
   /** Expected records whose canonical fold is exactly the expected line. */
   exact: number;
-  /** Expected records a later admission superseded (the index holds a higher revision): not compared. */
+  /** Expected records a later admission superseded (the index holds a higher revision, canonical at that revision). */
   superseded_later: number;
-  /** Staged lines excluded from the expected set (erased, not kept, not live, pre-reset) and confirmed absent. */
+  /** Index winners outside the backlog's expected set that canonical holds (a later admission, or preexisting). */
+  index_winners_canonical: number;
+  /** Staged lines excluded from the expected set (erased, not kept, not live, pre-reset) and not canonical. */
   excluded_absent: number;
+  /** Canonical lines in the baseline (before the drain) that the backlog does not account for: preserved, not judged. */
+  baseline_preserved: number;
   counts: Record<VerifyFailure, number>;
-  /** Per record (or per stage for `undrained`): sha256 of its identity tuple. Never an id or content. */
+  /** Per record (or per stage for `undrained`, per org for `export_missing`): sha256 of its identity tuple. */
   failures: { kind: VerifyFailure; ref: string }[];
 }
 
@@ -183,9 +193,15 @@ export interface VerifyOptions {
   keyRoot: string;
   orgId: string;
   decompress: (bytes: Uint8Array) => Uint8Array;
+  /**
+   * The org's canonical lines before the drain (`snapshotCanonical`). With it, a canonical line the backlog does not
+   * account for is `unexpected` (or `erased_present`) only when the drain introduced it; lines already there are
+   * preserved. Without it every such line fails (fail closed).
+   */
+  baseline?: CanonicalSnapshot;
 }
 
-/** A staged object as the verifier needs it (buffered-drain.ts readStagedObject's live form). */
+/** A staged object as the verifier needs it (buffered-drain.ts readLiveStaged). */
 export interface StagedForVerify {
   header: { org_id: string; workspace_id: string; origin_id: string; user_id: string };
   groups: { source: string; sessionId: string; lines: string[]; meta?: [string, string, string, string | null][] }[];
@@ -201,17 +217,165 @@ export interface VerifyDeps {
   parseStagedKey(key: string): { orgId: string } | null;
 }
 
+/** Canonical lines per session (sessionKey below), as read before a drain. */
+export interface CanonicalSnapshot { sessions: Map<string, string[]> }
+
 type Line = { tenant: LedgerTenant; origin: string; source: string; sessionId: string; line: string; recordId: string; revision: number };
+type Session = { tenant: LedgerTenant; origin: string; source: string; sessionId: string };
 const sessionKey = (t: LedgerTenant, origin: string, source: string, sessionId: string) => JSON.stringify([t.orgId, t.workspaceId, t.userId, origin, source, sessionId]);
 const recordKey = (t: LedgerTenant, origin: string, recordId: string) => JSON.stringify([t.orgId, t.workspaceId, t.userId, origin, recordId]);
+const userKey = (t: LedgerTenant) => JSON.stringify([t.orgId, t.workspaceId, t.userId]);
 const ref = (s: string) => sha256Hex(s);
 
-export async function verifyDrainMaterialization(opts: VerifyOptions, deps: VerifyDeps): Promise<VerifyResult> {
+interface Backlog {
+  allowed: Line[];
+  excluded: Line[];
+  sessions: Map<string, Session>;
+  /** Every (user, origin) of the backlog. */
+  origins: Map<string, { tenant: LedgerTenant; origin: string }>;
+  fences: Map<string, FenceDoc | null>;
+  undrained: string[];
+  exportComplete: boolean;
+}
+
+async function collectBacklog(opts: VerifyOptions, deps: VerifyDeps): Promise<Backlog> {
   const { store, keyRoot, orgId } = opts;
   const io = s3LedgerObjects(store, keyRoot);
+  const complete = await getText(store, acceptedCompleteKey(keyRoot, orgId), 64 * 1024);
+  const keys = await deps.list(`${keyRoot}/${orgId}/buffered-batches/v1`);
+  const all = new Set(keys);
+  const staged = keys.filter((k) => k.endsWith(".staged.ndjson.zst") && deps.parseStagedKey(k)?.orgId === orgId);
+  const b: Backlog = { allowed: [], excluded: [], sessions: new Map(), origins: new Map(), fences: new Map(), undrained: [], exportComplete: complete !== null && parseAcceptedComplete(complete) !== null };
+  const fenceOf = async (t: LedgerTenant): Promise<FenceDoc | null> => {
+    const k = userKey(t);
+    if (!b.fences.has(k)) {
+      const read = await io.readFence(io.keysFor(t).fence);
+      b.fences.set(k, read.state === "present" ? read.fence : null);
+    }
+    return b.fences.get(k)!;
+  };
+  const json = async (key: string) => {
+    if (!all.has(key)) return null;
+    try {
+      return JSON.parse((await getText(store, key, 1024 * 1024)) ?? "null") as Record<string, unknown> | null;
+    } catch {
+      return null;
+    }
+  };
+  for (const key of staged) {
+    const s = await deps.readStaged(key);
+    if (!s) continue; // not live: nothing of it can be canonical through the drain
+    const tenant: LedgerTenant = { orgId: s.header.org_id, workspaceId: s.header.workspace_id, userId: s.header.user_id };
+    const origin = s.header.origin_id;
+    b.origins.set(JSON.stringify([userKey(tenant), origin]), { tenant, origin });
+    const items = s.groups.map((g) => g.lines.map((line) => {
+      const r = JSON.parse(line) as { record_id: string; revision: string };
+      return { tenant, origin, source: g.source, sessionId: g.sessionId, line, recordId: r.record_id, revision: Number(r.revision) } satisfies Line;
+    }));
+    for (const g of s.groups) b.sessions.set(sessionKey(tenant, origin, g.source, g.sessionId), { tenant, origin, source: g.source, sessionId: g.sessionId });
+    const marker = await json(key + ".accepted.json");
+    const live = !!marker && marker.live === true && marker.stage_sha256 === s.sha256 && Array.isArray(marker.kept) && !all.has(key + ".superseded.json");
+    if (!live) {
+      b.excluded.push(...items.flat());
+      continue;
+    }
+    const outcome = (await json(key + ".drained.json"))?.outcome;
+    if (outcome === "pre_reset") {
+      b.excluded.push(...items.flat());
+      continue;
+    }
+    if (outcome !== "drained") {
+      b.undrained.push(key);
+      continue;
+    }
+    const fence = await fenceOf(tenant);
+    const kept = marker!.kept as number[][];
+    items.forEach((lines, gi) => {
+      const keep = new Set(kept[gi] ?? []);
+      lines.forEach((item, j) => {
+        const meta = s.groups[gi]!.meta?.[j];
+        const session = meta ? meta[3] : item.sessionId;
+        const deleted = fence === null || (session !== null && isDeletedForAdmission(fence, origin, meta ? meta[2] : item.source, session));
+        (keep.has(j) && !deleted ? b.allowed : b.excluded).push(item);
+      });
+    });
+  }
+  return b;
+}
+
+/** Every digest-bearing index entry of the backlog's users and origins, with the session it names (owner stubs). */
+async function collectIndex(opts: VerifyOptions, deps: VerifyDeps, b: Backlog) {
+  const io = s3LedgerObjects(opts.store, opts.keyRoot);
+  const out: { tenant: LedgerTenant; origin: string; recordId: string; entry: IndexEntry; session: Session | null }[] = [];
+  const owners = new Map<string, Map<string, Session>>();
+  for (const { tenant, origin } of b.origins.values()) {
+    const keys = io.keysFor(tenant);
+    const fence = b.fences.get(userKey(tenant)) ?? (await (async () => {
+      const read = await io.readFence(keys.fence);
+      return read.state === "present" ? read.fence : null;
+    })());
+    if (fence === null) continue; // the user is erased: no winner is owed
+    if (!owners.has(userKey(tenant))) {
+      const m = new Map<string, Session>();
+      for (const d of await io.listOwners(keys)) m.set(JSON.stringify([d.originId, sessionKeyHash(d.source, d.sessionId)]), { tenant, origin: d.originId, source: d.source, sessionId: d.sessionId });
+      owners.set(userKey(tenant), m);
+    }
+    const byHash = owners.get(userKey(tenant))!;
+    for (const s of b.sessions.values()) if (userKey(s.tenant) === userKey(tenant)) byHash.set(JSON.stringify([s.origin, sessionKeyHash(s.source, s.sessionId)]), s);
+    for (const shardKey of await deps.list(keys.revisionsRoot)) {
+      if (!shardKey.endsWith(".json")) continue;
+      const doc = (await io.readIndex(shardKey))?.doc;
+      if (!doc || doc.originId !== origin) continue;
+      for (const [recordId, e] of Object.entries(doc.records)) {
+        if (e[2] === null || entryForgotten(fence, origin, e)) continue; // revision-only (seeded) or forgotten (erased)
+        const session = e[3] === null
+          ? { tenant, origin, source: NO_SESSION_HARNESS, sessionId: NO_SESSION_ID }
+          : byHash.get(JSON.stringify([origin, e[3]])) ?? null;
+        out.push({ tenant, origin, recordId, entry: e, session });
+      }
+    }
+  }
+  return out;
+}
+
+async function readSessions(opts: VerifyOptions, sessions: Iterable<[string, Session]>, onError: (sk: string) => void): Promise<Map<string, CanonicalLine[] | null>> {
+  const out = new Map<string, CanonicalLine[] | null>();
+  for (const [sk, s] of sessions) {
+    if (out.has(sk)) continue;
+    try {
+      out.set(sk, await readCanonicalSession(opts.store, {
+        keyRoot: opts.keyRoot, orgId: s.tenant.orgId, workspaceId: s.tenant.workspaceId, machineId: liveMachineId(s.tenant.workspaceId, s.origin, s.tenant.userId),
+        source: s.source, sessionId: s.sessionId,
+      }, opts.decompress));
+    } catch {
+      onError(sk);
+    }
+  }
+  return out;
+}
+
+/**
+ * The org's canonical lines before a drain: every session of its staged backlog and every session its index names.
+ * Take it right before the drain and pass it to verifyDrainMaterialization as `baseline`. Throws when any session is
+ * unreadable (a baseline must be whole).
+ */
+export async function snapshotCanonical(opts: Omit<VerifyOptions, "baseline">, deps: VerifyDeps): Promise<CanonicalSnapshot> {
+  const b = await collectBacklog(opts, deps);
+  const idx = await collectIndex(opts, deps, b);
+  const sessions = new Map(b.sessions);
+  for (const i of idx) if (i.session) sessions.set(sessionKey(i.session.tenant, i.session.origin, i.session.source, i.session.sessionId), i.session);
+  const read = await readSessions(opts, sessions, () => { throw new CanonicalReadError("chunk_invalid"); });
+  return { sessions: new Map([...read].map(([sk, lines]) => [sk, (lines ?? []).map((l) => l.text)])) };
+}
+
+/**
+ * The record-by-record proof (see the header). Expected records, index winners, excluded lines and every canonical
+ * line of the touched sessions are each judged; `ok` only when no failure list has an entry.
+ */
+export async function verifyDrainMaterialization(opts: VerifyOptions, deps: VerifyDeps): Promise<VerifyResult> {
   const result: VerifyResult = {
-    ok: false, exact: 0, superseded_later: 0, excluded_absent: 0,
-    counts: { export_missing: 0, missing: 0, mismatch: 0, index_missing: 0, unexpected: 0, erased_present: 0, undrained: 0, unreadable: 0 },
+    ok: false, exact: 0, superseded_later: 0, index_winners_canonical: 0, excluded_absent: 0, baseline_preserved: 0,
+    counts: { export_missing: 0, missing: 0, mismatch: 0, index_missing: 0, unrecoverable: 0, unexpected: 0, erased_present: 0, undrained: 0, unreadable: 0 },
     failures: [],
   };
   const fail = (kind: VerifyFailure, r: string) => {
@@ -219,143 +383,67 @@ export async function verifyDrainMaterialization(opts: VerifyOptions, deps: Veri
     result.failures.push({ kind, ref: r });
   };
   // Without the org's accepted-stage completion the drain writes nothing of it, and no verdict is final: no proof.
-  const complete = await getText(store, acceptedCompleteKey(keyRoot, orgId), 64 * 1024);
-  if (complete === null || parseAcceptedComplete(complete) === null) fail("export_missing", ref(orgId));
-  const prefix = `${keyRoot}/${orgId}/buffered-batches/v1`;
-  const keys = await deps.list(prefix);
-  const all = new Set(keys);
-  const staged = keys.filter((k) => k.endsWith(".staged.ndjson.zst") && deps.parseStagedKey(k)?.orgId === orgId);
-
-  const fences = new Map<string, FenceDoc | null>();
-  const fenceOf = async (t: LedgerTenant): Promise<FenceDoc | null> => {
-    const k = JSON.stringify([t.orgId, t.workspaceId, t.userId]);
-    if (!fences.has(k)) {
-      const read = await io.readFence(io.keysFor(t).fence);
-      fences.set(k, read.state === "present" ? read.fence : null);
-    }
-    return fences.get(k)!;
-  };
-
-  const allowed: Line[] = [];
-  const excluded: Line[] = [];
-  for (const key of staged) {
-    const s = await deps.readStaged(key);
-    if (!s) continue; // never drainable: nothing of it can be canonical through the drain (excluded lines unknown)
-    const tenant: LedgerTenant = { orgId: s.header.org_id, workspaceId: s.header.workspace_id, userId: s.header.user_id };
-    const origin = s.header.origin_id;
-    const lines = (gi: number) => s.groups[gi]!.lines.map((line, j) => {
-      const r = JSON.parse(line) as { record_id: string; revision: string };
-      return { j, item: { tenant, origin, source: s.groups[gi]!.source, sessionId: s.groups[gi]!.sessionId, line, recordId: r.record_id, revision: Number(r.revision) } satisfies Line };
-    });
-    const allGroups = () => s.groups.flatMap((_, gi) => lines(gi).map((x) => x.item));
-    const accepted = all.has(key + ".accepted.json") ? await getText(store, key + ".accepted.json", 1024 * 1024) : null;
-    let marker: { stage_sha256?: string; live?: boolean; kept?: number[][] } | null = null;
-    try {
-      marker = accepted ? JSON.parse(accepted) : null;
-    } catch {
-      marker = null;
-    }
-    const live = !!marker && marker.live === true && marker.stage_sha256 === s.sha256 && Array.isArray(marker.kept) && !all.has(key + ".superseded.json");
-    if (!live) {
-      excluded.push(...allGroups());
-      continue;
-    }
-    const drainedText = all.has(key + ".drained.json") ? await getText(store, key + ".drained.json", 64 * 1024) : null;
-    let outcome: unknown;
-    try {
-      outcome = drainedText ? (JSON.parse(drainedText) as { outcome?: unknown }).outcome : undefined;
-    } catch {
-      outcome = undefined;
-    }
-    if (outcome === "pre_reset") {
-      excluded.push(...allGroups());
-      continue;
-    }
-    if (outcome !== "drained") {
-      fail("undrained", ref(key));
-      continue;
-    }
-    const fence = await fenceOf(tenant);
-    for (let gi = 0; gi < s.groups.length; gi++) {
-      const keep = new Set(marker!.kept![gi] ?? []);
-      for (const { j, item } of lines(gi)) {
-        const meta = s.groups[gi]!.meta?.[j];
-        const session = meta ? meta[3] : item.sessionId;
-        const deleted = session !== null && (fence === null || isDeletedForAdmission(fence, origin, meta ? meta[2] : item.source, session));
-        (keep.has(j) && !deleted ? allowed : excluded).push(item);
-      }
-    }
+  const b = await collectBacklog(opts, deps);
+  if (!b.exportComplete) fail("export_missing", ref(opts.orgId));
+  for (const k of b.undrained) fail("undrained", ref(k));
+  let idx: Awaited<ReturnType<typeof collectIndex>> = [];
+  try {
+    idx = await collectIndex(opts, deps, b);
+  } catch {
+    fail("unreadable", ref(JSON.stringify(["index", opts.orgId])));
   }
 
-  // expected: per record, the highest allowed revision; allowed lines per session (any revision).
+  // expected: per record, the highest allowed revision; every allowed form per session (any revision).
   const expected = new Map<string, Line>();
-  const allowedBySession = new Map<string, Set<string>>();
-  const sessions = new Map<string, { tenant: LedgerTenant; origin: string; source: string; sessionId: string }>();
-  for (const l of allowed) {
+  const allowedForms = new Map<string, Set<string>>();
+  const allowedAt = new Set<string>();
+  for (const l of b.allowed) {
     const rk = recordKey(l.tenant, l.origin, l.recordId);
     const prev = expected.get(rk);
     if (!prev || l.revision > prev.revision) expected.set(rk, l);
+    allowedAt.add(JSON.stringify([rk, l.revision]));
     const sk = sessionKey(l.tenant, l.origin, l.source, l.sessionId);
-    sessions.set(sk, { tenant: l.tenant, origin: l.origin, source: l.source, sessionId: l.sessionId });
-    const set = allowedBySession.get(sk) ?? new Set<string>();
+    const set = allowedForms.get(sk) ?? new Set<string>();
     set.add(canonicalFormOf(l.line));
-    allowedBySession.set(sk, set);
+    allowedForms.set(sk, set);
   }
-  for (const l of excluded) sessions.set(sessionKey(l.tenant, l.origin, l.source, l.sessionId), { tenant: l.tenant, origin: l.origin, source: l.source, sessionId: l.sessionId });
-
-  // canonical per session
-  const canonical = new Map<string, CanonicalLine[] | null>();
-  for (const [sk, s] of sessions) {
-    try {
-      canonical.set(sk, await readCanonicalSession(store, {
-        keyRoot, orgId: s.tenant.orgId, workspaceId: s.tenant.workspaceId, machineId: liveMachineId(s.tenant.workspaceId, s.origin, s.tenant.userId),
-        source: s.source, sessionId: s.sessionId,
-      }, opts.decompress));
-    } catch {
-      fail("unreadable", ref(sk));
-    }
-  }
-
-  // index: the revision each expected record is stored at
-  const indexRevision = new Map<string, number | null>();
-  const indexOf = async (t: LedgerTenant, origin: string, recordId: string): Promise<number | null> => {
-    const rk = recordKey(t, origin, recordId);
-    if (!indexRevision.has(rk)) {
-      const doc = (await io.readIndex(io.keysFor(t).revisions(origin, recordId)))?.doc;
-      const e = doc && Object.hasOwn(doc.records, recordId) ? doc.records[recordId] : undefined;
-      indexRevision.set(rk, e ? e[0] : null);
-    }
-    return indexRevision.get(rk)!;
-  };
+  const sessions = new Map(b.sessions);
+  for (const i of idx) if (i.session) sessions.set(sessionKey(i.session.tenant, i.session.origin, i.session.source, i.session.sessionId), i.session);
+  const canonical = await readSessions(opts, sessions, (sk) => fail("unreadable", ref(sk)));
+  const winners = new Map(idx.map((i) => [recordKey(i.tenant, i.origin, i.recordId), i]));
 
   for (const [rk, l] of expected) {
     const sk = sessionKey(l.tenant, l.origin, l.source, l.sessionId);
     if (!canonical.has(sk)) continue; // unreadable, already failed
-    let stored: number | null;
-    try {
-      stored = await indexOf(l.tenant, l.origin, l.recordId);
-    } catch {
-      fail("unreadable", ref(rk));
-      continue;
-    }
-    if (stored === null || stored < l.revision) {
+    const w = winners.get(rk);
+    if (!w || w.entry[0] < l.revision) {
       fail("index_missing", ref(rk));
       continue;
     }
-    if (stored > l.revision) {
-      result.superseded_later++;
-      continue;
-    }
+    if (w.entry[0] > l.revision) continue; // judged as an index winner below
     const lines = (canonical.get(sk) ?? []).filter((c) => c.originId === l.origin && c.recordId === l.recordId);
     const top = lines.reduce<CanonicalLine | null>((a, c) => (!a || c.revision > a.revision ? c : a), null);
     if (!top) fail("missing", ref(rk));
-    else if (top.revision !== l.revision || top.text !== canonicalFormOf(l.line) || lines.filter((c) => c.revision === l.revision).some((c) => c.text !== top.text)) fail("mismatch", ref(rk));
+    else if (top.revision !== l.revision || top.text !== canonicalFormOf(l.line) || lines.some((c) => c.revision === l.revision && c.text !== top.text)) fail("mismatch", ref(rk));
     else result.exact++;
   }
 
-  // nothing outside the allowed set (or a later admission's current revision) is canonical
+  // Every index winner the backlog does not hold at its revision: canonical must hold it, else nothing can recover it.
+  for (const [rk, w] of winners) {
+    const e = expected.get(rk);
+    if (e && e.revision === w.entry[0]) continue; // judged above
+    if (allowedAt.has(JSON.stringify([rk, w.entry[0]]))) continue; // never: expected is the highest allowed
+    const sk = w.session && sessionKey(w.session.tenant, w.session.origin, w.session.source, w.session.sessionId);
+    if (sk && !canonical.has(sk)) continue; // unreadable, already failed
+    const held = sk ? (canonical.get(sk) ?? []).some((c) => c.originId === w.origin && c.recordId === w.recordId && c.revision === w.entry[0]) : false;
+    if (!held) fail("unrecoverable", ref(rk));
+    else if (e) result.superseded_later++;
+    else result.index_winners_canonical++;
+  }
+
+  // Nothing the drain introduced outside the allowed set (or an index winner); nothing excluded made canonical.
   const excludedForms = new Map<string, Set<string>>();
-  for (const l of excluded) {
+  for (const l of b.excluded) {
     const sk = sessionKey(l.tenant, l.origin, l.source, l.sessionId);
     const set = excludedForms.get(sk) ?? new Set<string>();
     set.add(canonicalFormOf(l.line));
@@ -364,31 +452,22 @@ export async function verifyDrainMaterialization(opts: VerifyOptions, deps: Veri
   for (const [sk, s] of sessions) {
     const lines = canonical.get(sk);
     if (lines === undefined) continue; // unreadable, already failed
-    if (lines === null) {
-      result.excluded_absent += excludedForms.get(sk)?.size ?? 0;
-      continue;
-    }
-    const ok = allowedBySession.get(sk) ?? new Set<string>();
+    const ok = allowedForms.get(sk) ?? new Set<string>();
     const bad = excludedForms.get(sk) ?? new Set<string>();
-    for (const c of lines) {
+    const before = new Set(opts.baseline?.sessions.get(sk) ?? []);
+    for (const c of lines ?? []) {
       if (ok.has(c.text)) continue;
-      const id = ref(JSON.stringify([sk, c.recordId, c.revision]));
-      if (bad.has(c.text)) {
-        fail("erased_present", id);
+      const rk = recordKey(s.tenant, c.originId, c.recordId);
+      const w = winners.get(rk);
+      // The index's winner beyond the backlog (a later admission). At an expected revision only the expected bytes count.
+      if (w && w.entry[0] === c.revision && (expected.get(rk)?.revision ?? -1) < c.revision && !bad.has(c.text)) continue;
+      if (before.has(c.text)) {
+        result.baseline_preserved++;
         continue;
       }
-      let stored: number | null;
-      try {
-        stored = await indexOf(s.tenant, c.originId, c.recordId);
-      } catch {
-        fail("unreadable", id);
-        continue;
-      }
-      // A later admission (S3 path after the marker) wrote it and the index names it.
-      if (stored !== null && stored === c.revision && (expected.get(recordKey(s.tenant, c.originId, c.recordId))?.revision ?? -1) < c.revision) continue;
-      fail("unexpected", id);
+      fail(bad.has(c.text) ? "erased_present" : "unexpected", ref(JSON.stringify([sk, c.recordId, c.revision])));
     }
-    for (const form of bad) if (!ok.has(form) && !lines.some((c) => c.text === form)) result.excluded_absent++;
+    for (const form of bad) if (!ok.has(form) && !(lines ?? []).some((c) => c.text === form)) result.excluded_absent++;
   }
   result.ok = Object.values(result.counts).every((n) => n === 0);
   return result;

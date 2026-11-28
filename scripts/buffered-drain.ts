@@ -6,7 +6,7 @@
  *     (CloudShell / a role session; never a file).
  *   bun run scripts/buffered-drain.ts --dry-run  --bucket <name> [--region us-east-1] [--org <org> ...]
  *       [--concurrency 4] [--max-objects N] [--start-after <key> | --checkpoint-file <path> (execute only)]
- *       [--assume-empty-fence] [--reset-margin-seconds 300]
+ *       [--assume-empty-fence] [--reset-margin-seconds 300] [--rematerialize]
  *   bun run scripts/buffered-drain.ts --execute  --bucket <name> --kms-key-arn <arn> [same flags, never
  *       --assume-empty-fence]
  *
@@ -25,6 +25,8 @@
  *
  * A user without a backfilled `upload-fences.json` (0005 step 0) is always refused (`fence_absent`):
  * the backlog's deletions and resets were recorded in SQL, and the drain reads S3 alone.
+ * --rematerialize: recovery of a drain that ran before materialization (buffered-drain.ts `rematerialize`): stages whose
+ * `drained` marker predates it are drained again; only lines the canonical session does not hold are written.
  * --assume-empty-fence (dry run only; refused with --execute) classifies such a user as if the fence
  * were empty, counted in `fence_assumed_empty`, so a dry run before the backfill still measures the
  * backlog.
@@ -77,6 +79,7 @@ export interface DrainArgs {
   concurrency: number;
   /** Dry run only (refused with --execute here and in drainBufferedBatches). */
   assumeEmptyFence?: true;
+  rematerialize?: true;
   maxObjects?: number;
   /** Default 5 minutes in the drain; floor 1 minute. */
   resetMarginMs?: number;
@@ -86,7 +89,7 @@ export interface DrainArgs {
 }
 
 const VALUE_FLAGS = new Set(["--bucket", "--region", "--org", "--concurrency", "--max-objects", "--start-after", "--checkpoint-file", "--kms-key-arn", "--reset-margin-seconds"]);
-const BOOL_FLAGS = new Set(["--dry-run", "--execute", "--assume-empty-fence"]);
+const BOOL_FLAGS = new Set(["--dry-run", "--execute", "--assume-empty-fence", "--rematerialize"]);
 
 /** Strict parsing: nothing unvalidated reaches the S3 host, and the mode is never implied. */
 export function parseDrainArgs(argv: string[]): DrainArgs {
@@ -130,6 +133,7 @@ export function parseDrainArgs(argv: string[]): DrainArgs {
   return {
     mode, bucket, region, orgs, concurrency,
     ...(assumeEmptyFence ? { assumeEmptyFence: true as const } : {}),
+    ...(bools.has("--rematerialize") ? { rematerialize: true as const } : {}),
     ...(maxObjects !== undefined ? { maxObjects } : {}),
     ...(resetMarginSeconds !== undefined ? { resetMarginMs: resetMarginSeconds * 1000 } : {}),
     ...(startAfter !== undefined ? { startAfter } : {}),
@@ -194,6 +198,7 @@ export async function runDrain(args: DrainArgs, deps: { store: ObjectStore; orgs
     store: deps.store, keyRoot: KEY_ROOT, orgs, dryRun: args.mode === "dry_run", concurrency: args.concurrency,
     ...(deps.halt ? { halt: deps.halt } : {}),
     ...(args.assumeEmptyFence ? { assumeEmptyFence: true } : {}),
+    ...(args.rematerialize ? { rematerialize: true } : {}),
     ...(args.resetMarginMs !== undefined ? { resetMarginMs: args.resetMarginMs } : {}),
     decompress: (bytes) => new Uint8Array(zstdDecompressSync(bytes, { maxOutputLength: BUFFER_STAGE_MAX_BYTES })),
     ...(args.maxObjects !== undefined ? { maxObjects: args.maxObjects } : {}),
@@ -271,7 +276,7 @@ if (import.meta.main) {
   try {
     args = parseDrainArgs(process.argv.slice(2));
   } catch (error) {
-    console.error(`${(error as Error).message}\nusage: (--dry-run | --execute --kms-key-arn <arn>) --bucket <name> [--region r] [--org o ...] [--concurrency n] [--max-objects n] [--start-after key | --checkpoint-file path (execute only)] [--assume-empty-fence (dry run only)] [--reset-margin-seconds n (default 300, min 60)]; --execute only after controls dual-write is live and a fresh backfill rerun; one drain process at a time (lease at 96bulls/.drain/lock.json); AWS_* credentials in the environment`);
+    console.error(`${(error as Error).message}\nusage: (--dry-run | --execute --kms-key-arn <arn>) --bucket <name> [--region r] [--org o ...] [--concurrency n] [--max-objects n] [--start-after key | --checkpoint-file path (execute only)] [--assume-empty-fence (dry run only)] [--reset-margin-seconds n (default 300, min 60)] [--rematerialize]; --execute only after controls dual-write is live and a fresh backfill rerun; one drain process at a time (lease at 96bulls/.drain/lock.json); AWS_* credentials in the environment`);
     process.exit(2);
   }
   const accessKeyId = process.env.AWS_ACCESS_KEY_ID, secretAccessKey = process.env.AWS_SECRET_ACCESS_KEY;

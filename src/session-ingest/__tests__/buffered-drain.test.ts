@@ -22,7 +22,7 @@ import {
   readLiveStaged,
   parseStagedKey,
 } from "../buffered-drain.ts";
-import { verifyDrainMaterialization } from "../drain-materialization.ts";
+import { snapshotCanonical, verifyDrainMaterialization } from "../drain-materialization.ts";
 import { writeGroups } from "../writer.ts";
 import { drainRefusal, parseDrainArgs, runDrain, runDrainTool, validResumeKey } from "../../../scripts/buffered-drain.ts";
 import { isLedgerKey, ledgerHomeKey } from "../ledger-store.ts";
@@ -1380,15 +1380,14 @@ describe("buffered backlog drain (0005)", () => {
  * the slot's revision and digest) and prove the canonical set record by record with verifyDrainMaterialization.
  */
 describe("buffered drain materialization (FULL-seeded index)", () => {
-  const verify = (store: ObjectStore) => verifyDrainMaterialization(
-    { store, keyRoot: ROOT, orgId: TENANT.orgId, decompress },
-    { list: (p) => allKeys(store, p), readStaged: (k) => readLiveStaged(store, k, decompress), parseStagedKey },
-  );
+  const deps = (store: ObjectStore) => ({ list: (p: string) => allKeys(store, p), readStaged: (k: string) => readLiveStaged(store, k, decompress), parseStagedKey });
+  const verify = (store: ObjectStore) => verifyDrainMaterialization({ store, keyRoot: ROOT, orgId: TENANT.orgId, decompress }, deps(store));
   const SESS2 = sessionKeyHash("claude", "sess-2");
   /** The FULL's view of an owned lazy slot: (record, revision, digest) under its session, no canonical bytes. */
   const fullSlots = (store: ObjectStore, recs: { id: string; rev: number; session?: string }[]) =>
     seedIndex(store, recs.map((r) => ({
-      recordId: r.id, revision: r.rev, revisionId: `${r.id}:r${r.rev}`, digest: sha(`${r.id}:${r.rev}`),
+      // As upload-fence-backfill.ts writes an owned slot: no revision id, the slot's current digest.
+      recordId: r.id, revision: r.rev, revisionId: null, digest: sha(`${r.id}:${r.rev}`),
       sessionKey: r.session === "sess-2" ? SESS2 : SESS1, epoch: 0, resets: 0,
     })));
   const manifestRevisions = async (store: ObjectStore) => {
@@ -1413,7 +1412,7 @@ describe("buffered drain materialization (FULL-seeded index)", () => {
     expect(lines.get("sess-1")).toEqual(["a1@1", "a2@1"]);
     expect(lines.get("sess-2")).toEqual(["b1@2"]);
     // The index is unchanged (already the slot's entry).
-    expect(await storedEntry(store, "b1")).toEqual([2, "b1:r2", sha("b1:2"), SESS2, 0, 0]);
+    expect(await storedEntry(store, "b1")).toEqual([2, null, sha("b1:2"), SESS2, 0, 0]);
     const proof = await verify(store);
     expect(proof.failures).toEqual([]);
     expect(proof).toMatchObject({ ok: true, exact: 3, superseded_later: 0 });
@@ -1452,16 +1451,30 @@ describe("buffered drain materialization (FULL-seeded index)", () => {
     expect(await verify(store)).toMatchObject({ ok: true, exact: 2 });
   });
 
-  test("replay of the same batch under a new claim (a duplicate stage) never duplicates a canonical line", async () => {
+  test("a duplicate stage of the same line (another batch digest) in one run is written once", async () => {
     const store = await scratch();
     await fullSlots(store, [{ id: "a1", rev: 1 }]);
     await stage(store, [group("claude", "sess-1", [{ id: "a1", rev: 1 }])], { batch: "batch-x" });
-    await run(store);
     await stage(store, [group("claude", "sess-1", [{ id: "a1", rev: 1 }])], { batch: "batch-y" });
-    const second = await run(store);
-    expect(second.lines).toMatchObject({ written: 0, materialized: 0, already_stored: 1 });
+    const both = await run(store, { concurrency: 1 });
+    expect(both.objects.drained).toBe(2);
+    expect(both.lines).toMatchObject({ materialized: 1, already_stored: 1, written: 1 });
     expect((await canonical(store)).get("sess-1")).toEqual(["a1@1"]);
     expect(await verify(store)).toMatchObject({ ok: true, exact: 1 });
+  });
+
+  test("a full index entry (revision id set) is trusted only when canonical holds its exact line", async () => {
+    const store = await scratch();
+    // ingest_record_revisions' entry for a record whose canonical bytes are missing: written.
+    await seedIndex(store, [{ recordId: "f1", revision: 1, revisionId: "f1:r1", digest: sha("f1:1"), sessionKey: SESS1, epoch: 0, resets: 0 }]);
+    const key = await stage(store, [group("claude", "sess-1", [{ id: "f1", rev: 1 }])]);
+    const first = await run(store);
+    expect(first.lines).toMatchObject({ materialized: 1, written: 1 });
+    // The rerun after a lost marker reads canonical, finds the exact line, writes nothing.
+    await store.delete(objectKey(key + DRAINED_SUFFIX));
+    const again = await run(store);
+    expect(again.lines).toMatchObject({ materialized: 0, written: 0, already_stored: 1 });
+    expect((await canonical(store)).get("sess-1")).toEqual(["f1@1"]);
   });
 
   test("supersession: the newer revision wins and an older revision never overwrites it, in either drain order", async () => {
@@ -1474,7 +1487,7 @@ describe("buffered drain materialization (FULL-seeded index)", () => {
       if (order === "old-first") { await old(); await run(store); await neu(); await run(store); }
       else { await neu(); await run(store); await old(); await run(store); }
       expect((await canonical(store)).get("sess-1")).toEqual(["r@3"]);
-      expect(await storedEntry(store, "r")).toEqual([3, "r:r3", sha("r:3"), SESS1, 0, 0]);
+      expect(await storedEntry(store, "r")).toEqual([3, null, sha("r:3"), SESS1, 0, 0]);
       const proof = await verify(store);
       expect(proof.failures).toEqual([]);
       expect(proof).toMatchObject({ ok: true, exact: 1 });
@@ -1494,19 +1507,63 @@ describe("buffered drain materialization (FULL-seeded index)", () => {
   test("supersession: a later admission's higher revision is never overwritten by the backlog", async () => {
     const store = await scratch();
     await fullSlots(store, [{ id: "r", rev: 2 }]);
-    // The S3 path admitted revision 7 after the marker (its index entry is the claim's).
+    // The S3 path admitted revision 7 after the marker: its canonical line, then its index entry (the claim's commit).
+    await writeGroups({ store, keyRoot: ROOT }, { ...TENANT, originId: ORIGIN, batchDigest: sha("live-7") }, [group("claude", "sess-1", [{ id: "r", rev: 7 }])], new Date(RECEIVED));
     await seedIndex(store, [{ recordId: "r", revision: 7, revisionId: "r:r7", digest: sha("r:7"), sessionKey: SESS1, epoch: 0, resets: 0 }]);
     await stage(store, [group("claude", "sess-1", [{ id: "r", rev: 2 }])]);
     const summary = await run(store);
     expect(summary.lines).toMatchObject({ stale: 1, written: 0, materialized: 0 });
     expect(await storedEntry(store, "r")).toEqual([7, "r:r7", sha("r:7"), SESS1, 0, 0]);
     expect(await verify(store)).toMatchObject({ ok: true, exact: 0, superseded_later: 1 });
+    expect((await canonical(store)).get("sess-1")).toEqual(["r@7"]);
+  });
+
+  test("a winning revision with neither recoverable staged bytes nor canonical bytes is refused, record by record", async () => {
+    const store = await scratch();
+    // SQL's slot names revision 2; the only staged bytes are revision 1 (stale), and nothing is canonical.
+    await fullSlots(store, [{ id: "r", rev: 2 }, { id: "ok", rev: 1 }]);
+    await stage(store, [group("claude", "sess-1", [{ id: "r", rev: 1 }, { id: "ok", rev: 1 }])]);
+    const summary = await run(store);
+    expect(summary.lines).toMatchObject({ stale: 1, materialized: 1 });
+    const proof = await verify(store);
+    expect(proof.ok).toBe(false);
+    expect(proof.counts).toMatchObject({ unrecoverable: 1, missing: 0, index_missing: 0 });
+    expect(proof.exact).toBe(1);
+    // A slot of a session the backlog never staged (its stage vanished), located by its owner stub: refused too.
+    await s3LedgerObjects(store, ROOT).registerOwner(ownerKey("claude", "sess-9"), { v: 1, originId: ORIGIN, source: "claude", sessionId: "sess-9", epoch: 0, resets: 0 });
+    await seedIndex(store, [{ recordId: "gone", revision: 1, revisionId: "gone:r1", digest: sha("gone:1"), sessionKey: sessionKeyHash("claude", "sess-9"), epoch: 0, resets: 0 }]);
+    expect((await verify(store)).counts.unrecoverable).toBe(2);
+  });
+
+  test("preexisting canonical records outside the backlog are preserved; the drain introduces nothing unexpected", async () => {
+    const store = await scratch();
+    const target = { store, keyRoot: ROOT };
+    const batch = { ...TENANT, originId: ORIGIN };
+    // Before the buffered era: sess-1 already holds an older record and a superseded revision of another.
+    await writeGroups(target, { ...batch, batchDigest: sha("legacy") }, [group("claude", "sess-1", [{ id: "old", rev: 1 }, { id: "a1", rev: 1 }])], new Date(RECEIVED));
+    await seedIndex(store, [{ recordId: "old", revision: 1, revisionId: null, digest: null, sessionKey: SESS1, epoch: 0, resets: 0 }]);
+    await fullSlots(store, [{ id: "a1", rev: 2 }]);
+    await stage(store, [group("claude", "sess-1", [{ id: "a1", rev: 2 }])]);
+    await refreshVerdicts(store);
+    const baseline = await snapshotCanonical({ store, keyRoot: ROOT, orgId: TENANT.orgId, decompress }, deps(store));
+    await run(store);
+    expect((await canonical(store)).get("sess-1")).toEqual(["old@1", "a1@1", "a1@2"]);
+    const proof = await verifyDrainMaterialization({ store, keyRoot: ROOT, orgId: TENANT.orgId, decompress, baseline }, deps(store));
+    expect(proof.failures).toEqual([]);
+    expect(proof).toMatchObject({ ok: true, exact: 1, baseline_preserved: 2 });
+    // Without the baseline the same lines are not attributable: fail closed.
+    expect((await verify(store)).counts.unexpected).toBe(2);
+    // A line the drain did not account for, written after the baseline, is unexpected even with it.
+    await writeGroups(target, { ...batch, batchDigest: sha("rogue") }, [group("claude", "sess-1", [{ id: "zz", rev: 1 }])], new Date(RECEIVED));
+    const after = await verifyDrainMaterialization({ store, keyRoot: ROOT, orgId: TENANT.orgId, decompress, baseline }, deps(store));
+    expect(after.counts.unexpected).toBe(1);
   });
 
   test("erase: deleted sessions, lines SQL does not keep, and not-live or unacknowledged stages are never materialized nor resurrected", async () => {
     const store = await scratch();
-    // The FULL seeded every slot, including sessions erased since (index entries the fence later forgets).
-    await fullSlots(store, [{ id: "k1", rev: 1 }, { id: "nk", rev: 1 }, { id: "e1", rev: 1, session: "sess-2" }, { id: "nl", rev: 1 }, { id: "ua", rev: 1 }]);
+    // The FULL seeded the owned slots, including a session erased since (an index entry the fence later forgets). SQL
+    // names no slot for a line it hides (not body-accepted, not live, unacknowledged): those records have no winner.
+    await fullSlots(store, [{ id: "k1", rev: 1 }, { id: "e1", rev: 1, session: "sess-2" }]);
     await putFence(store, { deletions: [{ originId: ORIGIN, sessions: [["claude", "sess-2"]] }] });
     const keep = await stage(store, [group("claude", "sess-1", [{ id: "k1", rev: 1 }, { id: "nk", rev: 1 }]), group("claude", "sess-2", [{ id: "e1", rev: 1 }])], { keep: [[0], [0]] });
     await stage(store, [group("claude", "sess-1", [{ id: "nl", rev: 1 }])], { live: false });
@@ -1548,7 +1605,7 @@ describe("buffered drain materialization (FULL-seeded index)", () => {
 
   test("the verifier refuses an excluded line, a changed record, and an unreadable chunk", async () => {
     const store = await scratch();
-    await fullSlots(store, [{ id: "k1", rev: 1 }, { id: "nk", rev: 1 }]);
+    await fullSlots(store, [{ id: "k1", rev: 1 }]);
     await stage(store, [group("claude", "sess-1", [{ id: "k1", rev: 1 }, { id: "nk", rev: 1 }])], { keep: [[0]] });
     await run(store);
     expect(await verify(store)).toMatchObject({ ok: true, exact: 1, excluded_absent: 1 });
@@ -1570,9 +1627,55 @@ describe("buffered drain materialization (FULL-seeded index)", () => {
     expect((await verify(store)).counts.unreadable).toBeGreaterThan(0);
   });
 
-  test("a drain over an unreadable canonical session leaves the object for a rerun (canonical_unreadable), never marked", async () => {
+  test("an old false-success marker: verification catches it, rematerialize writes only the missing bytes", async () => {
+    const store = await scratch();
+    await fullSlots(store, [{ id: "a1", rev: 1 }, { id: "a2", rev: 1 }, { id: "e1", rev: 1, session: "sess-2" }]);
+    const key = await stage(store, [group("claude", "sess-1", [{ id: "a1", rev: 1 }, { id: "a2", rev: 1 }]), group("claude", "sess-2", [{ id: "e1", rev: 1 }])]);
+    await refreshVerdicts(store);
+    // main's drain at this point: every line already_stored, no canonical byte, the object marked drained (no materialization).
+    const legacy = { v: 1, kind: "buffered-drained", outcome: "drained", at: RECEIVED, staged_sha256: "0".repeat(64), sessions_written: 0,
+      lines: { candidate: 3, written: 0, fenced: 0, stale: 0, already_stored: 3, revision_conflict: 0, not_kept: 0 } };
+    await store.put(objectKey(key + DRAINED_SUFFIX), enc.encode(JSON.stringify(legacy)));
+    // An erasure after the false success: sess-2 must not come back through the recovery.
+    await putFence(store, { deletions: [{ originId: ORIGIN, sessions: [["claude", "sess-2"]] }] });
+    const plain = await run(store);
+    expect(plain.objects.already_drained).toBe(1);
+    const caught = await verify(store);
+    expect(caught.ok).toBe(false);
+    expect(caught.counts.missing).toBe(2);
+    // The dry run reports what the recovery would write.
+    const dry = await run(store, { dryRun: true, rematerialize: true });
+    expect(dry).toMatchObject({ rematerialize_revisited: 1, objects: { would_drain: 1 }, lines: { materialized: 2, fenced: 1 } });
+    expect((await canonical(store)).size).toBe(0);
+    const recovered = await run(store, { rematerialize: true });
+    expect(recovered).toMatchObject({ rematerialize_revisited: 1, objects: { drained: 1 }, lines: { materialized: 2, written: 2, fenced: 1 } });
+    const lines = await canonical(store);
+    expect(lines.get("sess-1")).toEqual(["a1@1", "a2@1"]);
+    expect(lines.has("sess-2")).toBe(false);
+    expect(await verify(store)).toMatchObject({ ok: true, exact: 2 });
+    // The legacy marker stays (create-only); a further recovery run revisits it and writes nothing.
+    expect((await readJson(store, key + DRAINED_SUFFIX)).materialization).toBeUndefined();
+    const again = await run(store, { rematerialize: true });
+    expect(again).toMatchObject({ rematerialize_revisited: 1, lines: { written: 0, materialized: 0, already_stored: 2 } });
+    expect(await verify(store)).toMatchObject({ ok: true, exact: 2 });
+  });
+
+  test("rematerialize never revisits a current marker or a pre_reset one", async () => {
     const store = await scratch();
     await fullSlots(store, [{ id: "a1", rev: 1 }]);
+    const key = await stage(store, [group("claude", "sess-1", [{ id: "a1", rev: 1 }])]);
+    await run(store);
+    expect((await readJson(store, key + DRAINED_SUFFIX)).materialization).toBe(1);
+    const pre = await stage(store, [group("claude", "sess-1", [{ id: "a2", rev: 1 }])]);
+    await store.put(objectKey(pre + DRAINED_SUFFIX), enc.encode(JSON.stringify({ v: 1, kind: "buffered-drained", outcome: "pre_reset" })));
+    const r = await run(store, { rematerialize: true });
+    expect(r).toMatchObject({ rematerialize_revisited: 0, objects: { already_drained: 2 } });
+  });
+
+  test("a drain over an unreadable canonical session leaves the object for a rerun (canonical_unreadable), never marked", async () => {
+    const store = await scratch();
+    // A full entry (an earlier admission's commit): its canonical session must be read.
+    await seedIndex(store, [{ recordId: "a1", revision: 1, revisionId: "a1:r1", digest: sha("a1:1"), sessionKey: SESS1, epoch: 0, resets: 0 }]);
     await stage(store, [group("claude", "sess-1", [{ id: "a0", rev: 1 }])], { batch: "first" });
     await run(store);
     const chunk = (await allKeys(store, `${ROOT}/${TENANT.orgId}/v1`)).find((k) => k.includes("/raw/"))!;

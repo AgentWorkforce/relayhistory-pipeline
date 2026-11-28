@@ -12,6 +12,9 @@ import { BUFFER_STAGE_MAX_BYTES, prepareBufferedStage, putBufferedStage, stagedK
 import type { Group } from "../writer.ts";
 import { parseExportArgs, parseMaxAge, resolveNoHeadParity } from "../../../scripts/accepted-stage-export.ts";
 import { applySupabaseSchema } from "./pglite-schema.ts";
+import { backfillUploadFences } from "../upload-fence-backfill.ts";
+import { readLiveStaged, parseStagedKey } from "../buffered-drain.ts";
+import { verifyDrainMaterialization } from "../drain-materialization.ts";
 import { scratchStore } from "./support.ts";
 
 setDefaultTimeout(120_000);
@@ -379,6 +382,31 @@ describe("accepted-stage export (0005 step 0b): SQL's own verdict per stage", ()
     const summary = await run(store);
     expect(summary).toMatchObject({ rows: 1, invalid: 1, orgs: { complete: 0, incomplete: 1 } });
     expect(await exists(store, misfiled + ACCEPTED_SUFFIX)).toBe(false);
+  });
+
+  test("FULL then export then drain: the owned lazy slots the FULL indexes are materialized, proven record by record", async () => {
+    const store = scratch();
+    await grantAuthority(store);
+    const make = (groups: SeedGroup[], o: Parameters<typeof seed>[2] = {}) => stageInBoth(store, groups, o);
+    await make([{ source: "claude", session: "s1", records: [{ id: "m1", rev: 1 }, { id: "m2", rev: 1 }] }, { source: "claude", session: "s2", records: [{ id: "m3", rev: 1 }] }]);
+    // The real FULL (fences, ownership, revisions): the revisions section indexes each owned slot with its digest.
+    const full = await backfillUploadFences({ sql: recordingSql([]), store, keyRoot: ROOT, dryRun: false, sleep: async () => {} });
+    expect(full.revisions.slot_rows).toBe(3);
+    const io = s3LedgerObjects(store, ROOT), keys = s3LedgerKeys(ROOT, A);
+    expect((await io.readIndex(keys.revisions(ORIGIN, "m1")))?.doc.records.m1?.[2]).toBe(sha("m1:1"));
+    expect(await run(store)).toMatchObject({ live: 1 });
+    const decompress = (b: Uint8Array) => new Uint8Array(zstdDecompressSync(b, { maxOutputLength: BUFFER_STAGE_MAX_BYTES }));
+    const drained = await drainBufferedBatches({ store, keyRoot: ROOT, orgs: [A.orgId], dryRun: false, sleep: async () => {}, decompress });
+    // main's drain counted these already_stored and wrote no canonical line.
+    expect(drained.objects.drained).toBe(1);
+    expect(drained.lines).toMatchObject({ candidate: 3, written: 3, materialized: 3, already_stored: 0 });
+    const deps = {
+      list: async (prefix: string) => (await allKeys(store)).map((k) => k.slice(0, k.lastIndexOf("@"))).filter((k) => k.startsWith(prefix)),
+      readStaged: (k: string) => readLiveStaged(store, k, decompress), parseStagedKey,
+    };
+    const proof = await verifyDrainMaterialization({ store, keyRoot: ROOT, orgId: A.orgId, decompress }, deps);
+    expect(proof.failures).toEqual([]);
+    expect(proof).toMatchObject({ ok: true, exact: 3 });
   });
 
   test("end to end: the drain writes exactly the lines SQL keeps, and nothing of a stage SQL hides", async () => {
