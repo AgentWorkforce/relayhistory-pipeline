@@ -6,8 +6,12 @@
  * Credentials come ONLY through stdin, held in RAM (zero-Neon checklist E3; AGENTS.md: nothing credential-like
  * on disk). One JSON object:
  *   {"databaseUrl": "<read-only-capable URL of the privacy authority>",
- *    "eraser": {"accessKeyId": "...", "secretAccessKey": "...", "sessionToken": "..."}}   // eraser: --execute only
- * from 1Password items "sessions-prod transcript eraser" and the authority's database login. The former
+ *    "eraser": {"accessKeyId": "...", "secretAccessKey": "...", "sessionToken": "...", "expiration": "..."}}   // --execute only
+ * The eraser key may instead be the broker's AWS credential_process v1 object pasted in as is
+ * ({"Version":1,"AccessKeyId","SecretAccessKey","SessionToken","Expiration"}; ../short-lived-credentials.ts). With an
+ * expiration the job refuses to start, and stops taking new work, once less than S3X_CREDS_MIN_REMAINING_S (600,
+ * 120-3000) is left, then exits 75 for the supervisor to mint a new key and restart. A dry run needs no eraser key
+ * at all: only the authority's database login, supplied through a private input of the operator's choosing. The former
  * NEON_URL_FILE / NEON_URL / S3X_ERASER_CREDS_FILE (and any AWS_* credential variable) now refuse to start.
  * A terminal or a regular file on stdin refuses too.
  *
@@ -49,6 +53,7 @@ import { sessionReadOnly } from "../neon-s3-sync/neon-reader.ts";
 import { SyncState, obligationsFlag } from "../neon-s3-sync/state.ts";
 import { errorCode } from "../neon-s3-sync/sync.ts";
 import { eraserDatabaseUrl, pinnedPgClient, readStdinCredentials, refuseCredentialEnv, s3Credentials, type S3Credentials } from "../stdin-credentials.ts";
+import { EXIT_CREDENTIALS_RENEW, expiringSoon, minRemainingMs } from "../short-lived-credentials.ts";
 import { assertEraserIdentity, neonAuthority, supabaseAuthority, type ErasureAuthorityKind } from "./authority.ts";
 import { createS3Eraser, isLiveObjectProbe, type Eraser, type PagedEraser } from "./eraser.ts";
 import { DEFAULT_ERASURE_CONFIG, ErasureJob, STALE_PREFIX_ALLOWLIST_MAX } from "./job.ts";
@@ -173,7 +178,32 @@ export function authorityUrl(kind: ErasureAuthorityKind, raw: unknown): string {
   return eraserDatabaseUrl(raw, "databaseUrl", kind);
 }
 
-export async function main() {
+/**
+ * The stale-prefix pass's exit status: 0 when it completed, EXIT_CREDENTIALS_RENEW when it stopped because the
+ * eraser key is about to expire (a partial pass to rerun after renewal, never reported as success). Throws the
+ * existing refusals for a held lease, or for a failed erase that was not an expiry stop.
+ */
+export function stalePassStatus(r: { ok: boolean; refused?: string; stoppedBy?: string }, credStop: boolean): number {
+  if (r.refused) throw optionRefusal(r.refused, "another eraser holds an unexpired lease: the stale-prefix pass did not start");
+  // A genuine failed erase (ok=false, stoppedBy=<outcome>) always fails, even if the expiry timer also fired.
+  if (!r.ok) throw optionRefusal("stale_prefix_pass_stopped", "the stale-prefix pass stopped at a failed erase");
+  // An expiry stop (the job's stop signal; ok stays true) is a partial pass: renew and rerun, never success.
+  if (credStop) return EXIT_CREDENTIALS_RENEW;
+  return 0;
+}
+
+/** The exit status for an error that escaped main(): 75 for a short-lived credential refusal (renew), else 1. */
+export function exitStatusForError(error: unknown): number {
+  return errorCode(error).startsWith("short_lived_") ? EXIT_CREDENTIALS_RENEW : 1;
+}
+
+/** The process exit status after a run: EXIT_CREDENTIALS_RENEW whenever the run stopped on an expiring key. */
+export function runStatus(status: number, credStop: boolean): number {
+  return credStop ? EXIT_CREDENTIALS_RENEW : status;
+}
+
+/** Runs the job and returns its exit status (0, or EXIT_CREDENTIALS_RENEW); a refusal or failure throws. */
+export async function main(): Promise<number> {
   const execute = flag("execute");
   const stale = staleprefixOptions(process.argv.slice(2));
   refuseCredentialEnv();
@@ -187,7 +217,13 @@ export async function main() {
   const retentionUrl = creds.retentionDatabaseUrl;
   delete creds.retentionDatabaseUrl;
   const url = authorityUrl(kind, creds.databaseUrl);
-  const eraser = eraserFor(execute, creds.eraser === undefined ? undefined : s3Credentials(creds.eraser, "eraser"));
+  const eraserKey = creds.eraser === undefined ? undefined : s3Credentials(creds.eraser, "eraser");
+  const minMs = minRemainingMs(env("S3X_CREDS_MIN_REMAINING_S"));
+  if (execute && eraserKey && expiringSoon(eraserKey, minMs, Date.now())) {
+    log({ message: "credentials expiring", reason: "credentials_expiring_at_start" });
+    process.exit(EXIT_CREDENTIALS_RENEW);
+  }
+  const eraser = eraserFor(execute, eraserKey);
   delete creds.databaseUrl;
   delete creds.eraser;
   const obligations = obligationsEnabled();
@@ -198,6 +234,14 @@ export async function main() {
   await client.connect();
   let stop = false;
   for (const sig of ["SIGINT", "SIGTERM"] as const) process.on(sig, () => void (stop = true));
+  // A short-lived eraser key: stop taking new work before it expires (the same stop signal as SIGTERM), then exit 75.
+  let credStop = false;
+  const credTimer = execute && eraserKey?.expiresAt
+    ? setInterval(() => {
+        if (!credStop && expiringSoon(eraserKey, minMs, Date.now())) { credStop = true; stop = true; log({ message: "stopping", reason: "credentials_expiring" }); }
+      }, 15_000)
+    : undefined;
+  credTimer?.unref();
   let phase: BabysitterPhase | undefined;
   if (retention && retention.mode !== "off") {
     const pool = new pg.Pool(poolConfig(retentionUrl, env("BABYSITTER_RETENTION_ALLOW_LOOPBACK") === "true"));
@@ -220,22 +264,23 @@ export async function main() {
       // One pass, no sweep, no phase. A dry run's eraser has no existence check: it reports sibling_checked false.
       log({ message: "start", mode: "stale_prefixes_only", execute, authority: kind, obligations, allowlist_size: stale.onlyIdentities.length, ...(stale.max !== undefined ? { max: stale.max } : {}) });
       const r = await job.staleprefixPass({ execute, onlyIdentities: stale.onlyIdentities, ...(stale.max !== undefined ? { max: stale.max } : {}), ...(isLiveObjectProbe(eraser) ? { probe: eraser } : {}) });
-      if (r.refused) throw optionRefusal(r.refused, "another eraser holds an unexpired lease: the stale-prefix pass did not start");
-      if (!r.ok) throw optionRefusal("stale_prefix_pass_stopped", "the stale-prefix pass stopped at a failed erase");
-      return;
+      // Returned through the finally below, which cleans up first; an expiry stop exits 75, never 0.
+      return stalePassStatus(r, credStop);
     }
     log({ message: "start", execute, authority: kind, recognize_legacy: cfg.recognizeLegacy, obligations });
     // A dry run deletes nothing and marks nothing done: it sweeps and reports what it would erase.
     if (!execute) {
       await job.sweep({ dryRun: true });
       job.progress(true);
-      return;
+      return 0;
     }
     // Babysitter retention phase (additive): runs beside the job until the same stop signal.
     const phaseRun = phase?.loop(() => stop, flag("once"));
     await job.run({ once: flag("once") });
     await phaseRun;
+    return runStatus(0, credStop);
   } finally {
+    if (credTimer) clearInterval(credTimer);
     await phase?.close();
     state.close();
     await client.end().catch(() => undefined);
@@ -243,7 +288,9 @@ export async function main() {
 }
 
 if (import.meta.main)
-  main().catch((error) => {
-    log({ message: "exit on error", error_code: errorCode(error) });
-    process.exit(1);
+  main().then((status) => { if (status !== 0) process.exit(status); }).catch((error) => {
+    const code = errorCode(error);
+    log({ message: "exit on error", error_code: code });
+    // A short-lived eraser key refused before signing (expired): renew and restart, not a crash.
+    process.exit(exitStatusForError(error));
   });

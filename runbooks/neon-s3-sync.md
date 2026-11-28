@@ -57,6 +57,32 @@ holds only the eraser key ("sessions-prod transcript eraser").
   new manifest no longer references, and session prefixes the group no longer
   produces, go to the `erasures` queue in the shared state file. Anything it
   references again is cancelled under a per-session lease.
+  A session keeps its first exported location (`datePin` in
+  `src/migration/neon-s3-sync/export-session.ts`). When Neon's earliest event
+  moves earlier after the first export, the manifest stays at its `d=` and
+  `started_at` and takes the older lines, instead of forking a second manifest
+  at the earlier date. Before this, every such move left two live manifests
+  until the erasure job removed the old prefix, and the indexer retried the
+  new key as `pointer_move_pending` in the meantime. Only a date difference is
+  pinned. A machine, workspace, harness or session change still moves the
+  session. The pin needs exactly one prior manifest key for the stream (any
+  date, from the group's `exported` keys), and that manifest must be readable,
+  this exporter's export of this session, record the same raw Neon machine id,
+  and carry a `session_uuid`. The manifest keeps that `session_uuid`;
+  `catalog.first_activity` is Neon's own earliest time, separate from the pinned
+  `started_at`. Under the session lease the exporter reads the manifest again.
+  If it was erased or rewritten after the first read, the group fails with
+  `date_pin_changed`, and that stream records no key and writes nothing (earlier
+  streams of the group may already have flushed chunks; their orphans are
+  queued as usual on a later export). It is a contention retry, like
+  `prefix_busy`: retried in 2 minutes, no attempt counted, never
+  `stuck_with_keys`. The retry resolves the pin again.
+  A missing or invalid prior manifest is unpinned. A store read or access
+  failure fails the group.
+  If two or more prior keys match the stream (a fork made before the pin, or a
+  failed run's keys merged into the row), there is no pin: the stream goes to
+  the computed date and the other keys take the `stale_prefix` path, exactly as
+  before the pin.
 - Erasure job, every 10 min:
   - It sweeps the rollups itself, and erases every exported group Neon no
     longer has. A sweep that reads nothing erases nothing.
@@ -422,6 +448,39 @@ ssh kjg-lap "zsh -lc 'jq -cn --arg u \"\$(op read <authority db url ref>)\" \
   \"{databaseUrl:\$u,eraser:\$e}\"'" | \
   S3X_BUCKET=... S3X_EXPECT_BUCKET=... bun run migration:neon-s3-erasure --execute
 ```
+
+### Short-lived credentials (no personal password manager)
+
+The block above shows the legacy credential path (an `op` read piped over ssh).
+The replacement takes AWS keys from the infra broker (`AgentWorkforce/infra`,
+`agent/broker/AGENTS.md`). The broker mints STS AssumeRole credentials with a
+15 to 60 minute lifetime and writes each mint as a new mode-0600 file in the AWS
+`credential_process` v1 shape:
+`{"Version":1,"AccessKeyId","SecretAccessKey","SessionToken","Expiration"}`.
+Neither command mints, stores or logs a credential
+(`src/migration/short-lived-credentials.ts`).
+
+- **Exporter.** Point `S3X_CREDS_FILE` at the current mint. A symlink the
+  supervisor repoints on renewal works best. The exporter re-reads the file
+  whenever its S3 client refreshes, which happens 5 minutes before
+  `Expiration`, so a renewed mint takes effect without a restart. With less
+  than `S3X_CREDS_MIN_REMAINING_S` left (default 600, range 120 to 3000), it
+  refuses to start. Once less than that remains while it runs, it stops taking
+  new groups: in-flight groups finish and the committed watermark is kept. It
+  then exits **75**, and the supervisor renews and restarts it. A key with no
+  expiry (the old static shape, for example through the FIFO) is read once and
+  behaves as before.
+- **Erasure.** A dry run (including `--stale-prefixes-only` without `--execute`)
+  needs no S3 key: only `databaseUrl`. With `--execute`, the stdin `eraser`
+  object may be the broker's v1 object pasted in as is. With an expiry, the job
+  refuses to start, or stops at the same minimum (the same stop signal as
+  SIGTERM) and exits **75**.
+- **Postgres logins.** The broker cannot mint them: the read-only Neon URL
+  (`NEON_URL_FILE`) and the privacy-authority `databaseUrl` need their own
+  private input, chosen by the operator. Credentials never go over Relay.
+- **Separate roles.** Writer and eraser are separate roles, as before: the
+  exporter refuses an eraser key, and the eraser is only loaded with
+  `--execute`.
 
 `S3X_PRIVACY_AUTHORITY` selects where deletions are read: `neon` (default;
 `databaseUrl` is a direct Neon URL, `deleted_upload_sessions` plus the rollup
