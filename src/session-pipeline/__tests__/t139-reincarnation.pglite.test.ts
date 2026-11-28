@@ -195,6 +195,30 @@ describe("T139 standard path: parsed authorized reads", () => {
     expect(await t.hits("markerold")).toEqual([]);
   }, 60_000);
 
+  test("complementary ordering: A paused (holding its revision 2), B published and read, THEN A resumes for the first time: refused (incarnation_moved); B read again unchanged, no second append", async () => {
+    const t = await rig();
+    const { key } = await aThenDelete(t);
+    await t.r.writeManifest(2, loc, "markerold");
+    const heldA = await t.snapshotReader(key);
+    const aTwoTag = await t.etag(key);
+    await t.r.store.delete(objectKey(key));
+    await t.run([t.del(key)]);
+    await t.authorityDelete();
+    expect(await t.reissue()).toBe("1");
+    await t.r.writeManifest(1, loc, "markernew", 1);
+    // B published by its own event while A is still paused.
+    expect((await t.run([t.put(key, await t.etag(key))])).result).toEqual({ batchItemFailures: [] });
+    const beforeResume = await t.read("markernew");
+    expect(beforeResume).toEqual({ status: 200, ids: ["markernew"] });
+    // A resumes for the FIRST time.
+    const resumed = await t.run([t.put(key, aTwoTag)], heldA);
+    expect(resumed.result).toEqual({ batchItemFailures: [] });
+    expect(named(resumed.lines, "pointer write refused by incarnation authority")).toEqual([expect.objectContaining({ reason: "incarnation_moved" })]);
+    // B read again, with no second append in between.
+    expect(await t.read("markernew")).toEqual({ status: 200, ids: ["markernew"] });
+    expect(await t.read("markerold")).toEqual({ status: 200, ids: [] });
+  }, 60_000);
+
   test("permanent erase: reissue is refused; a re-created B (incarnation 0 or 1) is refused (erased); the marker stays absent", async () => {
     const t = await rig();
     const { key } = await aThenDelete(t);
