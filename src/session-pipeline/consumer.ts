@@ -272,9 +272,13 @@ export async function processBatch(records: readonly QueueRecord[], deps: Consum
         write_batches: phase.writeBatches,
       });
       try {
-        const result = await (deps.searchScope ?? indexSearchScope)(scope, {
-          ...deps.search, metrics: phase, ...(physicallyCurrent === false && deps.search.skipCurrent ? { skipCurrent: false } : {}),
-        });
+        // 'revision covered' must name the bytes THIS pass indexed, not the pointer stage's earlier read: the object can be
+        // replaced between the two (Pipeline review of 4970d56f). Record the chunk list of every manifest the search
+        // stage itself reads (the last read of a key wins). Measurement only; the pass is unchanged.
+        const searchRead = new Map<string, readonly string[]>();
+        const searchDeps = { ...deps.search, metrics: phase, ...(deps.search.reader ? { reader: recordingReader(deps.search.reader, searchRead) } : {}),
+          ...(physicallyCurrent === false && deps.search.skipCurrent ? { skipCurrent: false } : {}) };
+        const result = await (deps.searchScope ?? indexSearchScope)(scope, searchDeps);
         if (result.busy) {
           // The running pass may have read S3 before this event's write: run again later.
           await later(manifestKey, messageIds, "scope busy");
@@ -288,7 +292,8 @@ export async function processBatch(records: readonly QueueRecord[], deps: Consum
             reason: result.reasons.join(","), ...phaseFields(), ...passFields(messageIds, recordOf, now), duration_ms: Date.now() - started,
           });
           logSearchable(scope, revisions, now, pickedUpAt, passStartedAt, true);
-          logCovered(scope, revisions, now, pickedUpAt, passStartedAt);
+          // Skipped: this pass read nothing, so it proves no input; superseded uploads are unobserved (coverage_unproven).
+          logCovered(scope, revisions, now, pickedUpAt, passStartedAt, searchRead);
           continue;
         }
         if (result.deferred) {
@@ -327,7 +332,7 @@ export async function processBatch(records: readonly QueueRecord[], deps: Consum
         });
         if (result.complete) {
           logSearchable(scope, revisions, now, pickedUpAt, passStartedAt, false);
-          logCovered(scope, revisions, now, pickedUpAt, passStartedAt);
+          logCovered(scope, revisions, now, pickedUpAt, passStartedAt, searchRead);
         }
       } catch (error) {
         log.error("search index failed", {
@@ -547,7 +552,19 @@ function logUnobserved(scope: SessionScope, r: Revised, reason: string) {
  * coverage_unproven: no chunk on the event, e.g. a forwarded or reconcile copy, or the live manifest lacks it).
  * Index pass completion, NOT an authorized caller read.
  */
-function logCovered(scope: SessionScope, revisions: readonly Revised[], now: () => number, pickedUpAt: number, passStartedAt: number) {
+/** Measurement only: a manifest reader that records `<seq>:<sha256>` of each manifest's chunks as the search stage reads it. */
+function recordingReader(reader: NonNullable<SearchIndexDeps["reader"]>, into: Map<string, readonly string[]>): NonNullable<SearchIndexDeps["reader"]> {
+  return Object.assign(Object.create(Object.getPrototypeOf(reader)), reader, {
+    read: async (key: string) => {
+      const read = await reader.read(key);
+      const chunks = (read?.manifest as { raw?: { chunks?: readonly { seq?: unknown; sha256?: unknown }[] } } | undefined)?.raw?.chunks;
+      if (read) into.set(key, (chunks ?? []).flatMap((c) => (typeof c.seq === "number" && typeof c.sha256 === "string" ? [`${c.seq}:${c.sha256}`] : [])));
+      return read;
+    },
+  });
+}
+
+function logCovered(scope: SessionScope, revisions: readonly Revised[], now: () => number, pickedUpAt: number, passStartedAt: number, searchRead: ReadonlyMap<string, readonly string[]>) {
   const seen = new Set<string>();
   for (const r of revisions) {
     if (r.live || r.event.deleted) continue;
@@ -559,7 +576,8 @@ function logCovered(scope: SessionScope, revisions: readonly Revised[], now: () 
     if (r.deleteAfter) { logUnobserved(scope, r, "erase_between"); continue; }
     if (rev >= r.liveRevision) { logUnobserved(scope, r, "recreate_between"); continue; }
     const chunk = r.event.revision?.chunk;
-    if (!chunk || !r.liveStamp?.chunks?.includes(chunk)) { logUnobserved(scope, r, "coverage_unproven"); continue; }
+    // The chunk must be listed by the manifest the completed search pass itself read for this key.
+    if (!chunk || !searchRead.get(r.event.key)?.includes(chunk)) { logUnobserved(scope, r, "coverage_unproven"); continue; }
     const committed = r.event.revision?.committedAt ? Date.parse(r.event.revision.committedAt) : NaN;
     log.info("revision covered", {
       stage: "revision-events", org_id: scope.orgId, workspace_id: scope.workspaceId, harness: scope.harness, session_id: scope.sessionId,
