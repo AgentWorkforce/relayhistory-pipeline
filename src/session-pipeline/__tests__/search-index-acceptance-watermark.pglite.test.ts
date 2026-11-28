@@ -487,6 +487,28 @@ describe("the real exported Lambda handler", () => {
   }, 120_000);
 });
 
+describe("what wakes a held scope", () => {
+  test("the seat's own manifest event: ONE delivery through the real handler moves the pointers and indexes the scope, no sweep needed", async () => {
+    const { x, r, state, stamps } = await rig();
+    const send = realHandler(r.consumer({ ch: state.ch, ...ON }));
+    await send(r.messages);
+    // A new revision without acceptance: its delivery is held.
+    await publish(x, [...generate(8), ...appended(12), ...contenders()]);
+    const heldLines = (await captureLogs(() => send(r.messages))).lines.filter((l) => l.message === "search index reconciled");
+    expect(heldLines.at(-1)).toMatchObject({ ok: false, acceptance_hold: "watermark" });
+    // The seats are published: the writer's manifest PUTs are the only event. That one delivery runs the pointer
+    // stage (the rows move to the new revisions) and then the search stage, which reads in full and indexes.
+    await publish(x, [...generate(8), ...appended(12), ...contenders(true)]);
+    const { result, lines } = await captureLogs(() => send(r.messages));
+    expect(result).toEqual({ batchItemFailures: [] });
+    expect(lines.filter((l) => l.message === "pointer indexed" && l.revision === 2).length).toBeGreaterThanOrEqual(2);
+    const reconciled = lines.filter((l) => l.message === "search index reconciled");
+    expect(reconciled.at(-1)).toMatchObject({ ok: true });
+    expect(reconciled.some((l) => l.acceptance_hold !== undefined)).toBe(false);
+    expect(stamps().at(-1)!.value).toBe("");
+  }, 120_000);
+});
+
 describe("SEARCH_INDEX_ACCEPTANCE_WATERMARK_ENABLED in the Lambda", () => {
   const BASE = {
     AWS_REGION: "us-east-1", PIPELINE_RAW_S3_BUCKET: "b", PIPELINE_KEY_PREFIX: "96bulls", PIPELINE_ORG_FROM_PREFIX: "true",
