@@ -12,14 +12,14 @@
  */
 import { errorCodeFields, errorFields, log, searchIndexErrorDetail } from "../shared/log.ts";
 import { dbErrorReasonField } from "../shared/db-error-reason.ts";
-import { parseQueueBody, sequencerAfter, type LandedEvent, type QueueOrigin } from "./s3-events.ts";
+import { parseQueueBody, sequencerAfter, type LandedEvent, type LargeReadHoldBody, type QueueOrigin } from "./s3-events.ts";
 import { indexPointer, type PointerDeps, type SessionScope } from "./pointer.ts";
 import { indexSearchScope, searchIndexPhaseMetrics, type SearchIndexDeps } from "./search-index.ts";
 import { LEGACY_PROVENANCE_INVALID } from "../session-read-api/legacy-provenance.ts";
 import { streamDeadlinePassed } from "../session-read-api/canonical-stream-projection.ts";
 import { captureRefusal, classifyReplayFailure, produceCanonicalReplay, type ReplayProducerDeps } from "./replay-publication.ts";
 import type { LargeJobState, LargeRoute } from "./large-read-worker.ts";
-import { DEADLINE_OVER_BOUND, DEADLINE_ROUTE, decideHold, deadlineMarked, hitStreamDeadline, markDeadline, type DeadlineIsolationDeps, type HoldDecision } from "./search-deadline-isolation.ts";
+import { DEADLINE_OVER_BOUND, DEADLINE_ROUTE, LARGE_READ_UNCLAIMED_MS, decideHold, deadlineMarked, holdId, sameSource, hitStreamDeadline, markDeadline, type DeadlineIsolationDeps, type HoldDecision } from "./search-deadline-isolation.ts";
 import { bufferedFeedQueryField, feedBufferedStageByKey, isBufferedStageKey, type BufferedFeedDeps } from "./buffered-search-feed.ts";
 
 export interface QueueRecord {
@@ -74,7 +74,7 @@ export interface ConsumerDeps {
    * Put a manifest back on the queue after a delay (SQS DelaySeconds): used when
    * another pass holds the session, so the event is neither lost nor failed.
    */
-  requeue?: (manifestKey: string, oldestEventTime?: string) => Promise<void>;
+  requeue?: (manifestKey: string, oldestEventTime?: string, hold?: LargeReadHoldBody) => Promise<void>;
   /** Clock for `event_age_ms` and `s3_event_age_ms` only (default Date.now). */
   now?: () => number;
   /**
@@ -156,9 +156,15 @@ async function shortenRetries(handles: readonly (string | undefined)[], rv: NonN
 interface Covered {
   oldestMs?: number;
   unknown: boolean;
+  /** Any message that is not a deadline-isolation hold (an upload, a delete, a sweep or another requeue). */
+  plain?: boolean;
+  /** The deadline-isolation holds among the messages. */
+  holds?: LargeReadHoldBody[];
 }
 
 function cover(into: Covered, event: LandedEvent): void {
+  if (event.hold) (into.holds ??= []).push(event.hold);
+  else into.plain = true;
   if (event.deleted) return;
   const at = event.oldestEventTime ?? event.eventTime;
   const ms = at === undefined ? NaN : Date.parse(at);
@@ -168,6 +174,8 @@ function cover(into: Covered, event: LandedEvent): void {
 
 function merge(into: Covered, from: Covered): void {
   if (from.unknown) into.unknown = true;
+  if (from.plain) into.plain = true;
+  if (from.holds?.length) (into.holds ??= []).push(...from.holds);
   if (from.oldestMs !== undefined && (into.oldestMs === undefined || from.oldestMs < into.oldestMs)) into.oldestMs = from.oldestMs;
 }
 
@@ -250,13 +258,21 @@ async function routeDeadlineScope(
   phase: Record<string, unknown>,
   started: number,
   anchorMs: number,
-  requeue: (() => Promise<void>) | undefined,
+  requeue: ((hold?: LargeReadHoldBody) => Promise<void>) | undefined,
+  incoming: { holdOnly: boolean; holds: readonly LargeReadHoldBody[] } = { holdOnly: false, holds: [] },
 ): Promise<"inline" | "done" | "held"> {
   const ids = { org_id: scope.orgId, workspace_id: scope.workspaceId, harness: scope.harness, session_id: scope.sessionId };
   const { enqueued, identity, source } = await isolation.enqueue(scope);
   if (!enqueued) {
     log.info("search index over-bound, large-read unavailable", { stage: "search-index", ...ids, reason: DEADLINE_OVER_BOUND, outcome: trigger, route: "inline" });
     return "inline";
+  }
+  // A delivery made only of holds whose incarnation was replaced between the obsolete check and this enqueue: the
+  // enqueue captured the newer incarnation (an upsert identical to that incarnation's own routing, and a no-op on its
+  // row when it is already enqueued). Its job row now exists, so the newer work is covered: ack, no mark, no hold.
+  if (incoming.holdOnly && isolation.current && !incoming.holds.some((h) => sameSource(h, source))) {
+    log.info("large-read hold obsolete", { stage: "large-read", ...ids, reason: "large_hold_obsolete", outcome: "enqueue_race" });
+    return "done";
   }
   const routedLine = (state: string) => log.info("search index over-bound, routed to large-read", {
     stage: "search-index", ...ids, reason: DEADLINE_OVER_BOUND, outcome: trigger, route: DEADLINE_ROUTE, state,
@@ -295,7 +311,11 @@ async function routeDeadlineScope(
     return "done";
   }
   if (!requeue) throw new Error("large-read hold and no requeue");
-  await requeue();
+  // The next hold waits for the incarnation this enqueue captured; its sequence follows the highest incoming hold for
+  // that incarnation, so a retry of this delivery mints the same hold id. No captured incarnation: a plain requeue.
+  const prior = incoming.holds.filter((h) => sameSource(h, source)).reduce((m, h) => Math.max(m, h.seq), 0);
+  const holdScope = identity ?? scope;
+  await requeue(source ? { epoch: source.epoch, fingerprint: source.fingerprint, seq: prior + 1, id: holdId(holdScope, source, prior + 1) } : undefined);
   routedLine(decision.why === "running" ? "held_running" : decision.why === "unknown" ? "held_unknown" : "held_queued");
   return "held";
 }
@@ -344,7 +364,7 @@ export async function processBatch(records: readonly QueueRecord[], deps: Consum
   for (const { event: carriedEvent, messageIds, covered } of byKey.values()) {
     const started = Date.now();
     // The carried time is telemetry only: no stage sees it.
-    const { oldestEventTime: _carried, ...event } = carriedEvent;
+    const { oldestEventTime: _carried, hold: _hold, ...event } = carriedEvent;
     if (deps.bufferedFeed && isBufferedStageKey(event.key, deps.bufferedFeed.keyRoot)) {
       // KEEP-UP. A delete event is a GC removal: index-row deletes are their own lane, so it is a no-op here.
       if (event.deleted) continue;
@@ -398,7 +418,7 @@ export async function processBatch(records: readonly QueueRecord[], deps: Consum
       if (held) {
         held.messageIds.push(...messageIds);
         merge(held.covered, covered);
-      } else scopes.set(id, { scope: outcome.scope, messageIds: [...messageIds], manifestKey: outcome.manifestKey, covered: { ...covered } });
+      } else scopes.set(id, { scope: outcome.scope, messageIds: [...messageIds], manifestKey: outcome.manifestKey, covered: { ...covered, ...(covered.holds ? { holds: [...covered.holds] } : {}) } });
     } catch (error) {
       const { fields, code } = errorCodeFields(error);
       // A 40001 / XX000 (the error's own string code, never the name fallback) also logs which known failure it was
@@ -454,10 +474,48 @@ export async function processBatch(records: readonly QueueRecord[], deps: Consum
         // the large-read job before any read or lock (one bounded ClickHouse read, one autocommit enqueue). A source
         // the enqueue reports unavailable (erased, blocked, no live pointer) runs the normal pass below.
         // The hold's clock starts at the oldest upload the message carries (kept across requeues), else the mark.
-        const holdRequeue = deps.requeue ? () => deps.requeue!(manifestKey, carriedTime(covered)) : undefined;
-        const mark = deps.deadlineIsolation ? await deadlineMarked(deps.deadlineIsolation, scope) : null;
+        let obsoleteInline = false;
+        const holdRequeue = deps.requeue ? (hold?: LargeReadHoldBody) => deps.requeue!(manifestKey, carriedTime(covered), hold) : undefined;
+        const incoming = { holdOnly: !covered.plain && (covered.holds?.length ?? 0) > 0, holds: covered.holds ?? [] };
+        // SEARCH_INDEX_DEADLINE_ISOLATION_ENABLED, a delivery made only of holds: before any enqueue, mark or hold, one
+        // STABLE read of the current incarnation. None of the holds' incarnations current: the hold is obsolete. It never
+        // enqueues, marks or holds for the newer incarnation: acked once that incarnation's job row exists (its own
+        // routing covers it); held once more (same expectation) while it does not, within LARGE_READ_UNCLAIMED_MS; past
+        // that, the normal inline pass runs with no enqueue, mark or hold. A failed read runs the checks below.
+        if (deps.deadlineIsolation?.current && incoming.holdOnly) {
+          let now: Awaited<ReturnType<NonNullable<DeadlineIsolationDeps["current"]>>> | undefined;
+          try { now = await deps.deadlineIsolation.current(scope); } catch (error) {
+            log.warn("large scope source unavailable", { stage: "large-read", org_id: scope.orgId, session_id: scope.sessionId, ...errorFields(error) });
+          }
+          if (now && !incoming.holds.some((h) => sameSource(h, now!.source))) {
+            const ids = { org_id: scope.orgId, workspace_id: scope.workspaceId, harness: scope.harness, session_id: scope.sessionId };
+            let covers = false;
+            try {
+              const row = deps.deadlineIsolation.progress ? await deps.deadlineIsolation.progress(now.identity) : null;
+              covers = !!row && row.state !== "failed" && sameSource(row.source, now.source);
+            } catch (error) {
+              log.warn("large scope job state unavailable", { stage: "large-read", ...ids, ...errorFields(error) });
+            }
+            const anchor = knownOldest(covered) ?? started;
+            const age = Math.max(0, (deps.deadlineIsolation.now ?? Date.now)() - anchor);
+            if (covers) {
+              log.info("large-read hold obsolete", { stage: "large-read", ...ids, reason: "large_hold_obsolete", outcome: "covered" });
+              continue;
+            }
+            if (age <= LARGE_READ_UNCLAIMED_MS && holdRequeue) {
+              // Same expectation, next sequence: the check repeats without touching the newer incarnation.
+              const top = incoming.holds.reduce((a, h) => (h.seq > a.seq ? h : a));
+              await holdRequeue({ epoch: top.epoch, fingerprint: top.fingerprint, seq: top.seq + 1, id: holdId(now.identity, top, top.seq + 1) });
+              log.info("large-read hold obsolete", { stage: "large-read", ...ids, reason: "large_hold_obsolete", outcome: "awaiting_newer", age_ms: age });
+              continue;
+            }
+            log.warn("large-read hold obsolete", { stage: "large-read", ...ids, reason: "large_hold_obsolete", outcome: "inline", age_ms: age });
+            obsoleteInline = true;
+          }
+        }
+        const mark = deps.deadlineIsolation && !obsoleteInline ? await deadlineMarked(deps.deadlineIsolation, scope) : null;
         if (deps.deadlineIsolation && mark) {
-          const routed = await routeDeadlineScope(deps.deadlineIsolation, scope, "marked", phaseFields(), started, knownOldest(covered) ?? mark.atMs, holdRequeue);
+          const routed = await routeDeadlineScope(deps.deadlineIsolation, scope, "marked", phaseFields(), started, knownOldest(covered) ?? mark.atMs, holdRequeue, incoming);
           if (routed !== "inline") continue;
         }
         // SEARCH_INDEX_STREAMING_CH=1 only (the backport lineage's 6264d119 / 51f876b6): past the invocation's
@@ -499,9 +557,9 @@ export async function processBatch(records: readonly QueueRecord[], deps: Consum
           });
         // SEARCH_INDEX_DEADLINE_ISOLATION_ENABLED=true only: the first deadline hit marks the scope and hands it to the
         // large-read job, after the pass returned (its transaction and scope lock are released).
-        if (deps.deadlineIsolation && hitStreamDeadline(result)) {
+        if (deps.deadlineIsolation && hitStreamDeadline(result) && !obsoleteInline) {
           await markDeadline(deps.deadlineIsolation, scope);
-          await routeDeadlineScope(deps.deadlineIsolation, scope, "first_hit", phaseFields(), started, knownOldest(covered) ?? started, holdRequeue);
+          await routeDeadlineScope(deps.deadlineIsolation, scope, "first_hit", phaseFields(), started, knownOldest(covered) ?? started, holdRequeue, incoming);
         }
         const lag = lagFields(covered, messageIds, messages, now());
         if (result.partial)

@@ -35,6 +35,23 @@ export const RECONCILE_BODY_KEY = "reconcile";
 export const OLDEST_EVENT_TIME_FIELD = "oldest_event_time";
 /** Field of a requeued reconcile body (`true`): the message is the consumer's own requeue. */
 export const REQUEUED_FIELD = "requeued";
+/**
+ * Optional field of a requeued reconcile body (SEARCH_INDEX_DEADLINE_ISOLATION_ENABLED holds only): the large-read job
+ * incarnation the hold waits for (source epoch, opaque fingerprint), the hold's sequence, and its id (a digest of the
+ * scope, incarnation and sequence; search-deadline-isolation.ts holdId). Internal; never logged.
+ */
+export const LARGE_READ_HOLD_FIELD = "large_read_hold";
+export interface LargeReadHoldBody { epoch: string; fingerprint: string; seq: number; id: string }
+/** A carried hold, validated: an unrecognised shape is dropped (the message is then a plain requeue). */
+export function parseLargeReadHold(value: unknown): LargeReadHoldBody | undefined {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
+  const v = value as Record<string, unknown>;
+  if (typeof v.epoch !== "string" || !/^[1-9][0-9]{0,18}$/.test(v.epoch)) return undefined;
+  if (typeof v.fingerprint !== "string" || !/^[0-9a-f]{64}$/.test(v.fingerprint)) return undefined;
+  if (typeof v.seq !== "number" || !Number.isSafeInteger(v.seq) || v.seq < 1 || v.seq > 100_000) return undefined;
+  if (typeof v.id !== "string" || !/^[0-9a-f]{64}$/.test(v.id)) return undefined;
+  return { epoch: v.epoch, fingerprint: v.fingerprint, seq: v.seq, id: v.id };
+}
 
 /** Where an SQS message came from, for `queue_origin`: an S3 notification, this consumer's requeue, or a sweep body. */
 export type QueueOrigin = "s3" | "requeue" | "sweep";
@@ -54,6 +71,8 @@ export interface LandedEvent extends ObjectLanded {
   sequencer?: string;
   /** A requeued reconcile body's carried upload event time (ISO 8601): telemetry only, stripped before any stage. */
   oldestEventTime?: string;
+  /** A deadline-isolation hold's carried expectation (LARGE_READ_HOLD_FIELD), stripped before any stage. */
+  hold?: LargeReadHoldBody;
 }
 
 export type ParsedBody =
@@ -106,12 +125,13 @@ export function parseQueueBody(body: string, provider: StorageProvider = "s3"): 
   const v = value as Record<string, unknown>;
   if (v.Event === "s3:TestEvent") return { kind: "test" };
   const reconcile = v[RECONCILE_BODY_KEY] as
-    | { key?: unknown; etag?: unknown; version?: unknown; [OLDEST_EVENT_TIME_FIELD]?: unknown; [REQUEUED_FIELD]?: unknown }
+    | { key?: unknown; etag?: unknown; version?: unknown; [OLDEST_EVENT_TIME_FIELD]?: unknown; [REQUEUED_FIELD]?: unknown; [LARGE_READ_HOLD_FIELD]?: unknown }
     | undefined;
   if (reconcile && typeof reconcile === "object") {
     if (typeof reconcile.key !== "string" || !reconcile.key) return { kind: "invalid" };
     const carried = reconcile[OLDEST_EVENT_TIME_FIELD];
     const oldestEventTime = typeof carried === "string" && carried ? carried : undefined;
+    const hold = parseLargeReadHold(reconcile[LARGE_READ_HOLD_FIELD]);
     return {
       kind: "events",
       events: [
@@ -121,6 +141,7 @@ export function parseQueueBody(body: string, provider: StorageProvider = "s3"): 
           ...(typeof reconcile.etag === "string" && reconcile.etag ? { etag: reconcile.etag } : {}),
           ...(typeof reconcile.version === "string" && reconcile.version ? { version: reconcile.version } : {}),
           ...(oldestEventTime ? { oldestEventTime } : {}),
+          ...(hold ? { hold } : {}),
         },
       ],
       // A requeue written before the marker existed is still a requeue when it carries a time.
@@ -137,9 +158,13 @@ export function parseQueueBody(body: string, provider: StorageProvider = "s3"): 
 }
 
 /** The body of a requeued search pass: the manifest key, the `requeued` marker, and the carried time when known. */
-export function requeueBody(manifestKey: string, oldestEventTime?: string): string {
+export function requeueBody(manifestKey: string, oldestEventTime?: string, hold?: LargeReadHoldBody): string {
   return JSON.stringify({
-    [RECONCILE_BODY_KEY]: { key: manifestKey, [REQUEUED_FIELD]: true, ...(oldestEventTime ? { [OLDEST_EVENT_TIME_FIELD]: oldestEventTime } : {}) },
+    [RECONCILE_BODY_KEY]: {
+      key: manifestKey, [REQUEUED_FIELD]: true,
+      ...(oldestEventTime ? { [OLDEST_EVENT_TIME_FIELD]: oldestEventTime } : {}),
+      ...(hold ? { [LARGE_READ_HOLD_FIELD]: { epoch: hold.epoch, fingerprint: hold.fingerprint, seq: hold.seq, id: hold.id } } : {}),
+    },
   });
 }
 

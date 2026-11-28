@@ -102,6 +102,13 @@ export interface DeadlineIsolationDeps {
    * inline pass instead (decideHold). Absent: routed and acked at once, as before.
    */
   progress?: (scope: SessionScope) => Promise<LargeReadProgress | null>;
+  /**
+   * The scope's current source incarnation and canonical identity (captureLargeReadSource: one STABLE read, no write),
+   * or null when the source is unavailable (erased, blocked, no live pointer). With it, a delivery made only of holds
+   * whose expected incarnation is no longer current is obsolete: it never enqueues, writes a mark or holds for the
+   * newer incarnation (consumer.ts). Absent: no obsolete check.
+   */
+  current?: (scope: SessionScope) => Promise<{ source: LargeReadSource; identity: SessionScope } | null>;
   /** Clock for the mark's age (default Date.now). */
   now?: () => number;
 }
@@ -187,4 +194,27 @@ export async function largeReadProgress(db: SqlExecutor, s: SessionScope): Promi
     [s.orgId, s.workspaceId, s.harness, s.sessionId],
   )).rows[0];
   return row ? { state: String(row.state), leaseLive: row.lease_live === true, source: { epoch: String(row.source_epoch), fingerprint: String(row.source_fingerprint) } } : null;
+}
+
+/** The capture's source incarnation and canonical identity (sessions.capture_session_replay_pages, STABLE), or null. */
+export async function captureLargeReadSource(db: SqlExecutor, s: SessionScope): Promise<{ source: LargeReadSource; identity: SessionScope } | null> {
+  const c = (await db.query<{ c: { exists?: unknown; blocked?: unknown; identity?: { sessionId?: unknown }; source?: { epoch?: unknown; fingerprint?: unknown } } }>(
+    "SELECT sessions.capture_session_replay_pages($1,$2,$3,$4) c", [s.orgId, s.workspaceId, s.harness, s.sessionId])).rows[0]?.c;
+  if (!c || c.exists !== true || c.blocked === true) return null;
+  const epoch = c.source?.epoch, fingerprint = c.source?.fingerprint, sessionId = c.identity?.sessionId;
+  if ((typeof epoch !== "string" && typeof epoch !== "number") || typeof fingerprint !== "string" || typeof sessionId !== "string" || !sessionId) return null;
+  return { source: { epoch: String(epoch), fingerprint }, identity: { ...s, sessionId } };
+}
+
+/** Same incarnation. */
+export function sameSource(a: LargeReadSource | undefined, b: LargeReadSource | undefined): boolean {
+  return a !== undefined && b !== undefined && a.epoch === b.epoch && a.fingerprint === b.fingerprint;
+}
+
+/**
+ * A hold's id: sha256 over a canonical encoding of the scope, the incarnation it waits for and its sequence. A retry of
+ * the same check (same incoming sequence) mints the same id; the next check (sequence + 1) a new one.
+ */
+export function holdId(scope: SessionScope, source: LargeReadSource, seq: number): string {
+  return createHash("sha256").update(JSON.stringify(["large-read-hold/v1", [scope.orgId, scope.workspaceId, scope.harness, scope.sessionId], [source.epoch, source.fingerprint], seq])).digest("hex");
 }
