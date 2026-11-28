@@ -1020,17 +1020,23 @@ describe("pull request linking", () => {
     git(["switch", "-q", "main"], "2026-11-06T00:00:00Z");
     git(["branch", "-q", "-D", "fix/a", "fix/b", "fix/c"], "2026-11-06T00:00:00Z"); // head branches deleted on merge
     const listed = [
-      { url: "https://github.com/example/widgets/pull/1", state: "MERGED", createdAt: "2026-11-02T01:00:00Z", updatedAt: "2026-11-03T00:00:00Z", mergedAt: "2026-11-03T00:00:00Z", closedAt: "2026-11-03T00:00:00Z", headRefName: "fix/a", baseRefName: "trunk", mergeCommit: { oid: mergeA }, headRefOid: a },
-      { url: "https://github.com/example/widgets/pull/2", state: "MERGED", createdAt: "2026-11-04T13:00:00Z", updatedAt: "2026-11-05T00:00:00Z", mergedAt: "2026-11-05T00:00:00Z", closedAt: "2026-11-05T00:00:00Z", headRefName: "fix/b", baseRefName: "trunk", mergeCommit: { oid: mergeB }, headRefOid: b },
-      { url: "https://github.com/example/widgets/pull/3", state: "OPEN", createdAt: "2026-11-06T01:00:00Z", updatedAt: "2026-11-06T01:00:00Z", mergedAt: null, closedAt: null, headRefName: "fix/c", baseRefName: "trunk", mergeCommit: null, headRefOid: c },
+      { url: "https://github.com/example/widgets/pull/1", state: "MERGED", createdAt: "2026-11-02T01:00:00Z", updatedAt: "2026-11-03T00:00:00Z", mergedAt: "2026-11-03T00:00:00Z", closedAt: "2026-11-03T00:00:00Z", headRefName: "fix/a", baseRefName: "trunk", mergeCommit: { oid: mergeA }, headRefOid: a, isCrossRepository: false },
+      { url: "https://github.com/example/widgets/pull/2", state: "MERGED", createdAt: "2026-11-04T13:00:00Z", updatedAt: "2026-11-05T00:00:00Z", mergedAt: "2026-11-05T00:00:00Z", closedAt: "2026-11-05T00:00:00Z", headRefName: "fix/b", baseRefName: "trunk", mergeCommit: { oid: mergeB }, headRefOid: b, isCrossRepository: false },
+      { url: "https://github.com/example/widgets/pull/3", state: "OPEN", createdAt: "2026-11-06T01:00:00Z", updatedAt: "2026-11-06T01:00:00Z", mergedAt: null, closedAt: null, headRefName: "fix/c", baseRefName: "trunk", mergeCommit: null, headRefOid: c, isCrossRepository: false },
       // Merged, but the mirror does not hold its merge commit: unknown (no landedAt), never a claimed absence.
-      { url: "https://github.com/example/widgets/pull/4", state: "MERGED", createdAt: "2026-11-06T01:00:00Z", updatedAt: "2026-11-06T02:00:00Z", mergedAt: "2026-11-06T02:00:00Z", closedAt: null, headRefName: "fix/d", baseRefName: "main", mergeCommit: { oid: "f".repeat(40) }, headRefOid: "e".repeat(40) },
+      { url: "https://github.com/example/widgets/pull/4", state: "MERGED", createdAt: "2026-11-06T01:00:00Z", updatedAt: "2026-11-06T02:00:00Z", mergedAt: "2026-11-06T02:00:00Z", closedAt: null, headRefName: "fix/d", baseRefName: "main", mergeCommit: { oid: "f".repeat(40) }, headRefOid: "e".repeat(40), isCrossRepository: false },
       // The same into trunk: its promotion to main is not known at all.
-      { url: "https://github.com/example/widgets/pull/5", state: "MERGED", createdAt: "2026-11-06T01:00:00Z", updatedAt: "2026-11-06T02:00:00Z", mergedAt: "2026-11-06T02:00:00Z", closedAt: null, headRefName: "fix/e", baseRefName: "trunk", mergeCommit: { oid: "d".repeat(40) }, headRefOid: "e".repeat(40) },
+      { url: "https://github.com/example/widgets/pull/5", state: "MERGED", createdAt: "2026-11-06T01:00:00Z", updatedAt: "2026-11-06T02:00:00Z", mergedAt: "2026-11-06T02:00:00Z", closedAt: null, headRefName: "fix/e", baseRefName: "trunk", mergeCommit: { oid: "d".repeat(40) }, headRefOid: "e".repeat(40), isCrossRepository: false },
     ];
     const f = forgeFacts("example/widgets", repo, "2026-10-31T00:00:00Z", "2026-11-30T00:00:00Z", "main", () => listed);
     const pr = (n: number) => f.prs.find((p) => p.ref.endsWith(`/pull/${n}`))!;
     expect(pr(1)).toMatchObject({ base: "trunk", mergeCommit: mergeA, landedAt: T("04T00:00:00"), commits: [a] });
+    // The head's repository: same (isCrossRepository false), a fork (true), unknown (gh omitted the field).
+    expect(pr(1).headSameRepo).toBe(true);
+    const legacy = forgeFacts("example/widgets", repo, "2026-10-31T00:00:00Z", "2026-11-30T00:00:00Z", "main", () => [{ ...listed[0]!, isCrossRepository: undefined }]);
+    expect(legacy.prs[0]!.headSameRepo).toBeUndefined();
+    const forked = forgeFacts("example/widgets", repo, "2026-10-31T00:00:00Z", "2026-11-30T00:00:00Z", "main", () => [{ ...listed[0]!, isCrossRepository: true }]);
+    expect(forked.prs[0]!.headSameRepo).toBe(false);
     expect(pr(2)).toMatchObject({ base: "trunk", mergeCommit: mergeB, landedAt: null, commits: [b] });
     // An unmerged PR's final commit list is not dated: none is recorded.
     expect(pr(3).commits).toBeUndefined();
@@ -1083,12 +1089,40 @@ describe("pull request linking", () => {
   });
 
   test("a head branch reused long before the feature is not its PR; a forge without landedAt reads mergedAt", () => {
-    const old = { prs: [{ ref: "https://github.com/example/widgets/pull/9", state: "merged" as const, at: "2026-10-01T00:00:00.000Z", mergedAt: "2026-10-02T00:00:00.000Z", branch: "fix/a" }], commits: [], flags: [] };
+    const old = { prs: [{ ref: "https://github.com/example/widgets/pull/9", state: "merged" as const, at: "2026-10-01T00:00:00.000Z", mergedAt: "2026-10-02T00:00:00.000Z", branch: "fix/a", headSameRepo: true }], commits: [], flags: [] };
     const onA = sess({ keys: keys({ branches: ["fix/a"] }), built: [{ id: "y", kind: "claim", what: "c", ref: null, at: T("02T00:30:00"), session: { source: "claude", sessionId: "s" }, outcomeId: null, evidence: [] }] });
     expect(deriveState([onA], old, T("10T00:00:00")).basis).toBe("analysis");
     const recent = { ...old, prs: [{ ...old.prs[0]!, at: T("02T02:00:00"), mergedAt: T("03T00:00:00") }] };
     expect(deriveState([onA], recent, T("10T00:00:00"))).toMatchObject({ state: "shipped", basis: "forge" });
     expect(deriveState([onA], recent, T("02T12:00:00")).state).toBe("in_progress");
+  });
+
+  test("branch-only PR credit needs a confirmed same-repository head; explicit PR or commit evidence still links a fork's PR", () => {
+    const X = "7654321".padEnd(40, "0");
+    const pr = (over: Record<string, unknown>) => ({ prs: [{ ref: "https://github.com/example/widgets/pull/11", state: "merged" as const, at: T("02T02:00:00"), mergedAt: T("03T00:00:00"), base: "main", branch: "fix/a", ...over }], commits: [], flags: [] });
+    const claim = [{ id: "y", kind: "claim" as const, what: "c", ref: null, at: T("02T00:30:00"), session: { source: "claude" as const, sessionId: "s" }, outcomeId: null, evidence: [] }];
+    const onA = sess({ keys: keys({ branches: ["fix/a"] }), built: claim });
+    // Positive: the head branch is in this repository.
+    expect(deriveState([onA], pr({ headSameRepo: true }), T("10T00:00:00"))).toMatchObject({ state: "shipped", basis: "forge" });
+    // Negative: a fork's branch of the same name, and a legacy forge that never recorded the head's repository.
+    expect(deriveState([onA], pr({ headSameRepo: false }), T("10T00:00:00")).basis).toBe("analysis");
+    expect(deriveState([onA], pr({}), T("10T00:00:00")).basis).toBe("analysis");
+    // A fork's PR the session created still links.
+    const created = sess({ keys: keys({ branches: ["fix/a"], prs: ["https://github.com/example/widgets/pull/11"] }), built: [{ id: "p", kind: "pr", what: "created", ref: "https://github.com/example/widgets/pull/11", at: T("02T02:00:00"), session: { source: "claude", sessionId: "s" }, outcomeId: null, evidence: [] }] });
+    expect(deriveState([created], pr({ headSameRepo: false }), T("10T00:00:00"))).toMatchObject({ state: "shipped", basis: "forge" });
+    expect(deriveState([created], pr({}), T("10T00:00:00"))).toMatchObject({ state: "shipped", basis: "forge" });
+    // So does a fork's merged PR holding a commit the session made.
+    const committed = sess({ keys: keys({ branches: ["fix/a"] }), built: [{ id: "x", kind: "commit", what: "commit", ref: X.slice(0, 9), at: T("02T00:30:00"), session: { source: "claude", sessionId: "s" }, outcomeId: null, evidence: [] }] });
+    expect(deriveState([committed], pr({ headSameRepo: false, mergeCommit: "f".repeat(40), landedAt: T("03T00:00:00"), commits: [X] }), T("10T00:00:00"))).toMatchObject({ state: "shipped", basis: "forge" });
+  });
+
+  test("forge: headSameRepo comes from isCrossRepository and stays absent when gh omits it", async () => {
+    const { parseForge } = await import("../bench/corpus.ts");
+    const pr = (headSameRepo: unknown) => ({ prs: [{ ref: "https://github.com/example/widgets/pull/1", state: "open", at: "2026-11-01T00:00:00.000Z", headSameRepo }], commits: [], flags: [] });
+    expect(parseForge(pr(true)).prs[0]!.headSameRepo).toBe(true);
+    expect(parseForge(pr(false)).prs[0]!.headSameRepo).toBe(false);
+    expect(() => parseForge(pr("yes"))).toThrow(/headSameRepo/u);
+    expect(() => parseForge(pr(1))).toThrow(/headSameRepo/u);
   });
 
   test("a PR links by a session's commit only through a merge known before the cut", () => {

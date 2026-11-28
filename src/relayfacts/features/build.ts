@@ -139,14 +139,15 @@ export function deriveState(sessions: readonly SessionFacts[], forgeIn: ForgeFac
   const lead = new Date(Date.parse(firstStart) - BRANCH_LEAD_MS).toISOString();
   const branches = (forge.branches ?? []).filter((b) => branchNames.has(b.name) && b.tipAt < asOf && b.tipAt >= lead);
   // The feature's pull requests, each opened before the cut: one a session created; one whose head branch is the
-  // feature's branch, opened within the same lead (a head branch is deleted on merge, so the live branches above
-  // rarely hold it, and a reused name from older work is not this feature); or one merged before the cut holding a
+  // feature's branch, in this repository (`headSameRepo`: a fork's branch of the same name is someone else's work,
+  // and an unknown head gets no branch credit), opened within the same lead (a head branch is deleted on merge, so
+  // the live branches above rarely hold it, and a reused name from older work is not this feature); or one merged before the cut holding a
   // commit a session made or pushed (prefix of at least 7 characters). A PR's commit list is fixed when it merges, so
   // only a merge known before the cut says it held the commit then. Mentioned PRs alone never count.
   const ownShas = [...shas].filter((s) => s.length >= 7);
   const defaultBranch = forge.defaultBranch ?? "main";
   const prs = forge.prs.filter((p) => p.at < asOf && (prUrls.has(p.ref.toLowerCase())
-    || (!!p.branch && branchNames.has(p.branch) && p.at >= lead)
+    || (p.headSameRepo === true && !!p.branch && branchNames.has(p.branch) && p.at >= lead)
     || (p.state === "merged" && !!p.mergedAt && p.mergedAt < asOf && (p.commits ?? []).some((c) => ownShas.some((s) => c.startsWith(s))))));
   // A merged PR landed when its merge commit reached the default branch (`landedAt`; null: not yet), which for a
   // PR into a trunk or release branch is the later merge that brought it in. With no `landedAt`, a PR into another

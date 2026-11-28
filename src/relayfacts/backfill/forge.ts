@@ -69,7 +69,7 @@ export const MAX_LISTED_PRS = 50_000;
 export type ListedPr = Record<string, unknown>;
 export function ghPullRequests(repo: string, since: string): ListedPr[] {
   const raw = execFileSync("gh", ["pr", "list", "-R", repo, "--state", "all", "--limit", String(MAX_LISTED_PRS),
-    "--json", "url,state,createdAt,updatedAt,mergedAt,closedAt,headRefName,baseRefName,mergeCommit,headRefOid"], { encoding: "utf8", maxBuffer: 1024 * 1024 * 1024 });
+    "--json", "url,state,createdAt,updatedAt,mergedAt,closedAt,headRefName,baseRefName,mergeCommit,headRefOid,isCrossRepository"], { encoding: "utf8", maxBuffer: 1024 * 1024 * 1024 });
   return prsUpdatedSince(JSON.parse(raw) as ListedPr[], since);
 }
 
@@ -219,6 +219,9 @@ export function forgeFacts(repo: string, mirror: string, since: string, until: s
     const pr: ForgeFacts["prs"][number] = {
       ref: String(p.url).toLowerCase(), state, at: String(p.createdAt), mergedAt: str(p.mergedAt), closedAt: str(p.closedAt), branch: str(p.headRefName),
       ...(base ? { base } : {}),
+      // Whether the head branch lives in this repository: only then can a session's branch of that name be it.
+      // Unknown (a listing without the field) is recorded as absent, never as same-repository.
+      ...(typeof p.isCrossRepository === "boolean" ? { headSameRepo: !p.isCrossRepository } : {}),
     };
     if (state === "merged" && mergeCommit && isCommit(mergeCommit)) {
       pr.mergeCommit = mergeCommit;

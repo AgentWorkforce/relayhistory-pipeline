@@ -138,10 +138,11 @@ export interface ForgeFacts {
   /**
    * `branch` is the head branch and `base` the branch it merged into. `landedAt` is when its merge commit reached the
    * default branch (null: merged, but not onto it; absent: unknown, read `mergedAt`). `commits` are its own commits
-   * (full ids), absent when unknown.
+   * (full ids), absent when unknown. `headSameRepo` is true when the head branch is in this repository, false when it
+   * is in a fork, and absent when unknown (forge files from before it was recorded).
    */
   prs: Array<{ ref: string; state: "open" | "merged" | "closed"; at: string; mergedAt?: string | null; closedAt?: string | null; branch?: string | null;
-    base?: string; mergeCommit?: string; landedAt?: string | null; commits?: string[] }>;
+    base?: string; mergeCommit?: string; landedAt?: string | null; commits?: string[]; headSameRepo?: boolean }>;
   /**
    * `defaultAt`: when the commit became reachable from the default branch; `defaultAtBasis` says how that is known
    * (`merge` and `patch` from the landing commit, `committer` only the commit's own time: see backfill/forge.ts).

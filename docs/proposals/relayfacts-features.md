@@ -152,7 +152,9 @@ must cite evidence ids that the scorer checks.
    A feature's pull requests are the ones a session created, any whose head branch is one of the
    feature's branches and that opened no earlier than seven days before its first session (GitHub
    deletes a head branch on merge, so the live branches rarely hold it: 99 of 2,267 merged `cloud` PRs
-   kept theirs), and any merged before the cut that holds a commit a session made or pushed. A PR only
+   kept theirs) and whose head is confirmed to be in this repository (`headSameRepo`, from GitHub's
+   `isCrossRepository`: a fork's branch of the same name is someone else's work, and a forge file that
+   never recorded the head's repository gives no branch credit), and any merged before the cut that holds a commit a session made or pushed. A PR only
    mentioned never counts. A PR's commit list is fixed when it merges, so the forge records one only for
    a merged PR and a commit links it only once that merge precedes the cut; an open PR's final list is
    undated (commits can be pushed to it after any cut) and links nothing.

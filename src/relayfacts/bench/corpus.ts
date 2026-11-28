@@ -72,10 +72,11 @@ export function parseForge(raw: unknown): ForgeFacts {
   only(f, ["defaultBranch", "prs", "commits", "flags", "branches"], "forge.json");
   if (!Array.isArray(f.prs) || !Array.isArray(f.commits) || !Array.isArray(f.flags)) throw new CorpusError("forge.json: prs, commits and flags must be arrays");
   for (const p of f.prs as Record<string, unknown>[]) {
-    only(p, ["ref", "state", "at", "mergedAt", "closedAt", "branch", "base", "mergeCommit", "landedAt", "commits"], "forge.json pr");
+    only(p, ["ref", "state", "at", "mergedAt", "closedAt", "branch", "base", "mergeCommit", "landedAt", "commits", "headSameRepo"], "forge.json pr");
     if (typeof p.ref !== "string" || !["open", "merged", "closed"].includes(p.state as string) || !iso(p.at)) throw new CorpusError("forge.json: bad pr");
     // A landing is only a merged PR's, and only with its merge commit.
     if (p.base !== undefined && typeof p.base !== "string") throw new CorpusError("forge.json: bad pr base");
+    if (p.headSameRepo !== undefined && typeof p.headSameRepo !== "boolean") throw new CorpusError("forge.json: bad pr headSameRepo");
     if (p.mergeCommit !== undefined && (p.state !== "merged" || typeof p.mergeCommit !== "string" || !/^[0-9a-f]{40}$/u.test(p.mergeCommit))) throw new CorpusError("forge.json: bad pr merge commit");
     if (p.landedAt !== undefined && (p.mergeCommit === undefined || (p.landedAt !== null && !iso(p.landedAt)))) throw new CorpusError("forge.json: a pr landing needs its merge commit and a valid time");
     if (p.commits !== undefined && (!Array.isArray(p.commits) || p.commits.length === 0 || p.commits.length > 200 || p.commits.some((c) => typeof c !== "string" || !/^[0-9a-f]{40}$/u.test(c))))
