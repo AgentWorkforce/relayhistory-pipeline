@@ -956,3 +956,63 @@ describe("issuance after signing (eraser request path)", () => {
     expect(f.s.count(m.oldP)).toBe(2);
   });
 });
+
+describe("in-path gate judged at a fresh time (after the lease queries)", () => {
+  /** Arms on signing a DELETE; the next lease read (inside the post-signing gate) runs `delay` first. */
+  const delayedGate = (f: Awaited<ReturnType<typeof fixture>>, delay: () => void) => {
+    let armed = false;
+    const fence = f.s.eraser({ signer: async (args) => { await signRequest(args); if (args.method === "DELETE") armed = true; } });
+    const real = f.st.leaseRemainingMs.bind(f.st);
+    f.st.leaseRemainingMs = (...a: Parameters<typeof real>) => { if (armed) { armed = false; delay(); } return real(...a); };
+    return fence;
+  };
+
+  test("a lease read inside the gate that advances the clock past the 2 s check age: ZERO fetch for that DELETE, not_attempted, the batch stops", async () => {
+    const f = await fixture();
+    const m = f.dateMove();
+    const receipt = await f.verify();
+    const fence = delayedGate(f, () => { f.clock.now += 2_101; });
+    const r = await f.execute(receipt, { fence });
+    expect(f.s.deletes).toEqual([]);
+    expect(r).toMatchObject({ ok: false, refused: "stale_prefix_deadline", erased: 0 });
+    expect(r.fenced![0]!.versions.every((v) => v.outcome === "not_attempted")).toBe(true);
+    expect(f.s.count(m.oldP)).toBe(3);
+  });
+
+  test("a lease read inside the gate that leaves a lease below request deadline + margin: ZERO fetch for that DELETE, not_attempted", async () => {
+    const f = await fixture();
+    const m = f.dateMove();
+    const receipt = await f.verify();
+    // The survivor lease row is aged (as if its renewals stalled) so that 20 s remain: below 30 s + 5 s margin.
+    const fence = delayedGate(f, () => void f.st.db.prepare("UPDATE leases SET at = ? WHERE prefix = ?").run(NOW - (2 * 3_600_000 - 20_000), m.newP));
+    const r = await f.execute(receipt, { fence });
+    expect(f.s.deletes).toEqual([]);
+    expect(r).toMatchObject({ ok: false, refused: "stale_prefix_deadline" });
+    expect(r.fenced![0]!.versions.every((v) => v.outcome === "not_attempted")).toBe(true);
+  });
+
+  test("control: the same path with a fast lease read issues normally", async () => {
+    const f = await fixture();
+    const m = f.dateMove();
+    const receipt = await f.verify();
+    const fence = delayedGate(f, () => {});
+    expect(await f.execute(receipt, { fence })).toMatchObject({ ok: true, erased: 1 });
+    expect(f.s.deletes).toHaveLength(3);
+    expect(f.s.count(m.oldP)).toBe(0);
+  });
+
+  test("the eraser's own no-time-left refusal (timeout <= 0) before fetch maps to not_attempted, never ambiguous", async () => {
+    const f = await fixture();
+    f.dateMove();
+    const receipt = await f.verify();
+    const fence = f.s.eraser();
+    const real = fence.deleteVersion;
+    let n = 0;
+    // The job's gate passes; the time left handed to the eraser is then 0 on delete 2.
+    fence.deleteVersion = (k, v, o) => real(k, v, { beforeFetch: () => { const left = o!.beforeFetch!(); return ++n === 2 ? 0 : left; } });
+    const rep = (await f.execute(receipt, { fence })).fenced![0]!;
+    expect(f.s.deletes).toHaveLength(1);
+    expect(rep).toMatchObject({ outcome: "partial", reason: "stale_prefix_deadline", deleted: 1 });
+    expect(rep.versions.map((v) => v.outcome)).toEqual(["deleted", "not_attempted", "not_attempted"]);
+  });
+});

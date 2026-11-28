@@ -408,9 +408,15 @@ function s3Core(cfg: S3EraserConfig, label: string) {
     refuseIfExpired(cfg.credentials, label, Date.now()); // a short-lived key is never used to sign past expiry
     await sign({ method, url: u, headers, payloadSha256: await sha256Hex(new Uint8Array()), region: cfg.region, credentials: cfg.credentials });
     // The caller's final gate AFTER signing (signing and hashing can be slow) and synchronously before fetch.
-    const left = beforeFetch ? beforeFetch() : Number.POSITIVE_INFINITY;
-    const timeout = Math.min(deadlineMs, left);
-    if (!(timeout > 0)) throw coded("stale_prefix_deadline", "no protected time left for this request");
+    // Any refusal here happens BEFORE fetch: it is marked notSent, so the caller records not_attempted, never ambiguous.
+    let timeout: number;
+    try {
+      const left = beforeFetch ? beforeFetch() : Number.POSITIVE_INFINITY;
+      timeout = Math.min(deadlineMs, left);
+      if (!(timeout > 0)) throw coded("stale_prefix_deadline", "no protected time left for this request");
+    } catch (error) {
+      throw Object.assign(error instanceof Error ? error : coded("stale_prefix_deadline", "pre-fetch refusal"), { notSent: true });
+    }
     const res = await doFetch(u, { method, headers, signal: AbortSignal.timeout(timeout) });
     // Status only: S3 error bodies can echo keys.
     if (!res.ok && !(method === "DELETE" && res.status === 404) && !passStatuses.includes(res.status)) throw coded(`s3_${res.status}`, `S3 ${method} failed`);
