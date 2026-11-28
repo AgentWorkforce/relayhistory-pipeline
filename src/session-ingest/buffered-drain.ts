@@ -46,6 +46,12 @@
  *      absent. Then an equal or higher stored revision is skipped, counted as `stale` (lower),
  *      `already_stored` (equal, same digest) or `revision_conflict` (equal, another digest: never
  *      written, since the reader fold refuses it, relayhistory-transform.ts chooseRelayhistoryRevision).
+ *      An equal revision with the same digest is NOT taken as stored on the index's word: the FULL's revisions section
+ *      indexes every owned lazy slot with its digest, and for a buffered org those lines exist only in this backlog.
+ *      The session's canonical manifest is read (drain-materialization.ts readCanonicalSession, fail closed:
+ *      `canonical_unreadable`); the line is `already_stored` only when the canonical session holds that exact line,
+ *      else it is written (`materialized`) and its index entry stays as it is. drain-materialization.ts
+ *      verifyDrainMaterialization proves the result record by record.
  *   4b. Register the ownership stubs of the sessions to be written (ledger-s3 `registerOwner`) BEFORE any
  *      canonical write, as the claim does, then re-read the fence: if it moved, `fence_moved` (rerun).
  *   5. Write the surviving groups through the writer (`writeGroups` with the staged batch digest and
@@ -83,6 +89,7 @@ import {
   sessionKeyHash, validFenceAuthority, validOrgFenceAuthority, type FenceDoc, type FenceRead, type IndexEntry, type IndexEntryInput,
 } from "./ledger-s3.ts";
 import { fitLine } from "./oversize.ts";
+import { canonicalHolds, readCanonicalSession, type CanonicalLine } from "./drain-materialization.ts";
 import { routedRawChunkSealerDeps } from "../../packages/pipeline/src/lib/scrub-engine/index.ts";
 import { BUFFER_STAGE_MAX_BYTES, decodeStaged, type StagedHeader } from "./staging.ts";
 import {
@@ -350,6 +357,7 @@ export type ObjectOutcome =
   | "hold_failed"
   | "lock_lost"
   | "index_unreadable"
+  | "canonical_unreadable"
   | "write_failed"
   | "index_merge_failed"
   | "fence_recheck_failed"
@@ -365,7 +373,7 @@ export type ObjectOutcome =
 
 const OUTCOMES: ObjectOutcome[] = [
   "drained", "would_drain", "already_drained", "pre_reset", "redacted", "vanished", "corrupt", "key_mismatch",
-  "ambiguous_replacement", "fence_absent", "fence_unreadable", "journal_unreadable", "privacy_control_open", "reset_undeterminable", "reset_margin", "reset_in_flight", "control_pending", "fence_authority_missing", "fence_authority_invalid", "fence_authority_stopped", "user_hold", "user_stopped", "hold_failed", "lock_lost", "index_unreadable", "write_failed",
+  "ambiguous_replacement", "fence_absent", "fence_unreadable", "journal_unreadable", "privacy_control_open", "reset_undeterminable", "reset_margin", "reset_in_flight", "control_pending", "fence_authority_missing", "fence_authority_invalid", "fence_authority_stopped", "user_hold", "user_stopped", "hold_failed", "lock_lost", "index_unreadable", "canonical_unreadable", "write_failed",
   "index_merge_failed", "fence_recheck_failed", "fence_moved", "stage_unacknowledged", "stage_export_missing", "accepted_mismatch", "stage_not_live", "stage_superseded", "fence_moved_since_export", "marker_failed", "internal_error",
 ];
 
@@ -401,7 +409,13 @@ export interface DrainSummary {
     written: number;
     fenced: number;
     stale: number;
+    /**
+     * Index-equal lines whose canonical session already holds the exact record (truly stored). An index entry alone
+     * is never taken as canonical bytes: the FULL seeds owned lazy slots with their digest (drain-materialization.ts).
+     */
     already_stored: number;
+    /** Index-equal lines the canonical layout did not hold: written (counted in `written` too). */
+    materialized: number;
     revision_conflict: number;
     /** Lines SQL does not keep (the export's verdict: GC-dropped, not body-accepted, or not live). */
     not_kept: number;
@@ -437,7 +451,7 @@ function emptySummary(mode: DrainSummary["mode"]): DrainSummary {
   return {
     mode, orgs: 0, listed: 0, foreign_keys: 0,
     objects: Object.fromEntries(OUTCOMES.map((o) => [o, 0])) as Record<ObjectOutcome, number>,
-    lines: { candidate: 0, written: 0, fenced: 0, stale: 0, already_stored: 0, revision_conflict: 0, not_kept: 0 },
+    lines: { candidate: 0, written: 0, fenced: 0, stale: 0, already_stored: 0, materialized: 0, revision_conflict: 0, not_kept: 0 },
     sessions_written: 0, rearmed: 0, hold_failures: 0, holds_pruned: 0, orgs_without_authority: 0, fence_assumed_empty: 0, write_failures: {}, stopped: "complete", resume: "none",
   };
 }
@@ -510,6 +524,17 @@ async function readStagedObject(store: ObjectStore, key: string, parts: StagedKe
   } catch {
     return { kind: "corrupt" };
   }
+}
+
+/**
+ * The live decoded staged object at `key` (validated against its key), or null when it is not live: the verifier's
+ * reader (drain-materialization.ts verifyDrainMaterialization). Throws on a storage failure.
+ */
+export async function readLiveStaged(store: ObjectStore, key: string, decompress: (b: Uint8Array) => Uint8Array): Promise<Decoded | null> {
+  const parts = parseStagedKey(key);
+  if (!parts) return null;
+  const read = await readStagedObject(store, key, parts, decompress);
+  return read.kind === "live" ? read.decoded : null;
 }
 
 // ---- listing ----
@@ -1286,7 +1311,7 @@ export async function drainBufferedBatches(opts: DrainOptions): Promise<DrainSum
       return "journal_unreadable";
     }
     if (journal && (journal.pending > 0 || journal.ambiguous > 0)) return "privacy_control_open";
-    const counts = { candidate: 0, written: 0, fenced: 0, stale: 0, already_stored: 0, revision_conflict: 0, not_kept: 0 };
+    const counts = { candidate: 0, written: 0, fenced: 0, stale: 0, already_stored: 0, materialized: 0, revision_conflict: 0, not_kept: 0 };
     // The fence must be exactly as the export saw it when it took SQL's verdict (finding 1): the same fence object, no
     // reset begun or finished since, and every kept session at the same epoch. Anything else needs a fresh export.
     const vf = verdict.fence;
@@ -1372,6 +1397,26 @@ export async function drainBufferedBatches(opts: DrainOptions): Promise<DrainSum
       } catch {
         return "index_unreadable";
       }
+      // Materialization: an equal stored revision with this line's digest is NOT proof of canonical bytes (the FULL
+      // indexes owned lazy slots with their digest, and their lines exist only in this backlog). Read the canonical
+      // session of every group with such a line; the line is materialized unless the canonical session holds it.
+      const canonical = new Map<Kept, CanonicalLine[] | null>();
+      try {
+        for (const k of kept) {
+          const indexEqual = k.lines.some((line, i) => {
+            const r = recordOf(line);
+            const shard = shards.get(keys.revisions(origin, r.record_id))!;
+            const e = Object.hasOwn(shard, r.record_id) ? shard[r.record_id] : undefined;
+            return !!e && !entryForgotten(fence, origin, e) && Number(r.revision) === e[0] && e[2] === k.meta[i]![1];
+          });
+          if (indexEqual) canonical.set(k, await readCanonicalSession(store, {
+            keyRoot: opts.keyRoot, orgId: header.org_id, workspaceId: header.workspace_id,
+            machineId: liveMachineId(header.workspace_id, origin, header.user_id), source: k.group.source, sessionId: k.group.sessionId,
+          }, opts.decompress));
+        }
+      } catch {
+        return "canonical_unreadable";
+      }
       const toWrite: Group[] = [];
       const entries = new Map<string, IndexEntryInput[]>();
       const inBatch = new Map<string, [number, string]>();
@@ -1393,9 +1438,15 @@ export async function drainBufferedBatches(opts: DrainOptions): Promise<DrainSum
           if (stored && revision < stored[0]) counts.stale++;
           // A revision-only stored entry (#587: SQL's seeded records and lazy slots) has no digest to compare: stale.
           else if (stored && revision === stored[0] && stored[2] === null) counts.stale++;
+          else if (stored && revision === stored[0] && stored[2] !== m[1]) counts.revision_conflict++;
+          else if (stored && revision === stored[0] && (canonicalHolds(canonical.get(k) ?? null, line) || (seen && revision === seen[0]))) counts.already_stored++;
           else if (stored && revision === stored[0]) {
-            if (stored[2] === m[1]) counts.already_stored++;
-            else counts.revision_conflict++;
+            // Index-equal, not canonical: write the line. The index already holds this entry (a merge would keep it).
+            counts.materialized++;
+            inBatch.set(r.record_id, [revision, m[1]]);
+            if (m[3] !== null) writtenSessions.set(JSON.stringify([m[2], m[3]]), [m[2], m[3]]);
+            lines.push(fitLine(line));
+            meta.push(m);
           } else if (seen && revision === seen[0] && seen[1] !== m[1]) counts.revision_conflict++;
           else {
             inBatch.set(r.record_id, [revision, m[1]]);

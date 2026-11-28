@@ -19,7 +19,11 @@ import {
   s3DrainLedger,
   type DrainLedger,
   type DrainOptions,
+  readLiveStaged,
+  parseStagedKey,
 } from "../buffered-drain.ts";
+import { verifyDrainMaterialization } from "../drain-materialization.ts";
+import { writeGroups } from "../writer.ts";
 import { drainRefusal, parseDrainArgs, runDrain, runDrainTool, validResumeKey } from "../../../scripts/buffered-drain.ts";
 import { isLedgerKey, ledgerHomeKey } from "../ledger-store.ts";
 import { TOOL_HOME_RECHECK_MS } from "../ledger-tool-store.ts";
@@ -178,7 +182,7 @@ describe("buffered backlog drain (0005)", () => {
     const summary = await run(store);
     expect(summary.objects.drained).toBe(1);
     expect(summary.sessions_written).toBe(2);
-    expect(summary.lines).toEqual({ candidate: 3, written: 3, fenced: 0, stale: 0, already_stored: 0, revision_conflict: 0, not_kept: 0 });
+    expect(summary.lines).toEqual({ candidate: 3, written: 3, fenced: 0, stale: 0, already_stored: 0, materialized: 0, revision_conflict: 0, not_kept: 0 });
     const lines = await canonical(store);
     expect(lines.get("sess-1")).toEqual(["r1@1", "r2@2"]);
     expect(lines.get("sess-2")).toEqual(["r3@1"]);
@@ -249,7 +253,7 @@ describe("buffered backlog drain (0005)", () => {
     expect(await exists(store, rearmKey("claude", "sess-1"))).toBe(false);
   });
 
-  test("equal revision with another digest is never written; stale and already-stored are skipped", async () => {
+  test("equal revision with another digest is never written; stale is skipped; an index-only equal entry is materialized", async () => {
     const store = await scratch();
     const gen = { sessionKey: SESS1, epoch: 0, resets: 0 };
     await seedIndex(store, [
@@ -260,8 +264,10 @@ describe("buffered backlog drain (0005)", () => {
     await stage(store, [group("claude", "sess-1", [{ id: "conflict", rev: 3 }, { id: "stale", rev: 4 }, { id: "same", rev: 2 }, { id: "fresh", rev: 1 }])]);
     const summary = await run(store);
     expect(summary.objects.drained).toBe(1);
-    expect(summary.lines).toEqual({ candidate: 4, written: 1, fenced: 0, stale: 1, already_stored: 1, revision_conflict: 1, not_kept: 0 });
-    expect((await canonical(store)).get("sess-1")).toEqual(["fresh@1"]);
+    // "same" is indexed with its digest (as the FULL seeds an owned lazy slot) but has no canonical bytes: written.
+    expect(summary.lines).toEqual({ candidate: 4, written: 2, fenced: 0, stale: 1, already_stored: 0, materialized: 1, revision_conflict: 1, not_kept: 0 });
+    expect((await canonical(store)).get("sess-1")).toEqual(["same@2", "fresh@1"]);
+    expect(await storedEntry(store, "same")).toEqual([2, "same:r2", sha("same:2"), SESS1, 0, 0]);
     expect(await storedEntry(store, "conflict")).toEqual([3, "x", "f".repeat(64), SESS1, 0, 0]); // the stored digest is kept
     expect(await storedEntry(store, "fresh")).toEqual([1, "fresh:r1", sha("fresh:1"), SESS1, 0, 0]);
   });
@@ -1365,5 +1371,215 @@ describe("buffered backlog drain (0005)", () => {
     expect(parseDrainCheckpoint(JSON.stringify({ ...saved!, exports: { x: 0 } }))).toBeNull();
     expect(parseDrainCheckpoint(JSON.stringify({ ...saved!, key: "96bulls/../x" }))).toBeNull();
     expect(parseDrainCheckpoint(JSON.stringify(saved!))).toEqual(saved!);
+  });
+});
+
+/**
+ * FULL-to-drain materialization (wave 1): the FULL's revisions section indexes every owned lazy slot with its digest,
+ * so an index entry is not canonical bytes. These seed the index exactly as the FULL does (ledger-s3 mergeIndex with
+ * the slot's revision and digest) and prove the canonical set record by record with verifyDrainMaterialization.
+ */
+describe("buffered drain materialization (FULL-seeded index)", () => {
+  const verify = (store: ObjectStore) => verifyDrainMaterialization(
+    { store, keyRoot: ROOT, orgId: TENANT.orgId, decompress },
+    { list: (p) => allKeys(store, p), readStaged: (k) => readLiveStaged(store, k, decompress), parseStagedKey },
+  );
+  const SESS2 = sessionKeyHash("claude", "sess-2");
+  /** The FULL's view of an owned lazy slot: (record, revision, digest) under its session, no canonical bytes. */
+  const fullSlots = (store: ObjectStore, recs: { id: string; rev: number; session?: string }[]) =>
+    seedIndex(store, recs.map((r) => ({
+      recordId: r.id, revision: r.rev, revisionId: `${r.id}:r${r.rev}`, digest: sha(`${r.id}:${r.rev}`),
+      sessionKey: r.session === "sess-2" ? SESS2 : SESS1, epoch: 0, resets: 0,
+    })));
+  const manifestRevisions = async (store: ObjectStore) => {
+    const out: number[] = [];
+    for (const k of await allKeys(store, `${ROOT}/${TENANT.orgId}/v1`)) if (k.endsWith("/manifest.json")) out.push((await readJson(store, k)).revision);
+    return out;
+  };
+
+  test("a FULL-seeded backlog is materialized line for line, and the verifier proves the exact canonical set", async () => {
+    const store = await scratch();
+    await fullSlots(store, [{ id: "a1", rev: 1 }, { id: "a2", rev: 1 }, { id: "b1", rev: 2, session: "sess-2" }]);
+    await stage(store, [group("claude", "sess-1", [{ id: "a1", rev: 1 }, { id: "a2", rev: 1 }]), group("claude", "sess-2", [{ id: "b1", rev: 2 }])]);
+    await refreshVerdicts(store);
+    const pre = await verify(store);
+    expect(pre.ok).toBe(false);
+    expect(pre.counts.undrained).toBe(1);
+    const summary = await run(store);
+    expect(summary.objects.drained).toBe(1);
+    expect(summary.lines).toEqual({ candidate: 3, written: 3, fenced: 0, stale: 0, already_stored: 0, materialized: 3, revision_conflict: 0, not_kept: 0 });
+    expect(summary.sessions_written).toBe(2);
+    const lines = await canonical(store);
+    expect(lines.get("sess-1")).toEqual(["a1@1", "a2@1"]);
+    expect(lines.get("sess-2")).toEqual(["b1@2"]);
+    // The index is unchanged (already the slot's entry).
+    expect(await storedEntry(store, "b1")).toEqual([2, "b1:r2", sha("b1:2"), SESS2, 0, 0]);
+    const proof = await verify(store);
+    expect(proof.failures).toEqual([]);
+    expect(proof).toMatchObject({ ok: true, exact: 3, superseded_later: 0 });
+  });
+
+  test("the verifier fails a drain that marked the backlog without canonical bytes (the pre-fix outcome)", async () => {
+    const store = await scratch();
+    await fullSlots(store, [{ id: "a1", rev: 1 }, { id: "a2", rev: 1 }]);
+    const key = await stage(store, [group("claude", "sess-1", [{ id: "a1", rev: 1 }, { id: "a2", rev: 1 }])]);
+    await refreshVerdicts(store);
+    // What main's drain left behind: every line already_stored, the object marked drained, nothing canonical.
+    await store.put(objectKey(key + DRAINED_SUFFIX), enc.encode(JSON.stringify({ v: 1, kind: "buffered-drained", outcome: "drained" })));
+    const proof = await verify(store);
+    expect(proof.ok).toBe(false);
+    expect(proof.counts.missing).toBe(2);
+    expect(proof.exact).toBe(0);
+  });
+
+  test("replay: a re-drain writes nothing, keeps every manifest revision, and the proof stays exact", async () => {
+    const store = await scratch();
+    await fullSlots(store, [{ id: "a1", rev: 1 }, { id: "a2", rev: 1 }]);
+    const key = await stage(store, [group("claude", "sess-1", [{ id: "a1", rev: 1 }, { id: "a2", rev: 1 }])]);
+    await run(store);
+    const keys = await allKeys(store);
+    const revisions = await manifestRevisions(store);
+    const again = await run(store);
+    expect(again.objects.already_drained).toBe(1);
+    expect(await allKeys(store)).toEqual(keys);
+    // A crash before the marker: the rerun finds the lines canonical (already_stored), writes none.
+    await store.delete(objectKey(key + DRAINED_SUFFIX));
+    const resumed = await run(store);
+    expect(resumed.objects.drained).toBe(1);
+    expect(resumed.lines).toMatchObject({ written: 0, materialized: 0, already_stored: 2 });
+    expect(await manifestRevisions(store)).toEqual(revisions);
+    expect((await canonical(store)).get("sess-1")).toEqual(["a1@1", "a2@1"]);
+    expect(await verify(store)).toMatchObject({ ok: true, exact: 2 });
+  });
+
+  test("replay of the same batch under a new claim (a duplicate stage) never duplicates a canonical line", async () => {
+    const store = await scratch();
+    await fullSlots(store, [{ id: "a1", rev: 1 }]);
+    await stage(store, [group("claude", "sess-1", [{ id: "a1", rev: 1 }])], { batch: "batch-x" });
+    await run(store);
+    await stage(store, [group("claude", "sess-1", [{ id: "a1", rev: 1 }])], { batch: "batch-y" });
+    const second = await run(store);
+    expect(second.lines).toMatchObject({ written: 0, materialized: 0, already_stored: 1 });
+    expect((await canonical(store)).get("sess-1")).toEqual(["a1@1"]);
+    expect(await verify(store)).toMatchObject({ ok: true, exact: 1 });
+  });
+
+  test("supersession: the newer revision wins and an older revision never overwrites it, in either drain order", async () => {
+    for (const order of ["old-first", "new-first"] as const) {
+      const store = await scratch();
+      // The slot names revision 3 (SQL's current); the backlog holds revisions 2 and 3.
+      await fullSlots(store, [{ id: "r", rev: 3 }]);
+      const old = () => stage(store, [group("claude", "sess-1", [{ id: "r", rev: 2 }])]);
+      const neu = () => stage(store, [group("claude", "sess-1", [{ id: "r", rev: 3 }])]);
+      if (order === "old-first") { await old(); await run(store); await neu(); await run(store); }
+      else { await neu(); await run(store); await old(); await run(store); }
+      expect((await canonical(store)).get("sess-1")).toEqual(["r@3"]);
+      expect(await storedEntry(store, "r")).toEqual([3, "r:r3", sha("r:3"), SESS1, 0, 0]);
+      const proof = await verify(store);
+      expect(proof.failures).toEqual([]);
+      expect(proof).toMatchObject({ ok: true, exact: 1 });
+    }
+  });
+
+  test("supersession: within one stage the higher revision is materialized and the lower one is stale", async () => {
+    const store = await scratch();
+    await fullSlots(store, [{ id: "r", rev: 5 }]);
+    await stage(store, [group("claude", "sess-1", [{ id: "r", rev: 4 }, { id: "r", rev: 5 }])]);
+    const summary = await run(store);
+    expect(summary.lines).toMatchObject({ stale: 1, materialized: 1, written: 1 });
+    expect((await canonical(store)).get("sess-1")).toEqual(["r@5"]);
+    expect(await verify(store)).toMatchObject({ ok: true, exact: 1 });
+  });
+
+  test("supersession: a later admission's higher revision is never overwritten by the backlog", async () => {
+    const store = await scratch();
+    await fullSlots(store, [{ id: "r", rev: 2 }]);
+    // The S3 path admitted revision 7 after the marker (its index entry is the claim's).
+    await seedIndex(store, [{ recordId: "r", revision: 7, revisionId: "r:r7", digest: sha("r:7"), sessionKey: SESS1, epoch: 0, resets: 0 }]);
+    await stage(store, [group("claude", "sess-1", [{ id: "r", rev: 2 }])]);
+    const summary = await run(store);
+    expect(summary.lines).toMatchObject({ stale: 1, written: 0, materialized: 0 });
+    expect(await storedEntry(store, "r")).toEqual([7, "r:r7", sha("r:7"), SESS1, 0, 0]);
+    expect(await verify(store)).toMatchObject({ ok: true, exact: 0, superseded_later: 1 });
+  });
+
+  test("erase: deleted sessions, lines SQL does not keep, and not-live or unacknowledged stages are never materialized nor resurrected", async () => {
+    const store = await scratch();
+    // The FULL seeded every slot, including sessions erased since (index entries the fence later forgets).
+    await fullSlots(store, [{ id: "k1", rev: 1 }, { id: "nk", rev: 1 }, { id: "e1", rev: 1, session: "sess-2" }, { id: "nl", rev: 1 }, { id: "ua", rev: 1 }]);
+    await putFence(store, { deletions: [{ originId: ORIGIN, sessions: [["claude", "sess-2"]] }] });
+    const keep = await stage(store, [group("claude", "sess-1", [{ id: "k1", rev: 1 }, { id: "nk", rev: 1 }]), group("claude", "sess-2", [{ id: "e1", rev: 1 }])], { keep: [[0], [0]] });
+    await stage(store, [group("claude", "sess-1", [{ id: "nl", rev: 1 }])], { live: false });
+    await stage(store, [group("claude", "sess-1", [{ id: "ua", rev: 1 }])], { accepted: false });
+    const summary = await run(store);
+    expect(summary.lines).toMatchObject({ written: 1, materialized: 1, fenced: 1, not_kept: 1 });
+    expect(summary.objects).toMatchObject({ drained: 1, stage_not_live: 1, stage_unacknowledged: 1 });
+    const lines = await canonical(store);
+    expect(lines.get("sess-1")).toEqual(["k1@1"]);
+    expect(lines.has("sess-2")).toBe(false);
+    const proof = await verify(store);
+    expect(proof.failures).toEqual([]);
+    expect(proof).toMatchObject({ ok: true, exact: 1, excluded_absent: 4 });
+    // Resurrection: a rerun after a lost marker writes none of them.
+    await store.delete(objectKey(keep + DRAINED_SUFFIX));
+    const again = await run(store);
+    expect(again.lines).toMatchObject({ written: 0, materialized: 0 });
+    expect((await canonical(store)).get("sess-1")).toEqual(["k1@1"]);
+    expect((await canonical(store)).has("sess-2")).toBe(false);
+    expect(await verify(store)).toMatchObject({ ok: true, exact: 1 });
+  });
+
+  test("erase: a session deleted after an earlier drain of it is reported erased_present until the eraser removes it", async () => {
+    const store = await scratch();
+    await fullSlots(store, [{ id: "e1", rev: 1, session: "sess-2" }]);
+    await stage(store, [group("claude", "sess-2", [{ id: "e1", rev: 1 }])]);
+    await run(store);
+    expect(await verify(store)).toMatchObject({ ok: true, exact: 1 });
+    await putFence(store, { deletions: [{ originId: ORIGIN, sessions: [["claude", "sess-2"]] }] });
+    const proof = await verify(store);
+    expect(proof.ok).toBe(false);
+    expect(proof.counts.erased_present).toBe(1);
+  });
+
+  test("the verifier refuses an org without its accepted-stage export completion", async () => {
+    const store = await scratch({ exportComplete: false });
+    expect(await verify(store)).toMatchObject({ ok: false, counts: { export_missing: 1 } });
+  });
+
+  test("the verifier refuses an excluded line, a changed record, and an unreadable chunk", async () => {
+    const store = await scratch();
+    await fullSlots(store, [{ id: "k1", rev: 1 }, { id: "nk", rev: 1 }]);
+    await stage(store, [group("claude", "sess-1", [{ id: "k1", rev: 1 }, { id: "nk", rev: 1 }])], { keep: [[0]] });
+    await run(store);
+    expect(await verify(store)).toMatchObject({ ok: true, exact: 1, excluded_absent: 1 });
+    const target = { store, keyRoot: ROOT };
+    const batch = { ...TENANT, originId: ORIGIN };
+    // A line SQL does not keep, written by another path.
+    await writeGroups(target, { ...batch, batchDigest: sha("rogue-1") }, [group("claude", "sess-1", [{ id: "nk", rev: 1 }])], new Date(RECEIVED));
+    expect((await verify(store)).counts.erased_present).toBe(1);
+    // The same record and revision with other content.
+    const other = group("claude", "sess-1", [{ id: "k1", rev: 1 }]);
+    other.lines = other.lines.map((l) => l.replace("t-k1-1", "changed"));
+    await writeGroups(target, { ...batch, batchDigest: sha("rogue-2") }, [other], new Date(RECEIVED));
+    const changed = await verify(store);
+    expect(changed.counts.mismatch).toBe(1);
+    expect(changed.counts.unexpected).toBe(1);
+    // A listed chunk gone: unreadable, never "absent".
+    const chunk = (await allKeys(store, `${ROOT}/${TENANT.orgId}/v1`)).find((k) => k.includes("/raw/"))!;
+    await store.delete(objectKey(chunk));
+    expect((await verify(store)).counts.unreadable).toBeGreaterThan(0);
+  });
+
+  test("a drain over an unreadable canonical session leaves the object for a rerun (canonical_unreadable), never marked", async () => {
+    const store = await scratch();
+    await fullSlots(store, [{ id: "a1", rev: 1 }]);
+    await stage(store, [group("claude", "sess-1", [{ id: "a0", rev: 1 }])], { batch: "first" });
+    await run(store);
+    const chunk = (await allKeys(store, `${ROOT}/${TENANT.orgId}/v1`)).find((k) => k.includes("/raw/"))!;
+    await store.delete(objectKey(chunk));
+    const key = await stage(store, [group("claude", "sess-1", [{ id: "a1", rev: 1 }])], { batch: "second" });
+    const summary = await run(store);
+    expect(summary.objects.canonical_unreadable).toBe(1);
+    expect(await exists(store, key + DRAINED_SUFFIX)).toBe(false);
   });
 });
