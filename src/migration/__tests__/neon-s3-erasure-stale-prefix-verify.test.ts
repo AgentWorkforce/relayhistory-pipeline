@@ -942,6 +942,56 @@ describe("issuance after signing (eraser request path)", () => {
     }
   });
 
+  test("job: slow abort-signal construction on DELETE 1 (2.101 s, after signing) is seen by the final gate: zero DELETE fetches, not_attempted, unchanged row; fast control erases", async () => {
+    for (const slow of [true, false]) {
+      const f = await fixture();
+      const m = f.dateMove();
+      const receipt = await f.verify();
+      const real = AbortSignal.timeout;
+      let armed = false, built = 0;
+      // Signing a DELETE arms the stub; that DELETE's signal construction then takes 2.101 s on the job's clock.
+      const fence = f.s.eraser({ signer: async (args) => { await signRequest(args); if (args.method === "DELETE") armed = true; } });
+      AbortSignal.timeout = ((ms: number) => {
+        if (armed) { armed = false; built++; if (slow) f.clock.now += 2_101; else f.clock.now += 100; }
+        return real.call(AbortSignal, ms);
+      }) as typeof AbortSignal.timeout;
+      const before = f.row(m.oldP);
+      let r: Awaited<ReturnType<typeof f.execute>>;
+      try { r = await f.execute(receipt, { fence }); } finally { AbortSignal.timeout = real; }
+      const rep = r.fenced![0]!;
+      if (slow) {
+        expect(built).toBe(1);
+        expect(f.s.deletes).toEqual([]); // the signal was built, the gate then refused: never fetched
+        expect(rep).toMatchObject({ outcome: "refused_before_delete", reason: "stale_prefix_deadline", deleted: 0 });
+        expect(rep.versions.every((v) => v.outcome === "not_attempted")).toBe(true);
+        expect(f.row(m.oldP)).toEqual(before);
+        expect(f.s.count(m.oldP)).toBe(3);
+      } else {
+        expect(built).toBe(3);
+        expect(r).toMatchObject({ ok: true, erased: 1 });
+        expect(f.s.deletes).toHaveLength(3);
+      }
+    }
+  });
+
+  test("adapter: the gate runs AFTER the abort timer is armed, and the armed full deadline must fit the time left (refused unsent, never shortened)", async () => {
+    for (const [left, sent] of [[29_999, false], [30_000, true]] as const) {
+      const s = new FakeS3Versions();
+      const key = "t/x/a.json", id = s.put(key);
+      const real = AbortSignal.timeout;
+      const order: string[] = [];
+      AbortSignal.timeout = ((ms: number) => { order.push(`signal:${ms}`); return real.call(AbortSignal, ms); }) as typeof AbortSignal.timeout;
+      const dispatch: { phase?: string } = {};
+      let err: unknown;
+      try {
+        await s.eraser({ requestDeadlineMs: 30_000 }).deleteVersion(key, id, { beforeFetch: () => (order.push("gate"), left), dispatch });
+      } catch (e) { err = e; } finally { AbortSignal.timeout = real; }
+      expect(order).toEqual(["signal:30000", "gate"]);
+      if (sent) { expect(err).toBeUndefined(); expect(s.deletes).toHaveLength(1); expect(dispatch.phase).toBe("dispatched"); }
+      else { expect(err).toMatchObject({ code: "stale_prefix_deadline", notSent: true }); expect(s.deletes).toEqual([]); expect(dispatch.phase).toBe("preparing"); }
+    }
+  });
+
   test("ambiguous DELETE: the diagnostic relist goes through the same gate; gated past the deadline it records unknown and issues no further request", async () => {
     const f = await fixture();
     const m = f.dateMove();
