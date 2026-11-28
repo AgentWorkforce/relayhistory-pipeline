@@ -568,14 +568,35 @@ positive erasure set is not wired to a mode. Only the empty-window path above is
 - **Replay (`replayErasures`).** It replays until the count is unchanged across a pass that found
   nothing new:
   - A user erase maps to that user's S3 fence reset (`resetUploadedSessions`, keyed by the request id),
-    then `eraseLogPayloads`.
+    then `eraseGenerationLogPayloads` at the request's bound generation: only payloads of batches admitted
+    below it, in every stream of the user. Never the unconditional `eraseLogPayloads`: a retry after release
+    finds the reset known (a no-op) but an unconditional erase would still delete post-release uploads.
   - A user erase replays only once the SQL erase reached `bytes_verified`. That is the artifact lane's
     own byte receipt, a separate prerequisite. Until then the replay returns `erasure_bytes_unverified`
     and writes no receipt.
-  - Even after `bytes_verified`, a user erase also needs a proven generation boundary
-    (`userGenerationBoundary`): a late old write cannot survive the replay, and a replay after release
-    keeps new uploads. No such proof exists yet, so every user erase returns
-    `erasure_generation_unproven`, with no effect and no receipt, and `bridge_complete` stays held.
+  - Even after `bytes_verified`, a user erase also needs a proven generation
+    (`src/session-ingest/user-erase-generation.ts`). Its generation is the user's S3-fence reset ordinal
+    that the request's own begin CAS bound (`FenceDoc.resetOrdinals`, written only by the S3 ledger's
+    `applyReset`; copies of SQL's resets by the backfill or the control mirror get none and are never
+    proven). Two separate checks:
+    - **Pre-effect**, before any write: the erase was recorded strictly after the hold's install (one
+      before it is `generation_pre_install`, one within 5 s of it `generation_ambiguous`; timestamps
+      only ever refuse), the hold is sealed with its FULL bound (started after the install, by the seal),
+      the SQL erase ran against this key root, no reset is pending, R is either not yet begun in the fence
+      or begun with its ordinal, and the evidence port `admissionFencedBefore` shows the SQL, direct and
+      fallback admission paths were all fenced before R. **That port is not built**: until it is, every
+      user erase stays `erasure_generation_unproven`.
+    - **Post-effect**, after the reset and the scoped payload erase: a create-only receipt at
+      `96bulls/.ledger/hold-bridge/<org>/<epoch>/generations/<hash of the request>.json` (hashes, counts,
+      the key root and epoch only) once every byte class of the user is empty below the generation:
+      no old owner stub the reset missed, no old log payload in any stream, every re-arm marker swept
+      (a done record for its exact bytes: a paused pre-reset write that commits after the reset is
+      re-armed, and holds the proof until swept), no publication generation and no admission-inbox body
+      for the user's machines. A retry re-derives the receipt and must match it; so does
+      `bridgeCompleteVerdict`. The erasure receipt is written only after it.
+    - Open, stated: the `admissionFencedBefore` evidence source; the publication-generation check lists
+      the org's whole `upload-generations/` prefix; a session re-enabled after release makes a later
+      re-derivation refuse (the gate runs before release, so it only blocks a post-release retry).
   - A session erase maps to the S3 fence deletion (`setSessionUploads`, `enabled: false`) of every
     target in a complete erase manifest: every alias, for every owner, at every recorded origin, the
     turns origin included. S3 owner stubs can be partial: the SQL erase unions owners from ownership,

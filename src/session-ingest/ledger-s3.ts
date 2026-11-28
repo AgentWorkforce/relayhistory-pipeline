@@ -210,6 +210,16 @@ export interface FenceDoc {
   epochs: Record<string, Record<string, number>>;
   /** A reset's request id: null while it runs, then the count it tombstoned (a replay answers it). */
   resetRequests: Record<string, number | null>;
+  /**
+   * A reset's generation ordinal, for resets begun HERE by s3Ledger's applyReset (S3 is the authority): the `resets`
+   * value its own begin CAS produced (applyFenceChange `bindOrdinal`, the same edit that records the request id), never
+   * rewritten. It is the only durable request -> generation binding: a finished
+   * request's `resetRequests` value is the count it tombstoned (shared by every reset finished in the same CAS), and
+   * `resets` / `resetsCompleted` move on, so neither can reconstruct it later. Absent for every copy of SQL's resets (the
+   * backfill, the control mirror's finishOrdered) and for every reset begun before this field existed: those requests have
+   * no proven generation (user-erase-generation.ts refuses them). Keys are a subset of `resetRequests`.
+   */
+  resetOrdinals?: Record<string, number>;
   ordered?: OrderedMark;
   /**
    * The Worker's fence mirror (s3ControlMirror) with SQL as the ORDERING authority: an ordered disable or reset is
@@ -330,6 +340,19 @@ const mapKey = (v: unknown): v is string => str(v) && v !== "__proto__";
 const own = <T>(o: Record<string, T>, k: string): T | undefined => (Object.hasOwn(o, k) ? o[k] : undefined);
 const exactKeys = (o: Record<string, unknown>, keys: string[]) => Object.keys(o).length === keys.length && keys.every((k) => Object.hasOwn(o, k));
 
+/**
+ * `resetOrdinals`: every key a recorded request, every value an ordinal 1..resets, and no two requests sharing one (each
+ * begin CAS adds exactly one to `resets`, so a repeated ordinal is a forged or corrupt fence).
+ */
+function validResetOrdinals(o: unknown, requests: Record<string, unknown>, resets: number): boolean {
+  if (!isObject(o) || Object.hasOwn(o, "__proto__")) return false;
+  const seen = new Set<number>();
+  for (const [k, n] of Object.entries(o)) {
+    if (!Object.hasOwn(requests, k) || !count(n) || (n as number) < 1 || (n as number) > resets || seen.has(n as number)) return false;
+    seen.add(n as number);
+  }
+  return true;
+}
 export function validFence(v: unknown): v is FenceDoc {
   if (!isObject(v) || (v.v !== 1 && v.v !== 2) || typeof v.instance !== "string" || !TOKEN.test(v.instance) || !count(v.version) || !count(v.resets) || !count(v.lastResetAtMs)
     || !isObject(v.deleted) || !isObject(v.epochs) || !isObject(v.resetRequests)) return false;
@@ -341,6 +364,7 @@ export function validFence(v: unknown): v is FenceDoc {
   if (!Object.values(v.deleted).every((list) => Array.isArray(list) && list.every(pairOk))) return false;
   if (!Object.values(v.epochs).every((m) => isObject(m) && Object.entries(m).every(([k, n]) => HEX32.test(k) && count(n)))) return false;
   if (!Object.values(v.resetRequests).every((n) => n === null || count(n))) return false;
+  if (v.resetOrdinals !== undefined && !validResetOrdinals(v.resetOrdinals, v.resetRequests, v.resets)) return false;
   const ctl = (t: unknown) => Array.isArray(t) && t.length === 2 && str(t[0]) && typeof t[1] === "string" && /^[1-9][0-9]{0,18}$/.test(t[1]);
   if (v.pending !== undefined && !(isObject(v.pending) && !Object.hasOwn(v.pending, "__proto__") && Object.values(v.pending).every((p) => isObject(p)
     && ((p.kind === "selection" && mapKey(p.originId) && Array.isArray(p.sessions) && p.sessions.every(pairOk)) || (p.kind === "reset" && mapKey(p.requestId)))
@@ -453,7 +477,7 @@ export interface FenceChange {
    * final count (an already finished reset, e.g. the backfill copying SQL's) and no other reset still running,
    * `resetsCompleted` follows `resets`: the caller applies that reset's tombstones in the same edit.
    */
-  reset?: { requestId: string; atMs: number; result: number | null };
+  reset?: { requestId: string; atMs: number; result: number | null; bindOrdinal?: boolean };
 }
 export interface FenceChangeResult { changed: boolean; newlyDeleted: [string, string, string][]; reset: "recorded" | "known" | null }
 
@@ -486,6 +510,12 @@ export function applyFenceChange(fence: FenceDoc, change: FenceChange): FenceCha
     else {
       fence.resetRequests[requestId] = result;
       fence.resets += 1;
+      // The S3-authoritative begin binds the request to the generation it opens, in this same CAS
+      // (FenceDoc.resetOrdinals). Copies of SQL's resets (the backfill, the control mirror) never do.
+      if (change.reset.bindOrdinal === true) {
+        if (result !== null) throw new LedgerUnavailableError("ledger_input_refused");
+        (fence.resetOrdinals ??= {})[requestId] = fence.resets;
+      }
       fence.lastResetAtMs = Math.max(fence.lastResetAtMs, atMs);
       if (result !== null && !Object.values(fence.resetRequests).includes(null)) fence.resetsCompleted = fence.resets;
       reset = "recorded";
@@ -1065,7 +1095,7 @@ export function s3Ledger(store: ObjectStore, keyRoot: string, opts: S3LedgerOpti
       if (typeof prior === "number") return { next: control && finishOrdered(f, control, prior) ? f : null, result: { outcome: "replay" as const, result: prior } };
       // Begun by an earlier attempt that stopped part way: finish it (the ordered mark, if any, is kept).
       if (prior === null) return { next: control ? f : null, result: "apply" as const };
-      applyFenceChange(f, { reset: { requestId, atMs, result: null } });
+      applyFenceChange(f, { reset: { requestId, atMs, result: null, bindOrdinal: true } });
       resetsSeen = f.resets;
       return { next: f, result: "apply" as const };
     });

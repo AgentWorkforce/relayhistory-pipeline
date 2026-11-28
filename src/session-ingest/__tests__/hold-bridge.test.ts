@@ -2,7 +2,7 @@
  * The admission hold's bridge side (src/session-ingest/hold-bridge.ts; docs/design/org-admission-hold.md section 6.1
  * and 6.2): the lifecycle adapter, the erasure set against the real schema (PGlite), the receipted replay, the
  * bridge_complete gate, waves and alarms. Each erase mapping is traced: operator_user_erasures -> the user's S3 fence
- * reset plus eraseLogPayloads; session_erasure_fences -> the session's S3 fence deletion for every owner.
+ * reset plus the generation-scoped payload erase (user-erase-generation.ts); session_erasure_fences -> the session's S3 fence deletion for every owner.
  */
 import { afterEach, expect, setDefaultTimeout, test } from "bun:test";
 import { PGlite } from "@electric-sql/pglite";
@@ -35,6 +35,9 @@ import {
   type Hold,
 } from "../hold-bridge.ts";
 import { applySupabaseSchema } from "./pglite-schema.ts";
+import { s3Ledger } from "../ledger-s3.ts";
+import type { GenerationPorts } from "../user-erase-generation.ts";
+import type { UserGeneration } from "../hold-bridge.ts";
 import { scratchStore } from "./support.ts";
 
 setDefaultTimeout(300_000);
@@ -138,13 +141,23 @@ test("erasure set rows are shape-checked", () => {
 
 const userErase: Erasure = { kind: "user", requestId: "req-1", workspaceId: "ws-1", userId: "user-1", atMs: NOW, bytesVerified: true };
 const sessionErase: Erasure = { kind: "session", requestId: "session\nws-2\nclaude\nsess-1", workspaceId: "ws-2", source: "claude", sessionId: "sess-1", atMs: NOW };
+/** The user-erase generation proof's ports over `store` (user-erase-generation.ts): a sealed hold, a bound FULL. */
+export function generationDeps(store: ObjectStore, over: Partial<GenerationPorts> = {}, epoch = E): UserGeneration {
+  return {
+    ports: { store, eraseKeyRoot: ROOT, now: () => NOW, userOrigins: async () => [], admissionFencedBefore: async () => ({ sql: true, direct: true, fallback: true }), ...over },
+    binding: (tenant, e) => ({ keyRoot: ROOT, tenant, requestId: e.requestId, epoch,
+      hold: { state: "marker_attempted", installedMs: NOW - 3_600_000, sealedMs: NOW - 1_800_000 },
+      full: { run: "full-run-1", startedMs: NOW - 2_700_000, evidenceSha256: SHA }, erasure: { atMs: e.atMs, bytesVerified: e.bytesVerified } }),
+  };
+}
 function deps(store: ObjectStore, over: Record<string, unknown> = {}) {
   const calls: unknown[][] = [];
+  const ledger = s3Ledger(store, ROOT, { sleep: async () => {} });
   return { calls, d: {
     store, keyRoot: ROOT, org: ORG, epoch: E, now: () => NOW,
-    resetUploadedSessions: async (t: LedgerTenant, r: string) => { calls.push(["reset", t, r]); return 3; },
-    eraseLogPayloads: async (t: LedgerTenant) => { calls.push(["logs", t]); return 2; },
-    userGenerationBoundary: async () => true,
+    resetUploadedSessions: async (t: LedgerTenant, r: string) => { calls.push(["reset", t, r]); await ledger.resetUploadedSessions(t, r); return 3; },
+    eraseGenerationLogPayloads: async (t: LedgerTenant, g: number) => { calls.push(["logs", t, g]); return 2; },
+    generation: generationDeps(store),
     setSessionUploads: async (i: SelectionInput) => { calls.push(["fence", i]); },
     resolveSessionTargets: async () => ({ complete: true, targets: [{ userId: "user-a", originId: "origin-a", source: "claude", sessionId: "sess-1" },
       { userId: "user-b", originId: "origin-b", source: "claude", sessionId: "sess-1" }] }),
@@ -152,20 +165,21 @@ function deps(store: ObjectStore, over: Record<string, unknown> = {}) {
   } };
 }
 
-test("replay, user erase -> the user's S3 fence reset (keyed by the request) and eraseLogPayloads; one create-only receipt", async () => {
+test("replay, user erase -> the user's S3 fence reset (keyed by the request) and the generation-scoped payload erase; one create-only receipt", async () => {
   const store = fresh();
   const { d, calls } = deps(store);
   expect(await replayErasure(d, userErase)).toBe("replayed");
   const tenant = { orgId: ORG, workspaceId: "ws-1", userId: "user-1" };
-  expect(calls).toEqual([["reset", tenant, "req-1"], ["logs", tenant]]);
+  expect(calls).toEqual([["reset", tenant, "req-1"], ["logs", tenant, 1]]);
   const receipt = JSON.parse(new TextDecoder().decode(await readAll((await store.getObject(objectKey(erasureReceiptKey(ROOT, ORG, E, "req-1")))).body)));
   expect(receipt).toEqual({ v: 1, kind: "hold-bridge-erasure", epoch: E, request: requestHash("req-1"), erasure: "user", counts: { reset: 3, payloads: 2, owners: 0 }, appliedAtMs: NOW });
   expect(JSON.stringify(receipt)).not.toContain("user-1");
   // A retry: already receipted, nothing re-applied.
   expect(await replayErasure(d, userErase)).toBe("already");
   expect(calls.length).toBe(2);
-  // The same request under another epoch is a separate replay.
-  expect(await replayErasure({ ...d, epoch: E2 }, userErase)).toBe("replayed");
+  // The same request under another epoch is a separate replay, with its own binding (never the first epoch's).
+  expect(await replayErasure({ ...d, epoch: E2 }, userErase)).toBe("erasure_generation_unproven");
+  expect(await replayErasure({ ...d, epoch: E2, generation: generationDeps(store, {}, E2) }, userErase)).toBe("replayed");
   expect(erasureReceiptKey(ROOT, ORG, E, "req-1")).toBe(`${ROOT}/.ledger/hold-bridge/${ORG}/${E}/erasures/${requestHash("req-1")}.json`);
   expect(erasureReceiptKey(ROOT, ORG, E, "req-1")).not.toContain("req-1");
 });
@@ -209,8 +223,10 @@ test("replay, user erase before the SQL erase reached bytes_verified: no effect,
   expect(calls).toEqual([]);
 });
 
-test("replay, user erase without a proven generation boundary (today: none exists): held even after bytes_verified", async () => {
-  for (const over of [{ userGenerationBoundary: undefined }, { userGenerationBoundary: async () => false }, { userGenerationBoundary: async () => { throw new Error("x"); } }]) {
+test("replay, user erase without a proven generation (no ports, admission unproven or a throwing port): held even after bytes_verified", async () => {
+  for (const over of [{ generation: undefined }, { generation: generationDeps(fresh(), { admissionFencedBefore: undefined }) },
+    { generation: generationDeps(fresh(), { admissionFencedBefore: async () => ({ sql: true, direct: false, fallback: true }) }) },
+    { generation: generationDeps(fresh(), { admissionFencedBefore: async () => { throw new Error("x"); } }) }]) {
     const store = fresh();
     const { d, calls } = deps(store, over);
     const outcome = await replayErasure(d, userErase);
@@ -224,7 +240,7 @@ test("a pre-seeded receipt never bypasses a missing proof, on the replay path or
   const store = fresh();
   const { d } = deps(store);
   expect(await replayErasure(d, userErase)).toBe("replayed"); // a receipt now exists (as if pre-seeded)
-  const noGen = { ...d, userGenerationBoundary: undefined };
+  const noGen = { ...d, generation: undefined };
   // Replay path: verified bytes but no generation proof -> refused before the receipt is read.
   expect(await replayErasure(noGen, userErase)).toBe("erasure_generation_unproven");
   expect(await replayErasure(d, { ...userErase, bytesVerified: false })).toBe("erasure_bytes_unverified");
@@ -250,7 +266,7 @@ test("an INSTALLED resolver with an invalid plan plus a pre-seeded receipt: refu
 });
 
 test("replay failures write no receipt (retried later); a corrupt receipt is never taken as done", async () => {
-  for (const over of [{ resetUploadedSessions: async () => { throw new Error("s3 503 secret"); } }, { eraseLogPayloads: async () => { throw new Error("unverified"); } }]) {
+  for (const over of [{ resetUploadedSessions: async () => { throw new Error("s3 503 secret"); } }, { eraseGenerationLogPayloads: async () => { throw new Error("unverified"); } }]) {
     const store = fresh();
     const { d } = deps(store, over);
     expect(await replayErasure(d, userErase)).toBe("replay_failed");
@@ -267,7 +283,7 @@ test("replay failures write no receipt (retried later); a corrupt receipt is nev
   const realPut = raced.put.bind(raced);
   let first = true;
   raced.put = (async (...a: Parameters<ObjectStore["put"]>) => {
-    if (first) { first = false; await realPut(a[0], a[1], { contentType: "application/json" }); throw new ObjectStoreError("precondition_failed", "s3", "exists", { status: 412 }); }
+    if (first && String(a[0]) === erasureReceiptKey(ROOT, ORG, E, "req-1")) { first = false; await realPut(a[0], a[1], { contentType: "application/json" }); throw new ObjectStoreError("precondition_failed", "s3", "exists", { status: 412 }); }
     return realPut(...a);
   }) as ObjectStore["put"];
   expect(await replayErasure(d, userErase)).toBe("already");

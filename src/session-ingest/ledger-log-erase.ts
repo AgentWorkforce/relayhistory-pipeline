@@ -174,8 +174,15 @@ export async function eraseLogPayloads(store: ObjectStore, keyRoot: string, tena
 
 /** One stream's superseded payloads (the module header's cost list): `p/` first, and nothing more when it is empty. */
 async function eraseSupersededIn(store: ObjectStore, keys: LogKeys, resets: number): Promise<number> {
+  const targets = await supersededIn(store, keys, resets);
+  await deleteVerified(store, targets);
+  return targets.length;
+}
+
+/** The present payloads of `keys`' unapplied batches admitted below `resets` that no live batch also names. Read-only. */
+async function supersededIn(store: ObjectStore, keys: LogKeys, resets: number): Promise<string[]> {
   const present = new Set(await listKeysUnder(store, keys.payloads));
-  if (present.size === 0) return 0;
+  if (present.size === 0) return [];
   // A lower bound: reading from below the true cursor reads more entries, never skips an unapplied one. A superseded
   // batch that is in fact applied already had its payload written (or skipped) and dropped (or about to be): deleting
   // it is the materializer's own next step.
@@ -195,9 +202,7 @@ async function eraseSupersededIn(store: ObjectStore, keys: LogKeys, resets: numb
     }
   }
   // Only payloads the listing found: one written after it is the "Ordering" window (never written, deleted at apply).
-  const targets = [...doomed].filter((k) => !live.has(k) && present.has(k));
-  await deleteVerified(store, targets);
-  return targets.length;
+  return [...doomed].filter((k) => !live.has(k) && present.has(k)).sort();
 }
 
 /**
@@ -209,4 +214,25 @@ export async function eraseSupersededLogPayloads(store: ObjectStore, keyRoot: st
   if (!Number.isSafeInteger(resets) || resets < 0) throw new LedgerUnavailableError("ledger_input_refused");
   if (resets === 0) return 0;
   return eachStream(opts, await reported(opts, undefined, () => userLogStreams(store, keyRoot, tenant)), (keys) => eraseSupersededIn(store, keys, resets));
+}
+
+/**
+ * The GENERATION-SCOPED whole-user payload erase (user-erase-generation.ts): the payloads of every unapplied batch of
+ * the user admitted below `generation` (a reset's bound ordinal, FenceDoc.resetOrdinals), in EVERY stream of the user
+ * (the index's and any its log directory holds, as eraseLogPayloads), and nothing admitted at or above it, so a replay
+ * of an old erase never deletes a post-erase upload. A payload a live batch also names is kept. Fail closed as the
+ * others. Returns how many were deleted.
+ */
+export async function eraseGenerationLogPayloads(store: ObjectStore, keyRoot: string, tenant: LedgerTenant, generation: number, opts: LogEraseOptions = {}): Promise<number> {
+  if (!Number.isSafeInteger(generation) || generation < 1) throw new LedgerUnavailableError("ledger_input_refused");
+  return eachStream(opts, await reported(opts, undefined, () => everyUserLogStream(store, keyRoot, tenant)), (keys) => eraseSupersededIn(store, keys, generation));
+}
+
+/**
+ * Read-only completion evidence for eraseGenerationLogPayloads: how many payloads of batches admitted below
+ * `generation` are still present, across every stream of the user. Any fault throws (retryable), never zero.
+ */
+export async function generationLogPayloadsRemaining(store: ObjectStore, keyRoot: string, tenant: LedgerTenant, generation: number, opts: LogEraseOptions = {}): Promise<number> {
+  if (!Number.isSafeInteger(generation) || generation < 1) throw new LedgerUnavailableError("ledger_input_refused");
+  return eachStream(opts, await reported(opts, undefined, () => everyUserLogStream(store, keyRoot, tenant)), async (keys) => (await supersededIn(store, keys, generation)).length);
 }
