@@ -616,6 +616,13 @@ async function captureSearchPreRead(scope: SessionScope, deps: SearchIndexDeps, 
   return { stamp: captured.stamp, siblingKeys: captured.siblingKeys, at, version, fromMs, s3, ...(scan ? { scan } : {}) };
 }
 
+/** The prepared read the base path hands to the streamed reconcile (its own reads run under the locks). */
+function streamableTooLarge(prepared: SearchPreRead, deps: SearchIndexDeps): boolean {
+  const s3 = prepared.s3;
+  return !!deps.stream && prepared.siblingKeys.length > 0 && !!s3.partial && !!s3.admitted &&
+    s3.reasons.length === 1 && s3.reasons[0] === "scope_too_large";
+}
+
 export async function indexSearchScope(scope: SessionScope, deps: SearchIndexDeps): Promise<SearchIndexResult> {
   // These paths need their existing transaction-bound service/facts contracts. The flag is
   // accepted but deliberately leaves them on the byte-identical base path.
@@ -633,6 +640,13 @@ export async function indexSearchScope(scope: SessionScope, deps: SearchIndexDep
     if (!captured) return indexSearchScopeBase(scope, deps);
     // Busy and already-current are complete results from the SQL-only capture transaction.
     if (!isSearchPreRead(captured)) return captured;
+    // Only a COMPLETE pre-read (source + index scan) or the streamable too-large hand-off may be
+    // applied from outside the locks. Any other incomplete capture (a manifest missing or unreadable,
+    // a canonical mismatch) can be transient: the source stamp does not change when a concurrent
+    // pass reads the same pointers successfully and commits readiness, so applying the stale
+    // incompleteness would invalidate that newer readiness. Such a capture re-reads under the locks
+    // on the unmodified base path, which still marks genuine, persistent incompleteness.
+    if (captured.scan === undefined && !streamableTooLarge(captured, deps)) return indexSearchScopeBase(scope, deps);
     const prepared = captured;
     const applied = await indexSearchScopeBase(scope, deps, prepared);
     if (applied !== SEARCH_SCOPE_CHANGED) return applied;

@@ -126,9 +126,55 @@ test("an incomplete S3 pre-read changed before the lock retries and never delete
   const reader = { ...base.reader, read: (key: string) => key === missing ? Promise.resolve(null) : base.reader.read(key) };
   const raced = between({ ...base, reader }, new Map([[2, () => bumpEpoch(r)]]));
   expect(await indexSearchScope(SCOPE, raced.deps)).toMatchObject({ complete: false, inserted: 0, deleted: 0, reasons: ["manifest_missing"] });
-  expect(raced.transactions()).toBe(4);
+  // An incomplete capture is never applied from outside the locks: capture, then the locked base path.
+  expect(raced.transactions()).toBe(2);
   expect(r.fake.dump()).toEqual(before);
 });
+
+async function projectionReady(r: Awaited<ReturnType<typeof hostedRig>>): Promise<boolean[]> {
+  const { rows } = await r.db.pg.query<{ ready: boolean }>(`SELECT event_projection_ready AS ready FROM sessions.session_directory
+    WHERE org_id='org_stream' AND workspace_id='ws_stream' AND harness='claude'`);
+  return rows.map((x) => x.ready);
+}
+
+for (const stream of [false, true]) {
+  const label = stream ? "streaming on" : "streaming off";
+
+  test(`${label}: a transiently incomplete pre-read never overrides readiness a newer pass committed meanwhile`, async () => {
+    // Pipeline review of 3b9cf638: A sees manifest_missing outside the locks; before A's apply, B reads
+    // the same pointers successfully and commits event_projection_ready=true; the stamp is unchanged.
+    const { source, r } = await rig(33);
+    const base = r.search(stream ? { stream: UNLIMITED } : {});
+    const flaky = source.keys[0]!;
+    let failOnce = true;
+    const reader = { ...base.reader, read: (key: string) => {
+      if (key === flaky && failOnce) { failOnce = false; return Promise.resolve(null); }
+      return base.reader.read(key);
+    } };
+    let newer: Awaited<ReturnType<typeof indexSearchScope>> | undefined;
+    const a = between({ ...base, reader }, new Map([[2, async () => {
+      expect(failOnce).toBe(false); // A's pre-read already hit the transient miss
+      newer = await indexSearchScope(SCOPE, r.search(stream ? { stream: UNLIMITED } : {}));
+    }]]));
+    const result = await indexSearchScope(SCOPE, a.deps);
+    expect(newer).toMatchObject({ complete: true });
+    expect(result).toMatchObject({ complete: true });
+    expect((await projectionReady(r)).every(Boolean)).toBe(true);
+  });
+
+  test(`${label}: a persistently missing manifest still marks the scope incomplete under the locks`, async () => {
+    const { source, r } = await rig(33);
+    const base = r.search(stream ? { stream: UNLIMITED } : {});
+    const missing = source.keys[0]!;
+    const reader = { ...base.reader, read: (key: string) => key === missing ? Promise.resolve(null) : base.reader.read(key) };
+    const before = r.fake.dump();
+    const a = between({ ...base, reader }, new Map());
+    expect(await indexSearchScope(SCOPE, a.deps)).toMatchObject({ complete: false, inserted: 0, deleted: 0, reasons: ["manifest_missing"] });
+    expect(a.transactions()).toBe(2);
+    expect((await projectionReady(r)).some((x) => x === false)).toBe(true);
+    expect(r.fake.dump()).toEqual(before);
+  });
+}
 
 test("two same-stamp stale scans apply idempotently: no resurrected row and no lost current row", async () => {
   const { r } = await rig(33);
