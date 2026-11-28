@@ -89,6 +89,8 @@ export async function processBatch(records: readonly QueueRecord[], deps: Consum
   const byKey = new Map<string, { event: LandedEvent; messageIds: string[] }>();
   const ordered = deps.ordered;
   const now = ordered?.now ?? Date.now;
+  /** Consumer pickup: the batch arrived, before any parse or pointer work (the 7s pickup budget ends here). */
+  const pickedUpAt = now();
   const recordOf = new Map(records.map((r) => [r.messageId, r]));
   /** Every revision event behind a key, in arrival order, for the per-upload latency lines. */
   const revisionsByKey = new Map<string, { event: LandedEvent; messageId: string }[]>();
@@ -136,6 +138,8 @@ export async function processBatch(records: readonly QueueRecord[], deps: Consum
   const scopes = new Map<string, { scope: SessionScope; messageIds: string[]; manifestKey: string; revisions: Revised[] }>();
   for (const { event, messageIds } of byKey.values()) {
     const started = Date.now();
+    /** This key's pointer work starts (consumer clock). */
+    const pointerStartedAt = now();
     if (deps.bufferedFeed && isBufferedStageKey(event.key)) {
       // KEEP-UP. A delete event is a GC removal: index-row deletes are their own lane, so it is a no-op here.
       if (event.deleted) continue;
@@ -181,7 +185,7 @@ export async function processBatch(records: readonly QueueRecord[], deps: Consum
         revision: outcome.revision,
         duration_ms: Date.now() - started,
       });
-      const revisions = checkRevisions(revisionsByKey.get(event.key) ?? [], outcome, recordOf, now);
+      const revisions = checkRevisions(revisionsByKey.get(event.key) ?? [], outcome, recordOf, now, { startedAt: pointerStartedAt, doneAt: now() });
       const id = scopeId(outcome.scope);
       const held = scopes.get(id);
       if (held) { held.messageIds.push(...messageIds); held.revisions.push(...revisions); }
@@ -260,7 +264,7 @@ export async function processBatch(records: readonly QueueRecord[], deps: Consum
             stage: "search-index", org_id: scope.orgId, workspace_id: scope.workspaceId, harness: scope.harness, session_id: scope.sessionId,
             reason: result.reasons.join(","), ...phaseFields(), ...passFields(messageIds, recordOf, now), duration_ms: Date.now() - started,
           });
-          logSearchable(scope, revisions, now, passStartedAt, true);
+          logSearchable(scope, revisions, now, pickedUpAt, passStartedAt, true);
           continue;
         }
         if (result.deferred) {
@@ -297,7 +301,7 @@ export async function processBatch(records: readonly QueueRecord[], deps: Consum
           ...passFields(messageIds, recordOf, now),
           duration_ms: Date.now() - started,
         });
-        if (result.complete) logSearchable(scope, revisions, now, passStartedAt, false);
+        if (result.complete) logSearchable(scope, revisions, now, pickedUpAt, passStartedAt, false);
       } catch (error) {
         log.error("search index failed", {
           stage: "search-index",
@@ -409,6 +413,8 @@ interface Revised {
   live: boolean;
   sentAt?: number;
   receiveCount?: number;
+  /** This key's pointer work: start and completion on the consumer clock. */
+  pointer: { startedAt: number; doneAt: number };
 }
 
 /**
@@ -419,7 +425,7 @@ interface Revised {
  * the new incarnation or nothing.
  */
 function checkRevisions(revs: readonly { event: LandedEvent; messageId: string }[], outcome: Extract<PointerOutcome, { scope: SessionScope }>,
-  recordOf: ReadonlyMap<string, QueueRecord>, now: () => number): Revised[] {
+  recordOf: ReadonlyMap<string, QueueRecord>, now: () => number, pointer: { startedAt: number; doneAt: number }): Revised[] {
   const out: Revised[] = [];
   const live = outcome.live;
   for (const { event, messageId } of revs) {
@@ -434,7 +440,7 @@ function checkRevisions(revs: readonly { event: LandedEvent; messageId: string }
         ...(record?.sentAt !== undefined ? { group_lag_ms: Math.max(0, now() - record.sentAt) } : {}),
       });
     }
-    out.push({ event, messageId, live: same, ...(record?.sentAt !== undefined ? { sentAt: record.sentAt } : {}), ...(record?.receiveCount !== undefined ? { receiveCount: record.receiveCount } : {}) });
+    out.push({ event, messageId, live: same, pointer, ...(record?.sentAt !== undefined ? { sentAt: record.sentAt } : {}), ...(record?.receiveCount !== undefined ? { receiveCount: record.receiveCount } : {}) });
   }
   return out;
 }
@@ -457,7 +463,7 @@ function passFields(messageIds: readonly string[], recordOf: ReadonlyMap<string,
  * upload's own commit time to the end of the pass that made it searchable. A superseded event
  * has no line of its own; the upload that superseded it reports.
  */
-function logSearchable(scope: SessionScope, revisions: readonly Revised[], now: () => number, passStartedAt: number, alreadyCurrent: boolean) {
+function logSearchable(scope: SessionScope, revisions: readonly Revised[], now: () => number, pickedUpAt: number, passStartedAt: number, alreadyCurrent: boolean) {
   const seen = new Set<string>();
   for (const r of revisions) {
     if (!r.live) continue;
@@ -470,8 +476,15 @@ function logSearchable(scope: SessionScope, revisions: readonly Revised[], now: 
       stage: "revision-events", org_id: scope.orgId, workspace_id: scope.workspaceId, harness: scope.harness, session_id: scope.sessionId,
       revision: r.event.revision?.revision, upload_kind: kind, event_source: r.event.revision?.source, already_current: alreadyCurrent,
       incarnation_sha256: incarnation(r.event),
-      // Pickup (the 7s budget) is commit to the covering pass's START; *_searchable / queue_wait_ms end at its completion.
+      // Legs, each on the consumer clock: enqueue/commit -> PICKUP (the batch arrived, before any pointer work: the 7s
+      // budget) -> this key's pointer work (pointer_ms; the 2s budget) -> the covering search pass's start -> its
+      // completion (*_searchable_ms, queue_wait_ms).
+      picked_up_at_ms: pickedUpAt,
+      pointer_started_at_ms: r.pointer.startedAt,
+      pointer_ms: Math.max(0, r.pointer.doneAt - r.pointer.startedAt),
       pass_started_at_ms: passStartedAt,
+      ...(Number.isFinite(committed) ? { commit_to_pickup_ms: Math.max(0, pickedUpAt - committed) } : {}),
+      ...(r.sentAt !== undefined ? { pickup_wait_ms: Math.max(0, pickedUpAt - r.sentAt) } : {}),
       ...(Number.isFinite(committed) ? { commit_to_start_ms: Math.max(0, passStartedAt - committed), commit_to_searchable_ms: Math.max(0, now() - committed) } : {}),
       ...(r.sentAt !== undefined ? { enqueued_at_ms: r.sentAt, start_wait_ms: Math.max(0, passStartedAt - r.sentAt), queue_wait_ms: Math.max(0, now() - r.sentAt) } : {}),
       ...(r.receiveCount !== undefined ? { receive_count: r.receiveCount } : {}),

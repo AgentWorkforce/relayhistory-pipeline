@@ -91,7 +91,14 @@ async function rig() {
     changeVisibility: async (handles, seconds) => { visibility.push({ handles: [...handles], seconds }); },
     now,
   };
-  const deps = (): ConsumerDeps => ({ ...r.deps(), search: {} as never, searchScope: searchScope as never });
+  // Each manifest read in the pointer stage takes 50 ms on the consumer clock: pickup, pointer start and completion
+  // and the pass start then all differ.
+  const deps = (): ConsumerDeps => {
+    const base = r.deps();
+    const reader = base.pointer.reader;
+    return { ...base, pointer: { ...base.pointer, reader: { ...reader, read: async (k: string) => { advance(50); return reader.read(k); } } },
+      search: {} as never, searchScope: searchScope as never };
+  };
   const etagOf = async (key: string) => (await r.store.head(objectKey(key)))!.version.eTag!.replace(/^"|"$/g, "");
   let n = 0;
   /** One FIFO record for a writer-side revision event, as the ESM delivers it. */
@@ -130,21 +137,28 @@ describe("burst coalescing", () => {
     const ok = named(lines, "revision searchable");
     expect(ok[0]!.incarnation_sha256).toBe(revisionMessage(events[4]!)!.MessageDeduplicationId);
     expect(sup[0]!.incarnation_sha256).toBe(revisionMessage(events[0]!)!.MessageDeduplicationId);
-    // Pickup ends at the covering pass's START (T0+1,500); searchable at its completion (T0+1,900).
-    expect(ok).toEqual([expect.objectContaining({ revision: 5, upload_kind: "append", event_source: "writer", pass_started_at_ms: T0 + 1_500,
-      commit_to_start_ms: 1_000, commit_to_searchable_ms: 1_400, start_wait_ms: 1_100, queue_wait_ms: 1_500, receive_count: 1 })]);
+    // Pickup is the batch's arrival (T0+1,500), BEFORE the pointer loop; then this key's pointer work, then the pass.
+    const line = ok[0]!;
+    expect(line).toMatchObject({ revision: 5, upload_kind: "append", event_source: "writer", picked_up_at_ms: T0 + 1_500,
+      commit_to_pickup_ms: 1_000, pickup_wait_ms: 1_100, pointer_started_at_ms: T0 + 1_500, receive_count: 1 });
+    const pointerMs = line.pointer_ms as number;
+    expect(pointerMs).toBeGreaterThan(0);
+    expect(line.pass_started_at_ms).toBe(T0 + 1_500 + pointerMs);
+    expect(line.commit_to_start_ms).toBe(1_000 + pointerMs);
+    expect(line.commit_to_searchable_ms).toBe(1_000 + pointerMs + 400);
+    expect(line.queue_wait_ms).toBe(1_100 + pointerMs + 400);
     const pass = named(lines, "search index reconciled")[0]!;
-    expect(pass).toMatchObject({ coalesced: 5, enqueued_at_ms: T0, queue_wait_ms: 1_900, receive_count: 1 });
+    expect(pass).toMatchObject({ coalesced: 5, enqueued_at_ms: T0, queue_wait_ms: 1_500 + pointerMs + 400, receive_count: 1 });
   });
 
   test("first upload and an append are measured separately", async () => {
     const t = await rig();
     const first = await t.writer(1, "r1", loc, new Date(T0).toISOString());
     const a = await t.run([t.record(first, T0)]);
-    expect(named(a.lines, "revision searchable")).toEqual([expect.objectContaining({ upload_kind: "initial", revision: 1, commit_to_start_ms: 1_500, commit_to_searchable_ms: 1_900 })]);
+    expect(named(a.lines, "revision searchable")).toEqual([expect.objectContaining({ upload_kind: "initial", revision: 1, commit_to_pickup_ms: 1_500 })]);
     const second = await t.writer(2, "r2", loc, new Date(T0 + 500).toISOString());
     const b = await t.run([t.record(second, T0 + 500)]);
-    expect(named(b.lines, "revision searchable")).toEqual([expect.objectContaining({ upload_kind: "append", revision: 2, commit_to_start_ms: 1_000, commit_to_searchable_ms: 1_400 })]);
+    expect(named(b.lines, "revision searchable")).toEqual([expect.objectContaining({ upload_kind: "append", revision: 2, commit_to_pickup_ms: 1_000 })]);
   });
 
   test("two machines of one session (one group) coalesce into one search pass; another session runs its own", async () => {
