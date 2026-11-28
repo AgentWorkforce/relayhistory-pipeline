@@ -617,9 +617,14 @@ async function captureSearchPreRead(scope: SessionScope, deps: SearchIndexDeps, 
 }
 
 export async function indexSearchScope(scope: SessionScope, deps: SearchIndexDeps): Promise<SearchIndexResult> {
-  // These paths need their existing transaction-bound service/facts/stream contracts. The flag is
+  // These paths need their existing transaction-bound service/facts contracts. The flag is
   // accepted but deliberately leaves them on the byte-identical base path.
-  if (!deps.preRead || !deps.ch || deps.adapter || deps.staged || deps.stream || deps.outputFacts || deps.outputFactsStore)
+  // Streaming (SEARCH_INDEX_STREAMING_CH=1, the hosted default) takes the pre-read too: a scope the
+  // whole read covers reconciles from the pre-read source and scan, with no S3 or ClickHouse read
+  // inside the locked transaction. A scope the whole read refuses as scope_too_large reaches the
+  // streamed reconcile through the same prepared read (after the stamp check), so it is not read
+  // twice; that streamed reconcile still runs inside the transaction, as before.
+  if (!deps.preRead || !deps.ch || deps.adapter || deps.staged || deps.outputFacts || deps.outputFactsStore)
     return indexSearchScopeBase(scope, deps);
   const limits = { ...SEARCH_INDEX_DEFAULT_LIMITS, ...deps.limits };
   for (let attempt = 0; attempt < 2; attempt++) {

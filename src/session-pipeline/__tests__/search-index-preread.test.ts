@@ -147,6 +147,67 @@ test("two same-stamp stale scans apply idempotently: no resurrected row and no l
   expect(r.fake.dump()).toEqual(wanted);
 });
 
+// SEARCH_INDEX_STREAMING_CH=1 (the hosted default): the pre-read no longer bypasses streaming.
+const UNLIMITED = { maxReadBytes: 1 << 30, maxReadEvents: 1 << 24 };
+const TINY = { maxScopeBytes: 1, maxScopeEvents: 1 };
+
+test("streaming on: a whole-read scope reads source and index before the apply transaction, never inside it", async () => {
+  const { r } = await rig(33);
+  r.fake.rows.splice(0, 3);
+  const wanted = (await rig(33)).r.fake.dump();
+  const reads = r.reads.count, calls = r.fake.calls.length;
+  let readsAtApply = -1, callsAtApply = -1;
+  const raced = between(r.search({ stream: UNLIMITED }), new Map([[2, async () => {
+    readsAtApply = r.reads.count;
+    callsAtApply = r.fake.calls.length;
+    const preLock = r.fake.calls.slice(calls);
+    expect(preLock.some((call) => call.ch === "select")).toBe(true);
+    expect(preLock.some((call) => call.ch === "insert" || call.ch === "command")).toBe(false);
+  }]]));
+  expect(await indexSearchScope(SCOPE, raced.deps)).toMatchObject({ complete: true, inserted: 3, deleted: 0 });
+  expect(raced.transactions()).toBe(2);
+  expect(readsAtApply).toBeGreaterThan(reads);
+  // Inside the apply transaction: no object read and no index select, only the writes.
+  expect(r.reads.count).toBe(readsAtApply);
+  expect(r.fake.calls.slice(callsAtApply).some((call) => call.ch === "select")).toBe(false);
+  expect(r.fake.dump()).toEqual(wanted);
+});
+
+test("streaming on: a directory epoch bump after the pre-read retries, then applies the newer source", async () => {
+  const { r } = await rig();
+  const raced = between(r.search({ stream: UNLIMITED }), new Map([[2, () => bumpEpoch(r)]]));
+  expect(await indexSearchScope(SCOPE, raced.deps)).toMatchObject({ complete: true });
+  expect(raced.transactions()).toBe(4);
+});
+
+// The too-large streamed parity (rows, directory, catalog, state, page walk) is in
+// search-index-stream-ch.test.ts ("streaming on, pre-read on").
+
+test("streaming on: a scope_too_large scope whose stamp changes after the pre-read retries and never applies the stale read", async () => {
+  const { r } = await rig(33);
+  const wanted = r.fake.dump();
+  r.fake.rows.splice(0, 2);
+  const raced = between(r.search({ limits: TINY, stream: UNLIMITED }), new Map([[2, () => bumpEpoch(r)]]));
+  expect(await indexSearchScope(SCOPE, raced.deps)).toMatchObject({ complete: true, inserted: 2 });
+  expect(raced.transactions()).toBe(4);
+  expect(r.fake.dump()).toEqual(wanted);
+});
+
+test("streaming on: two concurrent same-stamp passes apply idempotently: no resurrected row and no lost current row", async () => {
+  const { r } = await rig(33);
+  const wanted = r.fake.dump();
+  const stale = r.fake.rows[0]!;
+  stale.ts = new Date(Date.parse(`${stale.ts.replace(" ", "T")}Z`) - 1000).toISOString().replace("T", " ").replace("Z", "");
+  let arrived = 0;
+  let release!: () => void;
+  const both = new Promise<void>((resolve) => { release = resolve; });
+  const waitAtApply = async () => { arrived += 1; if (arrived === 2) release(); await both; };
+  const one = between(r.search({ stream: UNLIMITED }), new Map([[2, waitAtApply]]));
+  const two = between(r.search({ stream: UNLIMITED }), new Map([[2, waitAtApply]]));
+  await Promise.all([indexSearchScope(SCOPE, one.deps), indexSearchScope(SCOPE, two.deps)]);
+  expect(r.fake.dump()).toEqual(wanted);
+});
+
 test("two stamp changes exhaust the retry and fall back to the unmodified locked read", async () => {
   const { r } = await rig();
   let readsAfterSecondPreRead = 0;

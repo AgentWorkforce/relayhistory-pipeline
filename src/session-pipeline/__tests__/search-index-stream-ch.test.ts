@@ -177,6 +177,38 @@ test("ClickHouse binding, streaming on: a too-large scope gets the whole read's 
   expect(streamed.selects.filter((q) => !q.after).length).toBe(1);
 }, 60_000);
 
+test("ClickHouse binding, streaming on, pre-read on: a too-large scope gets exactly the streamed (and whole) result", async () => {
+  const x = await scope(generate(31));
+  const whole = backend(x, {});
+  const streamed = backend(x, { limits: { ...TINY, insertBatch: 3 }, stream: UNLIMITED });
+  const pre = backend(x, { limits: { ...TINY, insertBatch: 3 }, stream: UNLIMITED, preRead: true });
+  const w = await indexSearchScope(SCOPE, whole.deps);
+  const s = await indexSearchScope(SCOPE, streamed.deps);
+  const p = await indexSearchScope(SCOPE, pre.deps);
+  expect(s).toMatchObject({ complete: true, reasons: [], rows: w.rows, inserted: w.inserted, deleted: 0 });
+  expect(p).toEqual(s);
+  expect(pre.dump()).toEqual(whole.dump());
+  expect(pre.directory).toEqual(streamed.directory);
+  expect(pre.catalog).toEqual(streamed.catalog);
+  expect(pre.state.map((r) => r.needs_full)).toEqual(streamed.state.map((r) => r.needs_full));
+  // Same ClickHouse page walk as the streamed pass: the pre-read adds no index scan of its own
+  // (a too-large whole read is incomplete, so the pre-read skips its scan).
+  expect(pre.selects.map((q) => [q.keyset, q.limit])).toEqual(streamed.selects.map((q) => [q.keyset, q.limit]));
+}, 60_000);
+
+test("ClickHouse binding, streaming on, pre-read on: a whole-readable scope matches the base result", async () => {
+  const x = await scope(generate(31));
+  const whole = backend(x, { stream: UNLIMITED });
+  const pre = backend(x, { stream: UNLIMITED, preRead: true });
+  const w = await indexSearchScope(SCOPE, whole.deps);
+  const p = await indexSearchScope(SCOPE, pre.deps);
+  expect(w).toMatchObject({ complete: true, reasons: [] });
+  expect(p).toEqual(w);
+  expect(pre.dump()).toEqual(whole.dump());
+  expect(pre.directory).toEqual(whole.directory);
+  expect(pre.catalog).toEqual(whole.catalog);
+}, 60_000);
+
 test("ClickHouse binding, streaming on: a retracted row is deleted and a missing row is regenerated", async () => {
   const x = await scope(generate(32));
   const b = backend(x, { limits: { ...TINY, insertBatch: 4 }, stream: UNLIMITED });
