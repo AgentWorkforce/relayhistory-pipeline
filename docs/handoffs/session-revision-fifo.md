@@ -164,7 +164,8 @@ versionId.
 ## T124 + T126 integration: required fixtures (not built yet)
 
 Rule (option 1(b), confirmed by Skip and Pipeline): ACK the FIFO head only after durable recovery outside its group
-is committed for the exact job incarnation. A failed or ambiguous handoff keeps the head, even past 30 minutes.
+is committed for the exact job incarnation, AND a wakeup outside the group is verified for it: a queued row alone
+leaves the stalled-worker case open. A failed or ambiguous handoff keeps the head, even past 30 minutes.
 Hold body fields expected_epoch, expected_fingerprint (never logged), oldest_event_time, hold_seq and hold_id are
 anchored on the FIFO head in delivery order. The forwarder passes them through unchanged.
 
