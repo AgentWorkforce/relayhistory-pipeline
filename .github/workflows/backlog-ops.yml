@@ -98,7 +98,7 @@ on:
         type: string
         default: ""
       confirmation:
-        description: 'Execute: <MODE uppercase> <sha> DRY <dry_run> [BACKFILL <backfill_run>] [FULL <full_backfill_run>] [EXPORT <export_run>] [RESHARD <reshard_run>] [AUTHORITY <authority_run>] (catch-up: BACKFILL-CATCHUP-EXECUTE <sha> DRY <dry_run> FULL <full_backfill_run> [AUTHORITY <authority_run>]; AUTHORITY-EXECUTE <sha> DRY <dry_run> BACKFILL <backfill_run> FULL <full_backfill_run> RESHARD <reshard_run>; MARKER-EXECUTE <sha> DRY <dry_run> BACKFILL <backfill_run> FULL <full_backfill_run> RESHARD <reshard_run> AUTHORITY <authority_run> WAVE <wave_id>; a per_org retry adds PREVIOUS <previous_run>; with per_org, an execute's confirmation ends with PER_ORG). Dry modes: empty'
+        description: 'Execute: <MODE uppercase> <sha> DRY <dry_run> [BACKFILL <backfill_run>] [FULL <full_backfill_run>] [EXPORT <export_run>] [RESHARD <reshard_run>] [AUTHORITY <authority_run>] (catch-up: BACKFILL-CATCHUP-EXECUTE <sha> DRY <dry_run> FULL <full_backfill_run> [AUTHORITY <authority_run>]; AUTHORITY-EXECUTE <sha> DRY <dry_run> BACKFILL <backfill_run> FULL <full_backfill_run> RESHARD <reshard_run>; MARKER-EXECUTE <sha> DRY <dry_run> BACKFILL <backfill_run> FULL <full_backfill_run> RESHARD <reshard_run> AUTHORITY <authority_run> WAVE <wave_id>; a per_org retry adds PREVIOUS <previous_run>; with per_org, an execute''s confirmation ends with PER_ORG). Dry modes: empty'
         type: string
         default: ""
   pull_request:
