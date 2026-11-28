@@ -356,9 +356,9 @@ export async function generationEvidence(store: ObjectStore, p: GenerationPorts,
   // The S3 ledger's per-user admission directories share this root (async-admission.ts admissionUserDir: a pseudo
   // machine srv_<hash of ("admission-user-v1", ws, user)>). This user's is keys.dir, covered by the classes above;
   // any other has another (ws, user) by construction. Only its own object names parse.
-  // An admission-directory name passes unjudged ONLY under this user's own computed admission machine (keys.dir), or
-  // under a machine that is not one of this user's upload machines (another user's admission directory). Under one of
-  // this user's upload machines it is judged like any byte (a ledger-shaped object there is not the ledger's).
+  // An admission-directory name is exempt from judging ONLY under this user's own computed admission machine (keys.dir),
+  // where every object must match OWN_ADMIN_OBJECTS. Under every other machine it is judged like any byte: this user's
+  // machine holds bytes, and any other machine must be attributed `other` by machineOwners, or it refuses.
   const adminRe = /^m=([A-Za-z0-9._-]{1,128})\/(?:upload-fences\.json|privacy-journal\.json|ledger\/[^\s]+)$/u;
   if (!keys.dir.startsWith(inboxRoot)) refuse("generation_unreadable");
   const ownAdmin = keys.dir.slice(inboxRoot.length);
