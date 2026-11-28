@@ -457,6 +457,7 @@ names every step, and that each sentinel is false before its step and true after
 | `upstream:20261105062350_buffered_search_feed_page_keyset.sql` | replacement: sessions.buffered_search_feed_page(jsonb) selects its page with one row comparison (an Index Cond on ingest_stage_intents_cleanup_idx instead of an OR Filter) and carries plan_cache_mode=force_custom_plan (CREATE OR REPLACE, same signature, SECURITY DEFINER, owner and ACL; down: 043870's exact page function) |
 | `upstream:20261105062330_buffered_search_feed_custom_plans.sql` | replacement: sessions.buffered_search_feed_stage(jsonb) and sessions.ingest_buffer_gc_ordinals(uuid) carry plan_cache_mode=force_custom_plan in proconfig (ALTER FUNCTION only: no body, owner, SECURITY DEFINER or ACL change; keeps the stage RPC's statements off the cached generic plans that time out, 57014; down: RESET plan_cache_mode) |
 | `upstream:20261105062340_ingest_org_erasure_history.sql` | function sessions.ingest_org_erasure_history_bind(text,uuid,text,bigint,text) and the trigger ingest_org_erasure_history_record on sessions.upload_deletions (the per-org erasure history for the 062320 release: owner-only insert-only tables sessions.ingest_org_erasure_history / _coverage / _bindings, a recorder and a truncate refusal on each of the 15 erasure sources; replaces 062320's release and status, ACLs kept; the down refuses while any hold is not released, keeps the history, records the end of coverage and resets readiness to pending) |
+| `upstream:20261105062400_event_facts_observed_paths.sql` | column sessions.session_event_facts.observed_paths (text[], default empty, at most 64), carried by the replaced sessions.output_facts_reconcile and sessions.staged_facts_reconcile_v1 (same signatures and ACLs); dormant: no writer emits it until the facts builders are given observedPaths, and no reader or detector reads it; the down restores the 045040 and 062140 bodies and drops the column |
 | `upstream:20261105035000_semantic_copy_state.sql` | table sessions.search_feature_copy_state |
 | `upstream:20261105036000_canonical_consumer_lease.sql`        | table sessions.canonical_feature_consumer_lease |
 | `upstream:20261105037000_session_directory_document_pool.sql` | function sessions.canonical_feature_document_finish |
@@ -1035,7 +1036,7 @@ in each database.
 The down (`supabase/rollbacks/20261105062210_lazy_ack_t2.down.sql`) refuses unless the gate row says off/main, and it
 fails fast (55P03) while any ingest or erase transaction is open, the validation marker is in use or the gate table is
 in use. A successful down restores 043800's staged ACK exactly and drops the gate table and its three functions.
-It also refuses while a later migration is applied: roll back 062350, then 062340, then 062330, then 062320, then 062300, then 062220, first, each with its own down.
+It also refuses while a later migration is applied: roll back 062400, then 062350, then 062340, then 062330, then 062320, then 062300, then 062220, first, each with its own down.
 
 After the down commits, readiness is pending, and every staged commit is refused (55000 `generation not ready`, a 503
 to the client, which keeps the batch) until the owner restores readiness. Client retries alone do not clear a pending

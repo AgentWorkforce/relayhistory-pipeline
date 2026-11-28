@@ -34,6 +34,7 @@ import { createHash } from "node:crypto";
 import type { ClickHouseClient } from "./vendor/search-index/clickhouse.ts";
 import { arrayLiteral } from "./vendor/search-index/clickhouse.ts";
 import { EVENT_FACTS_TABLE, OUTPUT_FACTS_SESSION_STATE_TABLE, OUTPUT_FACTS_TABLE } from "./output-facts-schema.ts";
+import { observedPaths } from "./observed-paths.ts";
 import { canonicalLegacy } from "../session-read-api/canonical-legacy.ts";
 import { canonicalLiveTurns, mergeTurnRows } from "../session-read-api/canonical-turns.ts";
 import type { RelayhistoryStreamRecord } from "../../packages/pipeline/src/lib/pipeline/relayhistory-transform.ts";
@@ -60,8 +61,16 @@ export interface EventFactRow {
   input_tokens: number; output_tokens: number; reasoning_tokens: number; cache_read_tokens: number; cache_create_tokens: number;
   cache_create_5m_tokens: number | null; cache_create_1h_tokens: number | null; cost_usd_micros: number | null;
   files_touched: Array<string | null>;
+  /**
+   * Paths a tool result observed as changed (observed-paths.ts), present only when the builders are given
+   * `observedPaths: true`. Dormant: no runtime passes it yet, so rows stay byte-identical to before.
+   */
+  observed_paths?: string[];
   row_id: string; fingerprint: string; version: number;
 }
+
+/** Builder options. `observedPaths` derives EventFactRow.observed_paths (off by default). */
+export interface OutputFactsOptions { observedPaths?: boolean }
 
 export interface OutputFactRow {
   org_id: string; workspace_id: string; fact_kind: string; ts: string; scope_source: string; source: string; session_id: string;
@@ -268,7 +277,7 @@ function factRow(scope: FactsTenant, version: number, f: FactDraft): OutputFactR
 }
 
 /** One convergence event's event-fact row; `ts` is chTime(e.ts). */
-function eventFactRow(scope: FactsTenant & { canonicalId: string }, version: number, e: Json, ts: string): EventFactRow {
+function eventFactRow(scope: FactsTenant & { canonicalId: string }, version: number, e: Json, ts: string, opts: OutputFactsOptions = {}): EventFactRow {
   const base = { org_id: scope.orgId, workspace_id: scope.workspaceId, version };
   const taskRef = isObject(e.task_ref) ? e.task_ref : {};
   const files = Array.isArray(e.files_touched) ? e.files_touched.map(jtext) : [];
@@ -304,8 +313,12 @@ function eventFactRow(scope: FactsTenant & { canonicalId: string }, version: num
     cost_usd_micros: nint(e.cost_usd_micros),
     files_touched: files,
   };
+  // Observed paths only when asked for, and only on tool results. Empty paths are left out of the fingerprint, so
+  // turning the option on rewrites only the rows that gain paths.
+  const observed = opts.observedPaths && e.actor_role === "tool_result" ? observedPaths(jtext(e.content)) : [];
   const { version: _v, ...covered } = row;
-  return { ...row, row_id: sha256(identity), fingerprint: sha256([covered]) };
+  const fingerprint = sha256(observed.length ? [covered, observed] : [covered]);
+  return { ...row, ...(opts.observedPaths ? { observed_paths: observed } : {}), row_id: sha256(identity), fingerprint };
 }
 
 /** The messages CTE for one event: its message fact, or null. */
@@ -388,6 +401,7 @@ export function outputFactsFromScope(
   scope: OutputFactsScope,
   read: { projectionRows: Array<{ table: string; row: Json }>; records: RelayhistoryStreamRecord[]; complete: boolean },
   version: number,
+  opts: OutputFactsOptions = {},
 ): OutputFacts {
   const reasons: string[] = [];
   let complete = read.complete;
@@ -403,7 +417,7 @@ export function outputFactsFromScope(
   try {
     for (const e of events) {
       const ts = chTime(String(e.ts));
-      eventRows.push(eventFactRow(scope, version, e, ts));
+      eventRows.push(eventFactRow(scope, version, e, ts, opts));
       // messages CTE
       const message = messageFact(scope, e, ts);
       if (message) pushFact(message);
@@ -483,6 +497,7 @@ export function outputFactsBatchStep(
   scope: OutputFactsStagedScope,
   batch: { projectionRows: ReadonlyArray<{ table: string; row: Json }>; records: readonly RelayhistoryStreamRecord[] },
   version: number,
+  opts: OutputFactsOptions = {},
 ): OutputFactsStagedItem[] {
   const items: OutputFactsStagedItem[] = [];
   const note = (reason: string) => items.push({ kind: "note", reason });
@@ -493,7 +508,7 @@ export function outputFactsBatchStep(
       const group = JSON.stringify([e.source, e.session_id]);
       try {
         const ts = chTime(String(e.ts));
-        items.push({ kind: "event", row: eventFactRow(scope, version, e, ts) });
+        items.push({ kind: "event", row: eventFactRow(scope, version, e, ts, opts) });
         const message = messageFact(scope, e, ts);
         if (message) items.push({ kind: "fact", row: factRow(scope, version, message) });
         const commits = toolResultCommitFacts(scope, e, ts);
@@ -700,7 +715,12 @@ const REQUIRED_COLUMNS: Record<string, readonly string[]> = {
   [OUTPUT_FACTS_TABLE]: ["row_id", "scope_source", "fact_kind", "origin", "fingerprint", "version"],
   [OUTPUT_FACTS_SESSION_STATE_TABLE]: ["complete", "min_ts", "max_ts", "version"],
 };
-const schemaProbes = new WeakMap<ClickHouseClient, { at: number; ready: boolean; present: boolean }>();
+/** The required columns for a producer: with observed paths on, the event table must also carry observed_paths. */
+function requiredColumns(opts: OutputFactsOptions): Record<string, readonly string[]> {
+  if (!opts.observedPaths) return REQUIRED_COLUMNS;
+  return { ...REQUIRED_COLUMNS, [EVENT_FACTS_TABLE]: [...REQUIRED_COLUMNS[EVENT_FACTS_TABLE]!, "observed_paths"] };
+}
+const schemaProbes = new WeakMap<ClickHouseClient, Map<boolean, { at: number; ready: boolean; present: boolean }>>();
 
 /**
  * Whether the owner-applied output-facts DDL is present (`present`: any fact table exists, so
@@ -708,8 +728,9 @@ const schemaProbes = new WeakMap<ClickHouseClient, { at: number; ready: boolean;
  * required column, so a pass may write). An older skeleton (CREATE TABLE IF NOT EXISTS never
  * alters it) is present but not ready. Cached for a minute per client.
  */
-export async function outputFactsSchema(ch: ClickHouseClient, now = Date.now()): Promise<{ ready: boolean; present: boolean }> {
-  const cached = schemaProbes.get(ch);
+export async function outputFactsSchema(ch: ClickHouseClient, now = Date.now(), opts: OutputFactsOptions = {}): Promise<{ ready: boolean; present: boolean }> {
+  const required = requiredColumns(opts), key = opts.observedPaths === true;
+  const cached = schemaProbes.get(ch)?.get(key);
   if (cached && now - cached.at < 60_000) return { ready: cached.ready, present: cached.present };
   const rows = await ch.select<{ table: string; name: string }>(
     `SELECT table, name FROM system.columns WHERE database = currentDatabase() AND table IN {tables:Array(String)}`,
@@ -717,9 +738,11 @@ export async function outputFactsSchema(ch: ClickHouseClient, now = Date.now()):
   );
   const have = new Map<string, Set<string>>();
   for (const r of rows) have.set(r.table, (have.get(r.table) ?? new Set()).add(r.name));
-  const ready = Object.entries(REQUIRED_COLUMNS).every(([t, cols]) => cols.every((c) => have.get(t)?.has(c)));
+  const ready = Object.entries(required).every(([t, cols]) => cols.every((c) => have.get(t)?.has(c)));
   const probe = { at: now, ready, present: have.has(EVENT_FACTS_TABLE) || have.has(OUTPUT_FACTS_TABLE) };
-  schemaProbes.set(ch, probe);
+  const byOpts = schemaProbes.get(ch) ?? new Map();
+  byOpts.set(key, probe);
+  schemaProbes.set(ch, byOpts);
   return { ready: probe.ready, present: probe.present };
 }
 /** Tests: forget a client's cached probe. */

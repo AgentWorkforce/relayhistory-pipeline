@@ -32,6 +32,7 @@ import {
   type EventFactRow,
   type FactsRange,
   type OutputFactRow,
+  type OutputFactsOptions,
   type OutputFactsScope,
   type StatePhase,
 } from "./output-facts.ts";
@@ -284,8 +285,10 @@ export async function stageOutputFactsChunk(
    * weight of a record with any code unit above 0xFF; the caller resets both sums at chunk 0.
    */
   recordBytes?: { used: number; counted: number; cap: number; wideWeight: number },
+  /** Builder options (output-facts.ts OutputFactsOptions); none by default, and no runtime passes any yet. */
+  facts: OutputFactsOptions = {},
 ): Promise<number> {
-  const items = outputFactsBatchStep(scope, events, sourceVersionOf(sourceVersion));
+  const items = outputFactsBatchStep(scope, events, sourceVersionOf(sourceVersion), facts);
   const entries = items.map(stageEntry);
   if (recordBytes) {
     // Counted before anything is sent, so a run past the bound stops before the stage holds its records.

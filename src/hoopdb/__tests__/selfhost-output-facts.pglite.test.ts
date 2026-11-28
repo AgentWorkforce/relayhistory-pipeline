@@ -184,6 +184,31 @@ describe("20261105045040 self-host output facts", () => {
     expect(await count(db, "session_output_facts", "workspace_id = 'ws-f4'")).toBe(f.facts.length - 1);
   }, 180_000);
 
+  test("20261105062400: observed paths round-trip; a row without them stores none; a change of paths updates the row", async () => {
+    const db = await database();
+    // This suite stops at 045040: apply the observed-paths step's column and its replacement of this step's
+    // reconcile (grants kept). Its staged-reconcile half needs 062110's tables; the full step runs end to end in
+    // migration-profile.test.ts and search-index-stage-down.pglite.test.ts.
+    const step = read("supabase/migrations/20261105062400_event_facts_observed_paths.sql");
+    await db.exec(step.slice(0, step.indexOf("CREATE OR REPLACE FUNCTION sessions.staged_facts_reconcile_v1(")));
+    // The bound is NOT VALID (no scan of existing rows under the step's lock), yet enforced on every write (below).
+    expect((await db.query<{ v: boolean }>("SELECT convalidated v FROM pg_constraint WHERE conname = 'session_event_facts_observed_paths_bounded'")).rows[0]!.v).toBe(false);
+    const f = facts();
+    const [first, ...rest] = f.events;
+    const withPaths = { ...first!, observed_paths: ["src/a.ts", "docs/b.md"], fingerprint: "f".repeat(64) };
+    const run = (events: unknown[], v: number) => consumer(db, (s) => s.reconcile(SCOPE, { ...input(f), eventFacts: events as typeof f.events }, v));
+    expect(await run([withPaths, ...rest], 5)).toMatchObject({ applied: true });
+    const paths = async (rowId: string) => (await db.query<{ p: string[] }>("SELECT observed_paths AS p FROM sessions.session_event_facts WHERE row_id = $1", [rowId])).rows[0]!.p;
+    expect(await paths(first!.row_id)).toEqual(["src/a.ts", "docs/b.md"]);
+    for (const e of rest) expect(await paths(e.row_id)).toEqual([]);
+    expect(await run([{ ...withPaths, observed_paths: ["src/c.ts"], fingerprint: "e".repeat(64) }, ...rest], 6)).toMatchObject({ applied: true, inserted: 1 });
+    expect(await paths(first!.row_id)).toEqual(["src/c.ts"]);
+    // More than 64 paths violates the column's bound: the whole pass fails, nothing is half-written.
+    const tooMany = { ...withPaths, observed_paths: Array.from({ length: 65 }, (_, i) => `p${i}.ts`), fingerprint: "d".repeat(64) };
+    expect(await code(run([tooMany, ...rest], 7))).toBe("23514");
+    expect(await paths(first!.row_id)).toEqual(["src/c.ts"]);
+  }, 180_000);
+
   test("a pass older than the stored source version is a no-op (reconcile and state)", async () => {
     const db = await database();
     const f = facts();

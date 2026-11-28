@@ -44,6 +44,8 @@ const PAGE_KEYSET_DOWN = read("supabase/rollbacks/20261105062350_buffered_search
 // 20261105062340 (the per-org erasure history) sits above 062330: its down runs before 062330's.
 const HISTORY_STEP = "upstream:20261105062340_ingest_org_erasure_history.sql";
 const HISTORY_DOWN = read("supabase/rollbacks/20261105062340_ingest_org_erasure_history.down.sql");
+// 20261105062400 (observed paths on event facts) is newest: its down comes off first of all.
+const OBSERVED_PATHS_DOWN = read("supabase/rollbacks/20261105062400_event_facts_observed_paths.down.sql");
 const LOCAL: MigrationProfile = { mode: "local", shim: true, bootstrap: true, verify: false, runtimeRole: "postgres" };
 const V2 = "sessions.coordination_advisories_pending_for_v2(text,text,text,text,integer)";
 const V1 = "sessions.coordination_advisories_pending_for_v1(text,text,text,text)";
@@ -188,6 +190,7 @@ describe("20261105062190 coordination_advisories_pending_for_v2", () => {
     expect(warns).toEqual([]);
     // 20261105062200 (session list readiness), 062210 (T2 staged ACK) and 062220 (the advisory instance) sit above
     // 062190: their downs run first, newest first.
+    await db.exec(OBSERVED_PATHS_DOWN);
     await db.exec(PAGE_KEYSET_DOWN);    await db.exec(HISTORY_DOWN);
     await db.exec(CUSTOM_PLANS_DOWN);
     await db.exec(HOLD_DOWN);
@@ -211,8 +214,9 @@ describe("20261105062190 rollback", () => {
     try {
       // 20261105062200 (session list readiness), 20261105062210 (T2 staged ACK) and 20261105062220 (the advisory
       // instance) are the later steps: this down refuses under them; they come off first, newest first.
-      expect((await plan(LOCAL)).filter((s) => s.name.startsWith("upstream:") && s.name > STEP).map((s) => s.name)).toEqual(["upstream:20261105062200_session_directory_list_readiness.sql", "upstream:20261105062210_lazy_ack_t2.sql", INSTANCE_STEP, SEARCH_STAGE_STEP, HOLD_STEP, CUSTOM_PLANS_STEP, HISTORY_STEP, PAGE_KEYSET_STEP]);
+      expect((await plan(LOCAL)).filter((s) => s.name.startsWith("upstream:") && s.name > STEP).map((s) => s.name)).toEqual(["upstream:20261105062200_session_directory_list_readiness.sql", "upstream:20261105062210_lazy_ack_t2.sql", INSTANCE_STEP, SEARCH_STAGE_STEP, HOLD_STEP, CUSTOM_PLANS_STEP, HISTORY_STEP, PAGE_KEYSET_STEP, "upstream:20261105062400_event_facts_observed_paths.sql"]);
       expect(await message(DOWN)).toContain("a later migration is applied");
+      await db.exec(OBSERVED_PATHS_DOWN);
       await db.exec(PAGE_KEYSET_DOWN);
       await db.exec(HISTORY_DOWN);
       await db.exec(CUSTOM_PLANS_DOWN);

@@ -349,6 +349,17 @@ describe("20261105062140 staged output facts", () => {
     });
   });
 
+  test("20261105062400: the staged reconcile carries observed paths through; rows without them store none", async () => {
+    await clearFacts(db);
+    const read = outputFixture();
+    const result = read.projectionRows.find((r) => r.table === "convergence_events" && r.row.actor_role === "tool_result")!;
+    read.projectionRows.push({ table: "convergence_events", row: { ...result.row, event_id: "status-1", content: " M src/a.ts\n?? docs/b.md\n" } });
+    await stagedPass(db, SCOPE, read, 7, 3, false, { observedPaths: true });
+    const rows = (await db.query<{ event_id: string; p: string[] }>("SELECT event_id, observed_paths p FROM sessions.session_event_facts ORDER BY event_id")).rows;
+    expect(rows.find((r) => r.event_id === "status-1")!.p).toEqual(["src/a.ts", "docs/b.md"]);
+    for (const r of rows) if (r.event_id !== "status-1") expect(r.p).toEqual([]);
+  });
+
   test("a size failure in the final step (its own staging over the send limit) is the named non-retryable error, nothing reconciled", async () => {
     await clearFacts(db);
     const run = await stagedRun();

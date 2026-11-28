@@ -399,3 +399,61 @@ describe("legacyAndTurns: linear append, no argument spread (the whole-set path 
     expect(() => [].push(...(items as never[]))).toThrow(RangeError);
   });
 });
+
+describe("observed paths (dormant option)", () => {
+  /** The fixture plus one tool result that is a git status listing. */
+  const withStatus = () => {
+    const fx = outputFixture();
+    const result = fx.projectionRows.find((r) => r.table === "convergence_events" && r.row.actor_role === "tool_result")!;
+    fx.projectionRows.push({ table: "convergence_events", row: { ...result.row, event_id: "status-1", content: " M src/a.ts\n?? docs/b.md\n" } });
+    return fx;
+  };
+  test("off (the default): rows are byte-identical to before and carry no observed_paths key", () => {
+    const fx = withStatus();
+    const off = outputFactsFromScope(OUTPUT_FIXTURE_SCOPE, fx, 1);
+    expect(outputFactsFromScope(OUTPUT_FIXTURE_SCOPE, fx, 1, { observedPaths: false })).toEqual(off);
+    for (const e of off.events) expect("observed_paths" in e).toBe(false);
+  });
+  test("on: only tool results that are listings gain paths, and only their fingerprints change", () => {
+    const fx = withStatus();
+    const off = outputFactsFromScope(OUTPUT_FIXTURE_SCOPE, fx, 1), on = outputFactsFromScope(OUTPUT_FIXTURE_SCOPE, fx, 1, { observedPaths: true });
+    expect(on.events).toHaveLength(off.events.length);
+    const status = on.events.find((e) => e.event_id === "status-1")!;
+    expect(status.observed_paths).toEqual(["src/a.ts", "docs/b.md"]);
+    expect(status.fingerprint).not.toBe(off.events.find((e) => e.event_id === "status-1")!.fingerprint);
+    for (const [i, e] of on.events.entries()) {
+      if (e.event_id === "status-1") continue;
+      expect(e.observed_paths).toEqual([]);
+      expect(e.fingerprint).toBe(off.events[i]!.fingerprint);
+      expect(e.row_id).toBe(off.events[i]!.row_id);
+    }
+    expect(on.facts).toEqual(off.facts);
+  });
+  test("on: --stat output stores nothing, for either of two real trees that print it identically", () => {
+    const fx = outputFixture();
+    const result = fx.projectionRows.find((r) => r.table === "convergence_events" && r.row.actor_role === "tool_result")!;
+    // git diff --cached --stat for a tree with "tail" and for one with "tail " (a trailing space): byte-identical.
+    const same = " long-sibling.ts | 1 +\n tail            | 1 +\n 2 files changed, 2 insertions(+)\n";
+    for (const id of ["stat-tail", "stat-tail-space"]) fx.projectionRows.push({ table: "convergence_events", row: { ...result.row, event_id: id, content: same } });
+    fx.projectionRows.push({ table: "convergence_events", row: { ...result.row, event_id: "stat-rename", content: " draft => final.txt | 0\n src/{a => b}/x.ts  | 1 +\n 2 files changed, 1 insertion(+)\n" } });
+    const off = outputFactsFromScope(OUTPUT_FIXTURE_SCOPE, fx, 1), on = outputFactsFromScope(OUTPUT_FIXTURE_SCOPE, fx, 1, { observedPaths: true });
+    for (const id of ["stat-tail", "stat-tail-space", "stat-rename"]) {
+      const e = on.events.find((x) => x.event_id === id)!;
+      expect(e.observed_paths).toEqual([]);
+      expect(e.fingerprint).toBe(off.events.find((x) => x.event_id === id)!.fingerprint);
+    }
+  });
+  test("on: a tool result of indented prose or a status-shaped log line gains no paths", () => {
+    const fx = outputFixture();
+    const result = fx.projectionRows.find((r) => r.table === "convergence_events" && r.row.actor_role === "tool_result")!;
+    const texts = ["   three spaces then an ordinary sentence", "   - a list item\n   - another", " M looks like status but is prose", "build ok\n M src/a.ts",
+      "?? old -> synthetic-token", "UU old -> synthetic-token", "RR synthetic-token",
+      " synthetic confidential prose | Bin arbitrary log text\n 1 file changed", " old.ts => new.ts | 3 +++\n 1 file changed, 2 insertions(+)", ' "q\\"uote.txt" | 1 +\n 1 file changed, 1 insertion(+)', ' M "a b.txt"', '?? bad"name', "A  tail\u00a0", "A  tail\u00a0\n M ok.ts", "?? /tmp/non-repository-file", "R  a -> /b", 'R  "src\u0000name" -> dst', 'R  "\\\\server\\share" -> dst'];
+    for (const [i, content] of texts.entries()) fx.projectionRows.push({ table: "convergence_events", row: { ...result.row, event_id: `prose-${i}`, content } });
+    const off = outputFactsFromScope(OUTPUT_FIXTURE_SCOPE, fx, 1), on = outputFactsFromScope(OUTPUT_FIXTURE_SCOPE, fx, 1, { observedPaths: true });
+    for (const [i, e] of on.events.entries()) {
+      expect(e.observed_paths).toEqual([]);
+      expect(e.fingerprint).toBe(off.events[i]!.fingerprint);
+    }
+  });
+});

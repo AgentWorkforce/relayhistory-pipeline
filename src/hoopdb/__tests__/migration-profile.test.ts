@@ -2723,7 +2723,23 @@ describe("function boundary: ACL manifest, residual, activation gate", () => {
       const open = src.indexOf(tag, start) + tag.length;
       return src.slice(open, src.indexOf(tag, open));
     };
-    // 20261105062350 (the buffered feed page keyset) is newest: 062340's down refuses (55000) while it is applied; its
+    // 20261105062400 (observed paths on event facts) is newest: 062350's down refuses (55000) while it is applied; its
+    // checksum-pinned down restores 045040's exact output_facts_reconcile and 062140's exact staged_facts_reconcile_v1
+    // bodies (ACLs kept), drops the observed_paths column and its ledger row, and refuses on a rerun.
+    const OBS = "upstream:20261105062400_event_facts_observed_paths.sql";
+    expect(await names()).toContain(OBS);
+    expect((await failure(rollback("20261105062350_buffered_search_feed_page_keyset.down.sql")))?.code).toBe("55000");
+    const reconcilers = [
+      ["sessions.output_facts_reconcile(text,text,text,text[],text,jsonb,jsonb,boolean,bigint)", "20261105045040_selfhost_output_facts.sql", "output_facts_reconcile", "$reconcile$"],
+      ["sessions.staged_facts_reconcile_v1(bigint,uuid,text,text,text,text[],text,boolean,bigint)", "20261105062140_staged_output_facts.sql", "staged_facts_reconcile_v1", /CREATE FUNCTION sessions\.staged_facts_reconcile_v1\([^]*?AS (\$\w*\$)/.exec(readFileSync(join(root, "supabase/migrations/20261105062140_staged_output_facts.sql"), "utf8"))![1]!],
+    ] as const;
+    for (const [sig] of reconcilers) expect((await procSrc(sig)).s).toContain("observed_paths = EXCLUDED.observed_paths");
+    await rollback("20261105062400_event_facts_observed_paths.down.sql");
+    expect(await names()).not.toContain(OBS);
+    for (const [sig, file, name, tag] of reconcilers) expect(await procSrc(sig)).toEqual({ s: bodyOf(file, name, tag), d: true });
+    expect((await db.query<{ n: number }>("SELECT count(*)::int n FROM pg_attribute WHERE attrelid = 'sessions.session_event_facts'::regclass AND attname = 'observed_paths' AND NOT attisdropped")).rows[0]!.n).toBe(0);
+    expect((await failure(rollback("20261105062400_event_facts_observed_paths.down.sql")))?.code).toBe("55000");
+    // 20261105062350 (the buffered feed page keyset) is then newest: 062340's down refuses (55000) while it is applied; its
     // lane-generated, checksum-pinned down restores 043870's exact page function (body and proconfig), removes its
     // ledger row, and refuses on a rerun.
     const BPK = "upstream:20261105062350_buffered_search_feed_page_keyset.sql";

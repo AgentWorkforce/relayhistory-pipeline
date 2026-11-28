@@ -38,6 +38,8 @@ const PAGE_KEYSET_DOWN = read("supabase/rollbacks/20261105062350_buffered_search
 // 20261105062340 (the per-org erasure history) sits above 062330: its down runs before 062330's.
 const HISTORY_STEP = "upstream:20261105062340_ingest_org_erasure_history.sql";
 const HISTORY_DOWN = read("supabase/rollbacks/20261105062340_ingest_org_erasure_history.down.sql");
+// 20261105062400 (observed paths on event facts) is newest: its down comes off first of all.
+const OBSERVED_PATHS_DOWN = read("supabase/rollbacks/20261105062400_event_facts_observed_paths.down.sql");
 const V1_SQL = read("supabase/migrations/20261105062000_coordination_advisories.sql");
 const LOCAL: MigrationProfile = { mode: "local", shim: true, bootstrap: true, verify: false, runtimeRole: "postgres" };
 
@@ -153,6 +155,7 @@ describe("20261105062220 coordination advisories: the advisory instance", () => 
     expect(SQL).not.toMatch(/ADD COLUMN incarnation uuid[^;]*DEFAULT/i);
     // Before: roll 062220 back, write pending, delivered and acked rows through 062000's v1, then re-apply 062220.
     await reset();
+    await db.exec(OBSERVED_PATHS_DOWN);
     await db.exec(PAGE_KEYSET_DOWN);    await db.exec(HISTORY_DOWN);
     await db.exec(CUSTOM_PLANS_DOWN);
     await db.exec(HOLD_DOWN);
@@ -359,8 +362,9 @@ describe("20261105062220 rollback", () => {
     const h = harness(() => db);
     const message = async (sql: string) => { const m = await db.exec(sql).then(() => null, (e: Error) => e.message); await db.exec("ROLLBACK").catch(() => {}); return m; };
     try {
-      expect((await plan(LOCAL)).filter((s) => s.name.startsWith("upstream:") && s.name > STEP).map((s) => s.name)).toEqual([SEARCH_STAGE_STEP, HOLD_STEP, CUSTOM_PLANS_STEP, HISTORY_STEP, PAGE_KEYSET_STEP]);
+      expect((await plan(LOCAL)).filter((s) => s.name.startsWith("upstream:") && s.name > STEP).map((s) => s.name)).toEqual([SEARCH_STAGE_STEP, HOLD_STEP, CUSTOM_PLANS_STEP, HISTORY_STEP, PAGE_KEYSET_STEP, "upstream:20261105062400_event_facts_observed_paths.sql"]);
       expect(await message(DOWN)).toContain("a later migration is applied");
+      await db.exec(OBSERVED_PATHS_DOWN);
       await db.exec(PAGE_KEYSET_DOWN);
       await db.exec(HISTORY_DOWN);
       await db.exec(CUSTOM_PLANS_DOWN);
