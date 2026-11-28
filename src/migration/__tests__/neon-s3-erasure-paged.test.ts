@@ -12,6 +12,8 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { FakeS3Versions } from "./fake-s3-versions.ts";
 import { DEFAULT_ERASURE_CONFIG, ErasureJob, eraseScope } from "../neon-s3-erasure/job.ts";
+import { exitStatusForError } from "../neon-s3-erasure/main.ts";
+import { ShortLivedCredentialError } from "../short-lived-credentials.ts";
 import { liveStagedPrefix, liveTargets, livePointerPrefix } from "../neon-s3-erasure/live.ts";
 import type { ErasureAuthority, LegacyFencedGroup } from "../neon-s3-erasure/authority.ts";
 import type { LiveFencedGroup } from "../neon-s3-sync/neon-reader.ts";
@@ -474,3 +476,34 @@ describe("retirement cursor bound to the proof workset (lead 913e7ba5 case b)", 
 
 // Keep the pointer-prefix helper referenced (the live layout the tests address).
 void livePointerPrefix;
+
+describe("short-lived eraser key refused inside sweep (T56 review)", () => {
+  const expired = () => new ShortLivedCredentialError("short_lived_expired.eraser");
+  test("live fenced erase: a signing refusal propagates out of the public sweep (exit 75), never a zero count", async () => {
+    const s = new FakeS3Versions();
+    const st = await state();
+    fill(s, 3);
+    s.onDelete = () => { throw expired(); };
+    const j = job(s, st, authority({ legacyFencedPage: async () => [] as LegacyFencedGroup[], stillLegacyFenced: async () => true }));
+    let err: unknown; try { await j.sweep(); } catch (e) { err = e; }
+    expect((err as { code?: string }).code).toBe("short_lived_expired.eraser");
+    expect(exitStatusForError(err)).toBe(75);
+    expect(j.counters.liveFenceFailed).toBe(0); // not converted into an ordinary failed live sweep
+    // Renewal: the same sweep then erases the group's versions.
+    s.onDelete = undefined;
+    await job(s, st, authority({ legacyFencedPage: async () => [] as LegacyFencedGroup[], stillLegacyFenced: async () => true })).sweep();
+    expect(s.count(T.base)).toBe(0);
+  });
+  test("legacy fenced erase: a refusal propagates out of sweep; a genuine legacy failure keeps its current handling", async () => {
+    const s = new FakeS3Versions();
+    const st = await state();
+    const base = { fencedLivePage: async () => [], stillLegacyFenced: async () => true };
+    let err: unknown;
+    try { await job(s, st, authority({ ...base, legacyFencedPage: async () => { throw expired(); } })).sweep(); } catch (e) { err = e; }
+    expect((err as { code?: string }).code).toBe("short_lived_expired.eraser");
+    expect(exitStatusForError(err)).toBe(75);
+    const control = job(s, st, authority({ ...base, legacyFencedPage: async () => { throw Object.assign(new Error("broken"), { code: "legacy_rpc_broken" }); } }));
+    await control.sweep(); // still absorbed and counted, as before
+    expect(control.counters.legacyFenceFailed).toBe(1);
+  });
+});

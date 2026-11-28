@@ -109,6 +109,99 @@ export interface UnitResult {
   lines: number;
 }
 
+/**
+ * A session's kept location: the d= of its first exported manifest and that manifest's started_at (same UTC day),
+ * with the exact object observed (key and version) and its session_uuid. Under the lease the stream re-reads the key and
+ * goes on only if it is still that object (`checkPin`); the observation itself is advisory.
+ */
+export interface DatePin {
+  startDate: string;
+  startedAt: string;
+  key: string;
+  version: ObjectVersion;
+  sessionUuid: string;
+}
+
+function unpinnedLocation(target: ExportTarget, unit: SessionUnit, sourceMachineId: string): Omit<SessionLocation, "startDate"> {
+  return {
+    prefix: orgPrefix(target.keyRoot, unit.orgId),
+    workspaceId: component(unit.workspaceId),
+    machineId: component(sourceMachineId),
+    harness: component(unit.source),
+    sessionId: component(unit.sessionId),
+  };
+}
+
+/**
+ * Whether an exported manifest records exactly this raw Neon machine id (`component()` is lossy: `delivery:x` and
+ * `delivery_x` share a key). Both recorded ids must be present and equal to it; anything missing or different fails closed.
+ */
+function sameRawMachine(manifest: ManifestV1, sourceMachineId: string): boolean {
+  const bulls = manifest.extensions?.[SESSION_EXT] as { canonical_machine_id?: unknown } | undefined;
+  const catalog = (manifest.extensions?.[EXPORT_MARKER] as { catalog?: { neon_machine_id?: unknown } } | undefined)?.catalog;
+  return bulls?.canonical_machine_id === sourceMachineId && catalog?.neon_machine_id === sourceMachineId;
+}
+
+/** A session location without its date: two streams of one unit must never share it. */
+const undatedLocation = (loc: SessionLocation) =>
+  JSON.stringify([loc.prefix ?? "", loc.workspaceId, loc.machineId, loc.harness, loc.sessionId]);
+
+const sameVersion = (a: ObjectVersion, b: ObjectVersion) => a.eTag === b.eTag && a.version === b.version;
+
+/**
+ * The kept location of this unit's stream for `sourceMachineId`, if it was exported before under another d=.
+ *
+ * Neon's earliest event time for a session can move earlier after it was first exported (a later ingest carries an
+ * older event). Re-deriving d= from it each run forked the session: a second manifest at the earlier date while the
+ * first stays live until the erasure job removes its prefix (stale_prefix), and the indexer retries the new key as
+ * pointer_move_pending meanwhile. Like the live writer's location pointer (session-ingest/writer.ts resolveLocation),
+ * the first exported location is kept instead.
+ *
+ * Only an unambiguous prior is pinned; anything else is unpinned (exactly the behaviour before the pin):
+ * - exactly one of `priorKeys` is a manifest key of this stream's location (prefix, workspace, machine, harness,
+ *   session) at any date, and that date is not the computed one. Two or more (a fork made before the pin, or a failed
+ *   run's keys merged into the row by markFailed) or one at the computed date: unpinned.
+ * - its manifest is readable, this exporter's own export of this session, records this exact raw machine id, is dated
+ *   as its key says (so the manifest written under it validates), has a session_uuid and a comparable version.
+ * A missing or invalid (foreign_manifest_invalid) manifest is unpinned; any other read failure propagates.
+ */
+export async function datePin(
+  target: ExportTarget,
+  unit: SessionUnit,
+  sourceMachineId: string,
+  priorKeys: readonly string[] | undefined,
+): Promise<DatePin | undefined> {
+  if (!priorKeys?.length) return undefined;
+  const want = unpinnedLocation(target, unit, sourceMachineId);
+  const computed = new Date(unit.firstMs).toISOString().slice(0, 10);
+  const candidates = [...new Set(priorKeys)].filter((key) => {
+    const loc = parseSessionKey(key);
+    return !!loc && loc.rest === "manifest.json" && (loc.prefix ?? "") === (want.prefix ?? "") && loc.workspaceId === want.workspaceId &&
+      loc.machineId === want.machineId && loc.harness === want.harness && loc.sessionId === want.sessionId;
+  });
+  // Two or more: ambiguous (a fork made before the pin, or a failed run's keys merged by markFailed). Unpinned, so the
+  // stream goes to the computed date and the other keys take the stale_prefix path, exactly as before the pin.
+  if (candidates.length !== 1) return undefined;
+  const key = candidates[0]!;
+  const loc = parseSessionKey(key)!;
+  if (loc.startDate === computed) return undefined;
+  let found: Awaited<ReturnType<typeof readManifest>>;
+  try {
+    found = await readManifest(target.store, key);
+  } catch (error) {
+    if ((error as { code?: unknown }).code === "foreign_manifest_invalid") return undefined;
+    throw error;
+  }
+  if (!found || ownershipIssue(found.manifest, target.grantId, unitIdentity(unit))) return undefined;
+  if (!sameRawMachine(found.manifest, sourceMachineId)) return undefined;
+  if (found.version.eTag === undefined && found.version.version === undefined) return undefined;
+  const startedAt = found.manifest.session.started_at;
+  if (!Number.isFinite(Date.parse(startedAt)) || new Date(startedAt).toISOString().slice(0, 10) !== loc.startDate) return undefined;
+  const sessionUuid = (found.manifest.extensions?.[SESSION_EXT] as { session_uuid?: unknown } | undefined)?.session_uuid;
+  if (typeof sessionUuid !== "string" || sessionUuid === "") return undefined;
+  return { startDate: loc.startDate, startedAt: new Date(startedAt).toISOString(), key, version: found.version, sessionUuid };
+}
+
 class MachineStream {
   readonly loc: SessionLocation;
   readonly key: string;
@@ -135,18 +228,13 @@ class MachineStream {
     readonly target: ExportTarget,
     readonly unit: SessionUnit,
     readonly sourceMachineId: string,
+    /** The session's first exported location (datePin): its d= and started_at are kept, so a date move cannot fork it. */
+    readonly pin?: DatePin,
   ) {
     this.rawChunkSealer = target.rawChunkSealer;
     this.scrubVersion = this.rawChunkSealer?.marker.version ?? SCRUB_RULESET_VERSION;
-    const startDate = new Date(unit.firstMs).toISOString().slice(0, 10);
-    this.loc = {
-      prefix: orgPrefix(target.keyRoot, unit.orgId),
-      workspaceId: component(unit.workspaceId),
-      machineId: component(sourceMachineId),
-      harness: component(unit.source),
-      sessionId: component(unit.sessionId),
-      startDate,
-    };
+    const startDate = pin?.startDate ?? new Date(unit.firstMs).toISOString().slice(0, 10);
+    this.loc = { ...unpinnedLocation(target, unit, sourceMachineId), startDate };
     this.key = manifestKey(this.loc);
     // Stable while the key is stable, so a reused chunk's trace-id metadata
     // always equals the manifest's trace_id.
@@ -160,6 +248,25 @@ class MachineStream {
       return found;
     });
     return this.#existing;
+  }
+
+  /**
+   * Under the lease: the stored manifest must still be the object datePin observed (same key, version, raw machine,
+   * started_at). Gone or changed between the two reads (erased, rewritten): abort, so the key is not recorded and
+   * nothing is written; the retry resolves the pin again.
+   */
+  async checkPin() {
+    const pin = this.pin;
+    if (!pin) return;
+    const found = await this.existing();
+    if (
+      pin.key !== this.key ||
+      !found ||
+      !sameVersion(found.version, pin.version) ||
+      !sameRawMachine(found.manifest, this.sourceMachineId) ||
+      Date.parse(found.manifest.session.started_at) !== Date.parse(pin.startedAt)
+    )
+      throw coded("date_pin_changed", "the pinned manifest changed before the session lease was taken");
   }
 
   async push(line: StreamLine) {
@@ -338,7 +445,7 @@ async function buildManifest(
   const owner = `migration:${grantId}`;
   const entries = stream.entries;
   const last = entries.at(-1)!;
-  const startedAt = new Date(unit.firstMs).toISOString();
+  const startedAt = stream.pin?.startedAt ?? new Date(unit.firstMs).toISOString();
   const userId = stream.userId ?? "unknown";
   const orgId = unit.orgId;
   return {
@@ -354,7 +461,7 @@ async function buildManifest(
       harness: stream.loc.harness,
       session_id: stream.loc.sessionId,
       started_at: startedAt,
-      ended_at: new Date(Math.max(unit.lastMs, unit.firstMs)).toISOString(),
+      ended_at: new Date(Math.max(unit.lastMs, unit.firstMs, Date.parse(startedAt))).toISOString(),
     },
     writer: { delivery_instance_id: owner, plugin_version: SYNC_PLUGIN_VERSION },
     raw: {
@@ -375,7 +482,8 @@ async function buildManifest(
     },
     extensions: {
       [SESSION_EXT]: {
-        session_uuid: derivedUuidV7(`session\n${stream.key}`, unit.firstMs),
+        // A pinned stream keeps its manifest's session_uuid (Alleyoop reads it); it would move with firstMs otherwise.
+        session_uuid: stream.pin?.sessionUuid ?? derivedUuidV7(`session\n${stream.key}`, unit.firstMs),
         session_uuid_source: "minted",
         tenant_id: orgId,
         user_id: userId,
@@ -394,7 +502,8 @@ async function buildManifest(
           neon_session_id: unit.sessionId,
           neon_workspace_id: unit.workspaceId,
           neon_source: unit.source,
-          first_activity: startedAt,
+          // Neon's own first activity; started_at may be the pinned (layout) one.
+          first_activity: new Date(unit.firstMs).toISOString(),
           last_activity: new Date(unit.lastMs).toISOString(),
           neon_machine_id: stream.sourceMachineId,
           ...unit.totals,
@@ -470,6 +579,8 @@ export async function exportUnit(
      * reservation lock. Throws (and the manifest is not written) if any of them is reserved for erasure.
      */
     onPublish?: (manifestKey: string, referenced: readonly string[]) => void;
+    /** Manifest keys this session was exported under before (state `exported`): a stream keeps its first location. */
+    priorKeys?: readonly string[];
   } = {},
 ): Promise<UnitResult> {
   if (await source.fenced(unit, opts.freshFence)) return { fenced: true, manifests: [], lines: 0 };
@@ -479,10 +590,11 @@ export async function exportUnit(
     lines += 1;
     let stream = streams.get(line.machine);
     if (!stream) {
-      stream = new MachineStream(target, unit, line.machine);
-      // Two Neon machines that sanitize to one key would interleave: refuse.
+      stream = new MachineStream(target, unit, line.machine, await datePin(target, unit, line.machine, opts.priorKeys));
+      // Two Neon machines that sanitize to one key would interleave: refuse. Compared without the date, so a pinned
+      // stream and an unpinned alias of it (same machine component, another d=) are refused too.
       for (const other of streams.values())
-        if (other.key === stream.key)
+        if (undatedLocation(other.loc) === undatedLocation(stream.loc))
           throw Object.assign(new Error("two machines map to one key"), { code: "machine_key_collision" });
       // Ownership first: a foreign or colliding manifest throws here and its key
       // is never recorded (the eraser cannot read manifests, so only owned keys
@@ -490,6 +602,7 @@ export async function exportUnit(
       // before anything is written under it.
       opts.onLease?.(stream.key);
       await stream.existing();
+      await stream.checkPin();
       opts.onKey?.(stream.key);
       streams.set(line.machine, stream);
     }
