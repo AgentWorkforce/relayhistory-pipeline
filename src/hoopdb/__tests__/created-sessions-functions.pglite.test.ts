@@ -1,0 +1,96 @@
+/**
+ * createdSessionsFunctions against a live catalogue (PGlite). For each CREATE FUNCTION spelling, the parsed key is either
+ * exactly the regprocedure key of the function that statement creates, or no catalogue key at all (under-credit, the
+ * safe direction). It may never be another existing overload's key (over-credit). Overloads of the same name that
+ * already exist are in the catalogue for every case. Plus: the real 062360 migration's parsed keys, after a full
+ * migrate, are its live catalogue keys (the reader with its DEFAULTs included).
+ */
+import { afterAll, describe, expect, setDefaultTimeout, test } from "bun:test";
+import { readFileSync } from "node:fs";
+import { join } from "node:path";
+import { PGlite } from "@electric-sql/pglite";
+import { btree_gin } from "@electric-sql/pglite/contrib/btree_gin";
+import { pg_trgm } from "@electric-sql/pglite/contrib/pg_trgm";
+import { createdSessionsFunctions } from "../migrate-guards.ts";
+import { REPO_ROOT, applySupabaseSchema } from "../../session-ingest/__tests__/pglite-schema.ts";
+
+setDefaultTimeout(300_000);
+const open: PGlite[] = [];
+afterAll(async () => { await Promise.all(open.map((d) => d.close())); });
+
+const catalogue = async (db: PGlite) => new Set((await db.query<{ f: string }>(
+  "SELECT p.oid::regprocedure::text f FROM pg_proc p JOIN pg_namespace n ON n.oid=p.pronamespace WHERE n.nspname='sessions'")).rows.map((r) => r.f));
+
+// Argument lists that PostgreSQL accepts. Every case is created next to existing overloads g(text) and g(text,integer).
+const CASES = [
+  "a text, b integer DEFAULT 1",
+  "text, integer = 1",
+  "a text DEFAULT 'x', b integer DEFAULT 1",
+  "a text DEFAULT 'x,y', b integer DEFAULT 1",
+  "a text DEFAULT '=', b integer DEFAULT 1",
+  "a text DEFAULT 'a=b', b integer DEFAULT 1",
+  "a text DEFAULT $$q,r$$, b integer DEFAULT 1",
+  "a text DEFAULT E'it''s', b integer DEFAULT -1",
+  "a text DEFAULT NULL::text, b integer DEFAULT 1",
+  "a text = coalesce(null,'d'), b integer = 2",
+  "a text DEFAULT '''', b integer DEFAULT 1",
+  "a text\n DEFAULT\n NULL, b integer DEFAULT 1",
+  "a text DEFAULT current_setting('x'), b integer DEFAULT 5",
+  "a text DEFAULT '--', b integer DEFAULT 1",
+  // hard-delete-owner's repro at 9db388ec: the balanced-paren scan closes the argument list at the quoted ')', and a
+  // stripped DEFAULT then yielded "(text)", another existing overload's key.
+  "a text DEFAULT ')', b integer DEFAULT 1",
+  "a text DEFAULT '(', b integer DEFAULT 1",
+  "a text DEFAULT $$)$$, b integer DEFAULT 1",
+  "a text DEFAULT '/*', b integer DEFAULT 1",
+  "a text DEFAULT 'x', b integer DEFAULT (1)",
+  "a text, b integer DEFAULT 1, c jsonb DEFAULT '{}'::jsonb",
+  "a text, c jsonb DEFAULT '{\"k\":1,\"j\":2}'::jsonb",
+  "org text, workspace text, after_cursor jsonb DEFAULT NULL, page_size integer DEFAULT 512",
+];
+
+describe("createdSessionsFunctions, catalogue-backed", () => {
+  test("every spelling parses to its own catalogue key or to no catalogue key: never another overload", async () => {
+    const db = new PGlite();
+    open.push(db);
+    await db.exec("CREATE SCHEMA sessions");
+    for (const [i, c] of CASES.entries()) {
+      const name = `sessions.g${i}`;
+      // The overloads an over-credit could name: same name, one and two arguments, created first.
+      await db.exec(`CREATE FUNCTION ${name}(a text) RETURNS void LANGUAGE sql AS 'SELECT'; CREATE FUNCTION ${name}(a jsonb) RETURNS void LANGUAGE sql AS 'SELECT';`);
+      const sql = `CREATE FUNCTION ${name}(${c}) RETURNS void LANGUAGE sql AS 'SELECT';`;
+      const before = await catalogue(db);
+      await db.exec(sql);
+      const own = [...(await catalogue(db))].filter((k) => !before.has(k));
+      expect([c, own.length]).toEqual([c, 1]);
+      const all = await catalogue(db);
+      for (const k of createdSessionsFunctions([sql])) {
+        // Exactly the created function, or nothing the catalogue knows.
+        expect([c, k === own[0] || !all.has(k)]).toEqual([c, true]);
+      }
+    }
+  });
+
+  test("the defaults without quotes are credited exactly (the case the DEFAULT strip exists for)", async () => {
+    const db = new PGlite();
+    open.push(db);
+    await db.exec("CREATE SCHEMA sessions");
+    for (const [i, c] of ["a text, b integer DEFAULT 1", "text, integer = 1", "a text DEFAULT NULL::text, b integer DEFAULT 1",
+      "org text, workspace text, after_cursor jsonb DEFAULT NULL, page_size integer DEFAULT 512"].entries()) {
+      const sql = `CREATE FUNCTION sessions.h${i}(${c}) RETURNS void LANGUAGE sql AS 'SELECT';`;
+      await db.exec(sql);
+      const own = (await db.query<{ f: string }>(`SELECT 'sessions.h${i}'::regproc::regprocedure::text f`)).rows[0]!.f;
+      expect([c, [...createdSessionsFunctions([sql])]]).toEqual([c, [own]]);
+    }
+  });
+
+  test("the real 062360 migration: every parsed key is a live catalogue key after a full migrate (the reader included)", async () => {
+    const db = new PGlite({ extensions: { btree_gin, pg_trgm } });
+    open.push(db);
+    await applySupabaseSchema(db, {});
+    const live = await catalogue(db);
+    const parsed = [...createdSessionsFunctions([readFileSync(join(REPO_ROOT, "supabase/migrations/20261105062360_session_erasure_replay_manifest.sql"), "utf8")])];
+    expect(parsed).toContain("sessions.session_erasure_replay_read(text,text,text,text,jsonb,integer)");
+    for (const k of parsed) expect([k, live.has(k)]).toEqual([k, true]);
+  });
+});

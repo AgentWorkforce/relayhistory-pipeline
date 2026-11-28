@@ -2251,9 +2251,12 @@ function splitTopLevel(s: string): string[] {
 
 /** One signature argument in regprocedure spelling: no mode, no name, canonical type name. */
 function normalizeSignatureArg(raw: string): string {
-  // A parameter default (`name type DEFAULT expr` or `name type = expr`) is not part of the signature: the argument is
-  // already split at top-level commas, so everything from the DEFAULT keyword or the `=` on is the default expression.
-  let a = raw.trim().replace(/\s+/g, " ").replace(/\s+default\s[\s\S]*$/i, "").replace(/\s*=[\s\S]*$/, "");
+  // A parameter default (`name type DEFAULT expr` or `name type = expr`) is not part of the signature. It is dropped
+  // only when the default holds no quote or dollar quote: the comma split and the comment strip before it do not track
+  // literals, so an argument that contains one is left as it is and matches no manifest key (under-credit, the safe
+  // direction), never a shorter key that could name another overload.
+  let a = raw.trim().replace(/\s+/g, " ");
+  if (!/['$]/u.test(a)) a = a.replace(/\s+default\s[\s\S]*$/i, "").replace(/\s*=[\s\S]*$/, "");
   let array = "";
   while (a.endsWith("[]")) {
     array += "[]";
