@@ -2290,9 +2290,11 @@ function normalizeGrantTarget(raw: string): string | null {
  * The manifest keys ("sessions.fn(type,...)") of the sessions functions the given SQL
  * creates with a literal `CREATE [OR REPLACE] FUNCTION sessions.fn(args)`. Argument
  * lists are matched with balanced parentheses and normalized like pendingExecuteGrants
- * (a parameter DEFAULT is dropped: it is not part of the signature); an argument list it
- * cannot normalize (OUT, dynamic SQL) yields a key that matches no manifest entry, so the
- * caller under-credits: the safe direction.
+ * (a parameter DEFAULT is dropped: it is not part of the signature). A header whose
+ * argument list holds any quote (a quoted identifier, a string or dollar-quoted literal)
+ * is skipped entirely: the scan does not track quoting and may have closed early. That,
+ * and an argument list it cannot normalize (OUT, dynamic SQL), under-credits: the safe
+ * direction, never another overload's key.
  */
 export function createdSessionsFunctions(sql: readonly string[]): Set<string> {
   const created = new Set<string>();
@@ -2311,6 +2313,10 @@ export function createdSessionsFunctions(sql: readonly string[]): Set<string> {
         else if (text[i] === ")") depth--;
       }
       if (depth !== 0) continue;
+      // Conservative refusal: the paren scan, the comma split and the comment strip do not track quoting, so a quoted
+      // identifier or a literal anywhere in the argument list (which may itself have closed the scan early) makes the
+      // whole header ambiguous. Credit nothing for it (under-credit, the safe direction), before any dequoting.
+      if (/["'$]/u.test(text.slice(open, i - 1))) continue;
       const fn = normalizeGrantTarget(`${m[1]!.replace(/\s+/g, "")}(${text.slice(open, i - 1)})`);
       if (fn) created.add(fn);
     }

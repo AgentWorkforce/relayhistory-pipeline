@@ -46,6 +46,11 @@ const CASES = [
   // normalizing, so the truncated remainder must still name no catalogue signature.
   '"a)" text, b integer DEFAULT 1',
   '"text" text, b integer DEFAULT 1',
+  // Pipeline (5a8970329576): both conditions together. The quoted name ends the scan at its ')', and the dequoted
+  // prefix is itself a catalogue type ("text", "jsonb"), so a careless parser would credit g(text) or g(jsonb).
+  '"text)" integer, b integer DEFAULT 1',
+  '"jsonb)" integer, b integer DEFAULT 1',
+  '"text," integer, b integer DEFAULT 1',
   "a text DEFAULT '/*', b integer DEFAULT 1",
   "a text DEFAULT 'x', b integer DEFAULT (1)",
   "a text, b integer DEFAULT 1, c jsonb DEFAULT '{}'::jsonb",
