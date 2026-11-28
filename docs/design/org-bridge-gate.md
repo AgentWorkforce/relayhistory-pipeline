@@ -560,3 +560,49 @@ layout with two labelled toy readers:
     per-session outcomes.
 - Production reader wiring, grants, the migration and release remain held. B needs an unassigned forward slot
   (062400 belongs to T51). The PG17 two-connection orderings wait for the reserved lane. Wave 1 is held.
+
+### Narrow wave 1: Read Worker and read-API routes (static trace at 6d60dc4f; lander 16ff7d4938ce)
+
+**Finding: no Read Worker route runs the operator fence (`ingest_operator_runtime_erased`) before or after IO.**
+The Worker builds its app with no `operatorErased` (packages/session-read-worker/src/index.ts:655-691; see also its
+comment at :928). The hosted Lambda binds the fence only for `entry === "service"` with
+`SESSION_ERASE_FENCE_ENFORCED` (src/session-read-api/lambda.ts:749). The only erase checks on these routes are SQL
+tombstones (`session_index.deleted_at`).
+
+| Route | Reads canonical bytes? | Fence today | Reach gate (and fallback) | Enrolled org can reach? |
+|---|---|---|---|---|
+| GET `/v1/canonical/sessions/:id`, raw (default) | yes: pointers via PostgREST, then manifests and chunks (W/canonical.ts:413,425) | tombstone pre only; **no post-IO recheck** | `CANONICAL_READ_ENABLED=true` (live in wrangler.jsonc:68); service bearer `session_directory_search_worker` with an org claim; **no org allow-list**; it runs before the auth and config step; errors give 501, which the caller treats as "fall back" | **Yes**, for any org Cloud mints a service token for |
+| same route, pages mode | published replay pages (derived) | publication `deleted_at` pre and post | `CANONICAL_READ_MODE=pages` | Config-dependent |
+| GET `/v1/canonical/analyses/:id` | derived analysis-cache objects | SQL claim pre; publication re-read post | `CANONICAL_READ_ENABLED` and pages mode | Config-dependent |
+| GET `/v1/sessions/:id/events`, hosted canonical branch | yes | `hostedFenced` is a no-op (`operatorErased` unbound, app.ts:1042); post: tombstone plus partial recheck | `READ_API_CANONICAL_EVENTS_HOSTED`, the `READ_API_CANONICAL_EVENTS_WORKSPACES` allow-list (empty means none); otherwise ClickHouse | Config-dependent (allow-list) |
+| `/timing`, `/turns`, `/metadata` | yes | tombstone pre only | the `READ_API_DIRECTORY_WORKSPACES` canary (empty in wrangler.jsonc:52), the raw store; otherwise 501 | Config-dependent (canary) |
+| `/summary` (long fallback) | derived summary objects | tombstone | the brief and summary-fallback flags, canary | Config-dependent |
+| `/analysis` | derived result objects | **none** | `READ_API_ANALYSIS_ENABLED` (Lambda too) | Config-dependent |
+| `/v1/delivery/records` | babysitter retention buckets | none | `READ_API_BABYSITTER_EVIDENCE=on` | Config-dependent; overlap with v1 prefixes is UNKNOWN |
+| `/catalog` | yes | middleware (self-host only) | self-host only | No |
+| search, list, facts and coordination routes | no canonical reads found (ClickHouse/SQL) | none | own flags | n/a |
+
+No route passes chunk bytes through raw: chunks are decompressed in the Worker and returned as projected rows,
+including the full record payload.
+
+**Where the fence has to go for W2:**
+- W/canonical.ts between :307 and :358, and again before each `Response.json` (:388, :532);
+- analysis-cache.ts before :125 and :139;
+- app.ts:855, by binding `operatorErased` in index.ts:655, which covers timing, turns, metadata, summary, analysis
+  and events;
+- the existing hosted-events post-check at app.ts:1212.
+
+The `/v1/canonical/*` routes skip `createReadApi`, so they need their own SQL check. The `ingest_operator_runtime_erased`
+grant found is to `bulls96_read_api` only (050020:361), not to the PostgREST service role.
+
+**UNKNOWN (deploy-time):**
+- the live `CANONICAL_READ_MODE`;
+- the live hosted-events, directory-canary and raw-store flags, and whether the raw-store secrets are deployed;
+- which orgs Cloud mints `session_directory_search_worker` tokens for;
+- whether the babysitter key root overlaps canonical prefixes;
+- the partial-canonical branch (6e37080f), which was not reviewed here.
+
+**Consequence.** For the narrow option, `/v1/canonical/sessions/:id` in raw mode is reachable by an enrolled org with
+no fence after IO. It must either be made unreachable for enrolled orgs (refused before any read) or get a fence
+before and after IO. The other routes depend on configuration, so their reachability has to be proven from the live
+values, which are not in this repo.
