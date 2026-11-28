@@ -35,7 +35,9 @@ import {
   type Hold,
 } from "../hold-bridge.ts";
 import { applySupabaseSchema } from "./pglite-schema.ts";
-import { s3Ledger } from "../ledger-s3.ts";
+import { s3LedgerKeys } from "../ledger-s3.ts";
+const exists = async (store: ObjectStore, key: string) => (await store.head(objectKey(key))) !== undefined;
+const readJson = async (store: ObjectStore, key: string) => JSON.parse(new TextDecoder().decode(await readAll((await store.getObject(objectKey(key))).body)));
 import type { GenerationPorts } from "../user-erase-generation.ts";
 import type { UserGeneration } from "../hold-bridge.ts";
 import { scratchStore } from "./support.ts";
@@ -142,21 +144,31 @@ test("erasure set rows are shape-checked", () => {
 const userErase: Erasure = { kind: "user", requestId: "req-1", workspaceId: "ws-1", userId: "user-1", atMs: NOW, bytesVerified: true };
 const sessionErase: Erasure = { kind: "session", requestId: "session\nws-2\nclaude\nsess-1", workspaceId: "ws-2", source: "claude", sessionId: "sess-1", atMs: NOW };
 /** The user-erase generation proof's ports over `store` (user-erase-generation.ts): a sealed hold, a bound FULL. */
-export function generationDeps(store: ObjectStore, over: Partial<GenerationPorts> = {}, epoch = E): UserGeneration {
+export const BUCKET = "bucket-under-test";
+export function generationDeps(_store: ObjectStore, over: Partial<GenerationPorts> = {}, epoch = E): UserGeneration {
   return {
-    ports: { store, eraseKeyRoot: ROOT, now: () => NOW, userOrigins: async () => [], admissionFencedBefore: async () => ({ sql: true, direct: true, fallback: true }), ...over },
-    binding: (tenant, e) => ({ keyRoot: ROOT, tenant, requestId: e.requestId, epoch,
+    ports: { eraseDestination: { bucket: BUCKET, keyRoot: ROOT }, now: () => NOW, userOrigins: async () => [], admissionFencedBefore: async () => ({ sql: true, direct: true, fallback: true }), ...over },
+    binding: (tenant, e) => ({ bucket: BUCKET, keyRoot: ROOT, tenant, requestId: e.requestId, epoch,
       hold: { state: "marker_attempted", installedMs: NOW - 3_600_000, sealedMs: NOW - 1_800_000 },
       full: { run: "full-run-1", startedMs: NOW - 2_700_000, evidenceSha256: SHA }, erasure: { atMs: e.atMs, bytesVerified: e.bytesVerified } }),
   };
 }
-function deps(store: ObjectStore, over: Record<string, unknown> = {}) {
+/**
+ * The user erase's effects are built by the bridge from its own store, so they are observed THROUGH the store: a write
+ * of the user's fence is ["reset", fence key]. `fail` injects a store fault on matching keys.
+ */
+function deps(base: ObjectStore, over: Record<string, unknown> = {}, fail?: (op: string, key: string) => boolean) {
   const calls: unknown[][] = [];
-  const ledger = s3Ledger(store, ROOT, { sleep: async () => {} });
+  const store: ObjectStore = { ...base, backend: base.backend, head: (k) => base.head(k), get: (k, r) => base.get(k, r), getObject: (k, r) => base.getObject(k, r),
+    presignGet: (k, t) => base.presignGet(k, t), list: (p, c) => base.list(p, c),
+    delete: async (k) => { if (fail?.("delete", String(k))) throw new ObjectStoreError("transient", "fs", "injected", { status: 503 }); return base.delete(k); },
+    put: async (k, b, o) => {
+      if (fail?.("put", String(k))) throw new ObjectStoreError("transient", "fs", "injected", { status: 503 });
+      if (String(k).endsWith("/upload-fences.json")) calls.push(["reset", String(k)]);
+      return base.put(k, b, o);
+    } };
   return { calls, d: {
-    store, keyRoot: ROOT, org: ORG, epoch: E, now: () => NOW,
-    resetUploadedSessions: async (t: LedgerTenant, r: string) => { calls.push(["reset", t, r]); await ledger.resetUploadedSessions(t, r); return 3; },
-    eraseGenerationLogPayloads: async (t: LedgerTenant, g: number) => { calls.push(["logs", t, g]); return 2; },
+    store, bucket: BUCKET, keyRoot: ROOT, org: ORG, epoch: E, now: () => NOW, ledgerOptions: { sleep: async () => {} },
     generation: generationDeps(store),
     setSessionUploads: async (i: SelectionInput) => { calls.push(["fence", i]); },
     resolveSessionTargets: async () => ({ complete: true, targets: [{ userId: "user-a", originId: "origin-a", source: "claude", sessionId: "sess-1" },
@@ -170,12 +182,17 @@ test("replay, user erase -> the user's S3 fence reset (keyed by the request) and
   const { d, calls } = deps(store);
   expect(await replayErasure(d, userErase)).toBe("replayed");
   const tenant = { orgId: ORG, workspaceId: "ws-1", userId: "user-1" };
-  expect(calls).toEqual([["reset", tenant, "req-1"], ["logs", tenant, 1]]);
+  const fenceKey = s3LedgerKeys(ROOT, tenant).fence;
+  expect(calls).toEqual([["reset", fenceKey], ["reset", fenceKey]]); // the begin CAS, then the finish
+  expect((await readJson(store, fenceKey)).resetOrdinals).toEqual({ "req-1": 1 });
   const receipt = JSON.parse(new TextDecoder().decode(await readAll((await store.getObject(objectKey(erasureReceiptKey(ROOT, ORG, E, "req-1")))).body)));
-  expect(receipt).toEqual({ v: 1, kind: "hold-bridge-erasure", epoch: E, request: requestHash("req-1"), erasure: "user", counts: { reset: 3, payloads: 2, owners: 0 }, appliedAtMs: NOW });
+  expect(receipt).toEqual({ v: 1, kind: "hold-bridge-erasure", epoch: E, request: requestHash("req-1"), erasure: "user", counts: { reset: 0, payloads: 0, owners: 0 }, appliedAtMs: NOW });
   expect(JSON.stringify(receipt)).not.toContain("user-1");
   // A retry: already receipted, nothing re-applied.
   expect(await replayErasure(d, userErase)).toBe("already");
+  expect(calls.length).toBe(2);
+  // Without a declared bucket, or with one the SQL erase did not use: no effect.
+  for (const over of [{ bucket: undefined }, { bucket: "another-bucket" }]) expect(await replayErasure({ ...d, ...over }, userErase)).toBe("erasure_generation_unproven");
   expect(calls.length).toBe(2);
   // The same request under another epoch is a separate replay, with its own binding (never the first epoch's).
   expect(await replayErasure({ ...d, epoch: E2 }, userErase)).toBe("erasure_generation_unproven");
@@ -266,10 +283,12 @@ test("an INSTALLED resolver with an invalid plan plus a pre-seeded receipt: refu
 });
 
 test("replay failures write no receipt (retried later); a corrupt receipt is never taken as done", async () => {
-  for (const over of [{ resetUploadedSessions: async () => { throw new Error("s3 503 secret"); } }, { eraseGenerationLogPayloads: async () => { throw new Error("unverified"); } }]) {
+  // A store fault on the reset's fence write, or on the generation receipt's write.
+  for (const fail of [(op: string, k: string) => op === "put" && k.endsWith("/upload-fences.json"), (op: string, k: string) => op === "put" && k.includes("/generations/")]) {
     const store = fresh();
-    const { d } = deps(store, over);
-    expect(await replayErasure(d, userErase)).toBe("replay_failed");
+    const { d } = deps(store, {}, fail);
+    expect(["replay_failed", "erasure_generation_unproven"]).toContain(await replayErasure(d, userErase));
+    expect(await exists(store, erasureReceiptKey(ROOT, ORG, E, "req-1"))).toBe(false);
     expect(await bridgeCompleteVerdict(store, ROOT, ORG, hold("marker_attempted"), E, [userErase])).toMatchObject({ code: "erasure_unreplayed" });
     // The retry, once the fault clears, replays it.
     expect(await replayErasure(deps(store).d, userErase)).toBe("replayed");

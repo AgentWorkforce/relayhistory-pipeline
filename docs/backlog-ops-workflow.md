@@ -586,16 +586,28 @@ positive erasure set is not wired to a mode. Only the empty-window path above is
       or begun with its ordinal, and the evidence port `admissionFencedBefore` shows the SQL, direct and
       fallback admission paths were all fenced before R. **That port is not built**: until it is, every
       user erase stays `erasure_generation_unproven`.
+    - **One store.** The bridge builds the user erase's effects itself from its own store and key root
+      (the S3 ledger's reset, the scoped payload erase); nothing is injected, and the proof functions
+      take that same store, so the reset, the erase, both receipts and every re-verification hit one
+      store. The bridge declares its bucket (`bucket`); the binding and the receipt carry it, and it
+      must equal the SQL erase's bucket and key root (`eraseDestination`) before any effect.
     - **Post-effect**, after the reset and the scoped payload erase: a create-only receipt at
       `96bulls/.ledger/hold-bridge/<org>/<epoch>/generations/<hash of the request>.json` (hashes, counts,
       the key root and epoch only) once every byte class of the user is empty below the generation:
-      no old owner stub the reset missed, no old log payload in any stream, every re-arm marker swept
+      no old owner stub the reset missed; every present log payload in every stream classified, with
+      only one positively bound at or above the generation kept (an orphan written before a crash,
+      applied residue, or an unsnapshotted or older batch's payload refuses); every re-arm marker swept
       (a done record for its exact bytes: a paused pre-reset write that commits after the reset is
       re-armed, and holds the proof until swept), no publication generation and no admission-inbox body
-      for the user's machines. A retry re-derives the receipt and must match it; so does
+      for the user. Those two roots are judged over EVERY machine under the workspace, not only the
+      machines the known origins derive: a machine of the user must hold nothing, another user's must be
+      attributed by the `machineOwners` port, and an unattributed machine refuses
+      (`generation_machine_unattributed`). In every class a key that does not parse refuses
+      (`generation_unreadable`); nothing is skipped. A retry re-derives the receipt and must match it; so does
       `bridgeCompleteVerdict`. The erasure receipt is written only after it.
-    - Open, stated: the `admissionFencedBefore` evidence source; the publication-generation check lists
-      the org's whole `upload-generations/` prefix; a session re-enabled after release makes a later
+    - Open, stated: the `admissionFencedBefore` evidence source and the `machineOwners` attribution
+      source (absent, any other user's machine in the workspace refuses); the publication-generation
+      check lists the org's whole `upload-generations/` prefix and refuses on any malformed key there; a session re-enabled after release makes a later
       re-derivation refuse (the gate runs before release, so it only blocks a post-release retry).
   - A session erase maps to the S3 fence deletion (`setSessionUploads`, `enabled: false`) of every
     target in a complete erase manifest: every alias, for every owner, at every recorded origin, the

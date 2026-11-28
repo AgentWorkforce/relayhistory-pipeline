@@ -229,10 +229,27 @@ export async function eraseGenerationLogPayloads(store: ObjectStore, keyRoot: st
 }
 
 /**
- * Read-only completion evidence for eraseGenerationLogPayloads: how many payloads of batches admitted below
- * `generation` are still present, across every stream of the user. Any fault throws (retryable), never zero.
+ * Read-only completion evidence for eraseGenerationLogPayloads, EXHAUSTIVE: every payload present in every stream of
+ * the user is classified, and only one POSITIVELY bound at or above `generation` (named by an unapplied batch admitted
+ * at >= generation) is kept out of the count. Counted: a payload of a batch admitted below it, of a batch with no
+ * admission snapshot, and any payload no unapplied entry names (an orphan written before a crash and never appended,
+ * or applied residue). Any fault throws (retryable), never zero.
  */
-export async function generationLogPayloadsRemaining(store: ObjectStore, keyRoot: string, tenant: LedgerTenant, generation: number, opts: LogEraseOptions = {}): Promise<number> {
+export async function generationLogPayloadsUnproven(store: ObjectStore, keyRoot: string, tenant: LedgerTenant, generation: number, opts: LogEraseOptions = {}): Promise<number> {
   if (!Number.isSafeInteger(generation) || generation < 1) throw new LedgerUnavailableError("ledger_input_refused");
-  return eachStream(opts, await reported(opts, undefined, () => everyUserLogStream(store, keyRoot, tenant)), async (keys) => (await supersededIn(store, keys, generation)).length);
+  return eachStream(opts, await reported(opts, undefined, () => everyUserLogStream(store, keyRoot, tenant)), async (keys) => {
+    const present = await listKeysUnder(store, keys.payloads);
+    if (present.length === 0) return 0;
+    const through = await materializedAtLeast(store, keys);
+    const newer = new Set<string>(), older = new Set<string>();
+    for await (const e of readEntries(store, keys, through < 0 ? 0 : through)) {
+      if (e.seq <= through || e.kind !== "batches") continue;
+      for (const b of e.batches) for (const p of b.payloads) {
+        if (!p.key.startsWith(keys.payloads)) throw new LedgerUnavailableError("ledger_log_erase_failed");
+        (b.admitted !== undefined && b.admitted.resets >= generation ? newer : older).add(p.key);
+      }
+    }
+    // Shared with an older batch: not provably newer data only.
+    return present.filter((k) => !newer.has(k) || older.has(k)).length;
+  });
 }

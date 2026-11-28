@@ -10,7 +10,8 @@
  *      after FULL.created_at minus the margin. Read-only, and re-read until a read finds nothing new.
  *   3. Replay (replayErasures): each erasure's S3-ledger equivalent, idempotent, with a create-only receipt keyed by
  *      the erasure's request id (hashed) under the hold's epoch:
- *        user erase     resetUploadedSessions(tenant, request id), then eraseGenerationLogPayloads(tenant, G(R)):
+ *        user erase     resetUploadedSessions(tenant, request id), then eraseGenerationLogPayloads(tenant, G(R)), both
+ *                       built here from the bridge's own store (never injected):
  *                       only the payloads of batches admitted below the request's bound generation, never newer ones
  *        session erase  for every target of the session's COMPLETE erase manifest (every alias x owner x origin, the
  *                       turns origin included), the fence deletion setSessionUploads({..., enabled: false}). Coverage
@@ -39,6 +40,8 @@
 import { createHash } from "node:crypto";
 import { isObjectStoreError, objectKey, readAll, type ObjectStore } from "../shared/vendor.ts";
 import type { LedgerTenant, SelectionInput } from "./ledger.ts";
+import { s3Ledger, type S3LedgerOptions } from "./ledger-s3.ts";
+import { eraseGenerationLogPayloads } from "./ledger-log-erase.ts";
 import { generationPreEffect, GenerationRefused, produceGenerationReceipt, verifyGeneration, type GenerationBinding, type GenerationPorts } from "./user-erase-generation.ts";
 
 // ---- 1. lifecycle adapter -------------------------------------------------------------------------------------------
@@ -195,19 +198,21 @@ export interface ReplayDeps {
   keyRoot: string;
   org: string;
   epoch: string;
-  /** ledger-s3.ts s3Ledger(...).resetUploadedSessions: the user's S3 fence reset (idempotent per request id). */
-  resetUploadedSessions(tenant: LedgerTenant, requestId: string): Promise<number>;
   /**
-   * ledger-log-erase.ts eraseGenerationLogPayloads for the user: only payloads admitted below `generation`. Never the
-   * unconditional eraseLogPayloads (a retry after release would delete post-release uploads).
+   * The bucket `store` is (declared with it). A user erase's binding must name it, and it must equal the SQL erase's
+   * destination (GenerationPorts.eraseDestination). Absent: every user erase replays to erasure_generation_unproven.
    */
-  eraseGenerationLogPayloads(tenant: LedgerTenant, generation: number): Promise<number>;
+  bucket?: string;
   /**
-   * The user-erase generation proof (user-erase-generation.ts): its ports and, per user erasure, its binding (key root,
-   * hold epoch and state, the bound FULL, the erase's time and state). Absent: every user erase replays to
-   * erasure_generation_unproven.
+   * The user-erase generation proof (user-erase-generation.ts): its ports and, per user erasure, its binding (bucket,
+   * key root, hold epoch and state, the bound FULL, the erase's time and state). Absent: every user erase replays to
+   * erasure_generation_unproven. A user erase's effects are built HERE from `store` and `keyRoot` (the S3 ledger's
+   * resetUploadedSessions and eraseGenerationLogPayloads), never injected: the reset, the scoped payload erase, both
+   * receipts and every re-verification use the one store. Never the unconditional eraseLogPayloads.
    */
   generation?: UserGeneration;
+  /** S3-ledger options for the user erase's reset (sleep, attempts); never a store. */
+  ledgerOptions?: Omit<S3LedgerOptions, "acceptanceMode" | "resetBeginOnly" | "resetLogErase">;
   /** ledger-s3.ts s3Ledger(...).setSessionUploads: the session's S3 fence deletion for one owner. */
   setSessionUploads(input: SelectionInput): Promise<void>;
   /**
@@ -259,12 +264,12 @@ export function parseTargetCount(v: unknown): bigint {
  * The gate's proof for an erasure (bridgeCompleteVerdict): a session erase's complete plan; a user erase's
  * bytes_verified and its POST-EFFECT generation proof (verifyGeneration: the receipt, re-derived now). null when held.
  */
-export async function erasureProof(d: Pick<ReplayDeps, "org" | "keyRoot" | "epoch" | "generation" | "resolveSessionTargets">, e: Erasure): Promise<ProofRefusal | null> {
+export async function erasureProof(d: Pick<ReplayDeps, "store" | "bucket" | "org" | "keyRoot" | "epoch" | "generation" | "resolveSessionTargets">, e: Erasure): Promise<ProofRefusal | null> {
   if (e.kind === "session") { const p = await sessionPlan(d, e); return typeof p === "string" ? p : null; }
   if (!e.bytesVerified) return "erasure_bytes_unverified";
   if (!d.generation) return "erasure_generation_unproven";
   try {
-    return (await verifyGeneration(d.generation.ports, boundFor(d.generation, d.keyRoot, d.org, d.epoch, e))) === null ? null : "erasure_generation_unproven";
+    return (await verifyGeneration(d.store, d.generation.ports, boundFor(d.generation, d.bucket, d.keyRoot, d.org, d.epoch, e))) === null ? null : "erasure_generation_unproven";
   } catch { return "erasure_generation_unproven"; }
 }
 
@@ -272,10 +277,10 @@ export async function erasureProof(d: Pick<ReplayDeps, "org" | "keyRoot" | "epoc
  * The caller's binding for a user erasure, checked against THIS replay or gate: the same key root, epoch, tenant,
  * request and erase state. A binding naming anything else would prove (or write a receipt for) another erase.
  */
-function boundFor(g: UserGeneration, keyRoot: string, org: string, epoch: string, e: Extract<Erasure, { kind: "user" }>): GenerationBinding {
+function boundFor(g: UserGeneration, bucket: string | undefined, keyRoot: string, org: string, epoch: string, e: Extract<Erasure, { kind: "user" }>): GenerationBinding {
   const tenant = { orgId: org, workspaceId: e.workspaceId, userId: e.userId };
   const b = g.binding(tenant, e);
-  if (!b || b.keyRoot !== keyRoot || b.epoch !== epoch || b.requestId !== e.requestId || b.tenant?.orgId !== org || b.tenant.workspaceId !== e.workspaceId
+  if (!b || bucket === undefined || b.bucket !== bucket || b.keyRoot !== keyRoot || b.epoch !== epoch || b.requestId !== e.requestId || b.tenant?.orgId !== org || b.tenant.workspaceId !== e.workspaceId
       || b.tenant.userId !== e.userId || b.erasure?.atMs !== e.atMs || b.erasure.bytesVerified !== e.bytesVerified) refuse("generation_binding_mismatch");
   return b;
 }
@@ -285,7 +290,7 @@ async function userPreEffect(d: ReplayDeps, e: Extract<Erasure, { kind: "user" }
   if (!e.bytesVerified) return "erasure_bytes_unverified";
   if (!d.generation) return "erasure_generation_unproven";
   try {
-    return await generationPreEffect(d.generation.ports, boundFor(d.generation, d.keyRoot, d.org, d.epoch, e));
+    return await generationPreEffect(d.store, d.generation.ports, boundFor(d.generation, d.bucket, d.keyRoot, d.org, d.epoch, e));
   } catch (err) {
     return err instanceof GenerationRefused && err.code === "erasure_bytes_unverified" ? "erasure_bytes_unverified" : "erasure_generation_unproven";
   }
@@ -324,15 +329,15 @@ export async function replayErasure(d: ReplayDeps, e: Erasure): Promise<ReplayOu
     if (e.kind === "user") {
       const tenant = { orgId: d.org, workspaceId: e.workspaceId, userId: e.userId };
       let binding: GenerationBinding;
-      try { binding = boundFor(d.generation!, d.keyRoot, d.org, d.epoch, e); } catch { return "erasure_generation_unproven"; }
-      counts.reset = await d.resetUploadedSessions(tenant, e.requestId);
+      try { binding = boundFor(d.generation!, d.bucket, d.keyRoot, d.org, d.epoch, e); } catch { return "erasure_generation_unproven"; }
+      counts.reset = await s3Ledger(d.store, d.keyRoot, { ...d.ledgerOptions, acceptanceMode: "canonical" }).resetUploadedSessions(tenant, e.requestId);
       // The ordinal the reset's begin CAS bound (or the one a retry already had): must be there now, and unchanged.
       let after: { generation: number | null };
-      try { after = await generationPreEffect(d.generation!.ports, binding); } catch { return "erasure_generation_unproven"; }
+      try { after = await generationPreEffect(d.store, d.generation!.ports, binding); } catch { return "erasure_generation_unproven"; }
       if (after.generation === null || (pre.generation !== null && after.generation !== pre.generation)) return "erasure_generation_unproven";
-      counts.payloads = await d.eraseGenerationLogPayloads(tenant, after.generation);
+      counts.payloads = await eraseGenerationLogPayloads(d.store, d.keyRoot, tenant, after.generation);
       // The post-effect evidence, create-only, BEFORE the erasure receipt: no receipt without a proven generation.
-      try { await produceGenerationReceipt(d.generation!.ports, binding); } catch { return "erasure_generation_unproven"; }
+      try { await produceGenerationReceipt(d.store, d.generation!.ports, binding); } catch { return "erasure_generation_unproven"; }
     } else {
       // Every alias of the session for every owner at every recorded origin; only this session's pairs.
       for (const t of plan)
@@ -380,7 +385,7 @@ export async function replayErasures(d: ReplayDeps, readCount: () => Promise<num
  * immediately before the release) receipted for that epoch. Returns a code: ok, or the first reason it may not.
  */
 export async function bridgeCompleteVerdict(store: ObjectStore, keyRoot: string, org: string, hold: Hold | null, epoch: string, set: readonly Erasure[],
-  proofs: Pick<ReplayDeps, "generation" | "resolveSessionTargets"> = {}):
+  proofs: Pick<ReplayDeps, "bucket" | "generation" | "resolveSessionTargets"> = {}):
   Promise<{ code: "ok" | "hold_missing" | "hold_epoch_mismatch" | "hold_not_attempted" | "erasure_unreplayed"; erasures: number; receipted: number }> {
   const base = { erasures: set.length, receipted: 0 };
   if (hold === null) return { code: "hold_missing", ...base };
@@ -389,7 +394,7 @@ export async function bridgeCompleteVerdict(store: ObjectStore, keyRoot: string,
   let receipted = 0;
   // A receipt counts only when the erasure's proofs hold now too (the release counter is independent of the replay).
   for (const e of set)
-    if ((await erasureProof({ org, keyRoot, epoch, ...proofs }, e)) === null && validErasureReceipt(await readReceipt(store, erasureReceiptKey(keyRoot, org, epoch, e.requestId)), epoch, e.requestId))
+    if ((await erasureProof({ ...proofs, store, org, keyRoot, epoch }, e)) === null && validErasureReceipt(await readReceipt(store, erasureReceiptKey(keyRoot, org, epoch, e.requestId)), epoch, e.requestId))
       receipted++;
   return { code: receipted === set.length ? "ok" : "erasure_unreplayed", erasures: set.length, receipted };
 }
