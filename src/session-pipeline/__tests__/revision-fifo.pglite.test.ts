@@ -61,7 +61,9 @@ async function rig() {
   /** Set by a test: runs inside the next search pass, before it reads, once (park a pass). */
   const hold: { inPass?: () => Promise<void>; crash?: boolean } = {};
   const sid = (s: SessionScope) => [s.orgId, s.workspaceId, s.harness, s.sessionId].join("/");
-  const searchScope = async (scope: SessionScope): Promise<SearchIndexResult> => {
+  // The search stage reads manifests through ITS OWN deps.reader (as indexSearchScope does), so the consumer can record
+  // what this pass actually indexed ('revision covered').
+  const searchScope = async (scope: SessionScope, d?: { reader?: { read(k: string): Promise<{ manifest: ManifestV1 } | null> } }): Promise<SearchIndexResult> => {
     passes.push(sid(scope));
     // A pass takes 400 ms on the consumer clock: its start and completion differ.
     advance(400);
@@ -76,7 +78,10 @@ async function rig() {
     for (const { manifest_key } of live.rows) {
       const l = parseSessionKey(manifest_key)!;
       let manifest: ManifestV1;
-      try { manifest = JSON.parse(new TextDecoder().decode(await readAll(await r.store.get(objectKey(manifest_key))))) as ManifestV1; } catch { continue; }
+      try {
+        const viaDeps = d?.reader ? (await d.reader.read(manifest_key))?.manifest : undefined;
+        manifest = viaDeps ?? JSON.parse(new TextDecoder().decode(await readAll(await r.store.get(objectKey(manifest_key))))) as ManifestV1;
+      } catch { continue; }
       seen.push(manifest.raw.content_sha256);
       for (const c of manifest.raw.chunks) {
         const raw = zstdDecompressSync(await readAll(await r.store.get(rawChunkKey(l, c.seq, 0, c.sha256, "ndjson"))));
@@ -106,7 +111,7 @@ async function rig() {
     const base = r.deps();
     const reader = base.pointer.reader;
     return { ...base, pointer: { ...base.pointer, reader: { ...reader, read: async (k: string) => { advance(50); return reader.read(k); } } },
-      search: {} as never, searchScope: searchScope as never, searchCoverage };
+      search: { reader } as never, searchScope: searchScope as never, searchCoverage };
   };
   const etagOf = async (key: string) => (await r.store.head(objectKey(key)))!.version.eTag!.replace(/^"|"$/g, "");
   let n = 0;
@@ -426,6 +431,41 @@ describe("first indexed appearance of superseded uploads ('revision covered' / '
     const { lines } = await t.run([t.record({ ...forwarded, source: "forward" }), t.record(e2), t.record(e3)]);
     expect(named(lines, "revision unobserved")).toEqual([expect.objectContaining({ revision: 1, reason: "coverage_unproven" })]);
     expect(named(lines, "revision covered")).toEqual([expect.objectContaining({ revision: 2, covered_by_revision: 3 })]);
+  });
+
+  test("Pipeline review of 4970d56f: the object is replaced AFTER the pointer read and BEFORE the search read (same key and revision, earlier chunks omitted): no covered credit", async () => {
+    const t = await rig();
+    const e1 = await t.writer(1, "r1", loc, new Date(T0 + 100).toISOString(), undefined, true);
+    const e2 = await t.writer(2, "r2", loc, new Date(T0 + 200).toISOString(), undefined, true);
+    const e3 = await t.writer(3, "r3", loc, new Date(T0 + 300).toISOString(), undefined, true);
+    // The pointer stage reads revision 3 (it lists r1's and r2's chunks). Inside the search pass, before it reads, the
+    // object is replaced at the same key and revision by a manifest that lists only a fresh chunk.
+    t.hold.inPass = async () => { await t.r.writeManifest(3, loc, "replacement"); };
+    const { lines } = await t.run([t.record(e1), t.record(e2), t.record(e3)]);
+    expect(named(lines, "revision covered")).toEqual([]);
+    expect(named(lines, "revision unobserved").map((l) => [l.revision, l.reason])).toEqual([[1, "coverage_unproven"], [2, "coverage_unproven"]]);
+    // All three arrivals stay in the denominator: two unobserved, one searchable.
+    expect(named(lines, "revision searchable").map((l) => l.revision)).toEqual([3]);
+  });
+
+  test("matching-input control: the same batch with no replacement gives both superseded uploads a covered line", async () => {
+    const t = await rig();
+    const e1 = await t.writer(1, "r1", loc, new Date(T0 + 100).toISOString(), undefined, true);
+    const e2 = await t.writer(2, "r2", loc, new Date(T0 + 200).toISOString(), undefined, true);
+    const e3 = await t.writer(3, "r3", loc, new Date(T0 + 300).toISOString(), undefined, true);
+    const { lines } = await t.run([t.record(e1), t.record(e2), t.record(e3)]);
+    expect(named(lines, "revision covered").map((l) => l.revision)).toEqual([1, 2]);
+    expect(named(lines, "revision unobserved")).toEqual([]);
+  });
+
+  test("a skip-current skip (the pass read nothing) gives superseded uploads coverage_unproven, never covered", async () => {
+    const t = await rig();
+    const e1 = await t.writer(1, "r1", loc, new Date(T0 + 100).toISOString(), undefined, true);
+    const e2 = await t.writer(2, "r2", loc, new Date(T0 + 200).toISOString(), undefined, true);
+    const skipped = async () => ({ manifests: 1, rows: 0, inserted: 0, deleted: 0, complete: true, skipped: true, reasons: ["already_current"] });
+    const { lines } = await logged(() => dispatchSqsBatch([t.record(e1), t.record(e2)], { ...t.depsOf(), searchScope: skipped as never }, t.wiring));
+    expect(named(lines, "revision covered")).toEqual([]);
+    expect(named(lines, "revision unobserved")).toEqual([expect.objectContaining({ revision: 1, reason: "coverage_unproven" })]);
   });
 
   test("a superseded-only batch (skipped) reports its events as unobserved: covered_by_earlier_pass", async () => {
