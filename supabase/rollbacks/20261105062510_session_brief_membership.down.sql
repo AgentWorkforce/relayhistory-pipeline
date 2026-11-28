@@ -19,12 +19,12 @@ BEGIN
  END IF;
  SELECT sha256 INTO v_sha FROM sessions.__96bulls_migrations
   WHERE name='upstream:20261105062510_session_brief_membership.sql' FOR UPDATE;
- IF NOT FOUND OR v_sha<>'9b48a3e82a2caf6f07d82b53822dc0e517c35c562b2c8bee5b57e81f196f4660' THEN
+ IF NOT FOUND OR v_sha<>'eeb642c8c55eb29e2f3086cc64ea0d03a2b79c725c9986b7aa76a5c389d585e6' THEN
   RAISE EXCEPTION USING ERRCODE='55000', MESSAGE='brief membership: own applied checksum required';
  END IF;
 END
 $rollback_guard$;
-DROP FUNCTION sessions.session_brief_membership_for(text,text,text,text);
+DROP FUNCTION sessions.session_brief_membership_for(text,text,text,text,text);
 DROP TRIGGER session_brief_evidence_retire ON sessions.session_briefs;
 DROP FUNCTION sessions.session_brief_evidence_retire();
 DROP TABLE sessions.session_brief_members;

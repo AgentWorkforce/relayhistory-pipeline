@@ -54,7 +54,7 @@ describe("session_briefs schema", () => {
     // Rollback is newest-first: 062510's membership evidence (FK ON DELETE CASCADE to session_briefs)
     // comes off before the base table. Its real down is ledger-guarded; this ledger-free fixture runs
     // the same object removals directly.
-    await pg.exec(`DROP FUNCTION sessions.session_brief_membership_for(text,text,text,text);
+    await pg.exec(`DROP FUNCTION sessions.session_brief_membership_for(text,text,text,text,text);
       DROP TRIGGER session_brief_evidence_retire ON sessions.session_briefs;
       DROP FUNCTION sessions.session_brief_evidence_retire();
       DROP TABLE sessions.session_brief_members; DROP TABLE sessions.session_brief_evidence;`);

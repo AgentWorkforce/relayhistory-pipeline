@@ -2730,7 +2730,7 @@ describe("function boundary: ACL manifest, residual, activation gate", () => {
     const SV2_RPC = "sessions.session_brief_summary_v2_for(text,text,text)";
     const fnExists = async (sig: string) => (await db.query<{ e: boolean }>("SELECT to_regprocedure($1) IS NOT NULL AS e", [sig])).rows[0]!.e;
     const MEMBERSHIP = "upstream:20261105062510_session_brief_membership.sql";
-    const MEMBERSHIP_RPC = "sessions.session_brief_membership_for(text,text,text,text)";
+    const MEMBERSHIP_RPC = "sessions.session_brief_membership_for(text,text,text,text,text)";
     const RETIRE_FN = "sessions.session_brief_evidence_retire()";
     const retireTrigger = async () =>
       (await db.query<{ n: number }>("SELECT count(*)::int n FROM pg_trigger WHERE tgrelid='sessions.session_briefs'::regclass AND tgname='session_brief_evidence_retire'")).rows[0]!.n;

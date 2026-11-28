@@ -14,6 +14,7 @@ import { TENANT_SETTINGS_SQL, type TenantRunner } from "../../session-read-api/l
 import { BriefSummaryError, briefMembershipResponse, sqlBriefSummary } from "../../session-read-api/brief-summary.ts";
 
 setDefaultTimeout(60_000);
+const BINDING = expect.stringMatching(/^[0-9a-f]{64}$/);
 const open: PGlite[] = [];
 afterEach(async () => { await Promise.all(open.splice(0).map((db) => db.close())); });
 const ROLE = read("supabase/bootstrap/session_read_api_role.sql").split("\n").filter((l) => !l.startsWith("\\")).join("\n");
@@ -45,8 +46,8 @@ async function setup(membership = true) {
     try { await pg.query(TENANT_SETTINGS_SQL, [org, ws]); const r = await work(pg as never); await pg.exec("COMMIT"); return r; }
     catch (e) { await pg.exec("ROLLBACK"); throw e; } finally { await pg.exec("RESET ROLE"); }
   };
-  const ask = async (record: string, client = sqlBriefSummary(runner)) =>
-    briefMembershipResponse((await client.membership!(KEY.orgId, KEY.workspaceId, KEY.harness, KEY.sessionId, record))!, { orgId: KEY.orgId, workspaceId: KEY.workspaceId, source: KEY.harness, sessionId: KEY.sessionId });
+  const ask = async (record: string, client = sqlBriefSummary(runner), binding?: string) =>
+    briefMembershipResponse((await client.membership!(KEY.orgId, KEY.workspaceId, KEY.harness, KEY.sessionId, record, binding))!, { orgId: KEY.orgId, workspaceId: KEY.workspaceId, source: KEY.harness, sessionId: KEY.sessionId });
   return { pg, model, upload, tick, ask, runner };
 }
 
@@ -54,18 +55,18 @@ test("E2 through generation: not_member in the old consumed input, unknown while
   const s = await setup();
   await s.upload([U1, A1, TOOL], 1);
   expect(await s.tick()).toEqual({ generated: 1 });
-  expect(await s.ask("u1")).toEqual({ status: "member", revision: 1, sourceRevisions: { "m-1": 1 } });
+  expect(await s.ask("u1")).toEqual({ status: "member", revision: 1, sourceRevisions: { "m-1": 1 }, binding: BINDING });
   expect(await s.ask("a1")).toMatchObject({ status: "member", revision: 1 });
   expect(await s.ask("tool-1")).toMatchObject({ status: "not_member", revision: 1 }); // filtered out of the input
   expect(await s.ask("e2")).toMatchObject({ status: "not_member", revision: 1 }); // not in the old consumed input
   // E2 commits (revision 2): nothing covers it yet, so no brief is served and nothing is claimed.
   await s.upload([U1, E2, A1, TOOL], 2);
-  expect(await s.ask("e2")).toEqual({ status: "unknown", revision: null, sourceRevisions: null });
+  expect(await s.ask("e2")).toEqual({ status: "unknown", revision: null, sourceRevisions: null, binding: null });
   // The generator consumes E2.
   expect(await s.tick()).toEqual({ generated: 1 });
   const input = JSON.parse(s.model.requests[1]!.input);
   expect(input.messages.map((m: { text: string }) => m.text)).toContain("also check the retry path");
-  expect(await s.ask("e2")).toEqual({ status: "member", revision: 2, sourceRevisions: { "m-1": 2 } });
+  expect(await s.ask("e2")).toEqual({ status: "member", revision: 2, sourceRevisions: { "m-1": 2 }, binding: BINDING });
 });
 
 test("same-revision replacement interval: v2 still serves the stored A brief, membership answers unknown against the served binding", async () => {
@@ -78,7 +79,7 @@ test("same-revision replacement interval: v2 still serves the stored A brief, me
   const served = await s.runner(KEY.orgId, KEY.workspaceId, async (q) =>
     (await q.query<{ brief_revision: number }>("SELECT brief_revision FROM sessions.session_brief_summary_v2_for($1,$2,$3)", [KEY.workspaceId, KEY.harness, KEY.sessionId])).rows);
   expect(served).toEqual([{ brief_revision: 1 }]); // provenance as served (the v2 currency limitation)
-  expect(await s.ask("u1")).toEqual({ status: "unknown", revision: 1, sourceRevisions: { "m-1": 1 } });
+  expect(await s.ask("u1")).toEqual({ status: "unknown", revision: 1, sourceRevisions: { "m-1": 1 }, binding: BINDING });
   expect(await s.ask("never-seen")).toMatchObject({ status: "unknown" }); // no negative without binding-current evidence
 });
 
@@ -111,7 +112,7 @@ test("evidence is retired with its brief: a quarantine clears it, a deleted brie
   expect(await s.ask("u1")).toMatchObject({ status: "member" });
   await recordBrief(hoopDb(s.pg), KEY, { "m-1": 1 }, { status: "quarantined", error: "session_quarantined" });
   expect(await count()).toBe(0);
-  expect(await s.ask("u1")).toEqual({ status: "unknown", revision: null, sourceRevisions: null });
+  expect(await s.ask("u1")).toEqual({ status: "unknown", revision: null, sourceRevisions: null, binding: null });
   // A fresh brief, then the brief row itself is deleted: the evidence goes with it.
   await s.pg.exec("DELETE FROM sessions.session_briefs");
   await armWakeup(hoopDb(s.pg), KEY, { idleSeconds: 0, maxWaitSeconds: 0 });
@@ -126,14 +127,14 @@ test("flag off writes no evidence (legacy brief answers unknown); authority is v
   const s = await setup(false);
   await s.upload([U1, A1], 1);
   expect(await s.tick()).toEqual({ generated: 1 });
-  expect(await s.ask("u1")).toEqual({ status: "unknown", revision: 1, sourceRevisions: { "m-1": 1 } });
+  expect(await s.ask("u1")).toEqual({ status: "unknown", revision: 1, sourceRevisions: { "m-1": 1 }, binding: BINDING });
   const reason = (p: Promise<unknown>) => p.then(() => "resolved", (e: unknown) => (e instanceof BriefSummaryError ? e.reason : `other:${String(e)}`));
   const foreign = sqlBriefSummary((org, _ws, work) => s.runner(org, "foreign", work));
   expect(await reason(foreign.membership!(KEY.orgId, KEY.workspaceId, KEY.harness, KEY.sessionId, "u1"))).toBe("refused");
   expect(await reason(sqlBriefSummary(s.runner).membership!(KEY.orgId, KEY.workspaceId, KEY.harness, KEY.sessionId, ""))).toBe("invalid_argument");
   expect(await reason(sqlBriefSummary(s.runner).membership!(KEY.orgId, KEY.workspaceId, KEY.harness, "", "u1"))).toBe("invalid_argument");
   const acl = await s.pg.query<{ role: string; allowed: boolean }>(
-    "SELECT rolname AS role, has_function_privilege(oid,'sessions.session_brief_membership_for(text,text,text,text)','EXECUTE') AS allowed FROM pg_roles WHERE rolname IN ('bulls96_read_api','anon','authenticated','service_role','search_consumer_runtime')");
+    "SELECT rolname AS role, has_function_privilege(oid,'sessions.session_brief_membership_for(text,text,text,text,text)','EXECUTE') AS allowed FROM pg_roles WHERE rolname IN ('bulls96_read_api','anon','authenticated','service_role','search_consumer_runtime')");
   expect(acl.rows.length).toBeGreaterThan(0);
   for (const r of acl.rows) expect(r.allowed).toBe(r.role === "bulls96_read_api");
   for (const t of ["session_brief_evidence", "session_brief_members"])
@@ -196,4 +197,36 @@ test("drift guard: summaryMessages selects exactly the messages the vendored sum
   const sent = summaryInput(KEY.harness, KEY.sessionId, events).messages;
   expect(picked.map((e: { text: string }) => e.text.trim())).toEqual(sent.map((m) => m.text));
   expect(picked.map((e: { eventUid: string }) => e.eventUid)).toEqual(["u2", "u8", "u9", "u1"]);
+});
+
+test("caller correlation: a caller holding brief A asks after B published at the same revision; with A's binding the answer is changed, never B's member", async () => {
+  const s = await setup();
+  await s.upload([U1, A1], 1);
+  expect(await s.tick()).toEqual({ generated: 1 });
+  // Read 1 (summary, parsed): the caller now holds A and its binding.
+  const summaryRows = (await sqlBriefSummary(s.runner).read(KEY.orgId, KEY.workspaceId, KEY.harness, KEY.sessionId))!;
+  const { briefSummaryBinding } = await import("../../session-read-api/brief-summary.ts");
+  const bindingA = briefSummaryBinding(summaryRows)!;
+  expect(bindingA).toMatch(/^[0-9a-f]{64}$/);
+  expect(await s.ask("a1", undefined, bindingA)).toMatchObject({ status: "member", binding: bindingA });
+  // Between the caller's two requests B replaces the content at the SAME revision and publishes.
+  const B1 = line("b1", "user", "B-only request", "2026-10-29T10:00:01.000Z");
+  const store = tempStore();
+  const manifestB = await transcript(store, [B1, A1], { revision: 1 });
+  const manifestKey = `manifest/${KEY.sessionId}/m-1/r1`;
+  await pointer(s.pg, { revision: 1, manifestKey, ...indexedFrom(manifestB) });
+  await armWakeup(hoopDb(s.pg), KEY, { idleSeconds: 0, maxWaitSeconds: 0 });
+  await dueNow(s.pg);
+  const model = new FakeModel(); model.reply = { ...model.reply, description: "Brief B." };
+  expect(await briefTick({ reader: mapReader(new Map([[manifestKey, manifestB]])), store, transport: model, config: testConfig({ throttleSeconds: 0, membership: true }) })(hoopDb(s.pg), new Date())).toEqual({ generated: 1 });
+  // Read 2 with A's binding: the brief changed under the caller. No definitive answer about B.
+  const stale = await s.ask("b1", undefined, bindingA);
+  expect(stale.status).toBe("changed");
+  expect(stale.binding).not.toBe(bindingA);
+  // Without a binding (or with B's) the answer is about B, and says which brief it is.
+  const fresh = await s.ask("b1");
+  expect(fresh).toMatchObject({ status: "member", revision: 1 });
+  expect(await s.ask("b1", undefined, fresh.binding!)).toMatchObject({ status: "member", binding: fresh.binding });
+  // An invalid binding is refused like an invalid key.
+  await expect(sqlBriefSummary(s.runner).membership!(KEY.orgId, KEY.workspaceId, KEY.harness, KEY.sessionId, "b1", "nothex")).rejects.toMatchObject({ reason: "invalid_argument" });
 });

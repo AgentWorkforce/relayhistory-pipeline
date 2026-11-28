@@ -1,4 +1,4 @@
-import { BriefSummaryError, briefMembershipResponse, briefSummaryResponse, briefSummaryRevision, summaryActivityDays, type BriefSummary } from "./brief-summary.ts";
+import { BriefSummaryError, briefMembershipResponse, briefSummaryBinding, briefSummaryResponse, briefSummaryRevision, summaryActivityDays, type BriefSummary } from "./brief-summary.ts";
 import { SummaryFallbackError, sessionSummaryBody, type SummaryFallback } from "./summary-fallback.ts";
 /**
  * The session read API: an API-compatible subset of relayhistory's /v1 read
@@ -1935,11 +1935,13 @@ export function createReadApi(deps: ReadApiDeps) {
       const identity=c.get("identity");
       attestWorkspace(c,identity); requireCanary(identity,"summary"); rejectUnsupported(c);
       if(!deps.briefSummary?.membership)throw unsupported("summary_membership_not_configured");
-      for(const name of Object.keys(c.req.query()))if(!["workspace","source","record"].includes(name))throw unsupported(`param_${name}`);
-      const source=single(c,"source"),record=single(c,"record"),sessionId=c.req.param("sessionId");
+      for(const name of Object.keys(c.req.query()))if(!["workspace","source","record","binding"].includes(name))throw unsupported(`param_${name}`);
+      const source=single(c,"source"),record=single(c,"record"),binding=single(c,"binding"),sessionId=c.req.param("sessionId");
       if(!source||!HARNESS_NAME.test(source)||!sessionId||sessionId.length>MAX_ID_CHARS)throw bad("invalid session key");
       if(!record||record.length>512)throw bad("invalid record id");
-      const rows=await deps.briefSummary.membership(identity.orgId,identity.workspaceId,source,sessionId,record);
+      // The brief the caller holds (provenance.binding from the summary read): answers about any other brief come back as changed.
+      if(binding!==undefined&&!/^[0-9a-f]{64}$/.test(binding))throw bad("invalid binding");
+      const rows=await deps.briefSummary.membership(identity.orgId,identity.workspaceId,source,sessionId,record,binding);
       if(rows===null)throw unsupported("summary_membership_not_migrated");
       return c.json({membership:briefMembershipResponse(rows,{...identity,source,sessionId})});
     } catch(error) {
@@ -1973,7 +1975,7 @@ export function createReadApi(deps: ReadApiDeps) {
       if(kind==="short"&&rows.length>0) {
         const brief=briefSummaryResponse(rows,{...identity,source,sessionId});
         // revision: the served brief's (v2 read, T130); null under v1, exactly as before.
-        return c.json({summary:brief,provenance:{source:"session_brief",kind:"short",generatedAt:brief.status==="ready"?brief.builtAt:null,revision:brief.status==="ready"?briefSummaryRevision(rows):null,truncated:false}});
+        return c.json({summary:brief,provenance:{source:"session_brief",kind:"short",generatedAt:brief.status==="ready"?brief.builtAt:null,revision:brief.status==="ready"?briefSummaryRevision(rows):null,binding:brief.status==="ready"?briefSummaryBinding(rows):null,truncated:false}});
       }
       const ready=await fallback.read({orgId:identity.orgId,workspaceId:identity.workspaceId,source,sessionId},kind as "short"|"long");
       return c.json(ready?sessionSummaryBody(ready):{summary:{status:"empty",kind,state:null},provenance:null});

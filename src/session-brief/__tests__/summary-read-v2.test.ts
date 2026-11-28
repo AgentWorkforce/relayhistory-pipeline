@@ -47,7 +47,7 @@ test("v2 is v1's row plus the served revision and source revisions", async () =>
   await recordBrief(hoopDb(pg), KEY, { "m-1": 1 }, ready("First."));
   const [one] = await rows(pg, "session_brief_summary_for");
   const [two] = await v2(pg);
-  expect(two).toEqual({ ...one, brief_revision: 1, source_revisions: { "m-1": 1 } });
+  expect(two).toEqual({ ...one, brief_revision: 1, source_revisions: { "m-1": 1 }, brief_binding: expect.stringMatching(/^[0-9a-f]{64}$/) });
   expect(await served(pg)).toEqual({ description: "First.", revision: 1 });
 }), 60000);
 

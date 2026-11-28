@@ -252,17 +252,17 @@ describe("GET /v1/sessions/:id/summary with the fallback", () => {
     const body = await (await a.get()).json();
     expect(body).toEqual({
       summary: { status: "ready", kind: "short", summary: brief.description, model: brief.model, builtAt: "2026-11-09T00:00:00.000Z", state: null },
-      provenance: { source: "session_brief", kind: "short", generatedAt: "2026-11-09T00:00:00.000Z", revision: null, truncated: false },
+      provenance: { source: "session_brief", kind: "short", generatedAt: "2026-11-09T00:00:00.000Z", revision: null, binding: null, truncated: false },
     });
     expect(a.order).toEqual(["brief"]);
   });
 
   test("T130: a v2 row carries the served revision into provenance; the inner summary keys are unchanged", async () => {
-    const v2 = { ...brief, brief_revision: "7", source_revisions: { "m-1": 7 } };
+    const v2 = { ...brief, brief_revision: "7", source_revisions: { "m-1": 7 }, brief_binding: "b".repeat(64) };
     const body = await (await api({ fallback: ready, rows: [v2] }).get()).json();
     expect(body).toEqual({
       summary: { status: "ready", kind: "short", summary: brief.description, model: brief.model, builtAt: "2026-11-09T00:00:00.000Z", state: null },
-      provenance: { source: "session_brief", kind: "short", generatedAt: "2026-11-09T00:00:00.000Z", revision: 7, truncated: false },
+      provenance: { source: "session_brief", kind: "short", generatedAt: "2026-11-09T00:00:00.000Z", revision: 7, binding: "b".repeat(64), truncated: false },
     });
     // Flag off: byte-identical to v1, the revision is never exposed there.
     expect(await (await api({ fallback: false, rows: [v2] }).get()).text()).toBe(JSON.stringify({ summary: { status: "ready", kind: "short", summary: brief.description, model: brief.model, builtAt: "2026-11-09T00:00:00.000Z", state: null } }));
@@ -333,12 +333,12 @@ describe("GET /v1/sessions/:id/summary with the fallback", () => {
 
 // T130 membership route: the parsed read-API response for one record.
 describe("GET /v1/sessions/:id/summary/membership", () => {
-  const row = (over: Record<string, unknown> = {}) => ({ org_id: "o", workspace_id: "w", harness: "codex", session_id: "s", membership: "member", brief_revision: "2", source_revisions: { "m-1": 2 }, ...over });
+  const row = (over: Record<string, unknown> = {}) => ({ org_id: "o", workspace_id: "w", harness: "codex", session_id: "s", membership: "member", brief_revision: "2", source_revisions: { "m-1": 2 }, brief_binding: "c".repeat(64), ...over });
   function mapi(opts: { rows?: unknown[] | null; error?: unknown; noMembership?: boolean } = {}) {
     const asked: string[] = [];
     const briefSummary: BriefSummary = {
       async read() { return []; },
-      ...(opts.noMembership ? {} : { async membership(_o: string, _w: string, _s: string, _id: string, record: string) { asked.push(record); if (opts.error) throw opts.error; return (opts.rows === undefined ? [row()] : opts.rows) as never; } }),
+      ...(opts.noMembership ? {} : { async membership(_o: string, _w: string, _s: string, _id: string, record: string, binding?: string) { asked.push(binding ? `${record}@${binding.slice(0, 4)}` : record); if (opts.error) throw opts.error; return (opts.rows === undefined ? [row()] : opts.rows) as never; } }),
     };
     const app = createReadApi({
       verify: async (t) => { if (t !== "good") throw new AuthError(401, "invalid_token", "invalid"); return id; },
@@ -350,10 +350,13 @@ describe("GET /v1/sessions/:id/summary/membership", () => {
     const a = mapi();
     const r = await a.get("record=e2");
     expect(r.status).toBe(200);
-    expect(await r.json()).toEqual({ membership: { status: "member", revision: 2, sourceRevisions: { "m-1": 2 } } });
+    expect(await r.json()).toEqual({ membership: { status: "member", revision: 2, sourceRevisions: { "m-1": 2 }, binding: "c".repeat(64) } });
     expect(a.asked).toEqual(["e2"]);
-    expect(await (await mapi({ rows: [row({ membership: "not_member" })] }).get("record=x")).json()).toEqual({ membership: { status: "not_member", revision: 2, sourceRevisions: { "m-1": 2 } } });
-    expect(await (await mapi({ rows: [row({ membership: "unknown", brief_revision: null, source_revisions: null })] }).get("record=x")).json()).toEqual({ membership: { status: "unknown", revision: null, sourceRevisions: null } });
+    expect((await mapi().get(`record=x&binding=${"d".repeat(64)}`)).status).toBe(200);
+    expect((await mapi().get("record=x&binding=nothex")).status).toBe(400);
+    expect(await (await mapi({ rows: [row({ membership: "changed" })] }).get(`record=x&binding=${"d".repeat(64)}`)).json()).toEqual({ membership: { status: "changed", revision: 2, sourceRevisions: { "m-1": 2 }, binding: "c".repeat(64) } });
+    expect(await (await mapi({ rows: [row({ membership: "not_member" })] }).get("record=x")).json()).toEqual({ membership: { status: "not_member", revision: 2, sourceRevisions: { "m-1": 2 }, binding: "c".repeat(64) } });
+    expect(await (await mapi({ rows: [row({ membership: "unknown", brief_revision: null, source_revisions: null, brief_binding: null })] }).get("record=x")).json()).toEqual({ membership: { status: "unknown", revision: null, sourceRevisions: null, binding: null } });
   });
   test("refusals map like the summary route; a malformed row is a 503; not migrated or not configured is 501", async () => {
     expect((await mapi({ error: new BriefSummaryError("refused") }).get("record=x")).status).toBe(503);

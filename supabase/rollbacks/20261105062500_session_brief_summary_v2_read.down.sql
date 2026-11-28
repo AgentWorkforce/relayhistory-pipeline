@@ -18,7 +18,7 @@ BEGIN
  END IF;
  SELECT sha256 INTO v_sha FROM sessions.__96bulls_migrations
   WHERE name='upstream:20261105062500_session_brief_summary_v2_read.sql' FOR UPDATE;
- IF NOT FOUND OR v_sha<>'2c2ea6e1f857c1861c08bff1d3895e234a74752cddd204cbf75403ebfd694739' THEN
+ IF NOT FOUND OR v_sha<>'0c65fe1f9ef7e325005dcb237b15540170fdf34ae4a63dabae4a757323f6d932' THEN
   RAISE EXCEPTION USING ERRCODE='55000', MESSAGE='brief summary v2: own applied checksum required';
  END IF;
 END

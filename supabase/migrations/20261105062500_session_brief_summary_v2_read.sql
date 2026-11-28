@@ -1,14 +1,15 @@
 -- T130 Reader provenance: sessions.session_brief_summary_v2_for returns exactly
 -- session_brief_summary_for's (044100) row under the same authority, refusals and
 -- currency predicate, plus the served brief's revision and per-machine source
--- revisions, so a caller can prove which committed append a summary covers.
+-- revisions and an opaque brief_binding, so a caller can prove which committed append a summary
+-- covers and correlate a later membership read with the brief it was shown.
 -- Additive only: 044100 is untouched, no table, column, grant or data change beyond
 -- this function and its EXECUTE grant to bulls96_read_api.
 CREATE FUNCTION sessions.session_brief_summary_v2_for(
  p_workspace_id text, p_harness text, p_session_id text
 ) RETURNS TABLE(org_id text, workspace_id text, harness text, session_id text,
  description text, model text, generated_at timestamptz,
- brief_revision bigint, source_revisions jsonb)
+ brief_revision bigint, source_revisions jsonb, brief_binding text)
 LANGUAGE plpgsql STABLE SECURITY DEFINER
 SET search_path = pg_catalog, sessions, pg_temp AS $summary_rev$
 DECLARE v_org text;
@@ -44,7 +45,10 @@ BEGIN
  END IF;
  RETURN QUERY
  SELECT v_org, p_workspace_id, p_harness, p_session_id, b.description, b.model, b.generated_at,
-  b.brief_revision, b.brief_source_revisions
+  b.brief_revision, b.brief_source_revisions,
+  -- Opaque identity of the served brief (fingerprint, generation time, source revisions). A caller
+  -- passes it to session_brief_membership_for so a brief published between the two reads is detected.
+  encode(sha256(convert_to(b.brief_fingerprint || '|' || to_char(b.generated_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.US') || '|' || b.brief_source_revisions::text, 'UTF8')), 'hex')
  FROM sessions.session_briefs b
  WHERE b.org_id=v_org AND b.workspace_id=p_workspace_id AND b.harness=p_harness
   AND b.status='ready' AND b.origin='native'
