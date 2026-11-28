@@ -16,8 +16,9 @@
  *   D3 no-row race: D1 and D2 with no t139_session_incarnations row for the owner (incarnation 0).
  *   R1 concurrent reissue for one receipt: the second reissue is blocked on k, then issues nothing; exactly one N+1.
  *   E1 erase vs publication, both orders; reissue refused under the fence.
- *   O1 two owners under one logical session id: one owner's deletion and reissue never revoke or reissue the other's
- *      authority; k still serializes them (an observed block across owners).
+ *   O1 two owners under one logical session id: X's deletion never revokes Y; Y cannot consume X's receipt; the scope is
+ *      ambiguous, so reissue is refused without mutation; k still serializes them (an observed block across owners).
+ *   O2 single-owner control: only X ever seen, so the reissue succeeds.
  *   S1 stale publication of incarnation N after the reissue to N+1: refused (incarnation_moved).
  */
 import { afterAll, afterEach, describe, expect, setDefaultTimeout, test } from "bun:test";
@@ -143,19 +144,32 @@ describe.skipIf(!url)("T139 incarnation prototype (real PostgreSQL, two backends
     expect(await published(o)).toEqual([]);
   });
 
-  test("O1 two owners, one logical session id: X's deletion blocks Y's publication on k (serialization) but never revokes Y; Y cannot reissue from X's receipt; X's reissue leaves Y at incarnation 0", async () => {
+  test("O1 two owners, one logical session id: X's deletion blocks Y's publication on k (serialization) but never revokes Y; Y cannot consume X's receipt; ownership is AMBIGUOUS, so X's reissue is refused WITHOUT mutation", async () => {
     const { o, pair } = await rig();
+    // X publishes first (X is an owner), then X deletes while Y's publication waits on k.
+    expect(await publish(o, X, 0)).toBe("ok");
     const r = await expectBlocks(pair, { holder: pair.b, waiter: pair.a, hold: (c) => del(c, X), wait: (c) => publish(c, Y, 0) });
     advisory(r.receipt);
     expect(r.waited).toMatchObject({ ok: true, value: "ok" });
-    expect(await publish(o, X, 0)).toBe("incarnation_deleted");
-    expect(await reissue(o, Y)).toBeNull();
-    expect(await reissue(o, X)).toBe(1);
+    // Y is not revoked by X's deletion; X is.
     expect(await publish(o, Y, 0)).toBe("ok");
-    expect(await publish(o, Y, 1)).toBe("incarnation_moved");
-    expect(await publish(o, X, 0)).toBe("incarnation_moved");
+    expect(await publish(o, X, 0)).toBe("incarnation_deleted");
+    const before = { inc: await incarnationRows(o), rec: await receipts(o) };
+    // Y cannot consume X's receipt; X cannot reissue either: two owners make the scope ambiguous.
+    expect(await reissue(o, Y)).toBeNull();
+    expect(await reissue(o, X)).toBeNull();
+    // Refused WITHOUT mutation: no incarnation row, X's receipt still unconsumed.
+    expect({ inc: await incarnationRows(o), rec: await receipts(o) }).toEqual(before);
+    expect(before).toEqual({ inc: [], rec: [{ user_id: "user_x", incarnation: 0, consumed_by: null }] });
+    // Y keeps publishing at incarnation 0 after all of it.
+    expect(await publish(o, Y, 0)).toBe("ok");
+  });
+
+  test("O2 single-owner control: with only X ever seen, the same deletion lets X reissue (positive reissue only for a demonstrably single-owner session)", async () => {
+    const { o } = await rig();
+    expect(await publish(o, X, 0)).toBe("ok");
+    await del(o, X);
+    expect(await reissue(o, X)).toBe(1);
     expect(await publish(o, X, 1)).toBe("ok");
-    expect(await incarnationRows(o)).toEqual([{ user_id: "user_x", incarnation: 1 }]);
-    expect(await receipts(o)).toEqual([{ user_id: "user_x", incarnation: 0, consumed_by: 1 }]);
   });
 });

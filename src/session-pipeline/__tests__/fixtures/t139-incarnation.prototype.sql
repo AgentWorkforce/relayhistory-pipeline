@@ -25,6 +25,14 @@ CREATE TABLE sessions.t139_deletion_receipts (
   PRIMARY KEY (org_id, workspace_id, source, session_id, user_id, origin_id, incarnation)
 );
 
+-- Owners seen publishing under the logical session (Pipeline acceptance of fb6c7fd4: positive reissue only for a
+-- DEMONSTRABLY single-owner logical session). Recorded by t139_publish_check when it returns ok; never removed.
+CREATE TABLE sessions.t139_session_owners (
+  org_id text NOT NULL, workspace_id text NOT NULL, source text NOT NULL, session_id text NOT NULL,
+  user_id text NOT NULL, origin_id text NOT NULL,
+  PRIMARY KEY (org_id, workspace_id, source, session_id, user_id, origin_id)
+);
+
 CREATE FUNCTION sessions.t139_k(p_org text, p_ws text, p_source text, p_session text) RETURNS bigint
 LANGUAGE sql IMMUTABLE SET search_path = pg_catalog, pg_temp AS $k$
   SELECT hashtextextended('96bulls:incarnation' || chr(31) || p_org || chr(31) || p_ws || chr(31) || p_source || chr(31) || p_session, 0)
@@ -61,6 +69,18 @@ BEGIN
   PERFORM pg_advisory_xact_lock(sessions.t139_k(p_org, p_ws, p_source, p_session));
   IF EXISTS (SELECT 1 FROM sessions.session_erasure_fences AS f
               WHERE f.org_id = p_org AND f.workspace_id = p_ws AND f.source = p_source AND f.session_id = p_session) THEN
+    RETURN NULL;
+  END IF;
+  -- Ambiguous ownership: any OTHER owner known for this logical session (it published, holds a receipt or an
+  -- incarnation) refuses the reissue WITHOUT mutation. Positive reissue is for single-owner sessions only.
+  IF EXISTS (SELECT 1 FROM (
+        SELECT o.user_id, o.origin_id FROM sessions.t139_session_owners AS o
+         WHERE o.org_id = p_org AND o.workspace_id = p_ws AND o.source = p_source AND o.session_id = p_session
+        UNION SELECT r.user_id, r.origin_id FROM sessions.t139_deletion_receipts AS r
+         WHERE r.org_id = p_org AND r.workspace_id = p_ws AND r.source = p_source AND r.session_id = p_session
+        UNION SELECT i.user_id, i.origin_id FROM sessions.t139_session_incarnations AS i
+         WHERE i.org_id = p_org AND i.workspace_id = p_ws AND i.source = p_source AND i.session_id = p_session) AS owners
+      WHERE (owners.user_id, owners.origin_id) IS DISTINCT FROM (p_user, p_origin)) THEN
     RETURN NULL;
   END IF;
   v_n := sessions.t139_current(p_org, p_ws, p_source, p_session, p_user, p_origin);
@@ -105,6 +125,8 @@ BEGIN
                 AND r.user_id = p_user AND r.origin_id = p_origin AND r.incarnation = v_cur) THEN
     RETURN 'incarnation_deleted';
   END IF;
+  INSERT INTO sessions.t139_session_owners (org_id, workspace_id, source, session_id, user_id, origin_id)
+  VALUES (p_org, p_ws, p_source, p_session, p_user, p_origin) ON CONFLICT DO NOTHING;
   RETURN 'ok';
 END
 $pc$;
