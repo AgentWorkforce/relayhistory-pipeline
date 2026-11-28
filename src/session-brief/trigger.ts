@@ -223,6 +223,32 @@ export function finishPlan(state: BriefWakeState, claimedGeneration: number, now
   return { ...state, leased: false, pendingSince: nowMs, dueAt: Math.min(state.evidenceAt + secs(t.idleSeconds), nowMs + secs(t.maxWaitSeconds)) };
 }
 
+// ---- durable commit identity (design r2: sessions.session_brief_arms; the SQL mirrors this) ----
+
+/**
+ * What one machine's committed head says about a session: its content (head generation, pointer revision, manifest
+ * sha256) and whether the session has ended. A head deleted and recreated starts a new generation, so an equal
+ * revision with a different generation or sha is a REPLACEMENT (new work), never a replay.
+ */
+export interface BriefCommitIdentity { generation: string; revision: number; sha256: string; ended: boolean }
+
+const sameContent = (a: BriefCommitIdentity, b: BriefCommitIdentity) =>
+  a.generation === b.generation && a.revision === b.revision && a.sha256 === b.sha256;
+
+/**
+ * Does a committed identity add work over what is already armed and consumed for its machine? For the same content,
+ * `ended` is monotone (an end, once recorded, stays): a replay of the pre-end append (ended=false) after the end can
+ * neither clear the recorded end nor re-arm consumed work. Returns the identity to record as armed, or null (a no-op:
+ * an exact replay, the indexer seeing a commit publish already armed, or work already consumed).
+ */
+export function armIdentity(armed: BriefCommitIdentity | null, consumed: BriefCommitIdentity | null, incoming: BriefCommitIdentity): BriefCommitIdentity | null {
+  let next = incoming;
+  if (armed && sameContent(armed, incoming)) next = { ...incoming, ended: armed.ended || incoming.ended };
+  if (consumed && sameContent(consumed, next) && (consumed.ended || !next.ended)) return null; // covered
+  if (armed && sameContent(armed, next) && armed.ended === next.ended) return null; // already armed (exact replay)
+  return next;
+}
+
 /** SQS standard queues delay a message by at most 15 minutes. */
 export const SQS_MAX_DELAY_SECONDS = 900;
 

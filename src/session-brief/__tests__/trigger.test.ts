@@ -9,7 +9,7 @@
  */
 import { describe, expect, test } from "bun:test";
 import {
-  BRIEF_TRIGGER_CONTRACT, briefTriggerConfig, briefTriggerId, briefWakeHint, claimAt, claimPlan, finishPlan, handoffPlan,
+  armIdentity, BRIEF_TRIGGER_CONTRACT, briefTriggerConfig, briefTriggerId, briefWakeHint, claimAt, claimPlan, finishPlan, handoffPlan,
   briefMiss, hintCovers, parseBriefWakeHint, planArm, planHint, SQS_MAX_DELAY_SECONDS, type BriefPhysicalIncarnation,
   type BriefWakeHint, type BriefWakeKind, type BriefWakeState,
 } from "../trigger.ts";
@@ -490,5 +490,48 @@ describe("session-brief trigger: offline fixtures", () => {
     expect(handoffPlan(T0 + 3_600_000, T0)).toEqual({ action: "defer", delaySeconds: SQS_MAX_DELAY_SECONDS });
     expect(handoffPlan(T0 + 3_600_000, T0 + 3_599_500)).toEqual({ action: "defer", delaySeconds: 1 });
     expect(handoffPlan(T0 + 3_600_000, T0 + 3_600_000)).toEqual({ action: "run" });
+  });
+});
+
+describe("session-brief trigger: durable commit identity (design r2)", () => {
+  const id = (revision: number, o: { generation?: string; sha?: string; ended?: boolean } = {}) =>
+    ({ generation: o.generation ?? "1", revision, sha256: o.sha ?? "a".repeat(64), ended: o.ended ?? false });
+
+  test("an exact replay is a no-op; a committed replacement at the same machine revision arms", () => {
+    const a = id(5);
+    expect(armIdentity(null, null, a)).toEqual(a); // first commit: arms
+    expect(armIdentity(a, null, id(5))).toBeNull(); // exact replay (or the indexer seeing the same commit): no-op
+    expect(armIdentity(a, null, id(5, { sha: "b".repeat(64) }))).toEqual(id(5, { sha: "b".repeat(64) })); // new content
+    expect(armIdentity(a, null, id(5, { generation: "2" }))).toEqual(id(5, { generation: "2" })); // head recreated
+    expect(armIdentity(null, a, id(5))).toBeNull(); // consumed: covered, after completion
+    expect(armIdentity(null, a, id(5, { generation: "2" }))).toEqual(id(5, { generation: "2" })); // a replacement is not covered
+    expect(armIdentity(a, null, id(6))).toEqual(id(6)); // B: new evidence
+  });
+
+  test("a standalone end (no revision increment) arms once; a replayed pre-end append cannot clear it or re-arm", () => {
+    const append = id(5), end = id(5, { ended: true });
+    // Before any consumption: the end over the armed append arms (due now on the wakeup side).
+    expect(armIdentity(append, null, end)).toEqual(end);
+    expect(armIdentity(end, null, end)).toBeNull(); // a repeated end: no-op
+    expect(armIdentity(end, null, append)).toBeNull(); // the pre-end append replayed after the end: the end stands
+    // After the append was consumed, the standalone end is still new work (the session ended).
+    expect(armIdentity(append, append, end)).toEqual(end);
+    // After the end was consumed: neither the end nor the pre-end append re-arms.
+    expect(armIdentity(end, end, end)).toBeNull();
+    expect(armIdentity(end, end, append)).toBeNull();
+    expect(armIdentity(null, end, append)).toBeNull(); // even with no armed record left
+  });
+
+  test("standalone end eligibility: a confirmed first end is due now; with a brief, coalescing is skipped and the throttle applies", () => {
+    // First brief: a confirmed (v2) end makes the armed row due now, never throttled.
+    const first = planArm(null, T0, false, TIMING);
+    const firstEnd = planHint(first, hint("end", 1, T0), { nowMs: T0 + 1_000, hasBrief: false, timing: TIMING })!;
+    expect(firstEnd.dueAt).toBe(T0 + 1_000);
+    expect(claimAt(firstEnd, { hasBrief: false, lastAttemptMs: T0, throttleSeconds: THROTTLE_S })).toBe(T0 + 1_000);
+    // Existing brief: the end removes the coalescing (idle) wait, but the refresh throttle still applies.
+    const refresh = planArm(null, T0, true, TIMING);
+    const refreshEnd = planHint(refresh, hint("end", 2, T0), { nowMs: T0 + 1_000, hasBrief: true, coveredRevision: 1, timing: TIMING })!;
+    expect(refreshEnd.dueAt).toBe(T0 + 1_000);
+    expect(claimAt(refreshEnd, { hasBrief: true, lastAttemptMs: T0 - 30_000, throttleSeconds: THROTTLE_S })).toBe(T0 - 30_000 + THROTTLE_S * 1_000);
   });
 });
