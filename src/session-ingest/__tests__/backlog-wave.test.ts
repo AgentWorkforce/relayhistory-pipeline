@@ -151,7 +151,7 @@ test("two orgs, one refuses: FULL, catch-up, export and drain each give B its ow
   expect(bd.receipt.summary).toMatchObject({ kind: "wave", org_count: 2, ok_count: 2 });
   expect(bd.peak).toBeLessThanOrEqual(2);
   // FULL: B's revisions section fails (the tool exits 1); A completes.
-  const full = await step("backfill-execute", { BACKLOG_OPS_DRY_RUN: "701", BACKLOG_OPS_CONFIRMATION: `BACKFILL-EXECUTE ${SHA} DRY 701` }, { dry: "backfill-dry" },
+  const full = await step("backfill-execute", { BACKLOG_OPS_DRY_RUN: "701", BACKLOG_OPS_CONFIRMATION: `BACKFILL-EXECUTE ${SHA} DRY 701 PER_ORG` }, { dry: "backfill-dry" },
     (o) => o === B ? { code: 1, stdout: JSON.stringify(backfill("execute", { sections: { fences: "complete", ownership: "complete", revisions: "incomplete" } })) }
       : { code: 0, stdout: JSON.stringify(backfill("execute")) });
   expect(full.exit).toBe(0);
@@ -165,14 +165,14 @@ test("two orgs, one refuses: FULL, catch-up, export and drain each give B its ow
   const cd = await step("backfill-catchup-dry", since, { full: "backfill-execute" }, cu("dry_run"));
   expect(cd.seen).toEqual([A]);
   expect(cd.by[H(B)]).toMatchObject({ exit_code: 1, summary: { refused: "backlog_ops_bound_backfill_receipt" } });
-  const ce = await step("backfill-catchup-execute", { ...since, BACKLOG_OPS_DRY_RUN: "703", BACKLOG_OPS_CONFIRMATION: `BACKFILL-CATCHUP-EXECUTE ${SHA} DRY 703 FULL 702` },
+  const ce = await step("backfill-catchup-execute", { ...since, BACKLOG_OPS_DRY_RUN: "703", BACKLOG_OPS_CONFIRMATION: `BACKFILL-CATCHUP-EXECUTE ${SHA} DRY 703 FULL 702 PER_ORG` },
     { dry: "backfill-catchup-dry", full: "backfill-execute" }, cu("execute"));
   expect(ce.seen).toEqual([A]);
   expect(ce.receipt.summary.ok_count).toBe(1);
   // export: dry is fine for both (it binds nothing); execute binds the FULL wave, so B refuses again.
   const ed = await step("export-dry", {}, {}, fine(exportOk("dry_run")));
   expect(ed.seen.sort()).toEqual(TWO);
-  const ee = await step("export-execute", { BACKLOG_OPS_DRY_RUN: "705", BACKLOG_OPS_BACKFILL_RUN: "702", BACKLOG_OPS_CONFIRMATION: `EXPORT-EXECUTE ${SHA} DRY 705 BACKFILL 702` },
+  const ee = await step("export-execute", { BACKLOG_OPS_DRY_RUN: "705", BACKLOG_OPS_BACKFILL_RUN: "702", BACKLOG_OPS_CONFIRMATION: `EXPORT-EXECUTE ${SHA} DRY 705 BACKFILL 702 PER_ORG` },
     { dry: "export-dry", backfill: "backfill-execute" }, fine(exportOk("execute")));
   expect(ee.seen).toEqual([A]);
   expect(ee.peak).toBe(1); // the export's lease: one at a time
@@ -180,7 +180,7 @@ test("two orgs, one refuses: FULL, catch-up, export and drain each give B its ow
   const dd = await step("drain-dry", {}, {}, fine({ mode: "dry_run", listed: 3 }));
   expect(dd.exit).toBe(0);
   const de = await step("drain-execute", { BACKLOG_OPS_DRY_RUN: "707", BACKLOG_OPS_BACKFILL_RUN: "704", BACKLOG_OPS_FULL_BACKFILL_RUN: "702", BACKLOG_OPS_EXPORT_RUN: "706",
-    BACKLOG_OPS_REVISIONS_SINCE_MS: String(SINCE), BACKLOG_OPS_CONFIRMATION: `DRAIN-EXECUTE ${SHA} DRY 707 BACKFILL 704 FULL 702 EXPORT 706` },
+    BACKLOG_OPS_REVISIONS_SINCE_MS: String(SINCE), BACKLOG_OPS_CONFIRMATION: `DRAIN-EXECUTE ${SHA} DRY 707 BACKFILL 704 FULL 702 EXPORT 706 PER_ORG` },
     { dry: "drain-dry", backfill: "backfill-catchup-execute", full: "backfill-execute", export: "export-execute" }, fine({ mode: "execute", listed: 3 }));
   expect(de.seen).toEqual([A]);
   expect(de.peak).toBe(1); // the drain's lease
@@ -201,7 +201,7 @@ test("wave refusals: every org refused fails the run (no child for a refused bin
     expect(bad.receipt.summary.ok_count).toBe(0);
     await expect(step("backfill-dry", {}, {}, () => ({ code: 0, stdout: "{}" }), { BACKLOG_OPS_ORGS: "" })).rejects.toMatchObject({ code: "backlog_ops_scope_required" });
     // A missing binding refuses each org on its own: no child runs and the run fails.
-    const none = await step("backfill-execute", { BACKLOG_OPS_DRY_RUN: "701", BACKLOG_OPS_CONFIRMATION: `BACKFILL-EXECUTE ${SHA} DRY 701` }, {}, () => ({ code: 0, stdout: "{}" }));
+    const none = await step("backfill-execute", { BACKLOG_OPS_DRY_RUN: "701", BACKLOG_OPS_CONFIRMATION: `BACKFILL-EXECUTE ${SHA} DRY 701 PER_ORG` }, {}, () => ({ code: 0, stdout: "{}" }));
     expect(none.seen).toEqual([]);
     expect(none.exit).toBe(1);
     expect(Object.values(none.by).map((p: any) => p.summary.refused)).toEqual(["backlog_ops_bound_dry_missing", "backlog_ops_bound_dry_missing"]);
@@ -221,7 +221,7 @@ test("a marker binding a per-org FULL and catch-up: per-org checks, the failing 
   const childBase = (o: string) => ({ code: 0, stdout: JSON.stringify(backfill("dry_run", { revisions_since_ms: SINCE, authority_baseline: toReceiptShape(baseline([o])) })) });
   const cd = await step("backfill-catchup-dry", since, { full: "backfill-execute", authority: "authority-dry" }, childBase);
   expect(cd.seen).toEqual([A]); // B's FULL slice failed
-  const ce = await step("backfill-catchup-execute", { ...since, BACKLOG_OPS_DRY_RUN: "703", BACKLOG_OPS_CONFIRMATION: `BACKFILL-CATCHUP-EXECUTE ${SHA} DRY 703 FULL 702 AUTHORITY ${AUTH}` },
+  const ce = await step("backfill-catchup-execute", { ...since, BACKLOG_OPS_DRY_RUN: "703", BACKLOG_OPS_CONFIRMATION: `BACKFILL-CATCHUP-EXECUTE ${SHA} DRY 703 FULL 702 AUTHORITY ${AUTH} PER_ORG` },
     { dry: "backfill-catchup-dry", full: "backfill-execute", authority: "authority-dry" },
     (o) => ({ code: 0, stdout: JSON.stringify(backfill("execute", { revisions_since_ms: SINCE, authority_baseline: toReceiptShape(baseline([o])) })) }));
   expect(ce.receipt).toMatchObject({ authority_run: AUTH, full_run: "702" });
@@ -250,3 +250,41 @@ test("a marker binding a per-org FULL and catch-up: per-org checks, the failing 
   expect(code(() => markerWaveBound(env, d, SINCE))).toBe("backlog_ops_wave_no_org");
 });
 const RUNS_CE = "704";
+
+test("the approval names the run's shape: PER_ORG in the confirmation exactly when per_org is set", () => {
+  const base = { BACKLOG_OPS_MODE: "backfill-execute", BACKLOG_OPS_SHA: SHA, BACKLOG_OPS_DRY_RUN: "701" };
+  expect(backlogOpsDispatch({ ...base, BACKLOG_OPS_PER_ORG: "true", BACKLOG_OPS_CONFIRMATION: `BACKFILL-EXECUTE ${SHA} DRY 701 PER_ORG` }).perOrg).toBe(true);
+  expect(code(() => backlogOpsDispatch({ ...base, BACKLOG_OPS_PER_ORG: "true", BACKLOG_OPS_CONFIRMATION: `BACKFILL-EXECUTE ${SHA} DRY 701` }))).toBe("backlog_ops_confirmation");
+  expect(code(() => backlogOpsDispatch({ ...base, BACKLOG_OPS_CONFIRMATION: `BACKFILL-EXECUTE ${SHA} DRY 701 PER_ORG` }))).toBe("backlog_ops_confirmation");
+  // Without per_org the confirmation is byte-identical to before.
+  expect(backlogOpsDispatch({ ...base, BACKLOG_OPS_CONFIRMATION: `BACKFILL-EXECUTE ${SHA} DRY 701` }).confirmation).toBe(`BACKFILL-EXECUTE ${SHA} DRY 701`);
+  // A dry run's confirmation stays empty either way.
+  expect(code(() => backlogOpsDispatch({ BACKLOG_OPS_MODE: "backfill-dry", BACKLOG_OPS_SHA: SHA, BACKLOG_OPS_PER_ORG: "true", BACKLOG_OPS_CONFIRMATION: "PER_ORG" }))).toBe("backlog_ops_confirmation");
+});
+
+test("the drain's max_objects is a per-run cap: a wave splits it across its orgs (sum exact), and a budget below the org count refuses", async () => {
+  const { waveBudgets } = await import("../../../scripts/backlog-ops.ts");
+  expect(waveBudgets(null, TWO)).toBeNull();
+  expect([...waveBudgets(5, TWO)!.values()]).toEqual([3, 2]);
+  expect([...waveBudgets(1_000_000, ORGS)!.values()].reduce((a, b) => a + b, 0)).toBe(1_000_000);
+  expect(code(() => waveBudgets(1, TWO))).toBe("backlog_ops_wave_max_objects");
+  // End to end: each drain child gets its share as --max-objects, never the whole budget.
+  const saved = { ...receipts };
+  try {
+    const shares: number[] = [];
+    const temp = mkdtempSync(join(tmpdir(), "wave-budget-"));
+    cleanups.push(() => rmSync(temp, { recursive: true, force: true }));
+    const lines: string[] = [];
+    const log = console.log;
+    console.log = (...a: unknown[]) => { lines.push(a.join(" ")); };
+    try {
+      await backlogOpsRun({ ...target, ...SCOPE_ENV, BACKLOG_OPS_MODE: "drain-dry", BACKLOG_OPS_SHA: SHA, BACKLOG_OPS_PER_ORG: "true", BACKLOG_OPS_MAX_OBJECTS: "5",
+        GITHUB_SHA: SHA, GITHUB_RUN_ID: "720", RUNNER_TEMP: temp, ACTIONS_ID_TOKEN_REQUEST_URL: "https://token.example/x", ACTIONS_ID_TOKEN_REQUEST_TOKEN: "bearer" },
+        { fetcher, runChild: async (c) => { shares.push(Number(c.args[c.args.indexOf("--max-objects") + 1])); return { code: 0, stdout: JSON.stringify({ mode: "dry_run", listed: 1 }) }; } });
+    } finally { console.log = log; }
+    expect(shares.sort()).toEqual([2, 3]);
+    expect(lines).toContain("backlog_ops_wave_result ok_count=2 org_count=2 complete");
+    await expect(backlogOpsRun({ ...target, ...SCOPE_ENV, BACKLOG_OPS_MODE: "drain-dry", BACKLOG_OPS_SHA: SHA, BACKLOG_OPS_PER_ORG: "true", BACKLOG_OPS_MAX_OBJECTS: "1",
+      GITHUB_SHA: SHA, GITHUB_RUN_ID: "721", RUNNER_TEMP: temp }, { fetcher, runChild: async () => ({ code: 0, stdout: "{}" }) })).rejects.toMatchObject({ code: "backlog_ops_wave_max_objects" });
+  } finally { Object.assign(receipts, saved); }
+});

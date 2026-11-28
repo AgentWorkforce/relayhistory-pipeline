@@ -283,11 +283,13 @@ export interface BacklogOpsDispatch {
 
 /** The typed binding an execute must carry, exactly. */
 export function backlogOpsConfirmation(d: Pick<BacklogOpsDispatch, "mode" | "sha" | "dryRun" | "backfillRun" | "exportRun"> &
-  Partial<Pick<BacklogOpsDispatch, "fullBackfillRun" | "reshardRun" | "authorityRun" | "waveId">>): string {
+  Partial<Pick<BacklogOpsDispatch, "fullBackfillRun" | "reshardRun" | "authorityRun" | "waveId" | "perOrg">>): string {
   return [d.mode.toUpperCase(), d.sha, "DRY", d.dryRun,
     ...(d.backfillRun ? ["BACKFILL", d.backfillRun] : []), ...(d.fullBackfillRun ? ["FULL", d.fullBackfillRun] : []),
     ...(d.exportRun ? ["EXPORT", d.exportRun] : []), ...(d.reshardRun ? ["RESHARD", d.reshardRun] : []),
-    ...(d.authorityRun ? ["AUTHORITY", d.authorityRun] : []), ...(d.waveId ? ["WAVE", d.waveId] : [])].join(" ");
+    ...(d.authorityRun ? ["AUTHORITY", d.authorityRun] : []), ...(d.waveId ? ["WAVE", d.waveId] : []),
+    // A per-org wave run changes the run's shape (independent verdicts, partial success): the approval names it.
+    ...(d.perOrg ? ["PER_ORG"] : [])].join(" ");
 }
 
 /** The dispatch inputs, checked before any GitHub read or credential. */

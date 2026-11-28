@@ -338,6 +338,9 @@ export async function backlogOpsRun(
   const waveRun = d.perOrg === true;
   if (waveRun && scope.orgs === null) refuse("backlog_ops_scope_required");
   if (waveRun && nhp !== null) refuse("backlog_ops_wave_no_head_parity");
+  // The drain's max_objects is a per-RUN cap: a wave splits it across its orgs (the sum never exceeds it; every org
+  // gets at least one object, so a budget below the org count refuses).
+  const budgets = waveRun ? waveBudgets(d.maxObjects, scope.orgs!) : null;
   const readText = (p: string) => readFileSync(p, "utf8");
   const boundIsWave = (kind: string) => { try { return isWaveReceipt(readText(paths.bound(kind))); } catch { return false; } };
   let bound: BoundAuthority = {};
@@ -374,7 +377,8 @@ export async function backlogOpsRun(
       // A binding refused for this org: its slice records the code, and no child runs for it.
       if (typeof b === "string") return { org, exitCode: 1, summary: { refused: b } };
       const envOrg = { ...env, BACKLOG_OPS_ORGS: org };
-      const r = await run(backlogOpsChildSpawn(envOrg, d, aws, dbUrl, null, b));
+      const dOrg: BacklogOpsDispatch = { ...d, maxObjects: budgets === null ? null : budgets.get(org)! };
+      const r = await run(backlogOpsChildSpawn(envOrg, dOrg, aws, dbUrl, null, b));
       const one = finalReceipt(d, env.GITHUB_RUN_ID!, r.code, r.stdout, orgScopeId(org), [org], ledger, nhpId, home, since);
       return { org, exitCode: one.exitCode === 0 && r.code === 0 ? 0 : one.exitCode || r.code || 1, summary: one.summary };
     }, { fallback: "backlog_ops_wave_org_failed" });
@@ -382,6 +386,10 @@ export async function backlogOpsRun(
     const checked = waveReceiptSummary(waveSummary(orgs, slices), orgs, (sl) => waveSliceCheck(d, sl));
     receipt = { ...backlogOpsReceipt(d, env.GITHUB_RUN_ID!, 0, "{}", scope.id, ledger, nhpId, home), summary: checked.summary, exitCode: checked.ok ? 0 : 1 };
     exit = receipt.exitCode;
+    // A green wave run may still have refused orgs: say how many completed (counts only, never an org).
+    const sum = checked.summary as { ok_count?: number; org_count?: number };
+    console.log(`backlog_ops_wave_result ok_count=${sum.ok_count ?? 0} org_count=${sum.org_count ?? orgs.length}` +
+      ((sum.ok_count ?? 0) < orgs.length ? " incomplete" : " complete"));
   } else {
     const { code, stdout } = await run(backlogOpsChildSpawn(env, d, aws, dbUrl, session, bound));
     receipt = finalReceipt(d, env.GITHUB_RUN_ID!, code, stdout, scope.id, scope.orgs, ledger, nhpId, home, since);
@@ -390,6 +398,17 @@ export async function backlogOpsRun(
   writePrivate(paths.receipt, receipt);
   console.log("backlog_ops_receipt " + JSON.stringify(receipt));
   return exit;
+}
+
+/**
+ * A wave's per-org share of the drain's max_objects: null when unbounded; otherwise floor(max / n) each, the remainder
+ * to the first orgs, so the shares sum to exactly max. Refuses backlog_ops_wave_max_objects when max < n.
+ */
+export function waveBudgets(max: number | null, orgs: readonly string[]): Map<string, number> | null {
+  if (max === null) return null;
+  if (!Number.isSafeInteger(max) || max < orgs.length) refuse("backlog_ops_wave_max_objects");
+  const base = Math.floor(max / orgs.length), extra = max - base * orgs.length;
+  return new Map(orgs.map((o, i) => [o, base + (i < extra ? 1 : 0)]));
 }
 
 const refusalCode = (e: unknown) => { const c = (e as { code?: unknown })?.code; return typeof c === "string" && /^backlog_ops_[a-z0-9_]{1,52}$/u.test(c) ? c : "backlog_ops_wave_binding"; };

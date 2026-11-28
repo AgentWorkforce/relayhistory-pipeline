@@ -688,6 +688,12 @@ refresh, catch-up), export and drain.
 - Evidence hashes (the marker attempt's, the bridge's) stay sha256 over the bound file's exact bytes, never a view.
 - The export and drain executes hold a one-at-a-time lease, so their children run sequentially. Other modes run 2
   at a time, so size the job's 355-minute timeout for the sum.
+- An execute's confirmation ends with ` PER_ORG` exactly when `per_org` is set (`BACKFILL-EXECUTE <sha> DRY <id> PER_ORG`),
+  so the approval names the run's shape. Without it the confirmation is unchanged.
+- The drain's `max_objects` stays a per-run cap: a wave splits it across its orgs (shares sum to exactly the budget; a
+  budget below the org count refuses `backlog_ops_wave_max_objects`).
+- A green wave run can still have refused orgs: the step logs `backlog_ops_wave_result ok_count=<n> org_count=<m>
+  complete|incomplete`, and the receipt's `ok_count` says the same.
 - Path B is refused in a per-org run.
 - Without `per_org`, every receipt is byte-identical to before. A consumer that does not check per org (bridge,
   authority-execute) refuses a wave receipt.
