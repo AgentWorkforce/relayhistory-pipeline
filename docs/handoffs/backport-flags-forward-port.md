@@ -162,8 +162,11 @@ leaves its pointer row as it was, so the pointer set, and with it the stamp's di
   names that exact stamp row (its value and its time). The locked pass repeats a watermark stamp's outcome
   only with a token for the stamp row it reads itself. In every other case it reads in full: a manifest
   differs, a manifest read fails or throws, the stamp read fails in the probe, the probe does not run to the
-  end, or the stamp row changed in between. This is fail closed. A stamp without a watermark (a catalog-key
-  refusal, or more than 64 siblings) keeps the acceptance skip's behaviour.
+  end, or the stamp row changed in between. This is fail closed. "Carries a watermark" means the stamp has
+  a `w` field at all. A `w` this code cannot read (another watermark version, written by newer code during a
+  rollout, or a damaged value) is never verified, so that pass reads in full too. Only a stamp with no `w`
+  field (written before the flag, a catalog-key refusal, or more than 64 siblings) keeps the acceptance
+  skip's behaviour.
 
 The test "a manifest replaced with accepted content at the SAME revision, pointer rows unmoved" runs the three
 configurations from the same state and compares each index with a fresh evaluation.

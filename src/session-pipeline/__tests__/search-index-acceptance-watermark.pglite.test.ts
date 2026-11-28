@@ -515,7 +515,7 @@ describe("what wakes a held scope", () => {
  * their revision (the pointer upsert only takes a higher revision, so the rows cannot move), deliver the
  * manifests' events through the real handler, and report what the search stage did.
  */
-async function sameRevision(flags: Partial<SearchIndexDeps>, opts: { faultFirstManifestRead?: boolean; replace?: boolean } = {}) {
+async function sameRevision(flags: Partial<SearchIndexDeps>, opts: { faultFirstManifestRead?: boolean; replace?: boolean; tamperStamp?: (stamp: Record<string, unknown>) => void } = {}) {
   const { x, r, state, stamps } = await rig();
   // One-shot fault, armed only for the final delivery: the search stage's FIRST manifest read throws, every
   // later read is served (with the watermark flag on, that first read is the probe's verification).
@@ -544,6 +544,13 @@ async function sameRevision(flags: Partial<SearchIndexDeps>, opts: { faultFirstM
       await x.store.put(objectKey(k as never), new TextEncoder().encode(JSON.stringify({ ...now, revision: prior.get(k) })), { contentType: "application/json" });
       replaced += 1;
     }
+  }
+  if (opts.tamperStamp) {
+    // The latest stamp row rewritten in place: same name, same time, same enclosing v1 fields and digest.
+    const row = stamps().at(-1)!;
+    const value = JSON.parse(row.value) as Record<string, unknown>;
+    opts.tamperStamp(value);
+    row.value = JSON.stringify(value);
   }
   fault.armed = true;
   const reads = r.reads.count;
@@ -616,6 +623,33 @@ describe("a fault while the probe verifies the stamp (review HOLD on 6192d989)",
     const healthy = await sameRevision(ON, { replace: false });
     expect(healthy.reconciled).toMatchObject({ ok: false, reason: HELD_REASONS.join(",") });
     expect(healthy.chunkReads).toBe(0);
+  }, 240_000);
+});
+
+describe("a stamp whose watermark this code cannot read (review HOLD on 7483beb7)", () => {
+  const cases: Array<[string, (stamp: Record<string, unknown>) => void]> = [
+    ["an unsupported watermark version", (stamp) => { (stamp.w as Record<string, unknown>).v = 99; }],
+    ["a watermark that is not an object", (stamp) => { stamp.w = "damaged"; }],
+    ["a null watermark", (stamp) => { stamp.w = null; }],
+    ["a watermark missing its manifests", (stamp) => { delete (stamp.w as Record<string, unknown>).manifests; }],
+  ];
+  for (const [name, tamper] of cases)
+    test(`${name}, enclosing v1 stamp and digest intact, same-revision accepted replacement: full evaluation, index equal to fresh`, async () => {
+      const fresh = await sameRevision({});
+      const run = await sameRevision(ON, { tamperStamp: tamper });
+      expect(run.replaced).toBe(2);
+      expect(run.pointersMoved).toBe(false);
+      expect(run.reconciled).toMatchObject({ ok: true });
+      expect(String(run.reconciled.reason ?? "")).not.toContain(SKIPPED_BEFORE_READ);
+      expect(run.chunkReads).toBeGreaterThan(0);
+      expect(run.index).toEqual(fresh.index);
+      expect(run.stamp).toBe("");
+    }, 240_000);
+
+  test("control: a stamp with NO watermark field keeps the acceptance skip's own behaviour (the known gap, unchanged)", async () => {
+    const run = await sameRevision(ON, { tamperStamp: (stamp) => { delete stamp.w; } });
+    expect(run.reconciled).toMatchObject({ ok: false, reason: HELD_REASONS.join(",") });
+    expect(run.chunkReads).toBe(0);
   }, 240_000);
 });
 

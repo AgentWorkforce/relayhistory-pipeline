@@ -944,7 +944,10 @@ async function indexSearchScopeBase(scope: SessionScope, deps: SearchIndexDeps, 
       // when the probe verified the manifests against THIS stamp row (same value, same time). No probe result,
       // a failed or interrupted verification, a manifest that differs, another stamp row: the pass reads in
       // full (fail closed). A stamp without a watermark is the acceptance skip's own, as without the flag.
-      const unverifiedWatermark = deps.acceptanceWatermark === true && stamp.state === "live" && parseAcceptanceWatermark(stamp.value) !== null &&
+      // "Carries a watermark" is the presence of a `w` field at all, whatever is in it: a watermark this code
+      // cannot parse (another version, written by newer code during a rollout; a damaged value) is never
+      // verified, so it reads in full. Only a stamp with NO `w` is the acceptance skip's plain stamp.
+      const unverifiedWatermark = deps.acceptanceWatermark === true && stamp.state === "live" && stampHasWatermarkField(stamp.value) &&
         !(verified !== undefined && verified.value === stamp.value && verified.atMs === stamp.atMs);
       if (!unverifiedWatermark && acceptanceStampMatches(stamp, digest, at))
         return { manifests: 0, rows: 0, inserted: 0, deleted: 0, complete: false, skippedBeforeRead: true, reasons: [ACCEPTANCE_MISSING, SKIPPED_BEFORE_READ] };
@@ -2130,6 +2133,20 @@ async function acceptanceWatermarkOf(
     ids: [...new Set(refused.map(watermarkId))].sort().slice(0, ACCEPTANCE_WATERMARK_MAX_IDS),
     manifests,
   };
+}
+
+/**
+ * Whether a stamp value has a `w` field at all (any value, valid or not). False for a plain stamp and for a value
+ * that is not a JSON object (which no skip accepts anyway). Kept apart from parseAcceptanceWatermark on purpose:
+ * "has one I cannot read" must never be treated as "has none".
+ */
+function stampHasWatermarkField(value: string): boolean {
+  try {
+    const parsed: unknown = JSON.parse(value);
+    return typeof parsed === "object" && parsed !== null && Object.hasOwn(parsed, "w");
+  } catch {
+    return false;
+  }
 }
 
 /** A stamp value's digest and watermark, strictly parsed; null for anything else (a plain v1 stamp included). */
