@@ -481,6 +481,71 @@ describe("skip-current shadow on (hosted ClickHouse binding)", () => {
     expect("skip_check" in (await tickLogged(r, {})).named("search index reconciled")[0]!).toBe(false);
   }, 120_000);
 
+  test("a second oversized scope in one invocation is deferred after the probe: its deferred line accounts for it, shadow on and off", async () => {
+    const DEFERRED = "search index stream deferred, requeued";
+    const run = async (r: Rig, extra: Partial<SearchIndexDeps>) => {
+      const sql = r.sql.length;
+      const requeued = r.requeued.length;
+      const t = await tickLogged(r, { ...LARGE, ...extra });
+      return {
+        t, deferred: t.named(DEFERRED), reconciled: t.named("search index reconciled"), inconclusive: t.named("search index skip check inconclusive"),
+        requeued: r.requeued.length - requeued, sql: r.sql.slice(sql).map((s) => String(s.sql)),
+      };
+    };
+    const probeKeys = (line: Record<string, unknown>) => Object.keys(line).filter((k) => k.startsWith("skip_") || k === "would_skip").sort();
+    const r = await indexed(big, LARGE);
+
+    // One invocation's stream slot. Its first oversized scope streams and is verified; the slot is then used.
+    const slot = { used: false };
+    const first = await run(r, { ...SHADOW, streamSlot: slot });
+    expect(slot.used).toBe(true);
+    expect(first.deferred).toEqual([]);
+    expect(first.reconciled[0]).toMatchObject({ ok: true, would_skip: true, skip_check: "verified_noop" });
+
+    // The next oversized scope of the same invocation (the slot is the only invocation state the pass reads)
+    // is deferred: nothing read, requeued, but the probe DID run under its locks and is on the deferred line.
+    const second = await run(r, { ...SHADOW, streamSlot: slot });
+    expect(second.reconciled).toEqual([]);
+    expect(second.deferred.length).toBe(1);
+    expect(second.requeued).toBe(1);
+    expect(second.t.response.batchItemFailures).toEqual([]);
+    expect(second.sql.filter((s) => s.includes(PROBE_SQL)).length).toBe(1);
+    // Called current, but no pass ran: inconclusive, never a verified no-op.
+    expect(second.deferred[0]).toMatchObject({ stage: "search-index", reason: "stream_deferred", would_skip: true, skip_check: "inconclusive" });
+    expect(typeof second.deferred[0]!.skip_probe_ms).toBe("number");
+    expect(probeKeys(second.deferred[0]!)).toEqual(["skip_check", "skip_probe_ms", "would_skip"]);
+    expect(second.inconclusive.length).toBe(1);
+    expect(second.inconclusive[0]).toMatchObject({ reason: "skip_probe_inconclusive", skip_check: "inconclusive", ok: false });
+
+    // A deferred scope the proof calls not current is an ordinary miss, with its reason.
+    await r.db.pg.exec("UPDATE sessions.session_directory SET event_projection_ready = false");
+    const missed = await run(r, { ...SHADOW, streamSlot: { used: true } });
+    expect(missed.deferred[0]).toMatchObject({ would_skip: false, skip_miss: "not_ready", skip_check: "miss" });
+    expect(typeof missed.deferred[0]!.skip_probe_ms).toBe("number");
+    expect(missed.inconclusive).toEqual([]);
+
+    // A probe that fails on a deferred scope: rolled back, still deferred and requeued, failure on the line.
+    const broken = <T,>(work: (tx: SqlExecutor) => Promise<T>) =>
+      r.transact((tx) => work({
+        query: (sql: string, params?: unknown[]) =>
+          tx.query(sql.includes(PROBE_SQL) ? sql.replace("FROM sessions.session_directory d", "FROM sessions.no_such_probe_table d") : sql, params),
+      }));
+    const failed = await run(r, { ...SHADOW, streamSlot: { used: true }, transact: broken });
+    expect(failed.requeued).toBe(1);
+    expect(failed.t.response.batchItemFailures).toEqual([]);
+    expect(failed.deferred[0]).toMatchObject({ would_skip: false, skip_miss: "probe_failed", skip_check: "probe_failed", skip_probe_error: "42P01" });
+    expect(typeof failed.deferred[0]!.skip_probe_ms).toBe("number");
+
+    // Shadow off: the same deferral sends no probe and its line has exactly its old fields.
+    const off = await run(r, { streamSlot: { used: true } });
+    expect(off.deferred.length).toBe(1);
+    expect(off.requeued).toBe(1);
+    expect(off.sql.some((s) => s.includes(PROBE_SQL) || s.includes("search_skip_probe"))).toBe(false);
+    expect(Object.keys(off.deferred[0]!).filter((k) => !["ts", "time", "level", "msg", "message", "service", "deployment", "deployment_id"].includes(k)).sort())
+      .toEqual(["org_id", "reason", "session_id", "stage"]);
+    expect(off.inconclusive).toEqual([]);
+  }, 120_000);
+
   test("skipCheck: every result maps to exactly one outcome, and only a completed zero-write pass is verified", () => {
     const base: SearchIndexResult = { manifests: 1, rows: 5, inserted: 0, deleted: 0, complete: true, reasons: [] };
     const current = { skipProbe: { current: true } };
@@ -496,6 +561,8 @@ describe("skip-current shadow on (hosted ClickHouse binding)", () => {
     expect(skipCheck({ ...base, ...current, ...facts({ deleted: 1 }) })).toBe("facts_divergent");
     expect(skipCheck({ ...base, ...current, complete: false })).toBe("inconclusive");
     expect(skipCheck({ ...base, ...current, complete: false, partial: true, reasons: ["scope_too_large"] })).toBe("inconclusive");
+    // Deferred before its read (a used stream slot): a positive probe with no comparison.
+    expect(skipCheck({ ...base, rows: 0, complete: false, deferred: true, reasons: ["stream_deferred"], ...current })).toBe("inconclusive");
     expect(skipCheck({ ...base, ...current, ...facts({ complete: false }) })).toBe("inconclusive");
     for (const miss of ["no_directory", "directory_deleted", "projection_version", "sources_changed", "not_ready", "facts_incomplete"] as const)
       expect(skipCheck({ ...base, skipProbe: { current: false, miss } })).toBe("miss");

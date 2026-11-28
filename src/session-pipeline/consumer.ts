@@ -13,7 +13,7 @@
 import { errorFields, log, searchIndexErrorDetail } from "../shared/log.ts";
 import { parseQueueBody, sequencerAfter, type LandedEvent } from "./s3-events.ts";
 import { indexPointer, type PointerDeps, type SessionScope } from "./pointer.ts";
-import { indexSearchScope, searchIndexPhaseMetrics, skipCheck, type SearchIndexDeps } from "./search-index.ts";
+import { indexSearchScope, searchIndexPhaseMetrics, skipCheck, type SearchIndexDeps, type SearchIndexResult } from "./search-index.ts";
 import { LEGACY_PROVENANCE_INVALID } from "../session-read-api/legacy-provenance.ts";
 import { captureRefusal, classifyReplayFailure, produceCanonicalReplay, type ReplayProducerDeps } from "./replay-publication.ts";
 import type { LargeJobState, LargeRoute } from "./large-read-worker.ts";
@@ -178,20 +178,39 @@ export async function processBatch(records: readonly QueueRecord[], deps: Consum
       if (delegated.has(scopeId(scope)) || messageIds.every((id) => failed.has(id))) continue;
       const started = Date.now();
       const phase = searchIndexPhaseMetrics();
+      // SEARCH_INDEX_SKIP_CURRENT_SHADOW_ENABLED only, and only when the probe ran: its time inside the locked
+      // pass, its ClickHouse facts read's time when that ran, and its error code when it failed. On every line
+      // of a pass that probed: reconciled, deferred and failed alike. Empty when the flag is off.
+      const probeTiming = () => ({
+        ...(phase.skipProbeMs !== undefined ? { skip_probe_ms: phase.skipProbeMs } : {}),
+        ...(phase.skipProbeFactsMs !== undefined ? { skip_probe_facts_ms: phase.skipProbeFactsMs } : {}),
+        ...(phase.skipProbeError !== undefined ? { skip_probe_error: phase.skipProbeError } : {}),
+        ...(phase.skipProbeFactsError !== undefined ? { skip_probe_facts_error: phase.skipProbeFactsError } : {}),
+      });
       const phaseFields = () => ({
         source_read_ms: phase.sourceReadMs,
         index_scan_ms: phase.indexScanMs,
         locked_apply_ms: phase.lockedApplyMs,
         write_calls: phase.writeCalls,
         write_batches: phase.writeBatches,
-        // SEARCH_INDEX_SKIP_CURRENT_SHADOW_ENABLED only, and only when the probe ran: its time inside the locked
-        // pass, its ClickHouse facts read's time when that ran, and its error code when it failed. On every
-        // line of the pass, the failed one too.
-        ...(phase.skipProbeMs !== undefined ? { skip_probe_ms: phase.skipProbeMs } : {}),
-        ...(phase.skipProbeFactsMs !== undefined ? { skip_probe_facts_ms: phase.skipProbeFactsMs } : {}),
-        ...(phase.skipProbeError !== undefined ? { skip_probe_error: phase.skipProbeError } : {}),
-        ...(phase.skipProbeFactsError !== undefined ? { skip_probe_facts_error: phase.skipProbeFactsError } : {}),
+        ...probeTiming(),
       });
+      // The probe's verdict and the one outcome it led to (skipCheck), on whichever line ends the pass.
+      const probeVerdict = (result: SearchIndexResult) =>
+        result.skipProbe ? { would_skip: result.skipProbe.current, skip_miss: result.skipProbe.miss, skip_check: skipCheck(result) } : {};
+      const ids = { stage: "search-index", org_id: scope.orgId, workspace_id: scope.workspaceId, harness: scope.harness, session_id: scope.sessionId };
+      const warnProbe = (result: SearchIndexResult) => {
+        const check = skipCheck(result);
+        // The directory said current and the pass still changed the index (or only its facts): the skip would have left it stale.
+        if (check === "divergent" || check === "facts_divergent")
+          log.warn("search index skip would have missed changes", {
+            ...ids, reason: check === "divergent" ? "skip_probe_divergence" : "skip_probe_facts_divergence", skip_check: check, inserted: result.inserted, deleted: result.deleted,
+          });
+        // The directory said current, nothing was written, but no pass completed (incomplete, or deferred before its
+        // read): no no-op was verified.
+        if (check === "inconclusive")
+          log.warn("search index skip check inconclusive", { ...ids, reason: "skip_probe_inconclusive", skip_check: check, ok: result.complete });
+      };
       try {
         const result = await indexSearchScope(scope, { ...deps.search, metrics: phase });
         if (result.busy) {
@@ -213,7 +232,12 @@ export async function processBatch(records: readonly QueueRecord[], deps: Consum
           // This invocation already streamed a scope (streamSlot): stream this one in a later invocation.
           if (!deps.requeue) throw new Error("stream deferred and no requeue");
           await deps.requeue(manifestKey);
-          log.info("search index stream deferred, requeued", { stage: "search-index", org_id: scope.orgId, session_id: scope.sessionId, reason: "stream_deferred" });
+          // The deferral is decided after the shadow probe ran, under the pass's locks: its verdict, time and
+          // failure belong to this line, or the probe would be work no reading sees. No pass ran, so a positive
+          // probe is inconclusive here, never a verified no-op.
+          log.info("search index stream deferred, requeued", { stage: "search-index", org_id: scope.orgId, session_id: scope.sessionId, reason: "stream_deferred",
+            ...probeVerdict(result), ...probeTiming() });
+          warnProbe(result);
           continue;
         }
         if (result.reasons.includes(LEGACY_PROVENANCE_INVALID))
@@ -228,7 +252,6 @@ export async function processBatch(records: readonly QueueRecord[], deps: Consum
             reason: result.reasons.join(",") || "scope_too_large",
             ...(result.stream ? { stream: result.stream } : {}),
           });
-        const check = skipCheck(result);
         log.info("search index reconciled", {
           stage: "search-index",
           org_id: scope.orgId,
@@ -242,22 +265,11 @@ export async function processBatch(records: readonly QueueRecord[], deps: Consum
           ok: result.complete,
           reason: result.reasons.join(",") || undefined,
           // SEARCH_INDEX_SKIP_CURRENT_SHADOW_ENABLED: what the skip-current check answers for this pass, which ran anyway.
-          ...(result.skipProbe ? { would_skip: result.skipProbe.current, skip_miss: result.skipProbe.miss, skip_check: check } : {}),
+          ...probeVerdict(result),
           ...phaseFields(),
           duration_ms: Date.now() - started,
         });
-        // The directory said current and the pass still changed the index (or only its facts): the skip would have left it stale.
-        if (check === "divergent" || check === "facts_divergent")
-          log.warn("search index skip would have missed changes", {
-            stage: "search-index", org_id: scope.orgId, workspace_id: scope.workspaceId, harness: scope.harness, session_id: scope.sessionId,
-            reason: check === "divergent" ? "skip_probe_divergence" : "skip_probe_facts_divergence", skip_check: check, inserted: result.inserted, deleted: result.deleted,
-          });
-        // The directory said current, nothing was written, but the pass did not complete: no no-op was verified.
-        if (check === "inconclusive")
-          log.warn("search index skip check inconclusive", {
-            stage: "search-index", org_id: scope.orgId, workspace_id: scope.workspaceId, harness: scope.harness, session_id: scope.sessionId,
-            reason: "skip_probe_inconclusive", skip_check: check, ok: result.complete,
-          });
+        warnProbe(result);
       } catch (error) {
         log.error("search index failed", {
           stage: "search-index",

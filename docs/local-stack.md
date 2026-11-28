@@ -852,12 +852,19 @@ A probe that fails does not fail the pass: the statement is rolled back to its s
 `would_skip: false`, `skip_miss: probe_failed` and `skip_probe_error`, and the pass runs as with the flag off. Only
 when the rollback fails too (the connection is gone) does the pass fail and retry; its `search index failed` line
 then carries `skip_probe_error` and `skip_probe_ms`, which is how a failure caused by the probe is told from any
-other. A pass that never reached the probe (busy, erased, skipped) carries none of the three fields.
+other. A pass that never reached the probe (busy, erased, skipped) carries none of these fields; a deferred one, which did
+probe, carries them on its deferred line.
 
 A pass with `would_skip: true` that still inserts or deletes index rows also logs the warning
 `search index skip would have missed changes` (reason `skip_probe_divergence`, with the counts): the session
-directory said current while the index was not, which is the drift listed under "Not detected" above. Busy,
-deferred and erased passes, and a canonical mismatch, return before the check and carry neither field.
+directory said current while the index was not, which is the drift listed under "Not detected" above. Busy
+and erased passes, and a canonical mismatch, return before the check and carry neither field.
+
+A stream-deferred scope is different: the deferral (`search index stream deferred, requeued`, the second scope that
+would stream in one invocation) is decided after the probe ran, under the pass's locks, with nothing read. That
+line carries the probe's `would_skip`, `skip_miss`, `skip_check` and its `skip_probe_*` fields, so the probe is
+counted. No pass ran, so a positive probe there is `inconclusive` (with its warning), never a verified no-op; the
+requeued event probes again when its pass does run.
 
 Every probed pass also carries `skip_check`, exactly one of six outcomes, so each can be counted on its own:
 
@@ -866,7 +873,7 @@ Every probed pass also carries `skip_check`, exactly one of six outcomes, so eac
 | `verified_noop` | Called current; the full pass completed (its facts too, when on) and inserted and deleted nothing. | A verified no-op: the only evidence for the skip. |
 | `divergent` | Called current; the pass inserted or deleted index rows. Also warns (`skip_probe_divergence`). | A pass the skip would have got wrong. |
 | `facts_divergent` | Called current; index rows untouched, output facts inserted or deleted. Also warns (`skip_probe_facts_divergence`). | The same, for the facts. |
-| `inconclusive` | Called current; nothing written, but the pass or its facts did not complete. Also warns `search index skip check inconclusive` (`skip_probe_inconclusive`). | Not verified: neither for nor against. |
+| `inconclusive` | Called current; nothing written, but the pass or its facts did not complete, or the pass was stream-deferred before its read. Also warns `search index skip check inconclusive` (`skip_probe_inconclusive`). | Not verified: neither for nor against. |
 | `probe_failed` | The probe's statement failed (`skip_miss: probe_failed`) or its facts read failed or timed out (`facts_unreadable`). | No comparison was made. |
 | `miss` | The proof says not current; `skip_miss` says why. | An ordinary predicate miss: the skip would not have fired. |
 
