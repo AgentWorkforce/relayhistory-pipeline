@@ -242,8 +242,14 @@ export async function processBatch(records: readonly QueueRecord[], deps: Consum
       // fence keeps the pointer row at A). So first a PHYSICAL check against the real pointer rows: for every key of
       // this batch, the row's stored manifest_etag must be the live object the pointer pass just read (Pipeline
       // review of b41e49bf). Otherwise no proof: run the pass, which reads the live object.
-      if (ordered && supersededOnly(messageIds, revisions) &&
-          await pointerRowsAreLive(deps.pointer.db, scope, revisions).catch(() => false) &&
+      // Computed once: it gates the outer skip below AND the search stage's own skip-current (Pipeline review of
+      // 1cb42716). alreadyCurrent compares keys and revision numbers only, so after a same-key, same-revision
+      // replacement (B's notification lost, the pointer row still at A) it would credit a delayed A as current and
+      // skip before reading B. Without physical currency the pass runs with skip-current OFF and reads the live object.
+      const physicallyCurrent = ordered && revisions.length > 0
+        ? await pointerRowsAreLive(deps.pointer.db, scope, revisions).catch(() => false)
+        : undefined;
+      if (ordered && supersededOnly(messageIds, revisions) && physicallyCurrent === true &&
           await (deps.searchCoverage ?? ((s: SessionScope) => coverageProven(s, deps.search!)))(scope).catch(() => false)) {
         // Every message is a stamped revision whose write is no longer live. The newer live write has its
         // own message in this group: already processed (FIFO holds later messages until earlier ones are
@@ -264,7 +270,9 @@ export async function processBatch(records: readonly QueueRecord[], deps: Consum
         write_batches: phase.writeBatches,
       });
       try {
-        const result = await (deps.searchScope ?? indexSearchScope)(scope, { ...deps.search, metrics: phase });
+        const result = await (deps.searchScope ?? indexSearchScope)(scope, {
+          ...deps.search, metrics: phase, ...(physicallyCurrent === false && deps.search.skipCurrent ? { skipCurrent: false } : {}),
+        });
         if (result.busy) {
           // The running pass may have read S3 before this event's write: run again later.
           await later(manifestKey, messageIds, "scope busy");
