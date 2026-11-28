@@ -169,7 +169,7 @@ export function canonicalHolds(canonical: readonly CanonicalLine[] | null, stage
 // ---- verification ----
 
 export type VerifyFailure =
-  | "export_missing" | "missing" | "mismatch" | "index_missing" | "unrecoverable" | "unexpected" | "erased_present" | "baseline_lost" | "undrained" | "marker_invalid" | "no_verdict" | "unreadable";
+  | "export_missing" | "missing" | "mismatch" | "index_missing" | "unrecoverable" | "unexpected" | "erased_present" | "baseline_lost" | "undrained" | "marker_invalid" | "no_verdict" | "winner_unbound" | "unreadable";
 
 export interface VerifyResult {
   ok: boolean;
@@ -177,8 +177,14 @@ export interface VerifyResult {
   exact: number;
   /** Expected records a later admission superseded (the index holds a higher revision, canonical at that revision). */
   superseded_later: number;
-  /** Index winners outside the backlog's expected set that canonical holds (a later admission, or preexisting). */
+  /** Index winners outside the backlog's expected set whose canonical bytes a staged line with the winner's digest binds. */
   index_winners_canonical: number;
+  /**
+   * Full-entry winners (revision id set: an admission's commit or SQL's record revisions) with a canonical line at their
+   * revision that no staged line binds to their digest. Not a failure: S3 alone cannot recompute a record digest.
+   * A slot-form winner in the same position is `winner_unbound`, a failure.
+   */
+  winners_digest_unproven: number;
   /** Staged lines excluded from the expected set (erased, not kept, not live, pre-reset) and not canonical. */
   excluded_absent: number;
   /** Canonical lines in the baseline (before the drain) that the backlog does not account for: preserved, not judged. */
@@ -220,7 +226,7 @@ export interface VerifyDeps {
 /** Canonical lines per session (sessionKey below), as read before a drain. */
 export interface CanonicalSnapshot { sessions: Map<string, string[]> }
 
-type Line = { tenant: LedgerTenant; origin: string; source: string; sessionId: string; line: string; recordId: string; revision: number };
+type Line = { tenant: LedgerTenant; origin: string; source: string; sessionId: string; line: string; recordId: string; revision: number; digest: string | null };
 type Session = { tenant: LedgerTenant; origin: string; source: string; sessionId: string };
 const sessionKey = (t: LedgerTenant, origin: string, source: string, sessionId: string) => JSON.stringify([t.orgId, t.workspaceId, t.userId, origin, source, sessionId]);
 const recordKey = (t: LedgerTenant, origin: string, recordId: string) => JSON.stringify([t.orgId, t.workspaceId, t.userId, origin, recordId]);
@@ -285,9 +291,9 @@ async function collectBacklog(opts: VerifyOptions, deps: VerifyDeps): Promise<Ba
     const tenant: LedgerTenant = { orgId: s.header.org_id, workspaceId: s.header.workspace_id, userId: s.header.user_id };
     const origin = s.header.origin_id;
     b.origins.set(JSON.stringify([userKey(tenant), origin]), { tenant, origin });
-    const items = s.groups.map((g) => g.lines.map((line) => {
+    const items = s.groups.map((g) => g.lines.map((line, j) => {
       const r = JSON.parse(line) as { record_id: string; revision: string };
-      return { tenant, origin, source: g.source, sessionId: g.sessionId, line, recordId: r.record_id, revision: Number(r.revision) } satisfies Line;
+      return { tenant, origin, source: g.source, sessionId: g.sessionId, line, recordId: r.record_id, revision: Number(r.revision), digest: g.meta?.[j]?.[1] ?? null } satisfies Line;
     }));
     for (const g of s.groups) {
       b.sessions.set(sessionKey(tenant, origin, g.source, g.sessionId), { tenant, origin, source: g.source, sessionId: g.sessionId });
@@ -416,8 +422,8 @@ export async function snapshotCanonical(opts: Omit<VerifyOptions, "baseline">, d
  */
 export async function verifyDrainMaterialization(opts: VerifyOptions, deps: VerifyDeps): Promise<VerifyResult> {
   const result: VerifyResult = {
-    ok: false, exact: 0, superseded_later: 0, index_winners_canonical: 0, excluded_absent: 0, baseline_preserved: 0,
-    counts: { export_missing: 0, missing: 0, mismatch: 0, index_missing: 0, unrecoverable: 0, unexpected: 0, erased_present: 0, baseline_lost: 0, undrained: 0, marker_invalid: 0, no_verdict: 0, unreadable: 0 },
+    ok: false, exact: 0, superseded_later: 0, index_winners_canonical: 0, winners_digest_unproven: 0, excluded_absent: 0, baseline_preserved: 0,
+    counts: { export_missing: 0, missing: 0, mismatch: 0, index_missing: 0, unrecoverable: 0, unexpected: 0, erased_present: 0, baseline_lost: 0, undrained: 0, marker_invalid: 0, no_verdict: 0, winner_unbound: 0, unreadable: 0 },
     failures: [],
   };
   const fail = (kind: VerifyFailure, r: string) => {
@@ -459,6 +465,13 @@ export async function verifyDrainMaterialization(opts: VerifyOptions, deps: Veri
   }
   const canonical = await readSessions(opts, sessions, (sk) => fail("unreadable", ref(sk)));
   const winners = new Map(idx.map((i) => [recordKey(i.tenant, i.origin, i.recordId), i]));
+  /** Canonical forms of every staged line (kept or withheld, any stage), by (record, revision, digest). */
+  const stagedByDigest = new Map<string, string[]>();
+  for (const l of [...b.allowed, ...b.withheld, ...b.erased]) {
+    if (l.digest === null) continue;
+    const k = JSON.stringify([recordKey(l.tenant, l.origin, l.recordId), l.revision, l.digest]);
+    stagedByDigest.set(k, [...(stagedByDigest.get(k) ?? []), canonicalFormOf(l.line)]);
+  }
 
   for (const [rk, l] of expected) {
     const sk = sessionKey(l.tenant, l.origin, l.source, l.sessionId);
@@ -483,10 +496,29 @@ export async function verifyDrainMaterialization(opts: VerifyOptions, deps: Veri
     if (allowedAt.has(JSON.stringify([rk, w.entry[0]]))) continue; // never: expected is the highest allowed
     const sk = w.session && sessionKey(w.session.tenant, w.session.origin, w.session.source, w.session.sessionId);
     if (sk && !canonical.has(sk)) continue; // unreadable, already failed
-    const held = sk ? (canonical.get(sk) ?? []).some((c) => c.originId === w.origin && c.recordId === w.recordId && c.revision === w.entry[0]) : false;
-    if (!held) fail("unrecoverable", ref(rk));
-    else if (e) result.superseded_later++;
-    else result.index_winners_canonical++;
+    const at = sk ? (canonical.get(sk) ?? []).filter((c) => c.originId === w.origin && c.recordId === w.recordId && c.revision === w.entry[0]) : [];
+    if (at.length === 0) {
+      fail("unrecoverable", ref(rk));
+      continue;
+    }
+    // A canonical line at the winning revision is not yet the winning BYTES: the record digest is over the original
+    // record (prepare.ts digest), which a canonical line cannot reproduce. It is bound only through a staged line of
+    // the backlog (kept or withheld, any stage) with this record, revision and the winner's digest whose canonical form
+    // is exactly what canonical holds, and nothing else at that revision.
+    const forms = new Set(stagedByDigest.get(JSON.stringify([rk, w.entry[0], w.entry[2]])) ?? []);
+    const bound = forms.size > 0 && at.every((c) => forms.has(c.text));
+    if (bound) {
+      if (e) result.superseded_later++;
+      else result.index_winners_canonical++;
+    } else if (w.entry[1] === null) {
+      // A slot-form winner (the FULL's copy of SQL's lazy acceptance): no order reference or custody key proves its
+      // bytes, and nothing here binds them. Refused at record level.
+      fail("winner_unbound", ref(rk));
+    } else {
+      // A full entry (an admission's commit, or ingest_record_revisions) whose bytes no staged line binds: canonical at
+      // its revision, digest unproven from S3 alone. Reported, not judged (see winners_digest_unproven).
+      result.winners_digest_unproven++;
+    }
   }
 
   // Nothing the drain introduced outside the allowed set (or an index winner); nothing excluded made canonical.

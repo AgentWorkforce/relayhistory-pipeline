@@ -1514,7 +1514,9 @@ describe("buffered drain materialization (FULL-seeded index)", () => {
     const summary = await run(store);
     expect(summary.lines).toMatchObject({ stale: 1, written: 0, materialized: 0 });
     expect(await storedEntry(store, "r")).toEqual([7, "r:r7", sha("r:7"), SESS1, 0, 0]);
-    expect(await verify(store)).toMatchObject({ ok: true, exact: 0, superseded_later: 1 });
+    // The admission's bytes are canonical at revision 7, but no staged line carries revision 7's digest, so S3 alone
+    // cannot bind them to it: reported as unproven (a full entry), not counted as superseded.
+    expect(await verify(store)).toMatchObject({ ok: true, exact: 0, superseded_later: 0, winners_digest_unproven: 1 });
     expect((await canonical(store)).get("sess-1")).toEqual(["r@7"]);
   });
 
@@ -1640,6 +1642,20 @@ describe("buffered drain materialization (FULL-seeded index)", () => {
     await stage(store2, [group("claude", "sess-1", [{ id: "m1", rev: 1 }, { id: "m2", rev: 1 }])], { keep: [[0]] });
     await run(store2);
     expect((await verify(store2)).counts.erased_present).toBe(1);
+  });
+
+  test("a slot-form winner with canonical bytes at its revision that no staged line binds to its digest is refused", async () => {
+    const store = await scratch();
+    // SQL's slot names (1, sha("w:1")); the only staged line for w carries another digest (a rejected candidate), and
+    // canonical holds some line at revision 1 written by another path: nothing proves those are the winning bytes.
+    await writeGroups({ store, keyRoot: ROOT }, { ...TENANT, originId: ORIGIN, batchDigest: sha("other-w") }, [group("claude", "sess-1", [{ id: "w", rev: 1, digest: "c".repeat(64) }])], new Date(RECEIVED));
+    await fullSlots(store, [{ id: "w", rev: 1 }, { id: "k", rev: 1 }]);
+    await stage(store, [group("claude", "sess-1", [{ id: "k", rev: 1 }, { id: "w", rev: 1, digest: "c".repeat(64) }])], { keep: [[0]] });
+    await run(store);
+    const proof = await verify(store);
+    expect(proof.ok).toBe(false);
+    expect(proof.failures.map((f) => f.kind)).toEqual(["winner_unbound"]);
+    expect(proof.exact).toBe(1);
   });
 
   test("the verifier refuses an org without its accepted-stage export completion", async () => {
