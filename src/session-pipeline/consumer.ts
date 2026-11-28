@@ -229,7 +229,8 @@ export async function processBatch(records: readonly QueueRecord[], deps: Consum
     for (const { scope, messageIds, manifestKey, revisions } of scopes.values()) {
       if (delegated.has(scopeId(scope)) || messageIds.every((id) => failed.has(id))) continue;
       const started = Date.now();
-      // The covering pass's start on the consumer clock (ordered.now in tests): the 7s pickup budget ends here.
+      // The covering search pass's start on the consumer clock (ordered.now in tests). NOT the pickup endpoint:
+      // pickup is pickedUpAt (batch arrival, before any pointer work); this comes after pointer work and routing.
       const passStartedAt = now();
       if (ordered && supersededOnly(messageIds, revisions)) {
         // Every message is a stamped revision whose write is no longer live. The newer live write has its

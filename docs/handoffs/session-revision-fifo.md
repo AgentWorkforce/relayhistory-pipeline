@@ -85,12 +85,15 @@ Readout labels (use these exactly):
 |---|---|---|
 | `commit_to_pickup_ms` | manifest commit to consumer pickup (worker start, before pointer work) | `event_source=writer`: writer clock at the CAS ack; `forward`: S3 eventTime; `reconcile`: none (field absent) |
 | `pickup_wait_ms` | SQS enqueue to consumer pickup | SQS SentTimestamp |
-| `pointer_ms` | this key's pointer work | consumer clock |
+| `pointer_ms` | this key's own pointer work | consumer clock |
+| `pointer_started_at_ms + pointer_ms - picked_up_at_ms` | the 2s pointer leg: pickup to this key's pointer completion, INCLUDING time waiting behind earlier keys of the batch | consumer clock |
 | `commit_to_start_ms` / `start_wait_ms` | manifest commit / SQS enqueue to covering search pass start | as above |
 | `commit_to_searchable_ms` | manifest commit to covering-pass completion | as above |
 | `queue_wait_ms` | SQS enqueue to covering-pass completion (includes processing) | SQS SentTimestamp |
 
-The 7s pickup budget is `commit_to_pickup_ms` (worker start, `picked_up_at_ms`).
+The 7s pickup budget is `commit_to_pickup_ms` (worker start, `picked_up_at_ms`). The 2s pointer budget is pickup to
+this key's pointer completion (row above), not `pointer_ms` alone. `pass_started_at_ms` is the later search-pass start,
+never the pickup endpoint.
 `commit_*` uses the writer's commit time, or the S3 eventTime for forwarded events. These are
 pipeline-leg diagnostics, not the end-to-end score: they start at the manifest commit, not at
 Desktop's first HTTP attempt, and end at the pass, not at an authorized read. Count superseded
