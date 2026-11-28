@@ -1270,12 +1270,12 @@ export class ErasureJob {
     const hook = (prefix?: string) => {
       let n = 0;
       return () => {
-        this.#requestGate(fence, fs, held);
+        const now = this.#requestGate(fence, fs, held);
         if (prefix !== undefined) {
           if (++n > FENCE_LIST_MAX_PAGES) { fs.failure ??= "stale_prefix_listing_budget"; throw refusal("stale_prefix_listing_budget"); }
           fs.pages.set(prefix, Math.max(fs.pages.get(prefix) ?? 0, n));
         }
-        return fs.protectedUntil - this.now();
+        return fs.protectedUntil - now;
       };
     };
     const list = (prefix: string) => fence.listVersions(prefix, { beforeRequest: hook(prefix) });
@@ -1339,7 +1339,7 @@ export class ErasureJob {
           // Receipt membership of the very version about to be deleted.
           if (!w.entry.old_versions.some((e) => e.key_sha256 === out.key_sha256 && e.version_id === v.versionId)) { stop = "stale_prefix_receipt_drift"; break; }
           // IMMEDIATELY before issuing: attestation, check-to-delete interval, hard deadline, every lease's TTL.
-          stop = this.#issueCheck(fence, fs, held, attestation, checkDoneAt);
+          stop = this.#issueCheck(fence, fs, held, attestation, checkDoneAt).code;
           if (stop) break;
           const t1 = this.now();
           // The same issuance check again, AFTER signing and immediately before the DELETE is sent (eraser.ts
@@ -1347,14 +1347,16 @@ export class ErasureJob {
           // is sent and the version stays not_attempted.
           let gateRefused: string | undefined;
           const beforeFetch = () => {
-            const code = this.#issueCheck(fence, fs, held, attestation, checkDoneAt);
+            const { code, now } = this.#issueCheck(fence, fs, held, attestation, checkDoneAt);
             if (code) { gateRefused = code; throw refusal(code); }
-            return fs.protectedUntil - this.now();
+            return fs.protectedUntil - now;
           };
           try {
             await fence.deleteVersion(v.key, v.versionId, { beforeFetch });
           } catch (error) {
+            // Refused before fetch (this gate, or the eraser's own no-time-left refusal): nothing was sent.
             if (gateRefused) { stop = gateRefused; break; }
+            if ((error as { notSent?: boolean }).notSent === true) { stop = errorCode(error); break; }
             // A short-lived key refused BEFORE signing: nothing was sent, the version stays not_attempted.
             if (isCredentialFault(error)) { credential = error; stop = errorCode(error); break; }
             // Anything else may still have applied: never not_attempted. Resolve by an exact relist (through the same
@@ -1414,13 +1416,16 @@ export class ErasureJob {
    * must end by the hard deadline, and every lease must still cover the remaining work (#ttlBound, with the ACTUAL
    * page counts observed so far). Throws `stale_prefix_deadline` / `stale_prefix_lease_ttl_insufficient`.
    */
-  #requestGate(fence: ReceiptFence, fs: FenceClock, held: readonly string[]): void {
-    // Runs inside the eraser's request path after signing, immediately before fetch.
+  #requestGate(fence: ReceiptFence, fs: FenceClock, held: readonly string[]): number {
+    // Runs inside the eraser's request path after signing, immediately before fetch. Lease queries first, then one
+    // fresh clock sample for every condition.
+    const expiries = held.map((p) => this.#leaseExpiry(p));
     const now = this.now();
     const fail = (code: string) => { fs.failure ??= code; throw refusal(code); };
     if (now + fence.requestDeadlineMs * fence.requestAttempts > fs.protectedUntil) fail("stale_prefix_deadline");
     const bound = this.#ttlBound(fence, fs);
-    for (const p of held) if (this.state.leaseRemainingMs(p, LEASE_HOLDER, now) < bound) fail("stale_prefix_lease_ttl_insufficient");
+    for (const at of expiries) if (at - now < bound) fail("stale_prefix_lease_ttl_insufficient");
+    return now;
   }
 
   /**
@@ -1451,18 +1456,28 @@ export class ErasureJob {
    * ends by the hard deadline; and every lease's remaining TTL covers that request plus ISSUE_MARGIN_MS and the
    * remaining-work bound. Otherwise the delete is NOT issued.
    */
-  #issueCheck(fence: ReceiptFence, fs: FenceClock, held: readonly string[], attestation: ProtectionAttestation, checkDoneAt: number): string | undefined {
-    const now = this.now(), perRequest = fence.requestDeadlineMs * fence.requestAttempts;
-    if (!attestationFresh(attestation, now)) return "stale_prefix_protection_unproven";
-    if (now - checkDoneAt > CHECK_TO_DELETE_MAX_MS) return "stale_prefix_deadline";
-    if (now + perRequest > fs.protectedUntil) return "stale_prefix_deadline";
+  #issueCheck(fence: ReceiptFence, fs: FenceClock, held: readonly string[], attestation: ProtectionAttestation, checkDoneAt: number): { code?: string; now: number } {
+    const perRequest = fence.requestDeadlineMs * fence.requestAttempts;
+    // Every (synchronous) lease query FIRST, as absolute expiries; THEN one fresh clock sample, and every condition
+    // is judged at that instant, so time spent in the queries themselves is counted.
+    const expiries = held.map((p) => this.#leaseExpiry(p));
+    const now = this.now();
+    if (now - checkDoneAt > CHECK_TO_DELETE_MAX_MS) return { code: "stale_prefix_deadline", now };
+    if (now + perRequest > fs.protectedUntil) return { code: "stale_prefix_deadline", now };
+    if (!attestationFresh(attestation, now)) return { code: "stale_prefix_protection_unproven", now };
     const bound = this.#ttlBound(fence, fs);
-    for (const p of held) {
-      const left = this.state.leaseRemainingMs(p, LEASE_HOLDER, now);
-      if (left < perRequest + ISSUE_MARGIN_MS) return "stale_prefix_deadline";
-      if (left < bound) return "stale_prefix_lease_ttl_insufficient";
+    for (const at of expiries) {
+      const left = at - now;
+      if (left < perRequest + ISSUE_MARGIN_MS) return { code: "stale_prefix_deadline", now };
+      if (left < bound) return { code: "stale_prefix_lease_ttl_insufficient", now };
     }
-    return undefined;
+    return { now };
+  }
+
+  /** The absolute expiry of this holder's lease on `prefix` (negative infinity when not held). Read-only. */
+  #leaseExpiry(prefix: string): number {
+    const at = this.state.leaseRemainingMs(prefix, LEASE_HOLDER, 0);
+    return at < 0 ? Number.NEGATIVE_INFINITY : at;
   }
 
   /**
