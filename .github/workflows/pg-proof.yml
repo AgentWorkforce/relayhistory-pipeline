@@ -231,6 +231,16 @@ jobs:
         env:
           SESSION_INGEST_TEST_PG_URL: postgres://postgres@127.0.0.1:5432/postgres
         run: bun test src/session-pipeline/__tests__/brief-documents.postgres.test.ts
+      - name: Prove T130 Reader v2 + consumed-record membership (062500/062510) on real PostgreSQL (provenance constraint, preserved binding, stale token changed, unbound unknown)
+        env:
+          SESSION_INGEST_TEST_PG_URL: postgres://postgres@127.0.0.1:5432/postgres
+          SESSION_INGEST_TEST_PG_REQUIRED: "1"
+        run: |
+          set -o pipefail
+          bun test --timeout 300000 src/session-brief/__tests__/brief-membership.postgres.test.ts 2>&1 | tee brief-membership-pg.log
+          # The proof must have RUN: one passing test and no skipped one.
+          if grep -Eq '^ *[1-9][0-9]* skip' brief-membership-pg.log; then echo "::error title=pg-proof::T130 membership test skipped"; exit 1; fi
+          grep -Eq '^ *[1-9][0-9]* pass' brief-membership-pg.log || { echo "::error title=pg-proof::T130 membership test did not pass"; exit 1; }
       - name: Prove the staged reconcile claim never waits on a held run row (062110)
         env:
           SESSION_INGEST_TEST_PG_URL: postgres://postgres@127.0.0.1:5432/postgres
