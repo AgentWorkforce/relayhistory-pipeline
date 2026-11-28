@@ -210,6 +210,16 @@ export interface SearchIndexDeps {
    */
   skipCurrent?: boolean;
   /**
+   * SEARCH_INDEX_SKIP_CURRENT_SHADOW_ENABLED=true only (the hosted Lambda, lambda.ts): measure the skip
+   * without taking it. A pass that reaches the skip-current check and is not skipped runs exactly as
+   * before and carries `skipProbe`: whether the directory proves the scope current, and if not, the first
+   * condition that failed (skipCurrentProbe). One Postgres read per pass (plus the facts point read with
+   * `outputFacts`), no write. With `skipCurrent` off it says what the skip would have saved, and a probe
+   * that says current on a pass that then inserts or deletes is a change the skip would have missed.
+   * Absent: no query, no field.
+   */
+  skipCurrentShadow?: boolean;
+  /**
    * SEARCH_INDEX_PREREAD_ENABLED=true: for the legacy ClickHouse whole-read path without output
    * facts, read the canonical source and scan the index before the search transaction, then apply
    * only after the source stamp is unchanged under the existing locks. Staged, streamed, adapter
@@ -407,6 +417,8 @@ export interface SearchIndexResult {
   busy?: boolean;
   /** `skipCurrent` only: a complete pass already covers the live source set; nothing was read or written. */
   skipped?: boolean;
+  /** `skipCurrentShadow` only, on a pass that reached the skip-current check and ran: what the check answers. */
+  skipProbe?: SkipCurrentProbe;
   /** Would stream, but this invocation already streamed a scope (`streamSlot`): nothing was written, re-enqueue the event. */
   deferred?: boolean;
   /** Too large to index whole: no rows written, its index state marked partial. */
@@ -647,6 +659,9 @@ async function indexSearchScopeBase(scope: SessionScope, deps: SearchIndexDeps, 
   // The skip checks the facts state only for the ClickHouse facts (outputFactsComplete); a Postgres facts
   // store would be skipped with its facts unchecked.
   if (deps.skipCurrent && deps.outputFactsStore) throw new Error("skip current: not supported with the Postgres output facts store");
+  if (deps.skipCurrentShadow && deps.outputFactsStore) throw new Error("skip current shadow: not supported with the Postgres output facts store");
+  // Shadow only: set by the pass's transaction when it reaches the skip-current check, attached to the result below.
+  let skipProbe: SkipCurrentProbe | undefined;
   const limits = { ...SEARCH_INDEX_DEFAULT_LIMITS, ...deps.limits };
   const now = deps.now ?? (() => new Date());
   // Staged (SEARCH_INDEX_STAGED_RECONCILE_ENABLED, adapter binding): a scope that would stream
@@ -736,6 +751,8 @@ async function indexSearchScopeBase(scope: SessionScope, deps: SearchIndexDeps, 
     // mismatch, alias still live, erase), before any object read or index query.
     if (deps.skipCurrent && (await alreadyCurrent(tx, scope, pointerSnapshot, keys.length, deps.outputFacts ? deps.ch : undefined)))
       return { manifests: keys.length, rows: 0, inserted: 0, deleted: 0, complete: true, skipped: true, reasons: [ALREADY_CURRENT] };
+    // SEARCH_INDEX_SKIP_CURRENT_SHADOW_ENABLED: the same proof, read only; the pass below is unchanged.
+    skipProbe = deps.skipCurrentShadow ? await skipCurrentProbe(tx, scope, pointerSnapshot, keys.length, deps.outputFacts ? deps.ch : undefined) : undefined;
     const fromMs = prepared?.fromMs ?? await io.fromMs(at);
     const s3 = prepared?.s3 ?? await measurePhase(deps.metrics, "sourceReadMs", () =>
       readCanonicalScope(scope, siblingKeys, { ...deps, decompress: deps.decompress ?? defaultDecompress }, limits, version, pointerSnapshot.canonicalId));
@@ -912,7 +929,8 @@ async function indexSearchScopeBase(scope: SessionScope, deps: SearchIndexDeps, 
       deps.metrics.lockedApplyMs += Math.max(0, Date.now() - lockedStarted - source - scan);
     }
   }
-  return handoff ? stagedSearchScope(scope, deps, limits, handoff) : first;
+  const result = handoff ? await stagedSearchScope(scope, deps, limits, handoff) : first;
+  return skipProbe && result !== SEARCH_SCOPE_CHANGED && !result.skipped && !result.busy ? { ...result, skipProbe } : result;
 }
 
 /** What the index transaction hands a staged run: the admitted read and the source stamp it saw. */
@@ -1373,6 +1391,59 @@ export async function alreadyCurrent(
   if (rows[0]?.current !== true) return false;
   if (!factsCh) return true;
   return outputFactsComplete(factsCh, { orgId: scope.orgId, workspaceId: scope.workspaceId, harness: scope.harness, sessionId: snapshot.canonicalId });
+}
+
+/** Why skipCurrentProbe says a scope is not current: the first alreadyCurrent condition that failed, in this order. */
+export type SkipCurrentMiss =
+  /** No session directory row for the canonical id or the scope. */
+  | "no_directory"
+  | "directory_deleted"
+  | "projection_version"
+  /** The directory's sources are not the live manifest_key -> revision map: a revision, a sibling or a canonical id changed since the last complete pass. */
+  | "sources_changed"
+  /** Same sources, readiness reset: the last pass over them was incomplete, or a pointer change left the map equal. */
+  | "not_ready"
+  /** `outputFacts` only: the directory is current, the facts state is not complete (or unreadable). */
+  | "facts_incomplete";
+export interface SkipCurrentProbe {
+  /** What alreadyCurrent answers for the same snapshot. */
+  current: boolean;
+  miss?: SkipCurrentMiss;
+}
+
+/**
+ * alreadyCurrent with its reason (SEARCH_INDEX_SKIP_CURRENT_SHADOW_ENABLED): the same directory row, picked
+ * the same way, and the same conditions, each returned instead of folded into one EXISTS. `current` must
+ * equal alreadyCurrent for every state (search-index-skip-shadow.pglite.test.ts compares the two). Read only.
+ */
+export async function skipCurrentProbe(
+  tx: SqlExecutor,
+  scope: SessionScope,
+  snapshot: { canonicalId: string },
+  liveKeys: number,
+  factsCh?: ClickHouseClient,
+): Promise<SkipCurrentProbe> {
+  if (liveKeys === 0) return { current: false, miss: "sources_changed" };
+  const { rows } = await tx.query<{ deleted: boolean; ready: boolean; version: number | string; sources_equal: boolean | null }>(
+    `SELECT d.deleted_at IS NOT NULL AS deleted, d.event_projection_ready AS ready, d.event_projection_version AS version,
+            d.event_projection_sources=(
+              SELECT jsonb_object_agg(p.manifest_key,p.revision::text) FROM sessions.session_index p
+               WHERE p.org_id=$1 AND p.workspace_id=$2 AND p.harness=$3
+                 AND coalesce(p.canonical_session_id,p.session_id)=$4 AND p.deleted_at IS NULL) AS sources_equal
+       FROM sessions.session_directory d
+      WHERE d.org_id=$1 AND d.workspace_id=$2 AND d.harness=$3 AND d.session_id IN ($4,$5)
+      ORDER BY (d.session_id=$4) DESC LIMIT 1`,
+    [scope.orgId, scope.workspaceId, scope.harness, snapshot.canonicalId, scope.sessionId],
+  );
+  const d = rows[0];
+  if (!d) return { current: false, miss: "no_directory" };
+  if (d.deleted) return { current: false, miss: "directory_deleted" };
+  if (Number(d.version) !== 1) return { current: false, miss: "projection_version" };
+  if (d.sources_equal !== true) return { current: false, miss: "sources_changed" };
+  if (d.ready !== true) return { current: false, miss: "not_ready" };
+  if (factsCh && !(await outputFactsComplete(factsCh, { orgId: scope.orgId, workspaceId: scope.workspaceId, harness: scope.harness, sessionId: snapshot.canonicalId })))
+    return { current: false, miss: "facts_incomplete" };
+  return { current: true };
 }
 
 /** The streaming reader's keepalive interval: a third of the consumer pool's 60 s idle timeout. */

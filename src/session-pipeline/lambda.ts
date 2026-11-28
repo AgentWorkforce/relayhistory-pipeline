@@ -156,6 +156,8 @@ export interface LambdaEnv {
   originLabelsEnabled?: boolean;
   /** SEARCH_INDEX_SKIP_CURRENT_ENABLED=true: skip a pass a complete pass already covers (search-index.ts alreadyCurrent). Default off. */
   skipCurrentEnabled?: boolean;
+  /** SEARCH_INDEX_SKIP_CURRENT_SHADOW_ENABLED=true: log what the skip-current check answers, skip nothing (search-index.ts skipCurrentProbe). Default off. */
+  skipCurrentShadowEnabled?: boolean;
   /** SEARCH_INDEX_PREREAD_ENABLED=true: read a legacy ClickHouse whole scope before its search lock. Default off. */
   searchPreReadEnabled?: boolean;
   /** SESSION_POINTER_PREREAD_ENABLED=true: the pointer stage reads before its scope lock (pointer.ts indexPreRead). Default off. */
@@ -248,6 +250,10 @@ export function lambdaEnv(env: NodeJS.ProcessEnv = process.env, composition?: Se
   const skipCurrent = searchIndexSkipCurrentFromEnv(env);
   if (skipCurrent && env.SEARCH_INDEX_ENABLED !== "1")
     throw new Error("session pipeline: SEARCH_INDEX_SKIP_CURRENT_ENABLED=true needs SEARCH_INDEX_ENABLED=1");
+  // SEARCH_INDEX_SKIP_CURRENT_SHADOW_ENABLED: strict grammar, default off; on needs the search stage.
+  const skipCurrentShadow = searchIndexSkipCurrentShadowFromEnv(env);
+  if (skipCurrentShadow && env.SEARCH_INDEX_ENABLED !== "1")
+    throw new Error("session pipeline: SEARCH_INDEX_SKIP_CURRENT_SHADOW_ENABLED=true needs SEARCH_INDEX_ENABLED=1");
   // SEARCH_INDEX_PREREAD_ENABLED: strict grammar, default off; on needs the search stage.
   const searchPreRead = searchIndexPreReadFromEnv(env);
   if (searchPreRead && env.SEARCH_INDEX_ENABLED !== "1")
@@ -282,6 +288,7 @@ export function lambdaEnv(env: NodeJS.ProcessEnv = process.env, composition?: Se
     outputFactsEnabled: env.SEARCH_INDEX_OUTPUT_FACTS === "1",
     originLabelsEnabled: messageOriginLabelsEnabled(env[MESSAGE_ORIGIN_LABELS_VAR]),
     ...(skipCurrent ? { skipCurrentEnabled: true } : {}),
+    ...(skipCurrentShadow ? { skipCurrentShadowEnabled: true } : {}),
     ...(searchPreRead ? { searchPreReadEnabled: true } : {}),
     ...(pointerPreRead ? { pointerPreReadEnabled: true } : {}),
     ...(pointerSkipOriginBucket ? { pointerSkipOriginBucketEnabled: true } : {}),
@@ -578,6 +585,8 @@ export function runtimeFromSecret(env: LambdaEnv, secretText: string, schemaGene
       ...(env.originLabelsEnabled ? { originLabels: true as const } : {}),
       // Default off; on, a pass the session directory proves current returns before any read (already_current).
       ...(env.skipCurrentEnabled ? { skipCurrent: true as const } : {}),
+      // Default off; on, a pass that is not skipped logs the skip-current verdict (would_skip, skip_miss) and runs unchanged.
+      ...(env.skipCurrentShadowEnabled ? { skipCurrentShadow: true as const } : {}),
       ...(env.searchPreReadEnabled ? { preRead: true as const } : {}),
       // Default off (SEARCH_INDEX_STREAMING_CH=1, ClickHouse only); the deadline is set per invocation.
       ...(env.searchStreamCh && !binding ? { stream: { maxReadBytes: env.searchStreamCh.maxReadBytes, maxReadEvents: env.searchStreamCh.maxReadEvents } } : {}),
@@ -1170,6 +1179,14 @@ export function searchIndexSkipCurrentFromEnv(env: Record<string, string | undef
   if (value === undefined || value === "" || value === "false") return false;
   if (value === "true") return true;
   throw new Error("session pipeline: SEARCH_INDEX_SKIP_CURRENT_ENABLED must be true or false");
+}
+
+/** SEARCH_INDEX_SKIP_CURRENT_SHADOW_ENABLED, the same grammar: unset, "" and "false" are off; "true" is on; anything else fails init. */
+export function searchIndexSkipCurrentShadowFromEnv(env: Record<string, string | undefined>): boolean {
+  const value = env.SEARCH_INDEX_SKIP_CURRENT_SHADOW_ENABLED;
+  if (value === undefined || value === "" || value === "false") return false;
+  if (value === "true") return true;
+  throw new Error("session pipeline: SEARCH_INDEX_SKIP_CURRENT_SHADOW_ENABLED must be true or false");
 }
 
 /**

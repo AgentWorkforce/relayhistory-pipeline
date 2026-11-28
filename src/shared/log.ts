@@ -47,6 +47,8 @@ const SEARCH_PHASE_FIELDS = ["source_read_ms", "index_scan_ms", "locked_apply_ms
 export const ALLOWED_LOG_FIELDS = new Set([
   // The staged run summary line: the pass was answered from a cached size refusal (search-index.ts StagedRefusals).
   "cached_refusal",
+  // The search pass line under SEARCH_INDEX_SKIP_CURRENT_SHADOW_ENABLED: the skip-current verdict and its first failed condition.
+  "would_skip", "skip_miss",
   "service", "deployment", "deployment_id", "stage", "status", "outcome", "attempt",
   "trace_id", "span_id", "traceparent", "session_uuid", "session_uuid_source",
   "tenant_id", "org_id", "workspace_id", "machine_id", "harness", "session_id",

@@ -233,9 +233,17 @@ export async function processBatch(records: readonly QueueRecord[], deps: Consum
           deleted: result.deleted,
           ok: result.complete,
           reason: result.reasons.join(",") || undefined,
+          // SEARCH_INDEX_SKIP_CURRENT_SHADOW_ENABLED: what the skip-current check answers for this pass, which ran anyway.
+          ...(result.skipProbe ? { would_skip: result.skipProbe.current, skip_miss: result.skipProbe.miss } : {}),
           ...phaseFields(),
           duration_ms: Date.now() - started,
         });
+        // The directory said current and the pass still changed the index: the skip would have left it stale.
+        if (result.skipProbe?.current && (result.inserted > 0 || result.deleted > 0))
+          log.warn("search index skip would have missed changes", {
+            stage: "search-index", org_id: scope.orgId, workspace_id: scope.workspaceId, harness: scope.harness, session_id: scope.sessionId,
+            reason: "skip_probe_divergence", inserted: result.inserted, deleted: result.deleted,
+          });
       } catch (error) {
         log.error("search index failed", {
           stage: "search-index",

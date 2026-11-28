@@ -39,7 +39,7 @@ import { assertTranscriptStoreInputs, assertTranscriptStorePlanContract, transcr
 import { bufferedFeedConfig, bufferedFeedGateRefusal, BUFFERED_SEARCH_GATE_CONTRACT } from "../../../src/session-pipeline/buffered-search-feed.ts";
 import { bufferedErasureConfig } from "../../../src/session-pipeline/buffered-erasure-delete.ts";
 import { searchIndexLimits, searchIndexStreamChFromEnv, searchIndexStreamFloor, SEARCH_INDEX_STREAM_CH_CEILING } from "../../../src/session-pipeline/search-index.ts";
-import { lambdaEnv, pointerPreReadFromEnv, pointerSkipOriginBucketFromEnv, searchIndexPreReadFromEnv, searchIndexSkipCurrentFromEnv } from "../../../src/session-pipeline/lambda.ts";
+import { lambdaEnv, pointerPreReadFromEnv, pointerSkipOriginBucketFromEnv, searchIndexPreReadFromEnv, searchIndexSkipCurrentFromEnv, searchIndexSkipCurrentShadowFromEnv } from "../../../src/session-pipeline/lambda.ts";
 import { NeonExitRefusal } from "../../../src/shared/neon-exit.ts";
 import { analysisConfig } from "../../../src/session-analysis/worker.ts";
 
@@ -986,6 +986,40 @@ describe("session pipeline: analysisJobs.cutoverProof (SESSION_ANALYSIS_CUTOVER_
         "transcriptStore.sessionPipeline.analysisJobs requires exactly { enabled: boolean, cutoverProof?: boolean }",
       );
     expect(() => validate(withPipeline({ ...on, analysisJobs: { enabled: true, cutoverProof: true, extra: true } }))).toThrow(/analysisJobs requires exactly/);
+  });
+});
+
+describe("session pipeline: measure the skip without taking it (SEARCH_INDEX_SKIP_CURRENT_SHADOW_ENABLED)", () => {
+  const envOf = (cfg: SessionPipelineInputs) => sessionPipelineEnv({ stage: STAGE, bucket: t.bucket, names: p, p: cfg });
+  const refusedBy = (v: unknown) => { let why = ""; try { assertSessionPipelineInputs(v, (w: string) => { throw new Error(w); }); } catch (e) { why = (e as Error).message; } return why; };
+  const base = Object.keys(envOf({ searchIndex: true })).sort();
+
+  it("unset or false renders nothing new, and the Lambda reads it as off", () => {
+    expect(base).not.toContain("SEARCH_INDEX_SKIP_CURRENT_SHADOW_ENABLED");
+    for (const cfg of [{ searchIndex: true }, { searchIndex: true, skipCurrentShadow: false }, { skipCurrentShadow: false }] as SessionPipelineInputs[]) {
+      expect(refusedBy(cfg)).toBe("");
+      expect(Object.keys(envOf(cfg)).sort()).toEqual(Object.keys(envOf({ ...cfg, skipCurrentShadow: undefined } as SessionPipelineInputs)).sort());
+      expect(searchIndexSkipCurrentShadowFromEnv(envOf(cfg))).toBe(false);
+    }
+  });
+
+  it("true renders exactly the shadow flag, never the skip flag; both can be on", () => {
+    const env = envOf({ searchIndex: true, skipCurrentShadow: true });
+    expect(Object.keys(env).sort()).toEqual([...base, "SEARCH_INDEX_SKIP_CURRENT_SHADOW_ENABLED"].sort());
+    expect(env.SEARCH_INDEX_SKIP_CURRENT_SHADOW_ENABLED).toBe("true");
+    expect(searchIndexSkipCurrentShadowFromEnv(env)).toBe(true);
+    expect(searchIndexSkipCurrentFromEnv(env)).toBe(false);
+    const both = envOf({ searchIndex: true, skipCurrent: true, skipCurrentShadow: true });
+    expect(Object.keys(both).sort()).toEqual([...base, "SEARCH_INDEX_SKIP_CURRENT_ENABLED", "SEARCH_INDEX_SKIP_CURRENT_SHADOW_ENABLED"].sort());
+  });
+
+  it("invalid shapes are refused, by the stack and by the Lambda", () => {
+    expect(refusedBy({ skipCurrentShadow: true })).toMatch(/skipCurrentShadow requires searchIndex: true/);
+    expect(refusedBy({ searchIndex: false, skipCurrentShadow: true })).toMatch(/skipCurrentShadow requires searchIndex: true/);
+    for (const bad of ["true", 1, null, {}]) expect(refusedBy({ searchIndex: true, skipCurrentShadow: bad })).toMatch(/skipCurrentShadow must be a boolean/);
+    for (const bad of ["1", "TRUE", " true", "on", "yes"])
+      expect(() => searchIndexSkipCurrentShadowFromEnv({ SEARCH_INDEX_SKIP_CURRENT_SHADOW_ENABLED: bad })).toThrow("SEARCH_INDEX_SKIP_CURRENT_SHADOW_ENABLED must be true or false");
+    expect(searchIndexSkipCurrentShadowFromEnv({ SEARCH_INDEX_SKIP_CURRENT_SHADOW_ENABLED: "" })).toBe(false);
   });
 });
 

@@ -140,6 +140,13 @@ export interface SessionPipelineInputs {
    */
   skipCurrent?: boolean;
   /**
+   * Default off. `true` renders SEARCH_INDEX_SKIP_CURRENT_SHADOW_ENABLED=true: every search pass that is not
+   * skipped runs as before and logs what the skip-current check answers (`would_skip`, `skip_miss` on the
+   * `search index reconciled` line), and warns when a pass the check called current still inserted or deleted.
+   * One Postgres read per pass, no write, nothing skipped. Independent of `skipCurrent`. Needs `searchIndex: true`.
+   */
+  skipCurrentShadow?: boolean;
+  /**
    * Default off. `true` renders SEARCH_INDEX_PREREAD_ENABLED=true: the legacy ClickHouse whole-read
    * path reads its source and index before the search lock. A buffered row landing after that scan is
    * healed by the next delivered or scheduled reconcile pass. Requires searchIndex.
@@ -330,7 +337,7 @@ export function assertSessionPipelineInputs(p: unknown, refuse: (why: string) =>
     refuse("transcriptStore.sessionPipeline must be a plain object");
   const v = p as Record<string, unknown>;
   for (const k of Object.keys(v))
-    if (k !== "searchIndex" && k !== "replayPages" && k!=="analysisCache" && k !== "legacyReadSource" && k !== "desktopCatalog" && k !== "maxConcurrency" && k !== "reconcileMinutes" && k !== "briefs" && k !== "semanticCopy" && k !== "analysisJobs" && k !== "bufferedSearchFeed" && k !== "bufferedErasureDelete" && k !== "neonExit" && k !== "relayfacts" && k !== "schedules" && k !== "streamReconcile" && k !== "summaryRegen" && k !== "skipCurrent" && k !== "searchPreRead" && k !== "pointerPreRead" && k !== "pointerSkipOriginBucket") refuse(`transcriptStore.sessionPipeline.${k} is not a known setting`);
+    if (k !== "searchIndex" && k !== "replayPages" && k!=="analysisCache" && k !== "legacyReadSource" && k !== "desktopCatalog" && k !== "maxConcurrency" && k !== "reconcileMinutes" && k !== "briefs" && k !== "semanticCopy" && k !== "analysisJobs" && k !== "bufferedSearchFeed" && k !== "bufferedErasureDelete" && k !== "neonExit" && k !== "relayfacts" && k !== "schedules" && k !== "streamReconcile" && k !== "summaryRegen" && k !== "skipCurrent" && k !== "skipCurrentShadow" && k !== "searchPreRead" && k !== "pointerPreRead" && k !== "pointerSkipOriginBucket") refuse(`transcriptStore.sessionPipeline.${k} is not a known setting`);
   if (v.searchIndex !== undefined && typeof v.searchIndex !== "boolean") refuse("transcriptStore.sessionPipeline.searchIndex must be a boolean");
   if (v.replayPages !== undefined && typeof v.replayPages !== "boolean") refuse("transcriptStore.sessionPipeline.replayPages must be a boolean");
   if(v.analysisCache!==undefined&&typeof v.analysisCache!=="boolean")refuse("transcriptStore.sessionPipeline.analysisCache must be a boolean");
@@ -350,6 +357,8 @@ export function assertSessionPipelineInputs(p: unknown, refuse: (why: string) =>
   if (v.desktopCatalog !== undefined && typeof v.desktopCatalog !== "boolean") refuse("transcriptStore.sessionPipeline.desktopCatalog must be a boolean");
   if (v.skipCurrent !== undefined && typeof v.skipCurrent !== "boolean") refuse("transcriptStore.sessionPipeline.skipCurrent must be a boolean");
   if (v.skipCurrent === true && v.searchIndex !== true) refuse("transcriptStore.sessionPipeline.skipCurrent requires searchIndex: true");
+  if (v.skipCurrentShadow !== undefined && typeof v.skipCurrentShadow !== "boolean") refuse("transcriptStore.sessionPipeline.skipCurrentShadow must be a boolean");
+  if (v.skipCurrentShadow === true && v.searchIndex !== true) refuse("transcriptStore.sessionPipeline.skipCurrentShadow requires searchIndex: true");
   if (v.searchPreRead !== undefined && typeof v.searchPreRead !== "boolean") refuse("transcriptStore.sessionPipeline.searchPreRead must be a boolean");
   if (v.searchPreRead === true && v.searchIndex !== true) refuse("transcriptStore.sessionPipeline.searchPreRead requires searchIndex: true");
   if (v.pointerPreRead !== undefined && typeof v.pointerPreRead !== "boolean") refuse("transcriptStore.sessionPipeline.pointerPreRead must be a boolean");
@@ -709,6 +718,8 @@ export function sessionPipelineEnv(i: { stage: string; bucket: string; names: Se
     ...(i.p.bufferedErasureDelete?.budgetMs !== undefined ? { INGEST_BUFFERED_ERASURE_BUDGET_MS: String(i.p.bufferedErasureDelete.budgetMs) } : {}),
     // Only when armed: a stage without skipCurrent: true renders nothing and never skips.
     ...(i.p.skipCurrent === true ? { SEARCH_INDEX_SKIP_CURRENT_ENABLED: "true" } : {}),
+    // Only when armed: a stage without skipCurrentShadow: true renders nothing and probes nothing.
+    ...(i.p.skipCurrentShadow === true ? { SEARCH_INDEX_SKIP_CURRENT_SHADOW_ENABLED: "true" } : {}),
     // Only when armed: a stage without searchPreRead: true keeps the whole search pass under its lock.
     ...(i.p.searchPreRead === true ? { SEARCH_INDEX_PREREAD_ENABLED: "true" } : {}),
     // Only when armed: a stage without pointerPreRead: true renders nothing and reads under the lock as before.

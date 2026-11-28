@@ -811,6 +811,42 @@ the flag off (`false`): every event then re-reads its session as before. Any re-
 sessions needs the flag off for its whole run; there is no version to bump instead
 (`event_projection_version` is fixed at 1).
 
+### Hosted Lambda: measure the skip without taking it
+
+`SEARCH_INDEX_SKIP_CURRENT_SHADOW_ENABLED` (hosted session-pipeline Lambda only; stack input
+`transcriptStore.sessionPipeline.skipCurrentShadow`, which needs `searchIndex: true`) is **default off**, with the
+same strict grammar: unset, `""` and `false` change nothing (no query, no log field); `true` is on; any other value
+fails Lambda init naming the variable. It is independent of `SEARCH_INDEX_SKIP_CURRENT_ENABLED` and skips nothing.
+
+On, every search pass that reaches the skip-current check and is not skipped runs exactly as before, after one extra
+read-only Postgres statement (and, with `SEARCH_INDEX_OUTPUT_FACTS=1`, the facts state point read). Its
+`search index reconciled` line then carries:
+
+- `would_skip`: what the skip-current proof answers for this pass (`true`: the skip flag would have returned
+  before any read);
+- `skip_miss`, when `would_skip` is `false`, the first condition of the proof that failed, checked in this order:
+  `no_directory`, `directory_deleted`, `projection_version`, `sources_changed` (a revision, a sibling manifest or
+  the canonical id changed since the last complete pass), `not_ready` (same sources, but the last pass over them
+  was incomplete or readiness was reset), `facts_incomplete`.
+
+A pass with `would_skip: true` that still inserts or deletes index rows also logs the warning
+`search index skip would have missed changes` (reason `skip_probe_divergence`, with the counts): the session
+directory said current while the index was not, which is the drift listed under "Not detected" above. Busy,
+deferred and erased passes, and a canonical mismatch, return before the check and carry neither field.
+
+Use it before turning the skip on. Over a window with only the shadow flag on:
+
+- the share of `search index reconciled` lines with `would_skip: true`, and the sum of their `duration_ms`, is what
+  the skip flag saves (each such pass becomes the pointer stage and one Postgres check);
+- any `skip_probe_divergence` warning is a pass the skip would have got wrong; with none, the skip changes no
+  index content for that traffic;
+- `would_skip: false` lines split by `skip_miss` and `ok`: `sources_changed` is real new source data,
+  and `ok: false` lines repeat in full on every event whatever either flag says, because only a complete pass
+  makes a scope current.
+
+With both flags on, a skipped pass logs `search index skipped` as before and the remaining lines say why each pass
+was not skipped. The self-host consumer and the large-read job do not read this variable.
+
 ### Hosted Lambda: search reads before its lock
 
 `SEARCH_INDEX_PREREAD_ENABLED` (stack input `transcriptStore.sessionPipeline.searchPreRead`, which needs
