@@ -473,3 +473,23 @@ triggers (fan-out or queue), which is not yet traced.
   - R is only a candidate safe point until pending direct and drain effects are accounted for.
   - A's late-install versus withdrawal race still needs proof at the readable-byte boundary.
   - Wave 1 stays held.
+
+### Isolated synthetic proof (PGlite, every migration, real 062340 triggers; stand-in schema only)
+
+`src/session-ingest/__tests__/cutover-visibility.pglite.test.ts` (8 tests) pins:
+- the capture trigger records a real source-table write with an xid and no session scope;
+- erase first, after the bound: the publish refuses;
+- an erase before the bound: the publish is allowed;
+- publish first: the erase's own commit revokes, so pre-IO says visible and post-IO says revoked, with no replay;
+- scope is org-wide with 062340 as it is (option i), and another org is unaffected;
+- snapshot ordering;
+- publish refuses after the release;
+- the installer race: the withdrawal's SQL `_install` plus `verified_rollback` leaves a paused installer unable to
+  commit its request (55000).
+
+**Owed, needing the reserved PG17 lane (claim-ci):**
+- the two-connection orderings: a publish blocked by an in-flight erase that holds the key SHARED, and the reverse;
+- the interleaving where the xid is taken before commit.
+
+**Owed, needing reader stand-ins (C1/C3):**
+- the readable-byte boundary for the late-install race and the T97 parked direct writer.
