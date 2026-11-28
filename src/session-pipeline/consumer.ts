@@ -58,6 +58,31 @@ export interface ConsumerDeps {
   searchJobs?: { drain(): Promise<unknown> };
 }
 
+/** The index-row warning: a pass the probe called current inserted or deleted index rows. */
+export const SKIP_CHECK_DIVERGENT = "search index skip would have missed changes";
+/** The facts-only warning. A write count, not a content comparison: it does not say the skip would have been wrong. */
+export const SKIP_CHECK_FACTS_WRITTEN = "The facts reconcile wrote rows. Whether their content changed is unknown.";
+export const SKIP_CHECK_INCONCLUSIVE = "search index skip check inconclusive";
+
+/**
+ * The warnings of a probed pass (SEARCH_INDEX_SKIP_CURRENT_SHADOW_ENABLED), one at most, by its skipCheck outcome.
+ * `divergent`: an index row is inserted only when no row with its key and fingerprint exists, and deleted only
+ * when the source no longer carries it, so index writes are a content difference the skip would have left.
+ * `facts_divergent`: only the facts reconcile's row counts are known, so the warning says exactly that, with the
+ * facts counts. `inconclusive`: called current, nothing written, no pass completed (incomplete, or deferred
+ * before its read), so no no-op was verified. Nothing for a verified no-op, a miss or a failed probe.
+ */
+export function warnSkipCheck(scope: SessionScope, result: SearchIndexResult): void {
+  const check = skipCheck(result);
+  const ids = { stage: "search-index", org_id: scope.orgId, workspace_id: scope.workspaceId, harness: scope.harness, session_id: scope.sessionId };
+  if (check === "divergent")
+    log.warn(SKIP_CHECK_DIVERGENT, { ...ids, reason: "skip_probe_divergence", skip_check: check, inserted: result.inserted, deleted: result.deleted });
+  if (check === "facts_divergent")
+    log.warn(SKIP_CHECK_FACTS_WRITTEN, { ...ids, reason: "skip_probe_facts_written", skip_check: check, inserted: result.outputFacts?.inserted ?? 0, deleted: result.outputFacts?.deleted ?? 0 });
+  if (check === "inconclusive")
+    log.warn(SKIP_CHECK_INCONCLUSIVE, { ...ids, reason: "skip_probe_inconclusive", skip_check: check, ok: result.complete });
+}
+
 const scopeId = (s: SessionScope) => JSON.stringify([s.orgId, s.workspaceId, s.harness, s.sessionId]);
 
 export async function processBatch(records: readonly QueueRecord[], deps: ConsumerDeps): Promise<BatchResponse> {
@@ -198,19 +223,7 @@ export async function processBatch(records: readonly QueueRecord[], deps: Consum
       // The probe's verdict and the one outcome it led to (skipCheck), on whichever line ends the pass.
       const probeVerdict = (result: SearchIndexResult) =>
         result.skipProbe ? { would_skip: result.skipProbe.current, skip_miss: result.skipProbe.miss, skip_check: skipCheck(result) } : {};
-      const ids = { stage: "search-index", org_id: scope.orgId, workspace_id: scope.workspaceId, harness: scope.harness, session_id: scope.sessionId };
-      const warnProbe = (result: SearchIndexResult) => {
-        const check = skipCheck(result);
-        // The directory said current and the pass still changed the index (or only its facts): the skip would have left it stale.
-        if (check === "divergent" || check === "facts_divergent")
-          log.warn("search index skip would have missed changes", {
-            ...ids, reason: check === "divergent" ? "skip_probe_divergence" : "skip_probe_facts_divergence", skip_check: check, inserted: result.inserted, deleted: result.deleted,
-          });
-        // The directory said current, nothing was written, but no pass completed (incomplete, or deferred before its
-        // read): no no-op was verified.
-        if (check === "inconclusive")
-          log.warn("search index skip check inconclusive", { ...ids, reason: "skip_probe_inconclusive", skip_check: check, ok: result.complete });
-      };
+      const warnProbe = (result: SearchIndexResult) => warnSkipCheck(scope, result);
       try {
         const result = await indexSearchScope(scope, { ...deps.search, metrics: phase });
         if (result.busy) {

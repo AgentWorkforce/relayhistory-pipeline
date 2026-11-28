@@ -1493,15 +1493,16 @@ export function skipProbeFactsError(error: unknown): SkipProbeFactsError {
 
 /**
  * What a probed pass proved about the skip, one per pass (the consumer's `skip_check`). Only `verified_noop`
- * is evidence for the skip; `divergent`, `facts_divergent` and `inconclusive` are passes the probe called
- * current that did not confirm it; `probe_failed` has no verdict; `miss` is the proof answering not current.
+ * is evidence for the skip; `divergent` is a pass the skip would have left stale; `facts_divergent` (facts
+ * rows written, content not compared) and `inconclusive` are passes the probe called current that did not
+ * confirm it; `probe_failed` has no verdict; `miss` is the proof answering not current.
  */
 export type SkipCheck =
   /** Called current, and the full pass completed (facts too, when on) having inserted and deleted nothing. */
   | "verified_noop"
   /** Called current, and the pass inserted or deleted index rows: the skip would have left the index stale. */
   | "divergent"
-  /** Called current, index rows untouched, and the pass inserted or deleted output facts. */
+  /** Called current, index rows untouched, and the facts reconcile wrote rows. A write count: whether their content changed is unknown. */
   | "facts_divergent"
   /** Called current, nothing written, but the pass (or its facts) did not complete: the no-op was not verified. */
   | "inconclusive"

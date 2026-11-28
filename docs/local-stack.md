@@ -872,22 +872,26 @@ Every probed pass also carries `skip_check`, exactly one of six outcomes, so eac
 | --- | --- | --- |
 | `verified_noop` | Called current; the full pass completed (its facts too, when on) and inserted and deleted nothing. | A verified no-op: the only evidence for the skip. |
 | `divergent` | Called current; the pass inserted or deleted index rows. Also warns (`skip_probe_divergence`). | A pass the skip would have got wrong. |
-| `facts_divergent` | Called current; index rows untouched, output facts inserted or deleted. Also warns (`skip_probe_facts_divergence`). | The same, for the facts. |
+| `facts_divergent` | Called current; index rows untouched, the facts reconcile inserted or deleted fact rows. Also warns `The facts reconcile wrote rows. Whether their content changed is unknown.` (`skip_probe_facts_written`, with the facts row counts). | The facts reconcile wrote rows. Whether their content changed is unknown. Its own count: not a verified no-op, and not proof the skip would have been wrong. |
 | `inconclusive` | Called current; nothing written, but the pass or its facts did not complete, or the pass was stream-deferred before its read. Also warns `search index skip check inconclusive` (`skip_probe_inconclusive`). | Not verified: neither for nor against. |
 | `probe_failed` | The probe's statement failed (`skip_miss: probe_failed`) or its facts read failed or timed out (`facts_unreadable`). | No comparison was made. |
 | `miss` | The proof says not current; `skip_miss` says why. | An ordinary predicate miss: the skip would not have fired. |
 
 `would_skip: true` is the eligible prediction: `verified_noop`, `divergent`, `facts_divergent` and `inconclusive`
 together. Only `verified_noop` lines count toward what the skip saves. A window qualifies the skip flag only on
-its verified no-ops and with no `divergent` or `facts_divergent` line; an `inconclusive` or `probe_failed` line is
-a comparison that was not made and cannot stand in for one.
+its verified no-ops and with no `divergent` line. A `facts_divergent` line is never a verified no-op either: it
+is reported as its own count and needs a content comparison of the facts before it can be read as harmless or as
+a miss. An `inconclusive` or `probe_failed` line is a comparison that was not made and cannot stand in for one.
 
 Use it before turning the skip on. Over a window with only the shadow flag on:
 
 - the `skip_check: verified_noop` lines, and the sum of their `duration_ms`, are what the skip flag saves (each
   such pass becomes the pointer stage and one Postgres check);
-- any `divergent` or `facts_divergent` line is a pass the skip would have got wrong; with none, the skip changes
-  no index content for the passes that were verified;
+- any `divergent` line is a pass the skip would have got wrong (an index row is written only when its key and
+  fingerprint are missing, or deleted when the source no longer carries it); with none, the skip changes no index
+  content for the passes that were verified;
+- `facts_divergent` lines are counted apart: the facts reconcile wrote rows, and whether their content changed is
+  unknown from a write count;
 - `inconclusive` and `probe_failed` lines are counted and reported apart, never added to the verified ones;
 - `skip_probe_ms` (and the count and sum of `skip_probe_facts_ms`) is what the flag itself cost, and any
   `skip_probe_error` is a probe failure, by code;

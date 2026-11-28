@@ -9,6 +9,7 @@ import type { SqlExecutor } from "@rhc/lib/pipeline/queue.ts";
 import { alreadyCurrent, indexSearchScope, searchIndexPhaseMetrics, skipCheck, skipCurrentProbe, skipProbeFactsError, type SearchIndexDeps, type SearchIndexResult } from "../search-index.ts";
 import { runSearchJob, searchWorkKey, type SearchWakeMessage } from "../search-jobs.ts";
 import { sanitizeLogField } from "../../shared/log.ts";
+import { SKIP_CHECK_DIVERGENT, SKIP_CHECK_FACTS_WRITTEN, SKIP_CHECK_INCONCLUSIVE, warnSkipCheck } from "../consumer.ts";
 import { lambdaEnv, runtimeFromSecret, searchIndexSkipCurrentShadowFromEnv } from "../lambda.ts";
 import { SCOPE, exportStreamScope, generate, type ExportedScope } from "../../session-read-api/__tests__/stream-fixture.ts";
 import { closeReplayTemplate, warmReplayTemplate } from "./replay-fixture.ts";
@@ -545,6 +546,57 @@ describe("skip-current shadow on (hosted ClickHouse binding)", () => {
       .toEqual(["org_id", "reason", "session_id", "stage"]);
     expect(off.inconclusive).toEqual([]);
   }, 120_000);
+
+  test("the warnings on the real logger: index writes keep their warning, facts-only writes say only what is known", () => {
+    const base: SearchIndexResult = { manifests: 1, rows: 5, inserted: 0, deleted: 0, complete: true, reasons: [], skipProbe: { current: true } };
+    const facts = (inserted: number, deleted: number, complete = true) => ({ outputFacts: { inserted, deleted, complete, reasons: [] } });
+    /** The JSON lines warnSkipCheck writes through shared/log.ts for one result. */
+    const warned = (result: SearchIndexResult) => {
+      const lines: string[] = [];
+      const stdout = process.stdout.write;
+      const stderr = process.stderr.write;
+      const capture = (chunk: unknown) => { lines.push(String(chunk)); return true; };
+      process.stdout.write = capture as typeof process.stdout.write;
+      process.stderr.write = capture as typeof process.stderr.write;
+      try {
+        warnSkipCheck(SCOPE, result);
+      } finally {
+        process.stdout.write = stdout;
+        process.stderr.write = stderr;
+      }
+      return lines.flatMap((l) => l.split("\n")).filter(Boolean).map((l) => JSON.parse(l) as Record<string, unknown>);
+    };
+    const text = (line: Record<string, unknown>) => JSON.stringify(line);
+    expect(SKIP_CHECK_FACTS_WRITTEN).toBe("The facts reconcile wrote rows. Whether their content changed is unknown.");
+    expect(SKIP_CHECK_DIVERGENT).toBe("search index skip would have missed changes");
+
+    // Facts-only writes: one warning, the exact sentence, the facts counts, and no claim that anything was missed.
+    const f = warned({ ...base, ...facts(7, 2) });
+    expect(f.length).toBe(1);
+    expect(text(f[0]!)).toContain(SKIP_CHECK_FACTS_WRITTEN);
+    expect(text(f[0]!)).not.toContain("missed changes");
+    expect(f[0]).toMatchObject({ stage: "search-index", reason: "skip_probe_facts_written", skip_check: "facts_divergent", inserted: 7, deleted: 2, org_id: SCOPE.orgId, session_id: SCOPE.sessionId });
+
+    // Index-row writes: the index warning, preserved, with the index counts; facts written too does not change it.
+    for (const result of [{ ...base, inserted: 3 }, { ...base, inserted: 3, ...facts(7, 2) }]) {
+      const d = warned(result);
+      expect(d.length).toBe(1);
+      expect(text(d[0]!)).toContain(SKIP_CHECK_DIVERGENT);
+      expect(text(d[0]!)).not.toContain(SKIP_CHECK_FACTS_WRITTEN);
+      expect(d[0]).toMatchObject({ reason: "skip_probe_divergence", skip_check: "divergent", inserted: 3, deleted: 0 });
+    }
+
+    // Inconclusive, and the outcomes with no warning at all. Facts written is never a verified no-op.
+    const i = warned({ ...base, ...facts(0, 0, false) });
+    expect(i.length).toBe(1);
+    expect(text(i[0]!)).toContain(SKIP_CHECK_INCONCLUSIVE);
+    expect(warned({ ...base, ...facts(0, 0) })).toEqual([]);
+    expect(warned(base)).toEqual([]);
+    expect(warned({ ...base, skipProbe: { current: false, miss: "not_ready" } })).toEqual([]);
+    expect(warned({ ...base, inserted: 3, skipProbe: { current: false, miss: "probe_failed" } })).toEqual([]);
+    expect(warned({ ...base, skipProbe: undefined })).toEqual([]);
+    expect(skipCheck({ ...base, ...facts(1, 0) })).not.toBe("verified_noop");
+  });
 
   test("skipCheck: every result maps to exactly one outcome, and only a completed zero-write pass is verified", () => {
     const base: SearchIndexResult = { manifests: 1, rows: 5, inserted: 0, deleted: 0, complete: true, reasons: [] };
