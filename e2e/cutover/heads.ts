@@ -61,7 +61,15 @@ export interface CutoverHeads {
   sessionEraseReplay: Adapter<[CutoverContext, string, Extract<ReplayItem, { kind: "session_erase" }>], ReplayReceipt>;
   /** A user's own selection deletion: mirrored to the S3 fence at write time (controlMirror on); verified, not replayed. */
   selectionReplay: Adapter<[CutoverContext, string, Extract<ReplayItem, { kind: "selection_deletion" }>], ReplayReceipt>;
-  bridgeRelease: Adapter<[CutoverContext, string, { erasures: number; receipts: ReplayReceipt[]; evidenceSha256: string }], void>;
+  bridgeRelease: Adapter<[CutoverContext, string, { erasures: number; receipts: ReplayReceipt[]; evidenceSha256: string; detail: "erasure_window_empty" | null }], void>;
+  /**
+   * The S3-side hold (layered: the direct S3 writer stays fenced through COMMITTED bridge_complete, in-flight requests
+   * included): the exact refusal codes the S3 admission path answers for a held org. An S3 refusal with any other code
+   * is not a hold refusal. Pending today: no head defines one, so the set is empty and every S3 probe fails.
+   */
+  s3HoldRefusal: Adapter<[], ReadonlySet<string>>;
+  /** A real publication of drained sessions (claim, publish, search rows) after release. Pending: only the gate exists. */
+  publication: Adapter<[CutoverContext, { sessions: string[] }], { published: number }>;
 }
 
 const sha = (s: string | Uint8Array) => createHash("sha256").update(s).digest("hex");
@@ -70,6 +78,8 @@ const hashOf = (...parts: string[]) => "h_" + sha(["cutover-qualification/v1", .
 const WAVE = "sessions-wave-tooling";
 const GEN = "sessions-erase-generation-proof";
 const MANIFEST = "hard-delete-owner (062360 session erase manifest)";
+const S3HOLD = "release-path head: S3 admission fenced through bridge_complete (owner to be named by Pipeline)";
+const PUBLICATION = "search publication (publication job / buffered search feed)";
 
 /** The default adapters: stand-ins where main has the primitives, refusals where only the head can prove it. */
 export function defaultHeads(opts: { simulatePending?: boolean } = {}): CutoverHeads {
@@ -140,11 +150,21 @@ export function defaultHeads(opts: { simulatePending?: boolean } = {}): CutoverH
         return { kind: it.kind, outcome: "mirrored", hash: hashOf("selection", epoch, it.originId, it.source, it.sessionId) };
       },
     },
+    s3HoldRefusal: {
+      head: S3HOLD, integration: "pending",
+      todo: "the S3 admission path must refuse a held org (held, sealed, marker_attempted) through committed bridge_complete, with a fixed code and no durable write; name the code here",
+      run: async () => new Set<string>(),
+    },
+    publication: {
+      head: PUBLICATION, integration: "pending",
+      todo: "drive the real publication (ingest_publication_claim/publish or the buffered search feed) for drained sessions and read their search rows",
+      run: async () => { throw new HeadPending("publication_not_exercised", PUBLICATION); },
+    },
     bridgeRelease: {
       head: WAVE, integration: "standin",
       todo: "replace with bridge-execute (re-read the set, every item receipted for this epoch, _release bridge_complete with the settled count)",
       run: async (c, epoch, r) => {
-        await c.sql.query("SELECT sessions.ingest_org_admission_hold_release($1, $2::uuid, 'bridge_complete', $3, NULL, $4::bigint)", [c.org, epoch, r.evidenceSha256, r.erasures]);
+        await c.sql.query("SELECT sessions.ingest_org_admission_hold_release($1, $2::uuid, 'bridge_complete', $3, $5, $4::bigint)", [c.org, epoch, r.evidenceSha256, r.erasures, r.detail]);
       },
     },
   };

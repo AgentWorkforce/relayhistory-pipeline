@@ -1,6 +1,9 @@
 /**
  * bun run e2e/cutover/run.ts [--size ci|representative] [--users N --sessions N --batches N --records N --payload N]
- *                            [--simulate-pending] [--out DIR]
+ *                            [--erasures injected|empty] [--simulate-pending] [--out DIR]
+ *
+ * PostgreSQL + MinIO: src/session-ingest/__tests__/synthetic-cutover.postgres.test.ts under the hold-harness runner
+ * (bun src/session-ingest/__tests__/hold-harness/run.ts --pg 17 -- <that file>); CUTOVER_SIZE and CUTOVER_REPORT_DIR.
  *
  * The synthetic per-org cutover qualification (harness.ts). Local only: PGlite with every migration on this checkout
  * and a filesystem object store under $TMPDIR; no network, no credentials, synthetic ids. Writes report.json and
@@ -23,7 +26,9 @@ const size: FixtureSize = { users: int("--users", base.users), sessionsPerUser: 
   recordsPerBatch: int("--records", base.recordsPerBatch), payloadBytes: int("--payload", base.payloadBytes) };
 if ((process.env.TMPDIR ?? "/tmp").startsWith("/tmp")) throw new Error("set TMPDIR to a disk path (the fixture's object store lives there)");
 
-const report = await runCutoverQualification({ size, simulatePending: flag("--simulate-pending"), log: (l) => console.error(l) });
+const erasures = (val("--erasures") ?? "injected") as "injected" | "empty";
+if (erasures !== "injected" && erasures !== "empty") throw new Error("--erasures is injected or empty");
+const report = await runCutoverQualification({ size, erasures, simulatePending: flag("--simulate-pending"), log: (l) => console.error(l) });
 const out = val("--out") ?? join(process.env.RELAYFLOW_STATE_DIR ?? ".relayflow", "synthetic-cutover");
 mkdirSync(out, { recursive: true });
 writeFileSync(join(out, "report.json"), JSON.stringify(report, null, 2) + "\n");

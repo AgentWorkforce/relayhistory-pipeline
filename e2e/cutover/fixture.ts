@@ -20,7 +20,8 @@ import { sqlLedger } from "../../src/session-ingest/ledger-sql.ts";
 import { s3Ledger } from "../../src/session-ingest/ledger-s3.ts";
 import { deliveryAccount, prepareDelivery } from "../../src/session-ingest/vendor/delivery/prepare.ts";
 import { batch, record } from "../../src/session-ingest/__tests__/support.ts";
-import { authorityFixture, epoch, generation, identity } from "../../src/session-ingest/__tests__/privacy-authority-support.ts";
+import { epoch, generation, identity } from "../../src/session-ingest/__tests__/privacy-authority-support.ts";
+import { pgliteBackend, type Backend } from "./backend.ts";
 import type { LedgerTenant } from "../../src/session-ingest/ledger.ts";
 
 export const KEY_ROOT = "96bulls";
@@ -51,30 +52,28 @@ export const sessionOf = (i: number, s: number) => `sess-${String(i).padStart(3,
 /** Session s of user i is uploaded from origin s % 2. */
 export const originOfSession = (i: number, s: number) => originsOf(i)[s % 2]!;
 
-const text = (n: number, seed: string) => {
+/** The synthetic payload text of a record: deterministic, so a read can compare it exactly. */
+export const text = (n: number, seed: string) => {
   const base = createHash("sha256").update(seed).digest("hex");
   return base.repeat(Math.ceil(n / base.length)).slice(0, n);
 };
 
 export type Fx = Awaited<ReturnType<typeof openFixture>>;
 
-export async function openFixture() {
-  const f = await authorityFixture();
-  await f.seal();
-  // The lifecycle functions require their slots' ledger rows (the fixture applies migrations without the migrator).
-  await f.db.exec("CREATE TABLE IF NOT EXISTS sessions.__96bulls_migrations(name text PRIMARY KEY, sha256 text)");
-  for (const n of ["upstream:20261105062320_ingest_org_admission_fences.sql", "upstream:20261105062340_ingest_org_erasure_history.sql"])
-    await f.db.query("INSERT INTO sessions.__96bulls_migrations(name) VALUES($1) ON CONFLICT DO NOTHING", [n]);
+export async function openFixture(backend?: Backend) {
+  const b = backend ?? (await pgliteBackend());
+  const db = b.owner;
   // The v2 claim-sessions reader gate on (the export refuses otherwise), as admission runs in production.
-  await f.db.exec("SET session_replication_role = replica; UPDATE sessions.ingest_claim_sessions_policy SET write_enabled = true, backfill_complete_at = now(), read_enabled = true; SET session_replication_role = origin");
-  const store = f.deps.target.store;
+  await b.replica((a) => a.query("UPDATE sessions.ingest_claim_sessions_policy SET write_enabled = true, backfill_complete_at = now(), read_enabled = true"));
+  const store = b.store;
   /** The SQLSTATEs the ledger's database calls raised (deliverBatch maps them to a 503; the hold suite reads them so). */
   const sqlStates: string[] = [];
   const run = async (q: string, p: unknown) => {
-    try { return await f.run(q, p as unknown[]); } catch (e) { sqlStates.push(String((e as { code?: unknown }).code)); throw e; }
+    try { return await b.ingest(q, p as unknown[]); } catch (e) { sqlStates.push(String((e as { code?: unknown }).code)); throw e; }
   };
   const sqlLed = sqlLedger(run as never, { acceptanceMode: "buffered", expectedGeneration: generation });
   const s3Led = s3Ledger(store, KEY_ROOT, { acceptanceMode: "canonical", fenceAuthority: "required" });
+  const sqlDeps = { acceptanceMode: "buffered" as const, target: { store, keyRoot: KEY_ROOT } };
 
   async function witness(tenant: LedgerTenant, raw: any) {
     const p = await prepareDelivery(tenant, raw);
@@ -84,7 +83,7 @@ export async function openFixture() {
       records: p.records.map((r, i) => ({ preparedOrd: i, processingRank: i, candidateDigest: r.digest, recordId: r.record_id, revision: String(r.revision),
         revisionId: r.revision_id, candidateFenced: false, currentFenced: false, current: null })),
       privacy: { complete: true, deletions: [], resets: [] } };
-    const d = (await f.db.query<{ d: string }>("SELECT encode(sha256(convert_to($1::jsonb::text,'UTF8')),'hex') AS d", [JSON.stringify(w)])).rows[0]!.d;
+    const d = (await db.query<{ d: string }>("SELECT encode(sha256(convert_to($1::jsonb::text,'UTF8')),'hex') AS d", [JSON.stringify(w)])).rows[0]!.d;
     return { witness: w, sourceDigest: d };
   }
 
@@ -98,31 +97,30 @@ export async function openFixture() {
   /** Through the buffered SQL ledger (what the Worker HTTP path / SQL consumer admits before the cutover). */
   async function deliverSql(u: number, raw: any): Promise<DeliverResult> {
     const t = tenantOf(u);
-    return deliverBatch({ ...f.deps, ledger: sqlLed, custody: await witness(t, raw) } as never, t, raw);
+    return deliverBatch({ ...sqlDeps, ledger: sqlLed, custody: await witness(t, raw) } as never, t, raw);
   }
   /** Through the S3 ledger with the per-org fence authority required (the 0005 consumer after the marker). */
   async function deliverS3(u: number, raw: any): Promise<DeliverResult> {
     return deliverBatch({ ledger: s3Led, acceptanceMode: "canonical", target: { store, keyRoot: KEY_ROOT } } as never, tenantOf(u), raw);
   }
 
-  const one = async <T = Record<string, any>>(q: string, p: unknown[] = []) => (await f.db.query<T>(q, p as never)).rows[0]!;
+  const one = async <T = Record<string, any>>(q: string, p: unknown[] = []) => (await db.query<T>(q, p)).rows[0]!;
 
   /** The owner's parity proof and the active privacy authority (see the header); after the backlog. */
   async function proveOwnerParity(users: number) {
-    await f.db.exec("SET session_replication_role = replica");
-    try {
-      await f.db.query("INSERT INTO sessions.ingest_privacy_authority (singleton, state, control_epoch, neon_fingerprint_sha256, activated_at) VALUES (true, 'active', $1, $2, now()) ON CONFLICT (singleton) DO NOTHING", [epoch, "6".repeat(64)]);
+    await b.replica(async (a) => {
+      await a.query("INSERT INTO sessions.ingest_privacy_authority (singleton, state, control_epoch, neon_fingerprint_sha256, activated_at) VALUES (true, 'active', $1, $2, now()) ON CONFLICT (singleton) DO NOTHING", [epoch, "6".repeat(64)]);
       for (let u = 0; u < users; u++) {
         const t = tenantOf(u);
-        await f.db.query("DELETE FROM sessions.owner_buffered_parity WHERE org_id = $1 AND workspace_id = $2 AND user_id = $3", [t.orgId, t.workspaceId, t.userId]);
-        await f.db.query(`INSERT INTO sessions.owner_buffered_parity (org_id, workspace_id, user_id, cutover_epoch, head_epoch, head_version, head_digest, head_kind, no_head,
+        await a.query("DELETE FROM sessions.owner_buffered_parity WHERE org_id = $1 AND workspace_id = $2 AND user_id = $3", [t.orgId, t.workspaceId, t.userId]);
+        await a.query(`INSERT INTO sessions.owner_buffered_parity (org_id, workspace_id, user_id, cutover_epoch, head_epoch, head_version, head_digest, head_kind, no_head,
             privacy_baseline_sha256, deletion_set_digest, reset_set_digest, target_lineage_digest, target_generation)
           SELECT $1, $2, $3, $4, h.epoch, h.version, h.digest, h.kind, h.org_id IS NULL, $5, e.deletion_set_digest, e.reset_set_digest, e.target_lineage_digest, e.target_generation
             FROM (SELECT 1) AS one
             LEFT JOIN sessions.ingest_source_control_heads AS h ON h.org_id = $1 AND h.workspace_id = $2 AND h.user_id = $3
            CROSS JOIN LATERAL sessions.owner_buffered_parity_expected($1, $2, $3, $4, h.version, h.digest, h.kind) AS e`, [t.orgId, t.workspaceId, t.userId, epoch, generation]);
       }
-    } finally { await f.db.exec("SET session_replication_role = origin"); }
+    });
   }
 
   /** The operator user erase, SQL side, through its real entry points (begin, step to done, complete). */
@@ -141,12 +139,12 @@ export async function openFixture() {
   async function selectionDeletion(u: number, s: number) {
     const t = tenantOf(u);
     await s3Ledger(store, KEY_ROOT, { acceptanceMode: "canonical" }).setSessionUploads({ tenant: t, originId: originOfSession(u, s), enabled: false, sessions: [[SOURCE, sessionOf(u, s)]] });
-    await f.db.query("INSERT INTO sessions.upload_deletions(org_id,workspace_id,user_id,origin_id,source,session_id) VALUES($1,$2,$3,$4,$5,$6)",
+    await db.query("INSERT INTO sessions.upload_deletions(org_id,workspace_id,user_id,origin_id,source,session_id) VALUES($1,$2,$3,$4,$5,$6)",
       [t.orgId, t.workspaceId, t.userId, originOfSession(u, s), SOURCE, sessionOf(u, s)]);
   }
   /** A session erasure fence at the table (see the header). */
   async function sessionErasureFence(u: number, s: number) {
-    await f.db.query("INSERT INTO sessions.session_erasure_fences(org_id,workspace_id,source,session_id) VALUES($1,$2,$3,$4)", [ORG, WORKSPACE, SOURCE, sessionOf(u, s)]);
+    await db.query("INSERT INTO sessions.session_erasure_fences(org_id,workspace_id,source,session_id) VALUES($1,$2,$3,$4)", [ORG, WORKSPACE, SOURCE, sessionOf(u, s)]);
   }
 
   /** "accepted" plus the result, or the refusal's code (the SQLSTATE behind a ledger refusal when there is one). */
@@ -159,6 +157,6 @@ export async function openFixture() {
     }
   }
 
-  return { f, db: f.db, attempt, store, one, rawBatch, deliverSql, deliverS3, proveOwnerParity, operatorUserErase, selectionDeletion, sessionErasureFence, close: f.close };
+  return { kind: b.kind, db, attempt, store, one, rawBatch, deliverSql, deliverS3, proveOwnerParity, operatorUserErase, selectionDeletion, sessionErasureFence, close: b.close };
 }
 
