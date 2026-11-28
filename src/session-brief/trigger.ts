@@ -17,12 +17,22 @@
  *     brief covers is a no-op. So duplicates, A/B/A, any reordering and redelivery after a lease or a retry converge
  *     on one row state (LEAST and the coverage check commute). trigger_id is for tracing, never for dedupe.
  *
+ * Status of each rule: [owner] = proposed by the T130 contract owner (sessions-latency-owner), [builder] = proposed
+ * by this slice; NONE is a Pipeline decision yet (Pipeline owns the contract decisions and the hook point).
+ *
  * Due and claim eligibility (N = SESSION_BRIEF_MAX_DELAY_SECONDS 8, I = IDLE 600, W = MAX_WAIT 3600, T = THROTTLE):
- *   first brief (no ready brief): due = pending_since + N; an `end` makes it due now if earlier; never throttled.
- *   refresh, evidence or `append`: due = LEAST(evidence_at + I, pending_since + W).
- *   refresh, `end`: due = now (the idle wait is skipped). [proposal]
- *   claim (refresh): now >= due AND now >= last_attempt + T: the throttle takes precedence over W. [proposal]
- *   A refresh reaching its caller more than 60 s after it was due is a miss (refreshMiss), never a pass.
+ *   first brief (no ready brief): due = pending_since + N; an `end` makes it due now if earlier; never throttled. [owner]
+ *   refresh, evidence or `append`: due = LEAST(evidence_at + I, pending_since + W). [existing armWakeup]
+ *   refresh, `end`: due = now (the idle wait is skipped). [owner]
+ *   claim (refresh): now >= due AND now >= last_attempt + T: the throttle takes precedence over W. [owner]
+ *   a row in retry backoff or park is never lowered by a hint. [builder]
+ *   coverage suppression (hint.revision <= the stored brief's brief_revision for the same harness row) only ever
+ *     skips an EARLY wake: the armed row keeps its own due time, so uncovered work stays eligible even when the
+ *     check is wrong. brief_revision is the highest revision over the harness's machines, not a per-incarnation
+ *     record, so an equal revision from another machine (different content) can be suppressed early; exact
+ *     per-incarnation coverage needs the hint to carry the source incarnation (a contract change for Pipeline).
+ *   SCORING [Pipeline review]: a brief is a miss when the first authorized parsed brief proving consumption comes more
+ *     than 60 s after the cohort's first upload HTTP attempt (briefMiss). Due-to-claim is diagnostic only.
  *
  * Delivery: hosted, a standard queue (SESSION_BRIEF_QUEUE_URL, DLQ, event source mapping); a consumer handed a hint
  * before its claim time hands it off durably (re-enqueue delayed, at most 900 s a hop) and acknowledges only after a
@@ -197,9 +207,10 @@ export const claimPlan = (s: BriefWakeState): BriefWakeState => ({ ...s, leased:
 /**
  * The run finished, or failed, for the generation it claimed (store.ts finishWakeup). Same generation: done (null).
  * Newer evidence armed meanwhile: the lease is released and the trailing work stays, with its window restarted at
- * the finish (pending_since = now; due = LEAST(evidence_at + I, now + W)), exactly as finishWakeup does today. The
- * trailing evidence's own oldest commit time is not persisted (no column), so its window can start late by at most
- * the run's length (bounded by the lease). Exact preservation needs a column, i.e. a migration and a registry slot.
+ * the finish (pending_since = now; due = LEAST(evidence_at + I, now + W)), exactly as finishWakeup does today. KNOWN
+ * GAP (Pipeline review): the trailing evidence's own oldest uncovered time is not persisted, so its window starts late
+ * by up to the run's length and does not survive a retry. Exact preservation needs a column (trailing_since): a
+ * migration in a separate Pipeline registry slot, requested, not added here.
  */
 export function finishPlan(state: BriefWakeState, claimedGeneration: number, nowMs: number, t: BriefTriggerTiming): BriefWakeState | null {
   if (state.generation === claimedGeneration) return null;
@@ -217,9 +228,13 @@ export function handoffPlan(claimableAt: number, nowMs: number): BriefHandoff {
   return { action: "defer", delaySeconds: Math.min(SQS_MAX_DELAY_SECONDS, Math.ceil(wait / 1_000)) };
 }
 
-/** A refresh is a miss when it reaches its caller more than 60 s after it became claimable. */
-export const REFRESH_MISS_MS = 60_000;
-export const refreshMiss = (claimableMs: number, servedMs: number) => servedMs - claimableMs > REFRESH_MISS_MS;
+/**
+ * The score (Pipeline review): a miss when the first authorized, parsed brief proving consumption of a cohort is
+ * served more than 60 s after that cohort's first upload HTTP attempt. Never measured from due or claim time (those
+ * are diagnostics): a claim held 120 s by the throttle after an upload at 0 is already a miss when served at once.
+ */
+export const BRIEF_MISS_MS = 60_000;
+export const briefMiss = (firstUploadAttemptMs: number, firstServedMs: number) => firstServedMs - firstUploadAttemptMs > BRIEF_MISS_MS;
 
 // ---- settings ----
 

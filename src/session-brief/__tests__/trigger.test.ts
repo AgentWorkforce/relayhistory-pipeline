@@ -10,7 +10,7 @@
 import { describe, expect, test } from "bun:test";
 import {
   BRIEF_TRIGGER_CONTRACT, briefTriggerConfig, briefTriggerId, briefWakeHint, claimAt, claimPlan, finishPlan, handoffPlan,
-  hintCovers, parseBriefWakeHint, planArm, planHint, refreshMiss, SQS_MAX_DELAY_SECONDS, type BriefPhysicalIncarnation,
+  briefMiss, hintCovers, parseBriefWakeHint, planArm, planHint, SQS_MAX_DELAY_SECONDS, type BriefPhysicalIncarnation,
   type BriefWakeHint, type BriefWakeKind, type BriefWakeState,
 } from "../trigger.ts";
 
@@ -194,15 +194,16 @@ describe("session-brief trigger: due and claim eligibility", () => {
     expect(claimAt(armed, { hasBrief: false, lastAttemptMs: T0 - 1_000, throttleSeconds: THROTTLE_S })).toBe(T0 + 8_000);
   });
 
-  test("refresh where the throttle ends after max-wait: the throttle wins; the claim is scored, a >60 s serve is a miss", () => {
+  test("refresh where the throttle ends after max-wait: the throttle wins; scored from the upload, it is a miss", () => {
     // Pending since T0-3550 s, so max-wait is due at T0+50 s; the last attempt at T0, so the throttle ends at T0+120 s.
     const state: BriefWakeState = { pendingSince: T0 - 3_550_000, evidenceAt: T0, dueAt: T0 + 50_000, generation: 3, leased: false };
     const at = claimAt(state, { hasBrief: true, lastAttemptMs: T0, throttleSeconds: THROTTLE_S });
     expect(at).toBe(T0 + 120_000);
-    expect(refreshMiss(at, at + 60_000)).toBe(false);
-    expect(refreshMiss(at, at + 60_001)).toBe(true);
-    // Against the raw max-wait due time, the throttle gap alone (70 s) is already a miss.
-    expect(refreshMiss(state.dueAt, at)).toBe(true);
+    // The score runs from the cohort's first upload HTTP attempt, never from due or claim: an upload at T0 claimed at
+    // +120 s is a miss even if served the instant it is claimed.
+    expect(briefMiss(T0, at)).toBe(true);
+    expect(briefMiss(T0, T0 + 60_000)).toBe(false);
+    expect(briefMiss(T0, T0 + 60_001)).toBe(true);
   });
 });
 
@@ -278,6 +279,44 @@ describe("session-brief trigger: offline fixtures", () => {
     expect(sim.rows.size).toBe(1);
   });
 
+  test.todo("KNOWN GAP: B committed during A's lease keeps B's original uncovered time through finish and retry (needs trailing_since: a migration in a separate Pipeline registry slot)", () => {});
+
+  test("an equal revision with different content (another machine, same harness): suppression never removes eligibility", () => {
+    const sim = new Sim();
+    // The brief covers revision 5 (from machine M1). Machine M2 commits ITS revision 5 (different content).
+    sim.briefs.set("claude", { revision: 5, ready: true, lastAttempt: T0 - 600_000 });
+    sim.committed.set("claude", 5);
+    const m2 = sim.commit("claude", 5, { lose: true });
+    const armed = { ...sim.rows.get("claude")!.state };
+    sim.now += 10_000;
+    sim.consume({ ...m2, kind: "end", digest: "b".repeat(64) }); // collides with the covered revision
+    expect(sim.rows.get("claude")!.state.dueAt).toBe(armed.dueAt); // the early wake is skipped (the known limitation)...
+    sim.advance(15 * 60_000);
+    expect(sim.runs).toHaveLength(1); // ...but the uncovered work stays eligible and is claimed at its own due time
+    expect(sim.runs[0]!.claimableAt).toBe(armed.dueAt);
+  });
+
+  test("two harnesses, same session id and equal revision: v1 keeps each harness's own coverage, throttle and retry floor", () => {
+    const sim = new Sim();
+    sim.briefs.set("claude", { revision: 5, ready: true, lastAttempt: T0 - 10_000 }); // covered 5, throttled until T0+110 s
+    sim.briefs.set("codex", { revision: 4, ready: true, lastAttempt: T0 - 600_000 }); // not covered
+    sim.committed.set("claude", 5);
+    sim.commit("claude", 6, { lose: true });
+    sim.commit("codex", 5, { lose: true });
+    const claudeRow = sim.rows.get("claude")!;
+    claudeRow.state = { ...claudeRow.state, backoff: true }; // claude is in a retry backoff
+    const claudeBefore = { ...claudeRow.state };
+    sim.now += 5_000;
+    sim.consume(v1(hint("end", 5, T0, "codex"))); // a legacy v1 hint at revision 5: wakes both harnesses' rows
+    // claude: revision 5 is covered, and it is in backoff: unchanged, not claimed.
+    expect(sim.rows.get("claude")!.state).toEqual(claudeBefore);
+    // codex: its own revision 5 is uncovered, no throttle pending: claimed now.
+    expect(sim.runs.map((r) => r.harness)).toEqual(["codex"]);
+    // A v1 hint naming claude's new revision 6 still respects claude's backoff (its retry floor).
+    sim.consume(v1(hint("end", 6, T0, "claude")));
+    expect(sim.runs.map((r) => r.harness)).toEqual(["codex"]);
+  });
+
   test("a retry after a failed run: the row stays, a replayed hint neither delays nor duplicates it", () => {
     const sim = new Sim({ poll: true });
     const A = sim.commit("claude", 1, { lose: true });
@@ -302,7 +341,9 @@ describe("session-brief trigger: offline fixtures", () => {
     expect(hosted.runs).toHaveLength(1);
     const r = hosted.runs[0]!;
     expect(r.claimedAt - r.claimableAt).toBeLessThanOrEqual(300_000);
-    expect(refreshMiss(r.claimableAt, r.claimedAt)).toBe(r.claimedAt - r.claimableAt > 60_000); // recorded, not hidden
+    // Scored from the upload (committed at T0 here, a lower bound for its first HTTP attempt): a lost hint
+    // recovered by the 300 s sweep after a 600 s refresh window is a miss, recorded, not hidden.
+    expect(briefMiss(T0, r.claimedAt)).toBe(true);
     const selfHost = new Sim({ poll: true });
     selfHost.briefs.set("claude", { revision: 0, ready: true, lastAttempt: T0 - 600_000 });
     selfHost.commit("claude", 1, { lose: true });
