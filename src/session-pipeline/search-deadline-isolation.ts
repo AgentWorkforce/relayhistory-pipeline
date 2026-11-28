@@ -46,6 +46,8 @@ export const DEADLINE_MARK_PREFIX = "deadline_over_bound/";
 export const DEADLINE_OVER_BOUND = "stream_deadline_over_bound";
 export const DEADLINE_ROUTE = "large-read";
 const MARK_TIMEOUT_MS = 5_000;
+/** A marked scope's job may sit unclaimed this long, with no worker progress anywhere, before the inline pass is used again. */
+export const LARGE_READ_UNCLAIMED_MS = 5 * 60 * 1000;
 
 export interface DeadlineIsolationDeps {
   ch: ClickHouseClient;
@@ -57,6 +59,14 @@ export interface DeadlineIsolationDeps {
    * SKIP_STATE_MAX_AGE_MS. Absent: not read.
    */
   jobState?: (scope: SessionScope) => Promise<{ state: string; attempts: number } | null>;
+  /**
+   * The routed job's queue state and whether any large-read worker made progress on any job within `withinMs`
+   * (largeReadProgress). With it, a marked delivery whose mark is older than LARGE_READ_UNCLAIMED_MS, whose job is
+   * still `queued`, and with no worker progress anywhere in that window falls back to the inline pass (warn
+   * "large-read job unclaimed"): a missing or stalled worker degrades to today's behaviour, not to an unsearchable
+   * scope for the mark's lifetime. Absent: no check, always routed.
+   */
+  progress?: (scope: SessionScope, withinMs: number) => Promise<{ state: string; workerSeen: boolean } | null>;
   /** Clock for the mark's age (default Date.now). */
   now?: () => number;
 }
@@ -70,8 +80,8 @@ export function hitStreamDeadline(result: SearchIndexResult): boolean {
   return result.partial === true && !result.busy && !result.deferred && !result.skipped && result.reasons.includes(STREAM_DEADLINE);
 }
 
-/** Whether the scope carries a live mark. One bounded read; any failure or malformed row is `false` (the normal pass). */
-export async function deadlineMarked(deps: DeadlineIsolationDeps, scope: SessionScope): Promise<boolean> {
+/** The scope's live mark (its write time), or null. One bounded read; any failure or malformed row is null (the normal pass). */
+export async function deadlineMarked(deps: DeadlineIsolationDeps, scope: SessionScope): Promise<{ atMs: number } | null> {
   let rows: { value: unknown; at_ms: unknown }[];
   try {
     rows = await deps.ch.select<{ value: unknown; at_ms: unknown }>(
@@ -84,17 +94,18 @@ export async function deadlineMarked(deps: DeadlineIsolationDeps, scope: Session
     );
   } catch (error) {
     log.warn("search index deadline mark unavailable", { stage: "search-index", org_id: scope.orgId, session_id: scope.sessionId, reason: "deadline_mark_read_failed", ...errorFields(error) });
-    return false;
+    return null;
   }
   const row = rows[0];
-  if (row === undefined || typeof row.value !== "string" || row.value === "") return false;
-  const age = Math.abs((deps.now ?? Date.now)() - Number(row.at_ms));
-  if (!Number.isFinite(age) || !(age < SKIP_STATE_MAX_AGE_MS)) return false;
+  if (row === undefined || typeof row.value !== "string" || row.value === "") return null;
+  const atMs = Number(row.at_ms);
+  const age = Math.abs((deps.now ?? Date.now)() - atMs);
+  if (!Number.isFinite(age) || !(age < SKIP_STATE_MAX_AGE_MS)) return null;
   try {
     const v = JSON.parse(row.value) as Record<string, unknown> | null;
-    return typeof v === "object" && v !== null && v.v === 1 && v.reason === STREAM_DEADLINE;
+    return typeof v === "object" && v !== null && v.v === 1 && v.reason === STREAM_DEADLINE ? { atMs } : null;
   } catch {
-    return false;
+    return null;
   }
 }
 
@@ -126,4 +137,21 @@ export async function enqueueLargeRead(db: SqlExecutor, s: SessionScope): Promis
   if (!r.enqueued || typeof i?.sessionId !== "string" || !i.sessionId || i.orgId !== s.orgId || i.workspaceId !== s.workspaceId || i.source !== s.harness)
     return { enqueued: r.enqueued };
   return { enqueued: true, identity: { ...s, sessionId: i.sessionId } };
+}
+
+/**
+ * The job row's state for `s` (its canonical identity) and, in the same statement, whether a worker made progress on
+ * any job within `withinMs`: a job updated in that window that is not a fresh enqueue (claimed, finished, retried or
+ * failed). Enqueue alone (state queued, attempts 0, no error) never counts as progress.
+ */
+export async function largeReadProgress(db: SqlExecutor, s: SessionScope, withinMs: number): Promise<{ state: string; workerSeen: boolean } | null> {
+  const row = (await db.query<{ state: string; worker_seen: boolean }>(
+    `SELECT j.state, EXISTS(SELECT 1 FROM sessions.session_large_read_jobs w
+                             WHERE w.updated_at > clock_timestamp() - make_interval(secs => $5::double precision / 1000)
+                               AND (w.state <> 'queued' OR w.attempts > 0 OR w.last_error IS NOT NULL)) AS worker_seen
+       FROM sessions.session_large_read_jobs j
+      WHERE j.org_id=$1 AND j.workspace_id=$2 AND j.harness=$3 AND j.session_id=$4`,
+    [s.orgId, s.workspaceId, s.harness, s.sessionId, withinMs],
+  )).rows[0];
+  return row ? { state: String(row.state), workerSeen: row.worker_seen === true } : null;
 }

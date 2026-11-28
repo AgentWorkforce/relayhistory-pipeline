@@ -1,7 +1,7 @@
 // SEARCH_INDEX_DEADLINE_ISOLATION_ENABLED (search-deadline-isolation.ts) in the event consumer: real pointer stage
 // and real sessions.enqueue_session_large_read (PGlite), an in-memory search_ingest_state, and the search pass
 // replaced by one that always ends like the prod loop (partial, scope_too_large + stream_deadline). Synthetic data only.
-import { afterAll, afterEach, expect, mock, test } from "bun:test";
+import { afterAll, afterEach, describe, expect, mock, test } from "bun:test";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -22,7 +22,7 @@ let nextResult: () => SearchIndexResult = () => ({
 });
 mock.module("../search-index.ts", () => ({ ...realSearch, indexSearchScope: async () => { passes++; return nextResult(); } }));
 const { processBatch } = await import("../consumer.ts");
-const { DEADLINE_MARK_PREFIX, DEADLINE_OVER_BOUND, deadlineMarkName, enqueueLargeRead } = await import("../search-deadline-isolation.ts");
+const { DEADLINE_MARK_PREFIX, DEADLINE_OVER_BOUND, LARGE_READ_UNCLAIMED_MS, deadlineMarkName, enqueueLargeRead, largeReadProgress } = await import("../search-deadline-isolation.ts");
 type ConsumerDeps = import("../consumer.ts").ConsumerDeps;
 
 const cleanup: Array<() => Promise<unknown>> = [];
@@ -284,4 +284,90 @@ test("the job state is read under the canonical identity the enqueue returned (r
   const job = await f.jobs();
   expect(job).toHaveLength(1);
   expect(asked).toEqual([job[0]!.session_id]);
+}, 60_000);
+
+describe("a marked scope whose large-read job is never claimed (no worker, or a stalled one)", () => {
+  const own = { orgId: "org_replay", workspaceId: "ws_replay", harness: "claude", sessionId: "large_replay" };
+  const markAt = (s: ReturnType<typeof stateTable>, ms: number) =>
+    s.rows.push({ name: deadlineMarkName(own), value: JSON.stringify({ v: 1, reason: STREAM_DEADLINE }), updated_at: new Date(ms).toISOString().replace("T", " ").replace("Z", "") });
+  const capture = async (f: Awaited<ReturnType<typeof fixture>>) => {
+    const lines: any[] = [], out = process.stdout.write, err = process.stderr.write;
+    const tap = (w: any, st: NodeJS.WriteStream) => (c: any, ...r: any[]) => { for (const l of String(c).split("\n")) if (l.startsWith("{")) try { const j = JSON.parse(l); if (j.stage === "large-read") lines.push(j); } catch {} return w.call(st, c, ...r); };
+    process.stdout.write = tap(out, process.stdout) as any; process.stderr.write = tap(err, process.stderr) as any;
+    try { const r = await f.deliver(); return { ...r, large: lines }; } finally { process.stdout.write = out; process.stderr.write = err; }
+  };
+  const armed = (f: Awaited<ReturnType<typeof fixture>>, s: ReturnType<typeof stateTable>) => {
+    f.deps.deadlineIsolation = { ch: s.ch, enqueue: (scope) => enqueueLargeRead(f.x.db, scope), progress: (scope, ms) => largeReadProgress(f.x.db, scope, ms) };
+  };
+
+  test("job queued, never claimed, mark past the bound, no worker progress: warn and one inline pass; the scope indexes", async () => {
+    const f = await fixture();
+    const s = stateTable();
+    armed(f, s);
+    markAt(s, Date.now() - LARGE_READ_UNCLAIMED_MS - 60_000);
+    await enqueueLargeRead(f.x.db, own);
+    nextResult = () => ({ manifests: 1, rows: 3, inserted: 3, deleted: 0, complete: true, reasons: [] });
+    const r = await capture(f);
+    expect(r.failures).toEqual([]);
+    expect(passes).toBe(1);
+    expect(routed(r.lines)).toEqual([]);
+    expect(r.large).toEqual([expect.objectContaining({ level: "warn", message: "large-read job unclaimed", reason: "large_job_unclaimed", state: "queued", route: "inline", age_ms: expect.any(Number) })]);
+    expect(r.large[0]!.age_ms).toBeGreaterThan(LARGE_READ_UNCLAIMED_MS);
+    expect(r.lines.some((l) => l.message === "search index reconciled" && l.ok === true)).toBe(true);
+    // Each later delivery degrades the same way while nothing claims the job: today's behaviour, never stuck.
+    await capture(f);
+    expect(passes).toBe(2);
+  }, 60_000);
+
+  test("mark within the bound: routed, no inline pass (a healthy worker gets time to claim)", async () => {
+    const f = await fixture();
+    const s = stateTable();
+    armed(f, s);
+    markAt(s, Date.now() - 60_000);
+    const r = await capture(f);
+    expect(passes).toBe(0);
+    expect(routed(r.lines)).toHaveLength(1);
+    expect(r.large).toEqual([]);
+  }, 60_000);
+
+  test("mark past the bound but a worker progressed on another job in the window: routed, no inline pass", async () => {
+    const f = await fixture();
+    const s = stateTable();
+    armed(f, s);
+    markAt(s, Date.now() - LARGE_READ_UNCLAIMED_MS - 60_000);
+    await f.x.db.query(
+      `INSERT INTO sessions.session_large_read_jobs(org_id,workspace_id,harness,session_id,source_epoch,source_fingerprint,state,updated_at)
+       VALUES('org_other','ws_other','claude','other',1,$1,'complete',now())`, ["a".repeat(64)]);
+    const r = await capture(f);
+    expect(passes).toBe(0);
+    expect(routed(r.lines)).toHaveLength(1);
+    expect(r.large.some((l) => l.message === "large-read job unclaimed")).toBe(false);
+  }, 60_000);
+
+  test("a fresh enqueue is not worker progress; a claimed (running) own job is not unclaimed", async () => {
+    const f = await fixture();
+    await enqueueLargeRead(f.x.db, { ...own, orgId: "org_replay" });
+    const job = (await f.jobs())[0]!;
+    const canonical = { ...own, sessionId: job.session_id };
+    expect(await largeReadProgress(f.x.db, canonical, LARGE_READ_UNCLAIMED_MS)).toEqual({ state: "queued", workerSeen: false });
+    await f.x.db.query("UPDATE sessions.session_large_read_jobs SET state='running',lease_nonce=gen_random_uuid(),lease_expires_at=now()+interval '2 minutes',updated_at=now()");
+    expect(await largeReadProgress(f.x.db, canonical, LARGE_READ_UNCLAIMED_MS)).toEqual({ state: "running", workerSeen: true });
+  }, 60_000);
+});
+
+test("healthy scope, flag on: every delivery runs its pass exactly as flag off; one mark read each, no mark, no enqueue, no route", async () => {
+  const f = await fixture();
+  nextResult = () => ({ manifests: 1, rows: 3, inserted: 3, deleted: 0, complete: true, reasons: [] });
+  const off: any[] = [];
+  for (let i = 0; i < 3; i++) off.push(await f.deliver());
+  const s = stateTable();
+  let enqueues = 0;
+  f.deps.deadlineIsolation = { ch: s.ch, enqueue: async () => { enqueues++; return { enqueued: true }; } };
+  const on: any[] = [];
+  for (let i = 0; i < 3; i++) on.push(await f.deliver());
+  expect(passes).toBe(6);
+  const shape = (r: any) => ({ failures: r.failures, messages: r.lines.map((l: any) => [l.message, l.ok, l.reason]) });
+  expect(on.map(shape)).toEqual(off.map(shape));
+  expect({ enqueues, marks: s.rows.length, reads: s.reads.length }).toEqual({ enqueues: 0, marks: 0, reads: 3 });
+  expect(await f.jobs()).toEqual([]);
 }, 60_000);

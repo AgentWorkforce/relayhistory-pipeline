@@ -19,7 +19,7 @@ import { LEGACY_PROVENANCE_INVALID } from "../session-read-api/legacy-provenance
 import { streamDeadlinePassed } from "../session-read-api/canonical-stream-projection.ts";
 import { captureRefusal, classifyReplayFailure, produceCanonicalReplay, type ReplayProducerDeps } from "./replay-publication.ts";
 import type { LargeJobState, LargeRoute } from "./large-read-worker.ts";
-import { DEADLINE_OVER_BOUND, DEADLINE_ROUTE, deadlineMarked, hitStreamDeadline, markDeadline, type DeadlineIsolationDeps } from "./search-deadline-isolation.ts";
+import { DEADLINE_OVER_BOUND, DEADLINE_ROUTE, LARGE_READ_UNCLAIMED_MS, deadlineMarked, hitStreamDeadline, markDeadline, type DeadlineIsolationDeps } from "./search-deadline-isolation.ts";
 import { bufferedFeedQueryField, feedBufferedStageByKey, isBufferedStageKey, type BufferedFeedDeps } from "./buffered-search-feed.ts";
 
 export interface QueueRecord {
@@ -241,12 +241,30 @@ async function routeDeadlineScope(
   trigger: "first_hit" | "marked",
   phase: Record<string, unknown>,
   started: number,
+  markedAtMs?: number,
 ): Promise<boolean> {
   const ids = { org_id: scope.orgId, workspace_id: scope.workspaceId, harness: scope.harness, session_id: scope.sessionId };
   const { enqueued, identity } = await isolation.enqueue(scope);
   if (!enqueued) {
     log.info("search index over-bound, large-read unavailable", { stage: "search-index", ...ids, reason: DEADLINE_OVER_BOUND, outcome: trigger, route: "inline" });
     return false;
+  }
+  // A marked scope whose job nobody claims (no worker, or a stalled one) gets the inline pass again, not up to
+  // SKIP_STATE_MAX_AGE_MS without search. Only past LARGE_READ_UNCLAIMED_MS from the mark, with the job still
+  // queued and no worker progress on any job in that window. A failed read of that state routes as before.
+  if (trigger === "marked" && isolation.progress && markedAtMs !== undefined) {
+    const age = Math.max(0, (isolation.now ?? Date.now)() - markedAtMs);
+    if (age > LARGE_READ_UNCLAIMED_MS) {
+      try {
+        const p = await isolation.progress(identity ?? scope, LARGE_READ_UNCLAIMED_MS);
+        if (p && p.state === "queued" && !p.workerSeen) {
+          log.warn("large-read job unclaimed", { stage: "large-read", ...ids, reason: "large_job_unclaimed", state: p.state, age_ms: age, route: "inline" });
+          return false;
+        }
+      } catch (error) {
+        log.warn("large scope job state unavailable", { stage: "large-read", ...ids, ...errorFields(error) });
+      }
+    }
   }
   log.info("search index over-bound, routed to large-read", {
     stage: "search-index", ...ids, reason: DEADLINE_OVER_BOUND, outcome: trigger, route: DEADLINE_ROUTE,
@@ -417,8 +435,9 @@ export async function processBatch(records: readonly QueueRecord[], deps: Consum
         // SEARCH_INDEX_DEADLINE_ISOLATION_ENABLED=true only: a scope marked by an earlier stream_deadline pass goes to
         // the large-read job before any read or lock (one bounded ClickHouse read, one autocommit enqueue). A source
         // the enqueue reports unavailable (erased, blocked, no live pointer) runs the normal pass below.
-        if (deps.deadlineIsolation && (await deadlineMarked(deps.deadlineIsolation, scope))) {
-          if (await routeDeadlineScope(deps.deadlineIsolation, scope, "marked", phaseFields(), started)) continue;
+        const mark = deps.deadlineIsolation ? await deadlineMarked(deps.deadlineIsolation, scope) : null;
+        if (deps.deadlineIsolation && mark) {
+          if (await routeDeadlineScope(deps.deadlineIsolation, scope, "marked", phaseFields(), started, mark.atMs)) continue;
         }
         // SEARCH_INDEX_STREAMING_CH=1 only (the backport lineage's 6264d119 / 51f876b6): past the invocation's
         // stream deadline no scope of the batch is started (whole read or streamed); the rest are requeued. A

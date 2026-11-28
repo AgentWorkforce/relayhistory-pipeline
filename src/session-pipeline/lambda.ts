@@ -1,7 +1,7 @@
 import {createSemanticClickHouseClient} from "../search-features/semantic-copy-ch.ts";
 import {SemanticPostgresExecutor} from "../search-features/semantic-copy-postgres.ts";
 import { largeReadJobState, routeLargeRead } from "./large-read-worker.ts";
-import { enqueueLargeRead } from "./search-deadline-isolation.ts";
+import { enqueueLargeRead, largeReadProgress } from "./search-deadline-isolation.ts";
 /**
  * AWS Lambda entry for the sessions-prod session pipeline
  * (stacks/aws/session-pipeline.ts, sessions-pipeline-cloud:hosted-ops/preserved/runbooks/sessions-prod-session-pipeline.md).
@@ -816,7 +816,8 @@ export function runtimeFromSecret(env: LambdaEnv, secretText: string, schemaGene
   if(env.largeScopeHandoffEnabled&&(env.searchEnabled||env.replayPagesEnabled))deps.large={route:scope=>routeLargeRead(db,scope),jobState:scope=>largeReadJobState(db,scope)};
   // Default off (SEARCH_INDEX_DEADLINE_ISOLATION_ENABLED=true); the env check above guarantees streaming and the handoff.
   if (env.searchDeadlineIsolation && deps.search?.ch && deps.search.stream && deps.large)
-    deps.deadlineIsolation = { ch: deps.search.ch, enqueue: (scope) => enqueueLargeRead(db, scope), jobState: (scope) => largeReadJobState(db, scope) };
+    deps.deadlineIsolation = { ch: deps.search.ch, enqueue: (scope) => enqueueLargeRead(db, scope), jobState: (scope) => largeReadJobState(db, scope),
+      progress: (scope, withinMs) => largeReadProgress(db, scope, withinMs) };
   // The key comes from the secret only; "-disabled" or blank means no model, as in config.ts.
   const key = modelKey({ OPENAI_API_KEY: secret.openai_api_key });
   const briefSettings = briefConfig();
