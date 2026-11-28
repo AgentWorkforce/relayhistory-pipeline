@@ -162,6 +162,44 @@ for (const stream of [false, true]) {
     expect((await projectionReady(r)).every(Boolean)).toBe(true);
   });
 
+  test(`${label}: a transiently truncated pre-read scan never overrides readiness a newer pass committed meanwhile`, async () => {
+    // Pipeline review of 1f1e3a39: A captures an index scan with truncated=true; before A's apply, B
+    // finishes a complete pass at the same pointer stamp; A must not invalidate B's readiness.
+    const { r } = await rig(33);
+    const base = r.search(stream ? { stream: UNLIMITED } : {});
+    let padOnce = true;
+    const ch = { ...base.ch!, select: async <T,>(query: string, options?: { params?: Record<string, unknown> }) => {
+      const rows = await base.ch!.select<T>(query, options);
+      const limit = Number(options?.params?.limit);
+      if (padOnce && Number.isFinite(limit) && rows.length > 0 && rows.length < limit) {
+        padOnce = false;
+        while (rows.length < limit) rows.push(rows[0]!);
+      }
+      return rows;
+    } };
+    let newer: Awaited<ReturnType<typeof indexSearchScope>> | undefined;
+    const a = between({ ...base, ch: ch as never }, new Map([[2, async () => {
+      expect(padOnce).toBe(false); // A's pre-read scan was truncated
+      newer = await indexSearchScope(SCOPE, r.search(stream ? { stream: UNLIMITED } : {}));
+    }]]));
+    const result = await indexSearchScope(SCOPE, a.deps);
+    expect(newer).toMatchObject({ complete: true });
+    expect(result).toMatchObject({ complete: true });
+    expect((await projectionReady(r)).every(Boolean)).toBe(true);
+  });
+
+  test(`${label}: a persistently truncated index scan still marks the scope incomplete under the locks`, async () => {
+    const { r } = await rig(33);
+    const before = r.fake.dump();
+    const a = between(r.search({ ...(stream ? { stream: UNLIMITED } : {}), limits: { maxRows: 2 } }), new Map());
+    const result = await indexSearchScope(SCOPE, a.deps);
+    expect(result).toMatchObject({ complete: false, deleted: 0 });
+    expect(result.reasons).toContain("clickhouse_truncated");
+    expect(a.transactions()).toBe(2);
+    expect((await projectionReady(r)).some((x) => x === false)).toBe(true);
+    expect(r.fake.dump()).toEqual(before);
+  });
+
   test(`${label}: a persistently missing manifest still marks the scope incomplete under the locks`, async () => {
     const { source, r } = await rig(33);
     const base = r.search(stream ? { stream: UNLIMITED } : {});

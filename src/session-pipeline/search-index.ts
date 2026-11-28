@@ -646,7 +646,10 @@ export async function indexSearchScope(scope: SessionScope, deps: SearchIndexDep
     // pass reads the same pointers successfully and commits readiness, so applying the stale
     // incompleteness would invalidate that newer readiness. Such a capture re-reads under the locks
     // on the unmodified base path, which still marks genuine, persistent incompleteness.
-    if (captured.scan === undefined && !streamableTooLarge(captured, deps)) return indexSearchScopeBase(scope, deps);
+    // A TRUNCATED index scan is incomplete in the same way: the index rows can change (a concurrent
+    // complete pass) without any source-stamp change, so a stale truncated=true must not reach T2.
+    const completeScan = captured.scan !== undefined && !captured.scan.truncated;
+    if (!completeScan && !streamableTooLarge(captured, deps)) return indexSearchScopeBase(scope, deps);
     const prepared = captured;
     const applied = await indexSearchScopeBase(scope, deps, prepared);
     if (applied !== SEARCH_SCOPE_CHANGED) return applied;
