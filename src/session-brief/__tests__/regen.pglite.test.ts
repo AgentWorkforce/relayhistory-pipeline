@@ -349,7 +349,7 @@ describe("(4) audit retention", () => {
 /** The pointer vanishes between the sweep and the claim (a race): the claimed attempt is "gone" and writes nothing. */
 const goneAtClaim = (db: HoopDb): HoopDb => {
   const query = ((text: string, params?: unknown[]) =>
-    text.includes("SELECT machine_id, manifest_key, revision::text AS revision FROM sessions.session_index")
+    text.includes("SELECT machine_id, manifest_key, revision::text AS revision, encode(content_sha256, 'hex') AS content_sha256")
       ? Promise.resolve({ rows: [] })
       : db.query(text as never, params as never)) as HoopDb["query"];
   return { ...db, query, pool: { connect: async () => ({ query, release() {} }) } } as unknown as HoopDb;

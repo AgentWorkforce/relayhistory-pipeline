@@ -49,6 +49,12 @@ export interface BriefPointer {
   machineId: string;
   manifestKey: string;
   revision: number;
+  /**
+   * Hex SHA-256 of the manifest body the pointer row was derived from (session_index.content_sha256),
+   * or null when the row has none. Together with manifestKey and revision it identifies the exact
+   * incarnation a brief was built from: a re-create can reuse a revision number, never this digest.
+   */
+  contentSha256?: string | null;
 }
 
 export type BriefInput = (

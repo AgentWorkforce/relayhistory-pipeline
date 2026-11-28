@@ -182,14 +182,15 @@ export async function rescheduleWakeup(
 
 /** The session's live pointers (at most 64, as session_directory_pointers). */
 export async function livePointers(db: SqlExecutor, key: SessionDirectoryKey): Promise<BriefPointer[]> {
-  const { rows } = await db.query<{ machine_id: string; manifest_key: string | null; revision: string }>(
-    `SELECT machine_id, manifest_key, revision::text AS revision FROM sessions.session_index
+  const { rows } = await db.query<{ machine_id: string; manifest_key: string | null; revision: string; content_sha256: string | null }>(
+    `SELECT machine_id, manifest_key, revision::text AS revision, encode(content_sha256, 'hex') AS content_sha256
+       FROM sessions.session_index
       WHERE ${KEY} AND deleted_at IS NULL ORDER BY machine_id LIMIT 64`,
     keyParams(key),
   );
   return rows
     .filter((r) => r.manifest_key)
-    .map((r) => ({ machineId: r.machine_id, manifestKey: r.manifest_key!, revision: Number(r.revision) }));
+    .map((r) => ({ machineId: r.machine_id, manifestKey: r.manifest_key!, revision: Number(r.revision), contentSha256: r.content_sha256 ?? null }));
 }
 
 export interface StoredBrief {
@@ -374,7 +375,7 @@ export async function recordBrief(
   key: SessionDirectoryKey,
   sourceRevisions: Record<string, number>,
   outcome: BriefOutcome,
-  options: { canonicalSessionId?: string; coverage?: BriefCoverageWrite } = {},
+  options: { canonicalSessionId?: string; coverage?: BriefCoverageWrite; sourceBinding?: BriefSourceBinding } = {},
 ): Promise<{ written: boolean }> {
   const revision = Math.max(0, ...Object.values(sourceRevisions));
   // Summaries regeneration (push A): only with a coverage flag on and the columns present does a
@@ -403,12 +404,22 @@ export async function recordBrief(
     // machines at the same maximum revision) out of a newer brief.
     // Exactly livePointers' read (64 by machine_id, then rows with a manifest), so a
     // session past 64 machines still compares equal to the set the input was built from.
-    const live = await client.query<{ machine_id: string; manifest_key: string | null; revision: string }>(
-      `SELECT machine_id, manifest_key, revision::text AS revision FROM sessions.session_index
+    const live = await client.query<{ machine_id: string; manifest_key: string | null; revision: string; content_sha256: string | null }>(
+      `SELECT machine_id, manifest_key, revision::text AS revision, encode(content_sha256, 'hex') AS content_sha256
+         FROM sessions.session_index
         WHERE ${KEY} AND deleted_at IS NULL ORDER BY machine_id LIMIT 64 FOR SHARE`,
       keyParams(key),
     );
-    if (!sameSourceSet(live.rows.filter((r) => r.manifest_key), sourceRevisions)) {
+    const liveRows = live.rows.filter((r) => r.manifest_key);
+    if (!sameSourceSet(liveRows, sourceRevisions)) {
+      await client.query("ROLLBACK");
+      return { written: false };
+    }
+    // The same machines at the same revisions is not enough: a re-create can reuse a revision
+    // number with different content. With a binding (the incarnation the input was built from),
+    // every live pointer must still carry the same manifest key and manifest digest, or the
+    // input describes content that is no longer live and the brief is dropped as stale.
+    if (options.sourceBinding && !sameSourceIncarnation(liveRows, options.sourceBinding)) {
       await client.query("ROLLBACK");
       return { written: false };
     }
@@ -620,6 +631,25 @@ export async function briefSessionQuiet(
   const r = rows[0];
   if (r?.ended === true) return "ended_uncovered";
   return r?.idle === true ? "idle_uncovered" : null;
+}
+
+/** Per machine: the manifest key and digest of the exact incarnation a brief input was built from. */
+export type BriefSourceBinding = Record<string, { manifestKey: string; contentSha256: string | null }>;
+
+/** The binding for a pointer set, as read for the input (livePointers). */
+export function briefSourceBinding(pointers: readonly { machineId: string; manifestKey: string; contentSha256?: string | null }[]): BriefSourceBinding {
+  return Object.fromEntries(pointers.map((p) => [p.machineId, { manifestKey: p.manifestKey, contentSha256: p.contentSha256 ?? null }]));
+}
+
+function sameSourceIncarnation(
+  rows: Array<{ machine_id: string; manifest_key: string | null; content_sha256: string | null }>,
+  binding: BriefSourceBinding,
+): boolean {
+  if (rows.length !== Object.keys(binding).length) return false;
+  return rows.every((r) => {
+    const b = Object.prototype.hasOwnProperty.call(binding, r.machine_id) ? binding[r.machine_id] : undefined;
+    return b !== undefined && b.manifestKey === r.manifest_key && (b.contentSha256 ?? null) === (r.content_sha256 ?? null);
+  });
 }
 
 /** True when `rows` (machine_id, revision) are exactly the brief's source revisions. */

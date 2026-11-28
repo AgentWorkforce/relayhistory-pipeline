@@ -38,6 +38,7 @@ import {
   claimWakeups,
   finishWakeup,
   livePointers,
+  briefSourceBinding,
   pruneAttempts,
   pruneStaleWakeups,
   rearmAdmissibleParked,
@@ -126,9 +127,12 @@ function failureOf(error: unknown): { code: string; retryable: boolean } {
 export async function briefSession(deps: BriefDeps, w: ClaimedWakeup): Promise<BriefResult> {
   const { db, config } = deps;
   let canonicalSessionId: string | undefined;
-  const publish = (revisions: Record<string, number>, outcome: Parameters<typeof recordBrief>[3], coverage?: BriefCoverageWrite) =>
-    recordBrief(db, w, revisions, outcome, coverage ? { canonicalSessionId, coverage } : { canonicalSessionId });
   const pointers = await livePointers(db, w);
+  // The exact incarnation (manifest key + digest per machine) this attempt reads; the publish
+  // refuses if any of it changed, so a re-create that reuses a revision never gets a stale brief.
+  const sourceBinding = briefSourceBinding(pointers);
+  const publish = (revisions: Record<string, number>, outcome: Parameters<typeof recordBrief>[3], coverage?: BriefCoverageWrite) =>
+    recordBrief(db, w, revisions, outcome, coverage ? { canonicalSessionId, coverage, sourceBinding } : { canonicalSessionId, sourceBinding });
   if (!pointers.length) {
     await finishWakeup(db, w, { idleSeconds: config.idleSeconds, maxWaitSeconds: config.maxWaitSeconds });
     return "gone";
