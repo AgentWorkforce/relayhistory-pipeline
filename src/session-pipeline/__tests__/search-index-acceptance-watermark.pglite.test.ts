@@ -510,42 +510,57 @@ describe("what wakes a held scope", () => {
   }, 120_000);
 });
 
-describe("a manifest replaced with accepted content at the SAME revision, pointer rows unmoved", () => {
-  /**
-   * Warm a refusal with `flags`, then replace the contenders' manifests with the accepted content WITHOUT raising
-   * their revision (the pointer upsert only takes a higher revision, so the rows cannot move), deliver the
-   * manifests' events through the real handler, and report what the search stage did.
-   */
-  async function scenario(flags: Partial<SearchIndexDeps>) {
-    const { x, r, state, stamps } = await rig();
-    const send = realHandler(r.consumer({ ch: state.ch, ...flags }));
-    await send(r.messages);
-    const rows = async () => (await r.db.pg.query<{ manifest_key: string; revision: string; sha: string | null; manifest_etag: string | null }>(
-      "SELECT manifest_key, revision::text AS revision, encode(content_sha256, 'hex') AS sha, manifest_etag FROM sessions.session_index ORDER BY manifest_key")).rows;
-    const pointersBefore = await rows();
-    const prior = new Map<string, number>();
-    for (const k of x.keys) prior.set(k, (await x.reader.read(k))!.manifest.revision);
+/**
+ * Warm a refusal with `flags`, then replace the contenders' manifests with the accepted content WITHOUT raising
+ * their revision (the pointer upsert only takes a higher revision, so the rows cannot move), deliver the
+ * manifests' events through the real handler, and report what the search stage did.
+ */
+async function sameRevision(flags: Partial<SearchIndexDeps>, opts: { faultFirstManifestRead?: boolean; replace?: boolean } = {}) {
+  const { x, r, state, stamps } = await rig();
+  // One-shot fault, armed only for the final delivery: the search stage's FIRST manifest read throws, every
+  // later read is served (with the watermark flag on, that first read is the probe's verification).
+  const fault = { armed: false, thrown: 0, served: 0 };
+  const reader = {
+    provider: x.reader.provider,
+    read: async (key: string) => {
+      if (fault.armed && fault.thrown === 0) { fault.thrown += 1; throw new Error("synthetic manifest read failure"); }
+      if (fault.armed) fault.served += 1;
+      return x.reader.read(key);
+    },
+  };
+  const send = realHandler(r.consumer({ ch: state.ch, ...flags, ...(opts.faultFirstManifestRead ? { reader: reader as never } : {}) }));
+  await send(r.messages);
+  const rows = async () => (await r.db.pg.query<{ manifest_key: string; revision: string; sha: string | null; manifest_etag: string | null }>(
+    "SELECT manifest_key, revision::text AS revision, encode(content_sha256, 'hex') AS sha, manifest_etag FROM sessions.session_index ORDER BY manifest_key")).rows;
+  const pointersBefore = await rows();
+  const prior = new Map<string, number>();
+  for (const k of x.keys) prior.set(k, (await x.reader.read(k))!.manifest.revision);
+  let replaced = 0;
+  if (opts.replace !== false) {
     await publish(x, [...generate(8), ...appended(4), ...contenders(true)]);
-    let replaced = 0;
     for (const k of x.keys) {
       const now = (await x.reader.read(k))!.manifest;
       if (now.revision === prior.get(k)) continue;
       await x.store.put(objectKey(k as never), new TextEncoder().encode(JSON.stringify({ ...now, revision: prior.get(k) })), { contentType: "application/json" });
       replaced += 1;
     }
-    const reads = r.reads.count;
-    const { result, lines } = await captureLogs(() => send(r.messages));
-    const reconciled = lines.filter((l) => l.message === "search index reconciled").at(-1)!;
-    return {
-      replaced, result, reconciled, pointersMoved: JSON.stringify(await rows()) !== JSON.stringify(pointersBefore),
-      chunkReads: r.reads.count - reads, index: r.fake.dump(), stamp: stamps().at(-1)?.value,
-    };
   }
+  fault.armed = true;
+  const reads = r.reads.count;
+  const { result, lines } = await captureLogs(() => send(r.messages));
+  const reconciled = lines.filter((l) => l.message === "search index reconciled").at(-1)!;
+  return {
+    replaced, result, reconciled, pointersMoved: JSON.stringify(await rows()) !== JSON.stringify(pointersBefore),
+    chunkReads: r.reads.count - reads, index: r.fake.dump(), stamp: stamps().at(-1)?.value, fault,
+  };
+}
+
+describe("a manifest replaced with accepted content at the SAME revision, pointer rows unmoved", () => {
 
   test("both flags off (fresh evaluation), the acceptance skip alone, and the watermark: full pass or not, and whether the index agrees", async () => {
-    const fresh = await scenario({});
-    const skipAlone = await scenario(SKIP);
-    const watermark = await scenario(ON);
+    const fresh = await sameRevision({});
+    const skipAlone = await sameRevision(SKIP);
+    const watermark = await sameRevision(ON);
     for (const run of [fresh, skipAlone, watermark]) {
       expect(run.replaced).toBe(2);
       expect(run.result).toEqual({ batchItemFailures: [] });
@@ -569,6 +584,38 @@ describe("a manifest replaced with accepted content at the SAME revision, pointe
     expect(skipAlone.reconciled).toMatchObject({ ok: false, reason: HELD_REASONS.join(",") });
     expect(skipAlone.chunkReads).toBe(0);
     expect(skipAlone.index).not.toEqual(fresh.index);
+  }, 240_000);
+});
+
+describe("a fault while the probe verifies the stamp (review HOLD on 6192d989)", () => {
+  // Reuses the same-revision scenario above through a describe-local copy of its driver.
+  test("same-revision accepted replacement + the probe's first manifest read throws once: full evaluation, index equal to fresh, refusal cleared", async () => {
+    const fresh = await sameRevision({});
+    const faulted = await sameRevision(ON, { faultFirstManifestRead: true });
+    expect(faulted.replaced).toBe(2);
+    expect(faulted.pointersMoved).toBe(false);
+    // The fault happened, on the verification read, and the pass went on to read every manifest itself.
+    expect(faulted.fault.thrown).toBe(1);
+    expect(faulted.fault.served).toBeGreaterThan(0);
+    expect(faulted.result).toEqual({ batchItemFailures: [] });
+    // Never the stamped outcome: a full pass, the accepted content indexed, the same index as fresh, stamp cleared.
+    expect(faulted.reconciled).toMatchObject({ ok: true });
+    expect(String(faulted.reconciled.reason ?? "")).not.toContain(SKIPPED_BEFORE_READ);
+    expect(faulted.chunkReads).toBeGreaterThan(0);
+    expect(faulted.index).toEqual(fresh.index);
+    expect(faulted.stamp).toBe("");
+  }, 240_000);
+
+  test("nothing replaced + the same one-shot fault: still a full read (fail closed), refused again and re-stamped; the next delivery verifies and skips", async () => {
+    const faulted = await sameRevision(ON, { faultFirstManifestRead: true, replace: false });
+    expect(faulted.fault.thrown).toBe(1);
+    expect(faulted.reconciled).toMatchObject({ ok: false, reason: ACCEPTANCE_MISSING });
+    expect(faulted.chunkReads).toBeGreaterThan(0);
+    expect(JSON.parse(faulted.stamp!).w).toBeDefined();
+    // Control, no fault and nothing replaced: verification succeeds and the stamp licenses the skip, no chunk read.
+    const healthy = await sameRevision(ON, { replace: false });
+    expect(healthy.reconciled).toMatchObject({ ok: false, reason: HELD_REASONS.join(",") });
+    expect(healthy.chunkReads).toBe(0);
   }, 240_000);
 });
 

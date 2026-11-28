@@ -145,8 +145,8 @@ skipped_before_read`) plus `acceptanceHold`; the log line carries `acceptance_ho
 probe's time. A repeat at that revision is then the plain skip, and the next revision's probe reads only what
 was added after it.
 
-Anything else runs the normal pass: no watermark, an error of any kind (fail open), or any condition above
-not met.
+Anything else runs the normal pass: no watermark, an error of any kind, or any condition above not met. An
+error never licenses a skip or a hold (see the next section for the same-pointer case).
 
 ### A manifest replaced under an unmoved pointer row
 
@@ -158,8 +158,12 @@ leaves its pointer row as it was, so the pointer set, and with it the stamp's di
   "writers must raise the revision" condition above. It is a known gap of that flag.
 - **With the watermark flag on:** when the digest matches a stamp that carries a watermark, the probe first
   reads each sibling manifest (no chunk) and compares its chunk count and content chain with the stamped ones.
-  If any differs, the stamp licenses nothing for that pass and it reads in full. A stamp without a watermark
-  (a catalog-key refusal, or more than 64 siblings) keeps the acceptance skip's behaviour.
+  Only when every manifest is read and matches does the probe hand the locked pass a `verified` token that
+  names that exact stamp row (its value and its time). The locked pass repeats a watermark stamp's outcome
+  only with a token for the stamp row it reads itself. In every other case it reads in full: a manifest
+  differs, a manifest read fails or throws, the stamp read fails in the probe, the probe does not run to the
+  end, or the stamp row changed in between. This is fail closed. A stamp without a watermark (a catalog-key
+  refusal, or more than 64 siblings) keeps the acceptance skip's behaviour.
 
 The test "a manifest replaced with accepted content at the SAME revision, pointer rows unmoved" runs the three
 configurations from the same state and compares each index with a fresh evaluation.
