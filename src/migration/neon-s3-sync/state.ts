@@ -457,6 +457,12 @@ export class SyncState {
     return (this.db.prepare("SELECT gen FROM leases WHERE prefix = ?").get(prefix) as { gen: string | null } | undefined)?.gen ?? undefined;
   }
 
+  /** Milliseconds left on `prefix`'s lease for `holder` under acquireLease's expiry rule (-1 when not held by it). Read-only. */
+  leaseRemainingMs(prefix: string, holder: string, now = Date.now(), ttlMs = LEASE_TTL_MS): number {
+    const row = this.db.prepare("SELECT holder, at FROM leases WHERE prefix = ?").get(prefix) as { holder: string; at: number } | undefined;
+    return row && row.holder === holder ? Number(row.at) + ttlMs - now : -1;
+  }
+
   /** Extend a lease this holder still has; false if it was taken over. */
   renewLease(prefix: string, holder: string, now = Date.now()): boolean {
     return this.#offGuarded(() => Number(this.db.prepare("UPDATE leases SET at = ? WHERE prefix = ? AND holder = ?").run(now, prefix, holder).changes) === 1);

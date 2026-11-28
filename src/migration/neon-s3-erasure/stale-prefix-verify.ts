@@ -128,11 +128,31 @@ export interface ItemReceipt {
   counts: { versions: number; delete_markers: number; manifest_versions: number; chunk_versions: number; other_versions: number; records_old: number; records_survivor: number };
 }
 export interface IdentityReceipt { identity_hash: string; status: "PASS" | "FAIL"; reasons: Partial<Record<VerifyReason, number>>; items: ItemReceipt[] }
+/**
+ * What a receipt was produced against. Execute recomputes every field from its own configuration and refuses on any
+ * mismatch (job.ts, stale_prefix_receipt_target_mismatch / stale_prefix_receipt_stale).
+ */
+export interface ReceiptTarget {
+  bucket_sha256: string;
+  key_root: string;
+  /** allowlistDigest: sha256 over the canonical SORTED identity hashes. */
+  allowlist_sha256: string;
+  /** The state file's identity (main.ts stateIdentity: realpath + device + inode, hashed). */
+  state_identity: string;
+  /** The verifier's source commit (main.ts verifierCommit; a clean tree). */
+  verifier_commit: string;
+  produced_at: string;
+}
+/** A receipt is refused at execute when older than this. */
+export const RECEIPT_MAX_AGE_MS = 6 * 60 * 60 * 1000;
+export const allowlistDigest = (ids: readonly string[]) => digest([...ids].sort());
+
 export interface VerificationReceipt {
   v: 1;
   kind: typeof RECEIPT_KIND;
   bucket_sha256: string;
   key_root_sha256: string;
+  target: ReceiptTarget;
   /** The ORIGINAL allowlist, in the order given: never shrunk or filtered. */
   allowlist: string[];
   identities: IdentityReceipt[];
@@ -171,6 +191,10 @@ export function parseReceipt(text: string): VerificationReceipt {
   if (!r || r.v !== 1 || r.kind !== RECEIPT_KIND || !HEX64.test(r.bucket_sha256) || !HEX64.test(r.key_root_sha256) || !Array.isArray(r.allowlist)
       || !Array.isArray(r.identities) || (r.status !== "PASS" && r.status !== "FAIL") || typeof r.receipt_sha256 !== "string")
     throw invalid("shape");
+  const t = r.target;
+  if (!t || !HEX64.test(t.bucket_sha256) || typeof t.key_root !== "string" || !HEX64.test(t.allowlist_sha256) || !nonEmpty(t.state_identity)
+      || !nonEmpty(t.verifier_commit) || typeof t.produced_at !== "string" || !Number.isFinite(Date.parse(t.produced_at)))
+    throw invalid("target");
   const { receipt_sha256, ...unsealed } = r;
   if (digest(unsealed) !== receipt_sha256) throw invalid("receipt digest");
   for (const id of r.identities) {
@@ -301,6 +325,9 @@ export async function verifyStalePrefix(reader: VersionReader, input: { identity
   return finish(oldList, { prefix_sha256: sha256Hex(s.prefix), manifest: manifestPin, chunks: chunkPins, pin_sha256: pinDigest(manifestPin, chunkPins) });
 }
 
+/** The inline re-verification (job.ts) must reproduce the receipt's item EXACTLY: version set, pins, counts, status. */
+export const sameItem = (a: ItemReceipt, b: ItemReceipt) => canonical(a) === canonical(b);
+
 /** Every pinned key's CURRENT version is exactly the pinned version id and not a delete marker. */
 function pinsCurrent(listing: readonly ListedVersion[], pins: readonly { key: string; versionId: string }[]): boolean {
   return pins.every((p) => {
@@ -374,29 +401,43 @@ function topLevelTags(xml: string): string[] {
 }
 
 /**
- * The operator attestation (a file infra signs off; see the receipt fence in job.ts). It is REQUIRED for execute,
- * because some protections cannot be read by this code at all:
- *  - `survivor_writers`: the principals that can PutObject (overwrite a survivor key), DeleteObject without a
- *    versionId (a delete marker) and DeleteObjectVersion under the key root, attested by infra;
+ * The operator attestation (a file infra signs off; see FenceContext in job.ts). It is REQUIRED for execute, because
+ * the protections that matter most cannot be read or proven by this code at all:
+ *  - `actors` (with `actors_complete: true`, attested by infra): EVERY principal that can, on the bucket or under the
+ *    key root, overwrite a survivor key (s3:PutObject), create a delete marker (s3:DeleteObject without a versionId),
+ *    delete a version (s3:DeleteObjectVersion), or change lifecycle, versioning or the bucket policy
+ *    (s3:PutLifecycleConfiguration, which also covers DeleteBucketLifecycle; s3:PutBucketVersioning;
+ *    s3:PutBucketPolicy). Each REQUIRED_ACTIONS action must be covered by at least one listed actor. Each actor must
+ *    name the PREVENTIVE control that blocks it for the erase interval (`name` and `type`: a bucket-policy Deny with
+ *    a condition, an SCP, a permission boundary, or the permission being absent). An actor without one refuses. The
+ *    only exception is the one `self: true` actor (this eraser), and only for s3:DeleteObjectVersion. An alarm or a
+ *    change-control reference is detection, not prevention: informational only, it never satisfies this check;
  *  - `lifecycle`: no current-version Expiration or Transition for the key root, and the NoncurrentVersionExpiration
  *    days (it must agree with the configuration whenever the code could read it);
- *  - `lifecycle_change`: the principals that can PutBucketLifecycleConfiguration / DeleteBucketLifecycle. The
- *    preflight passes ONLY if every such principal is inside the explicit change-controlled `break_glass` set AND
- *    the change is PREVENTED (`prevented: true` with a named `preventive_control`) for the erase interval. An alarm
- *    or change-control reference is detection, not protection: it is recorded as informational only and never
- *    satisfies the check;
  *  - `versioning`: "Enabled";
- *  - `verified_at` (at most ATTESTATION_MAX_AGE_MS old at each item's first delete) and `change_control_ref`.
+ *  - `bucket_sha256`, `key_root` (checked against execute's own configuration), `verified_at` (at most
+ *    ATTESTATION_MAX_AGE_MS old before EVERY delete) and `change_control_ref`.
+ * Cross-host writers and every other actor are excluded ONLY by these attested preventive controls: code cannot prove
+ * it, so execute stays refused until such controls exist and are attested.
  */
+export const REQUIRED_ACTIONS = ["s3:PutObject", "s3:DeleteObject", "s3:DeleteObjectVersion", "s3:PutLifecycleConfiguration", "s3:PutBucketVersioning", "s3:PutBucketPolicy"] as const;
+export const PREVENTIVE_CONTROL_TYPES = ["bucket_policy_deny", "scp", "permission_boundary", "permission_absent"] as const;
+export interface AttestedActor {
+  principal: string;
+  actions: string[];
+  self?: boolean;
+  preventive_control: { name: string; type: (typeof PREVENTIVE_CONTROL_TYPES)[number] } | null;
+}
 export interface ProtectionAttestation {
   v: 1;
   kind: typeof ATTESTATION_KIND;
   bucket_sha256: string;
   key_root: string;
   versioning: "Enabled";
-  survivor_writers: { put_object: string[]; delete_marker: string[]; delete_version: string[]; attested_by: string };
+  actors: AttestedActor[];
+  actors_complete: true;
+  actors_attested_by: string;
   lifecycle: { current_version_expiration: false; current_version_transition: false; noncurrent_version_expiration_days: number };
-  lifecycle_change: { principals: string[]; break_glass: string[]; prevented: true; preventive_control: string };
   verified_at: string;
   change_control_ref: string;
   alarm_ref?: string;
@@ -411,21 +452,28 @@ export function attestationProblem(a: unknown, expect: { bucketSha256: string; k
   if (!x || typeof x !== "object" || x.v !== 1 || x.kind !== ATTESTATION_KIND) return "attestation_shape";
   if (x.bucket_sha256 !== expect.bucketSha256 || x.key_root !== expect.keyRoot) return "attestation_scope";
   if (x.versioning !== "Enabled") return "attestation_versioning";
-  const w = x.survivor_writers;
-  if (!w || !strList(w.put_object) || !strList(w.delete_marker) || !strList(w.delete_version) || !nonEmpty(w.attested_by)) return "attestation_survivor_writers";
+  if (!Array.isArray(x.actors) || !x.actors.length || x.actors_complete !== true || !nonEmpty(x.actors_attested_by)) return "attestation_actors";
+  let selves = 0;
+  for (const actor of x.actors) {
+    if (!actor || !nonEmpty(actor.principal) || !strList(actor.actions)) return "attestation_actors";
+    const pc = actor.preventive_control;
+    const prevented = !!pc && nonEmpty(pc.name) && (PREVENTIVE_CONTROL_TYPES as readonly string[]).includes(pc.type);
+    if (actor.self === true) {
+      selves++;
+      if (!prevented && actor.actions.some((a) => a !== "s3:DeleteObjectVersion")) return "attestation_actor_unprevented";
+    } else if (!prevented) return "attestation_actor_unprevented";
+  }
+  if (selves > 1) return "attestation_actors";
+  if (REQUIRED_ACTIONS.some((act) => !x.actors.some((actor) => actor.actions.includes(act)))) return "attestation_actors_incomplete";
   const l = x.lifecycle;
   if (!l || l.current_version_expiration !== false || l.current_version_transition !== false || !Number.isSafeInteger(l.noncurrent_version_expiration_days) || l.noncurrent_version_expiration_days < 1)
     return "attestation_lifecycle";
-  const c = x.lifecycle_change;
-  if (!c || !strList(c.principals) || !Array.isArray(c.break_glass) || !c.break_glass.every((p) => typeof p === "string" && p.length > 0)) return "attestation_lifecycle_change";
-  // Prevented, not alarmed: a change-capable principal outside the break-glass set, or no preventive control, refuses.
-  if (c.principals.some((p) => !c.break_glass.includes(p)) || c.prevented !== true || !nonEmpty(c.preventive_control)) return "attestation_lifecycle_change_not_prevented";
   if (typeof x.verified_at !== "string" || !Number.isFinite(Date.parse(x.verified_at))) return "attestation_verified_at";
   if (!nonEmpty(x.change_control_ref)) return "attestation_change_control_ref";
   return undefined;
 }
 
-/** Fresh enough at `now` (checked at each item's first delete). */
+/** Fresh enough at `now` (checked before EVERY delete). */
 export function attestationFresh(a: ProtectionAttestation, now: number, maxAgeMs = ATTESTATION_MAX_AGE_MS): boolean {
   const at = Date.parse(a.verified_at);
   return Number.isFinite(at) && at <= now + 60_000 && now - at <= maxAgeMs;

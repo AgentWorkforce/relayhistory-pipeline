@@ -297,7 +297,12 @@ export interface S3EraserConfig {
   endpoint?: string;
   credentials: AwsCredentials;
   fetch?: typeof fetch;
+  /** Per-request deadline (ms, default S3_REQUEST_DEADLINE_MS): every signed request is aborted at it. */
+  requestDeadlineMs?: number;
 }
+/** Default per-request deadline. Requests are never retried here (attempts = 1). */
+export const S3_REQUEST_DEADLINE_MS = 30_000;
+export const S3_REQUEST_ATTEMPTS = 1;
 
 /** One exact (key, version) identity. */
 export interface VersionRef {
@@ -378,6 +383,8 @@ export function assertInventoryXml(xml: string, root = "ListVersionsResult"): vo
  * page parser. `label` names the credential in a short-lived refusal (`short_lived_expired.<label>`).
  */
 function s3Core(cfg: S3EraserConfig, label: string) {
+  const deadlineMs = cfg.requestDeadlineMs ?? S3_REQUEST_DEADLINE_MS;
+  if (!(Number.isSafeInteger(deadlineMs) && deadlineMs > 0)) throw coded("erasure_config", "a positive request deadline is required");
   const doFetch = cfg.fetch ?? ((...a: Parameters<typeof fetch>) => fetch(...a));
   const url = (key = "") => {
     if (cfg.endpoint) {
@@ -391,7 +398,7 @@ function s3Core(cfg: S3EraserConfig, label: string) {
     const headers = new Headers();
     refuseIfExpired(cfg.credentials, label, Date.now()); // a short-lived key is never used to sign past expiry
     await signRequest({ method, url: u, headers, payloadSha256: await sha256Hex(new Uint8Array()), region: cfg.region, credentials: cfg.credentials });
-    const res = await doFetch(u, { method, headers });
+    const res = await doFetch(u, { method, headers, signal: AbortSignal.timeout(deadlineMs) });
     // Status only: S3 error bodies can echo keys.
     if (!res.ok && !(method === "DELETE" && res.status === 404) && !passStatuses.includes(res.status)) throw coded(`s3_${res.status}`, `S3 ${method} failed`);
     return res;
@@ -474,11 +481,11 @@ function s3Core(cfg: S3EraserConfig, label: string) {
     }
   }
 
-  return { url, request, fetchPage, versions };
+  return { url, request, fetchPage, versions, deadlineMs };
 }
 
 export function createS3Eraser(cfg: S3EraserConfig): Eraser & PreservedVersionEraser & PagedEraser & LiveObjectProbe & ReceiptFence {
-  const { url, request, fetchPage, versions } = s3Core(cfg, "eraser");
+  const { url, request, fetchPage, versions, deadlineMs } = s3Core(cfg, "eraser");
   async function remove(list: Version[]): Promise<number> {
     if (list.some((v) => v.key.split("/").some((seg) => seg === "." || seg === "..")))
       throw coded("erasure_key_shape", "a key with a dot segment would be normalized away");
@@ -539,6 +546,8 @@ export function createS3Eraser(cfg: S3EraserConfig): Eraser & PreservedVersionEr
       return [...new Set((await versions(prefix)).map((v) => v.key))];
     },
     listVersions: (prefix) => strictInventory(fetchPage, prefix),
+    requestDeadlineMs: deadlineMs,
+    requestAttempts: S3_REQUEST_ATTEMPTS,
     // Exactly one version by id: never a plain DELETE (that would only add a delete marker on a versioned bucket).
     deleteVersion: async (key, versionId) => {
       assertUnderPrefix(key.slice(0, key.lastIndexOf("/") + 1), [{ key, versionId }]);
@@ -586,9 +595,13 @@ export interface BucketProtectionReader {
  */
 export interface ReceiptFence extends VersionLister, BucketProtectionReader {
   deleteVersion(key: string, versionId: string): Promise<void>;
+  /** Worst-case time of one request (its abort deadline) and attempts per request: the lease-TTL bound uses both. */
+  readonly requestDeadlineMs: number;
+  readonly requestAttempts: number;
 }
 export function isReceiptFence(e: unknown): e is ReceiptFence {
-  return !!e && ["listVersions", "deleteVersion", "bucketLifecycle", "bucketVersioning"].every((m) => typeof (e as Record<string, unknown>)[m] === "function");
+  return !!e && ["listVersions", "deleteVersion", "bucketLifecycle", "bucketVersioning"].every((m) => typeof (e as Record<string, unknown>)[m] === "function")
+    && Number.isSafeInteger((e as ReceiptFence).requestDeadlineMs) && Number.isSafeInteger((e as ReceiptFence).requestAttempts);
 }
 
 /**
