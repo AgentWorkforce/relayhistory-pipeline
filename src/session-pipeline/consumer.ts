@@ -237,7 +237,13 @@ export async function processBatch(records: readonly QueueRecord[], deps: Consum
       // DURABLE proof is required, not inferred from the pointer: an 'unchanged' pointer can be this message's OWN
       // earlier attempt, which advanced the pointer and then crashed its search pass (Pipeline review of 16feaf75).
       // A failed proof read runs the pass.
+      // The search stage's proof (alreadyCurrent) compares manifest keys and REVISION numbers only, so it can still match
+      // an indexed PUT A after A was replaced by B at the same key and revision (B's notification lost; the revision
+      // fence keeps the pointer row at A). So first a PHYSICAL check against the real pointer rows: for every key of
+      // this batch, the row's stored manifest_etag must be the live object the pointer pass just read (Pipeline
+      // review of b41e49bf). Otherwise no proof: run the pass, which reads the live object.
       if (ordered && supersededOnly(messageIds, revisions) &&
+          await pointerRowsAreLive(deps.pointer.db, scope, revisions).catch(() => false) &&
           await (deps.searchCoverage ?? ((s: SessionScope) => coverageProven(s, deps.search!)))(scope).catch(() => false)) {
         // Every message is a stamped revision whose write is no longer live. The newer live write has its
         // own message in this group: already processed (FIFO holds later messages until earlier ones are
@@ -393,6 +399,25 @@ export async function processBatch(records: readonly QueueRecord[], deps: Consum
   return { batchItemFailures: [...failed].map((itemIdentifier) => ({ itemIdentifier })) };
 }
 
+const unquoteEtag = (v: string | null | undefined) => (v ? v.replace(/^"|"$/g, "") : undefined);
+
+/**
+ * Physical currency of the pointer rows: for every manifest key behind this scope's batch, the stored pointer row
+ * names the SAME object (ETag) that the pointer pass just read as live. A key without a live stamp, or a row that
+ * names another object, is no proof.
+ */
+async function pointerRowsAreLive(db: PointerDeps["db"], scope: SessionScope, revisions: readonly Revised[]): Promise<boolean> {
+  const liveByKey = new Map<string, string | undefined>();
+  for (const r of revisions) liveByKey.set(r.event.key, unquoteEtag(r.liveStamp?.etag));
+  if (liveByKey.size === 0 || [...liveByKey.values()].some((e) => e === undefined)) return false;
+  const { rows } = await db.query<{ manifest_key: string; manifest_etag: string | null }>(
+    `SELECT manifest_key, manifest_etag FROM sessions.session_index
+      WHERE org_id = $1 AND workspace_id = $2 AND harness = $3 AND session_id = $4 AND deleted_at IS NULL AND manifest_key = ANY($5::text[])`,
+    [scope.orgId, scope.workspaceId, scope.harness, scope.sessionId, [...liveByKey.keys()]]);
+  if (rows.length !== liveByKey.size) return false;
+  return rows.every((row) => unquoteEtag(row.manifest_etag) === liveByKey.get(row.manifest_key));
+}
+
 /**
  * True when every message behind a scope is a stamped revision event (a versionId or ETag) whose write the
  * pointer pass found not live, and none is a delete. Unstamped events (S3 or reconcile bodies that lack
@@ -430,6 +455,8 @@ interface Revised {
   pointer: { startedAt: number; doneAt: number };
   /** The pointer pass's outcome for this key: `unchanged` means an EARLIER pass already advanced it to the live write. */
   pointerStatus: string;
+  /** The live manifest's stamps as the pointer pass read them under the lock (absent for a delete). */
+  liveStamp?: { etag?: string; version?: string };
 }
 
 /**
@@ -455,7 +482,7 @@ function checkRevisions(revs: readonly { event: LandedEvent; messageId: string }
         ...(record?.sentAt !== undefined ? { group_lag_ms: Math.max(0, now() - record.sentAt) } : {}),
       });
     }
-    out.push({ event, messageId, live: same, pointer, pointerStatus: outcome.status, ...(record?.sentAt !== undefined ? { sentAt: record.sentAt } : {}), ...(record?.receiveCount !== undefined ? { receiveCount: record.receiveCount } : {}) });
+    out.push({ event, messageId, live: same, pointer, pointerStatus: outcome.status, ...(live ? { liveStamp: live } : {}), ...(record?.sentAt !== undefined ? { sentAt: record.sentAt } : {}), ...(record?.receiveCount !== undefined ? { receiveCount: record.receiveCount } : {}) });
   }
   return out;
 }

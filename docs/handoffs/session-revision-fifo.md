@@ -53,7 +53,11 @@ scheduled reconcile ──────────────┘
   pass already covers the scope's live pointer set (`coverageProven` in search-index.ts: the same directory
   readiness and sources evidence skip-current uses). An `unchanged` pointer alone proves nothing: it can be this
   message's own earlier attempt, which advanced the pointer and then crashed its search pass (Pipeline review of
-  16feaf75). No proof, or a failed proof read, runs the pass. If THIS pass advanced the pointer, it runs the search pass itself:
+  16feaf75). No proof, or a failed proof read, runs the pass. Because that proof compares keys and REVISION numbers
+  only, the consumer first checks PHYSICAL currency against the pointer rows: for every key of the batch, the
+  stored `manifest_etag` must be the live object the pointer pass just read. Otherwise (for example A indexed, then
+  B replacing it at the same key and revision with its notification lost) there is no proof and the pass runs
+  (Pipeline review of b41e49bf). If THIS pass advanced the pointer, it runs the search pass itself:
   the live write's own message may be lost, and reconcile would then see the pointer matching S3 and send
   nothing (Pipeline review of 51a8721b). No search state is read, so this does not depend on
   `SEARCH_INDEX_SKIP_CURRENT_ENABLED`.

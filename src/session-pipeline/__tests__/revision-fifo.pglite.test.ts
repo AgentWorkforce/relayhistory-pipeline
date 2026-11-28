@@ -317,6 +317,21 @@ describe("superseded-only skip needs DURABLE proof of a covering search (Pipelin
     expect(t.index.get(t.sid)).toEqual(["r2"]);
   });
 
+  test("same key AND revision replaced (A indexed, B's notification lost, no delete): a delayed A alone must run the pass and index B, even though the key/revision proof still matches A", async () => {
+    const t = await rig();
+    const a = await t.writer(1, "markera");
+    await t.run([t.record(a)]);
+    expect(t.index.get(t.sid)).toEqual(["markera"]);
+    // B replaces A at the SAME key and revision; its own notification is lost. The pointer row stays at A (revision fence).
+    await t.writer(1, "markerb");
+    const late = await t.run([t.record(a, T0, 2)]);
+    expect(late.result).toEqual({ batchItemFailures: [] });
+    // The model proof (key + revision) still matches, as the runtime alreadyCurrent would. The PHYSICAL pointer-row
+    // check sees the row naming A while B is live, so there is no proof and the pass runs, reading the live object.
+    expect(named(late.lines, "search index skipped")).toEqual([]);
+    expect(t.index.get(t.sid)).toEqual(["markerb"]);
+  });
+
   test("a failed proof read runs the pass (never skips on an error)", async () => {
     const t = await rig();
     const e1 = await t.writer(1, "r1");
