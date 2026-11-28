@@ -241,6 +241,8 @@ SQL step and its S3 CAS.
    any commit-check answer. Any reader diff goes to sessions-partial-canonical for review. This is design input, not
    a W2 verdict or a grant approval.
 
+**SUPERSEDED by the W2 revision below (lander verdict 252339171875885056, design at 79431c4b): SQL decides
+visibility per effect, and the drained marker only records terminal per-session outcomes. Kept for history.**
 **W2 and erasure (agreed with sessions-buffered-drain-materialization; B3 list-then-CAS guard withdrawn).** For
 enrolled orgs the drain's create-only `drained` marker is the visibility point, and the drain writes it strictly
 last, after verified materialization. An erase of an enrolled org pre-creates create-only markers with outcome
@@ -535,3 +537,13 @@ layout with two labelled toy readers:
 - **A paused direct writer** that claimed before enrollment and whose bytes land after the baseline capture. Its
   commit is refused while held. **Today's reader serves its bytes (the gap); the W2 rule (2) does not.** An entry
   that landed before the baseline capture is pre-cutover state: it is erased through its owner stub like any other.
+
+### Ruling state (latest)
+
+- **W2 verdict 252339171875885056.** The revised design and the isolated synthetic proof may proceed.
+  - The seven reader constraints stand, including the identical-pointer cursor regression and terminal fence
+    verdicts on failed reads.
+  - Erase ordering follows 79431c4b: SQL decides visibility per effect, and the drained marker records terminal
+    per-session outcomes.
+- Production reader wiring, grants, the migration and release remain held. B needs an unassigned forward slot
+  (062400 belongs to T51). The PG17 two-connection orderings wait for the reserved lane. Wave 1 is held.
