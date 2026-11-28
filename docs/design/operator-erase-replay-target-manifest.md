@@ -1,4 +1,4 @@
-# Operator erase replay target manifest — draft 6
+# Operator erase replay target manifest — draft 7
 
 ## Status and ownership
 
@@ -657,6 +657,19 @@ or expand it to all runtime writers without an explicit reviewed scope change.
 Future covering proofs can extend this matrix only with versioned evidence,
 qualified request attribution and the same bidirectional reconciliation.
 
+At the inspected `6d60dc4f` source, runtime scopes and runs are inserted after
+`_session` returns (062320:1706–1708). Their `target_session_id` and storage
+scope need comparison to the sealed targets or independent proof. Lease-only
+run updates (050020:161/173/194) are merely bookkeeping candidates: a durable
+witness must bind the exact run to the accepted request and establish unchanged
+target/storage scope. Classify each event writer and transition before claiming
+audit-only coverage. Write registration, finish and failure (050020:58/69/77)
+use `writer_id`; sharing a session does not bind that writer to an erase request.
+No later source mutation is qualified as bookkeeping solely by its history
+row. Capture missing attribution at its actual writer in a separately reviewed
+increment, or leave it uncovered; this partial increment requires no runtime
+rewrite.
+
 The consumer-owned co-read computes `binding_sha256` **in SQL**, only over the
 concrete evidence actually validated, using the producer/consumer's agreed
 byte-exact versioned, length-framed encoding and shared test vector. It must
@@ -897,6 +910,11 @@ Neither the session manifest nor 062320's shared org lock can stand in for it.
   refuse unless uniquely attributed and reconciled in both directions. Cover
   each of the 15 source rows in the matrix, including required-zero failures.
   Preseeded receipts never bypass these negatives or allow any object I/O.
+- Explicit qualification fixtures: two same-org erase requests in one xid,
+  with no unique per-mutation attribution; and a later transaction finishing
+  or failing a registered writer that names the same session but lacks a
+  durable request relation. Both retain `effect_mapping_missing` and a null
+  binding digest, with zero object calls and no qualifying receipt or release.
 - Wrapper negatives: non-null effect digest for unproven status; null/non-hex
   digest for proven status; alias-count mismatch or malformed/overflow text;
   and unknown SQL comparisons. Unproven counts are `"0"`, strict booleans
