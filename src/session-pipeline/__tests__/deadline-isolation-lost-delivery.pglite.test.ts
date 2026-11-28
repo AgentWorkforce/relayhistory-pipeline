@@ -10,12 +10,16 @@
  * Real: migrations on PGlite, the ingest delivery, the portable publisher against a MinIO-shaped fake, object-landed and
  * the managed session-indexed authority path (search-jobs-publication.ts publishedHead), claimSearchJobs,
  * runSearchJob with the real indexSearchScope and a recording ClickHouse, settleSearchJob.
+ * Forced: one more deadline. Drain 1's managed pass stops mid-stream (stream_deadline) and is settled as the Lambda's
+ * loop settles it (searchSettlementFor: retry 30 s, one attempt spent); the wake survives (not dead-lettered). After
+ * the backoff, drain 2 completes it. A scope whose every managed pass hits the deadline is retried until
+ * SEARCH_JOB_MAX_ATTEMPTS, then dead-lettered (a durable letter, not a completed pass).
  * Suppressed: B's S3-event delivery to the session pipeline consumer (processBatch is never called) and every later
  * append. Not covered: an actual SQS loss, the hosted schedule that drains held scopes, and any read endpoint past the
  * search state rows (no read-API authorized read; T139).
  */
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
-import { claimSearchJobs, runSearchJob, settleSearchJob } from "../search-jobs.ts";
+import { claimSearchJobs, runSearchJob, searchSettlementFor, settleSearchJob } from "../search-jobs.ts";
 import { objectStoreManifestReader } from "../../shared/vendor.ts";
 import type { SearchIndexDeps } from "../search-index.ts";
 import { publishedHead, type PublishedHead } from "./search-jobs-publication.ts";
@@ -38,9 +42,6 @@ describe("below-threshold B, delivery lost, no later append: the managed wake co
       "SELECT coalesce(sum(raw_bytes),0)::text b, coalesce(sum(event_count),0)::text n FROM sessions.session_index WHERE manifest_key=$1", [head.key])).rows[0]!;
     expect(BigInt(size.b)).toBeLessThanOrEqual(67108864n);
     expect(BigInt(size.n)).toBeLessThanOrEqual(100000n);
-    // The drain: claim, run B's managed pass, settle.
-    const [claimed] = await claimSearchJobs(head.db, 1);
-    expect(claimed).toBeDefined();
     const recorded = recordingReplayClickHouse();
     const prefix = head.key.slice(0, head.key.indexOf("/", head.key.indexOf("/") + 1));
     const search = {
@@ -48,6 +49,25 @@ describe("below-threshold B, delivery lost, no later append: the managed wake co
       reader: objectStoreManifestReader(head.store, { provider: "s3", bucket: "selfhost-sessions" }),
       store: head.store, ch: recorded.ch, prefixFor: () => prefix,
     } as SearchIndexDeps;
+    // Drain 1, forced into another deadline: B's managed pass cannot finish (whole-read bound of 1 byte, streaming on,
+    // its stream deadline crossed after the start check). Settled as the Lambda's loop settles it (searchSettlementFor).
+    let reads = 0; // the deadline is open for the start check, then crossed: the stream stops mid-pass
+    const [first] = await claimSearchJobs(head.db, 1);
+    expect(first).toBeDefined();
+    const stalled = await runSearchJob(first!.claimedMessage, {
+      search: { ...search, limits: { maxScopeBytes: 1, maxScopeEvents: 1 }, stream: { maxReadBytes: 1 << 30, maxReadEvents: 1 << 24 }, streamDeadline: { at: 1e14, now: () => (++reads <= 1 ? 0 : 2e14) } },
+    });
+    expect(stalled).toMatchObject({ outcome: "held", reasons: ["scope_too_large", "stream_deadline"] });
+    const settlement = searchSettlementFor(stalled, first!.attempts);
+    expect(settlement).toEqual({ retry: 30 });
+    expect(await settleSearchJob(head.db, first!, settlement)).toMatchObject({ applied: true });
+    // The wake survives the stalled pass: still queued, not dead-lettered, backed off.
+    const kept = (await head.db.query<{ dlq: boolean; attempts: number }>("SELECT dlq, attempts FROM sessions.pipeline_jobs WHERE stage='search-index'")).rows;
+    expect(kept).toEqual([{ dlq: false, attempts: 1 }]);
+    // The backoff elapses (test clock: make the job visible now), and drain 2 runs B's managed pass to completion.
+    await head.db.query("UPDATE sessions.pipeline_jobs SET visible_at=now() WHERE stage='search-index'");
+    const [claimed] = await claimSearchJobs(head.db, 1);
+    expect(claimed).toBeDefined();
     const out = await runSearchJob(claimed!.claimedMessage, { search });
     expect(out.outcome).toBe("indexed");
     expect(await settleSearchJob(head.db, claimed!, "done")).toMatchObject({ applied: true });
