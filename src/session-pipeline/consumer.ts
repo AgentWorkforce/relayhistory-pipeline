@@ -241,6 +241,8 @@ export async function processBatch(records: readonly QueueRecord[], deps: Consum
           stage: "search-index", org_id: scope.orgId, workspace_id: scope.workspaceId, harness: scope.harness, session_id: scope.sessionId,
           reason: "superseded_in_group", ...passFields(messageIds, recordOf, now), duration_ms: Date.now() - started,
         });
+        // An earlier pass covered these; its completion time is not known here.
+        for (const r of revisions) if (!r.event.deleted) logUnobserved(scope, r, "covered_by_earlier_pass");
         continue;
       }
       const phase = searchIndexPhaseMetrics();
@@ -266,6 +268,7 @@ export async function processBatch(records: readonly QueueRecord[], deps: Consum
             reason: result.reasons.join(","), ...phaseFields(), ...passFields(messageIds, recordOf, now), duration_ms: Date.now() - started,
           });
           logSearchable(scope, revisions, now, pickedUpAt, passStartedAt, true);
+          logCovered(scope, revisions, now, pickedUpAt, passStartedAt);
           continue;
         }
         if (result.deferred) {
@@ -302,7 +305,10 @@ export async function processBatch(records: readonly QueueRecord[], deps: Consum
           ...passFields(messageIds, recordOf, now),
           duration_ms: Date.now() - started,
         });
-        if (result.complete) logSearchable(scope, revisions, now, pickedUpAt, passStartedAt, false);
+        if (result.complete) {
+          logSearchable(scope, revisions, now, pickedUpAt, passStartedAt, false);
+          logCovered(scope, revisions, now, pickedUpAt, passStartedAt);
+        }
       } catch (error) {
         log.error("search index failed", {
           stage: "search-index",
@@ -424,6 +430,10 @@ interface Revised {
   pointer: { startedAt: number; doneAt: number };
   /** The pointer pass's outcome for this key: `unchanged` means an EARLIER pass already advanced it to the live write. */
   pointerStatus: string;
+  /** The live manifest's revision number after the pointer pass (absent for a delete or an unknown revision). */
+  liveRevision?: number;
+  /** A delete event of the same key arrived after this one in the group: an erase lies between it and the live write. */
+  deleteAfter: boolean;
 }
 
 /**
@@ -437,8 +447,9 @@ function checkRevisions(revs: readonly { event: LandedEvent; messageId: string }
   recordOf: ReadonlyMap<string, QueueRecord>, now: () => number, pointer: { startedAt: number; doneAt: number }): Revised[] {
   const out: Revised[] = [];
   const live = outcome.live;
-  for (const { event, messageId } of revs) {
+  for (const [i, { event, messageId }] of revs.entries()) {
     const record = recordOf.get(messageId);
+    const deleteAfter = revs.slice(i + 1).some((later) => later.event.deleted === true);
     const same = !event.deleted && live !== undefined && outcome.status !== "deleted" &&
       (event.version && live.version ? event.version === live.version : event.etag !== undefined && event.etag === live.etag);
     if (!same && !event.deleted) {
@@ -449,7 +460,8 @@ function checkRevisions(revs: readonly { event: LandedEvent; messageId: string }
         ...(record?.sentAt !== undefined ? { group_lag_ms: Math.max(0, now() - record.sentAt) } : {}),
       });
     }
-    out.push({ event, messageId, live: same, pointer, pointerStatus: outcome.status, ...(record?.sentAt !== undefined ? { sentAt: record.sentAt } : {}), ...(record?.receiveCount !== undefined ? { receiveCount: record.receiveCount } : {}) });
+    out.push({ event, messageId, live: same, pointer, pointerStatus: outcome.status, deleteAfter,
+      ...(outcome.status !== "deleted" && outcome.revision !== undefined ? { liveRevision: outcome.revision } : {}), ...(record?.sentAt !== undefined ? { sentAt: record.sentAt } : {}), ...(record?.receiveCount !== undefined ? { receiveCount: record.receiveCount } : {}) });
   }
   return out;
 }
@@ -472,6 +484,46 @@ function passFields(messageIds: readonly string[], recordOf: ReadonlyMap<string,
  * upload's own commit time to the end of the pass that made it searchable. A superseded event
  * has no line of its own; the upload that superseded it reports.
  */
+const uploadKind = (e: LandedEvent) =>
+  e.revision?.initial === true ? "initial" : e.revision?.initial === false ? "append" : e.revision?.revision === 1 ? "initial" : e.revision?.revision ? "append" : "unknown";
+
+function logUnobserved(scope: SessionScope, r: Revised, reason: string) {
+  log.info("revision unobserved", {
+    stage: "revision-events", org_id: scope.orgId, workspace_id: scope.workspaceId, harness: scope.harness, session_id: scope.sessionId,
+    revision: r.event.revision?.revision, upload_kind: uploadKind(r.event), event_source: r.event.revision?.source, incarnation_sha256: incarnation(r.event), reason,
+  });
+}
+
+/**
+ * First indexed appearance of SUPERSEDED uploads (readout request). An append is cumulative, so the live manifest
+ * the covering pass indexed contains a superseded append's records: that pass's completion is the upload's first
+ * indexed appearance. Fail-closed: covered ONLY for a lower revision of the same key with no delete after it in the
+ * group. Otherwise 'revision unobserved' with the reason (erase_between, recreate_between, revision_unknown).
+ * Index pass completion, NOT an authorized caller read.
+ */
+function logCovered(scope: SessionScope, revisions: readonly Revised[], now: () => number, pickedUpAt: number, passStartedAt: number) {
+  const seen = new Set<string>();
+  for (const r of revisions) {
+    if (r.live || r.event.deleted) continue;
+    const id = `${r.event.key}\u001f${r.event.version ?? r.event.etag ?? ""}`;
+    if (seen.has(id)) continue;
+    seen.add(id);
+    const rev = r.event.revision?.revision;
+    if (rev === undefined || r.liveRevision === undefined) { logUnobserved(scope, r, "revision_unknown"); continue; }
+    if (r.deleteAfter) { logUnobserved(scope, r, "erase_between"); continue; }
+    if (rev >= r.liveRevision) { logUnobserved(scope, r, "recreate_between"); continue; }
+    const committed = r.event.revision?.committedAt ? Date.parse(r.event.revision.committedAt) : NaN;
+    log.info("revision covered", {
+      stage: "revision-events", org_id: scope.orgId, workspace_id: scope.workspaceId, harness: scope.harness, session_id: scope.sessionId,
+      revision: rev, covered_by_revision: r.liveRevision, upload_kind: uploadKind(r.event), event_source: r.event.revision?.source,
+      incarnation_sha256: incarnation(r.event), picked_up_at_ms: pickedUpAt, pass_started_at_ms: passStartedAt,
+      ...(Number.isFinite(committed) ? { commit_to_pickup_ms: Math.max(0, pickedUpAt - committed), commit_to_start_ms: Math.max(0, passStartedAt - committed),
+        commit_to_searchable_ms: Math.max(0, now() - committed) } : {}),
+      ...(r.receiveCount !== undefined ? { receive_count: r.receiveCount } : {}),
+    });
+  }
+}
+
 function logSearchable(scope: SessionScope, revisions: readonly Revised[], now: () => number, pickedUpAt: number, passStartedAt: number, alreadyCurrent: boolean) {
   const seen = new Set<string>();
   for (const r of revisions) {
