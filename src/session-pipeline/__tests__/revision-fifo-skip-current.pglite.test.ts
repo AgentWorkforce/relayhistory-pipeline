@@ -111,4 +111,24 @@ describe("ordered consumer, real search stage, skip-current on", () => {
     // The pointer stage read the manifest; the search stage read nothing (skip-current held).
     expect(r.reads.count - reads).toBeLessThanOrEqual(1);
   }, 120_000);
+
+  // KNOWN GAP, pre-existing and NOT fixed here (reported to Pipeline): the physical pointer-row currency check runs only
+  // in ordered (FIFO) mode. On the standard queue, with SEARCH_INDEX_SKIP_CURRENT_ENABLED on (off in prod today), the
+  // search stage's alreadyCurrent credits the stale pointer row (key + revision) and B is never indexed. Pinned so a
+  // fix flips this deliberately.
+  test("standard path (no FIFO), the same lost-B / delayed-A sequence with skip-current on: B is NOT indexed (known gap, pinned)", async () => {
+    const r = await hostedRig(x, cleanup);
+    const key = x.keys[1]!;
+    await r.tick({});
+    expect((await indexSearchScope(SCOPE, r.search())).complete).toBe(true);
+    await replaceSameRevision(key);
+    const fresh = await hostedRig(x, cleanup);
+    await fresh.tick({});
+    expect((await indexSearchScope(SCOPE, fresh.search())).complete).toBe(true);
+    const indexedB = fresh.fake.dump();
+    // A delayed S3 notification for A, through processBatch (the standard queue), skip-current ON.
+    const res = await r.tick({ skipCurrent: true });
+    expect(res.batchItemFailures).toEqual([]);
+    expect(r.fake.dump()).not.toEqual(indexedB);
+  }, 120_000);
 });

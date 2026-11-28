@@ -26,7 +26,7 @@ import { processBatch, type ConsumerDeps } from "../consumer.ts";
 import { droppedFanout } from "../pointer.ts";
 import { dispatchSqsBatch, type RevisionWiring, type SqsRecord } from "../revision-dispatch.ts";
 import { revisionMessage, type RevisionEvent } from "../revision-events.ts";
-import { enqueueLargeRead, largeReadProgress } from "../search-deadline-isolation.ts";
+import { DEADLINE_MARK_PREFIX, captureLargeReadSource, deadlineMarkName, enqueueLargeRead, largeReadProgress } from "../search-deadline-isolation.ts";
 import { parseQueueBody, type LargeReadHoldBody } from "../s3-events.ts";
 import { clonedReplayDatabase, closeReplayTemplate, createFsStore, exportReplayFixture } from "./replay-fixture.ts";
 import { recordingReplayClickHouse } from "./replay-clickhouse-fixture.ts";
@@ -206,5 +206,60 @@ describe("(b) confirmed handoff: the head is released and a later append is pick
     expect(await f.plain()).toEqual([]);
     expect(passes).toBe(1);
     expect(f.standard).toHaveLength(2);
+  }, 60_000);
+});
+
+describe("(c) delayed and duplicate A against B: B's queue work stays intact", () => {
+  const own = { orgId: "org_replay", workspaceId: "ws_replay", harness: "claude", sessionId: "large_replay" };
+  const jobRow = async (f: F) => (await f.x.db.query<{ j: unknown }>("SELECT row_to_json(j)::text j FROM sessions.session_large_read_jobs j")).rows.map((r) => r.j);
+  const markNow = (f: F) =>
+    f.s.rows.push({ name: deadlineMarkName(own), value: JSON.stringify({ v: 1, reason: STREAM_DEADLINE }), updated_at: new Date(f.clock.t).toISOString().replace("T", " ").replace("Z", "") });
+
+  test("FIFO: a delayed A event, then its duplicate, after B's own routing: each acks, routes to B's job (row byte-identical), and holds for B's incarnation, never A's; no pass", async () => {
+    const f = await fixture();
+    f.deps.deadlineIsolation = { ...f.deps.deadlineIsolation!, current: (scope) => captureLargeReadSource(f.x.db, scope) };
+    // B is the live manifest; its own routing already enqueued its job and marked the scope.
+    await enqueueLargeRead(f.x.db, own);
+    markNow(f);
+    const b = (await captureLargeReadSource(f.x.db, own))!.source;
+    const before = await jobRow(f);
+    expect(before).toHaveLength(1);
+    // A: an earlier write of the same key (a stale ETag and a lower revision), delivered late, then again.
+    const a = await f.fifoRecord(1, 1, "a1");
+    const stale = { ...a, body: a.body.replace(/"etag":"[^"]+"/, '"etag":"stale-a-etag"') };
+    for (const [i, rec] of [stale, { ...stale, messageId: "a1-dup", receiptHandle: "rh-a1-dup-1" }].entries()) {
+      f.clock.t += 1_000;
+      expect(await f.fifo([rec])).toEqual([]);
+      expect(await jobRow(f)).toEqual(before);
+      expect(f.standard).toHaveLength(i + 1);
+      const hold = f.standard.at(-1)!.hold!;
+      expect({ epoch: hold.epoch, fingerprint: hold.fingerprint }).toEqual({ epoch: b.epoch, fingerprint: b.fingerprint });
+    }
+    expect(passes).toBe(0);
+    expect(f.s.rows.filter((r) => r.name.startsWith(DEADLINE_MARK_PREFIX))).toHaveLength(1);
+    // After A's deliveries are done, B's own wakeup still holds for B (its job is still queued) and changes no row.
+    f.clock.t += MIN;
+    expect(await wake(f, f.standard.at(-1)!)).toEqual([]);
+    expect(await jobRow(f)).toEqual(before);
+    expect(passes).toBe(0);
+  }, 60_000);
+
+  test("standard: the same delayed A and duplicate (S3-style bodies) leave B's job row byte-identical and hold for B", async () => {
+    const f = await fixture();
+    f.deps.deadlineIsolation = { ...f.deps.deadlineIsolation!, current: (scope) => captureLargeReadSource(f.x.db, scope) };
+    await enqueueLargeRead(f.x.db, own);
+    markNow(f);
+    const b = (await captureLargeReadSource(f.x.db, own))!.source;
+    const before = await jobRow(f);
+    const body = JSON.stringify({ Records: [{ eventSource: "aws:s3", eventName: "ObjectCreated:Put", eventTime: new Date(f.clock.t).toISOString(),
+      s3: { bucket: { name: "replay-fixture" }, object: { key: f.key, eTag: "stale-a-etag", sequencer: "0A" } } }] });
+    for (let i = 0; i < 2; i++) {
+      f.clock.t += 1_000;
+      expect(await f.plain(body)).toEqual([]);
+      expect(await jobRow(f)).toEqual(before);
+      const hold = f.standard.at(-1)!.hold!;
+      expect({ epoch: hold.epoch, fingerprint: hold.fingerprint }).toEqual({ epoch: b.epoch, fingerprint: b.fingerprint });
+    }
+    expect(passes).toBe(0);
   }, 60_000);
 });
