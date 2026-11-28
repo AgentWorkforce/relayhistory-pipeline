@@ -300,7 +300,10 @@ The first implementation's fixed 64 MiB encoding cap is a **proof resource
 bound**, not an erase cardinality limit. Origins per owner remain unbounded.
 Preflight the exact framed octet size without constructing the bytea, including
 the raw tag, every four-byte prefix, UTF-8 field and decimal count. Arithmetic
-must not overflow; prefer preflight before materializing the target product.
+must not overflow. Preflight must precede target insertion or aggregation of
+the full target product; retaining the normalized owner/origin derivation for
+that calculation must not allocate one unbounded value or change the shared
+derivation used by capture and erase.
 An oversized capture remains unsealed and uses the unchanged legacy erase
 loop, receipts, events and 062340 recording. Do not compute the digest first
 or introduce a runtime/caller-adjustable cap. The digest helper must enforce
