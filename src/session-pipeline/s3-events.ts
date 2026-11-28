@@ -55,6 +55,16 @@ export function parseLargeReadHold(value: unknown): LargeReadHoldBody | undefine
 
 /** Where an SQS message came from, for `queue_origin`: an S3 notification, this consumer's requeue, or a sweep body. */
 export type QueueOrigin = "s3" | "requeue" | "sweep";
+/** FIFO revision events (revision-events.ts): `{"revision":{"key","etag","version","revision","committed_at","initial","deleted","source"}}`. */
+export const REVISION_BODY_KEY = "revision";
+
+/** What a FIFO revision event adds to the landed event: metadata for coalescing and latency, never content. */
+export interface RevisionMeta {
+  source: "writer" | "forward" | "reconcile";
+  revision?: number;
+  committedAt?: string;
+  initial?: boolean;
+}
 
 interface S3Record {
   eventSource?: unknown;
@@ -73,6 +83,8 @@ export interface LandedEvent extends ObjectLanded {
   oldestEventTime?: string;
   /** A deadline-isolation hold's carried expectation (LARGE_READ_HOLD_FIELD), stripped before any stage. */
   hold?: LargeReadHoldBody;
+  /** Present only on a FIFO revision event. */
+  revision?: RevisionMeta;
 }
 
 export type ParsedBody =
@@ -124,6 +136,35 @@ export function parseQueueBody(body: string, provider: StorageProvider = "s3"): 
   if (!value || typeof value !== "object" || Array.isArray(value)) return { kind: "invalid" };
   const v = value as Record<string, unknown>;
   if (v.Event === "s3:TestEvent") return { kind: "test" };
+  const rev = v[REVISION_BODY_KEY] as Record<string, unknown> | undefined;
+  if (rev && typeof rev === "object" && !Array.isArray(rev)) {
+    if (typeof rev.key !== "string" || !rev.key) return { kind: "invalid" };
+    const source = rev.source === "writer" || rev.source === "forward" || rev.source === "reconcile" ? rev.source : undefined;
+    if (!source) return { kind: "invalid" };
+    const meta: RevisionMeta = {
+      source,
+      ...(typeof rev.revision === "number" && Number.isSafeInteger(rev.revision) && rev.revision > 0 ? { revision: rev.revision } : {}),
+      ...(typeof rev.committed_at === "string" && Number.isFinite(Date.parse(rev.committed_at)) ? { committedAt: rev.committed_at } : {}),
+      ...(typeof rev.initial === "boolean" ? { initial: rev.initial } : {}),
+    };
+    const deleted = rev.deleted === true;
+    return {
+      kind: "events",
+      // queue_origin (T124 telemetry): a reconcile hint is a sweep; a writer or forwarded event stands for its S3 write.
+      origin: source === "reconcile" ? "sweep" : "s3",
+      events: [
+        {
+          provider,
+          key: rev.key,
+          ...(!deleted && typeof rev.etag === "string" && rev.etag ? { etag: rev.etag } : {}),
+          ...(!deleted && typeof rev.version === "string" && rev.version ? { version: rev.version } : {}),
+          ...(meta.committedAt ? { eventTime: meta.committedAt } : {}),
+          ...(deleted ? { deleted: true } : {}),
+          revision: meta,
+        },
+      ],
+    };
+  }
   const reconcile = v[RECONCILE_BODY_KEY] as
     | { key?: unknown; etag?: unknown; version?: unknown; [OLDEST_EVENT_TIME_FIELD]?: unknown; [REQUEUED_FIELD]?: unknown; [LARGE_READ_HOLD_FIELD]?: unknown }
     | undefined;

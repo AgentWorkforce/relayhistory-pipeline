@@ -90,6 +90,13 @@ export interface WriteTarget {
   now?: () => Date;
   sleep?: (ms: number) => Promise<void>;
   random?: () => number;
+  /**
+   * Absent by default: after a manifest CAS commits (a new revision, not a replay), the per-session
+   * FIFO revision event (src/session-pipeline/revision-events.ts writerRevisionHook). It must not
+   * throw. A failure here never fails the write: the write's own S3 notification is forwarded onto
+   * the same queue (SESSION_EVENTS_MODE=forward), and the scheduled reconcile is the net under that.
+   */
+  onManifestCommitted?: (commits: readonly { key: string; revision: number; etag?: string; version?: string; committedAt: string }[]) => Promise<void>;
 }
 
 export interface WriteBatch {
@@ -473,6 +480,15 @@ export async function writeGroups(
         } catch (error) {
           failed = true;
           throw error;
+        }
+        const m = written[i]!.manifest;
+        if (target.onManifestCommitted && m.written) {
+          try {
+            await target.onManifestCommitted([{ key: m.key, revision: m.manifest.revision, committedAt: (target.now ?? (() => new Date()))().toISOString(),
+              ...(m.version.eTag ? { etag: m.version.eTag.replace(/^"|"$/g, "") } : {}), ...(m.version.version ? { version: m.version.version } : {}) }]);
+          } catch {
+            // Never fails the write (see WriteTarget.onManifestCommitted); the forwarder carries it.
+          }
         }
       }
     }),

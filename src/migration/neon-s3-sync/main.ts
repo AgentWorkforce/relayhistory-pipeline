@@ -9,8 +9,15 @@
  *
  * Configuration (environment; secrets only through files, never argv):
  *   NEON_URL_FILE        file holding the read-only Neon URL (e.g. a <(...) fd)
- *   S3X_CREDS_FILE       writer/exporter key: {"accessKeyId","secretAccessKey","sessionToken"?}
- *                        (else AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY / AWS_SESSION_TOKEN)
+ *   S3X_CREDS_FILE       writer/exporter key: a short-lived broker mint in the AWS credential_process v1
+ *                        shape {"Version":1,"AccessKeyId","SecretAccessKey","SessionToken","Expiration"},
+ *                        or the static {"accessKeyId","secretAccessKey","sessionToken"?,"expiration"?}
+ *                        (else AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY / AWS_SESSION_TOKEN). Re-read on every
+ *                        credential refresh (a symlink the supervisor repoints is followed), so a renewed mint
+ *                        takes effect without a restart. See ../short-lived-credentials.ts.
+ *   S3X_CREDS_MIN_REMAINING_S  600 (120-3000): with an Expiration, the exporter refuses to start, and stops
+ *                        taking new groups (in-flight groups finish, the watermark is kept), once less than
+ *                        this is left on the current file; it then exits 75 for the supervisor to renew.
  *   The exporter is write-only and never loads the eraser key; deletions are
  *   queued in the state file for `neon-s3-erasure` (its own process and key).
  *   S3X_BUCKET, S3X_EXPECT_BUCKET, S3X_REGION (us-east-1), S3X_ENDPOINT (MinIO)
@@ -38,6 +45,7 @@ import { writeOnly } from "./export-session.ts";
 import { sessionReadOnly } from "./neon-reader.ts";
 import { SyncState } from "./state.ts";
 import { DEFAULT_SYNC_CONFIG, Syncer, errorCode } from "./sync.ts";
+import { EXIT_CREDENTIALS_RENEW, fileCredentialSource, minRemainingMs, type FileCredentialSource } from "../short-lived-credentials.ts";
 import { Throttle, parseWindows } from "./throttle.ts";
 
 /**
@@ -90,12 +98,7 @@ export function discardingStore(): ObjectStore {
   };
 }
 
-function credentialsFrom(file: string | undefined, fallbackEnv: boolean) {
-  if (file) {
-    const c = JSON.parse(readFileSync(file, "utf8")) as Record<string, string>;
-    if (!c.accessKeyId || !c.secretAccessKey) throw new Error("a credentials file lacks accessKeyId/secretAccessKey");
-    return { accessKeyId: c.accessKeyId, secretAccessKey: c.secretAccessKey, ...(c.sessionToken ? { sessionToken: c.sessionToken } : {}) };
-  }
+function credentialsFrom(fallbackEnv: boolean) {
   if (!fallbackEnv) return undefined;
   const accessKeyId = env("AWS_ACCESS_KEY_ID");
   const secretAccessKey = env("AWS_SECRET_ACCESS_KEY");
@@ -104,8 +107,9 @@ function credentialsFrom(file: string | undefined, fallbackEnv: boolean) {
   return { accessKeyId, secretAccessKey, ...(sessionToken ? { sessionToken } : {}) };
 }
 
-function storeFromEnv(execute: boolean): ObjectStore {
-  if (!execute) return discardingStore();
+/** The store, and (with S3X_CREDS_FILE) the credential file it reads, for the expiry checks. */
+function storeFromEnv(execute: boolean, minMs: number): { store: ObjectStore; creds?: FileCredentialSource } {
+  if (!execute) return { store: discardingStore() };
   const bucket = env("S3X_BUCKET");
   if (!bucket) throw new Error("S3X_BUCKET is required with --execute");
   if (env("S3X_EXPECT_BUCKET") !== bucket) throw new Error("S3X_EXPECT_BUCKET must equal S3X_BUCKET (write guard)");
@@ -116,7 +120,7 @@ function storeFromEnv(execute: boolean): ObjectStore {
   if (kmsKey && !/^arn:aws:kms:[a-z0-9-]+:\d{12}:key\/[0-9a-f-]{36}$/.test(kmsKey))
     throw new Error("S3X_SSE_KMS_KEY_ID must be a KMS key ARN");
   if (kmsKey && sse !== "aws:kms") throw new Error("S3X_SSE_KMS_KEY_ID needs S3X_SSE=aws:kms");
-  const store = (credentials: NonNullable<ReturnType<typeof credentialsFrom>>) =>
+  const store = (credentials: Parameters<typeof createS3Store>[0]["credentials"]) =>
     createS3Store({
       bucket,
       region: env("S3X_REGION", "us-east-1")!,
@@ -126,7 +130,13 @@ function storeFromEnv(execute: boolean): ObjectStore {
       ...(kmsKey ? { sseKmsKeyId: kmsKey } : {}),
     });
   if (env("S3X_ERASER_CREDS_FILE")) throw new Error("the exporter must not be given the eraser key");
-  return writeOnly(store(credentialsFrom(env("S3X_CREDS_FILE"), true)!));
+  const file = env("S3X_CREDS_FILE");
+  if (file) {
+    const creds = fileCredentialSource(file, { minMs });
+    creds.current(); // validate the shape now: a bad file refuses at startup, by code
+    return { store: writeOnly(store(creds.provider)), creds };
+  }
+  return { store: writeOnly(store(credentialsFrom(true)!)) };
 }
 
 /** The AWS error code (e.g. AccessDenied, InvalidAccessKeyId) from a store error: a code, never content. */
@@ -224,7 +234,22 @@ export async function main() {
   const urlFile = env("NEON_URL_FILE");
   const url = urlFile ? readFileSync(urlFile, "utf8").trim() : env("NEON_URL");
   if (!url) throw new Error("NEON_URL_FILE (or NEON_URL) is required");
-  const store = storeFromEnv(execute);
+  const minMs = minRemainingMs(env("S3X_CREDS_MIN_REMAINING_S"));
+  const { store, creds } = storeFromEnv(execute, minMs);
+  if (creds?.expiring()) {
+    log({ message: "credentials expiring", reason: "credentials_expiring_at_start" });
+    process.exit(EXIT_CREDENTIALS_RENEW);
+  }
+  // Stop taking new groups once the credential file has less than the minimum left (or is unreadable): in-flight
+  // groups finish, the watermark is kept, and the process exits EXIT_CREDENTIALS_RENEW for the supervisor to renew.
+  let credStop = false;
+  const credentialsLow = () => {
+    if (!creds || credStop) return credStop;
+    let reason: string | undefined;
+    try { if (creds.expiring()) reason = "credentials_expiring"; } catch (error) { reason = errorCode(error); }
+    if (reason) { credStop = true; log({ message: "stopping", reason }); }
+    return credStop;
+  };
   if (execute && !(await preflight(store, env("S3X_KEY_ROOT", "96bulls")!))) {
     await new Promise((r) => setTimeout(r, 10 * 60 * 1000));
     process.exit(3);
@@ -299,7 +324,8 @@ export async function main() {
     );
     log({ message: "start", execute, backend: store.backend, lanes, rates: throttle.rates(), obligations: state.obligations });
     const maxGroups = arg("max-groups");
-    await syncer.run({ once: flag("once"), ...(maxGroups ? { maxGroups: Number(maxGroups) } : {}) });
+    // Expiry drains (no new group; in-flight groups finish), never interrupts: see Syncer.run's `admit`.
+    await syncer.run({ once: flag("once"), admit: () => !credentialsLow(), ...(maxGroups ? { maxGroups: Number(maxGroups) } : {}) });
   } finally {
     state.close();
     try {
@@ -308,10 +334,13 @@ export async function main() {
     run.cleanup();
     for (const c of clients) await c.end().catch(() => undefined);
   }
+  if (credStop) process.exit(EXIT_CREDENTIALS_RENEW);
 }
 
 if (import.meta.main)
   main().catch((error) => {
-    log({ message: "exit on error", error_code: errorCode(error) });
-    process.exit(1);
+    const code = errorCode(error);
+    log({ message: "exit on error", error_code: code });
+    // A short-lived credential refused (expired before signing, unreadable, downgraded): renew and restart, not a crash.
+    process.exit(code.startsWith("short_lived_") ? EXIT_CREDENTIALS_RENEW : 1);
   });

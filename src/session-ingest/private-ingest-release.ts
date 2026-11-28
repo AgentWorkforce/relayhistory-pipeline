@@ -105,7 +105,7 @@ export function privateIngestReleaseInputs(env: Record<string, string | undefine
 const COMMON_PROFILE = {
   acceptanceMode: "buffered",
   accountId: PRIVATE_INGEST_RELEASE.accountId,
-  expectedGeneration: "778af6866b9b28b64ff5af46bc59b1d6c7de4b43e24302bf64321b222cdf23df",
+  expectedGeneration: "756520cd96fc321d91ac322d8ea5ba02602f7f25b87e0a5eb8ec6fe000a5ee6a",
   hyperdriveId: "0fcc0265e96f43a39976b5aa4263f4a6",
   secretsStoreId: "59e0dcc52f0a4bd7863730548299fb2f",
   maxPerUser: 4,
@@ -184,11 +184,15 @@ const COMMON_PROFILE = {
  * generation; H = 756520cd... is `bun src/hoopdb/migrate.ts --generation` at the frozen combined head
  * (review/sessions-authority-evidence-friday-combined @ 0a786be5). Deploy G+H, open the window, apply,
  * rebind G -> H, then H-only, then null.
+ * Done: the G+H deploy 46067726761 (version 8f2ee6b4), the guarded apply through 062350 (46074146043)
+ * and rebind 46074985564 (2026-11-27 22:11:26Z, 1294/1294 admission rows) moved the policy and marker
+ * to H. This is lifecycle step (2): deploy H-only at the same baseline phase while retaining the pair
+ * solely to authorize the G+H -> H transition; step (3) sets it to null after the live Worker reads
+ * back exactly H. Done: the H-only deploy (plan 46082562988, deploy 46082684170 at 1b0bf2cf, READBACK_PASS
+ * baseline-drain, version 4e771fe6) read back exactly 756520cd..., so lifecycle step (3) returns the contract
+ * to dormant (null).
  */
-export const PRIVATE_INGEST_OVERLAP: PrivateIngestOverlap | null = {
-  from: "778af6866b9b28b64ff5af46bc59b1d6c7de4b43e24302bf64321b222cdf23df",
-  to: "756520cd96fc321d91ac322d8ea5ba02602f7f25b87e0a5eb8ec6fe000a5ee6a",
-};
+export const PRIVATE_INGEST_OVERLAP: PrivateIngestOverlap | null = null;
 
 export const PRIVATE_INGEST_GENERATION_CONTRACT: PrivateIngestGenerationContract = {
   generation: COMMON_PROFILE.expectedGeneration,

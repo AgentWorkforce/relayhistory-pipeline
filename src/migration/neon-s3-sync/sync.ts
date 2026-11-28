@@ -264,6 +264,8 @@ export class Syncer {
         const r = await exportUnit(target, unit, lane.source, {
           // Work driven by a change must see a fence written with that change.
           freshFence: work.kind !== "recent" && work.kind !== "history",
+          // Keep each stream at its first exported location: an earlier first_ts must not fork the session (datePin).
+          priorKeys: prior?.keys,
           onLease: (k) => {
             const prefix = k.slice(0, -"manifest.json".length);
             if (!this.state.acquireLease(prefix, LEASE_HOLDER))
@@ -321,13 +323,15 @@ export class Syncer {
     } catch (error) {
       const code = errorCode(error);
       // A credential failure is not the group's: its pending keys stay recorded
-      // (recovered at the next start) and it keeps its attempts.
-      if (code !== "unauthorized") this.state.markFailed(work.org_id, work.session_id, code, [...touched], work.revision);
+      // (recovered at the next start) and it keeps its attempts. That includes a short-lived
+      // credential refused as expired before signing (short_lived_*, ../short-lived-credentials.ts).
+      const credentialFault = code === "unauthorized" || code.startsWith("short_lived_");
+      if (!credentialFault) this.state.markFailed(work.org_id, work.session_id, code, [...touched], work.revision);
       this.counters.groupsFailed += 1;
       const aws = /<Code>([A-Za-z0-9]{1,64})<\/Code>/.exec(String((error as { message?: unknown })?.message ?? ""))?.[1];
       this.log({ message: "group failed", error_code: code, kind: work.kind, ...(aws ? { aws_code: aws } : {}) });
       // A credential or permission failure is not this group's: stop rather than fail every group.
-      if (code === "unauthorized") throw error;
+      if (credentialFault) throw error;
       if (isConnectionError(error)) throw error;
       return false;
     } finally {
@@ -369,7 +373,12 @@ export class Syncer {
    * session holds only its own lane, never the others (no batch barrier).
    * Sweeps run on their own loop beside the lanes.
    */
-  async run(opts: { once?: boolean; maxGroups?: number } = {}) {
+  /**
+   * `admit` (optional) gates only NEW groups: once it returns false no lane takes another group, while groups
+   * already in flight run to completion (unlike `stopped`, which also interrupts an in-flight group's reads). The
+   * exporter uses it to drain before its credential expires.
+   */
+  async run(opts: { once?: boolean; maxGroups?: number; admit?: () => boolean } = {}) {
     // Only one exporter runs per state file (lock): leases of an earlier one are stale.
     const stale = this.state.releaseStaleLeases("exporter:", LEASE_HOLDER);
     if (stale) this.log({ message: "released stale exporter leases", count: stale });
@@ -408,6 +417,10 @@ export class Syncer {
     await Promise.allSettled(
       this.lanes.map(async (lane) => {
         while (!halt()) {
+          if (opts.admit && !opts.admit()) {
+            finished = true; // drain: no new group anywhere; in-flight groups finish
+            return;
+          }
           refill();
           const item = queue.shift();
           if (!item) {

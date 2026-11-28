@@ -1679,6 +1679,19 @@ export const ALREADY_CURRENT = "already_current";
  * too: a complete search pass can record its facts incomplete. Not detected: a change of reader ruleset,
  * origin labels or projection code that re-fingerprints rows without a pointer change.
  */
+/**
+ * DURABLE proof that a COMPLETE search pass already covers this scope's live pointer set (the consumer's
+ * superseded-only skip, consumer.ts). It is the same evidence skip-current uses (alreadyCurrent: the directory
+ * row's readiness and sources, written only by a complete pass in its own transaction and reset by any pointer
+ * change), read in one short transaction. No proof (false) means the caller must run the pass.
+ */
+export async function coverageProven(scope: SessionScope, deps: Pick<SearchIndexDeps, "transact" | "ch" | "outputFacts">): Promise<boolean> {
+  return deps.transact(async (tx) => {
+    const snapshot = await livePointerSnapshot(tx, scope);
+    return alreadyCurrent(tx, scope, snapshot, snapshot.keys.length, deps.outputFacts ? deps.ch : undefined);
+  });
+}
+
 export async function alreadyCurrent(
   tx: SqlExecutor,
   scope: SessionScope,

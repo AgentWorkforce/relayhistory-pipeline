@@ -49,7 +49,20 @@ const SEARCH_PHASE_FIELDS = ["source_read_ms", "index_scan_ms", "locked_apply_ms
   // The committed search wake's clocks (session-pipeline/search-jobs.ts, design §0): publish and pointer series.
   "commit_to_searchable_ms", "pointer_to_searchable_ms"];
 
+/**
+ * The per-session FIFO revision lines (session-pipeline/revision-events.ts, consumer.ts ordered mode): bounded
+ * counts (queue timing in ms, SQS receive count, messages coalesced into one pass, retry delay, the superseding
+ * revision number, the epoch-ms enqueue time), never a key or id.
+ */
+const REVISION_EVENT_COUNT_FIELDS = ["picked_up_at_ms", "pickup_wait_ms", "commit_to_pickup_ms", "pointer_started_at_ms", "pointer_ms", "queue_wait_ms", "start_wait_ms", "commit_to_start_ms", "pass_started_at_ms", "group_lag_ms", "receive_count", "coalesced", "delay_seconds", "superseded_by_revision", "enqueued_at_ms"];
+
 export const ALLOWED_LOG_FIELDS = new Set([
+  ...REVISION_EVENT_COUNT_FIELDS,
+  // ...and their closed values (UPLOAD_KIND_VALUES, EVENT_SOURCE_VALUES) and booleans (BOOLEAN_FIELDS).
+  "upload_kind", "event_source", "already_current", "superseded_by_delete",
+  // ...and the physical write's identity digest (revision-events.ts revisionDedupId: sha256 over key, versionId, ETag),
+  // so an internal join can reproduce it without the path. 64 hex only (INCARNATION_SHAPE); never a metric dimension.
+  "incarnation_sha256",
   // The staged run summary line: the pass was answered from a cached size refusal (search-index.ts StagedRefusals).
   "cached_refusal",
   "service", "deployment", "deployment_id", "stage", "status", "outcome", "attempt",
@@ -180,6 +193,7 @@ export const BOUNDED_COUNT_FIELDS: ReadonlyMap<string, number> = new Map([
   ...STREAM_BUDGET_FIELDS.map((f): [string, number] => [f, Number.MAX_SAFE_INTEGER]),
   ...SEARCH_PHASE_FIELDS.map((f): [string, number] => [f, Number.MAX_SAFE_INTEGER]),
   ...SUMMARY_INPUT_FIELDS.map((f): [string, number] => [f, Number.MAX_SAFE_INTEGER]),
+  ...REVISION_EVENT_COUNT_FIELDS.map((f): [string, number] => [f, Number.MAX_SAFE_INTEGER]),
 ]);
 
 function boundedCount(v: unknown, max: number): number | undefined {
@@ -221,6 +235,9 @@ export const DB_ERROR_REASON_VALUES: ReadonlySet<string> = new Set(DB_ERROR_REAS
 /** `db_internal_reason`: exactly db-error-reason.ts DB_INTERNAL_REASONS (the XX000 families plus `other`). */
 export const DB_INTERNAL_REASON_VALUES: ReadonlySet<string> = new Set(DB_INTERNAL_REASONS);
 export const REGEN_SYSTEM_VALUES: ReadonlySet<string> = new Set(["bob_costas", "brief"]);
+/** `upload_kind` / `event_source` on the revision lines (consumer.ts logSearchable; s3-events.ts RevisionMeta.source). */
+export const UPLOAD_KIND_VALUES: ReadonlySet<string> = new Set(["initial", "append", "unknown"]);
+export const EVENT_SOURCE_VALUES: ReadonlySet<string> = new Set(["writer", "forward", "reconcile"]);
 const ENUM_FIELDS: ReadonlyMap<string, ReadonlySet<string>> = new Map([
   ["queue_origin", new Set(["s3", "requeue", "sweep"])],
   // "unknown": a streamed pass's acceptance refusal, which main's streamed reader does not classify.
@@ -232,17 +249,19 @@ const ENUM_FIELDS: ReadonlyMap<string, ReadonlySet<string>> = new Map([
   ["lock_retry_outcome", LOCK_RETRY_OUTCOME_VALUES], ["feed_query", FEED_QUERY_VALUES],
   ["db_error_reason", DB_ERROR_REASON_VALUES],
   ["db_internal_reason", DB_INTERNAL_REASON_VALUES],
+  ["upload_kind", UPLOAD_KIND_VALUES], ["event_source", EVENT_SOURCE_VALUES],
 ]);
 /** Shaped fields: emitted only when the string matches its pattern AND the scrubber leaves it unchanged (else
  * dropped). `client_version` is a release version (client-agent.ts CLIENT_VERSION, pinned equal in
  * ingest-refusal-log.test.ts): never a token, hostname or hex id. */
 export const CLIENT_VERSION_SHAPE = /^[0-9]{1,5}(?:\.[0-9]{1,5}){1,3}(?:-[0-9A-Za-z.]{1,16})?$/;
 export const LOG_TAG_SHAPE = /^[0-9a-f]{8}$/;
+export const INCARNATION_SHAPE = /^[0-9a-f]{64}$/;
 /** `error_frame`: a function name only (db-error-class.ts FRAME_NAME, pinned equal); never a path, line or text. */
 export const FRAME_NAME_SHAPE = /^(?=.{1,64}$)[A-Za-z_$][A-Za-z0-9_$]*(?:\.[A-Za-z_$][A-Za-z0-9_$]*){0,3}$/;
 /** Boolean fields: emitted only when the value is `true` or `false` (else dropped), so they can never carry text or an id. */
-export const BOOLEAN_FIELDS: ReadonlySet<string> = new Set(["same_origin"]);
-const SHAPED_FIELDS: ReadonlyMap<string, RegExp> = new Map([["client_version", CLIENT_VERSION_SHAPE], ["receipt_tag", LOG_TAG_SHAPE], ["attempt_tag", LOG_TAG_SHAPE], ["error_frame", FRAME_NAME_SHAPE]]);
+export const BOOLEAN_FIELDS: ReadonlySet<string> = new Set(["same_origin", "already_current", "superseded_by_delete"]);
+const SHAPED_FIELDS: ReadonlyMap<string, RegExp> = new Map([["client_version", CLIENT_VERSION_SHAPE], ["receipt_tag", LOG_TAG_SHAPE], ["attempt_tag", LOG_TAG_SHAPE], ["error_frame", FRAME_NAME_SHAPE], ["incarnation_sha256", INCARNATION_SHAPE]]);
 
 /**
  * The one field rule shared by log lines (logLine/emit) and span attributes (telemetry.ts

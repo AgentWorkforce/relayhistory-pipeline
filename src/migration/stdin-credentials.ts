@@ -6,6 +6,7 @@
 import { createReadStream, fstatSync } from "node:fs";
 import type { ConnectionOptions } from "node:tls";
 import { postgresTlsOptions } from "../shared/postgres-tls.ts";
+import { parseCredentialDocument as parseS3CredentialDocument } from "./short-lived-credentials.ts";
 
 /** Environment names that would put a credential, or a path to one, outside RAM. Any of them refuses. */
 export const FORBIDDEN_CREDENTIAL_ENV = [
@@ -267,13 +268,19 @@ export interface S3Credentials {
   accessKeyId: string;
   secretAccessKey: string;
   sessionToken?: string;
+  /** Set for a short-lived credential (a broker mint): the caller stops before it (short-lived-credentials.ts). */
+  expiresAt?: Date;
 }
 
+/**
+ * An S3 key from the stdin document, in either shape: {accessKeyId, secretAccessKey, sessionToken?, expiration?}, or
+ * the broker's AWS credential_process v1 object {Version:1, AccessKeyId, SecretAccessKey, SessionToken, Expiration}
+ * pasted in as is. Any other key, or a malformed value, refuses with `credentials_invalid.<name>`.
+ */
 export function s3Credentials(v: unknown, name: string): S3Credentials {
-  const c = v as Record<string, unknown> | null;
-  if (!c || typeof c !== "object" || Array.isArray(c)) throw new CredentialRefusal(`credentials_invalid.${name}`);
-  for (const k of Object.keys(c)) if (!["accessKeyId", "secretAccessKey", "sessionToken"].includes(k)) throw new CredentialRefusal(`credentials_invalid.${name}`);
-  if (typeof c.accessKeyId !== "string" || !c.accessKeyId || typeof c.secretAccessKey !== "string" || !c.secretAccessKey) throw new CredentialRefusal(`credentials_invalid.${name}`);
-  if (c.sessionToken !== undefined && (typeof c.sessionToken !== "string" || !c.sessionToken)) throw new CredentialRefusal(`credentials_invalid.${name}`);
-  return { accessKeyId: c.accessKeyId, secretAccessKey: c.secretAccessKey, ...(c.sessionToken ? { sessionToken: c.sessionToken as string } : {}) };
+  try {
+    return parseS3CredentialDocument(v, name);
+  } catch {
+    throw new CredentialRefusal(`credentials_invalid.${name}`);
+  }
 }
