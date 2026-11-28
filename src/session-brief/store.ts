@@ -376,7 +376,7 @@ export async function recordBrief(
   key: SessionDirectoryKey,
   sourceRevisions: Record<string, number>,
   outcome: BriefOutcome,
-  options: { canonicalSessionId?: string; coverage?: BriefCoverageWrite; sourceBinding?: BriefSourceBinding; canonicalGeneration?: string } = {},
+  options: { canonicalSessionId?: string; coverage?: BriefCoverageWrite; sourceBinding?: BriefSourceBinding; canonicalGeneration?: string; membership?: BriefMembershipWrite } = {},
 ): Promise<{ written: boolean }> {
   const revision = Math.max(0, ...Object.values(sourceRevisions));
   // Summaries regeneration (push A): only with a coverage flag on and the columns present does a
@@ -549,6 +549,10 @@ export async function recordBrief(
       await projectBriefTitle(client, key, null);
       await clearBriefDescription(client, key);
     }
+    // Consumed-record membership (T130, 062510), in this same guarded transaction: a refused
+    // publication above returned before reaching here, so it writes no evidence either.
+    // A reused brief now covers newer revisions with the same input: its evidence is rebound too.
+    if ((outcome.status === "ready" || outcome.status === "reused") && options.membership) await writeBriefMembership(client, key, options.membership);
     await client.query("COMMIT");
     return { written: true };
   } catch (error) {
@@ -640,6 +644,40 @@ export async function briefSessionQuiet(
   const r = rows[0];
   if (r?.ended === true) return "ended_uncovered";
   return r?.idle === true ? "idle_uncovered" : null;
+}
+
+/** The records a ready brief's generator consumed: their scoped identities, and whether that list is complete. */
+export interface BriefMembershipWrite { members: readonly string[]; complete: boolean }
+
+/**
+ * Replace the session's membership evidence with `m`, bound to the brief just written (its
+ * fingerprint) and to the live pointer rows (held FOR SHARE by the caller): the binding the
+ * read function compares against. Record identities are stored only as SHA-256 digests.
+ */
+async function writeBriefMembership(db: SqlExecutor, key: SessionDirectoryKey, m: BriefMembershipWrite): Promise<void> {
+  await db.query(`DELETE FROM sessions.session_brief_evidence WHERE ${KEY}`, keyParams(key));
+  await db.query(
+    `INSERT INTO sessions.session_brief_evidence
+       (org_id, workspace_id, harness, session_id, brief_fingerprint, source_binding, member_count, complete)
+     SELECT b.org_id, b.workspace_id, b.harness, b.session_id, b.brief_fingerprint,
+            (SELECT coalesce(jsonb_object_agg(p.machine_id, jsonb_build_object(
+               'manifest_key', p.manifest_key, 'revision', p.revision, 'content_sha256', encode(p.content_sha256,'hex'),
+               'manifest_etag', p.manifest_etag, 'user_id', p.user_id, 'bucket', p.bucket,
+               'storage_provider', p.storage_provider, 'raw_format', p.raw_format)), '{}'::jsonb)
+               FROM sessions.session_index p
+              WHERE p.org_id = b.org_id AND p.workspace_id = b.workspace_id AND p.harness = b.harness
+                AND p.session_id = b.session_id AND p.deleted_at IS NULL AND p.manifest_key IS NOT NULL),
+            $5, $6
+       FROM sessions.session_briefs b WHERE ${KEY.replace(/(org_id|workspace_id|harness|session_id)/g, "b.$1")} AND b.brief_fingerprint IS NOT NULL`,
+    [...keyParams(key), m.members.length, m.complete],
+  );
+  if (m.members.length)
+    await db.query(
+      `INSERT INTO sessions.session_brief_members (org_id, workspace_id, harness, session_id, member_sha256)
+       SELECT $1, $2, $3, $4, sha256(convert_to(x, 'UTF8')) FROM unnest($5::text[]) AS x
+       ON CONFLICT DO NOTHING`,
+      [...keyParams(key), [...m.members]],
+    );
 }
 
 /**

@@ -42,6 +42,8 @@ import {
 export interface BriefConfig {
   readerMaxRuleset?: number;
   enabled: boolean;
+  /** SESSION_BRIEF_MEMBERSHIP_ENABLED="true": persist consumed-record membership with each ready brief (T130, migration 062510). Default off. */
+  membership?: boolean;
   workspaceIds?: readonly string[];
   model: string;
   idleSeconds: number;
@@ -91,6 +93,7 @@ export function briefConfig(env: NodeJS.ProcessEnv = process.env): BriefConfig {
   return {
     readerMaxRuleset: maximum,
     enabled: env.SESSION_BRIEF_ENABLED === "true",
+    ...(env.SESSION_BRIEF_MEMBERSHIP_ENABLED === "true" ? { membership: true } : {}),
     ...(workspaceIds ? { workspaceIds } : {}),
     model: model && MODEL_PATTERN.test(model) ? model : "gpt-5.6-luna",
     idleSeconds: int(env, "SESSION_BRIEF_IDLE_SECONDS", 600, 0, 86_400),

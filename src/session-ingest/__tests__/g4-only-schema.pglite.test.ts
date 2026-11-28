@@ -261,6 +261,9 @@ describe("G4-only schema: the post-G4 objects are absent", () => {
       // T130 Reader provenance (provisional slot): a new read-only summary function, v1's body plus the served
       // revision; no G4 function names it, no ingest path calls it.
       "20261105062500_session_brief_summary_v2_read.sql",
+      // T130 consumed-record membership: two new evidence tables, an owner-only trigger on session_briefs and a
+      // read-role function; no G4 function names them, no ingest path writes them.
+      "20261105062510_session_brief_membership.sql",
     ]);
     expect(() => migrationFiles(REPO_ROOT, "20261105043800_typo.sql")).toThrow(/names no migration/);
     expect(OBJECTS.newFunctions.length).toBeGreaterThan(30);

@@ -54,13 +54,18 @@ const KEPT = { table: "sessions.search_stage_archive", index: "sessions.search_s
 const HOLD_DOWN = readFileSync(join(import.meta.dir, "../../../supabase/rollbacks/20261105062320_ingest_org_admission_fences.down.sql"), "utf8");
 const HISTORY_DOWN = readFileSync(join(import.meta.dir, "../../../supabase/rollbacks/20261105062340_ingest_org_erasure_history.down.sql"), "utf8");
 const CUSTOM_PLANS_DOWN = readFileSync(join(import.meta.dir, "../../../supabase/rollbacks/20261105062330_buffered_search_feed_custom_plans.down.sql"), "utf8");
-// 20261105062500 (the brief summary v2 read) is newest: its down runs first.
+// 20261105062510 (the brief membership) is newest: its down runs first.
+const BRIEF_MEMBERSHIP_DOWN = readFileSync(join(import.meta.dir, "../../../supabase/rollbacks/20261105062510_session_brief_membership.down.sql"), "utf8");
+// 20261105062500 (the brief summary v2 read) sits above 062350: its down runs next.
 const BRIEF_SUMMARY_V2_DOWN = readFileSync(join(import.meta.dir, "../../../supabase/rollbacks/20261105062500_session_brief_summary_v2_read.down.sql"), "utf8");
 // 20261105062350 (the buffered feed page keyset) sits above 062330: its down runs next.
 const PAGE_KEYSET_DOWN = readFileSync(join(import.meta.dir, "../../../supabase/rollbacks/20261105062350_buffered_search_feed_page_keyset.down.sql"), "utf8");
 const holdOff = async (pg: PGlite) => {
-  // 20261105062500 (the brief summary v2 read) is rolled back first, then 20261105062350 (the feed page keyset),
+  // 20261105062510 (the brief membership) is rolled back first, then 20261105062500 (the brief summary v2 read),
+  // then 20261105062350 (the feed page keyset),
   // then 20261105062340 (the erasure history).
+  const briefMembership = (await pg.query<{ n: number }>("SELECT count(*)::int AS n FROM sessions.__96bulls_migrations WHERE name = 'upstream:20261105062510_session_brief_membership.sql'")).rows[0]!.n;
+  if (briefMembership) await pg.exec(BRIEF_MEMBERSHIP_DOWN);
   const briefV2 = (await pg.query<{ n: number }>("SELECT count(*)::int AS n FROM sessions.__96bulls_migrations WHERE name = 'upstream:20261105062500_session_brief_summary_v2_read.sql'")).rows[0]!.n;
   if (briefV2) await pg.exec(BRIEF_SUMMARY_V2_DOWN);
   const keyset = (await pg.query<{ n: number }>("SELECT count(*)::int AS n FROM sessions.__96bulls_migrations WHERE name = 'upstream:20261105062350_buffered_search_feed_page_keyset.sql'")).rows[0]!.n;

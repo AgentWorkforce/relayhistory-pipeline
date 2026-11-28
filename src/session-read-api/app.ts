@@ -1,4 +1,4 @@
-import { BriefSummaryError, briefSummaryResponse, briefSummaryRevision, summaryActivityDays, type BriefSummary } from "./brief-summary.ts";
+import { BriefSummaryError, briefMembershipResponse, briefSummaryResponse, briefSummaryRevision, summaryActivityDays, type BriefSummary } from "./brief-summary.ts";
 import { SummaryFallbackError, sessionSummaryBody, type SummaryFallback } from "./summary-fallback.ts";
 /**
  * The session read API: an API-compatible subset of relayhistory's /v1 read
@@ -1929,6 +1929,30 @@ export function createReadApi(deps: ReadApiDeps) {
 
   // 044100 (brief summary): the real /v1/sessions/output route is registered above (this branch);
   // main's notMigrated output placeholder is dropped to avoid a duplicate registration.
+  // T130: does the served short brief cover one record? member / not_member / unknown, never the list.
+  app.get("/v1/sessions/:sessionId/summary/membership", async (c) => {
+    try {
+      const identity=c.get("identity");
+      attestWorkspace(c,identity); requireCanary(identity,"summary"); rejectUnsupported(c);
+      if(!deps.briefSummary?.membership)throw unsupported("summary_membership_not_configured");
+      for(const name of Object.keys(c.req.query()))if(!["workspace","source","record"].includes(name))throw unsupported(`param_${name}`);
+      const source=single(c,"source"),record=single(c,"record"),sessionId=c.req.param("sessionId");
+      if(!source||!HARNESS_NAME.test(source)||!sessionId||sessionId.length>MAX_ID_CHARS)throw bad("invalid session key");
+      if(!record||record.length>512)throw bad("invalid record id");
+      const rows=await deps.briefSummary.membership(identity.orgId,identity.workspaceId,source,sessionId,record);
+      if(rows===null)throw unsupported("summary_membership_not_migrated");
+      return c.json({membership:briefMembershipResponse(rows,{...identity,source,sessionId})});
+    } catch(error) {
+      if(error instanceof BriefSummaryError) {
+        if(error.reason==="tenant_mismatch")return fail(c,new TenantMismatchError());
+        if(error.reason==="invalid_argument")return fail(c,bad("invalid session key"));
+        if(error.reason==="unqualified")return fail(c,unsupported("summary_unqualified"));
+        return c.json({error:{code:"backend_unavailable",message:"read backend unavailable"},correlationId:c.get("correlationId")},503);
+      }
+      return fail(c,error);
+    }
+  });
+
   app.get("/v1/sessions/:sessionId/summary", async (c) => {
     try {
       const identity=c.get("identity");

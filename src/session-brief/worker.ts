@@ -128,12 +128,13 @@ export async function briefSession(deps: BriefDeps, w: ClaimedWakeup): Promise<B
   const { db, config } = deps;
   let canonicalSessionId: string | undefined;
   let canonicalGeneration: string | undefined;
+  let membership: { members: string[]; complete: boolean } | undefined;
   const pointers = await livePointers(db, w);
   // The exact incarnation (manifest key + digest per machine) this attempt reads; the publish
   // refuses if any of it changed, so a re-create that reuses a revision never gets a stale brief.
   const sourceBinding = briefSourceBinding(pointers);
   const publish = (revisions: Record<string, number>, outcome: Parameters<typeof recordBrief>[3], coverage?: BriefCoverageWrite) =>
-    recordBrief(db, w, revisions, outcome, { canonicalSessionId, sourceBinding, ...(canonicalGeneration !== undefined ? { canonicalGeneration } : {}), ...(coverage ? { coverage } : {}) });
+    recordBrief(db, w, revisions, outcome, { canonicalSessionId, sourceBinding, ...(canonicalGeneration !== undefined ? { canonicalGeneration } : {}), ...(coverage ? { coverage } : {}), ...(membership ? { membership } : {}) });
   if (!pointers.length) {
     await finishWakeup(db, w, { idleSeconds: config.idleSeconds, maxWaitSeconds: config.maxWaitSeconds });
     return "gone";
@@ -168,6 +169,7 @@ export async function briefSession(deps: BriefDeps, w: ClaimedWakeup): Promise<B
     const built = deps.canonicalInput ? await deps.canonicalInput(db, w, pointers) : await buildBriefInput({ ...deps, readerMaxRuleset: config.readerMaxRuleset }, w, pointers);
     canonicalSessionId = built.canonicalSessionId;
     canonicalGeneration = built.canonicalGeneration;
+    if (config.membership && built.kind === "ready") membership = { members: built.members, complete: true };
     if (built.kind !== "ready") {
       await publish(built.sourceRevisions, { status: built.kind, error: built.error });
       await finish();

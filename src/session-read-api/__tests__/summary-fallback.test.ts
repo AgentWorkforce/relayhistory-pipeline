@@ -330,3 +330,41 @@ describe("GET /v1/sessions/:id/summary with the fallback", () => {
     }
   });
 });
+
+// T130 membership route: the parsed read-API response for one record.
+describe("GET /v1/sessions/:id/summary/membership", () => {
+  const row = (over: Record<string, unknown> = {}) => ({ org_id: "o", workspace_id: "w", harness: "codex", session_id: "s", membership: "member", brief_revision: "2", source_revisions: { "m-1": 2 }, ...over });
+  function mapi(opts: { rows?: unknown[] | null; error?: unknown; noMembership?: boolean } = {}) {
+    const asked: string[] = [];
+    const briefSummary: BriefSummary = {
+      async read() { return []; },
+      ...(opts.noMembership ? {} : { async membership(_o: string, _w: string, _s: string, _id: string, record: string) { asked.push(record); if (opts.error) throw opts.error; return (opts.rows === undefined ? [row()] : opts.rows) as never; } }),
+    };
+    const app = createReadApi({
+      verify: async (t) => { if (t !== "good") throw new AuthError(401, "invalid_token", "invalid"); return id; },
+      log: () => undefined, ch: { database: "x" } as never, liveness: memoryLiveness().liveness, completeSinceMs: 0, directoryWorkspaces: new Set(["w"]), briefSummary,
+    });
+    return { asked, get: (q: string) => app.request(`/v1/sessions/s/summary/membership?workspace=w&source=codex&${q}`, { headers: { authorization: "Bearer good" } }) };
+  }
+  test("member / not_member / unknown with the served revision; the record id is passed through and never echoed", async () => {
+    const a = mapi();
+    const r = await a.get("record=e2");
+    expect(r.status).toBe(200);
+    expect(await r.json()).toEqual({ membership: { status: "member", revision: 2, sourceRevisions: { "m-1": 2 } } });
+    expect(a.asked).toEqual(["e2"]);
+    expect(await (await mapi({ rows: [row({ membership: "not_member" })] }).get("record=x")).json()).toEqual({ membership: { status: "not_member", revision: 2, sourceRevisions: { "m-1": 2 } } });
+    expect(await (await mapi({ rows: [row({ membership: "unknown", brief_revision: null, source_revisions: null })] }).get("record=x")).json()).toEqual({ membership: { status: "unknown", revision: null, sourceRevisions: null } });
+  });
+  test("refusals map like the summary route; a malformed row is a 503; not migrated or not configured is 501", async () => {
+    expect((await mapi({ error: new BriefSummaryError("refused") }).get("record=x")).status).toBe(503);
+    expect((await mapi({ error: new BriefSummaryError("invalid_argument") }).get("record=x")).status).toBe(400);
+    expect((await mapi({ error: new BriefSummaryError("unqualified") }).get("record=x")).status).toBe(501);
+    expect((await mapi({ rows: [row({ org_id: "other" })] }).get("record=x")).status).toBe(500); // as the summary route: TenantMismatchError
+    for (const bad of [row({ membership: "maybe" }), row({ membership: "member", brief_revision: null })]) expect((await mapi({ rows: [bad] }).get("record=x")).status).toBe(503);
+    expect((await mapi({ rows: null }).get("record=x")).status).toBe(501);
+    expect((await mapi({ noMembership: true }).get("record=x")).status).toBe(501);
+    expect((await mapi().get("")).status).toBe(400);
+    expect((await mapi().get(`record=${"x".repeat(513)}`)).status).toBe(400);
+    expect((await mapi().get("record=x&extra=1")).status).toBe(501);
+  });
+});

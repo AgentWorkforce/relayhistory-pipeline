@@ -10,6 +10,24 @@ export interface BriefSummary {
  read(orgId:string, workspaceId:string, source:string, sessionId:string):Promise<BriefSummaryRow[]|null>;
  /** Ready native summaries per UTC day (counts only); null = 056000 not applied. Absent = 501. */
  activity?(orgId:string, workspaceId:string, since:Date, until:Date):Promise<SummaryActivityRow[]|null>;
+ /** T130: one record's membership in the served brief; null = 062510 not applied. Absent = 501. */
+ membership?(orgId:string, workspaceId:string, source:string, sessionId:string, recordId:string):Promise<BriefMembershipRow[]|null>;
+}
+export interface BriefMembershipRow {
+ org_id:string; workspace_id:string; harness:string; session_id:string;
+ membership:string; brief_revision:number|string|bigint|null; source_revisions:Record<string,number>|null;
+}
+export const BRIEF_MEMBERSHIP_SIGNATURE="sessions.session_brief_membership_for(text,text,text,text)";
+const MEMBERSHIP=["member","not_member","unknown"] as const;
+/** The API shape of one membership answer; the record id is never echoed back. */
+export function briefMembershipResponse(rows:readonly BriefMembershipRow[], scope:{orgId:string;workspaceId:string;source:string;sessionId:string}) {
+ if(rows.length!==1)throw new BriefSummaryError("parse");
+ const row=rows[0]!;
+ if(row.org_id!==scope.orgId||row.workspace_id!==scope.workspaceId)throw new BriefSummaryError("tenant_mismatch");
+ if(row.harness!==scope.source||row.session_id!==scope.sessionId||!(MEMBERSHIP as readonly string[]).includes(row.membership))throw new BriefSummaryError("parse");
+ const revision=row.brief_revision===null?null:briefSummaryRevision([{...row,description:"",model:"",generated_at:new Date(0),brief_revision:row.brief_revision}]);
+ if(row.membership!=="unknown"&&revision===null)throw new BriefSummaryError("parse");
+ return {status:row.membership as typeof MEMBERSHIP[number],revision,sourceRevisions:row.source_revisions??null};
 }
 export interface SummaryActivityRow { day:Date|string; total:number|string|bigint; }
 export class BriefSummaryError extends Error {
@@ -33,6 +51,14 @@ export function sqlBriefSummary(run:TenantRunner):BriefSummary {
    const v2=installed.rows[0]?.v2===true;
    if(!v2&&!installed.rows[0]?.v1)return null;
    try { return (await q.query<BriefSummaryRow>(v2?"SELECT * FROM sessions.session_brief_summary_v2_for($1,$2,$3)":"SELECT * FROM sessions.session_brief_summary_for($1,$2,$3)",[workspaceId,source,sessionId])).rows; }
+   catch(e) {mapSummaryError(e);}
+  });
+ },
+ async membership(orgId,workspaceId,source,sessionId,recordId) {
+  return run(orgId,workspaceId,async q=>{
+   const installed=await q.query<{installed:boolean}>("SELECT to_regprocedure($1) IS NOT NULL AS installed",[BRIEF_MEMBERSHIP_SIGNATURE]);
+   if(!installed.rows[0]?.installed)return null;
+   try { return (await q.query<BriefMembershipRow>("SELECT * FROM sessions.session_brief_membership_for($1,$2,$3,$4)",[workspaceId,source,sessionId,recordId])).rows; }
    catch(e) {mapSummaryError(e);}
   });
  },

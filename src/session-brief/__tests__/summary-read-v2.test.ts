@@ -51,14 +51,16 @@ test("v2 is v1's row plus the served revision and source revisions", async () =>
   expect(await served(pg)).toEqual({ description: "First.", revision: 1 });
 }), 60000);
 
-test("acceptance: an append (E2) is absent from the old capture, and present once consumed", async () => withDb(async (pg) => {
+// REVISION PROVENANCE ONLY: recordBrief is called with supplied revisions, so E2 is never fed through
+// generation here. Proof that the generator consumed E2 is membership (summary-membership.test.ts).
+test("revision provenance: a brief at the old revision is not served once E2 commits; the brief recorded at revision 2 reports it", async () => withDb(async (pg) => {
   await recordBrief(hoopDb(pg), KEY, { "m-1": 1 }, ready("Before E2."));
   expect(await served(pg)).toEqual({ description: "Before E2.", revision: 1 });
   // E2 commits (revision 2, backdated events included): the old capture does not cover it and is not served.
   await pointer(pg, { revision: 2, manifestKey: "manifest/s-1/m-1/r2" });
   expect(await v2(pg)).toEqual([]);
   expect(await served(pg)).toEqual({ description: null, revision: null });
-  // The brief that consumed E2 is served, and its revision proves it covers E2.
+  // A brief recorded at revision 2 is served and reports revision 2 (provenance only, not consumption).
   await recordBrief(hoopDb(pg), KEY, { "m-1": 2 }, ready("After E2."));
   expect(await served(pg)).toEqual({ description: "After E2.", revision: 2 });
   expect((await v2(pg))[0]).toMatchObject({ source_revisions: { "m-1": 2 } });

@@ -64,7 +64,9 @@ export interface BriefPointer {
 }
 
 export type BriefInput = (
-  | { kind: "ready"; input: SessionSummaryInput; sourceRevisions: Record<string, number> }
+  | { kind: "ready"; input: SessionSummaryInput; sourceRevisions: Record<string, number>;
+      /** The scoped identities (eventUid) of every record the summary input contains, in input order. */
+      members: string[] }
   | { kind: "quarantined" | "empty" | "ineligible"; error: string; sourceRevisions: Record<string, number> }
 ) & {
   canonicalSessionId?: string;
@@ -370,6 +372,25 @@ export async function buildBriefInput(
   return briefInputFromEvents(key, sourceRevisions, collected);
 }
 
+/**
+ * The events summaryInput (vendored engine, unchanged) sends to the model, in input order: the same
+ * filter and order as its message selection. Consumed-record membership is built from this; the
+ * engine is hash-pinned, so this mirrors it and summary-membership.test.ts guards against drift
+ * (same count and the same texts as summaryInput's messages, before truncation).
+ */
+export function summaryMessages(source: string, sessionId: string, events: readonly NormalizedEvent[]): NormalizedEvent[] {
+  return events
+    .filter(
+      (event) =>
+        event.source === source &&
+        event.sessionId === sessionId &&
+        (event.role === "user" || event.role === "assistant") &&
+        event.kind === "text" &&
+        event.text?.trim(),
+    )
+    .sort((a, b) => a.tsMs - b.tsMs || a.id - b.id);
+}
+
 /** Same bounded model-input contract for raw transcript and verified canonical replay. */
 export function briefInputFromEvents(
   key: { harness: string; sessionId: string },
@@ -390,10 +411,12 @@ export function briefInputFromEvents(
   if (messages.length > SESSION_SUMMARY_MAX_MESSAGES)
     return { kind: "ineligible", error: "session_analysis_ineligible", sourceRevisions };
   try {
+    const input = summaryInput(key.harness, key.sessionId, events);
     return {
       kind: "ready",
-      input: summaryInput(key.harness, key.sessionId, events),
+      input,
       sourceRevisions,
+      members: summaryMessages(key.harness, key.sessionId, events).map((e) => e.eventUid),
     };
   } catch {
     // relayhistory request-processor: "Every analyzed session must also be briefable."

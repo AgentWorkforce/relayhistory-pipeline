@@ -2723,11 +2723,36 @@ describe("function boundary: ACL manifest, residual, activation gate", () => {
       const open = src.indexOf(tag, start) + tag.length;
       return src.slice(open, src.indexOf(tag, open));
     };
-    // 20261105062500 (T130 summary read v2, provisional slot) is newest: 062350's down refuses (55000) while it is
-    // applied; its checksum-pinned down drops only the v2 read function and its ledger row (v1 stays), and refuses on a rerun.
+    // 20261105062510 (T130 consumed-record membership) is newest: 062500's down refuses (55000) while it is applied;
+    // its checksum-pinned down drops the membership read function, the retirement trigger and its function, and both
+    // evidence tables, removes its ledger row (062500's v2 read stays), and refuses on a rerun.
     const SV2 = "upstream:20261105062500_session_brief_summary_v2_read.sql";
     const SV2_RPC = "sessions.session_brief_summary_v2_for(text,text,text)";
     const fnExists = async (sig: string) => (await db.query<{ e: boolean }>("SELECT to_regprocedure($1) IS NOT NULL AS e", [sig])).rows[0]!.e;
+    const MEMBERSHIP = "upstream:20261105062510_session_brief_membership.sql";
+    const MEMBERSHIP_RPC = "sessions.session_brief_membership_for(text,text,text,text)";
+    const RETIRE_FN = "sessions.session_brief_evidence_retire()";
+    const retireTrigger = async () =>
+      (await db.query<{ n: number }>("SELECT count(*)::int n FROM pg_trigger WHERE tgrelid='sessions.session_briefs'::regclass AND tgname='session_brief_evidence_retire'")).rows[0]!.n;
+    expect(await names()).toContain(MEMBERSHIP);
+    expect(await fnExists(MEMBERSHIP_RPC)).toBe(true);
+    expect(await fnExists(RETIRE_FN)).toBe(true);
+    expect(await retireTrigger()).toBe(1);
+    expect(await relation("sessions.session_brief_evidence")).toBe("sessions.session_brief_evidence");
+    expect(await relation("sessions.session_brief_members")).toBe("sessions.session_brief_members");
+    expect((await failure(rollback("20261105062500_session_brief_summary_v2_read.down.sql")))?.code).toBe("55000");
+    await rollback("20261105062510_session_brief_membership.down.sql");
+    expect(await names()).not.toContain(MEMBERSHIP);
+    expect(await fnExists(MEMBERSHIP_RPC)).toBe(false);
+    expect(await fnExists(RETIRE_FN)).toBe(false);
+    expect(await retireTrigger()).toBe(0);
+    expect(await relation("sessions.session_brief_evidence")).toBe(null);
+    expect(await relation("sessions.session_brief_members")).toBe(null);
+    expect(await names()).toContain(SV2);
+    expect(await fnExists(SV2_RPC)).toBe(true);
+    expect((await failure(rollback("20261105062510_session_brief_membership.down.sql")))?.code).toBe("55000");
+    // 20261105062500 (T130 summary read v2, provisional slot) is then newest: 062350's down refuses (55000) while it is
+    // applied; its checksum-pinned down drops only the v2 read function and its ledger row (v1 stays), and refuses on a rerun.
     expect(await names()).toContain(SV2);
     expect(await fnExists(SV2_RPC)).toBe(true);
     expect((await failure(rollback("20261105062350_buffered_search_feed_page_keyset.down.sql")))?.code).toBe("55000");

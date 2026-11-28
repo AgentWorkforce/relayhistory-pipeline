@@ -149,6 +149,7 @@ BEGIN
          'sessions.read_api_token_verify(text,timestamp with time zone)',
          'sessions.relayfacts_list_v1(text,text,text,timestamp with time zone,uuid,integer)',
          'sessions.relayfacts_topics_v1(text,text)',
+         'sessions.session_brief_membership_for(text,text,text,text)',
          'sessions.session_brief_summary_for(text,text,text)',
          'sessions.session_brief_summary_v2_for(text,text,text)',
          'sessions.session_brief_titles_for(text,text[],text[])',

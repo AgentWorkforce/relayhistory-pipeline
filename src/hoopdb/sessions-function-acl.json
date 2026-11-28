@@ -1664,6 +1664,13 @@
     "sessions.session_brief_document_json(sessions.session_directory,boolean)": [
       "<owner>:EXECUTE"
     ],
+    "sessions.session_brief_evidence_retire()": [
+      "<owner>:EXECUTE"
+    ],
+    "sessions.session_brief_membership_for(text,text,text,text)": [
+      "<owner>:EXECUTE",
+      "bulls96_read_api:EXECUTE"
+    ],
     "sessions.session_brief_summary_for(text,text,text)": [
       "<owner>:EXECUTE",
       "bulls96_read_api:EXECUTE"
