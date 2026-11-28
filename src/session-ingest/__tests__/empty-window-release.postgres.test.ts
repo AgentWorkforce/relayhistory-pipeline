@@ -8,6 +8,8 @@
  *   2 release first: an erasure write waits for the in-flight release (the recorder's SHARED org key), resumes after it
  *     commits, and takes effect under post-release authority (recorded after released_at)
  *   3 an erasure through the checked entry point ('erasure' class, never refused) is serialized the same way
+ *   4 the cutoff is the bound FULL start minus the margin, never a caller value: an erase committed just before the
+ *     install is counted at that cutoff (refused, held), and a later cutoff that would miss it is refused before the lock
  */
 import { afterEach, describe, expect, setDefaultTimeout, test } from "bun:test";
 import pg from "pg";
@@ -43,7 +45,8 @@ async function owner(db: ScratchDatabase) {
 const deletion = (session: string) =>
   `INSERT INTO sessions.upload_deletions(org_id,workspace_id,user_id,origin_id,source,session_id) VALUES('${ORG}','ws','u','o','claude','${session}')`;
 /** install, seal (the FULL receipt), bind the FULL (1 ms after the install), attempt the marker: the release input. */
-async function toAttempt(o: pg.Client): Promise<EmptyReleaseInput> {
+async function toAttempt(o: pg.Client, before?: string): Promise<EmptyReleaseInput> {
+  if (before !== undefined) await o.query(deletion(before)); // committed immediately before the install
   const e = (await o.query("SELECT sessions.ingest_org_admission_hold_install($1, gen_random_uuid())::text e", [ORG])).rows[0].e as string;
   await o.query("SELECT pg_sleep(0.003)");
   await o.query(`SELECT sessions.ingest_org_admission_hold_seal($1,$2::uuid,'${SEAL}')`, [ORG, e]);
@@ -108,6 +111,22 @@ describe.skipIf(!url)("empty-window release, two-connection orderings (real Post
       wait: { begin: RC, op: (c) => releaseEmptyWindowIn(c, input, Date.now, WAVE) } });
     expect(r.receipt.query).toBe(EMPTY_RELEASE_LOCK_SQL);
     expect(r.waited.ok && r.waited.value).toMatchObject({ status: "refused", code: "release_window_nonempty" });
+    expect((await hold(o, input.epoch)).state).toBe("marker_attempted");
+  });
+
+  test("4. the cutoff is bound to the FULL start: an erase just before the install is counted; a later cutoff is refused before the lock", async () => {
+    const db = await database();
+    const o = await owner(db);
+    const input = await toAttempt(o, "s-pre-install");
+    const run = async (a: EmptyReleaseInput) => {
+      await o.query(RC);
+      try { return await releaseEmptyWindowIn(o, a, Date.now, WAVE); } finally { await o.query("ROLLBACK"); }
+    };
+    const r = await run(input);
+    expect(r).toMatchObject({ status: "refused", code: "release_window_nonempty" });
+    expect(r.proof?.sources?.upload_deletions).toBe(1);
+    expect(r.proof?.watermark_erasures).toBe(0); // the history starts at the install: only the snapshot sees it
+    expect(await run({ ...input, cutoffMs: input.fullStartedMs })).toMatchObject({ status: "refused", code: "release_binding_mismatch", proof: null });
     expect((await hold(o, input.epoch)).state).toBe("marker_attempted");
   });
 });

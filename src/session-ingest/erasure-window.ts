@@ -18,6 +18,7 @@
  * release (proofFresh) narrows it to that window.
  */
 import { createHash } from "node:crypto";
+import { BACKLOG_OPS_CATCHUP_MARGIN_MS } from "./backlog-ops.ts";
 
 /**
  * Every per-org erasure-lane source, enumerated from the schema (supabase/migrations), with how a row counts as "in the
@@ -315,6 +316,11 @@ export async function releaseEmptyWindowIn(tx: Tx, a: EmptyReleaseInput, now: ()
   wave: readonly string[] = EMPTY_RELEASE_WAVE_ORG_HASHES): Promise<EmptyReleaseResult> {
   // The wave-1 exception only: an org outside it is refused before the lock or any read.
   if (!UUID.test(a.org) || !wave.includes(orgHash(a.org))) return { status: "refused", code: "release_org_not_in_wave", proof: null };
+  // The window's cutoff is not a free input: it is the bound FULL's start minus the gate's catch-up margin (the gate's
+  // t, backlog-ops.ts BACKLOG_OPS_CATCHUP_MARGIN_MS), exactly as bridge-dry derives it. A later cutoff would hide an
+  // erasure between the true cutoff and the install from the snapshot sources. Refused before the lock or any read.
+  if (!Number.isSafeInteger(a.cutoffMs) || !Number.isSafeInteger(a.fullStartedMs) || a.cutoffMs !== a.fullStartedMs - BACKLOG_OPS_CATCHUP_MARGIN_MS)
+    return { status: "refused", code: "release_binding_mismatch", proof: null };
   const sqlRefusal = (e: unknown, proof: ErasureWindowProof | null): EmptyReleaseResult => {
     const c = (e as { code?: unknown }).code;
     return { status: "refused", code: "release_sql_refused", ...(typeof c === "string" && /^[0-9A-Z]{5}$/u.test(c) ? { sqlstate: c } : {}), proof };

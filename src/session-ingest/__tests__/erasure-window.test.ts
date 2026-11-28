@@ -368,6 +368,34 @@ test("real 062320/062340: the empty-window release takes the org key, re-reads t
   expect(await state()).toBe("marker_attempted");
 });
 
+test("real 062320/062340: the release cutoff is the bound FULL start minus the margin, never a caller value (an erase just before the install)", async () => {
+  const d = await realDb();
+  const ORG7 = "77777777-3333-4333-8444-555555555555";
+  const one = async (sql: string, p: unknown[] = []) => (await d.query<Record<string, unknown>>(sql, p)).rows[0]!;
+  // An erasure committed immediately before the install: outside the history (it predates the fence), inside the
+  // snapshot window from the true cutoff (FULL start - 15 min).
+  await d.query("INSERT INTO sessions.upload_deletions (org_id, workspace_id, user_id, origin_id, source, session_id) VALUES ($1, 'w', 'u', 'o', 'claude', 's-pre')", [ORG7]);
+  const e = (await one("SELECT sessions.ingest_org_admission_hold_install($1, gen_random_uuid())::text e", [ORG7])).e as string;
+  await d.query("SELECT pg_sleep(0.003)");
+  await d.query("SELECT sessions.ingest_org_admission_hold_seal($1, $2::uuid, $3)", [ORG7, e, EV]);
+  const started = Number((await one("SELECT floor(extract(epoch FROM installed_at) * 1000)::bigint + 1 AS ms FROM sessions.ingest_org_admission_holds WHERE epoch = $1::uuid", [e])).ms);
+  await d.query("SELECT sessions.ingest_org_erasure_history_bind($1, $2::uuid, $3, $4::bigint, $5)", [ORG7, e, FULL, String(started), EV]);
+  await d.query(`SELECT sessions.ingest_org_admission_hold_marker_attempt($1, $2::uuid, '${"c".repeat(64)}')`, [ORG7, e]);
+  await d.query("SELECT pg_sleep(0.003)");
+  const base = { org: ORG7, epoch: e, fullRun: FULL, fullEvidence: EV, fullStartedMs: started };
+  const wave = [orgHash(ORG7)];
+  const state = async () => (await one("SELECT state FROM sessions.ingest_org_admission_holds WHERE epoch = $1::uuid", [e])).state;
+  // The true cutoff counts the pre-install erasure: refused, held.
+  const r = await releaseEmptyWindow(d, { ...base, cutoffMs: started - 15 * 60_000 }, Date.now, wave);
+  expect(r.status === "refused" && [r.code, r.proof?.sources?.upload_deletions, r.proof?.watermark_erasures]).toEqual(["release_window_nonempty", 1, 0]);
+  // Any other cutoff (the FULL start itself, which would miss it; or earlier; or one ms off) is refused before the lock.
+  for (const cutoffMs of [started, started - 15 * 60_000 + 1, started - 15 * 60_000 - 1, started - 30 * 60_000]) {
+    const x = await releaseEmptyWindow(d, { ...base, cutoffMs }, Date.now, wave);
+    expect(x.status === "refused" && [x.code, x.proof]).toEqual(["release_binding_mismatch", null]);
+  }
+  expect(await state()).toBe("marker_attempted");
+});
+
 test("real 062320/062340: an empty window on an attempted, bound epoch releases with bridge_complete / erasure_window_empty and the proof's evidence", async () => {
   const d = await realDb();
   const ORG6 = "66666666-2222-4333-8444-555555555555";
