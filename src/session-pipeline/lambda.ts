@@ -748,7 +748,7 @@ export async function reconcileRecent(deps: ReconcileDeps): Promise<ReconcileSum
   do {
     const page = await deps.store.list(objectKey(deps.keyPrefix), cursor);
     summary.pages += 1;
-    const recent: { key: string; etag?: string; version?: string; loc: SessionLocation }[] = [];
+    const recent: { key: string; etag?: string; version?: string; lastModified: string; loc: SessionLocation }[] = [];
     for (const item of page.items) {
       const key = String(item.key);
       if (!key.endsWith("/manifest.json")) continue;
@@ -756,7 +756,8 @@ export async function reconcileRecent(deps: ReconcileDeps): Promise<ReconcileSum
       if (item.lastModified.getTime() < since) continue;
       const loc = parseSessionKey(key);
       if (!loc || loc.rest !== "manifest.json" || !loc.prefix) continue;
-      recent.push({ key, ...(item.version.eTag ? { etag: item.version.eTag.replace(/^"|"$/g, "") } : {}), ...(item.version.version ? { version: item.version.version } : {}), loc });
+      recent.push({ key, ...(item.version.eTag ? { etag: item.version.eTag.replace(/^"|"$/g, "") } : {}), ...(item.version.version ? { version: item.version.version } : {}),
+        lastModified: item.lastModified.toISOString(), loc });
     }
     summary.recent += recent.length;
     if (recent.length > 0) {
@@ -777,7 +778,8 @@ export async function reconcileRecent(deps: ReconcileDeps): Promise<ReconcileSum
       for (const r of recent) {
         const row = indexed.get(r.key);
         if (row && !row.deleted && row.manifest_etag && row.manifest_etag === r.etag) continue;
-        await deps.send(JSON.stringify({ [RECONCILE_BODY_KEY]: { key: r.key, etag: r.etag, version: r.version } }));
+        // last_modified: the listed object's last PUT, i.e. the live manifest's commit time (backstop recovery measurement).
+        await deps.send(JSON.stringify({ [RECONCILE_BODY_KEY]: { key: r.key, etag: r.etag, version: r.version, last_modified: r.lastModified } }));
         summary.enqueued += 1;
       }
     }
@@ -820,11 +822,14 @@ export function revisionWiring(env: Pick<LambdaEnv, "revisionEvents" | "region">
  * so a manifest whose commit succeeded but whose notification or enqueue was lost re-enters its
  * session's group in order. A send that fails throws, so the reconcile run reports it.
  */
-export async function sendReconcileRevision(sender: RevisionSender, body: string, nonce: string): Promise<void> {
+export async function sendReconcileRevision(sender: RevisionSender, body: string, nonce: string, attempt?: number): Promise<void> {
   const parsed = parseQueueBody(body);
   if (parsed.kind !== "events") throw new Error("reconcile body unreadable");
+  // committedAt: the listing's last_modified (the live manifest's commit), so a recovered manifest's lines carry
+  // commit_to_pickup_ms etc. attempt: the reconcile chain link that enqueued it, joinable to 'reconcile finished'.
   const { failed } = await sendRevisions(sender, parsed.events.map((e) => ({ key: e.key, ...(e.etag ? { etag: e.etag } : {}),
-    ...(e.version ? { version: e.version } : {}), nonce, source: "reconcile" as const })));
+    ...(e.version ? { version: e.version } : {}), ...(e.eventTime ? { committedAt: e.eventTime } : {}),
+    ...(attempt !== undefined ? { attempt } : {}), nonce, source: "reconcile" as const })));
   if (failed.length) throw new Error("reconcile revision enqueue failed");
 }
 
@@ -841,7 +846,7 @@ async function runReconcile(rt: Runtime, event: ReconcileEvent) {
     send: async (body) => {
       const wiring = revisionWiring(env);
       // One recovery hint per key per chain link (revision-events.ts RevisionEvent.nonce).
-      if (wiring?.config.mode === "forward") return sendReconcileRevision(wiring.sender, body, `${since.toISOString()}#${event.link ?? 0}`);
+      if (wiring?.config.mode === "forward") return sendReconcileRevision(wiring.sender, body, `${since.toISOString()}#${event.link ?? 0}`, event.link ?? 0);
       await awsJsonCall({
         service: "sqs",
         target: "AmazonSQS.SendMessage",
