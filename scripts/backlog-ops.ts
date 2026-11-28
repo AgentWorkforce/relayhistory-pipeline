@@ -365,8 +365,8 @@ export async function backlogOpsRun(
   const nhp = backlogOpsNoHeadParity(env, d, scope);
   for (const org of nhp?.orgs ?? []) console.log(`::add-mask::${org}`);
   const since = backlogOpsRevisionsSince(env, d);
-  // The wave-1 enable (backlog-ops.ts): a marker or hold execute only for a scope wholly inside its reviewed allow-list,
-  // checked before any credential (a no-op where the global switch is on).
+  // The wave-1 enable (backlog-ops.ts): a marker or hold execute only for a scope whose org hashes are exactly the reviewed pair,
+  // checked before any credential. It always applies: no global switch or legacy boolean skips it.
   const scopeHashes = scope.orgs ? scope.orgs.map((o) => evidenceHash("org", o)) : null;
   const lists = deps.enabledOrgHashes ?? BACKLOG_OPS_ENABLED_ORG_HASHES;
   if (d.mode === "marker-execute") requireScopeEnabled(scopeHashes, lists, "marker", "backlog_ops_marker_scope_not_enabled");
