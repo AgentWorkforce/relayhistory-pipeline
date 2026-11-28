@@ -6,8 +6,8 @@ import * as AWS from "@alchemy.run/aws";
 import { SESSION_PIPELINE_RESOURCES } from "../session-pipeline.ts";
 import {
   OUTCOME_ALARM_DEFAULTS,
-  READ_REQUESTS_FILTER_PATTERN,
-  READ_UNAVAILABLE_FILTER_PATTERN,
+  REPLAY_REQUESTS_FILTER_PATTERN,
+  REPLAY_UNAVAILABLE_FILTER_PATTERN,
   SESSION_READ_API_RESOURCES,
   sessionReadApiOutcomeAlarm,
   sessionReadApiOutcomeMetricFilters,
@@ -74,7 +74,7 @@ describe("session read api: deploy plan contract", () => {
   });
 
   // The outcome alarm and its two metric filters, added once everything else is applied: a rollout of their own.
-  const outcome = { "session-read-api-outcome-alarm": "create", "session-read-api-requests-metric": "create", "session-read-api-unavailable-metric": "create" };
+  const outcome = { "session-read-api-outcome-alarm": "create", "session-read-api-replay-requests-metric": "create", "session-read-api-replay-unavailable-metric": "create" };
 
   it("rollout of the outcome alarm and its metric filters alone, and refused alongside anything else", () => {
     expect(check(plan(outcome, withApi))).toBe("session read api rollout");
@@ -82,7 +82,7 @@ describe("session read api: deploy plan contract", () => {
     expect(() => check(plan({ ...outcome, "session-read-api": "update" }, withBoth))).toThrow(/read api changes alone/);
     expect(() => check(plan({ ...outcome, "session-pipeline": "update" }, withBoth))).toThrow(/read api changes alone/);
     expect(() => check(plan({ ...outcome, transcripts: "update" }, withBoth))).toThrow(/read api changes alone/);
-    expect(() => check(plan({ "session-read-api-requests-metric": "replace" }, withBoth))).toThrow(/forbidden action replace/);
+    expect(() => check(plan({ "session-read-api-replay-requests-metric": "replace" }, withBoth))).toThrow(/forbidden action replace/);
     expect(() => check(plan(outcome, withBoth.filter((r) => r !== "session-read-api-outcome-alarm")))).toThrow(/missing resource session-read-api-outcome-alarm/);
   });
 
@@ -267,43 +267,35 @@ describe("session read api: reserved concurrency and alarms", () => {
   });
 });
 
-describe("session read api: outcome alarm (501/503 share of /v1 reads)", () => {
+describe("session read api: outcome alarm (501/503 share of session replay requests)", () => {
   const names = sessionReadApiNames(STAGE);
   const fn = "96bulls-aws-sessions-prod-session-read-api";
   const ns = "96bulls/aws-sessions-prod/session-read-api";
 
-  it("counts each /v1 request line once, and the 501/503 ones, from the function's log group", () => {
+  it("counts each session replay request line once, and the 501/503 ones, from the function's log group", () => {
     const filters = sessionReadApiOutcomeMetricFilters({ stage: STAGE, names, logGroupName: `/aws/lambda/${fn}` });
-    expect(filters.map(([id]) => id)).toEqual(["session-read-api-requests-metric", "session-read-api-unavailable-metric"]);
+    expect(filters.map(([id]) => id)).toEqual(["session-read-api-replay-requests-metric", "session-read-api-replay-unavailable-metric"]);
     expect(filters.map(([id]) => id).every((id) => (SESSION_READ_API_RESOURCES as readonly string[]).includes(id))).toBe(true);
     expect(filters[0][1]).toEqual({
       logGroupName: `/aws/lambda/${fn}`,
-      filterName: `${fn}-read-requests`,
-      filterPattern: '{ $.message = "session read" && $.route = "/v1/*" && $.duration_ms >= 0 }',
-      metricTransformations: [{ metricName: "ReadRequests", metricNamespace: ns, metricValue: "1", defaultValue: 0, unit: "Count" }],
+      filterName: `${fn}-replay-requests`,
+      filterPattern: '{ $.message = "session read" && $.route = "/v1/sessions/:sessionId/events" && $.duration_ms >= 0 }',
+      metricTransformations: [{ metricName: "ReplayRequests", metricNamespace: ns, metricValue: "1", defaultValue: 0, unit: "Count" }],
     });
     expect(filters[1][1]).toEqual({
       logGroupName: `/aws/lambda/${fn}`,
-      filterName: `${fn}-read-unavailable`,
-      filterPattern: '{ $.message = "session read" && $.route = "/v1/*" && $.duration_ms >= 0 && ($.status = 501 || $.status = 503) }',
-      metricTransformations: [{ metricName: "ReadUnavailable", metricNamespace: ns, metricValue: "1", defaultValue: 0, unit: "Count" }],
+      filterName: `${fn}-replay-unavailable`,
+      filterPattern: '{ $.message = "session read" && $.route = "/v1/sessions/:sessionId/events" && $.duration_ms >= 0 && ($.status = 501 || $.status = 503) }',
+      metricTransformations: [{ metricName: "ReplayUnavailable", metricNamespace: ns, metricValue: "1", defaultValue: 0, unit: "Count" }],
     });
     // The unavailable filter is the request filter narrowed, so the share can never exceed 100%.
-    expect(READ_UNAVAILABLE_FILTER_PATTERN.startsWith(READ_REQUESTS_FILTER_PATTERN.slice(0, -2))).toBe(true);
-  });
-
-  it("the patterns match the line the app actually writes: once per request, with route, status and duration_ms", () => {
+    expect(REPLAY_UNAVAILABLE_FILTER_PATTERN.startsWith(REPLAY_REQUESTS_FILTER_PATTERN.slice(0, -2))).toBe(true);
+    // The route is the one the app registers (the emitted lines themselves: session-read-api-outcome.test.ts).
     const app = readFileSync(fileURLToPath(new URL("../../../src/session-read-api/app.ts", import.meta.url)), "utf8");
-    const lambda = readFileSync(fileURLToPath(new URL("../../../src/session-read-api/lambda.ts", import.meta.url)), "utf8");
-    expect(lambda).toContain('log: (fields) => log.info("session read", fields),');
-    expect(app).toMatch(/app\.use\("\*", async \(c, next\) => \{[\s\S]*?await next\(\);[\s\S]*?log\(\{\n\s+route: c\.req\.routePath, status: c\.res\.status, duration_ms: durationMs,/);
-    // The handler's own reason lines carry no duration_ms, so they are not counted twice.
-    const reasonLines = [...app.matchAll(/log\(\{ route: [^\n]*reason: [^\n]*\}\);/g)].map((m) => m[0]);
-    expect(reasonLines.length).toBeGreaterThan(3);
-    for (const line of reasonLines) expect(line).not.toContain("duration_ms");
+    expect(app).toContain('app.get("/v1/sessions/:sessionId/events", async (c) => {');
   });
 
-  it("defaults: >50% of reads 501/503 over 30 minutes, at least 20 reads, actions as the other read api alarms", () => {
+  it("defaults: >50% of replay requests 501/503 over 30 minutes, at least 20 of them, actionless like the other read api alarms", () => {
     expect(OUTCOME_ALARM_DEFAULTS).toEqual({ thresholdPercent: 50, windowMinutes: 30, minRequests: 20 });
     const [id, props] = sessionReadApiOutcomeAlarm({ stage: STAGE, names, p: { completeSince: "epoch" } });
     expect(id).toBe("session-read-api-outcome-alarm");
@@ -318,11 +310,15 @@ describe("session read api: outcome alarm (501/503 share of /v1 reads)", () => {
       EvaluationPeriods: 1,
       DatapointsToAlarm: 1,
       Metrics: [
-        { Id: "requests", MetricStat: { Metric: { Namespace: ns, MetricName: "ReadRequests" }, Period: 1800, Stat: "Sum" }, ReturnData: false },
-        { Id: "unavailable", MetricStat: { Metric: { Namespace: ns, MetricName: "ReadUnavailable" }, Period: 1800, Stat: "Sum" }, ReturnData: false },
+        { Id: "requests", MetricStat: { Metric: { Namespace: ns, MetricName: "ReplayRequests" }, Period: 1800, Stat: "Sum" }, ReturnData: false },
+        { Id: "unavailable", MetricStat: { Metric: { Namespace: ns, MetricName: "ReplayUnavailable" }, Period: 1800, Stat: "Sum" }, ReturnData: false },
         { Id: "unavailable_pct", Expression: "IF(FILL(requests, 0) >= 20, 100 * FILL(unavailable, 0) / requests, 0)", ReturnData: true },
       ],
     });
+    // No alarm action of any kind: ALARM state only, and the description says so.
+    expect(props.ActionsEnabled).toBe(false);
+    for (const k of ["AlarmActions", "OKActions", "InsufficientDataActions"]) expect(k in props).toBe(false);
+    expect(props.AlarmDescription).toContain("No alarm action: ALARM state only.");
     // Exactly one series is returned (the alarm's), and it is the expression.
     expect(props.Metrics.filter((m) => m.ReturnData).map((m) => m.Id)).toEqual(["unavailable_pct"]);
     // A metric-math alarm sets no single-metric fields.
@@ -335,7 +331,7 @@ describe("session read api: outcome alarm (501/503 share of /v1 reads)", () => {
     expect(all.Threshold).toBe(25);
     expect(all.Metrics.slice(0, 2).map((m) => (m as { MetricStat: { Period: number } }).MetricStat.Period)).toEqual([3600, 3600]);
     expect(all.Metrics[2]).toMatchObject({ Expression: "IF(FILL(requests, 0) >= 100, 100 * FILL(unavailable, 0) / requests, 0)" });
-    expect(all.AlarmDescription).toContain("more than 25% of /v1 reads answered 501/503 over 60 minutes (at least 100 reads)");
+    expect(all.AlarmDescription).toContain("more than 25% of session replay requests (GET /v1/sessions/:sessionId/events) answered 501/503 over 60 minutes (at least 100 requests)");
     const one = alarm({ windowMinutes: 15 });
     expect(one.Threshold).toBe(50);
     expect((one.Metrics[0] as { MetricStat: { Period: number } }).MetricStat.Period).toBe(900);

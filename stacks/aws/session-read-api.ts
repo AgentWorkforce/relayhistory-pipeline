@@ -73,7 +73,8 @@ export interface SessionReadApiInputs {
    */
   relayfacts?: boolean;
   /**
-   * The outcome alarm (`session-read-api-outcome-alarm`): the share of /v1 reads answered 501 or 503 over one window.
+   * The outcome alarm (`session-read-api-outcome-alarm`): the share of session replay requests (GET
+   * /v1/sessions/:sessionId/events) answered 501 or 503 over one window. Actionless: it exposes ALARM state only.
    * Every field optional; defaults in {@link OUTCOME_ALARM_DEFAULTS}. The function never fails these requests, so the
    * Errors alarm stays quiet while Cloud falls back on every read; this alarm is the one that notices.
    */
@@ -81,11 +82,11 @@ export interface SessionReadApiInputs {
 }
 
 export interface SessionReadApiOutcomeAlarmInputs {
-  /** Alarm when more than this percent of reads in the window answered 501/503 (1-99). Default 50. */
+  /** Alarm when more than this percent of replay requests in the window answered 501/503 (1-99). Default 50. */
   thresholdPercent?: number;
   /** The window, in minutes (an integer 5-360). Default 30. */
   windowMinutes?: number;
-  /** Fewer reads than this in the window never alarm (an integer >= 1). Default 20. */
+  /** Fewer replay requests than this in the window never alarm (an integer >= 1). Default 20. */
   minRequests?: number;
 }
 
@@ -96,8 +97,8 @@ export const SESSION_READ_API_RESOURCES = [
   "session-read-api-secret",
   "session-read-api-errors-alarm",
   "session-read-api-throttles-alarm",
-  "session-read-api-requests-metric",
-  "session-read-api-unavailable-metric",
+  "session-read-api-replay-requests-metric",
+  "session-read-api-replay-unavailable-metric",
   "session-read-api-outcome-alarm",
 ] as const;
 
@@ -274,39 +275,48 @@ export function sessionReadApiMetricNamespace(stage: string): string {
 }
 
 /**
- * The request line the app writes once per request, after the handler (src/session-read-api/app.ts, the "*"
- * middleware: route, status, duration_ms). The handler's own reason lines ("session read" with a reason and no
- * duration_ms) are excluded by `duration_ms >= 0`, so a request counts once; `route = "/v1/*"` leaves out /health.
+ * The session replay route (the dashboard's session view; Cloud's worker reads GET /v1/sessions/:sessionId/events).
+ * Only this route is counted: the rest of /v1 (directory, workspace search, flag-disabled routes answering 501 by
+ * design) would dilute the share, e.g. 20 replays all 501 beside 100 healthy directory reads is 16.7%.
  */
-const READ_REQUEST_LINE = '$.message = "session read" && $.route = "/v1/*" && $.duration_ms >= 0';
-export const READ_REQUESTS_FILTER_PATTERN = `{ ${READ_REQUEST_LINE} }`;
-/** 501 (session_partial and other not-served reads) and 503 (retryable session_partial, ClickHouse, unavailable). */
-export const READ_UNAVAILABLE_FILTER_PATTERN = `{ ${READ_REQUEST_LINE} && ($.status = 501 || $.status = 503) }`;
+export const READ_REPLAY_ROUTE = "/v1/sessions/:sessionId/events";
 
-/** Two counters from the function's log group: every /v1 read, and the ones answered 501/503. */
+/**
+ * The request line the app writes once per request, after the handler (src/session-read-api/app.ts, the "*"
+ * middleware: route = Hono's routePath, status, duration_ms), raw JSON on stdout (src/shared/log.ts). The handler's own
+ * reason lines ("session read" with a reason and no duration_ms) are excluded by `duration_ms >= 0`, so a request
+ * counts once.
+ */
+const REPLAY_REQUEST_LINE = `$.message = "session read" && $.route = "${READ_REPLAY_ROUTE}" && $.duration_ms >= 0`;
+export const REPLAY_REQUESTS_FILTER_PATTERN = `{ ${REPLAY_REQUEST_LINE} }`;
+/** 501 (session_partial, history floor) and 503 (retryable session_partial, ClickHouse, unavailable). */
+export const REPLAY_UNAVAILABLE_FILTER_PATTERN = `{ ${REPLAY_REQUEST_LINE} && ($.status = 501 || $.status = 503) }`;
+
+/** Two counters from the function's log group: every replay request, and the ones answered 501/503. */
 export function sessionReadApiOutcomeMetricFilters(i: { stage: string; names: SessionReadApiNames; logGroupName: string }) {
   const metricNamespace = sessionReadApiMetricNamespace(i.stage);
   const counter = (metricName: string) => [{ metricName, metricNamespace, metricValue: "1", defaultValue: 0, unit: "Count" as const }];
   return [
-    ["session-read-api-requests-metric", {
+    ["session-read-api-replay-requests-metric", {
       logGroupName: i.logGroupName,
-      filterName: `${i.names.function}-read-requests`,
-      filterPattern: READ_REQUESTS_FILTER_PATTERN,
-      metricTransformations: counter("ReadRequests"),
+      filterName: `${i.names.function}-replay-requests`,
+      filterPattern: REPLAY_REQUESTS_FILTER_PATTERN,
+      metricTransformations: counter("ReplayRequests"),
     }],
-    ["session-read-api-unavailable-metric", {
+    ["session-read-api-replay-unavailable-metric", {
       logGroupName: i.logGroupName,
-      filterName: `${i.names.function}-read-unavailable`,
-      filterPattern: READ_UNAVAILABLE_FILTER_PATTERN,
-      metricTransformations: counter("ReadUnavailable"),
+      filterName: `${i.names.function}-replay-unavailable`,
+      filterPattern: REPLAY_UNAVAILABLE_FILTER_PATTERN,
+      metricTransformations: counter("ReplayUnavailable"),
     }],
   ] as const;
 }
 
 /**
- * The outcome alarm: more than `thresholdPercent` of /v1 reads in one `windowMinutes` window answered 501/503, with at
- * least `minRequests` reads in it (a quiet window never alarms). Same action wiring as the other read API alarms
- * (actions disabled until the stage routes alarms anywhere).
+ * The outcome alarm: more than `thresholdPercent` of replay requests in one `windowMinutes` window answered 501/503,
+ * with at least `minRequests` of them in it (a quiet window, or no data, never alarms). Actionless, like the other read
+ * API alarms: there is no approved alarm destination, so it exposes ALARM state only (console, DescribeAlarms) and
+ * notifies nobody until one is wired.
  */
 export function sessionReadApiOutcomeAlarm(i: { stage: string; names: SessionReadApiNames; p: SessionReadApiInputs }) {
   const { thresholdPercent, windowMinutes, minRequests } = { ...OUTCOME_ALARM_DEFAULTS, ...i.p.outcomeAlarm };
@@ -317,14 +327,14 @@ export function sessionReadApiOutcomeAlarm(i: { stage: string; names: SessionRea
     ActionsEnabled: false,
     TreatMissingData: "notBreaching",
     name: `${i.names.function}-outcome`,
-    AlarmDescription: `Session read API: more than ${thresholdPercent}% of /v1 reads answered 501/503 over ${windowMinutes} minutes (at least ${minRequests} reads); the function is not failing, but Cloud falls back to relayhistory on those reads. Check the "session read" log lines' reason.`,
+    AlarmDescription: `Session read API: more than ${thresholdPercent}% of session replay requests (GET ${READ_REPLAY_ROUTE}) answered 501/503 over ${windowMinutes} minutes (at least ${minRequests} requests); the function is not failing, but Cloud falls back to relayhistory on those reads. Check the "session read" log lines' reason. No alarm action: ALARM state only.`,
     Metrics: [
-      sum("requests", "ReadRequests"),
-      sum("unavailable", "ReadUnavailable"),
+      sum("requests", "ReplayRequests"),
+      sum("unavailable", "ReplayUnavailable"),
       {
         Id: "unavailable_pct",
         Expression: `IF(FILL(requests, 0) >= ${minRequests}, 100 * FILL(unavailable, 0) / requests, 0)`,
-        Label: "501/503 share of /v1 reads (%)",
+        Label: "501/503 share of session replay requests (%)",
         ReturnData: true,
       },
     ],
