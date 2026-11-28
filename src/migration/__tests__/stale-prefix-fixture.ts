@@ -6,7 +6,7 @@
 import { createHash } from "node:crypto";
 import { zstdCompressSync } from "node:zlib";
 import { rawChunkKey, type ChunkEntry, type ManifestV1 } from "../../shared/vendor.ts";
-import { ATTESTATION_KIND, type ProtectionAttestation } from "../neon-s3-erasure/stale-prefix-verify.ts";
+import { allowlistDigest, ATTESTATION_KIND, type ProtectionAttestation, type VerificationReceipt } from "../neon-s3-erasure/stale-prefix-verify.ts";
 import type { FakeS3Versions } from "./fake-s3-versions.ts";
 
 const PREFIX = /^(.+)\/v1\/ws=([^/]+)\/m=([^/]+)\/h=([^/]+)\/d=(\d{4})\/(\d{2})\/(\d{2})\/s=([^/]+)\/$/;
@@ -82,11 +82,22 @@ export function seedBodies(s: FakeS3Versions, prefix: string, at: number, chunks
 export function attestation(now: number, over: Partial<ProtectionAttestation> = {}, keyRoot = "96bulls"): ProtectionAttestation {
   return {
     v: 1, kind: ATTESTATION_KIND, bucket_sha256: sha("b"), key_root: keyRoot, versioning: "Enabled",
-    survivor_writers: { put_object: ["role/exporter"], delete_marker: ["role/eraser"], delete_version: ["role/eraser"], attested_by: "infra-synthetic" },
+    actors: [
+      { principal: "role/eraser-synthetic", actions: ["s3:DeleteObjectVersion"], self: true, preventive_control: null },
+      { principal: "role/exporter-synthetic", actions: ["s3:PutObject", "s3:DeleteObject"], preventive_control: { name: "deny-writes-during-erase", type: "bucket_policy_deny" } },
+      { principal: "role/admin-synthetic", actions: ["s3:PutObject", "s3:DeleteObject", "s3:DeleteObjectVersion", "s3:PutLifecycleConfiguration", "s3:PutBucketVersioning", "s3:PutBucketPolicy"], preventive_control: { name: "scp-synthetic", type: "scp" } },
+    ],
+    actors_complete: true, actors_attested_by: "infra-synthetic",
     lifecycle: { current_version_expiration: false, current_version_transition: false, noncurrent_version_expiration_days: 1 },
-    lifecycle_change: { principals: ["role/break-glass"], break_glass: ["role/break-glass"], prevented: true, preventive_control: "scp-synthetic" },
     verified_at: new Date(now).toISOString(), change_control_ref: "CHG-SYNTHETIC-1",
     ...over,
   } as ProtectionAttestation;
 }
 export const BUCKET_SHA = sha("b");
+/** The synthetic target both the verifier and the execute run under (state-file identity, verifier commit). */
+export const TARGET = { stateIdentity: "state-synthetic", verifierCommit: "0123456789abcdef0123456789abcdef01234567" };
+/** The approved values an owner entry would quote for a receipt: its allowlist digest and planned item count. */
+export function approvedFor(r: VerificationReceipt) {
+  const planned = r.identities.reduce((n, i) => n + i.items.length, 0);
+  return { approvedAllowlistSha256: allowlistDigest(r.allowlist), approvedMax: planned, max: planned };
+}

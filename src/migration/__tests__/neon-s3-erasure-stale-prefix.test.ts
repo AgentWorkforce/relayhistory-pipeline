@@ -23,7 +23,7 @@ import { ShortLivedCredentialError } from "../short-lived-credentials.ts";
 import { LEASE_TTL_MS, SyncState } from "../neon-s3-sync/state.ts";
 import { FORBIDDEN_CREDENTIAL_ENV } from "../stdin-credentials.ts";
 import { FakeS3Versions } from "./fake-s3-versions.ts";
-import { attestation, BUCKET_SHA, buildCopy, seedBodies } from "./stale-prefix-fixture.ts";
+import { approvedFor, attestation, BUCKET_SHA, buildCopy, seedBodies, TARGET } from "./stale-prefix-fixture.ts";
 
 // The mode runs only with S3X_OBLIGATIONS off: pinned per module, re-applied before every test, restored after.
 const OBLIGATIONS_MODE = "off";
@@ -89,11 +89,11 @@ async function fixture() {
   const exec = async (opts: StalePrefixPassOptions, j = job()) => {
     if (!opts.execute) return j.staleprefixPass(opts);
     const logged = logs.length;
-    const receipt = opts.receipt ?? await j.staleprefixVerify({ onlyIdentities: opts.onlyIdentities, reader: s.reader(), bucketSha256: BUCKET_SHA });
+    const receipt = opts.receipt ?? await j.staleprefixVerify({ onlyIdentities: opts.onlyIdentities, reader: s.reader(), bucketSha256: BUCKET_SHA, target: TARGET });
     logs.length = logged;
     s.lists = 0;
     s.gets = [];
-    return j.staleprefixPass({ receipt, fence: s.eraser(), bucketSha256: BUCKET_SHA, attestation: attestation(NOW), ...opts });
+    return j.staleprefixPass({ receipt, fence: s.eraser(), reader: s.reader(), target: TARGET, bucketSha256: BUCKET_SHA, attestation: attestation(NOW), ...approvedFor(receipt), ...opts });
   };
   /** The canonical date move: the group now exports NEW_P; OLD_P is queued stale; both copies are in the bucket. */
   const dateMove = (session = "sess-1", group = `g-${session}`, at = NOW - 60_000) => {
@@ -104,12 +104,20 @@ async function fixture() {
     st.enqueueErasure([{ key: oldP, kind: "prefix", org_id: ORG, reason: "stale_prefix" }], at);
     return { oldP, newP };
   };
-  return { path, st, s, logs, calls, job, exec, dateMove };
+  /** The read-only verifier's receipt for `ids` (taken before an arrange step: the guard then fails at execute). */
+  const verify = (ids?: string[]) => job().staleprefixVerify({ onlyIdentities: ids ?? allIds(st), reader: s.reader(), bucketSha256: BUCKET_SHA, target: TARGET });
+  return { path, st, s, logs, calls, job, exec, verify, dateMove };
 }
 /** An identity no fixture session has: keeps an allowlist non-empty. */
 const NO_ID = "0".repeat(64);
-/** Every derivable identity of the queued stale prefixes (the pre-allowlist behaviour), plus NO_ID. */
-const allIds = (st: SyncState) => [...new Set([...st.staleprefixErasures().map((e) => staleprefixIdentityHash("96bulls", e.org_id, e.key)).filter((h): h is string => h !== undefined), NO_ID])];
+/**
+ * Every derivable identity of the queued stale prefixes (the pre-allowlist behaviour); NO_ID only when there is none
+ * (an execute batch requires every allowlisted identity to have a PASS receipt entry, so an unmatched id refuses it).
+ */
+const allIds = (st: SyncState) => {
+  const ids = [...new Set(st.staleprefixErasures().map((e) => staleprefixIdentityHash("96bulls", e.org_id, e.key)).filter((h): h is string => h !== undefined))];
+  return ids.length ? ids : [NO_ID];
+};
 // Hand-computed offline: printf '%s' 'org-1/ws-1/m-1/claude/sess-1' | shasum -a 256 (and sess-2).
 const ID_A = "8c92d2fb0f2e5f259c3268f061f94ca22eda4f91834959d5402edd1b49de0bff";
 const ID_B = "6fdf52f1e97923a0a31c77efb8e9c070507b7f9926b2d1f376da1b20e92f2071";
@@ -184,11 +192,13 @@ describe("stale-prefixes-only mode", () => {
     for (const where of ["exported", "pending"] as const) {
       const f = await fixture();
       const { oldP } = f.dateMove();
+      const receipt = await f.verify(); // PASS when produced; the guard fails at execute time
       if (where === "exported") f.st.markExported(ORG, "g-other", 1, [`${oldP}manifest.json`], NOW - 1000);
       else f.st.recordPendingKey(ORG, "g-other", `${oldP}raw/c-0003.ndjson.zst`);
       const before = dump(f.path);
-      const r = await f.exec({ onlyIdentities: allIds(f.st), execute: true, probe: f.s.eraser() });
-      expect(r).toMatchObject({ ok: true, erased: 0, skipped: { current_key: 1 } });
+      const r = await f.exec({ onlyIdentities: allIds(f.st), execute: true, probe: f.s.eraser(), receipt });
+      // Any guard skip in scope refuses the WHOLE batch before any lease or delete.
+      expect(r).toMatchObject({ ok: false, refused: "stale_prefix_batch_guard_skip", erased: 0, skipped: { current_key: 1 } });
       expect(f.s.deletes).toEqual([]);
       expect(dump(f.path)).toEqual(before);
     }
@@ -209,11 +219,12 @@ describe("stale-prefixes-only mode", () => {
     test(`guard (b): ${reason} skips the entry and writes nothing (case ${refusals.filter((x) => x[0] === reason).findIndex((x) => x[1] === arrange) + 1})`, async () => {
       const f = await fixture();
       const { oldP, newP } = f.dateMove();
+      const receipt = await f.verify(); // PASS when produced; the guard fails at execute time
       const probe = arrange(f, oldP, newP) ?? f.s.eraser();
       const before = dump(f.path);
       const oldCount = f.s.count(oldP);
-      const r = await f.exec({ onlyIdentities: allIds(f.st), execute: true, probe });
-      expect(r).toMatchObject({ ok: true, erased: 0, skipped: { [reason]: 1 } });
+      const r = await f.exec({ onlyIdentities: allIds(f.st), execute: true, probe, receipt });
+      expect(r).toMatchObject({ ok: false, refused: "stale_prefix_batch_guard_skip", erased: 0, skipped: { [reason]: 1 } });
       expect(f.s.deletes).toEqual([]);
       expect(f.s.count(oldP)).toBe(oldCount);
       expect(dump(f.path)).toEqual(before);
@@ -237,8 +248,13 @@ describe("stale-prefixes-only mode", () => {
         const before = dump(f.path);
         let probed = 0;
         const probe: LiveObjectProbe = { objectLive: async () => { probed += 1; return true; } };
-        const r = await f.exec({ onlyIdentities: allIds(f.st), execute, ...(execute ? { probe } : {}) });
-        expect(r).toMatchObject({ ok: true, eligible: 0, erased: 0, skipped: { no_live_sibling: 1 } });
+        if (execute) {
+          // No survivor: the receipt is FAIL, so the whole-receipt gate refuses before the queue is even read.
+          await expect(f.exec({ onlyIdentities: allIds(f.st), execute, probe })).rejects.toMatchObject({ code: "stale_prefix_receipt_not_all_pass" });
+        } else {
+          const r = await f.exec({ onlyIdentities: allIds(f.st), execute });
+          expect(r).toMatchObject({ ok: true, eligible: 0, erased: 0, skipped: { no_live_sibling: 1 } });
+        }
         expect([f.s.lists, f.s.deletes.length, probed]).toEqual([0, 0, 0]);
         expect(f.s.count(OLD_P)).toBe(3);
         expect(JSON.stringify(erasureRow(f.st, OLD_P))).toBe(row);
@@ -255,9 +271,11 @@ describe("stale-prefixes-only mode", () => {
       { key: `${base()}/d=2026/11/01/`, kind: "prefix", org_id: ORG, reason: "stale_prefix" },
     ], NOW - 1000);
     const before = dump(f.path);
-    const r = await f.exec({ onlyIdentities: allIds(f.st), execute: true, probe: f.s.eraser() });
+    const r = await f.exec({ onlyIdentities: allIds(f.st), execute: false });
     // The allowlist check runs first; an entry whose identity cannot be derived is exactly one shape_invalid would catch.
     expect(r).toMatchObject({ ok: true, erased: 0, skipped: { identity_unresolved: 2 } });
+    // Execute has nothing to plan: refused before the queue is read.
+    await expect(f.exec({ onlyIdentities: allIds(f.st), execute: true, probe: f.s.eraser() })).rejects.toHaveProperty("code");
     expect(f.s.deletes).toEqual([]);
     expect(dump(f.path)).toEqual(before);
     expect(sessionPrefixParts("96bulls", ORG, OLD_P)).toEqual({ ws: "ws-1", m: "m-1", h: "claude", d: "2026/11/01", s: "sess-1" });
@@ -265,14 +283,16 @@ describe("stale-prefixes-only mode", () => {
       expect(sessionPrefixParts("96bulls", ORG, bad)).toBeUndefined();
   });
 
-  test("--max n: stops after n successful erases; the rest stay queued and in the bucket", async () => {
+  test("--max must equal the receipt's planned item count: a cap that would end the batch early refuses before delete 1; the exact count erases all", async () => {
     const f = await fixture();
     const copies = ["sess-1", "sess-2", "sess-3"].map((s, i) => f.dateMove(s, `g-${s}`, NOW - 60_000 + i));
-    const r = await f.exec({ onlyIdentities: allIds(f.st), execute: true, max: 2, probe: f.s.eraser() });
-    expect(r).toMatchObject({ ok: true, erased: 2, stoppedBy: "max" });
-    expect(copies.map((c) => f.s.count(c.oldP))).toEqual([0, 0, 3]);
-    expect(f.st.staleprefixErasures().map((e) => e.key)).toEqual([copies[2]!.oldP]);
+    await expect(f.exec({ onlyIdentities: allIds(f.st), execute: true, max: 2, probe: f.s.eraser() })).rejects.toMatchObject({ code: "stale_prefix_max_mismatch" });
+    expect(f.s.deletes).toEqual([]);
+    expect(copies.map((c) => f.s.count(c.oldP))).toEqual([3, 3, 3]);
     expect(erasureRow(f.st, copies[2]!.oldP)).toMatchObject({ attempts: 0, error: null, next_try: 0 });
+    const r = await f.exec({ onlyIdentities: allIds(f.st), execute: true, max: 3, probe: f.s.eraser() });
+    expect(r).toMatchObject({ ok: true, erased: 3 });
+    expect(copies.map((c) => f.s.count(c.oldP))).toEqual([0, 0, 0]);
     await expect(f.exec({ onlyIdentities: allIds(f.st), execute: true, max: 0, probe: f.s.eraser() })).rejects.toMatchObject({ code: "stale_prefix_mode_max_invalid" });
   });
 
@@ -295,7 +315,9 @@ describe("stale-prefixes-only mode", () => {
     expect(f.s.deletes.every((d) => d.startsWith(a.oldP))).toBe(true);
     expect(rowsOf(f.path, "leases")).toEqual([]);
     expect(f.logs.some((l) => l.message === "erasure failed")).toBe(true);
-    expect(f.logs.find((l) => l.message === "stale prefix pass stopped")).toMatchObject({ outcome: "failed" });
+    // The lost acknowledgement may have applied: the version is resolved by a relist, never not_attempted.
+    expect(f.logs.find((l) => l.message === "stale prefix pass stopped")).toMatchObject({ outcome: "partial", error_code: "stale_prefix_delete_ambiguous" });
+    expect(r.fenced![0]!.versions[0]!.outcome).toBe("absent_observed");
   });
 
   test("dry run: no delete, no lease, no queue write (full table dumps identical); counts eligible and skips, sibling_checked false", async () => {
@@ -316,21 +338,26 @@ describe("stale-prefixes-only mode", () => {
     expect(f.s.count(moved.oldP)).toBe(3);
   });
 
-  test("lease: taken for the erase and released after; a prefix leased by another holder is skipped untouched", async () => {
+  test("lease: held for every delete and released after; a prefix leased by another holder refuses the WHOLE batch untouched", async () => {
     const f = await fixture();
     const a = f.dateMove("sess-1", "g-1", NOW - 60_000);
-    const b = f.dateMove("sess-2", "g-2", NOW - 50_000);
-    f.st.acquireLease(b.oldP, "exporter:31337", undefined, NOW - 1000);
     const seen: string[] = [];
     f.s.onDelete = () => void seen.push(...(f.st.db.prepare("SELECT prefix, holder FROM leases WHERE prefix = ?").all(a.oldP) as { holder: string }[]).map((l) => l.holder));
-    const bRow = JSON.stringify(erasureRow(f.st, b.oldP));
-    const r = await f.exec({ onlyIdentities: allIds(f.st), execute: true, probe: f.s.eraser() });
-    expect(r).toMatchObject({ ok: true, erased: 1, skipped: { lease_busy: 1 }, otherEraserLeases: 0 });
-    expect(r.refused).toBeUndefined();
+    expect(await f.exec({ onlyIdentities: allIds(f.st), execute: true, probe: f.s.eraser() })).toMatchObject({ ok: true, erased: 1 });
     expect(new Set(seen)).toEqual(new Set([`eraser:${process.pid}`]));
-    expect(rowsOf(f.path, "leases")).toEqual([JSON.stringify({ prefix: b.oldP, holder: "exporter:31337", at: NOW - 1000 })]);
-    expect(JSON.stringify(erasureRow(f.st, b.oldP))).toBe(bRow);
-    expect(f.s.count(b.oldP)).toBe(3);
+    expect(rowsOf(f.path, "leases")).toEqual([]);
+    const g = await fixture();
+    const c = g.dateMove("sess-1", "g-1", NOW - 60_000);
+    const b = g.dateMove("sess-2", "g-2", NOW - 50_000);
+    g.st.acquireLease(b.oldP, "exporter:31337", undefined, NOW - 1000);
+    const bRow = JSON.stringify(erasureRow(g.st, b.oldP));
+    const r = await g.exec({ onlyIdentities: allIds(g.st), execute: true, probe: g.s.eraser() });
+    expect(r).toMatchObject({ ok: false, refused: "stale_prefix_batch_lease_busy", erased: 0, skipped: { lease_busy: 1 }, otherEraserLeases: 0 });
+    expect(g.s.deletes).toEqual([]);
+    expect(g.s.count(c.oldP)).toBe(3);
+    expect(rowsOf(g.path, "leases")).toEqual([JSON.stringify({ prefix: b.oldP, holder: "exporter:31337", at: NOW - 1000 })]);
+    expect(JSON.stringify(erasureRow(g.st, b.oldP))).toBe(bRow);
+    expect(g.s.count(b.oldP)).toBe(3);
   });
 
   test("another eraser's unexpired lease: execute refuses to start (nothing erased, state byte-identical); dry run reports it", async () => {
@@ -373,7 +400,7 @@ describe("stale-prefixes-only mode", () => {
     const a = f.dateMove("sess-1", "g-1", NOW - 60_000);
     const b = f.dateMove("sess-2", "g-2", NOW - 50_000);
     const bRow = JSON.stringify(erasureRow(f.st, b.oldP));
-    const receipt = await f.job().staleprefixVerify({ onlyIdentities: allIds(f.st), reader: f.s.reader(), bucketSha256: BUCKET_SHA });
+    const receipt = await f.job().staleprefixVerify({ onlyIdentities: allIds(f.st), reader: f.s.reader(), bucketSha256: BUCKET_SHA, target: TARGET });
     f.st.exportedKeysOf = () => { throw Object.assign(new Error("state read"), { code: "state_read_failed" }); };
     const r = await f.exec({ onlyIdentities: allIds(f.st), execute: true, probe: f.s.eraser(), receipt });
     expect(r).toMatchObject({ ok: false, stoppedBy: "failed", erased: 0 });
@@ -388,7 +415,7 @@ describe("stale-prefixes-only mode", () => {
 
   test("refusals in the job: S3X_OBLIGATIONS on, and --execute without an existence check", async () => {
     const f = await fixture();
-    await expect(f.exec({ onlyIdentities: allIds(f.st), execute: true })).rejects.toMatchObject({ code: "stale_prefix_mode_requires_existence_check" });
+    await expect(f.job().staleprefixPass({ onlyIdentities: allIds(f.st), execute: true })).rejects.toMatchObject({ code: "stale_prefix_mode_requires_existence_check" });
     const path = join(await mkdtemp(join(process.env.TMPDIR ?? tmpdir(), "e3-stale-on-")), "s.sqlite");
     const on = new SyncState(path, { obligations: true });
     const job = new ErasureJob(authority(), on, f.s.eraser(), () => {}, DEFAULT_ERASURE_CONFIG, () => NOW, async () => {});
@@ -454,12 +481,13 @@ describe("identity allowlist (--only-identity)", () => {
 
   test("an unlisted entry is skipped before its lease: another holder's lease on it does not turn into lease_busy", async () => {
     const f = await fixture();
+    const a = f.dateMove("sess-1", "g-1", NOW - 60_000);
     const b = f.dateMove("sess-2", "g-2", NOW - 50_000);
     f.st.acquireLease(b.oldP, "exporter:31337", undefined, NOW - 1000);
     const leased = leaseSpy(f.st);
     const r = await f.exec({ execute: true, onlyIdentities: [ID_A], probe: f.s.eraser() });
-    expect(r).toMatchObject({ ok: true, erased: 0, skipped: { not_in_identity_allowlist: 1 } });
-    expect(leased).toEqual([STALE_RUN_LEASE]); // only the run lease: the unlisted entry is never leased
+    expect(r).toMatchObject({ ok: true, erased: 1, skipped: { not_in_identity_allowlist: 1 } });
+    expect(leased).toEqual([STALE_RUN_LEASE, a.oldP, a.newP]); // the unlisted entry is never leased
   });
 
   test("one identity with several queued prefixes: every due prefix of it is eligible and erased", async () => {
@@ -477,16 +505,21 @@ describe("identity allowlist (--only-identity)", () => {
     expect(f.st.staleprefixErasures().map((e) => e.key)).toEqual([pfx("2026/11/01", "sess-2")]);
   });
 
-  test("--max counts erases of allowlisted entries only; unlisted skips do not consume it", async () => {
+  test("--max counts ITEMS (old prefixes): one identity with two prefixes and a max covering one refuses before delete 1; unlisted entries are not counted", async () => {
     const f = await fixture();
     f.dateMove("sess-2", "g-2", NOW - 70_000); // unlisted, first in order
     const a = f.dateMove("sess-1", "g-1", NOW - 60_000);
     const older = pfx("2026/10/31", "sess-1");
     seedCopy(f.s, older);
     f.st.enqueueErasure([{ key: older, kind: "prefix", org_id: ORG, reason: "stale_prefix" }], NOW - 30_000);
-    const r = await f.exec({ execute: true, max: 1, onlyIdentities: [ID_A], probe: f.s.eraser() });
-    expect(r).toMatchObject({ ok: true, erased: 1, stoppedBy: "max", skipped: { not_in_identity_allowlist: 1 } });
-    expect([f.s.count(a.oldP), f.s.count(older)]).toEqual([0, 3]);
+    const receipt = await f.verify([ID_A]);
+    expect(receipt.identities[0]!.items).toHaveLength(2);
+    await expect(f.exec({ execute: true, max: 1, approvedMax: 1, onlyIdentities: [ID_A], probe: f.s.eraser(), receipt })).rejects.toMatchObject({ code: "stale_prefix_max_mismatch" });
+    expect(f.s.deletes).toEqual([]);
+    expect([f.s.count(a.oldP), f.s.count(older)]).toEqual([3, 3]);
+    const r = await f.exec({ execute: true, onlyIdentities: [ID_A], probe: f.s.eraser(), receipt });
+    expect(r).toMatchObject({ ok: true, erased: 2, skipped: { not_in_identity_allowlist: 1 } });
+    expect([f.s.count(a.oldP), f.s.count(older)]).toEqual([0, 0]);
   });
 
   test("allowlist counts: size, matched identities (any queued entry, backing-off included) and unmatched, in the result and the pass line", async () => {
@@ -494,8 +527,11 @@ describe("identity allowlist (--only-identity)", () => {
     f.dateMove("sess-1", "g-1", NOW - 60_000);
     f.dateMove("sess-2", "g-2", NOW - 50_000);
     f.st.erasureFailed(pfx("2026/11/01", "sess-2"), "x", NOW); // backing off: matched, not processed
-    const r = await f.exec({ execute: true, onlyIdentities: [ID_A, ID_B, NO_ID], probe: f.s.eraser() });
-    expect(r).toMatchObject({ ok: true, selected: 2, due: 1, erased: 1, allowlistSize: 3, allowlistMatchedIdentities: 2, allowlistUnmatched: 1 });
+    const r = await f.exec({ execute: false, onlyIdentities: [ID_A, ID_B, NO_ID] });
+    expect(r).toMatchObject({ ok: true, selected: 2, due: 1, eligible: 1, allowlistSize: 3, allowlistMatchedIdentities: 2, allowlistUnmatched: 1 });
+    // Execute: an allowlisted identity without a PASS receipt entry (NO_ID) refuses the whole batch.
+    await expect(f.exec({ execute: true, onlyIdentities: [ID_A, ID_B, NO_ID], probe: f.s.eraser() })).rejects.toMatchObject({ code: "stale_prefix_receipt_not_all_pass" });
+    expect(f.s.deletes).toEqual([]);
     expect(passLine(f.logs)).toMatchObject({ allowlist_size: 3, allowlist_matched_identities: 2, allowlist_unmatched: 1 });
   });
 
@@ -512,10 +548,11 @@ describe("identity allowlist (--only-identity)", () => {
     expect(dry).toMatchObject({ ok: true, eligible: 2, allowlistSize: 2, allowlistMatchedIdentities: 2, allowlistUnmatched: 0, allowlistEligibleIdentities: 1 });
     expect(passLine(f.logs)).toMatchObject({ eligible: 2, allowlist_size: 2, allowlist_matched_identities: 2, allowlist_unmatched: 0, allowlist_eligible_identities: 1 });
     expect(dump(f.path)).toEqual(before);
-    // Execute: eligible identities are those with an erase.
+    // Execute: B's only entry is backing off (not due), so the WHOLE batch refuses before any delete.
     const r = await f.exec({ execute: true, onlyIdentities: [ID_A, ID_B], probe: f.s.eraser() });
-    expect(r).toMatchObject({ ok: true, erased: 2, allowlistEligibleIdentities: 1 });
-    expect([f.s.count(a.oldP), f.s.count(older), f.s.count(b.oldP)]).toEqual([0, 0, 3]);
+    expect(r).toMatchObject({ ok: false, refused: "stale_prefix_batch_not_due", erased: 0, allowlistEligibleIdentities: 0 });
+    expect(f.s.deletes).toEqual([]);
+    expect([f.s.count(a.oldP), f.s.count(older), f.s.count(b.oldP)]).toEqual([3, 3, 3]);
     // Both identities eligible: the gate equality holds.
     const g = await fixture();
     g.dateMove("sess-1", "g-1", NOW - 60_000);
@@ -629,8 +666,10 @@ describe("CLI options", () => {
   test("accepted forms", () => {
     expect(staleprefixOptions(["--stale-prefixes-only", "--only-identity", ID_A], env())).toEqual({ execute: false, verifyOnly: false, onlyIdentities: [ID_A] });
     expect(staleprefixOptions(["--stale-prefixes-only", "--execute", "--once", "--max", "25", "--only-identity", ID_A, "--only-identity", ID_B,
-      "--verified-receipt", "r.json", "--protection-attestation", "a.json"], env({ BABYSITTER_RETENTION_SWEEP: " OFF " })))
-      .toEqual({ execute: true, verifyOnly: false, max: 25, onlyIdentities: [ID_A, ID_B], verifiedReceipt: "r.json", protectionAttestation: "a.json" });
+      "--verified-receipt", "r.json", "--protection-attestation", "a.json", "--receipt-sha256", ID_A, "--attestation-sha256", ID_B,
+      "--approved-allowlist-sha256", NO_ID, "--approved-max", "25"], env({ BABYSITTER_RETENTION_SWEEP: " OFF " })))
+      .toEqual({ execute: true, verifyOnly: false, max: 25, onlyIdentities: [ID_A, ID_B], verifiedReceipt: "r.json", protectionAttestation: "a.json",
+        receiptSha256: ID_A, attestationSha256: ID_B, approvedAllowlistSha256: NO_ID, approvedMax: 25 });
     const hundred = Array.from({ length: 100 }, (_, i) => ["--only-identity", i.toString(16).padStart(64, "0")]).flat();
     expect(staleprefixOptions(["--stale-prefixes-only", ...hundred], env())?.onlyIdentities).toHaveLength(100);
   });

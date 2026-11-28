@@ -8,18 +8,19 @@
 import { afterAll as __modeAfterAll, beforeEach as __modeBeforeEach } from "bun:test";
 import { describe, expect, test } from "bun:test";
 import { createHash } from "node:crypto";
+import { writeFileSync } from "node:fs";
 import { mkdtemp } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { ErasureAuthority } from "../neon-s3-erasure/authority.ts";
 import { DEFAULT_ERASURE_CONFIG, ErasureJob, STALE_RUN_LEASE, staleprefixIdentityHash, type StalePrefixPassOptions } from "../neon-s3-erasure/job.ts";
-import { staleprefixOptions, stalePassStatus } from "../neon-s3-erasure/main.ts";
+import { boundOperatorFile, exitStatusForError, staleprefixOptions, stalePassStatus } from "../neon-s3-erasure/main.ts";
 import {
-  attestationProblem, chunkRecords, compareMultisets, evaluateLifecycle, parseReceipt, type ProtectionAttestation, type VerificationReceipt,
+  attestationProblem, chunkRecords, compareMultisets, evaluateLifecycle, parseReceipt, type AttestedActor, type ProtectionAttestation, type VerificationReceipt,
 } from "../neon-s3-erasure/stale-prefix-verify.ts";
 import { SyncState } from "../neon-s3-sync/state.ts";
 import { FakeS3Versions } from "./fake-s3-versions.ts";
-import { attestation, BUCKET_SHA, buildCopy, line, seedBodies } from "./stale-prefix-fixture.ts";
+import { approvedFor, attestation, BUCKET_SHA, buildCopy, line, seedBodies, TARGET } from "./stale-prefix-fixture.ts";
 
 const OBLIGATIONS_MODE = "off";
 const __modeBefore = process.env.S3X_OBLIGATIONS;
@@ -51,7 +52,8 @@ async function fixture() {
   const st = new SyncState(path, { obligations: false });
   const s = new FakeS3Versions();
   const logs: Logged[] = [];
-  const job = () => new ErasureJob(authority(), st, s.eraser(), (f) => void logs.push(f as Logged), DEFAULT_ERASURE_CONFIG, () => NOW, async () => {});
+  const clock = { now: NOW };
+  const job = () => new ErasureJob(authority(), st, s.eraser(), (f) => void logs.push(f as Logged), DEFAULT_ERASURE_CONFIG, () => clock.now, async () => {});
   /** A date move: old copy at d=11/01 (queued stale), survivor at d=11/02 (exported). Chunks are ndjson line lists. */
   const dateMove = (old: string[][] = [[line("r1"), line("r2")], [line("r3")]], survivor: string[][] = old, session = "sess-1", at = NOW - 60_000) => {
     const oldP = pfx("2026/11/01", session), newP = pfx("2026/11/02", session);
@@ -61,14 +63,18 @@ async function fixture() {
     st.enqueueErasure([{ key: oldP, kind: "prefix", org_id: ORG, reason: "stale_prefix" }], at);
     return { oldP, newP, oldCopy, newCopy };
   };
-  const verify = (ids: string[] = [ID()]) => job().staleprefixVerify({ onlyIdentities: ids, reader: s.reader(), bucketSha256: BUCKET_SHA });
+  const verify = (ids: string[] = [ID()]) => job().staleprefixVerify({ onlyIdentities: ids, reader: s.reader(), bucketSha256: BUCKET_SHA, target: TARGET });
+  /** The execute exactly as the owner entry approves it (allowlist digest and planned count from the receipt). */
   const execute = (receipt: VerificationReceipt, over: Partial<StalePrefixPassOptions> = {}) => {
     s.deletes = [];
-    return job().staleprefixPass({ execute: true, onlyIdentities: receipt.allowlist, probe: s.eraser(), receipt, fence: s.eraser(), bucketSha256: BUCKET_SHA, attestation: attestation(NOW), ...over });
+    return job().staleprefixPass({
+      execute: true, onlyIdentities: receipt.allowlist, probe: s.eraser(), receipt, fence: s.eraser(), reader: s.reader(), target: TARGET,
+      bucketSha256: BUCKET_SHA, attestation: attestation(clock.now), ...approvedFor(receipt), ...over,
+    });
   };
   const row = (key: string) => st.db.prepare("SELECT * FROM erasures WHERE key = ?").get(key) as Record<string, unknown> | undefined;
   const leases = () => st.db.prepare("SELECT prefix, holder FROM leases").all() as { prefix: string; holder: string }[];
-  return { path, st, s, logs, job, dateMove, verify, execute, row, leases };
+  return { path, st, s, logs, clock, job, dateMove, verify, execute, row, leases };
 }
 const item = (r: VerificationReceipt, i = 0, j = 0) => r.identities[i]!.items[j]!;
 const versionIds = (r: VerificationReceipt) => item(r).old_versions.map((v) => `${v.key_sha256}@${v.version_id}`).sort();
@@ -232,7 +238,7 @@ describe("receipt fence on execute", () => {
     f.s.put(m.oldCopy.chunks[0]!.key, NOW - 5, undefined, m.oldCopy.chunks[0]!.body);
     const row = JSON.stringify(f.row(m.oldP));
     const r = await f.execute(receipt);
-    expect(r).toMatchObject({ ok: false, erased: 0, versionsDeleted: 0, stoppedBy: "refused" });
+    expect(r).toMatchObject({ ok: false, erased: 0, versionsDeleted: 0, refused: "stale_prefix_receipt_drift" });
     expect(r.fenced![0]).toMatchObject({ outcome: "refused_before_delete", reason: "stale_prefix_receipt_drift", deleted: 0 });
     expect(f.s.deletes).toEqual([]);
     expect(JSON.stringify(f.row(m.oldP))).toBe(row);
@@ -263,20 +269,97 @@ describe("receipt fence on execute", () => {
     }
   });
 
-  test("a FAIL receipt is never erased (stale_prefix_receipt_failed); a PASS identity in the same pass still is; not ok", async () => {
+  test("whole-receipt gate: [PASS, FAIL] and [FAIL, PASS] receipts refuse before any delete (zero deleteVersion calls, non-zero exit, no state write)", async () => {
+    for (const order of [["sess-1", "sess-2"], ["sess-2", "sess-1"]]) {
+      const f = await fixture();
+      const bad = f.dateMove([[line("r1")], [line("r7")]], [[line("r1")]], "sess-1", NOW - 60_000);
+      const good = f.dateMove(undefined, undefined, "sess-2", NOW - 50_000);
+      const receipt = await f.verify(order.map((x) => ID(x)));
+      expect(receipt.identities.map((i) => i.status)).toEqual(order.map((x) => (x === "sess-1" ? "FAIL" : "PASS")));
+      const fence = f.s.eraser();
+      let calls = 0;
+      const del = fence.deleteVersion;
+      fence.deleteVersion = (k, v) => (calls++, del(k, v));
+      const rows = JSON.stringify([f.row(bad.oldP), f.row(good.oldP), f.leases()]);
+      let err: unknown;
+      try { await f.execute(receipt, { fence }); } catch (e) { err = e; }
+      expect((err as { code?: string }).code).toBe("stale_prefix_receipt_not_all_pass");
+      expect(exitStatusForError(err)).toBe(1);
+      expect([calls, f.s.deletes.length]).toEqual([0, 0]);
+      expect(JSON.stringify([f.row(bad.oldP), f.row(good.oldP), f.leases()])).toBe(rows);
+    }
+  });
+
+  test("whole-receipt gate: an allowlist that is a strict subset or superset of the receipt's identities refuses; so does a missing approval", async () => {
     const f = await fixture();
-    const bad = f.dateMove([[line("r1")], [line("r7")]], [[line("r1")]], "sess-1", NOW - 60_000);
-    const good = f.dateMove(undefined, undefined, "sess-2", NOW - 50_000);
-    const receipt = await f.verify([ID("sess-1"), ID("sess-2")]);
-    expect(receipt.identities.map((i) => i.status)).toEqual(["FAIL", "PASS"]);
+    f.dateMove(undefined, undefined, "sess-1", NOW - 60_000);
+    f.dateMove(undefined, undefined, "sess-2", NOW - 50_000);
+    const both = await f.verify([ID("sess-1"), ID("sess-2")]);
+    const one = await f.verify([ID("sess-1")]);
+    await expect(f.execute(both, { onlyIdentities: [ID("sess-1")] })).rejects.toMatchObject({ code: "stale_prefix_receipt_not_all_pass" });
+    await expect(f.execute(one, { onlyIdentities: [ID("sess-1"), ID("sess-2")] })).rejects.toMatchObject({ code: "stale_prefix_receipt_not_all_pass" });
+    await expect(f.execute(both, { approvedAllowlistSha256: NO_ID })).rejects.toMatchObject({ code: "stale_prefix_approved_allowlist_mismatch" });
+    await expect(f.execute(both, { approvedMax: undefined })).rejects.toMatchObject({ code: "stale_prefix_mode_requires_approval" });
+    await expect(f.execute(both, { max: 1, approvedMax: 1 })).rejects.toMatchObject({ code: "stale_prefix_max_mismatch" });
+    await expect(f.execute(both, { approvedMax: 3 })).rejects.toMatchObject({ code: "stale_prefix_max_mismatch" });
+    expect(f.s.deletes).toEqual([]);
+  });
+
+  test("batch inventory: an identity with TWO old prefixes is planned as two items; a max covering one refuses with zero deletes; the exact count erases both", async () => {
+    const f = await fixture();
+    const m = f.dateMove();
+    const older = pfx("2026/10/31");
+    seedBodies(f.s, older, OLD - 1000);
+    f.st.enqueueErasure([{ key: older, kind: "prefix", org_id: ORG, reason: "stale_prefix" }], NOW - 30_000);
+    const receipt = await f.verify();
+    expect(receipt.identities[0]!.items.map((i) => i.old_prefix_sha256)).toEqual([sha(older), sha(m.oldP)]);
+    await expect(f.execute(receipt, { max: 1, approvedMax: 1 })).rejects.toMatchObject({ code: "stale_prefix_max_mismatch" });
+    expect(f.s.deletes).toEqual([]);
     const r = await f.execute(receipt);
-    expect(r).toMatchObject({ ok: false, erased: 1 });
-    expect(r.fenced!.map((x) => [x.outcome, x.reason ?? null])).toEqual([["refused_before_delete", "stale_prefix_receipt_failed"], ["completed", null]]);
-    expect(f.s.count(bad.oldP)).toBe(3);
-    expect(f.s.count(good.oldP)).toBe(0);
-    expect(f.s.deletes.every((d) => d.startsWith(good.oldP))).toBe(true);
-    expect(f.row(bad.oldP)).toMatchObject({ attempts: 0, error: null });
-    expect(() => stalePassStatus(r, false)).toThrow();
+    expect(r).toMatchObject({ ok: true, erased: 2, versionsDeleted: 6 });
+    expect(r.fenced!.map((x) => x.outcome)).toEqual(["completed", "completed"]);
+  });
+
+  test("batch inventory: a queued item the receipt does not name, a receipt item no longer queued, or a not-due item refuses the WHOLE batch with zero deletes", async () => {
+    // A second prefix queued for the identity after verification.
+    const f = await fixture();
+    f.dateMove();
+    const receipt = await f.verify();
+    const later = pfx("2026/10/30");
+    seedBodies(f.s, later, OLD - 2000);
+    f.st.enqueueErasure([{ key: later, kind: "prefix", org_id: ORG, reason: "stale_prefix" }], NOW - 10_000);
+    expect(await f.execute(receipt)).toMatchObject({ ok: false, refused: "stale_prefix_receipt_missing", erased: 0 });
+    expect(f.s.deletes).toEqual([]);
+    // The receipt's item is gone from the queue.
+    const g = await fixture();
+    const n = g.dateMove();
+    const rec = await g.verify();
+    g.st.erasureDone(n.oldP, Number(g.row(n.oldP)!.enqueued_at));
+    expect(await g.execute(rec)).toMatchObject({ ok: false, refused: "stale_prefix_receipt_missing" });
+    expect(g.s.deletes).toEqual([]);
+    // Backing off (not due).
+    const h = await fixture();
+    const o = h.dateMove(undefined, undefined, "sess-1", NOW - 60_000);
+    h.dateMove(undefined, undefined, "sess-2", NOW - 50_000);
+    const rh = await h.verify([ID("sess-1"), ID("sess-2")]);
+    h.st.erasureFailed(pfx("2026/11/01", "sess-2"), "x", NOW);
+    const res = await h.execute(rh);
+    expect(res).toMatchObject({ ok: false, refused: "stale_prefix_batch_not_due", erased: 0 });
+    expect(h.s.deletes).toEqual([]);
+    expect(h.s.count(o.oldP)).toBe(3);
+    expect(() => stalePassStatus(res, false)).toThrow();
+  });
+
+  test("a guard skip on a LATER item refuses the whole batch before delete 1 (the earlier item is untouched)", async () => {
+    const f = await fixture();
+    const a = f.dateMove(undefined, undefined, "sess-1", NOW - 60_000);
+    const b = f.dateMove(undefined, undefined, "sess-2", NOW - 50_000);
+    const receipt = await f.verify([ID("sess-1"), ID("sess-2")]);
+    f.st.recordPendingKey(ORG, "g-other", `${b.oldP}raw/x.ndjson.zst`);
+    const r = await f.execute(receipt);
+    expect(r).toMatchObject({ ok: false, refused: "stale_prefix_batch_guard_skip", erased: 0, skipped: { current_key: 1 } });
+    expect(f.s.deletes).toEqual([]);
+    expect(f.s.count(a.oldP)).toBe(3);
   });
 
   test("an entry the receipt does not name (re-queued after verification) is refused stale_prefix_receipt_missing", async () => {
@@ -285,7 +368,7 @@ describe("receipt fence on execute", () => {
     const receipt = await f.verify();
     f.st.db.prepare("UPDATE erasures SET enqueued_at = enqueued_at + 1 WHERE key = ?").run(m.oldP);
     const r = await f.execute(receipt);
-    expect(r.fenced![0]).toMatchObject({ outcome: "refused_before_delete", reason: "stale_prefix_receipt_missing" });
+    expect(r).toMatchObject({ ok: false, refused: "stale_prefix_receipt_missing" });
     expect(f.s.deletes).toEqual([]);
   });
 
@@ -306,7 +389,7 @@ describe("receipt fence on execute", () => {
     expect(f.leases()).toEqual([]);
     let err: unknown; try { stalePassStatus(r, false); } catch (e) { err = e; }
     expect((err as { code?: string }).code).toBe("stale_prefix_pass_stopped");
-    expect(f.logs.find((l) => l.message === "stale prefix fence")).toMatchObject({ outcome: "partial", deleted: 1, not_attempted: 2, failed: 0, error_code: "stale_prefix_survivor_drift" });
+    expect(f.logs.find((l) => l.message === "stale prefix fence")).toMatchObject({ outcome: "partial", deleted: 1, not_attempted: 2, unknown: 0, absent_observed: 0, error_code: "stale_prefix_survivor_drift" });
   });
 
   test("survivor protection lost after delete 2 (a survivor chunk version removed) and before the last: partial with exactly 2 deleted", async () => {
@@ -343,16 +426,40 @@ describe("receipt fence on execute", () => {
     expect(() => stalePassStatus(r, false)).toThrow();
   });
 
-  test("a failed DELETE is partial with that version failed (never untouched)", async () => {
+  test("ambiguous DELETE (applied, then a transport error): resolved by the exact relist as absent_observed, never not_attempted; partial, exact accounting", async () => {
     const f = await fixture();
     const m = f.dateMove();
     const receipt = await f.verify();
     let n = 0;
-    f.s.onDelete = () => (++n === 2 ? "lose" : undefined);
+    f.s.onDelete = () => (++n === 2 ? "transport" : undefined);
+    const r = await f.execute(receipt);
+    const rep = r.fenced![0]!;
+    expect(rep).toMatchObject({ outcome: "partial", reason: "stale_prefix_delete_ambiguous", deleted: 1 });
+    expect(rep.versions.map((v) => v.outcome)).toEqual(["deleted", "absent_observed", "not_attempted"]);
+    expect(rep.versions[1]!.error_code).toBe("TypeError");
+    expect(f.s.deletes).toHaveLength(2);
+    expect(f.row(m.oldP)).toMatchObject({ attempts: 1, error: "stale_prefix_delete_ambiguous" });
+    expect(r).toMatchObject({ ok: false, stoppedBy: "failed", versionsDeleted: 1 });
+    expect(() => stalePassStatus(r, false)).toThrow();
+  });
+
+  test("ambiguous DELETE: a failed exact relist records unknown; a version still present records present_after_error; both stop the batch", async () => {
+    const f = await fixture();
+    f.dateMove();
+    const receipt = await f.verify();
+    let failing = false;
+    f.s.rewrite = (_c, xml) => (failing ? "<ListVersionsResult><IsTruncated>" : xml);
+    f.s.onDelete = () => { failing = true; return "transport"; };
     const rep = (await f.execute(receipt)).fenced![0]!;
-    expect(rep).toMatchObject({ outcome: "partial", reason: "s3_500", deleted: 1 });
-    expect(rep.versions.map((v) => v.outcome)).toEqual(["deleted", "failed", "not_attempted"]);
-    expect(f.row(m.oldP)).toMatchObject({ attempts: 1 });
+    expect(rep).toMatchObject({ outcome: "partial", reason: "stale_prefix_delete_ambiguous", deleted: 0 });
+    expect(rep.versions.map((v) => v.outcome)).toEqual(["unknown", "not_attempted", "not_attempted"]);
+    const g = await fixture();
+    g.dateMove();
+    const rec = await g.verify();
+    g.s.onDelete = () => "transport-before";
+    const rg = (await g.execute(rec)).fenced![0]!;
+    expect(rg).toMatchObject({ outcome: "partial", deleted: 0 });
+    expect(rg.versions.map((v) => v.outcome)).toEqual(["present_after_error", "not_attempted", "not_attempted"]);
   });
 
   test("a competing lease on the SURVIVOR prefix (the exporter writing it): refused_before_delete, zero deletes", async () => {
@@ -397,12 +504,21 @@ describe("receipt fence on execute", () => {
     const receipt = await f.verify();
     await expect(f.job().staleprefixPass({ execute: true, onlyIdentities: [ID()], probe: f.s.eraser() })).rejects.toMatchObject({ code: "stale_prefix_mode_requires_verified_receipt" });
     await expect(f.job().staleprefixPass({ execute: true, onlyIdentities: [ID()], probe: f.s.eraser(), receipt })).rejects.toMatchObject({ code: "stale_prefix_mode_requires_verified_receipt" });
+    await expect(f.execute(receipt, { reader: undefined })).rejects.toMatchObject({ code: "stale_prefix_mode_requires_verified_receipt" });
     await expect(f.execute(receipt, { bucketSha256: sha("other") })).rejects.toMatchObject({ code: "stale_prefix_receipt_invalid" });
     expect(f.s.deletes).toEqual([]);
     const code = (args: string[]) => { try { staleprefixOptions(args, () => undefined); return null; } catch (e) { return (e as { code?: string }).code; } };
     const mode = ["--stale-prefixes-only", "--only-identity", ID()];
     expect(code([...mode, "--execute"])).toBe("stale_prefix_execute_requires_verified_receipt");
     expect(code([...mode, "--execute", "--verified-receipt", "r.json"])).toBe("stale_prefix_execute_requires_attestation");
+    const files = [...mode, "--execute", "--verified-receipt", "r.json", "--protection-attestation", "a.json"];
+    expect(code(files)).toBe("stale_prefix_execute_requires_approval");
+    const approved = [...files, "--receipt-sha256", NO_ID, "--attestation-sha256", NO_ID, "--approved-allowlist-sha256", NO_ID, "--approved-max", "1"];
+    expect(code(approved)).toBe("stale_prefix_execute_requires_approval"); // --max too
+    expect(code([...approved, "--max", "1"])).toBeNull();
+    expect(code([...approved.slice(0, -2), "--max", "1"])).toBe("stale_prefix_execute_requires_approval");
+    expect(code([...files, "--receipt-sha256", "ABC"])).toBe("stale_prefix_sha256_invalid");
+    expect(code([...mode, "--receipt-sha256", NO_ID])).toBe("stale_prefix_receipt_without_execute");
     expect(code([...mode, "--verified-receipt", "r.json"])).toBe("stale_prefix_receipt_without_execute");
     expect(code([...mode, "--execute", "--verified-receipt"])).toBe("stale_prefix_path_invalid");
     expect(code([...mode, "--verify-only", "--execute"])).toBe("stale_prefix_verify_only_flag_refused");
@@ -458,14 +574,22 @@ describe("protection preflight", () => {
     expect(f.s.count(m.oldP)).toBe(0);
   });
 
-  test("versioning not Enabled, and any attestation that is stale, incomplete, or leaves lifecycle change unprevented, refuses with zero deletes", async () => {
+  const withActor = (actor: AttestedActor, replaceSelf = false) => {
+    const a = attestation(NOW);
+    return { ...a, actors: [...a.actors.filter((x) => !replaceSelf || !x.self), actor] };
+  };
+  test("versioning not Enabled, and any attestation that is stale, incomplete, or leaves an actor without a preventive control, refuses with zero deletes", async () => {
     const cases: [string, (f: Awaited<ReturnType<typeof fixture>>) => Partial<StalePrefixPassOptions>][] = [
       ["versioning_not_enabled", (f) => { f.s.versioning = { status: 200, body: "<VersioningConfiguration><Status>Suspended</Status></VersioningConfiguration>" }; return {}; }],
       ["attestation_stale", () => ({ attestation: attestation(NOW - 61 * 60_000) })],
-      ["attestation_survivor_writers", () => ({ attestation: attestation(NOW, { survivor_writers: undefined } as unknown as Partial<ProtectionAttestation>) })],
+      ["attestation_actors", () => ({ attestation: attestation(NOW, { actors: undefined } as unknown as Partial<ProtectionAttestation>) })],
+      ["attestation_actors", () => ({ attestation: attestation(NOW, { actors_complete: false } as unknown as Partial<ProtectionAttestation>) })],
       ["attestation_lifecycle", () => ({ attestation: attestation(NOW, { lifecycle: { current_version_expiration: true } } as unknown as Partial<ProtectionAttestation>) })],
-      ["attestation_lifecycle_change_not_prevented", () => ({ attestation: attestation(NOW, { lifecycle_change: { principals: ["role/break-glass", "role/admin"], break_glass: ["role/break-glass"], prevented: true, preventive_control: "scp" } }) })],
-      ["attestation_lifecycle_change_not_prevented", () => ({ attestation: attestation(NOW, { lifecycle_change: { principals: ["role/break-glass"], break_glass: ["role/break-glass"], prevented: false, preventive_control: "alarm-only" } } as unknown as Partial<ProtectionAttestation>) })],
+      // A principal that can write a survivor key or change lifecycle with no preventive control (an alarm is not one).
+      ["attestation_actor_unprevented", () => ({ attestation: withActor({ principal: "role/ops", actions: ["s3:PutLifecycleConfiguration"], preventive_control: null }) })],
+      ["attestation_actor_unprevented", () => ({ attestation: withActor({ principal: "role/ops", actions: ["s3:PutObject"], preventive_control: { name: "alarm-on-put", type: "alarm" } } as unknown as AttestedActor) })],
+      ["attestation_actor_unprevented", () => ({ attestation: withActor({ principal: "role/eraser-2", actions: ["s3:DeleteObjectVersion", "s3:PutObject"], self: true, preventive_control: null }, true) })],
+      ["attestation_actors_incomplete", () => ({ attestation: attestation(NOW, { actors: [{ principal: "role/admin", actions: ["s3:PutObject"], preventive_control: { name: "scp", type: "scp" } }] }) })],
       ["attestation_scope", () => ({ attestation: attestation(NOW, {}, "other-root") })],
       ["attestation_change_control_ref", () => ({ attestation: attestation(NOW, { change_control_ref: "" }) })],
     ];
@@ -492,5 +616,114 @@ describe("protection preflight", () => {
     expect(evaluateLifecycle({ status: "rules", xml: "<LifecycleConfiguration><Rule>" }, "96bulls").proven).toBe(false);
     expect(evaluateLifecycle({ status: "unreadable", code: "s3_403" }, "96bulls").proven).toBe(false);
     expect(attestationProblem(attestation(NOW), { bucketSha256: BUCKET_SHA, keyRoot: "96bulls" })).toBeUndefined();
+  });
+});
+
+describe("provenance and target binding", () => {
+  test("--receipt-sha256 / --attestation-sha256: the exact file bytes must hash to the approved value (one read; mismatch refused)", async () => {
+    const dir = await mkdtemp(join(process.env.TMPDIR ?? tmpdir(), "e3-bind-"));
+    const path = join(dir, "receipt.json");
+    writeFileSync(path, '{"v":1}\n');
+    expect(boundOperatorFile(path, sha('{"v":1}\n'), "stale_prefix_receipt")).toBe('{"v":1}\n');
+    expect(() => boundOperatorFile(path, sha('{"v":1}'), "stale_prefix_receipt")).toThrow(expect.objectContaining({ code: "stale_prefix_receipt_hash_mismatch" }));
+    expect(() => boundOperatorFile(path, NO_ID, "stale_prefix_attestation")).toThrow(expect.objectContaining({ code: "stale_prefix_attestation_hash_mismatch" }));
+    expect(() => boundOperatorFile(join(dir, "missing.json"), NO_ID, "stale_prefix_receipt")).toThrow(expect.objectContaining({ code: "stale_prefix_receipt" }));
+  });
+
+  test("the receipt records its target; execute refuses any mismatch (state file, verifier commit, bucket, key root) with zero deletes", async () => {
+    const f = await fixture();
+    f.dateMove();
+    const receipt = await f.verify();
+    expect(receipt.target).toMatchObject({ bucket_sha256: BUCKET_SHA, key_root: "96bulls", state_identity: TARGET.stateIdentity, verifier_commit: TARGET.verifierCommit, produced_at: new Date(NOW).toISOString() });
+    for (const target of [{ ...TARGET, stateIdentity: "other-state" }, { ...TARGET, verifierCommit: "f".repeat(40) }])
+      await expect(f.execute(receipt, { target })).rejects.toMatchObject({ code: "stale_prefix_receipt_target_mismatch" });
+    const moved = JSON.parse(JSON.stringify(receipt)) as VerificationReceipt;
+    moved.target.key_root = "other-root";
+    await expect(f.execute(moved)).rejects.toMatchObject({ code: "stale_prefix_receipt_target_mismatch" });
+    const otherBucket = JSON.parse(JSON.stringify(receipt)) as VerificationReceipt;
+    otherBucket.target.bucket_sha256 = sha("other");
+    await expect(f.execute(otherBucket)).rejects.toMatchObject({ code: "stale_prefix_receipt_target_mismatch" });
+    expect(f.s.deletes).toEqual([]);
+  });
+
+  test("a receipt older than 6 h (or from the future) is refused stale with zero deletes", async () => {
+    const f = await fixture();
+    const m = f.dateMove();
+    const receipt = await f.verify();
+    f.clock.now = NOW + 6 * 3_600_000 + 1;
+    await expect(f.execute(receipt)).rejects.toMatchObject({ code: "stale_prefix_receipt_stale" });
+    f.clock.now = NOW - 5 * 60_000;
+    await expect(f.execute(receipt)).rejects.toMatchObject({ code: "stale_prefix_receipt_stale" });
+    expect(f.s.deletes).toEqual([]);
+    f.clock.now = NOW + 6 * 3_600_000;
+    expect(await f.execute(receipt)).toMatchObject({ ok: true, erased: 1 });
+    expect(f.s.count(m.oldP)).toBe(0);
+  });
+
+  test("mandatory inline re-verification: a receipt that does not reproduce exactly (forged counts, or content changed in place) refuses with zero deletes", async () => {
+    const f = await fixture();
+    const m = f.dateMove();
+    const receipt = await f.verify();
+    const forged = JSON.parse(JSON.stringify(receipt)) as VerificationReceipt;
+    forged.identities[0]!.items[0]!.counts.records_old = 2;
+    const r = await f.execute(forged);
+    expect(r).toMatchObject({ ok: false, refused: "stale_prefix_reverify_mismatch", erased: 0 });
+    expect(f.s.deletes).toEqual([]);
+    // Same version ids, different bytes (a provider-side rewrite the version set cannot show).
+    const v = f.s.keys.get(m.oldCopy.chunks[1]!.key)![0]!;
+    v.body = buildCopy(m.oldP, [[line("r1"), line("r2")], [line("r3", { text: "changed" })]]).chunks[1]!.body;
+    expect(await f.execute(receipt)).toMatchObject({ ok: false, refused: "stale_prefix_reverify_mismatch" });
+    expect(f.s.deletes).toEqual([]);
+    expect(f.row(m.oldP)).toMatchObject({ attempts: 0 });
+  });
+
+  test("attestation freshness is re-checked before EVERY delete: it expiring after delete 1 stops with partial", async () => {
+    const f = await fixture();
+    f.dateMove();
+    const receipt = await f.verify();
+    let n = 0;
+    // Verified 59 min before the run; delete 1 takes 2 min, so the attestation is 61 min old at delete 2.
+    f.s.onDelete = () => { if (++n === 1) f.clock.now = NOW + 2 * 60_000; };
+    const rep = (await f.execute(receipt, { attestation: attestation(NOW - 59 * 60_000) })).fenced![0]!;
+    expect(rep).toMatchObject({ outcome: "partial", reason: "stale_prefix_protection_unproven", deleted: 1 });
+    expect(rep.versions.map((v) => v.outcome)).toEqual(["deleted", "not_attempted", "not_attempted"]);
+  });
+
+  test("lease TTL bound from the request deadline x attempts through the LAST delete: below it, the batch stops before that delete", async () => {
+    // 3 deletes x (old page + 2 survivor pages + delete) + post-checks, at a 10-minute deadline, exceeds the 2 h lease TTL.
+    const f = await fixture();
+    const m = f.dateMove();
+    const receipt = await f.verify();
+    const slow = f.s.eraser({ requestDeadlineMs: 10 * 60_000 });
+    const r = await f.execute(receipt, { fence: slow });
+    expect(r).toMatchObject({ ok: false, refused: "stale_prefix_lease_ttl_insufficient", erased: 0 });
+    expect(r.fenced![0]!.versions.every((v) => v.outcome === "not_attempted")).toBe(true);
+    expect(f.s.deletes).toEqual([]);
+    expect(f.s.count(m.oldP)).toBe(3);
+    // The same batch at a 1-minute deadline fits and erases.
+    const ok = await f.execute(receipt, { fence: f.s.eraser({ requestDeadlineMs: 60_000 }) });
+    expect(ok).toMatchObject({ ok: true, erased: 1 });
+  });
+
+  test("lease TTL bound with a fake clock: a lease whose remaining TTL fell below the bound after delete 1 (renewal refused) stops before delete 2", async () => {
+    const f = await fixture();
+    const m = f.dateMove();
+    const receipt = await f.verify();
+    let n = 0;
+    // After delete 1 the survivor lease is taken over by an exporter whose own clock is ahead (renewal by us fails).
+    f.s.onDelete = () => { if (++n === 1) f.st.db.prepare("UPDATE leases SET holder = 'exporter:777' WHERE prefix = ?").run(m.newP); };
+    const rep = (await f.execute(receipt)).fenced![0]!;
+    expect(rep).toMatchObject({ outcome: "partial", reason: "erasure_lease_lost", deleted: 1 });
+    const g = await fixture();
+    g.dateMove();
+    const rec = await g.verify();
+    // Renewal succeeds but the clock moved backwards relative to the lease row: remaining TTL is below the bound.
+    let k = 0;
+    const realRenew = g.st.renewLease.bind(g.st);
+    g.st.renewLease = (p, h, now) => realRenew(p, h, k >= 1 ? (now ?? NOW) - 2 * 3_600_000 + 1000 : now);
+    g.s.onDelete = () => void k++;
+    const rg = (await g.execute(rec)).fenced![0]!;
+    expect(rg).toMatchObject({ outcome: "partial", reason: "stale_prefix_lease_ttl_insufficient", deleted: 1 });
+    expect(rg.versions.map((v) => v.outcome)).toEqual(["deleted", "not_attempted", "not_attempted"]);
   });
 });

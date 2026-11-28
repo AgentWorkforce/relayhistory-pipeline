@@ -70,7 +70,11 @@ import { assertEraserIdentity, neonAuthority, supabaseAuthority, type ErasureAut
 import { createS3Eraser, createS3VersionReader, isLiveObjectProbe, isReceiptFence, type Eraser, type PagedEraser } from "./eraser.ts";
 import { parseReceipt, sha256Hex, type ProtectionAttestation } from "./stale-prefix-verify.ts";
 import type { ErasureAuthority } from "./authority.ts";
-import { closeSync, fstatSync, openSync, readSync, writeFileSync } from "node:fs";
+import { closeSync, fstatSync, openSync, readSync, realpathSync, statSync, writeFileSync } from "node:fs";
+import { execFileSync } from "node:child_process";
+import { createHash } from "node:crypto";
+import { dirname } from "node:path";
+import { fileURLToPath } from "node:url";
 import { DEFAULT_ERASURE_CONFIG, ErasureJob, STALE_PREFIX_ALLOWLIST_MAX } from "./job.ts";
 import { phaseSettings, poolConfig, startBabysitterPhase, type BabysitterPhase } from "./babysitter-phase.ts";
 
@@ -107,9 +111,13 @@ export interface StalePrefixOptions {
   /** --verify-only: the read-only verifier (stale-prefix-verify.ts); never with --execute. */
   verifyOnly: boolean;
   receiptOut?: string;
-  /** --execute: both required (the receipt fence). */
+  /** --execute: all required (the receipt fence and the owner-approved values). */
   verifiedReceipt?: string;
   protectionAttestation?: string;
+  receiptSha256?: string;
+  attestationSha256?: string;
+  approvedAllowlistSha256?: string;
+  approvedMax?: number;
 }
 
 /**
@@ -133,6 +141,13 @@ export function staleprefixOptions(args: readonly string[], e: (k: string) => st
   }
   let execute = false, max: number | undefined, seen = 0, verifyOnly = false;
   let receiptOut: string | undefined, verifiedReceipt: string | undefined, protectionAttestation: string | undefined;
+  let receiptSha256: string | undefined, attestationSha256: string | undefined, approvedAllowlistSha256: string | undefined, approvedMax: number | undefined;
+  const hexArg = (i: number, name: string, prior: string | undefined): string => {
+    if (prior !== undefined) throw optionRefusal("stale_prefix_sha256_invalid", `${name} given more than once`);
+    const v = args[i];
+    if (v === undefined || !/^[0-9a-f]{64}$/.test(v)) throw optionRefusal("stale_prefix_sha256_invalid", `${name} takes exactly 64 lowercase hex characters`);
+    return v;
+  };
   const onlyIdentities: string[] = [];
   const pathArg = (i: number, name: string, prior: string | undefined): string => {
     if (prior !== undefined) throw optionRefusal("stale_prefix_path_invalid", `${name} given more than once`);
@@ -163,7 +178,15 @@ export function staleprefixOptions(args: readonly string[], e: (k: string) => st
     } else if (a === "--receipt-out") receiptOut = pathArg(++i, "--receipt-out", receiptOut);
     else if (a === "--verified-receipt") verifiedReceipt = pathArg(++i, "--verified-receipt", verifiedReceipt);
     else if (a === "--protection-attestation") protectionAttestation = pathArg(++i, "--protection-attestation", protectionAttestation);
-    else throw optionRefusal("stale_prefix_mode_flag_refused", "--stale-prefixes-only accepts only --execute, --once, --max <n>, --only-identity <sha256>, --verify-only, --receipt-out <path>, --verified-receipt <path> and --protection-attestation <path>");
+    else if (a === "--receipt-sha256") receiptSha256 = hexArg(++i, "--receipt-sha256", receiptSha256);
+    else if (a === "--attestation-sha256") attestationSha256 = hexArg(++i, "--attestation-sha256", attestationSha256);
+    else if (a === "--approved-allowlist-sha256") approvedAllowlistSha256 = hexArg(++i, "--approved-allowlist-sha256", approvedAllowlistSha256);
+    else if (a === "--approved-max") {
+      if (approvedMax !== undefined) throw optionRefusal("stale_prefix_max_invalid", "--approved-max given more than once");
+      const v = args[++i];
+      if (v === undefined || !/^[1-9][0-9]*$/.test(v) || !Number.isSafeInteger(Number(v))) throw optionRefusal("stale_prefix_max_invalid", "--approved-max takes a positive decimal integer");
+      approvedMax = Number(v);
+    } else throw optionRefusal("stale_prefix_mode_flag_refused", "--stale-prefixes-only accepts only --execute, --once, --max <n>, --only-identity <sha256>, --verify-only, --receipt-out <path>, --verified-receipt <path>, --protection-attestation <path>, --receipt-sha256 <hex>, --attestation-sha256 <hex>, --approved-allowlist-sha256 <hex> and --approved-max <n>");
   }
   if (seen !== 1) throw optionRefusal("stale_prefix_mode_flag_refused", "--stale-prefixes-only given more than once");
   if (onlyIdentities.length === 0)
@@ -181,13 +204,19 @@ export function staleprefixOptions(args: readonly string[], e: (k: string) => st
   if (verifyOnly && (execute || max !== undefined || verifiedReceipt !== undefined || protectionAttestation !== undefined))
     throw optionRefusal("stale_prefix_verify_only_flag_refused", "--verify-only is read-only: it takes no --execute, --max, --verified-receipt or --protection-attestation");
   if (receiptOut !== undefined && !verifyOnly) throw optionRefusal("stale_prefix_receipt_out_without_verify", "--receipt-out applies only with --verify-only");
-  if (!execute && (verifiedReceipt !== undefined || protectionAttestation !== undefined))
-    throw optionRefusal("stale_prefix_receipt_without_execute", "--verified-receipt and --protection-attestation apply only with --execute");
+  const executeOnly = [verifiedReceipt, protectionAttestation, receiptSha256, attestationSha256, approvedAllowlistSha256, approvedMax];
+  if (!execute && executeOnly.some((x) => x !== undefined))
+    throw optionRefusal("stale_prefix_receipt_without_execute", "--verified-receipt, --protection-attestation, their --*-sha256 and the --approved-* values apply only with --execute");
   if (execute && verifiedReceipt === undefined) throw optionRefusal("stale_prefix_execute_requires_verified_receipt", "--execute requires --verified-receipt <path>");
   if (execute && protectionAttestation === undefined) throw optionRefusal("stale_prefix_execute_requires_attestation", "--execute requires --protection-attestation <path>");
+  // The owner-approved decision entry pins the exact files and the batch: all four are required, and --max with them.
+  if (execute && (receiptSha256 === undefined || attestationSha256 === undefined || approvedAllowlistSha256 === undefined || approvedMax === undefined || max === undefined))
+    throw optionRefusal("stale_prefix_execute_requires_approval", "--execute requires --receipt-sha256, --attestation-sha256, --approved-allowlist-sha256, --approved-max and --max");
   return {
     execute, onlyIdentities, verifyOnly, ...(max !== undefined ? { max } : {}), ...(receiptOut !== undefined ? { receiptOut } : {}),
     ...(verifiedReceipt !== undefined ? { verifiedReceipt } : {}), ...(protectionAttestation !== undefined ? { protectionAttestation } : {}),
+    ...(receiptSha256 !== undefined ? { receiptSha256 } : {}), ...(attestationSha256 !== undefined ? { attestationSha256 } : {}),
+    ...(approvedAllowlistSha256 !== undefined ? { approvedAllowlistSha256 } : {}), ...(approvedMax !== undefined ? { approvedMax } : {}),
   };
 }
 
@@ -237,6 +266,8 @@ export function authorityUrl(kind: ErasureAuthorityKind, raw: unknown): string {
 export function stalePassStatus(r: { ok: boolean; refused?: string; stoppedBy?: string }, credStop: boolean): number {
   if (r.refused) throw optionRefusal(r.refused, "the stale-prefix pass refused to start (nothing erased)");
   // A genuine failed erase (ok=false, stoppedBy=<outcome>) always fails, even if the expiry timer also fired.
+  // An expiry stop (the job's stop signal) between items is a partial batch to rerun after renewal: 75, never success.
+  if (!r.ok && credStop && r.stoppedBy === "signal") return EXIT_CREDENTIALS_RENEW;
   if (!r.ok) throw optionRefusal("stale_prefix_pass_stopped", "the stale-prefix pass stopped at a failed erase");
   // An expiry stop (the job's stop signal; ok stays true) is a partial pass: renew and rerun, never success.
   if (credStop) return EXIT_CREDENTIALS_RENEW;
@@ -254,16 +285,45 @@ export function runStatus(status: number, credStop: boolean): number {
 }
 
 /** A small operator file (receipt or attestation), bounded; any read failure is the given refusal code. */
-export function readBounded(path: string, code: string, max = 32 * 1024 * 1024): string {
+/**
+ * An operator file bound to the owner-approved decision entry: its exact bytes must hash to `sha256` (copied from
+ * that entry), else `<code>_hash_mismatch`. Returns the text.
+ */
+export function boundOperatorFile(path: string, sha256: string, code: string): string {
+  // ONE read: the bytes hashed are exactly the bytes parsed.
+  const bytes = readBoundedBytes(path, code);
+  if (createHash("sha256").update(bytes).digest("hex") !== sha256) throw optionRefusal(`${code}_hash_mismatch`, "an operator file does not match its approved sha256");
+  return utf8OrRefuse(bytes, code);
+}
+
+/** The verifier's source commit: HEAD of a CLEAN checkout (a dirty tree is refused: the commit would not name the code). */
+export function verifierCommit(dir = dirname(fileURLToPath(import.meta.url))): string {
+  try {
+    const head = execFileSync("git", ["-C", dir, "rev-parse", "HEAD"], { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] }).trim();
+    const dirty = execFileSync("git", ["-C", dir, "status", "--porcelain", "--untracked-files=no"], { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] }).trim();
+    if (!/^[0-9a-f]{40}$/.test(head) || dirty) throw new Error("unclean");
+    return head;
+  } catch {
+    throw optionRefusal("stale_prefix_verifier_commit_unknown", "the verifier commit cannot be established (a clean git checkout is required)");
+  }
+}
+
+/** The state file's identity: sha256 over its real path, device and inode (stable across runs, distinct per file). */
+export function stateIdentity(path: string): string {
+  const real = realpathSync(path), st = statSync(real);
+  return createHash("sha256").update(`${real}\n${st.dev}\n${st.ino}`).digest("hex");
+}
+
+function readBoundedBytes(path: string, code: string, max = 32 * 1024 * 1024): Uint8Array {
   let fd: number | undefined;
   try {
     fd = openSync(path, "r");
-    const size = fstatSync(fd).size;
-    if (!fstatSync(fd).isFile() || size > max) throw new Error("not a bounded regular file");
-    const buf = Buffer.alloc(size);
+    const st = fstatSync(fd);
+    if (!st.isFile() || st.size > max) throw new Error("not a bounded regular file");
+    const buf = Buffer.alloc(st.size);
     let at = 0;
-    while (at < size) { const n = readSync(fd, buf, at, size - at, at); if (n <= 0) break; at += n; }
-    return new TextDecoder("utf-8", { fatal: true }).decode(buf.subarray(0, at));
+    while (at < st.size) { const n = readSync(fd, buf, at, st.size - at, at); if (n <= 0) break; at += n; }
+    return buf.subarray(0, at);
   } catch {
     throw optionRefusal(code, "an operator file could not be read");
   } finally {
@@ -271,9 +331,24 @@ export function readBounded(path: string, code: string, max = 32 * 1024 * 1024):
   }
 }
 
+export function readBounded(path: string, code: string): string {
+  return utf8OrRefuse(readBoundedBytes(path, code), code);
+}
+const utf8OrRefuse = (b: Uint8Array, code: string) => {
+  try { return new TextDecoder("utf-8", { fatal: true, ignoreBOM: false }).decode(b); } catch { throw optionRefusal(code, "an operator file is not UTF-8"); }
+};
+
 /** The attestation as JSON only; its facts are checked by the job's preflight (stale-prefix-verify.ts attestationProblem). */
 export function parseAttestationFile(text: string): ProtectionAttestation {
   try { return JSON.parse(text) as ProtectionAttestation; } catch { throw optionRefusal("stale_prefix_protection_unproven", "the protection attestation is not JSON"); }
+}
+
+/** The read-only verifier client for the configured bucket (verify-only, and execute's inline re-verification). */
+function readerFor(key: S3Credentials) {
+  const bucket = env("S3X_BUCKET");
+  if (!bucket || env("S3X_EXPECT_BUCKET") !== bucket) throw new Error("S3X_BUCKET must equal S3X_EXPECT_BUCKET (bucket guard)");
+  const endpoint = env("S3X_ENDPOINT");
+  return createS3VersionReader({ bucket, region: env("S3X_REGION", "us-east-1")!, ...(endpoint ? { endpoint } : {}), credentials: key });
 }
 
 /** The verifier never touches the privacy authority: any call is a bug, refused loudly. */
@@ -293,13 +368,14 @@ async function verifyOnlyMain(stale: StalePrefixOptions): Promise<number> {
   const creds = await readStdinCredentials(["reader"], ["reader"]);
   const key = s3Credentials(creds.reader, "reader");
   delete creds.reader;
-  const endpoint = env("S3X_ENDPOINT");
-  const reader = createS3VersionReader({ bucket, region: env("S3X_REGION", "us-east-1")!, ...(endpoint ? { endpoint } : {}), credentials: key });
-  const state = new SyncState(env("S3X_STATE", `${process.env.HOME}/.agent-tmp/s3x/state.sqlite`)!, { obligations: obligationsEnabled() });
+  const reader = readerFor(key);
+  const statePath = env("S3X_STATE", `${process.env.HOME}/.agent-tmp/s3x/state.sqlite`)!;
+  const commit = verifierCommit();
+  const state = new SyncState(statePath, { obligations: obligationsEnabled() });
   try {
     const job = new ErasureJob(NO_AUTHORITY, state, eraserFor(false, undefined), log, { ...DEFAULT_ERASURE_CONFIG, keyRoot: env("S3X_KEY_ROOT", "96bulls")! });
     log({ message: "start", mode: "stale_prefixes_verify_only", allowlist_size: stale.onlyIdentities.length });
-    const receipt = await job.staleprefixVerify({ onlyIdentities: stale.onlyIdentities, reader, bucketSha256: sha256Hex(bucket) });
+    const receipt = await job.staleprefixVerify({ onlyIdentities: stale.onlyIdentities, reader, bucketSha256: sha256Hex(bucket), target: { stateIdentity: stateIdentity(statePath), verifierCommit: commit } });
     if (stale.receiptOut !== undefined) writeFileSync(stale.receiptOut, `${JSON.stringify(receipt, null, 2)}\n`, { flag: "wx", mode: 0o600 });
     else log({ message: "stale prefix receipt", receipt });
     return receipt.status === "PASS" ? 0 : 1;
@@ -319,8 +395,11 @@ export async function main(): Promise<number> {
   // more field of the same stdin credential JSON (never a file, env or argv).
   // The stale-prefixes-only mode never runs the phase (refused above unless BABYSITTER_RETENTION_SWEEP is off).
   const retention = stale ? undefined : phaseSettings(env, execute, env("S3X_KEY_ROOT", "96bulls")!);
-  const required = [...(execute ? ["databaseUrl", "eraser"] : ["databaseUrl"]), ...(retention && retention.mode !== "off" ? ["retentionDatabaseUrl"] : [])];
-  const creds = await readStdinCredentials(required, ["databaseUrl", "eraser", "retentionDatabaseUrl"]);
+  // The stale-prefix execute also needs the read-only reader key for its mandatory inline re-verification.
+  const required = [...(execute ? ["databaseUrl", "eraser"] : ["databaseUrl"]), ...(stale && execute ? ["reader"] : []), ...(retention && retention.mode !== "off" ? ["retentionDatabaseUrl"] : [])];
+  const creds = await readStdinCredentials(required, ["databaseUrl", "eraser", "retentionDatabaseUrl", ...(stale && execute ? ["reader"] : [])]);
+  const readerKey = creds.reader === undefined ? undefined : s3Credentials(creds.reader, "reader");
+  delete creds.reader;
   const retentionUrl = creds.retentionDatabaseUrl;
   delete creds.retentionDatabaseUrl;
   const url = authorityUrl(kind, creds.databaseUrl);
@@ -334,7 +413,8 @@ export async function main(): Promise<number> {
   delete creds.databaseUrl;
   delete creds.eraser;
   const obligations = obligationsEnabled();
-  const state = new SyncState(env("S3X_STATE", `${process.env.HOME}/.agent-tmp/s3x/state.sqlite`)!, { obligations });
+  const statePath = env("S3X_STATE", `${process.env.HOME}/.agent-tmp/s3x/state.sqlite`)!;
+  const state = new SyncState(statePath, { obligations });
   const { default: pg } = await import("pg");
   // The password is pinned from the stdin URL: pg can never fall back to ~/.pgpass (a credential on disk).
   const client = pinnedPgClient(pg, url, "databaseUrl", kind, { application_name: `96bulls-${kind}-s3-erasure` });
@@ -373,9 +453,13 @@ export async function main(): Promise<number> {
       // Execute: only through the receipt fence (the receipt and the attestation were required by the option parser).
       const fenced = execute
         ? {
-            receipt: parseReceipt(readBounded(stale.verifiedReceipt!, "stale_prefix_receipt_invalid")),
-            attestation: parseAttestationFile(readBounded(stale.protectionAttestation!, "stale_prefix_protection_unproven")),
+            receipt: parseReceipt(boundOperatorFile(stale.verifiedReceipt!, stale.receiptSha256!, "stale_prefix_receipt")),
+            attestation: parseAttestationFile(boundOperatorFile(stale.protectionAttestation!, stale.attestationSha256!, "stale_prefix_attestation")),
             bucketSha256: sha256Hex(env("S3X_BUCKET")!),
+            reader: readerFor(readerKey!),
+            target: { stateIdentity: stateIdentity(statePath), verifierCommit: verifierCommit() },
+            approvedAllowlistSha256: stale.approvedAllowlistSha256!,
+            approvedMax: stale.approvedMax!,
             ...(isReceiptFence(eraser) ? { fence: eraser } : {}),
           }
         : {};

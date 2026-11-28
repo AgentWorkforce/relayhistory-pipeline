@@ -19,8 +19,11 @@ export class FakeS3Versions {
   #n = 0;
   /** (listCall, xml) => xml : rewrite a page (1-based list call). */
   rewrite?: (call: number, xml: string) => string;
-  /** Called for every DELETE; return "lose" to apply it but answer 500. */
-  onDelete?: (key: string, id: string) => "lose" | void;
+  /**
+   * Called for every DELETE: "lose" applies it but answers 500; "transport" applies it, then fails the request
+   * (a timeout or connection reset after the provider acted); "transport-before" fails it without applying.
+   */
+  onDelete?: (key: string, id: string) => "lose" | "transport" | "transport-before" | void;
   /** GET ?lifecycle answer (default: S3's NoSuchLifecycleConfiguration 404). */
   lifecycle: { status: number; body: string } = NO_LIFECYCLE;
   /** GET ?versioning answer (default Enabled). */
@@ -95,7 +98,9 @@ export class FakeS3Versions {
       const key = decodeURIComponent(u.pathname.replace(/^\/b\//, "")), id = u.searchParams.get("versionId")!;
       this.deletes.push(`${key}@${id}`);
       const fault = this.onDelete?.(key, id);
+      if (fault === "transport-before") throw new TypeError("fetch failed");
       this.remove(key, id);
+      if (fault === "transport") throw new TypeError("fetch failed");
       return new Response(null, { status: fault === "lose" ? 500 : 204 });
     }
     return this.#list(u);
@@ -105,7 +110,7 @@ export class FakeS3Versions {
     return createS3VersionReader({ bucket: "b", region: "us-east-1", endpoint: "http://fake-s3.local", credentials: { accessKeyId: "a", secretAccessKey: "s" }, fetch: this.fetch });
   }
 
-  eraser() {
-    return createS3Eraser({ bucket: "b", region: "us-east-1", endpoint: "http://fake-s3.local", credentials: { accessKeyId: "a", secretAccessKey: "s" }, fetch: this.fetch });
+  eraser(opts: { requestDeadlineMs?: number } = {}) {
+    return createS3Eraser({ bucket: "b", region: "us-east-1", endpoint: "http://fake-s3.local", credentials: { accessKeyId: "a", secretAccessKey: "s" }, fetch: this.fetch, ...opts });
   }
 }
