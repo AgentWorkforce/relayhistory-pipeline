@@ -751,3 +751,40 @@ through its `session_index` pointer by the canonical readers, so the inherited-i
 4. **Every producer observation is PROVISIONAL until its actual commit and send paths are traced.** That covers
    staged-reconcile, Bob Costas, the brief input, publication-image and P5. The producer and raw-key reader tables
    above come from static call-site traces and file headers, not from end-to-end commit or send traces.
+
+### The enrollment boundary for in-flight external-send jobs (lander 54b45e7bdf80; design, no proof yet)
+
+The exclusion test starts with the org already enrolled. The open case: a model or analytics job passes its "not
+enrolled" check, parks, the org is enrolled and a covering erase commits, then the job resumes and sends.
+
+**Proposal: make the sender's exclusion key on the SQL hold, and hold the org key SHARED from the check to the send.**
+- Each external-send job (Bob Costas summary stages, briefTick, the brief analytics capture) runs its check and its
+  send inside one READ COMMITTED transaction. That transaction takes the org hold key SHARED, checks in a later
+  statement for any live hold or any `bridge_complete` history (and the S3 enrollment), and keeps the key until the
+  send has returned.
+- **What fences the in-flight jobs:** `_install` takes the org key EXCLUSIVE (the 062320 lifecycle). So install waits
+  for every sender already past its check, and enrollment only becomes effective at install. A sender that starts
+  after install sees the live hold and refuses before reading anything. Queued, retried and replayed jobs are all
+  checked at execution, under the key.
+- **What the boundary then is:** a parked job either finishes its send before install commits (it reads
+  pre-enrollment content, which is today's erase-versus-summarizer race, not a W2 effect), or it refuses. "Enroll,
+  then erase, then resume and send" cannot happen, because install cannot commit while the job holds the key.
+- **Costs and bounds:**
+  - Erasures take the key SHARED too, so they are never delayed by senders.
+  - Install, publish (EXCLUSIVE) and release wait for in-flight sends, so a sender must set a `lock_timeout` and
+    a maximum send duration, and install inherits that wait.
+  - A sender holds a database connection across an external call, which is a throughput coupling that needs a pool
+    bound.
+- **Order of operations at cutover:** S3 enrollment is written before install, so S3 consumers are fenced first.
+  Then install fences the SQL-side senders. A sender that checks only S3 enrollment is not enough for this boundary,
+  because the S3 PUT cannot wait for it.
+- **Owed:** the two-connection proof on PG17 (a sender holding SHARED blocks install, and a sender after install
+  refuses); a caller inventory of every external send; and deployment evidence. None of this is built.
+
+**baseCopies qualification (not met).** It needs:
+- the real destination-to-source binding to be written with the copy and to survive a copy retry;
+- every reachable generation reader and republisher to enforce it.
+The stand-in shows only the verdict logic.
+
+**Scope of evidence.** The 10 author-run passes in `cutover-visibility.pglite.test.ts` are stand-in evidence only.
+The reserved PG17 ordering run (8b7fc40e) is separate.
