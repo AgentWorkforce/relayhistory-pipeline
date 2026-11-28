@@ -46,6 +46,18 @@
  * outside the mode --max, --only-identity and any argument resembling the switch, --max or --only-identity (a
  * misspelled switch) are refused. --execute refuses to start while another eraser process holds an unexpired lease;
  * the mode never releases leases.
+ *
+ *   {"reader": <S3 key>} | bun run migration:neon-s3-erasure --stale-prefixes-only --verify-only --only-identity <sha256> [...] [--receipt-out <path>]
+ *
+ * Verify-only (READ-ONLY, stale-prefix-verify.ts): no database and no eraser key; a reader key (ListBucketVersions +
+ * GetObjectVersion) on stdin and the state file. Compares every version under each allowlisted old prefix, record by
+ * record, with the survivor's current pinned versions, and writes the receipt (hashes and counts only). Exit 0 PASS,
+ * 1 FAIL. --receipt-out is created, never overwritten.
+ *
+ * --execute in the mode REQUIRES --verified-receipt <path> (that receipt) and --protection-attestation <path> (the
+ * infra attestation, stale-prefix-verify.ts ProtectionAttestation). The protection preflight (lifecycle, versioning,
+ * attestation) and the per-item receipt fence (job.ts #receiptItem: exact old set, survivor pins current before every
+ * delete, the survivor-prefix lease) refuse before the first delete when anything is unproven.
  */
 import type { Queryable } from "../relayhistory-export.ts";
 import { sweepMode } from "../../session-ingest/babysitter-retention.ts";
@@ -55,7 +67,10 @@ import { errorCode } from "../neon-s3-sync/sync.ts";
 import { eraserDatabaseUrl, pinnedPgClient, readStdinCredentials, refuseCredentialEnv, s3Credentials, type S3Credentials } from "../stdin-credentials.ts";
 import { EXIT_CREDENTIALS_RENEW, expiringSoon, minRemainingMs } from "../short-lived-credentials.ts";
 import { assertEraserIdentity, neonAuthority, supabaseAuthority, type ErasureAuthorityKind } from "./authority.ts";
-import { createS3Eraser, isLiveObjectProbe, type Eraser, type PagedEraser } from "./eraser.ts";
+import { createS3Eraser, createS3VersionReader, isLiveObjectProbe, isReceiptFence, type Eraser, type PagedEraser } from "./eraser.ts";
+import { parseReceipt, sha256Hex, type ProtectionAttestation } from "./stale-prefix-verify.ts";
+import type { ErasureAuthority } from "./authority.ts";
+import { closeSync, fstatSync, openSync, readSync, writeFileSync } from "node:fs";
 import { DEFAULT_ERASURE_CONFIG, ErasureJob, STALE_PREFIX_ALLOWLIST_MAX } from "./job.ts";
 import { phaseSettings, poolConfig, startBabysitterPhase, type BabysitterPhase } from "./babysitter-phase.ts";
 
@@ -81,7 +96,20 @@ const optionRefusal = (code: string, message: string) => Object.assign(new Error
 function nearMissArgument(a: string): boolean {
   const lower = a.toLowerCase();
   const bare = lower.replace(/^-+/, "");
-  return lower.includes("stale") || lower.includes("prefix") || lower.includes("identit") || bare.startsWith("max") || bare.startsWith("only");
+  return lower.includes("stale") || lower.includes("prefix") || lower.includes("identit") || lower.includes("receipt") || lower.includes("verif")
+    || lower.includes("attest") || bare.startsWith("max") || bare.startsWith("only");
+}
+
+export interface StalePrefixOptions {
+  execute: boolean;
+  max?: number;
+  onlyIdentities: string[];
+  /** --verify-only: the read-only verifier (stale-prefix-verify.ts); never with --execute. */
+  verifyOnly: boolean;
+  receiptOut?: string;
+  /** --execute: both required (the receipt fence). */
+  verifiedReceipt?: string;
+  protectionAttestation?: string;
 }
 
 /**
@@ -93,7 +121,7 @@ function nearMissArgument(a: string): boolean {
  * or "only" in any case). Every other argument is left to the default job, which keeps ignoring what it does not use.
  * In the mode, `--only-identity <sha256>` (64 lowercase hex, repeatable, distinct, 1..100) is required, dry or not.
  */
-export function staleprefixOptions(args: readonly string[], e: (k: string) => string | undefined = (k) => process.env[k]): { execute: boolean; max?: number; onlyIdentities: string[] } | undefined {
+export function staleprefixOptions(args: readonly string[], e: (k: string) => string | undefined = (k) => process.env[k]): StalePrefixOptions | undefined {
   if (!args.includes("--stale-prefixes-only")) {
     if (args.some((a) => a === "--max" || a.startsWith("--max=")))
       throw optionRefusal("stale_prefix_max_without_mode", "--max applies only with --stale-prefixes-only");
@@ -103,8 +131,15 @@ export function staleprefixOptions(args: readonly string[], e: (k: string) => st
       throw optionRefusal("stale_prefix_mode_flag_refused", "an argument resembles the stale-prefix switch or --max but is not exactly --stale-prefixes-only: refused before the full job could run");
     return undefined;
   }
-  let execute = false, max: number | undefined, seen = 0;
+  let execute = false, max: number | undefined, seen = 0, verifyOnly = false;
+  let receiptOut: string | undefined, verifiedReceipt: string | undefined, protectionAttestation: string | undefined;
   const onlyIdentities: string[] = [];
+  const pathArg = (i: number, name: string, prior: string | undefined): string => {
+    if (prior !== undefined) throw optionRefusal("stale_prefix_path_invalid", `${name} given more than once`);
+    const v = args[i];
+    if (v === undefined || v === "" || v.startsWith("-")) throw optionRefusal("stale_prefix_path_invalid", `${name} takes one file path`);
+    return v;
+  };
   for (let i = 0; i < args.length; i++) {
     const a = args[i]!;
     if (a === "--stale-prefixes-only") seen += 1;
@@ -122,7 +157,13 @@ export function staleprefixOptions(args: readonly string[], e: (k: string) => st
         throw optionRefusal("stale_prefix_only_identity_invalid", "--only-identity takes one session identity hash: exactly 64 lowercase hex characters");
       if (onlyIdentities.includes(v)) throw optionRefusal("stale_prefix_only_identity_duplicate", "--only-identity given the same identity more than once");
       onlyIdentities.push(v);
-    } else throw optionRefusal("stale_prefix_mode_flag_refused", "--stale-prefixes-only accepts only --execute, --once, --max <n> and --only-identity <sha256>");
+    } else if (a === "--verify-only") {
+      if (verifyOnly) throw optionRefusal("stale_prefix_mode_flag_refused", "--verify-only given more than once");
+      verifyOnly = true;
+    } else if (a === "--receipt-out") receiptOut = pathArg(++i, "--receipt-out", receiptOut);
+    else if (a === "--verified-receipt") verifiedReceipt = pathArg(++i, "--verified-receipt", verifiedReceipt);
+    else if (a === "--protection-attestation") protectionAttestation = pathArg(++i, "--protection-attestation", protectionAttestation);
+    else throw optionRefusal("stale_prefix_mode_flag_refused", "--stale-prefixes-only accepts only --execute, --once, --max <n>, --only-identity <sha256>, --verify-only, --receipt-out <path>, --verified-receipt <path> and --protection-attestation <path>");
   }
   if (seen !== 1) throw optionRefusal("stale_prefix_mode_flag_refused", "--stale-prefixes-only given more than once");
   if (onlyIdentities.length === 0)
@@ -137,7 +178,17 @@ export function staleprefixOptions(args: readonly string[], e: (k: string) => st
   }
   if (retention !== "off") throw optionRefusal("stale_prefix_mode_retention_refused", "--stale-prefixes-only runs no babysitter phase: BABYSITTER_RETENTION_SWEEP must be off or unset");
   if (obligationsEnabled(e)) throw optionRefusal("stale_prefix_mode_requires_obligations_off", "--stale-prefixes-only runs only with S3X_OBLIGATIONS off");
-  return max === undefined ? { execute, onlyIdentities } : { execute, max, onlyIdentities };
+  if (verifyOnly && (execute || max !== undefined || verifiedReceipt !== undefined || protectionAttestation !== undefined))
+    throw optionRefusal("stale_prefix_verify_only_flag_refused", "--verify-only is read-only: it takes no --execute, --max, --verified-receipt or --protection-attestation");
+  if (receiptOut !== undefined && !verifyOnly) throw optionRefusal("stale_prefix_receipt_out_without_verify", "--receipt-out applies only with --verify-only");
+  if (!execute && (verifiedReceipt !== undefined || protectionAttestation !== undefined))
+    throw optionRefusal("stale_prefix_receipt_without_execute", "--verified-receipt and --protection-attestation apply only with --execute");
+  if (execute && verifiedReceipt === undefined) throw optionRefusal("stale_prefix_execute_requires_verified_receipt", "--execute requires --verified-receipt <path>");
+  if (execute && protectionAttestation === undefined) throw optionRefusal("stale_prefix_execute_requires_attestation", "--execute requires --protection-attestation <path>");
+  return {
+    execute, onlyIdentities, verifyOnly, ...(max !== undefined ? { max } : {}), ...(receiptOut !== undefined ? { receiptOut } : {}),
+    ...(verifiedReceipt !== undefined ? { verifiedReceipt } : {}), ...(protectionAttestation !== undefined ? { protectionAttestation } : {}),
+  };
 }
 
 const env = (k: string, d?: string) => process.env[k]?.trim() || d;
@@ -184,7 +235,7 @@ export function authorityUrl(kind: ErasureAuthorityKind, raw: unknown): string {
  * existing refusals for a held lease, or for a failed erase that was not an expiry stop.
  */
 export function stalePassStatus(r: { ok: boolean; refused?: string; stoppedBy?: string }, credStop: boolean): number {
-  if (r.refused) throw optionRefusal(r.refused, "another eraser holds an unexpired lease: the stale-prefix pass did not start");
+  if (r.refused) throw optionRefusal(r.refused, "the stale-prefix pass refused to start (nothing erased)");
   // A genuine failed erase (ok=false, stoppedBy=<outcome>) always fails, even if the expiry timer also fired.
   if (!r.ok) throw optionRefusal("stale_prefix_pass_stopped", "the stale-prefix pass stopped at a failed erase");
   // An expiry stop (the job's stop signal; ok stays true) is a partial pass: renew and rerun, never success.
@@ -202,11 +253,67 @@ export function runStatus(status: number, credStop: boolean): number {
   return credStop ? EXIT_CREDENTIALS_RENEW : status;
 }
 
+/** A small operator file (receipt or attestation), bounded; any read failure is the given refusal code. */
+export function readBounded(path: string, code: string, max = 32 * 1024 * 1024): string {
+  let fd: number | undefined;
+  try {
+    fd = openSync(path, "r");
+    const size = fstatSync(fd).size;
+    if (!fstatSync(fd).isFile() || size > max) throw new Error("not a bounded regular file");
+    const buf = Buffer.alloc(size);
+    let at = 0;
+    while (at < size) { const n = readSync(fd, buf, at, size - at, at); if (n <= 0) break; at += n; }
+    return new TextDecoder("utf-8", { fatal: true }).decode(buf.subarray(0, at));
+  } catch {
+    throw optionRefusal(code, "an operator file could not be read");
+  } finally {
+    if (fd !== undefined) closeSync(fd);
+  }
+}
+
+/** The attestation as JSON only; its facts are checked by the job's preflight (stale-prefix-verify.ts attestationProblem). */
+export function parseAttestationFile(text: string): ProtectionAttestation {
+  try { return JSON.parse(text) as ProtectionAttestation; } catch { throw optionRefusal("stale_prefix_protection_unproven", "the protection attestation is not JSON"); }
+}
+
+/** The verifier never touches the privacy authority: any call is a bug, refused loudly. */
+const NO_AUTHORITY = new Proxy({ kind: "neon" }, {
+  get: (t, k) => (k === "kind" ? t.kind : k === "then" ? undefined : () => { throw optionRefusal("verify_only_no_authority", "the verifier reads no authority"); }),
+}) as unknown as ErasureAuthority;
+
+/**
+ * `--stale-prefixes-only --verify-only`: READ-ONLY. stdin carries exactly {"reader": <S3 key, the eraser key's
+ * shapes>} (ListBucketVersions + GetObjectVersion; no database, no eraser key). Reads the state file, lists and GETs
+ * by version id, writes the receipt to --receipt-out (created, never overwritten, mode 0600) or else as one stdout
+ * line. Exit 0 when the receipt is PASS, 1 when FAIL. Logs: counts and hashes only.
+ */
+async function verifyOnlyMain(stale: StalePrefixOptions): Promise<number> {
+  const bucket = env("S3X_BUCKET");
+  if (!bucket || env("S3X_EXPECT_BUCKET") !== bucket) throw new Error("S3X_BUCKET must equal S3X_EXPECT_BUCKET (bucket guard)");
+  const creds = await readStdinCredentials(["reader"], ["reader"]);
+  const key = s3Credentials(creds.reader, "reader");
+  delete creds.reader;
+  const endpoint = env("S3X_ENDPOINT");
+  const reader = createS3VersionReader({ bucket, region: env("S3X_REGION", "us-east-1")!, ...(endpoint ? { endpoint } : {}), credentials: key });
+  const state = new SyncState(env("S3X_STATE", `${process.env.HOME}/.agent-tmp/s3x/state.sqlite`)!, { obligations: obligationsEnabled() });
+  try {
+    const job = new ErasureJob(NO_AUTHORITY, state, eraserFor(false, undefined), log, { ...DEFAULT_ERASURE_CONFIG, keyRoot: env("S3X_KEY_ROOT", "96bulls")! });
+    log({ message: "start", mode: "stale_prefixes_verify_only", allowlist_size: stale.onlyIdentities.length });
+    const receipt = await job.staleprefixVerify({ onlyIdentities: stale.onlyIdentities, reader, bucketSha256: sha256Hex(bucket) });
+    if (stale.receiptOut !== undefined) writeFileSync(stale.receiptOut, `${JSON.stringify(receipt, null, 2)}\n`, { flag: "wx", mode: 0o600 });
+    else log({ message: "stale prefix receipt", receipt });
+    return receipt.status === "PASS" ? 0 : 1;
+  } finally {
+    state.close();
+  }
+}
+
 /** Runs the job and returns its exit status (0, or EXIT_CREDENTIALS_RENEW); a refusal or failure throws. */
 export async function main(): Promise<number> {
   const execute = flag("execute");
   const stale = staleprefixOptions(process.argv.slice(2));
   refuseCredentialEnv();
+  if (stale?.verifyOnly) return verifyOnlyMain(stale);
   const kind = authorityKind(env("S3X_PRIVACY_AUTHORITY"));
   // Babysitter retention phase (additive): off without --execute; when on, its registry login is one
   // more field of the same stdin credential JSON (never a file, env or argv).
@@ -263,7 +370,16 @@ export async function main(): Promise<number> {
     if (stale) {
       // One pass, no sweep, no phase. A dry run's eraser has no existence check: it reports sibling_checked false.
       log({ message: "start", mode: "stale_prefixes_only", execute, authority: kind, obligations, allowlist_size: stale.onlyIdentities.length, ...(stale.max !== undefined ? { max: stale.max } : {}) });
-      const r = await job.staleprefixPass({ execute, onlyIdentities: stale.onlyIdentities, ...(stale.max !== undefined ? { max: stale.max } : {}), ...(isLiveObjectProbe(eraser) ? { probe: eraser } : {}) });
+      // Execute: only through the receipt fence (the receipt and the attestation were required by the option parser).
+      const fenced = execute
+        ? {
+            receipt: parseReceipt(readBounded(stale.verifiedReceipt!, "stale_prefix_receipt_invalid")),
+            attestation: parseAttestationFile(readBounded(stale.protectionAttestation!, "stale_prefix_protection_unproven")),
+            bucketSha256: sha256Hex(env("S3X_BUCKET")!),
+            ...(isReceiptFence(eraser) ? { fence: eraser } : {}),
+          }
+        : {};
+      const r = await job.staleprefixPass({ execute, onlyIdentities: stale.onlyIdentities, ...(stale.max !== undefined ? { max: stale.max } : {}), ...(isLiveObjectProbe(eraser) ? { probe: eraser } : {}), ...fenced });
       // Returned through the finally below, which cleans up first; an expiry stop exits 75, never 0.
       return stalePassStatus(r, credStop);
     }

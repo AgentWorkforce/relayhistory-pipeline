@@ -372,7 +372,12 @@ export function assertInventoryXml(xml: string, root = "ListVersionsResult"): vo
   if (stack.length || roots !== 1 || xml.slice(at).trim()) throw coded("erasure_inventory", "incomplete version inventory");
 }
 
-export function createS3Eraser(cfg: S3EraserConfig): Eraser & PreservedVersionEraser & PagedEraser & LiveObjectProbe {
+/**
+ * The signed S3 plumbing every S3 role here shares (the eraser, and the read-only stale-prefix verifier): one URL
+ * builder, one signed request (status-only errors: S3 error bodies can echo keys), and THE strict ListObjectVersions
+ * page parser. `label` names the credential in a short-lived refusal (`short_lived_expired.<label>`).
+ */
+function s3Core(cfg: S3EraserConfig, label: string) {
   const doFetch = cfg.fetch ?? ((...a: Parameters<typeof fetch>) => fetch(...a));
   const url = (key = "") => {
     if (cfg.endpoint) {
@@ -382,13 +387,13 @@ export function createS3Eraser(cfg: S3EraserConfig): Eraser & PreservedVersionEr
     }
     return new URL(`https://${cfg.bucket}.s3.${cfg.region}.amazonaws.com/${key ? encodeKeyPath(key) : ""}`);
   };
-  const request = async (method: string, u: URL) => {
+  const request = async (method: string, u: URL, passStatuses: readonly number[] = []) => {
     const headers = new Headers();
-    refuseIfExpired(cfg.credentials, "eraser", Date.now()); // a short-lived key is never used to sign past expiry
+    refuseIfExpired(cfg.credentials, label, Date.now()); // a short-lived key is never used to sign past expiry
     await signRequest({ method, url: u, headers, payloadSha256: await sha256Hex(new Uint8Array()), region: cfg.region, credentials: cfg.credentials });
     const res = await doFetch(u, { method, headers });
     // Status only: S3 error bodies can echo keys.
-    if (!res.ok && !(method === "DELETE" && res.status === 404)) throw coded(`s3_${res.status}`, `S3 ${method} failed`);
+    if (!res.ok && !(method === "DELETE" && res.status === 404) && !passStatuses.includes(res.status)) throw coded(`s3_${res.status}`, `S3 ${method} failed`);
     return res;
   };
 
@@ -469,6 +474,11 @@ export function createS3Eraser(cfg: S3EraserConfig): Eraser & PreservedVersionEr
     }
   }
 
+  return { url, request, fetchPage, versions };
+}
+
+export function createS3Eraser(cfg: S3EraserConfig): Eraser & PreservedVersionEraser & PagedEraser & LiveObjectProbe & ReceiptFence {
+  const { url, request, fetchPage, versions } = s3Core(cfg, "eraser");
   async function remove(list: Version[]): Promise<number> {
     if (list.some((v) => v.key.split("/").some((seg) => seg === "." || seg === "..")))
       throw coded("erasure_key_shape", "a key with a dot segment would be normalized away");
@@ -528,6 +538,17 @@ export function createS3Eraser(cfg: S3EraserConfig): Eraser & PreservedVersionEr
       if (!prefix.endsWith("/")) throw coded("erasure_prefix_shape", "a prefix ends in /");
       return [...new Set((await versions(prefix)).map((v) => v.key))];
     },
+    listVersions: (prefix) => strictInventory(fetchPage, prefix),
+    // Exactly one version by id: never a plain DELETE (that would only add a delete marker on a versioned bucket).
+    deleteVersion: async (key, versionId) => {
+      assertUnderPrefix(key.slice(0, key.lastIndexOf("/") + 1), [{ key, versionId }]);
+      if (!versionId || /[\x00-\x1f\x7f]/u.test(versionId)) throw coded("erasure_key_shape", "an exact version id is required");
+      const u = url(key);
+      u.searchParams.set("versionId", versionId);
+      await request("DELETE", u);
+    },
+    bucketLifecycle: () => readLifecycle(url, request),
+    bucketVersioning: () => readVersioning(url, request),
     // One strict ListObjectVersions page at the exact key (no GetObject/HeadObject grant needed). The exact key sorts
     // first under its own prefix and S3 lists its versions newest first, so its IsLatest entry is on the first page.
     objectLive: async (key) => {
@@ -538,6 +559,137 @@ export function createS3Eraser(cfg: S3EraserConfig): Eraser & PreservedVersionEr
       const latest = page.entries.filter((v) => v.key === key && v.latest);
       return latest.length === 1 && !latest[0]!.deleteMarker;
     },
+  };
+}
+
+// ------------------------------------------------------------------ stale-prefix verification and receipt fence
+
+/** A strict, complete, bounded version inventory of one directory prefix (every version and delete marker). */
+export interface VersionLister {
+  listVersions(prefix: string): Promise<ListedVersion[]>;
+}
+/** Read-only: the lister plus GET of one exact object version (bounded bytes). Needs s3:GetObjectVersion. */
+export interface VersionReader extends VersionLister {
+  getVersion(key: string, versionId: string, maxBytes: number): Promise<Uint8Array>;
+}
+/** The bucket's lifecycle configuration as read (raw XML only when rules exist); never guessed. */
+export type LifecycleRead = { status: "none" } | { status: "rules"; xml: string } | { status: "unreadable"; code: string };
+export type VersioningRead = { status: "Enabled" | "Suspended" | "Unversioned" } | { status: "unreadable"; code: string };
+export interface BucketProtectionReader {
+  bucketLifecycle(): Promise<LifecycleRead>;
+  bucketVersioning(): Promise<VersioningRead>;
+}
+/**
+ * What the receipt-fenced stale-prefix execute needs from the store, and nothing more: the strict inventory (old-set
+ * drift and survivor pin checks are ListObjectVersions, so the eraser key needs no GetObject), exact-version deletes,
+ * and the read-only bucket protection facts for the preflight.
+ */
+export interface ReceiptFence extends VersionLister, BucketProtectionReader {
+  deleteVersion(key: string, versionId: string): Promise<void>;
+}
+export function isReceiptFence(e: unknown): e is ReceiptFence {
+  return !!e && ["listVersions", "deleteVersion", "bucketLifecycle", "bucketVersioning"].every((m) => typeof (e as Record<string, unknown>)[m] === "function");
+}
+
+/**
+ * THE strict whole-prefix inventory, over any strict page fetcher: the same page rules as the paged eraser (checkPage:
+ * every key under the prefix, no dot segments, C order, no duplicate in a page, monotonic cursor, markers equal to the
+ * last entry), no duplicate across pages, no cursor cycle, and the same hard bounds (10,000 versions, 100 pages); any
+ * breach throws, never a short list.
+ */
+export async function strictInventory(fetchPage: PageFetcher, prefix: string): Promise<ListedVersion[]> {
+  if (!prefix.endsWith("/") || prefix.split("/").some((seg) => seg === "." || seg === ".."))
+    throw coded("erasure_prefix_shape", "a prefix ends in / and has no dot segment");
+  const out: ListedVersion[] = [];
+  const seen = new Set<string>(), cursors = new Set<string>();
+  let keyMarker: string | undefined, versionMarker: string | undefined, pages = 0;
+  for (;;) {
+    if (pages >= ERASE_RUN_MAX_PAGES) throw coded("erasure_inventory", "version pagination is unbounded");
+    const page = await fetchPage(prefix, keyMarker, versionMarker);
+    pages++;
+    checkPage(prefix, page, keyMarker, versionMarker);
+    for (const v of page.entries) {
+      const id = JSON.stringify([v.key, v.versionId]);
+      if (seen.has(id)) throw coded("erasure_inventory", "duplicate version across inventory pages");
+      seen.add(id);
+      out.push(v);
+    }
+    if (out.length > ERASE_RUN_MAX_VERSIONS) throw coded("erasure_inventory", "version inventory exceeds bound");
+    if (!page.truncated) return out;
+    keyMarker = page.nextKey; versionMarker = page.nextVersion;
+    const c = JSON.stringify([keyMarker, versionMarker]);
+    if (cursors.has(c)) throw coded("erasure_inventory", "version pagination cycle");
+    cursors.add(c);
+  }
+}
+
+/** A response body read to at most `max` bytes (refused beyond it). */
+async function boundedBody(res: Response, max: number, code: string): Promise<Uint8Array> {
+  const reader = res.body?.getReader(), chunks: Uint8Array[] = []; let size = 0;
+  try {
+    if (!reader) return new Uint8Array();
+    for (;;) {
+      const r = await reader.read(); if (r.done) break;
+      size += r.value.byteLength;
+      if (size > max) throw coded(code, "response byte bound");
+      chunks.push(r.value);
+    }
+  } finally { await reader?.cancel().catch(() => {}); reader?.releaseLock(); }
+  const body = new Uint8Array(size); let at = 0;
+  for (const c of chunks) { body.set(c, at); at += c.byteLength; }
+  return body;
+}
+const utf8Strict = (b: Uint8Array, code: string) => {
+  try { return new TextDecoder("utf-8", { fatal: true, ignoreBOM: false }).decode(b); } catch { throw coded(code, "response encoding"); }
+};
+type Requester = (method: string, u: URL, pass?: readonly number[]) => Promise<Response>;
+
+/** GetBucketLifecycleConfiguration, read-only. Only S3's own NoSuchLifecycleConfiguration means "no rules". */
+async function readLifecycle(url: (k?: string) => URL, request: Requester): Promise<LifecycleRead> {
+  const u = url(); u.searchParams.set("lifecycle", "");
+  let res: Response;
+  try { res = await request("GET", u, [404]); } catch (e) { return { status: "unreadable", code: (e as { code?: string }).code ?? "s3_error" }; }
+  try {
+    const xml = utf8Strict(await boundedBody(res, 1024 * 1024, "lifecycle_unreadable"), "lifecycle_unreadable");
+    if (res.status === 404) return /<Code>NoSuchLifecycleConfiguration<\/Code>/.test(xml) ? { status: "none" } : { status: "unreadable", code: "s3_404" };
+    return { status: "rules", xml };
+  } catch (e) { return { status: "unreadable", code: (e as { code?: string }).code ?? "lifecycle_unreadable" }; }
+}
+
+/** GetBucketVersioning, read-only: no Status element means the bucket was never versioned. */
+async function readVersioning(url: (k?: string) => URL, request: Requester): Promise<VersioningRead> {
+  const u = url(); u.searchParams.set("versioning", "");
+  try {
+    const xml = utf8Strict(await boundedBody(await request("GET", u), 64 * 1024, "versioning_unreadable"), "versioning_unreadable");
+    assertInventoryXml(xml, "VersioningConfiguration");
+    const st = xmlText(xml, "Status");
+    if (st === undefined) return { status: "Unversioned" };
+    if (st === "Enabled" || st === "Suspended") return { status: st };
+    return { status: "unreadable", code: "versioning_unknown" };
+  } catch (e) { return { status: "unreadable", code: (e as { code?: string }).code ?? "versioning_unreadable" }; }
+}
+
+/**
+ * The stale-prefix verifier's READ-ONLY client (ListBucketVersions + GetObjectVersion): the same signed core and
+ * strict inventory as the eraser, plus GET of one exact version. It has no delete method at all.
+ */
+export function createS3VersionReader(cfg: S3EraserConfig): VersionReader & BucketProtectionReader {
+  const { url, request, fetchPage } = s3Core(cfg, "reader");
+  return {
+    listVersions: (prefix) => strictInventory(fetchPage, prefix),
+    async getVersion(key, versionId, maxBytes) {
+      if (!key || key.endsWith("/") || key.split("/").some((seg) => seg === "." || seg === "..")) throw coded("erasure_key_shape", "a GET names one object");
+      if (!versionId || /[\x00-\x1f\x7f]/u.test(versionId)) throw coded("erasure_key_shape", "an exact version id is required");
+      const u = url(key);
+      u.searchParams.set("versionId", versionId);
+      const res = await request("GET", u);
+      // The provider must answer with the very version asked for.
+      const got = res.headers.get("x-amz-version-id");
+      if (got !== versionId) { await res.body?.cancel().catch(() => {}); throw coded("reader_version_mismatch", "the response is not the requested version"); }
+      return boundedBody(res, maxBytes, "reader_object_too_large");
+    },
+    bucketLifecycle: () => readLifecycle(url, request),
+    bucketVersioning: () => readVersioning(url, request),
   };
 }
 
