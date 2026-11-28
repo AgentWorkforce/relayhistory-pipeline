@@ -788,3 +788,37 @@ The stand-in shows only the verdict logic.
 
 **Scope of evidence.** The 10 author-run passes in `cutover-visibility.pglite.test.ts` are stand-in evidence only.
 The reserved PG17 ordering run (8b7fc40e) is separate.
+
+### The external boundary, pinned (lander 6b1d1deebc42)
+
+**The SHARED-key fence above orders install only against a sender whose DB transaction survives.** If the sender's
+session dies (crash, partition, kill), its key goes with it. The install commits, and the sender's process can still
+resume and send. Case 4 of `cutover-sender-fence.postgres.test.ts` (written, not run) shows the controlled receiver
+observing a request initiated after the install. A timeout or a lost response also leaves remote acceptance unknown
+after the lock is released. So that fence is **withdrawn as a guarantee**, and the boundary is pinned as follows.
+
+| Stage of an external send | Guaranteed against enrollment? |
+|---|---|
+| **Request initiation** | Only with the drain protocol below: no sender process for the org exists after enrollment |
+| **Remote acceptance** | **No.** A request initiated before enrollment can be accepted after it: an ambiguous send |
+| **Delivery and storage at the receiver** | **No.** It is outside our control; a model provider has no fence we can enforce |
+
+**Drain protocol (proposal: the exclusion of external senders must become effective BEFORE enrollment):**
+1. **Deny.** A sender-side deny for the org ships in every sender revision (Bob Costas, briefTick, the analytics
+   capture). It is checked at job execution, so queued, retried and replayed jobs are covered.
+2. **Drain.** Before `enrollOrg`, the operator proves:
+   - every running sender process is on a revision with the deny (deployment evidence, not a flag read);
+   - the org has no queued or leased sender job (the job tables or queues empty for the org);
+   - every send initiated before the deny has resolved, or has been waited out to its maximum send duration plus
+     the client timeout.
+   Only then is the org enrolled.
+3. **Ambiguous sends.** A send initiated before the drain completed whose response was lost is treated as
+   **accepted**. Its input is pre-enrollment content, and its erase race is the one every org has today. W2 claims
+   nothing about it.
+
+**If acceptance after install must be excluded, it needs a receiver-side fence**, meaning a receiver that refuses a
+request carrying a stale fencing token. That is possible only for receivers we operate, such as our own analytics
+ingest, and **not for third-party model providers**. Without one, the strongest claim is "no request initiated after
+the drain completes". Remote acceptance and delivery are not covered.
+
+**Not qualified by the stand-in tests:** baseCopies, and the real send paths.

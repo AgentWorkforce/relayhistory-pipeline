@@ -7,6 +7,9 @@
  *     commits only after the send, so "enroll, erase, resume and send" cannot interleave
  *   2 a sender that starts after the install refuses before any read (the live hold, read under the key)
  *   3 an erase (its 062340 trigger takes the key SHARED) is never blocked by an in-flight sender
+ *   4 COUNTEREXAMPLE (lander 6b1d1deebc42): the sender passes its check, its DB session is terminated (the SHARED key
+ *     goes with it), the install commits, then the sender's process resumes and sends to a controlled receiver. The
+ *     receiver observes a request initiated AFTER the install: the DB lock cannot bound the external boundary.
  * Not run by its author: needs its own reserved PG17 slot (claim-ci).
  */
 import { afterEach, describe, expect, setDefaultTimeout, test } from "bun:test";
@@ -71,5 +74,24 @@ describe.skipIf(!url)("external-send fence at the enrollment boundary (real Post
     const p = await pair(db);
     const r = await expectNotBlocked(p, { holder: p.a, waiter: p.b, hold: (c) => senderCheck(c), wait: (c) => c.query(deletion) });
     expect(r.waited.ok).toBe(true);
+  });
+
+  test("4. counterexample: a sender whose DB session is terminated after its check still sends after the install commits", async () => {
+    const { db, o } = await database();
+    const p = await pair(db);
+    // A controlled receiver: what it observes, in order, against the install's commit.
+    const received: { at: "before_install" | "after_install" }[] = [];
+    let installed = false;
+    const receiver = (input: string) => { void input; received.push({ at: installed ? "after_install" : "before_install" }); };
+    await p.a.query("BEGIN");
+    expect(await senderCheck(p.a)).toBe("may_send");
+    // The sender's DB session dies (a crash, a network partition, an operator kill): its transaction and key go.
+    await p.observer.query("SELECT pg_terminate_backend($1)", [p.a.pid]);
+    // The install no longer waits: it commits.
+    await install(o);
+    installed = true;
+    // The sender's process resumes and sends: nothing in the DB can stop it.
+    receiver("pre-enrollment content");
+    expect(received).toEqual([{ at: "after_install" }]);
   });
 });
