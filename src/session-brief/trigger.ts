@@ -17,7 +17,7 @@
  *     brief covers is a no-op. So duplicates, A/B/A, any reordering and redelivery after a lease or a retry converge
  *     on one row state (LEAST and the coverage check commute). trigger_id is for tracing, never for dedupe.
  *
- * Status of each rule: [Pipeline] = decided by Pipeline (contract owner of record, 378d6d3d3ddf via Skip);
+ * Status of each rule: [Pipeline] = decided by Pipeline (contract owner of record; receipt 252419350106017792);
  * [owner] = proposed by the T130 owner (sessions-latency-owner); [builder] = proposed by this slice. Still open with
  * Pipeline: the producer hook point and the backoff floor.
  *
@@ -40,8 +40,8 @@
  *
  * Delivery: hosted, a standard queue (SESSION_BRIEF_QUEUE_URL, DLQ, event source mapping); a consumer handed a hint
  * before its claim time hands it off durably (re-enqueue delayed, at most 900 s a hop) and acknowledges only after a
- * run or a successful handoff; a recovery tick enqueues `sweep` hints every SESSION_BRIEF_SWEEP_SECONDS (hosted sets
- * 300). Self-host: the native worker polls the table; no queue; the existing SESSION_BRIEF_SWEEP_SECONDS default (0,
+ * run or a successful handoff. The hosted one-minute tick checks due work every minute; SESSION_BRIEF_SWEEP_SECONDS
+ * (hosted sets 300) gates only its lost-hint scan. [Pipeline] Self-host: the native worker polls the table; no queue; the existing SESSION_BRIEF_SWEEP_SECONDS default (0,
  * off) is unchanged for a direct worker (the native chart renders its own value).
  *
  * Nothing here logs; ids travel only inside hints and SQL parameters.

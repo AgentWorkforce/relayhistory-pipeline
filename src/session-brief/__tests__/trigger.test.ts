@@ -137,10 +137,9 @@ class Sim {
               this.sweptAt.push(this.now);
             }
         }
-        // Due-time gating: the tick claims only rows that are claimable now. Hosted [Pipeline]: the minute tick does a
-        // full lost-hint scan only on the sweep cadence (hints drive claims in between); self-host polls every tick.
-        if (!this.opts.hosted || this.lastSweep === this.now)
-          for (const [harness, row] of [...this.rows]) if (!row.state.leased && this.claimable(harness, row.state) <= this.now) this.claim(harness);
+        // Due-time gating [Pipeline 252419350106017792]: every tick (hosted: the one-minute tick) checks due work and
+        // claims only rows claimable now; the sweep cadence above gates only the lost-hint (lost-arm) scan.
+        for (const [harness, row] of [...this.rows]) if (!row.state.leased && this.claimable(harness, row.state) <= this.now) this.claim(harness);
       }
     }
   }
@@ -386,14 +385,14 @@ describe("session-brief trigger: offline fixtures", () => {
   test("sweep fixture 1, hosted: explicit 300 s with one-minute ticks and due-time gating", () => {
     const sim = new Sim({ hosted: true, tickSeconds: 60, sweepSeconds: briefTriggerConfig({ SESSION_BRIEF_SWEEP_SECONDS: "300" }).sweepSeconds });
     sim.briefs.set("claude", { revision: 0, ready: true, lastAttempt: T0 - 600_000 });
-    sim.commit("claude", 1, { lose: true }); // armed, the hint lost: only the 300 s full lost-hint scan finds it
+    sim.commit("claude", 1, { lose: true }); // armed, the hint lost: the one-minute tick checks due work
     sim.advance(9 * 60_000);
     expect(sim.runs).toHaveLength(0); // not due yet: no tick claims early
-    sim.advance(6 * 60_000);
+    sim.advance(3 * 60_000);
     expect(sim.runs).toHaveLength(1);
-    // The actual claim time, recorded: at the first full scan on or after the due time (scans at T0+300 s, +600 s).
+    // The actual claim time, recorded: the first minute tick on or after the due time (T0 + 600 s).
     expect(sim.runs[0]!.claimedAt).toBe(T0 + 600_000);
-    expect(sim.runs[0]!.claimedAt - sim.runs[0]!.claimableAt).toBeLessThanOrEqual(300_000); // diagnostic: due to claim
+    expect(sim.runs[0]!.claimedAt - sim.runs[0]!.claimableAt).toBeLessThanOrEqual(60_000); // diagnostic: due to claim
     expect(briefMiss(T0, sim.runs[0]!.claimedAt)).toBe(true); // scored from the upload: a 600 s refresh window misses
     // A lost ARM (no wakeup row at all) is recovered only by the sweep, at its 300 s cadence.
     sim.now += 1;
