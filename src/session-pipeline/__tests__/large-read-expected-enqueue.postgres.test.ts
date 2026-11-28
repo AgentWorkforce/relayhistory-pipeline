@@ -225,4 +225,20 @@ describe.skipIf(!url)("capture-bound large-read enqueue prototype (real PostgreS
     expect(await expected(o, A)).toMatchObject({ enqueued: true, changed: false, state: "running" });
     expect(await job(o)).toEqual(before);
   });
+
+  test("11. source change after claim: the worker's heartbeat refuses (lease lost, no publication path); the row is not rewritten", async () => {
+    const { o } = await rig();
+    const A = await capture(o);
+    expect(await expected(o, A)).toMatchObject({ enqueued: true, changed: true });
+    const claimed = await claim(o);
+    expect(claimed).toMatchObject({ source: A });
+    const nonce = claimed.leaseNonce as string;
+    const beat = () => o.query("SELECT sessions.heartbeat_session_large_read($1,$2,$3,$4,$5::uuid) ok", [S.org, S.ws, S.harness, "large:replay", nonce]).then((r) => r.rows[0].ok);
+    expect(await beat()).toBe(true);
+    await moveEpoch(o);
+    const before = await job(o);
+    expect(await beat()).toBe(false); // runLargeReadOnce stops on a lost lease; publish_session_large_read also checks the source
+    expect(await job(o)).toEqual(before);
+    expect(await jobRow(o)).toMatchObject({ state: "running", epoch: A.epoch, leased: true });
+  });
 });
