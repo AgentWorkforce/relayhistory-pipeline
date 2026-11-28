@@ -79,19 +79,29 @@ describe.skipIf(!url)("external-send fence at the enrollment boundary (real Post
   test("4. counterexample: a sender whose DB session is terminated after its check still sends after the install commits", async () => {
     const { db, o } = await database();
     const p = await pair(db);
-    // A controlled receiver: what it observes, in order, against the install's commit.
-    const received: { at: "before_install" | "after_install" }[] = [];
+    // The ordered evidence, printed for the receipt: sender_checked, session_lost, install_committed, receiver_accepted.
+    const events: string[] = [];
     let installed = false;
-    const receiver = (input: string) => { void input; received.push({ at: installed ? "after_install" : "before_install" }); };
+    const received: { at: "before_install" | "after_install" }[] = [];
+    const receiver = (input: string) => { void input; received.push({ at: installed ? "after_install" : "before_install" }); events.push(`receiver_accepted:${installed ? "after_install" : "before_install"}`); };
     await p.a.query("BEGIN");
     expect(await senderCheck(p.a)).toBe("may_send");
-    // The sender's DB session dies (a crash, a network partition, an operator kill): its transaction and key go.
-    await p.observer.query("SELECT pg_terminate_backend($1)", [p.a.pid]);
-    // The install no longer waits: it commits.
-    await install(o);
+    events.push("sender_checked");
+    // The sender's DB session dies (a crash, a partition, an operator kill): its transaction and its SHARED key go.
+    const killed = (await p.observer.query("SELECT pg_terminate_backend($1) AS k", [p.a.pid])).rows[0].k;
+    expect(killed).toBe(true);
+    const gone = await p.a.query("SELECT 1").then(() => false, () => true);
+    expect(gone).toBe(true);
+    events.push("session_lost");
+    // The install no longer waits for it: it commits.
+    expect((await install(o)).rows[0].e).toMatch(/^[0-9a-f-]{36}$/);
     installed = true;
-    // The sender's process resumes and sends: nothing in the DB can stop it.
+    events.push("install_committed");
+    // The sender's process resumes and sends: nothing in the database can stop it.
     receiver("pre-enrollment content");
+    console.log(`# sender-fence case 4 order: ${events.join(" -> ")}`);
+    expect(events).toEqual(["sender_checked", "session_lost", "install_committed", "receiver_accepted:after_install"]);
+    // SAFETY VERDICT: this test PASSING demonstrates the gap: the receiver accepted a send after the install.
     expect(received).toEqual([{ at: "after_install" }]);
   });
 });
