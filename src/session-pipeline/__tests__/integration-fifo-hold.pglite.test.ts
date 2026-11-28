@@ -304,4 +304,38 @@ describe("(c) delayed and duplicate A against B: B's queue work stays intact", (
     expect(f.standard.slice(2).map((m) => m.hold && { epoch: m.hold.epoch, fingerprint: m.hold.fingerprint })).toEqual([{ epoch: b.epoch, fingerprint: b.fingerprint }]);
     expect(await f.jobs()).toEqual([expect.objectContaining({ state: "queued" })]);
   }, 60_000);
+
+  test("saved B wakeup FIRST, then delayed and duplicate hold-only A: zero B holds created or extended before B's wakeup runs; then the saved B wakeup runs and B's work survives", async () => {
+    const f = await fixture();
+    f.deps.deadlineIsolation = { ...f.deps.deadlineIsolation!, current: (scope) => captureLargeReadSource(f.x.db, scope) };
+    const b = (await captureLargeReadSource(f.x.db, own))!.source;
+    const isB = (m: F["standard"][number]) => m.hold?.epoch === b.epoch && m.hold?.fingerprint === b.fingerprint;
+    // B's own routing on the FIFO path: first hit, job enqueued, one hold for B. That hold is B's scheduled wakeup: saved.
+    expect(await f.fifo([await f.fifoRecord(1)])).toEqual([]);
+    expect(f.standard.filter(isB)).toHaveLength(1);
+    const savedB = f.standard[0]!;
+    const job = await jobRow(f);
+    const sentBefore = f.standard.length;
+    // Delayed, then duplicate, hold-only deliveries carrying expected A.
+    for (let i = 0; i < 2; i++) {
+      f.clock.t += 1_000;
+      expect(await f.plain(requeueBody(f.key, new Date(f.clock.t).toISOString(), holdA(3)))).toEqual([]);
+    }
+    const sentByA = f.standard.slice(sentBefore);
+    // Counted BEFORE B's wakeup runs: the A holds created or extended ZERO B holds. B's job row exists, so the
+    // obsolete A hold is covered by it: no send at all.
+    expect(sentByA.filter(isB)).toHaveLength(0);
+    expect(sentByA).toEqual([]);
+    expect(await jobRow(f)).toEqual(job);
+    expect(passes).toBe(1);
+    // Now the saved B wakeup runs: it holds again for B (its job is still queued), with the next sequence.
+    f.clock.t += MIN;
+    expect(await wake(f, savedB)).toEqual([]);
+    const after = f.standard.slice(sentBefore);
+    expect(after).toHaveLength(1);
+    expect(isB(after[0]!)).toBe(true);
+    expect(after[0]!.hold!.seq).toBe(savedB.hold!.seq + 1);
+    expect(await jobRow(f)).toEqual(job);
+    expect(passes).toBe(1);
+  }, 60_000);
 });
