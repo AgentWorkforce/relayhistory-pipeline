@@ -81,6 +81,10 @@ on:
         description: 'Backfill, catch-up, refresh, export and drain modes, scoped runs only - "true" runs the tool once per scope org (bounded; export and drain executes one at a time) and records one verdict per org; empty (default) = one run over the scope, as before'
         type: string
         default: ""
+      previous_run:
+        description: 'A per_org execute only (optional) - an earlier incomplete run of the same execute at the same sha with the same bindings; its completed orgs are carried and only the outstanding orgs run; empty otherwise'
+        type: string
+        default: ""
       max_objects:
         description: Drain modes only - per-run object budget (empty = unbounded)
         type: string
@@ -94,7 +98,7 @@ on:
         type: string
         default: ""
       confirmation:
-        description: 'Execute: <MODE uppercase> <sha> DRY <dry_run> [BACKFILL <backfill_run>] [FULL <full_backfill_run>] [EXPORT <export_run>] [RESHARD <reshard_run>] [AUTHORITY <authority_run>] (catch-up: BACKFILL-CATCHUP-EXECUTE <sha> DRY <dry_run> FULL <full_backfill_run> [AUTHORITY <authority_run>]; AUTHORITY-EXECUTE <sha> DRY <dry_run> BACKFILL <backfill_run> FULL <full_backfill_run> RESHARD <reshard_run>; MARKER-EXECUTE <sha> DRY <dry_run> BACKFILL <backfill_run> FULL <full_backfill_run> RESHARD <reshard_run> AUTHORITY <authority_run> WAVE <wave_id>; with per_org, an execute's confirmation ends with PER_ORG). Dry modes: empty'
+        description: 'Execute: <MODE uppercase> <sha> DRY <dry_run> [BACKFILL <backfill_run>] [FULL <full_backfill_run>] [EXPORT <export_run>] [RESHARD <reshard_run>] [AUTHORITY <authority_run>] (catch-up: BACKFILL-CATCHUP-EXECUTE <sha> DRY <dry_run> FULL <full_backfill_run> [AUTHORITY <authority_run>]; AUTHORITY-EXECUTE <sha> DRY <dry_run> BACKFILL <backfill_run> FULL <full_backfill_run> RESHARD <reshard_run>; MARKER-EXECUTE <sha> DRY <dry_run> BACKFILL <backfill_run> FULL <full_backfill_run> RESHARD <reshard_run> AUTHORITY <authority_run> WAVE <wave_id>; a per_org retry adds PREVIOUS <previous_run>; with per_org, an execute's confirmation ends with PER_ORG). Dry modes: empty'
         type: string
         default: ""
   pull_request:
@@ -197,6 +201,7 @@ env:
   BACKLOG_OPS_AUTHORITY_RUN: ${{ inputs.authority_run }}
   BACKLOG_OPS_WAVE_ID: ${{ inputs.wave_id }}
   BACKLOG_OPS_PER_ORG: ${{ inputs.per_org }}
+  BACKLOG_OPS_PREVIOUS_RUN: ${{ inputs.previous_run }}
   BACKLOG_OPS_MAX_OBJECTS: ${{ inputs.max_objects }}
   BACKLOG_OPS_SLOTS_READ: ${{ inputs.slots_read }}
   BACKLOG_OPS_SLOT_PACE_MS: ${{ inputs.slot_pace_ms }}
@@ -347,6 +352,15 @@ jobs:
           repository: ${{ github.repository }}
           run-id: ${{ inputs.authority_run }}
           github-token: ${{ github.token }}
+      - name: Download the previous incomplete run's receipt (a per_org retry with previous_run)
+        if: inputs.previous_run != ''
+        uses: actions/download-artifact@v4
+        with:
+          name: backlog-ops-receipt
+          path: ${{ runner.temp }}/backlog-ops-bound/previous
+          repository: ${{ github.repository }}
+          run-id: ${{ inputs.previous_run }}
+          github-token: ${{ github.token }}
       # The only step given the owner URL secret, and the only step that requests the OIDC token and exchanges it for
       # the mode's role. GitHub exposes ACTIONS_ID_TOKEN_REQUEST_* to every step of a job with id-token: write, so the
       # job's other steps (checkout, setup-bun, install, gate, download-artifact) could request a token too. That is
@@ -383,6 +397,8 @@ jobs:
           BACKLOG_OPS_NO_HEAD_PARITY_ORGS: ${{ (startsWith(inputs.mode, 'export-') || startsWith(inputs.mode, 'drain-')) && secrets.BACKLOG_OPS_NO_HEAD_PARITY_ORGS || '' }}
           BACKLOG_OPS_NO_HEAD_PARITY_MAX_AGE_SECONDS: ${{ (startsWith(inputs.mode, 'export-') || startsWith(inputs.mode, 'drain-')) && vars.BACKLOG_OPS_NO_HEAD_PARITY_MAX_AGE_SECONDS || '' }}
           BACKLOG_OPS_REVISIONS_SINCE_MS: ${{ steps.recheck.outputs.revisions_since_ms }}
+          # A per_org retry: the previous run's created_at from the gate (the GitHub API), never an input.
+          BACKLOG_OPS_PREVIOUS_CREATED_MS: ${{ steps.recheck.outputs.previous_created_ms }}
         run: bun scripts/backlog-ops.ts
       - name: Publish the counts-only receipt
         if: always()

@@ -44,6 +44,8 @@ import {
   BACKLOG_OPS_FRESH_BACKFILL_MS,
   BACKLOG_OPS_RECEIPT_ARTIFACT,
   BACKLOG_OPS_WORKFLOW,
+  BACKLOG_OPS_PREVIOUS_MAX_AGE_MS,
+  backlogOpsBindingMaxAgeMs,
   backlogOpsBindings,
   backlogOpsDispatch,
   backlogOpsEnvironment,
@@ -96,8 +98,7 @@ export async function backlogOpsGithubGate(
     const bound = await get(base + "/actions/runs/" + b.run);
     const at = Date.parse(bound.created_at);
     // The drain's BACKFILL and authority-execute's catch-up must be fresh (3 h); everything else under 24 h.
-    const maxAge = b.kind === "backfill" && (input.mode === "drain-execute" || input.mode === "authority-execute" || isMarker(input.mode))
-      ? BACKLOG_OPS_FRESH_BACKFILL_MS : BACKLOG_OPS_BINDING_MAX_AGE_MS;
+    const maxAge = backlogOpsBindingMaxAgeMs(input.mode, b.kind);
     if (String(bound.id) !== b.run || String(bound.id) === env.GITHUB_RUN_ID || bound.path !== BACKLOG_OPS_WORKFLOW ||
         bound.head_sha !== input.sha || bound.head_branch !== "main" || bound.event !== "workflow_dispatch" ||
         bound.run_attempt !== 1 || bound.status !== "completed" || bound.conclusion !== "success" ||
@@ -141,13 +142,30 @@ export async function backlogOpsGithubGate(
     revisionsSinceMs = created.full! - BACKLOG_OPS_CATCHUP_MARGIN_MS;
     if (!Number.isSafeInteger(revisionsSinceMs) || revisionsSinceMs < 1) refuse("backlog_ops_gate_full_run");
   } else if (isCatchup(input.mode)) refuse("backlog_ops_full_backfill_run");
+  // A per-org retry's PREVIOUS: the same execute at this sha by the same dispatcher, first attempt, completed and
+  // FAILED (an incomplete per-org execute exits nonzero), with one unexpired receipt, created after every run this
+  // one binds (it bound the same ones; the credential step checks that) and under BACKLOG_OPS_PREVIOUS_MAX_AGE_MS old.
+  let previousCreatedMs: number | null = null;
+  if (input.previousRun) {
+    const prev = await get(base + "/actions/runs/" + input.previousRun);
+    const at = Date.parse(prev.created_at);
+    if (String(prev.id) !== input.previousRun || String(prev.id) === env.GITHUB_RUN_ID || prev.path !== BACKLOG_OPS_WORKFLOW || prev.head_sha !== input.sha ||
+        prev.head_branch !== "main" || prev.event !== "workflow_dispatch" || prev.run_attempt !== 1 || prev.status !== "completed" || prev.conclusion !== "failure" ||
+        !isPinnedDispatcher(prev) || prev.display_title !== backlogOpsRunName(input.mode, input.sha) || !Number.isFinite(at) || at > now ||
+        now - at >= BACKLOG_OPS_PREVIOUS_MAX_AGE_MS || Object.values(created).some((c) => !(c < at)))
+      refuse("backlog_ops_gate_previous_run");
+    const artifacts = await get(base + "/actions/runs/" + input.previousRun + "/artifacts?per_page=100");
+    const named = (artifacts.artifacts ?? []).filter((a: Obj) => a.name === BACKLOG_OPS_RECEIPT_ARTIFACT);
+    if (artifacts.total_count !== artifacts.artifacts?.length || named.length !== 1 || named[0].expired !== false) refuse("backlog_ops_gate_previous_artifact");
+    previousCreatedMs = at;
+  }
   if (approved)
     await requireHumanApproval(get, base, env.GITHUB_RUN_ID!, environment, gate, true, {
       approval: "backlog_ops_gate_human_approval",
       rejected: "backlog_ops_gate_human_rejected",
       dispatch: "backlog_ops_gate_human_dispatch",
     });
-  return { ...input, environment, revisionsSinceMs };
+  return { ...input, environment, revisionsSinceMs, previousCreatedMs };
 }
 
 if (import.meta.main)
@@ -157,7 +175,9 @@ if (import.meta.main)
       // The protected environment the operate job must run in, derived from the mode (never an input).
       if (process.env.GITHUB_OUTPUT) appendFileSync(process.env.GITHUB_OUTPUT, `environment=${r.environment}\n` +
         // The catch-up's t (an epoch ms computed from FULL's created_at), for the credential step; never an input.
-        (r.revisionsSinceMs !== null ? `revisions_since_ms=${r.revisionsSinceMs}\n` : ""));
+        (r.revisionsSinceMs !== null ? `revisions_since_ms=${r.revisionsSinceMs}\n` : "") +
+        // A per-org retry's previous run's created_at (epoch ms), from this API only; never an input.
+        (r.previousCreatedMs !== null ? `previous_created_ms=${r.previousCreatedMs}\n` : ""));
     })
     .catch((error) => {
       const code = (error as { code?: unknown })?.code;

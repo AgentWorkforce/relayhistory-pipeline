@@ -278,16 +278,22 @@ export interface BacklogOpsDispatch {
   waveId?: string | null;
   /** BACKLOG_OPS_PER_ORG_MODES only (input per_org = "true"): one child run and one verdict per scope org. */
   perOrg?: boolean;
+  /**
+   * A per-org EXECUTE only (input previous_run, optional): an earlier incomplete run of the same execute at this sha,
+   * with the same bindings. Its completed orgs are carried; only the outstanding orgs run again (backlog-wave.ts).
+   */
+  previousRun?: string | null;
   confirmation: string;
 }
 
 /** The typed binding an execute must carry, exactly. */
 export function backlogOpsConfirmation(d: Pick<BacklogOpsDispatch, "mode" | "sha" | "dryRun" | "backfillRun" | "exportRun"> &
-  Partial<Pick<BacklogOpsDispatch, "fullBackfillRun" | "reshardRun" | "authorityRun" | "waveId" | "perOrg">>): string {
+  Partial<Pick<BacklogOpsDispatch, "fullBackfillRun" | "reshardRun" | "authorityRun" | "waveId" | "perOrg" | "previousRun">>): string {
   return [d.mode.toUpperCase(), d.sha, "DRY", d.dryRun,
     ...(d.backfillRun ? ["BACKFILL", d.backfillRun] : []), ...(d.fullBackfillRun ? ["FULL", d.fullBackfillRun] : []),
     ...(d.exportRun ? ["EXPORT", d.exportRun] : []), ...(d.reshardRun ? ["RESHARD", d.reshardRun] : []),
     ...(d.authorityRun ? ["AUTHORITY", d.authorityRun] : []), ...(d.waveId ? ["WAVE", d.waveId] : []),
+    ...(d.previousRun ? ["PREVIOUS", d.previousRun] : []),
     // A per-org wave run changes the run's shape (independent verdicts, partial success): the approval names it.
     ...(d.perOrg ? ["PER_ORG"] : [])].join(" ");
 }
@@ -308,7 +314,7 @@ export function backlogOpsDispatch(
     fullBackfillRun = env.BACKLOG_OPS_FULL_BACKFILL_RUN ?? "", confirmation = env.BACKLOG_OPS_CONFIRMATION ?? "",
     slotsReadRaw = env.BACKLOG_OPS_SLOTS_READ ?? "", slotPaceRaw = env.BACKLOG_OPS_SLOT_PACE_MS ?? "",
     reshardRun = env.BACKLOG_OPS_RESHARD_RUN ?? "", authorityRun = env.BACKLOG_OPS_AUTHORITY_RUN ?? "", waveId = env.BACKLOG_OPS_WAVE_ID ?? "",
-    perOrgRaw = env.BACKLOG_OPS_PER_ORG ?? "";
+    perOrgRaw = env.BACKLOG_OPS_PER_ORG ?? "", previousRun = env.BACKLOG_OPS_PREVIOUS_RUN ?? "";
   if (!(BACKLOG_OPS_MODES as readonly string[]).includes(mode) || !SHA40.test(sha)) refuse("backlog_ops_inputs");
   const m = mode as BacklogOpsMode, tool = toolOf(m), execute = isExecute(m);
   if (execute && enabled !== true) refuse("backlog_ops_dormant");
@@ -334,6 +340,8 @@ export function backlogOpsDispatch(
   if (m === "marker-execute" ? !WAVE_ID.test(waveId) : waveId !== "") refuse("backlog_ops_wave_id");
   // PER_ORG: "true" on a per-org-capable mode, else empty.
   if (!(perOrgRaw === "" || (perOrgRaw === "true" && BACKLOG_OPS_PER_ORG_MODES.includes(m)))) refuse("backlog_ops_per_org");
+  // PREVIOUS: a per-org execute only, optional.
+  if (previousRun !== "" && (perOrgRaw !== "true" || !execute || !RUN_ID.test(previousRun))) refuse("backlog_ops_previous_run");
   let budget: number | null = null;
   if (maxObjects !== "") {
     if (tool !== "drain" || !/^[1-9][0-9]{0,6}$/u.test(maxObjects) || Number(maxObjects) > BACKLOG_OPS_MAX_OBJECTS_CEILING)
@@ -346,12 +354,12 @@ export function backlogOpsDispatch(
   if (slotPaceRaw !== "" && (slotsRead !== "org" || !/^(0|[1-9][0-9]{0,3})$/u.test(slotPaceRaw) || Number(slotPaceRaw) > BACKLOG_OPS_SLOT_PACE_MAX_MS))
     refuse("backlog_ops_slot_pace_ms");
   const slotPaceMs = slotPaceRaw === "" || slotPaceRaw === "0" ? null : Number(slotPaceRaw);
-  const runs = [dryRun, backfillRun, exportRun, fullBackfillRun, reshardRun, authorityRun].filter((r) => r !== "");
+  const runs = [dryRun, backfillRun, exportRun, fullBackfillRun, reshardRun, authorityRun, previousRun].filter((r) => r !== "");
   if (new Set(runs).size !== runs.length) refuse("backlog_ops_bindings");
   const d: BacklogOpsDispatch = { mode: m, sha, dryRun: execute ? dryRun : null, backfillRun: wantsBackfill || (mayBackfill && backfillRun !== "") ? backfillRun : null,
     exportRun: wantsExport ? exportRun : null, fullBackfillRun: fullBackfillRun === "" ? null : fullBackfillRun,
     reshardRun: reshardRun === "" ? null : reshardRun, authorityRun: authorityRun === "" ? null : authorityRun, maxObjects: budget, slotsRead, slotPaceMs,
-    ...(m === "marker-execute" ? { waveId } : {}), ...(perOrgRaw === "true" ? { perOrg: true } : {}), confirmation };
+    ...(m === "marker-execute" ? { waveId } : {}), ...(perOrgRaw === "true" ? { perOrg: true } : {}), ...(previousRun !== "" ? { previousRun } : {}), confirmation };
   if (execute ? confirmation !== backlogOpsConfirmation(d) : confirmation !== "") refuse("backlog_ops_confirmation");
   return d;
 }
@@ -877,6 +885,17 @@ export function checkRefreshFingerprint(fullRaw: string, refreshRaw: string): vo
   if (full.scope !== refresh.scope) refuse("backlog_ops_bound_full_scope");
   if (BACKLOG_OPS_FINGERPRINT_FIELDS.some((k) => full.f[k] !== refresh.f[k])) refuse("backlog_ops_backfill_stale");
 }
+
+/**
+ * How old a bound run may be (the gate's freshness rule): the drain's, authority-execute's and a marker's BACKFILL
+ * BACKLOG_OPS_FRESH_BACKFILL_MS, everything else BACKLOG_OPS_BINDING_MAX_AGE_MS. Also applied by the credential step
+ * to a per-org slice CARRIED from an earlier run (backlog-wave.ts), measured from when that run was created.
+ */
+export function backlogOpsBindingMaxAgeMs(mode: BacklogOpsMode, kind: BacklogOpsBindingKind): number {
+  return kind === "backfill" && (mode === "drain-execute" || mode === "authority-execute" || isMarker(mode)) ? BACKLOG_OPS_FRESH_BACKFILL_MS : BACKLOG_OPS_BINDING_MAX_AGE_MS;
+}
+/** A per-org retry's previous run must be this recent (it is retried promptly, and its carried orgs age with it). */
+export const BACKLOG_OPS_PREVIOUS_MAX_AGE_MS = BACKLOG_OPS_FRESH_BACKFILL_MS;
 
 /** The run-name the workflow gives every dispatch: the gate reads a bound run's mode back from it. */
 export const backlogOpsRunName = (mode: string, sha: string) => `backlog ops ${mode} ${sha}`;

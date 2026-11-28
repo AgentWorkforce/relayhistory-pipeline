@@ -44,14 +44,19 @@ const refuse = (code: string): never => { throw new WaveReceiptRefusal(code); };
 /** The single-org scope id backlogOpsScope gives for exactly [org]. */
 export const orgScopeId = (org: string) => "orgs_" + createHash("sha256").update(org).digest("hex").slice(0, 32);
 
-export interface WaveSlice { org_hash: string; exit_code: number; summary: unknown }
+/**
+ * One org's slice. `carried_ms`: present only on a slice carried from an earlier incomplete run of the same execute
+ * (input previous_run): that run's created_at, so a consumer applies its freshness rule from when the org really ran.
+ */
+export interface WaveSlice { org_hash: string; exit_code: number; summary: unknown; carried_ms?: number }
 export interface WaveSummary { kind: "wave"; org_count: number; ok_count: number; per_org: WaveSlice[] }
 export const sliceOk = (s: WaveSlice) => s.exit_code === 0 && isObj(s.summary) && !Object.hasOwn(s.summary, "refused");
 
 /** Build the wave summary from per-org slices (in scope order); ok_count derived. */
-export function waveSummary(orgs: readonly string[], slices: readonly { org: string; exitCode: number; summary: unknown }[]): WaveSummary {
+export function waveSummary(orgs: readonly string[], slices: readonly { org: string; exitCode: number; summary: unknown; carriedMs?: number }[]): WaveSummary {
   if (slices.length !== orgs.length || !slices.every((s, i) => s.org === orgs[i])) refuse("backlog_ops_wave_slices");
-  const per_org = slices.map((s) => ({ org_hash: evidenceHash("org", s.org), exit_code: s.exitCode, summary: s.summary }));
+  const per_org = slices.map((s) => ({ org_hash: evidenceHash("org", s.org), exit_code: s.exitCode, summary: s.summary,
+    ...(s.carriedMs !== undefined ? { carried_ms: s.carriedMs } : {}) }));
   return { kind: "wave", org_count: orgs.length, ok_count: per_org.filter(sliceOk).length, per_org };
 }
 
@@ -70,11 +75,15 @@ export function waveReceiptSummary(summary: unknown, orgs: readonly string[] | n
   if (per.length !== want.length || summary.org_count !== want.length) return bad;
   const out: WaveSlice[] = [];
   for (const p of per) {
-    if (!isObj(p) || Object.keys(p).sort().join(",") !== "exit_code,org_hash,summary" || typeof p.org_hash !== "string" || !HASH.test(p.org_hash) ||
+    const pk = isObj(p) ? Object.keys(p).sort().join(",") : "";
+    if (!isObj(p) || (pk !== "exit_code,org_hash,summary" && pk !== "carried_ms,exit_code,org_hash,summary") || typeof p.org_hash !== "string" || !HASH.test(p.org_hash) ||
         !Number.isSafeInteger(p.exit_code) || p.exit_code < 0 || p.exit_code > 255) return bad;
+    // A carried slice is a completed org (only those are carried), with the earlier run's creation time.
+    if (pk.startsWith("carried_ms") && (!Number.isSafeInteger(p.carried_ms) || p.carried_ms < 1 || p.exit_code !== 0)) return bad;
     let s: unknown;
     try { s = slice(p.summary); } catch { return bad; }
-    out.push({ org_hash: p.org_hash, exit_code: p.exit_code, summary: s });
+    out.push({ org_hash: p.org_hash, exit_code: p.exit_code, summary: s, ...(p.carried_ms !== undefined ? { carried_ms: p.carried_ms } : {}) });
+    if (p.carried_ms !== undefined && !sliceOk(out[out.length - 1]!)) return bad;
   }
   const got = out.map((p) => p.org_hash).sort();
   if (!got.every((h, i) => h === want[i])) return bad;
@@ -105,7 +114,7 @@ export function waveView(raw: string, org: string, waveScope: string): string {
   if (isObj(r.summary) && r.summary.kind === "wave") {
     const s = (Array.isArray(r.summary.per_org) ? r.summary.per_org : []).filter((p: unknown) => isObj(p) && p.org_hash === h);
     if (s.length !== 1) refuse("backlog_ops_wave_view");
-    return JSON.stringify({ ...r, scope, exitCode: s[0].exit_code, summary: s[0].summary });
+    return JSON.stringify({ ...r, scope, exitCode: s[0].exit_code, summary: s[0].summary, ...(s[0].carried_ms !== undefined ? { carried_ms: s[0].carried_ms } : {}) });
   }
   const s = isObj(r.summary) ? { ...r.summary } : r.summary;
   if (isObj(s)) {

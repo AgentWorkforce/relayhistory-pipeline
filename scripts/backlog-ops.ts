@@ -46,8 +46,10 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { releaseConnection } from "../src/hoopdb/schema-release-contract.ts";
 import {
+  BACKLOG_OPS_CATCHUP_MARGIN_MS,
   BACKLOG_OPS_RECEIPT_FILE,
   BACKLOG_OPS_SESSION_SECONDS,
+  backlogOpsBindingMaxAgeMs,
   backlogOpsBindings,
   backlogOpsDispatch,
   BACKLOG_OPS_LEDGER_ID_TOOLS,
@@ -338,16 +340,18 @@ export async function backlogOpsRun(
   const waveRun = d.perOrg === true;
   if (waveRun && scope.orgs === null) refuse("backlog_ops_scope_required");
   if (waveRun && nhp !== null) refuse("backlog_ops_wave_no_head_parity");
-  // The drain's max_objects is a per-RUN cap: a wave splits it across its orgs (the sum never exceeds it; every org
-  // gets at least one object, so a budget below the org count refuses).
-  const budgets = waveRun ? waveBudgets(d.maxObjects, scope.orgs!) : null;
   const readText = (p: string) => readFileSync(p, "utf8");
   const boundIsWave = (kind: string) => { try { return isWaveReceipt(readText(paths.bound(kind))); } catch { return false; } };
   let bound: BoundAuthority = {};
-  let perOrgBound: Map<string, BoundAuthority | string> | null = null;
+  let perOrgBound: Map<string, { bound: BoundAuthority; since: number | null } | string> | null = null;
+  // A per-org retry: the orgs its previous run completed are carried, with that run's creation time.
+  const carried = waveRun && d.previousRun ? previousSlices(env, d, scope, ledgerIdFor(env, d), since) : new Map<string, { summary: unknown; carriedMs: number }>();
+  // The drain's max_objects is a per-RUN cap: a wave splits it across its outstanding orgs (the sum never exceeds it; every org
+  // gets at least one object, so a budget below the org count refuses).
+  const budgets = waveRun ? waveBudgets(d.maxObjects, scope.orgs!.filter((o) => !carried.has(o))) : null;
   if (waveRun) {
-    perOrgBound = new Map(scope.orgs!.map((o): [string, BoundAuthority | string] => {
-      try { return [o, checkOrgBindings(env, d, o, since)]; } catch (e) { return [o, refusalCode(e)]; }
+    perOrgBound = new Map(scope.orgs!.filter((o) => !carried.has(o)).map((o): [string, { bound: BoundAuthority; since: number | null } | string] => {
+      try { return [o, checkOrgBindingsAt(env, d, o, since)]; } catch (e) { return [o, refusalCode(e)]; }
     }));
   } else if (isMarker(d.mode) && (boundIsWave("backfill") || boundIsWave("full"))) {
     bound = markerWaveBound(env, d, since);
@@ -372,19 +376,27 @@ export async function backlogOpsRun(
   let exit: number;
   if (waveRun) {
     const orgs = scope.orgs!;
-    const settled = await runWave(orgs, waveConcurrencyFor(d.mode), async (org) => {
+    const outstanding = orgs.filter((o) => !carried.has(o));
+    const settled = outstanding.length === 0 ? [] : await runWave(outstanding, waveConcurrencyFor(d.mode), async (org) => {
       const b = perOrgBound!.get(org)!;
       // A binding refused for this org: its slice records the code, and no child runs for it.
       if (typeof b === "string") return { org, exitCode: 1, summary: { refused: b } };
-      const envOrg = { ...env, BACKLOG_OPS_ORGS: org };
+      // The org's own t (a carried FULL slice moves it), handed to its child exactly as the gate's t would be.
+      const envOrg = { ...env, BACKLOG_OPS_ORGS: org, ...(b.since !== null ? { BACKLOG_OPS_REVISIONS_SINCE_MS: String(b.since) } : {}) };
       const dOrg: BacklogOpsDispatch = { ...d, maxObjects: budgets === null ? null : budgets.get(org)! };
-      const r = await run(backlogOpsChildSpawn(envOrg, dOrg, aws, dbUrl, null, b));
-      const one = finalReceipt(d, env.GITHUB_RUN_ID!, r.code, r.stdout, orgScopeId(org), [org], ledger, nhpId, home, since);
+      const r = await run(backlogOpsChildSpawn(envOrg, dOrg, aws, dbUrl, null, b.bound));
+      const one = finalReceipt(d, env.GITHUB_RUN_ID!, r.code, r.stdout, orgScopeId(org), [org], ledger, nhpId, home, b.since);
       return { org, exitCode: one.exitCode === 0 && r.code === 0 ? 0 : one.exitCode || r.code || 1, summary: one.summary };
     }, { fallback: "backlog_ops_wave_org_failed" });
-    const slices = settled.map((x) => x.ok ? x.value : { org: x.org, exitCode: 1, summary: { refused: x.code } });
+    const ran = new Map(settled.map((x) => [x.org, x.ok ? x.value : { org: x.org, exitCode: 1, summary: { refused: x.code } }]));
+    const slices = orgs.map((o) => carried.has(o) ? { org: o, exitCode: 0, summary: carried.get(o)!.summary, carriedMs: carried.get(o)!.carriedMs } : ran.get(o)!);
     const checked = waveReceiptSummary(waveSummary(orgs, slices), orgs, (sl) => waveSliceCheck(d, sl));
-    receipt = { ...backlogOpsReceipt(d, env.GITHUB_RUN_ID!, 0, "{}", scope.id, ledger, nhpId, home), summary: checked.summary, exitCode: checked.ok ? 0 : 1 };
+    const sumC = checked.summary as { ok_count?: number };
+    // An execute is complete only when EVERY org completed: an incomplete one exits nonzero (its receipt keeps every
+    // slice, so a retry with previous_run runs only the outstanding orgs). A dry run may show an eligible subset.
+    const complete = checked.ok && (!isExecute(d.mode) || sumC.ok_count === orgs.length);
+    receipt = { ...backlogOpsReceipt(d, env.GITHUB_RUN_ID!, 0, "{}", scope.id, ledger, nhpId, home),
+      bindings: waveBindings(d), ...(d.previousRun ? { previous_run: d.previousRun } : {}), summary: checked.summary, exitCode: complete ? 0 : 1 };
     exit = receipt.exitCode;
     // A green wave run may still have refused orgs: say how many completed (counts only, never an org).
     const sum = checked.summary as { ok_count?: number; org_count?: number };
@@ -398,6 +410,44 @@ export async function backlogOpsRun(
   writePrivate(paths.receipt, receipt);
   console.log("backlog_ops_receipt " + JSON.stringify(receipt));
   return exit;
+}
+
+/** The runs a wave receipt's dispatch bound, by kind (a per-org retry must bind exactly the same). */
+export const waveBindings = (d: BacklogOpsDispatch) => Object.fromEntries(backlogOpsBindings(d).map((b) => [b.kind, b.run]));
+const ledgerIdFor = (env: Record<string, string | undefined>, d: BacklogOpsDispatch) =>
+  backlogOpsLedgerId(d, backlogOpsLedgerTarget(env, backlogOpsTarget(env)));
+
+/**
+ * A per-org retry's previous run (input previous_run; the gate checked it is this execute at this sha, failed, recent,
+ * created after every binding, and wrote previous_created_ms): its receipt must be a wave receipt of exactly this
+ * mode, sha, run, scope, ledger and home, with exactly this dispatch's bindings, not complete. Returns the orgs it
+ * completed, each with the time it really ran (its own carried_ms, or the previous run's creation).
+ */
+export function previousSlices(env: Record<string, string | undefined>, d: BacklogOpsDispatch, scope: { orgs: string[] | null; id: string }, ledger: string,
+  _since: number | null, read: (p: string) => string = (p) => readFileSync(p, "utf8")): Map<string, { summary: unknown; carriedMs: number }> {
+  const raw = (() => { try { return read(backlogOpsPaths(env).bound("previous")); } catch { return refuse("backlog_ops_bound_previous_missing"); } })();
+  const createdRaw = env.BACKLOG_OPS_PREVIOUS_CREATED_MS ?? "";
+  if (!/^[1-9][0-9]{0,15}$/u.test(createdRaw)) refuse("backlog_ops_previous_created");
+  const createdMs = Number(createdRaw);
+  let r: Record<string, any>;
+  try { r = JSON.parse(raw); } catch { return refuse("backlog_ops_bound_previous_receipt"); }
+  const t = backlogOpsTarget(env);
+  const home = BACKLOG_OPS_LEDGER_ID_TOOLS.includes(toolOf(d.mode)) ? backlogOpsHomeId(t, backlogOpsLedgerTarget(env, t)) : undefined;
+  if (!r || r.contract !== "backlog-ops-receipt/v1" || r.mode !== d.mode || r.sha !== d.sha || r.run !== d.previousRun || r.scope !== scope.id ||
+      r.ledger !== ledger || r.home !== home || r.exitCode === 0 || JSON.stringify(r.bindings) !== JSON.stringify(waveBindings(d)))
+    refuse("backlog_ops_bound_previous_receipt");
+  const checked = waveReceiptSummary(r.summary, scope.orgs, (sl) => waveSliceCheck(d, sl));
+  if ((checked.summary as { refused?: unknown }).refused !== undefined && !Array.isArray((checked.summary as { per_org?: unknown }).per_org))
+    refuse("backlog_ops_bound_previous_receipt");
+  const per = (checked.summary as { per_org: { org_hash: string; exit_code: number; summary: unknown; carried_ms?: number }[] }).per_org;
+  const byHash = new Map(per.map((p) => [p.org_hash, p]));
+  const out = new Map<string, { summary: unknown; carriedMs: number }>();
+  for (const org of scope.orgs ?? []) {
+    const p = byHash.get(evidenceHash("org", org));
+    if (p && p.exit_code === 0 && p.summary && typeof p.summary === "object" && !("refused" in (p.summary as object)))
+      out.set(org, { summary: p.summary, carriedMs: p.carried_ms ?? createdMs });
+  }
+  return out;
 }
 
 /**
@@ -475,12 +525,32 @@ export function waveSliceCheck(d: BacklogOpsDispatch, s: unknown): unknown {
  * re-scoped to the org), as a single-org run of the same dispatch. Any failure refuses that org only.
  */
 export function checkOrgBindings(env: Record<string, string | undefined>, d: BacklogOpsDispatch, org: string, since: number | null,
-  read: (p: string) => string = (p) => readFileSync(p, "utf8")): BoundAuthority {
+  read: (p: string) => string = (p) => readFileSync(p, "utf8"), now = Date.now()): BoundAuthority {
+  return checkOrgBindingsAt(env, d, org, since, read, now).bound;
+}
+/**
+ * checkOrgBindings, also returning the org's own t. A slice CARRIED from an earlier run (carried_ms) is checked
+ * against the binding's freshness rule from when that run was created (backlogOpsBindingMaxAgeMs), and a carried FULL
+ * slice moves this org's t to its own creation minus the margin: the catch-up must read every revision since the FULL
+ * that actually ran for the org, never since a later retry.
+ */
+export function checkOrgBindingsAt(env: Record<string, string | undefined>, d: BacklogOpsDispatch, org: string, since: number | null,
+  read: (p: string) => string = (p) => readFileSync(p, "utf8"), now = Date.now()): { bound: BoundAuthority; since: number | null } {
   const waveScope = backlogOpsScope(env).id;
   const envOrg = { ...env, BACKLOG_OPS_ORGS: org };
+  const paths = backlogOpsPaths(env);
   const views = new Map<string, string>();
   const view = (p: string) => { let v = views.get(p); if (v === undefined) { v = waveView(read(p), org, waveScope); views.set(p, v); } return v; };
-  return checkBoundReceipts(envOrg, d, view, since, (p) => Buffer.from(view(p), "utf8"));
+  let orgSince = since;
+  for (const b of backlogOpsBindings(d)) {
+    let carried: unknown;
+    try { carried = JSON.parse(view(paths.bound(b.kind))).carried_ms; } catch { continue; } // a missing file is checkBoundReceipts' refusal
+    if (carried === undefined) continue;
+    if (!Number.isSafeInteger(carried) || (carried as number) < 1 || now - (carried as number) >= backlogOpsBindingMaxAgeMs(d.mode, b.kind) || (carried as number) > now)
+      refuse(`backlog_ops_bound_${b.kind}_carried`);
+    if (b.kind === "full" && orgSince !== null) orgSince = (carried as number) - BACKLOG_OPS_CATCHUP_MARGIN_MS;
+  }
+  return { bound: checkBoundReceipts(envOrg, d, view, orgSince, (p) => Buffer.from(view(p), "utf8")), since: orgSince };
 }
 
 /**

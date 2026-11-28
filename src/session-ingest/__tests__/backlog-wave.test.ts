@@ -52,9 +52,13 @@ const fetcher = (async (url: string) => url.startsWith("https://token.example/")
 const ownerUrl = `postgresql://${P.owner}.${P.project}:p%40ss@${P.host}:${P.port}/${P.database}?sslmode=verify-full`;
 const receipts: Partial<Record<BacklogOpsMode, string>> = {};
 
+/** step(), with the child's argv handed to `child`. */
+const stepWithArgs = (mode: BacklogOpsMode, env: Record<string, string>, bind: Record<string, BacklogOpsMode>, child: (org: string, args: string[]) => { code: number; stdout: string },
+  extra: Record<string, string> = {}) => step(mode, env, bind, child as never, extra, true);
+
 /** One credential step: `bind` maps a binding kind to the mode whose persisted receipt it gets. */
 async function step(mode: BacklogOpsMode, env: Record<string, string>, bind: Record<string, BacklogOpsMode>, child: (org: string) => { code: number; stdout: string },
-  extra: Record<string, string> = {}) {
+  extra: Record<string, string> = {}, withArgs = false) {
   const temp = mkdtempSync(join(tmpdir(), "wave-step-"));
   cleanups.push(() => rmSync(temp, { recursive: true, force: true }));
   for (const [kind, m] of Object.entries(bind)) {
@@ -77,7 +81,7 @@ async function step(mode: BacklogOpsMode, env: Record<string, string>, bind: Rec
         seen.push(orgs[0]!);
         await new Promise((r) => setTimeout(r, 5));
         inFlight--;
-        return child(orgs[0]!);
+        return withArgs ? (child as unknown as (o: string, a: string[]) => { code: number; stdout: string })(orgs[0]!, c.args) : child(orgs[0]!);
       } });
   } finally { console.log = log; }
   const file = readFileSync(join(temp, "backlog-ops-out", "backlog-ops-receipt.json"), "utf8");
@@ -143,54 +147,116 @@ test("views: a wave slice becomes a single-org receipt; a non-wave receipt of th
   expect(JSON.parse(waveView(other, A, SCOPE_ID)).scope).toBe("orgs_" + "f".repeat(32));
 });
 
-test("two orgs, one refuses: FULL, catch-up, export and drain each give B its own refusal and complete A; children bounded", async () => {
+/** The --revisions-since-ms a child was given (null when none). */
+const sinceArg = (args: string[]) => { const i = args.indexOf("--revisions-since-ms"); return i < 0 ? null : Number(args[i + 1]); };
+
+test("an incomplete execute exits nonzero and keeps every slice; a retry runs only the outstanding orgs; the chain then completes with each org's own t", async () => {
   const fine = (s: unknown) => () => ({ code: 0, stdout: JSON.stringify(s) });
-  // backfill-dry: both fine.
   const bd = await step("backfill-dry", {}, {}, fine(backfill("dry_run")));
   expect(bd.exit).toBe(0);
   expect(bd.receipt.summary).toMatchObject({ kind: "wave", org_count: 2, ok_count: 2 });
   expect(bd.peak).toBeLessThanOrEqual(2);
-  // FULL: B's revisions section fails (the tool exits 1); A completes.
-  const full = await step("backfill-execute", { BACKLOG_OPS_DRY_RUN: "701", BACKLOG_OPS_CONFIRMATION: `BACKFILL-EXECUTE ${SHA} DRY 701 PER_ORG` }, { dry: "backfill-dry" },
+  // FULL: B fails transiently; A completes. Incomplete: exit 1, both slices kept.
+  const fullEnv = { BACKLOG_OPS_DRY_RUN: "701", BACKLOG_OPS_CONFIRMATION: `BACKFILL-EXECUTE ${SHA} DRY 701 PER_ORG` };
+  const full = await step("backfill-execute", fullEnv, { dry: "backfill-dry" },
     (o) => o === B ? { code: 1, stdout: JSON.stringify(backfill("execute", { sections: { fences: "complete", ownership: "complete", revisions: "incomplete" } })) }
       : { code: 0, stdout: JSON.stringify(backfill("execute")) });
-  expect(full.exit).toBe(0);
+  expect(full.exit).toBe(1);
+  expect(full.receipt.exitCode).toBe(1);
   expect(full.by[H(A)]).toMatchObject({ exit_code: 0 });
   expect(full.by[H(B)]).toMatchObject({ exit_code: 1 });
-  expect(full.receipt.summary.ok_count).toBe(1);
-  expect(full.receipt).toMatchObject({ mode: "backfill-execute", scope: SCOPE_ID, exitCode: 0 });
-  // catch-up dry and execute: B's FULL slice refuses B's binding, so no child runs for B.
-  const cu = (mode: "dry_run" | "execute") => fine(backfill(mode, { revisions_since_ms: SINCE }));
-  const since = { BACKLOG_OPS_REVISIONS_SINCE_MS: String(SINCE), BACKLOG_OPS_FULL_BACKFILL_RUN: "702" };
-  const cd = await step("backfill-catchup-dry", since, { full: "backfill-execute" }, cu("dry_run"));
-  expect(cd.seen).toEqual([A]);
-  expect(cd.by[H(B)]).toMatchObject({ exit_code: 1, summary: { refused: "backlog_ops_bound_backfill_receipt" } });
-  const ce = await step("backfill-catchup-execute", { ...since, BACKLOG_OPS_DRY_RUN: "703", BACKLOG_OPS_CONFIRMATION: `BACKFILL-CATCHUP-EXECUTE ${SHA} DRY 703 FULL 702 PER_ORG` },
-    { dry: "backfill-catchup-dry", full: "backfill-execute" }, cu("execute"));
-  expect(ce.seen).toEqual([A]);
-  expect(ce.receipt.summary.ok_count).toBe(1);
-  // export: dry is fine for both (it binds nothing); execute binds the FULL wave, so B refuses again.
+  expect(full.receipt.bindings).toEqual({ dry: "701" });
+  expect(full.lines).toContain("backlog_ops_wave_result ok_count=1 org_count=2 incomplete");
+  // The retry (PREVIOUS 702): only B runs; A is carried with the previous run's creation time.
+  const P = Date.now() - 60 * 60_000;
+  const retry = await step("backfill-execute", { ...fullEnv, BACKLOG_OPS_PREVIOUS_RUN: "702", BACKLOG_OPS_CONFIRMATION: `BACKFILL-EXECUTE ${SHA} DRY 701 PREVIOUS 702 PER_ORG` },
+    { dry: "backfill-dry", previous: "backfill-execute" }, fine(backfill("execute")), { GITHUB_RUN_ID: "712", BACKLOG_OPS_PREVIOUS_CREATED_MS: String(P) });
+  expect(retry.seen).toEqual([B]);
+  expect(retry.exit).toBe(0);
+  expect(retry.by[H(A)]).toMatchObject({ exit_code: 0, carried_ms: P });
+  expect(retry.by[H(B)]!.carried_ms).toBeUndefined();
+  expect(retry.receipt).toMatchObject({ run: "712", previous_run: "702", bindings: { dry: "701" } });
+  // catch-up: t from the gate for the retry FULL; A's FULL ran earlier, so A's child reads since A's own FULL.
+  const T = Date.now() - 30 * 60_000;
+  const echo = (mode: "dry_run" | "execute") => (o: string) => ({ code: 0, stdout: JSON.stringify(backfill(mode, { revisions_since_ms: givenSince.get(o) })) });
+  const givenSince = new Map<string, number | null>();
+  const sinceEnv = { BACKLOG_OPS_REVISIONS_SINCE_MS: String(T), BACKLOG_OPS_FULL_BACKFILL_RUN: "712" };
+  const spy = (f: (o: string) => { code: number; stdout: string }) => f;
+  const cdRun = async () => {
+    const r = await stepWithArgs("backfill-catchup-dry", sinceEnv, { full: "backfill-execute" }, (o, args) => { givenSince.set(o, sinceArg(args)); return echo("dry_run")(o); });
+    return r;
+  };
+  const cd = await cdRun();
+  expect(givenSince.get(A)).toBe(P - 15 * 60_000);
+  expect(givenSince.get(B)).toBe(T);
+  expect(cd.exit).toBe(0);
+  const ce = await stepWithArgs("backfill-catchup-execute", { ...sinceEnv, BACKLOG_OPS_DRY_RUN: "703", BACKLOG_OPS_CONFIRMATION: `BACKFILL-CATCHUP-EXECUTE ${SHA} DRY 703 FULL 712 PER_ORG` },
+    { dry: "backfill-catchup-dry", full: "backfill-execute" }, (o, args) => { givenSince.set(o, sinceArg(args)); return echo("execute")(o); });
+  expect(ce.exit).toBe(0);
+  expect(ce.seen.sort()).toEqual(TWO);
+  void spy;
+  // export and drain, complete for both.
   const ed = await step("export-dry", {}, {}, fine(exportOk("dry_run")));
-  expect(ed.seen.sort()).toEqual(TWO);
-  const ee = await step("export-execute", { BACKLOG_OPS_DRY_RUN: "705", BACKLOG_OPS_BACKFILL_RUN: "702", BACKLOG_OPS_CONFIRMATION: `EXPORT-EXECUTE ${SHA} DRY 705 BACKFILL 702 PER_ORG` },
+  const ee = await step("export-execute", { BACKLOG_OPS_DRY_RUN: "705", BACKLOG_OPS_BACKFILL_RUN: "712", BACKLOG_OPS_CONFIRMATION: `EXPORT-EXECUTE ${SHA} DRY 705 BACKFILL 712 PER_ORG` },
     { dry: "export-dry", backfill: "backfill-execute" }, fine(exportOk("execute")));
-  expect(ee.seen).toEqual([A]);
-  expect(ee.peak).toBe(1); // the export's lease: one at a time
-  // drain: BACKFILL the catch-up, FULL, EXPORT; A drains, B is refused.
+  expect([ed.exit, ee.exit, ee.peak]).toEqual([0, 0, 1]); // the export's lease: one at a time
   const dd = await step("drain-dry", {}, {}, fine({ mode: "dry_run", listed: 3 }));
-  expect(dd.exit).toBe(0);
-  const de = await step("drain-execute", { BACKLOG_OPS_DRY_RUN: "707", BACKLOG_OPS_BACKFILL_RUN: "704", BACKLOG_OPS_FULL_BACKFILL_RUN: "702", BACKLOG_OPS_EXPORT_RUN: "706",
-    BACKLOG_OPS_REVISIONS_SINCE_MS: String(SINCE), BACKLOG_OPS_CONFIRMATION: `DRAIN-EXECUTE ${SHA} DRY 707 BACKFILL 704 FULL 702 EXPORT 706 PER_ORG` },
+  const de = await step("drain-execute", { BACKLOG_OPS_DRY_RUN: "707", BACKLOG_OPS_BACKFILL_RUN: "704", BACKLOG_OPS_FULL_BACKFILL_RUN: "712", BACKLOG_OPS_EXPORT_RUN: "706",
+    BACKLOG_OPS_REVISIONS_SINCE_MS: String(T), BACKLOG_OPS_CONFIRMATION: `DRAIN-EXECUTE ${SHA} DRY 707 BACKFILL 704 FULL 712 EXPORT 706 PER_ORG` },
     { dry: "drain-dry", backfill: "backfill-catchup-execute", full: "backfill-execute", export: "export-execute" }, fine({ mode: "execute", listed: 3 }));
-  expect(de.seen).toEqual([A]);
-  expect(de.peak).toBe(1); // the drain's lease
-  expect(de.by[H(A)]).toMatchObject({ exit_code: 0, summary: { mode: "execute", listed: 3 } });
-  expect(de.by[H(B)]!.exit_code).toBe(1);
-  expect(de.exit).toBe(0);
-  // Every receipt and log line names no org.
-  for (const r of [bd, full, cd, ce, ed, ee, dd, de]) {
+  expect([dd.exit, de.exit, de.peak]).toEqual([0, 0, 1]); // the drain's lease
+  expect(de.seen.sort()).toEqual(TWO);
+  for (const r of [bd, full, retry, cd, ce, ed, ee, dd, de])
     for (const o of TWO) { expect(r.file).not.toContain(o); expect(r.lines.filter((l) => !l.startsWith("::add-mask::")).join("\n")).not.toContain(o); }
-  }
+});
+
+test("independent refusals: an org refused at its binding gets no child; the execute is incomplete (nonzero) while the dry shows the eligible subset", async () => {
+  const saved = { ...receipts };
+  try {
+    const bd = await step("backfill-dry", {}, {}, (o) => o === B ? { code: 1, stdout: JSON.stringify({ refused: "internal_error" }) } : { code: 0, stdout: JSON.stringify(backfill("dry_run")) });
+    expect([bd.exit, bd.receipt.summary.ok_count]).toEqual([0, 1]);
+    const fe = await step("backfill-execute", { BACKLOG_OPS_DRY_RUN: "701", BACKLOG_OPS_CONFIRMATION: `BACKFILL-EXECUTE ${SHA} DRY 701 PER_ORG` }, { dry: "backfill-dry" },
+      () => ({ code: 0, stdout: JSON.stringify(backfill("execute")) }));
+    expect(fe.seen).toEqual([A]);
+    expect(fe.by[H(B)]!.exit_code).toBe(1);
+    expect(fe.by[H(B)]!.summary.refused).toMatch(/^backlog_ops_bound_backfill_/u);
+    expect([fe.exit, fe.receipt.exitCode]).toEqual([1, 1]);
+  } finally { Object.assign(receipts, saved); }
+});
+
+test("retry negatives: the previous run must be this execute's, incomplete, same bindings, with the gate's creation time; carried slices age from it", async () => {
+  const saved = { ...receipts };
+  try {
+    const fullEnv = { BACKLOG_OPS_DRY_RUN: "701", BACKLOG_OPS_CONFIRMATION: `BACKFILL-EXECUTE ${SHA} DRY 701 PER_ORG` };
+    await step("backfill-dry", {}, {}, () => ({ code: 0, stdout: JSON.stringify(backfill("dry_run")) }));
+    await step("backfill-execute", fullEnv, { dry: "backfill-dry" }, (o) => ({ code: o === B ? 1 : 0, stdout: JSON.stringify(backfill("execute")) }));
+    const P = String(Date.now() - 60_000);
+    const retryEnv = { ...fullEnv, BACKLOG_OPS_PREVIOUS_RUN: "702", BACKLOG_OPS_CONFIRMATION: `BACKFILL-EXECUTE ${SHA} DRY 701 PREVIOUS 702 PER_ORG` };
+    const go = (extra: Record<string, string>, bind: Record<string, BacklogOpsMode> = { dry: "backfill-dry", previous: "backfill-execute" }) =>
+      step("backfill-execute", retryEnv, bind, () => ({ code: 0, stdout: JSON.stringify(backfill("execute")) }), { GITHUB_RUN_ID: "713", ...extra }).then(() => null, (e) => e.code);
+    expect(await go({})).toBe("backlog_ops_previous_created"); // no gate time
+    expect(await go({ BACKLOG_OPS_PREVIOUS_CREATED_MS: P }, { dry: "backfill-dry" })).toBe("backlog_ops_bound_previous_missing");
+    const prev = receipts["backfill-execute"]!;
+    const edit = (f: (r: any) => void) => { const r = JSON.parse(prev); f(r); return JSON.stringify(r); };
+    receipts["backfill-execute"] = edit((r) => { r.bindings = { dry: "799" }; });
+    expect(await go({ BACKLOG_OPS_PREVIOUS_CREATED_MS: P })).toBe("backlog_ops_bound_previous_receipt"); // other bindings
+    receipts["backfill-execute"] = edit((r) => { r.exitCode = 0; });
+    expect(await go({ BACKLOG_OPS_PREVIOUS_CREATED_MS: P })).toBe("backlog_ops_bound_previous_receipt"); // a complete run is not retried
+    receipts["backfill-execute"] = prev;
+    // Dispatch: PREVIOUS only on a per-org execute, named in the confirmation.
+    const base = { BACKLOG_OPS_MODE: "backfill-execute", BACKLOG_OPS_SHA: SHA, BACKLOG_OPS_DRY_RUN: "701" };
+    expect(code(() => backlogOpsDispatch({ ...base, BACKLOG_OPS_PREVIOUS_RUN: "702", BACKLOG_OPS_CONFIRMATION: `BACKFILL-EXECUTE ${SHA} DRY 701 PREVIOUS 702` }))).toBe("backlog_ops_previous_run");
+    expect(code(() => backlogOpsDispatch({ BACKLOG_OPS_MODE: "backfill-dry", BACKLOG_OPS_SHA: SHA, BACKLOG_OPS_PER_ORG: "true", BACKLOG_OPS_PREVIOUS_RUN: "702" }))).toBe("backlog_ops_previous_run");
+    expect(code(() => backlogOpsDispatch({ ...base, BACKLOG_OPS_PER_ORG: "true", BACKLOG_OPS_PREVIOUS_RUN: "702", BACKLOG_OPS_CONFIRMATION: `BACKFILL-EXECUTE ${SHA} DRY 701 PER_ORG` }))).toBe("backlog_ops_confirmation");
+    expect(code(() => backlogOpsDispatch({ ...base, BACKLOG_OPS_PER_ORG: "true", BACKLOG_OPS_PREVIOUS_RUN: "701", BACKLOG_OPS_CONFIRMATION: `BACKFILL-EXECUTE ${SHA} DRY 701 PREVIOUS 701 PER_ORG` }))).toBe("backlog_ops_bindings");
+    // A carried slice older than the consumer's freshness rule refuses that org (here: the catch-up's FULL, 24 h).
+    const stale = await step("backfill-execute", retryEnv, { dry: "backfill-dry", previous: "backfill-execute" }, () => ({ code: 0, stdout: JSON.stringify(backfill("execute")) }),
+      { GITHUB_RUN_ID: "714", BACKLOG_OPS_PREVIOUS_CREATED_MS: String(Date.now() - 25 * 3600_000) });
+    expect(stale.exit).toBe(0);
+    const cd = await step("backfill-catchup-dry", { BACKLOG_OPS_REVISIONS_SINCE_MS: String(Date.now() - 3600_000), BACKLOG_OPS_FULL_BACKFILL_RUN: "714" },
+      { full: "backfill-execute" }, () => ({ code: 0, stdout: JSON.stringify(backfill("dry_run", { revisions_since_ms: 1 })) }));
+    expect(cd.by[H(A)]).toMatchObject({ summary: { refused: "backlog_ops_bound_full_carried" } });
+  } finally { Object.assign(receipts, saved); }
 });
 
 test("wave refusals: every org refused fails the run (no child for a refused binding); a wave run needs a scope", async () => {
@@ -211,6 +277,11 @@ test("wave refusals: every org refused fails the run (no child for a refused bin
 test("a marker binding a per-org FULL and catch-up: per-org checks, the failing org refused, one merged baseline, evidence over the exact bytes", async () => {
   const fine = (s: unknown) => () => ({ code: 0, stdout: JSON.stringify(s) });
   const AUTH = "709";
+  // Its own FULL (run 702), where B's org failed (the credential step's per-org mechanism; the gate would also refuse
+  // binding a failed run, which is the stricter production case).
+  await step("backfill-dry", {}, {}, fine(backfill("dry_run")));
+  await step("backfill-execute", { BACKLOG_OPS_DRY_RUN: "701", BACKLOG_OPS_CONFIRMATION: `BACKFILL-EXECUTE ${SHA} DRY 701 PER_ORG` }, { dry: "backfill-dry" },
+    (o) => ({ code: o === B ? 1 : 0, stdout: JSON.stringify(backfill("execute")) }));
   // authority-dry (scope-level, non-wave) as the marker binds it.
   const unbound = (() => { const r = evidenceReport(TWO); return { ...r, status: "authority_evidence_unbound", orgs: r.orgs.map((o) => ({ ...o, ok: false, refusals: ["sql_unbound"] })) }; })();
   const home = JSON.parse(receipts["backfill-execute"]!).home;
@@ -287,4 +358,47 @@ test("the drain's max_objects is a per-run cap: a wave splits it across its orgs
     await expect(backlogOpsRun({ ...target, ...SCOPE_ENV, BACKLOG_OPS_MODE: "drain-dry", BACKLOG_OPS_SHA: SHA, BACKLOG_OPS_PER_ORG: "true", BACKLOG_OPS_MAX_OBJECTS: "1",
       GITHUB_SHA: SHA, GITHUB_RUN_ID: "721", RUNNER_TEMP: temp }, { fetcher, runChild: async () => ({ code: 0, stdout: "{}" }) })).rejects.toMatchObject({ code: "backlog_ops_wave_max_objects" });
   } finally { Object.assign(receipts, saved); }
+});
+
+test("gate: previous_run is this execute at this sha, FAILED, first attempt, by the dispatcher, after every binding, recent; its creation goes out as previous_created_ms", async () => {
+  const { backlogOpsGithubGate } = await import("../../../scripts/backlog-ops-github.ts");
+  const { PRIVATE_INGEST_RELEASE } = await import("../private-ingest-release.ts");
+  const WF = ".github/workflows/backlog-ops.yml";
+  const actor = { id: P.dispatcher.id, login: P.dispatcher.login, type: "User" };
+  const hoursAgo = (h: number) => new Date(Date.now() - h * 3600_000).toISOString();
+  const runOf = (id: string, mode: string, h: number, conclusion = "success") => ({ id: Number(id), head_sha: SHA, head_branch: "main", event: "workflow_dispatch", path: WF,
+    run_attempt: 1, status: "completed", conclusion, actor: { ...actor }, triggering_actor: { ...actor }, display_title: `backlog ops ${mode} ${SHA}`, created_at: hoursAgo(h) });
+  const fx = () => ({ bound: { "701": runOf("701", "backfill-dry", 3), "702": runOf("702", "backfill-execute", 1, "failure") } as Record<string, any> });
+  const get = (f: ReturnType<typeof fx>) => async (p: string): Promise<any> => {
+    if (p.endsWith("/git/ref/heads/main")) return { object: { sha: SHA } };
+    if (p.endsWith("/actions/runs/100")) return { id: 100, head_sha: SHA, head_branch: "main", event: "workflow_dispatch", path: WF, run_attempt: 1, actor, triggering_actor: { ...actor },
+      display_title: `backlog ops backfill-execute ${SHA}` };
+    for (const id of Object.keys(f.bound)) {
+      if (p.endsWith(`/actions/runs/${id}`)) return f.bound[id];
+      if (p.endsWith(`/actions/runs/${id}/artifacts?per_page=100`)) return { total_count: 1, artifacts: [{ name: "backlog-ops-receipt", expired: false }] };
+    }
+    if (p.includes("deployment-branch-policies")) return { total_count: 1, branch_policies: [{ name: "main", type: "branch" }] };
+    if (p.includes("/environments/")) return { id: 7, name: "session-backlog-execute", protection_rules: [{ type: "branch_policy" }], deployment_branch_policy: { protected_branches: false, custom_branch_policies: true } };
+    if (p.includes("/actions/workflows/")) return { workflow_runs: [{ id: 10, head_sha: SHA, head_branch: "main", event: "push", status: "completed", conclusion: "success", run_attempt: 1 }] };
+    if (p.includes("/runs/10/")) return { total_count: 5, jobs: ["checks", "session-read-worker / worker", "real PostgreSQL 15", "real PostgreSQL 16", "real PostgreSQL 17"]
+      .map((name) => ({ name, head_sha: SHA, status: "completed", conclusion: "success" })) };
+    throw new Error("unexpected " + p);
+  };
+  const env = { GITHUB_REPOSITORY: P.repository, GITHUB_REPOSITORY_ID: PRIVATE_INGEST_RELEASE.repositoryId, GITHUB_EVENT_NAME: "workflow_dispatch", GITHUB_REF: "refs/heads/main",
+    GITHUB_SHA: SHA, GITHUB_RUN_ATTEMPT: "1", GITHUB_RUN_ID: "100", BACKLOG_OPS_MODE: "backfill-execute", BACKLOG_OPS_SHA: SHA, BACKLOG_OPS_DRY_RUN: "701",
+    BACKLOG_OPS_PER_ORG: "true", BACKLOG_OPS_PREVIOUS_RUN: "702", BACKLOG_OPS_CONFIRMATION: `BACKFILL-EXECUTE ${SHA} DRY 701 PREVIOUS 702 PER_ORG` };
+  const gate = async (m: (f: ReturnType<typeof fx>) => void = () => {}) => {
+    const f = fx(); m(f);
+    try { return await backlogOpsGithubGate(env, get(f) as never, false, { enabled: true }); } catch (e) { return (e as { code?: string }).code; }
+  };
+  const ok = await gate();
+  expect(typeof ok === "string" ? ok : "object").toBe("object"); // (a refusal code here names what failed)
+  const pc = (ok as { previousCreatedMs: number }).previousCreatedMs;
+  expect(Math.abs(pc - (Date.now() - 3600_000))).toBeLessThan(60_000);
+  expect(await gate((f) => { f.bound["702"].conclusion = "success"; })).toBe("backlog_ops_gate_previous_run"); // a complete run is not retried
+  expect(await gate((f) => { f.bound["702"].display_title = `backlog ops backfill-dry ${SHA}`; })).toBe("backlog_ops_gate_previous_run");
+  expect(await gate((f) => { f.bound["702"].created_at = hoursAgo(3.5); f.bound["701"].created_at = hoursAgo(4); })).toBe("backlog_ops_gate_previous_run"); // too old
+  expect(await gate((f) => { f.bound["702"].created_at = hoursAgo(3.2); })).toBe("backlog_ops_gate_previous_run"); // before its DRY
+  expect(await gate((f) => { f.bound["702"].run_attempt = 2; })).toBe("backlog_ops_gate_previous_run");
+  expect(await gate((f) => { f.bound["702"].head_sha = "2".repeat(40); })).toBe("backlog_ops_gate_previous_run");
 });

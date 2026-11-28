@@ -1342,6 +1342,6 @@ test("workflow: Path B comes from a secret and a variable for export and drain m
   expect(yml).not.toContain("vars.BACKLOG_OPS_NO_HEAD_PARITY_ORGS");
   expect(yml).not.toMatch(/inputs\.[a-z_]*(parity|head)/u);
   const inputs = yml.slice(yml.indexOf("    inputs:"), yml.indexOf("  pull_request:"));
-  // 14 of GitHub's 25 workflow_dispatch inputs (the authority modes added reshard_run and authority_run, the marker wave_id, per_org).
-  expect(inputs.match(/^      [a-z_]+:$/gmu)?.length).toBe(14);
+  // 15 of GitHub's 25 workflow_dispatch inputs (the authority modes added reshard_run and authority_run; the waves wave_id, per_org, previous_run).
+  expect(inputs.match(/^      [a-z_]+:$/gmu)?.length).toBe(15);
 });

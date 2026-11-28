@@ -677,7 +677,19 @@ runs the unchanged tool once per scope org as a single-org scoped run. This appl
 refresh, catch-up), export and drain.
 - Each child's summary goes through its mode's own checks: countsOnly, and the exact backfill or catch-up schema.
 - The receipt summary is `{kind: "wave", org_count, ok_count, per_org: [{org_hash, exit_code, summary}]}`. Its hashes
-  must be exactly the scope's, each once, and `ok_count` is derived. The run exits 0 when at least one org succeeded.
+  must be exactly the scope's, each once, and `ok_count` is derived. A dry run exits 0 when at least one org succeeded
+  (it shows the eligible subset). An **execute exits nonzero unless every org completed**. Its receipt still keeps
+  every slice, and nothing binds a failed run.
+- **Retry of the outstanding orgs** (`previous_run`, a per-org execute only; confirmation `... PREVIOUS <run> PER_ORG`).
+  The gate checks the previous run: this execute at this sha, failed, first attempt, by the dispatcher, created after
+  every run this one binds, under 3 h old, one unexpired receipt. It writes that run's creation time as
+  `previous_created_ms`. The credential step checks the previous receipt: a wave receipt of exactly this mode, sha,
+  run, scope, ledger, home and bindings (the receipt's `bindings`), not complete.
+  - Completed orgs are carried with `carried_ms`, the time they really ran. Only the outstanding orgs run, and the
+    drain budget is split over those.
+  - Consumers apply their freshness rule to a carried slice from its `carried_ms`.
+  - A carried FULL slice moves that org's catch-up `t` to `carried_ms` minus the 15-min margin, so the catch-up never
+    reads from a later retry's `t`.
 - A run that binds a wave receipt checks it per org, on that org's view: the slice as a single-org receipt, or a
   non-wave receipt of exactly the wave's scope re-scoped to the org with its per-org lists sliced. The unchanged
   per-receipt checks run on each view: home, ledger, since, fingerprint, baseline. The run's 3 h / 24 h freshness and
