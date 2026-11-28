@@ -208,6 +208,26 @@ test("streaming on: two concurrent same-stamp passes apply idempotently: no resu
   expect(r.fake.dump()).toEqual(wanted);
 });
 
+test("streaming on: an older pass racing a newer pass that commits first never overwrites the newer result", async () => {
+  const { r } = await rig(33);
+  const wanted = r.fake.dump();
+  // The older pass A pre-reads first; the rows its read would restore are gone.
+  r.fake.rows.splice(0, 3);
+  let newer: Awaited<ReturnType<typeof indexSearchScope>> | undefined;
+  const older = between(r.search({ stream: UNLIMITED }), new Map([[2, async () => {
+    // Before A's apply transaction: a newer revision commits (epoch bump) and a whole
+    // newer pass B runs to completion and commits its result.
+    await bumpEpoch(r);
+    newer = await indexSearchScope(SCOPE, r.search({ stream: UNLIMITED }));
+  }]]));
+  const a = await indexSearchScope(SCOPE, older.deps);
+  expect(newer).toMatchObject({ complete: true, inserted: 3 });
+  // A's apply saw the changed stamp, refused, re-read and found nothing left to change.
+  expect(older.transactions()).toBe(4);
+  expect(a).toMatchObject({ complete: true, inserted: 0, deleted: 0 });
+  expect(r.fake.dump()).toEqual(wanted);
+});
+
 test("two stamp changes exhaust the retry and fall back to the unmodified locked read", async () => {
   const { r } = await rig();
   let readsAfterSecondPreRead = 0;
