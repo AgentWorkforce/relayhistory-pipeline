@@ -11,7 +11,7 @@ import { join } from "node:path";
 import { PGlite } from "@electric-sql/pglite";
 import { btree_gin } from "@electric-sql/pglite/contrib/btree_gin";
 import { pg_trgm } from "@electric-sql/pglite/contrib/pg_trgm";
-import { createdSessionsFunctions } from "../migrate-guards.ts";
+import { createdSessionsFunctions, pendingExecuteGrants } from "../migrate-guards.ts";
 import { REPO_ROOT, applySupabaseSchema } from "../../session-ingest/__tests__/pglite-schema.ts";
 
 setDefaultTimeout(300_000);
@@ -77,6 +77,39 @@ describe("createdSessionsFunctions, catalogue-backed", () => {
         // Exactly the created function, or nothing the catalogue knows.
         expect([c, k === own[0] || !all.has(k)]).toEqual([c, true]);
       }
+    }
+  });
+
+  test("GRANT targets too: a quoted parameter name in a GRANT signature credits its own key or nothing, never another overload", async () => {
+    const db = new PGlite();
+    open.push(db);
+    await db.exec("CREATE SCHEMA sessions; CREATE ROLE grant_probe;");
+    // hard-delete-owner (ae668e917048): GRANT parsing has the same quoted-name hazard as CREATE.
+    const GRANTS = [
+      ['k1', '"text)" integer'], ['k2', '"jsonb)" integer'], ['k3', '"text," integer, b integer'],
+      ['k4', 'a text'], ['k5', 'a text, b integer'],
+    ] as const;
+    for (const [name, sig] of GRANTS) {
+      // Overloads an over-split or truncated key could name: (text), (jsonb), and (text,integer,integer), which is what a
+      // comma inside a quoted name ("text,") splits (integer,integer) into.
+      await db.exec(`CREATE FUNCTION sessions.${name}(a text) RETURNS void LANGUAGE sql AS 'SELECT';
+        CREATE FUNCTION sessions.${name}(a jsonb) RETURNS void LANGUAGE sql AS 'SELECT';
+        CREATE FUNCTION sessions.${name}(a text, b integer, c integer) RETURNS void LANGUAGE sql AS 'SELECT';`);
+      await db.exec(`CREATE FUNCTION sessions.${name}(${sig}) RETURNS void LANGUAGE sql AS 'SELECT';`).catch(() => {}); // k4: already exists
+      const grant = `GRANT EXECUTE ON FUNCTION sessions.${name}(${sig}) TO grant_probe;`;
+      await db.exec(grant);
+      // The one function PostgreSQL resolved for that GRANT.
+      const granted = (await db.query<{ f: string }>(`SELECT p.oid::regprocedure::text f FROM pg_proc p JOIN pg_namespace n ON n.oid=p.pronamespace
+        WHERE n.nspname='sessions' AND p.proname=$1 AND has_function_privilege('grant_probe', p.oid, 'EXECUTE')
+          AND EXISTS(SELECT 1 FROM aclexplode(p.proacl) x WHERE x.grantee='grant_probe'::regrole)`, [name])).rows.map((r) => r.f);
+      expect([sig, granted.length]).toEqual([sig, 1]);
+      const all = await catalogue(db);
+      for (const g of pendingExecuteGrants([grant])) {
+        const k = g.slice(0, g.lastIndexOf(" "));
+        expect([sig, k === granted[0] || !all.has(k)]).toEqual([sig, true]);
+      }
+      // Quote-free signatures are still credited exactly.
+      if (!/["'$]/u.test(sig)) expect([sig, [...pendingExecuteGrants([grant])]]).toEqual([sig, [`${granted[0]} grant_probe:EXECUTE`]]);
     }
   });
 

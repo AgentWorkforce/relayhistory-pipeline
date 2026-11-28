@@ -2294,7 +2294,9 @@ function normalizeGrantTarget(raw: string): string | null {
  * argument list holds any quote (a quoted identifier, a string or dollar-quoted literal)
  * is skipped entirely: the scan does not track quoting and may have closed early. That,
  * and an argument list it cannot normalize (OUT, dynamic SQL), under-credits: the safe
- * direction, never another overload's key.
+ * direction, never another overload's key. Operationally, a future held migration that
+ * declares a quoted parameter name or a literal default therefore fails closed
+ * (function_acl_drift) until this parser tracks quoting.
  */
 export function createdSessionsFunctions(sql: readonly string[]): Set<string> {
   const created = new Set<string>();
@@ -2346,6 +2348,9 @@ export function pendingExecuteGrants(pendingSql: readonly string[]): Set<string>
       if (/\bwith\s+grant\s+option\b/.test(m[2]!) || /\bgranted\s+by\b/.test(m[2]!)) continue;
       const roles = m[2]!.split(",").map((r) => r.trim().replace(/"/g, ""));
       if (roles.some((r) => !/^[a-z_][a-z0-9_]*$/.test(r))) continue;
+      // Conservative refusal, as createdSessionsFunctions: the target split and normalizeGrantTarget's paren match do
+      // not track quoting, so any quoted identifier or literal in the target list credits nothing (under-credit).
+      if (/["'$]/u.test(m[1]!)) continue;
       for (const target of splitTopLevel(m[1]!)) {
         const fn = normalizeGrantTarget(target);
         if (fn) for (const role of roles) grants.add(`${fn} ${role}:EXECUTE`);
