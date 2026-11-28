@@ -657,7 +657,11 @@ test("workflow: dispatch inputs, gates, one credential step, OIDC, protected var
   // secret, never a variable, so this public repository's logs mask the org ids), presence-dry's session id and Path B's
   // allow-list (export and drain modes only).
   // ... and the authority modes' read-only Cloudflare token (authority modes only).
-  expect(yml.match(/secrets\./g)?.length).toBe(5);
+  // Plus exactly one more reference: the wave-1 scope-check step (marker and hold executes only) gets the org scope
+  // secret ALONE, before every other secret-bearing step (wave1-enable.test.ts pins its position and contents).
+  expect(yml.match(/secrets\./g)?.length).toBe(6);
+  const scopeCheck = yml.slice(yml.indexOf("- name: Check the wave-1 enabled scope"), yml.indexOf("- name: Recheck live gates"));
+  expect(scopeCheck.match(/secrets\.[A-Z_]+/gu)).toEqual(["secrets.BACKLOG_OPS_ORGS"]);
   expect(yml).toContain("BACKLOG_OPS_ORGS: ${{ secrets.BACKLOG_OPS_ORGS }}");
   expect(yml).not.toContain("vars.BACKLOG_OPS_ORGS");
   expect(yml).toContain("SUPABASE_MIGRATION_OWNER_URL: ${{ (startsWith(inputs.mode, 'backfill-') || startsWith(inputs.mode, 'export-') || inputs.mode == 'presence-dry' || startsWith(inputs.mode, 'authority-') || startsWith(inputs.mode, 'bridge-') || startsWith(inputs.mode, 'marker-') || startsWith(inputs.mode, 'hold-')) && secrets.SUPABASE_MIGRATION_OWNER_URL || '' }}");

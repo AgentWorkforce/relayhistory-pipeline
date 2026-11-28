@@ -34,7 +34,9 @@ const target = {
   BACKLOG_OPS_KMS_KEY_ARN: "arn:aws:kms:us-east-1:000000000000:key/00000000-0000-4000-8000-000000000000",
   BACKLOG_OPS_DRY_ROLE_ARN: "arn:aws:iam::000000000000:role/dry", BACKLOG_OPS_EXECUTE_ROLE_ARN: "arn:aws:iam::000000000000:role/exec",
 };
-const on = (env: Record<string, string>) => backlogOpsDispatch(env, true, false, false, false, true);
+/** A SYNTHETIC reviewed pair, tests only: the dispatch needs active lists for these modes (the shipped lists are empty). */
+const TEST_LISTS = { marker: ["h_" + "1".repeat(32), "h_" + "2".repeat(32)], hold: ["h_" + "1".repeat(32), "h_" + "2".repeat(32)] };
+const on = (env: Record<string, string>) => backlogOpsDispatch(env, true, false, false, false, true, TEST_LISTS);
 const dryRow = (o: string, hold: string, epoch: string | null, verdict = "ready") =>
   // A consistent row: an absent/released ready row has its fan-out proven (synthetic); a refused one carries the pending
   // batch its code names.

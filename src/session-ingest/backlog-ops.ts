@@ -165,13 +165,13 @@ export const isBridge = (mode: BacklogOpsMode) => mode.startsWith("bridge-");
  * marker-publication.ts) has its own hold: refused `backlog_ops_marker_held` before any GitHub read until a reviewed
  * commit flips it (after the hold is installed and sealed for a wave under Khaliq's explicit OK).
  */
-export const BACKLOG_OPS_MARKER_EXECUTE_ENABLED: boolean = false;
+export const BACKLOG_OPS_MARKER_EXECUTE_ENABLED: boolean = false; // not consulted since the wave-1 enable: see requireScopeEnabled
 /**
  * The 062320 hold's lifecycle executes (hold-lifecycle.ts: install, seal+bind, verified rollback) have their own hold:
  * refused `backlog_ops_hold_held` before any GitHub read until a reviewed commit flips it. Installing a hold on a real
  * database also needs Khaliq's explicit OK.
  */
-export const BACKLOG_OPS_HOLD_EXECUTE_ENABLED: boolean = false;
+export const BACKLOG_OPS_HOLD_EXECUTE_ENABLED: boolean = false; // not consulted since the wave-1 enable: see requireScopeEnabled
 /**
  * WAVE 1 ENABLE (owner decision A' 252297350480269312, as Pipeline relays it; lane assignment 7aad4e6c9ec7). The
  * marker execute and the hold executes may run only for a run whose ENTIRE secret org scope hashes into these reviewed
@@ -202,13 +202,19 @@ export function enabledScope(scopeOrgHashes: readonly string[] | null, allow: re
   const want = [...allow].sort(), got = [...scopeOrgHashes].sort();
   return got.every((h, i) => h === want[i]) ? "match" : "mismatch";
 }
+/** The two reviewed lists (production: the constants above; tests inject a synthetic pair). */
+export interface EnabledOrgHashes { marker: readonly string[]; hold: readonly string[] }
+export const BACKLOG_OPS_ENABLED_ORG_HASHES: EnabledOrgHashes = Object.freeze({ marker: BACKLOG_OPS_MARKER_ENABLED_ORG_HASHES, hold: BACKLOG_OPS_HOLD_ENABLED_ORG_HASHES });
+/** The lists enable anything at all: both valid, non-empty and the same pair. */
+export const enabledListsActive = (l: EnabledOrgHashes) => l.marker.length > 0 && enabledListsAgree(l.marker, l.hold);
 /**
- * The enable check: allowed when the global switch is on, or when the scope is EXACTLY the reviewed pair (and the hold
- * and marker lists agree). Refuses `<code>` otherwise, never naming an org.
+ * THE enable check for the marker and hold executes, and the only one: the lists are active (valid, non-empty,
+ * agreeing) AND the scope is EXACTLY the pair (Pipeline 6ca1decc4efa). There is no switch path: the boolean switches
+ * above are never consulted for these modes, so no future flip can bypass the secret-scope or the tool check.
+ * Refuses `<code>` otherwise, never naming an org.
  */
-export function requireScopeEnabled(scopeOrgHashes: readonly string[] | null, switchOn: boolean, allow: readonly string[], code: string): void {
-  if (switchOn === true) return;
-  if (!enabledListsAgree(BACKLOG_OPS_MARKER_ENABLED_ORG_HASHES, BACKLOG_OPS_HOLD_ENABLED_ORG_HASHES) || enabledScope(scopeOrgHashes, allow) !== "match") refuse(code);
+export function requireScopeEnabled(scopeOrgHashes: readonly string[] | null, lists: EnabledOrgHashes, which: "marker" | "hold", code: string): void {
+  if (!enabledListsActive(lists) || enabledScope(scopeOrgHashes, lists[which]) !== "match") refuse(code);
 }
 /** The hold modes: hold-dry (read only) and the three held executes, each binding a hold-dry as its DRY. */
 export const isHold = (mode: BacklogOpsMode) => mode.startsWith("hold-");
@@ -353,8 +359,7 @@ export function backlogOpsDispatch(
   bridgeEnabled: boolean = BACKLOG_OPS_BRIDGE_EXECUTE_ENABLED,
   markerEnabled: boolean = BACKLOG_OPS_MARKER_EXECUTE_ENABLED,
   holdEnabled: boolean = BACKLOG_OPS_HOLD_EXECUTE_ENABLED,
-  markerOrgHashes: readonly string[] = BACKLOG_OPS_MARKER_ENABLED_ORG_HASHES,
-  holdOrgHashes: readonly string[] = BACKLOG_OPS_HOLD_ENABLED_ORG_HASHES,
+  enabledOrgHashes: EnabledOrgHashes = BACKLOG_OPS_ENABLED_ORG_HASHES,
 ): BacklogOpsDispatch {
   const mode = env.BACKLOG_OPS_MODE ?? "", sha = env.BACKLOG_OPS_SHA ?? "";
   // A dry-only tool's execute is not a mode: refused with its own code, before the dormant switch is even read.
@@ -370,9 +375,10 @@ export function backlogOpsDispatch(
   if (execute && enabled !== true) refuse("backlog_ops_dormant");
   if (m === "authority-execute" && authorityEnabled !== true) refuse("backlog_ops_authority_held");
   if (m === "bridge-execute" && bridgeEnabled !== true) refuse("backlog_ops_bridge_held");
-  // The switch, or a reviewed two-hash allow-list (the scope itself is checked by the credential step and the tool).
-  if (m === "marker-execute" && markerEnabled !== true && !(validEnabledOrgHashes(markerOrgHashes) && markerOrgHashes.length > 0)) refuse("backlog_ops_marker_held");
-  if (isHold(m) && execute && holdEnabled !== true && !(validEnabledOrgHashes(holdOrgHashes) && holdOrgHashes.length > 0)) refuse("backlog_ops_hold_held");
+  // ONLY active, agreeing reviewed lists enable these (the switches are not consulted: no bypass); the scope itself is
+  // checked by the credential step and the tool. markerEnabled/holdEnabled are kept in the signature, unused.
+  void markerEnabled; void holdEnabled;
+  if ((m === "marker-execute" || (isHold(m) && execute)) && !enabledListsActive(enabledOrgHashes)) refuse(m === "marker-execute" ? "backlog_ops_marker_held" : "backlog_ops_hold_held");
   // A marker mode binds the catch-up (BACKFILL) whose baseline the evidence is bound to, dry or execute.
   const wantsBackfill = (execute && tool !== "backfill" && tool !== "bridge" && tool !== "hold") || isMarker(m), wantsExport = execute && tool === "drain";
   // reshard-dry may bind the completed catch-up it verifies after (BACKFILL, optional; authority-execute requires it).

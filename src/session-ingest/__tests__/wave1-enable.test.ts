@@ -46,13 +46,15 @@ test("exact-set scope: only the pair itself matches; a singleton, substituted, e
     expect([name, enabledScope(scope as never, PAIR)]).toEqual([name, "mismatch"]);
   expect(enabledScope(PAIR, [])).toBe("disabled");
   expect(enabledScope(PAIR, [H(A)])).toBe("mismatch"); // a malformed list never matches
-  // requireScopeEnabled: the switch, or an exact match against the SHIPPED lists.
-  expect(code(() => requireScopeEnabled(PAIR, true, [], "x_refused"))).toBeNull();
-  // Callers pass the SHIPPED list as `allow`: an empty one is held; an exact match against a populated one passes.
-  expect(code(() => requireScopeEnabled(PAIR, false, [], "x_refused"))).toBe("x_refused");
-  expect(code(() => requireScopeEnabled(PAIR, false, PAIR, "x_refused"))).toBeNull();
-  expect(code(() => requireScopeEnabled([H(A), H(C)], false, PAIR, "x_refused"))).toBe("x_refused");
-  expect(code(() => requireScopeEnabled(null, false, PAIR, "x_refused"))).toBe("x_refused");
+  // requireScopeEnabled: active agreeing lists AND an exact match; there is no switch path.
+  const L = { marker: PAIR, hold: PAIR };
+  expect(code(() => requireScopeEnabled(PAIR, L, "marker", "x_refused"))).toBeNull();
+  expect(code(() => requireScopeEnabled(PAIR, L, "hold", "x_refused"))).toBeNull();
+  expect(code(() => requireScopeEnabled(PAIR, { marker: [], hold: [] }, "marker", "x_refused"))).toBe("x_refused");
+  expect(code(() => requireScopeEnabled(PAIR, { marker: PAIR, hold: [] }, "marker", "x_refused"))).toBe("x_refused"); // lists disagree
+  expect(code(() => requireScopeEnabled(PAIR, { marker: PAIR, hold: [H(A), H(C)] }, "hold", "x_refused"))).toBe("x_refused");
+  for (const scope of [[H(A)], [H(A), H(C)], [H(A), H(B), H(C)], null])
+    expect(code(() => requireScopeEnabled(scope, L, "marker", "x_refused"))).toBe("x_refused");
 });
 
 test("dispatch: the executes stay held while the shipped list is empty; a non-empty well-formed list passes the dispatch (the scope is checked later)", () => {
@@ -60,12 +62,16 @@ test("dispatch: the executes stay held while the shipped list is empty; a non-em
     BACKLOG_OPS_FULL_BACKFILL_RUN: "603", BACKLOG_OPS_RESHARD_RUN: "604", BACKLOG_OPS_WAVE_ID: "h_" + "7".repeat(32),
     BACKLOG_OPS_CONFIRMATION: `MARKER-EXECUTE ${SHA} DRY 605 BACKFILL 602 FULL 603 RESHARD 604 AUTHORITY 601 WAVE h_${"7".repeat(32)}` };
   const hold = { BACKLOG_OPS_MODE: "hold-install-execute", BACKLOG_OPS_SHA: SHA, BACKLOG_OPS_DRY_RUN: "801", BACKLOG_OPS_CONFIRMATION: `HOLD-INSTALL-EXECUTE ${SHA} DRY 801` };
-  const d = (env: Record<string, string>, m: readonly string[], h: readonly string[]) => code(() => backlogOpsDispatch(env, true, false, false, false, false, m, h));
+  const d = (env: Record<string, string>, m: readonly string[], h: readonly string[]) => code(() => backlogOpsDispatch(env, true, false, false, false, false, { marker: m, hold: h }));
   expect(d(marker, [], [])).toBe("backlog_ops_marker_held");
   expect(d(hold, [], [])).toBe("backlog_ops_hold_held");
   expect(d(marker, PAIR, PAIR)).toBeNull();
   expect(d(hold, PAIR, PAIR)).toBeNull();
   expect(d(marker, [H(A)], [H(A)])).toBe("backlog_ops_marker_held"); // malformed (one hash)
+  expect(d(marker, PAIR, [])).toBe("backlog_ops_marker_held"); // the lists disagree
+  // The legacy switches no longer enable anything: all on, lists empty: still held.
+  expect(code(() => backlogOpsDispatch(marker, true, true, true, true, true, { marker: [], hold: [] }))).toBe("backlog_ops_marker_held");
+  expect(code(() => backlogOpsDispatch(hold, true, true, true, true, true, { marker: [], hold: [] }))).toBe("backlog_ops_hold_held");
   // hold-dry and marker-dry need no enable.
   expect(code(() => backlogOpsDispatch({ BACKLOG_OPS_MODE: "hold-dry", BACKLOG_OPS_SHA: SHA }))).toBeNull();
 });
@@ -106,4 +112,72 @@ test("the credential step: a hold or marker execute outside the enabled pair is 
   await expect(backlogOpsRun({ ...base, BACKLOG_OPS_MODE: "hold-install-execute", BACKLOG_OPS_ORGS: [A, C].join(","), BACKLOG_OPS_DRY_RUN: "801",
     BACKLOG_OPS_CONFIRMATION: `HOLD-INSTALL-EXECUTE ${SHA} DRY 801` }, { fetcher })).rejects.toMatchObject({ code: expect.stringMatching(/^backlog_ops_hold_(held|scope_not_enabled)$/u) });
   expect(fetched).toBe(before);
+});
+
+const SYNTH = { marker: PAIR, hold: PAIR }; // a SYNTHETIC reviewed pair (A, B), tests only
+
+test("both real CLIs with a populated (synthetic) pair: the exact pair passes the enable and moves on; any other --org set is held, naming no org", async () => {
+  const marker = await import("../../../scripts/backlog-marker.ts");
+  const hold = await import("../../../scripts/backlog-hold.ts");
+  const margs = (orgs: string[]) => ["execute", "--bucket", "transcripts", "--region", "us-east-1", "--sha", SHA, "--authority-run", "1", "--backfill-run", "2",
+    "--full-run", "3", "--reshard-run", "4", "--kms-key-arn", "arn:aws:kms:us-east-1:000000000000:key/00000000-0000-4000-8000-000000000000", ...orgs.flatMap((o) => ["--org", o])];
+  const hargs = (orgs: string[]) => ["install", "--sha", SHA, "--dry-run", "801", ...orgs.flatMap((o) => ["--org", o])];
+  const mcode = async (orgs: string[], lists = SYNTH) => { try { await marker.main(margs(orgs), {}, { stdin: () => "not json", enabledOrgHashes: lists }); return null; } catch (e) { return (e as { code?: string }).code; } };
+  const hcode = async (orgs: string[], lists = SYNTH) => { try { await hold.main(hargs(orgs), { stdin: () => "not json", enabledOrgHashes: lists }); return null; } catch (e) { return (e as { code?: string }).code; } };
+  // The exact pair passes the enable; the next refusal is the stdin parse (nothing past the enable was reached before).
+  expect(await mcode([A, B])).toBe("stdin_invalid");
+  expect(await hcode([A, B])).toBe("stdin_invalid");
+  for (const orgs of [[A], [A, C], [A, B, C]]) {
+    expect([orgs.length, await mcode(orgs)]).toEqual([orgs.length, "marker_execute_held"]);
+    expect([orgs.length, await hcode(orgs)]).toEqual([orgs.length, "hold_execute_held"]);
+  }
+  // Production lists (empty): held for the pair too.
+  expect(await mcode([A, B], { marker: [], hold: [] })).toBe("marker_execute_held");
+  expect(await hcode([A, B], { marker: [], hold: [] })).toBe("hold_execute_held");
+});
+
+test("the scope-check step: given only the inputs and the scope secret, it refuses a mismatched scope and passes the exact pair; other modes pass through", async () => {
+  const { backlogOpsScopeCheck } = await import("../../../scripts/backlog-ops.ts");
+  const hold = { BACKLOG_OPS_MODE: "hold-install-execute", BACKLOG_OPS_SHA: SHA, BACKLOG_OPS_DRY_RUN: "801", BACKLOG_OPS_CONFIRMATION: `HOLD-INSTALL-EXECUTE ${SHA} DRY 801` };
+  expect(backlogOpsScopeCheck({ ...hold, BACKLOG_OPS_ORGS: [A, B].join(",") }, SYNTH)).toBe("checked");
+  for (const orgs of ["", A, [A, C].join(","), [A, B, C].join(",")])
+    expect([orgs.length, code(() => backlogOpsScopeCheck({ ...hold, BACKLOG_OPS_ORGS: orgs }, SYNTH))]).toEqual([orgs.length, "backlog_ops_hold_scope_not_enabled"]);
+  expect(code(() => backlogOpsScopeCheck({ ...hold, BACKLOG_OPS_ORGS: [A, B].join(",") }))).toBe("backlog_ops_hold_held"); // shipped lists empty
+  expect(backlogOpsScopeCheck({ BACKLOG_OPS_MODE: "hold-dry", BACKLOG_OPS_SHA: SHA, BACKLOG_OPS_ORGS: A })).toBe("not_applicable");
+  // The workflow runs it before every step that holds another secret, with the scope secret alone.
+  const yml = readFileSync(new URL("../../../.github/workflows/backlog-ops.yml", import.meta.url), "utf8");
+  const at = yml.indexOf("- name: Check the wave-1 enabled scope"), recheck = yml.indexOf("- name: Recheck live gates"), tool = yml.indexOf("- name: Run the backlog tool");
+  expect(at > 0 && at < recheck && recheck < tool).toBe(true);
+  const block = yml.slice(at, recheck);
+  expect(block).toContain("run: bun scripts/backlog-ops-scope-check.ts");
+  expect(block.match(/secrets\.[A-Z_]+/gu)).toEqual(["secrets.BACKLOG_OPS_ORGS"]);
+});
+
+test("hold-dry with a populated (synthetic) pair records enable_scope match for the exact scope and mismatch otherwise (marker-dry: marker-publication.test.ts)", async () => {
+  const temp = mkdtempSync(join(tmpdir(), "wave1-mdry-"));
+  cleanups.push(() => rmSync(temp, { recursive: true, force: true }));
+  const { backlogOpsRun: run } = await import("../../../scripts/backlog-ops.ts");
+  const target = { BACKLOG_OPS_BUCKET: "96bulls-aws-sessions-prod-transcripts-000000000000", BACKLOG_OPS_REGION: "us-east-1",
+    BACKLOG_OPS_KMS_KEY_ARN: "arn:aws:kms:us-east-1:000000000000:key/00000000-0000-4000-8000-000000000000",
+    BACKLOG_OPS_DRY_ROLE_ARN: "arn:aws:iam::000000000000:role/dry", BACKLOG_OPS_EXECUTE_ROLE_ARN: "arn:aws:iam::000000000000:role/exec" };
+  const { SCHEMA_RELEASE: P } = await import("../../hoopdb/schema-release-contract.ts");
+  const fetcher = (async (url: string) => url.startsWith("https://token.example/") ? new Response(JSON.stringify({ value: "a.b.c" }))
+    : new Response(`<AssumeRoleWithWebIdentityResponse><Credentials><AccessKeyId>ASIAAAAAAAAAAAAAAAAA</AccessKeyId><SecretAccessKey>s</SecretAccessKey>
+      <SessionToken>t</SessionToken><Expiration>${new Date(Date.now() + 6 * 3600_000).toISOString()}</Expiration></Credentials></AssumeRoleWithWebIdentityResponse>`)) as unknown as typeof fetch;
+  const runOnce = async (orgs: string[], dir: string) => {
+    const lines: string[] = [];
+    const log = console.log;
+    console.log = (...a: unknown[]) => { lines.push(a.join(" ")); };
+    try {
+      // hold-dry: no bindings needed; the same receipt path as marker-dry for enable_scope.
+      await run({ ...target, BACKLOG_OPS_MODE: "hold-dry", BACKLOG_OPS_SHA: SHA, BACKLOG_OPS_ORGS: orgs.join(","), GITHUB_SHA: SHA, GITHUB_RUN_ID: "901", RUNNER_TEMP: dir,
+        SUPABASE_MIGRATION_OWNER_URL: `postgresql://${P.owner}.${P.project}:p%40ss@${P.host}:${P.port}/${P.database}?sslmode=verify-full`,
+        ACTIONS_ID_TOKEN_REQUEST_URL: "https://token.example/x", ACTIONS_ID_TOKEN_REQUEST_TOKEN: "bearer" },
+        { fetcher, runChild: async () => ({ code: 1, stdout: JSON.stringify({ refused: "internal_error" }) }), enabledOrgHashes: SYNTH });
+    } finally { console.log = log; }
+    return JSON.parse(lines.find((l) => l.startsWith("backlog_ops_receipt "))!.slice("backlog_ops_receipt ".length));
+  };
+  expect((await runOnce([A, B], join(temp, "1"))).enable_scope).toBe("match");
+  expect((await runOnce([A, C], join(temp, "2"))).enable_scope).toBe("mismatch");
+  expect((await runOnce([A], join(temp, "3"))).enable_scope).toBe("mismatch");
 });

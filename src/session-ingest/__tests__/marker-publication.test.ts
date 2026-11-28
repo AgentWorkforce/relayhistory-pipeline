@@ -425,7 +425,9 @@ const dispatchEnv = (mode: BacklogOpsMode, over: Record<string, string> = {}) =>
   }
   return { ...base, ...over };
 };
-const on = (env: Record<string, string>) => backlogOpsDispatch(env, true, false, false, true);
+/** A SYNTHETIC reviewed pair, tests only: the dispatch needs active lists for these modes (the shipped lists are empty). */
+const TEST_LISTS = { marker: ["h_" + "1".repeat(32), "h_" + "2".repeat(32)], hold: ["h_" + "1".repeat(32), "h_" + "2".repeat(32)] };
+const on = (env: Record<string, string>) => backlogOpsDispatch(env, true, false, false, true, false, TEST_LISTS);
 
 test("dispatch: both marker modes bind AUTHORITY, BACKFILL, FULL and RESHARD; the execute is held, binds its DRY and names the WAVE", () => {
   expect(code(() => backlogOpsDispatch(dispatchEnv("marker-execute")))).toBe("backlog_ops_marker_held");
@@ -501,7 +503,7 @@ const gateContext = { GITHUB_REPOSITORY: P.repository, GITHUB_REPOSITORY_ID: PRI
 const gate = (mode: BacklogOpsMode, mutate: (f: GateFx) => void = () => {}, markerEnabled = true) => {
   const f = gateFixture(mode);
   mutate(f);
-  return acode(() => backlogOpsGithubGate({ ...gateContext, ...dispatchEnv(mode) }, gateGet(f), false, { enabled: true, markerEnabled }));
+  return acode(() => backlogOpsGithubGate({ ...gateContext, ...dispatchEnv(mode) }, gateGet(f), false, { enabled: true, ...(markerEnabled ? { enabledOrgHashes: TEST_LISTS } : {}) }));
 };
 
 test("gate: the exact main head, then the marker order (authority and FULL before the catch-up, reshard after it, the dry last), the catch-up fresh", async () => {
@@ -690,7 +692,7 @@ test("the credential step end to end (fake OIDC/STS and tool child): the marker-
     <SessionToken>t</SessionToken><Expiration>${new Date(Date.now() + 6 * 3600_000).toISOString()}</Expiration></Credentials></AssumeRoleWithWebIdentityResponse>`;
   const fetcher = (async (url: string) => url.startsWith("https://token.example/") ? new Response(JSON.stringify({ value: "a.b.c" })) : new Response(xml)) as unknown as typeof fetch;
   const ownerUrl = `postgresql://${P.owner}.${P.project}:p%40ss@${P.host}:${P.port}/${P.database}?sslmode=verify-full`;
-  const step = async (stdout: string, out: string) => {
+  const step = async (stdout: string, out: string, enabledOrgHashes?: { marker: string[]; hold: string[] }) => {
     const lines: string[] = [];
     const log = console.log;
     console.log = (...a: unknown[]) => { lines.push(a.join(" ")); };
@@ -700,14 +702,16 @@ test("the credential step end to end (fake OIDC/STS and tool child): the marker-
       exit = await backlogOpsRun({ ...target, ...SCOPE_ENV, ...dispatchEnv("marker-dry"), GITHUB_SHA: SHA, GITHUB_RUN_ID: "900", RUNNER_TEMP: join(temp, out),
         BACKLOG_OPS_REVISIONS_SINCE_MS: String(SINCE), BACKLOG_OPS_CLOUDFLARE_TOKEN: "c".repeat(40), SUPABASE_MIGRATION_OWNER_URL: ownerUrl,
         ACTIONS_ID_TOKEN_REQUEST_URL: "https://token.example/x", ACTIONS_ID_TOKEN_REQUEST_TOKEN: "bearer" },
-        { fetcher, runChild: async (c) => { child = c as never; return { code: 0, stdout }; } });
+        { fetcher, runChild: async (c) => { child = c as never; return { code: 0, stdout }; }, ...(enabledOrgHashes ? { enabledOrgHashes } : {}) });
     } finally { console.log = log; }
     return { exit, lines, child: child!, receipt: JSON.parse(lines.find((l) => l.startsWith("backlog_ops_receipt "))!.slice("backlog_ops_receipt ".length)) };
   };
   // Every bound receipt lives under RUNNER_TEMP: point each run's temp at a copy.
   const { cpSync } = await import("node:fs");
-  for (const out of ["a", "b"]) cpSync(join(temp, "backlog-ops-bound"), join(temp, out, "backlog-ops-bound"), { recursive: true });
+  for (const out of ["a", "b", "c"]) cpSync(join(temp, "backlog-ops-bound"), join(temp, out, "backlog-ops-bound"), { recursive: true });
   const ok = await step(JSON.stringify(summary), "a");
+  // The wave-1 enable record on marker-dry: the shipped lists are empty, so `disabled`.
+  expect(ok.receipt.enable_scope).toBe("disabled");
   expect(ok.exit).toBe(0);
   expect(ok.receipt.summary).toEqual(JSON.parse(JSON.stringify(summary)));
   expect(ok.receipt).toMatchObject({ mode: "marker-dry", scope: scopeId, home, authority_run: RUNS.authority, after_run: RUNS.backfill, full_run: RUNS.full, reshard_run: RUNS.reshard });
@@ -719,6 +723,11 @@ test("the credential step end to end (fake OIDC/STS and tool child): the marker-
     expect(ok.lines).toContain(`::add-mask::${o}`);
     expect(ok.lines.filter((l) => !l.startsWith("::add-mask::")).join("\n")).not.toContain(o);
   }
+  // With a SYNTHETIC populated pair (tests only), the 3-org scope is not exactly the pair: `mismatch`; nothing names an org.
+  const pairOfTwo = [H(ORGS[0]!), H(ORGS[1]!)];
+  const mm = await step(JSON.stringify(summary), "c", { marker: pairOfTwo, hold: pairOfTwo });
+  expect(mm.receipt.enable_scope).toBe("mismatch");
+  expect(JSON.stringify(mm.receipt)).not.toContain(ORGS[0]!);
   // A tool line smuggling an org id (in a code-shaped position) is refused and never logged or persisted.
   const leak = JSON.parse(JSON.stringify(summary));
   leak.per_org[0].org_hash = ORGS[0];

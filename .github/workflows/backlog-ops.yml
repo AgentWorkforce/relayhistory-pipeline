@@ -303,6 +303,14 @@ jobs:
           bun-version: 1.4.2
       - name: Install without credentials
         run: bun install --frozen-lockfile
+      # The wave-1 enable (marker and hold executes only): the scope must be EXACTLY the reviewed two-org-hash pair. This
+      # step gets the BACKLOG_OPS_ORGS secret and nothing else, and runs before every step that holds another secret, so a
+      # refused scope ends the job before the database URL, the Cloudflare token or the role session reach any step.
+      - name: Check the wave-1 enabled scope (marker and hold executes)
+        if: inputs.mode == 'marker-execute' || (startsWith(inputs.mode, 'hold-') && endsWith(inputs.mode, '-execute'))
+        env:
+          BACKLOG_OPS_ORGS: ${{ secrets.BACKLOG_OPS_ORGS }}
+        run: bun scripts/backlog-ops-scope-check.ts
       - name: Recheck live gates and the recorded environment approval
         id: recheck
         # Also writes revisions_since_ms (FULL's created_at minus the catch-up margin) whenever full_backfill_run is bound.

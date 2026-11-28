@@ -6,7 +6,8 @@
  *       --full-run <id> --reshard-run <id> --org <org> ...
  *   bun scripts/backlog-marker.ts execute ... (the same) --kms-key-arn <arn>
  *       stdin {"dbUrl", "cloudflareToken", "baseline", "ledgerBucket", "bound"} (+ "wave" for execute).
- *       execute is refused unless BACKLOG_OPS_MARKER_EXECUTE_ENABLED (backlog-ops.ts; false in this tree).
+ *       execute is refused unless its --org set is EXACTLY the reviewed enabled pair (backlog-ops.ts requireScopeEnabled; the
+ *       lists are empty in this tree, so it is always refused).
  *
  * AWS_* credentials from the environment only. The evidence reads run each statement in its own REPEATABLE READ READ
  * ONLY transaction (scripts/backlog-authority.ts readOnlySql) on their own session; each org's hold reads, marker
@@ -20,7 +21,7 @@ import pg from "pg";
 import { createS3Store, type ObjectStore } from "../src/shared/vendor.ts";
 import { ownerClientConfig } from "../src/shared/owner-pg-config.ts";
 import { AUTHORITY_EVIDENCE, type AuthorityEvidenceSources } from "../src/session-ingest/authority-evidence.ts";
-import { BACKLOG_OPS_MARKER_ENABLED_ORG_HASHES, BACKLOG_OPS_MARKER_EXECUTE_ENABLED, backlogOpsScope, requireScopeEnabled } from "../src/session-ingest/backlog-ops.ts";
+import { BACKLOG_OPS_ENABLED_ORG_HASHES, backlogOpsScope, requireScopeEnabled, type EnabledOrgHashes } from "../src/session-ingest/backlog-ops.ts";
 import { evidenceHash } from "../src/session-ingest/authority-evidence.ts";
 import { BACKLOG_AUTHORITY_KEY_ROOT, CLOUDFLARE_TOKEN, cloudflareGet } from "../src/session-ingest/backlog-authority.ts";
 import {
@@ -156,11 +157,11 @@ function awsCredentials(env: NodeJS.ProcessEnv) {
   return { accessKeyId: accessKeyId!, secretAccessKey: secretAccessKey!, ...(env.AWS_SESSION_TOKEN ? { sessionToken: env.AWS_SESSION_TOKEN } : {}) };
 }
 
-export async function main(argv: readonly string[], env: NodeJS.ProcessEnv, deps: { stdin?: () => string } = {}) {
+export async function main(argv: readonly string[], env: NodeJS.ProcessEnv, deps: { stdin?: () => string; /** TESTS ONLY */ enabledOrgHashes?: EnabledOrgHashes } = {}) {
   const args = parseMarkerArgs(argv);
   // The switch, or every --org inside the reviewed two-hash allow-list (backlog-ops.ts); a refusal names no org.
   if (args.command === "execute") {
-    try { requireScopeEnabled(args.orgs.map((o) => evidenceHash("org", o)), BACKLOG_OPS_MARKER_EXECUTE_ENABLED, BACKLOG_OPS_MARKER_ENABLED_ORG_HASHES, "marker_execute_held"); }
+    try { requireScopeEnabled(args.orgs.map((o) => evidenceHash("org", o)), deps.enabledOrgHashes ?? BACKLOG_OPS_ENABLED_ORG_HASHES, "marker", "marker_execute_held"); }
     catch { fail("marker_execute_held"); }
   }
   const input = markerStdin((deps.stdin ?? (() => readFileSync(0, "utf8")))().split("\n")[0] ?? "", args.command);

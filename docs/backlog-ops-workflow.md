@@ -778,6 +778,20 @@ false.
   receipt changes.
 - **Separate from:** the empty-window release's own list (`EMPTY_RELEASE_WAVE_ORG_HASHES`), which is
   sessions-backlog-integration's commit.
+- **Exposure trace for a marker or hold execute** (operate job, in order). This is what reaches a step before the
+  scope is validated, and why:
+
+  | Step | Receives | Why it is acceptable before the scope check |
+  | --- | --- | --- |
+  | prerequisite-gate job (all steps) | `GITHUB_TOKEN` (`contents`, `actions`, `deployments`: read) | read-only GitHub API for the dispatch and CI gates; no environment, no secret; it refuses an empty list before any read |
+  | operate: checkout, setup-bun, install | `GITHUB_TOKEN` (checkout, `persist-credentials: false`) and the job's OIDC request capability (`id-token: write` exposes `ACTIONS_ID_TOKEN_REQUEST_*` to every step of the job) | the code at the exact sha and pinned first-party actions; none of them requests a token, and the write role trusts only the execute environment's subject |
+  | operate: **Check the wave-1 enabled scope** | `BACKLOG_OPS_ORGS` only (and the OIDC capability above) | the scope secret itself is the input being validated; a refused scope ends the job here, before any other secret |
+  | operate: recheck, artifact downloads | `GITHUB_TOKEN` | read-only gate recheck and downloads of the bound receipts (counts only); no secret |
+  | operate: Run the backlog tool | the owner DB URL, the Cloudflare token (marker), `BACKLOG_OPS_ORGS`, the protected variables, and the OIDC exchange for the role session | reached only when the scope check passed. The step then checks the scope again before reading any credential, and the tool checks its `--org` set a third time |
+
+  So for a refused scope, no operational credential (DB URL, Cloudflare token, role session) reaches any step. What
+  does run before the check: the read-only `GITHUB_TOKEN` and the OIDC request capability, which is job-wide by
+  GitHub's design and is not exercised before the tool step.
 - **Does not change install readiness:** fan-out stays unproven, so a hold install still refuses before `_install`.
   Marker publication also stays held pending Pipeline's direct-upload consumer contract. Every dispatch still needs
   its environment approval, and any live install or marker needs Khaliq's explicit OK.

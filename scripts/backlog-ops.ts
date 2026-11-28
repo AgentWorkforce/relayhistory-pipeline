@@ -47,11 +47,10 @@ import { fileURLToPath } from "node:url";
 import { releaseConnection } from "../src/hoopdb/schema-release-contract.ts";
 import {
   BACKLOG_OPS_CATCHUP_MARGIN_MS,
-  BACKLOG_OPS_HOLD_ENABLED_ORG_HASHES,
-  BACKLOG_OPS_HOLD_EXECUTE_ENABLED,
-  BACKLOG_OPS_MARKER_ENABLED_ORG_HASHES,
-  BACKLOG_OPS_MARKER_EXECUTE_ENABLED,
+  BACKLOG_OPS_ENABLED_ORG_HASHES,
+  enabledListsActive,
   requireScopeEnabled,
+  type EnabledOrgHashes,
   enabledScope,
   BACKLOG_OPS_RECEIPT_FILE,
   BACKLOG_OPS_SESSION_SECONDS,
@@ -351,7 +350,8 @@ function runChild(child: ChildSpec): Promise<{ code: number; stdout: string }> {
 
 export async function backlogOpsRun(
   env: Record<string, string | undefined>,
-  deps: { fetcher?: typeof fetch; runChild?: (child: ChildSpec) => Promise<{ code: number; stdout: string }> } = {},
+  deps: { fetcher?: typeof fetch; runChild?: (child: ChildSpec) => Promise<{ code: number; stdout: string }>;
+    /** TESTS ONLY: a synthetic reviewed pair (production always uses the shipped lists). */ enabledOrgHashes?: EnabledOrgHashes } = {},
 ) {
   const d = backlogOpsDispatch(env);
   if (env.GITHUB_SHA !== d.sha || !/^[1-9][0-9]*$/u.test(env.GITHUB_RUN_ID ?? "")) refuse("backlog_ops_checkout");
@@ -368,8 +368,9 @@ export async function backlogOpsRun(
   // The wave-1 enable (backlog-ops.ts): a marker or hold execute only for a scope wholly inside its reviewed allow-list,
   // checked before any credential (a no-op where the global switch is on).
   const scopeHashes = scope.orgs ? scope.orgs.map((o) => evidenceHash("org", o)) : null;
-  if (d.mode === "marker-execute") requireScopeEnabled(scopeHashes, BACKLOG_OPS_MARKER_EXECUTE_ENABLED, BACKLOG_OPS_MARKER_ENABLED_ORG_HASHES, "backlog_ops_marker_scope_not_enabled");
-  if (isHold(d.mode) && isExecute(d.mode)) requireScopeEnabled(scopeHashes, BACKLOG_OPS_HOLD_EXECUTE_ENABLED, BACKLOG_OPS_HOLD_ENABLED_ORG_HASHES, "backlog_ops_hold_scope_not_enabled");
+  const lists = deps.enabledOrgHashes ?? BACKLOG_OPS_ENABLED_ORG_HASHES;
+  if (d.mode === "marker-execute") requireScopeEnabled(scopeHashes, lists, "marker", "backlog_ops_marker_scope_not_enabled");
+  if (isHold(d.mode) && isExecute(d.mode)) requireScopeEnabled(scopeHashes, lists, "hold", "backlog_ops_hold_scope_not_enabled");
   // The authority modes' Cloudflare token (shape; and empty for every other mode), before any credential.
   backlogOpsCloudflareToken(env, d);
   const t = backlogOpsTarget(env), spec = backlogOpsToolArgs(d, t, scope, isCatchup(d.mode) || isBridge(d.mode) ? since : null, toolOf(d.mode) === "export" ? nhp : null);
@@ -453,7 +454,8 @@ export async function backlogOpsRun(
   // The wave-1 scope verification (a dry records it; it refuses nothing): whether this run's secret scope is exactly the
   // reviewed enable pair. Only hold-dry and marker-dry carry it, so every other receipt is byte-identical.
   if (d.mode === "hold-dry" || d.mode === "marker-dry")
-    receipt = { ...receipt, enable_scope: enabledScope(scopeHashes, d.mode === "hold-dry" ? BACKLOG_OPS_HOLD_ENABLED_ORG_HASHES : BACKLOG_OPS_MARKER_ENABLED_ORG_HASHES) };
+    receipt = { ...receipt, enable_scope: enabledListsActive(lists) || lists[d.mode === "hold-dry" ? "hold" : "marker"].length === 0
+      ? enabledScope(scopeHashes, lists[d.mode === "hold-dry" ? "hold" : "marker"]) : "mismatch" };
   writePrivate(paths.receipt, receipt);
   console.log("backlog_ops_receipt " + JSON.stringify(receipt));
   return exit;
@@ -646,6 +648,21 @@ export function markerWaveBound(env: Record<string, string | undefined>, d: Back
     out.wave = checkMarkerDryReceipt(raw, orgs!, { authority: d.authorityRun!, backfill: d.backfillRun!, full: d.fullBackfillRun!, reshard: d.reshardRun! }, d.waveId!);
   }
   return out;
+}
+
+/**
+ * The wave-1 scope check as its own workflow step (scripts/backlog-ops-scope-check.ts), run before every secret-bearing step for the marker
+ * and hold executes: given only the dispatch inputs and the BACKLOG_OPS_ORGS secret (no database URL, token or role), it
+ * refuses unless the scope is exactly the reviewed enabled pair. The credential step and the tool check it again.
+ * Every other mode passes through unchanged.
+ */
+export function backlogOpsScopeCheck(env: Record<string, string | undefined>, lists: EnabledOrgHashes = BACKLOG_OPS_ENABLED_ORG_HASHES): "checked" | "not_applicable" {
+  const d = backlogOpsDispatch(env, undefined, undefined, undefined, undefined, undefined, lists);
+  if (!(d.mode === "marker-execute" || (isHold(d.mode) && isExecute(d.mode)))) return "not_applicable";
+  const scope = backlogOpsScope(env);
+  requireScopeEnabled(scope.orgs ? scope.orgs.map((o) => evidenceHash("org", o)) : null, lists, d.mode === "marker-execute" ? "marker" : "hold",
+    d.mode === "marker-execute" ? "backlog_ops_marker_scope_not_enabled" : "backlog_ops_hold_scope_not_enabled");
+  return "checked";
 }
 
 if (import.meta.main)

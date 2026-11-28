@@ -5,7 +5,8 @@
  *   bun scripts/backlog-hold.ts dry --sha <sha> --org <org> ...                         stdin {"dbUrl"}
  *   bun scripts/backlog-hold.ts install|seal|rollback --sha <sha> --dry-run <id> --org <org> ...
  *       stdin {"dbUrl", "approved": [...], "full"?: {...} (seal), "evidence"?: <hex64> (rollback)}
- *       Every execute is refused unless BACKLOG_OPS_HOLD_EXECUTE_ENABLED (backlog-ops.ts; false in this tree).
+ *       Every execute is refused unless its --org set is EXACTLY the reviewed enabled pair (backlog-ops.ts requireScopeEnabled;
+ *       the lists are empty in this tree, so it is always refused).
  *
  * The dry's sessions are read-only (default_transaction_read_only=on). An execute's statements run in one READ
  * COMMITTED transaction per org (hold-lifecycle.ts). Output: one JSON line, counts, codes and hashes only; refusals as
@@ -15,7 +16,7 @@ import { readFileSync } from "node:fs";
 import { parseArgs } from "node:util";
 import pg from "pg";
 import { ownerClientConfig } from "../src/shared/owner-pg-config.ts";
-import { BACKLOG_OPS_HOLD_ENABLED_ORG_HASHES, BACKLOG_OPS_HOLD_EXECUTE_ENABLED, requireScopeEnabled } from "../src/session-ingest/backlog-ops.ts";
+import { BACKLOG_OPS_ENABLED_ORG_HASHES, requireScopeEnabled, type EnabledOrgHashes } from "../src/session-ingest/backlog-ops.ts";
 import { evidenceHash } from "../src/session-ingest/authority-evidence.ts";
 import { HOLD_LIFECYCLE_CONCURRENCY, HOLD_TOOL_REFUSALS, holdRun, type HoldSqlSession, type HoldStep } from "../src/session-ingest/hold-lifecycle.ts";
 import { waveOrgList } from "../src/session-ingest/org-wave.ts";
@@ -75,10 +76,10 @@ export function pgHoldSession(client: { query(text: string, params?: unknown[]):
   };
 }
 
-export async function main(argv: readonly string[], deps: { stdin?: () => string } = {}) {
+export async function main(argv: readonly string[], deps: { stdin?: () => string; /** TESTS ONLY */ enabledOrgHashes?: EnabledOrgHashes } = {}) {
   const a = parseHoldArgs(argv);
   if (a.step !== "dry") {
-    try { requireScopeEnabled(a.orgs.map((o) => evidenceHash("org", o)), BACKLOG_OPS_HOLD_EXECUTE_ENABLED, BACKLOG_OPS_HOLD_ENABLED_ORG_HASHES, "hold_execute_held"); }
+    try { requireScopeEnabled(a.orgs.map((o) => evidenceHash("org", o)), deps.enabledOrgHashes ?? BACKLOG_OPS_ENABLED_ORG_HASHES, "hold", "hold_execute_held"); }
     catch { fail("hold_execute_held"); }
   }
   const input = holdStdin((deps.stdin ?? (() => readFileSync(0, "utf8")))().split("\n")[0] ?? "", a.step);

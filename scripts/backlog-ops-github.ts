@@ -70,11 +70,12 @@ export async function backlogOpsGithubGate(
   env: Record<string, string | undefined>,
   get: Get,
   approved = false,
-  options: { enabled?: boolean; authorityEnabled?: boolean; bridgeEnabled?: boolean; markerEnabled?: boolean; holdEnabled?: boolean; now?: number } = {},
+  options: { enabled?: boolean; authorityEnabled?: boolean; bridgeEnabled?: boolean; markerEnabled?: boolean; holdEnabled?: boolean; now?: number;
+    /** TESTS ONLY: a synthetic reviewed pair. */ enabledOrgHashes?: import("../src/session-ingest/backlog-ops.ts").EnabledOrgHashes } = {},
 ) {
   const input = backlogOpsDispatch(env, options.enabled ?? BACKLOG_OPS_EXECUTE_ENABLED, options.authorityEnabled ?? BACKLOG_OPS_AUTHORITY_EXECUTE_ENABLED,
     options.bridgeEnabled ?? BACKLOG_OPS_BRIDGE_EXECUTE_ENABLED, options.markerEnabled ?? BACKLOG_OPS_MARKER_EXECUTE_ENABLED,
-    options.holdEnabled ?? BACKLOG_OPS_HOLD_EXECUTE_ENABLED);
+    options.holdEnabled ?? BACKLOG_OPS_HOLD_EXECUTE_ENABLED, ...(options.enabledOrgHashes ? [options.enabledOrgHashes] : []));
   const now = options.now ?? Date.now();
   if (env.GITHUB_REPOSITORY !== S.repository || env.GITHUB_REPOSITORY_ID !== PRIVATE_INGEST_RELEASE.repositoryId ||
       env.GITHUB_EVENT_NAME !== "workflow_dispatch" || env.GITHUB_REF !== "refs/heads/main" ||
