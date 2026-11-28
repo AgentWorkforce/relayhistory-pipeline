@@ -60,6 +60,15 @@ describe("group: the logical session scope", () => {
   });
 });
 
+describe("encoding", () => {
+  test("parts are encoded unambiguously: a key containing the old separator cannot collide with a split of parts", () => {
+    // With a joined-by-separator encoding, key "a\u001fput" + version "" could equal key "a" + "put" parts.
+    const k1 = "96bulls/org_1/v1/ws=ws_1/m=srv_bb/h=claude/d=2026/11/01/s=sess\u001fx/manifest.json";
+    expect(revisionDedupId({ key: k1, version: "v" })).not.toBe(revisionDedupId({ key: k1.replace("\u001f", ""), version: "v" }));
+    expect(revisionDedupId({ key: KEY, version: "a\u001fb", etag: "" })).not.toBe(revisionDedupId({ key: KEY, version: "a", etag: "b" }));
+  });
+});
+
 describe("T126 erase/re-create inside one dedup window", () => {
   test("same session and revision number, new incarnation: both admitted in order; an identical retry dedupes", async () => {
     const q = fifo();

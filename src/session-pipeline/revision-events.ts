@@ -65,7 +65,12 @@ export interface RevisionMessage {
   MessageDeduplicationId: string;
 }
 
-const sha = (parts: readonly string[]) => createHash("sha256").update(parts.join("\u001f")).digest("hex");
+/**
+ * sha256 over the parts encoded as a JSON array of strings: unambiguous for any key bytes (a key can contain
+ * any character, including a separator), and stable across producers. The store namespace is implicit: one
+ * transcript bucket per deployment, and the key carries the deployment root and org.
+ */
+const sha = (parts: readonly string[]) => createHash("sha256").update(JSON.stringify(parts)).digest("hex");
 
 /** The logical session's group, from the manifest key alone, so every producer derives the same one. Undefined: not a session key. */
 export function revisionGroupId(key: string): string | undefined {
