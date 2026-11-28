@@ -6,6 +6,7 @@
  * statement is recorded with that marker, so a test can assert what runs while the lock transaction is open.
  * Synthetic, secret-free data only.
  */
+import { createHash } from "node:crypto";
 import { zstdCompressSync } from "node:zlib";
 import { mkdir, mkdtemp, rm } from "node:fs/promises";
 import { readdirSync, readFileSync } from "node:fs";
@@ -28,6 +29,10 @@ export const AT = "2026-11-01T10:00:00.000Z";
 export const NOW = new Date("2026-11-02T00:00:00.000Z");
 export const loc = { prefix: "96bulls/org_1", workspaceId: "ws_1", machineId: "srv_bb", harness: "claude", sessionId: "sess_1", startDate: "2026-11-01" };
 export type Loc = typeof loc;
+
+/** The default location keeps the golden's session uuid; any other session or machine gets its own (a uuid is unique per row). */
+const sessionUuid = (l: Loc) => l.sessionId === loc.sessionId && l.machineId === loc.machineId ? "0193a1f3-8e2b-7c41-9d3a-5b6f0e2a7c18"
+  : `0193a1f3-8e2b-7c41-9d3a-${createHash("sha256").update(`${l.sessionId}\u001f${l.machineId}`).digest("hex").slice(0, 12)}`;
 
 export type Call = { at: "lock" | "free"; kind: string; detail: unknown };
 
@@ -114,17 +119,18 @@ export async function pointerRig() {
     requeue: async (key) => { requeued.push(key); },
   });
 
-  async function writeManifest(revision: number, l: Loc = loc) {
-    const source = new TextEncoder().encode(JSON.stringify({ kind: "session_event", origin_id: "o", record_id: `r${revision}`, revision: "1", operation: "upsert", received_at: AT, payload: { ts_ms: 1, text: "x" } }) + "\n");
+  /** `marker`: the record id (default `r<revision>`), so two incarnations with one revision number differ in content. */
+  async function writeManifest(revision: number, l: Loc = loc, marker = `r${revision}`, text = "x") {
+    const source = new TextEncoder().encode(JSON.stringify({ kind: "session_event", origin_id: "o", record_id: marker, revision: "1", operation: "upsert", received_at: AT, payload: { ts_ms: 1, text } }) + "\n");
     const stored = new Uint8Array(zstdCompressSync(source));
     const sha = await sha256Hex(source);
     const chunk: ChunkEntry = { seq: 0, epoch: 0, start_offset: 0, bytes: source.byteLength, stored_bytes: stored.byteLength, sha256: sha, sha256_8: sha.slice(0, 8), stored_sha256: await sha256Hex(stored), stored_raw_bytes: source.byteLength, raw_sha256: sha, compression: "zstd", records: 1 };
     await store.put(rawChunkKey(l, chunk.seq, 0, sha, "ndjson"), stored, {});
     const manifest = { schema_v: 1, layout: "v1", trace_id: "019a1f3c-8e2b-7c41-9d3a-5b6f0e2a7c18", revision, created_at: AT, updated_at: AT,
-      session: { workspace_id: "ws_1", machine_id: "srv_bb", harness: "claude", session_id: "sess_1", started_at: `${l.startDate}T10:00:00.000Z` },
-      writer: { delivery_instance_id: "srv_bb", plugin_version: "t" },
-      raw: { owner: "srv_bb", state: "open", updated_at: AT, format: "ndjson", compression: "zstd", chunk_count: 1, raw_bytes: chunk.bytes, stored_bytes: chunk.stored_bytes, content_sha256: await computeContentSha256([chunk]), epoch: 0, epochs: [{ epoch: 0, opened_at: AT, reason: "initial", first_seq: chunk.seq, opened_by: "srv_bb" }], next_offset: source.byteLength, chunks: [chunk], scrub: { ruleset: "relayhistory-scrub", version: 1 } },
-      extensions: { "96bulls": { user_id: "user_1", session_uuid: "0193a1f3-8e2b-7c41-9d3a-5b6f0e2a7c18" } } } as unknown as ManifestV1;
+      session: { workspace_id: l.workspaceId, machine_id: l.machineId, harness: l.harness, session_id: l.sessionId, started_at: `${l.startDate}T10:00:00.000Z` },
+      writer: { delivery_instance_id: l.machineId, plugin_version: "t" },
+      raw: { owner: l.machineId, state: "open", updated_at: AT, format: "ndjson", compression: "zstd", chunk_count: 1, raw_bytes: chunk.bytes, stored_bytes: chunk.stored_bytes, content_sha256: await computeContentSha256([chunk]), epoch: 0, epochs: [{ epoch: 0, opened_at: AT, reason: "initial", first_seq: chunk.seq, opened_by: l.machineId }], next_offset: source.byteLength, chunks: [chunk], scrub: { ruleset: "relayhistory-scrub", version: 1 } },
+      extensions: { "96bulls": { user_id: "user_1", session_uuid: sessionUuid(l) } } } as unknown as ManifestV1;
     const key = manifestKey(l);
     await store.put(objectKey(key), new TextEncoder().encode(JSON.stringify(manifest)), { contentType: "application/json" });
     return key;
