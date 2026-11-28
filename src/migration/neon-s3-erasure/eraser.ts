@@ -308,6 +308,13 @@ export interface S3EraserConfig {
  * is aborted at the earlier of that and the per-request deadline.
  */
 export type BeforeFetch = () => number;
+/**
+ * Adapter-owned dispatch record for ONE request. The adapter writes "preparing" when it starts and "dispatched"
+ * immediately before it calls fetch. A caller may treat a failure as NOT SENT only when it reads "preparing"; any
+ * other value, including a record the adapter never touched, means the request may have been sent. Error fields
+ * (notSent, a short_lived_* code) are never proof by themselves: a fetch implementation can throw anything.
+ */
+export interface DispatchRecord { phase?: "preparing" | "dispatched" }
 /** Default per-request deadline. Requests are never retried here (attempts = 1). */
 export const S3_REQUEST_DEADLINE_MS = 30_000;
 export const S3_REQUEST_ATTEMPTS = 1;
@@ -403,24 +410,31 @@ function s3Core(cfg: S3EraserConfig, label: string) {
     return new URL(`https://${cfg.bucket}.s3.${cfg.region}.amazonaws.com/${key ? encodeKeyPath(key) : ""}`);
   };
   const sign = cfg.signer ?? signRequest;
-  const request = async (method: string, u: URL, passStatuses: readonly number[] = [], beforeFetch?: BeforeFetch) => {
-    // EVERY local preparation step before dispatch (expiry refusal, hashing, signing, headers, the caller's gate, the
-    // timeout) is inside this block: any failure here is tagged notSent (fetch was never called), so the caller records
-    // not_attempted. A short-lived credential refusal keeps its own code (the credential stop) and is notSent too.
-    // Only fetch itself and what follows can be ambiguous.
-    const headers = new Headers();
-    let timeout: number;
+  const request = async (method: string, target: URL | (() => URL), passStatuses: readonly number[] = [], beforeFetch?: BeforeFetch, dispatch?: DispatchRecord) => {
+    // EVERY local preparation step before dispatch (the URL, headers, expiry refusal, hashing, signing, the caller's
+    // gate, the timeout, the completed RequestInit) is inside this block: any failure here is tagged notSent (fetch was
+    // never called). A short-lived credential refusal keeps its own code (the credential stop). `dispatch` flips to
+    // "dispatched" only after the block, immediately before fetch: fetch itself and what follows can be ambiguous.
+    if (dispatch) dispatch.phase = "preparing";
+    let u: URL;
+    let init: RequestInit;
     try {
+      u = typeof target === "function" ? target() : target;
+      const headers = new Headers();
       refuseIfExpired(cfg.credentials, label, Date.now()); // a short-lived key is never used to sign past expiry
       await sign({ method, url: u, headers, payloadSha256: await sha256Hex(new Uint8Array()), region: cfg.region, credentials: cfg.credentials });
       // The caller's final gate AFTER signing (signing and hashing can be slow) and synchronously before fetch.
       const left = beforeFetch ? beforeFetch() : Number.POSITIVE_INFINITY;
-      timeout = Math.min(deadlineMs, left);
+      const timeout = Math.min(deadlineMs, left);
       if (!(timeout > 0)) throw coded("stale_prefix_deadline", "no protected time left for this request");
+      // Built here, inside the not-sent block: constructing the abort signal is local preparation too.
+      const signal = AbortSignal.timeout(timeout);
+      init = { method, headers, signal };
     } catch (error) {
       throw Object.assign(error instanceof Error ? error : coded("request_prepare_failed", "request preparation failed"), { notSent: true });
     }
-    const res = await doFetch(u, { method, headers, signal: AbortSignal.timeout(timeout) });
+    if (dispatch) dispatch.phase = "dispatched";
+    const res = await doFetch(u, init);
     // Status only: S3 error bodies can echo keys.
     if (!res.ok && !(method === "DELETE" && res.status === 404) && !passStatuses.includes(res.status)) throw coded(`s3_${res.status}`, `S3 ${method} failed`);
     return res;
@@ -572,12 +586,16 @@ export function createS3Eraser(cfg: S3EraserConfig): Eraser & PreservedVersionEr
     requestDeadlineMs: deadlineMs,
     requestAttempts: S3_REQUEST_ATTEMPTS,
     // Exactly one version by id: never a plain DELETE (that would only add a delete marker on a versioned bucket).
+    // Key/version validation and the URL are preparation too: they run inside request's not-sent block, and the
+    // caller's dispatch record reads "preparing" until fetch is called.
     deleteVersion: async (key, versionId, opts) => {
-      assertUnderPrefix(key.slice(0, key.lastIndexOf("/") + 1), [{ key, versionId }]);
-      if (!versionId || /[\x00-\x1f\x7f]/u.test(versionId)) throw coded("erasure_key_shape", "an exact version id is required");
-      const u = url(key);
-      u.searchParams.set("versionId", versionId);
-      await request("DELETE", u, [], opts?.beforeFetch);
+      await request("DELETE", () => {
+        assertUnderPrefix(key.slice(0, key.lastIndexOf("/") + 1), [{ key, versionId }]);
+        if (!versionId || /[\x00-\x1f\x7f]/u.test(versionId)) throw coded("erasure_key_shape", "an exact version id is required");
+        const u = url(key);
+        u.searchParams.set("versionId", versionId);
+        return u;
+      }, [], opts?.beforeFetch, opts?.dispatch);
     },
     bucketLifecycle: () => readLifecycle(url, request),
     bucketVersioning: () => readVersioning(url, request),
@@ -621,8 +639,11 @@ export interface BucketProtectionReader {
  * and the read-only bucket protection facts for the preflight.
  */
 export interface ReceiptFence extends VersionLister, BucketProtectionReader {
-  /** `beforeFetch` runs after signing, immediately before the DELETE is sent; throwing means it is never sent. */
-  deleteVersion(key: string, versionId: string, opts?: { beforeFetch?: BeforeFetch }): Promise<void>;
+  /**
+   * `beforeFetch` runs after signing, immediately before the DELETE is sent; throwing means it is never sent.
+   * `dispatch` is written by the adapter (see DispatchRecord): the caller's only proof that a failed DELETE was not sent.
+   */
+  deleteVersion(key: string, versionId: string, opts?: { beforeFetch?: BeforeFetch; dispatch?: DispatchRecord }): Promise<void>;
   /** Worst-case time of one request (its abort deadline) and attempts per request: the lease-TTL bound uses both. */
   readonly requestDeadlineMs: number;
   readonly requestAttempts: number;
