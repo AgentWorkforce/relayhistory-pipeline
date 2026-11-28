@@ -895,6 +895,11 @@ export interface ReconcileSummary {
   /** Where the listing stopped at the deadline; the next link of the chain starts here. */
   nextCursor?: string;
   complete: boolean;
+  /** Leg 3 (search enabled only): live scopes examined, found not current, and hinted; its resume point. */
+  projectionScanned?: number;
+  projectionStale?: number;
+  nextProjectionCursor?: string;
+  projectionComplete?: boolean;
 }
 
 /** Stop listing this long before the function timeout (300 s), leaving time to hand off. */
@@ -911,16 +916,43 @@ export interface ReconcileDeps {
   maxPages?: number;
   deadlineMs?: number;
   now?: () => number;
+  /**
+   * Leg 3, set when search indexing is enabled (T124/T126 default recovery, Pipeline decision 89e060b9fcc4): rediscover
+   * every live scope whose search projection is missing, incomplete or stale for its CURRENT source, even when its
+   * pointer ETag matches. `cursor` resumes a chain; `pageSize` bounds one query (default 500 scopes).
+   */
+  projection?: { cursor?: string; pageSize?: number };
+  /** A chain link that only continues leg 3 (no listing cursor left): legs 1 and 2 already completed this chain. */
+  projectionOnly?: boolean;
+}
+
+/** Leg 3's keyset cursor: the last examined scope (org, workspace, harness, canonical session), JSON. */
+type ProjectionCursor = [string, string, string, string];
+function projectionCursor(raw: string | undefined): ProjectionCursor {
+  if (!raw) return ["", "", "", ""];
+  const v = JSON.parse(raw) as unknown;
+  if (!Array.isArray(v) || v.length !== 4 || v.some((x) => typeof x !== "string")) throw new Error("reconcile: invalid projection cursor");
+  return v as ProjectionCursor;
 }
 
 /**
- * The safety net for lost or raced notifications, in two legs.
+ * The safety net for lost or raced notifications, in two legs (three with search enabled).
  *
  * 1. Live pointers indexed since `since` (first link only): HEAD each
  *    manifest; a gone one is enqueued, and the queue path tombstones it under
  *    the session lock. This repairs a delete that was lost or raced.
  * 2. Manifests modified since `since`: enqueue those whose pointer row is
  *    missing, deleted or names another ETag. No manifest body is read here.
+ *
+ * 3. (deps.projection: search enabled) Every LIVE scope, in key order from
+ *    a cursor (not a time window, so stale work cannot age out), whose search
+ *    projection is not current for its live pointer set: no live directory
+ *    row, not ready, another projection version, or sources that differ from
+ *    the live manifest->revision map (the same evidence skip-current uses). One
+ *    hint per scope (a live manifest key, no ETag); the pickup re-reads the
+ *    live scope under the pointer and search locks, so replacement converges on
+ *    the current source and a deleted scope takes the erase path. Independent
+ *    of the pointer ETag, SEARCH_JOBS_ENABLED and SEARCH_WAKE_ENQUEUE.
  *
  * The listing stops at the deadline and returns `nextCursor`; the caller
  * hands it to the next link (an async self-invocation), so a bucket of any
@@ -932,6 +964,11 @@ export async function reconcileRecent(deps: ReconcileDeps): Promise<ReconcileSum
   const deadline = now() + (deps.deadlineMs ?? RECONCILE_DEADLINE_MS);
   const summary: ReconcileSummary = { listed: 0, recent: 0, enqueued: 0, pages: 0, pointersChecked: 0, pointersGone: 0, complete: false };
 
+  if (deps.projectionOnly) {
+    if (deps.projection) await reconcileProjections(deps, summary, deadline, now);
+    summary.complete = true;
+    return summary;
+  }
   if (deps.cursor === undefined) {
     const { rows } = await deps.db.query<{ manifest_key: string }>(
       `SELECT manifest_key FROM sessions.session_index
@@ -990,12 +1027,54 @@ export async function reconcileRecent(deps: ReconcileDeps): Promise<ReconcileSum
   } while (cursor && summary.pages < (deps.maxPages ?? 5_000) && now() < deadline);
   summary.complete = !cursor;
   if (cursor) summary.nextCursor = cursor;
+  if (deps.projection) await reconcileProjections(deps, summary, deadline, now);
   return summary;
+}
+
+/** Leg 3 (see reconcileRecent): bounded by pageSize per query and by the link's deadline; resumable by cursor. */
+async function reconcileProjections(deps: ReconcileDeps, summary: ReconcileSummary, deadline: number, now: () => number): Promise<void> {
+  const pageSize = deps.projection!.pageSize ?? 500;
+  let cursor: ProjectionCursor = projectionCursor(deps.projection!.cursor);
+  summary.projectionScanned = 0;
+  summary.projectionStale = 0;
+  for (;;) {
+    if (now() > deadline) { summary.nextProjectionCursor = JSON.stringify(cursor); summary.projectionComplete = false; return; }
+    const { rows } = await deps.db.query<{ org_id: string; workspace_id: string; harness: string; sid: string; key: string; stale: boolean }>(
+      `WITH live AS (
+         SELECT p.org_id, p.workspace_id, p.harness, coalesce(p.canonical_session_id, p.session_id) AS sid,
+                min(p.manifest_key) AS key, jsonb_object_agg(p.manifest_key, p.revision::text) AS sources
+           FROM sessions.session_index p
+          WHERE p.deleted_at IS NULL AND p.manifest_key LIKE $5
+            AND (p.org_id, p.workspace_id, p.harness, coalesce(p.canonical_session_id, p.session_id)) > ($1, $2, $3, $4)
+          GROUP BY 1, 2, 3, 4
+          ORDER BY 1, 2, 3, 4
+          LIMIT $6)
+       SELECT l.org_id, l.workspace_id, l.harness, l.sid, l.key,
+              NOT EXISTS (SELECT 1 FROM sessions.session_directory d
+                           WHERE d.org_id = l.org_id AND d.workspace_id = l.workspace_id AND d.harness = l.harness AND d.session_id = l.sid
+                             AND d.deleted_at IS NULL AND d.event_projection_ready AND d.event_projection_version = 1
+                             AND d.event_projection_sources = l.sources) AS stale
+         FROM live l
+        ORDER BY 1, 2, 3, 4`,
+      [...cursor, `${deps.keyPrefix}/%`, pageSize],
+    );
+    for (const r of rows) {
+      summary.projectionScanned += 1;
+      cursor = [r.org_id, r.workspace_id, r.harness, r.sid];
+      if (!r.stale) continue;
+      summary.projectionStale += 1;
+      await deps.send(JSON.stringify({ [RECONCILE_BODY_KEY]: { key: r.key } }));
+      summary.enqueued += 1;
+    }
+    if (rows.length < pageSize) { summary.projectionComplete = true; return; }
+  }
 }
 
 interface ReconcileEvent {
   reconcile: true;
   cursor?: string;
+  /** Leg 3's resume point (reconcileRecent ReconcileDeps.projection.cursor). */
+  projectionCursor?: string;
   since?: string;
   /** Links already run in this chain. */
   link?: number;
@@ -1043,6 +1122,9 @@ async function runReconcile(rt: Runtime, event: ReconcileEvent) {
     keyPrefix: env.keyPrefix,
     since,
     ...(event.cursor ? { cursor: event.cursor } : {}),
+    // Leg 3 whenever search indexing is enabled (rt.deps.search): default recovery of missing or stale projections.
+    ...(rt.deps.search ? { projection: { ...(event.projectionCursor ? { cursor: event.projectionCursor } : {}) } } : {}),
+    ...(event.projectionCursor && !event.cursor ? { projectionOnly: true } : {}),
     send: async (body) => {
       const wiring = revisionWiring(env);
       // One recovery hint per key per chain link (revision-events.ts RevisionEvent.nonce).
@@ -1057,8 +1139,9 @@ async function runReconcile(rt: Runtime, event: ReconcileEvent) {
     },
   });
   const link = (event.link ?? 0) + 1;
-  if (summary.nextCursor && link < MAX_RECONCILE_LINKS) {
-    const next: ReconcileEvent = { reconcile: true, cursor: summary.nextCursor, since: since.toISOString(), link };
+  if ((summary.nextCursor || summary.nextProjectionCursor) && link < MAX_RECONCILE_LINKS) {
+    const next: ReconcileEvent = { reconcile: true, ...(summary.nextCursor ? { cursor: summary.nextCursor } : {}),
+      ...(summary.nextProjectionCursor ? { projectionCursor: summary.nextProjectionCursor } : {}), since: since.toISOString(), link };
     await invokeAsync({
       region: env.region,
       functionName: process.env.AWS_LAMBDA_FUNCTION_NAME ?? "",

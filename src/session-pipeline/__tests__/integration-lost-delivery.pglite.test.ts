@@ -106,10 +106,18 @@ async function rig() {
   const unauthorized = async () => (await app.request(`/v1/events?workspace=${scope.workspaceId}&q=markerb&limit=50`, { headers: { authorization: "Bearer wrong" } })).status;
   /** One reconcile link over the real store and pointer rows; its hints picked up on `path` (FIFO: reconcile revision hints). */
   let link = 0;
-  const reconcile = async (path: "standard" | "fifo", skipCurrent = false) => {
+  let lastSummary: Awaited<ReturnType<typeof reconcileRecent>> | undefined;
+  /**
+   * `legacy`: the two pre-fix legs only (the red baseline). Default: search enabled, so leg 3 (projection recovery) runs,
+   * as runReconcile does when rt.deps.search is set.
+   */
+  const reconcile = async (path: "standard" | "fifo", skipCurrent = false, opts: { legacy?: boolean; projection?: { cursor?: string; pageSize?: number }; projectionOnly?: boolean; now?: () => number; deadlineMs?: number } = {}) => {
     const bodies: string[] = [];
-    await reconcileRecent({ store: r.store, db: { query: (t: string, p?: unknown[]) => r.pg.query(t, p as unknown[]) } as never,
-      keyPrefix: "96bulls", since: new Date("2026-01-01T00:00:00.000Z"), send: async (b) => { bodies.push(b); } });
+    const summary = await reconcileRecent({ store: r.store, db: { query: (t: string, p?: unknown[]) => r.pg.query(t, p as unknown[]) } as never,
+      keyPrefix: "96bulls", since: new Date("2026-01-01T00:00:00.000Z"), send: async (b) => { bodies.push(b); },
+      ...(opts.legacy ? {} : { projection: opts.projection ?? {} }), ...(opts.projectionOnly ? { projectionOnly: true } : {}),
+      ...(opts.now ? { now: opts.now } : {}), ...(opts.deadlineMs !== undefined ? { deadlineMs: opts.deadlineMs } : {}) });
+    lastSummary = summary;
     link += 1;
     const failures: unknown[] = [];
     for (const body of bodies) {
@@ -125,7 +133,7 @@ async function rig() {
     return { hints: bodies.length, failures };
   };
   const status = async (q: string) => (await app.request(`/v1/events?workspace=${scope.workspaceId}&q=${encodeURIComponent(q)}&limit=50`, { headers: { authorization: "Bearer fixture" } })).status;
-  return { r, standard, fifo, hits, etag, unauthorized, reconcile, status, failSearch };
+  return { r, standard, fifo, hits, etag, unauthorized, reconcile, status, failSearch, summary: () => lastSummary! };
 }
 
 
@@ -158,7 +166,7 @@ for (const path of ["standard", "fifo"] as const) {
       expect(await t.hits("markera")).toEqual([]);
     }, 60_000);
 
-    test("STRANDED under defaults: B's delivery reaches the pointer stage, its search pass crashes, and the message is then LOST (retries exhausted, no later append): the reconcile sends nothing (pointer matches the manifest) and B stays unserved", async () => {
+    test("post-pointer FIRST-INDEX loss (pointer current, projection missing, message lost): RED with the two legacy legs (stranded, 501); GREEN with leg 3 (1 hint, B served); then QUIET", async () => {
       const t = await rig();
       const key = await t.r.writeManifest(1, loc, "markerb", "markerb");
       t.failSearch.on = true;
@@ -168,15 +176,21 @@ for (const path of ["standard", "fifo"] as const) {
       // The message is never redelivered (DLQ after retries, or lost). The pointer row exists and matches the manifest.
       expect((await t.r.pg.query<{ etag: string }>("SELECT manifest_etag etag FROM sessions.session_index WHERE deleted_at IS NULL")).rows.map((r) => r.etag?.replace(/^"|"$/g, ""))).toEqual([await t.etag(key)]);
       expect(await t.status("markerb")).toBe(501);
-      // Two reconcile links: neither finds anything to send.
-      expect(await t.reconcile(path)).toEqual({ hints: 0, failures: [] });
-      expect(await t.reconcile(path)).toEqual({ hints: 0, failures: [] });
+      // RED (the pre-fix two legs): neither finds anything to send; B stays stranded; nothing pending.
+      expect(await t.reconcile(path, false, { legacy: true })).toEqual({ hints: 0, failures: [] });
       expect(await t.status("markerb")).toBe(501);
-      // Pending work: no requeue was sent; nothing else exists in this defaults tree that would run B's search.
       expect(t.r.requeued).toEqual([]);
+      // GREEN (leg 3, search enabled): the scope's projection is missing, so one hint; picked up on this path.
+      expect(await t.reconcile(path)).toEqual({ hints: 1, failures: [] });
+      expect(t.summary()).toMatchObject({ projectionScanned: 1, projectionStale: 1, projectionComplete: true });
+      expect(await t.hits("markerb")).toEqual(["markerb"]);
+      expect(await t.unauthorized()).toBe(401);
+      // QUIET completed control: the next link finds the scope current and sends nothing.
+      expect(await t.reconcile(path)).toEqual({ hints: 0, failures: [] });
+      expect(t.summary()).toMatchObject({ projectionScanned: 1, projectionStale: 0 });
     }, 60_000);
 
-    test("STRANDED, stale variant: A indexed; B's append commits its pointer (ETag current), its search pass crashes, the message is lost: both reconcile legs send nothing and the read keeps serving the stale A", async () => {
+    test("post-pointer STALE-A loss (B pointer current, projection still A, message lost): RED with the legacy legs (stale A served); GREEN with leg 3 (B served, A absent); then QUIET", async () => {
       const t = await rig();
       const key = await t.r.writeManifest(1, loc, "markera", "markera");
       expect(path === "standard" ? await t.standard(key, await t.etag(key), false) : await t.fifo(key, await t.etag(key), 1, false)).toEqual([]);
@@ -188,13 +202,18 @@ for (const path of ["standard", "fifo"] as const) {
       const row = (await t.r.pg.query<{ revision: string; etag: string }>("SELECT revision::text, manifest_etag etag FROM sessions.session_index WHERE deleted_at IS NULL")).rows;
       expect(row.map((r) => [r.revision, r.etag?.replace(/^"|"$/g, "")])).toEqual([["2", await t.etag(key)]]);
       const before = { a: await t.status("markera"), b: await t.status("markerb") };
-      const links = [await t.reconcile(path), await t.reconcile(path)];
-      expect(before).toEqual({ a: 200, b: 200 });
-      expect(await t.hits("markerb")).toEqual([]);
-      expect(links).toEqual([{ hints: 0, failures: [] }, { hints: 0, failures: [] }]);
-      // Stale A served indefinitely; B never served; nothing pending.
+      // RED (the pre-fix two legs): nothing sent; the stale A is still served.
+      expect(await t.reconcile(path, false, { legacy: true })).toEqual({ hints: 0, failures: [] });
       expect(await t.hits("markera")).toEqual(["markera"]);
       expect(await t.hits("markerb")).toEqual([]);
+      const links = [await t.reconcile(path), await t.reconcile(path)];
+      expect(before).toEqual({ a: 200, b: 200 });
+      // `links` ran with leg 3 (default): the stale projection (sources name revision 1, pointer is at 2) is found.
+      expect(links[0]).toEqual({ hints: 1, failures: [] });
+      expect(links[1]).toEqual({ hints: 0, failures: [] });
+      // GREEN: B served, A absent; quiet after.
+      expect(await t.hits("markerb")).toEqual(["markerb"]);
+      expect(await t.hits("markera")).toEqual([]);
       expect(t.r.requeued).toEqual([]);
     }, 60_000);
 
@@ -203,6 +222,66 @@ for (const path of ["standard", "fifo"] as const) {
       await t.r.writeManifest(1, loc, "markerb", "markerb");
       expect(await t.reconcile(path, true)).toEqual({ hints: 1, failures: [] });
       expect(await t.hits("markerb")).toEqual(["markerb"]);
+    }, 60_000);
+
+    test("leg 3 is BOUNDED and RESUMABLE: three stale scopes, pageSize 1, the deadline after the first page hands off a cursor; the next link (projection-only: legs 1 and 2 not repeated) resumes and covers the rest, in key order", async () => {
+      const t = await rig();
+      const keys: string[] = [];
+      for (const sess of ["sess_1", "sess_2", "sess_3"]) keys.push(await t.r.writeManifest(1, { ...loc, sessionId: sess }, `marker${sess.slice(-1)}`, `marker${sess.slice(-1)}x`));
+      // Pointers current, projections missing: search crashed for all three, messages lost.
+      t.failSearch.on = true;
+      for (const k of keys) await (path === "standard" ? t.standard(k, await t.etag(k), false) : t.fifo(k, await t.etag(k), 1, false));
+      t.failSearch.on = false;
+      // Link 1 (leg 3 only, so the clock below counts its pages): the deadline passes after the first page.
+      let clock = 0;
+      const first = await t.reconcile(path, false, { projection: { pageSize: 1 }, projectionOnly: true, deadlineMs: 5, now: () => (clock += 3) });
+      const s1 = t.summary();
+      expect(first.hints).toBe(1);
+      expect(s1.projectionComplete).toBe(false);
+      expect(s1.nextProjectionCursor).toBeDefined();
+      // Link 2: projection-only, from the cursor; no listing (legs 1 and 2 skipped).
+      const second = await t.reconcile(path, false, { projection: { pageSize: 1, cursor: s1.nextProjectionCursor! }, projectionOnly: true });
+      const s2 = t.summary();
+      expect(s2).toMatchObject({ projectionComplete: true, pages: 0, listed: 0, pointersChecked: 0 });
+      expect(first.hints + second.hints).toBe(3);
+      for (const n of ["1", "2", "3"]) expect(await t.hits(`marker${n}x`)).toEqual([`marker${n}x`]);
+      // Quiet afterwards.
+      expect((await t.reconcile(path)).hints).toBe(0);
+    }, 60_000);
+
+    test("FENCES at pickup: a scope hinted as stale is DELETED before pickup (erase path, nothing revived), and another is REPLACED before pickup (the pickup indexes the current source)", async () => {
+      const t = await rig();
+      const keyD = await t.r.writeManifest(1, { ...loc, sessionId: "sess_d" }, "markerd", "markerd");
+      const keyR = await t.r.writeManifest(1, { ...loc, sessionId: "sess_r" }, "markerr1", "markerr1");
+      t.failSearch.on = true;
+      for (const k of [keyD, keyR]) await (path === "standard" ? t.standard(k, await t.etag(k), false) : t.fifo(k, await t.etag(k), 1, false));
+      t.failSearch.on = false;
+      // Between the selector and the pickup: D's object is deleted; R is replaced by revision 2.
+      const realReconcile = t.reconcile;
+      await t.r.store.delete(objectKey(keyD));
+      await t.r.writeManifest(2, { ...loc, sessionId: "sess_r" }, "markerr2", "markerr2");
+      const rec = await realReconcile(path);
+      expect(rec.failures).toEqual([]);
+      // D: the pickup re-read found the object gone and tombstoned it; nothing served, never revived.
+      expect((await t.r.pg.query<{ deleted: boolean }>("SELECT deleted_at IS NOT NULL deleted FROM sessions.session_index WHERE session_id='sess_d'")).rows).toEqual([{ deleted: true }]);
+      expect(await t.hits("markerd")).toEqual([]);
+      // R: the current source (revision 2) is what got indexed.
+      expect(await t.hits("markerr2")).toEqual(["markerr2"]);
+      expect(await t.hits("markerr1")).toEqual([]);
+      expect((await t.reconcile(path)).hints).toBe(0);
+    }, 60_000);
+
+    test("absent directory/completion evidence: a live scope with NO directory row at all is selected as stale and recovered", async () => {
+      const t = await rig();
+      const key = await t.r.writeManifest(1, loc, "markerb", "markerb");
+      t.failSearch.on = true;
+      await (path === "standard" ? t.standard(key, await t.etag(key), false) : t.fifo(key, await t.etag(key), 1, false));
+      t.failSearch.on = false;
+      await t.r.pg.query("DELETE FROM sessions.session_directory WHERE session_id='sess_1'").catch(() => {});
+      const rec = await t.reconcile(path);
+      expect(rec).toEqual({ hints: 1, failures: [] });
+      expect(await t.hits("markerb")).toEqual(["markerb"]);
+      expect((await t.reconcile(path)).hints).toBe(0);
     }, 60_000);
   });
 }
