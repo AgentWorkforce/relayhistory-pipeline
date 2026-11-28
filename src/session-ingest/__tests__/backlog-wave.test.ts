@@ -77,7 +77,7 @@ async function step(mode: BacklogOpsMode, env: Record<string, string>, bind: Rec
       { fetcher, runChild: async (c) => {
         inFlight++; peak = Math.max(peak, inFlight);
         const orgs = c.args.flatMap((a, i) => (c.args[i - 1] === "--org" ? [a] : []));
-        expect(orgs).toHaveLength(1); // one org per child
+        if ((extra.BACKLOG_OPS_PER_ORG ?? "true") === "true") expect(orgs).toHaveLength(1); // one org per child (a per-org run)
         seen.push(orgs[0]!);
         await new Promise((r) => setTimeout(r, 5));
         inFlight--;
@@ -451,5 +451,31 @@ test("credential step: evidence scoped to A alone never feeds an A+B wave (neith
       () => ({ code: 0, stdout: JSON.stringify(backfill("execute")) }), { BACKLOG_OPS_ORGS: A });
     expect([ex3.seen, ex3.exit]).toEqual([[A], 0]);
     // The exact-wave path (A+B dry bound by an A+B execute) is the chain test above.
+  } finally { Object.assign(receipts, saved); }
+});
+
+test("an export-execute bound to an UNSCOPED backfill-execute: accepted without per_org (the non-wave rule), refused for both orgs with zero children under per_org", async () => {
+  const saved = { ...receipts };
+  try {
+    const top = (mode: BacklogOpsMode, run: string, scope: string, summary: unknown) =>
+      JSON.stringify({ contract: "backlog-ops-receipt/v1", mode, sha: SHA, run, scope, ledger: "none", exitCode: 0, summary });
+    // The export's own dry (scoped to A+B, non-wave) and an all-orgs FULL (scope "all").
+    receipts["export-dry"] = top("export-dry", "705", SCOPE_ID, exportOk("dry_run"));
+    receipts["backfill-execute"] = top("backfill-execute", "702", "all", backfill("execute"));
+    const env = { BACKLOG_OPS_DRY_RUN: "705", BACKLOG_OPS_BACKFILL_RUN: "702" };
+    const bind = { dry: "export-dry", backfill: "backfill-execute" } as Record<string, BacklogOpsMode>;
+    // (1) Non-wave control: one child over the scope, accepted (checkBoundReceipt lets a non-dry, non-exact binding be unscoped).
+    const plain = await step("export-execute", { ...env, BACKLOG_OPS_CONFIRMATION: `EXPORT-EXECUTE ${SHA} DRY 705 BACKFILL 702` }, bind,
+      () => ({ code: 0, stdout: JSON.stringify(exportOk("execute")) }), { BACKLOG_OPS_PER_ORG: "" });
+    expect(plain.exit).toBe(0);
+    expect(plain.receipt.summary).toEqual(exportOk("execute"));
+    receipts["export-dry"] = top("export-dry", "705", SCOPE_ID, exportOk("dry_run"));
+    receipts["backfill-execute"] = top("backfill-execute", "702", "all", backfill("execute"));
+    // (2) The same dispatch with per_org over A+B: the unscoped FULL never stands in for the wave.
+    const wave = await step("export-execute", { ...env, BACKLOG_OPS_CONFIRMATION: `EXPORT-EXECUTE ${SHA} DRY 705 BACKFILL 702 PER_ORG` }, bind,
+      () => ({ code: 0, stdout: JSON.stringify(exportOk("execute")) }));
+    expect(wave.seen).toEqual([]);
+    expect(Object.values(wave.by).map((p: any) => p.summary.refused)).toEqual(["backlog_ops_wave_scope", "backlog_ops_wave_scope"]);
+    expect([wave.exit, wave.receipt.exitCode]).toEqual([1, 1]);
   } finally { Object.assign(receipts, saved); }
 });
