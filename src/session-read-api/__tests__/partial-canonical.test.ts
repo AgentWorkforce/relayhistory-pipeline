@@ -293,6 +293,17 @@ describe("partialCanonicalDeps: the Lambda source over canonicalSnapshot", () =>
     expect(keys.some((k) => k.includes("/raw/"))).toBe(false);
   });
 
+  test("a request by the physical session id whose canonical id differs refuses before any GET (the unchanged 501 upstream)", async () => {
+    // The read role matches `coalesce(canonical_session_id, session_id) = $4 OR session_id = $4` and returns the
+    // coalesced canonical id, so a physical-id request (sess_1) gets the row with session_id sess:1.
+    const keys: string[] = [];
+    const spy = new Proxy(store, { get(t, k) { const v = Reflect.get(t, k); return k === "getObject" ? (key: unknown, ...a: unknown[]) => { keys.push(String(key)); return (v as (...x: unknown[]) => unknown).call(t, key, ...a); } : v; } });
+    const got = await refusal(lambdaSource({ store: spy }).read({ ...identity, sessionId: "sess_1" }));
+    expect([got, keys]).toEqual([{ class: "forbidden", codes: ["tenant_mismatch"] }, []]);
+    // The canonical id resolves and serves.
+    expect((await lambdaSource().read(identity)).exists).toBe(true);
+  });
+
   test("key scope admits the caller's upload-generation publication manifests", async () => {
     const { parseSessionKey } = await import("../../../packages/object-store/src/index.ts");
     const at = parseSessionKey(String(pointerRow.manifest_key))!;
