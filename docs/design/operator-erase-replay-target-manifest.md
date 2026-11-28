@@ -1,4 +1,4 @@
-# Operator erase replay target manifest — draft 4
+# Operator erase replay target manifest — draft 5
 
 ## Status and ownership
 
@@ -556,6 +556,111 @@ from actual erase effects; without it the wrapper remains unproven. A
 matching count or an array containing only the surviving fence rows is not
 a completeness proof for the whole window.
 
+#### Request attribution and bidirectional reconciliation
+
+An eligible effect witness records the validated org, the **actual emitting
+transaction's xid8**, accepted request/manifest binding, source/operation,
+the mutation identities needed by that source's covering proof, and exact
+multiplicity. The xid8 comes from the writer transaction, never caller input
+or a guessed 32-bit row xmin. Preserve its exact textual/type value; do not
+round it through a JavaScript number. Per-source/op counts are canonical
+nonnegative bigint values, checked without lossy conversion.
+
+The producer must prove unique request-to-effect attribution under that
+transaction's locks, committing the witness with the effects it attests to.
+It may not assign every row for `(org,xid8)` to whichever erase finishes first.
+Multiple requests sharing a transaction are permitted only if every covered
+mutation has an unambiguous request attribution; otherwise qualification
+refuses. Unrelated same-org writes, nested calls, or outer runtime writes
+after the capture helper returns cannot be silently absorbed by its certificate.
+The call/request association must be established by reviewed actual mutation
+provenance or an equivalently enforced writer protocol, not reconstructed by
+source/op totals, timestamps, SQL call ordering assumptions or current rows.
+
+For the qualified epoch/window, let `H(org,xid8,source,op)` be the authoritative
+history multiplicities and `E` be the multiset projection of the genuinely
+attributed, validated effect witnesses. Before object I/O the bridge must
+reconcile **both directions**:
+
+1. Every in-window history occurrence has exactly one covering attribution
+   under its applicable per-source proof. No missing source/op, unmatched
+   transaction, undiscovered request or partial multiplicity may be ignored.
+2. Every claimed witness occurrence maps to that same qualified history
+   window and request/effect domain. No orphan certificate, extra occurrence,
+   double credit, cross-org member or unsupported operation is allowed.
+
+The bridge's owner-only co-read derives `H` from the actual 062340 history
+rows in the same statement, not merely status `by_source` totals. This adds
+no runtime grant or v1 page fields and does not change status JSON; xid/op
+details remain internal to the qualified SQL proof and hash-only diagnostics.
+
+`E` here projects only effects claimed for this window. An earlier complete
+capture may remain the immutable identity/target anchor without its old
+effects being counted again after the fence. Do not exclude an otherwise
+qualified outside-hold capture solely because its capture transaction predates
+the window, or import those old occurrences just to balance a later count.
+
+After unique attribution is proved, projected `E` and `H` must match in every
+org/xid8/source/op multiplicity, not just in their grand total or `by_source`
+sum. That equality is necessary corroboration, not the identity proof itself.
+A source row can disappear or change after its mutation; an after-the-fact
+join to survivors is not a substitute for missing mutation evidence. History
+and the effect witnesses must be read with the same epoch/FULL/coverage
+binding as the manifest preparation. Any ambiguity means no receipt lookup,
+mutation or release, even if a cached receipt looks valid.
+The consumer performs qualification on a read-only transaction/connection
+separate from an uncommitted producer write transaction. Seeing one's own
+uncommitted seal during a diagnostic SELECT is not replay authority; no object
+I/O may run before the source effects and witness have committed. This does
+not change the pure v1 reader's supported transaction-mode behavior.
+
+#### Covering proof or required zero for every history source
+
+The following is the scope of the first prospective session-capture increment,
+not a statement that any covering implementation already exists. A candidate
+proof below is usable only after its actual request joins, operation identities
+and multiplicities are reviewed. If that proof is absent, its authoritative
+history multiplicity must be zero; otherwise qualification remains missing or
+partial. Absence of a `by_source` entry means zero only after validating the
+full 062340 status and shared source inventory, never by dropping an unknown key.
+
+| Source | Required covering proof, or zero in this increment |
+| --- | --- |
+| `operator_user_erasures` | Required zero for session-manifest qualification. A separate user replay still requires its bytes and generation proof; no session certificate covers it. |
+| `session_erasure_fences` | Actual INSERT identities bind the full org/workspace/source/alias keys to the manifest's accepted request and complete alias declaration. Existing historical fences cannot be retroactively assigned to a fresh intent. UPDATE/DELETE or unproved alias/request attribution refuses. |
+| `session_erasure_receipts` | Actual INSERT/UPDATE effects bind the exact receipt compound key and its persisted accepted request, including every claimed mutation occurrence. A matching current receipt alone does not identify all historical updates; DELETE or unproved mutations refuse. |
+| `session_erasure_events` | Actual append event identities bind their receipt scope and accepted request, with any incoming retry ID explicitly distinguished. Every claimed INSERT is uniquely attributed. Later audit/step events are not presumed covered merely because they name the same session; unsupported operations refuse. |
+| `session_erasure_runs` | Required zero unless a separately reviewed per-mutation runtime/run-to-request proof covers the full lifecycle. A run count or current lease is not that proof; the capture helper does not cover later outer-runtime inserts by implication. |
+| `session_erasure_scopes` | Required zero unless separately reviewed immutable run/alias/request provenance and actual mutation attribution cover it. Do not infer it solely from an alias count. |
+| `session_erasure_writes` | Required zero unless separately reviewed write-obligation-to-request/effect provenance covers each begin/finish/failure/cleanup transaction. An expired obligation or its disappearance is not evidence of coverage. |
+| `upload_deletions` | Actual selection mutations must bind the full org/workspace/user/origin/source/session key to the freshly materialized target set and accepted request. Each claimed source/op occurrence must come from that reviewed selection effect path. Unrelated selection/re-enable or lost identity refuses. |
+| `upload_resets` | Required zero. A whole-user reset is not proved by a finite session target set; a future user/reset proof is separate. |
+| `upload_erasure_rearm` | Required zero. Rearm/re-admission and later writes need separate authority/generation coverage, not a session-alias certificate. |
+| `relayfacts_erasure_fences` | Required zero. Relayfacts/user erasure is a distinct effect domain, not implied by this session capture. |
+| `session_analysis_purge_fences` | Required zero without an independently reviewed analysis-purge effect proof; target capture is not proof that derived bytes were purged. |
+| `session_analysis_purge_authority` | Required zero without its own reviewed authority-to-effect proof. A grant/authority row is not a purge receipt. |
+| `ingest_frozen_source_deletions` | Required zero without a reviewed frozen-source lineage/control effect proof. Session target membership alone does not establish it. |
+| `ingest_frozen_source_resets` | Required zero without a reviewed frozen-source reset proof; a broader reset cannot be inferred from finite aliases. |
+
+Required zero means **refuse proof when nonzero**, not prevent, skip or delete
+the underlying erase operation. Ordinary runtime paths do write sources not
+yet covered by the first capture-call certificate. Therefore the scoped first
+increment can persist useful target witnesses while remaining unable to
+qualify a positive runtime window. Do not claim it completes wave-2 release
+or expand it to all runtime writers without an explicit reviewed scope change.
+Future covering proofs can extend this matrix only with versioned evidence,
+qualified request attribution and the same bidirectional reconciliation.
+
+The consumer may compute `binding_sha256` only over the concrete evidence it
+actually validated, using the producer/consumer's agreed byte-exact encoding
+and version. It must bind the accepted manifest/request/scope and attributed
+effect facts, not a guessed complete set or a hash of the expected counts.
+Until the physical provenance/read contract and vectors exist, keep it null
+and qualification unproven. Missing required coverage also leaves the runtime
+binding digest null; a hash of a validated subset is not promoted to complete
+proof. The v2 receipt cannot turn that null or a target digest into a complete
+effect proof.
+
 Drain every manifest page in the SQL-only preparation phase and pin its
 identity, accepted request, full scope, capture version, aliases, count and
 digest. Pin the wrapper's epoch, installed fence, selected FULL triple and
@@ -779,6 +884,12 @@ Neither the session manifest nor 062320's shared org lock can stand in for it.
   valid v1 manifest with incomplete/mismatched effect provenance, ambiguous
   xid/time matches and an unresolved non-session source: none can authorize
   receipt lookup, mutation or release. No silent reader-v1 field additions.
+- Same-org/same-xid multiple requests or unrelated control writes, equal totals
+  with swapped request/row identities, duplicate/orphan witnesses, missing or
+  extra per-source/op occurrences, and outer-runtime writes after capture all
+  refuse unless uniquely attributed and reconciled in both directions. Cover
+  each of the 15 source rows in the matrix, including required-zero failures.
+  Preseeded receipts never bypass these negatives or allow any object I/O.
 - A racing source write between proof and release, transient/deleted source
   rows, history-event versus alias/group cardinality, and an erase predating
   the replay window. The final exclusive-key check uses authoritative 062340
@@ -835,6 +946,10 @@ bridge behavior, release gate or live state.
   new request's effects; only a genuinely fully covered repeat can reuse it.
   An empty owner set or unwind with no seal may return `manifest_unsealed`;
   no extra marker table or false empty completion is needed just for diagnosis.
+  A pre-existing alias fence without a complete original capture is historical
+  proof debt too, even when it has no alias-to-manifest binding yet. A fresh
+  receipt must not launder that alias into complete history by discovering only
+  its surviving owners; preserve legacy erase behavior and keep proof unproven.
 - **Compound keys/down:** full request/scope FKs may be added only in the new
   migration, never by changing 050000 bytes. A retained FK to receipts can
   prevent 050000's DROP TABLE even with empty histories. Its populated and
