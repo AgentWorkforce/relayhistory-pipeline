@@ -38,6 +38,8 @@ const WITNESS_FUNCTIONS = [
   "sessions.session_erasure_replay_seal_guard()",
   "sessions.session_erasure_replay_child_guard()",
   "sessions.session_erasure_replay_digest(uuid)",
+  "sessions.session_erasure_replay_framed_bytes(uuid)",
+  "sessions.session_erasure_replay_digest_cap()",
   "sessions.session_erasure_replay_guard()",
 ];
 
@@ -111,6 +113,8 @@ export const sessionErasureReplayManifest: LaneManifest = {
   functions: {
     "sessions.session_erasure_replay_guard()": OWNER,
     "sessions.session_erasure_replay_digest(uuid)": OWNER,
+    "sessions.session_erasure_replay_digest_cap()": OWNER,
+    "sessions.session_erasure_replay_framed_bytes(uuid)": OWNER,
     "sessions.session_erasure_replay_child_guard()": OWNER,
     "sessions.session_erasure_replay_seal_guard()": OWNER,
     "sessions.session_erasure_replay_fence(text,text,text,text,text[],uuid)": OWNER,

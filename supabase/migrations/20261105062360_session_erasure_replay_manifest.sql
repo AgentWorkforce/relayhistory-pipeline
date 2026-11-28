@@ -145,12 +145,41 @@ LANGUAGE sql STABLE SET search_path=pg_catalog,pg_temp AS $replay_digest$
  FROM a, t WHERE EXISTS(SELECT 1 FROM r)
 $replay_digest$;
 
+-- The size bound (equivalence review, finding 2). PostgreSQL caps one value at 1 GiB, and the digest hashes the whole
+-- framed message as one bytea; origins per owner are not capped by 050000. So a manifest whose framed message would
+-- exceed this source cap is never sealed: the witness stays unsealed (unproven) and the erase proceeds exactly as
+-- before. The cap is far below the ceiling so that capture, seal and the reader's per-page recompute stay bounded.
+CREATE OR REPLACE FUNCTION sessions.session_erasure_replay_digest_cap() RETURNS bigint
+LANGUAGE sql IMMUTABLE SET search_path=pg_catalog,pg_temp AS $replay_cap$
+ SELECT 67108864::bigint -- 64 MiB of framed message
+$replay_cap$;
+
+-- The exact octet length of the digest's framed message, summed without building it (one value never materializes).
+CREATE OR REPLACE FUNCTION sessions.session_erasure_replay_framed_bytes(p_manifest uuid) RETURNS bigint
+LANGUAGE sql STABLE SET search_path=pg_catalog,pg_temp AS $replay_bytes$
+ WITH r AS (SELECT * FROM sessions.session_erasure_replay_requests WHERE manifest_id=p_manifest),
+ a AS (SELECT count(*) AS n,coalesce(sum(4+octet_length(convert_to(x.alias_session_id,'UTF8'))),0) AS b
+       FROM sessions.session_erasure_replay_aliases AS x WHERE x.manifest_id=p_manifest),
+ t AS (SELECT count(*) AS n,coalesce(sum(16+octet_length(convert_to(x.user_id,'UTF8'))+octet_length(convert_to(x.origin_id,'UTF8'))
+         +octet_length(convert_to(x.source,'UTF8'))+octet_length(convert_to(x.session_id,'UTF8'))),0) AS b
+       FROM sessions.session_erasure_replay_targets AS x WHERE x.manifest_id=p_manifest)
+ SELECT (octet_length(convert_to('rh-erase-replay-manifest/v1','UTF8'))
+   +(SELECT sum(4+octet_length(convert_to(v,'UTF8'))) FROM r, LATERAL (VALUES (r.capture_version::text),(r.manifest_id::text),(r.request_id),
+       (r.org_id),(r.workspace_id),(r.source),(r.requested_session_id)) AS v(v))
+   +4+octet_length(a.n::text)+a.b+4+octet_length(t.n::text)+t.b)::bigint
+ FROM a, t WHERE EXISTS(SELECT 1 FROM r)
+$replay_bytes$;
+
 -- A child row (alias or target) may not join a sealed manifest. FOR SHARE on the parent conflicts with the seal's
 -- FOR UPDATE, so a child insert racing a seal either commits first (and the seal's recount sees it) or waits and sees
--- the seal (READ COMMITTED re-reads after the wait).
+-- the seal: each later statement takes a fresh READ COMMITTED snapshot. Both guards refuse any other isolation level.
 CREATE OR REPLACE FUNCTION sessions.session_erasure_replay_child_guard() RETURNS trigger
 LANGUAGE plpgsql VOLATILE SET search_path=pg_catalog,pg_temp AS $replay_child$
 BEGIN
+ -- READ COMMITTED only (40001 otherwise): the check below must see a seal committed while this insert waited on the
+ -- parent lock, which a REPEATABLE READ or SERIALIZABLE snapshot taken earlier would not.
+ IF current_setting('transaction_isolation')<>'read committed' THEN
+  RAISE EXCEPTION USING ERRCODE='40001',MESSAGE='session erasure replay manifest: read-committed transaction required';END IF;
  PERFORM 1 FROM sessions.session_erasure_replay_requests WHERE manifest_id=NEW.manifest_id FOR SHARE;
  IF EXISTS(SELECT 1 FROM sessions.session_erasure_replay_completions WHERE manifest_id=NEW.manifest_id) THEN
   RAISE EXCEPTION USING ERRCODE='55000',MESSAGE='session erasure replay manifest: manifest is sealed';END IF;
@@ -163,6 +192,10 @@ CREATE OR REPLACE FUNCTION sessions.session_erasure_replay_seal_guard() RETURNS 
 LANGUAGE plpgsql VOLATILE SET search_path=pg_catalog,pg_temp AS $replay_seal$
 DECLARE r sessions.session_erasure_replay_requests%ROWTYPE;v_aliases bigint;v_owners bigint;v_pairs bigint;v_targets bigint;
 BEGIN
+ -- READ COMMITTED only (40001 otherwise): the recount below must see every child committed before this seal took the
+ -- parent lock, which a REPEATABLE READ or SERIALIZABLE snapshot taken earlier would not.
+ IF current_setting('transaction_isolation')<>'read committed' THEN
+  RAISE EXCEPTION USING ERRCODE='40001',MESSAGE='session erasure replay manifest: read-committed transaction required';END IF;
  SELECT * INTO r FROM sessions.session_erasure_replay_requests WHERE manifest_id=NEW.manifest_id FOR UPDATE;
  IF NOT FOUND THEN RAISE EXCEPTION USING ERRCODE='23503',MESSAGE='session erasure replay manifest: no intent';END IF;
  SELECT count(*) INTO v_aliases FROM sessions.session_erasure_replay_aliases WHERE manifest_id=NEW.manifest_id;
@@ -175,6 +208,7 @@ BEGIN
   OR v_targets<>v_pairs*v_aliases
   OR (NEW.alias_count,NEW.owner_count,NEW.pair_count,NEW.target_count)IS DISTINCT FROM(v_aliases,v_owners,v_pairs,v_targets)
   OR NEW.derivation_version IS DISTINCT FROM r.capture_version
+  OR sessions.session_erasure_replay_framed_bytes(NEW.manifest_id)>sessions.session_erasure_replay_digest_cap()
   OR NEW.manifest_sha256 IS DISTINCT FROM sessions.session_erasure_replay_digest(NEW.manifest_id) THEN
   RAISE EXCEPTION USING ERRCODE='55000',MESSAGE='session erasure replay manifest: seal does not match its rows';END IF;
  RETURN NEW;
@@ -249,6 +283,12 @@ BEGIN
    CROSS JOIN unnest(p_ids) AS i;
   GET DIAGNOSTICS v_targets=ROW_COUNT;
   v_owner_origins:=v_targets/cardinality(p_ids);
+ END IF;
+ -- Over the size bound: no seal (unproven), and the legacy derivation below, exactly as before.
+ IF v_manifest IS NOT NULL AND sessions.session_erasure_replay_framed_bytes(v_manifest)>sessions.session_erasure_replay_digest_cap() THEN
+  v_manifest:=NULL;
+ END IF;
+ IF v_manifest IS NOT NULL THEN
   INSERT INTO sessions.session_erasure_replay_completions(manifest_id,org_id,workspace_id,source,derivation_version,
     alias_count,owner_count,pair_count,target_count,manifest_sha256)
   VALUES(v_manifest,p_org,p_ws,p_source,1,cardinality(p_ids),cardinality(v_users),v_owner_origins,v_targets,

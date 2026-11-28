@@ -9,6 +9,8 @@
  *   4 org SHARED precedes the global erase gate (961996,50000) on BOTH entry paths, direct owner _session and
  *     runtime_begin as a real ingest login: behind an open install (org X) the waiter waits on org S holding no gate;
  *     behind a held gate it already holds org S; nothing leaks past either commit; the live body has the check first
+ *   6 the child and seal guards refuse any isolation but READ COMMITTED (stale REPEATABLE READ insert-after-seal and
+ *     seal-from-old-snapshot are refused 40001); a READ COMMITTED seal waits for an in-flight child, then recounts
  *   5 the down keeps a populated witness (the reviewed shape on this major), a reapply reuses it; an empty manifest's
  *     down drops it with the receipts binding
  */
@@ -225,6 +227,79 @@ describe.skipIf(!url)("062360 replay manifest on real PostgreSQL", () => {
     // A sealed capture through both paths after the gates are free: a seeded session, the direct path.
     await erase(o, "req-seeded");
     expect((await read(o, SID)).complete).toBe(true);
+  });
+
+  test("6. the guards hold under any isolation: stale REPEATABLE READ inserts and seals are refused; READ COMMITTED races serialize", async () => {
+    const db = await database();
+    const o = await owner(db);
+    // An unsealed manifest built directly by the owner: receipt, fence, intent, one alias, one target.
+    const M = "6f1e2d3c-4b5a-4968-8776-655443322110";
+    await o.query(`INSERT INTO sessions.session_erasure_receipts(org_id,workspace_id,source,session_id,request_id,artifacts,actor_kind,actor_id)
+      SELECT $1,$2,$3,'s-m','req-m',jsonb_object_agg(k,jsonb_build_object('count',0,'state','pending')),'user','t'
+      FROM unnest(sessions.ingest_operator_erase_artifact_keys()) AS k`, [ORG, WS, SRC]);
+    await o.query("INSERT INTO sessions.session_erasure_fences(org_id,workspace_id,source,session_id) VALUES($1,$2,$3,'s-m')", [ORG, WS, SRC]);
+    await o.query("INSERT INTO sessions.session_erasure_replay_requests(manifest_id,request_id,org_id,workspace_id,source,requested_session_id,capture_version) VALUES($4,'req-m',$1,$2,$3,'s-m',1)", [ORG, WS, SRC, M]);
+    await o.query("INSERT INTO sessions.session_erasure_replay_aliases VALUES($4,$1,$2,$3,'s-m')", [ORG, WS, SRC, M]);
+    const target = (u: string) => ["INSERT INTO sessions.session_erasure_replay_targets VALUES($1,$2,$3,$4,'o',$5,'s-m')", [M, ORG, WS, u, SRC]] as const;
+    await o.query(...target("u-1"));
+    const seal = async (c: Q) => {
+      const x = (await c.query(`SELECT count(DISTINCT user_id)::int ow,count(*)::int t,sessions.session_erasure_replay_digest($1) h
+        FROM sessions.session_erasure_replay_targets WHERE manifest_id=$1`, [M])).rows[0];
+      return c.query("INSERT INTO sessions.session_erasure_replay_completions VALUES($1,$2,$3,$4,1,1,$5::int,$5::bigint,$6::bigint,$7)", [M, ORG, WS, SRC, x.ow, x.t, x.h]);
+    };
+    const p = await pair(db);
+    // (b) A seal computed from an old REPEATABLE READ snapshot, after another transaction added a target: refused 40001.
+    await p.a.query("BEGIN ISOLATION LEVEL REPEATABLE READ");
+    await p.a.query("SELECT count(*) FROM sessions.session_erasure_replay_targets"); // the snapshot
+    await o.query(...target("u-2"));
+    await expect(seal(p.a)).rejects.toMatchObject({ code: "40001" });
+    await p.a.query("ROLLBACK");
+    expect(await n(o, "SELECT count(*)::int n FROM sessions.session_erasure_replay_completions")).toBe(0);
+    // (a) A target inserted from an old REPEATABLE READ snapshot after another transaction sealed: refused 40001.
+    await p.a.query("BEGIN ISOLATION LEVEL REPEATABLE READ");
+    await p.a.query("SELECT count(*) FROM sessions.session_erasure_replay_completions"); // the snapshot, before the seal
+    await seal(o);
+    await expect(p.a.query(...target("u-3"))).rejects.toMatchObject({ code: "40001" });
+    await p.a.query("ROLLBACK");
+    for (const iso of ["SERIALIZABLE", "REPEATABLE READ"]) {
+      await p.a.query(`BEGIN ISOLATION LEVEL ${iso}`);
+      await expect(p.a.query(...target("u-4"))).rejects.toMatchObject({ code: "40001" });
+      await p.a.query("ROLLBACK");
+    }
+    // The sealed manifest is still exactly consistent: two targets, counts and digest match.
+    const page = await read(o, "s-m");
+    expect(page).toMatchObject({ complete: true, target_count: "2" });
+    // The guards bind only mutations: the reader keeps working in REPEATABLE READ and SERIALIZABLE READ ONLY transactions
+    // (a bridge drain can pin one snapshot across pages), with identical pages.
+    for (const iso of ["REPEATABLE READ", "SERIALIZABLE"]) {
+      await p.a.query(`BEGIN ISOLATION LEVEL ${iso} READ ONLY`);
+      const q = (await p.a.query("SELECT sessions.session_erasure_replay_read($1,$2,$3,'s-m') p", [ORG, WS, SRC])).rows[0].p;
+      await p.a.query("COMMIT");
+      expect([iso, q]).toEqual([iso, page]);
+    }
+    // READ COMMITTED race, the seal first: a child insert waits on the parent lock, then sees the seal (55000).
+    await o.query("INSERT INTO sessions.session_erasure_fences(org_id,workspace_id,source,session_id) VALUES($1,$2,$3,'s-n')", [ORG, WS, SRC]);
+    await o.query(`INSERT INTO sessions.session_erasure_receipts(org_id,workspace_id,source,session_id,request_id,artifacts,actor_kind,actor_id)
+      SELECT $1,$2,$3,'s-n','req-n',artifacts,actor_kind,actor_id FROM sessions.session_erasure_receipts WHERE session_id='s-m'`, [ORG, WS, SRC]);
+    const M2 = "7f2e3d4c-5b6a-4a79-9887-766554433221";
+    await o.query("INSERT INTO sessions.session_erasure_replay_requests(manifest_id,request_id,org_id,workspace_id,source,requested_session_id,capture_version) VALUES($4,'req-n',$1,$2,$3,'s-n',1)", [ORG, WS, SRC, M2]);
+    await o.query("INSERT INTO sessions.session_erasure_replay_aliases VALUES($4,$1,$2,$3,'s-n')", [ORG, WS, SRC, M2]);
+    await o.query("INSERT INTO sessions.session_erasure_replay_targets VALUES($1,$2,$3,'u-1','o',$4,'s-n')", [M2, ORG, WS, SRC]);
+    const seal2 = (c: Q) => c.query(`INSERT INTO sessions.session_erasure_replay_completions
+      SELECT $1,$2,$3,$4,1,1,1,1,1,sessions.session_erasure_replay_digest($1)`, [M2, ORG, WS, SRC]);
+    const child2 = (u: string) => (c: Q) => c.query("INSERT INTO sessions.session_erasure_replay_targets VALUES($1,$2,$3,$4,'o',$5,'s-n')", [M2, ORG, WS, u, SRC]);
+    const r1 = await expectBlocks(p, { holder: p.a, waiter: p.b, hold: (c) => child2("u-9")(c), wait: seal2, holderEnd: "rollback" });
+    expect(r1.receipt.waiting[0]).toMatchObject({ locktype: "transactionid" }); // the seal waits for the child's parent lock
+    expect(r1.waited.ok).toBe(true); // the child rolled back: the recount is the one target, and the seal commits
+    // Now sealed: a later READ COMMITTED child sees the seal and is refused.
+    await expect(o.query("INSERT INTO sessions.session_erasure_replay_targets VALUES($1,$2,$3,'u-7','o',$4,'s-n')", [M2, ORG, WS, SRC])).rejects.toMatchObject({ code: "55000" });
+    // After every transaction above: each persisted seal equals its rows (counts and digest recomputed).
+    const drift = await n(o, `SELECT count(*)::int n FROM sessions.session_erasure_replay_completions c WHERE
+      c.target_count<>(SELECT count(*) FROM sessions.session_erasure_replay_targets t WHERE t.manifest_id=c.manifest_id)
+      OR c.owner_count<>(SELECT count(DISTINCT user_id) FROM sessions.session_erasure_replay_targets t WHERE t.manifest_id=c.manifest_id)
+      OR c.manifest_sha256<>sessions.session_erasure_replay_digest(c.manifest_id)`);
+    expect(drift).toBe(0);
+    expect(await n(o, "SELECT count(*)::int n FROM sessions.session_erasure_replay_completions")).toBe(2);
   });
 
   test("5. down: a populated witness is kept in the reviewed shape and reused by a reapply; an empty one is dropped", async () => {

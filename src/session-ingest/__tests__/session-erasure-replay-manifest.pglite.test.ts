@@ -234,6 +234,31 @@ describe("062360 session erasure replay manifest", () => {
     expect((await page(d, SID)).reason).toBe("manifest_missing");
   });
 
+  test("over the size bound (an injected small cap) the witness stays unsealed and the erase is exactly the legacy one", async () => {
+    const legacy = await database(before());
+    await scenario(legacy);
+    await erase(legacy);
+    const d = await database();
+    await scenario(d);
+    const at = (await rows<{ n: string }>(d, "SELECT sessions.session_erasure_replay_digest_cap()::text n"))[0]!.n;
+    expect(at).toBe("67108864");
+    // The test stands in for an oversized manifest by lowering the cap below this scenario's framed size.
+    await d.db.exec("CREATE OR REPLACE FUNCTION sessions.session_erasure_replay_digest_cap() RETURNS bigint LANGUAGE sql IMMUTABLE SET search_path=pg_catalog,pg_temp AS $c$ SELECT 200::bigint $c$");
+    const r = await erase(d);
+    expect(r).toMatchObject({ status: "in_progress", uploadsFenced: true, failure: null });
+    expect((await page(d, SID)).reason).toBe("manifest_unsealed");
+    expect(await rows(d, "SELECT count(*)::int n FROM sessions.session_erasure_replay_completions")).toEqual([{ n: 0 }]);
+    expect(await effectSet(d)).toEqual(await effectSet(legacy));
+    // An oversize seal is refused even by the owner, with correct counts and digest.
+    const m = (await rows<{ m: string }>(d, "SELECT manifest_id::text m FROM sessions.session_erasure_replay_requests"))[0]!.m;
+    const c = (await rows<{ a: number; o: number; p: number; t: number; h: string }>(d, `SELECT (SELECT count(*) FROM sessions.session_erasure_replay_aliases WHERE manifest_id=$1)::int a,
+      count(DISTINCT user_id)::int o,count(DISTINCT (user_id,origin_id))::int p,count(*)::int t,sessions.session_erasure_replay_digest($1) h
+      FROM sessions.session_erasure_replay_targets WHERE manifest_id=$1`, [m]))[0]!;
+    expect(c.t).toBeGreaterThan(0);
+    expect(await code(d.db.query("INSERT INTO sessions.session_erasure_replay_completions VALUES($1,$2,$3,$4,1,$5,$6,$7,$8,$9)",
+      [m, ORG, WS, SRC, c.a, c.o, c.p, c.t, c.h]))).toBe("55000");
+  });
+
   test("an erase with no owners is never sealed (empty coverage is unproven)", async () => {
     const d = await database();
     const r = await erase(d);
@@ -387,6 +412,13 @@ describe("062360 digest vectors", () => {
       for (const t of v.targets) await d.db.query("INSERT INTO sessions.session_erasure_replay_targets VALUES($1,$2,$3,$4,$5,$6,$7)",
         [b.manifest_id, b.org_id, b.workspace_id, t.user_id, t.origin_id, t.source, t.session_id]);
       expect([v.name, (await rows<{ h: string }>(d, "SELECT sessions.session_erasure_replay_digest($1) h", [b.manifest_id]))[0]!.h]).toEqual([v.name, v.sha256]);
+      // framed_bytes is exactly the message's octet length, computed without building it.
+      const f = (x: string) => 4 + Buffer.byteLength(x, "utf8");
+      const len = Buffer.byteLength("rh-erase-replay-manifest/v1", "ascii")
+        + ["1", b.manifest_id, b.request_id, b.org_id, b.workspace_id, b.source, b.requested_session_id].reduce((n, x) => n + f(x), 0)
+        + f(String(v.aliases.length)) + v.aliases.reduce((n, x) => n + f(x), 0)
+        + f(String(v.targets.length)) + v.targets.reduce((n, t) => n + f(t.user_id) + f(t.origin_id) + f(t.source) + f(t.session_id), 0);
+      expect([v.name, Number((await rows<{ n: string }>(d, "SELECT sessions.session_erasure_replay_framed_bytes($1)::text n", [b.manifest_id]))[0]!.n)]).toEqual([v.name, len]);
     }
   });
 });
