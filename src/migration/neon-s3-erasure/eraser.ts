@@ -303,9 +303,10 @@ export interface S3EraserConfig {
   signer?: typeof signRequest;
 }
 /**
- * The last gate of ONE request: runs AFTER signing and IMMEDIATELY before fetch (nothing awaits between). Throwing
- * means fetch is never called. Returns the milliseconds left to the caller's ABSOLUTE protected deadline; the request
- * is aborted at the earlier of that and the per-request deadline.
+ * The last gate of ONE request: runs AFTER signing and after the request's abort timer is armed, IMMEDIATELY before
+ * fetch (nothing awaits or prepares between). Throwing means fetch is never called. Returns the milliseconds left to
+ * the caller's ABSOLUTE protected deadline; the already-armed timer (the full per-request deadline) must fit inside
+ * it, or the request is refused unsent.
  */
 export type BeforeFetch = () => number;
 /**
@@ -411,10 +412,11 @@ function s3Core(cfg: S3EraserConfig, label: string) {
   };
   const sign = cfg.signer ?? signRequest;
   const request = async (method: string, target: URL | (() => URL), passStatuses: readonly number[] = [], beforeFetch?: BeforeFetch, dispatch?: DispatchRecord) => {
-    // EVERY local preparation step before dispatch (the URL, headers, expiry refusal, hashing, signing, the caller's
-    // gate, the timeout, the completed RequestInit) is inside this block: any failure here is tagged notSent (fetch was
-    // never called). A short-lived credential refusal keeps its own code (the credential stop). `dispatch` flips to
-    // "dispatched" only after the block, immediately before fetch: fetch itself and what follows can be ambiguous.
+    // EVERY local preparation step before dispatch (the URL, headers, expiry refusal, hashing, signing, the abort
+    // timer, the completed RequestInit, then the caller's gate LAST) is inside this block: any failure here is tagged
+    // notSent (fetch was never called). A short-lived credential refusal keeps its own code (the credential stop).
+    // `dispatch` flips to "dispatched" only after the block, immediately before fetch: fetch itself and what follows
+    // can be ambiguous.
     if (dispatch) dispatch.phase = "preparing";
     let u: URL;
     let init: RequestInit;
@@ -423,13 +425,15 @@ function s3Core(cfg: S3EraserConfig, label: string) {
       const headers = new Headers();
       refuseIfExpired(cfg.credentials, label, Date.now()); // a short-lived key is never used to sign past expiry
       await sign({ method, url: u, headers, payloadSha256: await sha256Hex(new Uint8Array()), region: cfg.region, credentials: cfg.credentials });
-      // The caller's final gate AFTER signing (signing and hashing can be slow) and synchronously before fetch.
-      const left = beforeFetch ? beforeFetch() : Number.POSITIVE_INFINITY;
-      const timeout = Math.min(deadlineMs, left);
-      if (!(timeout > 0)) throw coded("stale_prefix_deadline", "no protected time left for this request");
-      // Built here, inside the not-sent block: constructing the abort signal is local preparation too.
-      const signal = AbortSignal.timeout(timeout);
+      // Arm the abort timer at the full per-request deadline and complete the RequestInit BEFORE the final gate, so the
+      // time any of this takes (signing, hashing, building the signal) is seen by the gate. The timer started before
+      // the gate's clock sample, so it fires no later than that sample + deadlineMs.
+      const signal = AbortSignal.timeout(deadlineMs);
       init = { method, headers, signal };
+      // The caller's final gate, LAST and synchronously before fetch: full issuance conditions at a fresh instant, and
+      // the already-armed timer must end inside the protected interval (refused unsent otherwise, never shortened).
+      const left = beforeFetch ? beforeFetch() : Number.POSITIVE_INFINITY;
+      if (!(left >= deadlineMs)) throw coded("stale_prefix_deadline", "the armed request deadline does not fit the protected time left");
     } catch (error) {
       throw Object.assign(error instanceof Error ? error : coded("request_prepare_failed", "request preparation failed"), { notSent: true });
     }
