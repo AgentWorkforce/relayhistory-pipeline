@@ -707,3 +707,30 @@ park, a covering erase, then the resume. Proven per class in `cutover-visibility
 publish snapshot must be fresh after the exclusive lock, and verdicts fresh after IO. **Revocation stays org-wide
 for the affected org** until an authoritative narrower scope exists; the scope columns remain a proposal. The PG17
 fixture at 8b7fc40e waits for claim-ci's window. Wave 1 is held.
+
+### The last verdict → external send interval, and the caller of inherited identity (lander c87b55a16c86)
+
+**External sends.** The interval from a sender's last visibility verdict to its external send is uncloseable: a
+delivered payload cannot be revoked. So a claimed exclusion needs **evidence that an enrolled org cannot reach the
+send at all**, and that includes queued and replayed work. Required evidence (none of it is built; design only):
+1. **The refusal is at execution, not at enqueue.** Each sender (Bob Costas summary stages, session-brief
+   briefTick, the brief analytics capture) reads the org's enrollment fresh, immediately before reading any canonical
+   byte, and refuses when the org is enrolled. A job queued before enrollment, and a retry or replay after it, hits
+   the same execution-time refusal.
+2. **What can still be sent.** Only a run whose refusal read happened before the enrollment PUT can reach the send.
+   Such a run reads pre-enrollment content, and its erase race is the one every org has today: nothing W2 publishes
+   is in it. This interval stays explicit and is **not** claimed closed.
+3. **Deployment evidence.** The refusal is in the running worker revision for every sender, and no other code path
+   invokes the summarizer or analytics for canonical input. That needs a caller inventory of
+   `summarizer.summarize`, `summarizeSessionInput` and the analytics capture.
+
+**Copied bytes: the caller reads that enforce inherited identity.** A publication generation's chunks are served
+through its `session_index` pointer by the canonical readers, so the inherited-identity check has to run at:
+- the read-API scope read (C3 `snapshotWithLimits`, with the C1 per-entry verdict): it maps a generation chunk key
+  to its recorded source effect;
+- the Read Worker `/v1/canonical/sessions/:id` (W/canonical.ts), which bypasses C3 and needs its own check;
+- the republisher, publication-image itself: before copying a base chunk into a newer generation, it resolves the
+  base chunk's (inherited) effect verdict, so a revoked effect is never carried forward. A copy that still lands
+  after the erase is covered by the serving checks above.
+- Every producer in the trace that reads through these readers (P1 to P7) inherits the check. Any that reads
+  generation chunks by raw key needs its own.
