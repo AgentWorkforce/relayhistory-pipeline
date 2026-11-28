@@ -392,6 +392,38 @@ describe("backstop recovery: a manifest recovered by reconcile", () => {
   });
 });
 
+describe("FIFO redelivery shapes (head-only, beyond ten)", () => {
+  test("head-only redelivery: a busy head comes back ALONE (no newer messages yet), is retried and then indexes", async () => {
+    const t = await rig();
+    const e1 = await t.writer(1, "r1");
+    const head = t.record(e1);
+    t.makeBusy(1);
+    const first = await t.run([head]);
+    expect(first.result.batchItemFailures).toEqual([{ itemIdentifier: head.messageId }]);
+    // Visibility expires; nothing else is queued for the group, so the head is redelivered alone.
+    const again = await t.run([{ ...head, attributes: { ...head.attributes!, ApproximateReceiveCount: "2" } }]);
+    expect(again.result).toEqual({ batchItemFailures: [] });
+    expect(t.index.get(t.sid)).toEqual(["r1"]);
+    // Pickup is the head's own redelivery: the line carries receive_count 2 and pickup_wait_ms from its ORIGINAL enqueue.
+    expect(named(again.lines, "revision searchable")).toEqual([expect.objectContaining({ revision: 1, receive_count: 2, pickup_wait_ms: 1_500 })]);
+  });
+
+  test("beyond ten: with 12 queued behind a busy head, the measured append (the 12th) is NOT in the first receive; its pickup is the later batch's", async () => {
+    const t = await rig();
+    const events: RevisionEvent[] = [];
+    for (let rev = 1; rev <= 12; rev++) events.push(await t.writer(rev, `r${rev}`, loc, new Date(T0 + rev * 10).toISOString()));
+    const recs = events.map((e, i) => t.record(e, T0 + i * 10));
+    // First receive: the ESM hands over at most 10 (head + 9); revision 12 is not among them.
+    const first = await t.run(recs.slice(0, 10));
+    expect(first.result).toEqual({ batchItemFailures: [] });
+    expect(named(first.lines, "revision searchable").map((l) => l.revision)).toEqual([]);
+    // The 12th is picked up only by the next batch; its own pickup and commit_to_pickup come from THAT receive.
+    const second = await t.run(recs.slice(10));
+    const line = named(second.lines, "revision searchable").find((l) => l.revision === 12)!;
+    expect(line).toMatchObject({ picked_up_at_ms: T0 + 1_500, commit_to_pickup_ms: 1_500 - 120 });
+  });
+});
+
 describe("in-flight pass: park it, commit a newer revision, then crash or lose the ack", () => {
   test("crash: the parked pass fails, SQS redelivers in order with the newer arrival, the newest live state becomes searchable", async () => {
     const t = await rig();
