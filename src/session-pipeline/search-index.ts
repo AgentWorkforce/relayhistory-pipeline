@@ -235,6 +235,16 @@ export interface SearchIndexPhaseMetrics {
   lockedApplyMs: number;
   writeCalls: number;
   writeBatches: number;
+  /**
+   * SEARCH_INDEX_SKIP_CURRENT_SHADOW_ENABLED only, set when the shadow probe ran in this pass (absent otherwise,
+   * so a flag-off line is unchanged): its whole wall time inside the locked transaction (savepoint, the
+   * Postgres read, the facts read), not counted in lockedApplyMs.
+   */
+  skipProbeMs?: number;
+  /** The probe's ClickHouse facts state point read (`outputFacts` only), when it ran: its wall time, included in skipProbeMs. */
+  skipProbeFactsMs?: number;
+  /** The probe failed: its error code (never a message). The pass went on if the savepoint rolled back. */
+  skipProbeError?: string;
 }
 
 export const searchIndexPhaseMetrics = (): SearchIndexPhaseMetrics => ({
@@ -671,6 +681,7 @@ async function indexSearchScopeBase(scope: SessionScope, deps: SearchIndexDeps, 
   const lockedStarted = Date.now();
   const sourceBefore = deps.metrics?.sourceReadMs ?? 0;
   const scanBefore = deps.metrics?.indexScanMs ?? 0;
+  const probeBefore = deps.metrics?.skipProbeMs ?? 0;
   let first: SearchIndexResult | typeof SEARCH_SCOPE_CHANGED;
   try {
     first = await deps.transact(async (tx): Promise<SearchIndexResult | typeof SEARCH_SCOPE_CHANGED> => {
@@ -752,7 +763,7 @@ async function indexSearchScopeBase(scope: SessionScope, deps: SearchIndexDeps, 
     if (deps.skipCurrent && (await alreadyCurrent(tx, scope, pointerSnapshot, keys.length, deps.outputFacts ? deps.ch : undefined)))
       return { manifests: keys.length, rows: 0, inserted: 0, deleted: 0, complete: true, skipped: true, reasons: [ALREADY_CURRENT] };
     // SEARCH_INDEX_SKIP_CURRENT_SHADOW_ENABLED: the same proof, read only; the pass below is unchanged.
-    skipProbe = deps.skipCurrentShadow ? await skipCurrentProbe(tx, scope, pointerSnapshot, keys.length, deps.outputFacts ? deps.ch : undefined) : undefined;
+    skipProbe = deps.skipCurrentShadow ? await shadowSkipProbe(tx, scope, pointerSnapshot, keys.length, deps.outputFacts ? deps.ch : undefined, deps.metrics) : undefined;
     const fromMs = prepared?.fromMs ?? await io.fromMs(at);
     const s3 = prepared?.s3 ?? await measurePhase(deps.metrics, "sourceReadMs", () =>
       readCanonicalScope(scope, siblingKeys, { ...deps, decompress: deps.decompress ?? defaultDecompress }, limits, version, pointerSnapshot.canonicalId));
@@ -926,7 +937,7 @@ async function indexSearchScopeBase(scope: SessionScope, deps: SearchIndexDeps, 
     if (deps.metrics) {
       const source = deps.metrics.sourceReadMs - sourceBefore;
       const scan = deps.metrics.indexScanMs - scanBefore;
-      deps.metrics.lockedApplyMs += Math.max(0, Date.now() - lockedStarted - source - scan);
+      deps.metrics.lockedApplyMs += Math.max(0, Date.now() - lockedStarted - source - scan - ((deps.metrics.skipProbeMs ?? 0) - probeBefore));
     }
   }
   const result = handoff ? await stagedSearchScope(scope, deps, limits, handoff) : first;
@@ -1404,11 +1415,15 @@ export type SkipCurrentMiss =
   /** Same sources, readiness reset: the last pass over them was incomplete, or a pointer change left the map equal. */
   | "not_ready"
   /** `outputFacts` only: the directory is current, the facts state is not complete (or unreadable). */
-  | "facts_incomplete";
+  | "facts_incomplete"
+  /** The shadow probe's own statement failed and was rolled back to its savepoint: no verdict, the pass ran. */
+  | "probe_failed";
 export interface SkipCurrentProbe {
   /** What alreadyCurrent answers for the same snapshot. */
   current: boolean;
   miss?: SkipCurrentMiss;
+  /** The ClickHouse facts state point read ran (only when the directory is otherwise current and `outputFacts` is on). */
+  factsRead?: true;
 }
 
 /**
@@ -1422,6 +1437,8 @@ export async function skipCurrentProbe(
   snapshot: { canonicalId: string },
   liveKeys: number,
   factsCh?: ClickHouseClient,
+  /** Receives the wall time of the facts read, when it runs. */
+  timing?: { factsMs?: number },
 ): Promise<SkipCurrentProbe> {
   if (liveKeys === 0) return { current: false, miss: "sources_changed" };
   const { rows } = await tx.query<{ deleted: boolean; ready: boolean; version: number | string; sources_equal: boolean | null }>(
@@ -1441,9 +1458,72 @@ export async function skipCurrentProbe(
   if (Number(d.version) !== 1) return { current: false, miss: "projection_version" };
   if (d.sources_equal !== true) return { current: false, miss: "sources_changed" };
   if (d.ready !== true) return { current: false, miss: "not_ready" };
-  if (factsCh && !(await outputFactsComplete(factsCh, { orgId: scope.orgId, workspaceId: scope.workspaceId, harness: scope.harness, sessionId: snapshot.canonicalId })))
-    return { current: false, miss: "facts_incomplete" };
-  return { current: true };
+  if (!factsCh) return { current: true };
+  // One ClickHouse point read (20 s timeout, an unreadable state answers not complete), only when Postgres says current.
+  const factsStarted = Date.now();
+  const complete = await outputFactsComplete(factsCh, { orgId: scope.orgId, workspaceId: scope.workspaceId, harness: scope.harness, sessionId: snapshot.canonicalId });
+  if (timing) timing.factsMs = Date.now() - factsStarted;
+  return complete ? { current: true, factsRead: true } : { current: false, miss: "facts_incomplete", factsRead: true };
+}
+
+const SKIP_PROBE_SAVEPOINT = "search_skip_probe";
+const probeErrorCode = (error: unknown): string => {
+  const e = error as { code?: unknown; name?: unknown };
+  return typeof e?.code === "string" ? e.code : typeof e?.name === "string" ? e.name : "unknown";
+};
+
+/**
+ * The shadow probe as the pass runs it: timed, and fenced by a savepoint so that a probe that fails cannot
+ * fail the pass. A failed statement is rolled back to the savepoint and answered `probe_failed` (no verdict);
+ * the pass then runs as if the flag were off. Only when that rollback fails too (the connection is gone) does
+ * the error reach the pass, which would have failed on its next statement anyway. `metrics` gets the probe's
+ * time, its facts read's time and its error code in every case, before any rethrow, so the consumer's
+ * `search index failed` line names the probe.
+ */
+async function shadowSkipProbe(
+  tx: SqlExecutor,
+  scope: SessionScope,
+  snapshot: { canonicalId: string },
+  liveKeys: number,
+  factsCh: ClickHouseClient | undefined,
+  metrics: SearchIndexPhaseMetrics | undefined,
+): Promise<SkipCurrentProbe> {
+  const started = Date.now();
+  const timing: { factsMs?: number } = {};
+  const done = (error?: unknown) => {
+    if (!metrics) return;
+    metrics.skipProbeMs = (metrics.skipProbeMs ?? 0) + (Date.now() - started);
+    if (timing.factsMs !== undefined) metrics.skipProbeFactsMs = (metrics.skipProbeFactsMs ?? 0) + timing.factsMs;
+    if (error !== undefined) metrics.skipProbeError = probeErrorCode(error);
+  };
+  let probe: SkipCurrentProbe;
+  try {
+    await tx.query(`SAVEPOINT ${SKIP_PROBE_SAVEPOINT}`);
+  } catch (error) {
+    done(error);
+    throw error;
+  }
+  try {
+    probe = await skipCurrentProbe(tx, scope, snapshot, liveKeys, factsCh, timing);
+  } catch (error) {
+    try {
+      await tx.query(`ROLLBACK TO SAVEPOINT ${SKIP_PROBE_SAVEPOINT}`);
+      await tx.query(`RELEASE SAVEPOINT ${SKIP_PROBE_SAVEPOINT}`);
+    } catch {
+      done(error);
+      throw error;
+    }
+    done(error);
+    return { current: false, miss: "probe_failed" };
+  }
+  try {
+    await tx.query(`RELEASE SAVEPOINT ${SKIP_PROBE_SAVEPOINT}`);
+  } catch (error) {
+    done(error);
+    throw error;
+  }
+  done();
+  return probe;
 }
 
 /** The streaming reader's keepalive interval: a third of the consumer pool's 60 s idle timeout. */

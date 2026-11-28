@@ -49,6 +49,8 @@ export const ALLOWED_LOG_FIELDS = new Set([
   "cached_refusal",
   // The search pass line under SEARCH_INDEX_SKIP_CURRENT_SHADOW_ENABLED: the skip-current verdict and its first failed condition.
   "would_skip", "skip_miss",
+  // The probe's own cost and failure, on every line of the pass: wall ms in the locked pass, the ClickHouse facts read's ms, the error code.
+  "skip_probe_ms", "skip_probe_facts_ms", "skip_probe_error",
   "service", "deployment", "deployment_id", "stage", "status", "outcome", "attempt",
   "trace_id", "span_id", "traceparent", "session_uuid", "session_uuid_source",
   "tenant_id", "org_id", "workspace_id", "machine_id", "harness", "session_id",

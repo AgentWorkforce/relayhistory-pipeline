@@ -184,6 +184,12 @@ export async function processBatch(records: readonly QueueRecord[], deps: Consum
         locked_apply_ms: phase.lockedApplyMs,
         write_calls: phase.writeCalls,
         write_batches: phase.writeBatches,
+        // SEARCH_INDEX_SKIP_CURRENT_SHADOW_ENABLED only, and only when the probe ran: its time inside the locked
+        // pass, its ClickHouse facts read's time when that ran, and its error code when it failed. On every
+        // line of the pass, the failed one too.
+        ...(phase.skipProbeMs !== undefined ? { skip_probe_ms: phase.skipProbeMs } : {}),
+        ...(phase.skipProbeFactsMs !== undefined ? { skip_probe_facts_ms: phase.skipProbeFactsMs } : {}),
+        ...(phase.skipProbeError !== undefined ? { skip_probe_error: phase.skipProbeError } : {}),
       });
       try {
         const result = await indexSearchScope(scope, { ...deps.search, metrics: phase });
