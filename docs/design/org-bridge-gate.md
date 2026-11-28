@@ -234,6 +234,12 @@ SQL step and its S3 CAS.
    ledger read, failed reads included. An uncommitted-entry refusal must never become a fallback-eligible 501 for a
    fenced session.
 6. Unenrolled orgs: add a fixture proving the reader is byte-identical (compatible with the dormant flag).
+7. Required tests (lander relay of the T89 owner, 252330578929815552): a commit between two pages while the pointer
+   rows stay identical, which must 409 or be bound into the cursor and never continue silently; an uncommitted newer
+   revision, where the scope is incomplete and the older revision is never served. The operator fence takes
+   precedence on success and failure: 404 `session_fenced` and the terminal 503 `operator_fence_unavailable` win over
+   any commit-check answer. Any reader diff goes to sessions-partial-canonical for review. This is design input, not
+   a W2 verdict or a grant approval.
 
 **W2 and erasure (agreed with sessions-buffered-drain-materialization; B3 list-then-CAS guard withdrawn).** For
 enrolled orgs the drain's create-only `drained` marker is the visibility point, and the drain writes it strictly
