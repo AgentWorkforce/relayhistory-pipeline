@@ -38,8 +38,11 @@ every session erasure.
   With a manifest, T is materialized once, after owner-lock convergence and under the owner locks. It is sealed
   before the first `ingest_apply_selection`, and the sealed rows then drive the selection loop, in the legacy order.
 - `ingest_operator_erase_session` (050000 body) changes in three ways:
-  - 062320's marked erasure check is its first statement. This matters for a direct owner call; through
-    `runtime_begin` the re-take is reentrant.
+  - 062320's marked erasure check is its first statement. The direct-owner `_session` path gains 062320's
+    erasure-class check here (new in 062360; before this slot only `ingest_operator_runtime_begin` had it). Through
+    `runtime_begin` the re-take is reentrant. The line keeps the `-- 062320 org admission hold` marker on purpose: that
+    is what 062320's down verify keys on, so a 062320 down can never leave `_session` calling the hold check it
+    drops. The 062360 lane owns the replacement, and the 062360 down restores the unmarked 050000 body.
   - An intent is written only by the call that inserted the receipt, and only when none of the closure's aliases was
     fenced before this call.
   - The intent is written at the fences' boundary, outside the RH010 block.

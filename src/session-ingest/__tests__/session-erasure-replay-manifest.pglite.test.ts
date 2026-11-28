@@ -477,6 +477,28 @@ describe("062360 down and reapply", () => {
     expect(to(await body(d, SESSION))).toBe(original("ingest_operator_erase_session", "$operator_erase$"));
   });
 
+  test("marker attribution: one 062320-marked line in 062360, inside _session; 062320's classes count only 062320; its down refuses while 062360 is applied", async () => {
+    const own = read(`supabase/migrations/${MIGRATION}`);
+    const marked = own.split("\n").map((l, i) => ({ l, i })).filter((x) => x.l.includes("-- 062320 org admission hold"));
+    expect(marked.map((x) => x.l.trim())).toEqual(["PERFORM sessions.ingest_org_admission_hold_check(p_org,'erasure'); -- 062320 org admission hold"]);
+    const opened = own.lastIndexOf("CREATE OR REPLACE FUNCTION sessions.ingest_operator_erase_session(", own.split("\n").slice(0, marked[0]!.i).join("\n").length);
+    expect(opened).toBeGreaterThanOrEqual(0);
+    expect(own.indexOf("$operator_erase$;", opened)).toBeGreaterThan(own.split("\n").slice(0, marked[0]!.i).join("\n").length);
+    // The 062320 classes test reads only 062320's own file, so this line is never counted as one of 062320's entries.
+    const classes = read("src/hoopdb/__tests__/org-admission-hold-classes.test.ts");
+    expect(classes).toContain("20261105062320_ingest_org_admission_fences.sql");
+    expect(classes).not.toContain("20261105062360");
+    // 062320's down refuses (55000) while 062360 is applied, and changes nothing: _session keeps the marked check.
+    const d = await database();
+    await ledgered(d);
+    await d.db.exec("CREATE TABLE IF NOT EXISTS sessions.__96bulls_role_validation(name text PRIMARY KEY, status text, updated_at timestamptz)");
+    let refused: { code?: string; message?: string } | undefined;
+    try { await d.db.exec(read("supabase/rollbacks/20261105062320_ingest_org_admission_fences.down.sql")); }
+    catch (e) { refused = e as { code?: string; message?: string }; await d.db.exec("ROLLBACK"); }
+    expect(refused).toMatchObject({ code: "55000", message: "org admission hold: a later migration is applied; roll it back first" });
+    expect((await body(d, SESSION)).s).toContain("PERFORM sessions.ingest_org_admission_hold_check(p_org,'erasure'); -- 062320 org admission hold");
+  });
+
   test("the down refuses while a later upstream slot is applied, and with a foreign checksum", async () => {
     const d = await database();
     await ledgered(d);
