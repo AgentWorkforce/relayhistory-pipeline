@@ -133,6 +133,11 @@ export class FakeHolds {
       h.state = "marker_attempted"; h.attemptedMs = this.clock(); h.events.push({ kind: "marker_attempted", evidence: params[2] as string });
       return [{}];
     }
+    if (text.includes("attempt_evidence")) {
+      const h = this.all.find((x) => x.epoch === params[0]);
+      const ev = h?.events.find((e) => e.kind === "marker_attempted");
+      return ev ? [{ attempt_evidence: ev.evidence }] : [];
+    }
     if (text.includes("ingest_org_admission_hold_events")) {
       return [{ n: this.all.filter((h) => h.org === org && h.epoch !== params[1] && h.events.some((e) => e.kind === "marker_attempted")).length }];
     }

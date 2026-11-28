@@ -21,7 +21,7 @@ import {
 import { epochHash } from "../erasure-window.ts";
 import { orgFenceAuthorityKey, validOrgFenceAuthority } from "../ledger-s3.ts";
 import {
-  MARKER_ATTESTATION_FIELDS, MARKER_CLOCK_SKEW_MS, checkMarkerDryReceipt, markerAdoptable, markerBoundFrom, markerOk, markerReceiptSummary, markerRun,
+  MARKER_ATTESTATION_FIELDS, MARKER_CLOCK_SKEW_MS, MARKER_IDENTITY_META, checkMarkerDryReceipt, markerAdoptable, markerIdentity, markerBoundFrom, markerOk, markerReceiptSummary, markerRun,
   parseLiveHold, type MarkerRunDeps, type MarkerSummary,
 } from "../marker-publication.ts";
 import { waveId } from "../org-wave.ts";
@@ -274,17 +274,22 @@ test("foreign markers: one before any attempt, one from an earlier epoch, or the
   expect(by(e)[H(A)]).toMatchObject({ refused: "marker_conflict", attempted: false });
   expect(w.holds.live(A)!.state).toBe("sealed");
   expect((await marker(w.store, A)).writtenAtMs).toBe(NOW - 10_000);
-  // markerAdoptable's rules.
+  // markerAdoptable's rules (the identity is over org, epoch and the DURABLE attempt's evidence).
   const live = { epoch: w.holds.live(B)!.epoch, state: "marker_attempted" as const, attemptedMs: NOW - 1000 };
-  const doc = orgFenceAuthorityDoc(B, NOW);
-  expect(markerAdoptable(doc, B, live, live.epoch, 0, NOW)).toBe(true);
-  expect(markerAdoptable(doc, B, live, live.epoch, 1, NOW)).toBe(false); // another epoch attempted a marker
-  expect(markerAdoptable(orgFenceAuthorityDoc(B, NOW - 1000 - MARKER_CLOCK_SKEW_MS - 1), B, live, live.epoch, 0, NOW)).toBe(false); // older than the attempt
-  expect(markerAdoptable(orgFenceAuthorityDoc(B, NOW + MARKER_CLOCK_SKEW_MS + 1), B, live, live.epoch, 0, NOW)).toBe(false); // from the future
-  expect(markerAdoptable(orgFenceAuthorityDoc(C, NOW), B, live, live.epoch, 0, NOW)).toBe(false); // another org's
-  expect(markerAdoptable({ ...doc, revisionLayout: "64" }, B, live, live.epoch, 0, NOW)).toBe(false);
-  expect(markerAdoptable(doc, B, { ...live, state: "sealed", attemptedMs: null }, live.epoch, 0, NOW)).toBe(false);
-  expect(markerAdoptable(doc, B, live, "00000000-0000-4000-8000-000000000000", 0, NOW)).toBe(false);
+  const ctx = { org: B, hold: live, approvedEpoch: live.epoch, otherAttempts: 0, durableEvidence: CATCHUP_EVIDENCE, boundEvidence: CATCHUP_EVIDENCE, nowMs: NOW };
+  const own = { doc: orgFenceAuthorityDoc(B, NOW), identity: markerIdentity(B, live.epoch, CATCHUP_EVIDENCE) };
+  expect(markerAdoptable(own, ctx)).toBe(true);
+  expect(markerAdoptable({ ...own, identity: null }, ctx)).toBe(false); // written outside the protocol
+  expect(markerAdoptable({ ...own, identity: markerIdentity(B, live.epoch, "e".repeat(64)) }, ctx)).toBe(false); // another attempt's evidence
+  expect(markerAdoptable(own, { ...ctx, durableEvidence: "e".repeat(64) })).toBe(false); // the durable attempt is another publisher's
+  expect(markerAdoptable(own, { ...ctx, durableEvidence: null })).toBe(false);
+  expect(markerAdoptable(own, { ...ctx, otherAttempts: 1 })).toBe(false); // another epoch attempted a marker
+  expect(markerAdoptable({ ...own, doc: orgFenceAuthorityDoc(B, NOW - 1000 - MARKER_CLOCK_SKEW_MS - 1) }, ctx)).toBe(false); // older than the attempt
+  expect(markerAdoptable({ ...own, doc: orgFenceAuthorityDoc(B, NOW + MARKER_CLOCK_SKEW_MS + 1) }, ctx)).toBe(false); // from the future
+  expect(markerAdoptable({ ...own, doc: orgFenceAuthorityDoc(C, NOW) }, ctx)).toBe(false); // another org's
+  expect(markerAdoptable({ ...own, doc: { ...own.doc, revisionLayout: "64" } }, ctx)).toBe(false);
+  expect(markerAdoptable(own, { ...ctx, hold: { ...live, state: "sealed", attemptedMs: null } })).toBe(false);
+  expect(markerAdoptable(own, { ...ctx, approvedEpoch: "00000000-0000-4000-8000-000000000000" })).toBe(false);
 });
 
 test("a PUT that times out is unknown (held, retried later); a guard lost after the PUT is proven by a fresh hold read", async () => {
@@ -723,4 +728,58 @@ test("the credential step end to end (fake OIDC/STS and tool child): the marker-
   expect(["backlog_ops_receipt_string", "backlog_ops_receipt_schema"]).toContain(bad.receipt.summary.refused);
   expect(bad.lines.filter((l) => !l.startsWith("::add-mask::")).join("\n")).not.toContain(ORGS[0]);
   expect(readFileSync(join(temp, "b", "backlog-ops-out", "backlog-ops-receipt.json"), "utf8")).not.toContain(ORGS[0]);
+});
+
+test("publication identity: a same-org, same-window marker from a different attempt is never adopted, on the first GET or the If-None-Match path; an own retry is", async () => {
+  const [A, B, C] = ORGS as [string, string, string];
+  const store = fresh();
+  // A's first PUT fails, so A is left marker_attempted with this run's evidence and no marker.
+  let failA = true, raceC: (() => Promise<void>) | null = null;
+  const s3 = new Proxy(store, { get: (t, p) => p === "put" ? async (key: { toString(): string }, ...rest: unknown[]) => {
+    if (failA && String(key).includes(`fence-authority/${A}`)) throw new Error("s3 down");
+    if (raceC && String(key).includes(`fence-authority/${C}`)) { const r = raceC; raceC = null; await r(); }
+    return (t as any).put(key, ...rest);
+  } : (t as any)[p]?.bind?.(t) ?? (t as any)[p] }) as ObjectStore;
+  const w = await world({ store: s3 });
+  const d = await w.dry();
+  const e1 = await w.execute(w.wave(d));
+  expect(by(e1)[H(A)]).toMatchObject({ verdict: "incomplete", refused: "marker_write_failed", attempted: true });
+  // Published markers carry the identity over (org, epoch, durable evidence).
+  const meta = async (o: string) => (await store.getObject(objectKey(orgFenceAuthorityKey(ROOT, o)))).meta.metadata[MARKER_IDENTITY_META];
+  expect(await meta(B)).toBe(markerIdentity(B, w.holds.live(B)!.epoch, CATCHUP_EVIDENCE));
+  // Another publisher now writes A's marker in the window (same org, same time), valid doc, a different attempt's identity.
+  const epochA = w.holds.live(A)!.epoch;
+  await store.put(objectKey(orgFenceAuthorityKey(ROOT, A)), new TextEncoder().encode(JSON.stringify(orgFenceAuthorityDoc(A, NOW))),
+    { contentType: "application/json", metadata: { [MARKER_IDENTITY_META]: markerIdentity(A, epochA, "f".repeat(64)) } });
+  failA = false;
+  const e2 = await w.execute(w.wave(d));
+  expect(by(e2)[H(A)]).toMatchObject({ verdict: "refused", refused: "marker_conflict", attempted: false });
+  expect(await meta(A)).toBe(markerIdentity(A, epochA, "f".repeat(64))); // never overwritten
+  expect(by(e2)[H(B)]).toMatchObject({ verdict: "adopted", marker: "adopted" }); // own retry
+  // The If-None-Match path: C in a fresh store; a foreign object lands between our GET and our PUT.
+  const store3 = fresh();
+  const s33 = new Proxy(store3, { get: (t, p) => p === "put" ? async (key: { toString(): string }, ...rest: unknown[]) => {
+    if (raceC && String(key).includes(`fence-authority/${C}`)) { const r = raceC; raceC = null; await r(); }
+    return (t as any).put(key, ...rest);
+  } : (t as any)[p]?.bind?.(t) ?? (t as any)[p] }) as ObjectStore;
+  const w3 = await world({ store: s33, orgs: [C] });
+  const d3 = await w3.dry();
+  raceC = async () => {
+    await store3.put(objectKey(orgFenceAuthorityKey(ROOT, C)), new TextEncoder().encode(JSON.stringify(orgFenceAuthorityDoc(C, NOW))), { contentType: "application/json" });
+  };
+  const e3 = await w3.execute(w3.wave(d3));
+  expect(e3.per_org[0]).toMatchObject({ verdict: "incomplete", refused: "marker_conflict", marker: "conflict", attempted: true });
+  expect((await store3.getObject(objectKey(orgFenceAuthorityKey(ROOT, C)))).meta.metadata[MARKER_IDENTITY_META]).toBeUndefined();
+});
+
+test("publication identity: an epoch whose durable attempt recorded another publisher's evidence refuses before any PUT", async () => {
+  const [A] = ORGS as [string];
+  const w = await world({ orgs: [A] });
+  const d = await w.dry();
+  // Another publisher attempted first at the same epoch with different bound evidence.
+  const h = w.holds.live(A)!;
+  h.state = "marker_attempted"; h.attemptedMs = NOW - 500; h.events.push({ kind: "marker_attempted", evidence: "e".repeat(64) });
+  const e = await w.execute(w.wave(d));
+  expect(e.per_org[0]).toMatchObject({ refused: "hold_attempt_evidence_mismatch", attempted: true, marker: "absent" });
+  expect(await marker(w.store, A)).toBeNull();
 });

@@ -31,11 +31,21 @@
  *      gone with it), the hold is re-read on a fresh statement; still live at the epoch is the same proof (monotone);
  *      released is `marker_hold_lapsed` (incomplete, needs the hold owner).
  *
+ * Publication identity. Every PUT stamps the object's metadata `marker-publication` with markerIdentity(org, epoch,
+ * evidence): a domain-separated sha256 over the org, the hold epoch and the attempt's bound evidence (the final
+ * catch-up receipt's sha256). The DURABLE side is the epoch's one `marker_attempted` event, which records that
+ * evidence; the attempt function returns early on a repeat without checking evidence, so after the attempt the tool
+ * re-reads the event and refuses (`hold_attempt_evidence_mismatch`) unless it carries this run's bound evidence.
+ * A publisher with other evidence therefore never gets an event matching its PUT, and one bypassing the protocol
+ * writes no identity at all.
+ *
  * Retry. A rerun binds the same marker-dry and the same wave id. `_marker_attempt` is idempotent at the same epoch.
- * A marker already present is adopted when (markerAdoptable): it is a valid marker for this org; the hold is live at
- * the approved epoch in `marker_attempted`; its writtenAtMs is no earlier than the epoch's first attempt minus
- * MARKER_CLOCK_SKEW_MS and no later than now plus that skew; and no OTHER epoch of this org ever recorded a marker
- * attempt (so no other cutover could have written it). Anything else is a conflict and is never overwritten.
+ * A marker already present (the first GET, or the If-None-Match conflict path) is adopted only when
+ * (markerAdoptable): it is a valid marker for this org; its stored identity equals markerIdentity over the live epoch
+ * and the evidence of that epoch's durable attempt event, which equals this run's bound evidence; the hold is live at
+ * the approved epoch in `marker_attempted`; no OTHER epoch of this org ever recorded a marker attempt; and its
+ * writtenAtMs lies between the epoch's first attempt minus MARKER_CLOCK_SKEW_MS and now plus that skew. Anything else
+ * is a conflict and is never overwritten.
  *
  * marker-dry runs steps 1 and 2 read-only (no attempt, no PUT), plus the sweeper and the bound evidence, and records
  * per org its readiness and its epoch's hash. Its `wave_id` (org-wave.ts waveId over the commit, scope, bound runs and
@@ -59,8 +69,8 @@ import {
   BacklogAuthorityRefusal,
   readServingSpec,
   sweeperExpectation,
+  orgFenceAuthorityDoc,
   toReceiptShape,
-  writeOrgMarker,
 } from "./backlog-authority.ts";
 import { BACKLOG_OPS_SWEEPER_PASS_MAX_AGE_MS } from "./backlog-sweeper-limits.ts";
 import { EVIDENCE_SCHEMA, conforms, type ReceiptSchema } from "./backlog-authority-schema.ts";
@@ -98,6 +108,12 @@ export const MARKER_SQL = {
   lockShared: (org: string) => {
     if (!ORG_UUID.test(org)) refuse("marker_org");
     return { text: "SELECT sessions.ingest_org_admission_hold_check($1::text, 'erasure') AS locked", params: [org] };
+  },
+  /** The evidence the epoch's one durable `marker_attempted` event recorded (no row: no attempt yet). */
+  attemptEvidence: (epoch: string) => {
+    if (!UUID.test(epoch)) refuse("marker_org");
+    return { text: `SELECT evidence_sha256 AS attempt_evidence FROM sessions.ingest_org_admission_hold_events
+      WHERE epoch = $1::uuid AND kind = 'marker_attempted'`, params: [epoch] };
   },
   /** How many OTHER epochs of the org ever recorded a marker attempt (an earlier cutover's marker is not ours). */
   otherAttempts: (org: string, epoch: string) => {
@@ -194,11 +210,28 @@ const withTimeout = async <T>(p: Promise<T>, ms: number, code: string): Promise<
   } finally { if (t) clearTimeout(t); }
 };
 
-/** The org's marker: null when absent; `{doc}` (doc null when not JSON) when present. Fixed codes otherwise. */
-export async function readMarkerObject(store: ObjectStore, keyRoot: string, org: string, timeoutMs = MARKER_S3_TIMEOUT_MS): Promise<{ doc: unknown } | null> {
+/** The object metadata key carrying a marker's publication identity. */
+export const MARKER_IDENTITY_META = "marker-publication";
+/** The publication identity: org, hold epoch and the attempt's bound evidence, domain-separated (64 hex). */
+export function markerIdentity(org: string, epoch: string, evidence: string): string {
+  if (!ORG_UUID.test(org) || !UUID.test(epoch) || !HEX64.test(evidence)) refuse("marker_org");
+  return createHash("sha256").update(`marker-publication/v1\norg\n${org}\nepoch\n${epoch}\nevidence\n${evidence}`).digest("hex");
+}
+export interface MarkerObject { doc: unknown; identity: string | null }
+const identityOf = (meta: Record<string, string> | undefined) => {
+  const v = meta?.[MARKER_IDENTITY_META];
+  return typeof v === "string" && HEX64.test(v) ? v : null;
+};
+
+/** The org's marker: null when absent; its doc (null when not JSON) and stored identity when present. Fixed codes otherwise. */
+export async function readMarkerObject(store: ObjectStore, keyRoot: string, org: string, timeoutMs = MARKER_S3_TIMEOUT_MS): Promise<MarkerObject | null> {
   try {
-    const bytes = await withTimeout((async () => readAll((await store.getObject(objectKey(orgFenceAuthorityKey(keyRoot, org)))).body))(), timeoutMs, "marker_read_unknown");
-    try { return { doc: JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(bytes)) }; } catch { return { doc: null }; }
+    const got = await withTimeout((async () => {
+      const o = await store.getObject(objectKey(orgFenceAuthorityKey(keyRoot, org)));
+      return { bytes: await readAll(o.body), identity: identityOf(o.meta?.metadata) };
+    })(), timeoutMs, "marker_read_unknown");
+    try { return { doc: JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(got.bytes)), identity: got.identity }; }
+    catch { return { doc: null, identity: got.identity }; }
   } catch (error) {
     if (error instanceof MarkerRefusal) throw error;
     if (isObjectStoreError(error, "not_found")) return null;
@@ -207,14 +240,51 @@ export async function readMarkerObject(store: ObjectStore, keyRoot: string, org:
 }
 
 /**
- * Whether an existing marker is THIS epoch's to adopt on a retry (header, "Retry"). `hold` must be the live hold at
- * the approved epoch; `otherAttempts` the count of other epochs of the org that recorded an attempt.
+ * One org's marker, CREATE-ONLY, stamped with its publication identity, then read back: the doc and the identity must
+ * be exactly what was written (`marker_readback_mismatch`). An object already at the key (If-None-Match) is
+ * `conflict`, decided by the caller through markerAdoptable. (backlog-authority.ts writeOrgMarker, plus the identity.)
  */
-export function markerAdoptable(doc: unknown, org: string, hold: LiveHold | null, approvedEpoch: string, otherAttempts: number, nowMs: number): boolean {
-  if (!validOrgFenceAuthority(doc) || doc.orgId !== org) return false;
-  if (!hold || hold.epoch !== approvedEpoch || hold.state !== "marker_attempted" || hold.attemptedMs === null) return false;
-  if (!Number.isSafeInteger(otherAttempts) || otherAttempts !== 0) return false;
-  return doc.writtenAtMs >= hold.attemptedMs - MARKER_CLOCK_SKEW_MS && doc.writtenAtMs <= nowMs + MARKER_CLOCK_SKEW_MS;
+export async function writeMarkerObject(store: ObjectStore, keyRoot: string, org: string, nowMs: number, identity: string): Promise<"written" | "conflict"> {
+  if (!ORG_UUID.test(org) || !HEX64.test(identity)) refuse("marker_org");
+  const doc = orgFenceAuthorityDoc(org, nowMs);
+  if (!validOrgFenceAuthority(doc)) refuse("marker_write_failed");
+  try {
+    await store.put(objectKey(orgFenceAuthorityKey(keyRoot, org)), new TextEncoder().encode(JSON.stringify(doc)),
+      { contentType: "application/json", ifNoneMatch: true, metadata: { [MARKER_IDENTITY_META]: identity } });
+  } catch (error) {
+    if (isObjectStoreError(error, "precondition_failed") || isObjectStoreError(error, "already_exists")) return "conflict";
+    return refuse(isAccessDenied(error) ? "marker_access_denied" : "marker_write_failed");
+  }
+  const back = await readMarkerObject(store, keyRoot, org);
+  // Identical bytes already stored are an idempotent success for the store: the identity read back decides.
+  if (!back || !validOrgFenceAuthority(back.doc) || back.doc.orgId !== org || back.doc.writtenAtMs !== nowMs) refuse("marker_readback_mismatch");
+  if (back!.identity !== identity) return "conflict";
+  return "written";
+}
+
+/** What adoption compares an existing marker against (header, "Retry"). */
+export interface AdoptionContext {
+  org: string;
+  /** The live hold, read in the deciding transaction. */
+  hold: LiveHold | null;
+  approvedEpoch: string;
+  /** Count of OTHER epochs of the org that recorded a marker attempt. */
+  otherAttempts: number;
+  /** The evidence the live epoch's durable `marker_attempted` event recorded (null: none). */
+  durableEvidence: string | null;
+  /** This run's bound evidence (the final catch-up receipt's sha256). */
+  boundEvidence: string;
+  nowMs: number;
+}
+/** Whether an existing marker is THIS publication's to adopt (header, "Retry"). */
+export function markerAdoptable(m: MarkerObject, c: AdoptionContext): boolean {
+  const { doc } = m;
+  if (!validOrgFenceAuthority(doc) || doc.orgId !== c.org) return false;
+  if (!c.hold || c.hold.epoch !== c.approvedEpoch || c.hold.state !== "marker_attempted" || c.hold.attemptedMs === null) return false;
+  if (!Number.isSafeInteger(c.otherAttempts) || c.otherAttempts !== 0) return false;
+  if (c.durableEvidence === null || !HEX64.test(c.durableEvidence) || c.durableEvidence !== c.boundEvidence) return false;
+  if (m.identity === null || m.identity !== markerIdentity(c.org, c.hold.epoch, c.durableEvidence)) return false;
+  return doc.writtenAtMs >= c.hold.attemptedMs - MARKER_CLOCK_SKEW_MS && doc.writtenAtMs <= c.nowMs + MARKER_CLOCK_SKEW_MS;
 }
 
 // ---- the run --------------------------------------------------------------------------------------------------------
@@ -236,6 +306,7 @@ export interface MarkerOrgResult {
 /** Every per-org refusal code (closed: the receipt schema allows only these). */
 export const MARKER_ORG_REFUSALS = [
   "hold_absent", "hold_released", "hold_not_sealed", "hold_epoch_changed", "hold_state_invalid", "hold_unreadable", "hold_epoch_stale",
+  "hold_attempt_evidence_mismatch",
   "hold_attempt_failed", "hold_released_before_put", "hold_lock_failed", "marker_guard_lost", "marker_hold_lapsed",
   "evidence_not_corroborated", "evidence_org_missing", "attestation_missing", "marker_handoff_lapsed", "marker_conflict", "marker_present",
   "marker_org", "marker_access_denied", "marker_unreadable", "marker_write_failed", "marker_readback_mismatch", "marker_put_unknown", "marker_read_unknown",
@@ -356,19 +427,28 @@ export async function markerRun(d: MarkerRunDeps) {
       if (!MARKER_ATTESTATION_FIELDS.every((k) => r.attest[k])) return stop("attestation_missing");
 
       // 2. an existing marker must be this epoch's (only possible on a retry).
-      const otherAttempts = async (q: (t: string, p: readonly unknown[]) => Promise<Rows>) => {
+      type Q = (t: string, p: readonly unknown[]) => Promise<Rows>;
+      const otherAttempts = async (q: Q) => {
         const s = MARKER_SQL.otherAttempts(org, live.hold!.epoch);
         const n = (await q(s.text, s.params))[0]?.n;
         return typeof n === "number" && Number.isSafeInteger(n) ? n : -1;
       };
-      let existing: { doc: unknown } | null;
+      const durableEvidence = async (q: Q) => {
+        const s = MARKER_SQL.attemptEvidence(live.hold!.epoch);
+        const rows = await q(s.text, s.params);
+        const v = rows.length === 1 ? rows[0]!.attempt_evidence : null;
+        return typeof v === "string" && HEX64.test(v) ? v : null;
+      };
+      const adoptable = async (m: MarkerObject, hold: LiveHold, q: Q) => markerAdoptable(m, { org, hold, approvedEpoch: live.hold!.epoch,
+        otherAttempts: await otherAttempts(q), durableEvidence: await durableEvidence(q), boundEvidence: d.bound.catchupEvidence, nowMs: d.now() });
+      let existing: MarkerObject | null;
       try { existing = await readMarkerObject(d.store, d.keyRoot, org, s3Timeout); }
       catch (error) { return stop(error instanceof MarkerRefusal ? error.code : "marker_unreadable"); }
       r.marker = existing ? "present" : "absent";
       if (existing) {
-        let others: number;
-        try { others = await otherAttempts(sql.read); } catch { return stop("hold_unreadable"); }
-        if (!markerAdoptable(existing.doc, org, live.hold, live.hold.epoch, others, d.now())) return stop(execute ? "marker_conflict" : "marker_present");
+        let ok: boolean;
+        try { ok = await adoptable(existing, live.hold, sql.read); } catch { return stop("hold_unreadable"); }
+        if (!ok) return stop(execute ? "marker_conflict" : "marker_present");
       }
       if (!execute) { r.verdict = "ready"; return r; }
 
@@ -396,23 +476,26 @@ export async function markerRun(d: MarkerRunDeps) {
           if (!now.hold) throw new MarkerRefusal(now.released ? "hold_released_before_put" : "hold_absent");
           if (now.hold.epoch !== epoch) throw new MarkerRefusal("hold_epoch_changed");
           if (now.hold.state !== "marker_attempted") throw new MarkerRefusal("hold_state_invalid");
+          // The durable attempt must be THIS publication's (the attempt function returns early on a repeat without
+          // checking evidence): the identity is derived from what SQL recorded, never from this run alone.
+          const recorded = await durableEvidence(inTx);
+          if (recorded !== d.bound.catchupEvidence) throw new MarkerRefusal("hold_attempt_evidence_mismatch");
+          const identity = markerIdentity(org, epoch, recorded);
           const found = await readMarkerObject(d.store, d.keyRoot, org, s3Timeout);
           if (found) {
-            const others = await otherAttempts(inTx);
-            if (!markerAdoptable(found.doc, org, now.hold, epoch, others, d.now())) { r.marker = "conflict"; throw new MarkerRefusal("marker_conflict"); }
+            if (!(await adoptable(found, now.hold, inTx))) { r.marker = "conflict"; throw new MarkerRefusal("marker_conflict"); }
             r.marker = "adopted";
           } else {
             let outcome: "written" | "conflict";
-            try { outcome = await withTimeout(writeOrgMarker(d.store, d.keyRoot, org, d.now()), s3Timeout, "marker_put_unknown"); }
+            try { outcome = await withTimeout(writeMarkerObject(d.store, d.keyRoot, org, d.now(), identity), s3Timeout, "marker_put_unknown"); }
             catch (error) {
-              if (error instanceof MarkerRefusal) { r.marker = "unknown"; throw error; }
+              if (error instanceof MarkerRefusal) { if (error.code === "marker_put_unknown") r.marker = "unknown"; throw error; }
               throw new MarkerRefusal(error instanceof BacklogAuthorityRefusal ? error.code : "marker_write_failed");
             }
             if (outcome === "conflict") {
               // Another writer between our GET and PUT: adopt only if it is this epoch's.
               const again = await readMarkerObject(d.store, d.keyRoot, org, s3Timeout);
-              const others = await otherAttempts(inTx);
-              if (!again || !markerAdoptable(again.doc, org, now.hold, epoch, others, d.now())) { r.marker = "conflict"; throw new MarkerRefusal("marker_conflict"); }
+              if (!again || !(await adoptable(again, now.hold, inTx))) { r.marker = "conflict"; throw new MarkerRefusal("marker_conflict"); }
               r.marker = "adopted";
             } else r.marker = "written";
           }
