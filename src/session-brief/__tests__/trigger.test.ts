@@ -50,7 +50,7 @@ class Sim {
    * sweepSeconds: SESSION_BRIEF_SWEEP_SECONDS, how often the tick also sweeps: it re-arms committed revisions that no
    * brief covers and that have no wakeup (a lost arm) and, hosted, enqueues a sweep hint for them; 0 = off.
    */
-  constructor(public opts: { sweepSeconds?: number; tickSeconds?: number } = {}) {}
+  constructor(public opts: { sweepSeconds?: number; tickSeconds?: number; hosted?: boolean } = {}) {}
 
   brief(h: string): Brief { return this.briefs.get(h) ?? { revision: -1, ready: false }; }
 
@@ -137,8 +137,10 @@ class Sim {
               this.sweptAt.push(this.now);
             }
         }
-        // Due-time gating: the tick claims only rows that are claimable now.
-        for (const [harness, row] of [...this.rows]) if (!row.state.leased && this.claimable(harness, row.state) <= this.now) this.claim(harness);
+        // Due-time gating: the tick claims only rows that are claimable now. Hosted [Pipeline]: the minute tick does a
+        // full lost-hint scan only on the sweep cadence (hints drive claims in between); self-host polls every tick.
+        if (!this.opts.hosted || this.lastSweep === this.now)
+          for (const [harness, row] of [...this.rows]) if (!row.state.leased && this.claimable(harness, row.state) <= this.now) this.claim(harness);
       }
     }
   }
@@ -297,6 +299,30 @@ describe("session-brief trigger: offline fixtures", () => {
     expect(briefMiss(bCommittedAt, sim.runs[1]!.claimedAt)).toBe(true);
   });
 
+  test("during a backoff: a replay changes nothing; a genuinely new committed append re-arms and its hint applies", () => {
+    const sim = new Sim();
+    const A = sim.commit("claude", 1, { lose: true });
+    sim.failRuns = 1;
+    sim.now = sim.rows.get("claude")!.state.dueAt;
+    sim.claim("claude"); // the first brief fails: rescheduled 60 s out, in backoff
+    const backedOff = { ...sim.rows.get("claude")!.state };
+    expect(backedOff.backoff).toBe(true);
+    sim.now += 5_000;
+    sim.consume(A); // replay: no-op, the retry floor stands
+    expect(sim.rows.get("claude")!.state).toEqual(backedOff);
+    expect(sim.runs).toHaveLength(1);
+    sim.now += 5_000;
+    const B = sim.commit("claude", 2, { lose: true }); // a NEW committed append: armWakeup resets attempts
+    const rearmed = sim.rows.get("claude")!.state;
+    expect(rearmed.backoff).toBeUndefined();
+    expect(rearmed.generation).toBe(backedOff.generation + 1);
+    expect(rearmed.dueAt).toBeLessThanOrEqual(backedOff.dueAt); // the first-brief bound, never later than promised
+    sim.consume(B); // its hint applies normally now
+    expect(sim.runs).toHaveLength(rearmed.dueAt <= sim.now ? 2 : 1);
+    sim.advance(60_000);
+    expect(sim.runs).toHaveLength(2);
+  });
+
   test.todo("KNOWN GAP: B committed during A's lease keeps B's original uncovered time through finish and retry (needs trailing_since: a migration in a separate Pipeline registry slot)", () => {});
 
   test("an equal revision with different content (another machine, same harness): suppression never removes eligibility", () => {
@@ -325,14 +351,20 @@ describe("session-brief trigger: offline fixtures", () => {
     claudeRow.state = { ...claudeRow.state, backoff: true }; // claude is in a retry backoff
     const claudeBefore = { ...claudeRow.state };
     sim.now += 5_000;
+    const codexBefore = { ...sim.rows.get("codex")!.state };
     sim.consume(v1(hint("end", 5, T0, "codex"))); // a legacy v1 hint at revision 5: wakes both harnesses' rows
     // claude: revision 5 is covered, and it is in backoff: unchanged, not claimed.
     expect(sim.rows.get("claude")!.state).toEqual(claudeBefore);
-    // codex: its own revision 5 is uncovered, no throttle pending: claimed now.
-    expect(sim.runs.map((r) => r.harness)).toEqual(["codex"]);
+    // codex: uncovered, but an ambiguous v1 end ends nothing: woken like an append (its own due, nothing earlier).
+    expect(sim.rows.get("codex")!.state.dueAt).toBe(codexBefore.dueAt);
+    expect(sim.runs).toHaveLength(0);
     // A v1 hint naming claude's new revision 6 still respects claude's backoff (its retry floor).
     sim.consume(v1(hint("end", 6, T0, "claude")));
-    expect(sim.runs.map((r) => r.harness)).toEqual(["codex"]);
+    expect(sim.rows.get("claude")!.state).toEqual(claudeBefore);
+    // Each harness's own eligibility decides: codex is claimed at its own due time (consumed copies hand off).
+    sim.advance(15 * 60_000);
+    expect(sim.runs.map((r) => r.harness)).toContain("codex");
+    expect(sim.runs.find((r) => r.harness === "codex")!.claimableAt).toBe(codexBefore.dueAt);
   });
 
   test("a retry after a failed run: the row stays, a replayed hint neither delays nor duplicates it", () => {
@@ -352,14 +384,16 @@ describe("session-brief trigger: offline fixtures", () => {
   });
 
   test("sweep fixture 1, hosted: explicit 300 s with one-minute ticks and due-time gating", () => {
-    const sim = new Sim({ tickSeconds: 60, sweepSeconds: briefTriggerConfig({ SESSION_BRIEF_SWEEP_SECONDS: "300" }).sweepSeconds });
+    const sim = new Sim({ hosted: true, tickSeconds: 60, sweepSeconds: briefTriggerConfig({ SESSION_BRIEF_SWEEP_SECONDS: "300" }).sweepSeconds });
     sim.briefs.set("claude", { revision: 0, ready: true, lastAttempt: T0 - 600_000 });
-    sim.commit("claude", 1, { lose: true }); // armed, the hint lost: the one-minute tick claims it once due (gated)
+    sim.commit("claude", 1, { lose: true }); // armed, the hint lost: only the 300 s full lost-hint scan finds it
     sim.advance(9 * 60_000);
-    expect(sim.runs).toHaveLength(0); // not due yet: the tick never claims early
-    sim.advance(3 * 60_000);
+    expect(sim.runs).toHaveLength(0); // not due yet: no tick claims early
+    sim.advance(6 * 60_000);
     expect(sim.runs).toHaveLength(1);
-    expect(sim.runs[0]!.claimedAt - sim.runs[0]!.claimableAt).toBeLessThanOrEqual(60_000); // diagnostic: due to claim
+    // The actual claim time, recorded: at the first full scan on or after the due time (scans at T0+300 s, +600 s).
+    expect(sim.runs[0]!.claimedAt).toBe(T0 + 600_000);
+    expect(sim.runs[0]!.claimedAt - sim.runs[0]!.claimableAt).toBeLessThanOrEqual(300_000); // diagnostic: due to claim
     expect(briefMiss(T0, sim.runs[0]!.claimedAt)).toBe(true); // scored from the upload: a 600 s refresh window misses
     // A lost ARM (no wakeup row at all) is recovered only by the sweep, at its 300 s cadence.
     sim.now += 1;
@@ -392,6 +426,22 @@ describe("session-brief trigger: offline fixtures", () => {
     expect(sim.sweptAt).toHaveLength(0);
   });
 
+  test("two harnesses share a session, E2 (a confirmed end at revision 2) in only one: only that one is ended", () => {
+    const sim = new Sim();
+    for (const h of ["claude", "codex"]) sim.briefs.set(h, { revision: 1, ready: true, lastAttempt: T0 - 600_000 });
+    sim.commit("claude", 2, { lose: true });
+    sim.commit("codex", 2, { lose: true });
+    const codexBefore = { ...sim.rows.get("codex")!.state };
+    sim.now += 10_000;
+    sim.consume(hint("end", 2, T0, "claude")); // E2, v2, claude only: the coalescing wait is removed for claude
+    expect(sim.runs.map((r) => r.harness)).toEqual(["claude"]);
+    expect(sim.rows.get("codex")!.state).toEqual(codexBefore); // codex untouched
+    // A v1 end at revision 2 is ambiguous: it wakes codex like an append (no early 'ended' claim).
+    sim.consume(v1(hint("end", 2, T0, "codex")));
+    expect(sim.runs.map((r) => r.harness)).toEqual(["claude"]);
+    expect(sim.rows.get("codex")!.state.dueAt).toBe(codexBefore.dueAt);
+  });
+
   test("the same session id in two harnesses: v2 wakes only its own; v1 wakes both; coverage is per harness", () => {
     const sim = new Sim();
     for (const h of ["claude", "codex"]) sim.briefs.set(h, { revision: 0, ready: true, lastAttempt: T0 - 600_000 });
@@ -402,13 +452,15 @@ describe("session-brief trigger: offline fixtures", () => {
     expect(sim.runs.map((r) => r.harness)).toEqual(["claude"]);
     expect(sim.rows.has("codex")).toBe(true);
     sim.now += 10_000;
-    sim.consume(v1(hint("end", 1, T0, "codex"))); // v1: every harness of the session (claude is gone, covered)
+    sim.consume(v1(hint("end", 1, T0, "codex"))); // v1: wakes every harness's row, but an ambiguous end ends none
+    expect(sim.runs.map((r) => r.harness)).toEqual(["claude"]);
+    sim.consume(hint("end", 1, T0, "codex")); // the confirmed (v2) end for codex
     expect(sim.runs.map((r) => r.harness)).toEqual(["claude", "codex"]);
     sim.commit("codex", 2, { lose: true });
     sim.now += 10_000;
     sim.consume(v1(hint("end", 1, T0, "claude"))); // a revision-1 hint is covered for codex too
     expect(sim.runs).toHaveLength(2);
-    sim.consume(v1(hint("end", 2, T0, "codex")));
+    sim.consume(hint("end", 2, T0, "codex"));
     expect(sim.runs).toHaveLength(2); // codex's last attempt was 10 s ago: the refresh throttle holds it
     sim.advance(130_000); // the handed-off copy arrives once the throttle releases
     expect(sim.runs.map((r) => r.harness)).toEqual(["claude", "codex", "codex"]);

@@ -17,14 +17,18 @@
  *     brief covers is a no-op. So duplicates, A/B/A, any reordering and redelivery after a lease or a retry converge
  *     on one row state (LEAST and the coverage check commute). trigger_id is for tracing, never for dedupe.
  *
- * Status of each rule: [owner] = proposed by the T130 contract owner (sessions-latency-owner), [builder] = proposed
- * by this slice; NONE is a Pipeline decision yet (Pipeline owns the contract decisions and the hook point).
+ * Status of each rule: [Pipeline] = decided by Pipeline (contract owner of record, 378d6d3d3ddf via Skip);
+ * [owner] = proposed by the T130 owner (sessions-latency-owner); [builder] = proposed by this slice. Still open with
+ * Pipeline: the producer hook point and the backoff floor.
  *
  * Due and claim eligibility (N = SESSION_BRIEF_MAX_DELAY_SECONDS 8, I = IDLE 600, W = MAX_WAIT 3600, T = THROTTLE):
  *   first brief (no ready brief): due = pending_since + N; an `end` makes it due now if earlier; never throttled. [owner]
  *   refresh, evidence or `append`: due = LEAST(evidence_at + I, pending_since + W). [existing armWakeup]
- *   refresh, `end`: due = now (the idle wait is skipped). [owner]
- *   claim (refresh): now >= due AND now >= last_attempt + T: the throttle takes precedence over W. [owner]
+ *   refresh, `end`: due = now: a confirmed end removes the coalescing wait. [Pipeline]
+ *   claim (refresh): now >= due AND now >= last_attempt + T: the refresh throttle applies (beats W). [Pipeline]
+ *   v1 (no harness) [Pipeline]: wakes every candidate row by full key, each with its OWN debounce, throttle and
+ *     retry floor; nothing (identity, time) is copied across harnesses, and an ambiguous v1 `end` marks no harness
+ *     ended (it wakes like an append).
  *   a row in retry backoff or park is never lowered by a hint. [builder]
  *   coverage suppression (hint.revision <= the stored brief's brief_revision for the same harness row) only ever
  *     skips an EARLY wake: the armed row keeps its own due time, so uncovered work stays eligible even when the
@@ -64,7 +68,7 @@ interface HintBase {
 }
 /** Contract v1: no harness (the consumer wakes every harness's wakeup for the session). */
 export interface BriefWakeHintV1 extends HintBase { v: 1 }
-/** v2 [proposal]: the exact durable scope. */
+/** v2 [Pipeline]: the exact durable scope. Rollout: deploy a consumer that accepts v1 and v2 BEFORE emitting v2. */
 export interface BriefWakeHintV2 extends HintBase { v: 2; harness: string }
 export type BriefWakeHint = BriefWakeHintV1 | BriefWakeHintV2;
 
@@ -185,11 +189,13 @@ export function planHint(prev: BriefWakeState | null, hint: BriefWakeHint, ctx: 
   if (prev.backoff) return null; // a retry backoff or park stands until it ends or new evidence re-arms
   if (ctx.coveredRevision !== undefined && hint.revision <= ctx.coveredRevision) return null; // already briefed
   if (hint.kind === "sweep") return null;
+  // Only a v2 end is a confirmed end of THIS harness's session; a v1 end is ambiguous and wakes like an append.
+  const ended = hint.kind === "end" && hint.v === 2;
   const t = ctx.timing;
   const firstBound = prev.pendingSince + secs(t.maxDelaySeconds);
   const eligible = !ctx.hasBrief
-    ? (hint.kind === "end" ? Math.min(ctx.nowMs, firstBound) : firstBound)
-    : hint.kind === "end"
+    ? (ended ? Math.min(ctx.nowMs, firstBound) : firstBound)
+    : ended
       ? ctx.nowMs
       : Math.min(prev.evidenceAt + secs(t.idleSeconds), prev.pendingSince + secs(t.maxWaitSeconds));
   return eligible < prev.dueAt ? { ...prev, dueAt: eligible } : null;
