@@ -32,7 +32,7 @@
 import { createHash, randomUUID } from "node:crypto";
 import { parseArgs } from "node:util";
 import { normalizeRepo } from "../features/extract.ts";
-import { utc } from "../features/types.ts";
+import { requireUtc, utc } from "../features/types.ts";
 import { CORPUS_FORMAT, parseForge, sha256Hex } from "../bench/corpus.ts";
 import { PrivateDir, readPrivateFile } from "../out-path.ts";
 import { errorCode, printable, UsageError } from "../errors.ts";
@@ -116,6 +116,23 @@ export function scopedSessions(lines: Record<string, unknown>[], scope: BoundSco
   return { rows, excluded };
 }
 
+/**
+ * Why a collected session is outside the window [since, until), or null when it is inside. The test is the
+ * session's own event times: every evidence pointer of its analysis and every build-evidence event (both from
+ * the canonical events, not the model). The directory's last_activity_at is not used: a re-upload moves it (on
+ * the cloud collection, 387 of 661 sessions listed active Nov 21-22 held only September and October events).
+ */
+export function outsideWindow(row: { snapshot?: unknown; artifacts?: unknown }, since: string, until: string): "no_event_times" | "events_outside_window" | null {
+  const times: string[] = [];
+  const refs = (row.snapshot as { evidence?: { references?: Array<{ at?: unknown }> } } | undefined)?.evidence?.references ?? [];
+  for (const r of refs) { const t = typeof r.at === "string" ? utc(r.at) : null; if (t) times.push(t); }
+  for (const list of Object.values((row.artifacts ?? {}) as Record<string, unknown>))
+    if (Array.isArray(list)) for (const e of list) { const at = (e as { at?: unknown })?.at; const t = typeof at === "string" ? utc(at) : null; if (t) times.push(t); }
+  if (!times.length) return "no_event_times";
+  const from = requireUtc(since, "since"), to = requireUtc(until, "until");
+  return times.some((t) => t >= from && t < to) ? null : "events_outside_window";
+}
+
 /** Every coding session the directory lists for the tenant inside the scope's window: key -> lastActivityAt. */
 async function directoryWindow(source: { run: Parameters<typeof directoryRows>[0]; cfg: Parameters<typeof directoryRows>[1] }, scope: CollectionScope): Promise<Map<string, string>> {
   const out = new Map<string, string>();
@@ -180,6 +197,7 @@ export async function main(argv: string[]): Promise<number> {
     const sessionsDir = out.child("sessions"), artifactsDir = out.child("artifacts");
     // A directory collected before opaque names would hold the same session twice: refuse it.
     for (const d of [sessionsDir, artifactsDir]) if (d.list(".json").some((f) => !/^[0-9a-f]{32}\.json$/u.test(f))) throw new UsageError("seal: files without opaque names found: migrate or recollect this directory");
+    const excluded: Record<string, number> = {};
     const lines = sessionsDir.list(".json").map((f) => {
       const { scope: rowScope, ...row } = JSON.parse(sessionsDir.read(f));
       // Row provenance: only rows this scope's commands wrote, under the name derived from their own key.
@@ -192,8 +210,13 @@ export async function main(argv: string[]): Promise<number> {
       }
       const parents = parentsBy.get(`${row.source}\u0000${row.sessionId}`);
       if (parents?.length) row.context = { ...row.context, parentSessionIds: parents };
-      return JSON.stringify(row);
-    });
+      return row;
+    }).filter((row) => {
+      // The window is the session's own events, never the directory's last-activity time (which a re-upload moves).
+      const why = outsideWindow(row, scope.since, scope.until);
+      if (why) excluded[why] = (excluded[why] ?? 0) + 1;
+      return why === null;
+    }).map((row) => JSON.stringify(row));
     const corpus = out.child("corpus");
     const sessions = `${lines.join("\n")}\n`;
     const forge = JSON.stringify(parseForge(JSON.parse(readPrivateFile(values.forge))));
@@ -204,7 +227,7 @@ export async function main(argv: string[]): Promise<number> {
       createdAt: new Date().toISOString(), deleteBy: scope.deleteBy,
       files: { "sessions.jsonl": sha256Hex(sessions), "forge.json": sha256Hex(forge) },
     }, null, 2));
-    console.log(JSON.stringify({ corpus: corpus.path, sessions: lines.length }));
+    console.log(JSON.stringify({ corpus: corpus.path, sessions: lines.length, excluded }));
     return 0;
   }
 
