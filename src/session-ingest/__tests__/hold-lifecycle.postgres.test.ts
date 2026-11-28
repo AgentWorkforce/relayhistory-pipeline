@@ -9,6 +9,8 @@
  *         event, the lease row unchanged); install first makes the lease capture wait and get RH042 with zero capture
  *         rows; a preview capture is never fenced and writes nothing. Pre-062390 (the slot rolled back by its real down,
  *         which refuses captures until readiness is restored) the lease capture is NOT fenced (characterization).
+ *         Case 3's install-execute is bound to an approval the real hold-dry issued (read-only session, checkHoldDryReceipt)
+ *         before the capture or install starts; the fan-out seam is the only synthetic input.
  * The tool's own logic (holdRun) runs as the waiter; its per-org transaction is a SAVEPOINT inside the harness's
  * transaction, so a refusal rolls its statements back exactly as the tool's own transaction would.
  */
@@ -16,7 +18,8 @@ import { afterEach, describe, expect, setDefaultTimeout, test } from "bun:test";
 import pg from "pg";
 import { fixturePgUrl, migrateAsOwner, rollBackLaterSlots, scratchDatabase, type ScratchDatabase } from "./hold-harness/pg.ts";
 import { expectBlocks, expectNotBlocked, openPair, type Conn, type Pair } from "./hold-harness/two-conn.ts";
-import { holdRun, type HoldSqlSession } from "../hold-lifecycle.ts";
+import { checkHoldDryReceipt, holdRun, type HoldSqlSession } from "../hold-lifecycle.ts";
+import { pgHoldSession } from "../../../scripts/backlog-hold.ts";
 import { epochHash } from "../erasure-window.ts";
 import { evidenceHash } from "../authority-evidence.ts";
 
@@ -55,8 +58,26 @@ const harnessSession = (c: Conn): HoldSqlSession => {
 const RC = "BEGIN ISOLATION LEVEL READ COMMITTED";
 const status = async (o: pg.Client) => (await o.query("SELECT sessions.ingest_org_admission_hold_status($1) s", [ORG])).rows[0].s;
 // SYNTHETIC fan-out proof (production has none, and every install refuses before _install without it).
-const installVia = (c: Conn) => holdRun({ step: "install", orgs: [ORG], sha: SHA, dryRun: DRY, approved: [{ orgHash: evidenceHash("org", ORG), epochHash: null }],
+const installVia = (c: Conn) => installBound([{ orgHash: evidenceHash("org", ORG), epochHash: null }])(c);
+type Approved = { orgHash: string; epochHash: string | null }[];
+/** install-execute bound to an approval (case 3: one the real dry issued). */
+const installBound = (approved: Approved) => (c: Conn) => holdRun({ step: "install", orgs: [ORG], sha: SHA, dryRun: DRY, approved,
   withSession: (fn) => fn(harnessSession(c)), now: () => Date.now(), concurrency: 1, fanoutProof: async () => true });
+/**
+ * The real hold-dry, on its own read-only owner session through the tool's pgHoldSession (as backlog-hold.ts runs it),
+ * then the execute's binding of that receipt (checkHoldDryReceipt). Only the fan-out seam is synthetic.
+ */
+const dryApproval = async (db: ScratchDatabase): Promise<Approved> => {
+  const c = new pg.Client({ connectionString: db.ownerUrl, options: "-c default_transaction_read_only=on" }); await c.connect();
+  try {
+    const summary = await holdRun({ step: "dry", orgs: [ORG], sha: SHA, withSession: (fn) => fn(pgHoldSession(c)), now: () => Date.now(),
+      concurrency: 1, fanoutProof: async () => true });
+    expect(summary.per_org[0]).toMatchObject({ verdict: "ready", hold: "absent", seed_captures: 0, fanout: "proven" });
+    const approved = checkHoldDryReceipt(JSON.stringify({ summary }), [ORG], "install");
+    expect(approved).toEqual([{ orgHash: evidenceHash("org", ORG), epochHash: null }]);
+    return approved;
+  } finally { await c.end(); }
+};
 /** A canonical commit in flight: the admission entry check (shared key), then a committed canonical batch row. */
 const canonicalCommit = async (c: Conn) => {
   await c.query("SELECT sessions.ingest_org_admission_hold_check($1,'admission')", [ORG]);
@@ -139,8 +160,9 @@ describe.skipIf(!url)("hold lifecycle two-connection orderings (real PostgreSQL)
   test("3a. post-062390, capture first: the install waits on the in-flight lease capture, then refuses the committed lease whole", async () => {
     const db = await database();
     const { o, generation, seeders, owners } = await seeding(db);
+    const approved = await dryApproval(db); // the dry approves BEFORE the capture or install starts
     const r = await expectBlocks(both(seeders, owners), { holder: seeders.a, waiter: owners.a,
-      hold: { op: capture(generation, "lease"), begin: SEEDER_TX }, wait: { op: installVia, begin: RC } });
+      hold: { op: capture(generation, "lease"), begin: SEEDER_TX }, wait: { op: installBound(approved), begin: RC } });
     expect(r.receipt.waiting[0]).toMatchObject({ locktype: "advisory" });
     expect(r.holderEnded.ok).toBe(true);
     expect(r.waited.ok).toBe(true);
@@ -159,8 +181,9 @@ describe.skipIf(!url)("hold lifecycle two-connection orderings (real PostgreSQL)
   test("3b. post-062390, install first: the lease capture waits on the in-flight install, then gets RH042 with zero lease writes", async () => {
     const db = await database();
     const { o, generation, seeders, owners } = await seeding(db);
+    const approved = await dryApproval(db); // the dry approves BEFORE the capture or install starts
     const r = await expectBlocks(both(owners, seeders), { holder: owners.a, waiter: seeders.a,
-      hold: { op: installVia, begin: RC }, wait: { op: capture(generation, "lease"), begin: SEEDER_TX } });
+      hold: { op: installBound(approved), begin: RC }, wait: { op: capture(generation, "lease"), begin: SEEDER_TX } });
     expect(r.receipt.waiting[0]).toMatchObject({ locktype: "advisory" });
     expect((r.held as any).per_org[0].verdict).toBe("installed");
     expect(r.waited).toMatchObject({ ok: false, error: { code: "RH042" } });
@@ -171,8 +194,9 @@ describe.skipIf(!url)("hold lifecycle two-connection orderings (real PostgreSQL)
   test("3c. post-062390, preview stays metadata-only: never fenced by an install in flight, and writes no capture", async () => {
     const db = await database();
     const { o, generation, seeders, owners } = await seeding(db);
+    const approved = await dryApproval(db); // the dry approves BEFORE the capture or install starts
     const r = await expectNotBlocked(both(owners, seeders), { holder: owners.a, waiter: seeders.a,
-      hold: { op: installVia, begin: RC }, wait: { op: capture(generation, "preview"), begin: SEEDER_TX } });
+      hold: { op: installBound(approved), begin: RC }, wait: { op: capture(generation, "preview"), begin: SEEDER_TX } });
     expect((r.held as any).per_org[0].verdict).toBe("installed");
     expect(r.waited.ok).toBe(true);
     expect(await captures(o)).toBe(0);
@@ -191,8 +215,9 @@ describe.skipIf(!url)("hold lifecycle two-connection orderings (real PostgreSQL)
     // exercise the pre-062390 body itself (no other row or function is touched).
     const su = new pg.Client({ connectionString: db.fixtureUrl }); await su.connect(); cleanups.push(() => su.end());
     expect((await su.query("UPDATE sessions.__96bulls_role_validation SET status='pass' WHERE name='session_directory_search_worker' AND generation=$1", [generation])).rowCount).toBe(1);
+    const approved = await dryApproval(db);
     const r = await expectNotBlocked(both(owners, seeders), { holder: owners.a, waiter: seeders.a,
-      hold: { op: installVia, begin: RC }, wait: { op: capture(generation, "lease"), begin: SEEDER_TX } });
+      hold: { op: installBound(approved), begin: RC }, wait: { op: capture(generation, "lease"), begin: SEEDER_TX } });
     expect((r.held as any).per_org[0].verdict).toBe("installed");
     expect(r.waited.ok).toBe(true);
     expect(await captures(o)).toBe(1);
