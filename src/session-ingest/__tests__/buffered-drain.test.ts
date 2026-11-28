@@ -1574,16 +1574,38 @@ describe("buffered drain materialization (FULL-seeded index)", () => {
     const lines = await canonical(store);
     expect(lines.get("sess-1")).toEqual(["k1@1"]);
     expect(lines.has("sess-2")).toBe(false);
+    const lines2 = await canonical(store);
+    expect(lines2.has("sess-2")).toBe(false);
+    // The unacknowledged stage has no sidecar: no exported verdict, refused by the proof (never assumed unacknowledged).
     const proof = await verify(store);
-    expect(proof.failures).toEqual([]);
-    expect(proof).toMatchObject({ ok: true, exact: 1, excluded_absent: 4 });
+    expect(proof.failures.map((f) => f.kind)).toEqual(["no_verdict"]);
+    expect(proof).toMatchObject({ ok: false, exact: 1, excluded_absent: 3 });
     // Resurrection: a rerun after a lost marker writes none of them.
     await store.delete(objectKey(keep + DRAINED_SUFFIX));
     const again = await run(store);
     expect(again.lines).toMatchObject({ written: 0, materialized: 0 });
     expect((await canonical(store)).get("sess-1")).toEqual(["k1@1"]);
     expect((await canonical(store)).has("sess-2")).toBe(false);
+    expect(await verify(store)).toMatchObject({ ok: false, exact: 1, counts: { no_verdict: 1 } });
+  });
+
+  test("no exported verdict: an absent sidecar, and a stage that arrives after the export completed, are refused", async () => {
+    const store = await scratch();
+    await fullSlots(store, [{ id: "a1", rev: 1 }]);
+    await stage(store, [group("claude", "sess-1", [{ id: "a1", rev: 1 }])]);
+    await run(store);
     expect(await verify(store)).toMatchObject({ ok: true, exact: 1 });
+    // A later admission's SQL acceptance of the late stage (the FULL catch-up indexes its slot).
+    await fullSlots(store, [{ id: "late", rev: 1 }]);
+    // A stage staged after the export's completion object: the drain never writes it (stage_unacknowledged), and the
+    // proof cannot tell "SQL refused it" from "the export never saw it", so it refuses rather than excluding it.
+    await stage(store, [group("claude", "sess-1", [{ id: "late", rev: 1 }])], { accepted: false });
+    const drained = await run(store);
+    expect(drained.objects.stage_unacknowledged).toBe(1);
+    expect((await canonical(store)).get("sess-1")).toEqual(["a1@1"]);
+    const proof = await verify(store);
+    expect(proof.ok).toBe(false);
+    expect(proof.counts).toMatchObject({ no_verdict: 1, unrecoverable: 1 });
   });
 
   test("erase: a session deleted after an earlier drain of it is reported erased_present until the eraser removes it", async () => {
