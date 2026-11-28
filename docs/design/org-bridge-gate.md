@@ -249,3 +249,47 @@ already_exists, or its ACK was lost, the drain re-reads the stored marker. It co
 marker is its own: outcome `drained` with the same `staged_sha256`. An `erased` marker, or any other outcome or
 digest, means the stage is not drained, and the drain reports the erase's outcome. Its bytes are re-armed, never
 served. B1 and B2 (the binding and the witness) are diagnosable refusals only.
+
+## W2 revision (design and isolated synthetic proof only; no migration, grant or production enable)
+
+Split agreed with sessions-buffered-drain-materialization (cc lander):
+- (1) revocation authority and (2) registration and exclusion of late writers: sessions-s3-admission-fence;
+- (3) granularity: sessions-buffered-drain-materialization;
+- the serving-path inventory: with the T89 reader owner, sessions-partial-canonical.
+Direction: for enrolled orgs during the hold, the authoritative visibility and revocation decision is a SQL
+visibility row per effect, committed under the same lock as the erasure-history capture. Readers check its verdict
+before and after IO, and the S3 drained marker is only a projection of it.
+
+### (3) Granularity: per (stage, session) effect, never per stage (by sessions-buffered-drain-materialization)
+
+- **Unit.** A drained stage's canonical effect is one write per (source, session) group: writeGroups appends exactly
+  one chunk per group to that session's manifest. The visibility unit is the effect e = (stage_sha256, session_key),
+  with session_key = sessionKeyHash(source, session). A direct committed batch is e = (batch digest, session_key).
+  There is one row per effect, keyed (org, effect kind, effect digest, session_key): hashes only.
+- **Provenance.** Before the first canonical byte, the drain records its intent for each group: session_key, the
+  chunk source sha256 (embedded in the chunk key) and the line count. After the write it records the manifest seq
+  and stored_sha256. Every canonical chunk maps to exactly one effect, and the mapping survives a lost ACK. A replay
+  is the same effect (the batch-digest dedupe).
+- **Mixed stage.** Stage X has groups s1 and s2, and s2 is erased.
+  - Erase first: its SQL commit, under the history lock, refuses the row for (X, s2) only. (X, s1) can still publish.
+  - Publish first: the erase revokes (X, s2) in the same commit that records the erasure, and (X, s1) stays served.
+  - No subset fold: a chunk is served only when its effect row is visible, and is never re-folded partially. No
+    chunk spans two sessions, and none of the 15 sources erases below a session, so (stage, session) is sufficient. A
+    record-level source would be a new effect kind, never a sub-chunk mask.
+- **Cross-page generation.** The row carries the fence generation (epoch, resets) it was written under, as
+  recordGeneration stamps. A reset or an epoch bump makes it stale by rule, as entryForgotten treats an index entry,
+  so a later page never revives an older effect.
+- **Crash and lost ACK.** With an intent and possibly bytes but no row, nothing is served. The rerun re-derives the
+  same effect, reads the bytes back (materialization_unverified otherwise) and only then requests the row. If an
+  erase won meanwhile, the request refuses and the orphan chunk is re-armed (marker_foreign).
+- **S3 outage.** The erase's SQL commit, which revokes rows, needs no S3, so erasure is never blocked by the store.
+  Byte deletion follows through the re-arm sweeper once S3 is back, and reads stay excluded meanwhile because the
+  row is revoked.
+- **Synthetic proof (theirs, isolated: fs store and PGlite, then PG17/MinIO with put-gate):**
+  - a mixed stage [s1, s2];
+  - park the s2 manifest PUT after the last check, commit a SQL-only s2 erase, resume;
+  - read both sessions through the canonical reader plus the verdict, before any repair;
+  - the reverse order;
+  - a crash after the intent, after the bytes and after the row;
+  - a lost ACK on each put, then a retry.
+  Driven by an in-memory verdict function until the visibility-row stand-in exists.
