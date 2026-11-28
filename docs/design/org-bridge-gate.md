@@ -452,6 +452,19 @@ a verdict, or an argument that it cannot serve an enrolled org's drain effect:
 - publication-image (:147), which copies base chunks forward;
 - session-pipeline pointer (:258).
 
+**Deltas on the readers above** (sessions-buffered-drain-materialization, static call sites, lander checks at 6d60dc4f):
+- **Bob Costas, the brief input and relayhistory-transform** consume chunk content. Their derived outputs, and the
+  publish and read gates on those outputs, still need tracing.
+- **publication-image `baseCopies`.** A copied hidden chunk must keep its effect identity (chunk key to effect row),
+  or be refused before publication.
+- **Corrections:**
+  - alleyoop/manifests.ts:670 is a HEAD that validates metadata; what that validation authorizes needs tracing.
+  - parked.ts:66 is a DELETE in deleteParkedSession, which is cleanup. Its key isolation from live chunks needs
+    checking.
+  - pointer.ts:258 probes whether manifests exist across dates; the downstream pointer selection needs tracing.
+- **Open:** whether an enrolled org can reach these paths at all, and caller-visible closure. Nobody is assigned to
+  trace them yet.
+
 **Not traced:** raw `getObject` readers over `raw/` outside these helpers, and src/migration (legacy-export,
 neon-s3-sync, neon-s3-erasure). A targeted grep is owed before W2 is ruled.
 
