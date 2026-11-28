@@ -1706,6 +1706,83 @@ describe("buffered drain materialization (FULL-seeded index)", () => {
     expect(lost.counts.baseline_lost).toBe(1);
   });
 
+  /**
+   * The paused-writer race, pinned as main behaves today (design input for W2, docs/design/org-bridge-gate.md): the
+   * manifest PUT of the s2 group is parked after the drain's last check, the erase lands, the PUT resumes. These tests
+   * read the canonical layout immediately after resumption, before any repair, and record what a reader would see.
+   */
+  function parkedStore(store: ObjectStore, match: (key: string) => boolean) {
+    let parked!: () => void;
+    const gate = new Promise<void>((r) => (parked = r));
+    let reached!: () => void;
+    const atGate = new Promise<void>((r) => (reached = r));
+    let armed = true;
+    const s: ObjectStore = new Proxy(store, {
+      get(target, prop) {
+        const v = (target as unknown as Record<PropertyKey, unknown>)[prop];
+        if (prop !== "put") return typeof v === "function" ? (v as (...a: unknown[]) => unknown).bind(target) : v;
+        return async (k: unknown, ...rest: unknown[]) => {
+          if (armed && match(String(k))) { armed = false; reached(); await gate; }
+          return (v as (...a: unknown[]) => unknown).apply(target, [k, ...rest]);
+        };
+      },
+    });
+    return { store: s, atGate, resume: () => parked() };
+  }
+
+  test("race (erase commits while a manifest PUT is parked): today the resumed PUT makes erased bytes readable; re-arm only", async () => {
+    const store = await scratch();
+    await fullSlots(store, [{ id: "k1", rev: 1 }, { id: "e1", rev: 1, session: "sess-2" }]);
+    const key = await stage(store, [group("claude", "sess-1", [{ id: "k1", rev: 1 }]), group("claude", "sess-2", [{ id: "e1", rev: 1 }])]);
+    const p = parkedStore(store, (k) => k.includes("/s=sess-2/") && k.endsWith("/manifest.json"));
+    await refreshVerdicts(store);
+    const running = run(p.store, {}, { refresh: false });
+    await p.atGate;
+    // The erase of sess-2 (S3-visible here: the control mirror's fence deletion) commits while the PUT is parked.
+    await putFence(store, { deletions: [{ originId: ORIGIN, sessions: [["claude", "sess-2"]] }] });
+    p.resume();
+    const summary = await running;
+    // Immediately after resumption, before any repair: the erased session's bytes are readable.
+    const visible = await canonical(store);
+    expect(visible.get("sess-2")).toEqual(["e1@1"]);
+    expect(visible.get("sess-1")).toEqual(["k1@1"]);
+    // The commit's fence re-read caught it: re-armed for the eraser, its index entry dropped, still marked drained.
+    expect(summary.rearmed).toBe(1);
+    expect(await exists(store, rearmKey("claude", "sess-2"))).toBe(true);
+    expect(await exists(store, key + DRAINED_SUFFIX)).toBe(true);
+    // The verifier reports the erased bytes record by record until the eraser removes them.
+    expect(await verify(store)).toMatchObject({ ok: false, counts: { erased_present: 1 }, exact: 1 });
+  });
+
+  test("race with a SQL-only erase: nothing on S3 moves, so today neither the drain nor the S3 verifier can see it (the W2 gap)", async () => {
+    const store = await scratch();
+    await fullSlots(store, [{ id: "e1", rev: 1, session: "sess-2" }]);
+    await stage(store, [group("claude", "sess-2", [{ id: "e1", rev: 1 }])]);
+    const p = parkedStore(store, (k) => k.includes("/s=sess-2/") && k.endsWith("/manifest.json"));
+    await refreshVerdicts(store);
+    const running = run(p.store, {}, { refresh: false });
+    await p.atGate;
+    // A SQL-only erasure source commits here (no fence, journal or object changes): nothing for an S3 reader to observe.
+    p.resume();
+    const summary = await running;
+    expect(summary.objects.drained).toBe(1);
+    expect(summary.rearmed).toBe(0);
+    expect((await canonical(store)).get("sess-2")).toEqual(["e1@1"]);
+    // The S3-only proof passes: it has no input that names the erasure. Exclusion needs the SQL visibility decision.
+    expect((await verify(store)).ok).toBe(true);
+  });
+
+  test("race, reverse order (the erase commits after the resumed PUT): the bytes were published first, then re-armed", async () => {
+    const store = await scratch();
+    await fullSlots(store, [{ id: "e1", rev: 1, session: "sess-2" }]);
+    await stage(store, [group("claude", "sess-2", [{ id: "e1", rev: 1 }])]);
+    const summary = await run(store);
+    expect(summary.objects.drained).toBe(1);
+    await putFence(store, { deletions: [{ originId: ORIGIN, sessions: [["claude", "sess-2"]] }] });
+    expect((await canonical(store)).get("sess-2")).toEqual(["e1@1"]);
+    expect(await verify(store)).toMatchObject({ ok: false, counts: { erased_present: 1 } });
+  });
+
   test("a marker another writer created first (an erase's) is never counted drained: what was written is re-armed", async () => {
     const store = await scratch();
     await fullSlots(store, [{ id: "a1", rev: 1 }]);
