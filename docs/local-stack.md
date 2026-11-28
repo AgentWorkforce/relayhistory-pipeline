@@ -866,14 +866,20 @@ line carries the probe's `would_skip`, `skip_miss`, `skip_check` and its `skip_p
 counted. No pass ran, so a positive probe there is `inconclusive` (with its warning), never a verified no-op; the
 requeued event probes again when its pass does run.
 
-Every probed pass also carries `skip_check`, exactly one of six outcomes, so each can be counted on its own:
+Every probed attempt also carries `skip_check`, exactly one of six outcomes, on exactly one log line: the line that
+ends the attempt. That is `search index reconciled` for a pass that ran, `search index stream deferred, requeued`
+for a deferred scope, and `search index failed` when the pass threw after its probe or the requeue of a deferred
+scope threw (and, for a pre-read pass that probed, found its source changed and was then answered busy or skipped,
+the `busy` or `skipped` line). The warnings never carry `skip_check`, so counting lines by it counts probed
+attempts, once each. On a failed, busy or skipped line no comparison was completed: a positive probe there is
+`inconclusive`, a miss stays `miss`, and a probe without a verdict is `probe_failed`.
 
 | `skip_check` | Meaning | Counts as |
 | --- | --- | --- |
 | `verified_noop` | Called current; the full pass completed (its facts too, when on) and inserted and deleted nothing. | A verified no-op: the only evidence for the skip. |
 | `divergent` | Called current; the pass inserted or deleted index rows. Also warns (`skip_probe_divergence`). | A pass the skip would have got wrong. |
 | `facts_divergent` | Called current; index rows untouched, the facts reconcile inserted or deleted fact rows. Also warns `The facts reconcile wrote rows. Whether their content changed is unknown.` (`skip_probe_facts_written`, with the facts row counts). | The facts reconcile wrote rows. Whether their content changed is unknown. Its own count: not a verified no-op, and not proof the skip would have been wrong. |
-| `inconclusive` | Called current; nothing written, but the pass or its facts did not complete, or the pass was stream-deferred before its read. Also warns `search index skip check inconclusive` (`skip_probe_inconclusive`). | Not verified: neither for nor against. |
+| `inconclusive` | Called current; nothing written, but the pass or its facts did not complete, the pass was stream-deferred before its read, or the attempt failed after the probe (the pass or the deferral's requeue threw). Also warns `search index skip check inconclusive` (`skip_probe_inconclusive`). | Not verified: neither for nor against. |
 | `probe_failed` | The probe's statement failed (`skip_miss: probe_failed`) or its facts read failed or timed out (`facts_unreadable`). | No comparison was made. |
 | `miss` | The proof says not current; `skip_miss` says why. | An ordinary predicate miss: the skip would not have fired. |
 

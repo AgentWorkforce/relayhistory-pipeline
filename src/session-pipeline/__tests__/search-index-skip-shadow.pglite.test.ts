@@ -6,10 +6,10 @@
  */
 import { afterAll, afterEach, beforeAll, describe, expect, test } from "bun:test";
 import type { SqlExecutor } from "@rhc/lib/pipeline/queue.ts";
-import { alreadyCurrent, indexSearchScope, searchIndexPhaseMetrics, skipCheck, skipCurrentProbe, skipProbeFactsError, type SearchIndexDeps, type SearchIndexResult } from "../search-index.ts";
+import { alreadyCurrent, indexSearchScope, searchIndexPhaseMetrics, skipCheck, skipCheckUncompleted, skipCurrentProbe, skipProbeFactsError, type SearchIndexDeps, type SearchIndexResult } from "../search-index.ts";
 import { runSearchJob, searchWorkKey, type SearchWakeMessage } from "../search-jobs.ts";
 import { sanitizeLogField } from "../../shared/log.ts";
-import { SKIP_CHECK_DIVERGENT, SKIP_CHECK_FACTS_WRITTEN, SKIP_CHECK_INCONCLUSIVE, warnSkipCheck } from "../consumer.ts";
+import { SKIP_CHECK_DIVERGENT, SKIP_CHECK_FACTS_WRITTEN, SKIP_CHECK_INCONCLUSIVE, uncompletedProbeVerdict, warnSkipCheck } from "../consumer.ts";
 import { lambdaEnv, runtimeFromSecret, searchIndexSkipCurrentShadowFromEnv } from "../lambda.ts";
 import { SCOPE, exportStreamScope, generate, type ExportedScope } from "../../session-read-api/__tests__/stream-fixture.ts";
 import { closeReplayTemplate, warmReplayTemplate } from "./replay-fixture.ts";
@@ -76,7 +76,10 @@ async function tickLogged(r: Rig, extra: Partial<SearchIndexDeps>) {
   }
   const named = (message: string) =>
     lines.flatMap((l) => l.split("\n")).filter((l) => l.includes(message)).map((l) => JSON.parse(l) as Record<string, unknown>);
-  return { response, named };
+  /** Every JSON log line of the tick that carries a skip_check: one per probed attempt, whatever ended it. */
+  const outcomes = () =>
+    lines.flatMap((l) => l.split("\n")).filter((l) => l.startsWith("{")).map((l) => JSON.parse(l) as Record<string, unknown>).filter((l) => "skip_check" in l);
+  return { response, named, outcomes };
 }
 /** Both answers for the scope's current state, in one read-only transaction. */
 const verdicts = (r: Rig, x: ExportedScope) =>
@@ -391,7 +394,8 @@ describe("skip-current shadow on (hosted ClickHouse binding)", () => {
     const failed = t.named("search index failed");
     expect(failed.length).toBe(1);
     // The probe's own error (not the rollback's), with its time, on the failure line.
-    expect(failed[0]).toMatchObject({ stage: "search-index", error_code: "08006", skip_probe_error: "08006" });
+    expect(failed[0]).toMatchObject({ stage: "search-index", error_code: "08006", skip_probe_error: "08006", would_skip: false, skip_miss: "probe_failed", skip_check: "probe_failed" });
+    expect(t.outcomes().length).toBe(1);
     expect(typeof failed[0]!.skip_probe_ms).toBe("number");
     expect(t.named("search index reconciled")).toEqual([]);
     // Flag off, the same broken probe is never sent: the pass succeeds.
@@ -449,7 +453,7 @@ describe("skip-current shadow on (hosted ClickHouse binding)", () => {
     expect(unverified.line).toMatchObject({ ok: false, inserted: 0, deleted: 0, would_skip: true, skip_check: "inconclusive" });
     expect(unverified.divergent).toEqual([]);
     expect(unverified.inconclusive.length).toBe(1);
-    expect(unverified.inconclusive[0]).toMatchObject({ stage: "search-index", reason: "skip_probe_inconclusive", skip_check: "inconclusive", ok: false, org_id: SCOPE.orgId, session_id: SCOPE.sessionId });
+    expect(unverified.inconclusive[0]).toMatchObject({ stage: "search-index", reason: "skip_probe_inconclusive", ok: false, org_id: SCOPE.orgId, session_id: SCOPE.sessionId });
     expect(unverified.failures).toEqual([]);
 
     // 3. The incomplete pass reset readiness: the next probe is an ordinary miss, then current again.
@@ -465,7 +469,7 @@ describe("skip-current shadow on (hosted ClickHouse binding)", () => {
     expect(divergent.line).toMatchObject({ ok: true, would_skip: true, skip_check: "divergent" });
     expect(Number(divergent.line.inserted)).toBeGreaterThan(0);
     expect(divergent.divergent.length).toBe(1);
-    expect(divergent.divergent[0]).toMatchObject({ reason: "skip_probe_divergence", skip_check: "divergent", inserted: divergent.line.inserted });
+    expect(divergent.divergent[0]).toMatchObject({ reason: "skip_probe_divergence", inserted: divergent.line.inserted });
     expect(divergent.inconclusive).toEqual([]);
 
     // 5. No verdict: the probe failed.
@@ -516,7 +520,7 @@ describe("skip-current shadow on (hosted ClickHouse binding)", () => {
     expect(typeof second.deferred[0]!.skip_probe_ms).toBe("number");
     expect(probeKeys(second.deferred[0]!)).toEqual(["skip_check", "skip_probe_ms", "would_skip"]);
     expect(second.inconclusive.length).toBe(1);
-    expect(second.inconclusive[0]).toMatchObject({ reason: "skip_probe_inconclusive", skip_check: "inconclusive", ok: false });
+    expect(second.inconclusive[0]).toMatchObject({ reason: "skip_probe_inconclusive", ok: false });
 
     // A deferred scope the proof calls not current is an ordinary miss, with its reason.
     await r.db.pg.exec("UPDATE sessions.session_directory SET event_projection_ready = false");
@@ -575,7 +579,7 @@ describe("skip-current shadow on (hosted ClickHouse binding)", () => {
     expect(f.length).toBe(1);
     expect(text(f[0]!)).toContain(SKIP_CHECK_FACTS_WRITTEN);
     expect(text(f[0]!)).not.toContain("missed changes");
-    expect(f[0]).toMatchObject({ stage: "search-index", reason: "skip_probe_facts_written", skip_check: "facts_divergent", inserted: 7, deleted: 2, org_id: SCOPE.orgId, session_id: SCOPE.sessionId });
+    expect(f[0]).toMatchObject({ stage: "search-index", reason: "skip_probe_facts_written", inserted: 7, deleted: 2, org_id: SCOPE.orgId, session_id: SCOPE.sessionId });
 
     // Index-row writes: the index warning, preserved, with the index counts; facts written too does not change it.
     for (const result of [{ ...base, inserted: 3 }, { ...base, inserted: 3, ...facts(7, 2) }]) {
@@ -583,7 +587,7 @@ describe("skip-current shadow on (hosted ClickHouse binding)", () => {
       expect(d.length).toBe(1);
       expect(text(d[0]!)).toContain(SKIP_CHECK_DIVERGENT);
       expect(text(d[0]!)).not.toContain(SKIP_CHECK_FACTS_WRITTEN);
-      expect(d[0]).toMatchObject({ reason: "skip_probe_divergence", skip_check: "divergent", inserted: 3, deleted: 0 });
+      expect(d[0]).toMatchObject({ reason: "skip_probe_divergence", inserted: 3, deleted: 0 });
     }
 
     // Inconclusive, and the outcomes with no warning at all. Facts written is never a verified no-op.
@@ -596,6 +600,113 @@ describe("skip-current shadow on (hosted ClickHouse binding)", () => {
     expect(warned({ ...base, inserted: 3, skipProbe: { current: false, miss: "probe_failed" } })).toEqual([]);
     expect(warned({ ...base, skipProbe: undefined })).toEqual([]);
     expect(skipCheck({ ...base, ...facts(1, 0) })).not.toBe("verified_noop");
+  });
+
+  test("a requeue that throws after a deferral keeps the probe's verdict on the failed line: inconclusive, one outcome; shadow off unchanged", async () => {
+    const r = await indexed(big, LARGE);
+    const FAILED = "search index failed";
+    // The harness's requeue records the key; make that send fail, as a refused SQS send would.
+    const push = r.requeued.push.bind(r.requeued);
+    const refuse = () => { r.requeued.push = (() => { throw Object.assign(new Error("synthetic"), { code: "requeue_refused" }); }) as typeof r.requeued.push; };
+    const restore = () => { r.requeued.push = push; };
+    try {
+      // Shadow on, the probe says current, the scope is deferred, the requeue throws.
+      refuse();
+      const on = await tickLogged(r, { ...SHADOW, ...LARGE, streamSlot: { used: true } });
+      expect(on.response.batchItemFailures.length).toBe(r.messages.length);
+      expect(on.named("search index stream deferred, requeued")).toEqual([]);
+      const failed = on.named(FAILED);
+      expect(failed.length).toBe(1);
+      // The prediction did not vanish: it is on the line that ended the attempt, and it is not a verified no-op.
+      expect(failed[0]).toMatchObject({ stage: "search-index", error_code: "requeue_refused", would_skip: true, skip_check: "inconclusive" });
+      expect(typeof failed[0]!.skip_probe_ms).toBe("number");
+      expect(on.named(SKIP_CHECK_INCONCLUSIVE).length).toBe(1);
+      expect(on.outcomes().length).toBe(1);
+
+      // The same with a scope the proof calls not current: a miss, no warning, still one outcome.
+      await r.db.pg.exec("UPDATE sessions.session_directory SET event_projection_ready = false");
+      const miss = await tickLogged(r, { ...SHADOW, ...LARGE, streamSlot: { used: true } });
+      expect(miss.named(FAILED)[0]).toMatchObject({ error_code: "requeue_refused", would_skip: false, skip_miss: "not_ready", skip_check: "miss" });
+      expect(miss.named(SKIP_CHECK_INCONCLUSIVE)).toEqual([]);
+      expect(miss.outcomes().length).toBe(1);
+
+      // Shadow off: the same throwing requeue fails the same way, with no probe field and no warning.
+      const off = await tickLogged(r, { ...LARGE, streamSlot: { used: true } });
+      expect(off.response.batchItemFailures.length).toBe(r.messages.length);
+      const plain = off.named(FAILED);
+      expect(plain.length).toBe(1);
+      expect(plain[0]).toMatchObject({ error_code: "requeue_refused" });
+      expect(Object.keys(plain[0]!).filter((k) => k.startsWith("skip_") || k === "would_skip")).toEqual([]);
+      expect(off.named(SKIP_CHECK_INCONCLUSIVE)).toEqual([]);
+      expect(off.outcomes()).toEqual([]);
+    } finally {
+      restore();
+    }
+    // With the requeue working again the deferral logs its own line, once.
+    await r.db.pg.exec("UPDATE sessions.session_directory SET event_projection_ready = false");
+    const ok = await tickLogged(r, { ...SHADOW, ...LARGE, streamSlot: { used: true } });
+    expect(ok.response.batchItemFailures).toEqual([]);
+    expect(ok.outcomes().length).toBe(1);
+    expect(ok.named(FAILED)).toEqual([]);
+  }, 120_000);
+
+  test("a pass that throws after its probe keeps the verdict on the failed line; every probed attempt has exactly one outcome", async () => {
+    const r = await indexed();
+    const FAILED = "search index failed";
+    /** The source read, which comes after the probe, fails. */
+    const unreadable = { store: { ...r.store, getObject: (() => Promise.reject(Object.assign(new Error("synthetic"), { code: "source_unavailable" }))) as typeof r.store.getObject } };
+
+    // Called current, then the pass failed: nothing was compared.
+    const on = await tickLogged(r, { ...SHADOW, ...unreadable });
+    expect(on.response.batchItemFailures.length).toBe(r.messages.length);
+    const failed = on.named(FAILED);
+    expect(failed.length).toBe(1);
+    // (The reader reports a failed chunk read as chunk_unavailable.)
+    expect(failed[0]).toMatchObject({ error_code: "chunk_unavailable", would_skip: true, skip_check: "inconclusive" });
+    expect(typeof failed[0]!.skip_probe_ms).toBe("number");
+    expect("skip_probe_error" in failed[0]!).toBe(false);
+    expect(on.named(SKIP_CHECK_INCONCLUSIVE).length).toBe(1);
+    expect(on.named("search index reconciled")).toEqual([]);
+    expect(on.outcomes().length).toBe(1);
+
+    // Not current, then the pass failed: still a miss.
+    await r.db.pg.exec("UPDATE sessions.session_directory SET event_projection_ready = false");
+    const miss = await tickLogged(r, { ...SHADOW, ...unreadable });
+    expect(miss.named(FAILED)[0]).toMatchObject({ would_skip: false, skip_miss: "not_ready", skip_check: "miss" });
+    expect(miss.named(SKIP_CHECK_INCONCLUSIVE)).toEqual([]);
+    expect(miss.outcomes().length).toBe(1);
+
+    // Shadow off: the same failure, no probe field.
+    const off = await tickLogged(r, unreadable);
+    expect(off.named(FAILED).length).toBe(1);
+    expect(off.outcomes()).toEqual([]);
+    expect(Object.keys(off.named(FAILED)[0]!).filter((k) => k.startsWith("skip_") || k === "would_skip")).toEqual([]);
+
+    // One outcome per probed attempt on every other ending too, warnings included in the count.
+    const one = async (extra: Partial<SearchIndexDeps>, expected: string) => {
+      const t = await tickLogged(r, { ...SHADOW, ...extra });
+      expect(t.outcomes().map((l) => l.skip_check)).toEqual([expected]);
+    };
+    await one({}, "miss"); // completes, readiness restored
+    await one({}, "verified_noop");
+    await one({ limits: TINY }, "inconclusive"); // warns, the warning carries no skip_check
+    await one({}, "miss");
+    const victim = r.fake.rows[0]!.event_id;
+    r.fake.rows.splice(0, r.fake.rows.length, ...r.fake.rows.filter((row) => row.event_id !== victim));
+    await one({}, "divergent"); // warns too
+  }, 120_000);
+
+  test("the uncompleted outcome: positive is inconclusive, a miss stays a miss, no verdict is probe_failed, no probe is nothing", () => {
+    expect(skipCheckUncompleted({ current: true })).toBe("inconclusive");
+    expect(skipCheckUncompleted({ current: true, factsRead: true })).toBe("inconclusive");
+    expect(skipCheckUncompleted({ current: false, miss: "sources_changed" })).toBe("miss");
+    expect(skipCheckUncompleted({ current: false, miss: "facts_incomplete", factsRead: true })).toBe("miss");
+    expect(skipCheckUncompleted({ current: false, miss: "probe_failed" })).toBe("probe_failed");
+    expect(skipCheckUncompleted({ current: false, miss: "facts_unreadable", factsRead: true })).toBe("probe_failed");
+    // What the busy, skipped and failed lines add: from the pass's metrics, nothing when no probe ran.
+    expect(uncompletedProbeVerdict(searchIndexPhaseMetrics())).toEqual({});
+    expect(uncompletedProbeVerdict({ ...searchIndexPhaseMetrics(), skipProbe: { current: true } })).toEqual({ would_skip: true, skip_miss: undefined, skip_check: "inconclusive" });
+    expect(uncompletedProbeVerdict({ ...searchIndexPhaseMetrics(), skipProbe: { current: false, miss: "probe_failed" } })).toEqual({ would_skip: false, skip_miss: "probe_failed", skip_check: "probe_failed" });
   });
 
   test("skipCheck: every result maps to exactly one outcome, and only a completed zero-write pass is verified", () => {

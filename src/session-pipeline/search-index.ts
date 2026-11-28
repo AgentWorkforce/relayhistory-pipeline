@@ -248,6 +248,12 @@ export interface SearchIndexPhaseMetrics {
   skipProbeError?: string;
   /** The probe's ClickHouse facts read failed (it ran, skipProbeFactsMs holds how long): `timeout`, `clickhouse_error` or `error`. */
   skipProbeFactsError?: SkipProbeFactsError;
+  /**
+   * What the probe answered (the last one, when a pre-read pass repeats), kept here as well as on the result
+   * so that a pass which throws after probing, or a requeue that throws after a deferral, still has the
+   * verdict to log. A probe whose own failure reaches the pass is `{ current: false, miss: "probe_failed" }`.
+   */
+  skipProbe?: SkipCurrentProbe;
 }
 
 export const searchIndexPhaseMetrics = (): SearchIndexPhaseMetrics => ({
@@ -1523,6 +1529,16 @@ export function skipCheck(result: SearchIndexResult): SkipCheck | undefined {
   return "verified_noop";
 }
 
+/**
+ * The outcome of a probed attempt that produced no result to compare: the pass threw after the probe, or the
+ * requeue of a deferred scope threw. A positive probe with no completed comparison is `inconclusive`; a miss
+ * stays a miss (the skip would not have fired, whatever happened next); no verdict is `probe_failed`.
+ */
+export function skipCheckUncompleted(probe: SkipCurrentProbe): SkipCheck {
+  if (probe.miss === "probe_failed" || probe.miss === "facts_unreadable") return "probe_failed";
+  return probe.current ? "inconclusive" : "miss";
+}
+
 const SKIP_PROBE_SAVEPOINT = "search_skip_probe";
 /** A SQLSTATE or an error class name, and nothing else: anything longer or of another shape is `unknown`. */
 const PROBE_ERROR_CODE = /^[A-Za-z0-9_]{1,40}$/;
@@ -1550,8 +1566,10 @@ async function shadowSkipProbe(
 ): Promise<SkipCurrentProbe> {
   const started = Date.now();
   const timing: { factsMs?: number; factsError?: SkipProbeFactsError } = {};
-  const done = (error?: unknown) => {
+  const FAILED: SkipCurrentProbe = { current: false, miss: "probe_failed" };
+  const done = (observed: SkipCurrentProbe, error?: unknown) => {
     if (!metrics) return;
+    metrics.skipProbe = observed;
     metrics.skipProbeMs = (metrics.skipProbeMs ?? 0) + (Date.now() - started);
     if (timing.factsMs !== undefined) metrics.skipProbeFactsMs = (metrics.skipProbeFactsMs ?? 0) + timing.factsMs;
     if (timing.factsError !== undefined) metrics.skipProbeFactsError = timing.factsError;
@@ -1561,7 +1579,7 @@ async function shadowSkipProbe(
   try {
     await tx.query(`SAVEPOINT ${SKIP_PROBE_SAVEPOINT}`);
   } catch (error) {
-    done(error);
+    done(FAILED, error);
     throw error;
   }
   try {
@@ -1571,19 +1589,20 @@ async function shadowSkipProbe(
       await tx.query(`ROLLBACK TO SAVEPOINT ${SKIP_PROBE_SAVEPOINT}`);
       await tx.query(`RELEASE SAVEPOINT ${SKIP_PROBE_SAVEPOINT}`);
     } catch {
-      done(error);
+      done(FAILED, error);
       throw error;
     }
-    done(error);
-    return { current: false, miss: "probe_failed" };
+    done(FAILED, error);
+    return FAILED;
   }
   try {
     await tx.query(`RELEASE SAVEPOINT ${SKIP_PROBE_SAVEPOINT}`);
   } catch (error) {
-    done(error);
+    // The verdict was read; only the release failed. The pass fails on it, with the verdict kept.
+    done(probe, error);
     throw error;
   }
-  done();
+  done(probe);
   return probe;
 }
 

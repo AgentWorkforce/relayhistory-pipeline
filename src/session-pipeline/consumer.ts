@@ -13,7 +13,7 @@
 import { errorFields, log, searchIndexErrorDetail } from "../shared/log.ts";
 import { parseQueueBody, sequencerAfter, type LandedEvent } from "./s3-events.ts";
 import { indexPointer, type PointerDeps, type SessionScope } from "./pointer.ts";
-import { indexSearchScope, searchIndexPhaseMetrics, skipCheck, type SearchIndexDeps, type SearchIndexResult } from "./search-index.ts";
+import { indexSearchScope, searchIndexPhaseMetrics, skipCheck, skipCheckUncompleted, type SearchIndexDeps, type SearchIndexPhaseMetrics, type SearchIndexResult } from "./search-index.ts";
 import { LEGACY_PROVENANCE_INVALID } from "../session-read-api/legacy-provenance.ts";
 import { captureRefusal, classifyReplayFailure, produceCanonicalReplay, type ReplayProducerDeps } from "./replay-publication.ts";
 import type { LargeJobState, LargeRoute } from "./large-read-worker.ts";
@@ -71,16 +71,31 @@ export const SKIP_CHECK_INCONCLUSIVE = "search index skip check inconclusive";
  * `facts_divergent`: only the facts reconcile's row counts are known, so the warning says exactly that, with the
  * facts counts. `inconclusive`: called current, nothing written, no pass completed (incomplete, or deferred
  * before its read), so no no-op was verified. Nothing for a verified no-op, a miss or a failed probe.
+ *
+ * A warning never carries `skip_check`: that field is on exactly one line per probed attempt, the line that ends
+ * it (reconciled, deferred or failed), so counting by it counts attempts. The warnings are told apart by `reason`.
  */
 export function warnSkipCheck(scope: SessionScope, result: SearchIndexResult): void {
   const check = skipCheck(result);
-  const ids = { stage: "search-index", org_id: scope.orgId, workspace_id: scope.workspaceId, harness: scope.harness, session_id: scope.sessionId };
+  const ids = skipWarningIds(scope);
   if (check === "divergent")
-    log.warn(SKIP_CHECK_DIVERGENT, { ...ids, reason: "skip_probe_divergence", skip_check: check, inserted: result.inserted, deleted: result.deleted });
+    log.warn(SKIP_CHECK_DIVERGENT, { ...ids, reason: "skip_probe_divergence", inserted: result.inserted, deleted: result.deleted });
   if (check === "facts_divergent")
-    log.warn(SKIP_CHECK_FACTS_WRITTEN, { ...ids, reason: "skip_probe_facts_written", skip_check: check, inserted: result.outputFacts?.inserted ?? 0, deleted: result.outputFacts?.deleted ?? 0 });
+    log.warn(SKIP_CHECK_FACTS_WRITTEN, { ...ids, reason: "skip_probe_facts_written", inserted: result.outputFacts?.inserted ?? 0, deleted: result.outputFacts?.deleted ?? 0 });
   if (check === "inconclusive")
-    log.warn(SKIP_CHECK_INCONCLUSIVE, { ...ids, reason: "skip_probe_inconclusive", skip_check: check, ok: result.complete });
+    log.warn(SKIP_CHECK_INCONCLUSIVE, { ...ids, reason: "skip_probe_inconclusive", ok: result.complete });
+}
+const skipWarningIds = (scope: SessionScope) => ({ stage: "search-index", org_id: scope.orgId, workspace_id: scope.workspaceId, harness: scope.harness, session_id: scope.sessionId });
+
+/**
+ * The terminal fields of a probed attempt that ended with no result to compare: the pass threw after its probe,
+ * the requeue of a deferred scope threw, or a pre-read pass probed, found its source changed and was then
+ * answered busy or skipped. The verdict the probe gave, kept on the pass's metrics, and its outcome
+ * (skipCheckUncompleted: a positive probe that was never compared is inconclusive). `{}` when no probe ran.
+ */
+export function uncompletedProbeVerdict(phase: SearchIndexPhaseMetrics): Record<string, unknown> {
+  const probe = phase.skipProbe;
+  return probe ? { would_skip: probe.current, skip_miss: probe.miss, skip_check: skipCheckUncompleted(probe) } : {};
 }
 
 const scopeId = (s: SessionScope) => JSON.stringify([s.orgId, s.workspaceId, s.harness, s.sessionId]);
@@ -230,14 +245,16 @@ export async function processBatch(records: readonly QueueRecord[], deps: Consum
           // The running pass may have read S3 before this event's write: run again later.
           if (!deps.requeue) throw new Error("scope busy and no requeue");
           await deps.requeue(manifestKey);
-          log.info("search index busy, requeued", { stage: "search-index", org_id: scope.orgId, session_id: scope.sessionId, reason: "scope_busy" });
+          // Busy is answered before the probe; only a pre-read pass that probed, then repeated, has one to account for.
+          log.info("search index busy, requeued", { stage: "search-index", org_id: scope.orgId, session_id: scope.sessionId, reason: "scope_busy",
+            ...uncompletedProbeVerdict(phase), ...probeTiming() });
           continue;
         }
         if (result.skipped) {
           // SEARCH_INDEX_SKIP_CURRENT_ENABLED: a complete pass already covers the live source set; done, not retried.
           log.info("search index skipped", {
             stage: "search-index", org_id: scope.orgId, workspace_id: scope.workspaceId, harness: scope.harness, session_id: scope.sessionId,
-            reason: result.reasons.join(","), ...phaseFields(), duration_ms: Date.now() - started,
+            reason: result.reasons.join(","), ...uncompletedProbeVerdict(phase), ...phaseFields(), duration_ms: Date.now() - started,
           });
           continue;
         }
@@ -290,9 +307,13 @@ export async function processBatch(records: readonly QueueRecord[], deps: Consum
           session_id: scope.sessionId,
           ...errorFields(error),
           ...searchIndexErrorDetail(error),
+          // The attempt ends here: a probe that ran keeps its verdict and gets its one outcome on this line.
+          ...uncompletedProbeVerdict(phase),
           ...phaseFields(),
           duration_ms: Date.now() - started,
         });
+        if (phase.skipProbe && skipCheckUncompleted(phase.skipProbe) === "inconclusive")
+          log.warn(SKIP_CHECK_INCONCLUSIVE, { ...skipWarningIds(scope), reason: "skip_probe_inconclusive", ok: false });
         for (const id of messageIds) failed.add(id);
       }
     }
