@@ -225,6 +225,8 @@ export async function processBatch(records: readonly QueueRecord[], deps: Consum
     for (const { scope, messageIds, manifestKey, revisions } of scopes.values()) {
       if (delegated.has(scopeId(scope)) || messageIds.every((id) => failed.has(id))) continue;
       const started = Date.now();
+      // The covering pass's start on the consumer clock (ordered.now in tests): the 7s pickup budget ends here.
+      const passStartedAt = now();
       if (ordered && supersededOnly(messageIds, revisions)) {
         // Every message is a stamped revision whose write is no longer live. The newer live write has its
         // own message in this group: already processed (FIFO holds later messages until earlier ones are
@@ -258,7 +260,7 @@ export async function processBatch(records: readonly QueueRecord[], deps: Consum
             stage: "search-index", org_id: scope.orgId, workspace_id: scope.workspaceId, harness: scope.harness, session_id: scope.sessionId,
             reason: result.reasons.join(","), ...phaseFields(), ...passFields(messageIds, recordOf, now), duration_ms: Date.now() - started,
           });
-          logSearchable(scope, revisions, now, true);
+          logSearchable(scope, revisions, now, passStartedAt, true);
           continue;
         }
         if (result.deferred) {
@@ -295,7 +297,7 @@ export async function processBatch(records: readonly QueueRecord[], deps: Consum
           ...passFields(messageIds, recordOf, now),
           duration_ms: Date.now() - started,
         });
-        if (result.complete) logSearchable(scope, revisions, now, false);
+        if (result.complete) logSearchable(scope, revisions, now, passStartedAt, false);
       } catch (error) {
         log.error("search index failed", {
           stage: "search-index",
@@ -455,7 +457,7 @@ function passFields(messageIds: readonly string[], recordOf: ReadonlyMap<string,
  * upload's own commit time to the end of the pass that made it searchable. A superseded event
  * has no line of its own; the upload that superseded it reports.
  */
-function logSearchable(scope: SessionScope, revisions: readonly Revised[], now: () => number, alreadyCurrent: boolean) {
+function logSearchable(scope: SessionScope, revisions: readonly Revised[], now: () => number, passStartedAt: number, alreadyCurrent: boolean) {
   const seen = new Set<string>();
   for (const r of revisions) {
     if (!r.live) continue;
@@ -468,8 +470,10 @@ function logSearchable(scope: SessionScope, revisions: readonly Revised[], now: 
       stage: "revision-events", org_id: scope.orgId, workspace_id: scope.workspaceId, harness: scope.harness, session_id: scope.sessionId,
       revision: r.event.revision?.revision, upload_kind: kind, event_source: r.event.revision?.source, already_current: alreadyCurrent,
       incarnation_sha256: incarnation(r.event),
-      ...(Number.isFinite(committed) ? { commit_to_searchable_ms: Math.max(0, now() - committed) } : {}),
-      ...(r.sentAt !== undefined ? { enqueued_at_ms: r.sentAt, queue_wait_ms: Math.max(0, now() - r.sentAt) } : {}),
+      // Pickup (the 7s budget) is commit to the covering pass's START; *_searchable / queue_wait_ms end at its completion.
+      pass_started_at_ms: passStartedAt,
+      ...(Number.isFinite(committed) ? { commit_to_start_ms: Math.max(0, passStartedAt - committed), commit_to_searchable_ms: Math.max(0, now() - committed) } : {}),
+      ...(r.sentAt !== undefined ? { enqueued_at_ms: r.sentAt, start_wait_ms: Math.max(0, passStartedAt - r.sentAt), queue_wait_ms: Math.max(0, now() - r.sentAt) } : {}),
       ...(r.receiveCount !== undefined ? { receive_count: r.receiveCount } : {}),
     });
   }

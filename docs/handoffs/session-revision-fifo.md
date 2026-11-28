@@ -71,13 +71,19 @@ scheduled reconcile ──────────────┘
 
 | line | fields |
 |---|---|
-| `revision searchable` (one per live upload) | `upload_kind` initial/append, `revision`, `commit_to_searchable_ms`, `queue_wait_ms`, `enqueued_at_ms`, `receive_count`, `event_source`, `already_current` |
+| `revision searchable` (one per live upload) | `upload_kind` initial/append, `revision`, `pass_started_at_ms`, `commit_to_start_ms` and `start_wait_ms` (to the covering pass's START: the pickup budget), `commit_to_searchable_ms` and `queue_wait_ms` (to its COMPLETION), `enqueued_at_ms`, `receive_count`, `event_source`, `already_current`, `incarnation_sha256` |
 | `revision superseded` (one per coalesced or stale event) | `revision`, `superseded_by_revision` or `superseded_by_delete`, `group_lag_ms`, `event_source` |
 | `search index reconciled` / `skipped` | adds `enqueued_at_ms`, `queue_wait_ms`, `receive_count`, `coalesced` |
 | `revision retry scheduled` | `reason`, `delay_seconds`, `count` |
 | `revision events forwarded` | `count`, `failed`, `skipped` |
 
-`commit_to_searchable_ms` uses the writer's commit time, or the S3 eventTime for forwarded events.
+`commit_*` uses the writer's commit time, or the S3 eventTime for forwarded events. These are
+pipeline-leg diagnostics, not the end-to-end score: they start at the manifest commit, not at
+Desktop's first HTTP attempt, and end at the pass, not at an authorized read. Count superseded
+events, `superseded_in_group` batches and executed passes separately; they are not additive. A
+reduction percentage needs an uncoalesced baseline on the same arrivals. A pass that crashes logs
+no line, so its revisions show up only as a later `revision searchable` (with `receive_count` > 1)
+or not at all; count unobserved starts from the arrivals side.
 
 ## Switches (all default off)
 

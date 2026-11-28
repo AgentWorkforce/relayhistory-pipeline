@@ -49,7 +49,7 @@ const SEARCH_PHASE_FIELDS = ["source_read_ms", "index_scan_ms", "locked_apply_ms
  * counts (queue timing in ms, SQS receive count, messages coalesced into one pass, retry delay, the superseding
  * revision number, the epoch-ms enqueue time), never a key or id.
  */
-const REVISION_EVENT_COUNT_FIELDS = ["queue_wait_ms", "group_lag_ms", "receive_count", "coalesced", "delay_seconds", "superseded_by_revision", "enqueued_at_ms"];
+const REVISION_EVENT_COUNT_FIELDS = ["queue_wait_ms", "start_wait_ms", "commit_to_start_ms", "pass_started_at_ms", "group_lag_ms", "receive_count", "coalesced", "delay_seconds", "superseded_by_revision", "enqueued_at_ms"];
 
 export const ALLOWED_LOG_FIELDS = new Set([
   ...REVISION_EVENT_COUNT_FIELDS,

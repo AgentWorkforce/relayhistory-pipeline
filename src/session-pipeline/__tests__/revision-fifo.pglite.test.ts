@@ -56,6 +56,8 @@ async function rig() {
   const sid = (s: SessionScope) => [s.orgId, s.workspaceId, s.harness, s.sessionId].join("/");
   const searchScope = async (scope: SessionScope): Promise<SearchIndexResult> => {
     passes.push(sid(scope));
+    // A pass takes 400 ms on the consumer clock: its start and completion differ.
+    advance(400);
     if (hold.inPass) { const h = hold.inPass; hold.inPass = undefined; await h(); }
     if (hold.crash) { hold.crash = false; throw Object.assign(new Error("synthetic crash"), { code: "synthetic_crash" }); }
     if (busy > 0) { busy -= 1; return { manifests: 0, rows: 0, inserted: 0, deleted: 0, complete: false, busy: true, reasons: ["scope_busy"] }; }
@@ -79,7 +81,10 @@ async function rig() {
     return { manifests: live.rows.length, rows: markers.length, inserted: markers.length, deleted: 0, complete: true, reasons: [] };
   };
   const visibility: { handles: string[]; seconds: number }[] = [];
-  const now = () => T0 + 1_500;
+  // Advances 100 ms per read once started (start reads first, completion later), from T0 + 1,500.
+  let tick = 0;
+  const now = () => T0 + 1_500 + tick;
+  const advance = (ms: number) => { tick += ms; };
   const wiring: RevisionWiring = {
     config: { queueUrl: "https://sqs.us-east-1.amazonaws.com/000000000000/synthetic-revisions.fifo", mode: "direct", busyRetrySeconds: 5 },
     sender: async () => ({ failed: [] }),
@@ -100,7 +105,8 @@ async function rig() {
     const key = await r.writeManifest(revision, l, marker);
     return { key, revision, etag: await etagOf(key), committedAt, initial: revision === 1, source: "writer" };
   };
-  const run = (records: SqsRecord[]) => logged(() => dispatchSqsBatch(records, deps(), wiring));
+  // Each batch starts at T0 + 1,500 on the consumer clock.
+  const run = (records: SqsRecord[]) => { tick = 0; return logged(() => dispatchSqsBatch(records, deps(), wiring)); };
   const liveDigest = async (key: string) =>
     (JSON.parse(new TextDecoder().decode(await readAll(await r.store.get(objectKey(key))))) as ManifestV1).raw.content_sha256;
   return { r, index, digests, liveDigest, passes, visibility, record, writer, run, hold, makeBusy: (k: number) => { busy = k; }, sid: sid({ orgId: "org_1", workspaceId: "ws_1", harness: "claude", sessionId: "sess_1" }) };
@@ -124,19 +130,21 @@ describe("burst coalescing", () => {
     const ok = named(lines, "revision searchable");
     expect(ok[0]!.incarnation_sha256).toBe(revisionMessage(events[4]!)!.MessageDeduplicationId);
     expect(sup[0]!.incarnation_sha256).toBe(revisionMessage(events[0]!)!.MessageDeduplicationId);
-    expect(ok).toEqual([expect.objectContaining({ revision: 5, upload_kind: "append", event_source: "writer", commit_to_searchable_ms: 1_000, queue_wait_ms: 1_100, receive_count: 1 })]);
+    // Pickup ends at the covering pass's START (T0+1,500); searchable at its completion (T0+1,900).
+    expect(ok).toEqual([expect.objectContaining({ revision: 5, upload_kind: "append", event_source: "writer", pass_started_at_ms: T0 + 1_500,
+      commit_to_start_ms: 1_000, commit_to_searchable_ms: 1_400, start_wait_ms: 1_100, queue_wait_ms: 1_500, receive_count: 1 })]);
     const pass = named(lines, "search index reconciled")[0]!;
-    expect(pass).toMatchObject({ coalesced: 5, enqueued_at_ms: T0, queue_wait_ms: 1_500, receive_count: 1 });
+    expect(pass).toMatchObject({ coalesced: 5, enqueued_at_ms: T0, queue_wait_ms: 1_900, receive_count: 1 });
   });
 
   test("first upload and an append are measured separately", async () => {
     const t = await rig();
     const first = await t.writer(1, "r1", loc, new Date(T0).toISOString());
     const a = await t.run([t.record(first, T0)]);
-    expect(named(a.lines, "revision searchable")).toEqual([expect.objectContaining({ upload_kind: "initial", revision: 1, commit_to_searchable_ms: 1_500 })]);
+    expect(named(a.lines, "revision searchable")).toEqual([expect.objectContaining({ upload_kind: "initial", revision: 1, commit_to_start_ms: 1_500, commit_to_searchable_ms: 1_900 })]);
     const second = await t.writer(2, "r2", loc, new Date(T0 + 500).toISOString());
     const b = await t.run([t.record(second, T0 + 500)]);
-    expect(named(b.lines, "revision searchable")).toEqual([expect.objectContaining({ upload_kind: "append", revision: 2, commit_to_searchable_ms: 1_000 })]);
+    expect(named(b.lines, "revision searchable")).toEqual([expect.objectContaining({ upload_kind: "append", revision: 2, commit_to_start_ms: 1_000, commit_to_searchable_ms: 1_400 })]);
   });
 
   test("two machines of one session (one group) coalesce into one search pass; another session runs its own", async () => {
