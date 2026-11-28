@@ -42,6 +42,8 @@ class Sim {
   failRuns = 0;
   inFlight = new Map<string, { generation: number }>();
   sweptAt: number[] = [];
+  /** Every durable handoff: when it was sent and the delay it asked for. */
+  handoffs: { at: number; delaySeconds: number }[] = [];
   private lastSweep = T0;
   private lastTick = T0;
   /**
@@ -87,7 +89,9 @@ class Sim {
     }
     if (earliest === Infinity) return true;
     const plan = handoffPlan(earliest, this.now);
-    try { this.send(h, plan.action === "defer" ? plan.delaySeconds : 0); } catch { return false; } // failed handoff: keep the original
+    const delaySeconds = plan.action === "defer" ? plan.delaySeconds : 0;
+    try { this.send(h, delaySeconds); } catch { return false; } // failed handoff: keep the original
+    this.handoffs.push({ at: this.now, delaySeconds });
     return true;
   }
 
@@ -223,11 +227,18 @@ describe("session-brief trigger: due and claim eligibility", () => {
 describe("session-brief trigger: offline fixtures", () => {
   test("a single early hint with the recovery tick off is handed off durably and claimed at its due time", () => {
     const sim = new Sim();
-    sim.commit("claude", 1);
+    sim.commit("claude", 1); // the commit (and the upload's lower bound) at T0
     sim.advance(60_000);
     expect(sim.runs).toHaveLength(1);
-    expect(sim.runs[0]!.dueAt).toBe(T0 + 8_000);
-    expect(sim.runs[0]!.claimedAt - sim.runs[0]!.claimableAt).toBeLessThanOrEqual(1_000);
+    // The recorded timeline, relative to the commit at T0 (ms): delivered at +1000 (the simulator's first 1 s step),
+    // not claimable until +8000 (first brief: pending + 8 s), so handed off at +1000 with a 7 s delay; the copy is
+    // delivered and claimed at +8000, exactly at due.
+    const timeline = { due: sim.runs[0]!.dueAt - T0, handoff: sim.handoffs.map((x) => ({ at: x.at - T0, delaySeconds: x.delaySeconds })),
+      claim: sim.runs[0]!.claimedAt - T0 };
+    expect(timeline).toEqual({ due: 8_000, handoff: [{ at: 1_000, delaySeconds: 7 }], claim: 8_000 });
+    // GAP: there is no parsed authorized read in this offline core (no Reader); the score from the upload needs the
+    // integration trace (sessions-latency-owner's membership read). The claim alone is within 60 s here.
+    expect(briefMiss(T0, sim.runs[0]!.claimedAt)).toBe(false);
     expect(sim.queue).toHaveLength(0);
   });
 
