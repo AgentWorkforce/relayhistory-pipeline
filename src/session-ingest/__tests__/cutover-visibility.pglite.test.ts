@@ -141,4 +141,45 @@ describe("W2 isolated proof: visibility under the 062340 history lock (stand-in 
     const live = await x.one<{ n: number }>("SELECT count(*)::int n FROM sessions.ingest_org_admission_holds WHERE held_org = $1 AND state <> 'released'", [ORG]);
     expect(live.n).toBe(0);
   });
+
+  // ---- lander 8227a0ec7f22: park after the LAST visibility read, commit a covering erase, resume ----
+
+  test("baseCopies with inherited effect identity: a copy made after the last read, across a covering erase, is never served or republished", async () => {
+    const x = await fixture();
+    await x.install(ORG);
+    const bound = await x.snapshot();
+    expect(await x.publish(ORG, "stage-src", "sess-1", bound)).toBe("visible");
+    // The copier's last visibility read, then it parks.
+    expect(await x.verdict(ORG, "stage-src", "sess-1")).toBe("visible");
+    await x.erase(ORG, "sess-1"); // the covering erase commits while the copier is parked
+    // Resume: the copy lands (an object-store PUT cannot be conditioned on SQL), carrying its SOURCE effect identity.
+    const destination = { key: "gen-2/raw/chunk-1", inherits: { kind: "drain", digest: "stage-src", session: "sess-1" } };
+    // Serving or republishing the destination resolves the inherited effect: revoked, so neither happens.
+    const served = (await x.verdict(ORG, destination.inherits.digest, destination.inherits.session)) === "visible";
+    expect(served).toBe(false);
+    // Without inherited identity the copy would be a fresh effect with no row: absent, never served either, but
+    // only a reader that requires a row for every entry gives that; inherited identity makes the revocation explicit.
+    expect(await x.verdict(ORG, "gen-2-fresh", "sess-1")).toBe("absent");
+  });
+
+  test("an external send (model or analytics) cannot be ordered against the erase: the interleaving sends revoked input, so such paths are EXCLUDED for enrolled orgs", async () => {
+    const x = await fixture();
+    await x.install(ORG);
+    const bound = await x.snapshot();
+    expect(await x.publish(ORG, "stage-a", "sess-1", bound)).toBe("visible");
+    const sent: string[] = [];
+    const send = async (input: string) => { sent.push(input); }; // the external call: no SQL condition possible
+    // A non-excluded sender: check, park, erase, resume, send.
+    const ok = (await x.verdict(ORG, "stage-a", "sess-1")) === "visible";
+    await x.erase(ORG, "sess-1");
+    if (ok) await send("sess-1 content");
+    expect(sent).toEqual(["sess-1 content"]); // THE OPEN INTERLEAVING: revoked input left the system
+    expect(await x.verdict(ORG, "stage-a", "sess-1")).toBe("revoked");
+    // The excluded sender: an enrolled org is refused before any read, so the same interleaving sends nothing.
+    const enrolled = new Set([ORG]);
+    const excludedSent: string[] = [];
+    const excludedRun = async () => { if (enrolled.has(ORG)) return "excluded_enrolled_org"; excludedSent.push("x"); return "sent"; };
+    expect(await excludedRun()).toBe("excluded_enrolled_org");
+    expect(excludedSent).toEqual([]);
+  });
 });

@@ -678,3 +678,32 @@ verdict must precede the send**, because nothing can revoke them afterwards. Wit
 - publication-generation copies;
 - normalize output;
 - anything already sent to an external model or to analytics.
+
+### Ordering after the last visibility read (lander 8227a0ec7f22 and 93449d69a3f3)
+
+A standalone check before a send or before a copy loop leaves this interleaving open: the last visibility read, a
+park, a covering erase, then the resume. Proven per class in `cutover-visibility.pglite.test.ts` (now 10 tests):
+
+- **Copies (publication-image baseCopies) can be closed by inherited effect identity.** The destination records the
+  source effect (kind, digest, session), and serving or republishing the destination resolves that source effect's
+  verdict. A copy that lands after the covering erase (an object PUT cannot be conditioned on SQL) is therefore
+  revoked, and never served or republished. Requirement: the inherited identity is written with the copy and checked
+  by every reader and republisher of generation locations.
+- **External sends (Bob Costas and the session-brief model calls, the brief's analytics capture) cannot be ordered
+  against an erase.** Nothing conditions an external call on SQL, and nothing revokes it afterwards. The test shows
+  the interleaving sending revoked input. These paths are therefore **EXCLUDED for enrolled orgs**: the worker refuses
+  an enrolled org before any read, so the same interleaving sends nothing. That exclusion must be **verified**
+  (deploy-time evidence that the refusal is in the running worker) before enrollment.
+  - Residual, outside W2: a worker that read "not enrolled" before the enrollment PUT works on pre-enrollment
+    content. That is the same erase-versus-summarizer race every org has today.
+- **Any other path that cannot enforce the ordering is excluded from enrollment until its exclusion is verified.**
+  Candidates from the traces:
+  - P2 output/digest, which has no read fence;
+  - P1 search under a SQL-only change, where nothing enqueues a pass;
+  - normalize output, which only prefix erasure removes;
+  - the unfenced Read Worker routes, unless they get a fence before and after IO.
+
+**Ruling state.** 062340 records the xid and the affected org, and xid magnitude cannot establish commit order. The
+publish snapshot must be fresh after the exclusive lock, and verdicts fresh after IO. **Revocation stays org-wide
+for the affected org** until an authoritative narrower scope exists; the scope columns remain a proposal. The PG17
+fixture at 8b7fc40e waits for claim-ci's window. Wave 1 is held.
