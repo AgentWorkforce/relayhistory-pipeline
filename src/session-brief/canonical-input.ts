@@ -120,9 +120,9 @@ export function canonicalBriefInputFromEnv(env: NodeJS.ProcessEnv = process.env)
       const after = await canonicalBriefScope(run, key);
       if (after.sessionId !== logicalKey.sessionId) throw new PipelineError("canonical_input_scope_changed", "canonical source changed", true);
       if (transcript) {
-        return { ...briefInputFromTranscript(logicalKey,pointers,transcript), canonicalSessionId: logicalKey.sessionId };
+        return { ...briefInputFromTranscript(logicalKey,pointers,transcript), canonicalSessionId: logicalKey.sessionId, canonicalGeneration: transcript.generation };
       }
-      return { ...briefInputFromCanonical(logicalKey, pointers, snapshot!), canonicalSessionId: logicalKey.sessionId };
+      return { ...briefInputFromCanonical(logicalKey, pointers, snapshot!), canonicalSessionId: logicalKey.sessionId, canonicalGeneration: snapshot!.generation };
     } catch (error) {
       if (error instanceof CanonicalReadError) return canonicalInputRefusal(error, pointers, readingTranscript ? "canonical_jsonl_input_refused" : "canonical_input_refused");
       throw error;

@@ -15,6 +15,7 @@ import {
 } from "../hoopdb/session-directory-summary.ts";
 import { SESSION_SUMMARY_STATES, type SessionSummaryState } from "./engine/summary-contract.ts";
 import type { BriefPointer } from "./input.ts";
+import { canonicalSourceGeneration } from "../session-read-api/canonical.ts";
 import { SESSION_BRIEF_CANONICAL_ENGINE_VERSION, SESSION_BRIEF_PROMPT_VERSION, SESSION_BRIEF_SOURCE_PREFIX } from "./versions.ts";
 
 const KEY = `org_id = $1 AND workspace_id = $2 AND harness = $3 AND session_id = $4`;
@@ -375,7 +376,7 @@ export async function recordBrief(
   key: SessionDirectoryKey,
   sourceRevisions: Record<string, number>,
   outcome: BriefOutcome,
-  options: { canonicalSessionId?: string; coverage?: BriefCoverageWrite; sourceBinding?: BriefSourceBinding } = {},
+  options: { canonicalSessionId?: string; coverage?: BriefCoverageWrite; sourceBinding?: BriefSourceBinding; canonicalGeneration?: string } = {},
 ): Promise<{ written: boolean }> {
   const revision = Math.max(0, ...Object.values(sourceRevisions));
   // Summaries regeneration (push A): only with a coverage flag on and the columns present does a
@@ -420,6 +421,14 @@ export async function recordBrief(
     // every live pointer must still carry the same manifest key and manifest digest, or the
     // input describes content that is no longer live and the brief is dropped as stale.
     if (options.sourceBinding && !sameSourceIncarnation(liveRows, options.sourceBinding)) {
+      await client.query("ROLLBACK");
+      return { written: false };
+    }
+    // Canonical input: the generation the consumed snapshot was verified against must still be
+    // the live one. It covers pointer fields beyond the binding (user, bucket, provider, format),
+    // so a canonical re-publication that keeps key, revision and digest is still refused.
+    if (options.canonicalGeneration !== undefined &&
+        (await liveCanonicalGeneration(client, key, options.canonicalSessionId ?? key.sessionId)) !== options.canonicalGeneration) {
       await client.query("ROLLBACK");
       return { written: false };
     }
@@ -631,6 +640,32 @@ export async function briefSessionQuiet(
   const r = rows[0];
   if (r?.ended === true) return "ended_uncovered";
   return r?.idle === true ? "idle_uncovered" : null;
+}
+
+/**
+ * canonicalSourceGeneration over the session's live pointer rows (read FOR SHARE in the caller's
+ * transaction), exactly as the canonical readers compute it for this logical identity.
+ */
+export async function liveCanonicalGeneration(db: SqlExecutor, key: SessionDirectoryKey, logicalSessionId: string): Promise<string> {
+  const { rows } = await db.query<{
+    machine_id: string; manifest_key: string; revision: string; content_sha256: string | null;
+    user_id: string; bucket: string; storage_provider: string; raw_format: string;
+  }>(
+    `SELECT machine_id, manifest_key, revision::text AS revision, encode(content_sha256, 'hex') AS content_sha256,
+            user_id, bucket, storage_provider, raw_format
+       FROM sessions.session_index
+      WHERE ${KEY} AND deleted_at IS NULL AND manifest_key IS NOT NULL ORDER BY machine_id LIMIT 64 FOR SHARE`,
+    keyParams(key),
+  );
+  return canonicalSourceGeneration(
+    rows.map((r) => ({
+      org_id: key.orgId, workspace_id: key.workspaceId, harness: key.harness, session_id: key.sessionId,
+      machine_id: r.machine_id, user_id: r.user_id, storage_provider: r.storage_provider, bucket: r.bucket,
+      manifest_key: r.manifest_key, content_sha256: r.content_sha256 ?? "", raw_format: r.raw_format,
+      revision: r.revision, deleted_at: null,
+    })),
+    { orgId: key.orgId, workspaceId: key.workspaceId, source: key.harness, sessionId: logicalSessionId },
+  );
 }
 
 /** Per machine: the manifest key and digest of the exact incarnation a brief input was built from. */

@@ -66,7 +66,16 @@ export interface BriefPointer {
 export type BriefInput = (
   | { kind: "ready"; input: SessionSummaryInput; sourceRevisions: Record<string, number> }
   | { kind: "quarantined" | "empty" | "ineligible"; error: string; sourceRevisions: Record<string, number> }
-) & { canonicalSessionId?: string };
+) & {
+  canonicalSessionId?: string;
+  /**
+   * Canonical input paths only: the generation (canonicalSourceGeneration over the identity and
+   * every pointer's key, revision, digest, machine, user, bucket, provider and format) the
+   * consumed snapshot was verified against. Publication recomputes it from the live rows under
+   * the write guard and refuses a mismatch.
+   */
+  canonicalGeneration?: string;
+};
 
 /** Raw bytes read for one session, all machines together. relayhistory-transform's own bound. */
 export const MAX_BRIEF_SESSION_BYTES = 256 * 1024 * 1024;
