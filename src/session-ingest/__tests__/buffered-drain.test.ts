@@ -1424,7 +1424,7 @@ describe("buffered drain materialization (FULL-seeded index)", () => {
     const key = await stage(store, [group("claude", "sess-1", [{ id: "a1", rev: 1 }, { id: "a2", rev: 1 }])]);
     await refreshVerdicts(store);
     // What main's drain left behind: every line already_stored, the object marked drained, nothing canonical.
-    await store.put(objectKey(key + DRAINED_SUFFIX), enc.encode(JSON.stringify({ v: 1, kind: "buffered-drained", outcome: "drained" })));
+    await store.put(objectKey(key + DRAINED_SUFFIX), enc.encode(JSON.stringify({ v: 1, kind: "buffered-drained", outcome: "drained", staged_sha256: sha(await readAll(await store.get(objectKey(key)))) })));
     const proof = await verify(store);
     expect(proof.ok).toBe(false);
     expect(proof.counts.missing).toBe(2);
@@ -1804,7 +1804,8 @@ describe("buffered drain materialization (FULL-seeded index)", () => {
     expect(summary.rearmed).toBe(1);
     expect(await exists(store, rearmKey("claude", "sess-1"))).toBe(true);
     expect((await readJson(store, key + DRAINED_SUFFIX)).outcome).toBe("erased");
-    expect(await verify(store)).toMatchObject({ ok: false, counts: { erased_present: 1 } });
+    // An outcome the proof does not know refuses the stage (never silently excluded).
+    expect(await verify(store)).toMatchObject({ ok: false, counts: { marker_invalid: 1 } });
     // A later run never drains it.
     expect((await run(store)).objects).toMatchObject({ already_drained: 1, drained: 0 });
   });
@@ -1836,14 +1837,39 @@ describe("buffered drain materialization (FULL-seeded index)", () => {
     await run(store);
     expect((await readJson(store, key + DRAINED_SUFFIX)).materialization).toBe(1);
     const pre = await stage(store, [group("claude", "sess-1", [{ id: "a2", rev: 1 }])]);
-    await store.put(objectKey(pre + DRAINED_SUFFIX), enc.encode(JSON.stringify({ v: 1, kind: "buffered-drained", outcome: "pre_reset" })));
+    await store.put(objectKey(pre + DRAINED_SUFFIX), enc.encode(JSON.stringify({ v: 1, kind: "buffered-drained", outcome: "pre_reset", staged_sha256: sha(await readAll(await store.get(objectKey(pre)))) })));
     // A marker another writer owns (an erase pre-creating one, sessions-s3-admission-fence's proposal): final too.
     const erased = await stage(store, [group("claude", "sess-1", [{ id: "a3", rev: 1 }])]);
     await store.put(objectKey(erased + DRAINED_SUFFIX), enc.encode(JSON.stringify({ v: 1, kind: "buffered-drained", outcome: "erased" })));
     const r = await run(store, { rematerialize: true });
     expect(r).toMatchObject({ rematerialize_revisited: 0, objects: { already_drained: 3 } });
     expect((await canonical(store)).get("sess-1")).toEqual(["a1@1"]);
-    expect(await verify(store)).toMatchObject({ ok: true, exact: 1, excluded_absent: 2 });
+    // pre_reset over these bytes is excluded; the unknown `erased` outcome is refused, never silently excluded.
+    expect(await verify(store)).toMatchObject({ ok: false, exact: 1, counts: { marker_invalid: 1 } });
+  });
+
+  test("the verifier refuses a malformed marker, a marker over other bytes, and a sidecar bound to other bytes", async () => {
+    for (const bad of ["marker_garbage", "marker_other_digest", "sidecar_other_digest", "sidecar_garbage"] as const) {
+      const store = await scratch();
+      await fullSlots(store, [{ id: "a1", rev: 1 }]);
+      const key = await stage(store, [group("claude", "sess-1", [{ id: "a1", rev: 1 }])]);
+      await run(store);
+      expect(await verify(store)).toMatchObject({ ok: true });
+      if (bad === "marker_garbage") { await store.delete(objectKey(key + DRAINED_SUFFIX)); await store.put(objectKey(key + DRAINED_SUFFIX), enc.encode("{not json")); }
+      if (bad === "marker_other_digest") {
+        const m = await readJson(store, key + DRAINED_SUFFIX);
+        await store.delete(objectKey(key + DRAINED_SUFFIX));
+        await store.put(objectKey(key + DRAINED_SUFFIX), enc.encode(JSON.stringify({ ...m, staged_sha256: "0".repeat(64) })));
+      }
+      if (bad === "sidecar_other_digest") {
+        const m = await readJson(store, key + ACCEPTED_SUFFIX);
+        await store.put(objectKey(key + ACCEPTED_SUFFIX), enc.encode(JSON.stringify({ ...m, stage_sha256: "0".repeat(64) })));
+      }
+      if (bad === "sidecar_garbage") await store.put(objectKey(key + ACCEPTED_SUFFIX), enc.encode("[]"));
+      const proof = await verify(store);
+      expect(proof.ok).toBe(false);
+      expect(proof.counts.marker_invalid).toBe(1);
+    }
   });
 
   test("a drain over an unreadable canonical session leaves the object for a rerun (canonical_unreadable), never marked", async () => {

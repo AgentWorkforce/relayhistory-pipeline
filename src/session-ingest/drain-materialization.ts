@@ -40,7 +40,7 @@ import { entryForgotten, isDeletedForAdmission, s3LedgerObjects, sessionKeyHash,
 import type { LedgerTenant } from "./ledger.ts";
 import { NO_SESSION_HARNESS, NO_SESSION_ID, liveMachineId } from "./writer.ts";
 // A cycle with buffered-drain.ts (which imports canonicalHolds): only called at run time, never at module init.
-import { acceptedCompleteKey, parseAcceptedComplete } from "./buffered-drain.ts";
+import { acceptedCompleteKey, parseAcceptedComplete, parseAcceptedMarker } from "./buffered-drain.ts";
 
 const decoder = new TextDecoder("utf-8", { fatal: true });
 const encoder = new TextEncoder();
@@ -169,7 +169,7 @@ export function canonicalHolds(canonical: readonly CanonicalLine[] | null, stage
 // ---- verification ----
 
 export type VerifyFailure =
-  | "export_missing" | "missing" | "mismatch" | "index_missing" | "unrecoverable" | "unexpected" | "erased_present" | "baseline_lost" | "undrained" | "unreadable";
+  | "export_missing" | "missing" | "mismatch" | "index_missing" | "unrecoverable" | "unexpected" | "erased_present" | "baseline_lost" | "undrained" | "marker_invalid" | "unreadable";
 
 export interface VerifyResult {
   ok: boolean;
@@ -235,6 +235,8 @@ interface Backlog {
   origins: Map<string, { tenant: LedgerTenant; origin: string }>;
   fences: Map<string, FenceDoc | null>;
   undrained: string[];
+  /** Stages whose sidecar or marker is malformed, bound to other bytes, or carries an unknown outcome: refused. */
+  invalid: string[];
   exportComplete: boolean;
   /** Sessions (sessionKey) the user's CURRENT S3 fence deletes, or whose user has no fence (erased). */
   deleted: Set<string>;
@@ -247,7 +249,7 @@ async function collectBacklog(opts: VerifyOptions, deps: VerifyDeps): Promise<Ba
   const keys = await deps.list(`${keyRoot}/${orgId}/buffered-batches/v1`);
   const all = new Set(keys);
   const staged = keys.filter((k) => k.endsWith(".staged.ndjson.zst") && deps.parseStagedKey(k)?.orgId === orgId);
-  const b: Backlog = { allowed: [], excluded: [], sessions: new Map(), origins: new Map(), fences: new Map(), undrained: [], exportComplete: complete !== null && parseAcceptedComplete(complete) !== null, deleted: new Set() };
+  const b: Backlog = { allowed: [], excluded: [], sessions: new Map(), origins: new Map(), fences: new Map(), undrained: [], invalid: [], exportComplete: complete !== null && parseAcceptedComplete(complete) !== null, deleted: new Set() };
   const fenceOf = async (t: LedgerTenant): Promise<FenceDoc | null> => {
     const k = userKey(t);
     if (!b.fences.has(k)) {
@@ -256,12 +258,13 @@ async function collectBacklog(opts: VerifyOptions, deps: VerifyDeps): Promise<Ba
     }
     return b.fences.get(k)!;
   };
-  const json = async (key: string) => {
-    if (!all.has(key)) return null;
+  const doc = async (key: string): Promise<{ state: "absent" } | { state: "invalid" } | { state: "ok"; text: string }> => {
+    if (!all.has(key)) return { state: "absent" };
     try {
-      return JSON.parse((await getText(store, key, 1024 * 1024)) ?? "null") as Record<string, unknown> | null;
+      const text = await getText(store, key, 1024 * 1024);
+      return text === null ? { state: "absent" } : { state: "ok", text };
     } catch {
-      return null;
+      return { state: "invalid" };
     }
   };
   const markDeleted = async (t: LedgerTenant, origin: string, source: string, sessionId: string) => {
@@ -282,22 +285,38 @@ async function collectBacklog(opts: VerifyOptions, deps: VerifyDeps): Promise<Ba
       b.sessions.set(sessionKey(tenant, origin, g.source, g.sessionId), { tenant, origin, source: g.source, sessionId: g.sessionId });
       await markDeleted(tenant, origin, g.source, g.sessionId);
     }
-    const marker = await json(key + ".accepted.json");
-    const live = !!marker && marker.live === true && marker.stage_sha256 === s.sha256 && Array.isArray(marker.kept) && !all.has(key + ".superseded.json");
-    if (!live) {
+    // The export's sidecar. Absent: SQL never acknowledged the stage (excluded). Present but malformed, bound to other
+    // bytes, or not matching the stage's groups: refused, never silently excluded.
+    const sidecar = await doc(key + ".accepted.json");
+    if (sidecar.state === "invalid") { b.invalid.push(key); continue; }
+    const marker = sidecar.state === "ok" ? parseAcceptedMarker(sidecar.text) : null;
+    if (sidecar.state === "ok" && (!marker || marker.stage_sha256 !== s.sha256 ||
+        (marker.live && (marker.kept.length !== s.groups.length || marker.kept.some((ks, gi) => ks.some((j) => j >= s.groups[gi]!.lines.length)))))) {
+      b.invalid.push(key);
+      continue;
+    }
+    if (!marker || !marker.live || all.has(key + ".superseded.json")) {
       b.excluded.push(...items.flat());
       continue;
     }
-    const markerDoc = await json(key + ".drained.json");
-    const outcome = markerDoc?.outcome;
-    // No marker, or one that does not parse: not proven drained.
-    if (outcome === undefined || typeof outcome !== "string") {
-      b.undrained.push(key);
+    // The drain's marker. Absent: not drained. Known outcomes only, over these exact bytes: `drained` (allowed) and
+    // `pre_reset` (excluded). Anything else (malformed, another kind or digest, an outcome this proof does not know,
+    // such as a per-session settlement before its format is agreed) is refused, never silently excluded.
+    const drained = await doc(key + ".drained.json");
+    if (drained.state === "absent") { b.undrained.push(key); continue; }
+    let md: Record<string, unknown> | null = null;
+    try {
+      md = drained.state === "ok" ? (JSON.parse(drained.text) as Record<string, unknown>) : null;
+    } catch {
+      md = null;
+    }
+    const outcome = md && typeof md === "object" && md.kind === "buffered-drained" && md.staged_sha256 === s.sha256 ? md.outcome : undefined;
+    if (outcome === "pre_reset") {
+      b.excluded.push(...items.flat());
       continue;
     }
-    // Any final outcome other than drained (pre_reset, or an erase's marker): nothing of the stage may be canonical.
     if (outcome !== "drained") {
-      b.excluded.push(...items.flat());
+      b.invalid.push(key);
       continue;
     }
     const fence = await fenceOf(tenant);
@@ -387,7 +406,7 @@ export async function snapshotCanonical(opts: Omit<VerifyOptions, "baseline">, d
 export async function verifyDrainMaterialization(opts: VerifyOptions, deps: VerifyDeps): Promise<VerifyResult> {
   const result: VerifyResult = {
     ok: false, exact: 0, superseded_later: 0, index_winners_canonical: 0, excluded_absent: 0, baseline_preserved: 0,
-    counts: { export_missing: 0, missing: 0, mismatch: 0, index_missing: 0, unrecoverable: 0, unexpected: 0, erased_present: 0, baseline_lost: 0, undrained: 0, unreadable: 0 },
+    counts: { export_missing: 0, missing: 0, mismatch: 0, index_missing: 0, unrecoverable: 0, unexpected: 0, erased_present: 0, baseline_lost: 0, undrained: 0, marker_invalid: 0, unreadable: 0 },
     failures: [],
   };
   const fail = (kind: VerifyFailure, r: string) => {
@@ -398,6 +417,7 @@ export async function verifyDrainMaterialization(opts: VerifyOptions, deps: Veri
   const b = await collectBacklog(opts, deps);
   if (!b.exportComplete) fail("export_missing", ref(opts.orgId));
   for (const k of b.undrained) fail("undrained", ref(k));
+  for (const k of b.invalid) fail("marker_invalid", ref(k));
   let idx: Awaited<ReturnType<typeof collectIndex>> = [];
   try {
     idx = await collectIndex(opts, deps, b);
