@@ -24,7 +24,7 @@ import {
   backlogOpsToolArgs, type BacklogOpsMode,
 } from "../backlog-ops.ts";
 import {
-  ERASURE_HISTORY_TABLES, ERASURE_PROOF_MAX_AGE_MS, ERASURE_SOURCES, ERASURE_SOURCE_EXCLUSIONS, ERASURE_TABLE_NAME, ERASURE_WINDOW_SQL, epochHash,
+  ERASURE_HISTORY_TABLES, ERASURE_PROOF_MAX_AGE_MS, ERASURE_PROOF_TABLES, ERASURE_SOURCES, ERASURE_SOURCE_EXCLUSIONS, ERASURE_TABLE_NAME, ERASURE_WINDOW_SQL, epochHash,
   erasureWindowProof, orgHash, releaseOnEmptyWindow, validErasureWindowProof,
 } from "../erasure-window.ts";
 import { applySupabaseSchema } from "./pglite-schema.ts";
@@ -51,7 +51,7 @@ const row = (over: Record<string, unknown> = {}) => ({ ...zeros(), status: statu
 
 // ---- classification ----
 
-test("every erasure-like per-org table in the schema is a source (or a documented singleton exclusion, or 062340's own history)", () => {
+test("every erasure-like per-org table in the schema is a source (or a documented singleton exclusion, 062340's own history, or 062360's proof storage)", () => {
   const dir = fileURLToPath(new URL("../../../supabase/migrations/", import.meta.url));
   const tables = new Map<string, string>();
   for (const f of readdirSync(dir).filter((x) => x.endsWith(".sql"))) {
@@ -61,15 +61,21 @@ test("every erasure-like per-org table in the schema is a source (or a documente
   const erasureLike = [...tables.keys()].filter((t) => ERASURE_TABLE_NAME.test(t)).sort();
   expect(erasureLike.length).toBeGreaterThan(10);
   for (const t of erasureLike) {
-    const classified = Object.hasOwn(ERASURE_SOURCES, t) || Object.hasOwn(ERASURE_SOURCE_EXCLUSIONS, t) || Object.hasOwn(ERASURE_HISTORY_TABLES, t);
+    const classified = Object.hasOwn(ERASURE_SOURCES, t) || Object.hasOwn(ERASURE_SOURCE_EXCLUSIONS, t) || Object.hasOwn(ERASURE_HISTORY_TABLES, t)
+      || Object.hasOwn(ERASURE_PROOF_TABLES, t);
     expect([t, classified]).toEqual([t, true]);
-    // A source has an org_id; an exclusion has none.
-    expect([t, /\borg_id\b/u.test(tables.get(t)!)]).toEqual([t, Object.hasOwn(ERASURE_SOURCES, t)]);
+    // A source has an org_id, and so does proof storage (its tenant binding); an exclusion or history table has none.
+    expect([t, /\borg_id\b/u.test(tables.get(t)!)]).toEqual([t, Object.hasOwn(ERASURE_SOURCES, t) || Object.hasOwn(ERASURE_PROOF_TABLES, t)]);
   }
-  for (const t of [...Object.keys(ERASURE_SOURCES), ...Object.keys(ERASURE_SOURCE_EXCLUSIONS), ...Object.keys(ERASURE_HISTORY_TABLES)])
+  for (const t of [...Object.keys(ERASURE_SOURCES), ...Object.keys(ERASURE_SOURCE_EXCLUSIONS), ...Object.keys(ERASURE_HISTORY_TABLES), ...Object.keys(ERASURE_PROOF_TABLES)])
     expect([t, tables.has(t)]).toEqual([t, true]);
-  // The three classes are disjoint.
-  for (const t of Object.keys(ERASURE_HISTORY_TABLES)) expect([t, Object.hasOwn(ERASURE_SOURCES, t) || Object.hasOwn(ERASURE_SOURCE_EXCLUSIONS, t)]).toEqual([t, false]);
+  // The four classes are disjoint.
+  const classes = [ERASURE_SOURCES, ERASURE_SOURCE_EXCLUSIONS, ERASURE_HISTORY_TABLES, ERASURE_PROOF_TABLES].map((c) => Object.keys(c));
+  expect(new Set(classes.flat()).size).toBe(classes.flat().length);
+  // Proof storage is an exact list, never a prefix: a new replay-named table would be unclassified.
+  expect(Object.keys(ERASURE_PROOF_TABLES).sort()).toEqual(["session_erasure_replay_aliases", "session_erasure_replay_completions",
+    "session_erasure_replay_requests", "session_erasure_replay_targets"]);
+  expect(Object.hasOwn(ERASURE_PROOF_TABLES, "session_erasure_replay_effects")).toBe(false);
   // The ones the reviewer named.
   for (const t of ["operator_user_erasures", "session_erasure_scopes", "session_erasure_runs", "session_erasure_receipts", "upload_deletions", "upload_erasure_rearm"])
     expect(Object.hasOwn(ERASURE_SOURCES, t)).toBe(true);

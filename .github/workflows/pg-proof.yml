@@ -508,7 +508,7 @@ jobs:
           bun src/session-ingest/__tests__/hold-harness/run.ts --pg-url postgres://postgres@127.0.0.1:5432/postgres --pg ${{ matrix.pg }} -- src/session-ingest/__tests__/hold-harness/two-conn.postgres.test.ts src/session-ingest/__tests__/hold-harness/put-gate.minio.test.ts 2>&1 | tee hold-harness-pg${{ matrix.pg }}.log
           # The 062320/062340 proofs bootstrap scratch databases (cluster-wide roles), which the later auth and role
           # proofs refuse on the service cluster: they run on the harness's own disposable PostgreSQL, same major.
-          bun src/session-ingest/__tests__/hold-harness/run.ts --pg ${{ matrix.pg }} -- src/session-ingest/__tests__/org-admission-hold.postgres.test.ts src/session-ingest/__tests__/org-erasure-history.postgres.test.ts 2>&1 | tee -a hold-harness-pg${{ matrix.pg }}.log
+          bun src/session-ingest/__tests__/hold-harness/run.ts --pg ${{ matrix.pg }} -- src/session-ingest/__tests__/org-admission-hold.postgres.test.ts src/session-ingest/__tests__/org-erasure-history.postgres.test.ts src/session-ingest/__tests__/session-erasure-replay-manifest.postgres.test.ts 2>&1 | tee -a hold-harness-pg${{ matrix.pg }}.log
           grep -E '^# hold-harness' hold-harness-pg${{ matrix.pg }}.log | sed "s/^/PostgreSQL ${{ matrix.pg }}: /" >> "$GITHUB_STEP_SUMMARY"
       # The session-analysis runner on LOCKER_PROVIDER=azure against Azurite: loopback-only, random host port,
       # in-memory data, two accounts (one with blob versioning, one without) whose throwaway keys live only in

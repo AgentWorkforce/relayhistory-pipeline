@@ -210,6 +210,44 @@ export const RETAINED_BY_ROLLBACK: Readonly<Record<string, readonly string[]>> =
     "trigger:ingest_org_erasure_history_bindings_guard@sessions.ingest_org_erasure_history_bindings",
     "trigger:ingest_org_erasure_history_bindings_truncate@sessions.ingest_org_erasure_history_bindings",
   ],
+  // 20261105062360: a POPULATED replay manifest (its four tables, guards, digest, shape and reader, and the receipts
+  // binding constraint) is kept by the down as the immutable replay witness; an empty one is dropped. Its sentinel is the
+  // captured fence body, which the down always drops.
+  "upstream:20261105062360_session_erasure_replay_manifest.sql": [
+    "relation:sessions.session_erasure_replay_requests",
+    "relation:sessions.session_erasure_replay_aliases",
+    "relation:sessions.session_erasure_replay_targets",
+    "relation:sessions.session_erasure_replay_completions",
+    "index:session_erasure_replay_requests_pkey",
+    "index:session_erasure_replay_requests_receipt",
+    "index:session_erasure_replay_requests_request",
+    "index:session_erasure_replay_requests_scope",
+    "index:session_erasure_replay_aliases_pkey",
+    "index:session_erasure_replay_aliases_member",
+    "index:session_erasure_replay_aliases_manifest",
+    "index:session_erasure_replay_targets_pkey",
+    "index:session_erasure_replay_targets_order",
+    "index:session_erasure_replay_completions_pkey",
+    "index:session_erasure_receipts_request_binding",
+    "function:sessions.session_erasure_replay_guard",
+    "function:sessions.session_erasure_replay_digest",
+    "function:sessions.session_erasure_replay_child_guard",
+    "function:sessions.session_erasure_replay_seal_guard",
+    "function:sessions.session_erasure_replay_shape",
+    "function:sessions.session_erasure_replay_read",
+    "function:sessions.session_erasure_replay_unproven",
+    "trigger:session_erasure_replay_guard@sessions.session_erasure_replay_requests",
+    "trigger:session_erasure_replay_truncate@sessions.session_erasure_replay_requests",
+    "trigger:session_erasure_replay_guard@sessions.session_erasure_replay_aliases",
+    "trigger:session_erasure_replay_truncate@sessions.session_erasure_replay_aliases",
+    "trigger:session_erasure_replay_guard@sessions.session_erasure_replay_targets",
+    "trigger:session_erasure_replay_truncate@sessions.session_erasure_replay_targets",
+    "trigger:session_erasure_replay_guard@sessions.session_erasure_replay_completions",
+    "trigger:session_erasure_replay_truncate@sessions.session_erasure_replay_completions",
+    "trigger:session_erasure_replay_unsealed@sessions.session_erasure_replay_aliases",
+    "trigger:session_erasure_replay_unsealed@sessions.session_erasure_replay_targets",
+    "trigger:session_erasure_replay_seal@sessions.session_erasure_replay_completions",
+  ],
 };
 
 /** How an ADOPTABLE_INDEXES step is prebuilt, and what else its CREATE inventory names. */
@@ -714,6 +752,10 @@ export const MIGRATION_SENTINELS: Record<string, Sentinel> = {
   "upstream:20261105062350_buffered_search_feed_page_keyset.sql": {
     evidence: "replacement: buffered_search_feed_page's keyset is one row comparison, with plan_cache_mode=force_custom_plan",
     sql: "SELECT EXISTS(SELECT 1 FROM pg_proc WHERE oid=to_regprocedure('sessions.buffered_search_feed_page(jsonb)') AND prosecdef AND prosrc LIKE '%coalesce(c.after_created_at,c.since-interval%' AND 'plan_cache_mode=force_custom_plan'=ANY(proconfig)) AS applied",
+  },
+  "upstream:20261105062360_session_erasure_replay_manifest.sql": {
+    evidence: "function sessions.session_erasure_replay_fence(text,text,text,text,text[],uuid) (the captured session erase fence)",
+    sql: "SELECT to_regprocedure('sessions.session_erasure_replay_fence(text,text,text,text,text[],uuid)') IS NOT NULL AS applied",
   },
   "upstream:20261105062070_coordination_advisor_readers.sql": {
     evidence: "functions sessions.coordination_advisor_write_facts_v1 and sessions.coordination_advisories_recent_v1",

@@ -1797,6 +1797,30 @@
     "sessions.session_directory_worker_scope(text)": [
       "<owner>:EXECUTE"
     ],
+    "sessions.session_erasure_replay_child_guard()": [
+      "<owner>:EXECUTE"
+    ],
+    "sessions.session_erasure_replay_digest(uuid)": [
+      "<owner>:EXECUTE"
+    ],
+    "sessions.session_erasure_replay_fence(text,text,text,text,text[],uuid)": [
+      "<owner>:EXECUTE"
+    ],
+    "sessions.session_erasure_replay_guard()": [
+      "<owner>:EXECUTE"
+    ],
+    "sessions.session_erasure_replay_read(text,text,text,text,jsonb,integer)": [
+      "<owner>:EXECUTE"
+    ],
+    "sessions.session_erasure_replay_seal_guard()": [
+      "<owner>:EXECUTE"
+    ],
+    "sessions.session_erasure_replay_shape()": [
+      "<owner>:EXECUTE"
+    ],
+    "sessions.session_erasure_replay_unproven(text)": [
+      "<owner>:EXECUTE"
+    ],
     "sessions.session_history_capture(jsonb)": [
       "<owner>:EXECUTE",
       "bulls96_session_ingest:EXECUTE"

@@ -4,6 +4,7 @@
  */
 import { ingestOrgAdmissionHold, lastBody as holdLastBody } from "../../../scripts/sessions-function-boundary/lanes/ingest-org-admission-hold.ts";
 import { ingestOrgErasureHistory } from "../../../scripts/sessions-function-boundary/lanes/ingest-org-erasure-history.ts";
+import { sessionErasureReplayManifest } from "../../../scripts/sessions-function-boundary/lanes/session-erasure-replay-manifest.ts";
 import { afterEach, describe, expect, setDefaultTimeout, spyOn, test } from "bun:test";
 import { createHash } from "node:crypto";
 import { existsSync, readFileSync } from "node:fs";
@@ -2723,7 +2724,27 @@ describe("function boundary: ACL manifest, residual, activation gate", () => {
       const open = src.indexOf(tag, start) + tag.length;
       return src.slice(open, src.indexOf(tag, open));
     };
-    // 20261105062350 (the buffered feed page keyset) is newest: 062340's down refuses (55000) while it is applied; its
+    // 20261105062360 (the session erasure replay manifest) is newest: 062350's down refuses (55000) while it is applied;
+    // its checksum-pinned down restores 050000's erase session and fence bodies exactly and, with no captured manifest
+    // here, drops the four manifest tables, their functions and the receipts binding constraint; it removes its ledger
+    // row and refuses on a rerun. (The populated, retained-witness path: session-erasure-replay-manifest.pglite.test.ts.)
+    const RPM = "upstream:20261105062360_session_erasure_replay_manifest.sql";
+    expect(await names()).toContain(RPM);
+    expect((await failure(rollback("20261105062350_buffered_search_feed_page_keyset.down.sql")))?.code).toBe("55000");
+    const manifestReplaced = Object.entries(sessionErasureReplayManifest.replaces);
+    for (const [sig] of manifestReplaced) expect((await procSrc(sig)).s).toContain("-- 062360 session erasure replay manifest");
+    await rollback("20261105062360_session_erasure_replay_manifest.down.sql");
+    expect(await names()).not.toContain(RPM);
+    for (const [sig, r] of manifestReplaced) {
+      const prior = holdLastBody(readFileSync(join(root, r.original), "utf8"), sig);
+      const tag = /AS (\$[a-z_]+\$)/u.exec(prior)![1]!;
+      const open = prior.indexOf(tag) + tag.length;
+      expect(await procSrc(sig)).toEqual({ s: prior.slice(open, prior.indexOf(tag, open)), d: r.secdef });
+    }
+    for (const t of ["requests", "aliases", "targets", "completions"]) expect(await relation(`sessions.session_erasure_replay_${t}`)).toBeNull();
+    expect((await db.query<{ n: number }>("SELECT count(*)::int n FROM pg_proc p JOIN pg_namespace n ON n.oid=p.pronamespace WHERE n.nspname='sessions' AND p.proname LIKE 'session\\_erasure\\_replay\\_%'")).rows[0]!.n).toBe(0);
+    expect((await failure(rollback("20261105062360_session_erasure_replay_manifest.down.sql")))?.code).toBe("55000");
+    // 20261105062350 (the buffered feed page keyset) is then newest: 062340's down refuses (55000) while it is applied; its
     // lane-generated, checksum-pinned down restores 043870's exact page function (body and proconfig), removes its
     // ledger row, and refuses on a rerun.
     const BPK = "upstream:20261105062350_buffered_search_feed_page_keyset.sql";

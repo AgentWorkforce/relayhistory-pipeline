@@ -1,0 +1,250 @@
+{
+  "encoding": "rh-erase-replay-manifest/v1: sha256 over the raw ASCII tag 'rh-erase-replay-manifest/v1' (not framed), then frames; frame = u32 big-endian UTF-8 octet length + bytes. Frames in order: capture_version (canonical decimal), manifest_id (canonical lowercase UUID), request_id, org_id, workspace_id, source, requested_session_id, alias count (canonical decimal), each alias in bytewise order, target count (canonical decimal), then per target in bytewise order of (user_id, origin_id, source, session_id) its four frames. No Unicode normalization, no locale.",
+  "minimal_message_hex": "72682d65726173652d7265706c61792d6d616e69666573742f763100000001310000002437653866396130622d316332642d346533662d396134622d3563366437653866396130620000000c7265712d766563746f722d320000000a6f72672d766563746f720000000977732d766563746f7200000006636c6175646500000001730000000131000000017300000001310000000175000000016f00000006636c617564650000000173",
+  "vectors": [
+    {
+      "name": "1 minimal: one alias, one target",
+      "binding": {
+        "capture_version": 1,
+        "manifest_id": "7e8f9a0b-1c2d-4e3f-9a4b-5c6d7e8f9a0b",
+        "request_id": "req-vector-2",
+        "org_id": "org-vector",
+        "workspace_id": "ws-vector",
+        "source": "claude",
+        "requested_session_id": "s"
+      },
+      "aliases": [
+        "s"
+      ],
+      "targets": [
+        {
+          "user_id": "u",
+          "origin_id": "o",
+          "source": "claude",
+          "session_id": "s"
+        }
+      ],
+      "sha256": "13fef14bd7f52cf5da522d2e9ed9ff9b5caccfda76e98c2d49d76b37510b25bd"
+    },
+    {
+      "name": "2+3+4 three aliases and four targets given out of order; non-ASCII ids (multi-byte octet lengths); uppercase before lowercase, ASCII before U+00E9",
+      "binding": {
+        "capture_version": 1,
+        "manifest_id": "0b9f1c2e-6d3a-4f5e-8a7b-1c2d3e4f5a6b",
+        "request_id": "req-vector-1",
+        "org_id": "org-vector",
+        "workspace_id": "ws-vector",
+        "source": "claude",
+        "requested_session_id": "sess-B"
+      },
+      "aliases": [
+        "sess-é",
+        "sess-B",
+        "sess-a"
+      ],
+      "targets": [
+        {
+          "user_id": "u-ü",
+          "origin_id": "relayhistory:conversation_turns:v1",
+          "source": "claude",
+          "session_id": "sess-a"
+        },
+        {
+          "user_id": "U-1",
+          "origin_id": "origin-z",
+          "source": "claude",
+          "session_id": "sess-é"
+        },
+        {
+          "user_id": "U-1",
+          "origin_id": "origin-z",
+          "source": "claude",
+          "session_id": "sess-B"
+        },
+        {
+          "user_id": "U-1",
+          "origin_id": "origin-Z",
+          "source": "claude",
+          "session_id": "sess-a"
+        }
+      ],
+      "sha256": "f8271f947933d7325d1f4ad828e0ec36325cae9f01241522d12473e4057a9a92"
+    },
+    {
+      "name": "4 C-vs-locale traps: bytewise '-' (0x2D) < '.' (0x2E) < '_' (0x5F) and 'A' < 'a', so A < a < a- < a.1 < a_",
+      "binding": {
+        "capture_version": 1,
+        "manifest_id": "3c4d5e6f-7a8b-4c9d-8e0f-1a2b3c4d5e6f",
+        "request_id": "req-vector-3",
+        "org_id": "org-vector",
+        "workspace_id": "ws-vector",
+        "source": "claude",
+        "requested_session_id": "a"
+      },
+      "aliases": [
+        "a_",
+        "a",
+        "a-",
+        "A",
+        "a.1"
+      ],
+      "targets": [
+        {
+          "user_id": "u",
+          "origin_id": "o",
+          "source": "claude",
+          "session_id": "a_"
+        },
+        {
+          "user_id": "u",
+          "origin_id": "o",
+          "source": "claude",
+          "session_id": "a-"
+        },
+        {
+          "user_id": "u",
+          "origin_id": "o",
+          "source": "claude",
+          "session_id": "A"
+        },
+        {
+          "user_id": "u",
+          "origin_id": "o",
+          "source": "claude",
+          "session_id": "a"
+        },
+        {
+          "user_id": "u",
+          "origin_id": "o",
+          "source": "claude",
+          "session_id": "a.1"
+        }
+      ],
+      "sha256": "7b6cfcca670190967f5bfa367df062a0eabc4bd5dad7ab31a2eedbff42a468b3"
+    },
+    {
+      "name": "5 boundary: empty workspace_id (the erase accepts it; every other field is non-empty)",
+      "binding": {
+        "capture_version": 1,
+        "manifest_id": "5e6f7a8b-9c0d-4e1f-a2b3-c4d5e6f7a8b9",
+        "request_id": "req-vector-4",
+        "org_id": "org-vector",
+        "workspace_id": "",
+        "source": "claude",
+        "requested_session_id": "s"
+      },
+      "aliases": [
+        "s"
+      ],
+      "targets": [
+        {
+          "user_id": "u",
+          "origin_id": "o",
+          "source": "claude",
+          "session_id": "s"
+        }
+      ],
+      "sha256": "610313e9097b3104d0c6c67cc02442b13f66bbbab53aa6f8e6f04949aae25192"
+    },
+    {
+      "name": "6 counts >= 10: eleven aliases (s-0..s-10, bytewise s-1 < s-10 < s-2) and twelve targets",
+      "binding": {
+        "capture_version": 1,
+        "manifest_id": "9a0b1c2d-3e4f-4a5b-8c6d-7e8f9a0b1c2d",
+        "request_id": "req-vector-5",
+        "org_id": "org-vector",
+        "workspace_id": "ws-vector",
+        "source": "claude",
+        "requested_session_id": "s-10"
+      },
+      "aliases": [
+        "s-10",
+        "s-9",
+        "s-8",
+        "s-7",
+        "s-6",
+        "s-5",
+        "s-4",
+        "s-3",
+        "s-2",
+        "s-1",
+        "s-0"
+      ],
+      "targets": [
+        {
+          "user_id": "u",
+          "origin_id": "o",
+          "source": "claude",
+          "session_id": "s-0"
+        },
+        {
+          "user_id": "u",
+          "origin_id": "o",
+          "source": "claude",
+          "session_id": "s-1"
+        },
+        {
+          "user_id": "u",
+          "origin_id": "o",
+          "source": "claude",
+          "session_id": "s-2"
+        },
+        {
+          "user_id": "u",
+          "origin_id": "o",
+          "source": "claude",
+          "session_id": "s-3"
+        },
+        {
+          "user_id": "u",
+          "origin_id": "o",
+          "source": "claude",
+          "session_id": "s-4"
+        },
+        {
+          "user_id": "u",
+          "origin_id": "o",
+          "source": "claude",
+          "session_id": "s-5"
+        },
+        {
+          "user_id": "u",
+          "origin_id": "o",
+          "source": "claude",
+          "session_id": "s-6"
+        },
+        {
+          "user_id": "u",
+          "origin_id": "o",
+          "source": "claude",
+          "session_id": "s-7"
+        },
+        {
+          "user_id": "u",
+          "origin_id": "o",
+          "source": "claude",
+          "session_id": "s-8"
+        },
+        {
+          "user_id": "u",
+          "origin_id": "o",
+          "source": "claude",
+          "session_id": "s-9"
+        },
+        {
+          "user_id": "u",
+          "origin_id": "o",
+          "source": "claude",
+          "session_id": "s-10"
+        },
+        {
+          "user_id": "v",
+          "origin_id": "o",
+          "source": "claude",
+          "session_id": "s-3"
+        }
+      ],
+      "sha256": "ee93c4ff1e1c8bf7b6b98f19a5b891794eecb39c566a4b37b34b9f36cedc56ca"
+    }
+  ]
+}

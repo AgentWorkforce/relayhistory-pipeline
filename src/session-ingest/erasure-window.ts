@@ -60,6 +60,19 @@ export const ERASURE_HISTORY_TABLES: Record<string, string> = {
   ingest_org_erasure_history_coverage: "062340 coverage periods, no org, read via hold_status",
   ingest_org_erasure_history_bindings: "062340 per-epoch fence and selected FULL (bound_org), read via hold_status",
 };
+/**
+ * Slot 062360's replay-target manifest: proof storage for session erasures, not erasure sources. Each has an org_id (the
+ * compound tenant binding of the witness), yet none is a 062340 source and none carries its recorder, so a manifest
+ * write never changes the release watermark (session-erasure-replay-manifest.pglite.test.ts pins both). An EXACT list:
+ * a future table matching ERASURE_TABLE_NAME, under this prefix or any other, still fails classification until it is
+ * reviewed into one of these classes. The bridge reads them only through sessions.session_erasure_replay_read.
+ */
+export const ERASURE_PROOF_TABLES: Record<string, string> = {
+  session_erasure_replay_requests: "062360 capture intent: manifest UUID, accepted request, tenant, source, requested session",
+  session_erasure_replay_aliases: "062360 original alias declaration A0, one row per fence identity",
+  session_erasure_replay_targets: "062360 captured target set (owner, origin, source, alias)",
+  session_erasure_replay_completions: "062360 seal: counts and canonical digest of a complete nonempty capture",
+};
 export const ERASURE_TABLE_NAME = /eras|delet|rearm|purge|tombstone|forget|reset/u;
 
 /**
