@@ -62,7 +62,10 @@ interface HintBase {
   session: string;
   /** The authoritative pointer revision the producer committed (a sweep: the highest it saw). */
   revision: number;
-  /** sha256 (hex) of the committed manifest. */
+  /**
+   * sha256 (hex) of the committed object: session_index.content_sha256, the raw chain hash (packages/object-store
+   * manifest.ts raw.content_sha256), which both hook paths hold; the manifest body hash exists only on publish.
+   */
   digest: string;
   /** Epoch ms of the oldest committed evidence the producer knows is not yet covered by a brief. */
   first_uncovered_at: number;
@@ -102,13 +105,18 @@ export function parseBriefWakeHint(v: unknown): BriefWakeHint | null {
   return v as unknown as BriefWakeHint;
 }
 
-/** The physical incarnation a producer committed: what a retry of the same commit has in common, and no other. */
+/**
+ * The committed object a producer wrote, as BOTH hook paths see it at the session_index upsert (canonical publish
+ * in SQL; the legacy indexer in TS): the physical row (source = harness, session, machine) and the manifest key,
+ * which is unique per publication attempt and so tells a recreated row (after the rekey DELETE) from the one it
+ * replaced. The publication head generation is NOT used: it is a random uuid with no order and is absent on legacy
+ * keys.
+ */
 export interface BriefPhysicalIncarnation {
   source: string;
   session: string;
   machine: string;
-  /** The publication head generation (or the pointer row's): a deleted and recreated head differs. */
-  generation: string;
+  manifestKey: string;
 }
 
 /**
@@ -121,8 +129,8 @@ export interface BriefPhysicalIncarnation {
 export function briefTriggerId(h: { org: string; workspace: string; harness: string; session: string; revision: number; digest: string },
   incarnation: BriefPhysicalIncarnation): string {
   return createHash("sha256").update(JSON.stringify([
-    "session-brief-commit", 2, h.org, h.workspace, h.harness, h.session, h.revision, h.digest,
-    incarnation.source, incarnation.session, incarnation.machine, incarnation.generation,
+    "session-brief-commit", 3, h.org, h.workspace, h.harness, h.session, h.revision, h.digest,
+    incarnation.source, incarnation.session, incarnation.machine, incarnation.manifestKey,
   ])).digest("hex");
 }
 
@@ -157,6 +165,14 @@ export interface BriefWakeState {
    * (armWakeup resets attempts to 0).
    */
   backoff?: boolean;
+  /** The outstanding lease (store.ts lease_id): set by a claim, still set after its wall-clock expiry until reclaim. */
+  leaseId?: string;
+  /**
+   * [Pipeline 80c6350a1113] The FIRST committed evidence armed while a lease was outstanding (expired or not): the
+   * trailing work's own oldest uncovered time (B, kept when C lands too). Cleared only by a new claim, which sets
+   * its own generation boundary. Column sessions.session_brief_wakeups.trailing_since (slot 20261105062520).
+   */
+  trailingSince?: number;
 }
 
 const secs = (s: number) => s * 1_000;
@@ -174,7 +190,13 @@ export function planArm(prev: BriefWakeState | null, nowMs: number, hasBrief: bo
     ? Math.min(nowMs + secs(t.idleSeconds), pendingSince + secs(t.maxWaitSeconds))
     : pendingSince + secs(t.maxDelaySeconds);
   if (prev && !hasBrief) dueAt = Math.min(dueAt, prev.dueAt);
-  return { pendingSince, evidenceAt: nowMs, dueAt, generation: (prev?.generation ?? 0) + 1, leased: prev?.leased ?? false };
+  // Evidence armed while a lease is outstanding (fenced by lease_id, not by its wall-clock expiry) is trailing work.
+  const trailingSince = prev?.leaseId !== undefined ? (prev.trailingSince ?? nowMs) : prev?.trailingSince;
+  return {
+    pendingSince, evidenceAt: nowMs, dueAt, generation: (prev?.generation ?? 0) + 1, leased: prev?.leased ?? false,
+    ...(prev?.leaseId !== undefined ? { leaseId: prev.leaseId } : {}),
+    ...(trailingSince !== undefined ? { trailingSince } : {}),
+  };
 }
 
 export interface BriefHintContext {
@@ -224,46 +246,78 @@ export function claimAt(state: BriefWakeState, opts: { hasBrief: boolean; lastAt
   return Math.max(state.dueAt, opts.lastAttemptMs + secs(opts.throttleSeconds));
 }
 
-/** A worker claims a due wakeup. */
-export const claimPlan = (s: BriefWakeState): BriefWakeState => ({ ...s, leased: true });
+/**
+ * A worker claims a due wakeup under a new lease (also a reclaim after an expired one). The claim is a new
+ * generation boundary: everything armed so far is within it, so trailing_since clears; pending_since is kept (a
+ * failed earlier run retired nothing, so the oldest uncovered time still stands).
+ */
+export function claimPlan(s: BriefWakeState, leaseId = "lease"): BriefWakeState {
+  const { trailingSince: _t, backoff: _b, ...rest } = s;
+  return { ...rest, leased: true, leaseId };
+}
+
+/** The claim a run holds: what its finish or failure is fenced by. */
+export interface BriefClaim { generation: number; leaseId: string }
 
 /**
- * The run finished, or failed, for the generation it claimed (store.ts finishWakeup). Same generation: done (null).
- * Newer evidence armed meanwhile: the lease is released and the trailing work stays, with its window restarted at
- * the finish (pending_since = now; due = LEAST(evidence_at + I, now + W)), exactly as finishWakeup does today. KNOWN
- * GAP (Pipeline review): the trailing evidence's own oldest uncovered time is not persisted, so its window starts late
- * by up to the run's length and does not survive a retry. Exact preservation needs a column (trailing_since): a
- * migration in a separate Pipeline registry slot, requested, not added here.
+ * The run finished for the claim it holds (store.ts finishWakeup), fenced by lease_id. A stale finish (the lease was
+ * reclaimed) changes nothing: the state is returned as is, so it can never clear a successor's times. Same lease and
+ * generation: done (null). Same lease, newer generation: the trailing work stays, its window starting at its own
+ * first commit (pending_since := trailing_since); with no trailing_since (a row armed during a lease before this
+ * column existed) the conservative pending_since is kept, never now() (which would silently postpone known work).
  */
-export function finishPlan(state: BriefWakeState, claimedGeneration: number, nowMs: number, t: BriefTriggerTiming): BriefWakeState | null {
-  if (state.generation === claimedGeneration) return null;
-  return { ...state, leased: false, pendingSince: nowMs, dueAt: Math.min(state.evidenceAt + secs(t.idleSeconds), nowMs + secs(t.maxWaitSeconds)) };
+export function finishPlan(state: BriefWakeState, claim: BriefClaim, t: BriefTriggerTiming): BriefWakeState | null {
+  if (state.leaseId !== claim.leaseId) return state; // stale completion
+  if (state.generation === claim.generation) return null;
+  const { trailingSince, leaseId: _l, ...rest } = state;
+  const pendingSince = trailingSince ?? state.pendingSince;
+  return { ...rest, leased: false, pendingSince, dueAt: Math.min(state.evidenceAt + secs(t.idleSeconds), pendingSince + secs(t.maxWaitSeconds)) };
+}
+
+/**
+ * The run failed (store.ts rescheduleWakeup), fenced by lease_id like a finish. A failure retires no evidence: the
+ * lease is released, pending_since and trailing_since are kept, and the row is due after the backoff (in backoff,
+ * so a hint cannot pull it forward; new committed evidence still re-arms it).
+ */
+export function failPlan(state: BriefWakeState, claim: BriefClaim, nowMs: number, backoffMs: number): BriefWakeState {
+  if (state.leaseId !== claim.leaseId) return state; // stale
+  const { leaseId: _l, ...rest } = state;
+  return { ...rest, leased: false, dueAt: nowMs + backoffMs, backoff: true };
 }
 
 // ---- durable commit identity (design r2: sessions.session_brief_arms; the SQL mirrors this) ----
 
 /**
- * What one machine's committed head says about a session: its content (head generation, pointer revision, manifest
- * sha256) and whether the session has ended. A head deleted and recreated starts a new generation, so an equal
- * revision with a different generation or sha is a REPLACEMENT (new work), never a replay.
+ * One machine's committed object for a session, as both hook paths derive it: the session_index revision (the only
+ * durable, shared order: fenced strictly greater per row, monotone across publication head regenerations and
+ * tombstones), the manifest key (unique per publication attempt) and the raw content sha256, plus whether the
+ * manifest marks the session ended (an end is a new manifest revision: manifests are immutable).
  */
-export interface BriefCommitIdentity { generation: string; revision: number; sha256: string; ended: boolean }
+export interface BriefCommitIdentity { revision: number; manifestKey: string; contentSha256: string; ended: boolean }
 
-const sameContent = (a: BriefCommitIdentity, b: BriefCommitIdentity) =>
-  a.generation === b.generation && a.revision === b.revision && a.sha256 === b.sha256;
+const sameObject = (a: BriefCommitIdentity, b: BriefCommitIdentity) =>
+  a.revision === b.revision && a.manifestKey === b.manifestKey && a.contentSha256 === b.contentSha256;
 
 /**
- * Does a committed identity add work over what is already armed and consumed for its machine? For the same content,
- * `ended` is monotone (an end, once recorded, stays): a replay of the pre-end append (ended=false) after the end can
- * neither clear the recorded end nor re-arm consumed work. Returns the identity to record as armed, or null (a no-op:
- * an exact replay, the indexer seeing a commit publish already armed, or work already consumed).
+ * Does a committed object add work over what this machine's row has armed and consumed (sessions.session_brief_arms:
+ * the highest armed and consumed identities; it survives completion, and is erased with the row, so a recreate after
+ * the rekey DELETE starts fresh)? Ordered by revision:
+ *   below max(armed, consumed): an older replay (A after B, even after completion): no-op;
+ *   equal, the same object: a replay or the other hook path seeing the same commit: no-op, except that `ended` is
+ *     monotone (an end recorded for that object stays; a pre-end replay cannot clear it);
+ *   equal, a different object: not authoritative (the session_index fence admits one object per revision within a
+ *     row's lifetime): no-op;
+ *   above: new evidence: arm.
+ * Returns the identity to record as armed, or null.
  */
 export function armIdentity(armed: BriefCommitIdentity | null, consumed: BriefCommitIdentity | null, incoming: BriefCommitIdentity): BriefCommitIdentity | null {
-  let next = incoming;
-  if (armed && sameContent(armed, incoming)) next = { ...incoming, ended: armed.ended || incoming.ended };
-  if (consumed && sameContent(consumed, next) && (consumed.ended || !next.ended)) return null; // covered
-  if (armed && sameContent(armed, next) && armed.ended === next.ended) return null; // already armed (exact replay)
-  return next;
+  const floor = Math.max(armed?.revision ?? -1, consumed?.revision ?? -1);
+  if (incoming.revision < floor) return null;
+  if (incoming.revision > floor) return incoming;
+  const at = armed && armed.revision === floor ? armed : consumed!;
+  if (!sameObject(at, incoming)) return null; // a different object at a fenced revision
+  if (incoming.ended && !at.ended && !(consumed && sameObject(consumed, incoming) && consumed.ended)) return { ...at, ended: true };
+  return null;
 }
 
 /** SQS standard queues delay a message by at most 15 minutes. */

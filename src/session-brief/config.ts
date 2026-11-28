@@ -28,6 +28,9 @@
  *                                   once admit() would admit them (a limit raised mid-day; the global
  *                                   ceiling is checked first), and re-swept after the stale-wakeup prune.
  *                                   The caps are unchanged and still enforced at claim.
+ *   SESSION_BRIEF_TRAILING          T144, default off. Exactly "true": keep trailing work's own first commit
+ *                                   time through finish and retry (sessions.session_brief_wakeups.trailing_since);
+ *                                   requires migration 20261105062520 applied first. Off: SQL byte-identical to main.
  *   SESSION_BRIEF_WORKSPACE_IDS     optional comma-separated explicit workspace ids; required for native
  *                                   canonical input. Restricts sweep, claims and housekeeping.
  *
@@ -59,6 +62,8 @@ export interface BriefConfig {
   batch: number;
   leaseSeconds: number;
   sweepSeconds: number;
+  /** T144 trailing state (SESSION_BRIEF_TRAILING=true; needs migration 20261105062520). */
+  trailing: boolean;
 }
 
 function int(
@@ -105,6 +110,7 @@ export function briefConfig(env: NodeJS.ProcessEnv = process.env): BriefConfig {
     // Above a full batch of 20 s model calls, so a claim never lapses mid-tick.
     leaseSeconds: int(env, "SESSION_BRIEF_LEASE_SECONDS", 300, 30, 3_600),
     sweepSeconds: int(env, "SESSION_BRIEF_SWEEP_SECONDS", 0, 0, 86_400),
+    trailing: env.SESSION_BRIEF_TRAILING === "true",
   };
 }
 

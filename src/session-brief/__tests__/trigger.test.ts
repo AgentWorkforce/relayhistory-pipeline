@@ -9,7 +9,7 @@
  */
 import { describe, expect, test } from "bun:test";
 import {
-  armIdentity, BRIEF_TRIGGER_CONTRACT, briefTriggerConfig, briefTriggerId, briefWakeHint, claimAt, claimPlan, finishPlan, handoffPlan,
+  armIdentity, BRIEF_TRIGGER_CONTRACT, briefTriggerConfig, briefTriggerId, briefWakeHint, claimAt, claimPlan, failPlan, finishPlan, handoffPlan,
   briefMiss, hintCovers, parseBriefWakeHint, planArm, planHint, SQS_MAX_DELAY_SECONDS, type BriefPhysicalIncarnation,
   type BriefCommitIdentity, type BriefWakeHint, type BriefWakeKind, type BriefWakeState,
 } from "../trigger.ts";
@@ -20,10 +20,13 @@ const THROTTLE_S = 120;
 const VISIBILITY_MS = 30_000;
 const DIGEST = "a".repeat(64);
 const M1 = "srv_00000000000000000000000000000001", M2 = "srv_00000000000000000000000000000002";
-interface CommitOpts { machine?: string; generation?: string; digest?: string }
-const inc = (harness: string, o: CommitOpts = {}): BriefPhysicalIncarnation => ({ source: harness, session: "phys-1", machine: o.machine ?? M1, generation: o.generation ?? "1" });
+/** manifestKey: the committed object's key (unique per publication attempt); default one per machine and revision. */
+interface CommitOpts { machine?: string; manifestKey?: string; digest?: string }
+const keyOf = (revision: number, o: CommitOpts) => o.manifestKey ?? `${o.machine ?? M1}/r${revision}`;
+const inc = (harness: string, o: CommitOpts = {}, revision = 0): BriefPhysicalIncarnation =>
+  ({ source: harness, session: "phys-1", machine: o.machine ?? M1, manifestKey: keyOf(revision, o) });
 const hint = (kind: BriefWakeKind, revision: number, at: number, harness = "claude", o: CommitOpts = {}): BriefWakeHint =>
-  briefWakeHint(kind, { org: "org-1", workspace: "ws-1", harness, session: "sess-1", revision, digest: o.digest ?? DIGEST, first_uncovered_at: at }, inc(harness, o));
+  briefWakeHint(kind, { org: "org-1", workspace: "ws-1", harness, session: "sess-1", revision, digest: o.digest ?? DIGEST, first_uncovered_at: at }, inc(harness, o, revision));
 const v1 = (h: BriefWakeHint): BriefWakeHint => {
   const { harness: _h, ...rest } = h as BriefWakeHint & { harness?: string };
   return { ...rest, v: 1 } as BriefWakeHint;
@@ -42,6 +45,11 @@ class Sim {
   /** The consumed identity per harness:machine (it survives completion). */
   consumedIds = new Map<string, BriefCommitIdentity>();
   armedRefs(harness: string): Set<string> { return new Set([...(this.rows.get(harness)?.armed.values() ?? [])].map((x) => x.ref)); }
+  /** The rekey DELETE of a session_index row: the arm record for that machine is erased with it (a recreate starts fresh). */
+  deleteRow(harness: string, machine = M1) {
+    this.rows.get(harness)?.armed.delete(machine);
+    this.consumedIds.delete(`${harness}:${machine}`);
+  }
   briefs = new Map<string, Brief>();
   /** The highest committed revision per harness (what a run reads from the authoritative pointers). */
   committed = new Map<string, number>();
@@ -49,7 +57,8 @@ class Sim {
   runs: Run[] = [];
   failSends = 0;
   failRuns = 0;
-  inFlight = new Map<string, { generation: number }>();
+  inFlight = new Map<string, { generation: number; leaseId: string }>();
+  private leases = 0;
   sweptAt: number[] = [];
   /** Commit refs consumed by a successful run (they never re-arm and never advance a row). */
   consumed = new Set<string>();
@@ -73,7 +82,7 @@ class Sim {
     const prevRow = this.rows.get(harness);
     const h = hint(opts.kind ?? "append", revision, prevRow?.state.pendingSince ?? this.now, harness, opts);
     const machine = opts.machine ?? M1;
-    const incoming: BriefCommitIdentity = { generation: opts.generation ?? "1", revision, sha256: opts.digest ?? DIGEST, ended: opts.kind === "end" };
+    const incoming: BriefCommitIdentity = { revision, manifestKey: keyOf(revision, opts), contentSha256: opts.digest ?? DIGEST, ended: opts.kind === "end" };
     const next = armIdentity(prevRow?.armed.get(machine)?.id ?? null, this.consumedIds.get(`${harness}:${machine}`) ?? null, incoming);
     if (!opts.loseArm && next) { // only genuinely changed committed evidence arms (a duplicate producer commit does not)
       const armed = new Map(prevRow?.armed ?? []);
@@ -113,23 +122,30 @@ class Sim {
     return true;
   }
 
+  /** Claim (or reclaim after an expired lease) under a new lease; returns the claim the run holds. */
   claim(harness: string, hold = false) {
     const row = this.rows.get(harness)!;
     this.runs.push({ harness, claimableAt: this.claimable(harness, row.state), claimedAt: this.now, generation: row.state.generation, dueAt: row.state.dueAt });
-    row.state = claimPlan(row.state);
+    const leaseId = `lease-${++this.leases}`;
+    row.state = claimPlan(row.state, leaseId);
     row.claimed = new Map(row.armed); // the arm record's claimed snapshot
-    this.inFlight.set(harness, { generation: row.state.generation });
+    const claim = { generation: row.state.generation, leaseId };
+    this.inFlight.set(harness, claim);
     if (!hold) this.finish(harness);
+    return claim;
   }
-  finish(harness: string) {
+  finish(harness: string, claim = this.inFlight.get(harness)!) {
     const row = this.rows.get(harness)!;
-    const g = this.inFlight.get(harness)!.generation;
-    this.inFlight.delete(harness);
+    if (this.inFlight.get(harness)?.leaseId === claim.leaseId) this.inFlight.delete(harness);
     const b = this.brief(harness);
+    if (row.state.leaseId !== claim.leaseId) { // a stale finish (reclaimed): nothing changes, nothing is consumed
+      row.state = finishPlan(row.state, claim, TIMING)!;
+      return;
+    }
     if (this.failRuns > 0) { // a retryable failure: the attempt counts, the row is rescheduled 60 s out (existing backoff)
       this.failRuns--;
       this.briefs.set(harness, { ...b, lastAttempt: this.now });
-      row.state = { ...row.state, leased: false, dueAt: this.now + 60_000, backoff: true };
+      row.state = failPlan(row.state, claim, this.now, 60_000);
       return;
     }
     // The run read the authoritative pointers: it covers every revision committed so far.
@@ -140,7 +156,7 @@ class Sim {
       if (row.armed.get(m)?.ref === c.ref) row.armed.delete(m);
     }
     delete row.claimed;
-    const next = finishPlan(row.state, g, this.now, TIMING);
+    const next = finishPlan(row.state, claim, TIMING);
     if (next) row.state = next; else this.rows.delete(harness);
   }
 
@@ -163,7 +179,7 @@ class Sim {
           for (const [harness, rev] of this.committed) // a lost arm: committed, uncovered, no wakeup
             if (!this.rows.has(harness) && rev > this.brief(harness).revision) {
               this.rows.set(harness, { state: planArm(null, this.now, this.brief(harness).ready, TIMING),
-                armed: new Map([[M1, { ref: hint("append", rev, T0, harness).trigger_id, id: { generation: "1", revision: rev, sha256: DIGEST, ended: false } }]]) });
+                armed: new Map([[M1, { ref: hint("append", rev, T0, harness).trigger_id, id: { revision: rev, manifestKey: keyOf(rev, {}), contentSha256: DIGEST, ended: false } }]]) });
               this.sweptAt.push(this.now);
             }
         }
@@ -195,7 +211,7 @@ describe("session-brief trigger: hint contract", () => {
   test("the commit reference is stable for one commit, kind-independent, and differs for any other incarnation or content", () => {
     const f = { org: "org-1", workspace: "ws-1", harness: "claude", session: "sess-1", revision: 3, digest: DIGEST };
     expect(briefTriggerId(f, inc("claude"))).toBe(briefTriggerId(f, { ...inc("claude") }));
-    for (const other of [{ ...inc("claude"), generation: "2" }, { ...inc("claude"), machine: M2 }, { ...inc("claude"), session: "phys-2" }])
+    for (const other of [{ ...inc("claude"), manifestKey: "recreated" }, { ...inc("claude"), machine: M2 }, { ...inc("claude"), session: "phys-2" }])
       expect(briefTriggerId(f, other)).not.toBe(briefTriggerId(f, inc("claude")));
     // Kind-independent: the append and the end for one commit share the reference (it names the commit).
     expect(hint("end", 3, T0).trigger_id).toBe(hint("append", 3, T0).trigger_id);
@@ -324,14 +340,14 @@ describe("session-brief trigger: offline fixtures", () => {
     sim.finish("claude");
     const trailing = sim.rows.get("claude")!.state;
     expect(trailing.leased).toBe(false);
-    // The trailing window restarts at the finish: late by the run's length (bounded by the lease), recorded here.
-    expect(trailing.pendingSince).toBe(finishedAt);
+    // The trailing window starts at B's own commit (trailing_since), not at the finish.
+    expect(trailing.pendingSince).toBe(bCommittedAt);
     expect(finishedAt - bCommittedAt).toBe(20_000);
     sim.advance(20 * 60_000);
     expect(sim.runs).toHaveLength(1); // hint B was lost and the tick is off: the trailing row waits for recovery
     expect(sim.rows.size).toBe(1);
     // With the one-minute tick the trailing work is claimed; its delay is SCORED from B's commit (a lower bound for
-    // B's first upload attempt), never reported as a pass: the restarted window makes it a miss.
+    // B's first upload attempt), never reported as a pass: a refresh waits the idle window, so it is a miss.
     sim.opts.tickSeconds = 60;
     sim.advance(5 * 60_000);
     expect(sim.runs).toHaveLength(2);
@@ -362,17 +378,78 @@ describe("session-brief trigger: offline fixtures", () => {
     expect(sim.runs).toHaveLength(2);
   });
 
-  test.todo("KNOWN GAP: B committed during A's lease keeps B's original uncovered time through finish and retry (needs trailing_since: a migration in a separate Pipeline registry slot)", () => {});
+  test("trailing state: B then C during A's lease, A succeeds covering A only: pending_since = tB", () => {
+    const t = TIMING;
+    let s = planArm(null, T0, true, t); // A at tA = T0
+    const a = { generation: s.generation, leaseId: "L1" };
+    s = claimPlan(s, a.leaseId);
+    const tB = T0 + 10_000, tC = T0 + 20_000;
+    s = planArm(s, tB, true, t); // B during A's lease
+    s = planArm(s, tC, true, t); // C too: the FIRST trailing commit is kept
+    expect(s.trailingSince).toBe(tB);
+    const after = finishPlan(s, a, t)!;
+    expect(after.pendingSince).toBe(tB);
+    expect(after.trailingSince).toBeUndefined();
+    expect(after.dueAt).toBe(Math.min(tC + 600_000, tB + 3_600_000));
+  });
 
-  test("A/B equal-revision replacement: the replacement's own reference advances its row; the consumed A does not", () => {
+  test("trailing state: failed A retires nothing; retry, a new trailing D, and a stale completion cannot clear the successor", () => {
+    const t = TIMING;
+    let s = planArm(null, T0, true, t); // A at tA
+    const a1 = { generation: s.generation, leaseId: "L1" };
+    s = claimPlan(s, a1.leaseId);
+    s = planArm(s, T0 + 10_000, true, t); // B during A
+    s = planArm(s, T0 + 20_000, true, t); // C during A
+    s = failPlan(s, a1, T0 + 30_000, 60_000); // A fails: nothing retired
+    expect([s.pendingSince, s.trailingSince, s.leased]).toEqual([T0, T0 + 10_000, false]);
+    const a2 = { generation: s.generation, leaseId: "L2" };
+    s = claimPlan(s, a2.leaseId); // the retry's claim: a new generation boundary (B and C are within it)
+    expect([s.pendingSince, s.trailingSince]).toEqual([T0, undefined]); // tA kept: the oldest uncovered time
+    s = planArm(s, T0 + 100_000, true, t); // D during the retry
+    expect(s.trailingSince).toBe(T0 + 100_000);
+    // A stale completion of the FIRST lease changes nothing (it cannot clear the successor's times).
+    expect(finishPlan(s, a1, t)).toBe(s);
+    expect(failPlan(s, a1, T0 + 110_000, 60_000)).toBe(s);
+    const done = finishPlan(s, a2, t)!; // the retry succeeds, covering A, B, C (not D)
+    expect(done.pendingSince).toBe(T0 + 100_000);
+  });
+
+  test("trailing state: B arms after the lease expired but before reclaim; reclaim; the stale finish is fenced", () => {
+    const t = TIMING;
+    let s = planArm(null, T0, true, t);
+    const a = { generation: s.generation, leaseId: "L1" };
+    s = claimPlan(s, a.leaseId);
+    // The lease's wall-clock expiry passes (lease_expires_at < now) but lease_id is still set until a reclaim.
+    s = planArm(s, T0 + 400_000, true, t); // B after expiry, before reclaim: still trailing work of lease L1
+    expect(s.trailingSince).toBe(T0 + 400_000);
+    const r = { generation: s.generation, leaseId: "L2" };
+    s = claimPlan(s, r.leaseId); // reclaim: new boundary, B is within it
+    expect(s.trailingSince).toBeUndefined();
+    expect(finishPlan(s, a, t)).toBe(s); // A's late finish: stale, no effect
+    expect(finishPlan(s, r, t)).toBeNull(); // the reclaim's run covers everything
+  });
+
+  test("trailing state: a legacy row (generation mismatch, no trailing_since) keeps the conservative pending bound", () => {
+    const t = TIMING;
+    const legacy: BriefWakeState = { pendingSince: T0, evidenceAt: T0 + 50_000, dueAt: T0 + 650_000, generation: 3, leased: true, leaseId: "L1" };
+    const after = finishPlan(legacy, { generation: 2, leaseId: "L1" }, t)!;
+    expect(after.pendingSince).toBe(T0); // never now(): that would silently postpone known pending work
+    expect(after.dueAt).toBe(Math.min(T0 + 50_000 + 600_000, T0 + 3_600_000));
+  });
+
+  test("same machine/revision different object: a no-op while the row lives; after a recreate it arms, and A's end is wake-only", () => {
     const sim = new Sim();
     sim.briefs.set("claude", { revision: 4, ready: true, lastAttempt: T0 - 600_000 });
-    const A = sim.commit("claude", 5, { lose: true }); // A: generation 1, revision 5
+    const A = sim.commit("claude", 5, { lose: true }); // A: revision 5
     sim.now = sim.rows.get("claude")!.state.dueAt;
     sim.claim("claude"); // A consumed
     expect(sim.consumed.has(A.trigger_id)).toBe(true);
     sim.now += 300_000;
-    const B = sim.commit("claude", 5, { lose: true, generation: "2", digest: "b".repeat(64) }); // head recreated: same revision
+    // While the row lives, the session_index fence admits ONE object per revision: another object at 5 is a no-op.
+    const blocked = sim.commit("claude", 5, { lose: true, manifestKey: "other", digest: "b".repeat(64) });
+    expect(sim.armedRefs("claude").has(blocked.trigger_id)).toBe(false);
+    sim.deleteRow("claude"); // the rekey DELETE: the row and its arm record go
+    const B = sim.commit("claude", 5, { lose: true, manifestKey: "recreated", digest: "b".repeat(64) }); // recreated at 5
     expect(B.trigger_id).not.toBe(A.trigger_id);
     const armed = { ...sim.rows.get("claude")!.state };
     sim.consume({ ...A, kind: "end" }); // an end naming the CONSUMED A: wake-only, nothing advanced
@@ -387,7 +464,8 @@ describe("session-brief trigger: offline fixtures", () => {
     sim.briefs.set("claude", { revision: 1, ready: true, lastAttempt: T0 - 600_000 }); // served revision 1
     const A = sim.commit("claude", 2, { lose: true, digest: "a".repeat(64) }); // A: revision 2, digest A (not consumed)
     sim.now += 30_000;
-    const B = sim.commit("claude", 2, { lose: true, generation: "2", digest: "b".repeat(64) }); // replaces A, same rev
+    sim.deleteRow("claude"); // the only way a same-revision replacement is committed: the row is deleted and recreated
+    const B = sim.commit("claude", 2, { lose: true, manifestKey: "recreated", digest: "b".repeat(64) }); // B at rev 2
     const armed = { ...sim.rows.get("claude")!.state };
     expect(sim.armedRefs("claude").has(A.trigger_id)).toBe(false); // A's identity was retired by the replacement
     sim.now += 10_000;
@@ -397,6 +475,31 @@ describe("session-brief trigger: offline fixtures", () => {
     sim.consume({ ...B, kind: "end" }); // control: B's own (current) end accelerates
     expect(sim.runs).toHaveLength(1);
     expect(sim.runs[0]!.claimedAt).toBe(sim.now);
+  });
+
+  test("A/B/late-A after B completes, and A paused across B's commit: no generation bump, deadline move or coverage change", () => {
+    const sim = new Sim();
+    sim.briefs.set("claude", { revision: 0, ready: true, lastAttempt: T0 - 600_000 });
+    const A = sim.commit("claude", 1, { lose: true });
+    sim.now = sim.rows.get("claude")!.state.dueAt;
+    sim.claim("claude"); // A consumed
+    sim.now += 200_000;
+    sim.commit("claude", 2, { lose: true }); // B
+    sim.now = sim.rows.get("claude")!.state.dueAt;
+    sim.claim("claude"); // B consumed: the wakeup is gone
+    expect(sim.rows.size).toBe(0);
+    const consumedBefore = sim.consumedIds.get(`claude:${M1}`);
+    sim.now += 10_000;
+    sim.commit("claude", 1, { lose: true }); // late A (a delayed indexer or redelivered commit)
+    expect(sim.rows.size).toBe(0); // no wakeup, no generation, no deadline
+    expect(sim.consumedIds.get(`claude:${M1}`)).toEqual(consumedBefore); // coverage unchanged
+    sim.consume(A);
+    expect(sim.runs).toHaveLength(2);
+    // Paused A: A's writer prepared revision 3, B' commits 4 first, then A resumes at 3.
+    sim.commit("claude", 4, { lose: true });
+    const armed = { ...sim.rows.get("claude")!.state };
+    sim.commit("claude", 3, { lose: true }); // the paused writer resumes below the floor
+    expect(sim.rows.get("claude")!.state).toEqual(armed);
   });
 
   test("a confirmed current end accelerates even when another machine shares its numeric revision", () => {
@@ -607,32 +710,32 @@ describe("session-brief trigger: offline fixtures", () => {
 });
 
 describe("session-brief trigger: durable commit identity (design r2)", () => {
-  const id = (revision: number, o: { generation?: string; sha?: string; ended?: boolean } = {}) =>
-    ({ generation: o.generation ?? "1", revision, sha256: o.sha ?? "a".repeat(64), ended: o.ended ?? false });
+  const id = (revision: number, o: { key?: string; sha?: string; ended?: boolean } = {}) =>
+    ({ revision, manifestKey: o.key ?? `k${revision}`, contentSha256: o.sha ?? "a".repeat(64), ended: o.ended ?? false });
 
-  test("an exact replay is a no-op; a committed replacement at the same machine revision arms", () => {
+  test("ordered by the shared revision token: replays, the other path, older commits and fenced objects are no-ops", () => {
     const a = id(5);
     expect(armIdentity(null, null, a)).toEqual(a); // first commit: arms
-    expect(armIdentity(a, null, id(5))).toBeNull(); // exact replay (or the indexer seeing the same commit): no-op
-    expect(armIdentity(a, null, id(5, { sha: "b".repeat(64) }))).toEqual(id(5, { sha: "b".repeat(64) })); // new content
-    expect(armIdentity(a, null, id(5, { generation: "2" }))).toEqual(id(5, { generation: "2" })); // head recreated
-    expect(armIdentity(null, a, id(5))).toBeNull(); // consumed: covered, after completion
-    expect(armIdentity(null, a, id(5, { generation: "2" }))).toEqual(id(5, { generation: "2" })); // a replacement is not covered
+    expect(armIdentity(a, null, id(5))).toBeNull(); // exact replay, or the other hook path seeing the same commit
+    expect(armIdentity(a, null, id(5, { key: "other", sha: "b".repeat(64) }))).toBeNull(); // fenced: one object per revision
     expect(armIdentity(a, null, id(6))).toEqual(id(6)); // B: new evidence
+    expect(armIdentity(id(6), null, a)).toBeNull(); // A after B (armed): older
+    expect(armIdentity(null, id(6), a)).toBeNull(); // A after B COMPLETED (consumed): older, cannot revive obsolete work
+    expect(armIdentity(null, a, id(5))).toBeNull(); // dual-path replay after completion
+    expect(armIdentity(null, null, id(1, { key: "recreated" }))).toEqual(id(1, { key: "recreated" })); // revision-1 recreate (record erased)
   });
 
-  test("a standalone end (no revision increment) arms once; a replayed pre-end append cannot clear it or re-arm", () => {
-    const append = id(5), end = id(5, { ended: true });
-    // Before any consumption: the end over the armed append arms (due now on the wakeup side).
-    expect(armIdentity(append, null, end)).toEqual(end);
-    expect(armIdentity(end, null, end)).toBeNull(); // a repeated end: no-op
-    expect(armIdentity(end, null, append)).toBeNull(); // the pre-end append replayed after the end: the end stands
-    // After the append was consumed, the standalone end is still new work (the session ended).
-    expect(armIdentity(append, append, end)).toEqual(end);
-    // After the end was consumed: neither the end nor the pre-end append re-arms.
-    expect(armIdentity(end, end, end)).toBeNull();
-    expect(armIdentity(end, end, append)).toBeNull();
-    expect(armIdentity(null, end, append)).toBeNull(); // even with no armed record left
+  test("ends: an end is a new revision (manifests are immutable); a duplicate end and a pre-end replay are no-ops", () => {
+    const append = id(5), end = id(6, { ended: true });
+    expect(armIdentity(append, null, end)).toEqual(end); // the end commit arms
+    expect(armIdentity(end, null, end)).toBeNull(); // a duplicate explicit end
+    expect(armIdentity(end, null, append)).toBeNull(); // the pre-end append replayed after the end
+    expect(armIdentity(null, end, append)).toBeNull();
+    expect(armIdentity(null, end, end)).toBeNull();
+    // A same-object end flag (an end recorded on the armed object itself) is monotone: a non-end replay cannot clear it.
+    const endedSame = id(5, { ended: true });
+    expect(armIdentity(append, null, endedSame)).toEqual(endedSame);
+    expect(armIdentity(endedSame, null, append)).toBeNull();
   });
 
   test("standalone end eligibility: a confirmed first end is due now; with a brief, coalescing is skipped and the throttle applies", () => {

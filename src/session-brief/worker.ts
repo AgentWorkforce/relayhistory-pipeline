@@ -130,7 +130,7 @@ export async function briefSession(deps: BriefDeps, w: ClaimedWakeup): Promise<B
     recordBrief(db, w, revisions, outcome, coverage ? { canonicalSessionId, coverage } : { canonicalSessionId });
   const pointers = await livePointers(db, w);
   if (!pointers.length) {
-    await finishWakeup(db, w, { idleSeconds: config.idleSeconds, maxWaitSeconds: config.maxWaitSeconds });
+    await finishWakeup(db, w, { idleSeconds: config.idleSeconds, maxWaitSeconds: config.maxWaitSeconds, ...(config.trailing ? { trailing: true } : {}) });
     return "gone";
   }
   const stored = await storedBrief(db, w);
@@ -145,7 +145,7 @@ export async function briefSession(deps: BriefDeps, w: ClaimedWakeup): Promise<B
   }
   const sourceRevisions = Object.fromEntries(pointers.map((p) => [p.machineId, p.revision]));
   const regen = await activeRegen(deps);
-  const window = { idleSeconds: config.idleSeconds, maxWaitSeconds: config.maxWaitSeconds };
+  const window = { idleSeconds: config.idleSeconds, maxWaitSeconds: config.maxWaitSeconds, ...(config.trailing ? { trailing: true } : {}) };
   // After a committed outcome, cleanup is separate: a cleanup failure never rewrites the
   // committed brief (the lease lapses and the wakeup is reclaimed, then reused or throttled).
   const finish = async () => {
@@ -398,7 +398,7 @@ export function briefTick(deps: Omit<BriefDeps, "db">, analytics?: AnalyticsPort
     if (!deps.transport) return null;
     const started = performance.now();
     const counts = {} as Record<BriefResult, number>;
-    const claimed = await claimWakeups(db, deps.config.batch, deps.config.leaseSeconds, deps.config.workspaceIds);
+    const claimed = await claimWakeups(db, deps.config.batch, deps.config.leaseSeconds, deps.config.workspaceIds, deps.config.trailing ? { trailing: true } : {});
     for (const w of claimed) {
       const result = await briefSession(full, w);
       counts[result] = (counts[result] ?? 0) + 1;

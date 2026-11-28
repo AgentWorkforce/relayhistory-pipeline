@@ -23,6 +23,16 @@ const keyParams = (k: SessionDirectoryKey) => [k.orgId, k.workspaceId, k.harness
 export type WakeupAdmission = "background" | "sweep";
 
 /**
+ * T144 trailing state (SESSION_BRIEF_TRAILING=true; needs migration 20261105062520, column trailing_since). Off: every
+ * statement below is byte-identical to main. On: evidence armed while a lease is outstanding (fenced by lease_id,
+ * expired or not) keeps its FIRST commit time; a claim clears it (a new generation boundary); a failure keeps it
+ * (rescheduleWakeup is unchanged); a finish on a generation mismatch starts the trailing window there, and a legacy
+ * NULL keeps the conservative pending_since rather than now().
+ */
+const TRAILING_ARM = `,
+       trailing_since = CASE WHEN w.lease_id IS NOT NULL AND w.trailing_since IS NULL THEN now() ELSE w.trailing_since END`;
+
+/**
  * Arm (or push back) a session's wakeup: due `idleSeconds` after this evidence, but never
  * later than `maxWaitSeconds` after the first unbriefed evidence (relayhistory 0048:
  * LEAST(now() + 10 minutes, created_at + 60 minutes)). Bumps the generation, so a run in
@@ -31,7 +41,7 @@ export type WakeupAdmission = "background" | "sweep";
 export async function armWakeup(
   db: SqlExecutor,
   key: SessionDirectoryKey,
-  opts: { admission?: WakeupAdmission; idleSeconds: number; maxWaitSeconds: number },
+  opts: { admission?: WakeupAdmission; idleSeconds: number; maxWaitSeconds: number; trailing?: boolean },
 ): Promise<void> {
   await db.query(
     `INSERT INTO sessions.session_brief_wakeups AS w
@@ -44,7 +54,7 @@ export async function armWakeup(
                       w.pending_since + make_interval(secs => $7::integer)),
        generation = w.generation + 1,
        attempts = 0,
-       last_error = NULL`,
+       last_error = NULL${opts.trailing === true ? TRAILING_ARM : ""}`,
     [...keyParams(key), opts.admission ?? "background", opts.idleSeconds, opts.maxWaitSeconds],
   );
 }
@@ -76,7 +86,7 @@ export interface ClaimedWakeup extends SessionDirectoryKey {
 }
 
 /** Claim up to `batch` due wakeups under a lease (SKIP LOCKED, so any number of workers may poll). */
-export async function claimWakeups(db: SqlExecutor, batch: number, leaseSeconds: number, workspaceIds?: readonly string[]): Promise<ClaimedWakeup[]> {
+export async function claimWakeups(db: SqlExecutor, batch: number, leaseSeconds: number, workspaceIds?: readonly string[], opts: { trailing?: boolean } = {}): Promise<ClaimedWakeup[]> {
   const { rows } = await db.query<{
     org_id: string;
     workspace_id: string;
@@ -95,7 +105,7 @@ export async function claimWakeups(db: SqlExecutor, batch: number, leaseSeconds:
         LIMIT $1 FOR UPDATE SKIP LOCKED)
      UPDATE sessions.session_brief_wakeups AS w
         SET lease_id = gen_random_uuid(), lease_expires_at = now() + make_interval(secs => $2::integer),
-            attempts = w.attempts + 1
+            attempts = w.attempts + 1${opts.trailing === true ? ", trailing_since = NULL" : ""}
        FROM due
       WHERE w.org_id = due.org_id AND w.workspace_id = due.workspace_id
         AND w.harness = due.harness AND w.session_id = due.session_id
@@ -126,7 +136,7 @@ export async function claimWakeups(db: SqlExecutor, batch: number, leaseSeconds:
 export async function finishWakeup(
   db: SqlExecutor,
   w: ClaimedWakeup,
-  window: { idleSeconds: number; maxWaitSeconds: number },
+  window: { idleSeconds: number; maxWaitSeconds: number; trailing?: boolean },
 ): Promise<void> {
   const params = [...keyParams(w), w.leaseId, w.generation];
   const { rows } = await db.query(
@@ -135,6 +145,21 @@ export async function finishWakeup(
     params,
   );
   if (rows.length) return;
+  if (window.trailing === true) {
+    // T144: the trailing window starts at the trailing evidence's own first commit, not at now() (B kept through
+    // C); a legacy NULL keeps the conservative pending_since. Fenced by lease_id like the delete above.
+    await db.query(
+      `UPDATE sessions.session_brief_wakeups AS w
+          SET lease_id = NULL, lease_expires_at = NULL,
+              pending_since = coalesce(w.trailing_since, w.pending_since),
+              due_at = LEAST(w.evidence_at + make_interval(secs => $6::integer),
+                             coalesce(w.trailing_since, w.pending_since) + make_interval(secs => $7::integer)),
+              trailing_since = NULL
+        WHERE ${KEY} AND lease_id = $5::uuid`,
+      [...params.slice(0, 5), window.idleSeconds, window.maxWaitSeconds],
+    );
+    return;
+  }
   await db.query(
     `UPDATE sessions.session_brief_wakeups AS w
         SET lease_id = NULL, lease_expires_at = NULL, pending_since = now(),
