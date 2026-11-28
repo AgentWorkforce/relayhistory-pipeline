@@ -90,6 +90,9 @@ describe.skipIf(!url)("W2 visibility stand-in: two-connection orderings (real Po
     const probe = (await o.query(`SELECT $1::xid8 < $2::xid8 AS numerically_before,
       pg_visible_in_snapshot($1::xid8, published_snapshot) AS visible FROM cutover_proof.effects WHERE digest = 'stage-3'`, [early, late])).rows[0];
     expect(probe).toEqual({ numerically_before: true, visible: false });
+    // The late commit: b's erasure-history row is committed (visible now) under b's own xid.
+    const committed = (await o.query("SELECT count(*)::int n FROM sessions.ingest_org_erasure_history WHERE erased_org = $1 AND xid = $2::xid8", [ORG, early])).rows[0].n;
+    expect(committed).toBe(1);
     expect(await verdict(o, "stage-3", "s-3")).toBe("revoked");
   });
 
