@@ -49,9 +49,11 @@ scheduled reconcile ──────────────┘
 - **Superseded-only batches** (for example the trailing ceil(n/10) batches of a backlog over 10): the
   search pass is skipped (`search index skipped`, reason `superseded_in_group`) only when coverage is
   PROVEN. Every message behind the scope must be a stamped revision whose write is no longer live, none
-  may be a delete, and every key's pointer outcome must be `unchanged`, meaning an earlier pass
-  already advanced the pointer to the live write. FIFO deletes that earlier message only after its batch,
-  search pass included, succeeded. If THIS pass advanced the pointer, it runs the search pass itself:
+  may be a delete, and every key's pointer outcome must be `unchanged`, AND there must be DURABLE proof that a COMPLETE search
+  pass already covers the scope's live pointer set (`coverageProven` in search-index.ts: the same directory
+  readiness and sources evidence skip-current uses). An `unchanged` pointer alone proves nothing: it can be this
+  message's own earlier attempt, which advanced the pointer and then crashed its search pass (Pipeline review of
+  16feaf75). No proof, or a failed proof read, runs the pass. If THIS pass advanced the pointer, it runs the search pass itself:
   the live write's own message may be lost, and reconcile would then see the pointer matching S3 and send
   nothing (Pipeline review of 51a8721b). No search state is read, so this does not depend on
   `SEARCH_INDEX_SKIP_CURRENT_ENABLED`.

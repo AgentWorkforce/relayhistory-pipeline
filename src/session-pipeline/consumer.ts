@@ -13,7 +13,7 @@
 import { errorFields, log, searchIndexErrorDetail } from "../shared/log.ts";
 import { parseQueueBody, sequencerAfter, type LandedEvent } from "./s3-events.ts";
 import { indexPointer, type PointerDeps, type PointerOutcome, type SessionScope } from "./pointer.ts";
-import { indexSearchScope, searchIndexPhaseMetrics, type SearchIndexDeps } from "./search-index.ts";
+import { coverageProven, indexSearchScope, searchIndexPhaseMetrics, type SearchIndexDeps } from "./search-index.ts";
 import { LEGACY_PROVENANCE_INVALID } from "../session-read-api/legacy-provenance.ts";
 import { captureRefusal, classifyReplayFailure, produceCanonicalReplay, type ReplayProducerDeps } from "./replay-publication.ts";
 import type { LargeJobState, LargeRoute } from "./large-read-worker.ts";
@@ -72,6 +72,8 @@ export interface ConsumerDeps {
    * also fails every later message of that group in the batch (FIFO partial-batch rule).
    */
   ordered?: { retryLater(messageIds: readonly string[], seconds: number): Promise<void>; busyRetrySeconds: number; now?: () => number };
+  /** Test seam only: replaces coverageProven (the durable proof for the superseded-only skip). Absent in the runtimes. */
+  searchCoverage?: (scope: SessionScope) => Promise<boolean>;
   /** Test seam only: replaces indexSearchScope for the search stage. Absent (always, in the runtimes): indexSearchScope. */
   searchScope?: typeof indexSearchScope;
 }
@@ -232,7 +234,11 @@ export async function processBatch(records: readonly QueueRecord[], deps: Consum
       // The covering search pass's start on the consumer clock (ordered.now in tests). NOT the pickup endpoint:
       // pickup is pickedUpAt (batch arrival, before any pointer work); this comes after pointer work and routing.
       const passStartedAt = now();
-      if (ordered && supersededOnly(messageIds, revisions)) {
+      // DURABLE proof is required, not inferred from the pointer: an 'unchanged' pointer can be this message's OWN
+      // earlier attempt, which advanced the pointer and then crashed its search pass (Pipeline review of 16feaf75).
+      // A failed proof read runs the pass.
+      if (ordered && supersededOnly(messageIds, revisions) &&
+          await (deps.searchCoverage ?? ((s: SessionScope) => coverageProven(s, deps.search!)))(scope).catch(() => false)) {
         // Every message is a stamped revision whose write is no longer live. The newer live write has its
         // own message in this group: already processed (FIFO holds later messages until earlier ones are
         // deleted), in this batch, or still to come. So this pass would only repeat it. Independent of

@@ -47,6 +47,11 @@ async function rig() {
   const r = await pointerRig();
   cleanup.push(r.close);
   const index = new Map<string, string[]>();
+  /** Durable proof, as the search stage keeps it: the live pointer set (key + revision) the last COMPLETE pass covered. */
+  const covered = new Map<string, string>();
+  const liveStamp = async (scope: SessionScope) => JSON.stringify((await r.pg.query<{ manifest_key: string; revision: string }>(
+    "SELECT manifest_key, revision::text FROM sessions.session_index WHERE org_id=$1 AND workspace_id=$2 AND harness=$3 AND session_id=$4 AND deleted_at IS NULL ORDER BY manifest_key",
+    [scope.orgId, scope.workspaceId, scope.harness, scope.sessionId])).rows);
   /** The raw.content_sha256 of each manifest the last pass indexed, per scope. */
   const digests = new Map<string, string[]>();
   const passes: string[] = [];
@@ -77,6 +82,7 @@ async function rig() {
       }
     }
     index.set(sid(scope), markers.sort());
+    covered.set(sid(scope), await liveStamp(scope));
     digests.set(sid(scope), seen.sort());
     return { manifests: live.rows.length, rows: markers.length, inserted: markers.length, deleted: 0, complete: true, reasons: [] };
   };
@@ -93,11 +99,12 @@ async function rig() {
   };
   // Each manifest read in the pointer stage takes 50 ms on the consumer clock: pickup, pointer start and completion
   // and the pass start then all differ.
+  const searchCoverage = async (scope: SessionScope) => covered.get(sid(scope)) === await liveStamp(scope);
   const deps = (): ConsumerDeps => {
     const base = r.deps();
     const reader = base.pointer.reader;
     return { ...base, pointer: { ...base.pointer, reader: { ...reader, read: async (k: string) => { advance(50); return reader.read(k); } } },
-      search: {} as never, searchScope: searchScope as never };
+      search: {} as never, searchScope: searchScope as never, searchCoverage };
   };
   const etagOf = async (key: string) => (await r.store.head(objectKey(key)))!.version.eTag!.replace(/^"|"$/g, "");
   let n = 0;
@@ -116,7 +123,7 @@ async function rig() {
   const run = (records: SqsRecord[]) => { tick = 0; return logged(() => dispatchSqsBatch(records, deps(), wiring)); };
   const liveDigest = async (key: string) =>
     (JSON.parse(new TextDecoder().decode(await readAll(await r.store.get(objectKey(key))))) as ManifestV1).raw.content_sha256;
-  return { r, index, digests, liveDigest, passes, visibility, record, writer, run, hold, makeBusy: (k: number) => { busy = k; }, sid: sid({ orgId: "org_1", workspaceId: "ws_1", harness: "claude", sessionId: "sess_1" }) };
+  return { r, index, digests, liveDigest, passes, visibility, record, writer, run, hold, depsOf: deps, wiring, makeBusy: (k: number) => { busy = k; }, sid: sid({ orgId: "org_1", workspaceId: "ws_1", harness: "claude", sessionId: "sess_1" }) };
 }
 
 const named = (lines: Record<string, unknown>[], msg: string) => lines.filter((l) => l.msg === msg || l.message === msg);
@@ -290,6 +297,35 @@ describe("trailing superseded batches (ceil(n/10) passes) skip the search pass",
     expect(named(lines, "search index skipped")).toEqual([]);
     expect(t.passes).toEqual([t.sid]);
     expect(t.index.get(t.sid)).toEqual(["r2"]);
+  });
+});
+
+describe("superseded-only skip needs DURABLE proof of a covering search (Pipeline review of 16feaf75)", () => {
+  test("lost r2 event; r1's first delivery advances the pointer to r2 and its search CRASHES; r1 redelivered ALONE must still run the covering search", async () => {
+    const t = await rig();
+    const e1 = await t.writer(1, "r1");
+    await t.writer(2, "r2"); // its own event is lost
+    const m1 = t.record(e1);
+    t.hold.crash = true;
+    const first = await t.run([m1]);
+    expect(first.result.batchItemFailures).toEqual([{ itemIdentifier: m1.messageId }]);
+    expect(await t.r.row()).toEqual([expect.objectContaining({ revision: "2" })]); // the pointer DID advance
+    // Redelivered alone: the pointer is now 'unchanged', but no complete pass covered r2, so no proof and the pass runs.
+    const again = await t.run([{ ...m1, attributes: { ...m1.attributes!, ApproximateReceiveCount: "2" } }]);
+    expect(again.result).toEqual({ batchItemFailures: [] });
+    expect(named(again.lines, "search index skipped")).toEqual([]);
+    expect(t.index.get(t.sid)).toEqual(["r2"]);
+  });
+
+  test("a failed proof read runs the pass (never skips on an error)", async () => {
+    const t = await rig();
+    const e1 = await t.writer(1, "r1");
+    const e2 = await t.writer(2, "r2");
+    await t.run([t.record(e2)]);
+    const passes = t.passes.length;
+    const { lines } = await logged(() => dispatchSqsBatch([t.record(e1)], { ...t.depsOf(), searchCoverage: async () => { throw new Error("synthetic proof failure"); } }, t.wiring));
+    expect(named(lines, "search index skipped")).toEqual([]);
+    expect(t.passes.length).toBe(passes + 1);
   });
 });
 
