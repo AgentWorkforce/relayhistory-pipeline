@@ -2723,7 +2723,19 @@ describe("function boundary: ACL manifest, residual, activation gate", () => {
       const open = src.indexOf(tag, start) + tag.length;
       return src.slice(open, src.indexOf(tag, open));
     };
-    // 20261105062350 (the buffered feed page keyset) is newest: 062340's down refuses (55000) while it is applied; its
+    // 20261105062520 (T144 session-brief trailing state) is newest: 062350's down refuses (55000) while it is applied; its
+    // checksum-pinned down drops sessions.session_brief_wakeups.trailing_since, removes its ledger row, and refuses on a
+    // rerun.
+    const TRAILING = "upstream:20261105062520_session_brief_trailing.sql";
+    const trailingCol = async () => (await db.query<{ n: number }>("SELECT count(*)::int n FROM pg_attribute WHERE attrelid='sessions.session_brief_wakeups'::regclass AND attname='trailing_since' AND NOT attisdropped")).rows[0]!.n;
+    expect(await names()).toContain(TRAILING);
+    expect(await trailingCol()).toBe(1);
+    expect((await failure(rollback("20261105062350_buffered_search_feed_page_keyset.down.sql")))?.code).toBe("55000");
+    await rollback("20261105062520_session_brief_trailing.down.sql");
+    expect(await names()).not.toContain(TRAILING);
+    expect(await trailingCol()).toBe(0);
+    expect((await failure(rollback("20261105062520_session_brief_trailing.down.sql")))?.code).toBe("55000");
+    // 20261105062350 (the buffered feed page keyset) is then newest: 062340's down refuses (55000) while it is applied; its
     // lane-generated, checksum-pinned down restores 043870's exact page function (body and proconfig), removes its
     // ledger row, and refuses on a rerun.
     const BPK = "upstream:20261105062350_buffered_search_feed_page_keyset.sql";
