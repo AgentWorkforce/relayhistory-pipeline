@@ -12,6 +12,8 @@ import { afterAll, afterEach, beforeAll, describe, expect, test } from "bun:test
 import {
   ACCEPTANCE_MISSING,
   ACCEPTANCE_WATERMARK_VERSION,
+  SEARCH_INDEX_DEFAULT_LIMITS,
+  acceptanceWatermarkBase,
   SKIPPED_BEFORE_READ,
   SKIP_STATE_MAX_AGE_MS,
   acceptanceStampName,
@@ -370,6 +372,64 @@ describe("what never holds", () => {
     const p = await pass({ ...ON, limits });
     expect(p.result.acceptanceHold).toBeUndefined();
     expect(p.result).toMatchObject({ complete: false, partial: true, reasons: ["scope_too_large"] });
+  }, 120_000);
+
+  test("an unverifiable chunk prefix: an EARLIER chunk rewritten, or a stored chain that does not match, runs the ordinary pass", async () => {
+    const { x, state, pass, pointers, stamps, latest } = await rig();
+    const first = await pass();
+    // machine:0's FIRST appended event changes: an early chunk of its manifest is rewritten, not just its tail.
+    const rewritten = appended(12).map((line, i) => (i === 0 ? { ...line, record: { ...line.record, payload: { ...(line.record as { payload: object }).payload, text: `rewritten ${"y".repeat(200)}` } } } : line));
+    await publish(x, [...generate(8), ...rewritten, ...contenders()]);
+    await pointers();
+    const p = await pass();
+    expect(p.result.acceptanceHold).toBeUndefined();
+    expect(p.result.skippedBeforeRead).toBeUndefined();
+    expect(p.result).toMatchObject({ complete: false, reasons: [ACCEPTANCE_MISSING] });
+    expect(p.reads).toBeGreaterThanOrEqual(first.reads);
+    // A stamp whose stored chains match nothing (both the full and the all-but-last chain): never trusted.
+    const value = latest();
+    const multi = (value.w!.manifests as Array<{ n: number; c: string; p: string }>).find((m) => m.n > 1)!;
+    expect(multi).toBeDefined();
+    multi.c = "0".repeat(64);
+    multi.p = "1".repeat(64);
+    state.ingest.push({ ...stamps().at(-1)!, value: JSON.stringify(value), updated_at: stamps().at(-1)!.updated_at.replace(/\d$/, "9") });
+    await publish(x, [...generate(8), ...rewritten, ...appended(20).slice(12), ...contenders()]);
+    await pointers();
+    const tampered = await pass();
+    expect(tampered.result.acceptanceHold).toBeUndefined();
+    expect(tampered.result).toMatchObject({ complete: false, reasons: [ACCEPTANCE_MISSING] });
+    expect(tampered.reads).toBeGreaterThanOrEqual(first.reads);
+  }, 120_000);
+
+  test("one workspace cannot suppress another: the stamp is named and bound per org, workspace, harness and session", async () => {
+    const { x, state, pass, pointers, stamps, latest } = await rig();
+    const other = { ...SCOPE, workspaceId: `${SCOPE.workspaceId}-other` };
+    // Another name per workspace and per org, and another settings binding for the very same session.
+    expect(acceptanceStampName(other)).not.toBe(acceptanceStampName(SCOPE));
+    expect(acceptanceStampName({ ...SCOPE, orgId: `${SCOPE.orgId}-other` })).not.toBe(acceptanceStampName(SCOPE));
+    const baseOf = (scope: typeof SCOPE) => acceptanceWatermarkBase(scope, x.canonicalId, "default:14d", SEARCH_INDEX_DEFAULT_LIMITS, undefined, undefined);
+    expect(baseOf(other)).not.toBe(baseOf(SCOPE));
+    await pass();
+    const genuine = stamps().at(-1)!;
+    // The other workspace's stamp row for the same session id sits beside ours: our passes never read it.
+    state.ingest.push({ ...genuine, name: acceptanceStampName(other) });
+    await publish(x, [...generate(8), ...appended(12), ...contenders()]);
+    await pointers();
+    const held = await pass();
+    expect(held.result.acceptanceHold).toBeDefined();
+    const names = held.calls.filter((c) => JSON.stringify(c).includes("acceptance_skip/")).map((c) => JSON.stringify(c));
+    expect(names.length).toBeGreaterThan(0);
+    for (const call of names) expect(call).not.toContain(acceptanceStampName(other));
+    // A watermark bound to the other workspace, even under OUR name with every chain and id intact: never held.
+    const foreign = latest();
+    (foreign.w as unknown as { base: string }).base = baseOf(other);
+    state.ingest.push({ ...stamps().at(-1)!, value: JSON.stringify(foreign), updated_at: stamps().at(-1)!.updated_at.replace(/\d$/, "9") });
+    await publish(x, [...generate(8), ...appended(18), ...contenders()]);
+    await pointers();
+    const p = await pass();
+    expect(p.result.acceptanceHold).toBeUndefined();
+    expect(p.result.skippedBeforeRead).toBeUndefined();
+    expect(p.result).toMatchObject({ complete: false, reasons: [ACCEPTANCE_MISSING] });
   }, 120_000);
 
   test("the age bound: a hold never outlives SKIP_STATE_MAX_AGE_MS from the full read, however often it advanced", async () => {

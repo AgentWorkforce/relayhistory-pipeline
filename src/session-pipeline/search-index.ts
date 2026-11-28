@@ -2076,7 +2076,7 @@ async function watermarkManifest(key: string, chunks: ManifestV1["raw"]["chunks"
 const watermarkId = (value: string): string => createHash("sha256").update(value).digest("hex").slice(0, 32);
 
 /** The settings a refusal was found under, with the scope and its canonical id: another value is another watermark. */
-function acceptanceWatermarkBase(
+export function acceptanceWatermarkBase(
   scope: SessionScope, canonicalId: string, windowMarker: string, limits: Pick<SearchIndexLimits, "maxScopeBytes" | "maxScopeEvents">,
   stream: StreamReadLimits | undefined, readerMaxRuleset: number | undefined,
 ): string {
