@@ -370,18 +370,31 @@ export function successRowConsistent(step: HoldStep, p: HoldOrgResult, approved?
     return (p.hold === "held" || p.hold === "sealed") && typeof p.epoch_hash === "string";
   }
   if (!a) return false;
-  if (step === "install") return p.hold === "held" && typeof p.epoch_hash === "string" && a.epochHash === null;
-  if (step === "seal") return p.hold === "sealed" && typeof a.epochHash === "string" && p.epoch_hash === a.epochHash;
-  return p.hold === "released" && typeof a.epochHash === "string" && p.epoch_hash === a.epochHash;
+  // Exactly what holdRun writes for each step's success (Pipeline 3a743320f501): an install passed the fan-out proof and
+  // read canonical history and seed captures as 0 under the key; _install checks pending itself, so it is not read.
+  if (step === "install") return p.hold === "held" && typeof p.epoch_hash === "string" && a.epochHash === null &&
+    p.fanout === "proven" && p.canonical_committed === 0 && p.seed_captures === 0 && p.pending_batches === null;
+  // Seal and rollback read none of the diagnostics: they keep the producer's defaults.
+  const unread = p.fanout === "not_read" && p.pending_batches === null && p.canonical_committed === null && p.seed_captures === null;
+  if (step === "seal") return unread && p.hold === "sealed" && typeof a.epochHash === "string" && p.epoch_hash === a.epochHash;
+  return unread && p.hold === "released" && typeof a.epochHash === "string" && p.epoch_hash === a.epochHash;
 }
 
-/** A dry refusal whose code is about a field must report that field accordingly; other codes (a read error) stand alone. */
+/**
+ * A dry refusal is one holdRun could have written: a field-specific code only from the hold states it is issued in,
+ * with that field read and supporting it (Pipeline 3a743320f501). The install-readiness codes come only from a row
+ * with no live hold (absent or released), with every count read (the dry reads them all before deciding) and the
+ * fan-out state known; a marker-attempted refusal only from that state. Any other code (a read failure) may keep
+ * partial fields.
+ */
 export function dryRefusalConsistent(p: HoldOrgResult): boolean {
+  const noLive = p.hold === "absent" || p.hold === "released";
+  const allRead = [p.pending_batches, p.canonical_committed, p.seed_captures].every((c) => typeof c === "number") && (p.fanout === "proven" || p.fanout === "unproven");
   switch (p.refused) {
-    case "hold_pending_batch": return typeof p.pending_batches === "number" && p.pending_batches > 0;
-    case "hold_canonical_history": return typeof p.canonical_committed === "number" && p.canonical_committed > 0;
-    case "hold_seed_capture_active": return typeof p.seed_captures === "number" && p.seed_captures > 0;
-    case "hold_fanout_unproven": return p.fanout === "unproven";
+    case "hold_pending_batch": return noLive && allRead && p.pending_batches! > 0;
+    case "hold_canonical_history": return noLive && allRead && p.pending_batches === 0 && p.canonical_committed! > 0;
+    case "hold_seed_capture_active": return noLive && allRead && p.pending_batches === 0 && p.canonical_committed === 0 && p.seed_captures! > 0;
+    case "hold_fanout_unproven": return noLive && allRead && p.pending_batches === 0 && p.canonical_committed === 0 && p.seed_captures === 0 && p.fanout === "unproven";
     case "hold_marker_attempted": return p.hold === "marker_attempted";
     default: return p.refused !== null;
   }

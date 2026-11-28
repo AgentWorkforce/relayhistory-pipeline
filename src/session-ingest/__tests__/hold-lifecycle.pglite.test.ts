@@ -20,7 +20,7 @@ import { batch, record } from "./support.ts";
 import { authorityFixture, epoch as controlEpoch, generation, identity } from "./privacy-authority-support.ts";
 import { evidenceHash } from "../authority-evidence.ts";
 import { epochHash } from "../erasure-window.ts";
-import { HOLD_BIND_FUNCTION, holdRun, type HoldRunDeps, type HoldSqlSession } from "../hold-lifecycle.ts";
+import { HOLD_BIND_FUNCTION, holdReceiptSummary, holdRun, type HoldRunDeps, type HoldSqlSession } from "../hold-lifecycle.ts";
 import { pgHoldSession } from "../../../scripts/backlog-hold.ts";
 
 setDefaultTimeout(240_000);
@@ -42,8 +42,14 @@ async function fixture() {
   // SYNTHETIC ONLY: these fixtures inject a fan-out proof so the install path can be exercised. Production has no
   // provider (fan-out stays unproven and every install refuses before _install: see "the production path" below).
   const SYNTHETIC_FANOUT_PROOF = async () => true;
-  const run = (step: HoldRunDeps["step"], over: Partial<HoldRunDeps> = {}, s: HoldSqlSession = session) =>
-    holdRun({ step, orgs: [A, B], sha: SHA, withSession: (fn) => fn(s), now: () => Date.now(), concurrency: 1, fanoutProof: SYNTHETIC_FANOUT_PROOF, ...over });
+  // Every receipt the REAL producer writes here must pass the validator its consumers use (no false refusal either).
+  const run = async (step: HoldRunDeps["step"], over: Partial<HoldRunDeps> = {}, s: HoldSqlSession = session) => {
+    const deps: HoldRunDeps = { step, orgs: [A, B], sha: SHA, withSession: (fn) => fn(s), now: () => Date.now(), concurrency: 1, fanoutProof: SYNTHETIC_FANOUT_PROOF, ...over };
+    const out = await holdRun(deps);
+    const v = holdReceiptSummary(JSON.parse(JSON.stringify(out)), { step, orgs: deps.orgs as string[], ...(deps.approved ? { approved: deps.approved } : {}) });
+    expect([step, (v.summary as { refused?: string }).refused]).toEqual([step, undefined]);
+    return out;
+  };
   const one = async (sql: string, p: unknown[] = []) => (await f.db.query<Record<string, any>>(sql, p)).rows[0]!;
   const status = async (org: string) => (await one("SELECT sessions.ingest_org_admission_hold_status($1) s", [org])).s as any;
   // Real uploads through the TS ledger as the ingest role; "accepted" or the SQLSTATE behind the refusal.

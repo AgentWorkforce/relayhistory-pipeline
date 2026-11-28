@@ -209,3 +209,62 @@ test("every success row must agree with its own fields: a contradictory ready or
   for (const bad of [{ hold: "held" }, { hold: "released" }, { epoch_hash: null }, { epoch_hash: E("9") }])
     expect([bad, finalReceipt(seal, "9", 0, out([execRow(A, bad), execRow(B)]), SCOPE_ID, ORGS, "none", "none", home, null, AP).summary]).toEqual([bad, { refused: "backlog_ops_receipt_schema" }]);
 });
+
+test("execute success rows must equal what holdRun writes for the step, field by field: one-field mutations refused, valid controls pass (through finalReceipt)", () => {
+  const t = backlogOpsTarget(target), home = backlogOpsHomeId({ bucket: t.bucket, region: t.region }, null);
+  const W = E("7");
+  const modes = {
+    install: on({ BACKLOG_OPS_MODE: "hold-install-execute", BACKLOG_OPS_SHA: SHA, BACKLOG_OPS_DRY_RUN: "801", BACKLOG_OPS_CONFIRMATION: `HOLD-INSTALL-EXECUTE ${SHA} DRY 801` }),
+    seal: on({ BACKLOG_OPS_MODE: "hold-seal-execute", BACKLOG_OPS_SHA: SHA, BACKLOG_OPS_DRY_RUN: "803", BACKLOG_OPS_FULL_BACKFILL_RUN: "802", BACKLOG_OPS_WAVE_ID: W,
+      BACKLOG_OPS_CONFIRMATION: `HOLD-SEAL-EXECUTE ${SHA} DRY 803 FULL 802 WAVE ${W}` }),
+    rollback: on({ BACKLOG_OPS_MODE: "hold-rollback-execute", BACKLOG_OPS_SHA: SHA, BACKLOG_OPS_DRY_RUN: "804", BACKLOG_OPS_WAVE_ID: W,
+      BACKLOG_OPS_CONFIRMATION: `HOLD-ROLLBACK-EXECUTE ${SHA} DRY 804 WAVE ${W}` }),
+  };
+  // What holdRun emits on success, per step.
+  const good = {
+    install: (o: string) => ({ org_hash: H(o), epoch_hash: E(o === A ? "1" : "2"), hold: "held", pending_batches: null, canonical_committed: 0, seed_captures: 0,
+      fanout: "proven", verdict: "installed", refused: null }),
+    seal: (o: string) => ({ org_hash: H(o), epoch_hash: E(o === A ? "a" : "b"), hold: "sealed", pending_batches: null, canonical_committed: null, seed_captures: null,
+      fanout: "not_read", verdict: "sealed", refused: null }),
+    rollback: (o: string) => ({ org_hash: H(o), epoch_hash: E(o === A ? "a" : "b"), hold: "released", pending_batches: null, canonical_committed: null, seed_captures: null,
+      fanout: "not_read", verdict: "rolled_back", refused: null }),
+  };
+  const approved = { install: ORGS.map((o) => ({ orgHash: H(o), epochHash: null })), seal: [{ orgHash: H(A), epochHash: E("a") }, { orgHash: H(B), epochHash: E("b") }] };
+  const mutations = {
+    install: [{ fanout: "unproven" }, { fanout: "not_read" }, { canonical_committed: 1 }, { canonical_committed: null }, { seed_captures: 1 }, { seed_captures: null },
+      { pending_batches: 0 }, { pending_batches: 1 }, { hold: "sealed" }, { epoch_hash: null }],
+    seal: [{ fanout: "proven" }, { fanout: "unproven" }, { pending_batches: 0 }, { canonical_committed: 0 }, { seed_captures: 0 }, { hold: "held" }, { epoch_hash: E("9") }],
+    rollback: [{ fanout: "proven" }, { pending_batches: 0 }, { canonical_committed: 0 }, { seed_captures: 0 }, { hold: "sealed" }, { epoch_hash: null }],
+  };
+  for (const step of ["install", "seal", "rollback"] as const) {
+    const ap = step === "install" ? approved.install : approved.seal;
+    const out = (rows: unknown[]) => JSON.stringify({ mode: "execute", tool: "hold_lifecycle", step, org_count: 2, wave_org_count: 2, done_count: 2, complete: true, per_org: rows });
+    const fin = (rows: unknown[]) => finalReceipt(modes[step], "9", 0, out(rows), SCOPE_ID, ORGS, "none", "none", home, null, ap);
+    expect([step, fin([good[step](A), good[step](B)]).exitCode]).toEqual([step, 0]); // the valid control
+    for (const m of mutations[step]) expect([step, m, fin([{ ...good[step](A), ...m }, good[step](B)]).summary]).toEqual([step, m, { refused: "backlog_ops_receipt_schema" }]);
+  }
+});
+
+test("a dry refusal is one holdRun could write: field codes only from no-live-hold rows with every count read; read failures keep partial fields", () => {
+  const ready = { ...dryRow(A, "absent", null) };
+  const refusedB = (over: Record<string, unknown>) => ({ ...dryRow(B, "absent", null, "refused"), pending_batches: 0, canonical_committed: 0, seed_captures: 0, ...over });
+  const dry = (b: Record<string, unknown>) => JSON.stringify({ summary: drySummary([ready as never, b as never]) });
+  const ok = (b: Record<string, unknown>) => code(() => checkHoldDryReceipt(dry(b), ORGS, "install"));
+  // Valid controls, one per code (the producer's check order: pending, canonical, seed, fan-out).
+  expect(ok(refusedB({ refused: "hold_pending_batch", pending_batches: 1 }))).toBeNull();
+  expect(ok(refusedB({ refused: "hold_canonical_history", canonical_committed: 1 }))).toBeNull();
+  expect(ok(refusedB({ refused: "hold_seed_capture_active", seed_captures: 1 }))).toBeNull();
+  expect(ok(refusedB({ refused: "hold_fanout_unproven", fanout: "unproven" }))).toBeNull();
+  expect(ok(refusedB({ refused: "hold_marker_attempted", hold: "marker_attempted", epoch_hash: E("b") }))).toBeNull();
+  expect(ok(refusedB({ refused: "hold_read_failed", pending_batches: null, canonical_committed: null, seed_captures: null, fanout: "not_read", hold: "not_read" }))).toBeNull();
+  // One-field mutations: the code's field, the state it is raised in, an unread count, an earlier check that would have fired first.
+  for (const bad of [
+    { refused: "hold_pending_batch", pending_batches: 0 }, { refused: "hold_pending_batch", pending_batches: 1, hold: "held", epoch_hash: E("b") },
+    { refused: "hold_canonical_history", canonical_committed: 0 }, { refused: "hold_canonical_history", canonical_committed: 1, pending_batches: 1 },
+    { refused: "hold_canonical_history", canonical_committed: 1, seed_captures: null },
+    { refused: "hold_seed_capture_active", seed_captures: 0 }, { refused: "hold_seed_capture_active", seed_captures: 1, hold: "sealed", epoch_hash: E("b") },
+    { refused: "hold_fanout_unproven", fanout: "proven" }, { refused: "hold_fanout_unproven", fanout: "unproven", seed_captures: 1 },
+    { refused: "hold_fanout_unproven", fanout: "unproven", hold: "held", epoch_hash: E("b") },
+    { refused: "hold_marker_attempted", hold: "held", epoch_hash: E("b") },
+  ]) expect([bad, ok(refusedB(bad))]).toEqual([bad, "backlog_ops_bound_hold_dry"]);
+});
