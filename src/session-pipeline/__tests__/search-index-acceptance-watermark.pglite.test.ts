@@ -57,9 +57,9 @@ function appended(n: number): Line[] {
 const base = (): Line[] => [...generate(8), ...appended(4), ...contenders()];
 
 /** Publish `lines` as the scope's new content: every changed manifest moves to its next revision. */
-async function publish(x: ExportedScope, lines: Line[]) {
+async function publish(x: ExportedScope, lines: Line[]): Promise<string[]> {
   const encoder = new TextEncoder();
-  await exportUnit({ store: x.store, keyRoot: "96bulls", grantId: "stream_parity", maxChunkBytes: 1200 },
+  const exported = await exportUnit({ store: x.store, keyRoot: "96bulls", grantId: "stream_parity", maxChunkBytes: 1200 },
     { orgId: ID.orgId, workspaceId: ID.workspaceId, source: ID.source, sessionId: ID.sessionId, firstMs: T0, lastMs: T0 + 60_000, machineIds: [], totals: {} },
     {
       fenced: async () => false,
@@ -67,6 +67,7 @@ async function publish(x: ExportedScope, lines: Line[]) {
         for (const { machine, record, userId } of lines) yield { machine, userId: userId ?? USER, bytes: encoder.encode(JSON.stringify(record) + "\n") };
       },
     });
+  return exported.manifests.map((m) => m.manifestKey);
 }
 
 async function rig(lines: Line[] = base()) {
@@ -150,7 +151,7 @@ describe("repeated revisions with acceptance missing", () => {
       expect(latest().w!.fullAt).toBe(fullAt);
       // A repeat at the same revision is the plain skip: no object read, no write at all.
       const repeat = await pass();
-      expect(repeat.result).toEqual({ manifests: 0, rows: 0, inserted: 0, deleted: 0, complete: false, skippedBeforeRead: true, reasons: HELD_REASONS });
+      expect(repeat.result).toEqual({ manifests: 0, rows: 0, inserted: 0, deleted: 0, complete: false, skippedBeforeRead: true, acceptanceStamp: "watermark", reasons: HELD_REASONS });
       expect(repeat.reads).toBe(0);
       expect(chWrites(repeat.calls)).toEqual([]);
     }
@@ -375,6 +376,29 @@ describe("what never holds", () => {
     expect(p.result).toMatchObject({ complete: false, partial: true, reasons: ["scope_too_large"] });
   }, 120_000);
 
+  test("a sibling manifest ADDED after the refusal was cached (a new machine joins): another manifest set, never held", async () => {
+    const { x, r, state, latest } = await rig();
+    const send = realHandler(r.consumer({ ch: state.ch, ...ON }));
+    await send(r.messages);
+    const cached = latest().w!.manifests.length;
+    expect(cached).toBe(x.keys.length);
+    // A machine that had no manifest before publishes one, with unrelated events only. Every other manifest is unchanged.
+    const joined = Array.from({ length: 3 }, (_, i) => activity("machine:joined", "capacity:joined", "session_event", `joined-${i}`, T0 + 40_000 + i * 10, { role: "user", text: `joined ${i}` }));
+    const published = await publish(x, [...generate(8), ...appended(4), ...contenders(), ...joined]);
+    const added = published.filter((k) => !x.keys.includes(k));
+    expect(added).toHaveLength(1);
+    // Its own manifest event: the pointer stage creates the new row, the search stage sees another sibling set.
+    const reads = r.reads.count;
+    const { result, lines } = await captureLogs(() => send([...r.messages, { messageId: "m-joined", body: JSON.stringify({ reconcile: { key: added[0] } }) }]));
+    expect(result).toEqual({ batchItemFailures: [] });
+    const reconciled = lines.filter((l) => l.message === "search index reconciled");
+    expect(reconciled.some((l) => l.acceptance_hold !== undefined)).toBe(false);
+    // A full read (still refused: the new machine brought no seat), and the new watermark covers the wider set.
+    expect(reconciled.some((l) => l.reason === ACCEPTANCE_MISSING)).toBe(true);
+    expect(r.reads.count - reads).toBeGreaterThan(0);
+    expect(latest().w!.manifests).toHaveLength(cached + 1);
+  }, 120_000);
+
   test("an unverifiable chunk prefix: an EARLIER chunk rewritten, or a stored chain that does not match, runs the ordinary pass", async () => {
     const { x, state, pass, pointers, stamps, latest } = await rig();
     const first = await pass();
@@ -485,6 +509,55 @@ describe("the real exported Lambda handler", () => {
     const reconciled = lines.filter((l) => l.message === "search index reconciled");
     expect(reconciled.at(-1)).toMatchObject({ ok: false, reason: HELD_REASONS.join(","), acceptance_hold: "watermark" });
     expect(reconciled.at(-1)!.delta_chunks).toBeGreaterThan(0);
+  }, 120_000);
+});
+
+describe("rollout: stamps written before the flag", () => {
+  test("a plain stamp keeps the acceptance skip (logged acceptance_stamp=plain) until a new revision or its age bound; that full read writes the watermark; then holds", async () => {
+    const { x, r, state, latest, clock } = await rig();
+    const lastLine = async (flags: Partial<SearchIndexDeps>) => {
+      clock.ms += 1_000;
+      const send = realHandler(r.consumer({ ch: state.ch, now: () => new Date(clock.ms), ...flags }));
+      return (await captureLogs(() => send(r.messages))).lines.filter((l) => l.message === "search index reconciled").at(-1)!;
+    };
+    // Before the flag: the acceptance skip alone stamps a plain stamp.
+    expect(await lastLine(SKIP)).toMatchObject({ ok: false, reason: ACCEPTANCE_MISSING });
+    expect(latest().w).toBeUndefined();
+    // The flag is turned on. Same pointer set: still the plain skip, no full read, no watermark yet.
+    const reads = r.reads.count;
+    const plain = await lastLine(ON);
+    expect(plain).toMatchObject({ ok: false, reason: HELD_REASONS.join(","), acceptance_stamp: "plain" });
+    expect(plain.acceptance_hold).toBeUndefined();
+    expect(r.reads.count).toBe(reads);
+    expect(latest().w).toBeUndefined();
+    // The next revision: nothing to hold on, so ONE full read, which writes the watermark.
+    await publish(x, [...generate(8), ...appended(12), ...contenders()]);
+    const full = await lastLine(ON);
+    expect(full).toMatchObject({ ok: false, reason: ACCEPTANCE_MISSING });
+    expect(full.acceptance_hold).toBeUndefined();
+    expect(full.acceptance_stamp).toBeUndefined();
+    expect(latest().w).toBeDefined();
+    // From then on: same pointer set is a watermark-checked skip, the revision after is a hold.
+    expect(await lastLine(ON)).toMatchObject({ reason: HELD_REASONS.join(","), acceptance_stamp: "watermark" });
+    await publish(x, [...generate(8), ...appended(18), ...contenders()]);
+    const held = await lastLine(ON);
+    expect(held).toMatchObject({ reason: HELD_REASONS.join(","), acceptance_hold: "watermark" });
+    expect(held.acceptance_stamp).toBeUndefined();
+  }, 120_000);
+
+  test("a plain stamp does not last: at its age bound the next delivery reads in full and writes a watermark", async () => {
+    const { pass, latest, clock, stamps } = await rig();
+    await pass(SKIP);
+    expect(latest().w).toBeUndefined();
+    const written = Date.parse(`${stamps().at(-1)!.updated_at.replace(" ", "T")}Z`);
+    clock.ms = written + SKIP_STATE_MAX_AGE_MS - 2_000;
+    expect((await pass()).result).toMatchObject({ skippedBeforeRead: true, acceptanceStamp: "plain" });
+    clock.ms = written + SKIP_STATE_MAX_AGE_MS;
+    const p = await pass();
+    expect(p.result.skippedBeforeRead).toBeUndefined();
+    expect(p.result).toMatchObject({ complete: false, reasons: [ACCEPTANCE_MISSING] });
+    expect(p.reads).toBeGreaterThan(0);
+    expect(latest().w).toBeDefined();
   }, 120_000);
 });
 

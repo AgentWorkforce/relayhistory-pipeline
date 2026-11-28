@@ -466,6 +466,13 @@ export interface SearchIndexResult {
    */
   acceptanceHold?: { deltaChunks: number };
   /**
+   * `acceptanceWatermark` only, on a same-pointer skip (`skippedBeforeRead` without `acceptanceHold`): the stamp
+   * that licensed it. `watermark`: written by a full read or a hold with the flag on, and its manifests were
+   * checked against it by the probe. `plain`: a stamp without a watermark (written before the flag, a catalog-key
+   * refusal, or too wide a scope); the acceptance skip's own behaviour, nothing checked. Telemetry only.
+   */
+  acceptanceStamp?: "plain" | "watermark";
+  /**
    * Only on a whole-read pass that read and ended with `relayhistory_acceptance_missing` (never on a skipped pass):
    * how the refused contender groups looked (session-read-api/contender-seats.ts). Telemetry only.
    */
@@ -941,7 +948,11 @@ async function indexSearchScopeBase(scope: SessionScope, deps: SearchIndexDeps, 
       // The last pass over this exact pointer set, epoch, window and limits ended incomplete for the
       // acceptance refusal alone, recently: the same outcome, without a read or a write.
       if (!unlisted && acceptanceStampMatches(stamp, digest, at))
-        return { manifests: 0, rows: 0, inserted: 0, deleted: 0, complete: false, skippedBeforeRead: true, reasons: [ACCEPTANCE_MISSING, SKIPPED_BEFORE_READ] };
+        return {
+          manifests: 0, rows: 0, inserted: 0, deleted: 0, complete: false, skippedBeforeRead: true, reasons: [ACCEPTANCE_MISSING, SKIPPED_BEFORE_READ],
+          // Watermark flag on only: which kind of stamp licensed this same-pointer skip (rollout uptake).
+          ...(deps.acceptanceWatermark === true ? { acceptanceStamp: stamp.state === "live" && parseAcceptanceWatermark(stamp.value) ? "watermark" as const : "plain" as const } : {}),
+        };
       acceptance = { stamp, digest, windowMarker, observed: new Map() };
     } else fromMs = prepared?.fromMs ?? await io.fromMs(at);
     if (hostedState) {
