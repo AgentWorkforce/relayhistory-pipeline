@@ -386,8 +386,15 @@ describe("062380 session binding: the revision sequence stays owner-only and its
     const db = await database(async (d) => {
       await d.exec("CREATE SEQUENCE sessions.session_binding_revision AS bigint");
       await d.query("SELECT setval('sessions.session_binding_revision', 500)");
-      await d.exec("GRANT UPDATE ON SEQUENCE sessions.session_binding_revision TO service_role");
+      // A grant-option chain: service_role holds UPDATE WITH GRANT OPTION and passed it on to authenticated.
+      await d.exec("GRANT USAGE ON SCHEMA sessions TO service_role");
+      await d.exec("GRANT UPDATE ON SEQUENCE sessions.session_binding_revision TO service_role WITH GRANT OPTION");
+      await d.exec("SET ROLE service_role; GRANT UPDATE ON SEQUENCE sessions.session_binding_revision TO authenticated; RESET ROLE");
     });
+    for (const role of ["service_role", "authenticated"]) {
+      const can = (await db.query<{ c: boolean }>("SELECT has_sequence_privilege($1, 'sessions.session_binding_revision', 'UPDATE') AS c", [role])).rows[0]!.c;
+      expect([role, can]).toEqual([role, false]);
+    }
     expect(await sequenceGrantees(db)).toEqual([]);
     await upsertPointer(db, { machine: "m1", last: "2026-10-01T12:00:00Z" });
     await projectSessionDirectory(db, KEY);
@@ -395,7 +402,7 @@ describe("062380 session binding: the revision sequence stays owner-only and its
   });
 
   test("a retained sequence of another shape refuses the migration (55000)", async () => {
-    for (const shape of ["AS integer", "AS bigint INCREMENT BY 2", "AS bigint CYCLE", "AS bigint MINVALUE 0"]) {
+    for (const shape of ["AS integer", "AS bigint INCREMENT BY 2", "AS bigint CYCLE", "AS bigint MINVALUE 0", "AS bigint CACHE 16"]) {
       const refused = await database((d) => d.exec(`CREATE SEQUENCE sessions.session_binding_revision ${shape}`)).then(
         () => null, (e: { code?: string }) => e.code ?? "no_code");
       expect([shape, refused]).toEqual([shape, "55000"]);

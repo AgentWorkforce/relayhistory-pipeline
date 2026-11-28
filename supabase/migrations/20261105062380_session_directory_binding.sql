@@ -65,9 +65,10 @@ ALTER TABLE sessions.session_directory ADD CONSTRAINT session_directory_binding_
 -- The binding order. Only the trigger function (its owner) draws from it. The rollback KEEPS it as inert history
 -- (RETAINED_BY_ROLLBACK), so a re-apply continues the order instead of restarting it: a revision is never reissued,
 -- and a consumer's remembered revision is never above a legitimate new binding's. A retained sequence must be
--- exactly this one (bigint, increment 1, min 1, max 2^63-1, no cycle, owned by the migrating role), else 55000.
+-- exactly this one (bigint, increment 1, min 1, max 2^63-1, CACHE 1, no cycle, owned by the migrating role), else 55000.
+-- CACHE 1 matters: with a larger cache each connection reserves a block, and a later mint could draw a lower revision.
 CREATE SEQUENCE IF NOT EXISTS sessions.session_binding_revision AS bigint;
-REVOKE ALL ON SEQUENCE sessions.session_binding_revision FROM PUBLIC, anon, authenticated, service_role;
+REVOKE ALL ON SEQUENCE sessions.session_binding_revision FROM PUBLIC, anon, authenticated, service_role CASCADE;
 -- Owner-only, whatever default privileges or an earlier install granted: every other grantee is revoked (CASCADE, so
 -- grants made under a grant option go too), and any grant still present refuses the migration (55000). A retained
 -- UPDATE would allow setval and break the order.
@@ -76,7 +77,7 @@ DECLARE v_seq regclass := 'sessions.session_binding_revision'; v_role text;
 BEGIN
  IF (SELECT pg_get_userbyid(c.relowner) FROM pg_class c WHERE c.oid = v_seq) IS DISTINCT FROM current_user::text
     OR NOT EXISTS(SELECT 1 FROM pg_sequence q WHERE q.seqrelid = v_seq AND q.seqtypid = 'bigint'::regtype
-      AND q.seqincrement = 1 AND q.seqmin = 1 AND q.seqmax = 9223372036854775807 AND NOT q.seqcycle) THEN
+      AND q.seqincrement = 1 AND q.seqmin = 1 AND q.seqmax = 9223372036854775807 AND q.seqcache = 1 AND NOT q.seqcycle) THEN
   RAISE EXCEPTION USING ERRCODE = '55000',
    MESSAGE = 'session binding: an existing sessions.session_binding_revision is not the binding sequence; nothing applied';
  END IF;

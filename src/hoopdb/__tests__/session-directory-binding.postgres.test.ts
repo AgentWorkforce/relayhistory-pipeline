@@ -4,7 +4,8 @@
  *   primary-key insert) issue exactly one binding;
  * - the projector lifecycle (mint, keep across retries, tombstone retires, fenced re-send stays retired, a new revision
  *   mints a new id with a greater revision) as on PGlite;
- * - the revision sequence stays owner-only despite a pre-existing default sequence grant (no setval by another role);
+ * - the revision sequence stays owner-only despite a pre-existing default sequence grant and a retained
+ *   grant-option chain (no setval by either role);
  * - the reader under the real bulls96_read_api role: a read that starts after a tombstone commits returns nothing,
  *   while a transaction that read before keeps its snapshot (the read's linearization point is its own statement).
  *
@@ -52,7 +53,16 @@ beforeAll(async () => {
   for (const f of readdirSync(join(root, "supabase/migrations")).filter((f) => f.endsWith(".sql")).sort()) {
     // A synthetic pre-existing default sequence grant: 062380 must still leave its sequence owner-only.
     if (f === "20261105062380_session_directory_binding.sql")
+    {
       await c.query("ALTER DEFAULT PRIVILEGES IN SCHEMA sessions GRANT ALL ON SEQUENCES TO service_role, PUBLIC");
+      // A retained sequence carrying a grant-option chain: service_role -> authenticated (dependent grant).
+      await c.query("CREATE SEQUENCE sessions.session_binding_revision AS bigint");
+      await c.query("GRANT USAGE ON SCHEMA sessions TO service_role, authenticated");
+      await c.query("GRANT UPDATE ON SEQUENCE sessions.session_binding_revision TO service_role WITH GRANT OPTION");
+      await c.query("SET ROLE service_role");
+      await c.query("GRANT UPDATE ON SEQUENCE sessions.session_binding_revision TO authenticated");
+      await c.query("RESET ROLE");
+    }
     await c.query(read("supabase/migrations/" + f));
   }
   await c.query(sqlFile("supabase/bootstrap/session_read_api_role.sql"));
@@ -160,7 +170,7 @@ maybe("the reader under bulls96_read_api: a read that starts after a tombstone c
   await writer.query("ROLLBACK");
 });
 
-maybe("the revision sequence is owner-only despite a default sequence grant present before the migration", async () => {
+maybe("the revision sequence is owner-only despite a default grant and a retained grant-option chain (service_role -> authenticated)", async () => {
   const c = await connect();
   const grantees = (await c.query<{ g: string }>(
     `SELECT coalesce(r.rolname, 'PUBLIC') AS g FROM pg_class k
@@ -168,8 +178,10 @@ maybe("the revision sequence is owner-only despite a default sequence grant pres
       LEFT JOIN pg_roles r ON r.oid = a.grantee
      WHERE k.oid = 'sessions.session_binding_revision'::regclass AND a.grantee <> k.relowner`)).rows;
   expect(grantees).toEqual([]);
-  await c.query("BEGIN");
-  await c.query("SET LOCAL ROLE service_role");
-  await expect(c.query("SELECT setval('sessions.session_binding_revision', 1)")).rejects.toMatchObject({ code: "42501" });
-  await c.query("ROLLBACK");
+  for (const role of ["service_role", "authenticated"]) {
+    await c.query("BEGIN");
+    await c.query(`SET LOCAL ROLE ${role}`);
+    await expect(c.query("SELECT setval('sessions.session_binding_revision', 1)")).rejects.toMatchObject({ code: "42501" });
+    await c.query("ROLLBACK");
+  }
 });
