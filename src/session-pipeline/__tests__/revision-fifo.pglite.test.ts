@@ -228,6 +228,16 @@ describe("concurrent revisions of one session: no requeue, no reorder", () => {
     expect(orderedRetrySeconds(5, 1_000)).toBe(300);
   });
 
+  test("schedule from an age-zero start with prompt redelivery: the first receive past 30 minutes is receive 12, at 30m15s", () => {
+    // Receive n is scheduled at the sum of the visibility timeouts set by receives 1..n-1.
+    const at = [0];
+    for (let n = 1; n < 20; n++) at.push(at[n - 1]! + orderedRetrySeconds(5, n));
+    expect(at.slice(0, 12)).toEqual([0, 5, 15, 35, 75, 155, 315, 615, 915, 1_215, 1_515, 1_815]);
+    expect(at.findIndex((s) => s > 1_800) + 1).toBe(12);
+    // maxReceiveCount 20: the last receive is scheduled at 4,215 s (about 1.17 h) before the DLQ.
+    expect(at[19]).toBe(4_215);
+  });
+
   test("FIFO partial-batch rule: a failure fails every LATER message of its group, never an earlier one or another group", async () => {
     const t = await rig();
     const e1 = await t.writer(1, "r1");
