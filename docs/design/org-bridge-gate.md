@@ -392,13 +392,47 @@ interface CutoverVisibility {
 }
 ```
 
-### Serving paths (inventory owed with sessions-partial-canonical)
+### Serving paths (by sessions-partial-canonical, static grep at 8a043736; deploy wiring and raw getObject readers not verified)
 
-Candidates that read canonical manifests or chunks, found by grep and still to be confirmed per path:
-- the session read API (`canonical-projection.ts`, `canonical-stream-projection.ts`);
-- `packages/session-read-worker`;
-- the pipeline package (`relayhistory-transform`, `reconcile`, `adapter`, `manifest-readiness`);
-- the HoopDb search indexer (`src/hoopdb/indexer.ts`);
-- the session-analysis runner;
-- the neon-s3 sync and erasure tools.
-Every confirmed path must enforce the verdict, or be shown never to read an enrolled org's manifests.
+**Choke points.**
+- C1: `canonical-projection.ts` readManifestRecords and streamManifestRecords, through which every chunk GET of the
+  projection readers passes. Mark entries before boundedPrefetch, re-check after the scope loop, and make the scope
+  incomplete on a non-visible entry, never dropping it.
+- C2: `objectStoreManifestReader` (pipeline adapter). It reads manifests only, with no SQL or tenant, so the
+  verdict goes at its callers.
+- C3: `canonical.ts` snapshotWithLimits. It already reads SQL pointers before IO and re-reads them after (the
+  generation fence). This is the place for one batched visibility read per scope, folded into
+  `canonicalSourceGeneration` so cursors answer 409 when visibility moves.
+- C4: `canonical-transcript.ts` has its own chunk loop, bypasses C1, and needs its own verdict.
+
+**Request-time serving paths.**
+1. The hosted partial fallback (`/v1/sessions/:id/events`): C3 and C1, with pointers and the operator fence pre and
+   post.
+2. The self-host service-canonical routes (timing, turns, metadata, catalog, events, includeMessageId): C3 and C1.
+   The transcriptSource path goes through C4. The operator fence applies only with `SESSION_ERASE_FENCE_ENFORCED=1`.
+3. The Read Worker canonical routes: C3 and C1, with **no operator fence** (index.ts:655).
+4. Read Worker pages mode: serves published replay artifacts. They must publish only visible effects, or re-check
+   at serve time against the artifact's source generation.
+5. The session-analysis reader: as 4.
+6. The canonical history adapter: covered if 3 and 4 are.
+
+**Producers (derived stores outlive a serve-time verdict, so they need gating plus invalidation on a verdict change).**
+- P1: the search index (search-index, consumer, search-jobs, large-read, staged-reconcile, canonical-stream-projection).
+- P2: output and digest facts.
+- P3: relayfacts backfill.
+- P4: session analysis (evidence and worker; results served by /analysis).
+- P5: replay publication (which feeds 4 and 5).
+- P6: the session brief (via C3, C1 and C4; served by /summary).
+- P7: search features.
+- P8: pipeline reconcile and adapter (pointer reconcile).
+- P9: the ingest, seed and courier tails (writer side).
+- Not canonical: buffered-search-feed and owner-buffered.
+
+**Not traced:** raw `getObject` readers over `raw/` outside these helpers, and src/migration (legacy-export,
+neon-s3-sync, neon-s3-erasure). A targeted grep is owed before W2 is ruled.
+
+**Consequence for scope (for the lander).** W2 as a full reader contract touches 4 choke points, 6 serving paths
+and 7 derived producers. A narrower option for wave 1 would apply that contract only to the paths that can serve an
+enrolled org during the hold, and keep every derived producer from consuming an enrolled org's canonical entries
+beyond its baseline until the bridge sweep has settled visibility. Whether that is sound depends on the producers'
+triggers (fan-out or queue), which is not yet traced.
