@@ -108,7 +108,7 @@ export const code = async (p: Promise<unknown>) =>
 /** A session_index pointer, then the directory projection, as the indexer does. */
 export async function pointer(
   pg: PGlite,
-  opts: { key?: typeof KEY; machine?: string; revision?: number; title?: string | null; manifestKey?: string } = {},
+  opts: { key?: typeof KEY; machine?: string; revision?: number; title?: string | null; manifestKey?: string; contentSha256?: string } = {},
 ) {
   const key = opts.key ?? KEY;
   const machine = opts.machine ?? "m-1";
@@ -117,9 +117,9 @@ export async function pointer(
        (org_id, workspace_id, harness, session_id, machine_id, user_id, created_at, last_activity_at,
         storage_provider, bucket, manifest_key, content_sha256, raw_format, trace_id, revision, title)
      VALUES ($1, $2, $3, $4, $5, 'u-1', now(), now(), 'fs', 'bucket', $6,
-             decode(repeat('ab', 32), 'hex'), 'jsonl', $7, $8, $9)
+             decode(coalesce($10, repeat('ab', 32)), 'hex'), 'jsonl', $7, $8, $9)
      ON CONFLICT (org_id, workspace_id, harness, session_id, machine_id) DO UPDATE SET
-       revision = excluded.revision, manifest_key = excluded.manifest_key,
+       revision = excluded.revision, manifest_key = excluded.manifest_key, content_sha256 = excluded.content_sha256,
        title = excluded.title, last_activity_at = now(), deleted_at = NULL`,
     [
       key.orgId,
@@ -131,6 +131,8 @@ export async function pointer(
       TRACE,
       opts.revision ?? 1,
       opts.title === undefined ? "pointer title" : opts.title,
+      // As hoopdb writes it: the manifest's raw.content_sha256 (default: a fixed digest).
+      opts.contentSha256 ?? null,
     ],
   );
   await projectSessionDirectory(hoopDb(pg), key);

@@ -648,7 +648,8 @@ function sameSourceIncarnation(
   if (rows.length !== Object.keys(binding).length) return false;
   return rows.every((r) => {
     const b = Object.prototype.hasOwnProperty.call(binding, r.machine_id) ? binding[r.machine_id] : undefined;
-    return b !== undefined && b.manifestKey === r.manifest_key && (b.contentSha256 ?? null) === (r.content_sha256 ?? null);
+    // Positive evidence only: a row without a digest cannot prove its content is unchanged.
+    return b !== undefined && b.manifestKey === r.manifest_key && b.contentSha256 != null && b.contentSha256 === r.content_sha256;
   });
 }
 

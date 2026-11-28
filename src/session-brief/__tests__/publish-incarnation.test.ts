@@ -85,6 +85,17 @@ describe("recordBrief binds the source incarnation", () => {
     expect(await recordBrief(hoopDb(pg), KEY, { "m-1": 3 }, ready, { sourceBinding: binding })).toEqual({ written: false });
   });
 
+  test("null digest on both sides is not evidence: refused", async () => {
+    const pg = await database();
+    open.push(pg);
+    await pointer(pg, { revision: 3, manifestKey: "manifest/s-1/m-1/r3" });
+    await pg.exec("UPDATE sessions.session_index SET content_sha256 = NULL");
+    const binding = briefSourceBinding(await livePointers(hoopDb(pg), KEY));
+    expect(binding["m-1"]!.contentSha256).toBeNull();
+    expect(await recordBrief(hoopDb(pg), KEY, { "m-1": 3 }, ready, { sourceBinding: binding })).toEqual({ written: false });
+    expect(await briefRows(pg)).toEqual([]);
+  });
+
   test("without a binding the existing machine+revision check is unchanged", async () => {
     const pg = await database();
     open.push(pg);
@@ -95,7 +106,7 @@ describe("recordBrief binds the source incarnation", () => {
 });
 
 describe("the worker refuses a re-create between pointer read and publish", () => {
-  async function run(recreateDuringGeneration: boolean) {
+  async function run(recreateDuringGeneration: boolean, pointerDigest?: string) {
     const pg = await database();
     open.push(pg);
     const store = tempStore();
@@ -108,7 +119,7 @@ describe("the worker refuses a re-create between pointer read and publish", () =
         revision: 1,
       }),
     );
-    await pointer(pg, { revision: 1, manifestKey });
+    await pointer(pg, { revision: 1, manifestKey, contentSha256: pointerDigest ?? manifests.get(manifestKey)!.raw.content_sha256 });
     await armWakeup(hoopDb(pg), KEY, { idleSeconds: 600, maxWaitSeconds: 3600 });
     await dueNow(pg);
     const model = new FakeModel();
@@ -119,7 +130,7 @@ describe("the worker refuses a re-create between pointer read and publish", () =
       return complete(req);
     };
     const counts = await briefTick({ reader: mapReader(manifests), store, transport: model, config: testConfig() })(hoopDb(pg), new Date());
-    return { counts, rows: await briefRows(pg) };
+    return { counts, rows: await briefRows(pg), modelCalls: model.requests.length };
   }
 
   test("control: no re-create, the brief is generated", async () => {
@@ -131,6 +142,13 @@ describe("the worker refuses a re-create between pointer read and publish", () =
   test("re-created at the same revision during generation: stale, no brief published", async () => {
     const { counts, rows } = await run(true);
     expect(counts).toEqual({ stale: 1 });
+    expect(rows.filter((r) => r.status === "ready")).toEqual([]);
+  });
+
+  test("the manifest consumed is not the incarnation the pointer names: retried, no model call, no brief", async () => {
+    const { counts, rows, modelCalls } = await run(false, DIGEST_B);
+    expect(counts?.generated ?? 0).toBe(0);
+    expect(modelCalls).toBe(0);
     expect(rows.filter((r) => r.status === "ready")).toEqual([]);
   });
 });

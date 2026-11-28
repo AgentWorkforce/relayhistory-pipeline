@@ -77,7 +77,7 @@ async function setup(opts: { transport?: boolean; analytics?: AnalyticsPort } = 
     const revision = o.revision ?? 1;
     const manifestKey = `manifest/${KEY.sessionId}/${machine}/r${revision}`;
     manifests.set(manifestKey, await transcript(store, lines, { machine, revision, scrubbed: o.scrubbed }));
-    await pointer(pg, { machine, revision, manifestKey });
+    await pointer(pg, { machine, revision, manifestKey, contentSha256: manifests.get(manifestKey)!.raw.content_sha256 });
     await armWakeup(hoopDb(pg), KEY, { idleSeconds: 600, maxWaitSeconds: 3600 });
   };
   const tick: Setup["tick"] = async (overrides = {}) =>
@@ -289,7 +289,7 @@ describe("a due wakeup is briefed by the model", () => {
         rec("r3", 3_000, "tool_call", { name: "Bash", target: "bun test" }),
       ]),
     );
-    await pointer(s.pg, { manifestKey });
+    await pointer(s.pg, { manifestKey, contentSha256: s.manifests.get(manifestKey)!.raw.content_sha256 });
     await armWakeup(hoopDb(s.pg), KEY, { idleSeconds: 0, maxWaitSeconds: 0 });
     expect(await s.tick()).toEqual({ generated: 1 });
     const input = JSON.parse(s.model.requests[0]!.input);

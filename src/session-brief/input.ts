@@ -325,6 +325,11 @@ export async function buildBriefInput(
     // The pointer is live but its manifest is not there yet (or was just replaced): retry.
     if (!read)
       throw new PipelineError("manifest_missing", "a live pointer's manifest is missing", true);
+    // The manifest consumed must be the incarnation the pointer row names: its content digest
+    // (validated against the chunk hash chain by parseManifest) equals session_index.content_sha256.
+    // A manifest replaced between the pointer read and this fetch is retried, never briefed.
+    if (p.contentSha256 !== undefined && read.manifest.raw.content_sha256 !== p.contentSha256)
+      throw new PipelineError("manifest_replaced", "a live pointer's manifest is not the incarnation it names", true);
     if (!read.manifest.raw.scrub)
       return { kind: "quarantined", error: "session_quarantined", sourceRevisions };
     assertReaderScrubMarker(read.manifest.raw.scrub, deps.readerMaxRuleset);

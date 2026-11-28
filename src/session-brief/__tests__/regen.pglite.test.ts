@@ -51,7 +51,7 @@ async function setup() {
     revision += 1;
     const manifestKey = `manifest/${KEY.sessionId}/m-1/r${revision}`;
     manifests.set(manifestKey, await transcript(store, conversation(turns), { machine: "m-1", revision }));
-    await pointer(pg, { machine: "m-1", revision, manifestKey });
+    await pointer(pg, { machine: "m-1", revision, manifestKey, contentSha256: manifests.get(manifestKey)!.raw.content_sha256 });
     await armWakeup(hoopDb(pg), KEY, { idleSeconds: 600, maxWaitSeconds: 3600 });
   };
   const tick = (r: BriefRegen | null, opts: { sweep?: boolean; now?: Date; via?: (db: HoopDb) => HoopDb } = {}) =>
