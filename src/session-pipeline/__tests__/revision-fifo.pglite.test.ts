@@ -396,6 +396,17 @@ describe("first indexed appearance of superseded uploads ('revision covered' / '
   });
 });
 
+describe("backstop recovery: a manifest recovered by reconcile", () => {
+  test("its 'revision searchable' line carries commit_to_pickup_ms from the listing's last_modified and the enqueuing attempt", async () => {
+    const t = await rig();
+    const e1 = await t.writer(1, "r1");
+    // The writer and forwarder events were lost; reconcile lists the manifest (last_modified = its commit) on link 2.
+    const hint: RevisionEvent = { key: e1.key, etag: e1.etag!, committedAt: new Date(T0).toISOString(), attempt: 2, nonce: "since#2", source: "reconcile" };
+    const { lines } = await t.run([t.record(hint, T0 + 600_000)]);
+    expect(named(lines, "revision searchable")).toEqual([expect.objectContaining({ event_source: "reconcile", attempt: 2, commit_to_pickup_ms: 1_500 })]);
+  });
+});
+
 describe("in-flight pass: park it, commit a newer revision, then crash or lose the ack", () => {
   test("crash: the parked pass fails, SQS redelivers in order with the newer arrival, the newest live state becomes searchable", async () => {
     const t = await rig();

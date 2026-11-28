@@ -569,6 +569,7 @@ function logSearchable(scope: SessionScope, revisions: readonly Revised[], now: 
     log.info("revision searchable", {
       stage: "revision-events", org_id: scope.orgId, workspace_id: scope.workspaceId, harness: scope.harness, session_id: scope.sessionId,
       revision: r.event.revision?.revision, upload_kind: kind, event_source: r.event.revision?.source, already_current: alreadyCurrent,
+      ...(r.event.revision?.attempt !== undefined ? { attempt: r.event.revision.attempt } : {}),
       incarnation_sha256: incarnation(r.event),
       // Legs, each on the consumer clock: enqueue/commit -> PICKUP (the batch arrived, before any pointer work: the 7s
       // budget) -> this key's pointer work (pointer_ms; the 2s budget) -> the covering search pass's start -> its

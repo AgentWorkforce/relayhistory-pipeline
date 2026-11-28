@@ -64,6 +64,8 @@ export interface RevisionEvent {
    * (an identical-byte re-create has the same ETag).
    */
   nonce?: string;
+  /** Reconcile only: the chain link that enqueued it (carried to the consumer's lines as `attempt`). */
+  attempt?: number;
   source: RevisionMeta["source"];
 }
 
@@ -116,6 +118,7 @@ export function revisionMessage(event: RevisionEvent, id = "0"): RevisionMessage
     ...(event.committedAt ? { committed_at: event.committedAt } : {}),
     ...(event.initial !== undefined ? { initial: event.initial } : {}),
     ...(event.deleted ? { deleted: true } : {}),
+    ...(event.attempt !== undefined ? { attempt: event.attempt } : {}),
   };
   return { Id: id, MessageBody: JSON.stringify({ [REVISION_BODY_KEY]: body }), MessageGroupId: group, MessageDeduplicationId: revisionDedupId(event) };
 }
