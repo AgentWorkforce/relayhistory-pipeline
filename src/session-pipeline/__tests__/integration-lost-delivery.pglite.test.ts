@@ -106,7 +106,7 @@ async function rig() {
   const unauthorized = async () => (await app.request(`/v1/events?workspace=${scope.workspaceId}&q=markerb&limit=50`, { headers: { authorization: "Bearer wrong" } })).status;
   /** One reconcile link over the real store and pointer rows; its hints picked up on `path` (FIFO: reconcile revision hints). */
   let link = 0;
-  const reconcile = async (path: "standard" | "fifo") => {
+  const reconcile = async (path: "standard" | "fifo", skipCurrent = false) => {
     const bodies: string[] = [];
     await reconcileRecent({ store: r.store, db: { query: (t: string, p?: unknown[]) => r.pg.query(t, p as unknown[]) } as never,
       keyPrefix: "96bulls", since: new Date("2026-01-01T00:00:00.000Z"), send: async (b) => { bodies.push(b); } });
@@ -114,12 +114,12 @@ async function rig() {
     const failures: unknown[] = [];
     for (const body of bodies) {
       const hint = (JSON.parse(body) as { reconcile: { key: string; etag?: string } }).reconcile;
-      if (path === "standard") failures.push(...(await processBatch([{ messageId: `rec${link}-${hint.key}`, body }], deps(false))).batchItemFailures);
+      if (path === "standard") failures.push(...(await processBatch([{ messageId: `rec${link}-${hint.key}`, body }], deps(skipCurrent))).batchItemFailures);
       else {
         const m = revisionMessage({ key: hint.key, ...(hint.etag ? { etag: hint.etag } : {}), nonce: `since#${link}`, source: "reconcile" })!;
         const rec: SqsRecord = { messageId: `recf${link}`, receiptHandle: `rh-rec${link}`, body: m.MessageBody, eventSourceARN: ARN,
           attributes: { MessageGroupId: m.MessageGroupId, MessageDeduplicationId: m.MessageDeduplicationId, SentTimestamp: String(NOW.getTime()), ApproximateReceiveCount: "1" } };
-        failures.push(...(await dispatchSqsBatch([rec], deps(false), wiring)).batchItemFailures);
+        failures.push(...(await dispatchSqsBatch([rec], deps(skipCurrent), wiring)).batchItemFailures);
       }
     }
     return { hints: bodies.length, failures };
@@ -174,6 +174,35 @@ for (const path of ["standard", "fifo"] as const) {
       expect(await t.status("markerb")).toBe(501);
       // Pending work: no requeue was sent; nothing else exists in this defaults tree that would run B's search.
       expect(t.r.requeued).toEqual([]);
+    }, 60_000);
+
+    test("STRANDED, stale variant: A indexed; B's append commits its pointer (ETag current), its search pass crashes, the message is lost: both reconcile legs send nothing and the read keeps serving the stale A", async () => {
+      const t = await rig();
+      const key = await t.r.writeManifest(1, loc, "markera", "markera");
+      expect(path === "standard" ? await t.standard(key, await t.etag(key), false) : await t.fifo(key, await t.etag(key), 1, false)).toEqual([]);
+      expect(await t.hits("markera")).toEqual(["markera"]);
+      await t.r.writeManifest(2, loc, "markerb", "markerb");
+      t.failSearch.on = true;
+      expect(path === "standard" ? await t.standard(key, await t.etag(key), false) : await t.fifo(key, await t.etag(key), 2, false)).toHaveLength(1);
+      t.failSearch.on = false;
+      const row = (await t.r.pg.query<{ revision: string; etag: string }>("SELECT revision::text, manifest_etag etag FROM sessions.session_index WHERE deleted_at IS NULL")).rows;
+      expect(row.map((r) => [r.revision, r.etag?.replace(/^"|"$/g, "")])).toEqual([["2", await t.etag(key)]]);
+      const before = { a: await t.status("markera"), b: await t.status("markerb") };
+      const links = [await t.reconcile(path), await t.reconcile(path)];
+      expect(before).toEqual({ a: 200, b: 200 });
+      expect(await t.hits("markerb")).toEqual([]);
+      expect(links).toEqual([{ hints: 0, failures: [] }, { hints: 0, failures: [] }]);
+      // Stale A served indefinitely; B never served; nothing pending.
+      expect(await t.hits("markera")).toEqual(["markera"]);
+      expect(await t.hits("markerb")).toEqual([]);
+      expect(t.r.requeued).toEqual([]);
+    }, 60_000);
+
+    test("skip-current ON for the reconcile pickup (not the deployed default): the whole-delivery-loss recovery is unchanged", async () => {
+      const t = await rig();
+      await t.r.writeManifest(1, loc, "markerb", "markerb");
+      expect(await t.reconcile(path, true)).toEqual({ hints: 1, failures: [] });
+      expect(await t.hits("markerb")).toEqual(["markerb"]);
     }, 60_000);
   });
 }
