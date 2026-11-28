@@ -21,6 +21,12 @@ export interface PartialCanonicalDeps {
   sources: SessionSources;
   /** The whole request's budget for this path (READ_API_PARTIAL_CANONICAL_DEADLINE_MS). */
   deadlineMs: number;
+  /**
+   * The authoritative operator erase fence for one (source, id) key (liveness.ts sqlOperatorErased:
+   * sessions.ingest_operator_runtime_erased as the read role). Always wired with this path; a throw
+   * refuses the read (fail closed). True = 404 `session_fenced`, no content.
+   */
+  operatorFence(key: { orgId: string; workspaceId: string; source: string; sessionId: string }): Promise<boolean>;
 }
 
 export type PartialCanonicalClass = "missing" | "forbidden" | "transient" | "oversize" | "invalid";

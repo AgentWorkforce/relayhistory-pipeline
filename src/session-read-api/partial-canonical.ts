@@ -52,7 +52,7 @@ import { createS3Store } from "../shared/vendor.ts";
 import { isManifestRest, parseSessionKey, parseUploadGenerationPrefix } from "../../packages/object-store/src/index.ts";
 import { CanonicalReadError, canonicalSnapshot, type CanonicalDeps, type CanonicalIdentity, type CanonicalPointer } from "./canonical.ts";
 import { parseDirectoryWorkspaces } from "./config.ts";
-import type { TenantRunner } from "./liveness.ts";
+import { sqlOperatorErased, type TenantRunner } from "./liveness.ts";
 import { sqlCanonicalPointers } from "./session-timing-source.ts";
 import { sqlSessionSources } from "./session-sources.ts";
 import type { PartialCanonicalDeps } from "./partial-canonical-policy.ts";
@@ -188,5 +188,9 @@ export function partialCanonicalDeps(env: NodeJS.ProcessEnv, entry: "lambda" | "
     workspaces: config.workspaces,
     sources: sqlSessionSources(run),
     deadlineMs: config.deadlineMs,
+    // Always wired, independent of SESSION_ERASE_FENCE_ENFORCED (which gates the self-host middleware):
+    // this path never serves canonical content without asking the authoritative fence (migration 050020
+    // grants the read role EXECUTE on it). Unavailable = refused.
+    operatorFence: sqlOperatorErased(run),
   };
 }

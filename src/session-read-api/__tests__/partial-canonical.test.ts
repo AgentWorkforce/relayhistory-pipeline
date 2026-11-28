@@ -92,9 +92,11 @@ const location = { prefix: "96bulls/org_1", workspaceId: "ws_1", machineId: "srv
 let root: string, store: ObjectStore, manifest: ManifestV1, chunkKey: string;
 let pointerRow: Record<string, unknown>;
 const sqlCalls: Array<{ org: string; ws: string; text: string; params: unknown[] }> = [];
+const fenceRows = new Set<string>();
 
 beforeEach(async () => {
   sqlCalls.length = 0;
+  fenceRows.clear();
   root = await mkdtemp(join(tmpdir(), "partial-canonical-"));
   store = createFsStore({ root });
   const lines = ["first synthetic line", "second synthetic line"].map((text, i) => ({
@@ -138,6 +140,7 @@ function runner(rows: () => Array<Record<string, unknown>>): TenantRunner {
     work({
       async query(text: string, params: unknown[] = []) {
         sqlCalls.push({ org, ws, text, params });
+        if (text.startsWith("SELECT sessions.ingest_operator_runtime_erased(")) return { rows: [{ erased: fenceRows.has(String(params[3])) }] };
         if (text !== SESSION_POINTERS_SQL) throw Error("unexpected SQL");
         // The read role's RLS: only the bound tenant's rows.
         return { rows: rows().filter((r) => r.org_id === org && r.workspace_id === ws) };
@@ -172,6 +175,21 @@ describe("partialCanonicalDeps: the Lambda source over canonicalSnapshot", () =>
     expect(deps.workspaces).toEqual(new Set(["ws_1"]));
     expect(deps.deadlineMs).toBe(3000);
     expect("deadlineMs" in deps.events).toBe(false);
+  });
+
+  test("the Lambda wires the authoritative operator fence: the read role's ingest_operator_runtime_erased, tenant-bound", async () => {
+    const { deps } = lambdaSource();
+    fenceRows.add("sess:1");
+    expect(await deps.operatorFence({ ...identity })).toBe(true);
+    expect(await deps.operatorFence({ ...identity, sessionId: "other" })).toBe(false);
+    const fence = sqlCalls.filter((c) => c.text.startsWith("SELECT sessions.ingest_operator_runtime_erased("));
+    expect(fence.map((c) => [c.org, c.ws, c.params])).toEqual([
+      ["org_1", "ws_1", ["org_1", "ws_1", "claude", "sess:1"]],
+      ["org_1", "ws_1", ["org_1", "ws_1", "claude", "other"]],
+    ]);
+    // A lookup failure is a throw (the route answers 503), never a silent false.
+    const broken = partialCanonicalDeps(ON, "lambda", (async () => { throw new Error("db down"); }) as unknown as TenantRunner)!;
+    await expect(broken.operatorFence({ ...identity })).rejects.toThrow("operator_fence_unavailable");
   });
 
   test("another tenant's identity sees no pointer and reads nothing", async () => {

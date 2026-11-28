@@ -618,6 +618,9 @@ components:
         object read failed transiently; retry the same cursor a bounded number
         of times, then restart without a cursor. Its first page never answers
         this 503: every refusal there is the unchanged 501 `session_partial`.
+        On the same flagged path, a failed operator-fence lookup answers 503
+        `backend_unavailable` with `reason: operator_fence_unavailable` on any
+        page (fail closed; not a 501, so do not fall back to another reader).
         That list is not complete.
       headers:
         Retry-After:
@@ -644,7 +647,10 @@ components:
         unsupported_by_backend with a reason; 409 cursor_backend_transition
         on `/v1/sessions/{sessionId}/events` when a cursor was issued by
         another backend or a canonical cursor's source generation moved
-        (restart without a cursor); 503 backend_unavailable or
+        (restart without a cursor); 404 session_fenced (reason
+        `session_fenced`) on that route's partial-canonical path when the
+        session is operator-fenced: no content, and do not fall back to another
+        reader; 503 backend_unavailable or
         token_store_unavailable (retryable).
       content:
         application/json:

@@ -80,6 +80,10 @@ function fixture(o: Options = {}) {
     fail: undefined as unknown,
     hang: false,
     afterRead: undefined as undefined | (() => void),
+    /** Operator-fenced `${source}/${id}` keys (the authoritative fence, apart from tombstones). */
+    fenced: new Set<string>(),
+    fenceFails: false,
+    fenceAsked: [] as string[],
   };
   const deps: ReadApiDeps = {
     verify: async () => ({ ...tenant, userId: "u", scopes: ["rth:read"] }),
@@ -103,6 +107,11 @@ function fixture(o: Options = {}) {
       workspaces: o.pc.workspaces,
       sources: async () => { sourceCalls++; return o.pc ? o.pc.sources ?? [sourceRow("codex")] : []; },
       deadlineMs: o.pc.deadlineMs ?? 3000,
+      operatorFence: async (key) => {
+        state.fenceAsked.push(`${key.orgId}/${key.workspaceId}/${key.source}/${key.sessionId}`);
+        if (state.fenceFails) throw new Error("synthetic fence outage");
+        return state.fenced.has(`${key.source}/${key.sessionId}`);
+      },
     };
     deps.canonicalEventsPartial = pc;
   }
@@ -155,7 +164,8 @@ describe("served", () => {
     expect(second.events.map((e: any) => e.eventId)).toEqual(["canon-2"]);
     expect(second.nextCursor).toBeNull();
     // No ClickHouse event query ran; the object source was asked with the caller's tenant only.
-    expect(f.counts()).toEqual({ reads: 2, sourceCalls: 0, indexQueries: 0 });
+    // sourceCalls: the fence's id-form lookup for the explicit source, once per page.
+    expect(f.counts()).toEqual({ reads: 2, sourceCalls: 2, indexQueries: 0 });
     expect(f.identities).toEqual([{ ...tenant, sessionId: "sess", source: "codex" }, { ...tenant, sessionId: "sess", source: "codex" }]);
     expect(f.logs.filter((l) => l.reason === "partial_canonical_served").map((l) => [l.kind, l.count])).toEqual([["first_page", 1], ["cursor_page", 1]]);
   });
@@ -230,9 +240,7 @@ describe("erasure", () => {
 
   test("an operator fence on the resolved source after the read is a 404 with no content", async () => {
     const f = fixture({ pc: { workspaces: "*", sources: [sourceRow("codex", { canonical_ids: ["sess-alias"] })] } });
-    const fenced = new Set<string>();
-    f.deps.operatorErased = async (key) => fenced.has(`${key.source}/${key.sessionId}`);
-    f.state.afterRead = () => fenced.add("codex/sess-alias");
+    f.state.afterRead = () => f.state.fenced.add("codex/sess-alias");
     const r = await f.get("");
     expect([r.status, (await r.text()).includes("synthetic-canonical")]).toEqual([404, false]);
   });
@@ -368,7 +376,7 @@ describe("public handler (handleUrlEvent)", () => {
       ["canon-2", "codex", "history", "synthetic-canonical-2-long-content"],
     ]);
     expect(r.body.nextCursor).toBeNull();
-    expect(f.counts()).toEqual({ reads: 1, sourceCalls: 0, indexQueries: 0 });
+    expect(f.counts()).toEqual({ reads: 1, sourceCalls: 1, indexQueries: 0 });
   });
 
   test("PH2 unauthenticated: 401, no read, no events", async () => {
@@ -425,6 +433,80 @@ describe("public handler (handleUrlEvent)", () => {
   });
 });
 
+describe("authoritative operator fence (pc.operatorFence), apart from tombstones", () => {
+  const FENCED_BODY = `{"error":{"code":"session_fenced","message":"Session not found","reason":"session_fenced"},"correlationId":"corr-1"}`;
+  const FENCED_404 = { ...json, status: 404, body: FENCED_BODY };
+  const UNAVAILABLE_503 = { ...json, status: 503, body: `{"error":{"code":"backend_unavailable","message":"read backend unavailable","reason":"operator_fence_unavailable"},"correlationId":"corr-1"}` };
+
+  test("F1 fenced before the read: 404 session_fenced, verified workspace header, zero object reads, no content", async () => {
+    for (const query of ["&source=codex", "", `&source=codex&cursor=${objectCursor()}`]) {
+      const f = fixture({ pc: { workspaces: "*" } });
+      f.state.fenced.add("codex/sess");
+      expect([query, await snapshot(await f.get(query))]).toEqual([query, FENCED_404]);
+      expect([query, f.counts().reads]).toEqual([query, 0]);
+    }
+  });
+
+  test("F2 every id form is asked: a fence on the canonical/physical alias alone blocks, before any read", async () => {
+    for (const query of ["&source=codex", ""]) {
+      const f = fixture({ pc: { workspaces: "*", sources: [sourceRow("codex", { session_ids: ["sess", "sess-physical"], canonical_ids: ["sess-canonical"] })] } });
+      f.state.fenced.add("codex/sess-canonical");
+      expect([query, await snapshot(await f.get(query))]).toEqual([query, FENCED_404]);
+      expect(f.counts().reads).toBe(0);
+      expect(f.state.fenceAsked).toEqual(["sess", "sess-physical", "sess-canonical"].map((id) => `org-a/ws-a/codex/${id}`));
+    }
+    // Another harness's alias does not fence this source.
+    const other = fixture({ pc: { workspaces: "*", sources: [sourceRow("codex"), sourceRow("claude", { session_ids: ["sess"], canonical_ids: ["claude-only"] })] } });
+    other.state.fenced.add("claude/claude-only");
+    expect((await other.get("&source=codex")).status).toBe(200);
+  });
+
+  test("F3 a fence that commits during the object read: 404 session_fenced, no content, on first and cursor pages", async () => {
+    for (const query of ["&source=codex", "", `&source=codex&cursor=${objectCursor()}`]) {
+      const f = fixture({ pc: { workspaces: "*" } });
+      f.state.afterRead = () => f.state.fenced.add("codex/sess");
+      expect([query, await snapshot(await f.get(query))]).toEqual([query, FENCED_404]);
+      expect([query, f.counts().reads]).toEqual([query, 1]);
+      expect(JSON.stringify(f.logs).includes("synthetic-canonical")).toBe(false);
+    }
+  });
+
+  test("F4 fence lookup failure fails closed: 503 operator_fence_unavailable (never the 501 that sends Cloud to History), zero reads", async () => {
+    for (const query of ["&source=codex", "", `&source=codex&cursor=${objectCursor()}`]) {
+      const f = fixture({ pc: { workspaces: "*" } });
+      f.state.fenceFails = true;
+      expect([query, await snapshot(await f.get(query))]).toEqual([query, UNAVAILABLE_503]);
+      expect(f.counts().reads).toBe(0);
+    }
+    // Failing only after the read: still the 503, no content.
+    const late = fixture({ pc: { workspaces: "*" } });
+    late.state.afterRead = () => { late.state.fenceFails = true; };
+    const r = await late.get("&source=codex");
+    expect([r.status, (await r.text()).includes("synthetic-canonical")]).toEqual([503, false]);
+  });
+
+  test("F5 workspace attestation mismatch fails closed before the fence or any read (403)", async () => {
+    const f = fixture({ pc: { workspaces: "*" } });
+    f.deps.verify = async () => ({ orgId: "org-a", workspaceId: "ws-b", userId: "u", scopes: ["rth:read"] });
+    expect((await f.get("&source=codex")).status).toBe(403);
+    expect([f.counts().reads, f.state.fenceAsked]).toEqual([0, []]);
+  });
+
+  test("F6 ordinary contracts stay separate: tombstone = 200 empty (fence not consulted); not fenced = served; flag off = unchanged", async () => {
+    const tomb = fixture({ pc: { workspaces: "*" }, created: {}, erased: [{ source: "codex", sessionId: "sess" }] });
+    expect(await (await tomb.get("&source=codex")).json()).toEqual({ sessionId: "sess", events: [], nextCursor: null, correlationId: "corr-1" });
+    expect(tomb.state.fenceAsked).toEqual([]);
+    const open = fixture({ pc: { workspaces: "*" } });
+    expect((await open.get("&source=codex")).status).toBe(200);
+    expect(open.state.fenceAsked).toEqual(["org-a/ws-a/codex/sess", "org-a/ws-a/codex/sess"]);
+    // A not-partial session never reaches this path, so the fence is not asked there (the existing Lambda behaviour).
+    const notPartial = fixture({ pc: { workspaces: "*" }, partial: [] });
+    notPartial.state.fenced.add("codex/sess");
+    expect((await notPartial.get("&source=codex")).status).toBe(200);
+    expect(notPartial.state.fenceAsked).toEqual([]);
+  });
+});
+
 describe("no content on any refused or erased answer", () => {
   const FAILS: unknown[] = [
     new CanonicalReadError("tenant_mismatch"), new CanonicalReadError("pointer_invalid"), new CanonicalReadError("prefix_mismatch"),
@@ -456,9 +538,7 @@ describe("no content on any refused or erased answer", () => {
       expect((await r.text()).includes("synthetic-canonical")).toBe(false);
     }
     const fenced = fixture({ pc: { workspaces: "*" } });
-    const keys = new Set<string>();
-    fenced.deps.operatorErased = async (k) => keys.has(`${k.source}/${k.sessionId}`);
-    fenced.state.afterRead = () => keys.add("codex/sess");
+    fenced.state.afterRead = () => fenced.state.fenced.add("codex/sess");
     runs.push(fenced);
     expect((await (await before.get("&source=codex")).text()).includes("synthetic-canonical")).toBe(false);
     expect((await (await fenced.get("")).text()).includes("synthetic-canonical")).toBe(false);

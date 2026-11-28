@@ -1139,6 +1139,26 @@ export function createReadApi(deps: ReadApiDeps) {
       if (resolved === undefined) throw refusePartial(c, continuing, "missing", ["source_unresolved"]);
       served = resolved.source;
       forms = resolved.forms;
+    }
+    // The authoritative operator fence (pc.operatorFence: sessions.ingest_operator_runtime_erased), kept
+    // apart from tombstones: every id form of the served source, before any object read and again after
+    // the IO, on first and cursor pages. Unavailable = refused (fail closed), never read through.
+    const fenceSource = served;
+    const fenceForms = forms ?? await sourceForms(identity, q.sessionId, fenceSource, pc.sources);
+    const fenced = async (): Promise<boolean> => {
+      try {
+        for (const id of fenceForms)
+          if (await pc.operatorFence({ orgId: identity.orgId, workspaceId: identity.workspaceId, source: fenceSource, sessionId: id })) return true;
+        return false;
+      } catch {
+        // Fail closed and NOT the 501: a 501 sends Cloud to History, which must not serve a session whose
+        // fence state is unknown. 503 on every page.
+        log({ route: c.req.routePath, reason: "operator_fence_unavailable", status: 503, kind: continuing ? "cursor_page" : "first_page", correlation_id: c.get("correlationId") });
+        throw new HttpError(503, "backend_unavailable", "read backend unavailable", "operator_fence_unavailable");
+      }
+    };
+    if (await fenced()) throw sessionFenced(c, continuing);
+    if (forms) {
       start = await deps.liveness.sessionStart(identity.orgId, identity.workspaceId, q.sessionId, served);
       if (start.pointers > 0 && start.live === 0) return empty();
     }
@@ -1159,9 +1179,33 @@ export function createReadApi(deps: ReadApiDeps) {
       throw refusePartial(c, continuing, cls, codes);
     }
     // A fence that committed during the object read wins before any content leaves.
-    if (forms && await hostedFenced(identity, served, forms)) throw new HttpError(404, "not_found", "Session not found");
+    if (await fenced()) throw sessionFenced(c, continuing);
     log({ route: c.req.routePath, reason: "partial_canonical_served", count: page.events.length, kind: continuing ? "cursor_page" : "first_page", correlation_id: c.get("correlationId") });
     return c.json({ sessionId: q.sessionId, events: page.events, nextCursor: page.nextCursor, correlationId: c.get("correlationId") });
+  }
+
+  /** The id forms of one explicit source's live rows (the requested id first), checked as hostedSource checks them. */
+  async function sourceForms(identity: VerifiedIdentity, sessionId: string, source: string, reader: SessionSources): Promise<string[]> {
+    const rows = await reader(identity.orgId, identity.workspaceId, sessionId);
+    if (rows.length > SESSION_SOURCES_MAX) throw new Error("session sources out of contract");
+    const forms = new Set([sessionId]);
+    for (const row of rows) {
+      if (row.org_id !== identity.orgId || row.workspace_id !== identity.workspaceId) throw new TenantMismatchError();
+      if (row.harness !== source) continue;
+      if (!Array.isArray(row.session_ids) || !Array.isArray(row.canonical_ids)) throw new Error("session sources out of contract");
+      for (const id of [...row.session_ids, ...row.canonical_ids]) if (typeof id === "string" && id !== "") forms.add(id);
+    }
+    return [...forms];
+  }
+
+  /**
+   * An authoritative operator fence on the partial-canonical path: 404 `session_fenced`, no content
+   * (X-Relayhistory-Workspace-Id is the verified workspace, set by the auth middleware). Distinct from
+   * a tombstone (the empty page) and from the ordinary 404 `not_found`, which are unchanged.
+   */
+  function sessionFenced(c: Context, continuing: boolean): HttpError {
+    log({ route: c.req.routePath, reason: "session_fenced", status: 404, kind: continuing ? "cursor_page" : "first_page", correlation_id: c.get("correlationId") });
+    return new HttpError(404, "session_fenced", "Session not found", "session_fenced");
   }
 
   /**
