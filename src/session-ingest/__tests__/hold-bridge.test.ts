@@ -19,6 +19,7 @@ import {
   HOLD_FUNCTIONS,
   HOLD_SEAL_MAX_MS,
   bridgeCompleteVerdict,
+  bridgeStore,
   erasureReceiptKey,
   holdAlarms,
   holdSql,
@@ -50,7 +51,7 @@ const code = async (fn: () => unknown) => { try { await fn(); return null; } cat
 const codeSync = (fn: () => unknown) => { try { fn(); return null; } catch (e) { return (e as { code?: string }).code ?? String(e); } };
 const cleanups: (() => void)[] = [];
 afterEach(() => cleanups.splice(0).forEach((f) => f()));
-const fresh = () => { const s = scratchStore(); cleanups.push(s.done); return s.store; };
+const fresh = () => { const s = scratchStore(); cleanups.push(s.done); return asBridge(s.store); };
 const ROOT = "96bulls";
 
 // ---- the lifecycle adapter ----
@@ -145,6 +146,9 @@ const userErase: Erasure = { kind: "user", requestId: "req-1", workspaceId: "ws-
 const sessionErase: Erasure = { kind: "session", requestId: "session\nws-2\nclaude\nsess-1", workspaceId: "ws-2", source: "claude", sessionId: "sess-1", atMs: NOW };
 /** The user-erase generation proof's ports over `store` (user-erase-generation.ts): a sealed hold, a bound FULL. */
 export const BUCKET = "bucket-under-test";
+/** A store registered as the bridge's, built for BUCKET (bridgeStore, with the store factory replaced by `inner`). */
+export const asBridge = (inner: ObjectStore, bucket = BUCKET) =>
+  bridgeStore({ bucket, region: "us-east-1", credentials: { accessKeyId: "test", secretAccessKey: "test" } as never }, () => inner);
 export function generationDeps(_store: ObjectStore, over: Partial<GenerationPorts> = {}, epoch = E): UserGeneration {
   return {
     ports: { eraseDestination: { bucket: BUCKET, keyRoot: ROOT }, now: () => NOW, userOrigins: async () => [], admissionFencedBefore: async () => ({ sql: true, direct: true, fallback: true }), ...over },
@@ -159,16 +163,16 @@ export function generationDeps(_store: ObjectStore, over: Partial<GenerationPort
  */
 function deps(base: ObjectStore, over: Record<string, unknown> = {}, fail?: (op: string, key: string) => boolean) {
   const calls: unknown[][] = [];
-  const store: ObjectStore = { ...base, backend: base.backend, head: (k) => base.head(k), get: (k, r) => base.get(k, r), getObject: (k, r) => base.getObject(k, r),
+  const store: ObjectStore = asBridge({ ...base, backend: base.backend, head: (k) => base.head(k), get: (k, r) => base.get(k, r), getObject: (k, r) => base.getObject(k, r),
     presignGet: (k, t) => base.presignGet(k, t), list: (p, c) => base.list(p, c),
     delete: async (k) => { if (fail?.("delete", String(k))) throw new ObjectStoreError("transient", "fs", "injected", { status: 503 }); return base.delete(k); },
     put: async (k, b, o) => {
       if (fail?.("put", String(k))) throw new ObjectStoreError("transient", "fs", "injected", { status: 503 });
       if (String(k).endsWith("/upload-fences.json")) calls.push(["reset", String(k)]);
       return base.put(k, b, o);
-    } };
+    } });
   return { calls, d: {
-    store, bucket: BUCKET, keyRoot: ROOT, org: ORG, epoch: E, now: () => NOW, ledgerOptions: { sleep: async () => {} },
+    store, keyRoot: ROOT, org: ORG, epoch: E, now: () => NOW, ledgerOptions: { sleep: async () => {} },
     generation: generationDeps(store),
     setSessionUploads: async (i: SelectionInput) => { calls.push(["fence", i]); },
     resolveSessionTargets: async () => ({ complete: true, targets: [{ userId: "user-a", originId: "origin-a", source: "claude", sessionId: "sess-1" },
@@ -191,8 +195,9 @@ test("replay, user erase -> the user's S3 fence reset (keyed by the request) and
   // A retry: already receipted, nothing re-applied.
   expect(await replayErasure(d, userErase)).toBe("already");
   expect(calls.length).toBe(2);
-  // Without a declared bucket, or with one the SQL erase did not use: no effect.
-  for (const over of [{ bucket: undefined }, { bucket: "another-bucket" }]) expect(await replayErasure({ ...d, ...over }, userErase)).toBe("erasure_generation_unproven");
+  // A store not built by bridgeStore (no bucket), or one built for a bucket the SQL erase did not use: refused.
+  const raw = scratchStore(); cleanups.push(raw.done);
+  for (const s of [raw.store, asBridge(store, "another-bucket")]) expect(await replayErasure({ ...d, store: s }, userErase)).toBe("erasure_generation_unproven");
   expect(calls.length).toBe(2);
   // The same request under another epoch is a separate replay, with its own binding (never the first epoch's).
   expect(await replayErasure({ ...d, epoch: E2 }, userErase)).toBe("erasure_generation_unproven");

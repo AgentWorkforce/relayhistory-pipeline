@@ -38,7 +38,8 @@
  *      BACKLOG_OPS_HOLD_ALARM_OWNER, an Agent Relay name), never a code constant. Counts, codes and hashes only.
  */
 import { createHash } from "node:crypto";
-import { isObjectStoreError, objectKey, readAll, type ObjectStore } from "../shared/vendor.ts";
+import { createS3Store, isObjectStoreError, objectKey, readAll, type ObjectStore } from "../shared/vendor.ts";
+import type { S3Config } from "../../packages/object-store/src/index.ts";
 import type { LedgerTenant, SelectionInput } from "./ledger.ts";
 import { s3Ledger, type S3LedgerOptions } from "./ledger-s3.ts";
 import { eraseGenerationLogPayloads } from "./ledger-log-erase.ts";
@@ -199,13 +200,8 @@ export interface ReplayDeps {
   org: string;
   epoch: string;
   /**
-   * The bucket `store` is (declared with it). A user erase's binding must name it, and it must equal the SQL erase's
-   * destination (GenerationPorts.eraseDestination). Absent: every user erase replays to erasure_generation_unproven.
-   */
-  bucket?: string;
-  /**
-   * The user-erase generation proof (user-erase-generation.ts): its ports and, per user erasure, its binding (bucket,
-   * key root, hold epoch and state, the bound FULL, the erase's time and state). Absent: every user erase replays to
+   * The user-erase generation proof (user-erase-generation.ts): its ports and, per user erasure, its binding (the
+   * bucket `store` was built for by bridgeStore, key root, hold epoch and state, the bound FULL, the erase's time and state). Absent: every user erase replays to
    * erasure_generation_unproven. A user erase's effects are built HERE from `store` and `keyRoot` (the S3 ledger's
    * resetUploadedSessions and eraseGenerationLogPayloads), never injected: the reset, the scoped payload erase, both
    * receipts and every re-verification use the one store. Never the unconditional eraseLogPayloads.
@@ -224,6 +220,23 @@ export interface ReplayDeps {
     Promise<{ complete: boolean; targets: { userId: string; originId: string; source: string; sessionId: string }[] }>;
   now(): number;
 }
+
+/**
+ * The bridge's store and its bucket, made from ONE config: bridgeStore builds the store from that config and records
+ * (store -> bucket) here, module-private, so the bucket a user erase is bound to is always the one its store was built
+ * for. There is no other setter; a store not made by bridgeStore has no bucket, and every user erase on it refuses.
+ */
+const BRIDGE_BUCKETS = new WeakMap<ObjectStore, string>();
+export interface BridgeStoreConfig { bucket: string; region: string; endpoint?: string; credentials: S3Config["credentials"] }
+export function bridgeStore(config: BridgeStoreConfig, make: (c: S3Config) => ObjectStore = (c) => createS3Store(c) as unknown as ObjectStore): ObjectStore {
+  if (!config || typeof config.bucket !== "string" || !/^[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]$/u.test(config.bucket)) refuse("bridge_store_config");
+  const cfg: S3Config = { bucket: config.bucket, region: config.region, ...(config.endpoint ? { endpoint: config.endpoint } : {}), credentials: config.credentials };
+  const store = make(cfg);
+  BRIDGE_BUCKETS.set(store, cfg.bucket);
+  return store;
+}
+/** The bucket `store` was built for by bridgeStore, or undefined. */
+export const bridgeBucket = (store: ObjectStore): string | undefined => BRIDGE_BUCKETS.get(store);
 
 export interface UserGeneration {
   ports: GenerationPorts;
@@ -264,12 +277,12 @@ export function parseTargetCount(v: unknown): bigint {
  * The gate's proof for an erasure (bridgeCompleteVerdict): a session erase's complete plan; a user erase's
  * bytes_verified and its POST-EFFECT generation proof (verifyGeneration: the receipt, re-derived now). null when held.
  */
-export async function erasureProof(d: Pick<ReplayDeps, "store" | "bucket" | "org" | "keyRoot" | "epoch" | "generation" | "resolveSessionTargets">, e: Erasure): Promise<ProofRefusal | null> {
+export async function erasureProof(d: Pick<ReplayDeps, "store" | "org" | "keyRoot" | "epoch" | "generation" | "resolveSessionTargets">, e: Erasure): Promise<ProofRefusal | null> {
   if (e.kind === "session") { const p = await sessionPlan(d, e); return typeof p === "string" ? p : null; }
   if (!e.bytesVerified) return "erasure_bytes_unverified";
   if (!d.generation) return "erasure_generation_unproven";
   try {
-    return (await verifyGeneration(d.store, d.generation.ports, boundFor(d.generation, d.bucket, d.keyRoot, d.org, d.epoch, e))) === null ? null : "erasure_generation_unproven";
+    return (await verifyGeneration(d.store, d.generation.ports, boundFor(d.generation, bridgeBucket(d.store), d.keyRoot, d.org, d.epoch, e))) === null ? null : "erasure_generation_unproven";
   } catch { return "erasure_generation_unproven"; }
 }
 
@@ -290,7 +303,7 @@ async function userPreEffect(d: ReplayDeps, e: Extract<Erasure, { kind: "user" }
   if (!e.bytesVerified) return "erasure_bytes_unverified";
   if (!d.generation) return "erasure_generation_unproven";
   try {
-    return await generationPreEffect(d.store, d.generation.ports, boundFor(d.generation, d.bucket, d.keyRoot, d.org, d.epoch, e));
+    return await generationPreEffect(d.store, d.generation.ports, boundFor(d.generation, bridgeBucket(d.store), d.keyRoot, d.org, d.epoch, e));
   } catch (err) {
     return err instanceof GenerationRefused && err.code === "erasure_bytes_unverified" ? "erasure_bytes_unverified" : "erasure_generation_unproven";
   }
@@ -329,7 +342,7 @@ export async function replayErasure(d: ReplayDeps, e: Erasure): Promise<ReplayOu
     if (e.kind === "user") {
       const tenant = { orgId: d.org, workspaceId: e.workspaceId, userId: e.userId };
       let binding: GenerationBinding;
-      try { binding = boundFor(d.generation!, d.bucket, d.keyRoot, d.org, d.epoch, e); } catch { return "erasure_generation_unproven"; }
+      try { binding = boundFor(d.generation!, bridgeBucket(d.store), d.keyRoot, d.org, d.epoch, e); } catch { return "erasure_generation_unproven"; }
       counts.reset = await s3Ledger(d.store, d.keyRoot, { ...d.ledgerOptions, acceptanceMode: "canonical" }).resetUploadedSessions(tenant, e.requestId);
       // The ordinal the reset's begin CAS bound (or the one a retry already had): must be there now, and unchanged.
       let after: { generation: number | null };
@@ -385,7 +398,7 @@ export async function replayErasures(d: ReplayDeps, readCount: () => Promise<num
  * immediately before the release) receipted for that epoch. Returns a code: ok, or the first reason it may not.
  */
 export async function bridgeCompleteVerdict(store: ObjectStore, keyRoot: string, org: string, hold: Hold | null, epoch: string, set: readonly Erasure[],
-  proofs: Pick<ReplayDeps, "bucket" | "generation" | "resolveSessionTargets"> = {}):
+  proofs: Pick<ReplayDeps, "generation" | "resolveSessionTargets"> = {}):
   Promise<{ code: "ok" | "hold_missing" | "hold_epoch_mismatch" | "hold_not_attempted" | "erasure_unreplayed"; erasures: number; receipted: number }> {
   const base = { erasures: set.length, receipted: 0 };
   if (hold === null) return { code: "hold_missing", ...base };

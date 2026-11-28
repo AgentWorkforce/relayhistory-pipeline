@@ -310,13 +310,21 @@ export async function generationEvidence(store: ObjectStore, p: GenerationPorts,
   // The S3 ledger's per-user admission directories share this root (async-admission.ts admissionUserDir: a pseudo
   // machine srv_<hash of ("admission-user-v1", ws, user)>). This user's is keys.dir, covered by the classes above;
   // any other has another (ws, user) by construction. Only its own object names parse.
-  const adminRe = /^m=[A-Za-z0-9._-]{1,128}\/(?:upload-fences\.json|privacy-journal\.json|ledger\/[^\s]+)$/u;
+  // An admission-directory name passes unjudged ONLY under this user's own computed admission machine (keys.dir), or
+  // under a machine that is not one of this user's upload machines (another user's admission directory). Under one of
+  // this user's upload machines it is judged like any byte (a ledger-shaped object there is not the ledger's).
+  const adminRe = /^m=([A-Za-z0-9._-]{1,128})\/(?:upload-fences\.json|privacy-journal\.json|ledger\/[^\s]+)$/u;
   if (!keys.dir.startsWith(inboxRoot)) refuse("generation_unreadable");
+  const ownAdmin = keys.dir.slice(inboxRoot.length);
+  if (!/^m=[A-Za-z0-9._-]{1,128}$/u.test(ownAdmin) || mine.has(ownAdmin.slice(2))) refuse("generation_unreadable");
   for (const k of await listAll(store, inboxRoot)) {
     const rest = k.slice(inboxRoot.length);
     const m = inboxRe.exec(rest);
     if (m) { if (!k.endsWith(".json")) judge(m[1]!); continue; }
-    if (!adminRe.test(rest)) refuse("generation_unreadable");
+    const a = adminRe.exec(rest);
+    if (!a) refuse("generation_unreadable");
+    if (`m=${a![1]}` === ownAdmin) continue;
+    if (mine.has(a![1]!)) refuse("generation_bytes_remain");
   }
 
   const prefixes = userErasePrefixes(b.keyRoot, { requestId: b.requestId, orgId: t.orgId, workspaceId: t.workspaceId, userId: t.userId }, sqlOrigins);

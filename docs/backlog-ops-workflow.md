@@ -589,8 +589,10 @@ positive erasure set is not wired to a mode. Only the empty-window path above is
     - **One store.** The bridge builds the user erase's effects itself from its own store and key root
       (the S3 ledger's reset, the scoped payload erase); nothing is injected, and the proof functions
       take that same store, so the reset, the erase, both receipts and every re-verification hit one
-      store. The bridge declares its bucket (`bucket`); the binding and the receipt carry it, and it
-      must equal the SQL erase's bucket and key root (`eraseDestination`) before any effect.
+      store. The store and its bucket come from one config (`bridgeStore`, which builds the store and
+      records its bucket; there is no other setter): a store not built by it has no bucket and every
+      user erase on it refuses. The binding and the receipt carry that bucket, and it must equal the
+      SQL erase's bucket and key root (`eraseDestination`) before any effect.
     - **Post-effect**, after the reset and the scoped payload erase: a create-only receipt at
       `96bulls/.ledger/hold-bridge/<org>/<epoch>/generations/<hash of the request>.json` (hashes, counts,
       the key root and epoch only) once every byte class of the user is empty below the generation:

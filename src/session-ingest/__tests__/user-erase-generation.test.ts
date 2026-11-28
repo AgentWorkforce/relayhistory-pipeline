@@ -21,7 +21,7 @@ import type { ClaimInput, CommitInput, LedgerRecord, LedgerTenant } from "../led
 import { appendBatches, enableLogMode, logKeys, putPayload, type LogBatch, type LogKeys, type LogState } from "../ledger-log.ts";
 import { eraseGenerationLogPayloads, eraseLogPayloads } from "../ledger-log-erase.ts";
 import { applyFenceChange, newFence, s3Ledger, s3LedgerKeys, sessionKeyHash, validFence, type FenceDoc } from "../ledger-s3.ts";
-import { bridgeCompleteVerdict, erasureReceiptKey, replayErasure, requestHash, replayErasures, type Erasure, type Hold, type ReplayDeps, type UserGeneration } from "../hold-bridge.ts";
+import { bridgeCompleteVerdict, bridgeStore, erasureReceiptKey, replayErasure, requestHash, replayErasures, type Erasure, type Hold, type ReplayDeps, type UserGeneration } from "../hold-bridge.ts";
 import { ERASE_ORDER_MARGIN_MS, generationEvidence, generationPreEffect, generationReceiptKey, produceGenerationReceipt, verifyGeneration, type GenerationBinding, type GenerationPorts } from "../user-erase-generation.ts";
 import { rearmDoneKey } from "../rearm-sweeper.ts";
 import { originInboxDir } from "../async-admission.ts";
@@ -44,14 +44,16 @@ const enc = (v: unknown) => new TextEncoder().encode(JSON.stringify(v));
 
 const cleanups: (() => void)[] = [];
 afterEach(() => cleanups.splice(0).forEach((f) => f()));
-const fresh = () => { const s = scratchStore(); cleanups.push(s.done); return s.store; };
+const BUCKET = "bucket-under-test";
+const asBridge = (inner: ObjectStore, bucket = BUCKET) =>
+  bridgeStore({ bucket, region: "us-east-1", credentials: { accessKeyId: "test", secretAccessKey: "test" } as never }, () => inner);
+const fresh = () => { const s = scratchStore(); cleanups.push(s.done); return asBridge(s.store); };
 const exists = async (store: ObjectStore, key: string) => (await store.head(objectKey(key))) !== undefined;
 const json = async (store: ObjectStore, key: string) => JSON.parse(new TextDecoder().decode(await readAll((await store.getObject(objectKey(key))).body)));
 const fenceOf = (store: ObjectStore, t: LedgerTenant): Promise<FenceDoc> => json(store, s3LedgerKeys(ROOT, t).fence);
 const ledgerOn = (store: ObjectStore) => s3Ledger(store, ROOT, { sleep: async () => {} });
 
 const fenced = { sql: true, direct: true, fallback: true };
-const BUCKET = "bucket-under-test";
 /** The ports plus, for these tests only, the store the proof functions are called with (the bridge passes its own). */
 type P = GenerationPorts & { store: ObjectStore };
 function ports(store: ObjectStore, over: Partial<GenerationPorts> = {}): P {
@@ -78,15 +80,15 @@ function observed(base: ObjectStore, calls: string[]): ObjectStore {
   const users = [A, B, { ...A, userId: "user-c" }, { ...A, userId: "user-d" }];
   const who = (k: string) => users.find((t) => k.startsWith(s3LedgerKeys(ROOT, t).dir + "/"))?.userId ?? "other";
   const note = (v: string) => { if (calls[calls.length - 1] !== v) calls.push(v); };
-  return { ...base, backend: base.backend, head: (k) => base.head(k), get: (k, r) => base.get(k, r), getObject: (k, r) => base.getObject(k, r),
+  return asBridge({ ...base, backend: base.backend, head: (k) => base.head(k), get: (k, r) => base.get(k, r), getObject: (k, r) => base.getObject(k, r),
     presignGet: (k, t) => base.presignGet(k, t), list: (p, c) => base.list(p, c),
     delete: async (k) => { if (/\/ledger\/log\/o=[0-9a-f]{32}\/p\//u.test(String(k))) note(`payloads:${who(String(k))}`); return base.delete(k); },
-    put: async (k, b, o) => { if (String(k).endsWith("/upload-fences.json")) note(`reset:${who(String(k))}`); return base.put(k, b, o); } };
+    put: async (k, b, o) => { if (String(k).endsWith("/upload-fences.json")) note(`reset:${who(String(k))}`); return base.put(k, b, o); } });
 }
 function bridgeDeps(base: ObjectStore, calls: string[] = [], over: Partial<ReplayDeps> = {}): ReplayDeps {
   const store = observed(base, calls);
   return {
-    store, bucket: BUCKET, keyRoot: ROOT, org: ORG, epoch: E, now: () => NOW, ledgerOptions: { sleep: async () => {} },
+    store, keyRoot: ROOT, org: ORG, epoch: E, now: () => NOW, ledgerOptions: { sleep: async () => {} },
     setSessionUploads: async () => { throw new Error("no session erase here"); },
     generation: generation(store),
     ...over,
@@ -353,8 +355,20 @@ describe("negative controls (layered-sessions-pipeline counterexamples at 481754
     expect((await bridgeCompleteVerdict(a, ROOT, ORG, hold, E, [e], { bucket: BUCKET, generation: g })).code).toBe("erasure_unreplayed");
   });
 
-  test("(2b) a declared destination that differs from the SQL erase's refuses before any effect", async () => {
-    for (const over of [{ bucket: "other-bucket" }, { bucket: undefined }, { keyRoot: "other-root" }] as Partial<ReplayDeps>[]) {
+  test("(2b) a destination that differs from the SQL erase's refuses before any effect; the bucket comes only from the store's own config", async () => {
+    // A store built (bridgeStore) for bucket A, the SQL erase bound to bucket B: refused, nothing written.
+    const scratch = scratchStore(); cleanups.push(scratch.done);
+    const calls0: string[] = [];
+    const storeA = asBridge(observed(scratch.store, calls0), "bucket-a");
+    const onB = generation(storeA, { eraseDestination: { bucket: "bucket-b", keyRoot: ROOT } });
+    expect(await replayErasure({ ...bridgeDeps(storeA), store: storeA, generation: onB }, user(A, "req-1", SEALED + 1_000))).toBe("erasure_generation_unproven");
+    expect(calls0).toEqual([]);
+    // A store not made by bridgeStore has no bucket at all; a `bucket` field beside it is ignored.
+    const raw = scratchStore(); cleanups.push(raw.done);
+    const loose = { ...bridgeDeps(fresh()), store: raw.store, bucket: BUCKET } as ReplayDeps;
+    expect(await replayErasure(loose, user(A, "req-1", SEALED + 1_000))).toBe("erasure_generation_unproven");
+    expect(await exists(raw.store, s3LedgerKeys(ROOT, A).fence)).toBe(false);
+    for (const over of [{ keyRoot: "other-root" }] as Partial<ReplayDeps>[]) {
       const store = fresh(), calls: string[] = [];
       expect(await replayErasure(bridgeDeps(store, calls, over), user(A, "req-1", SEALED + 1_000))).toBe("erasure_generation_unproven");
       expect(calls).toEqual([]);
@@ -442,6 +456,12 @@ describe("byte classes, bindings and receipts", () => {
       const store = fresh(), b = await proven(store);
       await store.put(objectKey(odd), enc({}));
       await expect(evidenceOf(ports(store), b)).rejects.toMatchObject({ code: "generation_unreadable" });
+    }
+    // A ledger-shaped object under one of this user's UPLOAD machines is not the ledger's: judged as bytes.
+    for (const name of ["ledger/log/o=x/p/y", "upload-fences.json", "privacy-journal.json"]) {
+      const st = fresh(), bb = await proven(st);
+      await st.put(objectKey(`${inbox}/m=${liveMachineId(A.workspaceId, ORIGIN, A.userId)}/${name}`), enc({}));
+      await expect(evidenceOf(ports(st), bb)).rejects.toMatchObject({ code: "generation_bytes_remain" });
     }
     // The sweeper's done and corrupt records are recognized, not refused.
     const store = fresh(), b = await proven(store);
