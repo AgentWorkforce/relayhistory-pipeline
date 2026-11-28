@@ -123,6 +123,11 @@ export interface SessionFacts {
   rationale: RationaleItem[];
   outcomeStatuses: string[];
   keys: LinkKeys;
+  /**
+   * `approval_assessor`: a session the harness started to judge another session's pending action (Codex's approval
+   * review). It reviews work, never does it: it may join a feature, never found one or make one alone.
+   */
+  role?: "approval_assessor";
   /** Counts of what extraction dropped, by reason. */
   dropped: Record<string, number>;
 }
@@ -130,7 +135,13 @@ export interface SessionFacts {
 /** Repository facts, independent of any session (the forge and the code). */
 export interface ForgeFacts {
   defaultBranch?: string;
-  prs: Array<{ ref: string; state: "open" | "merged" | "closed"; at: string; mergedAt?: string | null; closedAt?: string | null; branch?: string | null }>;
+  /**
+   * `branch` is the head branch and `base` the branch it merged into. `landedAt` is when its merge commit reached the
+   * default branch (null: merged, but not onto it; absent: unknown, read `mergedAt`). `commits` are its own commits
+   * (full ids), absent when unknown.
+   */
+  prs: Array<{ ref: string; state: "open" | "merged" | "closed"; at: string; mergedAt?: string | null; closedAt?: string | null; branch?: string | null;
+    base?: string; mergeCommit?: string; landedAt?: string | null; commits?: string[] }>;
   /**
    * `defaultAt`: when the commit became reachable from the default branch; `defaultAtBasis` says how that is known
    * (`merge` and `patch` from the landing commit, `committer` only the commit's own time: see backfill/forge.ts).
@@ -255,7 +266,7 @@ export function utcForge(forge: ForgeFacts): ForgeFacts {
   const opt = (t: string | null | undefined) => (t === null || t === undefined ? null : requireUtc(t, "a forge time"));
   const out: ForgeFacts = {
     ...forge,
-    prs: forge.prs.map((p) => ({ ...p, at: req(p.at), ...(p.mergedAt !== undefined ? { mergedAt: opt(p.mergedAt) } : {}), ...(p.closedAt !== undefined ? { closedAt: opt(p.closedAt) } : {}) })),
+    prs: forge.prs.map((p) => ({ ...p, at: req(p.at), ...(p.mergedAt !== undefined ? { mergedAt: opt(p.mergedAt) } : {}), ...(p.closedAt !== undefined ? { closedAt: opt(p.closedAt) } : {}), ...(p.landedAt !== undefined ? { landedAt: opt(p.landedAt) } : {}) })),
     commits: forge.commits.map((c) => ({ ...c, at: req(c.at), ...(c.transitions ? { transitions: c.transitions.map((t) => ({ ...t, at: req(t.at) })) } : {}), ...(c.defaultAt !== undefined ? { defaultAt: opt(c.defaultAt) } : {}), ...(c.revertedAt !== undefined ? { revertedAt: opt(c.revertedAt) } : {}) })),
     ...(forge.branches ? { branches: forge.branches.map((b) => ({ ...b, tipAt: req(b.tipAt), landedAt: opt(b.landedAt) })) } : {}),
   };

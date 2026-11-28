@@ -224,6 +224,19 @@ function evidenceArtifacts(ctx: Ctx, snapshot: SessionAnalysisSnapshot) {
   return { commits, prs, branches, seenPrs, seenCommits };
 }
 
+/**
+ * The opening of a Codex approval review: the harness hands the assessor the agent history of another session whose
+ * action awaits approval ("The following is the Codex agent history whose request action ..." and, on a later round,
+ * "... added since your last approval assessment"). Read only from the session's first human message, by time.
+ */
+const APPROVAL_ASSESSOR = /^The following is the Codex agent history\b/u;
+export function isApprovalAssessor(snapshot: SessionAnalysisSnapshot): boolean {
+  if (snapshot.source !== "codex") return false;
+  const human = (snapshot.evidence?.references ?? []).filter((r) => r.kind === "human-message");
+  const first = human.filter((r) => utc(r.at) !== null).sort((x, y) => textCompare(utc(x.at)!, utc(y.at)!))[0] ?? human[0];
+  return !!first && APPROVAL_ASSESSOR.test((first.detail ?? first.summary ?? "").trimStart());
+}
+
 /** Stage 1: the facts of one session analysis. */
 export function extractSessionFacts(snapshot: SessionAnalysisSnapshot, context: SessionContext = {}, artifacts?: SessionArtifacts): SessionFacts {
   const key: SessionKey = { source: snapshot.source, sessionId: snapshot.sessionId };
@@ -359,6 +372,7 @@ export function extractSessionFacts(snapshot: SessionAnalysisSnapshot, context: 
     rationale,
     outcomeStatuses: statuses,
     keys,
+    ...(isApprovalAssessor(snapshot) ? { role: "approval_assessor" as const } : {}),
     dropped: ctx.dropped,
   };
 }

@@ -1,7 +1,8 @@
 /**
  * Forge facts for a benchmark corpus (docs/proposals/relayfacts-features.md, "Corpus"): pull requests
- * (state, merge time, head branch) from `gh`, default-branch commits and reverts from a local git
- * mirror, and flag defaults from the repository's own docs tables. Reads only.
+ * (state, merge time, head and base branch, merge and head commits) from `gh`, with their landing and own
+ * commits from a local git mirror; default-branch commits and reverts from the mirror; and flag defaults
+ * from the repository's own docs tables. Reads only.
  *
  *   bun run src/relayfacts/backfill/forge.ts --repo <owner/name> --git <mirror dir> --since <iso> --until <iso> --out <forge.json>
  */
@@ -65,28 +66,27 @@ export const MAX_LISTED_PRS = 50_000;
  * `since`. Listed in full and filtered here: GitHub's search API (`--search updated:>=...`) returns at most
  * 1,000 results, which silently truncated a busy repository's window.
  */
-export function ghPullRequests(repo: string, since: string): Array<Record<string, string | null>> {
+export type ListedPr = Record<string, unknown>;
+export function ghPullRequests(repo: string, since: string): ListedPr[] {
   const raw = execFileSync("gh", ["pr", "list", "-R", repo, "--state", "all", "--limit", String(MAX_LISTED_PRS),
-    "--json", "url,state,createdAt,updatedAt,mergedAt,closedAt,headRefName"], { encoding: "utf8", maxBuffer: 1024 * 1024 * 1024 });
-  return prsUpdatedSince(JSON.parse(raw) as Array<Record<string, string | null>>, since);
+    "--json", "url,state,createdAt,updatedAt,mergedAt,closedAt,headRefName,baseRefName,mergeCommit,headRefOid"], { encoding: "utf8", maxBuffer: 1024 * 1024 * 1024 });
+  return prsUpdatedSince(JSON.parse(raw) as ListedPr[], since);
 }
 
+/** At most this many commits are recorded for one pull request; a larger one records none (unknown, never cut). */
+export const MAX_PR_COMMITS = 200;
+const str = (v: unknown) => (typeof v === "string" && v ? v : null);
+const FULL_SHA = /^[0-9a-f]{40}$/u;
+
 /** The full listing's pull requests updated since `since`; a listing at the cap is refused as partial. */
-export function prsUpdatedSince(all: Array<Record<string, string | null>>, since: string, cap = MAX_LISTED_PRS): Array<Record<string, string | null>> {
+export function prsUpdatedSince<T extends ListedPr>(all: T[], since: string, cap = MAX_LISTED_PRS): T[] {
   if (all.length >= cap) throw new UsageError(`gh pr list hit its ${cap} limit: the listing would be partial`);
   const from = requireUtc(since, "--since");
-  return all.filter((p) => { const u = utc(p.updatedAt ?? null); return u !== null && u >= from; });
+  return all.filter((p) => { const u = utc(str(p.updatedAt)); return u !== null && u >= from; });
 }
 
 export function forgeFacts(repo: string, mirror: string, since: string, until: string, defaultBranch = "main", pullRequests: typeof ghPullRequests = ghPullRequests, maxTransitions = MAX_TRANSITIONS): ForgeFacts {
   const listed = pullRequests(repo, since);
-  const prs = listed
-    .filter((p) => { const c = utc(p.createdAt ?? null); return c !== null && c < requireUtc(until, "--until"); })
-    .map((p) => ({
-      ref: String(p.url).toLowerCase(),
-      state: p.state === "MERGED" ? "merged" as const : p.state === "CLOSED" ? "closed" as const : "open" as const,
-      at: String(p.createdAt), mergedAt: p.mergedAt ?? null, closedAt: p.closedAt ?? null, branch: p.headRefName ?? null,
-    }));
   const sh = (cmd: string, ...args: string[]) => { try { return execFileSync("sh", ["-c", cmd, ...args], { encoding: "utf8", maxBuffer: 256 * 1024 * 1024 }).trim(); } catch { return ""; } };
   // Git commands take full refs (a tag or path named like a branch is never ambiguous); names are stored short.
   const mainRef = `refs/heads/${defaultBranch}`;
@@ -190,6 +190,49 @@ export function forgeFacts(repo: string, mirror: string, since: string, until: s
     // Kept whenever the history is more than "this commit landed as itself": a landing by a copy records its copy
     // from the first seal on, so a later revert never changes how an earlier landing reads.
     if (transitions.length > 1 || firstRevert || transitions.some((t) => t.by !== c.sha)) c.transitions = transitions;
+  }
+  // Pull requests. A PR reached the default branch when its merge commit did (`landedAt`): directly for a PR
+  // based on it, or later, when a merge train or a release merge brings in the base it merged into. GitHub's
+  // `mergedAt` is only when it merged into its base. Every `landedAt` is dated evidence, never a guess: the walk's
+  // time; for a PR based on the default branch whose merge the walk did not date (merged before `since`), its
+  // `mergedAt` (merging into the default branch is the landing); `null` when the merge commit is not on the
+  // default branch. Absent is unknown: a PR into another base reached by the default branch before `since` (its
+  // promotion is undated), or a merged PR whose merge commit the mirror does not hold. Its own commits (`commits`)
+  // are what the merge brought into its base (the second parent's side of a merge commit; for a squash or rebase,
+  // its final head against the merge's parent), fixed at `mergedAt`. A PR not merged records none: its final
+  // commit list is not dated, so it cannot say what the PR held at a cut. A PR with more than MAX_PR_COMMITS
+  // records none.
+  const until_ = requireUtc(until, "--until");
+  const isCommit = (sha: string | null) => !!sha && FULL_SHA.test(sha) && sh(`git -C "$0" cat-file -e "$1^{commit}" 2>/dev/null && echo yes`, mirror, sha) === "yes";
+  const ownCommits = (range: string[]) => {
+    const list = sh(`git -C "$0" rev-list --max-count=${MAX_PR_COMMITS + 1} "$@"`, mirror, ...range).split("\n").filter((x) => FULL_SHA.test(x));
+    return list.length && list.length <= MAX_PR_COMMITS ? list : null;
+  };
+  const prs: ForgeFacts["prs"] = [];
+  for (const p of listed) {
+    const created = utc(str(p.createdAt));
+    if (created === null || created >= until_) continue;
+    const state = p.state === "MERGED" ? "merged" as const : p.state === "CLOSED" ? "closed" as const : "open" as const;
+    const mergeCommit = str((p.mergeCommit as { oid?: unknown } | null | undefined)?.oid)?.toLowerCase() ?? null;
+    const head = str(p.headRefOid)?.toLowerCase() ?? null;
+    const base = str(p.baseRefName);
+    const pr: ForgeFacts["prs"][number] = {
+      ref: String(p.url).toLowerCase(), state, at: String(p.createdAt), mergedAt: str(p.mergedAt), closedAt: str(p.closedAt), branch: str(p.headRefName),
+      ...(base ? { base } : {}),
+    };
+    if (state === "merged" && mergeCommit && isCommit(mergeCommit)) {
+      pr.mergeCommit = mergeCommit;
+      const walked = defaultAt.get(mergeCommit);
+      const onMain = walked !== undefined || sh(`git -C "$0" merge-base --is-ancestor "$1" "$2" && echo yes`, mirror, mergeCommit, mainRef) === "yes";
+      const intoDefault = !base || base === defaultBranch;
+      if (walked !== undefined) pr.landedAt = walked;
+      else if (!onMain) pr.landedAt = null;
+      else if (intoDefault) pr.landedAt = pr.mergedAt ?? null;
+      const parents = sh(`git -C "$0" rev-list --parents -n 1 "$1"`, mirror, mergeCommit).split(" ").slice(1);
+      const own = parents.length === 2 ? ownCommits([`${parents[0]}..${parents[1]}`]) : head && isCommit(head) ? ownCommits([head, `^${parents[0] ?? mergeCommit}`]) : null;
+      if (own) pr.commits = own;
+    }
+    prs.push(pr);
   }
   // Branch landing: a branch's work reached the default branch when its tip is an ancestor of it, when any of
   // its own commits has a default-branch copy with the same patch id, or when its combined diff (a squash) does.
