@@ -7,6 +7,7 @@
 import { afterEach, expect, test } from "bun:test";
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
+import { fileURLToPath as fileURLToPathW } from "node:url";
 import { join } from "node:path";
 import { createHash } from "node:crypto";
 import { evidenceHash } from "../authority-evidence.ts";
@@ -478,4 +479,21 @@ test("an export-execute bound to an UNSCOPED backfill-execute: accepted without 
     expect(Object.values(wave.by).map((p: any) => p.summary.refused)).toEqual(["backlog_ops_wave_scope", "backlog_ops_wave_scope"]);
     expect([wave.exit, wave.receipt.exitCode]).toEqual([1, 1]);
   } finally { Object.assign(receipts, saved); }
+});
+
+test("every workflow file parses as YAML (a text-only check misses a broken quote; GitHub then runs no job at all)", () => {
+  const { readdirSync, readFileSync: rf } = require("node:fs");
+  const dir = fileURLToPathW(new URL("../../../.github/workflows/", import.meta.url));
+  const files = readdirSync(dir).filter((f: string) => f.endsWith(".yml") || f.endsWith(".yaml"));
+  expect(files.length).toBeGreaterThan(5);
+  for (const f of files) {
+    let parsed: unknown;
+    try { parsed = Bun.YAML.parse(rf(dir + f, "utf8")); } catch (e) { parsed = `PARSE ERROR in ${f}: ${(e as Error).message}`; }
+    expect(typeof parsed === "object" && parsed !== null ? f : parsed).toBe(f);
+  }
+  // The backlog-ops dispatch inputs survive the parse with their descriptions.
+  const wf = Bun.YAML.parse(rf(dir + "backlog-ops.yml", "utf8")) as any;
+  const inputs = wf.on.workflow_dispatch.inputs;
+  expect(Object.keys(inputs)).toContain("per_org");
+  expect(inputs.confirmation.description).toContain("an execute's confirmation ends with PER_ORG");
 });
