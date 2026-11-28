@@ -465,7 +465,11 @@ export async function runSearchJob(message: StageMessage, deps: { search: Search
   if (decision !== "work") return decision;
   // §4.2 again, under the final write locks: the managed pass opts in to the committed-state guard (the shared
   // S3-event path never does), so a scope that lost its rows between the decision and the work erases nothing.
-  const result = await indexSearchScope(scope, { ...deps.search, committedGuard: true });
+  // The skip-current shadow probe (SEARCH_INDEX_SKIP_CURRENT_SHADOW_ENABLED) is for the S3-event path only: this
+  // path's log line (searchJobLogFields) carries none of its fields, so a probe here would be locked work no
+  // reading could see. The hosted runtime hands both paths the same search deps; the flag is dropped here.
+  const { skipCurrentShadow: _shadowIsEventPathOnly, ...search } = deps.search;
+  const result = await indexSearchScope(scope, { ...search, committedGuard: true });
   const out = (outcome: SearchJobOutcome): SearchJobResult => ({ outcome, reasons: result.reasons, search: result });
   if (result.busy || result.deferred) return out("busy");
   if (result.reasons.includes(NOT_COMMITTED)) return out("not_committed");

@@ -821,15 +821,19 @@ fails Lambda init naming the variable. It is independent of `SEARCH_INDEX_SKIP_C
 On, every search pass that reaches the skip-current check and is not skipped runs exactly as before, after the
 probe: inside the pass's transaction and under its locks, `SAVEPOINT`, one read-only `SELECT`, `RELEASE SAVEPOINT`
 (three round trips, no write). With `SEARCH_INDEX_OUTPUT_FACTS=1`, and only when that `SELECT` already says current,
-the probe also makes the one ClickHouse facts state point read the skip itself makes (20 s timeout; an unreadable
-state answers `facts_incomplete`, never an error). Its `search index reconciled` line then carries:
+the probe also makes the one ClickHouse facts state point read the skip itself makes (20 s timeout). A state that
+was read and is not complete, or has no row, answers `facts_incomplete`; a read that failed or timed out answers
+`facts_unreadable`, with its class in `skip_probe_facts_error`. Neither is an error for the pass, and the skip flag
+treats both as not current, as before. Only the S3-event path probes: the managed search-jobs pass (the
+`{"searchJobs": true}` schedule and the batch follow-on) drops the flag, because its log line carries none of the
+fields below. Its `search index reconciled` line then carries:
 
 - `would_skip`: what the skip-current proof answers for this pass (`true`: the skip flag would have returned
   before any read);
 - `skip_miss`, when `would_skip` is `false`, the first condition of the proof that failed, checked in this order:
   `probe_failed` (no verdict, see below), `no_directory`, `directory_deleted`, `projection_version`, `sources_changed` (a revision, a sibling manifest or
   the canonical id changed since the last complete pass), `not_ready` (same sources, but the last pass over them
-  was incomplete or readiness was reset), `facts_incomplete`.
+  was incomplete or readiness was reset), `facts_incomplete`, `facts_unreadable`.
 
 The probe's own cost and failure are on every log line of the pass (`search index reconciled`, and
 `search index failed` when the pass throws), so neither has to be inferred from `duration_ms`:
@@ -838,8 +842,11 @@ The probe's own cost and failure are on every log line of the pass (`search inde
   part of `locked_apply_ms`, `source_read_ms` or `index_scan_ms`;
 - `skip_probe_facts_ms`: present only when the ClickHouse facts read ran, its wall time (included in
   `skip_probe_ms`). Counting the lines that carry it counts the facts reads;
-- `skip_probe_error`: present only when the probe failed, the error code (a SQLSTATE or an error name, never a
-  message).
+- `skip_probe_facts_error`: present only when that facts read failed: `timeout` (the 20 s bound), `clickhouse_error`
+  (ClickHouse answered with an error) or `error` (anything else). `skip_probe_facts_ms` on the same line is how long
+  it held the pass's locks;
+- `skip_probe_error`: present only when the probe's Postgres statement failed, the error code (a SQLSTATE or an
+  error class name of at most 40 identifier characters, otherwise `unknown`; never a message).
 
 A probe that fails does not fail the pass: the statement is rolled back to its savepoint, the line says
 `would_skip: false`, `skip_miss: probe_failed` and `skip_probe_error`, and the pass runs as with the flag off. Only

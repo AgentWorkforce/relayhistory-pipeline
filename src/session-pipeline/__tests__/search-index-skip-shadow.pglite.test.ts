@@ -6,7 +6,9 @@
  */
 import { afterAll, afterEach, beforeAll, describe, expect, test } from "bun:test";
 import type { SqlExecutor } from "@rhc/lib/pipeline/queue.ts";
-import { alreadyCurrent, indexSearchScope, searchIndexPhaseMetrics, skipCurrentProbe, type SearchIndexDeps } from "../search-index.ts";
+import { alreadyCurrent, indexSearchScope, searchIndexPhaseMetrics, skipCurrentProbe, skipProbeFactsError, type SearchIndexDeps } from "../search-index.ts";
+import { runSearchJob, searchWorkKey, type SearchWakeMessage } from "../search-jobs.ts";
+import { sanitizeLogField } from "../../shared/log.ts";
 import { lambdaEnv, runtimeFromSecret, searchIndexSkipCurrentShadowFromEnv } from "../lambda.ts";
 import { SCOPE, exportStreamScope, generate, type ExportedScope } from "../../session-read-api/__tests__/stream-fixture.ts";
 import { closeReplayTemplate, warmReplayTemplate } from "./replay-fixture.ts";
@@ -194,12 +196,13 @@ describe("skip-current shadow on (hosted ClickHouse binding)", () => {
     const r = await indexed();
     const factsReads = () => r.fake.calls.filter((c) => String(c.query).includes("output_facts_session_state")).length;
     expect((await pass(r, { ...SHADOW, outputFacts: true })).result.skipProbe).toEqual({ current: false, miss: "facts_incomplete", factsRead: true });
+    r.fake.facts.complete = 0;
+    const incomplete = searchIndexPhaseMetrics();
+    expect((await pass(r, { ...SHADOW, outputFacts: true, metrics: incomplete })).result.skipProbe).toEqual({ current: false, miss: "facts_incomplete", factsRead: true });
+    // A state that was read and is not complete is no error.
+    expect("skipProbeFactsError" in incomplete).toBe(false);
+    expect(incomplete.skipProbeFactsMs).toBeGreaterThanOrEqual(0);
     r.fake.facts.complete = 1;
-    r.fake.facts.fail = true;
-    const unreadable = await pass(r, { ...SHADOW, outputFacts: true });
-    expect(unreadable.result.skipProbe).toEqual({ current: false, miss: "facts_incomplete", factsRead: true });
-    expect(unreadable.reads).toBeGreaterThan(0);
-    r.fake.facts.fail = false;
     // Exactly one facts state read per probed pass, timed on its own, and counted in the probe's time.
     const metrics = searchIndexPhaseMetrics();
     const current = await pass(r, { ...SHADOW, outputFacts: true, metrics });
@@ -218,6 +221,92 @@ describe("skip-current shadow on (hosted ClickHouse binding)", () => {
     const plain = searchIndexPhaseMetrics();
     expect((await pass(r, { ...SHADOW, metrics: plain })).result.skipProbe).toEqual({ current: true });
     expect("skipProbeFactsMs" in plain).toBe(false);
+  }, 120_000);
+
+  test("output facts on: a facts read that fails or times out is facts_unreadable with its class and duration, never facts_incomplete", async () => {
+    const r = await indexed();
+    r.fake.facts.complete = 1;
+    /** The rig's ClickHouse with the facts state read replaced: slow, then rejecting as `error`. */
+    const failing = (error: Error, afterMs: number) => ({
+      ...r.fake.ch,
+      select: (async (query: string, options?: unknown) => {
+        if (!query.includes("output_facts_session_state")) return r.fake.ch.select(query, options as never);
+        r.fake.calls.push({ ch: "select", query });
+        await new Promise((done) => setTimeout(done, afterMs));
+        throw error;
+      }) as typeof r.fake.ch.select,
+    });
+    const timeout = Object.assign(new Error("synthetic"), { name: "TimeoutError" });
+    const refused = Object.assign(new Error("synthetic"), { name: "ClickHouseError", code: "60" });
+    for (const [error, cls] of [[timeout, "timeout"], [refused, "clickhouse_error"], [new Error("synthetic"), "error"]] as const) {
+      const metrics = searchIndexPhaseMetrics();
+      const off = await pass(r, { outputFacts: true });
+      const p = await pass(r, { ...SHADOW, outputFacts: true, metrics, ch: failing(error, 40) });
+      // The pass itself is untouched: a ClickHouse failure in the probe is not a Postgres error, no rollback.
+      expect(p.result).toEqual({ ...off.result, skipProbe: { current: false, miss: "facts_unreadable", factsRead: true } });
+      expect(p.sql.filter((s) => s.includes("search_skip_probe"))).toEqual(["SAVEPOINT search_skip_probe", "RELEASE SAVEPOINT search_skip_probe"]);
+      expect(metrics.skipProbeFactsError).toBe(cls);
+      expect(metrics.skipProbeFactsMs!).toBeGreaterThanOrEqual(35);
+      expect(metrics.skipProbeMs!).toBeGreaterThanOrEqual(metrics.skipProbeFactsMs!);
+      // A facts failure is not a probe (Postgres) failure.
+      expect("skipProbeError" in metrics).toBe(false);
+    }
+    // The real skip's contract is unchanged: an unreadable facts state is not proof, the pass runs, nothing throws.
+    const real = await pass(r, { skipCurrent: true, outputFacts: true, ch: failing(timeout, 0) });
+    expect(real.result.skipped).toBeUndefined();
+    expect(real.result.complete).toBe(true);
+    // And with a readable, complete state it skips.
+    expect((await pass(r, { skipCurrent: true, outputFacts: true })).result.skipped).toBe(true);
+
+    // Through the consumer: the class and the duration are on the pass's line.
+    const t = await tickLogged(r, { ...SHADOW, outputFacts: true, ch: failing(timeout, 40) });
+    expect(t.response.batchItemFailures).toEqual([]);
+    const line = t.named("search index reconciled")[0]!;
+    expect(line).toMatchObject({ would_skip: false, skip_miss: "facts_unreadable", skip_probe_facts_error: "timeout" });
+    expect(Number(line.skip_probe_facts_ms)).toBeGreaterThanOrEqual(35);
+    expect("skip_probe_error" in line).toBe(false);
+  }, 120_000);
+
+  test("error classification is bounded: three facts classes, a closed miss set, a short code or unknown", async () => {
+    expect([{ name: "TimeoutError" }, { name: "AbortError" }, { name: "ClickHouseError" }, { name: "TypeError" }, null, "x"].map(skipProbeFactsError))
+      .toEqual(["timeout", "timeout", "clickhouse_error", "error", "error", "error"]);
+    // The logger drops anything outside the closed sets.
+    expect(sanitizeLogField("skip_probe_facts_error", "timeout")).toBe("timeout");
+    expect(sanitizeLogField("skip_probe_facts_error", "connect ECONNREFUSED 10.0.0.1")).toBeUndefined();
+    expect(sanitizeLogField("skip_miss", "facts_unreadable")).toBe("facts_unreadable");
+    expect(sanitizeLogField("skip_miss", "anything else")).toBeUndefined();
+    // A probe error whose code is not a short identifier is logged as unknown, never as its text.
+    const r = await indexed();
+    const wordy = <T,>(work: (tx: SqlExecutor) => Promise<T>) =>
+      r.transact((tx) => work({
+        query: (sql: string, params?: unknown[]) =>
+          sql.includes(PROBE_SQL) ? (Promise.reject(Object.assign(new Error("synthetic"), { code: "relation \"x\" does not exist at 10.0.0.1" })) as never) : tx.query(sql, params),
+      }));
+    const metrics = searchIndexPhaseMetrics();
+    expect((await pass(r, { ...SHADOW, metrics, transact: wordy })).result.skipProbe).toEqual({ current: false, miss: "probe_failed" });
+    expect(metrics.skipProbeError).toBe("unknown");
+  }, 120_000);
+
+  test("the managed search-jobs pass never probes, whatever the shared search deps say (hosted-entry control)", async () => {
+    const r = await indexed();
+    // Not current, so the job does the work (a current scope answers `unchanged` before any pass).
+    await r.db.pg.exec("UPDATE sessions.session_directory SET event_projection_ready = false");
+    const wake: SearchWakeMessage = {
+      v: 1, stage: "search-index", ctx: { traceId: crypto.randomUUID(), ...SCOPE, sessionId: x.canonicalId }, workKey: searchWorkKey({ ...SCOPE, sessionId: x.canonicalId }), revision: 1,
+      payload: { epoch: 0, clock: { source: "pointer", at: new Date().toISOString() } },
+    };
+    const metrics = searchIndexPhaseMetrics();
+    const sql = r.sql.length;
+    const job = await runSearchJob(wake, { search: r.search({ ...SHADOW, metrics }) });
+    expect(job.search?.complete).toBe(true);
+    expect("skipProbe" in job.search!).toBe(false);
+    const sent = r.sql.slice(sql).map((s) => String(s.sql));
+    expect(sent.some((s) => s.includes(PROBE_SQL) || s.includes("search_skip_probe"))).toBe(false);
+    expect(Object.keys(metrics).filter((k) => k.startsWith("skipProbe"))).toEqual([]);
+    // The same deps on the S3-event path do probe.
+    await r.db.pg.exec("UPDATE sessions.session_directory SET event_projection_ready = false");
+    expect((await pass(r, { ...SHADOW, metrics })).result.skipProbe).toEqual({ current: false, miss: "not_ready" });
+    expect(metrics.skipProbeMs).toBeGreaterThanOrEqual(0);
   }, 120_000);
 
   test("the probe is timed on its own, outside locked_apply_ms; flag off sets no probe metric", async () => {

@@ -190,6 +190,7 @@ export async function processBatch(records: readonly QueueRecord[], deps: Consum
         ...(phase.skipProbeMs !== undefined ? { skip_probe_ms: phase.skipProbeMs } : {}),
         ...(phase.skipProbeFactsMs !== undefined ? { skip_probe_facts_ms: phase.skipProbeFactsMs } : {}),
         ...(phase.skipProbeError !== undefined ? { skip_probe_error: phase.skipProbeError } : {}),
+        ...(phase.skipProbeFactsError !== undefined ? { skip_probe_facts_error: phase.skipProbeFactsError } : {}),
       });
       try {
         const result = await indexSearchScope(scope, { ...deps.search, metrics: phase });

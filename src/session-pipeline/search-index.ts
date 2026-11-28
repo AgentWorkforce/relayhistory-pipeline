@@ -72,7 +72,7 @@ import { chNow, deleteRows, windowStart, type PendingDelete } from "./vendor/sea
 import { scopeLockKey, type SessionScope } from "./pointer.ts";
 import { directoryCatalogWriter, type writeDirectoryCatalog } from "../hoopdb/session-directory-catalog.ts";
 import { writeDirectoryEvents, invalidateDirectoryEvents, completeErasedDirectoryEvents } from "../hoopdb/session-directory-events.ts";
-import { outputFactsComplete, outputFactsFromScope, passVersion, type OutputFactsScope } from "./output-facts.ts";
+import { outputFactsComplete, outputFactsFromScope, readOutputFactsComplete, passVersion, type OutputFactsScope } from "./output-facts.ts";
 import {
   clickhouseOutputFactsStore,
   finishStagedOutputFacts,
@@ -216,7 +216,8 @@ export interface SearchIndexDeps {
    * condition that failed (skipCurrentProbe). One Postgres read per pass (plus the facts point read with
    * `outputFacts`), no write. With `skipCurrent` off it says what the skip would have saved, and a probe
    * that says current on a pass that then inserts or deletes is a change the skip would have missed.
-   * Absent: no query, no field.
+   * Only the S3-event path probes: the managed search-jobs pass drops the flag (search-jobs.ts
+   * runSearchJob), since its log line carries none of the probe's fields. Absent: no query, no field.
    */
   skipCurrentShadow?: boolean;
   /**
@@ -245,6 +246,8 @@ export interface SearchIndexPhaseMetrics {
   skipProbeFactsMs?: number;
   /** The probe failed: its error code (never a message). The pass went on if the savepoint rolled back. */
   skipProbeError?: string;
+  /** The probe's ClickHouse facts read failed (it ran, skipProbeFactsMs holds how long): `timeout`, `clickhouse_error` or `error`. */
+  skipProbeFactsError?: SkipProbeFactsError;
 }
 
 export const searchIndexPhaseMetrics = (): SearchIndexPhaseMetrics => ({
@@ -1414,8 +1417,10 @@ export type SkipCurrentMiss =
   | "sources_changed"
   /** Same sources, readiness reset: the last pass over them was incomplete, or a pointer change left the map equal. */
   | "not_ready"
-  /** `outputFacts` only: the directory is current, the facts state is not complete (or unreadable). */
+  /** `outputFacts` only: the directory is current, the facts state was read and is not complete (or has no row). */
   | "facts_incomplete"
+  /** `outputFacts` only: the directory is current, the facts state read failed or timed out (the real skip treats this as not current too). */
+  | "facts_unreadable"
   /** The shadow probe's own statement failed and was rolled back to its savepoint: no verdict, the pass ran. */
   | "probe_failed";
 export interface SkipCurrentProbe {
@@ -1437,8 +1442,8 @@ export async function skipCurrentProbe(
   snapshot: { canonicalId: string },
   liveKeys: number,
   factsCh?: ClickHouseClient,
-  /** Receives the wall time of the facts read, when it runs. */
-  timing?: { factsMs?: number },
+  /** Receives the wall time of the facts read, when it runs, and its failure class, when it fails. */
+  timing?: { factsMs?: number; factsError?: SkipProbeFactsError },
 ): Promise<SkipCurrentProbe> {
   if (liveKeys === 0) return { current: false, miss: "sources_changed" };
   const { rows } = await tx.query<{ deleted: boolean; ready: boolean; version: number | string; sources_equal: boolean | null }>(
@@ -1460,16 +1465,39 @@ export async function skipCurrentProbe(
   if (d.ready !== true) return { current: false, miss: "not_ready" };
   if (!factsCh) return { current: true };
   // One ClickHouse point read (20 s timeout, an unreadable state answers not complete), only when Postgres says current.
+  // alreadyCurrent reads it through outputFactsComplete, which answers false for a failed read; here the
+  // failure is kept apart from a state that was read and is not complete. Either way: not current.
   const factsStarted = Date.now();
-  const complete = await outputFactsComplete(factsCh, { orgId: scope.orgId, workspaceId: scope.workspaceId, harness: scope.harness, sessionId: snapshot.canonicalId });
+  let complete: boolean;
+  try {
+    complete = await readOutputFactsComplete(factsCh, { orgId: scope.orgId, workspaceId: scope.workspaceId, harness: scope.harness, sessionId: snapshot.canonicalId });
+  } catch (error) {
+    if (timing) {
+      timing.factsMs = Date.now() - factsStarted;
+      timing.factsError = skipProbeFactsError(error);
+    }
+    return { current: false, miss: "facts_unreadable", factsRead: true };
+  }
   if (timing) timing.factsMs = Date.now() - factsStarted;
   return complete ? { current: true, factsRead: true } : { current: false, miss: "facts_incomplete", factsRead: true };
 }
 
+/** Why the probe's facts read failed: three classes, nothing from the error itself. */
+export type SkipProbeFactsError = "timeout" | "clickhouse_error" | "error";
+export function skipProbeFactsError(error: unknown): SkipProbeFactsError {
+  const name = (error as { name?: unknown })?.name;
+  // AbortSignal.timeout (the client's 20 s bound) rejects with TimeoutError; an aborted fetch with AbortError.
+  if (name === "TimeoutError" || name === "AbortError") return "timeout";
+  return name === "ClickHouseError" ? "clickhouse_error" : "error";
+}
+
 const SKIP_PROBE_SAVEPOINT = "search_skip_probe";
+/** A SQLSTATE or an error class name, and nothing else: anything longer or of another shape is `unknown`. */
+const PROBE_ERROR_CODE = /^[A-Za-z0-9_]{1,40}$/;
 const probeErrorCode = (error: unknown): string => {
   const e = error as { code?: unknown; name?: unknown };
-  return typeof e?.code === "string" ? e.code : typeof e?.name === "string" ? e.name : "unknown";
+  const code = typeof e?.code === "string" ? e.code : typeof e?.name === "string" ? e.name : "unknown";
+  return PROBE_ERROR_CODE.test(code) ? code : "unknown";
 };
 
 /**
@@ -1489,11 +1517,12 @@ async function shadowSkipProbe(
   metrics: SearchIndexPhaseMetrics | undefined,
 ): Promise<SkipCurrentProbe> {
   const started = Date.now();
-  const timing: { factsMs?: number } = {};
+  const timing: { factsMs?: number; factsError?: SkipProbeFactsError } = {};
   const done = (error?: unknown) => {
     if (!metrics) return;
     metrics.skipProbeMs = (metrics.skipProbeMs ?? 0) + (Date.now() - started);
     if (timing.factsMs !== undefined) metrics.skipProbeFactsMs = (metrics.skipProbeFactsMs ?? 0) + timing.factsMs;
+    if (timing.factsError !== undefined) metrics.skipProbeFactsError = timing.factsError;
     if (error !== undefined) metrics.skipProbeError = probeErrorCode(error);
   };
   let probe: SkipCurrentProbe;

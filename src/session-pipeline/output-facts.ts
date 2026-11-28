@@ -649,17 +649,28 @@ export async function outputFactsComplete(
   id: { orgId: string; workspaceId: string; harness: string; sessionId: string },
 ): Promise<boolean> {
   try {
-    const rows = await ch.select<{ complete: string | number }>(
-      `SELECT complete FROM ${OUTPUT_FACTS_SESSION_STATE_TABLE} FINAL
-        WHERE org_id = {org:String} AND workspace_id = {workspace:String} AND source = {source:String} AND session_id = {session:String}
-        LIMIT 1`,
-      { params: { org: id.orgId, workspace: id.workspaceId, source: id.harness, session: id.sessionId }, timeoutMs: 20_000 },
-    );
-    return Number(rows[0]?.complete ?? 0) === 1;
+    return await readOutputFactsComplete(ch, id);
   } catch {
     // An unreadable or missing state table proves nothing: run the pass.
     return false;
   }
+}
+
+/**
+ * The same point read, for a caller that must tell an unreadable state from an incomplete one (the
+ * skip-current shadow probe): a failed or timed-out read throws instead of answering false.
+ */
+export async function readOutputFactsComplete(
+  ch: ClickHouseClient,
+  id: { orgId: string; workspaceId: string; harness: string; sessionId: string },
+): Promise<boolean> {
+  const rows = await ch.select<{ complete: string | number }>(
+    `SELECT complete FROM ${OUTPUT_FACTS_SESSION_STATE_TABLE} FINAL
+        WHERE org_id = {org:String} AND workspace_id = {workspace:String} AND source = {source:String} AND session_id = {session:String}
+        LIMIT 1`,
+    { params: { org: id.orgId, workspace: id.workspaceId, source: id.harness, session: id.sessionId }, timeoutMs: 20_000 },
+  );
+  return Number(rows[0]?.complete ?? 0) === 1;
 }
 
 /** A pass's base version: even, at least 2 x its ms, and above every earlier state of the scope. */

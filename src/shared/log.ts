@@ -50,7 +50,7 @@ export const ALLOWED_LOG_FIELDS = new Set([
   // The search pass line under SEARCH_INDEX_SKIP_CURRENT_SHADOW_ENABLED: the skip-current verdict and its first failed condition.
   "would_skip", "skip_miss",
   // The probe's own cost and failure, on every line of the pass: wall ms in the locked pass, the ClickHouse facts read's ms, the error code.
-  "skip_probe_ms", "skip_probe_facts_ms", "skip_probe_error",
+  "skip_probe_ms", "skip_probe_facts_ms", "skip_probe_error", "skip_probe_facts_error",
   "service", "deployment", "deployment_id", "stage", "status", "outcome", "attempt",
   "trace_id", "span_id", "traceparent", "session_uuid", "session_uuid_source",
   "tenant_id", "org_id", "workspace_id", "machine_id", "harness", "session_id",
@@ -195,6 +195,9 @@ export const REGEN_REASON_VALUES: ReadonlySet<string> = new Set([
 export const LOCK_RETRY_OUTCOME_VALUES: ReadonlySet<string> = new Set(["succeeded_after_retry", "exhausted", "not_retryable"]);
 export const REGEN_SYSTEM_VALUES: ReadonlySet<string> = new Set(["bob_costas", "brief"]);
 const ENUM_FIELDS: ReadonlyMap<string, ReadonlySet<string>> = new Map([
+  // The skip-current shadow probe (session-pipeline/search-index.ts SkipCurrentMiss, SkipProbeFactsError): closed sets.
+  ["skip_miss", new Set(["probe_failed", "no_directory", "directory_deleted", "projection_version", "sources_changed", "not_ready", "facts_incomplete", "facts_unreadable"])],
+  ["skip_probe_facts_error", new Set(["timeout", "clickhouse_error", "error"])],
   ["store_cause", STORE_CAUSE_VALUES], ["streaming", STREAMING_VALUES],
   ["db_refusal", DB_REFUSAL_VALUES], ["client_kind", CLIENT_KIND_VALUES], ["client_os", CLIENT_OS_VALUES],
   ["regeneration_reason", REGEN_REASON_VALUES], ["system", REGEN_SYSTEM_VALUES],
