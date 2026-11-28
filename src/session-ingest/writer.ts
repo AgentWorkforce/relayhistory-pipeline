@@ -64,6 +64,18 @@ export const LIVE_OWNER = "relayhistory-api:delivery";
 export const INGEST_PLUGIN_VERSION = "96bulls-session-ingest/1";
 /** Manifest extension recording which batches each chunk holds (replay dedupe), as relayhistory. */
 export const LIVE_EXTENSION = "relayhistory_live";
+
+/**
+ * Measurement only: `<seq>:<sha256>` of the newest chunk of a manifest, the chunk this revision appended. The
+ * consumer logs 'revision covered' for a superseded upload only when the live manifest still lists this chunk.
+ */
+export function lastChunkProof(manifest: { raw?: { chunks?: readonly { seq?: unknown; sha256?: unknown }[] } }): string | undefined {
+  let best: { seq: number; sha256: string } | undefined;
+  for (const c of manifest.raw?.chunks ?? []) {
+    if (typeof c.seq === "number" && typeof c.sha256 === "string" && (!best || c.seq > best.seq)) best = { seq: c.seq, sha256: c.sha256 };
+  }
+  return best ? `${best.seq}:${best.sha256}` : undefined;
+}
 /** Authenticated user and pre-layout session identity consumed by the session pipeline. */
 export const BULLS_EXTENSION = "96bulls";
 const REMEMBERED_BATCHES = 64;
@@ -96,7 +108,7 @@ export interface WriteTarget {
    * throw. A failure here never fails the write: the write's own S3 notification is forwarded onto
    * the same queue (SESSION_EVENTS_MODE=forward), and the scheduled reconcile is the net under that.
    */
-  onManifestCommitted?: (commits: readonly { key: string; revision: number; etag?: string; version?: string; committedAt: string }[]) => Promise<void>;
+  onManifestCommitted?: (commits: readonly { key: string; revision: number; etag?: string; version?: string; committedAt: string; chunk?: string }[]) => Promise<void>;
 }
 
 export interface WriteBatch {
@@ -485,6 +497,7 @@ export async function writeGroups(
         if (target.onManifestCommitted && m.written) {
           try {
             await target.onManifestCommitted([{ key: m.key, revision: m.manifest.revision, committedAt: (target.now ?? (() => new Date()))().toISOString(),
+              ...(lastChunkProof(m.manifest) ? { chunk: lastChunkProof(m.manifest) } : {}),
               ...(m.version.eTag ? { etag: m.version.eTag.replace(/^"|"$/g, "") } : {}), ...(m.version.version ? { version: m.version.version } : {}) }]);
           } catch {
             // Never fails the write (see WriteTarget.onManifestCommitted); the forwarder carries it.

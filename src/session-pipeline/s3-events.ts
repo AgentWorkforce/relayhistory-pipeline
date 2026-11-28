@@ -33,6 +33,8 @@ export interface RevisionMeta {
   revision?: number;
   committedAt?: string;
   initial?: boolean;
+  /** Writer only: `<seq>:<sha256>` of the chunk this revision appended. Measurement only. */
+  chunk?: string;
   /** Reconcile only: the chain link that enqueued this recovery hint. */
   attempt?: number;
 }
@@ -113,6 +115,7 @@ export function parseQueueBody(body: string, provider: StorageProvider = "s3"): 
       ...(typeof rev.revision === "number" && Number.isSafeInteger(rev.revision) && rev.revision > 0 ? { revision: rev.revision } : {}),
       ...(typeof rev.committed_at === "string" && Number.isFinite(Date.parse(rev.committed_at)) ? { committedAt: rev.committed_at } : {}),
       ...(typeof rev.initial === "boolean" ? { initial: rev.initial } : {}),
+      ...(typeof rev.chunk === "string" && /^\d+:[0-9a-f]{64}$/.test(rev.chunk) ? { chunk: rev.chunk } : {}),
       ...(typeof rev.attempt === "number" && Number.isSafeInteger(rev.attempt) && rev.attempt >= 0 ? { attempt: rev.attempt } : {}),
     };
     const deleted = rev.deleted === true;

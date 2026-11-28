@@ -54,6 +54,12 @@ export interface RevisionEvent {
   committedAt?: string;
   /** Revision 1 of a new manifest (the first upload); false for an append; absent when unknown. */
   initial?: boolean;
+  /**
+   * Writer only: `<seq>:<sha256>` of the chunk this revision appended. Measurement only: a superseded upload is
+   * 'revision covered' only when the live manifest still lists this chunk. Never part of the identity (the
+   * forwarded copy has none).
+   */
+  chunk?: string;
   deleted?: boolean;
   /** S3's per-key sequencer, when the producer saw the notification (forwarder). Part of a delete's identity only. */
   sequencer?: string;
@@ -117,6 +123,7 @@ export function revisionMessage(event: RevisionEvent, id = "0"): RevisionMessage
     ...(event.revision !== undefined ? { revision: event.revision } : {}),
     ...(event.committedAt ? { committed_at: event.committedAt } : {}),
     ...(event.initial !== undefined ? { initial: event.initial } : {}),
+    ...(event.chunk ? { chunk: event.chunk } : {}),
     ...(event.deleted ? { deleted: true } : {}),
     ...(event.attempt !== undefined ? { attempt: event.attempt } : {}),
   };
@@ -177,6 +184,7 @@ export interface ManifestCommit {
   etag?: string;
   version?: string;
   committedAt: string;
+  chunk?: string;
 }
 
 /**
@@ -189,7 +197,7 @@ export function writerRevisionHook(sender: RevisionSender): (commits: readonly M
     const { failed } = await sendRevisions(
       sender,
       commits.map((c) => ({ key: c.key, ...(c.etag ? { etag: c.etag } : {}), ...(c.version ? { version: c.version } : {}),
-        revision: c.revision, committedAt: c.committedAt, initial: c.revision === 1, source: "writer" as const })),
+        revision: c.revision, committedAt: c.committedAt, initial: c.revision === 1, ...(c.chunk ? { chunk: c.chunk } : {}), source: "writer" as const })),
     );
     // Metadata only: a count; the forwarder carries these writes.
     if (failed.length) log.warn("revision enqueue failed", { stage: "revision-events", count: failed.length, reason: "forwarder_recovers" });

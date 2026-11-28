@@ -462,7 +462,7 @@ interface Revised {
   /** The pointer pass's outcome for this key: `unchanged` means an EARLIER pass already advanced it to the live write. */
   pointerStatus: string;
   /** The live manifest's stamps as the pointer pass read them under the lock (absent for a delete). */
-  liveStamp?: { etag?: string; version?: string };
+  liveStamp?: { etag?: string; version?: string; chunks?: readonly string[] };
   /** The live manifest's revision number after the pointer pass (absent for a delete or an unknown revision). */
   liveRevision?: number;
   /** A delete event of the same key arrived after this one in the group: an erase lies between it and the live write. */
@@ -531,7 +531,12 @@ function logUnobserved(scope: SessionScope, r: Revised, reason: string) {
  * First indexed appearance of SUPERSEDED uploads (readout request). An append is cumulative, so the live manifest
  * the covering pass indexed contains a superseded append's records: that pass's completion is the upload's first
  * indexed appearance. Fail-closed: covered ONLY for a lower revision of the same key with no delete after it in the
- * group. Otherwise 'revision unobserved' with the reason (erase_between, recreate_between, revision_unknown).
+ * group AND evidence that the covering manifest includes the upload: the chunk it appended (`<seq>:<sha256>`, from
+ * the writer) is listed by the live manifest the pointer pass read. Same key and a lower revision alone prove
+ * nothing: a delete and re-create between them may be missing from this group (lost, or consumed by an earlier
+ * batch), and the re-created manifest then does not contain the earlier append (Pipeline review of 1cb42716).
+ * Otherwise 'revision unobserved' with the reason (erase_between, recreate_between, revision_unknown,
+ * coverage_unproven: no chunk on the event, e.g. a forwarded or reconcile copy, or the live manifest lacks it).
  * Index pass completion, NOT an authorized caller read.
  */
 function logCovered(scope: SessionScope, revisions: readonly Revised[], now: () => number, pickedUpAt: number, passStartedAt: number) {
@@ -545,6 +550,8 @@ function logCovered(scope: SessionScope, revisions: readonly Revised[], now: () 
     if (rev === undefined || r.liveRevision === undefined) { logUnobserved(scope, r, "revision_unknown"); continue; }
     if (r.deleteAfter) { logUnobserved(scope, r, "erase_between"); continue; }
     if (rev >= r.liveRevision) { logUnobserved(scope, r, "recreate_between"); continue; }
+    const chunk = r.event.revision?.chunk;
+    if (!chunk || !r.liveStamp?.chunks?.includes(chunk)) { logUnobserved(scope, r, "coverage_unproven"); continue; }
     const committed = r.event.revision?.committedAt ? Date.parse(r.event.revision.committedAt) : NaN;
     log.info("revision covered", {
       stage: "revision-events", org_id: scope.orgId, workspace_id: scope.workspaceId, harness: scope.harness, session_id: scope.sessionId,
