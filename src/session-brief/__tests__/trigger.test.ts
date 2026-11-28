@@ -19,9 +19,11 @@ const TIMING = { maxDelaySeconds: 8, idleSeconds: 600, maxWaitSeconds: 3_600 };
 const THROTTLE_S = 120;
 const VISIBILITY_MS = 30_000;
 const DIGEST = "a".repeat(64);
-const inc = (harness: string): BriefPhysicalIncarnation => ({ source: harness, session: "phys-1", machine: "srv_00000000000000000000000000000001", generation: "1" });
-const hint = (kind: BriefWakeKind, revision: number, at: number, harness = "claude"): BriefWakeHint =>
-  briefWakeHint(kind, { org: "org-1", workspace: "ws-1", harness, session: "sess-1", revision, digest: DIGEST, first_uncovered_at: at }, inc(harness));
+const M1 = "srv_00000000000000000000000000000001", M2 = "srv_00000000000000000000000000000002";
+interface CommitOpts { machine?: string; generation?: string; digest?: string }
+const inc = (harness: string, o: CommitOpts = {}): BriefPhysicalIncarnation => ({ source: harness, session: "phys-1", machine: o.machine ?? M1, generation: o.generation ?? "1" });
+const hint = (kind: BriefWakeKind, revision: number, at: number, harness = "claude", o: CommitOpts = {}): BriefWakeHint =>
+  briefWakeHint(kind, { org: "org-1", workspace: "ws-1", harness, session: "sess-1", revision, digest: o.digest ?? DIGEST, first_uncovered_at: at }, inc(harness, o));
 const v1 = (h: BriefWakeHint): BriefWakeHint => {
   const { harness: _h, ...rest } = h as BriefWakeHint & { harness?: string };
   return { ...rest, v: 1 } as BriefWakeHint;
@@ -32,7 +34,8 @@ interface Run { harness: string; claimableAt: number; claimedAt: number; generat
 
 class Sim {
   now = T0;
-  rows = new Map<string, { state: BriefWakeState }>(); // by harness (one org/workspace/session in these fixtures)
+  /** By harness (one org/workspace/session here). armed: commit refs armed and not consumed (sessions.session_brief_arms). */
+  rows = new Map<string, { state: BriefWakeState; armed: Set<string>; claimed?: Set<string> }>();
   briefs = new Map<string, Brief>();
   /** The highest committed revision per harness (what a run reads from the authoritative pointers). */
   committed = new Map<string, number>();
@@ -42,6 +45,8 @@ class Sim {
   failRuns = 0;
   inFlight = new Map<string, { generation: number }>();
   sweptAt: number[] = [];
+  /** Commit refs consumed by a successful run (they never re-arm and never advance a row). */
+  consumed = new Set<string>();
   /** Every durable handoff: when it was sent and the delay it asked for. */
   handoffs: { at: number; delaySeconds: number }[] = [];
   private lastSweep = T0;
@@ -57,11 +62,15 @@ class Sim {
   brief(h: string): Brief { return this.briefs.get(h) ?? { revision: -1, ready: false }; }
 
   /** The producer, right after the authoritative CAS: arm the durable row, then send the hint (which may be lost). */
-  commit(harness: string, revision: number, opts: { kind?: "append" | "end"; lose?: boolean; loseArm?: boolean } = {}) {
+  commit(harness: string, revision: number, opts: { kind?: "append" | "end"; lose?: boolean; loseArm?: boolean } & CommitOpts = {}) {
     this.committed.set(harness, Math.max(this.committed.get(harness) ?? -1, revision));
-    const prev = this.rows.get(harness)?.state ?? null;
-    if (!opts.loseArm) this.rows.set(harness, { state: planArm(prev, this.now, this.brief(harness).ready, TIMING) });
-    const h = hint(opts.kind ?? "append", revision, prev?.pendingSince ?? this.now, harness);
+    const prevRow = this.rows.get(harness);
+    const h = hint(opts.kind ?? "append", revision, prevRow?.state.pendingSince ?? this.now, harness, opts);
+    if (!opts.loseArm) {
+      const armed = new Set(prevRow?.armed ?? []);
+      armed.add(h.trigger_id);
+      this.rows.set(harness, { state: planArm(prevRow?.state ?? null, this.now, this.brief(harness).ready, TIMING), armed, ...(prevRow?.claimed ? { claimed: prevRow.claimed } : {}) });
+    }
     if (!opts.lose) this.send(h);
     return h;
   }
@@ -80,7 +89,7 @@ class Sim {
     for (const [harness, row] of [...this.rows]) {
       if (!hintCovers(h, { org: "org-1", workspace: "ws-1", harness, session: "sess-1" })) continue;
       const b = this.brief(harness);
-      const next = planHint(row.state, h, { nowMs: this.now, hasBrief: b.ready, timing: TIMING, ...(b.ready ? { coveredRevision: b.revision } : {}) });
+      const next = planHint(row.state, h, { nowMs: this.now, hasBrief: b.ready, timing: TIMING, armedRefs: row.armed });
       if (next) row.state = next;
       if (row.state.leased) continue; // in flight: the generation decides the trailing work
       const at = this.claimable(harness, row.state);
@@ -99,6 +108,7 @@ class Sim {
     const row = this.rows.get(harness)!;
     this.runs.push({ harness, claimableAt: this.claimable(harness, row.state), claimedAt: this.now, generation: row.state.generation, dueAt: row.state.dueAt });
     row.state = claimPlan(row.state);
+    row.claimed = new Set(row.armed); // the arm record's claimed snapshot
     this.inFlight.set(harness, { generation: row.state.generation });
     if (!hold) this.finish(harness);
   }
@@ -115,6 +125,8 @@ class Sim {
     }
     // The run read the authoritative pointers: it covers every revision committed so far.
     this.briefs.set(harness, { revision: this.committed.get(harness)!, ready: true, lastAttempt: this.now });
+    for (const r of row.claimed ?? []) { row.armed.delete(r); this.consumed.add(r); } // consumed := claimed
+    delete row.claimed;
     const next = finishPlan(row.state, g, this.now, TIMING);
     if (next) row.state = next; else this.rows.delete(harness);
   }
@@ -137,7 +149,7 @@ class Sim {
           this.lastSweep = this.now;
           for (const [harness, rev] of this.committed) // a lost arm: committed, uncovered, no wakeup
             if (!this.rows.has(harness) && rev > this.brief(harness).revision) {
-              this.rows.set(harness, { state: planArm(null, this.now, this.brief(harness).ready, TIMING) });
+              this.rows.set(harness, { state: planArm(null, this.now, this.brief(harness).ready, TIMING), armed: new Set([hint("append", rev, T0, harness).trigger_id]) });
               this.sweptAt.push(this.now);
             }
         }
@@ -166,14 +178,16 @@ describe("session-brief trigger: hint contract", () => {
     expect(parseBriefWakeHint(noHarness)).toBeNull(); // v2 without its harness
   });
 
-  test("the tracing id is stable for one commit and differs for any other incarnation, kind, revision or harness", () => {
+  test("the commit reference is stable for one commit, kind-independent, and differs for any other incarnation or content", () => {
     const f = { org: "org-1", workspace: "ws-1", harness: "claude", session: "sess-1", revision: 3, digest: DIGEST };
-    expect(briefTriggerId("append", f, inc("claude"))).toBe(briefTriggerId("append", f, { ...inc("claude") }));
-    for (const other of [{ ...inc("claude"), generation: "2" }, { ...inc("claude"), machine: "srv_00000000000000000000000000000002" }, { ...inc("claude"), session: "phys-2" }])
-      expect(briefTriggerId("append", f, other)).not.toBe(briefTriggerId("append", f, inc("claude")));
-    expect(briefTriggerId("end", f, inc("claude"))).not.toBe(briefTriggerId("append", f, inc("claude")));
-    expect(briefTriggerId("append", { ...f, revision: 4 }, inc("claude"))).not.toBe(briefTriggerId("append", f, inc("claude")));
-    expect(briefTriggerId("append", { ...f, harness: "codex" }, inc("claude"))).not.toBe(briefTriggerId("append", f, inc("claude")));
+    expect(briefTriggerId(f, inc("claude"))).toBe(briefTriggerId(f, { ...inc("claude") }));
+    for (const other of [{ ...inc("claude"), generation: "2" }, { ...inc("claude"), machine: M2 }, { ...inc("claude"), session: "phys-2" }])
+      expect(briefTriggerId(f, other)).not.toBe(briefTriggerId(f, inc("claude")));
+    // Kind-independent: the append and the end for one commit share the reference (it names the commit).
+    expect(hint("end", 3, T0).trigger_id).toBe(hint("append", 3, T0).trigger_id);
+    expect(briefTriggerId({ ...f, revision: 4 }, inc("claude"))).not.toBe(briefTriggerId(f, inc("claude")));
+    expect(briefTriggerId({ ...f, digest: "b".repeat(64) }, inc("claude"))).not.toBe(briefTriggerId(f, inc("claude")));
+    expect(briefTriggerId({ ...f, harness: "codex" }, inc("claude"))).not.toBe(briefTriggerId(f, inc("claude")));
   });
 
   test("settings: off by default; the existing sweep default 0 kept (direct worker unset/0), native chart 60, hosted 300", () => {
@@ -191,7 +205,7 @@ describe("session-brief trigger: hint contract", () => {
 
 describe("session-brief trigger: due and claim eligibility", () => {
   test("a hint is monotone: never later, never pending_since or the generation, never creates a row", () => {
-    const ctx = { nowMs: T0 + 30_000, hasBrief: true, timing: TIMING };
+    const ctx = { nowMs: T0 + 30_000, hasBrief: true, timing: TIMING, armedRefs: new Set([hint("end", 1, T0).trigger_id]) };
     expect(planHint(null, hint("append", 1, T0), ctx)).toBeNull();
     const armed = planArm(null, T0, true, TIMING);
     expect(armed.dueAt).toBe(T0 + 600_000);
@@ -200,13 +214,14 @@ describe("session-brief trigger: due and claim eligibility", () => {
     expect([ended.pendingSince, ended.generation, ended.evidenceAt]).toEqual([armed.pendingSince, armed.generation, armed.evidenceAt]);
     expect(planHint(ended, hint("append", 1, T0), { ...ctx, nowMs: T0 + 90_000 })).toBeNull(); // never later
     expect(planHint(armed, hint("sweep", 1, T0), ctx)).toBeNull();
-    expect(planHint(armed, hint("end", 1, T0), { ...ctx, coveredRevision: 1 })).toBeNull(); // covered
+    expect(planHint(armed, hint("end", 1, T0), { ...ctx, armedRefs: new Set() })).toBeNull(); // consumed: wake-only
+    expect(planHint(armed, v1(hint("end", 1, T0)), ctx)).toBeNull(); // v1 cannot prove its scope: wake-only
   });
 
   test("first brief: due within N, an end makes it due now, later evidence never pushes it back, never throttled", () => {
     const armed = planArm(null, T0, false, TIMING);
     expect(armed.dueAt).toBe(T0 + 8_000);
-    expect(planHint(armed, hint("end", 1, T0), { nowMs: T0 + 2_000, hasBrief: false, timing: TIMING })!.dueAt).toBe(T0 + 2_000);
+    expect(planHint(armed, hint("end", 1, T0), { nowMs: T0 + 2_000, hasBrief: false, timing: TIMING, armedRefs: new Set([hint("end", 1, T0).trigger_id]) })!.dueAt).toBe(T0 + 2_000);
     expect(planArm(armed, T0 + 5_000, false, TIMING).dueAt).toBe(T0 + 8_000);
     expect(claimAt(armed, { hasBrief: false, lastAttemptMs: T0 - 1_000, throttleSeconds: THROTTLE_S })).toBe(T0 + 8_000);
   });
@@ -335,19 +350,43 @@ describe("session-brief trigger: offline fixtures", () => {
 
   test.todo("KNOWN GAP: B committed during A's lease keeps B's original uncovered time through finish and retry (needs trailing_since: a migration in a separate Pipeline registry slot)", () => {});
 
-  test("an equal revision with different content (another machine, same harness): suppression never removes eligibility", () => {
+  test("A/B equal-revision replacement: the replacement's own reference advances its row; the consumed A does not", () => {
     const sim = new Sim();
-    // The brief covers revision 5 (from machine M1). Machine M2 commits ITS revision 5 (different content).
-    sim.briefs.set("claude", { revision: 5, ready: true, lastAttempt: T0 - 600_000 });
-    sim.committed.set("claude", 5);
-    const m2 = sim.commit("claude", 5, { lose: true });
+    sim.briefs.set("claude", { revision: 4, ready: true, lastAttempt: T0 - 600_000 });
+    const A = sim.commit("claude", 5, { lose: true }); // A: generation 1, revision 5
+    sim.now = sim.rows.get("claude")!.state.dueAt;
+    sim.claim("claude"); // A consumed
+    expect(sim.consumed.has(A.trigger_id)).toBe(true);
+    sim.now += 300_000;
+    const B = sim.commit("claude", 5, { lose: true, generation: "2", digest: "b".repeat(64) }); // head recreated: same revision
+    expect(B.trigger_id).not.toBe(A.trigger_id);
     const armed = { ...sim.rows.get("claude")!.state };
-    sim.now += 10_000;
-    sim.consume({ ...m2, kind: "end", digest: "b".repeat(64) }); // collides with the covered revision
-    expect(sim.rows.get("claude")!.state.dueAt).toBe(armed.dueAt); // the early wake is skipped (the known limitation)...
-    sim.advance(15 * 60_000);
-    expect(sim.runs).toHaveLength(1); // ...but the uncovered work stays eligible and is claimed at its own due time
-    expect(sim.runs[0]!.claimableAt).toBe(armed.dueAt);
+    sim.consume({ ...A, kind: "end" }); // an end naming the CONSUMED A: wake-only, nothing advanced
+    expect(sim.rows.get("claude")!.state.dueAt).toBe(armed.dueAt);
+    sim.consume({ ...B, kind: "end" }); // B's own end: its reference is armed on this row, so it advances (due now)
+    expect(sim.runs).toHaveLength(2);
+    expect(sim.runs[1]!.claimedAt).toBe(sim.now);
+  });
+
+  test("two machines with overlapping revisions: each machine's commit is its own reference; neither covers the other", () => {
+    const sim = new Sim();
+    sim.briefs.set("claude", { revision: 4, ready: true, lastAttempt: T0 - 600_000 });
+    const m1 = sim.commit("claude", 5, { lose: true, machine: M1 });
+    sim.now = sim.rows.get("claude")!.state.dueAt;
+    sim.claim("claude"); // M1's revision 5 consumed
+    sim.now += 300_000;
+    const m2 = sim.commit("claude", 5, { lose: true, machine: M2 }); // M2's revision 5 (different content, same number)
+    expect(m2.trigger_id).not.toBe(m1.trigger_id);
+    expect(sim.rows.get("claude")!.armed.has(m2.trigger_id)).toBe(true);
+    // The max brief_revision (5) would wrongly call M2 covered; the reference does not: M2's end advances.
+    sim.consume({ ...m2, kind: "end" });
+    expect(sim.runs).toHaveLength(2);
+    // M1's consumed reference is wake-only (no early claim for already-consumed work).
+    sim.commit("claude", 6, { lose: true, machine: M2 });
+    const before = { ...sim.rows.get("claude")!.state };
+    sim.now += 1_000;
+    sim.consume({ ...m1, kind: "end" });
+    expect(sim.rows.get("claude")!.state.dueAt).toBe(before.dueAt);
   });
 
   test("two harnesses, same session id and equal revision: v1 keeps each harness's own coverage, throttle and retry floor", () => {
@@ -413,6 +452,19 @@ describe("session-brief trigger: offline fixtures", () => {
     expect(sim.sweptAt.length).toBeGreaterThanOrEqual(1);
     expect(sim.sweptAt[0]! - lostAt).toBeLessThanOrEqual(300_000 + 60_000);
     expect(sim.runs).toHaveLength(2);
+  });
+
+  test("hosted: an intervening minute tick claims pending work without a scan (cadence here is per instance)", () => {
+    const sim = new Sim({ tickSeconds: 60, sweepSeconds: 300 });
+    sim.briefs.set("claude", { revision: 0, ready: true, lastAttempt: T0 - 600_000 });
+    sim.now = T0 + 90_000;
+    sim.commit("claude", 1, { lose: true }); // due at T0 + 690 s; scans fall at +300, +600, +900 s
+    sim.now = T0;
+    sim.advance(16 * 60_000);
+    expect(sim.runs).toHaveLength(1);
+    const claimed = sim.runs[0]!.claimedAt - T0;
+    expect(claimed).toBe(720_000); // the first minute tick after due, which is NOT a scan tick
+    expect(claimed % 300_000).not.toBe(0);
   });
 
   test("sweep fixture 2, native Helm default 60 s: the poll sweeps every minute", () => {
@@ -525,12 +577,12 @@ describe("session-brief trigger: durable commit identity (design r2)", () => {
   test("standalone end eligibility: a confirmed first end is due now; with a brief, coalescing is skipped and the throttle applies", () => {
     // First brief: a confirmed (v2) end makes the armed row due now, never throttled.
     const first = planArm(null, T0, false, TIMING);
-    const firstEnd = planHint(first, hint("end", 1, T0), { nowMs: T0 + 1_000, hasBrief: false, timing: TIMING })!;
+    const firstEnd = planHint(first, hint("end", 1, T0), { nowMs: T0 + 1_000, hasBrief: false, timing: TIMING, armedRefs: new Set([hint("end", 1, T0).trigger_id]) })!;
     expect(firstEnd.dueAt).toBe(T0 + 1_000);
     expect(claimAt(firstEnd, { hasBrief: false, lastAttemptMs: T0, throttleSeconds: THROTTLE_S })).toBe(T0 + 1_000);
     // Existing brief: the end removes the coalescing (idle) wait, but the refresh throttle still applies.
     const refresh = planArm(null, T0, true, TIMING);
-    const refreshEnd = planHint(refresh, hint("end", 2, T0), { nowMs: T0 + 1_000, hasBrief: true, coveredRevision: 1, timing: TIMING })!;
+    const refreshEnd = planHint(refresh, hint("end", 2, T0), { nowMs: T0 + 1_000, hasBrief: true, timing: TIMING, armedRefs: new Set([hint("end", 2, T0).trigger_id]) })!;
     expect(refreshEnd.dueAt).toBe(T0 + 1_000);
     expect(claimAt(refreshEnd, { hasBrief: true, lastAttemptMs: T0 - 30_000, throttleSeconds: THROTTLE_S })).toBe(T0 - 30_000 + THROTTLE_S * 1_000);
   });

@@ -30,18 +30,20 @@
  *     retry floor; nothing (identity, time) is copied across harnesses, and an ambiguous v1 `end` marks no harness
  *     ended (it wakes like an append).
  *   a row in retry backoff or park is never lowered by a hint. [builder]
- *   coverage suppression (hint.revision <= the stored brief's brief_revision for the same harness row) only ever
- *     skips an EARLY wake: the armed row keeps its own due time, so uncovered work stays eligible even when the
- *     check is wrong. brief_revision is the highest revision over the harness's machines, not a per-incarnation
- *     record, so an equal revision from another machine (different content) can be suppressed early; exact
- *     per-incarnation coverage needs the hint to carry the source incarnation (a contract change for Pipeline).
+ *   coverage [Pipeline item 8]: a hint advances a row only when its trigger_id (the opaque commit reference)
+ *     resolves to work armed and not consumed on that row; otherwise it is wake-only. Never decided from the max
+ *     brief_revision. Caller credit still needs consumed membership (the Reader's, not this slice's).
  *   SCORING [Pipeline review]: a brief is a miss when the first authorized parsed brief proving consumption comes more
  *     than 60 s after the cohort's first upload HTTP attempt (briefMiss). Due-to-claim is diagnostic only.
  *
  * Delivery: hosted, a standard queue (SESSION_BRIEF_QUEUE_URL, DLQ, event source mapping); a consumer handed a hint
  * before its claim time hands it off durably (re-enqueue delayed, at most 900 s a hop) and acknowledges only after a
  * run or a successful handoff. The hosted one-minute tick checks due work every minute; SESSION_BRIEF_SWEEP_SECONDS
- * (hosted sets 300) gates only its lost-hint scan. [Pipeline] Self-host: the native worker polls the table; no queue; the existing SESSION_BRIEF_SWEEP_SECONDS default (0,
+ * (hosted sets 300) gates only its lost-hint scan. [Pipeline] At dcbd14bb the scan cadence is PER INSTANCE (the
+ * worker's lastSweep lives in its closure): concurrent or cold Lambda instances each keep their own, so the 300 s is
+ * a per-instance minimum, not a shared schedule. A shared cadence would need an atomic shared sweep claim (e.g. a
+ * CAS'd last-discovery row) and cold/concurrent tick tests; not built here. With EventBridge disabled there are no
+ * ticks at all, so only hints drive claims. Self-host: the native worker polls the table; no queue; the existing SESSION_BRIEF_SWEEP_SECONDS default (0,
  * off) is unchanged for a direct worker (the native chart renders its own value).
  *
  * Nothing here logs; ids travel only inside hints and SQL parameters.
@@ -109,11 +111,17 @@ export interface BriefPhysicalIncarnation {
   generation: string;
 }
 
-/** The tracing identity of one hint: equal for a retry of the same commit, different for anything else. */
-export function briefTriggerId(kind: BriefWakeKind, h: { org: string; workspace: string; harness: string; session: string; revision: number; digest: string },
+/**
+ * trigger_id [builder, per Pipeline item 8]: the OPAQUE REFERENCE to the durable scoped commit identity (scope,
+ * machine, head generation, pointer revision, manifest sha256), independent of the hint kind, so an append and an
+ * end for the same commit share it and the consumer can resolve it against the arm record
+ * (sessions.session_brief_arms). Equal for a retry of the same commit; different for a replacement at the same
+ * revision (another generation or sha) and for another machine. Also the tracing join key.
+ */
+export function briefTriggerId(h: { org: string; workspace: string; harness: string; session: string; revision: number; digest: string },
   incarnation: BriefPhysicalIncarnation): string {
   return createHash("sha256").update(JSON.stringify([
-    "session-brief-trigger", kind, h.org, h.workspace, h.harness, h.session, h.revision, h.digest,
+    "session-brief-commit", 2, h.org, h.workspace, h.harness, h.session, h.revision, h.digest,
     incarnation.source, incarnation.session, incarnation.machine, incarnation.generation,
   ])).digest("hex");
 }
@@ -121,7 +129,7 @@ export function briefTriggerId(kind: BriefWakeKind, h: { org: string; workspace:
 /** Build a v2 hint (the producer always knows its harness). Throws only for a programming error. */
 export function briefWakeHint(kind: BriefWakeKind, f: Omit<BriefWakeHintV2, "v" | "kind" | "trigger_id">,
   incarnation: BriefPhysicalIncarnation): BriefWakeHintV2 {
-  const hint = { v: 2 as const, kind, ...f, trigger_id: briefTriggerId(kind, f, incarnation) };
+  const hint = { v: 2 as const, kind, ...f, trigger_id: briefTriggerId(f, incarnation) };
   const ok = parseBriefWakeHint(hint);
   if (!ok || ok.v !== 2) throw new Error("session-brief trigger: invalid hint fields");
   return ok;
@@ -173,8 +181,15 @@ export interface BriefHintContext {
   nowMs: number;
   /** A ready brief exists (a refresh); false: the first brief. */
   hasBrief: boolean;
-  /** The highest revision the stored brief covers for this scope (brief_revision), when there is a brief. */
-  coveredRevision?: number;
+  /**
+   * The commit references (trigger_ids) armed on this row and not yet consumed, resolved from the durable arm record
+   * (sessions.session_brief_arms). A hint's eligibility rules apply only when its reference is one of them: then the
+   * hint provably concerns uncovered work on this row. Otherwise (a consumed commit, an unknown reference, or any v1
+   * hint, which cannot name its scope) the hint is WAKE-ONLY: the consumer re-evaluates the row (its own due time,
+   * retry floor and the armed uncovered evidence) and nothing is suppressed or advanced on the hint's word. Never
+   * the max brief_revision alone (Pipeline item 8).
+   */
+  armedRefs?: ReadonlySet<string>;
   timing: BriefTriggerTiming;
 }
 
@@ -187,8 +202,9 @@ export interface BriefHintContext {
 export function planHint(prev: BriefWakeState | null, hint: BriefWakeHint, ctx: BriefHintContext): BriefWakeState | null {
   if (!prev) return null; // nothing armed: nothing to wake (committed evidence arms; the sweep recovers)
   if (prev.backoff) return null; // a retry backoff or park stands until it ends or new evidence re-arms
-  if (ctx.coveredRevision !== undefined && hint.revision <= ctx.coveredRevision) return null; // already briefed
   if (hint.kind === "sweep") return null;
+  // Only a v2 hint whose reference resolves to work armed on THIS row advances it; anything else is wake-only.
+  if (hint.v !== 2 || !ctx.armedRefs?.has(hint.trigger_id)) return null;
   // Only a v2 end is a confirmed end of THIS harness's session; a v1 end is ambiguous and wakes like an append.
   const ended = hint.kind === "end" && hint.v === 2;
   const t = ctx.timing;
