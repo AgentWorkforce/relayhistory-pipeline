@@ -88,7 +88,9 @@ export interface CutoverReport {
    * its last authority check). store_ops_after_barrier_open: the request's store calls after the gate opened; null
    * when the release never committed (the count would not describe calls after a release).
    */
-  inflight_barrier: { reached_ms: number | null; release_committed_ms: number | null; store_ops_after_barrier_open: number | null } | null;
+  inflight_barrier: { reached_ms: number | null; release_committed_ms: number | null; store_ops_after_barrier_open: number | null;
+    /** The second writer, parked at its first durable write after its authority reads (the post-authority/pre-PUT race). */
+    post_authority?: { parked_ms: number | null; authority_read_before_park: boolean; parked_on: string | null; outcome: string } } | null;
   /** The first non-PASS step and its first failing assertion (for the implementation owners). */
   first_failure: { step: string; status: StepStatus; code: string | null; assertion: string | null } | null;
   /** What this run does not cover, stated in every receipt (pending adapters and unbuilt checks). */
@@ -204,21 +206,34 @@ export async function runCutoverQualification(opts: RunOptions = {}): Promise<Cu
    * harness commits the release while the request is parked inside admission, then lets it go: the ordering
    * "writer in the admission path before the release committed" is established by the barrier, not by clocks.
    */
-  function barrierStore(): { store: ObjectStore; reached: Promise<number>; open: () => void; ops: () => number } {
-    let reach!: (ms: number) => void, release!: () => void, n = 0;
+  /**
+   * `at: "first-write"`: park instead at the request's FIRST durable write (put or delete), after every read before it
+   * (the fence-authority marker read included: `authorityRead`): the writer has passed its last authority check and
+   * has not yet written anything. `parkedOn` names the class of the key it was about to write (never the key).
+   */
+  function barrierStore(at: "first-call" | "first-write" = "first-call"): { store: ObjectStore; reached: Promise<number>; open: () => void; ops: () => number;
+    authorityRead: () => boolean; parkedOn: () => string | null } {
+    let reach!: (ms: number) => void, release!: () => void, n = 0, parked = false, authority = false, parkedOn: string | null = null;
     const reached = new Promise<number>((r) => { reach = r; });
     const gate = new Promise<void>((r) => { release = r; });
+    const markerKey = orgFenceAuthorityKey(KEY_ROOT, ORG);
+    const classOf = (k: string) => k.includes("/ledger/batches/") ? "batch_record" : k.includes("/ledger/owners/") ? "owner_stub" : k.includes("/ledger/revisions/") ? "revision_shard"
+      : k.includes("/v1/ws=") ? "canonical" : k.includes("/.ledger/") ? "ledger_control" : "other";
     const store = new Proxy(fx.store, {
       get(target, prop, recv) {
         const v = Reflect.get(target, prop, recv);
         if (typeof v !== "function") return v;
         return async (...args: unknown[]) => {
-          if (n++ === 0) { reach(Date.now()); await gate; }
+          n++;
+          const key = String(args[0] ?? "");
+          if (prop !== "put" && prop !== "delete" && key === markerKey) authority = true;
+          const park = !parked && (at === "first-call" || prop === "put" || prop === "delete");
+          if (park) { parked = true; parkedOn = classOf(key); reach(Date.now()); await gate; }
           return (v as (...a: unknown[]) => unknown).apply(target, args);
         };
       },
     }) as ObjectStore;
-    return { store, reached, open: release, ops: () => n };
+    return { store, reached, open: release, ops: () => n, authorityRead: () => authority, parkedOn: () => parkedOn };
   }
   const exists = async (key: string) => {
     try { await readAll(await fx.store.get(objectKey(key))); return true; }
@@ -519,21 +534,31 @@ export async function runCutoverQualification(opts: RunOptions = {}): Promise<Cu
       const raw = await fx.rawBatch(u, session, originsOf(u)[0]!, `live-b-${n}`, 2, 3, 128);
       const bar = barrierStore();
       const inflight = upload("release.inflight", "s3", { u, origin: originsOf(u)[0]!, batchId: `live-b-${n}`, session, records: 3, revision: 2, payloadBytes: 128, raw, via: bar.store });
-      let reachedMs: number | null = null;
+      // And one parked AFTER its last authority check, at its first durable write (the post-authority/pre-PUT race).
+      const n2 = liveSeq++, session2 = `live-${String(u).padStart(3, "0")}-${String(n2).padStart(4, "0")}`;
+      const raw2 = await fx.rawBatch(u, session2, originsOf(u)[0]!, `live-b-${n2}`, 2, 3, 128);
+      const bar2 = barrierStore("first-write");
+      const inflight2 = upload("release.inflight.postauth", "s3", { u, origin: originsOf(u)[0]!, batchId: `live-b-${n2}`, session: session2, records: 3, revision: 2, payloadBytes: 128, raw: raw2, via: bar2.store });
+      let reachedMs: number | null = null, reached2: number | null = null;
+      const within = <T,>(p: Promise<T>) => Promise.race([p, new Promise<null>((r) => setTimeout(() => r(null), 30_000))]);
       try {
-        reachedMs = await Promise.race([bar.reached, new Promise<null>((r) => setTimeout(() => r(null), 30_000))]);
+        reachedMs = await within(bar.reached);
         must(reachedMs !== null, "inflight_barrier_not_reached", "the in-flight upload never reached the store within 30 s");
+        // The post-authority writer either parks at its first write, or settles without writing (refused before any write).
+        reached2 = await within(Promise.race([bar2.reached, inflight2.then(() => null)]));
         await heads.bridgeRelease.run(ctx, epoch, { erasures: Number(again.erasures), receipts, evidenceSha256: sha(JSON.stringify(receipts.map((r) => r.hash))),
           detail: scenario === "empty" ? "erasure_window_empty" : null });
         const committed = (await fx.one<{ s: any }>("SELECT sessions.ingest_org_admission_hold_status($1) s", [ORG])).s;
         if (committed.hold?.state === "released") releaseCommittedMs = Date.parse(committed.hold.released_at);
       } finally {
-        bar.open();
-        const ev = await inflight;
+        bar.open(); bar2.open();
+        const ev = await inflight, ev2 = await inflight2;
         inflightBarrier = { reached_ms: reachedMs, release_committed_ms: releaseCommittedMs,
-          store_ops_after_barrier_open: releaseCommittedMs === null || reachedMs === null ? null : bar.ops() - 1 };
-        obs.push(`in-flight upload: parked at the barrier before the release (${reachedMs === null ? "not reached" : "reached"}), release ${releaseCommittedMs === null ? "not committed" : "committed while parked"}, then ${ev.outcome}`);
-        await checkS3Closed([ev], fail, obs);
+          store_ops_after_barrier_open: releaseCommittedMs === null || reachedMs === null ? null : bar.ops() - 1,
+          post_authority: { parked_ms: reached2, authority_read_before_park: bar2.authorityRead(), parked_on: bar2.parkedOn(), outcome: ev2.outcome } };
+        obs.push(`in-flight upload: parked at its first store call before the release (${reachedMs === null ? "not reached" : "reached"}), release ${releaseCommittedMs === null ? "not committed" : "committed while parked"}, then ${ev.outcome}`);
+        obs.push(`post-authority writer: ${reached2 === null ? "settled before any write" : `parked at its first write (${bar2.parkedOn()}) after the authority read=${bar2.authorityRead()}`}, then ${ev2.outcome}`);
+        await checkS3Closed([ev, ev2], fail, obs);
       }
       const after = (await fx.one<{ s: any }>("SELECT sessions.ingest_org_admission_hold_status($1) s", [ORG])).s;
       must(after.hold.state === "released" && after.hold.release_reason === "bridge_complete", "not_released");
@@ -642,7 +667,7 @@ export async function runCutoverQualification(opts: RunOptions = {}): Promise<Cu
       ...Object.entries(heads).filter(([, a]) => a.integration === "pending").map(([k, a]) => `adapter ${k} pending (${a.head})`),
       "HTTP serving reads (session-read-api /v1/sessions/:id/events) not exercised; reads use the read API's canonical reader in process",
       "search_index rows after publication not checked (publication adapter pending)",
-      "in-flight interleaving after the writer's last authority check and before its durable PUT (claim, chunk or manifest write) not exercised: the barrier parks the request at its FIRST store call (request start only); needs the real S3-hold adapter, with readable chunks and manifests inspected",
+      "post-authority/pre-PUT race exercised only against the stand-in path (no S3-side hold exists): the second in-flight writer is parked at its first durable write after its authority reads; its refusal semantics need the real S3-hold adapter",
     ],
     downtime: {
       observed_upper_bound_ms: installMs !== null && fs3 ? fs3.endedMs - installMs : null,
