@@ -36,13 +36,15 @@ run-name: ${{ github.event_name == 'workflow_dispatch' && format('backlog ops {0
 # the ready orgs' hold epochs; marker-execute binds that dry, the same runs and its wave_id (confirmation WAVE <id>) and
 # publishes each wave org's marker under its enforced hold (src/session-ingest/marker-publication.ts). It is HELD in
 # code (BACKLOG_OPS_MARKER_EXECUTE_ENABLED). Org ids reach no input, run-name, log line or receipt: wave_id is a hash.
+# hold-dry (read only) and hold-install-/hold-seal-/hold-rollback-execute (the 062320 hold's lifecycle; each binds a
+# hold-dry, the seal also the FULL it seals and binds via 062340 _bind) are HELD in code (BACKLOG_OPS_HOLD_EXECUTE_ENABLED).
 # Push and pull_request run only the credential-free tests (no secrets, no environment).
 on:
   workflow_dispatch:
     inputs:
       mode:
         type: choice
-        options: [backfill-dry, backfill-execute, export-dry, export-execute, drain-dry, drain-execute, presence-dry, backfill-refresh-dry, backfill-refresh-execute, backfill-catchup-dry, backfill-catchup-execute, reshard-dry, authority-dry, authority-execute, bridge-dry, bridge-execute, marker-dry, marker-execute]
+        options: [backfill-dry, backfill-execute, export-dry, export-execute, drain-dry, drain-execute, presence-dry, backfill-refresh-dry, backfill-refresh-execute, backfill-catchup-dry, backfill-catchup-execute, reshard-dry, authority-dry, authority-execute, bridge-dry, bridge-execute, marker-dry, marker-execute, hold-dry, hold-install-execute, hold-seal-execute, hold-rollback-execute]
         default: backfill-dry
         required: true
       sha:
@@ -120,6 +122,9 @@ on:
       - src/session-ingest/org-wave.ts
       - src/session-ingest/reshard-wave.ts
       - src/session-ingest/backlog-wave.ts
+      - scripts/backlog-hold.ts
+      - src/session-ingest/hold-lifecycle.ts
+      - src/session-ingest/__tests__/hold-lifecycle*
       - src/session-ingest/__tests__/backlog-wave*
       - src/session-ingest/__tests__/marker-publication*
       - src/session-ingest/__tests__/org-wave*
@@ -158,6 +163,9 @@ on:
       - src/session-ingest/org-wave.ts
       - src/session-ingest/reshard-wave.ts
       - src/session-ingest/backlog-wave.ts
+      - scripts/backlog-hold.ts
+      - src/session-ingest/hold-lifecycle.ts
+      - src/session-ingest/__tests__/hold-lifecycle*
       - src/session-ingest/__tests__/backlog-wave*
       - src/session-ingest/__tests__/marker-publication*
       - src/session-ingest/__tests__/org-wave*
@@ -233,6 +241,7 @@ jobs:
         run: |
           bun test --timeout 120000 ./src/session-ingest/__tests__/org-wave.test.ts ./src/session-ingest/__tests__/marker-publication.test.ts ./src/session-ingest/__tests__/backlog-wave.test.ts
           bun test --timeout 300000 ./src/session-ingest/__tests__/marker-publication.pglite.test.ts
+          bun test --timeout 300000 ./src/session-ingest/__tests__/hold-lifecycle.test.ts ./src/session-ingest/__tests__/hold-lifecycle.pglite.test.ts
       - name: Relocated-ledger stores and fork guard of the backfill and the drain (in-process fake buckets, no credentials)
         run: bun test --timeout 120000 ./src/session-ingest/__tests__/ledger-tool-store.test.ts
       - name: The drain and the backfill end to end, routed and single-bucket (scratch stores, in-process PGlite, no credentials)
@@ -317,7 +326,7 @@ jobs:
           run-id: ${{ inputs.backfill_run }}
           github-token: ${{ github.token }}
       - name: Download the bound full backfill's receipt (drain-execute with full_backfill_run, backfill-catchup-*, authority-execute, bridge-*, marker-*)
-        if: (inputs.mode == 'drain-execute' || startsWith(inputs.mode, 'backfill-catchup-') || inputs.mode == 'authority-execute' || startsWith(inputs.mode, 'bridge-') || startsWith(inputs.mode, 'marker-')) && inputs.full_backfill_run != ''
+        if: (inputs.mode == 'drain-execute' || startsWith(inputs.mode, 'backfill-catchup-') || inputs.mode == 'authority-execute' || startsWith(inputs.mode, 'bridge-') || startsWith(inputs.mode, 'marker-') || inputs.mode == 'hold-seal-execute') && inputs.full_backfill_run != ''
         uses: actions/download-artifact@v4
         with:
           name: backlog-ops-receipt
@@ -370,7 +379,7 @@ jobs:
       # session id is given to this step only, for presence-dry only, and reaches the tool on the same stdin pipe.
       - name: Run the backlog tool (the only step holding the DB secret or the role session)
         env:
-          SUPABASE_MIGRATION_OWNER_URL: ${{ (startsWith(inputs.mode, 'backfill-') || startsWith(inputs.mode, 'export-') || inputs.mode == 'presence-dry' || startsWith(inputs.mode, 'authority-') || startsWith(inputs.mode, 'bridge-') || startsWith(inputs.mode, 'marker-')) && secrets.SUPABASE_MIGRATION_OWNER_URL || '' }}
+          SUPABASE_MIGRATION_OWNER_URL: ${{ (startsWith(inputs.mode, 'backfill-') || startsWith(inputs.mode, 'export-') || inputs.mode == 'presence-dry' || startsWith(inputs.mode, 'authority-') || startsWith(inputs.mode, 'bridge-') || startsWith(inputs.mode, 'marker-') || startsWith(inputs.mode, 'hold-')) && secrets.SUPABASE_MIGRATION_OWNER_URL || '' }}
           # The authority modes' read-only Cloudflare token (Workers Scripts:Read, Queues:Read): a SECRET on both
           # environments, given to this step for authority and marker modes only; the tool gets it only on its stdin pipe.
           BACKLOG_OPS_CLOUDFLARE_TOKEN: ${{ (startsWith(inputs.mode, 'authority-') || startsWith(inputs.mode, 'marker-')) && secrets.BACKLOG_OPS_CLOUDFLARE_TOKEN || '' }}

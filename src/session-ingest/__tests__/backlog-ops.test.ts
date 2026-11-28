@@ -53,7 +53,7 @@ import {
 } from "../backlog-ops.ts";
 
 /** The modes before the authority modes; those have their own tests (backlog-authority.test.ts). */
-const AUTHORITY_MODES: readonly BacklogOpsMode[] = ["reshard-dry", "authority-dry", "authority-execute", "bridge-dry", "bridge-execute", "marker-dry", "marker-execute"];
+const AUTHORITY_MODES: readonly BacklogOpsMode[] = ["reshard-dry", "authority-dry", "authority-execute", "bridge-dry", "bridge-execute", "marker-dry", "marker-execute", "hold-dry", "hold-install-execute", "hold-seal-execute", "hold-rollback-execute"];
 const LEGACY_MODES = BACKLOG_OPS_MODES.filter((m) => !AUTHORITY_MODES.includes(m));
 const sha = "1".repeat(40), DRY = "111", BACKFILL = "222", EXPORT = "333", FULL = "444";
 const code = async (fn: () => unknown) => {
@@ -92,7 +92,7 @@ const dispatchEnv = (mode: BacklogOpsMode, extra: Record<string, string> = {}) =
 test("eleven modes (presence dry only; the backfill refresh's and catch-up's own two); executes are enabled, and refuse before anything else while disabled", () => {
   expect([...BACKLOG_OPS_MODES]).toEqual(["backfill-dry", "backfill-execute", "export-dry", "export-execute", "drain-dry", "drain-execute", "presence-dry",
     "backfill-refresh-dry", "backfill-refresh-execute", "backfill-catchup-dry", "backfill-catchup-execute",
-    "reshard-dry", "authority-dry", "authority-execute", "bridge-dry", "bridge-execute", "marker-dry", "marker-execute"]);
+    "reshard-dry", "authority-dry", "authority-execute", "bridge-dry", "bridge-execute", "marker-dry", "marker-execute", "hold-dry", "hold-install-execute", "hold-seal-execute", "hold-rollback-execute"]);
   expect(BACKLOG_OPS_EXECUTE_ENABLED).toBe(true);
   for (const mode of LEGACY_MODES) {
     const exec = mode.endsWith("-execute");
@@ -622,13 +622,13 @@ test("workflow: the proof job runs the presence tests, and every presence file i
 test("workflow: dispatch inputs, gates, one credential step, OIDC, protected vars, counts-only receipt, one op at a time", () => {
   const yml = readFileSync(fileURLToPath(new URL("../../../" + BACKLOG_OPS_WORKFLOW, import.meta.url)), "utf8");
   const code_ = yml.split("\n").filter((l) => !l.trimStart().startsWith("#")).join("\n");
-  expect(yml).toContain("options: [backfill-dry, backfill-execute, export-dry, export-execute, drain-dry, drain-execute, presence-dry, backfill-refresh-dry, backfill-refresh-execute, backfill-catchup-dry, backfill-catchup-execute, reshard-dry, authority-dry, authority-execute, bridge-dry, bridge-execute, marker-dry, marker-execute]");
+  expect(yml).toContain("options: [backfill-dry, backfill-execute, export-dry, export-execute, drain-dry, drain-execute, presence-dry, backfill-refresh-dry, backfill-refresh-execute, backfill-catchup-dry, backfill-catchup-execute, reshard-dry, authority-dry, authority-execute, bridge-dry, bridge-execute, marker-dry, marker-execute, hold-dry, hold-install-execute, hold-seal-execute, hold-rollback-execute]");
   // The FULL binding: an input, its env, and its receipt downloaded (drain-execute with FULL, a catch-up) before the tool step.
   expect(yml).toContain("BACKLOG_OPS_FULL_BACKFILL_RUN: ${{ inputs.full_backfill_run }}");
   expect(yml).toContain("BACKLOG_OPS_SLOTS_READ: ${{ inputs.slots_read }}");
   expect(yml).toContain("BACKLOG_OPS_SLOT_PACE_MS: ${{ inputs.slot_pace_ms }}");
   expect(yml).toMatch(/\n      slot_pace_ms:\n        description: [^\n]+\n        type: string\n        default: ""\n/u);
-  expect(yml).toContain("if: (inputs.mode == 'drain-execute' || startsWith(inputs.mode, 'backfill-catchup-') || inputs.mode == 'authority-execute' || startsWith(inputs.mode, 'bridge-') || startsWith(inputs.mode, 'marker-')) && inputs.full_backfill_run != ''");
+  expect(yml).toContain("if: (inputs.mode == 'drain-execute' || startsWith(inputs.mode, 'backfill-catchup-') || inputs.mode == 'authority-execute' || startsWith(inputs.mode, 'bridge-') || startsWith(inputs.mode, 'marker-') || inputs.mode == 'hold-seal-execute') && inputs.full_backfill_run != ''");
   // The catch-up's t: the recheck gate step's output, handed only to the tool step; never a dispatch input.
   expect(yml).toContain("        id: recheck\n");
   expect(yml).toContain("BACKLOG_OPS_REVISIONS_SINCE_MS: ${{ steps.recheck.outputs.revisions_since_ms }}");
@@ -660,7 +660,7 @@ test("workflow: dispatch inputs, gates, one credential step, OIDC, protected var
   expect(yml.match(/secrets\./g)?.length).toBe(5);
   expect(yml).toContain("BACKLOG_OPS_ORGS: ${{ secrets.BACKLOG_OPS_ORGS }}");
   expect(yml).not.toContain("vars.BACKLOG_OPS_ORGS");
-  expect(yml).toContain("SUPABASE_MIGRATION_OWNER_URL: ${{ (startsWith(inputs.mode, 'backfill-') || startsWith(inputs.mode, 'export-') || inputs.mode == 'presence-dry' || startsWith(inputs.mode, 'authority-') || startsWith(inputs.mode, 'bridge-') || startsWith(inputs.mode, 'marker-')) && secrets.SUPABASE_MIGRATION_OWNER_URL || '' }}");
+  expect(yml).toContain("SUPABASE_MIGRATION_OWNER_URL: ${{ (startsWith(inputs.mode, 'backfill-') || startsWith(inputs.mode, 'export-') || inputs.mode == 'presence-dry' || startsWith(inputs.mode, 'authority-') || startsWith(inputs.mode, 'bridge-') || startsWith(inputs.mode, 'marker-') || startsWith(inputs.mode, 'hold-')) && secrets.SUPABASE_MIGRATION_OWNER_URL || '' }}");
   expect(yml).toContain("SESSION_PRESENCE_SESSION: ${{ inputs.mode == 'presence-dry' && secrets.SESSION_PRESENCE_SESSION || '' }}");
   for (const v of ["BACKLOG_OPS_BUCKET", "BACKLOG_OPS_REGION", "BACKLOG_OPS_KMS_KEY_ARN", "BACKLOG_OPS_DRY_ROLE_ARN", "BACKLOG_OPS_EXECUTE_ROLE_ARN"])
     expect(yml).toContain(`${v}: \${{ vars.${v} }}`);

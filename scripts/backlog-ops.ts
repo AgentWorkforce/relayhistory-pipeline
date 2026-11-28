@@ -76,6 +76,7 @@ import {
   isBridge,
   isCatchup,
   isMarker,
+  isHold,
   isExecute,
   parseStsCredentials,
   toolOf,
@@ -86,7 +87,8 @@ import { checkAuthorityDryReceipt, checkBaselineReceipt, checkReshardReceipt } f
 import { authorityReceiptSummary, type AuthorityReceiptKind } from "../src/session-ingest/backlog-authority-schema.ts";
 import { checkMarkerDryReceipt, markerBoundFrom, markerReceiptSummary, receiptSha256, type MarkerBound } from "../src/session-ingest/marker-publication.ts";
 import { isWaveReceipt, mergeBaselines, orgScopeId, waveConcurrencyFor, waveReceiptSummary, waveSummary, waveView } from "../src/session-ingest/backlog-wave.ts";
-import { runWave } from "../src/session-ingest/org-wave.ts";
+import { runWave, waveId as waveIdOf } from "../src/session-ingest/org-wave.ts";
+import { checkHoldDryReceipt, holdReceiptSummary, type HoldStep } from "../src/session-ingest/hold-lifecycle.ts";
 import { evidenceHash } from "../src/session-ingest/authority-evidence.ts";
 
 const ROOT = fileURLToPath(new URL("..", import.meta.url));
@@ -138,6 +140,9 @@ export function backlogOpsChildSpawn(
   // for the sweeper's home check) on stdin. A catch-up bound to an authority-dry: that run's evidence on stdin.
   const cfToken = backlogOpsCloudflareToken(env, d);
   const wantsEvidence = isCatchup(d.mode) && d.authorityRun !== null, wantsBaseline = d.mode === "authority-execute" || isMarker(d.mode), wantsFull = isBridge(d.mode);
+  // A hold execute: the approved orgs (and the FULL, or the rollback evidence) on stdin; hold-dry: nothing but the URL.
+  if ((isHold(d.mode) && isExecute(d.mode)) !== (bound.hold !== undefined) || (d.mode === "hold-seal-execute") !== (bound.hold?.full !== undefined) ||
+      (d.mode === "hold-rollback-execute") !== (bound.hold?.evidence !== undefined)) refuse("backlog_ops_authority_binding");
   // A marker mode: what the bound receipts proved (and marker-execute's approved wave), beside the baseline.
   const marker = isMarker(d.mode);
   if (marker !== (bound.marker !== undefined) || (d.mode === "marker-execute") !== (bound.wave !== undefined)) refuse("backlog_ops_authority_binding");
@@ -150,6 +155,8 @@ export function backlogOpsChildSpawn(
     ...(marker ? { bound: bound.marker, ...(bound.wave ? { wave: bound.wave } : {}) } : {}) };
   if (wantsEvidence) payload = { dbUrl, authorityEvidence: bound.evidence };
   if (wantsFull) payload = { dbUrl, fullEvidence: bound.fullEvidence };
+  if (bound.hold) payload = { dbUrl, approved: bound.hold.approved, ...(bound.hold.full ? { full: bound.hold.full } : {}),
+    ...(bound.hold.evidence ? { evidence: bound.hold.evidence } : {}) };
   return {
     command: process.execPath,
     args: [join(ROOT, spec.script), ...spec.args],
@@ -167,7 +174,9 @@ export function backlogOpsChildSpawn(
 /** What the authority bindings hand the tool: an authority-dry's evidence (a catch-up), a catch-up's baseline (authority-execute). */
 export interface BoundAuthority { evidence?: unknown; baseline?: unknown; /** A bridge mode: sha256 of the bound FULL receipt's exact bytes. */ fullEvidence?: string;
   /** A marker mode: the sections, reshard verdicts and catch-up evidence the bound receipts proved. */ marker?: MarkerBound;
-  /** marker-execute: the approved wave its marker-dry recorded. */ wave?: { id: string; orgs: { orgHash: string; epochHash: string }[] } }
+  /** marker-execute: the approved wave its marker-dry recorded. */ wave?: { id: string; orgs: { orgHash: string; epochHash: string }[] };
+  /** A hold execute: the orgs its hold-dry approved, and (seal) the FULL, (rollback) the release evidence. */
+  hold?: { approved: { orgHash: string; epochHash: string | null }[]; full?: { run: string; startedMs: number; evidence: string }; evidence?: string } }
 export function checkBoundReceipts(env: Record<string, string | undefined>, d: BacklogOpsDispatch, read = (p: string) => readFileSync(p, "utf8"),
   revisionsSinceMs: number | null = backlogOpsRevisionsSince(env, d), readBytes: (p: string) => Uint8Array = (p: string) => readFileSync(p)): BoundAuthority {
   const paths = backlogOpsPaths(env), scopeFull = backlogOpsScope(env), scope = scopeFull.id;
@@ -181,7 +190,7 @@ export function checkBoundReceipts(env: Record<string, string | undefined>, d: B
     backlogOpsLedgerTarget(env, { bucket: env.BACKLOG_OPS_BUCKET ?? "" }));
   // Which bound receipts must attest this run's home: every authority-execute binding (FULL included: every backfill
   // receipt records it), a catch-up's AUTHORITY, and a reshard-dry's catch-up.
-  const authorityRun = (b: { kind: string }, dd: BacklogOpsDispatch) => dd.mode === "authority-execute" || b.kind === "authority" || dd.mode === "reshard-dry" || isBridge(dd.mode) || isMarker(dd.mode);
+  const authorityRun = (b: { kind: string }, dd: BacklogOpsDispatch) => dd.mode === "authority-execute" || b.kind === "authority" || dd.mode === "reshard-dry" || isBridge(dd.mode) || isMarker(dd.mode) || isHold(dd.mode);
   const authority: BoundAuthority = {};
   // The per-org bindings need the scope's org list (their receipts carry org hashes, never ids).
   const orgs = scopeFull.orgs;
@@ -198,7 +207,7 @@ export function checkBoundReceipts(env: Record<string, string | undefined>, d: B
     try { raw = read(path); } catch { return refuse(`backlog_ops_bound_${b.kind}_missing`); }
     // The drain's BACKFILL and FULL, and a catch-up's FULL: exactly the run's scope (never an unscoped run standing in).
     const exact = (d.mode === "drain-execute" && (b.kind === "backfill" || b.kind === "full")) || (isCatchup(d.mode) && b.kind === "full") ||
-      d.mode === "authority-execute" || b.kind === "authority" || d.mode === "reshard-dry" || isBridge(d.mode) || isMarker(d.mode);
+      d.mode === "authority-execute" || b.kind === "authority" || d.mode === "reshard-dry" || isBridge(d.mode) || isMarker(d.mode) || isHold(d.mode);
     // The drain's BACKFILL with FULL: a refresh or a catch-up, whichever the receipt says (the gate checked its run-name).
     let mode = b.mode;
     if (b.altMode !== undefined) {
@@ -235,12 +244,33 @@ export function checkBoundReceipts(env: Record<string, string | undefined>, d: B
     if (d.mode === "authority-execute" && b.kind === "backfill") authority.baseline = checkBaselineReceipt(raw, orgs!, d.dryRun!, d.fullBackfillRun!);
     // A bridge mode: the bound FULL receipt's sha256 (over its exact downloaded bytes), compared by the tool to the
     // 062340 binding's selected_full.evidence_sha256 (the seal's evidence).
-    if (isBridge(d.mode) && b.kind === "full") {
+    // A hold execute: what its hold-dry approved; the release evidence is the dry's exact bytes.
+    if (isHold(d.mode) && b.kind === "dry") {
+      const step = (d.mode === "hold-install-execute" ? "install" : d.mode === "hold-seal-execute" ? "seal" : "rollback") as Exclude<HoldStep, "dry">;
+      const approved = checkHoldDryReceipt(raw, orgs!, step);
+      const bytes = readBytes(path);
+      if (Buffer.compare(Buffer.from(bytes), Buffer.from(raw, "utf8")) !== 0) refuse("backlog_ops_bound_dry_receipt");
+      authority.hold = { ...(authority.hold ?? {}), approved, ...(step === "rollback" ? { evidence: createHash("sha256").update(bytes).digest("hex") } : {}) };
+    }
+    if ((isBridge(d.mode) || d.mode === "hold-seal-execute") && b.kind === "full") {
       // Over the file's exact bytes (read without decoding), and those bytes must be what was parsed and checked.
       const bytes = readBytes(path);
       if (Buffer.compare(Buffer.from(bytes), Buffer.from(raw, "utf8")) !== 0) refuse("backlog_ops_bound_full_receipt");
       authority.fullEvidence = createHash("sha256").update(bytes).digest("hex");
+      // The seal: the FULL's run, its GitHub created_at (t plus the margin, as the gate derived t) and that digest.
+      if (d.mode === "hold-seal-execute") {
+        if (revisionsSinceMs === null) refuse("backlog_ops_revisions_since");
+        authority.hold = { ...(authority.hold ?? { approved: [] }), full: { run: d.fullBackfillRun!, startedMs: revisionsSinceMs! + BACKLOG_OPS_CATCHUP_MARGIN_MS,
+          evidence: authority.fullEvidence } };
+        delete authority.fullEvidence;
+      }
     }
+  }
+  // A hold seal or rollback: the dispatch's WAVE is the id over the approved orgs at their epochs and the bound runs.
+  if ((d.mode === "hold-seal-execute" || d.mode === "hold-rollback-execute") && authority.hold) {
+    const runs: Record<string, string> = { dry: d.dryRun!, ...(d.fullBackfillRun ? { full: d.fullBackfillRun } : {}) };
+    const id = waveIdOf({ sha: d.sha, scope: scopeFull.id, runs, orgs: authority.hold.approved.map((a) => ({ orgHash: a.orgHash, epochHash: a.epochHash! })) });
+    if (id !== d.waveId) refuse("backlog_ops_bound_hold_wave");
   }
   if (isMarker(d.mode)) {
     if (raws.full === undefined || raws.backfill === undefined || raws.reshard === undefined || catchupEvidence === undefined) refuse("backlog_ops_bound_full_missing");
@@ -484,6 +514,10 @@ export function finalReceipt(d: BacklogOpsDispatch, run: string, code: number, s
     if (isMarker(d.mode)) {
       // Exact marker schema, self-consistent for this scope (and, for marker-execute, the approved wave id).
       const r = markerReceiptSummary(receipt.summary, { mode: isExecute(d.mode) ? "execute" : "dry_run", orgs, waveId: d.waveId ?? null });
+      receipt = { ...receipt, summary: r.summary, exitCode: r.ok ? receipt.exitCode : receipt.exitCode || 1 };
+    } else if (isHold(d.mode)) {
+      const step: HoldStep = d.mode === "hold-dry" ? "dry" : d.mode === "hold-install-execute" ? "install" : d.mode === "hold-seal-execute" ? "seal" : "rollback";
+      const r = holdReceiptSummary(receipt.summary, { step, orgs });
       receipt = { ...receipt, summary: r.summary, exitCode: r.ok ? receipt.exitCode : receipt.exitCode || 1 };
     } else if (schemaKind !== null) {
       // The bridge's proofs must match the run's scope and the exact gate-derived cutoff the child was given.

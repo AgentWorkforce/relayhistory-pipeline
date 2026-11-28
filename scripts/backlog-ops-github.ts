@@ -41,6 +41,7 @@ import {
   BACKLOG_OPS_BRIDGE_EXECUTE_ENABLED,
   BACKLOG_OPS_EXECUTE_ENABLED,
   BACKLOG_OPS_MARKER_EXECUTE_ENABLED,
+  BACKLOG_OPS_HOLD_EXECUTE_ENABLED,
   BACKLOG_OPS_FRESH_BACKFILL_MS,
   BACKLOG_OPS_RECEIPT_ARTIFACT,
   BACKLOG_OPS_WORKFLOW,
@@ -69,10 +70,11 @@ export async function backlogOpsGithubGate(
   env: Record<string, string | undefined>,
   get: Get,
   approved = false,
-  options: { enabled?: boolean; authorityEnabled?: boolean; bridgeEnabled?: boolean; markerEnabled?: boolean; now?: number } = {},
+  options: { enabled?: boolean; authorityEnabled?: boolean; bridgeEnabled?: boolean; markerEnabled?: boolean; holdEnabled?: boolean; now?: number } = {},
 ) {
   const input = backlogOpsDispatch(env, options.enabled ?? BACKLOG_OPS_EXECUTE_ENABLED, options.authorityEnabled ?? BACKLOG_OPS_AUTHORITY_EXECUTE_ENABLED,
-    options.bridgeEnabled ?? BACKLOG_OPS_BRIDGE_EXECUTE_ENABLED, options.markerEnabled ?? BACKLOG_OPS_MARKER_EXECUTE_ENABLED);
+    options.bridgeEnabled ?? BACKLOG_OPS_BRIDGE_EXECUTE_ENABLED, options.markerEnabled ?? BACKLOG_OPS_MARKER_EXECUTE_ENABLED,
+    options.holdEnabled ?? BACKLOG_OPS_HOLD_EXECUTE_ENABLED);
   const now = options.now ?? Date.now();
   if (env.GITHUB_REPOSITORY !== S.repository || env.GITHUB_REPOSITORY_ID !== PRIVATE_INGEST_RELEASE.repositoryId ||
       env.GITHUB_EVENT_NAME !== "workflow_dispatch" || env.GITHUB_REF !== "refs/heads/main" ||
@@ -142,6 +144,9 @@ export async function backlogOpsGithubGate(
     revisionsSinceMs = created.full! - BACKLOG_OPS_CATCHUP_MARGIN_MS;
     if (!Number.isSafeInteger(revisionsSinceMs) || revisionsSinceMs < 1) refuse("backlog_ops_gate_full_run");
   } else if (isCatchup(input.mode)) refuse("backlog_ops_full_backfill_run");
+  // hold-seal-execute: its DRY (which recorded the epochs it seals) ran after the FULL it seals and binds, so the hold
+  // was already installed when that FULL was dispatched only if the operator followed the order; 062340 checks it.
+  if (input.mode === "hold-seal-execute" && !(created.full! < created.dry!)) refuse("backlog_ops_gate_full_order");
   // A per-org retry's PREVIOUS: the same execute at this sha by the same dispatcher, first attempt, completed and
   // FAILED (an incomplete per-org execute exits nonzero), with one unexpired receipt, created after every run this
   // one binds (it bound the same ones; the credential step checks that) and under BACKLOG_OPS_PREVIOUS_MAX_AGE_MS old.

@@ -590,7 +590,7 @@ test("credential step: marker-dry and marker-execute check every bound receipt, 
 
 test("workflow: the marker inputs, downloads and secrets; no expression in a run line; no org literal; wave_id is gated", () => {
   const yml = readFileSync(fileURLToPath(new URL("../../../" + BACKLOG_OPS_WORKFLOW, import.meta.url)), "utf8");
-  expect(yml).toContain("marker-dry, marker-execute]");
+  expect(yml).toContain("marker-dry, marker-execute, hold-dry, hold-install-execute, hold-seal-execute, hold-rollback-execute]");
   expect(yml).toContain("  BACKLOG_OPS_WAVE_ID: ${{ inputs.wave_id }}");
   expect(yml).toContain("if: inputs.mode == 'authority-execute' || startsWith(inputs.mode, 'marker-')");
   expect(yml).toContain("if: (startsWith(inputs.mode, 'backfill-catchup-') || startsWith(inputs.mode, 'marker-')) && inputs.authority_run != ''");

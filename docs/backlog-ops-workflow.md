@@ -744,6 +744,25 @@ role; the orgs come on stdin, never argv. It binds nothing.
 **Not built here:** installing and sealing a hold (`_install`, `_seal`, and 062340's `_bind`) as a mode, and the
 bridge release (`bridge-execute`, held). A marker needs the org's hold already sealed.
 
+## Hold lifecycle (hold-dry, hold-install-execute, hold-seal-execute, hold-rollback-execute)
+
+These modes drive the 062320 admission hold's lifecycle for a scoped wave (`src/session-ingest/hold-lifecycle.ts`,
+`scripts/backlog-hold.ts`). Every execute is **held in code** (`BACKLOG_OPS_HOLD_EXECUTE_ENABLED`, refused
+`backlog_ops_hold_held` before any GitHub read). Installing a hold on a real database needs Khaliq's explicit OK. The
+plan, the outage and the release gate are in `docs/design/wave-1-two-org-plan.md`.
+
+| Mode | Binds | Confirmation | Does, per org, in one transaction |
+| --- | --- | --- | --- |
+| `hold-dry` | nothing | none | reads (read only): hold state and epoch hash, pending batches, open canonical claims |
+| `hold-install-execute` | `DRY` a hold-dry | `HOLD-INSTALL-EXECUTE <sha> DRY <id>` | `_install` (request id from sha, DRY and org: a retry gets the same epoch), then refuses and rolls back on any open canonical claim |
+| `hold-seal-execute` | `DRY` a hold-dry created after `FULL`, `FULL` the FULL backfill-execute | `... DRY <id> FULL <id> WAVE <id>` | `_seal` and 062340's `_bind` with the sha256 of the FULL receipt's exact bytes and the FULL's start (the gate's t plus the margin); refuses unless installed_at < start |
+| `hold-rollback-execute` | `DRY` a hold-dry | `... DRY <id> WAVE <id>` | `_release(verified_rollback)`, only before any marker attempt |
+
+The seal's and the rollback's `WAVE` is the wave id over the commit, the scope, the bound runs and each approved org's
+hold epoch hash as the DRY recorded it. The approval covers exactly those orgs at those epochs; an org whose epoch
+moved refuses `hold_epoch_changed`. Each org has its own verdict. An execute exits 0 only when every approved org
+completed. Receipts are counts, codes and hashes only.
+
 ## Gates
 
 Every run passes the same gates as the guarded schema release:
