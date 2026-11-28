@@ -1,6 +1,5 @@
 /**
- * OFFLINE PROTOTYPE evidence for T124 (layered-sessions-pipeline d99235d6fca0): the capture-bound large-read enqueue
- * (fixtures/large-read-expected-enqueue.prototype.sql, not a migration) on real PostgreSQL
+ * Migration 20261105062410 (slot assigned by layered-sessions-pipeline 220fe2274d20; code only) on real PostgreSQL
  * (SESSION_INGEST_TEST_PG_URL; hold-harness run.ts gives a disposable 15/16/17). Two independent backends (distinct
  * pg_backend_pid, asserted by openPair) plus an observer; every interleaving is a pg_locks-observed block on the
  * fixture's test gate (an advisory key the RPC waits on right after its capture and validation), never timing.
@@ -17,9 +16,8 @@
  *   4  B committed before A's capture (the other order): A returns obsolete at once, no mutation.
  *   5  a matching failed row: enqueued:true, changed:false, state 'failed' (not durable recovery; the caller must
  *      not treat it as such); row unchanged.
- *   6  the ordinary enqueue (gated copy of 20261105021000's) captured B, then C commits and C's job is enqueued:
- *      B's late upsert OVERWRITES the newer C job (pre-existing behaviour of enqueue_session_large_read, recorded
- *      here as a finding, not changed by this prototype).
+ *   6  the ordinary enqueue (062410's newer-epoch guard) captured B, then C commits and C's job is enqueued and
+ *      claimed: B's late upsert changes nothing; C's row and lease byte-identical (021000 overwrote it).
  *   7  B's durable wakeup with its original delivery lost, for a measured-large scope: discover_session_large_reads
  *      enqueues B after A's stale job was superseded. (Below the measured thresholds there is no SQL-side wakeup;
  *      the consumer's sweep / S3 redelivery is the only one, not provable here.)
@@ -37,7 +35,26 @@ import { enqueueLargeReadExpected } from "../search-deadline-isolation.ts";
 
 setDefaultTimeout(300_000);
 const url = fixturePgUrl();
-const PROTOTYPE = readFileSync(join(import.meta.dir, "fixtures/large-read-expected-enqueue.prototype.sql"), "utf8");
+// The migration under test is applied by migrateAsOwner. Test-only gated copies (*_gated) are derived from ITS text:
+// the same bodies, renamed, with one wait on an advisory key at the point under test (after the expected enqueue's
+// capture and validation; after the ordinary enqueue's capture), so another backend can commit in exactly that window.
+const MIGRATION = readFileSync(join(import.meta.dir, "../../../supabase/migrations/20261105062410_session_large_read_expected_enqueue.sql"), "utf8");
+const GATE_SQL = `
+ IF coalesce(current_setting('rh.large_read_test_gate',true),'')<>'' THEN
+  PERFORM pg_advisory_xact_lock_shared(current_setting('rh.large_read_test_gate')::bigint);
+ END IF;`;
+function gated(name: string, tag: string, after: string): string {
+  const start = MIGRATION.indexOf(`FUNCTION sessions.${name}(`);
+  const create = MIGRATION.lastIndexOf("CREATE", start);
+  const end = MIGRATION.indexOf(`END ${tag};`, start) + `END ${tag};`.length;
+  const body = MIGRATION.slice(create, end);
+  if (start < 0 || !body.includes(after)) throw Error(`gate anchor missing in ${name}`);
+  return body.replace(/^CREATE (OR REPLACE )?FUNCTION sessions\.(\w+)\(/, "CREATE FUNCTION sessions.$2_gated(").replace(after, after + GATE_SQL);
+}
+const PROTOTYPE = [
+  gated("enqueue_session_large_read_expected", "$expected$", "RETURN jsonb_build_object('enqueued',false,'obsolete',true,'reason','incarnation_moved');\n END IF;"),
+  gated("enqueue_session_large_read", "$enqueue$", "RETURN jsonb_build_object('enqueued',false,'reason','source_unavailable'); END IF;"),
+].join("\n");
 const GATE = 424242;
 const S = { org: "org_replay", ws: "ws_replay", harness: "claude", session: "large_replay" };
 const ARGS = [S.org, S.ws, S.harness, S.session];
@@ -66,8 +83,8 @@ const capture = async (c: pg.Client | Conn): Promise<Src> =>
   (await c.query("SELECT sessions.capture_session_replay_pages($1,$2,$3,$4)->'source' s", ARGS)).rows[0].s;
 const job = async (c: pg.Client) => (await c.query("SELECT row_to_json(j)::text r FROM sessions.session_large_read_jobs j")).rows.map((r) => r.r as string);
 const jobRow = async (c: pg.Client) => (await c.query("SELECT state,source_epoch::text epoch,source_fingerprint fp,lease_nonce IS NOT NULL leased FROM sessions.session_large_read_jobs")).rows[0];
-const expected = (c: Conn | pg.Client, src: Src) =>
-  c.query("SELECT sessions.enqueue_session_large_read_expected($1,$2,$3,$4,$5::bigint,$6) r", [...ARGS, src.epoch, src.fingerprint]).then((r) => r.rows[0].r);
+const expected = (c: Conn | pg.Client, src: Src, gate = false) =>
+  c.query(`SELECT sessions.enqueue_session_large_read_expected${gate ? "_gated" : ""}($1,$2,$3,$4,$5::bigint,$6) r`, [...ARGS, src.epoch, src.fingerprint]).then((r) => r.rows[0].r);
 const ordinary = (c: Conn | pg.Client, gated = false) =>
   c.query(`SELECT sessions.enqueue_session_large_read${gated ? "_gated" : ""}($1,$2,$3,$4) r`, ARGS).then((r) => r.rows[0].r);
 const claim = (c: pg.Client) => c.query("SELECT sessions.claim_session_large_read(gen_random_uuid(),120) j").then((r) => r.rows[0].j);
@@ -82,7 +99,7 @@ describe.skipIf(!url)("capture-bound large-read enqueue prototype (real PostgreS
     await gateOn(pair.b);
     let B: Src | undefined;
     const r = await expectBlocks(pair, {
-      holder: pair.a, waiter: pair.b, hold: holdGate, wait: (c) => expected(c, A),
+      holder: pair.a, waiter: pair.b, hold: holdGate, wait: (c) => expected(c, A, true),
       whileBlocked: async () => { await moveEpoch(o); B = await capture(o); },
     });
     expect(r.receipt.waiting.some((l) => l.locktype === "advisory" && !l.granted) && r.receipt.holderPid === pair.a.pid).toBe(true);
@@ -101,7 +118,7 @@ describe.skipIf(!url)("capture-bound large-read enqueue prototype (real PostgreS
     await o.query("UPDATE sessions.session_large_read_jobs SET state='superseded'");
     await gateOn(pair.b);
     const r = await expectBlocks(pair, {
-      holder: pair.a, waiter: pair.b, hold: holdGate, wait: (c) => expected(c, A),
+      holder: pair.a, waiter: pair.b, hold: holdGate, wait: (c) => expected(c, A, true),
       whileBlocked: async () => { await moveEpoch(o); },
     });
     expect(r.waited).toMatchObject({ ok: true, value: { enqueued: true, changed: true, state: "queued" } });
@@ -126,7 +143,7 @@ describe.skipIf(!url)("capture-bound large-read enqueue prototype (real PostgreS
     await gateOn(pair.b);
     let before: string[] = [];
     const r = await expectBlocks(pair, {
-      holder: pair.a, waiter: pair.b, hold: holdGate, wait: (c) => expected(c, A),
+      holder: pair.a, waiter: pair.b, hold: holdGate, wait: (c) => expected(c, A, true),
       whileBlocked: async () => {
         await moveEpoch(o);
         await ordinary(o);
@@ -150,7 +167,7 @@ describe.skipIf(!url)("capture-bound large-read enqueue prototype (real PostgreS
     let A1: Src | undefined;
     let before: string[] = [];
     const r = await expectBlocks(pair, {
-      holder: pair.a, waiter: pair.b, hold: holdGate, wait: (c) => expected(c, A0),
+      holder: pair.a, waiter: pair.b, hold: holdGate, wait: (c) => expected(c, A0, true),
       whileBlocked: async () => {
         await o.query("UPDATE sessions.session_directory_event_pending SET epoch=epoch+1 WHERE org_id=$1", [S.org]);
         A1 = await capture(o);
@@ -185,21 +202,44 @@ describe.skipIf(!url)("capture-bound large-read enqueue prototype (real PostgreS
     expect(await job(o)).toEqual(before);
   });
 
-  test("6. FINDING: the ordinary enqueue, paused after its capture of B, overwrites a newer C job", async () => {
+  test("6. the ordinary enqueue (062410), paused after its capture of B, never overwrites C's newer leased job", async () => {
     const { o, pair } = await rig();
     await moveEpoch(o);
     const B = await capture(o);
     await gateOn(pair.b);
     let C: Src | undefined;
+    let before: string[] = [];
     const r = await expectBlocks(pair, {
       holder: pair.a, waiter: pair.b, hold: holdGate, wait: (c) => ordinary(c, true),
-      whileBlocked: async () => { await moveEpoch(o); C = await capture(o); await ordinary(o); },
+      whileBlocked: async () => {
+        await moveEpoch(o); C = await capture(o); await ordinary(o);
+        expect(await claim(o)).not.toBeNull(); // C's job running with a live lease
+        before = await job(o);
+      },
     });
     expect(r.receipt.waiting.some((l) => l.locktype === "advisory" && !l.granted) && r.receipt.holderPid === pair.a.pid).toBe(true);
-    expect(r.waited).toMatchObject({ ok: true, value: { enqueued: true } });
-    // Pre-existing 20261105021000 behaviour: the late upsert of B replaces the newer C job.
-    expect(await jobRow(o)).toMatchObject({ state: "queued", epoch: B.epoch });
     expect(Number(C!.epoch)).toBeGreaterThan(Number(B.epoch));
+    expect(r.waited).toMatchObject({ ok: true, value: { enqueued: true, changed: false } });
+    expect(await job(o)).toEqual(before); // C's row and lease byte-identical
+    expect(await jobRow(o)).toMatchObject({ state: "running", epoch: C!.epoch, leased: true });
+  });
+
+  test("6b. the ordinary enqueue, paused after its capture of B, never overwrites C's newer QUEUED job either", async () => {
+    const { o, pair } = await rig();
+    await moveEpoch(o);
+    const B = await capture(o);
+    await gateOn(pair.b);
+    let C: Src | undefined;
+    let before: string[] = [];
+    const r = await expectBlocks(pair, {
+      holder: pair.a, waiter: pair.b, hold: holdGate, wait: (c) => ordinary(c, true),
+      whileBlocked: async () => { await moveEpoch(o); C = await capture(o); await ordinary(o); before = await job(o); },
+    });
+    expect(r.receipt.waiting.some((l) => l.locktype === "advisory" && !l.granted) && r.receipt.holderPid === pair.a.pid).toBe(true);
+    expect(Number(C!.epoch)).toBeGreaterThan(Number(B.epoch));
+    expect(r.waited).toMatchObject({ ok: true, value: { enqueued: true, changed: false } });
+    expect(await job(o)).toEqual(before);
+    expect(await jobRow(o)).toEqual({ state: "queued", epoch: C!.epoch, fp: C!.fingerprint, leased: false });
   });
 
   test("7. B's durable wakeup without its delivery (measured-large scope): discovery enqueues B after stale A is superseded", async () => {

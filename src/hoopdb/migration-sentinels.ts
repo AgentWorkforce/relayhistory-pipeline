@@ -715,6 +715,10 @@ export const MIGRATION_SENTINELS: Record<string, Sentinel> = {
     evidence: "replacement: buffered_search_feed_page's keyset is one row comparison, with plan_cache_mode=force_custom_plan",
     sql: "SELECT EXISTS(SELECT 1 FROM pg_proc WHERE oid=to_regprocedure('sessions.buffered_search_feed_page(jsonb)') AND prosecdef AND prosrc LIKE '%coalesce(c.after_created_at,c.since-interval%' AND 'plan_cache_mode=force_custom_plan'=ANY(proconfig)) AS applied",
   },
+  "upstream:20261105062410_session_large_read_expected_enqueue.sql": {
+    evidence: "function: enqueue_session_large_read_expected (exact-incarnation large-read re-queue); enqueue_session_large_read never replaces a newer epoch",
+    sql: "SELECT EXISTS(SELECT 1 FROM pg_proc WHERE oid=to_regprocedure('sessions.enqueue_session_large_read_expected(text,text,text,text,bigint,text)') AND prosecdef) AND EXISTS(SELECT 1 FROM pg_proc WHERE oid=to_regprocedure('sessions.enqueue_session_large_read(text,text,text,text)') AND prosrc LIKE '%j.source_epoch < excluded.source_epoch%') AS applied",
+  },
   "upstream:20261105062070_coordination_advisor_readers.sql": {
     evidence: "functions sessions.coordination_advisor_write_facts_v1 and sessions.coordination_advisories_recent_v1",
     sql: "SELECT to_regprocedure('sessions.coordination_advisor_write_facts_v1(text,text,timestamptz,timestamptz,text,integer)') IS NOT NULL AND to_regprocedure('sessions.coordination_advisories_recent_v1(text,text,timestamptz)') IS NOT NULL AS applied",

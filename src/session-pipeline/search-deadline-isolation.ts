@@ -228,7 +228,7 @@ export type ExpectedEnqueue =
   | { kind: "unavailable" };
 
 /**
- * PROTOTYPE (not wired; the SQL function exists only in __tests__/fixtures/large-read-expected-enqueue.prototype.sql
+ * NOT WIRED (no consumer or Lambda call; the SQL function is migration 20261105062410, a review reservation only,
  * until a migration slot is assigned): sessions.enqueue_session_large_read_expected for the expected incarnation.
  * `enqueued` with state 'failed' is not durable recovery: the caller treats it as decideHold does (inline).
  */

@@ -770,4 +770,26 @@ describe("obsolete holds: a hold for incarnation A never enqueues, marks or hold
     expect(holdsSent).toHaveLength(1); // the marked scope's bounded hold; the healthy scope sent nothing
     expect(holdsSent[0]).toMatchObject({ seq: 1 });
   }, 60_000);
+
+  test("F1: hold-only delivery, enqueue returns {enqueued:true} with NO source (and so no job row): never acked obsolete; the inline pass runs at once (large_job_missing)", async () => {
+    const f = await fixture();
+    const s = stateTable();
+    const clock = { t: Date.now() };
+    markNow(s, clock.t);
+    const upload = new Date(clock.t).toISOString();
+    f.deps.deadlineIsolation = {
+      ch: s.ch, now: () => clock.t, current: (scope) => captureLargeReadSource(f.x.db, scope),
+      enqueue: async () => ({ enqueued: true }), // identity and source omitted; no job row written
+      progress: (scope) => largeReadProgress(f.x.db, scope),
+    };
+    const b = (await captureLargeReadSource(f.x.db, own))!;
+    nextResult = () => ({ manifests: 1, rows: 3, inserted: 3, deleted: 0, complete: true, reasons: [] });
+    const r = await run(f, requeueBody(f.key, upload, { ...b.source, seq: 2, id: holdId(b.identity, b.source, 2) }));
+    expect(r.failures).toEqual([]);
+    expect(obsolete(r.all)).toEqual([]);
+    expect(r.all.filter((l) => l.message === "large-read job unclaimed")[0]).toMatchObject({ reason: "large_job_missing", route: "inline" });
+    expect(passes).toBe(1); // the bounded fallback runs now
+    expect(f.holds).toEqual([]);
+    expect(r.all.some((l) => l.message === "search index reconciled" && l.ok === true)).toBe(true);
+  }, 60_000);
 });

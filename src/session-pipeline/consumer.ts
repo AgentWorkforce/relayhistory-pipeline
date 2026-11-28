@@ -270,7 +270,9 @@ async function routeDeadlineScope(
   // A delivery made only of holds whose incarnation was replaced between the obsolete check and this enqueue: the
   // enqueue captured the newer incarnation (an upsert identical to that incarnation's own routing, and a no-op on its
   // row when it is already enqueued). Its job row now exists, so the newer work is covered: ack, no mark, no hold.
-  if (incoming.holdOnly && isolation.current && !incoming.holds.some((h) => sameSource(h, source))) {
+  // No captured source is NOT evidence of a newer incarnation: it takes decideHold's unknown-target rule (hold within
+  // LARGE_READ_UNCLAIMED_MS, then inline), never an obsolete ack.
+  if (incoming.holdOnly && isolation.current && source !== undefined && !incoming.holds.some((h) => sameSource(h, source))) {
     log.info("large-read hold obsolete", { stage: "large-read", ...ids, reason: "large_hold_obsolete", outcome: "enqueue_race" });
     return "done";
   }
