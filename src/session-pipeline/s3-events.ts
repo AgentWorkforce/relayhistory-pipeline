@@ -33,6 +33,8 @@ export interface RevisionMeta {
   revision?: number;
   committedAt?: string;
   initial?: boolean;
+  /** Reconcile only: the chain link that enqueued this recovery hint. */
+  attempt?: number;
 }
 
 interface S3Record {
@@ -111,6 +113,7 @@ export function parseQueueBody(body: string, provider: StorageProvider = "s3"): 
       ...(typeof rev.revision === "number" && Number.isSafeInteger(rev.revision) && rev.revision > 0 ? { revision: rev.revision } : {}),
       ...(typeof rev.committed_at === "string" && Number.isFinite(Date.parse(rev.committed_at)) ? { committedAt: rev.committed_at } : {}),
       ...(typeof rev.initial === "boolean" ? { initial: rev.initial } : {}),
+      ...(typeof rev.attempt === "number" && Number.isSafeInteger(rev.attempt) && rev.attempt >= 0 ? { attempt: rev.attempt } : {}),
     };
     const deleted = rev.deleted === true;
     return {
@@ -128,7 +131,7 @@ export function parseQueueBody(body: string, provider: StorageProvider = "s3"): 
       ],
     };
   }
-  const reconcile = v[RECONCILE_BODY_KEY] as { key?: unknown; etag?: unknown; version?: unknown } | undefined;
+  const reconcile = v[RECONCILE_BODY_KEY] as { key?: unknown; etag?: unknown; version?: unknown; last_modified?: unknown } | undefined;
   if (reconcile && typeof reconcile === "object") {
     if (typeof reconcile.key !== "string" || !reconcile.key) return { kind: "invalid" };
     return {
@@ -139,6 +142,7 @@ export function parseQueueBody(body: string, provider: StorageProvider = "s3"): 
           key: reconcile.key,
           ...(typeof reconcile.etag === "string" && reconcile.etag ? { etag: reconcile.etag } : {}),
           ...(typeof reconcile.version === "string" && reconcile.version ? { version: reconcile.version } : {}),
+          ...(typeof reconcile.last_modified === "string" && Number.isFinite(Date.parse(reconcile.last_modified)) ? { eventTime: reconcile.last_modified } : {}),
         },
       ],
     };

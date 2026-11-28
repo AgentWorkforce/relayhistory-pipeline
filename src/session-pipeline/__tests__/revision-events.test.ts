@@ -130,6 +130,20 @@ describe("one committed physical manifest: writer and forwarder share its identi
   });
 });
 
+describe("backstop recovery measurement", () => {
+  test("a reconcile hint carries the listing's last_modified as its commit time and the enqueuing chain link as attempt", async () => {
+    const q = fifo();
+    await sendReconcileRevision(q.sender, JSON.stringify({ reconcile: { key: KEY, etag: "e7", last_modified: "2026-11-01T09:12:00.000Z" } }), "2026-11-01T09:30:00.000Z#3", 3);
+    expect(JSON.parse(q.accepted[0]!.MessageBody).revision).toEqual({ key: KEY, source: "reconcile", etag: "e7", committed_at: "2026-11-01T09:12:00.000Z", attempt: 3 });
+    const parsed = parseQueueBody(q.accepted[0]!.MessageBody);
+    expect(parsed.kind === "events" && parsed.events[0]!.revision).toEqual({ source: "reconcile", committedAt: "2026-11-01T09:12:00.000Z", attempt: 3 });
+    // A malformed last_modified is dropped, not trusted.
+    const r = fifo();
+    await sendReconcileRevision(r.sender, JSON.stringify({ reconcile: { key: KEY, etag: "e7", last_modified: "nope" } }), "n#0", 0);
+    expect(JSON.parse(r.accepted[0]!.MessageBody).revision.committed_at).toBeUndefined();
+  });
+});
+
 describe("the writer hook", () => {
   test("emits revision, versionId, ETag, commit time and initial/append", async () => {
     const q = fifo();
