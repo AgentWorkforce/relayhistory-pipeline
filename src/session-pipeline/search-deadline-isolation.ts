@@ -103,6 +103,11 @@ export interface DeadlineIsolationDeps {
    */
   progress?: (scope: SessionScope) => Promise<LargeReadProgress | null>;
   /**
+   * The exact-incarnation enqueue (enqueueLargeReadExpected, migration 20261105062410) for hold-only deliveries. Absent:
+   * hold-only deliveries use `enqueue` as before.
+   */
+  enqueueExpected?: (scope: SessionScope, expected: LargeReadSource) => Promise<ExpectedEnqueue>;
+  /**
    * The scope's current source incarnation and canonical identity (captureLargeReadSource: one STABLE read, no write),
    * or null when the source is unavailable (erased, blocked, no live pointer). With it, a delivery made only of holds
    * whose expected incarnation is no longer current is obsolete: it never enqueues, writes a mark or holds for the
@@ -228,8 +233,8 @@ export type ExpectedEnqueue =
   | { kind: "unavailable" };
 
 /**
- * NOT WIRED (no consumer or Lambda call; the SQL function is migration 20261105062410, a review reservation only,
- * until a migration slot is assigned): sessions.enqueue_session_large_read_expected for the expected incarnation.
+ * sessions.enqueue_session_large_read_expected (migration 20261105062410) for the expected incarnation; the consumer's
+ * hold-only deliveries call it (DeadlineIsolationDeps.enqueueExpected, lambda.ts).
  * `enqueued` with state 'failed' is not durable recovery: the caller treats it as decideHold does (inline).
  */
 export async function enqueueLargeReadExpected(db: SqlExecutor, s: SessionScope, expected: LargeReadSource): Promise<ExpectedEnqueue> {

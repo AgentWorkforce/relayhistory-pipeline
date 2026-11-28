@@ -222,6 +222,9 @@ describe.skipIf(!url)("capture-bound large-read enqueue prototype (real PostgreS
     expect(r.waited).toMatchObject({ ok: true, value: { enqueued: true, changed: false } });
     expect(await job(o)).toEqual(before); // C's row and lease byte-identical
     expect(await jobRow(o)).toMatchObject({ state: "running", epoch: C!.epoch, leased: true });
+    // C's own enqueue still succeeds (no change: its job is current and leased).
+    expect(await ordinary(o)).toMatchObject({ enqueued: true, changed: false, source: C });
+    expect(await jobRow(o)).toMatchObject({ state: "running", epoch: C!.epoch, leased: true });
   });
 
   test("6b. the ordinary enqueue, paused after its capture of B, never overwrites C's newer QUEUED job either", async () => {
@@ -239,6 +242,9 @@ describe.skipIf(!url)("capture-bound large-read enqueue prototype (real PostgreS
     expect(Number(C!.epoch)).toBeGreaterThan(Number(B.epoch));
     expect(r.waited).toMatchObject({ ok: true, value: { enqueued: true, changed: false } });
     expect(await job(o)).toEqual(before);
+    expect(await jobRow(o)).toEqual({ state: "queued", epoch: C!.epoch, fp: C!.fingerprint, leased: false });
+    // C's own enqueue still succeeds and leaves C queued.
+    expect(await ordinary(o)).toMatchObject({ enqueued: true, changed: false, source: C });
     expect(await jobRow(o)).toEqual({ state: "queued", epoch: C!.epoch, fp: C!.fingerprint, leased: false });
   });
 

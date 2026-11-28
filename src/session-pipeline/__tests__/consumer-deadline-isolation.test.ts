@@ -15,7 +15,7 @@ import { processBatch, type ConsumerDeps } from "../consumer.ts";
 import { droppedFanout } from "../pointer.ts";
 import { runLargeReadOnce } from "../large-read-worker.ts";
 import {
-  DEADLINE_MARK_PREFIX, DEADLINE_OVER_BOUND, LARGE_READ_HOLD_MAX_MS, LARGE_READ_UNCLAIMED_MS, captureLargeReadSource, decideHold, deadlineMarkName, enqueueLargeRead, holdId, largeReadProgress,
+  DEADLINE_MARK_PREFIX, DEADLINE_OVER_BOUND, LARGE_READ_HOLD_MAX_MS, LARGE_READ_UNCLAIMED_MS, captureLargeReadSource, decideHold, deadlineMarkName, enqueueLargeRead, enqueueLargeReadExpected, holdId, largeReadProgress,
 } from "../search-deadline-isolation.ts";
 import { parseQueueBody, requeueBody, type LargeReadHoldBody } from "../s3-events.ts";
 import { exportStreamScope, generate } from "../../session-read-api/__tests__/stream-fixture.ts";
@@ -791,5 +791,110 @@ describe("obsolete holds: a hold for incarnation A never enqueues, marks or hold
     expect(passes).toBe(1); // the bounded fallback runs now
     expect(f.holds).toEqual([]);
     expect(r.all.some((l) => l.message === "search index reconciled" && l.ok === true)).toBe(true);
+  }, 60_000);
+
+  // ---- hold-only deliveries wired to enqueue_session_large_read_expected (migration 20261105062410, real SQL) ----
+  const wired = (f: Awaited<ReturnType<typeof fixture>>, s: ReturnType<typeof stateTable>, clock: { t: number }, current?: any) => {
+    f.deps.deadlineIsolation = {
+      ch: s.ch, now: () => clock.t, enqueue: (scope) => enqueueLargeRead(f.x.db, scope), progress: (scope) => largeReadProgress(f.x.db, scope),
+      current: current ?? ((scope) => captureLargeReadSource(f.x.db, scope)), enqueueExpected: (scope, e) => enqueueLargeReadExpected(f.x.db, scope, e),
+    };
+  };
+  const claimNow = (f: Awaited<ReturnType<typeof fixture>>) => f.x.db.query<{ j: unknown }>("SELECT sessions.claim_session_large_read(gen_random_uuid(),120) j").then((r) => r.rows[0]!.j);
+  const holdFor = (src: { epoch: string; fingerprint: string }, seq: number) => ({ ...src, seq, id: holdId({ ...own, sessionId: "large:replay" }, src, seq) });
+
+  test("wired, own exact job queued: the expected enqueue changes nothing; the hold continues for the SAME incarnation (seq + 1)", async () => {
+    const f = await fixture();
+    const s = stateTable(); const clock = { t: Date.now() };
+    wired(f, s, clock); markNow(s, clock.t);
+    await enqueueLargeRead(f.x.db, own); // the originating route created it
+    const cur = (await captureLargeReadSource(f.x.db, own))!.source;
+    const before = await jobRow(f);
+    const r = await run(f, requeueBody(f.key, new Date(clock.t).toISOString(), holdFor(cur, 3)));
+    expect(r.failures).toEqual([]);
+    expect(routed(r.all)).toEqual([expect.objectContaining({ state: "held_queued" })]);
+    expect(f.holds).toEqual([holdFor(cur, 4)]);
+    expect(await jobRow(f)).toEqual(before);
+    expect(passes).toBe(0);
+  }, 60_000);
+
+  test("wired, delayed A while B is current and LEASED: acked covered; B's row and lease byte-identical; no hold, no mark, no pass", async () => {
+    const f = await fixture();
+    const s = stateTable(); const clock = { t: Date.now() };
+    wired(f, s, clock); markNow(s, clock.t);
+    await enqueueLargeRead(f.x.db, own);
+    expect(await claimNow(f)).not.toBeNull(); // B's job running with a live lease
+    const before = await jobRow(f); const marks = s.rows.length;
+    const r = await run(f, requeueBody(f.key, new Date(clock.t).toISOString(), holdA(3)));
+    expect(r.failures).toEqual([]);
+    expect(obsolete(r.all)).toEqual([expect.objectContaining({ outcome: "covered" })]);
+    expect(await jobRow(f)).toEqual(before);
+    expect(f.requeued).toEqual([]); expect(s.rows).toHaveLength(marks); expect(passes).toBe(0);
+  }, 60_000);
+
+  test("wired, the pre-check is stale (still sees A) while B is current and leased: the expected enqueue refuses (incarnation_moved); acked covered; B byte-identical; nothing sent", async () => {
+    const f = await fixture();
+    const s = stateTable(); const clock = { t: Date.now() };
+    let calls = 0;
+    const real = (scope: any) => captureLargeReadSource(f.x.db, scope);
+    // First call (the pre-check) is stale; later calls (coverage) are authoritative.
+    wired(f, s, clock, async (scope: any) => (++calls === 1 ? { source: A, identity: { ...scope, sessionId: "large:replay" } } : real(scope)));
+    markNow(s, clock.t);
+    await enqueueLargeRead(f.x.db, own);
+    expect(await claimNow(f)).not.toBeNull();
+    const before = await jobRow(f);
+    const r = await run(f, requeueBody(f.key, new Date(clock.t).toISOString(), holdA(3)));
+    expect(r.failures).toEqual([]);
+    expect(obsolete(r.all)).toEqual([expect.objectContaining({ outcome: "covered", state: "expected_incarnation_moved" })]);
+    expect(await jobRow(f)).toEqual(before);
+    expect(f.requeued).toEqual([]); expect(passes).toBe(0);
+  }, 60_000);
+
+  test("wired, own incarnation current but NO job (empty slot): never inserts; held for the same incarnation within 5 min, then the inline pass; the slot stays empty", async () => {
+    const f = await fixture();
+    const s = stateTable(); const clock = { t: Date.now() };
+    wired(f, s, clock); markNow(s, clock.t);
+    const cur = (await captureLargeReadSource(f.x.db, own))!.source;
+    const upload = new Date(clock.t).toISOString();
+    const r = await run(f, requeueBody(f.key, upload, holdFor(cur, 2)));
+    expect(r.failures).toEqual([]);
+    expect(obsolete(r.all)).toEqual([expect.objectContaining({ outcome: "awaiting_newer", state: "expected_no_job" })]);
+    expect(f.holds).toEqual([holdFor(cur, 3)]);
+    expect(await f.jobs()).toEqual([]);
+    clock.t += 6 * 60_000;
+    nextResult = () => ({ manifests: 1, rows: 3, inserted: 3, deleted: 0, complete: true, reasons: [] });
+    const later = await run(f, requeueBody(f.key, upload, f.holds[0]!));
+    expect(obsolete(later.all)).toEqual([expect.objectContaining({ level: "warn", outcome: "inline", state: "expected_no_job" })]);
+    expect(passes).toBe(1);
+    expect(await f.jobs()).toEqual([]);
+  }, 60_000);
+
+  test("wired, the expected enqueue reports unavailable: the inline pass; a failing expected enqueue fails the delivery (retry); neither acks obsolete", async () => {
+    const f = await fixture();
+    const s = stateTable(); const clock = { t: Date.now() };
+    markNow(s, clock.t);
+    const cur = (await captureLargeReadSource(f.x.db, own))!.source;
+    f.deps.deadlineIsolation = { ch: s.ch, now: () => clock.t, enqueue: async () => { throw new Error("ordinary enqueue must not run for a hold"); },
+      progress: (scope) => largeReadProgress(f.x.db, scope), current: (scope) => captureLargeReadSource(f.x.db, scope), enqueueExpected: async () => ({ kind: "unavailable" }) };
+    nextResult = () => ({ manifests: 1, rows: 3, inserted: 3, deleted: 0, complete: true, reasons: [] });
+    const r = await run(f, requeueBody(f.key, undefined, holdFor(cur, 2)));
+    expect(r.failures).toEqual([]); expect(obsolete(r.all)).toEqual([]); expect(passes).toBe(1);
+    f.deps.deadlineIsolation = { ...f.deps.deadlineIsolation, enqueueExpected: async () => { throw Object.assign(new Error("read ECONNRESET"), { code: "ECONNRESET" }); } };
+    const failed = await run(f, requeueBody(f.key, undefined, holdFor(cur, 2)));
+    expect(failed.failures).toHaveLength(1); expect(obsolete(failed.all)).toEqual([]); expect(passes).toBe(1);
+  }, 60_000);
+
+  test("wired, own exact job superseded: re-queued (the only write a hold makes), then held; claim runs it", async () => {
+    const f = await fixture();
+    const s = stateTable(); const clock = { t: Date.now() };
+    wired(f, s, clock); markNow(s, clock.t);
+    await enqueueLargeRead(f.x.db, own);
+    await f.x.db.query("UPDATE sessions.session_large_read_jobs SET state='superseded'");
+    const cur = (await captureLargeReadSource(f.x.db, own))!.source;
+    const r = await run(f, requeueBody(f.key, new Date(clock.t).toISOString(), holdFor(cur, 2)));
+    expect(r.failures).toEqual([]);
+    expect(routed(r.all)).toEqual([expect.objectContaining({ state: "held_queued" })]);
+    expect((await f.jobs())[0]).toMatchObject({ state: "queued" });
+    expect(await claimNow(f)).not.toBeNull();
   }, 60_000);
 });

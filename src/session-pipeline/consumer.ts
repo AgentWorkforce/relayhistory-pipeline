@@ -13,6 +13,7 @@
 import { errorCodeFields, errorFields, log, searchIndexErrorDetail } from "../shared/log.ts";
 import { dbErrorReasonField } from "../shared/db-error-reason.ts";
 import { parseQueueBody, sequencerAfter, type LandedEvent, type LargeReadHoldBody, type QueueOrigin } from "./s3-events.ts";
+import type { LargeReadSource } from "./search-deadline-isolation.ts";
 import { indexPointer, type PointerDeps, type SessionScope } from "./pointer.ts";
 import { indexSearchScope, searchIndexPhaseMetrics, type SearchIndexDeps } from "./search-index.ts";
 import { LEGACY_PROVENANCE_INVALID } from "../session-read-api/legacy-provenance.ts";
@@ -241,6 +242,52 @@ function carriedTime(c: Covered): string | undefined {
 const scopeId = (s: SessionScope) => JSON.stringify([s.orgId, s.workspaceId, s.harness, s.sessionId]);
 
 /**
+ * A hold-only delivery whose expected incarnation has no job to act on (expected enqueue: obsolete or no_job), or whose
+ * incarnation is no longer current. It never enqueues, marks or holds for another incarnation:
+ * - "done" (ack) only when the CURRENT incarnation's job row exists and is not failed: that incarnation's own work is
+ *   durably held (covered);
+ * - "held": within LARGE_READ_UNCLAIMED_MS of the carried upload time, requeued once more for the SAME expectation
+ *   (seq + 1), never for the newer one;
+ * - "inline": past that bound (or without a requeue), the normal inline pass runs, with no enqueue, mark or hold.
+ * A failed read of the current source or of the job row is not coverage.
+ */
+async function settleUnmatchedHold(
+  isolation: DeadlineIsolationDeps,
+  scope: SessionScope,
+  holds: readonly LargeReadHoldBody[],
+  anchorMs: number,
+  requeue: ((hold?: LargeReadHoldBody) => Promise<void>) | undefined,
+  why: string,
+): Promise<"inline" | "done" | "held"> {
+  const ids = { org_id: scope.orgId, workspace_id: scope.workspaceId, harness: scope.harness, session_id: scope.sessionId };
+  let covers = false;
+  let canonical: SessionScope = scope;
+  try {
+    const now = isolation.current ? await isolation.current(scope) : null;
+    if (now) {
+      canonical = now.identity;
+      const row = isolation.progress ? await isolation.progress(now.identity) : null;
+      covers = !!row && row.state !== "failed" && sameSource(row.source, now.source);
+    }
+  } catch (error) {
+    log.warn("large scope job state unavailable", { stage: "large-read", ...ids, ...errorFields(error) });
+  }
+  const age = Math.max(0, (isolation.now ?? Date.now)() - anchorMs);
+  if (covers) {
+    log.info("large-read hold obsolete", { stage: "large-read", ...ids, reason: "large_hold_obsolete", outcome: "covered", state: why });
+    return "done";
+  }
+  if (age <= LARGE_READ_UNCLAIMED_MS && requeue) {
+    const top = holds.reduce((a, h) => (h.seq > a.seq ? h : a));
+    await requeue({ epoch: top.epoch, fingerprint: top.fingerprint, seq: top.seq + 1, id: holdId(canonical, top, top.seq + 1) });
+    log.info("large-read hold obsolete", { stage: "large-read", ...ids, reason: "large_hold_obsolete", outcome: "awaiting_newer", state: why, age_ms: age });
+    return "held";
+  }
+  log.warn("large-read hold obsolete", { stage: "large-read", ...ids, reason: "large_hold_obsolete", outcome: "inline", state: why, age_ms: age });
+  return "inline";
+}
+
+/**
  * Enqueue a deadline-isolated scope's large-read job and decide what this delivery does:
  * - "inline": the source is unavailable to the job (erased, blocked, no live pointer), or (with `progress`) its own job
  *   failed, is missing, or was not claimed within LARGE_READ_UNCLAIMED_MS of the oldest upload the message carries:
@@ -262,7 +309,23 @@ async function routeDeadlineScope(
   incoming: { holdOnly: boolean; holds: readonly LargeReadHoldBody[] } = { holdOnly: false, holds: [] },
 ): Promise<"inline" | "done" | "held"> {
   const ids = { org_id: scope.orgId, workspace_id: scope.workspaceId, harness: scope.harness, session_id: scope.sessionId };
-  const { enqueued, identity, source } = await isolation.enqueue(scope);
+  // A delivery made only of holds acts only on its OWN exact job (Pipeline f1c6515df1fd, ae37e77b3809): the expected
+  // enqueue never inserts, never advances or renews another incarnation's job, and the next hold (if any) waits for
+  // the same expected incarnation. Originating work (an upload, a first hit, a mixed batch) keeps the ordinary enqueue.
+  let enqueued: boolean, identity: SessionScope | undefined, source: LargeReadSource | undefined;
+  if (incoming.holdOnly && isolation.enqueueExpected && incoming.holds.length > 0) {
+    const expected = incoming.holds.reduce((a, h) => (h.seq > a.seq ? h : a));
+    const r = await isolation.enqueueExpected(scope, { epoch: expected.epoch, fingerprint: expected.fingerprint });
+    if (r.kind === "unavailable") {
+      log.info("search index over-bound, large-read unavailable", { stage: "search-index", ...ids, reason: DEADLINE_OVER_BOUND, outcome: trigger, route: "inline" });
+      return "inline";
+    }
+    if (r.kind === "obsolete" || r.kind === "no_job")
+      return settleUnmatchedHold(isolation, scope, incoming.holds, anchorMs, requeue, r.kind === "obsolete" ? `expected_${r.reason}` : `expected_${r.reason}`);
+    enqueued = true; identity = r.identity; source = r.source;
+  } else {
+    ({ enqueued, identity, source } = await isolation.enqueue(scope));
+  }
   if (!enqueued) {
     log.info("search index over-bound, large-read unavailable", { stage: "search-index", ...ids, reason: DEADLINE_OVER_BOUND, outcome: trigger, route: "inline" });
     return "inline";
@@ -490,28 +553,8 @@ export async function processBatch(records: readonly QueueRecord[], deps: Consum
             log.warn("large scope source unavailable", { stage: "large-read", org_id: scope.orgId, session_id: scope.sessionId, ...errorFields(error) });
           }
           if (now && !incoming.holds.some((h) => sameSource(h, now!.source))) {
-            const ids = { org_id: scope.orgId, workspace_id: scope.workspaceId, harness: scope.harness, session_id: scope.sessionId };
-            let covers = false;
-            try {
-              const row = deps.deadlineIsolation.progress ? await deps.deadlineIsolation.progress(now.identity) : null;
-              covers = !!row && row.state !== "failed" && sameSource(row.source, now.source);
-            } catch (error) {
-              log.warn("large scope job state unavailable", { stage: "large-read", ...ids, ...errorFields(error) });
-            }
-            const anchor = knownOldest(covered) ?? started;
-            const age = Math.max(0, (deps.deadlineIsolation.now ?? Date.now)() - anchor);
-            if (covers) {
-              log.info("large-read hold obsolete", { stage: "large-read", ...ids, reason: "large_hold_obsolete", outcome: "covered" });
-              continue;
-            }
-            if (age <= LARGE_READ_UNCLAIMED_MS && holdRequeue) {
-              // Same expectation, next sequence: the check repeats without touching the newer incarnation.
-              const top = incoming.holds.reduce((a, h) => (h.seq > a.seq ? h : a));
-              await holdRequeue({ epoch: top.epoch, fingerprint: top.fingerprint, seq: top.seq + 1, id: holdId(now.identity, top, top.seq + 1) });
-              log.info("large-read hold obsolete", { stage: "large-read", ...ids, reason: "large_hold_obsolete", outcome: "awaiting_newer", age_ms: age });
-              continue;
-            }
-            log.warn("large-read hold obsolete", { stage: "large-read", ...ids, reason: "large_hold_obsolete", outcome: "inline", age_ms: age });
+            const settled = await settleUnmatchedHold(deps.deadlineIsolation, scope, incoming.holds, knownOldest(covered) ?? started, holdRequeue, "incarnation_moved");
+            if (settled !== "inline") continue;
             obsoleteInline = true;
           }
         }
