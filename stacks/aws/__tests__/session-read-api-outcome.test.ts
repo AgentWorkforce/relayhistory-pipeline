@@ -15,11 +15,13 @@ import type { Directory } from "../../../src/session-read-api/directory.ts";
 import { memoryLiveness } from "../../../src/session-read-api/__tests__/support.ts";
 import { ClickHouseError, type ClickHouseClient } from "../../../src/session-pipeline/vendor/search-index/clickhouse.ts";
 import {
+  OUTCOME_ALARM_DEFAULTS,
   READ_REPLAY_ROUTE,
   REPLAY_REQUESTS_FILTER_PATTERN,
   REPLAY_UNAVAILABLE_FILTER_PATTERN,
   sessionReadApiFunctionProps,
   sessionReadApiNames,
+  sessionReadApiOutcomeAlarm,
 } from "../session-read-api.ts";
 
 const ID: VerifiedIdentity = { userId: "u-1", orgId: "org-a", workspaceId: "ws-a", scopes: ["rth:read"] };
@@ -207,5 +209,110 @@ describe("session read api outcome alarm: Lambda log formatting", () => {
     expect(src).not.toMatch(/console\.(log|info|warn|error)\(/);
     const lambda = readFileSync(fileURLToPath(new URL("../../../src/session-read-api/lambda.ts", import.meta.url)), "utf8");
     expect(lambda).toContain('log: (fields) => log.info("session read", fields),');
+  });
+});
+
+/**
+ * LOCAL evaluation, not CloudWatch: a small evaluator for the metric-math subset the synthesized
+ * expression uses (IF, FILL, >=, *, /, identifiers, numbers), applied to one window's sums, then
+ * the alarm's own ComparisonOperator, Threshold and TreatMissingData. The parser refuses anything
+ * outside that subset, so an edit to the expression fails here rather than being half-evaluated.
+ * Semantics assumed from the CloudWatch metric-math docs: a series with no datapoint is missing,
+ * FILL(x, 0) supplies 0 for it when another series in the expression has a datapoint, and a
+ * window with no datapoint in any series yields no value (then TreatMissingData decides).
+ */
+type Series = number | undefined;
+function evaluate(expression: string, vars: Record<string, Series>): Series {
+  const tokens = expression.match(/\s*(>=|[A-Z]+|[a-z_]+|\d+(?:\.\d+)?|[(),*/])/g)?.map((t) => t.trim()) ?? [];
+  if (tokens.join("") !== expression.replace(/\s+/g, "")) throw new Error(`unsupported expression: ${expression}`);
+  let i = 0;
+  const peek = () => tokens[i];
+  const eat = (t?: string) => {
+    const got = tokens[i++];
+    if (t !== undefined && got !== t) throw new Error(`expected ${t}, got ${got}`);
+    return got!;
+  };
+  const anyPresent = Object.values(vars).some((v) => v !== undefined);
+  const primary = (): Series => {
+    const t = eat();
+    if (/^\d/.test(t)) return Number(t);
+    if (t === "IF") {
+      eat("("); const c = comparison(); eat(","); const a = comparison(); eat(","); const b = comparison(); eat(")");
+      return c === undefined ? undefined : c !== 0 ? a : b;
+    }
+    if (t === "FILL") {
+      eat("("); const v = comparison(); eat(","); const fill = Number(eat()); eat(")");
+      return v === undefined && anyPresent ? fill : v;
+    }
+    if (t === "(") { const v = comparison(); eat(")"); return v; }
+    if (/^[a-z_]+$/.test(t)) {
+      if (!(t in vars)) throw new Error(`unknown series ${t}`);
+      return vars[t];
+    }
+    throw new Error(`unsupported token ${t}`);
+  };
+  const product = (): Series => {
+    let v = primary();
+    while (peek() === "*" || peek() === "/") {
+      const op = eat(); const r = primary();
+      v = v === undefined || r === undefined ? undefined : op === "*" ? v * r : v / r;
+    }
+    return v;
+  };
+  const comparison = (): Series => {
+    const l = product();
+    if (peek() !== ">=") return l;
+    eat(); const r = product();
+    return l === undefined || r === undefined ? undefined : l >= r ? 1 : 0;
+  };
+  const out = comparison();
+  if (i !== tokens.length) throw new Error(`trailing tokens in ${expression}`);
+  return out;
+}
+
+describe("session read api outcome alarm: LOCAL evaluation of the synthesized expression and comparison (not CloudWatch)", () => {
+  const [, alarm] = sessionReadApiOutcomeAlarm({ stage: "aws-sessions-prod", names: sessionReadApiNames("aws-sessions-prod"), p: { completeSince: "epoch" } });
+  const expression = alarm.Metrics.find((m) => m.ReturnData) as { Expression: string };
+  /** One window's state for the alarm as configured: its expression, operator, threshold and missing-data rule. */
+  const state = (window: { requests?: number; unavailable?: number }) => {
+    expect(alarm.ComparisonOperator).toBe("GreaterThanThreshold");
+    expect([alarm.EvaluationPeriods, alarm.DatapointsToAlarm]).toEqual([1, 1]);
+    const value = evaluate(expression.Expression, { requests: window.requests, unavailable: window.unavailable });
+    if (value === undefined) return alarm.TreatMissingData === "notBreaching" ? "quiet" : "other";
+    return value > alarm.Threshold ? "breach" : "quiet";
+  };
+
+  it("evaluates the expression the alarm is built with, at the defaults", () => {
+    expect(OUTCOME_ALARM_DEFAULTS).toEqual({ thresholdPercent: 50, windowMinutes: 30, minRequests: 20 });
+    expect(expression.Expression).toBe("IF(FILL(requests, 0) >= 20, 100 * FILL(unavailable, 0) / requests, 0)");
+    expect(alarm.Threshold).toBe(50);
+  });
+
+  it("missing data, 19/19, 10/20 and 11/20 unavailable: quiet, quiet, quiet, breach", () => {
+    // No datapoint in the window at all (no log lines): no value, notBreaching.
+    expect(state({})).toBe("quiet");
+    // Log lines but no replay request (defaultValue 0 on both filters): 0 requests is below the minimum.
+    expect(state({ requests: 0, unavailable: 0 })).toBe("quiet");
+    // Below the minimum volume, however bad.
+    expect(state({ requests: 19, unavailable: 19 })).toBe("quiet");
+    // Exactly the threshold is not "greater than".
+    expect(state({ requests: 20, unavailable: 10 })).toBe("quiet");
+    expect(state({ requests: 20, unavailable: 11 })).toBe("breach");
+  });
+
+  it("edges: the unavailable series missing is 0%, the outage shape breaches, and a configured minimum moves the floor", () => {
+    expect(state({ requests: 100 })).toBe("quiet");
+    expect(state({ requests: 20, unavailable: 20 })).toBe("breach");
+    expect(state({ requests: 1000, unavailable: 990 })).toBe("breach");
+    const [, tuned] = sessionReadApiOutcomeAlarm({ stage: "aws-sessions-prod", names: sessionReadApiNames("aws-sessions-prod"), p: { completeSince: "epoch", outcomeAlarm: { minRequests: 5, thresholdPercent: 25 } } });
+    const e = (tuned.Metrics.find((m) => m.ReturnData) as { Expression: string }).Expression;
+    expect(evaluate(e, { requests: 5, unavailable: 2 })).toBe(40);
+    expect(evaluate(e, { requests: 4, unavailable: 4 })).toBe(0);
+  });
+
+  it("the local evaluator refuses expressions outside its subset", () => {
+    expect(() => evaluate("SUM(METRICS())", { requests: 1 })).toThrow();
+    expect(() => evaluate("IF(requests > 1, 1, 0)", { requests: 1 })).toThrow();
+    expect(() => evaluate("IF(FILL(other, 0) >= 1, 1, 0)", { requests: 1 })).toThrow(/unknown series other/);
   });
 });
