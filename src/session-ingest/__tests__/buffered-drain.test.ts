@@ -1515,8 +1515,11 @@ describe("buffered drain materialization (FULL-seeded index)", () => {
     expect(summary.lines).toMatchObject({ stale: 1, written: 0, materialized: 0 });
     expect(await storedEntry(store, "r")).toEqual([7, "r:r7", sha("r:7"), SESS1, 0, 0]);
     // The admission's bytes are canonical at revision 7, but no staged line carries revision 7's digest, so S3 alone
-    // cannot bind them to it: reported as unproven (a full entry), not counted as superseded.
-    expect(await verify(store)).toMatchObject({ ok: true, exact: 0, superseded_later: 0, winners_digest_unproven: 1 });
+    // cannot bind them to it: non-qualifying (winner_digest_unproven, record-level), distinct from missing or corrupt.
+    const proof = await verify(store);
+    expect(proof).toMatchObject({ ok: false, exact: 0, superseded_later: 0, winners_digest_unproven: 1 });
+    expect(proof.failures).toEqual([{ kind: "winner_digest_unproven", ref: sha(JSON.stringify([TENANT.orgId, TENANT.workspaceId, TENANT.userId, ORIGIN, "r"])) }]);
+    expect(proof.counts).toMatchObject({ missing: 0, mismatch: 0, unrecoverable: 0, winner_unbound: 0 });
     expect((await canonical(store)).get("sess-1")).toEqual(["r@7"]);
   });
 
@@ -1642,6 +1645,20 @@ describe("buffered drain materialization (FULL-seeded index)", () => {
     await stage(store2, [group("claude", "sess-1", [{ id: "m1", rev: 1 }, { id: "m2", rev: 1 }])], { keep: [[0]] });
     await run(store2);
     expect((await verify(store2)).counts.erased_present).toBe(1);
+  });
+
+  test("a bound full-entry winner passes: a staged original with that identity, revision and digest, canonical as is", async () => {
+    const store = await scratch();
+    await fullSlots(store, [{ id: "r", rev: 2 }]);
+    // The S3 path admitted revision 7 (full entry); the same record at revision 7, with that digest, is also staged
+    // (withheld from this stage's custody), so its verified canonical form binds the admission's bytes.
+    await writeGroups({ store, keyRoot: ROOT }, { ...TENANT, originId: ORIGIN, batchDigest: sha("live-7") }, [group("claude", "sess-1", [{ id: "r", rev: 7 }])], new Date(RECEIVED));
+    await seedIndex(store, [{ recordId: "r", revision: 7, revisionId: "r:r7", digest: sha("r:7"), sessionKey: SESS1, epoch: 0, resets: 0 }]);
+    await stage(store, [group("claude", "sess-1", [{ id: "r", rev: 2 }, { id: "r", rev: 7 }])], { keep: [[0]] });
+    await run(store);
+    const proof = await verify(store);
+    expect(proof.failures).toEqual([]);
+    expect(proof).toMatchObject({ ok: true, superseded_later: 1, winners_digest_unproven: 0 });
   });
 
   test("a slot-form winner with canonical bytes at its revision that no staged line binds to its digest is refused", async () => {

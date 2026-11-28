@@ -169,7 +169,7 @@ export function canonicalHolds(canonical: readonly CanonicalLine[] | null, stage
 // ---- verification ----
 
 export type VerifyFailure =
-  | "export_missing" | "missing" | "mismatch" | "index_missing" | "unrecoverable" | "unexpected" | "erased_present" | "baseline_lost" | "undrained" | "marker_invalid" | "no_verdict" | "winner_unbound" | "unreadable";
+  | "export_missing" | "missing" | "mismatch" | "index_missing" | "unrecoverable" | "unexpected" | "erased_present" | "baseline_lost" | "undrained" | "marker_invalid" | "no_verdict" | "winner_unbound" | "winner_digest_unproven" | "unreadable";
 
 export interface VerifyResult {
   ok: boolean;
@@ -181,8 +181,9 @@ export interface VerifyResult {
   index_winners_canonical: number;
   /**
    * Full-entry winners (revision id set: an admission's commit or SQL's record revisions) with a canonical line at their
-   * revision that no staged line binds to their digest. Not a failure: S3 alone cannot recompute a record digest.
-   * A slot-form winner in the same position is `winner_unbound`, a failure.
+   * revision that no staged line binds to their digest (S3 alone cannot recompute a record digest). Each is also a
+   * `winner_digest_unproven` failure: non-qualifying, distinct from missing or corrupt. A slot-form winner in the same
+   * position is `winner_unbound`.
    */
   winners_digest_unproven: number;
   /** Staged lines excluded from the expected set (erased, not kept, not live, pre-reset) and not canonical. */
@@ -423,7 +424,7 @@ export async function snapshotCanonical(opts: Omit<VerifyOptions, "baseline">, d
 export async function verifyDrainMaterialization(opts: VerifyOptions, deps: VerifyDeps): Promise<VerifyResult> {
   const result: VerifyResult = {
     ok: false, exact: 0, superseded_later: 0, index_winners_canonical: 0, winners_digest_unproven: 0, excluded_absent: 0, baseline_preserved: 0,
-    counts: { export_missing: 0, missing: 0, mismatch: 0, index_missing: 0, unrecoverable: 0, unexpected: 0, erased_present: 0, baseline_lost: 0, undrained: 0, marker_invalid: 0, no_verdict: 0, winner_unbound: 0, unreadable: 0 },
+    counts: { export_missing: 0, missing: 0, mismatch: 0, index_missing: 0, unrecoverable: 0, unexpected: 0, erased_present: 0, baseline_lost: 0, undrained: 0, marker_invalid: 0, no_verdict: 0, winner_unbound: 0, winner_digest_unproven: 0, unreadable: 0 },
     failures: [],
   };
   const fail = (kind: VerifyFailure, r: string) => {
@@ -516,8 +517,11 @@ export async function verifyDrainMaterialization(opts: VerifyOptions, deps: Veri
       fail("winner_unbound", ref(rk));
     } else {
       // A full entry (an admission's commit, or ingest_record_revisions) whose bytes no staged line binds: canonical at
-      // its revision, digest unproven from S3 alone. Reported, not judged (see winners_digest_unproven).
+      // its revision, digest unproven from S3 alone. Not missing or corrupt, but not proven either: non-qualifying
+      // (lander 4d7d6dcdb7d7). Live admissions carry no per-record digest evidence on S3 (ledger-s3 BatchDoc), so
+      // every post-marker winner lands here until such evidence exists: an owner limitation, reported as such.
       result.winners_digest_unproven++;
+      fail("winner_digest_unproven", ref(rk));
     }
   }
 
