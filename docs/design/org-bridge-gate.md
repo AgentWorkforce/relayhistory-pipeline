@@ -218,3 +218,19 @@ SQL step and its S3 CAS.
   withdrawn and the consumer falls back to O's create-only per-org marker from G, so S3 stays the writer.
 - Plan a new forward migration after the applied chain and slots are reconciled.
 - R-to-P exclusion stays conditional on W2's sweep accounting for every outstanding effect.
+
+**W2 read-side constraints (sessions-partial-canonical, reader lane T89 8a043736; no blocker claimed).**
+1. Generation fence. The canonical cursor and the post-IO recheck bind `canonicalSourceGeneration`, a hash over
+   pointer rows only. Committed-ness must either be folded into that generation or refuse with
+   `source_generation_changed` (409) when it moves between pages. It must never silently continue.
+2. No subset folds. An uncommitted entry makes the scope incomplete (partial, so the read falls back). It is never
+   dropped, because dropping could serve an older revision of a record whose newer revision is uncommitted.
+3. Grants and SQL. The reader reads as `bulls96_read_api` through `session_index` and `ingest_operator_runtime_erased`
+   only. A commit check needs a new tenant-bound read and grant, a migration, and a role-verify update. An S3-only
+   read of the ledger (batch records and drained markers) avoids the grant but costs IO.
+4. Budget. 3000 ms per request (`READ_API_PARTIAL_CANONICAL_DEADLINE_MS`, max 3500; Cloud's timeout is 4 s). The
+   check must be one batched lookup per scope, never one per chunk.
+5. Operator fence ordering. The authoritative fence verdict comes before the read and after the IO, around any new
+   ledger read, failed reads included. An uncommitted-entry refusal must never become a fallback-eligible 501 for a
+   fenced session.
+6. Unenrolled orgs: add a fixture proving the reader is byte-identical (compatible with the dormant flag).
