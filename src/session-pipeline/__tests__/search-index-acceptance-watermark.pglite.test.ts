@@ -80,8 +80,15 @@ async function rig(lines: Line[] = base()) {
   // What each transaction saw: object reads and ClickHouse calls made while it was open, and whether it took a lock.
   const transactions: Array<{ locked: boolean; reads: number; ch: number }> = [];
   // Runs once, right after the next lock-free transaction commits (the probe's pointer snapshot): a racing writer.
-  const race: { afterProbe?: () => Promise<unknown> } = {};
+  // `beforeLocked` runs once, right before the pass's SECOND transaction opens: the probe has finished every read
+  // (stamp, pointer snapshot, manifests, added chunks) and the locked pass has not started. A parked pass.
+  const race: { afterProbe?: () => Promise<unknown>; beforeLocked?: () => Promise<unknown> } = {};
   const transact: SearchIndexDeps["transact"] = async (work) => {
+    if (transactions.length === 1 && race.beforeLocked) {
+      const run = race.beforeLocked;
+      race.beforeLocked = undefined;
+      await run();
+    }
     const reads = r.reads.count, ch = r.fake.calls.length, sql = r.sql.length;
     let locked = false;
     try {
@@ -397,7 +404,14 @@ describe("what never holds", () => {
     expect(reconciled.some((l) => l.reason === ACCEPTANCE_MISSING)).toBe(true);
     expect(r.reads.count - reads).toBeGreaterThan(0);
     expect(latest().w!.manifests).toHaveLength(cached + 1);
-  }, 120_000);
+    // Cached versus fresh: the same content on a rig that never cached anything, both flags off, the same
+    // synthetic delivery. Both refuse for acceptance (the new machine brought no seat) and index the same rows.
+    const fresh = await rig([...generate(8), ...appended(4), ...contenders(), ...joined]);
+    const freshLines = (await captureLogs(() => realHandler(fresh.r.consumer({ ch: fresh.state.ch }))(fresh.r.messages))).lines.filter((l) => l.message === "search index reconciled");
+    expect(freshLines.at(-1)).toMatchObject({ ok: false, reason: ACCEPTANCE_MISSING });
+    expect(reconciled.at(-1)).toMatchObject({ ok: false, reason: ACCEPTANCE_MISSING });
+    expect(r.fake.dump()).toEqual(fresh.r.fake.dump());
+  }, 240_000);
 
   test("an unverifiable chunk prefix: an EARLIER chunk rewritten, or a stored chain that does not match, runs the ordinary pass", async () => {
     const { x, state, pass, pointers, stamps, latest } = await rig();
@@ -664,6 +678,60 @@ describe("a manifest replaced with accepted content at the SAME revision, pointe
     expect(skipAlone.reconciled).toMatchObject({ ok: false, reason: HELD_REASONS.join(",") });
     expect(skipAlone.chunkReads).toBe(0);
     expect(skipAlone.index).not.toEqual(fresh.index);
+  }, 240_000);
+});
+
+describe("a manifest replaced while a pass is parked between its probe and its lock", () => {
+  test("same revision, pointer rows fixed: the parked pass holds and writes no index row; the replacement's own (synthetic) delivery reads in full; index and stamp equal fresh", async () => {
+    const { x, r, state, pass, pointers, stamps, race } = await rig();
+    await pass();
+    // A new unaccepted revision, so the next pass probes for a hold.
+    await publish(x, [...generate(8), ...appended(12), ...contenders()]);
+    await pointers();
+    const rows = async () => JSON.stringify((await r.db.pg.query(
+      "SELECT manifest_key, revision::text AS revision, encode(content_sha256, 'hex') AS sha, manifest_etag FROM sessions.session_index ORDER BY manifest_key")).rows);
+    const pointersBefore = await rows();
+    const indexBefore = r.fake.dump();
+    let replaced = 0;
+    // Parked after the probe: both contenders' manifests are replaced with the accepted content at their
+    // CURRENT revision. No pointer stage runs, so the rows cannot move.
+    race.beforeLocked = async () => {
+      const prior = new Map<string, number>();
+      for (const k of x.keys) prior.set(k, (await x.reader.read(k))!.manifest.revision);
+      await publish(x, [...generate(8), ...appended(12), ...contenders(true)]);
+      for (const k of x.keys) {
+        const now = (await x.reader.read(k))!.manifest;
+        if (now.revision === prior.get(k)) continue;
+        await x.store.put(objectKey(k as never), new TextEncoder().encode(JSON.stringify({ ...now, revision: prior.get(k) })), { contentType: "application/json" });
+        replaced += 1;
+      }
+    };
+    const parked = await pass();
+    expect(replaced).toBe(2);
+    expect(await rows()).toBe(pointersBefore);
+    // The first pass: it proved the refusal for what it read, so it returns it. It publishes nothing.
+    expect(parked.result).toMatchObject({ complete: false, skippedBeforeRead: true, reasons: HELD_REASONS });
+    expect(parked.result.acceptanceHold).toBeDefined();
+    expect(parked.result.inserted).toBe(0);
+    expect(parked.result.deleted).toBe(0);
+    expect(r.fake.dump()).toEqual(indexBefore);
+    expect(sqlWrites(parked.statements)).toEqual([]);
+    // The replacement's own manifest events (synthetic delivery into the real handler). The pointer stage sees
+    // the same revisions and moves nothing; the search stage finds the manifests are not the stamped ones.
+    const { result, lines } = await captureLogs(() => realHandler(r.consumer({ ch: state.ch, ...ON }))(r.messages));
+    expect(result).toEqual({ batchItemFailures: [] });
+    expect(await rows()).toBe(pointersBefore);
+    const reconciled = lines.filter((l) => l.message === "search index reconciled").at(-1)!;
+    expect(reconciled).toMatchObject({ ok: true });
+    expect(reconciled.acceptance_hold).toBeUndefined();
+    expect(reconciled.acceptance_stamp).toBeUndefined();
+    expect(stamps().at(-1)!.value).toBe("");
+    // Fresh evaluation of the same final content, both flags off, a rig that never cached anything.
+    const fresh = await rig([...generate(8), ...appended(12), ...contenders(true)]);
+    expect((await fresh.pass({})).result).toMatchObject({ complete: true, reasons: [] });
+    expect(r.fake.dump().length).toBeGreaterThan(0);
+    expect(r.fake.dump()).toEqual(fresh.r.fake.dump());
+    expect(fresh.stamps()).toEqual([]);
   }, 240_000);
 });
 
