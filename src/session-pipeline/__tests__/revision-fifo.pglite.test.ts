@@ -49,9 +49,13 @@ async function rig() {
   const index = new Map<string, string[]>();
   const passes: string[] = [];
   let busy = 0;
+  /** Set by a test: runs inside the next search pass, before it reads, once (park a pass). */
+  const hold: { inPass?: () => Promise<void>; crash?: boolean } = {};
   const sid = (s: SessionScope) => [s.orgId, s.workspaceId, s.harness, s.sessionId].join("/");
   const searchScope = async (scope: SessionScope): Promise<SearchIndexResult> => {
     passes.push(sid(scope));
+    if (hold.inPass) { const h = hold.inPass; hold.inPass = undefined; await h(); }
+    if (hold.crash) { hold.crash = false; throw Object.assign(new Error("synthetic crash"), { code: "synthetic_crash" }); }
     if (busy > 0) { busy -= 1; return { manifests: 0, rows: 0, inserted: 0, deleted: 0, complete: false, busy: true, reasons: ["scope_busy"] }; }
     const live = await r.pg.query<{ manifest_key: string }>(
       "SELECT manifest_key FROM sessions.session_index WHERE org_id=$1 AND workspace_id=$2 AND harness=$3 AND session_id=$4 AND deleted_at IS NULL",
@@ -92,7 +96,7 @@ async function rig() {
     return { key, revision, etag: await etagOf(key), committedAt, initial: revision === 1, source: "writer" };
   };
   const run = (records: SqsRecord[]) => logged(() => dispatchSqsBatch(records, deps(), wiring));
-  return { r, index, passes, visibility, record, writer, run, makeBusy: (k: number) => { busy = k; }, sid: sid({ orgId: "org_1", workspaceId: "ws_1", harness: "claude", sessionId: "sess_1" }) };
+  return { r, index, passes, visibility, record, writer, run, hold, makeBusy: (k: number) => { busy = k; }, sid: sid({ orgId: "org_1", workspaceId: "ws_1", harness: "claude", sessionId: "sess_1" }) };
 }
 
 const named = (lines: Record<string, unknown>[], msg: string) => lines.filter((l) => l.msg === msg || l.message === msg);
@@ -228,6 +232,48 @@ describe("trailing superseded batches (ceil(n/10) passes) skip the search pass",
     // An unstamped event (a reconcile body without stamps) always runs.
     await t.run([t.record({ key: events[0]!.key, source: "reconcile" })]);
     expect(t.passes.length).toBe(2);
+  });
+});
+
+describe("in-flight pass: park it, commit a newer revision, then crash or lose the ack", () => {
+  test("crash: the parked pass fails, SQS redelivers in order with the newer arrival, the newest live state becomes searchable", async () => {
+    const t = await rig();
+    const e1 = await t.writer(1, "r1");
+    let e2!: RevisionEvent;
+    const m1 = t.record(e1);
+    // Park pass 1 inside the search stage; while parked, revision 2 commits. Then pass 1 crashes.
+    t.hold.inPass = async () => { e2 = await t.writer(2, "r2"); };
+    t.hold.crash = true;
+    const first = await t.run([m1]);
+    expect(first.result.batchItemFailures).toEqual([{ itemIdentifier: m1.messageId }]);
+    expect(t.index.get(t.sid)).toBeUndefined();
+    // Redelivery: m1 again (receive 2), then revision 2's own message, in group order.
+    const again = await t.run([{ ...m1, attributes: { ...m1.attributes!, ApproximateReceiveCount: "2" } }, t.record(e2)]);
+    expect(again.result).toEqual({ batchItemFailures: [] });
+    expect(t.index.get(t.sid)).toEqual(["r2"]);
+    expect(named(again.lines, "revision superseded")).toEqual([expect.objectContaining({ revision: 1, superseded_by_revision: 2 })]);
+    expect(named(again.lines, "revision searchable")).toEqual([expect.objectContaining({ revision: 2, upload_kind: "append" })]);
+  });
+
+  test("lost ack: the parked pass succeeds on what was live when it read, its delete is lost, the redelivery with the newer arrival converges on the newest", async () => {
+    const t = await rig();
+    const e1 = await t.writer(1, "r1");
+    let e2!: RevisionEvent;
+    const m1 = t.record(e1);
+    // Pass 1 reads and indexes revision 1; revision 2 commits after that read.
+    const first = await t.run([m1]);
+    expect(first.result).toEqual({ batchItemFailures: [] });
+    expect(t.index.get(t.sid)).toEqual(["r1"]);
+    e2 = await t.writer(2, "r2");
+    // The ack (DeleteMessage) was lost: SQS redelivers m1 after its visibility timeout, now behind nothing, with revision 2's message.
+    const again = await t.run([{ ...m1, attributes: { ...m1.attributes!, ApproximateReceiveCount: "2" } }, t.record(e2)]);
+    expect(again.result).toEqual({ batchItemFailures: [] });
+    expect(t.index.get(t.sid)).toEqual(["r2"]);
+    // Redelivered alone after that (a second lost ack): superseded-only, no pass, nothing older exposed.
+    const passes = t.passes.length;
+    await t.run([{ ...m1, attributes: { ...m1.attributes!, ApproximateReceiveCount: "3" } }]);
+    expect(t.passes.length).toBe(passes);
+    expect(t.index.get(t.sid)).toEqual(["r2"]);
   });
 });
 
