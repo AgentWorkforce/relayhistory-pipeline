@@ -45,6 +45,7 @@ class Sim {
   /** The consumed identity per harness:machine (it survives completion). */
   consumedIds = new Map<string, BriefCommitIdentity>();
   armedRefs(harness: string): Set<string> { return new Set([...(this.rows.get(harness)?.armed.values() ?? [])].map((x) => x.ref)); }
+  endedRefs(harness: string): Set<string> { return new Set([...(this.rows.get(harness)?.armed.values() ?? [])].filter((x) => x.id.ended).map((x) => x.ref)); }
   /** The rekey DELETE of a session_index row: the arm record for that machine is erased with it (a recreate starts fresh). */
   deleteRow(harness: string, machine = M1) {
     this.rows.get(harness)?.armed.delete(machine);
@@ -107,7 +108,7 @@ class Sim {
     for (const [harness, row] of [...this.rows]) {
       if (!hintCovers(h, { org: "org-1", workspace: "ws-1", harness, session: "sess-1" })) continue;
       const b = this.brief(harness);
-      const next = planHint(row.state, h, { nowMs: this.now, hasBrief: b.ready, timing: TIMING, armedRefs: this.armedRefs(harness) });
+      const next = planHint(row.state, h, { nowMs: this.now, hasBrief: b.ready, timing: TIMING, armedRefs: this.armedRefs(harness), endedRefs: this.endedRefs(harness) });
       if (next) row.state = next;
       if (row.state.leased) continue; // in flight: the generation decides the trailing work
       const at = this.claimable(harness, row.state);
@@ -235,7 +236,7 @@ describe("session-brief trigger: hint contract", () => {
 
 describe("session-brief trigger: due and claim eligibility", () => {
   test("a hint is monotone: never later, never pending_since or the generation, never creates a row", () => {
-    const ctx = { nowMs: T0 + 30_000, hasBrief: true, timing: TIMING, armedRefs: new Set([hint("end", 1, T0).trigger_id]) };
+    const ctx = { nowMs: T0 + 30_000, hasBrief: true, timing: TIMING, armedRefs: new Set([hint("end", 1, T0).trigger_id]), endedRefs: new Set([hint("end", 1, T0).trigger_id]) };
     expect(planHint(null, hint("append", 1, T0), ctx)).toBeNull();
     const armed = planArm(null, T0, true, TIMING);
     expect(armed.dueAt).toBe(T0 + 600_000);
@@ -251,7 +252,7 @@ describe("session-brief trigger: due and claim eligibility", () => {
   test("first brief: due within N, an end makes it due now, later evidence never pushes it back, never throttled", () => {
     const armed = planArm(null, T0, false, TIMING);
     expect(armed.dueAt).toBe(T0 + 8_000);
-    expect(planHint(armed, hint("end", 1, T0), { nowMs: T0 + 2_000, hasBrief: false, timing: TIMING, armedRefs: new Set([hint("end", 1, T0).trigger_id]) })!.dueAt).toBe(T0 + 2_000);
+    expect(planHint(armed, hint("end", 1, T0), { nowMs: T0 + 2_000, hasBrief: false, timing: TIMING, armedRefs: new Set([hint("end", 1, T0).trigger_id]), endedRefs: new Set([hint("end", 1, T0).trigger_id]) })!.dueAt).toBe(T0 + 2_000);
     expect(planArm(armed, T0 + 5_000, false, TIMING).dueAt).toBe(T0 + 8_000);
     expect(claimAt(armed, { hasBrief: false, lastAttemptMs: T0 - 1_000, throttleSeconds: THROTTLE_S })).toBe(T0 + 8_000);
   });
@@ -449,7 +450,7 @@ describe("session-brief trigger: offline fixtures", () => {
     const blocked = sim.commit("claude", 5, { lose: true, manifestKey: "other", digest: "b".repeat(64) });
     expect(sim.armedRefs("claude").has(blocked.trigger_id)).toBe(false);
     sim.deleteRow("claude"); // the rekey DELETE: the row and its arm record go
-    const B = sim.commit("claude", 5, { lose: true, manifestKey: "recreated", digest: "b".repeat(64) }); // recreated at 5
+    const B = sim.commit("claude", 5, { lose: true, kind: "end", manifestKey: "recreated", digest: "b".repeat(64) }); // recreated at 5, ended
     expect(B.trigger_id).not.toBe(A.trigger_id);
     const armed = { ...sim.rows.get("claude")!.state };
     sim.consume({ ...A, kind: "end" }); // an end naming the CONSUMED A: wake-only, nothing advanced
@@ -465,7 +466,7 @@ describe("session-brief trigger: offline fixtures", () => {
     const A = sim.commit("claude", 2, { lose: true, digest: "a".repeat(64) }); // A: revision 2, digest A (not consumed)
     sim.now += 30_000;
     sim.deleteRow("claude"); // the only way a same-revision replacement is committed: the row is deleted and recreated
-    const B = sim.commit("claude", 2, { lose: true, manifestKey: "recreated", digest: "b".repeat(64) }); // B at rev 2
+    const B = sim.commit("claude", 2, { lose: true, kind: "end", manifestKey: "recreated", digest: "b".repeat(64) }); // B at rev 2, ended
     const armed = { ...sim.rows.get("claude")!.state };
     expect(sim.armedRefs("claude").has(A.trigger_id)).toBe(false); // A's identity was retired by the replacement
     sim.now += 10_000;
@@ -502,11 +503,28 @@ describe("session-brief trigger: offline fixtures", () => {
     expect(sim.rows.get("claude")!.state).toEqual(armed);
   });
 
+  test("an append's reference presented as an end does not accelerate: that needs a persisted current ended=true", () => {
+    const sim = new Sim();
+    sim.briefs.set("claude", { revision: 1, ready: true, lastAttempt: T0 - 600_000 });
+    const append = sim.commit("claude", 2, { lose: true }); // armed, ended=false (persisted)
+    const armed = { ...sim.rows.get("claude")!.state };
+    sim.now += 10_000;
+    sim.consume({ ...append, kind: "end" }); // the same (kind-independent) reference, claimed to be an end
+    expect(sim.rows.get("claude")!.state.dueAt).toBe(armed.dueAt); // append eligibility only: due stays +600 s
+    expect(sim.runs).toHaveLength(0);
+    // The end commit (a new revision with ended=true, persisted on the arm record) is what accelerates.
+    const end = sim.commit("claude", 3, { lose: true, kind: "end" });
+    expect(sim.endedRefs("claude").has(end.trigger_id)).toBe(true);
+    sim.consume(end);
+    expect(sim.runs).toHaveLength(1);
+    expect(sim.runs[0]!.claimedAt).toBe(sim.now);
+  });
+
   test("a confirmed current end accelerates even when another machine shares its numeric revision", () => {
     const sim = new Sim();
     sim.briefs.set("claude", { revision: 1, ready: true, lastAttempt: T0 - 600_000 });
     sim.commit("claude", 2, { lose: true, machine: M2, digest: "c".repeat(64) }); // M2 also at revision 2
-    const m1 = sim.commit("claude", 2, { lose: true, machine: M1 });
+    const m1 = sim.commit("claude", 2, { lose: true, kind: "end", machine: M1 });
     sim.now += 10_000;
     sim.consume({ ...m1, kind: "end" }); // M1's current end
     expect(sim.runs).toHaveLength(1);
@@ -539,7 +557,7 @@ describe("session-brief trigger: offline fixtures", () => {
     sim.now = sim.rows.get("claude")!.state.dueAt;
     sim.claim("claude"); // M1's revision 5 consumed
     sim.now += 300_000;
-    const m2 = sim.commit("claude", 5, { lose: true, machine: M2 }); // M2's revision 5 (different content, same number)
+    const m2 = sim.commit("claude", 5, { lose: true, kind: "end", machine: M2 }); // M2's revision 5 (different content, same number), ended
     expect(m2.trigger_id).not.toBe(m1.trigger_id);
     expect(sim.armedRefs("claude").has(m2.trigger_id)).toBe(true);
     // The max brief_revision (5) would wrongly call M2 covered; the reference does not: M2's end advances.
@@ -655,7 +673,7 @@ describe("session-brief trigger: offline fixtures", () => {
   test("two harnesses share a session, E2 (a confirmed end at revision 2) in only one: only that one is ended", () => {
     const sim = new Sim();
     for (const h of ["claude", "codex"]) sim.briefs.set(h, { revision: 1, ready: true, lastAttempt: T0 - 600_000 });
-    sim.commit("claude", 2, { lose: true });
+    sim.commit("claude", 2, { lose: true, kind: "end" }); // E2: claude's session ended (persisted)
     sim.commit("codex", 2, { lose: true });
     const codexBefore = { ...sim.rows.get("codex")!.state };
     sim.now += 10_000;
@@ -671,8 +689,8 @@ describe("session-brief trigger: offline fixtures", () => {
   test("the same session id in two harnesses: v2 wakes only its own; v1 wakes both; coverage is per harness", () => {
     const sim = new Sim();
     for (const h of ["claude", "codex"]) sim.briefs.set(h, { revision: 0, ready: true, lastAttempt: T0 - 600_000 });
-    sim.commit("claude", 1, { lose: true });
-    sim.commit("codex", 1, { lose: true });
+    sim.commit("claude", 1, { lose: true, kind: "end" });
+    sim.commit("codex", 1, { lose: true, kind: "end" });
     sim.now += 10_000;
     sim.consume(hint("end", 1, T0, "claude")); // v2: claude only
     expect(sim.runs.map((r) => r.harness)).toEqual(["claude"]);
@@ -682,7 +700,7 @@ describe("session-brief trigger: offline fixtures", () => {
     expect(sim.runs.map((r) => r.harness)).toEqual(["claude"]);
     sim.consume(hint("end", 1, T0, "codex")); // the confirmed (v2) end for codex
     expect(sim.runs.map((r) => r.harness)).toEqual(["claude", "codex"]);
-    sim.commit("codex", 2, { lose: true });
+    sim.commit("codex", 2, { lose: true, kind: "end" });
     sim.now += 10_000;
     sim.consume(v1(hint("end", 1, T0, "claude"))); // a revision-1 hint is covered for codex too
     expect(sim.runs).toHaveLength(2);
@@ -741,12 +759,12 @@ describe("session-brief trigger: durable commit identity (design r2)", () => {
   test("standalone end eligibility: a confirmed first end is due now; with a brief, coalescing is skipped and the throttle applies", () => {
     // First brief: a confirmed (v2) end makes the armed row due now, never throttled.
     const first = planArm(null, T0, false, TIMING);
-    const firstEnd = planHint(first, hint("end", 1, T0), { nowMs: T0 + 1_000, hasBrief: false, timing: TIMING, armedRefs: new Set([hint("end", 1, T0).trigger_id]) })!;
+    const firstEnd = planHint(first, hint("end", 1, T0), { nowMs: T0 + 1_000, hasBrief: false, timing: TIMING, armedRefs: new Set([hint("end", 1, T0).trigger_id]), endedRefs: new Set([hint("end", 1, T0).trigger_id]) })!;
     expect(firstEnd.dueAt).toBe(T0 + 1_000);
     expect(claimAt(firstEnd, { hasBrief: false, lastAttemptMs: T0, throttleSeconds: THROTTLE_S })).toBe(T0 + 1_000);
     // Existing brief: the end removes the coalescing (idle) wait, but the refresh throttle still applies.
     const refresh = planArm(null, T0, true, TIMING);
-    const refreshEnd = planHint(refresh, hint("end", 2, T0), { nowMs: T0 + 1_000, hasBrief: true, timing: TIMING, armedRefs: new Set([hint("end", 2, T0).trigger_id]) })!;
+    const refreshEnd = planHint(refresh, hint("end", 2, T0), { nowMs: T0 + 1_000, hasBrief: true, timing: TIMING, armedRefs: new Set([hint("end", 2, T0).trigger_id]), endedRefs: new Set([hint("end", 2, T0).trigger_id]) })!;
     expect(refreshEnd.dueAt).toBe(T0 + 1_000);
     expect(claimAt(refreshEnd, { hasBrief: true, lastAttemptMs: T0 - 30_000, throttleSeconds: THROTTLE_S })).toBe(T0 - 30_000 + THROTTLE_S * 1_000);
   });

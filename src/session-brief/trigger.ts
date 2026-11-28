@@ -213,6 +213,12 @@ export interface BriefHintContext {
    * the max brief_revision alone (Pipeline item 8).
    */
   armedRefs?: ReadonlySet<string>;
+  /**
+   * The subset of armedRefs whose PERSISTED current identity is ended (the arm record's ended=true). Only an end whose
+   * reference is here accelerates: an append's reference presented as an end (the reference is kind-independent) gets
+   * ordinary append eligibility.
+   */
+  endedRefs?: ReadonlySet<string>;
   timing: BriefTriggerTiming;
 }
 
@@ -228,8 +234,9 @@ export function planHint(prev: BriefWakeState | null, hint: BriefWakeHint, ctx: 
   if (hint.kind === "sweep") return null;
   // Only a v2 hint whose reference resolves to work armed on THIS row advances it; anything else is wake-only.
   if (hint.v !== 2 || !ctx.armedRefs?.has(hint.trigger_id)) return null;
-  // Only a v2 end is a confirmed end of THIS harness's session; a v1 end is ambiguous and wakes like an append.
-  const ended = hint.kind === "end" && hint.v === 2;
+  // Only a v2 end naming a persisted current ended identity is a confirmed end; a v1 end is ambiguous, and an append's
+  // reference presented as an end is not an end: both get append eligibility.
+  const ended = hint.kind === "end" && hint.v === 2 && ctx.endedRefs?.has(hint.trigger_id) === true;
   const t = ctx.timing;
   const firstBound = prev.pendingSince + secs(t.maxDelaySeconds);
   const eligible = !ctx.hasBrief
