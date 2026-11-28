@@ -42,6 +42,10 @@ const CASES = [
   "a text DEFAULT ')', b integer DEFAULT 1",
   "a text DEFAULT '(', b integer DEFAULT 1",
   "a text DEFAULT $$)$$, b integer DEFAULT 1",
+  // A double-quoted parameter name holding ')' also ends the balanced-paren scan early; the quotes are removed before
+  // normalizing, so the truncated remainder must still name no catalogue signature.
+  '"a)" text, b integer DEFAULT 1',
+  '"text" text, b integer DEFAULT 1',
   "a text DEFAULT '/*', b integer DEFAULT 1",
   "a text DEFAULT 'x', b integer DEFAULT (1)",
   "a text, b integer DEFAULT 1, c jsonb DEFAULT '{}'::jsonb",
