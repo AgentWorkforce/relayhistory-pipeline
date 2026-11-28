@@ -130,16 +130,32 @@ export function deriveState(sessions: readonly SessionFacts[], forgeIn: ForgeFac
   // Every forge fact counts only with a time strictly before the cut: a commit the mirror holds from later never
   // makes a feature a forge decision, even off the default branch.
   const commits = forge.commits.filter((c) => c.at < asOf && (shas.has(c.sha) || [...shas].some((s) => c.sha.startsWith(s) || s.startsWith(c.sha))));
-  const prs = forge.prs.filter((p) => prUrls.has(p.ref.toLowerCase()) && p.at < asOf);
   const branchNames = new Set(sessions.flatMap((s) => s.keys.branches));
   // A branch counts only for work near or after the feature's first session: a branch cut from main and pushed
   // with no commits of its own is an ancestor of main at an older tip, which is not this feature landing. The
   // lead allows for work committed before the first session the corpus holds (a zero lead cut shipped 69 -> 19
   // on the first corpus, nearly all of them real landings; seven days keeps 52).
   const firstStart = sessions.map((s) => s.startedAt).sort(textCompare)[0] ?? asOf;
-  const branches = (forge.branches ?? []).filter((b) => branchNames.has(b.name) && b.tipAt < asOf && b.tipAt >= new Date(Date.parse(firstStart) - BRANCH_LEAD_MS).toISOString());
+  const lead = new Date(Date.parse(firstStart) - BRANCH_LEAD_MS).toISOString();
+  const branches = (forge.branches ?? []).filter((b) => branchNames.has(b.name) && b.tipAt < asOf && b.tipAt >= lead);
+  // The feature's pull requests, each opened before the cut: one a session created; one whose head branch is the
+  // feature's branch, opened within the same lead (a head branch is deleted on merge, so the live branches above
+  // rarely hold it, and a reused name from older work is not this feature); or one merged before the cut holding a
+  // commit a session made or pushed (prefix of at least 7 characters). A PR's commit list is fixed when it merges, so
+  // only a merge known before the cut says it held the commit then. Mentioned PRs alone never count.
+  const ownShas = [...shas].filter((s) => s.length >= 7);
+  const defaultBranch = forge.defaultBranch ?? "main";
+  const prs = forge.prs.filter((p) => p.at < asOf && (prUrls.has(p.ref.toLowerCase())
+    || (!!p.branch && branchNames.has(p.branch) && p.at >= lead)
+    || (p.state === "merged" && !!p.mergedAt && p.mergedAt < asOf && (p.commits ?? []).some((c) => ownShas.some((s) => c.startsWith(s))))));
+  // A merged PR landed when its merge commit reached the default branch (`landedAt`; null: not yet), which for a
+  // PR into a trunk or release branch is the later merge that brought it in. With no `landedAt`, a PR into another
+  // base has no known landing (its trunk merge is not a shipment); one into the default branch, or from a forge
+  // that records no base, landed at `mergedAt`.
+  const prLanding = (p: (typeof prs)[number]) => (p.state !== "merged" ? null : p.landedAt !== undefined ? p.landedAt
+    : p.base && p.base !== defaultBranch ? null : p.mergedAt ?? null);
   const merges: Transition[] = [
-    ...prs.filter((p) => p.state === "merged" && p.mergedAt && p.mergedAt < asOf).map((p) => ({ at: p.mergedAt!, what: `merged ${p.ref.replace("https://github.com/", "")}` })),
+    ...prs.flatMap((p) => { const at = prLanding(p); return at && at < asOf ? [{ at, what: `merged ${p.ref.replace("https://github.com/", "")}${p.base && p.base !== defaultBranch ? ` into ${p.base}, on ${defaultBranch}` : ""}` }] : []; }),
     // Every landing of a commit's patch known before the cut (a re-landing after a revert restores it).
     ...commits.flatMap((c) => landingsOf(c)).filter((l) => l.at < asOf),
     ...branches.filter((b) => b.landed && b.landedAt && b.landedAt < asOf).map((b) => ({ at: b.landedAt!, ...(b.landedSeq !== undefined ? { seq: b.landedSeq } : {}), ...(b.landedStep !== undefined ? { step: b.landedStep } : {}), ...(b.landedUnorderedWith?.length ? { unorderedWith: b.landedUnorderedWith } : {}), what: `branch ${b.name} landed` })),
@@ -167,6 +183,10 @@ export function deriveState(sessions: readonly SessionFacts[], forgeIn: ForgeFac
     }
     // Closed as of the cut: a close known to precede it. A PR closed later, or at an unknown time, was still open.
     if (prs.length && prs.every((p) => p.state === "closed" && p.closedAt && p.closedAt < asOf)) return { state: "abandoned", basis: "forge", reason: "every pull request closed without merging" };
+    // Merged into its base before the cut, not yet on the default branch (a trunk awaiting its merge train): work
+    // handed on, not dropped, however long since the session's last activity.
+    const waiting = prs.find((p) => p.state === "merged" && p.base && p.base !== defaultBranch && p.mergedAt && p.mergedAt < asOf);
+    if (waiting) return { state: "in_progress", basis: "forge", reason: `merged ${waiting.ref.replace("https://github.com/", "")} into ${waiting.base}, ${waiting.landedAt === undefined ? `no dated landing on ${defaultBranch}` : `not yet on ${defaultBranch}`}` };
     if (stale) return { state: "abandoned", basis: "forge", reason: `no merge and no activity since ${lastActivity}` };
     return { state: "in_progress", basis: "forge", reason: "commits or an open pull request, not merged" };
   }
@@ -223,7 +243,14 @@ export function buildFeatures(all: readonly SessionFacts[], options: BuildOption
   const forge = utcForge(options.forge ?? EMPTY_FORGE);
   options = { ...options, asOf: requireCut(options.asOf, "asOf") };
   const facts = all.map((f) => factsAsOf(f, options.asOf)).filter((f): f is SessionFacts => f !== null).map((f) => withoutBaseCommits(f, forge)).map((f) => withCommitBranches(f, forge, options.asOf));
-  const { groups, links } = linkSessions(facts, options.link ?? DEFAULT_LINK_PARAMS);
+  const { groups: linked, links } = linkSessions(facts, options.link ?? DEFAULT_LINK_PARAMS);
+  // A feature is founded by work: a group of approval assessors alone is review with no work it can name, and in
+  // a mixed group the earliest working session founds it (the assessors stay as contributing sessions).
+  const works = (s: SessionFacts) => s.role !== "approval_assessor";
+  // An assessor's own analysis is of the review it ran (the action it judged, its verdict), not of the human's
+  // request or the work: it contributes its sessions and link keys only, never asks, claims, gaps or outcomes.
+  const asContributor = (s: SessionFacts): SessionFacts => (works(s) ? s : { ...s, asked: [], built: [], gaps: [], rationale: [], outcomeStatuses: [] });
+  const groups = linked.filter((g) => g.some(works)).map((g) => { const i = g.findIndex(works); return (i === 0 ? g : [g[i]!, ...g.slice(0, i), ...g.slice(i + 1)]).map(asContributor); });
   return groups.map((sessions) => {
     const founding = sessions[0]!;
     const keys = new Set(sessions.map((s) => sessionKeyString(s)));
