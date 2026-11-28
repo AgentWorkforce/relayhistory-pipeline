@@ -468,7 +468,27 @@ describe("first indexed appearance of superseded uploads ('revision covered' / '
     const skipped = async () => ({ manifests: 1, rows: 0, inserted: 0, deleted: 0, complete: true, skipped: true, reasons: ["already_current"] });
     const { lines } = await logged(() => dispatchSqsBatch([t.record(e1), t.record(e2)], { ...t.depsOf(), searchScope: skipped as never }, t.wiring));
     expect(named(lines, "revision covered")).toEqual([]);
-    expect(named(lines, "revision unobserved")).toEqual([expect.objectContaining({ revision: 1, reason: "coverage_unproven" })]);
+    // The live upload is not credited either: a skip proves no exact upload (Pipeline review of ac5132c3).
+    expect(named(lines, "revision searchable")).toEqual([]);
+    expect(named(lines, "revision unobserved").map((l) => [l.revision, l.reason]).sort()).toEqual([[1, "coverage_unproven"], [2, "coverage_unproven"]]);
+  });
+
+  test("Pipeline review of ac5132c3: a pass that pre-READ the manifests and then returned skipped (a later pass made the scope current first) earns NO credit from those unapplied reads", async () => {
+    const t = await rig();
+    const e1 = await t.writer(1, "r1", loc, new Date(T0 + 100).toISOString(), undefined, true);
+    const e2 = await t.writer(2, "r2", loc, new Date(T0 + 200).toISOString(), undefined, true);
+    const e3 = await t.writer(3, "r3", loc, new Date(T0 + 300).toISOString(), undefined, true);
+    // The pre-read capture reads every live manifest (recorded as evidence), then the apply finds the scope already
+    // current (another pass completed in between) and returns skipped.
+    const preReadThenSkipped = async (_scope: unknown, d: { reader?: { read(k: string): Promise<unknown> }; onAttempt?: () => void }) => {
+      d.onAttempt?.();
+      await d.reader!.read(e3.key);
+      return { manifests: 1, rows: 0, inserted: 0, deleted: 0, complete: true, skipped: true, reasons: ["already_current"] };
+    };
+    const { lines } = await logged(() => dispatchSqsBatch([t.record(e1), t.record(e2), t.record(e3)], { ...t.depsOf(), searchScope: preReadThenSkipped as never }, t.wiring));
+    expect(named(lines, "revision covered")).toEqual([]);
+    expect(named(lines, "revision searchable")).toEqual([]);
+    expect(named(lines, "revision unobserved").map((l) => [l.revision, l.reason]).sort()).toEqual([[1, "coverage_unproven"], [2, "coverage_unproven"], [3, "coverage_unproven"]]);
   });
 
   test("a superseded-only batch (skipped) reports its events as unobserved: covered_by_earlier_pass", async () => {

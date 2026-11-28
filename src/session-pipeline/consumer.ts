@@ -294,11 +294,12 @@ export async function processBatch(records: readonly QueueRecord[], deps: Consum
             stage: "search-index", org_id: scope.orgId, workspace_id: scope.workspaceId, harness: scope.harness, session_id: scope.sessionId,
             reason: result.reasons.join(","), ...phaseFields(), ...passFields(messageIds, recordOf, now), duration_ms: Date.now() - started,
           });
-          // Skipped: the pass read nothing. The live upload is credited only on PHYSICAL proof that the indexed pointer
-          // rows are this very object (the stored manifest_etag equals the live ETag); otherwise coverage_unproven.
-          logSearchable(scope, revisions, now, pickedUpAt, passStartedAt, true, () => physicallyCurrent === true);
-          // Skipped: this pass read nothing, so it proves no input; superseded uploads are unobserved (coverage_unproven).
-          logCovered(scope, revisions, now, pickedUpAt, passStartedAt, searchRead);
+          // Skipped: nothing this pass read was APPLIED. A pre-read capture may have read manifests before a later pass
+          // made the scope current, so every recorded read is ignored (Pipeline review of ac5132c3), and a pre-search ETag
+          // sample (physical currency) does not prove the exact upload either: live and superseded uploads alike are
+          // unobserved (coverage_unproven), never credited.
+          logSearchable(scope, revisions, now, pickedUpAt, passStartedAt, true, () => false);
+          logCovered(scope, revisions, now, pickedUpAt, passStartedAt, new Map());
           continue;
         }
         if (result.deferred) {
