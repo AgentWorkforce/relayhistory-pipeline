@@ -173,29 +173,48 @@ export const fenceAuthorityStopKey = (keyRoot: string) => `${keyRoot}/.ledger/fe
 /** The stop marker: `{"v":1,"stop":"all","writtenAtMs":<ms>}`. A present but invalid one refuses too (fail closed). */
 export interface FenceAuthorityStopDoc { v: 1; stop: "all"; writtenAtMs: number }
 /**
- * One org's BRIDGE-COMPLETE record (OrgBridgeDoc; org-bridge-gate.ts completeOrgBridge writes it, create-only):
- * the S3 projection of the org's 062320 hold released with `bridge_complete`. With `orgBridge: "required"` a
- * per-org marker admits only beside this record bound to that marker's exact bytes; without it every claim of the
- * org is a retry (`ledger_fence_authority_bridge_pending`), so S3 admission stays fenced from hold install through
- * the committed bridge_complete, not only until the marker PUT. The buffered drain (the fallback writer) refuses
- * the org from the moment it exists. Under a dot directory: no tenant segment starts with a dot
- * (assertTenantSegment), so it can never be read as an org's marker. Covered by the consumer's read grant on
- * `fence-authority/*`.
+ * Per-org 0005 cutover under the 062320 hold (org-bridge-gate.ts, docs/design/org-bridge-gate.md): two operator
+ * objects under a dot directory of `fence-authority/` (no tenant segment starts with a dot, assertTenantSegment, so
+ * neither can be read as an org's marker; covered by the consumer's read grant on `fence-authority/*`).
+ *
+ * ENROLLMENT (OrgEnrollmentDoc, `.enrolled/<org>.json`, CAS-versioned, never deleted): written BEFORE the SQL hold
+ * install and bound to that install's request id (sha256). With `orgBridge: "required"` it is read on EVERY claim
+ * and commit, never cached: while it is `enrolled` at generation G, the org admits only through its per-org marker
+ * AND its bridge-complete record for G, whatever the deployment-wide marker or an earlier positive read says
+ * (the STOP still refuses first). `withdrawn` (install failed, or a verified rollback) hands the org back to the
+ * markers as before. A later cutover of the same org takes generation G+1, so no older bytes can satisfy it.
+ *
+ * BRIDGE-COMPLETE (OrgBridgeDoc, `.bridge/<org>/g<G>.json`, create-only): the S3 projection of the hold released with
+ * `bridge_complete` for the request G was enrolled with, bound to the sha256 of the marker's stored bytes.
  */
-export const orgBridgeKey = (keyRoot: string, orgId: string) => `${keyRoot}/.ledger/fence-authority/.bridge/${orgId}.json`;
-/**
- * `holdEpochSha256`: orgBridgeEpochHash(epoch) of the released hold; `markerSha256`: sha256 of the per-org marker's
- * stored bytes; `releaseEvidenceSha256`: the hold's release_evidence_sha256. Hashes only, never an id but the org's.
- */
-export interface OrgBridgeDoc { v: 1; kind: "org-bridge-complete"; orgId: string; holdEpochSha256: string; markerSha256: string; releaseEvidenceSha256: string; writtenAtMs: number }
-const BRIDGE_FIELDS = ["v", "kind", "orgId", "holdEpochSha256", "markerSha256", "releaseEvidenceSha256", "writtenAtMs"];
+export const orgEnrollmentKey = (keyRoot: string, orgId: string) => `${keyRoot}/.ledger/fence-authority/.enrolled/${orgId}.json`;
+export const orgBridgeKey = (keyRoot: string, orgId: string, generation: number) => `${keyRoot}/.ledger/fence-authority/.bridge/${orgId}/g${generation}.json`;
+export type OrgEnrollmentWithdrawal = "install_failed" | "verified_rollback";
+export interface OrgEnrollmentDoc {
+  v: 1; kind: "org-cutover-enrollment"; orgId: string; generation: number; requestSha256: string;
+  state: "enrolled" | "withdrawn"; withdrawn: OrgEnrollmentWithdrawal | null; writtenAtMs: number;
+}
+const ENROLLMENT_FIELDS = ["v", "kind", "orgId", "generation", "requestSha256", "state", "withdrawn", "writtenAtMs"];
+export function validOrgEnrollment(v: unknown): v is OrgEnrollmentDoc {
+  return isObject(v) && exactKeys(v, ENROLLMENT_FIELDS) && v.v === 1 && v.kind === "org-cutover-enrollment" && str(v.orgId)
+    && Number.isSafeInteger(v.generation) && (v.generation as number) >= 1 && typeof v.requestSha256 === "string" && HEX64.test(v.requestSha256)
+    && ((v.state === "enrolled" && v.withdrawn === null) || (v.state === "withdrawn" && (v.withdrawn === "install_failed" || v.withdrawn === "verified_rollback")))
+    && count(v.writtenAtMs) && v.writtenAtMs > 0;
+}
+export interface OrgBridgeDoc {
+  v: 1; kind: "org-bridge-complete"; orgId: string; generation: number; requestSha256: string; holdEpochSha256: string;
+  markerSha256: string; releaseEvidenceSha256: string; writtenAtMs: number;
+}
+const BRIDGE_FIELDS = ["v", "kind", "orgId", "generation", "requestSha256", "holdEpochSha256", "markerSha256", "releaseEvidenceSha256", "writtenAtMs"];
 export function validOrgBridge(v: unknown): v is OrgBridgeDoc {
   return isObject(v) && exactKeys(v, BRIDGE_FIELDS) && v.v === 1 && v.kind === "org-bridge-complete" && str(v.orgId)
-    && typeof v.holdEpochSha256 === "string" && HEX64.test(v.holdEpochSha256) && typeof v.markerSha256 === "string" && HEX64.test(v.markerSha256)
-    && typeof v.releaseEvidenceSha256 === "string" && HEX64.test(v.releaseEvidenceSha256) && count(v.writtenAtMs) && v.writtenAtMs > 0;
+    && Number.isSafeInteger(v.generation) && (v.generation as number) >= 1
+    && [v.requestSha256, v.holdEpochSha256, v.markerSha256, v.releaseEvidenceSha256].every((x) => typeof x === "string" && HEX64.test(x))
+    && count(v.writtenAtMs) && v.writtenAtMs > 0;
 }
-/** Domain-separated hash of a hold epoch, so the record never names it. */
+/** Domain-separated hashes of a hold epoch and an install request id, so no record names either. */
 export const orgBridgeEpochHash = (epoch: string) => createHash("sha256").update(`96bulls:org-bridge-epoch-v1:${epoch}`).digest("hex");
+export const orgEnrollmentRequestHash = (requestId: string) => createHash("sha256").update(`96bulls:org-enrollment-request-v1:${requestId}`).digest("hex");
 
 // ---- object shapes ----
 
@@ -686,11 +705,11 @@ export interface S3LedgerOptions {
   /** How long a VALID marker read is trusted (default 60 s). A missing or invalid one is never cached. */
   fenceAuthorityTtlMs?: number;
   /**
-   * "required" (needs `fenceAuthority: "required"`; the hosted consumer sets it): an org admitted through its PER-ORG
-   * marker also needs its bridge-complete record (orgBridgeKey, validOrgBridge) naming that org and the sha256 of the
-   * marker's stored bytes. Absent: `ledger_fence_authority_bridge_pending` (retry); present but invalid, another org
-   * or another marker: `ledger_fence_authority_bridge_invalid`. Nothing is cached until both pass. The
-   * deployment-wide marker is unaffected (it follows every org's own cutover). Unset: no extra read (self-host).
+   * "required" (needs `fenceAuthority: "required"`; the hosted consumers set it): every claim and every commit reads the
+   * org's cutover enrollment (orgEnrollmentKey) fresh. Enrolled at generation G: admits only beside a valid per-org
+   * marker and its bridge-complete record for G bound to that marker's bytes (`ledger_fence_authority_bridge_pending`
+   * while either is missing, `ledger_fence_authority_bridge_invalid` when one does not bind); nothing cached. Not
+   * enrolled, or withdrawn: the markers decide, as before. Unset: no extra read (self-host).
    */
   orgBridge?: "required";
   /**
@@ -1006,22 +1025,51 @@ export function s3Ledger(store: ObjectStore, keyRoot: string, opts: S3LedgerOpti
    * Fail closed: no admission for an org without a valid fence-authority marker (FenceAuthorityDoc): its own
    * per-org marker, or else the deployment-wide one. A present-but-invalid per-org marker refuses outright.
    */
+  /**
+   * An enrolled org's gate (orgBridge "required"), uncached: the STOP first, then its per-org marker (the
+   * deployment-wide one never counts), then the bridge-complete record of its enrollment generation, bound to the
+   * marker's bytes and the enrollment's request. Returns false when the org is not enrolled (or withdrawn).
+   */
+  async function enrolledGate(orgId: string, at: "claim" | "commit" = "claim"): Promise<boolean> {
+    if (opts.orgBridge !== "required") return false;
+    const enrolled = await readDoc(store, orgEnrollmentKey(keyRoot, orgId), validOrgEnrollment, "ledger_fence_authority_enrollment_invalid");
+    if (!enrolled || enrolled.doc.state !== "enrolled") {
+      if (enrolled && enrolled.doc.orgId !== orgId) throw new LedgerUnavailableError("ledger_fence_authority_enrollment_invalid");
+      return false;
+    }
+    const e = enrolled.doc;
+    if (e.orgId !== orgId) throw new LedgerUnavailableError("ledger_fence_authority_enrollment_invalid");
+    // The STOP is the kill switch for NEW claims only (a commit never read it): not re-read at commit.
+    if (at === "claim" && await readDoc(store, fenceAuthorityStopKey(keyRoot), validFenceAuthorityStop, "ledger_fence_authority_stopped"))
+      throw new LedgerUnavailableError("ledger_fence_authority_stopped");
+    const marker = await readDocHashed(store, orgFenceAuthorityKey(keyRoot, orgId), validOrgFenceAuthority, "ledger_fence_authority_invalid");
+    if (!marker) throw new LedgerUnavailableError("ledger_fence_authority_bridge_pending");
+    if (marker.doc.orgId !== orgId) throw new LedgerUnavailableError("ledger_fence_authority_org_mismatch");
+    const bridge = await readDoc(store, orgBridgeKey(keyRoot, orgId, e.generation), validOrgBridge, "ledger_fence_authority_bridge_invalid");
+    if (!bridge) throw new LedgerUnavailableError("ledger_fence_authority_bridge_pending");
+    const b = bridge.doc;
+    if (b.orgId !== orgId || b.generation !== e.generation || b.requestSha256 !== e.requestSha256 || b.markerSha256 !== marker.sha256)
+      throw new LedgerUnavailableError("ledger_fence_authority_bridge_invalid");
+    if (opts.ledgerHome) {
+      const home = await readDoc(store, ledgerHomeKey(keyRoot), validLedgerHome, "ledger_home_invalid");
+      const verdict = ledgerHomeVerdict(home?.doc ?? null, opts.ledgerHome.expect, opts.ledgerHome.required);
+      if (verdict !== "ok") throw new LedgerUnavailableError(verdict);
+    }
+    return true;
+  }
+
   async function requireFenceAuthority(orgId: string): Promise<void> {
     if (opts.fenceAuthority !== "required") return;
+    // Before the cache: a warm positive read never admits an org enrolled since.
+    if (await enrolledGate(orgId)) return;
     const now = nowMs();
     if (now < (authorityUntil.get(orgId) ?? -Infinity)) return;
     // The deployment-wide stop first: present (valid or not) refuses every org.
     if (await readDoc(store, fenceAuthorityStopKey(keyRoot), validFenceAuthorityStop, "ledger_fence_authority_stopped"))
       throw new LedgerUnavailableError("ledger_fence_authority_stopped");
-    const org = await readDocHashed(store, orgFenceAuthorityKey(keyRoot, orgId), validOrgFenceAuthority, "ledger_fence_authority_invalid");
+    const org = await readDoc(store, orgFenceAuthorityKey(keyRoot, orgId), validOrgFenceAuthority, "ledger_fence_authority_invalid");
     if (org) {
       if (org.doc.orgId !== orgId) throw new LedgerUnavailableError("ledger_fence_authority_org_mismatch");
-      // The marker alone no longer reopens the org: only its committed bridge_complete, bound to these marker bytes.
-      if (opts.orgBridge === "required") {
-        const bridge = await readDoc(store, orgBridgeKey(keyRoot, orgId), validOrgBridge, "ledger_fence_authority_bridge_invalid");
-        if (!bridge) throw new LedgerUnavailableError("ledger_fence_authority_bridge_pending");
-        if (bridge.doc.orgId !== orgId || bridge.doc.markerSha256 !== org.sha256) throw new LedgerUnavailableError("ledger_fence_authority_bridge_invalid");
-      }
     } else if (!(await readDoc(store, fenceAuthorityKey(keyRoot), validFenceAuthority, "ledger_fence_authority_invalid"))) {
       throw new LedgerUnavailableError("ledger_fence_authority_missing");
     }
@@ -1331,6 +1379,10 @@ export function s3Ledger(store: ObjectStore, keyRoot: string, opts: S3LedgerOpti
       const snapshot = stored.doc;
       const pairs = batchPairs(input.sessions, input.records);
       if (pairs.some(([s, id]) => !Object.hasOwn(snapshot.epochs, sessionKeyHash(s, id)))) throw new LedgerUnavailableError("ledger_attempt_mismatch");
+      // orgBridge: a claim acquired before its org was enrolled (or before install) whose commit resumes while the
+      // org is held stays pending (a retry, same claim token) until the bridge-complete record: no re-arm marker, no
+      // index merge, no committed state before it. Re-checked right before pending -> committed.
+      await enrolledGate(input.tenant.orgId, "commit");
 
       // ingest_attempt_fenced: a session deleted now, or whose epoch or the reset count moved since the claim.
       // Nothing to recheck only when this is the SAME fence object (instance) at the same version.
@@ -1378,7 +1430,8 @@ export function s3Ledger(store: ObjectStore, keyRoot: string, opts: S3LedgerOpti
       // A fenced session the fence no longer deletes (re-enabled since the claim): SQL's invalidated.
       const fenced = first.fenced;
       if (fenced.some(([s, id]) => !first.deleted.has(pairId(s, id)))) throw new LedgerUnavailableError("ledger_attempt_superseded");
-      // 3. pending -> committed.
+      // 3. pending -> committed (the enrolled org's gate once more, uncached).
+      await enrolledGate(input.tenant.orgId, "commit");
       if (!(await casPut(store, batchKey, { ...snapshot, state: "committed" }, stored.version))) {
         const now = await readDoc(store, batchKey, validBatch, "ledger_batch_record_invalid");
         if (!(now && now.doc.state === "committed" && now.doc.claimToken === input.claimToken && now.doc.digest === input.batchDigest))

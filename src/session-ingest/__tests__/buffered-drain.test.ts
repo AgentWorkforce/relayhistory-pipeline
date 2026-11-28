@@ -27,7 +27,7 @@ import { mkdtempSync, readFileSync as readFileSyncFs, rmSync, writeFileSync as w
 import { join } from "node:path";
 import { scratchStore } from "./support.ts";
 import { journalKey as journalKeyFor } from "../async-admission.ts";
-import { applyFenceChange, fenceAuthorityKey, fenceAuthorityStopKey, fenceEpoch, orgBridgeKey, orgFenceAuthorityKey, s3ControlMirror, s3LedgerKeys, s3LedgerObjects, sessionKeyHash, type FenceChange, type IndexEntryInput } from "../ledger-s3.ts";
+import { applyFenceChange, fenceAuthorityKey, fenceAuthorityStopKey, fenceEpoch, orgBridgeKey, orgEnrollmentKey, orgFenceAuthorityKey, s3ControlMirror, s3LedgerKeys, s3LedgerObjects, sessionKeyHash, type FenceChange, type IndexEntryInput } from "../ledger-s3.ts";
 import type { OrderedControlInput } from "../ledger.ts";
 
 const ROOT = "96bulls";
@@ -1370,8 +1370,10 @@ describe("buffered backlog drain (0005)", () => {
 
 // ---- the writer switch of a per-org cutover (org-bridge-gate.ts): the drain is the fallback writer ----
 describe("buffered drain: refuses an org once its bridge-complete record exists (direct/fallback writer exclusion)", () => {
-  const bridged = (store: ObjectStore) => store.put(objectKey(orgBridgeKey(ROOT, TENANT.orgId)), enc.encode(JSON.stringify({ v: 1, kind: "org-bridge-complete",
-    orgId: TENANT.orgId, holdEpochSha256: "a".repeat(64), markerSha256: "b".repeat(64), releaseEvidenceSha256: "c".repeat(64), writtenAtMs: 1 })));
+  const enrolled = (store: ObjectStore, o: Record<string, unknown> = {}) => store.put(objectKey(orgEnrollmentKey(ROOT, TENANT.orgId)), enc.encode(JSON.stringify({
+    v: 1, kind: "org-cutover-enrollment", orgId: TENANT.orgId, generation: 1, requestSha256: "d".repeat(64), state: "enrolled", withdrawn: null, writtenAtMs: 1, ...o })));
+  const bridged = (store: ObjectStore, gen = 1) => store.put(objectKey(orgBridgeKey(ROOT, TENANT.orgId, gen)), enc.encode(JSON.stringify({ v: 1, kind: "org-bridge-complete",
+    orgId: TENANT.orgId, generation: gen, requestSha256: "d".repeat(64), holdEpochSha256: "a".repeat(64), markerSha256: "b".repeat(64), releaseEvidenceSha256: "c".repeat(64), writtenAtMs: 1 })));
   /** The store, with `hook` run (once) right after the first put whose key matches. */
   const after = (store: ObjectStore, match: (key: string) => boolean, hook: () => Promise<unknown>) => {
     let fired = false;
@@ -1392,8 +1394,9 @@ describe("buffered drain: refuses an org once its bridge-complete record exists 
     for (const body of ["valid", "garbage"]) {
       const store = await scratch();
       const key = await stage(store, [group("claude", "sess-1", [{ id: "r1", rev: 1 }])]);
+      await enrolled(store);
       if (body === "valid") await bridged(store);
-      else await store.put(objectKey(orgBridgeKey(ROOT, TENANT.orgId)), enc.encode("not json"));
+      else await store.put(objectKey(orgBridgeKey(ROOT, TENANT.orgId, 1)), enc.encode("not json"));
       const summary = await run(store);
       expect(summary.objects).toMatchObject({ bridge_complete_drain_refused: 1, drained: 0 });
       expect([...(await canonical(store)).keys()]).toEqual([]);
@@ -1405,6 +1408,7 @@ describe("buffered drain: refuses an org once its bridge-complete record exists 
   test("bridge_complete committed after the run's cached authority read, before the first canonical byte: refused, zero canonical bytes", async () => {
     const base = await scratch();
     const key = await stage(base, [group("claude", "sess-1", [{ id: "r1", rev: 1 }])]);
+    await enrolled(base);
     // The ownership stubs are the last write before the canonical bytes (step 4b): the switch lands right after them.
     const store = after(base, (k) => k.includes("/ledger/owners/"), () => bridged(base));
     const summary = await run(store);
@@ -1417,6 +1421,7 @@ describe("buffered drain: refuses an org once its bridge-complete record exists 
   test("a drain paused across bridge_complete (canonical bytes landed while open) merges no index entry and is not marked", async () => {
     const base = await scratch();
     const key = await stage(base, [group("claude", "sess-1", [{ id: "r1", rev: 1 }])]);
+    await enrolled(base);
     const store = after(base, (k) => k.startsWith(`${ROOT}/${TENANT.orgId}/v1/`) && k.includes("/raw/"), () => bridged(base));
     const summary = await run(store);
     expect(summary.objects).toMatchObject({ bridge_complete_drain_refused: 1, drained: 0 });
@@ -1428,9 +1433,23 @@ describe("buffered drain: refuses an org once its bridge-complete record exists 
     expect((await run(base)).objects).toMatchObject({ bridge_complete_drain_refused: 1, drained: 0 });
   });
 
+  test("an unreadable enrollment writes nothing (bridge_state_unreadable); a withdrawn one or another generation's record leaves the drain open", async () => {
+    const store = await scratch();
+    const key = await stage(store, [group("claude", "sess-1", [{ id: "r1", rev: 1 }])]);
+    await store.put(objectKey(orgEnrollmentKey(ROOT, TENANT.orgId)), enc.encode("not json"));
+    expect((await run(store)).objects).toMatchObject({ drained: 0 });
+    expect([...(await canonical(store)).keys()]).toEqual([]);
+    // Generation 2 enrolled; generation 1's old record does not close it (the drain serves the new cutover).
+    await enrolled(store, { generation: 2 });
+    await bridged(store, 1);
+    expect((await run(store)).objects.drained).toBe(1);
+    expect(await exists(store, key + DRAINED_SUFFIX)).toBe(true);
+  });
+
   test("without a record (the bridge still open) the same batch drains: the switch is the only difference", async () => {
     const store = await scratch();
     const key = await stage(store, [group("claude", "sess-1", [{ id: "r1", rev: 1 }])]);
+    await enrolled(store);
     expect((await run(store)).objects.drained).toBe(1);
     expect(await storedEntry(store, "r1")).toBeDefined();
     expect(await exists(store, key + DRAINED_SUFFIX)).toBe(true);

@@ -37,7 +37,7 @@ const { createUploadAdmissionHandler } = await import("../upload-admission-lambd
 const { hostedUploadAdmissionRuntime } = await import("../upload-admission-hosted.ts");
 const { uploadAdmissionStatus, uploadDirectConfig, uploadStatusKey } = await import("../upload-admission.ts");
 const { journalKey, outcomeKey, receiptDir } = await import("../async-admission.ts");
-const { fenceAuthorityKey, orgBridgeKey, orgFenceAuthorityKey, s3LedgerKeys } = await import("../ledger-s3.ts");
+const { fenceAuthorityKey, orgBridgeKey, orgEnrollmentKey, orgFenceAuthorityKey, s3LedgerKeys } = await import("../ledger-s3.ts");
 const { encodeUploadWitness, parseUploadKey, parseUploadWitnessKey, uploadKeyPrefix, uploadObjectKey, uploadObjectSha256Hex } = await import("../upload-inbox-contract.ts");
 const { prepareDelivery } = await import("../vendor/delivery/prepare.ts");
 
@@ -173,12 +173,16 @@ describe("upload -> promoteUpload -> inline admission with the S3 ledger (decisi
     await store.put(objectKey(orgFenceAuthorityKey(ROOT, TENANT.orgId)), new TextEncoder().encode(JSON.stringify({ v: 1, orgId: TENANT.orgId, fenceBackfill: "complete",
       revisionBackfill: "complete", ownershipBackfill: "complete", controlMirror: "on", rearmSweeper: "live", revisionLayout: "4096", workerHttpAdmission: "off", writtenAtMs: T0 })), { contentType: "application/json" });
     const { key } = await upload(store, "batch-org");
-    // The marker alone does not reopen the org (orgBridge: "required"): a retry until its bridge-complete record.
+    // Not enrolled: the per-org marker admits as before. Enrolled (a hosted cutover under the 062320 hold): the marker
+    // alone is a retry until the org's bridge-complete record (orgBridge: "required").
+    const req = "d".repeat(64);
+    await store.put(objectKey(orgEnrollmentKey(ROOT, TENANT.orgId)), new TextEncoder().encode(JSON.stringify({ v: 1, kind: "org-cutover-enrollment", orgId: TENANT.orgId,
+      generation: 1, requestSha256: req, state: "enrolled", withdrawn: null, writtenAtMs: T0 })), { contentType: "application/json" });
     expect(await handler({ Records: [{ messageId: "m0", body: s3Body(key) }] })).toEqual({ batchItemFailures: [{ itemIdentifier: "m0" }] });
     expect(await exists(store, key)).toBe(true);
     const marker = await readAll((await store.getObject(objectKey(orgFenceAuthorityKey(ROOT, TENANT.orgId)))).body);
-    await store.put(objectKey(orgBridgeKey(ROOT, TENANT.orgId)), new TextEncoder().encode(JSON.stringify({ v: 1, kind: "org-bridge-complete", orgId: TENANT.orgId,
-      holdEpochSha256: "a".repeat(64), markerSha256: createHash("sha256").update(marker).digest("hex"), releaseEvidenceSha256: "b".repeat(64), writtenAtMs: T0 })), { contentType: "application/json" });
+    await store.put(objectKey(orgBridgeKey(ROOT, TENANT.orgId, 1)), new TextEncoder().encode(JSON.stringify({ v: 1, kind: "org-bridge-complete", orgId: TENANT.orgId,
+      generation: 1, requestSha256: req, holdEpochSha256: "a".repeat(64), markerSha256: createHash("sha256").update(marker).digest("hex"), releaseEvidenceSha256: "b".repeat(64), writtenAtMs: T0 })), { contentType: "application/json" });
     expect(await handler({ Records: [{ messageId: "m1", body: s3Body(key) }] })).toEqual({ batchItemFailures: [] });
     expect(await exists(store, key)).toBe(false);
     expect(await json(store, s3LedgerKeys(ROOT, TENANT).batch("origin-1", "batch-org"))).toMatchObject({ state: "committed" });

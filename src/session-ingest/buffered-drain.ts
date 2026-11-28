@@ -79,7 +79,7 @@ import { layoutComponent } from "../shared/layout-component.ts";
 import { journalKey } from "./async-admission.ts";
 import type { LedgerTenant } from "./ledger.ts";
 import {
-  entryForgotten, fenceAuthorityKey, fenceAuthorityStopKey, orgBridgeKey, fenceEpoch, hasPendingReset, isDeletedForAdmission, newFence, orgFenceAuthorityKey, recordGeneration, s3LedgerObjects,
+  entryForgotten, fenceAuthorityKey, fenceAuthorityStopKey, orgBridgeKey, orgEnrollmentKey, validOrgEnrollment, fenceEpoch, hasPendingReset, isDeletedForAdmission, newFence, orgFenceAuthorityKey, recordGeneration, s3LedgerObjects,
   sessionKeyHash, validFenceAuthority, validOrgFenceAuthority, type FenceDoc, type FenceRead, type IndexEntry, type IndexEntryInput,
 } from "./ledger-s3.ts";
 import { fitLine } from "./oversize.ts";
@@ -558,7 +558,7 @@ async function orgAuthority(store: ObjectStore, keyRoot: string, orgId: string):
     if (await read(fenceAuthorityStopKey(keyRoot))) return "stopped";
     const org = await read(orgFenceAuthorityKey(keyRoot, orgId));
     // The org's bridge-complete record: from then on S3 admission is the writer and the drain writes nothing more.
-    if (org && (await assertBridgeOpen(store, keyRoot, orgId)) !== "open") return "bridged";
+    if ((await assertBridgeOpen(store, keyRoot, orgId)) !== "open") return "bridged";
     if (org) return validOrgFenceAuthority(org.v) && (org.v as { orgId: string }).orgId === orgId ? "ok" : "invalid";
     const all = await read(fenceAuthorityKey(keyRoot));
     if (!all) return "missing";
@@ -574,16 +574,23 @@ function authorityOutcome(a: Exclude<Authority, "ok">): ObjectOutcome {
 }
 
 /**
- * The writer switch of a per-org cutover (org-bridge-gate.ts): "open" while the org has no bridge-complete record
- * (ledger-s3 orgBridgeKey), "closed" once ANY object is stored there (valid or not: the direct writer may be live),
- * "unreadable" on a store error (fail closed: nothing written). Never cached. Called before a batch's first
- * canonical byte and again before its index merge, so a drain paused across bridge_complete stops there.
+ * The writer switch of a per-org cutover (org-bridge-gate.ts): "open" while the org is not enrolled, withdrawn, or
+ * enrolled at generation G without a bridge-complete record for G; "closed" once ANY object is stored at G's record
+ * key (valid or not: the direct writer may be live); "unreadable" on a store error or an unreadable enrollment (fail
+ * closed: nothing written). Never cached. Called before a batch's first canonical byte and again before its index
+ * merge.
  */
 export async function assertBridgeOpen(store: ObjectStore, keyRoot: string, orgId: string): Promise<"open" | "closed" | "unreadable"> {
   try {
-    return (await store.head(objectKey(orgBridgeKey(keyRoot, orgId)))) === undefined ? "open" : "closed";
-  } catch (error) {
-    return isObjectStoreError(error, "not_found") ? "open" : "unreadable";
+    const got = await readText(store, orgEnrollmentKey(keyRoot, orgId), 64 * 1024);
+    if (!got) return "open";
+    let v: unknown;
+    try { v = JSON.parse(got.text); } catch { return "unreadable"; }
+    if (!validOrgEnrollment(v) || v.orgId !== orgId) return "unreadable";
+    if (v.state !== "enrolled") return "open";
+    return (await store.head(objectKey(orgBridgeKey(keyRoot, orgId, v.generation)))) === undefined ? "open" : "closed";
+  } catch {
+    return "unreadable";
   }
 }
 const bridgeOutcome = (b: "closed" | "unreadable"): ObjectOutcome => (b === "closed" ? "bridge_complete_drain_refused" : "bridge_state_unreadable");
