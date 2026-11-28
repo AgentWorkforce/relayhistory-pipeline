@@ -208,6 +208,31 @@ stamp and window reads stay where they were.
   than the gap. A stale stamp cannot cause a wrong skip or hold: both re-check the current pointer rows and
   manifest content. It is hashes and counts only.
 
+### Rollout: stamps written before the flag
+
+A stamp written before the flag was on has no watermark. Turning the flag on does not read anything by itself.
+
+- While such a session's pointer set is unchanged, its deliveries keep taking the acceptance skip on the plain
+  stamp. Nothing is read, no watermark is written, and the manifest check above does not apply.
+- It gets a watermark on its next eligible delivery after a pointer change or after the plain stamp expires: that
+  pass reads in full, and writes a watermark if it ends with the acceptance refusal alone, read as listed, with
+  a record id group. Holds can start from the revision after that.
+- Six hours bounds how long a stamp is valid. Expiry does not schedule a read: a session that gets no delivery
+  is never converted, and costs nothing.
+
+To measure uptake, count three things separately on the `search index reconciled` line:
+
+| What | How it logs |
+| --- | --- |
+| Full-read refusal | `reason: relayhistory_acceptance_missing`, no `skipped_before_read` |
+| Same-pointer skip | reason ends `skipped_before_read`, with `acceptance_stamp: plain` or `acceptance_stamp: watermark` |
+| Hold across a new revision | `acceptance_hold: watermark`, with `delta_chunks` |
+
+`acceptance_stamp` is logged only with the watermark flag on. `watermark` means this pass verified every sibling
+manifest against the exact stamp row it skipped on. It is set from that verification, never from the stamp's
+stored format. A watermark stamp that could not be verified does not skip, so it logs as a full read. `plain`
+means the stamp has no `w` field at all; a stamp whose `w` this code cannot read is never logged as `plain`.
+
 ### Rollback
 
 Unset the flag, or set it to `false`. The acceptance skip ignores the `w` field, so stamps written with the
