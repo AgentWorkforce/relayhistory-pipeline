@@ -1620,6 +1620,28 @@ describe("buffered drain materialization (FULL-seeded index)", () => {
     expect(proof.counts.erased_present).toBe(1);
   });
 
+  test("a withheld line whose bytes another writer made canonical, and which the index names as winner, is not erased", async () => {
+    const store = await scratch();
+    const target = { store, keyRoot: ROOT };
+    // m2's custody is another writer's: SQL keeps no line for it in this stage, its slot names (1, digest).
+    await writeGroups(target, { ...TENANT, originId: ORIGIN, batchDigest: sha("independent-m2") }, [group("claude", "sess-1", [{ id: "m2", rev: 1 }])], new Date(RECEIVED));
+    await fullSlots(store, [{ id: "m1", rev: 1 }, { id: "m2", rev: 1 }]);
+    await stage(store, [group("claude", "sess-1", [{ id: "m1", rev: 1 }, { id: "m2", rev: 1 }])], { keep: [[0]] });
+    const summary = await run(store);
+    expect(summary.lines).toMatchObject({ materialized: 1, not_kept: 1 });
+    expect((await canonical(store)).get("sess-1")).toEqual(["m2@1", "m1@1"]);
+    const proof = await verify(store);
+    expect(proof.failures).toEqual([]);
+    expect(proof).toMatchObject({ ok: true, exact: 1, index_winners_canonical: 1 });
+    // The same withheld line with no index winner (its slot forgotten or never owned) is excluded yet readable: refused.
+    const store2 = await scratch();
+    await writeGroups({ store: store2, keyRoot: ROOT }, { ...TENANT, originId: ORIGIN, batchDigest: sha("independent-m2") }, [group("claude", "sess-1", [{ id: "m2", rev: 1 }])], new Date(RECEIVED));
+    await fullSlots(store2, [{ id: "m1", rev: 1 }]);
+    await stage(store2, [group("claude", "sess-1", [{ id: "m1", rev: 1 }, { id: "m2", rev: 1 }])], { keep: [[0]] });
+    await run(store2);
+    expect((await verify(store2)).counts.erased_present).toBe(1);
+  });
+
   test("the verifier refuses an org without its accepted-stage export completion", async () => {
     const store = await scratch({ exportComplete: false });
     expect(await verify(store)).toMatchObject({ ok: false, counts: { export_missing: 1 } });

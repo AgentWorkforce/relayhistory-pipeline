@@ -229,7 +229,13 @@ const ref = (s: string) => sha256Hex(s);
 
 interface Backlog {
   allowed: Line[];
-  excluded: Line[];
+  /** Lines an erasure excludes: a deleted session or user (current fence), or a pre-reset stage. Never canonical. */
+  erased: Line[];
+  /**
+   * Lines SQL's verdict withholds from this stage (not kept, not live, superseded): not this stage's custody. Their
+   * bytes may legitimately be canonical through another writer when the index still names that revision as the winner.
+   */
+  withheld: Line[];
   sessions: Map<string, Session>;
   /** Every (user, origin) of the backlog. */
   origins: Map<string, { tenant: LedgerTenant; origin: string }>;
@@ -251,7 +257,7 @@ async function collectBacklog(opts: VerifyOptions, deps: VerifyDeps): Promise<Ba
   const keys = await deps.list(`${keyRoot}/${orgId}/buffered-batches/v1`);
   const all = new Set(keys);
   const staged = keys.filter((k) => k.endsWith(".staged.ndjson.zst") && deps.parseStagedKey(k)?.orgId === orgId);
-  const b: Backlog = { allowed: [], excluded: [], sessions: new Map(), origins: new Map(), fences: new Map(), undrained: [], invalid: [], noVerdict: [], exportComplete: complete !== null && parseAcceptedComplete(complete) !== null, deleted: new Set() };
+  const b: Backlog = { allowed: [], erased: [], withheld: [], sessions: new Map(), origins: new Map(), fences: new Map(), undrained: [], invalid: [], noVerdict: [], exportComplete: complete !== null && parseAcceptedComplete(complete) !== null, deleted: new Set() };
   const fenceOf = async (t: LedgerTenant): Promise<FenceDoc | null> => {
     const k = userKey(t);
     if (!b.fences.has(k)) {
@@ -301,7 +307,7 @@ async function collectBacklog(opts: VerifyOptions, deps: VerifyDeps): Promise<Ba
       continue;
     }
     if (!marker || !marker.live || all.has(key + ".superseded.json")) {
-      b.excluded.push(...items.flat());
+      b.withheld.push(...items.flat());
       continue;
     }
     // The drain's marker. Absent: not drained. Known outcomes only, over these exact bytes: `drained` (allowed) and
@@ -317,7 +323,7 @@ async function collectBacklog(opts: VerifyOptions, deps: VerifyDeps): Promise<Ba
     }
     const outcome = md && typeof md === "object" && md.kind === "buffered-drained" && md.staged_sha256 === s.sha256 ? md.outcome : undefined;
     if (outcome === "pre_reset") {
-      b.excluded.push(...items.flat());
+      b.erased.push(...items.flat());
       continue;
     }
     if (outcome !== "drained") {
@@ -332,7 +338,7 @@ async function collectBacklog(opts: VerifyOptions, deps: VerifyDeps): Promise<Ba
         const meta = s.groups[gi]!.meta?.[j];
         const session = meta ? meta[3] : item.sessionId;
         const deleted = fence === null || (session !== null && isDeletedForAdmission(fence, origin, meta ? meta[2] : item.source, session));
-        (keep.has(j) && !deleted ? b.allowed : b.excluded).push(item);
+        (deleted ? b.erased : keep.has(j) ? b.allowed : b.withheld).push(item);
       });
     });
   }
@@ -484,18 +490,25 @@ export async function verifyDrainMaterialization(opts: VerifyOptions, deps: Veri
   }
 
   // Nothing the drain introduced outside the allowed set (or an index winner); nothing excluded made canonical.
-  const excludedForms = new Map<string, Set<string>>();
-  for (const l of b.excluded) {
-    const sk = sessionKey(l.tenant, l.origin, l.source, l.sessionId);
-    const set = excludedForms.get(sk) ?? new Set<string>();
-    set.add(canonicalFormOf(l.line));
-    excludedForms.set(sk, set);
-  }
+  const formsBySession = (ls: Line[]) => {
+    const m = new Map<string, Set<string>>();
+    for (const l of ls) {
+      const sk = sessionKey(l.tenant, l.origin, l.source, l.sessionId);
+      const set = m.get(sk) ?? new Set<string>();
+      set.add(canonicalFormOf(l.line));
+      m.set(sk, set);
+    }
+    return m;
+  };
+  const erasedForms = formsBySession(b.erased);
+  const withheldForms = formsBySession(b.withheld);
   for (const [sk, s] of sessions) {
     const lines = canonical.get(sk);
     if (lines === undefined) continue; // unreadable, already failed
     const ok = allowedForms.get(sk) ?? new Set<string>();
-    const bad = excludedForms.get(sk) ?? new Set<string>();
+    const erasedHere = erasedForms.get(sk) ?? new Set<string>();
+    const withheldHere = withheldForms.get(sk) ?? new Set<string>();
+    const bad = new Set([...erasedHere, ...withheldHere]);
     const before = new Set(opts.baseline?.sessions.get(sk) ?? []);
     // An erased session: every readable line is erased_present, whoever wrote it and whenever (baseline included).
     if (b.deleted.has(sk)) {
@@ -508,15 +521,22 @@ export async function verifyDrainMaterialization(opts: VerifyOptions, deps: Veri
     for (const t of before) if (!now.has(t)) fail("baseline_lost", ref(JSON.stringify([sk, sha256Hex(t)])));
     for (const c of lines ?? []) {
       if (ok.has(c.text)) continue;
-      // An excluded line is erased_present while readable, even if it was there before the drain.
-      if (bad.has(c.text)) {
+      // An erased line is erased_present while readable, even if it was there before the drain.
+      if (erasedHere.has(c.text)) {
         fail("erased_present", ref(JSON.stringify([sk, c.recordId, c.revision])));
         continue;
       }
       const rk = recordKey(s.tenant, c.originId, c.recordId);
       const w = winners.get(rk);
-      // The index's winner beyond the backlog (a later admission). At an expected revision only the expected bytes count.
+      // The index's current, unforgotten winner beyond the backlog's expected revision (a later admission, or a
+      // withheld line whose custody is another writer's): canonical may hold it. At an expected revision only the
+      // expected bytes count.
       if (w && w.entry[0] === c.revision && (expected.get(rk)?.revision ?? -1) < c.revision) continue;
+      // A withheld line that is not the index's winner: excluded, yet readable.
+      if (withheldHere.has(c.text)) {
+        fail("erased_present", ref(JSON.stringify([sk, c.recordId, c.revision])));
+        continue;
+      }
       if (before.has(c.text)) {
         result.baseline_preserved++;
         continue;

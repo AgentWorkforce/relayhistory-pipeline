@@ -20,11 +20,11 @@ import pg from "pg";
 import { objectKey, readAll, type ObjectStore } from "../../shared/vendor.ts";
 import { exportAcceptedStages, type ExportSql } from "../accepted-stage-export.ts";
 import { DRAINED_SUFFIX, drainBufferedBatches, parseStagedKey, readLiveStaged } from "../buffered-drain.ts";
-import { verifyDrainMaterialization } from "../drain-materialization.ts";
-import { orgFenceAuthorityKey } from "../ledger-s3.ts";
+import { canonicalFormOf, readCanonicalSession, verifyDrainMaterialization } from "../drain-materialization.ts";
+import { orgFenceAuthorityKey, s3LedgerKeys, s3LedgerObjects, sessionKeyHash } from "../ledger-s3.ts";
 import { BUFFER_STAGE_MAX_BYTES, prepareBufferedStage, putBufferedStage } from "../staging.ts";
 import { backfillUploadFences } from "../upload-fence-backfill.ts";
-import type { Group } from "../writer.ts";
+import { liveMachineId, writeGroups, type Group } from "../writer.ts";
 import { SESSION_BOOTSTRAP_FILES } from "../../hoopdb/session-bootstrap-chain.ts";
 import { migrationFiles } from "./pglite-schema.ts";
 import { fixturePgUrl } from "./hold-harness/pg.ts";
@@ -156,34 +156,75 @@ async function listKeys(prefix: string): Promise<string[]> {
   return out.sort();
 }
 
+const deps = () => ({ list: listKeys, readStaged: (k: string) => readLiveStaged(store, k, decompress), parseStagedKey });
+const verify = () => verifyDrainMaterialization({ store, keyRoot: ROOT, orgId: A.orgId, decompress }, deps());
+const drain = () => drainBufferedBatches({ store, keyRoot: ROOT, orgs: [A.orgId], dryRun: false, sleep: async () => {}, decompress });
+const full = () => backfillUploadFences({ sql, store, keyRoot: ROOT, dryRun: false, sleep: async () => {} });
+const exportStages = () => exportAcceptedStages({ sql, store, keyRoot: ROOT, dryRun: false, nowMs: () => 1_893_542_400_000 });
+const recordRef = (recordId: string) => sha(JSON.stringify([A.orgId, A.workspaceId, A.userId, ORIGIN, recordId]));
+const KEYS = s3LedgerKeys(ROOT, A);
+const indexEntry = async (recordId: string) => (await s3LedgerObjects(store, ROOT).readIndex(KEYS.revisions(ORIGIN, recordId)))?.doc.records[recordId];
+
 describe.skipIf(!url)("FULL-to-drain materialization on PostgreSQL + MinIO", () => {
-  test("the real FULL, export and drain materialize the owned lazy slots; the proof is exact and a re-drain is a no-op", async () => {
+  beforeAll(async () => {
     await store.put(objectKey(orgFenceAuthorityKey(ROOT, A.orgId)), new TextEncoder().encode(JSON.stringify({ v: 1, fenceBackfill: "complete", revisionBackfill: "complete",
       ownershipBackfill: "complete", controlMirror: "on", rearmSweeper: "live", revisionLayout: "4096", workerHttpAdmission: "off", writtenAtMs: 1, orgId: A.orgId })));
+  });
+
+  test("positive control: canonical bytes for the not-body-accepted winner written independently; exact proof, replay and crash", async () => {
+    // m2's decision is not body-accepted, so the drain keeps no line for it; its owned slot still names (1, digest).
+    // A synthetic stand-in for "the bytes live elsewhere": an independent writer puts m2's canonical line first. This
+    // qualifies only this control; where such bytes live in production stays with the SQL owner.
+    await writeGroups({ store, keyRoot: ROOT }, { ...A, originId: ORIGIN, batchDigest: sha("independent-m2") },
+      [{ source: "claude", sessionId: "s1", lines: [line("m2", 1)], meta: [["m2:r1", sha("m2:1"), "claude", "s1"]] }], new Date(RECEIVED));
     const key = await stageInBoth([
       { source: "claude", session: "s1", records: [{ id: "m1", rev: 1 }, { id: "m2", rev: 1, accepted: false }] },
       { source: "claude", session: "s2", records: [{ id: "m3", rev: 1 }] },
     ]);
-    const full = await backfillUploadFences({ sql, store, keyRoot: ROOT, dryRun: false, sleep: async () => {} });
-    expect(full.revisions.slot_rows).toBe(3);
-    expect(await exportAcceptedStages({ sql, store, keyRoot: ROOT, dryRun: false, nowMs: () => 1_893_542_400_000 })).toMatchObject({ live: 1 });
-    const drain = () => drainBufferedBatches({ store, keyRoot: ROOT, orgs: [A.orgId], dryRun: false, sleep: async () => {}, decompress });
+    expect((await full()).revisions.slot_rows).toBe(3);
+    expect(await indexEntry("m2")).toEqual([1, null, sha("m2:1"), sessionKeyHash("claude", "s1"), 0, 0]);
+    expect(await exportStages()).toMatchObject({ live: 1 });
     const first = await drain();
     expect(first.objects.drained).toBe(1);
-    // m2 is not body-accepted (SQL does not keep it); m1 and m3 are FULL slot entries, materialized.
     expect(first.lines).toMatchObject({ candidate: 2, written: 2, materialized: 2, already_stored: 0, not_kept: 1 });
-    const deps = { list: listKeys, readStaged: (k: string) => readLiveStaged(store, k, decompress), parseStagedKey };
-    const proof = await verifyDrainMaterialization({ store, keyRoot: ROOT, orgId: A.orgId, decompress }, deps);
+    // Identity and digest of the independently written bytes, through the canonical reader (it checks each chunk's
+    // stored sha256 and raw sha256 against the manifest): m2's canonical line is exactly the staged line's canonical form.
+    const s1 = await readCanonicalSession(store, { keyRoot: ROOT, orgId: A.orgId, workspaceId: A.workspaceId,
+      machineId: liveMachineId(A.workspaceId, ORIGIN, A.userId), source: "claude", sessionId: "s1" }, decompress);
+    const m2Lines = (s1 ?? []).filter((c) => c.recordId === "m2");
+    expect(m2Lines.map((c) => c.revision)).toEqual([1]);
+    expect(m2Lines[0]!.text).toBe(canonicalFormOf(line("m2", 1)));
+    const proof = await verify();
     expect(proof.failures).toEqual([]);
-    expect(proof).toMatchObject({ ok: true, exact: 2, excluded_absent: 1 });
-    // A crash before the marker: the rerun reads the bytes back and writes nothing.
-    const canonicalKeys = (await listKeys(`${ROOT}/${A.orgId}/v1`));
+    expect(proof).toMatchObject({ ok: true, exact: 2, index_winners_canonical: 1 });
+    // Replay: a crash before the marker; the rerun reads the bytes back and writes nothing.
+    const canonicalKeys = await listKeys(`${ROOT}/${A.orgId}/v1`);
     await store.delete(objectKey(key + DRAINED_SUFFIX));
     const again = await drain();
+    expect(again.objects.drained).toBe(1);
     expect(again.lines).toMatchObject({ written: 0, materialized: 0, already_stored: 2 });
     expect(await listKeys(`${ROOT}/${A.orgId}/v1`)).toEqual(canonicalKeys);
-    expect((await verifyDrainMaterialization({ store, keyRoot: ROOT, orgId: A.orgId, decompress }, deps)).ok).toBe(true);
+    expect(await verify()).toMatchObject({ ok: true, exact: 2, index_winners_canonical: 1 });
     const marker = JSON.parse(new TextDecoder().decode(await readAll(await store.get(objectKey(key + DRAINED_SUFFIX)))));
     expect(marker).toMatchObject({ outcome: "drained", materialization: 1 });
+    // A replay of the whole drain over the marked stage: already drained, nothing written.
+    const third = await drain();
+    expect(third.objects).toMatchObject({ already_drained: 1, drained: 0 });
+    expect(await listKeys(`${ROOT}/${A.orgId}/v1`)).toEqual(canonicalKeys);
+  });
+
+  test("missing bytes: the same winner with no canonical bytes is refused as exactly one unrecoverable, for that record", async () => {
+    await stageInBoth([{ source: "claude", session: "s9", records: [{ id: "n1", rev: 1 }, { id: "n2", rev: 1, accepted: false }] }]);
+    await full();
+    // The exact winning revision the FULL indexed for n2: revision 1, slot form, its digest.
+    expect(await indexEntry("n2")).toEqual([1, null, sha("n2:1"), sessionKeyHash("claude", "s9"), 0, 0]);
+    await exportStages();
+    const drained = await drain();
+    expect(drained.lines).toMatchObject({ materialized: 1, not_kept: 1 });
+    const proof = await verify();
+    expect(proof.ok).toBe(false);
+    expect(proof.failures).toEqual([{ kind: "unrecoverable", ref: recordRef("n2") }]);
+    // n1 (and the control's records) are still exact.
+    expect(proof.exact).toBe(3);
   });
 });
