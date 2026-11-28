@@ -169,7 +169,7 @@ export function canonicalHolds(canonical: readonly CanonicalLine[] | null, stage
 // ---- verification ----
 
 export type VerifyFailure =
-  | "export_missing" | "missing" | "mismatch" | "index_missing" | "unrecoverable" | "unexpected" | "erased_present" | "baseline_lost" | "undrained" | "marker_invalid" | "no_verdict" | "winner_unbound" | "winner_digest_unproven" | "unreadable";
+  | "export_missing" | "missing" | "mismatch" | "index_missing" | "unrecoverable" | "unexpected" | "erased_present" | "baseline_lost" | "undrained" | "marker_invalid" | "no_verdict" | "winner_unbound" | "winner_digest_unproven" | "winner_digest_mismatch" | "winner_session_mismatch" | "unreadable";
 
 export interface VerifyResult {
   ok: boolean;
@@ -424,7 +424,7 @@ export async function snapshotCanonical(opts: Omit<VerifyOptions, "baseline">, d
 export async function verifyDrainMaterialization(opts: VerifyOptions, deps: VerifyDeps): Promise<VerifyResult> {
   const result: VerifyResult = {
     ok: false, exact: 0, superseded_later: 0, index_winners_canonical: 0, winners_digest_unproven: 0, excluded_absent: 0, baseline_preserved: 0,
-    counts: { export_missing: 0, missing: 0, mismatch: 0, index_missing: 0, unrecoverable: 0, unexpected: 0, erased_present: 0, baseline_lost: 0, undrained: 0, marker_invalid: 0, no_verdict: 0, winner_unbound: 0, winner_digest_unproven: 0, unreadable: 0 },
+    counts: { export_missing: 0, missing: 0, mismatch: 0, index_missing: 0, unrecoverable: 0, unexpected: 0, erased_present: 0, baseline_lost: 0, undrained: 0, marker_invalid: 0, no_verdict: 0, winner_unbound: 0, winner_digest_unproven: 0, winner_digest_mismatch: 0, winner_session_mismatch: 0, unreadable: 0 },
     failures: [],
   };
   const fail = (kind: VerifyFailure, r: string) => {
@@ -448,11 +448,14 @@ export async function verifyDrainMaterialization(opts: VerifyOptions, deps: Veri
   const expected = new Map<string, Line>();
   const allowedForms = new Map<string, Set<string>>();
   const allowedAt = new Set<string>();
+  /** Every allowed line by (record, revision): the candidates an equal-revision winner must be one of. */
+  const allowedLines = new Map<string, Line[]>();
   for (const l of b.allowed) {
     const rk = recordKey(l.tenant, l.origin, l.recordId);
     const prev = expected.get(rk);
     if (!prev || l.revision > prev.revision) expected.set(rk, l);
     allowedAt.add(JSON.stringify([rk, l.revision]));
+    allowedLines.set(JSON.stringify([rk, l.revision]), [...(allowedLines.get(JSON.stringify([rk, l.revision])) ?? []), l]);
     const sk = sessionKey(l.tenant, l.origin, l.source, l.sessionId);
     const set = allowedForms.get(sk) ?? new Set<string>();
     set.add(canonicalFormOf(l.line));
@@ -483,10 +486,23 @@ export async function verifyDrainMaterialization(opts: VerifyOptions, deps: Veri
       continue;
     }
     if (w.entry[0] > l.revision) continue; // judged as an index winner below
-    const lines = (canonical.get(sk) ?? []).filter((c) => c.originId === l.origin && c.recordId === l.recordId);
+    // At the expected revision the winner must BE the staged original: its digest and its session, not only its
+    // revision. The canonical bytes are then judged against that original's canonical form.
+    const original = allowedLines.get(JSON.stringify([rk, l.revision]))?.find((a) => a.digest !== null && a.digest === w.entry[2]);
+    if (!original) {
+      fail("winner_digest_mismatch", ref(rk));
+      continue;
+    }
+    const osk = sessionKey(original.tenant, original.origin, original.source, original.sessionId);
+    if (w.session === null || sessionKey(w.session.tenant, w.session.origin, w.session.source, w.session.sessionId) !== osk) {
+      fail("winner_session_mismatch", ref(rk));
+      continue;
+    }
+    if (!canonical.has(osk)) continue; // unreadable, already failed
+    const lines = (canonical.get(osk) ?? []).filter((c) => c.originId === original.origin && c.recordId === original.recordId);
     const top = lines.reduce<CanonicalLine | null>((a, c) => (!a || c.revision > a.revision ? c : a), null);
     if (!top) fail("missing", ref(rk));
-    else if (top.revision !== l.revision || top.text !== canonicalFormOf(l.line) || lines.some((c) => c.revision === l.revision && c.text !== top.text)) fail("mismatch", ref(rk));
+    else if (top.revision !== l.revision || top.text !== canonicalFormOf(original.line) || lines.some((c) => c.revision === l.revision && c.text !== top.text)) fail("mismatch", ref(rk));
     else result.exact++;
   }
 

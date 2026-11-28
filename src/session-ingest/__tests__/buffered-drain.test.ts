@@ -1647,6 +1647,39 @@ describe("buffered drain materialization (FULL-seeded index)", () => {
     expect((await verify(store2)).counts.erased_present).toBe(1);
   });
 
+  /** Rewrite one stored index entry in place (the shard object), as a corrupted or foreign index would hold it. */
+  async function rewriteEntry(store: ObjectStore, recordId: string, edit: (e: unknown[]) => unknown[]) {
+    const key = KEYS.revisions(ORIGIN, recordId);
+    const doc = await readJson(store, key);
+    doc.records[recordId] = edit([...doc.records[recordId]]);
+    await store.put(objectKey(key), enc.encode(JSON.stringify(doc)));
+  }
+
+  test("equal revision: the winner must carry the staged original's digest and session; canonical bytes alone never qualify", async () => {
+    for (const change of ["control", "digest", "session"] as const) {
+      const store = await scratch();
+      await fullSlots(store, [{ id: "r", rev: 3 }]);
+      await stage(store, [group("claude", "sess-1", [{ id: "r", rev: 3 }])]);
+      await run(store);
+      expect((await canonical(store)).get("sess-1")).toEqual(["r@3"]);
+      // Same revision, same canonical bytes; only the index winner's digest, or its session, is replaced.
+      if (change === "digest") await rewriteEntry(store, "r", (e) => { e[2] = "d".repeat(64); return e; });
+      if (change === "session") {
+        await s3LedgerObjects(store, ROOT).registerOwner(ownerKey("claude", "sess-2"), { v: 1, originId: ORIGIN, source: "claude", sessionId: "sess-2", epoch: 0, resets: 0 });
+        await rewriteEntry(store, "r", (e) => { e[3] = SESS2; return e; });
+      }
+      const proof = await verify(store);
+      if (change === "control") {
+        expect(proof.failures).toEqual([]);
+        expect(proof).toMatchObject({ ok: true, exact: 1 });
+      } else {
+        expect(proof.ok).toBe(false);
+        expect(proof.exact).toBe(0);
+        expect(proof.failures).toEqual([{ kind: change === "digest" ? "winner_digest_mismatch" : "winner_session_mismatch", ref: sha(JSON.stringify([TENANT.orgId, TENANT.workspaceId, TENANT.userId, ORIGIN, "r"])) }]);
+      }
+    }
+  });
+
   test("a bound full-entry winner passes: a staged original with that identity, revision and digest, canonical as is", async () => {
     const store = await scratch();
     await fullSlots(store, [{ id: "r", rev: 2 }]);
