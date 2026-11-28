@@ -763,6 +763,25 @@ hold epoch hash as the DRY recorded it. The approval covers exactly those orgs a
 moved refuses `hold_epoch_changed`. Each org has its own verdict. An execute exits 0 only when every approved org
 completed. Receipts are counts, codes and hashes only.
 
+### Wave-1 enable (a reviewed two-org-hash allow-list)
+
+`marker-execute` and the hold executes may run only for a run whose ENTIRE secret scope (`BACKLOG_OPS_ORGS`) is
+exactly the reviewed pair in `BACKLOG_OPS_MARKER_ENABLED_ORG_HASHES` and `BACKLOG_OPS_HOLD_ENABLED_ORG_HASHES`
+(`backlog-ops.ts`). The lists hold org HASHES (`evidenceHash("org", id)`), never ids. Each is empty or exactly two
+distinct hashes, and the two lists are the same pair. An empty list means held, like the boolean switches, which stay
+false.
+- **Checked three times.** The dispatch requires a non-empty list. The credential step requires the scope to be
+  exactly the pair, before any credential. The tool requires its `--org` set to be exactly the pair.
+- **Refused:** an unset, singleton, substituted, extra or repeated scope (`backlog_ops_<marker|hold>_scope_not_enabled`).
+- **Recorded, not refused:** `hold-dry` and `marker-dry` record `enable_scope` (`match`, `mismatch` or `disabled`) in
+  their receipt. A dry with `match` is the authoritative check that the secret maps to the reviewed pair. No other
+  receipt changes.
+- **Separate from:** the empty-window release's own list (`EMPTY_RELEASE_WAVE_ORG_HASHES`), which is
+  sessions-backlog-integration's commit.
+- **Does not change install readiness:** fan-out stays unproven, so a hold install still refuses before `_install`.
+  Marker publication also stays held pending Pipeline's direct-upload consumer contract. Every dispatch still needs
+  its environment approval, and any live install or marker needs Khaliq's explicit OK.
+
 ## Gates
 
 Every run passes the same gates as the guarded schema release:

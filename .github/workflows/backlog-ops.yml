@@ -125,6 +125,7 @@ on:
       - scripts/backlog-hold.ts
       - src/session-ingest/hold-lifecycle.ts
       - src/session-ingest/__tests__/hold-lifecycle*
+      - src/session-ingest/__tests__/wave1-enable*
       - src/session-ingest/__tests__/backlog-wave*
       - src/session-ingest/__tests__/marker-publication*
       - src/session-ingest/__tests__/org-wave*
@@ -166,6 +167,7 @@ on:
       - scripts/backlog-hold.ts
       - src/session-ingest/hold-lifecycle.ts
       - src/session-ingest/__tests__/hold-lifecycle*
+      - src/session-ingest/__tests__/wave1-enable*
       - src/session-ingest/__tests__/backlog-wave*
       - src/session-ingest/__tests__/marker-publication*
       - src/session-ingest/__tests__/org-wave*
@@ -241,7 +243,7 @@ jobs:
         run: |
           bun test --timeout 120000 ./src/session-ingest/__tests__/org-wave.test.ts ./src/session-ingest/__tests__/marker-publication.test.ts ./src/session-ingest/__tests__/backlog-wave.test.ts
           bun test --timeout 300000 ./src/session-ingest/__tests__/marker-publication.pglite.test.ts
-          bun test --timeout 300000 ./src/session-ingest/__tests__/hold-lifecycle.test.ts ./src/session-ingest/__tests__/hold-lifecycle.pglite.test.ts
+          bun test --timeout 300000 ./src/session-ingest/__tests__/hold-lifecycle.test.ts ./src/session-ingest/__tests__/hold-lifecycle.pglite.test.ts ./src/session-ingest/__tests__/wave1-enable.test.ts
       - name: Relocated-ledger stores and fork guard of the backfill and the drain (in-process fake buckets, no credentials)
         run: bun test --timeout 120000 ./src/session-ingest/__tests__/ledger-tool-store.test.ts
       - name: The drain and the backfill end to end, routed and single-bucket (scratch stores, in-process PGlite, no credentials)

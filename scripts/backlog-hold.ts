@@ -15,7 +15,8 @@ import { readFileSync } from "node:fs";
 import { parseArgs } from "node:util";
 import pg from "pg";
 import { ownerClientConfig } from "../src/shared/owner-pg-config.ts";
-import { BACKLOG_OPS_HOLD_EXECUTE_ENABLED } from "../src/session-ingest/backlog-ops.ts";
+import { BACKLOG_OPS_HOLD_ENABLED_ORG_HASHES, BACKLOG_OPS_HOLD_EXECUTE_ENABLED, requireScopeEnabled } from "../src/session-ingest/backlog-ops.ts";
+import { evidenceHash } from "../src/session-ingest/authority-evidence.ts";
 import { HOLD_LIFECYCLE_CONCURRENCY, HOLD_TOOL_REFUSALS, holdRun, type HoldSqlSession, type HoldStep } from "../src/session-ingest/hold-lifecycle.ts";
 import { waveOrgList } from "../src/session-ingest/org-wave.ts";
 import { sessionPool } from "./backlog-marker.ts";
@@ -76,7 +77,10 @@ export function pgHoldSession(client: { query(text: string, params?: unknown[]):
 
 export async function main(argv: readonly string[], deps: { stdin?: () => string } = {}) {
   const a = parseHoldArgs(argv);
-  if (a.step !== "dry" && BACKLOG_OPS_HOLD_EXECUTE_ENABLED !== true) fail("hold_execute_held");
+  if (a.step !== "dry") {
+    try { requireScopeEnabled(a.orgs.map((o) => evidenceHash("org", o)), BACKLOG_OPS_HOLD_EXECUTE_ENABLED, BACKLOG_OPS_HOLD_ENABLED_ORG_HASHES, "hold_execute_held"); }
+    catch { fail("hold_execute_held"); }
+  }
   const input = holdStdin((deps.stdin ?? (() => readFileSync(0, "utf8")))().split("\n")[0] ?? "", a.step);
   const dbUrl = input.dbUrl;
   input.dbUrl = "";

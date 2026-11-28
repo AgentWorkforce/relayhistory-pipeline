@@ -20,7 +20,8 @@ import pg from "pg";
 import { createS3Store, type ObjectStore } from "../src/shared/vendor.ts";
 import { ownerClientConfig } from "../src/shared/owner-pg-config.ts";
 import { AUTHORITY_EVIDENCE, type AuthorityEvidenceSources } from "../src/session-ingest/authority-evidence.ts";
-import { BACKLOG_OPS_MARKER_EXECUTE_ENABLED, backlogOpsScope } from "../src/session-ingest/backlog-ops.ts";
+import { BACKLOG_OPS_MARKER_ENABLED_ORG_HASHES, BACKLOG_OPS_MARKER_EXECUTE_ENABLED, backlogOpsScope, requireScopeEnabled } from "../src/session-ingest/backlog-ops.ts";
+import { evidenceHash } from "../src/session-ingest/authority-evidence.ts";
 import { BACKLOG_AUTHORITY_KEY_ROOT, CLOUDFLARE_TOKEN, cloudflareGet } from "../src/session-ingest/backlog-authority.ts";
 import {
   MARKER_LOCK_TIMEOUT_MS,
@@ -157,7 +158,11 @@ function awsCredentials(env: NodeJS.ProcessEnv) {
 
 export async function main(argv: readonly string[], env: NodeJS.ProcessEnv, deps: { stdin?: () => string } = {}) {
   const args = parseMarkerArgs(argv);
-  if (args.command === "execute" && BACKLOG_OPS_MARKER_EXECUTE_ENABLED !== true) fail("marker_execute_held");
+  // The switch, or every --org inside the reviewed two-hash allow-list (backlog-ops.ts); a refusal names no org.
+  if (args.command === "execute") {
+    try { requireScopeEnabled(args.orgs.map((o) => evidenceHash("org", o)), BACKLOG_OPS_MARKER_EXECUTE_ENABLED, BACKLOG_OPS_MARKER_ENABLED_ORG_HASHES, "marker_execute_held"); }
+    catch { fail("marker_execute_held"); }
+  }
   const input = markerStdin((deps.stdin ?? (() => readFileSync(0, "utf8")))().split("\n")[0] ?? "", args.command);
   const dbUrl = input.dbUrl;
   input.dbUrl = "";

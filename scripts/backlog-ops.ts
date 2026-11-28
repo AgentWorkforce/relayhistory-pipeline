@@ -47,6 +47,12 @@ import { fileURLToPath } from "node:url";
 import { releaseConnection } from "../src/hoopdb/schema-release-contract.ts";
 import {
   BACKLOG_OPS_CATCHUP_MARGIN_MS,
+  BACKLOG_OPS_HOLD_ENABLED_ORG_HASHES,
+  BACKLOG_OPS_HOLD_EXECUTE_ENABLED,
+  BACKLOG_OPS_MARKER_ENABLED_ORG_HASHES,
+  BACKLOG_OPS_MARKER_EXECUTE_ENABLED,
+  requireScopeEnabled,
+  enabledScope,
   BACKLOG_OPS_RECEIPT_FILE,
   BACKLOG_OPS_SESSION_SECONDS,
   backlogOpsBindingMaxAgeMs,
@@ -359,6 +365,11 @@ export async function backlogOpsRun(
   const nhp = backlogOpsNoHeadParity(env, d, scope);
   for (const org of nhp?.orgs ?? []) console.log(`::add-mask::${org}`);
   const since = backlogOpsRevisionsSince(env, d);
+  // The wave-1 enable (backlog-ops.ts): a marker or hold execute only for a scope wholly inside its reviewed allow-list,
+  // checked before any credential (a no-op where the global switch is on).
+  const scopeHashes = scope.orgs ? scope.orgs.map((o) => evidenceHash("org", o)) : null;
+  if (d.mode === "marker-execute") requireScopeEnabled(scopeHashes, BACKLOG_OPS_MARKER_EXECUTE_ENABLED, BACKLOG_OPS_MARKER_ENABLED_ORG_HASHES, "backlog_ops_marker_scope_not_enabled");
+  if (isHold(d.mode) && isExecute(d.mode)) requireScopeEnabled(scopeHashes, BACKLOG_OPS_HOLD_EXECUTE_ENABLED, BACKLOG_OPS_HOLD_ENABLED_ORG_HASHES, "backlog_ops_hold_scope_not_enabled");
   // The authority modes' Cloudflare token (shape; and empty for every other mode), before any credential.
   backlogOpsCloudflareToken(env, d);
   const t = backlogOpsTarget(env), spec = backlogOpsToolArgs(d, t, scope, isCatchup(d.mode) || isBridge(d.mode) ? since : null, toolOf(d.mode) === "export" ? nhp : null);
@@ -439,6 +450,10 @@ export async function backlogOpsRun(
       bound.hold ? bound.hold.approved : null);
     exit = receipt.exitCode === 0 && code === 0 ? 0 : 1;
   }
+  // The wave-1 scope verification (a dry records it; it refuses nothing): whether this run's secret scope is exactly the
+  // reviewed enable pair. Only hold-dry and marker-dry carry it, so every other receipt is byte-identical.
+  if (d.mode === "hold-dry" || d.mode === "marker-dry")
+    receipt = { ...receipt, enable_scope: enabledScope(scopeHashes, d.mode === "hold-dry" ? BACKLOG_OPS_HOLD_ENABLED_ORG_HASHES : BACKLOG_OPS_MARKER_ENABLED_ORG_HASHES) };
   writePrivate(paths.receipt, receipt);
   console.log("backlog_ops_receipt " + JSON.stringify(receipt));
   return exit;
