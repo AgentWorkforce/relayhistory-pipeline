@@ -1,0 +1,176 @@
+/**
+ * The benchmark's world model (docs/session-intel-overlap-bench.md, "Model"): sessions grouped into work roots,
+ * with time-ordered edits, PR references and relay messages, built from a Cloud harvest. Pure: callers load files.
+ */
+import type { EventFacts } from "../cloud-harvest/features.ts";
+import type { DirectoryRow, SessionFacts } from "../cloud-harvest/harvest.ts";
+import { HOT_PATH, repoOf, repoRelative } from "./paths.ts";
+import { canonicalTs, elapsedNs, NS_PER_MINUTE } from "../cloud-harvest/instant.ts";
+
+/** `repo` is the edit's own repository: taken from an absolute path when it names one, else the session's. */
+export interface Edit { ts: string; repo: string; path: string; via: string; hot: boolean }
+/** `undated` marks a ref known only as fetched (the directory row's PR); scoring may link through it, detectors never read it. */
+export interface PrRef { ts: string; repo: string | null; number: number; action: "create" | "mention"; undated?: true }
+export interface Message { ts: string; from: string; to: string }
+
+export interface Session {
+  key: string;
+  source: string;
+  sessionId: string;
+  owner: string | null;
+  repo: string | null;
+  root: string;
+  parents: string[];
+  startedAt: string;
+  lastTs: string;
+  edits: Edit[];
+  prs: PrRef[];
+  branches: Array<{ ts: string; name: string }>;
+  shas: Array<{ ts: string; sha: string }>;
+  received: Message[];
+  /** Relay names this session answers to (the `to` of messages it received). */
+  names: Set<string>;
+}
+
+export const sessionKey = (source: string, sessionId: string) => `${source}:${sessionId}`;
+
+function projectName(row: DirectoryRow): string | null {
+  const p = row.project as { name?: unknown; detail?: unknown } | null | undefined;
+  return repoOf(typeof p?.name === "string" ? p.name : null) ?? repoOf(typeof p?.detail === "string" ? p.detail : null) ?? repoOf(row.projectId as string | null);
+}
+
+const PR_KEY = /^([a-z0-9._-]+\/[a-z0-9._-]+)?#(\d+)$/i;
+
+/** A `gh pr create` call's PR URL arrives in the tool result after it; a result this soon after claims the number. */
+const CREATE_RESULT_NS = 10n * NS_PER_MINUTE;
+
+/** Events stamped before this (epoch zero, clock faults) carry no usable time and are dropped. */
+/** In canonicalTs form, like every time the model holds. */
+export const EARLIEST_TS = "2025-01-01T00:00:00.000000000Z";
+
+/**
+ * How paths a session only observed are treated. `git status` and `git diff --stat` list what is dirty or changed,
+ * not what this session wrote: a checkout left dirty by earlier work repeats the same paths in every session that
+ * looks at it, and `--stat` often shows someone else's commit. `all` counts them as edits; `fresh` keeps only
+ * `git status` paths that the session's first status did not already list (the dirt it started with) and drops
+ * `--stat` paths (a path the session wrote is already counted from the write); `none` drops observed paths.
+ */
+export type ObservedPolicy = "all" | "fresh" | "none";
+const OBSERVED = new Set(["status", "stat"]);
+
+function pushMention(s: Session, ref: string, ts: string) {
+  const m = PR_KEY.exec(ref);
+  if (m) s.prs.push({ ts, repo: m[1] ? m[1].toLowerCase() : s.repo?.toLowerCase() ?? null, number: Number(m[2]), action: "mention" });
+}
+
+function fromFacts(s: Session, events: EventFacts[], observed: ObservedPolicy) {
+  let pendingCreate: { ts: string; index: number; seq: number | undefined } | null = null;
+  let baseline: Set<string> | null = null;
+  for (const raw of events) {
+    // Times are held in one fixed width at full precision, so string order is time order (canonicalTs).
+    const ts = canonicalTs(raw.ts);
+    if (ts === null || !(ts >= EARLIEST_TS)) continue;
+    const e = ts === raw.ts ? raw : { ...raw, ts };
+    const seen = e.touched.filter((t) => t.via === "status").map((t) => t.path);
+    const first = baseline === null && seen.length > 0;
+    for (const path of [...new Set([...e.files, ...e.touched.map((t) => t.path)])]) {
+      const via = e.files.includes(path) ? "files" : e.touched.find((t) => t.path === path)!.via;
+      if (OBSERVED.has(via)) {
+        if (observed === "none") continue;
+        if (observed === "fresh" && (via === "stat" || first || baseline?.has(path))) continue;
+      }
+      const repo = (path.startsWith("/") || path.startsWith("~") ? repoOf(path) : null) ?? s.repo;
+      const rel = repo ? repoRelative(path, repo) : null;
+      if (repo && rel && !rel.endsWith("/")) s.edits.push({ ts: e.ts, repo, path: rel, via, hot: HOT_PATH.test(rel) });
+    }
+    if (first) baseline = new Set(seen);
+    const creates = e.gh.includes("pr-create");
+    // Only a call that is exactly one `gh pr create` may have its result claim a PR; a compound call is an act
+    // of opening a PR that owns nothing (its result could come from another segment).
+    const claimable = e.gh.includes("pr-create-sole");
+    // A create call usually names no number; its own result does. Only the call's own result may claim it: the
+    // very next raw event (by `seq`, counting events that were not kept), a tool result, within CREATE_RESULT_NS,
+    // not failed. Facts carry no tool-use id, so with parallel calls (the next raw event is another call) or without
+    // `seq` (facts harvested before it) the claim abstains. The PR is owned from the result's time.
+    // The result must come at or after its call: elapsed time is bounded below by 0 and above by CREATE_RESULT_NS.
+    // An unresolved call stays as a placeholder (number -1): an act of opening a PR, owning nothing. A failed
+    // result removes it. PR numbers a create call itself names (a --body or --title citing another PR) are
+    // mentions, never the PR being created: only the result knows that one.
+    const isResult = e.type === "tool_result" || e.role === "tool_result";
+    if (pendingCreate) {
+      const el = elapsedNs(pendingCreate.ts, e.ts);
+      if (el < 0n || el > CREATE_RESULT_NS || (!isResult && !creates)) pendingCreate = null;
+    }
+    const adjacent = pendingCreate !== null && pendingCreate.seq !== undefined && e.seq === pendingCreate.seq + 1;
+    if (pendingCreate && isResult && !adjacent) pendingCreate = null;
+    if (pendingCreate && isResult) {
+      // The result must identify exactly one PR: with two distinct PR URLs it cannot say which one was created.
+      const urls = [...new Map(e.prRefs.map((r) => PR_KEY.exec(r)).filter((m): m is RegExpExecArray => !!m?.[1]).map((m) => [`${m[1]!.toLowerCase()}#${m[2]}`, m])).values()];
+      const url = urls.length === 1 ? urls[0] : undefined;
+      // Positive evidence only: the result must say "success". Error, cancellation or an unknown status claims nothing.
+      const succeeded = e.toolStatus === "success";
+      const failed = !succeeded && /error|fail|cancel/i.test(e.toolStatus ?? "");
+      if (url && succeeded) s.prs[pendingCreate.index] = { ts: e.ts, repo: url[1]!.toLowerCase(), number: Number(url[2]), action: "create" };
+      else if (failed) s.prs.splice(pendingCreate.index, 1);
+      pendingCreate = null;
+      for (const ref of e.prRefs) if (ref !== url?.[0]) pushMention(s, ref, e.ts);
+    } else {
+      for (const ref of e.prRefs) pushMention(s, ref, e.ts);
+      if (creates) {
+        s.prs.push({ ts: e.ts, repo: s.repo?.toLowerCase() ?? null, number: -1, action: "create" });
+        pendingCreate = claimable ? { ts: e.ts, index: s.prs.length - 1, seq: e.seq } : null;
+      }
+    }
+    for (const b of e.branches) s.branches.push({ ts: e.ts, name: b });
+    for (const sha of e.shas) s.shas.push({ ts: e.ts, sha: sha.toLowerCase() });
+    if (e.relay) { s.received.push({ ts: e.ts, from: e.relay.from, to: e.relay.to }); s.names.add(e.relay.to); }
+  }
+}
+
+/** Builds sessions and resolves each one's work root by following same-source parents. */
+export function buildModel(rows: DirectoryRow[], facts: SessionFacts[], observed: ObservedPolicy = "all"): Map<string, Session> {
+  const sessions = new Map<string, Session>();
+  for (const r of rows) {
+    const key = sessionKey(r.source, r.sessionId);
+    const users = (r.userIds as string[] | null) ?? [];
+    sessions.set(key, {
+      key, source: r.source, sessionId: r.sessionId, owner: users[0] ?? null, repo: projectName(r),
+      root: key, parents: ((r.parentSessionIds as string[] | null) ?? []).map((p) => sessionKey(r.source, p)),
+      startedAt: canonicalTs(r.createdAt) ?? canonicalTs(r.lastTs) ?? String(r.createdAt ?? r.lastTs), lastTs: canonicalTs(r.lastTs) ?? r.lastTs, edits: [], prs: [], branches: [], shas: [], received: [], names: new Set(),
+    });
+    const pr = r.pullRequest as { url?: string; number?: string | number } | null;
+    if (pr?.number) sessions.get(key)!.prs.push({ ts: sessions.get(key)!.lastTs, repo: repoOf(pr.url ?? null)?.toLowerCase() ?? null, number: Number(pr.number), action: "mention", undated: true });
+  }
+  for (const f of facts) {
+    const s = sessions.get(sessionKey(f.source, f.sessionId));
+    if (s) fromFacts(s, f.events, observed);
+  }
+  for (const s of sessions.values()) {
+    const seen = new Set<string>();
+    let cur = s;
+    while (cur.parents.length && !seen.has(cur.key)) {
+      seen.add(cur.key);
+      const parent = sessions.get(cur.parents[0]!);
+      if (!parent) { s.root = cur.parents[0]!; break; }
+      cur = parent; s.root = cur.key;
+    }
+    s.edits.sort((a, b) => (a.ts < b.ts ? -1 : a.ts > b.ts ? 1 : 0));
+  }
+  return sessions;
+}
+
+/**
+ * Pairs that communicated over Agent Relay before `at`: one received a message from a name the other answers to.
+ * Keyed by work root, so a lead messaging a worker covers both roots.
+ */
+export function communicated(sessions: Map<string, Session>): (rootA: string, rootB: string, at: string) => boolean {
+  const byName = new Map<string, Set<string>>();
+  for (const s of sessions.values()) for (const n of s.names) byName.set(n, (byName.get(n) ?? new Set()).add(s.root));
+  const first = new Map<string, string>();
+  for (const s of sessions.values()) for (const m of s.received) for (const other of byName.get(m.from) ?? []) {
+    if (other === s.root) continue;
+    const k = [s.root, other].sort().join("\u0001");
+    if (!first.has(k) || m.ts < first.get(k)!) first.set(k, m.ts);
+  }
+  return (a, b, at) => { const t = first.get([a, b].sort().join("\u0001")); return t !== undefined && t < at; };
+}
