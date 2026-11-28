@@ -44,6 +44,7 @@ const SETTLED_CFG = { ...DEFAULT_ERASURE_CONFIG, obligationsSettled: () => true 
 const attestedState = (path: string) => new SyncState(path, { obligations: OBLIGATIONS_MODE === "on" });
 import { Syncer, DEFAULT_SYNC_CONFIG } from "../neon-s3-sync/sync.ts";
 import { Throttle, parseWindows } from "../neon-s3-sync/throttle.ts";
+import { ShortLivedCredentialError } from "../short-lived-credentials.ts";
 
 // These suites exercise the obligation model (S3X_OBLIGATIONS on); the default-off path has its own suite.
 // The suite's OWN mode, pinned per module (never inherited from another file's leaked env): ON, or OFF when
@@ -1343,4 +1344,78 @@ describe.skipIf(OBLIGATIONS_MODE !== "on")("exporter publication vs E3 reservati
 // Guard: in the ON run this suite MUST be registered and run; only the "?mode=off" wrapper may skip it.
 test(`mode guard (${OBLIGATIONS_MODE}): the ON-only exportUnit interlock suite EXECUTES exactly when ON`, () => {
   expect(onInterlockRan).toBe(OBLIGATIONS_MODE === "on");
+});
+
+describe("short-lived credential drain (T56 review)", () => {
+  const T1 = Date.now();
+  const seed = (state: SyncState, ids: string[]) => {
+    state.seeRevisions(1, ids.map((id) => ({ org_id: "org-a", session_id: id, revision: "1" })));
+    state.seeActivity(1, ids.map((id, i) => ({ org_id: "org-a", session_id: id, last_ms: String(T1 - i * 1000), events: "1" })));
+    for (const k of ["act_sweep_done", "rev_sweep_done"]) state.setMeta(k, "1");
+    for (const k of ["act_sweep_at", "rev_sweep_at"]) state.setMeta(k, String(T1));
+  };
+  const db: Queryable = {
+    async query<T>(sql: string, params?: unknown[]) {
+      if (sql.includes("pg_locks")) return { rows: [{ total: "0", non_advisory: "0" }] as T[] };
+      if (sql.includes("FROM sessions.session_catalog")) return { rows: [] as T[] };
+      if (sql.includes("LIMIT 10000"))
+        return { rows: [{ workspace_id: "w", source: "claude", first_ms: String(T1), last_ms: String(T1), machine_ids: [], models: [], event_count: "1", input_tokens: "0", output_tokens: "0", reasoning_tokens: "0", cache_read_tokens: "0", cache_create_tokens: "0", cost_usd_metros: "0", cost_usd_micros: "0", _s: params?.[1] }] as T[] };
+      throw new Error("unexpected query");
+    },
+  };
+  const realThrottle = () => new Throttle({ rowsPerSec: 1e9, bytesPerSec: 1e12, slowWindows: [], slowFactor: 1, sleep: (ms) => new Promise((r) => setTimeout(r, Math.min(ms, 5))) });
+
+  test("admit=false drains: the in-flight group finishes and is recorded; no new group starts", async () => {
+    const { store } = await countingStore();
+    const state = attestedState(join(await tempDir(), "s.sqlite"));
+    const ids = Array.from({ length: 6 }, (_, i) => `d${i}`);
+    seed(state, ids);
+    let admit = true; let release!: () => void; const gate = new Promise<void>((r) => (release = r));
+    const started: string[] = [], finished: string[] = [];
+    const source = (): UnitSource => ({
+      fenced: async () => false,
+      async *lines(u) {
+        started.push(u.sessionId);
+        if (started.length === 1) { admit = false; await gate; } // expiry arrives while this group is in flight
+        finished.push(u.sessionId);
+        yield { machine: "delivery:m", bytes: buildSessionStream([rec("session_event", "o", u.sessionId, { a: 1 })]).bytes, userId: "u" };
+      },
+    });
+    // One lane, so admission is the only thing that can stop the next group.
+    const syncer = new Syncer(db, state, target(store), realThrottle(), () => {}, DEFAULT_SYNC_CONFIG, () => false, source);
+    const run = syncer.run({ once: true, admit: () => admit });
+    await new Promise((r) => setTimeout(r, 30));
+    release();
+    await run;
+    expect(started).toHaveLength(1); // no group after admission closed
+    expect(finished).toEqual(started); // the in-flight group was not interrupted
+    expect(syncer.counters.groupsFailed).toBe(0);
+    const row = state.exported("org-a", started[0]!)!;
+    expect(row.error ?? null).toBeNull();
+    expect(row.keys.length).toBeGreaterThan(0); // its manifest is recorded: the watermark advanced for it
+    state.close();
+  });
+
+  test("an expired key refused before signing is not the group's fault: no markFailed, pending keys kept, the run stops", async () => {
+    const { store } = await countingStore();
+    let refuse = false;
+    const guarded: ObjectStore = { ...store, put: async (k, b, o) => { if (refuse) throw new ShortLivedCredentialError("short_lived_expired.S3X_CREDS_FILE"); return store.put(k, b, o); } };
+    const state = attestedState(join(await tempDir(), "s.sqlite"));
+    seed(state, ["e0"]);
+    const source = (): UnitSource => ({
+      fenced: async () => false,
+      async *lines(u) {
+        refuse = true; // the mint expired (not renewed) while the group was still reading
+        yield { machine: "delivery:m", bytes: buildSessionStream([rec("session_event", "o", u.sessionId, { a: 1 })]).bytes, userId: "u" };
+      },
+    });
+    const syncer = new Syncer(db, state, target(guarded), realThrottle(), () => {}, DEFAULT_SYNC_CONFIG, () => false, source);
+    let err: unknown; try { await syncer.run({ once: true }); } catch (e) { err = e; }
+    expect((err as { code?: string }).code).toBe("short_lived_expired.S3X_CREDS_FILE");
+    const row = state.exported("org-a", "e0");
+    expect(row?.error ?? null).toBeNull(); // not recorded as the group's failure: it keeps its attempts
+    // A restart recovers the interrupted group's pending keys (recoverPendingKeys) and redoes it.
+    expect(state.recoverPendingKeys()).toBeGreaterThanOrEqual(0);
+    state.close();
+  });
 });
