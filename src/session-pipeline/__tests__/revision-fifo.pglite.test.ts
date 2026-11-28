@@ -437,6 +437,29 @@ describe("FIFO redelivery shapes (head-only, beyond ten)", () => {
     const line = named(second.lines, "revision searchable").find((l) => l.revision === 12)!;
     expect(line).toMatchObject({ picked_up_at_ms: T0 + 1_500, commit_to_pickup_ms: 1_500 - 120 });
   });
+
+  test("burst of 12 across two receives: all 12 stay in the denominator, each with exactly one outcome line", async () => {
+    const t = await rig();
+    const events: RevisionEvent[] = [];
+    for (let rev = 1; rev <= 12; rev++) events.push(await t.writer(rev, `r${rev}`, loc, new Date(T0 + rev * 10).toISOString()));
+    const recs = events.map((e, i) => t.record(e, T0 + i * 10));
+    const first = await t.run(recs.slice(0, 10));
+    const second = await t.run(recs.slice(10));
+    const lines = [...first.lines, ...second.lines];
+    const outcome = new Map<number, string[]>();
+    for (const name of ["revision searchable", "revision covered", "revision unobserved"]) {
+      for (const l of named(lines, name)) outcome.set(l.revision as number, [...(outcome.get(l.revision as number) ?? []), name]);
+    }
+    expect([...outcome.keys()].sort((a, b) => a - b)).toEqual(Array.from({ length: 12 }, (_, i) => i + 1));
+    for (const names of outcome.values()) expect(names).toHaveLength(1);
+    // Revisions 1-11 are covered by 12's pass, each interval from ITS OWN commit (revision r committed at T0 + r*10).
+    const live = named(lines, "revision searchable")[0]!;
+    expect(live).toMatchObject({ revision: 12 });
+    for (const l of named(lines, "revision covered")) {
+      expect(l).toMatchObject({ covered_by_revision: 12 });
+      expect(l.commit_to_pickup_ms).toBe((live.commit_to_pickup_ms as number) + (12 - (l.revision as number)) * 10);
+    }
+  });
 });
 
 describe("in-flight pass: park it, commit a newer revision, then crash or lose the ack", () => {
