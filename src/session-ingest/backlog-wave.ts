@@ -19,7 +19,8 @@
  * Bindings. A consumer that binds a wave receipt checks it PER ORG, through waveView: the org's slice as a single-org
  * receipt (the wave's top-level fields with the org's single-org scope id, its exit_code and summary). A non-wave
  * receipt bound by a wave run gets the same per-org view: its scope must first be exactly the wave's, then it is
- * re-scoped to the org with its per-org lists (authority evidence, baseline, reshard verdicts) sliced to that org.
+ * re-scoped to the org with its per-org lists (authority evidence, baseline, reshard verdicts) sliced to that org. A
+ * bound receipt of any other scope (one org alone, a subset, unscoped) is refused before slicing.
  * The existing per-receipt checks run unchanged on each view, so one org's binding failing refuses that org alone.
  * Views are for checking only. Every evidence hash (the marker attempt's, the bridge's) stays sha256 over the bound
  * file's exact bytes, never over a view.
@@ -102,15 +103,18 @@ const sliceList = (list: unknown, key: string, h: string) => (Array.isArray(list
 
 /**
  * One org's view of a bound receipt (raw JSON), for the existing per-receipt checks. `waveScope` is the wave's scope
- * id: a non-wave receipt must carry exactly it (else the view keeps its own scope, so the check refuses). A wave
- * receipt must also carry the wave's scope; its view is the org's slice. Refuses `backlog_ops_wave_view` when the
- * receipt is not JSON, or a wave receipt has no slice for the org.
+ * id: every bound receipt, wave or not, must carry exactly it (`backlog_ops_wave_scope` otherwise, before any
+ * slicing; an unscoped or subset-scoped receipt never stands in for a wave). A wave receipt's view is the org's
+ * slice. Refuses `backlog_ops_wave_view` when the receipt is not JSON, or a wave receipt has no slice for the org.
  */
 export function waveView(raw: string, org: string, waveScope: string): string {
   let r: Record<string, any>;
   try { r = JSON.parse(raw); } catch { return refuse("backlog_ops_wave_view"); }
   if (!isObj(r)) refuse("backlog_ops_wave_view");
-  const h = evidenceHash("org", org), scope = r.scope === waveScope ? orgScopeId(org) : r.scope;
+  // The bound receipt must carry EXACTLY the wave's scope, wave or not: a receipt scoped to a subset (e.g. one org
+  // alone) or unscoped would otherwise pass that org's single-org check in a dispatch approved for the whole wave.
+  if (typeof r.scope !== "string" || r.scope !== waveScope) refuse("backlog_ops_wave_scope");
+  const h = evidenceHash("org", org), scope = orgScopeId(org);
   if (isObj(r.summary) && r.summary.kind === "wave") {
     const s = (Array.isArray(r.summary.per_org) ? r.summary.per_org : []).filter((p: unknown) => isObj(p) && p.org_hash === h);
     if (s.length !== 1) refuse("backlog_ops_wave_view");
