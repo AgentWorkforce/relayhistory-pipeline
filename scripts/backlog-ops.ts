@@ -345,7 +345,7 @@ export async function backlogOpsRun(
   let bound: BoundAuthority = {};
   let perOrgBound: Map<string, { bound: BoundAuthority; since: number | null } | string> | null = null;
   // A per-org retry: the orgs its previous run completed are carried, with that run's creation time.
-  const carried = waveRun && d.previousRun ? previousSlices(env, d, scope, ledgerIdFor(env, d), since) : new Map<string, { summary: unknown; carriedMs: number }>();
+  const carried = waveRun && d.previousRun ? previousSlices(env, d, scope, ledgerIdFor(env, d)) : new Map<string, { summary: unknown; carriedMs: number }>();
   // The drain's max_objects is a per-RUN cap: a wave splits it across its outstanding orgs (the sum never exceeds it; every org
   // gets at least one object, so a budget below the org count refuses).
   const budgets = waveRun ? waveBudgets(d.maxObjects, scope.orgs!.filter((o) => !carried.has(o))) : null;
@@ -390,13 +390,14 @@ export async function backlogOpsRun(
     }, { fallback: "backlog_ops_wave_org_failed" });
     const ran = new Map(settled.map((x) => [x.org, x.ok ? x.value : { org: x.org, exitCode: 1, summary: { refused: x.code } }]));
     const slices = orgs.map((o) => carried.has(o) ? { org: o, exitCode: 0, summary: carried.get(o)!.summary, carriedMs: carried.get(o)!.carriedMs } : ran.get(o)!);
-    const checked = waveReceiptSummary(waveSummary(orgs, slices), orgs, (sl) => waveSliceCheck(d, sl));
+    const writtenMs = Date.now();
+    const checked = waveReceiptSummary(waveSummary(orgs, slices), orgs, (sl) => waveSliceCheck(d, sl), { previousRun: d.previousRun ?? null, writtenMs });
     const sumC = checked.summary as { ok_count?: number };
     // An execute is complete only when EVERY org completed: an incomplete one exits nonzero (its receipt keeps every
     // slice, so a retry with previous_run runs only the outstanding orgs). A dry run may show an eligible subset.
     const complete = checked.ok && (!isExecute(d.mode) || sumC.ok_count === orgs.length);
     receipt = { ...backlogOpsReceipt(d, env.GITHUB_RUN_ID!, 0, "{}", scope.id, ledger, nhpId, home),
-      bindings: waveBindings(d), ...(d.previousRun ? { previous_run: d.previousRun } : {}), summary: checked.summary, exitCode: complete ? 0 : 1 };
+      bindings: waveBindings(d), ...(d.previousRun ? { previous_run: d.previousRun } : {}), written_ms: writtenMs, summary: checked.summary, exitCode: complete ? 0 : 1 };
     exit = receipt.exitCode;
     // A green wave run may still have refused orgs: say how many completed (counts only, never an org).
     const sum = checked.summary as { ok_count?: number; org_count?: number };
@@ -424,7 +425,7 @@ const ledgerIdFor = (env: Record<string, string | undefined>, d: BacklogOpsDispa
  * completed, each with the time it really ran (its own carried_ms, or the previous run's creation).
  */
 export function previousSlices(env: Record<string, string | undefined>, d: BacklogOpsDispatch, scope: { orgs: string[] | null; id: string }, ledger: string,
-  _since: number | null, read: (p: string) => string = (p) => readFileSync(p, "utf8")): Map<string, { summary: unknown; carriedMs: number }> {
+  read: (p: string) => string = (p) => readFileSync(p, "utf8")): Map<string, { summary: unknown; carriedMs: number }> {
   const raw = (() => { try { return read(backlogOpsPaths(env).bound("previous")); } catch { return refuse("backlog_ops_bound_previous_missing"); } })();
   const createdRaw = env.BACKLOG_OPS_PREVIOUS_CREATED_MS ?? "";
   if (!/^[1-9][0-9]{0,15}$/u.test(createdRaw)) refuse("backlog_ops_previous_created");
@@ -436,7 +437,7 @@ export function previousSlices(env: Record<string, string | undefined>, d: Backl
   if (!r || r.contract !== "backlog-ops-receipt/v1" || r.mode !== d.mode || r.sha !== d.sha || r.run !== d.previousRun || r.scope !== scope.id ||
       r.ledger !== ledger || r.home !== home || r.exitCode === 0 || JSON.stringify(r.bindings) !== JSON.stringify(waveBindings(d)))
     refuse("backlog_ops_bound_previous_receipt");
-  const checked = waveReceiptSummary(r.summary, scope.orgs, (sl) => waveSliceCheck(d, sl));
+  const checked = waveReceiptSummary(r.summary, scope.orgs, (sl) => waveSliceCheck(d, sl), { previousRun: r.previous_run, writtenMs: r.written_ms });
   if ((checked.summary as { refused?: unknown }).refused !== undefined && !Array.isArray((checked.summary as { per_org?: unknown }).per_org))
     refuse("backlog_ops_bound_previous_receipt");
   const per = (checked.summary as { per_org: { org_hash: string; exit_code: number; summary: unknown; carried_ms?: number }[] }).per_org;

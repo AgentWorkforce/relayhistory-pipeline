@@ -402,3 +402,20 @@ test("gate: previous_run is this execute at this sha, FAILED, first attempt, by 
   expect(await gate((f) => { f.bound["702"].run_attempt = 2; })).toBe("backlog_ops_gate_previous_run");
   expect(await gate((f) => { f.bound["702"].head_sha = "2".repeat(40); })).toBe("backlog_ops_gate_previous_run");
 });
+
+test("consumer hardening: a carried slice only with previous_run, and never after the receipt was written", () => {
+  const slice = (s: unknown) => s;
+  const W = Date.now();
+  const w = waveSummary(TWO, TWO.map((o) => ({ org: o, exitCode: 0, summary: { listed: 1 }, ...(o === A ? { carriedMs: W - 1000 } : {}) })));
+  expect(waveReceiptSummary(w, TWO, slice, { previousRun: "702", writtenMs: W }).ok).toBe(true);
+  expect(waveReceiptSummary(w, TWO, slice, { previousRun: null, writtenMs: W }).ok).toBe(false);
+  expect(waveReceiptSummary(w, TWO, slice).ok).toBe(false);
+  expect(waveReceiptSummary(w, TWO, slice, { previousRun: "702", writtenMs: W - 2000 }).ok).toBe(false);
+  const top = { contract: "backlog-ops-receipt/v1", mode: "backfill-execute", sha: SHA, run: "712", scope: SCOPE_ID, ledger: "none", exitCode: 0, summary: w };
+  expect(JSON.parse(waveView(JSON.stringify({ ...top, previous_run: "702", written_ms: W }), A, SCOPE_ID)).carried_ms).toBe(W - 1000);
+  expect(code(() => waveView(JSON.stringify({ ...top, written_ms: W }), A, SCOPE_ID))).toBe("backlog_ops_wave_view");
+  expect(code(() => waveView(JSON.stringify({ ...top, previous_run: "702", written_ms: W - 5000 }), A, SCOPE_ID))).toBe("backlog_ops_wave_view");
+  expect(code(() => waveView(JSON.stringify({ ...top, previous_run: "702" }), A, SCOPE_ID))).toBe("backlog_ops_wave_view");
+  // A non-carried slice needs neither.
+  expect(JSON.parse(waveView(JSON.stringify(top), B, SCOPE_ID)).carried_ms).toBeUndefined();
+});

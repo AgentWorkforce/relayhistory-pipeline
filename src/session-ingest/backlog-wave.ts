@@ -65,7 +65,8 @@ export function waveSummary(orgs: readonly string[], slices: readonly { org: str
  * counts derived, every slice summary accepted by `slice` (its mode's own check; returns the summary to keep or throws).
  * Returns the checked summary or {"refused": "backlog_ops_receipt_wave"}.
  */
-export function waveReceiptSummary(summary: unknown, orgs: readonly string[] | null, slice: (s: unknown) => unknown): { summary: unknown; ok: boolean } {
+export function waveReceiptSummary(summary: unknown, orgs: readonly string[] | null, slice: (s: unknown) => unknown,
+  ctx: { previousRun?: string | null; writtenMs?: number } = {}): { summary: unknown; ok: boolean } {
   const bad = { summary: { refused: "backlog_ops_receipt_wave" }, ok: false };
   if (!orgs || orgs.length === 0 || !isObj(summary)) return bad;
   const keys = Object.keys(summary).sort();
@@ -84,6 +85,9 @@ export function waveReceiptSummary(summary: unknown, orgs: readonly string[] | n
     try { s = slice(p.summary); } catch { return bad; }
     out.push({ org_hash: p.org_hash, exit_code: p.exit_code, summary: s, ...(p.carried_ms !== undefined ? { carried_ms: p.carried_ms } : {}) });
     if (p.carried_ms !== undefined && !sliceOk(out[out.length - 1]!)) return bad;
+    // A carried slice needs the receipt's previous_run, and ran no later than the receipt was written.
+    if (p.carried_ms !== undefined && (typeof ctx.previousRun !== "string" || !/^[1-9][0-9]{0,19}$/u.test(ctx.previousRun) ||
+        !Number.isSafeInteger(ctx.writtenMs) || p.carried_ms > ctx.writtenMs!)) return bad;
   }
   const got = out.map((p) => p.org_hash).sort();
   if (!got.every((h, i) => h === want[i])) return bad;
@@ -114,6 +118,9 @@ export function waveView(raw: string, org: string, waveScope: string): string {
   if (isObj(r.summary) && r.summary.kind === "wave") {
     const s = (Array.isArray(r.summary.per_org) ? r.summary.per_org : []).filter((p: unknown) => isObj(p) && p.org_hash === h);
     if (s.length !== 1) refuse("backlog_ops_wave_view");
+    // Consumer hardening: a carried slice only in a retry's receipt, never later than the receipt was written.
+    if (s[0].carried_ms !== undefined && (typeof r.previous_run !== "string" || !/^[1-9][0-9]{0,19}$/u.test(r.previous_run) ||
+        !Number.isSafeInteger(r.written_ms) || !Number.isSafeInteger(s[0].carried_ms) || s[0].carried_ms > r.written_ms)) refuse("backlog_ops_wave_view");
     return JSON.stringify({ ...r, scope, exitCode: s[0].exit_code, summary: s[0].summary, ...(s[0].carried_ms !== undefined ? { carried_ms: s[0].carried_ms } : {}) });
   }
   const s = isObj(r.summary) ? { ...r.summary } : r.summary;

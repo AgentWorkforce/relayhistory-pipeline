@@ -690,6 +690,13 @@ refresh, catch-up), export and drain.
   - Consumers apply their freshness rule to a carried slice from its `carried_ms`.
   - A carried FULL slice moves that org's catch-up `t` to `carried_ms` minus the 15-min margin, so the catch-up never
     reads from a later retry's `t`.
+  - Wave receipts record `written_ms`. A carried slice is accepted only in a receipt with `previous_run`, and only
+    with `carried_ms` no later than `written_ms`.
+  - **For the future seal/bind caller:** for an org whose FULL slice is carried, the FULL start that 062340's
+    `_bind` takes (`full_started_ms`), and the seal's evidence of when FULL ran, is that org's `carried_ms`, never
+    the retry run's `created_at`. Today the bridge does not check per org and refuses wave receipts.
+  - `max_objects` is per run, so a drain retry chain of k runs can move up to k times the cap in total. Each retry
+    is a separately approved run with its own cap.
 - A run that binds a wave receipt checks it per org, on that org's view: the slice as a single-org receipt, or a
   non-wave receipt of exactly the wave's scope re-scoped to the org with its per-org lists sliced. The unchanged
   per-receipt checks run on each view: home, ledger, since, fingerprint, baseline. The run's 3 h / 24 h freshness and
