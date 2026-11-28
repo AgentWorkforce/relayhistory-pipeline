@@ -16,6 +16,7 @@ import { createPipelineLambdaHandler, lambdaEnv, runtimeFromSecret } from "../la
 import { SUPABASE_PROD_CA_2021 } from "../supabase-ca.ts";
 import { BUFFERED_SEARCH_FEED_RUNTIME_ROLE } from "../buffered-feed-role.ts";
 import { BUFFERED_SEARCH_GATE_CONTRACT } from "../../session-read-api/buffered-search-gate.ts";
+import { BUFFERED_FEED_TIMING_FIELDS, FEED_QUERY_VALUES, logLine, sanitizeLogField } from "../../shared/log.ts";
 import type { SessionScope } from "../pointer.ts";
 import {
   assertOriginColumns,
@@ -28,6 +29,11 @@ import {
   projectBufferedStage,
   runBufferedFeed,
   sqlBufferedFeedSource,
+  bufferedFeedQueryField,
+  bufferedFeedTimingFields,
+  emptyBufferedFeedTimings,
+  BUFFERED_FEED_QUERIES,
+  BufferedFeedError,
   BUFFERED_VERSION_CEILING,
   bufferedFeedVersionRefusal,
   canonicalPresent,
@@ -40,7 +46,12 @@ import {
   type BufferedFeedSource,
   type StageCandidate,
   type StageState,
+  isBufferedStageKey,
 } from "../buffered-search-feed.ts";
+import { parseStagedKey } from "../../session-ingest/buffered-drain.ts";
+import { bufferedFeedPoolOptions, HOOPDB_CONNECT_TIMEOUT_MS } from "../lambda.ts";
+import pg from "pg";
+import { createServer, type AddressInfo, type Socket } from "node:net";
 
 const NOW = Date.parse("2026-11-07T12:00:00.000Z");
 /** Synthetic B1 ceiling for tests only, independent of the pinned production BUFFERED_VERSION_CEILING. */
@@ -465,6 +476,63 @@ describe("buffered-stage search feed", () => {
     expect(mem.calls).toEqual([]);
   });
 
+  test("only the complete staged-key shape under this root is a buffered stage (same shape as parseStagedKey)", async () => {
+    const store = newStore();
+    const { prepared } = await stageBatch(store);
+    const staged = prepared.spec.key;
+    expect(isBufferedStageKey(staged, "96bulls")).toBe(true);
+    // An ordinary session manifest that merely contains the segment (no org segment before it) is not a stage.
+    const manifest = "96bulls/buffered-batches/v1/ws=ws/m=m/h=claude/d=2026/11/26/s=session/manifest.json";
+    const notStages = [
+      manifest,
+      `96bulls/${ORG}/buffered-batches/v1/ws=${WS}/m=m/h=claude/d=2026/11/26/s=session/manifest.json`,
+      staged.replace(/^96bulls\//, "other-root/"),
+      staged.replace(/\.staged\.ndjson\.zst$/, ".staged.ndjson.zst.drained.json"),
+      staged.replace(/\/m=srv_[0-9a-f]{32}\//, "/m=srv_short/"),
+      staged.replace(/^96bulls\/[^/]+\//, "96bulls/../"),
+    ];
+    for (const key of notStages) expect(isBufferedStageKey(key, "96bulls")).toBe(false);
+    expect(isBufferedStageKey(staged, "other-root")).toBe(false);
+    // Kept in step with session-ingest's own parser of the same keys.
+    for (const key of [staged, ...notStages]) expect(isBufferedStageKey(key, "96bulls")).toBe(parseStagedKey(key)?.keyRoot === "96bulls");
+  });
+
+  test("keep-up routing: an ordinary manifest key with the segment reaches the pointer stage, never the feed", async () => {
+    const store = newStore(), ch = fakeClickHouse();
+    const mem = memorySource([]);
+    const manifest = "96bulls/buffered-batches/v1/ws=ws/m=m/h=claude/d=2026/11/26/s=session/manifest.json";
+    const body = JSON.stringify({ Records: [{ eventSource: "aws:s3", eventName: "ObjectCreated:Put", s3: { object: { key: encodeURIComponent(manifest) } } }] });
+    const pointer = { db: { query: async () => ({ rows: [] }) }, lock: async (_s: unknown, w: () => unknown) => w(),
+      reader: { provider: "s3", read: async () => null }, exists: async () => false, orgs: async () => null,
+      allowPrefix: () => false, fanout: { send: async () => {} } } as never;
+    const result = await processBatch([{ messageId: "m1", body }], { pointer, bufferedFeed: feedDeps(mem.source, store, ch.ch) });
+    expect(mem.calls).toEqual([]); // the feed source was never consulted
+    // The record went to the pointer stage. This stub is not a working pointer, so that stage fails it and SQS
+    // redelivers it: never the silent skip-and-ACK the substring match produced (empty batchItemFailures).
+    expect(result.batchItemFailures).toEqual([{ itemIdentifier: "m1" }]);
+  });
+
+  test("the feeder pool carries the shared 10 s checkout bound: a silent server fails the checkout instead of hanging", async () => {
+    expect(bufferedFeedPoolOptions({}).connectionTimeoutMillis).toBe(HOOPDB_CONNECT_TIMEOUT_MS);
+    expect(HOOPDB_CONNECT_TIMEOUT_MS).toBe(10_000);
+    const sockets: Socket[] = [];
+    const silent = createServer((s) => { sockets.push(s); }); // accepts, never answers the startup packet
+    await new Promise<void>((r) => silent.listen(0, "127.0.0.1", r));
+    const port = (silent.address() as AddressInfo).port;
+    const pool = new pg.Pool(bufferedFeedPoolOptions({ host: "127.0.0.1", port, user: "u", password: "p", database: "d", ssl: false }));
+    const started = Date.now();
+    try {
+      await expect(pool.connect()).rejects.toThrow();
+      const elapsed = Date.now() - started;
+      expect(elapsed).toBeGreaterThanOrEqual(HOOPDB_CONNECT_TIMEOUT_MS - 500);
+      expect(elapsed).toBeLessThan(HOOPDB_CONNECT_TIMEOUT_MS + 3_000);
+    } finally {
+      await pool.end().catch(() => {});
+      for (const s of sockets) s.destroy();
+      await new Promise<void>((r) => silent.close(() => r()));
+    }
+  }, 20_000);
+
   test("keep-up leaves a fenced-authority stage to the cursor instead of requeueing it forever", async () => {
     const store = newStore(), ch = fakeClickHouse();
     const { prepared } = await stageBatch(store);
@@ -657,6 +725,243 @@ describe("buffered-stage search feed", () => {
     const failing = (code: string): SqlExecutor => ({ query: async () => { throw Object.assign(new Error("x"), { code }); } });
     await expect(sqlBufferedFeedSource(failing("40001")).stage({ stageToken: randomUUID() })).rejects.toMatchObject({ code: "sql_40001", retryable: true });
     await expect(sqlBufferedFeedSource(failing("42501")).stage({ stageToken: randomUUID() })).rejects.toMatchObject({ code: "sql_42501", retryable: false });
+  });
+
+  test("a failed feeder SQL call names its query on the error: page, stage or advance", async () => {
+    const failing = (code: string): SqlExecutor => ({ query: async () => { throw Object.assign(new Error("x"), { code }); } });
+    const src = sqlBufferedFeedSource(failing("57014"));
+    const caught = async (p: Promise<unknown>) => p.then(() => null, (e: unknown) => e);
+    expect(await caught(src.page("c", BUFFERED_FEED_DEFAULT_SINCE, 5))).toMatchObject({ code: "sql_57014", retryable: true, query: "page" });
+    expect(await caught(src.stage({ stageToken: randomUUID() }))).toMatchObject({ code: "sql_57014", query: "stage" });
+    expect(await caught(src.advance("c", { createdAt: "2026-11-27T00:00:00.000000Z", stageToken: randomUUID() }, { indexed: 0, skipped: 0 }))).toMatchObject({ code: "sql_57014", query: "advance" });
+    // Result-shape refusals and anything that is not a feeder SQL error carry no feed_query.
+    const answer = (r: unknown): SqlExecutor => ({ query: async <R>() => ({ rows: [{ r }] as R[] }) });
+    expect(bufferedFeedQueryField(await caught(sqlBufferedFeedSource(answer({ found: true, status: "weird", reason: null, retained: [] })).stage({ stageToken: randomUUID() })))).toEqual({});
+    expect(bufferedFeedQueryField(Object.assign(new Error("x"), { query: "page" }))).toEqual({});
+    expect(bufferedFeedQueryField(new BufferedFeedError("sql_57014", true, "drop table" as never))).toEqual({});
+    expect(bufferedFeedQueryField(undefined)).toEqual({});
+  });
+
+  test("feed_query is a closed enum in the log serializer, pinned to the feeder's calls", () => {
+    expect([...FEED_QUERY_VALUES].sort()).toEqual([...BUFFERED_FEED_QUERIES].sort());
+    for (const q of BUFFERED_FEED_QUERIES) expect(sanitizeLogField("feed_query", q)).toBe(q);
+    for (const v of ["PAGE", " page", "page ", "pages", "select 1", "sessions.buffered_search_feed_page", "", 1, true, null, {}, ["page"]])
+      expect(sanitizeLogField("feed_query", v)).toBeUndefined();
+    // The old ad-hoc key is not on the allowlist: nothing but feed_query can carry the call name.
+    expect(sanitizeLogField("query", "page")).toBeUndefined();
+    const line = JSON.parse(logLine("error", "buffered search feed failed", { feed_query: "select * from secret_table" }));
+    expect("feed_query" in line).toBe(false);
+  });
+
+  /** The JSON lines written to stderr (error/warn) while `work` runs. */
+  async function stderrJson(work: () => Promise<unknown>): Promise<Record<string, unknown>[]> {
+    const original = process.stderr.write;
+    const out: string[] = [];
+    process.stderr.write = ((chunk: unknown) => { out.push(String(chunk)); return true; }) as typeof process.stderr.write;
+    try { await work(); } finally { process.stderr.write = original; }
+    return out.join("").split("\n").filter(Boolean).flatMap((l) => { try { return [JSON.parse(l) as Record<string, unknown>]; } catch { return []; } });
+  }
+  const MARKER = "PRIVATE-MARKER-relation-secret_table";
+  /** A feeder login whose every call fails with SQLSTATE `code` and foreign error text that must never be logged. */
+  const timingOut = (code = "57014"): SqlExecutor => ({ query: async () => { throw Object.assign(new Error(`${MARKER} canceling statement`), { code, detail: MARKER }); } });
+
+  test("emitted JSON, scheduled run: a statement timeout logs feed_query=page with the code, never the error text", async () => {
+    const keys = ["INGEST_BUFFERED_SEARCH_FEED", "BUFFERED_SEARCH_FEED_GATE_DECLARED", "INGEST_BUFFERED_SEARCH_FEED_SECOND_VERSION"] as const;
+    const saved = keys.map((k) => process.env[k]);
+    const store = newStore(), ch = fakeClickHouse();
+    const runtime = { deps: { bufferedFeed: feedDeps(sqlBufferedFeedSource(timingOut()), store, ch.ch) },
+      env: { bufferedSearchFeed: { pageSize: 10, stagesPerSecond: 50, since: BUFFERED_FEED_DEFAULT_SINCE, cursor: "tail", budgetMs: 60_000 } } };
+    const handler = createPipelineLambdaHandler({ loadRuntime: async () => runtime as never });
+    try {
+      process.env.INGEST_BUFFERED_SEARCH_FEED = "on";
+      process.env.BUFFERED_SEARCH_FEED_GATE_DECLARED = BUFFERED_SEARCH_GATE_CONTRACT;
+      process.env.INGEST_BUFFERED_SEARCH_FEED_SECOND_VERSION = "on";
+      let result: unknown;
+      const lines = await stderrJson(async () => { result = await handler({ bufferedSearchFeed: true }); });
+      expect(result).toEqual({ ok: false });
+      const failed = lines.filter((l) => l.message === "buffered search feed failed");
+      expect(failed).toHaveLength(1);
+      expect(failed[0]).toMatchObject({ level: "error", stage: "buffered-search-feed", error_code: "sql_57014", retryable: true, feed_query: "page" });
+      expect(JSON.stringify(lines)).not.toContain(MARKER);
+    } finally {
+      keys.forEach((k, i) => { if (saved[i] === undefined) delete process.env[k]; else process.env[k] = saved[i]; });
+    }
+  });
+
+  test("the scheduled run uses Runtime.scheduledFeed (the timed source) when present, never the keep-up deps", async () => {
+    const keys = ["INGEST_BUFFERED_SEARCH_FEED", "BUFFERED_SEARCH_FEED_GATE_DECLARED", "INGEST_BUFFERED_SEARCH_FEED_SECOND_VERSION"] as const;
+    const saved = keys.map((k) => process.env[k]);
+    const store = newStore(), ch = fakeClickHouse();
+    const cfg = { pageSize: 10, stagesPerSecond: 50, since: BUFFERED_FEED_DEFAULT_SINCE, cursor: "tail", budgetMs: 60_000 };
+    const keepUp = feedDeps(sqlBufferedFeedSource(timingOut()), store, ch.ch); // would fail 57014 if used
+    const scheduled = feedDeps(memorySource([]).source, store, ch.ch); // an empty, healthy feed
+    try {
+      process.env.INGEST_BUFFERED_SEARCH_FEED = "on";
+      process.env.BUFFERED_SEARCH_FEED_GATE_DECLARED = BUFFERED_SEARCH_GATE_CONTRACT;
+      process.env.INGEST_BUFFERED_SEARCH_FEED_SECOND_VERSION = "on";
+      const withScheduled = createPipelineLambdaHandler({ loadRuntime: async () => ({ deps: { bufferedFeed: keepUp }, scheduledFeed: scheduled, env: { bufferedSearchFeed: cfg } }) as never });
+      expect(await withScheduled({ bufferedSearchFeed: true })).toEqual({ ok: true });
+      // Without it (an older runtime shape), the run falls back to deps.bufferedFeed, as before.
+      const fallback = createPipelineLambdaHandler({ loadRuntime: async () => ({ deps: { bufferedFeed: keepUp }, env: { bufferedSearchFeed: cfg } }) as never });
+      const lines = await stderrJson(async () => { expect(await fallback({ bufferedSearchFeed: true })).toEqual({ ok: false }); });
+      expect(lines.some((l) => l.message === "buffered search feed failed" && l.error_code === "sql_57014")).toBe(true);
+    } finally {
+      keys.forEach((k, i) => { if (saved[i] === undefined) delete process.env[k]; else process.env[k] = saved[i]; });
+    }
+  });
+
+  test("emitted JSON, keep-up: a statement timeout on the stage call logs feed_query=stage, and the message retries", async () => {
+    const store = newStore(), ch = fakeClickHouse();
+    const { prepared } = await stageBatch(store);
+    const body = JSON.stringify({ Records: [{ eventSource: "aws:s3", eventName: "ObjectCreated:Put", s3: { object: { key: encodeURIComponent(prepared.spec.key) } } }] });
+    const pointer = { db: { query: async () => ({ rows: [] }) }, reader: { provider: "s3" } } as never;
+    let result: unknown;
+    const lines = await stderrJson(async () => {
+      result = await processBatch([{ messageId: "m1", body }], { pointer, bufferedFeed: feedDeps(sqlBufferedFeedSource(timingOut()), store, ch.ch), requeue: async () => {} });
+    });
+    // The retry behaviour is unchanged: the message is failed back to its queue.
+    expect(result).toEqual({ batchItemFailures: [{ itemIdentifier: "m1" }] });
+    const failed = lines.filter((l) => l.message === "buffered stage search feed failed");
+    expect(failed).toHaveLength(1);
+    expect(failed[0]).toMatchObject({ level: "error", stage: "buffered-search-feed", error_code: "sql_57014", retryable: true, feed_query: "stage" });
+    expect(JSON.stringify(lines)).not.toContain(MARKER);
+  });
+
+  /** The JSON lines written to stdout and stderr while `work` runs. */
+  async function emittedJson(work: () => Promise<unknown>): Promise<Record<string, unknown>[]> {
+    const out: string[] = [];
+    const lines = await stderrJson(async () => {
+      const original = process.stdout.write;
+      process.stdout.write = ((chunk: unknown) => { out.push(String(chunk)); return true; }) as typeof process.stdout.write;
+      try { await work(); } finally { process.stdout.write = original; }
+    });
+    return [...lines, ...out.join("").split("\n").filter(Boolean).flatMap((l) => { try { return [JSON.parse(l) as Record<string, unknown>]; } catch { return []; } })];
+  }
+  /** A fake clock and a source whose every call takes a known time on it (ms per call, in call order). */
+  function steppedClock() {
+    let t = NOW;
+    return { now: () => t, step: (ms: number) => { t += ms; } };
+  }
+  function slowSource(inner: BufferedFeedSource, clock: { step: (ms: number) => void }, ms: { page: number[]; stage: number[]; advance: number[] }): BufferedFeedSource {
+    const take = (q: keyof typeof ms) => clock.step(ms[q].shift() ?? 0);
+    return {
+      page: async (...a) => { take("page"); return inner.page(...a); },
+      stage: async (...a) => { take("stage"); return inner.stage(...a); },
+      advance: async (...a) => { take("advance"); return inner.advance(...a); },
+    };
+  }
+  const timedCandidate = (n: number): StageCandidate => ({ stageToken: `00000000-0000-4000-8000-00000000009${n}`, createdAt: `2026-11-06T00:00:0${n}.000000Z`,
+    tenant: { orgId: ORG, workspaceId: WS, userId: USER }, originId: ORIGIN, batchId: `t${n}` });
+  async function withFeedEnv(work: () => Promise<void>) {
+    const keys = ["INGEST_BUFFERED_SEARCH_FEED", "BUFFERED_SEARCH_FEED_GATE_DECLARED", "INGEST_BUFFERED_SEARCH_FEED_SECOND_VERSION"] as const;
+    const saved = keys.map((k) => process.env[k]);
+    try {
+      process.env.INGEST_BUFFERED_SEARCH_FEED = "on";
+      process.env.BUFFERED_SEARCH_FEED_GATE_DECLARED = BUFFERED_SEARCH_GATE_CONTRACT;
+      process.env.INGEST_BUFFERED_SEARCH_FEED_SECOND_VERSION = "on";
+      await work();
+    } finally {
+      keys.forEach((k, i) => { if (saved[i] === undefined) delete process.env[k]; else process.env[k] = saved[i]; });
+    }
+  }
+  const timedCfg = { pageSize: 10, stagesPerSecond: 50, since: BUFFERED_FEED_DEFAULT_SINCE, cursor: "tail", budgetMs: 60_000 };
+
+  test("emitted JSON, scheduled run: the run line carries per-call counts, total and longest ms for page, stage and advance", async () => {
+    const store = newStore(), ch = fakeClickHouse();
+    const { prepared } = await stageBatch(store);
+    const c = timedCandidate(1);
+    const mem = memorySource([{ candidate: c, state: () => liveState(prepared, c.stageToken, c.createdAt) }]);
+    const clock = steppedClock();
+    // The stage call, then the post-write re-check of the same stage.
+    const source = slowSource(mem.source, clock, { page: [120], stage: [700, 300], advance: [40] });
+    const runtime = { deps: { bufferedFeed: { ...feedDeps(source, store, ch.ch), now: clock.now } }, env: { bufferedSearchFeed: timedCfg } };
+    const handler = createPipelineLambdaHandler({ loadRuntime: async () => runtime as never });
+    await withFeedEnv(async () => {
+      let result: unknown;
+      const lines = await emittedJson(async () => { result = await handler({ bufferedSearchFeed: true }); });
+      expect(result).toEqual({ ok: true });
+      const run = lines.filter((l) => l.message === "buffered search feed run");
+      expect(run).toHaveLength(1);
+      expect(run[0]).toMatchObject({ level: "info", inserted: 1, state: "caught_up",
+        feed_page_calls: 1, feed_page_ms_total: 120, feed_page_ms_max: 120,
+        feed_stage_calls: 2, feed_stage_ms_total: 1_000, feed_stage_ms_max: 700,
+        feed_advance_calls: 1, feed_advance_ms_total: 40, feed_advance_ms_max: 40 });
+      // Only a failed call carries its own elapsed time.
+      expect("feed_query_ms" in run[0]!).toBe(false);
+    });
+  });
+
+  test("emitted JSON, scheduled run: a 57014 on stage logs that call's own ms and the run's timings up to it", async () => {
+    const store = newStore(), ch = fakeClickHouse();
+    const { prepared } = await stageBatch(store);
+    const c = timedCandidate(2);
+    const mem = memorySource([{ candidate: c, state: () => liveState(prepared, c.stageToken, c.createdAt) }]);
+    const clock = steppedClock();
+    // The stage SQL runs 30.5 s on the clock, then is cancelled by its statement timeout.
+    const cancelled: SqlExecutor = { query: async () => { clock.step(30_500); throw Object.assign(new Error(`${MARKER} canceling statement`), { code: "57014", detail: MARKER }); } };
+    const sqlStage = sqlBufferedFeedSource(cancelled, { now: clock.now });
+    const source = slowSource({ ...mem.source, stage: sqlStage.stage }, clock, { page: [250], stage: [], advance: [] });
+    const runtime = { deps: { bufferedFeed: { ...feedDeps(source, store, ch.ch), now: clock.now } }, env: { bufferedSearchFeed: timedCfg } };
+    const handler = createPipelineLambdaHandler({ loadRuntime: async () => runtime as never });
+    await withFeedEnv(async () => {
+      let result: unknown;
+      const lines = await emittedJson(async () => { result = await handler({ bufferedSearchFeed: true }); });
+      expect(result).toEqual({ ok: false });
+      const failed = lines.filter((l) => l.message === "buffered search feed failed");
+      expect(failed).toHaveLength(1);
+      expect(failed[0]).toMatchObject({ level: "error", error_code: "sql_57014", retryable: true, feed_query: "stage", feed_query_ms: 30_500,
+        feed_page_calls: 1, feed_page_ms_total: 250, feed_page_ms_max: 250,
+        feed_stage_calls: 1, feed_stage_ms_total: 30_500, feed_stage_ms_max: 30_500,
+        feed_advance_calls: 0, feed_advance_ms_total: 0, feed_advance_ms_max: 0 });
+      expect(lines.some((l) => l.message === "buffered search feed run")).toBe(false);
+      expect(JSON.stringify(lines)).not.toContain(MARKER);
+    });
+    // The cursor did not move: timing changed nothing about the failure.
+    expect(mem.cursor.after).toBeNull();
+  });
+
+  test("timing passes results and errors through unchanged; the caller's timings survive a throw", async () => {
+    const clock = steppedClock();
+    const boom = new BufferedFeedError("sql_40001", true, "page", 5);
+    const source = slowSource({ page: async () => { throw boom; }, stage: async () => { throw new Error("unused"); }, advance: async () => true }, clock, { page: [9], stage: [], advance: [] });
+    const timings = emptyBufferedFeedTimings();
+    const thrown = await runBufferedFeed({ ...feedDeps(source, newStore(), fakeClickHouse().ch), now: clock.now }, timedCfg, timings).then(() => null, (e: unknown) => e);
+    expect(thrown).toBe(boom);
+    expect(timings).toEqual({ page: { calls: 1, msTotal: 9, msMax: 9 }, stage: { calls: 0, msTotal: 0, msMax: 0 }, advance: { calls: 0, msTotal: 0, msMax: 0 } });
+  });
+
+  test("emitted JSON, keep-up: a statement timeout on the stage call logs feed_query_ms", async () => {
+    const store = newStore(), ch = fakeClickHouse();
+    const { prepared } = await stageBatch(store);
+    const clock = steppedClock();
+    const cancelled: SqlExecutor = { query: async () => { clock.step(5_000); throw Object.assign(new Error(MARKER), { code: "57014" }); } };
+    const body = JSON.stringify({ Records: [{ eventSource: "aws:s3", eventName: "ObjectCreated:Put", s3: { object: { key: encodeURIComponent(prepared.spec.key) } } }] });
+    const pointer = { db: { query: async () => ({ rows: [] }) }, reader: { provider: "s3" } } as never;
+    let result: unknown;
+    const lines = await stderrJson(async () => {
+      result = await processBatch([{ messageId: "m1", body }], { pointer, bufferedFeed: { ...feedDeps(sqlBufferedFeedSource(cancelled, { now: clock.now }), store, ch.ch), now: clock.now }, requeue: async () => {} });
+    });
+    expect(result).toEqual({ batchItemFailures: [{ itemIdentifier: "m1" }] });
+    const failed = lines.filter((l) => l.message === "buffered stage search feed failed");
+    expect(failed).toHaveLength(1);
+    expect(failed[0]).toMatchObject({ error_code: "sql_57014", feed_query: "stage", feed_query_ms: 5_000 });
+  });
+
+  test("feed timing fields are bounded counts: pinned to the feeder's names, non-integers and negatives dropped, huge clamped", () => {
+    expect([...BUFFERED_FEED_TIMING_FIELDS].sort()).toEqual(Object.keys(bufferedFeedTimingFields(emptyBufferedFeedTimings())).sort());
+    for (const f of [...BUFFERED_FEED_TIMING_FIELDS, "feed_query_ms"]) {
+      expect(sanitizeLogField(f, 0)).toBe(0);
+      expect(sanitizeLogField(f, 30_500)).toBe(30_500);
+      for (const v of [1.5, -1, Number.NaN, Infinity, "30500", null, true, {}, [1]]) expect(sanitizeLogField(f, v)).toBeUndefined();
+      expect(sanitizeLogField(f, 1e12)).toBe(f.endsWith("_calls") ? 1_000_000 : 3_600_000);
+    }
+    const line = JSON.parse(logLine("error", "buffered search feed failed", { feed_query_ms: -3, feed_stage_ms_max: 2.5, feed_stage_calls: "7", feed_page_ms_total: 1e15 }));
+    expect("feed_query_ms" in line || "feed_stage_ms_max" in line || "feed_stage_calls" in line).toBe(false);
+    expect(line.feed_page_ms_total).toBe(3_600_000);
+    // The helper: only a feeder SQL error carries the elapsed time.
+    expect(bufferedFeedQueryField(new BufferedFeedError("sql_57014", true, "stage", 42))).toEqual({ feed_query: "stage", feed_query_ms: 42 });
+    expect(bufferedFeedQueryField(new BufferedFeedError("sql_57014", true, "stage"))).toEqual({ feed_query: "stage" });
+    expect(bufferedFeedQueryField(new BufferedFeedError("sql_57014", true, undefined, 42))).toEqual({});
   });
 
   /** Stages at fixed offsets (ms) before NOW; `listed` decides which the page RPC returns (acknowledged). */
@@ -856,7 +1161,8 @@ describe("buffered feed version (S): created_at seconds with same-second refusal
     const selects: string[] = [];
     const spy: ClickHouseClient = { ...ch.ch, async select(q, o) { selects.push(q); return ch.ch.select(q, o); } };
     const summary = await runBufferedFeed(feedDeps(mem.source, store, spy), cfg);
-    expect(summary).toEqual({ pages: 1, stages: 1, indexed: 1, skipped: 0, rows: 6, deleted: 0, caughtUp: true, reasons: {} });
+    expect(summary).toEqual({ pages: 1, stages: 1, indexed: 1, skipped: 0, rows: 6, deleted: 0, caughtUp: true, reasons: {},
+      timings: { page: { calls: 1, msTotal: 0, msMax: 0 }, stage: { calls: 2, msTotal: 0, msMax: 0 }, advance: { calls: 1, msTotal: 0, msMax: 0 } } });
     expect(new Set(ch.rows.map((r) => r.version))).toEqual(new Set([RECEIVED.getTime()]));
     expect(selects.some((q) => q.includes("origin <> 'buffered'") || q.includes("buffered-tie"))).toBe(false);
     expect(await feedBufferedStageByKey(prepared.spec.key, feedDeps(mem.source, store, ch.ch))).toEqual({ outcome: "indexed", rows: 6, deleted: 0 });

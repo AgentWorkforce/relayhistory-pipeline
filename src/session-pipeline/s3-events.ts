@@ -12,7 +12,14 @@
  * versions is not notified and needs nothing: the current version is unchanged.
  *
  * The scheduled reconcile puts `{"reconcile":{"key","etag","version"}}` bodies
- * on the same queue, so its work takes the same path, retries and DLQ.
+ * on the same queue, so its work takes the same path, retries and DLQ. A search
+ * pass requeued by the consumer (busy, deferred, past the batch deadline) puts
+ * `{"reconcile":{"key","requeued":true,"oldest_event_time"?}}` (`requeueBody`; the
+ * backport lineage's ecb5d981). Both extra fields are telemetry only and never part
+ * of the event a stage reads: `requeued` marks the consumer's own requeue
+ * (`queue_origin`), and `oldest_event_time` carries the oldest upload event time
+ * the requeued pass stands for (`s3_event_age_ms`). An older build reads only `key`,
+ * `etag` and `version` and ignores both.
  *
  * `provider` is the Locker the consumer reads the manifest from (its
  * ManifestReader's provider), stamped on every event and from there on the
@@ -24,6 +31,13 @@
 import type { ObjectLanded, StorageProvider } from "@rhc/lib/pipeline/adapter.ts";
 
 export const RECONCILE_BODY_KEY = "reconcile";
+/** Optional field of a requeued reconcile body: the oldest upload event time (ISO 8601) it stands for. */
+export const OLDEST_EVENT_TIME_FIELD = "oldest_event_time";
+/** Field of a requeued reconcile body (`true`): the message is the consumer's own requeue. */
+export const REQUEUED_FIELD = "requeued";
+
+/** Where an SQS message came from, for `queue_origin`: an S3 notification, this consumer's requeue, or a sweep body. */
+export type QueueOrigin = "s3" | "requeue" | "sweep";
 
 interface S3Record {
   eventSource?: unknown;
@@ -38,10 +52,12 @@ interface S3Record {
 export interface LandedEvent extends ObjectLanded {
   /** S3's per-key ordering token (hex, compare by length then value). */
   sequencer?: string;
+  /** A requeued reconcile body's carried upload event time (ISO 8601): telemetry only, stripped before any stage. */
+  oldestEventTime?: string;
 }
 
 export type ParsedBody =
-  | { kind: "events"; events: LandedEvent[] }
+  | { kind: "events"; events: LandedEvent[]; origin: QueueOrigin }
   | { kind: "test" }
   | { kind: "invalid" };
 
@@ -89,9 +105,13 @@ export function parseQueueBody(body: string, provider: StorageProvider = "s3"): 
   if (!value || typeof value !== "object" || Array.isArray(value)) return { kind: "invalid" };
   const v = value as Record<string, unknown>;
   if (v.Event === "s3:TestEvent") return { kind: "test" };
-  const reconcile = v[RECONCILE_BODY_KEY] as { key?: unknown; etag?: unknown; version?: unknown } | undefined;
+  const reconcile = v[RECONCILE_BODY_KEY] as
+    | { key?: unknown; etag?: unknown; version?: unknown; [OLDEST_EVENT_TIME_FIELD]?: unknown; [REQUEUED_FIELD]?: unknown }
+    | undefined;
   if (reconcile && typeof reconcile === "object") {
     if (typeof reconcile.key !== "string" || !reconcile.key) return { kind: "invalid" };
+    const carried = reconcile[OLDEST_EVENT_TIME_FIELD];
+    const oldestEventTime = typeof carried === "string" && carried ? carried : undefined;
     return {
       kind: "events",
       events: [
@@ -100,8 +120,11 @@ export function parseQueueBody(body: string, provider: StorageProvider = "s3"): 
           key: reconcile.key,
           ...(typeof reconcile.etag === "string" && reconcile.etag ? { etag: reconcile.etag } : {}),
           ...(typeof reconcile.version === "string" && reconcile.version ? { version: reconcile.version } : {}),
+          ...(oldestEventTime ? { oldestEventTime } : {}),
         },
       ],
+      // A requeue written before the marker existed is still a requeue when it carries a time.
+      origin: reconcile[REQUEUED_FIELD] === true || oldestEventTime ? "requeue" : "sweep",
     };
   }
   if (!Array.isArray(v.Records)) return { kind: "invalid" };
@@ -110,7 +133,14 @@ export function parseQueueBody(body: string, provider: StorageProvider = "s3"): 
     const event = record && typeof record === "object" ? fromRecord(record, provider) : null;
     if (event) events.push(event);
   }
-  return { kind: "events", events };
+  return { kind: "events", events, origin: "s3" };
+}
+
+/** The body of a requeued search pass: the manifest key, the `requeued` marker, and the carried time when known. */
+export function requeueBody(manifestKey: string, oldestEventTime?: string): string {
+  return JSON.stringify({
+    [RECONCILE_BODY_KEY]: { key: manifestKey, [REQUEUED_FIELD]: true, ...(oldestEventTime ? { [OLDEST_EVENT_TIME_FIELD]: oldestEventTime } : {}) },
+  });
 }
 
 /** S3 sequencers order events for one key: longer is later, then lexical. */

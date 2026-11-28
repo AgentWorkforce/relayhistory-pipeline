@@ -450,7 +450,7 @@ describe("session pipeline: deploy plan contract", () => {
     expect(()=>check(plan({...creates,"session-semantic-copy-schedule":"update"},[...withBufferedFeed,...SESSION_SEMANTIC_COPY_RESOURCES]))).toThrow(/separate reviewed phase/);
     expect(()=>check(plan({...creates,"session-pipeline":"update",transcripts:"update"},withBufferedFeed))).toThrow(/without the role-ARN cascade/);
   });
-  const NEW_FEED_KEYS = ["INGEST_BUFFERED_SEARCH_FEED_SECOND_VERSION", "INGEST_BUFFERED_SEARCH_FEED_SETTLE_S", "INGEST_BUFFERED_ERASURE_DELETE", "INGEST_BUFFERED_ERASURE_PAGE", "INGEST_BUFFERED_ERASURE_RATE", "INGEST_BUFFERED_ERASURE_BUDGET_MS"];
+  const NEW_FEED_KEYS = ["INGEST_BUFFERED_SEARCH_FEED_SECOND_VERSION", "INGEST_BUFFERED_SEARCH_FEED_SETTLE_S", "INGEST_BUFFERED_SEARCH_FEED_STATEMENT_TIMEOUT_MS", "INGEST_BUFFERED_ERASURE_DELETE", "INGEST_BUFFERED_ERASURE_PAGE", "INGEST_BUFFERED_ERASURE_RATE", "INGEST_BUFFERED_ERASURE_BUDGET_MS"];
   const refusedBy=(v:unknown)=>{let why="";try{assertSessionPipelineInputs(v,(w:string)=>{throw new Error(w)})}catch(e){why=(e as Error).message}return why};
   const envOf=(cfg:SessionPipelineInputs)=>sessionPipelineEnv({stage:STAGE,bucket:t.bucket,names:p,p:cfg});
   it("buffered second-version, settle and erasure defaults set no new variable and keep the erasure schedule DISABLED",()=>{
@@ -481,6 +481,17 @@ describe("session pipeline: deploy plan contract", () => {
     const c=bufferedFeedConfig(env,1_000_000_000_000);
     expect([c.enabled,c.secondVersion,c.settleMs]).toEqual([true,true,600_000]);
     for(const n of [180,3600])expect(bufferedFeedConfig(envOf({bufferedSearchFeed:{enabled:false,settleSeconds:n}})).settleMs).toBe(n*1000);
+  });
+  it("buffered feed statementTimeoutMs passes through only when set, within the feeder's bounds",()=>{
+    expect(Object.hasOwn(envOf({bufferedSearchFeed:{enabled:false}}),"INGEST_BUFFERED_SEARCH_FEED_STATEMENT_TIMEOUT_MS")).toBe(false);
+    expect(envOf({bufferedSearchFeed:{enabled:false,statementTimeoutMs:30000}}).INGEST_BUFFERED_SEARCH_FEED_STATEMENT_TIMEOUT_MS).toBe("30000");
+    for(const n of [1000,30000,60000])expect(refusedBy({bufferedSearchFeed:{enabled:false,statementTimeoutMs:n}})).toBe("");
+    for(const n of [0,999,60001,1.5,"30000",null])expect(refusedBy({bufferedSearchFeed:{enabled:false,statementTimeoutMs:n}})).toMatch(/bufferedSearchFeed.statementTimeoutMs must be an integer from 1000 to 60000/);
+    // The feeder accepts what the stack renders, and absent means the login's own 5000.
+    for(const n of [1000,30000,60000])expect(bufferedFeedConfig(envOf({bufferedSearchFeed:{enabled:false,statementTimeoutMs:n}})).statementTimeoutMs).toBe(n);
+    expect(bufferedFeedConfig(envOf({bufferedSearchFeed:{enabled:false}})).statementTimeoutMs).toBe(5000);
+    const env=envOf({...armed,bufferedSearchFeed:{...armed.bufferedSearchFeed,secondVersion:true,statementTimeoutMs:30000}});
+    expect(bufferedFeedConfig(env,1_000_000_000_000)).toMatchObject({enabled:true,secondVersion:true,statementTimeoutMs:30000});
   });
   it("buffered erasure delete arms only with the gate declaration and searchIndex; knobs are bounded like the lane's",()=>{
     const gate={enabled:false,gateDeclared:BUFFERED_SEARCH_FEED_GATE_CONTRACT};

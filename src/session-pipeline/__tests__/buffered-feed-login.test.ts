@@ -234,3 +234,134 @@ test("checked executor: every backend passes the login check before its first fe
   expect(flip.log.filter((l) => l.endsWith(":login"))).toEqual(["1:login", "2:login"]);
   expect(flip.log.filter((l) => l.endsWith(":rpc"))).toEqual(["2:rpc"]);
 });
+
+// ---------------------------------------------------------------- per-query statement timeout (SET LOCAL)
+
+import { PGlite } from "@electric-sql/pglite";
+import { BUFFERED_FEED_TIMEOUTS } from "../buffered-feed-login.ts";
+import { BUFFERED_FEED_LOGIN_STATEMENT_TIMEOUT_MS, bufferedFeedConfig } from "../buffered-search-feed.ts";
+
+/**
+ * A one-backend pool (the feed pool is max: 1, lambda.ts bufferedFeedPoolOptions) whose backend models statement_timeout:
+ * the login's 5s startup value, SET LOCAL inside a transaction, reverted when it ends. A destroyed backend is replaced.
+ */
+function timedPool(opts: { rpcError?: { code: string }; rollbackFails?: boolean } = {}) {
+  const log: string[] = [];
+  const seen: string[] = []; // statement_timeout as the login check and each statement see it
+  let n = 0;
+  let held: FeedPoolClient | undefined;
+  const pool: FeedPool = {
+    async connect() {
+      if (held) return held;
+      const id = ++n;
+      let timeout = BUFFERED_FEED_TIMEOUTS.statement_timeout; // the startup option: "5s"
+      let local: string | undefined;
+      const client: FeedPoolClient = {
+        async query<T>(text: string, values?: unknown[]) {
+          const now = local ?? timeout;
+          if (text === LOGIN_SQL) { log.push(`${id}:login`); seen.push(`login:${now}`); return { rows: [{ ...healthy, statement_timeout: now }] as T[] }; }
+          if (text === SYSTEM_USER_SQL) { log.push(`${id}:system_user`); return { rows: [{ system_user: `scram-sha-256:${healthy.backend_user}` }] as T[] }; }
+          if (text === MEMBERS_SQL) { log.push(`${id}:members`); return { rows: [] as T[] }; }
+          if (text === "BEGIN") { log.push(`${id}:begin`); return { rows: [] as T[] }; }
+          if (text.startsWith("SELECT set_config('statement_timeout'")) { local = String(values![0]); log.push(`${id}:set_local:${local}`); return { rows: [] as T[] }; }
+          if (text === "COMMIT") { local = undefined; log.push(`${id}:commit`); return { rows: [] as T[] }; }
+          if (text === "ROLLBACK") { log.push(`${id}:rollback`); if (opts.rollbackFails) throw new Error("socket closed"); local = undefined; return { rows: [] as T[] }; }
+          log.push(`${id}:rpc`); seen.push(`rpc:${now}`);
+          if (opts.rpcError) throw Object.assign(new Error("canceling statement due to statement timeout"), opts.rpcError);
+          return { rows: [{ r: { advanced: true } }] as T[] };
+        },
+        release(destroy) { log.push(`${id}:release${destroy ? ":destroy" : ""}`); if (destroy) held = undefined; },
+      };
+      held = client;
+      return client;
+    },
+  };
+  return { pool, log, seen };
+}
+const ADVANCE: [string, { createdAt: string; stageToken: string }, { indexed: number; skipped: number }] =
+  ["c", { createdAt: "2026-11-06T00:00:00.000000Z", stageToken: "00000000-0000-4000-8000-000000000001" }, { indexed: 0, skipped: 0 }];
+
+test("the login's own 5s is the default timeout: pinned to BUFFERED_FEED_TIMEOUTS, and the env key is bounded 1000-60000 ms", () => {
+  expect(BUFFERED_FEED_TIMEOUTS.statement_timeout).toBe(`${BUFFERED_FEED_LOGIN_STATEMENT_TIMEOUT_MS / 1000}s`);
+  expect(bufferedFeedConfig({}).statementTimeoutMs).toBe(5_000);
+  expect(bufferedFeedConfig({ INGEST_BUFFERED_SEARCH_FEED_STATEMENT_TIMEOUT_MS: "30000" }).statementTimeoutMs).toBe(30_000);
+  expect(bufferedFeedConfig({ INGEST_BUFFERED_SEARCH_FEED_STATEMENT_TIMEOUT_MS: "60000" }).statementTimeoutMs).toBe(60_000);
+  for (const bad of ["999", "60001", "30s", "-1", "3e4", " 30000"])
+    expect(() => bufferedFeedConfig({ INGEST_BUFFERED_SEARCH_FEED_STATEMENT_TIMEOUT_MS: bad })).toThrow(expect.objectContaining({ code: "config_statement_timeout_ms_invalid" }));
+});
+
+test("per-query timeout: the login check still sees 5s, the RPC runs at 30s inside its own transaction, the backend returns at 5s", async () => {
+  const t = timedPool();
+  const source = sqlBufferedFeedSource(loginCheckedFeedExecutor(t.pool), { statementTimeoutMs: 30_000 });
+  expect(await source.advance(...ADVANCE)).toBe(true);
+  expect(t.log).toEqual(["1:login", "1:system_user", "1:members", "1:begin", "1:set_local:30000ms", "1:rpc", "1:commit", "1:release"]);
+  // The second call reuses the verified backend (no re-check); a plain statement afterwards runs at the login's 5s:
+  // the SET LOCAL did not survive COMMIT.
+  const exec = loginCheckedFeedExecutor(t.pool);
+  expect(await source.advance(...ADVANCE)).toBe(true);
+  await exec.query("SELECT 1");
+  expect(t.seen).toEqual(["login:5s", "rpc:30000ms", "rpc:30000ms", "login:5s", "rpc:5s"]);
+  expect(t.log.filter((l) => l.endsWith(":login"))).toEqual(["1:login", "1:login"]); // a second executor checks the backend once
+});
+
+test("per-query timeout off (unset or equal to the login's 5s): the single-statement path, unchanged", async () => {
+  for (const statementTimeoutMs of [undefined, 5_000]) {
+    const t = timedPool();
+    const source = sqlBufferedFeedSource(loginCheckedFeedExecutor(t.pool), statementTimeoutMs === undefined ? {} : { statementTimeoutMs });
+    expect(await source.advance(...ADVANCE)).toBe(true);
+    expect(t.log).toEqual(["1:login", "1:system_user", "1:members", "1:rpc", "1:release"]);
+    expect(t.seen).toEqual(["login:5s", "rpc:5s"]);
+  }
+  // A plain executor cannot hold a transaction: a timed source over it is refused at construction.
+  expect(() => sqlBufferedFeedSource({ query: async () => ({ rows: [] }) }, { statementTimeoutMs: 30_000 })).toThrow(expect.objectContaining({ code: "config_statement_timeout_unsupported" }));
+});
+
+test("per-query timeout failures: a 57014 rolls back and keeps its code, query name and retry class; a failed ROLLBACK destroys the backend", async () => {
+  const t = timedPool({ rpcError: { code: "57014" } });
+  const source = sqlBufferedFeedSource(loginCheckedFeedExecutor(t.pool), { statementTimeoutMs: 30_000 });
+  const err = await source.advance(...ADVANCE).then(() => null, (e: unknown) => e);
+  expect(err).toMatchObject({ code: "sql_57014", retryable: true, query: "advance" });
+  expect(t.log.slice(-3)).toEqual(["1:rpc", "1:rollback", "1:release"]);
+  const broken = timedPool({ rpcError: { code: "57014" }, rollbackFails: true });
+  const err2 = await sqlBufferedFeedSource(loginCheckedFeedExecutor(broken.pool), { statementTimeoutMs: 30_000 }).advance(...ADVANCE).then(() => null, (e: unknown) => e);
+  expect(err2).toMatchObject({ code: "sql_57014", query: "advance" });
+  expect(broken.log.at(-1)).toBe("1:release:destroy");
+  // Out-of-range timeouts are refused before any backend is touched.
+  for (const bad of [999, 60_001, 1.5]) {
+    const p = timedPool();
+    await expect(loginCheckedFeedExecutor(p.pool).queryWithTimeout(bad, "SELECT 1")).rejects.toMatchObject({ code: "config_statement_timeout_invalid" });
+    expect(p.log).toEqual([]);
+  }
+});
+
+test("real Postgres semantics (PGlite): set_config(statement_timeout, ..., true) lasts only until the transaction ends", async () => {
+  const pg = new PGlite();
+  try {
+    await pg.exec("SET statement_timeout = '5s'");
+    const show = async () => (await pg.query<{ statement_timeout: string }>("SHOW statement_timeout")).rows[0]!.statement_timeout;
+    await pg.exec("BEGIN");
+    await pg.query("SELECT set_config('statement_timeout', $1, true)", ["30000ms"]);
+    expect(await show()).toBe("30s");
+    await pg.exec("COMMIT");
+    expect(await show()).toBe("5s");
+    await pg.exec("BEGIN");
+    await pg.query("SELECT set_config('statement_timeout', $1, true)", ["30000ms"]);
+    await pg.exec("ROLLBACK");
+    expect(await show()).toBe("5s");
+  } finally {
+    await pg.close();
+  }
+});
+
+test("scope: only the scheduled run's source is timed; the SQS keep-up source and the default config keep the login's 5s", async () => {
+  const { bufferedFeedSources } = await import("../lambda.ts");
+  for (const [cfg, scheduledTimed] of [[{ secondVersion: false, statementTimeoutMs: 30_000 }, true], [{ secondVersion: true, statementTimeoutMs: 30_000 }, true], [{ secondVersion: false, statementTimeoutMs: 5_000 }, false]] as const) {
+    const t = timedPool();
+    const s = bufferedFeedSources(loginCheckedFeedExecutor(t.pool), cfg);
+    expect(await s.keepUp.advance(...ADVANCE)).toBe(true);
+    expect(t.log.some((l) => l.includes(":begin") || l.includes(":set_local"))).toBe(false); // keep-up: single statement at 5s
+    expect(await s.scheduled.advance(...ADVANCE)).toBe(true);
+    expect(t.log.some((l) => l.includes(":set_local:30000ms"))).toBe(scheduledTimed);
+    expect(t.seen.filter((x) => x.startsWith("rpc:"))).toEqual(scheduledTimed ? ["rpc:5s", "rpc:30000ms"] : ["rpc:5s", "rpc:5s"]);
+  }
+});

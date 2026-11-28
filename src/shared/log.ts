@@ -5,6 +5,7 @@
  * at the only place a service writes a log line.
  */
 import { scrubTextForLog as scrubText } from "@rhc/lib/scrub-engine/index.ts";
+import { DB_ERROR_REASONS, DB_INTERNAL_REASONS } from "./db-error-reason.ts";
 
 /** The analytics sink's operator counters (never analytics events themselves). */
 const ANALYTICS_COUNTER_FIELDS = [
@@ -37,6 +38,10 @@ const SUMMARY_INPUT_FIELDS = [
 ];
 
 /** The streaming reconcile read budgets serve() logs at startup (searchIndexStreamBudgetWarning). */
+/** The buffered search feed run's per-call timing fields (buffered-search-feed.ts bufferedFeedTimingFields, pinned equal
+ * in buffered-search-feed.test.ts): calls, total ms and longest ms per SQL call kind. */
+export const BUFFERED_FEED_TIMING_FIELDS: readonly string[] = Object.freeze(["page", "stage", "advance"]
+  .flatMap((q) => [`feed_${q}_calls`, `feed_${q}_ms_total`, `feed_${q}_ms_max`]));
 const STREAM_BUDGET_FIELDS = ["max_read_bytes", "max_read_events", "largest_streamed_scope_bytes", "largest_streamed_scope_events"];
 
 /** The search pass's phase timers and write counters (session-pipeline/consumer.ts). */
@@ -67,6 +72,12 @@ export const ALLOWED_LOG_FIELDS = new Set([
   // ...and a 55000's closed refusal class (db-refusal-class.ts; DB_REFUSAL_VALUES, anything else dropped;
   // the mirror is pinned in src/session-ingest/__tests__/ingest-refusal-log.test.ts).
   "db_refusal",
+  // ...and a 40001's closed reason (db-error-reason.ts dbErrorReasonField: the exact SQL RAISE MESSAGE or Postgres
+  // serialization text mapped to a slug, else `other`; DB_ERROR_REASON_VALUES, anything else dropped). Never the message.
+  "db_error_reason",
+  // ...and an XX000's closed message family (db-error-reason.ts DB_INTERNAL_REASON_FAMILIES, else `other`;
+  // DB_INTERNAL_REASON_VALUES, anything else dropped). Never the message.
+  "db_internal_reason",
   // The batch route's uploading client (src/session-ingest/client-agent.ts): closed values from the
   // User-Agent, never its text (CLIENT_KIND_VALUES, CLIENT_OS_VALUES, CLIENT_VERSION_SHAPE; mirrors pinned
   // in src/session-ingest/__tests__/ingest-refusal-log.test.ts).
@@ -108,6 +119,11 @@ export const ALLOWED_LOG_FIELDS = new Set([
   "streaming",
   ...STREAM_BUDGET_FIELDS,
   ...SEARCH_PHASE_FIELDS,
+  // The session pipeline's queue and upload latency (session-pipeline/consumer.ts; the backport lineage's ecb5d981):
+  // non-negative integers only (BOUNDED_COUNT_FIELDS) and one of three words (ENUM_FIELDS).
+  "event_age_ms", "s3_event_age_ms", "queue_origin",
+  // How a search pass's acceptance refusal looked (session-pipeline/contender-seats.ts; 9279264f): one of four words.
+  "contender_seats",
   // The ingest origin claim fence fallback (src/session-ingest/ledger-sql.ts originScoped): epoch ms until which the
   // isolate uses the per-user functions; a bounded integer.
   "fallback_until_ms",
@@ -124,6 +140,11 @@ export const ALLOWED_LOG_FIELDS = new Set([
   // The ingest bounded lock retry (src/session-ingest/deliver.ts LockRetryFields, INGEST_LOCK_RETRY_BUDGET_MS): retries
   // issued for one delivery (a bounded integer) and how they ended (LOCK_RETRY_OUTCOME_VALUES).
   "lock_retry_attempts", "lock_retry_outcome",
+  // The buffered search feed's failing SQL call: one of page / stage / advance (FEED_QUERY_VALUES), never SQL text,
+  // and that call's own wall time in ms (a bounded integer).
+  "feed_query", "feed_query_ms",
+  // ...and the scheduled run's per-call timings (buffered-search-feed.ts bufferedFeedTimingFields): bounded counts only.
+  ...BUFFERED_FEED_TIMING_FIELDS,
 ]);
 
 /**
@@ -132,6 +153,8 @@ export const ALLOWED_LOG_FIELDS = new Set([
  * never carry free text or an identifier.
  */
 export const BOUNDED_COUNT_FIELDS: ReadonlyMap<string, number> = new Map([
+  ["event_age_ms", Number.MAX_SAFE_INTEGER],
+  ["s3_event_age_ms", Number.MAX_SAFE_INTEGER],
   ["buffered_checked", 100_000],
   ["buffered_dropped", 100_000],
   ["admission_backlog", 10_000_000],
@@ -149,6 +172,8 @@ export const BOUNDED_COUNT_FIELDS: ReadonlyMap<string, number> = new Map([
   ["skipped_control", 100_000],
   ["age_ms", 3_600_000],
   ["lock_retry_attempts", 100],
+  ["feed_query_ms", 3_600_000],
+  ...BUFFERED_FEED_TIMING_FIELDS.map((f): [string, number] => [f, f.endsWith("_calls") ? 1_000_000 : 3_600_000]),
   ...ADMISSION_PHASE_FIELDS_LIST.map((f): [string, number] => [f, 3_600_000]),
   ...ANALYTICS_COUNTER_FIELDS.map((f): [string, number] => [f, Number.MAX_SAFE_INTEGER]),
   ...SEAL_POOL_LOG_FIELDS.map((f): [string, number] => [f, Number.MAX_SAFE_INTEGER]),
@@ -189,13 +214,24 @@ export const REGEN_REASON_VALUES: ReadonlySet<string> = new Set([
 ]);
 /** `lock_retry_outcome` mirrors session-ingest deliver.ts LOCK_RETRY_OUTCOMES (pinned equal in lock-retry-budget.test.ts). */
 export const LOCK_RETRY_OUTCOME_VALUES: ReadonlySet<string> = new Set(["succeeded_after_retry", "exhausted", "not_retryable"]);
+/** `feed_query` mirrors buffered-search-feed.ts BUFFERED_FEED_QUERIES (pinned equal in buffered-search-feed.test.ts). */
+export const FEED_QUERY_VALUES: ReadonlySet<string> = new Set(["page", "stage", "advance"]);
+/** `db_error_reason`: exactly db-error-reason.ts DB_ERROR_REASONS (the 40001 slugs plus `other`). */
+export const DB_ERROR_REASON_VALUES: ReadonlySet<string> = new Set(DB_ERROR_REASONS);
+/** `db_internal_reason`: exactly db-error-reason.ts DB_INTERNAL_REASONS (the XX000 families plus `other`). */
+export const DB_INTERNAL_REASON_VALUES: ReadonlySet<string> = new Set(DB_INTERNAL_REASONS);
 export const REGEN_SYSTEM_VALUES: ReadonlySet<string> = new Set(["bob_costas", "brief"]);
 const ENUM_FIELDS: ReadonlyMap<string, ReadonlySet<string>> = new Map([
+  ["queue_origin", new Set(["s3", "requeue", "sweep"])],
+  // "unknown": a streamed pass's acceptance refusal, which main's streamed reader does not classify.
+  ["contender_seats", new Set(["all_unseated", "seated_unseated", "both", "catalog_key", "unknown"])],
   ["store_cause", STORE_CAUSE_VALUES], ["streaming", STREAMING_VALUES],
   ["db_refusal", DB_REFUSAL_VALUES], ["client_kind", CLIENT_KIND_VALUES], ["client_os", CLIENT_OS_VALUES],
   ["regeneration_reason", REGEN_REASON_VALUES], ["system", REGEN_SYSTEM_VALUES],
   ["db_error_detail", DB_ERROR_DETAIL_VALUES], ["db_client_phase", DB_CLIENT_PHASE_VALUES],
-  ["lock_retry_outcome", LOCK_RETRY_OUTCOME_VALUES],
+  ["lock_retry_outcome", LOCK_RETRY_OUTCOME_VALUES], ["feed_query", FEED_QUERY_VALUES],
+  ["db_error_reason", DB_ERROR_REASON_VALUES],
+  ["db_internal_reason", DB_INTERNAL_REASON_VALUES],
 ]);
 /** Shaped fields: emitted only when the string matches its pattern AND the scrubber leaves it unchanged (else
  * dropped). `client_version` is a release version (client-agent.ts CLIENT_VERSION, pinned equal in
@@ -268,13 +304,25 @@ export const log = {
   error: (m: string, f: Record<string, unknown> = {}) => emit("error", m, f),
 };
 
-/** The code and retryable flag of an error, never its message. */
-export function errorFields(err: unknown): Record<string, unknown> {
+/**
+ * errorFields plus the error's own `code` when it is a string (read once), else undefined. `fields.error_code` falls
+ * back to the name for display and retry; `code` never does, so a diagnostic keyed on a real database code (for
+ * example dbErrorReasonField) is not fooled by an error whose name merely looks like one.
+ */
+export function errorCodeFields(err: unknown): { fields: Record<string, unknown>; code: string | undefined } {
   const e = err as { code?: unknown; retryable?: unknown; name?: unknown };
-  return {
-    error_code: typeof e?.code === "string" ? e.code : typeof e?.name === "string" ? e.name : "unknown",
+  const raw = e?.code;
+  const code = typeof raw === "string" ? raw : undefined;
+  const fields = {
+    error_code: code ?? (typeof e?.name === "string" ? e.name : "unknown"),
     ...(typeof e?.retryable === "boolean" ? { retryable: e.retryable } : {}),
   };
+  return { fields, code };
+}
+
+/** The code and retryable flag of an error, never its message. */
+export function errorFields(err: unknown): Record<string, unknown> {
+  return errorCodeFields(err).fields;
 }
 
 /** A SearchIndexError detail code: identifier tokens joined by `:`, never free text (emitted truncated to 256). */

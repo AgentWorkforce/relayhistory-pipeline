@@ -168,13 +168,73 @@ export function parseBufferedFingerprint(fingerprint: string): { stageToken: str
 /** ClickHouse (re2) expressions over `fingerprint`: the bound stage token ('' when legacy) and ordinal strings. */
 export const FINGERPRINT_STAGE_SQL = "extract(fingerprint, '^bf[0-9a-f]+:([0-9a-f-]{36}):')";
 export const FINGERPRINT_ORDINALS_SQL = "arrayFilter(x -> x != '', splitByChar(',', extract(fingerprint, '^bf[0-9a-f]+:[0-9a-f-]{36}:([0-9,]*)$')))";
-export const isBufferedStageKey = (key: string) => key.includes("/buffered-batches/v1/");
+/**
+ * A buffered stage object, by its COMPLETE key shape (the same shape as session-ingest/buffered-drain.ts
+ * parseStagedKey, kept in step by a test) under this deployment's key root:
+ * `<keyRoot>/<org>/buffered-batches/v1/ws=<ws>/m=srv_<32>/b=<batch32>-<content16>-<claim32>.staged.ndjson.zst`.
+ * A substring match is not enough: an ordinary session key such as `<root>/buffered-batches/v1/ws=.../manifest.json`
+ * contains the segment too, and routing it here would skip and ACK it without indexing its pointer.
+ */
+const BUFFERED_STAGE_KEY =
+  /^([a-z0-9][a-z0-9-]{0,62})\/((?!\.)[A-Za-z0-9._-]{1,128})\/buffered-batches\/v1\/ws=((?!\.)[A-Za-z0-9._-]{1,128})\/m=(srv_[0-9a-f]{32})\/b=([0-9a-f]{32})-([0-9a-f]{16})-([0-9a-f]{32})\.staged\.ndjson\.zst$/;
+export const isBufferedStageKey = (key: string, keyRoot: string) => {
+  const m = BUFFERED_STAGE_KEY.exec(key);
+  return m !== null && m[1] === keyRoot && !key.split("/").some((s) => s === "." || s === "..");
+};
+
+/** The feeder's SQL calls (sessions.buffered_search_feed_<query>), named on a failed call's error. The log
+ * serializer's FEED_QUERY_VALUES (shared/log.ts) is the same closed set (pinned equal in buffered-search-feed.test.ts). */
+export const BUFFERED_FEED_QUERIES = Object.freeze(["page", "stage", "advance"] as const);
+export type BufferedFeedQuery = (typeof BUFFERED_FEED_QUERIES)[number];
 
 export class BufferedFeedError extends Error {
-  constructor(readonly code: string, readonly retryable = false) {
+  /** `query` names the SQL call that failed (sql_* codes only), so a timeout can be traced to its statement; it is
+   * logged as `feed_query` (bufferedFeedQueryField). `elapsedMs` is that failed call's own wall time (logged as
+   * `feed_query_ms`), so a statement timeout is told apart from a run that spent its budget on earlier calls. */
+  constructor(readonly code: string, readonly retryable = false, readonly query?: BufferedFeedQuery, readonly elapsedMs?: number) {
     super(`buffered search feed: ${code}`);
     this.name = "BufferedFeedError";
   }
+}
+
+/** `{ feed_query, feed_query_ms }` for a BufferedFeedError raised by a feeder SQL call; `{}` for anything else. A fixed
+ * name from BUFFERED_FEED_QUERIES only, never SQL text; the log serializer drops any other value (shared/log.ts
+ * ENUM_FIELDS), and keeps `feed_query_ms` only as a bounded non-negative integer (BOUNDED_COUNT_FIELDS). */
+export function bufferedFeedQueryField(error: unknown): { feed_query?: BufferedFeedQuery; feed_query_ms?: number } {
+  if (!(error instanceof BufferedFeedError) || typeof error.query !== "string") return {};
+  if (!(BUFFERED_FEED_QUERIES as readonly string[]).includes(error.query)) return {};
+  return error.elapsedMs === undefined ? { feed_query: error.query } : { feed_query: error.query, feed_query_ms: error.elapsedMs };
+}
+
+/** Per feeder SQL call kind: calls made (failed ones included) and their wall time, total and longest, in whole ms. */
+export interface BufferedFeedCallTiming { calls: number; msTotal: number; msMax: number }
+export type BufferedFeedTimings = Record<BufferedFeedQuery, BufferedFeedCallTiming>;
+export const emptyBufferedFeedTimings = (): BufferedFeedTimings =>
+  ({ page: { calls: 0, msTotal: 0, msMax: 0 }, stage: { calls: 0, msTotal: 0, msMax: 0 }, advance: { calls: 0, msTotal: 0, msMax: 0 } });
+
+/** The timing log fields (shared/log.ts BUFFERED_FEED_TIMING_FIELDS, bounded counts): feed_<query>_calls / _ms_total / _ms_max. */
+export function bufferedFeedTimingFields(t: BufferedFeedTimings): Record<string, number> {
+  const out: Record<string, number> = {};
+  for (const q of BUFFERED_FEED_QUERIES) {
+    out[`feed_${q}_calls`] = t[q].calls;
+    out[`feed_${q}_ms_total`] = t[q].msTotal;
+    out[`feed_${q}_ms_max`] = t[q].msMax;
+  }
+  return out;
+}
+
+/** The source with every call's wall time (by `now`) added to `timings`; results and errors pass through unchanged. */
+function timedFeedSource(source: BufferedFeedSource, now: () => number, timings: BufferedFeedTimings): BufferedFeedSource {
+  const timed = <A extends unknown[], R>(q: BufferedFeedQuery, f: (...a: A) => Promise<R>) => async (...a: A): Promise<R> => {
+    const t0 = now();
+    try { return await f(...a); }
+    finally {
+      const ms = Math.max(0, Math.round(now() - t0));
+      const t = timings[q];
+      t.calls += 1; t.msTotal += ms; t.msMax = Math.max(t.msMax, ms);
+    }
+  };
+  return { page: timed("page", source.page.bind(source)), stage: timed("stage", source.stage.bind(source)), advance: timed("advance", source.advance.bind(source)) };
 }
 
 export interface BufferedFeedConfig {
@@ -192,6 +252,12 @@ export interface BufferedFeedConfig {
   secondVersion: boolean;
   /** Only stages created at least this long before the run's clock are processed (late-ack guard). 180-3600 s, default 300. */
   settleMs: number;
+  /**
+   * INGEST_BUFFERED_SEARCH_FEED_STATEMENT_TIMEOUT_MS: the statement timeout of each feeder RPC, 1000-60000 ms, default
+   * 5000 (the login's own, BUFFERED_FEED_TIMEOUTS). Any other value runs each RPC in its own transaction under
+   * SET LOCAL (set_config(..., true)): the login, its role setting and the schema verifier stay at 5s.
+   */
+  statementTimeoutMs: number;
 }
 
 const ISO = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d{1,6})?Z$/;
@@ -304,6 +370,7 @@ export function bufferedFeedConfig(env: NodeJS.ProcessEnv, versionCeiling: numbe
     budgetMs: int("INGEST_BUFFERED_SEARCH_FEED_BUDGET_MS", 50_000, 5_000, 240_000),
     secondVersion: second === "on",
     settleMs: int("INGEST_BUFFERED_SEARCH_FEED_SETTLE_S", 300, 180, 3_600) * 1_000,
+    statementTimeoutMs: int("INGEST_BUFFERED_SEARCH_FEED_STATEMENT_TIMEOUT_MS", BUFFERED_FEED_LOGIN_STATEMENT_TIMEOUT_MS, 1_000, 60_000),
   };
 }
 
@@ -360,18 +427,38 @@ const keysetBefore = (a: { createdAt: string; stageToken: string }, b: { created
  * `secondVersion` (INGEST_BUFFERED_SEARCH_FEED_SECOND_VERSION=on) every createdAt has the exact grammar,
  * a page is a strict keyset after its cursor, and a found stage must carry 045010's `sameSecond`.
  */
-export function sqlBufferedFeedSource(db: SqlExecutor, options: { secondVersion?: boolean } = {}): BufferedFeedSource {
+/** The feed login's own statement timeout (buffered-feed-login.ts BUFFERED_FEED_TIMEOUTS, "5s"), in ms. */
+export const BUFFERED_FEED_LOGIN_STATEMENT_TIMEOUT_MS = 5_000;
+
+/**
+ * A feeder executor that can run one statement under its own statement timeout: BEGIN; set_config(statement_timeout,
+ * <ms>, true); the statement; COMMIT, on one held backend (buffered-feed-login.ts loginCheckedFeedExecutor).
+ */
+export interface TimedSqlExecutor extends SqlExecutor {
+  queryWithTimeout<R = Record<string, unknown>>(timeoutMs: number, text: string, params?: unknown[]): Promise<{ rows: R[] }>;
+}
+
+export function sqlBufferedFeedSource(db: SqlExecutor | TimedSqlExecutor, options: { secondVersion?: boolean; statementTimeoutMs?: number; now?: () => number } = {}): BufferedFeedSource {
+  const clock = options.now ?? Date.now;
   const strict = options.secondVersion === true;
-  const call = async (name: "page" | "stage" | "advance", p: unknown): Promise<Record<string, unknown>> => {
+  const timeoutMs = options.statementTimeoutMs;
+  // A timeout equal to the login's own changes nothing: the single-statement path, exactly as before.
+  const timed = timeoutMs !== undefined && timeoutMs !== BUFFERED_FEED_LOGIN_STATEMENT_TIMEOUT_MS;
+  if (timed && !("queryWithTimeout" in db)) throw new BufferedFeedError("config_statement_timeout_unsupported");
+  const run = <R>(text: string, params: unknown[]) =>
+    timed ? (db as TimedSqlExecutor).queryWithTimeout<R>(timeoutMs!, text, params) : db.query<R>(text, params);
+  const call = async (name: BufferedFeedQuery, p: unknown): Promise<Record<string, unknown>> => {
     let value: unknown;
-    try { value = (await db.query<{ r: unknown }>(`SELECT sessions.buffered_search_feed_${name}($1::jsonb) AS r`, [JSON.stringify(p)])).rows[0]?.r; }
+    const t0 = clock();
+    try { value = (await run<{ r: unknown }>(`SELECT sessions.buffered_search_feed_${name}($1::jsonb) AS r`, [JSON.stringify(p)])).rows[0]?.r; }
     catch (error) {
       // A refused feeder login (buffered-feed-login.ts) keeps its own code and is not retried.
       if (error instanceof BufferedFeedError) throw error;
       const code = (error as { code?: unknown } | null)?.code;
       // Serialization, lock and statement timeouts are transient: the page or message retries.
       const sqlstate = typeof code === "string" && /^[0-9A-Z]{5}$/.test(code) ? code : "unknown";
-      throw new BufferedFeedError(`sql_${sqlstate}`, ["40001", "40P01", "55P03", "57014", "08006", "08003", "unknown"].includes(sqlstate));
+      throw new BufferedFeedError(`sql_${sqlstate}`, ["40001", "40P01", "55P03", "57014", "08006", "08003", "unknown"].includes(sqlstate), name,
+        Math.max(0, Math.round(clock() - t0)));
     }
     if (!obj(value)) bad("sql_result");
     return value as Record<string, unknown>;
@@ -754,7 +841,7 @@ export type KeepUpOutcome =
 
 /** KEEP-UP: one stage named by its object key (an S3 event on the pipeline queue, or a requeue). */
 export async function feedBufferedStageByKey(key: string, deps: BufferedFeedDeps): Promise<KeepUpOutcome> {
-  if (!isBufferedStageKey(key)) return { outcome: "skipped", reason: "not_a_buffered_stage" };
+  if (!isBufferedStageKey(key, deps.keyRoot)) return { outcome: "skipped", reason: "not_a_buffered_stage" };
   const state = await deps.source.stage({ stageKey: key });
   // A preparing stage (bounded by its intent expiry) or a GC lease (minutes) resolves soon: look
   // again. A fenced privacy authority can last: the stage is left to the backfill/tail cursor,
@@ -796,6 +883,8 @@ export interface BackfillSummary {
   refusalsOutstanding?: number;
   /** S encoding only: rows not written because a canonical row of the identity exists (guard (c)). */
   canonicalPresent?: number;
+  /** Per SQL call kind: calls, total and longest wall time (bufferedFeedTimingFields). */
+  timings: BufferedFeedTimings;
 }
 
 /**
@@ -803,12 +892,18 @@ export interface BackfillSummary {
  * past stages that were indexed (and re-checked) or are terminally not indexable, and only after
  * the ClickHouse writes, so a crash replays at most one page (idempotent).
  */
-export async function runBufferedFeed(deps: BufferedFeedDeps, config: Pick<BufferedFeedConfig, "pageSize" | "stagesPerSecond" | "since" | "cursor" | "budgetMs"> & { settleMs?: number }): Promise<BackfillSummary> {
+/**
+ * `timings` (optional) is where the per-call timings accumulate: the caller keeps it, so a run that throws still has the
+ * timings of every call up to and including the failed one. Timing never changes what the run does.
+ */
+export async function runBufferedFeed(deps: BufferedFeedDeps, config: Pick<BufferedFeedConfig, "pageSize" | "stagesPerSecond" | "since" | "cursor" | "budgetMs"> & { settleMs?: number },
+  timings: BufferedFeedTimings = emptyBufferedFeedTimings()): Promise<BackfillSummary> {
   const now = deps.now ?? Date.now;
+  deps = { ...deps, source: timedFeedSource(deps.source, now, timings) };
   const sleep = deps.sleep ?? ((ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms)));
   const deadline = now() + config.budgetMs;
   const interval = 1_000 / config.stagesPerSecond;
-  const summary: BackfillSummary = { pages: 0, stages: 0, indexed: 0, skipped: 0, rows: 0, deleted: 0, caughtUp: false, reasons: {} };
+  const summary: BackfillSummary = { pages: 0, stages: 0, indexed: 0, skipped: 0, rows: 0, deleted: 0, caughtUp: false, reasons: {}, timings };
   const s2 = deps.secondVersion;
   if (s2) { summary.refused = 0; summary.canonicalPresent = 0; }
   const count = (reason: string) => (summary.reasons[reason] = (summary.reasons[reason] ?? 0) + 1);
