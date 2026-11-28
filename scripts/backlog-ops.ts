@@ -544,8 +544,12 @@ export function checkOrgBindingsAt(env: Record<string, string | undefined>, d: B
   const view = (p: string) => { let v = views.get(p); if (v === undefined) { v = waveView(read(p), org, waveScope); views.set(p, v); } return v; };
   let orgSince = since;
   for (const b of backlogOpsBindings(d)) {
-    let carried: unknown;
-    try { carried = JSON.parse(view(paths.bound(b.kind))).carried_ms; } catch { continue; } // a missing file is checkBoundReceipts' refusal
+    let raw: string;
+    try { raw = read(paths.bound(b.kind)); } catch { continue; } // a missing file is checkBoundReceipts' refusal
+    // The view refuses any bound receipt not scoped exactly to the wave (backlog_ops_wave_scope), named here, not
+    // masked as a missing file by the read inside checkBoundReceipts.
+    views.set(paths.bound(b.kind), waveView(raw, org, waveScope));
+    const carried: unknown = JSON.parse(views.get(paths.bound(b.kind))!).carried_ms;
     if (carried === undefined) continue;
     if (!Number.isSafeInteger(carried) || (carried as number) < 1 || now - (carried as number) >= backlogOpsBindingMaxAgeMs(d.mode, b.kind) || (carried as number) > now)
       refuse(`backlog_ops_bound_${b.kind}_carried`);

@@ -142,9 +142,12 @@ test("views: a wave slice becomes a single-org receipt; a non-wave receipt of th
   expect(v.scope).toBe(orgScopeId(B));
   expect(v.summary.evidence.org_count).toBe(1);
   expect(v.summary.evidence.orgs.map((o: { org_hash: string }) => o.org_hash)).toEqual([H(B)]);
-  // Another scope is kept as is, so the exact scope check refuses it.
-  const other = JSON.stringify({ ...top, scope: "orgs_" + "f".repeat(32), exitCode: 0, summary: {} });
-  expect(JSON.parse(waveView(other, A, SCOPE_ID)).scope).toBe("orgs_" + "f".repeat(32));
+  // Any other scope is refused before slicing: another wave's, one org alone, unscoped, missing; wave or not.
+  for (const sc of ["orgs_" + "f".repeat(32), orgScopeId(A), "all", undefined])
+    for (const summary of [{}, waveSummary([A], [{ org: A, exitCode: 0, summary: {} }])])
+      expect(code(() => waveView(JSON.stringify({ ...top, scope: sc, exitCode: 0, summary }), A, SCOPE_ID))).toBe("backlog_ops_wave_scope");
+  // The single-org wave: its scope is that org's, exactly.
+  expect(JSON.parse(waveView(JSON.stringify({ ...top, scope: orgScopeId(A), exitCode: 0, summary: {} }), A, orgScopeId(A))).scope).toBe(orgScopeId(A));
 });
 
 /** The --revisions-since-ms a child was given (null when none). */
@@ -418,4 +421,35 @@ test("consumer hardening: a carried slice only with previous_run, and never afte
   expect(code(() => waveView(JSON.stringify({ ...top, previous_run: "702" }), A, SCOPE_ID))).toBe("backlog_ops_wave_view");
   // A non-carried slice needs neither.
   expect(JSON.parse(waveView(JSON.stringify(top), B, SCOPE_ID)).carried_ms).toBeUndefined();
+});
+
+test("credential step: evidence scoped to A alone never feeds an A+B wave (neither child executes); the exact-wave and single-org paths still bind", async () => {
+  const saved = { ...receipts };
+  try {
+    const ok = () => ({ code: 0, stdout: JSON.stringify(backfill("dry_run")) });
+    // A single-org (A only) wave: its own receipts, scope orgs_<A>.
+    const single = await step("backfill-dry", {}, {}, ok, { BACKLOG_OPS_ORGS: A });
+    expect(single.receipt.scope).toBe(orgScopeId(A));
+    expect(single.exit).toBe(0);
+    // An A+B execute bound to that A-only dry: refused for both orgs, no child runs.
+    const ex = await step("backfill-execute", { BACKLOG_OPS_DRY_RUN: "701", BACKLOG_OPS_CONFIRMATION: `BACKFILL-EXECUTE ${SHA} DRY 701 PER_ORG` }, { dry: "backfill-dry" },
+      () => ({ code: 0, stdout: JSON.stringify(backfill("execute")) }));
+    expect(ex.seen).toEqual([]);
+    expect(Object.values(ex.by).map((p: any) => p.summary.refused)).toEqual(["backlog_ops_wave_scope", "backlog_ops_wave_scope"]);
+    expect(ex.exit).toBe(1);
+    // A non-wave receipt scoped to A alone, bound by an A+B wave: the same.
+    const nonWave = JSON.parse(single.file);
+    nonWave.summary = backfill("dry_run");
+    receipts["backfill-dry"] = JSON.stringify(nonWave);
+    const ex2 = await step("backfill-execute", { BACKLOG_OPS_DRY_RUN: "701", BACKLOG_OPS_CONFIRMATION: `BACKFILL-EXECUTE ${SHA} DRY 701 PER_ORG` }, { dry: "backfill-dry" },
+      () => ({ code: 0, stdout: JSON.stringify(backfill("execute")) }));
+    expect(ex2.seen).toEqual([]);
+    expect(ex2.exit).toBe(1);
+    // The single-org path: an A-only execute binds the A-only dry and runs A.
+    receipts["backfill-dry"] = single.file;
+    const ex3 = await step("backfill-execute", { BACKLOG_OPS_DRY_RUN: "701", BACKLOG_OPS_CONFIRMATION: `BACKFILL-EXECUTE ${SHA} DRY 701 PER_ORG` }, { dry: "backfill-dry" },
+      () => ({ code: 0, stdout: JSON.stringify(backfill("execute")) }), { BACKLOG_OPS_ORGS: A });
+    expect([ex3.seen, ex3.exit]).toEqual([[A], 0]);
+    // The exact-wave path (A+B dry bound by an A+B execute) is the chain test above.
+  } finally { Object.assign(receipts, saved); }
 });

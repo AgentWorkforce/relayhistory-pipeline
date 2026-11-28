@@ -701,6 +701,10 @@ refresh, catch-up), export and drain.
   non-wave receipt of exactly the wave's scope re-scoped to the org with its per-org lists sliced. The unchanged
   per-receipt checks run on each view: home, ledger, since, fingerprint, baseline. The run's 3 h / 24 h freshness and
   order checks still apply.
+- **A per-org run binds only receipts scoped exactly to its wave** (`backlog_ops_wave_scope` otherwise, before any
+  slicing). This includes an UNSCOPED receipt, which a non-wave run accepts for a non-dry, non-exact binding (for
+  example an export-execute whose BACKFILL was an all-orgs backfill-execute). The choice is deliberately fail-closed;
+  run the bound step at the wave's scope. Pinned by the view test in `backlog-wave.test.ts`.
 - An org whose bindings fail is refused alone (its slice records the code) and no child runs for it.
 - A catch-up child with `AUTHORITY` gets only its org's evidence and records its org's baseline. A marker merges the
   passing orgs' baselines and refuses the others `binding_refused`. A reshard-dry needs one org of a wave catch-up to bind.
