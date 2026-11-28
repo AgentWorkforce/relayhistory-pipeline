@@ -734,3 +734,20 @@ through its `session_index` pointer by the canonical readers, so the inherited-i
   after the erase is covered by the serving checks above.
 - Every producer in the trace that reads through these readers (P1 to P7) inherits the check. Any that reads
   generation chunks by raw key needs its own.
+
+### Lander clarifications (105216e28735, relayed by sessions-partial-canonical)
+
+1. **P5: the publication is the first durable copy, and every later page response is a separate disclosure.**
+   Required fixture: publish a page, commit a revocation, then request the same page before cleanup; it must not be
+   served. The verdict therefore belongs at the page-serving read too, not only at publication.
+2. **Staged search: a check before each write-page commit still races an erase** between the check and the commit.
+   Either trace what serializes them (an advisory lock, a CAS, or the same transaction), or keep committed pages
+   invisible until a guarded publication step. Under W2, that step would be a publish-style transaction: the org key
+   EXCLUSIVE, then the verdict, then flip visible, which is ordered against every erase as in (1) above.
+3. **Buffered responses: the FINAL (post-IO) verdict is the read's ordering point**, and revocation during the IO
+   must be exercised. sessions-partial-canonical's F3 and F7 (partial-canonical-events.test.ts, on their branch)
+   commit the operator fence during the object read, on successful and failing reads, first and cursor pages, and
+   expect 404 `session_fenced` with no content. A W2 verdict would sit at the same point.
+4. **Every producer observation is PROVISIONAL until its actual commit and send paths are traced.** That covers
+   staged-reconcile, Bob Costas, the brief input, publication-image and P5. The producer and raw-key reader tables
+   above come from static call-site traces and file headers, not from end-to-end commit or send traces.
