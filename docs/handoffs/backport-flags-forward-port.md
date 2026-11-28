@@ -92,6 +92,103 @@ line, `search index acceptance stamp not written`, and its result is unchanged.
 
 Unset the flag, or set it to `false`. Leftover stamps are then inert.
 
+## SEARCH_INDEX_ACCEPTANCE_WATERMARK_ENABLED
+
+Not a backport flag: it is new here, and it extends the acceptance skip above. Default off.
+
+### Grammar
+
+| Value | Result |
+| --- | --- |
+| unset, `""`, `false` | Off. The acceptance skip runs exactly as described above. |
+| `true` | On. Needs `SEARCH_INDEX_SKIP_ACCEPTANCE_MISSING_ENABLED=true`. |
+| anything else | Init fails and names the variable. |
+
+### Why
+
+The acceptance skip matches only an unchanged pointer set. A live session gets a new manifest revision with
+every upload, so each revision of a session that is still refused for acceptance reads the whole scope again,
+only to refuse again.
+
+### What it does
+
+A stamped full read also stores a watermark in the stamp (`w`). It holds hashes and counts only:
+
+- the record ids of the refused groups, hashed (at most 32). Each one is proved by the fold itself: the
+  records carrying that id, alone, make `normalizeRelayhistoryRecords` refuse;
+- for every live sibling manifest (its key hashed): how many chunks were read, the manifest's content chain
+  over them, and the chain over all but the last;
+- a digest of the settings (salt, scope, canonical id, window, limits, stream budgets, reader ruleset);
+- the time of the full read.
+
+A later pass whose pointer set differs runs a probe before its transaction, with no lock held. The probe
+reads the stamp, the live pointer rows (one short read-only transaction), the stored window, each sibling
+manifest, and only the chunks added since the watermark. The refusal is held when all of these are true:
+
+1. The sibling manifest set is the watermark's.
+2. Every manifest was read as its pointer row lists it (revision, content sha256, etag) and is scrubbed.
+3. Every chunk the refused read covered is still listed unchanged: the content chain over the first `n`
+   chunks is the stored one. If only the last of them changed (a writer that re-cuts its tail chunk), the
+   read starts at that chunk instead.
+4. The scope is still within the whole-read bounds, and the added chunks are within the probe's bounds
+   (64 chunks, 32 MiB).
+5. At least one refused record id has no record in the added chunks, in any sibling manifest, from any origin.
+6. Less than `SKIP_STATE_MAX_AGE_MS` (six hours) has passed since the full read. A hold never moves that
+   time, so a scope that stays refused is still read in full every six hours.
+
+The locked pass then runs every branch it always runs first (canonical mismatch, alias still live, erase,
+skip-current, over-bound). It returns the held outcome only if the pointer rows, the epoch and the canonical
+id it reads under the locks are exactly the probe's. This check uses SQL facts only. The result is the
+acceptance skip's (`complete: false`, `skippedBeforeRead`, reasons `relayhistory_acceptance_missing,
+skipped_before_read`) plus `acceptanceHold`; the log line carries `acceptance_hold: "watermark"` and
+`delta_chunks`. After the transaction commits, the stamp is advanced to the new pointer set, written at the
+probe's time. A repeat at that revision is then the plain skip, and the next revision's probe reads only what
+was added after it.
+
+Anything else runs the normal pass: no watermark, an error of any kind (fail open), or any condition above
+not met.
+
+### Why a hold is correct
+
+The pass indexes nothing while the cross-origin fold refuses one record id group, and a group is built only
+from the scope's records that carry its record id. The scope's records are the chunks of its live sibling
+manifests. Conditions 1, 3 and 5 together mean the group's input is identical, so the fold refuses again.
+
+A seat (`accepted_seq`), an acceptance repair, a new revision, a tombstone and a new contender can each
+change a group only as a record with that record id. Such a record is either in an added chunk (condition 5
+ends the hold) or it replaced an earlier chunk (condition 3 fails) or it came with a new manifest (condition 1
+fails). This does not depend on how any writer publishes: no writer path is assumed.
+
+### Locks
+
+The probe's object and ClickHouse reads run before the search transaction. The stamp write runs after it
+commits. The transaction itself gains no read: one in-memory digest comparison. The acceptance skip's own
+stamp and window reads stay where they were.
+
+### Costs with the flag on
+
+- Every pass: one more stamp read, outside the lock. When the stamp carries a watermark: one short read-only
+  transaction and one window read as well.
+- A held pass: one manifest read per sibling, the added chunks, one stamp insert.
+- A probe that does not hold costs what it read, and the normal pass follows.
+
+### Known limits
+
+- A refusal that comes only from the catalog-key fold has no record id group and is stamped without a
+  watermark.
+- A scope with more than 64 sibling manifests is stamped without a watermark.
+- When every kept record id is touched by the added chunks (for example the contended record is rewritten
+  on every upload), the pass reads in full each time, as without the flag.
+- Stamp writes are ordered by time. A stamp advanced after the lock is released is written at the probe's
+  time, so a pass that ran in between stays the latest row unless the two runtimes' clocks disagree by more
+  than the gap. A stale stamp cannot cause a wrong skip or hold: both re-check the current pointer rows and
+  manifest content. It is hashes and counts only.
+
+### Rollback
+
+Unset the flag, or set it to `false`. The acceptance skip ignores the `w` field, so stamps written with the
+flag on keep working as plain stamps.
+
 ## SEARCH_INDEX_SKIP_OVER_BOUND_ENABLED
 
 The backport commits are 14e9c00a and 95776f5b.

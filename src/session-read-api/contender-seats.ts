@@ -45,13 +45,8 @@ export function seatsOfGroups(groups: Iterable<readonly (string | undefined)[]>)
   return undefined;
 }
 
-/**
- * The word for the record set handed to normalizeRelayhistoryRecords, over the seats its cross-origin fold sees: per
- * record key the newest revision, with accepted_seq merged across copies of that same revision, tombstones
- * included, convergence events and legacy records left out, grouped by record id. Call it only after that fold
- * refused with ACCEPTANCE_MISSING.
- */
-export function contenderSeatsOfRecords(records: Iterable<RelayhistoryStreamRecord>): RecordIdSeats | undefined {
+/** The record id fold's input, as normalizeRelayhistoryRecords sees it: each contending seat's accepted_seq, grouped by record id. */
+function seatGroupsOfRecords(records: Iterable<RelayhistoryStreamRecord>): Map<string, (string | undefined)[]> {
   const latest = new Map<string, { revision: bigint; seq: string | undefined; contends: boolean; recordId: string }>();
   for (const r of records) {
     const key = relayhistoryRecordKey(r);
@@ -71,5 +66,27 @@ export function contenderSeatsOfRecords(records: Iterable<RelayhistoryStreamReco
     if (group) group.push(seat.seq);
     else groups.set(seat.recordId, [seat.seq]);
   }
-  return seatsOfGroups(groups.values());
+  return groups;
+}
+
+/**
+ * The word for the record set handed to normalizeRelayhistoryRecords, over the seats its cross-origin fold sees: per
+ * record key the newest revision, with accepted_seq merged across copies of that same revision, tombstones
+ * included, convergence events and legacy records left out, grouped by record id. Call it only after that fold
+ * refused with ACCEPTANCE_MISSING.
+ */
+export function contenderSeatsOfRecords(records: Iterable<RelayhistoryStreamRecord>): RecordIdSeats | undefined {
+  return seatsOfGroups(seatGroupsOfRecords(records).values());
+}
+
+/**
+ * The record ids of the refused groups over the same seats (two or more contenders, at least one without
+ * accepted_seq), sorted. Each is a group the cross-origin fold (lastAccepted) refuses for as long as no record with
+ * that record id is added to the set: the group is built only from records carrying the id. Call it only after
+ * that fold refused with ACCEPTANCE_MISSING; empty when every refusal came from the catalog-key fold.
+ */
+export function refusedRecordIdsOfRecords(records: Iterable<RelayhistoryStreamRecord>): string[] {
+  const out: string[] = [];
+  for (const [recordId, group] of seatGroupsOfRecords(records)) if (group.length >= 2 && group.some((seq) => seq === undefined)) out.push(recordId);
+  return out.sort();
 }

@@ -16,7 +16,7 @@ import {
   type RelayhistoryStreamRecord,
 } from "../../packages/pipeline/src/lib/pipeline/relayhistory-transform.ts";
 import { PipelineError } from "../../packages/pipeline/src/lib/pipeline/errors.ts";
-import { ACCEPTANCE_MISSING, contenderSeatsOfRecords, type ContenderSeats } from "./contender-seats.ts";
+import { ACCEPTANCE_MISSING, contenderSeatsOfRecords, refusedRecordIdsOfRecords, type ContenderSeats } from "./contender-seats.ts";
 import { labelledActorName, messageSubagent } from "../../packages/pipeline/src/lib/pipeline/message-origin.ts";
 import {
   chunkKeys,
@@ -66,6 +66,8 @@ interface SearchIndexDeps {
   decompress: (stored: Uint8Array, maxBytes: number) => Uint8Array;
   /** Self-host READ_API_CANONICAL_FETCH_CONCURRENCY (CanonicalDeps.fetchConcurrency); absent: 1, sequential. */
   fetchConcurrency?: number;
+  /** Only the search stage's acceptance watermark: also report the refused groups' record ids (ScopeRead.refusedRecordIds). */
+  refusedRecordIds?: true;
   /** MESSAGE_ORIGIN_LABELS_ENABLED on an index writer (projectedToNeonRow). Absent: off. */
   originLabels?: boolean;
 }
@@ -100,6 +102,26 @@ export function manifestUserId(manifest: ManifestV1): string {
   } catch {
     return admittedManifestUserId(manifest) ?? "";
   }
+}
+
+/** The most candidate record ids refoldedRefusals proves (sorted, the first ones). */
+const REFUSED_RECORD_IDS_MAX = 64;
+
+/**
+ * The refused groups' record ids, each PROVED by the fold itself: of the candidates contender-seats.ts names, only
+ * those whose own records (every record of the set carrying that record id, and nothing else) make
+ * normalizeRelayhistoryRecords refuse with relayhistory_acceptance_missing. Failure path only.
+ */
+function refoldedRefusals(records: RelayhistoryStreamRecord[]): string[] {
+  const proved: string[] = [];
+  for (const recordId of refusedRecordIdsOfRecords(records).slice(0, REFUSED_RECORD_IDS_MAX)) {
+    try {
+      normalizeRelayhistoryRecords(records.filter((r) => r.record_id === recordId));
+    } catch (error) {
+      if (error instanceof PipelineError && error.code === ACCEPTANCE_MISSING) proved.push(recordId);
+    }
+  }
+  return proved;
 }
 
 /** Every canonical record of one manifest, digests verified. Throws a PipelineError with a code. */
@@ -432,6 +454,11 @@ export interface ScopeRead {
   admitted?: Array<{ manifest: ManifestV1; key: string }>;
   /** Set only when `reasons` carries relayhistory_acceptance_missing (contender-seats.ts): telemetry only. */
   contenderSeats?: ContenderSeats;
+  /**
+   * Only with `refusedRecordIds: true` in the deps, when the record id fold refused with
+   * relayhistory_acceptance_missing: the refused groups' record ids (contender-seats.ts refusedRecordIdsOfRecords).
+   */
+  refusedRecordIds?: string[];
 }
 
 export async function readCanonicalScope(
@@ -594,6 +621,7 @@ export async function readCanonicalScope(
   // bytes) falls back to folding each manifest on its own, without deletes.
   let canonicalRecords: RelayhistoryStreamRecord[] = [];
   let recordIdSeats: ContenderSeats | undefined;
+  let refusedRecordIds: string[] | undefined;
   let catalogRefused = false;
   let groups: { records: RelayhistoryStreamRecord[]; part: Part }[];
   try {
@@ -622,6 +650,8 @@ export async function readCanonicalScope(
     reasons.push(error instanceof PipelineError ? error.code : "fold_failed");
     // Failure path only: the record id fold's refusal, classified over the set it was handed.
     if (error instanceof PipelineError && error.code === ACCEPTANCE_MISSING) recordIdSeats = contenderSeatsOfRecords(parts.flatMap((p) => p.records));
+    if (error instanceof PipelineError && error.code === ACCEPTANCE_MISSING && deps.refusedRecordIds === true)
+      refusedRecordIds = refoldedRefusals(parts.flatMap((p) => p.records));
     groups = [];
     for (const part of parts) {
       try {
@@ -761,5 +791,6 @@ export async function readCanonicalScope(
     })),
     // A record id word wins; with it the catalog-key fold may also have refused. Absent on every other read.
     ...(recordIdSeats !== undefined ? { contenderSeats: recordIdSeats } : catalogRefused ? { contenderSeats: "catalog_key" as const } : {}),
+    ...(refusedRecordIds !== undefined ? { refusedRecordIds } : {}),
   };
 }

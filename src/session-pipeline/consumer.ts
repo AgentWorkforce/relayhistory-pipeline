@@ -434,6 +434,8 @@ export async function processBatch(records: readonly QueueRecord[], deps: Consum
           reason: result.reasons.join(",") || undefined,
           // Only on a read pass refused for acceptance (search-index.ts SearchIndexResult.contenderSeats).
           contender_seats: result.contenderSeats,
+          // SEARCH_INDEX_ACCEPTANCE_WATERMARK_ENABLED: the refusal was held across a new revision; chunks its probe read.
+          ...(result.acceptanceHold ? { acceptance_hold: "watermark", delta_chunks: result.acceptanceHold.deltaChunks } : {}),
           ...phaseFields(),
           duration_ms: Date.now() - started,
           ...lag,

@@ -124,6 +124,9 @@ export const ALLOWED_LOG_FIELDS = new Set([
   "event_age_ms", "s3_event_age_ms", "queue_origin",
   // How a search pass's acceptance refusal looked (session-pipeline/contender-seats.ts; 9279264f): one of four words.
   "contender_seats",
+  // SEARCH_INDEX_ACCEPTANCE_WATERMARK_ENABLED (session-pipeline/search-index.ts acceptanceWatermarkProbe): the
+  // acceptance refusal was held across a new revision (one word), and how many added chunks its probe read.
+  "acceptance_hold", "delta_chunks",
   // The ingest origin claim fence fallback (src/session-ingest/ledger-sql.ts originScoped): epoch ms until which the
   // isolate uses the per-user functions; a bounded integer.
   "fallback_until_ms",
@@ -154,6 +157,7 @@ export const ALLOWED_LOG_FIELDS = new Set([
  */
 export const BOUNDED_COUNT_FIELDS: ReadonlyMap<string, number> = new Map([
   ["event_age_ms", Number.MAX_SAFE_INTEGER],
+  ["delta_chunks", 100_000],
   ["s3_event_age_ms", Number.MAX_SAFE_INTEGER],
   ["buffered_checked", 100_000],
   ["buffered_dropped", 100_000],
@@ -225,6 +229,7 @@ const ENUM_FIELDS: ReadonlyMap<string, ReadonlySet<string>> = new Map([
   ["queue_origin", new Set(["s3", "requeue", "sweep"])],
   // "unknown": a streamed pass's acceptance refusal, which main's streamed reader does not classify.
   ["contender_seats", new Set(["all_unseated", "seated_unseated", "both", "catalog_key", "unknown"])],
+  ["acceptance_hold", new Set(["watermark"])],
   ["store_cause", STORE_CAUSE_VALUES], ["streaming", STREAMING_VALUES],
   ["db_refusal", DB_REFUSAL_VALUES], ["client_kind", CLIENT_KIND_VALUES], ["client_os", CLIENT_OS_VALUES],
   ["regeneration_reason", REGEN_REASON_VALUES], ["system", REGEN_SYSTEM_VALUES],

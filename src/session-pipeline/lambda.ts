@@ -164,6 +164,12 @@ export interface LambdaEnv {
    */
   searchSkipAcceptanceMissing?: true;
   /**
+   * SEARCH_INDEX_ACCEPTANCE_WATERMARK_ENABLED=true (default off; needs SEARCH_INDEX_SKIP_ACCEPTANCE_MISSING_ENABLED=true):
+   * the acceptance stamp carries a watermark, and a pass over a changed pointer set holds the refusal after reading
+   * only the added chunks, before its transaction (search-index.ts acceptanceWatermarkProbe).
+   */
+  searchAcceptanceWatermark?: true;
+  /**
    * SEARCH_INDEX_SKIP_OVER_BOUND_ENABLED=true (default off; same grammar as on the backport lineage): a scope whose
    * stored pointer sizes and search state already show the size refusal at its current revision returns before
    * any manifest read (search-index.ts overBoundBeforeRead). The managed search-jobs pass never skips. Absent: as
@@ -282,6 +288,10 @@ export function lambdaEnv(env: NodeJS.ProcessEnv = process.env, composition?: Se
   const skipAcceptanceMissing = searchIndexSkipAcceptanceMissingFromEnv(env);
   if (skipAcceptanceMissing && env.SEARCH_INDEX_ENABLED !== "1")
     throw new Error("session pipeline: SEARCH_INDEX_SKIP_ACCEPTANCE_MISSING_ENABLED=true needs SEARCH_INDEX_ENABLED=1");
+  // SEARCH_INDEX_ACCEPTANCE_WATERMARK_ENABLED: the same strict grammar, default off; on needs the acceptance skip.
+  const acceptanceWatermark = searchIndexAcceptanceWatermarkFromEnv(env);
+  if (acceptanceWatermark && !skipAcceptanceMissing)
+    throw new Error("session pipeline: SEARCH_INDEX_ACCEPTANCE_WATERMARK_ENABLED=true needs SEARCH_INDEX_SKIP_ACCEPTANCE_MISSING_ENABLED=true");
   // SEARCH_INDEX_SKIP_OVER_BOUND_ENABLED: strict grammar, default off; on needs the search stage.
   const skipOverBound = searchIndexSkipOverBoundFromEnv(env);
   if (skipOverBound && env.SEARCH_INDEX_ENABLED !== "1")
@@ -319,6 +329,7 @@ export function lambdaEnv(env: NodeJS.ProcessEnv = process.env, composition?: Se
     ...(skipCurrent ? { skipCurrentEnabled: true } : {}),
     ...(searchPreRead ? { searchPreReadEnabled: true } : {}),
     ...(skipAcceptanceMissing ? { searchSkipAcceptanceMissing: true as const } : {}),
+    ...(acceptanceWatermark ? { searchAcceptanceWatermark: true as const } : {}),
     ...(skipOverBound ? { searchSkipOverBound: true as const } : {}),
     ...(pointerPreRead ? { pointerPreReadEnabled: true } : {}),
     ...(pointerSkipOriginBucket ? { pointerSkipOriginBucketEnabled: true } : {}),
@@ -760,6 +771,8 @@ export function runtimeFromSecret(env: LambdaEnv, secretText: string, schemaGene
       ...(env.searchPreReadEnabled ? { preRead: true as const } : {}),
       // Default off (SEARCH_INDEX_SKIP_ACCEPTANCE_MISSING_ENABLED=true, ClickHouse only).
       ...(env.searchSkipAcceptanceMissing && !binding ? { skipAcceptanceMissing: true as const } : {}),
+      // Default off (SEARCH_INDEX_ACCEPTANCE_WATERMARK_ENABLED=true, with the acceptance skip, ClickHouse only).
+      ...(env.searchSkipAcceptanceMissing && env.searchAcceptanceWatermark && !binding ? { acceptanceWatermark: true as const } : {}),
       // Default off (SEARCH_INDEX_SKIP_OVER_BOUND_ENABLED=true, ClickHouse only).
       ...(env.searchSkipOverBound && !binding ? { skipOverBound: true as const } : {}),
       // Default off (SEARCH_INDEX_STREAMING_CH=1, ClickHouse only); the deadline is set per invocation.
@@ -1398,6 +1411,14 @@ export function searchIndexSkipAcceptanceMissingFromEnv(env: Record<string, stri
   if (value === undefined || value === "" || value === "false") return false;
   if (value === "true") return true;
   throw new Error("session pipeline: SEARCH_INDEX_SKIP_ACCEPTANCE_MISSING_ENABLED must be true or false");
+}
+
+/** SEARCH_INDEX_ACCEPTANCE_WATERMARK_ENABLED, the same grammar: unset, "" and "false" are off; "true" is on; anything else fails init naming the variable. */
+export function searchIndexAcceptanceWatermarkFromEnv(env: Record<string, string | undefined>): boolean {
+  const value = env.SEARCH_INDEX_ACCEPTANCE_WATERMARK_ENABLED;
+  if (value === undefined || value === "" || value === "false") return false;
+  if (value === "true") return true;
+  throw new Error("session pipeline: SEARCH_INDEX_ACCEPTANCE_WATERMARK_ENABLED must be true or false");
 }
 
 /**

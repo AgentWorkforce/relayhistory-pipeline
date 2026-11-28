@@ -37,7 +37,7 @@
  * Nothing here logs content; errors carry codes only.
  */
 import { ARTIFACT_MAX_SOURCE_BYTES, ARTIFACT_MAX_SOURCE_RECORDS } from "../session-read-api/canonical-artifact.ts";
-import { readCanonicalScope } from "../session-read-api/canonical-projection.ts";
+import { readCanonicalScope, streamManifestRecords } from "../session-read-api/canonical-projection.ts";
 import type { ContenderSeats } from "../session-read-api/contender-seats.ts";
 import {
   STREAM_DEADLINE,
@@ -65,7 +65,7 @@ import { createHash, randomInt } from "node:crypto";
 import * as zlib from "node:zlib";
 import { layoutComponent } from "../shared/layout-component.ts";
 import { errorFields, log } from "../shared/log.ts";
-import { PipelineError, type ManifestReader, type ObjectStore } from "../shared/vendor.ts";
+import { PipelineError, computeContentSha256, parseSessionKey, type ManifestReader, type ManifestV1, type ObjectStore } from "../shared/vendor.ts";
 import type { SqlExecutor } from "@rhc/lib/pipeline/queue.ts";
 import type { ClickHouseClient } from "./vendor/search-index/clickhouse.ts";
 import { tsMillis } from "./vendor/search-index/rows.ts";
@@ -229,6 +229,21 @@ export interface SearchIndexDeps {
    * query, nothing else changes.
    */
   skipAcceptanceMissing?: true;
+  /**
+   * SEARCH_INDEX_ACCEPTANCE_WATERMARK_ENABLED=true only (lambda.ts; needs `skipAcceptanceMissing`, and applies
+   * where it does): the stamp of an acceptance refusal also carries a watermark (AcceptanceWatermark): the
+   * refused groups' record ids (hashed) and, per sibling manifest, how many chunks the pass read and their
+   * content chain. A later pass whose pointer set differs (a new revision) first reads, before the search
+   * transaction and outside any lock, each sibling manifest and only the chunks added since the watermark
+   * (acceptanceWatermarkProbe). While at least one refused record id has no record in those chunks, and every
+   * earlier chunk is unchanged, the fold must refuse again: the pass returns the acceptance outcome without the
+   * full read (`skippedBeforeRead`, `acceptanceHold`), under the scope locks and only if the pointer set is still
+   * the one the probe read, then advances the stamp after the transaction. Anything else runs the normal pass.
+   * Absent: stamps, reads and results exactly as with `skipAcceptanceMissing` alone.
+   */
+  acceptanceWatermark?: true;
+  /** Internal (set by the watermark pass for readCanonicalScope): report the refused groups' record ids. */
+  refusedRecordIds?: true;
   /**
    * SEARCH_INDEX_SKIP_OVER_BOUND_ENABLED=true only (lambda.ts, the hosted ClickHouse binding): before any manifest
    * read, a scope whose live sibling pointers' scrubbed raw_bytes already exceed the whole-read bound (and, with
@@ -444,6 +459,12 @@ export interface SearchIndexResult {
    * nothing was read from the object store and nothing was written.
    */
   skippedBeforeRead?: true;
+  /**
+   * `acceptanceWatermark` only, with `skippedBeforeRead`: the acceptance outcome was held across a changed
+   * pointer set, from the stamp's watermark and a read of the added chunks alone (no full read, no write but the
+   * advanced stamp). `deltaChunks` is how many chunks that read covered.
+   */
+  acceptanceHold?: { deltaChunks: number };
   /**
    * Only on a whole-read pass that read and ended with `relayhistory_acceptance_missing` (never on a skipped pass):
    * how the refused contender groups looked (session-read-api/contender-seats.ts). Telemetry only.
@@ -737,6 +758,16 @@ async function captureSearchPreRead(scope: SessionScope, deps: SearchIndexDeps, 
 }
 
 export async function indexSearchScope(scope: SessionScope, deps: SearchIndexDeps): Promise<SearchIndexResult> {
+  // SEARCH_INDEX_ACCEPTANCE_WATERMARK_ENABLED=true (with the acceptance skip, where it applies): the watermark
+  // probe reads the stamp, the added chunks and one lock-free pointer snapshot BEFORE the search transaction;
+  // the locked pass then only compares pointer rows. No probe result: the pass below exactly as without it.
+  if (deps.acceptanceWatermark === true && deps.skipAcceptanceMissing === true && inlineSkipsApply(deps)) {
+    const hold = await acceptanceWatermarkProbe(scope, deps);
+    const result = await indexSearchScopeBase(scope, deps, undefined, hold ?? undefined);
+    // After COMMIT, outside the locks: the held pass advances the stamp to the pointer set it held on.
+    if (hold && result !== SEARCH_SCOPE_CHANGED && result.acceptanceHold) await advanceAcceptanceStamp(deps.ch!, scope, hold);
+    return result as SearchIndexResult;
+  }
   // These paths need their existing transaction-bound service/facts/stream contracts. The flag is
   // accepted but deliberately leaves them on the byte-identical base path.
   if (!deps.preRead || !deps.ch || deps.adapter || deps.staged || deps.stream || deps.outputFacts || deps.outputFactsStore)
@@ -760,8 +791,8 @@ export async function indexSearchScope(scope: SessionScope, deps: SearchIndexDep
 }
 
 function indexSearchScopeBase(scope: SessionScope, deps: SearchIndexDeps): Promise<SearchIndexResult>;
-function indexSearchScopeBase(scope: SessionScope, deps: SearchIndexDeps, prepared: SearchPreRead): Promise<SearchIndexResult | typeof SEARCH_SCOPE_CHANGED>;
-async function indexSearchScopeBase(scope: SessionScope, deps: SearchIndexDeps, prepared?: SearchPreRead): Promise<SearchIndexResult | typeof SEARCH_SCOPE_CHANGED> {
+function indexSearchScopeBase(scope: SessionScope, deps: SearchIndexDeps, prepared: SearchPreRead | undefined, hold?: AcceptanceHold): Promise<SearchIndexResult | typeof SEARCH_SCOPE_CHANGED>;
+async function indexSearchScopeBase(scope: SessionScope, deps: SearchIndexDeps, prepared?: SearchPreRead, hold?: AcceptanceHold): Promise<SearchIndexResult | typeof SEARCH_SCOPE_CHANGED> {
   if (Boolean(deps.ch) === Boolean(deps.adapter)) throw new Error("search requires exactly one service binding");
   // The Output/digest facts are ClickHouse tables: a portable adapter has no home for them.
   if (deps.outputFacts && !deps.ch) throw new Error("output facts require the ClickHouse search binding");
@@ -884,20 +915,31 @@ async function indexSearchScopeBase(scope: SessionScope, deps: SearchIndexDeps, 
         manifests: 0, rows: 0, inserted: 0, deleted: 0, complete: false, partial: true, skippedBeforeRead: true,
         reasons: ["scope_too_large", SKIPPED_BEFORE_READ],
       };
+    // SEARCH_INDEX_ACCEPTANCE_WATERMARK_ENABLED=true: the probe (before this transaction) proved the refusal
+    // still stands for the pointer set it read. Under both locks, after every branch that must run (canonical
+    // mismatch, alias still live, erase, skip-current, over-bound): held only if these pointer rows, epoch and
+    // canonical id are exactly the probe's (SQL facts only: no object or ClickHouse read under the locks).
+    if (hold && acceptanceArmed && siblingFacts &&
+        acceptanceDigest(scope, pointerSnapshot, siblingFacts, hold.windowMarker, limits, deps.stream, deps.readerMaxRuleset) === hold.digest)
+      return {
+        manifests: 0, rows: 0, inserted: 0, deleted: 0, complete: false, skippedBeforeRead: true,
+        acceptanceHold: { deltaChunks: hold.deltaChunks }, reasons: [ACCEPTANCE_MISSING, SKIPPED_BEFORE_READ],
+      };
     let fromMs: number;
-    let acceptance: { stamp: StampRead; digest: string; observed: Map<string, ManifestObservation> } | null = null;
+    let acceptance: { stamp: StampRead; digest: string; windowMarker: string; observed: Map<string, ManifestObservation> } | null = null;
     if (acceptanceArmed && siblingFacts) {
       // SEARCH_INDEX_SKIP_ACCEPTANCE_MISSING_ENABLED=true: windowStart's own read and default (same ClickHouse
       // read, same value), kept apart so the digest tells a stored window from the rolling default.
       const stored = await measurePhase(deps.metrics, "indexScanMs", () => readState(deps.ch!, STATE_WINDOW_START));
       fromMs = Date.parse(stored ?? new Date(at.getTime() - DEFAULT_WINDOW_DAYS * 24 * 60 * 60 * 1000).toISOString());
-      const digest = acceptanceDigest(scope, pointerSnapshot, siblingFacts, stored === null ? `default:${DEFAULT_WINDOW_DAYS}d` : `stored:${stored}`, limits, deps.stream, deps.readerMaxRuleset);
+      const windowMarker = acceptanceWindowMarker(stored);
+      const digest = acceptanceDigest(scope, pointerSnapshot, siblingFacts, windowMarker, limits, deps.stream, deps.readerMaxRuleset);
       const stamp = await readAcceptanceStamp(deps.ch!, stampName);
       // The last pass over this exact pointer set, epoch, window and limits ended incomplete for the
       // acceptance refusal alone, recently: the same outcome, without a read or a write.
       if (acceptanceStampMatches(stamp, digest, at))
         return { manifests: 0, rows: 0, inserted: 0, deleted: 0, complete: false, skippedBeforeRead: true, reasons: [ACCEPTANCE_MISSING, SKIPPED_BEFORE_READ] };
-      acceptance = { stamp, digest, observed: new Map() };
+      acceptance = { stamp, digest, windowMarker, observed: new Map() };
     } else fromMs = prepared?.fromMs ?? await io.fromMs(at);
     if (hostedState) {
       // Before any source read of the pass (the backport's pre-mark, ahead of manifest admission), under the locks.
@@ -908,16 +950,22 @@ async function indexSearchScopeBase(scope: SessionScope, deps: SearchIndexDeps, 
     }
     const observedReader = acceptance ? { reader: observingReader(deps.reader, acceptance.observed) } : {};
     const s3 = prepared?.s3 ?? await measurePhase(deps.metrics, "sourceReadMs", () =>
-      readCanonicalScope(scope, siblingKeys, { ...deps, ...observedReader, decompress: deps.decompress ?? defaultDecompress }, limits, version, pointerSnapshot.canonicalId));
+      readCanonicalScope(scope, siblingKeys, { ...deps, ...observedReader, ...(acceptance && deps.acceptanceWatermark === true ? { refusedRecordIds: true as const } : {}), decompress: deps.decompress ?? defaultDecompress }, limits, version, pointerSnapshot.canonicalId));
     // Flag on: stamp or clear once the pass has its outcome. Busy and deferred passes return before this is
     // called (the lock refusals above, the stream deferral below), so they do neither.
     const settle = async (result: SearchIndexResult): Promise<SearchIndexResult> => {
-      if (acceptance && siblingFacts)
+      if (acceptance && siblingFacts) {
+        const stampable = acceptanceOnly(result) && readAsListed(siblingFacts, acceptance.observed);
         await settleAcceptanceStamp(
           deps.ch!, scope, stampName, acceptance.stamp,
-          acceptanceOnly(result) && readAsListed(siblingFacts, acceptance.observed) ? acceptance.digest : null,
+          stampable ? acceptance.digest : null,
           at,
+          // The watermark of a full read: what a later pass over another pointer set may hold on.
+          stampable && deps.acceptanceWatermark === true
+            ? await acceptanceWatermarkOf(scope, pointerSnapshot.canonicalId, acceptance.windowMarker, limits, deps.stream, deps.readerMaxRuleset, s3.refusedRecordIds, siblingFacts, acceptance.observed, at)
+            : null,
         );
+      }
       return result;
     };
     // Output facts need the whole read, or the staged run's facts hooks (Postgres store only): with a
@@ -1813,6 +1861,8 @@ interface ManifestObservation {
   revision: string;
   contentSha256: string;
   etag: string | null;
+  /** `raw.chunks` of the body read (the list itself, not a copy). */
+  chunks: ManifestV1["raw"]["chunks"];
 }
 
 /** `reader` that records what each read returned; the reads themselves are unchanged. */
@@ -1822,7 +1872,7 @@ function observingReader(reader: ManifestReader, observed: Map<string, ManifestO
     ...(reader.bucket !== undefined ? { bucket: reader.bucket } : {}),
     async read(key) {
       const read = await reader.read(key);
-      if (read) observed.set(key, { revision: String(read.manifest.revision), contentSha256: String(read.manifest.raw?.content_sha256 ?? ""), etag: read.etag ?? null });
+      if (read) observed.set(key, { revision: String(read.manifest.revision), contentSha256: String(read.manifest.raw?.content_sha256 ?? ""), etag: read.etag ?? null, chunks: read.manifest.raw?.chunks ?? [] });
       return read;
     },
   };
@@ -1937,12 +1987,13 @@ async function settleAcceptanceStamp(
   stamp: StampRead,
   stampDigest: string | null,
   at: Date,
+  watermark: AcceptanceWatermark | null = null,
 ): Promise<void> {
   try {
     if (stampDigest !== null)
       await ch.insert(
         INGEST_STATE_TABLE,
-        [{ name, value: JSON.stringify({ v: 1, reason: ACCEPTANCE_MISSING, digest: stampDigest }), updated_at: chNow(at) }],
+        [{ name, value: JSON.stringify({ v: 1, reason: ACCEPTANCE_MISSING, digest: stampDigest, ...(watermark ? { w: watermark } : {}) }), updated_at: chNow(at) }],
         { timeoutMs: 5_000 },
       );
     else if (stamp.state !== "none") {
@@ -1958,6 +2009,234 @@ async function settleAcceptanceStamp(
       session_id: scope.sessionId,
       reason: stampDigest !== null ? "acceptance_stamp_write_failed" : "acceptance_stamp_clear_failed",
       ...errorFields(error),
+    });
+  }
+}
+
+/** The digest's window marker: a stored window_start, or the rolling default's own marker. */
+const acceptanceWindowMarker = (stored: string | null): string => (stored === null ? `default:${DEFAULT_WINDOW_DAYS}d` : `stored:${stored}`);
+
+/** Format of the watermark inside an acceptance stamp. Bump it with any change to what a hold proves. */
+export const ACCEPTANCE_WATERMARK_VERSION = 1;
+/** The most refused record ids a watermark keeps (sorted, the first ones): one that stays untouched is enough to hold. */
+export const ACCEPTANCE_WATERMARK_MAX_IDS = 32;
+/** The most sibling manifests a watermark covers; a wider scope is stamped without one. */
+export const ACCEPTANCE_WATERMARK_MAX_MANIFESTS = 64;
+/** The most added chunks, and their sized bytes, a probe reads; more runs the normal pass (which stamps a new watermark). */
+export const ACCEPTANCE_WATERMARK_MAX_DELTA_CHUNKS = 64;
+export const ACCEPTANCE_WATERMARK_MAX_DELTA_BYTES = 32 * 1024 * 1024;
+
+/**
+ * What a full read that ended with the acceptance refusal alone leaves for later passes over ANOTHER pointer set
+ * (SEARCH_INDEX_ACCEPTANCE_WATERMARK_ENABLED). Only hashes and counts: no record content, id or object key.
+ *
+ * Why a hold is sound. The pass indexes nothing while the cross-origin fold (relayhistoryNewestAcrossOrigins /
+ * lastAccepted) refuses any one record id group, and a group is built only from the scope's records that carry
+ * its record id. The scope's records are exactly the chunks of its live sibling manifests. So while (1) the
+ * sibling manifest set is the watermark's, (2) every chunk the refused read covered is still listed, byte for
+ * byte (the manifest's content chain over the first `n` chunks equals `c`: a seat stamped in place, a repair, an
+ * epoch reset or any rewrite changes a chunk's sha256, offset or position and breaks it), and (3) no chunk added
+ * since, in ANY sibling manifest and from any origin, carries a record with a kept refused id, that group's
+ * input is identical and the fold refuses again. A seat, a new revision, a tombstone or a new contender for the
+ * id can only arrive as such a record, so each of them ends the hold; nothing here depends on how a writer
+ * publishes them.
+ */
+export interface AcceptanceWatermark {
+  v: typeof ACCEPTANCE_WATERMARK_VERSION;
+  /** Everything of the digest but the pointer rows and the epoch (acceptanceWatermarkBase). */
+  base: string;
+  /** When the full read that found the refusal ran (ms): a hold never outlives SKIP_STATE_MAX_AGE_MS from it. */
+  fullAt: number;
+  /** sha256 (hex, 32 chars) of each kept refused record id, sorted. */
+  ids: string[];
+  /**
+   * Per live sibling manifest, sorted by `k` (sha256 of its manifest key, hex, 32 chars): chunks covered (`n`), the content chain over them (`c`) and over all
+   * but the last (`p`; "" when n is 0 or 1). A writer that re-cuts only its last chunk keeps `p`: the probe then
+   * reads from that chunk on.
+   */
+  manifests: Array<{ k: string; n: number; c: string; p: string }>;
+}
+
+/** What the probe hands the locked pass: the pointer set it proved the refusal for, and the stamp to write after. */
+interface AcceptanceHold {
+  digest: string;
+  windowMarker: string;
+  deltaChunks: number;
+  name: string;
+  watermark: AcceptanceWatermark;
+  at: Date;
+}
+
+/** One manifest's watermark entry over its whole chunk list as read. */
+async function watermarkManifest(key: string, chunks: ManifestV1["raw"]["chunks"], contentSha256: string): Promise<AcceptanceWatermark["manifests"][number]> {
+  return { k: watermarkId(key), n: chunks.length, c: contentSha256.toLowerCase(), p: chunks.length > 1 ? await computeContentSha256(chunks.slice(0, -1)) : "" };
+}
+
+/** A record id or a manifest key as the watermark keeps it: hashed, so a stamp row carries no identifier of its own. */
+const watermarkId = (value: string): string => createHash("sha256").update(value).digest("hex").slice(0, 32);
+
+/** The settings a refusal was found under, with the scope and its canonical id: another value is another watermark. */
+function acceptanceWatermarkBase(
+  scope: SessionScope, canonicalId: string, windowMarker: string, limits: Pick<SearchIndexLimits, "maxScopeBytes" | "maxScopeEvents">,
+  stream: StreamReadLimits | undefined, readerMaxRuleset: number | undefined,
+): string {
+  return createHash("sha256").update(JSON.stringify([
+    ACCEPTANCE_SKIP_VERSION, ACCEPTANCE_WATERMARK_VERSION, [scope.orgId, scope.workspaceId, scope.harness, scope.sessionId], canonicalId, windowMarker,
+    [limits.maxScopeBytes, limits.maxScopeEvents], stream ? [stream.maxReadBytes, stream.maxReadEvents] : null, readerMaxRuleset ?? null,
+  ])).digest("hex");
+}
+
+/** The watermark of a stamped full read, or null when it has no record id group to hold on (a catalog-key refusal) or is too wide. */
+async function acceptanceWatermarkOf(
+  scope: SessionScope, canonicalId: string, windowMarker: string, limits: Pick<SearchIndexLimits, "maxScopeBytes" | "maxScopeEvents">,
+  stream: StreamReadLimits | undefined, readerMaxRuleset: number | undefined,
+  refused: readonly string[] | undefined, pointers: readonly SiblingPointerFacts[], observed: ReadonlyMap<string, ManifestObservation>, at: Date,
+): Promise<AcceptanceWatermark | null> {
+  if (!refused?.length || pointers.length === 0 || pointers.length > ACCEPTANCE_WATERMARK_MAX_MANIFESTS) return null;
+  const manifests: AcceptanceWatermark["manifests"] = [];
+  try {
+    for (const p of pointers) {
+      const o = observed.get(p.manifest_key);
+      if (!o) return null;
+      manifests.push(await watermarkManifest(p.manifest_key, o.chunks, o.contentSha256));
+    }
+  } catch {
+    // Never fails the pass: the stamp is written without a watermark.
+    return null;
+  }
+  manifests.sort((a, b) => (a.k < b.k ? -1 : a.k > b.k ? 1 : 0));
+  return {
+    v: ACCEPTANCE_WATERMARK_VERSION,
+    base: acceptanceWatermarkBase(scope, canonicalId, windowMarker, limits, stream, readerMaxRuleset),
+    fullAt: at.getTime(),
+    ids: [...new Set(refused.map(watermarkId))].sort().slice(0, ACCEPTANCE_WATERMARK_MAX_IDS),
+    manifests,
+  };
+}
+
+/** A stamp value's digest and watermark, strictly parsed; null for anything else (a plain v1 stamp included). */
+function parseAcceptanceWatermark(value: string): { digest: string; watermark: AcceptanceWatermark } | null {
+  let parsed: unknown;
+  try { parsed = JSON.parse(value); } catch { return null; }
+  if (typeof parsed !== "object" || parsed === null) return null;
+  const v = parsed as Record<string, unknown>;
+  if (v.v !== 1 || v.reason !== ACCEPTANCE_MISSING || typeof v.digest !== "string" || typeof v.w !== "object" || v.w === null) return null;
+  const w = v.w as Record<string, unknown>;
+  const hex = (x: unknown, n: number): x is string => typeof x === "string" && x.length === n && /^[0-9a-f]+$/.test(x);
+  if (w.v !== ACCEPTANCE_WATERMARK_VERSION || !hex(w.base, 64) || typeof w.fullAt !== "number" || !Number.isSafeInteger(w.fullAt)) return null;
+  if (!Array.isArray(w.ids) || w.ids.length === 0 || w.ids.length > ACCEPTANCE_WATERMARK_MAX_IDS || !w.ids.every((id) => hex(id, 32))) return null;
+  if (!Array.isArray(w.manifests) || w.manifests.length === 0 || w.manifests.length > ACCEPTANCE_WATERMARK_MAX_MANIFESTS) return null;
+  const manifests: AcceptanceWatermark["manifests"] = [];
+  for (const m of w.manifests as unknown[]) {
+    if (typeof m !== "object" || m === null) return null;
+    const e = m as Record<string, unknown>;
+    if (!hex(e.k, 32) || typeof e.n !== "number" || !Number.isSafeInteger(e.n) || e.n < 0 || !hex(e.c, 64)) return null;
+    if (e.p !== "" && !hex(e.p, 64)) return null;
+    manifests.push({ k: e.k, n: e.n, c: e.c, p: e.p });
+  }
+  return { digest: v.digest, watermark: { v: ACCEPTANCE_WATERMARK_VERSION, base: w.base, fullAt: w.fullAt, ids: w.ids as string[], manifests } };
+}
+
+/**
+ * SEARCH_INDEX_ACCEPTANCE_WATERMARK_ENABLED=true: before the search transaction, with no lock held, decide whether
+ * the stamped acceptance refusal still stands for the scope's CURRENT pointer set (see AcceptanceWatermark for why
+ * that is sound). Reads the stamp (one bounded ClickHouse read), the live pointer rows (one short read-only
+ * transaction, no lock), the stored window, each sibling manifest and only the chunks added since the watermark.
+ * Returns the hold, or null to run the normal pass: no stamp or watermark, too old, a matching digest (the plain
+ * skip takes it without any object read), other settings, another sibling set, a manifest not read as listed or
+ * not scrubbed, an earlier chunk changed or gone, a scope now past the whole-read bounds (the streamed path may
+ * take it), a delta past the probe's bounds, every kept id touched, or any error (fail open).
+ */
+async function acceptanceWatermarkProbe(scope: SessionScope, deps: SearchIndexDeps): Promise<AcceptanceHold | null> {
+  try {
+    const ch = deps.ch!;
+    const limits = { ...SEARCH_INDEX_DEFAULT_LIMITS, ...deps.limits };
+    const at = (deps.now ?? (() => new Date()))();
+    const name = acceptanceStampName(scope);
+    const stamp = await readAcceptanceStamp(ch, name);
+    if (stamp.state !== "live") return null;
+    const stampAge = Math.abs(at.getTime() - stamp.atMs);
+    if (!Number.isFinite(stampAge) || !(stampAge < SKIP_STATE_MAX_AGE_MS)) return null;
+    const held = parseAcceptanceWatermark(stamp.value);
+    if (!held) return null;
+    const mark = held.watermark;
+    // A hold never rewrites `fullAt`: a scope that keeps getting revisions still takes a full read this often.
+    if (!(Math.abs(at.getTime() - mark.fullAt) < SKIP_STATE_MAX_AGE_MS)) return null;
+    const listed = await deps.transact(async (tx) => {
+      const snapshot = await livePointerSnapshot(tx, scope);
+      if (!snapshot.keys.length || layoutComponent(snapshot.canonicalId) !== scope.sessionId) return null;
+      return { snapshot, facts: await siblingPointerFacts(tx, scope, snapshot.canonicalId) };
+    });
+    if (!listed || listed.facts.length === 0) return null;
+    const { snapshot, facts } = listed;
+    const windowMarker = acceptanceWindowMarker(await readState(ch, STATE_WINDOW_START));
+    const digest = acceptanceDigest(scope, snapshot, facts, windowMarker, limits, deps.stream, deps.readerMaxRuleset);
+    if (digest === held.digest) return null;
+    if (acceptanceWatermarkBase(scope, snapshot.canonicalId, windowMarker, limits, deps.stream, deps.readerMaxRuleset) !== mark.base) return null;
+    // (1) The same sibling manifest set: a manifest added or gone is another fold input.
+    const byKey = new Map(mark.manifests.map((m) => [m.k, m]));
+    if (facts.length !== byKey.size || !facts.every((f) => byKey.has(watermarkId(f.manifest_key)))) return null;
+    const prefix = deps.prefixFor(scope.orgId);
+    const next: AcceptanceWatermark["manifests"] = [];
+    const deltas: Array<{ manifest: ManifestV1; prefix: string }> = [];
+    let bytes = 0, events = 0, deltaChunks = 0, deltaBytes = 0;
+    for (const f of facts) {
+      const was = byKey.get(watermarkId(f.manifest_key))!;
+      const read = await deps.reader.read(f.manifest_key);
+      if (!read) return null;
+      const manifest = read.manifest;
+      const raw = manifest.raw;
+      // Read as listed (the stamp's own rule), scrubbed (the only manifests a pass reads).
+      if (String(manifest.revision) !== f.revision || f.content_sha256 === null || String(raw.content_sha256).toLowerCase() !== f.content_sha256.toLowerCase() ||
+          (read.etag ?? null) !== f.manifest_etag || !f.scrubbed || !raw.scrub) return null;
+      // (2) Every chunk the refused read covered is still there, unchanged, in the same place; or all but the
+      // last one are (a re-cut tail), and the read starts at that chunk.
+      let from: number;
+      if (raw.chunks.length >= was.n && (await computeContentSha256(raw.chunks.slice(0, was.n))) === was.c) from = was.n;
+      else if (was.n === 1) from = 0;
+      else if (was.n > 1 && raw.chunks.length >= was.n - 1 && (await computeContentSha256(raw.chunks.slice(0, was.n - 1))) === was.p) from = was.n - 1;
+      else return null;
+      for (const c of raw.chunks) { bytes += Math.max(c.bytes, c.stored_raw_bytes ?? 0); events += c.records ?? 0; }
+      const added = raw.chunks.slice(from);
+      deltaChunks += added.length;
+      deltaBytes += added.reduce((n, c) => n + Math.max(c.bytes, c.stored_bytes, c.stored_raw_bytes ?? 0), 0);
+      if (added.length) deltas.push({ manifest: { ...manifest, raw: { ...raw, chunks: added } }, prefix: parseSessionKey(f.manifest_key)?.prefix ?? prefix });
+      next.push(await watermarkManifest(f.manifest_key, raw.chunks, String(raw.content_sha256)));
+    }
+    // Past the whole-read bounds the pass sizes, streams or refuses for size: not this outcome.
+    if (bytes > limits.maxScopeBytes || events > limits.maxScopeEvents) return null;
+    if (deltaChunks > ACCEPTANCE_WATERMARK_MAX_DELTA_CHUNKS || deltaBytes > ACCEPTANCE_WATERMARK_MAX_DELTA_BYTES) return null;
+    // (3) The added chunks, every sibling manifest and origin: a record with a kept id ends that id's hold.
+    const kept = new Set(mark.ids);
+    for (const delta of deltas) {
+      for await (const record of streamManifestRecords(delta.manifest, deps.store, delta.prefix, deps.decompress ?? defaultDecompress, limits.maxScopeEvents, deps.readerMaxRuleset))
+        kept.delete(watermarkId(record.record_id));
+      if (kept.size === 0) return null;
+    }
+    if (kept.size === 0) return null;
+    next.sort((a, b) => (a.k < b.k ? -1 : a.k > b.k ? 1 : 0));
+    return { digest, windowMarker, deltaChunks, name, at, watermark: { v: ACCEPTANCE_WATERMARK_VERSION, base: mark.base, fullAt: mark.fullAt, ids: [...kept].sort(), manifests: next } };
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * After a held pass committed (no lock held): the stamp moves to the pointer set the hold was proved for, so a
+ * repeat over it is the plain skip and the next revision's probe reads only what is added after it. Written at the
+ * probe's time: a pass that ran since (and stamped or cleared at its own, later time) stays the latest row. Best
+ * effort, as every stamp write.
+ */
+async function advanceAcceptanceStamp(ch: ClickHouseClient, scope: SessionScope, hold: AcceptanceHold): Promise<void> {
+  try {
+    await ch.insert(
+      INGEST_STATE_TABLE,
+      [{ name: hold.name, value: JSON.stringify({ v: 1, reason: ACCEPTANCE_MISSING, digest: hold.digest, w: hold.watermark }), updated_at: chNow(hold.at) }],
+      { timeoutMs: 5_000 },
+    );
+  } catch (error) {
+    log.warn("search index acceptance stamp not written", {
+      stage: "search-index", org_id: scope.orgId, session_id: scope.sessionId, reason: "acceptance_stamp_write_failed", ...errorFields(error),
     });
   }
 }
